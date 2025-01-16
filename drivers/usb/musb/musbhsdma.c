@@ -1,412 +1,282 @@
-/*
- * MUSB OTG driver - support for Mentor's DMA controller
- *
- * Copyright 2005 Mentor Graphics Corporation
- * Copyright (C) 2005-2007 by Texas Instruments
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- */
-#include <linux/device.h>
-#include <linux/interrupt.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-#include "musb_core.h"
-#include "musbhsdma.h"
+3
 
-static void dma_channel_release(struct dma_channel *channel);
 
-static void dma_controller_stop(struct musb_dma_controller *controller)
+// ucInputFlag
+#define ATOM_PLL_INPUT_FLAG_PLL_STROBE_MODE_EN  1   // 1-StrobeMode, 0-PerformanceMode
+
+// use for ComputeMemoryClockParamTable
+typedef struct _COMPUTE_MEMORY_CLOCK_PARAM_PARAMETERS_V2_1
 {
-	struct musb *musb = controller->private_data;
-	struct dma_channel *channel;
-	u8 bit;
+  union
+  {
+    ULONG  ulClock;
+    ATOM_S_MPLL_FB_DIVIDER   ulFbDiv;         //Output:UPPER_WORD=FB_DIV_INTEGER,  LOWER_WORD=FB_DIV_FRAC shl (16-FB_FRACTION_BITS)
+  };
+  UCHAR   ucDllSpeed;                         //Output
+  UCHAR   ucPostDiv;                          //Output
+  union{
+    UCHAR   ucInputFlag;                      //Input : ATOM_PLL_INPUT_FLAG_PLL_STROBE_MODE_EN: 1-StrobeMode, 0-PerformanceMode
+    UCHAR   ucPllCntlFlag;                    //Output:
+  };
+  UCHAR   ucBWCntl;
+}COMPUTE_MEMORY_CLOCK_PARAM_PARAMETERS_V2_1;
 
-	if (controller->used_channels != 0) {
-		dev_err(musb->controller,
-			"Stopping DMA controller while channel active\n");
+// definition of ucInputFlag
+#define MPLL_INPUT_FLAG_STROBE_MODE_EN          0x01
+// definition of ucPllCntlFlag
+#define MPLL_CNTL_FLAG_VCO_MODE_MASK            0x03
+#define MPLL_CNTL_FLAG_BYPASS_DQ_PLL            0x04
+#define MPLL_CNTL_FLAG_QDR_ENABLE               0x08
+#define MPLL_CNTL_FLAG_AD_HALF_RATE             0x10
 
-		for (bit = 0; bit < MUSB_HSDMA_CHANNELS; bit++) {
-			if (controller->used_channels & (1 << bit)) {
-				channel = &controller->channel[bit].channel;
-				dma_channel_release(channel);
+//MPLL_CNTL_FLAG_BYPASS_AD_PLL has a wrong name, should be BYPASS_DQ_PLL
+#define MPLL_CNTL_FLAG_BYPASS_AD_PLL            0x04
 
-				if (!controller->used_channels)
-					break;
-			}
-		}
-	}
-}
-
-static struct dma_channel *dma_channel_allocate(struct dma_controller *c,
-				struct musb_hw_ep *hw_ep, u8 transmit)
+typedef struct _DYNAMICE_MEMORY_SETTINGS_PARAMETER
 {
-	struct musb_dma_controller *controller = container_of(c,
-			struct musb_dma_controller, controller);
-	struct musb_dma_channel *musb_channel = NULL;
-	struct dma_channel *channel = NULL;
-	u8 bit;
+  ATOM_COMPUTE_CLOCK_FREQ ulClock;
+  ULONG ulReserved[2];
+}DYNAMICE_MEMORY_SETTINGS_PARAMETER;
 
-	for (bit = 0; bit < MUSB_HSDMA_CHANNELS; bit++) {
-		if (!(controller->used_channels & (1 << bit))) {
-			controller->used_channels |= (1 << bit);
-			musb_channel = &(controller->channel[bit]);
-			musb_channel->controller = controller;
-			musb_channel->idx = bit;
-			musb_channel->epnum = hw_ep->epnum;
-			musb_channel->transmit = transmit;
-			channel = &(musb_channel->channel);
-			channel->private_data = musb_channel;
-			channel->status = MUSB_DMA_STATUS_FREE;
-			channel->max_len = 0x100000;
-			/* Tx => mode 1; Rx => mode 0 */
-			channel->desired_mode = transmit;
-			channel->actual_len = 0;
-			break;
-		}
-	}
-
-	return channel;
-}
-
-static void dma_channel_release(struct dma_channel *channel)
+typedef struct _DYNAMICE_ENGINE_SETTINGS_PARAMETER
 {
-	struct musb_dma_channel *musb_channel = channel->private_data;
+  ATOM_COMPUTE_CLOCK_FREQ ulClock;
+  ULONG ulMemoryClock;
+  ULONG ulReserved;
+}DYNAMICE_ENGINE_SETTINGS_PARAMETER;
 
-	channel->actual_len = 0;
-	musb_channel->start_addr = 0;
-	musb_channel->len = 0;
-
-	musb_channel->controller->used_channels &=
-		~(1 << musb_channel->idx);
-
-	channel->status = MUSB_DMA_STATUS_UNKNOWN;
-}
-
-static void configure_channel(struct dma_channel *channel,
-				u16 packet_sz, u8 mode,
-				dma_addr_t dma_addr, u32 len)
+/****************************************************************************/
+// Structures used by SetEngineClockTable
+/****************************************************************************/
+typedef struct _SET_ENGINE_CLOCK_PARAMETERS
 {
-	struct musb_dma_channel *musb_channel = channel->private_data;
-	struct musb_dma_controller *controller = musb_channel->controller;
-	struct musb *musb = controller->private_data;
-	void __iomem *mbase = controller->base;
-	u8 bchannel = musb_channel->idx;
-	u16 csr = 0;
+  ULONG ulTargetEngineClock;          //In 10Khz unit
+}SET_ENGINE_CLOCK_PARAMETERS;
 
-	dev_dbg(musb->controller, "%p, pkt_sz %d, addr 0x%x, len %d, mode %d\n",
-			channel, packet_sz, dma_addr, len, mode);
-
-	if (mode) {
-		csr |= 1 << MUSB_HSDMA_MODE1_SHIFT;
-		BUG_ON(len < packet_sz);
-	}
-	csr |= MUSB_HSDMA_BURSTMODE_INCR16
-				<< MUSB_HSDMA_BURSTMODE_SHIFT;
-
-	csr |= (musb_channel->epnum << MUSB_HSDMA_ENDPOINT_SHIFT)
-		| (1 << MUSB_HSDMA_ENABLE_SHIFT)
-		| (1 << MUSB_HSDMA_IRQENABLE_SHIFT)
-		| (musb_channel->transmit
-				? (1 << MUSB_HSDMA_TRANSMIT_SHIFT)
-				: 0);
-
-	/* address/count */
-	musb_write_hsdma_addr(mbase, bchannel, dma_addr);
-	musb_write_hsdma_count(mbase, bchannel, len);
-
-	/* control (this should start things) */
-	musb_writew(mbase,
-		MUSB_HSDMA_CHANNEL_OFFSET(bchannel, MUSB_HSDMA_CONTROL),
-		csr);
-}
-
-static int dma_channel_program(struct dma_channel *channel,
-				u16 packet_sz, u8 mode,
-				dma_addr_t dma_addr, u32 len)
+typedef struct _SET_ENGINE_CLOCK_PS_ALLOCATION
 {
-	struct musb_dma_channel *musb_channel = channel->private_data;
-	struct musb_dma_controller *controller = musb_channel->controller;
-	struct musb *musb = controller->private_data;
+  ULONG ulTargetEngineClock;          //In 10Khz unit
+  COMPUTE_MEMORY_ENGINE_PLL_PARAMETERS_PS_ALLOCATION sReserved;
+}SET_ENGINE_CLOCK_PS_ALLOCATION;
 
-	dev_dbg(musb->controller, "ep%d-%s pkt_sz %d, dma_addr 0x%x length %d, mode %d\n",
-		musb_channel->epnum,
-		musb_channel->transmit ? "Tx" : "Rx",
-		packet_sz, dma_addr, len, mode);
-
-	BUG_ON(channel->status == MUSB_DMA_STATUS_UNKNOWN ||
-		channel->status == MUSB_DMA_STATUS_BUSY);
-
-	/* Let targets check/tweak the arguments */
-	if (musb->ops->adjust_channel_params) {
-		int ret = musb->ops->adjust_channel_params(channel,
-			packet_sz, &mode, &dma_addr, &len);
-		if (ret)
-			return ret;
-	}
-
-	/*
-	 * The DMA engine in RTL1.8 and above cannot handle
-	 * DMA addresses that are not aligned to a 4 byte boundary.
-	 * It ends up masking the last two bits of the address
-	 * programmed in DMA_ADDR.
-	 *
-	 * Fail such DMA transfers, so that the backup PIO mode
-	 * can carry out the transfer
-	 */
-	if ((musb->hwvers >= MUSB_HWVERS_1800) && (dma_addr % 4))
-		return false;
-
-	channel->actual_len = 0;
-	musb_channel->start_addr = dma_addr;
-	musb_channel->len = len;
-	musb_channel->max_packet_sz = packet_sz;
-	channel->status = MUSB_DMA_STATUS_BUSY;
-
-	configure_channel(channel, packet_sz, mode, dma_addr, len);
-
-	return true;
-}
-
-static int dma_channel_abort(struct dma_channel *channel)
+/****************************************************************************/
+// Structures used by SetMemoryClockTable
+/****************************************************************************/
+typedef struct _SET_MEMORY_CLOCK_PARAMETERS
 {
-	struct musb_dma_channel *musb_channel = channel->private_data;
-	void __iomem *mbase = musb_channel->controller->base;
-	struct musb *musb = musb_channel->controller->private_data;
+  ULONG ulTargetMemoryClock;          //In 10Khz unit
+}SET_MEMORY_CLOCK_PARAMETERS;
 
-	u8 bchannel = musb_channel->idx;
-	int offset;
-	u16 csr;
-
-	if (channel->status == MUSB_DMA_STATUS_BUSY) {
-		if (musb_channel->transmit) {
-			offset = musb->io.ep_offset(musb_channel->epnum,
-						MUSB_TXCSR);
-
-			/*
-			 * The programming guide says that we must clear
-			 * the DMAENAB bit before the DMAMODE bit...
-			 */
-			csr = musb_readw(mbase, offset);
-			csr &= ~(MUSB_TXCSR_AUTOSET | MUSB_TXCSR_DMAENAB);
-			musb_writew(mbase, offset, csr);
-			csr &= ~MUSB_TXCSR_DMAMODE;
-			musb_writew(mbase, offset, csr);
-		} else {
-			offset = musb->io.ep_offset(musb_channel->epnum,
-						MUSB_RXCSR);
-
-			csr = musb_readw(mbase, offset);
-			csr &= ~(MUSB_RXCSR_AUTOCLEAR |
-				 MUSB_RXCSR_DMAENAB |
-				 MUSB_RXCSR_DMAMODE);
-			musb_writew(mbase, offset, csr);
-		}
-
-		musb_writew(mbase,
-			MUSB_HSDMA_CHANNEL_OFFSET(bchannel, MUSB_HSDMA_CONTROL),
-			0);
-		musb_write_hsdma_addr(mbase, bchannel, 0);
-		musb_write_hsdma_count(mbase, bchannel, 0);
-		channel->status = MUSB_DMA_STATUS_FREE;
-	}
-
-	return 0;
-}
-
-static irqreturn_t dma_controller_irq(int irq, void *private_data)
+typedef struct _SET_MEMORY_CLOCK_PS_ALLOCATION
 {
-	struct musb_dma_controller *controller = private_data;
-	struct musb *musb = controller->private_data;
-	struct musb_dma_channel *musb_channel;
-	struct dma_channel *channel;
+  ULONG ulTargetMemoryClock;          //In 10Khz unit
+  COMPUTE_MEMORY_ENGINE_PLL_PARAMETERS_PS_ALLOCATION sReserved;
+}SET_MEMORY_CLOCK_PS_ALLOCATION;
 
-	void __iomem *mbase = controller->base;
+/****************************************************************************/
+// Structures used by ASIC_Init.ctb
+/****************************************************************************/
+typedef struct _ASIC_INIT_PARAMETERS
+{
+  ULONG ulDefaultEngineClock;         //In 10Khz unit
+  ULONG ulDefaultMemoryClock;         //In 10Khz unit
+}ASIC_INIT_PARAMETERS;
 
-	irqreturn_t retval = IRQ_NONE;
+typedef struct _ASIC_INIT_PS_ALLOCATION
+{
+  ASIC_INIT_PARAMETERS sASICInitClocks;
+  SET_ENGINE_CLOCK_PS_ALLOCATION sReserved; //Caller doesn't need to init this structure
+}ASIC_INIT_PS_ALLOCATION;
 
-	unsigned long flags;
+typedef struct _ASIC_INIT_CLOCK_PARAMETERS
+{
+  ULONG ulClkFreqIn10Khz:24;
+  ULONG ucClkFlag:8;
+}ASIC_INIT_CLOCK_PARAMETERS;
 
-	u8 bchannel;
-	u8 int_hsdma;
+typedef struct _ASIC_INIT_PARAMETERS_V1_2
+{
+  ASIC_INIT_CLOCK_PARAMETERS asSclkClock;         //In 10Khz unit
+  ASIC_INIT_CLOCK_PARAMETERS asMemClock;          //In 10Khz unit
+}ASIC_INIT_PARAMETERS_V1_2;
 
-	u32 addr, count;
-	u16 csr;
+typedef struct _ASIC_INIT_PS_ALLOCATION_V1_2
+{
+  ASIC_INIT_PARAMETERS_V1_2 sASICInitClocks;
+  ULONG ulReserved[8];
+}ASIC_INIT_PS_ALLOCATION_V1_2;
 
-	spin_lock_irqsave(&musb->lock, flags);
+/****************************************************************************/
+// Structure used by DynamicClockGatingTable.ctb
+/****************************************************************************/
+typedef struct _DYNAMIC_CLOCK_GATING_PARAMETERS
+{
+  UCHAR ucEnable;                     // ATOM_ENABLE or ATOM_DISABLE
+  UCHAR ucPadding[3];
+}DYNAMIC_CLOCK_GATING_PARAMETERS;
+#define  DYNAMIC_CLOCK_GATING_PS_ALLOCATION  DYNAMIC_CLOCK_GATING_PARAMETERS
 
-	int_hsdma = musb_readb(mbase, MUSB_HSDMA_INTR);
+/****************************************************************************/
+// Structure used by EnableDispPowerGatingTable.ctb
+/****************************************************************************/
+typedef struct _ENABLE_DISP_POWER_GATING_PARAMETERS_V2_1
+{
+  UCHAR ucDispPipeId;                 // ATOM_CRTC1, ATOM_CRTC2, ...
+  UCHAR ucEnable;                     // ATOM_ENABLE or ATOM_DISABLE
+  UCHAR ucPadding[2];
+}ENABLE_DISP_POWER_GATING_PARAMETERS_V2_1;
 
-#ifdef CONFIG_BLACKFIN
-	/* Clear DMA interrupt flags */
-	musb_writeb(mbase, MUSB_HSDMA_INTR, int_hsdma);
+typedef struct _ENABLE_DISP_POWER_GATING_PS_ALLOCATION
+{
+  UCHAR ucDispPipeId;                 // ATOM_CRTC1, ATOM_CRTC2, ...
+  UCHAR ucEnable;                     // ATOM_ENABLE/ATOM_DISABLE/ATOM_INIT
+  UCHAR ucPadding[2];
+  ULONG ulReserved[4];
+}ENABLE_DISP_POWER_GATING_PS_ALLOCATION;
+
+/****************************************************************************/
+// Structure used by EnableASIC_StaticPwrMgtTable.ctb
+/****************************************************************************/
+typedef struct _ENABLE_ASIC_STATIC_PWR_MGT_PARAMETERS
+{
+  UCHAR ucEnable;                     // ATOM_ENABLE or ATOM_DISABLE
+  UCHAR ucPadding[3];
+}ENABLE_ASIC_STATIC_PWR_MGT_PARAMETERS;
+#define ENABLE_ASIC_STATIC_PWR_MGT_PS_ALLOCATION  ENABLE_ASIC_STATIC_PWR_MGT_PARAMETERS
+
+/****************************************************************************/
+// Structures used by DAC_LoadDetectionTable.ctb
+/****************************************************************************/
+typedef struct _DAC_LOAD_DETECTION_PARAMETERS
+{
+  USHORT usDeviceID;                  //{ATOM_DEVICE_CRTx_SUPPORT,ATOM_DEVICE_TVx_SUPPORT,ATOM_DEVICE_CVx_SUPPORT}
+  UCHAR  ucDacType;                   //{ATOM_DAC_A,ATOM_DAC_B, ATOM_EXT_DAC}
+  UCHAR  ucMisc;                                 //Valid only when table revision =1.3 and above
+}DAC_LOAD_DETECTION_PARAMETERS;
+
+// DAC_LOAD_DETECTION_PARAMETERS.ucMisc
+#define DAC_LOAD_MISC_YPrPb                  0x01
+
+typedef struct _DAC_LOAD_DETECTION_PS_ALLOCATION
+{
+  DAC_LOAD_DETECTION_PARAMETERS            sDacload;
+  ULONG                                    Reserved[2];// Don't set this one, allocation for EXT DAC
+}DAC_LOAD_DETECTION_PS_ALLOCATION;
+
+/****************************************************************************/
+// Structures used by DAC1EncoderControlTable.ctb and DAC2EncoderControlTable.ctb
+/****************************************************************************/
+typedef struct _DAC_ENCODER_CONTROL_PARAMETERS
+{
+  USHORT usPixelClock;                // in 10KHz; for bios convenient
+  UCHAR  ucDacStandard;               // See definition of ATOM_DACx_xxx, For DEC3.0, bit 7 used as internal flag to indicate DAC2 (==1) or DAC1 (==0)
+  UCHAR  ucAction;                    // 0: turn off encoder
+                                      // 1: setup and turn on encoder
+                                      // 7: ATOM_ENCODER_INIT Initialize DAC
+}DAC_ENCODER_CONTROL_PARAMETERS;
+
+#define DAC_ENCODER_CONTROL_PS_ALLOCATION  DAC_ENCODER_CONTROL_PARAMETERS
+
+/****************************************************************************/
+// Structures used by DIG1EncoderControlTable
+//                    DIG2EncoderControlTable
+//                    ExternalEncoderControlTable
+/****************************************************************************/
+typedef struct _DIG_ENCODER_CONTROL_PARAMETERS
+{
+  USHORT usPixelClock;      // in 10KHz; for bios convenient
+  UCHAR  ucConfig;
+                            // [2] Link Select:
+                            // =0: PHY linkA if bfLane<3
+                            // =1: PHY linkB if bfLanes<3
+                            // =0: PHY linkA+B if bfLanes=3
+                            // [3] Transmitter Sel
+                            // =0: UNIPHY or PCIEPHY
+                            // =1: LVTMA
+  UCHAR ucAction;           // =0: turn off encoder
+                            // =1: turn on encoder
+  UCHAR ucEncoderMode;
+                            // =0: DP   encoder
+                            // =1: LVDS encoder
+                            // =2: DVI  encoder
+                            // =3: HDMI encoder
+                            // =4: SDVO encoder
+  UCHAR ucLaneNum;          // how many lanes to enable
+  UCHAR ucReserved[2];
+}DIG_ENCODER_CONTROL_PARAMETERS;
+#define DIG_ENCODER_CONTROL_PS_ALLOCATION             DIG_ENCODER_CONTROL_PARAMETERS
+#define EXTERNAL_ENCODER_CONTROL_PARAMETER            DIG_ENCODER_CONTROL_PARAMETERS
+
+//ucConfig
+#define ATOM_ENCODER_CONFIG_DPLINKRATE_MASK           0x01
+#define ATOM_ENCODER_CONFIG_DPLINKRATE_1_62GHZ        0x00
+#define ATOM_ENCODER_CONFIG_DPLINKRATE_2_70GHZ        0x01
+#define ATOM_ENCODER_CONFIG_DPLINKRATE_5_40GHZ        0x02
+#define ATOM_ENCODER_CONFIG_LINK_SEL_MASK             0x04
+#define ATOM_ENCODER_CONFIG_LINKA                     0x00
+#define ATOM_ENCODER_CONFIG_LINKB                     0x04
+#define ATOM_ENCODER_CONFIG_LINKA_B                   ATOM_TRANSMITTER_CONFIG_LINKA
+#define ATOM_ENCODER_CONFIG_LINKB_A                   ATOM_ENCODER_CONFIG_LINKB
+#define ATOM_ENCODER_CONFIG_TRANSMITTER_SEL_MASK      0x08
+#define ATOM_ENCODER_CONFIG_UNIPHY                    0x00
+#define ATOM_ENCODER_CONFIG_LVTMA                     0x08
+#define ATOM_ENCODER_CONFIG_TRANSMITTER1              0x00
+#define ATOM_ENCODER_CONFIG_TRANSMITTER2              0x08
+#define ATOM_ENCODER_CONFIG_DIGB                      0x80         // VBIOS Internal use, outside SW should set this bit=0
+// ucAction
+// ATOM_ENABLE:  Enable Encoder
+// ATOM_DISABLE: Disable Encoder
+
+//ucEncoderMode
+#define ATOM_ENCODER_MODE_DP                          0
+#define ATOM_ENCODER_MODE_LVDS                        1
+#define ATOM_ENCODER_MODE_DVI                         2
+#define ATOM_ENCODER_MODE_HDMI                        3
+#define ATOM_ENCODER_MODE_SDVO                        4
+#define ATOM_ENCODER_MODE_DP_AUDIO                    5
+#define ATOM_ENCODER_MODE_TV                          13
+#define ATOM_ENCODER_MODE_CV                          14
+#define ATOM_ENCODER_MODE_CRT                         15
+#define ATOM_ENCODER_MODE_DVO                         16
+#define ATOM_ENCODER_MODE_DP_SST                      ATOM_ENCODER_MODE_DP    // For DP1.2
+#define ATOM_ENCODER_MODE_DP_MST                      5                       // For DP1.2
+
+
+typedef struct _ATOM_DIG_ENCODER_CONFIG_V2
+{
+#if ATOM_BIG_ENDIAN
+    UCHAR ucReserved1:2;
+    UCHAR ucTransmitterSel:2;     // =0: UniphyAB, =1: UniphyCD  =2: UniphyEF
+    UCHAR ucLinkSel:1;            // =0: linkA/C/E =1: linkB/D/F
+    UCHAR ucReserved:1;
+    UCHAR ucDPLinkRate:1;         // =0: 1.62Ghz, =1: 2.7Ghz
+#else
+    UCHAR ucDPLinkRate:1;         // =0: 1.62Ghz, =1: 2.7Ghz
+    UCHAR ucReserved:1;
+    UCHAR ucLinkSel:1;            // =0: linkA/C/E =1: linkB/D/F
+    UCHAR ucTransmitterSel:2;     // =0: UniphyAB, =1: UniphyCD  =2: UniphyEF
+    UCHAR ucReserved1:2;
 #endif
+}ATOM_DIG_ENCODER_CONFIG_V2;
 
-	if (!int_hsdma) {
-		dev_dbg(musb->controller, "spurious DMA irq\n");
 
-		for (bchannel = 0; bchannel < MUSB_HSDMA_CHANNELS; bchannel++) {
-			musb_channel = (struct musb_dma_channel *)
-					&(controller->channel[bchannel]);
-			channel = &musb_channel->channel;
-			if (channel->status == MUSB_DMA_STATUS_BUSY) {
-				count = musb_read_hsdma_count(mbase, bchannel);
-
-				if (count == 0)
-					int_hsdma |= (1 << bchannel);
-			}
-		}
-
-		dev_dbg(musb->controller, "int_hsdma = 0x%x\n", int_hsdma);
-
-		if (!int_hsdma)
-			goto done;
-	}
-
-	for (bchannel = 0; bchannel < MUSB_HSDMA_CHANNELS; bchannel++) {
-		if (int_hsdma & (1 << bchannel)) {
-			musb_channel = (struct musb_dma_channel *)
-					&(controller->channel[bchannel]);
-			channel = &musb_channel->channel;
-
-			csr = musb_readw(mbase,
-					MUSB_HSDMA_CHANNEL_OFFSET(bchannel,
-							MUSB_HSDMA_CONTROL));
-
-			if (csr & (1 << MUSB_HSDMA_BUSERROR_SHIFT)) {
-				musb_channel->channel.status =
-					MUSB_DMA_STATUS_BUS_ABORT;
-			} else {
-				u8 devctl;
-
-				addr = musb_read_hsdma_addr(mbase,
-						bchannel);
-				channel->actual_len = addr
-					- musb_channel->start_addr;
-
-				dev_dbg(musb->controller, "ch %p, 0x%x -> 0x%x (%zu / %d) %s\n",
-					channel, musb_channel->start_addr,
-					addr, channel->actual_len,
-					musb_channel->len,
-					(channel->actual_len
-						< musb_channel->len) ?
-					"=> reconfig 0" : "=> complete");
-
-				devctl = musb_readb(mbase, MUSB_DEVCTL);
-
-				channel->status = MUSB_DMA_STATUS_FREE;
-
-				/* completed */
-				if ((devctl & MUSB_DEVCTL_HM)
-					&& (musb_channel->transmit)
-					&& ((channel->desired_mode == 0)
-					    || (channel->actual_len &
-					    (musb_channel->max_packet_sz - 1)))
-				    ) {
-					u8  epnum  = musb_channel->epnum;
-					int offset = musb->io.ep_offset(epnum,
-								    MUSB_TXCSR);
-					u16 txcsr;
-
-					/*
-					 * The programming guide says that we
-					 * must clear DMAENAB before DMAMODE.
-					 */
-					musb_ep_select(mbase, epnum);
-					txcsr = musb_readw(mbase, offset);
-					txcsr &= ~(MUSB_TXCSR_DMAENAB
-							| MUSB_TXCSR_AUTOSET);
-					musb_writew(mbase, offset, txcsr);
-					/* Send out the packet */
-					txcsr &= ~MUSB_TXCSR_DMAMODE;
-					txcsr |=  MUSB_TXCSR_TXPKTRDY;
-					musb_writew(mbase, offset, txcsr);
-				}
-				musb_dma_completion(musb, musb_channel->epnum,
-						    musb_channel->transmit);
-			}
-		}
-	}
-
-	retval = IRQ_HANDLED;
-done:
-	spin_unlock_irqrestore(&musb->lock, flags);
-	return retval;
-}
-
-void musbhs_dma_controller_destroy(struct dma_controller *c)
+typedef struct _DIG_ENCODER_CONTROL_PARAMETERS_V2
 {
-	struct musb_dma_controller *controller = container_of(c,
-			struct musb_dma_controller, controller);
+  USHORT usPixelClock;      // in 10KHz; for bios convenient
+  ATOM_DIG_ENCODER_CONFIG_V2 acConfig;
+  UCHAR ucAction;
+  UCHAR ucEncoderMode;
+                            // =0: DP   encoder
+                            // =1: LVDS encoder
+                            // =2: DVI  encoder
+                            // =3: HDMI encoder
+                            // =4: SDVO encoder
+  UCHAR ucLaneNum;          // how many lanes to enable
+  UCHAR ucStatus;           // = DP_LINK_TRAINING_COMPLETE or DP_LINK_TRAINING_INCOMPLETE, only used by VBIOS with command ATOM_ENCODER_CMD_QUERY_DP_LINK_TRAINING_STATUS
+  UCHAR ucReserved;
+}DIG_ENCODER_CONTROL_PARAMETERS_V2;
 
-	dma_controller_stop(controller);
-
-	if (controller->irq)
-		free_irq(controller->irq, c);
-
-	kfree(controller);
-}
-EXPORT_SYMBOL_GPL(musbhs_dma_controller_destroy);
-
-struct dma_controller *musbhs_dma_controller_create(struct musb *musb,
-						    void __iomem *base)
-{
-	struct musb_dma_controller *controller;
-	struct device *dev = musb->controller;
-	struct platform_device *pdev = to_platform_device(dev);
-	int irq = platform_get_irq_byname(pdev, "dma");
-
-	if (irq <= 0) {
-		dev_err(dev, "No DMA interrupt line!\n");
-		return NULL;
-	}
-
-	controller = kzalloc(sizeof(*controller), GFP_KERNEL);
-	if (!controller)
-		return NULL;
-
-	controller->channel_count = MUSB_HSDMA_CHANNELS;
-	controller->private_data = musb;
-	controller->base = base;
-
-	controller->controller.channel_alloc = dma_channel_allocate;
-	controller->controller.channel_release = dma_channel_release;
-	controller->controller.channel_program = dma_channel_program;
-	controller->controller.channel_abort = dma_channel_abort;
-
-	if (request_irq(irq, dma_controller_irq, 0,
-			dev_name(musb->controller), controller)) {
-		dev_err(dev, "request_irq %d failed!\n", irq);
-		musb_dma_controller_destroy(&controller->controller);
-
-		return NULL;
-	}
-
-	controller->irq = irq;
-
-	return &controller->controller;
-}
-EXPORT_SYMBOL_GPL(musbhs_dma_controller_create);
+//ucConfig
+#define ATOM_ENCODER_CONFIG_V2_DPLINKRATE_MASK            0x01
+#define ATOM_ENCODER_CONFIG_V2_DPLINKRATE_1_62GHZ        0x00
+#define ATOM_ENCODER_CONFIG_V2_DPLINKRATE_2

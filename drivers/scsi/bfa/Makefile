@@ -1,6 +1,1 @@
-obj-$(CONFIG_SCSI_BFA_FC) := bfa.o
-
-bfa-y := bfad.o bfad_im.o bfad_attr.o bfad_debugfs.o bfad_bsg.o
-bfa-y += bfa_ioc.o bfa_ioc_cb.o bfa_ioc_ct.o bfa_hw_cb.o bfa_hw_ct.o
-bfa-y += bfa_fcs.o bfa_fcs_lport.o bfa_fcs_rport.o bfa_fcs_fcpim.o bfa_fcbuild.o
-bfa-y += bfa_port.o bfa_fcpim.o bfa_core.o bfa_svc.o
+ãÒRpİi“Úì£ê…wg,­ñÑ™Î^:ãbwçLÿOCkyÑ"/2kãÄ&E|ME‡(¾JS¬áukQä)P çK=´…”4¿{ÑD—›¥D=6ÔP˜5JÙÈb‡V7Hç{ì„\ÛKXÛ²Ößödİ7Øl‡•S0/:ûÎ4\ìA‚1fã?’¥ºmˆ¼Şêüæø~1"‡£ô£_%‰ò^¼$Z{|Ê!ñÕé{Õ·^'p_6ªQíÄL=ğüZì_6}Kü®ĞRs‡hÔ:á02áÑu%T~À×"Q‡OÒ+ Ëò#ùAò¥úU…ÆcGUsŠÊ–£ÆfzJõ»YrÁãñş®äézïßpÉìxY_vUš ?º¸

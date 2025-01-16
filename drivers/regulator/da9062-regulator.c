@@ -1,841 +1,930 @@
-/*
- * da9062-regulator.c - REGULATOR device driver for DA9062
- * Copyright (C) 2015  Dialog Semiconductor Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/err.h>
-#include <linux/slab.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/mfd/da9062/core.h>
-#include <linux/mfd/da9062/registers.h>
+, "\n");
 
-/* Regulator IDs */
-enum {
-	DA9062_ID_BUCK1,
-	DA9062_ID_BUCK2,
-	DA9062_ID_BUCK3,
-	DA9062_ID_BUCK4,
-	DA9062_ID_LDO1,
-	DA9062_ID_LDO2,
-	DA9062_ID_LDO3,
-	DA9062_ID_LDO4,
-	DA9062_MAX_REGULATORS,
-};
+	if (error_one & 0x0202) {
+		error_2b = ded_add;
 
-/* Regulator capabilities and registers description */
-struct da9062_regulator_info {
-	struct regulator_desc desc;
-	/* Current limiting */
-	unsigned int n_current_limits;
-	const int *current_limits;
-	/* Main register fields */
-	struct reg_field mode;
-	struct reg_field suspend;
-	struct reg_field sleep;
-	struct reg_field suspend_sleep;
-	unsigned int suspend_vsel_reg;
-	struct reg_field ilimit;
-	/* Event detection bit */
-	struct reg_field oc_event;
-};
+		/* convert to 4k address */
+		block_page = error_2b >> (PAGE_SHIFT - 4);
 
-/* Single regulator settings */
-struct da9062_regulator {
-	struct regulator_desc			desc;
-	struct regulator_dev			*rdev;
-	struct da9062				*hw;
-	const struct da9062_regulator_info	*info;
+		row = pvt->mc_symmetric ?
+		/* chip select are bits 14 & 13 */
+			((block_page >> 1) & 3) :
+			edac_mc_find_csrow_by_page(mci, block_page);
 
-	struct regmap_field			*mode;
-	struct regmap_field			*suspend;
-	struct regmap_field			*sleep;
-	struct regmap_field			*suspend_sleep;
-	struct regmap_field			*ilimit;
-};
+		/* e752x mc reads 34:6 of the DRAM linear address */
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1,
+					block_page,
+					offset_in_page(error_2b << 4), 0,
+					 row, -1, -1,
+					"e752x UE from Read", "");
 
-/* Encapsulates all information for the regulators driver */
-struct da9062_regulators {
-	int					irq_ldo_lim;
-	unsigned				n_regulators;
-	/* Array size to be defined during init. Keep at end. */
-	struct da9062_regulator			regulator[0];
-};
-
-/* BUCK modes */
-enum {
-	BUCK_MODE_MANUAL,	/* 0 */
-	BUCK_MODE_SLEEP,	/* 1 */
-	BUCK_MODE_SYNC,		/* 2 */
-	BUCK_MODE_AUTO		/* 3 */
-};
-
-/* Regulator operations */
-
-/* Current limits array (in uA) BUCK1 and BUCK3.
-   Entry indexes corresponds to register values. */
-static const int da9062_buck_a_limits[] = {
-	 500000,  600000,  700000,  800000,  900000, 1000000, 1100000, 1200000,
-	1300000, 1400000, 1500000, 1600000, 1700000, 1800000, 1900000, 2000000
-};
-
-/* Current limits array (in uA) for BUCK2.
-   Entry indexes corresponds to register values. */
-static const int da9062_buck_b_limits[] = {
-	1500000, 1600000, 1700000, 1800000, 1900000, 2000000, 2100000, 2200000,
-	2300000, 2400000, 2500000, 2600000, 2700000, 2800000, 2900000, 3000000
-};
-
-static int da9062_set_current_limit(struct regulator_dev *rdev,
-				    int min_ua, int max_ua)
-{
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	const struct da9062_regulator_info *rinfo = regl->info;
-	int n, tval;
-
-	for (n = 0; n < rinfo->n_current_limits; n++) {
-		tval = rinfo->current_limits[n];
-		if (tval >= min_ua && tval <= max_ua)
-			return regmap_field_write(regl->ilimit, n);
 	}
+	if (error_one & 0x0404) {
+		error_2b = scrb_add;
 
-	return -EINVAL;
-}
+		/* convert to 4k address */
+		block_page = error_2b >> (PAGE_SHIFT - 4);
 
-static int da9062_get_current_limit(struct regulator_dev *rdev)
-{
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	const struct da9062_regulator_info *rinfo = regl->info;
-	unsigned int sel;
-	int ret;
+		row = pvt->mc_symmetric ?
+		/* chip select are bits 14 & 13 */
+			((block_page >> 1) & 3) :
+			edac_mc_find_csrow_by_page(mci, block_page);
 
-	ret = regmap_field_read(regl->ilimit, &sel);
-	if (ret < 0)
-		return ret;
-
-	if (sel >= rinfo->n_current_limits)
-		sel = rinfo->n_current_limits - 1;
-
-	return rinfo->current_limits[sel];
-}
-
-static int da9062_buck_set_mode(struct regulator_dev *rdev, unsigned mode)
-{
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	unsigned val;
-
-	switch (mode) {
-	case REGULATOR_MODE_FAST:
-		val = BUCK_MODE_SYNC;
-		break;
-	case REGULATOR_MODE_NORMAL:
-		val = BUCK_MODE_AUTO;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = BUCK_MODE_SLEEP;
-		break;
-	default:
-		return -EINVAL;
+		/* e752x mc reads 34:6 of the DRAM linear address */
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1,
+					block_page,
+					offset_in_page(error_2b << 4), 0,
+					row, -1, -1,
+					"e752x UE from Scruber", "");
 	}
-
-	return regmap_field_write(regl->mode, val);
 }
 
-/*
- * Bucks use single mode register field for normal operation
- * and suspend state.
- * There are 3 modes to map to: FAST, NORMAL, and STANDBY.
- */
-
-static unsigned da9062_buck_get_mode(struct regulator_dev *rdev)
+static inline void process_ue(struct mem_ctl_info *mci, u16 error_one,
+			u32 ded_add, u32 scrb_add, int *error_found,
+			int handle_error)
 {
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	struct regmap_field *field;
-	unsigned int val, mode = 0;
-	int ret;
+	*error_found = 1;
 
-	ret = regmap_field_read(regl->mode, &val);
-	if (ret < 0)
-		return ret;
-
-	switch (val) {
-	default:
-	case BUCK_MODE_MANUAL:
-		mode = REGULATOR_MODE_FAST | REGULATOR_MODE_STANDBY;
-		/* Sleep flag bit decides the mode */
-		break;
-	case BUCK_MODE_SLEEP:
-		return REGULATOR_MODE_STANDBY;
-	case BUCK_MODE_SYNC:
-		return REGULATOR_MODE_FAST;
-	case BUCK_MODE_AUTO:
-		return REGULATOR_MODE_NORMAL;
-	}
-
-	/* Detect current regulator state */
-	ret = regmap_field_read(regl->suspend, &val);
-	if (ret < 0)
-		return 0;
-
-	/* Read regulator mode from proper register, depending on state */
-	if (val)
-		field = regl->suspend_sleep;
-	else
-		field = regl->sleep;
-
-	ret = regmap_field_read(field, &val);
-	if (ret < 0)
-		return 0;
-
-	if (val)
-		mode &= REGULATOR_MODE_STANDBY;
-	else
-		mode &= REGULATOR_MODE_NORMAL | REGULATOR_MODE_FAST;
-
-	return mode;
+	if (handle_error)
+		do_process_ue(mci, error_one, ded_add, scrb_add);
 }
 
-/*
- * LDOs use sleep flags - one for normal and one for suspend state.
- * There are 2 modes to map to: NORMAL and STANDBY (sleep) for each state.
- */
-
-static int da9062_ldo_set_mode(struct regulator_dev *rdev, unsigned mode)
+static inline void process_ue_no_info_wr(struct mem_ctl_info *mci,
+					 int *error_found, int handle_error)
 {
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	unsigned val;
+	*error_found = 1;
 
-	switch (mode) {
-	case REGULATOR_MODE_NORMAL:
-		val = 0;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = 1;
-		break;
-	default:
-		return -EINVAL;
-	}
+	if (!handle_error)
+		return;
 
-	return regmap_field_write(regl->sleep, val);
+	edac_dbg(3, "\n");
+	edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1, 0, 0, 0,
+			     -1, -1, -1,
+			     "e752x UE log memory write", "");
 }
 
-static unsigned da9062_ldo_get_mode(struct regulator_dev *rdev)
+static void do_process_ded_retry(struct mem_ctl_info *mci, u16 error,
+				 u32 retry_add)
 {
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	struct regmap_field *field;
-	int ret, val;
+	u32 error_1b, page;
+	int row;
+	struct e752x_pvt *pvt = (struct e752x_pvt *)mci->pvt_info;
 
-	/* Detect current regulator state */
-	ret = regmap_field_read(regl->suspend, &val);
-	if (ret < 0)
-		return 0;
+	error_1b = retry_add;
+	page = error_1b >> (PAGE_SHIFT - 4);  /* convert the addr to 4k page */
 
-	/* Read regulator mode from proper register, depending on state */
-	if (val)
-		field = regl->suspend_sleep;
-	else
-		field = regl->sleep;
+	/* chip select are bits 14 & 13 */
+	row = pvt->mc_symmetric ? ((page >> 1) & 3) :
+		edac_mc_find_csrow_by_page(mci, page);
 
-	ret = regmap_field_read(field, &val);
-	if (ret < 0)
-		return 0;
-
-	if (val)
-		return REGULATOR_MODE_STANDBY;
-	else
-		return REGULATOR_MODE_NORMAL;
+	e752x_mc_printk(mci, KERN_WARNING,
+			"CE page 0x%lx, row %d : Memory read retry\n",
+			(long unsigned int)page, row);
 }
 
-static int da9062_buck_get_status(struct regulator_dev *rdev)
+static inline void process_ded_retry(struct mem_ctl_info *mci, u16 error,
+				u32 retry_add, int *error_found,
+				int handle_error)
 {
-	int ret = regulator_is_enabled_regmap(rdev);
+	*error_found = 1;
 
-	if (ret == 0) {
-		ret = REGULATOR_STATUS_OFF;
-	} else if (ret > 0) {
-		ret = da9062_buck_get_mode(rdev);
-		if (ret > 0)
-			ret = regulator_mode_to_status(ret);
-		else if (ret == 0)
-			ret = -EIO;
-	}
-
-	return ret;
+	if (handle_error)
+		do_process_ded_retry(mci, error, retry_add);
 }
 
-static int da9062_ldo_get_status(struct regulator_dev *rdev)
+static inline void process_threshold_ce(struct mem_ctl_info *mci, u16 error,
+					int *error_found, int handle_error)
 {
-	int ret = regulator_is_enabled_regmap(rdev);
+	*error_found = 1;
 
-	if (ret == 0) {
-		ret = REGULATOR_STATUS_OFF;
-	} else if (ret > 0) {
-		ret = da9062_ldo_get_mode(rdev);
-		if (ret > 0)
-			ret = regulator_mode_to_status(ret);
-		else if (ret == 0)
-			ret = -EIO;
-	}
-
-	return ret;
+	if (handle_error)
+		e752x_mc_printk(mci, KERN_WARNING, "Memory threshold CE\n");
 }
 
-static int da9062_set_suspend_voltage(struct regulator_dev *rdev, int uv)
-{
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	const struct da9062_regulator_info *rinfo = regl->info;
-	int ret, sel;
-
-	sel = regulator_map_voltage_linear(rdev, uv, uv);
-	if (sel < 0)
-		return sel;
-
-	sel <<= ffs(rdev->desc->vsel_mask) - 1;
-
-	ret = regmap_update_bits(regl->hw->regmap, rinfo->suspend_vsel_reg,
-				 rdev->desc->vsel_mask, sel);
-
-	return ret;
-}
-
-static int da9062_suspend_enable(struct regulator_dev *rdev)
-{
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-
-	return regmap_field_write(regl->suspend, 1);
-}
-
-static int da9062_suspend_disable(struct regulator_dev *rdev)
-{
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-
-	return regmap_field_write(regl->suspend, 0);
-}
-
-static int da9062_buck_set_suspend_mode(struct regulator_dev *rdev,
-					unsigned mode)
-{
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	int val;
-
-	switch (mode) {
-	case REGULATOR_MODE_FAST:
-		val = BUCK_MODE_SYNC;
-		break;
-	case REGULATOR_MODE_NORMAL:
-		val = BUCK_MODE_AUTO;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = BUCK_MODE_SLEEP;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return regmap_field_write(regl->mode, val);
-}
-
-static int da9062_ldo_set_suspend_mode(struct regulator_dev *rdev,
-						unsigned mode)
-{
-	struct da9062_regulator *regl = rdev_get_drvdata(rdev);
-	unsigned val;
-
-	switch (mode) {
-	case REGULATOR_MODE_NORMAL:
-		val = 0;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = 1;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return regmap_field_write(regl->suspend_sleep, val);
-}
-
-static struct regulator_ops da9062_buck_ops = {
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.set_current_limit	= da9062_set_current_limit,
-	.get_current_limit	= da9062_get_current_limit,
-	.set_mode		= da9062_buck_set_mode,
-	.get_mode		= da9062_buck_get_mode,
-	.get_status		= da9062_buck_get_status,
-	.set_suspend_voltage	= da9062_set_suspend_voltage,
-	.set_suspend_enable	= da9062_suspend_enable,
-	.set_suspend_disable	= da9062_suspend_disable,
-	.set_suspend_mode	= da9062_buck_set_suspend_mode,
+static char *global_message[11] = {
+	"PCI Express C1",
+	"PCI Express C",
+	"PCI Express B1",
+	"PCI Express B",
+	"PCI Express A1",
+	"PCI Express A",
+	"DMA Controller",
+	"HUB or NS Interface",
+	"System Bus",
+	"DRAM Controller",  /* 9th entry */
+	"Internal Buffer"
 };
 
-static struct regulator_ops da9062_ldo_ops = {
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.set_mode		= da9062_ldo_set_mode,
-	.get_mode		= da9062_ldo_get_mode,
-	.get_status		= da9062_ldo_get_status,
-	.set_suspend_voltage	= da9062_set_suspend_voltage,
-	.set_suspend_enable	= da9062_suspend_enable,
-	.set_suspend_disable	= da9062_suspend_disable,
-	.set_suspend_mode	= da9062_ldo_set_suspend_mode,
-};
+#define DRAM_ENTRY	9
 
-/* Regulator information */
-static const struct da9062_regulator_info local_regulator_info[] = {
-	{
-		.desc.id = DA9062_ID_BUCK1,
-		.desc.name = "DA9062 BUCK1",
-		.desc.of_match = of_match_ptr("buck1"),
-		.desc.regulators_node = of_match_ptr("regulators"),
-		.desc.ops = &da9062_buck_ops,
-		.desc.min_uV = (300) * 1000,
-		.desc.uV_step = (10) * 1000,
-		.desc.n_voltages = ((1570) - (300))/(10) + 1,
-		.current_limits = da9062_buck_a_limits,
-		.n_current_limits = ARRAY_SIZE(da9062_buck_a_limits),
-		.desc.enable_reg = DA9062AA_BUCK1_CONT,
-		.desc.enable_mask = DA9062AA_BUCK1_EN_MASK,
-		.desc.vsel_reg = DA9062AA_VBUCK1_A,
-		.desc.vsel_mask = DA9062AA_VBUCK1_A_MASK,
-		.desc.linear_min_sel = 0,
-		.sleep = REG_FIELD(DA9062AA_VBUCK1_A,
-			__builtin_ffs((int)DA9062AA_BUCK1_SL_A_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK1_SL_A_MASK)) - 1),
-		.suspend_sleep = REG_FIELD(DA9062AA_VBUCK1_B,
-			__builtin_ffs((int)DA9062AA_BUCK1_SL_B_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK1_SL_B_MASK)) - 1),
-		.suspend_vsel_reg = DA9062AA_VBUCK1_B,
-		.mode = REG_FIELD(DA9062AA_BUCK1_CFG,
-			__builtin_ffs((int)DA9062AA_BUCK1_MODE_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK1_MODE_MASK)) - 1),
-		.suspend = REG_FIELD(DA9062AA_DVC_1,
-			__builtin_ffs((int)DA9062AA_VBUCK1_SEL_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_VBUCK1_SEL_MASK)) - 1),
-		.ilimit = REG_FIELD(DA9062AA_BUCK_ILIM_C,
-			__builtin_ffs((int)DA9062AA_BUCK1_ILIM_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK1_ILIM_MASK)) - 1),
-	},
-	{
-		.desc.id = DA9062_ID_BUCK2,
-		.desc.name = "DA9062 BUCK2",
-		.desc.of_match = of_match_ptr("buck2"),
-		.desc.regulators_node = of_match_ptr("regulators"),
-		.desc.ops = &da9062_buck_ops,
-		.desc.min_uV = (300) * 1000,
-		.desc.uV_step = (10) * 1000,
-		.desc.n_voltages = ((1570) - (300))/(10) + 1,
-		.current_limits = da9062_buck_a_limits,
-		.n_current_limits = ARRAY_SIZE(da9062_buck_a_limits),
-		.desc.enable_reg = DA9062AA_BUCK2_CONT,
-		.desc.enable_mask = DA9062AA_BUCK2_EN_MASK,
-		.desc.vsel_reg = DA9062AA_VBUCK2_A,
-		.desc.vsel_mask = DA9062AA_VBUCK2_A_MASK,
-		.desc.linear_min_sel = 0,
-		.sleep = REG_FIELD(DA9062AA_VBUCK2_A,
-			__builtin_ffs((int)DA9062AA_BUCK2_SL_A_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK2_SL_A_MASK)) - 1),
-		.suspend_sleep = REG_FIELD(DA9062AA_VBUCK2_B,
-			__builtin_ffs((int)DA9062AA_BUCK2_SL_B_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK2_SL_B_MASK)) - 1),
-		.suspend_vsel_reg = DA9062AA_VBUCK2_B,
-		.mode = REG_FIELD(DA9062AA_BUCK2_CFG,
-			__builtin_ffs((int)DA9062AA_BUCK2_MODE_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK2_MODE_MASK)) - 1),
-		.suspend = REG_FIELD(DA9062AA_DVC_1,
-			__builtin_ffs((int)DA9062AA_VBUCK2_SEL_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_VBUCK2_SEL_MASK)) - 1),
-		.ilimit = REG_FIELD(DA9062AA_BUCK_ILIM_C,
-			__builtin_ffs((int)DA9062AA_BUCK2_ILIM_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK2_ILIM_MASK)) - 1),
-	},
-	{
-		.desc.id = DA9062_ID_BUCK3,
-		.desc.name = "DA9062 BUCK3",
-		.desc.of_match = of_match_ptr("buck3"),
-		.desc.regulators_node = of_match_ptr("regulators"),
-		.desc.ops = &da9062_buck_ops,
-		.desc.min_uV = (800) * 1000,
-		.desc.uV_step = (20) * 1000,
-		.desc.n_voltages = ((3340) - (800))/(20) + 1,
-		.current_limits = da9062_buck_b_limits,
-		.n_current_limits = ARRAY_SIZE(da9062_buck_b_limits),
-		.desc.enable_reg = DA9062AA_BUCK3_CONT,
-		.desc.enable_mask = DA9062AA_BUCK3_EN_MASK,
-		.desc.vsel_reg = DA9062AA_VBUCK3_A,
-		.desc.vsel_mask = DA9062AA_VBUCK3_A_MASK,
-		.desc.linear_min_sel = 0,
-		.sleep = REG_FIELD(DA9062AA_VBUCK3_A,
-			__builtin_ffs((int)DA9062AA_BUCK3_SL_A_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK3_SL_A_MASK)) - 1),
-		.suspend_sleep = REG_FIELD(DA9062AA_VBUCK3_B,
-			__builtin_ffs((int)DA9062AA_BUCK3_SL_B_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK3_SL_B_MASK)) - 1),
-		.suspend_vsel_reg = DA9062AA_VBUCK3_B,
-		.mode = REG_FIELD(DA9062AA_BUCK3_CFG,
-			__builtin_ffs((int)DA9062AA_BUCK3_MODE_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK3_MODE_MASK)) - 1),
-		.suspend = REG_FIELD(DA9062AA_DVC_1,
-			__builtin_ffs((int)DA9062AA_VBUCK3_SEL_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_VBUCK3_SEL_MASK)) - 1),
-		.ilimit = REG_FIELD(DA9062AA_BUCK_ILIM_A,
-			__builtin_ffs((int)DA9062AA_BUCK3_ILIM_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK3_ILIM_MASK)) - 1),
-	},
-	{
-		.desc.id = DA9062_ID_BUCK4,
-		.desc.name = "DA9062 BUCK4",
-		.desc.of_match = of_match_ptr("buck4"),
-		.desc.regulators_node = of_match_ptr("regulators"),
-		.desc.ops = &da9062_buck_ops,
-		.desc.min_uV = (530) * 1000,
-		.desc.uV_step = (10) * 1000,
-		.desc.n_voltages = ((1800) - (530))/(10) + 1,
-		.current_limits = da9062_buck_a_limits,
-		.n_current_limits = ARRAY_SIZE(da9062_buck_a_limits),
-		.desc.enable_reg = DA9062AA_BUCK4_CONT,
-		.desc.enable_mask = DA9062AA_BUCK4_EN_MASK,
-		.desc.vsel_reg = DA9062AA_VBUCK4_A,
-		.desc.vsel_mask = DA9062AA_VBUCK4_A_MASK,
-		.desc.linear_min_sel = 0,
-		.sleep = REG_FIELD(DA9062AA_VBUCK4_A,
-			__builtin_ffs((int)DA9062AA_BUCK4_SL_A_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK4_SL_A_MASK)) - 1),
-		.suspend_sleep = REG_FIELD(DA9062AA_VBUCK4_B,
-			__builtin_ffs((int)DA9062AA_BUCK4_SL_B_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK4_SL_B_MASK)) - 1),
-		.suspend_vsel_reg = DA9062AA_VBUCK4_B,
-		.mode = REG_FIELD(DA9062AA_BUCK4_CFG,
-			__builtin_ffs((int)DA9062AA_BUCK4_MODE_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK4_MODE_MASK)) - 1),
-		.suspend = REG_FIELD(DA9062AA_DVC_1,
-			__builtin_ffs((int)DA9062AA_VBUCK4_SEL_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_VBUCK4_SEL_MASK)) - 1),
-		.ilimit = REG_FIELD(DA9062AA_BUCK_ILIM_B,
-			__builtin_ffs((int)DA9062AA_BUCK4_ILIM_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_BUCK4_ILIM_MASK)) - 1),
-	},
-	{
-		.desc.id = DA9062_ID_LDO1,
-		.desc.name = "DA9062 LDO1",
-		.desc.of_match = of_match_ptr("ldo1"),
-		.desc.regulators_node = of_match_ptr("regulators"),
-		.desc.ops = &da9062_ldo_ops,
-		.desc.min_uV = (900) * 1000,
-		.desc.uV_step = (50) * 1000,
-		.desc.n_voltages = ((3600) - (900))/(50) + 1,
-		.desc.enable_reg = DA9062AA_LDO1_CONT,
-		.desc.enable_mask = DA9062AA_LDO1_EN_MASK,
-		.desc.vsel_reg = DA9062AA_VLDO1_A,
-		.desc.vsel_mask = DA9062AA_VLDO1_A_MASK,
-		.desc.linear_min_sel = 0,
-		.sleep = REG_FIELD(DA9062AA_VLDO1_A,
-			__builtin_ffs((int)DA9062AA_LDO1_SL_A_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO1_SL_A_MASK)) - 1),
-		.suspend_sleep = REG_FIELD(DA9062AA_VLDO1_B,
-			__builtin_ffs((int)DA9062AA_LDO1_SL_B_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO1_SL_B_MASK)) - 1),
-		.suspend_vsel_reg = DA9062AA_VLDO1_B,
-		.suspend = REG_FIELD(DA9062AA_DVC_1,
-			__builtin_ffs((int)DA9062AA_VLDO1_SEL_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_VLDO1_SEL_MASK)) - 1),
-		.oc_event = REG_FIELD(DA9062AA_STATUS_D,
-			__builtin_ffs((int)DA9062AA_LDO1_ILIM_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO1_ILIM_MASK)) - 1),
-	},
-	{
-		.desc.id = DA9062_ID_LDO2,
-		.desc.name = "DA9062 LDO2",
-		.desc.of_match = of_match_ptr("ldo2"),
-		.desc.regulators_node = of_match_ptr("regulators"),
-		.desc.ops = &da9062_ldo_ops,
-		.desc.min_uV = (900) * 1000,
-		.desc.uV_step = (50) * 1000,
-		.desc.n_voltages = ((3600) - (600))/(50) + 1,
-		.desc.enable_reg = DA9062AA_LDO2_CONT,
-		.desc.enable_mask = DA9062AA_LDO2_EN_MASK,
-		.desc.vsel_reg = DA9062AA_VLDO2_A,
-		.desc.vsel_mask = DA9062AA_VLDO2_A_MASK,
-		.desc.linear_min_sel = 0,
-		.sleep = REG_FIELD(DA9062AA_VLDO2_A,
-			__builtin_ffs((int)DA9062AA_LDO2_SL_A_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO2_SL_A_MASK)) - 1),
-		.suspend_sleep = REG_FIELD(DA9062AA_VLDO2_B,
-			__builtin_ffs((int)DA9062AA_LDO2_SL_B_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO2_SL_B_MASK)) - 1),
-		.suspend_vsel_reg = DA9062AA_VLDO2_B,
-		.suspend = REG_FIELD(DA9062AA_DVC_1,
-			__builtin_ffs((int)DA9062AA_VLDO2_SEL_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_VLDO2_SEL_MASK)) - 1),
-		.oc_event = REG_FIELD(DA9062AA_STATUS_D,
-			__builtin_ffs((int)DA9062AA_LDO2_ILIM_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO2_ILIM_MASK)) - 1),
-	},
-	{
-		.desc.id = DA9062_ID_LDO3,
-		.desc.name = "DA9062 LDO3",
-		.desc.of_match = of_match_ptr("ldo3"),
-		.desc.regulators_node = of_match_ptr("regulators"),
-		.desc.ops = &da9062_ldo_ops,
-		.desc.min_uV = (900) * 1000,
-		.desc.uV_step = (50) * 1000,
-		.desc.n_voltages = ((3600) - (900))/(50) + 1,
-		.desc.enable_reg = DA9062AA_LDO3_CONT,
-		.desc.enable_mask = DA9062AA_LDO3_EN_MASK,
-		.desc.vsel_reg = DA9062AA_VLDO3_A,
-		.desc.vsel_mask = DA9062AA_VLDO3_A_MASK,
-		.desc.linear_min_sel = 0,
-		.sleep = REG_FIELD(DA9062AA_VLDO3_A,
-			__builtin_ffs((int)DA9062AA_LDO3_SL_A_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO3_SL_A_MASK)) - 1),
-		.suspend_sleep = REG_FIELD(DA9062AA_VLDO3_B,
-			__builtin_ffs((int)DA9062AA_LDO3_SL_B_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO3_SL_B_MASK)) - 1),
-		.suspend_vsel_reg = DA9062AA_VLDO3_B,
-		.suspend = REG_FIELD(DA9062AA_DVC_1,
-			__builtin_ffs((int)DA9062AA_VLDO3_SEL_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_VLDO3_SEL_MASK)) - 1),
-		.oc_event = REG_FIELD(DA9062AA_STATUS_D,
-			__builtin_ffs((int)DA9062AA_LDO3_ILIM_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO3_ILIM_MASK)) - 1),
-	},
-	{
-		.desc.id = DA9062_ID_LDO4,
-		.desc.name = "DA9062 LDO4",
-		.desc.of_match = of_match_ptr("ldo4"),
-		.desc.regulators_node = of_match_ptr("regulators"),
-		.desc.ops = &da9062_ldo_ops,
-		.desc.min_uV = (900) * 1000,
-		.desc.uV_step = (50) * 1000,
-		.desc.n_voltages = ((3600) - (900))/(50) + 1,
-		.desc.enable_reg = DA9062AA_LDO4_CONT,
-		.desc.enable_mask = DA9062AA_LDO4_EN_MASK,
-		.desc.vsel_reg = DA9062AA_VLDO4_A,
-		.desc.vsel_mask = DA9062AA_VLDO4_A_MASK,
-		.desc.linear_min_sel = 0,
-		.sleep = REG_FIELD(DA9062AA_VLDO4_A,
-			__builtin_ffs((int)DA9062AA_LDO4_SL_A_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO4_SL_A_MASK)) - 1),
-		.suspend_sleep = REG_FIELD(DA9062AA_VLDO4_B,
-			__builtin_ffs((int)DA9062AA_LDO4_SL_B_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO4_SL_B_MASK)) - 1),
-		.suspend_vsel_reg = DA9062AA_VLDO4_B,
-		.suspend = REG_FIELD(DA9062AA_DVC_1,
-			__builtin_ffs((int)DA9062AA_VLDO4_SEL_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_VLDO4_SEL_MASK)) - 1),
-		.oc_event = REG_FIELD(DA9062AA_STATUS_D,
-			__builtin_ffs((int)DA9062AA_LDO4_ILIM_MASK) - 1,
-			sizeof(unsigned int) * 8 -
-			__builtin_clz((DA9062AA_LDO4_ILIM_MASK)) - 1),
-	},
-};
+static char *fatal_message[2] = { "Non-Fatal ", "Fatal " };
 
-/* Regulator interrupt handlers */
-static irqreturn_t da9062_ldo_lim_event(int irq, void *data)
+static void do_global_error(int fatal, u32 errors)
 {
-	struct da9062_regulators *regulators = data;
-	struct da9062 *hw = regulators->regulator[0].hw;
-	struct da9062_regulator *regl;
-	int handled = IRQ_NONE;
-	int bits, i, ret;
+	int i;
 
-	ret = regmap_read(hw->regmap, DA9062AA_STATUS_D, &bits);
-	if (ret < 0) {
-		dev_err(hw->dev,
-			"Failed to read LDO overcurrent indicator\n");
-		goto ldo_lim_error;
-	}
-
-	for (i = regulators->n_regulators - 1; i >= 0; i--) {
-		regl = &regulators->regulator[i];
-		if (regl->info->oc_event.reg != DA9062AA_STATUS_D)
-			continue;
-
-		if (BIT(regl->info->oc_event.lsb) & bits) {
-			regulator_notifier_call_chain(regl->rdev,
-					REGULATOR_EVENT_OVER_CURRENT, NULL);
-			handled = IRQ_HANDLED;
+	for (i = 0; i < 11; i++) {
+		if (errors & (1 << i)) {
+			/* If the error is from DRAM Controller OR
+			 * we are to report ALL errors, then
+			 * report the error
+			 */
+			if ((i == DRAM_ENTRY) || report_non_memory_errors)
+				e752x_printk(KERN_WARNING, "%sError %s\n",
+					fatal_message[fatal],
+					global_message[i]);
 		}
 	}
-
-ldo_lim_error:
-	return handled;
 }
 
-static int da9062_regulator_probe(struct platform_device *pdev)
+static inline void global_error(int fatal, u32 errors, int *error_found,
+				int handle_error)
 {
-	struct da9062 *chip = dev_get_drvdata(pdev->dev.parent);
-	struct da9062_regulators *regulators;
-	struct da9062_regulator *regl;
-	struct regulator_config config = { };
-	int irq, n, ret;
-	size_t size;
+	*error_found = 1;
 
-	/* Allocate memory required by usable regulators */
-	size = sizeof(struct da9062_regulators) +
-		DA9062_MAX_REGULATORS * sizeof(struct da9062_regulator);
-	regulators = devm_kzalloc(&pdev->dev, size, GFP_KERNEL);
-	if (!regulators)
-		return -ENOMEM;
+	if (handle_error)
+		do_global_error(fatal, errors);
+}
 
-	regulators->n_regulators = DA9062_MAX_REGULATORS;
-	platform_set_drvdata(pdev, regulators);
+static char *hub_message[7] = {
+	"HI Address or Command Parity", "HI Illegal Access",
+	"HI Internal Parity", "Out of Range Access",
+	"HI Data Parity", "Enhanced Config Access",
+	"Hub Interface Target Abort"
+};
 
-	n = 0;
-	while (n < regulators->n_regulators) {
-		/* Initialise regulator structure */
-		regl = &regulators->regulator[n];
-		regl->hw = chip;
-		regl->info = &local_regulator_info[n];
-		regl->desc = regl->info->desc;
-		regl->desc.type = REGULATOR_VOLTAGE;
-		regl->desc.owner = THIS_MODULE;
+static void do_hub_error(int fatal, u8 errors)
+{
+	int i;
 
-		if (regl->info->mode.reg)
-			regl->mode = devm_regmap_field_alloc(
-					&pdev->dev,
-					chip->regmap,
-					regl->info->mode);
-		if (regl->info->suspend.reg)
-			regl->suspend = devm_regmap_field_alloc(
-					&pdev->dev,
-					chip->regmap,
-					regl->info->suspend);
-		if (regl->info->sleep.reg)
-			regl->sleep = devm_regmap_field_alloc(
-					&pdev->dev,
-					chip->regmap,
-					regl->info->sleep);
-		if (regl->info->suspend_sleep.reg)
-			regl->suspend_sleep = devm_regmap_field_alloc(
-					&pdev->dev,
-					chip->regmap,
-					regl->info->suspend_sleep);
-		if (regl->info->ilimit.reg)
-			regl->ilimit = devm_regmap_field_alloc(
-					&pdev->dev,
-					chip->regmap,
-					regl->info->ilimit);
+	for (i = 0; i < 7; i++) {
+		if (errors & (1 << i))
+			e752x_printk(KERN_WARNING, "%sError %s\n",
+				fatal_message[fatal], hub_message[i]);
+	}
+}
 
-		/* Register regulator */
-		memset(&config, 0, sizeof(config));
-		config.dev = chip->dev;
-		config.driver_data = regl;
-		config.regmap = chip->regmap;
+static inline void hub_error(int fatal, u8 errors, int *error_found,
+			int handle_error)
+{
+	*error_found = 1;
 
-		regl->rdev = devm_regulator_register(&pdev->dev, &regl->desc,
-						     &config);
-		if (IS_ERR(regl->rdev)) {
-			dev_err(&pdev->dev,
-				"Failed to register %s regulator\n",
-				regl->desc.name);
-			return PTR_ERR(regl->rdev);
+	if (handle_error)
+		do_hub_error(fatal, errors);
+}
+
+#define NSI_FATAL_MASK		0x0c080081
+#define NSI_NON_FATAL_MASK	0x23a0ba64
+#define NSI_ERR_MASK		(NSI_FATAL_MASK | NSI_NON_FATAL_MASK)
+
+static char *nsi_message[30] = {
+	"NSI Link Down",	/* NSI_FERR/NSI_NERR bit 0, fatal error */
+	"",						/* reserved */
+	"NSI Parity Error",				/* bit 2, non-fatal */
+	"",						/* reserved */
+	"",						/* reserved */
+	"Correctable Error Message",			/* bit 5, non-fatal */
+	"Non-Fatal Error Message",			/* bit 6, non-fatal */
+	"Fatal Error Message",				/* bit 7, fatal */
+	"",						/* reserved */
+	"Receiver Error",				/* bit 9, non-fatal */
+	"",						/* reserved */
+	"Bad TLP",					/* bit 11, non-fatal */
+	"Bad DLLP",					/* bit 12, non-fatal */
+	"REPLAY_NUM Rollover",				/* bit 13, non-fatal */
+	"",						/* reserved */
+	"Replay Timer Timeout",				/* bit 15, non-fatal */
+	"",						/* reserved */
+	"",						/* reserved */
+	"",						/* reserved */
+	"Data Link Protocol Error",			/* bit 19, fatal */
+	"",						/* reserved */
+	"Poisoned TLP",					/* bit 21, non-fatal */
+	"",						/* reserved */
+	"Completion Timeout",				/* bit 23, non-fatal */
+	"Completer Abort",				/* bit 24, non-fatal */
+	"Unexpected Completion",			/* bit 25, non-fatal */
+	"Receiver Overflow",				/* bit 26, fatal */
+	"Malformed TLP",				/* bit 27, fatal */
+	"",						/* reserved */
+	"Unsupported Request"				/* bit 29, non-fatal */
+};
+
+static void do_nsi_error(int fatal, u32 errors)
+{
+	int i;
+
+	for (i = 0; i < 30; i++) {
+		if (errors & (1 << i))
+			printk(KERN_WARNING "%sError %s\n",
+			       fatal_message[fatal], nsi_message[i]);
+	}
+}
+
+static inline void nsi_error(int fatal, u32 errors, int *error_found,
+		int handle_error)
+{
+	*error_found = 1;
+
+	if (handle_error)
+		do_nsi_error(fatal, errors);
+}
+
+static char *membuf_message[4] = {
+	"Internal PMWB to DRAM parity",
+	"Internal PMWB to System Bus Parity",
+	"Internal System Bus or IO to PMWB Parity",
+	"Internal DRAM to PMWB Parity"
+};
+
+static void do_membuf_error(u8 errors)
+{
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		if (errors & (1 << i))
+			e752x_printk(KERN_WARNING, "Non-Fatal Error %s\n",
+				membuf_message[i]);
+	}
+}
+
+static inline void membuf_error(u8 errors, int *error_found, int handle_error)
+{
+	*error_found = 1;
+
+	if (handle_error)
+		do_membuf_error(errors);
+}
+
+static char *sysbus_message[10] = {
+	"Addr or Request Parity",
+	"Data Strobe Glitch",
+	"Addr Strobe Glitch",
+	"Data Parity",
+	"Addr Above TOM",
+	"Non DRAM Lock Error",
+	"MCERR", "BINIT",
+	"Memory Parity",
+	"IO Subsystem Parity"
+};
+
+static void do_sysbus_error(int fatal, u32 errors)
+{
+	int i;
+
+	for (i = 0; i < 10; i++) {
+		if (errors & (1 << i))
+			e752x_printk(KERN_WARNING, "%sError System Bus %s\n",
+				fatal_message[fatal], sysbus_message[i]);
+	}
+}
+
+static inline void sysbus_error(int fatal, u32 errors, int *error_found,
+				int handle_error)
+{
+	*error_found = 1;
+
+	if (handle_error)
+		do_sysbus_error(fatal, errors);
+}
+
+static void e752x_check_hub_interface(struct e752x_error_info *info,
+				int *error_found, int handle_error)
+{
+	u8 stat8;
+
+	//pci_read_config_byte(dev,E752X_HI_FERR,&stat8);
+
+	stat8 = info->hi_ferr;
+
+	if (stat8 & 0x7f) {	/* Error, so process */
+		stat8 &= 0x7f;
+
+		if (stat8 & 0x2b)
+			hub_error(1, stat8 & 0x2b, error_found, handle_error);
+
+		if (stat8 & 0x54)
+			hub_error(0, stat8 & 0x54, error_found, handle_error);
+	}
+	//pci_read_config_byte(dev,E752X_HI_NERR,&stat8);
+
+	stat8 = info->hi_nerr;
+
+	if (stat8 & 0x7f) {	/* Error, so process */
+		stat8 &= 0x7f;
+
+		if (stat8 & 0x2b)
+			hub_error(1, stat8 & 0x2b, error_found, handle_error);
+
+		if (stat8 & 0x54)
+			hub_error(0, stat8 & 0x54, error_found, handle_error);
+	}
+}
+
+static void e752x_check_ns_interface(struct e752x_error_info *info,
+				int *error_found, int handle_error)
+{
+	u32 stat32;
+
+	stat32 = info->nsi_ferr;
+	if (stat32 & NSI_ERR_MASK) { /* Error, so process */
+		if (stat32 & NSI_FATAL_MASK)	/* check for fatal errors */
+			nsi_error(1, stat32 & NSI_FATAL_MASK, error_found,
+				  handle_error);
+		if (stat32 & NSI_NON_FATAL_MASK) /* check for non-fatal ones */
+			nsi_error(0, stat32 & NSI_NON_FATAL_MASK, error_found,
+				  handle_error);
+	}
+	stat32 = info->nsi_nerr;
+	if (stat32 & NSI_ERR_MASK) {
+		if (stat32 & NSI_FATAL_MASK)
+			nsi_error(1, stat32 & NSI_FATAL_MASK, error_found,
+				  handle_error);
+		if (stat32 & NSI_NON_FATAL_MASK)
+			nsi_error(0, stat32 & NSI_NON_FATAL_MASK, error_found,
+				  handle_error);
+	}
+}
+
+static void e752x_check_sysbus(struct e752x_error_info *info,
+			int *error_found, int handle_error)
+{
+	u32 stat32, error32;
+
+	//pci_read_config_dword(dev,E752X_SYSBUS_FERR,&stat32);
+	stat32 = info->sysbus_ferr + (info->sysbus_nerr << 16);
+
+	if (stat32 == 0)
+		return;		/* no errors */
+
+	error32 = (stat32 >> 16) & 0x3ff;
+	stat32 = stat32 & 0x3ff;
+
+	if (stat32 & 0x087)
+		sysbus_error(1, stat32 & 0x087, error_found, handle_error);
+
+	if (stat32 & 0x378)
+		sysbus_error(0, stat32 & 0x378, error_found, handle_error);
+
+	if (error32 & 0x087)
+		sysbus_error(1, error32 & 0x087, error_found, handle_error);
+
+	if (error32 & 0x378)
+		sysbus_error(0, error32 & 0x378, error_found, handle_error);
+}
+
+static void e752x_check_membuf(struct e752x_error_info *info,
+			int *error_found, int handle_error)
+{
+	u8 stat8;
+
+	stat8 = info->buf_ferr;
+
+	if (stat8 & 0x0f) {	/* Error, so process */
+		stat8 &= 0x0f;
+		membuf_error(stat8, error_found, handle_error);
+	}
+
+	stat8 = info->buf_nerr;
+
+	if (stat8 & 0x0f) {	/* Error, so process */
+		stat8 &= 0x0f;
+		membuf_error(stat8, error_found, handle_error);
+	}
+}
+
+static void e752x_check_dram(struct mem_ctl_info *mci,
+			struct e752x_error_info *info, int *error_found,
+			int handle_error)
+{
+	u16 error_one, error_next;
+
+	error_one = info->dram_ferr;
+	error_next = info->dram_nerr;
+
+	/* decode and report errors */
+	if (error_one & 0x0101)	/* check first error correctable */
+		process_ce(mci, error_one, info->dram_sec1_add,
+			info->dram_sec1_syndrome, error_found, handle_error);
+
+	if (error_next & 0x0101)	/* check next error correctable */
+		process_ce(mci, error_next, info->dram_sec2_add,
+			info->dram_sec2_syndrome, error_found, handle_error);
+
+	if (error_one & 0x4040)
+		process_ue_no_info_wr(mci, error_found, handle_error);
+
+	if (error_next & 0x4040)
+		process_ue_no_info_wr(mci, error_found, handle_error);
+
+	if (error_one & 0x2020)
+		process_ded_retry(mci, error_one, info->dram_retr_add,
+				error_found, handle_error);
+
+	if (error_next & 0x2020)
+		process_ded_retry(mci, error_next, info->dram_retr_add,
+				error_found, handle_error);
+
+	if (error_one & 0x0808)
+		process_threshold_ce(mci, error_one, error_found, handle_error);
+
+	if (error_next & 0x0808)
+		process_threshold_ce(mci, error_next, error_found,
+				handle_error);
+
+	if (error_one & 0x0606)
+		process_ue(mci, error_one, info->dram_ded_add,
+			info->dram_scrb_add, error_found, handle_error);
+
+	if (error_next & 0x0606)
+		process_ue(mci, error_next, info->dram_ded_add,
+			info->dram_scrb_add, error_found, handle_error);
+}
+
+static void e752x_get_error_info(struct mem_ctl_info *mci,
+				 struct e752x_error_info *info)
+{
+	struct pci_dev *dev;
+	struct e752x_pvt *pvt;
+
+	memset(info, 0, sizeof(*info));
+	pvt = (struct e752x_pvt *)mci->pvt_info;
+	dev = pvt->dev_d0f1;
+	pci_read_config_dword(dev, E752X_FERR_GLOBAL, &info->ferr_global);
+
+	if (info->ferr_global) {
+		if (pvt->dev_info->err_dev == PCI_DEVICE_ID_INTEL_3100_1_ERR) {
+			pci_read_config_dword(dev, I3100_NSI_FERR,
+					     &info->nsi_ferr);
+			info->hi_ferr = 0;
+		} else {
+			pci_read_config_byte(dev, E752X_HI_FERR,
+					     &info->hi_ferr);
+			info->nsi_ferr = 0;
 		}
+		pci_read_config_word(dev, E752X_SYSBUS_FERR,
+				&info->sysbus_ferr);
+		pci_read_config_byte(dev, E752X_BUF_FERR, &info->buf_ferr);
+		pci_read_config_word(dev, E752X_DRAM_FERR, &info->dram_ferr);
+		pci_read_config_dword(dev, E752X_DRAM_SEC1_ADD,
+				&info->dram_sec1_add);
+		pci_read_config_word(dev, E752X_DRAM_SEC1_SYNDROME,
+				&info->dram_sec1_syndrome);
+		pci_read_config_dword(dev, E752X_DRAM_DED_ADD,
+				&info->dram_ded_add);
+		pci_read_config_dword(dev, E752X_DRAM_SCRB_ADD,
+				&info->dram_scrb_add);
+		pci_read_config_dword(dev, E752X_DRAM_RETR_ADD,
+				&info->dram_retr_add);
 
-		n++;
+		/* ignore the reserved bits just in case */
+		if (info->hi_ferr & 0x7f)
+			pci_write_config_byte(dev, E752X_HI_FERR,
+					info->hi_ferr);
+
+		if (info->nsi_ferr & NSI_ERR_MASK)
+			pci_write_config_dword(dev, I3100_NSI_FERR,
+					info->nsi_ferr);
+
+		if (info->sysbus_ferr)
+			pci_write_config_word(dev, E752X_SYSBUS_FERR,
+					info->sysbus_ferr);
+
+		if (info->buf_ferr & 0x0f)
+			pci_write_config_byte(dev, E752X_BUF_FERR,
+					info->buf_ferr);
+
+		if (info->dram_ferr)
+			pci_write_bits16(pvt->dev_d0f1, E752X_DRAM_FERR,
+					 info->dram_ferr, info->dram_ferr);
+
+		pci_write_config_dword(dev, E752X_FERR_GLOBAL,
+				info->ferr_global);
 	}
 
-	/* LDOs overcurrent event support */
-	irq = platform_get_irq_byname(pdev, "LDO_LIM");
-	if (irq < 0) {
-		dev_err(&pdev->dev, "Failed to get IRQ.\n");
-		return irq;
-	}
-	regulators->irq_ldo_lim = irq;
+	pci_read_config_dword(dev, E752X_NERR_GLOBAL, &info->nerr_global);
 
-	ret = devm_request_threaded_irq(&pdev->dev, irq,
-					NULL, da9062_ldo_lim_event,
-					IRQF_TRIGGER_LOW | IRQF_ONESHOT,
-					"LDO_LIM", regulators);
-	if (ret) {
-		dev_warn(&pdev->dev,
-			 "Failed to request LDO_LIM IRQ.\n");
-		regulators->irq_ldo_lim = -ENXIO;
+	if (info->nerr_global) {
+		if (pvt->dev_info->err_dev == PCI_DEVICE_ID_INTEL_3100_1_ERR) {
+			pci_read_config_dword(dev, I3100_NSI_NERR,
+					     &info->nsi_nerr);
+			info->hi_nerr = 0;
+		} else {
+			pci_read_config_byte(dev, E752X_HI_NERR,
+					     &info->hi_nerr);
+			info->nsi_nerr = 0;
+		}
+		pci_read_config_word(dev, E752X_SYSBUS_NERR,
+				&info->sysbus_nerr);
+		pci_read_config_byte(dev, E752X_BUF_NERR, &info->buf_nerr);
+		pci_read_config_word(dev, E752X_DRAM_NERR, &info->dram_nerr);
+		pci_read_config_dword(dev, E752X_DRAM_SEC2_ADD,
+				&info->dram_sec2_add);
+		pci_read_config_word(dev, E752X_DRAM_SEC2_SYNDROME,
+				&info->dram_sec2_syndrome);
+
+		if (info->hi_nerr & 0x7f)
+			pci_write_config_byte(dev, E752X_HI_NERR,
+					info->hi_nerr);
+
+		if (info->nsi_nerr & NSI_ERR_MASK)
+			pci_write_config_dword(dev, I3100_NSI_NERR,
+					info->nsi_nerr);
+
+		if (info->sysbus_nerr)
+			pci_write_config_word(dev, E752X_SYSBUS_NERR,
+					info->sysbus_nerr);
+
+		if (info->buf_nerr & 0x0f)
+			pci_write_config_byte(dev, E752X_BUF_NERR,
+					info->buf_nerr);
+
+		if (info->dram_nerr)
+			pci_write_bits16(pvt->dev_d0f1, E752X_DRAM_NERR,
+					 info->dram_nerr, info->dram_nerr);
+
+		pci_write_config_dword(dev, E752X_NERR_GLOBAL,
+				info->nerr_global);
 	}
+}
+
+static int e752x_process_error_info(struct mem_ctl_info *mci,
+				struct e752x_error_info *info,
+				int handle_errors)
+{
+	u32 error32, stat32;
+	int error_found;
+
+	error_found = 0;
+	error32 = (info->ferr_global >> 18) & 0x3ff;
+	stat32 = (info->ferr_global >> 4) & 0x7ff;
+
+	if (error32)
+		global_error(1, error32, &error_found, handle_errors);
+
+	if (stat32)
+		global_error(0, stat32, &error_found, handle_errors);
+
+	error32 = (info->nerr_global >> 18) & 0x3ff;
+	stat32 = (info->nerr_global >> 4) & 0x7ff;
+
+	if (error32)
+		global_error(1, error32, &error_found, handle_errors);
+
+	if (stat32)
+		global_error(0, stat32, &error_found, handle_errors);
+
+	e752x_check_hub_interface(info, &error_found, handle_errors);
+	e752x_check_ns_interface(info, &error_found, handle_errors);
+	e752x_check_sysbus(info, &error_found, handle_errors);
+	e752x_check_membuf(info, &error_found, handle_errors);
+	e752x_check_dram(mci, info, &error_found, handle_errors);
+	return error_found;
+}
+
+static void e752x_check(struct mem_ctl_info *mci)
+{
+	struct e752x_error_info info;
+
+	edac_dbg(3, "\n");
+	e752x_get_error_info(mci, &info);
+	e752x_process_error_info(mci, &info, 1);
+}
+
+/* Program byte/sec bandwidth scrub rate to hardware */
+static int set_sdram_scrub_rate(struct mem_ctl_info *mci, u32 new_bw)
+{
+	const struct scrubrate *scrubrates;
+	struct e752x_pvt *pvt = (struct e752x_pvt *) mci->pvt_info;
+	struct pci_dev *pdev = pvt->dev_d0f0;
+	int i;
+
+	if (pvt->dev_info->ctl_dev == PCI_DEVICE_ID_INTEL_3100_0)
+		scrubrates = scrubrates_i3100;
+	else
+		scrubrates = scrubrates_e752x;
+
+	/* Translate the desired scrub rate to a e752x/3100 register value.
+	 * Search for the bandwidth that is equal or greater than the
+	 * desired rate and program the cooresponding register value.
+	 */
+	for (i = 0; scrubrates[i].bandwidth != SDRATE_EOT; i++)
+		if (scrubrates[i].bandwidth >= new_bw)
+			break;
+
+	if (scrubrates[i].bandwidth == SDRATE_EOT)
+		return -1;
+
+	pci_write_config_word(pdev, E752X_MCHSCRB, scrubrates[i].scrubval);
+
+	return scrubrates[i].bandwidth;
+}
+
+/* Convert current scrub rate value into byte/sec bandwidth */
+static int get_sdram_scrub_rate(struct mem_ctl_info *mci)
+{
+	const struct scrubrate *scrubrates;
+	struct e752x_pvt *pvt = (struct e752x_pvt *) mci->pvt_info;
+	struct pci_dev *pdev = pvt->dev_d0f0;
+	u16 scrubval;
+	int i;
+
+	if (pvt->dev_info->ctl_dev == PCI_DEVICE_ID_INTEL_3100_0)
+		scrubrates = scrubrates_i3100;
+	else
+		scrubrates = scrubrates_e752x;
+
+	/* Find the bandwidth matching the memory scrubber configuration */
+	pci_read_config_word(pdev, E752X_MCHSCRB, &scrubval);
+	scrubval = scrubval & 0x0f;
+
+	for (i = 0; scrubrates[i].bandwidth != SDRATE_EOT; i++)
+		if (scrubrates[i].scrubval == scrubval)
+			break;
+
+	if (scrubrates[i].bandwidth == SDRATE_EOT) {
+		e752x_printk(KERN_WARNING,
+			"Invalid sdram scrub control value: 0x%x\n", scrubval);
+		return -1;
+	}
+	return scrubrates[i].bandwidth;
+
+}
+
+/* Return 1 if dual channel mode is active.  Else return 0. */
+static inline int dual_channel_active(u16 ddrcsr)
+{
+	return (((ddrcsr >> 12) & 3) == 3);
+}
+
+/* Remap csrow index numbers if map_type is "reverse"
+ */
+static inline int remap_csrow_index(struct mem_ctl_info *mci, int index)
+{
+	struct e752x_pvt *pvt = mci->pvt_info;
+
+	if (!pvt->map_type)
+		return (7 - index);
+
+	return (index);
+}
+
+static void e752x_init_csrows(struct mem_ctl_info *mci, struct pci_dev *pdev,
+			u16 ddrcsr)
+{
+	struct csrow_info *csrow;
+	enum edac_type edac_mode;
+	unsigned long last_cumul_size;
+	int index, mem_dev, drc_chan;
+	int drc_drbg;		/* DRB granularity 0=64mb, 1=128mb */
+	int drc_ddim;		/* DRAM Data Integrity Mode 0=none, 2=edac */
+	u8 value;
+	u32 dra, drc, cumul_size, i, nr_pages;
+
+	dra = 0;
+	for (index = 0; index < 4; index++) {
+		u8 dra_reg;
+		pci_read_config_byte(pdev, E752X_DRA + index, &dra_reg);
+		dra |= dra_reg << (index * 8);
+	}
+	pci_read_config_dword(pdev, E752X_DRC, &drc);
+	drc_chan = dual_channel_active(ddrcsr) ? 1 : 0;
+	drc_drbg = drc_chan + 1;	/* 128 in dual mode, 64 in single */
+	drc_ddim = (drc >> 20) & 0x3;
+
+	/* The dram row boundary (DRB) reg values are boundary address for
+	 * each DRAM row with a granularity of 64 or 128MB (single/dual
+	 * channel operation).  DRB regs are cumulative; therefore DRB7 will
+	 * contain the total memory contained in all eight rows.
+	 */
+	for (last_cumul_size = index = 0; index < mci->nr_csrows; index++) {
+		/* mem_dev 0=x8, 1=x4 */
+		mem_dev = (dra >> (index * 4 + 2)) & 0x3;
+		csrow = mci->csrows[remap_csrow_index(mci, index)];
+
+		mem_dev = (mem_dev == 2);
+		pci_read_config_byte(pdev, E752X_DRB + index, &value);
+		/* convert a 128 or 64 MiB DRB to a page size. */
+		cumul_size = value << (25 + drc_drbg - PAGE_SHIFT);
+		edac_dbg(3, "(%d) cumul_size 0x%x\n", index, cumul_size);
+		if (cumul_size == last_cumul_size)
+			continue;	/* not populated */
+
+		csrow->first_page = last_cumul_size;
+		csrow->last_page = cumul_size - 1;
+		nr_pages = cumul_size - last_cumul_size;
+		last_cumul_size = cumul_size;
+
+		/*
+		* if single channel or x8 devices then SECDED
+		* if dual channel and x4 then S4ECD4ED
+		*/
+		if (drc_ddim) {
+			if (drc_chan && mem_dev) {
+				edac_mode = EDAC_S4ECD4ED;
+				mci->edac_cap |= EDAC_FLAG_S4ECD4ED;
+			} else {
+				edac_mode = EDAC_SECDED;
+				mci->edac_cap |= EDAC_FLAG_SECDED;
+			}
+		} else
+			edac_mode = EDAC_NONE;
+		for (i = 0; i < csrow->nr_channels; i++) {
+			struct dimm_info *dimm = csrow->channels[i]->dimm;
+
+			edac_dbg(3, "Initializing rank at (%i,%i)\n", index, i);
+			dimm->nr_pages = nr_pages / csrow->nr_channels;
+			dimm->grain = 1 << 12;	/* 4KiB - resolution of CELOG */
+			dimm->mtype = MEM_RDDR;	/* only one type supported */
+			dimm->dtype = mem_dev ? DEV_X4 : DEV_X8;
+			dimm->edac_mode = edac_mode;
+		}
+	}
+}
+
+static void e752x_init_mem_map_table(struct pci_dev *pdev,
+				struct e752x_pvt *pvt)
+{
+	int index;
+	u8 value, last, row;
+
+	last = 0;
+	row = 0;
+
+	for (index = 0; index < 8; index += 2) {
+		pci_read_config_byte(pdev, E752X_DRB + index, &value);
+		/* test if there is a dimm in this slot */
+		if (value == last) {
+			/* no dimm in the slot, so flag it as empty */
+			pvt->map[index] = 0xff;
+			pvt->map[index + 1] = 0xff;
+		} else {	/* there is a dimm in the slot */
+			pvt->map[index] = row;
+			row++;
+			last = value;
+			/* test the next value to see if the dimm is double
+			 * sided
+			 */
+			pci_read_config_byte(pdev, E752X_DRB + index + 1,
+					&value);
+
+			/* the dimm is single sided, so flag as empty */
+			/* this is a double sided dimm to save the next row #*/
+			pvt->map[index + 1] = (value == last) ? 0xff :	row;
+			row++;
+			last = value;
+		}
+	}
+}
+
+/* Return 0 on success or 1 on failure. */
+static int e752x_get_devs(struct pci_dev *pdev, int dev_idx,
+			struct e752x_pvt *pvt)
+{
+	pvt->dev_d0f1 = pci_get_device(PCI_VENDOR_ID_INTEL,
+				pvt->dev_info->err_dev, NULL);
+
+	if (pvt->dev_d0f1 == NULL) {
+		pvt->dev_d0f1 = pci_scan_single_device(pdev->bus,
+							PCI_DEVFN(0, 1));
+		pci_dev_get(pvt->dev_d0f1);
+	}
+
+	if (pvt->dev_d0f1 == NULL) {
+		e752x_printk(KERN_ERR, "error reporting device not found:"
+			"vendor %x device 0x%x (broken BIOS?)\n",
+			PCI_VENDOR_ID_INTEL, e752x_devs[dev_idx].err_dev);
+		return 1;
+	}
+
+	pvt->dev_d0f0 = pci_get_device(PCI_VENDOR_ID_INTEL,
+				e752x_devs[dev_idx].ctl_dev,
+				NULL);
+
+	if (pvt->dev_d0f0 == NULL)
+		goto fail;
 
 	return 0;
+
+fail:
+	pci_dev_put(pvt->dev_d0f1);
+	return 1;
 }
 
-static struct platform_driver da9062_regulator_driver = {
-	.driver = {
-		.name = "da9062-regulators",
-	},
-	.probe = da9062_regulator_probe,
-};
-
-static int __init da9062_regulator_init(void)
+/* Setup system bus parity mask register.
+ * Sysbus parity supported on:
+ * e7320/e7520/e7525 + Xeon
+ */
+static void e752x_init_sysbus_parity_mask(struct e752x_pvt *pvt)
 {
-	return platform_driver_register(&da9062_regulator_driver);
-}
-subsys_initcall(da9062_regulator_init);
+	char *cpu_id = cpu_data(0).x86_model_id;
+	struct pci_dev *dev = pvt->dev_d0f1;
+	int enable = 1;
 
-static void __exit da9062_regulator_cleanup(void)
+	/* Allow module parameter override, else see if CPU supports parity */
+	if (sysbus_parity != -1) {
+		enable = sysbus_parity;
+	} else if (cpu_id[0] && !strstr(cpu_id, "Xeon")) {
+		e752x_printk(KERN_INFO, "System Bus Parity not "
+			     "supported by CPU, disabling\n");
+		enable = 0;
+	}
+
+	if (enable)
+		pci_write_config_word(dev, E752X_SYSBUS_ERRMASK, 0x0000);
+	else
+		pci_write_config_word(dev, E752X_SYSBUS_ERRMASK, 0x0309);
+}
+
+static void e752x_init_error_reporting_regs(struct e752x_pvt *pvt)
 {
-	platform_driver_unregister(&da9062_regulator_driver);
-}
-module_exit(da9062_regulator_cleanup);
+	struct pci_dev *dev;
 
-/* Module information */
-MODULE_AUTHOR("S Twiss <stwiss.opensource@diasemi.com>");
-MODULE_DESCRIPTION("REGULATOR device driver for Dialog DA9062");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:da9062-regulators");
+	dev = pvt->dev_d0f1;
+	/* Turn off error disable & SMI in case the BIOS turned it on */
+	if (pvt->dev_info->err_dev == PCI_DEVICE_ID_INTEL_3100_1_ERR) {
+		pci_write_config_dword(dev, I3100_NSI_EMASK, 0);
+		pci_write_config_dword(dev, I3100_NSI_SMICMD, 0);
+	} else {
+		pci_write_config_byte(dev, E752X_HI_ERRMASK, 0x00);
+		pci_write_config_byte(dev, E752X_HI_SMICMD, 0x00);
+	}
+
+	e752x_init_sysbus_parity_mask(pvt);
+
+	pci_write_config_word(dev, E752X_SYSBUS_SMICMD, 0x00);
+	pci_write_config_byte(dev, E752X_BUF_ERRMASK, 0x00);
+	pci_write_config_byte(dev, E752X_BUF_SMICMD, 0x00);
+	pci_write_config_byte(dev, E752X_DRAM_ERRMASK, 0x00);
+	pci_write_config_byte(dev, E752X_DRAM_SMICMD, 0x00);
+}
+
+static int e752x_probe1(struct pci_dev *pdev, int dev_idx)
+{
+	u16 pci_data;
+	u8 stat8;
+	struct mem_ctl_info *mci;
+	struct edac_mc_layer layers[2];
+	struct e752x_pvt *pvt;
+	u16 ddrcsr;
+	int drc_chan;		/* Number of channels 0=1chan,1=2chan */
+	struct e752x_error_info discard;
+
+	edac_dbg(0, "mci\n");
+	edac_dbg(0, "Starting Probe1\n");
+
+	/* check to see if device 0 function 1 is enabled; if it isn't, we
+	 * assume the BIOS has reserved it for a reason and is expecting
+	 * exclusive access, we take care not to violate that assumption and
+	 * fail the probe. */
+	pci_read_config_byte(pdev, E752X_DEVPRES1, &stat8);
+	if (!force_function_unhide && !(stat8 & (1 << 5))) {
+		printk(KERN_INFO "Contact your BIOS vendor to see if the "
+			"E752x error registers can be safely un-hidden\n");
+		return -ENODEV;
+	}
+	stat8 |= (1 << 5);
+	pci_write_config_byte(pdev, E752X_DEVPRES1, stat8);
+
+	pci_read_config_word(pdev, E752X_DDRCSR, &ddrcsr);
+	/* FIXME: should check >>12 or 0xf, true for all? */
+	/* Dual channel = 1, Single channel = 0 */
+	drc_chan = dual_channel_active(ddrcsr);
+
+	layers[0].type = EDAC_MC_LAYER_CHIP_SELECT;
+	layers[0].size = E752X_NR_CSROWS;
+	layers[0].is_virt_csrow = true;
+	layers[1].type = EDAC_MC_LAYER_CHANNEL;
+	layers[1].size = drc_chan + 1;
+	layers[1].is_virt_csrow = false;
+	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers, sizeof(*pvt));
+	if (mci == NULL)
+		return -ENOMEM;
+
+	edac_dbg(3, "init mci\n");
+	mci->mtype_cap = MEM_FLAG_RDDR;
+	/* 3100 IMCH supports SECDEC only */
+	mci->edac_ctl_cap = (dev_idx == I3100) ? EDAC_FLAG_SECDED :
+		(EDAC_FLAG_NONE | EDAC_FLAG_SECDED | EDAC_FLAG_S4ECD4ED);
+	/* FIXME - what if different memory types are in different csrows? */
+	mci->mod_name = EDAC_MOD_STR;
+	mci->mod_ver = E752X_REVISION;
+	mci->pdev = &pdev->dev;
+
+	edac_dbg(3, "init pvt\n");
+	pvt = (struct e752x_pvt *)mci->pvt_info;
+	pvt->dev_info = &e752x_devs[dev_idx];
+	pvt->mc_symmetric = ((ddrcsr & 0x10) != 0);
+
+	if (e752x_get_devs(pdev, dev_idx, pvt)) {
+		edac_mc_free(mci);
+		return -ENODEV;
+	}
+
+	edac_dbg(3, "more mci init\n");
+	mci->ctl_name = pvt->dev_info->ctl_name;
+	mci->dev_name = pci_name(pdev);
+	mci->edac_check = e752x_check;
+	mci->ctl_page_to_phys = ctl_page_to_phys;
+	mci->set_sdram_scrub_rate = set_sdram_scrub_rate;
+	mci->get_sdram_scrub_

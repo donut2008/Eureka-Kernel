@@ -1,282 +1,378 @@
+* 20    reserved
+					 * 19:18 Data Integ Mode 00=none,01=ecc
+					 * 17:11 reserved
+					 * 10:8  refresh mode
+					 *  7    reserved
+					 *  6:4  mode select
+					 *  3:2  reserved
+					 *  1:0  DRAM type 01=DDR
+					 */
 
-    D-Link DL2000-based Gigabit Ethernet Adapter Installation
-    for Linux
-    May 23, 2002
+enum i82875p_chips {
+	I82875P = 0,
+};
 
-Contents
-========
- - Compatibility List
- - Quick Install
- - Compiling the Driver
- - Installing the Driver
- - Option parameter
- - Configuration Script Sample
- - Troubleshooting
+struct i82875p_pvt {
+	struct pci_dev *ovrfl_pdev;
+	void __iomem *ovrfl_window;
+};
 
+struct i82875p_dev_info {
+	const char *ctl_name;
+};
 
-Compatibility List
-=================
-Adapter Support:
+struct i82875p_error_info {
+	u16 errsts;
+	u32 eap;
+	u8 des;
+	u8 derrsyn;
+	u16 errsts2;
+};
 
-D-Link DGE-550T Gigabit Ethernet Adapter.
-D-Link DGE-550SX Gigabit Ethernet Adapter.
-D-Link DL2000-based Gigabit Ethernet Adapter.
+static const struct i82875p_dev_info i82875p_devs[] = {
+	[I82875P] = {
+		.ctl_name = "i82875p"},
+};
 
+static struct pci_dev *mci_pdev;	/* init dev: in case that AGP code has
+					 * already registered driver
+					 */
 
-The driver support Linux kernel 2.4.7 later. We had tested it
-on the environments below.
+static struct edac_pci_ctl_info *i82875p_pci;
 
- . Red Hat v6.2 (update kernel to 2.4.7)
- . Red Hat v7.0 (update kernel to 2.4.7)
- . Red Hat v7.1 (kernel 2.4.7)
- . Red Hat v7.2 (kernel 2.4.7-10)
+static void i82875p_get_error_info(struct mem_ctl_info *mci,
+				struct i82875p_error_info *info)
+{
+	struct pci_dev *pdev;
 
+	pdev = to_pci_dev(mci->pdev);
 
-Quick Install
-=============
-Install linux driver as following command:
+	/*
+	 * This is a mess because there is no atomic way to read all the
+	 * registers at once and the registers can transition from CE being
+	 * overwritten by UE.
+	 */
+	pci_read_config_word(pdev, I82875P_ERRSTS, &info->errsts);
 
-1. make all
-2. insmod dl2k.ko
-3. ifconfig eth0 up 10.xxx.xxx.xxx netmask 255.0.0.0
-		    ^^^^^^^^^^^^^^^\	    ^^^^^^^^\
-				    IP		     NETMASK
-Now eth0 should active, you can test it by "ping" or get more information by
-"ifconfig". If tested ok, continue the next step.
+	if (!(info->errsts & 0x0081))
+		return;
 
-4. cp dl2k.ko /lib/modules/`uname -r`/kernel/drivers/net
-5. Add the following line to /etc/modprobe.d/dl2k.conf:
-	alias eth0 dl2k
-6. Run depmod to updated module indexes.
-7. Run "netconfig" or "netconf" to create configuration script ifcfg-eth0
-   located at /etc/sysconfig/network-scripts or create it manually.
-   [see - Configuration Script Sample]
-8. Driver will automatically load and configure at next boot time.
+	pci_read_config_dword(pdev, I82875P_EAP, &info->eap);
+	pci_read_config_byte(pdev, I82875P_DES, &info->des);
+	pci_read_config_byte(pdev, I82875P_DERRSYN, &info->derrsyn);
+	pci_read_config_word(pdev, I82875P_ERRSTS, &info->errsts2);
 
-Compiling the Driver
-====================
-  In Linux, NIC drivers are most commonly configured as loadable modules.
-The approach of building a monolithic kernel has become obsolete. The driver
-can be compiled as part of a monolithic kernel, but is strongly discouraged.
-The remainder of this section assumes the driver is built as a loadable module.
-In the Linux environment, it is a good idea to rebuild the driver from the
-source instead of relying on a precompiled version. This approach provides
-better reliability since a precompiled driver might depend on libraries or
-kernel features that are not present in a given Linux installation.
+	/*
+	 * If the error is the same then we can for both reads then
+	 * the first set of reads is valid.  If there is a change then
+	 * there is a CE no info and the second set of reads is valid
+	 * and should be UE info.
+	 */
+	if ((info->errsts ^ info->errsts2) & 0x0081) {
+		pci_read_config_dword(pdev, I82875P_EAP, &info->eap);
+		pci_read_config_byte(pdev, I82875P_DES, &info->des);
+		pci_read_config_byte(pdev, I82875P_DERRSYN, &info->derrsyn);
+	}
 
-The 3 files necessary to build Linux device driver are dl2k.c, dl2k.h and
-Makefile. To compile, the Linux installation must include the gcc compiler,
-the kernel source, and the kernel headers. The Linux driver supports Linux
-Kernels 2.4.7. Copy the files to a directory and enter the following command
-to compile and link the driver:
+	pci_write_bits16(pdev, I82875P_ERRSTS, 0x0081, 0x0081);
+}
 
-CD-ROM drive
-------------
+static int i82875p_process_error_info(struct mem_ctl_info *mci,
+				struct i82875p_error_info *info,
+				int handle_errors)
+{
+	int row, multi_chan;
 
-[root@XXX /] mkdir cdrom
-[root@XXX /] mount -r -t iso9660 -o conv=auto /dev/cdrom /cdrom
-[root@XXX /] cd root
-[root@XXX /root] mkdir dl2k
-[root@XXX /root] cd dl2k
-[root@XXX dl2k] cp /cdrom/linux/dl2k.tgz /root/dl2k
-[root@XXX dl2k] tar xfvz dl2k.tgz
-[root@XXX dl2k] make all
+	multi_chan = mci->csrows[0]->nr_channels - 1;
 
-Floppy disc drive
------------------
+	if (!(info->errsts & 0x0081))
+		return 0;
 
-[root@XXX /] cd root
-[root@XXX /root] mkdir dl2k
-[root@XXX /root] cd dl2k
-[root@XXX dl2k] mcopy a:/linux/dl2k.tgz /root/dl2k
-[root@XXX dl2k] tar xfvz dl2k.tgz
-[root@XXX dl2k] make all
+	if (!handle_errors)
+		return 1;
 
-Installing the Driver
-=====================
+	if ((info->errsts ^ info->errsts2) & 0x0081) {
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1, 0, 0, 0,
+				     -1, -1, -1,
+				     "UE overwrote CE", "");
+		info->errsts = info->errsts2;
+	}
 
-  Manual Installation
-  -------------------
-  Once the driver has been compiled, it must be loaded, enabled, and bound
-  to a protocol stack in order to establish network connectivity. To load a
-  module enter the command:
+	info->eap >>= PAGE_SHIFT;
+	row = edac_mc_find_csrow_by_page(mci, info->eap);
 
-  insmod dl2k.o
+	if (info->errsts & 0x0080)
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1,
+				     info->eap, 0, 0,
+				     row, -1, -1,
+				     "i82875p UE", "");
+	else
+		edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1,
+				     info->eap, 0, info->derrsyn,
+				     row, multi_chan ? (info->des & 0x1) : 0,
+				     -1, "i82875p CE", "");
 
-  or
+	return 1;
+}
 
-  insmod dl2k.o <optional parameter>	; add parameter
+static void i82875p_check(struct mem_ctl_info *mci)
+{
+	struct i82875p_error_info info;
 
-  ===============================================================
-   example: insmod dl2k.o media=100mbps_hd
-   or	    insmod dl2k.o media=3
-   or	    insmod dl2k.o media=3,2	; for 2 cards
-  ===============================================================
+	edac_dbg(1, "MC%d\n", mci->mc_idx);
+	i82875p_get_error_info(mci, &info);
+	i82875p_process_error_info(mci, &info, 1);
+}
 
-  Please reference the list of the command line parameters supported by
-  the Linux device driver below.
+/* Return 0 on success or 1 on failure. */
+static int i82875p_setup_overfl_dev(struct pci_dev *pdev,
+				struct pci_dev **ovrfl_pdev,
+				void __iomem **ovrfl_window)
+{
+	struct pci_dev *dev;
+	void __iomem *window;
 
-  The insmod command only loads the driver and gives it a name of the form
-  eth0, eth1, etc. To bring the NIC into an operational state,
-  it is necessary to issue the following command:
+	*ovrfl_pdev = NULL;
+	*ovrfl_window = NULL;
+	dev = pci_get_device(PCI_VEND_DEV(INTEL, 82875_6), NULL);
 
-  ifconfig eth0 up
+	if (dev == NULL) {
+		/* Intel tells BIOS developers to hide device 6 which
+		 * configures the overflow device access containing
+		 * the DRBs - this is where we expose device 6.
+		 * http://www.x86-secret.com/articles/tweak/pat/patsecrets-2.htm
+		 */
+		pci_write_bits8(pdev, 0xf4, 0x2, 0x2);
+		dev = pci_scan_single_device(pdev->bus, PCI_DEVFN(6, 0));
 
-  Finally, to bind the driver to the active protocol (e.g., TCP/IP with
-  Linux), enter the following command:
+		if (dev == NULL)
+			return 1;
 
-  ifup eth0
+		pci_bus_assign_resources(dev->bus);
+		pci_bus_add_device(dev);
+	}
 
-  Note that this is meaningful only if the system can find a configuration
-  script that contains the necessary network information. A sample will be
-  given in the next paragraph.
+	*ovrfl_pdev = dev;
 
-  The commands to unload a driver are as follows:
+	if (pci_enable_device(dev)) {
+		i82875p_printk(KERN_ERR, "%s(): Failed to enable overflow "
+			"device\n", __func__);
+		return 1;
+	}
 
-  ifdown eth0
-  ifconfig eth0 down
-  rmmod dl2k.o
+	if (pci_request_regions(dev, pci_name(dev))) {
+#ifdef CORRECT_BIOS
+		goto fail0;
+#endif
+	}
 
-  The following are the commands to list the currently loaded modules and
-  to see the current network configuration.
+	/* cache is irrelevant for PCI bus reads/writes */
+	window = pci_ioremap_bar(dev, 0);
+	if (window == NULL) {
+		i82875p_printk(KERN_ERR, "%s(): Failed to ioremap bar6\n",
+			__func__);
+		goto fail1;
+	}
 
-  lsmod
-  ifconfig
+	*ovrfl_window = window;
+	return 0;
 
+fail1:
+	pci_release_regions(dev);
 
-  Automated Installation
-  ----------------------
-  This section describes how to install the driver such that it is
-  automatically loaded and configured at boot time. The following description
-  is based on a Red Hat 6.0/7.0 distribution, but it can easily be ported to
-  other distributions as well.
+#ifdef CORRECT_BIOS
+fail0:
+	pci_disable_device(dev);
+#endif
+	/* NOTE: the ovrfl proc entry and pci_dev are intentionally left */
+	return 1;
+}
 
-  Red Hat v6.x/v7.x
-  -----------------
-  1. Copy dl2k.o to the network modules directory, typically
-     /lib/modules/2.x.x-xx/net or /lib/modules/2.x.x/kernel/drivers/net.
-  2. Locate the boot module configuration file, most commonly in the
-     /etc/modprobe.d/ directory. Add the following lines:
+/* Return 1 if dual channel mode is active.  Else return 0. */
+static inline int dual_channel_active(u32 drc)
+{
+	return (drc >> 21) & 0x1;
+}
 
-     alias ethx dl2k
-     options dl2k <optional parameters>
+static void i82875p_init_csrows(struct mem_ctl_info *mci,
+				struct pci_dev *pdev,
+				void __iomem * ovrfl_window, u32 drc)
+{
+	struct csrow_info *csrow;
+	struct dimm_info *dimm;
+	unsigned nr_chans = dual_channel_active(drc) + 1;
+	unsigned long last_cumul_size;
+	u8 value;
+	u32 drc_ddim;		/* DRAM Data Integrity Mode 0=none,2=edac */
+	u32 cumul_size, nr_pages;
+	int index, j;
 
-     where ethx will be eth0 if the NIC is the only ethernet adapter, eth1 if
-     one other ethernet adapter is installed, etc. Refer to the table in the
-     previous section for the list of optional parameters.
-  3. Locate the network configuration scripts, normally the
-     /etc/sysconfig/network-scripts directory, and create a configuration
-     script named ifcfg-ethx that contains network information.
-  4. Note that for most Linux distributions, Red Hat included, a configuration
-     utility with a graphical user interface is provided to perform steps 2
-     and 3 above.
+	drc_ddim = (drc >> 18) & 0x1;
+	last_cumul_size = 0;
 
+	/* The dram row boundary (DRB) reg values are boundary address
+	 * for each DRAM row with a granularity of 32 or 64MB (single/dual
+	 * channel operation).  DRB regs are cumulative; therefore DRB7 will
+	 * contain the total memory contained in all eight rows.
+	 */
 
-Parameter Description
-=====================
-You can install this driver without any additional parameter. However, if you
-are going to have extensive functions then it is necessary to set extra
-parameter. Below is a list of the command line parameters supported by the
-Linux device
-driver.
+	for (index = 0; index < mci->nr_csrows; index++) {
+		csrow = mci->csrows[index];
 
-mtu=packet_size			- Specifies the maximum packet size. default
-				  is 1500.
+		value = readb(ovrfl_window + I82875P_DRB + index);
+		cumul_size = value << (I82875P_DRB_SHIFT - PAGE_SHIFT);
+		edac_dbg(3, "(%d) cumul_size 0x%x\n", index, cumul_size);
+		if (cumul_size == last_cumul_size)
+			continue;	/* not populated */
 
-media=media_type		- Specifies the media type the NIC operates at.
-				  autosense	Autosensing active media.
-				  10mbps_hd	10Mbps half duplex.
-				  10mbps_fd	10Mbps full duplex.
-				  100mbps_hd	100Mbps half duplex.
-				  100mbps_fd	100Mbps full duplex.
-				  1000mbps_fd	1000Mbps full duplex.
-				  1000mbps_hd	1000Mbps half duplex.
-				  0		Autosensing active media.
-				  1		10Mbps half duplex.
-				  2		10Mbps full duplex.
-				  3		100Mbps half duplex.
-				  4		100Mbps full duplex.
-				  5          	1000Mbps half duplex.
-				  6          	1000Mbps full duplex.
+		csrow->first_page = last_cumul_size;
+		csrow->last_page = cumul_size - 1;
+		nr_pages = cumul_size - last_cumul_size;
+		last_cumul_size = cumul_size;
 
-				  By default, the NIC operates at autosense.
-				  1000mbps_fd and 1000mbps_hd types are only
-				  available for fiber adapter.
+		for (j = 0; j < nr_chans; j++) {
+			dimm = csrow->channels[j]->dimm;
 
-vlan=n				- Specifies the VLAN ID. If vlan=0, the
-				  Virtual Local Area Network (VLAN) function is
-				  disable.
+			dimm->nr_pages = nr_pages / nr_chans;
+			dimm->grain = 1 << 12;	/* I82875P_EAP has 4KiB reolution */
+			dimm->mtype = MEM_DDR;
+			dimm->dtype = DEV_UNKNOWN;
+			dimm->edac_mode = drc_ddim ? EDAC_SECDED : EDAC_NONE;
+		}
+	}
+}
 
-jumbo=[0|1]			- Specifies the jumbo frame support. If jumbo=1,
-				  the NIC accept jumbo frames. By default, this
-				  function is disabled.
-				  Jumbo frame usually improve the performance
-				  int gigabit.
-				  This feature need jumbo frame compatible 
-				  remote.
-				  
-rx_coalesce=m			- Number of rx frame handled each interrupt.
-rx_timeout=n			- Rx DMA wait time for an interrupt. 
-				  If set rx_coalesce > 0, hardware only assert 
-				  an interrupt for m frames. Hardware won't 
-				  assert rx interrupt until m frames received or
-				  reach timeout of n * 640 nano seconds. 
-				  Set proper rx_coalesce and rx_timeout can 
-				  reduce congestion collapse and overload which
-				  has been a bottleneck for high speed network.
-				  
-				  For example, rx_coalesce=10 rx_timeout=800.
-				  that is, hardware assert only 1 interrupt 
-				  for 10 frames received or timeout of 512 us. 
+static int i82875p_probe1(struct pci_dev *pdev, int dev_idx)
+{
+	int rc = -ENODEV;
+	struct mem_ctl_info *mci;
+	struct edac_mc_layer layers[2];
+	struct i82875p_pvt *pvt;
+	struct pci_dev *ovrfl_pdev;
+	void __iomem *ovrfl_window;
+	u32 drc;
+	u32 nr_chans;
+	struct i82875p_error_info discard;
 
-tx_coalesce=n			- Number of tx frame handled each interrupt.
-				  Set n > 1 can reduce the interrupts 
-				  congestion usually lower performance of
-				  high speed network card. Default is 16.
-				  
-tx_flow=[1|0]			- Specifies the Tx flow control. If tx_flow=0, 
-				  the Tx flow control disable else driver
-				  autodetect.
-rx_flow=[1|0]			- Specifies the Rx flow control. If rx_flow=0, 
-				  the Rx flow control enable else driver
-				  autodetect.
+	edac_dbg(0, "\n");
 
+	if (i82875p_setup_overfl_dev(pdev, &ovrfl_pdev, &ovrfl_window))
+		return -ENODEV;
+	drc = readl(ovrfl_window + I82875P_DRC);
+	nr_chans = dual_channel_active(drc) + 1;
 
-Configuration Script Sample
-===========================
-Here is a sample of a simple configuration script:
+	layers[0].type = EDAC_MC_LAYER_CHIP_SELECT;
+	layers[0].size = I82875P_NR_CSROWS(nr_chans);
+	layers[0].is_virt_csrow = true;
+	layers[1].type = EDAC_MC_LAYER_CHANNEL;
+	layers[1].size = nr_chans;
+	layers[1].is_virt_csrow = false;
+	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers, sizeof(*pvt));
+	if (!mci) {
+		rc = -ENOMEM;
+		goto fail0;
+	}
 
-DEVICE=eth0
-USERCTL=no
-ONBOOT=yes
-POOTPROTO=none
-BROADCAST=207.200.5.255
-NETWORK=207.200.5.0
-NETMASK=255.255.255.0
-IPADDR=207.200.5.2
+	edac_dbg(3, "init mci\n");
+	mci->pdev = &pdev->dev;
+	mci->mtype_cap = MEM_FLAG_DDR;
+	mci->edac_ctl_cap = EDAC_FLAG_NONE | EDAC_FLAG_SECDED;
+	mci->edac_cap = EDAC_FLAG_UNKNOWN;
+	mci->mod_name = EDAC_MOD_STR;
+	mci->mod_ver = I82875P_REVISION;
+	mci->ctl_name = i82875p_devs[dev_idx].ctl_name;
+	mci->dev_name = pci_name(pdev);
+	mci->edac_check = i82875p_check;
+	mci->ctl_page_to_phys = NULL;
+	edac_dbg(3, "init pvt\n");
+	pvt = (struct i82875p_pvt *)mci->pvt_info;
+	pvt->ovrfl_pdev = ovrfl_pdev;
+	pvt->ovrfl_window = ovrfl_window;
+	i82875p_init_csrows(mci, pdev, ovrfl_window, drc);
+	i82875p_get_error_info(mci, &discard);	/* clear counters */
 
+	/* Here we assume that we will never see multiple instances of this
+	 * type of memory controller.  The ID is therefore hardcoded to 0.
+	 */
+	if (edac_mc_add_mc(mci)) {
+		edac_dbg(3, "failed edac_mc_add_mc()\n");
+		goto fail1;
+	}
 
-Troubleshooting
-===============
-Q1. Source files contain ^ M behind every line.
-	Make sure all files are Unix file format (no LF). Try the following
-    shell command to convert files.
+	/* allocating generic PCI control info */
+	i82875p_pci = edac_pci_create_generic_ctl(&pdev->dev, EDAC_MOD_STR);
+	if (!i82875p_pci) {
+		printk(KERN_WARNING
+			"%s(): Unable to create PCI control\n",
+			__func__);
+		printk(KERN_WARNING
+			"%s(): PCI error report via EDAC not setup\n",
+			__func__);
+	}
 
-	cat dl2k.c | col -b > dl2k.tmp
-	mv dl2k.tmp dl2k.c
+	/* get this far and it's successful */
+	edac_dbg(3, "success\n");
+	return 0;
 
-	OR
+fail1:
+	edac_mc_free(mci);
 
-	cat dl2k.c | tr -d "\r" > dl2k.tmp
-	mv dl2k.tmp dl2k.c
+fail0:
+	iounmap(ovrfl_window);
+	pci_release_regions(ovrfl_pdev);
 
-Q2: Could not find header files (*.h) ?
-	To compile the driver, you need kernel header files. After
-    installing the kernel source, the header files are usually located in
-    /usr/src/linux/include, which is the default include directory configured
-    in Makefile. For some distributions, there is a copy of header files in
-    /usr/src/include/linux and /usr/src/include/asm, that you can change the
-    INCLUDEDIR in Makefile to /usr/include without installing kernel source.
-	Note that RH 7.0 didn't provide correct header files in /usr/include,
-    including those files will make a wrong version driver.
+	pci_disable_device(ovrfl_pdev);
+	/* NOTE: the ovrfl proc entry and pci_dev are intentionally left */
+	return rc;
+}
 
+/* returns count (>= 0), or negative on error */
+static int i82875p_init_one(struct pci_dev *pdev,
+			    const struct pci_device_id *ent)
+{
+	int rc;
+
+	edac_dbg(0, "\n");
+	i82875p_printk(KERN_INFO, "i82875p init one\n");
+
+	if (pci_enable_device(pdev) < 0)
+		return -EIO;
+
+	rc = i82875p_probe1(pdev, ent->driver_data);
+
+	if (mci_pdev == NULL)
+		mci_pdev = pci_dev_get(pdev);
+
+	return rc;
+}
+
+static void i82875p_remove_one(struct pci_dev *pdev)
+{
+	struct mem_ctl_info *mci;
+	struct i82875p_pvt *pvt = NULL;
+
+	edac_dbg(0, "\n");
+
+	if (i82875p_pci)
+		edac_pci_release_generic_ctl(i82875p_pci);
+
+	if ((mci = edac_mc_del_mc(&pdev->dev)) == NULL)
+		return;
+
+	pvt = (struct i82875p_pvt *)mci->pvt_info;
+
+	if (pvt->ovrfl_window)
+		iounmap(pvt->ovrfl_window);
+
+	if (pvt->ovrfl_pdev) {
+#ifdef CORRECT_BIOS
+		pci_release_regions(pvt->ovrfl_pdev);
+#endif				/*CORRECT_BIOS */
+		pci_disable_device(pvt->ovrfl_pdev);
+		pci_dev_put(pvt->ovrfl_pdev);
+	}
+
+	edac_mc_free(mci);
+}
+
+static const struct pci_device_id i82875p_pci_tbl[] = 

@@ -1,9 +1,6 @@
-#
-# Makefile for the <t-base core and trusted UI drivers
-#
-
-obj-$(CONFIG_TRUSTONIC_TEE) := MobiCoreDriver/
-obj-$(CONFIG_TRUSTONIC_TRUSTED_UI) += TlcTui/
-
-obj-$(CONFIG_SECURE_OS_CONTROL) += sec-os-ctrl/
-obj-$(CONFIG_SECURE_OS_BOOSTER_API) += sec-os-booster/
+x8
+#define MC_IO_DEBUG_DQB2_CDR_PHSIZE_D1__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_DQB2_CDR_PHSIZE_D1__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_DQB2_CDR_PHSIZE_D1__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_DQB2_CDR_PHSIZE_D1__VALUE3__SHIFT 0x18
+#define MC_I

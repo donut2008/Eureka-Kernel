@@ -1,1079 +1,504 @@
-/* Driver for Realtek RTS51xx USB card reader
- *
- * Copyright(c) 2009 Realtek Semiconductor Corp. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, see <http://www.gnu.org/licenses/>.
- *
- * Author:
- *   wwang (wei_wang@realsil.com.cn)
- *   No. 450, Shenhu Road, Suzhou Industry Park, Suzhou, China
- */
-
-#include <linux/module.h>
-#include <linux/blkdev.h>
-#include <linux/kthread.h>
-#include <linux/sched.h>
-#include <linux/kernel.h>
-
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-#include <scsi/scsi_device.h>
-#include <linux/cdrom.h>
-
-#include <linux/usb.h>
-#include <linux/slab.h>
-#include <linux/usb_usual.h>
-
-#include "usb.h"
-#include "transport.h"
-#include "protocol.h"
-#include "debug.h"
-#include "scsiglue.h"
-
-#define DRV_NAME "ums-realtek"
-
-MODULE_DESCRIPTION("Driver for Realtek USB Card Reader");
-MODULE_AUTHOR("wwang <wei_wang@realsil.com.cn>");
-MODULE_LICENSE("GPL");
-MODULE_VERSION("1.03");
-
-static int auto_delink_en = 1;
-module_param(auto_delink_en, int, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(auto_delink_en, "auto delink mode (0=firmware, 1=software [default])");
-
-#ifdef CONFIG_REALTEK_AUTOPM
-static int ss_en = 1;
-module_param(ss_en, int, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(ss_en, "enable selective suspend");
-
-static int ss_delay = 50;
-module_param(ss_delay, int, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(ss_delay,
-		 "seconds to delay before entering selective suspend");
-
-enum RTS51X_STAT {
-	RTS51X_STAT_INIT,
-	RTS51X_STAT_IDLE,
-	RTS51X_STAT_RUN,
-	RTS51X_STAT_SS
-};
-
-#define POLLING_INTERVAL	50
-
-#define rts51x_set_stat(chip, stat)	\
-	((chip)->state = (enum RTS51X_STAT)(stat))
-#define rts51x_get_stat(chip)		((chip)->state)
-
-#define SET_LUN_READY(chip, lun)	((chip)->lun_ready |= ((u8)1 << (lun)))
-#define CLR_LUN_READY(chip, lun)	((chip)->lun_ready &= ~((u8)1 << (lun)))
-#define TST_LUN_READY(chip, lun)	((chip)->lun_ready & ((u8)1 << (lun)))
-
-#endif
-
-struct rts51x_status {
-	u16 vid;
-	u16 pid;
-	u8 cur_lun;
-	u8 card_type;
-	u8 total_lun;
-	u16 fw_ver;
-	u8 phy_exist;
-	u8 multi_flag;
-	u8 multi_card;
-	u8 log_exist;
-	union {
-		u8 detailed_type1;
-		u8 detailed_type2;
-	} detailed_type;
-	u8 function[2];
-};
-
-struct rts51x_chip {
-	u16 vendor_id;
-	u16 product_id;
-	char max_lun;
-
-	struct rts51x_status *status;
-	int status_len;
-
-	u32 flag;
-	struct us_data *us;
-
-#ifdef CONFIG_REALTEK_AUTOPM
-	struct timer_list rts51x_suspend_timer;
-	unsigned long timer_expires;
-	int pwr_state;
-	u8 lun_ready;
-	enum RTS51X_STAT state;
-	int support_auto_delink;
-#endif
-	/* used to back up the protocol chosen in probe1 phase */
-	proto_cmnd proto_handler_backup;
-};
-
-/* flag definition */
-#define FLIDX_AUTO_DELINK		0x01
-
-#define SCSI_LUN(srb)			((srb)->device->lun)
-
-/* Bit Operation */
-#define SET_BIT(data, idx)		((data) |= 1 << (idx))
-#define CLR_BIT(data, idx)		((data) &= ~(1 << (idx)))
-#define CHK_BIT(data, idx)		((data) & (1 << (idx)))
-
-#define SET_AUTO_DELINK(chip)		((chip)->flag |= FLIDX_AUTO_DELINK)
-#define CLR_AUTO_DELINK(chip)		((chip)->flag &= ~FLIDX_AUTO_DELINK)
-#define CHK_AUTO_DELINK(chip)		((chip)->flag & FLIDX_AUTO_DELINK)
-
-#define RTS51X_GET_VID(chip)		((chip)->vendor_id)
-#define RTS51X_GET_PID(chip)		((chip)->product_id)
-
-#define VENDOR_ID(chip)			((chip)->status[0].vid)
-#define PRODUCT_ID(chip)		((chip)->status[0].pid)
-#define FW_VERSION(chip)		((chip)->status[0].fw_ver)
-#define STATUS_LEN(chip)		((chip)->status_len)
-
-#define STATUS_SUCCESS		0
-#define STATUS_FAIL		1
-
-/* Check card reader function */
-#define SUPPORT_DETAILED_TYPE1(chip)	\
-		CHK_BIT((chip)->status[0].function[0], 1)
-#define SUPPORT_OT(chip)		\
-		CHK_BIT((chip)->status[0].function[0], 2)
-#define SUPPORT_OC(chip)		\
-		CHK_BIT((chip)->status[0].function[0], 3)
-#define SUPPORT_AUTO_DELINK(chip)	\
-		CHK_BIT((chip)->status[0].function[0], 4)
-#define SUPPORT_SDIO(chip)		\
-		CHK_BIT((chip)->status[0].function[1], 0)
-#define SUPPORT_DETAILED_TYPE2(chip)	\
-		CHK_BIT((chip)->status[0].function[1], 1)
-
-#define CHECK_PID(chip, pid)		(RTS51X_GET_PID(chip) == (pid))
-#define CHECK_FW_VER(chip, fw_ver)	(FW_VERSION(chip) == (fw_ver))
-#define CHECK_ID(chip, pid, fw_ver)	\
-		(CHECK_PID((chip), (pid)) && CHECK_FW_VER((chip), (fw_ver)))
-
-static int init_realtek_cr(struct us_data *us);
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{\
-	USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-	.driver_info = (flags) \
-}
-
-static const struct usb_device_id realtek_cr_ids[] = {
-#	include "unusual_realtek.h"
-	{}			/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, realtek_cr_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev realtek_cr_unusual_dev_list[] = {
-#	include "unusual_realtek.h"
-	{}			/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-static int rts51x_bulk_transport(struct us_data *us, u8 lun,
-				 u8 *cmd, int cmd_len, u8 *buf, int buf_len,
-				 enum dma_data_direction dir, int *act_len)
-{
-	struct bulk_cb_wrap *bcb = (struct bulk_cb_wrap *)us->iobuf;
-	struct bulk_cs_wrap *bcs = (struct bulk_cs_wrap *)us->iobuf;
-	int result;
-	unsigned int residue;
-	unsigned int cswlen;
-	unsigned int cbwlen = US_BULK_CB_WRAP_LEN;
-
-	/* set up the command wrapper */
-	bcb->Signature = cpu_to_le32(US_BULK_CB_SIGN);
-	bcb->DataTransferLength = cpu_to_le32(buf_len);
-	bcb->Flags = (dir == DMA_FROM_DEVICE) ? US_BULK_FLAG_IN : 0;
-	bcb->Tag = ++us->tag;
-	bcb->Lun = lun;
-	bcb->Length = cmd_len;
-
-	/* copy the command payload */
-	memset(bcb->CDB, 0, sizeof(bcb->CDB));
-	memcpy(bcb->CDB, cmd, bcb->Length);
-
-	/* send it to out endpoint */
-	result = usb_stor_bulk_transfer_buf(us, us->send_bulk_pipe,
-					    bcb, cbwlen, NULL);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	/* DATA STAGE */
-	/* send/receive data payload, if there is any */
-
-	if (buf && buf_len) {
-		unsigned int pipe = (dir == DMA_FROM_DEVICE) ?
-		    us->recv_bulk_pipe : us->send_bulk_pipe;
-		result = usb_stor_bulk_transfer_buf(us, pipe,
-						    buf, buf_len, NULL);
-		if (result == USB_STOR_XFER_ERROR)
-			return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	/* get CSW for device status */
-	result = usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
-					    bcs, US_BULK_CS_WRAP_LEN, &cswlen);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	/* check bulk status */
-	if (bcs->Signature != cpu_to_le32(US_BULK_CS_SIGN)) {
-		usb_stor_dbg(us, "Signature mismatch: got %08X, expecting %08X\n",
-			     le32_to_cpu(bcs->Signature), US_BULK_CS_SIGN);
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	residue = bcs->Residue;
-	if (bcs->Tag != us->tag)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	/* try to compute the actual residue, based on how much data
-	 * was really transferred and what the device tells us */
-	if (residue)
-		residue = residue < buf_len ? residue : buf_len;
-
-	if (act_len)
-		*act_len = buf_len - residue;
-
-	/* based on the status code, we report good or bad */
-	switch (bcs->Status) {
-	case US_BULK_STAT_OK:
-		/* command good -- note that data could be short */
-		return USB_STOR_TRANSPORT_GOOD;
-
-	case US_BULK_STAT_FAIL:
-		/* command failed */
-		return USB_STOR_TRANSPORT_FAILED;
-
-	case US_BULK_STAT_PHASE:
-		/* phase error -- note that a transport reset will be
-		 * invoked by the invoke_transport() function
-		 */
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	/* we should never get here, but if we do, we're in trouble */
-	return USB_STOR_TRANSPORT_ERROR;
-}
-
-static int rts51x_bulk_transport_special(struct us_data *us, u8 lun,
-				 u8 *cmd, int cmd_len, u8 *buf, int buf_len,
-				 enum dma_data_direction dir, int *act_len)
-{
-	struct bulk_cb_wrap *bcb = (struct bulk_cb_wrap *) us->iobuf;
-	struct bulk_cs_wrap *bcs = (struct bulk_cs_wrap *) us->iobuf;
-	int result;
-	unsigned int cswlen;
-	unsigned int cbwlen = US_BULK_CB_WRAP_LEN;
-
-	/* set up the command wrapper */
-	bcb->Signature = cpu_to_le32(US_BULK_CB_SIGN);
-	bcb->DataTransferLength = cpu_to_le32(buf_len);
-	bcb->Flags = (dir == DMA_FROM_DEVICE) ? US_BULK_FLAG_IN : 0;
-	bcb->Tag = ++us->tag;
-	bcb->Lun = lun;
-	bcb->Length = cmd_len;
-
-	/* copy the command payload */
-	memset(bcb->CDB, 0, sizeof(bcb->CDB));
-	memcpy(bcb->CDB, cmd, bcb->Length);
-
-	/* send it to out endpoint */
-	result = usb_stor_bulk_transfer_buf(us, us->send_bulk_pipe,
-				bcb, cbwlen, NULL);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	/* DATA STAGE */
-	/* send/receive data payload, if there is any */
-
-	if (buf && buf_len) {
-		unsigned int pipe = (dir == DMA_FROM_DEVICE) ?
-				us->recv_bulk_pipe : us->send_bulk_pipe;
-		result = usb_stor_bulk_transfer_buf(us, pipe,
-				buf, buf_len, NULL);
-		if (result == USB_STOR_XFER_ERROR)
-			return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	/* get CSW for device status */
-	result = usb_bulk_msg(us->pusb_dev, us->recv_bulk_pipe, bcs,
-			US_BULK_CS_WRAP_LEN, &cswlen, 250);
-	return result;
-}
-
-/* Determine what the maximum LUN supported is */
-static int rts51x_get_max_lun(struct us_data *us)
-{
-	int result;
-
-	/* issue the command */
-	us->iobuf[0] = 0;
-	result = usb_stor_control_msg(us, us->recv_ctrl_pipe,
-				      US_BULK_GET_MAX_LUN,
-				      USB_DIR_IN | USB_TYPE_CLASS |
-				      USB_RECIP_INTERFACE,
-				      0, us->ifnum, us->iobuf, 1, 10 * HZ);
-
-	usb_stor_dbg(us, "GetMaxLUN command result is %d, data is %d\n",
-		     result, us->iobuf[0]);
-
-	/* if we have a successful request, return the result */
-	if (result > 0)
-		return us->iobuf[0];
-
-	return 0;
-}
-
-static int rts51x_read_mem(struct us_data *us, u16 addr, u8 *data, u16 len)
-{
-	int retval;
-	u8 cmnd[12] = { 0 };
-	u8 *buf;
-
-	buf = kmalloc(len, GFP_NOIO);
-	if (buf == NULL)
-		return -ENOMEM;
-
-	usb_stor_dbg(us, "addr = 0x%x, len = %d\n", addr, len);
-
-	cmnd[0] = 0xF0;
-	cmnd[1] = 0x0D;
-	cmnd[2] = (u8) (addr >> 8);
-	cmnd[3] = (u8) addr;
-	cmnd[4] = (u8) (len >> 8);
-	cmnd[5] = (u8) len;
-
-	retval = rts51x_bulk_transport(us, 0, cmnd, 12,
-				       buf, len, DMA_FROM_DEVICE, NULL);
-	if (retval != USB_STOR_TRANSPORT_GOOD) {
-		kfree(buf);
-		return -EIO;
-	}
-
-	memcpy(data, buf, len);
-	kfree(buf);
-	return 0;
-}
-
-static int rts51x_write_mem(struct us_data *us, u16 addr, u8 *data, u16 len)
-{
-	int retval;
-	u8 cmnd[12] = { 0 };
-	u8 *buf;
-
-	buf = kmemdup(data, len, GFP_NOIO);
-	if (buf == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "addr = 0x%x, len = %d\n", addr, len);
-
-	cmnd[0] = 0xF0;
-	cmnd[1] = 0x0E;
-	cmnd[2] = (u8) (addr >> 8);
-	cmnd[3] = (u8) addr;
-	cmnd[4] = (u8) (len >> 8);
-	cmnd[5] = (u8) len;
-
-	retval = rts51x_bulk_transport(us, 0, cmnd, 12,
-				       buf, len, DMA_TO_DEVICE, NULL);
-	kfree(buf);
-	if (retval != USB_STOR_TRANSPORT_GOOD)
-		return -EIO;
-
-	return 0;
-}
-
-static int rts51x_read_status(struct us_data *us,
-			      u8 lun, u8 *status, int len, int *actlen)
-{
-	int retval;
-	u8 cmnd[12] = { 0 };
-	u8 *buf;
-
-	buf = kmalloc(len, GFP_NOIO);
-	if (buf == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "lun = %d\n", lun);
-
-	cmnd[0] = 0xF0;
-	cmnd[1] = 0x09;
-
-	retval = rts51x_bulk_transport(us, lun, cmnd, 12,
-				       buf, len, DMA_FROM_DEVICE, actlen);
-	if (retval != USB_STOR_TRANSPORT_GOOD) {
-		kfree(buf);
-		return -EIO;
-	}
-
-	memcpy(status, buf, len);
-	kfree(buf);
-	return 0;
-}
-
-static int rts51x_check_status(struct us_data *us, u8 lun)
-{
-	struct rts51x_chip *chip = (struct rts51x_chip *)(us->extra);
-	int retval;
-	u8 buf[16];
-
-	retval = rts51x_read_status(us, lun, buf, 16, &(chip->status_len));
-	if (retval != STATUS_SUCCESS)
-		return -EIO;
-
-	usb_stor_dbg(us, "chip->status_len = %d\n", chip->status_len);
-
-	chip->status[lun].vid = ((u16) buf[0] << 8) | buf[1];
-	chip->status[lun].pid = ((u16) buf[2] << 8) | buf[3];
-	chip->status[lun].cur_lun = buf[4];
-	chip->status[lun].card_type = buf[5];
-	chip->status[lun].total_lun = buf[6];
-	chip->status[lun].fw_ver = ((u16) buf[7] << 8) | buf[8];
-	chip->status[lun].phy_exist = buf[9];
-	chip->status[lun].multi_flag = buf[10];
-	chip->status[lun].multi_card = buf[11];
-	chip->status[lun].log_exist = buf[12];
-	if (chip->status_len == 16) {
-		chip->status[lun].detailed_type.detailed_type1 = buf[13];
-		chip->status[lun].function[0] = buf[14];
-		chip->status[lun].function[1] = buf[15];
-	}
-
-	return 0;
-}
-
-static int enable_oscillator(struct us_data *us)
-{
-	int retval;
-	u8 value;
-
-	retval = rts51x_read_mem(us, 0xFE77, &value, 1);
-	if (retval < 0)
-		return -EIO;
-
-	value |= 0x04;
-	retval = rts51x_write_mem(us, 0xFE77, &value, 1);
-	if (retval < 0)
-		return -EIO;
-
-	retval = rts51x_read_mem(us, 0xFE77, &value, 1);
-	if (retval < 0)
-		return -EIO;
-
-	if (!(value & 0x04))
-		return -EIO;
-
-	return 0;
-}
-
-static int __do_config_autodelink(struct us_data *us, u8 *data, u16 len)
-{
-	int retval;
-	u8 cmnd[12] = {0};
-	u8 *buf;
-
-	usb_stor_dbg(us, "addr = 0xfe47, len = %d\n", len);
-
-	buf = kmemdup(data, len, GFP_NOIO);
-	if (!buf)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	cmnd[0] = 0xF0;
-	cmnd[1] = 0x0E;
-	cmnd[2] = 0xfe;
-	cmnd[3] = 0x47;
-	cmnd[4] = (u8)(len >> 8);
-	cmnd[5] = (u8)len;
-
-	retval = rts51x_bulk_transport_special(us, 0, cmnd, 12, buf, len, DMA_TO_DEVICE, NULL);
-	kfree(buf);
-	if (retval != USB_STOR_TRANSPORT_GOOD) {
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int do_config_autodelink(struct us_data *us, int enable, int force)
-{
-	int retval;
-	u8 value;
-
-	retval = rts51x_read_mem(us, 0xFE47, &value, 1);
-	if (retval < 0)
-		return -EIO;
-
-	if (enable) {
-		if (force)
-			value |= 0x03;
-		else
-			value |= 0x01;
-	} else {
-		value &= ~0x03;
-	}
-
-	usb_stor_dbg(us, "set 0xfe47 to 0x%x\n", value);
-
-	/* retval = rts51x_write_mem(us, 0xFE47, &value, 1); */
-	retval = __do_config_autodelink(us, &value, 1);
-	if (retval < 0)
-		return -EIO;
-
-	return 0;
-}
-
-static int config_autodelink_after_power_on(struct us_data *us)
-{
-	struct rts51x_chip *chip = (struct rts51x_chip *)(us->extra);
-	int retval;
-	u8 value;
-
-	if (!CHK_AUTO_DELINK(chip))
-		return 0;
-
-	retval = rts51x_read_mem(us, 0xFE47, &value, 1);
-	if (retval < 0)
-		return -EIO;
-
-	if (auto_delink_en) {
-		CLR_BIT(value, 0);
-		CLR_BIT(value, 1);
-		SET_BIT(value, 2);
-
-		if (CHECK_ID(chip, 0x0138, 0x3882))
-			CLR_BIT(value, 2);
-
-		SET_BIT(value, 7);
-
-		/* retval = rts51x_write_mem(us, 0xFE47, &value, 1); */
-		retval = __do_config_autodelink(us, &value, 1);
-		if (retval < 0)
-			return -EIO;
-
-		retval = enable_oscillator(us);
-		if (retval == 0)
-			(void)do_config_autodelink(us, 1, 0);
-	} else {
-		/* Autodelink controlled by firmware */
-
-		SET_BIT(value, 2);
-
-		if (CHECK_ID(chip, 0x0138, 0x3882))
-			CLR_BIT(value, 2);
-
-		if (CHECK_ID(chip, 0x0159, 0x5889) ||
-		    CHECK_ID(chip, 0x0138, 0x3880)) {
-			CLR_BIT(value, 0);
-			CLR_BIT(value, 7);
-		}
-
-		/* retval = rts51x_write_mem(us, 0xFE47, &value, 1); */
-		retval = __do_config_autodelink(us, &value, 1);
-		if (retval < 0)
-			return -EIO;
-
-		if (CHECK_ID(chip, 0x0159, 0x5888)) {
-			value = 0xFF;
-			retval = rts51x_write_mem(us, 0xFE79, &value, 1);
-			if (retval < 0)
-				return -EIO;
-
-			value = 0x01;
-			retval = rts51x_write_mem(us, 0x48, &value, 1);
-			if (retval < 0)
-				return -EIO;
-		}
-	}
-
-	return 0;
-}
-
-#ifdef CONFIG_PM
-static int config_autodelink_before_power_down(struct us_data *us)
-{
-	struct rts51x_chip *chip = (struct rts51x_chip *)(us->extra);
-	int retval;
-	u8 value;
-
-	if (!CHK_AUTO_DELINK(chip))
-		return 0;
-
-	if (auto_delink_en) {
-		retval = rts51x_read_mem(us, 0xFE77, &value, 1);
-		if (retval < 0)
-			return -EIO;
-
-		SET_BIT(value, 2);
-		retval = rts51x_write_mem(us, 0xFE77, &value, 1);
-		if (retval < 0)
-			return -EIO;
-
-		if (CHECK_ID(chip, 0x0159, 0x5888)) {
-			value = 0x01;
-			retval = rts51x_write_mem(us, 0x48, &value, 1);
-			if (retval < 0)
-				return -EIO;
-		}
-
-		retval = rts51x_read_mem(us, 0xFE47, &value, 1);
-		if (retval < 0)
-			return -EIO;
-
-		SET_BIT(value, 0);
-		if (CHECK_ID(chip, 0x0138, 0x3882))
-			SET_BIT(value, 2);
-		retval = rts51x_write_mem(us, 0xFE77, &value, 1);
-		if (retval < 0)
-			return -EIO;
-	} else {
-		if (CHECK_ID(chip, 0x0159, 0x5889) ||
-		    CHECK_ID(chip, 0x0138, 0x3880) ||
-		    CHECK_ID(chip, 0x0138, 0x3882)) {
-			retval = rts51x_read_mem(us, 0xFE47, &value, 1);
-			if (retval < 0)
-				return -EIO;
-
-			if (CHECK_ID(chip, 0x0159, 0x5889) ||
-			    CHECK_ID(chip, 0x0138, 0x3880)) {
-				SET_BIT(value, 0);
-				SET_BIT(value, 7);
-			}
-
-			if (CHECK_ID(chip, 0x0138, 0x3882))
-				SET_BIT(value, 2);
-
-			/* retval = rts51x_write_mem(us, 0xFE47, &value, 1); */
-			retval = __do_config_autodelink(us, &value, 1);
-			if (retval < 0)
-				return -EIO;
-		}
-
-		if (CHECK_ID(chip, 0x0159, 0x5888)) {
-			value = 0x01;
-			retval = rts51x_write_mem(us, 0x48, &value, 1);
-			if (retval < 0)
-				return -EIO;
-		}
-	}
-
-	return 0;
-}
-
-static void fw5895_init(struct us_data *us)
-{
-	struct rts51x_chip *chip = (struct rts51x_chip *)(us->extra);
-	int retval;
-	u8 val;
-
-	if ((PRODUCT_ID(chip) != 0x0158) || (FW_VERSION(chip) != 0x5895)) {
-		usb_stor_dbg(us, "Not the specified device, return immediately!\n");
-	} else {
-		retval = rts51x_read_mem(us, 0xFD6F, &val, 1);
-		if (retval == STATUS_SUCCESS && (val & 0x1F) == 0) {
-			val = 0x1F;
-			retval = rts51x_write_mem(us, 0xFD70, &val, 1);
-			if (retval != STATUS_SUCCESS)
-				usb_stor_dbg(us, "Write memory fail\n");
-		} else {
-			usb_stor_dbg(us, "Read memory fail, OR (val & 0x1F) != 0\n");
-		}
-	}
-}
-#endif
-
-#ifdef CONFIG_REALTEK_AUTOPM
-static void fw5895_set_mmc_wp(struct us_data *us)
-{
-	struct rts51x_chip *chip = (struct rts51x_chip *)(us->extra);
-	int retval;
-	u8 buf[13];
-
-	if ((PRODUCT_ID(chip) != 0x0158) || (FW_VERSION(chip) != 0x5895)) {
-		usb_stor_dbg(us, "Not the specified device, return immediately!\n");
-	} else {
-		retval = rts51x_read_mem(us, 0xFD6F, buf, 1);
-		if (retval == STATUS_SUCCESS && (buf[0] & 0x24) == 0x24) {
-			/* SD Exist and SD WP */
-			retval = rts51x_read_mem(us, 0xD04E, buf, 1);
-			if (retval == STATUS_SUCCESS) {
-				buf[0] |= 0x04;
-				retval = rts51x_write_mem(us, 0xFD70, buf, 1);
-				if (retval != STATUS_SUCCESS)
-					usb_stor_dbg(us, "Write memory fail\n");
-			} else {
-				usb_stor_dbg(us, "Read memory fail\n");
-			}
-		} else {
-			usb_stor_dbg(us, "Read memory fail, OR (buf[0]&0x24)!=0x24\n");
-		}
-	}
-}
-
-static void rts51x_modi_suspend_timer(struct rts51x_chip *chip)
-{
-	struct us_data *us = chip->us;
-
-	usb_stor_dbg(us, "state:%d\n", rts51x_get_stat(chip));
-
-	chip->timer_expires = jiffies + msecs_to_jiffies(1000*ss_delay);
-	mod_timer(&chip->rts51x_suspend_timer, chip->timer_expires);
-}
-
-static void rts51x_suspend_timer_fn(unsigned long data)
-{
-	struct rts51x_chip *chip = (struct rts51x_chip *)data;
-	struct us_data *us = chip->us;
-
-	switch (rts51x_get_stat(chip)) {
-	case RTS51X_STAT_INIT:
-	case RTS51X_STAT_RUN:
-		rts51x_modi_suspend_timer(chip);
-		break;
-	case RTS51X_STAT_IDLE:
-	case RTS51X_STAT_SS:
-		usb_stor_dbg(us, "RTS51X_STAT_SS, power.usage:%d\n",
-			     atomic_read(&us->pusb_intf->dev.power.usage_count));
-
-		if (atomic_read(&us->pusb_intf->dev.power.usage_count) > 0) {
-			usb_stor_dbg(us, "Ready to enter SS state\n");
-			rts51x_set_stat(chip, RTS51X_STAT_SS);
-			/* ignore mass storage interface's children */
-			pm_suspend_ignore_children(&us->pusb_intf->dev, true);
-			usb_autopm_put_interface_async(us->pusb_intf);
-			usb_stor_dbg(us, "RTS51X_STAT_SS 01, power.usage:%d\n",
-				     atomic_read(&us->pusb_intf->dev.power.usage_count));
-		}
-		break;
-	default:
-		usb_stor_dbg(us, "Unknown state !!!\n");
-		break;
-	}
-}
-
-static inline int working_scsi(struct scsi_cmnd *srb)
-{
-	if ((srb->cmnd[0] == TEST_UNIT_READY) ||
-	    (srb->cmnd[0] == ALLOW_MEDIUM_REMOVAL)) {
-		return 0;
-	}
-
-	return 1;
-}
-
-static void rts51x_invoke_transport(struct scsi_cmnd *srb, struct us_data *us)
-{
-	struct rts51x_chip *chip = (struct rts51x_chip *)(us->extra);
-	static int card_first_show = 1;
-	static u8 media_not_present[] = { 0x70, 0, 0x02, 0, 0, 0, 0,
-		10, 0, 0, 0, 0, 0x3A, 0, 0, 0, 0, 0
-	};
-	static u8 invalid_cmd_field[] = { 0x70, 0, 0x05, 0, 0, 0, 0,
-		10, 0, 0, 0, 0, 0x24, 0, 0, 0, 0, 0
-	};
-	int ret;
-
-	if (working_scsi(srb)) {
-		usb_stor_dbg(us, "working scsi, power.usage:%d\n",
-			     atomic_read(&us->pusb_intf->dev.power.usage_count));
-
-		if (atomic_read(&us->pusb_intf->dev.power.usage_count) <= 0) {
-			ret = usb_autopm_get_interface(us->pusb_intf);
-			usb_stor_dbg(us, "working scsi, ret=%d\n", ret);
-		}
-		if (rts51x_get_stat(chip) != RTS51X_STAT_RUN)
-			rts51x_set_stat(chip, RTS51X_STAT_RUN);
-		chip->proto_handler_backup(srb, us);
-	} else {
-		if (rts51x_get_stat(chip) == RTS51X_STAT_SS) {
-			usb_stor_dbg(us, "NOT working scsi\n");
-			if ((srb->cmnd[0] == TEST_UNIT_READY) &&
-			    (chip->pwr_state == US_SUSPEND)) {
-				if (TST_LUN_READY(chip, srb->device->lun)) {
-					srb->result = SAM_STAT_GOOD;
-				} else {
-					srb->result = SAM_STAT_CHECK_CONDITION;
-					memcpy(srb->sense_buffer,
-					       media_not_present,
-					       US_SENSE_SIZE);
-				}
-				usb_stor_dbg(us, "TEST_UNIT_READY\n");
-				goto out;
-			}
-			if (srb->cmnd[0] == ALLOW_MEDIUM_REMOVAL) {
-				int prevent = srb->cmnd[4] & 0x1;
-				if (prevent) {
-					srb->result = SAM_STAT_CHECK_CONDITION;
-					memcpy(srb->sense_buffer,
-					       invalid_cmd_field,
-					       US_SENSE_SIZE);
-				} else {
-					srb->result = SAM_STAT_GOOD;
-				}
-				usb_stor_dbg(us, "ALLOW_MEDIUM_REMOVAL\n");
-				goto out;
-			}
-		} else {
-			usb_stor_dbg(us, "NOT working scsi, not SS\n");
-			chip->proto_handler_backup(srb, us);
-			/* Check whether card is plugged in */
-			if (srb->cmnd[0] == TEST_UNIT_READY) {
-				if (srb->result == SAM_STAT_GOOD) {
-					SET_LUN_READY(chip, srb->device->lun);
-					if (card_first_show) {
-						card_first_show = 0;
-						fw5895_set_mmc_wp(us);
-					}
-				} else {
-					CLR_LUN_READY(chip, srb->device->lun);
-					card_first_show = 1;
-				}
-			}
-			if (rts51x_get_stat(chip) != RTS51X_STAT_IDLE)
-				rts51x_set_stat(chip, RTS51X_STAT_IDLE);
-		}
-	}
-out:
-	usb_stor_dbg(us, "state:%d\n", rts51x_get_stat(chip));
-	if (rts51x_get_stat(chip) == RTS51X_STAT_RUN)
-		rts51x_modi_suspend_timer(chip);
-}
-
-static int realtek_cr_autosuspend_setup(struct us_data *us)
-{
-	struct rts51x_chip *chip;
-	struct rts51x_status *status = NULL;
-	u8 buf[16];
-	int retval;
-
-	chip = (struct rts51x_chip *)us->extra;
-	chip->support_auto_delink = 0;
-	chip->pwr_state = US_RESUME;
-	chip->lun_ready = 0;
-	rts51x_set_stat(chip, RTS51X_STAT_INIT);
-
-	retval = rts51x_read_status(us, 0, buf, 16, &(chip->status_len));
-	if (retval != STATUS_SUCCESS) {
-		usb_stor_dbg(us, "Read status fail\n");
-		return -EIO;
-	}
-	status = chip->status;
-	status->vid = ((u16) buf[0] << 8) | buf[1];
-	status->pid = ((u16) buf[2] << 8) | buf[3];
-	status->cur_lun = buf[4];
-	status->card_type = buf[5];
-	status->total_lun = buf[6];
-	status->fw_ver = ((u16) buf[7] << 8) | buf[8];
-	status->phy_exist = buf[9];
-	status->multi_flag = buf[10];
-	status->multi_card = buf[11];
-	status->log_exist = buf[12];
-	if (chip->status_len == 16) {
-		status->detailed_type.detailed_type1 = buf[13];
-		status->function[0] = buf[14];
-		status->function[1] = buf[15];
-	}
-
-	/* back up the proto_handler in us->extra */
-	chip = (struct rts51x_chip *)(us->extra);
-	chip->proto_handler_backup = us->proto_handler;
-	/* Set the autosuspend_delay to 0 */
-	pm_runtime_set_autosuspend_delay(&us->pusb_dev->dev, 0);
-	/* override us->proto_handler setted in get_protocol() */
-	us->proto_handler = rts51x_invoke_transport;
-
-	chip->timer_expires = 0;
-	setup_timer(&chip->rts51x_suspend_timer, rts51x_suspend_timer_fn,
-			(unsigned long)chip);
-	fw5895_init(us);
-
-	/* enable autosuspend function of the usb device */
-	usb_enable_autosuspend(us->pusb_dev);
-
-	return 0;
-}
-#endif
-
-static void realtek_cr_destructor(void *extra)
-{
-	struct rts51x_chip *chip = extra;
-
-	if (!chip)
-		return;
-
-#ifdef CONFIG_REALTEK_AUTOPM
-	if (ss_en) {
-		del_timer(&chip->rts51x_suspend_timer);
-		chip->timer_expires = 0;
-	}
-#endif
-	kfree(chip->status);
-}
-
-#ifdef CONFIG_PM
-static int realtek_cr_suspend(struct usb_interface *iface, pm_message_t message)
-{
-	struct us_data *us = usb_get_intfdata(iface);
-
-	/* wait until no command is running */
-	mutex_lock(&us->dev_mutex);
-
-	config_autodelink_before_power_down(us);
-
-	mutex_unlock(&us->dev_mutex);
-
-	return 0;
-}
-
-static int realtek_cr_resume(struct usb_interface *iface)
-{
-	struct us_data *us = usb_get_intfdata(iface);
-
-	fw5895_init(us);
-	config_autodelink_after_power_on(us);
-
-	return 0;
-}
-#else
-#define realtek_cr_suspend	NULL
-#define realtek_cr_resume	NULL
-#endif
-
-static int init_realtek_cr(struct us_data *us)
-{
-	struct rts51x_chip *chip;
-	int size, i, retval;
-
-	chip = kzalloc(sizeof(struct rts51x_chip), GFP_KERNEL);
-	if (!chip)
-		return -ENOMEM;
-
-	us->extra = chip;
-	us->extra_destructor = realtek_cr_destructor;
-	us->max_lun = chip->max_lun = rts51x_get_max_lun(us);
-	chip->us = us;
-
-	usb_stor_dbg(us, "chip->max_lun = %d\n", chip->max_lun);
-
-	size = (chip->max_lun + 1) * sizeof(struct rts51x_status);
-	chip->status = kzalloc(size, GFP_KERNEL);
-	if (!chip->status)
-		goto INIT_FAIL;
-
-	for (i = 0; i <= (int)(chip->max_lun); i++) {
-		retval = rts51x_check_status(us, (u8) i);
-		if (retval < 0)
-			goto INIT_FAIL;
-	}
-
-	if (CHECK_PID(chip, 0x0138) || CHECK_PID(chip, 0x0158) ||
-	    CHECK_PID(chip, 0x0159)) {
-		if (CHECK_FW_VER(chip, 0x5888) || CHECK_FW_VER(chip, 0x5889) ||
-				CHECK_FW_VER(chip, 0x5901))
-			SET_AUTO_DELINK(chip);
-		if (STATUS_LEN(chip) == 16) {
-			if (SUPPORT_AUTO_DELINK(chip))
-				SET_AUTO_DELINK(chip);
-		}
-	}
-#ifdef CONFIG_REALTEK_AUTOPM
-	if (ss_en)
-		realtek_cr_autosuspend_setup(us);
-#endif
-
-	usb_stor_dbg(us, "chip->flag = 0x%x\n", chip->flag);
-
-	(void)config_autodelink_after_power_on(us);
-
-	return 0;
-
-INIT_FAIL:
-	if (us->extra) {
-		kfree(chip->status);
-		kfree(us->extra);
-		us->extra = NULL;
-	}
-
-	return -EIO;
-}
-
-static struct scsi_host_template realtek_cr_host_template;
-
-static int realtek_cr_probe(struct usb_interface *intf,
-			    const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-
-	dev_dbg(&intf->dev, "Probe Realtek Card Reader!\n");
-
-	result = usb_stor_probe1(&us, intf, id,
-				 (id - realtek_cr_ids) +
-				 realtek_cr_unusual_dev_list,
-				 &realtek_cr_host_template);
-	if (result)
-		return result;
-
-	result = usb_stor_probe2(us);
-
-	return result;
-}
-
-static struct usb_driver realtek_cr_driver = {
-	.name = DRV_NAME,
-	.probe = realtek_cr_probe,
-	.disconnect = usb_stor_disconnect,
-	/* .suspend =      usb_stor_suspend, */
-	/* .resume =       usb_stor_resume, */
-	.reset_resume = usb_stor_reset_resume,
-	.suspend = realtek_cr_suspend,
-	.resume = realtek_cr_resume,
-	.pre_reset = usb_stor_pre_reset,
-	.post_reset = usb_stor_post_reset,
-	.id_table = realtek_cr_ids,
-	.soft_unbind = 1,
-	.supports_autosuspend = 1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(realtek_cr_driver, realtek_cr_host_template, DRV_NAME);
+LIC_FLUSH_DONE_IND__CP3_MASK 0x8
+#define GPU_GARLIC_FLUSH_DONE_IND__CP3__SHIFT 0x3
+#define GPU_GARLIC_FLUSH_DONE_IND__CP4_MASK 0x10
+#define GPU_GARLIC_FLUSH_DONE_IND__CP4__SHIFT 0x4
+#define GPU_GARLIC_FLUSH_DONE_IND__CP5_MASK 0x20
+#define GPU_GARLIC_FLUSH_DONE_IND__CP5__SHIFT 0x5
+#define GPU_GARLIC_FLUSH_DONE_IND__CP6_MASK 0x40
+#define GPU_GARLIC_FLUSH_DONE_IND__CP6__SHIFT 0x6
+#define GPU_GARLIC_FLUSH_DONE_IND__CP7_MASK 0x80
+#define GPU_GARLIC_FLUSH_DONE_IND__CP7__SHIFT 0x7
+#define GPU_GARLIC_FLUSH_DONE_IND__CP8_MASK 0x100
+#define GPU_GARLIC_FLUSH_DONE_IND__CP8__SHIFT 0x8
+#define GPU_GARLIC_FLUSH_DONE_IND__CP9_MASK 0x200
+#define GPU_GARLIC_FLUSH_DONE_IND__CP9__SHIFT 0x9
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA0_MASK 0x400
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA0__SHIFT 0xa
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA1_MASK 0x800
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA1__SHIFT 0xb
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA2_MASK 0x1000
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA2__SHIFT 0xc
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA3_MASK 0x2000
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA3__SHIFT 0xd
+#define GARLIC_COHE_CP_RB0_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB0_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_RB1_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB1_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_RB2_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB2_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_UVD_RBC_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_UVD_RBC_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA0_GFX_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA0_GFX_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA1_GFX_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA1_GFX_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_DMA_ME_COMMAND_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_DMA_ME_COMMAND_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_DMA_PFP_COMMAND_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_DMA_PFP_COMMAND_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SAM_SAB_RBI_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SAM_SAB_RBI_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SAM_SAB_RBO_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SAM_SAB_RBO_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_OUT_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_OUT_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_RB_WPTR2_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_RB_WPTR2_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA2_GFX_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA2_GFX_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA3_GFX_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA3_GFX_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_DMA_PIO_COMMAND_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_DMA_PIO_COMMAND_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_GARLIC_FLUSH_REQ_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_GARLIC_FLUSH_REQ_IND__ADDRESS__SHIFT 0x2
+#define REMAP_HDP_MEM_FLUSH_CNTL_IND__ADDRESS_MASK 0x7fffc
+#define REMAP_HDP_MEM_FLUSH_CNTL_IND__ADDRESS__SHIFT 0x2
+#define REMAP_HDP_REG_FLUSH_CNTL_IND__ADDRESS_MASK 0x7fffc
+#define REMAP_HDP_REG_FLUSH_CNTL_IND__ADDRESS__SHIFT 0x2
+#define BIOS_SCRATCH_0_IND__BIOS_SCRATCH_0_MASK 0xffffffff
+#define BIOS_SCRATCH_0_IND__BIOS_SCRATCH_0__SHIFT 0x0
+#define BIOS_SCRATCH_1_IND__BIOS_SCRATCH_1_MASK 0xffffffff
+#define BIOS_SCRATCH_1_IND__BIOS_SCRATCH_1__SHIFT 0x0
+#define BIOS_SCRATCH_2_IND__BIOS_SCRATCH_2_MASK 0xffffffff
+#define BIOS_SCRATCH_2_IND__BIOS_SCRATCH_2__SHIFT 0x0
+#define BIOS_SCRATCH_3_IND__BIOS_SCRATCH_3_MASK 0xffffffff
+#define BIOS_SCRATCH_3_IND__BIOS_SCRATCH_3__SHIFT 0x0
+#define BIOS_SCRATCH_4_IND__BIOS_SCRATCH_4_MASK 0xffffffff
+#define BIOS_SCRATCH_4_IND__BIOS_SCRATCH_4__SHIFT 0x0
+#define BIOS_SCRATCH_5_IND__BIOS_SCRATCH_5_MASK 0xffffffff
+#define BIOS_SCRATCH_5_IND__BIOS_SCRATCH_5__SHIFT 0x0
+#define BIOS_SCRATCH_6_IND__BIOS_SCRATCH_6_MASK 0xffffffff
+#define BIOS_SCRATCH_6_IND__BIOS_SCRATCH_6__SHIFT 0x0
+#define BIOS_SCRATCH_7_IND__BIOS_SCRATCH_7_MASK 0xffffffff
+#define BIOS_SCRATCH_7_IND__BIOS_SCRATCH_7__SHIFT 0x0
+#define BIOS_SCRATCH_8_IND__BIOS_SCRATCH_8_MASK 0xffffffff
+#define BIOS_SCRATCH_8_IND__BIOS_SCRATCH_8__SHIFT 0x0
+#define BIOS_SCRATCH_9_IND__BIOS_SCRATCH_9_MASK 0xffffffff
+#define BIOS_SCRATCH_9_IND__BIOS_SCRATCH_9__SHIFT 0x0
+#define BIOS_SCRATCH_10_IND__BIOS_SCRATCH_10_MASK 0xffffffff
+#define BIOS_SCRATCH_10_IND__BIOS_SCRATCH_10__SHIFT 0x0
+#define BIOS_SCRATCH_11_IND__BIOS_SCRATCH_11_MASK 0xffffffff
+#define BIOS_SCRATCH_11_IND__BIOS_SCRATCH_11__SHIFT 0x0
+#define BIOS_SCRATCH_12_IND__BIOS_SCRATCH_12_MASK 0xffffffff
+#define BIOS_SCRATCH_12_IND__BIOS_SCRATCH_12__SHIFT 0x0
+#define BIOS_SCRATCH_13_IND__BIOS_SCRATCH_13_MASK 0xffffffff
+#define BIOS_SCRATCH_13_IND__BIOS_SCRATCH_13__SHIFT 0x0
+#define BIOS_SCRATCH_14_IND__BIOS_SCRATCH_14_MASK 0xffffffff
+#define BIOS_SCRATCH_14_IND__BIOS_SCRATCH_14__SHIFT 0x0
+#define BIOS_SCRATCH_15_IND__BIOS_SCRATCH_15_MASK 0xffffffff
+#define BIOS_SCRATCH_15_IND__BIOS_SCRATCH_15__SHIFT 0x0
+#define BIF_RB_CNTL_IND__RB_ENABLE_MASK 0x1
+#define BIF_RB_CNTL_IND__RB_ENABLE__SHIFT 0x0
+#define BIF_RB_CNTL_IND__RB_SIZE_MASK 0x3e
+#define BIF_RB_CNTL_IND__RB_SIZE__SHIFT 0x1
+#define BIF_RB_CNTL_IND__WPTR_WRITEBACK_ENABLE_MASK 0x100
+#define BIF_RB_CNTL_IND__WPTR_WRITEBACK_ENABLE__SHIFT 0x8
+#define BIF_RB_CNTL_IND__WPTR_WRITEBACK_TIMER_MASK 0x3e00
+#define BIF_RB_CNTL_IND__WPTR_WRITEBACK_TIMER__SHIFT 0x9
+#define BIF_RB_CNTL_IND__BIF_RB_TRAN_MASK 0x20000
+#define BIF_RB_CNTL_IND__BIF_RB_TRAN__SHIFT 0x11
+#define BIF_RB_CNTL_IND__WPTR_OVERFLOW_CLEAR_MASK 0x80000000
+#define BIF_RB_CNTL_IND__WPTR_OVERFLOW_CLEAR__SHIFT 0x1f
+#define BIF_RB_BASE_IND__ADDR_MASK 0xffffffff
+#define BIF_RB_BASE_IND__ADDR__SHIFT 0x0
+#define BIF_RB_RPTR_IND__OFFSET_MASK 0x3fffc
+#define BIF_RB_RPTR_IND__OFFSET__SHIFT 0x2
+#define BIF_RB_WPTR_IND__BIF_RB_OVERFLOW_MASK 0x1
+#define BIF_RB_WPTR_IND__BIF_RB_OVERFLOW__SHIFT 0x0
+#define BIF_RB_WPTR_IND__OFFSET_MASK 0x3fffc
+#define BIF_RB_WPTR_IND__OFFSET__SHIFT 0x2
+#define BIF_RB_WPTR_ADDR_HI_IND__ADDR_MASK 0xff
+#define BIF_RB_WPTR_ADDR_HI_IND__ADDR__SHIFT 0x0
+#define BIF_RB_WPTR_ADDR_LO_IND__ADDR_MASK 0xfffffffc
+#define BIF_RB_WPTR_ADDR_LO_IND__ADDR__SHIFT 0x2
+#define NB_GBIF_INDEX__NB_GBIF_IND_ADDR_MASK 0xffffffff
+#define NB_GBIF_INDEX__NB_GBIF_IND_ADDR__SHIFT 0x0
+#define NB_GBIF_DATA__NB_GBIF_DATA_MASK 0xffffffff
+#define NB_GBIF_DATA__NB_GBIF_DATA__SHIFT 0x0
+#define PCIE_INDEX__PCIE_INDEX_MASK 0xffffffff
+#define PCIE_INDEX__PCIE_INDEX__SHIFT 0x0
+#define PCIE_DATA__PCIE_DATA_MASK 0xffffffff
+#define PCIE_DATA__PCIE_DATA__SHIFT 0x0
+#define PCIE_INDEX_2__PCIE_INDEX_MASK 0xffffffff
+#define PCIE_INDEX_2__PCIE_INDEX__SHIFT 0x0
+#define PCIE_DATA_2__PCIE_DATA_MASK 0xffffffff
+#define PCIE_DATA_2__PCIE_DATA__SHIFT 0x0
+#define PCIE_RESERVED__PCIE_RESERVED_MASK 0xffffffff
+#define PCIE_RESERVED__PCIE_RESERVED__SHIFT 0x0
+#define PCIE_SCRATCH__PCIE_SCRATCH_MASK 0xffffffff
+#define PCIE_SCRATCH__PCIE_SCRATCH__SHIFT 0x0
+#define PCIE_HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define PCIE_HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define PCIE_HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define PCIE_HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define PCIE_HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define PCIE_HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define PCIE_HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define PCIE_HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define PCIE_HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define PCIE_HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define PCIE_HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define PCIE_HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define PCIE_HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define PCIE_HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define PCIE_HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define PCIE_HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define PCIE_HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define PCIE_HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define PCIE_HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define PCIE_HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define PCIE_HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define PCIE_HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define PCIE_HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define PCIE_HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define PCIE_HW_DEBUG__HW_12_DEBUG_MASK 0x1000
+#define PCIE_HW_DEBUG__HW_12_DEBUG__SHIFT 0xc
+#define PCIE_HW_DEBUG__HW_13_DEBUG_MASK 0x2000
+#define PCIE_HW_DEBUG__HW_13_DEBUG__SHIFT 0xd
+#define PCIE_HW_DEBUG__HW_14_DEBUG_MASK 0x4000
+#define PCIE_HW_DEBUG__HW_14_DEBUG__SHIFT 0xe
+#define PCIE_HW_DEBUG__HW_15_DEBUG_MASK 0x8000
+#define PCIE_HW_DEBUG__HW_15_DEBUG__SHIFT 0xf
+#define PCIE_RX_NUM_NAK__RX_NUM_NAK_MASK 0xffffffff
+#define PCIE_RX_NUM_NAK__RX_NUM_NAK__SHIFT 0x0
+#define PCIE_RX_NUM_NAK_GENERATED__RX_NUM_NAK_GENERATED_MASK 0xffffffff
+#define PCIE_RX_NUM_NAK_GENERATED__RX_NUM_NAK_GENERATED__SHIFT 0x0
+#define PCIE_CNTL__HWINIT_WR_LOCK_MASK 0x1
+#define PCIE_CNTL__HWINIT_WR_LOCK__SHIFT 0x0
+#define PCIE_CNTL__LC_HOT_PLUG_DELAY_SEL_MASK 0xe
+#define PCIE_CNTL__LC_HOT_PLUG_DELAY_SEL__SHIFT 0x1
+#define PCIE_CNTL__UR_ERR_REPORT_DIS_MASK 0x80
+#define PCIE_CNTL__UR_ERR_REPORT_DIS__SHIFT 0x7
+#define PCIE_CNTL__PCIE_MALFORM_ATOMIC_OPS_MASK 0x100
+#define PCIE_CNTL__PCIE_MALFORM_ATOMIC_OPS__SHIFT 0x8
+#define PCIE_CNTL__PCIE_HT_NP_MEM_WRITE_MASK 0x200
+#define PCIE_CNTL__PCIE_HT_NP_MEM_WRITE__SHIFT 0x9
+#define PCIE_CNTL__RX_SB_ADJ_PAYLOAD_SIZE_MASK 0x1c00
+#define PCIE_CNTL__RX_SB_ADJ_PAYLOAD_SIZE__SHIFT 0xa
+#define PCIE_CNTL__RX_RCB_ATS_UC_DIS_MASK 0x8000
+#define PCIE_CNTL__RX_RCB_ATS_UC_DIS__SHIFT 0xf
+#define PCIE_CNTL__RX_RCB_REORDER_EN_MASK 0x10000
+#define PCIE_CNTL__RX_RCB_REORDER_EN__SHIFT 0x10
+#define PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS_MASK 0x20000
+#define PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS__SHIFT 0x11
+#define PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS_MASK 0x40000
+#define PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS__SHIFT 0x12
+#define PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE_MASK 0x80000
+#define PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE__SHIFT 0x13
+#define PCIE_CNTL__RX_RCB_CHANNEL_ORDERING_MASK 0x100000
+#define PCIE_CNTL__RX_RCB_CHANNEL_ORDERING__SHIFT 0x14
+#define PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS_MASK 0x200000
+#define PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS__SHIFT 0x15
+#define PCIE_CNTL__RX_RCB_WRONG_FUNCNUM_DIS_MASK 0x400000
+#define PCIE_CNTL__RX_RCB_WRONG_FUNCNUM_DIS__SHIFT 0x16
+#define PCIE_CNTL__RX_ATS_TRAN_CPL_SPLIT_DIS_MASK 0x800000
+#define PCIE_CNTL__RX_ATS_TRAN_CPL_SPLIT_DIS__SHIFT 0x17
+#define PCIE_CNTL__TX_CPL_DEBUG_MASK 0x3f000000
+#define PCIE_CNTL__TX_CPL_DEBUG__SHIFT 0x18
+#define PCIE_CNTL__RX_IGNORE_LTR_MSG_UR_MASK 0x40000000
+#define PCIE_CNTL__RX_IGNORE_LTR_MSG_UR__SHIFT 0x1e
+#define PCIE_CNTL__RX_CPL_POSTED_REQ_ORD_EN_MASK 0x80000000
+#define PCIE_CNTL__RX_CPL_POSTED_REQ_ORD_EN__SHIFT 0x1f
+#define PCIE_CONFIG_CNTL__DYN_CLK_LATENCY_MASK 0xf
+#define PCIE_CONFIG_CNTL__DYN_CLK_LATENCY__SHIFT 0x0
+#define PCIE_CONFIG_CNTL__CI_MAX_PAYLOAD_SIZE_MODE_MASK 0x10000
+#define PCIE_CONFIG_CNTL__CI_MAX_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_PAYLOAD_SIZE_MASK 0xe0000
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_PAYLOAD_SIZE__SHIFT 0x11
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_REQUEST_SIZE_MODE_MASK 0x100000
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_REQUEST_SIZE_MODE__SHIFT 0x14
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_READ_REQUEST_SIZE_MASK 0xe00000
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_READ_REQUEST_SIZE__SHIFT 0x15
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_SAFE_MODE_MASK 0x1000000
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_SAFE_MODE__SHIFT 0x18
+#define PCIE_CONFIG_CNTL__CI_EXTENDED_TAG_EN_OVERRIDE_MASK 0x6000000
+#define PCIE_CONFIG_CNTL__CI_EXTENDED_TAG_EN_OVERRIDE__SHIFT 0x19
+#define PCIE_DEBUG_CNTL__DEBUG_PORT_EN_MASK 0xff
+#define PCIE_DEBUG_CNTL__DEBUG_PORT_EN__SHIFT 0x0
+#define PCIE_DEBUG_CNTL__DEBUG_SELECT_MASK 0x100
+#define PCIE_DEBUG_CNTL__DEBUG_SELECT__SHIFT 0x8
+#define PCIE_DEBUG_CNTL__DEBUG_LANE_EN_MASK 0xffff0000
+#define PCIE_DEBUG_CNTL__DEBUG_LANE_EN__SHIFT 0x10
+#define PCIE_INT_CNTL__CORR_ERR_INT_EN_MASK 0x1
+#define PCIE_INT_CNTL__CORR_ERR_INT_EN__SHIFT 0x0
+#define PCIE_INT_CNTL__NON_FATAL_ERR_INT_EN_MASK 0x2
+#define PCIE_INT_CNTL__NON_FATAL_ERR_INT_EN__SHIFT 0x1
+#define PCIE_INT_CNTL__FATAL_ERR_INT_EN_MASK 0x4
+#define PCIE_INT_CNTL__FATAL_ERR_INT_EN__SHIFT 0x2
+#define PCIE_INT_CNTL__USR_DETECTED_INT_EN_MASK 0x8
+#define PCIE_INT_CNTL__USR_DETECTED_INT_EN__SHIFT 0x3
+#define PCIE_INT_CNTL__MISC_ERR_INT_EN_MASK 0x10
+#define PCIE_INT_CNTL__MISC_ERR_INT_EN__SHIFT 0x4
+#define PCIE_INT_CNTL__POWER_STATE_CHG_INT_EN_MASK 0x40
+#define PCIE_INT_CNTL__POWER_STATE_CHG_INT_EN__SHIFT 0x6
+#define PCIE_INT_CNTL__LINK_BW_INT_EN_MASK 0x80
+#define PCIE_INT_CNTL__LINK_BW_INT_EN__SHIFT 0x7
+#define PCIE_INT_CNTL__QUIESCE_RCVD_INT_EN_MASK 0x100
+#define PCIE_INT_CNTL__QUIESCE_RCVD_INT_EN__SHIFT 0x8
+#define PCIE_INT_STATUS__CORR_ERR_INT_STATUS_MASK 0x1
+#define PCIE_INT_STATUS__CORR_ERR_INT_STATUS__SHIFT 0x0
+#define PCIE_INT_STATUS__NON_FATAL_ERR_INT_STATUS_MASK 0x2
+#define PCIE_INT_STATUS__NON_FATAL_ERR_INT_STATUS__SHIFT 0x1
+#define PCIE_INT_STATUS__FATAL_ERR_INT_STATUS_MASK 0x4
+#define PCIE_INT_STATUS__FATAL_ERR_INT_STATUS__SHIFT 0x2
+#define PCIE_INT_STATUS__USR_DETECTED_INT_STATUS_MASK 0x8
+#define PCIE_INT_STATUS__USR_DETECTED_INT_STATUS__SHIFT 0x3
+#define PCIE_INT_STATUS__MISC_ERR_INT_STATUS_MASK 0x10
+#define PCIE_INT_STATUS__MISC_ERR_INT_STATUS__SHIFT 0x4
+#define PCIE_INT_STATUS__POWER_STATE_CHG_INT_STATUS_MASK 0x40
+#define PCIE_INT_STATUS__POWER_STATE_CHG_INT_STATUS__SHIFT 0x6
+#define PCIE_INT_STATUS__LINK_BW_INT_STATUS_MASK 0x80
+#define PCIE_INT_STATUS__LINK_BW_INT_STATUS__SHIFT 0x7
+#define PCIE_INT_STATUS__QUIESCE_RCVD_INT_STATUS_MASK 0x100
+#define PCIE_INT_STATUS__QUIESCE_RCVD_INT_STATUS__SHIFT 0x8
+#define PCIE_CNTL2__TX_ARB_ROUND_ROBIN_EN_MASK 0x1
+#define PCIE_CNTL2__TX_ARB_ROUND_ROBIN_EN__SHIFT 0x0
+#define PCIE_CNTL2__TX_ARB_SLV_LIMIT_MASK 0x3e
+#define PCIE_CNTL2__TX_ARB_SLV_LIMIT__SHIFT 0x1
+#define PCIE_CNTL2__TX_ARB_MST_LIMIT_MASK 0x7c0
+#define PCIE_CNTL2__TX_ARB_MST_LIMIT__SHIFT 0x6
+#define PCIE_CNTL2__TX_BLOCK_TLP_ON_PM_DIS_MASK 0x800
+#define PCIE_CNTL2__TX_BLOCK_TLP_ON_PM_DIS__SHIFT 0xb
+#define PCIE_CNTL2__SLV_MEM_LS_EN_MASK 0x10000
+#define PCIE_CNTL2__SLV_MEM_LS_EN__SHIFT 0x10
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN_MASK 0x20000
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN__SHIFT 0x11
+#define PCIE_CNTL2__MST_MEM_LS_EN_MASK 0x40000
+#define PCIE_CNTL2__MST_MEM_LS_EN__SHIFT 0x12
+#define PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK 0x80000
+#define PCIE_CNTL2__REPLAY_MEM_LS_EN__SHIFT 0x13
+#define PCIE_CNTL2__SLV_MEM_SD_EN_MASK 0x100000
+#define PCIE_CNTL2__SLV_MEM_SD_EN__SHIFT 0x14
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN_MASK 0x200000
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN__SHIFT 0x15
+#define PCIE_CNTL2__MST_MEM_SD_EN_MASK 0x400000
+#define PCIE_CNTL2__MST_MEM_SD_EN__SHIFT 0x16
+#define PCIE_CNTL2__REPLAY_MEM_SD_EN_MASK 0x800000
+#define PCIE_CNTL2__REPLAY_MEM_SD_EN__SHIFT 0x17
+#define PCIE_CNTL2__RX_NP_MEM_WRITE_ENCODING_MASK 0x1f000000
+#define PCIE_CNTL2__RX_NP_MEM_WRITE_ENCODING__SHIFT 0x18
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVALIDPASID_UR_MASK 0x1
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVALIDPASID_UR__SHIFT 0x0
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMRD_UR_MASK 0x2
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMRD_UR__SHIFT 0x1
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMWR_UR_MASK 0x4
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMWR_UR__SHIFT 0x2
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_ATSTRANSREQ_UR_MASK 0x8
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_ATSTRANSREQ_UR__SHIFT 0x3
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_PAGEREQMSG_UR_MASK 0x10
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_PAGEREQMSG_UR__SHIFT 0x4
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVCPL_UR_MASK 0x20
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVCPL_UR__SHIFT 0x5
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_EN_MASK 0x100
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_EN__SHIFT 0x8
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_SCALE_MASK 0xe00
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_SCALE__SHIFT 0x9
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_MAX_COUNT_MASK 0x3ff0000
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_MAX_COUNT__SHIFT 0x10
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_P_MASK 0x3
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_P__SHIFT 0x0
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_NP_MASK 0xc
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_NP__SHIFT 0x2
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_CPL_MASK 0x30
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_CPL__SHIFT 0x4
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_P_MASK 0xc0
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_P__SHIFT 0x6
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_NP_MASK 0x300
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_NP__SHIFT 0x8
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_SNR_OVERRIDE_P_MASK 0xc00
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_SNR_OVERRIDE_P__SHIFT 0xa
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_SNR_OVERRIDE_NP_MASK 0x3000
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_SNR_OVERRIDE_NP__SHIFT 0xc
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_P_MASK 0x3
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_P__SHIFT 0x0
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_NP_MASK 0xc
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_NP__SHIFT 0x2
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_CPL_MASK 0x30
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_CPL__SHIFT 0x4
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_RO_OVERRIDE_P_MASK 0xc0
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_RO_OVERRIDE_P__SHIFT 0x6
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_RO_OVERRIDE_NP_MASK 0x300
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_RO_OVERRIDE_NP__SHIFT 0x8
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_SNR_OVERRIDE_P_MASK 0xc00
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_SNR_OVERRIDE_P__SHIFT 0xa
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_SNR_OVERRIDE_NP_MASK 0x3000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_SNR_OVERRIDE_NP__SHIFT 0xc
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_P_MASK 0x30000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_P__SHIFT 0x10
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_NP_MASK 0xc0000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_NP__SHIFT 0x12
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_CPL_MASK 0x300000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_CPL__SHIFT 0x14
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_RO_OVERRIDE_P_MASK 0xc00000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_RO_OVERRIDE_P__SHIFT 0x16
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_RO_OVERRIDE_NP_MASK 0x3000000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_RO_OVERRIDE_NP__SHIFT 0x18
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_SNR_OVERRIDE_P_MASK 0xc000000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_SNR_OVERRIDE_P__SHIFT 0x1a
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_SNR_OVERRIDE_NP_MASK 0x30000000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_SNR_OVERRIDE_NP__SHIFT 0x1c
+#define PCIE_CI_CNTL__CI_SLAVE_SPLIT_MODE_MASK 0x4
+#define PCIE_CI_CNTL__CI_SLAVE_SPLIT_MODE__SHIFT 0x2
+#define PCIE_CI_CNTL__CI_SLAVE_GEN_USR_DIS_MASK 0x8
+#define PCIE_CI_CNTL__CI_SLAVE_GEN_USR_DIS__SHIFT 0x3
+#define PCIE_CI_CNTL__CI_MST_CMPL_DUMMY_DATA_MASK 0x10
+#define PCIE_CI_CNTL__CI_MST_CMPL_DUMMY_DATA__SHIFT 0x4
+#define PCIE_CI_CNTL__CI_SLV_RC_RD_REQ_SIZE_MASK 0xc0
+#define PCIE_CI_CNTL__CI_SLV_RC_RD_REQ_SIZE__SHIFT 0x6
+#define PCIE_CI_CNTL__CI_SLV_ORDERING_DIS_MASK 0x100
+#define PCIE_CI_CNTL__CI_SLV_ORDERING_DIS__SHIFT 0x8
+#define PCIE_CI_CNTL__CI_RC_ORDERING_DIS_MASK 0x200
+#define PCIE_CI_CNTL__CI_RC_ORDERING_DIS__SHIFT 0x9
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_DIS_MASK 0x400
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_DIS__SHIFT 0xa
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_MODE_MASK 0x800
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_MODE__SHIFT 0xb
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_SOR_MASK 0x1000
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_SOR__SHIFT 0xc
+#define PCIE_CI_CNTL__CI_MST_IGNORE_PAGE_ALIGNED_REQUEST_MASK 0x2000
+#define PCIE_CI_CNTL__CI_MST_IGNORE_PAGE_ALIGNED_REQUEST__SHIFT 0xd
+#define PCIE_BUS_CNTL__PMI_INT_DIS_MASK 0x40
+#define PCIE_BUS_CNTL__PMI_INT_DIS__SHIFT 0x6
+#define PCIE_BUS_CNTL__IMMEDIATE_PMI_DIS_MASK 0x80
+#define PCIE_BUS_CNTL__IMMEDIATE_PMI_DIS__SHIFT 0x7
+#define PCIE_BUS_CNTL__TRUE_PM_STATUS_EN_MASK 0x1000
+#define PCIE_BUS_CNTL__TRUE_PM_STATUS_EN__SHIFT 0xc
+#define PCIE_LC_STATE6__LC_PREV_STATE24_MASK 0x3f
+#define PCIE_LC_STATE6__LC_PREV_STATE24__SHIFT 0x0
+#define PCIE_LC_STATE6__LC_PREV_STATE25_MASK 0x3f00
+#define PCIE_LC_STATE6__LC_PREV_STATE25__SHIFT 0x8
+#define PCIE_LC_STATE6__LC_PREV_STATE26_MASK 0x3f0000
+#define PCIE_LC_STATE6__LC_PREV_STATE26__SHIFT 0x10
+#define PCIE_LC_STATE6__LC_PREV_STATE27_MASK 0x3f000000
+#define PCIE_LC_STATE6__LC_PREV_STATE27__SHIFT 0x18
+#define PCIE_LC_STATE7__LC_PREV_STATE28_MASK 0x3f
+#define PCIE_LC_STATE7__LC_PREV_STATE28__SHIFT 0x0
+#define PCIE_LC_STATE7__LC_PREV_STATE29_MASK 0x3f00
+#define PCIE_LC_STATE7__LC_PREV_STATE29__SHIFT 0x8
+#define PCIE_LC_STATE7__LC_PREV_STATE30_MASK 0x3f0000
+#define PCIE_LC_STATE7__LC_PREV_STATE30__SHIFT 0x10
+#define PCIE_LC_STATE7__LC_PREV_STATE31_MASK 0x3f000000
+#define PCIE_LC_STATE7__LC_PREV_STATE31__SHIFT 0x18
+#define PCIE_LC_STATE8__LC_PREV_STATE32_MASK 0x3f
+#define PCIE_LC_STATE8__LC_PREV_STATE32__SHIFT 0x0
+#define PCIE_LC_STATE8__LC_PREV_STATE33_MASK 0x3f00
+#define PCIE_LC_STATE8__LC_PREV_STATE33__SHIFT 0x8
+#define PCIE_LC_STATE8__LC_PREV_STATE34_MASK 0x3f0000
+#define PCIE_LC_STATE8__LC_PREV_STATE34__SHIFT 0x10
+#define PCIE_LC_STATE8__LC_PREV_STATE35_MASK 0x3f000000
+#define PCIE_LC_STATE8__LC_PREV_STATE35__SHIFT 0x18
+#define PCIE_LC_STATE9__LC_PREV_STATE36_MASK 0x3f
+#define PCIE_LC_STATE9__LC_PREV_STATE36__SHIFT 0x0
+#define PCIE_LC_STATE9__LC_PREV_STATE37_MASK 0x3f00
+#define PCIE_LC_STATE9__LC_PREV_STATE37__SHIFT 0x8
+#define PCIE_LC_STATE9__LC_PREV_STATE38_MASK 0x3f0000
+#define PCIE_LC_STATE9__LC_PREV_STATE38__SHIFT 0x10
+#define PCIE_LC_STATE9__LC_PREV_STATE39_MASK 0x3f000000
+#define PCIE_LC_STATE9__LC_PREV_STATE39__SHIFT 0x18
+#define PCIE_LC_STATE10__LC_PREV_STATE40_MASK 0x3f
+#define PCIE_LC_STATE10__LC_PREV_STATE40__SHIFT 0x0
+#define PCIE_LC_STATE10__LC_PREV_STATE41_MASK 0x3f00
+#define PCIE_LC_STATE10__LC_PREV_STATE41__SHIFT 0x8
+#define PCIE_LC_STATE10__LC_PREV_STATE42_MASK 0x3f0000
+#define PCIE_LC_STATE10__LC_PREV_STATE42__SHIFT 0x10
+#define PCIE_LC_STATE10__LC_PREV_STATE43_MASK 0x3f000000
+#define PCIE_LC_STATE10__LC_PREV_STATE43__SHIFT 0x18
+#define PCIE_LC_STATE11__LC_PREV_STATE44_MASK 0x3f
+#define PCIE_LC_STATE11__LC_PREV_STATE44__SHIFT 0x0
+#define PCIE_LC_STATE11__LC_PREV_STATE45_MASK 0x3f00
+#define PCIE_LC_STATE11__LC_PREV_STATE45__SHIFT 0x8
+#define PCIE_LC_STATE11__LC_PREV_STATE46_MASK 0x3f0000
+#define PCIE_LC_STATE11__LC_PREV_STATE46__SHIFT 0x10
+#define PCIE_LC_STATE11__LC_PREV_STATE47_MASK 0x3f000000
+#define PCIE_LC_STATE11__LC_PREV_STATE47__SHIFT 0x18
+#define PCIE_LC_STATUS1__LC_REVERSE_RCVR_MASK 0x1
+#define PCIE_LC_STATUS1__LC_REVERSE_RCVR__SHIFT 0x0
+#define PCIE_LC_STATUS1__LC_REVERSE_XMIT_MASK 0x2
+#define PCIE_LC_STATUS1__LC_REVERSE_XMIT__SHIFT 0x1
+#define PCIE_LC_STATUS1__LC_OPERATING_LINK_WIDTH_MASK 0x1c
+#define PCIE_LC_STATUS1__LC_OPERATING_LINK_WIDTH__SHIFT 0x2
+#define PCIE_LC_STATUS1__LC_DETECTED_LINK_WIDTH_MASK 0xe0
+#define PCIE_LC_STATUS1__LC_DETECTED_LINK_WIDTH__SHIFT 0x5
+#define PCIE_LC_STATUS2__LC_TOTAL_INACTIVE_LANES_MASK 0xffff
+#define PCIE_LC_STATUS2__LC_TOTAL_INACTIVE_LANES__SHIFT 0x0
+#define PCIE_LC_STATUS2__LC_TURN_ON_LANE_MASK 0xffff0000
+#define PCIE_LC_STATUS2__LC_TURN_ON_LANE__SHIFT 0x10
+#define PCIE_WPR_CNTL__WPR_RESET_HOT_RST_EN_MASK 0x1
+#define PCIE_WPR_CNTL__WPR_RESET_HOT_RST_EN__SHIFT 0x0
+#define PCIE_WPR_CNTL__WPR_RESET_LNK_DWN_EN_MASK 0x2
+#define PCIE_WPR_CNTL__WPR_RESET_LNK_DWN_EN__SHIFT 0x1
+#define PCIE_WPR_CNTL__WPR_RESET_LNK_DIS_EN_MASK 0x4
+#define PCIE_WPR_CNTL__WPR_RESET_LNK_DIS_EN__SHIFT 0x2
+#define PCIE_WPR_CNTL__WPR_RESET_COR_EN_MASK 0x8
+#define PCIE_WPR_CNTL__WPR_RESET_COR_EN__SHIFT 0x3
+#define PCIE_WPR_CNTL__WPR_RESET_REG_EN_MASK 0x10
+#define PCIE_WPR_CNTL__WPR_RESET_REG_EN__SHIFT 0x4
+#define PCIE_WPR_CNTL__WPR_RESET_STY_EN_MASK 0x20
+#define PCIE_WPR_CNTL__WPR_RESET_STY_EN__SHIFT 0x5
+#define PCIE_WPR_CNTL__WPR_RESET_PHY_EN_MASK 0x40
+#define PCIE_WPR_CNTL__WPR_RESET_PHY_EN__SHIFT 0x6
+#define PCIE_RX_LAST_TLP0__RX_LAST_TLP0_MASK 0xffffffff
+#define PCIE_RX_LAST_TLP0__RX_LAST_TLP0__SHIFT 0x0
+#define PCIE_RX_LAST_TLP1__RX_LAST_TLP1_MASK 0xffffffff
+#define PCIE_RX_LAST_TLP1__RX_LAST_TLP1__SHIFT 0x0
+#define PCIE_RX_LAST_TLP2__RX_LAST_TLP2_MASK 0xffffffff
+#define PCIE_RX_LAST_TLP2__RX_LAST_TLP2__SHIFT 0x0
+#define PCIE_RX_LAST_TLP3__RX_LAST_TLP3_MASK 0xffffffff
+#define PCIE_RX_LAST_TLP3__RX_LAST_TLP3__SHIFT 0x0
+#define PCIE_TX_LAST_TLP0__TX_LAST_TLP0_MASK 0xffffffff
+#define PCIE_TX_LAST_TLP0__TX_LAST_TLP0__SHIFT 0x0
+#define PCIE_TX_LAST_TLP1__TX_LAST_TLP1_MASK 0xffffffff
+#define PCIE_TX_LAST_TLP1__TX_LAST_TLP1__SHIFT 0x0
+#define PCIE_TX_LAST_TLP2__TX_LAST_TLP2_MASK 0xffffffff
+#define PCIE_TX_LAST_TLP2__TX_LAST_TLP2__SHIFT 0x0
+#define PCIE_TX_LAST_TLP3__TX_LAST_TLP3_MASK 0xffffffff
+#define PCIE_TX_LAST_TLP3__TX_LAST_TLP3__SHIFT 0x0
+#define PCIE_I2C_REG_ADDR_EXPAND__I2C_REG_ADDR_MASK 0x1ffff
+#define PCIE_I2C_REG_ADDR_EXPAND__I2C_REG_ADDR__SHIFT 0x0
+#define PCIE_I2C_REG_DATA__I2C_REG_DATA_MASK 0xffffffff
+#define PCIE_I2C_REG_DATA__I2C_REG_DATA__SHIFT 0x0
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_HIDDEN_REG_MASK 0x1
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_HIDDEN_REG__SHIFT 0x0
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_GEN2_HIDDEN_REG_MASK 0x2
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_GEN2_HIDDEN_REG__SHIFT 0x1
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_GEN3_HIDDEN_REG_MASK 0x4
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_GEN3_HIDDEN_REG__SHIFT 0x2
+#define PCIE_P_CNTL__P_PWRDN_EN_MASK 0x1
+#define PCIE_P_CNTL__P_PWRDN_EN__SHIFT 0x0
+#define PCIE_P_CNTL__P_SYMALIGN_MODE_MASK 0x2
+#define PCIE_P_CNTL__P_SYMALIGN_MODE__SHIFT 0x1
+#define PCIE_P_CNTL__P_SYMALIGN_HW_DEBUG_MASK 0x4
+#define PCIE_P_CNTL__P_SYMALIGN_HW_DEBUG__SHIFT 0x2
+#define PCIE_P_CNTL__P_ELASTDESKEW_HW_DEBUG_MASK 0x8
+#define PCIE_P_CNTL__P_ELASTDESKEW_HW_DEBUG__SHIFT 0x3
+#define PCIE_P_CNTL__P_IGNORE_CRC_ERR_MASK 0x10
+#define PCIE_P_CNTL__P_IGNORE_CRC_ERR__SHIFT 0x4
+#define PCIE_P_CNTL__P_IGNORE_LEN_ERR_MASK 0x20
+#define PCIE_P_CNTL__P_IGNORE_LEN_ERR__SHIFT 0x5
+#define PCIE_P_CNTL__P_IGNORE_EDB_ERR_MASK 0x40
+#define PCIE_P_CNTL__P_IGNORE_EDB_ERR__SHIFT 0x6
+#define PCIE_P_CNTL__P_IGNORE_IDL_ERR_MASK 0x80
+#define PCIE_P_CNTL__P_IGNORE_IDL_ERR__SHIFT 0x7
+#define PCIE_P_CNTL__P_IGNORE_TOK_ERR_MASK 0x100
+#define PCIE_P_CNTL__P_IGNORE_TOK_ERR__SHIFT 0x8
+#define PCIE_P_CNTL__P_BLK_LOCK_MODE_MASK 0x1000
+#define PCIE_P_CNTL__P_BLK_LOCK_MODE__SHIFT 0xc
+#define PCIE_P_CNTL__P_ALWAYS_USE_FAST_TXCLK_MASK 0x2000
+#define PCIE_P_CNTL__P_ALWAYS_USE_FAST_TXCLK__SHIFT 0xd
+#define PCIE_P_CNTL__P_ELEC_IDLE_MODE_MASK 0xc000
+#define PCIE_P_CNTL__P_ELEC_IDLE_MODE__SHIFT 0xe
+#define PCIE_P_CNTL__DLP_IGNORE_IN_L1_EN_MASK 0x10000
+#define PCIE_P_CNTL__DLP_IGNORE_IN_L1_EN__SHIFT 0x10
+#define PCIE_P_BUF_STATUS__P_OVERFLOW_ERR_MASK 0xffff
+#define PCIE_P_BUF_STATUS__P_OVERFLOW_ERR__SHIFT 0x0
+#define PCIE_P_BUF_STATUS__P_UNDERFLOW_ERR_MASK 0xffff0000
+#define PCIE_P_BUF_STATUS__P_UNDERFLOW_ERR__SHIFT 0x10
+#define PCIE_P_DECODER_STATUS__P_DECODE_ERR_MASK 0xffff
+#define PCIE_P_DECODER_STATUS__P_DECODE_ERR__SHIFT 0x0
+#define PCIE_P_MISC_STATUS__P_DESKEW_ERR_MASK 0xff
+#define PCIE_P_MISC_STATUS__P_DESKEW_ERR__SHIFT 0x0
+#define PCIE_P_MISC_STATUS__P_SYMUNLOCK_ERR_MASK 0xffff0000
+#

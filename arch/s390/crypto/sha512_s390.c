@@ -1,156 +1,140 @@
 /*
- * Cryptographic API.
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
  *
- * s390 implementation of the SHA512 and SHA38 Secure Hash Algorithm.
+ * Copyright (C) 2004 Silicon Graphics, Inc. All rights reserved.
  *
- * Copyright IBM Corp. 2007
- * Author(s): Jan Glauber (jang@de.ibm.com)
+ * Data types used by the SN_SAL_HWPERF_OP SAL call for monitoring
+ * SGI Altix node and router hardware
  *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option)
- * any later version.
- *
+ * Mark Goodwin <markgw@sgi.com> Mon Aug 30 12:23:46 EST 2004
  */
-#include <crypto/internal/hash.h>
-#include <crypto/sha.h>
-#include <linux/errno.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/cpufeature.h>
 
-#include "sha.h"
-#include "crypt_s390.h"
+#ifndef SN_HWPERF_H
+#define SN_HWPERF_H
 
-static int sha512_init(struct shash_desc *desc)
-{
-	struct s390_sha_ctx *ctx = shash_desc_ctx(desc);
-
-	*(__u64 *)&ctx->state[0] = 0x6a09e667f3bcc908ULL;
-	*(__u64 *)&ctx->state[2] = 0xbb67ae8584caa73bULL;
-	*(__u64 *)&ctx->state[4] = 0x3c6ef372fe94f82bULL;
-	*(__u64 *)&ctx->state[6] = 0xa54ff53a5f1d36f1ULL;
-	*(__u64 *)&ctx->state[8] = 0x510e527fade682d1ULL;
-	*(__u64 *)&ctx->state[10] = 0x9b05688c2b3e6c1fULL;
-	*(__u64 *)&ctx->state[12] = 0x1f83d9abfb41bd6bULL;
-	*(__u64 *)&ctx->state[14] = 0x5be0cd19137e2179ULL;
-	ctx->count = 0;
-	ctx->func = KIMD_SHA_512;
-
-	return 0;
-}
-
-static int sha512_export(struct shash_desc *desc, void *out)
-{
-	struct s390_sha_ctx *sctx = shash_desc_ctx(desc);
-	struct sha512_state *octx = out;
-
-	octx->count[0] = sctx->count;
-	octx->count[1] = 0;
-	memcpy(octx->state, sctx->state, sizeof(octx->state));
-	memcpy(octx->buf, sctx->buf, sizeof(octx->buf));
-	return 0;
-}
-
-static int sha512_import(struct shash_desc *desc, const void *in)
-{
-	struct s390_sha_ctx *sctx = shash_desc_ctx(desc);
-	const struct sha512_state *ictx = in;
-
-	if (unlikely(ictx->count[1]))
-		return -ERANGE;
-	sctx->count = ictx->count[0];
-
-	memcpy(sctx->state, ictx->state, sizeof(ictx->state));
-	memcpy(sctx->buf, ictx->buf, sizeof(ictx->buf));
-	sctx->func = KIMD_SHA_512;
-	return 0;
-}
-
-static struct shash_alg sha512_alg = {
-	.digestsize	=	SHA512_DIGEST_SIZE,
-	.init		=	sha512_init,
-	.update		=	s390_sha_update,
-	.final		=	s390_sha_final,
-	.export		=	sha512_export,
-	.import		=	sha512_import,
-	.descsize	=	sizeof(struct s390_sha_ctx),
-	.statesize	=	sizeof(struct sha512_state),
-	.base		=	{
-		.cra_name	=	"sha512",
-		.cra_driver_name=	"sha512-s390",
-		.cra_priority	=	CRYPT_S390_PRIORITY,
-		.cra_flags	=	CRYPTO_ALG_TYPE_SHASH,
-		.cra_blocksize	=	SHA512_BLOCK_SIZE,
-		.cra_module	=	THIS_MODULE,
-	}
+/*
+ * object structure. SN_HWPERF_ENUM_OBJECTS and SN_HWPERF_GET_CPU_INFO
+ * return an array of these. Do not change this without also
+ * changing the corresponding SAL code.
+ */
+#define SN_HWPERF_MAXSTRING		128
+struct sn_hwperf_object_info {
+	u32 id;
+	union {
+		struct {
+			u64 this_part:1;
+			u64 is_shared:1;
+		} fields;
+		struct {
+			u64 flags;
+			u64 reserved;
+		} b;
+	} f;
+	char name[SN_HWPERF_MAXSTRING];
+	char location[SN_HWPERF_MAXSTRING];
+	u32 ports;
 };
 
-MODULE_ALIAS_CRYPTO("sha512");
+#define sn_hwp_this_part	f.fields.this_part
+#define sn_hwp_is_shared	f.fields.is_shared
+#define sn_hwp_flags		f.b.flags
 
-static int sha384_init(struct shash_desc *desc)
-{
-	struct s390_sha_ctx *ctx = shash_desc_ctx(desc);
+/* macros for object classification */
+#define SN_HWPERF_IS_NODE(x)		((x) && strstr((x)->name, "SHub"))
+#define SN_HWPERF_IS_NODE_SHUB2(x)	((x) && strstr((x)->name, "SHub 2."))
+#define SN_HWPERF_IS_IONODE(x)		((x) && strstr((x)->name, "TIO"))
+#define SN_HWPERF_IS_NL3ROUTER(x)	((x) && strstr((x)->name, "NL3Router"))
+#define SN_HWPERF_IS_NL4ROUTER(x)	((x) && strstr((x)->name, "NL4Router"))
+#define SN_HWPERF_IS_OLDROUTER(x)	((x) && strstr((x)->name, "Router"))
+#define SN_HWPERF_IS_ROUTER(x)		(SN_HWPERF_IS_NL3ROUTER(x) || 		\
+					 	SN_HWPERF_IS_NL4ROUTER(x) || 	\
+					 	SN_HWPERF_IS_OLDROUTER(x))
+#define SN_HWPERF_FOREIGN(x)		((x) && !(x)->sn_hwp_this_part && !(x)->sn_hwp_is_shared)
+#define SN_HWPERF_SAME_OBJTYPE(x,y)	((SN_HWPERF_IS_NODE(x) && SN_HWPERF_IS_NODE(y)) ||\
+					(SN_HWPERF_IS_IONODE(x) && SN_HWPERF_IS_IONODE(y)) ||\
+					(SN_HWPERF_IS_ROUTER(x) && SN_HWPERF_IS_ROUTER(y)))
 
-	*(__u64 *)&ctx->state[0] = 0xcbbb9d5dc1059ed8ULL;
-	*(__u64 *)&ctx->state[2] = 0x629a292a367cd507ULL;
-	*(__u64 *)&ctx->state[4] = 0x9159015a3070dd17ULL;
-	*(__u64 *)&ctx->state[6] = 0x152fecd8f70e5939ULL;
-	*(__u64 *)&ctx->state[8] = 0x67332667ffc00b31ULL;
-	*(__u64 *)&ctx->state[10] = 0x8eb44a8768581511ULL;
-	*(__u64 *)&ctx->state[12] = 0xdb0c2e0d64f98fa7ULL;
-	*(__u64 *)&ctx->state[14] = 0x47b5481dbefa4fa4ULL;
-	ctx->count = 0;
-	ctx->func = KIMD_SHA_512;
-
-	return 0;
-}
-
-static struct shash_alg sha384_alg = {
-	.digestsize	=	SHA384_DIGEST_SIZE,
-	.init		=	sha384_init,
-	.update		=	s390_sha_update,
-	.final		=	s390_sha_final,
-	.export		=	sha512_export,
-	.import		=	sha512_import,
-	.descsize	=	sizeof(struct s390_sha_ctx),
-	.statesize	=	sizeof(struct sha512_state),
-	.base		=	{
-		.cra_name	=	"sha384",
-		.cra_driver_name=	"sha384-s390",
-		.cra_priority	=	CRYPT_S390_PRIORITY,
-		.cra_flags	=	CRYPTO_ALG_TYPE_SHASH,
-		.cra_blocksize	=	SHA384_BLOCK_SIZE,
-		.cra_ctxsize	=	sizeof(struct s390_sha_ctx),
-		.cra_module	=	THIS_MODULE,
-	}
+/* numa port structure, SN_HWPERF_ENUM_PORTS returns an array of these */
+struct sn_hwperf_port_info {
+	u32 port;
+	u32 conn_id;
+	u32 conn_port;
 };
 
-MODULE_ALIAS_CRYPTO("sha384");
+/* for HWPERF_{GET,SET}_MMRS */
+struct sn_hwperf_data {
+	u64 addr;
+	u64 data;
+};
 
-static int __init init(void)
-{
-	int ret;
+/* user ioctl() argument, see below */
+struct sn_hwperf_ioctl_args {
+        u64 arg;		/* argument, usually an object id */
+        u64 sz;                 /* size of transfer */
+        void *ptr;              /* pointer to source/target */
+        u32 v0;			/* second return value */
+};
 
-	if (!crypt_s390_func_available(KIMD_SHA_512, CRYPT_S390_MSA))
-		return -EOPNOTSUPP;
-	if ((ret = crypto_register_shash(&sha512_alg)) < 0)
-		goto out;
-	if ((ret = crypto_register_shash(&sha384_alg)) < 0)
-		crypto_unregister_shash(&sha512_alg);
-out:
-	return ret;
-}
+/*
+ * For SN_HWPERF_{GET,SET}_MMRS and SN_HWPERF_OBJECT_DISTANCE,
+ * sn_hwperf_ioctl_args.arg can be used to specify a CPU on which
+ * to call SAL, and whether to use an interprocessor interrupt
+ * or task migration in order to do so. If the CPU specified is
+ * SN_HWPERF_ARG_ANY_CPU, then the current CPU will be used.
+ */
+#define SN_HWPERF_ARG_ANY_CPU		0x7fffffffUL
+#define SN_HWPERF_ARG_CPU_MASK		0x7fffffff00000000ULL
+#define SN_HWPERF_ARG_USE_IPI_MASK	0x8000000000000000ULL
+#define SN_HWPERF_ARG_OBJID_MASK	0x00000000ffffffffULL
 
-static void __exit fini(void)
-{
-	crypto_unregister_shash(&sha512_alg);
-	crypto_unregister_shash(&sha384_alg);
-}
+/* 
+ * ioctl requests on the "sn_hwperf" misc device that call SAL.
+ */
+#define SN_HWPERF_OP_MEM_COPYIN		0x1000
+#define SN_HWPERF_OP_MEM_COPYOUT	0x2000
+#define SN_HWPERF_OP_MASK		0x0fff
 
-module_cpu_feature_match(MSA, init);
-module_exit(fini);
+/*
+ * Determine mem requirement.
+ * arg	don't care
+ * sz	8
+ * p	pointer to u64 integer
+ */
+#define	SN_HWPERF_GET_HEAPSIZE		1
 
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("SHA512 and SHA-384 Secure Hash Algorithm");
+/*
+ * Install mem for SAL drvr
+ * arg	don't care
+ * sz	sizeof buffer pointed to by p
+ * p	pointer to buffer for scratch area
+ */
+#define SN_HWPERF_INSTALL_HEAP		2
+
+/*
+ * Determine number of objects
+ * arg	don't care
+ * sz	8
+ * p	pointer to u64 integer
+ */
+#define SN_HWPERF_OBJECT_COUNT		(10|SN_HWPERF_OP_MEM_COPYOUT)
+
+/*
+ * Determine object "distance", relative to a cpu. This operation can
+ * execute on a designated logical cpu number, using either an IPI or
+ * via task migration. If the cpu number is SN_HWPERF_ANY_CPU, then
+ * the current CPU is used. See the SN_HWPERF_ARG_* macros above.
+ *
+ * arg	bitmap of IPI flag, cpu number and object id
+ * sz	8
+ * p	pointer to u64 integer
+ */
+#define SN_HWPERF_OBJECT_DISTANCE	(11|SN_HWPERF_OP_MEM_COPYOUT)
+
+/*
+ * Enumerate objects. Special case if sz == 8, returns the required
+ * buffer size.
+ * arg	don't care
+ * sz	sizeof buffer pointed to by p
+ * p	poin

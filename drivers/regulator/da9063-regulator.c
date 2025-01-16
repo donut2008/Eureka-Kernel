@@ -1,903 +1,944 @@
+1) ? 8 : 4)
+#define MTR_DRAM_BANKS(mtr)		((((mtr) >> 5) & 0x1) ? 8 : 4)
+#define MTR_DRAM_BANKS_ADDR_BITS(mtr)	((MTR_DRAM_BANKS(mtr) == 8) ? 3 : 2)
+#define MTR_DIMM_RANK(mtr)		(((mtr) >> 4) & 0x1)
+#define MTR_DIMM_RANK_ADDR_BITS(mtr)	(MTR_DIMM_RANK(mtr) ? 2 : 1)
+#define MTR_DIMM_ROWS(mtr)		(((mtr) >> 2) & 0x3)
+#define MTR_DIMM_ROWS_ADDR_BITS(mtr)	(MTR_DIMM_ROWS(mtr) + 13)
+#define MTR_DIMM_COLS(mtr)		((mtr) & 0x3)
+#define MTR_DIMM_COLS_ADDR_BITS(mtr)	(MTR_DIMM_COLS(mtr) + 10)
+
+/* enables the report of miscellaneous messages as CE errors - default off */
+static int misc_messages;
+
+/* Enumeration of supported devices */
+enum i5000_chips {
+	I5000P = 0,
+	I5000V = 1,		/* future */
+	I5000X = 2		/* future */
+};
+
+/* Device name and register DID (Device ID) */
+struct i5000_dev_info {
+	const char *ctl_name;	/* name for this device */
+	u16 fsb_mapping_errors;	/* DID for the branchmap,control */
+};
+
+/* Table of devices attributes supported by this driver */
+static const struct i5000_dev_info i5000_devs[] = {
+	[I5000P] = {
+		.ctl_name = "I5000",
+		.fsb_mapping_errors = PCI_DEVICE_ID_INTEL_I5000_DEV16,
+	},
+};
+
+struct i5000_dimm_info {
+	int megabytes;		/* size, 0 means not present  */
+	int dual_rank;
+};
+
+#define	MAX_CHANNELS	6	/* max possible channels */
+#define MAX_CSROWS	(8*2)	/* max possible csrows per channel */
+
+/* driver private data structure */
+struct i5000_pvt {
+	struct pci_dev *system_address;	/* 16.0 */
+	struct pci_dev *branchmap_werrors;	/* 16.1 */
+	struct pci_dev *fsb_error_regs;	/* 16.2 */
+	struct pci_dev *branch_0;	/* 21.0 */
+	struct pci_dev *branch_1;	/* 22.0 */
+
+	u16 tolm;		/* top of low memory */
+	union {
+		u64 ambase;		/* AMB BAR */
+		struct {
+			u32 ambase_bottom;
+			u32 ambase_top;
+		} u __packed;
+	};
+
+	u16 mir0, mir1, mir2;
+
+	u16 b0_mtr[NUM_MTRS];	/* Memory Technlogy Reg */
+	u16 b0_ambpresent0;	/* Branch 0, Channel 0 */
+	u16 b0_ambpresent1;	/* Brnach 0, Channel 1 */
+
+	u16 b1_mtr[NUM_MTRS];	/* Memory Technlogy Reg */
+	u16 b1_ambpresent0;	/* Branch 1, Channel 8 */
+	u16 b1_ambpresent1;	/* Branch 1, Channel 1 */
+
+	/* DIMM information matrix, allocating architecture maximums */
+	struct i5000_dimm_info dimm_info[MAX_CSROWS][MAX_CHANNELS];
+
+	/* Actual values for this controller */
+	int maxch;		/* Max channels */
+	int maxdimmperch;	/* Max DIMMs per channel */
+};
+
+/* I5000 MCH error information retrieved from Hardware */
+struct i5000_error_info {
+
+	/* These registers are always read from the MC */
+	u32 ferr_fat_fbd;	/* First Errors Fatal */
+	u32 nerr_fat_fbd;	/* Next Errors Fatal */
+	u32 ferr_nf_fbd;	/* First Errors Non-Fatal */
+	u32 nerr_nf_fbd;	/* Next Errors Non-Fatal */
+
+	/* These registers are input ONLY if there was a Recoverable  Error */
+	u32 redmemb;		/* Recoverable Mem Data Error log B */
+	u16 recmema;		/* Recoverable Mem Error log A */
+	u32 recmemb;		/* Recoverable Mem Error log B */
+
+	/* These registers are input ONLY if there was a
+	 * Non-Recoverable Error */
+	u16 nrecmema;		/* Non-Recoverable Mem log A */
+	u32 nrecmemb;		/* Non-Recoverable Mem log B */
+
+};
+
+static struct edac_pci_ctl_info *i5000_pci;
 
 /*
- * Regulator driver for DA9063 PMIC series
- *
- * Copyright 2012 Dialog Semiconductors Ltd.
- * Copyright 2013 Philipp Zabel, Pengutronix
- *
- * Author: Krystian Garbaciak <krystian.garbaciak@diasemi.com>
- *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the  License, or (at your
- *  option) any later version.
- *
+ *	i5000_get_error_info	Retrieve the hardware error information from
+ *				the hardware and cache it in the 'info'
+ *				structure
  */
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/err.h>
-#include <linux/slab.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/mfd/da9063/core.h>
-#include <linux/mfd/da9063/pdata.h>
-#include <linux/mfd/da9063/registers.h>
-
-
-/* Definition for registering regmap bit fields using a mask */
-#define BFIELD(_reg, _mask) \
-	REG_FIELD(_reg, __builtin_ffs((int)_mask) - 1, \
-		sizeof(unsigned int) * 8 - __builtin_clz((_mask)) - 1)
-
-/* Regulator capabilities and registers description */
-struct da9063_regulator_info {
-	struct regulator_desc desc;
-
-	/* Current limiting */
-	unsigned	n_current_limits;
-	const int	*current_limits;
-
-	/* DA9063 main register fields */
-	struct reg_field mode;		/* buck mode of operation */
-	struct reg_field suspend;
-	struct reg_field sleep;
-	struct reg_field suspend_sleep;
-	unsigned int suspend_vsel_reg;
-	struct reg_field ilimit;
-
-	/* DA9063 event detection bit */
-	struct reg_field oc_event;
-};
-
-/* Macros for LDO */
-#define DA9063_LDO(chip, regl_name, min_mV, step_mV, max_mV) \
-	.desc.id = chip##_ID_##regl_name, \
-	.desc.name = __stringify(chip##_##regl_name), \
-	.desc.ops = &da9063_ldo_ops, \
-	.desc.min_uV = (min_mV) * 1000, \
-	.desc.uV_step = (step_mV) * 1000, \
-	.desc.n_voltages = (((max_mV) - (min_mV))/(step_mV) + 1 \
-		+ (DA9063_V##regl_name##_BIAS)), \
-	.desc.enable_reg = DA9063_REG_##regl_name##_CONT, \
-	.desc.enable_mask = DA9063_LDO_EN, \
-	.desc.vsel_reg = DA9063_REG_V##regl_name##_A, \
-	.desc.vsel_mask = DA9063_V##regl_name##_MASK, \
-	.desc.linear_min_sel = DA9063_V##regl_name##_BIAS, \
-	.sleep = BFIELD(DA9063_REG_V##regl_name##_A, DA9063_LDO_SL), \
-	.suspend_sleep = BFIELD(DA9063_REG_V##regl_name##_B, DA9063_LDO_SL), \
-	.suspend_vsel_reg = DA9063_REG_V##regl_name##_B
-
-/* Macros for voltage DC/DC converters (BUCKs) */
-#define DA9063_BUCK(chip, regl_name, min_mV, step_mV, max_mV, limits_array) \
-	.desc.id = chip##_ID_##regl_name, \
-	.desc.name = __stringify(chip##_##regl_name), \
-	.desc.ops = &da9063_buck_ops, \
-	.desc.min_uV = (min_mV) * 1000, \
-	.desc.uV_step = (step_mV) * 1000, \
-	.desc.n_voltages = ((max_mV) - (min_mV))/(step_mV) + 1, \
-	.current_limits = limits_array, \
-	.n_current_limits = ARRAY_SIZE(limits_array)
-
-#define DA9063_BUCK_COMMON_FIELDS(regl_name) \
-	.desc.enable_reg = DA9063_REG_##regl_name##_CONT, \
-	.desc.enable_mask = DA9063_BUCK_EN, \
-	.desc.vsel_reg = DA9063_REG_V##regl_name##_A, \
-	.desc.vsel_mask = DA9063_VBUCK_MASK, \
-	.desc.linear_min_sel = DA9063_VBUCK_BIAS, \
-	.sleep = BFIELD(DA9063_REG_V##regl_name##_A, DA9063_BUCK_SL), \
-	.suspend_sleep = BFIELD(DA9063_REG_V##regl_name##_B, DA9063_BUCK_SL), \
-	.suspend_vsel_reg = DA9063_REG_V##regl_name##_B, \
-	.mode = BFIELD(DA9063_REG_##regl_name##_CFG, DA9063_BUCK_MODE_MASK)
-
-/* Defines asignment of regulators info table to chip model */
-struct da9063_dev_model {
-	const struct da9063_regulator_info	*regulator_info;
-	unsigned				n_regulators;
-	unsigned				dev_model;
-};
-
-/* Single regulator settings */
-struct da9063_regulator {
-	struct regulator_desc			desc;
-	struct regulator_dev			*rdev;
-	struct da9063				*hw;
-	const struct da9063_regulator_info	*info;
-
-	struct regmap_field			*mode;
-	struct regmap_field			*suspend;
-	struct regmap_field			*sleep;
-	struct regmap_field			*suspend_sleep;
-	struct regmap_field			*ilimit;
-};
-
-/* Encapsulates all information for the regulators driver */
-struct da9063_regulators {
-	unsigned				n_regulators;
-	/* Array size to be defined during init. Keep at end. */
-	struct da9063_regulator			regulator[0];
-};
-
-/* BUCK modes for DA9063 */
-enum {
-	BUCK_MODE_MANUAL,	/* 0 */
-	BUCK_MODE_SLEEP,	/* 1 */
-	BUCK_MODE_SYNC,		/* 2 */
-	BUCK_MODE_AUTO		/* 3 */
-};
-
-/* Regulator operations */
-
-/* Current limits array (in uA) for BCORE1, BCORE2, BPRO.
-   Entry indexes corresponds to register values. */
-static const int da9063_buck_a_limits[] = {
-	 500000,  600000,  700000,  800000,  900000, 1000000, 1100000, 1200000,
-	1300000, 1400000, 1500000, 1600000, 1700000, 1800000, 1900000, 2000000
-};
-
-/* Current limits array (in uA) for BMEM, BIO, BPERI.
-   Entry indexes corresponds to register values. */
-static const int da9063_buck_b_limits[] = {
-	1500000, 1600000, 1700000, 1800000, 1900000, 2000000, 2100000, 2200000,
-	2300000, 2400000, 2500000, 2600000, 2700000, 2800000, 2900000, 3000000
-};
-
-/* Current limits array (in uA) for merged BCORE1 and BCORE2.
-   Entry indexes corresponds to register values. */
-static const int da9063_bcores_merged_limits[] = {
-	1000000, 1200000, 1400000, 1600000, 1800000, 2000000, 2200000, 2400000,
-	2600000, 2800000, 3000000, 3200000, 3400000, 3600000, 3800000, 4000000
-};
-
-/* Current limits array (in uA) for merged BMEM and BIO.
-   Entry indexes corresponds to register values. */
-static const int da9063_bmem_bio_merged_limits[] = {
-	3000000, 3200000, 3400000, 3600000, 3800000, 4000000, 4200000, 4400000,
-	4600000, 4800000, 5000000, 5200000, 5400000, 5600000, 5800000, 6000000
-};
-
-static int da9063_set_current_limit(struct regulator_dev *rdev,
-							int min_uA, int max_uA)
+static void i5000_get_error_info(struct mem_ctl_info *mci,
+				 struct i5000_error_info *info)
 {
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	const struct da9063_regulator_info *rinfo = regl->info;
-	int n, tval;
+	struct i5000_pvt *pvt;
+	u32 value;
 
-	for (n = 0; n < rinfo->n_current_limits; n++) {
-		tval = rinfo->current_limits[n];
-		if (tval >= min_uA && tval <= max_uA)
-			return regmap_field_write(regl->ilimit, n);
+	pvt = mci->pvt_info;
+
+	/* read in the 1st FATAL error register */
+	pci_read_config_dword(pvt->branchmap_werrors, FERR_FAT_FBD, &value);
+
+	/* Mask only the bits that the doc says are valid
+	 */
+	value &= (FERR_FAT_FBDCHAN | FERR_FAT_MASK);
+
+	/* If there is an error, then read in the */
+	/* NEXT FATAL error register and the Memory Error Log Register A */
+	if (value & FERR_FAT_MASK) {
+		info->ferr_fat_fbd = value;
+
+		/* harvest the various error data we need */
+		pci_read_config_dword(pvt->branchmap_werrors,
+				NERR_FAT_FBD, &info->nerr_fat_fbd);
+		pci_read_config_word(pvt->branchmap_werrors,
+				NRECMEMA, &info->nrecmema);
+		pci_read_config_dword(pvt->branchmap_werrors,
+				NRECMEMB, &info->nrecmemb);
+
+		/* Clear the error bits, by writing them back */
+		pci_write_config_dword(pvt->branchmap_werrors,
+				FERR_FAT_FBD, value);
+	} else {
+		info->ferr_fat_fbd = 0;
+		info->nerr_fat_fbd = 0;
+		info->nrecmema = 0;
+		info->nrecmemb = 0;
 	}
 
-	return -EINVAL;
-}
+	/* read in the 1st NON-FATAL error register */
+	pci_read_config_dword(pvt->branchmap_werrors, FERR_NF_FBD, &value);
 
-static int da9063_get_current_limit(struct regulator_dev *rdev)
-{
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	const struct da9063_regulator_info *rinfo = regl->info;
-	unsigned int sel;
-	int ret;
+	/* If there is an error, then read in the 1st NON-FATAL error
+	 * register as well */
+	if (value & FERR_NF_MASK) {
+		info->ferr_nf_fbd = value;
 
-	ret = regmap_field_read(regl->ilimit, &sel);
-	if (ret < 0)
-		return ret;
+		/* harvest the various error data we need */
+		pci_read_config_dword(pvt->branchmap_werrors,
+				NERR_NF_FBD, &info->nerr_nf_fbd);
+		pci_read_config_word(pvt->branchmap_werrors,
+				RECMEMA, &info->recmema);
+		pci_read_config_dword(pvt->branchmap_werrors,
+				RECMEMB, &info->recmemb);
+		pci_read_config_dword(pvt->branchmap_werrors,
+				REDMEMB, &info->redmemb);
 
-	if (sel >= rinfo->n_current_limits)
-		sel = rinfo->n_current_limits - 1;
-
-	return rinfo->current_limits[sel];
-}
-
-static int da9063_buck_set_mode(struct regulator_dev *rdev, unsigned mode)
-{
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	unsigned val;
-
-	switch (mode) {
-	case REGULATOR_MODE_FAST:
-		val = BUCK_MODE_SYNC;
-		break;
-	case REGULATOR_MODE_NORMAL:
-		val = BUCK_MODE_AUTO;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = BUCK_MODE_SLEEP;
-		break;
-	default:
-		return -EINVAL;
+		/* Clear the error bits, by writing them back */
+		pci_write_config_dword(pvt->branchmap_werrors,
+				FERR_NF_FBD, value);
+	} else {
+		info->ferr_nf_fbd = 0;
+		info->nerr_nf_fbd = 0;
+		info->recmema = 0;
+		info->recmemb = 0;
+		info->redmemb = 0;
 	}
-
-	return regmap_field_write(regl->mode, val);
 }
 
 /*
- * Bucks use single mode register field for normal operation
- * and suspend state.
- * There are 3 modes to map to: FAST, NORMAL, and STANDBY.
+ * i5000_process_fatal_error_info(struct mem_ctl_info *mci,
+ * 					struct i5000_error_info *info,
+ * 					int handle_errors);
+ *
+ *	handle the Intel FATAL errors, if any
  */
-
-static unsigned da9063_buck_get_mode(struct regulator_dev *rdev)
+static void i5000_process_fatal_error_info(struct mem_ctl_info *mci,
+					struct i5000_error_info *info,
+					int handle_errors)
 {
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	struct regmap_field *field;
-	unsigned int val, mode = 0;
-	int ret;
+	char msg[EDAC_MC_LABEL_LEN + 1 + 160];
+	char *specific = NULL;
+	u32 allErrors;
+	int channel;
+	int bank;
+	int rank;
+	int rdwr;
+	int ras, cas;
 
-	ret = regmap_field_read(regl->mode, &val);
-	if (ret < 0)
-		return ret;
+	/* mask off the Error bits that are possible */
+	allErrors = (info->ferr_fat_fbd & FERR_FAT_MASK);
+	if (!allErrors)
+		return;		/* if no error, return now */
 
-	switch (val) {
-	default:
-	case BUCK_MODE_MANUAL:
-		mode = REGULATOR_MODE_FAST | REGULATOR_MODE_STANDBY;
-		/* Sleep flag bit decides the mode */
+	channel = EXTRACT_FBDCHAN_INDX(info->ferr_fat_fbd);
+
+	/* Use the NON-Recoverable macros to extract data */
+	bank = NREC_BANK(info->nrecmema);
+	rank = NREC_RANK(info->nrecmema);
+	rdwr = NREC_RDWR(info->nrecmema);
+	ras = NREC_RAS(info->nrecmemb);
+	cas = NREC_CAS(info->nrecmemb);
+
+	edac_dbg(0, "\t\tCSROW= %d  Channel= %d (DRAM Bank= %d rdwr= %s ras= %d cas= %d)\n",
+		 rank, channel, bank,
+		 rdwr ? "Write" : "Read", ras, cas);
+
+	/* Only 1 bit will be on */
+	switch (allErrors) {
+	case FERR_FAT_M1ERR:
+		specific = "Alert on non-redundant retry or fast "
+				"reset timeout";
 		break;
-	case BUCK_MODE_SLEEP:
-		return REGULATOR_MODE_STANDBY;
-	case BUCK_MODE_SYNC:
-		return REGULATOR_MODE_FAST;
-	case BUCK_MODE_AUTO:
-		return REGULATOR_MODE_NORMAL;
+	case FERR_FAT_M2ERR:
+		specific = "Northbound CRC error on non-redundant "
+				"retry";
+		break;
+	case FERR_FAT_M3ERR:
+		{
+		static int done;
+
+		/*
+		 * This error is generated to inform that the intelligent
+		 * throttling is disabled and the temperature passed the
+		 * specified middle point. Since this is something the BIOS
+		 * should take care of, we'll warn only once to avoid
+		 * worthlessly flooding the log.
+		 */
+		if (done)
+			return;
+		done++;
+
+		specific = ">Tmid Thermal event with intelligent "
+			   "throttling disabled";
+		}
+		break;
 	}
 
-	/* Detect current regulator state */
-	ret = regmap_field_read(regl->suspend, &val);
-	if (ret < 0)
-		return 0;
+	/* Form out message */
+	snprintf(msg, sizeof(msg),
+		 "Bank=%d RAS=%d CAS=%d FATAL Err=0x%x (%s)",
+		 bank, ras, cas, allErrors, specific);
 
-	/* Read regulator mode from proper register, depending on state */
-	if (val)
-		field = regl->suspend_sleep;
-	else
-		field = regl->sleep;
-
-	ret = regmap_field_read(field, &val);
-	if (ret < 0)
-		return 0;
-
-	if (val)
-		mode &= REGULATOR_MODE_STANDBY;
-	else
-		mode &= REGULATOR_MODE_NORMAL | REGULATOR_MODE_FAST;
-
-	return mode;
+	/* Call the helper to output message */
+	edac_mc_handle_error(HW_EVENT_ERR_FATAL, mci, 1, 0, 0, 0,
+			     channel >> 1, channel & 1, rank,
+			     rdwr ? "Write error" : "Read error",
+			     msg);
 }
 
 /*
- * LDOs use sleep flags - one for normal and one for suspend state.
- * There are 2 modes to map to: NORMAL and STANDBY (sleep) for each state.
+ * i5000_process_fatal_error_info(struct mem_ctl_info *mci,
+ * 				struct i5000_error_info *info,
+ * 				int handle_errors);
+ *
+ *	handle the Intel NON-FATAL errors, if any
  */
-
-static int da9063_ldo_set_mode(struct regulator_dev *rdev, unsigned mode)
+static void i5000_process_nonfatal_error_info(struct mem_ctl_info *mci,
+					struct i5000_error_info *info,
+					int handle_errors)
 {
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	unsigned val;
+	char msg[EDAC_MC_LABEL_LEN + 1 + 170];
+	char *specific = NULL;
+	u32 allErrors;
+	u32 ue_errors;
+	u32 ce_errors;
+	u32 misc_errors;
+	int branch;
+	int channel;
+	int bank;
+	int rank;
+	int rdwr;
+	int ras, cas;
 
-	switch (mode) {
-	case REGULATOR_MODE_NORMAL:
-		val = 0;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = 1;
-		break;
-	default:
-		return -EINVAL;
-	}
+	/* mask off the Error bits that are possible */
+	allErrors = (info->ferr_nf_fbd & FERR_NF_MASK);
+	if (!allErrors)
+		return;		/* if no error, return now */
 
-	return regmap_field_write(regl->sleep, val);
-}
+	/* ONLY ONE of the possible error bits will be set, as per the docs */
+	ue_errors = allErrors & FERR_NF_UNCORRECTABLE;
+	if (ue_errors) {
+		edac_dbg(0, "\tUncorrected bits= 0x%x\n", ue_errors);
 
-static unsigned da9063_ldo_get_mode(struct regulator_dev *rdev)
-{
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	struct regmap_field *field;
-	int ret, val;
+		branch = EXTRACT_FBDCHAN_INDX(info->ferr_nf_fbd);
 
-	/* Detect current regulator state */
-	ret = regmap_field_read(regl->suspend, &val);
-	if (ret < 0)
-		return 0;
+		/*
+		 * According with i5000 datasheet, bit 28 has no significance
+		 * for errors M4Err-M12Err and M17Err-M21Err, on FERR_NF_FBD
+		 */
+		channel = branch & 2;
 
-	/* Read regulator mode from proper register, depending on state */
-	if (val)
-		field = regl->suspend_sleep;
-	else
-		field = regl->sleep;
+		bank = NREC_BANK(info->nrecmema);
+		rank = NREC_RANK(info->nrecmema);
+		rdwr = NREC_RDWR(info->nrecmema);
+		ras = NREC_RAS(info->nrecmemb);
+		cas = NREC_CAS(info->nrecmemb);
 
-	ret = regmap_field_read(field, &val);
-	if (ret < 0)
-		return 0;
+		edac_dbg(0, "\t\tCSROW= %d  Channels= %d,%d  (Branch= %d DRAM Bank= %d rdwr= %s ras= %d cas= %d)\n",
+			 rank, channel, channel + 1, branch >> 1, bank,
+			 rdwr ? "Write" : "Read", ras, cas);
 
-	if (val)
-		return REGULATOR_MODE_STANDBY;
-	else
-		return REGULATOR_MODE_NORMAL;
-}
-
-static int da9063_buck_get_status(struct regulator_dev *rdev)
-{
-	int ret = regulator_is_enabled_regmap(rdev);
-
-	if (ret == 0) {
-		ret = REGULATOR_STATUS_OFF;
-	} else if (ret > 0) {
-		ret = da9063_buck_get_mode(rdev);
-		if (ret > 0)
-			ret = regulator_mode_to_status(ret);
-		else if (ret == 0)
-			ret = -EIO;
-	}
-
-	return ret;
-}
-
-static int da9063_ldo_get_status(struct regulator_dev *rdev)
-{
-	int ret = regulator_is_enabled_regmap(rdev);
-
-	if (ret == 0) {
-		ret = REGULATOR_STATUS_OFF;
-	} else if (ret > 0) {
-		ret = da9063_ldo_get_mode(rdev);
-		if (ret > 0)
-			ret = regulator_mode_to_status(ret);
-		else if (ret == 0)
-			ret = -EIO;
-	}
-
-	return ret;
-}
-
-static int da9063_set_suspend_voltage(struct regulator_dev *rdev, int uV)
-{
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	const struct da9063_regulator_info *rinfo = regl->info;
-	int ret, sel;
-
-	sel = regulator_map_voltage_linear(rdev, uV, uV);
-	if (sel < 0)
-		return sel;
-
-	sel <<= ffs(rdev->desc->vsel_mask) - 1;
-
-	ret = regmap_update_bits(regl->hw->regmap, rinfo->suspend_vsel_reg,
-				 rdev->desc->vsel_mask, sel);
-
-	return ret;
-}
-
-static int da9063_suspend_enable(struct regulator_dev *rdev)
-{
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-
-	return regmap_field_write(regl->suspend, 1);
-}
-
-static int da9063_suspend_disable(struct regulator_dev *rdev)
-{
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-
-	return regmap_field_write(regl->suspend, 0);
-}
-
-static int da9063_buck_set_suspend_mode(struct regulator_dev *rdev, unsigned mode)
-{
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	int val;
-
-	switch (mode) {
-	case REGULATOR_MODE_FAST:
-		val = BUCK_MODE_SYNC;
-		break;
-	case REGULATOR_MODE_NORMAL:
-		val = BUCK_MODE_AUTO;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = BUCK_MODE_SLEEP;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return regmap_field_write(regl->mode, val);
-}
-
-static int da9063_ldo_set_suspend_mode(struct regulator_dev *rdev, unsigned mode)
-{
-	struct da9063_regulator *regl = rdev_get_drvdata(rdev);
-	unsigned val;
-
-	switch (mode) {
-	case REGULATOR_MODE_NORMAL:
-		val = 0;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = 1;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return regmap_field_write(regl->suspend_sleep, val);
-}
-
-static struct regulator_ops da9063_buck_ops = {
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.set_current_limit	= da9063_set_current_limit,
-	.get_current_limit	= da9063_get_current_limit,
-	.set_mode		= da9063_buck_set_mode,
-	.get_mode		= da9063_buck_get_mode,
-	.get_status		= da9063_buck_get_status,
-	.set_suspend_voltage	= da9063_set_suspend_voltage,
-	.set_suspend_enable	= da9063_suspend_enable,
-	.set_suspend_disable	= da9063_suspend_disable,
-	.set_suspend_mode	= da9063_buck_set_suspend_mode,
-};
-
-static struct regulator_ops da9063_ldo_ops = {
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.set_mode		= da9063_ldo_set_mode,
-	.get_mode		= da9063_ldo_get_mode,
-	.get_status		= da9063_ldo_get_status,
-	.set_suspend_voltage	= da9063_set_suspend_voltage,
-	.set_suspend_enable	= da9063_suspend_enable,
-	.set_suspend_disable	= da9063_suspend_disable,
-	.set_suspend_mode	= da9063_ldo_set_suspend_mode,
-};
-
-/* Info of regulators for DA9063 */
-static const struct da9063_regulator_info da9063_regulator_info[] = {
-	{
-		DA9063_BUCK(DA9063, BCORE1, 300, 10, 1570,
-			    da9063_buck_a_limits),
-		DA9063_BUCK_COMMON_FIELDS(BCORE1),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VBCORE1_SEL),
-		.ilimit = BFIELD(DA9063_REG_BUCK_ILIM_C,
-				 DA9063_BCORE1_ILIM_MASK),
-	},
-	{
-		DA9063_BUCK(DA9063, BCORE2, 300, 10, 1570,
-			    da9063_buck_a_limits),
-		DA9063_BUCK_COMMON_FIELDS(BCORE2),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VBCORE2_SEL),
-		.ilimit = BFIELD(DA9063_REG_BUCK_ILIM_C,
-				 DA9063_BCORE2_ILIM_MASK),
-	},
-	{
-		DA9063_BUCK(DA9063, BPRO, 530, 10, 1800,
-			    da9063_buck_a_limits),
-		DA9063_BUCK_COMMON_FIELDS(BPRO),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VBPRO_SEL),
-		.ilimit = BFIELD(DA9063_REG_BUCK_ILIM_B,
-				 DA9063_BPRO_ILIM_MASK),
-	},
-	{
-		DA9063_BUCK(DA9063, BMEM, 800, 20, 3340,
-			    da9063_buck_b_limits),
-		DA9063_BUCK_COMMON_FIELDS(BMEM),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VBMEM_SEL),
-		.ilimit = BFIELD(DA9063_REG_BUCK_ILIM_A,
-				 DA9063_BMEM_ILIM_MASK),
-	},
-	{
-		DA9063_BUCK(DA9063, BIO, 800, 20, 3340,
-			    da9063_buck_b_limits),
-		DA9063_BUCK_COMMON_FIELDS(BIO),
-		.suspend = BFIELD(DA9063_REG_DVC_2, DA9063_VBIO_SEL),
-		.ilimit = BFIELD(DA9063_REG_BUCK_ILIM_A,
-				 DA9063_BIO_ILIM_MASK),
-	},
-	{
-		DA9063_BUCK(DA9063, BPERI, 800, 20, 3340,
-			    da9063_buck_b_limits),
-		DA9063_BUCK_COMMON_FIELDS(BPERI),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VBPERI_SEL),
-		.ilimit = BFIELD(DA9063_REG_BUCK_ILIM_B,
-				 DA9063_BPERI_ILIM_MASK),
-	},
-	{
-		DA9063_BUCK(DA9063, BCORES_MERGED, 300, 10, 1570,
-			    da9063_bcores_merged_limits),
-		/* BCORES_MERGED uses the same register fields as BCORE1 */
-		DA9063_BUCK_COMMON_FIELDS(BCORE1),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VBCORE1_SEL),
-		.ilimit = BFIELD(DA9063_REG_BUCK_ILIM_C,
-				 DA9063_BCORE1_ILIM_MASK),
-	},
-	{
-		DA9063_BUCK(DA9063, BMEM_BIO_MERGED, 800, 20, 3340,
-			    da9063_bmem_bio_merged_limits),
-		/* BMEM_BIO_MERGED uses the same register fields as BMEM */
-		DA9063_BUCK_COMMON_FIELDS(BMEM),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VBMEM_SEL),
-		.ilimit = BFIELD(DA9063_REG_BUCK_ILIM_A,
-				 DA9063_BMEM_ILIM_MASK),
-	},
-	{
-		DA9063_LDO(DA9063, LDO1, 600, 20, 1860),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VLDO1_SEL),
-	},
-	{
-		DA9063_LDO(DA9063, LDO2, 600, 20, 1860),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VLDO2_SEL),
-	},
-	{
-		DA9063_LDO(DA9063, LDO3, 900, 20, 3440),
-		.suspend = BFIELD(DA9063_REG_DVC_1, DA9063_VLDO3_SEL),
-		.oc_event = BFIELD(DA9063_REG_STATUS_D, DA9063_LDO3_LIM),
-	},
-	{
-		DA9063_LDO(DA9063, LDO4, 900, 20, 3440),
-		.suspend = BFIELD(DA9063_REG_DVC_2, DA9063_VLDO4_SEL),
-		.oc_event = BFIELD(DA9063_REG_STATUS_D, DA9063_LDO4_LIM),
-	},
-	{
-		DA9063_LDO(DA9063, LDO5, 900, 50, 3600),
-		.suspend = BFIELD(DA9063_REG_LDO5_CONT, DA9063_VLDO5_SEL),
-	},
-	{
-		DA9063_LDO(DA9063, LDO6, 900, 50, 3600),
-		.suspend = BFIELD(DA9063_REG_LDO6_CONT, DA9063_VLDO6_SEL),
-	},
-	{
-		DA9063_LDO(DA9063, LDO7, 900, 50, 3600),
-		.suspend = BFIELD(DA9063_REG_LDO7_CONT, DA9063_VLDO7_SEL),
-		.oc_event = BFIELD(DA9063_REG_STATUS_D, DA9063_LDO7_LIM),
-	},
-	{
-		DA9063_LDO(DA9063, LDO8, 900, 50, 3600),
-		.suspend = BFIELD(DA9063_REG_LDO8_CONT, DA9063_VLDO8_SEL),
-		.oc_event = BFIELD(DA9063_REG_STATUS_D, DA9063_LDO8_LIM),
-	},
-	{
-		DA9063_LDO(DA9063, LDO9, 950, 50, 3600),
-		.suspend = BFIELD(DA9063_REG_LDO9_CONT, DA9063_VLDO9_SEL),
-	},
-	{
-		DA9063_LDO(DA9063, LDO10, 900, 50, 3600),
-		.suspend = BFIELD(DA9063_REG_LDO10_CONT, DA9063_VLDO10_SEL),
-	},
-	{
-		DA9063_LDO(DA9063, LDO11, 900, 50, 3600),
-		.suspend = BFIELD(DA9063_REG_LDO11_CONT, DA9063_VLDO11_SEL),
-		.oc_event = BFIELD(DA9063_REG_STATUS_D, DA9063_LDO11_LIM),
-	},
-};
-
-/* Link chip model with regulators info table */
-static struct da9063_dev_model regulators_models[] = {
-	{
-		.regulator_info = da9063_regulator_info,
-		.n_regulators = ARRAY_SIZE(da9063_regulator_info),
-		.dev_model = PMIC_DA9063,
-	},
-	{ }
-};
-
-/* Regulator interrupt handlers */
-static irqreturn_t da9063_ldo_lim_event(int irq, void *data)
-{
-	struct da9063_regulators *regulators = data;
-	struct da9063 *hw = regulators->regulator[0].hw;
-	struct da9063_regulator *regl;
-	int bits, i , ret;
-
-	ret = regmap_read(hw->regmap, DA9063_REG_STATUS_D, &bits);
-	if (ret < 0)
-		return IRQ_NONE;
-
-	for (i = regulators->n_regulators - 1; i >= 0; i--) {
-		regl = &regulators->regulator[i];
-		if (regl->info->oc_event.reg != DA9063_REG_STATUS_D)
-			continue;
-
-		if (BIT(regl->info->oc_event.lsb) & bits)
-			regulator_notifier_call_chain(regl->rdev,
-					REGULATOR_EVENT_OVER_CURRENT, NULL);
-	}
-
-	return IRQ_HANDLED;
-}
-
-/*
- * Probing and Initialisation functions
- */
-static const struct regulator_init_data *da9063_get_regulator_initdata(
-		const struct da9063_regulators_pdata *regl_pdata, int id)
-{
-	int i;
-
-	for (i = 0; i < regl_pdata->n_regulators; i++) {
-		if (id == regl_pdata->regulator_data[i].id)
-			return regl_pdata->regulator_data[i].initdata;
-	}
-
-	return NULL;
-}
-
-#ifdef CONFIG_OF
-static struct of_regulator_match da9063_matches[] = {
-	[DA9063_ID_BCORE1]           = { .name = "bcore1"           },
-	[DA9063_ID_BCORE2]           = { .name = "bcore2"           },
-	[DA9063_ID_BPRO]             = { .name = "bpro",            },
-	[DA9063_ID_BMEM]             = { .name = "bmem",            },
-	[DA9063_ID_BIO]              = { .name = "bio",             },
-	[DA9063_ID_BPERI]            = { .name = "bperi",           },
-	[DA9063_ID_BCORES_MERGED]    = { .name = "bcores-merged"    },
-	[DA9063_ID_BMEM_BIO_MERGED]  = { .name = "bmem-bio-merged", },
-	[DA9063_ID_LDO1]             = { .name = "ldo1",            },
-	[DA9063_ID_LDO2]             = { .name = "ldo2",            },
-	[DA9063_ID_LDO3]             = { .name = "ldo3",            },
-	[DA9063_ID_LDO4]             = { .name = "ldo4",            },
-	[DA9063_ID_LDO5]             = { .name = "ldo5",            },
-	[DA9063_ID_LDO6]             = { .name = "ldo6",            },
-	[DA9063_ID_LDO7]             = { .name = "ldo7",            },
-	[DA9063_ID_LDO8]             = { .name = "ldo8",            },
-	[DA9063_ID_LDO9]             = { .name = "ldo9",            },
-	[DA9063_ID_LDO10]            = { .name = "ldo10",           },
-	[DA9063_ID_LDO11]            = { .name = "ldo11",           },
-};
-
-static struct da9063_regulators_pdata *da9063_parse_regulators_dt(
-		struct platform_device *pdev,
-		struct of_regulator_match **da9063_reg_matches)
-{
-	struct da9063_regulators_pdata *pdata;
-	struct da9063_regulator_data *rdata;
-	struct device_node *node;
-	int i, n, num;
-
-	node = of_get_child_by_name(pdev->dev.parent->of_node, "regulators");
-	if (!node) {
-		dev_err(&pdev->dev, "Regulators device node not found\n");
-		return ERR_PTR(-ENODEV);
-	}
-
-	num = of_regulator_match(&pdev->dev, node, da9063_matches,
-				 ARRAY_SIZE(da9063_matches));
-	of_node_put(node);
-	if (num < 0) {
-		dev_err(&pdev->dev, "Failed to match regulators\n");
-		return ERR_PTR(-EINVAL);
-	}
-
-	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata)
-		return ERR_PTR(-ENOMEM);
-
-	pdata->regulator_data = devm_kzalloc(&pdev->dev,
-					num * sizeof(*pdata->regulator_data),
-					GFP_KERNEL);
-	if (!pdata->regulator_data)
-		return ERR_PTR(-ENOMEM);
-	pdata->n_regulators = num;
-
-	n = 0;
-	for (i = 0; i < ARRAY_SIZE(da9063_matches); i++) {
-		if (!da9063_matches[i].init_data)
-			continue;
-
-		rdata = &pdata->regulator_data[n];
-		rdata->id = i;
-		rdata->initdata = da9063_matches[i].init_data;
-
-		n++;
-	}
-
-	*da9063_reg_matches = da9063_matches;
-	return pdata;
-}
-#else
-static struct da9063_regulators_pdata *da9063_parse_regulators_dt(
-		struct platform_device *pdev,
-		struct of_regulator_match **da9063_reg_matches)
-{
-	*da9063_reg_matches = NULL;
-	return ERR_PTR(-ENODEV);
-}
-#endif
-
-static int da9063_regulator_probe(struct platform_device *pdev)
-{
-	struct da9063 *da9063 = dev_get_drvdata(pdev->dev.parent);
-	struct da9063_pdata *da9063_pdata = dev_get_platdata(da9063->dev);
-	struct of_regulator_match *da9063_reg_matches = NULL;
-	struct da9063_regulators_pdata *regl_pdata;
-	const struct da9063_dev_model *model;
-	struct da9063_regulators *regulators;
-	struct da9063_regulator *regl;
-	struct regulator_config config;
-	bool bcores_merged, bmem_bio_merged;
-	int id, irq, n, n_regulators, ret, val;
-	size_t size;
-
-	regl_pdata = da9063_pdata ? da9063_pdata->regulators_pdata : NULL;
-
-	if (!regl_pdata)
-		regl_pdata = da9063_parse_regulators_dt(pdev,
-							&da9063_reg_matches);
-
-	if (IS_ERR(regl_pdata) || regl_pdata->n_regulators == 0) {
-		dev_err(&pdev->dev,
-			"No regulators defined for the platform\n");
-		return PTR_ERR(regl_pdata);
-	}
-
-	/* Find regulators set for particular device model */
-	for (model = regulators_models; model->regulator_info; model++) {
-		if (model->dev_model == da9063->model)
+		switch (ue_errors) {
+		case FERR_NF_M12ERR:
+			specific = "Non-Aliased Uncorrectable Patrol Data ECC";
 			break;
-	}
-	if (!model->regulator_info) {
-		dev_err(&pdev->dev, "Chip model not recognised (%u)\n",
-			da9063->model);
-		return -ENODEV;
-	}
-
-	ret = regmap_read(da9063->regmap, DA9063_REG_CONFIG_H, &val);
-	if (ret < 0) {
-		dev_err(&pdev->dev,
-			"Error while reading BUCKs configuration\n");
-		return ret;
-	}
-	bcores_merged = val & DA9063_BCORE_MERGE;
-	bmem_bio_merged = val & DA9063_BUCK_MERGE;
-
-	n_regulators = model->n_regulators;
-	if (bcores_merged)
-		n_regulators -= 2; /* remove BCORE1, BCORE2 */
-	else
-		n_regulators--;    /* remove BCORES_MERGED */
-	if (bmem_bio_merged)
-		n_regulators -= 2; /* remove BMEM, BIO */
-	else
-		n_regulators--;    /* remove BMEM_BIO_MERGED */
-
-	/* Allocate memory required by usable regulators */
-	size = sizeof(struct da9063_regulators) +
-		n_regulators * sizeof(struct da9063_regulator);
-	regulators = devm_kzalloc(&pdev->dev, size, GFP_KERNEL);
-	if (!regulators)
-		return -ENOMEM;
-
-	regulators->n_regulators = n_regulators;
-	platform_set_drvdata(pdev, regulators);
-
-	/* Register all regulators declared in platform information */
-	n = 0;
-	id = 0;
-	while (n < regulators->n_regulators) {
-		/* Skip regulator IDs depending on merge mode configuration */
-		switch (id) {
-		case DA9063_ID_BCORE1:
-		case DA9063_ID_BCORE2:
-			if (bcores_merged) {
-				id++;
-				continue;
-			}
+		case FERR_NF_M11ERR:
+			specific = "Non-Aliased Uncorrectable Spare-Copy "
+					"Data ECC";
 			break;
-		case DA9063_ID_BMEM:
-		case DA9063_ID_BIO:
-			if (bmem_bio_merged) {
-				id++;
-				continue;
-			}
+		case FERR_NF_M10ERR:
+			specific = "Non-Aliased Uncorrectable Mirrored Demand "
+					"Data ECC";
 			break;
-		case DA9063_ID_BCORES_MERGED:
-			if (!bcores_merged) {
-				id++;
-				continue;
-			}
+		case FERR_NF_M9ERR:
+			specific = "Non-Aliased Uncorrectable Non-Mirrored "
+					"Demand Data ECC";
 			break;
-		case DA9063_ID_BMEM_BIO_MERGED:
-			if (!bmem_bio_merged) {
-				id++;
-				continue;
-			}
+		case FERR_NF_M8ERR:
+			specific = "Aliased Uncorrectable Patrol Data ECC";
+			break;
+		case FERR_NF_M7ERR:
+			specific = "Aliased Uncorrectable Spare-Copy Data ECC";
+			break;
+		case FERR_NF_M6ERR:
+			specific = "Aliased Uncorrectable Mirrored Demand "
+					"Data ECC";
+			break;
+		case FERR_NF_M5ERR:
+			specific = "Aliased Uncorrectable Non-Mirrored Demand "
+					"Data ECC";
+			break;
+		case FERR_NF_M4ERR:
+			specific = "Uncorrectable Data ECC on Replay";
 			break;
 		}
 
-		/* Initialise regulator structure */
-		regl = &regulators->regulator[n];
-		regl->hw = da9063;
-		regl->info = &model->regulator_info[id];
-		regl->desc = regl->info->desc;
-		regl->desc.type = REGULATOR_VOLTAGE;
-		regl->desc.owner = THIS_MODULE;
+		/* Form out message */
+		snprintf(msg, sizeof(msg),
+			 "Rank=%d Bank=%d RAS=%d CAS=%d, UE Err=0x%x (%s)",
+			 rank, bank, ras, cas, ue_errors, specific);
 
-		if (regl->info->mode.reg)
-			regl->mode = devm_regmap_field_alloc(&pdev->dev,
-					da9063->regmap, regl->info->mode);
-		if (regl->info->suspend.reg)
-			regl->suspend = devm_regmap_field_alloc(&pdev->dev,
-					da9063->regmap, regl->info->suspend);
-		if (regl->info->sleep.reg)
-			regl->sleep = devm_regmap_field_alloc(&pdev->dev,
-					da9063->regmap, regl->info->sleep);
-		if (regl->info->suspend_sleep.reg)
-			regl->suspend_sleep = devm_regmap_field_alloc(&pdev->dev,
-					da9063->regmap, regl->info->suspend_sleep);
-		if (regl->info->ilimit.reg)
-			regl->ilimit = devm_regmap_field_alloc(&pdev->dev,
-					da9063->regmap, regl->info->ilimit);
+		/* Call the helper to output message */
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1, 0, 0, 0,
+				channel >> 1, -1, rank,
+				rdwr ? "Write error" : "Read error",
+				msg);
+	}
 
-		/* Register regulator */
-		memset(&config, 0, sizeof(config));
-		config.dev = &pdev->dev;
-		config.init_data = da9063_get_regulator_initdata(regl_pdata, id);
-		config.driver_data = regl;
-		if (da9063_reg_matches)
-			config.of_node = da9063_reg_matches[id].of_node;
-		config.regmap = da9063->regmap;
-		regl->rdev = devm_regulator_register(&pdev->dev, &regl->desc,
-						     &config);
-		if (IS_ERR(regl->rdev)) {
-			dev_err(&pdev->dev,
-				"Failed to register %s regulator\n",
-				regl->desc.name);
-			return PTR_ERR(regl->rdev);
+	/* Check correctable errors */
+	ce_errors = allErrors & FERR_NF_CORRECTABLE;
+	if (ce_errors) {
+		edac_dbg(0, "\tCorrected bits= 0x%x\n", ce_errors);
+
+		branch = EXTRACT_FBDCHAN_INDX(info->ferr_nf_fbd);
+
+		channel = 0;
+		if (REC_ECC_LOCATOR_ODD(info->redmemb))
+			channel = 1;
+
+		/* Convert channel to be based from zero, instead of
+		 * from branch base of 0 */
+		channel += branch;
+
+		bank = REC_BANK(info->recmema);
+		rank = REC_RANK(info->recmema);
+		rdwr = REC_RDWR(info->recmema);
+		ras = REC_RAS(info->recmemb);
+		cas = REC_CAS(info->recmemb);
+
+		edac_dbg(0, "\t\tCSROW= %d Channel= %d  (Branch %d DRAM Bank= %d rdwr= %s ras= %d cas= %d)\n",
+			 rank, channel, branch >> 1, bank,
+			 rdwr ? "Write" : "Read", ras, cas);
+
+		switch (ce_errors) {
+		case FERR_NF_M17ERR:
+			specific = "Correctable Non-Mirrored Demand Data ECC";
+			break;
+		case FERR_NF_M18ERR:
+			specific = "Correctable Mirrored Demand Data ECC";
+			break;
+		case FERR_NF_M19ERR:
+			specific = "Correctable Spare-Copy Data ECC";
+			break;
+		case FERR_NF_M20ERR:
+			specific = "Correctable Patrol Data ECC";
+			break;
 		}
-		id++;
-		n++;
+
+		/* Form out message */
+		snprintf(msg, sizeof(msg),
+			 "Rank=%d Bank=%d RDWR=%s RAS=%d "
+			 "CAS=%d, CE Err=0x%x (%s))", branch >> 1, bank,
+			 rdwr ? "Write" : "Read", ras, cas, ce_errors,
+			 specific);
+
+		/* Call the helper to output message */
+		edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1, 0, 0, 0,
+				channel >> 1, channel % 2, rank,
+				rdwr ? "Write error" : "Read error",
+				msg);
 	}
 
-	/* LDOs overcurrent event support */
-	irq = platform_get_irq_byname(pdev, "LDO_LIM");
-	if (irq < 0) {
-		dev_err(&pdev->dev, "Failed to get IRQ.\n");
-		return irq;
+	if (!misc_messages)
+		return;
+
+	misc_errors = allErrors & (FERR_NF_NON_RETRY | FERR_NF_NORTH_CRC |
+				   FERR_NF_SPD_PROTOCOL | FERR_NF_DIMM_SPARE);
+	if (misc_errors) {
+		switch (misc_errors) {
+		case FERR_NF_M13ERR:
+			specific = "Non-Retry or Redundant Retry FBD Memory "
+					"Alert or Redundant Fast Reset Timeout";
+			break;
+		case FERR_NF_M14ERR:
+			specific = "Non-Retry or Redundant Retry FBD "
+					"Configuration Alert";
+			break;
+		case FERR_NF_M15ERR:
+			specific = "Non-Retry or Redundant Retry FBD "
+					"Northbound CRC error on read data";
+			break;
+		case FERR_NF_M21ERR:
+			specific = "FBD Northbound CRC error on "
+					"FBD Sync Status";
+			break;
+		case FERR_NF_M22ERR:
+			specific = "SPD protocol error";
+			break;
+		case FERR_NF_M27ERR:
+			specific = "DIMM-spare copy started";
+			break;
+		case FERR_NF_M28ERR:
+			specific = "DIMM-spare copy completed";
+			break;
+		}
+		branch = EXTRACT_FBDCHAN_INDX(info->ferr_nf_fbd);
+
+		/* Form out message */
+		snprintf(msg, sizeof(msg),
+			 "Err=%#x (%s)", misc_errors, specific);
+
+		/* Call the helper to output message */
+		edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1, 0, 0, 0,
+				branch >> 1, -1, -1,
+				"Misc error", msg);
+	}
+}
+
+/*
+ *	i5000_process_error_info	Process the error info that is
+ *	in the 'info' structure, previously retrieved from hardware
+ */
+static void i5000_process_error_info(struct mem_ctl_info *mci,
+				struct i5000_error_info *info,
+				int handle_errors)
+{
+	/* First handle any fatal errors that occurred */
+	i5000_process_fatal_error_info(mci, info, handle_errors);
+
+	/* now handle any non-fatal errors that occurred */
+	i5000_process_nonfatal_error_info(mci, info, handle_errors);
+}
+
+/*
+ *	i5000_clear_error	Retrieve any error from the hardware
+ *				but do NOT process that error.
+ *				Used for 'clearing' out of previous errors
+ *				Called by the Core module.
+ */
+static void i5000_clear_error(struct mem_ctl_info *mci)
+{
+	struct i5000_error_info info;
+
+	i5000_get_error_info(mci, &info);
+}
+
+/*
+ *	i5000_check_error	Retrieve and process errors reported by the
+ *				hardware. Called by the Core module.
+ */
+static void i5000_check_error(struct mem_ctl_info *mci)
+{
+	struct i5000_error_info info;
+	edac_dbg(4, "MC%d\n", mci->mc_idx);
+	i5000_get_error_info(mci, &info);
+	i5000_process_error_info(mci, &info, 1);
+}
+
+/*
+ *	i5000_get_devices	Find and perform 'get' operation on the MCH's
+ *			device/functions we want to reference for this driver
+ *
+ *			Need to 'get' device 16 func 1 and func 2
+ */
+static int i5000_get_devices(struct mem_ctl_info *mci, int dev_idx)
+{
+	//const struct i5000_dev_info *i5000_dev = &i5000_devs[dev_idx];
+	struct i5000_pvt *pvt;
+	struct pci_dev *pdev;
+
+	pvt = mci->pvt_info;
+
+	/* Attempt to 'get' the MCH register we want */
+	pdev = NULL;
+	while (1) {
+		pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_INTEL_I5000_DEV16, pdev);
+
+		/* End of list, leave */
+		if (pdev == NULL) {
+			i5000_printk(KERN_ERR,
+				"'system address,Process Bus' "
+				"device not found:"
+				"vendor 0x%x device 0x%x FUNC 1 "
+				"(broken BIOS?)\n",
+				PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_INTEL_I5000_DEV16);
+
+			return 1;
+		}
+
+		/* Scan for device 16 func 1 */
+		if (PCI_FUNC(pdev->devfn) == 1)
+			break;
 	}
 
-	ret = devm_request_threaded_irq(&pdev->dev, irq,
-				NULL, da9063_ldo_lim_event,
-				IRQF_TRIGGER_LOW | IRQF_ONESHOT,
-				"LDO_LIM", regulators);
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to request LDO_LIM IRQ.\n");
-		return ret;
+	pvt->branchmap_werrors = pdev;
+
+	/* Attempt to 'get' the MCH register we want */
+	pdev = NULL;
+	while (1) {
+		pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_INTEL_I5000_DEV16, pdev);
+
+		if (pdev == NULL) {
+			i5000_printk(KERN_ERR,
+				"MC: 'branchmap,control,errors' "
+				"device not found:"
+				"vendor 0x%x device 0x%x Func 2 "
+				"(broken BIOS?)\n",
+				PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_INTEL_I5000_DEV16);
+
+			pci_dev_put(pvt->branchmap_werrors);
+			return 1;
+		}
+
+		/* Scan for device 16 func 1 */
+		if (PCI_FUNC(pdev->devfn) == 2)
+			break;
+	}
+
+	pvt->fsb_error_regs = pdev;
+
+	edac_dbg(1, "System Address, processor bus- PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->system_address),
+		 pvt->system_address->vendor, pvt->system_address->device);
+	edac_dbg(1, "Branchmap, control and errors - PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->branchmap_werrors),
+		 pvt->branchmap_werrors->vendor,
+		 pvt->branchmap_werrors->device);
+	edac_dbg(1, "FSB Error Regs - PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->fsb_error_regs),
+		 pvt->fsb_error_regs->vendor, pvt->fsb_error_regs->device);
+
+	pdev = NULL;
+	pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+			PCI_DEVICE_ID_I5000_BRANCH_0, pdev);
+
+	if (pdev == NULL) {
+		i5000_printk(KERN_ERR,
+			"MC: 'BRANCH 0' device not found:"
+			"vendor 0x%x device 0x%x Func 0 (broken BIOS?)\n",
+			PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_I5000_BRANCH_0);
+
+		pci_dev_put(pvt->branchmap_werrors);
+		pci_dev_put(pvt->fsb_error_regs);
+		return 1;
+	}
+
+	pvt->branch_0 = pdev;
+
+	/* If this device claims to have more than 2 channels then
+	 * fetch Branch 1's information
+	 */
+	if (pvt->maxch >= CHANNELS_PER_BRANCH) {
+		pdev = NULL;
+		pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_I5000_BRANCH_1, pdev);
+
+		if (pdev == NULL) {
+			i5000_printk(KERN_ERR,
+				"MC: 'BRANCH 1' device not found:"
+				"vendor 0x%x device 0x%x Func 0 "
+				"(broken BIOS?)\n",
+				PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_I5000_BRANCH_1);
+
+			pci_dev_put(pvt->branchmap_werrors);
+			pci_dev_put(pvt->fsb_error_regs);
+			pci_dev_put(pvt->branch_0);
+			return 1;
+		}
+
+		pvt->branch_1 = pdev;
 	}
 
 	return 0;
 }
 
-static struct platform_driver da9063_regulator_driver = {
-	.driver = {
-		.name = DA9063_DRVNAME_REGULATORS,
-	},
-	.probe = da9063_regulator_probe,
-};
-
-static int __init da9063_regulator_init(void)
+/*
+ *	i5000_put_devices	'put' all the devices that we have
+ *				reserved via 'get'
+ */
+static void i5000_put_devices(struct mem_ctl_info *mci)
 {
-	return platform_driver_register(&da9063_regulator_driver);
-}
-subsys_initcall(da9063_regulator_init);
+	struct i5000_pvt *pvt;
 
-static void __exit da9063_regulator_cleanup(void)
+	pvt = mci->pvt_info;
+
+	pci_dev_put(pvt->branchmap_werrors);	/* FUNC 1 */
+	pci_dev_put(pvt->fsb_error_regs);	/* FUNC 2 */
+	pci_dev_put(pvt->branch_0);	/* DEV 21 */
+
+	/* Only if more than 2 channels do we release the second branch */
+	if (pvt->maxch >= CHANNELS_PER_BRANCH)
+		pci_dev_put(pvt->branch_1);	/* DEV 22 */
+}
+
+/*
+ *	determine_amb_resent
+ *
+ *		the information is contained in NUM_MTRS different registers
+ *		determineing which of the NUM_MTRS requires knowing
+ *		which channel is in question
+ *
+ *	2 branches, each with 2 channels
+ *		b0_ambpresent0 for channel '0'
+ *		b0_ambpresent1 for channel '1'
+ *		b1_ambpresent0 for channel '2'
+ *		b1_ambpresent1 for channel '3'
+ */
+static int determine_amb_present_reg(struct i5000_pvt *pvt, int channel)
 {
-	platform_driver_unregister(&da9063_regulator_driver);
+	int amb_present;
+
+	if (channel < CHANNELS_PER_BRANCH) {
+		if (channel & 0x1)
+			amb_present = pvt->b0_ambpresent1;
+		else
+			amb_present = pvt->b0_ambpresent0;
+	} else {
+		if (channel & 0x1)
+			amb_present = pvt->b1_ambpresent1;
+		else
+			amb_present = pvt->b1_ambpresent0;
+	}
+
+	return amb_present;
 }
-module_exit(da9063_regulator_cleanup);
 
+/*
+ * determine_mtr(pvt, csrow, channel)
+ *
+ *	return the proper MTR register as determine by the csrow and channel desired
+ */
+static int determine_mtr(struct i5000_pvt *pvt, int slot, int channel)
+{
+	int mtr;
 
-/* Module information */
-MODULE_AUTHOR("Krystian Garbaciak <krystian.garbaciak@diasemi.com>");
-MODULE_DESCRIPTION("DA9063 regulators driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("paltform:" DA9063_DRVNAME_REGULATORS);
+	if (channel < CHANNELS_PER_BRANCH)
+		mtr = pvt->b0_mtr[slot];
+	else
+		mtr = pvt->b1_mtr[slot];
+
+	return mtr;
+}
+
+/*
+ */
+static void decode_mtr(int slot_row, u16 mtr)
+{
+	int ans;
+
+	ans = MTR_DIMMS_PRESENT(mtr);
+
+	edac_dbg(2, "\tMTR%d=0x%x:  DIMMs are %sPresent\n",
+		 slot_row, mtr, ans ? "" : "NOT ");
+	if (!ans)
+		return;
+
+	edac_dbg(2, "\t\tWIDTH: x%d\n", MTR_DRAM_WIDTH(mtr));
+	edac_dbg(2, "\t\tNUMBANK: %d bank(s)\n", MTR_DRAM_BANKS(mtr));
+	edac_dbg(2, "\t\tNUMRANK: %s\n",
+		 MTR_DIMM_RANK(mtr) ? "double" : "single");
+	edac_dbg(2, "\t\tNUMROW: %s\n",
+		 MTR_DIMM_ROWS(mtr) == 0 ? "8,192 - 13 rows" :
+		 MTR_DIMM_ROWS(mtr) == 1 ? "16,384 - 14 rows" :
+		 MTR_DIMM_ROWS(mtr) == 2 ? "32,768 - 15 rows" :
+		 "reserved");
+	edac_dbg(2, "\t\tNUMCOL: %s\n",
+		 MTR_DIMM_COLS(mtr) == 0 ? "1,024 - 10 columns" :
+		 MTR_DIMM_COLS(mtr) == 1 ? "2,048 - 11 columns" :
+		 MTR_DIMM_COLS(mtr) == 2 ? "4,096 - 12 columns" :
+		 "reserved");
+}
+
+static void handle_channel(struct i5000_pvt *pvt, int slot, int channel,
+			struct i5000_dimm_info *dinfo)
+{
+	int mtr;
+	int amb_present_reg;
+	int addrBits;
+
+	mtr = determine_mtr(pvt, slot, channel);
+	if (MTR_DIMMS_PRESENT(mtr)) {
+		amb_present_reg = determine_amb_present_reg(pvt, channel);
+
+		/* Determine if there is a DIMM present in this DIMM slot */
+		if (amb_present_reg) {
+			dinfo->dual_rank = MTR_DIMM_RANK(mtr);
+
+			/* Start with the number of bits for a Bank
+				* on the DRAM */
+			addrBits = MTR_DRAM_BANKS_ADDR_BITS(mtr);
+			/* Add the number of ROW bits */
+			addrBits += MTR_DIMM_ROWS_ADDR_BITS(mtr);
+			/* add the number of COLUMN bits */
+			addrBits += MTR_DIMM_COLS_ADDR_BITS(mtr);
+
+			/* Dual-rank memories have twice the size */
+			if (dinfo->dual_rank)
+				addrBits++;
+
+			addrBits += 6;	/* add 64 bits per DIMM */
+			addrBits -= 20;	/* divide by 2^^20 */
+			addrBits -= 3;	/* 8 bits per bytes */
+
+			dinfo->megabytes = 1 << addrBits;
+		}
+	}
+}
+
+/*
+ *	calculate_dimm_size
+ *
+ *	also will output a DIMM matrix map, if debug is enabled, for viewing
+ *	how the DIMMs are populated
+ */
+static void calculate_dimm_size(struct i5000_pvt *pvt)
+{
+	struct i5000_dimm_info *dinfo;
+	int slot, channel, branch;
+	char *p, *mem_buffer;
+	int space, n;
+
+	/* ================= Generate some debug output ================= */
+	space = PAGE_SIZE;
+	mem_buffer = p = kmalloc(space, GFP_KERNEL);
+	if (p == NULL) {
+		i5000_printk(KERN_ERR, "MC: %s:%s() kmalloc() failed\n",
+			__FILE__, __func__);
+		return;
+	}
+
+	/* Scan all the actual slots
+	 * and calculate the information for each DIMM
+	 * Start with the highest slot first, to display it first
+	 * and work toward the 0th slot
+	 */
+	for (slot = pvt->maxdimmperch - 1; slot >= 0; slot--) {
+
+		/* on an odd slot, first output a 'boundary' marker,
+		 * then reset the message buffer  */
+		if (slot & 0x1) {
+			n = snprintf(p, space, "--------------------------"
+				"--------------------------------");
+			p += n;
+			space -= n;
+			edac_dbg(2, "%s\n", mem_buffer);
+			p = mem_buffer;
+			space = PAGE_SIZE;
+		}
+		n = snprintf(p, space, "slot %2d    ", slot);
+		p += n;
+		space -= n;
+
+		for (channel = 0; channel < pvt->maxch; channel++) {
+			dinfo = &pvt->dimm_info[slot][channel];
+			handle_channel(pvt, slot, channel, dinfo);
+			if (dinfo->megabytes)
+				n = snprintf(p, space, "%4d MB %dR| ",
+					     dinfo->megabytes, dinfo->dual_rank + 1);
+			else
+				n = snprintf(p, space, "%4d MB   | ", 0);
+			p += n;
+			space -= n;
+		}
+		p += n;
+		space -= n;
+		edac_dbg(2, "%s\n", mem_buffer);
+		p = mem_buffer;
+		space = PAGE_SIZE;
+	}
+
+	/* Output the last bottom 'boundary' marker */
+	n = snprintf(p, space, "--------------------------"
+		"--------------------------------");
+	p += n;
+	space -= n;
+	edac_dbg(2, "%s\n", mem_buffer);
+	p = mem_buffer;
+	space = PAGE_SIZE;
+
+	/* now output the 'channel' labels */
+	n = snprintf(p, space, "           ");
+	p += n;
+	space -= n;
+	for (channel = 0; channel < pvt->maxch; channel++) {
+		n = snprintf(p, space, "channel %d | ", channel);
+		p += n;
+		space -= n;
+	}
+	edac_dbg(2, "%s\n", mem_buffer);
+	p = mem_buffer;
+	space = PAGE_SIZE;
+
+	n = snprintf(p, space, "           ");
+	p += n;
+	for (branch = 0; branch < MAX_BRANCHES; branch++) {
+		n = snprintf(p, space, "       branch %d       | ", branch);
+		p += n;
+		space -= n;
+	}
+
+	/* output the last message and free buffer */
+	edac_dbg(2, "%s\n", mem_buffer);
+	kfree(mem_buffer);
+}
+
+/*
+ *	i5000_get_mc_regs	read in the necessary registers and
+ *				cache locally
+ *
+ *			Fills in the private data members
+ */
+static void i5000_get_mc_regs(struct mem_ctl_info *mci)
+{
+	struct i5000_pvt *pvt;
+	u32 actual_tolm;
+	u16 limit;
+	int slot_row;
+	int maxch;
+	int maxdimmperch;
+	int way0, way1;
+
+	pvt = mci->pvt_info;
+
+	pci_read_config_dword(pvt->system_address, AMBASE,
+			&pvt->u.ambase_bottom);
+	pci_read_config_dword(pvt->system_address, AMBASE + sizeof(u32),
+			&pvt->u.ambase_top);
+
+	maxdimmperch = pvt->maxdimmperch;
+	maxch = pvt->maxch;
+
+	edac_dbg(2, "AMBASE= 0x%lx  MAXCH= %d  MAX-DIMM-Per-CH= %d\n",
+		 (long unsigned int)pvt->ambase, pvt->maxch, pvt->maxdimmperch);
+
+	/* Get the Branch Map regs */
+	pci_read_config_word(pvt->branchmap_werrors, TOLM, &pvt->tolm);
+	pvt->tolm >>= 12;
+	edac_dbg(2, "TOLM (number of 256M regions) =%u (0x%x)\n",
+		 pvt->tolm, pvt->tolm);
+
+	actual_tolm = pvt->tolm << 28;
+	edac_dbg(2, "Actual TOLM byte addr=%u (0x%x)\n",
+		 actual_tolm, actual_tolm);
+
+	pci_read_config_word(pvt->branchmap_werrors, MIR0, &pvt->mir0);
+	pci_read_config_word(pvt->branchmap_werrors, MIR1, &pvt->mir1);
+	pci_read_config_word(pvt->branchmap_werrors, MIR2, &pvt->mir2);
+
+	/* Get the MIR[0-2] regs */
+	limit = (pvt->mir0 >> 4) & 0x0FFF;
+	way0 = pvt->mir0 & 0x1;
+	way1 = pvt->mir0 & 0x2;
+	edac_dbg(2, "MIR0: limit= 0x%x  WAY1= %u  WAY0= %x\n",
+		 limit, way1, way0);
+	limit = (pvt->mir1 >> 4) & 0x0FFF;
+	way0 = pvt->mir1 & 0x1;
+	way1 = pvt->mir1 & 0x2;
+	edac_dbg(2, "MIR1: limit= 0x%x  WAY1= %u  WAY0= %x\n",
+		 limit, way1, way0);
+	limit = (pvt->mir2 >> 4) & 0x0FFF;
+	way0 = pvt->mir2 & 0x1;
+	way1 = pvt->mir2 & 0x2;
+	edac_dbg(2, "MIR2: limit= 0x%x  WAY1= %u  WAY0= %x\n",
+		 limit, way1, way0);
+
+	/* Get the MTR[0-3] regs */
+	for (slot_row = 0; slot_row < NUM_MTRS; slot_row++) {
+		int where = MTR0 + (slot_row * sizeof(u32));
+
+		pci_read_config_word(pvt->branch_0, where,
+				&pvt->b0_mtr[slot_row]);
+
+		edac_dbg(2, "MTR%d where=0x%x B0 value=0x%x\n",
+			 slot_row, where, pvt->b0_mtr[slot_row]);
+
+		if (pvt->maxch >= CHANNELS_PER_BRANCH) {
+			pci_read_config_word(pvt->branch_1, where,
+					&pvt->b1_mtr[slot_row]);
+			edac_dbg(2, "MTR%d where=0x%x B1 value=0x%x\n",
+				 slot_row, where, pvt->b1_mtr[slot_row]);
+		} else {
+			pvt->b1_mtr[slot_row] = 0;
+		}
+	}
+
+	/* Read and dump branch 0's MTRs */
+	edac_dbg(2, "Memory Technology Registers:\n");
+	edac_dbg(2, "   Branch 0:\n");
+	for (slot_row = 0; slot_row < NUM_MTRS; slot_row++) {
+		decode_mtr(slot_row, pvt->b0_mtr[slot_row]);
+	}
+	pci_read_config_word(pvt->branch_0, AMB_PRESENT_0,
+			&pvt->b0_ambpresent0);
+	edac_dbg(2, "\t\tAMB-Branch 0-present0 0x%x:\n", pvt->b0_ambpresent0);
+	pci_read_config_word(pvt->branch_0, AMB_PRESENT_1,
+			&pvt->b0_ambpresent1);
+	edac_dbg(2, "\t\tAMB-Branch 0-present1 0x%x:\n", pvt->b0_ambpresent1);
+
+	/* Only if we have 2 branchs (4 channels) */
+	if (pvt->maxch < CHANNELS_PER_BRANCH) {
+		pvt->b1_ambpresent0 = 0;
+		pvt->b1_ambpresent1 = 0;
+	} else {
+		/* Read and 

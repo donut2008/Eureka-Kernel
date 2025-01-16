@@ -1,61 +1,57 @@
-#include <linux/slab.h>
-#include <linux/string.h>
+/*
+ * Copyright 2011-2012 Calxeda, Inc.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/ctype.h>
+#include <linux/edac.h>
+#include <linux/interrupt.h>
 #include <linux/platform_device.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/fixed.h>
+#include <linux/of_platform.h>
 
-struct fixed_regulator_data {
-	struct fixed_voltage_config cfg;
-	struct regulator_init_data init_data;
-	struct platform_device pdev;
+#include "edac_core.h"
+#include "edac_module.h"
+
+#define SR_CLR_SB_ECC_INTR	0x0
+#define SR_CLR_DB_ECC_INTR	0x4
+
+struct hb_l2_drvdata {
+	void __iomem *base;
+	int sb_irq;
+	int db_irq;
 };
 
-static void regulator_fixed_release(struct device *dev)
+static irqreturn_t highbank_l2_err_handler(int irq, void *dev_id)
 {
-	struct fixed_regulator_data *data = container_of(dev,
-			struct fixed_regulator_data, pdev.dev);
-	kfree(data->cfg.supply_name);
-	kfree(data);
-}
+	struct edac_device_ctl_info *dci = dev_id;
+	struct hb_l2_drvdata *drvdata = dci->pvt_info;
 
-/**
- * regulator_register_fixed_name - register a no-op fixed regulator
- * @id: platform device id
- * @name: name to be used for the regulator
- * @supplies: consumers for this regulator
- * @num_supplies: number of consumers
- * @uv: voltage in microvolts
- */
-struct platform_device *regulator_register_always_on(int id, const char *name,
-	struct regulator_consumer_supply *supplies, int num_supplies, int uv)
-{
-	struct fixed_regulator_data *data;
-
-	data = kzalloc(sizeof(*data), GFP_KERNEL);
-	if (!data)
-		return NULL;
-
-	data->cfg.supply_name = kstrdup(name, GFP_KERNEL);
-	if (!data->cfg.supply_name) {
-		kfree(data);
-		return NULL;
+	if (irq == drvdata->sb_irq) {
+		writel(1, drvdata->base + SR_CLR_SB_ECC_INTR);
+		edac_device_handle_ce(dci, 0, 0, dci->ctl_name);
+	}
+	if (irq == drvdata->db_irq) {
+		writel(1, drvdata->base + SR_CLR_DB_ECC_INTR);
+		edac_device_handle_ue(dci, 0, 0, dci->ctl_name);
 	}
 
-	data->cfg.microvolts = uv;
-	data->cfg.gpio = -EINVAL;
-	data->cfg.enabled_at_boot = 1;
-	data->cfg.init_data = &data->init_data;
-
-	data->init_data.constraints.always_on = 1;
-	data->init_data.consumer_supplies = supplies;
-	data->init_data.num_consumer_supplies = num_supplies;
-
-	data->pdev.name = "reg-fixed-voltage";
-	data->pdev.id = id;
-	data->pdev.dev.platform_data = &data->cfg;
-	data->pdev.dev.release = regulator_fixed_release;
-
-	platform_device_register(&data->pdev);
-
-	return &data->pdev;
+	return IRQ_HANDLED;
 }
+
+static const struct of_device_id hb_l2_err_of_match[] = {
+	{ .compatible = "calxeda,hb-sregs-l2-ecc", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, hb_l2_err_of_match)

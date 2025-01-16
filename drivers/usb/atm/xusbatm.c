@@ -1,231 +1,110 @@
-/******************************************************************************
- *  xusbatm.c -	dumb usbatm-based driver for modems initialized in userspace
- *
- *  Copyright (C) 2005 Duncan Sands, Roman Kagan (rkagan % mail ! ru)
- *
- *  This program is free software; you can redistribute it and/or modify it
- *  under the terms of the GNU General Public License as published by the Free
- *  Software Foundation; either version 2 of the License, or (at your option)
- *  any later version.
- *
- *  This program is distributed in the hope that it will be useful, but WITHOUT
- *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- *  more details.
- *
- *  You should have received a copy of the GNU General Public License along with
- *  this program; if not, write to the Free Software Foundation, Inc., 59
- *  Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- *
- ******************************************************************************/
-
-#include <linux/module.h>
-#include <linux/etherdevice.h>		/* for eth_random_addr() */
-
-#include "usbatm.h"
-
-
-#define XUSBATM_DRIVERS_MAX	8
-
-#define XUSBATM_PARM(name, type, parmtype, desc) \
-	static type name[XUSBATM_DRIVERS_MAX]; \
-	static unsigned int num_##name; \
-	module_param_array(name, parmtype, &num_##name, 0444); \
-	MODULE_PARM_DESC(name, desc)
-
-XUSBATM_PARM(vendor, unsigned short, ushort, "USB device vendor");
-XUSBATM_PARM(product, unsigned short, ushort, "USB device product");
-
-XUSBATM_PARM(rx_endpoint, unsigned char, byte, "rx endpoint number");
-XUSBATM_PARM(tx_endpoint, unsigned char, byte, "tx endpoint number");
-XUSBATM_PARM(rx_padding, unsigned char, byte, "rx padding (default 0)");
-XUSBATM_PARM(tx_padding, unsigned char, byte, "tx padding (default 0)");
-XUSBATM_PARM(rx_altsetting, unsigned char, byte, "rx altsetting (default 0)");
-XUSBATM_PARM(tx_altsetting, unsigned char, byte, "rx altsetting (default 0)");
-
-static const char xusbatm_driver_name[] = "xusbatm";
-
-static struct usbatm_driver xusbatm_drivers[XUSBATM_DRIVERS_MAX];
-static struct usb_device_id xusbatm_usb_ids[XUSBATM_DRIVERS_MAX + 1];
-static struct usb_driver xusbatm_usb_driver;
-
-static struct usb_interface *xusbatm_find_intf(struct usb_device *usb_dev, int altsetting, u8 ep)
-{
-	struct usb_host_interface *alt;
-	struct usb_interface *intf;
-	int i, j;
-
-	for (i = 0; i < usb_dev->actconfig->desc.bNumInterfaces; i++)
-		if ((intf = usb_dev->actconfig->interface[i]) && (alt = usb_altnum_to_altsetting(intf, altsetting)))
-			for (j = 0; j < alt->desc.bNumEndpoints; j++)
-				if (alt->endpoint[j].desc.bEndpointAddress == ep)
-					return intf;
-	return NULL;
-}
-
-static int xusbatm_capture_intf(struct usbatm_data *usbatm, struct usb_device *usb_dev,
-		struct usb_interface *intf, int altsetting, int claim)
-{
-	int ifnum = intf->altsetting->desc.bInterfaceNumber;
-	int ret;
-
-	if (claim && (ret = usb_driver_claim_interface(&xusbatm_usb_driver, intf, usbatm))) {
-		usb_err(usbatm, "%s: failed to claim interface %2d (%d)!\n", __func__, ifnum, ret);
-		return ret;
-	}
-	ret = usb_set_interface(usb_dev, ifnum, altsetting);
-	if (ret) {
-		usb_err(usbatm, "%s: altsetting %2d for interface %2d failed (%d)!\n", __func__, altsetting, ifnum, ret);
-		return ret;
-	}
-	return 0;
-}
-
-static void xusbatm_release_intf(struct usb_device *usb_dev, struct usb_interface *intf, int claimed)
-{
-	if (claimed) {
-		usb_set_intfdata(intf, NULL);
-		usb_driver_release_interface(&xusbatm_usb_driver, intf);
-	}
-}
-
-static int xusbatm_bind(struct usbatm_data *usbatm,
-			struct usb_interface *intf, const struct usb_device_id *id)
-{
-	struct usb_device *usb_dev = interface_to_usbdev(intf);
-	int drv_ix = id - xusbatm_usb_ids;
-	int rx_alt = rx_altsetting[drv_ix];
-	int tx_alt = tx_altsetting[drv_ix];
-	struct usb_interface *rx_intf = xusbatm_find_intf(usb_dev, rx_alt, rx_endpoint[drv_ix]);
-	struct usb_interface *tx_intf = xusbatm_find_intf(usb_dev, tx_alt, tx_endpoint[drv_ix]);
-	int ret;
-
-	usb_dbg(usbatm, "%s: binding driver %d: vendor %04x product %04x"
-		" rx: ep %02x padd %d alt %2d tx: ep %02x padd %d alt %2d\n",
-		__func__, drv_ix, vendor[drv_ix], product[drv_ix],
-		rx_endpoint[drv_ix], rx_padding[drv_ix], rx_alt,
-		tx_endpoint[drv_ix], tx_padding[drv_ix], tx_alt);
-
-	if (!rx_intf || !tx_intf) {
-		if (!rx_intf)
-			usb_dbg(usbatm, "%s: no interface contains endpoint %02x in altsetting %2d\n",
-				__func__, rx_endpoint[drv_ix], rx_alt);
-		if (!tx_intf)
-			usb_dbg(usbatm, "%s: no interface contains endpoint %02x in altsetting %2d\n",
-				__func__, tx_endpoint[drv_ix], tx_alt);
-		return -ENODEV;
-	}
-
-	if ((rx_intf != intf) && (tx_intf != intf))
-		return -ENODEV;
-
-	if ((rx_intf == tx_intf) && (rx_alt != tx_alt)) {
-		usb_err(usbatm, "%s: altsettings clash on interface %2d (%2d vs %2d)!\n", __func__,
-				rx_intf->altsetting->desc.bInterfaceNumber, rx_alt, tx_alt);
-		return -EINVAL;
-	}
-
-	usb_dbg(usbatm, "%s: rx If#=%2d; tx If#=%2d\n", __func__,
-			rx_intf->altsetting->desc.bInterfaceNumber,
-			tx_intf->altsetting->desc.bInterfaceNumber);
-
-	ret = xusbatm_capture_intf(usbatm, usb_dev, rx_intf, rx_alt, rx_intf != intf);
-	if (ret)
-		return ret;
-
-	if ((tx_intf != rx_intf) && (ret = xusbatm_capture_intf(usbatm, usb_dev, tx_intf, tx_alt, tx_intf != intf))) {
-		xusbatm_release_intf(usb_dev, rx_intf, rx_intf != intf);
-		return ret;
-	}
-
-	return 0;
-}
-
-static void xusbatm_unbind(struct usbatm_data *usbatm,
-			   struct usb_interface *intf)
-{
-	struct usb_device *usb_dev = interface_to_usbdev(intf);
-	int i;
-
-	usb_dbg(usbatm, "%s entered\n", __func__);
-
-	for (i = 0; i < usb_dev->actconfig->desc.bNumInterfaces; i++) {
-		struct usb_interface *cur_intf = usb_dev->actconfig->interface[i];
-
-		if (cur_intf && (usb_get_intfdata(cur_intf) == usbatm)) {
-			usb_set_intfdata(cur_intf, NULL);
-			usb_driver_release_interface(&xusbatm_usb_driver, cur_intf);
-		}
-	}
-}
-
-static int xusbatm_atm_start(struct usbatm_data *usbatm,
-			     struct atm_dev *atm_dev)
-{
-	atm_dbg(usbatm, "%s entered\n", __func__);
-
-	/* use random MAC as we've no way to get it from the device */
-	eth_random_addr(atm_dev->esi);
-
-	return 0;
-}
-
-
-static int xusbatm_usb_probe(struct usb_interface *intf,
-			     const struct usb_device_id *id)
-{
-	return usbatm_usb_probe(intf, id,
-				xusbatm_drivers + (id - xusbatm_usb_ids));
-}
-
-static struct usb_driver xusbatm_usb_driver = {
-	.name		= xusbatm_driver_name,
-	.probe		= xusbatm_usb_probe,
-	.disconnect	= usbatm_usb_disconnect,
-	.id_table	= xusbatm_usb_ids
-};
-
-static int __init xusbatm_init(void)
-{
-	int i;
-
-	if (!num_vendor ||
-	    num_vendor != num_product ||
-	    num_vendor != num_rx_endpoint ||
-	    num_vendor != num_tx_endpoint) {
-		printk(KERN_WARNING "xusbatm: malformed module parameters\n");
-		return -EINVAL;
-	}
-
-	for (i = 0; i < num_vendor; i++) {
-		rx_endpoint[i] |= USB_DIR_IN;
-		tx_endpoint[i] &= USB_ENDPOINT_NUMBER_MASK;
-
-		xusbatm_usb_ids[i].match_flags	= USB_DEVICE_ID_MATCH_DEVICE;
-		xusbatm_usb_ids[i].idVendor	= vendor[i];
-		xusbatm_usb_ids[i].idProduct	= product[i];
-
-		xusbatm_drivers[i].driver_name	= xusbatm_driver_name;
-		xusbatm_drivers[i].bind		= xusbatm_bind;
-		xusbatm_drivers[i].unbind	= xusbatm_unbind;
-		xusbatm_drivers[i].atm_start	= xusbatm_atm_start;
-		xusbatm_drivers[i].bulk_in	= rx_endpoint[i];
-		xusbatm_drivers[i].bulk_out	= tx_endpoint[i];
-		xusbatm_drivers[i].rx_padding	= rx_padding[i];
-		xusbatm_drivers[i].tx_padding	= tx_padding[i];
-	}
-
-	return usb_register(&xusbatm_usb_driver);
-}
-module_init(xusbatm_init);
-
-static void __exit xusbatm_exit(void)
-{
-	usb_deregister(&xusbatm_usb_driver);
-}
-module_exit(xusbatm_exit);
-
-MODULE_AUTHOR("Roman Kagan, Duncan Sands");
-MODULE_DESCRIPTION("Driver for USB ADSL modems initialized in userspace");
-MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1");
+__TLP_HDR_MASK 0xffffffff
+#define D2F3_PCIE_HDR_LOG1__TLP_HDR__SHIFT 0x0
+#define D2F3_PCIE_HDR_LOG2__TLP_HDR_MASK 0xffffffff
+#define D2F3_PCIE_HDR_LOG2__TLP_HDR__SHIFT 0x0
+#define D2F3_PCIE_HDR_LOG3__TLP_HDR_MASK 0xffffffff
+#define D2F3_PCIE_HDR_LOG3__TLP_HDR__SHIFT 0x0
+#define D2F3_PCIE_ROOT_ERR_CMD__CORR_ERR_REP_EN_MASK 0x1
+#define D2F3_PCIE_ROOT_ERR_CMD__CORR_ERR_REP_EN__SHIFT 0x0
+#define D2F3_PCIE_ROOT_ERR_CMD__NONFATAL_ERR_REP_EN_MASK 0x2
+#define D2F3_PCIE_ROOT_ERR_CMD__NONFATAL_ERR_REP_EN__SHIFT 0x1
+#define D2F3_PCIE_ROOT_ERR_CMD__FATAL_ERR_REP_EN_MASK 0x4
+#define D2F3_PCIE_ROOT_ERR_CMD__FATAL_ERR_REP_EN__SHIFT 0x2
+#define D2F3_PCIE_ROOT_ERR_STATUS__ERR_CORR_RCVD_MASK 0x1
+#define D2F3_PCIE_ROOT_ERR_STATUS__ERR_CORR_RCVD__SHIFT 0x0
+#define D2F3_PCIE_ROOT_ERR_STATUS__MULT_ERR_CORR_RCVD_MASK 0x2
+#define D2F3_PCIE_ROOT_ERR_STATUS__MULT_ERR_CORR_RCVD__SHIFT 0x1
+#define D2F3_PCIE_ROOT_ERR_STATUS__ERR_FATAL_NONFATAL_RCVD_MASK 0x4
+#define D2F3_PCIE_ROOT_ERR_STATUS__ERR_FATAL_NONFATAL_RCVD__SHIFT 0x2
+#define D2F3_PCIE_ROOT_ERR_STATUS__MULT_ERR_FATAL_NONFATAL_RCVD_MASK 0x8
+#define D2F3_PCIE_ROOT_ERR_STATUS__MULT_ERR_FATAL_NONFATAL_RCVD__SHIFT 0x3
+#define D2F3_PCIE_ROOT_ERR_STATUS__FIRST_UNCORRECTABLE_FATAL_MASK 0x10
+#define D2F3_PCIE_ROOT_ERR_STATUS__FIRST_UNCORRECTABLE_FATAL__SHIFT 0x4
+#define D2F3_PCIE_ROOT_ERR_STATUS__NONFATAL_ERROR_MSG_RCVD_MASK 0x20
+#define D2F3_PCIE_ROOT_ERR_STATUS__NONFATAL_ERROR_MSG_RCVD__SHIFT 0x5
+#define D2F3_PCIE_ROOT_ERR_STATUS__FATAL_ERROR_MSG_RCVD_MASK 0x40
+#define D2F3_PCIE_ROOT_ERR_STATUS__FATAL_ERROR_MSG_RCVD__SHIFT 0x6
+#define D2F3_PCIE_ROOT_ERR_STATUS__ADV_ERR_INT_MSG_NUM_MASK 0xf8000000
+#define D2F3_PCIE_ROOT_ERR_STATUS__ADV_ERR_INT_MSG_NUM__SHIFT 0x1b
+#define D2F3_PCIE_ERR_SRC_ID__ERR_CORR_SRC_ID_MASK 0xffff
+#define D2F3_PCIE_ERR_SRC_ID__ERR_CORR_SRC_ID__SHIFT 0x0
+#define D2F3_PCIE_ERR_SRC_ID__ERR_FATAL_NONFATAL_SRC_ID_MASK 0xffff0000
+#define D2F3_PCIE_ERR_SRC_ID__ERR_FATAL_NONFATAL_SRC_ID__SHIFT 0x10
+#define D2F3_PCIE_TLP_PREFIX_LOG0__TLP_PREFIX_MASK 0xffffffff
+#define D2F3_PCIE_TLP_PREFIX_LOG0__TLP_PREFIX__SHIFT 0x0
+#define D2F3_PCIE_TLP_PREFIX_LOG1__TLP_PREFIX_MASK 0xffffffff
+#define D2F3_PCIE_TLP_PREFIX_LOG1__TLP_PREFIX__SHIFT 0x0
+#define D2F3_PCIE_TLP_PREFIX_LOG2__TLP_PREFIX_MASK 0xffffffff
+#define D2F3_PCIE_TLP_PREFIX_LOG2__TLP_PREFIX__SHIFT 0x0
+#define D2F3_PCIE_TLP_PREFIX_LOG3__TLP_PREFIX_MASK 0xffffffff
+#define D2F3_PCIE_TLP_PREFIX_LOG3__TLP_PREFIX__SHIFT 0x0
+#define D2F3_PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F3_PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F3_PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F3_PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F3_PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F3_PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F3_PCIE_LINK_CNTL3__PERFORM_EQUALIZATION_MASK 0x1
+#define D2F3_PCIE_LINK_CNTL3__PERFORM_EQUALIZATION__SHIFT 0x0
+#define D2F3_PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN_MASK 0x2
+#define D2F3_PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN__SHIFT 0x1
+#define D2F3_PCIE_LINK_CNTL3__RESERVED_MASK 0xfffffffc
+#define D2F3_PCIE_LINK_CNTL3__RESERVED__SHIFT 0x2
+#define D2F3_PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS_MASK 0xffff
+#define D2F3_PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS__SHIFT 0x0
+#define D2F3_PCIE_LANE_ERROR_STATUS__RESERVED_MASK 0xffff0000
+#define D2F3_PCIE_LANE_ERROR_STATUS__RESERVED__SHIFT 0x10
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F3_PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F3_PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F3_PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F3_PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F3_PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F3_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F3_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F3_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F3_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_

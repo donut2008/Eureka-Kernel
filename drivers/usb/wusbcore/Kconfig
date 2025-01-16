@@ -1,39 +1,14 @@
-#
-# Wireless USB Core configuration
-#
-config USB_WUSB
-	tristate "Enable Wireless USB extensions"
-	depends on UWB
-        select CRYPTO
-        select CRYPTO_BLKCIPHER
-        select CRYPTO_CBC
-        select CRYPTO_MANAGER
-        select CRYPTO_AES
-	help
-	  Enable the host-side support for Wireless USB.
-
-          To compile this support select Y (built in). It is safe to
-	  select even if you don't have the hardware.
-
-config USB_WUSB_CBAF
-	tristate "Support WUSB Cable Based Association (CBA)"
-	depends on USB
-	help
-	  Some WUSB devices support Cable Based Association. It's used to
-	  enable the secure communication between the host and the
-	  device.
-
-	  Enable this option if your WUSB device must to be connected
-	  via wired USB before establishing a wireless link.
-
-	  It is safe to select even if you don't have a compatible
-	  hardware.
-
-config USB_WUSB_CBAF_DEBUG
-	bool "Enable CBA debug messages"
-	depends on USB_WUSB_CBAF
-	help
-	  Say Y here if you want the CBA to produce a bunch of debug messages
-	  to the system log. Select this if you are having a problem with
-	  CBA support and want to see more of what is going on.
-
+8
+#define ixPCIE_PRBS_STATUS1                                                     0x14000c9
+#define ixPCIE_PRBS_STATUS2                                                     0x14000ca
+#define ixPCIE_PRBS_FREERUN                                                     0x14000cb
+#define ixPCIE_PRBS_MISC                                                        0x14000cc
+#define ixPCIE_PRBS_USER_PATTERN                                                0x14000cd
+#define ixPCIE_PRBS_LO_BITCNT                                                   0x14000ce
+#define ixPCIE_PRBS_HI_BITCNT                                                   0x14000cf
+#define ixPCIE_PRBS_ERRCNT_0                                                    0x14000d0
+#define ixPCIE_PRBS_ERRCNT_1                                                    0x14000d1
+#define ixPCIE_PRBS_ERRCNT_2                                                    0x14000d2
+#define ixPCIE_PRBS_ERRCNT_3                                                    0x14000d3
+#define ixPCIE_PRBS_ERRCNT_4                                                    0x14000d4
+#define ixPCIE_PRBS_ERRCNT_5                               

@@ -1,71 +1,32 @@
-/*
- *	Copyright (C) 2013 Daniel Tang <tangrs@tangrs.id.au>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2, as
- * published by the Free Software Foundation.
- *
- * Based off drivers/usb/chipidea/ci_hdrc_msm.c
- *
- */
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/usb/gadget.h>
-#include <linux/usb/chipidea.h>
-
-#include "ci.h"
-
-static struct ci_hdrc_platform_data ci_hdrc_zevio_platdata = {
-	.name			= "ci_hdrc_zevio",
-	.flags			= CI_HDRC_REGS_SHARED | CI_HDRC_FORCE_FULLSPEED,
-	.capoffset		= DEF_CAPOFFSET,
-};
-
-static int ci_hdrc_zevio_probe(struct platform_device *pdev)
-{
-	struct platform_device *ci_pdev;
-
-	dev_dbg(&pdev->dev, "ci_hdrc_zevio_probe\n");
-
-	ci_pdev = ci_hdrc_add_device(&pdev->dev,
-				pdev->resource, pdev->num_resources,
-				&ci_hdrc_zevio_platdata);
-
-	if (IS_ERR(ci_pdev)) {
-		dev_err(&pdev->dev, "ci_hdrc_add_device failed!\n");
-		return PTR_ERR(ci_pdev);
-	}
-
-	platform_set_drvdata(pdev, ci_pdev);
-
-	return 0;
-}
-
-static int ci_hdrc_zevio_remove(struct platform_device *pdev)
-{
-	struct platform_device *ci_pdev = platform_get_drvdata(pdev);
-
-	ci_hdrc_remove_device(ci_pdev);
-
-	return 0;
-}
-
-static const struct of_device_id ci_hdrc_zevio_dt_ids[] = {
-	{ .compatible = "lsi,zevio-usb", },
-	{ /* sentinel */ }
-};
-
-static struct platform_driver ci_hdrc_zevio_driver = {
-	.probe = ci_hdrc_zevio_probe,
-	.remove = ci_hdrc_zevio_remove,
-	.driver = {
-		.name = "zevio_usb",
-		.of_match_table = ci_hdrc_zevio_dt_ids,
-	},
-};
-
-MODULE_DEVICE_TABLE(of, ci_hdrc_zevio_dt_ids);
-module_platform_driver(ci_hdrc_zevio_driver);
-
-MODULE_LICENSE("GPL v2");
+eg__SHIFT 0x0
+#define SMC_SYSCON_RESET_CNTL__srbm_soft_rst_override_MASK 0x2
+#define SMC_SYSCON_RESET_CNTL__srbm_soft_rst_override__SHIFT 0x1
+#define SMC_SYSCON_RESET_CNTL__RegReset_MASK 0x40000000
+#define SMC_SYSCON_RESET_CNTL__RegReset__SHIFT 0x1e
+#define SMC_SYSCON_CLOCK_CNTL_0__ck_disable_MASK 0x1
+#define SMC_SYSCON_CLOCK_CNTL_0__ck_disable__SHIFT 0x0
+#define SMC_SYSCON_CLOCK_CNTL_0__auto_cg_en_MASK 0x2
+#define SMC_SYSCON_CLOCK_CNTL_0__auto_cg_en__SHIFT 0x1
+#define SMC_SYSCON_CLOCK_CNTL_0__auto_cg_timeout_MASK 0xffff00
+#define SMC_SYSCON_CLOCK_CNTL_0__auto_cg_timeout__SHIFT 0x8
+#define SMC_SYSCON_CLOCK_CNTL_0__cken_MASK 0x1000000
+#define SMC_SYSCON_CLOCK_CNTL_0__cken__SHIFT 0x18
+#define SMC_SYSCON_CLOCK_CNTL_1__auto_ck_disable_MASK 0x1
+#define SMC_SYSCON_CLOCK_CNTL_1__auto_ck_disable__SHIFT 0x0
+#define SMC_SYSCON_CLOCK_CNTL_2__wake_on_irq_MASK 0xffffffff
+#define SMC_SYSCON_CLOCK_CNTL_2__wake_on_irq__SHIFT 0x0
+#define SMC_SYSCON_MISC_CNTL__dma_no_outstanding_MASK 0x2
+#define SMC_SYSCON_MISC_CNTL__dma_no_outstanding__SHIFT 0x1
+#define SMC_SYSCON_MSG_ARG_0__smc_msg_arg_MASK 0xffffffff
+#define SMC_SYSCON_MSG_ARG_0__smc_msg_arg__SHIFT 0x0
+#define SMC_PC_C__smc_pc_c_MASK 0xffffffff
+#define SMC_PC_C__smc_pc_c__SHIFT 0x0
+#define SMC_SCRATCH9__SCRATCH_VALUE_MASK 0xffffffff
+#define SMC_SCRATCH9__SCRATCH_VALUE__SHIFT 0x0
+#define GPIOPAD_SW_INT_STAT__SW_INT_STAT_MASK 0x1
+#define GPIOPAD_SW_INT_STAT__SW_INT_STAT__SHIFT 0x0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SN_MASK 0xf
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SN__SHIFT 0x0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SP_MASK 0xf0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SP__SHIFT 0x4
+#define GPIOPAD_MASK__GPIO_M

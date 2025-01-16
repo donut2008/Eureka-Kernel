@@ -1,97 +1,36 @@
-/*
- * Copyright (c) 2014 MediaTek Inc.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/mfd/syscon.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
-#include <linux/reset-controller.h>
-#include <linux/slab.h>
-
-#include "clk-mtk.h"
-
-struct mtk_reset {
-	struct regmap *regmap;
-	int regofs;
-	struct reset_controller_dev rcdev;
-};
-
-static int mtk_reset_assert(struct reset_controller_dev *rcdev,
-			      unsigned long id)
-{
-	struct mtk_reset *data = container_of(rcdev, struct mtk_reset, rcdev);
-
-	return regmap_update_bits(data->regmap, data->regofs + ((id / 32) << 2),
-			BIT(id % 32), ~0);
-}
-
-static int mtk_reset_deassert(struct reset_controller_dev *rcdev,
-				unsigned long id)
-{
-	struct mtk_reset *data = container_of(rcdev, struct mtk_reset, rcdev);
-
-	return regmap_update_bits(data->regmap, data->regofs + ((id / 32) << 2),
-			BIT(id % 32), 0);
-}
-
-static int mtk_reset(struct reset_controller_dev *rcdev,
-			      unsigned long id)
-{
-	int ret;
-
-	ret = mtk_reset_assert(rcdev, id);
-	if (ret)
-		return ret;
-
-	return mtk_reset_deassert(rcdev, id);
-}
-
-static struct reset_control_ops mtk_reset_ops = {
-	.assert = mtk_reset_assert,
-	.deassert = mtk_reset_deassert,
-	.reset = mtk_reset,
-};
-
-void mtk_register_reset_controller(struct device_node *np,
-			unsigned int num_regs, int regofs)
-{
-	struct mtk_reset *data;
-	int ret;
-	struct regmap *regmap;
-
-	regmap = syscon_node_to_regmap(np);
-	if (IS_ERR(regmap)) {
-		pr_err("Cannot find regmap for %s: %ld\n", np->full_name,
-				PTR_ERR(regmap));
-		return;
-	}
-
-	data = kzalloc(sizeof(*data), GFP_KERNEL);
-	if (!data)
-		return;
-
-	data->regmap = regmap;
-	data->regofs = regofs;
-	data->rcdev.owner = THIS_MODULE;
-	data->rcdev.nr_resets = num_regs * 32;
-	data->rcdev.ops = &mtk_reset_ops;
-	data->rcdev.of_node = np;
-
-	ret = reset_controller_register(&data->rcdev);
-	if (ret) {
-		pr_err("could not register reset controller: %d\n", ret);
-		kfree(data);
-		return;
-	}
-}
+_MACRO_CNTL_RESERVED__SHIFT 0x0
+#define PLL_MACRO_CNTL_RESERVED40__PLL_MACRO_CNTL_RESERVED_MASK 0xffffffff
+#define PLL_MACRO_CNTL_RESERVED40__PLL_MACRO_CNTL_RESERVED__SHIFT 0x0
+#define PLL_MACRO_CNTL_RESERVED41__PLL_MACRO_CNTL_RESERVED_MASK 0xffffffff
+#define PLL_MACRO_CNTL_RESERVED41__PLL_MACRO_CNTL_RESERVED__SHIFT 0x0
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_WDIVIDER_MASK 0x7f
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_WDIVIDER__SHIFT 0x0
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_RDIVIDER_MASK 0x7f00
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_RDIVIDER__SHIFT 0x8
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_CHG_MODE_MASK 0x18000
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_CHG_MODE__SHIFT 0xf
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_CHGTOG_MASK 0x20000
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_CHGTOG__SHIFT 0x11
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_DONETOG_MASK 0x40000
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_DONETOG__SHIFT 0x12
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_CHG_DONE_MASK 0x80000
+#define DENTIST_DISPCLK_CNTL__DENTIST_DISPCLK_CHG_DONE__SHIFT 0x13
+#define DENTIST_DISPCLK_CNTL__DENTIST_DPREFCLK_CHG_DONE_MASK 0x100000
+#define DENTIST_DISPCLK_CNTL__DENTIST_DPREFCLK_CHG_DONE__SHIFT 0x14
+#define DENTIST_DISPCLK_CNTL__DENTIST_DPREFCLK_CHGTOG_MASK 0x200000
+#define DENTIST_DISPCLK_CNTL__DENTIST_DPREFCLK_CHGTOG__SHIFT 0x15
+#define DENTIST_DISPCLK_CNTL__DENTIST_DPREFCLK_DONETOG_MASK 0x400000
+#define DENTIST_DISPCLK_CNTL__DENTIST_DPREFCLK_DONETOG__SHIFT 0x16
+#define DENTIST_DISPCLK_CNTL__DENTIST_DPREFCLK_WDIVIDER_MASK 0x7f000000
+#define DENTIST_DISPCLK_CNTL__DENTIST_DPREFCLK_WDIVIDER__SHIFT 0x18
+#define DCDEBUG_BUS_CLK1_SEL__DCDEBUG_BUS_CLK1_SEL_MASK 0xffffffff
+#define DCDEBUG_BUS_CLK1_SEL__DCDEBUG_BUS_CLK1_SEL__SHIFT 0x0
+#define DCDEBUG_BUS_CLK2_SEL__DCDEBUG_BUS_CLK2_SEL_MASK 0xffffffff
+#define DCDEBUG_BUS_CLK2_SEL__DCDEBUG_BUS_CLK2_SEL__SHIFT 0x0
+#define DCDEBUG_BUS_CLK3_SEL__DCDEBUG_BUS_CLK3_SEL_MASK 0xffffffff
+#define DCDEBUG_BUS_CLK3_SEL__DCDEBUG_BUS_CLK3_SEL__SHIFT 0x0
+#define DCDEBUG_BUS_CLK4_SEL__DCDEBUG_BUS_CLK4_SEL_MASK 0xffffffff
+#define DCDEBUG_BUS_CLK4_SEL__DCDEBUG_BUS_CLK4_SEL__SHIFT 0x0
+#define DCDEBUG_BUS_CLK5_SEL__DCDEBUG_BUS_CLK5_SEL_MASK 0xffffffff
+#define DCDEBUG_BUS_CLK5_SEL__DCDEBUG_BUS_CLK5_SEL__SHIFT 0x0
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE1_PIN_SEL_MASK 

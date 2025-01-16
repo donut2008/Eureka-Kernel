@@ -1,121 +1,71 @@
-/**
- * gadget.h - DesignWare USB3 DRD Gadget Header
- *
- * Copyright (C) 2010-2011 Texas Instruments Incorporated - http://www.ti.com
- *
- * Authors: Felipe Balbi <balbi@ti.com>,
- *	    Sebastian Andrzej Siewior <bigeasy@linutronix.de>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2  of
- * the License as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#ifndef __DRIVERS_USB_DWC3_GADGET_H
-#define __DRIVERS_USB_DWC3_GADGET_H
-
-#include <linux/list.h>
-#include <linux/usb/gadget.h>
-#include "io.h"
-
-struct dwc3;
-#define to_dwc3_ep(ep)		(container_of(ep, struct dwc3_ep, endpoint))
-#define gadget_to_dwc(g)	(container_of(g, struct dwc3, gadget))
-
-/* DEPCFG parameter 1 */
-#define DWC3_DEPCFG_INT_NUM(n)		(((n) & 0x1f) << 0)
-#define DWC3_DEPCFG_XFER_COMPLETE_EN	(1 << 8)
-#define DWC3_DEPCFG_XFER_IN_PROGRESS_EN	(1 << 9)
-#define DWC3_DEPCFG_XFER_NOT_READY_EN	(1 << 10)
-#define DWC3_DEPCFG_FIFO_ERROR_EN	(1 << 11)
-#define DWC3_DEPCFG_STREAM_EVENT_EN	(1 << 13)
-#define DWC3_DEPCFG_BINTERVAL_M1(n)	(((n) & 0xff) << 16)
-#define DWC3_DEPCFG_STREAM_CAPABLE	(1 << 24)
-#define DWC3_DEPCFG_EP_NUMBER(n)	(((n) & 0x1f) << 25)
-#define DWC3_DEPCFG_BULK_BASED		(1 << 30)
-#define DWC3_DEPCFG_FIFO_BASED		(1 << 31)
-
-/* DEPCFG parameter 0 */
-#define DWC3_DEPCFG_EP_TYPE(n)		(((n) & 0x3) << 1)
-#define DWC3_DEPCFG_MAX_PACKET_SIZE(n)	(((n) & 0x7ff) << 3)
-#define DWC3_DEPCFG_FIFO_NUMBER(n)	(((n) & 0x1f) << 17)
-#define DWC3_DEPCFG_BURST_SIZE(n)	(((n) & 0xf) << 22)
-#define DWC3_DEPCFG_DATA_SEQ_NUM(n)	((n) << 26)
-/* This applies for core versions earlier than 1.94a */
-#define DWC3_DEPCFG_IGN_SEQ_NUM		(1 << 31)
-/* These apply for core versions 1.94a and later */
-#define DWC3_DEPCFG_ACTION_INIT		(0 << 30)
-#define DWC3_DEPCFG_ACTION_RESTORE	(1 << 30)
-#define DWC3_DEPCFG_ACTION_MODIFY	(2 << 30)
-
-/* DEPXFERCFG parameter 0 */
-#define DWC3_DEPXFERCFG_NUM_XFER_RES(n)	((n) & 0xffff)
-
-/* -------------------------------------------------------------------------- */
-
-#define to_dwc3_request(r)	(container_of(r, struct dwc3_request, request))
-
-static inline struct dwc3_request *next_request(struct list_head *list)
-{
-	if (list_empty(list))
-		return NULL;
-
-	return list_first_entry(list, struct dwc3_request, list);
-}
-
-static inline void dwc3_gadget_move_request_list_front(struct dwc3_request *req)
-{
-	struct dwc3_ep		*dep = req->dep;
-
-	req->queued = false;
-	list_move(&req->list, &dep->request_list);
-}
-
-static inline void dwc3_gadget_move_request_queued(struct dwc3_request *req)
-{
-	struct dwc3_ep		*dep = req->dep;
-
-	req->queued = true;
-	list_move_tail(&req->list, &dep->req_queued);
-}
-
-void dwc3_gadget_giveback(struct dwc3_ep *dep, struct dwc3_request *req,
-		int status);
-
-void dwc3_ep0_interrupt(struct dwc3 *dwc,
-		const struct dwc3_event_depevt *event);
-void dwc3_ep0_out_start(struct dwc3 *dwc);
-int __dwc3_gadget_ep0_set_halt(struct usb_ep *ep, int value);
-int dwc3_gadget_ep0_set_halt(struct usb_ep *ep, int value);
-int dwc3_gadget_ep0_queue(struct usb_ep *ep, struct usb_request *request,
-		gfp_t gfp_flags);
-int __dwc3_gadget_ep_set_halt(struct dwc3_ep *dep, int value, int protocol);
-
-/**
- * dwc3_gadget_ep_get_transfer_index - Gets transfer index from HW
- * @dwc: DesignWare USB3 Pointer
- * @number: DWC endpoint number
- *
- * Caller should take care of locking
- */
-static inline u32 dwc3_gadget_ep_get_transfer_index(struct dwc3 *dwc, u8 number)
-{
-	u32			res_id;
-
-	res_id = dwc3_readl(dwc->regs, DWC3_DEPCMD(number));
-
-	return DWC3_DEPCMD_GET_RSC_IDX(res_id);
-}
-
-/**
- * ISR for DWC3 gadget was changed because of RNDIS performance.
- * However, previous ISR code was not removed to track the history.
- */
-#undef DWC3_GADGET_IRQ_ORG
-
-#endif /* __DRIVERS_USB_DWC3_GADGET_H */
+__STATIC_SCREEN_THRESHOLD_UNIT_MASK 0xf0000
+#define CG_STATIC_SCREEN_PARAMETER__STATIC_SCREEN_THRESHOLD_UNIT__SHIFT 0x10
+#define CG_DISPLAY_GAP_CNTL__DISP_GAP_MASK 0x3
+#define CG_DISPLAY_GAP_CNTL__DISP_GAP__SHIFT 0x0
+#define CG_DISPLAY_GAP_CNTL__VBI_TIMER_COUNT_MASK 0x3fff0
+#define CG_DISPLAY_GAP_CNTL__VBI_TIMER_COUNT__SHIFT 0x4
+#define CG_DISPLAY_GAP_CNTL__VBI_TIMER_UNIT_MASK 0x700000
+#define CG_DISPLAY_GAP_CNTL__VBI_TIMER_UNIT__SHIFT 0x14
+#define CG_DISPLAY_GAP_CNTL__DISP_GAP_MCHG_MASK 0x3000000
+#define CG_DISPLAY_GAP_CNTL__DISP_GAP_MCHG__SHIFT 0x18
+#define CG_DISPLAY_GAP_CNTL__VBI_TIMER_DISABLE_MASK 0x10000000
+#define CG_DISPLAY_GAP_CNTL__VBI_TIMER_DISABLE__SHIFT 0x1c
+#define CG_DISPLAY_GAP_CNTL2__VBI_PREDICTION_MASK 0xffffffff
+#define CG_DISPLAY_GAP_CNTL2__VBI_PREDICTION__SHIFT 0x0
+#define CG_ACPI_CNTL__SCLK_ACPI_DIV_MASK 0x7f
+#define CG_ACPI_CNTL__SCLK_ACPI_DIV__SHIFT 0x0
+#define CG_ACPI_CNTL__SCLK_CHANGE_SKIP_MASK 0x80
+#define CG_ACPI_CNTL__SCLK_CHANGE_SKIP__SHIFT 0x7
+#define SCLK_DEEP_SLEEP_CNTL__DIV_ID_MASK 0x7
+#define SCLK_DEEP_SLEEP_CNTL__DIV_ID__SHIFT 0x0
+#define SCLK_DEEP_SLEEP_CNTL__RAMP_DIS_MASK 0x8
+#define SCLK_DEEP_SLEEP_CNTL__RAMP_DIS__SHIFT 0x3
+#define SCLK_DEEP_SLEEP_CNTL__HYSTERESIS_MASK 0xfff0
+#define SCLK_DEEP_SLEEP_CNTL__HYSTERESIS__SHIFT 0x4
+#define SCLK_DEEP_SLEEP_CNTL__SCLK_RUNNING_MASK_MASK 0x10000
+#define SCLK_DEEP_SLEEP_CNTL__SCLK_RUNNING_MASK__SHIFT 0x10
+#define SCLK_DEEP_SLEEP_CNTL__SELF_REFRESH_MASK_MASK 0x20000
+#define SCLK_DEEP_SLEEP_CNTL__SELF_REFRESH_MASK__SHIFT 0x11
+#define SCLK_DEEP_SLEEP_CNTL__ALLOW_NBPSTATE_MASK_MASK 0x40000
+#define SCLK_DEEP_SLEEP_CNTL__ALLOW_NBPSTATE_MASK__SHIFT 0x12
+#define SCLK_DEEP_SLEEP_CNTL__BIF_BUSY_MASK_MASK 0x80000
+#define SCLK_DEEP_SLEEP_CNTL__BIF_BUSY_MASK__SHIFT 0x13
+#define SCLK_DEEP_SLEEP_CNTL__UVD_BUSY_MASK_MASK 0x100000
+#define SCLK_DEEP_SLEEP_CNTL__UVD_BUSY_MASK__SHIFT 0x14
+#define SCLK_DEEP_SLEEP_CNTL__MC0SRBM_BUSY_MASK_MASK 0x200000
+#define SCLK_DEEP_SLEEP_CNTL__MC0SRBM_BUSY_MASK__SHIFT 0x15
+#define SCLK_DEEP_SLEEP_CNTL__MC1SRBM_BUSY_MASK_MASK 0x400000
+#define SCLK_DEEP_SLEEP_CNTL__MC1SRBM_BUSY_MASK__SHIFT 0x16
+#define SCLK_DEEP_SLEEP_CNTL__MC_ALLOW_MASK_MASK 0x800000
+#define SCLK_DEEP_SLEEP_CNTL__MC_ALLOW_MASK__SHIFT 0x17
+#define SCLK_DEEP_SLEEP_CNTL__SMU_BUSY_MASK_MASK 0x1000000
+#define SCLK_DEEP_SLEEP_CNTL__SMU_BUSY_MASK__SHIFT 0x18
+#define SCLK_DEEP_SLEEP_CNTL__SELF_REFRESH_NLC_MASK_MASK 0x2000000
+#define SCLK_DEEP_SLEEP_CNTL__SELF_REFRESH_NLC_MASK__SHIFT 0x19
+#define SCLK_DEEP_SLEEP_CNTL__FAST_EXIT_REQ_NBPSTATE_MASK 0x4000000
+#define SCLK_DEEP_SLEEP_CNTL__FAST_EXIT_REQ_NBPSTATE__SHIFT 0x1a
+#define SCLK_DEEP_SLEEP_CNTL__DEEP_SLEEP_ENTRY_MODE_MASK 0x8000000
+#define SCLK_DEEP_SLEEP_CNTL__DEEP_SLEEP_ENTRY_MODE__SHIFT 0x1b
+#define SCLK_DEEP_SLEEP_CNTL__MBUS2_ACTIVE_MASK_MASK 0x10000000
+#define SCLK_DEEP_SLEEP_CNTL__MBUS2_ACTIVE_MASK__SHIFT 0x1c
+#define SCLK_DEEP_SLEEP_CNTL__VCE_BUSY_MASK_MASK 0x20000000
+#define SCLK_DEEP_SLEEP_CNTL__VCE_BUSY_MASK__SHIFT 0x1d
+#define SCLK_DEEP_SLEEP_CNTL__AZ_BUSY_MASK_MASK 0x40000000
+#define SCLK_DEEP_SLEEP_CNTL__AZ_BUSY_MASK__SHIFT 0x1e
+#define SCLK_DEEP_SLEEP_CNTL__ENABLE_DS_MASK 0x80000000
+#define SCLK_DEEP_SLEEP_CNTL__ENABLE_DS__SHIFT 0x1f
+#define SCLK_DEEP_SLEEP_CNTL2__RLC_BUSY_MASK_MASK 0x1
+#define SCLK_DEEP_SLEEP_CNTL2__RLC_BUSY_MASK__SHIFT 0x0
+#define SCLK_DEEP_SLEEP_CNTL2__HDP_BUSY_MASK_MASK 0x2
+#define SCLK_DEEP_SLEEP_CNTL2__HDP_BUSY_MASK__SHIFT 0x1
+#define SCLK_DEEP_SLEEP_CNTL2__ROM_BUSY_MASK_MASK 0x4
+#define SCLK_DEEP_SLEEP_CNTL2__ROM_BUSY_MASK__SHIFT 0x2
+#define SCLK_DEEP_SLEEP_CNTL2__IH_SEM_BUSY_MASK_MASK 0x8
+#define SCLK_DEEP_SLEEP_CNTL2__IH_SEM_BUSY_MASK__SHIFT 0x3
+#define SCLK_DEEP_SLEEP_CNTL2__PDMA_BUSY_MASK_MASK 0x10
+#define SCLK_DEEP_SLEEP_CNTL2__PDMA_BUSY_MASK__SHIFT 0x4
+#define SCLK_DEEP_SLEEP_CNTL2__IDCT_BUSY_MASK_MASK 0x40
+#define SCLK_DEEP_SLEEP_CNTL2__IDCT_BUSY_MASK__SHIFT 0x6
+#define SCLK_DEEP_SLEEP_CNTL2__SDMA_BUSY_MASK_MASK 0x80
+#define SCLK_DEEP_SLEEP_CNTL2__SDMA_BUSY_MASK__SHIFT 0x7
+#define 

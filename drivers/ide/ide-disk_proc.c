@@ -1,176 +1,162 @@
-#include <linux/kernel.h>
-#include <linux/ide.h>
-#include <linux/slab.h>
-#include <linux/export.h>
-#include <linux/seq_file.h>
 
-#include "ide-disk.h"
+	reg = idmac_read_icreg(ipu, IDMAC_CHA_EN);
+	idmac_write_icreg(ipu, reg & ~chan_mask, IDMAC_CHA_EN);
 
-static int smart_enable(ide_drive_t *drive)
-{
-	struct ide_cmd cmd;
-	struct ide_taskfile *tf = &cmd.tf;
+	spin_unlock_irqrestore(&ipu->lock, flags);
 
-	memset(&cmd, 0, sizeof(cmd));
-	tf->feature = ATA_SMART_ENABLE;
-	tf->lbam    = ATA_SMART_LBAM_PASS;
-	tf->lbah    = ATA_SMART_LBAH_PASS;
-	tf->command = ATA_CMD_SMART;
-	cmd.valid.out.tf = IDE_VALID_OUT_TF | IDE_VALID_DEVICE;
-	cmd.valid.in.tf  = IDE_VALID_IN_TF  | IDE_VALID_DEVICE;
-
-	return ide_no_data_taskfile(drive, &cmd);
-}
-
-static int get_smart_data(ide_drive_t *drive, u8 *buf, u8 sub_cmd)
-{
-	struct ide_cmd cmd;
-	struct ide_taskfile *tf = &cmd.tf;
-
-	memset(&cmd, 0, sizeof(cmd));
-	tf->feature = sub_cmd;
-	tf->nsect   = 0x01;
-	tf->lbam    = ATA_SMART_LBAM_PASS;
-	tf->lbah    = ATA_SMART_LBAH_PASS;
-	tf->command = ATA_CMD_SMART;
-	cmd.valid.out.tf = IDE_VALID_OUT_TF | IDE_VALID_DEVICE;
-	cmd.valid.in.tf  = IDE_VALID_IN_TF  | IDE_VALID_DEVICE;
-	cmd.protocol = ATA_PROT_PIO;
-
-	return ide_raw_taskfile(drive, &cmd, buf, 1);
-}
-
-static int idedisk_cache_proc_show(struct seq_file *m, void *v)
-{
-	ide_drive_t	*drive = (ide_drive_t *) m->private;
-
-	if (drive->dev_flags & IDE_DFLAG_ID_READ)
-		seq_printf(m, "%i\n", drive->id[ATA_ID_BUF_SIZE] / 2);
-	else
-		seq_printf(m, "(none)\n");
 	return 0;
 }
 
-static int idedisk_cache_proc_open(struct inode *inode, struct file *file)
+static struct scatterlist *idmac_sg_next(struct idmac_channel *ichan,
+	struct idmac_tx_desc **desc, struct scatterlist *sg)
 {
-	return single_open(file, idedisk_cache_proc_show, PDE_DATA(inode));
+	struct scatterlist *sgnew = sg ? sg_next(sg) : NULL;
+
+	if (sgnew)
+		/* next sg-element in this list */
+		return sgnew;
+
+	if ((*desc)->list.next == &ichan->queue)
+		/* No more descriptors on the queue */
+		return NULL;
+
+	/* Fetch next descriptor */
+	*desc = list_entry((*desc)->list.next, struct idmac_tx_desc, list);
+	return (*desc)->sg;
 }
 
-static const struct file_operations idedisk_cache_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= idedisk_cache_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int idedisk_capacity_proc_show(struct seq_file *m, void *v)
+/*
+ * We have several possibilities here:
+ * current BUF		next BUF
+ *
+ * not last sg		next not last sg
+ * not last sg		next last sg
+ * last sg		first sg from next descriptor
+ * last sg		NULL
+ *
+ * Besides, the descriptor queue might be empty or not. We process all these
+ * cases carefully.
+ */
+static irqreturn_t idmac_interrupt(int irq, void *dev_id)
 {
-	ide_drive_t*drive = (ide_drive_t *)m->private;
+	struct idmac_channel *ichan = dev_id;
+	struct device *dev = &ichan->dma_chan.dev->device;
+	unsigned int chan_id = ichan->dma_chan.chan_id;
+	struct scatterlist **sg, *sgnext, *sgnew = NULL;
+	/* Next transfer descriptor */
+	struct idmac_tx_desc *desc, *descnew;
+	dma_async_tx_callback callback;
+	void *callback_param;
+	bool done = false;
+	u32 ready0, ready1, curbuf, err;
+	unsigned long flags;
 
-	seq_printf(m, "%llu\n", (long long)ide_gd_capacity(drive));
-	return 0;
-}
+	/* IDMAC has cleared the respective BUFx_RDY bit, we manage the buffer */
 
-static int idedisk_capacity_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, idedisk_capacity_proc_show, PDE_DATA(inode));
-}
+	dev_dbg(dev, "IDMAC irq %d, buf %d\n", irq, ichan->active_buffer);
 
-static const struct file_operations idedisk_capacity_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= idedisk_capacity_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
+	spin_lock_irqsave(&ipu_data.lock, flags);
 
-static int __idedisk_proc_show(struct seq_file *m, ide_drive_t *drive, u8 sub_cmd)
-{
-	u8 *buf;
+	ready0	= idmac_read_ipureg(&ipu_data, IPU_CHA_BUF0_RDY);
+	ready1	= idmac_read_ipureg(&ipu_data, IPU_CHA_BUF1_RDY);
+	curbuf	= idmac_read_ipureg(&ipu_data, IPU_CHA_CUR_BUF);
+	err	= idmac_read_ipureg(&ipu_data, IPU_INT_STAT_4);
 
-	buf = kmalloc(SECTOR_SIZE, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	if (err & (1 << chan_id)) {
+		idmac_write_ipureg(&ipu_data, 1 << chan_id, IPU_INT_STAT_4);
+		spin_unlock_irqrestore(&ipu_data.lock, flags);
+		/*
+		 * Doing this
+		 * ichan->sg[0] = ichan->sg[1] = NULL;
+		 * you can force channel re-enable on the next tx_submit(), but
+		 * this is dirty - think about descriptors with multiple
+		 * sg elements.
+		 */
+		dev_warn(dev, "NFB4EOF on channel %d, ready %x, %x, cur %x\n",
+			 chan_id, ready0, ready1, curbuf);
+		return IRQ_HANDLED;
+	}
+	spin_unlock_irqrestore(&ipu_data.lock, flags);
 
-	(void)smart_enable(drive);
+	/* Other interrupts do not interfere with this channel */
+	spin_lock(&ichan->lock);
+	if (unlikely((ichan->active_buffer && (ready1 >> chan_id) & 1) ||
+		     (!ichan->active_buffer && (ready0 >> chan_id) & 1)
+		     )) {
+		spin_unlock(&ichan->lock);
+		dev_dbg(dev,
+			"IRQ with active buffer still ready on channel %x, "
+			"active %d, ready %x, %x!\n", chan_id,
+			ichan->active_buffer, ready0, ready1);
+		return IRQ_NONE;
+	}
 
-	if (get_smart_data(drive, buf, sub_cmd) == 0) {
-		__le16 *val = (__le16 *)buf;
-		int i;
+	if (unlikely(list_empty(&ichan->queue))) {
+		ichan->sg[ichan->active_buffer] = NULL;
+		spin_unlock(&ichan->lock);
+		dev_err(dev,
+			"IRQ without queued buffers on channel %x, active %d, "
+			"ready %x, %x!\n", chan_id,
+			ichan->active_buffer, ready0, ready1);
+		return IRQ_NONE;
+	}
 
-		for (i = 0; i < SECTOR_SIZE / 2; i++) {
-			seq_printf(m, "%04x%c", le16_to_cpu(val[i]),
-					(i % 8) == 7 ? '\n' : ' ');
+	/*
+	 * active_buffer is a software flag, it shows which buffer we are
+	 * currently expecting back from the hardware, IDMAC should be
+	 * processing the other buffer already
+	 */
+	sg = &ichan->sg[ichan->active_buffer];
+	sgnext = ichan->sg[!ichan->active_buffer];
+
+	if (!*sg) {
+		spin_unlock(&ichan->lock);
+		return IRQ_HANDLED;
+	}
+
+	desc = list_entry(ichan->queue.next, struct idmac_tx_desc, list);
+	descnew = desc;
+
+	dev_dbg(dev, "IDMAC irq %d, dma %#llx, next dma %#llx, current %d, curbuf %#x\n",
+		irq, (u64)sg_dma_address(*sg),
+		sgnext ? (u64)sg_dma_address(sgnext) : 0,
+		ichan->active_buffer, curbuf);
+
+	/* Find the descriptor of sgnext */
+	sgnew = idmac_sg_next(ichan, &descnew, *sg);
+	if (sgnext != sgnew)
+		dev_err(dev, "Submitted buffer %p, next buffer %p\n", sgnext, sgnew);
+
+	/*
+	 * if sgnext == NULL sg must be the last element in a scatterlist and
+	 * queue must be empty
+	 */
+	if (unlikely(!sgnext)) {
+		if (!WARN_ON(sg_next(*sg)))
+			dev_dbg(dev, "Underrun on channel %x\n", chan_id);
+		ichan->sg[!ichan->active_buffer] = sgnew;
+
+		if (unlikely(sgnew)) {
+			ipu_submit_buffer(ichan, descnew, sgnew, !ichan->active_buffer);
+		} else {
+			spin_lock_irqsave(&ipu_data.lock, flags);
+			ipu_ic_disable_task(&ipu_data, chan_id);
+			spin_unlock_irqrestore(&ipu_data.lock, flags);
+			ichan->status = IPU_CHANNEL_READY;
+			/* Continue to check for complete descriptor */
 		}
 	}
-	kfree(buf);
-	return 0;
-}
 
-static int idedisk_sv_proc_show(struct seq_file *m, void *v)
-{
-	return __idedisk_proc_show(m, m->private, ATA_SMART_READ_VALUES);
-}
+	/* Calculate and submit the next sg element */
+	sgnew = idmac_sg_next(ichan, &descnew, sgnew);
 
-static int idedisk_sv_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, idedisk_sv_proc_show, PDE_DATA(inode));
-}
+	if (unlikely(!sg_next(*sg)) || !sgnext) {
+		/*
+		 * Last element in scatterlist done, remove from the queue,
+		 * _init for debugging
+		 */
+		list_del_init(&desc->list);
+		done = true;
+	}
 
-static const struct file_operations idedisk_sv_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= idedisk_sv_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int idedisk_st_proc_show(struct seq_file *m, void *v)
-{
-	return __idedisk_proc_show(m, m->private, ATA_SMART_READ_THRESHOLDS);
-}
-
-static int idedisk_st_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, idedisk_st_proc_show, PDE_DATA(inode));
-}
-
-static const struct file_operations idedisk_st_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= idedisk_st_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-ide_proc_entry_t ide_disk_proc[] = {
-	{ "cache",	  S_IFREG|S_IRUGO, &idedisk_cache_proc_fops	},
-	{ "capacity",	  S_IFREG|S_IRUGO, &idedisk_capacity_proc_fops	},
-	{ "geometry",	  S_IFREG|S_IRUGO, &ide_geometry_proc_fops	},
-	{ "smart_values", S_IFREG|S_IRUSR, &idedisk_sv_proc_fops	},
-	{ "smart_thresholds", S_IFREG|S_IRUSR, &idedisk_st_proc_fops	},
-	{}
-};
-
-ide_devset_rw_field(bios_cyl, bios_cyl);
-ide_devset_rw_field(bios_head, bios_head);
-ide_devset_rw_field(bios_sect, bios_sect);
-ide_devset_rw_field(failures, failures);
-ide_devset_rw_field(lun, lun);
-ide_devset_rw_field(max_failures, max_failures);
-
-const struct ide_proc_devset ide_disk_settings[] = {
-	IDE_PROC_DEVSET(acoustic,	0,   254),
-	IDE_PROC_DEVSET(address,	0,     2),
-	IDE_PROC_DEVSET(bios_cyl,	0, 65535),
-	IDE_PROC_DEVSET(bios_head,	0,   255),
-	IDE_PROC_DEVSET(bios_sect,	0,    63),
-	IDE_PROC_DEVSET(failures,	0, 65535),
-	IDE_PROC_DEVSET(lun,		0,     7),
-	IDE_PROC_DEVSET(max_failures,	0, 65535),
-	IDE_PROC_DEVSET(multcount,	0,    16),
-	IDE_PROC_DEVSET(nowerr,		0,     1),
-	IDE_PROC_DEVSET(wcache,		0,     1),
-	{ NULL },
-};
+	*sg =

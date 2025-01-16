@@ -1,790 +1,704 @@
-/*
- *  Copyright (C) 1997-1998	Mark Lord
- *  Copyright (C) 2003		Red Hat
- *
- *  Some code was moved here from ide.c, see it for original copyrights.
- */
-
-/*
- * This is the /proc/ide/ filesystem implementation.
- *
- * Drive/Driver settings can be retrieved by reading the drive's
- * "settings" files.  e.g.    "cat /proc/ide0/hda/settings"
- * To write a new value "val" into a specific setting "name", use:
- *   echo "name:val" >/proc/ide/ide0/hda/settings
- */
-
-#include <linux/module.h>
-
-#include <asm/uaccess.h>
-#include <linux/errno.h>
-#include <linux/proc_fs.h>
-#include <linux/stat.h>
-#include <linux/mm.h>
-#include <linux/pci.h>
-#include <linux/ctype.h>
-#include <linux/ide.h>
-#include <linux/seq_file.h>
-#include <linux/slab.h>
-
-#include <asm/io.h>
-
-static struct proc_dir_entry *proc_ide_root;
-
-static int ide_imodel_proc_show(struct seq_file *m, void *v)
-{
-	ide_hwif_t	*hwif = (ide_hwif_t *) m->private;
-	const char	*name;
-
-	switch (hwif->chipset) {
-	case ide_generic:	name = "generic";	break;
-	case ide_pci:		name = "pci";		break;
-	case ide_cmd640:	name = "cmd640";	break;
-	case ide_dtc2278:	name = "dtc2278";	break;
-	case ide_ali14xx:	name = "ali14xx";	break;
-	case ide_qd65xx:	name = "qd65xx";	break;
-	case ide_umc8672:	name = "umc8672";	break;
-	case ide_ht6560b:	name = "ht6560b";	break;
-	case ide_4drives:	name = "4drives";	break;
-	case ide_pmac:		name = "mac-io";	break;
-	case ide_au1xxx:	name = "au1xxx";	break;
-	case ide_palm3710:      name = "palm3710";      break;
-	case ide_acorn:		name = "acorn";		break;
-	default:		name = "(unknown)";	break;
+_err(dev, "Self-test  2nd zero setup failed\n");
+		err = -ENODEV;
+		goto dma_unmap;
 	}
-	seq_printf(m, "%s\n", name);
-	return 0;
-}
+	dma->device_issue_pending(dma_chan);
 
-static int ide_imodel_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_imodel_proc_show, PDE_DATA(inode));
-}
+	tmo = wait_for_completion_timeout(&cmp, msecs_to_jiffies(3000));
 
-static const struct file_operations ide_imodel_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_imodel_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int ide_mate_proc_show(struct seq_file *m, void *v)
-{
-	ide_hwif_t	*hwif = (ide_hwif_t *) m->private;
-
-	if (hwif && hwif->mate)
-		seq_printf(m, "%s\n", hwif->mate->name);
-	else
-		seq_printf(m, "(none)\n");
-	return 0;
-}
-
-static int ide_mate_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_mate_proc_show, PDE_DATA(inode));
-}
-
-static const struct file_operations ide_mate_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_mate_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int ide_channel_proc_show(struct seq_file *m, void *v)
-{
-	ide_hwif_t	*hwif = (ide_hwif_t *) m->private;
-
-	seq_printf(m, "%c\n", hwif->channel ? '1' : '0');
-	return 0;
-}
-
-static int ide_channel_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_channel_proc_show, PDE_DATA(inode));
-}
-
-static const struct file_operations ide_channel_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_channel_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int ide_identify_proc_show(struct seq_file *m, void *v)
-{
-	ide_drive_t *drive = (ide_drive_t *)m->private;
-	u8 *buf;
-
-	if (!drive) {
-		seq_putc(m, '\n');
-		return 0;
+	if (tmo == 0 ||
+	    dma->device_tx_status(dma_chan, cookie, NULL) != DMA_COMPLETE) {
+		dev_err(dev, "Self-test 2nd validate timed out\n");
+		err = -ENODEV;
+		goto dma_unmap;
 	}
 
-	buf = kmalloc(SECTOR_SIZE, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-	if (taskfile_lib_get_identify(drive, buf) == 0) {
-		__le16 *val = (__le16 *)buf;
+	if (xor_val_result != SUM_CHECK_P_RESULT) {
+		dev_err(dev, "Self-test validate failed compare\n");
+		err = -ENODEV;
+		goto dma_unmap;
+	}
+
+	for (i = 0; i < IOAT_NUM_SRC_TEST + 1; i++)
+		dma_unmap_page(dev, dma_srcs[i], PAGE_SIZE, DMA_TO_DEVICE);
+
+	goto free_resources;
+dma_unmap:
+	if (op == IOAT_OP_XOR) {
+		if (dest_dma != DMA_ERROR_CODE)
+			dma_unmap_page(dev, dest_dma, PAGE_SIZE,
+				       DMA_FROM_DEVICE);
+		for (i = 0; i < IOAT_NUM_SRC_TEST; i++)
+			if (dma_srcs[i] != DMA_ERROR_CODE)
+				dma_unmap_page(dev, dma_srcs[i], PAGE_SIZE,
+					       DMA_TO_DEVICE);
+	} else if (op == IOAT_OP_XOR_VAL) {
+		for (i = 0; i < IOAT_NUM_SRC_TEST + 1; i++)
+			if (dma_srcs[i] != DMA_ERROR_CODE)
+				dma_unmap_page(dev, dma_srcs[i], PAGE_SIZE,
+					       DMA_TO_DEVICE);
+	}
+free_resources:
+	dma->device_free_chan_resources(dma_chan);
+out:
+	src_idx = IOAT_NUM_SRC_TEST;
+	while (src_idx--)
+		__free_page(xor_srcs[src_idx]);
+	__free_page(dest);
+	return err;
+}
+
+static int ioat3_dma_self_test(struct ioatdma_device *ioat_dma)
+{
+	int rc;
+
+	rc = ioat_dma_self_test(ioat_dma);
+	if (rc)
+		return rc;
+
+	rc = ioat_xor_val_self_test(ioat_dma);
+
+	return rc;
+}
+
+static void ioat_intr_quirk(struct ioatdma_device *ioat_dma)
+{
+	struct dma_device *dma;
+	struct dma_chan *c;
+	struct ioatdma_chan *ioat_chan;
+	u32 errmask;
+
+	dma = &ioat_dma->dma_dev;
+
+	/*
+	 * if we have descriptor write back error status, we mask the
+	 * error interrupts
+	 */
+	if (ioat_dma->cap & IOAT_CAP_DWBES) {
+		list_for_each_entry(c, &dma->channels, device_node) {
+			ioat_chan = to_ioat_chan(c);
+			errmask = readl(ioat_chan->reg_base +
+					IOAT_CHANERR_MASK_OFFSET);
+			errmask |= IOAT_CHANERR_XOR_P_OR_CRC_ERR |
+				   IOAT_CHANERR_XOR_Q_ERR;
+			writel(errmask, ioat_chan->reg_base +
+					IOAT_CHANERR_MASK_OFFSET);
+		}
+	}
+}
+
+static int ioat3_dma_probe(struct ioatdma_device *ioat_dma, int dca)
+{
+	struct pci_dev *pdev = ioat_dma->pdev;
+	int dca_en = system_has_dca_enabled(pdev);
+	struct dma_device *dma;
+	struct dma_chan *c;
+	struct ioatdma_chan *ioat_chan;
+	bool is_raid_device = false;
+	int err;
+
+	dma = &ioat_dma->dma_dev;
+	dma->device_prep_dma_memcpy = ioat_dma_prep_memcpy_lock;
+	dma->device_issue_pending = ioat_issue_pending;
+	dma->device_alloc_chan_resources = ioat_alloc_chan_resources;
+	dma->device_free_chan_resources = ioat_free_chan_resources;
+
+	dma_cap_set(DMA_INTERRUPT, dma->cap_mask);
+	dma->device_prep_dma_interrupt = ioat_prep_interrupt_lock;
+
+	ioat_dma->cap = readl(ioat_dma->reg_base + IOAT_DMA_CAP_OFFSET);
+
+	if (is_xeon_cb32(pdev) || is_bwd_noraid(pdev))
+		ioat_dma->cap &=
+			~(IOAT_CAP_XOR | IOAT_CAP_PQ | IOAT_CAP_RAID16SS);
+
+	/* dca is incompatible with raid operations */
+	if (dca_en && (ioat_dma->cap & (IOAT_CAP_XOR|IOAT_CAP_PQ)))
+		ioat_dma->cap &= ~(IOAT_CAP_XOR|IOAT_CAP_PQ);
+
+	if (ioat_dma->cap & IOAT_CAP_XOR) {
+		is_raid_device = true;
+		dma->max_xor = 8;
+
+		dma_cap_set(DMA_XOR, dma->cap_mask);
+		dma->device_prep_dma_xor = ioat_prep_xor;
+
+		dma_cap_set(DMA_XOR_VAL, dma->cap_mask);
+		dma->device_prep_dma_xor_val = ioat_prep_xor_val;
+	}
+
+	if (ioat_dma->cap & IOAT_CAP_PQ) {
+		is_raid_device = true;
+
+		dma->device_prep_dma_pq = ioat_prep_pq;
+		dma->device_prep_dma_pq_val = ioat_prep_pq_val;
+		dma_cap_set(DMA_PQ, dma->cap_mask);
+		dma_cap_set(DMA_PQ_VAL, dma->cap_mask);
+
+		if (ioat_dma->cap & IOAT_CAP_RAID16SS)
+			dma_set_maxpq(dma, 16, 0);
+		else
+			dma_set_maxpq(dma, 8, 0);
+
+		if (!(ioat_dma->cap & IOAT_CAP_XOR)) {
+			dma->device_prep_dma_xor = ioat_prep_pqxor;
+			dma->device_prep_dma_xor_val = ioat_prep_pqxor_val;
+			dma_cap_set(DMA_XOR, dma->cap_mask);
+			dma_cap_set(DMA_XOR_VAL, dma->cap_mask);
+
+			if (ioat_dma->cap & IOAT_CAP_RAID16SS)
+				dma->max_xor = 16;
+			else
+				dma->max_xor = 8;
+		}
+	}
+
+	dma->device_tx_status = ioat_tx_status;
+
+	/* starting with CB3.3 super extended descriptors are supported */
+	if (ioat_dma->cap & IOAT_CAP_RAID16SS) {
+		char pool_name[14];
 		int i;
 
-		for (i = 0; i < SECTOR_SIZE / 2; i++) {
-			seq_printf(m, "%04x%c", le16_to_cpu(val[i]),
-					(i % 8) == 7 ? '\n' : ' ');
+		for (i = 0; i < MAX_SED_POOLS; i++) {
+			snprintf(pool_name, 14, "ioat_hw%d_sed", i);
+
+			/* allocate SED DMA pool */
+			ioat_dma->sed_hw_pool[i] = dmam_pool_create(pool_name,
+					&pdev->dev,
+					SED_SIZE * (i + 1), 64, 0);
+			if (!ioat_dma->sed_hw_pool[i])
+				return -ENOMEM;
+
 		}
-	} else
-		seq_putc(m, buf[0]);
-	kfree(buf);
+	}
+
+	if (!(ioat_dma->cap & (IOAT_CAP_XOR | IOAT_CAP_PQ)))
+		dma_cap_set(DMA_PRIVATE, dma->cap_mask);
+
+	err = ioat_probe(ioat_dma);
+	if (err)
+		return err;
+
+	list_for_each_entry(c, &dma->channels, device_node) {
+		ioat_chan = to_ioat_chan(c);
+		writel(IOAT_DMA_DCA_ANY_CPU,
+		       ioat_chan->reg_base + IOAT_DCACTRL_OFFSET);
+	}
+
+	err = ioat_register(ioat_dma);
+	if (err)
+		return err;
+
+	ioat_kobject_add(ioat_dma, &ioat_ktype);
+
+	if (dca)
+		ioat_dma->dca = ioat_dca_init(pdev, ioat_dma->reg_base);
+
 	return 0;
 }
 
-static int ide_identify_proc_open(struct inode *inode, struct file *file)
+static void ioat_shutdown(struct pci_dev *pdev)
 {
-	return single_open(file, ide_identify_proc_show, PDE_DATA(inode));
-}
-
-static const struct file_operations ide_identify_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_identify_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-/**
- *	ide_find_setting	-	find a specific setting
- *	@st: setting table pointer
- *	@name: setting name
- *
- *	Scan's the setting table for a matching entry and returns
- *	this or NULL if no entry is found. The caller must hold the
- *	setting semaphore
- */
-
-static
-const struct ide_proc_devset *ide_find_setting(const struct ide_proc_devset *st,
-					       char *name)
-{
-	while (st->name) {
-		if (strcmp(st->name, name) == 0)
-			break;
-		st++;
-	}
-	return st->name ? st : NULL;
-}
-
-/**
- *	ide_read_setting	-	read an IDE setting
- *	@drive: drive to read from
- *	@setting: drive setting
- *
- *	Read a drive setting and return the value. The caller
- *	must hold the ide_setting_mtx when making this call.
- *
- *	BUGS: the data return and error are the same return value
- *	so an error -EINVAL and true return of the same value cannot
- *	be told apart
- */
-
-static int ide_read_setting(ide_drive_t *drive,
-			    const struct ide_proc_devset *setting)
-{
-	const struct ide_devset *ds = setting->setting;
-	int val = -EINVAL;
-
-	if (ds->get)
-		val = ds->get(drive);
-
-	return val;
-}
-
-/**
- *	ide_write_setting	-	read an IDE setting
- *	@drive: drive to read from
- *	@setting: drive setting
- *	@val: value
- *
- *	Write a drive setting if it is possible. The caller
- *	must hold the ide_setting_mtx when making this call.
- *
- *	BUGS: the data return and error are the same return value
- *	so an error -EINVAL and true return of the same value cannot
- *	be told apart
- *
- *	FIXME:  This should be changed to enqueue a special request
- *	to the driver to change settings, and then wait on a sema for completion.
- *	The current scheme of polling is kludgy, though safe enough.
- */
-
-static int ide_write_setting(ide_drive_t *drive,
-			     const struct ide_proc_devset *setting, int val)
-{
-	const struct ide_devset *ds = setting->setting;
-
-	if (!capable(CAP_SYS_ADMIN))
-		return -EACCES;
-	if (!ds->set)
-		return -EPERM;
-	if ((ds->flags & DS_SYNC)
-	    && (val < setting->min || val > setting->max))
-		return -EINVAL;
-	return ide_devset_execute(drive, ds, val);
-}
-
-ide_devset_get(xfer_rate, current_speed);
-
-static int set_xfer_rate (ide_drive_t *drive, int arg)
-{
-	struct ide_cmd cmd;
-
-	if (arg < XFER_PIO_0 || arg > XFER_UDMA_6)
-		return -EINVAL;
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.tf.command = ATA_CMD_SET_FEATURES;
-	cmd.tf.feature = SETFEATURES_XFER;
-	cmd.tf.nsect   = (u8)arg;
-	cmd.valid.out.tf = IDE_VALID_FEATURE | IDE_VALID_NSECT;
-	cmd.valid.in.tf  = IDE_VALID_NSECT;
-	cmd.tf_flags   = IDE_TFLAG_SET_XFER;
-
-	return ide_no_data_taskfile(drive, &cmd);
-}
-
-ide_devset_rw(current_speed, xfer_rate);
-ide_devset_rw_field(init_speed, init_speed);
-ide_devset_rw_flag(nice1, IDE_DFLAG_NICE1);
-ide_devset_rw_field(number, dn);
-
-static const struct ide_proc_devset ide_generic_settings[] = {
-	IDE_PROC_DEVSET(current_speed, 0, 70),
-	IDE_PROC_DEVSET(init_speed, 0, 70),
-	IDE_PROC_DEVSET(io_32bit,  0, 1 + (SUPPORT_VLB_SYNC << 1)),
-	IDE_PROC_DEVSET(keepsettings, 0, 1),
-	IDE_PROC_DEVSET(nice1, 0, 1),
-	IDE_PROC_DEVSET(number, 0, 3),
-	IDE_PROC_DEVSET(pio_mode, 0, 255),
-	IDE_PROC_DEVSET(unmaskirq, 0, 1),
-	IDE_PROC_DEVSET(using_dma, 0, 1),
-	{ NULL },
-};
-
-static void proc_ide_settings_warn(void)
-{
-	printk_once(KERN_WARNING "Warning: /proc/ide/hd?/settings interface is "
-			    "obsolete, and will be removed soon!\n");
-}
-
-static int ide_settings_proc_show(struct seq_file *m, void *v)
-{
-	const struct ide_proc_devset *setting, *g, *d;
-	const struct ide_devset *ds;
-	ide_drive_t	*drive = (ide_drive_t *) m->private;
-	int		rc, mul_factor, div_factor;
-
-	proc_ide_settings_warn();
-
-	mutex_lock(&ide_setting_mtx);
-	g = ide_generic_settings;
-	d = drive->settings;
-	seq_printf(m, "name\t\t\tvalue\t\tmin\t\tmax\t\tmode\n");
-	seq_printf(m, "----\t\t\t-----\t\t---\t\t---\t\t----\n");
-	while (g->name || (d && d->name)) {
-		/* read settings in the alphabetical order */
-		if (g->name && d && d->name) {
-			if (strcmp(d->name, g->name) < 0)
-				setting = d++;
-			else
-				setting = g++;
-		} else if (d && d->name) {
-			setting = d++;
-		} else
-			setting = g++;
-		mul_factor = setting->mulf ? setting->mulf(drive) : 1;
-		div_factor = setting->divf ? setting->divf(drive) : 1;
-		seq_printf(m, "%-24s", setting->name);
-		rc = ide_read_setting(drive, setting);
-		if (rc >= 0)
-			seq_printf(m, "%-16d", rc * mul_factor / div_factor);
-		else
-			seq_printf(m, "%-16s", "write-only");
-		seq_printf(m, "%-16d%-16d", (setting->min * mul_factor + div_factor - 1) / div_factor, setting->max * mul_factor / div_factor);
-		ds = setting->setting;
-		if (ds->get)
-			seq_printf(m, "r");
-		if (ds->set)
-			seq_printf(m, "w");
-		seq_printf(m, "\n");
-	}
-	mutex_unlock(&ide_setting_mtx);
-	return 0;
-}
-
-static int ide_settings_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_settings_proc_show, PDE_DATA(inode));
-}
-
-#define MAX_LEN	30
-
-static ssize_t ide_settings_proc_write(struct file *file, const char __user *buffer,
-				       size_t count, loff_t *pos)
-{
-	ide_drive_t	*drive = PDE_DATA(file_inode(file));
-	char		name[MAX_LEN + 1];
-	int		for_real = 0, mul_factor, div_factor;
-	unsigned long	n;
-
-	const struct ide_proc_devset *setting;
-	char *buf, *s;
-
-	if (!capable(CAP_SYS_ADMIN))
-		return -EACCES;
-
-	proc_ide_settings_warn();
-
-	if (count >= PAGE_SIZE)
-		return -EINVAL;
-
-	s = buf = (char *)__get_free_page(GFP_USER);
-	if (!buf)
-		return -ENOMEM;
-
-	if (copy_from_user(buf, buffer, count)) {
-		free_page((unsigned long)buf);
-		return -EFAULT;
-	}
-
-	buf[count] = '\0';
-
-	/*
-	 * Skip over leading whitespace
-	 */
-	while (count && isspace(*s)) {
-		--count;
-		++s;
-	}
-	/*
-	 * Do one full pass to verify all parameters,
-	 * then do another to actually write the new settings.
-	 */
-	do {
-		char *p = s;
-		n = count;
-		while (n > 0) {
-			unsigned val;
-			char *q = p;
-
-			while (n > 0 && *p != ':') {
-				--n;
-				p++;
-			}
-			if (*p != ':')
-				goto parse_error;
-			if (p - q > MAX_LEN)
-				goto parse_error;
-			memcpy(name, q, p - q);
-			name[p - q] = 0;
-
-			if (n > 0) {
-				--n;
-				p++;
-			} else
-				goto parse_error;
-
-			val = simple_strtoul(p, &q, 10);
-			n -= q - p;
-			p = q;
-			if (n > 0 && !isspace(*p))
-				goto parse_error;
-			while (n > 0 && isspace(*p)) {
-				--n;
-				++p;
-			}
-
-			mutex_lock(&ide_setting_mtx);
-			/* generic settings first, then driver specific ones */
-			setting = ide_find_setting(ide_generic_settings, name);
-			if (!setting) {
-				if (drive->settings)
-					setting = ide_find_setting(drive->settings, name);
-				if (!setting) {
-					mutex_unlock(&ide_setting_mtx);
-					goto parse_error;
-				}
-			}
-			if (for_real) {
-				mul_factor = setting->mulf ? setting->mulf(drive) : 1;
-				div_factor = setting->divf ? setting->divf(drive) : 1;
-				ide_write_setting(drive, setting, val * div_factor / mul_factor);
-			}
-			mutex_unlock(&ide_setting_mtx);
-		}
-	} while (!for_real++);
-	free_page((unsigned long)buf);
-	return count;
-parse_error:
-	free_page((unsigned long)buf);
-	printk("%s(): parse error\n", __func__);
-	return -EINVAL;
-}
-
-static const struct file_operations ide_settings_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_settings_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-	.write		= ide_settings_proc_write,
-};
-
-static int ide_capacity_proc_show(struct seq_file *m, void *v)
-{
-	seq_printf(m, "%llu\n", (long long)0x7fffffff);
-	return 0;
-}
-
-static int ide_capacity_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_capacity_proc_show, NULL);
-}
-
-const struct file_operations ide_capacity_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_capacity_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-EXPORT_SYMBOL_GPL(ide_capacity_proc_fops);
-
-static int ide_geometry_proc_show(struct seq_file *m, void *v)
-{
-	ide_drive_t	*drive = (ide_drive_t *) m->private;
-
-	seq_printf(m, "physical     %d/%d/%d\n",
-			drive->cyl, drive->head, drive->sect);
-	seq_printf(m, "logical      %d/%d/%d\n",
-			drive->bios_cyl, drive->bios_head, drive->bios_sect);
-	return 0;
-}
-
-static int ide_geometry_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_geometry_proc_show, PDE_DATA(inode));
-}
-
-const struct file_operations ide_geometry_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_geometry_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-EXPORT_SYMBOL(ide_geometry_proc_fops);
-
-static int ide_dmodel_proc_show(struct seq_file *seq, void *v)
-{
-	ide_drive_t	*drive = (ide_drive_t *) seq->private;
-	char		*m = (char *)&drive->id[ATA_ID_PROD];
-
-	seq_printf(seq, "%.40s\n", m[0] ? m : "(none)");
-	return 0;
-}
-
-static int ide_dmodel_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_dmodel_proc_show, PDE_DATA(inode));
-}
-
-static const struct file_operations ide_dmodel_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_dmodel_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int ide_driver_proc_show(struct seq_file *m, void *v)
-{
-	ide_drive_t		*drive = (ide_drive_t *)m->private;
-	struct device		*dev = &drive->gendev;
-	struct ide_driver	*ide_drv;
-
-	if (dev->driver) {
-		ide_drv = to_ide_driver(dev->driver);
-		seq_printf(m, "%s version %s\n",
-				dev->driver->name, ide_drv->version);
-	} else
-		seq_printf(m, "ide-default version 0.9.newide\n");
-	return 0;
-}
-
-static int ide_driver_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_driver_proc_show, PDE_DATA(inode));
-}
-
-static int ide_replace_subdriver(ide_drive_t *drive, const char *driver)
-{
-	struct device *dev = &drive->gendev;
-	int ret = 1;
-	int err;
-
-	device_release_driver(dev);
-	/* FIXME: device can still be in use by previous driver */
-	strlcpy(drive->driver_req, driver, sizeof(drive->driver_req));
-	err = device_attach(dev);
-	if (err < 0)
-		printk(KERN_WARNING "IDE: %s: device_attach error: %d\n",
-			__func__, err);
-	drive->driver_req[0] = 0;
-	if (dev->driver == NULL) {
-		err = device_attach(dev);
-		if (err < 0)
-			printk(KERN_WARNING
-				"IDE: %s: device_attach(2) error: %d\n",
-				__func__, err);
-	}
-	if (dev->driver && !strcmp(dev->driver->name, driver))
-		ret = 0;
-
-	return ret;
-}
-
-static ssize_t ide_driver_proc_write(struct file *file, const char __user *buffer,
-				     size_t count, loff_t *pos)
-{
-	ide_drive_t	*drive = PDE_DATA(file_inode(file));
-	char name[32];
-
-	if (!capable(CAP_SYS_ADMIN))
-		return -EACCES;
-	if (count > 31)
-		count = 31;
-	if (copy_from_user(name, buffer, count))
-		return -EFAULT;
-	name[count] = '\0';
-	if (ide_replace_subdriver(drive, name))
-		return -EINVAL;
-	return count;
-}
-
-static const struct file_operations ide_driver_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_driver_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-	.write		= ide_driver_proc_write,
-};
-
-static int ide_media_proc_show(struct seq_file *m, void *v)
-{
-	ide_drive_t	*drive = (ide_drive_t *) m->private;
-	const char	*media;
-
-	switch (drive->media) {
-	case ide_disk:		media = "disk\n";	break;
-	case ide_cdrom:		media = "cdrom\n";	break;
-	case ide_tape:		media = "tape\n";	break;
-	case ide_floppy:	media = "floppy\n";	break;
-	case ide_optical:	media = "optical\n";	break;
-	default:		media = "UNKNOWN\n";	break;
-	}
-	seq_puts(m, media);
-	return 0;
-}
-
-static int ide_media_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ide_media_proc_show, PDE_DATA(inode));
-}
-
-static const struct file_operations ide_media_proc_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ide_media_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static ide_proc_entry_t generic_drive_entries[] = {
-	{ "driver",	S_IFREG|S_IRUGO,	 &ide_driver_proc_fops	},
-	{ "identify",	S_IFREG|S_IRUSR,	 &ide_identify_proc_fops},
-	{ "media",	S_IFREG|S_IRUGO,	 &ide_media_proc_fops	},
-	{ "model",	S_IFREG|S_IRUGO,	 &ide_dmodel_proc_fops	},
-	{ "settings",	S_IFREG|S_IRUSR|S_IWUSR, &ide_settings_proc_fops},
-	{}
-};
-
-static void ide_add_proc_entries(struct proc_dir_entry *dir, ide_proc_entry_t *p, void *data)
-{
-	struct proc_dir_entry *ent;
-
-	if (!dir || !p)
-		return;
-	while (p->name != NULL) {
-		ent = proc_create_data(p->name, p->mode, dir, p->proc_fops, data);
-		if (!ent) return;
-		p++;
-	}
-}
-
-static void ide_remove_proc_entries(struct proc_dir_entry *dir, ide_proc_entry_t *p)
-{
-	if (!dir || !p)
-		return;
-	while (p->name != NULL) {
-		remove_proc_entry(p->name, dir);
-		p++;
-	}
-}
-
-void ide_proc_register_driver(ide_drive_t *drive, struct ide_driver *driver)
-{
-	mutex_lock(&ide_setting_mtx);
-	drive->settings = driver->proc_devsets(drive);
-	mutex_unlock(&ide_setting_mtx);
-
-	ide_add_proc_entries(drive->proc, driver->proc_entries(drive), drive);
-}
-
-EXPORT_SYMBOL(ide_proc_register_driver);
-
-/**
- *	ide_proc_unregister_driver	-	remove driver specific data
- *	@drive: drive
- *	@driver: driver
- *
- *	Clean up the driver specific /proc files and IDE settings
- *	for a given drive.
- *
- *	Takes ide_setting_mtx.
- */
-
-void ide_proc_unregister_driver(ide_drive_t *drive, struct ide_driver *driver)
-{
-	ide_remove_proc_entries(drive->proc, driver->proc_entries(drive));
-
-	mutex_lock(&ide_setting_mtx);
-	/*
-	 * ide_setting_mtx protects both the settings list and the use
-	 * of settings (we cannot take a setting out that is being used).
-	 */
-	drive->settings = NULL;
-	mutex_unlock(&ide_setting_mtx);
-}
-EXPORT_SYMBOL(ide_proc_unregister_driver);
-
-void ide_proc_port_register_devices(ide_hwif_t *hwif)
-{
-	struct proc_dir_entry *ent;
-	struct proc_dir_entry *parent = hwif->proc;
-	ide_drive_t *drive;
-	char name[64];
+	struct ioatdma_device *ioat_dma = pci_get_drvdata(pdev);
+	struct ioatdma_chan *ioat_chan;
 	int i;
 
-	ide_port_for_each_dev(i, drive, hwif) {
-		if ((drive->dev_flags & IDE_DFLAG_PRESENT) == 0)
-			continue;
-
-		drive->proc = proc_mkdir(drive->name, parent);
-		if (drive->proc)
-			ide_add_proc_entries(drive->proc, generic_drive_entries, drive);
-		sprintf(name, "ide%d/%s", (drive->name[2]-'a')/2, drive->name);
-		ent = proc_symlink(drive->name, proc_ide_root, name);
-		if (!ent) return;
-	}
-}
-
-void ide_proc_unregister_device(ide_drive_t *drive)
-{
-	if (drive->proc) {
-		ide_remove_proc_entries(drive->proc, generic_drive_entries);
-		remove_proc_entry(drive->name, proc_ide_root);
-		remove_proc_entry(drive->name, drive->hwif->proc);
-		drive->proc = NULL;
-	}
-}
-
-static ide_proc_entry_t hwif_entries[] = {
-	{ "channel",	S_IFREG|S_IRUGO,	&ide_channel_proc_fops	},
-	{ "mate",	S_IFREG|S_IRUGO,	&ide_mate_proc_fops	},
-	{ "model",	S_IFREG|S_IRUGO,	&ide_imodel_proc_fops	},
-	{}
-};
-
-void ide_proc_register_port(ide_hwif_t *hwif)
-{
-	if (!hwif->proc) {
-		hwif->proc = proc_mkdir(hwif->name, proc_ide_root);
-
-		if (!hwif->proc)
-			return;
-
-		ide_add_proc_entries(hwif->proc, hwif_entries, hwif);
-	}
-}
-
-void ide_proc_unregister_port(ide_hwif_t *hwif)
-{
-	if (hwif->proc) {
-		ide_remove_proc_entries(hwif->proc, hwif_entries);
-		remove_proc_entry(hwif->name, proc_ide_root);
-		hwif->proc = NULL;
-	}
-}
-
-static int proc_print_driver(struct device_driver *drv, void *data)
-{
-	struct ide_driver *ide_drv = to_ide_driver(drv);
-	struct seq_file *s = data;
-
-	seq_printf(s, "%s version %s\n", drv->name, ide_drv->version);
-
-	return 0;
-}
-
-static int ide_drivers_show(struct seq_file *s, void *p)
-{
-	int err;
-
-	err = bus_for_each_drv(&ide_bus_type, NULL, s, proc_print_driver);
-	if (err < 0)
-		printk(KERN_WARNING "IDE: %s: bus_for_each_drv error: %d\n",
-			__func__, err);
-	return 0;
-}
-
-static int ide_drivers_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, &ide_drivers_show, NULL);
-}
-
-static const struct file_operations ide_drivers_operations = {
-	.owner		= THIS_MODULE,
-	.open		= ide_drivers_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-void proc_ide_create(void)
-{
-	proc_ide_root = proc_mkdir("ide", NULL);
-
-	if (!proc_ide_root)
+	if (!ioat_dma)
 		return;
 
-	proc_create("drivers", 0, proc_ide_root, &ide_drivers_operations);
+	for (i = 0; i < IOAT_MAX_CHANS; i++) {
+		ioat_chan = ioat_dma->idx[i];
+		if (!ioat_chan)
+			continue;
+
+		spin_lock_bh(&ioat_chan->prep_lock);
+		set_bit(IOAT_CHAN_DOWN, &ioat_chan->state);
+		spin_unlock_bh(&ioat_chan->prep_lock);
+		/*
+		 * Synchronization rule for del_timer_sync():
+		 *  - The caller must not hold locks which would prevent
+		 *    completion of the timer's handler.
+		 * So prep_lock cannot be held before calling it.
+		 */
+		del_timer_sync(&ioat_chan->timer);
+
+		/* this should quiesce then reset */
+		ioat_reset_hw(ioat_chan);
+	}
+
+	ioat_disable_interrupts(ioat_dma);
 }
 
-void proc_ide_destroy(void)
+void ioat_resume(struct ioatdma_device *ioat_dma)
 {
-	remove_proc_entry("drivers", proc_ide_root);
-	remove_proc_entry("ide", NULL);
+	struct ioatdma_chan *ioat_chan;
+	u32 chanerr;
+	int i;
+
+	for (i = 0; i < IOAT_MAX_CHANS; i++) {
+		ioat_chan = ioat_dma->idx[i];
+		if (!ioat_chan)
+			continue;
+
+		spin_lock_bh(&ioat_chan->prep_lock);
+		clear_bit(IOAT_CHAN_DOWN, &ioat_chan->state);
+		spin_unlock_bh(&ioat_chan->prep_lock);
+
+		chanerr = readl(ioat_chan->reg_base + IOAT_CHANERR_OFFSET);
+		writel(chanerr, ioat_chan->reg_base + IOAT_CHANERR_OFFSET);
+
+		/* no need to reset as shutdown already did that */
+	}
 }
+
+#define DRV_NAME "ioatdma"
+
+static pci_ers_result_t ioat_pcie_error_detected(struct pci_dev *pdev,
+						 enum pci_channel_state error)
+{
+	dev_dbg(&pdev->dev, "%s: PCIe AER error %d\n", DRV_NAME, error);
+
+	/* quiesce and block I/O */
+	ioat_shutdown(pdev);
+
+	return PCI_ERS_RESULT_NEED_RESET;
+}
+
+static pci_ers_result_t ioat_pcie_error_slot_reset(struct pci_dev *pdev)
+{
+	pci_ers_result_t result = PCI_ERS_RESULT_RECOVERED;
+	int err;
+
+	dev_dbg(&pdev->dev, "%s post reset handling\n", DRV_NAME);
+
+	if (pci_enable_device_mem(pdev) < 0) {
+		dev_err(&pdev->dev,
+			"Failed to enable PCIe device after reset.\n");
+		result = PCI_ERS_RESULT_DISCONNECT;
+	} else {
+		pci_set_master(pdev);
+		pci_restore_state(pdev);
+		pci_save_state(pdev);
+		pci_wake_from_d3(pdev, false);
+	}
+
+	err = pci_cleanup_aer_uncorrect_error_status(pdev);
+	if (err) {
+		dev_err(&pdev->dev,
+			"AER uncorrect error status clear failed: %#x\n", err);
+	}
+
+	return result;
+}
+
+static void ioat_pcie_error_resume(struct pci_dev *pdev)
+{
+	struct ioatdma_device *ioat_dma = pci_get_drvdata(pdev);
+
+	dev_dbg(&pdev->dev, "%s: AER handling resuming\n", DRV_NAME);
+
+	/* initialize and bring everything back */
+	ioat_resume(ioat_dma);
+}
+
+static const struct pci_error_handlers ioat_err_handler = {
+	.error_detected = ioat_pcie_error_detected,
+	.slot_reset = ioat_pcie_error_slot_reset,
+	.resume = ioat_pcie_error_resume,
+};
+
+static struct pci_driver ioat_pci_driver = {
+	.name		= DRV_NAME,
+	.id_table	= ioat_pci_tbl,
+	.probe		= ioat_pci_probe,
+	.remove		= ioat_remove,
+	.shutdown	= ioat_shutdown,
+	.err_handler	= &ioat_err_handler,
+};
+
+static struct ioatdma_device *
+alloc_ioatdma(struct pci_dev *pdev, void __iomem *iobase)
+{
+	struct device *dev = &pdev->dev;
+	struct ioatdma_device *d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+
+	if (!d)
+		return NULL;
+	d->pdev = pdev;
+	d->reg_base = iobase;
+	return d;
+}
+
+static int ioat_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	void __iomem * const *iomap;
+	struct device *dev = &pdev->dev;
+	struct ioatdma_device *device;
+	int err;
+
+	err = pcim_enable_device(pdev);
+	if (err)
+		return err;
+
+	err = pcim_iomap_regions(pdev, 1 << IOAT_MMIO_BAR, DRV_NAME);
+	if (err)
+		return err;
+	iomap = pcim_iomap_table(pdev);
+	if (!iomap)
+		return -ENOMEM;
+
+	err = pci_set_dma_mask(pdev, DMA_BIT_MASK(64));
+	if (err)
+		err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+	if (err)
+		return err;
+
+	err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
+	if (err)
+		err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32));
+	if (err)
+		return err;
+
+	device = alloc_ioatdma(pdev, iomap[IOAT_MMIO_BAR]);
+	if (!device)
+		return -ENOMEM;
+	pci_set_master(pdev);
+	pci_set_drvdata(pdev, device);
+
+	device->version = readb(device->reg_base + IOAT_VER_OFFSET);
+	if (device->version >= IOAT_VER_3_0) {
+		if (is_skx_ioat(pdev))
+			device->version = IOAT_VER_3_2;
+		err = ioat3_dma_probe(device, ioat_dca_enabled);
+
+		if (device->version >= IOAT_VER_3_3)
+			pci_enable_pcie_error_reporting(pdev);
+	} else
+		return -ENODEV;
+
+	if (err) {
+		dev_err(dev, "Intel(R) I/OAT DMA Engine init failed\n");
+		pci_disable_pcie_error_reporting(pdev);
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+static void ioat_remove(struct pci_dev *pdev)
+{
+	struct ioatdma_device *device = pci_get_drvdata(pdev);
+
+	if (!device)
+		return;
+
+	dev_err(&pdev->dev, "Removing dma and dca services\n");
+	if (device->dca) {
+		unregister_dca_provider(device->dca, &pdev->dev);
+		free_dca_provider(device->dca);
+		device->dca = NULL;
+	}
+
+	pci_disable_pcie_error_reporting(pdev);
+	ioat_dma_remove(device);
+}
+
+static int __init ioat_init_module(void)
+{
+	int err = -ENOMEM;
+
+	pr_info("%s: Intel(R) QuickData Technology Driver %s\n",
+		DRV_NAME, IOAT_DMA_VERSION);
+
+	ioat_cache = kmem_cache_create("ioat", sizeof(struct ioat_ring_ent),
+					0, SLAB_HWCACHE_ALIGN, NULL);
+	if (!ioat_cache)
+		return -ENOMEM;
+
+	ioat_sed_cache = KMEM_CACHE(ioat_sed_ent, 0);
+	if (!ioat_sed_cache)
+		goto err_ioat_cache;
+
+	err = pci_register_driver(&ioat_pci_driver);
+	if (err)
+		goto err_ioat3_cache;
+
+	return 0;
+
+ err_ioat3_cache:
+	kmem_cache_destroy(ioat_sed_cache);
+
+ err_ioat_cache:
+	kmem_cache_destroy(ioat_cache);
+
+	return err;
+}
+module_init(ioat_init_module);
+
+static void __exit ioat_exit_module(void)
+{
+	pci_unregister_driver(&ioat_pci_driver);
+	kmem_cache_destroy(ioat_cache);
+}
+module_exit(ioat_exit_module);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   /*
+ * Intel I/OAT DMA Linux driver
+ * Copyright(c) 2004 - 2015 Intel Corporation.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * The full GNU General Public License is included in this distribution in
+ * the file called "COPYING".
+ *
+ */
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/gfp.h>
+#include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
+#include <linux/prefetch.h>
+#include "../dmaengine.h"
+#include "registers.h"
+#include "hw.h"
+#include "dma.h"
+
+#define MAX_SCF	1024
+
+/* provide a lookup table for setting the source address in the base or
+ * extended descriptor of an xor or pq descriptor
+ */
+static const u8 xor_idx_to_desc = 0xe0;
+static const u8 xor_idx_to_field[] = { 1, 4, 5, 6, 7, 0, 1, 2 };
+static const u8 pq_idx_to_desc = 0xf8;
+static const u8 pq16_idx_to_desc[] = { 0, 0, 1, 1, 1, 1, 1, 1, 1,
+				       2, 2, 2, 2, 2, 2, 2 };
+static const u8 pq_idx_to_field[] = { 1, 4, 5, 0, 1, 2, 4, 5 };
+static const u8 pq16_idx_to_field[] = { 1, 4, 1, 2, 3, 4, 5, 6, 7,
+					0, 1, 2, 3, 4, 5, 6 };
+
+static void xor_set_src(struct ioat_raw_descriptor *descs[2],
+			dma_addr_t addr, u32 offset, int idx)
+{
+	struct ioat_raw_descriptor *raw = descs[xor_idx_to_desc >> idx & 1];
+
+	raw->field[xor_idx_to_field[idx]] = addr + offset;
+}
+
+static dma_addr_t pq_get_src(struct ioat_raw_descriptor *descs[2], int idx)
+{
+	struct ioat_raw_descriptor *raw = descs[pq_idx_to_desc >> idx & 1];
+
+	return raw->field[pq_idx_to_field[idx]];
+}
+
+static dma_addr_t pq16_get_src(struct ioat_raw_descriptor *desc[3], int idx)
+{
+	struct ioat_raw_descriptor *raw = desc[pq16_idx_to_desc[idx]];
+
+	return raw->field[pq16_idx_to_field[idx]];
+}
+
+static void pq_set_src(struct ioat_raw_descriptor *descs[2],
+		       dma_addr_t addr, u32 offset, u8 coef, int idx)
+{
+	struct ioat_pq_descriptor *pq = (struct ioat_pq_descriptor *) descs[0];
+	struct ioat_raw_descriptor *raw = descs[pq_idx_to_desc >> idx & 1];
+
+	raw->field[pq_idx_to_field[idx]] = addr + offset;
+	pq->coef[idx] = coef;
+}
+
+static void pq16_set_src(struct ioat_raw_descriptor *desc[3],
+			dma_addr_t addr, u32 offset, u8 coef, unsigned idx)
+{
+	struct ioat_pq_descriptor *pq = (struct ioat_pq_descriptor *)desc[0];
+	struct ioat_pq16a_descriptor *pq16 =
+		(struct ioat_pq16a_descriptor *)desc[1];
+	struct ioat_raw_descriptor *raw = desc[pq16_idx_to_desc[idx]];
+
+	raw->field[pq16_idx_to_field[idx]] = addr + offset;
+
+	if (idx < 8)
+		pq->coef[idx] = coef;
+	else
+		pq16->coef[idx - 8] = coef;
+}
+
+static struct ioat_sed_ent *
+ioat3_alloc_sed(struct ioatdma_device *ioat_dma, unsigned int hw_pool)
+{
+	struct ioat_sed_ent *sed;
+	gfp_t flags = __GFP_ZERO | GFP_ATOMIC;
+
+	sed = kmem_cache_alloc(ioat_sed_cache, flags);
+	if (!sed)
+		return NULL;
+
+	sed->hw_pool = hw_pool;
+	sed->hw = dma_pool_alloc(ioat_dma->sed_hw_pool[hw_pool],
+				 flags, &sed->dma);
+	if (!sed->hw) {
+		kmem_cache_free(ioat_sed_cache, sed);
+		return NULL;
+	}
+
+	return sed;
+}
+
+struct dma_async_tx_descriptor *
+ioat_dma_prep_memcpy_lock(struct dma_chan *c, dma_addr_t dma_dest,
+			   dma_addr_t dma_src, size_t len, unsigned long flags)
+{
+	struct ioatdma_chan *ioat_chan = to_ioat_chan(c);
+	struct ioat_dma_descriptor *hw;
+	struct ioat_ring_ent *desc;
+	dma_addr_t dst = dma_dest;
+	dma_addr_t src = dma_src;
+	size_t total_len = len;
+	int num_descs, idx, i;
+
+	if (test_bit(IOAT_CHAN_DOWN, &ioat_chan->state))
+		return NULL;
+
+	num_descs = ioat_xferlen_to_descs(ioat_chan, len);
+	if (likely(num_descs) &&
+	    ioat_check_space_lock(ioat_chan, num_descs) == 0)
+		idx = ioat_chan->head;
+	else
+		return NULL;
+	i = 0;
+	do {
+		size_t copy = min_t(size_t, len, 1 << ioat_chan->xfercap_log);
+
+		desc = ioat_get_ring_ent(ioat_chan, idx + i);
+		hw = desc->hw;
+
+		hw->size = copy;
+		hw->ctl = 0;
+		hw->src_addr = src;
+		hw->dst_addr = dst;
+
+		len -= copy;
+		dst += copy;
+		src += copy;
+		dump_desc_dbg(ioat_chan, desc);
+	} while (++i < num_descs);
+
+	desc->txd.flags = flags;
+	desc->len = total_len;
+	hw->ctl_f.int_en = !!(flags & DMA_PREP_INTERRUPT);
+	hw->ctl_f.fence = !!(flags & DMA_PREP_FENCE);
+	hw->ctl_f.compl_write = 1;
+	dump_desc_dbg(ioat_chan, desc);
+	/* we leave the channel locked to ensure in order submission */
+
+	return &desc->txd;
+}
+
+
+static struct dma_async_tx_descriptor *
+__ioat_prep_xor_lock(struct dma_chan *c, enum sum_check_flags *result,
+		      dma_addr_t dest, dma_addr_t *src, unsigned int src_cnt,
+		      size_t len, unsigned long flags)
+{
+	struct ioatdma_chan *ioat_chan = to_ioat_chan(c);
+	struct ioat_ring_ent *compl_desc;
+	struct ioat_ring_ent *desc;
+	struct ioat_ring_ent *ext;
+	size_t total_len = len;
+	struct ioat_xor_descriptor *xor;
+	struct ioat_xor_ext_descriptor *xor_ex = NULL;
+	struct ioat_dma_descriptor *hw;
+	int num_descs, with_ext, idx, i;
+	u32 offset = 0;
+	u8 op = result ? IOAT_OP_XOR_VAL : IOAT_OP_XOR;
+
+	BUG_ON(src_cnt < 2);
+
+	num_descs = ioat_xferlen_to_descs(ioat_chan, len);
+	/* we need 2x the number of descriptors to cover greater than 5
+	 * sources
+	 */
+	if (src_cnt > 5) {
+		with_ext = 1;
+		num_descs *= 2;
+	} else
+		with_ext = 0;
+
+	/* completion writes from the raid engine may pass completion
+	 * writes from the legacy engine, so we need one extra null
+	 * (legacy) descriptor to ensure all completion writes arrive in
+	 * order.
+	 */
+	if (likely(num_descs) &&
+	    ioat_check_space_lock(ioat_chan, num_descs+1) == 0)
+		idx = ioat_chan->head;
+	else
+		return NULL;
+	i = 0;
+	do {
+		struct ioat_raw_descriptor *descs[2];
+		size_t xfer_size = min_t(size_t,
+					 len, 1 << ioat_chan->xfercap_log);
+		int s;
+
+		desc = ioat_get_ring_ent(ioat_chan, idx + i);
+		xor = desc->xor;
+
+		/* save a branch by unconditionally retrieving the
+		 * extended descriptor xor_set_src() knows to not write
+		 * to it in the single descriptor case
+		 */
+		ext = ioat_get_ring_ent(ioat_chan, idx + i + 1);
+		xor_ex = ext->xor_ex;
+
+		descs[0] = (struct ioat_raw_descriptor *) xor;
+		descs[1] = (struct ioat_raw_descriptor *) xor_ex;
+		for (s = 0; s < src_cnt; s++)
+			xor_set_src(descs, src[s], offset, s);
+		xor->size = xfer_size;
+		xor->dst_addr = dest + offset;
+		xor->ctl = 0;
+		xor->ctl_f.op = op;
+		xor->ctl_f.src_cnt = src_cnt_to_hw(src_cnt);
+
+		len -= xfer_size;
+		offset += xfer_size;
+		dump_desc_dbg(ioat_chan, desc);
+	} while ((i += 1 + with_ext) < num_descs);
+
+	/* last xor descriptor carries the unmap parameters and fence bit */
+	desc->txd.flags = flags;
+	desc->len = total_len;
+	if (result)
+		desc->result = result;
+	xor->ctl_f.fence = !!(flags & DMA_PREP_FENCE);
+
+	/* completion descriptor carries interrupt bit */
+	compl_desc = ioat_get_ring_ent(ioat_chan, idx + i);
+	compl_desc->txd.flags = flags & DMA_PREP_INTERRUPT;
+	hw = compl_desc->hw;
+	hw->ctl = 0;
+	hw->ctl_f.null = 1;
+	hw->ctl_f.int_en = !!(flags & DMA_PREP_INTERRUPT);
+	hw->ctl_f.compl_write = 1;
+	hw->size = NULL_DESC_BUFFER_SIZE;
+	dump_desc_dbg(ioat_chan, compl_desc);
+
+	/* we leave the channel locked to ensure in order submission */
+	return &compl_desc->txd;
+}
+
+struct dma_async_tx_descriptor *
+ioat_prep_xor(struct dma_chan *chan, dma_addr_t dest, dma_addr_t *src,
+	       unsigned int src_cnt, size_t len, unsigned long flags)
+{
+	struct ioat

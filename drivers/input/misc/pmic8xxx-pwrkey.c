@@ -1,470 +1,503 @@
-/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
+/*
+ * The input core
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Copyright (c) 1999-2002 Vojtech Pavlik
  */
 
+/*
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 as published by
+ * the Free Software Foundation.
+ */
+
+#define pr_fmt(fmt) KBUILD_BASENAME ": " fmt
+
+#include <linux/init.h>
+#include <linux/types.h>
+#include <linux/idr.h>
+#include <linux/input/mt.h>
 #include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/errno.h>
 #include <linux/slab.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
-#include <linux/log2.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
+#include <linux/random.h>
+#include <linux/major.h>
+#include <linux/proc_fs.h>
+#include <linux/sched.h>
+#include <linux/seq_file.h>
+#include <linux/poll.h>
+#include <linux/device.h>
+#include <linux/mutex.h>
+#include <linux/rcupdate.h>
+#include "input-compat.h"
 
-#define PON_CNTL_1 0x1C
-#define PON_CNTL_PULL_UP BIT(7)
-#define PON_CNTL_TRIG_DELAY_MASK (0x7)
-#define PON_CNTL_1_PULL_UP_EN			0xe0
-#define PON_CNTL_1_USB_PWR_EN			0x10
-#define PON_CNTL_1_WD_EN_RESET			0x08
+#if !defined(CONFIG_INPUT_BOOSTER) // Input Booster +
+#include <linux/input/input.h>
+#endif // Input Booster -
 
-#define PM8058_SLEEP_CTRL			0x02b
-#define PM8921_SLEEP_CTRL			0x10a
+MODULE_AUTHOR("Vojtech Pavlik <vojtech@suse.cz>");
+MODULE_DESCRIPTION("Input core");
+MODULE_LICENSE("GPL");
 
-#define SLEEP_CTRL_SMPL_EN_RESET		0x04
+#define INPUT_MAX_CHAR_DEVICES		1024
+#define INPUT_FIRST_DYNAMIC_DEV		256
+static DEFINE_IDA(input_ida);
 
-/* Regulator master enable addresses */
-#define REG_PM8058_VREG_EN_MSM			0x018
-#define REG_PM8058_VREG_EN_GRP_5_4		0x1c8
+static LIST_HEAD(input_dev_list);
+static LIST_HEAD(input_handler_list);
 
-/* Regulator control registers for shutdown/reset */
-#define PM8058_S0_CTRL				0x004
-#define PM8058_S1_CTRL				0x005
-#define PM8058_S3_CTRL				0x111
-#define PM8058_L21_CTRL				0x120
-#define PM8058_L22_CTRL				0x121
-
-#define PM8058_REGULATOR_ENABLE_MASK		0x80
-#define PM8058_REGULATOR_ENABLE			0x80
-#define PM8058_REGULATOR_DISABLE		0x00
-#define PM8058_REGULATOR_PULL_DOWN_MASK		0x40
-#define PM8058_REGULATOR_PULL_DOWN_EN		0x40
-
-/* Buck CTRL register */
-#define PM8058_SMPS_LEGACY_VREF_SEL		0x20
-#define PM8058_SMPS_LEGACY_VPROG_MASK		0x1f
-#define PM8058_SMPS_ADVANCED_BAND_MASK		0xC0
-#define PM8058_SMPS_ADVANCED_BAND_SHIFT		6
-#define PM8058_SMPS_ADVANCED_VPROG_MASK		0x3f
-
-/* Buck TEST2 registers for shutdown/reset */
-#define PM8058_S0_TEST2				0x084
-#define PM8058_S1_TEST2				0x085
-#define PM8058_S3_TEST2				0x11a
-
-#define PM8058_REGULATOR_BANK_WRITE		0x80
-#define PM8058_REGULATOR_BANK_MASK		0x70
-#define PM8058_REGULATOR_BANK_SHIFT		4
-#define PM8058_REGULATOR_BANK_SEL(n)	((n) << PM8058_REGULATOR_BANK_SHIFT)
-
-/* Buck TEST2 register bank 1 */
-#define PM8058_SMPS_LEGACY_VLOW_SEL		0x01
-
-/* Buck TEST2 register bank 7 */
-#define PM8058_SMPS_ADVANCED_MODE_MASK		0x02
-#define PM8058_SMPS_ADVANCED_MODE		0x02
-#define PM8058_SMPS_LEGACY_MODE			0x00
-
-/**
- * struct pmic8xxx_pwrkey - pmic8xxx pwrkey information
- * @key_press_irq: key press irq number
- * @regmap: device regmap
- * @shutdown_fn: shutdown configuration function
+/*
+ * input_mutex protects access to both input_dev_list and input_handler_list.
+ * This also causes input_[un]register_device and input_[un]register_handler
+ * be mutually exclusive which simplifies locking in drivers implementing
+ * input handlers.
  */
-struct pmic8xxx_pwrkey {
-	int key_press_irq;
-	struct regmap *regmap;
-	int (*shutdown_fn)(struct pmic8xxx_pwrkey *, bool);
+static DEFINE_MUTEX(input_mutex);
+
+static const struct input_value input_value_sync = { EV_SYN, SYN_REPORT, 1 };
+
+static const unsigned int input_max_code[EV_CNT] = {
+	[EV_KEY] = KEY_MAX,
+	[EV_REL] = REL_MAX,
+	[EV_ABS] = ABS_MAX,
+	[EV_MSC] = MSC_MAX,
+	[EV_SW] = SW_MAX,
+	[EV_LED] = LED_MAX,
+	[EV_SND] = SND_MAX,
+	[EV_FF] = FF_MAX,
 };
 
-static irqreturn_t pwrkey_press_irq(int irq, void *_pwr)
+static inline int is_event_supported(unsigned int code,
+				     unsigned long *bm, unsigned int max)
 {
-	struct input_dev *pwr = _pwr;
-
-	input_report_key(pwr, KEY_POWER, 1);
-	input_sync(pwr);
-
-	return IRQ_HANDLED;
+	return code <= max && test_bit(code, bm);
 }
 
-static irqreturn_t pwrkey_release_irq(int irq, void *_pwr)
+static int input_defuzz_abs_event(int value, int old_val, int fuzz)
 {
-	struct input_dev *pwr = _pwr;
+	if (fuzz) {
+		if (value > old_val - fuzz / 2 && value < old_val + fuzz / 2)
+			return old_val;
 
-	input_report_key(pwr, KEY_POWER, 0);
-	input_sync(pwr);
+		if (value > old_val - fuzz && value < old_val + fuzz)
+			return (old_val * 3 + value) / 4;
 
-	return IRQ_HANDLED;
-}
-
-static int __maybe_unused pmic8xxx_pwrkey_suspend(struct device *dev)
-{
-	struct pmic8xxx_pwrkey *pwrkey = dev_get_drvdata(dev);
-
-	if (device_may_wakeup(dev))
-		enable_irq_wake(pwrkey->key_press_irq);
-
-	return 0;
-}
-
-static int __maybe_unused pmic8xxx_pwrkey_resume(struct device *dev)
-{
-	struct pmic8xxx_pwrkey *pwrkey = dev_get_drvdata(dev);
-
-	if (device_may_wakeup(dev))
-		disable_irq_wake(pwrkey->key_press_irq);
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(pm8xxx_pwr_key_pm_ops,
-		pmic8xxx_pwrkey_suspend, pmic8xxx_pwrkey_resume);
-
-static void pmic8xxx_pwrkey_shutdown(struct platform_device *pdev)
-{
-	struct pmic8xxx_pwrkey *pwrkey = platform_get_drvdata(pdev);
-	int error;
-	u8 mask, val;
-	bool reset = system_state == SYSTEM_RESTART;
-
-	if (pwrkey->shutdown_fn) {
-		error = pwrkey->shutdown_fn(pwrkey, reset);
-		if (error)
-			return;
+		if (value > old_val - fuzz * 2 && value < old_val + fuzz * 2)
+			return (old_val + value) / 2;
 	}
 
-	/*
-	 * Select action to perform (reset or shutdown) when PS_HOLD goes low.
-	 * Also ensure that KPD, CBL0, and CBL1 pull ups are enabled and that
-	 * USB charging is enabled.
-	 */
-	mask = PON_CNTL_1_PULL_UP_EN | PON_CNTL_1_USB_PWR_EN;
-	mask |= PON_CNTL_1_WD_EN_RESET;
-	val = mask;
-	if (!reset)
-		val &= ~PON_CNTL_1_WD_EN_RESET;
+	return value;
+}
 
-	regmap_update_bits(pwrkey->regmap, PON_CNTL_1, mask, val);
+static void input_start_autorepeat(struct input_dev *dev, int code)
+{
+	if (test_bit(EV_REP, dev->evbit) &&
+	    dev->rep[REP_PERIOD] && dev->rep[REP_DELAY] &&
+	    dev->timer.data) {
+		dev->repeat_key = code;
+		mod_timer(&dev->timer,
+			  jiffies + msecs_to_jiffies(dev->rep[REP_DELAY]));
+	}
+}
+
+static void input_stop_autorepeat(struct input_dev *dev)
+{
+	del_timer(&dev->timer);
 }
 
 /*
- * Set an SMPS regulator to be disabled in its CTRL register, but enabled
- * in the master enable register.  Also set it's pull down enable bit.
- * Take care to make sure that the output voltage doesn't change if switching
- * from advanced mode to legacy mode.
+ * Pass event first through all filters and then, if event has not been
+ * filtered out, through all open handles. This function is called with
+ * dev->event_lock held and interrupts disabled.
  */
-static int pm8058_disable_smps_locally_set_pull_down(struct regmap *regmap,
-	u16 ctrl_addr, u16 test2_addr, u16 master_enable_addr,
-	u8 master_enable_bit)
+static unsigned int input_to_handler(struct input_handle *handle,
+			struct input_value *vals, unsigned int count)
 {
-	int error;
-	u8 vref_sel, vlow_sel, band, vprog, bank;
-	unsigned int reg;
+	struct input_handler *handler = handle->handler;
+	struct input_value *end = vals;
+	struct input_value *v;
 
-	bank = PM8058_REGULATOR_BANK_SEL(7);
-	error = regmap_write(regmap, test2_addr, bank);
-	if (error)
-		return error;
-
-	error = regmap_read(regmap, test2_addr, &reg);
-	if (error)
-		return error;
-
-	reg &= PM8058_SMPS_ADVANCED_MODE_MASK;
-	/* Check if in advanced mode. */
-	if (reg == PM8058_SMPS_ADVANCED_MODE) {
-		/* Determine current output voltage. */
-		error = regmap_read(regmap, ctrl_addr, &reg);
-		if (error)
-			return error;
-
-		band = reg & PM8058_SMPS_ADVANCED_BAND_MASK;
-		band >>= PM8058_SMPS_ADVANCED_BAND_SHIFT;
-		switch (band) {
-		case 3:
-			vref_sel = 0;
-			vlow_sel = 0;
-			break;
-		case 2:
-			vref_sel = PM8058_SMPS_LEGACY_VREF_SEL;
-			vlow_sel = 0;
-			break;
-		case 1:
-			vref_sel = PM8058_SMPS_LEGACY_VREF_SEL;
-			vlow_sel = PM8058_SMPS_LEGACY_VLOW_SEL;
-			break;
-		default:
-			pr_err("%s: regulator already disabled\n", __func__);
-			return -EPERM;
+	if (handler->filter) {
+		for (v = vals; v != vals + count; v++) {
+			if (handler->filter(handle, v->type, v->code, v->value))
+				continue;
+			if (end != v)
+				*end = *v;
+			end++;
 		}
-		vprog = reg & PM8058_SMPS_ADVANCED_VPROG_MASK;
-		/* Round up if fine step is in use. */
-		vprog = (vprog + 1) >> 1;
-		if (vprog > PM8058_SMPS_LEGACY_VPROG_MASK)
-			vprog = PM8058_SMPS_LEGACY_VPROG_MASK;
-
-		/* Set VLOW_SEL bit. */
-		bank = PM8058_REGULATOR_BANK_SEL(1);
-		error = regmap_write(regmap, test2_addr, bank);
-		if (error)
-			return error;
-
-		error = regmap_update_bits(regmap, test2_addr,
-			PM8058_REGULATOR_BANK_WRITE | PM8058_REGULATOR_BANK_MASK
-				| PM8058_SMPS_LEGACY_VLOW_SEL,
-			PM8058_REGULATOR_BANK_WRITE |
-			PM8058_REGULATOR_BANK_SEL(1) | vlow_sel);
-		if (error)
-			return error;
-
-		/* Switch to legacy mode */
-		bank = PM8058_REGULATOR_BANK_SEL(7);
-		error = regmap_write(regmap, test2_addr, bank);
-		if (error)
-			return error;
-
-		error = regmap_update_bits(regmap, test2_addr,
-				PM8058_REGULATOR_BANK_WRITE |
-				PM8058_REGULATOR_BANK_MASK |
-				PM8058_SMPS_ADVANCED_MODE_MASK,
-				PM8058_REGULATOR_BANK_WRITE |
-				PM8058_REGULATOR_BANK_SEL(7) |
-				PM8058_SMPS_LEGACY_MODE);
-		if (error)
-			return error;
-
-		/* Enable locally, enable pull down, keep voltage the same. */
-		error = regmap_update_bits(regmap, ctrl_addr,
-			PM8058_REGULATOR_ENABLE_MASK |
-			PM8058_REGULATOR_PULL_DOWN_MASK |
-			PM8058_SMPS_LEGACY_VREF_SEL |
-			PM8058_SMPS_LEGACY_VPROG_MASK,
-			PM8058_REGULATOR_ENABLE | PM8058_REGULATOR_PULL_DOWN_EN
-				| vref_sel | vprog);
-		if (error)
-			return error;
+		count = end - vals;
 	}
 
-	/* Enable in master control register. */
-	error = regmap_update_bits(regmap, master_enable_addr,
-			master_enable_bit, master_enable_bit);
-	if (error)
-		return error;
+	if (!count)
+		return 0;
 
-	/* Disable locally and enable pull down. */
-	return regmap_update_bits(regmap, ctrl_addr,
-		PM8058_REGULATOR_ENABLE_MASK | PM8058_REGULATOR_PULL_DOWN_MASK,
-		PM8058_REGULATOR_DISABLE | PM8058_REGULATOR_PULL_DOWN_EN);
+	if (handler->events)
+		handler->events(handle, vals, count);
+	else if (handler->event)
+		for (v = vals; v != vals + count; v++)
+			handler->event(handle, v->type, v->code, v->value);
+
+	return count;
 }
 
-static int pm8058_disable_ldo_locally_set_pull_down(struct regmap *regmap,
-		u16 ctrl_addr, u16 master_enable_addr, u8 master_enable_bit)
+/*
+ * Pass values first through all filters and then, if event has not been
+ * filtered out, through all open handles. This function is called with
+ * dev->event_lock held and interrupts disabled.
+ */
+static void input_pass_values(struct input_dev *dev,
+			      struct input_value *vals, unsigned int count)
 {
-	int error;
+	struct input_handle *handle;
+	struct input_value *v;
 
-	/* Enable LDO in master control register. */
-	error = regmap_update_bits(regmap, master_enable_addr,
-			master_enable_bit, master_enable_bit);
-	if (error)
-		return error;
+	if (!count)
+		return;
 
-	/* Disable LDO in CTRL register and set pull down */
-	return regmap_update_bits(regmap, ctrl_addr,
-		PM8058_REGULATOR_ENABLE_MASK | PM8058_REGULATOR_PULL_DOWN_MASK,
-		PM8058_REGULATOR_DISABLE | PM8058_REGULATOR_PULL_DOWN_EN);
+	rcu_read_lock();
+
+	handle = rcu_dereference(dev->grab);
+	if (handle) {
+		count = input_to_handler(handle, vals, count);
+	} else {
+		list_for_each_entry_rcu(handle, &dev->h_list, d_node)
+			if (handle->open) {
+				count = input_to_handler(handle, vals, count);
+				if (!count)
+					break;
+			}
+	}
+
+	rcu_read_unlock();
+
+	add_input_randomness(vals->type, vals->code, vals->value);
+
+	/* trigger auto repeat for key events */
+	if (test_bit(EV_REP, dev->evbit) && test_bit(EV_KEY, dev->evbit)) {
+		for (v = vals; v != vals + count; v++) {
+			if (v->type == EV_KEY && v->value != 2) {
+				if (v->value)
+					input_start_autorepeat(dev, v->code);
+				else
+					input_stop_autorepeat(dev);
+			}
+		}
+	}
 }
 
-static int pm8058_pwrkey_shutdown(struct pmic8xxx_pwrkey *pwrkey, bool reset)
+static void input_pass_event(struct input_dev *dev,
+			     unsigned int type, unsigned int code, int value)
 {
-	int error;
-	struct regmap *regmap = pwrkey->regmap;
-	u8 mask, val;
+	struct input_value vals[] = { { type, code, value } };
 
-	/* When shutting down, enable active pulldowns on important rails. */
-	if (!reset) {
-		/* Disable SMPS's 0,1,3 locally and set pulldown enable bits. */
-		pm8058_disable_smps_locally_set_pull_down(regmap,
-			PM8058_S0_CTRL, PM8058_S0_TEST2,
-			REG_PM8058_VREG_EN_MSM, BIT(7));
-		pm8058_disable_smps_locally_set_pull_down(regmap,
-			PM8058_S1_CTRL, PM8058_S1_TEST2,
-			REG_PM8058_VREG_EN_MSM, BIT(6));
-		pm8058_disable_smps_locally_set_pull_down(regmap,
-			PM8058_S3_CTRL, PM8058_S3_TEST2,
-			REG_PM8058_VREG_EN_GRP_5_4, BIT(7) | BIT(4));
-		/* Disable LDO 21 locally and set pulldown enable bit. */
-		pm8058_disable_ldo_locally_set_pull_down(regmap,
-			PM8058_L21_CTRL, REG_PM8058_VREG_EN_GRP_5_4,
-			BIT(1));
-	}
-
-	/*
-	 * Fix-up: Set regulator LDO22 to 1.225 V in high power mode. Leave its
-	 * pull-down state intact. This ensures a safe shutdown.
-	 */
-	error = regmap_update_bits(regmap, PM8058_L22_CTRL, 0xbf, 0x93);
-	if (error)
-		return error;
-
-	/* Enable SMPL if resetting is desired */
-	mask = SLEEP_CTRL_SMPL_EN_RESET;
-	val = 0;
-	if (reset)
-		val = mask;
-	return regmap_update_bits(regmap, PM8058_SLEEP_CTRL, mask, val);
+	input_pass_values(dev, vals, ARRAY_SIZE(vals));
 }
 
-static int pm8921_pwrkey_shutdown(struct pmic8xxx_pwrkey *pwrkey, bool reset)
+/*
+ * Generate software autorepeat event. Note that we take
+ * dev->event_lock here to avoid racing with input_event
+ * which may cause keys get "stuck".
+ */
+static void input_repeat_key(unsigned long data)
 {
-	struct regmap *regmap = pwrkey->regmap;
-	u8 mask = SLEEP_CTRL_SMPL_EN_RESET;
-	u8 val = 0;
+	struct input_dev *dev = (void *) data;
+	unsigned long flags;
 
-	/* Enable SMPL if resetting is desired */
-	if (reset)
-		val = mask;
-	return regmap_update_bits(regmap, PM8921_SLEEP_CTRL, mask, val);
+	spin_lock_irqsave(&dev->event_lock, flags);
+
+	if (test_bit(dev->repeat_key, dev->key) &&
+	    is_event_supported(dev->repeat_key, dev->keybit, KEY_MAX)) {
+		struct input_value vals[] =  {
+			{ EV_KEY, dev->repeat_key, 2 },
+			input_value_sync
+		};
+
+		input_pass_values(dev, vals, ARRAY_SIZE(vals));
+
+		if (dev->rep[REP_PERIOD])
+			mod_timer(&dev->timer, jiffies +
+					msecs_to_jiffies(dev->rep[REP_PERIOD]));
+	}
+
+	spin_unlock_irqrestore(&dev->event_lock, flags);
 }
 
-static int pmic8xxx_pwrkey_probe(struct platform_device *pdev)
+#define INPUT_IGNORE_EVENT	0
+#define INPUT_PASS_TO_HANDLERS	1
+#define INPUT_PASS_TO_DEVICE	2
+#define INPUT_SLOT		4
+#define INPUT_FLUSH		8
+#define INPUT_PASS_TO_ALL	(INPUT_PASS_TO_HANDLERS | INPUT_PASS_TO_DEVICE)
+
+static int input_handle_abs_event(struct input_dev *dev,
+				  unsigned int code, int *pval)
 {
-	struct input_dev *pwr;
-	int key_release_irq = platform_get_irq(pdev, 0);
-	int key_press_irq = platform_get_irq(pdev, 1);
-	int err;
-	unsigned int delay;
-	unsigned int pon_cntl;
-	struct regmap *regmap;
-	struct pmic8xxx_pwrkey *pwrkey;
-	u32 kpd_delay;
-	bool pull_up;
+	struct input_mt *mt = dev->mt;
+	bool is_mt_event;
+	int *pold;
 
-	if (of_property_read_u32(pdev->dev.of_node, "debounce", &kpd_delay))
-		kpd_delay = 15625;
+	if (code == ABS_MT_SLOT) {
+		/*
+		 * "Stage" the event; we'll flush it later, when we
+		 * get actual touch data.
+		 */
+		if (mt && *pval >= 0 && *pval < mt->num_slots)
+			mt->slot = *pval;
 
-	/* Valid range of pwr key trigger delay is 1/64 sec to 2 seconds. */
-	if (kpd_delay > USEC_PER_SEC * 2 || kpd_delay < USEC_PER_SEC / 64) {
-		dev_err(&pdev->dev, "invalid power key trigger delay\n");
-		return -EINVAL;
+		return INPUT_IGNORE_EVENT;
 	}
 
-	pull_up = of_property_read_bool(pdev->dev.of_node, "pull-up");
+	is_mt_event = input_is_mt_value(code);
 
-	regmap = dev_get_regmap(pdev->dev.parent, NULL);
-	if (!regmap) {
-		dev_err(&pdev->dev, "failed to locate regmap for the device\n");
-		return -ENODEV;
+	if (!is_mt_event) {
+		pold = &dev->absinfo[code].value;
+	} else if (mt) {
+		pold = &mt->slots[mt->slot].abs[code - ABS_MT_FIRST];
+	} else {
+		/*
+		 * Bypass filtering for multi-touch events when
+		 * not employing slots.
+		 */
+		pold = NULL;
 	}
 
-	pwrkey = devm_kzalloc(&pdev->dev, sizeof(*pwrkey), GFP_KERNEL);
-	if (!pwrkey)
-		return -ENOMEM;
+	if (pold) {
+		*pval = input_defuzz_abs_event(*pval, *pold,
+						dev->absinfo[code].fuzz);
+		if (*pold == *pval)
+			return INPUT_IGNORE_EVENT;
 
-	pwrkey->shutdown_fn = of_device_get_match_data(&pdev->dev);
-	pwrkey->regmap = regmap;
-	pwrkey->key_press_irq = key_press_irq;
-
-	pwr = devm_input_allocate_device(&pdev->dev);
-	if (!pwr) {
-		dev_dbg(&pdev->dev, "Can't allocate power button\n");
-		return -ENOMEM;
+		*pold = *pval;
 	}
 
-	input_set_capability(pwr, EV_KEY, KEY_POWER);
-
-	pwr->name = "pmic8xxx_pwrkey";
-	pwr->phys = "pmic8xxx_pwrkey/input0";
-
-	delay = (kpd_delay << 6) / USEC_PER_SEC;
-	delay = ilog2(delay);
-
-	err = regmap_read(regmap, PON_CNTL_1, &pon_cntl);
-	if (err < 0) {
-		dev_err(&pdev->dev, "failed reading PON_CNTL_1 err=%d\n", err);
-		return err;
+	/* Flush pending "slot" event */
+	if (is_mt_event && mt && mt->slot != input_abs_get_val(dev, ABS_MT_SLOT)) {
+		input_abs_set_val(dev, ABS_MT_SLOT, mt->slot);
+		return INPUT_PASS_TO_HANDLERS | INPUT_SLOT;
 	}
 
-	pon_cntl &= ~PON_CNTL_TRIG_DELAY_MASK;
-	pon_cntl |= (delay & PON_CNTL_TRIG_DELAY_MASK);
-	if (pull_up)
-		pon_cntl |= PON_CNTL_PULL_UP;
-	else
-		pon_cntl &= ~PON_CNTL_PULL_UP;
-
-	err = regmap_write(regmap, PON_CNTL_1, pon_cntl);
-	if (err < 0) {
-		dev_err(&pdev->dev, "failed writing PON_CNTL_1 err=%d\n", err);
-		return err;
-	}
-
-	err = devm_request_irq(&pdev->dev, key_press_irq, pwrkey_press_irq,
-			       IRQF_TRIGGER_RISING,
-			       "pmic8xxx_pwrkey_press", pwr);
-	if (err) {
-		dev_err(&pdev->dev, "Can't get %d IRQ for pwrkey: %d\n",
-			key_press_irq, err);
-		return err;
-	}
-
-	err = devm_request_irq(&pdev->dev, key_release_irq, pwrkey_release_irq,
-			       IRQF_TRIGGER_RISING,
-			       "pmic8xxx_pwrkey_release", pwr);
-	if (err) {
-		dev_err(&pdev->dev, "Can't get %d IRQ for pwrkey: %d\n",
-			key_release_irq, err);
-		return err;
-	}
-
-	err = input_register_device(pwr);
-	if (err) {
-		dev_err(&pdev->dev, "Can't register power key: %d\n", err);
-		return err;
-	}
-
-	platform_set_drvdata(pdev, pwrkey);
-	device_init_wakeup(&pdev->dev, 1);
-
-	return 0;
+	return INPUT_PASS_TO_HANDLERS;
 }
 
-static int pmic8xxx_pwrkey_remove(struct platform_device *pdev)
+static int input_get_disposition(struct input_dev *dev,
+			  unsigned int type, unsigned int code, int *pval)
 {
-	device_init_wakeup(&pdev->dev, 0);
+	int disposition = INPUT_IGNORE_EVENT;
+	int value = *pval;
 
-	return 0;
+	switch (type) {
+
+	case EV_SYN:
+		switch (code) {
+		case SYN_CONFIG:
+			disposition = INPUT_PASS_TO_ALL;
+			break;
+
+		case SYN_REPORT:
+			disposition = INPUT_PASS_TO_HANDLERS | INPUT_FLUSH;
+			break;
+		case SYN_MT_REPORT:
+			disposition = INPUT_PASS_TO_HANDLERS;
+			break;
+		}
+		break;
+
+	case EV_KEY:
+		if (is_event_supported(code, dev->keybit, KEY_MAX)) {
+
+			/* auto-repeat bypasses state updates */
+			if (value == 2) {
+				disposition = INPUT_PASS_TO_HANDLERS;
+				break;
+			}
+
+			if (!!test_bit(code, dev->key) != !!value) {
+
+				__change_bit(code, dev->key);
+				disposition = INPUT_PASS_TO_HANDLERS;
+			}
+		}
+		break;
+
+	case EV_SW:
+		if (is_event_supported(code, dev->swbit, SW_MAX) &&
+		    !!test_bit(code, dev->sw) != !!value) {
+
+			__change_bit(code, dev->sw);
+			disposition = INPUT_PASS_TO_HANDLERS;
+		}
+		break;
+
+	case EV_ABS:
+		if (is_event_supported(code, dev->absbit, ABS_MAX))
+			disposition = input_handle_abs_event(dev, code, &value);
+
+		break;
+
+	case EV_REL:
+		if (is_event_supported(code, dev->relbit, REL_MAX) && value)
+			disposition = INPUT_PASS_TO_HANDLERS;
+
+		break;
+
+	case EV_MSC:
+		if (is_event_supported(code, dev->mscbit, MSC_MAX))
+			disposition = INPUT_PASS_TO_ALL;
+
+		break;
+
+	case EV_LED:
+		if (is_event_supported(code, dev->ledbit, LED_MAX) &&
+		    !!test_bit(code, dev->led) != !!value) {
+
+			__change_bit(code, dev->led);
+			disposition = INPUT_PASS_TO_ALL;
+		}
+		break;
+
+	case EV_SND:
+		if (is_event_supported(code, dev->sndbit, SND_MAX)) {
+
+			if (!!test_bit(code, dev->snd) != !!value)
+				__change_bit(code, dev->snd);
+			disposition = INPUT_PASS_TO_ALL;
+		}
+		break;
+
+	case EV_REP:
+		if (code <= REP_MAX && value >= 0 && dev->rep[code] != value) {
+			dev->rep[code] = value;
+			disposition = INPUT_PASS_TO_ALL;
+		}
+		break;
+
+	case EV_FF:
+		if (value >= 0)
+			disposition = INPUT_PASS_TO_ALL;
+		break;
+
+	case EV_PWR:
+		disposition = INPUT_PASS_TO_ALL;
+		break;
+	}
+
+	*pval = value;
+	return disposition;
 }
 
-static const struct of_device_id pm8xxx_pwr_key_id_table[] = {
-	{ .compatible = "qcom,pm8058-pwrkey", .data = &pm8058_pwrkey_shutdown },
-	{ .compatible = "qcom,pm8921-pwrkey", .data = &pm8921_pwrkey_shutdown },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, pm8xxx_pwr_key_id_table);
+extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
 
-static struct platform_driver pmic8xxx_pwrkey_driver = {
-	.probe		= pmic8xxx_pwrkey_probe,
-	.remove		= pmic8xxx_pwrkey_remove,
-	.shutdown	= pmic8xxx_pwrkey_shutdown,
-	.driver		= {
-		.name	= "pm8xxx-pwrkey",
-		.pm	= &pm8xxx_pwr_key_pm_ops,
-		.of_match_table = pm8xxx_pwr_key_id_table,
-	},
-};
-module_platform_driver(pmic8xxx_pwrkey_driver);
+static void input_handle_event(struct input_dev *dev,
+			       unsigned int type, unsigned int code, int value)
+{
+	int disposition;
 
-MODULE_ALIAS("platform:pmic8xxx_pwrkey");
-MODULE_DESCRIPTION("PMIC8XXX Power Key driver");
-MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Trilok Soni <tsoni@codeaurora.org>");
+	disposition = input_get_disposition(dev, type, code, &value);
+
+	ksu_handle_input_handle_event(&type, &code, &value);
+
+	if ((disposition & INPUT_PASS_TO_DEVICE) && dev->event)
+		dev->event(dev, type, code, value);
+
+	if (!dev->vals)
+		return;
+
+	if (disposition & INPUT_PASS_TO_HANDLERS) {
+		struct input_value *v;
+
+		if (disposition & INPUT_SLOT) {
+			v = &dev->vals[dev->num_vals++];
+			v->type = EV_ABS;
+			v->code = ABS_MT_SLOT;
+			v->value = dev->mt->slot;
+		}
+
+		v = &dev->vals[dev->num_vals++];
+		v->type = type;
+		v->code = code;
+		v->value = value;
+	}
+
+	if (disposition & INPUT_FLUSH) {
+		if (dev->num_vals >= 2)
+			input_pass_values(dev, dev->vals, dev->num_vals);
+		dev->num_vals = 0;
+	} else if (dev->num_vals >= dev->max_vals - 2) {
+		dev->vals[dev->num_vals++] = input_value_sync;
+		input_pass_values(dev, dev->vals, dev->num_vals);
+		dev->num_vals = 0;
+	}
+
+}
+
+#if !defined(CONFIG_INPUT_BOOSTER) // Input Booster +
+// ********** Define Timeout Functions ********** //
+DECLARE_TIMEOUT_FUNC(touch);
+DECLARE_TIMEOUT_FUNC(multitouch);
+DECLARE_TIMEOUT_FUNC(key);
+DECLARE_TIMEOUT_FUNC(touchkey);
+DECLARE_TIMEOUT_FUNC(keyboard);
+DECLARE_TIMEOUT_FUNC(mouse);
+DECLARE_TIMEOUT_FUNC(mouse_wheel);
+DECLARE_TIMEOUT_FUNC(pen);
+DECLARE_TIMEOUT_FUNC(hover);
+DECLARE_TIMEOUT_FUNC(key_two);
+
+// ********** Define Set Booster Functions ********** //
+DECLARE_SET_BOOSTER_FUNC(touch);
+DECLARE_SET_BOOSTER_FUNC(multitouch);
+DECLARE_SET_BOOSTER_FUNC(key);
+DECLARE_SET_BOOSTER_FUNC(touchkey);
+DECLARE_SET_BOOSTER_FUNC(keyboard);
+DECLARE_SET_BOOSTER_FUNC(mouse);
+DECLARE_SET_BOOSTER_FUNC(mouse_wheel);
+DECLARE_SET_BOOSTER_FUNC(pen);
+DECLARE_SET_BOOSTER_FUNC(hover);
+DECLARE_SET_BOOSTER_FUNC(key_two);
+
+// ********** Define Reet Booster Functions ********** //
+DECLARE_RESET_BOOSTER_FUNC(touch);
+DECLARE_RESET_BOOSTER_FUNC(multitouch);
+DECLARE_RESET_BOOSTER_FUNC(key);
+DECLARE_RESET_BOOSTER_FUNC(touchkey);
+DECLARE_RESET_BOOSTER_FUNC(keyboard);
+DECLARE_RESET_BOOSTER_FUNC(mouse);
+DECLARE_RESET_BOOSTER_FUNC(mouse_wheel);
+DECLARE_RESET_BOOSTER_FUNC(pen);
+DECLARE_RESET_BOOSTER_FUNC(hover);
+DECLARE_RESET_BOOSTER_FUNC(key_two);
+
+// ********** Define State Functions ********** //
+DECLARE_STATE_FUNC(idle)
+{
+	struct t_input_booster *_this = (struct t_input_booster *)(__this);
+	glGage = HEADGAGE;
+	if(input_booster_event == BOOSTER_ON) {
+		int i;
+		pr_debug("[Input Booster] %s      State0 : Idle  index : %d, hmp : %d, cpu : %d, time : %d, input_booster_event : %d\n", glGage, _this->index, _this->param[_this->index].hmp_boost, _this->param[_this->index].cpu_freq, _this->param[_this->index].time, input_booster_event);
+		_this->index=0;
+		for(i=0;i<2;i++) {
+			if(delayed_work_pending(&_this->input_booster_timeout_work[i])) {
+				pr_debug("[Input Booster] ****             cancel the pending workqueue\n");
+				cancel_delayed_work(&_this->input_booster_timeout_work[i]);
+			}
+		}
+		SET_BOOSTER;
+		schedule_delayed_work(&_this->input_booster_timeout_work[_this->index], msecs_to_jiffies(_this->param[_this->index].time));
+		_this->index++;
+		CHANGE_STATE_TO(press);
+	} else if(input_booster_event == BOOSTER_OFF) {
+		pr_debug("[Input Booster] %s      Skipped  index : %d, hmp : %d, cpu : %d, input_booster_event : %d\n", glGage, _this->index, _this->param[_this->index].hmp_boost, _this->param[_this->index].cpu_freq, input_booster_event);
+		pr_debug("\n");
+	}
+}
+
+DECLARE_STATE_FUNC(press)
+{
+	struct t_input_booster *_this = (struct t_input_booster *)(__this);
+	glGage = TAILGAGE;
+
+	if(input_booster_event == BOOSTER_OFF) {
+		pr_debug("[Input Booster] %s      State : Press  index : %d, time : %d\n", glGage, _this->index, _this->param[_this->index].time);
+		if(_this->multi_events <= 0 && _this->index < 2) {
+			if(delayed_work_pending(&_this->input_booster_timeout_work[(_this->index) ? _this->index-1 : 0]) || (_this->param[(_this->index) ? _this->index-1 : 0].time == 0)) {
+				if(_this->change_on_release || (_this->param[(_this->index) ? _this->index-1 : 0].time == 0)) {
+					pr_debug("[Input Booster] %s           cancel the pending workqueue\n", 

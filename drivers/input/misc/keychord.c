@@ -1,466 +1,435 @@
-/*
- *  drivers/input/misc/keychord.c
- *
- * Copyright (C) 2008 Google, Inc.
- * Author: Mike Lockwood <lockwood@android.com>
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
-*/
+et = ch->target;
+	struct srp_device *dev = target->srp_host->srp_dev;
+	struct ib_device *ibdev = dev->dev;
+	dma_addr_t dma_addr = ib_sg_dma_address(ibdev, sg);
+	unsigned int dma_len = ib_sg_dma_len(ibdev, sg);
+	unsigned int len = 0;
+	int ret;
 
-#include <linux/poll.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/spinlock.h>
-#include <linux/fs.h>
-#include <linux/miscdevice.h>
-#include <linux/keychord.h>
-#include <linux/sched.h>
+	WARN_ON_ONCE(!dma_len);
 
-#define KEYCHORD_NAME		"keychord"
-#define BUFFER_SIZE			16
-
-MODULE_AUTHOR("Mike Lockwood <lockwood@android.com>");
-MODULE_DESCRIPTION("Key chord input driver");
-MODULE_SUPPORTED_DEVICE("keychord");
-MODULE_LICENSE("GPL");
-
-#define NEXT_KEYCHORD(kc) ((struct input_keychord *) \
-		((char *)kc + sizeof(struct input_keychord) + \
-		kc->count * sizeof(kc->keycodes[0])))
-
-struct keychord_device {
-	struct input_handler	input_handler;
-	int			registered;
-
-	/* list of keychords to monitor */
-	struct input_keychord	*keychords;
-	int			keychord_count;
-
-	/* bitmask of keys contained in our keychords */
-	unsigned long keybit[BITS_TO_LONGS(KEY_CNT)];
-	/* current state of the keys */
-	unsigned long keystate[BITS_TO_LONGS(KEY_CNT)];
-	/* number of keys that are currently pressed */
-	int key_down;
-
-	/* second input_device_id is needed for null termination */
-	struct input_device_id  device_ids[2];
-
-	spinlock_t		lock;
-	wait_queue_head_t	waitq;
-	unsigned char		head;
-	unsigned char		tail;
-	__u16			buff[BUFFER_SIZE];
-	/* Bit to serialize writes to this device */
-#define KEYCHORD_BUSY			0x01
-	unsigned long		flags;
-	wait_queue_head_t	write_waitq;
-};
-
-static int check_keychord(struct keychord_device *kdev,
-		struct input_keychord *keychord)
-{
-	int i;
-
-	if (keychord->count != kdev->key_down)
-		return 0;
-
-	for (i = 0; i < keychord->count; i++) {
-		if (!test_bit(keychord->keycodes[i], kdev->keystate))
-			return 0;
-	}
-
-	/* we have a match */
-	return 1;
-}
-
-static void keychord_event(struct input_handle *handle, unsigned int type,
-			   unsigned int code, int value)
-{
-	struct keychord_device *kdev = handle->private;
-	struct input_keychord *keychord;
-	unsigned long flags;
-	int i, got_chord = 0;
-
-	if (type != EV_KEY || code >= KEY_MAX)
-		return;
-
-	spin_lock_irqsave(&kdev->lock, flags);
-	/* do nothing if key state did not change */
-	if (!test_bit(code, kdev->keystate) == !value)
-		goto done;
-	__change_bit(code, kdev->keystate);
-	if (value)
-		kdev->key_down++;
-	else
-		kdev->key_down--;
-
-	/* don't notify on key up */
-	if (!value)
-		goto done;
-	/* ignore this event if it is not one of the keys we are monitoring */
-	if (!test_bit(code, kdev->keybit))
-		goto done;
-
-	keychord = kdev->keychords;
-	if (!keychord)
-		goto done;
-
-	/* check to see if the keyboard state matches any keychords */
-	for (i = 0; i < kdev->keychord_count; i++) {
-		if (check_keychord(kdev, keychord)) {
-			kdev->buff[kdev->head] = keychord->id;
-			kdev->head = (kdev->head + 1) % BUFFER_SIZE;
-			got_chord = 1;
-			break;
+	while (dma_len) {
+		unsigned offset = dma_addr & ~dev->mr_page_mask;
+		if (state->npages == dev->max_pages_per_mr || offset != 0) {
+			ret = srp_map_finish_fmr(state, ch);
+			if (ret)
+				return ret;
 		}
-		/* skip to next keychord */
-		keychord = NEXT_KEYCHORD(keychord);
+
+		len = min_t(unsigned int, dma_len, dev->mr_page_size - offset);
+
+		if (!state->npages)
+			state->base_dma_addr = dma_addr;
+		state->pages[state->npages++] = dma_addr & dev->mr_page_mask;
+		state->dma_len += len;
+		dma_addr += len;
+		dma_len -= len;
 	}
-
-done:
-	spin_unlock_irqrestore(&kdev->lock, flags);
-
-	if (got_chord) {
-		pr_info("keychord: got keychord id %d. Any tasks: %d\n",
-			keychord->id,
-			!list_empty_careful(&kdev->waitq.task_list));
-		wake_up_interruptible(&kdev->waitq);
-	}
-}
-
-static int keychord_connect(struct input_handler *handler,
-					  struct input_dev *dev,
-					  const struct input_device_id *id)
-{
-	int i, ret;
-	struct input_handle *handle;
-	struct keychord_device *kdev =
-		container_of(handler, struct keychord_device, input_handler);
 
 	/*
-	 * ignore this input device if it does not contain any keycodes
-	 * that we are monitoring
+	 * If the last entry of the MR wasn't a full page, then we need to
+	 * close it out and start a new one -- we can only merge at page
+	 * boundries.
 	 */
-	for (i = 0; i < KEY_MAX; i++) {
-		if (test_bit(i, kdev->keybit) && test_bit(i, dev->keybit))
-			break;
-	}
-	if (i == KEY_MAX)
-		return -ENODEV;
-
-	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
-	if (!handle)
-		return -ENOMEM;
-
-	handle->dev = dev;
-	handle->handler = handler;
-	handle->name = KEYCHORD_NAME;
-	handle->private = kdev;
-
-	ret = input_register_handle(handle);
-	if (ret)
-		goto err_input_register_handle;
-
-	ret = input_open_device(handle);
-	if (ret)
-		goto err_input_open_device;
-
-	pr_info("keychord: using input dev %s for fevent\n", dev->name);
-	return 0;
-
-err_input_open_device:
-	input_unregister_handle(handle);
-err_input_register_handle:
-	kfree(handle);
+	ret = 0;
+	if (len != dev->mr_page_size)
+		ret = srp_map_finish_fmr(state, ch);
 	return ret;
 }
 
-static void keychord_disconnect(struct input_handle *handle)
+static int srp_map_sg_fmr(struct srp_map_state *state, struct srp_rdma_ch *ch,
+			  struct srp_request *req, struct scatterlist *scat,
+			  int count)
 {
-	input_close_device(handle);
-	input_unregister_handle(handle);
-	kfree(handle);
-}
+	struct scatterlist *sg;
+	int i, ret;
 
-/*
- * keychord_read is used to read keychord events from the driver
- */
-static ssize_t keychord_read(struct file *file, char __user *buffer,
-		size_t count, loff_t *ppos)
-{
-	struct keychord_device *kdev = file->private_data;
-	__u16   id;
-	int retval;
-	unsigned long flags;
+	state->desc = req->indirect_desc;
+	state->pages = req->map_page;
+	state->fmr.next = req->fmr_list;
+	state->fmr.end = req->fmr_list + ch->target->cmd_sg_cnt;
 
-	if (count < sizeof(id))
-		return -EINVAL;
-	count = sizeof(id);
-
-	if (kdev->head == kdev->tail && (file->f_flags & O_NONBLOCK))
-		return -EAGAIN;
-
-	retval = wait_event_interruptible(kdev->waitq,
-			kdev->head != kdev->tail);
-	if (retval)
-		return retval;
-
-	spin_lock_irqsave(&kdev->lock, flags);
-	/* pop a keychord ID off the queue */
-	id = kdev->buff[kdev->tail];
-	kdev->tail = (kdev->tail + 1) % BUFFER_SIZE;
-	spin_unlock_irqrestore(&kdev->lock, flags);
-
-	if (copy_to_user(buffer, &id, count))
-		return -EFAULT;
-
-	return count;
-}
-
-/*
- * serializes writes on a device. can use mutex_lock_interruptible()
- * for this particular use case as well - a matter of preference.
- */
-static int
-keychord_write_lock(struct keychord_device *kdev)
-{
-	int ret;
-	unsigned long flags;
-
-	spin_lock_irqsave(&kdev->lock, flags);
-	while (kdev->flags & KEYCHORD_BUSY) {
-		spin_unlock_irqrestore(&kdev->lock, flags);
-		ret = wait_event_interruptible(kdev->write_waitq,
-			       ((kdev->flags & KEYCHORD_BUSY) == 0));
+	for_each_sg(scat, sg, count, i) {
+		ret = srp_map_sg_entry(state, ch, sg, i);
 		if (ret)
 			return ret;
-		spin_lock_irqsave(&kdev->lock, flags);
 	}
-	kdev->flags |= KEYCHORD_BUSY;
-	spin_unlock_irqrestore(&kdev->lock, flags);
+
+	ret = srp_map_finish_fmr(state, ch);
+	if (ret)
+		return ret;
+
+	req->nmdesc = state->nmdesc;
+
 	return 0;
 }
 
-static void
-keychord_write_unlock(struct keychord_device *kdev)
+static int srp_map_sg_fr(struct srp_map_state *state, struct srp_rdma_ch *ch,
+			 struct srp_request *req, struct scatterlist *scat,
+			 int count)
 {
-	unsigned long flags;
+	state->desc = req->indirect_desc;
+	state->fr.next = req->fr_list;
+	state->fr.end = req->fr_list + ch->target->cmd_sg_cnt;
+	state->sg = scat;
 
-	spin_lock_irqsave(&kdev->lock, flags);
-	kdev->flags &= ~KEYCHORD_BUSY;
-	spin_unlock_irqrestore(&kdev->lock, flags);
-	wake_up_interruptible(&kdev->write_waitq);
+	while (count) {
+		int i, n;
+
+		n = srp_map_finish_fr(state, ch, count);
+		if (unlikely(n < 0))
+			return n;
+
+		count -= n;
+		for (i = 0; i < n; i++)
+			state->sg = sg_next(state->sg);
+	}
+
+	req->nmdesc = state->nmdesc;
+
+	return 0;
+}
+
+static int srp_map_sg_dma(struct srp_map_state *state, struct srp_rdma_ch *ch,
+			  struct srp_request *req, struct scatterlist *scat,
+			  int count)
+{
+	struct srp_target_port *target = ch->target;
+	struct srp_device *dev = target->srp_host->srp_dev;
+	struct scatterlist *sg;
+	int i;
+
+	state->desc = req->indirect_desc;
+	for_each_sg(scat, sg, count, i) {
+		srp_map_desc(state, ib_sg_dma_address(dev->dev, sg),
+			     ib_sg_dma_len(dev->dev, sg),
+			     target->global_mr->rkey);
+	}
+
+	req->nmdesc = state->nmdesc;
+
+	return 0;
 }
 
 /*
- * keychord_write is used to configure the driver
+ * Register the indirect data buffer descriptor with the HCA.
+ *
+ * Note: since the indirect data buffer descriptor has been allocated with
+ * kmalloc() it is guaranteed that this buffer is a physically contiguous
+ * memory buffer.
  */
-static ssize_t keychord_write(struct file *file, const char __user *buffer,
-		size_t count, loff_t *ppos)
+static int srp_map_idb(struct srp_rdma_ch *ch, struct srp_request *req,
+		       void **next_mr, void **end_mr, u32 idb_len,
+		       __be32 *idb_rkey)
 {
-	struct keychord_device *kdev = file->private_data;
-	struct input_keychord *keychords = 0;
-	struct input_keychord *keychord;
-	int ret, i, key;
-	unsigned long flags;
-	size_t resid = count;
-	size_t key_bytes;
+	struct srp_target_port *target = ch->target;
+	struct srp_device *dev = target->srp_host->srp_dev;
+	struct srp_map_state state;
+	struct srp_direct_buf idb_desc;
+	u64 idb_pages[1];
+	struct scatterlist idb_sg[1];
+	int ret;
 
-	if (count < sizeof(struct input_keychord) || count > PAGE_SIZE)
+	memset(&state, 0, sizeof(state));
+	memset(&idb_desc, 0, sizeof(idb_desc));
+	state.gen.next = next_mr;
+	state.gen.end = end_mr;
+	state.desc = &idb_desc;
+	state.base_dma_addr = req->indirect_dma_addr;
+	state.dma_len = idb_len;
+
+	if (dev->use_fast_reg) {
+		state.sg = idb_sg;
+		sg_init_one(idb_sg, req->indirect_desc, idb_len);
+		idb_sg->dma_address = req->indirect_dma_addr; /* hack! */
+#ifdef CONFIG_NEED_SG_DMA_LENGTH
+		idb_sg->dma_length = idb_sg->length;	      /* hack^2 */
+#endif
+		ret = srp_map_finish_fr(&state, ch, 1);
+		if (ret < 0)
+			return ret;
+	} else if (dev->use_fmr) {
+		state.pages = idb_pages;
+		state.pages[0] = (req->indirect_dma_addr &
+				  dev->mr_page_mask);
+		state.npages = 1;
+		ret = srp_map_finish_fmr(&state, ch);
+		if (ret < 0)
+			return ret;
+	} else {
 		return -EINVAL;
-	keychords = kzalloc(count, GFP_KERNEL);
-	if (!keychords)
-		return -ENOMEM;
+	}
 
-	/* read list of keychords from userspace */
-	if (copy_from_user(keychords, buffer, count)) {
-		kfree(keychords);
-		return -EFAULT;
+	*idb_rkey = idb_desc.key;
+
+	return 0;
+}
+
+static int srp_map_data(struct scsi_cmnd *scmnd, struct srp_rdma_ch *ch,
+			struct srp_request *req)
+{
+	struct srp_target_port *target = ch->target;
+	struct scatterlist *scat;
+	struct srp_cmd *cmd = req->cmd->buf;
+	int len, nents, count, ret;
+	struct srp_device *dev;
+	struct ib_device *ibdev;
+	struct srp_map_state state;
+	struct srp_indirect_buf *indirect_hdr;
+	u32 idb_len, table_len;
+	__be32 idb_rkey;
+	u8 fmt;
+
+	if (!scsi_sglist(scmnd) || scmnd->sc_data_direction == DMA_NONE)
+		return sizeof (struct srp_cmd);
+
+	if (scmnd->sc_data_direction != DMA_FROM_DEVICE &&
+	    scmnd->sc_data_direction != DMA_TO_DEVICE) {
+		shost_printk(KERN_WARNING, target->scsi_host,
+			     PFX "Unhandled data direction %d\n",
+			     scmnd->sc_data_direction);
+		return -EINVAL;
+	}
+
+	nents = scsi_sg_count(scmnd);
+	scat  = scsi_sglist(scmnd);
+
+	dev = target->srp_host->srp_dev;
+	ibdev = dev->dev;
+
+	count = ib_dma_map_sg(ibdev, scat, nents, scmnd->sc_data_direction);
+	if (unlikely(count == 0))
+		return -EIO;
+
+	fmt = SRP_DATA_DESC_DIRECT;
+	len = sizeof (struct srp_cmd) +	sizeof (struct srp_direct_buf);
+
+	if (count == 1 && target->global_mr) {
+		/*
+		 * The midlayer only generated a single gather/scatter
+		 * entry, or DMA mapping coalesced everything to a
+		 * single entry.  So a direct descriptor along with
+		 * the DMA MR suffices.
+		 */
+		struct srp_direct_buf *buf = (void *) cmd->add_data;
+
+		buf->va  = cpu_to_be64(ib_sg_dma_address(ibdev, scat));
+		buf->key = cpu_to_be32(target->global_mr->rkey);
+		buf->len = cpu_to_be32(ib_sg_dma_len(ibdev, scat));
+
+		req->nmdesc = 0;
+		goto map_complete;
 	}
 
 	/*
-	 * Serialize writes to this device to prevent various races.
-	 * 1) writers racing here could do duplicate input_unregister_handler()
-	 *    calls, resulting in attempting to unlink a node from a list that
-	 *    does not exist.
-	 * 2) writers racing here could do duplicate input_register_handler() calls
-	 *    below, resulting in a duplicate insertion of a node into the list.
-	 * 3) a double kfree of keychords can occur (in the event that
-	 *    input_register_handler() fails below.
+	 * We have more than one scatter/gather entry, so build our indirect
+	 * descriptor table, trying to merge as many entries as we can.
 	 */
-	ret = keychord_write_lock(kdev);
-	if (ret) {
-		kfree(keychords);
-		return ret;
+	indirect_hdr = (void *) cmd->add_data;
+
+	ib_dma_sync_single_for_cpu(ibdev, req->indirect_dma_addr,
+				   target->indirect_size, DMA_TO_DEVICE);
+
+	memset(&state, 0, sizeof(state));
+	if (dev->use_fast_reg)
+		srp_map_sg_fr(&state, ch, req, scat, count);
+	else if (dev->use_fmr)
+		srp_map_sg_fmr(&state, ch, req, scat, count);
+	else
+		srp_map_sg_dma(&state, ch, req, scat, count);
+
+	/* We've mapped the request, now pull as much of the indirect
+	 * descriptor table as we can into the command buffer. If this
+	 * target is not using an external indirect table, we are
+	 * guaranteed to fit into the command, as the SCSI layer won't
+	 * give us more S/G entries than we allow.
+	 */
+	if (state.ndesc == 1) {
+		/*
+		 * Memory registration collapsed the sg-list into one entry,
+		 * so use a direct descriptor.
+		 */
+		struct srp_direct_buf *buf = (void *) cmd->add_data;
+
+		*buf = req->indirect_desc[0];
+		goto map_complete;
 	}
 
-	/* unregister handler before changing configuration */
-	if (kdev->registered) {
-		input_unregister_handler(&kdev->input_handler);
-		kdev->registered = 0;
+	if (unlikely(target->cmd_sg_cnt < state.ndesc &&
+						!target->allow_ext_sg)) {
+		shost_printk(KERN_ERR, target->scsi_host,
+			     "Could not fit S/G list into SRP_CMD\n");
+		return -EIO;
 	}
 
-	spin_lock_irqsave(&kdev->lock, flags);
-	/* clear any existing configuration */
-	kfree(kdev->keychords);
-	kdev->keychords = 0;
-	kdev->keychord_count = 0;
-	kdev->key_down = 0;
-	memset(kdev->keybit, 0, sizeof(kdev->keybit));
-	memset(kdev->keystate, 0, sizeof(kdev->keystate));
-	kdev->head = kdev->tail = 0;
+	count = min(state.ndesc, target->cmd_sg_cnt);
+	table_len = state.ndesc * sizeof (struct srp_direct_buf);
+	idb_len = sizeof(struct srp_indirect_buf) + table_len;
 
-	keychord = keychords;
-	while (resid > 0) {
-		/* Is the entire keychord entry header present ? */
-		if (resid < sizeof(struct input_keychord)) {
-			pr_err("keychord: Insufficient bytes present for header %zu\n",
-			       resid);
-			goto err_unlock_return;
-		}
-		resid -= sizeof(struct input_keychord);
-		if (keychord->count <= 0) {
-			pr_err("keychord: invalid keycode count %d\n",
-				keychord->count);
-			goto err_unlock_return;
-		}
-		key_bytes = keychord->count * sizeof(keychord->keycodes[0]);
-		/* Do we have all the expected keycodes ? */
-		if (resid < key_bytes) {
-			pr_err("keychord: Insufficient bytes present for keycount %zu\n",
-			       resid);
-			goto err_unlock_return;
-		}
-		resid -= key_bytes;
+	fmt = SRP_DATA_DESC_INDIRECT;
+	len = sizeof(struct srp_cmd) + sizeof (struct srp_indirect_buf);
+	len += count * sizeof (struct srp_direct_buf);
 
-		if (keychord->version != KEYCHORD_VERSION) {
-			pr_err("keychord: unsupported version %d\n",
-				keychord->version);
-			goto err_unlock_return;
-		}
+	memcpy(indirect_hdr->desc_list, req->indirect_desc,
+	       count * sizeof (struct srp_direct_buf));
 
-		/* keep track of the keys we are monitoring in keybit */
-		for (i = 0; i < keychord->count; i++) {
-			key = keychord->keycodes[i];
-			if (key < 0 || key >= KEY_CNT) {
-				pr_err("keychord: keycode %d out of range\n",
-					key);
-				goto err_unlock_return;
-			}
-			__set_bit(key, kdev->keybit);
-		}
-
-		kdev->keychord_count++;
-		keychord = NEXT_KEYCHORD(keychord);
+	if (!target->global_mr) {
+		ret = srp_map_idb(ch, req, state.gen.next, state.gen.end,
+				  idb_len, &idb_rkey);
+		if (ret < 0)
+			return ret;
+		req->nmdesc++;
+	} else {
+		idb_rkey = cpu_to_be32(target->global_mr->rkey);
 	}
 
-	kdev->keychords = keychords;
-	spin_unlock_irqrestore(&kdev->lock, flags);
+	indirect_hdr->table_desc.va = cpu_to_be64(req->indirect_dma_addr);
+	indirect_hdr->table_desc.key = idb_rkey;
+	indirect_hdr->table_desc.len = cpu_to_be32(table_len);
+	indirect_hdr->len = cpu_to_be32(state.total_len);
 
-	ret = input_register_handler(&kdev->input_handler);
-	if (ret) {
-		kfree(keychords);
-		kdev->keychords = 0;
-		keychord_write_unlock(kdev);
-		return ret;
+	if (scmnd->sc_data_direction == DMA_TO_DEVICE)
+		cmd->data_out_desc_cnt = count;
+	else
+		cmd->data_in_desc_cnt = count;
+
+	ib_dma_sync_single_for_device(ibdev, req->indirect_dma_addr, table_len,
+				      DMA_TO_DEVICE);
+
+map_complete:
+	if (scmnd->sc_data_direction == DMA_TO_DEVICE)
+		cmd->buf_fmt = fmt << 4;
+	else
+		cmd->buf_fmt = fmt;
+
+	return len;
+}
+
+/*
+ * Return an IU and possible credit to the free pool
+ */
+static void srp_put_tx_iu(struct srp_rdma_ch *ch, struct srp_iu *iu,
+			  enum srp_iu_type iu_type)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ch->lock, flags);
+	list_add(&iu->list, &ch->free_tx);
+	if (iu_type != SRP_IU_RSP)
+		++ch->req_lim;
+	spin_unlock_irqrestore(&ch->lock, flags);
+}
+
+/*
+ * Must be called with ch->lock held to protect req_lim and free_tx.
+ * If IU is not sent, it must be returned using srp_put_tx_iu().
+ *
+ * Note:
+ * An upper limit for the number of allocated information units for each
+ * request type is:
+ * - SRP_IU_CMD: SRP_CMD_SQ_SIZE, since the SCSI mid-layer never queues
+ *   more than Scsi_Host.can_queue requests.
+ * - SRP_IU_TSK_MGMT: SRP_TSK_MGMT_SQ_SIZE.
+ * - SRP_IU_RSP: 1, since a conforming SRP target never sends more than
+ *   one unanswered SRP request to an initiator.
+ */
+static struct srp_iu *__srp_get_tx_iu(struct srp_rdma_ch *ch,
+				      enum srp_iu_type iu_type)
+{
+	struct srp_target_port *target = ch->target;
+	s32 rsv = (iu_type == SRP_IU_TSK_MGMT) ? 0 : SRP_TSK_MGMT_SQ_SIZE;
+	struct srp_iu *iu;
+
+	srp_send_completion(ch->send_cq, ch);
+
+	if (list_empty(&ch->free_tx))
+		return NULL;
+
+	/* Initiator responses to target requests do not consume credits */
+	if (iu_type != SRP_IU_RSP) {
+		if (ch->req_lim <= rsv) {
+			++target->zero_req_lim;
+			return NULL;
+		}
+
+		--ch->req_lim;
 	}
-	kdev->registered = 1;
 
-	keychord_write_unlock(kdev);
-
-	return count;
-
-err_unlock_return:
-	spin_unlock_irqrestore(&kdev->lock, flags);
-	kfree(keychords);
-	keychord_write_unlock(kdev);
-	return -EINVAL;
+	iu = list_first_entry(&ch->free_tx, struct srp_iu, list);
+	list_del(&iu->list);
+	return iu;
 }
 
-static unsigned int keychord_poll(struct file *file, poll_table *wait)
+static int srp_post_send(struct srp_rdma_ch *ch, struct srp_iu *iu, int len)
 {
-	struct keychord_device *kdev = file->private_data;
+	struct srp_target_port *target = ch->target;
+	struct ib_sge list;
+	struct ib_send_wr wr, *bad_wr;
 
-	poll_wait(file, &kdev->waitq, wait);
+	list.addr   = iu->dma;
+	list.length = len;
+	list.lkey   = target->lkey;
 
-	if (kdev->head != kdev->tail)
-		return POLLIN | POLLRDNORM;
+	wr.next       = NULL;
+	wr.wr_id      = (uintptr_t) iu;
+	wr.sg_list    = &list;
+	wr.num_sge    = 1;
+	wr.opcode     = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED;
 
-	return 0;
+	return ib_post_send(ch->qp, &wr, &bad_wr);
 }
 
-static int keychord_open(struct inode *inode, struct file *file)
+static int srp_post_recv(struct srp_rdma_ch *ch, struct srp_iu *iu)
 {
-	struct keychord_device *kdev;
+	struct srp_target_port *target = ch->target;
+	struct ib_recv_wr wr, *bad_wr;
+	struct ib_sge list;
 
-	kdev = kzalloc(sizeof(struct keychord_device), GFP_KERNEL);
-	if (!kdev)
-		return -ENOMEM;
+	list.addr   = iu->dma;
+	list.length = iu->size;
+	list.lkey   = target->lkey;
 
-	spin_lock_init(&kdev->lock);
-	init_waitqueue_head(&kdev->waitq);
-	init_waitqueue_head(&kdev->write_waitq);
+	wr.next     = NULL;
+	wr.wr_id    = (uintptr_t) iu;
+	wr.sg_list  = &list;
+	wr.num_sge  = 1;
 
-	kdev->input_handler.event = keychord_event;
-	kdev->input_handler.connect = keychord_connect;
-	kdev->input_handler.disconnect = keychord_disconnect;
-	kdev->input_handler.name = KEYCHORD_NAME;
-	kdev->input_handler.id_table = kdev->device_ids;
-
-	kdev->device_ids[0].flags = INPUT_DEVICE_ID_MATCH_EVBIT;
-	__set_bit(EV_KEY, kdev->device_ids[0].evbit);
-
-	file->private_data = kdev;
-
-	return 0;
+	return ib_post_recv(ch->qp, &wr, &bad_wr);
 }
 
-static int keychord_release(struct inode *inode, struct file *file)
+static void srp_process_rsp(struct srp_rdma_ch *ch, struct srp_rsp *rsp)
 {
-	struct keychord_device *kdev = file->private_data;
+	struct srp_target_port *target = ch->target;
+	struct srp_request *req;
+	struct scsi_cmnd *scmnd;
+	unsigned long flags;
 
-	if (kdev->registered)
-		input_unregister_handler(&kdev->input_handler);
-	kfree(kdev->keychords);
-	kfree(kdev);
+	if (unlikely(rsp->tag & SRP_TAG_TSK_MGMT)) {
+		spin_lock_irqsave(&ch->lock, flags);
+		ch->req_lim += be32_to_cpu(rsp->req_lim_delta);
+		if (rsp->tag == ch->tsk_mgmt_tag) {
+			ch->tsk_mgmt_status = -1;
+			if (be32_to_cpu(rsp->resp_data_len) >= 4)
+				ch->tsk_mgmt_status = rsp->data[3];
+			complete(&ch->tsk_mgmt_done);
+		} else {
+			shost_printk(KERN_ERR, target->scsi_host,
+				     "Received tsk mgmt response too late for tag %#llx\n",
+				     rsp->tag);
+		}
+		spin_unlock_irqrestore(&ch->lock, flags);
+	} else {
+		scmnd = scsi_host_find_tag(target->scsi_host, rsp->tag);
+		if (scmnd && scmnd->host_scribble) {
+			req = (void *)scmnd->host_scribble;
+			scmnd = srp_claim_req(ch, req, NULL, scmnd);
+		} else {
+			scmnd = NULL;
+		}
+		if (!scmnd) {
+			shost_printk(KERN_ERR, target->scsi_host,
+				     "Null scmnd for RSP w/tag %#016llx received on ch %td / QP %#x\n",
+				     rsp->tag, ch - target->ch, ch->qp->qp_num);
 
-	return 0;
-}
-
-static const struct file_operations keychord_fops = {
-	.owner		= THIS_MODULE,
-	.open		= keychord_open,
-	.release	= keychord_release,
-	.read		= keychord_read,
-	.write		= keychord_write,
-	.poll		= keychord_poll,
-};
-
-static struct miscdevice keychord_misc = {
-	.fops		= &keychord_fops,
-	.name		= KEYCHORD_NAME,
-	.minor		= MISC_DYNAMIC_MINOR,
-};
-
-static int __init keychord_init(void)
-{
-	return misc_register(&keychord_misc);
-}
-
-static void __exit keychord_exit(void)
-{
-	misc_deregister(&keychord_misc);
-}
-
-module_init(keychord_init);
-module_exit(keychord_exit);
+			spin_lock_irqsave(&ch->l

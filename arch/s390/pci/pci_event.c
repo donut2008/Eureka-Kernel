@@ -1,142 +1,142 @@
+s  :   cpuid
+ *  Outputs :   None
+ */
+static void
+ia64_mca_wakeup(int cpu)
+{
+	platform_send_ipi(cpu, IA64_MCA_WAKEUP_VECTOR, IA64_IPI_DM_INT, 0);
+}
+
 /*
- *  Copyright IBM Corp. 2012
+ * ia64_mca_wakeup_all
  *
- *  Author(s):
- *    Jan Glauber <jang@linux.vnet.ibm.com>
+ *	Wakeup all the slave cpus which have rendez'ed previously.
+ *
+ *  Inputs  :   None
+ *  Outputs :   None
+ */
+static void
+ia64_mca_wakeup_all(void)
+{
+	int cpu;
+
+	/* Clear the Rendez checkin flag for all cpus */
+	for_each_online_cpu(cpu) {
+		if (ia64_mc_info.imi_rendez_checkin[cpu] == IA64_MCA_RENDEZ_CHECKIN_DONE)
+			ia64_mca_wakeup(cpu);
+	}
+
+}
+
+/*
+ * ia64_mca_rendez_interrupt_handler
+ *
+ *	This is handler used to put slave processors into spinloop
+ *	while the monarch processor does the mca handling and later
+ *	wake each slave up once the monarch is done.  The state
+ *	IA64_MCA_RENDEZ_CHECKIN_DONE indicates the cpu is rendez'ed
+ *	in SAL.  The state IA64_MCA_RENDEZ_CHECKIN_NOTDONE indicates
+ *	the cpu has come out of OS rendezvous.
+ *
+ *  Inputs  :   None
+ *  Outputs :   None
+ */
+static irqreturn_t
+ia64_mca_rendez_int_handler(int rendez_irq, void *arg)
+{
+	unsigned long flags;
+	int cpu = smp_processor_id();
+	struct ia64_mca_notify_die nd =
+		{ .sos = NULL, .monarch_cpu = &monarch_cpu };
+
+	/* Mask all interrupts */
+	local_irq_save(flags);
+
+	NOTIFY_MCA(DIE_MCA_RENDZVOUS_ENTER, get_irq_regs(), (long)&nd, 1);
+
+	ia64_mc_info.imi_rendez_checkin[cpu] = IA64_MCA_RENDEZ_CHECKIN_DONE;
+	/* Register with the SAL monarch that the slave has
+	 * reached SAL
+	 */
+	ia64_sal_mc_rendez();
+
+	NOTIFY_MCA(DIE_MCA_RENDZVOUS_PROCESS, get_irq_regs(), (long)&nd, 1);
+
+	/* Wait for the monarch cpu to exit. */
+	while (monarch_cpu != -1)
+	       cpu_relax();	/* spin until monarch leaves */
+
+	NOTIFY_MCA(DIE_MCA_RENDZVOUS_LEAVE, get_irq_regs(), (long)&nd, 1);
+
+	ia64_mc_info.imi_rendez_checkin[cpu] = IA64_MCA_RENDEZ_CHECKIN_NOTDONE;
+	/* Enable all interrupts */
+	local_irq_restore(flags);
+	return IRQ_HANDLED;
+}
+
+/*
+ * ia64_mca_wakeup_int_handler
+ *
+ *	The interrupt handler for processing the inter-cpu interrupt to the
+ *	slave cpu which was spinning in the rendez loop.
+ *	Since this spinning is done by turning off the interrupts and
+ *	polling on the wakeup-interrupt bit in the IRR, there is
+ *	nothing useful to be done in the handler.
+ *
+ *  Inputs  :   wakeup_irq  (Wakeup-interrupt bit)
+ *	arg		(Interrupt handler specific argument)
+ *  Outputs :   None
+ *
+ */
+static irqreturn_t
+ia64_mca_wakeup_int_handler(int wakeup_irq, void *arg)
+{
+	return IRQ_HANDLED;
+}
+
+/* Function pointer for extra MCA recovery */
+int (*ia64_mca_ucmc_extension)
+	(void*,struct ia64_sal_os_state*)
+	= NULL;
+
+int
+ia64_reg_MCA_extension(int (*fn)(void *, struct ia64_sal_os_state *))
+{
+	if (ia64_mca_ucmc_extension)
+		return 1;
+
+	ia64_mca_ucmc_extension = fn;
+	return 0;
+}
+
+void
+ia64_unreg_MCA_extension(void)
+{
+	if (ia64_mca_ucmc_extension)
+		ia64_mca_ucmc_extension = NULL;
+}
+
+EXPORT_SYMBOL(ia64_reg_MCA_extension);
+EXPORT_SYMBOL(ia64_unreg_MCA_extension);
+
+
+static inline void
+copy_reg(const u64 *fr, u64 fnat, unsigned long *tr, unsigned long *tnat)
+{
+	u64 fslot, tslot, nat;
+	*tr = *fr;
+	fslot = ((unsigned long)fr >> 3) & 63;
+	tslot = ((unsigned long)tr >> 3) & 63;
+	*tnat &= ~(1UL << tslot);
+	nat = (fnat >> fslot) & 1;
+	*tnat |= (nat << tslot);
+}
+
+/* Change the comm field on the MCA/INT task to include the pid that
+ * was interrupted, it makes for easier debugging.  If that pid was 0
+ * (swapper or nested MCA/INIT) then use the start of the previous comm
+ * field suffixed with its cpu.
  */
 
-#define KMSG_COMPONENT "zpci"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
-
-#include <linux/kernel.h>
-#include <linux/pci.h>
-#include <asm/pci_debug.h>
-#include <asm/sclp.h>
-
-/* Content Code Description for PCI Function Error */
-struct zpci_ccdf_err {
-	u32 reserved1;
-	u32 fh;				/* function handle */
-	u32 fid;			/* function id */
-	u32 ett		:  4;		/* expected table type */
-	u32 mvn		: 12;		/* MSI vector number */
-	u32 dmaas	:  8;		/* DMA address space */
-	u32		:  6;
-	u32 q		:  1;		/* event qualifier */
-	u32 rw		:  1;		/* read/write */
-	u64 faddr;			/* failing address */
-	u32 reserved3;
-	u16 reserved4;
-	u16 pec;			/* PCI event code */
-} __packed;
-
-/* Content Code Description for PCI Function Availability */
-struct zpci_ccdf_avail {
-	u32 reserved1;
-	u32 fh;				/* function handle */
-	u32 fid;			/* function id */
-	u32 reserved2;
-	u32 reserved3;
-	u32 reserved4;
-	u32 reserved5;
-	u16 reserved6;
-	u16 pec;			/* PCI event code */
-} __packed;
-
-static void __zpci_event_error(struct zpci_ccdf_err *ccdf)
-{
-	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
-	struct pci_dev *pdev = zdev ? zdev->pdev : NULL;
-
-	zpci_err("error CCDF:\n");
-	zpci_err_hex(ccdf, sizeof(*ccdf));
-
-	pr_err("%s: Event 0x%x reports an error for PCI function 0x%x\n",
-	       pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
-}
-
-void zpci_event_error(void *data)
-{
-	if (zpci_is_enabled())
-		__zpci_event_error(data);
-}
-
-static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
-{
-	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
-	struct pci_dev *pdev = zdev ? zdev->pdev : NULL;
-	int ret;
-
-	pr_info("%s: Event 0x%x reconfigured PCI function 0x%x\n",
-		pdev ? pci_name(pdev) : "n/a", ccdf->pec, ccdf->fid);
-	zpci_err("avail CCDF:\n");
-	zpci_err_hex(ccdf, sizeof(*ccdf));
-
-	switch (ccdf->pec) {
-	case 0x0301: /* Reserved|Standby -> Configured */
-		if (!zdev) {
-			ret = clp_add_pci_device(ccdf->fid, ccdf->fh, 0);
-			if (ret)
-				break;
-			zdev = get_zdev_by_fid(ccdf->fid);
-		}
-		if (!zdev || zdev->state != ZPCI_FN_STATE_STANDBY)
-			break;
-		zdev->state = ZPCI_FN_STATE_CONFIGURED;
-		zdev->fh = ccdf->fh;
-		ret = zpci_enable_device(zdev);
-		if (ret)
-			break;
-		pci_lock_rescan_remove();
-		pci_rescan_bus(zdev->bus);
-		pci_unlock_rescan_remove();
-		break;
-	case 0x0302: /* Reserved -> Standby */
-		if (!zdev)
-			clp_add_pci_device(ccdf->fid, ccdf->fh, 0);
-		break;
-	case 0x0303: /* Deconfiguration requested */
-		if (pdev)
-			pci_stop_and_remove_bus_device_locked(pdev);
-
-		ret = zpci_disable_device(zdev);
-		if (ret)
-			break;
-
-		ret = sclp_pci_deconfigure(zdev->fid);
-		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, ret);
-		if (!ret)
-			zdev->state = ZPCI_FN_STATE_STANDBY;
-
-		break;
-	case 0x0304: /* Configured -> Standby */
-		if (pdev) {
-			/* Give the driver a hint that the function is
-			 * already unusable. */
-			pdev->error_state = pci_channel_io_perm_failure;
-			pci_stop_and_remove_bus_device_locked(pdev);
-		}
-
-		zdev->fh = ccdf->fh;
-		zpci_disable_device(zdev);
-		zdev->state = ZPCI_FN_STATE_STANDBY;
-		break;
-	case 0x0306: /* 0x308 or 0x302 for multiple devices */
-		clp_rescan_pci_devices();
-		break;
-	case 0x0308: /* Standby -> Reserved */
-		if (!zdev)
-			break;
-		pci_stop_root_bus(zdev->bus);
-		pci_remove_root_bus(zdev->bus);
-		break;
-	default:
-		break;
-	}
-}
-
-void zpci_event_availability(void *data)
-{
-	if (zpci_is_enabled())
-		__zpci_event_availability(data);
-}
+static void
+ia64_m

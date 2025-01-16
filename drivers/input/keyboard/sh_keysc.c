@@ -1,341 +1,160 @@
-/*
- * SuperH KEYSC Keypad Driver
- *
- * Copyright (C) 2008 Magnus Damm
- *
- * Based on gpio_keys.c, Copyright 2005 Phil Blundell
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/delay.h>
-#include <linux/platform_device.h>
-#include <linux/input.h>
-#include <linux/input/sh_keysc.h>
-#include <linux/bitmap.h>
-#include <linux/pm_runtime.h>
-#include <linux/io.h>
-#include <linux/slab.h>
-
-static const struct {
-	unsigned char kymd, keyout, keyin;
-} sh_keysc_mode[] = {
-	[SH_KEYSC_MODE_1] = { 0, 6, 5 },
-	[SH_KEYSC_MODE_2] = { 1, 5, 6 },
-	[SH_KEYSC_MODE_3] = { 2, 4, 7 },
-	[SH_KEYSC_MODE_4] = { 3, 6, 6 },
-	[SH_KEYSC_MODE_5] = { 4, 6, 7 },
-	[SH_KEYSC_MODE_6] = { 5, 8, 8 },
-};
-
-struct sh_keysc_priv {
-	void __iomem *iomem_base;
-	DECLARE_BITMAP(last_keys, SH_KEYSC_MAXKEYS);
-	struct input_dev *input;
-	struct sh_keysc_info pdata;
-};
-
-#define KYCR1 0
-#define KYCR2 1
-#define KYINDR 2
-#define KYOUTDR 3
-
-#define KYCR2_IRQ_LEVEL    0x10
-#define KYCR2_IRQ_DISABLED 0x00
-
-static unsigned long sh_keysc_read(struct sh_keysc_priv *p, int reg_nr)
-{
-	return ioread16(p->iomem_base + (reg_nr << 2));
-}
-
-static void sh_keysc_write(struct sh_keysc_priv *p, int reg_nr,
-			   unsigned long value)
-{
-	iowrite16(value, p->iomem_base + (reg_nr << 2));
-}
-
-static void sh_keysc_level_mode(struct sh_keysc_priv *p,
-				unsigned long keys_set)
-{
-	struct sh_keysc_info *pdata = &p->pdata;
-
-	sh_keysc_write(p, KYOUTDR, 0);
-	sh_keysc_write(p, KYCR2, KYCR2_IRQ_LEVEL | (keys_set << 8));
-
-	if (pdata->kycr2_delay)
-		udelay(pdata->kycr2_delay);
-}
-
-static void sh_keysc_map_dbg(struct device *dev, unsigned long *map,
-			     const char *str)
-{
-	int k;
-
-	for (k = 0; k < BITS_TO_LONGS(SH_KEYSC_MAXKEYS); k++)
-		dev_dbg(dev, "%s[%d] 0x%lx\n", str, k, map[k]);
-}
-
-static irqreturn_t sh_keysc_isr(int irq, void *dev_id)
-{
-	struct platform_device *pdev = dev_id;
-	struct sh_keysc_priv *priv = platform_get_drvdata(pdev);
-	struct sh_keysc_info *pdata = &priv->pdata;
-	int keyout_nr = sh_keysc_mode[pdata->mode].keyout;
-	int keyin_nr = sh_keysc_mode[pdata->mode].keyin;
-	DECLARE_BITMAP(keys, SH_KEYSC_MAXKEYS);
-	DECLARE_BITMAP(keys0, SH_KEYSC_MAXKEYS);
-	DECLARE_BITMAP(keys1, SH_KEYSC_MAXKEYS);
-	unsigned char keyin_set, tmp;
-	int i, k, n;
-
-	dev_dbg(&pdev->dev, "isr!\n");
-
-	bitmap_fill(keys1, SH_KEYSC_MAXKEYS);
-	bitmap_zero(keys0, SH_KEYSC_MAXKEYS);
-
-	do {
-		bitmap_zero(keys, SH_KEYSC_MAXKEYS);
-		keyin_set = 0;
-
-		sh_keysc_write(priv, KYCR2, KYCR2_IRQ_DISABLED);
-
-		for (i = 0; i < keyout_nr; i++) {
-			n = keyin_nr * i;
-
-			/* drive one KEYOUT pin low, read KEYIN pins */
-			sh_keysc_write(priv, KYOUTDR, 0xffff ^ (3 << (i * 2)));
-			udelay(pdata->delay);
-			tmp = sh_keysc_read(priv, KYINDR);
-
-			/* set bit if key press has been detected */
-			for (k = 0; k < keyin_nr; k++) {
-				if (tmp & (1 << k))
-					__set_bit(n + k, keys);
-			}
-
-			/* keep track of which KEYIN bits that have been set */
-			keyin_set |= tmp ^ ((1 << keyin_nr) - 1);
-		}
-
-		sh_keysc_level_mode(priv, keyin_set);
-
-		bitmap_complement(keys, keys, SH_KEYSC_MAXKEYS);
-		bitmap_and(keys1, keys1, keys, SH_KEYSC_MAXKEYS);
-		bitmap_or(keys0, keys0, keys, SH_KEYSC_MAXKEYS);
-
-		sh_keysc_map_dbg(&pdev->dev, keys, "keys");
-
-	} while (sh_keysc_read(priv, KYCR2) & 0x01);
-
-	sh_keysc_map_dbg(&pdev->dev, priv->last_keys, "last_keys");
-	sh_keysc_map_dbg(&pdev->dev, keys0, "keys0");
-	sh_keysc_map_dbg(&pdev->dev, keys1, "keys1");
-
-	for (i = 0; i < SH_KEYSC_MAXKEYS; i++) {
-		k = pdata->keycodes[i];
-		if (!k)
-			continue;
-
-		if (test_bit(i, keys0) == test_bit(i, priv->last_keys))
-			continue;
-
-		if (test_bit(i, keys1) || test_bit(i, keys0)) {
-			input_event(priv->input, EV_KEY, k, 1);
-			__set_bit(i, priv->last_keys);
-		}
-
-		if (!test_bit(i, keys1)) {
-			input_event(priv->input, EV_KEY, k, 0);
-			__clear_bit(i, priv->last_keys);
-		}
-
-	}
-	input_sync(priv->input);
-
-	return IRQ_HANDLED;
-}
-
-static int sh_keysc_probe(struct platform_device *pdev)
-{
-	struct sh_keysc_priv *priv;
-	struct sh_keysc_info *pdata;
-	struct resource *res;
-	struct input_dev *input;
-	int i;
-	int irq, error;
-
-	if (!dev_get_platdata(&pdev->dev)) {
-		dev_err(&pdev->dev, "no platform data defined\n");
-		error = -EINVAL;
-		goto err0;
-	}
-
-	error = -ENXIO;
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (res == NULL) {
-		dev_err(&pdev->dev, "failed to get I/O memory\n");
-		goto err0;
-	}
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(&pdev->dev, "failed to get irq\n");
-		goto err0;
-	}
-
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (priv == NULL) {
-		dev_err(&pdev->dev, "failed to allocate driver data\n");
-		error = -ENOMEM;
-		goto err0;
-	}
-
-	platform_set_drvdata(pdev, priv);
-	memcpy(&priv->pdata, dev_get_platdata(&pdev->dev), sizeof(priv->pdata));
-	pdata = &priv->pdata;
-
-	priv->iomem_base = ioremap_nocache(res->start, resource_size(res));
-	if (priv->iomem_base == NULL) {
-		dev_err(&pdev->dev, "failed to remap I/O memory\n");
-		error = -ENXIO;
-		goto err1;
-	}
-
-	priv->input = input_allocate_device();
-	if (!priv->input) {
-		dev_err(&pdev->dev, "failed to allocate input device\n");
-		error = -ENOMEM;
-		goto err2;
-	}
-
-	input = priv->input;
-	input->evbit[0] = BIT_MASK(EV_KEY);
-
-	input->name = pdev->name;
-	input->phys = "sh-keysc-keys/input0";
-	input->dev.parent = &pdev->dev;
-
-	input->id.bustype = BUS_HOST;
-	input->id.vendor = 0x0001;
-	input->id.product = 0x0001;
-	input->id.version = 0x0100;
-
-	input->keycode = pdata->keycodes;
-	input->keycodesize = sizeof(pdata->keycodes[0]);
-	input->keycodemax = ARRAY_SIZE(pdata->keycodes);
-
-	error = request_threaded_irq(irq, NULL, sh_keysc_isr, IRQF_ONESHOT,
-				     dev_name(&pdev->dev), pdev);
-	if (error) {
-		dev_err(&pdev->dev, "failed to request IRQ\n");
-		goto err3;
-	}
-
-	for (i = 0; i < SH_KEYSC_MAXKEYS; i++)
-		__set_bit(pdata->keycodes[i], input->keybit);
-	__clear_bit(KEY_RESERVED, input->keybit);
-
-	error = input_register_device(input);
-	if (error) {
-		dev_err(&pdev->dev, "failed to register input device\n");
-		goto err4;
-	}
-
-	pm_runtime_enable(&pdev->dev);
-	pm_runtime_get_sync(&pdev->dev);
-
-	sh_keysc_write(priv, KYCR1, (sh_keysc_mode[pdata->mode].kymd << 8) |
-		       pdata->scan_timing);
-	sh_keysc_level_mode(priv, 0);
-
-	device_init_wakeup(&pdev->dev, 1);
-
-	return 0;
-
- err4:
-	free_irq(irq, pdev);
- err3:
-	input_free_device(input);
- err2:
-	iounmap(priv->iomem_base);
- err1:
-	kfree(priv);
- err0:
-	return error;
-}
-
-static int sh_keysc_remove(struct platform_device *pdev)
-{
-	struct sh_keysc_priv *priv = platform_get_drvdata(pdev);
-
-	sh_keysc_write(priv, KYCR2, KYCR2_IRQ_DISABLED);
-
-	input_unregister_device(priv->input);
-	free_irq(platform_get_irq(pdev, 0), pdev);
-	iounmap(priv->iomem_base);
-
-	pm_runtime_put_sync(&pdev->dev);
-	pm_runtime_disable(&pdev->dev);
-
-	kfree(priv);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int sh_keysc_suspend(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct sh_keysc_priv *priv = platform_get_drvdata(pdev);
-	int irq = platform_get_irq(pdev, 0);
-	unsigned short value;
-
-	value = sh_keysc_read(priv, KYCR1);
-
-	if (device_may_wakeup(dev)) {
-		sh_keysc_write(priv, KYCR1, value | 0x80);
-		enable_irq_wake(irq);
-	} else {
-		sh_keysc_write(priv, KYCR1, value & ~0x80);
-		pm_runtime_put_sync(dev);
-	}
-
-	return 0;
-}
-
-static int sh_keysc_resume(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	int irq = platform_get_irq(pdev, 0);
-
-	if (device_may_wakeup(dev))
-		disable_irq_wake(irq);
-	else
-		pm_runtime_get_sync(dev);
-
-	return 0;
-}
-#endif
-
-static SIMPLE_DEV_PM_OPS(sh_keysc_dev_pm_ops,
-			 sh_keysc_suspend, sh_keysc_resume);
-
-static struct platform_driver sh_keysc_device_driver = {
-	.probe		= sh_keysc_probe,
-	.remove		= sh_keysc_remove,
-	.driver		= {
-		.name	= "sh_keysc",
-		.pm	= &sh_keysc_dev_pm_ops,
-	}
-};
-module_platform_driver(sh_keysc_device_driver);
-
-MODULE_AUTHOR("Magnus Damm");
-MODULE_DESCRIPTION("SuperH KEYSC Keypad Driver");
-MODULE_LICENSE("GPL");
+T_MASK 0x780
+#define MC_HUB_WDP_CPF__MAXBURST__SHIFT 0x7
+#define MC_HUB_WDP_CPF__LAZY_TIMER_MASK 0x7800
+#define MC_HUB_WDP_CPF__LAZY_TIMER__SHIFT 0xb
+#define MC_HUB_WDP_CPF__STALL_OVERRIDE_WTM_MASK 0x8000
+#define MC_HUB_WDP_CPF__STALL_OVERRIDE_WTM__SHIFT 0xf
+#define MC_RPB_CONF__XPB_PCIE_ORDER_MASK 0x8000
+#define MC_RPB_CONF__XPB_PCIE_ORDER__SHIFT 0xf
+#define MC_RPB_CONF__RPB_RD_PCIE_ORDER_MASK 0x10000
+#define MC_RPB_CONF__RPB_RD_PCIE_ORDER__SHIFT 0x10
+#define MC_RPB_CONF__RPB_WR_PCIE_ORDER_MASK 0x20000
+#define MC_RPB_CONF__RPB_WR_PCIE_ORDER__SHIFT 0x11
+#define MC_RPB_IF_CONF__RPB_BIF_CREDITS_MASK 0xff
+#define MC_RPB_IF_CONF__RPB_BIF_CREDITS__SHIFT 0x0
+#define MC_RPB_IF_CONF__OUTSTANDING_WRRET_ASK_MASK 0xff00
+#define MC_RPB_IF_CONF__OUTSTANDING_WRRET_ASK__SHIFT 0x8
+#define MC_RPB_DBG1__RPB_BIF_OUTSTANDING_RD_MASK 0xff
+#define MC_RPB_DBG1__RPB_BIF_OUTSTANDING_RD__SHIFT 0x0
+#define MC_RPB_DBG1__RPB_BIF_OUTSTANDING_RD_32B_MASK 0xfff00
+#define MC_RPB_DBG1__RPB_BIF_OUTSTANDING_RD_32B__SHIFT 0x8
+#define MC_RPB_DBG1__DEBUG_BITS_MASK 0xfff00000
+#define MC_RPB_DBG1__DEBUG_BITS__SHIFT 0x14
+#define MC_RPB_EFF_CNTL__WR_LAZY_TIMER_MASK 0xff
+#define MC_RPB_EFF_CNTL__WR_LAZY_TIMER__SHIFT 0x0
+#define MC_RPB_EFF_CNTL__RD_LAZY_TIMER_MASK 0xff00
+#define MC_RPB_EFF_CNTL__RD_LAZY_TIMER__SHIFT 0x8
+#define MC_RPB_ARB_CNTL__WR_SWITCH_NUM_MASK 0xff
+#define MC_RPB_ARB_CNTL__WR_SWITCH_NUM__SHIFT 0x0
+#define MC_RPB_ARB_CNTL__RD_SWITCH_NUM_MASK 0xff00
+#define MC_RPB_ARB_CNTL__RD_SWITCH_NUM__SHIFT 0x8
+#define MC_RPB_ARB_CNTL__ATC_SWITCH_NUM_MASK 0xff0000
+#define MC_RPB_ARB_CNTL__ATC_SWITCH_NUM__SHIFT 0x10
+#define MC_RPB_BIF_CNTL__ARB_SWITCH_NUM_MASK 0xff
+#define MC_RPB_BIF_CNTL__ARB_SWITCH_NUM__SHIFT 0x0
+#define MC_RPB_BIF_CNTL__XPB_SWITCH_NUM_MASK 0xff00
+#define MC_RPB_BIF_CNTL__XPB_SWITCH_NUM__SHIFT 0x8
+#define MC_RPB_WR_SWITCH_CNTL__QUEUE0_SWITCH_NUM_MASK 0xff
+#define MC_RPB_WR_SWITCH_CNTL__QUEUE0_SWITCH_NUM__SHIFT 0x0
+#define MC_RPB_WR_SWITCH_CNTL__QUEUE1_SWITCH_NUM_MASK 0xff00
+#define MC_RPB_WR_SWITCH_CNTL__QUEUE1_SWITCH_NUM__SHIFT 0x8
+#define MC_RPB_WR_SWITCH_CNTL__QUEUE2_SWITCH_NUM_MASK 0xff0000
+#define MC_RPB_WR_SWITCH_CNTL__QUEUE2_SWITCH_NUM__SHIFT 0x10
+#define MC_RPB_WR_SWITCH_CNTL__QUEUE3_SWITCH_NUM_MASK 0xff000000
+#define MC_RPB_WR_SWITCH_CNTL__QUEUE3_SWITCH_NUM__SHIFT 0x18
+#define MC_RPB_WR_COMBINE_CNTL__WC_ENABLE_MASK 0x1
+#define MC_RPB_WR_COMBINE_CNTL__WC_ENABLE__SHIFT 0x0
+#define MC_RPB_WR_COMBINE_CNTL__WC_MAX_PACKET_SIZE_MASK 0x6
+#define MC_RPB_WR_COMBINE_CNTL__WC_MAX_PACKET_SIZE__SHIFT 0x1
+#define MC_RPB_WR_COMBINE_CNTL__WC_FLUSH_TIMER_MASK 0x78
+#define MC_RPB_WR_COMBINE_CNTL__WC_FLUSH_TIMER__SHIFT 0x3
+#define MC_RPB_WR_COMBINE_CNTL__WC_ALIGN_MASK 0x80
+#define MC_RPB_WR_COMBINE_CNTL__WC_ALIGN__SHIFT 0x7
+#define MC_RPB_RD_SWITCH_CNTL__QUEUE0_SWITCH_NUM_MASK 0xff
+#define MC_RPB_RD_SWITCH_CNTL__QUEUE0_SWITCH_NUM__SHIFT 0x0
+#define MC_RPB_RD_SWITCH_CNTL__QUEUE1_SWITCH_NUM_MASK 0xff00
+#define MC_RPB_RD_SWITCH_CNTL__QUEUE1_SWITCH_NUM__SHIFT 0x8
+#define MC_RPB_RD_SWITCH_CNTL__QUEUE2_SWITCH_NUM_MASK 0xff0000
+#define MC_RPB_RD_SWITCH_CNTL__QUEUE2_SWITCH_NUM__SHIFT 0x10
+#define MC_RPB_RD_SWITCH_CNTL__QUEUE3_SWITCH_NUM_MASK 0xff000000
+#define MC_RPB_RD_SWITCH_CNTL__QUEUE3_SWITCH_NUM__SHIFT 0x18
+#define MC_RPB_CID_QUEUE_WR__CLIENT_ID_MASK 0xff
+#define MC_RPB_CID_QUEUE_WR__CLIENT_ID__SHIFT 0x0
+#define MC_RPB_CID_QUEUE_WR__UPDATE_MODE_MASK 0x100
+#define MC_RPB_CID_QUEUE_WR__UPDATE_MODE__SHIFT 0x8
+#define MC_RPB_CID_QUEUE_WR__WRITE_QUEUE_MASK 0x600
+#define MC_RPB_CID_QUEUE_WR__WRITE_QUEUE__SHIFT 0x9
+#define MC_RPB_CID_QUEUE_WR__READ_QUEUE_MASK 0x1800
+#define MC_RPB_CID_QUEUE_WR__READ_QUEUE__SHIFT 0xb
+#define MC_RPB_CID_QUEUE_WR__UPDATE_MASK 0x2000
+#define MC_RPB_CID_QUEUE_WR__UPDATE__SHIFT 0xd
+#define MC_RPB_CID_QUEUE_RD__CLIENT_ID_MASK 0xff
+#define MC_RPB_CID_QUEUE_RD__CLIENT_ID__SHIFT 0x0
+#define MC_RPB_CID_QUEUE_RD__WRITE_QUEUE_MASK 0x300
+#define MC_RPB_CID_QUEUE_RD__WRITE_QUEUE__SHIFT 0x8
+#define MC_RPB_CID_QUEUE_RD__READ_QUEUE_MASK 0xc00
+#define MC_RPB_CID_QUEUE_RD__READ_QUEUE__SHIFT 0xa
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_SELECT_MASK 0x3
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_SELECT__SHIFT 0x0
+#define MC_RPB_PERF_COUNTER_CNTL__CLEAR_SELECTED_PERF_COUNTER_MASK 0x4
+#define MC_RPB_PERF_COUNTER_CNTL__CLEAR_SELECTED_PERF_COUNTER__SHIFT 0x2
+#define MC_RPB_PERF_COUNTER_CNTL__CLEAR_ALL_PERF_COUNTERS_MASK 0x8
+#define MC_RPB_PERF_COUNTER_CNTL__CLEAR_ALL_PERF_COUNTERS__SHIFT 0x3
+#define MC_RPB_PERF_COUNTER_CNTL__STOP_ON_COUNTER_SATURATION_MASK 0x10
+#define MC_RPB_PERF_COUNTER_CNTL__STOP_ON_COUNTER_SATURATION__SHIFT 0x4
+#define MC_RPB_PERF_COUNTER_CNTL__ENABLE_PERF_COUNTERS_MASK 0x1e0
+#define MC_RPB_PERF_COUNTER_CNTL__ENABLE_PERF_COUNTERS__SHIFT 0x5
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_ASSIGN_0_MASK 0x3e00
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_ASSIGN_0__SHIFT 0x9
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_ASSIGN_1_MASK 0x7c000
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_ASSIGN_1__SHIFT 0xe
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_ASSIGN_2_MASK 0xf80000
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_ASSIGN_2__SHIFT 0x13
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_ASSIGN_3_MASK 0x1f000000
+#define MC_RPB_PERF_COUNTER_CNTL__PERF_COUNTER_ASSIGN_3__SHIFT 0x18
+#define MC_RPB_PERF_COUNTER_STATUS__PERFORMANCE_COUNTER_VALUE_MASK 0xffffffff
+#define MC_RPB_PERF_COUNTER_STATUS__PERFORMANCE_COUNTER_VALUE__SHIFT 0x0
+#define MC_RPB_CID_QUEUE_EX__START_MASK 0x1
+#define MC_RPB_CID_QUEUE_EX__START__SHIFT 0x0
+#define MC_RPB_CID_QUEUE_EX__OFFSET_MASK 0x3e
+#define MC_RPB_CID_QUEUE_EX__OFFSET__SHIFT 0x1
+#define MC_RPB_CID_QUEUE_EX_DATA__WRITE_ENTRIES_MASK 0xffff
+#define MC_RPB_CID_QUEUE_EX_DATA__WRITE_ENTRIES__SHIFT 0x0
+#define MC_RPB_CID_QUEUE_EX_DATA__READ_ENTRIES_MASK 0xffff0000
+#define MC_RPB_CID_QUEUE_EX_DATA__READ_ENTRIES__SHIFT 0x10
+#define MC_SHARED_CHMAP__CHAN0_MASK 0xf
+#define MC_SHARED_CHMAP__CHAN0__SHIFT 0x0
+#define MC_SHARED_CHMAP__CHAN1_MASK 0xf0
+#define MC_SHARED_CHMAP__CHAN1__SHIFT 0x4
+#define MC_SHARED_CHMAP__CHAN2_MASK 0xf00
+#define MC_SHARED_CHMAP__CHAN2__SHIFT 0x8
+#define MC_SHARED_CHMAP__NOOFCHAN_MASK 0xf000
+#define MC_SHARED_CHMAP__NOOFCHAN__SHIFT 0xc
+#define MC_SHARED_CHREMAP__CHAN0_MASK 0x7
+#define MC_SHARED_CHREMAP__CHAN0__SHIFT 0x0
+#define MC_SHARED_CHREMAP__CHAN1_MASK 0x38
+#define MC_SHARED_CHREMAP__CHAN1__SHIFT 0x3
+#define MC_SHARED_CHREMAP__CHAN2_MASK 0x1c0
+#define MC_SHARED_CHREMAP__CHAN2__SHIFT 0x6
+#define MC_SHARED_CHREMAP__CHAN3_MASK 0xe00
+#define MC_SHARED_CHREMAP__CHAN3__SHIFT 0x9
+#define MC_SHARED_CHREMAP__CHAN4_MASK 0x7000
+#define MC_SHARED_CHREMAP__CHAN4__SHIFT 0xc
+#define MC_SHARED_CHREMAP__CHAN5_MASK 0x38000
+#define MC_SHARED_CHREMAP__CHAN5__SHIFT 0xf
+#define MC_SHARED_CHREMAP__CHAN6_MASK 0x1c0000
+#define MC_SHARED_CHREMAP__CHAN6__SHIFT 0x12
+#define MC_SHARED_CHREMAP__CHAN7_MASK 0xe00000
+#define MC_SHARED_CHREMAP__CHAN7__SHIFT 0x15
+#define MC_RD_GRP_GFX__CP_MASK 0xf
+#define MC_RD_GRP_GFX__CP__SHIFT 0x0
+#define MC_RD_GRP_GFX__SH_MASK 0xf0
+#define MC_RD_GRP_GFX__SH__SHIFT 0x4
+#define MC_RD_GRP_GFX__IA_MASK 0xf00
+#define MC_RD_GRP_GFX__IA__SHIFT 0x8
+#define MC_RD_GRP_GFX__ACPG_MASK 0xf000
+#define MC_RD_GRP_GFX__ACPG__SHIFT 0xc
+#define MC_RD_GRP_GFX__ACPO_MASK 0xf0000
+#define MC_RD_GRP_GFX__ACPO__SHIFT 0x10
+#define MC_RD_GRP_GFX__XDMAM_MASK 0xf00000
+#define MC_RD_GRP_GFX__XDMAM__SHIFT 0x14
+#define MC_WR_GRP_GFX__CP_MASK 0xf
+#define MC_WR_GRP_GFX__CP__SHIFT 0x0
+#define MC_WR_GRP_GFX__SH_MASK 0xf0
+#define MC_WR_GRP_GFX__SH__SHIFT 0x4
+#define MC_WR_GRP_GFX__ACPG_MASK 0xf00
+#define MC_WR_GRP_GFX__ACPG__SHIFT 0x8
+#define MC_WR_GRP_GFX__ACPO_MASK 0xf000
+#define MC_WR_GRP_GFX__ACPO__SHIFT 0xc
+#define MC_WR_GRP_GFX__XDMA_MASK 0xf0000
+#define MC_WR_GRP_GFX__XDMA__SHIFT 0x10
+#define MC_WR_GRP_GFX__XDMAM_MASK 0xf00000
+#define MC_WR_GRP_GFX__XDMAM__SHIFT 0x14
+#define MC_RD_GRP_SYS__RLC_MASK 0xf
+#define MC_RD_GRP_SYS__RLC__SHIFT 0x0
+#define MC_RD_GRP_SYS__VMC_MASK 0xf0
+#define MC_RD_GRP_SYS__VMC__SHIFT 0x4
+#define MC_RD_GRP_SYS__SDMA1_MASK 0xf00
+#define MC_RD_GRP_SYS__SDMA1__SHIFT 0x8
+#define MC_RD_GRP_SYS__DMIF_MASK 0xf000
+#define MC_RD_GRP_SYS__DM

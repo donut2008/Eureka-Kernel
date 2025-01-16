@@ -1,75 +1,53 @@
-/*
- * MSB0 numbered special bitops handling.
- *
- * The bits are numbered:
- *   |0..............63|64............127|128...........191|192...........255|
- *
- * The reason for this bit numbering is the fact that the hardware sets bits
- * in a bitmap starting at bit 0 (MSB) and we don't want to scan the bitmap
- * from the 'wrong end'.
- */
+		      struct ib_mw_bind *mw_bind);
+	int                        (*dealloc_mw)(struct ib_mw *mw);
+	struct ib_fmr *	           (*alloc_fmr)(struct ib_pd *pd,
+						int mr_access_flags,
+						struct ib_fmr_attr *fmr_attr);
+	int		           (*map_phys_fmr)(struct ib_fmr *fmr,
+						   u64 *page_list, int list_len,
+						   u64 iova);
+	int		           (*unmap_fmr)(struct list_head *fmr_list);
+	int		           (*dealloc_fmr)(struct ib_fmr *fmr);
+	int                        (*attach_mcast)(struct ib_qp *qp,
+						   union ib_gid *gid,
+						   u16 lid);
+	int                        (*detach_mcast)(struct ib_qp *qp,
+						   union ib_gid *gid,
+						   u16 lid);
+	int                        (*process_mad)(struct ib_device *device,
+						  int process_mad_flags,
+						  u8 port_num,
+						  const struct ib_wc *in_wc,
+						  const struct ib_grh *in_grh,
+						  const struct ib_mad_hdr *in_mad,
+						  size_t in_mad_size,
+						  struct ib_mad_hdr *out_mad,
+						  size_t *out_mad_size,
+						  u16 *out_mad_pkey_index);
+	struct ib_xrcd *	   (*alloc_xrcd)(struct ib_device *device,
+						 struct ib_ucontext *ucontext,
+						 struct ib_udata *udata);
+	int			   (*dealloc_xrcd)(struct ib_xrcd *xrcd);
+	struct ib_flow *	   (*create_flow)(struct ib_qp *qp,
+						  struct ib_flow_attr
+						  *flow_attr,
+						  int domain);
+	int			   (*destroy_flow)(struct ib_flow *flow_id);
+	int			   (*check_mr_status)(struct ib_mr *mr, u32 check_mask,
+						      struct ib_mr_status *mr_status);
+	void			   (*disassociate_ucontext)(struct ib_ucontext *ibcontext);
 
-#include <linux/compiler.h>
-#include <linux/bitops.h>
-#include <linux/export.h>
+	struct ib_dma_mapping_ops   *dma_ops;
 
-unsigned long find_first_bit_inv(const unsigned long *addr, unsigned long size)
-{
-	const unsigned long *p = addr;
-	unsigned long result = 0;
-	unsigned long tmp;
+	struct module               *owner;
+	struct device                dev;
+	struct kobject               *ports_parent;
+	struct list_head             port_list;
 
-	while (size & ~(BITS_PER_LONG - 1)) {
-		if ((tmp = *(p++)))
-			goto found;
-		result += BITS_PER_LONG;
-		size -= BITS_PER_LONG;
-	}
-	if (!size)
-		return result;
-	tmp = (*p) & (~0UL << (BITS_PER_LONG - size));
-	if (!tmp)		/* Are any bits set? */
-		return result + size;	/* Nope. */
-found:
-	return result + (__fls(tmp) ^ (BITS_PER_LONG - 1));
-}
-EXPORT_SYMBOL(find_first_bit_inv);
+	enum {
+		IB_DEV_UNINITIALIZED,
+		IB_DEV_REGISTERED,
+		IB_DEV_UNREGISTERED
+	}                            reg_state;
 
-unsigned long find_next_bit_inv(const unsigned long *addr, unsigned long size,
-				unsigned long offset)
-{
-	const unsigned long *p = addr + (offset / BITS_PER_LONG);
-	unsigned long result = offset & ~(BITS_PER_LONG - 1);
-	unsigned long tmp;
-
-	if (offset >= size)
-		return size;
-	size -= result;
-	offset %= BITS_PER_LONG;
-	if (offset) {
-		tmp = *(p++);
-		tmp &= (~0UL >> offset);
-		if (size < BITS_PER_LONG)
-			goto found_first;
-		if (tmp)
-			goto found_middle;
-		size -= BITS_PER_LONG;
-		result += BITS_PER_LONG;
-	}
-	while (size & ~(BITS_PER_LONG-1)) {
-		if ((tmp = *(p++)))
-			goto found_middle;
-		result += BITS_PER_LONG;
-		size -= BITS_PER_LONG;
-	}
-	if (!size)
-		return result;
-	tmp = *p;
-found_first:
-	tmp &= (~0UL << (BITS_PER_LONG - size));
-	if (!tmp)		/* Are any bits set? */
-		return result + size;	/* Nope. */
-found_middle:
-	return result + (__fls(tmp) ^ (BITS_PER_LONG - 1));
-}
-EXPORT_SYMBOL(find_next_bit_inv);
+	int			   

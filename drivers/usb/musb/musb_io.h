@@ -1,70 +1,68 @@
-/*
- * MUSB OTG driver register I/O
- *
- * Copyright 2005 Mentor Graphics Corporation
- * Copyright (C) 2005-2006 by Texas Instruments
- * Copyright (C) 2006-2007 Nokia Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- */
+ne ATOM_ENCODER_CONFIG_V2_TRANSMITTER3                0x10
 
-#ifndef __MUSB_LINUX_PLATFORM_ARCH_H__
-#define __MUSB_LINUX_PLATFORM_ARCH_H__
+// ucAction:
+// ATOM_DISABLE
+// ATOM_ENABLE
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_START       0x08
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_PATTERN1    0x09
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_PATTERN2    0x0a
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_PATTERN3    0x13
+#define ATOM_ENCODER_CMD_DP_LINK_TRAINING_COMPLETE    0x0b
+#define ATOM_ENCODER_CMD_DP_VIDEO_OFF                 0x0c
+#define ATOM_ENCODER_CMD_DP_VIDEO_ON                  0x0d
+#define ATOM_ENCODER_CMD_QUERY_DP_LINK_TRAINING_STATUS    0x0e
+#define ATOM_ENCODER_CMD_SETUP                        0x0f
+#define ATOM_ENCODER_CMD_SETUP_PANEL_MODE            0x10
 
-#include <linux/io.h>
+// ucStatus
+#define ATOM_ENCODER_STATUS_LINK_TRAINING_COMPLETE    0x10
+#define ATOM_ENCODER_STATUS_LINK_TRAINING_INCOMPLETE  0x00
 
-#define musb_ep_select(_mbase, _epnum)	musb->io.ep_select((_mbase), (_epnum))
-
-/**
- * struct musb_io - IO functions for MUSB
- * @quirks:	platform specific flags
- * @ep_offset:	platform specific function to get end point offset
- * @ep_select:	platform specific function to select end point
- * @fifo_offset: platform specific function to get fifo offset
- * @read_fifo:	platform specific function to read fifo
- * @write_fifo:	platform specific function to write fifo
- * @busctl_offset: platform specific function to get busctl offset
- */
-struct musb_io {
-	u32	quirks;
-	u32	(*ep_offset)(u8 epnum, u16 offset);
-	void	(*ep_select)(void __iomem *mbase, u8 epnum);
-	u32	(*fifo_offset)(u8 epnum);
-	void	(*read_fifo)(struct musb_hw_ep *hw_ep, u16 len, u8 *buf);
-	void	(*write_fifo)(struct musb_hw_ep *hw_ep, u16 len, const u8 *buf);
-	u32	(*busctl_offset)(u8 epnum, u16 offset);
-};
-
-/* Do not add new entries here, add them the struct musb_io instead */
-extern u8 (*musb_readb)(const void __iomem *addr, unsigned offset);
-extern void (*musb_writeb)(void __iomem *addr, unsigned offset, u8 data);
-extern u16 (*musb_readw)(const void __iomem *addr, unsigned offset);
-extern void (*musb_writew)(void __iomem *addr, unsigned offset, u16 data);
-extern u32 (*musb_readl)(const void __iomem *addr, unsigned offset);
-extern void (*musb_writel)(void __iomem *addr, unsigned offset, u32 data);
-
+//ucTableFormatRevision=1
+//ucTableContentRevision=3
+// Following function ENABLE sub-function will be used by driver when TMDS/HDMI/LVDS is used, disable function will be used by driver
+typedef struct _ATOM_DIG_ENCODER_CONFIG_V3
+{
+#if ATOM_BIG_ENDIAN
+    UCHAR ucReserved1:1;
+    UCHAR ucDigSel:3;             // =0/1/2/3/4/5: DIG0/1/2/3/4/5 (In register spec also referred as DIGA/B/C/D/E/F)
+    UCHAR ucReserved:3;
+    UCHAR ucDPLinkRate:1;         // =0: 1.62Ghz, =1: 2.7Ghz
+#else
+    UCHAR ucDPLinkRate:1;         // =0: 1.62Ghz, =1: 2.7Ghz
+    UCHAR ucReserved:3;
+    UCHAR ucDigSel:3;             // =0/1/2/3/4/5: DIG0/1/2/3/4/5 (In register spec also referred as DIGA/B/C/D/E/F)
+    UCHAR ucReserved1:1;
 #endif
+}ATOM_DIG_ENCODER_CONFIG_V3;
+
+#define ATOM_ENCODER_CONFIG_V3_DPLINKRATE_MASK            0x03
+#define ATOM_ENCODER_CONFIG_V3_DPLINKRATE_1_62GHZ        0x00
+#define ATOM_ENCODER_CONFIG_V3_DPLINKRATE_2_70GHZ        0x01
+#define ATOM_ENCODER_CONFIG_V3_ENCODER_SEL                 0x70
+#define ATOM_ENCODER_CONFIG_V3_DIG0_ENCODER                 0x00
+#define ATOM_ENCODER_CONFIG_V3_DIG1_ENCODER                 0x10
+#define ATOM_ENCODER_CONFIG_V3_DIG2_ENCODER                 0x20
+#define ATOM_ENCODER_CONFIG_V3_DIG3_ENCODER                 0x30
+#define ATOM_ENCODER_CONFIG_V3_DIG4_ENCODER                 0x40
+#define ATOM_ENCODER_CONFIG_V3_DIG5_ENCODER                 0x50
+
+typedef struct _DIG_ENCODER_CONTROL_PARAMETERS_V3
+{
+  USHORT usPixelClock;      // in 10KHz; for bios convenient
+  ATOM_DIG_ENCODER_CONFIG_V3 acConfig;
+  UCHAR ucAction;
+  union{
+    UCHAR ucEncoderMode;
+                            // =0: DP   encoder
+                            // =1: LVDS encoder
+                            // =2: DVI  encoder
+                            // =3: HDMI encoder
+                            // =4: SDVO encoder
+                            // =5: DP audio
+    UCHAR ucPanelMode;        // only valid when ucAction == ATOM_ENCODER_CMD_SETUP_PANEL_MODE
+                            // =0:     external DP
+                            // =0x1:   internal DP2
+                            // =0x11:  internal DP1 for NutMeg/Travis DP translator
+  };
+  UCHAR ucLaneNum;          // how many lanes to 

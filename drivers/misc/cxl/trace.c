@@ -1,13 +1,6 @@
-/*
- * Copyright 2015 IBM Corp.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
- */
-
-#ifndef __CHECKER__
-#define CREATE_TRACE_POINTS
-#include "trace.h"
-#endif
+RX_LANE11_CTRL_REG0__RX_CFG_OVR_PWRSF_11_MASK 0x2000
+#define PB1_RX_LANE11_CTRL_REG0__RX_CFG_OVR_PWRSF_11__SHIFT 0xd
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__RXPWR_11_MASK 0x7
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__RXPWR_11__SHIFT 0x0
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__ELECIDLEDETEN_11_MASK 0x8
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__ELECIDLEDETEN_11

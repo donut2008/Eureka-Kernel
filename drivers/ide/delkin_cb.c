@@ -1,181 +1,149 @@
-/*
- *  Created 20 Oct 2004 by Mark Lord
- *
- *  Basic support for Delkin/ASKA/Workbit Cardbus CompactFlash adapter
- *
- *  Modeled after the 16-bit PCMCIA driver: ide-cs.c
- *
- *  This is slightly peculiar, in that it is a PCI driver,
- *  but is NOT an IDE PCI driver -- the IDE layer does not directly
- *  support hot insertion/removal of PCI interfaces, so this driver
- *  is unable to use the IDE PCI interfaces.  Instead, it uses the
- *  same interfaces as the ide-cs (PCMCIA) driver uses.
- *  On the plus side, the driver is also smaller/simpler this way.
- *
- *  This file is subject to the terms and conditions of the GNU General Public
- *  License.  See the file COPYING in the main directory of this archive for
- *  more details.
- */
+ring_ent(ioat_chan, idx + i);
+		pq = desc->pq;
 
-#include <linux/types.h>
-#include <linux/module.h>
-#include <linux/ide.h>
-#include <linux/init.h>
-#include <linux/pci.h>
+		/* save a branch by unconditionally retrieving the
+		 * extended descriptor pq_set_src() knows to not write
+		 * to it in the single descriptor case
+		 */
+		ext = ioat_get_ring_ent(ioat_chan, idx + i + with_ext);
+		pq_ex = ext->pq_ex;
 
-#include <asm/io.h>
+		descs[0] = (struct ioat_raw_descriptor *) pq;
+		descs[1] = (struct ioat_raw_descriptor *) pq_ex;
 
-/*
- * No chip documentation has yet been found,
- * so these configuration values were pulled from
- * a running Win98 system using "debug".
- * This gives around 3MByte/second read performance,
- * which is about 2/3 of what the chip is capable of.
- *
- * There is also a 4KByte mmio region on the card,
- * but its purpose has yet to be reverse-engineered.
- */
-static const u8 setup[] = {
-	0x00, 0x05, 0xbe, 0x01, 0x20, 0x8f, 0x00, 0x00,
-	0xa4, 0x1f, 0xb3, 0x1b, 0x00, 0x00, 0x00, 0x80,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0xa4, 0x83, 0x02, 0x13,
-};
+		for (s = 0; s < src_cnt; s++)
+			pq_set_src(descs, src[s], offset, scf[s], s);
 
-static const struct ide_port_ops delkin_cb_port_ops = {
-	.quirkproc		= ide_undecoded_slave,
-};
+		/* see the comment for dma_maxpq in include/linux/dmaengine.h */
+		if (dmaf_p_disabled_continue(flags))
+			pq_set_src(descs, dst[1], offset, 1, s++);
+		else if (dmaf_continue(flags)) {
+			pq_set_src(descs, dst[0], offset, 0, s++);
+			pq_set_src(descs, dst[1], offset, 1, s++);
+			pq_set_src(descs, dst[1], offset, 0, s++);
+		}
+		pq->size = xfer_size;
+		pq->p_addr = dst[0] + offset;
+		pq->q_addr = dst[1] + offset;
+		pq->ctl = 0;
+		pq->ctl_f.op = op;
+		/* we turn on descriptor write back error status */
+		if (ioat_dma->cap & IOAT_CAP_DWBES)
+			pq->ctl_f.wb_en = result ? 1 : 0;
+		pq->ctl_f.src_cnt = src_cnt_to_hw(s);
+		pq->ctl_f.p_disable = !!(flags & DMA_PREP_PQ_DISABLE_P);
+		pq->ctl_f.q_disable = !!(flags & DMA_PREP_PQ_DISABLE_Q);
 
-static int delkin_cb_init_chipset(struct pci_dev *dev)
-{
-	unsigned long base = pci_resource_start(dev, 0);
-	int i;
+		len -= xfer_size;
+		offset += xfer_size;
+	} while ((i += 1 + with_ext) < num_descs);
 
-	outb(0x02, base + 0x1e);	/* set nIEN to block interrupts */
-	inb(base + 0x17);		/* read status to clear interrupts */
+	/* last pq descriptor carries the unmap parameters and fence bit */
+	desc->txd.flags = flags;
+	desc->len = total_len;
+	if (result)
+		desc->result = result;
+	pq->ctl_f.fence = !!(flags & DMA_PREP_FENCE);
+	dump_pq_desc_dbg(ioat_chan, desc, ext);
 
-	for (i = 0; i < sizeof(setup); ++i) {
-		if (setup[i])
-			outb(setup[i], base + i);
+	if (!cb32) {
+		pq->ctl_f.int_en = !!(flags & DMA_PREP_INTERRUPT);
+		pq->ctl_f.compl_write = 1;
+		compl_desc = desc;
+	} else {
+		/* completion descriptor carries interrupt bit */
+		compl_desc = ioat_get_ring_ent(ioat_chan, idx + i);
+		compl_desc->txd.flags = flags & DMA_PREP_INTERRUPT;
+		hw = compl_desc->hw;
+		hw->ctl = 0;
+		hw->ctl_f.null = 1;
+		hw->ctl_f.int_en = !!(flags & DMA_PREP_INTERRUPT);
+		hw->ctl_f.compl_write = 1;
+		hw->size = NULL_DESC_BUFFER_SIZE;
+		dump_desc_dbg(ioat_chan, compl_desc);
 	}
 
-	return 0;
+
+	/* we leave the channel locked to ensure in order submission */
+	return &compl_desc->txd;
 }
 
-static const struct ide_port_info delkin_cb_port_info = {
-	.port_ops		= &delkin_cb_port_ops,
-	.host_flags		= IDE_HFLAG_IO_32BIT | IDE_HFLAG_UNMASK_IRQS |
-				  IDE_HFLAG_NO_DMA,
-	.irq_flags		= IRQF_SHARED,
-	.init_chipset		= delkin_cb_init_chipset,
-	.chipset		= ide_pci,
-};
-
-static int delkin_cb_probe(struct pci_dev *dev, const struct pci_device_id *id)
+static struct dma_async_tx_descriptor *
+__ioat_prep_pq16_lock(struct dma_chan *c, enum sum_check_flags *result,
+		       const dma_addr_t *dst, const dma_addr_t *src,
+		       unsigned int src_cnt, const unsigned char *scf,
+		       size_t len, unsigned long flags)
 {
-	struct ide_host *host;
-	unsigned long base;
-	int rc;
-	struct ide_hw hw, *hws[] = { &hw };
+	struct ioatdma_chan *ioat_chan = to_ioat_chan(c);
+	struct ioatdma_device *ioat_dma = ioat_chan->ioat_dma;
+	struct ioat_ring_ent *desc;
+	size_t total_len = len;
+	struct ioat_pq_descriptor *pq;
+	u32 offset = 0;
+	u8 op;
+	int i, s, idx, num_descs;
 
-	rc = pci_enable_device(dev);
-	if (rc) {
-		printk(KERN_ERR "delkin_cb: pci_enable_device failed (%d)\n", rc);
-		return rc;
-	}
-	rc = pci_request_regions(dev, "delkin_cb");
-	if (rc) {
-		printk(KERN_ERR "delkin_cb: pci_request_regions failed (%d)\n", rc);
-		pci_disable_device(dev);
-		return rc;
-	}
-	base = pci_resource_start(dev, 0);
+	/* this function is only called with 9-16 sources */
+	op = result ? IOAT_OP_PQ_VAL_16S : IOAT_OP_PQ_16S;
 
-	delkin_cb_init_chipset(dev);
+	dev_dbg(to_dev(ioat_chan), "%s\n", __func__);
 
-	memset(&hw, 0, sizeof(hw));
-	ide_std_init_ports(&hw, base + 0x10, base + 0x1e);
-	hw.irq = dev->irq;
-	hw.dev = &dev->dev;
+	num_descs = ioat_xferlen_to_descs(ioat_chan, len);
 
-	rc = ide_host_add(&delkin_cb_port_info, hws, 1, &host);
-	if (rc)
-		goto out_disable;
+	/*
+	 * 16 source pq is only available on cb3.3 and has no completion
+	 * write hw bug.
+	 */
+	if (num_descs && ioat_check_space_lock(ioat_chan, num_descs) == 0)
+		idx = ioat_chan->head;
+	else
+		return NULL;
 
-	pci_set_drvdata(dev, host);
+	i = 0;
 
-	return 0;
+	do {
+		struct ioat_raw_descriptor *descs[4];
+		size_t xfer_size = min_t(size_t, len,
+					 1 << ioat_chan->xfercap_log);
 
-out_disable:
-	pci_release_regions(dev);
-	pci_disable_device(dev);
-	return rc;
-}
+		desc = ioat_get_ring_ent(ioat_chan, idx + i);
+		pq = desc->pq;
 
-static void
-delkin_cb_remove (struct pci_dev *dev)
-{
-	struct ide_host *host = pci_get_drvdata(dev);
+		descs[0] = (struct ioat_raw_descriptor *) pq;
 
-	ide_host_remove(host);
+		desc->sed = ioat3_alloc_sed(ioat_dma, (src_cnt-2) >> 3);
+		if (!desc->sed) {
+			dev_err(to_dev(ioat_chan),
+				"%s: no free sed entries\n", __func__);
+			return NULL;
+		}
 
-	pci_release_regions(dev);
-	pci_disable_device(dev);
-}
+		pq->sed_addr = desc->sed->dma;
+		desc->sed->parent = desc;
 
-#ifdef CONFIG_PM
-static int delkin_cb_suspend(struct pci_dev *dev, pm_message_t state)
-{
-	pci_save_state(dev);
-	pci_disable_device(dev);
-	pci_set_power_state(dev, pci_choose_state(dev, state));
+		descs[1] = (struct ioat_raw_descriptor *)desc->sed->hw;
+		descs[2] = (void *)descs[1] + 64;
 
-	return 0;
-}
+		for (s = 0; s < src_cnt; s++)
+			pq16_set_src(descs, src[s], offset, scf[s], s);
 
-static int delkin_cb_resume(struct pci_dev *dev)
-{
-	struct ide_host *host = pci_get_drvdata(dev);
-	int rc;
+		/* see the comment for dma_maxpq in include/linux/dmaengine.h */
+		if (dmaf_p_disabled_continue(flags))
+			pq16_set_src(descs, dst[1], offset, 1, s++);
+		else if (dmaf_continue(flags)) {
+			pq16_set_src(descs, dst[0], offset, 0, s++);
+			pq16_set_src(descs, dst[1], offset, 1, s++);
+			pq16_set_src(descs, dst[1], offset, 0, s++);
+		}
 
-	pci_set_power_state(dev, PCI_D0);
-
-	rc = pci_enable_device(dev);
-	if (rc)
-		return rc;
-
-	pci_restore_state(dev);
-	pci_set_master(dev);
-
-	if (host->init_chipset)
-		host->init_chipset(dev);
-
-	return 0;
-}
-#else
-#define delkin_cb_suspend NULL
-#define delkin_cb_resume NULL
-#endif
-
-static struct pci_device_id delkin_cb_pci_tbl[] = {
-	{ 0x1145, 0xf021, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0},
-	{ 0x1145, 0xf024, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0},
-	{ 0, },
-};
-MODULE_DEVICE_TABLE(pci, delkin_cb_pci_tbl);
-
-static struct pci_driver delkin_cb_pci_driver = {
-	.name		= "Delkin-ASKA-Workbit Cardbus IDE",
-	.id_table	= delkin_cb_pci_tbl,
-	.probe		= delkin_cb_probe,
-	.remove		= delkin_cb_remove,
-	.suspend	= delkin_cb_suspend,
-	.resume		= delkin_cb_resume,
-};
-
-module_pci_driver(delkin_cb_pci_driver);
-
-MODULE_AUTHOR("Mark Lord");
-MODULE_DESCRIPTION("Basic support for Delkin/ASKA/Workbit Cardbus IDE");
-MODULE_LICENSE("GPL");
-
+		pq->size = xfer_size;
+		pq->p_addr = dst[0] + offset;
+		pq->q_addr = dst[1] + offset;
+		pq->ctl = 0;
+		pq->ctl_f.op = op;
+		pq->ctl_f.src_cnt = src16_cnt_to_hw(s);
+		/* we turn on descriptor write back error status */
+		if (ioat_dma->cap & IOAT_CAP_DWBES)
+			pq->ctl_f.wb_en = result ? 1 : 0;
+		pq->ctl_f.p_disable = !!(flags & DMA_PREP_PQ_DISABLE_P);
+		pq->ctl_f.q_disable = !!

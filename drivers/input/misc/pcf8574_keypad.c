@@ -1,224 +1,133 @@
+7) target 22 (13) (15:11) */
+	le_val = (ppd->dd->cspec->r1 || IS_QME(ppd->dd)) ? 0xb6c0 : 0x6bac;
+	ibsd_wr_allchans(ppd, 21, le_val, 0xfffe);
+	/*       Enable VGA */
+	ibsd_wr_allchans(ppd, 5, 0, BMASK(0, 0));
+	msleep(20);
+	/*       Set Frequency Loop Bandwidth */
+	ibsd_wr_allchans(ppd, 2, (15 << 5), BMASK(8, 5));
+	/*       Enable Frequency Loop */
+	ibsd_wr_allchans(ppd, 2, (1 << 4), BMASK(4, 4));
+	/*       Set Timing Loop Bandwidth */
+	ibsd_wr_allchans(ppd, 2, 0, BMASK(11, 9));
+	/*       Enable Timing Loop */
+	ibsd_wr_allchans(ppd, 2, (1 << 3), BMASK(3, 3));
+	msleep(50);
+	/*       Enable DFE
+	 *       Set receive adaptation mode.  SDR and DDR adaptation are
+	 *       always on, and QDR is initially enabled; later disabled.
+	 */
+	qib_write_kreg_port(ppd, krp_static_adapt_dis(0), 0ULL);
+	qib_write_kreg_port(ppd, krp_static_adapt_dis(1), 0ULL);
+	qib_write_kreg_port(ppd, krp_static_adapt_dis(2),
+			    ppd->dd->cspec->r1 ?
+			    QDR_STATIC_ADAPT_DOWN_R1 : QDR_STATIC_ADAPT_DOWN);
+	ppd->cpspec->qdr_dfe_on = 1;
+	/*       Disable LE1  */
+	ibsd_wr_allchans(ppd, 13, (0 << 5), (1 << 5));
+	/*       Disable auto adapt for LE1 */
+	ibsd_wr_allchans(ppd, 1, (0 << 15), BMASK(15, 15));
+	msleep(20);
+	/*       Enable AFE Offset Cancel */
+	ibsd_wr_allchans(ppd, 12, (1 << 12), BMASK(12, 12));
+	/*       Enable Baseline Wander Correction */
+	ibsd_wr_allchans(ppd, 12, (1 << 13), BMASK(13, 13));
+	/* Termination: rxtermctrl_r2d addr 11 bits [12:11] = 1 */
+	ibsd_wr_allchans(ppd, 11, (1 << 11), BMASK(12, 11));
+	/* VGA output common mode */
+	ibsd_wr_allchans(ppd, 12, (3 << 2), BMASK(3, 2));
+
+	/*
+	 * Initialize the Tx DDS tables.  Also done every QSFP event,
+	 * for adapters with QSFP
+	 */
+	init_txdds_table(ppd, 0);
+
+	return 0;
+}
+
+/* start adjust QMH serdes parameters */
+
+static void set_man_code(struct qib_pportdata *ppd, int chan, int code)
+{
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), (chan + (chan >> 1)),
+		9, code << 9, 0x3f << 9);
+}
+
+static void set_man_mode_h1(struct qib_pportdata *ppd, int chan,
+	int enable, u32 tapenable)
+{
+	if (enable)
+		ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), (chan + (chan >> 1)),
+			1, 3 << 10, 0x1f << 10);
+	else
+		ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), (chan + (chan >> 1)),
+			1, 0, 0x1f << 10);
+}
+
+/* Set clock to 1, 0, 1, 0 */
+static void clock_man(struct qib_pportdata *ppd, int chan)
+{
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), (chan + (chan >> 1)),
+		4, 0x4000, 0x4000);
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), (chan + (chan >> 1)),
+		4, 0, 0x4000);
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), (chan + (chan >> 1)),
+		4, 0x4000, 0x4000);
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), (chan + (chan >> 1)),
+		4, 0, 0x4000);
+}
+
 /*
- * Driver for a keypad w/16 buttons connected to a PCF8574 I2C I/O expander
- *
- * Copyright 2005-2008 Analog Devices Inc.
- *
- * Licensed under the GPL-2 or later.
+ * write the current Tx serdes pre,post,main,amp settings into the serdes.
+ * The caller must pass the settings appropriate for the current speed,
+ * or not care if they are correct for the current speed.
  */
-
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/i2c.h>
-#include <linux/slab.h>
-#include <linux/workqueue.h>
-
-#define DRV_NAME "pcf8574_keypad"
-
-static const unsigned char pcf8574_kp_btncode[] = {
-	[0] = KEY_RESERVED,
-	[1] = KEY_ENTER,
-	[2] = KEY_BACKSLASH,
-	[3] = KEY_0,
-	[4] = KEY_RIGHTBRACE,
-	[5] = KEY_C,
-	[6] = KEY_9,
-	[7] = KEY_8,
-	[8] = KEY_7,
-	[9] = KEY_B,
-	[10] = KEY_6,
-	[11] = KEY_5,
-	[12] = KEY_4,
-	[13] = KEY_A,
-	[14] = KEY_3,
-	[15] = KEY_2,
-	[16] = KEY_1
-};
-
-struct kp_data {
-	unsigned short btncode[ARRAY_SIZE(pcf8574_kp_btncode)];
-	struct input_dev *idev;
-	struct i2c_client *client;
-	char name[64];
-	char phys[32];
-	unsigned char laststate;
-};
-
-static short read_state(struct kp_data *lp)
+static void write_tx_serdes_param(struct qib_pportdata *ppd,
+				  struct txdds_ent *txdds)
 {
-	unsigned char x, y, a, b;
+	u64 deemph;
 
-	i2c_smbus_write_byte(lp->client, 240);
-	x = 0xF & (~(i2c_smbus_read_byte(lp->client) >> 4));
+	deemph = qib_read_kreg_port(ppd, krp_tx_deemph_override);
+	/* field names for amp, main, post, pre, respectively */
+	deemph &= ~(SYM_MASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0, txampcntl_d2a) |
+		    SYM_MASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0, txc0_ena) |
+		    SYM_MASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0, txcp1_ena) |
+		    SYM_MASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0, txcn1_ena));
 
-	i2c_smbus_write_byte(lp->client, 15);
-	y = 0xF & (~i2c_smbus_read_byte(lp->client));
-
-	for (a = 0; x > 0; a++)
-		x = x >> 1;
-	for (b = 0; y > 0; b++)
-		y = y >> 1;
-
-	return ((a - 1) * 4) + b;
+	deemph |= SYM_MASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+			   tx_override_deemphasis_select);
+	deemph |= (txdds->amp & SYM_RMASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+		    txampcntl_d2a)) << SYM_LSB(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+				       txampcntl_d2a);
+	deemph |= (txdds->main & SYM_RMASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+		     txc0_ena)) << SYM_LSB(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+				   txc0_ena);
+	deemph |= (txdds->post & SYM_RMASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+		     txcp1_ena)) << SYM_LSB(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+				    txcp1_ena);
+	deemph |= (txdds->pre & SYM_RMASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+		     txcn1_ena)) << SYM_LSB(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+				    txcn1_ena);
+	qib_write_kreg_port(ppd, krp_tx_deemph_override, deemph);
 }
 
-static irqreturn_t pcf8574_kp_irq_handler(int irq, void *dev_id)
+/*
+ * Set the parameters for mez cards on link bounce, so they are
+ * always exactly what was requested.  Similar logic to init_txdds
+ * but does just the serdes.
+ */
+static void adj_tx_serdes(struct qib_pportdata *ppd)
 {
-	struct kp_data *lp = dev_id;
-	unsigned char nextstate = read_state(lp);
+	const struct txdds_ent *sdr_dds, *ddr_dds, *qdr_dds;
+	struct txdds_ent *dds;
 
-	if (lp->laststate != nextstate) {
-		int key_down = nextstate < ARRAY_SIZE(lp->btncode);
-		unsigned short keycode = key_down ?
-			lp->btncode[nextstate] : lp->btncode[lp->laststate];
-
-		input_report_key(lp->idev, keycode, key_down);
-		input_sync(lp->idev);
-
-		lp->laststate = nextstate;
-	}
-
-	return IRQ_HANDLED;
+	find_best_ent(ppd, &sdr_dds, &ddr_dds, &qdr_dds, 1);
+	dds = (struct txdds_ent *)(ppd->link_speed_active == QIB_IB_QDR ?
+		qdr_dds : (ppd->link_speed_active == QIB_IB_DDR ?
+				ddr_dds : sdr_dds));
+	write_tx_serdes_param(ppd, dds);
 }
 
-static int pcf8574_kp_probe(struct i2c_client *client, const struct i2c_device_id *id)
-{
-	int i, ret;
-	struct input_dev *idev;
-	struct kp_data *lp;
-
-	if (i2c_smbus_write_byte(client, 240) < 0) {
-		dev_err(&client->dev, "probe: write fail\n");
-		return -ENODEV;
-	}
-
-	lp = kzalloc(sizeof(*lp), GFP_KERNEL);
-	if (!lp)
-		return -ENOMEM;
-
-	idev = input_allocate_device();
-	if (!idev) {
-		dev_err(&client->dev, "Can't allocate input device\n");
-		ret = -ENOMEM;
-		goto fail_allocate;
-	}
-
-	lp->idev = idev;
-	lp->client = client;
-
-	idev->evbit[0] = BIT_MASK(EV_KEY);
-	idev->keycode = lp->btncode;
-	idev->keycodesize = sizeof(lp->btncode[0]);
-	idev->keycodemax = ARRAY_SIZE(lp->btncode);
-
-	for (i = 0; i < ARRAY_SIZE(pcf8574_kp_btncode); i++) {
-		if (lp->btncode[i] <= KEY_MAX) {
-			lp->btncode[i] = pcf8574_kp_btncode[i];
-			__set_bit(lp->btncode[i], idev->keybit);
-		}
-	}
-	__clear_bit(KEY_RESERVED, idev->keybit);
-
-	sprintf(lp->name, DRV_NAME);
-	sprintf(lp->phys, "kp_data/input0");
-
-	idev->name = lp->name;
-	idev->phys = lp->phys;
-	idev->id.bustype = BUS_I2C;
-	idev->id.vendor = 0x0001;
-	idev->id.product = 0x0001;
-	idev->id.version = 0x0100;
-
-	lp->laststate = read_state(lp);
-
-	ret = request_threaded_irq(client->irq, NULL, pcf8574_kp_irq_handler,
-				   IRQF_TRIGGER_LOW | IRQF_ONESHOT,
-				   DRV_NAME, lp);
-	if (ret) {
-		dev_err(&client->dev, "IRQ %d is not free\n", client->irq);
-		goto fail_free_device;
-	}
-
-	ret = input_register_device(idev);
-	if (ret) {
-		dev_err(&client->dev, "input_register_device() failed\n");
-		goto fail_free_irq;
-	}
-
-	i2c_set_clientdata(client, lp);
-	return 0;
-
- fail_free_irq:
-	free_irq(client->irq, lp);
- fail_free_device:
-	input_free_device(idev);
- fail_allocate:
-	kfree(lp);
-
-	return ret;
-}
-
-static int pcf8574_kp_remove(struct i2c_client *client)
-{
-	struct kp_data *lp = i2c_get_clientdata(client);
-
-	free_irq(client->irq, lp);
-
-	input_unregister_device(lp->idev);
-	kfree(lp);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM
-static int pcf8574_kp_resume(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-
-	enable_irq(client->irq);
-
-	return 0;
-}
-
-static int pcf8574_kp_suspend(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-
-	disable_irq(client->irq);
-
-	return 0;
-}
-
-static const struct dev_pm_ops pcf8574_kp_pm_ops = {
-	.suspend	= pcf8574_kp_suspend,
-	.resume		= pcf8574_kp_resume,
-};
-
-#else
-# define pcf8574_kp_resume  NULL
-# define pcf8574_kp_suspend NULL
-#endif
-
-static const struct i2c_device_id pcf8574_kp_id[] = {
-	{ DRV_NAME, 0 },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, pcf8574_kp_id);
-
-static struct i2c_driver pcf8574_kp_driver = {
-	.driver = {
-		.name  = DRV_NAME,
-#ifdef CONFIG_PM
-		.pm = &pcf8574_kp_pm_ops,
-#endif
-	},
-	.probe    = pcf8574_kp_probe,
-	.remove   = pcf8574_kp_remove,
-	.id_table = pcf8574_kp_id,
-};
-
-module_i2c_driver(pcf8574_kp_driver);
-
-MODULE_AUTHOR("Michael Hennerich");
-MODULE_DESCRIPTION("Keypad input driver for 16 keys connected to PCF8574");
-MODULE_LICENSE("GPL");
+/* set QDR forced value for H1, if needed */
+sta

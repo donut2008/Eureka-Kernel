@@ -1,143 +1,61 @@
-/*
- * PlayStation 2 Trance Vibrator driver
- *
- * Copyright (C) 2006 Sam Hocevar <sam@zoy.org>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-/* Standard include files */
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/usb.h>
-
-/* Version Information */
-#define DRIVER_VERSION "v1.1"
-#define DRIVER_AUTHOR "Sam Hocevar, sam@zoy.org"
-#define DRIVER_DESC "PlayStation 2 Trance Vibrator driver"
-
-#define TRANCEVIBRATOR_VENDOR_ID	0x0b49	/* ASCII Corporation */
-#define TRANCEVIBRATOR_PRODUCT_ID	0x064f	/* Trance Vibrator */
-
-static const struct usb_device_id id_table[] = {
-	{ USB_DEVICE(TRANCEVIBRATOR_VENDOR_ID, TRANCEVIBRATOR_PRODUCT_ID) },
-	{ },
-};
-MODULE_DEVICE_TABLE (usb, id_table);
-
-/* Driver-local specific stuff */
-struct trancevibrator {
-	struct usb_device *udev;
-	unsigned int speed;
-};
-
-static ssize_t show_speed(struct device *dev, struct device_attribute *attr,
-			  char *buf)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct trancevibrator *tv = usb_get_intfdata(intf);
-
-	return sprintf(buf, "%d\n", tv->speed);
-}
-
-static ssize_t set_speed(struct device *dev, struct device_attribute *attr,
-			 const char *buf, size_t count)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct trancevibrator *tv = usb_get_intfdata(intf);
-	int temp, retval, old;
-
-	temp = simple_strtoul(buf, NULL, 10);
-	if (temp > 255)
-		temp = 255;
-	else if (temp < 0)
-		temp = 0;
-	old = tv->speed;
-	tv->speed = temp;
-
-	dev_dbg(&tv->udev->dev, "speed = %d\n", tv->speed);
-
-	/* Set speed */
-	retval = usb_control_msg(tv->udev, usb_sndctrlpipe(tv->udev, 0),
-				 0x01, /* vendor request: set speed */
-				 USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_OTHER,
-				 tv->speed, /* speed value */
-				 0, NULL, 0, USB_CTRL_SET_TIMEOUT);
-	if (retval) {
-		tv->speed = old;
-		dev_dbg(&tv->udev->dev, "retval = %d\n", retval);
-		return retval;
-	}
-	return count;
-}
-
-static DEVICE_ATTR(speed, S_IRUGO | S_IWUSR, show_speed, set_speed);
-
-static int tv_probe(struct usb_interface *interface,
-		    const struct usb_device_id *id)
-{
-	struct usb_device *udev = interface_to_usbdev(interface);
-	struct trancevibrator *dev;
-	int retval;
-
-	dev = kzalloc(sizeof(struct trancevibrator), GFP_KERNEL);
-	if (dev == NULL) {
-		dev_err(&interface->dev, "Out of memory\n");
-		retval = -ENOMEM;
-		goto error;
-	}
-
-	dev->udev = usb_get_dev(udev);
-	usb_set_intfdata(interface, dev);
-	retval = device_create_file(&interface->dev, &dev_attr_speed);
-	if (retval)
-		goto error_create_file;
-
-	return 0;
-
-error_create_file:
-	usb_put_dev(udev);
-	usb_set_intfdata(interface, NULL);
-error:
-	kfree(dev);
-	return retval;
-}
-
-static void tv_disconnect(struct usb_interface *interface)
-{
-	struct trancevibrator *dev;
-
-	dev = usb_get_intfdata (interface);
-	device_remove_file(&interface->dev, &dev_attr_speed);
-	usb_set_intfdata(interface, NULL);
-	usb_put_dev(dev->udev);
-	kfree(dev);
-}
-
-/* USB subsystem object */
-static struct usb_driver tv_driver = {
-	.name =		"trancevibrator",
-	.probe =	tv_probe,
-	.disconnect =	tv_disconnect,
-	.id_table =	id_table,
-};
-
-module_usb_driver(tv_driver);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+_REQUESTTRK_9__SHIFT 0x6
+#define PB1_RX_LANE9_SCI_STAT_OVRD_REG0__ENABLEFOM_9_MASK 0x80
+#define PB1_RX_LANE9_SCI_STAT_OVRD_REG0__ENABLEFOM_9__SHIFT 0x7
+#define PB1_RX_LANE9_SCI_STAT_OVRD_REG0__REQUESTFOM_9_MASK 0x100
+#define PB1_RX_LANE9_SCI_STAT_OVRD_REG0__REQUESTFOM_9__SHIFT 0x8
+#define PB1_RX_LANE9_SCI_STAT_OVRD_REG0__RESPONSEMODE_9_MASK 0x200
+#define PB1_RX_LANE9_SCI_STAT_OVRD_REG0__RESPONSEMODE_9__SHIFT 0x9
+#define PB1_RX_LANE9_SCI_STAT_OVRD_REG0__RXEYEFOM_9_MASK 0x3fc00
+#define PB1_RX_LANE9_SCI_STAT_OVRD_REG0__RXEYEFOM_9__SHIFT 0xa
+#define PB1_RX_LANE10_CTRL_REG0__RX_BACKUP_10_MASK 0xff
+#define PB1_RX_LANE10_CTRL_REG0__RX_BACKUP_10__SHIFT 0x0
+#define PB1_RX_LANE10_CTRL_REG0__RX_DBG_ANALOG_SEL_10_MASK 0xc00
+#define PB1_RX_LANE10_CTRL_REG0__RX_DBG_ANALOG_SEL_10__SHIFT 0xa
+#define PB1_RX_LANE10_CTRL_REG0__RX_TST_BSCAN_EN_10_MASK 0x1000
+#define PB1_RX_LANE10_CTRL_REG0__RX_TST_BSCAN_EN_10__SHIFT 0xc
+#define PB1_RX_LANE10_CTRL_REG0__RX_CFG_OVR_PWRSF_10_MASK 0x2000
+#define PB1_RX_LANE10_CTRL_REG0__RX_CFG_OVR_PWRSF_10__SHIFT 0xd
+#define PB1_RX_LANE10_CTRL_REG0__RX_TERM_EN_10_MASK 0x4000
+#define PB1_RX_LANE10_CTRL_REG0__RX_TERM_EN_10__SHIFT 0xe
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__RXPWR_10_MASK 0x7
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__RXPWR_10__SHIFT 0x0
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__ELECIDLEDETEN_10_MASK 0x8
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__ELECIDLEDETEN_10__SHIFT 0x3
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__REQUESTTRK_10_MASK 0x40
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__REQUESTTRK_10__SHIFT 0x6
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__ENABLEFOM_10_MASK 0x80
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__ENABLEFOM_10__SHIFT 0x7
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__REQUESTFOM_10_MASK 0x100
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__REQUESTFOM_10__SHIFT 0x8
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__RESPONSEMODE_10_MASK 0x200
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__RESPONSEMODE_10__SHIFT 0x9
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__RXEYEFOM_10_MASK 0x3fc00
+#define PB1_RX_LANE10_SCI_STAT_OVRD_REG0__RXEYEFOM_10__SHIFT 0xa
+#define PB1_RX_LANE11_CTRL_REG0__RX_BACKUP_11_MASK 0xff
+#define PB1_RX_LANE11_CTRL_REG0__RX_BACKUP_11__SHIFT 0x0
+#define PB1_RX_LANE11_CTRL_REG0__RX_DBG_ANALOG_SEL_11_MASK 0xc00
+#define PB1_RX_LANE11_CTRL_REG0__RX_DBG_ANALOG_SEL_11__SHIFT 0xa
+#define PB1_RX_LANE11_CTRL_REG0__RX_TST_BSCAN_EN_11_MASK 0x1000
+#define PB1_RX_LANE11_CTRL_REG0__RX_TST_BSCAN_EN_11__SHIFT 0xc
+#define PB1_RX_LANE11_CTRL_REG0__RX_CFG_OVR_PWRSF_11_MASK 0x2000
+#define PB1_RX_LANE11_CTRL_REG0__RX_CFG_OVR_PWRSF_11__SHIFT 0xd
+#define PB1_RX_LANE11_CTRL_REG0__RX_TERM_EN_11_MASK 0x4000
+#define PB1_RX_LANE11_CTRL_REG0__RX_TERM_EN_11__SHIFT 0xe
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__RXPWR_11_MASK 0x7
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__RXPWR_11__SHIFT 0x0
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__ELECIDLEDETEN_11_MASK 0x8
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__ELECIDLEDETEN_11__SHIFT 0x3
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__REQUESTTRK_11_MASK 0x40
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__REQUESTTRK_11__SHIFT 0x6
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__ENABLEFOM_11_MASK 0x80
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__ENABLEFOM_11__SHIFT 0x7
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__REQUESTFOM_11_MASK 0x100
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__REQUESTFOM_11__SHIFT 0x8
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__RESPONSEMODE_11_MASK 0x200
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__RESPONSEMODE_11__SHIFT 0x9
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__RXEYEFOM_11_MASK 0x3fc00
+#define PB1_RX_LANE11_SCI_STAT_OVRD_REG0__RXEYEFOM_11__SHIFT 0xa
+#define PB1_RX_LANE12_CTRL_REG0__RX_BACKUP_12_MASK 0xff
+#define PB1_RX_LANE12_CTRL_REG0__RX_BACKUP_12__SHIFT 0x0
+#define PB1_RX_LANE12_CTRL_REG0__RX_DBG_ANALOG_SEL_12_MASK 0xc00
+#define PB1_RX_LANE12_CTRL_REG0__RX_DBG_ANALOG_SEL_12__SHI

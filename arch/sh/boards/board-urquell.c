@@ -1,221 +1,142 @@
-/*
- * Renesas Technology Corp. SH7786 Urquell Support.
+cv(qp, recv_wr, bad_recv_wr);
+}
+
+/**
+ * ib_create_cq - Creates a CQ on the specified device.
+ * @device: The device on which to create the CQ.
+ * @comp_handler: A user-specified callback that is invoked when a
+ *   completion event occurs on the CQ.
+ * @event_handler: A user-specified callback that is invoked when an
+ *   asynchronous event not associated with a completion occurs on the CQ.
+ * @cq_context: Context associated with the CQ returned to the user via
+ *   the associated completion and event handlers.
+ * @cq_attr: The attributes the CQ should be created upon.
  *
- * Copyright (C) 2008  Kuninori Morimoto <morimoto.kuninori@renesas.com>
- * Copyright (C) 2009, 2010  Paul Mundt
- *
- * Based on board-sh7785lcr.c
- * Copyright (C) 2008  Yoshihiro Shimoda
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ * Users can examine the cq structure to determine the actual CQ size.
  */
-#include <linux/init.h>
-#include <linux/platform_device.h>
-#include <linux/fb.h>
-#include <linux/smc91x.h>
-#include <linux/mtd/physmap.h>
-#include <linux/delay.h>
-#include <linux/gpio.h>
-#include <linux/irq.h>
-#include <linux/clk.h>
-#include <linux/sh_intc.h>
-#include <mach/urquell.h>
-#include <cpu/sh7786.h>
-#include <asm/heartbeat.h>
-#include <asm/sizes.h>
-#include <asm/smp-ops.h>
+struct ib_cq *ib_create_cq(struct ib_device *device,
+			   ib_comp_handler comp_handler,
+			   void (*event_handler)(struct ib_event *, void *),
+			   void *cq_context,
+			   const struct ib_cq_init_attr *cq_attr);
 
-/*
- * bit  1234 5678
- *----------------------------
- * SW1  0101 0010  -> Pck 33MHz version
- *     (1101 0010)    Pck 66MHz version
- * SW2  0x1x xxxx  -> little endian
- *                    29bit mode
- * SW47 0001 1000  -> CS0 : on-board flash
- *                    CS1 : SRAM, registers, LAN, PCMCIA
- *                    38400 bps for SCIF1
+/**
+ * ib_resize_cq - Modifies the capacity of the CQ.
+ * @cq: The CQ to resize.
+ * @cqe: The minimum size of the CQ.
  *
- * Address
- * 0x00000000 - 0x04000000  (CS0)     Nor Flash
- * 0x04000000 - 0x04200000  (CS1)     SRAM
- * 0x05000000 - 0x05800000  (CS1)     on board register
- * 0x05800000 - 0x06000000  (CS1)     LAN91C111
- * 0x06000000 - 0x06400000  (CS1)     PCMCIA
- * 0x08000000 - 0x10000000  (CS2-CS3) DDR3
- * 0x10000000 - 0x14000000  (CS4)     PCIe
- * 0x14000000 - 0x14800000  (CS5)     Core0 LRAM/URAM
- * 0x14800000 - 0x15000000  (CS5)     Core1 LRAM/URAM
- * 0x18000000 - 0x1C000000  (CS6)     ATA/NAND-Flash
- * 0x1C000000 -             (CS7)     SH7786 Control register
+ * Users can examine the cq structure to determine the actual CQ size.
  */
+int ib_resize_cq(struct ib_cq *cq, int cqe);
 
-/* HeartBeat */
-static struct resource heartbeat_resource = {
-	.start	= BOARDREG(SLEDR),
-	.end	= BOARDREG(SLEDR),
-	.flags	= IORESOURCE_MEM | IORESOURCE_MEM_16BIT,
-};
-
-static struct platform_device heartbeat_device = {
-	.name		= "heartbeat",
-	.id		= -1,
-	.num_resources	= 1,
-	.resource	= &heartbeat_resource,
-};
-
-/* LAN91C111 */
-static struct smc91x_platdata smc91x_info = {
-	.flags = SMC91X_USE_16BIT | SMC91X_NOWAIT,
-};
-
-static struct resource smc91x_eth_resources[] = {
-	[0] = {
-		.name   = "SMC91C111" ,
-		.start  = 0x05800300,
-		.end    = 0x0580030f,
-		.flags  = IORESOURCE_MEM,
-	},
-	[1] = {
-		.start  = evt2irq(0x360),
-		.flags  = IORESOURCE_IRQ,
-	},
-};
-
-static struct platform_device smc91x_eth_device = {
-	.name           = "smc91x",
-	.num_resources  = ARRAY_SIZE(smc91x_eth_resources),
-	.resource       = smc91x_eth_resources,
-	.dev	= {
-		.platform_data	= &smc91x_info,
-	},
-};
-
-/* Nor Flash */
-static struct mtd_partition nor_flash_partitions[] = {
-	{
-		.name		= "loader",
-		.offset		= 0x00000000,
-		.size		= SZ_512K,
-		.mask_flags	= MTD_WRITEABLE,	/* Read-only */
-	},
-	{
-		.name		= "bootenv",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= SZ_512K,
-		.mask_flags	= MTD_WRITEABLE,	/* Read-only */
-	},
-	{
-		.name		= "kernel",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= SZ_4M,
-	},
-	{
-		.name		= "data",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= MTDPART_SIZ_FULL,
-	},
-};
-
-static struct physmap_flash_data nor_flash_data = {
-	.width		= 2,
-	.parts		= nor_flash_partitions,
-	.nr_parts	= ARRAY_SIZE(nor_flash_partitions),
-};
-
-static struct resource nor_flash_resources[] = {
-	[0] = {
-		.start	= NOR_FLASH_ADDR,
-		.end	= NOR_FLASH_ADDR + NOR_FLASH_SIZE - 1,
-		.flags	= IORESOURCE_MEM,
-	}
-};
-
-static struct platform_device nor_flash_device = {
-	.name		= "physmap-flash",
-	.dev		= {
-		.platform_data	= &nor_flash_data,
-	},
-	.num_resources	= ARRAY_SIZE(nor_flash_resources),
-	.resource	= nor_flash_resources,
-};
-
-static struct platform_device *urquell_devices[] __initdata = {
-	&heartbeat_device,
-	&smc91x_eth_device,
-	&nor_flash_device,
-};
-
-static int __init urquell_devices_setup(void)
-{
-	/* USB */
-	gpio_request(GPIO_FN_USB_OVC0,  NULL);
-	gpio_request(GPIO_FN_USB_PENC0, NULL);
-
-	/* enable LAN */
-	__raw_writew(__raw_readw(UBOARDREG(IRL2MSKR)) & ~0x00000001,
-		  UBOARDREG(IRL2MSKR));
-
-	return platform_add_devices(urquell_devices,
-				    ARRAY_SIZE(urquell_devices));
-}
-device_initcall(urquell_devices_setup);
-
-static void urquell_power_off(void)
-{
-	__raw_writew(0xa5a5, UBOARDREG(SRSTR));
-}
-
-static void __init urquell_init_irq(void)
-{
-	plat_irq_setup_pins(IRQ_MODE_IRL3210_MASK);
-}
-
-static int urquell_mode_pins(void)
-{
-	return __raw_readw(UBOARDREG(MDSWMR));
-}
-
-static int urquell_clk_init(void)
-{
-	struct clk *clk;
-	int ret;
-
-	/*
-	 * Only handle the EXTAL case, anyone interfacing a crystal
-	 * resonator will need to provide their own input clock.
-	 */
-	if (test_mode_pin(MODE_PIN9))
-		return -EINVAL;
-
-	clk = clk_get(NULL, "extal");
-	if (IS_ERR(clk))
-		return PTR_ERR(clk);
-	ret = clk_set_rate(clk, 33333333);
-	clk_put(clk);
-
-	return ret;
-}
-
-/* Initialize the board */
-static void __init urquell_setup(char **cmdline_p)
-{
-	printk(KERN_INFO "Renesas Technology Corp. Urquell support.\n");
-
-	pm_power_off = urquell_power_off;
-
-	register_smp_ops(&shx3_smp_ops);
-}
-
-/*
- * The Machine Vector
+/**
+ * ib_modify_cq - Modifies moderation params of the CQ
+ * @cq: The CQ to modify.
+ * @cq_count: number of CQEs that will trigger an event
+ * @cq_period: max period of time in usec before triggering an event
+ *
  */
-static struct sh_machine_vector mv_urquell __initmv = {
-	.mv_name	= "Urquell",
-	.mv_setup	= urquell_setup,
-	.mv_init_irq	= urquell_init_irq,
-	.mv_mode_pins	= urquell_mode_pins,
-	.mv_clk_init	= urquell_clk_init,
-};
+int ib_modify_cq(struct ib_cq *cq, u16 cq_count, u16 cq_period);
+
+/**
+ * ib_destroy_cq - Destroys the specified CQ.
+ * @cq: The CQ to destroy.
+ */
+int ib_destroy_cq(struct ib_cq *cq);
+
+/**
+ * ib_poll_cq - poll a CQ for completion(s)
+ * @cq:the CQ being polled
+ * @num_entries:maximum number of completions to return
+ * @wc:array of at least @num_entries &struct ib_wc where completions
+ *   will be returned
+ *
+ * Poll a CQ for (possibly multiple) completions.  If the return value
+ * is < 0, an error occurred.  If the return value is >= 0, it is the
+ * number of completions returned.  If the return value is
+ * non-negative and < num_entries, then the CQ was emptied.
+ */
+static inline int ib_poll_cq(struct ib_cq *cq, int num_entries,
+			     struct ib_wc *wc)
+{
+	return cq->device->poll_cq(cq, num_entries, wc);
+}
+
+/**
+ * ib_peek_cq - Returns the number of unreaped completions currently
+ *   on the specified CQ.
+ * @cq: The CQ to peek.
+ * @wc_cnt: A minimum number of unreaped completions to check for.
+ *
+ * If the number of unreaped completions is greater than or equal to wc_cnt,
+ * this function returns wc_cnt, otherwise, it returns the actual number of
+ * unreaped completions.
+ */
+int ib_peek_cq(struct ib_cq *cq, int wc_cnt);
+
+/**
+ * ib_req_notify_cq - Request completion notification on a CQ.
+ * @cq: The CQ to generate an event for.
+ * @flags:
+ *   Must contain exactly one of %IB_CQ_SOLICITED or %IB_CQ_NEXT_COMP
+ *   to request an event on the next solicited event or next work
+ *   completion at any type, respectively. %IB_CQ_REPORT_MISSED_EVENTS
+ *   may also be |ed in to request a hint about missed events, as
+ *   described below.
+ *
+ * Return Value:
+ *    < 0 means an error occurred while requesting notification
+ *   == 0 means notification was requested successfully, and if
+ *        IB_CQ_REPORT_MISSED_EVENTS was passed in, then no events
+ *        were missed and it is safe to wait for another event.  In
+ *        this case is it guaranteed that any work completions added
+ *        to the CQ since the last CQ poll will trigger a completion
+ *        notification event.
+ *    > 0 is only returned if IB_CQ_REPORT_MISSED_EVENTS was passed
+ *        in.  It means that the consumer must poll the CQ again to
+ *        make sure it is empty to avoid missing an event because of a
+ *        race between requesting notification and an entry being
+ *        added to the CQ.  This return value means it is possible
+ *        (but not guaranteed) that a work completion has been added
+ *        to the CQ since the last poll without triggering a
+ *        completion notification event.
+ */
+static inline int ib_req_notify_cq(struct ib_cq *cq,
+				   enum ib_cq_notify_flags flags)
+{
+	return cq->device->req_notify_cq(cq, flags);
+}
+
+/**
+ * ib_req_ncomp_notif - Request completion notification when there are
+ *   at least the specified number of unreaped completions on the CQ.
+ * @cq: The CQ to generate an event for.
+ * @wc_cnt: The number of unreaped completions that should be on the
+ *   CQ before an event is generated.
+ */
+static inline int ib_req_ncomp_notif(struct ib_cq *cq, int wc_cnt)
+{
+	return cq->device->req_ncomp_notif ?
+		cq->device->req_ncomp_notif(cq, wc_cnt) :
+		-ENOSYS;
+}
+
+/**
+ * ib_get_dma_mr - Returns a memory region for system memory that is
+ *   usable for DMA.
+ * @pd: The protection domain associated with the memory region.
+ * @mr_access_flags: Specifies the memory access rights.
+ *
+ * Note that the ib_dma_*() functions defined below must be used
+ * to create/destroy addresses used with the Lkey or Rkey returned
+ * by ib_get_dma_mr().
+ */
+struct ib_mr *ib_get_dma_mr(struct ib_pd *pd, int mr_access_flags);
+
+/**
+ * ib_dma_mapping_error - check a DMA addr for error
+ * @dev: The device for which the dma_addr was created
+ * @dma_addr: The DMA address to check
+ */
+static inline int ib_dma_mapping_error(struct ib_device *dev, u64 dma_addr)
+{

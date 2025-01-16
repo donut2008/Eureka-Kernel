@@ -1,465 +1,289 @@
+adm_error_mask and ce_adm_error_summary register bit masks */
+#define CE_ADM_ERR_CRM_SSP_REQ_INVALID			(0x1ULL <<  0)
+#define CE_ADM_ERR_SSP_REQ_HEADER			(0x1ULL <<  1)
+#define CE_ADM_ERR_SSP_RSP_HEADER			(0x1ULL <<  2)
+#define CE_ADM_ERR_SSP_PROTOCOL_ERROR			(0x1ULL <<  3)
+#define CE_ADM_ERR_SSP_SBE				(0x1ULL <<  4)
+#define CE_ADM_ERR_SSP_MBE				(0x1ULL <<  5)
+#define CE_ADM_ERR_CXM_CREDIT_OFLOW			(0x1ULL <<  6)
+#define CE_ADM_ERR_DRE_SSP_REQ_INVAL			(0x1ULL <<  7)
+#define CE_ADM_ERR_SSP_REQ_LONG				(0x1ULL <<  8)
+#define CE_ADM_ERR_SSP_REQ_OFLOW			(0x1ULL <<  9)
+#define CE_ADM_ERR_SSP_REQ_SHORT			(0x1ULL << 10)
+#define CE_ADM_ERR_SSP_REQ_SIDEBAND			(0x1ULL << 11)
+#define CE_ADM_ERR_SSP_REQ_ADDR_ERR			(0x1ULL << 12)
+#define CE_ADM_ERR_SSP_REQ_BAD_BE			(0x1ULL << 13)
+#define CE_ADM_ERR_PCIE_COMPL_TIMEOUT			(0x1ULL << 14)
+#define CE_ADM_ERR_PCIE_UNEXP_COMPL			(0x1ULL << 15)
+#define CE_ADM_ERR_PCIE_ERR_COMPL			(0x1ULL << 16)
+#define CE_ADM_ERR_DRE_CREDIT_OFLOW			(0x1ULL << 17)
+#define CE_ADM_ERR_DRE_SRAM_PE				(0x1ULL << 18)
+#define CE_ADM_ERR_SSP_RSP_INVALID			(0x1ULL << 19)
+#define CE_ADM_ERR_SSP_RSP_LONG				(0x1ULL << 20)
+#define CE_ADM_ERR_SSP_RSP_SHORT			(0x1ULL << 21)
+#define CE_ADM_ERR_SSP_RSP_SIDEBAND			(0x1ULL << 22)
+#define CE_ADM_ERR_URE_SSP_RSP_UNEXP			(0x1ULL << 23)
+#define CE_ADM_ERR_URE_SSP_WR_REQ_TIMEOUT		(0x1ULL << 24)
+#define CE_ADM_ERR_URE_SSP_RD_REQ_TIMEOUT		(0x1ULL << 25)
+#define CE_ADM_ERR_URE_ATE3240_PAGE_FAULT		(0x1ULL << 26)
+#define CE_ADM_ERR_URE_ATE40_PAGE_FAULT			(0x1ULL << 27)
+#define CE_ADM_ERR_URE_CREDIT_OFLOW			(0x1ULL << 28)
+#define CE_ADM_ERR_URE_SRAM_PE				(0x1ULL << 29)
+#define CE_ADM_ERR_ADM_SSP_RSP_UNEXP			(0x1ULL << 30)
+#define CE_ADM_ERR_ADM_SSP_REQ_TIMEOUT			(0x1ULL << 31)
+#define CE_ADM_ERR_MMR_ACCESS_ERROR			(0x1ULL << 32)
+#define CE_ADM_ERR_MMR_ADDR_ERROR			(0x1ULL << 33)
+#define CE_ADM_ERR_ADM_CREDIT_OFLOW			(0x1ULL << 34)
+#define CE_ADM_ERR_ADM_SRAM_PE				(0x1ULL << 35)
+#define CE_ADM_ERR_DTL1_MIN_PDATA_CREDIT_ERR		(0x1ULL << 36)
+#define CE_ADM_ERR_DTL1_INF_COMPL_CRED_UPDT_ERR		(0x1ULL << 37)
+#define CE_ADM_ERR_DTL1_INF_POSTED_CRED_UPDT_ERR	(0x1ULL << 38)
+#define CE_ADM_ERR_DTL1_INF_NPOSTED_CRED_UPDT_ERR	(0x1ULL << 39)
+#define CE_ADM_ERR_DTL1_COMP_HD_CRED_MAX_ERR		(0x1ULL << 40)
+#define CE_ADM_ERR_DTL1_COMP_D_CRED_MAX_ERR		(0x1ULL << 41)
+#define CE_ADM_ERR_DTL1_NPOSTED_HD_CRED_MAX_ERR		(0x1ULL << 42)
+#define CE_ADM_ERR_DTL1_NPOSTED_D_CRED_MAX_ERR		(0x1ULL << 43)
+#define CE_ADM_ERR_DTL1_POSTED_HD_CRED_MAX_ERR		(0x1ULL << 44)
+#define CE_ADM_ERR_DTL1_POSTED_D_CRED_MAX_ERR		(0x1ULL << 45)
+#define CE_ADM_ERR_DTL2_MIN_PDATA_CREDIT_ERR		(0x1ULL << 46)
+#define CE_ADM_ERR_DTL2_INF_COMPL_CRED_UPDT_ERR		(0x1ULL << 47)
+#define CE_ADM_ERR_DTL2_INF_POSTED_CRED_UPDT_ERR	(0x1ULL << 48)
+#define CE_ADM_ERR_DTL2_INF_NPOSTED_CRED_UPDT_ERR	(0x1ULL << 49)
+#define CE_ADM_ERR_DTL2_COMP_HD_CRED_MAX_ERR		(0x1ULL << 50)
+#define CE_ADM_ERR_DTL2_COMP_D_CRED_MAX_ERR		(0x1ULL << 51)
+#define CE_ADM_ERR_DTL2_NPOSTED_HD_CRED_MAX_ERR		(0x1ULL << 52)
+#define CE_ADM_ERR_DTL2_NPOSTED_D_CRED_MAX_ERR		(0x1ULL << 53)
+#define CE_ADM_ERR_DTL2_POSTED_HD_CRED_MAX_ERR		(0x1ULL << 54)
+#define CE_ADM_ERR_DTL2_POSTED_D_CRED_MAX_ERR		(0x1ULL << 55)
+#define CE_ADM_ERR_PORT1_PCIE_COR_ERR			(0x1ULL << 56)
+#define CE_ADM_ERR_PORT1_PCIE_NFAT_ERR			(0x1ULL << 57)
+#define CE_ADM_ERR_PORT1_PCIE_FAT_ERR			(0x1ULL << 58)
+#define CE_ADM_ERR_PORT2_PCIE_COR_ERR			(0x1ULL << 59)
+#define CE_ADM_ERR_PORT2_PCIE_NFAT_ERR			(0x1ULL << 60)
+#define CE_ADM_ERR_PORT2_PCIE_FAT_ERR			(0x1ULL << 61)
+
+/* ce_adm_ure_ups_buf_barrier_flush register bit masks and shifts */
+#define FLUSH_SEL_PORT1_PIPE0_SHFT	0
+#define FLUSH_SEL_PORT1_PIPE1_SHFT	4
+#define FLUSH_SEL_PORT1_PIPE2_SHFT	8
+#define FLUSH_SEL_PORT1_PIPE3_SHFT	12
+#define FLUSH_SEL_PORT2_PIPE0_SHFT	16
+#define FLUSH_SEL_PORT2_PIPE1_SHFT	20
+#define FLUSH_SEL_PORT2_PIPE2_SHFT	24
+#define FLUSH_SEL_PORT2_PIPE3_SHFT	28
+
+/* ce_dre_config1 register bit masks and shifts */
+#define CE_DRE_RO_ENABLE		(0x1ULL << 0)
+#define CE_DRE_DYN_RO_ENABLE		(0x1ULL << 1)
+#define CE_DRE_SUP_CONFIG_COMP_ERROR	(0x1ULL << 2)
+#define CE_DRE_SUP_IO_COMP_ERROR	(0x1ULL << 3)
+#define CE_DRE_ADDR_MODE_SHFT		4
+
+/* ce_dre_config_req_status register bit masks */
+#define CE_DRE_LAST_CONFIG_COMPLETION	(0x7ULL << 0)
+#define CE_DRE_DOWNSTREAM_CONFIG_ERROR	(0x1ULL << 3)
+#define CE_DRE_CONFIG_COMPLETION_VALID	(0x1ULL << 4)
+#define CE_DRE_CONFIG_REQUEST_ACTIVE	(0x1ULL << 5)
+
+/* ce_ure_control register bit masks & shifts */
+#define CE_URE_RD_MRG_ENABLE		(0x1ULL << 0)
+#define CE_URE_WRT_MRG_ENABLE1		(0x1ULL << 4)
+#define CE_URE_WRT_MRG_ENABLE2		(0x1ULL << 5)
+#define CE_URE_WRT_MRG_TIMER_SHFT	12
+#define CE_URE_WRT_MRG_TIMER_MASK	(0x7FFULL << CE_URE_WRT_MRG_TIMER_SHFT)
+#define CE_URE_WRT_MRG_TIMER(x)		(((u64)(x) << \
+					  CE_URE_WRT_MRG_TIMER_SHFT) & \
+					 CE_URE_WRT_MRG_TIMER_MASK)
+#define CE_URE_RSPQ_BYPASS_DISABLE	(0x1ULL << 24)
+#define CE_URE_UPS_DAT1_PAR_DISABLE	(0x1ULL << 32)
+#define CE_URE_UPS_HDR1_PAR_DISABLE	(0x1ULL << 33)
+#define CE_URE_UPS_DAT2_PAR_DISABLE	(0x1ULL << 34)
+#define CE_URE_UPS_HDR2_PAR_DISABLE	(0x1ULL << 35)
+#define CE_URE_ATE_PAR_DISABLE		(0x1ULL << 36)
+#define CE_URE_RCI_PAR_DISABLE		(0x1ULL << 37)
+#define CE_URE_RSPQ_PAR_DISABLE		(0x1ULL << 38)
+#define CE_URE_DNS_DAT_PAR_DISABLE	(0x1ULL << 39)
+#define CE_URE_DNS_HDR_PAR_DISABLE	(0x1ULL << 40)
+#define CE_URE_MALFORM_DISABLE		(0x1ULL << 44)
+#define CE_URE_UNSUP_DISABLE		(0x1ULL << 45)
+
+/* ce_ure_page_map register bit masks & shifts */
+#define CE_URE_ATE3240_ENABLE		(0x1ULL << 0)
+#define CE_URE_ATE40_ENABLE 		(0x1ULL << 1)
+#define CE_URE_PAGESIZE_SHFT		4
+#define CE_URE_PAGESIZE_MASK		(0x7ULL << CE_URE_PAGESIZE_SHFT)
+#define CE_URE_4K_PAGESIZE		(0x0ULL << CE_URE_PAGESIZE_SHFT)
+#define CE_URE_16K_PAGESIZE		(0x1ULL << CE_URE_PAGESIZE_SHFT)
+#define CE_URE_64K_PAGESIZE		(0x2ULL << CE_URE_PAGESIZE_SHFT)
+#define CE_URE_128K_PAGESIZE		(0x3ULL << CE_URE_PAGESIZE_SHFT)
+#define CE_URE_256K_PAGESIZE		(0x4ULL << CE_URE_PAGESIZE_SHFT)
+
+/* ce_ure_pipe_sel register bit masks & shifts */
+#define PKT_TRAFIC_SHRT			16
+#define BUS_SRC_ID_SHFT			8
+#define DEV_SRC_ID_SHFT			3
+#define FNC_SRC_ID_SHFT			0
+#define CE_URE_TC_MASK			(0x07ULL << PKT_TRAFIC_SHRT)
+#define CE_URE_BUS_MASK			(0xFFULL << BUS_SRC_ID_SHFT)
+#define CE_URE_DEV_MASK			(0x1FULL << DEV_SRC_ID_SHFT)
+#define CE_URE_FNC_MASK			(0x07ULL << FNC_SRC_ID_SHFT)
+#define CE_URE_PIPE_BUS(b)		(((u64)(b) << BUS_SRC_ID_SHFT) & \
+					 CE_URE_BUS_MASK)
+#define CE_URE_PIPE_DEV(d)		(((u64)(d) << DEV_SRC_ID_SHFT) & \
+					 CE_URE_DEV_MASK)
+#define CE_URE_PIPE_FNC(f)		(((u64)(f) << FNC_SRC_ID_SHFT) & \
+					 CE_URE_FNC_MASK)
+
+#define CE_URE_SEL1_SHFT		0
+#define CE_URE_SEL2_SHFT		20
+#define CE_URE_SEL3_SHFT		40
+#define CE_URE_SEL1_MASK		(0x7FFFFULL << CE_URE_SEL1_SHFT)
+#define CE_URE_SEL2_MASK		(0x7FFFFULL << CE_URE_SEL2_SHFT)
+#define CE_URE_SEL3_MASK		(0x7FFFFULL << CE_URE_SEL3_SHFT)
+
+
+/* ce_ure_pipe_mask register bit masks & shifts */
+#define CE_URE_MASK1_SHFT		0
+#define CE_URE_MASK2_SHFT		20
+#define CE_URE_MASK3_SHFT		40
+#define CE_URE_MASK1_MASK		(0x7FFFFULL << CE_URE_MASK1_SHFT)
+#define CE_URE_MASK2_MASK		(0x7FFFFULL << CE_URE_MASK2_SHFT)
+#define CE_URE_MASK3_MASK		(0x7FFFFULL << CE_URE_MASK3_SHFT)
+
+
+/* ce_ure_pcie_control1 register bit masks & shifts */
+#define CE_URE_SI			(0x1ULL << 0)
+#define CE_URE_ELAL_SHFT		4
+#define CE_URE_ELAL_MASK		(0x7ULL << CE_URE_ELAL_SHFT)
+#define CE_URE_ELAL_SET(n)		(((u64)(n) << CE_URE_ELAL_SHFT) & \
+					 CE_URE_ELAL_MASK)
+#define CE_URE_ELAL1_SHFT		8
+#define CE_URE_ELAL1_MASK		(0x7ULL << CE_URE_ELAL1_SHFT)
+#define CE_URE_ELAL1_SET(n)		(((u64)(n) << CE_URE_ELAL1_SHFT) & \
+					 CE_URE_ELAL1_MASK)
+#define CE_URE_SCC			(0x1ULL << 12)
+#define CE_URE_PN1_SHFT			16
+#define CE_URE_PN1_MASK			(0xFFULL << CE_URE_PN1_SHFT)
+#define CE_URE_PN2_SHFT			24
+#define CE_URE_PN2_MASK			(0xFFULL << CE_URE_PN2_SHFT)
+#define CE_URE_PN1_SET(n)		(((u64)(n) << CE_URE_PN1_SHFT) & \
+					 CE_URE_PN1_MASK)
+#define CE_URE_PN2_SET(n)		(((u64)(n) << CE_URE_PN2_SHFT) & \
+					 CE_URE_PN2_MASK)
+
+/* ce_ure_pcie_control2 register bit masks & shifts */
+#define CE_URE_ABP			(0x1ULL << 0)
+#define CE_URE_PCP			(0x1ULL << 1)
+#define CE_URE_MSP			(0x1ULL << 2)
+#define CE_URE_AIP			(0x1ULL << 3)
+#define CE_URE_PIP			(0x1ULL << 4)
+#define CE_URE_HPS			(0x1ULL << 5)
+#define CE_URE_HPC			(0x1ULL << 6)
+#define CE_URE_SPLV_SHFT		7
+#define CE_URE_SPLV_MASK		(0xFFULL << CE_URE_SPLV_SHFT)
+#define CE_URE_SPLV_SET(n)		(((u64)(n) << CE_URE_SPLV_SHFT) & \
+					 CE_URE_SPLV_MASK)
+#define CE_URE_SPLS_SHFT		15
+#define CE_URE_SPLS_MASK		(0x3ULL << CE_URE_SPLS_SHFT)
+#define CE_URE_SPLS_SET(n)		(((u64)(n) << CE_URE_SPLS_SHFT) & \
+					 CE_URE_SPLS_MASK)
+#define CE_URE_PSN1_SHFT		19
+#define CE_URE_PSN1_MASK		(0x1FFFULL << CE_URE_PSN1_SHFT)
+#define CE_URE_PSN2_SHFT		32
+#define CE_URE_PSN2_MASK		(0x1FFFULL << CE_URE_PSN2_SHFT)
+#define CE_URE_PSN1_SET(n)		(((u64)(n) << CE_URE_PSN1_SHFT) & \
+					 CE_URE_PSN1_MASK)
+#define CE_URE_PSN2_SET(n)		(((u64)(n) << CE_URE_PSN2_SHFT) & \
+					 CE_URE_PSN2_MASK)
+
 /*
- *  Copyright IBM Corp. 2001, 2009
- *  Author(s): Ulrich Weigand <Ulrich.Weigand@de.ibm.com>,
- *	       Martin Schwidefsky <schwidefsky@de.ibm.com>,
+ * PIO address space ranges for CE
  */
 
-#include <linux/kernel.h>
-#include <linux/mm.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/init.h>
-#include <linux/delay.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <asm/ebcdic.h>
-#include <asm/sysinfo.h>
-#include <asm/cpcmd.h>
-#include <asm/topology.h>
+/* Local CE Registers Space */
+#define CE_PIO_MMR			0x00000000
+#define CE_PIO_MMR_LEN			0x04000000
 
-/* Sigh, math-emu. Don't ask. */
-#include <asm/sfp-util.h>
-#include <math-emu/soft-fp.h>
-#include <math-emu/single.h>
+/* PCI Compatible Config Space */
+#define CE_PIO_CONFIG_SPACE		0x04000000
+#define CE_PIO_CONFIG_SPACE_LEN		0x04000000
 
-int topology_max_mnest;
+/* PCI I/O Space Alias */
+#define CE_PIO_IO_SPACE_ALIAS		0x08000000
+#define CE_PIO_IO_SPACE_ALIAS_LEN	0x08000000
+
+/* PCI Enhanced Config Space */
+#define CE_PIO_E_CONFIG_SPACE		0x10000000
+#define CE_PIO_E_CONFIG_SPACE_LEN	0x10000000
+
+/* PCI I/O Space */
+#define CE_PIO_IO_SPACE			0x100000000
+#define CE_PIO_IO_SPACE_LEN		0x100000000
+
+/* PCI MEM Space */
+#define CE_PIO_MEM_SPACE		0x200000000
+#define CE_PIO_MEM_SPACE_LEN		TIO_HWIN_SIZE
+
 
 /*
- * stsi - store system information
+ * CE PCI Enhanced Config Space shifts & masks
+ */
+#define CE_E_CONFIG_BUS_SHFT		20
+#define CE_E_CONFIG_BUS_MASK		(0xFF << CE_E_CONFIG_BUS_SHFT)
+#define CE_E_CONFIG_DEVICE_SHFT		15
+#define CE_E_CONFIG_DEVICE_MASK		(0x1F << CE_E_CONFIG_DEVICE_SHFT)
+#define CE_E_CONFIG_FUNC_SHFT		12
+#define CE_E_CONFIG_FUNC_MASK		(0x7  << CE_E_CONFIG_FUNC_SHFT)
+
+#endif /* __ASM_IA64_SN_TIOCE_H__ */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
  *
- * Returns the current configuration level if function code 0 was specified.
- * Otherwise returns 0 on success or a negative value on error.
+ * Copyright (c) 2003-2005 Silicon Graphics, Inc. All rights reserved.
  */
-int stsi(void *sysinfo, int fc, int sel1, int sel2)
-{
-	register int r0 asm("0") = (fc << 28) | sel1;
-	register int r1 asm("1") = sel2;
-	int rc = 0;
 
-	asm volatile(
-		"	stsi	0(%3)\n"
-		"0:	jz	2f\n"
-		"1:	lhi	%1,%4\n"
-		"2:\n"
-		EX_TABLE(0b, 1b)
-		: "+d" (r0), "+d" (rc)
-		: "d" (r1), "a" (sysinfo), "K" (-EOPNOTSUPP)
-		: "cc", "memory");
-	if (rc)
-		return rc;
-	return fc ? 0 : ((unsigned int) r0) >> 28;
-}
-EXPORT_SYMBOL(stsi);
+#ifndef _ASM_IA64_SN_CE_PROVIDER_H
+#define _ASM_IA64_SN_CE_PROVIDER_H
 
-static void stsi_1_1_1(struct seq_file *m, struct sysinfo_1_1_1 *info)
-{
-	int i;
-
-	if (stsi(info, 1, 1, 1))
-		return;
-	EBCASC(info->manufacturer, sizeof(info->manufacturer));
-	EBCASC(info->type, sizeof(info->type));
-	EBCASC(info->model, sizeof(info->model));
-	EBCASC(info->sequence, sizeof(info->sequence));
-	EBCASC(info->plant, sizeof(info->plant));
-	EBCASC(info->model_capacity, sizeof(info->model_capacity));
-	EBCASC(info->model_perm_cap, sizeof(info->model_perm_cap));
-	EBCASC(info->model_temp_cap, sizeof(info->model_temp_cap));
-	seq_printf(m, "Manufacturer:         %-16.16s\n", info->manufacturer);
-	seq_printf(m, "Type:                 %-4.4s\n", info->type);
-	/*
-	 * Sigh: the model field has been renamed with System z9
-	 * to model_capacity and a new model field has been added
-	 * after the plant field. To avoid confusing older programs
-	 * the "Model:" prints "model_capacity model" or just
-	 * "model_capacity" if the model string is empty .
-	 */
-	seq_printf(m, "Model:                %-16.16s", info->model_capacity);
-	if (info->model[0] != '\0')
-		seq_printf(m, " %-16.16s", info->model);
-	seq_putc(m, '\n');
-	seq_printf(m, "Sequence Code:        %-16.16s\n", info->sequence);
-	seq_printf(m, "Plant:                %-4.4s\n", info->plant);
-	seq_printf(m, "Model Capacity:       %-16.16s %08u\n",
-		   info->model_capacity, info->model_cap_rating);
-	if (info->model_perm_cap_rating)
-		seq_printf(m, "Model Perm. Capacity: %-16.16s %08u\n",
-			   info->model_perm_cap,
-			   info->model_perm_cap_rating);
-	if (info->model_temp_cap_rating)
-		seq_printf(m, "Model Temp. Capacity: %-16.16s %08u\n",
-			   info->model_temp_cap,
-			   info->model_temp_cap_rating);
-	if (info->ncr)
-		seq_printf(m, "Nominal Cap. Rating:  %08u\n", info->ncr);
-	if (info->npr)
-		seq_printf(m, "Nominal Perm. Rating: %08u\n", info->npr);
-	if (info->ntr)
-		seq_printf(m, "Nominal Temp. Rating: %08u\n", info->ntr);
-	if (info->cai) {
-		seq_printf(m, "Capacity Adj. Ind.:   %d\n", info->cai);
-		seq_printf(m, "Capacity Ch. Reason:  %d\n", info->ccr);
-		seq_printf(m, "Capacity Transient:   %d\n", info->t);
-	}
-	if (info->p) {
-		for (i = 1; i <= ARRAY_SIZE(info->typepct); i++) {
-			seq_printf(m, "Type %d Percentage:    %d\n",
-				   i, info->typepct[i - 1]);
-		}
-	}
-}
-
-static void stsi_15_1_x(struct seq_file *m, struct sysinfo_15_1_x *info)
-{
-	static int max_mnest;
-	int i, rc;
-
-	seq_putc(m, '\n');
-	if (!MACHINE_HAS_TOPOLOGY)
-		return;
-	if (stsi(info, 15, 1, topology_max_mnest))
-		return;
-	seq_printf(m, "CPU Topology HW:     ");
-	for (i = 0; i < TOPOLOGY_NR_MAG; i++)
-		seq_printf(m, " %d", info->mag[i]);
-	seq_putc(m, '\n');
-#ifdef CONFIG_SCHED_MC
-	store_topology(info);
-	seq_printf(m, "CPU Topology SW:     ");
-	for (i = 0; i < TOPOLOGY_NR_MAG; i++)
-		seq_printf(m, " %d", info->mag[i]);
-	seq_putc(m, '\n');
-#endif
-}
-
-static void stsi_1_2_2(struct seq_file *m, struct sysinfo_1_2_2 *info)
-{
-	struct sysinfo_1_2_2_extension *ext;
-	int i;
-
-	if (stsi(info, 1, 2, 2))
-		return;
-	ext = (struct sysinfo_1_2_2_extension *)
-		((unsigned long) info + info->acc_offset);
-	seq_printf(m, "CPUs Total:           %d\n", info->cpus_total);
-	seq_printf(m, "CPUs Configured:      %d\n", info->cpus_configured);
-	seq_printf(m, "CPUs Standby:         %d\n", info->cpus_standby);
-	seq_printf(m, "CPUs Reserved:        %d\n", info->cpus_reserved);
-	/*
-	 * Sigh 2. According to the specification the alternate
-	 * capability field is a 32 bit floating point number
-	 * if the higher order 8 bits are not zero. Printing
-	 * a floating point number in the kernel is a no-no,
-	 * always print the number as 32 bit unsigned integer.
-	 * The user-space needs to know about the strange
-	 * encoding of the alternate cpu capability.
-	 */
-	seq_printf(m, "Capability:           %u", info->capability);
-	if (info->format == 1)
-		seq_printf(m, " %u", ext->alt_capability);
-	seq_putc(m, '\n');
-	if (info->nominal_cap)
-		seq_printf(m, "Nominal Capability:   %d\n", info->nominal_cap);
-	if (info->secondary_cap)
-		seq_printf(m, "Secondary Capability: %d\n", info->secondary_cap);
-	for (i = 2; i <= info->cpus_total; i++) {
-		seq_printf(m, "Adjustment %02d-way:    %u",
-			   i, info->adjustment[i-2]);
-		if (info->format == 1)
-			seq_printf(m, " %u", ext->alt_adjustment[i-2]);
-		seq_putc(m, '\n');
-	}
-}
-
-static void stsi_2_2_2(struct seq_file *m, struct sysinfo_2_2_2 *info)
-{
-	if (stsi(info, 2, 2, 2))
-		return;
-	EBCASC(info->name, sizeof(info->name));
-	seq_putc(m, '\n');
-	seq_printf(m, "LPAR Number:          %d\n", info->lpar_number);
-	seq_printf(m, "LPAR Characteristics: ");
-	if (info->characteristics & LPAR_CHAR_DEDICATED)
-		seq_printf(m, "Dedicated ");
-	if (info->characteristics & LPAR_CHAR_SHARED)
-		seq_printf(m, "Shared ");
-	if (info->characteristics & LPAR_CHAR_LIMITED)
-		seq_printf(m, "Limited ");
-	seq_putc(m, '\n');
-	seq_printf(m, "LPAR Name:            %-8.8s\n", info->name);
-	seq_printf(m, "LPAR Adjustment:      %d\n", info->caf);
-	seq_printf(m, "LPAR CPUs Total:      %d\n", info->cpus_total);
-	seq_printf(m, "LPAR CPUs Configured: %d\n", info->cpus_configured);
-	seq_printf(m, "LPAR CPUs Standby:    %d\n", info->cpus_standby);
-	seq_printf(m, "LPAR CPUs Reserved:   %d\n", info->cpus_reserved);
-	seq_printf(m, "LPAR CPUs Dedicated:  %d\n", info->cpus_dedicated);
-	seq_printf(m, "LPAR CPUs Shared:     %d\n", info->cpus_shared);
-	if (info->mt_installed & 0x80) {
-		seq_printf(m, "LPAR CPUs G-MTID:     %d\n",
-			   info->mt_general & 0x1f);
-		seq_printf(m, "LPAR CPUs S-MTID:     %d\n",
-			   info->mt_installed & 0x1f);
-		seq_printf(m, "LPAR CPUs PS-MTID:    %d\n",
-			   info->mt_psmtid & 0x1f);
-	}
-}
-
-static void print_ext_name(struct seq_file *m, int lvl,
-			   struct sysinfo_3_2_2 *info)
-{
-	if (info->vm[lvl].ext_name_encoding == 0)
-		return;
-	if (info->ext_names[lvl][0] == 0)
-		return;
-	switch (info->vm[lvl].ext_name_encoding) {
-	case 1: /* EBCDIC */
-		EBCASC(info->ext_names[lvl], sizeof(info->ext_names[lvl]));
-		break;
-	case 2:	/* UTF-8 */
-		break;
-	default:
-		return;
-	}
-	seq_printf(m, "VM%02d Extended Name:   %-.256s\n", lvl,
-		   info->ext_names[lvl]);
-}
-
-static void print_uuid(struct seq_file *m, int i, struct sysinfo_3_2_2 *info)
-{
-	if (!memcmp(&info->vm[i].uuid, &NULL_UUID_BE, sizeof(uuid_be)))
-		return;
-	seq_printf(m, "VM%02d UUID:            %pUb\n", i, &info->vm[i].uuid);
-}
-
-static void stsi_3_2_2(struct seq_file *m, struct sysinfo_3_2_2 *info)
-{
-	int i;
-
-	if (stsi(info, 3, 2, 2))
-		return;
-	for (i = 0; i < info->count; i++) {
-		EBCASC(info->vm[i].name, sizeof(info->vm[i].name));
-		EBCASC(info->vm[i].cpi, sizeof(info->vm[i].cpi));
-		seq_putc(m, '\n');
-		seq_printf(m, "VM%02d Name:            %-8.8s\n", i, info->vm[i].name);
-		seq_printf(m, "VM%02d Control Program: %-16.16s\n", i, info->vm[i].cpi);
-		seq_printf(m, "VM%02d Adjustment:      %d\n", i, info->vm[i].caf);
-		seq_printf(m, "VM%02d CPUs Total:      %d\n", i, info->vm[i].cpus_total);
-		seq_printf(m, "VM%02d CPUs Configured: %d\n", i, info->vm[i].cpus_configured);
-		seq_printf(m, "VM%02d CPUs Standby:    %d\n", i, info->vm[i].cpus_standby);
-		seq_printf(m, "VM%02d CPUs Reserved:   %d\n", i, info->vm[i].cpus_reserved);
-		print_ext_name(m, i, info);
-		print_uuid(m, i, info);
-	}
-}
-
-static int sysinfo_show(struct seq_file *m, void *v)
-{
-	void *info = (void *)get_zeroed_page(GFP_KERNEL);
-	int level;
-
-	if (!info)
-		return 0;
-	level = stsi(NULL, 0, 0, 0);
-	if (level >= 1)
-		stsi_1_1_1(m, info);
-	if (level >= 1)
-		stsi_15_1_x(m, info);
-	if (level >= 1)
-		stsi_1_2_2(m, info);
-	if (level >= 2)
-		stsi_2_2_2(m, info);
-	if (level >= 3)
-		stsi_3_2_2(m, info);
-	free_page((unsigned long)info);
-	return 0;
-}
-
-static int sysinfo_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, sysinfo_show, NULL);
-}
-
-static const struct file_operations sysinfo_fops = {
-	.open		= sysinfo_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int __init sysinfo_create_proc(void)
-{
-	proc_create("sysinfo", 0444, NULL, &sysinfo_fops);
-	return 0;
-}
-device_initcall(sysinfo_create_proc);
+#include <asm/sn/pcibus_provider_defs.h>
+#include <asm/sn/tioce.h>
 
 /*
- * Service levels interface.
+ * Common TIOCE structure shared between the prom and kernel
+ *
+ * DO NOT CHANGE THIS STRUCT WITHOUT MAKING CORRESPONDING CHANGES TO THE
+ * PROM VERSION.
  */
+struct tioce_common {
+	struct pcibus_bussoft	ce_pcibus;	/* common pciio header */
 
-static DECLARE_RWSEM(service_level_sem);
-static LIST_HEAD(service_level_list);
-
-int register_service_level(struct service_level *slr)
-{
-	struct service_level *ptr;
-
-	down_write(&service_level_sem);
-	list_for_each_entry(ptr, &service_level_list, list)
-		if (ptr == slr) {
-			up_write(&service_level_sem);
-			return -EEXIST;
-		}
-	list_add_tail(&slr->list, &service_level_list);
-	up_write(&service_level_sem);
-	return 0;
-}
-EXPORT_SYMBOL(register_service_level);
-
-int unregister_service_level(struct service_level *slr)
-{
-	struct service_level *ptr, *next;
-	int rc = -ENOENT;
-
-	down_write(&service_level_sem);
-	list_for_each_entry_safe(ptr, next, &service_level_list, list) {
-		if (ptr != slr)
-			continue;
-		list_del(&ptr->list);
-		rc = 0;
-		break;
-	}
-	up_write(&service_level_sem);
-	return rc;
-}
-EXPORT_SYMBOL(unregister_service_level);
-
-static void *service_level_start(struct seq_file *m, loff_t *pos)
-{
-	down_read(&service_level_sem);
-	return seq_list_start(&service_level_list, *pos);
-}
-
-static void *service_level_next(struct seq_file *m, void *p, loff_t *pos)
-{
-	return seq_list_next(p, &service_level_list, pos);
-}
-
-static void service_level_stop(struct seq_file *m, void *p)
-{
-	up_read(&service_level_sem);
-}
-
-static int service_level_show(struct seq_file *m, void *p)
-{
-	struct service_level *slr;
-
-	slr = list_entry(p, struct service_level, list);
-	slr->seq_print(m, slr);
-	return 0;
-}
-
-static const struct seq_operations service_level_seq_ops = {
-	.start		= service_level_start,
-	.next		= service_level_next,
-	.stop		= service_level_stop,
-	.show		= service_level_show
+	u32		ce_rev;
+	u64		ce_kernel_private;
+	u64		ce_prom_private;
 };
 
-static int service_level_open(struct inode *inode, struct file *file)
-{
-	return seq_open(file, &service_level_seq_ops);
-}
+struct tioce_kernel {
+	struct tioce_common	*ce_common;
+	spinlock_t		ce_lock;
+	struct list_head	ce_dmamap_list;
 
-static const struct file_operations service_level_ops = {
-	.open		= service_level_open,
-	.read		= seq_read,
-	.llseek 	= seq_lseek,
-	.release	= seq_release
+	u64		ce_ate40_shadow[TIOCE_NUM_M40_ATES];
+	u64		ce_ate3240_shadow[TIOCE_NUM_M3240_ATES];
+	u32		ce_ate3240_pagesize;
+
+	u8			ce_port1_secondary;
+
+	/* per-port resources */
+	struct {
+		int 		dirmap_refcnt;
+		u64	dirmap_shadow;
+	} ce_port[TIOCE_NUM_PORTS];
 };
 
-static void service_level_vm_print(struct seq_file *m,
-				   struct service_level *slr)
-{
-	char *query_buffer, *str;
+struct tioce_dmamap {
+	struct list_head	ce_dmamap_list;	/* headed by tioce_kernel */
+	u32		refcnt;
 
-	query_buffer = kmalloc(1024, GFP_KERNEL | GFP_DMA);
-	if (!query_buffer)
-		return;
-	cpcmd("QUERY CPLEVEL", query_buffer, 1024, NULL);
-	str = strchr(query_buffer, '\n');
-	if (str)
-		*str = 0;
-	seq_printf(m, "VM: %s\n", query_buffer);
-	kfree(query_buffer);
-}
-
-static struct service_level service_level_vm = {
-	.seq_print = service_level_vm_print
-};
-
-static __init int create_proc_service_level(void)
-{
-	proc_create("service_levels", 0, NULL, &service_level_ops);
-	if (MACHINE_IS_VM)
-		register_service_level(&service_level_vm);
-	return 0;
-}
-subsys_initcall(create_proc_service_level);
-
-/*
- * CPU capability might have changed. Therefore recalculate loops_per_jiffy.
- */
-void s390_adjust_jiffies(void)
-{
-	struct sysinfo_1_2_2 *info;
-	const unsigned int fmil = 0x4b189680;	/* 1e7 as 32-bit float. */
-	FP_DECL_S(SA); FP_DECL_S(SB); FP_DECL_S(SR);
-	FP_DECL_EX;
-	unsigned int capability;
-
-	info = (void *) get_zeroed_page(GFP_KERNEL);
-	if (!info)
-		return;
-
-	if (stsi(info, 1, 2, 2) == 0) {
-		/*
-		 * Major sigh. The cpu capability encoding is "special".
-		 * If the first 9 bits of info->capability are 0 then it
-		 * is a 32 bit unsigned integer in the range 0 .. 2^23.
-		 * If the first 9 bits are != 0 then it is a 32 bit float.
-		 * In addition a lower value indicates a proportionally
-		 * higher cpu capacity. Bogomips are the other way round.
-		 * To get to a halfway suitable number we divide 1e7
-		 * by the cpu capability number. Yes, that means a floating
-		 * point division .. math-emu here we come :-)
-		 */
-		FP_UNPACK_SP(SA, &fmil);
-		if ((info->capability >> 23) == 0)
-			FP_FROM_INT_S(SB, (long) info->capability, 64, long);
-		else
-			FP_UNPACK_SP(SB, &info->capability);
-		FP_DIV_S(SR, SA, SB);
-		FP_TO_INT_S(capability, SR, 32, 0);
-	} else
-		/*
-		 * Really old machine without stsi block for basic
-		 * cpu information. Report 42.0 bogomips.
-		 */
-		capability = 42;
-	loops_per_jiffy = capability * (500000/HZ);
-	free_page((unsigned long) info);
-}
-
-/*
- * calibrate the delay loop
- */
-void calibrate_delay(void)
-{
-	s390_adjust_jiffies();
-	/* Print the good old Bogomips line .. */
-	printk(KERN_DEBUG "Calibrating delay loop (skipped)... "
-	       "%lu.%02lu BogoMIPS preset\n", loops_per_jiffy/(500000/HZ),
-	       (loops_per_jiffy/(5000/HZ)) % 100);
-}
+	u64		nbytes;		/* # bytes mapped */

@@ -1,290 +1,307 @@
+_umem32(struct qib_devdata *dd, void __user *uaddr,
+			   u32 regoffs, size_t count)
+{
+	const u32 __iomem *reg_addr;
+	const u32 __iomem *reg_end;
+	u32 limit;
+	int ret;
+
+	reg_addr = qib_remap_ioaddr32(dd, regoffs, &limit);
+	if (reg_addr == NULL || limit == 0 || !(dd->flags & QIB_PRESENT)) {
+		ret = -EINVAL;
+		goto bail;
+	}
+	if (count >= limit)
+		count = limit;
+	reg_end = reg_addr + (count / sizeof(u32));
+
+	/* not very efficient, but it works for now */
+	while (reg_addr < reg_end) {
+		u32 data = readl(reg_addr);
+
+		if (copy_to_user(uaddr, &data, sizeof(data))) {
+			ret = -EFAULT;
+			goto bail;
+		}
+
+		reg_addr++;
+		uaddr += sizeof(u32);
+
+	}
+	ret = 0;
+bail:
+	return ret;
+}
+
 /*
- * I2C multiplexer using GPIO API
+ * qib_write_umem32 - write a 32-bit quantity to the chip from user space
+ * @dd: the qlogic_ib device
+ * @regoffs: the offset from BAR0 (_NOT_ full pointer, anymore)
+ * @uaddr: the source of the data in user memory
+ * @count: number of bytes to copy
  *
- * Peter Korsgaard <peter.korsgaard@barco.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
+ * write 32 bit values, not 64 bit; for memories that only
+ * support 32 bit write; usually a single dword.
  */
 
-#include <linux/i2c.h>
-#include <linux/i2c-mux.h>
-#include <linux/i2c-mux-gpio.h>
-#include <linux/platform_device.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
-
-struct gpiomux {
-	struct i2c_adapter *parent;
-	struct i2c_adapter **adap; /* child busses */
-	struct i2c_mux_gpio_platform_data data;
-	unsigned gpio_base;
-};
-
-static void i2c_mux_gpio_set(const struct gpiomux *mux, unsigned val)
+static int qib_write_umem32(struct qib_devdata *dd, u32 regoffs,
+			    const void __user *uaddr, size_t count)
 {
-	int i;
+	u32 __iomem *reg_addr;
+	const u32 __iomem *reg_end;
+	u32 limit;
+	int ret;
 
-	for (i = 0; i < mux->data.n_gpios; i++)
-		gpio_set_value_cansleep(mux->gpio_base + mux->data.gpios[i],
-					val & (1 << i));
+	reg_addr = qib_remap_ioaddr32(dd, regoffs, &limit);
+	if (reg_addr == NULL || limit == 0 || !(dd->flags & QIB_PRESENT)) {
+		ret = -EINVAL;
+		goto bail;
+	}
+	if (count >= limit)
+		count = limit;
+	reg_end = reg_addr + (count / sizeof(u32));
+
+	while (reg_addr < reg_end) {
+		u32 data;
+
+		if (copy_from_user(&data, uaddr, sizeof(data))) {
+			ret = -EFAULT;
+			goto bail;
+		}
+		writel(data, reg_addr);
+
+		reg_addr++;
+		uaddr += sizeof(u32);
+	}
+	ret = 0;
+bail:
+	return ret;
 }
 
-static int i2c_mux_gpio_select(struct i2c_adapter *adap, void *data, u32 chan)
+static int qib_diag_open(struct inode *in, struct file *fp)
 {
-	struct gpiomux *mux = data;
+	int unit = iminor(in) - QIB_DIAG_MINOR_BASE;
+	struct qib_devdata *dd;
+	struct qib_diag_client *dc;
+	int ret;
 
-	i2c_mux_gpio_set(mux, chan);
+	mutex_lock(&qib_mutex);
 
-	return 0;
-}
+	dd = qib_lookup(unit);
 
-static int i2c_mux_gpio_deselect(struct i2c_adapter *adap, void *data, u32 chan)
-{
-	struct gpiomux *mux = data;
-
-	i2c_mux_gpio_set(mux, mux->data.idle);
-
-	return 0;
-}
-
-static int match_gpio_chip_by_label(struct gpio_chip *chip,
-					      void *data)
-{
-	return !strcmp(chip->label, data);
-}
-
-#ifdef CONFIG_OF
-static int i2c_mux_gpio_probe_dt(struct gpiomux *mux,
-					struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct device_node *adapter_np, *child;
-	struct i2c_adapter *adapter;
-	unsigned *values, *gpios;
-	int i = 0, ret;
-
-	if (!np)
-		return -ENODEV;
-
-	adapter_np = of_parse_phandle(np, "i2c-parent", 0);
-	if (!adapter_np) {
-		dev_err(&pdev->dev, "Cannot parse i2c-parent\n");
-		return -ENODEV;
-	}
-	adapter = of_find_i2c_adapter_by_node(adapter_np);
-	of_node_put(adapter_np);
-	if (!adapter)
-		return -EPROBE_DEFER;
-
-	mux->data.parent = i2c_adapter_id(adapter);
-	put_device(&adapter->dev);
-
-	mux->data.n_values = of_get_child_count(np);
-
-	values = devm_kzalloc(&pdev->dev,
-			      sizeof(*mux->data.values) * mux->data.n_values,
-			      GFP_KERNEL);
-	if (!values) {
-		dev_err(&pdev->dev, "Cannot allocate values array");
-		return -ENOMEM;
+	if (dd == NULL || !(dd->flags & QIB_PRESENT) ||
+	    !dd->kregbase) {
+		ret = -ENODEV;
+		goto bail;
 	}
 
-	for_each_child_of_node(np, child) {
-		of_property_read_u32(child, "reg", values + i);
-		i++;
-	}
-	mux->data.values = values;
-
-	if (of_property_read_u32(np, "idle-state", &mux->data.idle))
-		mux->data.idle = I2C_MUX_GPIO_NO_IDLE;
-
-	mux->data.n_gpios = of_gpio_named_count(np, "mux-gpios");
-	if (mux->data.n_gpios < 0) {
-		dev_err(&pdev->dev, "Missing mux-gpios property in the DT.\n");
-		return -EINVAL;
-	}
-
-	gpios = devm_kzalloc(&pdev->dev,
-			     sizeof(*mux->data.gpios) * mux->data.n_gpios, GFP_KERNEL);
-	if (!gpios) {
-		dev_err(&pdev->dev, "Cannot allocate gpios array");
-		return -ENOMEM;
-	}
-
-	for (i = 0; i < mux->data.n_gpios; i++) {
-		ret = of_get_named_gpio(np, "mux-gpios", i);
-		if (ret < 0)
-			return ret;
-		gpios[i] = ret;
-	}
-
-	mux->data.gpios = gpios;
-
-	return 0;
-}
-#else
-static int i2c_mux_gpio_probe_dt(struct gpiomux *mux,
-					struct platform_device *pdev)
-{
-	return 0;
-}
-#endif
-
-static int i2c_mux_gpio_probe(struct platform_device *pdev)
-{
-	struct gpiomux *mux;
-	struct i2c_adapter *parent;
-	int (*deselect) (struct i2c_adapter *, void *, u32);
-	unsigned initial_state, gpio_base;
-	int i, ret;
-
-	mux = devm_kzalloc(&pdev->dev, sizeof(*mux), GFP_KERNEL);
-	if (!mux) {
-		dev_err(&pdev->dev, "Cannot allocate gpiomux structure");
-		return -ENOMEM;
-	}
-
-	platform_set_drvdata(pdev, mux);
-
-	if (!dev_get_platdata(&pdev->dev)) {
-		ret = i2c_mux_gpio_probe_dt(mux, pdev);
-		if (ret < 0)
-			return ret;
-	} else {
-		memcpy(&mux->data, dev_get_platdata(&pdev->dev),
-			sizeof(mux->data));
-	}
-
-	/*
-	 * If a GPIO chip name is provided, the GPIO pin numbers provided are
-	 * relative to its base GPIO number. Otherwise they are absolute.
-	 */
-	if (mux->data.gpio_chip) {
-		struct gpio_chip *gpio;
-
-		gpio = gpiochip_find(mux->data.gpio_chip,
-				     match_gpio_chip_by_label);
-		if (!gpio)
-			return -EPROBE_DEFER;
-
-		gpio_base = gpio->base;
-	} else {
-		gpio_base = 0;
-	}
-
-	parent = i2c_get_adapter(mux->data.parent);
-	if (!parent)
-		return -EPROBE_DEFER;
-
-	mux->parent = parent;
-	mux->gpio_base = gpio_base;
-
-	mux->adap = devm_kzalloc(&pdev->dev,
-				 sizeof(*mux->adap) * mux->data.n_values,
-				 GFP_KERNEL);
-	if (!mux->adap) {
-		dev_err(&pdev->dev, "Cannot allocate i2c_adapter structure");
+	dc = get_client(dd);
+	if (!dc) {
 		ret = -ENOMEM;
-		goto alloc_failed;
+		goto bail;
 	}
-
-	if (mux->data.idle != I2C_MUX_GPIO_NO_IDLE) {
-		initial_state = mux->data.idle;
-		deselect = i2c_mux_gpio_deselect;
-	} else {
-		initial_state = mux->data.values[0];
-		deselect = NULL;
-	}
-
-	for (i = 0; i < mux->data.n_gpios; i++) {
-		ret = gpio_request(gpio_base + mux->data.gpios[i], "i2c-mux-gpio");
-		if (ret) {
-			dev_err(&pdev->dev, "Failed to request GPIO %d\n",
-				mux->data.gpios[i]);
-			goto err_request_gpio;
-		}
-
-		ret = gpio_direction_output(gpio_base + mux->data.gpios[i],
-					    initial_state & (1 << i));
-		if (ret) {
-			dev_err(&pdev->dev,
-				"Failed to set direction of GPIO %d to output\n",
-				mux->data.gpios[i]);
-			i++;	/* gpio_request above succeeded, so must free */
-			goto err_request_gpio;
-		}
-	}
-
-	for (i = 0; i < mux->data.n_values; i++) {
-		u32 nr = mux->data.base_nr ? (mux->data.base_nr + i) : 0;
-		unsigned int class = mux->data.classes ? mux->data.classes[i] : 0;
-
-		mux->adap[i] = i2c_add_mux_adapter(parent, &pdev->dev, mux, nr,
-						   mux->data.values[i], class,
-						   i2c_mux_gpio_select, deselect);
-		if (!mux->adap[i]) {
-			ret = -ENODEV;
-			dev_err(&pdev->dev, "Failed to add adapter %d\n", i);
-			goto add_adapter_failed;
-		}
-	}
-
-	dev_info(&pdev->dev, "%d port mux on %s adapter\n",
-		 mux->data.n_values, parent->name);
-
-	return 0;
-
-add_adapter_failed:
-	for (; i > 0; i--)
-		i2c_del_mux_adapter(mux->adap[i - 1]);
-	i = mux->data.n_gpios;
-err_request_gpio:
-	for (; i > 0; i--)
-		gpio_free(gpio_base + mux->data.gpios[i - 1]);
-alloc_failed:
-	i2c_put_adapter(parent);
+	dc->next = dd->diag_client;
+	dd->diag_client = dc;
+	fp->private_data = dc;
+	ret = 0;
+bail:
+	mutex_unlock(&qib_mutex);
 
 	return ret;
 }
 
-static int i2c_mux_gpio_remove(struct platform_device *pdev)
+/**
+ * qib_diagpkt_write - write an IB packet
+ * @fp: the diag data device file pointer
+ * @data: qib_diag_pkt structure saying where to get the packet
+ * @count: size of data to write
+ * @off: unused by this code
+ */
+static ssize_t qib_diagpkt_write(struct file *fp,
+				 const char __user *data,
+				 size_t count, loff_t *off)
 {
-	struct gpiomux *mux = platform_get_drvdata(pdev);
-	int i;
+	u32 __iomem *piobuf;
+	u32 plen, pbufn, maxlen_reserve;
+	struct qib_diag_xpkt dp;
+	u32 *tmpbuf = NULL;
+	struct qib_devdata *dd;
+	struct qib_pportdata *ppd;
+	ssize_t ret = 0;
 
-	for (i = 0; i < mux->data.n_values; i++)
-		i2c_del_mux_adapter(mux->adap[i]);
+	if (count != sizeof(dp)) {
+		ret = -EINVAL;
+		goto bail;
+	}
+	if (copy_from_user(&dp, data, sizeof(dp))) {
+		ret = -EFAULT;
+		goto bail;
+	}
 
-	for (i = 0; i < mux->data.n_gpios; i++)
-		gpio_free(mux->gpio_base + mux->data.gpios[i]);
+	dd = qib_lookup(dp.unit);
+	if (!dd || !(dd->flags & QIB_PRESENT) || !dd->kregbase) {
+		ret = -ENODEV;
+		goto bail;
+	}
+	if (!(dd->flags & QIB_INITTED)) {
+		/* no hardware, freeze, etc. */
+		ret = -ENODEV;
+		goto bail;
+	}
 
-	i2c_put_adapter(mux->parent);
+	if (dp.version != _DIAG_XPKT_VERS) {
+		qib_dev_err(dd, "Invalid version %u for diagpkt_write\n",
+			    dp.version);
+		ret = -EINVAL;
+		goto bail;
+	}
+	/* send count must be an exact number of dwords */
+	if (dp.len & 3) {
+		ret = -EINVAL;
+		goto bail;
+	}
+	if (!dp.port || dp.port > dd->num_pports) {
+		ret = -EINVAL;
+		goto bail;
+	}
+	ppd = &dd->pport[dp.port - 1];
+
+	/*
+	 * need total length before first word written, plus 2 Dwords. One Dword
+	 * is for padding so we get the full user data when not aligned on
+	 * a word boundary. The other Dword is to make sure we have room for the
+	 * ICRC which gets tacked on later.
+	 */
+	maxlen_reserve = 2 * sizeof(u32);
+	if (dp.len > ppd->ibmaxlen - maxlen_reserve) {
+		ret = -EINVAL;
+		goto bail;
+	}
+
+	plen = sizeof(u32) + dp.len;
+
+	tmpbuf = vmalloc(plen);
+	if (!tmpbuf) {
+		qib_devinfo(dd->pcidev,
+			"Unable to allocate tmp buffer, failing\n");
+		ret = -ENOMEM;
+		goto bail;
+	}
+
+	if (copy_from_user(tmpbuf,
+			   (const void __user *) (unsigned long) dp.data,
+			   dp.len)) {
+		ret = -EFAULT;
+		goto bail;
+	}
+
+	plen >>= 2;             /* in dwords */
+
+	if (dp.pbc_wd == 0)
+		dp.pbc_wd = plen;
+
+	piobuf = dd->f_getsendbuf(ppd, dp.pbc_wd, &pbufn);
+	if (!piobuf) {
+		ret = -EBUSY;
+		goto bail;
+	}
+	/* disarm it just to be extra sure */
+	dd->f_sendctrl(dd->pport, QIB_SENDCTRL_DISARM_BUF(pbufn));
+
+	/* disable header check on pbufn for this packet */
+	dd->f_txchk_change(dd, pbufn, 1, TXCHK_CHG_TYPE_DIS1, NULL);
+
+	writeq(dp.pbc_wd, piobuf);
+	/*
+	 * Copy all but the trigger word, then flush, so it's written
+	 * to chip before trigger word, then write trigger word, then
+	 * flush again, so packet is sent.
+	 */
+	if (dd->flags & QIB_PIO_FLUSH_WC) {
+		qib_flush_wc();
+		qib_pio_copy(piobuf + 2, tmpbuf, plen - 1);
+		qib_flush_wc();
+		__raw_writel(tmpbuf[plen - 1], piobuf + plen + 1);
+	} else
+		qib_pio_copy(piobuf + 2, tmpbuf, plen);
+
+	if (dd->flags & QIB_USE_SPCL_TRIG) {
+		u32 spcl_off = (pbufn >= dd->piobcnt2k) ? 2047 : 1023;
+
+		qib_flush_wc();
+		__raw_writel(0xaebecede, piobuf + spcl_off);
+	}
+
+	/*
+	 * Ensure buffer is written to the chip, then re-enable
+	 * header checks (if supported by chip).  The txchk
+	 * code will ensure seen by chip before returning.
+	 */
+	qib_flush_wc();
+	qib_sendbuf_done(dd, pbufn);
+	dd->f_txchk_change(dd, pbufn, 1, TXCHK_CHG_TYPE_ENAB1, NULL);
+
+	ret = sizeof(dp);
+
+bail:
+	vfree(tmpbuf);
+	return ret;
+}
+
+static int qib_diag_release(struct inode *in, struct file *fp)
+{
+	mutex_lock(&qib_mutex);
+	return_client(fp->private_data);
+	fp->private_data = NULL;
+	mutex_unlock(&qib_mutex);
+	return 0;
+}
+
+/*
+ * Chip-specific code calls to register its interest in
+ * a specific range.
+ */
+struct diag_observer_list_elt {
+	struct diag_observer_list_elt *next;
+	const struct diag_observer *op;
+};
+
+int qib_register_observer(struct qib_devdata *dd,
+			  const struct diag_observer *op)
+{
+	struct diag_observer_list_elt *olp;
+	unsigned long flags;
+
+	if (!dd || !op)
+		return -EINVAL;
+	olp = vmalloc(sizeof(*olp));
+	if (!olp) {
+		pr_err("vmalloc for observer failed\n");
+		return -ENOMEM;
+	}
+
+	spin_lock_irqsave(&dd->qib_diag_trans_lock, flags);
+	olp->op = op;
+	olp->next = dd->diag_observer_list;
+	dd->diag_observer_list = olp;
+	spin_unlock_irqrestore(&dd->qib_diag_trans_lock, flags);
 
 	return 0;
 }
 
-static const struct of_device_id i2c_mux_gpio_of_match[] = {
-	{ .compatible = "i2c-mux-gpio", },
-	{},
-};
-MODULE_DEVICE_TABLE(of, i2c_mux_gpio_of_match);
+/* Remove all registered observers when device is closed */
+static void qib_unregister_observers(struct qib_devdata *dd)
+{
+	struct diag_observer_list_elt *olp;
+	unsigned long flags;
 
-static struct platform_driver i2c_mux_gpio_driver = {
-	.probe	= i2c_mux_gpio_probe,
-	.remove	= i2c_mux_gpio_remove,
-	.driver	= {
-		.name	= "i2c-mux-gpio",
-		.of_match_table = i2c_mux_gpio_of_match,
-	},
-};
-
-module_platform_driver(i2c_mux_gpio_driver);
-
-MODULE_DESCRIPTION("GPIO-based I2C multiplexer driver");
-MODULE_AUTHOR("Peter Korsgaard <peter.korsgaard@barco.com>");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:i2c-mux-gpio");
+	spin_lock_irqsave(&dd->qib_diag_trans_lock, flags);
+	olp = dd->diag_observer_list;
+	while (olp) {
+		/* Pop one observer, let go of lock */
+		dd->diag_observer_list = olp->next;
+		spin_unlock_irqrestore(&dd->qib_diag_trans_lock, flags);
+		vfree(olp);
+		/* try again. */
+		spin_lock_irqsave(&dd->qib_diag_trans_lock, flags);
+		olp = dd->diag_observer_list;

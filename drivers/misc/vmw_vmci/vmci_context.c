@@ -1,1224 +1,617 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#include <linux/vmw_vmci_defs.h>
-#include <linux/vmw_vmci_api.h>
-#include <linux/highmem.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
-
-#include "vmci_queue_pair.h"
-#include "vmci_datagram.h"
-#include "vmci_doorbell.h"
-#include "vmci_context.h"
-#include "vmci_driver.h"
-#include "vmci_event.h"
-
-/* Use a wide upper bound for the maximum contexts. */
-#define VMCI_MAX_CONTEXTS 2000
-
-/*
- * List of current VMCI contexts.  Contexts can be added by
- * vmci_ctx_create() and removed via vmci_ctx_destroy().
- * These, along with context lookup, are protected by the
- * list structure's lock.
- */
-static struct {
-	struct list_head head;
-	spinlock_t lock; /* Spinlock for context list operations */
-} ctx_list = {
-	.head = LIST_HEAD_INIT(ctx_list.head),
-	.lock = __SPIN_LOCK_UNLOCKED(ctx_list.lock),
-};
-
-/* Used by contexts that did not set up notify flag pointers */
-static bool ctx_dummy_notify;
-
-static void ctx_signal_notify(struct vmci_ctx *context)
-{
-	*context->notify = true;
-}
-
-static void ctx_clear_notify(struct vmci_ctx *context)
-{
-	*context->notify = false;
-}
-
-/*
- * If nothing requires the attention of the guest, clears both
- * notify flag and call.
- */
-static void ctx_clear_notify_call(struct vmci_ctx *context)
-{
-	if (context->pending_datagrams == 0 &&
-	    vmci_handle_arr_get_size(context->pending_doorbell_array) == 0)
-		ctx_clear_notify(context);
-}
-
-/*
- * Sets the context's notify flag iff datagrams are pending for this
- * context.  Called from vmci_setup_notify().
- */
-void vmci_ctx_check_signal_notify(struct vmci_ctx *context)
-{
-	spin_lock(&context->lock);
-	if (context->pending_datagrams)
-		ctx_signal_notify(context);
-	spin_unlock(&context->lock);
-}
-
-/*
- * Allocates and initializes a VMCI context.
- */
-struct vmci_ctx *vmci_ctx_create(u32 cid, u32 priv_flags,
-				 uintptr_t event_hnd,
-				 int user_version,
-				 const struct cred *cred)
-{
-	struct vmci_ctx *context;
-	int error;
-
-	if (cid == VMCI_INVALID_ID) {
-		pr_devel("Invalid context ID for VMCI context\n");
-		error = -EINVAL;
-		goto err_out;
-	}
-
-	if (priv_flags & ~VMCI_PRIVILEGE_ALL_FLAGS) {
-		pr_devel("Invalid flag (flags=0x%x) for VMCI context\n",
-			 priv_flags);
-		error = -EINVAL;
-		goto err_out;
-	}
-
-	if (user_version == 0) {
-		pr_devel("Invalid suer_version %d\n", user_version);
-		error = -EINVAL;
-		goto err_out;
-	}
-
-	context = kzalloc(sizeof(*context), GFP_KERNEL);
-	if (!context) {
-		pr_warn("Failed to allocate memory for VMCI context\n");
-		error = -EINVAL;
-		goto err_out;
-	}
-
-	kref_init(&context->kref);
-	spin_lock_init(&context->lock);
-	INIT_LIST_HEAD(&context->list_item);
-	INIT_LIST_HEAD(&context->datagram_queue);
-	INIT_LIST_HEAD(&context->notifier_list);
-
-	/* Initialize host-specific VMCI context. */
-	init_waitqueue_head(&context->host_context.wait_queue);
-
-	context->queue_pair_array =
-		vmci_handle_arr_create(0, VMCI_MAX_GUEST_QP_COUNT);
-	if (!context->queue_pair_array) {
-		error = -ENOMEM;
-		goto err_free_ctx;
-	}
-
-	context->doorbell_array =
-		vmci_handle_arr_create(0, VMCI_MAX_GUEST_DOORBELL_COUNT);
-	if (!context->doorbell_array) {
-		error = -ENOMEM;
-		goto err_free_qp_array;
-	}
-
-	context->pending_doorbell_array =
-		vmci_handle_arr_create(0, VMCI_MAX_GUEST_DOORBELL_COUNT);
-	if (!context->pending_doorbell_array) {
-		error = -ENOMEM;
-		goto err_free_db_array;
-	}
-
-	context->user_version = user_version;
-
-	context->priv_flags = priv_flags;
-
-	if (cred)
-		context->cred = get_cred(cred);
-
-	context->notify = &ctx_dummy_notify;
-	context->notify_page = NULL;
-
-	/*
-	 * If we collide with an existing context we generate a new
-	 * and use it instead. The VMX will determine if regeneration
-	 * is okay. Since there isn't 4B - 16 VMs running on a given
-	 * host, the below loop will terminate.
-	 */
-	spin_lock(&ctx_list.lock);
-
-	while (vmci_ctx_exists(cid)) {
-		/* We reserve the lowest 16 ids for fixed contexts. */
-		cid = max(cid, VMCI_RESERVED_CID_LIMIT - 1) + 1;
-		if (cid == VMCI_INVALID_ID)
-			cid = VMCI_RESERVED_CID_LIMIT;
-	}
-	context->cid = cid;
-
-	list_add_tail_rcu(&context->list_item, &ctx_list.head);
-	spin_unlock(&ctx_list.lock);
-
-	return context;
-
- err_free_db_array:
-	vmci_handle_arr_destroy(context->doorbell_array);
- err_free_qp_array:
-	vmci_handle_arr_destroy(context->queue_pair_array);
- err_free_ctx:
-	kfree(context);
- err_out:
-	return ERR_PTR(error);
-}
-
-/*
- * Destroy VMCI context.
- */
-void vmci_ctx_destroy(struct vmci_ctx *context)
-{
-	spin_lock(&ctx_list.lock);
-	list_del_rcu(&context->list_item);
-	spin_unlock(&ctx_list.lock);
-	synchronize_rcu();
-
-	vmci_ctx_put(context);
-}
-
-/*
- * Fire notification for all contexts interested in given cid.
- */
-static int ctx_fire_notification(u32 context_id, u32 priv_flags)
-{
-	u32 i, array_size;
-	struct vmci_ctx *sub_ctx;
-	struct vmci_handle_arr *subscriber_array;
-	struct vmci_handle context_handle =
-		vmci_make_handle(context_id, VMCI_EVENT_HANDLER);
-
-	/*
-	 * We create an array to hold the subscribers we find when
-	 * scanning through all contexts.
-	 */
-	subscriber_array = vmci_handle_arr_create(0, VMCI_MAX_CONTEXTS);
-	if (subscriber_array == NULL)
-		return VMCI_ERROR_NO_MEM;
-
-	/*
-	 * Scan all contexts to find who is interested in being
-	 * notified about given contextID.
-	 */
-	rcu_read_lock();
-	list_for_each_entry_rcu(sub_ctx, &ctx_list.head, list_item) {
-		struct vmci_handle_list *node;
-
-		/*
-		 * We only deliver notifications of the removal of
-		 * contexts, if the two contexts are allowed to
-		 * interact.
-		 */
-		if (vmci_deny_interaction(priv_flags, sub_ctx->priv_flags))
-			continue;
-
-		list_for_each_entry_rcu(node, &sub_ctx->notifier_list, node) {
-			if (!vmci_handle_is_equal(node->handle, context_handle))
-				continue;
-
-			vmci_handle_arr_append_entry(&subscriber_array,
-					vmci_make_handle(sub_ctx->cid,
-							 VMCI_EVENT_HANDLER));
-		}
-	}
-	rcu_read_unlock();
-
-	/* Fire event to all subscribers. */
-	array_size = vmci_handle_arr_get_size(subscriber_array);
-	for (i = 0; i < array_size; i++) {
-		int result;
-		struct vmci_event_ctx ev;
-
-		ev.msg.hdr.dst = vmci_handle_arr_get_entry(subscriber_array, i);
-		ev.msg.hdr.src = vmci_make_handle(VMCI_HYPERVISOR_CONTEXT_ID,
-						  VMCI_CONTEXT_RESOURCE_ID);
-		ev.msg.hdr.payload_size = sizeof(ev) - sizeof(ev.msg.hdr);
-		ev.msg.event_data.event = VMCI_EVENT_CTX_REMOVED;
-		ev.payload.context_id = context_id;
-
-		result = vmci_datagram_dispatch(VMCI_HYPERVISOR_CONTEXT_ID,
-						&ev.msg.hdr, false);
-		if (result < VMCI_SUCCESS) {
-			pr_devel("Failed to enqueue event datagram (type=%d) for context (ID=0x%x)\n",
-				 ev.msg.event_data.event,
-				 ev.msg.hdr.dst.context);
-			/* We continue to enqueue on next subscriber. */
-		}
-	}
-	vmci_handle_arr_destroy(subscriber_array);
-
-	return VMCI_SUCCESS;
-}
-
-/*
- * Returns the current number of pending datagrams. The call may
- * also serve as a synchronization point for the datagram queue,
- * as no enqueue operations can occur concurrently.
- */
-int vmci_ctx_pending_datagrams(u32 cid, u32 *pending)
-{
-	struct vmci_ctx *context;
-
-	context = vmci_ctx_get(cid);
-	if (context == NULL)
-		return VMCI_ERROR_INVALID_ARGS;
-
-	spin_lock(&context->lock);
-	if (pending)
-		*pending = context->pending_datagrams;
-	spin_unlock(&context->lock);
-	vmci_ctx_put(context);
-
-	return VMCI_SUCCESS;
-}
-
-/*
- * Queues a VMCI datagram for the appropriate target VM context.
- */
-int vmci_ctx_enqueue_datagram(u32 cid, struct vmci_datagram *dg)
-{
-	struct vmci_datagram_queue_entry *dq_entry;
-	struct vmci_ctx *context;
-	struct vmci_handle dg_src;
-	size_t vmci_dg_size;
-
-	vmci_dg_size = VMCI_DG_SIZE(dg);
-	if (vmci_dg_size > VMCI_MAX_DG_SIZE) {
-		pr_devel("Datagram too large (bytes=%Zu)\n", vmci_dg_size);
-		return VMCI_ERROR_INVALID_ARGS;
-	}
-
-	/* Get the target VM's VMCI context. */
-	context = vmci_ctx_get(cid);
-	if (!context) {
-		pr_devel("Invalid context (ID=0x%x)\n", cid);
-		return VMCI_ERROR_INVALID_ARGS;
-	}
-
-	/* Allocate guest call entry and add it to the target VM's queue. */
-	dq_entry = kmalloc(sizeof(*dq_entry), GFP_KERNEL);
-	if (dq_entry == NULL) {
-		pr_warn("Failed to allocate memory for datagram\n");
-		vmci_ctx_put(context);
-		return VMCI_ERROR_NO_MEM;
-	}
-	dq_entry->dg = dg;
-	dq_entry->dg_size = vmci_dg_size;
-	dg_src = dg->src;
-	INIT_LIST_HEAD(&dq_entry->list_item);
-
-	spin_lock(&context->lock);
-
-	/*
-	 * We put a higher limit on datagrams from the hypervisor.  If
-	 * the pending datagram is not from hypervisor, then we check
-	 * if enqueueing it would exceed the
-	 * VMCI_MAX_DATAGRAM_QUEUE_SIZE limit on the destination.  If
-	 * the pending datagram is from hypervisor, we allow it to be
-	 * queued at the destination side provided we don't reach the
-	 * VMCI_MAX_DATAGRAM_AND_EVENT_QUEUE_SIZE limit.
-	 */
-	if (context->datagram_queue_size + vmci_dg_size >=
-	    VMCI_MAX_DATAGRAM_QUEUE_SIZE &&
-	    (!vmci_handle_is_equal(dg_src,
-				vmci_make_handle
-				(VMCI_HYPERVISOR_CONTEXT_ID,
-				 VMCI_CONTEXT_RESOURCE_ID)) ||
-	     context->datagram_queue_size + vmci_dg_size >=
-	     VMCI_MAX_DATAGRAM_AND_EVENT_QUEUE_SIZE)) {
-		spin_unlock(&context->lock);
-		vmci_ctx_put(context);
-		kfree(dq_entry);
-		pr_devel("Context (ID=0x%x) receive queue is full\n", cid);
-		return VMCI_ERROR_NO_RESOURCES;
-	}
-
-	list_add(&dq_entry->list_item, &context->datagram_queue);
-	context->pending_datagrams++;
-	context->datagram_queue_size += vmci_dg_size;
-	ctx_signal_notify(context);
-	wake_up(&context->host_context.wait_queue);
-	spin_unlock(&context->lock);
-	vmci_ctx_put(context);
-
-	return vmci_dg_size;
-}
-
-/*
- * Verifies whether a context with the specified context ID exists.
- * FIXME: utility is dubious as no decisions can be reliably made
- * using this data as context can appear and disappear at any time.
- */
-bool vmci_ctx_exists(u32 cid)
-{
-	struct vmci_ctx *context;
-	bool exists = false;
-
-	rcu_read_lock();
-
-	list_for_each_entry_rcu(context, &ctx_list.head, list_item) {
-		if (context->cid == cid) {
-			exists = true;
-			break;
-		}
-	}
-
-	rcu_read_unlock();
-	return exists;
-}
-
-/*
- * Retrieves VMCI context corresponding to the given cid.
- */
-struct vmci_ctx *vmci_ctx_get(u32 cid)
-{
-	struct vmci_ctx *c, *context = NULL;
-
-	if (cid == VMCI_INVALID_ID)
-		return NULL;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(c, &ctx_list.head, list_item) {
-		if (c->cid == cid) {
-			/*
-			 * The context owner drops its own reference to the
-			 * context only after removing it from the list and
-			 * waiting for RCU grace period to expire. This
-			 * means that we are not about to increase the
-			 * reference count of something that is in the
-			 * process of being destroyed.
-			 */
-			context = c;
-			kref_get(&context->kref);
-			break;
-		}
-	}
-	rcu_read_unlock();
-
-	return context;
-}
-
-/*
- * Deallocates all parts of a context data structure. This
- * function doesn't lock the context, because it assumes that
- * the caller was holding the last reference to context.
- */
-static void ctx_free_ctx(struct kref *kref)
-{
-	struct vmci_ctx *context = container_of(kref, struct vmci_ctx, kref);
-	struct vmci_datagram_queue_entry *dq_entry, *dq_entry_tmp;
-	struct vmci_handle temp_handle;
-	struct vmci_handle_list *notifier, *tmp;
-
-	/*
-	 * Fire event to all contexts interested in knowing this
-	 * context is dying.
-	 */
-	ctx_fire_notification(context->cid, context->priv_flags);
-
-	/*
-	 * Cleanup all queue pair resources attached to context.  If
-	 * the VM dies without cleaning up, this code will make sure
-	 * that no resources are leaked.
-	 */
-	temp_handle = vmci_handle_arr_get_entry(context->queue_pair_array, 0);
-	while (!vmci_handle_is_equal(temp_handle, VMCI_INVALID_HANDLE)) {
-		if (vmci_qp_broker_detach(temp_handle,
-					  context) < VMCI_SUCCESS) {
-			/*
-			 * When vmci_qp_broker_detach() succeeds it
-			 * removes the handle from the array.  If
-			 * detach fails, we must remove the handle
-			 * ourselves.
-			 */
-			vmci_handle_arr_remove_entry(context->queue_pair_array,
-						     temp_handle);
-		}
-		temp_handle =
-		    vmci_handle_arr_get_entry(context->queue_pair_array, 0);
-	}
-
-	/*
-	 * It is fine to destroy this without locking the callQueue, as
-	 * this is the only thread having a reference to the context.
-	 */
-	list_for_each_entry_safe(dq_entry, dq_entry_tmp,
-				 &context->datagram_queue, list_item) {
-		WARN_ON(dq_entry->dg_size != VMCI_DG_SIZE(dq_entry->dg));
-		list_del(&dq_entry->list_item);
-		kfree(dq_entry->dg);
-		kfree(dq_entry);
-	}
-
-	list_for_each_entry_safe(notifier, tmp,
-				 &context->notifier_list, node) {
-		list_del(&notifier->node);
-		kfree(notifier);
-	}
-
-	vmci_handle_arr_destroy(context->queue_pair_array);
-	vmci_handle_arr_destroy(context->doorbell_array);
-	vmci_handle_arr_destroy(context->pending_doorbell_array);
-	vmci_ctx_unset_notify(context);
-	if (context->cred)
-		put_cred(context->cred);
-	kfree(context);
-}
-
-/*
- * Drops reference to VMCI context. If this is the last reference to
- * the context it will be deallocated. A context is created with
- * a reference count of one, and on destroy, it is removed from
- * the context list before its reference count is decremented. Thus,
- * if we reach zero, we are sure that nobody else are about to increment
- * it (they need the entry in the context list for that), and so there
- * is no need for locking.
- */
-void vmci_ctx_put(struct vmci_ctx *context)
-{
-	kref_put(&context->kref, ctx_free_ctx);
-}
-
-/*
- * Dequeues the next datagram and returns it to caller.
- * The caller passes in a pointer to the max size datagram
- * it can handle and the datagram is only unqueued if the
- * size is less than max_size. If larger max_size is set to
- * the size of the datagram to give the caller a chance to
- * set up a larger buffer for the guestcall.
- */
-int vmci_ctx_dequeue_datagram(struct vmci_ctx *context,
-			      size_t *max_size,
-			      struct vmci_datagram **dg)
-{
-	struct vmci_datagram_queue_entry *dq_entry;
-	struct list_head *list_item;
-	int rv;
-
-	/* Dequeue the next datagram entry. */
-	spin_lock(&context->lock);
-	if (context->pending_datagrams == 0) {
-		ctx_clear_notify_call(context);
-		spin_unlock(&context->lock);
-		pr_devel("No datagrams pending\n");
-		return VMCI_ERROR_NO_MORE_DATAGRAMS;
-	}
-
-	list_item = context->datagram_queue.next;
-
-	dq_entry =
-	    list_entry(list_item, struct vmci_datagram_queue_entry, list_item);
-
-	/* Check size of caller's buffer. */
-	if (*max_size < dq_entry->dg_size) {
-		*max_size = dq_entry->dg_size;
-		spin_unlock(&context->lock);
-		pr_devel("Caller's buffer should be at least (size=%u bytes)\n",
-			 (u32) *max_size);
-		return VMCI_ERROR_NO_MEM;
-	}
-
-	list_del(list_item);
-	context->pending_datagrams--;
-	context->datagram_queue_size -= dq_entry->dg_size;
-	if (context->pending_datagrams == 0) {
-		ctx_clear_notify_call(context);
-		rv = VMCI_SUCCESS;
-	} else {
-		/*
-		 * Return the size of the next datagram.
-		 */
-		struct vmci_datagram_queue_entry *next_entry;
-
-		list_item = context->datagram_queue.next;
-		next_entry =
-		    list_entry(list_item, struct vmci_datagram_queue_entry,
-			       list_item);
-
-		/*
-		 * The following size_t -> int truncation is fine as
-		 * the maximum size of a (routable) datagram is 68KB.
-		 */
-		rv = (int)next_entry->dg_size;
-	}
-	spin_unlock(&context->lock);
-
-	/* Caller must free datagram. */
-	*dg = dq_entry->dg;
-	dq_entry->dg = NULL;
-	kfree(dq_entry);
-
-	return rv;
-}
-
-/*
- * Reverts actions set up by vmci_setup_notify().  Unmaps and unlocks the
- * page mapped/locked by vmci_setup_notify().
- */
-void vmci_ctx_unset_notify(struct vmci_ctx *context)
-{
-	struct page *notify_page;
-
-	spin_lock(&context->lock);
-
-	notify_page = context->notify_page;
-	context->notify = &ctx_dummy_notify;
-	context->notify_page = NULL;
-
-	spin_unlock(&context->lock);
-
-	if (notify_page) {
-		kunmap(notify_page);
-		put_page(notify_page);
-	}
-}
-
-/*
- * Add remote_cid to list of contexts current contexts wants
- * notifications from/about.
- */
-int vmci_ctx_add_notification(u32 context_id, u32 remote_cid)
-{
-	struct vmci_ctx *context;
-	struct vmci_handle_list *notifier, *n;
-	int result;
-	bool exists = false;
-
-	context = vmci_ctx_get(context_id);
-	if (!context)
-		return VMCI_ERROR_NOT_FOUND;
-
-	if (VMCI_CONTEXT_IS_VM(context_id) && VMCI_CONTEXT_IS_VM(remote_cid)) {
-		pr_devel("Context removed notifications for other VMs not supported (src=0x%x, remote=0x%x)\n",
-			 context_id, remote_cid);
-		result = VMCI_ERROR_DST_UNREACHABLE;
-		goto out;
-	}
-
-	if (context->priv_flags & VMCI_PRIVILEGE_FLAG_RESTRICTED) {
-		result = VMCI_ERROR_NO_ACCESS;
-		goto out;
-	}
-
-	notifier = kmalloc(sizeof(struct vmci_handle_list), GFP_KERNEL);
-	if (!notifier) {
-		result = VMCI_ERROR_NO_MEM;
-		goto out;
-	}
-
-	INIT_LIST_HEAD(&notifier->node);
-	notifier->handle = vmci_make_handle(remote_cid, VMCI_EVENT_HANDLER);
-
-	spin_lock(&context->lock);
-
-	if (context->n_notifiers < VMCI_MAX_CONTEXTS) {
-		list_for_each_entry(n, &context->notifier_list, node) {
-			if (vmci_handle_is_equal(n->handle, notifier->handle)) {
-				exists = true;
-				break;
-			}
-		}
-
-		if (exists) {
-			kfree(notifier);
-			result = VMCI_ERROR_ALREADY_EXISTS;
-		} else {
-			list_add_tail_rcu(&notifier->node,
-					  &context->notifier_list);
-			context->n_notifiers++;
-			result = VMCI_SUCCESS;
-		}
-	} else {
-		kfree(notifier);
-		result = VMCI_ERROR_NO_MEM;
-	}
-
-	spin_unlock(&context->lock);
-
- out:
-	vmci_ctx_put(context);
-	return result;
-}
-
-/*
- * Remove remote_cid from current context's list of contexts it is
- * interested in getting notifications from/about.
- */
-int vmci_ctx_remove_notification(u32 context_id, u32 remote_cid)
-{
-	struct vmci_ctx *context;
-	struct vmci_handle_list *notifier, *tmp;
-	struct vmci_handle handle;
-	bool found = false;
-
-	context = vmci_ctx_get(context_id);
-	if (!context)
-		return VMCI_ERROR_NOT_FOUND;
-
-	handle = vmci_make_handle(remote_cid, VMCI_EVENT_HANDLER);
-
-	spin_lock(&context->lock);
-	list_for_each_entry_safe(notifier, tmp,
-				 &context->notifier_list, node) {
-		if (vmci_handle_is_equal(notifier->handle, handle)) {
-			list_del_rcu(&notifier->node);
-			context->n_notifiers--;
-			found = true;
-			break;
-		}
-	}
-	spin_unlock(&context->lock);
-
-	if (found) {
-		synchronize_rcu();
-		kfree(notifier);
-	}
-
-	vmci_ctx_put(context);
-
-	return found ? VMCI_SUCCESS : VMCI_ERROR_NOT_FOUND;
-}
-
-static int vmci_ctx_get_chkpt_notifiers(struct vmci_ctx *context,
-					u32 *buf_size, void **pbuf)
-{
-	u32 *notifiers;
-	size_t data_size;
-	struct vmci_handle_list *entry;
-	int i = 0;
-
-	if (context->n_notifiers == 0) {
-		*buf_size = 0;
-		*pbuf = NULL;
-		return VMCI_SUCCESS;
-	}
-
-	data_size = context->n_notifiers * sizeof(*notifiers);
-	if (*buf_size < data_size) {
-		*buf_size = data_size;
-		return VMCI_ERROR_MORE_DATA;
-	}
-
-	notifiers = kmalloc(data_size, GFP_ATOMIC); /* FIXME: want GFP_KERNEL */
-	if (!notifiers)
-		return VMCI_ERROR_NO_MEM;
-
-	list_for_each_entry(entry, &context->notifier_list, node)
-		notifiers[i++] = entry->handle.context;
-
-	*buf_size = data_size;
-	*pbuf = notifiers;
-	return VMCI_SUCCESS;
-}
-
-static int vmci_ctx_get_chkpt_doorbells(struct vmci_ctx *context,
-					u32 *buf_size, void **pbuf)
-{
-	struct dbell_cpt_state *dbells;
-	u32 i, n_doorbells;
-
-	n_doorbells = vmci_handle_arr_get_size(context->doorbell_array);
-	if (n_doorbells > 0) {
-		size_t data_size = n_doorbells * sizeof(*dbells);
-		if (*buf_size < data_size) {
-			*buf_size = data_size;
-			return VMCI_ERROR_MORE_DATA;
-		}
-
-		dbells = kzalloc(data_size, GFP_ATOMIC);
-		if (!dbells)
-			return VMCI_ERROR_NO_MEM;
-
-		for (i = 0; i < n_doorbells; i++)
-			dbells[i].handle = vmci_handle_arr_get_entry(
-						context->doorbell_array, i);
-
-		*buf_size = data_size;
-		*pbuf = dbells;
-	} else {
-		*buf_size = 0;
-		*pbuf = NULL;
-	}
-
-	return VMCI_SUCCESS;
-}
-
-/*
- * Get current context's checkpoint state of given type.
- */
-int vmci_ctx_get_chkpt_state(u32 context_id,
-			     u32 cpt_type,
-			     u32 *buf_size,
-			     void **pbuf)
-{
-	struct vmci_ctx *context;
-	int result;
-
-	context = vmci_ctx_get(context_id);
-	if (!context)
-		return VMCI_ERROR_NOT_FOUND;
-
-	spin_lock(&context->lock);
-
-	switch (cpt_type) {
-	case VMCI_NOTIFICATION_CPT_STATE:
-		result = vmci_ctx_get_chkpt_notifiers(context, buf_size, pbuf);
-		break;
-
-	case VMCI_WELLKNOWN_CPT_STATE:
-		/*
-		 * For compatibility with VMX'en with VM to VM communication, we
-		 * always return zero wellknown handles.
-		 */
-
-		*buf_size = 0;
-		*pbuf = NULL;
-		result = VMCI_SUCCESS;
-		break;
-
-	case VMCI_DOORBELL_CPT_STATE:
-		result = vmci_ctx_get_chkpt_doorbells(context, buf_size, pbuf);
-		break;
-
-	default:
-		pr_devel("Invalid cpt state (type=%d)\n", cpt_type);
-		result = VMCI_ERROR_INVALID_ARGS;
-		break;
-	}
-
-	spin_unlock(&context->lock);
-	vmci_ctx_put(context);
-
-	return result;
-}
-
-/*
- * Set current context's checkpoint state of given type.
- */
-int vmci_ctx_set_chkpt_state(u32 context_id,
-			     u32 cpt_type,
-			     u32 buf_size,
-			     void *cpt_buf)
-{
-	u32 i;
-	u32 current_id;
-	int result = VMCI_SUCCESS;
-	u32 num_ids = buf_size / sizeof(u32);
-
-	if (cpt_type == VMCI_WELLKNOWN_CPT_STATE && num_ids > 0) {
-		/*
-		 * We would end up here if VMX with VM to VM communication
-		 * attempts to restore a checkpoint with wellknown handles.
-		 */
-		pr_warn("Attempt to restore checkpoint with obsolete wellknown handles\n");
-		return VMCI_ERROR_OBSOLETE;
-	}
-
-	if (cpt_type != VMCI_NOTIFICATION_CPT_STATE) {
-		pr_devel("Invalid cpt state (type=%d)\n", cpt_type);
-		return VMCI_ERROR_INVALID_ARGS;
-	}
-
-	for (i = 0; i < num_ids && result == VMCI_SUCCESS; i++) {
-		current_id = ((u32 *)cpt_buf)[i];
-		result = vmci_ctx_add_notification(context_id, current_id);
-		if (result != VMCI_SUCCESS)
-			break;
-	}
-	if (result != VMCI_SUCCESS)
-		pr_devel("Failed to set cpt state (type=%d) (error=%d)\n",
-			 cpt_type, result);
-
-	return result;
-}
-
-/*
- * Retrieves the specified context's pending notifications in the
- * form of a handle array. The handle arrays returned are the
- * actual data - not a copy and should not be modified by the
- * caller. They must be released using
- * vmci_ctx_rcv_notifications_release.
- */
-int vmci_ctx_rcv_notifications_get(u32 context_id,
-				   struct vmci_handle_arr **db_handle_array,
-				   struct vmci_handle_arr **qp_handle_array)
-{
-	struct vmci_ctx *context;
-	int result = VMCI_SUCCESS;
-
-	context = vmci_ctx_get(context_id);
-	if (context == NULL)
-		return VMCI_ERROR_NOT_FOUND;
-
-	spin_lock(&context->lock);
-
-	*db_handle_array = context->pending_doorbell_array;
-	context->pending_doorbell_array =
-		vmci_handle_arr_create(0, VMCI_MAX_GUEST_DOORBELL_COUNT);
-	if (!context->pending_doorbell_array) {
-		context->pending_doorbell_array = *db_handle_array;
-		*db_handle_array = NULL;
-		result = VMCI_ERROR_NO_MEM;
-	}
-	*qp_handle_array = NULL;
-
-	spin_unlock(&context->lock);
-	vmci_ctx_put(context);
-
-	return result;
-}
-
-/*
- * Releases handle arrays with pending notifications previously
- * retrieved using vmci_ctx_rcv_notifications_get. If the
- * notifications were not successfully handed over to the guest,
- * success must be false.
- */
-void vmci_ctx_rcv_notifications_release(u32 context_id,
-					struct vmci_handle_arr *db_handle_array,
-					struct vmci_handle_arr *qp_handle_array,
-					bool success)
-{
-	struct vmci_ctx *context = vmci_ctx_get(context_id);
-
-	spin_lock(&context->lock);
-	if (!success) {
-		struct vmci_handle handle;
-
-		/*
-		 * New notifications may have been added while we were not
-		 * holding the context lock, so we transfer any new pending
-		 * doorbell notifications to the old array, and reinstate the
-		 * old array.
-		 */
-
-		handle = vmci_handle_arr_remove_tail(
-					context->pending_doorbell_array);
-		while (!vmci_handle_is_invalid(handle)) {
-			if (!vmci_handle_arr_has_entry(db_handle_array,
-						       handle)) {
-				vmci_handle_arr_append_entry(
-						&db_handle_array, handle);
-			}
-			handle = vmci_handle_arr_remove_tail(
-					context->pending_doorbell_array);
-		}
-		vmci_handle_arr_destroy(context->pending_doorbell_array);
-		context->pending_doorbell_array = db_handle_array;
-		db_handle_array = NULL;
-	} else {
-		ctx_clear_notify_call(context);
-	}
-	spin_unlock(&context->lock);
-	vmci_ctx_put(context);
-
-	if (db_handle_array)
-		vmci_handle_arr_destroy(db_handle_array);
-
-	if (qp_handle_array)
-		vmci_handle_arr_destroy(qp_handle_array);
-}
-
-/*
- * Registers that a new doorbell handle has been allocated by the
- * context. Only doorbell handles registered can be notified.
- */
-int vmci_ctx_dbell_create(u32 context_id, struct vmci_handle handle)
-{
-	struct vmci_ctx *context;
-	int result;
-
-	if (context_id == VMCI_INVALID_ID || vmci_handle_is_invalid(handle))
-		return VMCI_ERROR_INVALID_ARGS;
-
-	context = vmci_ctx_get(context_id);
-	if (context == NULL)
-		return VMCI_ERROR_NOT_FOUND;
-
-	spin_lock(&context->lock);
-	if (!vmci_handle_arr_has_entry(context->doorbell_array, handle))
-		result = vmci_handle_arr_append_entry(&context->doorbell_array,
-						      handle);
-	else
-		result = VMCI_ERROR_DUPLICATE_ENTRY;
-
-	spin_unlock(&context->lock);
-	vmci_ctx_put(context);
-
-	return result;
-}
-
-/*
- * Unregisters a doorbell handle that was previously registered
- * with vmci_ctx_dbell_create.
- */
-int vmci_ctx_dbell_destroy(u32 context_id, struct vmci_handle handle)
-{
-	struct vmci_ctx *context;
-	struct vmci_handle removed_handle;
-
-	if (context_id == VMCI_INVALID_ID || vmci_handle_is_invalid(handle))
-		return VMCI_ERROR_INVALID_ARGS;
-
-	context = vmci_ctx_get(context_id);
-	if (context == NULL)
-		return VMCI_ERROR_NOT_FOUND;
-
-	spin_lock(&context->lock);
-	removed_handle =
-	    vmci_handle_arr_remove_entry(context->doorbell_array, handle);
-	vmci_handle_arr_remove_entry(context->pending_doorbell_array, handle);
-	spin_unlock(&context->lock);
-
-	vmci_ctx_put(context);
-
-	return vmci_handle_is_invalid(removed_handle) ?
-	    VMCI_ERROR_NOT_FOUND : VMCI_SUCCESS;
-}
-
-/*
- * Unregisters all doorbell handles that were previously
- * registered with vmci_ctx_dbell_create.
- */
-int vmci_ctx_dbell_destroy_all(u32 context_id)
-{
-	struct vmci_ctx *context;
-	struct vmci_handle handle;
-
-	if (context_id == VMCI_INVALID_ID)
-		return VMCI_ERROR_INVALID_ARGS;
-
-	context = vmci_ctx_get(context_id);
-	if (context == NULL)
-		return VMCI_ERROR_NOT_FOUND;
-
-	spin_lock(&context->lock);
-	do {
-		struct vmci_handle_arr *arr = context->doorbell_array;
-		handle = vmci_handle_arr_remove_tail(arr);
-	} while (!vmci_handle_is_invalid(handle));
-	do {
-		struct vmci_handle_arr *arr = context->pending_doorbell_array;
-		handle = vmci_handle_arr_remove_tail(arr);
-	} while (!vmci_handle_is_invalid(handle));
-	spin_unlock(&context->lock);
-
-	vmci_ctx_put(context);
-
-	return VMCI_SUCCESS;
-}
-
-/*
- * Registers a notification of a doorbell handle initiated by the
- * specified source context. The notification of doorbells are
- * subject to the same isolation rules as datagram delivery. To
- * allow host side senders of notifications a finer granularity
- * of sender rights than those assigned to the sending context
- * itself, the host context is required to specify a different
- * set of privilege flags that will override the privileges of
- * the source context.
- */
-int vmci_ctx_notify_dbell(u32 src_cid,
-			  struct vmci_handle handle,
-			  u32 src_priv_flags)
-{
-	struct vmci_ctx *dst_context;
-	int result;
-
-	if (vmci_handle_is_invalid(handle))
-		return VMCI_ERROR_INVALID_ARGS;
-
-	/* Get the target VM's VMCI context. */
-	dst_context = vmci_ctx_get(handle.context);
-	if (!dst_context) {
-		pr_devel("Invalid context (ID=0x%x)\n", handle.context);
-		return VMCI_ERROR_NOT_FOUND;
-	}
-
-	if (src_cid != handle.context) {
-		u32 dst_priv_flags;
-
-		if (VMCI_CONTEXT_IS_VM(src_cid) &&
-		    VMCI_CONTEXT_IS_VM(handle.context)) {
-			pr_devel("Doorbell notification from VM to VM not supported (src=0x%x, dst=0x%x)\n",
-				 src_cid, handle.context);
-			result = VMCI_ERROR_DST_UNREACHABLE;
-			goto out;
-		}
-
-		result = vmci_dbell_get_priv_flags(handle, &dst_priv_flags);
-		if (result < VMCI_SUCCESS) {
-			pr_warn("Failed to get privilege flags for destination (handle=0x%x:0x%x)\n",
-				handle.context, handle.resource);
-			goto out;
-		}
-
-		if (src_cid != VMCI_HOST_CONTEXT_ID ||
-		    src_priv_flags == VMCI_NO_PRIVILEGE_FLAGS) {
-			src_priv_flags = vmci_context_get_priv_flags(src_cid);
-		}
-
-		if (vmci_deny_interaction(src_priv_flags, dst_priv_flags)) {
-			result = VMCI_ERROR_NO_ACCESS;
-			goto out;
-		}
-	}
-
-	if (handle.context == VMCI_HOST_CONTEXT_ID) {
-		result = vmci_dbell_host_context_notify(src_cid, handle);
-	} else {
-		spin_lock(&dst_context->lock);
-
-		if (!vmci_handle_arr_has_entry(dst_context->doorbell_array,
-					       handle)) {
-			result = VMCI_ERROR_NOT_FOUND;
-		} else {
-			if (!vmci_handle_arr_has_entry(
-					dst_context->pending_doorbell_array,
-					handle)) {
-				result = vmci_handle_arr_append_entry(
-					&dst_context->pending_doorbell_array,
-					handle);
-				if (result == VMCI_SUCCESS) {
-					ctx_signal_notify(dst_context);
-					wake_up(&dst_context->host_context.wait_queue);
-				}
-			} else {
-				result = VMCI_SUCCESS;
-			}
-		}
-		spin_unlock(&dst_context->lock);
-	}
-
- out:
-	vmci_ctx_put(dst_context);
-
-	return result;
-}
-
-bool vmci_ctx_supports_host_qp(struct vmci_ctx *context)
-{
-	return context && context->user_version >= VMCI_VERSION_HOSTQP;
-}
-
-/*
- * Registers that a new queue pair handle has been allocated by
- * the context.
- */
-int vmci_ctx_qp_create(struct vmci_ctx *context, struct vmci_handle handle)
-{
-	int result;
-
-	if (context == NULL || vmci_handle_is_invalid(handle))
-		return VMCI_ERROR_INVALID_ARGS;
-
-	if (!vmci_handle_arr_has_entry(context->queue_pair_array, handle))
-		result = vmci_handle_arr_append_entry(
-			&context->queue_pair_array, handle);
-	else
-		result = VMCI_ERROR_DUPLICATE_ENTRY;
-
-	return result;
-}
-
-/*
- * Unregisters a queue pair handle that was previously registered
- * with vmci_ctx_qp_create.
- */
-int vmci_ctx_qp_destroy(struct vmci_ctx *context, struct vmci_handle handle)
-{
-	struct vmci_handle hndl;
-
-	if (context == NULL || vmci_handle_is_invalid(handle))
-		return VMCI_ERROR_INVALID_ARGS;
-
-	hndl = vmci_handle_arr_remove_entry(context->queue_pair_array, handle);
-
-	return vmci_handle_is_invalid(hndl) ?
-		VMCI_ERROR_NOT_FOUND : VMCI_SUCCESS;
-}
-
-/*
- * Determines whether a given queue pair handle is registered
- * with the given context.
- */
-bool vmci_ctx_qp_exists(struct vmci_ctx *context, struct vmci_handle handle)
-{
-	if (context == NULL || vmci_handle_is_invalid(handle))
-		return false;
-
-	return vmci_handle_arr_has_entry(context->queue_pair_array, handle);
-}
-
-/*
- * vmci_context_get_priv_flags() - Retrieve privilege flags.
- * @context_id: The context ID of the VMCI context.
- *
- * Retrieves privilege flags of the given VMCI context ID.
- */
-u32 vmci_context_get_priv_flags(u32 context_id)
-{
-	if (vmci_host_code_active()) {
-		u32 flags;
-		struct vmci_ctx *context;
-
-		context = vmci_ctx_get(context_id);
-		if (!context)
-			return VMCI_LEAST_PRIVILEGE_FLAGS;
-
-		flags = context->priv_flags;
-		vmci_ctx_put(context);
-		return flags;
-	}
-	return VMCI_NO_PRIVILEGE_FLAGS;
-}
-EXPORT_SYMBOL_GPL(vmci_context_get_priv_flags);
-
-/*
- * vmci_is_context_owner() - Determimnes if user is the context owner
- * @context_id: The context ID of the VMCI context.
- * @uid:        The host user id (real kernel value).
- *
- * Determines whether a given UID is the owner of given VMCI context.
- */
-bool vmci_is_context_owner(u32 context_id, kuid_t uid)
-{
-	bool is_owner = false;
-
-	if (vmci_host_code_active()) {
-		struct vmci_ctx *context = vmci_ctx_get(context_id);
-		if (context) {
-			if (context->cred)
-				is_owner = uid_eq(context->cred->uid, uid);
-			vmci_ctx_put(context);
-		}
-	}
-
-	return is_owner;
-}
-EXPORT_SYMBOL_GPL(vmci_is_context_owner);
+_RB_WPTR__BIF_RB_OVERFLOW_MASK 0x1
+#define BIF_RB_WPTR__BIF_RB_OVERFLOW__SHIFT 0x0
+#define BIF_RB_WPTR__OFFSET_MASK 0x3fffc
+#define BIF_RB_WPTR__OFFSET__SHIFT 0x2
+#define BIF_RB_WPTR_ADDR_HI__ADDR_MASK 0xff
+#define BIF_RB_WPTR_ADDR_HI__ADDR__SHIFT 0x0
+#define BIF_RB_WPTR_ADDR_LO__ADDR_MASK 0xfffffffc
+#define BIF_RB_WPTR_ADDR_LO__ADDR__SHIFT 0x2
+#define MAILBOX_INDEX__MAILBOX_INDEX_MASK 0xf
+#define MAILBOX_INDEX__MAILBOX_INDEX__SHIFT 0x0
+#define MAILBOX_MSGBUF_TRN_DW0__MSGBUF_DATA_MASK 0xffffffff
+#define MAILBOX_MSGBUF_TRN_DW0__MSGBUF_DATA__SHIFT 0x0
+#define MAILBOX_MSGBUF_TRN_DW1__MSGBUF_DATA_MASK 0xffffffff
+#define MAILBOX_MSGBUF_TRN_DW1__MSGBUF_DATA__SHIFT 0x0
+#define MAILBOX_MSGBUF_TRN_DW2__MSGBUF_DATA_MASK 0xffffffff
+#define MAILBOX_MSGBUF_TRN_DW2__MSGBUF_DATA__SHIFT 0x0
+#define MAILBOX_MSGBUF_TRN_DW3__MSGBUF_DATA_MASK 0xffffffff
+#define MAILBOX_MSGBUF_TRN_DW3__MSGBUF_DATA__SHIFT 0x0
+#define MAILBOX_MSGBUF_RCV_DW0__MSGBUF_DATA_MASK 0xffffffff
+#define MAILBOX_MSGBUF_RCV_DW0__MSGBUF_DATA__SHIFT 0x0
+#define MAILBOX_MSGBUF_RCV_DW1__MSGBUF_DATA_MASK 0xffffffff
+#define MAILBOX_MSGBUF_RCV_DW1__MSGBUF_DATA__SHIFT 0x0
+#define MAILBOX_MSGBUF_RCV_DW2__MSGBUF_DATA_MASK 0xffffffff
+#define MAILBOX_MSGBUF_RCV_DW2__MSGBUF_DATA__SHIFT 0x0
+#define MAILBOX_MSGBUF_RCV_DW3__MSGBUF_DATA_MASK 0xffffffff
+#define MAILBOX_MSGBUF_RCV_DW3__MSGBUF_DATA__SHIFT 0x0
+#define MAILBOX_CONTROL__TRN_MSG_VALID_MASK 0x1
+#define MAILBOX_CONTROL__TRN_MSG_VALID__SHIFT 0x0
+#define MAILBOX_CONTROL__TRN_MSG_ACK_MASK 0x2
+#define MAILBOX_CONTROL__TRN_MSG_ACK__SHIFT 0x1
+#define MAILBOX_CONTROL__RCV_MSG_VALID_MASK 0x100
+#define MAILBOX_CONTROL__RCV_MSG_VALID__SHIFT 0x8
+#define MAILBOX_CONTROL__RCV_MSG_ACK_MASK 0x200
+#define MAILBOX_CONTROL__RCV_MSG_ACK__SHIFT 0x9
+#define MAILBOX_INT_CNTL__VALID_INT_EN_MASK 0x1
+#define MAILBOX_INT_CNTL__VALID_INT_EN__SHIFT 0x0
+#define MAILBOX_INT_CNTL__ACK_INT_EN_MASK 0x2
+#define MAILBOX_INT_CNTL__ACK_INT_EN__SHIFT 0x1
+#define BIF_VIRT_RESET_REQ__VIRT_RESET_REQ_VF_MASK 0xffff
+#define BIF_VIRT_RESET_REQ__VIRT_RESET_REQ_VF__SHIFT 0x0
+#define BIF_VIRT_RESET_REQ__VIRT_RESET_REQ_SOFTPF_MASK 0x80000000
+#define BIF_VIRT_RESET_REQ__VIRT_RESET_REQ_SOFTPF__SHIFT 0x1f
+#define VM_INIT_STATUS__VM_INIT_STATUS_MASK 0x1
+#define VM_INIT_STATUS__VM_INIT_STATUS__SHIFT 0x0
+#define BIF_GPUIOV_RESET_NOTIFICATION__RESET_NOTIFICATION_MASK 0xffffffff
+#define BIF_GPUIOV_RESET_NOTIFICATION__RESET_NOTIFICATION__SHIFT 0x0
+#define BIF_GPUIOV_VM_INIT_STATUS__VM_INIT_STATUS_MASK 0xffffffff
+#define BIF_GPUIOV_VM_INIT_STATUS__VM_INIT_STATUS__SHIFT 0x0
+#define BIF_GPUIOV_FB_TOTAL_FB_INFO__TOTAL_FB_AVAILABLE_MASK 0xffff
+#define BIF_GPUIOV_FB_TOTAL_FB_INFO__TOTAL_FB_AVAILABLE__SHIFT 0x0
+#define BIF_GPUIOV_FB_TOTAL_FB_INFO__TOTAL_FB_CONSUMED_MASK 0xffff0000
+#define BIF_GPUIOV_FB_TOTAL_FB_INFO__TOTAL_FB_CONSUMED__SHIFT 0x10
+#define BIF_GPUIOV_GPU_IDLE_LATENCY__GPU_IDLE_LATENCY_MASK 0xffffffff
+#define BIF_GPUIOV_GPU_IDLE_LATENCY__GPU_IDLE_LATENCY__SHIFT 0x0
+#define BIF_GPUIOV_MMIO_MAP_RANGE0__MMIO_MAP_RANGE0_LOWER_MASK 0xffff
+#define BIF_GPUIOV_MMIO_MAP_RANGE0__MMIO_MAP_RANGE0_LOWER__SHIFT 0x0
+#define BIF_GPUIOV_MMIO_MAP_RANGE0__MMIO_MAP_RANGE0_UPPER_MASK 0xffff0000
+#define BIF_GPUIOV_MMIO_MAP_RANGE0__MMIO_MAP_RANGE0_UPPER__SHIFT 0x10
+#define BIF_GPUIOV_MMIO_MAP_RANGE1__MMIO_MAP_RANGE1_LOWER_MASK 0xffff
+#define BIF_GPUIOV_MMIO_MAP_RANGE1__MMIO_MAP_RANGE1_LOWER__SHIFT 0x0
+#define BIF_GPUIOV_MMIO_MAP_RANGE1__MMIO_MAP_RANGE1_UPPER_MASK 0xffff0000
+#define BIF_GPUIOV_MMIO_MAP_RANGE1__MMIO_MAP_RANGE1_UPPER__SHIFT 0x10
+#define BIF_GPUIOV_MMIO_MAP_RANGE2__MMIO_MAP_RANGE2_LOWER_MASK 0xffff
+#define BIF_GPUIOV_MMIO_MAP_RANGE2__MMIO_MAP_RANGE2_LOWER__SHIFT 0x0
+#define BIF_GPUIOV_MMIO_MAP_RANGE2__MMIO_MAP_RANGE2_UPPER_MASK 0xffff0000
+#define BIF_GPUIOV_MMIO_MAP_RANGE2__MMIO_MAP_RANGE2_UPPER__SHIFT 0x10
+#define BIF_GPUIOV_MMIO_MAP_RANGE3__MMIO_MAP_RANGE3_LOWER_MASK 0xffff
+#define BIF_GPUIOV_MMIO_MAP_RANGE3__MMIO_MAP_RANGE3_LOWER__SHIFT 0x0
+#define BIF_GPUIOV_MMIO_MAP_RANGE3__MMIO_MAP_RANGE3_UPPER_MASK 0xffff0000
+#define BIF_GPUIOV_MMIO_MAP_RANGE3__MMIO_MAP_RANGE3_UPPER__SHIFT 0x10
+#define BIF_GPUIOV_MMIO_MAP_RANGE4__MMIO_MAP_RANGE4_LOWER_MASK 0xffff
+#define BIF_GPUIOV_MMIO_MAP_RANGE4__MMIO_MAP_RANGE4_LOWER__SHIFT 0x0
+#define BIF_GPUIOV_MMIO_MAP_RANGE4__MMIO_MAP_RANGE4_UPPER_MASK 0xffff0000
+#define BIF_GPUIOV_MMIO_MAP_RANGE4__MMIO_MAP_RANGE4_UPPER__SHIFT 0x10
+#define BIF_GPUIOV_MMIO_MAP_RANGE5__MMIO_MAP_RANGE5_LOWER_MASK 0xffff
+#define BIF_GPUIOV_MMIO_MAP_RANGE5__MMIO_MAP_RANGE5_LOWER__SHIFT 0x0
+#define BIF_GPUIOV_MMIO_MAP_RANGE5__MMIO_MAP_RANGE5_UPPER_MASK 0xffff0000
+#define BIF_GPUIOV_MMIO_MAP_RANGE5__MMIO_MAP_RANGE5_UPPER__SHIFT 0x10
+#define BIF_GPU_IDLE_LATENCY__GPU_IDLE_LATENCY_MASK 0xffffffff
+#define BIF_GPU_IDLE_LATENCY__GPU_IDLE_LATENCY__SHIFT 0x0
+#define BIF_MMIO_MAP_RANGE0__MMIO_MAP_RANGE0_LOWER_MASK 0xffff
+#define BIF_MMIO_MAP_RANGE0__MMIO_MAP_RANGE0_LOWER__SHIFT 0x0
+#define BIF_MMIO_MAP_RANGE0__MMIO_MAP_RANGE0_UPPER_MASK 0xffff0000
+#define BIF_MMIO_MAP_RANGE0__MMIO_MAP_RANGE0_UPPER__SHIFT 0x10
+#define BIF_MMIO_MAP_RANGE1__MMIO_MAP_RANGE1_LOWER_MASK 0xffff
+#define BIF_MMIO_MAP_RANGE1__MMIO_MAP_RANGE1_LOWER__SHIFT 0x0
+#define BIF_MMIO_MAP_RANGE1__MMIO_MAP_RANGE1_UPPER_MASK 0xffff0000
+#define BIF_MMIO_MAP_RANGE1__MMIO_MAP_RANGE1_UPPER__SHIFT 0x10
+#define BIF_MMIO_MAP_RANGE2__MMIO_MAP_RANGE2_LOWER_MASK 0xffff
+#define BIF_MMIO_MAP_RANGE2__MMIO_MAP_RANGE2_LOWER__SHIFT 0x0
+#define BIF_MMIO_MAP_RANGE2__MMIO_MAP_RANGE2_UPPER_MASK 0xffff0000
+#define BIF_MMIO_MAP_RANGE2__MMIO_MAP_RANGE2_UPPER__SHIFT 0x10
+#define BIF_MMIO_MAP_RANGE3__MMIO_MAP_RANGE3_LOWER_MASK 0xffff
+#define BIF_MMIO_MAP_RANGE3__MMIO_MAP_RANGE3_LOWER__SHIFT 0x0
+#define BIF_MMIO_MAP_RANGE3__MMIO_MAP_RANGE3_UPPER_MASK 0xffff0000
+#define BIF_MMIO_MAP_RANGE3__MMIO_MAP_RANGE3_UPPER__SHIFT 0x10
+#define BIF_MMIO_MAP_RANGE4__MMIO_MAP_RANGE4_LOWER_MASK 0xffff
+#define BIF_MMIO_MAP_RANGE4__MMIO_MAP_RANGE4_LOWER__SHIFT 0x0
+#define BIF_MMIO_MAP_RANGE4__MMIO_MAP_RANGE4_UPPER_MASK 0xffff0000
+#define BIF_MMIO_MAP_RANGE4__MMIO_MAP_RANGE4_UPPER__SHIFT 0x10
+#define BIF_MMIO_MAP_RANGE5__MMIO_MAP_RANGE5_LOWER_MASK 0xffff
+#define BIF_MMIO_MAP_RANGE5__MMIO_MAP_RANGE5_LOWER__SHIFT 0x0
+#define BIF_MMIO_MAP_RANGE5__MMIO_MAP_RANGE5_UPPER_MASK 0xffff0000
+#define BIF_MMIO_MAP_RANGE5__MMIO_MAP_RANGE5_UPPER__SHIFT 0x10
+#define VENDOR_ID__VENDOR_ID_MASK 0xffff
+#define VENDOR_ID__VENDOR_ID__SHIFT 0x0
+#define DEVICE_ID__DEVICE_ID_MASK 0xffff
+#define DEVICE_ID__DEVICE_ID__SHIFT 0x0
+#define COMMAND__IO_ACCESS_EN_MASK 0x1
+#define COMMAND__IO_ACCESS_EN__SHIFT 0x0
+#define COMMAND__MEM_ACCESS_EN_MASK 0x2
+#define COMMAND__MEM_ACCESS_EN__SHIFT 0x1
+#define COMMAND__BUS_MASTER_EN_MASK 0x4
+#define COMMAND__BUS_MASTER_EN__SHIFT 0x2
+#define COMMAND__SPECIAL_CYCLE_EN_MASK 0x8
+#define COMMAND__SPECIAL_CYCLE_EN__SHIFT 0x3
+#define COMMAND__MEM_WRITE_INVALIDATE_EN_MASK 0x10
+#define COMMAND__MEM_WRITE_INVALIDATE_EN__SHIFT 0x4
+#define COMMAND__PAL_SNOOP_EN_MASK 0x20
+#define COMMAND__PAL_SNOOP_EN__SHIFT 0x5
+#define COMMAND__PARITY_ERROR_RESPONSE_MASK 0x40
+#define COMMAND__PARITY_ERROR_RESPONSE__SHIFT 0x6
+#define COMMAND__AD_STEPPING_MASK 0x80
+#define COMMAND__AD_STEPPING__SHIFT 0x7
+#define COMMAND__SERR_EN_MASK 0x100
+#define COMMAND__SERR_EN__SHIFT 0x8
+#define COMMAND__FAST_B2B_EN_MASK 0x200
+#define COMMAND__FAST_B2B_EN__SHIFT 0x9
+#define COMMAND__INT_DIS_MASK 0x400
+#define COMMAND__INT_DIS__SHIFT 0xa
+#define STATUS__INT_STATUS_MASK 0x8
+#define STATUS__INT_STATUS__SHIFT 0x3
+#define STATUS__CAP_LIST_MASK 0x10
+#define STATUS__CAP_LIST__SHIFT 0x4
+#define STATUS__PCI_66_EN_MASK 0x20
+#define STATUS__PCI_66_EN__SHIFT 0x5
+#define STATUS__FAST_BACK_CAPABLE_MASK 0x80
+#define STATUS__FAST_BACK_CAPABLE__SHIFT 0x7
+#define STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x100
+#define STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x8
+#define STATUS__DEVSEL_TIMING_MASK 0x600
+#define STATUS__DEVSEL_TIMING__SHIFT 0x9
+#define STATUS__SIGNAL_TARGET_ABORT_MASK 0x800
+#define STATUS__SIGNAL_TARGET_ABORT__SHIFT 0xb
+#define STATUS__RECEIVED_TARGET_ABORT_MASK 0x1000
+#define STATUS__RECEIVED_TARGET_ABORT__SHIFT 0xc
+#define STATUS__RECEIVED_MASTER_ABORT_MASK 0x2000
+#define STATUS__RECEIVED_MASTER_ABORT__SHIFT 0xd
+#define STATUS__SIGNALED_SYSTEM_ERROR_MASK 0x4000
+#define STATUS__SIGNALED_SYSTEM_ERROR__SHIFT 0xe
+#define STATUS__PARITY_ERROR_DETECTED_MASK 0x8000
+#define STATUS__PARITY_ERROR_DETECTED__SHIFT 0xf
+#define REVISION_ID__MINOR_REV_ID_MASK 0xf
+#define REVISION_ID__MINOR_REV_ID__SHIFT 0x0
+#define REVISION_ID__MAJOR_REV_ID_MASK 0xf0
+#define REVISION_ID__MAJOR_REV_ID__SHIFT 0x4
+#define PROG_INTERFACE__PROG_INTERFACE_MASK 0xff
+#define PROG_INTERFACE__PROG_INTERFACE__SHIFT 0x0
+#define SUB_CLASS__SUB_CLASS_MASK 0xff
+#define SUB_CLASS__SUB_CLASS__SHIFT 0x0
+#define BASE_CLASS__BASE_CLASS_MASK 0xff
+#define BASE_CLASS__BASE_CLASS__SHIFT 0x0
+#define CACHE_LINE__CACHE_LINE_SIZE_MASK 0xff
+#define CACHE_LINE__CACHE_LINE_SIZE__SHIFT 0x0
+#define LATENCY__LATENCY_TIMER_MASK 0xff
+#define LATENCY__LATENCY_TIMER__SHIFT 0x0
+#define HEADER__HEADER_TYPE_MASK 0x7f
+#define HEADER__HEADER_TYPE__SHIFT 0x0
+#define HEADER__DEVICE_TYPE_MASK 0x80
+#define HEADER__DEVICE_TYPE__SHIFT 0x7
+#define BIST__BIST_COMP_MASK 0xf
+#define BIST__BIST_COMP__SHIFT 0x0
+#define BIST__BIST_STRT_MASK 0x40
+#define BIST__BIST_STRT__SHIFT 0x6
+#define BIST__BIST_CAP_MASK 0x80
+#define BIST__BIST_CAP__SHIFT 0x7
+#define BASE_ADDR_1__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_1__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_2__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_2__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_3__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_3__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_4__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_4__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_5__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_5__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_6__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_6__BASE_ADDR__SHIFT 0x0
+#define ROM_BASE_ADDR__BASE_ADDR_MASK 0xffffffff
+#define ROM_BASE_ADDR__BASE_ADDR__SHIFT 0x0
+#define CAP_PTR__CAP_PTR_MASK 0xff
+#define CAP_PTR__CAP_PTR__SHIFT 0x0
+#define INTERRUPT_LINE__INTERRUPT_LINE_MASK 0xff
+#define INTERRUPT_LINE__INTERRUPT_LINE__SHIFT 0x0
+#define INTERRUPT_PIN__INTERRUPT_PIN_MASK 0xff
+#define INTERRUPT_PIN__INTERRUPT_PIN__SHIFT 0x0
+#define ADAPTER_ID__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define ADAPTER_ID__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define ADAPTER_ID__SUBSYSTEM_ID_MASK 0xffff0000
+#define ADAPTER_ID__SUBSYSTEM_ID__SHIFT 0x10
+#define MIN_GRANT__MIN_GNT_MASK 0xff
+#define MIN_GRANT__MIN_GNT__SHIFT 0x0
+#define MAX_LATENCY__MAX_LAT_MASK 0xff
+#define MAX_LATENCY__MAX_LAT__SHIFT 0x0
+#define VENDOR_CAP_LIST__CAP_ID_MASK 0xff
+#define VENDOR_CAP_LIST__CAP_ID__SHIFT 0x0
+#define VENDOR_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define VENDOR_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define VENDOR_CAP_LIST__LENGTH_MASK 0xff0000
+#define VENDOR_CAP_LIST__LENGTH__SHIFT 0x10
+#define ADAPTER_ID_W__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define ADAPTER_ID_W__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define ADAPTER_ID_W__SUBSYSTEM_ID_MASK 0xffff0000
+#define ADAPTER_ID_W__SUBSYSTEM_ID__SHIFT 0x10
+#define PMI_CAP_LIST__CAP_ID_MASK 0xff
+#define PMI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PMI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define PMI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define PMI_CAP__VERSION_MASK 0x7
+#define PMI_CAP__VERSION__SHIFT 0x0
+#define PMI_CAP__PME_CLOCK_MASK 0x8
+#define PMI_CAP__PME_CLOCK__SHIFT 0x3
+#define PMI_CAP__DEV_SPECIFIC_INIT_MASK 0x20
+#define PMI_CAP__DEV_SPECIFIC_INIT__SHIFT 0x5
+#define PMI_CAP__AUX_CURRENT_MASK 0x1c0
+#define PMI_CAP__AUX_CURRENT__SHIFT 0x6
+#define PMI_CAP__D1_SUPPORT_MASK 0x200
+#define PMI_CAP__D1_SUPPORT__SHIFT 0x9
+#define PMI_CAP__D2_SUPPORT_MASK 0x400
+#define PMI_CAP__D2_SUPPORT__SHIFT 0xa
+#define PMI_CAP__PME_SUPPORT_MASK 0xf800
+#define PMI_CAP__PME_SUPPORT__SHIFT 0xb
+#define PMI_STATUS_CNTL__POWER_STATE_MASK 0x3
+#define PMI_STATUS_CNTL__POWER_STATE__SHIFT 0x0
+#define PMI_STATUS_CNTL__NO_SOFT_RESET_MASK 0x8
+#define PMI_STATUS_CNTL__NO_SOFT_RESET__SHIFT 0x3
+#define PMI_STATUS_CNTL__PME_EN_MASK 0x100
+#define PMI_STATUS_CNTL__PME_EN__SHIFT 0x8
+#define PMI_STATUS_CNTL__DATA_SELECT_MASK 0x1e00
+#define PMI_STATUS_CNTL__DATA_SELECT__SHIFT 0x9
+#define PMI_STATUS_CNTL__DATA_SCALE_MASK 0x6000
+#define PMI_STATUS_CNTL__DATA_SCALE__SHIFT 0xd
+#define PMI_STATUS_CNTL__PME_STATUS_MASK 0x8000
+#define PMI_STATUS_CNTL__PME_STATUS__SHIFT 0xf
+#define PMI_STATUS_CNTL__B2_B3_SUPPORT_MASK 0x400000
+#define PMI_STATUS_CNTL__B2_B3_SUPPORT__SHIFT 0x16
+#define PMI_STATUS_CNTL__BUS_PWR_EN_MASK 0x800000
+#define PMI_STATUS_CNTL__BUS_PWR_EN__SHIFT 0x17
+#define PMI_STATUS_CNTL__PMI_DATA_MASK 0xff000000
+#define PMI_STATUS_CNTL__PMI_DATA__SHIFT 0x18
+#define PCIE_CAP_LIST__CAP_ID_MASK 0xff
+#define PCIE_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define PCIE_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define PCIE_CAP__VERSION_MASK 0xf
+#define PCIE_CAP__VERSION__SHIFT 0x0
+#define PCIE_CAP__DEVICE_TYPE_MASK 0xf0
+#define PCIE_CAP__DEVICE_TYPE__SHIFT 0x4
+#define PCIE_CAP__SLOT_IMPLEMENTED_MASK 0x100
+#define PCIE_CAP__SLOT_IMPLEMENTED__SHIFT 0x8
+#define PCIE_CAP__INT_MESSAGE_NUM_MASK 0x3e00
+#define PCIE_CAP__INT_MESSAGE_NUM__SHIFT 0x9
+#define DEVICE_CAP__MAX_PAYLOAD_SUPPORT_MASK 0x7
+#define DEVICE_CAP__MAX_PAYLOAD_SUPPORT__SHIFT 0x0
+#define DEVICE_CAP__PHANTOM_FUNC_MASK 0x18
+#define DEVICE_CAP__PHANTOM_FUNC__SHIFT 0x3
+#define DEVICE_CAP__EXTENDED_TAG_MASK 0x20
+#define DEVICE_CAP__EXTENDED_TAG__SHIFT 0x5
+#define DEVICE_CAP__L0S_ACCEPTABLE_LATENCY_MASK 0x1c0
+#define DEVICE_CAP__L0S_ACCEPTABLE_LATENCY__SHIFT 0x6
+#define DEVICE_CAP__L1_ACCEPTABLE_LATENCY_MASK 0xe00
+#define DEVICE_CAP__L1_ACCEPTABLE_LATENCY__SHIFT 0x9
+#define DEVICE_CAP__ROLE_BASED_ERR_REPORTING_MASK 0x8000
+#define DEVICE_CAP__ROLE_BASED_ERR_REPORTING__SHIFT 0xf
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT_MASK 0x3fc0000
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT__SHIFT 0x12
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE_MASK 0xc000000
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE__SHIFT 0x1a
+#define DEVICE_CAP__FLR_CAPABLE_MASK 0x10000000
+#define DEVICE_CAP__FLR_CAPABLE__SHIFT 0x1c
+#define DEVICE_CNTL__CORR_ERR_EN_MASK 0x1
+#define DEVICE_CNTL__CORR_ERR_EN__SHIFT 0x0
+#define DEVICE_CNTL__NON_FATAL_ERR_EN_MASK 0x2
+#define DEVICE_CNTL__NON_FATAL_ERR_EN__SHIFT 0x1
+#define DEVICE_CNTL__FATAL_ERR_EN_MASK 0x4
+#define DEVICE_CNTL__FATAL_ERR_EN__SHIFT 0x2
+#define DEVICE_CNTL__USR_REPORT_EN_MASK 0x8
+#define DEVICE_CNTL__USR_REPORT_EN__SHIFT 0x3
+#define DEVICE_CNTL__RELAXED_ORD_EN_MASK 0x10
+#define DEVICE_CNTL__RELAXED_ORD_EN__SHIFT 0x4
+#define DEVICE_CNTL__MAX_PAYLOAD_SIZE_MASK 0xe0
+#define DEVICE_CNTL__MAX_PAYLOAD_SIZE__SHIFT 0x5
+#define DEVICE_CNTL__EXTENDED_TAG_EN_MASK 0x100
+#define DEVICE_CNTL__EXTENDED_TAG_EN__SHIFT 0x8
+#define DEVICE_CNTL__PHANTOM_FUNC_EN_MASK 0x200
+#define DEVICE_CNTL__PHANTOM_FUNC_EN__SHIFT 0x9
+#define DEVICE_CNTL__AUX_POWER_PM_EN_MASK 0x400
+#define DEVICE_CNTL__AUX_POWER_PM_EN__SHIFT 0xa
+#define DEVICE_CNTL__NO_SNOOP_EN_MASK 0x800
+#define DEVICE_CNTL__NO_SNOOP_EN__SHIFT 0xb
+#define DEVICE_CNTL__MAX_READ_REQUEST_SIZE_MASK 0x7000
+#define DEVICE_CNTL__MAX_READ_REQUEST_SIZE__SHIFT 0xc
+#define DEVICE_CNTL__INITIATE_FLR_MASK 0x8000
+#define DEVICE_CNTL__INITIATE_FLR__SHIFT 0xf
+#define DEVICE_STATUS__CORR_ERR_MASK 0x1
+#define DEVICE_STATUS__CORR_ERR__SHIFT 0x0
+#define DEVICE_STATUS__NON_FATAL_ERR_MASK 0x2
+#define DEVICE_STATUS__NON_FATAL_ERR__SHIFT 0x1
+#define DEVICE_STATUS__FATAL_ERR_MASK 0x4
+#define DEVICE_STATUS__FATAL_ERR__SHIFT 0x2
+#define DEVICE_STATUS__USR_DETECTED_MASK 0x8
+#define DEVICE_STATUS__USR_DETECTED__SHIFT 0x3
+#define DEVICE_STATUS__AUX_PWR_MASK 0x10
+#define DEVICE_STATUS__AUX_PWR__SHIFT 0x4
+#define DEVICE_STATUS__TRANSACTIONS_PEND_MASK 0x20
+#define DEVICE_STATUS__TRANSACTIONS_PEND__SHIFT 0x5
+#define LINK_CAP__LINK_SPEED_MASK 0xf
+#define LINK_CAP__LINK_SPEED__SHIFT 0x0
+#define LINK_CAP__LINK_WIDTH_MASK 0x3f0
+#define LINK_CAP__LINK_WIDTH__SHIFT 0x4
+#define LINK_CAP__PM_SUPPORT_MASK 0xc00
+#define LINK_CAP__PM_SUPPORT__SHIFT 0xa
+#define LINK_CAP__L0S_EXIT_LATENCY_MASK 0x7000
+#define LINK_CAP__L0S_EXIT_LATENCY__SHIFT 0xc
+#define LINK_CAP__L1_EXIT_LATENCY_MASK 0x38000
+#define LINK_CAP__L1_EXIT_LATENCY__SHIFT 0xf
+#define LINK_CAP__CLOCK_POWER_MANAGEMENT_MASK 0x40000
+#define LINK_CAP__CLOCK_POWER_MANAGEMENT__SHIFT 0x12
+#define LINK_CAP__SURPRISE_DOWN_ERR_REPORTING_MASK 0x80000
+#define LINK_CAP__SURPRISE_DOWN_ERR_REPORTING__SHIFT 0x13
+#define LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE_MASK 0x100000
+#define LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE__SHIFT 0x14
+#define LINK_CAP__LINK_BW_NOTIFICATION_CAP_MASK 0x200000
+#define LINK_CAP__LINK_BW_NOTIFICATION_CAP__SHIFT 0x15
+#define LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE_MASK 0x400000
+#define LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE__SHIFT 0x16
+#define LINK_CAP__PORT_NUMBER_MASK 0xff000000
+#define LINK_CAP__PORT_NUMBER__SHIFT 0x18
+#define LINK_CNTL__PM_CONTROL_MASK 0x3
+#define LINK_CNTL__PM_CONTROL__SHIFT 0x0
+#define LINK_CNTL__READ_CPL_BOUNDARY_MASK 0x8
+#define LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define LINK_CNTL__LINK_DIS_MASK 0x10
+#define LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0x9
+#define LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN_MASK 0x400
+#define LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN__SHIFT 0xa
+#define LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN_MASK 0x800
+#define LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN__SHIFT 0xb
+#define LINK_STATUS__CURRENT_LINK_SPEED_MASK 0xf
+#define LINK_STATUS__CURRENT_LINK_SPEED__SHIFT 0x0
+#define LINK_STATUS__NEGOTIATED_LINK_WIDTH_MASK 0x3f0
+#define LINK_STATUS__NEGOTIATED_LINK_WIDTH__SHIFT 0x4
+#define LINK_STATUS__LINK_TRAINING_MASK 0x800
+#define LINK_STATUS__LINK_TRAINING__SHIFT 0xb
+#define LINK_STATUS__SLOT_CLOCK_CFG_MASK 0x1000
+#define LINK_STATUS__SLOT_CLOCK_CFG__SHIFT 0xc
+#define LINK_STATUS__DL_ACTIVE_MASK 0x2000
+#define LINK_STATUS__DL_ACTIVE__SHIFT 0xd
+#define LINK_STATUS__LINK_BW_MANAGEMENT_STATUS_MASK 0x4000
+#define LINK_STATUS__LINK_BW_MANAGEMENT_STATUS__SHIFT 0xe
+#define LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS_MASK 0x8000
+#define LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS__SHIFT 0xf
+#define DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED_MASK 0xf
+#define DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED__SHIFT 0x0
+#define DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED_MASK 0x10
+#define DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED__SHIFT 0x4
+#define DEVICE_CAP2__ARI_FORWARDING_SUPPORTED_MASK 0x20
+#define DEVICE_CAP2__ARI_FORWARDING_SUPPORTED__SHIFT 0x5
+#define DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED_MASK 0x40
+#define DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED__SHIFT 0x6
+#define DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED_MASK 0x80
+#define DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED__SHIFT 0x7
+#define DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED_MASK 0x100
+#define DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED__SHIFT 0x8
+#define DEVICE_CAP2__CAS128_CMPLT_SUPPORTED_MASK 0x200
+#define DEVICE_CAP2__CAS128_CMPLT_SUPPORTED__SHIFT 0x9
+#define DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING_MASK 0x400
+#define DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING__SHIFT 0xa
+#define DEVICE_CAP2__LTR_SUPPORTED_MASK 0x800
+#define DEVICE_CAP2__LTR_SUPPORTED__SHIFT 0xb
+#define DEVICE_CAP2__TPH_CPLR_SUPPORTED_MASK 0x3000
+#define DEVICE_CAP2__TPH_CPLR_SUPPORTED__SHIFT 0xc
+#define DEVICE_CAP2__OBFF_SUPPORTED_MASK 0xc0000
+#define DEVICE_CAP2__OBFF_SUPPORTED__SHIFT 0x12
+#define DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED_MASK 0x100000
+#define DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED__SHIFT 0x14
+#define DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED_MASK 0x200000
+#define DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED__SHIFT 0x15
+#define DEVICE_CAP2__MAX_END_END_TLP_PREFIXES_MASK 0xc00000
+#define DEVICE_CAP2__MAX_END_END_TLP_PREFIXES__SHIFT 0x16
+#define DEVICE_CNTL2__CPL_TIMEOUT_VALUE_MASK 0xf
+#define DEVICE_CNTL2__CPL_TIMEOUT_VALUE__SHIFT 0x0
+#define DEVICE_CNTL2__CPL_TIMEOUT_DIS_MASK 0x10
+#define DEVICE_CNTL2__CPL_TIMEOUT_DIS__SHIFT 0x4
+#define DEVICE_CNTL2__ARI_FORWARDING_EN_MASK 0x20
+#define DEVICE_CNTL2__ARI_FORWARDING_EN__SHIFT 0x5
+#define DEVICE_CNTL2__ATOMICOP_REQUEST_EN_MASK 0x40
+#define DEVICE_CNTL2__ATOMICOP_REQUEST_EN__SHIFT 0x6
+#define DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING_MASK 0x80
+#define DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING__SHIFT 0x7
+#define DEVICE_CNTL2__IDO_REQUEST_ENABLE_MASK 0x100
+#define DEVICE_CNTL2__IDO_REQUEST_ENABLE__SHIFT 0x8
+#define DEVICE_CNTL2__IDO_COMPLETION_ENABLE_MASK 0x200
+#define DEVICE_CNTL2__IDO_COMPLETION_ENABLE__SHIFT 0x9
+#define DEVICE_CNTL2__LTR_EN_MASK 0x400
+#define DEVICE_CNTL2__LTR_EN__SHIFT 0xa
+#define DEVICE_CNTL2__OBFF_EN_MASK 0x6000
+#define DEVICE_CNTL2__OBFF_EN__SHIFT 0xd
+#define DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING_MASK 0x8000
+#define DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING__SHIFT 0xf
+#define DEVICE_STATUS2__RESERVED_MASK 0xffff
+#define DEVICE_STATUS2__RESERVED__SHIFT 0x0
+#define LINK_CAP2__SUPPORTED_LINK_SPEED_MASK 0xfe
+#define LINK_CAP2__SUPPORTED_LINK_SPEED__SHIFT 0x1
+#define LINK_CAP2__CROSSLINK_SUPPORTED_MASK 0x100
+#define LINK_CAP2__CROSSLINK_SUPPORTED__SHIFT 0x8
+#define LINK_CAP2__RESERVED_MASK 0xfffffe00
+#define LINK_CAP2__RESERVED__SHIFT 0x9
+#define LINK_CNTL2__TARGET_LINK_SPEED_MASK 0xf
+#define LINK_CNTL2__TARGET_LINK_SPEED__SHIFT 0x0
+#define LINK_CNTL2__ENTER_COMPLIANCE_MASK 0x10
+#define LINK_CNTL2__ENTER_COMPLIANCE__SHIFT 0x4
+#define LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE_MASK 0x20
+#define LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define LINK_CNTL2__ENTER_MOD_COMPLIANCE_MASK 0x400
+#define LINK_CNTL2__ENTER_MOD_COMPLIANCE__SHIFT 0xa
+#define LINK_CNTL2__COMPLIANCE_SOS_MASK 0x800
+#define LINK_CNTL2__COMPLIANCE_SOS__SHIFT 0xb
+#define LINK_CNTL2__COMPLIANCE_DEEMPHASIS_MASK 0xf000
+#define LINK_CNTL2__COMPLIANCE_DEEMPHASIS__SHIFT 0xc
+#define LINK_STATUS2__CUR_DEEMPHASIS_LEVEL_MASK 0x1
+#define LINK_STATUS2__CUR_DEEMPHASIS_LEVEL__SHIFT 0x0
+#define LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x2
+#define LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x1
+#define LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x4
+#define LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x2
+#define LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS_MASK 0x8
+#define LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS__SHIFT 0x3
+#define LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS_MASK 0x10
+#define LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS__SHIFT 0x4
+#define LINK_STATUS2__LINK_EQUALIZATION_REQUEST_MASK 0x20
+#define LINK_STATUS2__LINK_EQUALIZATION_REQUEST__SHIFT 0x5
+#define MSI_CAP_LIST__CAP_ID_MASK 0xff
+#define MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define MSI_MSG_CNTL__MSI_EN_MASK 0x1
+#define MSI_MSG_CNTL__MSI_EN__SHIFT 0x0
+#define MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe
+#define MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x1
+#define MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x70
+#define MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x4
+#define MSI_MSG_CNTL__MSI_64BIT_MASK 0x80
+#define MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x7
+#define MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP_MASK 0x100
+#define MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP__SHIFT 0x8
+#define MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define MSI_MASK__MSI_MASK_MASK 0xffffffff
+#define MSI_MASK__MSI_MASK__SHIFT 0x0
+#define MSI_PENDING__MSI_PENDING_MASK 0xffffffff
+#define MSI_PENDING__MSI_PENDING__SHIFT 0x0
+#define MSI_MASK_64__MSI_MASK_64_MASK 0xffffffff
+#define MSI_MASK_64__MSI_MASK_64__SHIFT 0x0
+#define MSI_PENDING_64__MSI_PENDING_64_MASK 0xffffffff
+#define MSI_PENDING_64__MSI_PENDING_64__SHIFT 0x0
+#define MSIX_CAP_LIST__CAP_ID_MASK 0xff
+#define MSIX_CAP_LIST__CAP_ID__SHIFT 0x0
+#define MSIX_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define MSIX_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define MSIX_MSG_CNTL__MSIX_TABLE_SIZE_MASK 0x7ff
+#define MSIX_MSG_CNTL__MSIX_TABLE_SIZE__SHIFT 0x0
+#define MSIX_MSG_CNTL__MSIX_FUNC_MASK_MASK 0x4000
+#define MSIX_MSG_CNTL__MSIX_FUNC_MASK__SHIFT 0xe
+#define MSIX_MSG_CNTL__MSIX_EN_MASK 0x8000
+#define MSIX_MSG_CNTL__MSIX_EN__SHIFT 0xf
+#define MSIX_TABLE__MSIX_TABLE_BIR_MASK 0x7
+#define MSIX_TABLE__MSIX_TABLE_BIR__SHIFT 0x0
+#define MSIX_TABLE__MSIX_TABLE_OFFSET_MASK 0xfffffff8
+#define MSIX_TABLE__MSIX_TABLE_OFFSET__SHIFT 0x3
+#define MSIX_PBA__MSIX_PBA_BIR_MASK 0x7
+#define MSIX_PBA__MSIX_PBA_BIR__SHIFT 0x0
+#define MSIX_PBA__MSIX_PBA_OFFSET_MASK 0xfffffff8
+#define MSIX_PBA__MSIX_PBA_OFFSET__SHIFT 0x3
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID_MASK 0xffff
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV_MASK 0xf0000
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV__SHIFT 0x10
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH_MASK 0xfff00000
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH__SHIFT 0x14
+#define PCIE_VENDOR_SPECIFIC1__SCRATCH_MASK 0xffffffff
+#define PCIE_VENDOR_SPECIFIC1__SCRATCH__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT_MASK 0x70
+#define PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT__SHIFT 0x4
+#define PCIE_PORT_VC_CAP_REG1__REF_CLK_MASK 0x300
+#define PCIE_PORT_VC_CAP_REG1__REF_CLK__SHIFT 0x8
+#define PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE_MASK 0xc00
+#define PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE__SHIFT 0xa
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP_MASK 0xff
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP__SHIFT 0x0
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE_MASK 0x1
+#define PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE__SHIFT 0x0
+#define PCIE_PORT_VC_CNTL__VC_ARB_SELECT_MASK 0xe
+#define PCIE_PORT_VC_CNTL__VC_ARB_SELECT__SHIFT 0x1
+#define PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define PCIE_VC0_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define PCIE_VC0_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define PCIE_VC0_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define PCIE_VC0_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x2
+#define PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x1
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define PCIE_VC1_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define PCIE_VC1_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define PCIE_VC1_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define PCIE_VC1_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x2
+#define PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x1
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO_MASK 0xffffffff
+#define PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO__SHIFT 0x0
+#define PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI_MASK 0xffffffff
+#define PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI__SHIFT 0x0
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS_MASK 0x10
+#define PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS__SHIFT 0x4
+#define PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS_MASK 0x20
+#define PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS__SHIFT 0x5
+#define PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS_MASK 0x1000
+#define PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS__SHIFT 0xc
+#define PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS_MASK 0x2000
+#define PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS__SHIFT 0xd
+#define PCIE_UNC

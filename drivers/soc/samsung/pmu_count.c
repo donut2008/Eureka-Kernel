@@ -1,81 +1,33 @@
-/* drivers/soc/samsung/pmu_count.c
- *
- * Copyright (c) 2016 Samsung Electronics Co., Ltd.
- *              http://www.samsung.com
- *
- * Samsung CPU Support
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/kobject.h>
-#include <linux/string.h>
-#include <linux/sysfs.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/kthread.h>
-#include <linux/cpumask.h>
-
-#include <soc/samsung/pmu_func.h>
-
-/* 0x11 = ccnt
- * 0x08 = instruction
- * 0x06 = load instruction
- * 0x07 = store instruction
- * 0x19 = bus access
- * 0x17 = L2 cache refil
- * 0x23 = stall frontend
- * 0x24 = stall backend
- * 0x1d = bus cycle
- */
-#define PMU_EVENT_MAX	6
-
-static int events[PMU_EVENT_MAX] = {0x11, 0x08};
-
-int init_counter_cpu(void)
-{
-	int i;
-
-	disable_pmu();
-	for (i = 0; i < ARRAY_SIZE(events); i++) {
-		pmu_enable_counter(i);
-		pmnc_config(i, events[i]);
-	}
-
-	return 0;
-}
-
-int start_counter_cpu(void)
-{
-	pmnc_reset();
-	enable_pmu();
-
-	return 0;
-}
-
-int stop_counter_cpu(void)
-{
-	disable_pmu();
-
-	return 0;
-}
-
-int read_pmu_one(void *data)
-{
-	struct pmu_count_value *p = (struct pmu_count_value *)data;
-
-	p->pmnc0 += pmnc_read2(0);
-	p->pmnc1 += pmnc_read2(1);
-
-	return 0;
-}
-int reset_pmu_one(void *data)
-{
-	struct pmu_count_value *p = (struct pmu_count_value *)data;
-
-	p->pmnc0 = 0;
-	p->pmnc1 = 0;
-	return 0;
-}
+T 0x0
+#define SOFT_REGISTERS_TABLE_28__Reserved_0_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_28__Reserved_0__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_29__Reserved_1_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_29__Reserved_1__SHIFT 0x0
+#define FIRMWARE_FLAGS__INTERRUPTS_ENABLED_MASK 0x1
+#define FIRMWARE_FLAGS__INTERRUPTS_ENABLED__SHIFT 0x0
+#define FIRMWARE_FLAGS__RESERVED_MASK 0xfffffe
+#define FIRMWARE_FLAGS__RESERVED__SHIFT 0x1
+#define FIRMWARE_FLAGS__TEST_COUNT_MASK 0xff000000
+#define FIRMWARE_FLAGS__TEST_COUNT__SHIFT 0x18
+#define TDC_STATUS__VDD_Boost_MASK 0xff
+#define TDC_STATUS__VDD_Boost__SHIFT 0x0
+#define TDC_STATUS__VDD_Throttle_MASK 0xff00
+#define TDC_STATUS__VDD_Throttle__SHIFT 0x8
+#define TDC_STATUS__VDDC_Boost_MASK 0xff0000
+#define TDC_STATUS__VDDC_Boost__SHIFT 0x10
+#define TDC_STATUS__VDDC_Throttle_MASK 0xff000000
+#define TDC_STATUS__VDDC_Throttle__SHIFT 0x18
+#define TDC_MV_AVERAGE__IDD_MASK 0xffff
+#define TDC_MV_AVERAGE__IDD__SHIFT 0x0
+#define TDC_MV_AVERAGE__IDDC_MASK 0xffff0000
+#define TDC_MV_AVERAGE__IDDC__SHIFT 0x10
+#define TDC_VRM_LIMIT__IDD_MASK 0xffff
+#define TDC_VRM_LIMIT__IDD__SHIFT 0x0
+#define TDC_VRM_LIMIT__IDDC_MASK 0xffff0000
+#define TDC_VRM_LIMIT__IDDC__SHIFT 0x10
+#define FEATURE_STATUS__SCLK_DPM_ON_MASK 0x1
+#define FEATURE_STATUS__SCLK_DPM_ON__SHIFT 0x0
+#define FEATURE_STATUS__MCLK_DPM_ON_MASK 0x2
+#define FEATURE_STATUS__MCLK_DPM_ON__SHIFT 0x1
+#define FEATURE_STATUS__LCLK_DPM_ON_MASK 0x4
+#define FEATURE_STA

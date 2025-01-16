@@ -1,57 +1,33 @@
-/* Unusual Devices File for In-System Design, Inc. ISD200 ASIC
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if defined(CONFIG_USB_STORAGE_ISD200) || \
-		defined(CONFIG_USB_STORAGE_ISD200_MODULE)
-
-UNUSUAL_DEV(  0x054c, 0x002b, 0x0100, 0x0110,
-		"Sony",
-		"Portable USB Harddrive V2",
-		USB_SC_ISD200, USB_PR_BULK, isd200_Initialization,
-		0),
-
-UNUSUAL_DEV(  0x05ab, 0x0031, 0x0100, 0x0110,
-		"In-System",
-		"USB/IDE Bridge (ATA/ATAPI)",
-		USB_SC_ISD200, USB_PR_BULK, isd200_Initialization,
-		0),
-
-UNUSUAL_DEV(  0x05ab, 0x0301, 0x0100, 0x0110,
-		"In-System",
-		"Portable USB Harddrive V2",
-		USB_SC_ISD200, USB_PR_BULK, isd200_Initialization,
-		0),
-
-UNUSUAL_DEV(  0x05ab, 0x0351, 0x0100, 0x0110,
-		"In-System",
-		"Portable USB Harddrive V2",
-		USB_SC_ISD200, USB_PR_BULK, isd200_Initialization,
-		0),
-
-UNUSUAL_DEV(  0x05ab, 0x5701, 0x0100, 0x0110,
-		"In-System",
-		"USB Storage Adapter V2",
-		USB_SC_ISD200, USB_PR_BULK, isd200_Initialization,
-		0),
-
-UNUSUAL_DEV(  0x0bf6, 0xa001, 0x0100, 0x0110,
-		"ATI",
-		"USB Cable 205",
-		USB_SC_ISD200, USB_PR_BULK, isd200_Initialization,
-		0),
-
-#endif /* defined(CONFIG_USB_STORAGE_ISD200) || ... */
+_NO_ST_MODE_SUPPORTED_MASK 0x1
+#define PCIE_TPH_REQR_CAP__TPH_REQR_NO_ST_MODE_SUPPORTED__SHIFT 0x0
+#define PCIE_TPH_REQR_CAP__TPH_REQR_INT_VEC_MODE_SUPPORTED_MASK 0x2
+#define PCIE_TPH_REQR_CAP__TPH_REQR_INT_VEC_MODE_SUPPORTED__SHIFT 0x1
+#define PCIE_TPH_REQR_CAP__TPH_REQR_DEV_SPC_MODE_SUPPORTED_MASK 0x4
+#define PCIE_TPH_REQR_CAP__TPH_REQR_DEV_SPC_MODE_SUPPORTED__SHIFT 0x2
+#define PCIE_TPH_REQR_CAP__TPH_REQR_EXTND_TPH_REQR_SUPPORED_MASK 0x100
+#define PCIE_TPH_REQR_CAP__TPH_REQR_EXTND_TPH_REQR_SUPPORED__SHIFT 0x8
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_LOCATION_MASK 0x600
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_LOCATION__SHIFT 0x9
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_SIZE_MASK 0x7ff0000
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_SIZE__SHIFT 0x10
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_ST_MODE_SEL_MASK 0x7
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_ST_MODE_SEL__SHIFT 0x0
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_EN_MASK 0x300
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_EN__SHIFT 0x8
+#define PCIE_MC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_MC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_MC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_MC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_MC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_MC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_MC_CAP__MC_MAX_GROUP_MASK 0x3f
+#define PCIE_MC_CAP__MC_MAX_GROUP__SHIFT 0x0
+#define PCIE_MC_CAP__MC_WIN_SIZE_REQ_MASK 0x3f00
+#define PCIE_MC_CAP__MC_WIN_SIZE_REQ__SHIFT 0x8
+#define PCIE_MC_CAP__MC_ECRC_REGEN_SUPP_MASK 0x8000
+#define PCIE_MC_CAP__MC_ECRC_REGEN_SUPP__SHIFT 0xf
+#define PCIE_MC_CNTL__MC_NUM_GROUP_MASK 0x3f
+#define PCIE_MC_CNTL__MC_NUM_GROUP__SHIFT 0x0
+#define PCIE_MC_CNTL__MC_ENABLE_MASK 0x8000
+#define PCIE_MC_CNTL__MC_ENABLE__SHIFT 0xf
+#define PCIE_MC_ADD

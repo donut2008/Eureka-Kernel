@@ -1,25 +1,14 @@
-/*
- * Copyright (C) 2011 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-
-#ifndef _LINUX_DM_SPACE_MAP_DISK_H
-#define _LINUX_DM_SPACE_MAP_DISK_H
-
-#include "dm-block-manager.h"
-
-struct dm_space_map;
-struct dm_transaction_manager;
-
-/*
- * Unfortunately we have to use two-phase construction due to the cycle
- * between the tm and sm.
- */
-struct dm_space_map *dm_sm_disk_create(struct dm_transaction_manager *tm,
-				       dm_block_t nr_blocks);
-
-struct dm_space_map *dm_sm_disk_open(struct dm_transaction_manager *tm,
-				     void *root, size_t len);
-
-#endif /* _LINUX_DM_SPACE_MAP_DISK_H */
+_SHIFT 0x10
+#define AVSNB_CONFIG__RESERVED_MASK 0xff000000
+#define AVSNB_CONFIG__RESERVED__SHIFT 0x18
+#define HTC_CONFIG__CSR_ADDR_MASK 0x3f
+#define HTC_CONFIG__CSR_ADDR__SHIFT 0x0
+#define HTC_CONFIG__TCEN_ID_MASK 0x3c0
+#define HTC_CONFIG__TCEN_ID__SHIFT 0x6
+#define HTC_CONFIG__HTC_ACTIVE_PSTATE_LIMIT_MASK 0xff0000
+#define HTC_CONFIG__HTC_ACTIVE_PSTATE_LIMIT__SHIFT 0x10
+#define HTC_CONFIG__Reserved_MASK 0xff000000
+#define HTC_CONFIG__Reserved__SHIFT 0x18
+#define AVS_CU0_TEMPERATURE_SENSOR__CsrAddr_MASK 0x3f
+#define AVS_CU0_TEMPERATURE_SENSOR__CsrAddr__SHIFT 0x0
+#define AVS_CU0_TEMPERATURE_SENSOR_

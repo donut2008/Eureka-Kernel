@@ -1,15 +1,8 @@
-/*
- * Ours Technology Inc. OTi-6858 USB to serial adapter driver.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- */
-#ifndef __LINUX_USB_SERIAL_OTI6858_H
-#define __LINUX_USB_SERIAL_OTI6858_H
-
-#define OTI6858_VENDOR_ID	0x0ea0
-#define OTI6858_PRODUCT_ID	0x6858
-
-#endif
+SHIFT 0x1
+#define D3F4_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE_MASK 0x4
+#define D3F4_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE__SHIFT 0x2
+#define D3F4_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE_MASK 0x8
+#define D3F4_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE__SHIFT 0x3
+#define D3F4_PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE_MASK 0x10
+#define D3F4_PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE__SHIFT 0x4
+#define D3F4_PCIE_LC_BW_

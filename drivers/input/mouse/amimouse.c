@@ -1,149 +1,69 @@
-/*
- *  Amiga mouse driver for Linux/m68k
- *
- *  Copyright (c) 2000-2002 Vojtech Pavlik
- *
- *  Based on the work of:
- *	Michael Rausch		James Banks
- *	Matther Dillon		David Giller
- *	Nathan Laredo		Linus Torvalds
- *	Johan Myreen		Jes Sorensen
- *	Russell King
- */
-
-/*
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation
- */
-
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/platform_device.h>
-
-#include <asm/irq.h>
-#include <asm/setup.h>
-#include <asm/uaccess.h>
-#include <asm/amigahw.h>
-#include <asm/amigaints.h>
-
-MODULE_AUTHOR("Vojtech Pavlik <vojtech@ucw.cz>");
-MODULE_DESCRIPTION("Amiga mouse driver");
-MODULE_LICENSE("GPL");
-
-static int amimouse_lastx, amimouse_lasty;
-
-static irqreturn_t amimouse_interrupt(int irq, void *data)
-{
-	struct input_dev *dev = data;
-	unsigned short joy0dat, potgor;
-	int nx, ny, dx, dy;
-
-	joy0dat = amiga_custom.joy0dat;
-
-	nx = joy0dat & 0xff;
-	ny = joy0dat >> 8;
-
-	dx = nx - amimouse_lastx;
-	dy = ny - amimouse_lasty;
-
-	if (dx < -127) dx = (256 + nx) - amimouse_lastx;
-	if (dx >  127) dx = (nx - 256) - amimouse_lastx;
-	if (dy < -127) dy = (256 + ny) - amimouse_lasty;
-	if (dy >  127) dy = (ny - 256) - amimouse_lasty;
-
-	amimouse_lastx = nx;
-	amimouse_lasty = ny;
-
-	potgor = amiga_custom.potgor;
-
-	input_report_rel(dev, REL_X, dx);
-	input_report_rel(dev, REL_Y, dy);
-
-	input_report_key(dev, BTN_LEFT,   ciaa.pra & 0x40);
-	input_report_key(dev, BTN_MIDDLE, potgor & 0x0100);
-	input_report_key(dev, BTN_RIGHT,  potgor & 0x0400);
-
-	input_sync(dev);
-
-	return IRQ_HANDLED;
-}
-
-static int amimouse_open(struct input_dev *dev)
-{
-	unsigned short joy0dat;
-	int error;
-
-	joy0dat = amiga_custom.joy0dat;
-
-	amimouse_lastx = joy0dat & 0xff;
-	amimouse_lasty = joy0dat >> 8;
-
-	error = request_irq(IRQ_AMIGA_VERTB, amimouse_interrupt, 0, "amimouse",
-			    dev);
-	if (error)
-		dev_err(&dev->dev, "Can't allocate irq %d\n", IRQ_AMIGA_VERTB);
-
-	return error;
-}
-
-static void amimouse_close(struct input_dev *dev)
-{
-	free_irq(IRQ_AMIGA_VERTB, dev);
-}
-
-static int __init amimouse_probe(struct platform_device *pdev)
-{
-	int err;
-	struct input_dev *dev;
-
-	dev = input_allocate_device();
-	if (!dev)
-		return -ENOMEM;
-
-	dev->name = pdev->name;
-	dev->phys = "amimouse/input0";
-	dev->id.bustype = BUS_AMIGA;
-	dev->id.vendor = 0x0001;
-	dev->id.product = 0x0002;
-	dev->id.version = 0x0100;
-
-	dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REL);
-	dev->relbit[0] = BIT_MASK(REL_X) | BIT_MASK(REL_Y);
-	dev->keybit[BIT_WORD(BTN_LEFT)] = BIT_MASK(BTN_LEFT) |
-		BIT_MASK(BTN_MIDDLE) | BIT_MASK(BTN_RIGHT);
-	dev->open = amimouse_open;
-	dev->close = amimouse_close;
-	dev->dev.parent = &pdev->dev;
-
-	err = input_register_device(dev);
-	if (err) {
-		input_free_device(dev);
-		return err;
-	}
-
-	platform_set_drvdata(pdev, dev);
-
-	return 0;
-}
-
-static int __exit amimouse_remove(struct platform_device *pdev)
-{
-	struct input_dev *dev = platform_get_drvdata(pdev);
-
-	input_unregister_device(dev);
-	return 0;
-}
-
-static struct platform_driver amimouse_driver = {
-	.remove = __exit_p(amimouse_remove),
-	.driver   = {
-		.name	= "amiga-mouse",
-	},
-};
-
-module_platform_driver_probe(amimouse_driver, amimouse_probe);
-
-MODULE_ALIAS("platform:amiga-mouse");
+fine SQ_BUF_RSRC_WORD3__ELEMENT_SIZE_MASK 0x180000
+#define SQ_BUF_RSRC_WORD3__ELEMENT_SIZE__SHIFT 0x13
+#define SQ_BUF_RSRC_WORD3__INDEX_STRIDE_MASK 0x600000
+#define SQ_BUF_RSRC_WORD3__INDEX_STRIDE__SHIFT 0x15
+#define SQ_BUF_RSRC_WORD3__ADD_TID_ENABLE_MASK 0x800000
+#define SQ_BUF_RSRC_WORD3__ADD_TID_ENABLE__SHIFT 0x17
+#define SQ_BUF_RSRC_WORD3__ATC_MASK 0x1000000
+#define SQ_BUF_RSRC_WORD3__ATC__SHIFT 0x18
+#define SQ_BUF_RSRC_WORD3__HASH_ENABLE_MASK 0x2000000
+#define SQ_BUF_RSRC_WORD3__HASH_ENABLE__SHIFT 0x19
+#define SQ_BUF_RSRC_WORD3__HEAP_MASK 0x4000000
+#define SQ_BUF_RSRC_WORD3__HEAP__SHIFT 0x1a
+#define SQ_BUF_RSRC_WORD3__MTYPE_MASK 0x38000000
+#define SQ_BUF_RSRC_WORD3__MTYPE__SHIFT 0x1b
+#define SQ_BUF_RSRC_WORD3__TYPE_MASK 0xc0000000
+#define SQ_BUF_RSRC_WORD3__TYPE__SHIFT 0x1e
+#define SQ_IMG_RSRC_WORD0__BASE_ADDRESS_MASK 0xffffffff
+#define SQ_IMG_RSRC_WORD0__BASE_ADDRESS__SHIFT 0x0
+#define SQ_IMG_RSRC_WORD1__BASE_ADDRESS_HI_MASK 0xff
+#define SQ_IMG_RSRC_WORD1__BASE_ADDRESS_HI__SHIFT 0x0
+#define SQ_IMG_RSRC_WORD1__MIN_LOD_MASK 0xfff00
+#define SQ_IMG_RSRC_WORD1__MIN_LOD__SHIFT 0x8
+#define SQ_IMG_RSRC_WORD1__DATA_FORMAT_MASK 0x3f00000
+#define SQ_IMG_RSRC_WORD1__DATA_FORMAT__SHIFT 0x14
+#define SQ_IMG_RSRC_WORD1__NUM_FORMAT_MASK 0x3c000000
+#define SQ_IMG_RSRC_WORD1__NUM_FORMAT__SHIFT 0x1a
+#define SQ_IMG_RSRC_WORD1__MTYPE_MASK 0xc0000000
+#define SQ_IMG_RSRC_WORD1__MTYPE__SHIFT 0x1e
+#define SQ_IMG_RSRC_WORD2__WIDTH_MASK 0x3fff
+#define SQ_IMG_RSRC_WORD2__WIDTH__SHIFT 0x0
+#define SQ_IMG_RSRC_WORD2__HEIGHT_MASK 0xfffc000
+#define SQ_IMG_RSRC_WORD2__HEIGHT__SHIFT 0xe
+#define SQ_IMG_RSRC_WORD2__PERF_MOD_MASK 0x70000000
+#define SQ_IMG_RSRC_WORD2__PERF_MOD__SHIFT 0x1c
+#define SQ_IMG_RSRC_WORD2__INTERLACED_MASK 0x80000000
+#define SQ_IMG_RSRC_WORD2__INTERLACED__SHIFT 0x1f
+#define SQ_IMG_RSRC_WORD3__DST_SEL_X_MASK 0x7
+#define SQ_IMG_RSRC_WORD3__DST_SEL_X__SHIFT 0x0
+#define SQ_IMG_RSRC_WORD3__DST_SEL_Y_MASK 0x38
+#define SQ_IMG_RSRC_WORD3__DST_SEL_Y__SHIFT 0x3
+#define SQ_IMG_RSRC_WORD3__DST_SEL_Z_MASK 0x1c0
+#define SQ_IMG_RSRC_WORD3__DST_SEL_Z__SHIFT 0x6
+#define SQ_IMG_RSRC_WORD3__DST_SEL_W_MASK 0xe00
+#define SQ_IMG_RSRC_WORD3__DST_SEL_W__SHIFT 0x9
+#define SQ_IMG_RSRC_WORD3__BASE_LEVEL_MASK 0xf000
+#define SQ_IMG_RSRC_WORD3__BASE_LEVEL__SHIFT 0xc
+#define SQ_IMG_RSRC_WORD3__LAST_LEVEL_MASK 0xf0000
+#define SQ_IMG_RSRC_WORD3__LAST_LEVEL__SHIFT 0x10
+#define SQ_IMG_RSRC_WORD3__TILING_INDEX_MASK 0x1f00000
+#define SQ_IMG_RSRC_WORD3__TILING_INDEX__SHIFT 0x14
+#define SQ_IMG_RSRC_WORD3__POW2_PAD_MASK 0x2000000
+#define SQ_IMG_RSRC_WORD3__POW2_PAD__SHIFT 0x19
+#define SQ_IMG_RSRC_WORD3__MTYPE_MASK 0x4000000
+#define SQ_IMG_RSRC_WORD3__MTYPE__SHIFT 0x1a
+#define SQ_IMG_RSRC_WORD3__ATC_MASK 0x8000000
+#define SQ_IMG_RSRC_WORD3__ATC__SHIFT 0x1b
+#define SQ_IMG_RSRC_WORD3__TYPE_MASK 0xf0000000
+#define SQ_IMG_RSRC_WORD3__TYPE__SHIFT 0x1c
+#define SQ_IMG_RSRC_WORD4__DEPTH_MASK 0x1fff
+#define SQ_IMG_RSRC_WORD4__DEPTH__SHIFT 0x0
+#define SQ_IMG_RSRC_WORD4__PITCH_MASK 0x7ffe000
+#define SQ_IMG_RSRC_WORD4__PITCH__SHIFT 0xd
+#define SQ_IMG_RSRC_WORD5__BASE_ARRAY_MASK 0x1fff
+#define SQ_IMG_RSRC_WORD5__BASE_ARRAY__SHIFT 0x0
+#define SQ_IMG_RSRC_WORD5__LAST_ARRAY_MASK 0x3ffe000
+#define SQ_IMG_RSRC_WORD5__LAST_ARRAY__SHIFT 0xd
+#define SQ_IMG_RSRC_WORD6__MIN_LOD_WARN_MASK 0xfff
+#define SQ_IMG_RSRC_WORD6__MIN_LOD_WARN__SHIFT 0x0
+#define S

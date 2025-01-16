@@ -1,192 +1,53 @@
-/*
- * Driver for Aeroflex Gaisler GRLIB GRUSBHC EHCI host controller
- *
- * GRUSBHC is typically found on LEON/GRLIB SoCs
- *
- * (c) Jan Andersson <jan@gaisler.com>
- *
- * Based on ehci-ppc-of.c which is:
- * (c) Valentine Barshak <vbarshak@ru.mvista.com>
- * and in turn based on "ehci-ppc-soc.c" by Stefan Roese <sr@denx.de>
- * and "ohci-ppc-of.c" by Sylvain Munaut <tnt@246tNt.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2 of the License, or (at your
- * option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software Foundation,
- * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/err.h>
-#include <linux/signal.h>
-
-#include <linux/of_irq.h>
-#include <linux/of_address.h>
-#include <linux/of_platform.h>
-
-#define GRUSBHC_HCIVERSION 0x0100 /* Known value of cap. reg. HCIVERSION */
-
-static const struct hc_driver ehci_grlib_hc_driver = {
-	.description		= hcd_name,
-	.product_desc		= "GRLIB GRUSBHC EHCI",
-	.hcd_priv_size		= sizeof(struct ehci_hcd),
-
-	/*
-	 * generic hardware linkage
-	 */
-	.irq			= ehci_irq,
-	.flags			= HCD_MEMORY | HCD_USB2 | HCD_BH,
-
-	/*
-	 * basic lifecycle operations
-	 */
-	.reset			= ehci_setup,
-	.start			= ehci_run,
-	.stop			= ehci_stop,
-	.shutdown		= ehci_shutdown,
-
-	/*
-	 * managing i/o requests and associated device resources
-	 */
-	.urb_enqueue		= ehci_urb_enqueue,
-	.urb_dequeue		= ehci_urb_dequeue,
-	.endpoint_disable	= ehci_endpoint_disable,
-	.endpoint_reset		= ehci_endpoint_reset,
-
-	/*
-	 * scheduling support
-	 */
-	.get_frame_number	= ehci_get_frame,
-
-	/*
-	 * root hub support
-	 */
-	.hub_status_data	= ehci_hub_status_data,
-	.hub_control		= ehci_hub_control,
-#ifdef	CONFIG_PM
-	.bus_suspend		= ehci_bus_suspend,
-	.bus_resume		= ehci_bus_resume,
-#endif
-	.relinquish_port	= ehci_relinquish_port,
-	.port_handed_over	= ehci_port_handed_over,
-
-	.clear_tt_buffer_complete	= ehci_clear_tt_buffer_complete,
-};
-
-
-static int ehci_hcd_grlib_probe(struct platform_device *op)
-{
-	struct device_node *dn = op->dev.of_node;
-	struct usb_hcd *hcd;
-	struct ehci_hcd	*ehci = NULL;
-	struct resource res;
-	u32 hc_capbase;
-	int irq;
-	int rv;
-
-	if (usb_disabled())
-		return -ENODEV;
-
-	dev_dbg(&op->dev, "initializing GRUSBHC EHCI USB Controller\n");
-
-	rv = of_address_to_resource(dn, 0, &res);
-	if (rv)
-		return rv;
-
-	/* usb_create_hcd requires dma_mask != NULL */
-	op->dev.dma_mask = &op->dev.coherent_dma_mask;
-	hcd = usb_create_hcd(&ehci_grlib_hc_driver, &op->dev,
-			"GRUSBHC EHCI USB");
-	if (!hcd)
-		return -ENOMEM;
-
-	hcd->rsrc_start = res.start;
-	hcd->rsrc_len = resource_size(&res);
-
-	irq = irq_of_parse_and_map(dn, 0);
-	if (irq == NO_IRQ) {
-		dev_err(&op->dev, "%s: irq_of_parse_and_map failed\n",
-			__FILE__);
-		rv = -EBUSY;
-		goto err_irq;
-	}
-
-	hcd->regs = devm_ioremap_resource(&op->dev, &res);
-	if (IS_ERR(hcd->regs)) {
-		rv = PTR_ERR(hcd->regs);
-		goto err_ioremap;
-	}
-
-	ehci = hcd_to_ehci(hcd);
-
-	ehci->caps = hcd->regs;
-
-	/* determine endianness of this implementation */
-	hc_capbase = ehci_readl(ehci, &ehci->caps->hc_capbase);
-	if (HC_VERSION(ehci, hc_capbase) != GRUSBHC_HCIVERSION) {
-		ehci->big_endian_mmio = 1;
-		ehci->big_endian_desc = 1;
-		ehci->big_endian_capbase = 1;
-	}
-
-	rv = usb_add_hcd(hcd, irq, 0);
-	if (rv)
-		goto err_ioremap;
-
-	device_wakeup_enable(hcd->self.controller);
-	return 0;
-
-err_ioremap:
-	irq_dispose_mapping(irq);
-err_irq:
-	usb_put_hcd(hcd);
-
-	return rv;
-}
-
-
-static int ehci_hcd_grlib_remove(struct platform_device *op)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(op);
-
-	dev_dbg(&op->dev, "stopping GRLIB GRUSBHC EHCI USB Controller\n");
-
-	usb_remove_hcd(hcd);
-
-	irq_dispose_mapping(hcd->irq);
-
-	usb_put_hcd(hcd);
-
-	return 0;
-}
-
-
-static const struct of_device_id ehci_hcd_grlib_of_match[] = {
-	{
-		.name = "GAISLER_EHCI",
-	 },
-	{
-		.name = "01_026",
-	 },
-	{},
-};
-MODULE_DEVICE_TABLE(of, ehci_hcd_grlib_of_match);
-
-
-static struct platform_driver ehci_grlib_driver = {
-	.probe		= ehci_hcd_grlib_probe,
-	.remove		= ehci_hcd_grlib_remove,
-	.shutdown	= usb_hcd_platform_shutdown,
-	.driver = {
-		.name = "grlib-ehci",
-		.of_match_table = ehci_hcd_grlib_of_match,
-	},
-};
+                                                  0x436d
+#define mmBLND5_BLND_CONTROL                                                    0x456d
+#define mmBLND6_BLND_CONTROL                                                    0x476d
+#define mmSM_CONTROL2                                                           0x1b6e
+#define mmBLND0_SM_CONTROL2                                                     0x1b6e
+#define mmBLND1_SM_CONTROL2                                                     0x1d6e
+#define mmBLND2_SM_CONTROL2                                                     0x1f6e
+#define mmBLND3_SM_CONTROL2                                                     0x416e
+#define mmBLND4_SM_CONTROL2                                                     0x436e
+#define mmBLND5_SM_CONTROL2                                                     0x456e
+#define mmBLND6_SM_CONTROL2                                                     0x476e
+#define mmBLND_CONTROL2                                                         0x1b6f
+#define mmBLND0_BLND_CONTROL2                                                   0x1b6f
+#define mmBLND1_BLND_CONTROL2                                                   0x1d6f
+#define mmBLND2_BLND_CONTROL2                                                   0x1f6f
+#define mmBLND3_BLND_CONTROL2                                                   0x416f
+#define mmBLND4_BLND_CONTROL2                                                   0x436f
+#define mmBLND5_BLND_CONTROL2                                                   0x456f
+#define mmBLND6_BLND_CONTROL2                                                   0x476f
+#define mmBLND_UPDATE                                                           0x1b70
+#define mmBLND0_BLND_UPDATE                                                     0x1b70
+#define mmBLND1_BLND_UPDATE                                                     0x1d70
+#define mmBLND2_BLND_UPDATE                                                     0x1f70
+#define mmBLND3_BLND_UPDATE                                                     0x4170
+#define mmBLND4_BLND_UPDATE                                                     0x4370
+#define mmBLND5_BLND_UPDATE                                                     0x4570
+#define mmBLND6_BLND_UPDATE                                                     0x4770
+#define mmBLND_UNDERFLOW_INTERRUPT                                              0x1b71
+#define mmBLND0_BLND_UNDERFLOW_INTERRUPT                                        0x1b71
+#define mmBLND1_BLND_UNDERFLOW_INTERRUPT                                        0x1d71
+#define mmBLND2_BLND_UNDERFLOW_INTERRUPT                                        0x1f71
+#define mmBLND3_BLND_UNDERFLOW_INTERRUPT                                        0x4171
+#define mmBLND4_BLND_UNDERFLOW_INTERRUPT                                        0x4371
+#define mmBLND5_BLND_UNDERFLOW_INTERRUPT                                        0x4571
+#define mmBLND6_BLND_UNDERFLOW_INTERRUPT                                        0x4771
+#define mmBLND_V_UPDATE_LOCK                                                    0x1b73
+#define mmBLND0_BLND_V_UPDATE_LOCK                                              0x1b73
+#define mmBLND1_BLND_V_UPDATE_LOCK                                              0x1d73
+#define mmBLND2_BLND_V_UPDATE_LOCK                                              0x1f73
+#define mmBLND3_BLND_V_UPDATE_LOCK                                              0x4173
+#define mmBLND4_BLND_V_UPDATE_LOCK                                              0x4373
+#define mmBLND5_BLND_V_UPDATE_LOCK                                              0x4573
+#define mmBLND6_BLND_V_UPDATE_LOCK                                              0x4773
+#define mmBLND_REG_UPDATE_STATUS                                                0x1b77
+#define mmBLND0_BLND_REG_UPDATE_STATUS                                          0x1b77
+#define mmBLND1_BLND_REG_UPDATE_STATUS                                          0x1d77
+#define mmBLND2_BLND_REG_UPDATE_STATUS                                          0x1f77
+#define mmBLND3_BLND_REG_UPDATE_STATUS                                          0x4177
+#define mmBLND4_BLND_REG_UPDATE_STATUS                                          0x4377
+#define mmBLND5_BLND_REG_UPDATE_STATUS                                          0x4577
+#define mmBLND6_BLND_REG_UPDATE_STATUS                                          0x4777
+#define mmBLND_DEBUG                                                            0x1b74
+#define mmBLND0_BLND_DEBUG              

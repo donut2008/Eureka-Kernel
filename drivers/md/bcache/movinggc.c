@@ -1,256 +1,96 @@
-/*
- * Moving/copying garbage collector
- *
- * Copyright 2012 Google, Inc.
- */
-
-#include "bcache.h"
-#include "btree.h"
-#include "debug.h"
-#include "request.h"
-
-#include <trace/events/bcache.h>
-
-struct moving_io {
-	struct closure		cl;
-	struct keybuf_key	*w;
-	struct data_insert_op	op;
-	struct bbio		bio;
-};
-
-static bool moving_pred(struct keybuf *buf, struct bkey *k)
-{
-	struct cache_set *c = container_of(buf, struct cache_set,
-					   moving_gc_keys);
-	unsigned i;
-
-	for (i = 0; i < KEY_PTRS(k); i++)
-		if (ptr_available(c, k, i) &&
-		    GC_MOVE(PTR_BUCKET(c, k, i)))
-			return true;
-
-	return false;
-}
-
-/* Moving GC - IO loop */
-
-static void moving_io_destructor(struct closure *cl)
-{
-	struct moving_io *io = container_of(cl, struct moving_io, cl);
-	kfree(io);
-}
-
-static void write_moving_finish(struct closure *cl)
-{
-	struct moving_io *io = container_of(cl, struct moving_io, cl);
-	struct bio *bio = &io->bio.bio;
-	struct bio_vec *bv;
-	int i;
-
-	bio_for_each_segment_all(bv, bio, i)
-		__free_page(bv->bv_page);
-
-	if (io->op.replace_collision)
-		trace_bcache_gc_copy_collision(&io->w->key);
-
-	bch_keybuf_del(&io->op.c->moving_gc_keys, io->w);
-
-	up(&io->op.c->moving_in_flight);
-
-	closure_return_with_destructor(cl, moving_io_destructor);
-}
-
-static void read_moving_endio(struct bio *bio)
-{
-	struct bbio *b = container_of(bio, struct bbio, bio);
-	struct moving_io *io = container_of(bio->bi_private,
-					    struct moving_io, cl);
-
-	if (bio->bi_error)
-		io->op.error = bio->bi_error;
-	else if (!KEY_DIRTY(&b->key) &&
-		 ptr_stale(io->op.c, &b->key, 0)) {
-		io->op.error = -EINTR;
-	}
-
-	bch_bbio_endio(io->op.c, bio, bio->bi_error, "reading data to move");
-}
-
-static void moving_init(struct moving_io *io)
-{
-	struct bio *bio = &io->bio.bio;
-
-	bio_init(bio);
-	bio_get(bio);
-	bio_set_prio(bio, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0));
-
-	bio->bi_iter.bi_size	= KEY_SIZE(&io->w->key) << 9;
-	bio->bi_max_vecs	= DIV_ROUND_UP(KEY_SIZE(&io->w->key),
-					       PAGE_SECTORS);
-	bio->bi_private		= &io->cl;
-	bio->bi_io_vec		= bio->bi_inline_vecs;
-	bch_bio_map(bio, NULL);
-}
-
-static void write_moving(struct closure *cl)
-{
-	struct moving_io *io = container_of(cl, struct moving_io, cl);
-	struct data_insert_op *op = &io->op;
-
-	if (!op->error) {
-		moving_init(io);
-
-		io->bio.bio.bi_iter.bi_sector = KEY_START(&io->w->key);
-		op->write_prio		= 1;
-		op->bio			= &io->bio.bio;
-
-		op->writeback		= KEY_DIRTY(&io->w->key);
-		op->csum		= KEY_CSUM(&io->w->key);
-
-		bkey_copy(&op->replace_key, &io->w->key);
-		op->replace		= true;
-
-		closure_call(&op->cl, bch_data_insert, NULL, cl);
-	}
-
-	continue_at(cl, write_moving_finish, op->wq);
-}
-
-static void read_moving_submit(struct closure *cl)
-{
-	struct moving_io *io = container_of(cl, struct moving_io, cl);
-	struct bio *bio = &io->bio.bio;
-
-	bch_submit_bbio(bio, io->op.c, &io->w->key, 0);
-
-	continue_at(cl, write_moving, io->op.wq);
-}
-
-static void read_moving(struct cache_set *c)
-{
-	struct keybuf_key *w;
-	struct moving_io *io;
-	struct bio *bio;
-	struct closure cl;
-
-	closure_init_stack(&cl);
-
-	/* XXX: if we error, background writeback could stall indefinitely */
-
-	while (!test_bit(CACHE_SET_STOPPING, &c->flags)) {
-		w = bch_keybuf_next_rescan(c, &c->moving_gc_keys,
-					   &MAX_KEY, moving_pred);
-		if (!w)
-			break;
-
-		if (ptr_stale(c, &w->key, 0)) {
-			bch_keybuf_del(&c->moving_gc_keys, w);
-			continue;
-		}
-
-		io = kzalloc(sizeof(struct moving_io) + sizeof(struct bio_vec)
-			     * DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
-			     GFP_KERNEL);
-		if (!io)
-			goto err;
-
-		w->private	= io;
-		io->w		= w;
-		io->op.inode	= KEY_INODE(&w->key);
-		io->op.c	= c;
-		io->op.wq	= c->moving_gc_wq;
-
-		moving_init(io);
-		bio = &io->bio.bio;
-
-		bio->bi_rw	= READ;
-		bio->bi_end_io	= read_moving_endio;
-
-		if (bio_alloc_pages(bio, GFP_KERNEL))
-			goto err;
-
-		trace_bcache_gc_copy(&w->key);
-
-		down(&c->moving_in_flight);
-		closure_call(&io->cl, read_moving_submit, NULL, &cl);
-	}
-
-	if (0) {
-err:		if (!IS_ERR_OR_NULL(w->private))
-			kfree(w->private);
-
-		bch_keybuf_del(&c->moving_gc_keys, w);
-	}
-
-	closure_sync(&cl);
-}
-
-static bool bucket_cmp(struct bucket *l, struct bucket *r)
-{
-	return GC_SECTORS_USED(l) < GC_SECTORS_USED(r);
-}
-
-static unsigned bucket_heap_top(struct cache *ca)
-{
-	struct bucket *b;
-	return (b = heap_peek(&ca->heap)) ? GC_SECTORS_USED(b) : 0;
-}
-
-void bch_moving_gc(struct cache_set *c)
-{
-	struct cache *ca;
-	struct bucket *b;
-	unsigned i;
-
-	if (!c->copy_gc_enabled)
-		return;
-
-	mutex_lock(&c->bucket_lock);
-
-	for_each_cache(ca, c, i) {
-		unsigned sectors_to_move = 0;
-		unsigned reserve_sectors = ca->sb.bucket_size *
-			fifo_used(&ca->free[RESERVE_MOVINGGC]);
-
-		ca->heap.used = 0;
-
-		for_each_bucket(b, ca) {
-			if (GC_MARK(b) == GC_MARK_METADATA ||
-			    !GC_SECTORS_USED(b) ||
-			    GC_SECTORS_USED(b) == ca->sb.bucket_size ||
-			    atomic_read(&b->pin))
-				continue;
-
-			if (!heap_full(&ca->heap)) {
-				sectors_to_move += GC_SECTORS_USED(b);
-				heap_add(&ca->heap, b, bucket_cmp);
-			} else if (bucket_cmp(b, heap_peek(&ca->heap))) {
-				sectors_to_move -= bucket_heap_top(ca);
-				sectors_to_move += GC_SECTORS_USED(b);
-
-				ca->heap.data[0] = b;
-				heap_sift(&ca->heap, 0, bucket_cmp);
-			}
-		}
-
-		while (sectors_to_move > reserve_sectors) {
-			heap_pop(&ca->heap, b, bucket_cmp);
-			sectors_to_move -= GC_SECTORS_USED(b);
-		}
-
-		while (heap_pop(&ca->heap, b, bucket_cmp))
-			SET_GC_MOVE(b, 1);
-	}
-
-	mutex_unlock(&c->bucket_lock);
-
-	c->moving_gc_keys.last_scanned = ZERO_KEY;
-
-	read_moving(c);
-}
-
-void bch_moving_init_cache_set(struct cache_set *c)
-{
-	bch_keybuf_init(&c->moving_gc_keys);
-	sema_init(&c->moving_in_flight, 64);
-}
+e LCLK_DEEP_SLEEP_CNTL2__BIF_CG_LCLK_BUSY_MASK_MASK 0x2
+#define LCLK_DEEP_SLEEP_CNTL2__BIF_CG_LCLK_BUSY_MASK__SHIFT 0x1
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMU_SMU_IDLE_MASK_MASK 0x4
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMU_SMU_IDLE_MASK__SHIFT 0x2
+#define LCLK_DEEP_SLEEP_CNTL2__RESERVED_BIT3_MASK 0x8
+#define LCLK_DEEP_SLEEP_CNTL2__RESERVED_BIT3__SHIFT 0x3
+#define LCLK_DEEP_SLEEP_CNTL2__SCLK_RUNNING_MASK_MASK 0x10
+#define LCLK_DEEP_SLEEP_CNTL2__SCLK_RUNNING_MASK__SHIFT 0x4
+#define LCLK_DEEP_SLEEP_CNTL2__SMU_BUSY_MASK_MASK 0x20
+#define LCLK_DEEP_SLEEP_CNTL2__SMU_BUSY_MASK__SHIFT 0x5
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE1_MASK_MASK 0x40
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE1_MASK__SHIFT 0x6
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE2_MASK_MASK 0x80
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE2_MASK__SHIFT 0x7
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE3_MASK_MASK 0x100
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE3_MASK__SHIFT 0x8
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE4_MASK_MASK 0x200
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE4_MASK__SHIFT 0x9
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUGPP_IDLE_MASK_MASK 0x400
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUGPP_IDLE_MASK__SHIFT 0xa
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUGPPSB_IDLE_MASK_MASK 0x800
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUGPPSB_IDLE_MASK__SHIFT 0xb
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUBIF_IDLE_MASK_MASK 0x1000
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUBIF_IDLE_MASK__SHIFT 0xc
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUINTGEN_IDLE_MASK_MASK 0x2000
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUINTGEN_IDLE_MASK__SHIFT 0xd
+#define LCLK_DEEP_SLEEP_CNTL2__L2IMU_IDLE_MASK_MASK 0x4000
+#define LCLK_DEEP_SLEEP_CNTL2__L2IMU_IDLE_MASK__SHIFT 0xe
+#define LCLK_DEEP_SLEEP_CNTL2__ORB_IDLE_MASK_MASK 0x8000
+#define LCLK_DEEP_SLEEP_CNTL2__ORB_IDLE_MASK__SHIFT 0xf
+#define LCLK_DEEP_SLEEP_CNTL2__ON_INB_WAKE_MASK_MASK 0x10000
+#define LCLK_DEEP_SLEEP_CNTL2__ON_INB_WAKE_MASK__SHIFT 0x10
+#define LCLK_DEEP_SLEEP_CNTL2__ON_INB_WAKE_ACK_MASK_MASK 0x20000
+#define LCLK_DEEP_SLEEP_CNTL2__ON_INB_WAKE_ACK_MASK__SHIFT 0x11
+#define LCLK_DEEP_SLEEP_CNTL2__ON_OUTB_WAKE_MASK_MASK 0x40000
+#define LCLK_DEEP_SLEEP_CNTL2__ON_OUTB_WAKE_MASK__SHIFT 0x12
+#define LCLK_DEEP_SLEEP_CNTL2__ON_OUTB_WAKE_ACK_MASK_MASK 0x80000
+#define LCLK_DEEP_SLEEP_CNTL2__ON_OUTB_WAKE_ACK_MASK__SHIFT 0x13
+#define LCLK_DEEP_SLEEP_CNTL2__DMAACTIVE_MASK_MASK 0x100000
+#define LCLK_DEEP_SLEEP_CNTL2__DMAACTIVE_MASK__SHIFT 0x14
+#define LCLK_DEEP_SLEEP_CNTL2__RLC_SMU_GFXCLK_OFF_MASK_MASK 0x200000
+#define LCLK_DEEP_SLEEP_CNTL2__RLC_SMU_GFXCLK_OFF_MASK__SHIFT 0x15
+#define LCLK_DEEP_SLEEP_CNTL2__RESERVED_MASK 0xffc00000
+#define LCLK_DEEP_SLEEP_CNTL2__RESERVED__SHIFT 0x16
+#define SMU_VOLTAGE_STATUS__SMU_VOLTAGE_STATUS_MASK 0x1
+#define SMU_VOLTAGE_STATUS__SMU_VOLTAGE_STATUS__SHIFT 0x0
+#define SMU_VOLTAGE_STATUS__SMU_VOLTAGE_CURRENT_LEVEL_MASK 0x1fe
+#define SMU_VOLTAGE_STATUS__SMU_VOLTAGE_CURRENT_LEVEL__SHIFT 0x1
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__CURR_VDDCI_INDEX_MASK 0xf
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__CURR_VDDCI_INDEX__SHIFT 0x0
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__TARG_VDDCI_INDEX_MASK 0xf0
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__TARG_VDDCI_INDEX__SHIFT 0x4
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__CURR_MVDD_INDEX_MASK 0xf00
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__CURR_MVDD_INDEX__SHIFT 0x8
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__TARG_MVDD_INDEX_MASK 0xf000
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__TARG_MVDD_INDEX__SHIFT 0xc
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__CURR_VDDC_INDEX_MASK 0xf0000
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__CURR_VDDC_INDEX__SHIFT 0x10
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__TARG_VDDC_INDEX_MASK 0xf00000
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__TARG_VDDC_INDEX__SHIFT 0x14
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__CURR_PCIE_INDEX_MASK 0xf000000
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__CURR_PCIE_INDEX__SHIFT 0x18
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__TARG_PCIE_INDEX_MASK 0xf0000000
+#define TARGET_AND_CURRENT_PROFILE_INDEX_1__TARG_PCIE_INDEX__SHIFT 0x1c
+#define CG_ULV_PARAMETER__ULV_THRESHOLD_MASK 0xffff
+#define CG_ULV_PARAMETER__ULV_THRESHOLD__SHIFT 0x0
+#define CG_ULV_PARAMETER__ULV_THRESHOLD_UNIT_MASK 0xf0000
+#define CG_ULV_PARAMETER__ULV_THRESHOLD_UNIT__SHIFT 0x10
+#define SCLK_MIN_DIV__FRACV_MASK 0xfff
+#define SCLK_MIN_DIV__FRACV__SHIFT 0x0
+#define SCLK_MIN_DIV__INTV_MASK 0x7f000
+#define SCLK_MIN_DIV__INTV__SHIFT 0xc
+#define LCAC_SX0_CNTL__SX0_ENABLE_MASK 0x1
+#define LCAC_SX0_CNTL__SX0_ENABLE__SHIFT 0x0
+#define LCAC_SX0_CNTL__SX0_THRESHOLD_MASK 0x1fffe
+#define LCAC_SX0_CNTL__SX0_THRESHOLD__SHIFT 0x1
+#define LCAC_SX0_CNTL__SX0_BLOCK_ID_MASK 0x3e0000
+#define LCAC_SX0_CNTL__SX0_BLOCK_ID__SHIFT 0x11
+#define LCAC_SX0_CNTL__SX0_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_SX0_CNTL__SX0_SIGNAL_ID__SHIFT 0x16
+#define LCAC_SX0_OVR_SEL__SX0_OVR_SEL_MASK 0xffffffff
+#define LCAC_SX0_OVR_SEL__SX0_OVR_SEL__SHIFT 0x0
+#define LCAC_SX0_OVR_VAL__SX0_OVR_VAL_MASK 0xffffffff
+#define LCAC_SX0_OVR_VAL__SX0_OVR_VAL__SHIFT 0x0
+#define LCAC_MC0_CNTL__MC0_ENABLE_MASK 0x1
+#define LCAC_MC0_CNTL__MC0_ENABLE__SHIFT 0x0
+#define LCAC_MC0_CNTL__MC0_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC0_CNTL__MC0_THRESHOLD__SHIFT 0x1
+#define LCAC_MC0_CNTL__MC0_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC0_CNTL__MC0_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC0_CNTL__MC0_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC0_CNTL__MC0_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC0_OVR_SEL__MC0_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC0_OVR_SEL__MC0_OVR_SEL__SHIFT 0x0
+#define LCAC_MC0_OVR_VAL__MC0_OVR_VAL_MASK 0xffffffff
+#define L

@@ -1,186 +1,76 @@
-/*
- * Copyright (C) 2013 STMicroelectronics Limited
- * Author: Stephen Gallimore <stephen.gallimore@st.com>
- *
- * Inspired by mach-imx/src.c
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- */
-#include <linux/kernel.h>
-#include <linux/platform_device.h>
-#include <linux/module.h>
-#include <linux/err.h>
-#include <linux/types.h>
-#include <linux/of_device.h>
-#include <linux/regmap.h>
-#include <linux/mfd/syscon.h>
-
-#include "reset-syscfg.h"
-
-/**
- * Reset channel regmap configuration
- *
- * @reset: regmap field for the channel's reset bit.
- * @ack: regmap field for the channel's ack bit (optional).
- */
-struct syscfg_reset_channel {
-	struct regmap_field *reset;
-	struct regmap_field *ack;
-};
-
-/**
- * A reset controller which groups together a set of related reset bits, which
- * may be located in different system configuration registers.
- *
- * @rst: base reset controller structure.
- * @active_low: are the resets in this controller active low, i.e. clearing
- *              the reset bit puts the hardware into reset.
- * @channels: An array of reset channels for this controller.
- */
-struct syscfg_reset_controller {
-	struct reset_controller_dev rst;
-	bool active_low;
-	struct syscfg_reset_channel *channels;
-};
-
-#define to_syscfg_reset_controller(_rst) \
-	container_of(_rst, struct syscfg_reset_controller, rst)
-
-static int syscfg_reset_program_hw(struct reset_controller_dev *rcdev,
-				   unsigned long idx, int assert)
-{
-	struct syscfg_reset_controller *rst = to_syscfg_reset_controller(rcdev);
-	const struct syscfg_reset_channel *ch;
-	u32 ctrl_val = rst->active_low ? !assert : !!assert;
-	int err;
-
-	if (idx >= rcdev->nr_resets)
-		return -EINVAL;
-
-	ch = &rst->channels[idx];
-
-	err = regmap_field_write(ch->reset, ctrl_val);
-	if (err)
-		return err;
-
-	if (ch->ack) {
-		unsigned long timeout = jiffies + msecs_to_jiffies(1000);
-		u32 ack_val;
-
-		while (true) {
-			err = regmap_field_read(ch->ack, &ack_val);
-			if (err)
-				return err;
-
-			if (ack_val == ctrl_val)
-				break;
-
-			if (time_after(jiffies, timeout))
-				return -ETIME;
-
-			cpu_relax();
-		}
-	}
-
-	return 0;
-}
-
-static int syscfg_reset_assert(struct reset_controller_dev *rcdev,
-			       unsigned long idx)
-{
-	return syscfg_reset_program_hw(rcdev, idx, true);
-}
-
-static int syscfg_reset_deassert(struct reset_controller_dev *rcdev,
-				 unsigned long idx)
-{
-	return syscfg_reset_program_hw(rcdev, idx, false);
-}
-
-static int syscfg_reset_dev(struct reset_controller_dev *rcdev,
-			    unsigned long idx)
-{
-	int err = syscfg_reset_assert(rcdev, idx);
-	if (err)
-		return err;
-
-	return syscfg_reset_deassert(rcdev, idx);
-}
-
-static struct reset_control_ops syscfg_reset_ops = {
-	.reset    = syscfg_reset_dev,
-	.assert   = syscfg_reset_assert,
-	.deassert = syscfg_reset_deassert,
-};
-
-static int syscfg_reset_controller_register(struct device *dev,
-				const struct syscfg_reset_controller_data *data)
-{
-	struct syscfg_reset_controller *rc;
-	size_t size;
-	int i, err;
-
-	rc = devm_kzalloc(dev, sizeof(*rc), GFP_KERNEL);
-	if (!rc)
-		return -ENOMEM;
-
-	size = sizeof(struct syscfg_reset_channel) * data->nr_channels;
-
-	rc->channels = devm_kzalloc(dev, size, GFP_KERNEL);
-	if (!rc->channels)
-		return -ENOMEM;
-
-	rc->rst.ops = &syscfg_reset_ops,
-	rc->rst.of_node = dev->of_node;
-	rc->rst.nr_resets = data->nr_channels;
-	rc->active_low = data->active_low;
-
-	for (i = 0; i < data->nr_channels; i++) {
-		struct regmap *map;
-		struct regmap_field *f;
-		const char *compatible = data->channels[i].compatible;
-
-		map = syscon_regmap_lookup_by_compatible(compatible);
-		if (IS_ERR(map))
-			return PTR_ERR(map);
-
-		f = devm_regmap_field_alloc(dev, map, data->channels[i].reset);
-		if (IS_ERR(f))
-			return PTR_ERR(f);
-
-		rc->channels[i].reset = f;
-
-		if (!data->wait_for_ack)
-			continue;
-
-		f = devm_regmap_field_alloc(dev, map, data->channels[i].ack);
-		if (IS_ERR(f))
-			return PTR_ERR(f);
-
-		rc->channels[i].ack = f;
-	}
-
-	err = reset_controller_register(&rc->rst);
-	if (!err)
-		dev_info(dev, "registered\n");
-
-	return err;
-}
-
-int syscfg_reset_probe(struct platform_device *pdev)
-{
-	struct device *dev = pdev ? &pdev->dev : NULL;
-	const struct of_device_id *match;
-
-	if (!dev || !dev->driver)
-		return -ENODEV;
-
-	match = of_match_device(dev->driver->of_match_table, dev);
-	if (!match || !match->data)
-		return -EINVAL;
-
-	return syscfg_reset_controller_register(dev, match->data);
-}
+L_MULTICHANNEL2_ENABLE_MULTICHANNEL2_MUTE;
+typedef enum AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL3_ENABLE_MULTICHANNEL3_MUTE {
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL3_ENABLE_MULTICHANNEL3_NOT_MUTED= 0x0,
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL3_ENABLE_MULTICHANNEL3_MUTED= 0x1,
+} AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL3_ENABLE_MULTICHANNEL3_MUTE;
+typedef enum AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL4_ENABLE_MULTICHANNEL4_MUTE {
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL4_ENABLE_MULTICHANNEL4_NOT_MUTED= 0x0,
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL4_ENABLE_MULTICHANNEL4_MUTED= 0x1,
+} AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL4_ENABLE_MULTICHANNEL4_MUTE;
+typedef enum AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL5_ENABLE_MULTICHANNEL5_MUTE {
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL5_ENABLE_MULTICHANNEL5_NOT_MUTED= 0x0,
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL5_ENABLE_MULTICHANNEL5_MUTED= 0x1,
+} AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL5_ENABLE_MULTICHANNEL5_MUTE;
+typedef enum AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL6_ENABLE_MULTICHANNEL6_MUTE {
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL6_ENABLE_MULTICHANNEL6_NOT_MUTED= 0x0,
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL6_ENABLE_MULTICHANNEL6_MUTED= 0x1,
+} AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL6_ENABLE_MULTICHANNEL6_MUTE;
+typedef enum AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL7_ENABLE_MULTICHANNEL7_MUTE {
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL7_ENABLE_MULTICHANNEL7_NOT_MUTED= 0x0,
+	AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL7_ENABLE_MULTICHANNEL7_MUTED= 0x1,
+} AZALIA_F2_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL7_ENABLE_MULTICHANNEL7_MUTE;
+typedef enum BLND_CONTROL_BLND_MODE {
+	BLND_CONTROL_BLND_MODE_CURRENT_PIPE_ONLY         = 0x0,
+	BLND_CONTROL_BLND_MODE_OTHER_PIPE_ONLY           = 0x1,
+	BLND_CONTROL_BLND_MODE_ALPHA_BLENDING_MODE       = 0x2,
+	BLND_CONTROL_BLND_MODE_OTHER_STEREO_TYPE         = 0x3,
+} BLND_CONTROL_BLND_MODE;
+typedef enum BLND_CONTROL_BLND_STEREO_TYPE {
+	BLND_CONTROL_BLND_STEREO_TYPE_NON_SINGLE_PIPE_STEREO= 0x0,
+	BLND_CONTROL_BLND_STEREO_TYPE_SIDE_BY_SIDE_SINGLE_PIPE_STEREO= 0x1,
+	BLND_CONTROL_BLND_STEREO_TYPE_TOP_BOTTOM_SINGLE_PIPE_STEREO= 0x2,
+	BLND_CONTROL_BLND_STEREO_TYPE_UNUSED             = 0x3,
+} BLND_CONTROL_BLND_STEREO_TYPE;
+typedef enum BLND_CONTROL_BLND_STEREO_POLARITY {
+	BLND_CONTROL_BLND_STEREO_POLARITY_LOW            = 0x0,
+	BLND_CONTROL_BLND_STEREO_POLARITY_HIGH           = 0x1,
+} BLND_CONTROL_BLND_STEREO_POLARITY;
+typedef enum BLND_CONTROL_BLND_FEEDTHROUGH_EN {
+	BLND_CONTROL_BLND_FEEDTHROUGH_EN_FALSE           = 0x0,
+	BLND_CONTROL_BLND_FEEDTHROUGH_EN_TRUE            = 0x1,
+} BLND_CONTROL_BLND_FEEDTHROUGH_EN;
+typedef enum BLND_CONTROL_BLND_ALPHA_MODE {
+	BLND_CONTROL_BLND_ALPHA_MODE_CURRENT_PIXEL_ALPHA = 0x0,
+	BLND_CONTROL_BLND_ALPHA_MODE_PIXEL_ALPHA_COMBINED_GLOBAL_GAIN= 0x1,
+	BLND_CONTROL_BLND_ALPHA_MODE_GLOBAL_ALPHA_ONLY   = 0x2,
+	BLND_CONTROL_BLND_ALPHA_MODE_UNUSED              = 0x3,
+} BLND_CONTROL_BLND_ALPHA_MODE;
+typedef enum BLND_CONTROL_BLND_MULTIPLIED_MODE {
+	BLND_CONTROL_BLND_MULTIPLIED_MODE_FALSE          = 0x0,
+	BLND_CONTROL_BLND_MULTIPLIED_MODE_TRUE           = 0x1,
+} BLND_CONTROL_BLND_MULTIPLIED_MODE;
+typedef enum BLND_SM_CONTROL2_SM_MODE {
+	BLND_SM_CONTROL2_SM_MODE_SINGLE_PLANE            = 0x0,
+	BLND_SM_CONTROL2_SM_MODE_ROW_SUBSAMPLING         = 0x2,
+	BLND_SM_CONTROL2_SM_MODE_COLUMN_SUBSAMPLING      = 0x4,
+	BLND_SM_CONTROL2_SM_MODE_CHECKERBOARD_SUBSAMPLING= 0x6,
+} BLND_SM_CONTROL2_SM_MODE;
+typedef enum BLND_SM_CONTROL2_SM_FRAME_ALTERNATE {
+	BLND_SM_CONTROL2_SM_FRAME_ALTERNATE_FALSE        = 0x0,
+	BLND_SM_CONTROL2_SM_FRAME_ALTERNATE_TRUE         = 0x1,
+} BLND_SM_CONTROL2_SM_FRAME_ALTERNATE;
+typedef enum BLND_SM_CONTROL2_SM_FIELD_ALTERNATE {
+	BLND_SM_CONTROL2_SM_FIELD_ALTERNATE_FALSE        = 0x0,
+	BLND_SM_CONTROL2_SM_FIELD_ALTERNATE_TRUE         = 0x1,
+} BLND_SM_CONTROL2_SM_FIELD_ALTERNATE;
+typedef enum BLND_SM_CONTROL2_SM_FORCE_NEXT_FRAME_POL {
+	BLND_SM_CONTROL2_SM_FORCE_NEXT_FRAME_POL_NO_FORCE= 0x0,
+	BLND_SM_CONTROL2_SM_FORCE_NEXT_FRAME_POL_RESERVED= 0x1,
+	BLND_SM_CONTROL2_SM_FORCE_NEXT_FRAME_POL_FORCE_LOW= 0x2,
+	BLND_SM_CONTROL2_SM_FORCE_NEXT_FRAME_POL_FORCE_HIGH= 0x3,
+} BLND_SM_CONTROL2_SM_FORCE_NEXT_FRAME_POL;
+typedef enum BLND_SM_CONTROL2_SM_FORCE_NEXT_TOP_POL {
+	BLND_SM_CONTROL2_SM_FORCE_NEXT_TOP_POL_NO_FORCE  = 0x0,
+	BLND_SM_CONTROL2_SM_FORCE_NEXT_TOP_POL_RESERVED  = 0x1,
+	BLND_SM_CONTROL2_SM_FORCE_NEXT_TOP_POL_FORCE_LOW = 0x2,
+	BLND_SM_CONTROL2_SM_FORCE

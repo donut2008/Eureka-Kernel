@@ -1,615 +1,203 @@
-/*
- * Wireless USB Host Controller
- * Security support: encryption enablement, etc
- *
- * Copyright (C) 2006 Intel Corporation
- * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
- *
- * FIXME: docs
- */
-#include <linux/types.h>
-#include <linux/slab.h>
-#include <linux/usb/ch9.h>
-#include <linux/random.h>
-#include <linux/export.h>
-#include "wusbhc.h"
-
-static void wusbhc_gtk_rekey_work(struct work_struct *work);
-
-int wusbhc_sec_create(struct wusbhc *wusbhc)
-{
-	/*
-	 * WQ is singlethread because we need to serialize rekey operations.
-	 * Use a separate workqueue for security operations instead of the
-	 * wusbd workqueue because security operations may need to communicate
-	 * directly with downstream wireless devices using synchronous URBs.
-	 * If a device is not responding, this could block other host
-	 * controller operations.
-	 */
-	wusbhc->wq_security = create_singlethread_workqueue("wusbd_security");
-	if (wusbhc->wq_security == NULL) {
-		pr_err("WUSB-core: Cannot create wusbd_security workqueue\n");
-		return -ENOMEM;
-	}
-
-	wusbhc->gtk.descr.bLength = sizeof(wusbhc->gtk.descr) +
-		sizeof(wusbhc->gtk.data);
-	wusbhc->gtk.descr.bDescriptorType = USB_DT_KEY;
-	wusbhc->gtk.descr.bReserved = 0;
-	wusbhc->gtk_index = 0;
-
-	INIT_WORK(&wusbhc->gtk_rekey_work, wusbhc_gtk_rekey_work);
-
-	return 0;
-}
-
-
-/* Called when the HC is destroyed */
-void wusbhc_sec_destroy(struct wusbhc *wusbhc)
-{
-	destroy_workqueue(wusbhc->wq_security);
-}
-
-
-/**
- * wusbhc_next_tkid - generate a new, currently unused, TKID
- * @wusbhc:   the WUSB host controller
- * @wusb_dev: the device whose PTK the TKID is for
- *            (or NULL for a TKID for a GTK)
- *
- * The generated TKID consists of two parts: the device's authenticated
- * address (or 0 or a GTK); and an incrementing number.  This ensures
- * that TKIDs cannot be shared between devices and by the time the
- * incrementing number wraps around the older TKIDs will no longer be
- * in use (a maximum of two keys may be active at any one time).
- */
-static u32 wusbhc_next_tkid(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev)
-{
-	u32 *tkid;
-	u32 addr;
-
-	if (wusb_dev == NULL) {
-		tkid = &wusbhc->gtk_tkid;
-		addr = 0;
-	} else {
-		tkid = &wusb_port_by_idx(wusbhc, wusb_dev->port_idx)->ptk_tkid;
-		addr = wusb_dev->addr & 0x7f;
-	}
-
-	*tkid = (addr << 8) | ((*tkid + 1) & 0xff);
-
-	return *tkid;
-}
-
-static void wusbhc_generate_gtk(struct wusbhc *wusbhc)
-{
-	const size_t key_size = sizeof(wusbhc->gtk.data);
-	u32 tkid;
-
-	tkid = wusbhc_next_tkid(wusbhc, NULL);
-
-	wusbhc->gtk.descr.tTKID[0] = (tkid >>  0) & 0xff;
-	wusbhc->gtk.descr.tTKID[1] = (tkid >>  8) & 0xff;
-	wusbhc->gtk.descr.tTKID[2] = (tkid >> 16) & 0xff;
-
-	get_random_bytes(wusbhc->gtk.descr.bKeyData, key_size);
-}
-
-/**
- * wusbhc_sec_start - start the security management process
- * @wusbhc: the WUSB host controller
- *
- * Generate and set an initial GTK on the host controller.
- *
- * Called when the HC is started.
- */
-int wusbhc_sec_start(struct wusbhc *wusbhc)
-{
-	const size_t key_size = sizeof(wusbhc->gtk.data);
-	int result;
-
-	wusbhc_generate_gtk(wusbhc);
-
-	result = wusbhc->set_gtk(wusbhc, wusbhc->gtk_tkid,
-				&wusbhc->gtk.descr.bKeyData, key_size);
-	if (result < 0)
-		dev_err(wusbhc->dev, "cannot set GTK for the host: %d\n",
-			result);
-
-	return result;
-}
-
-/**
- * wusbhc_sec_stop - stop the security management process
- * @wusbhc: the WUSB host controller
- *
- * Wait for any pending GTK rekeys to stop.
- */
-void wusbhc_sec_stop(struct wusbhc *wusbhc)
-{
-	cancel_work_sync(&wusbhc->gtk_rekey_work);
-}
-
-
-/** @returns encryption type name */
-const char *wusb_et_name(u8 x)
-{
-	switch (x) {
-	case USB_ENC_TYPE_UNSECURE:	return "unsecure";
-	case USB_ENC_TYPE_WIRED:	return "wired";
-	case USB_ENC_TYPE_CCM_1:	return "CCM-1";
-	case USB_ENC_TYPE_RSA_1:	return "RSA-1";
-	default:			return "unknown";
-	}
-}
-EXPORT_SYMBOL_GPL(wusb_et_name);
-
-/*
- * Set the device encryption method
- *
- * We tell the device which encryption method to use; we do this when
- * setting up the device's security.
- */
-static int wusb_dev_set_encryption(struct usb_device *usb_dev, int value)
-{
-	int result;
-	struct device *dev = &usb_dev->dev;
-	struct wusb_dev *wusb_dev = usb_dev->wusb_dev;
-
-	if (value) {
-		value = wusb_dev->ccm1_etd.bEncryptionValue;
-	} else {
-		/* FIXME: should be wusb_dev->etd[UNSECURE].bEncryptionValue */
-		value = 0;
-	}
-	/* Set device's */
-	result = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			USB_REQ_SET_ENCRYPTION,
-			USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
-			value, 0, NULL, 0, USB_CTRL_SET_TIMEOUT);
-	if (result < 0)
-		dev_err(dev, "Can't set device's WUSB encryption to "
-			"%s (value %d): %d\n",
-			wusb_et_name(wusb_dev->ccm1_etd.bEncryptionType),
-			wusb_dev->ccm1_etd.bEncryptionValue,  result);
-	return result;
-}
-
-/*
- * Set the GTK to be used by a device.
- *
- * The device must be authenticated.
- */
-static int wusb_dev_set_gtk(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev)
-{
-	struct usb_device *usb_dev = wusb_dev->usb_dev;
-	u8 key_index = wusb_key_index(wusbhc->gtk_index,
-		WUSB_KEY_INDEX_TYPE_GTK, WUSB_KEY_INDEX_ORIGINATOR_HOST);
-
-	return usb_control_msg(
-		usb_dev, usb_sndctrlpipe(usb_dev, 0),
-		USB_REQ_SET_DESCRIPTOR,
-		USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
-		USB_DT_KEY << 8 | key_index, 0,
-		&wusbhc->gtk.descr, wusbhc->gtk.descr.bLength,
-		USB_CTRL_SET_TIMEOUT);
-}
-
-
-/* FIXME: prototype for adding security */
-int wusb_dev_sec_add(struct wusbhc *wusbhc,
-		     struct usb_device *usb_dev, struct wusb_dev *wusb_dev)
-{
-	int result, bytes, secd_size;
-	struct device *dev = &usb_dev->dev;
-	struct usb_security_descriptor *secd, *new_secd;
-	const struct usb_encryption_descriptor *etd, *ccm1_etd = NULL;
-	const void *itr, *top;
-	char buf[64];
-
-	secd = kmalloc(sizeof(*secd), GFP_KERNEL);
-	if (secd == NULL) {
-		result = -ENOMEM;
-		goto out;
-	}
-
-	result = usb_get_descriptor(usb_dev, USB_DT_SECURITY,
-				    0, secd, sizeof(*secd));
-	if (result < (int)sizeof(*secd)) {
-		dev_err(dev, "Can't read security descriptor or "
-			"not enough data: %d\n", result);
-		goto out;
-	}
-	secd_size = le16_to_cpu(secd->wTotalLength);
-	new_secd = krealloc(secd, secd_size, GFP_KERNEL);
-	if (new_secd == NULL) {
-		dev_err(dev,
-			"Can't allocate space for security descriptors\n");
-		goto out;
-	}
-	secd = new_secd;
-	result = usb_get_descriptor(usb_dev, USB_DT_SECURITY,
-				    0, secd, secd_size);
-	if (result < secd_size) {
-		dev_err(dev, "Can't read security descriptor or "
-			"not enough data: %d\n", result);
-		goto out;
-	}
-	bytes = 0;
-	itr = &secd[1];
-	top = (void *)secd + result;
-	while (itr < top) {
-		etd = itr;
-		if (top - itr < sizeof(*etd)) {
-			dev_err(dev, "BUG: bad device security descriptor; "
-				"not enough data (%zu vs %zu bytes left)\n",
-				top - itr, sizeof(*etd));
-			break;
-		}
-		if (etd->bLength < sizeof(*etd)) {
-			dev_err(dev, "BUG: bad device encryption descriptor; "
-				"descriptor is too short "
-				"(%u vs %zu needed)\n",
-				etd->bLength, sizeof(*etd));
-			break;
-		}
-		itr += etd->bLength;
-		bytes += snprintf(buf + bytes, sizeof(buf) - bytes,
-				  "%s (0x%02x/%02x) ",
-				  wusb_et_name(etd->bEncryptionType),
-				  etd->bEncryptionValue, etd->bAuthKeyIndex);
-		if (etd->bEncryptionType == USB_ENC_TYPE_CCM_1)
-			ccm1_etd = etd;
-	}
-	/* This code only supports CCM1 as of now. */
-	/* FIXME: user has to choose which sec mode to use?
-	 * In theory we want CCM */
-	if (ccm1_etd == NULL) {
-		dev_err(dev, "WUSB device doesn't support CCM1 encryption, "
-			"can't use!\n");
-		result = -EINVAL;
-		goto out;
-	}
-	wusb_dev->ccm1_etd = *ccm1_etd;
-	dev_dbg(dev, "supported encryption: %s; using %s (0x%02x/%02x)\n",
-		buf, wusb_et_name(ccm1_etd->bEncryptionType),
-		ccm1_etd->bEncryptionValue, ccm1_etd->bAuthKeyIndex);
-	result = 0;
-out:
-	kfree(secd);
-	return result;
-}
-
-void wusb_dev_sec_rm(struct wusb_dev *wusb_dev)
-{
-	/* Nothing so far */
-}
-
-/**
- * Update the address of an unauthenticated WUSB device
- *
- * Once we have successfully authenticated, we take it to addr0 state
- * and then to a normal address.
- *
- * Before the device's address (as known by it) was usb_dev->devnum |
- * 0x80 (unauthenticated address). With this we update it to usb_dev->devnum.
- */
-int wusb_dev_update_address(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev)
-{
-	int result = -ENOMEM;
-	struct usb_device *usb_dev = wusb_dev->usb_dev;
-	struct device *dev = &usb_dev->dev;
-	u8 new_address = wusb_dev->addr & 0x7F;
-
-	/* Set address 0 */
-	result = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			USB_REQ_SET_ADDRESS,
-			USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
-			 0, 0, NULL, 0, USB_CTRL_SET_TIMEOUT);
-	if (result < 0) {
-		dev_err(dev, "auth failed: can't set address 0: %d\n",
-			result);
-		goto error_addr0;
-	}
-	result = wusb_set_dev_addr(wusbhc, wusb_dev, 0);
-	if (result < 0)
-		goto error_addr0;
-	usb_set_device_state(usb_dev, USB_STATE_DEFAULT);
-	usb_ep0_reinit(usb_dev);
-
-	/* Set new (authenticated) address. */
-	result = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			USB_REQ_SET_ADDRESS,
-			USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
-			new_address, 0, NULL, 0,
-			USB_CTRL_SET_TIMEOUT);
-	if (result < 0) {
-		dev_err(dev, "auth failed: can't set address %u: %d\n",
-			new_address, result);
-		goto error_addr;
-	}
-	result = wusb_set_dev_addr(wusbhc, wusb_dev, new_address);
-	if (result < 0)
-		goto error_addr;
-	usb_set_device_state(usb_dev, USB_STATE_ADDRESS);
-	usb_ep0_reinit(usb_dev);
-	usb_dev->authenticated = 1;
-error_addr:
-error_addr0:
-	return result;
-}
-
-/*
- *
- *
- */
-/* FIXME: split and cleanup */
-int wusb_dev_4way_handshake(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev,
-			    struct wusb_ckhdid *ck)
-{
-	int result = -ENOMEM;
-	struct usb_device *usb_dev = wusb_dev->usb_dev;
-	struct device *dev = &usb_dev->dev;
-	u32 tkid;
-	__le32 tkid_le;
-	struct usb_handshake *hs;
-	struct aes_ccm_nonce ccm_n;
-	u8 mic[8];
-	struct wusb_keydvt_in keydvt_in;
-	struct wusb_keydvt_out keydvt_out;
-
-	hs = kcalloc(3, sizeof(hs[0]), GFP_KERNEL);
-	if (hs == NULL) {
-		dev_err(dev, "can't allocate handshake data\n");
-		goto error_kzalloc;
-	}
-
-	/* We need to turn encryption before beginning the 4way
-	 * hshake (WUSB1.0[.3.2.2]) */
-	result = wusb_dev_set_encryption(usb_dev, 1);
-	if (result < 0)
-		goto error_dev_set_encryption;
-
-	tkid = wusbhc_next_tkid(wusbhc, wusb_dev);
-	tkid_le = cpu_to_le32(tkid);
-
-	hs[0].bMessageNumber = 1;
-	hs[0].bStatus = 0;
-	memcpy(hs[0].tTKID, &tkid_le, sizeof(hs[0].tTKID));
-	hs[0].bReserved = 0;
-	memcpy(hs[0].CDID, &wusb_dev->cdid, sizeof(hs[0].CDID));
-	get_random_bytes(&hs[0].nonce, sizeof(hs[0].nonce));
-	memset(hs[0].MIC, 0, sizeof(hs[0].MIC)); /* Per WUSB1.0[T7-22] */
-
-	result = usb_control_msg(
-		usb_dev, usb_sndctrlpipe(usb_dev, 0),
-		USB_REQ_SET_HANDSHAKE,
-		USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
-		1, 0, &hs[0], sizeof(hs[0]), USB_CTRL_SET_TIMEOUT);
-	if (result < 0) {
-		dev_err(dev, "Handshake1: request failed: %d\n", result);
-		goto error_hs1;
-	}
-
-	/* Handshake 2, from the device -- need to verify fields */
-	result = usb_control_msg(
-		usb_dev, usb_rcvctrlpipe(usb_dev, 0),
-		USB_REQ_GET_HANDSHAKE,
-		USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
-		2, 0, &hs[1], sizeof(hs[1]), USB_CTRL_GET_TIMEOUT);
-	if (result < 0) {
-		dev_err(dev, "Handshake2: request failed: %d\n", result);
-		goto error_hs2;
-	}
-
-	result = -EINVAL;
-	if (hs[1].bMessageNumber != 2) {
-		dev_err(dev, "Handshake2 failed: bad message number %u\n",
-			hs[1].bMessageNumber);
-		goto error_hs2;
-	}
-	if (hs[1].bStatus != 0) {
-		dev_err(dev, "Handshake2 failed: bad status %u\n",
-			hs[1].bStatus);
-		goto error_hs2;
-	}
-	if (memcmp(hs[0].tTKID, hs[1].tTKID, sizeof(hs[0].tTKID))) {
-		dev_err(dev, "Handshake2 failed: TKID mismatch "
-			"(#1 0x%02x%02x%02x vs #2 0x%02x%02x%02x)\n",
-			hs[0].tTKID[0], hs[0].tTKID[1], hs[0].tTKID[2],
-			hs[1].tTKID[0], hs[1].tTKID[1], hs[1].tTKID[2]);
-		goto error_hs2;
-	}
-	if (memcmp(hs[0].CDID, hs[1].CDID, sizeof(hs[0].CDID))) {
-		dev_err(dev, "Handshake2 failed: CDID mismatch\n");
-		goto error_hs2;
-	}
-
-	/* Setup the CCM nonce */
-	memset(&ccm_n.sfn, 0, sizeof(ccm_n.sfn)); /* Per WUSB1.0[6.5.2] */
-	memcpy(ccm_n.tkid, &tkid_le, sizeof(ccm_n.tkid));
-	ccm_n.src_addr = wusbhc->uwb_rc->uwb_dev.dev_addr;
-	ccm_n.dest_addr.data[0] = wusb_dev->addr;
-	ccm_n.dest_addr.data[1] = 0;
-
-	/* Derive the KCK and PTK from CK, the CCM, H and D nonces */
-	memcpy(keydvt_in.hnonce, hs[0].nonce, sizeof(keydvt_in.hnonce));
-	memcpy(keydvt_in.dnonce, hs[1].nonce, sizeof(keydvt_in.dnonce));
-	result = wusb_key_derive(&keydvt_out, ck->data, &ccm_n, &keydvt_in);
-	if (result < 0) {
-		dev_err(dev, "Handshake2 failed: cannot derive keys: %d\n",
-			result);
-		goto error_hs2;
-	}
-
-	/* Compute MIC and verify it */
-	result = wusb_oob_mic(mic, keydvt_out.kck, &ccm_n, &hs[1]);
-	if (result < 0) {
-		dev_err(dev, "Handshake2 failed: cannot compute MIC: %d\n",
-			result);
-		goto error_hs2;
-	}
-
-	if (memcmp(hs[1].MIC, mic, sizeof(hs[1].MIC))) {
-		dev_err(dev, "Handshake2 failed: MIC mismatch\n");
-		goto error_hs2;
-	}
-
-	/* Send Handshake3 */
-	hs[2].bMessageNumber = 3;
-	hs[2].bStatus = 0;
-	memcpy(hs[2].tTKID, &tkid_le, sizeof(hs[2].tTKID));
-	hs[2].bReserved = 0;
-	memcpy(hs[2].CDID, &wusb_dev->cdid, sizeof(hs[2].CDID));
-	memcpy(hs[2].nonce, hs[0].nonce, sizeof(hs[2].nonce));
-	result = wusb_oob_mic(hs[2].MIC, keydvt_out.kck, &ccm_n, &hs[2]);
-	if (result < 0) {
-		dev_err(dev, "Handshake3 failed: cannot compute MIC: %d\n",
-			result);
-		goto error_hs2;
-	}
-
-	result = usb_control_msg(
-		usb_dev, usb_sndctrlpipe(usb_dev, 0),
-		USB_REQ_SET_HANDSHAKE,
-		USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
-		3, 0, &hs[2], sizeof(hs[2]), USB_CTRL_SET_TIMEOUT);
-	if (result < 0) {
-		dev_err(dev, "Handshake3: request failed: %d\n", result);
-		goto error_hs3;
-	}
-
-	result = wusbhc->set_ptk(wusbhc, wusb_dev->port_idx, tkid,
-				 keydvt_out.ptk, sizeof(keydvt_out.ptk));
-	if (result < 0)
-		goto error_wusbhc_set_ptk;
-
-	result = wusb_dev_set_gtk(wusbhc, wusb_dev);
-	if (result < 0) {
-		dev_err(dev, "Set GTK for device: request failed: %d\n",
-			result);
-		goto error_wusbhc_set_gtk;
-	}
-
-	/* Update the device's address from unauth to auth */
-	if (usb_dev->authenticated == 0) {
-		result = wusb_dev_update_address(wusbhc, wusb_dev);
-		if (result < 0)
-			goto error_dev_update_address;
-	}
-	result = 0;
-	dev_info(dev, "device authenticated\n");
-
-error_dev_update_address:
-error_wusbhc_set_gtk:
-error_wusbhc_set_ptk:
-error_hs3:
-error_hs2:
-error_hs1:
-	memset(hs, 0, 3*sizeof(hs[0]));
-	memzero_explicit(&keydvt_out, sizeof(keydvt_out));
-	memzero_explicit(&keydvt_in, sizeof(keydvt_in));
-	memzero_explicit(&ccm_n, sizeof(ccm_n));
-	memzero_explicit(mic, sizeof(mic));
-	if (result < 0)
-		wusb_dev_set_encryption(usb_dev, 0);
-error_dev_set_encryption:
-	kfree(hs);
-error_kzalloc:
-	return result;
-}
-
-/*
- * Once all connected and authenticated devices have received the new
- * GTK, switch the host to using it.
- */
-static void wusbhc_gtk_rekey_work(struct work_struct *work)
-{
-	struct wusbhc *wusbhc = container_of(work,
-					struct wusbhc, gtk_rekey_work);
-	size_t key_size = sizeof(wusbhc->gtk.data);
-	int port_idx;
-	struct wusb_dev *wusb_dev, *wusb_dev_next;
-	LIST_HEAD(rekey_list);
-
-	mutex_lock(&wusbhc->mutex);
-	/* generate the new key */
-	wusbhc_generate_gtk(wusbhc);
-	/* roll the gtk index. */
-	wusbhc->gtk_index = (wusbhc->gtk_index + 1) % (WUSB_KEY_INDEX_MAX + 1);
-	/*
-	 * Save all connected devices on a list while holding wusbhc->mutex and
-	 * take a reference to each one.  Then submit the set key request to
-	 * them after releasing the lock in order to avoid a deadlock.
-	 */
-	for (port_idx = 0; port_idx < wusbhc->ports_max; port_idx++) {
-		wusb_dev = wusbhc->port[port_idx].wusb_dev;
-		if (!wusb_dev || !wusb_dev->usb_dev
-			|| !wusb_dev->usb_dev->authenticated)
-			continue;
-
-		wusb_dev_get(wusb_dev);
-		list_add_tail(&wusb_dev->rekey_node, &rekey_list);
-	}
-	mutex_unlock(&wusbhc->mutex);
-
-	/* Submit the rekey requests without holding wusbhc->mutex. */
-	list_for_each_entry_safe(wusb_dev, wusb_dev_next, &rekey_list,
-		rekey_node) {
-		list_del_init(&wusb_dev->rekey_node);
-		dev_dbg(&wusb_dev->usb_dev->dev,
-			"%s: rekey device at port %d\n",
-			__func__, wusb_dev->port_idx);
-
-		if (wusb_dev_set_gtk(wusbhc, wusb_dev) < 0) {
-			dev_err(&wusb_dev->usb_dev->dev,
-				"%s: rekey device at port %d failed\n",
-				__func__, wusb_dev->port_idx);
-		}
-		wusb_dev_put(wusb_dev);
-	}
-
-	/* Switch the host controller to use the new GTK. */
-	mutex_lock(&wusbhc->mutex);
-	wusbhc->set_gtk(wusbhc, wusbhc->gtk_tkid,
-		&wusbhc->gtk.descr.bKeyData, key_size);
-	mutex_unlock(&wusbhc->mutex);
-}
-
-/**
- * wusbhc_gtk_rekey - generate and distribute a new GTK
- * @wusbhc: the WUSB host controller
- *
- * Generate a new GTK and distribute it to all connected and
- * authenticated devices.  When all devices have the new GTK, the host
- * starts using it.
- *
- * This must be called after every device disconnect (see [WUSB]
- * section 6.2.11.2).
- */
-void wusbhc_gtk_rekey(struct wusbhc *wusbhc)
-{
-	/*
-	 * We need to submit a URB to the downstream WUSB devices in order to
-	 * change the group key.  This can't be done while holding the
-	 * wusbhc->mutex since that is also taken in the urb_enqueue routine
-	 * and will cause a deadlock.  Instead, queue a work item to do
-	 * it when the lock is not held
-	 */
-	queue_work(wusbhc->wq_security, &wusbhc->gtk_rekey_work);
-}
+                                                  0x200001d
+#define ixD2F1_ROOT_STATUS                                                      0x200001e
+#define ixD2F1_DEVICE_CAP2                                                      0x200001f
+#define ixD2F1_DEVICE_CNTL2                                                     0x2000020
+#define ixD2F1_DEVICE_STATUS2                                                   0x2000020
+#define ixD2F1_LINK_CAP2                                                        0x2000021
+#define ixD2F1_LINK_CNTL2                                                       0x2000022
+#define ixD2F1_LINK_STATUS2                                                     0x2000022
+#define ixD2F1_SLOT_CAP2                                                        0x2000023
+#define ixD2F1_SLOT_CNTL2                                                       0x2000024
+#define ixD2F1_SLOT_STATUS2                                                     0x2000024
+#define ixD2F1_MSI_CAP_LIST                                                     0x2000028
+#define ixD2F1_MSI_MSG_CNTL                                                     0x2000028
+#define ixD2F1_MSI_MSG_ADDR_LO                                                  0x2000029
+#define ixD2F1_MSI_MSG_ADDR_HI                                                  0x200002a
+#define ixD2F1_MSI_MSG_DATA_64                                                  0x200002b
+#define ixD2F1_MSI_MSG_DATA                                                     0x200002a
+#define ixD2F1_SSID_CAP_LIST                                                    0x2000030
+#define ixD2F1_SSID_CAP                                                         0x2000031
+#define ixD2F1_MSI_MAP_CAP_LIST                                                 0x2000032
+#define ixD2F1_MSI_MAP_CAP                                                      0x2000032
+#define ixD2F1_MSI_MAP_ADDR_LO                                                  0x2000033
+#define ixD2F1_MSI_MAP_ADDR_HI                                                  0x2000034
+#define ixD2F1_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST                                0x2000040
+#define ixD2F1_PCIE_VENDOR_SPECIFIC_HDR                                         0x2000041
+#define ixD2F1_PCIE_VENDOR_SPECIFIC1                                            0x2000042
+#define ixD2F1_PCIE_VENDOR_SPECIFIC2                                            0x2000043
+#define ixD2F1_PCIE_VC_ENH_CAP_LIST                                             0x2000044
+#define ixD2F1_PCIE_PORT_VC_CAP_REG1                                            0x2000045
+#define ixD2F1_PCIE_PORT_VC_CAP_REG2                                            0x2000046
+#define ixD2F1_PCIE_PORT_VC_CNTL                                                0x2000047
+#define ixD2F1_PCIE_PORT_VC_STATUS                                              0x2000047
+#define ixD2F1_PCIE_VC0_RESOURCE_CAP                                            0x2000048
+#define ixD2F1_PCIE_VC0_RESOURCE_CNTL                                           0x2000049
+#define ixD2F1_PCIE_VC0_RESOURCE_STATUS                                         0x200004a
+#define ixD2F1_PCIE_VC1_RESOURCE_CAP                                            0x200004b
+#define ixD2F1_PCIE_VC1_RESOURCE_CNTL                                           0x200004c
+#define ixD2F1_PCIE_VC1_RESOURCE_STATUS                                         0x200004d
+#define ixD2F1_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST                                 0x2000050
+#define ixD2F1_PCIE_DEV_SERIAL_NUM_DW1                                          0x2000051
+#define ixD2F1_PCIE_DEV_SERIAL_NUM_DW2                                          0x2000052
+#define ixD2F1_PCIE_ADV_ERR_RPT_ENH_CAP_LIST                                    0x2000054
+#define ixD2F1_PCIE_UNCORR_ERR_STATUS                                           0x2000055
+#define ixD2F1_PCIE_UNCORR_ERR_MASK                                             0x2000056
+#define ixD2F1_PCIE_UNCORR_ERR_SEVERITY                                         0x2000057
+#define ixD2F1_PCIE_CORR_ERR_STATUS                                             0x2000058
+#define ixD2F1_PCIE_CORR_ERR_MASK                                               0x2000059
+#define ixD2F1_PCIE_ADV_ERR_CAP_CNTL                                            0x200005a
+#define ixD2F1_PCIE_HDR_LOG0                                                    0x200005b
+#define ixD2F1_PCIE_HDR_LOG1                                                    0x200005c
+#define ixD2F1_PCIE_HDR_LOG2                                                    0x200005d
+#define ixD2F1_PCIE_HDR_LOG3                                                    0x200005e
+#define ixD2F1_PCIE_ROOT_ERR_CMD                                                0x200005f
+#define ixD2F1_PCIE_ROOT_ERR_STATUS                                             0x2000060
+#define ixD2F1_PCIE_ERR_SRC_ID                                                  0x2000061
+#define ixD2F1_PCIE_TLP_PREFIX_LOG0                                             0x2000062
+#define ixD2F1_PCIE_TLP_PREFIX_LOG1                                             0x2000063
+#define ixD2F1_PCIE_TLP_PREFIX_LOG2                                             0x2000064
+#define ixD2F1_PCIE_TLP_PREFIX_LOG3                                             0x2000065
+#define ixD2F1_PCIE_SECONDARY_ENH_CAP_LIST                                      0x200009c
+#define ixD2F1_PCIE_LINK_CNTL3                                                  0x200009d
+#define ixD2F1_PCIE_LANE_ERROR_STATUS                                           0x200009e
+#define ixD2F1_PCIE_LANE_0_EQUALIZATION_CNTL                                    0x200009f
+#define ixD2F1_PCIE_LANE_1_EQUALIZATION_CNTL                                    0x200009f
+#define ixD2F1_PCIE_LANE_2_EQUALIZATION_CNTL                                    0x20000a0
+#define ixD2F1_PCIE_LANE_3_EQUALIZATION_CNTL                                    0x20000a0
+#define ixD2F1_PCIE_LANE_4_EQUALIZATION_CNTL                                    0x20000a1
+#define ixD2F1_PCIE_LANE_5_EQUALIZATION_CNTL                                    0x20000a1
+#define ixD2F1_PCIE_LANE_6_EQUALIZATION_CNTL                                    0x20000a2
+#define ixD2F1_PCIE_LANE_7_EQUALIZATION_CNTL                                    0x20000a2
+#define ixD2F1_PCIE_LANE_8_EQUALIZATION_CNTL                                    0x20000a3
+#define ixD2F1_PCIE_LANE_9_EQUALIZATION_CNTL                                    0x20000a3
+#define ixD2F1_PCIE_LANE_10_EQUALIZATION_CNTL                                   0x20000a4
+#define ixD2F1_PCIE_LANE_11_EQUALIZATION_CNTL                                   0x20000a4
+#define ixD2F1_PCIE_LANE_12_EQUALIZATION_CNTL                                   0x20000a5
+#define ixD2F1_PCIE_LANE_13_EQUALIZATION_CNTL                                   0x20000a5
+#define ixD2F1_PCIE_LANE_14_EQUALIZATION_CNTL                                   0x20000a6
+#define ixD2F1_PCIE_LANE_15_EQUALIZATION_CNTL                                   0x20000a6
+#define ixD2F1_PCIE_ACS_ENH_CAP_LIST                                            0x20000a8
+#define ixD2F1_PCIE_ACS_CAP                                                     0x20000a9
+#define ixD2F1_PCIE_ACS_CNTL                                                    0x20000a9
+#define ixD2F1_PCIE_MC_ENH_CAP_LIST                                             0x20000bc
+#define ixD2F1_PCIE_MC_CAP                                                      0x20000bd
+#define ixD2F1_PCIE_MC_CNTL                                                     0x20000bd
+#define ixD2F1_PCIE_MC_ADDR0                                                    0x20000be
+#define ixD2F1_PCIE_MC_ADDR1                                                    0x20000bf
+#define ixD2F1_PCIE_MC_RCV0                                                     0x20000c0
+#define ixD2F1_PCIE_MC_RCV1                                                     0x20000c1
+#define ixD2F1_PCIE_MC_BLOCK_ALL0                                               0x20000c2
+#define ixD2F1_PCIE_MC_BLOCK_ALL1                                               0x20000c3
+#define ixD2F1_PCIE_MC_BLOCK_UNTRANSLATED_0                                     0x20000c4
+#define ixD2F1_PCIE_MC_BLOCK_UNTRANSLATED_1                                     0x20000c5
+#define ixD2F1_PCIE_MC_OVERLAY_BAR0                                             0x20000c6
+#define ixD2F1_PCIE_MC_OVERLAY_BAR1                                             0x20000c7
+#define ixD2F2_PCIE_PORT_INDEX                                                  0x3000038
+#define ixD2F2_PCIE_PORT_DATA                                                   0x3000039
+#define ixD2F2_PCIEP_RESERVED                                                   0x0
+#define ixD2F2_PCIEP_SCRATCH                                                    0x1
+#define ixD2F2_PCIEP_HW_DEBUG                                                   0x2
+#define ixD2F2_PCIEP_PORT_CNTL                                                  0x10
+#define ixD2F2_PCIE_TX_CNTL                                                     0x20
+#define ixD2F2_PCIE_TX_REQUESTER_ID                                             0x21
+#define ixD2F2_PCIE_TX_VENDOR_SPECIFIC                                          0x22
+#define ixD2F2_PCIE_TX_REQUEST_NUM_CNTL                                         0x23
+#define ixD2F2_PCIE_TX_SEQ                                                      0x24
+#define ixD2F2_PCIE_TX_REPLAY                                                   0x25
+#define ixD2F2_PCIE_TX_ACK_LATENCY_LIMIT                                        0x26
+#define ixD2F2_PCIE_TX_CREDITS_ADVT_P                                           0x30
+#define ixD2F2_PCIE_TX_CREDITS_ADVT_NP                                          0x31
+#define ixD2F2_PCIE_TX_CREDITS_ADVT_CPL                                         0x32
+#define ixD2F2_PCIE_TX_CREDITS_INIT_P                                           0x33
+#define ixD2F2_PCIE_TX_CREDITS_INIT_NP                                          0x34
+#define ixD2F2_PCIE_TX_CREDITS_INIT_CPL                                         0x35
+#define ixD2F2_PCIE_TX_CREDITS_STATUS                                           0x36
+#define ixD2F2_PCIE_TX_CREDITS_FCU_THRESHOLD                                    0x37
+#define ixD2F2_PCIE_P_PORT_LANE_STATUS                                          0x50
+#define ixD2F2_PCIE_FC_P                                                        0x60
+#define ixD2F2_PCIE_FC_NP                                                       0x61
+#define ixD2F2_PCIE_FC_CPL                                                      0x62
+#define ixD2F2_PCIE_ERR_CNTL                                                    0x6a
+#define ixD2F2_PCIE_RX_CNTL                                                     0x70
+#define ixD2F2_PCIE_RX_EXPECTED_SEQNUM                                          0x71
+#define ixD2F2_PCIE_RX_VENDOR_SPECIFIC                                          0x72
+#define ixD2F2_PCIE_RX_CNTL3                                                    0x74
+#define ixD2F2_PCIE_RX_CREDITS_ALLOCATED_P                                      0x80
+#define ixD2F2_PCIE_RX_CREDITS_ALLOCATED_NP                                     0x81
+#define ixD2F2_PCIE_RX_CREDITS_ALLOCATED_CPL                                    0x82
+#define ixD2F2_PCIEP_ERROR_INJECT_PHYSICAL                                      0x83
+#define ixD2F2_PCIEP_ERROR_INJECT_TRANSACTION                                   0x84
+#define ixD2F2_PCIE_LC_CNTL                                                     0xa0
+#define ixD2F2_PCIE_LC_CNTL2                                                    0xb1
+#define ixD2F2_PCIE_LC_CNTL3                                                    0xb5
+#define ixD2F2_PCIE_LC_CNTL4                                                    0xb6
+#define ixD2F2_PCIE_LC_CNTL5                                                    0xb7
+#define ixD2F2_PCIE_LC_CNTL6                                                    0xbb
+#define ixD2F2_PCIE_LC_BW_CHANGE_CNTL                                           0xb2
+#define ixD2F2_PCIE_LC_TRAINING_CNTL                                            0xa1
+#define ixD2F2_PCIE_LC_LINK_WIDTH_CNTL                                          0xa2
+#define ixD2F2_PCIE_LC_N_FTS_CNTL                                               0xa3
+#define ixD2F2_PCIE_LC_SPEED_CNTL                                               0xa4
+#define ixD2F2_PCIE_LC_CDR_CNTL                                                 0xb3
+#define ixD2F2_PCIE_LC_LANE_CNTL                                                0xb4
+#define ixD2F2_PCIE_LC_FORCE_COEFF                                              0xb8
+#define ixD2F2_PCIE_LC_BEST_EQ_SETTINGS                                         0xb9
+#define ixD2F2_PCIE_LC_FORCE_EQ_REQ_COEFF                                       0xba
+#define ixD2F2_PCIE_LC_STATE0                                                   0xa5
+#define ixD2F2_PCIE_LC_STATE1                                                   0xa6
+#define ixD2F2_PCIE_LC_STATE2                                                   0xa7
+#define ixD2F2_PCIE_LC_STATE3                                                   0xa8
+#define ixD2F2_PCIE_LC_STATE4                                                   0xa9
+#define ixD2F2_PCIE_LC_STATE5                                                   0xaa
+#define ixD2F2_PCIEP_STRAP_LC                                                   0xc0
+#define ixD2F2_PCIEP_STRAP_MISC                                                 0xc1
+#define ixD2F2_PCIEP_BCH_ECC_CNTL                                               0xd0
+#define ixD2F2_PCIEP_HPGI_PRIVATE                                               0xd2
+#define ixD2F2_PCIEP_HPGI                                                       0xda
+#define ixD2F2_VENDOR_ID                                                        0x3000000
+#define ixD2F2_DEVICE_ID                                                        0x3000000
+#define ixD2F2_COMMAND                                                          0x3000001
+#define ixD2F2_STATUS                                                           0x3000001
+#define ixD2F2_REVISION_ID                                                      0x3000002
+#define ixD2F2_PROG_INTERFACE                                                   0x3000002
+#define ixD2F2_SUB_CLASS                                                        0x3000002
+#define ixD2F2_BASE_CLASS                                                       0x3000002
+#define ixD2F2_CACHE_LINE                                                       0x3000003
+#define ixD2F2_LATENCY                                                          0x3000003
+#define ixD2F2_HEADER                                                           0x3000003
+#define ixD2F2_BIST                                                             0x3000003
+#define ixD2F2_SUB_BUS_NUMBER_LATENCY                                           0x3000006
+#define ixD2F2_IO_BASE_LIMIT                                                    0x3000007
+#define ixD2F2_SECONDARY_STATUS                                                 0x3000007
+#define ixD2F2_MEM_BASE_LIMIT                                                   0x3000008
+#define ixD2F2_PREF_BASE_LIMIT                                                  0x3000009
+#define ixD2F2_PREF_BASE_UPPER                                                  0x300000a
+#define ixD2F2_PREF_LIMIT_UPPER                                                 0x300000b
+#define ixD2F2_IO_BASE_LIMIT_HI                                                 0x300000c
+#define ixD2F2_IRQ_BRIDGE_CNTL                                                  0x300000f
+#define ixD2F2_CAP_PTR                                                          0x300000d
+#define ixD2F2_INTERRUPT_LINE                                                   0x300000f
+#define ixD2F2_INTERRUPT_PIN                                                    0x300000f
+#define ixD2F2_EXT_BRIDGE_CNTL                                                  0x3000010
+#define ixD2F2_PMI_CAP_LIST                                                     0x3000014
+#define ixD2F2_PMI_CAP                                                          0x3000014
+#define ixD2F2_PMI_STATUS_CNTL                                                  0x3000015
+#define ixD2F2_PCIE_CAP_LIST                                                    0x3000016
+#define ixD2F2_PCIE_CAP                                                         0x3000016
+#define ixD2F2_DEVICE_CAP                                                       0x3000017
+#define ixD2F2_DEVICE_CNTL                                                      0x3000018
+#define ixD2F2_DEVICE_STATUS                                                    0x3000018
+#define ixD2F2_LINK_CAP                                                         0x3000019
+#define ixD2F2_LINK_CNTL                                                        0x300001a
+#define ixD2F2_LINK_STATUS                                                      0x300001a
+#define ixD2F2_SLOT_CAP                                                         0x300001b
+#define ixD2F2_SLOT_CNTL                                                        0x300001c
+#define ixD2F2_SLOT_STATUS                                                      0x300001c
+#define ixD2F2_ROOT_CNTL                                                        0x300001d
+#define ixD2F2_ROOT_CAP                                                         0x300001d
+#define ixD2F2_ROOT_STATUS                                                      0x300001e
+#define ixD2F2_DEVICE_CAP2                                                      0x300001f
+#define ixD2F2_DEVICE_CNTL2                                                     0x3000020
+#define ixD2F2_DEVICE_STATUS2                                                   0x3000020
+#define ixD2F2_LINK_CAP2                                                        0x3000021
+#define ixD2F2_LINK_CNTL2                                                       0x300

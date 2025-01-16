@@ -1,1433 +1,675 @@
-/* linux/drivers/soc/samsung/exynos-dm.c
- *
- * Copyright (C) 2016 Samsung Electronics Co., Ltd.
- *		http://www.samsung.com
- *
- * Samsung Exynos SoC series DVFS Manager
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/errno.h>
-#include <linux/of.h>
-#include <linux/slab.h>
-#include <linux/exynos-ss.h>
-#include "acpm/acpm.h"
-#include "acpm/acpm_ipc.h"
-
-#include <soc/samsung/exynos-dm.h>
-#include <soc/samsung/cal-if.h>
-
-static struct list_head *get_min_constraint_list(struct exynos_dm_data *dm_data);
-static struct list_head *get_max_constraint_list(struct exynos_dm_data *dm_data);
-static void get_governor_min_freq(struct exynos_dm_data *dm_data, u32 *gov_min_freq);
-static void get_min_max_freq(struct exynos_dm_data *dm_data, u32 *min_freq, u32 *max_freq);
-static void update_min_max_freq(struct exynos_dm_data *dm_data, u32 min_freq, u32 max_freq);
-static void get_policy_min_max_freq(struct exynos_dm_data *dm_data, u32 *min_freq, u32 *max_freq);
-static void update_policy_min_max_freq(struct exynos_dm_data *dm_data, u32 min_freq, u32 max_freq);
-static void get_current_freq(struct exynos_dm_data *dm_data, u32 *cur_freq);
-static void get_target_freq(struct exynos_dm_data *dm_data, u32 *target_freq);
-
-#define DM_EMPTY	0xFF
-static struct exynos_dm_device *exynos_dm;
-static enum exynos_dm_type min_order[DM_TYPE_END + 1] = {DM_EMPTY, };
-static enum exynos_dm_type max_order[DM_TYPE_END + 1] = {DM_EMPTY, };
-
-/*
- * SYSFS for Debugging
- */
-static ssize_t show_available(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct platform_device *pdev = container_of(dev, struct platform_device, dev);
-	struct exynos_dm_device *dm = platform_get_drvdata(pdev);
-	ssize_t count = 0;
-	int i;
-
-	for (i = 0; i < DM_TYPE_END; i++) {
-		if (!dm->dm_data[i].available)
-			continue;
-
-		count += snprintf(buf + count, PAGE_SIZE,
-				"dm_type: %d(%s), dvfs_type: %d, available = %s\n",
-				dm->dm_data[i].dm_type, dm->dm_data[i].dm_type_name,
-				dm->dm_data[i].dvfs_type,
-				dm->dm_data[i].available ? "true" : "false");
-	}
-
-	return count;
-}
-
-#define show_constraint_tables(dm_type, type_name)					\
-static ssize_t show_constraint_tables_##type_name					\
-(struct device *dev, struct device_attribute *attr, char *buf)				\
-{											\
-	struct platform_device *pdev = container_of(dev, struct platform_device, dev);	\
-	struct exynos_dm_device *dm = platform_get_drvdata(pdev);			\
-	struct list_head *constraint_list;						\
-	struct exynos_dm_constraint *constraint;					\
-	ssize_t count = 0;								\
-	int i;										\
-											\
-	if (!dm->dm_data[dm_type].available) {						\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"This dm_type is not available\n");			\
-		return count;								\
-	}										\
-											\
-	count += snprintf(buf + count, PAGE_SIZE, "dm_type: %s\n",			\
-				dm->dm_data[dm_type].dm_type_name);			\
-											\
-	constraint_list = get_min_constraint_list(&dm->dm_data[dm_type]);		\
-	if (list_empty(constraint_list)) {						\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"This dm_type have not min constraint tables\n\n");	\
-		goto next;								\
-	}										\
-											\
-	list_for_each_entry(constraint, constraint_list, node) {			\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"-------------------------------------------------\n");	\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"constraint_dm_type = %s\n", constraint->dm_type_name);	\
-		count += snprintf(buf + count, PAGE_SIZE, "constraint_type: %s\n",	\
-				constraint->constraint_type ? "MAX" : "MIN");		\
-		count += snprintf(buf + count, PAGE_SIZE, "guidance: %s\n",		\
-				constraint->guidance ? "true" : "false");		\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"min_freq = %u, max_freq =%u\n",			\
-				constraint->min_freq, constraint->max_freq);		\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"master_freq\t constraint_freq\n");			\
-		for (i = 0; i < constraint->table_length; i++)				\
-			count += snprintf(buf + count, PAGE_SIZE, "%10u\t %10u\n",	\
-					constraint->freq_table[i].master_freq,		\
-					constraint->freq_table[i].constraint_freq);	\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"-------------------------------------------------\n");	\
-	}										\
-											\
-next:											\
-	constraint_list = get_max_constraint_list(&dm->dm_data[dm_type]);		\
-	if (list_empty(constraint_list)) {						\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"This dm_type have not max constraint tables\n\n");	\
-		return count;								\
-	}										\
-											\
-	list_for_each_entry(constraint, constraint_list, node) {			\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"-------------------------------------------------\n");	\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"constraint_dm_type = %s\n", constraint->dm_type_name);	\
-		count += snprintf(buf + count, PAGE_SIZE, "constraint_type: %s\n",	\
-				constraint->constraint_type ? "MAX" : "MIN");		\
-		count += snprintf(buf + count, PAGE_SIZE, "guidance: %s\n",		\
-				constraint->guidance ? "true" : "false");		\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"min_freq = %u, max_freq =%u\n",			\
-				constraint->min_freq, constraint->max_freq);		\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"master_freq\t constraint_freq\n");			\
-		for (i = 0; i < constraint->table_length; i++)				\
-			count += snprintf(buf + count, PAGE_SIZE, "%10u\t %10u\n",	\
-					constraint->freq_table[i].master_freq,		\
-					constraint->freq_table[i].constraint_freq);	\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"-------------------------------------------------\n");	\
-	}										\
-											\
-	return count;									\
-}
-
-#define show_dm_policy(dm_type, type_name)						\
-static ssize_t show_dm_policy_##type_name						\
-(struct device *dev, struct device_attribute *attr, char *buf)				\
-{											\
-	struct platform_device *pdev = container_of(dev, struct platform_device, dev);	\
-	struct exynos_dm_device *dm = platform_get_drvdata(pdev);			\
-	struct list_head *constraint_list;						\
-	struct exynos_dm_constraint *constraint;					\
-	ssize_t count = 0;								\
-	u32 gov_min_freq, min_freq, max_freq;						\
-	u32 policy_min_freq, policy_max_freq, cur_freq, target_freq;			\
-	u32 find;									\
-	int i;										\
-											\
-	if (!dm->dm_data[dm_type].available) {						\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"This dm_type is not available\n");			\
-		return count;								\
-	}										\
-											\
-	count += snprintf(buf + count, PAGE_SIZE, "dm_type: %s\n",			\
-				dm->dm_data[dm_type].dm_type_name);			\
-											\
-	get_governor_min_freq(&dm->dm_data[dm_type], &gov_min_freq);			\
-	get_min_max_freq(&dm->dm_data[dm_type], &min_freq, &max_freq);			\
-	get_policy_min_max_freq(&dm->dm_data[dm_type],					\
-				&policy_min_freq, &policy_max_freq);			\
-	get_current_freq(&dm->dm_data[dm_type], &cur_freq);				\
-	get_target_freq(&dm->dm_data[dm_type], &target_freq);				\
-											\
-	count += snprintf(buf + count, PAGE_SIZE,					\
-			"governor_min_freq = %u\n", gov_min_freq);			\
-	count += snprintf(buf + count, PAGE_SIZE,					\
-			"policy_min_freq = %u, policy_max_freq = %u\n",			\
-			policy_min_freq, policy_max_freq);				\
-	count += snprintf(buf + count, PAGE_SIZE,					\
-			"min_freq = %u, max_freq = %u\n", min_freq, max_freq);		\
-	count += snprintf(buf + count, PAGE_SIZE, "current_freq = %u\n", cur_freq);	\
-	count += snprintf(buf + count, PAGE_SIZE, "target_freq = %u\n", target_freq);	\
-	count += snprintf(buf + count, PAGE_SIZE,					\
-			"-------------------------------------------------\n");		\
-	count += snprintf(buf + count, PAGE_SIZE, "min constraint by\n");		\
-	find = 0;									\
-											\
-	for (i = 0; i < DM_TYPE_END; i++) {						\
-		if (!exynos_dm->dm_data[i].available)					\
-			continue;							\
-											\
-		constraint_list = get_min_constraint_list(&exynos_dm->dm_data[i]);	\
-		if (list_empty(constraint_list))					\
-			continue;							\
-		list_for_each_entry(constraint, constraint_list, node) {		\
-			if (constraint->constraint_dm_type == dm_type) {		\
-				count += snprintf(buf + count, PAGE_SIZE,		\
-					"%s : %u ---> %s : %u",				\
-					exynos_dm->dm_data[i].dm_type_name,		\
-					constraint->master_freq,			\
-					constraint->dm_type_name,			\
-					constraint->min_freq);				\
-				if (constraint->guidance)				\
-					count += snprintf(buf+count, PAGE_SIZE,		\
-						" [guidance]\n");			\
-				else							\
-					count += snprintf(buf+count, PAGE_SIZE, "\n");	\
-				find = max(find, constraint->min_freq);			\
-			}								\
-		}									\
-	}										\
-	if (find == 0)									\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"There is no min constraint\n\n");			\
-	else										\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"min constraint freq = %u\n", find);			\
-	count += snprintf(buf + count, PAGE_SIZE,					\
-			"-------------------------------------------------\n");		\
-	count += snprintf(buf + count, PAGE_SIZE, "max constraint by\n");		\
-	find = INT_MAX;									\
-											\
-	for (i = 0; i < DM_TYPE_END; i++) {						\
-		if (!exynos_dm->dm_data[i].available)					\
-			continue;							\
-											\
-		constraint_list = get_max_constraint_list(&exynos_dm->dm_data[i]);	\
-		if (list_empty(constraint_list))					\
-			continue;							\
-		list_for_each_entry(constraint, constraint_list, node) {		\
-			if (constraint->constraint_dm_type == dm_type) {		\
-				count += snprintf(buf + count, PAGE_SIZE,		\
-					"%s : %u ---> %s : %u",				\
-					exynos_dm->dm_data[i].dm_type_name,		\
-					constraint->master_freq,			\
-					constraint->dm_type_name,			\
-					constraint->max_freq);				\
-				if (constraint->guidance)				\
-					count += snprintf(buf+count, PAGE_SIZE,		\
-						" [guidance]\n");			\
-				else							\
-					count += snprintf(buf+count, PAGE_SIZE, "\n");	\
-				find = min(find, constraint->max_freq);			\
-			}								\
-		}									\
-	}										\
-	if (find == INT_MAX)								\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"There is no max constraint\n\n");			\
-	else										\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"max constraint freq = %u\n", find);			\
-	count += snprintf(buf + count, PAGE_SIZE,					\
-			"-------------------------------------------------\n");		\
-	return count;									\
-}											\
-
-#define show_voltage_table(dm_type, type_name)						\
-static ssize_t show_voltage_table_##type_name						\
-(struct device *dev, struct device_attribute *attr, char *buf)				\
-{											\
-	struct platform_device *pdev = container_of(dev, struct platform_device, dev);	\
-	struct exynos_dm_device *dm = platform_get_drvdata(pdev);			\
-	ssize_t count = 0;								\
-	unsigned int cal_id, table_size;						\
-	unsigned int *volt_table;							\
-	unsigned long *rate_table;							\
-	int num_lvl, index;								\
-											\
-	if (!dm->dm_data[dm_type].available) {						\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"This dm_type is not available\n");			\
-		return count;								\
-	}										\
-											\
-	cal_id = dm->dm_data[dm_type].cal_id;						\
-											\
-	table_size = cal_dfs_get_lv_num(cal_id);					\
-											\
-	rate_table = kzalloc(sizeof(unsigned int) * table_size, GFP_KERNEL);		\
-	if (!rate_table) {								\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"Out of memory\n");					\
-		return count;								\
-	}										\
-											\
-	volt_table = kzalloc(sizeof(unsigned int) * table_size, GFP_KERNEL);		\
-	if (!volt_table) {								\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"Out of memory\n");					\
-		goto free_rate_table;							\
-	}										\
-											\
-	num_lvl = cal_dfs_get_rate_table(cal_id, rate_table);				\
-	if (num_lvl <= 0) {								\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"No rate table entries (%d)\n", num_lvl);		\
-		goto free_tables;							\
-	}										\
-											\
-	num_lvl = cal_dfs_get_asv_table(cal_id, volt_table);				\
-	if (num_lvl <= 0) {								\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-				"No volt table entries (%d)\n", num_lvl);		\
-		goto free_tables;							\
-	}										\
-											\
-	count += snprintf(buf + count, PAGE_SIZE, "dm_type: %s\n",			\
-				dm->dm_data[dm_type].dm_type_name);			\
-											\
-	for (index = 0; index < table_size; index++) {					\
-		count += snprintf(buf + count, PAGE_SIZE,				\
-			"%lu MHz: %u uV\n", rate_table[index] / 1000, volt_table[index]);	\
-	}										\
-											\
-free_tables:										\
-	kfree(rate_table);								\
-	kfree(volt_table);								\
-	return count;									\
-											\
-free_rate_table:									\
-	kfree(rate_table);								\
-	return count;									\
-}
-
-show_constraint_tables(DM_CPU_CL0, dm_cpu_cl0);
-show_constraint_tables(DM_CPU_CL1, dm_cpu_cl1);
-show_constraint_tables(DM_MIF, dm_mif);
-show_constraint_tables(DM_INT, dm_int);
-show_constraint_tables(DM_INTCAM, dm_intcam);
-show_constraint_tables(DM_DISP, dm_disp);
-#if defined(CONFIG_SOC_EXYNOS7885)
-show_constraint_tables(DM_FSYS, dm_fsys);
-show_constraint_tables(DM_AUD, dm_aud);
-#endif
-show_constraint_tables(DM_CAM, dm_cam);
-show_constraint_tables(DM_GPU, dm_gpu);
-
-show_dm_policy(DM_CPU_CL0, dm_cpu_cl0);
-show_dm_policy(DM_CPU_CL1, dm_cpu_cl1);
-show_dm_policy(DM_MIF, dm_mif);
-show_dm_policy(DM_INT, dm_int);
-show_dm_policy(DM_INTCAM, dm_intcam);
-show_dm_policy(DM_DISP, dm_disp);
-#if defined(CONFIG_SOC_EXYNOS7885)
-show_dm_policy(DM_FSYS, dm_fsys);
-show_dm_policy(DM_AUD, dm_aud);
-#endif
-show_dm_policy(DM_CAM, dm_cam);
-show_dm_policy(DM_GPU, dm_gpu);
-
-show_voltage_table(DM_CPU_CL0, dm_cpu_cl0);
-show_voltage_table(DM_CPU_CL1, dm_cpu_cl1);
-show_voltage_table(DM_MIF, dm_mif);
-show_voltage_table(DM_INT, dm_int);
-show_voltage_table(DM_INTCAM, dm_intcam);
-show_voltage_table(DM_DISP, dm_disp);
-#if defined(CONFIG_SOC_EXYNOS7885)
-show_voltage_table(DM_FSYS, dm_fsys);
-show_voltage_table(DM_AUD, dm_aud);
-#endif
-show_voltage_table(DM_CAM, dm_cam);
-show_voltage_table(DM_GPU, dm_gpu);
-
-static DEVICE_ATTR(available, 0440, show_available, NULL);
-static DEVICE_ATTR(constraint_tables_dm_cpu_cl0, 0440, show_constraint_tables_dm_cpu_cl0, NULL);
-static DEVICE_ATTR(constraint_tables_dm_cpu_cl1, 0440, show_constraint_tables_dm_cpu_cl1, NULL);
-static DEVICE_ATTR(constraint_tables_dm_mif, 0440, show_constraint_tables_dm_mif, NULL);
-static DEVICE_ATTR(constraint_tables_dm_int, 0440, show_constraint_tables_dm_int, NULL);
-static DEVICE_ATTR(constraint_tables_dm_intcam, 0440, show_constraint_tables_dm_intcam, NULL);
-static DEVICE_ATTR(constraint_tables_dm_disp, 0440, show_constraint_tables_dm_disp, NULL);
-#if defined(CONFIG_SOC_EXYNOS7885)
-static DEVICE_ATTR(constraint_tables_dm_fsys, 0440, show_constraint_tables_dm_fsys, NULL);
-static DEVICE_ATTR(constraint_tables_dm_aud, 0440, show_constraint_tables_dm_aud, NULL);
-#endif
-static DEVICE_ATTR(constraint_tables_dm_cam, 0440, show_constraint_tables_dm_cam, NULL);
-static DEVICE_ATTR(constraint_tables_dm_gpu, 0440, show_constraint_tables_dm_gpu, NULL);
-static DEVICE_ATTR(dm_policy_dm_cpu_cl0, 0440, show_dm_policy_dm_cpu_cl0, NULL);
-static DEVICE_ATTR(dm_policy_dm_cpu_cl1, 0440, show_dm_policy_dm_cpu_cl1, NULL);
-static DEVICE_ATTR(dm_policy_dm_mif, 0440, show_dm_policy_dm_mif, NULL);
-static DEVICE_ATTR(dm_policy_dm_int, 0440, show_dm_policy_dm_int, NULL);
-static DEVICE_ATTR(dm_policy_dm_intcam, 0440, show_dm_policy_dm_intcam, NULL);
-static DEVICE_ATTR(dm_policy_dm_disp, 0440, show_dm_policy_dm_disp, NULL);
-#if defined(CONFIG_SOC_EXYNOS7885)
-static DEVICE_ATTR(dm_policy_dm_fsys, 0440, show_dm_policy_dm_fsys, NULL);
-static DEVICE_ATTR(dm_policy_dm_aud, 0440, show_dm_policy_dm_aud, NULL);
-#endif
-static DEVICE_ATTR(dm_policy_dm_cam, 0440, show_dm_policy_dm_cam, NULL);
-static DEVICE_ATTR(dm_policy_dm_gpu, 0440, show_dm_policy_dm_gpu, NULL);
-static DEVICE_ATTR(voltage_table_dm_cpu_cl0, 0440, show_voltage_table_dm_cpu_cl0, NULL);
-static DEVICE_ATTR(voltage_table_dm_cpu_cl1, 0440, show_voltage_table_dm_cpu_cl1, NULL);
-static DEVICE_ATTR(voltage_table_dm_mif, 0440, show_voltage_table_dm_mif, NULL);
-static DEVICE_ATTR(voltage_table_dm_int, 0440, show_voltage_table_dm_int, NULL);
-static DEVICE_ATTR(voltage_table_dm_intcam, 0440, show_voltage_table_dm_intcam, NULL);
-static DEVICE_ATTR(voltage_table_dm_disp, 0440, show_voltage_table_dm_disp, NULL);
-#if defined(CONFIG_SOC_EXYNOS7885)
-static DEVICE_ATTR(voltage_table_dm_fsys, 0440, show_voltage_table_dm_fsys, NULL);
-static DEVICE_ATTR(voltage_table_dm_aud, 0440, show_voltage_table_dm_aud, NULL);
-#endif
-static DEVICE_ATTR(voltage_table_dm_cam, 0440, show_voltage_table_dm_cam, NULL);
-static DEVICE_ATTR(voltage_table_dm_gpu, 0440, show_voltage_table_dm_gpu, NULL);
-
-static struct attribute *exynos_dm_sysfs_entries[] = {
-	&dev_attr_available.attr,
-	&dev_attr_constraint_tables_dm_cpu_cl0.attr,
-	&dev_attr_constraint_tables_dm_cpu_cl1.attr,
-	&dev_attr_constraint_tables_dm_mif.attr,
-	&dev_attr_constraint_tables_dm_int.attr,
-	&dev_attr_constraint_tables_dm_intcam.attr,
-	&dev_attr_constraint_tables_dm_disp.attr,
-#if defined(CONFIG_SOC_EXYNOS7885)
-	&dev_attr_constraint_tables_dm_fsys.attr,
-	&dev_attr_constraint_tables_dm_aud.attr,
-#endif
-	&dev_attr_constraint_tables_dm_cam.attr,
-	&dev_attr_constraint_tables_dm_gpu.attr,
-	&dev_attr_dm_policy_dm_cpu_cl0.attr,
-	&dev_attr_dm_policy_dm_cpu_cl1.attr,
-	&dev_attr_dm_policy_dm_mif.attr,
-	&dev_attr_dm_policy_dm_int.attr,
-	&dev_attr_dm_policy_dm_intcam.attr,
-	&dev_attr_dm_policy_dm_disp.attr,
-#if defined(CONFIG_SOC_EXYNOS7885)
-	&dev_attr_dm_policy_dm_fsys.attr,
-	&dev_attr_dm_policy_dm_aud.attr,
-#endif
-	&dev_attr_dm_policy_dm_cam.attr,
-	&dev_attr_dm_policy_dm_gpu.attr,
-	&dev_attr_voltage_table_dm_cpu_cl0.attr,
-	&dev_attr_voltage_table_dm_cpu_cl1.attr,
-	&dev_attr_voltage_table_dm_mif.attr,
-	&dev_attr_voltage_table_dm_int.attr,
-	&dev_attr_voltage_table_dm_intcam.attr,
-	&dev_attr_voltage_table_dm_disp.attr,
-#if defined(CONFIG_SOC_EXYNOS7885)
-	&dev_attr_voltage_table_dm_fsys.attr,
-	&dev_attr_voltage_table_dm_aud.attr,
-#endif
-	&dev_attr_voltage_table_dm_cam.attr,
-	&dev_attr_voltage_table_dm_gpu.attr,
-	NULL,
-};
-
-static struct attribute_group exynos_dm_attr_group = {
-	.name	= "exynos_dm",
-	.attrs	= exynos_dm_sysfs_entries,
-};
-/*
- * SYSFS for Debugging end
- */
-
-static void print_available_dm_data(struct exynos_dm_device *dm)
-{
-	int i;
-
-	for (i = 0; i < DM_TYPE_END; i++) {
-		if (!dm->dm_data[i].available)
-			continue;
-
-		dev_info(dm->dev, "dm_type: %d(%s), dvfs_type: %d, available = %s\n",
-				dm->dm_data[i].dm_type, dm->dm_data[i].dm_type_name,
-				dm->dm_data[i].dvfs_type,
-				dm->dm_data[i].available ? "true" : "false");
-	}
-}
-
-static int exynos_dm_index_validate(enum exynos_dm_type index)
-{
-	if ((index < DM_CPU_CL0) || (index >= DM_TYPE_END)) {
-		dev_err(exynos_dm->dev, "invalid dm_index (%d)\n", index);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static enum exynos_dvfs_type exynos_dm_dvfs_type(enum exynos_dm_type dm_type)
-{
-	enum exynos_dvfs_type dvfs_type;
-
-	switch (dm_type) {
-	case DM_CPU_CL0...DM_CPU_CL1:
-		dvfs_type = DVFS_CPUFREQ;
-		break;
-	case DM_MIF...DM_CAM:
-		dvfs_type = DVFS_DEVFREQ;
-		break;
-	case DM_GPU:
-		dvfs_type = DVFS_GPU;
-		break;
-	default:
-		dvfs_type = DVFS_TYPE_END;
-		dev_err(exynos_dm->dev, "invalid dm_type (%d)\n", dm_type);
-		break;
-	}
-
-	return dvfs_type;
-}
-
-#ifdef CONFIG_OF
-static int exynos_dm_parse_dt(struct device_node *np, struct exynos_dm_device *dm)
-{
-	struct device_node *child_np;
-	int ret = 0;
-
-	if (!np)
-		return -ENODEV;
-
-	for_each_child_of_node(np, child_np) {
-		int index;
-		const char *available;
-#ifdef CONFIG_EXYNOS_ACPM
-		const char *policy_use;
-#endif
-		if (of_property_read_u32(child_np, "dm-index", &index))
-			return -ENODEV;
-
-		ret = exynos_dm_index_validate(index);
-		if (ret)
-			return ret;
-
-		if (of_property_read_string(child_np, "available", &available))
-			return -ENODEV;
-
-		if (!strcmp(available, "true")) {
-			dm->dm_data[index].dm_type = index;
-			dm->dm_data[index].available = true;
-			dm->dm_data[index].dvfs_type = exynos_dm_dvfs_type(index);
-			strncpy(dm->dm_data[index].dm_type_name, dm_type_name[index],
-							EXYNOS_DM_TYPE_NAME_LEN);
-			INIT_LIST_HEAD(&dm->dm_data[index].min_clist);
-			INIT_LIST_HEAD(&dm->dm_data[index].max_clist);
-		} else {
-			dm->dm_data[index].available = false;
-		}
-#ifdef CONFIG_EXYNOS_ACPM
-		if (of_property_read_string(child_np, "policy_use", &policy_use)) {
-			dev_info(dm->dev, "This doesn't need to send policy to ACPM\n");
-		} else {
-			if (!strcmp(policy_use, "true"))
-				dm->dm_data[index].policy_use = true;
-		}
-
-		if (of_property_read_u32(child_np, "cal_id", &dm->dm_data[index].cal_id))
-			return -ENODEV;
-#endif
-	}
-
-	return ret;
-}
-#else
-static int exynos_dm_parse_dt(struct device_node *np, struct exynos_dm_device *dm)
-{
-	return -ENODEV;
-}
-#endif
-
-static struct list_head *get_min_constraint_list(struct exynos_dm_data *dm_data)
-{
-	return &dm_data->min_clist;
-}
-
-static struct list_head *get_max_constraint_list(struct exynos_dm_data *dm_data)
-{
-	return &dm_data->max_clist;
-}
-
-/*
- * This function should be called from each DVFS drivers
- * before DVFS driver registration to DVFS framework.
- * 	Initialize sequence Step.1
- */
-int exynos_dm_data_init(enum exynos_dm_type dm_type,
-			u32 min_freq, u32 max_freq, u32 cur_freq)
-{
-	int ret = 0;
-
-	ret = exynos_dm_index_validate(dm_type);
-	if (ret)
-		return ret;
-
-	mutex_lock(&exynos_dm->lock);
-
-	if (!exynos_dm->dm_data[dm_type].available) {
-		dev_err(exynos_dm->dev,
-			"This dm type(%d) is not available\n", dm_type);
-		ret = -ENODEV;
-		goto out;
-	}
-
-	exynos_dm->dm_data[dm_type].gov_min_freq = min_freq;
-	exynos_dm->dm_data[dm_type].policy_min_freq = min_freq;
-	exynos_dm->dm_data[dm_type].policy_max_freq = max_freq;
-	exynos_dm->dm_data[dm_type].cur_freq = cur_freq;
-
-	if (!exynos_dm->dm_data[dm_type].min_freq)
-		exynos_dm->dm_data[dm_type].min_freq = min_freq;
-
-	if (!exynos_dm->dm_data[dm_type].max_freq)
-		exynos_dm->dm_data[dm_type].max_freq = max_freq;
-
-out:
-	mutex_unlock(&exynos_dm->lock);
-
-	return ret;
-}
-
-/*
- * 	Initialize sequence Step.2
- */
-int register_exynos_dm_constraint_table(enum exynos_dm_type dm_type,
-				struct exynos_dm_constraint *constraint)
-{
-	struct exynos_dm_constraint *sub_constraint;
-	int i, ret = 0;
-
-	ret = exynos_dm_index_validate(dm_type);
-	if (ret)
-		return ret;
-
-	if (!constraint) {
-		dev_err(exynos_dm->dev, "constraint is not valid\n");
-		return -EINVAL;
-	}
-
-	/* check member invalid */
-	if ((constraint->constraint_type < CONSTRAINT_MIN) ||
-		(constraint->constraint_type > CONSTRAINT_MAX)) {
-		dev_err(exynos_dm->dev, "constraint_type is invalid\n");
-		return -EINVAL;
-	}
-
-	ret = exynos_dm_index_validate(constraint->constraint_dm_type);
-	if (ret)
-		return ret;
-
-	if (!constraint->freq_table) {
-		dev_err(exynos_dm->dev, "No frequency table for constraint\n");
-		return -EINVAL;
-	}
-
-	mutex_lock(&exynos_dm->lock);
-
-	strncpy(constraint->dm_type_name,
-			dm_type_name[constraint->constraint_dm_type],
-			EXYNOS_DM_TYPE_NAME_LEN);
-	constraint->min_freq = 0;
-	constraint->max_freq = UINT_MAX;
-
-	if (constraint->constraint_type == CONSTRAINT_MIN)
-		list_add(&constraint->node, &exynos_dm->dm_data[dm_type].min_clist);
-	else if (constraint->constraint_type == CONSTRAINT_MAX)
-		list_add(&constraint->node, &exynos_dm->dm_data[dm_type].max_clist);
-
-	/* check guidance and sub constraint table generations */
-	if (constraint->guidance && (constraint->constraint_type == CONSTRAINT_MIN)) {
-		sub_constraint = kzalloc(sizeof(struct exynos_dm_constraint), GFP_KERNEL);
-		if (sub_constraint == NULL) {
-			dev_err(exynos_dm->dev, "failed to allocate sub constraint\n");
-			ret = -ENOMEM;
-			goto err_sub_const;
-		}
-
-		sub_constraint->guidance = true;
-		sub_constraint->table_length = constraint->table_length;
-		sub_constraint->constraint_type = CONSTRAINT_MAX;
-		sub_constraint->constraint_dm_type = dm_type;
-		strncpy(sub_constraint->dm_type_name,
-				dm_type_name[sub_constraint->constraint_dm_type],
-				EXYNOS_DM_TYPE_NAME_LEN);
-		sub_constraint->min_freq = 0;
-		sub_constraint->max_freq = UINT_MAX;
-
-		sub_constraint->freq_table =
-			kzalloc(sizeof(struct exynos_dm_freq) * sub_constraint->table_length, GFP_KERNEL);
-		if (sub_constraint->freq_table == NULL) {
-			dev_err(exynos_dm->dev, "failed to allocate freq table for sub const\n");
-			ret = -ENOMEM;
-			goto err_freq_table;
-		}
-
-		/* generation table */
-		for (i = 0; i < constraint->table_length; i++) {
-			sub_constraint->freq_table[i].master_freq =
-					constraint->freq_table[i].constraint_freq;
-			sub_constraint->freq_table[i].constraint_freq =
-					constraint->freq_table[i].master_freq;
-		}
-
-		list_add(&sub_constraint->node,
-			&exynos_dm->dm_data[constraint->constraint_dm_type].max_clist);
-
-		/* linked sub constraint */
-		constraint->sub_constraint = sub_constraint;
-	}
-
-	mutex_unlock(&exynos_dm->lock);
-
-	return 0;
-
-err_freq_table:
-	kfree(sub_constraint);
-err_sub_const:
-	list_del(&constraint->node);
-
-	mutex_unlock(&exynos_dm->lock);
-
-	return ret;
-}
-
-int unregister_exynos_dm_constraint_table(enum exynos_dm_type dm_type,
-				struct exynos_dm_constraint *constraint)
-{
-	struct exynos_dm_constraint *sub_constraint;
-	int ret = 0;
-
-	ret = exynos_dm_index_validate(dm_type);
-	if (ret)
-		return ret;
-
-	if (!constraint) {
-		dev_err(exynos_dm->dev, "constraint is not valid\n");
-		return -EINVAL;
-	}
-
-	mutex_lock(&exynos_dm->lock);
-
-	if (constraint->sub_constraint) {
-		sub_constraint = constraint->sub_constraint;
-		list_del(&sub_constraint->node);
-		kfree(sub_constraint->freq_table);
-		kfree(sub_constraint);
-	}
-
-	list_del(&constraint->node);
-
-	mutex_unlock(&exynos_dm->lock);
-
-	return 0;
-}
-
-/*
- * This function should be called from each DVFS driver registration function
- * before return to corresponding DVFS drvier.
- * 	Initialize sequence Step.3
- */
-int register_exynos_dm_freq_scaler(enum exynos_dm_type dm_type,
-			int (*scaler_func)(enum exynos_dm_type dm_type, u32 target_freq, unsigned int relation))
-{
-	int ret = 0;
-
-	ret = exynos_dm_index_validate(dm_type);
-	if (ret)
-		return ret;
-
-	if (!scaler_func) {
-		dev_err(exynos_dm->dev, "function is not valid\n");
-		return -EINVAL;
-	}
-
-	mutex_lock(&exynos_dm->lock);
-
-	if (!exynos_dm->dm_data[dm_type].available) {
-		dev_err(exynos_dm->dev,
-			"This dm type(%d) is not available\n", dm_type);
-		ret = -ENODEV;
-		goto out;
-	}
-
-	if (!exynos_dm->dm_data[dm_type].freq_scaler)
-		exynos_dm->dm_data[dm_type].freq_scaler = scaler_func;
-
-out:
-	mutex_unlock(&exynos_dm->lock);
-
-	return 0;
-}
-
-int unregister_exynos_dm_freq_scaler(enum exynos_dm_type dm_type)
-{
-	int ret = 0;
-
-	ret = exynos_dm_index_validate(dm_type);
-	if (ret)
-		return ret;
-
-	mutex_lock(&exynos_dm->lock);
-
-	if (!exynos_dm->dm_data[dm_type].available) {
-		dev_err(exynos_dm->dev,
-			"This dm type(%d) is not available\n", dm_type);
-		ret = -ENODEV;
-		goto out;
-	}
-
-	if (exynos_dm->dm_data[dm_type].freq_scaler)
-		exynos_dm->dm_data[dm_type].freq_scaler = NULL;
-
-out:
-	mutex_unlock(&exynos_dm->lock);
-
-	return 0;
-}
-
-/*
- * Policy Updater
- *
- * @dm_type: DVFS domain type for updating policy
- * @min_freq: Minimum frequency decided by policy
- * @max_freq: Maximum frequency decided by policy
- *
- * In this function, policy_min_freq and policy_max_freq will be changed.
- * After that, DVFS Manager will decide min/max freq. of current domain
- * and check dependent domains whether update is necessary.
- */
-static int dm_data_updater(enum exynos_dm_type dm_type);
-static int constraint_checker_min(struct list_head *head, u32 freq);
-static int constraint_checker_max(struct list_head *head, u32 freq);
-static int constraint_data_updater(enum exynos_dm_type dm_type, int cnt);
-static int max_constraint_data_updater(enum exynos_dm_type dm_type, int cnt);
-static int scaling_callback(enum dvfs_direction dir, unsigned int relation);
-
-static bool max_flag = false;
-
-#define POLICY_REQ	4
-
-static int __policy_update_call_to_DM(enum exynos_dm_type dm_type, u32 min_freq, u32 max_freq)
-{
-	struct exynos_dm_data *dm;
-#ifdef CONFIG_EXYNOS_SNAPSHOT_DM
-	struct timeval pre, before, after;
-#endif
-#ifdef CONFIG_EXYNOS_ACPM
-	struct ipc_config config;
-	unsigned int cmd[4];
-	int size, ch_num, ret;
-#endif
-#ifdef CONFIG_EXYNOS_SNAPSHOT_DM
-	s32 time = 0, pre_time = 0;
-
-	exynos_ss_dm((int)dm_type, min_freq, max_freq, pre_time, time);
-
-	do_gettimeofday(&pre);
-	do_gettimeofday(&before);
-#endif
-
-	min_freq = min(min_freq, max_freq);
-
-	dm = &exynos_dm->dm_data[dm_type];
-	if ((dm->policy_min_freq == min_freq) && (dm->policy_max_freq == max_freq))
-		goto out;
-
-	update_policy_min_max_freq(dm, min_freq, max_freq);
-
-	/* Check dependent domains */
-
-	/*Send policy to FVP*/
-#ifdef CONFIG_EXYNOS_ACPM
-	if (dm->policy_use) {
-		ret = acpm_ipc_request_channel(exynos_dm->dev->of_node, NULL, &ch_num, &size);
-		if (ret) {
-			dev_err(exynos_dm->dev,
-					"acpm request channel is failed, id:%u, size:%u\n", ch_num, size);
-			goto out;
-		}
-		config.cmd = cmd;
-		config.response = true;
-		config.indirection = false;
-		config.cmd[0] = dm->cal_id;
-		config.cmd[1] = max_freq;
-		config.cmd[2] = POLICY_REQ;
-
-		ret = acpm_ipc_send_data(ch_num, &config);
-		if (ret) {
-			dev_err(exynos_dm->dev, "Failed to send policy data to FVP");
-			goto out;
-		}
-	}
-#endif
-
-out:
-#ifdef CONFIG_EXYNOS_SNAPSHOT_DM
-	do_gettimeofday(&after);
-
-	pre_time = (before.tv_sec - pre.tv_sec) * USEC_PER_SEC +
-		(before.tv_usec - pre.tv_usec);
-	time = (after.tv_sec - before.tv_sec) * USEC_PER_SEC +
-		(after.tv_usec - before.tv_usec);
-
-	exynos_ss_dm((int)dm_type, min_freq, max_freq, pre_time, time);
-#endif
-
-	return 0;
-}
-
-static int constraint_checker_min(struct list_head *head, u32 freq)
-{
-	struct exynos_dm_data *dm;
-	struct exynos_dm_constraint *constraint;
-	int i;
-
-	if (!list_empty(head)) {
-		list_for_each_entry(constraint, head, node) {
-			for (i = constraint->table_length - 1; i >= 0; i--) {
-				if (freq <= constraint->freq_table[i].master_freq) {
-					constraint->min_freq = constraint->freq_table[i].constraint_freq;
-					constraint->master_freq = freq;
-					break;
-				}
-			}
-			dm_data_updater(constraint->constraint_dm_type);
-			dm = &exynos_dm->dm_data[constraint->constraint_dm_type];
-			constraint_checker_min(get_min_constraint_list(dm), dm->min_freq);
-		}
-	}
-
-	return 0;
-}
-
-static int constraint_checker_max(struct list_head *head, u32 freq)
-{
-	struct exynos_dm_data *dm;
-	struct exynos_dm_constraint *constraint;
-	int i;
-
-	if (!list_empty(head)) {
-		list_for_each_entry(constraint, head, node) {
-			for (i = 0; i < constraint->table_length; i++) {
-				if (freq >= constraint->freq_table[i].master_freq) {
-					constraint->max_freq = constraint->freq_table[i].constraint_freq;
-					break;
-				}
-			}
-			dm_data_updater(constraint->constraint_dm_type);
-			dm = &exynos_dm->dm_data[constraint->constraint_dm_type];
-			constraint_checker_max(get_max_constraint_list(dm), dm->max_freq);
-		}
-	}
-
-	return 0;
-}
-
-/*
- * DM CALL
- */
-static int __DM_CALL(enum exynos_dm_type dm_type, unsigned long *target_freq)
-{
-	struct exynos_dm_data *dm;
-	int i;
-	int ret;
-	unsigned int relation = EXYNOS_DM_RELATION_L;
-	u32 old_min_freq;
-#ifdef CONFIG_EXYNOS_SNAPSHOT_DM
-	struct timeval pre, before, after;
-	s32 time = 0, pre_time = 0;
-
-	exynos_ss_dm((int)dm_type, *target_freq, 1, pre_time, time);
-
-	do_gettimeofday(&pre);
-	do_gettimeofday(&before);
-#endif
-
-	dm = &exynos_dm->dm_data[dm_type];
-	old_min_freq = dm->min_freq;
-	dm->gov_min_freq = (u32)(*target_freq);
-
-	if (dm->gov_min_freq > dm->policy_max_freq)
-		dm->gov_min_freq = dm->policy_max_freq;
-
-	for (i = 0; i < DM_TYPE_END; i++)
-		(&exynos_dm->dm_data[i])->constraint_checked = 0;
-
-	if (dm->policy_max_freq < dm->cur_freq)
-		max_flag = true;
-	else
-		max_flag = false;
-
-	ret = dm_data_updater(dm_type);
-	if (ret) {
-		pr_err("Failed to update DM DATA!\n");
-		return -EAGAIN;
-	}
-
-	dm->target_freq = (u32)(*target_freq);
-
-	if (dm->target_freq < dm->min_freq)
-		dm->target_freq = dm->min_freq;
-	if (dm->target_freq >= dm->max_freq) {
-		dm->target_freq = dm->max_freq;
-		relation = EXYNOS_DM_RELATION_H;
-	}
-
-	*target_freq = dm->target_freq;
-
-	/* Constratin checker should be called to decide target frequency */
-	constraint_data_updater(dm_type, 1);
-	max_constraint_data_updater(dm_type, 1);
-
-	if (dm->target_freq > dm->cur_freq)
-		scaling_callback(UP, relation);
-	else if (dm->target_freq < dm->cur_freq)
-		scaling_callback(DOWN, relation);
-	else if (dm->min_freq > old_min_freq)
-		scaling_callback(UP, relation);
-	else if (dm->min_freq < old_min_freq)
-		scaling_callback(DOWN, relation);
-
-	/* min/max order clear */
-	for (i = 0; i <= DM_TYPE_END; i++) {
-		min_order[i] = DM_EMPTY;
-		max_order[i] = DM_EMPTY;
-	}
-	
-#ifdef CONFIG_EXYNOS_SNAPSHOT_DM
-	do_gettimeofday(&after);
-
-	pre_time = (before.tv_sec - pre.tv_sec) * USEC_PER_SEC +
-		(before.tv_usec - pre.tv_usec);
-	time = (after.tv_sec - before.tv_sec) * USEC_PER_SEC +
-		(after.tv_usec - before.tv_usec);
-
-	exynos_ss_dm((int)dm_type, *target_freq, 3, pre_time, time);
-#endif
-
-	return 0;
-}
-
-static int dm_data_updater(enum exynos_dm_type dm_type)
-{
-	struct exynos_dm_data *dm;
-	struct exynos_dm_constraint *constraint;
-	struct list_head *constraint_list;
-	int i;
-	/* Initial min/max frequency is set to policy min/max frequency */
-	u32 min_freq;
-	u32 max_freq;
-
-	dm = &exynos_dm->dm_data[dm_type];
-	min_freq = dm->policy_min_freq;
-	max_freq = dm->policy_max_freq;
-
-	/* Check min/max constraint conditions */
-	for (i = 0; i < DM_TYPE_END; i++) {
-		if (!exynos_dm->dm_data[i].available)
-			continue;
-
-		constraint_list = get_min_constraint_list(&exynos_dm->dm_data[i]);
-		if (list_empty(constraint_list))
-			continue;
-		list_for_each_entry(constraint, constraint_list, node) {
-			if (constraint->constraint_dm_type == dm_type)
-				min_freq = max(min_freq, constraint->min_freq);
-		}
-	}
-	for (i = 0; i < DM_TYPE_END; i++) {
-		if (!exynos_dm->dm_data[i].available)
-			continue;
-
-		constraint_list = get_max_constraint_list(&exynos_dm->dm_data[i]);
-		if (list_empty(constraint_list))
-			continue;
-		list_for_each_entry(constraint, constraint_list, node) {
-			if (constraint->constraint_dm_type == dm_type)
-				max_freq = min(max_freq, constraint->max_freq);
-		}
-	}
-
-	min_freq = max(min_freq, dm->gov_min_freq); //MIN freq should be checked with gov_min_freq
-	update_min_max_freq(dm, min_freq, max_freq);
-
-	return 0;
-}
-
-int policy_update_call_to_DM(enum exynos_dm_type dm_type, u32 min_freq, u32 max_freq)
-{
-	int ret = 0;
-
-	mutex_lock(&exynos_dm->lock);
-	ret = __policy_update_call_to_DM(dm_type, min_freq, max_freq);
-	mutex_unlock(&exynos_dm->lock);
-
-	return ret;
-}
-
-int DM_CALL(enum exynos_dm_type dm_type, unsigned long *target_freq)
-{
-	int ret = 0;
-
-	mutex_lock(&exynos_dm->lock);
-	ret = __DM_CALL(dm_type, target_freq);
-	mutex_unlock(&exynos_dm->lock);
-
-	return ret;
-}
-
-int policy_update_with_DM_CALL(enum exynos_dm_type dm_type, u32 min_freq, u32 max_freq, unsigned long *target_freq)
-{
-	int ret = 0;
-
-	mutex_lock(&exynos_dm->lock);
-	__policy_update_call_to_DM(dm_type, min_freq, max_freq);
-	ret = __DM_CALL(dm_type, target_freq);
-	mutex_unlock(&exynos_dm->lock);
-
-	return ret;
-}
-
-static int constraint_data_updater(enum exynos_dm_type dm_type, int cnt)
-{
-	struct exynos_dm_data *dm;
-	struct exynos_dm_constraint *constraint;
-	struct list_head *constraint_list;
-
-	dm = &exynos_dm->dm_data[dm_type];
-
-	/* Check dependent domains */
-	constraint_checker_min(get_min_constraint_list(dm), dm->min_freq);
-
-	if (!dm->constraint_checked)
-		dm->constraint_checked += cnt;
-
-	min_order[dm->constraint_checked] = dm_type;
-
-	constraint_list = get_min_constraint_list(dm);
-	if (list_empty(constraint_list))
-		return 0;
-
-	min_order[0] = 0;
-
-	list_for_each_entry(constraint, constraint_list, node) {
-		dm = &exynos_dm->dm_data[constraint->constraint_dm_type];
-		dm_data_updater(dm->dm_type);
-
-		dm->target_freq = dm->min_freq;
-		if (dm->target_freq >= dm->max_freq)
-			dm->target_freq = dm->max_freq;
-
-		constraint_data_updater(dm->dm_type, cnt + 1);
-	}
-
-	return 0;
-}
-
-static int max_constraint_data_updater(enum exynos_dm_type dm_type, int cnt)
-{
-	struct exynos_dm_data *dm;
-	struct exynos_dm_constraint *constraint;
-	struct list_head *constraint_list;
-
-	dm = &exynos_dm->dm_data[dm_type];
-
-	/* Check dependent domains */
-	constraint_checker_max(get_max_constraint_list(dm), dm->max_freq);
-
-	if (!dm->constraint_checked)
-		dm->constraint_checked += cnt;
-
-	max_order[dm->constraint_checked] = dm_type;
-
-	constraint_list = get_max_constraint_list(dm);
-	if (list_empty(constraint_list))
-		return 0;
-
-	max_order[0] = 0;
-
-	list_for_each_entry(constraint, constraint_list, node) {
-		dm = &exynos_dm->dm_data[constraint->constraint_dm_type];
-		dm_data_updater(dm->dm_type);
-
-		dm->target_freq = dm->min_freq;
-		if (dm->target_freq >= dm->max_freq)
-			dm->target_freq = dm->max_freq;
-
-		max_constraint_data_updater(dm->dm_type, cnt + 1);
-	}
-
-	return 0;
-}
-
-/*
- * Scaling Callback
- * Call callback function in each DVFS drivers to scaling frequency
- */
-static int scaling_callback(enum dvfs_direction dir, unsigned int relation)
-{
-	struct exynos_dm_data *dm;
-	int i;
-
-	switch (dir) {
-	case DOWN:
-		if (min_order[0] == 0 && max_flag == false) {
-			for (i = 1; i <= DM_TYPE_END; i++) {
-				if (min_order[i] == DM_EMPTY)
-					continue;
-
-				dm = &exynos_dm->dm_data[min_order[i]];
-				if (dm->constraint_checked) {
-					if (dm->freq_scaler) {
-						dm->freq_scaler(dm->dm_type, dm->target_freq, relation);
-						dm->cur_freq = dm->target_freq;
-					}
-					dm->constraint_checked = 0;
-				}
-			}
-		} else if (max_order[0] == 0 && max_flag == true) {
-			for (i = DM_TYPE_END; i > 0; i--) {
-				if (max_order[i] == DM_EMPTY)
-					continue;
-
-				dm = &exynos_dm->dm_data[max_order[i]];
-				if (dm->constraint_checked) {
-					if (dm->freq_scaler) {
-						dm->freq_scaler(dm->dm_type, dm->target_freq, relation);
-						dm->cur_freq = dm->target_freq;
-					}
-					dm->constraint_checked = 0;
-				}
-			}
-		}
-		break;
-	case UP:
-		if (min_order[0] == 0) {
-			for (i = DM_TYPE_END; i > 0; i--) {
-				if (min_order[i] == DM_EMPTY)
-					continue;
-
-				dm = &exynos_dm->dm_data[min_order[i]];
-				if (dm->constraint_checked) {
-					if (dm->freq_scaler) {
-						dm->freq_scaler(dm->dm_type, dm->target_freq, relation);
-						dm->cur_freq = dm->target_freq;
-					}
-					dm->constraint_checked = 0;
-				}
-			}
-		} else if (max_order[0] == 0) {
-			for (i = 1; i <= DM_TYPE_END; i++) {
-				if (max_order[i] == DM_EMPTY)
-					continue;
-
-				dm = &exynos_dm->dm_data[max_order[i]];
-				if (dm->constraint_checked) {
-					if (dm->freq_scaler) {
-						dm->freq_scaler(dm->dm_type, dm->target_freq, relation);
-						dm->cur_freq = dm->target_freq;
-					}
-					dm->constraint_checked = 0;
-				}
-			}
-		}
-		break;
-	default:
-		break;
-	}
-
-	for (i = 1; i <= DM_TYPE_END; i++) {
-		if (min_order[i] == DM_EMPTY)
-			continue;
-
-		dm = &exynos_dm->dm_data[min_order[i]];
-		if (dm->constraint_checked) {
-			if (dm->freq_scaler) {
-				dm->freq_scaler(dm->dm_type, dm->target_freq, relation);
-				dm->cur_freq = dm->target_freq;
-			}
-			dm->constraint_checked = 0;
-		}
-	}
-
-	max_flag = false;
-
-	return 0;
-}
-
-static void get_governor_min_freq(struct exynos_dm_data *dm_data, u32 *gov_min_freq)
-{
-	*gov_min_freq = dm_data->gov_min_freq;
-}
-
-static void get_min_max_freq(struct exynos_dm_data *dm_data, u32 *min_freq, u32 *max_freq)
-{
-	*min_freq = dm_data->min_freq;
-	*max_freq = dm_data->max_freq;
-}
-
-static void update_min_max_freq(struct exynos_dm_data *dm_data, u32 min_freq, u32 max_freq)
-{
-	dm_data->min_freq = min_freq;
-	dm_data->max_freq = max_freq;
-}
-
-static void get_policy_min_max_freq(struct exynos_dm_data *dm_data, u32 *min_freq, u32 *max_freq)
-{
-	*min_freq = dm_data->policy_min_freq;
-	*max_freq = dm_data->policy_max_freq;
-}
-
-static void update_policy_min_max_freq(struct exynos_dm_data *dm_data, u32 min_freq, u32 max_freq)
-{
-	dm_data->policy_min_freq = min_freq;
-	dm_data->policy_max_freq = max_freq;
-}
-
-static void get_current_freq(struct exynos_dm_data *dm_data, u32 *cur_freq)
-{
-	*cur_freq = dm_data->cur_freq;
-}
-
-static void get_target_freq(struct exynos_dm_data *dm_data, u32 *target_freq)
-{
-	*target_freq = dm_data->target_freq;
-}
-
-static int exynos_dm_suspend(struct device *dev)
-{
-	/* Suspend callback function might be registered if necessary */
-
-	return 0;
-}
-
-static int exynos_dm_resume(struct device *dev)
-{
-	/* Resume callback function might be registered if necessary */
-
-	return 0;
-}
-
-static int exynos_dm_probe(struct platform_device *pdev)
-{
-	int ret = 0;
-	struct exynos_dm_device *dm;
-
-	dm = kzalloc(sizeof(struct exynos_dm_device), GFP_KERNEL);
-	if (dm == NULL) {
-		dev_err(&pdev->dev, "failed to allocate DVFS Manager device\n");
-		ret = -ENOMEM;
-		goto err_device;
-	}
-
-	dm->dev = &pdev->dev;
-
-	mutex_init(&dm->lock);
-
-	/* parsing devfreq dts data for exynos-dvfs-manager */
-	ret = exynos_dm_parse_dt(dm->dev->of_node, dm);
-	if (ret) {
-		dev_err(dm->dev, "failed to parse private data\n");
-		goto err_parse_dt;
-	}
-
-	print_available_dm_data(dm);
-
-	ret = sysfs_create_group(&dm->dev->kobj, &exynos_dm_attr_group);
-	if (ret)
-		dev_warn(dm->dev, "failed create sysfs for DVFS Manager\n");
-
-	exynos_dm = dm;
-	platform_set_drvdata(pdev, dm);
-
-	return 0;
-
-err_parse_dt:
-	mutex_destroy(&dm->lock);
-	kfree(dm);
-err_device:
-
-	return ret;
-}
-
-static int exynos_dm_remove(struct platform_device *pdev)
-{
-	struct exynos_dm_device *dm = platform_get_drvdata(pdev);
-
-	sysfs_remove_group(&dm->dev->kobj, &exynos_dm_attr_group);
-	mutex_destroy(&dm->lock);
-	kfree(dm);
-
-	return 0;
-}
-
-static struct platform_device_id exynos_dm_driver_ids[] = {
-	{
-		.name		= EXYNOS_DM_MODULE_NAME,
-	},
-	{},
-};
-MODULE_DEVICE_TABLE(platform, exynos_dm_driver_ids);
-
-static const struct of_device_id exynos_dm_match[] = {
-	{
-		.compatible	= "samsung,exynos-dvfs-manager",
-	},
-	{},
-};
-MODULE_DEVICE_TABLE(of, exynos_dm_match);
-
-static const struct dev_pm_ops exynos_dm_pm_ops = {
-	.suspend	= exynos_dm_suspend,
-	.resume		= exynos_dm_resume,
-};
-
-static struct platform_driver exynos_dm_driver = {
-	.probe		= exynos_dm_probe,
-	.remove		= exynos_dm_remove,
-	.id_table	= exynos_dm_driver_ids,
-	.driver	= {
-		.name	= EXYNOS_DM_MODULE_NAME,
-		.owner	= THIS_MODULE,
-		.pm	= &exynos_dm_pm_ops,
-		.of_match_table = exynos_dm_match,
-	},
-};
-
-static int __init exynos_dm_init(void)
-{
-	return platform_driver_register(&exynos_dm_driver);
-}
-subsys_initcall(exynos_dm_init);
-
-static void __exit exynos_dm_exit(void)
-{
-	platform_driver_unregister(&exynos_dm_driver);
-}
-module_exit(exynos_dm_exit);
-
-MODULE_AUTHOR("Taekki Kim <taekki.kim@samsung.com>");
-MODULE_AUTHOR("Eunok Jo <eunok25.jo@samsung.com>");
-MODULE_DESCRIPTION("Samsung EXYNOS SoC series DVFS Manager");
-MODULE_LICENSE("GPL");
+100__GraphicsLevel_2_SclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_100__GraphicsLevel_2_SclkFrequency__SHIFT 0x0
+#define DPM_TABLE_101__GraphicsLevel_2_ActivityLevel_MASK 0xffff
+#define DPM_TABLE_101__GraphicsLevel_2_ActivityLevel__SHIFT 0x0
+#define DPM_TABLE_101__GraphicsLevel_2_DeepSleepDivId_MASK 0xff0000
+#define DPM_TABLE_101__GraphicsLevel_2_DeepSleepDivId__SHIFT 0x10
+#define DPM_TABLE_101__GraphicsLevel_2_pcieDpmLevel_MASK 0xff000000
+#define DPM_TABLE_101__GraphicsLevel_2_pcieDpmLevel__SHIFT 0x18
+#define DPM_TABLE_102__GraphicsLevel_2_CgSpllFuncCntl3_MASK 0xffffffff
+#define DPM_TABLE_102__GraphicsLevel_2_CgSpllFuncCntl3__SHIFT 0x0
+#define DPM_TABLE_103__GraphicsLevel_2_CgSpllFuncCntl4_MASK 0xffffffff
+#define DPM_TABLE_103__GraphicsLevel_2_CgSpllFuncCntl4__SHIFT 0x0
+#define DPM_TABLE_104__GraphicsLevel_2_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_104__GraphicsLevel_2_SpllSpreadSpectrum__SHIFT 0x0
+#define DPM_TABLE_105__GraphicsLevel_2_SpllSpreadSpectrum2_MASK 0xffffffff
+#define DPM_TABLE_105__GraphicsLevel_2_SpllSpreadSpectrum2__SHIFT 0x0
+#define DPM_TABLE_106__GraphicsLevel_2_CcPwrDynRm_MASK 0xffffffff
+#define DPM_TABLE_106__GraphicsLevel_2_CcPwrDynRm__SHIFT 0x0
+#define DPM_TABLE_107__GraphicsLevel_2_CcPwrDynRm1_MASK 0xffffffff
+#define DPM_TABLE_107__GraphicsLevel_2_CcPwrDynRm1__SHIFT 0x0
+#define DPM_TABLE_108__GraphicsLevel_2_EnabledForThrottle_MASK 0xff
+#define DPM_TABLE_108__GraphicsLevel_2_EnabledForThrottle__SHIFT 0x0
+#define DPM_TABLE_108__GraphicsLevel_2_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_108__GraphicsLevel_2_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_108__GraphicsLevel_2_DisplayWatermark_MASK 0xff0000
+#define DPM_TABLE_108__GraphicsLevel_2_DisplayWatermark__SHIFT 0x10
+#define DPM_TABLE_108__GraphicsLevel_2_SclkDid_MASK 0xff000000
+#define DPM_TABLE_108__GraphicsLevel_2_SclkDid__SHIFT 0x18
+#define DPM_TABLE_109__GraphicsLevel_2_PowerThrottle_MASK 0xff
+#define DPM_TABLE_109__GraphicsLevel_2_PowerThrottle__SHIFT 0x0
+#define DPM_TABLE_109__GraphicsLevel_2_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_109__GraphicsLevel_2_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_109__GraphicsLevel_2_DownHyst_MASK 0xff0000
+#define DPM_TABLE_109__GraphicsLevel_2_DownHyst__SHIFT 0x10
+#define DPM_TABLE_109__GraphicsLevel_2_UpHyst_MASK 0xff000000
+#define DPM_TABLE_109__GraphicsLevel_2_UpHyst__SHIFT 0x18
+#define DPM_TABLE_110__GraphicsLevel_3_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_110__GraphicsLevel_3_MinVddc__SHIFT 0x0
+#define DPM_TABLE_111__GraphicsLevel_3_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_111__GraphicsLevel_3_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_112__GraphicsLevel_3_SclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_112__GraphicsLevel_3_SclkFrequency__SHIFT 0x0
+#define DPM_TABLE_113__GraphicsLevel_3_ActivityLevel_MASK 0xffff
+#define DPM_TABLE_113__GraphicsLevel_3_ActivityLevel__SHIFT 0x0
+#define DPM_TABLE_113__GraphicsLevel_3_DeepSleepDivId_MASK 0xff0000
+#define DPM_TABLE_113__GraphicsLevel_3_DeepSleepDivId__SHIFT 0x10
+#define DPM_TABLE_113__GraphicsLevel_3_pcieDpmLevel_MASK 0xff000000
+#define DPM_TABLE_113__GraphicsLevel_3_pcieDpmLevel__SHIFT 0x18
+#define DPM_TABLE_114__GraphicsLevel_3_CgSpllFuncCntl3_MASK 0xffffffff
+#define DPM_TABLE_114__GraphicsLevel_3_CgSpllFuncCntl3__SHIFT 0x0
+#define DPM_TABLE_115__GraphicsLevel_3_CgSpllFuncCntl4_MASK 0xffffffff
+#define DPM_TABLE_115__GraphicsLevel_3_CgSpllFuncCntl4__SHIFT 0x0
+#define DPM_TABLE_116__GraphicsLevel_3_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_116__GraphicsLevel_3_SpllSpreadSpectrum__SHIFT 0x0
+#define DPM_TABLE_117__GraphicsLevel_3_SpllSpreadSpectrum2_MASK 0xffffffff
+#define DPM_TABLE_117__GraphicsLevel_3_SpllSpreadSpectrum2__SHIFT 0x0
+#define DPM_TABLE_118__GraphicsLevel_3_CcPwrDynRm_MASK 0xffffffff
+#define DPM_TABLE_118__GraphicsLevel_3_CcPwrDynRm__SHIFT 0x0
+#define DPM_TABLE_119__GraphicsLevel_3_CcPwrDynRm1_MASK 0xffffffff
+#define DPM_TABLE_119__GraphicsLevel_3_CcPwrDynRm1__SHIFT 0x0
+#define DPM_TABLE_120__GraphicsLevel_3_EnabledForThrottle_MASK 0xff
+#define DPM_TABLE_120__GraphicsLevel_3_EnabledForThrottle__SHIFT 0x0
+#define DPM_TABLE_120__GraphicsLevel_3_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_120__GraphicsLevel_3_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_120__GraphicsLevel_3_DisplayWatermark_MASK 0xff0000
+#define DPM_TABLE_120__GraphicsLevel_3_DisplayWatermark__SHIFT 0x10
+#define DPM_TABLE_120__GraphicsLevel_3_SclkDid_MASK 0xff000000
+#define DPM_TABLE_120__GraphicsLevel_3_SclkDid__SHIFT 0x18
+#define DPM_TABLE_121__GraphicsLevel_3_PowerThrottle_MASK 0xff
+#define DPM_TABLE_121__GraphicsLevel_3_PowerThrottle__SHIFT 0x0
+#define DPM_TABLE_121__GraphicsLevel_3_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_121__GraphicsLevel_3_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_121__GraphicsLevel_3_DownHyst_MASK 0xff0000
+#define DPM_TABLE_121__GraphicsLevel_3_DownHyst__SHIFT 0x10
+#define DPM_TABLE_121__GraphicsLevel_3_UpHyst_MASK 0xff000000
+#define DPM_TABLE_121__GraphicsLevel_3_UpHyst__SHIFT 0x18
+#define DPM_TABLE_122__GraphicsLevel_4_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_122__GraphicsLevel_4_MinVddc__SHIFT 0x0
+#define DPM_TABLE_123__GraphicsLevel_4_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_123__GraphicsLevel_4_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_124__GraphicsLevel_4_SclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_124__GraphicsLevel_4_SclkFrequency__SHIFT 0x0
+#define DPM_TABLE_125__GraphicsLevel_4_ActivityLevel_MASK 0xffff
+#define DPM_TABLE_125__GraphicsLevel_4_ActivityLevel__SHIFT 0x0
+#define DPM_TABLE_125__GraphicsLevel_4_DeepSleepDivId_MASK 0xff0000
+#define DPM_TABLE_125__GraphicsLevel_4_DeepSleepDivId__SHIFT 0x10
+#define DPM_TABLE_125__GraphicsLevel_4_pcieDpmLevel_MASK 0xff000000
+#define DPM_TABLE_125__GraphicsLevel_4_pcieDpmLevel__SHIFT 0x18
+#define DPM_TABLE_126__GraphicsLevel_4_CgSpllFuncCntl3_MASK 0xffffffff
+#define DPM_TABLE_126__GraphicsLevel_4_CgSpllFuncCntl3__SHIFT 0x0
+#define DPM_TABLE_127__GraphicsLevel_4_CgSpllFuncCntl4_MASK 0xffffffff
+#define DPM_TABLE_127__GraphicsLevel_4_CgSpllFuncCntl4__SHIFT 0x0
+#define DPM_TABLE_128__GraphicsLevel_4_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_128__GraphicsLevel_4_SpllSpreadSpectrum__SHIFT 0x0
+#define DPM_TABLE_129__GraphicsLevel_4_SpllSpreadSpectrum2_MASK 0xffffffff
+#define DPM_TABLE_129__GraphicsLevel_4_SpllSpreadSpectrum2__SHIFT 0x0
+#define DPM_TABLE_130__GraphicsLevel_4_CcPwrDynRm_MASK 0xffffffff
+#define DPM_TABLE_130__GraphicsLevel_4_CcPwrDynRm__SHIFT 0x0
+#define DPM_TABLE_131__GraphicsLevel_4_CcPwrDynRm1_MASK 0xffffffff
+#define DPM_TABLE_131__GraphicsLevel_4_CcPwrDynRm1__SHIFT 0x0
+#define DPM_TABLE_132__GraphicsLevel_4_EnabledForThrottle_MASK 0xff
+#define DPM_TABLE_132__GraphicsLevel_4_EnabledForThrottle__SHIFT 0x0
+#define DPM_TABLE_132__GraphicsLevel_4_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_132__GraphicsLevel_4_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_132__GraphicsLevel_4_DisplayWatermark_MASK 0xff0000
+#define DPM_TABLE_132__GraphicsLevel_4_DisplayWatermark__SHIFT 0x10
+#define DPM_TABLE_132__GraphicsLevel_4_SclkDid_MASK 0xff000000
+#define DPM_TABLE_132__GraphicsLevel_4_SclkDid__SHIFT 0x18
+#define DPM_TABLE_133__GraphicsLevel_4_PowerThrottle_MASK 0xff
+#define DPM_TABLE_133__GraphicsLevel_4_PowerThrottle__SHIFT 0x0
+#define DPM_TABLE_133__GraphicsLevel_4_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_133__GraphicsLevel_4_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_133__GraphicsLevel_4_DownHyst_MASK 0xff0000
+#define DPM_TABLE_133__GraphicsLevel_4_DownHyst__SHIFT 0x10
+#define DPM_TABLE_133__GraphicsLevel_4_UpHyst_MASK 0xff000000
+#define DPM_TABLE_133__GraphicsLevel_4_UpHyst__SHIFT 0x18
+#define DPM_TABLE_134__GraphicsLevel_5_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_134__GraphicsLevel_5_MinVddc__SHIFT 0x0
+#define DPM_TABLE_135__GraphicsLevel_5_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_135__GraphicsLevel_5_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_136__GraphicsLevel_5_SclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_136__GraphicsLevel_5_SclkFrequency__SHIFT 0x0
+#define DPM_TABLE_137__GraphicsLevel_5_ActivityLevel_MASK 0xffff
+#define DPM_TABLE_137__GraphicsLevel_5_ActivityLevel__SHIFT 0x0
+#define DPM_TABLE_137__GraphicsLevel_5_DeepSleepDivId_MASK 0xff0000
+#define DPM_TABLE_137__GraphicsLevel_5_DeepSleepDivId__SHIFT 0x10
+#define DPM_TABLE_137__GraphicsLevel_5_pcieDpmLevel_MASK 0xff000000
+#define DPM_TABLE_137__GraphicsLevel_5_pcieDpmLevel__SHIFT 0x18
+#define DPM_TABLE_138__GraphicsLevel_5_CgSpllFuncCntl3_MASK 0xffffffff
+#define DPM_TABLE_138__GraphicsLevel_5_CgSpllFuncCntl3__SHIFT 0x0
+#define DPM_TABLE_139__GraphicsLevel_5_CgSpllFuncCntl4_MASK 0xffffffff
+#define DPM_TABLE_139__GraphicsLevel_5_CgSpllFuncCntl4__SHIFT 0x0
+#define DPM_TABLE_140__GraphicsLevel_5_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_140__GraphicsLevel_5_SpllSpreadSpectrum__SHIFT 0x0
+#define DPM_TABLE_141__GraphicsLevel_5_SpllSpreadSpectrum2_MASK 0xffffffff
+#define DPM_TABLE_141__GraphicsLevel_5_SpllSpreadSpectrum2__SHIFT 0x0
+#define DPM_TABLE_142__GraphicsLevel_5_CcPwrDynRm_MASK 0xffffffff
+#define DPM_TABLE_142__GraphicsLevel_5_CcPwrDynRm__SHIFT 0x0
+#define DPM_TABLE_143__GraphicsLevel_5_CcPwrDynRm1_MASK 0xffffffff
+#define DPM_TABLE_143__GraphicsLevel_5_CcPwrDynRm1__SHIFT 0x0
+#define DPM_TABLE_144__GraphicsLevel_5_EnabledForThrottle_MASK 0xff
+#define DPM_TABLE_144__GraphicsLevel_5_EnabledForThrottle__SHIFT 0x0
+#define DPM_TABLE_144__GraphicsLevel_5_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_144__GraphicsLevel_5_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_144__GraphicsLevel_5_DisplayWatermark_MASK 0xff0000
+#define DPM_TABLE_144__GraphicsLevel_5_DisplayWatermark__SHIFT 0x10
+#define DPM_TABLE_144__GraphicsLevel_5_SclkDid_MASK 0xff000000
+#define DPM_TABLE_144__GraphicsLevel_5_SclkDid__SHIFT 0x18
+#define DPM_TABLE_145__GraphicsLevel_5_PowerThrottle_MASK 0xff
+#define DPM_TABLE_145__GraphicsLevel_5_PowerThrottle__SHIFT 0x0
+#define DPM_TABLE_145__GraphicsLevel_5_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_145__GraphicsLevel_5_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_145__GraphicsLevel_5_DownHyst_MASK 0xff0000
+#define DPM_TABLE_145__GraphicsLevel_5_DownHyst__SHIFT 0x10
+#define DPM_TABLE_145__GraphicsLevel_5_UpHyst_MASK 0xff000000
+#define DPM_TABLE_145__GraphicsLevel_5_UpHyst__SHIFT 0x18
+#define DPM_TABLE_146__GraphicsLevel_6_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_146__GraphicsLevel_6_MinVddc__SHIFT 0x0
+#define DPM_TABLE_147__GraphicsLevel_6_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_147__GraphicsLevel_6_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_148__GraphicsLevel_6_SclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_148__GraphicsLevel_6_SclkFrequency__SHIFT 0x0
+#define DPM_TABLE_149__GraphicsLevel_6_ActivityLevel_MASK 0xffff
+#define DPM_TABLE_149__GraphicsLevel_6_ActivityLevel__SHIFT 0x0
+#define DPM_TABLE_149__GraphicsLevel_6_DeepSleepDivId_MASK 0xff0000
+#define DPM_TABLE_149__GraphicsLevel_6_DeepSleepDivId__SHIFT 0x10
+#define DPM_TABLE_149__GraphicsLevel_6_pcieDpmLevel_MASK 0xff000000
+#define DPM_TABLE_149__GraphicsLevel_6_pcieDpmLevel__SHIFT 0x18
+#define DPM_TABLE_150__GraphicsLevel_6_CgSpllFuncCntl3_MASK 0xffffffff
+#define DPM_TABLE_150__GraphicsLevel_6_CgSpllFuncCntl3__SHIFT 0x0
+#define DPM_TABLE_151__GraphicsLevel_6_CgSpllFuncCntl4_MASK 0xffffffff
+#define DPM_TABLE_151__GraphicsLevel_6_CgSpllFuncCntl4__SHIFT 0x0
+#define DPM_TABLE_152__GraphicsLevel_6_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_152__GraphicsLevel_6_SpllSpreadSpectrum__SHIFT 0x0
+#define DPM_TABLE_153__GraphicsLevel_6_SpllSpreadSpectrum2_MASK 0xffffffff
+#define DPM_TABLE_153__GraphicsLevel_6_SpllSpreadSpectrum2__SHIFT 0x0
+#define DPM_TABLE_154__GraphicsLevel_6_CcPwrDynRm_MASK 0xffffffff
+#define DPM_TABLE_154__GraphicsLevel_6_CcPwrDynRm__SHIFT 0x0
+#define DPM_TABLE_155__GraphicsLevel_6_CcPwrDynRm1_MASK 0xffffffff
+#define DPM_TABLE_155__GraphicsLevel_6_CcPwrDynRm1__SHIFT 0x0
+#define DPM_TABLE_156__GraphicsLevel_6_EnabledForThrottle_MASK 0xff
+#define DPM_TABLE_156__GraphicsLevel_6_EnabledForThrottle__SHIFT 0x0
+#define DPM_TABLE_156__GraphicsLevel_6_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_156__GraphicsLevel_6_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_156__GraphicsLevel_6_DisplayWatermark_MASK 0xff0000
+#define DPM_TABLE_156__GraphicsLevel_6_DisplayWatermark__SHIFT 0x10
+#define DPM_TABLE_156__GraphicsLevel_6_SclkDid_MASK 0xff000000
+#define DPM_TABLE_156__GraphicsLevel_6_SclkDid__SHIFT 0x18
+#define DPM_TABLE_157__GraphicsLevel_6_PowerThrottle_MASK 0xff
+#define DPM_TABLE_157__GraphicsLevel_6_PowerThrottle__SHIFT 0x0
+#define DPM_TABLE_157__GraphicsLevel_6_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_157__GraphicsLevel_6_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_157__GraphicsLevel_6_DownHyst_MASK 0xff0000
+#define DPM_TABLE_157__GraphicsLevel_6_DownHyst__SHIFT 0x10
+#define DPM_TABLE_157__GraphicsLevel_6_UpHyst_MASK 0xff000000
+#define DPM_TABLE_157__GraphicsLevel_6_UpHyst__SHIFT 0x18
+#define DPM_TABLE_158__GraphicsLevel_7_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_158__GraphicsLevel_7_MinVddc__SHIFT 0x0
+#define DPM_TABLE_159__GraphicsLevel_7_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_159__GraphicsLevel_7_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_160__GraphicsLevel_7_SclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_160__GraphicsLevel_7_SclkFrequency__SHIFT 0x0
+#define DPM_TABLE_161__GraphicsLevel_7_ActivityLevel_MASK 0xffff
+#define DPM_TABLE_161__GraphicsLevel_7_ActivityLevel__SHIFT 0x0
+#define DPM_TABLE_161__GraphicsLevel_7_DeepSleepDivId_MASK 0xff0000
+#define DPM_TABLE_161__GraphicsLevel_7_DeepSleepDivId__SHIFT 0x10
+#define DPM_TABLE_161__GraphicsLevel_7_pcieDpmLevel_MASK 0xff000000
+#define DPM_TABLE_161__GraphicsLevel_7_pcieDpmLevel__SHIFT 0x18
+#define DPM_TABLE_162__GraphicsLevel_7_CgSpllFuncCntl3_MASK 0xffffffff
+#define DPM_TABLE_162__GraphicsLevel_7_CgSpllFuncCntl3__SHIFT 0x0
+#define DPM_TABLE_163__GraphicsLevel_7_CgSpllFuncCntl4_MASK 0xffffffff
+#define DPM_TABLE_163__GraphicsLevel_7_CgSpllFuncCntl4__SHIFT 0x0
+#define DPM_TABLE_164__GraphicsLevel_7_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_164__GraphicsLevel_7_SpllSpreadSpectrum__SHIFT 0x0
+#define DPM_TABLE_165__GraphicsLevel_7_SpllSpreadSpectrum2_MASK 0xffffffff
+#define DPM_TABLE_165__GraphicsLevel_7_SpllSpreadSpectrum2__SHIFT 0x0
+#define DPM_TABLE_166__GraphicsLevel_7_CcPwrDynRm_MASK 0xffffffff
+#define DPM_TABLE_166__GraphicsLevel_7_CcPwrDynRm__SHIFT 0x0
+#define DPM_TABLE_167__GraphicsLevel_7_CcPwrDynRm1_MASK 0xffffffff
+#define DPM_TABLE_167__GraphicsLevel_7_CcPwrDynRm1__SHIFT 0x0
+#define DPM_TABLE_168__GraphicsLevel_7_EnabledForThrottle_MASK 0xff
+#define DPM_TABLE_168__GraphicsLevel_7_EnabledForThrottle__SHIFT 0x0
+#define DPM_TABLE_168__GraphicsLevel_7_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_168__GraphicsLevel_7_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_168__GraphicsLevel_7_DisplayWatermark_MASK 0xff0000
+#define DPM_TABLE_168__GraphicsLevel_7_DisplayWatermark__SHIFT 0x10
+#define DPM_TABLE_168__GraphicsLevel_7_SclkDid_MASK 0xff000000
+#define DPM_TABLE_168__GraphicsLevel_7_SclkDid__SHIFT 0x18
+#define DPM_TABLE_169__GraphicsLevel_7_PowerThrottle_MASK 0xff
+#define DPM_TABLE_169__GraphicsLevel_7_PowerThrottle__SHIFT 0x0
+#define DPM_TABLE_169__GraphicsLevel_7_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_169__GraphicsLevel_7_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_169__GraphicsLevel_7_DownHyst_MASK 0xff0000
+#define DPM_TABLE_169__GraphicsLevel_7_DownHyst__SHIFT 0x10
+#define DPM_TABLE_169__GraphicsLevel_7_UpHyst_MASK 0xff000000
+#define DPM_TABLE_169__GraphicsLevel_7_UpHyst__SHIFT 0x18
+#define DPM_TABLE_170__MemoryACPILevel_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_170__MemoryACPILevel_MinVddc__SHIFT 0x0
+#define DPM_TABLE_171__MemoryACPILevel_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_171__MemoryACPILevel_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_172__MemoryACPILevel_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_172__MemoryACPILevel_MinVddci__SHIFT 0x0
+#define DPM_TABLE_173__MemoryACPILevel_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_173__MemoryACPILevel_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_174__MemoryACPILevel_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_174__MemoryACPILevel_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_175__MemoryACPILevel_StutterEnable_MASK 0xff
+#define DPM_TABLE_175__MemoryACPILevel_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_175__MemoryACPILevel_RttEnable_MASK 0xff00
+#define DPM_TABLE_175__MemoryACPILevel_RttEnable__SHIFT 0x8
+#define DPM_TABLE_175__MemoryACPILevel_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_175__MemoryACPILevel_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_175__MemoryACPILevel_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_175__MemoryACPILevel_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_176__MemoryACPILevel_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_176__MemoryACPILevel_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_176__MemoryACPILevel_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_176__MemoryACPILevel_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_176__MemoryACPILevel_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_176__MemoryACPILevel_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_176__MemoryACPILevel_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_176__MemoryACPILevel_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_177__MemoryACPILevel_padding_MASK 0xff
+#define DPM_TABLE_177__MemoryACPILevel_padding__SHIFT 0x0
+#define DPM_TABLE_177__MemoryACPILevel_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_177__MemoryACPILevel_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_177__MemoryACPILevel_DownHyst_MASK 0xff0000
+#define DPM_TABLE_177__MemoryACPILevel_DownHyst__SHIFT 0x10
+#define DPM_TABLE_177__MemoryACPILevel_UpHyst_MASK 0xff000000
+#define DPM_TABLE_177__MemoryACPILevel_UpHyst__SHIFT 0x18
+#define DPM_TABLE_178__MemoryACPILevel_padding1_MASK 0xff
+#define DPM_TABLE_178__MemoryACPILevel_padding1__SHIFT 0x0
+#define DPM_TABLE_178__MemoryACPILevel_DisplayWatermark_MASK 0xff00
+#define DPM_TABLE_178__MemoryACPILevel_DisplayWatermark__SHIFT 0x8
+#define DPM_TABLE_178__MemoryACPILevel_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_178__MemoryACPILevel_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_179__MemoryACPILevel_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_179__MemoryACPILevel_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_180__MemoryACPILevel_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_180__MemoryACPILevel_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_181__MemoryACPILevel_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_181__MemoryACPILevel_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_182__MemoryACPILevel_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_182__MemoryACPILevel_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_183__MemoryACPILevel_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_183__MemoryACPILevel_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_184__MemoryACPILevel_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_184__MemoryACPILevel_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_185__MemoryACPILevel_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_185__MemoryACPILevel_DllCntl__SHIFT 0x0
+#define DPM_TABLE_186__MemoryACPILevel_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_186__MemoryACPILevel_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_187__MemoryACPILevel_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_187__MemoryACPILevel_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_188__MemoryLevel_0_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_188__MemoryLevel_0_MinVddc__SHIFT 0x0
+#define DPM_TABLE_189__MemoryLevel_0_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_189__MemoryLevel_0_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_190__MemoryLevel_0_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_190__MemoryLevel_0_MinVddci__SHIFT 0x0
+#define DPM_TABLE_191__MemoryLevel_0_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_191__MemoryLevel_0_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_192__MemoryLevel_0_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_192__MemoryLevel_0_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_193__MemoryLevel_0_StutterEnable_MASK 0xff
+#define DPM_TABLE_193__MemoryLevel_0_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_193__MemoryLevel_0_RttEnable_MASK 0xff00
+#define DPM_TABLE_193__MemoryLevel_0_RttEnable__SHIFT 0x8
+#define DPM_TABLE_193__MemoryLevel_0_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_193__MemoryLevel_0_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_193__MemoryLevel_0_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_193__MemoryLevel_0_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_194__MemoryLevel_0_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_194__MemoryLevel_0_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_194__MemoryLevel_0_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_194__MemoryLevel_0_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_194__MemoryLevel_0_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_194__MemoryLevel_0_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_194__MemoryLevel_0_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_194__MemoryLevel_0_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_195__MemoryLevel_0_padding_MASK 0xff
+#define DPM_TABLE_195__MemoryLevel_0_padding__SHIFT 0x0
+#define DPM_TABLE_195__MemoryLevel_0_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_195__MemoryLevel_0_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_195__MemoryLevel_0_DownHyst_MASK 0xff0000
+#define DPM_TABLE_195__MemoryLevel_0_DownHyst__SHIFT 0x10
+#define DPM_TABLE_195__MemoryLevel_0_UpHyst_MASK 0xff000000
+#define DPM_TABLE_195__MemoryLevel_0_UpHyst__SHIFT 0x18
+#define DPM_TABLE_196__MemoryLevel_0_padding1_MASK 0xff
+#define DPM_TABLE_196__MemoryLevel_0_padding1__SHIFT 0x0
+#define DPM_TABLE_196__MemoryLevel_0_DisplayWatermark_MASK 0xff00
+#define DPM_TABLE_196__MemoryLevel_0_DisplayWatermark__SHIFT 0x8
+#define DPM_TABLE_196__MemoryLevel_0_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_196__MemoryLevel_0_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_197__MemoryLevel_0_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_197__MemoryLevel_0_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_198__MemoryLevel_0_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_198__MemoryLevel_0_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_199__MemoryLevel_0_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_199__MemoryLevel_0_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_200__MemoryLevel_0_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_200__MemoryLevel_0_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_201__MemoryLevel_0_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_201__MemoryLevel_0_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_202__MemoryLevel_0_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_202__MemoryLevel_0_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_203__MemoryLevel_0_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_203__MemoryLevel_0_DllCntl__SHIFT 0x0
+#define DPM_TABLE_204__MemoryLevel_0_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_204__MemoryLevel_0_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_205__MemoryLevel_0_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_205__MemoryLevel_0_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_206__MemoryLevel_1_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_206__MemoryLevel_1_MinVddc__SHIFT 0x0
+#define DPM_TABLE_207__MemoryLevel_1_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_207__MemoryLevel_1_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_208__MemoryLevel_1_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_208__MemoryLevel_1_MinVddci__SHIFT 0x0
+#define DPM_TABLE_209__MemoryLevel_1_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_209__MemoryLevel_1_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_210__MemoryLevel_1_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_210__MemoryLevel_1_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_211__MemoryLevel_1_StutterEnable_MASK 0xff
+#define DPM_TABLE_211__MemoryLevel_1_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_211__MemoryLevel_1_RttEnable_MASK 0xff00
+#define DPM_TABLE_211__MemoryLevel_1_RttEnable__SHIFT 0x8
+#define DPM_TABLE_211__MemoryLevel_1_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_211__MemoryLevel_1_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_211__MemoryLevel_1_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_211__MemoryLevel_1_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_212__MemoryLevel_1_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_212__MemoryLevel_1_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_212__MemoryLevel_1_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_212__MemoryLevel_1_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_212__MemoryLevel_1_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_212__MemoryLevel_1_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_212__MemoryLevel_1_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_212__MemoryLevel_1_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_213__MemoryLevel_1_padding_MASK 0xff
+#define DPM_TABLE_213__MemoryLevel_1_padding__SHIFT 0x0
+#define DPM_TABLE_213__MemoryLevel_1_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_213__MemoryLevel_1_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_213__MemoryLevel_1_DownHyst_MASK 0xff0000
+#define DPM_TABLE_213__MemoryLevel_1_DownHyst__SHIFT 0x10
+#define DPM_TABLE_213__MemoryLevel_1_UpHyst_MASK 0xff000000
+#define DPM_TABLE_213__MemoryLevel_1_UpHyst__SHIFT 0x18
+#define DPM_TABLE_214__MemoryLevel_1_padding1_MASK 0xff
+#define DPM_TABLE_214__MemoryLevel_1_padding1__SHIFT 0x0
+#define DPM_TABLE_214__MemoryLevel_1_DisplayWatermark_MASK 0xff00
+#define DPM_TABLE_214__MemoryLevel_1_DisplayWatermark__SHIFT 0x8
+#define DPM_TABLE_214__MemoryLevel_1_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_214__MemoryLevel_1_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_215__MemoryLevel_1_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_215__MemoryLevel_1_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_216__MemoryLevel_1_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_216__MemoryLevel_1_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_217__MemoryLevel_1_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_217__MemoryLevel_1_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_218__MemoryLevel_1_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_218__MemoryLevel_1_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_219__MemoryLevel_1_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_219__MemoryLevel_1_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_220__MemoryLevel_1_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_220__MemoryLevel_1_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_221__MemoryLevel_1_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_221__MemoryLevel_1_DllCntl__SHIFT 0x0
+#define DPM_TABLE_222__MemoryLevel_1_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_222__MemoryLevel_1_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_223__MemoryLevel_1_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_223__MemoryLevel_1_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_224__MemoryLevel_2_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_224__MemoryLevel_2_MinVddc__SHIFT 0x0
+#define DPM_TABLE_225__MemoryLevel_2_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_225__MemoryLevel_2_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_226__MemoryLevel_2_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_226__MemoryLevel_2_MinVddci__SHIFT 0x0
+#define DPM_TABLE_227__MemoryLevel_2_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_227__MemoryLevel_2_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_228__MemoryLevel_2_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_228__MemoryLevel_2_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_229__MemoryLevel_2_StutterEnable_MASK 0xff
+#define DPM_TABLE_229__MemoryLevel_2_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_229__MemoryLevel_2_RttEnable_MASK 0xff00
+#define DPM_TABLE_229__MemoryLevel_2_RttEnable__SHIFT 0x8
+#define DPM_TABLE_229__MemoryLevel_2_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_229__MemoryLevel_2_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_229__MemoryLevel_2_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_229__MemoryLevel_2_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_230__MemoryLevel_2_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_230__MemoryLevel_2_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_230__MemoryLevel_2_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_230__MemoryLevel_2_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_230__MemoryLevel_2_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_230__MemoryLevel_2_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_230__MemoryLevel_2_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_230__MemoryLevel_2_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_231__MemoryLevel_2_padding_MASK 0xff
+#define DPM_TABLE_231__MemoryLevel_2_padding__SHIFT 0x0
+#define DPM_TABLE_231__MemoryLevel_2_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_231__MemoryLevel_2_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_231__MemoryLevel_2_DownHyst_MASK 0xff0000
+#define DPM_TABLE_231__MemoryLevel_2_DownHyst__SHIFT 0x10
+#define DPM_TABLE_231__MemoryLevel_2_UpHyst_MASK 0xff000000
+#define DPM_TABLE_231__MemoryLevel_2_UpHyst__SHIFT 0x18
+#define DPM_TABLE_232__MemoryLevel_2_padding1_MASK 0xff
+#define DPM_TABLE_232__MemoryLevel_2_padding1__SHIFT 0x0
+#define DPM_TABLE_232__MemoryLevel_2_DisplayWatermark_MASK 0xff00
+#define DPM_TABLE_232__MemoryLevel_2_DisplayWatermark__SHIFT 0x8
+#define DPM_TABLE_232__MemoryLevel_2_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_232__MemoryLevel_2_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_233__MemoryLevel_2_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_233__MemoryLevel_2_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_234__MemoryLevel_2_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_234__MemoryLevel_2_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_235__MemoryLevel_2_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_235__MemoryLevel_2_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_236__MemoryLevel_2_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_236__MemoryLevel_2_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_237__MemoryLevel_2_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_237__MemoryLevel_2_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_238__MemoryLevel_2_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_238__MemoryLevel_2_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_239__MemoryLevel_2_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_239__MemoryLevel_2_DllCntl__SHIFT 0x0
+#define DPM_TABLE_240__MemoryLevel_2_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_240__MemoryLevel_2_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_241__MemoryLevel_2_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_241__MemoryLevel_2_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_242__MemoryLevel_3_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_242__MemoryLevel_3_MinVddc__SHIFT 0x0
+#define DPM_TABLE_243__MemoryLevel_3_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_243__MemoryLevel_3_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_244__MemoryLevel_3_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_244__MemoryLevel_3_MinVddci__SHIFT 0x0
+#define DPM_TABLE_245__MemoryLevel_3_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_245__MemoryLevel_3_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_246__MemoryLevel_3_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_246__MemoryLevel_3_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_247__MemoryLevel_3_StutterEnable_MASK 0xff
+#define DPM_TABLE_247__MemoryLevel_3_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_247__MemoryLevel_3_RttEnable_MASK 0xff00
+#define DPM_TABLE_247__MemoryLevel_3_RttEnable__SHIFT 0x8
+#define DPM_TABLE_247__MemoryLevel_3_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_247__MemoryLevel_3_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_247__MemoryLevel_3_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_247__MemoryLevel_3_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_248__MemoryLevel_3_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_248__MemoryLevel_3_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_248__MemoryLevel_3_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_248__MemoryLevel_3_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_248__MemoryLevel_3_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_248__MemoryLevel_3_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_248__MemoryLevel_3_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_248__MemoryLevel_3_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_249__MemoryLevel_3_padding_MASK 0xff
+#define DPM_TABLE_249__MemoryLevel_3_padding__SHIFT 0x0
+#define DPM_TABLE_249__MemoryLevel_3_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_249__MemoryLevel_3_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_249__MemoryLevel_3_DownHyst_MASK 0xff0000
+#define DPM_TABLE_249__MemoryLevel_3_DownHyst__SHIFT 0x10
+#define DPM_TABLE_249__MemoryLevel_3_UpHyst_MASK 0xff000000
+#define DPM_TABLE_249__MemoryLevel_3_UpHyst__SHIFT 0x18
+#define DPM_TABLE_250__MemoryLevel_3_padding1_MASK 0xff
+#define DPM_TABLE_250__MemoryLevel_3_padding1__SHIFT 0x0
+#define DPM_TABLE_250__MemoryLevel_3_DisplayWatermark_MASK 0xff00
+#define DPM_TABLE_250__MemoryLevel_3_DisplayWatermark__SHIFT 0x8
+#define DPM_TABLE_250__MemoryLevel_3_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_250__MemoryLevel_3_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_251__MemoryLevel_3_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_251__MemoryLevel_3_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_252__MemoryLevel_3_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_252__MemoryLevel_3_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_253__MemoryLevel_3_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_253__MemoryLevel_3_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_254__MemoryLevel_3_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_254__MemoryLevel_3_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_255__MemoryLevel_3_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_255__MemoryLevel_3_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_256__MemoryLevel_3_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_256__MemoryLevel_3_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_257__MemoryLevel_3_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_257__MemoryLevel_3_DllCntl__SHIFT 0x0
+#define DPM_TABLE_258__MemoryLevel_3_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_258__MemoryLevel_3_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_259__MemoryLevel_3_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_259__MemoryLevel_3_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_260__LinkLevel_0_SPC_MASK 0xff
+#define DPM_TABLE_260__LinkLevel_0_SPC__SHIFT 0x0
+#define DPM_TABLE_260__LinkLevel_0_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_260__LinkLevel_0_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_260__LinkLevel_0_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_260__LinkLevel_0_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_260__LinkLevel_0_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_260__LinkLevel_0_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_261__LinkLevel_0_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_261__LinkLevel_0_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_262__LinkLevel_0_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_262__LinkLevel_0_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_263__LinkLevel_0_Reserved_MASK 0xffffffff
+#define DPM_TABLE_263__LinkLevel_0_Reserved__SHIFT 0x0
+#define DPM_TABLE_264__LinkLevel_1_SPC_MASK 0xff
+#define DPM_TABLE_264__LinkLevel_1_SPC__SHIFT 0x0
+#define DPM_TABLE_264__LinkLevel_1_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_264__LinkLevel_1_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_264__LinkLevel_1_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_264__LinkLevel_1_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_264__LinkLevel_1_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_264__LinkLevel_1_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_265__LinkLevel_1_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_265__LinkLevel_1_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_266__LinkLevel_1_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_266__LinkLevel_1_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_267__LinkLevel_1_Reserved_MASK 0xffffffff
+#define DPM_TABLE_267__LinkLevel_1_Reserved__SHIFT 0x0
+#define DPM_TABLE_268__LinkLevel_2_SPC_MASK 0xff
+#define DPM_TABLE_268__LinkLevel_2_SPC__SHIFT 0x0
+#define DPM_TABLE_268__LinkLevel_2_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_268__LinkLevel_2_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_268__LinkLevel_2_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_268__LinkLevel_2_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_268__LinkLevel_2_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_268__LinkLevel_2_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_269__LinkLevel_2_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_269__LinkLevel_2_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_270__LinkLevel_2_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_270__LinkLevel_2_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_271__LinkLevel_2_Reserved_MASK 0xffffffff
+#define DPM_TABLE_271__LinkLevel_2_Reserved__SHIFT 0x0
+#define DPM_TABLE_272__LinkLevel_3_SPC_MASK 0xff
+#define DPM_TABLE_272__LinkLevel_3_SPC__SHIFT 0x0
+#define DPM_TABLE_272__LinkLevel_3_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_272__LinkLevel_3_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_272__LinkLevel_3_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_272__LinkLevel_3_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_272__LinkLevel_3_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_272__LinkLevel_3_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_273__LinkLevel_3_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_273__LinkLevel_3_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_274__LinkLevel_3_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_274__LinkLevel_3_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_275__LinkLevel_3_Reserved_MASK 0xffffffff
+#define DPM_TABLE_275__LinkLevel_3_Reserved__SHIFT 0x0
+#define DPM_TABLE_276__LinkLevel_4_SPC_MASK 0xff
+#define DPM_TABLE_276__LinkLevel_4_SPC__SHIFT 0x0
+#define DPM_TABLE_276__LinkLevel_4_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_276__LinkLevel_4_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_276__LinkLevel_4_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_276__LinkLevel_4_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_276__LinkLevel_4_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_276__LinkLevel_4_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_277__LinkLevel_4_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_277__LinkLevel_4_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_278__LinkLevel_4_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_278__LinkLevel_4_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_279__LinkLevel_4_Reserved_MASK 0xffffffff
+#define DPM_TABLE_279__LinkLevel_4_Reserved__SHIFT 0x0
+#define DPM_TABLE_280__LinkLevel_5_SPC_MASK 0xff
+#define DPM_TABLE_280__LinkLevel_5_SPC__SHIFT 0x0
+#define DPM_TABLE_280__LinkLevel_5_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_280__LinkLevel_5_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_280__LinkLevel_5_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_280__LinkLevel_5_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_280__LinkLevel_5_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_280__LinkLevel_5_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_281__LinkLevel_5_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_281__LinkLevel_5_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_282__LinkLevel_5_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_282__LinkLevel_5_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_283__LinkLevel_5_Reserved_MASK 0xffffffff
+#define DPM_TABLE_283__LinkLevel_5_Reserved__SHIFT 0x0
+#define DPM_TABLE_284__LinkLevel_6_SPC_MASK 0xff
+#define DPM_TABLE_284__LinkLevel_6_SPC__SHIFT 0x0
+#define DPM_TABLE_284__LinkLevel_6_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_284__LinkLevel_6_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_284__LinkLevel_6_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_284__LinkLevel_6_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_284__LinkLevel_6_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_284__LinkLevel_6_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_285__LinkLevel_6_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_285__LinkLevel_6_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_286__LinkLevel_6_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_286__LinkLevel_6_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_287__LinkLevel_6_Reserved_MASK 0xffffffff
+#define DPM_TABLE_287__LinkLevel_6_Reserved__SHIFT 0x0
+#define DPM_TABLE_288__LinkLevel_7_SPC_MASK 0xff
+#define DPM_TABLE_288__LinkLevel_7_SPC__SHIFT 0x0
+#define DPM_TABLE_288__LinkLevel_7_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_288__LinkLevel_7_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_288__LinkLevel_7_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_288__LinkLevel_7_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_288__LinkLevel_7_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_288__LinkLevel_7_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_289__LinkLevel_7_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_289__LinkLevel_7_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_290__LinkLevel_7_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_290__LinkLevel_7_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_291__LinkLevel_7_Reserved_MASK 0xffffffff
+#define DPM_TABLE_291__LinkLevel_7_Reserved__SHIFT 0x0
+#define DPM_TABLE_292__ACPILevel_Flags_MASK 0xffffffff
+#define DPM_TABLE_292__ACPILevel_Flags__SHIFT 0x0
+#define DPM_TABLE_293__ACPILevel_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_293__ACPILevel_MinVddc__SHIFT 0x0
+#define DPM_TABLE_294__ACPILevel_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_294__ACPILevel_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_295__ACPILevel_SclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_295__ACPILevel_SclkFrequency__SHIFT 0x0
+#define DPM_TABLE_296__ACPILevel_padding_MASK 0xff
+#define DPM_TABLE_296__ACPILevel_padding__SHIFT 0x0
+#define DPM_TABLE_296__ACPILevel_DeepSleepDivId_MASK 0xff00
+#define DPM_TABLE_296__ACPILevel_DeepSleepDivId__SHIFT 0x8
+#define DPM_TABLE_296__ACPILevel_DisplayWatermark_MASK 0xff0000
+#define DPM_TABLE_296__ACPILevel_DisplayWatermark__SHIFT 0x10
+#define DPM_TABLE_296__ACPILevel_SclkDid_MASK 0xff000000
+#define DPM_TABLE_296__ACPILevel_SclkDid__SHIFT 0x18
+#define DPM_TABLE_297__ACPILevel_CgSpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_297__ACPILevel_CgSpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_298__ACPILevel_CgSpllFuncCntl2_MASK 0xffffffff
+#define DPM_TABLE_298__ACPILevel_CgSpllFuncCntl2__SHIFT 0x0
+#define DPM_TABLE_299__ACPILevel_CgSpllFuncCntl3_MASK 0xffffffff
+#define DPM_TABLE_299__ACPILevel_CgSpllFuncCntl3__SHIFT 0x0
+#define DPM_TABLE_300__ACPILevel_CgSpllFuncCntl4_MASK 0xffffffff
+#define DPM_TABLE_300__ACPILevel_CgSpllFuncCntl4__SHIFT 0x0
+#define DPM_TABLE_301__ACPILevel_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_301__ACPILevel_SpllSpreadSpectrum__SHIFT 0x0
+#define DPM_TABLE_302__ACPILevel_SpllSpreadSpectrum2_MASK 0xffffffff
+#define DPM_TABLE_302__ACPILevel_SpllSpreadSpectrum2__SHIFT 0x0
+#define DPM_TABLE_303__ACPILevel_CcPwrDynRm_MASK 0xffffffff
+#define DPM_TABLE_303__ACPILevel_CcPwrDynRm__SHIFT 0x0
+#define DPM_TABLE_304__ACPILevel_CcPwrDynRm1_MASK 0xffffffff
+#define DPM_TABLE_304__ACPILevel_CcPwrDynRm1__SHIFT 0x0
+#define DPM_TABLE_305__SclkStepSize_MASK 0xffffffff
+#define DPM_TABLE_305__SclkStepSize__SHIFT 0x0
+#define DPM_TABLE_306__Smio_0_MASK 0xffffffff
+#define DPM_TABLE_306__Smio_0__SHIFT 0x0
+#defi

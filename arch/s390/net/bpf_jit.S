@@ -1,119 +1,134 @@
-/*
- * BPF Jit compiler for s390, help functions.
- *
- * Copyright IBM Corp. 2012,2015
- *
- * Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>
- *	      Michael Holzheu <holzheu@linux.vnet.ibm.com>
- */
+DR	0xfffffa23
+#define LACDRC		BYTE_REF(LACDRC_ADDR)
 
-#include <linux/linkage.h>
-#include <asm/nospec-insn.h>
-#include "bpf_jit.h"
+#define LACDRC_ACDSLT	 0x80	/* Signal Source Select */
+#define LACDRC_ACD_MASK	 0x0f	/* Alternate Crystal Direction Control */
+#define LACDRC_ACD_SHIFT 0
 
 /*
- * Calling convention:
- * registers %r7-%r10, %r11,%r13, and %r15 are call saved
- *
- * Input (64 bit):
- *   %r3 (%b2) = offset into skb data
- *   %r6 (%b5) = return address
- *   %r7 (%b6) = skb pointer
- *   %r12      = skb data pointer
- *
- * Output:
- *   %r14= %b0 = return value (read skb value)
- *
- * Work registers: %r2,%r4,%r5,%r14
- *
- * skb_copy_bits takes 4 parameters:
- *   %r2 = skb pointer
- *   %r3 = offset into skb data
- *   %r4 = pointer to temp buffer
- *   %r5 = length to copy
- *   Return value in %r2: 0 = ok
- *
- * bpf_internal_load_pointer_neg_helper takes 3 parameters:
- *   %r2 = skb pointer
- *   %r3 = offset into data
- *   %r4 = length to copy
- *   Return value in %r2: Pointer to data
+ * LCD Pixel Clock Divider Register
  */
+#define LPXCD_ADDR	0xfffffa25
+#define LPXCD		BYTE_REF(LPXCD_ADDR)
 
-#define SKF_MAX_NEG_OFF	-0x200000	/* SKF_LL_OFF from filter.h */
+#define	LPXCD_PCD_MASK	0x3f 	/* Pixel Clock Divider */
+#define LPXCD_PCD_SHIFT	0
 
 /*
- * Load SIZE bytes from SKB
+ * LCD Clocking Control Register
  */
-#define sk_load_common(NAME, SIZE, LOAD)				\
-ENTRY(sk_load_##NAME);							\
-	ltgr	%r3,%r3;		/* Is offset negative? */	\
-	jl	sk_load_##NAME##_slow_neg;				\
-ENTRY(sk_load_##NAME##_pos);						\
-	aghi	%r3,SIZE;		/* Offset + SIZE */		\
-	clg	%r3,STK_OFF_HLEN(%r15);	/* Offset + SIZE > hlen? */	\
-	jh	sk_load_##NAME##_slow;					\
-	LOAD	%r14,-SIZE(%r3,%r12);	/* Get data from skb */		\
-	B_EX	OFF_OK,%r6;		/* Return */			\
-									\
-sk_load_##NAME##_slow:;							\
-	lgr	%r2,%r7;		/* Arg1 = skb pointer */	\
-	aghi	%r3,-SIZE;		/* Arg2 = offset */		\
-	la	%r4,STK_OFF_TMP(%r15);	/* Arg3 = temp bufffer */	\
-	lghi	%r5,SIZE;		/* Arg4 = size */		\
-	brasl	%r14,skb_copy_bits;	/* Get data from skb */		\
-	LOAD	%r14,STK_OFF_TMP(%r15);	/* Load from temp bufffer */	\
-	ltgr	%r2,%r2;		/* Set cc to (%r2 != 0) */	\
-	BR_EX	%r6;			/* Return */
+#define LCKCON_ADDR	0xfffffa27
+#define LCKCON		BYTE_REF(LCKCON_ADDR)
 
-sk_load_common(word, 4, llgf)	/* r14 = *(u32 *) (skb->data+offset) */
-sk_load_common(half, 2, llgh)	/* r14 = *(u16 *) (skb->data+offset) */
+#define LCKCON_DWS_MASK	 0x0f	/* Display Wait-State */
+#define LCKCON_DWS_SHIFT 0
+#define LCKCON_DWIDTH	 0x40	/* Display Memory Width  */
+#define LCKCON_LCDON	 0x80	/* Enable LCD Controller */
 
-	GEN_BR_THUNK %r6
-	GEN_B_THUNK OFF_OK,%r6
+/* '328-compatible definitions */
+#define LCKCON_DW_MASK  LCKCON_DWS_MASK
+#define LCKCON_DW_SHIFT LCKCON_DWS_SHIFT
+ 
+/*
+ * LCD Refresh Rate Adjustment Register 
+ */
+#define LRRA_ADDR	0xfffffa29
+#define LRRA		BYTE_REF(LRRA_ADDR)
 
 /*
- * Load 1 byte from SKB (optimized version)
+ * LCD Panning Offset Register
  */
-	/* r14 = *(u8 *) (skb->data+offset) */
-ENTRY(sk_load_byte)
-	ltgr	%r3,%r3			# Is offset negative?
-	jl	sk_load_byte_slow_neg
-ENTRY(sk_load_byte_pos)
-	clg	%r3,STK_OFF_HLEN(%r15)	# Offset >= hlen?
-	jnl	sk_load_byte_slow
-	llgc	%r14,0(%r3,%r12)	# Get byte from skb
-	B_EX	OFF_OK,%r6		# Return OK
+#define LPOSR_ADDR	0xfffffa2d
+#define LPOSR		BYTE_REF(LPOSR_ADDR)
 
-sk_load_byte_slow:
-	lgr	%r2,%r7			# Arg1 = skb pointer
-					# Arg2 = offset
-	la	%r4,STK_OFF_TMP(%r15)	# Arg3 = pointer to temp buffer
-	lghi	%r5,1			# Arg4 = size (1 byte)
-	brasl	%r14,skb_copy_bits	# Get data from skb
-	llgc	%r14,STK_OFF_TMP(%r15)	# Load result from temp buffer
-	ltgr	%r2,%r2			# Set cc to (%r2 != 0)
-	BR_EX	%r6			# Return cc
+#define LPOSR_POS_MASK	0x0f	/* Pixel Offset Code */
+#define LPOSR_POS_SHIFT	0
 
-#define sk_negative_common(NAME, SIZE, LOAD)				\
-sk_load_##NAME##_slow_neg:;						\
-	cgfi	%r3,SKF_MAX_NEG_OFF;					\
-	jl	bpf_error;						\
-	lgr	%r2,%r7;		/* Arg1 = skb pointer */	\
-					/* Arg2 = offset */		\
-	lghi	%r4,SIZE;		/* Arg3 = size */		\
-	brasl	%r14,bpf_internal_load_pointer_neg_helper;		\
-	ltgr	%r2,%r2;						\
-	jz	bpf_error;						\
-	LOAD	%r14,0(%r2);		/* Get data from pointer */	\
-	xr	%r3,%r3;		/* Set cc to zero */		\
-	BR_EX	%r6;			/* Return cc */
+/*
+ * LCD Frame Rate Control Modulation Register
+ */
+#define LFRCM_ADDR	0xfffffa31
+#define LFRCM		BYTE_REF(LFRCM_ADDR)
 
-sk_negative_common(word, 4, llgf)
-sk_negative_common(half, 2, llgh)
-sk_negative_common(byte, 1, llgc)
+#define LFRCM_YMOD_MASK	 0x0f	/* Vertical Modulation */
+#define LFRCM_YMOD_SHIFT 0
+#define LFRCM_XMOD_MASK	 0xf0	/* Horizontal Modulation */
+#define LFRCM_XMOD_SHIFT 4
 
-bpf_error:
-# force a return 0 from jit handler
-	ltgr	%r15,%r15	# Set condition code
-	BR_EX	%r6
+/*
+ * LCD Gray Palette Mapping Register
+ */
+#define LGPMR_ADDR	0xfffffa33
+#define LGPMR		BYTE_REF(LGPMR_ADDR)
+
+#define LGPMR_G1_MASK	0x0f
+#define LGPMR_G1_SHIFT	0
+#define LGPMR_G2_MASK	0xf0
+#define LGPMR_G2_SHIFT	4
+
+/* 
+ * PWM Contrast Control Register
+ */
+#define PWMR_ADDR	0xfffffa36
+#define PWMR		WORD_REF(PWMR_ADDR)
+
+#define PWMR_PW_MASK	0x00ff	/* Pulse Width */
+#define PWMR_PW_SHIFT	0
+#define PWMR_CCPEN	0x0100	/* Contrast Control Enable */
+#define PWMR_SRC_MASK	0x0600	/* Input Clock Source */
+#define   PWMR_SRC_LINE	  0x0000	/* Line Pulse  */
+#define   PWMR_SRC_PIXEL  0x0200	/* Pixel Clock */
+#define   PWMR_SRC_LCD    0x4000	/* LCD clock   */
+
+/**********
+ *
+ * 0xFFFFFBxx -- Real-Time Clock (RTC)
+ *
+ **********/
+
+/*
+ * RTC Hours Minutes and Seconds Register
+ */
+#define RTCTIME_ADDR	0xfffffb00
+#define RTCTIME		LONG_REF(RTCTIME_ADDR)
+
+#define RTCTIME_SECONDS_MASK	0x0000003f	/* Seconds */
+#define RTCTIME_SECONDS_SHIFT	0
+#define RTCTIME_MINUTES_MASK	0x003f0000	/* Minutes */
+#define RTCTIME_MINUTES_SHIFT	16
+#define RTCTIME_HOURS_MASK	0x1f000000	/* Hours */
+#define RTCTIME_HOURS_SHIFT	24
+
+/*
+ *  RTC Alarm Register 
+ */
+#define RTCALRM_ADDR    0xfffffb04
+#define RTCALRM         LONG_REF(RTCALRM_ADDR)
+
+#define RTCALRM_SECONDS_MASK    0x0000003f      /* Seconds */
+#define RTCALRM_SECONDS_SHIFT   0
+#define RTCALRM_MINUTES_MASK    0x003f0000      /* Minutes */
+#define RTCALRM_MINUTES_SHIFT   16
+#define RTCALRM_HOURS_MASK      0x1f000000      /* Hours */
+#define RTCALRM_HOURS_SHIFT     24
+
+/*
+ * Watchdog Timer Register 
+ */
+#define WATCHDOG_ADDR	0xfffffb0a
+#define WATCHDOG	WORD_REF(WATCHDOG_ADDR)
+
+#define WATCHDOG_EN	0x0001	/* Watchdog Enabled */
+#define WATCHDOG_ISEL	0x0002	/* Select the watchdog interrupt */
+#define WATCHDOG_INTF	0x0080	/* Watchdog interrupt occurred */
+#define WATCHDOG_CNT_MASK  0x0300	/* Watchdog Counter */
+#define WATCHDOG_CNT_SHIFT 8
+
+/*
+ * RTC Control Register
+ */
+#define RTCCTL_ADDR	0xfffffb0c
+#define RTCCTL		WORD_REF(RTCCTL_ADDR)
+
+#define RTCCTL_XTL	0x0020	/* Crystal Selection */
+#define RTCCT

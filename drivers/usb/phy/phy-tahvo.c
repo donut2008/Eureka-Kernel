@@ -1,464 +1,143 @@
-/*
- * Tahvo USB transceiver driver
- *
- * Copyright (C) 2005-2006 Nokia Corporation
- *
- * Parts copied from isp1301_omap.c.
- * Copyright (C) 2004 Texas Instruments
- * Copyright (C) 2004 David Brownell
- *
- * Original driver written by Juha Yrjölä, Tony Lindgren and Timo Teräs.
- * Modified for Retu/Tahvo MFD by Aaro Koskinen.
- *
- * This file is subject to the terms and conditions of the GNU General
- * Public License. See the file "COPYING" in the main directory of this
- * archive for more details.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
-
-#include <linux/io.h>
-#include <linux/clk.h>
-#include <linux/usb.h>
-#include <linux/extcon.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/usb/otg.h>
-#include <linux/mfd/retu.h>
-#include <linux/usb/gadget.h>
-#include <linux/platform_device.h>
-
-#define DRIVER_NAME     "tahvo-usb"
-
-#define TAHVO_REG_IDSR	0x02
-#define TAHVO_REG_USBR	0x06
-
-#define USBR_SLAVE_CONTROL	(1 << 8)
-#define USBR_VPPVIO_SW		(1 << 7)
-#define USBR_SPEED		(1 << 6)
-#define USBR_REGOUT		(1 << 5)
-#define USBR_MASTER_SW2		(1 << 4)
-#define USBR_MASTER_SW1		(1 << 3)
-#define USBR_SLAVE_SW		(1 << 2)
-#define USBR_NSUSPEND		(1 << 1)
-#define USBR_SEMODE		(1 << 0)
-
-#define TAHVO_MODE_HOST		0
-#define TAHVO_MODE_PERIPHERAL	1
-
-struct tahvo_usb {
-	struct platform_device	*pt_dev;
-	struct usb_phy		phy;
-	int			vbus_state;
-	struct mutex		serialize;
-	struct clk		*ick;
-	int			irq;
-	int			tahvo_mode;
-	struct extcon_dev	*extcon;
-};
-
-static const unsigned int tahvo_cable[] = {
-	EXTCON_USB,
-	EXTCON_USB_HOST,
-
-	EXTCON_NONE,
-};
-
-static ssize_t vbus_state_show(struct device *device,
-			       struct device_attribute *attr, char *buf)
-{
-	struct tahvo_usb *tu = dev_get_drvdata(device);
-	return sprintf(buf, "%s\n", tu->vbus_state ? "on" : "off");
-}
-static DEVICE_ATTR(vbus, 0444, vbus_state_show, NULL);
-
-static void check_vbus_state(struct tahvo_usb *tu)
-{
-	struct retu_dev *rdev = dev_get_drvdata(tu->pt_dev->dev.parent);
-	int reg, prev_state;
-
-	reg = retu_read(rdev, TAHVO_REG_IDSR);
-	if (reg & TAHVO_STAT_VBUS) {
-		switch (tu->phy.otg->state) {
-		case OTG_STATE_B_IDLE:
-			/* Enable the gadget driver */
-			if (tu->phy.otg->gadget)
-				usb_gadget_vbus_connect(tu->phy.otg->gadget);
-			tu->phy.otg->state = OTG_STATE_B_PERIPHERAL;
-			usb_phy_set_event(&tu->phy, USB_EVENT_ENUMERATED);
-			break;
-		case OTG_STATE_A_IDLE:
-			/*
-			 * Session is now valid assuming the USB hub is driving
-			 * Vbus.
-			 */
-			tu->phy.otg->state = OTG_STATE_A_HOST;
-			break;
-		default:
-			break;
-		}
-		dev_info(&tu->pt_dev->dev, "USB cable connected\n");
-	} else {
-		switch (tu->phy.otg->state) {
-		case OTG_STATE_B_PERIPHERAL:
-			if (tu->phy.otg->gadget)
-				usb_gadget_vbus_disconnect(tu->phy.otg->gadget);
-			tu->phy.otg->state = OTG_STATE_B_IDLE;
-			usb_phy_set_event(&tu->phy, USB_EVENT_NONE);
-			break;
-		case OTG_STATE_A_HOST:
-			tu->phy.otg->state = OTG_STATE_A_IDLE;
-			break;
-		default:
-			break;
-		}
-		dev_info(&tu->pt_dev->dev, "USB cable disconnected\n");
-	}
-
-	prev_state = tu->vbus_state;
-	tu->vbus_state = reg & TAHVO_STAT_VBUS;
-	if (prev_state != tu->vbus_state) {
-		extcon_set_cable_state_(tu->extcon, EXTCON_USB, tu->vbus_state);
-		sysfs_notify(&tu->pt_dev->dev.kobj, NULL, "vbus_state");
-	}
-}
-
-static void tahvo_usb_become_host(struct tahvo_usb *tu)
-{
-	struct retu_dev *rdev = dev_get_drvdata(tu->pt_dev->dev.parent);
-
-	extcon_set_cable_state_(tu->extcon, EXTCON_USB_HOST, true);
-
-	/* Power up the transceiver in USB host mode */
-	retu_write(rdev, TAHVO_REG_USBR, USBR_REGOUT | USBR_NSUSPEND |
-		   USBR_MASTER_SW2 | USBR_MASTER_SW1);
-	tu->phy.otg->state = OTG_STATE_A_IDLE;
-
-	check_vbus_state(tu);
-}
-
-static void tahvo_usb_stop_host(struct tahvo_usb *tu)
-{
-	tu->phy.otg->state = OTG_STATE_A_IDLE;
-}
-
-static void tahvo_usb_become_peripheral(struct tahvo_usb *tu)
-{
-	struct retu_dev *rdev = dev_get_drvdata(tu->pt_dev->dev.parent);
-
-	extcon_set_cable_state_(tu->extcon, EXTCON_USB_HOST, false);
-
-	/* Power up transceiver and set it in USB peripheral mode */
-	retu_write(rdev, TAHVO_REG_USBR, USBR_SLAVE_CONTROL | USBR_REGOUT |
-		   USBR_NSUSPEND | USBR_SLAVE_SW);
-	tu->phy.otg->state = OTG_STATE_B_IDLE;
-
-	check_vbus_state(tu);
-}
-
-static void tahvo_usb_stop_peripheral(struct tahvo_usb *tu)
-{
-	if (tu->phy.otg->gadget)
-		usb_gadget_vbus_disconnect(tu->phy.otg->gadget);
-	tu->phy.otg->state = OTG_STATE_B_IDLE;
-}
-
-static void tahvo_usb_power_off(struct tahvo_usb *tu)
-{
-	struct retu_dev *rdev = dev_get_drvdata(tu->pt_dev->dev.parent);
-
-	/* Disable gadget controller if any */
-	if (tu->phy.otg->gadget)
-		usb_gadget_vbus_disconnect(tu->phy.otg->gadget);
-
-	/* Power off transceiver */
-	retu_write(rdev, TAHVO_REG_USBR, 0);
-	tu->phy.otg->state = OTG_STATE_UNDEFINED;
-}
-
-static int tahvo_usb_set_suspend(struct usb_phy *dev, int suspend)
-{
-	struct tahvo_usb *tu = container_of(dev, struct tahvo_usb, phy);
-	struct retu_dev *rdev = dev_get_drvdata(tu->pt_dev->dev.parent);
-	u16 w;
-
-	dev_dbg(&tu->pt_dev->dev, "%s\n", __func__);
-
-	w = retu_read(rdev, TAHVO_REG_USBR);
-	if (suspend)
-		w &= ~USBR_NSUSPEND;
-	else
-		w |= USBR_NSUSPEND;
-	retu_write(rdev, TAHVO_REG_USBR, w);
-
-	return 0;
-}
-
-static int tahvo_usb_set_host(struct usb_otg *otg, struct usb_bus *host)
-{
-	struct tahvo_usb *tu = container_of(otg->usb_phy, struct tahvo_usb,
-					    phy);
-
-	dev_dbg(&tu->pt_dev->dev, "%s %p\n", __func__, host);
-
-	mutex_lock(&tu->serialize);
-
-	if (host == NULL) {
-		if (tu->tahvo_mode == TAHVO_MODE_HOST)
-			tahvo_usb_power_off(tu);
-		otg->host = NULL;
-		mutex_unlock(&tu->serialize);
-		return 0;
-	}
-
-	if (tu->tahvo_mode == TAHVO_MODE_HOST) {
-		otg->host = NULL;
-		tahvo_usb_become_host(tu);
-	}
-
-	otg->host = host;
-
-	mutex_unlock(&tu->serialize);
-
-	return 0;
-}
-
-static int tahvo_usb_set_peripheral(struct usb_otg *otg,
-				    struct usb_gadget *gadget)
-{
-	struct tahvo_usb *tu = container_of(otg->usb_phy, struct tahvo_usb,
-					    phy);
-
-	dev_dbg(&tu->pt_dev->dev, "%s %p\n", __func__, gadget);
-
-	mutex_lock(&tu->serialize);
-
-	if (!gadget) {
-		if (tu->tahvo_mode == TAHVO_MODE_PERIPHERAL)
-			tahvo_usb_power_off(tu);
-		tu->phy.otg->gadget = NULL;
-		mutex_unlock(&tu->serialize);
-		return 0;
-	}
-
-	tu->phy.otg->gadget = gadget;
-	if (tu->tahvo_mode == TAHVO_MODE_PERIPHERAL)
-		tahvo_usb_become_peripheral(tu);
-
-	mutex_unlock(&tu->serialize);
-
-	return 0;
-}
-
-static irqreturn_t tahvo_usb_vbus_interrupt(int irq, void *_tu)
-{
-	struct tahvo_usb *tu = _tu;
-
-	mutex_lock(&tu->serialize);
-	check_vbus_state(tu);
-	mutex_unlock(&tu->serialize);
-
-	return IRQ_HANDLED;
-}
-
-static ssize_t otg_mode_show(struct device *device,
-			     struct device_attribute *attr, char *buf)
-{
-	struct tahvo_usb *tu = dev_get_drvdata(device);
-
-	switch (tu->tahvo_mode) {
-	case TAHVO_MODE_HOST:
-		return sprintf(buf, "host\n");
-	case TAHVO_MODE_PERIPHERAL:
-		return sprintf(buf, "peripheral\n");
-	}
-
-	return -EINVAL;
-}
-
-static ssize_t otg_mode_store(struct device *device,
-			      struct device_attribute *attr,
-			      const char *buf, size_t count)
-{
-	struct tahvo_usb *tu = dev_get_drvdata(device);
-	int r;
-
-	mutex_lock(&tu->serialize);
-	if (count >= 4 && strncmp(buf, "host", 4) == 0) {
-		if (tu->tahvo_mode == TAHVO_MODE_PERIPHERAL)
-			tahvo_usb_stop_peripheral(tu);
-		tu->tahvo_mode = TAHVO_MODE_HOST;
-		if (tu->phy.otg->host) {
-			dev_info(device, "HOST mode: host controller present\n");
-			tahvo_usb_become_host(tu);
-		} else {
-			dev_info(device, "HOST mode: no host controller, powering off\n");
-			tahvo_usb_power_off(tu);
-		}
-		r = strlen(buf);
-	} else if (count >= 10 && strncmp(buf, "peripheral", 10) == 0) {
-		if (tu->tahvo_mode == TAHVO_MODE_HOST)
-			tahvo_usb_stop_host(tu);
-		tu->tahvo_mode = TAHVO_MODE_PERIPHERAL;
-		if (tu->phy.otg->gadget) {
-			dev_info(device, "PERIPHERAL mode: gadget driver present\n");
-			tahvo_usb_become_peripheral(tu);
-		} else {
-			dev_info(device, "PERIPHERAL mode: no gadget driver, powering off\n");
-			tahvo_usb_power_off(tu);
-		}
-		r = strlen(buf);
-	} else {
-		r = -EINVAL;
-	}
-	mutex_unlock(&tu->serialize);
-
-	return r;
-}
-static DEVICE_ATTR(otg_mode, 0644, otg_mode_show, otg_mode_store);
-
-static struct attribute *tahvo_attributes[] = {
-	&dev_attr_vbus.attr,
-	&dev_attr_otg_mode.attr,
-	NULL
-};
-
-static struct attribute_group tahvo_attr_group = {
-	.attrs = tahvo_attributes,
-};
-
-static int tahvo_usb_probe(struct platform_device *pdev)
-{
-	struct retu_dev *rdev = dev_get_drvdata(pdev->dev.parent);
-	struct tahvo_usb *tu;
-	int ret;
-
-	tu = devm_kzalloc(&pdev->dev, sizeof(*tu), GFP_KERNEL);
-	if (!tu)
-		return -ENOMEM;
-
-	tu->phy.otg = devm_kzalloc(&pdev->dev, sizeof(*tu->phy.otg),
-				   GFP_KERNEL);
-	if (!tu->phy.otg)
-		return -ENOMEM;
-
-	tu->pt_dev = pdev;
-
-	/* Default mode */
-#ifdef CONFIG_TAHVO_USB_HOST_BY_DEFAULT
-	tu->tahvo_mode = TAHVO_MODE_HOST;
-#else
-	tu->tahvo_mode = TAHVO_MODE_PERIPHERAL;
-#endif
-
-	mutex_init(&tu->serialize);
-
-	tu->ick = devm_clk_get(&pdev->dev, "usb_l4_ick");
-	if (!IS_ERR(tu->ick))
-		clk_enable(tu->ick);
-
-	/*
-	 * Set initial state, so that we generate kevents only on state changes.
-	 */
-	tu->vbus_state = retu_read(rdev, TAHVO_REG_IDSR) & TAHVO_STAT_VBUS;
-
-	tu->extcon = devm_extcon_dev_allocate(&pdev->dev, tahvo_cable);
-	if (IS_ERR(tu->extcon)) {
-		dev_err(&pdev->dev, "failed to allocate memory for extcon\n");
-		ret = PTR_ERR(tu->extcon);
-		goto err_disable_clk;
-	}
-
-	ret = devm_extcon_dev_register(&pdev->dev, tu->extcon);
-	if (ret) {
-		dev_err(&pdev->dev, "could not register extcon device: %d\n",
-			ret);
-		goto err_disable_clk;
-	}
-
-	/* Set the initial cable state. */
-	extcon_set_cable_state_(tu->extcon, EXTCON_USB_HOST,
-			       tu->tahvo_mode == TAHVO_MODE_HOST);
-	extcon_set_cable_state_(tu->extcon, EXTCON_USB, tu->vbus_state);
-
-	/* Create OTG interface */
-	tahvo_usb_power_off(tu);
-	tu->phy.dev = &pdev->dev;
-	tu->phy.otg->state = OTG_STATE_UNDEFINED;
-	tu->phy.label = DRIVER_NAME;
-	tu->phy.set_suspend = tahvo_usb_set_suspend;
-
-	tu->phy.otg->usb_phy = &tu->phy;
-	tu->phy.otg->set_host = tahvo_usb_set_host;
-	tu->phy.otg->set_peripheral = tahvo_usb_set_peripheral;
-
-	ret = usb_add_phy(&tu->phy, USB_PHY_TYPE_USB2);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "cannot register USB transceiver: %d\n",
-			ret);
-		goto err_disable_clk;
-	}
-
-	dev_set_drvdata(&pdev->dev, tu);
-
-	tu->irq = ret = platform_get_irq(pdev, 0);
-	if (ret < 0)
-		goto err_remove_phy;
-	ret = request_threaded_irq(tu->irq, NULL, tahvo_usb_vbus_interrupt,
-				   IRQF_ONESHOT,
-				   "tahvo-vbus", tu);
-	if (ret) {
-		dev_err(&pdev->dev, "could not register tahvo-vbus irq: %d\n",
-			ret);
-		goto err_remove_phy;
-	}
-
-	/* Attributes */
-	ret = sysfs_create_group(&pdev->dev.kobj, &tahvo_attr_group);
-	if (ret) {
-		dev_err(&pdev->dev, "cannot create sysfs group: %d\n", ret);
-		goto err_free_irq;
-	}
-
-	return 0;
-
-err_free_irq:
-	free_irq(tu->irq, tu);
-err_remove_phy:
-	usb_remove_phy(&tu->phy);
-err_disable_clk:
-	if (!IS_ERR(tu->ick))
-		clk_disable(tu->ick);
-
-	return ret;
-}
-
-static int tahvo_usb_remove(struct platform_device *pdev)
-{
-	struct tahvo_usb *tu = platform_get_drvdata(pdev);
-
-	sysfs_remove_group(&pdev->dev.kobj, &tahvo_attr_group);
-	free_irq(tu->irq, tu);
-	usb_remove_phy(&tu->phy);
-	if (!IS_ERR(tu->ick))
-		clk_disable(tu->ick);
-
-	return 0;
-}
-
-static struct platform_driver tahvo_usb_driver = {
-	.probe		= tahvo_usb_probe,
-	.remove		= tahvo_usb_remove,
-	.driver		= {
-		.name	= "tahvo-usb",
-	},
-};
-module_platform_driver(tahvo_usb_driver);
-
-MODULE_DESCRIPTION("Tahvo USB transceiver driver");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Juha Yrjölä, Tony Lindgren, and Timo Teräs");
-MODULE_AUTHOR("Aaro Koskinen <aaro.koskinen@iki.fi>");
+x0
+#define DPG_PIPE_ARBITRATION_CONTROL2__URGENCY_WEIGHT_MASK 0xffff0000
+#define DPG_PIPE_ARBITRATION_CONTROL2__URGENCY_WEIGHT__SHIFT 0x10
+#define DPG_WATERMARK_MASK_CONTROL__STUTTER_EXIT_SELF_REFRESH_WATERMARK_MASK_MASK 0x3
+#define DPG_WATERMARK_MASK_CONTROL__STUTTER_EXIT_SELF_REFRESH_WATERMARK_MASK__SHIFT 0x0
+#define DPG_WATERMARK_MASK_CONTROL__URGENCY_WATERMARK_MASK_MASK 0x300
+#define DPG_WATERMARK_MASK_CONTROL__URGENCY_WATERMARK_MASK__SHIFT 0x8
+#define DPG_WATERMARK_MASK_CONTROL__NB_PSTATE_CHANGE_WATERMARK_MASK_MASK 0x30000
+#define DPG_WATERMARK_MASK_CONTROL__NB_PSTATE_CHANGE_WATERMARK_MASK__SHIFT 0x10
+#define DPG_PIPE_URGENCY_CONTROL__URGENCY_LOW_WATERMARK_MASK 0xffff
+#define DPG_PIPE_URGENCY_CONTROL__URGENCY_LOW_WATERMARK__SHIFT 0x0
+#define DPG_PIPE_URGENCY_CONTROL__URGENCY_HIGH_WATERMARK_MASK 0xffff0000
+#define DPG_PIPE_URGENCY_CONTROL__URGENCY_HIGH_WATERMARK__SHIFT 0x10
+#define DPG_PIPE_DPM_CONTROL__DPM_ENABLE_MASK 0x1
+#define DPG_PIPE_DPM_CONTROL__DPM_ENABLE__SHIFT 0x0
+#define DPG_PIPE_DPM_CONTROL__MCLK_CHANGE_ENABLE_MASK 0x10
+#define DPG_PIPE_DPM_CONTROL__MCLK_CHANGE_ENABLE__SHIFT 0x4
+#define DPG_PIPE_DPM_CONTROL__MCLK_CHANGE_FORCE_ON_MASK 0x100
+#define DPG_PIPE_DPM_CONTROL__MCLK_CHANGE_FORCE_ON__SHIFT 0x8
+#define DPG_PIPE_DPM_CONTROL__MCLK_CHANGE_WATERMARK_MASK_MASK 0x3000
+#define DPG_PIPE_DPM_CONTROL__MCLK_CHANGE_WATERMARK_MASK__SHIFT 0xc
+#define DPG_PIPE_DPM_CONTROL__MCLK_CHANGE_WATERMARK_MASK 0xffff0000
+#define DPG_PIPE_DPM_CONTROL__MCLK_CHANGE_WATERMARK__SHIFT 0x10
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_ENABLE_MASK 0x1
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_ENABLE__SHIFT 0x0
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_IGNORE_CURSOR_MASK 0x10
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_IGNORE_CURSOR__SHIFT 0x4
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_IGNORE_ICON_MASK 0x20
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_IGNORE_ICON__SHIFT 0x5
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_IGNORE_VGA_MASK 0x40
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_IGNORE_VGA__SHIFT 0x6
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_IGNORE_FBC_MASK 0x80
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_IGNORE_FBC__SHIFT 0x7
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_WM_HIGH_FORCE_ON_MASK 0x100
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_WM_HIGH_FORCE_ON__SHIFT 0x8
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_WM_HIGH_EXCLUDES_VBLANK_MASK 0x200
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_WM_HIGH_EXCLUDES_VBLANK__SHIFT 0x9
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_URGENT_IN_NOT_SELF_REFRESH_MASK 0x400
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_URGENT_IN_NOT_SELF_REFRESH__SHIFT 0xa
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_SELF_REFRESH_FORCE_ON_MASK 0x800
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_SELF_REFRESH_FORCE_ON__SHIFT 0xb
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_EXIT_SELF_REFRESH_WATERMARK_MASK 0xffff0000
+#define DPG_PIPE_STUTTER_CONTROL__STUTTER_EXIT_SELF_REFRESH_WATERMARK__SHIFT 0x10
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_ENABLE_MASK 0x1
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_ENABLE__SHIFT 0x0
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_URGENT_DURING_REQUEST_MASK 0x10
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_URGENT_DURING_REQUEST__SHIFT 0x4
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_NOT_SELF_REFRESH_DURING_REQUEST_MASK 0x100
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_NOT_SELF_REFRESH_DURING_REQUEST__SHIFT 0x8
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_FORCE_ON_MASK 0x200
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_FORCE_ON__SHIFT 0x9
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_ALLOW_FOR_URGENT_MASK 0x400
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_ALLOW_FOR_URGENT__SHIFT 0xa
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_WATERMARK_MASK 0xffff0000
+#define DPG_PIPE_NB_PSTATE_CHANGE_CONTROL__NB_PSTATE_CHANGE_WATERMARK__SHIFT 0x10
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_ENABLE_NONLPTCH_MASK 0x1
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_ENABLE_NONLPTCH__SHIFT 0x0
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_IGNORE_CURSOR_NONLPTCH_MASK 0x10
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_IGNORE_CURSOR_NONLPTCH__SHIFT 0x4
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_IGNORE_ICON_NONLPTCH_MASK 0x20
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_IGNORE_ICON_NONLPTCH__SHIFT 0x5
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_IGNORE_VGA_NONLPTCH_MASK 0x40
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_IGNORE_VGA_NONLPTCH__SHIFT 0x6
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_IGNORE_FBC_NONLPTCH_MASK 0x80
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_IGNORE_FBC_NONLPTCH__SHIFT 0x7
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_WM_HIGH_FORCE_ON_NONLPTCH_MASK 0x100
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_WM_HIGH_FORCE_ON_NONLPTCH__SHIFT 0x8
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_WM_HIGH_EXCLUDES_VBLANK_NONLPTCH_MASK 0x200
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_WM_HIGH_EXCLUDES_VBLANK_NONLPTCH__SHIFT 0x9
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_URGENT_IN_NOT_SELF_REFRESH_NONLPTCH_MASK 0x400
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_URGENT_IN_NOT_SELF_REFRESH_NONLPTCH__SHIFT 0xa
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_SELF_REFRESH_FORCE_ON_NONLPTCH_MASK 0x800
+#define DPG_PIPE_STUTTER_CONTROL_NONLPTCH__STUTTER_SELF_REFRESH_FORCE_ON_NONLPTCH__SHIFT 0xb
+#define DPG_REPEATER_PROGRAM__REG_DPG_DMIFRC_REPEATER_MASK 0x7
+#define DPG_REPEATER_PROGRAM__REG_DPG_DMIFRC_REPEATER__SHIFT 0x0
+#define DPG_REPEATER_PROGRAM__REG_DMIFRC_DPG_REPEATER_MASK 0x70
+#define DPG_REPEATER_PROGRAM__REG_DMIFRC_DPG_REPEATER__SHIFT 0x4
+#define DPG_HW_DEBUG_A__DPG_HW_DEBUG_A_MASK 0xffffffff
+#define DPG_HW_DEBUG_A__DPG_HW_DEBUG_A__SHIFT 0x0
+#define DPG_HW_DEBUG_B__DPG_HW_DEBUG_B_MASK 0xffffffff
+#define DPG_HW_DEBUG_B__DPG_HW_DEBUG_B__SHIFT 0x0
+#define DPG_HW_DEBUG_11__DPG_HW_DEBUG_11_MASK 0x1
+#define DPG_HW_DEBUG_11__DPG_HW_DEBUG_11__SHIFT 0x0
+#define DPG_TEST_DEBUG_INDEX__DPG_TEST_DEBUG_INDEX_MASK 0xff
+#define DPG_TEST_DEBUG_INDEX__DPG_TEST_DEBUG_INDEX__SHIFT 0x0
+#define DPG_TEST_DEBUG_INDEX__DPG_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define DPG_TEST_DEBUG_INDEX__DPG_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define DPG_TEST_DEBUG_DATA__DPG_TEST_DEBUG_DATA_MASK 0xffffffff
+#define DPG_TEST_DEBUG_DATA__DPG_TEST_DEBUG_DATA__SHIFT 0x0
+#define AZROOT_IMMEDIATE_COMMAND_OUTPUT_INTERFACE_INDEX__IMMEDIATE_COMMAND_WRITE_MASK 0x1ffff
+#define AZROOT_IMMEDIATE_COMMAND_OUTPUT_INTERFACE_INDEX__IMMEDIATE_COMMAND_WRITE__SHIFT 0x0
+#define AZROOT_IMMEDIATE_COMMAND_OUTPUT_INTERFACE_DATA__IMMEDIATE_COMMAND_WRITE_MASK 0xffffffff
+#define AZROOT_IMMEDIATE_COMMAND_OUTPUT_INTERFACE_DATA__IMMEDIATE_COMMAND_WRITE__SHIFT 0x0
+#define AZALIA_F2_CODEC_ROOT_PARAMETER_VENDOR_AND_DEVICE_ID__AZALIA_CODEC_ROOT_PARAMETER_VENDOR_AND_DEVICE_ID_MASK 0xffffffff
+#define AZALIA_F2_CODEC_ROOT_PARAMETER_VENDOR_AND_DEVICE_ID__AZALIA_CODEC_ROOT_PARAMETER_VENDOR_AND_DEVICE_ID__SHIFT 0x0
+#define AZALIA_F2_CODEC_ROOT_PARAMETER_REVISION_ID__AZALIA_CODEC_ROOT_PARAMETER_REVISION_ID_MASK 0xffffffff
+#define AZALIA_F2_CODEC_ROOT_PARAMETER_REVISION_ID__AZALIA_CODEC_ROOT_PARAMETER_REVISION_ID__SHIFT 0x0
+#define AZALIA_F2_CODEC_ROOT_PARAMETER_SUBORDINATE_NODE_COUNT__AZALIA_CODEC_ROOT_PARAMETER_SUBORDINATE_NODE_COUNT_MASK 0xffffffff
+#define AZALIA_F2_CODEC_ROOT_PARAMETER_SUBORDINATE_NODE_COUNT__AZALIA_CODEC_ROOT_PARAMETER_SUBORDINATE_NODE_COUNT__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_SUBORDINATE_NODE_COUNT__AZALIA_CODEC_FUNCTION_PARAMETER_SUBORDINATE_NODE_COUNT_MASK 0xffffffff
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_SUBORDINATE_NODE_COUNT__AZALIA_CODEC_FUNCTION_PARAMETER_SUBORDINATE_NODE_COUNT__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_GROUP_TYPE__AZALIA_CODEC_FUNCTION_PARAMETER_GROUP_TYPE_MASK 0xffffffff
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_GROUP_TYPE__AZALIA_CODEC_FUNCTION_PARAMETER_GROUP_TYPE__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_RATE_CAPABILITIES_MASK 0xfff
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_RATE_CAPABILITIES__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_BIT_CAPABILITIES_MASK 0x1f0000
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_BIT_CAPABILITIES__SHIFT 0x10
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS__AZALIA_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS_MASK 0xffffffff
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS__AZALIA_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_POWER_STATES__AZALIA_CODEC_FUNCTION_PARAMETER_POWER_STATES_MASK 0x3fffffff
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_POWER_STATES__AZALIA_CODEC_FUNCTION_PARAMETER_POWER_STATES__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_POWER_STATES__CLKSTOP_MASK 0x40000000
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_POWER_STATES__CLKSTOP__SHIFT 0x1e
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_POWER_STATES__EPSS_MASK 0x80000000
+#define AZALIA_F2_CODEC_FUNCTION_PARAMETER_POWER_STATES__EPSS__SHIFT 0x1f
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_SET_MASK 0xf
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_SET__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_ACT_MASK 0xf0
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_ACT__SHIFT 0x4
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE__CLKSTOPOK_MASK 0x200
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE__CLKSTOPOK__SHIFT 0x9
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_SETTINGS_RESET_MASK 0x400
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_SETTINGS_RESET__SHIFT 0xa
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESET__CODEC_RESET_MASK 0x1
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESET__CODEC_RESET__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID__SUBSYSTEM_ID_BYTE0_MASK 0xff
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID__SUBSYSTEM_ID_BYTE0__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID__SUBSYSTEM_ID_BYTE1_MASK 0xff00
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID__SUBSYSTEM_ID_BYTE1__SHIFT 0x8
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID__SUBSYSTEM_ID_BYTE2_MASK 0xff0000
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID__SUBSYSTEM_ID_BYTE2__SHIFT 0x10
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID__SUBSYSTEM_ID_BYTE3_MASK 0xff000000
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID__SUBSYSTEM_ID_BYTE3__SHIFT 0x18
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_2__SUBSYSTEM_ID_BYTE1_MASK 0xff
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_2__SUBSYSTEM_ID_BYTE1__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_3__SUBSYSTEM_ID_BYTE2_MASK 0xff
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_3__SUBSYSTEM_ID_BYTE2__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_4__SUBSYSTEM_ID_BYTE3_MASK 0xff
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_4__SUBSYSTEM_ID_BYTE3__SHIFT 0x0
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_CONVERTER_SYNCHRONIZATION__CONVERTER_SYNCHRONIZATION_MASK 0x7f
+#define AZALIA_F2_CODEC_FUNCTION_CONTROL_CONVERTER_SYNCHRONIZATION__CONVERTER_SYNCHRONIZATION__SHIFT 0x0
+#define AZALIA_F0_CODEC_ROOT_PARAMETER_VENDOR_AND_DEVICE_ID__AZALIA_CODEC_ROOT_PARAMETER_VENDOR_AND_DEVICE_ID_MASK 0xffffffff
+#define AZALIA

@@ -1,57 +1,53 @@
+bal		_060LSP__cmp2_Dw_
+_060LSP__cmp2_Dw_:
+
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-4
+	movm.l		&0x3800,-(%sp)		# save d2-d4
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,CMP2_CC(%a6)
+	mov.l		0x8(%a6), %d2		# get regval
+
+	mov.w		([0xc,%a6],0x0),%d0
+	mov.w		([0xc,%a6],0x2),%d1
+
+	ext.l		%d0			# sign extend lo bnd
+	ext.l		%d1			# sign extend hi bnd
+
+# operation is a data register compare.
+# sign extend word to long so we can do simple longword compares.
+	ext.l		%d2			# sign extend data word
+	bra.w		l_cmp2_cmp		# go emulate compare
+
+	global		_060LSP__cmp2_Dl_
+_060LSP__cmp2_Dl_:
+
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-4
+	movm.l		&0x3800,-(%sp)		# save d2-d4
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,CMP2_CC(%a6)
+	mov.l		0x8(%a6), %d2		# get regval
+
+	mov.l		([0xc,%a6],0x0),%d0
+	mov.l		([0xc,%a6],0x4),%d1
+
 #
-# KVM configuration
+# To set the ccodes correctly:
+#	(1) save 'Z' bit from (Rn - lo)
+#	(2) save 'Z' and 'N' bits from ((hi - lo) - (Rn - hi))
+#	(3) keep 'X', 'N', and 'V' from before instruction
+#	(4) combine ccodes
 #
-source "virt/kvm/Kconfig"
+l_cmp2_cmp:
+	sub.l		%d0, %d2		# (Rn - lo)
+	mov.w		%cc, %d3		# fetch resulting ccodes
+	andi.b		&0x4, %d3		# keep 'Z' bit
+	sub.l		%d0, %d1		# (hi - lo)
+	cmp.l		%d1,%d2			# ((hi - lo) - (Rn - hi))
 
-menuconfig VIRTUALIZATION
-	def_bool y
-	prompt "KVM"
-	---help---
-	  Say Y here to get to see options for using your Linux host to run other
-	  operating systems inside virtual machines (guests).
-	  This option alone does not add any kernel code.
-
-	  If you say N, all options in this submenu will be skipped and disabled.
-
-if VIRTUALIZATION
-
-config KVM
-	def_tristate y
-	prompt "Kernel-based Virtual Machine (KVM) support"
-	depends on HAVE_KVM
-	select PREEMPT_NOTIFIERS
-	select HAVE_KVM_CPU_RELAX_INTERCEPT
-	select HAVE_KVM_EVENTFD
-	select KVM_ASYNC_PF
-	select KVM_ASYNC_PF_SYNC
-	select HAVE_KVM_IRQCHIP
-	select HAVE_KVM_IRQFD
-	select HAVE_KVM_IRQ_ROUTING
-	select SRCU
-	---help---
-	  Support hosting paravirtualized guest machines using the SIE
-	  virtualization capability on the mainframe. This should work
-	  on any 64bit machine.
-
-	  This module provides access to the hardware capabilities through
-	  a character device node named /dev/kvm.
-
-	  To compile this as a module, choose M here: the module
-	  will be called kvm.
-
-	  If unsure, say N.
-
-config KVM_S390_UCONTROL
-	bool "Userspace controlled virtual machines"
-	depends on KVM
-	---help---
-	  Allow CAP_SYS_ADMIN users to create KVM virtual machines that are
-	  controlled by userspace.
-
-	  If unsure, say N.
-
-# OK, it's a little counter-intuitive to do this, but it puts it neatly under
-# the virtualization menu.
-source drivers/vhost/Kconfig
-
-endif # VIRTUALIZATION
+	mov.w	

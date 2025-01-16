@@ -1,6 +1,5 @@
-#
-# TI Keystone SOC drivers
-#
-obj-$(CONFIG_KEYSTONE_NAVIGATOR_QMSS)	+= knav_qmss.o
-knav_qmss-y := knav_qmss_queue.o knav_qmss_acc.o
-obj-$(CONFIG_KEYSTONE_NAVIGATOR_DMA)	+= knav_dma.o
+YPASSVCLK_MASK 0x10
+#define GCK_DFS_BYPASS_CNTL__BYPASSVCLK__SHIFT 0x4
+#define GCK_DFS_BYPASS_CNTL__BYPASSDISPCLK_MASK 0x20
+#define GCK_DFS_BYPASS_CNTL__BYPASSDISPCLK__SHIFT 0x5
+#defi

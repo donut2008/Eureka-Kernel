@@ -1,3 +1,8 @@
-altera-stapl-objs = altera-lpt.o altera-jtag.o altera-comp.o altera.o
+_func__);
+		host->cmdq_ops->enable(host);
+	}
 
-obj-$(CONFIG_ALTERA_STAPL) += altera-stapl.o
+	mmc_put_card(card);
+
+	/* copy to user if data and response */
+	for (i

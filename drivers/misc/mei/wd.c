@@ -1,391 +1,324 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/device.h>
-#include <linux/sched.h>
-#include <linux/watchdog.h>
-
-#include <linux/mei.h>
-
-#include "mei_dev.h"
-#include "hbm.h"
-#include "client.h"
-
-static const u8 mei_start_wd_params[] = { 0x02, 0x12, 0x13, 0x10 };
-static const u8 mei_stop_wd_params[] = { 0x02, 0x02, 0x14, 0x10 };
-
-/*
- * AMT Watchdog Device
- */
-#define INTEL_AMT_WATCHDOG_ID "INTCAMT"
-
-/* UUIDs for AMT F/W clients */
-const uuid_le mei_wd_guid = UUID_LE(0x05B79A6F, 0x4628, 0x4D7F, 0x89,
-						0x9D, 0xA9, 0x15, 0x14, 0xCB,
-						0x32, 0xAB);
-
-static void mei_wd_set_start_timeout(struct mei_device *dev, u16 timeout)
-{
-	dev_dbg(dev->dev, "wd: set timeout=%d.\n", timeout);
-	memcpy(dev->wd_data, mei_start_wd_params, MEI_WD_HDR_SIZE);
-	memcpy(dev->wd_data + MEI_WD_HDR_SIZE, &timeout, sizeof(u16));
-}
-
-/**
- * mei_wd_host_init - connect to the watchdog client
- *
- * @dev: the device structure
- * @me_cl: me client
- *
- * Return: -ENOTTY if wd client cannot be found
- *         -EIO if write has failed
- *         0 on success
- */
-int mei_wd_host_init(struct mei_device *dev, struct mei_me_client *me_cl)
-{
-	struct mei_cl *cl = &dev->wd_cl;
-	int ret;
-
-	mei_cl_init(cl, dev);
-
-	dev->wd_timeout = MEI_WD_DEFAULT_TIMEOUT;
-	dev->wd_state = MEI_WD_IDLE;
-
-	ret = mei_cl_link(cl, MEI_WD_HOST_CLIENT_ID);
-	if (ret < 0) {
-		dev_info(dev->dev, "wd: failed link client\n");
-		return ret;
+| reg == 0x75 || reg == 0x77;
+	case nct6779:
+	case nct6791:
+	case nct6792:
+	case nct6793:
+		return reg == 0x150 || reg == 0x153 || reg == 0x155 ||
+		  ((reg & 0xfff0) == 0x4b0 && (reg & 0x000f) < 0x0b) ||
+		  reg == 0x402 ||
+		  reg == 0x63a || reg == 0x63c || reg == 0x63e ||
+		  reg == 0x640 || reg == 0x642 ||
+		  reg == 0x73 || reg == 0x75 || reg == 0x77 || reg == 0x79 ||
+		  reg == 0x7b || reg == 0x7d;
 	}
-
-	ret = mei_cl_connect(cl, me_cl, NULL);
-	if (ret) {
-		dev_err(dev->dev, "wd: failed to connect = %d\n", ret);
-		mei_cl_unlink(cl);
-		return ret;
-	}
-
-	ret = mei_watchdog_register(dev);
-	if (ret) {
-		mei_cl_disconnect(cl);
-		mei_cl_unlink(cl);
-	}
-	return ret;
-}
-
-/**
- * mei_wd_send - sends watch dog message to fw.
- *
- * @dev: the device structure
- *
- * Return: 0 if success,
- *	-EIO when message send fails
- *	-EINVAL when invalid message is to be sent
- *	-ENODEV on flow control failure
- */
-int mei_wd_send(struct mei_device *dev)
-{
-	struct mei_cl *cl = &dev->wd_cl;
-	struct mei_msg_hdr hdr;
-	int ret;
-
-	hdr.host_addr = cl->host_client_id;
-	hdr.me_addr = mei_cl_me_id(cl);
-	hdr.msg_complete = 1;
-	hdr.reserved = 0;
-	hdr.internal = 0;
-
-	if (!memcmp(dev->wd_data, mei_start_wd_params, MEI_WD_HDR_SIZE))
-		hdr.length = MEI_WD_START_MSG_SIZE;
-	else if (!memcmp(dev->wd_data, mei_stop_wd_params, MEI_WD_HDR_SIZE))
-		hdr.length = MEI_WD_STOP_MSG_SIZE;
-	else {
-		dev_err(dev->dev, "wd: invalid message is to be sent, aborting\n");
-		return -EINVAL;
-	}
-
-	ret = mei_write_message(dev, &hdr, dev->wd_data);
-	if (ret) {
-		dev_err(dev->dev, "wd: write message failed\n");
-		return ret;
-	}
-
-	ret = mei_cl_flow_ctrl_reduce(cl);
-	if (ret) {
-		dev_err(dev->dev, "wd: flow_ctrl_reduce failed.\n");
-		return ret;
-	}
-
-	return 0;
-}
-
-/**
- * mei_wd_stop - sends watchdog stop message to fw.
- *
- * @dev: the device structure
- *
- * Return: 0 if success
- * on error:
- *	-EIO    when message send fails
- *	-EINVAL when invalid message is to be sent
- *	-ETIME  on message timeout
- */
-int mei_wd_stop(struct mei_device *dev)
-{
-	struct mei_cl *cl = &dev->wd_cl;
-	int ret;
-
-	if (!mei_cl_is_connected(cl) ||
-	    dev->wd_state != MEI_WD_RUNNING)
-		return 0;
-
-	memcpy(dev->wd_data, mei_stop_wd_params, MEI_WD_STOP_MSG_SIZE);
-
-	dev->wd_state = MEI_WD_STOPPING;
-
-	ret = mei_cl_flow_ctrl_creds(cl);
-	if (ret < 0)
-		goto err;
-
-	if (ret && mei_hbuf_acquire(dev)) {
-		ret = mei_wd_send(dev);
-		if (ret)
-			goto err;
-		dev->wd_pending = false;
-	} else {
-		dev->wd_pending = true;
-	}
-
-	mutex_unlock(&dev->device_lock);
-
-	ret = wait_event_timeout(dev->wait_stop_wd,
-				dev->wd_state == MEI_WD_IDLE,
-				msecs_to_jiffies(MEI_WD_STOP_TIMEOUT));
-	mutex_lock(&dev->device_lock);
-	if (dev->wd_state != MEI_WD_IDLE) {
-		/* timeout */
-		ret = -ETIME;
-		dev_warn(dev->dev, "wd: stop failed to complete ret=%d\n", ret);
-		goto err;
-	}
-	dev_dbg(dev->dev, "wd: stop completed after %u msec\n",
-			MEI_WD_STOP_TIMEOUT - jiffies_to_msecs(ret));
-	return 0;
-err:
-	return ret;
-}
-
-/**
- * mei_wd_ops_start - wd start command from the watchdog core.
- *
- * @wd_dev: watchdog device struct
- *
- * Return: 0 if success, negative errno code for failure
- */
-static int mei_wd_ops_start(struct watchdog_device *wd_dev)
-{
-	struct mei_device *dev;
-	struct mei_cl *cl;
-	int err = -ENODEV;
-
-	dev = watchdog_get_drvdata(wd_dev);
-	if (!dev)
-		return -ENODEV;
-
-	cl = &dev->wd_cl;
-
-	mutex_lock(&dev->device_lock);
-
-	if (dev->dev_state != MEI_DEV_ENABLED) {
-		dev_dbg(dev->dev, "wd: dev_state != MEI_DEV_ENABLED  dev_state = %s\n",
-			mei_dev_state_str(dev->dev_state));
-		goto end_unlock;
-	}
-
-	if (!mei_cl_is_connected(cl)) {
-		cl_dbg(dev, cl, "MEI Driver is not connected to Watchdog Client\n");
-		goto end_unlock;
-	}
-
-	mei_wd_set_start_timeout(dev, dev->wd_timeout);
-
-	err = 0;
-end_unlock:
-	mutex_unlock(&dev->device_lock);
-	return err;
-}
-
-/**
- * mei_wd_ops_stop -  wd stop command from the watchdog core.
- *
- * @wd_dev: watchdog device struct
- *
- * Return: 0 if success, negative errno code for failure
- */
-static int mei_wd_ops_stop(struct watchdog_device *wd_dev)
-{
-	struct mei_device *dev;
-
-	dev = watchdog_get_drvdata(wd_dev);
-	if (!dev)
-		return -ENODEV;
-
-	mutex_lock(&dev->device_lock);
-	mei_wd_stop(dev);
-	mutex_unlock(&dev->device_lock);
-
-	return 0;
-}
-
-/**
- * mei_wd_ops_ping - wd ping command from the watchdog core.
- *
- * @wd_dev: watchdog device struct
- *
- * Return: 0 if success, negative errno code for failure
- */
-static int mei_wd_ops_ping(struct watchdog_device *wd_dev)
-{
-	struct mei_device *dev;
-	struct mei_cl *cl;
-	int ret;
-
-	dev = watchdog_get_drvdata(wd_dev);
-	if (!dev)
-		return -ENODEV;
-
-	cl = &dev->wd_cl;
-
-	mutex_lock(&dev->device_lock);
-
-	if (!mei_cl_is_connected(cl)) {
-		cl_err(dev, cl, "wd: not connected.\n");
-		ret = -ENODEV;
-		goto end;
-	}
-
-	dev->wd_state = MEI_WD_RUNNING;
-
-	ret = mei_cl_flow_ctrl_creds(cl);
-	if (ret < 0)
-		goto end;
-
-	/* Check if we can send the ping to HW*/
-	if (ret && mei_hbuf_acquire(dev)) {
-		dev_dbg(dev->dev, "wd: sending ping\n");
-
-		ret = mei_wd_send(dev);
-		if (ret)
-			goto end;
-		dev->wd_pending = false;
-	} else {
-		dev->wd_pending = true;
-	}
-
-end:
-	mutex_unlock(&dev->device_lock);
-	return ret;
-}
-
-/**
- * mei_wd_ops_set_timeout - wd set timeout command from the watchdog core.
- *
- * @wd_dev: watchdog device struct
- * @timeout: timeout value to set
- *
- * Return: 0 if success, negative errno code for failure
- */
-static int mei_wd_ops_set_timeout(struct watchdog_device *wd_dev,
-		unsigned int timeout)
-{
-	struct mei_device *dev;
-
-	dev = watchdog_get_drvdata(wd_dev);
-	if (!dev)
-		return -ENODEV;
-
-	/* Check Timeout value */
-	if (timeout < MEI_WD_MIN_TIMEOUT || timeout > MEI_WD_MAX_TIMEOUT)
-		return -EINVAL;
-
-	mutex_lock(&dev->device_lock);
-
-	dev->wd_timeout = timeout;
-	wd_dev->timeout = timeout;
-	mei_wd_set_start_timeout(dev, dev->wd_timeout);
-
-	mutex_unlock(&dev->device_lock);
-
-	return 0;
+	return false;
 }
 
 /*
- * Watchdog Device structs
+ * On older chips, only registers 0x50-0x5f are banked.
+ * On more recent chips, all registers are banked.
+ * Assume that is the case and set the bank number for each access.
+ * Cache the bank number so it only needs to be set if it changes.
  */
-static const struct watchdog_ops wd_ops = {
-		.owner = THIS_MODULE,
-		.start = mei_wd_ops_start,
-		.stop = mei_wd_ops_stop,
-		.ping = mei_wd_ops_ping,
-		.set_timeout = mei_wd_ops_set_timeout,
-};
-static const struct watchdog_info wd_info = {
-		.identity = INTEL_AMT_WATCHDOG_ID,
-		.options = WDIOF_KEEPALIVEPING |
-			   WDIOF_SETTIMEOUT |
-			   WDIOF_ALARMONLY,
-};
-
-static struct watchdog_device amt_wd_dev = {
-		.info = &wd_info,
-		.ops = &wd_ops,
-		.timeout = MEI_WD_DEFAULT_TIMEOUT,
-		.min_timeout = MEI_WD_MIN_TIMEOUT,
-		.max_timeout = MEI_WD_MAX_TIMEOUT,
-};
-
-
-int mei_watchdog_register(struct mei_device *dev)
+static inline void nct6775_set_bank(struct nct6775_data *data, u16 reg)
 {
+	u8 bank = reg >> 8;
 
-	int ret;
-
-	amt_wd_dev.parent = dev->dev;
-	/* unlock to perserve correct locking order */
-	mutex_unlock(&dev->device_lock);
-	ret = watchdog_register_device(&amt_wd_dev);
-	mutex_lock(&dev->device_lock);
-	if (ret) {
-		dev_err(dev->dev, "wd: unable to register watchdog device = %d.\n",
-			ret);
-		return ret;
+	if (data->bank != bank) {
+		outb_p(NCT6775_REG_BANK, data->addr + ADDR_REG_OFFSET);
+		outb_p(bank, data->addr + DATA_REG_OFFSET);
+		data->bank = bank;
 	}
+}
 
-	dev_dbg(dev->dev, "wd: successfully register watchdog interface.\n");
-	watchdog_set_drvdata(&amt_wd_dev, dev);
+static u16 nct6775_read_value(struct nct6775_data *data, u16 reg)
+{
+	int res, word_sized = is_word_sized(data, reg);
+
+	nct6775_set_bank(data, reg);
+	outb_p(reg & 0xff, data->addr + ADDR_REG_OFFSET);
+	res = inb_p(data->addr + DATA_REG_OFFSET);
+	if (word_sized) {
+		outb_p((reg & 0xff) + 1,
+		       data->addr + ADDR_REG_OFFSET);
+		res = (res << 8) + inb_p(data->addr + DATA_REG_OFFSET);
+	}
+	return res;
+}
+
+static int nct6775_write_value(struct nct6775_data *data, u16 reg, u16 value)
+{
+	int word_sized = is_word_sized(data, reg);
+
+	nct6775_set_bank(data, reg);
+	outb_p(reg & 0xff, data->addr + ADDR_REG_OFFSET);
+	if (word_sized) {
+		outb_p(value >> 8, data->addr + DATA_REG_OFFSET);
+		outb_p((reg & 0xff) + 1,
+		       data->addr + ADDR_REG_OFFSET);
+	}
+	outb_p(value & 0xff, data->addr + DATA_REG_OFFSET);
 	return 0;
 }
 
-void mei_watchdog_unregister(struct mei_device *dev)
+/* We left-align 8-bit temperature values to make the code simpler */
+static u16 nct6775_read_temp(struct nct6775_data *data, u16 reg)
 {
-	if (watchdog_get_drvdata(&amt_wd_dev) == NULL)
+	u16 res;
+
+	res = nct6775_read_value(data, reg);
+	if (!is_word_sized(data, reg))
+		res <<= 8;
+
+	return res;
+}
+
+static int nct6775_write_temp(struct nct6775_data *data, u16 reg, u16 value)
+{
+	if (!is_word_sized(data, reg))
+		value >>= 8;
+	return nct6775_write_value(data, reg, value);
+}
+
+/* This function assumes that the caller holds data->update_lock */
+static void nct6775_write_fan_div(struct nct6775_data *data, int nr)
+{
+	u8 reg;
+
+	switch (nr) {
+	case 0:
+		reg = (nct6775_read_value(data, NCT6775_REG_FANDIV1) & 0x70)
+		    | (data->fan_div[0] & 0x7);
+		nct6775_write_value(data, NCT6775_REG_FANDIV1, reg);
+		break;
+	case 1:
+		reg = (nct6775_read_value(data, NCT6775_REG_FANDIV1) & 0x7)
+		    | ((data->fan_div[1] << 4) & 0x70);
+		nct6775_write_value(data, NCT6775_REG_FANDIV1, reg);
+		break;
+	case 2:
+		reg = (nct6775_read_value(data, NCT6775_REG_FANDIV2) & 0x70)
+		    | (data->fan_div[2] & 0x7);
+		nct6775_write_value(data, NCT6775_REG_FANDIV2, reg);
+		break;
+	case 3:
+		reg = (nct6775_read_value(data, NCT6775_REG_FANDIV2) & 0x7)
+		    | ((data->fan_div[3] << 4) & 0x70);
+		nct6775_write_value(data, NCT6775_REG_FANDIV2, reg);
+		break;
+	}
+}
+
+static void nct6775_write_fan_div_common(struct nct6775_data *data, int nr)
+{
+	if (data->kind == nct6775)
+		nct6775_write_fan_div(data, nr);
+}
+
+static void nct6775_update_fan_div(struct nct6775_data *data)
+{
+	u8 i;
+
+	i = nct6775_read_value(data, NCT6775_REG_FANDIV1);
+	data->fan_div[0] = i & 0x7;
+	data->fan_div[1] = (i & 0x70) >> 4;
+	i = nct6775_read_value(data, NCT6775_REG_FANDIV2);
+	data->fan_div[2] = i & 0x7;
+	if (data->has_fan & (1 << 3))
+		data->fan_div[3] = (i & 0x70) >> 4;
+}
+
+static void nct6775_update_fan_div_common(struct nct6775_data *data)
+{
+	if (data->kind == nct6775)
+		nct6775_update_fan_div(data);
+}
+
+static void nct6775_init_fan_div(struct nct6775_data *data)
+{
+	int i;
+
+	nct6775_update_fan_div_common(data);
+	/*
+	 * For all fans, start with highest divider value if the divider
+	 * register is not initialized. This ensures that we get a
+	 * reading from the fan count register, even if it is not optimal.
+	 * We'll compute a better divider later on.
+	 */
+	for (i = 0; i < ARRAY_SIZE(data->fan_div); i++) {
+		if (!(data->has_fan & (1 << i)))
+			continue;
+		if (data->fan_div[i] == 0) {
+			data->fan_div[i] = 7;
+			nct6775_write_fan_div_common(data, i);
+		}
+	}
+}
+
+static void nct6775_init_fan_common(struct device *dev,
+				    struct nct6775_data *data)
+{
+	int i;
+	u8 reg;
+
+	if (data->has_fan_div)
+		nct6775_init_fan_div(data);
+
+	/*
+	 * If fan_min is not set (0), set it to 0xff to disable it. This
+	 * prevents the unnecessary warning when fanX_min is reported as 0.
+	 */
+	for (i = 0; i < ARRAY_SIZE(data->fan_min); i++) {
+		if (data->has_fan_min & (1 << i)) {
+			reg = nct6775_read_value(data, data->REG_FAN_MIN[i]);
+			if (!reg)
+				nct6775_write_value(data, data->REG_FAN_MIN[i],
+						    data->has_fan_div ? 0xff
+								      : 0xff1f);
+		}
+	}
+}
+
+static void nct6775_select_fan_div(struct device *dev,
+				   struct nct6775_data *data, int nr, u16 reg)
+{
+	u8 fan_div = data->fan_div[nr];
+	u16 fan_min;
+
+	if (!data->has_fan_div)
 		return;
 
-	watchdog_set_drvdata(&amt_wd_dev, NULL);
-	watchdog_unregister_device(&amt_wd_dev);
+	/*
+	 * If we failed to measure the fan speed, or the reported value is not
+	 * in the optimal range, and the clock divider can be modified,
+	 * let's try that for next time.
+	 */
+	if (reg == 0x00 && fan_div < 0x07)
+		fan_div++;
+	else if (reg != 0x00 && reg < 0x30 && fan_div > 0)
+		fan_div--;
+
+	if (fan_div != data->fan_div[nr]) {
+		dev_dbg(dev, "Modifying fan%d clock divider from %u to %u\n",
+			nr + 1, div_from_reg(data->fan_div[nr]),
+			div_from_reg(fan_div));
+
+		/* Preserve min limit if possible */
+		if (data->has_fan_min & (1 << nr)) {
+			fan_min = data->fan_min[nr];
+			if (fan_div > data->fan_div[nr]) {
+				if (fan_min != 255 && fan_min > 1)
+					fan_min >>= 1;
+			} else {
+				if (fan_min != 255) {
+					fan_min <<= 1;
+					if (fan_min > 254)
+						fan_min = 254;
+				}
+			}
+			if (fan_min != data->fan_min[nr]) {
+				data->fan_min[nr] = fan_min;
+				nct6775_write_value(data, data->REG_FAN_MIN[nr],
+						    fan_min);
+			}
+		}
+		data->fan_div[nr] = fan_div;
+		nct6775_write_fan_div_common(data, nr);
+	}
 }
 
+static void nct6775_update_pwm(struct device *dev)
+{
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	int i, j;
+	int fanmodecfg, reg;
+	bool duty_is_dc;
+
+	for (i = 0; i < data->pwm_num; i++) {
+		if (!(data->has_pwm & (1 << i)))
+			continue;
+
+		duty_is_dc = data->REG_PWM_MODE[i] &&
+		  (nct6775_read_value(data, data->REG_PWM_MODE[i])
+		   & data->PWM_MODE_MASK[i]);
+		data->pwm_mode[i] = !duty_is_dc;
+
+		fanmodecfg = nct6775_read_value(data, data->REG_FAN_MODE[i]);
+		for (j = 0; j < ARRAY_SIZE(data->REG_PWM); j++) {
+			if (data->REG_PWM[j] && data->REG_PWM[j][i]) {
+				data->pwm[j][i]
+				  = nct6775_read_value(data,
+						       data->REG_PWM[j][i]);
+			}
+		}
+
+		data->pwm_enable[i] = reg_to_pwm_enable(data->pwm[0][i],
+							(fanmodecfg >> 4) & 7);
+
+		if (!data->temp_tolerance[0][i] ||
+		    data->pwm_enable[i] != speed_cruise)
+			data->temp_tolerance[0][i] = fanmodecfg & 0x0f;
+		if (!data->target_speed_tolerance[i] ||
+		    data->pwm_enable[i] == speed_cruise) {
+			u8 t = fanmodecfg & 0x0f;
+
+			if (data->REG_TOLERANCE_H) {
+				t |= (nct6775_read_value(data,
+				      data->REG_TOLERANCE_H[i]) & 0x70) >> 1;
+			}
+			data->target_speed_tolerance[i] = t;
+		}
+
+		data->temp_tolerance[1][i] =
+			nct6775_read_value(data,
+					data->REG_CRITICAL_TEMP_TOLERANCE[i]);
+
+		reg = nct6775_read_value(data, data->REG_TEMP_SEL[i]);
+		data->pwm_temp_sel[i] = reg & 0x1f;
+		/* If fan can stop, report floor as 0 */
+		if (reg & 0x80)
+			data->pwm[2][i] = 0;
+
+		if (!data->REG_WEIGHT_TEMP_SEL[i])
+			continue;
+
+		reg = nct6775_read_value(data, data->REG_WEIGHT_TEMP_SEL[i]);
+		data->pwm_weight_temp_sel[i] = reg & 0x1f;
+		/* If weight is disabled, report weight source as 0 */
+		if (j == 1 && !(reg & 0x80))
+			data->pwm_weight_temp_sel[i] = 0;
+
+		/* Weight temp data */
+		for (j = 0; j < ARRAY_SIZE(data->weight_temp); j++) {
+			data->weight_temp[j][i]
+			  = nct6775_read_value(data,
+					       data->REG_WEIGHT_TEMP[j][i]);
+		}
+	}
+}
+
+static void nct6775_update_pwm_limits(struct device *dev)
+{
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	int i, j;
+	u8 reg;
+	u16 reg_t;
+
+	for (i = 0; i < data->pwm_num; i++) {
+		if (!(data->has_pwm & (1 << i)))
+			continue;
+
+		for (j = 0; j < ARRAY_SIZE(data->fan_time); j++) {
+			data->fan_time[j][i] =
+			  nct6775_read_value(data, data->REG_FAN_TIME[j][i]);
+		}
+
+		reg_t = nct6775_read_value(data, data->REG_TARGET[i]);
+		/* Update only in matching mode or if never updated */
+		if (!data->target_temp[i] ||
+		    data->pwm_enable[i] == thermal_cruise)
+			data->target_temp[i] = reg_t & data->target_temp_mask;
+		if (!data->target_speed[i] ||
+		    data->pwm_enable[i] == speed_cruise) {
+			if (data->REG_TOLERANCE_H) {
+			

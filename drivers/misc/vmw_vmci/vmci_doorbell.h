@@ -1,51 +1,31 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#ifndef VMCI_DOORBELL_H
-#define VMCI_DOORBELL_H
-
-#include <linux/vmw_vmci_defs.h>
-#include <linux/types.h>
-
-#include "vmci_driver.h"
-
-/*
- * VMCINotifyResourceInfo: Used to create and destroy doorbells, and
- * generate a notification for a doorbell or queue pair.
- */
-struct vmci_dbell_notify_resource_info {
-	struct vmci_handle handle;
-	u16 resource;
-	u16 action;
-	s32 result;
-};
-
-/*
- * Structure used for checkpointing the doorbell mappings. It is
- * written to the checkpoint as is, so changing this structure will
- * break checkpoint compatibility.
- */
-struct dbell_cpt_state {
-	struct vmci_handle handle;
-	u64 bitmap_idx;
-};
-
-int vmci_dbell_host_context_notify(u32 src_cid, struct vmci_handle handle);
-int vmci_dbell_get_priv_flags(struct vmci_handle handle, u32 *priv_flags);
-
-bool vmci_dbell_register_notification_bitmap(u32 bitmap_ppn);
-void vmci_dbell_scan_notification_entries(u8 *bitmap);
-
-#endif /* VMCI_DOORBELL_H */
+ffffff
+#define PCIE_TLP_PREFIX_LOG2__TLP_PREFIX__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG3__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG3__TLP_PREFIX__SHIFT 0x0
+#define PCIE_BAR_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_BAR_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_BAR_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_BAR_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_BAR_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_BAR_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_BAR1_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR1_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR1_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR1_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR1_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR1_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR1_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR1_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR2_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR2_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR2_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR2_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR2_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR2_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR2_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR2_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR3_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR3_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR3_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR3_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR3_CNTL__BAR_TOTAL_NUM

@@ -1,13 +1,1 @@
-#
-# PPS generators configuration
-#
-
-comment "PPS generators support"
-
-config PPS_GENERATOR_PARPORT
-	tristate "Parallel port PPS signal generator"
-	depends on PARPORT && BROKEN
-	help
-	  If you say yes here you get support for a PPS signal generator which
-	  utilizes STROBE pin of a parallel port to send PPS signals. It uses
-	  parport abstraction layer and hrtimers to precisely control the signal.
+êQª_"„T)‘¤ºð7ÀS¢«˜±è¢R1sÙª÷AÄè.‰2IŸ#žñ±mè+ ú¥ ü8RAÿ[•4–l$"*‚TÝVéŽÚ¦	Ýdx$©hüý´!^#Žã4$!3†‚‘° “æÂJuÂHGT—ho†}¡e„q¥Ó$kªÐ&îÂÀÏÈ[,~#½9$ß6ÐÓ™ŸeÃŒ8¦¾3Ôb¹LúÕª’#P³×”jãÒGZç•§©6ÍÕ‰£/¢bÑ¤á)ÞBm8Lùƒ£§‹Í>Ì¡A¤+ã£ç¾-‘Ç~6‹p¶'ž¨ÚÈyÎ6ÆÊÛÊ1Žpè©#Ô­cÊU Â´ˆ…ÎEXÞçó®\šîÈ|.?î§Mõý(**Ü’’^;ºÍEƒ÷ÍÁóäGé(„ëdcá”«Ì•X‡n>ä ¼±FÙþß7QCÝ]îfYkk°·Ø%_êÿÝá¶š‰Ž‡·c©†?ÌgUáI±tŽ­ÅÓbiQÏy@ž«d$

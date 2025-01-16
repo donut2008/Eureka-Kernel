@@ -1,3200 +1,2790 @@
-/*
- * Copyright (c) 2007 Mellanox Technologies. All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
- */
+ckdep et al. */
+		up(&fs_info->uuid_tree_rescan_sem);
 
-#include <linux/etherdevice.h>
-#include <linux/tcp.h>
-#include <linux/if_vlan.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
-#include <linux/hash.h>
-#include <net/ip.h>
-#include <net/busy_poll.h>
-#include <net/vxlan.h>
+		sb->s_flags |= MS_RDONLY;
 
-#include <linux/mlx4/driver.h>
-#include <linux/mlx4/device.h>
-#include <linux/mlx4/cmd.h>
-#include <linux/mlx4/cq.h>
+		/*
+		 * Setting MS_RDONLY will put the cleaner thread to
+		 * sleep at the next loop if it's already active.
+		 * If it's already asleep, we'll leave unused block
+		 * groups on disk until we're mounted read-write again
+		 * unless we clean them up here.
+		 */
+		btrfs_delete_unused_bgs(fs_info);
 
-#include "mlx4_en.h"
-#include "en_port.h"
+		btrfs_dev_replace_suspend_for_unmount(fs_info);
+		btrfs_scrub_cancel(fs_info);
+		btrfs_pause_balance(fs_info);
 
-int mlx4_en_setup_tc(struct net_device *dev, u8 up)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	int i;
-	unsigned int offset = 0;
+		ret = btrfs_commit_super(root);
+		if (ret)
+			goto restore;
+	} else {
+		if (test_bit(BTRFS_FS_STATE_ERROR, &root->fs_info->fs_state)) {
+			btrfs_err(fs_info,
+				"Remounting read-write after error is not allowed");
+			ret = -EINVAL;
+			goto restore;
+		}
+		if (fs_info->fs_devices->rw_devices == 0) {
+			ret = -EACCES;
+			goto restore;
+		}
 
-	if (up && up != MLX4_EN_NUM_UP)
-		return -EINVAL;
+		if (fs_info->fs_devices->missing_devices >
+		     fs_info->num_tolerated_disk_barrier_failures &&
+		    !(*flags & MS_RDONLY)) {
+			btrfs_warn(fs_info,
+				"too many missing devices, writeable remount is not allowed");
+			ret = -EACCES;
+			goto restore;
+		}
 
-	netdev_set_num_tc(dev, up);
+		if (btrfs_super_log_root(fs_info->super_copy) != 0) {
+			btrfs_warn(fs_info,
+		"mount required to replay tree-log, cannot remount read-write");
+			ret = -EINVAL;
+			goto restore;
+		}
 
-	/* Partition Tx queues evenly amongst UP's */
-	for (i = 0; i < up; i++) {
-		netdev_set_tc_queue(dev, i, priv->num_tx_rings_p_up, offset);
-		offset += priv->num_tx_rings_p_up;
+		ret = btrfs_cleanup_fs_roots(fs_info);
+		if (ret)
+			goto restore;
+
+		/* recover relocation */
+		mutex_lock(&fs_info->cleaner_mutex);
+		ret = btrfs_recover_relocation(root);
+		mutex_unlock(&fs_info->cleaner_mutex);
+		if (ret)
+			goto restore;
+
+		ret = btrfs_resume_balance_async(fs_info);
+		if (ret)
+			goto restore;
+
+		ret = btrfs_resume_dev_replace_async(fs_info);
+		if (ret) {
+			btrfs_warn(fs_info, "failed to resume dev_replace");
+			goto restore;
+		}
+
+		btrfs_qgroup_rescan_resume(fs_info);
+
+		if (!fs_info->uuid_root) {
+			btrfs_info(fs_info, "creating UUID tree");
+			ret = btrfs_create_uuid_tree(fs_info);
+			if (ret) {
+				btrfs_warn(fs_info, "failed to create the UUID tree %d", ret);
+				goto restore;
+			}
+		}
+		sb->s_flags &= ~MS_RDONLY;
 	}
+out:
+	wake_up_process(fs_info->transaction_kthread);
+	btrfs_remount_cleanup(fs_info, old_opts);
+	return 0;
 
+restore:
+	/* We've hit an error - don't reset MS_RDONLY */
+	if (sb->s_flags & MS_RDONLY)
+		old_flags |= MS_RDONLY;
+	sb->s_flags = old_flags;
+	fs_info->mount_opt = old_opts;
+	fs_info->compress_type = old_compress_type;
+	fs_info->max_inline = old_max_inline;
+	mutex_lock(&fs_info->chunk_mutex);
+	fs_info->alloc_start = old_alloc_start;
+	mutex_unlock(&fs_info->chunk_mutex);
+	btrfs_resize_thread_pool(fs_info,
+		old_thread_pool_size, fs_info->thread_pool_size);
+	fs_info->metadata_ratio = old_metadata_ratio;
+	btrfs_remount_cleanup(fs_info, old_opts);
+	return ret;
+}
+
+/* Used to sort the devices by max_avail(descending sort) */
+static int btrfs_cmp_device_free_bytes(const void *dev_info1,
+				       const void *dev_info2)
+{
+	if (((struct btrfs_device_info *)dev_info1)->max_avail >
+	    ((struct btrfs_device_info *)dev_info2)->max_avail)
+		return -1;
+	else if (((struct btrfs_device_info *)dev_info1)->max_avail <
+		 ((struct btrfs_device_info *)dev_info2)->max_avail)
+		return 1;
+	else
 	return 0;
 }
 
-#ifdef CONFIG_NET_RX_BUSY_POLL
-/* must be called with local_bh_disable()d */
-static int mlx4_en_low_latency_recv(struct napi_struct *napi)
+/*
+ * sort the devices by max_avail, in which max free extent size of each device
+ * is stored.(Descending Sort)
+ */
+static inline void btrfs_descending_sort_devices(
+					struct btrfs_device_info *devices,
+					size_t nr_devices)
 {
-	struct mlx4_en_cq *cq = container_of(napi, struct mlx4_en_cq, napi);
-	struct net_device *dev = cq->dev;
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_rx_ring *rx_ring = priv->rx_ring[cq->ring];
-	int done;
+	sort(devices, nr_devices, sizeof(struct btrfs_device_info),
+	     btrfs_cmp_device_free_bytes, NULL);
+}
 
-	if (!priv->port_up)
-		return LL_FLUSH_FAILED;
+/*
+ * The helper to calc the free space on the devices that can be used to store
+ * file data.
+ */
+static int btrfs_calc_avail_data_space(struct btrfs_root *root, u64 *free_bytes)
+{
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct btrfs_device_info *devices_info;
+	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
+	struct btrfs_device *device;
+	u64 skip_space;
+	u64 type;
+	u64 avail_space;
+	u64 used_space;
+	u64 min_stripe_size;
+	int min_stripes = 1, num_stripes = 1;
+	int i = 0, nr_devices;
+	int ret;
 
-	if (!mlx4_en_cq_lock_poll(cq))
-		return LL_FLUSH_BUSY;
+	/*
+	 * We aren't under the device list lock, so this is racey-ish, but good
+	 * enough for our purposes.
+	 */
+	nr_devices = fs_info->fs_devices->open_devices;
+	if (!nr_devices) {
+		smp_mb();
+		nr_devices = fs_info->fs_devices->open_devices;
+		ASSERT(nr_devices);
+		if (!nr_devices) {
+			*free_bytes = 0;
+			return 0;
+		}
+	}
 
-	done = mlx4_en_process_rx_cq(dev, cq, 4);
-	if (likely(done))
-		rx_ring->cleaned += done;
+	devices_info = kmalloc_array(nr_devices, sizeof(*devices_info),
+			       GFP_NOFS);
+	if (!devices_info)
+		return -ENOMEM;
+
+	/* calc min stripe number for data space alloction */
+	type = btrfs_get_alloc_profile(root, 1);
+	if (type & BTRFS_BLOCK_GROUP_RAID0) {
+		min_stripes = 2;
+		num_stripes = nr_devices;
+	} else if (type & BTRFS_BLOCK_GROUP_RAID1) {
+		min_stripes = 2;
+		num_stripes = 2;
+	} else if (type & BTRFS_BLOCK_GROUP_RAID10) {
+		min_stripes = 4;
+		num_stripes = 4;
+	}
+
+	if (type & BTRFS_BLOCK_GROUP_DUP)
+		min_stripe_size = 2 * BTRFS_STRIPE_LEN;
 	else
-		rx_ring->misses++;
+		min_stripe_size = BTRFS_STRIPE_LEN;
 
-	mlx4_en_cq_unlock_poll(cq);
+	if (fs_info->alloc_start)
+		mutex_lock(&fs_devices->device_list_mutex);
+	rcu_read_lock();
+	list_for_each_entry_rcu(device, &fs_devices->devices, dev_list) {
+		if (!device->in_fs_metadata || !device->bdev ||
+		    device->is_tgtdev_for_dev_replace)
+			continue;
 
-	return done;
-}
-#endif	/* CONFIG_NET_RX_BUSY_POLL */
-
-#ifdef CONFIG_RFS_ACCEL
-
-struct mlx4_en_filter {
-	struct list_head next;
-	struct work_struct work;
-
-	u8     ip_proto;
-	__be32 src_ip;
-	__be32 dst_ip;
-	__be16 src_port;
-	__be16 dst_port;
-
-	int rxq_index;
-	struct mlx4_en_priv *priv;
-	u32 flow_id;			/* RFS infrastructure id */
-	int id;				/* mlx4_en driver id */
-	u64 reg_id;			/* Flow steering API id */
-	u8 activated;			/* Used to prevent expiry before filter
-					 * is attached
-					 */
-	struct hlist_node filter_chain;
-};
-
-static void mlx4_en_filter_rfs_expire(struct mlx4_en_priv *priv);
-
-static enum mlx4_net_trans_rule_id mlx4_ip_proto_to_trans_rule_id(u8 ip_proto)
-{
-	switch (ip_proto) {
-	case IPPROTO_UDP:
-		return MLX4_NET_TRANS_RULE_ID_UDP;
-	case IPPROTO_TCP:
-		return MLX4_NET_TRANS_RULE_ID_TCP;
-	default:
-		return MLX4_NET_TRANS_RULE_NUM;
-	}
-};
-
-static void mlx4_en_filter_work(struct work_struct *work)
-{
-	struct mlx4_en_filter *filter = container_of(work,
-						     struct mlx4_en_filter,
-						     work);
-	struct mlx4_en_priv *priv = filter->priv;
-	struct mlx4_spec_list spec_tcp_udp = {
-		.id = mlx4_ip_proto_to_trans_rule_id(filter->ip_proto),
-		{
-			.tcp_udp = {
-				.dst_port = filter->dst_port,
-				.dst_port_msk = (__force __be16)-1,
-				.src_port = filter->src_port,
-				.src_port_msk = (__force __be16)-1,
-			},
-		},
-	};
-	struct mlx4_spec_list spec_ip = {
-		.id = MLX4_NET_TRANS_RULE_ID_IPV4,
-		{
-			.ipv4 = {
-				.dst_ip = filter->dst_ip,
-				.dst_ip_msk = (__force __be32)-1,
-				.src_ip = filter->src_ip,
-				.src_ip_msk = (__force __be32)-1,
-			},
-		},
-	};
-	struct mlx4_spec_list spec_eth = {
-		.id = MLX4_NET_TRANS_RULE_ID_ETH,
-	};
-	struct mlx4_net_trans_rule rule = {
-		.list = LIST_HEAD_INIT(rule.list),
-		.queue_mode = MLX4_NET_TRANS_Q_LIFO,
-		.exclusive = 1,
-		.allow_loopback = 1,
-		.promisc_mode = MLX4_FS_REGULAR,
-		.port = priv->port,
-		.priority = MLX4_DOMAIN_RFS,
-	};
-	int rc;
-	__be64 mac_mask = cpu_to_be64(MLX4_MAC_MASK << 16);
-
-	if (spec_tcp_udp.id >= MLX4_NET_TRANS_RULE_NUM) {
-		en_warn(priv, "RFS: ignoring unsupported ip protocol (%d)\n",
-			filter->ip_proto);
-		goto ignore;
-	}
-	list_add_tail(&spec_eth.list, &rule.list);
-	list_add_tail(&spec_ip.list, &rule.list);
-	list_add_tail(&spec_tcp_udp.list, &rule.list);
-
-	rule.qpn = priv->rss_map.qps[filter->rxq_index].qpn;
-	memcpy(spec_eth.eth.dst_mac, priv->dev->dev_addr, ETH_ALEN);
-	memcpy(spec_eth.eth.dst_mac_msk, &mac_mask, ETH_ALEN);
-
-	filter->activated = 0;
-
-	if (filter->reg_id) {
-		rc = mlx4_flow_detach(priv->mdev->dev, filter->reg_id);
-		if (rc && rc != -ENOENT)
-			en_err(priv, "Error detaching flow. rc = %d\n", rc);
-	}
-
-	rc = mlx4_flow_attach(priv->mdev->dev, &rule, &filter->reg_id);
-	if (rc)
-		en_err(priv, "Error attaching flow. err = %d\n", rc);
-
-ignore:
-	mlx4_en_filter_rfs_expire(priv);
-
-	filter->activated = 1;
-}
-
-static inline struct hlist_head *
-filter_hash_bucket(struct mlx4_en_priv *priv, __be32 src_ip, __be32 dst_ip,
-		   __be16 src_port, __be16 dst_port)
-{
-	unsigned long l;
-	int bucket_idx;
-
-	l = (__force unsigned long)src_port |
-	    ((__force unsigned long)dst_port << 2);
-	l ^= (__force unsigned long)(src_ip ^ dst_ip);
-
-	bucket_idx = hash_long(l, MLX4_EN_FILTER_HASH_SHIFT);
-
-	return &priv->filter_hash[bucket_idx];
-}
-
-static struct mlx4_en_filter *
-mlx4_en_filter_alloc(struct mlx4_en_priv *priv, int rxq_index, __be32 src_ip,
-		     __be32 dst_ip, u8 ip_proto, __be16 src_port,
-		     __be16 dst_port, u32 flow_id)
-{
-	struct mlx4_en_filter *filter = NULL;
-
-	filter = kzalloc(sizeof(struct mlx4_en_filter), GFP_ATOMIC);
-	if (!filter)
-		return NULL;
-
-	filter->priv = priv;
-	filter->rxq_index = rxq_index;
-	INIT_WORK(&filter->work, mlx4_en_filter_work);
-
-	filter->src_ip = src_ip;
-	filter->dst_ip = dst_ip;
-	filter->ip_proto = ip_proto;
-	filter->src_port = src_port;
-	filter->dst_port = dst_port;
-
-	filter->flow_id = flow_id;
-
-	filter->id = priv->last_filter_id++ % RPS_NO_FILTER;
-
-	list_add_tail(&filter->next, &priv->filters);
-	hlist_add_head(&filter->filter_chain,
-		       filter_hash_bucket(priv, src_ip, dst_ip, src_port,
-					  dst_port));
-
-	return filter;
-}
-
-static void mlx4_en_filter_free(struct mlx4_en_filter *filter)
-{
-	struct mlx4_en_priv *priv = filter->priv;
-	int rc;
-
-	list_del(&filter->next);
-
-	rc = mlx4_flow_detach(priv->mdev->dev, filter->reg_id);
-	if (rc && rc != -ENOENT)
-		en_err(priv, "Error detaching flow. rc = %d\n", rc);
-
-	kfree(filter);
-}
-
-static inline struct mlx4_en_filter *
-mlx4_en_filter_find(struct mlx4_en_priv *priv, __be32 src_ip, __be32 dst_ip,
-		    u8 ip_proto, __be16 src_port, __be16 dst_port)
-{
-	struct mlx4_en_filter *filter;
-	struct mlx4_en_filter *ret = NULL;
-
-	hlist_for_each_entry(filter,
-			     filter_hash_bucket(priv, src_ip, dst_ip,
-						src_port, dst_port),
-			     filter_chain) {
-		if (filter->src_ip == src_ip &&
-		    filter->dst_ip == dst_ip &&
-		    filter->ip_proto == ip_proto &&
-		    filter->src_port == src_port &&
-		    filter->dst_port == dst_port) {
-			ret = filter;
-			break;
-		}
-	}
-
-	return ret;
-}
-
-static int
-mlx4_en_filter_rfs(struct net_device *net_dev, const struct sk_buff *skb,
-		   u16 rxq_index, u32 flow_id)
-{
-	struct mlx4_en_priv *priv = netdev_priv(net_dev);
-	struct mlx4_en_filter *filter;
-	const struct iphdr *ip;
-	const __be16 *ports;
-	u8 ip_proto;
-	__be32 src_ip;
-	__be32 dst_ip;
-	__be16 src_port;
-	__be16 dst_port;
-	int nhoff = skb_network_offset(skb);
-	int ret = 0;
-
-	if (skb->encapsulation)
-		return -EPROTONOSUPPORT;
-
-	if (skb->protocol != htons(ETH_P_IP))
-		return -EPROTONOSUPPORT;
-
-	ip = (const struct iphdr *)(skb->data + nhoff);
-	if (ip_is_fragment(ip))
-		return -EPROTONOSUPPORT;
-
-	if ((ip->protocol != IPPROTO_TCP) && (ip->protocol != IPPROTO_UDP))
-		return -EPROTONOSUPPORT;
-	ports = (const __be16 *)(skb->data + nhoff + 4 * ip->ihl);
-
-	ip_proto = ip->protocol;
-	src_ip = ip->saddr;
-	dst_ip = ip->daddr;
-	src_port = ports[0];
-	dst_port = ports[1];
-
-	spin_lock_bh(&priv->filters_lock);
-	filter = mlx4_en_filter_find(priv, src_ip, dst_ip, ip_proto,
-				     src_port, dst_port);
-	if (filter) {
-		if (filter->rxq_index == rxq_index)
-			goto out;
-
-		filter->rxq_index = rxq_index;
-	} else {
-		filter = mlx4_en_filter_alloc(priv, rxq_index,
-					      src_ip, dst_ip, ip_proto,
-					      src_port, dst_port, flow_id);
-		if (!filter) {
-			ret = -ENOMEM;
-			goto err;
-		}
-	}
-
-	queue_work(priv->mdev->workqueue, &filter->work);
-
-out:
-	ret = filter->id;
-err:
-	spin_unlock_bh(&priv->filters_lock);
-
-	return ret;
-}
-
-void mlx4_en_cleanup_filters(struct mlx4_en_priv *priv)
-{
-	struct mlx4_en_filter *filter, *tmp;
-	LIST_HEAD(del_list);
-
-	spin_lock_bh(&priv->filters_lock);
-	list_for_each_entry_safe(filter, tmp, &priv->filters, next) {
-		list_move(&filter->next, &del_list);
-		hlist_del(&filter->filter_chain);
-	}
-	spin_unlock_bh(&priv->filters_lock);
-
-	list_for_each_entry_safe(filter, tmp, &del_list, next) {
-		cancel_work_sync(&filter->work);
-		mlx4_en_filter_free(filter);
-	}
-}
-
-static void mlx4_en_filter_rfs_expire(struct mlx4_en_priv *priv)
-{
-	struct mlx4_en_filter *filter = NULL, *tmp, *last_filter = NULL;
-	LIST_HEAD(del_list);
-	int i = 0;
-
-	spin_lock_bh(&priv->filters_lock);
-	list_for_each_entry_safe(filter, tmp, &priv->filters, next) {
-		if (i > MLX4_EN_FILTER_EXPIRY_QUOTA)
+		if (i >= nr_devices)
 			break;
 
-		if (filter->activated &&
-		    !work_pending(&filter->work) &&
-		    rps_may_expire_flow(priv->dev,
-					filter->rxq_index, filter->flow_id,
-					filter->id)) {
-			list_move(&filter->next, &del_list);
-			hlist_del(&filter->filter_chain);
-		} else
-			last_filter = filter;
+		avail_space = device->total_bytes - device->bytes_used;
+
+		/* align with stripe_len */
+		avail_space = div_u64(avail_space, BTRFS_STRIPE_LEN);
+		avail_space *= BTRFS_STRIPE_LEN;
+
+		/*
+		 * In order to avoid overwritting the superblock on the drive,
+		 * btrfs starts at an offset of at least 1MB when doing chunk
+		 * allocation.
+		 */
+		skip_space = 1024 * 1024;
+
+		/* user can set the offset in fs_info->alloc_start. */
+		if (fs_info->alloc_start &&
+		    fs_info->alloc_start + BTRFS_STRIPE_LEN <=
+		    device->total_bytes) {
+			rcu_read_unlock();
+			skip_space = max(fs_info->alloc_start, skip_space);
+
+			/*
+			 * btrfs can not use the free space in
+			 * [0, skip_space - 1], we must subtract it from the
+			 * total. In order to implement it, we account the used
+			 * space in this range first.
+			 */
+			ret = btrfs_account_dev_extents_size(device, 0,
+							     skip_space - 1,
+							     &used_space);
+			if (ret) {
+				kfree(devices_info);
+				mutex_unlock(&fs_devices->device_list_mutex);
+				return ret;
+			}
+
+			rcu_read_lock();
+
+			/* calc the free space in [0, skip_space - 1] */
+			skip_space -= used_space;
+		}
+
+		/*
+		 * we can use the free space in [0, skip_space - 1], subtract
+		 * it from the total.
+		 */
+		if (avail_space && avail_space >= skip_space)
+			avail_space -= skip_space;
+		else
+			avail_space = 0;
+
+		if (avail_space < min_stripe_size)
+			continue;
+
+		devices_info[i].dev = device;
+		devices_info[i].max_avail = avail_space;
 
 		i++;
 	}
+	rcu_read_unlock();
+	if (fs_info->alloc_start)
+		mutex_unlock(&fs_devices->device_list_mutex);
 
-	if (last_filter && (&last_filter->next != priv->filters.next))
-		list_move(&priv->filters, &last_filter->next);
+	nr_devices = i;
 
-	spin_unlock_bh(&priv->filters_lock);
+	btrfs_descending_sort_devices(devices_info, nr_devices);
 
-	list_for_each_entry_safe(filter, tmp, &del_list, next)
-		mlx4_en_filter_free(filter);
-}
-#endif
+	i = nr_devices - 1;
+	avail_space = 0;
+	while (nr_devices >= min_stripes) {
+		if (num_stripes > nr_devices)
+			num_stripes = nr_devices;
 
-static int mlx4_en_vlan_rx_add_vid(struct net_device *dev,
-				   __be16 proto, u16 vid)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int err;
-	int idx;
+		if (devices_info[i].max_avail >= min_stripe_size) {
+			int j;
+			u64 alloc_size;
 
-	en_dbg(HW, priv, "adding VLAN:%d\n", vid);
-
-	set_bit(vid, priv->active_vlans);
-
-	/* Add VID to port VLAN filter */
-	mutex_lock(&mdev->state_lock);
-	if (mdev->device_up && priv->port_up) {
-		err = mlx4_SET_VLAN_FLTR(mdev->dev, priv);
-		if (err) {
-			en_err(priv, "Failed configuring VLAN filter\n");
-			goto out;
+			avail_space += devices_info[i].max_avail * num_stripes;
+			alloc_size = devices_info[i].max_avail;
+			for (j = i + 1 - num_stripes; j <= i; j++)
+				devices_info[j].max_avail -= alloc_size;
 		}
+		i--;
+		nr_devices--;
 	}
-	err = mlx4_register_vlan(mdev->dev, priv->port, vid, &idx);
-	if (err)
-		en_dbg(HW, priv, "Failed adding vlan %d\n", vid);
 
-out:
-	mutex_unlock(&mdev->state_lock);
-	return err;
-}
-
-static int mlx4_en_vlan_rx_kill_vid(struct net_device *dev,
-				    __be16 proto, u16 vid)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int err = 0;
-
-	en_dbg(HW, priv, "Killing VID:%d\n", vid);
-
-	clear_bit(vid, priv->active_vlans);
-
-	/* Remove VID from port VLAN filter */
-	mutex_lock(&mdev->state_lock);
-	mlx4_unregister_vlan(mdev->dev, priv->port, vid);
-
-	if (mdev->device_up && priv->port_up) {
-		err = mlx4_SET_VLAN_FLTR(mdev->dev, priv);
-		if (err)
-			en_err(priv, "Failed configuring VLAN filter\n");
-	}
-	mutex_unlock(&mdev->state_lock);
-
-	return err;
-}
-
-static void mlx4_en_u64_to_mac(unsigned char dst_mac[ETH_ALEN + 2], u64 src_mac)
-{
-	int i;
-	for (i = ETH_ALEN - 1; i >= 0; --i) {
-		dst_mac[i] = src_mac & 0xff;
-		src_mac >>= 8;
-	}
-	memset(&dst_mac[ETH_ALEN], 0, 2);
-}
-
-
-static int mlx4_en_tunnel_steer_add(struct mlx4_en_priv *priv, unsigned char *addr,
-				    int qpn, u64 *reg_id)
-{
-	int err;
-
-	if (priv->mdev->dev->caps.tunnel_offload_mode != MLX4_TUNNEL_OFFLOAD_MODE_VXLAN ||
-	    priv->mdev->dev->caps.dmfs_high_steer_mode == MLX4_STEERING_DMFS_A0_STATIC)
-		return 0; /* do nothing */
-
-	err = mlx4_tunnel_steer_add(priv->mdev->dev, addr, priv->port, qpn,
-				    MLX4_DOMAIN_NIC, reg_id);
-	if (err) {
-		en_err(priv, "failed to add vxlan steering rule, err %d\n", err);
-		return err;
-	}
-	en_dbg(DRV, priv, "added vxlan steering rule, mac %pM reg_id %llx\n", addr, *reg_id);
+	kfree(devices_info);
+	*free_bytes = avail_space;
 	return 0;
 }
 
-
-static int mlx4_en_uc_steer_add(struct mlx4_en_priv *priv,
-				unsigned char *mac, int *qpn, u64 *reg_id)
-{
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct mlx4_dev *dev = mdev->dev;
-	int err;
-
-	switch (dev->caps.steering_mode) {
-	case MLX4_STEERING_MODE_B0: {
-		struct mlx4_qp qp;
-		u8 gid[16] = {0};
-
-		qp.qpn = *qpn;
-		memcpy(&gid[10], mac, ETH_ALEN);
-		gid[5] = priv->port;
-
-		err = mlx4_unicast_attach(dev, &qp, gid, 0, MLX4_PROT_ETH);
-		break;
-	}
-	case MLX4_STEERING_MODE_DEVICE_MANAGED: {
-		struct mlx4_spec_list spec_eth = { {NULL} };
-		__be64 mac_mask = cpu_to_be64(MLX4_MAC_MASK << 16);
-
-		struct mlx4_net_trans_rule rule = {
-			.queue_mode = MLX4_NET_TRANS_Q_FIFO,
-			.exclusive = 0,
-			.allow_loopback = 1,
-			.promisc_mode = MLX4_FS_REGULAR,
-			.priority = MLX4_DOMAIN_NIC,
-		};
-
-		rule.port = priv->port;
-		rule.qpn = *qpn;
-		INIT_LIST_HEAD(&rule.list);
-
-		spec_eth.id = MLX4_NET_TRANS_RULE_ID_ETH;
-		memcpy(spec_eth.eth.dst_mac, mac, ETH_ALEN);
-		memcpy(spec_eth.eth.dst_mac_msk, &mac_mask, ETH_ALEN);
-		list_add_tail(&spec_eth.list, &rule.list);
-
-		err = mlx4_flow_attach(dev, &rule, reg_id);
-		break;
-	}
-	default:
-		return -EINVAL;
-	}
-	if (err)
-		en_warn(priv, "Failed Attaching Unicast\n");
-
-	return err;
-}
-
-static void mlx4_en_uc_steer_release(struct mlx4_en_priv *priv,
-				     unsigned char *mac, int qpn, u64 reg_id)
-{
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct mlx4_dev *dev = mdev->dev;
-
-	switch (dev->caps.steering_mode) {
-	case MLX4_STEERING_MODE_B0: {
-		struct mlx4_qp qp;
-		u8 gid[16] = {0};
-
-		qp.qpn = qpn;
-		memcpy(&gid[10], mac, ETH_ALEN);
-		gid[5] = priv->port;
-
-		mlx4_unicast_detach(dev, &qp, gid, MLX4_PROT_ETH);
-		break;
-	}
-	case MLX4_STEERING_MODE_DEVICE_MANAGED: {
-		mlx4_flow_detach(dev, reg_id);
-		break;
-	}
-	default:
-		en_err(priv, "Invalid steering mode.\n");
-	}
-}
-
-static int mlx4_en_get_qp(struct mlx4_en_priv *priv)
-{
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct mlx4_dev *dev = mdev->dev;
-	int index = 0;
-	int err = 0;
-	int *qpn = &priv->base_qpn;
-	u64 mac = mlx4_mac_to_u64(priv->dev->dev_addr);
-
-	en_dbg(DRV, priv, "Registering MAC: %pM for adding\n",
-	       priv->dev->dev_addr);
-	index = mlx4_register_mac(dev, priv->port, mac);
-	if (index < 0) {
-		err = index;
-		en_err(priv, "Failed adding MAC: %pM\n",
-		       priv->dev->dev_addr);
-		return err;
-	}
-
-	if (dev->caps.steering_mode == MLX4_STEERING_MODE_A0) {
-		int base_qpn = mlx4_get_base_qpn(dev, priv->port);
-		*qpn = base_qpn + index;
-		return 0;
-	}
-
-	err = mlx4_qp_reserve_range(dev, 1, 1, qpn, MLX4_RESERVE_A0_QP);
-	en_dbg(DRV, priv, "Reserved qp %d\n", *qpn);
-	if (err) {
-		en_err(priv, "Failed to reserve qp for mac registration\n");
-		mlx4_unregister_mac(dev, priv->port, mac);
-		return err;
-	}
-
-	return 0;
-}
-
-static void mlx4_en_put_qp(struct mlx4_en_priv *priv)
-{
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct mlx4_dev *dev = mdev->dev;
-	int qpn = priv->base_qpn;
-
-	if (dev->caps.steering_mode == MLX4_STEERING_MODE_A0) {
-		u64 mac = mlx4_mac_to_u64(priv->dev->dev_addr);
-		en_dbg(DRV, priv, "Registering MAC: %pM for deleting\n",
-		       priv->dev->dev_addr);
-		mlx4_unregister_mac(dev, priv->port, mac);
-	} else {
-		en_dbg(DRV, priv, "Releasing qp: port %d, qpn %d\n",
-		       priv->port, qpn);
-		mlx4_qp_release_range(dev, qpn, 1);
-		priv->flags &= ~MLX4_EN_FLAG_FORCE_PROMISC;
-	}
-}
-
-static int mlx4_en_replace_mac(struct mlx4_en_priv *priv, int qpn,
-			       unsigned char *new_mac, unsigned char *prev_mac)
-{
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct mlx4_dev *dev = mdev->dev;
-	int err = 0;
-	u64 new_mac_u64 = mlx4_mac_to_u64(new_mac);
-
-	if (dev->caps.steering_mode != MLX4_STEERING_MODE_A0) {
-		struct hlist_head *bucket;
-		unsigned int mac_hash;
-		struct mlx4_mac_entry *entry;
-		struct hlist_node *tmp;
-		u64 prev_mac_u64 = mlx4_mac_to_u64(prev_mac);
-
-		bucket = &priv->mac_hash[prev_mac[MLX4_EN_MAC_HASH_IDX]];
-		hlist_for_each_entry_safe(entry, tmp, bucket, hlist) {
-			if (ether_addr_equal_64bits(entry->mac, prev_mac)) {
-				mlx4_en_uc_steer_release(priv, entry->mac,
-							 qpn, entry->reg_id);
-				mlx4_unregister_mac(dev, priv->port,
-						    prev_mac_u64);
-				hlist_del_rcu(&entry->hlist);
-				synchronize_rcu();
-				memcpy(entry->mac, new_mac, ETH_ALEN);
-				entry->reg_id = 0;
-				mac_hash = new_mac[MLX4_EN_MAC_HASH_IDX];
-				hlist_add_head_rcu(&entry->hlist,
-						   &priv->mac_hash[mac_hash]);
-				mlx4_register_mac(dev, priv->port, new_mac_u64);
-				err = mlx4_en_uc_steer_add(priv, new_mac,
-							   &qpn,
-							   &entry->reg_id);
-				if (err)
-					return err;
-				if (priv->tunnel_reg_id) {
-					mlx4_flow_detach(priv->mdev->dev, priv->tunnel_reg_id);
-					priv->tunnel_reg_id = 0;
-				}
-				err = mlx4_en_tunnel_steer_add(priv, new_mac, qpn,
-							       &priv->tunnel_reg_id);
-				return err;
-			}
-		}
-		return -EINVAL;
-	}
-
-	return __mlx4_replace_mac(dev, priv->port, qpn, new_mac_u64);
-}
-
-static int mlx4_en_do_set_mac(struct mlx4_en_priv *priv,
-			      unsigned char new_mac[ETH_ALEN + 2])
-{
-	int err = 0;
-
-	if (priv->port_up) {
-		/* Remove old MAC and insert the new one */
-		err = mlx4_en_replace_mac(priv, priv->base_qpn,
-					  new_mac, priv->current_mac);
-		if (err)
-			en_err(priv, "Failed changing HW MAC address\n");
-	} else
-		en_dbg(HW, priv, "Port is down while registering mac, exiting...\n");
-
-	if (!err)
-		memcpy(priv->current_mac, new_mac, sizeof(priv->current_mac));
-
-	return err;
-}
-
-static int mlx4_en_set_mac(struct net_device *dev, void *addr)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct sockaddr *saddr = addr;
-	unsigned char new_mac[ETH_ALEN + 2];
-	int err;
-
-	if (!is_valid_ether_addr(saddr->sa_data))
-		return -EADDRNOTAVAIL;
-
-	mutex_lock(&mdev->state_lock);
-	memcpy(new_mac, saddr->sa_data, ETH_ALEN);
-	err = mlx4_en_do_set_mac(priv, new_mac);
-	if (!err)
-		memcpy(dev->dev_addr, saddr->sa_data, ETH_ALEN);
-	mutex_unlock(&mdev->state_lock);
-
-	return err;
-}
-
-static void mlx4_en_clear_list(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_mc_list *tmp, *mc_to_del;
-
-	list_for_each_entry_safe(mc_to_del, tmp, &priv->mc_list, list) {
-		list_del(&mc_to_del->list);
-		kfree(mc_to_del);
-	}
-}
-
-static void mlx4_en_cache_mclist(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct netdev_hw_addr *ha;
-	struct mlx4_en_mc_list *tmp;
-
-	mlx4_en_clear_list(dev);
-	netdev_for_each_mc_addr(ha, dev) {
-		tmp = kzalloc(sizeof(struct mlx4_en_mc_list), GFP_ATOMIC);
-		if (!tmp) {
-			mlx4_en_clear_list(dev);
-			return;
-		}
-		memcpy(tmp->addr, ha->addr, ETH_ALEN);
-		list_add_tail(&tmp->list, &priv->mc_list);
-	}
-}
-
-static void update_mclist_flags(struct mlx4_en_priv *priv,
-				struct list_head *dst,
-				struct list_head *src)
-{
-	struct mlx4_en_mc_list *dst_tmp, *src_tmp, *new_mc;
-	bool found;
-
-	/* Find all the entries that should be removed from dst,
-	 * These are the entries that are not found in src
-	 */
-	list_for_each_entry(dst_tmp, dst, list) {
-		found = false;
-		list_for_each_entry(src_tmp, src, list) {
-			if (ether_addr_equal(dst_tmp->addr, src_tmp->addr)) {
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-			dst_tmp->action = MCLIST_REM;
-	}
-
-	/* Add entries that exist in src but not in dst
-	 * mark them as need to add
-	 */
-	list_for_each_entry(src_tmp, src, list) {
-		found = false;
-		list_for_each_entry(dst_tmp, dst, list) {
-			if (ether_addr_equal(dst_tmp->addr, src_tmp->addr)) {
-				dst_tmp->action = MCLIST_NONE;
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			new_mc = kmemdup(src_tmp,
-					 sizeof(struct mlx4_en_mc_list),
-					 GFP_KERNEL);
-			if (!new_mc)
-				return;
-
-			new_mc->action = MCLIST_ADD;
-			list_add_tail(&new_mc->list, dst);
-		}
-	}
-}
-
-static void mlx4_en_set_rx_mode(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-
-	if (!priv->port_up)
-		return;
-
-	queue_work(priv->mdev->workqueue, &priv->rx_mode_task);
-}
-
-static void mlx4_en_set_promisc_mode(struct mlx4_en_priv *priv,
-				     struct mlx4_en_dev *mdev)
-{
-	int err = 0;
-
-	if (!(priv->flags & MLX4_EN_FLAG_PROMISC)) {
-		if (netif_msg_rx_status(priv))
-			en_warn(priv, "Entering promiscuous mode\n");
-		priv->flags |= MLX4_EN_FLAG_PROMISC;
-
-		/* Enable promiscouos mode */
-		switch (mdev->dev->caps.steering_mode) {
-		case MLX4_STEERING_MODE_DEVICE_MANAGED:
-			err = mlx4_flow_steer_promisc_add(mdev->dev,
-							  priv->port,
-							  priv->base_qpn,
-							  MLX4_FS_ALL_DEFAULT);
-			if (err)
-				en_err(priv, "Failed enabling promiscuous mode\n");
-			priv->flags |= MLX4_EN_FLAG_MC_PROMISC;
-			break;
-
-		case MLX4_STEERING_MODE_B0:
-			err = mlx4_unicast_promisc_add(mdev->dev,
-						       priv->base_qpn,
-						       priv->port);
-			if (err)
-				en_err(priv, "Failed enabling unicast promiscuous mode\n");
-
-			/* Add the default qp number as multicast
-			 * promisc
-			 */
-			if (!(priv->flags & MLX4_EN_FLAG_MC_PROMISC)) {
-				err = mlx4_multicast_promisc_add(mdev->dev,
-								 priv->base_qpn,
-								 priv->port);
-				if (err)
-					en_err(priv, "Failed enabling multicast promiscuous mode\n");
-				priv->flags |= MLX4_EN_FLAG_MC_PROMISC;
-			}
-			break;
-
-		case MLX4_STEERING_MODE_A0:
-			err = mlx4_SET_PORT_qpn_calc(mdev->dev,
-						     priv->port,
-						     priv->base_qpn,
-						     1);
-			if (err)
-				en_err(priv, "Failed enabling promiscuous mode\n");
-			break;
-		}
-
-		/* Disable port multicast filter (unconditionally) */
-		err = mlx4_SET_MCAST_FLTR(mdev->dev, priv->port, 0,
-					  0, MLX4_MCAST_DISABLE);
-		if (err)
-			en_err(priv, "Failed disabling multicast filter\n");
-	}
-}
-
-static void mlx4_en_clear_promisc_mode(struct mlx4_en_priv *priv,
-				       struct mlx4_en_dev *mdev)
-{
-	int err = 0;
-
-	if (netif_msg_rx_status(priv))
-		en_warn(priv, "Leaving promiscuous mode\n");
-	priv->flags &= ~MLX4_EN_FLAG_PROMISC;
-
-	/* Disable promiscouos mode */
-	switch (mdev->dev->caps.steering_mode) {
-	case MLX4_STEERING_MODE_DEVICE_MANAGED:
-		err = mlx4_flow_steer_promisc_remove(mdev->dev,
-						     priv->port,
-						     MLX4_FS_ALL_DEFAULT);
-		if (err)
-			en_err(priv, "Failed disabling promiscuous mode\n");
-		priv->flags &= ~MLX4_EN_FLAG_MC_PROMISC;
-		break;
-
-	case MLX4_STEERING_MODE_B0:
-		err = mlx4_unicast_promisc_remove(mdev->dev,
-						  priv->base_qpn,
-						  priv->port);
-		if (err)
-			en_err(priv, "Failed disabling unicast promiscuous mode\n");
-		/* Disable Multicast promisc */
-		if (priv->flags & MLX4_EN_FLAG_MC_PROMISC) {
-			err = mlx4_multicast_promisc_remove(mdev->dev,
-							    priv->base_qpn,
-							    priv->port);
-			if (err)
-				en_err(priv, "Failed disabling multicast promiscuous mode\n");
-			priv->flags &= ~MLX4_EN_FLAG_MC_PROMISC;
-		}
-		break;
-
-	case MLX4_STEERING_MODE_A0:
-		err = mlx4_SET_PORT_qpn_calc(mdev->dev,
-					     priv->port,
-					     priv->base_qpn, 0);
-		if (err)
-			en_err(priv, "Failed disabling promiscuous mode\n");
-		break;
-	}
-}
-
-static void mlx4_en_do_multicast(struct mlx4_en_priv *priv,
-				 struct net_device *dev,
-				 struct mlx4_en_dev *mdev)
-{
-	struct mlx4_en_mc_list *mclist, *tmp;
-	u64 mcast_addr = 0;
-	u8 mc_list[16] = {0};
-	int err = 0;
-
-	/* Enable/disable the multicast filter according to IFF_ALLMULTI */
-	if (dev->flags & IFF_ALLMULTI) {
-		err = mlx4_SET_MCAST_FLTR(mdev->dev, priv->port, 0,
-					  0, MLX4_MCAST_DISABLE);
-		if (err)
-			en_err(priv, "Failed disabling multicast filter\n");
-
-		/* Add the default qp number as multicast promisc */
-		if (!(priv->flags & MLX4_EN_FLAG_MC_PROMISC)) {
-			switch (mdev->dev->caps.steering_mode) {
-			case MLX4_STEERING_MODE_DEVICE_MANAGED:
-				err = mlx4_flow_steer_promisc_add(mdev->dev,
-								  priv->port,
-								  priv->base_qpn,
-								  MLX4_FS_MC_DEFAULT);
-				break;
-
-			case MLX4_STEERING_MODE_B0:
-				err = mlx4_multicast_promisc_add(mdev->dev,
-								 priv->base_qpn,
-								 priv->port);
-				break;
-
-			case MLX4_STEERING_MODE_A0:
-				break;
-			}
-			if (err)
-				en_err(priv, "Failed entering multicast promisc mode\n");
-			priv->flags |= MLX4_EN_FLAG_MC_PROMISC;
-		}
-	} else {
-		/* Disable Multicast promisc */
-		if (priv->flags & MLX4_EN_FLAG_MC_PROMISC) {
-			switch (mdev->dev->caps.steering_mode) {
-			case MLX4_STEERING_MODE_DEVICE_MANAGED:
-				err = mlx4_flow_steer_promisc_remove(mdev->dev,
-								     priv->port,
-								     MLX4_FS_MC_DEFAULT);
-				break;
-
-			case MLX4_STEERING_MODE_B0:
-				err = mlx4_multicast_promisc_remove(mdev->dev,
-								    priv->base_qpn,
-								    priv->port);
-				break;
-
-			case MLX4_STEERING_MODE_A0:
-				break;
-			}
-			if (err)
-				en_err(priv, "Failed disabling multicast promiscuous mode\n");
-			priv->flags &= ~MLX4_EN_FLAG_MC_PROMISC;
-		}
-
-		err = mlx4_SET_MCAST_FLTR(mdev->dev, priv->port, 0,
-					  0, MLX4_MCAST_DISABLE);
-		if (err)
-			en_err(priv, "Failed disabling multicast filter\n");
-
-		/* Flush mcast filter and init it with broadcast address */
-		mlx4_SET_MCAST_FLTR(mdev->dev, priv->port, ETH_BCAST,
-				    1, MLX4_MCAST_CONFIG);
-
-		/* Update multicast list - we cache all addresses so they won't
-		 * change while HW is updated holding the command semaphor */
-		netif_addr_lock_bh(dev);
-		mlx4_en_cache_mclist(dev);
-		netif_addr_unlock_bh(dev);
-		list_for_each_entry(mclist, &priv->mc_list, list) {
-			mcast_addr = mlx4_mac_to_u64(mclist->addr);
-			mlx4_SET_MCAST_FLTR(mdev->dev, priv->port,
-					    mcast_addr, 0, MLX4_MCAST_CONFIG);
-		}
-		err = mlx4_SET_MCAST_FLTR(mdev->dev, priv->port, 0,
-					  0, MLX4_MCAST_ENABLE);
-		if (err)
-			en_err(priv, "Failed enabling multicast filter\n");
-
-		update_mclist_flags(priv, &priv->curr_list, &priv->mc_list);
-		list_for_each_entry_safe(mclist, tmp, &priv->curr_list, list) {
-			if (mclist->action == MCLIST_REM) {
-				/* detach this address and delete from list */
-				memcpy(&mc_list[10], mclist->addr, ETH_ALEN);
-				mc_list[5] = priv->port;
-				err = mlx4_multicast_detach(mdev->dev,
-							    &priv->rss_map.indir_qp,
-							    mc_list,
-							    MLX4_PROT_ETH,
-							    mclist->reg_id);
-				if (err)
-					en_err(priv, "Fail to detach multicast address\n");
-
-				if (mclist->tunnel_reg_id) {
-					err = mlx4_flow_detach(priv->mdev->dev, mclist->tunnel_reg_id);
-					if (err)
-						en_err(priv, "Failed to detach multicast address\n");
-				}
-
-				/* remove from list */
-				list_del(&mclist->list);
-				kfree(mclist);
-			} else if (mclist->action == MCLIST_ADD) {
-				/* attach the address */
-				memcpy(&mc_list[10], mclist->addr, ETH_ALEN);
-				/* needed for B0 steering support */
-				mc_list[5] = priv->port;
-				err = mlx4_multicast_attach(mdev->dev,
-							    &priv->rss_map.indir_qp,
-							    mc_list,
-							    priv->port, 0,
-							    MLX4_PROT_ETH,
-							    &mclist->reg_id);
-				if (err)
-					en_err(priv, "Fail to attach multicast address\n");
-
-				err = mlx4_en_tunnel_steer_add(priv, &mc_list[10], priv->base_qpn,
-							       &mclist->tunnel_reg_id);
-				if (err)
-					en_err(priv, "Failed to attach multicast address\n");
-			}
-		}
-	}
-}
-
-static void mlx4_en_do_uc_filter(struct mlx4_en_priv *priv,
-				 struct net_device *dev,
-				 struct mlx4_en_dev *mdev)
-{
-	struct netdev_hw_addr *ha;
-	struct mlx4_mac_entry *entry;
-	struct hlist_node *tmp;
-	bool found;
-	u64 mac;
-	int err = 0;
-	struct hlist_head *bucket;
-	unsigned int i;
-	int removed = 0;
-	u32 prev_flags;
-
-	/* Note that we do not need to protect our mac_hash traversal with rcu,
-	 * since all modification code is protected by mdev->state_lock
-	 */
-
-	/* find what to remove */
-	for (i = 0; i < MLX4_EN_MAC_HASH_SIZE; ++i) {
-		bucket = &priv->mac_hash[i];
-		hlist_for_each_entry_safe(entry, tmp, bucket, hlist) {
-			found = false;
-			netdev_for_each_uc_addr(ha, dev) {
-				if (ether_addr_equal_64bits(entry->mac,
-							    ha->addr)) {
-					found = true;
-					break;
-				}
-			}
-
-			/* MAC address of the port is not in uc list */
-			if (ether_addr_equal_64bits(entry->mac,
-						    priv->current_mac))
-				found = true;
-
-			if (!found) {
-				mac = mlx4_mac_to_u64(entry->mac);
-				mlx4_en_uc_steer_release(priv, entry->mac,
-							 priv->base_qpn,
-							 entry->reg_id);
-				mlx4_unregister_mac(mdev->dev, priv->port, mac);
-
-				hlist_del_rcu(&entry->hlist);
-				kfree_rcu(entry, rcu);
-				en_dbg(DRV, priv, "Removed MAC %pM on port:%d\n",
-				       entry->mac, priv->port);
-				++removed;
-			}
-		}
-	}
-
-	/* if we didn't remove anything, there is no use in trying to add
-	 * again once we are in a forced promisc mode state
-	 */
-	if ((priv->flags & MLX4_EN_FLAG_FORCE_PROMISC) && 0 == removed)
-		return;
-
-	prev_flags = priv->flags;
-	priv->flags &= ~MLX4_EN_FLAG_FORCE_PROMISC;
-
-	/* find what to add */
-	netdev_for_each_uc_addr(ha, dev) {
-		found = false;
-		bucket = &priv->mac_hash[ha->addr[MLX4_EN_MAC_HASH_IDX]];
-		hlist_for_each_entry(entry, bucket, hlist) {
-			if (ether_addr_equal_64bits(entry->mac, ha->addr)) {
-				found = true;
-				break;
-			}
-		}
-
-		if (!found) {
-			entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-			if (!entry) {
-				en_err(priv, "Failed adding MAC %pM on port:%d (out of memory)\n",
-				       ha->addr, priv->port);
-				priv->flags |= MLX4_EN_FLAG_FORCE_PROMISC;
-				break;
-			}
-			mac = mlx4_mac_to_u64(ha->addr);
-			memcpy(entry->mac, ha->addr, ETH_ALEN);
-			err = mlx4_register_mac(mdev->dev, priv->port, mac);
-			if (err < 0) {
-				en_err(priv, "Failed registering MAC %pM on port %d: %d\n",
-				       ha->addr, priv->port, err);
-				kfree(entry);
-				priv->flags |= MLX4_EN_FLAG_FORCE_PROMISC;
-				break;
-			}
-			err = mlx4_en_uc_steer_add(priv, ha->addr,
-						   &priv->base_qpn,
-						   &entry->reg_id);
-			if (err) {
-				en_err(priv, "Failed adding MAC %pM on port %d: %d\n",
-				       ha->addr, priv->port, err);
-				mlx4_unregister_mac(mdev->dev, priv->port, mac);
-				kfree(entry);
-				priv->flags |= MLX4_EN_FLAG_FORCE_PROMISC;
-				break;
-			} else {
-				unsigned int mac_hash;
-				en_dbg(DRV, priv, "Added MAC %pM on port:%d\n",
-				       ha->addr, priv->port);
-				mac_hash = ha->addr[MLX4_EN_MAC_HASH_IDX];
-				bucket = &priv->mac_hash[mac_hash];
-				hlist_add_head_rcu(&entry->hlist, bucket);
-			}
-		}
-	}
-
-	if (priv->flags & MLX4_EN_FLAG_FORCE_PROMISC) {
-		en_warn(priv, "Forcing promiscuous mode on port:%d\n",
-			priv->port);
-	} else if (prev_flags & MLX4_EN_FLAG_FORCE_PROMISC) {
-		en_warn(priv, "Stop forcing promiscuous mode on port:%d\n",
-			priv->port);
-	}
-}
-
-static void mlx4_en_do_set_rx_mode(struct work_struct *work)
-{
-	struct mlx4_en_priv *priv = container_of(work, struct mlx4_en_priv,
-						 rx_mode_task);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct net_device *dev = priv->dev;
-
-	mutex_lock(&mdev->state_lock);
-	if (!mdev->device_up) {
-		en_dbg(HW, priv, "Card is not up, ignoring rx mode change.\n");
-		goto out;
-	}
-	if (!priv->port_up) {
-		en_dbg(HW, priv, "Port is down, ignoring rx mode change.\n");
-		goto out;
-	}
-
-	if (!netif_carrier_ok(dev)) {
-		if (!mlx4_en_QUERY_PORT(mdev, priv->port)) {
-			if (priv->port_state.link_state) {
-				priv->last_link_state = MLX4_DEV_EVENT_PORT_UP;
-				netif_carrier_on(dev);
-				en_dbg(LINK, priv, "Link Up\n");
-			}
-		}
-	}
-
-	if (dev->priv_flags & IFF_UNICAST_FLT)
-		mlx4_en_do_uc_filter(priv, dev, mdev);
-
-	/* Promsicuous mode: disable all filters */
-	if ((dev->flags & IFF_PROMISC) ||
-	    (priv->flags & MLX4_EN_FLAG_FORCE_PROMISC)) {
-		mlx4_en_set_promisc_mode(priv, mdev);
-		goto out;
-	}
-
-	/* Not in promiscuous mode */
-	if (priv->flags & MLX4_EN_FLAG_PROMISC)
-		mlx4_en_clear_promisc_mode(priv, mdev);
-
-	mlx4_en_do_multicast(priv, dev, mdev);
-out:
-	mutex_unlock(&mdev->state_lock);
-}
-
-#ifdef CONFIG_NET_POLL_CONTROLLER
-static void mlx4_en_netpoll(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_cq *cq;
-	int i;
-
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		cq = priv->rx_cq[i];
-		napi_schedule(&cq->napi);
-	}
-}
-#endif
-
-static int mlx4_en_set_rss_steer_rules(struct mlx4_en_priv *priv)
-{
-	u64 reg_id;
-	int err = 0;
-	int *qpn = &priv->base_qpn;
-	struct mlx4_mac_entry *entry;
-
-	err = mlx4_en_uc_steer_add(priv, priv->dev->dev_addr, qpn, &reg_id);
-	if (err)
-		return err;
-
-	err = mlx4_en_tunnel_steer_add(priv, priv->dev->dev_addr, *qpn,
-				       &priv->tunnel_reg_id);
-	if (err)
-		goto tunnel_err;
-
-	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-	if (!entry) {
-		err = -ENOMEM;
-		goto alloc_err;
-	}
-
-	memcpy(entry->mac, priv->dev->dev_addr, sizeof(entry->mac));
-	memcpy(priv->current_mac, entry->mac, sizeof(priv->current_mac));
-	entry->reg_id = reg_id;
-	hlist_add_head_rcu(&entry->hlist,
-			   &priv->mac_hash[entry->mac[MLX4_EN_MAC_HASH_IDX]]);
-
-	return 0;
-
-alloc_err:
-	if (priv->tunnel_reg_id)
-		mlx4_flow_detach(priv->mdev->dev, priv->tunnel_reg_id);
-
-tunnel_err:
-	mlx4_en_uc_steer_release(priv, priv->dev->dev_addr, *qpn, reg_id);
-	return err;
-}
-
-static void mlx4_en_delete_rss_steer_rules(struct mlx4_en_priv *priv)
-{
-	u64 mac;
-	unsigned int i;
-	int qpn = priv->base_qpn;
-	struct hlist_head *bucket;
-	struct hlist_node *tmp;
-	struct mlx4_mac_entry *entry;
-
-	for (i = 0; i < MLX4_EN_MAC_HASH_SIZE; ++i) {
-		bucket = &priv->mac_hash[i];
-		hlist_for_each_entry_safe(entry, tmp, bucket, hlist) {
-			mac = mlx4_mac_to_u64(entry->mac);
-			en_dbg(DRV, priv, "Registering MAC:%pM for deleting\n",
-			       entry->mac);
-			mlx4_en_uc_steer_release(priv, entry->mac,
-						 qpn, entry->reg_id);
-
-			mlx4_unregister_mac(priv->mdev->dev, priv->port, mac);
-			hlist_del_rcu(&entry->hlist);
-			kfree_rcu(entry, rcu);
-		}
-	}
-
-	if (priv->tunnel_reg_id) {
-		mlx4_flow_detach(priv->mdev->dev, priv->tunnel_reg_id);
-		priv->tunnel_reg_id = 0;
-	}
-}
-
-static void mlx4_en_tx_timeout(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int i;
-
-	if (netif_msg_timer(priv))
-		en_warn(priv, "Tx timeout called on port:%d\n", priv->port);
-
-	for (i = 0; i < priv->tx_ring_num; i++) {
-		if (!netif_tx_queue_stopped(netdev_get_tx_queue(dev, i)))
-			continue;
-		en_warn(priv, "TX timeout on queue: %d, QP: 0x%x, CQ: 0x%x, Cons: 0x%x, Prod: 0x%x\n",
-			i, priv->tx_ring[i]->qpn, priv->tx_ring[i]->cqn,
-			priv->tx_ring[i]->cons, priv->tx_ring[i]->prod);
-	}
-
-	priv->port_stats.tx_timeout++;
-	if (!test_and_set_bit(MLX4_EN_STATE_FLAG_RESTARTING, &priv->state)) {
-		en_dbg(DRV, priv, "Scheduling port restart\n");
-		queue_work(mdev->workqueue, &priv->restart_task);
-	}
-}
-
-
-static struct net_device_stats *mlx4_en_get_stats(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-
-	spin_lock_bh(&priv->stats_lock);
-	memcpy(&priv->ret_stats, &priv->stats, sizeof(priv->stats));
-	spin_unlock_bh(&priv->stats_lock);
-
-	return &priv->ret_stats;
-}
-
-static void mlx4_en_set_default_moderation(struct mlx4_en_priv *priv)
-{
-	struct mlx4_en_cq *cq;
-	int i;
-
-	/* If we haven't received a specific coalescing setting
-	 * (module param), we set the moderation parameters as follows:
-	 * - moder_cnt is set to the number of mtu sized packets to
-	 *   satisfy our coalescing target.
-	 * - moder_time is set to a fixed value.
-	 */
-	priv->rx_frames = MLX4_EN_RX_COAL_TARGET;
-	priv->rx_usecs = MLX4_EN_RX_COAL_TIME;
-	priv->tx_frames = MLX4_EN_TX_COAL_PKTS;
-	priv->tx_usecs = MLX4_EN_TX_COAL_TIME;
-	en_dbg(INTR, priv, "Default coalesing params for mtu:%d - rx_frames:%d rx_usecs:%d\n",
-	       priv->dev->mtu, priv->rx_frames, priv->rx_usecs);
-
-	/* Setup cq moderation params */
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		cq = priv->rx_cq[i];
-		cq->moder_cnt = priv->rx_frames;
-		cq->moder_time = priv->rx_usecs;
-		priv->last_moder_time[i] = MLX4_EN_AUTO_CONF;
-		priv->last_moder_packets[i] = 0;
-		priv->last_moder_bytes[i] = 0;
-	}
-
-	for (i = 0; i < priv->tx_ring_num; i++) {
-		cq = priv->tx_cq[i];
-		cq->moder_cnt = priv->tx_frames;
-		cq->moder_time = priv->tx_usecs;
-	}
-
-	/* Reset auto-moderation params */
-	priv->pkt_rate_low = MLX4_EN_RX_RATE_LOW;
-	priv->rx_usecs_low = MLX4_EN_RX_COAL_TIME_LOW;
-	priv->pkt_rate_high = MLX4_EN_RX_RATE_HIGH;
-	priv->rx_usecs_high = MLX4_EN_RX_COAL_TIME_HIGH;
-	priv->sample_interval = MLX4_EN_SAMPLE_INTERVAL;
-	priv->adaptive_rx_coal = 1;
-	priv->last_moder_jiffies = 0;
-	priv->last_moder_tx_packets = 0;
-}
-
-static void mlx4_en_auto_moderation(struct mlx4_en_priv *priv)
-{
-	unsigned long period = (unsigned long) (jiffies - priv->last_moder_jiffies);
-	struct mlx4_en_cq *cq;
-	unsigned long packets;
-	unsigned long rate;
-	unsigned long avg_pkt_size;
-	unsigned long rx_packets;
-	unsigned long rx_bytes;
-	unsigned long rx_pkt_diff;
-	int moder_time;
-	int ring, err;
-
-	if (!priv->adaptive_rx_coal || period < priv->sample_interval * HZ)
-		return;
-
-	for (ring = 0; ring < priv->rx_ring_num; ring++) {
-		spin_lock_bh(&priv->stats_lock);
-		rx_packets = priv->rx_ring[ring]->packets;
-		rx_bytes = priv->rx_ring[ring]->bytes;
-		spin_unlock_bh(&priv->stats_lock);
-
-		rx_pkt_diff = ((unsigned long) (rx_packets -
-				priv->last_moder_packets[ring]));
-		packets = rx_pkt_diff;
-		rate = packets * HZ / period;
-		avg_pkt_size = packets ? ((unsigned long) (rx_bytes -
-				priv->last_moder_bytes[ring])) / packets : 0;
-
-		/* Apply auto-moderation only when packet rate
-		 * exceeds a rate that it matters */
-		if (rate > (MLX4_EN_RX_RATE_THRESH / priv->rx_ring_num) &&
-		    avg_pkt_size > MLX4_EN_AVG_PKT_SMALL) {
-			if (rate < priv->pkt_rate_low)
-				moder_time = priv->rx_usecs_low;
-			else if (rate > priv->pkt_rate_high)
-				moder_time = priv->rx_usecs_high;
-			else
-				moder_time = (rate - priv->pkt_rate_low) *
-					(priv->rx_usecs_high - priv->rx_usecs_low) /
-					(priv->pkt_rate_high - priv->pkt_rate_low) +
-					priv->rx_usecs_low;
-		} else {
-			moder_time = priv->rx_usecs_low;
-		}
-
-		if (moder_time != priv->last_moder_time[ring]) {
-			priv->last_moder_time[ring] = moder_time;
-			cq = priv->rx_cq[ring];
-			cq->moder_time = moder_time;
-			cq->moder_cnt = priv->rx_frames;
-			err = mlx4_en_set_cq_moder(priv, cq);
-			if (err)
-				en_err(priv, "Failed modifying moderation for cq:%d\n",
-				       ring);
-		}
-		priv->last_moder_packets[ring] = rx_packets;
-		priv->last_moder_bytes[ring] = rx_bytes;
-	}
-
-	priv->last_moder_jiffies = jiffies;
-}
-
-static void mlx4_en_do_get_stats(struct work_struct *work)
-{
-	struct delayed_work *delay = to_delayed_work(work);
-	struct mlx4_en_priv *priv = container_of(delay, struct mlx4_en_priv,
-						 stats_task);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int err;
-
-	mutex_lock(&mdev->state_lock);
-	if (mdev->device_up) {
-		if (priv->port_up) {
-			err = mlx4_en_DUMP_ETH_STATS(mdev, priv->port, 0);
-			if (err)
-				en_dbg(HW, priv, "Could not update stats\n");
-
-			mlx4_en_auto_moderation(priv);
-		}
-
-		queue_delayed_work(mdev->workqueue, &priv->stats_task, STATS_DELAY);
-	}
-	if (mdev->mac_removed[MLX4_MAX_PORTS + 1 - priv->port]) {
-		mlx4_en_do_set_mac(priv, priv->current_mac);
-		mdev->mac_removed[MLX4_MAX_PORTS + 1 - priv->port] = 0;
-	}
-	mutex_unlock(&mdev->state_lock);
-}
-
-/* mlx4_en_service_task - Run service task for tasks that needed to be done
- * periodically
+/*
+ * Calculate numbers for 'df', pessimistic in case of mixed raid profiles.
+ *
+ * If there's a redundant raid level at DATA block groups, use the respective
+ * multiplier to scale the sizes.
+ *
+ * Unused device space usage is based on simulating the chunk allocator
+ * algorithm that respects the device sizes, order of allocations and the
+ * 'alloc_start' value, this is a close approximation of the actual use but
+ * there are other factors that may change the result (like a new metadata
+ * chunk).
+ *
+ * If metadata is exhausted, f_bavail will be 0.
+ *
+ * FIXME: not accurate for mixed block groups, total and free/used are ok,
+ * available appears slightly larger.
  */
-static void mlx4_en_service_task(struct work_struct *work)
+static int btrfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
-	struct delayed_work *delay = to_delayed_work(work);
-	struct mlx4_en_priv *priv = container_of(delay, struct mlx4_en_priv,
-						 service_task);
-	struct mlx4_en_dev *mdev = priv->mdev;
+	struct btrfs_fs_info *fs_info = btrfs_sb(dentry->d_sb);
+	struct btrfs_super_block *disk_super = fs_info->super_copy;
+	struct list_head *head = &fs_info->space_info;
+	struct btrfs_space_info *found;
+	u64 total_used = 0;
+	u64 total_free_data = 0;
+	u64 total_free_meta = 0;
+	int bits = dentry->d_sb->s_blocksize_bits;
+	__be32 *fsid = (__be32 *)fs_info->fsid;
+	unsigned factor = 1;
+	struct btrfs_block_rsv *block_rsv = &fs_info->global_block_rsv;
+	int ret;
+	u64 thresh = 0;
+	int mixed = 0;
 
-	mutex_lock(&mdev->state_lock);
-	if (mdev->device_up) {
-		if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_TS)
-			mlx4_en_ptp_overflow_check(mdev);
-
-		mlx4_en_recover_from_oom(priv);
-		queue_delayed_work(mdev->workqueue, &priv->service_task,
-				   SERVICE_TASK_DELAY);
-	}
-	mutex_unlock(&mdev->state_lock);
-}
-
-static void mlx4_en_linkstate(struct work_struct *work)
-{
-	struct mlx4_en_priv *priv = container_of(work, struct mlx4_en_priv,
-						 linkstate_task);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int linkstate = priv->link_state;
-
-	mutex_lock(&mdev->state_lock);
-	/* If observable port state changed set carrier state and
-	 * report to system log */
-	if (priv->last_link_state != linkstate) {
-		if (linkstate == MLX4_DEV_EVENT_PORT_DOWN) {
-			en_info(priv, "Link Down\n");
-			netif_carrier_off(priv->dev);
-		} else {
-			en_info(priv, "Link Up\n");
-			netif_carrier_on(priv->dev);
-		}
-	}
-	priv->last_link_state = linkstate;
-	mutex_unlock(&mdev->state_lock);
-}
-
-static int mlx4_en_init_affinity_hint(struct mlx4_en_priv *priv, int ring_idx)
-{
-	struct mlx4_en_rx_ring *ring = priv->rx_ring[ring_idx];
-	int numa_node = priv->mdev->dev->numa_node;
-
-	if (!zalloc_cpumask_var(&ring->affinity_mask, GFP_KERNEL))
-		return -ENOMEM;
-
-	cpumask_set_cpu(cpumask_local_spread(ring_idx, numa_node),
-			ring->affinity_mask);
-	return 0;
-}
-
-static void mlx4_en_free_affinity_hint(struct mlx4_en_priv *priv, int ring_idx)
-{
-	free_cpumask_var(priv->rx_ring[ring_idx]->affinity_mask);
-}
-
-int mlx4_en_start_port(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct mlx4_en_cq *cq;
-	struct mlx4_en_tx_ring *tx_ring;
-	int rx_index = 0;
-	int tx_index = 0;
-	int err = 0;
-	int i;
-	int j;
-	u8 mc_list[16] = {0};
-
-	if (priv->port_up) {
-		en_dbg(DRV, priv, "start port called while port already up\n");
-		return 0;
-	}
-
-	INIT_LIST_HEAD(&priv->mc_list);
-	INIT_LIST_HEAD(&priv->curr_list);
-	INIT_LIST_HEAD(&priv->ethtool_list);
-	memset(&priv->ethtool_rules[0], 0,
-	       sizeof(struct ethtool_flow_id) * MAX_NUM_OF_FS_RULES);
-
-	/* Calculate Rx buf size */
-	dev->mtu = min(dev->mtu, priv->max_mtu);
-	mlx4_en_calc_rx_buf(dev);
-	en_dbg(DRV, priv, "Rx buf size:%d\n", priv->rx_skb_size);
-
-	/* Configure rx cq's and rings */
-	err = mlx4_en_activate_rx_rings(priv);
-	if (err) {
-		en_err(priv, "Failed to activate RX rings\n");
-		return err;
-	}
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		cq = priv->rx_cq[i];
-
-		mlx4_en_cq_init_lock(cq);
-
-		err = mlx4_en_init_affinity_hint(priv, i);
-		if (err) {
-			en_err(priv, "Failed preparing IRQ affinity hint\n");
-			goto cq_err;
-		}
-
-		err = mlx4_en_activate_cq(priv, cq, i);
-		if (err) {
-			en_err(priv, "Failed activating Rx CQ\n");
-			mlx4_en_free_affinity_hint(priv, i);
-			goto cq_err;
-		}
-
-		for (j = 0; j < cq->size; j++) {
-			struct mlx4_cqe *cqe = NULL;
-
-			cqe = mlx4_en_get_cqe(cq->buf, j, priv->cqe_size) +
-			      priv->cqe_factor;
-			cqe->owner_sr_opcode = MLX4_CQE_OWNER_MASK;
-		}
-
-		err = mlx4_en_set_cq_moder(priv, cq);
-		if (err) {
-			en_err(priv, "Failed setting cq moderation parameters\n");
-			mlx4_en_deactivate_cq(priv, cq);
-			mlx4_en_free_affinity_hint(priv, i);
-			goto cq_err;
-		}
-		mlx4_en_arm_cq(priv, cq);
-		priv->rx_ring[i]->cqn = cq->mcq.cqn;
-		++rx_index;
-	}
-
-	/* Set qp number */
-	en_dbg(DRV, priv, "Getting qp number for port %d\n", priv->port);
-	err = mlx4_en_get_qp(priv);
-	if (err) {
-		en_err(priv, "Failed getting eth qp\n");
-		goto cq_err;
-	}
-	mdev->mac_removed[priv->port] = 0;
-
-	priv->counter_index =
-			mlx4_get_default_counter_index(mdev->dev, priv->port);
-
-	err = mlx4_en_config_rss_steer(priv);
-	if (err) {
-		en_err(priv, "Failed configuring rss steering\n");
-		goto mac_err;
-	}
-
-	err = mlx4_en_create_drop_qp(priv);
-	if (err)
-		goto rss_err;
-
-	/* Configure tx cq's and rings */
-	for (i = 0; i < priv->tx_ring_num; i++) {
-		/* Configure cq */
-		cq = priv->tx_cq[i];
-		err = mlx4_en_activate_cq(priv, cq, i);
-		if (err) {
-			en_err(priv, "Failed allocating Tx CQ\n");
-			goto tx_err;
-		}
-		err = mlx4_en_set_cq_moder(priv, cq);
-		if (err) {
-			en_err(priv, "Failed setting cq moderation parameters\n");
-			mlx4_en_deactivate_cq(priv, cq);
-			goto tx_err;
-		}
-		en_dbg(DRV, priv, "Resetting index of collapsed CQ:%d to -1\n", i);
-		cq->buf->wqe_index = cpu_to_be16(0xffff);
-
-		/* Configure ring */
-		tx_ring = priv->tx_ring[i];
-		err = mlx4_en_activate_tx_ring(priv, tx_ring, cq->mcq.cqn,
-			i / priv->num_tx_rings_p_up);
-		if (err) {
-			en_err(priv, "Failed allocating Tx ring\n");
-			mlx4_en_deactivate_cq(priv, cq);
-			goto tx_err;
-		}
-		tx_ring->tx_queue = netdev_get_tx_queue(dev, i);
-
-		/* Arm CQ for TX completions */
-		mlx4_en_arm_cq(priv, cq);
-
-		/* Set initial ownership of all Tx TXBBs to SW (1) */
-		for (j = 0; j < tx_ring->buf_size; j += STAMP_STRIDE)
-			*((u32 *) (tx_ring->buf + j)) = 0xffffffff;
-		++tx_index;
-	}
-
-	/* Configure port */
-	err = mlx4_SET_PORT_general(mdev->dev, priv->port,
-				    priv->rx_skb_size + ETH_FCS_LEN,
-				    priv->prof->tx_pause,
-				    priv->prof->tx_ppp,
-				    priv->prof->rx_pause,
-				    priv->prof->rx_ppp);
-	if (err) {
-		en_err(priv, "Failed setting port general configurations for port %d, with error %d\n",
-		       priv->port, err);
-		goto tx_err;
-	}
-	/* Set default qp number */
-	err = mlx4_SET_PORT_qpn_calc(mdev->dev, priv->port, priv->base_qpn, 0);
-	if (err) {
-		en_err(priv, "Failed setting default qp numbers\n");
-		goto tx_err;
-	}
-
-	if (mdev->dev->caps.tunnel_offload_mode == MLX4_TUNNEL_OFFLOAD_MODE_VXLAN) {
-		err = mlx4_SET_PORT_VXLAN(mdev->dev, priv->port, VXLAN_STEER_BY_OUTER_MAC, 1);
-		if (err) {
-			en_err(priv, "Failed setting port L2 tunnel configuration, err %d\n",
-			       err);
-			goto tx_err;
-		}
-	}
-
-	/* Init port */
-	en_dbg(HW, priv, "Initializing port\n");
-	err = mlx4_INIT_PORT(mdev->dev, priv->port);
-	if (err) {
-		en_err(priv, "Failed Initializing port\n");
-		goto tx_err;
-	}
-
-	/* Set Unicast and VXLAN steering rules */
-	if (mdev->dev->caps.steering_mode != MLX4_STEERING_MODE_A0 &&
-	    mlx4_en_set_rss_steer_rules(priv))
-		mlx4_warn(mdev, "Failed setting steering rules\n");
-
-	/* Attach rx QP to bradcast address */
-	eth_broadcast_addr(&mc_list[10]);
-	mc_list[5] = priv->port; /* needed for B0 steering support */
-	if (mlx4_multicast_attach(mdev->dev, &priv->rss_map.indir_qp, mc_list,
-				  priv->port, 0, MLX4_PROT_ETH,
-				  &priv->broadcast_id))
-		mlx4_warn(mdev, "Failed Attaching Broadcast\n");
-
-	/* Must redo promiscuous mode setup. */
-	priv->flags &= ~(MLX4_EN_FLAG_PROMISC | MLX4_EN_FLAG_MC_PROMISC);
-
-	/* Schedule multicast task to populate multicast list */
-	queue_work(mdev->workqueue, &priv->rx_mode_task);
-
-#ifdef CONFIG_MLX4_EN_VXLAN
-	if (priv->mdev->dev->caps.tunnel_offload_mode == MLX4_TUNNEL_OFFLOAD_MODE_VXLAN)
-		vxlan_get_rx_port(dev);
-#endif
-	priv->port_up = true;
-
-	/* Process all completions if exist to prevent
-	 * the queues freezing if they are full
+	/*
+	 * holding chunk_muext to avoid allocating new chunks, holding
+	 * device_list_mutex to avoid the device being removed
 	 */
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		local_bh_disable();
-		napi_schedule(&priv->rx_cq[i]->napi);
-		local_bh_enable();
+	rcu_read_lock();
+	list_for_each_entry_rcu(found, head, list) {
+		if (found->flags & BTRFS_BLOCK_GROUP_DATA) {
+			int i;
+
+			total_free_data += found->disk_total - found->disk_used;
+			total_free_data -=
+				btrfs_account_ro_block_groups_free_space(found);
+
+			for (i = 0; i < BTRFS_NR_RAID_TYPES; i++) {
+				if (!list_empty(&found->block_groups[i])) {
+					switch (i) {
+					case BTRFS_RAID_DUP:
+					case BTRFS_RAID_RAID1:
+					case BTRFS_RAID_RAID10:
+						factor = 2;
+					}
+				}
+			}
+		}
+
+		/*
+		 * Metadata in mixed block goup profiles are accounted in data
+		 */
+		if (!mixed && found->flags & BTRFS_BLOCK_GROUP_METADATA) {
+			if (found->flags & BTRFS_BLOCK_GROUP_DATA)
+				mixed = 1;
+			else
+				total_free_meta += found->disk_total -
+					found->disk_used;
+		}
+
+		total_used += found->disk_used;
 	}
 
-	clear_bit(MLX4_EN_STATE_FLAG_RESTARTING, &priv->state);
-	netif_tx_start_all_queues(dev);
-	netif_device_attach(dev);
+	rcu_read_unlock();
+
+	buf->f_blocks = div_u64(btrfs_super_total_bytes(disk_super), factor);
+	buf->f_blocks >>= bits;
+	buf->f_bfree = buf->f_blocks - (div_u64(total_used, factor) >> bits);
+
+	/* Account global block reserve as used, it's in logical size already */
+	spin_lock(&block_rsv->lock);
+	buf->f_bfree -= block_rsv->size >> bits;
+	spin_unlock(&block_rsv->lock);
+
+	buf->f_bavail = div_u64(total_free_data, factor);
+	ret = btrfs_calc_avail_data_space(fs_info->tree_root, &total_free_data);
+	if (ret)
+		return ret;
+	buf->f_bavail += div_u64(total_free_data, factor);
+	buf->f_bavail = buf->f_bavail >> bits;
+
+	/*
+	 * We calculate the remaining metadata space minus global reserve. If
+	 * this is (supposedly) smaller than zero, there's no space. But this
+	 * does not hold in practice, the exhausted state happens where's still
+	 * some positive delta. So we apply some guesswork and compare the
+	 * delta to a 4M threshold.  (Practically observed delta was ~2M.)
+	 *
+	 * We probably cannot calculate the exact threshold value because this
+	 * depends on the internal reservations requested by various
+	 * operations, so some operations that consume a few metadata will
+	 * succeed even if the Avail is zero. But this is better than the other
+	 * way around.
+	 */
+	thresh = 4 * 1024 * 1024;
+
+	/*
+	 * We only want to claim there's no available space if we can no longer
+	 * allocate chunks for our metadata profile and our global reserve will
+	 * not fit in the free metadata space.  If we aren't ->full then we
+	 * still can allocate chunks and thus are fine using the currently
+	 * calculated f_bavail.
+	 */
+	if (!mixed && block_rsv->space_info->full &&
+	    (total_free_meta < thresh || total_free_meta - thresh < block_rsv->size))
+		buf->f_bavail = 0;
+
+	buf->f_type = BTRFS_SUPER_MAGIC;
+	buf->f_bsize = dentry->d_sb->s_blocksize;
+	buf->f_namelen = BTRFS_NAME_LEN;
+
+	/* We treat it as constant endianness (it doesn't matter _which_)
+	   because we want the fsid to come out the same whether mounted
+	   on a big-endian or little-endian host */
+	buf->f_fsid.val[0] = be32_to_cpu(fsid[0]) ^ be32_to_cpu(fsid[2]);
+	buf->f_fsid.val[1] = be32_to_cpu(fsid[1]) ^ be32_to_cpu(fsid[3]);
+	/* Mask in the root object ID too, to disambiguate subvols */
+	buf->f_fsid.val[0] ^= BTRFS_I(d_inode(dentry))->root->objectid >> 32;
+	buf->f_fsid.val[1] ^= BTRFS_I(d_inode(dentry))->root->objectid;
+
+	return 0;
+}
+
+static void btrfs_kill_super(struct super_block *sb)
+{
+	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
+	kill_anon_super(sb);
+	free_fs_info(fs_info);
+}
+
+static struct file_system_type btrfs_fs_type = {
+	.owner		= THIS_MODULE,
+	.name		= "btrfs",
+	.mount		= btrfs_mount,
+	.kill_sb	= btrfs_kill_super,
+	.fs_flags	= FS_REQUIRES_DEV | FS_BINARY_MOUNTDATA,
+};
+MODULE_ALIAS_FS("btrfs");
+
+static int btrfs_control_open(struct inode *inode, struct file *file)
+{
+	/*
+	 * The control file's private_data is used to hold the
+	 * transaction when it is started and is used to keep
+	 * track of whether a transaction is already in progress.
+	 */
+	file->private_data = NULL;
+	return 0;
+}
+
+/*
+ * used by btrfsctl to scan devices when no FS is mounted
+ */
+static long btrfs_control_ioctl(struct file *file, unsigned int cmd,
+				unsigned long arg)
+{
+	struct btrfs_ioctl_vol_args *vol;
+	struct btrfs_fs_devices *fs_devices;
+	int ret = -ENOTTY;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	vol = memdup_user((void __user *)arg, sizeof(*vol));
+	if (IS_ERR(vol))
+		return PTR_ERR(vol);
+	vol->name[BTRFS_PATH_NAME_MAX] = '\0';
+
+	switch (cmd) {
+	case BTRFS_IOC_SCAN_DEV:
+		ret = btrfs_scan_one_device(vol->name, FMODE_READ,
+					    &btrfs_fs_type, &fs_devices);
+		break;
+	case BTRFS_IOC_DEVICES_READY:
+		ret = btrfs_scan_one_device(vol->name, FMODE_READ,
+					    &btrfs_fs_type, &fs_devices);
+		if (ret)
+			break;
+		ret = !(fs_devices->num_devices == fs_devices->total_devices);
+		break;
+	}
+
+	kfree(vol);
+	return ret;
+}
+
+static int btrfs_freeze(struct super_block *sb)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_root *root = btrfs_sb(sb)->tree_root;
+
+	trans = btrfs_attach_transaction_barrier(root);
+	if (IS_ERR(trans)) {
+		/* no transaction, don't bother */
+		if (PTR_ERR(trans) == -ENOENT)
+			return 0;
+		return PTR_ERR(trans);
+	}
+	return btrfs_commit_transaction(trans, root);
+}
+
+static int btrfs_show_devname(struct seq_file *m, struct dentry *root)
+{
+	struct btrfs_fs_info *fs_info = btrfs_sb(root->d_sb);
+	struct btrfs_fs_devices *cur_devices;
+	struct btrfs_device *dev, *first_dev = NULL;
+	struct list_head *head;
+	struct rcu_string *name;
+
+	mutex_lock(&fs_info->fs_devices->device_list_mutex);
+	cur_devices = fs_info->fs_devices;
+	while (cur_devices) {
+		head = &cur_devices->devices;
+		list_for_each_entry(dev, head, dev_list) {
+			if (dev->missing)
+				continue;
+			if (!dev->name)
+				continue;
+			if (!first_dev || dev->devid < first_dev->devid)
+				first_dev = dev;
+		}
+		cur_devices = cur_devices->seed;
+	}
+
+	if (first_dev) {
+		rcu_read_lock();
+		name = rcu_dereference(first_dev->name);
+		seq_escape(m, name->str, " \t\n\\");
+		rcu_read_unlock();
+	} else {
+		WARN_ON(1);
+	}
+	mutex_unlock(&fs_info->fs_devices->device_list_mutex);
+	return 0;
+}
+
+static const struct super_operations btrfs_super_ops = {
+	.drop_inode	= btrfs_drop_inode,
+	.evict_inode	= btrfs_evict_inode,
+	.put_super	= btrfs_put_super,
+	.sync_fs	= btrfs_sync_fs,
+	.show_options	= btrfs_show_options,
+	.show_devname	= btrfs_show_devname,
+	.write_inode	= btrfs_write_inode,
+	.alloc_inode	= btrfs_alloc_inode,
+	.destroy_inode	= btrfs_destroy_inode,
+	.statfs		= btrfs_statfs,
+	.remount_fs	= btrfs_remount,
+	.freeze_fs	= btrfs_freeze,
+};
+
+static const struct file_operations btrfs_ctl_fops = {
+	.open = btrfs_control_open,
+	.unlocked_ioctl	 = btrfs_control_ioctl,
+	.compat_ioctl = btrfs_control_ioctl,
+	.owner	 = THIS_MODULE,
+	.llseek = noop_llseek,
+};
+
+static struct miscdevice btrfs_misc = {
+	.minor		= BTRFS_MINOR,
+	.name		= "btrfs-control",
+	.fops		= &btrfs_ctl_fops
+};
+
+MODULE_ALIAS_MISCDEV(BTRFS_MINOR);
+MODULE_ALIAS("devname:btrfs-control");
+
+static int btrfs_interface_init(void)
+{
+	return misc_register(&btrfs_misc);
+}
+
+static void btrfs_interface_exit(void)
+{
+	misc_deregister(&btrfs_misc);
+}
+
+static void btrfs_print_info(void)
+{
+	printk(KERN_INFO "Btrfs loaded"
+#ifdef CONFIG_BTRFS_DEBUG
+			", debug=on"
+#endif
+#ifdef CONFIG_BTRFS_ASSERT
+			", assert=on"
+#endif
+#ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+			", integrity-checker=on"
+#endif
+			"\n");
+}
+
+static int btrfs_run_sanity_tests(void)
+{
+	int ret;
+
+	ret = btrfs_init_test_fs();
+	if (ret)
+		return ret;
+
+	ret = btrfs_test_free_space_cache();
+	if (ret)
+		goto out;
+	ret = btrfs_test_extent_buffer_operations();
+	if (ret)
+		goto out;
+	ret = btrfs_test_extent_io();
+	if (ret)
+		goto out;
+	ret = btrfs_test_inodes();
+	if (ret)
+		goto out;
+	ret = btrfs_test_qgroups();
+out:
+	btrfs_destroy_test_fs();
+	return ret;
+}
+
+static int __init init_btrfs_fs(void)
+{
+	int err;
+
+	err = btrfs_hash_init();
+	if (err)
+		return err;
+
+	btrfs_props_init();
+
+	err = btrfs_init_sysfs();
+	if (err)
+		goto free_hash;
+
+	btrfs_init_compress();
+
+	err = btrfs_init_cachep();
+	if (err)
+		goto free_compress;
+
+	err = extent_io_init();
+	if (err)
+		goto free_cachep;
+
+	err = extent_map_init();
+	if (err)
+		goto free_extent_io;
+
+	err = ordered_data_init();
+	if (err)
+		goto free_extent_map;
+
+	err = btrfs_delayed_inode_init();
+	if (err)
+		goto free_ordered_data;
+
+	err = btrfs_auto_defrag_init();
+	if (err)
+		goto free_delayed_inode;
+
+	err = btrfs_delayed_ref_init();
+	if (err)
+		goto free_auto_defrag;
+
+	err = btrfs_prelim_ref_init();
+	if (err)
+		goto free_delayed_ref;
+
+	err = btrfs_end_io_wq_init();
+	if (err)
+		goto free_prelim_ref;
+
+	err = btrfs_interface_init();
+	if (err)
+		goto free_end_io_wq;
+
+	btrfs_init_lockdep();
+
+	btrfs_print_info();
+
+	err = btrfs_run_sanity_tests();
+	if (err)
+		goto unregister_ioctl;
+
+	err = register_filesystem(&btrfs_fs_type);
+	if (err)
+		goto unregister_ioctl;
 
 	return 0;
 
-tx_err:
-	while (tx_index--) {
-		mlx4_en_deactivate_tx_ring(priv, priv->tx_ring[tx_index]);
-		mlx4_en_deactivate_cq(priv, priv->tx_cq[tx_index]);
-	}
-	mlx4_en_destroy_drop_qp(priv);
-rss_err:
-	mlx4_en_release_rss_steer(priv);
-mac_err:
-	mlx4_en_put_qp(priv);
-cq_err:
-	while (rx_index--) {
-		mlx4_en_deactivate_cq(priv, priv->rx_cq[rx_index]);
-		mlx4_en_free_affinity_hint(priv, rx_index);
-	}
-	for (i = 0; i < priv->rx_ring_num; i++)
-		mlx4_en_deactivate_rx_ring(priv, priv->rx_ring[i]);
-
-	return err; /* need to close devices */
-}
-
-
-void mlx4_en_stop_port(struct net_device *dev, int detach)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct mlx4_en_mc_list *mclist, *tmp;
-	struct ethtool_flow_id *flow, *tmp_flow;
-	int i;
-	u8 mc_list[16] = {0};
-
-	if (!priv->port_up) {
-		en_dbg(DRV, priv, "stop port called while port already down\n");
-		return;
-	}
-
-	/* close port*/
-	mlx4_CLOSE_PORT(mdev->dev, priv->port);
-
-	/* Synchronize with tx routine */
-	netif_tx_lock_bh(dev);
-	if (detach)
-		netif_device_detach(dev);
-	netif_tx_stop_all_queues(dev);
-	netif_tx_unlock_bh(dev);
-
-	netif_tx_disable(dev);
-
-	/* Set port as not active */
-	priv->port_up = false;
-	priv->counter_index = MLX4_SINK_COUNTER_INDEX(mdev->dev);
-
-	/* Promsicuous mode */
-	if (mdev->dev->caps.steering_mode ==
-	    MLX4_STEERING_MODE_DEVICE_MANAGED) {
-		priv->flags &= ~(MLX4_EN_FLAG_PROMISC |
-				 MLX4_EN_FLAG_MC_PROMISC);
-		mlx4_flow_steer_promisc_remove(mdev->dev,
-					       priv->port,
-					       MLX4_FS_ALL_DEFAULT);
-		mlx4_flow_steer_promisc_remove(mdev->dev,
-					       priv->port,
-					       MLX4_FS_MC_DEFAULT);
-	} else if (priv->flags & MLX4_EN_FLAG_PROMISC) {
-		priv->flags &= ~MLX4_EN_FLAG_PROMISC;
-
-		/* Disable promiscouos mode */
-		mlx4_unicast_promisc_remove(mdev->dev, priv->base_qpn,
-					    priv->port);
-
-		/* Disable Multicast promisc */
-		if (priv->flags & MLX4_EN_FLAG_MC_PROMISC) {
-			mlx4_multicast_promisc_remove(mdev->dev, priv->base_qpn,
-						      priv->port);
-			priv->flags &= ~MLX4_EN_FLAG_MC_PROMISC;
-		}
-	}
-
-	/* Detach All multicasts */
-	eth_broadcast_addr(&mc_list[10]);
-	mc_list[5] = priv->port; /* needed for B0 steering support */
-	mlx4_multicast_detach(mdev->dev, &priv->rss_map.indir_qp, mc_list,
-			      MLX4_PROT_ETH, priv->broadcast_id);
-	list_for_each_entry(mclist, &priv->curr_list, list) {
-		memcpy(&mc_list[10], mclist->addr, ETH_ALEN);
-		mc_list[5] = priv->port;
-		mlx4_multicast_detach(mdev->dev, &priv->rss_map.indir_qp,
-				      mc_list, MLX4_PROT_ETH, mclist->reg_id);
-		if (mclist->tunnel_reg_id)
-			mlx4_flow_detach(mdev->dev, mclist->tunnel_reg_id);
-	}
-	mlx4_en_clear_list(dev);
-	list_for_each_entry_safe(mclist, tmp, &priv->curr_list, list) {
-		list_del(&mclist->list);
-		kfree(mclist);
-	}
-
-	/* Flush multicast filter */
-	mlx4_SET_MCAST_FLTR(mdev->dev, priv->port, 0, 1, MLX4_MCAST_CONFIG);
-
-	/* Remove flow steering rules for the port*/
-	if (mdev->dev->caps.steering_mode ==
-	    MLX4_STEERING_MODE_DEVICE_MANAGED) {
-		ASSERT_RTNL();
-		list_for_each_entry_safe(flow, tmp_flow,
-					 &priv->ethtool_list, list) {
-			mlx4_flow_detach(mdev->dev, flow->id);
-			list_del(&flow->list);
-		}
-	}
-
-	mlx4_en_destroy_drop_qp(priv);
-
-	/* Free TX Rings */
-	for (i = 0; i < priv->tx_ring_num; i++) {
-		mlx4_en_deactivate_tx_ring(priv, priv->tx_ring[i]);
-		mlx4_en_deactivate_cq(priv, priv->tx_cq[i]);
-	}
-	msleep(10);
-
-	for (i = 0; i < priv->tx_ring_num; i++)
-		mlx4_en_free_tx_buf(dev, priv->tx_ring[i]);
-
-	if (mdev->dev->caps.steering_mode != MLX4_STEERING_MODE_A0)
-		mlx4_en_delete_rss_steer_rules(priv);
-
-	/* Free RSS qps */
-	mlx4_en_release_rss_steer(priv);
-
-	/* Unregister Mac address for the port */
-	mlx4_en_put_qp(priv);
-	if (!(mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_REASSIGN_MAC_EN))
-		mdev->mac_removed[priv->port] = 1;
-
-	/* Free RX Rings */
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		struct mlx4_en_cq *cq = priv->rx_cq[i];
-
-		local_bh_disable();
-		while (!mlx4_en_cq_lock_napi(cq)) {
-			pr_info("CQ %d locked\n", i);
-			mdelay(1);
-		}
-		local_bh_enable();
-
-		napi_synchronize(&cq->napi);
-		mlx4_en_deactivate_rx_ring(priv, priv->rx_ring[i]);
-		mlx4_en_deactivate_cq(priv, cq);
-
-		mlx4_en_free_affinity_hint(priv, i);
-	}
-}
-
-static void mlx4_en_restart(struct work_struct *work)
-{
-	struct mlx4_en_priv *priv = container_of(work, struct mlx4_en_priv,
-						 restart_task);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct net_device *dev = priv->dev;
-
-	en_dbg(DRV, priv, "Watchdog task called for port %d\n", priv->port);
-
-	mutex_lock(&mdev->state_lock);
-	if (priv->port_up) {
-		mlx4_en_stop_port(dev, 1);
-		if (mlx4_en_start_port(dev))
-			en_err(priv, "Failed restarting port %d\n", priv->port);
-	}
-	mutex_unlock(&mdev->state_lock);
-}
-
-static void mlx4_en_clear_stats(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int i;
-
-	if (mlx4_en_DUMP_ETH_STATS(mdev, priv->port, 1))
-		en_dbg(HW, priv, "Failed dumping statistics\n");
-
-	memset(&priv->stats, 0, sizeof(priv->stats));
-	memset(&priv->pstats, 0, sizeof(priv->pstats));
-	memset(&priv->pkstats, 0, sizeof(priv->pkstats));
-	memset(&priv->port_stats, 0, sizeof(priv->port_stats));
-	memset(&priv->rx_flowstats, 0, sizeof(priv->rx_flowstats));
-	memset(&priv->tx_flowstats, 0, sizeof(priv->tx_flowstats));
-	memset(&priv->rx_priority_flowstats, 0,
-	       sizeof(priv->rx_priority_flowstats));
-	memset(&priv->tx_priority_flowstats, 0,
-	       sizeof(priv->tx_priority_flowstats));
-	memset(&priv->pf_stats, 0, sizeof(priv->pf_stats));
-
-	for (i = 0; i < priv->tx_ring_num; i++) {
-		priv->tx_ring[i]->bytes = 0;
-		priv->tx_ring[i]->packets = 0;
-		priv->tx_ring[i]->tx_csum = 0;
-	}
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		priv->rx_ring[i]->bytes = 0;
-		priv->rx_ring[i]->packets = 0;
-		priv->rx_ring[i]->csum_ok = 0;
-		priv->rx_ring[i]->csum_none = 0;
-		priv->rx_ring[i]->csum_complete = 0;
-	}
-}
-
-static int mlx4_en_open(struct net_device *dev)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int err = 0;
-
-	mutex_lock(&mdev->state_lock);
-
-	if (!mdev->device_up) {
-		en_err(priv, "Cannot open - device down/disabled\n");
-		err = -EBUSY;
-		goto out;
-	}
-
-	/* Reset HW statistics and SW counters */
-	mlx4_en_clear_stats(dev);
-
-	err = mlx4_en_start_port(dev);
-	if (err)
-		en_err(priv, "Failed starting port:%d\n", priv->port);
-
-out:
-	mutex_unlock(&mdev->state_lock);
+unregister_ioctl:
+	btrfs_interface_exit();
+free_end_io_wq:
+	btrfs_end_io_wq_exit();
+free_prelim_ref:
+	btrfs_prelim_ref_exit();
+free_delayed_ref:
+	btrfs_delayed_ref_exit();
+free_auto_defrag:
+	btrfs_auto_defrag_exit();
+free_delayed_inode:
+	btrfs_delayed_inode_exit();
+free_ordered_data:
+	ordered_data_exit();
+free_extent_map:
+	extent_map_exit();
+free_extent_io:
+	extent_io_exit();
+free_cachep:
+	btrfs_destroy_cachep();
+free_compress:
+	btrfs_exit_compress();
+	btrfs_exit_sysfs();
+free_hash:
+	btrfs_hash_exit();
 	return err;
 }
 
-
-static int mlx4_en_close(struct net_device *dev)
+static void __exit exit_btrfs_fs(void)
 {
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-
-	en_dbg(IFDOWN, priv, "Close port called\n");
-
-	mutex_lock(&mdev->state_lock);
-
-	mlx4_en_stop_port(dev, 0);
-	netif_carrier_off(dev);
-
-	mutex_unlock(&mdev->state_lock);
-	return 0;
+	btrfs_destroy_cachep();
+	btrfs_delayed_ref_exit();
+	btrfs_auto_defrag_exit();
+	btrfs_delayed_inode_exit();
+	btrfs_prelim_ref_exit();
+	ordered_data_exit();
+	extent_map_exit();
+	extent_io_exit();
+	btrfs_interface_exit();
+	btrfs_end_io_wq_exit();
+	unregister_filesystem(&btrfs_fs_type);
+	btrfs_exit_sysfs();
+	btrfs_cleanup_fs_uuids();
+	btrfs_exit_compress();
+	btrfs_hash_exit();
 }
 
-void mlx4_en_free_resources(struct mlx4_en_priv *priv)
+late_initcall(init_btrfs_fs);
+module_exit(exit_btrfs_fs)
+
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * Copyright (C) 2007 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/completion.h>
+#include <linux/buffer_head.h>
+#include <linux/kobject.h>
+#include <linux/bug.h>
+#include <linux/genhd.h>
+#include <linux/debugfs.h>
+
+#include "ctree.h"
+#include "disk-io.h"
+#include "transaction.h"
+#include "sysfs.h"
+#include "volumes.h"
+
+static inline struct btrfs_fs_info *to_fs_info(struct kobject *kobj);
+static inline struct btrfs_fs_devices *to_fs_devs(struct kobject *kobj);
+
+static u64 get_features(struct btrfs_fs_info *fs_info,
+			enum btrfs_feature_set set)
 {
-	int i;
-
-#ifdef CONFIG_RFS_ACCEL
-	priv->dev->rx_cpu_rmap = NULL;
-#endif
-
-	for (i = 0; i < priv->tx_ring_num; i++) {
-		if (priv->tx_ring && priv->tx_ring[i])
-			mlx4_en_destroy_tx_ring(priv, &priv->tx_ring[i]);
-		if (priv->tx_cq && priv->tx_cq[i])
-			mlx4_en_destroy_cq(priv, &priv->tx_cq[i]);
-	}
-
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		if (priv->rx_ring[i])
-			mlx4_en_destroy_rx_ring(priv, &priv->rx_ring[i],
-				priv->prof->rx_ring_size, priv->stride);
-		if (priv->rx_cq[i])
-			mlx4_en_destroy_cq(priv, &priv->rx_cq[i]);
-	}
-
+	struct btrfs_super_block *disk_super = fs_info->super_copy;
+	if (set == FEAT_COMPAT)
+		return btrfs_super_compat_flags(disk_super);
+	else if (set == FEAT_COMPAT_RO)
+		return btrfs_super_compat_ro_flags(disk_super);
+	else
+		return btrfs_super_incompat_flags(disk_super);
 }
 
-int mlx4_en_alloc_resources(struct mlx4_en_priv *priv)
+static void set_features(struct btrfs_fs_info *fs_info,
+			 enum btrfs_feature_set set, u64 features)
 {
-	struct mlx4_en_port_profile *prof = priv->prof;
-	int i;
-	int node;
-
-	/* Create tx Rings */
-	for (i = 0; i < priv->tx_ring_num; i++) {
-		node = cpu_to_node(i % num_online_cpus());
-		if (mlx4_en_create_cq(priv, &priv->tx_cq[i],
-				      prof->tx_ring_size, i, TX, node))
-			goto err;
-
-		if (mlx4_en_create_tx_ring(priv, &priv->tx_ring[i],
-					   prof->tx_ring_size, TXBB_SIZE,
-					   node, i))
-			goto err;
-	}
-
-	/* Create rx Rings */
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		node = cpu_to_node(i % num_online_cpus());
-		if (mlx4_en_create_cq(priv, &priv->rx_cq[i],
-				      prof->rx_ring_size, i, RX, node))
-			goto err;
-
-		if (mlx4_en_create_rx_ring(priv, &priv->rx_ring[i],
-					   prof->rx_ring_size, priv->stride,
-					   node))
-			goto err;
-	}
-
-#ifdef CONFIG_RFS_ACCEL
-	priv->dev->rx_cpu_rmap = mlx4_get_cpu_rmap(priv->mdev->dev, priv->port);
-#endif
-
-	return 0;
-
-err:
-	en_err(priv, "Failed to allocate NIC resources\n");
-	for (i = 0; i < priv->rx_ring_num; i++) {
-		if (priv->rx_ring[i])
-			mlx4_en_destroy_rx_ring(priv, &priv->rx_ring[i],
-						prof->rx_ring_size,
-						priv->stride);
-		if (priv->rx_cq[i])
-			mlx4_en_destroy_cq(priv, &priv->rx_cq[i]);
-	}
-	for (i = 0; i < priv->tx_ring_num; i++) {
-		if (priv->tx_ring[i])
-			mlx4_en_destroy_tx_ring(priv, &priv->tx_ring[i]);
-		if (priv->tx_cq[i])
-			mlx4_en_destroy_cq(priv, &priv->tx_cq[i]);
-	}
-	return -ENOMEM;
+	struct btrfs_super_block *disk_super = fs_info->super_copy;
+	if (set == FEAT_COMPAT)
+		btrfs_set_super_compat_flags(disk_super, features);
+	else if (set == FEAT_COMPAT_RO)
+		btrfs_set_super_compat_ro_flags(disk_super, features);
+	else
+		btrfs_set_super_incompat_flags(disk_super, features);
 }
 
-
-void mlx4_en_destroy_netdev(struct net_device *dev)
+static int can_modify_feature(struct btrfs_feature_attr *fa)
 {
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
+	int val = 0;
+	u64 set, clear;
+	switch (fa->feature_set) {
+	case FEAT_COMPAT:
+		set = BTRFS_FEATURE_COMPAT_SAFE_SET;
+		clear = BTRFS_FEATURE_COMPAT_SAFE_CLEAR;
+		break;
+	case FEAT_COMPAT_RO:
+		set = BTRFS_FEATURE_COMPAT_RO_SAFE_SET;
+		clear = BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR;
+		break;
+	case FEAT_INCOMPAT:
+		set = BTRFS_FEATURE_INCOMPAT_SAFE_SET;
+		clear = BTRFS_FEATURE_INCOMPAT_SAFE_CLEAR;
+		break;
+	default:
+		printk(KERN_WARNING "btrfs: sysfs: unknown feature set %d\n",
+				fa->feature_set);
+		return 0;
+	}
 
-	en_dbg(DRV, priv, "Destroying netdev on port:%d\n", priv->port);
+	if (set & fa->feature_bit)
+		val |= 1;
+	if (clear & fa->feature_bit)
+		val |= 2;
 
-	/* Unregister device - this will close the port if it was up */
-	if (priv->registered)
-		unregister_netdev(dev);
-
-	if (priv->allocated)
-		mlx4_free_hwq_res(mdev->dev, &priv->res, MLX4_EN_PAGE_SIZE);
-
-	cancel_delayed_work(&priv->stats_task);
-	cancel_delayed_work(&priv->service_task);
-	/* flush any pending task for this netdev */
-	flush_workqueue(mdev->workqueue);
-
-	if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_TS)
-		mlx4_en_remove_timestamp(mdev);
-
-	/* Detach the netdev so tasks would not attempt to access it */
-	mutex_lock(&mdev->state_lock);
-	mdev->pndev[priv->port] = NULL;
-	mdev->upper[priv->port] = NULL;
-	mutex_unlock(&mdev->state_lock);
-
-	mlx4_en_free_resources(priv);
-
-	kfree(priv->tx_ring);
-	kfree(priv->tx_cq);
-
-	free_netdev(dev);
+	return val;
 }
 
-static int mlx4_en_change_mtu(struct net_device *dev, int new_mtu)
+static ssize_t btrfs_feature_attr_show(struct kobject *kobj,
+				       struct kobj_attribute *a, char *buf)
 {
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int err = 0;
+	int val = 0;
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+	struct btrfs_feature_attr *fa = to_btrfs_feature_attr(a);
+	if (fs_info) {
+		u64 features = get_features(fs_info, fa->feature_set);
+		if (features & fa->feature_bit)
+			val = 1;
+	} else
+		val = can_modify_feature(fa);
 
-	en_dbg(DRV, priv, "Change MTU called - current:%d new:%d\n",
-		 dev->mtu, new_mtu);
+	return snprintf(buf, PAGE_SIZE, "%d\n", val);
+}
 
-	if ((new_mtu < MLX4_EN_MIN_MTU) || (new_mtu > priv->max_mtu)) {
-		en_err(priv, "Bad MTU size:%d.\n", new_mtu);
+static ssize_t btrfs_feature_attr_store(struct kobject *kobj,
+					struct kobj_attribute *a,
+					const char *buf, size_t count)
+{
+	struct btrfs_fs_info *fs_info;
+	struct btrfs_feature_attr *fa = to_btrfs_feature_attr(a);
+	u64 features, set, clear;
+	unsigned long val;
+	int ret;
+
+	fs_info = to_fs_info(kobj);
+	if (!fs_info)
+		return -EPERM;
+
+	ret = kstrtoul(skip_spaces(buf), 0, &val);
+	if (ret)
+		return ret;
+
+	if (fa->feature_set == FEAT_COMPAT) {
+		set = BTRFS_FEATURE_COMPAT_SAFE_SET;
+		clear = BTRFS_FEATURE_COMPAT_SAFE_CLEAR;
+	} else if (fa->feature_set == FEAT_COMPAT_RO) {
+		set = BTRFS_FEATURE_COMPAT_RO_SAFE_SET;
+		clear = BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR;
+	} else {
+		set = BTRFS_FEATURE_INCOMPAT_SAFE_SET;
+		clear = BTRFS_FEATURE_INCOMPAT_SAFE_CLEAR;
+	}
+
+	features = get_features(fs_info, fa->feature_set);
+
+	/* Nothing to do */
+	if ((val && (features & fa->feature_bit)) ||
+	    (!val && !(features & fa->feature_bit)))
+		return count;
+
+	if ((val && !(set & fa->feature_bit)) ||
+	    (!val && !(clear & fa->feature_bit))) {
+		btrfs_info(fs_info,
+			"%sabling feature %s on mounted fs is not supported.",
+			val ? "En" : "Dis", fa->kobj_attr.attr.name);
 		return -EPERM;
 	}
-	dev->mtu = new_mtu;
 
-	if (netif_running(dev)) {
-		mutex_lock(&mdev->state_lock);
-		if (!mdev->device_up) {
-			/* NIC is probably restarting - let restart task reset
-			 * the port */
-			en_dbg(DRV, priv, "Change MTU called with card down!?\n");
-		} else {
-			mlx4_en_stop_port(dev, 1);
-			err = mlx4_en_start_port(dev);
-			if (err) {
-				en_err(priv, "Failed restarting port:%d\n",
-					 priv->port);
-				if (!test_and_set_bit(MLX4_EN_STATE_FLAG_RESTARTING,
-						      &priv->state))
-					queue_work(mdev->workqueue, &priv->restart_task);
-			}
+	btrfs_info(fs_info, "%s %s feature flag",
+		   val ? "Setting" : "Clearing", fa->kobj_attr.attr.name);
+
+	spin_lock(&fs_info->super_lock);
+	features = get_features(fs_info, fa->feature_set);
+	if (val)
+		features |= fa->feature_bit;
+	else
+		features &= ~fa->feature_bit;
+	set_features(fs_info, fa->feature_set, features);
+	spin_unlock(&fs_info->super_lock);
+
+	/*
+	 * We don't want to do full transaction commit from inside sysfs
+	 */
+	btrfs_set_pending(fs_info, COMMIT);
+	wake_up_process(fs_info->transaction_kthread);
+
+	return count;
+}
+
+static umode_t btrfs_feature_visible(struct kobject *kobj,
+				     struct attribute *attr, int unused)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+	umode_t mode = attr->mode;
+
+	if (fs_info) {
+		struct btrfs_feature_attr *fa;
+		u64 features;
+
+		fa = attr_to_btrfs_feature_attr(attr);
+		features = get_features(fs_info, fa->feature_set);
+
+		if (can_modify_feature(fa))
+			mode |= S_IWUSR;
+		else if (!(features & fa->feature_bit))
+			mode = 0;
+	}
+
+	return mode;
+}
+
+BTRFS_FEAT_ATTR_INCOMPAT(mixed_backref, MIXED_BACKREF);
+BTRFS_FEAT_ATTR_INCOMPAT(default_subvol, DEFAULT_SUBVOL);
+BTRFS_FEAT_ATTR_INCOMPAT(mixed_groups, MIXED_GROUPS);
+BTRFS_FEAT_ATTR_INCOMPAT(compress_lzo, COMPRESS_LZO);
+BTRFS_FEAT_ATTR_INCOMPAT(big_metadata, BIG_METADATA);
+BTRFS_FEAT_ATTR_INCOMPAT(extended_iref, EXTENDED_IREF);
+BTRFS_FEAT_ATTR_INCOMPAT(raid56, RAID56);
+BTRFS_FEAT_ATTR_INCOMPAT(skinny_metadata, SKINNY_METADATA);
+BTRFS_FEAT_ATTR_INCOMPAT(no_holes, NO_HOLES);
+
+static struct attribute *btrfs_supported_feature_attrs[] = {
+	BTRFS_FEAT_ATTR_PTR(mixed_backref),
+	BTRFS_FEAT_ATTR_PTR(default_subvol),
+	BTRFS_FEAT_ATTR_PTR(mixed_groups),
+	BTRFS_FEAT_ATTR_PTR(compress_lzo),
+	BTRFS_FEAT_ATTR_PTR(big_metadata),
+	BTRFS_FEAT_ATTR_PTR(extended_iref),
+	BTRFS_FEAT_ATTR_PTR(raid56),
+	BTRFS_FEAT_ATTR_PTR(skinny_metadata),
+	BTRFS_FEAT_ATTR_PTR(no_holes),
+	NULL
+};
+
+static const struct attribute_group btrfs_feature_attr_group = {
+	.name = "features",
+	.is_visible = btrfs_feature_visible,
+	.attrs = btrfs_supported_feature_attrs,
+};
+
+static ssize_t btrfs_show_u64(u64 *value_ptr, spinlock_t *lock, char *buf)
+{
+	u64 val;
+	if (lock)
+		spin_lock(lock);
+	val = *value_ptr;
+	if (lock)
+		spin_unlock(lock);
+	return snprintf(buf, PAGE_SIZE, "%llu\n", val);
+}
+
+static ssize_t global_rsv_size_show(struct kobject *kobj,
+				    struct kobj_attribute *ka, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj->parent);
+	struct btrfs_block_rsv *block_rsv = &fs_info->global_block_rsv;
+	return btrfs_show_u64(&block_rsv->size, &block_rsv->lock, buf);
+}
+BTRFS_ATTR(global_rsv_size, global_rsv_size_show);
+
+static ssize_t global_rsv_reserved_show(struct kobject *kobj,
+					struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj->parent);
+	struct btrfs_block_rsv *block_rsv = &fs_info->global_block_rsv;
+	return btrfs_show_u64(&block_rsv->reserved, &block_rsv->lock, buf);
+}
+BTRFS_ATTR(global_rsv_reserved, global_rsv_reserved_show);
+
+#define to_space_info(_kobj) container_of(_kobj, struct btrfs_space_info, kobj)
+#define to_raid_kobj(_kobj) container_of(_kobj, struct raid_kobject, kobj)
+
+static ssize_t raid_bytes_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf);
+BTRFS_RAID_ATTR(total_bytes, raid_bytes_show);
+BTRFS_RAID_ATTR(used_bytes, raid_bytes_show);
+
+static ssize_t raid_bytes_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+
+{
+	struct btrfs_space_info *sinfo = to_space_info(kobj->parent);
+	struct btrfs_block_group_cache *block_group;
+	int index = to_raid_kobj(kobj)->raid_type;
+	u64 val = 0;
+
+	down_read(&sinfo->groups_sem);
+	list_for_each_entry(block_group, &sinfo->block_groups[index], list) {
+		if (&attr->attr == BTRFS_RAID_ATTR_PTR(total_bytes))
+			val += block_group->key.offset;
+		else
+			val += btrfs_block_group_used(&block_group->item);
+	}
+	up_read(&sinfo->groups_sem);
+	return snprintf(buf, PAGE_SIZE, "%llu\n", val);
+}
+
+static struct attribute *raid_attributes[] = {
+	BTRFS_RAID_ATTR_PTR(total_bytes),
+	BTRFS_RAID_ATTR_PTR(used_bytes),
+	NULL
+};
+
+static void release_raid_kobj(struct kobject *kobj)
+{
+	kfree(to_raid_kobj(kobj));
+}
+
+struct kobj_type btrfs_raid_ktype = {
+	.sysfs_ops = &kobj_sysfs_ops,
+	.release = release_raid_kobj,
+	.default_attrs = raid_attributes,
+};
+
+#define SPACE_INFO_ATTR(field)						\
+static ssize_t btrfs_space_info_show_##field(struct kobject *kobj,	\
+					     struct kobj_attribute *a,	\
+					     char *buf)			\
+{									\
+	struct btrfs_space_info *sinfo = to_space_info(kobj);		\
+	return btrfs_show_u64(&sinfo->field, &sinfo->lock, buf);	\
+}									\
+BTRFS_ATTR(field, btrfs_space_info_show_##field)
+
+static ssize_t btrfs_space_info_show_total_bytes_pinned(struct kobject *kobj,
+						       struct kobj_attribute *a,
+						       char *buf)
+{
+	struct btrfs_space_info *sinfo = to_space_info(kobj);
+	s64 val = percpu_counter_sum(&sinfo->total_bytes_pinned);
+	return snprintf(buf, PAGE_SIZE, "%lld\n", val);
+}
+
+SPACE_INFO_ATTR(flags);
+SPACE_INFO_ATTR(total_bytes);
+SPACE_INFO_ATTR(bytes_used);
+SPACE_INFO_ATTR(bytes_pinned);
+SPACE_INFO_ATTR(bytes_reserved);
+SPACE_INFO_ATTR(bytes_may_use);
+SPACE_INFO_ATTR(disk_used);
+SPACE_INFO_ATTR(disk_total);
+BTRFS_ATTR(total_bytes_pinned, btrfs_space_info_show_total_bytes_pinned);
+
+static struct attribute *space_info_attrs[] = {
+	BTRFS_ATTR_PTR(flags),
+	BTRFS_ATTR_PTR(total_bytes),
+	BTRFS_ATTR_PTR(bytes_used),
+	BTRFS_ATTR_PTR(bytes_pinned),
+	BTRFS_ATTR_PTR(bytes_reserved),
+	BTRFS_ATTR_PTR(bytes_may_use),
+	BTRFS_ATTR_PTR(disk_used),
+	BTRFS_ATTR_PTR(disk_total),
+	BTRFS_ATTR_PTR(total_bytes_pinned),
+	NULL,
+};
+
+static void space_info_release(struct kobject *kobj)
+{
+	struct btrfs_space_info *sinfo = to_space_info(kobj);
+	percpu_counter_destroy(&sinfo->total_bytes_pinned);
+	kfree(sinfo);
+}
+
+struct kobj_type space_info_ktype = {
+	.sysfs_ops = &kobj_sysfs_ops,
+	.release = space_info_release,
+	.default_attrs = space_info_attrs,
+};
+
+static const struct attribute *allocation_attrs[] = {
+	BTRFS_ATTR_PTR(global_rsv_reserved),
+	BTRFS_ATTR_PTR(global_rsv_size),
+	NULL,
+};
+
+static ssize_t btrfs_label_show(struct kobject *kobj,
+				struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+	char *label = fs_info->super_copy->label;
+	return snprintf(buf, PAGE_SIZE, label[0] ? "%s\n" : "%s", label);
+}
+
+static ssize_t btrfs_label_store(struct kobject *kobj,
+				 struct kobj_attribute *a,
+				 const char *buf, size_t len)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+	size_t p_len;
+
+	if (fs_info->sb->s_flags & MS_RDONLY)
+		return -EROFS;
+
+	/*
+	 * p_len is the len until the first occurrence of either
+	 * '\n' or '\0'
+	 */
+	p_len = strcspn(buf, "\n");
+
+	if (p_len >= BTRFS_LABEL_SIZE)
+		return -EINVAL;
+
+	spin_lock(&fs_info->super_lock);
+	memset(fs_info->super_copy->label, 0, BTRFS_LABEL_SIZE);
+	memcpy(fs_info->super_copy->label, buf, p_len);
+	spin_unlock(&fs_info->super_lock);
+
+	/*
+	 * We don't want to do full transaction commit from inside sysfs
+	 */
+	btrfs_set_pending(fs_info, COMMIT);
+	wake_up_process(fs_info->transaction_kthread);
+
+	return len;
+}
+BTRFS_ATTR_RW(label, btrfs_label_show, btrfs_label_store);
+
+static ssize_t btrfs_nodesize_show(struct kobject *kobj,
+				struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+
+	return snprintf(buf, PAGE_SIZE, "%u\n", fs_info->super_copy->nodesize);
+}
+
+BTRFS_ATTR(nodesize, btrfs_nodesize_show);
+
+static ssize_t btrfs_sectorsize_show(struct kobject *kobj,
+				struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+
+	return snprintf(buf, PAGE_SIZE, "%u\n", fs_info->super_copy->sectorsize);
+}
+
+BTRFS_ATTR(sectorsize, btrfs_sectorsize_show);
+
+static ssize_t btrfs_clone_alignment_show(struct kobject *kobj,
+				struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_info *fs_info = to_fs_info(kobj);
+
+	return snprintf(buf, PAGE_SIZE, "%u\n", fs_info->super_copy->sectorsize);
+}
+
+BTRFS_ATTR(clone_alignment, btrfs_clone_alignment_show);
+
+static const struct attribute *btrfs_attrs[] = {
+	BTRFS_ATTR_PTR(label),
+	BTRFS_ATTR_PTR(nodesize),
+	BTRFS_ATTR_PTR(sectorsize),
+	BTRFS_ATTR_PTR(clone_alignment),
+	NULL,
+};
+
+static void btrfs_release_fsid_kobj(struct kobject *kobj)
+{
+	struct btrfs_fs_devices *fs_devs = to_fs_devs(kobj);
+
+	memset(&fs_devs->fsid_kobj, 0, sizeof(struct kobject));
+	complete(&fs_devs->kobj_unregister);
+}
+
+static struct kobj_type btrfs_ktype = {
+	.sysfs_ops	= &kobj_sysfs_ops,
+	.release	= btrfs_release_fsid_kobj,
+};
+
+static inline struct btrfs_fs_devices *to_fs_devs(struct kobject *kobj)
+{
+	if (kobj->ktype != &btrfs_ktype)
+		return NULL;
+	return container_of(kobj, struct btrfs_fs_devices, fsid_kobj);
+}
+
+static inline struct btrfs_fs_info *to_fs_info(struct kobject *kobj)
+{
+	if (kobj->ktype != &btrfs_ktype)
+		return NULL;
+	return to_fs_devs(kobj)->fs_info;
+}
+
+#define NUM_FEATURE_BITS 64
+static char btrfs_unknown_feature_names[3][NUM_FEATURE_BITS][13];
+static struct btrfs_feature_attr btrfs_feature_attrs[3][NUM_FEATURE_BITS];
+
+static const u64 supported_feature_masks[3] = {
+	[FEAT_COMPAT]    = BTRFS_FEATURE_COMPAT_SUPP,
+	[FEAT_COMPAT_RO] = BTRFS_FEATURE_COMPAT_RO_SUPP,
+	[FEAT_INCOMPAT]  = BTRFS_FEATURE_INCOMPAT_SUPP,
+};
+
+static int addrm_unknown_feature_attrs(struct btrfs_fs_info *fs_info, bool add)
+{
+	int set;
+
+	for (set = 0; set < FEAT_MAX; set++) {
+		int i;
+		struct attribute *attrs[2];
+		struct attribute_group agroup = {
+			.name = "features",
+			.attrs = attrs,
+		};
+		u64 features = get_features(fs_info, set);
+		features &= ~supported_feature_masks[set];
+
+		if (!features)
+			continue;
+
+		attrs[1] = NULL;
+		for (i = 0; i < NUM_FEATURE_BITS; i++) {
+			struct btrfs_feature_attr *fa;
+
+			if (!(features & (1ULL << i)))
+				continue;
+
+			fa = &btrfs_feature_attrs[set][i];
+			attrs[0] = &fa->kobj_attr.attr;
+			if (add) {
+				int ret;
+				ret = sysfs_merge_group(&fs_info->fs_devices->fsid_kobj,
+							&agroup);
+				if (ret)
+					return ret;
+			} else
+				sysfs_unmerge_group(&fs_info->fs_devices->fsid_kobj,
+						    &agroup);
 		}
-		mutex_unlock(&mdev->state_lock);
+
 	}
 	return 0;
 }
 
-static int mlx4_en_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
+static void __btrfs_sysfs_remove_fsid(struct btrfs_fs_devices *fs_devs)
 {
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	struct hwtstamp_config config;
+	if (fs_devs->device_dir_kobj) {
+		kobject_del(fs_devs->device_dir_kobj);
+		kobject_put(fs_devs->device_dir_kobj);
+		fs_devs->device_dir_kobj = NULL;
+	}
 
-	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
-		return -EFAULT;
+	if (fs_devs->fsid_kobj.state_initialized) {
+		kobject_del(&fs_devs->fsid_kobj);
+		kobject_put(&fs_devs->fsid_kobj);
+		wait_for_completion(&fs_devs->kobj_unregister);
+	}
+}
 
-	/* reserved for future extensions */
-	if (config.flags)
+/* when fs_devs is NULL it will remove all fsid kobject */
+void btrfs_sysfs_remove_fsid(struct btrfs_fs_devices *fs_devs)
+{
+	struct list_head *fs_uuids = btrfs_get_fs_uuids();
+
+	if (fs_devs) {
+		__btrfs_sysfs_remove_fsid(fs_devs);
+		return;
+	}
+
+	list_for_each_entry(fs_devs, fs_uuids, list) {
+		__btrfs_sysfs_remove_fsid(fs_devs);
+	}
+}
+
+void btrfs_sysfs_remove_mounted(struct btrfs_fs_info *fs_info)
+{
+	btrfs_reset_fs_info_ptr(fs_info);
+
+	if (fs_info->space_info_kobj) {
+		sysfs_remove_files(fs_info->space_info_kobj, allocation_attrs);
+		kobject_del(fs_info->space_info_kobj);
+		kobject_put(fs_info->space_info_kobj);
+	}
+	addrm_unknown_feature_attrs(fs_info, false);
+	sysfs_remove_group(&fs_info->fs_devices->fsid_kobj, &btrfs_feature_attr_group);
+	sysfs_remove_files(&fs_info->fs_devices->fsid_kobj, btrfs_attrs);
+	btrfs_sysfs_rm_device_link(fs_info->fs_devices, NULL);
+}
+
+const char * const btrfs_feature_set_names[3] = {
+	[FEAT_COMPAT]	 = "compat",
+	[FEAT_COMPAT_RO] = "compat_ro",
+	[FEAT_INCOMPAT]	 = "incompat",
+};
+
+char *btrfs_printable_features(enum btrfs_feature_set set, u64 flags)
+{
+	size_t bufsize = 4096; /* safe max, 64 names * 64 bytes */
+	int len = 0;
+	int i;
+	char *str;
+
+	str = kmalloc(bufsize, GFP_KERNEL);
+	if (!str)
+		return str;
+
+	for (i = 0; i < ARRAY_SIZE(btrfs_feature_attrs[set]); i++) {
+		const char *name;
+
+		if (!(flags & (1ULL << i)))
+			continue;
+
+		name = btrfs_feature_attrs[set][i].kobj_attr.attr.name;
+		len += snprintf(str + len, bufsize - len, "%s%s",
+				len ? "," : "", name);
+	}
+
+	return str;
+}
+
+static void init_feature_attrs(void)
+{
+	struct btrfs_feature_attr *fa;
+	int set, i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(btrfs_unknown_feature_names) !=
+		     ARRAY_SIZE(btrfs_feature_attrs));
+	BUILD_BUG_ON(ARRAY_SIZE(btrfs_unknown_feature_names[0]) !=
+		     ARRAY_SIZE(btrfs_feature_attrs[0]));
+
+	memset(btrfs_feature_attrs, 0, sizeof(btrfs_feature_attrs));
+	memset(btrfs_unknown_feature_names, 0,
+	       sizeof(btrfs_unknown_feature_names));
+
+	for (i = 0; btrfs_supported_feature_attrs[i]; i++) {
+		struct btrfs_feature_attr *sfa;
+		struct attribute *a = btrfs_supported_feature_attrs[i];
+		int bit;
+		sfa = attr_to_btrfs_feature_attr(a);
+		bit = ilog2(sfa->feature_bit);
+		fa = &btrfs_feature_attrs[sfa->feature_set][bit];
+
+		fa->kobj_attr.attr.name = sfa->kobj_attr.attr.name;
+	}
+
+	for (set = 0; set < FEAT_MAX; set++) {
+		for (i = 0; i < ARRAY_SIZE(btrfs_feature_attrs[set]); i++) {
+			char *name = btrfs_unknown_feature_names[set][i];
+			fa = &btrfs_feature_attrs[set][i];
+
+			if (fa->kobj_attr.attr.name)
+				continue;
+
+			snprintf(name, 13, "%s:%u",
+				 btrfs_feature_set_names[set], i);
+
+			fa->kobj_attr.attr.name = name;
+			fa->kobj_attr.attr.mode = S_IRUGO;
+			fa->feature_set = set;
+			fa->feature_bit = 1ULL << i;
+		}
+	}
+}
+
+/* when one_device is NULL, it removes all device links */
+
+int btrfs_sysfs_rm_device_link(struct btrfs_fs_devices *fs_devices,
+		struct btrfs_device *one_device)
+{
+	struct hd_struct *disk;
+	struct kobject *disk_kobj;
+
+	if (!fs_devices->device_dir_kobj)
 		return -EINVAL;
 
-	/* device doesn't support time stamping */
-	if (!(mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_TS))
-		return -EINVAL;
+	if (one_device && one_device->bdev) {
+		disk = one_device->bdev->bd_part;
+		disk_kobj = &part_to_dev(disk)->kobj;
 
-	/* TX HW timestamp */
-	switch (config.tx_type) {
-	case HWTSTAMP_TX_OFF:
-	case HWTSTAMP_TX_ON:
-		break;
-	default:
-		return -ERANGE;
+		sysfs_remove_link(fs_devices->device_dir_kobj,
+						disk_kobj->name);
 	}
 
-	/* RX HW timestamp */
-	switch (config.rx_filter) {
-	case HWTSTAMP_FILTER_NONE:
-		break;
-	case HWTSTAMP_FILTER_ALL:
-	case HWTSTAMP_FILTER_SOME:
-	case HWTSTAMP_FILTER_PTP_V1_L4_EVENT:
-	case HWTSTAMP_FILTER_PTP_V1_L4_SYNC:
-	case HWTSTAMP_FILTER_PTP_V1_L4_DELAY_REQ:
-	case HWTSTAMP_FILTER_PTP_V2_L4_EVENT:
-	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
-	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
-	case HWTSTAMP_FILTER_PTP_V2_L2_EVENT:
-	case HWTSTAMP_FILTER_PTP_V2_L2_SYNC:
-	case HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ:
-	case HWTSTAMP_FILTER_PTP_V2_EVENT:
-	case HWTSTAMP_FILTER_PTP_V2_SYNC:
-	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
-		config.rx_filter = HWTSTAMP_FILTER_ALL;
-		break;
-	default:
-		return -ERANGE;
+	if (one_device)
+		return 0;
+
+	list_for_each_entry(one_device,
+			&fs_devices->devices, dev_list) {
+		if (!one_device->bdev)
+			continue;
+		disk = one_device->bdev->bd_part;
+		disk_kobj = &part_to_dev(disk)->kobj;
+
+		sysfs_remove_link(fs_devices->device_dir_kobj,
+						disk_kobj->name);
 	}
 
-	if (mlx4_en_reset_config(dev, config, dev->features)) {
-		config.tx_type = HWTSTAMP_TX_OFF;
-		config.rx_filter = HWTSTAMP_FILTER_NONE;
+	return 0;
+}
+
+int btrfs_sysfs_add_device(struct btrfs_fs_devices *fs_devs)
+{
+	if (!fs_devs->device_dir_kobj)
+		fs_devs->device_dir_kobj = kobject_create_and_add("devices",
+						&fs_devs->fsid_kobj);
+
+	if (!fs_devs->device_dir_kobj)
+		return -ENOMEM;
+
+	return 0;
+}
+
+int btrfs_sysfs_add_device_link(struct btrfs_fs_devices *fs_devices,
+				struct btrfs_device *one_device)
+{
+	int error = 0;
+	struct btrfs_device *dev;
+
+	list_for_each_entry(dev, &fs_devices->devices, dev_list) {
+		struct hd_struct *disk;
+		struct kobject *disk_kobj;
+
+		if (!dev->bdev)
+			continue;
+
+		if (one_device && one_device != dev)
+			continue;
+
+		disk = dev->bdev->bd_part;
+		disk_kobj = &part_to_dev(disk)->kobj;
+
+		error = sysfs_create_link(fs_devices->device_dir_kobj,
+					  disk_kobj, disk_kobj->name);
+		if (error)
+			break;
 	}
 
-	return copy_to_user(ifr->ifr_data, &config,
-			    sizeof(config)) ? -EFAULT : 0;
+	return error;
 }
 
-static int mlx4_en_hwtstamp_get(struct net_device *dev, struct ifreq *ifr)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
+/* /sys/fs/btrfs/ entry */
+static struct kset *btrfs_kset;
 
-	return copy_to_user(ifr->ifr_data, &priv->hwtstamp_config,
-			    sizeof(priv->hwtstamp_config)) ? -EFAULT : 0;
-}
+/* /sys/kernel/debug/btrfs */
+static struct dentry *btrfs_debugfs_root_dentry;
 
-static int mlx4_en_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+/* Debugging tunables and exported data */
+u64 btrfs_debugfs_test;
+
+/*
+ * Can be called by the device discovery thread.
+ * And parent can be specified for seed device
+ */
+int btrfs_sysfs_add_fsid(struct btrfs_fs_devices *fs_devs,
+				struct kobject *parent)
 {
-	switch (cmd) {
-	case SIOCSHWTSTAMP:
-		return mlx4_en_hwtstamp_set(dev, ifr);
-	case SIOCGHWTSTAMP:
-		return mlx4_en_hwtstamp_get(dev, ifr);
-	default:
-		return -EOPNOTSUPP;
+	int error;
+
+	init_completion(&fs_devs->kobj_unregister);
+	fs_devs->fsid_kobj.kset = btrfs_kset;
+	error = kobject_init_and_add(&fs_devs->fsid_kobj,
+				&btrfs_ktype, parent, "%pU", fs_devs->fsid);
+	if (error) {
+		kobject_put(&fs_devs->fsid_kobj);
+		return error;
 	}
+
+	return 0;
 }
 
-static netdev_features_t mlx4_en_fix_features(struct net_device *netdev,
-					      netdev_features_t features)
+int btrfs_sysfs_add_mounted(struct btrfs_fs_info *fs_info)
 {
-	struct mlx4_en_priv *en_priv = netdev_priv(netdev);
-	struct mlx4_en_dev *mdev = en_priv->mdev;
+	int error;
+	struct btrfs_fs_devices *fs_devs = fs_info->fs_devices;
+	struct kobject *fsid_kobj = &fs_devs->fsid_kobj;
 
-	/* Since there is no support for separate RX C-TAG/S-TAG vlan accel
-	 * enable/disable make sure S-TAG flag is always in same state as
-	 * C-TAG.
-	 */
-	if (features & NETIF_F_HW_VLAN_CTAG_RX &&
-	    !(mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_SKIP_OUTER_VLAN))
-		features |= NETIF_F_HW_VLAN_STAG_RX;
-	else
-		features &= ~NETIF_F_HW_VLAN_STAG_RX;
+	btrfs_set_fs_info_ptr(fs_info);
 
-	return features;
+	error = btrfs_sysfs_add_device_link(fs_devs, NULL);
+	if (error)
+		return error;
+
+	error = sysfs_create_files(fsid_kobj, btrfs_attrs);
+	if (error) {
+		btrfs_sysfs_rm_device_link(fs_devs, NULL);
+		return error;
+	}
+
+	error = sysfs_create_group(fsid_kobj,
+				   &btrfs_feature_attr_group);
+	if (error)
+		goto failure;
+
+	error = addrm_unknown_feature_attrs(fs_info, true);
+	if (error)
+		goto failure;
+
+	fs_info->space_info_kobj = kobject_create_and_add("allocation",
+						  fsid_kobj);
+	if (!fs_info->space_info_kobj) {
+		error = -ENOMEM;
+		goto failure;
+	}
+
+	error = sysfs_create_files(fs_info->space_info_kobj, allocation_attrs);
+	if (error)
+		goto failure;
+
+	return 0;
+failure:
+	btrfs_sysfs_remove_mounted(fs_info);
+	return error;
 }
 
-static int mlx4_en_set_features(struct net_device *netdev,
-		netdev_features_t features)
+static int btrfs_init_debugfs(void)
 {
-	struct mlx4_en_priv *priv = netdev_priv(netdev);
-	bool reset = false;
+#ifdef CONFIG_DEBUG_FS
+	btrfs_debugfs_root_dentry = debugfs_create_dir("btrfs", NULL);
+	if (!btrfs_debugfs_root_dentry)
+		return -ENOMEM;
+
+	debugfs_create_u64("test", S_IRUGO | S_IWUGO, btrfs_debugfs_root_dentry,
+			&btrfs_debugfs_test);
+#endif
+	return 0;
+}
+
+int btrfs_init_sysfs(void)
+{
+	int ret;
+
+	btrfs_kset = kset_create_and_add("btrfs", NULL, fs_kobj);
+	if (!btrfs_kset)
+		return -ENOMEM;
+
+	ret = btrfs_init_debugfs();
+	if (ret)
+		goto out1;
+
+	init_feature_attrs();
+	ret = sysfs_create_group(&btrfs_kset->kobj, &btrfs_feature_attr_group);
+	if (ret)
+		goto out2;
+
+	return 0;
+out2:
+	debugfs_remove_recursive(btrfs_debugfs_root_dentry);
+out1:
+	kset_unregister(btrfs_kset);
+
+	return ret;
+}
+
+void btrfs_exit_sysfs(void)
+{
+	sysfs_remove_group(&btrfs_kset->kobj, &btrfs_feature_attr_group);
+	kset_unregister(btrfs_kset);
+	debugfs_remove_recursive(btrfs_debugfs_root_dentry);
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 #ifndef _BTRFS_SYSFS_H_
+#define _BTRFS_SYSFS_H_
+
+/*
+ * Data exported through sysfs
+ */
+extern u64 btrfs_debugfs_test;
+
+enum btrfs_feature_set {
+	FEAT_COMPAT,
+	FEAT_COMPAT_RO,
+	FEAT_INCOMPAT,
+	FEAT_MAX
+};
+
+#define __INIT_KOBJ_ATTR(_name, _mode, _show, _store)			\
+{									\
+	.attr	= { .name = __stringify(_name), .mode = _mode },	\
+	.show	= _show,						\
+	.store	= _store,						\
+}
+
+#define BTRFS_ATTR_RW(_name, _show, _store)			\
+	static struct kobj_attribute btrfs_attr_##_name =		\
+			__INIT_KOBJ_ATTR(_name, 0644, _show, _store)
+
+#define BTRFS_ATTR(_name, _show)					\
+	static struct kobj_attribute btrfs_attr_##_name =		\
+			__INIT_KOBJ_ATTR(_name, 0444, _show, NULL)
+
+#define BTRFS_ATTR_PTR(_name)    (&btrfs_attr_##_name.attr)
+
+#define BTRFS_RAID_ATTR(_name, _show)					\
+	static struct kobj_attribute btrfs_raid_attr_##_name =		\
+			__INIT_KOBJ_ATTR(_name, 0444, _show, NULL)
+
+#define BTRFS_RAID_ATTR_PTR(_name)    (&btrfs_raid_attr_##_name.attr)
+
+
+struct btrfs_feature_attr {
+	struct kobj_attribute kobj_attr;
+	enum btrfs_feature_set feature_set;
+	u64 feature_bit;
+};
+
+#define BTRFS_FEAT_ATTR(_name, _feature_set, _prefix, _feature_bit)	     \
+static struct btrfs_feature_attr btrfs_attr_##_name = {			     \
+	.kobj_attr = __INIT_KOBJ_ATTR(_name, S_IRUGO,			     \
+				      btrfs_feature_attr_show,		     \
+				      btrfs_feature_attr_store),	     \
+	.feature_set	= _feature_set,					     \
+	.feature_bit	= _prefix ##_## _feature_bit,			     \
+}
+#define BTRFS_FEAT_ATTR_PTR(_name)    (&btrfs_attr_##_name.kobj_attr.attr)
+
+#define BTRFS_FEAT_ATTR_COMPAT(name, feature) \
+	BTRFS_FEAT_ATTR(name, FEAT_COMPAT, BTRFS_FEATURE_COMPAT, feature)
+#define BTRFS_FEAT_ATTR_COMPAT_RO(name, feature) \
+	BTRFS_FEAT_ATTR(name, FEAT_COMPAT_RO, BTRFS_FEATURE_COMPAT, feature)
+#define BTRFS_FEAT_ATTR_INCOMPAT(name, feature) \
+	BTRFS_FEAT_ATTR(name, FEAT_INCOMPAT, BTRFS_FEATURE_INCOMPAT, feature)
+
+/* convert from attribute */
+static inline struct btrfs_feature_attr *
+to_btrfs_feature_attr(struct kobj_attribute *a)
+{
+	return container_of(a, struct btrfs_feature_attr, kobj_attr);
+}
+
+static inline struct kobj_attribute *attr_to_btrfs_attr(struct attribute *attr)
+{
+	return container_of(attr, struct kobj_attribute, attr);
+}
+
+static inline struct btrfs_feature_attr *
+attr_to_btrfs_feature_attr(struct attribute *attr)
+{
+	return to_btrfs_feature_attr(attr_to_btrfs_attr(attr));
+}
+
+char *btrfs_printable_features(enum btrfs_feature_set set, u64 flags);
+extern const char * const btrfs_feature_set_names[3];
+extern struct kobj_type space_info_ktype;
+extern struct kobj_type btrfs_raid_ktype;
+int btrfs_sysfs_add_device_link(struct btrfs_fs_devices *fs_devices,
+		struct btrfs_device *one_device);
+int btrfs_sysfs_rm_device_link(struct btrfs_fs_devices *fs_devices,
+                struct btrfs_device *one_device);
+int btrfs_sysfs_add_fsid(struct btrfs_fs_devices *fs_devs,
+				struct kobject *parent);
+int btrfs_sysfs_add_device(struct btrfs_fs_devices *fs_devs);
+void btrfs_sysfs_remove_fsid(struct btrfs_fs_devices *fs_devs);
+#endif /* _BTRFS_SYSFS_H_ */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * Copyright (C) 2013 Fusion IO.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/fs.h>
+#include <linux/mount.h>
+#include <linux/magic.h>
+#include "btrfs-tests.h"
+#include "../ctree.h"
+#include "../volumes.h"
+#include "../disk-io.h"
+#include "../qgroup.h"
+
+static struct vfsmount *test_mnt = NULL;
+
+static const struct super_operations btrfs_test_super_ops = {
+	.alloc_inode	= btrfs_alloc_inode,
+	.destroy_inode	= btrfs_test_destroy_inode,
+};
+
+static struct dentry *btrfs_test_mount(struct file_system_type *fs_type,
+				       int flags, const char *dev_name,
+				       void *data)
+{
+	return mount_pseudo(fs_type, "btrfs_test:", &btrfs_test_super_ops,
+			    NULL, BTRFS_TEST_MAGIC);
+}
+
+static struct file_system_type test_type = {
+	.name		= "btrfs_test_fs",
+	.mount		= btrfs_test_mount,
+	.kill_sb	= kill_anon_super,
+};
+
+struct inode *btrfs_new_test_inode(void)
+{
+	struct inode *inode;
+
+	inode = new_inode(test_mnt->mnt_sb);
+	if (inode)
+		inode_init_owner(inode, NULL, S_IFREG);
+
+	return inode;
+}
+
+int btrfs_init_test_fs(void)
+{
+	int ret;
+
+	ret = register_filesystem(&test_type);
+	if (ret) {
+		printk(KERN_ERR "btrfs: cannot register test file system\n");
+		return ret;
+	}
+
+	test_mnt = kern_mount(&test_type);
+	if (IS_ERR(test_mnt)) {
+		printk(KERN_ERR "btrfs: cannot mount test file system\n");
+		unregister_filesystem(&test_type);
+		return ret;
+	}
+	return 0;
+}
+
+void btrfs_destroy_test_fs(void)
+{
+	kern_unmount(test_mnt);
+	unregister_filesystem(&test_type);
+}
+
+struct btrfs_fs_info *btrfs_alloc_dummy_fs_info(void)
+{
+	struct btrfs_fs_info *fs_info = kzalloc(sizeof(struct btrfs_fs_info),
+						GFP_NOFS);
+
+	if (!fs_info)
+		return fs_info;
+	fs_info->fs_devices = kzalloc(sizeof(struct btrfs_fs_devices),
+				      GFP_NOFS);
+	if (!fs_info->fs_devices) {
+		kfree(fs_info);
+		return NULL;
+	}
+	fs_info->super_copy = kzalloc(sizeof(struct btrfs_super_block),
+				      GFP_NOFS);
+	if (!fs_info->super_copy) {
+		kfree(fs_info->fs_devices);
+		kfree(fs_info);
+		return NULL;
+	}
+
+	if (init_srcu_struct(&fs_info->subvol_srcu)) {
+		kfree(fs_info->fs_devices);
+		kfree(fs_info->super_copy);
+		kfree(fs_info);
+		return NULL;
+	}
+
+	spin_lock_init(&fs_info->buffer_lock);
+	spin_lock_init(&fs_info->qgroup_lock);
+	spin_lock_init(&fs_info->qgroup_op_lock);
+	spin_lock_init(&fs_info->super_lock);
+	spin_lock_init(&fs_info->fs_roots_radix_lock);
+	mutex_init(&fs_info->qgroup_ioctl_lock);
+	mutex_init(&fs_info->qgroup_rescan_lock);
+	rwlock_init(&fs_info->tree_mod_log_lock);
+	fs_info->running_transaction = NULL;
+	fs_info->qgroup_tree = RB_ROOT;
+	fs_info->qgroup_ulist = NULL;
+	atomic64_set(&fs_info->tree_mod_seq, 0);
+	INIT_LIST_HEAD(&fs_info->dirty_qgroups);
+	INIT_LIST_HEAD(&fs_info->dead_roots);
+	INIT_LIST_HEAD(&fs_info->tree_mod_seq_list);
+	INIT_RADIX_TREE(&fs_info->buffer_radix, GFP_ATOMIC);
+	INIT_RADIX_TREE(&fs_info->fs_roots_radix, GFP_ATOMIC);
+	return fs_info;
+}
+
+static void btrfs_free_dummy_fs_info(struct btrfs_fs_info *fs_info)
+{
+	struct radix_tree_iter iter;
+	void **slot;
+
+	spin_lock(&fs_info->buffer_lock);
+restart:
+	radix_tree_for_each_slot(slot, &fs_info->buffer_radix, &iter, 0) {
+		struct extent_buffer *eb;
+
+		eb = radix_tree_deref_slot_protected(slot, &fs_info->buffer_lock);
+		if (!eb)
+			continue;
+		/* Shouldn't happen but that kind of thinking creates CVE's */
+		if (radix_tree_exception(eb)) {
+			if (radix_tree_deref_retry(eb))
+				goto restart;
+			continue;
+		}
+		spin_unlock(&fs_info->buffer_lock);
+		free_extent_buffer_stale(eb);
+		spin_lock(&fs_info->buffer_lock);
+	}
+	spin_unlock(&fs_info->buffer_lock);
+
+	btrfs_free_qgroup_config(fs_info);
+	btrfs_free_fs_roots(fs_info);
+	cleanup_srcu_struct(&fs_info->subvol_srcu);
+	kfree(fs_info->super_copy);
+	kfree(fs_info->fs_devices);
+	kfree(fs_info);
+}
+
+void btrfs_free_dummy_root(struct btrfs_root *root)
+{
+	if (IS_ERR_OR_NULL(root))
+		return;
+	if (root->node)
+		free_extent_buffer(root->node);
+	if (root->fs_info)
+		btrfs_free_dummy_fs_info(root->fs_info);
+	kfree(root);
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+ * Copyright (C) 2013 Fusion IO.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#ifndef __BTRFS_TESTS
+#define __BTRFS_TESTS
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+
+#define test_msg(fmt, ...) pr_info("BTRFS: selftest: " fmt, ##__VA_ARGS__)
+
+struct btrfs_root;
+
+int btrfs_test_free_space_cache(void);
+int btrfs_test_extent_buffer_operations(void);
+int btrfs_test_extent_io(void);
+int btrfs_test_inodes(void);
+int btrfs_test_qgroups(void);
+int btrfs_init_test_fs(void);
+void btrfs_destroy_test_fs(void);
+struct inode *btrfs_new_test_inode(void);
+struct btrfs_fs_info *btrfs_alloc_dummy_fs_info(void);
+void btrfs_free_dummy_root(struct btrfs_root *root);
+#else
+static inline int btrfs_test_free_space_cache(void)
+{
+	return 0;
+}
+static inline int btrfs_test_extent_buffer_operations(void)
+{
+	return 0;
+}
+static inline int btrfs_init_test_fs(void)
+{
+	return 0;
+}
+static inline void btrfs_destroy_test_fs(void)
+{
+}
+static inline int btrfs_test_extent_io(void)
+{
+	return 0;
+}
+static inline int btrfs_test_inodes(void)
+{
+	return 0;
+}
+static inline int btrfs_test_qgroups(void)
+{
+	return 0;
+}
+#endif
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Copyright (C) 2013 Fusion IO.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/slab.h>
+#include "btrfs-tests.h"
+#include "../ctree.h"
+#include "../extent_io.h"
+#include "../disk-io.h"
+
+static int test_btrfs_split_item(void)
+{
+	struct btrfs_path *path;
+	struct btrfs_root *root;
+	struct extent_buffer *eb;
+	struct btrfs_item *item;
+	char *value = "mary had a little lamb";
+	char *split1 = "mary had a little";
+	char *split2 = " lamb";
+	char *split3 = "mary";
+	char *split4 = " had a little";
+	char buf[32];
+	struct btrfs_key key;
+	u32 value_len = strlen(value);
 	int ret = 0;
 
-	if (DEV_FEATURE_CHANGED(netdev, features, NETIF_F_RXFCS)) {
-		en_info(priv, "Turn %s RX-FCS\n",
-			(features & NETIF_F_RXFCS) ? "ON" : "OFF");
-		reset = true;
+	test_msg("Running btrfs_split_item tests\n");
+
+	root = btrfs_alloc_dummy_root();
+	if (IS_ERR(root)) {
+		test_msg("Could not allocate root\n");
+		return PTR_ERR(root);
 	}
 
-	if (DEV_FEATURE_CHANGED(netdev, features, NETIF_F_RXALL)) {
-		u8 ignore_fcs_value = (features & NETIF_F_RXALL) ? 1 : 0;
-
-		en_info(priv, "Turn %s RX-ALL\n",
-			ignore_fcs_value ? "ON" : "OFF");
-		ret = mlx4_SET_PORT_fcs_check(priv->mdev->dev,
-					      priv->port, ignore_fcs_value);
-		if (ret)
-			return ret;
+	path = btrfs_alloc_path();
+	if (!path) {
+		test_msg("Could not allocate path\n");
+		kfree(root);
+		return -ENOMEM;
 	}
 
-	if (DEV_FEATURE_CHANGED(netdev, features, NETIF_F_HW_VLAN_CTAG_RX)) {
-		en_info(priv, "Turn %s RX vlan strip offload\n",
-			(features & NETIF_F_HW_VLAN_CTAG_RX) ? "ON" : "OFF");
-		reset = true;
-	}
-
-	if (DEV_FEATURE_CHANGED(netdev, features, NETIF_F_HW_VLAN_CTAG_TX))
-		en_info(priv, "Turn %s TX vlan strip offload\n",
-			(features & NETIF_F_HW_VLAN_CTAG_TX) ? "ON" : "OFF");
-
-	if (DEV_FEATURE_CHANGED(netdev, features, NETIF_F_HW_VLAN_STAG_TX))
-		en_info(priv, "Turn %s TX S-VLAN strip offload\n",
-			(features & NETIF_F_HW_VLAN_STAG_TX) ? "ON" : "OFF");
-
-	if (DEV_FEATURE_CHANGED(netdev, features, NETIF_F_LOOPBACK)) {
-		en_info(priv, "Turn %s loopback\n",
-			(features & NETIF_F_LOOPBACK) ? "ON" : "OFF");
-		mlx4_en_update_loopback_state(netdev, features);
-	}
-
-	if (reset) {
-		ret = mlx4_en_reset_config(netdev, priv->hwtstamp_config,
-					   features);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-static int mlx4_en_set_vf_mac(struct net_device *dev, int queue, u8 *mac)
-{
-	struct mlx4_en_priv *en_priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = en_priv->mdev;
-	u64 mac_u64 = mlx4_mac_to_u64(mac);
-
-	if (is_multicast_ether_addr(mac))
-		return -EINVAL;
-
-	return mlx4_set_vf_mac(mdev->dev, en_priv->port, queue, mac_u64);
-}
-
-static int mlx4_en_set_vf_vlan(struct net_device *dev, int vf, u16 vlan, u8 qos)
-{
-	struct mlx4_en_priv *en_priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = en_priv->mdev;
-
-	return mlx4_set_vf_vlan(mdev->dev, en_priv->port, vf, vlan, qos);
-}
-
-static int mlx4_en_set_vf_rate(struct net_device *dev, int vf, int min_tx_rate,
-			       int max_tx_rate)
-{
-	struct mlx4_en_priv *en_priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = en_priv->mdev;
-
-	return mlx4_set_vf_rate(mdev->dev, en_priv->port, vf, min_tx_rate,
-				max_tx_rate);
-}
-
-static int mlx4_en_set_vf_spoofchk(struct net_device *dev, int vf, bool setting)
-{
-	struct mlx4_en_priv *en_priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = en_priv->mdev;
-
-	return mlx4_set_vf_spoofchk(mdev->dev, en_priv->port, vf, setting);
-}
-
-static int mlx4_en_get_vf_config(struct net_device *dev, int vf, struct ifla_vf_info *ivf)
-{
-	struct mlx4_en_priv *en_priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = en_priv->mdev;
-
-	return mlx4_get_vf_config(mdev->dev, en_priv->port, vf, ivf);
-}
-
-static int mlx4_en_set_vf_link_state(struct net_device *dev, int vf, int link_state)
-{
-	struct mlx4_en_priv *en_priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = en_priv->mdev;
-
-	return mlx4_set_vf_link_state(mdev->dev, en_priv->port, vf, link_state);
-}
-
-static int mlx4_en_get_vf_stats(struct net_device *dev, int vf,
-				struct ifla_vf_stats *vf_stats)
-{
-	struct mlx4_en_priv *en_priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = en_priv->mdev;
-
-	return mlx4_get_vf_stats(mdev->dev, en_priv->port, vf, vf_stats);
-}
-
-#define PORT_ID_BYTE_LEN 8
-static int mlx4_en_get_phys_port_id(struct net_device *dev,
-				    struct netdev_phys_item_id *ppid)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_dev *mdev = priv->mdev->dev;
-	int i;
-	u64 phys_port_id = mdev->caps.phys_port_id[priv->port];
-
-	if (!phys_port_id)
-		return -EOPNOTSUPP;
-
-	ppid->id_len = sizeof(phys_port_id);
-	for (i = PORT_ID_BYTE_LEN - 1; i >= 0; --i) {
-		ppid->id[i] =  phys_port_id & 0xff;
-		phys_port_id >>= 8;
-	}
-	return 0;
-}
-
-#ifdef CONFIG_MLX4_EN_VXLAN
-static void mlx4_en_add_vxlan_offloads(struct work_struct *work)
-{
-	int ret;
-	struct mlx4_en_priv *priv = container_of(work, struct mlx4_en_priv,
-						 vxlan_add_task);
-
-	ret = mlx4_config_vxlan_port(priv->mdev->dev, priv->vxlan_port);
-	if (ret)
+	path->nodes[0] = eb = alloc_dummy_extent_buffer(NULL, 4096);
+	if (!eb) {
+		test_msg("Could not allocate dummy buffer\n");
+		ret = -ENOMEM;
 		goto out;
+	}
+	path->slots[0] = 0;
 
-	ret = mlx4_SET_PORT_VXLAN(priv->mdev->dev, priv->port,
-				  VXLAN_STEER_BY_OUTER_MAC, 1);
-out:
+	key.objectid = 0;
+	key.type = BTRFS_EXTENT_CSUM_KEY;
+	key.offset = 0;
+
+	setup_items_for_insert(root, path, &key, &value_len, value_len,
+			       value_len + sizeof(struct btrfs_item), 1);
+	item = btrfs_item_nr(0);
+	write_extent_buffer(eb, value, btrfs_item_ptr_offset(eb, 0),
+			    value_len);
+
+	key.offset = 3;
+
+	/*
+	 * Passing NULL trans here should be safe because we have plenty of
+	 * space in this leaf to split the item without having to split the
+	 * leaf.
+	 */
+	ret = btrfs_split_item(NULL, root, path, &key, 17);
 	if (ret) {
-		en_err(priv, "failed setting L2 tunnel configuration ret %d\n", ret);
-		return;
+		test_msg("Split item failed %d\n", ret);
+		goto out;
 	}
 
-	/* set offloads */
-	priv->dev->hw_enc_features |= NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
-				      NETIF_F_TSO | NETIF_F_GSO_UDP_TUNNEL;
+	/*
+	 * Read the first slot, it should have the original key and contain only
+	 * 'mary had a little'
+	 */
+	btrfs_item_key_to_cpu(eb, &key, 0);
+	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
+	    key.offset != 0) {
+		test_msg("Invalid key at slot 0\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	item = btrfs_item_nr(0);
+	if (btrfs_item_size(eb, item) != strlen(split1)) {
+		test_msg("Invalid len in the first split\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 0),
+			   strlen(split1));
+	if (memcmp(buf, split1, strlen(split1))) {
+		test_msg("Data in the buffer doesn't match what it should "
+			 "in the first split have='%.*s' want '%s'\n",
+			 (int)strlen(split1), buf, split1);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	btrfs_item_key_to_cpu(eb, &key, 1);
+	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
+	    key.offset != 3) {
+		test_msg("Invalid key at slot 1\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	item = btrfs_item_nr(1);
+	if (btrfs_item_size(eb, item) != strlen(split2)) {
+		test_msg("Invalid len in the second split\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 1),
+			   strlen(split2));
+	if (memcmp(buf, split2, strlen(split2))) {
+		test_msg("Data in the buffer doesn't match what it should "
+			 "in the second split\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	key.offset = 1;
+	/* Do it again so we test memmoving the other items in the leaf */
+	ret = btrfs_split_item(NULL, root, path, &key, 4);
+	if (ret) {
+		test_msg("Second split item failed %d\n", ret);
+		goto out;
+	}
+
+	btrfs_item_key_to_cpu(eb, &key, 0);
+	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
+	    key.offset != 0) {
+		test_msg("Invalid key at slot 0\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	item = btrfs_item_nr(0);
+	if (btrfs_item_size(eb, item) != strlen(split3)) {
+		test_msg("Invalid len in the first split\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 0),
+			   strlen(split3));
+	if (memcmp(buf, split3, strlen(split3))) {
+		test_msg("Data in the buffer doesn't match what it should "
+			 "in the third split");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	btrfs_item_key_to_cpu(eb, &key, 1);
+	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
+	    key.offset != 1) {
+		test_msg("Invalid key at slot 1\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	item = btrfs_item_nr(1);
+	if (btrfs_item_size(eb, item) != strlen(split4)) {
+		test_msg("Invalid len in the second split\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 1),
+			   strlen(split4));
+	if (memcmp(buf, split4, strlen(split4))) {
+		test_msg("Data in the buffer doesn't match what it should "
+			 "in the fourth split\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	btrfs_item_key_to_cpu(eb, &key, 2);
+	if (key.objectid != 0 || key.type != BTRFS_EXTENT_CSUM_KEY ||
+	    key.offset != 3) {
+		test_msg("Invalid key at slot 2\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	item = btrfs_item_nr(2);
+	if (btrfs_item_size(eb, item) != strlen(split2)) {
+		test_msg("Invalid len in the second split\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	read_extent_buffer(eb, buf, btrfs_item_ptr_offset(eb, 2),
+			   strlen(split2));
+	if (memcmp(buf, split2, strlen(split2))) {
+		test_msg("Data in the buffer doesn't match what it should "
+			 "in the last chunk\n");
+		ret = -EINVAL;
+		goto out;
+	}
+out:
+	btrfs_free_path(path);
+	kfree(root);
+	return ret;
 }
 
-static void mlx4_en_del_vxlan_offloads(struct work_struct *work)
+int btrfs_test_extent_buffer_operations(void)
+{
+	test_msg("Running extent buffer operation tests");
+	return test_btrfs_split_item();
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+ * Copyright (C) 2013 Fusion IO.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/pagemap.h>
+#include <linux/sched.h>
+#include "btrfs-tests.h"
+#include "../extent_io.h"
+
+#define PROCESS_UNLOCK		(1 << 0)
+#define PROCESS_RELEASE		(1 << 1)
+#define PROCESS_TEST_LOCKED	(1 << 2)
+
+static noinline int process_page_range(struct inode *inode, u64 start, u64 end,
+				       unsigned long flags)
 {
 	int ret;
-	struct mlx4_en_priv *priv = container_of(work, struct mlx4_en_priv,
-						 vxlan_del_task);
-	/* unset offloads */
-	priv->dev->hw_enc_features &= ~(NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
-				      NETIF_F_TSO | NETIF_F_GSO_UDP_TUNNEL);
-
-	ret = mlx4_SET_PORT_VXLAN(priv->mdev->dev, priv->port,
-				  VXLAN_STEER_BY_OUTER_MAC, 0);
-	if (ret)
-		en_err(priv, "failed setting L2 tunnel configuration ret %d\n", ret);
-
-	priv->vxlan_port = 0;
-}
-
-static void mlx4_en_add_vxlan_port(struct  net_device *dev,
-				   sa_family_t sa_family, __be16 port)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	__be16 current_port;
-
-	if (priv->mdev->dev->caps.tunnel_offload_mode != MLX4_TUNNEL_OFFLOAD_MODE_VXLAN)
-		return;
-
-	if (sa_family == AF_INET6)
-		return;
-
-	current_port = priv->vxlan_port;
-	if (current_port && current_port != port) {
-		en_warn(priv, "vxlan port %d configured, can't add port %d\n",
-			ntohs(current_port), ntohs(port));
-		return;
-	}
-
-	priv->vxlan_port = port;
-	queue_work(priv->mdev->workqueue, &priv->vxlan_add_task);
-}
-
-static void mlx4_en_del_vxlan_port(struct  net_device *dev,
-				   sa_family_t sa_family, __be16 port)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	__be16 current_port;
-
-	if (priv->mdev->dev->caps.tunnel_offload_mode != MLX4_TUNNEL_OFFLOAD_MODE_VXLAN)
-		return;
-
-	if (sa_family == AF_INET6)
-		return;
-
-	current_port = priv->vxlan_port;
-	if (current_port != port) {
-		en_dbg(DRV, priv, "vxlan port %d isn't configured, ignoring\n", ntohs(port));
-		return;
-	}
-
-	queue_work(priv->mdev->workqueue, &priv->vxlan_del_task);
-}
-
-static netdev_features_t mlx4_en_features_check(struct sk_buff *skb,
-						struct net_device *dev,
-						netdev_features_t features)
-{
-	features = vlan_features_check(skb, features);
-	return vxlan_features_check(skb, features);
-}
-#endif
-
-static int mlx4_en_set_tx_maxrate(struct net_device *dev, int queue_index, u32 maxrate)
-{
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_tx_ring *tx_ring = priv->tx_ring[queue_index];
-	struct mlx4_update_qp_params params;
-	int err;
-
-	if (!(priv->mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_QP_RATE_LIMIT))
-		return -EOPNOTSUPP;
-
-	/* rate provided to us in Mbs, check if it fits into 12 bits, if not use Gbs */
-	if (maxrate >> 12) {
-		params.rate_unit = MLX4_QP_RATE_LIMIT_GBS;
-		params.rate_val  = maxrate / 1000;
-	} else if (maxrate) {
-		params.rate_unit = MLX4_QP_RATE_LIMIT_MBS;
-		params.rate_val  = maxrate;
-	} else { /* zero serves to revoke the QP rate-limitation */
-		params.rate_unit = 0;
-		params.rate_val  = 0;
-	}
-
-	err = mlx4_update_qp(priv->mdev->dev, tx_ring->qpn, MLX4_UPDATE_QP_RATE_LIMIT,
-			     &params);
-	return err;
-}
-
-static const struct net_device_ops mlx4_netdev_ops = {
-	.ndo_open		= mlx4_en_open,
-	.ndo_stop		= mlx4_en_close,
-	.ndo_start_xmit		= mlx4_en_xmit,
-	.ndo_select_queue	= mlx4_en_select_queue,
-	.ndo_get_stats		= mlx4_en_get_stats,
-	.ndo_set_rx_mode	= mlx4_en_set_rx_mode,
-	.ndo_set_mac_address	= mlx4_en_set_mac,
-	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_change_mtu		= mlx4_en_change_mtu,
-	.ndo_do_ioctl		= mlx4_en_ioctl,
-	.ndo_tx_timeout		= mlx4_en_tx_timeout,
-	.ndo_vlan_rx_add_vid	= mlx4_en_vlan_rx_add_vid,
-	.ndo_vlan_rx_kill_vid	= mlx4_en_vlan_rx_kill_vid,
-#ifdef CONFIG_NET_POLL_CONTROLLER
-	.ndo_poll_controller	= mlx4_en_netpoll,
-#endif
-	.ndo_set_features	= mlx4_en_set_features,
-	.ndo_fix_features	= mlx4_en_fix_features,
-	.ndo_setup_tc		= mlx4_en_setup_tc,
-#ifdef CONFIG_RFS_ACCEL
-	.ndo_rx_flow_steer	= mlx4_en_filter_rfs,
-#endif
-#ifdef CONFIG_NET_RX_BUSY_POLL
-	.ndo_busy_poll		= mlx4_en_low_latency_recv,
-#endif
-	.ndo_get_phys_port_id	= mlx4_en_get_phys_port_id,
-#ifdef CONFIG_MLX4_EN_VXLAN
-	.ndo_add_vxlan_port	= mlx4_en_add_vxlan_port,
-	.ndo_del_vxlan_port	= mlx4_en_del_vxlan_port,
-	.ndo_features_check	= mlx4_en_features_check,
-#endif
-	.ndo_set_tx_maxrate	= mlx4_en_set_tx_maxrate,
-};
-
-static const struct net_device_ops mlx4_netdev_ops_master = {
-	.ndo_open		= mlx4_en_open,
-	.ndo_stop		= mlx4_en_close,
-	.ndo_start_xmit		= mlx4_en_xmit,
-	.ndo_select_queue	= mlx4_en_select_queue,
-	.ndo_get_stats		= mlx4_en_get_stats,
-	.ndo_set_rx_mode	= mlx4_en_set_rx_mode,
-	.ndo_set_mac_address	= mlx4_en_set_mac,
-	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_change_mtu		= mlx4_en_change_mtu,
-	.ndo_tx_timeout		= mlx4_en_tx_timeout,
-	.ndo_vlan_rx_add_vid	= mlx4_en_vlan_rx_add_vid,
-	.ndo_vlan_rx_kill_vid	= mlx4_en_vlan_rx_kill_vid,
-	.ndo_set_vf_mac		= mlx4_en_set_vf_mac,
-	.ndo_set_vf_vlan	= mlx4_en_set_vf_vlan,
-	.ndo_set_vf_rate	= mlx4_en_set_vf_rate,
-	.ndo_set_vf_spoofchk	= mlx4_en_set_vf_spoofchk,
-	.ndo_set_vf_link_state	= mlx4_en_set_vf_link_state,
-	.ndo_get_vf_stats       = mlx4_en_get_vf_stats,
-	.ndo_get_vf_config	= mlx4_en_get_vf_config,
-#ifdef CONFIG_NET_POLL_CONTROLLER
-	.ndo_poll_controller	= mlx4_en_netpoll,
-#endif
-	.ndo_set_features	= mlx4_en_set_features,
-	.ndo_fix_features	= mlx4_en_fix_features,
-	.ndo_setup_tc		= mlx4_en_setup_tc,
-#ifdef CONFIG_RFS_ACCEL
-	.ndo_rx_flow_steer	= mlx4_en_filter_rfs,
-#endif
-	.ndo_get_phys_port_id	= mlx4_en_get_phys_port_id,
-#ifdef CONFIG_MLX4_EN_VXLAN
-	.ndo_add_vxlan_port	= mlx4_en_add_vxlan_port,
-	.ndo_del_vxlan_port	= mlx4_en_del_vxlan_port,
-	.ndo_features_check	= mlx4_en_features_check,
-#endif
-	.ndo_set_tx_maxrate	= mlx4_en_set_tx_maxrate,
-};
-
-struct mlx4_en_bond {
-	struct work_struct work;
-	struct mlx4_en_priv *priv;
-	int is_bonded;
-	struct mlx4_port_map port_map;
-};
-
-static void mlx4_en_bond_work(struct work_struct *work)
-{
-	struct mlx4_en_bond *bond = container_of(work,
-						     struct mlx4_en_bond,
-						     work);
-	int err = 0;
-	struct mlx4_dev *dev = bond->priv->mdev->dev;
-
-	if (bond->is_bonded) {
-		if (!mlx4_is_bonded(dev)) {
-			err = mlx4_bond(dev);
-			if (err)
-				en_err(bond->priv, "Fail to bond device\n");
-		}
-		if (!err) {
-			err = mlx4_port_map_set(dev, &bond->port_map);
-			if (err)
-				en_err(bond->priv, "Fail to set port map [%d][%d]: %d\n",
-				       bond->port_map.port1,
-				       bond->port_map.port2,
-				       err);
-		}
-	} else if (mlx4_is_bonded(dev)) {
-		err = mlx4_unbond(dev);
-		if (err)
-			en_err(bond->priv, "Fail to unbond device\n");
-	}
-	dev_put(bond->priv->dev);
-	kfree(bond);
-}
-
-static int mlx4_en_queue_bond_work(struct mlx4_en_priv *priv, int is_bonded,
-				   u8 v2p_p1, u8 v2p_p2)
-{
-	struct mlx4_en_bond *bond = NULL;
-
-	bond = kzalloc(sizeof(*bond), GFP_ATOMIC);
-	if (!bond)
-		return -ENOMEM;
-
-	INIT_WORK(&bond->work, mlx4_en_bond_work);
-	bond->priv = priv;
-	bond->is_bonded = is_bonded;
-	bond->port_map.port1 = v2p_p1;
-	bond->port_map.port2 = v2p_p2;
-	dev_hold(priv->dev);
-	queue_work(priv->mdev->workqueue, &bond->work);
-	return 0;
-}
-
-int mlx4_en_netdev_event(struct notifier_block *this,
-			 unsigned long event, void *ptr)
-{
-	struct net_device *ndev = netdev_notifier_info_to_dev(ptr);
-	u8 port = 0;
-	struct mlx4_en_dev *mdev;
-	struct mlx4_dev *dev;
-	int i, num_eth_ports = 0;
-	bool do_bond = true;
-	struct mlx4_en_priv *priv;
-	u8 v2p_port1 = 0;
-	u8 v2p_port2 = 0;
-
-	if (!net_eq(dev_net(ndev), &init_net))
-		return NOTIFY_DONE;
-
-	mdev = container_of(this, struct mlx4_en_dev, nb);
-	dev = mdev->dev;
-
-	/* Go into this mode only when two network devices set on two ports
-	 * of the same mlx4 device are slaves of the same bonding master
-	 */
-	mlx4_foreach_port(i, dev, MLX4_PORT_TYPE_ETH) {
-		++num_eth_ports;
-		if (!port && (mdev->pndev[i] == ndev))
-			port = i;
-		mdev->upper[i] = mdev->pndev[i] ?
-			netdev_master_upper_dev_get(mdev->pndev[i]) : NULL;
-		/* condition not met: network device is a slave */
-		if (!mdev->upper[i])
-			do_bond = false;
-		if (num_eth_ports < 2)
-			continue;
-		/* condition not met: same master */
-		if (mdev->upper[i] != mdev->upper[i-1])
-			do_bond = false;
-	}
-	/* condition not met: 2 salves */
-	do_bond = (num_eth_ports ==  2) ? do_bond : false;
-
-	/* handle only events that come with enough info */
-	if ((do_bond && (event != NETDEV_BONDING_INFO)) || !port)
-		return NOTIFY_DONE;
-
-	priv = netdev_priv(ndev);
-	if (do_bond) {
-		struct netdev_notifier_bonding_info *notifier_info = ptr;
-		struct netdev_bonding_info *bonding_info =
-			&notifier_info->bonding_info;
-
-		/* required mode 1, 2 or 4 */
-		if ((bonding_info->master.bond_mode != BOND_MODE_ACTIVEBACKUP) &&
-		    (bonding_info->master.bond_mode != BOND_MODE_XOR) &&
-		    (bonding_info->master.bond_mode != BOND_MODE_8023AD))
-			do_bond = false;
-
-		/* require exactly 2 slaves */
-		if (bonding_info->master.num_slaves != 2)
-			do_bond = false;
-
-		/* calc v2p */
-		if (do_bond) {
-			if (bonding_info->master.bond_mode ==
-			    BOND_MODE_ACTIVEBACKUP) {
-				/* in active-backup mode virtual ports are
-				 * mapped to the physical port of the active
-				 * slave */
-				if (bonding_info->slave.state ==
-				    BOND_STATE_BACKUP) {
-					if (port == 1) {
-						v2p_port1 = 2;
-						v2p_port2 = 2;
-					} else {
-						v2p_port1 = 1;
-						v2p_port2 = 1;
-					}
-				} else { /* BOND_STATE_ACTIVE */
-					if (port == 1) {
-						v2p_port1 = 1;
-						v2p_port2 = 1;
-					} else {
-						v2p_port1 = 2;
-						v2p_port2 = 2;
-					}
-				}
-			} else { /* Active-Active */
-				/* in active-active mode a virtual port is
-				 * mapped to the native physical port if and only
-				 * if the physical port is up */
-				__s8 link = bonding_info->slave.link;
-
-				if (port == 1)
-					v2p_port2 = 2;
-				else
-					v2p_port1 = 1;
-				if ((link == BOND_LINK_UP) ||
-				    (link == BOND_LINK_FAIL)) {
-					if (port == 1)
-						v2p_port1 = 1;
-					else
-						v2p_port2 = 2;
-				} else { /* BOND_LINK_DOWN || BOND_LINK_BACK */
-					if (port == 1)
-						v2p_port1 = 2;
-					else
-						v2p_port2 = 1;
-				}
-			}
-		}
-	}
-
-	mlx4_en_queue_bond_work(priv, do_bond,
-				v2p_port1, v2p_port2);
-
-	return NOTIFY_DONE;
-}
-
-void mlx4_en_update_pfc_stats_bitmap(struct mlx4_dev *dev,
-				     struct mlx4_en_stats_bitmap *stats_bitmap,
-				     u8 rx_ppp, u8 rx_pause,
-				     u8 tx_ppp, u8 tx_pause)
-{
-	int last_i = NUM_MAIN_STATS + NUM_PORT_STATS + NUM_PF_STATS;
-
-	if (!mlx4_is_slave(dev) &&
-	    (dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_FLOWSTATS_EN)) {
-		mutex_lock(&stats_bitmap->mutex);
-		bitmap_clear(stats_bitmap->bitmap, last_i, NUM_FLOW_STATS);
-
-		if (rx_ppp)
-			bitmap_set(stats_bitmap->bitmap, last_i,
-				   NUM_FLOW_PRIORITY_STATS_RX);
-		last_i += NUM_FLOW_PRIORITY_STATS_RX;
-
-		if (rx_pause && !(rx_ppp))
-			bitmap_set(stats_bitmap->bitmap, last_i,
-				   NUM_FLOW_STATS_RX);
-		last_i += NUM_FLOW_STATS_RX;
-
-		if (tx_ppp)
-			bitmap_set(stats_bitmap->bitmap, last_i,
-				   NUM_FLOW_PRIORITY_STATS_TX);
-		last_i += NUM_FLOW_PRIORITY_STATS_TX;
-
-		if (tx_pause && !(tx_ppp))
-			bitmap_set(stats_bitmap->bitmap, last_i,
-				   NUM_FLOW_STATS_TX);
-		last_i += NUM_FLOW_STATS_TX;
-
-		mutex_unlock(&stats_bitmap->mutex);
-	}
-}
-
-void mlx4_en_set_stats_bitmap(struct mlx4_dev *dev,
-			      struct mlx4_en_stats_bitmap *stats_bitmap,
-			      u8 rx_ppp, u8 rx_pause,
-			      u8 tx_ppp, u8 tx_pause)
-{
-	int last_i = 0;
-
-	mutex_init(&stats_bitmap->mutex);
-	bitmap_zero(stats_bitmap->bitmap, NUM_ALL_STATS);
-
-	if (mlx4_is_slave(dev)) {
-		bitmap_set(stats_bitmap->bitmap, last_i +
-					 MLX4_FIND_NETDEV_STAT(rx_packets), 1);
-		bitmap_set(stats_bitmap->bitmap, last_i +
-					 MLX4_FIND_NETDEV_STAT(tx_packets), 1);
-		bitmap_set(stats_bitmap->bitmap, last_i +
-					 MLX4_FIND_NETDEV_STAT(rx_bytes), 1);
-		bitmap_set(stats_bitmap->bitmap, last_i +
-					 MLX4_FIND_NETDEV_STAT(tx_bytes), 1);
-		bitmap_set(stats_bitmap->bitmap, last_i +
-					 MLX4_FIND_NETDEV_STAT(rx_dropped), 1);
-		bitmap_set(stats_bitmap->bitmap, last_i +
-					 MLX4_FIND_NETDEV_STAT(tx_dropped), 1);
-	} else {
-		bitmap_set(stats_bitmap->bitmap, last_i, NUM_MAIN_STATS);
-	}
-	last_i += NUM_MAIN_STATS;
-
-	bitmap_set(stats_bitmap->bitmap, last_i, NUM_PORT_STATS);
-	last_i += NUM_PORT_STATS;
-
-	if (mlx4_is_master(dev))
-		bitmap_set(stats_bitmap->bitmap, last_i,
-			   NUM_PF_STATS);
-	last_i += NUM_PF_STATS;
-
-	mlx4_en_update_pfc_stats_bitmap(dev, stats_bitmap,
-					rx_ppp, rx_pause,
-					tx_ppp, tx_pause);
-	last_i += NUM_FLOW_STATS;
-
-	if (!mlx4_is_slave(dev))
-		bitmap_set(stats_bitmap->bitmap, last_i, NUM_PKT_STATS);
-}
-
-int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
-			struct mlx4_en_port_profile *prof)
-{
-	struct net_device *dev;
-	struct mlx4_en_priv *priv;
+	struct page *pages[16];
+	unsigned long index = start >> PAGE_CACHE_SHIFT;
+	unsigned long end_index = end >> PAGE_CACHE_SHIFT;
+	unsigned long nr_pages = end_index - index + 1;
 	int i;
-	int err;
+	int count = 0;
+	int loops = 0;
 
-	dev = alloc_etherdev_mqs(sizeof(struct mlx4_en_priv),
-				 MAX_TX_RINGS, MAX_RX_RINGS);
-	if (dev == NULL)
+	while (nr_pages > 0) {
+		ret = find_get_pages_contig(inode->i_mapping, index,
+				     min_t(unsigned long, nr_pages,
+				     ARRAY_SIZE(pages)), pages);
+		for (i = 0; i < ret; i++) {
+			if (flags & PROCESS_TEST_LOCKED &&
+			    !PageLocked(pages[i]))
+				count++;
+			if (flags & PROCESS_UNLOCK && PageLocked(pages[i]))
+				unlock_page(pages[i]);
+			page_cache_release(pages[i]);
+			if (flags & PROCESS_RELEASE)
+				page_cache_release(pages[i]);
+		}
+		nr_pages -= ret;
+		index += ret;
+		cond_resched();
+		loops++;
+		if (loops > 100000) {
+			printk(KERN_ERR "stuck in a loop, start %Lu, end %Lu, nr_pages %lu, ret %d\n", start, end, nr_pages, ret);
+			break;
+		}
+	}
+	return count;
+}
+
+static int test_find_delalloc(void)
+{
+	struct inode *inode;
+	struct extent_io_tree tmp;
+	struct page *page;
+	struct page *locked_page = NULL;
+	unsigned long index = 0;
+	u64 total_dirty = 256 * 1024 * 1024;
+	u64 max_bytes = 128 * 1024 * 1024;
+	u64 start, end, test_start;
+	u64 found;
+	int ret = -EINVAL;
+
+	inode = btrfs_new_test_inode();
+	if (!inode) {
+		test_msg("Failed to allocate test inode\n");
 		return -ENOMEM;
+	}
 
-	netif_set_real_num_tx_queues(dev, prof->tx_ring_num);
-	netif_set_real_num_rx_queues(dev, prof->rx_ring_num);
-
-	SET_NETDEV_DEV(dev, &mdev->dev->persist->pdev->dev);
-	dev->dev_port = port - 1;
+	extent_io_tree_init(&tmp, &inode->i_data);
 
 	/*
-	 * Initialize driver private data
+	 * First go through and create and mark all of our pages dirty, we pin
+	 * everything to make sure our pages don't get evicted and screw up our
+	 * test.
 	 */
-
-	priv = netdev_priv(dev);
-	memset(priv, 0, sizeof(struct mlx4_en_priv));
-	priv->counter_index = MLX4_SINK_COUNTER_INDEX(mdev->dev);
-	spin_lock_init(&priv->stats_lock);
-	INIT_WORK(&priv->rx_mode_task, mlx4_en_do_set_rx_mode);
-	INIT_WORK(&priv->restart_task, mlx4_en_restart);
-	INIT_WORK(&priv->linkstate_task, mlx4_en_linkstate);
-	INIT_DELAYED_WORK(&priv->stats_task, mlx4_en_do_get_stats);
-	INIT_DELAYED_WORK(&priv->service_task, mlx4_en_service_task);
-#ifdef CONFIG_MLX4_EN_VXLAN
-	INIT_WORK(&priv->vxlan_add_task, mlx4_en_add_vxlan_offloads);
-	INIT_WORK(&priv->vxlan_del_task, mlx4_en_del_vxlan_offloads);
-#endif
-#ifdef CONFIG_RFS_ACCEL
-	INIT_LIST_HEAD(&priv->filters);
-	spin_lock_init(&priv->filters_lock);
-#endif
-
-	priv->dev = dev;
-	priv->mdev = mdev;
-	priv->ddev = &mdev->pdev->dev;
-	priv->prof = prof;
-	priv->port = port;
-	priv->port_up = false;
-	priv->flags = prof->flags;
-	priv->pflags = MLX4_EN_PRIV_FLAGS_BLUEFLAME;
-	priv->ctrl_flags = cpu_to_be32(MLX4_WQE_CTRL_CQ_UPDATE |
-			MLX4_WQE_CTRL_SOLICITED);
-	priv->num_tx_rings_p_up = mdev->profile.num_tx_rings_p_up;
-	priv->tx_ring_num = prof->tx_ring_num;
-	priv->tx_work_limit = MLX4_EN_DEFAULT_TX_WORK;
-	netdev_rss_key_fill(priv->rss_key, sizeof(priv->rss_key));
-
-	priv->tx_ring = kzalloc(sizeof(struct mlx4_en_tx_ring *) * MAX_TX_RINGS,
-				GFP_KERNEL);
-	if (!priv->tx_ring) {
-		err = -ENOMEM;
-		goto out;
-	}
-	priv->tx_cq = kzalloc(sizeof(struct mlx4_en_cq *) * MAX_TX_RINGS,
-			      GFP_KERNEL);
-	if (!priv->tx_cq) {
-		err = -ENOMEM;
-		goto out;
-	}
-	priv->rx_ring_num = prof->rx_ring_num;
-	priv->cqe_factor = (mdev->dev->caps.cqe_size == 64) ? 1 : 0;
-	priv->cqe_size = mdev->dev->caps.cqe_size;
-	priv->mac_index = -1;
-	priv->msg_enable = MLX4_EN_MSG_LEVEL;
-#ifdef CONFIG_MLX4_EN_DCB
-	if (!mlx4_is_slave(priv->mdev->dev)) {
-		if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_ETS_CFG) {
-			dev->dcbnl_ops = &mlx4_en_dcbnl_ops;
-		} else {
-			en_info(priv, "enabling only PFC DCB ops\n");
-			dev->dcbnl_ops = &mlx4_en_dcbnl_pfc_ops;
-		}
-	}
-#endif
-
-	for (i = 0; i < MLX4_EN_MAC_HASH_SIZE; ++i)
-		INIT_HLIST_HEAD(&priv->mac_hash[i]);
-
-	/* Query for default mac and max mtu */
-	priv->max_mtu = mdev->dev->caps.eth_mtu_cap[priv->port];
-
-	if (mdev->dev->caps.rx_checksum_flags_port[priv->port] &
-	    MLX4_RX_CSUM_MODE_VAL_NON_TCP_UDP)
-		priv->flags |= MLX4_EN_FLAG_RX_CSUM_NON_TCP_UDP;
-
-	/* Set default MAC */
-	dev->addr_len = ETH_ALEN;
-	mlx4_en_u64_to_mac(dev->dev_addr, mdev->dev->caps.def_mac[priv->port]);
-	if (!is_valid_ether_addr(dev->dev_addr)) {
-		en_err(priv, "Port: %d, invalid mac burned: %pM, quiting\n",
-		       priv->port, dev->dev_addr);
-		err = -EINVAL;
-		goto out;
-	} else if (mlx4_is_slave(priv->mdev->dev) &&
-		   (priv->mdev->dev->port_random_macs & 1 << priv->port)) {
-		/* Random MAC was assigned in mlx4_slave_cap
-		 * in mlx4_core module
-		 */
-		dev->addr_assign_type |= NET_ADDR_RANDOM;
-		en_warn(priv, "Assigned random MAC address %pM\n", dev->dev_addr);
-	}
-
-	memcpy(priv->current_mac, dev->dev_addr, sizeof(priv->current_mac));
-
-	priv->stride = roundup_pow_of_two(sizeof(struct mlx4_en_rx_desc) +
-					  DS_SIZE * MLX4_EN_MAX_RX_FRAGS);
-	err = mlx4_en_alloc_resources(priv);
-	if (err)
-		goto out;
-
-	/* Initialize time stamping config */
-	priv->hwtstamp_config.flags = 0;
-	priv->hwtstamp_config.tx_type = HWTSTAMP_TX_OFF;
-	priv->hwtstamp_config.rx_filter = HWTSTAMP_FILTER_NONE;
-
-	/* Allocate page for receive rings */
-	err = mlx4_alloc_hwq_res(mdev->dev, &priv->res,
-				MLX4_EN_PAGE_SIZE, MLX4_EN_PAGE_SIZE);
-	if (err) {
-		en_err(priv, "Failed to allocate page for rx qps\n");
-		goto out;
-	}
-	priv->allocated = 1;
-
-	/*
-	 * Initialize netdev entry points
-	 */
-	if (mlx4_is_master(priv->mdev->dev))
-		dev->netdev_ops = &mlx4_netdev_ops_master;
-	else
-		dev->netdev_ops = &mlx4_netdev_ops;
-	dev->watchdog_timeo = MLX4_EN_WATCHDOG_TIMEOUT;
-	netif_set_real_num_tx_queues(dev, priv->tx_ring_num);
-	netif_set_real_num_rx_queues(dev, priv->rx_ring_num);
-
-	dev->ethtool_ops = &mlx4_en_ethtool_ops;
-
-	/*
-	 * Set driver features
-	 */
-	dev->hw_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
-	if (mdev->LSO_support)
-		dev->hw_features |= NETIF_F_TSO | NETIF_F_TSO6;
-
-	dev->vlan_features = dev->hw_features;
-
-	dev->hw_features |= NETIF_F_RXCSUM | NETIF_F_RXHASH;
-	dev->features = dev->hw_features | NETIF_F_HIGHDMA |
-			NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX |
-			NETIF_F_HW_VLAN_CTAG_FILTER;
-	dev->hw_features |= NETIF_F_LOOPBACK |
-			NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX;
-
-	if (!(mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_SKIP_OUTER_VLAN)) {
-		dev->features |= NETIF_F_HW_VLAN_STAG_RX |
-			NETIF_F_HW_VLAN_STAG_FILTER;
-		dev->hw_features |= NETIF_F_HW_VLAN_STAG_RX;
-	}
-
-	if (mlx4_is_slave(mdev->dev)) {
-		int phv;
-
-		err = get_phv_bit(mdev->dev, port, &phv);
-		if (!err && phv) {
-			dev->hw_features |= NETIF_F_HW_VLAN_STAG_TX;
-			priv->pflags |= MLX4_EN_PRIV_FLAGS_PHV;
-		}
-	} else {
-		if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_PHV_EN &&
-		    !(mdev->dev->caps.flags2 &
-		      MLX4_DEV_CAP_FLAG2_SKIP_OUTER_VLAN))
-			dev->hw_features |= NETIF_F_HW_VLAN_STAG_TX;
-	}
-
-	if (mdev->dev->caps.flags & MLX4_DEV_CAP_FLAG_FCS_KEEP)
-		dev->hw_features |= NETIF_F_RXFCS;
-
-	if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_IGNORE_FCS)
-		dev->hw_features |= NETIF_F_RXALL;
-
-	if (mdev->dev->caps.steering_mode ==
-	    MLX4_STEERING_MODE_DEVICE_MANAGED &&
-	    mdev->dev->caps.dmfs_high_steer_mode != MLX4_STEERING_DMFS_A0_STATIC)
-		dev->hw_features |= NETIF_F_NTUPLE;
-
-	if (mdev->dev->caps.steering_mode != MLX4_STEERING_MODE_A0)
-		dev->priv_flags |= IFF_UNICAST_FLT;
-
-	/* Setting a default hash function value */
-	if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_RSS_TOP) {
-		priv->rss_hash_fn = ETH_RSS_HASH_TOP;
-	} else if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_RSS_XOR) {
-		priv->rss_hash_fn = ETH_RSS_HASH_XOR;
-	} else {
-		en_warn(priv,
-			"No RSS hash capabilities exposed, using Toeplitz\n");
-		priv->rss_hash_fn = ETH_RSS_HASH_TOP;
-	}
-
-	if (mdev->dev->caps.tunnel_offload_mode == MLX4_TUNNEL_OFFLOAD_MODE_VXLAN) {
-		dev->hw_features |= NETIF_F_GSO_UDP_TUNNEL;
-		dev->features    |= NETIF_F_GSO_UDP_TUNNEL;
-	}
-
-	mdev->pndev[port] = dev;
-	mdev->upper[port] = NULL;
-
-	netif_carrier_off(dev);
-	mlx4_en_set_default_moderation(priv);
-
-	en_warn(priv, "Using %d TX rings\n", prof->tx_ring_num);
-	en_warn(priv, "Using %d RX rings\n", prof->rx_ring_num);
-
-	mlx4_en_update_loopback_state(priv->dev, priv->dev->features);
-
-	/* Configure port */
-	mlx4_en_calc_rx_buf(dev);
-	err = mlx4_SET_PORT_general(mdev->dev, priv->port,
-				    priv->rx_skb_size + ETH_FCS_LEN,
-				    prof->tx_pause, prof->tx_ppp,
-				    prof->rx_pause, prof->rx_ppp);
-	if (err) {
-		en_err(priv, "Failed setting port general configurations for port %d, with error %d\n",
-		       priv->port, err);
-		goto out;
-	}
-
-	if (mdev->dev->caps.tunnel_offload_mode == MLX4_TUNNEL_OFFLOAD_MODE_VXLAN) {
-		err = mlx4_SET_PORT_VXLAN(mdev->dev, priv->port, VXLAN_STEER_BY_OUTER_MAC, 1);
-		if (err) {
-			en_err(priv, "Failed setting port L2 tunnel configuration, err %d\n",
-			       err);
+	for (index = 0; index < (total_dirty >> PAGE_CACHE_SHIFT); index++) {
+		page = find_or_create_page(inode->i_mapping, index, GFP_NOFS);
+		if (!page) {
+			test_msg("Failed to allocate test page\n");
+			ret = -ENOMEM;
 			goto out;
 		}
+		SetPageDirty(page);
+		if (index) {
+			unlock_page(page);
+		} else {
+			page_cache_get(page);
+			locked_page = page;
+		}
 	}
 
-	/* Init port */
-	en_warn(priv, "Initializing port\n");
-	err = mlx4_INIT_PORT(mdev->dev, priv->port);
-	if (err) {
-		en_err(priv, "Failed Initializing port\n");
-		goto out;
+	/* Test this scenario
+	 * |--- delalloc ---|
+	 * |---  search  ---|
+	 */
+	set_extent_delalloc(&tmp, 0, 4095, NULL, GFP_NOFS);
+	start = 0;
+	end = 0;
+	found = find_lock_delalloc_range(inode, &tmp, locked_page, &start,
+					 &end, max_bytes);
+	if (!found) {
+		test_msg("Should have found at least one delalloc\n");
+		goto out_bits;
 	}
-	queue_delayed_work(mdev->workqueue, &priv->stats_task, STATS_DELAY);
+	if (start != 0 || end != 4095) {
+		test_msg("Expected start 0 end 4095, got start %Lu end %Lu\n",
+			 start, end);
+		goto out_bits;
+	}
+	unlock_extent(&tmp, start, end);
+	unlock_page(locked_page);
+	page_cache_release(locked_page);
 
-	/* Initialize time stamp mechanism */
-	if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_TS)
-		mlx4_en_init_timestamp(mdev);
+	/*
+	 * Test this scenario
+	 *
+	 * |--- delalloc ---|
+	 *           |--- search ---|
+	 */
+	test_start = 64 * 1024 * 1024;
+	locked_page = find_lock_page(inode->i_mapping,
+				     test_start >> PAGE_CACHE_SHIFT);
+	if (!locked_page) {
+		test_msg("Couldn't find the locked page\n");
+		goto out_bits;
+	}
+	set_extent_delalloc(&tmp, 4096, max_bytes - 1, NULL, GFP_NOFS);
+	start = test_start;
+	end = 0;
+	found = find_lock_delalloc_range(inode, &tmp, locked_page, &start,
+					 &end, max_bytes);
+	if (!found) {
+		test_msg("Couldn't find delalloc in our range\n");
+		goto out_bits;
+	}
+	if (start != test_start || end != max_bytes - 1) {
+		test_msg("Expected start %Lu end %Lu, got start %Lu, end "
+			 "%Lu\n", test_start, max_bytes - 1, start, end);
+		goto out_bits;
+	}
+	if (process_page_range(inode, start, end,
+			       PROCESS_TEST_LOCKED | PROCESS_UNLOCK)) {
+		test_msg("There were unlocked pages in the range\n");
+		goto out_bits;
+	}
+	unlock_extent(&tmp, start, end);
+	/* locked_page was unlocked above */
+	page_cache_release(locked_page);
 
-	queue_delayed_work(mdev->workqueue, &priv->service_task,
-			   SERVICE_TASK_DELAY);
-
-	mlx4_en_set_stats_bitmap(mdev->dev, &priv->stats_bitmap,
-				 mdev->profile.prof[priv->port].rx_ppp,
-				 mdev->profile.prof[priv->port].rx_pause,
-				 mdev->profile.prof[priv->port].tx_ppp,
-				 mdev->profile.prof[priv->port].tx_pause);
-
-	err = register_netdev(dev);
-	if (err) {
-		en_err(priv, "Netdev registration failed for port %d\n", port);
-		goto out;
+	/*
+	 * Test this scenario
+	 * |--- delalloc ---|
+	 *                    |--- search ---|
+	 */
+	test_start = max_bytes + 4096;
+	locked_page = find_lock_page(inode->i_mapping, test_start >>
+				     PAGE_CACHE_SHIFT);
+	if (!locked_page) {
+		test_msg("Could'nt find the locked page\n");
+		goto out_bits;
+	}
+	start = test_start;
+	end = 0;
+	found = find_lock_delalloc_range(inode, &tmp, locked_page, &start,
+					 &end, max_bytes);
+	if (found) {
+		test_msg("Found range when we shouldn't have\n");
+		goto out_bits;
+	}
+	if (end != (u64)-1) {
+		test_msg("Did not return the proper end offset\n");
+		goto out_bits;
 	}
 
-	priv->registered = 1;
+	/*
+	 * Test this scenario
+	 * [------- delalloc -------|
+	 * [max_bytes]|-- search--|
+	 *
+	 * We are re-using our test_start from above since it works out well.
+	 */
+	set_extent_delalloc(&tmp, max_bytes, total_dirty - 1, NULL, GFP_NOFS);
+	start = test_start;
+	end = 0;
+	found = find_lock_delalloc_range(inode, &tmp, locked_page, &start,
+					 &end, max_bytes);
+	if (!found) {
+		test_msg("Didn't find our range\n");
+		goto out_bits;
+	}
+	if (start != test_start || end != total_dirty - 1) {
+		test_msg("Expected start %Lu end %Lu, got start %Lu end %Lu\n",
+			 test_start, total_dirty - 1, start, end);
+		goto out_bits;
+	}
+	if (process_page_range(inode, start, end,
+			       PROCESS_TEST_LOCKED | PROCESS_UNLOCK)) {
+		test_msg("Pages in range were not all locked\n");
+		goto out_bits;
+	}
+	unlock_extent(&tmp, start, end);
+
+	/*
+	 * Now to test where we run into a page that is no longer dirty in the
+	 * range we want to find.
+	 */
+	page = find_get_page(inode->i_mapping, (max_bytes + (1 * 1024 * 1024))
+			     >> PAGE_CACHE_SHIFT);
+	if (!page) {
+		test_msg("Couldn't find our page\n");
+		goto out_bits;
+	}
+	ClearPageDirty(page);
+	page_cache_release(page);
+
+	/* We unlocked it in the previous test */
+	lock_page(locked_page);
+	start = test_start;
+	end = 0;
+	/*
+	 * Currently if we fail to find dirty pages in the delalloc range we
+	 * will adjust max_bytes down to PAGE_CACHE_SIZE and then re-search.  If
+	 * this changes at any point in the future we will need to fix this
+	 * tests expected behavior.
+	 */
+	found = find_lock_delalloc_range(inode, &tmp, locked_page, &start,
+					 &end, max_bytes);
+	if (!found) {
+		test_msg("Didn't find our range\n");
+		goto out_bits;
+	}
+	if (start != test_start && end != test_start + PAGE_CACHE_SIZE - 1) {
+		test_msg("Expected start %Lu end %Lu, got start %Lu end %Lu\n",
+			 test_start, test_start + PAGE_CACHE_SIZE - 1, start,
+			 end);
+		goto out_bits;
+	}
+	if (process_page_range(inode, start, end, PROCESS_TEST_LOCKED |
+			       PROCESS_UNLOCK)) {
+		test_msg("Pages in range were not all locked\n");
+		goto out_bits;
+	}
+	ret = 0;
+out_bits:
+	clear_extent_bits(&tmp, 0, total_dirty - 1, (unsigned)-1, GFP_NOFS);
+out:
+	if (locked_page)
+		page_cache_release(locked_page);
+	process_page_range(inode, 0, total_dirty - 1,
+			   PROCESS_UNLOCK | PROCESS_RELEASE);
+	iput(inode);
+	return ret;
+}
+
+int btrfs_test_extent_io(void)
+{
+	test_msg("Running find delalloc tests\n");
+	return test_find_delalloc();
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+ * Copyright (C) 2013 Fusion IO.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/slab.h>
+#include "btrfs-tests.h"
+#include "../ctree.h"
+#include "../disk-io.h"
+#include "../free-space-cache.h"
+
+#define BITS_PER_BITMAP		(PAGE_CACHE_SIZE * 8)
+static struct btrfs_block_group_cache *init_test_block_group(void)
+{
+	struct btrfs_block_group_cache *cache;
+
+	cache = kzalloc(sizeof(*cache), GFP_NOFS);
+	if (!cache)
+		return NULL;
+	cache->free_space_ctl = kzalloc(sizeof(*cache->free_space_ctl),
+					GFP_NOFS);
+	if (!cache->free_space_ctl) {
+		kfree(cache);
+		return NULL;
+	}
+	cache->fs_info = btrfs_alloc_dummy_fs_info();
+	if (!cache->fs_info) {
+		kfree(cache->free_space_ctl);
+		kfree(cache);
+		return NULL;
+	}
+
+	cache->key.objectid = 0;
+	cache->key.offset = 1024 * 1024 * 1024;
+	cache->key.type = BTRFS_BLOCK_GROUP_ITEM_KEY;
+	cache->sectorsize = 4096;
+	cache->full_stripe_len = 4096;
+
+	spin_lock_init(&cache->lock);
+	INIT_LIST_HEAD(&cache->list);
+	INIT_LIST_HEAD(&cache->cluster_list);
+	INIT_LIST_HEAD(&cache->bg_list);
+
+	btrfs_init_free_space_ctl(cache);
+
+	return cache;
+}
+
+/*
+ * This test just does basic sanity checking, making sure we can add an exten
+ * entry and remove space from either end and the middle, and make sure we can
+ * remove space that covers adjacent extent entries.
+ */
+static int test_extents(struct btrfs_block_group_cache *cache)
+{
+	int ret = 0;
+
+	test_msg("Running extent only tests\n");
+
+	/* First just make sure we can remove an entire entry */
+	ret = btrfs_add_free_space(cache, 0, 4 * 1024 * 1024);
+	if (ret) {
+		test_msg("Error adding initial extents %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 0, 4 * 1024 * 1024);
+	if (ret) {
+		test_msg("Error removing extent %d\n", ret);
+		return ret;
+	}
+
+	if (test_check_exists(cache, 0, 4 * 1024 * 1024)) {
+		test_msg("Full remove left some lingering space\n");
+		return -1;
+	}
+
+	/* Ok edge and middle cases now */
+	ret = btrfs_add_free_space(cache, 0, 4 * 1024 * 1024);
+	if (ret) {
+		test_msg("Error adding half extent %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 3 * 1024 * 1024, 1 * 1024 * 1024);
+	if (ret) {
+		test_msg("Error removing tail end %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 0, 1 * 1024 * 1024);
+	if (ret) {
+		test_msg("Error removing front end %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 2 * 1024 * 1024, 4096);
+	if (ret) {
+		test_msg("Error removing middle piece %d\n", ret);
+		return ret;
+	}
+
+	if (test_check_exists(cache, 0, 1 * 1024 * 1024)) {
+		test_msg("Still have space at the front\n");
+		return -1;
+	}
+
+	if (test_check_exists(cache, 2 * 1024 * 1024, 4096)) {
+		test_msg("Still have space in the middle\n");
+		return -1;
+	}
+
+	if (test_check_exists(cache, 3 * 1024 * 1024, 1 * 1024 * 1024)) {
+		test_msg("Still have space at the end\n");
+		return -1;
+	}
+
+	/* Cleanup */
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
 
 	return 0;
-
-out:
-	mlx4_en_destroy_netdev(dev);
-	return err;
 }
 
-int mlx4_en_reset_config(struct net_device *dev,
-			 struct hwtstamp_config ts_config,
-			 netdev_features_t features)
+static int test_bitmaps(struct btrfs_block_group_cache *cache)
 {
-	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_dev *mdev = priv->mdev;
-	int port_up = 0;
-	int err = 0;
+	u64 next_bitmap_offset;
+	int ret;
 
-	if (priv->hwtstamp_config.tx_type == ts_config.tx_type &&
-	    priv->hwtstamp_config.rx_filter == ts_config.rx_filter &&
-	    !DEV_FEATURE_CHANGED(dev, features, NETIF_F_HW_VLAN_CTAG_RX) &&
-	    !DEV_FEATURE_CHANGED(dev, features, NETIF_F_RXFCS))
-		return 0; /* Nothing to change */
+	test_msg("Running bitmap only tests\n");
 
-	if (DEV_FEATURE_CHANGED(dev, features, NETIF_F_HW_VLAN_CTAG_RX) &&
-	    (features & NETIF_F_HW_VLAN_CTAG_RX) &&
-	    (priv->hwtstamp_config.rx_filter != HWTSTAMP_FILTER_NONE)) {
-		en_warn(priv, "Can't turn ON rx vlan offload while time-stamping rx filter is ON\n");
-		return -EINVAL;
+	ret = test_add_free_space_entry(cache, 0, 4 * 1024 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't create a bitmap entry %d\n", ret);
+		return ret;
 	}
 
-	mutex_lock(&mdev->state_lock);
-	if (priv->port_up) {
-		port_up = 1;
-		mlx4_en_stop_port(dev, 1);
+	ret = btrfs_remove_free_space(cache, 0, 4 * 1024 * 1024);
+	if (ret) {
+		test_msg("Error removing bitmap full range %d\n", ret);
+		return ret;
 	}
 
-	mlx4_en_free_resources(priv);
-
-	en_warn(priv, "Changing device configuration rx filter(%x) rx vlan(%x)\n",
-		ts_config.rx_filter, !!(features & NETIF_F_HW_VLAN_CTAG_RX));
-
-	priv->hwtstamp_config.tx_type = ts_config.tx_type;
-	priv->hwtstamp_config.rx_filter = ts_config.rx_filter;
-
-	if (DEV_FEATURE_CHANGED(dev, features, NETIF_F_HW_VLAN_CTAG_RX)) {
-		if (features & NETIF_F_HW_VLAN_CTAG_RX)
-			dev->features |= NETIF_F_HW_VLAN_CTAG_RX;
-		else
-			dev->features &= ~NETIF_F_HW_VLAN_CTAG_RX;
-	} else if (ts_config.rx_filter == HWTSTAMP_FILTER_NONE) {
-		/* RX time-stamping is OFF, update the RX vlan offload
-		 * to the latest wanted state
-		 */
-		if (dev->wanted_features & NETIF_F_HW_VLAN_CTAG_RX)
-			dev->features |= NETIF_F_HW_VLAN_CTAG_RX;
-		else
-			dev->features &= ~NETIF_F_HW_VLAN_CTAG_RX;
+	if (test_check_exists(cache, 0, 4 * 1024 * 1024)) {
+		test_msg("Left some space in bitmap\n");
+		return -1;
 	}
 
-	if (DEV_FEATURE_CHANGED(dev, features, NETIF_F_RXFCS)) {
-		if (features & NETIF_F_RXFCS)
-			dev->features |= NETIF_F_RXFCS;
-		else
-			dev->features &= ~NETIF_F_RXFCS;
+	ret = test_add_free_space_entry(cache, 0, 4 * 1024 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't add to our bitmap entry %d\n", ret);
+		return ret;
 	}
 
-	/* RX vlan offload and RX time-stamping can't co-exist !
-	 * Regardless of the caller's choice,
-	 * Turn Off RX vlan offload in case of time-stamping is ON
+	ret = btrfs_remove_free_space(cache, 1 * 1024 * 1024, 2 * 1024 * 1024);
+	if (ret) {
+		test_msg("Couldn't remove middle chunk %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * The first bitmap we have starts at offset 0 so the next one is just
+	 * at the end of the first bitmap.
 	 */
-	if (ts_config.rx_filter != HWTSTAMP_FILTER_NONE) {
-		if (dev->features & NETIF_F_HW_VLAN_CTAG_RX)
-			en_warn(priv, "Turning off RX vlan offload since RX time-stamping is ON\n");
-		dev->features &= ~NETIF_F_HW_VLAN_CTAG_RX;
+	next_bitmap_offset = (u64)(BITS_PER_BITMAP * 4096);
+
+	/* Test a bit straddling two bitmaps */
+	ret = test_add_free_space_entry(cache, next_bitmap_offset -
+				   (2 * 1024 * 1024), 4 * 1024 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't add space that straddles two bitmaps %d\n",
+				ret);
+		return ret;
 	}
 
-	err = mlx4_en_alloc_resources(priv);
-	if (err) {
-		en_err(priv, "Failed reallocating port resources\n");
-		goto out;
-	}
-	if (port_up) {
-		err = mlx4_en_start_port(dev);
-		if (err)
-			en_err(priv, "Failed starting port\n");
+	ret = btrfs_remove_free_space(cache, next_bitmap_offset -
+				      (1 * 1024 * 1024), 2 * 1024 * 1024);
+	if (ret) {
+		test_msg("Couldn't remove overlapping space %d\n", ret);
+		return ret;
 	}
 
-	if (!err)
-		err = mlx4_en_moderation_update(priv);
-out:
-	mutex_unlock(&mdev->state_lock);
-	netdev_features_change(dev);
-	return err;
+	if (test_check_exists(cache, next_bitmap_offset - (1 * 1024 * 1024),
+			 2 * 1024 * 1024)) {
+		test_msg("Left some space when removing overlapping\n");
+		return -1;
+	}
+
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
+
+	return 0;
 }
+
+/* This is the high grade jackassery */
+static int test_bitmaps_and_extents(struct btrfs_block_group_cache *cache)
+{
+	u64 bitmap_offset = (u64)(BITS_PER_BITMAP * 4096);
+	int ret;
+
+	test_msg("Running bitmap and extent tests\n");
+
+	/*
+	 * First let's do something simple, an extent at the same offset as the
+	 * bitmap, but the free space completely in the extent and then
+	 * completely in the bitmap.
+	 */
+	ret = test_add_free_space_entry(cache, 4 * 1024 * 1024, 1 * 1024 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't create bitmap entry %d\n", ret);
+		return ret;
+	}
+
+	ret = test_add_free_space_entry(cache, 0, 1 * 1024 * 1024, 0);
+	if (ret) {
+		test_msg("Couldn't add extent entry %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 0, 1 * 1024 * 1024);
+	if (ret) {
+		test_msg("Couldn't remove extent entry %d\n", ret);
+		return ret;
+	}
+
+	if (test_check_exists(cache, 0, 1 * 1024 * 1024)) {
+		test_msg("Left remnants after our remove\n");
+		return -1;
+	}
+
+	/* Now to add back the extent entry and remove from the bitmap */
+	ret = test_add_free_space_entry(cache, 0, 1 * 1024 * 1024, 0);
+	if (ret) {
+		test_msg("Couldn't re-add extent entry %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 4 * 1024 * 1024, 1 * 1024 * 1024);
+	if (ret) {
+		test_msg("Couldn't remove from bitmap %d\n", ret);
+		return ret;
+	}
+
+	if (test_check_exists(cache, 4 * 1024 * 1024, 1 * 1024 * 1024)) {
+		test_msg("Left remnants in the bitmap\n");
+		return -1;
+	}
+
+	/*
+	 * Ok so a little more evil, extent entry and bitmap at the same offset,
+	 * removing an overlapping chunk.
+	 */
+	ret = test_add_free_space_entry(cache, 1 * 1024 * 1024, 4 * 1024 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't add to a bitmap %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 512 * 1024, 3 * 1024 * 1024);
+	if (ret) {
+		test_msg("Couldn't remove overlapping space %d\n", ret);
+		return ret;
+	}
+
+	if (test_check_exists(cache, 512 * 1024, 3 * 1024 * 1024)) {
+		test_msg("Left over pieces after removing overlapping\n");
+		return -1;
+	}
+
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
+
+	/* Now with the extent entry offset into the bitmap */
+	ret = test_add_free_space_entry(cache, 4 * 1024 * 1024, 4 * 1024 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't add space to the bitmap %d\n", ret);
+		return ret;
+	}
+
+	ret = test_add_free_space_entry(cache, 2 * 1024 * 1024, 2 * 1024 * 1024, 0);
+	if (ret) {
+		test_msg("Couldn't add extent to the cache %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 3 * 1024 * 1024, 4 * 1024 * 1024);
+	if (ret) {
+		test_msg("Problem removing overlapping space %d\n", ret);
+		return ret;
+	}
+
+	if (test_check_exists(cache, 3 * 1024 * 1024, 4 * 1024 * 1024)) {
+		test_msg("Left something behind when removing space");
+		return -1;
+	}
+
+	/*
+	 * This has blown up in the past, the extent entry starts before the
+	 * bitmap entry, but we're trying to remove an offset that falls
+	 * completely within the bitmap range and is in both the extent entry
+	 * and the bitmap entry, looks like this
+	 *
+	 *   [ extent ]
+	 *      [ bitmap ]
+	 *        [ del ]
+	 */
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
+	ret = test_add_free_space_entry(cache, bitmap_offset + 4 * 1024 * 1024,
+				   4 * 1024 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't add bitmap %d\n", ret);
+		return ret;
+	}
+
+	ret = test_add_free_space_entry(cache, bitmap_offset - 1 * 1024 * 1024,
+				   5 * 1024 * 1024, 0);
+	if (ret) {
+		test_msg("Couldn't add extent entry %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, bitmap_offset + 1 * 1024 * 1024,
+				      5 * 1024 * 1024);
+	if (ret) {
+		test_msg("Failed to free our space %d\n", ret);
+		return ret;
+	}
+
+	if (test_check_exists(cache, bitmap_offset + 1 * 1024 * 1024,
+			 5 * 1024 * 1024)) {
+		test_msg("Left stuff over\n");
+		return -1;
+	}
+
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
+
+	/*
+	 * This blew up before, we have part of the free space in a bitmap and
+	 * then the entirety of the rest of the space in an extent.  This used
+	 * to return -EAGAIN back from btrfs_remove_extent, make sure this
+	 * doesn't happen.
+	 */
+	ret = test_add_free_space_entry(cache, 1 * 1024 * 1024, 2 * 1024 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't add bitmap entry %d\n", ret);
+		return ret;
+	}
+
+	ret = test_add_free_space_entry(cache, 3 * 1024 * 1024, 1 * 1024 * 1024, 0);
+	if (ret) {
+		test_msg("Couldn't add extent entry %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_remove_free_space(cache, 1 * 1024 * 1024, 3 * 1024 * 1024);
+	if (ret) {
+		test_msg("Error removing bitmap and extent overlapping %d\n", ret);
+		return ret;
+	}
+
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
+	return 0;
+}
+
+/* Used by test_steal_space_from_bitmap_to_extent(). */
+static bool test_use_bitmap(struct btrfs_free_space_ctl *ctl,
+			    struct btrfs_free

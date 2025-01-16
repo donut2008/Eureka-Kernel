@@ -1,926 +1,745 @@
-/*
- * wm831x-dcdc.c  --  DC-DC buck convertor driver for the WM831x series
- *
- * Copyright 2009 Wolfson Microelectronics PLC.
- *
- * Author: Mark Brown <broonie@opensource.wolfsonmicro.com>
- *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the  License, or (at your
- *  option) any later version.
- */
 
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/init.h>
-#include <linux/bitops.h>
-#include <linux/err.h>
-#include <linux/i2c.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/gpio.h>
-#include <linux/slab.h>
 
-#include <linux/mfd/wm831x/core.h>
-#include <linux/mfd/wm831x/regulator.h>
-#include <linux/mfd/wm831x/pdata.h>
+	do {
+		variable_name_size = 1024;
 
-#define WM831X_BUCKV_MAX_SELECTOR 0x68
-#define WM831X_BUCKP_MAX_SELECTOR 0x66
+		status = ops->get_next_variable(&variable_name_size,
+						variable_name,
+						&vendor_guid);
+		switch (status) {
+		case EFI_SUCCESS:
+			if (!atomic)
+				spin_unlock_irq(&__efivars->lock);
 
-#define WM831X_DCDC_MODE_FAST    0
-#define WM831X_DCDC_MODE_NORMAL  1
-#define WM831X_DCDC_MODE_IDLE    2
-#define WM831X_DCDC_MODE_STANDBY 3
+			variable_name_size = var_name_strnsize(variable_name,
+							       variable_name_size);
 
-#define WM831X_DCDC_MAX_NAME 9
+			/*
+			 * Some firmware implementations return the
+			 * same variable name on multiple calls to
+			 * get_next_variable(). Terminate the loop
+			 * immediately as there is no guarantee that
+			 * we'll ever see a different variable name,
+			 * and may end up looping here forever.
+			 */
+			if (duplicates &&
+			    variable_is_present(variable_name, &vendor_guid, head)) {
+				dup_variable_bug(variable_name, &vendor_guid,
+						 variable_name_size);
+				if (!atomic)
+					spin_lock_irq(&__efivars->lock);
 
-/* Register offsets in control block */
-#define WM831X_DCDC_CONTROL_1     0
-#define WM831X_DCDC_CONTROL_2     1
-#define WM831X_DCDC_ON_CONFIG     2
-#define WM831X_DCDC_SLEEP_CONTROL 3
-#define WM831X_DCDC_DVS_CONTROL   4
+				status = EFI_NOT_FOUND;
+				break;
+			}
 
-/*
- * Shared
- */
+			err = func(variable_name, vendor_guid, variable_name_size, data);
+			if (err)
+				status = EFI_NOT_FOUND;
 
-struct wm831x_dcdc {
-	char name[WM831X_DCDC_MAX_NAME];
-	char supply_name[WM831X_DCDC_MAX_NAME];
-	struct regulator_desc desc;
-	int base;
-	struct wm831x *wm831x;
-	struct regulator_dev *regulator;
-	int dvs_gpio;
-	int dvs_gpio_state;
-	int on_vsel;
-	int dvs_vsel;
-};
+			if (!atomic)
+				spin_lock_irq(&__efivars->lock);
 
-static unsigned int wm831x_dcdc_get_mode(struct regulator_dev *rdev)
-
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	u16 reg = dcdc->base + WM831X_DCDC_ON_CONFIG;
-	int val;
-
-	val = wm831x_reg_read(wm831x, reg);
-	if (val < 0)
-		return val;
-
-	val = (val & WM831X_DC1_ON_MODE_MASK) >> WM831X_DC1_ON_MODE_SHIFT;
-
-	switch (val) {
-	case WM831X_DCDC_MODE_FAST:
-		return REGULATOR_MODE_FAST;
-	case WM831X_DCDC_MODE_NORMAL:
-		return REGULATOR_MODE_NORMAL;
-	case WM831X_DCDC_MODE_STANDBY:
-		return REGULATOR_MODE_STANDBY;
-	case WM831X_DCDC_MODE_IDLE:
-		return REGULATOR_MODE_IDLE;
-	default:
-		BUG();
-		return -EINVAL;
-	}
-}
-
-static int wm831x_dcdc_set_mode_int(struct wm831x *wm831x, int reg,
-				    unsigned int mode)
-{
-	int val;
-
-	switch (mode) {
-	case REGULATOR_MODE_FAST:
-		val = WM831X_DCDC_MODE_FAST;
-		break;
-	case REGULATOR_MODE_NORMAL:
-		val = WM831X_DCDC_MODE_NORMAL;
-		break;
-	case REGULATOR_MODE_STANDBY:
-		val = WM831X_DCDC_MODE_STANDBY;
-		break;
-	case REGULATOR_MODE_IDLE:
-		val = WM831X_DCDC_MODE_IDLE;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return wm831x_set_bits(wm831x, reg, WM831X_DC1_ON_MODE_MASK,
-			       val << WM831X_DC1_ON_MODE_SHIFT);
-}
-
-static int wm831x_dcdc_set_mode(struct regulator_dev *rdev, unsigned int mode)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	u16 reg = dcdc->base + WM831X_DCDC_ON_CONFIG;
-
-	return wm831x_dcdc_set_mode_int(wm831x, reg, mode);
-}
-
-static int wm831x_dcdc_set_suspend_mode(struct regulator_dev *rdev,
-					unsigned int mode)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	u16 reg = dcdc->base + WM831X_DCDC_SLEEP_CONTROL;
-
-	return wm831x_dcdc_set_mode_int(wm831x, reg, mode);
-}
-
-static int wm831x_dcdc_get_status(struct regulator_dev *rdev)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	int ret;
-
-	/* First, check for errors */
-	ret = wm831x_reg_read(wm831x, WM831X_DCDC_UV_STATUS);
-	if (ret < 0)
-		return ret;
-
-	if (ret & (1 << rdev_get_id(rdev))) {
-		dev_dbg(wm831x->dev, "DCDC%d under voltage\n",
-			rdev_get_id(rdev) + 1);
-		return REGULATOR_STATUS_ERROR;
-	}
-
-	/* DCDC1 and DCDC2 can additionally detect high voltage/current */
-	if (rdev_get_id(rdev) < 2) {
-		if (ret & (WM831X_DC1_OV_STS << rdev_get_id(rdev))) {
-			dev_dbg(wm831x->dev, "DCDC%d over voltage\n",
-				rdev_get_id(rdev) + 1);
-			return REGULATOR_STATUS_ERROR;
+			break;
+		case EFI_NOT_FOUND:
+			break;
+		default:
+			printk(KERN_WARNING "efivars: get_next_variable: status=%lx\n",
+				status);
+			status = EFI_NOT_FOUND;
+			break;
 		}
 
-		if (ret & (WM831X_DC1_HC_STS << rdev_get_id(rdev))) {
-			dev_dbg(wm831x->dev, "DCDC%d over current\n",
-				rdev_get_id(rdev) + 1);
-			return REGULATOR_STATUS_ERROR;
-		}
-	}
+	} while (status != EFI_NOT_FOUND);
 
-	/* Is the regulator on? */
-	ret = wm831x_reg_read(wm831x, WM831X_DCDC_STATUS);
-	if (ret < 0)
-		return ret;
-	if (!(ret & (1 << rdev_get_id(rdev))))
-		return REGULATOR_STATUS_OFF;
+	spin_unlock_irq(&__efivars->lock);
 
-	/* TODO: When we handle hardware control modes so we can report the
-	 * current mode. */
-	return REGULATOR_STATUS_ON;
+	kfree(variable_name);
+
+	return err;
 }
+EXPORT_SYMBOL_GPL(efivar_init);
 
-static irqreturn_t wm831x_dcdc_uv_irq(int irq, void *data)
+/**
+ * efivar_entry_add - add entry to variable list
+ * @entry: entry to add to list
+ * @head: list head
+ */
+void efivar_entry_add(struct efivar_entry *entry, struct list_head *head)
 {
-	struct wm831x_dcdc *dcdc = data;
-
-	regulator_notifier_call_chain(dcdc->regulator,
-				      REGULATOR_EVENT_UNDER_VOLTAGE,
-				      NULL);
-
-	return IRQ_HANDLED;
+	spin_lock_irq(&__efivars->lock);
+	list_add(&entry->list, head);
+	spin_unlock_irq(&__efivars->lock);
 }
+EXPORT_SYMBOL_GPL(efivar_entry_add);
 
-static irqreturn_t wm831x_dcdc_oc_irq(int irq, void *data)
+/**
+ * efivar_entry_remove - remove entry from variable list
+ * @entry: entry to remove from list
+ */
+void efivar_entry_remove(struct efivar_entry *entry)
 {
-	struct wm831x_dcdc *dcdc = data;
-
-	regulator_notifier_call_chain(dcdc->regulator,
-				      REGULATOR_EVENT_OVER_CURRENT,
-				      NULL);
-
-	return IRQ_HANDLED;
+	spin_lock_irq(&__efivars->lock);
+	list_del(&entry->list);
+	spin_unlock_irq(&__efivars->lock);
 }
+EXPORT_SYMBOL_GPL(efivar_entry_remove);
 
 /*
- * BUCKV specifics
+ * efivar_entry_list_del_unlock - remove entry from variable list
+ * @entry: entry to remove
+ *
+ * Remove @entry from the variable list and release the list lock.
+ *
+ * NOTE: slightly weird locking semantics here - we expect to be
+ * called with the efivars lock already held, and we release it before
+ * returning. This is because this function is usually called after
+ * set_variable() while the lock is still held.
  */
-
-static int wm831x_buckv_list_voltage(struct regulator_dev *rdev,
-				      unsigned selector)
+static void efivar_entry_list_del_unlock(struct efivar_entry *entry)
 {
-	if (selector <= 0x8)
-		return 600000;
-	if (selector <= WM831X_BUCKV_MAX_SELECTOR)
-		return 600000 + ((selector - 0x8) * 12500);
-	return -EINVAL;
+	lockdep_assert_held(&__efivars->lock);
+
+	list_del(&entry->list);
+	spin_unlock_irq(&__efivars->lock);
 }
 
-static int wm831x_buckv_map_voltage(struct regulator_dev *rdev,
-				   int min_uV, int max_uV)
+/**
+ * __efivar_entry_delete - delete an EFI variable
+ * @entry: entry containing EFI variable to delete
+ *
+ * Delete the variable from the firmware but leave @entry on the
+ * variable list.
+ *
+ * This function differs from efivar_entry_delete() because it does
+ * not remove @entry from the variable list. Also, it is safe to be
+ * called from within a efivar_entry_iter_begin() and
+ * efivar_entry_iter_end() region, unlike efivar_entry_delete().
+ *
+ * Returns 0 on success, or a converted EFI status code if
+ * set_variable() fails.
+ */
+int __efivar_entry_delete(struct efivar_entry *entry)
 {
-	u16 vsel;
+	const struct efivar_operations *ops = __efivars->ops;
+	efi_status_t status;
 
-	if (min_uV < 600000)
-		vsel = 0;
-	else if (min_uV <= 1800000)
-		vsel = DIV_ROUND_UP(min_uV - 600000, 12500) + 8;
-	else
-		return -EINVAL;
+	lockdep_assert_held(&__efivars->lock);
 
-	if (wm831x_buckv_list_voltage(rdev, vsel) > max_uV)
-		return -EINVAL;
+	status = ops->set_variable(entry->var.VariableName,
+				   &entry->var.VendorGuid,
+				   0, 0, NULL);
 
-	return vsel;
+	return efi_status_to_err(status);
 }
+EXPORT_SYMBOL_GPL(__efivar_entry_delete);
 
-static int wm831x_buckv_set_dvs(struct regulator_dev *rdev, int state)
+/**
+ * efivar_entry_delete - delete variable and remove entry from list
+ * @entry: entry containing variable to delete
+ *
+ * Delete the variable from the firmware and remove @entry from the
+ * variable list. It is the caller's responsibility to free @entry
+ * once we return.
+ *
+ * Returns 0 on success, or a converted EFI status code if
+ * set_variable() fails.
+ */
+int efivar_entry_delete(struct efivar_entry *entry)
 {
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
+	const struct efivar_operations *ops = __efivars->ops;
+	efi_status_t status;
 
-	if (state == dcdc->dvs_gpio_state)
-		return 0;
+	spin_lock_irq(&__efivars->lock);
+	status = ops->set_variable(entry->var.VariableName,
+				   &entry->var.VendorGuid,
+				   0, 0, NULL);
+	if (!(status == EFI_SUCCESS || status == EFI_NOT_FOUND)) {
+		spin_unlock_irq(&__efivars->lock);
+		return efi_status_to_err(status);
+	}
 
-	dcdc->dvs_gpio_state = state;
-	gpio_set_value(dcdc->dvs_gpio, state);
-
-	/* Should wait for DVS state change to be asserted if we have
-	 * a GPIO for it, for now assume the device is configured
-	 * for the fastest possible transition.
-	 */
-
+	efivar_entry_list_del_unlock(entry);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(efivar_entry_delete);
 
-static int wm831x_buckv_set_voltage_sel(struct regulator_dev *rdev,
-					unsigned vsel)
+/**
+ * efivar_entry_set - call set_variable()
+ * @entry: entry containing the EFI variable to write
+ * @attributes: variable attributes
+ * @size: size of @data buffer
+ * @data: buffer containing variable data
+ * @head: head of variable list
+ *
+ * Calls set_variable() for an EFI variable. If creating a new EFI
+ * variable, this function is usually followed by efivar_entry_add().
+ *
+ * Before writing the variable, the remaining EFI variable storage
+ * space is checked to ensure there is enough room available.
+ *
+ * If @head is not NULL a lookup is performed to determine whether
+ * the entry is already on the list.
+ *
+ * Returns 0 on success, -EEXIST if a lookup is performed and the entry
+ * already exists on the list, or a converted EFI status code if
+ * set_variable() fails.
+ */
+int efivar_entry_set(struct efivar_entry *entry, u32 attributes,
+		     unsigned long size, void *data, struct list_head *head)
 {
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	int on_reg = dcdc->base + WM831X_DCDC_ON_CONFIG;
-	int dvs_reg = dcdc->base + WM831X_DCDC_DVS_CONTROL;
-	int ret;
+	const struct efivar_operations *ops = __efivars->ops;
+	efi_status_t status;
+	efi_char16_t *name = entry->var.VariableName;
+	efi_guid_t vendor = entry->var.VendorGuid;
 
-	/* If this value is already set then do a GPIO update if we can */
-	if (dcdc->dvs_gpio && dcdc->on_vsel == vsel)
-		return wm831x_buckv_set_dvs(rdev, 0);
+	spin_lock_irq(&__efivars->lock);
 
-	if (dcdc->dvs_gpio && dcdc->dvs_vsel == vsel)
-		return wm831x_buckv_set_dvs(rdev, 1);
+	if (head && efivar_entry_find(name, vendor, head, false)) {
+		spin_unlock_irq(&__efivars->lock);
+		return -EEXIST;
+	}
 
-	/* Always set the ON status to the minimum voltage */
-	ret = wm831x_set_bits(wm831x, on_reg, WM831X_DC1_ON_VSEL_MASK, vsel);
-	if (ret < 0)
-		return ret;
-	dcdc->on_vsel = vsel;
+	status = check_var_size(attributes, size + ucs2_strsize(name, 1024));
+	if (status == EFI_SUCCESS || status == EFI_UNSUPPORTED)
+		status = ops->set_variable(name, &vendor,
+					   attributes, size, data);
 
-	if (!dcdc->dvs_gpio)
-		return ret;
+	spin_unlock_irq(&__efivars->lock);
 
-	/* Kick the voltage transition now */
-	ret = wm831x_buckv_set_dvs(rdev, 0);
-	if (ret < 0)
-		return ret;
+	return efi_status_to_err(status);
+
+}
+EXPORT_SYMBOL_GPL(efivar_entry_set);
+
+/*
+ * efivar_entry_set_nonblocking - call set_variable_nonblocking()
+ *
+ * This function is guaranteed to not block and is suitable for calling
+ * from crash/panic handlers.
+ *
+ * Crucially, this function will not block if it cannot acquire
+ * __efivars->lock. Instead, it returns -EBUSY.
+ */
+static int
+efivar_entry_set_nonblocking(efi_char16_t *name, efi_guid_t vendor,
+			     u32 attributes, unsigned long size, void *data)
+{
+	const struct efivar_operations *ops = __efivars->ops;
+	unsigned long flags;
+	efi_status_t status;
+
+	if (!spin_trylock_irqsave(&__efivars->lock, flags))
+		return -EBUSY;
+
+	status = check_var_size(attributes, size + ucs2_strsize(name, 1024));
+	if (status != EFI_SUCCESS) {
+		spin_unlock_irqrestore(&__efivars->lock, flags);
+		return -ENOSPC;
+	}
+
+	status = ops->set_variable_nonblocking(name, &vendor, attributes,
+					       size, data);
+
+	spin_unlock_irqrestore(&__efivars->lock, flags);
+	return efi_status_to_err(status);
+}
+
+/**
+ * efivar_entry_set_safe - call set_variable() if enough space in firmware
+ * @name: buffer containing the variable name
+ * @vendor: variable vendor guid
+ * @attributes: variable attributes
+ * @block: can we block in this context?
+ * @size: size of @data buffer
+ * @data: buffer containing variable data
+ *
+ * Ensures there is enough free storage in the firmware for this variable, and
+ * if so, calls set_variable(). If creating a new EFI variable, this function
+ * is usually followed by efivar_entry_add().
+ *
+ * Returns 0 on success, -ENOSPC if the firmware does not have enough
+ * space for set_variable() to succeed, or a converted EFI status code
+ * if set_variable() fails.
+ */
+int efivar_entry_set_safe(efi_char16_t *name, efi_guid_t vendor, u32 attributes,
+			  bool block, unsigned long size, void *data)
+{
+	const struct efivar_operations *ops = __efivars->ops;
+	unsigned long flags;
+	efi_status_t status;
+
+	if (!ops->query_variable_store)
+		return -ENOSYS;
 
 	/*
-	 * If this VSEL is higher than the last one we've seen then
-	 * remember it as the DVS VSEL.  This is optimised for CPUfreq
-	 * usage where we want to get to the highest voltage very
-	 * quickly.
+	 * If the EFI variable backend provides a non-blocking
+	 * ->set_variable() operation and we're in a context where we
+	 * cannot block, then we need to use it to avoid live-locks,
+	 * since the implication is that the regular ->set_variable()
+	 * will block.
+	 *
+	 * If no ->set_variable_nonblocking() is provided then
+	 * ->set_variable() is assumed to be non-blocking.
 	 */
-	if (vsel > dcdc->dvs_vsel) {
-		ret = wm831x_set_bits(wm831x, dvs_reg,
-				      WM831X_DC1_DVS_VSEL_MASK,
-				      vsel);
-		if (ret == 0)
-			dcdc->dvs_vsel = vsel;
-		else
-			dev_warn(wm831x->dev,
-				 "Failed to set DCDC DVS VSEL: %d\n", ret);
+	if (!block && ops->set_variable_nonblocking)
+		return efivar_entry_set_nonblocking(name, vendor, attributes,
+						    size, data);
+
+	if (!block) {
+		if (!spin_trylock_irqsave(&__efivars->lock, flags))
+			return -EBUSY;
+	} else {
+		spin_lock_irqsave(&__efivars->lock, flags);
 	}
 
-	return 0;
+	status = check_var_size(attributes, size + ucs2_strsize(name, 1024));
+	if (status != EFI_SUCCESS) {
+		spin_unlock_irqrestore(&__efivars->lock, flags);
+		return -ENOSPC;
+	}
+
+	status = ops->set_variable(name, &vendor, attributes, size, data);
+
+	spin_unlock_irqrestore(&__efivars->lock, flags);
+
+	return efi_status_to_err(status);
 }
-
-static int wm831x_buckv_set_suspend_voltage(struct regulator_dev *rdev,
-					    int uV)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	u16 reg = dcdc->base + WM831X_DCDC_SLEEP_CONTROL;
-	int vsel;
-
-	vsel = wm831x_buckv_map_voltage(rdev, uV, uV);
-	if (vsel < 0)
-		return vsel;
-
-	return wm831x_set_bits(wm831x, reg, WM831X_DC1_SLP_VSEL_MASK, vsel);
-}
-
-static int wm831x_buckv_get_voltage_sel(struct regulator_dev *rdev)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-
-	if (dcdc->dvs_gpio && dcdc->dvs_gpio_state)
-		return dcdc->dvs_vsel;
-	else
-		return dcdc->on_vsel;
-}
-
-/* Current limit options */
-static const unsigned int wm831x_dcdc_ilim[] = {
-	125000, 250000, 375000, 500000, 625000, 750000, 875000, 1000000
-};
-
-static int wm831x_buckv_set_current_limit(struct regulator_dev *rdev,
-					   int min_uA, int max_uA)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	u16 reg = dcdc->base + WM831X_DCDC_CONTROL_2;
-	int i;
-
-	for (i = ARRAY_SIZE(wm831x_dcdc_ilim) - 1; i >= 0; i--) {
-		if ((min_uA <= wm831x_dcdc_ilim[i]) &&
-		    (wm831x_dcdc_ilim[i] <= max_uA))
-			return wm831x_set_bits(wm831x, reg,
-					       WM831X_DC1_HC_THR_MASK,
-						i << WM831X_DC1_HC_THR_SHIFT);
-	}
-
-	return -EINVAL;
-}
-
-static int wm831x_buckv_get_current_limit(struct regulator_dev *rdev)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	u16 reg = dcdc->base + WM831X_DCDC_CONTROL_2;
-	int val;
-
-	val = wm831x_reg_read(wm831x, reg);
-	if (val < 0)
-		return val;
-
-	val = (val & WM831X_DC1_HC_THR_MASK) >> WM831X_DC1_HC_THR_SHIFT;
-	return wm831x_dcdc_ilim[val];
-}
-
-static struct regulator_ops wm831x_buckv_ops = {
-	.set_voltage_sel = wm831x_buckv_set_voltage_sel,
-	.get_voltage_sel = wm831x_buckv_get_voltage_sel,
-	.list_voltage = wm831x_buckv_list_voltage,
-	.map_voltage = wm831x_buckv_map_voltage,
-	.set_suspend_voltage = wm831x_buckv_set_suspend_voltage,
-	.set_current_limit = wm831x_buckv_set_current_limit,
-	.get_current_limit = wm831x_buckv_get_current_limit,
-
-	.is_enabled = regulator_is_enabled_regmap,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.get_status = wm831x_dcdc_get_status,
-	.get_mode = wm831x_dcdc_get_mode,
-	.set_mode = wm831x_dcdc_set_mode,
-	.set_suspend_mode = wm831x_dcdc_set_suspend_mode,
-};
-
-/*
- * Set up DVS control.  We just log errors since we can still run
- * (with reduced performance) if we fail.
- */
-static void wm831x_buckv_dvs_init(struct platform_device *pdev,
-				  struct wm831x_dcdc *dcdc,
-				  struct wm831x_buckv_pdata *pdata)
-{
-	struct wm831x *wm831x = dcdc->wm831x;
-	int ret;
-	u16 ctrl;
-
-	if (!pdata || !pdata->dvs_gpio)
-		return;
-
-	/* gpiolib won't let us read the GPIO status so pick the higher
-	 * of the two existing voltages so we take it as platform data.
-	 */
-	dcdc->dvs_gpio_state = pdata->dvs_init_state;
-
-	ret = devm_gpio_request_one(&pdev->dev, pdata->dvs_gpio,
-				    dcdc->dvs_gpio_state ? GPIOF_INIT_HIGH : 0,
-				    "DCDC DVS");
-	if (ret < 0) {
-		dev_err(wm831x->dev, "Failed to get %s DVS GPIO: %d\n",
-			dcdc->name, ret);
-		return;
-	}
-
-	dcdc->dvs_gpio = pdata->dvs_gpio;
-
-	switch (pdata->dvs_control_src) {
-	case 1:
-		ctrl = 2 << WM831X_DC1_DVS_SRC_SHIFT;
-		break;
-	case 2:
-		ctrl = 3 << WM831X_DC1_DVS_SRC_SHIFT;
-		break;
-	default:
-		dev_err(wm831x->dev, "Invalid DVS control source %d for %s\n",
-			pdata->dvs_control_src, dcdc->name);
-		return;
-	}
-
-	/* If DVS_VSEL is set to the minimum value then raise it to ON_VSEL
-	 * to make bootstrapping a bit smoother.
-	 */
-	if (!dcdc->dvs_vsel) {
-		ret = wm831x_set_bits(wm831x,
-				      dcdc->base + WM831X_DCDC_DVS_CONTROL,
-				      WM831X_DC1_DVS_VSEL_MASK, dcdc->on_vsel);
-		if (ret == 0)
-			dcdc->dvs_vsel = dcdc->on_vsel;
-		else
-			dev_warn(wm831x->dev, "Failed to set DVS_VSEL: %d\n",
-				 ret);
-	}
-
-	ret = wm831x_set_bits(wm831x, dcdc->base + WM831X_DCDC_DVS_CONTROL,
-			      WM831X_DC1_DVS_SRC_MASK, ctrl);
-	if (ret < 0) {
-		dev_err(wm831x->dev, "Failed to set %s DVS source: %d\n",
-			dcdc->name, ret);
-	}
-}
-
-static int wm831x_buckv_probe(struct platform_device *pdev)
-{
-	struct wm831x *wm831x = dev_get_drvdata(pdev->dev.parent);
-	struct wm831x_pdata *pdata = dev_get_platdata(wm831x->dev);
-	struct regulator_config config = { };
-	int id;
-	struct wm831x_dcdc *dcdc;
-	struct resource *res;
-	int ret, irq;
-
-	if (pdata && pdata->wm831x_num)
-		id = (pdata->wm831x_num * 10) + 1;
-	else
-		id = 0;
-	id = pdev->id - id;
-
-	dev_dbg(&pdev->dev, "Probing DCDC%d\n", id + 1);
-
-	dcdc = devm_kzalloc(&pdev->dev,  sizeof(struct wm831x_dcdc),
-			    GFP_KERNEL);
-	if (!dcdc)
-		return -ENOMEM;
-
-	dcdc->wm831x = wm831x;
-
-	res = platform_get_resource(pdev, IORESOURCE_REG, 0);
-	if (res == NULL) {
-		dev_err(&pdev->dev, "No REG resource\n");
-		ret = -EINVAL;
-		goto err;
-	}
-	dcdc->base = res->start;
-
-	snprintf(dcdc->name, sizeof(dcdc->name), "DCDC%d", id + 1);
-	dcdc->desc.name = dcdc->name;
-
-	snprintf(dcdc->supply_name, sizeof(dcdc->supply_name),
-		 "DC%dVDD", id + 1);
-	dcdc->desc.supply_name = dcdc->supply_name;
-
-	dcdc->desc.id = id;
-	dcdc->desc.type = REGULATOR_VOLTAGE;
-	dcdc->desc.n_voltages = WM831X_BUCKV_MAX_SELECTOR + 1;
-	dcdc->desc.ops = &wm831x_buckv_ops;
-	dcdc->desc.owner = THIS_MODULE;
-	dcdc->desc.enable_reg = WM831X_DCDC_ENABLE;
-	dcdc->desc.enable_mask = 1 << id;
-
-	ret = wm831x_reg_read(wm831x, dcdc->base + WM831X_DCDC_ON_CONFIG);
-	if (ret < 0) {
-		dev_err(wm831x->dev, "Failed to read ON VSEL: %d\n", ret);
-		goto err;
-	}
-	dcdc->on_vsel = ret & WM831X_DC1_ON_VSEL_MASK;
-
-	ret = wm831x_reg_read(wm831x, dcdc->base + WM831X_DCDC_DVS_CONTROL);
-	if (ret < 0) {
-		dev_err(wm831x->dev, "Failed to read DVS VSEL: %d\n", ret);
-		goto err;
-	}
-	dcdc->dvs_vsel = ret & WM831X_DC1_DVS_VSEL_MASK;
-
-	if (pdata && pdata->dcdc[id])
-		wm831x_buckv_dvs_init(pdev, dcdc,
-				      pdata->dcdc[id]->driver_data);
-
-	config.dev = pdev->dev.parent;
-	if (pdata)
-		config.init_data = pdata->dcdc[id];
-	config.driver_data = dcdc;
-	config.regmap = wm831x->regmap;
-
-	dcdc->regulator = devm_regulator_register(&pdev->dev, &dcdc->desc,
-						  &config);
-	if (IS_ERR(dcdc->regulator)) {
-		ret = PTR_ERR(dcdc->regulator);
-		dev_err(wm831x->dev, "Failed to register DCDC%d: %d\n",
-			id + 1, ret);
-		goto err;
-	}
-
-	irq = wm831x_irq(wm831x, platform_get_irq_byname(pdev, "UV"));
-	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
-					wm831x_dcdc_uv_irq,
-					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-					dcdc->name, dcdc);
-	if (ret != 0) {
-		dev_err(&pdev->dev, "Failed to request UV IRQ %d: %d\n",
-			irq, ret);
-		goto err;
-	}
-
-	irq = wm831x_irq(wm831x, platform_get_irq_byname(pdev, "HC"));
-	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
-					wm831x_dcdc_oc_irq,
-					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-					dcdc->name, dcdc);
-	if (ret != 0) {
-		dev_err(&pdev->dev, "Failed to request HC IRQ %d: %d\n",
-			irq, ret);
-		goto err;
-	}
-
-	platform_set_drvdata(pdev, dcdc);
-
-	return 0;
-
-err:
-	return ret;
-}
-
-static struct platform_driver wm831x_buckv_driver = {
-	.probe = wm831x_buckv_probe,
-	.driver		= {
-		.name	= "wm831x-buckv",
-	},
-};
-
-/*
- * BUCKP specifics
- */
-
-static int wm831x_buckp_set_suspend_voltage(struct regulator_dev *rdev, int uV)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	u16 reg = dcdc->base + WM831X_DCDC_SLEEP_CONTROL;
-	int sel;
-
-	sel = regulator_map_voltage_linear(rdev, uV, uV);
-	if (sel < 0)
-		return sel;
-
-	return wm831x_set_bits(wm831x, reg, WM831X_DC3_ON_VSEL_MASK, sel);
-}
-
-static struct regulator_ops wm831x_buckp_ops = {
-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
-	.get_voltage_sel = regulator_get_voltage_sel_regmap,
-	.list_voltage = regulator_list_voltage_linear,
-	.map_voltage = regulator_map_voltage_linear,
-	.set_suspend_voltage = wm831x_buckp_set_suspend_voltage,
-
-	.is_enabled = regulator_is_enabled_regmap,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.get_status = wm831x_dcdc_get_status,
-	.get_mode = wm831x_dcdc_get_mode,
-	.set_mode = wm831x_dcdc_set_mode,
-	.set_suspend_mode = wm831x_dcdc_set_suspend_mode,
-};
-
-static int wm831x_buckp_probe(struct platform_device *pdev)
-{
-	struct wm831x *wm831x = dev_get_drvdata(pdev->dev.parent);
-	struct wm831x_pdata *pdata = dev_get_platdata(wm831x->dev);
-	struct regulator_config config = { };
-	int id;
-	struct wm831x_dcdc *dcdc;
-	struct resource *res;
-	int ret, irq;
-
-	if (pdata && pdata->wm831x_num)
-		id = (pdata->wm831x_num * 10) + 1;
-	else
-		id = 0;
-	id = pdev->id - id;
-
-	dev_dbg(&pdev->dev, "Probing DCDC%d\n", id + 1);
-
-	dcdc = devm_kzalloc(&pdev->dev, sizeof(struct wm831x_dcdc),
-			    GFP_KERNEL);
-	if (!dcdc)
-		return -ENOMEM;
-
-	dcdc->wm831x = wm831x;
-
-	res = platform_get_resource(pdev, IORESOURCE_REG, 0);
-	if (res == NULL) {
-		dev_err(&pdev->dev, "No REG resource\n");
-		ret = -EINVAL;
-		goto err;
-	}
-	dcdc->base = res->start;
-
-	snprintf(dcdc->name, sizeof(dcdc->name), "DCDC%d", id + 1);
-	dcdc->desc.name = dcdc->name;
-
-	snprintf(dcdc->supply_name, sizeof(dcdc->supply_name),
-		 "DC%dVDD", id + 1);
-	dcdc->desc.supply_name = dcdc->supply_name;
-
-	dcdc->desc.id = id;
-	dcdc->desc.type = REGULATOR_VOLTAGE;
-	dcdc->desc.n_voltages = WM831X_BUCKP_MAX_SELECTOR + 1;
-	dcdc->desc.ops = &wm831x_buckp_ops;
-	dcdc->desc.owner = THIS_MODULE;
-	dcdc->desc.vsel_reg = dcdc->base + WM831X_DCDC_ON_CONFIG;
-	dcdc->desc.vsel_mask = WM831X_DC3_ON_VSEL_MASK;
-	dcdc->desc.enable_reg = WM831X_DCDC_ENABLE;
-	dcdc->desc.enable_mask = 1 << id;
-	dcdc->desc.min_uV = 850000;
-	dcdc->desc.uV_step = 25000;
-
-	config.dev = pdev->dev.parent;
-	if (pdata)
-		config.init_data = pdata->dcdc[id];
-	config.driver_data = dcdc;
-	config.regmap = wm831x->regmap;
-
-	dcdc->regulator = devm_regulator_register(&pdev->dev, &dcdc->desc,
-						  &config);
-	if (IS_ERR(dcdc->regulator)) {
-		ret = PTR_ERR(dcdc->regulator);
-		dev_err(wm831x->dev, "Failed to register DCDC%d: %d\n",
-			id + 1, ret);
-		goto err;
-	}
-
-	irq = wm831x_irq(wm831x, platform_get_irq_byname(pdev, "UV"));
-	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
-					wm831x_dcdc_uv_irq,
-					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-					dcdc->name, dcdc);
-	if (ret != 0) {
-		dev_err(&pdev->dev, "Failed to request UV IRQ %d: %d\n",
-			irq, ret);
-		goto err;
-	}
-
-	platform_set_drvdata(pdev, dcdc);
-
-	return 0;
-
-err:
-	return ret;
-}
-
-static struct platform_driver wm831x_buckp_driver = {
-	.probe = wm831x_buckp_probe,
-	.driver		= {
-		.name	= "wm831x-buckp",
-	},
-};
-
-/*
- * DCDC boost convertors
- */
-
-static int wm831x_boostp_get_status(struct regulator_dev *rdev)
-{
-	struct wm831x_dcdc *dcdc = rdev_get_drvdata(rdev);
-	struct wm831x *wm831x = dcdc->wm831x;
-	int ret;
-
-	/* First, check for errors */
-	ret = wm831x_reg_read(wm831x, WM831X_DCDC_UV_STATUS);
-	if (ret < 0)
-		return ret;
-
-	if (ret & (1 << rdev_get_id(rdev))) {
-		dev_dbg(wm831x->dev, "DCDC%d under voltage\n",
-			rdev_get_id(rdev) + 1);
-		return REGULATOR_STATUS_ERROR;
-	}
-
-	/* Is the regulator on? */
-	ret = wm831x_reg_read(wm831x, WM831X_DCDC_STATUS);
-	if (ret < 0)
-		return ret;
-	if (ret & (1 << rdev_get_id(rdev)))
-		return REGULATOR_STATUS_ON;
-	else
-		return REGULATOR_STATUS_OFF;
-}
-
-static struct regulator_ops wm831x_boostp_ops = {
-	.get_status = wm831x_boostp_get_status,
-
-	.is_enabled = regulator_is_enabled_regmap,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-};
-
-static int wm831x_boostp_probe(struct platform_device *pdev)
-{
-	struct wm831x *wm831x = dev_get_drvdata(pdev->dev.parent);
-	struct wm831x_pdata *pdata = dev_get_platdata(wm831x->dev);
-	struct regulator_config config = { };
-	int id = pdev->id % ARRAY_SIZE(pdata->dcdc);
-	struct wm831x_dcdc *dcdc;
-	struct resource *res;
-	int ret, irq;
-
-	dev_dbg(&pdev->dev, "Probing DCDC%d\n", id + 1);
-
-	if (pdata == NULL || pdata->dcdc[id] == NULL)
-		return -ENODEV;
-
-	dcdc = devm_kzalloc(&pdev->dev, sizeof(struct wm831x_dcdc), GFP_KERNEL);
-	if (!dcdc)
-		return -ENOMEM;
-
-	dcdc->wm831x = wm831x;
-
-	res = platform_get_resource(pdev, IORESOURCE_REG, 0);
-	if (res == NULL) {
-		dev_err(&pdev->dev, "No REG resource\n");
-		return -EINVAL;
-	}
-	dcdc->base = res->start;
-
-	snprintf(dcdc->name, sizeof(dcdc->name), "DCDC%d", id + 1);
-	dcdc->desc.name = dcdc->name;
-	dcdc->desc.id = id;
-	dcdc->desc.type = REGULATOR_VOLTAGE;
-	dcdc->desc.ops = &wm831x_boostp_ops;
-	dcdc->desc.owner = THIS_MODULE;
-	dcdc->desc.enable_reg = WM831X_DCDC_ENABLE;
-	dcdc->desc.enable_mask = 1 << id;
-
-	config.dev = pdev->dev.parent;
-	if (pdata)
-		config.init_data = pdata->dcdc[id];
-	config.driver_data = dcdc;
-	config.regmap = wm831x->regmap;
-
-	dcdc->regulator = devm_regulator_register(&pdev->dev, &dcdc->desc,
-						  &config);
-	if (IS_ERR(dcdc->regulator)) {
-		ret = PTR_ERR(dcdc->regulator);
-		dev_err(wm831x->dev, "Failed to register DCDC%d: %d\n",
-			id + 1, ret);
-		return ret;
-	}
-
-	irq = wm831x_irq(wm831x, platform_get_irq_byname(pdev, "UV"));
-	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
-					wm831x_dcdc_uv_irq,
-					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-					dcdc->name,
-					dcdc);
-	if (ret != 0) {
-		dev_err(&pdev->dev, "Failed to request UV IRQ %d: %d\n",
-			irq, ret);
-		return ret;
-	}
-
-	platform_set_drvdata(pdev, dcdc);
-
-	return 0;
-}
-
-static struct platform_driver wm831x_boostp_driver = {
-	.probe = wm831x_boostp_probe,
-	.driver		= {
-		.name	= "wm831x-boostp",
-	},
-};
-
-/*
- * External Power Enable
+EXPORT_SYMBOL_GPL(efivar_entry_set_safe);
+
+/**
+ * efivar_entry_find - search for an entry
+ * @name: the EFI variable name
+ * @guid: the EFI variable vendor's guid
+ * @head: head of the variable list
+ * @remove: should we remove the entry from the list?
  *
- * These aren't actually DCDCs but look like them in hardware so share
- * code.
+ * Search for an entry on the variable list that has the EFI variable
+ * name @name and vendor guid @guid. If an entry is found on the list
+ * and @remove is true, the entry is removed from the list.
+ *
+ * The caller MUST call efivar_entry_iter_begin() and
+ * efivar_entry_iter_end() before and after the invocation of this
+ * function, respectively.
+ *
+ * Returns the entry if found on the list, %NULL otherwise.
  */
-
-#define WM831X_EPE_BASE 6
-
-static struct regulator_ops wm831x_epe_ops = {
-	.is_enabled = regulator_is_enabled_regmap,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.get_status = wm831x_dcdc_get_status,
-};
-
-static int wm831x_epe_probe(struct platform_device *pdev)
+struct efivar_entry *efivar_entry_find(efi_char16_t *name, efi_guid_t guid,
+				       struct list_head *head, bool remove)
 {
-	struct wm831x *wm831x = dev_get_drvdata(pdev->dev.parent);
-	struct wm831x_pdata *pdata = dev_get_platdata(wm831x->dev);
-	struct regulator_config config = { };
-	int id = pdev->id % ARRAY_SIZE(pdata->epe);
-	struct wm831x_dcdc *dcdc;
-	int ret;
+	struct efivar_entry *entry, *n;
+	int strsize1, strsize2;
+	bool found = false;
 
-	dev_dbg(&pdev->dev, "Probing EPE%d\n", id + 1);
+	lockdep_assert_held(&__efivars->lock);
 
-	dcdc = devm_kzalloc(&pdev->dev, sizeof(struct wm831x_dcdc), GFP_KERNEL);
-	if (!dcdc)
-		return -ENOMEM;
-
-	dcdc->wm831x = wm831x;
-
-	/* For current parts this is correct; probably need to revisit
-	 * in future.
-	 */
-	snprintf(dcdc->name, sizeof(dcdc->name), "EPE%d", id + 1);
-	dcdc->desc.name = dcdc->name;
-	dcdc->desc.id = id + WM831X_EPE_BASE; /* Offset in DCDC registers */
-	dcdc->desc.ops = &wm831x_epe_ops;
-	dcdc->desc.type = REGULATOR_VOLTAGE;
-	dcdc->desc.owner = THIS_MODULE;
-	dcdc->desc.enable_reg = WM831X_DCDC_ENABLE;
-	dcdc->desc.enable_mask = 1 << dcdc->desc.id;
-
-	config.dev = pdev->dev.parent;
-	if (pdata)
-		config.init_data = pdata->epe[id];
-	config.driver_data = dcdc;
-	config.regmap = wm831x->regmap;
-
-	dcdc->regulator = devm_regulator_register(&pdev->dev, &dcdc->desc,
-						  &config);
-	if (IS_ERR(dcdc->regulator)) {
-		ret = PTR_ERR(dcdc->regulator);
-		dev_err(wm831x->dev, "Failed to register EPE%d: %d\n",
-			id + 1, ret);
-		goto err;
+	list_for_each_entry_safe(entry, n, head, list) {
+		strsize1 = ucs2_strsize(name, 1024);
+		strsize2 = ucs2_strsize(entry->var.VariableName, 1024);
+		if (strsize1 == strsize2 &&
+		    !memcmp(name, &(entry->var.VariableName), strsize1) &&
+		    !efi_guidcmp(guid, entry->var.VendorGuid)) {
+			found = true;
+			break;
+		}
 	}
 
-	platform_set_drvdata(pdev, dcdc);
+	if (!found)
+		return NULL;
+
+	if (remove) {
+		if (entry->scanning) {
+			/*
+			 * The entry will be deleted
+			 * after scanning is completed.
+			 */
+			entry->deleting = true;
+		} else
+			list_del(&entry->list);
+	}
+
+	return entry;
+}
+EXPORT_SYMBOL_GPL(efivar_entry_find);
+
+/**
+ * efivar_entry_size - obtain the size of a variable
+ * @entry: entry for this variable
+ * @size: location to store the variable's size
+ */
+int efivar_entry_size(struct efivar_entry *entry, unsigned long *size)
+{
+	const struct efivar_operations *ops = __efivars->ops;
+	efi_status_t status;
+
+	*size = 0;
+
+	spin_lock_irq(&__efivars->lock);
+	status = ops->get_variable(entry->var.VariableName,
+				   &entry->var.VendorGuid, NULL, size, NULL);
+	spin_unlock_irq(&__efivars->lock);
+
+	if (status != EFI_BUFFER_TOO_SMALL)
+		return efi_status_to_err(status);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(efivar_entry_size);
+
+/**
+ * __efivar_entry_get - call get_variable()
+ * @entry: read data for this variable
+ * @attributes: variable attributes
+ * @size: size of @data buffer
+ * @data: buffer to store variable data
+ *
+ * The caller MUST call efivar_entry_iter_begin() and
+ * efivar_entry_iter_end() before and after the invocation of this
+ * function, respectively.
+ */
+int __efivar_entry_get(struct efivar_entry *entry, u32 *attributes,
+		       unsigned long *size, void *data)
+{
+	const struct efivar_operations *ops = __efivars->ops;
+	efi_status_t status;
+
+	lockdep_assert_held(&__efivars->lock);
+
+	status = ops->get_variable(entry->var.VariableName,
+				   &entry->var.VendorGuid,
+				   attributes, size, data);
+
+	return efi_status_to_err(status);
+}
+EXPORT_SYMBOL_GPL(__efivar_entry_get);
+
+/**
+ * efivar_entry_get - call get_variable()
+ * @entry: read data for this variable
+ * @attributes: variable attributes
+ * @size: size of @data buffer
+ * @data: buffer to store variable data
+ */
+int efivar_entry_get(struct efivar_entry *entry, u32 *attributes,
+		     unsigned long *size, void *data)
+{
+	const struct efivar_operations *ops = __efivars->ops;
+	efi_status_t status;
+
+	spin_lock_irq(&__efivars->lock);
+	status = ops->get_variable(entry->var.VariableName,
+				   &entry->var.VendorGuid,
+				   attributes, size, data);
+	spin_unlock_irq(&__efivars->lock);
+
+	return efi_status_to_err(status);
+}
+EXPORT_SYMBOL_GPL(efivar_entry_get);
+
+/**
+ * efivar_entry_set_get_size - call set_variable() and get new size (atomic)
+ * @entry: entry containing variable to set and get
+ * @attributes: attributes of variable to be written
+ * @size: size of data buffer
+ * @data: buffer containing data to write
+ * @set: did the set_variable() call succeed?
+ *
+ * This is a pretty special (complex) function. See efivarfs_file_write().
+ *
+ * Atomically call set_variable() for @entry and if the call is
+ * successful, return the new size of the variable from get_variable()
+ * in @size. The success of set_variable() is indicated by @set.
+ *
+ * Returns 0 on success, -EINVAL if the variable data is invalid,
+ * -ENOSPC if the firmware does not have enough available space, or a
+ * converted EFI status code if either of set_variable() or
+ * get_variable() fail.
+ *
+ * If the EFI variable does not exist when calling set_variable()
+ * (EFI_NOT_FOUND), @entry is removed from the variable list.
+ */
+int efivar_entry_set_get_size(struct efivar_entry *entry, u32 attributes,
+			      unsigned long *size, void *data, bool *set)
+{
+	const struct efivar_operations *ops = __efivars->ops;
+	efi_char16_t *name = entry->var.VariableName;
+	efi_guid_t *vendor = &entry->var.VendorGuid;
+	efi_status_t status;
+	int err;
+
+	*set = false;
+
+	if (efivar_validate(*vendor, name, data, *size) == false)
+		return -EINVAL;
+
+	/*
+	 * The lock here protects the get_variable call, the conditional
+	 * set_variable call, and removal of the variable from the efivars
+	 * list (in the case of an authenticated delete).
+	 */
+	spin_lock_irq(&__efivars->lock);
+
+	/*
+	 * Ensure that the available space hasn't shrunk below the safe level
+	 */
+	status = check_var_size(attributes, *size + ucs2_strsize(name, 1024));
+	if (status != EFI_SUCCESS) {
+		if (status != EFI_UNSUPPORTED) {
+			err = efi_status_to_err(status);
+			goto out;
+		}
+
+		if (*size > 65536) {
+			err = -ENOSPC;
+			goto out;
+		}
+	}
+
+	status = ops->set_variable(name, vendor, attributes, *size, data);
+	if (status != EFI_SUCCESS) {
+		err = efi_status_to_err(status);
+		goto out;
+	}
+
+	*set = true;
+
+	/*
+	 * Writing to the variable may have caused a change in size (which
+	 * could either be an append or an overwrite), or the variable to be
+	 * deleted. Perform a GetVariable() so we can tell what actually
+	 * happened.
+	 */
+	*size = 0;
+	status = ops->get_variable(entry->var.VariableName,
+				   &entry->var.VendorGuid,
+				   NULL, size, NULL);
+
+	if (status == EFI_NOT_FOUND)
+		efivar_entry_list_del_unlock(entry);
+	else
+		spin_unlock_irq(&__efivars->lock);
+
+	if (status && status != EFI_BUFFER_TOO_SMALL)
+		return efi_status_to_err(status);
 
 	return 0;
 
-err:
-	return ret;
+out:
+	spin_unlock_irq(&__efivars->lock);
+	return err;
+
 }
+EXPORT_SYMBOL_GPL(efivar_entry_set_get_size);
 
-static struct platform_driver wm831x_epe_driver = {
-	.probe = wm831x_epe_probe,
-	.driver		= {
-		.name	= "wm831x-epe",
-	},
-};
-
-static int __init wm831x_dcdc_init(void)
+/**
+ * efivar_entry_iter_begin - begin iterating the variable list
+ *
+ * Lock the variable list to prevent entry insertion and removal until
+ * efivar_entry_iter_end() is called. This function is usually used in
+ * conjunction with __efivar_entry_iter() or efivar_entry_iter().
+ */
+void efivar_entry_iter_begin(void)
 {
-	int ret;
-	ret = platform_driver_register(&wm831x_buckv_driver);
-	if (ret != 0)
-		pr_err("Failed to register WM831x BUCKV driver: %d\n", ret);
+	spin_lock_irq(&__efivars->lock);
+}
+EXPORT_SYMBOL_GPL(efivar_entry_iter_begin);
 
-	ret = platform_driver_register(&wm831x_buckp_driver);
-	if (ret != 0)
-		pr_err("Failed to register WM831x BUCKP driver: %d\n", ret);
+/**
+ * efivar_entry_iter_end - finish iterating the variable list
+ *
+ * Unlock the variable list and allow modifications to the list again.
+ */
+void efivar_entry_iter_end(void)
+{
+	spin_unlock_irq(&__efivars->lock);
+}
+EXPORT_SYMBOL_GPL(efivar_entry_iter_end);
 
-	ret = platform_driver_register(&wm831x_boostp_driver);
-	if (ret != 0)
-		pr_err("Failed to register WM831x BOOST driver: %d\n", ret);
+/**
+ * __efivar_entry_iter - iterate over variable list
+ * @func: callback function
+ * @head: head of the variable list
+ * @data: function-specific data to pass to callback
+ * @prev: entry to begin iterating from
+ *
+ * Iterate over the list of EFI variables and call @func with every
+ * entry on the list. It is safe for @func to remove entries in the
+ * list via efivar_entry_delete().
+ *
+ * You MUST call efivar_enter_iter_begin() before this function, and
+ * efivar_entry_iter_end() afterwards.
+ *
+ * It is possible to begin iteration from an arbitrary entry within
+ * the list by passing @prev. @prev is updated on return to point to
+ * the last entry passed to @func. To begin iterating from the
+ * beginning of the list @prev must be %NULL.
+ *
+ * The restrictions for @func are the same as documented for
+ * efivar_entry_iter().
+ */
+int __efivar_entry_iter(int (*func)(struct efivar_entry *, void *),
+			struct list_head *head, void *data,
+			struct efivar_entry **prev)
+{
+	struct efivar_entry *entry, *n;
+	int err = 0;
 
-	ret = platform_driver_register(&wm831x_epe_driver);
-	if (ret != 0)
-		pr_err("Failed to register WM831x EPE driver: %d\n", ret);
+	if (!prev || !*prev) {
+		list_for_each_entry_safe(entry, n, head, list) {
+			err = func(entry, data);
+			if (err)
+				break;
+		}
+
+		if (prev)
+			*prev = entry;
+
+		return err;
+	}
+
+
+	list_for_each_entry_safe_continue((*prev), n, head, list) {
+		err = func(*prev, data);
+		if (err)
+			break;
+	}
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(__efivar_entry_iter);
+
+/**
+ * efivar_entry_iter - iterate over variable list
+ * @func: callback function
+ * @head: head of variable list
+ * @data: function-specific data to pass to callback
+ *
+ * Iterate over the list of EFI variables and call @func with every
+ * entry on the list. It is safe for @func to remove entries in the
+ * list via efivar_entry_delete() while iterating.
+ *
+ * Some notes for the callback function:
+ *  - a non-zero return value indicates an error and terminates the loop
+ *  - @func is called from atomic context
+ */
+int efivar_entry_iter(int (*func)(struct efivar_entry *, void *),
+		      struct list_head *head, void *data)
+{
+	int err = 0;
+
+	efivar_entry_iter_begin();
+	err = __efivar_entry_iter(func, head, data, NULL);
+	efivar_entry_iter_end();
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(efivar_entry_iter);
+
+/**
+ * efivars_kobject - get the kobject for the registered efivars
+ *
+ * If efivars_register() has not been called we return NULL,
+ * otherwise return the kobject used at registration time.
+ */
+struct kobject *efivars_kobject(void)
+{
+	if (!__efivars)
+		return NULL;
+
+	return __efivars->kobject;
+}
+EXPORT_SYMBOL_GPL(efivars_kobject);
+
+/**
+ * efivar_run_worker - schedule the efivar worker thread
+ */
+void efivar_run_worker(void)
+{
+	if (efivar_wq_enabled)
+		schedule_work(&efivar_work);
+}
+EXPORT_SYMBOL_GPL(efivar_run_worker);
+
+/**
+ * efivars_register - register an efivars
+ * @efivars: efivars to register
+ * @ops: efivars operations
+ * @kobject: @efivars-specific kobject
+ *
+ * Only a single efivars can be registered at any time.
+ */
+int efivars_register(struct efivars *efivars,
+		     const struct efivar_operations *ops,
+		     struct kobject *kobject)
+{
+	spin_lock_init(&efivars->lock);
+	efivars->ops = ops;
+	efivars->kobject = kobject;
+
+	__efivars = efivars;
 
 	return 0;
 }
-subsys_initcall(wm831x_dcdc_init);
+EXPORT_SYMBOL_GPL(efivars_register);
 
-static void __exit wm831x_dcdc_exit(void)
+/**
+ * efivars_unregister - unregister an efivars
+ * @efivars: efivars to unregister
+ *
+ * The caller must have already removed every entry from the list,
+ * failure to do so is an error.
+ */
+int efivars_unregister(struct efivars *efivars)
 {
-	platform_driver_unregister(&wm831x_epe_driver);
-	platform_driver_unregister(&wm831x_boostp_driver);
-	platform_driver_unregister(&wm831x_buckp_driver);
-	platform_driver_unregister(&wm831x_buckv_driver);
-}
-module_exit(wm831x_dcdc_exit);
+	int rv;
 
-/* Module information */
-MODULE_AUTHOR("Mark Brown");
-MODULE_DESCRIPTION("WM831x DC-DC convertor driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:wm831x-buckv");
-MODULE_ALIAS("platform:wm831x-buckp");
-MODULE_ALIAS("platform:wm831x-boostp");
-MODULE_ALIAS("platform:wm831x-epe");
+	if (!__efivars) {
+		printk(KERN_ERR "efivars not registered\n");
+		rv = -EINVAL;
+		goto out;
+	}
+
+	if (__efivars != efivars) {
+		rv = -EINVAL;
+		goto out;
+	}
+
+	__efivars = NULL;
+
+	rv = 0;
+out:
+	return rv;
+}
+EXPORT_SYMBOL_GPL(efivars_unregister);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          config GOOGLE_FIRMWARE
+	bool "Google Firmware Drivers"
+	depends on X86
+	default n
+	help
+	  These firmware drivers are used by Google's servers.  They are
+	  only useful if you are working directly on one of their
+	  proprietary servers.  If in doubt, say "N".
+
+menu "Google Firmware Drivers"
+	depends on GOOGLE_FIRMWARE
+
+config GOOGLE_SMI
+	tristate "SMI interface for Google platforms"
+	depends on ACPI && DMI && EFI
+	select EFI_VARS
+	help
+	  Say Y here if you want to enable SMI callbacks for Google
+	  platforms.  This provides an interface for writing to and
+	  clearing the EFI event log and reading and writing NVRAM
+	  variables.
+
+config GOOGLE_MEMCONSOLE
+	tristate "Firmware Memory Console"
+	depends on DMI
+	help
+	  This option enables the kernel to search for a firmware log in
+	  the EBDA on Google servers.  If found, this log is exported to
+	  userland in the file /sys/firmware/log.
+
+endmenu
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          

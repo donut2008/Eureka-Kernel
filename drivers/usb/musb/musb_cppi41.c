@@ -1,752 +1,280 @@
-#include <linux/device.h>
-#include <linux/dma-mapping.h>
-#include <linux/dmaengine.h>
-#include <linux/sizes.h>
-#include <linux/platform_device.h>
-#include <linux/of.h>
+ of GNB voltage configured by SBIOS, which is suffcient to support VBIOS DISPCLK requirement.
+usExtDispConnInfoOffset:          Offset to sExtDispConnInfo inside the structure
+usPanelRefreshRateRange:          Bit vector for LCD supported refresh rate range. If DRR is requestd by the platform, at least two bits need to be set
+                                  to indicate a range.
+                                  SUPPORTED_LCD_REFRESHRATE_30Hz          0x0004
+                                  SUPPORTED_LCD_REFRESHRATE_40Hz          0x0008
+                                  SUPPORTED_LCD_REFRESHRATE_50Hz          0x0010
+                                  SUPPORTED_LCD_REFRESHRATE_60Hz          0x0020
+ucMemoryType:                     [3:0]=1:DDR1;=2:DDR2;=3:DDR3.[7:4] is reserved.
+ucUMAChannelNumber:                 System memory channel numbers.
+ulCSR_M3_ARB_CNTL_DEFAULT[10]:    Arrays with values for CSR M3 arbiter for default
+ulCSR_M3_ARB_CNTL_UVD[10]:        Arrays with values for CSR M3 arbiter for UVD playback.
+ulCSR_M3_ARB_CNTL_FS3D[10]:       Arrays with values for CSR M3 arbiter for Full Screen 3D applications.
+sAvail_SCLK[5]:                   Arrays to provide availabe list of SLCK and corresponding voltage, order from low to high
+ulGMCRestoreResetTime:            GMC power restore and GMC reset time to calculate data reconnection latency. Unit in ns.
+ulMinimumNClk:                    Minimum NCLK speed among all NB-Pstates to calcualte data reconnection latency. Unit in 10kHz.
+ulIdleNClk:                       NCLK speed while memory runs in self-refresh state. Unit in 10kHz.
+ulDDR_DLL_PowerUpTime:            DDR PHY DLL power up time. Unit in ns.
+ulDDR_PLL_PowerUpTime:            DDR PHY PLL power up time. Unit in ns.
+usPCIEClkSSPercentage:            PCIE Clock Spred Spectrum Percentage in unit 0.01%; 100 mean 1%.
+usPCIEClkSSType:                  PCIE Clock Spred Spectrum Type. 0 for Down spread(default); 1 for Center spread.
+usLvdsSSPercentage:               LVDS panel ( not include eDP ) Spread Spectrum Percentage in unit of 0.01%, =0, use VBIOS default setting.
+usLvdsSSpreadRateIn10Hz:          LVDS panel ( not include eDP ) Spread Spectrum frequency in unit of 10Hz, =0, use VBIOS default setting.
+usHDMISSPercentage:               HDMI Spread Spectrum Percentage in unit 0.01%; 100 mean 1%,  =0, use VBIOS default setting.
+usHDMISSpreadRateIn10Hz:          HDMI Spread Spectrum frequency in unit of 10Hz,  =0, use VBIOS default setting.
+usDVISSPercentage:                DVI Spread Spectrum Percentage in unit 0.01%; 100 mean 1%,  =0, use VBIOS default setting.
+usDVISSpreadRateIn10Hz:           DVI Spread Spectrum frequency in unit of 10Hz,  =0, use VBIOS default setting.
+usMaxLVDSPclkFreqInSingleLink:    Max pixel clock LVDS panel single link, if=0 means VBIOS use default threhold, right now it is 85Mhz
+ucLVDSMisc:                       [bit0] LVDS 888bit panel mode =0: LVDS 888 panel in LDI mode, =1: LVDS 888 panel in FPDI mode
+                                  [bit1] LVDS panel lower and upper link mapping =0: lower link and upper link not swap, =1: lower link and upper link are swapped
+                                  [bit2] LVDS 888bit per color mode  =0: 666 bit per color =1:888 bit per color
+                                  [bit3] LVDS parameter override enable  =0: ucLvdsMisc parameter are not used =1: ucLvdsMisc parameter should be used
+                                  [bit4] Polarity of signal sent to digital BLON output pin. =0: not inverted(active high) =1: inverted ( active low )
+**********************************************************************************************************************/
 
-#include "musb_core.h"
-
-#define RNDIS_REG(x) (0x80 + ((x - 1) * 4))
-
-#define EP_MODE_AUTOREQ_NONE		0
-#define EP_MODE_AUTOREQ_ALL_NEOP	1
-#define EP_MODE_AUTOREQ_ALWAYS		3
-
-#define EP_MODE_DMA_TRANSPARENT		0
-#define EP_MODE_DMA_RNDIS		1
-#define EP_MODE_DMA_GEN_RNDIS		3
-
-#define USB_CTRL_TX_MODE	0x70
-#define USB_CTRL_RX_MODE	0x74
-#define USB_CTRL_AUTOREQ	0xd0
-#define USB_TDOWN		0xd8
-
-struct cppi41_dma_channel {
-	struct dma_channel channel;
-	struct cppi41_dma_controller *controller;
-	struct musb_hw_ep *hw_ep;
-	struct dma_chan *dc;
-	dma_cookie_t cookie;
-	u8 port_num;
-	u8 is_tx;
-	u8 is_allocated;
-	u8 usb_toggle;
-
-	dma_addr_t buf_addr;
-	u32 total_len;
-	u32 prog_len;
-	u32 transferred;
-	u32 packet_sz;
-	struct list_head tx_check;
-	int tx_zlp;
-};
-
-#define MUSB_DMA_NUM_CHANNELS 15
-
-struct cppi41_dma_controller {
-	struct dma_controller controller;
-	struct cppi41_dma_channel rx_channel[MUSB_DMA_NUM_CHANNELS];
-	struct cppi41_dma_channel tx_channel[MUSB_DMA_NUM_CHANNELS];
-	struct musb *musb;
-	struct hrtimer early_tx;
-	struct list_head early_tx_list;
-	u32 rx_mode;
-	u32 tx_mode;
-	u32 auto_req;
-};
-
-static void save_rx_toggle(struct cppi41_dma_channel *cppi41_channel)
+// this Table is used for Liano/Ontario APU
+typedef struct _ATOM_FUSION_SYSTEM_INFO_V1
 {
-	u16 csr;
-	u8 toggle;
+  ATOM_INTEGRATED_SYSTEM_INFO_V6    sIntegratedSysInfo;
+  ULONG  ulPowerplayTable[128];
+}ATOM_FUSION_SYSTEM_INFO_V1;
 
-	if (cppi41_channel->is_tx)
-		return;
-	if (!is_host_active(cppi41_channel->controller->musb))
-		return;
 
-	csr = musb_readw(cppi41_channel->hw_ep->regs, MUSB_RXCSR);
-	toggle = csr & MUSB_RXCSR_H_DATATOGGLE ? 1 : 0;
-
-	cppi41_channel->usb_toggle = toggle;
-}
-
-static void update_rx_toggle(struct cppi41_dma_channel *cppi41_channel)
+typedef struct _ATOM_TDP_CONFIG_BITS
 {
-	struct musb_hw_ep *hw_ep = cppi41_channel->hw_ep;
-	struct musb *musb = hw_ep->musb;
-	u16 csr;
-	u8 toggle;
+#if ATOM_BIG_ENDIAN
+  ULONG   uReserved:2;
+  ULONG   uTDP_Value:14;  // Original TDP value in tens of milli watts
+  ULONG   uCTDP_Value:14; // Override value in tens of milli watts
+  ULONG   uCTDP_Enable:2; // = (uCTDP_Value > uTDP_Value? 2: (uCTDP_Value < uTDP_Value))
+#else
+  ULONG   uCTDP_Enable:2; // = (uCTDP_Value > uTDP_Value? 2: (uCTDP_Value < uTDP_Value))
+  ULONG   uCTDP_Value:14; // Override value in tens of milli watts
+  ULONG   uTDP_Value:14;  // Original TDP value in tens of milli watts
+  ULONG   uReserved:2;
+#endif
+}ATOM_TDP_CONFIG_BITS;
 
-	if (cppi41_channel->is_tx)
-		return;
-	if (!is_host_active(musb))
-		return;
-
-	musb_ep_select(musb->mregs, hw_ep->epnum);
-	csr = musb_readw(hw_ep->regs, MUSB_RXCSR);
-	toggle = csr & MUSB_RXCSR_H_DATATOGGLE ? 1 : 0;
-
-	/*
-	 * AM335x Advisory 1.0.13: Due to internal synchronisation error the
-	 * data toggle may reset from DATA1 to DATA0 during receiving data from
-	 * more than one endpoint.
-	 */
-	if (!toggle && toggle == cppi41_channel->usb_toggle) {
-		csr |= MUSB_RXCSR_H_DATATOGGLE | MUSB_RXCSR_H_WR_DATATOGGLE;
-		musb_writew(cppi41_channel->hw_ep->regs, MUSB_RXCSR, csr);
-		dev_dbg(cppi41_channel->controller->musb->controller,
-				"Restoring DATA1 toggle.\n");
-	}
-
-	cppi41_channel->usb_toggle = toggle;
-}
-
-static bool musb_is_tx_fifo_empty(struct musb_hw_ep *hw_ep)
+typedef union _ATOM_TDP_CONFIG
 {
-	u8		epnum = hw_ep->epnum;
-	struct musb	*musb = hw_ep->musb;
-	void __iomem	*epio = musb->endpoints[epnum].regs;
-	u16		csr;
+  ATOM_TDP_CONFIG_BITS TDP_config;
+  ULONG            TDP_config_all;
+}ATOM_TDP_CONFIG;
 
-	musb_ep_select(musb->mregs, hw_ep->epnum);
-	csr = musb_readw(epio, MUSB_TXCSR);
-	if (csr & MUSB_TXCSR_TXPKTRDY)
-		return false;
-	return true;
-}
+/**********************************************************************************************************************
+  ATOM_FUSION_SYSTEM_INFO_V1 Description
+sIntegratedSysInfo:               refer to ATOM_INTEGRATED_SYSTEM_INFO_V6 definition.
+ulPowerplayTable[128]:            This 512 bytes memory is used to save ATOM_PPLIB_POWERPLAYTABLE3, starting form ulPowerplayTable[0]
+**********************************************************************************************************************/
 
-static void cppi41_dma_callback(void *private_data);
-
-static void cppi41_trans_done(struct cppi41_dma_channel *cppi41_channel)
+// this IntegrateSystemInfoTable is used for Trinity APU
+typedef struct _ATOM_INTEGRATED_SYSTEM_INFO_V1_7
 {
-	struct musb_hw_ep *hw_ep = cppi41_channel->hw_ep;
-	struct musb *musb = hw_ep->musb;
-	void __iomem *epio = hw_ep->regs;
-	u16 csr;
-
-	if (!cppi41_channel->prog_len ||
-	    (cppi41_channel->channel.status == MUSB_DMA_STATUS_FREE)) {
-
-		/* done, complete */
-		cppi41_channel->channel.actual_len =
-			cppi41_channel->transferred;
-		cppi41_channel->channel.status = MUSB_DMA_STATUS_FREE;
-		cppi41_channel->channel.rx_packet_done = true;
-
-		/*
-		 * transmit ZLP using PIO mode for transfers which size is
-		 * multiple of EP packet size.
-		 */
-		if (cppi41_channel->tx_zlp && (cppi41_channel->transferred %
-					cppi41_channel->packet_sz) == 0) {
-			musb_ep_select(musb->mregs, hw_ep->epnum);
-			csr = MUSB_TXCSR_MODE | MUSB_TXCSR_TXPKTRDY;
-			musb_writew(epio, MUSB_TXCSR, csr);
-		}
-		musb_dma_completion(musb, hw_ep->epnum, cppi41_channel->is_tx);
-	} else {
-		/* next iteration, reload */
-		struct dma_chan *dc = cppi41_channel->dc;
-		struct dma_async_tx_descriptor *dma_desc;
-		enum dma_transfer_direction direction;
-		u32 remain_bytes;
-
-		cppi41_channel->buf_addr += cppi41_channel->packet_sz;
-
-		remain_bytes = cppi41_channel->total_len;
-		remain_bytes -= cppi41_channel->transferred;
-		remain_bytes = min(remain_bytes, cppi41_channel->packet_sz);
-		cppi41_channel->prog_len = remain_bytes;
-
-		direction = cppi41_channel->is_tx ? DMA_MEM_TO_DEV
-			: DMA_DEV_TO_MEM;
-		dma_desc = dmaengine_prep_slave_single(dc,
-				cppi41_channel->buf_addr,
-				remain_bytes,
-				direction,
-				DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
-		if (WARN_ON(!dma_desc))
-			return;
-
-		dma_desc->callback = cppi41_dma_callback;
-		dma_desc->callback_param = &cppi41_channel->channel;
-		cppi41_channel->cookie = dma_desc->tx_submit(dma_desc);
-		dma_async_issue_pending(dc);
-
-		if (!cppi41_channel->is_tx) {
-			musb_ep_select(musb->mregs, hw_ep->epnum);
-			csr = musb_readw(epio, MUSB_RXCSR);
-			csr |= MUSB_RXCSR_H_REQPKT;
-			musb_writew(epio, MUSB_RXCSR, csr);
-		}
-	}
-}
-
-static enum hrtimer_restart cppi41_recheck_tx_req(struct hrtimer *timer)
-{
-	struct cppi41_dma_controller *controller;
-	struct cppi41_dma_channel *cppi41_channel, *n;
-	struct musb *musb;
-	unsigned long flags;
-	enum hrtimer_restart ret = HRTIMER_NORESTART;
-
-	controller = container_of(timer, struct cppi41_dma_controller,
-			early_tx);
-	musb = controller->musb;
-
-	spin_lock_irqsave(&musb->lock, flags);
-	list_for_each_entry_safe(cppi41_channel, n, &controller->early_tx_list,
-			tx_check) {
-		bool empty;
-		struct musb_hw_ep *hw_ep = cppi41_channel->hw_ep;
-
-		empty = musb_is_tx_fifo_empty(hw_ep);
-		if (empty) {
-			list_del_init(&cppi41_channel->tx_check);
-			cppi41_trans_done(cppi41_channel);
-		}
-	}
-
-	if (!list_empty(&controller->early_tx_list) &&
-	    !hrtimer_is_queued(&controller->early_tx)) {
-		ret = HRTIMER_RESTART;
-		hrtimer_forward_now(&controller->early_tx,
-				ktime_set(0, 20 * NSEC_PER_USEC));
-	}
-
-	spin_unlock_irqrestore(&musb->lock, flags);
-	return ret;
-}
-
-static void cppi41_dma_callback(void *private_data)
-{
-	struct dma_channel *channel = private_data;
-	struct cppi41_dma_channel *cppi41_channel = channel->private_data;
-	struct musb_hw_ep *hw_ep = cppi41_channel->hw_ep;
-	struct cppi41_dma_controller *controller;
-	struct musb *musb = hw_ep->musb;
-	unsigned long flags;
-	struct dma_tx_state txstate;
-	u32 transferred;
-	int is_hs = 0;
-	bool empty;
-
-	spin_lock_irqsave(&musb->lock, flags);
-
-	dmaengine_tx_status(cppi41_channel->dc, cppi41_channel->cookie,
-			&txstate);
-	transferred = cppi41_channel->prog_len - txstate.residue;
-	cppi41_channel->transferred += transferred;
-
-	dev_dbg(musb->controller, "DMA transfer done on hw_ep=%d bytes=%d/%d\n",
-		hw_ep->epnum, cppi41_channel->transferred,
-		cppi41_channel->total_len);
-
-	update_rx_toggle(cppi41_channel);
-
-	if (cppi41_channel->transferred == cppi41_channel->total_len ||
-			transferred < cppi41_channel->packet_sz)
-		cppi41_channel->prog_len = 0;
-
-	if (cppi41_channel->is_tx) {
-		u8 type;
-
-		if (is_host_active(musb))
-			type = hw_ep->out_qh->type;
-		else
-			type = hw_ep->ep_in.type;
-
-		if (type == USB_ENDPOINT_XFER_ISOC)
-			/*
-			 * Don't use the early-TX-interrupt workaround below
-			 * for Isoch transfter. Since Isoch are periodic
-			 * transfer, by the time the next transfer is
-			 * scheduled, the current one should be done already.
-			 *
-			 * This avoids audio playback underrun issue.
-			 */
-			empty = true;
-		else
-			empty = musb_is_tx_fifo_empty(hw_ep);
-	}
-
-	if (!cppi41_channel->is_tx || empty) {
-		cppi41_trans_done(cppi41_channel);
-		goto out;
-	}
-
-	/*
-	 * On AM335x it has been observed that the TX interrupt fires
-	 * too early that means the TXFIFO is not yet empty but the DMA
-	 * engine says that it is done with the transfer. We don't
-	 * receive a FIFO empty interrupt so the only thing we can do is
-	 * to poll for the bit. On HS it usually takes 2us, on FS around
-	 * 110us - 150us depending on the transfer size.
-	 * We spin on HS (no longer than than 25us and setup a timer on
-	 * FS to check for the bit and complete the transfer.
-	 */
-	controller = cppi41_channel->controller;
-
-	if (is_host_active(musb)) {
-		if (musb->port1_status & USB_PORT_STAT_HIGH_SPEED)
-			is_hs = 1;
-	} else {
-		if (musb->g.speed == USB_SPEED_HIGH)
-			is_hs = 1;
-	}
-	if (is_hs) {
-		unsigned wait = 25;
-
-		do {
-			empty = musb_is_tx_fifo_empty(hw_ep);
-			if (empty) {
-				cppi41_trans_done(cppi41_channel);
-				goto out;
-			}
-			wait--;
-			if (!wait)
-				break;
-			cpu_relax();
-		} while (1);
-	}
-	list_add_tail(&cppi41_channel->tx_check,
-			&controller->early_tx_list);
-	if (!hrtimer_is_queued(&controller->early_tx)) {
-		unsigned long usecs = cppi41_channel->total_len / 10;
-
-		hrtimer_start_range_ns(&controller->early_tx,
-				ktime_set(0, usecs * NSEC_PER_USEC),
-				20 * NSEC_PER_USEC,
-				HRTIMER_MODE_REL);
-	}
-
-out:
-	spin_unlock_irqrestore(&musb->lock, flags);
-}
-
-static u32 update_ep_mode(unsigned ep, unsigned mode, u32 old)
-{
-	unsigned shift;
-
-	shift = (ep - 1) * 2;
-	old &= ~(3 << shift);
-	old |= mode << shift;
-	return old;
-}
-
-static void cppi41_set_dma_mode(struct cppi41_dma_channel *cppi41_channel,
-		unsigned mode)
-{
-	struct cppi41_dma_controller *controller = cppi41_channel->controller;
-	u32 port;
-	u32 new_mode;
-	u32 old_mode;
-
-	if (cppi41_channel->is_tx)
-		old_mode = controller->tx_mode;
-	else
-		old_mode = controller->rx_mode;
-	port = cppi41_channel->port_num;
-	new_mode = update_ep_mode(port, mode, old_mode);
-
-	if (new_mode == old_mode)
-		return;
-	if (cppi41_channel->is_tx) {
-		controller->tx_mode = new_mode;
-		musb_writel(controller->musb->ctrl_base, USB_CTRL_TX_MODE,
-				new_mode);
-	} else {
-		controller->rx_mode = new_mode;
-		musb_writel(controller->musb->ctrl_base, USB_CTRL_RX_MODE,
-				new_mode);
-	}
-}
-
-static void cppi41_set_autoreq_mode(struct cppi41_dma_channel *cppi41_channel,
-		unsigned mode)
-{
-	struct cppi41_dma_controller *controller = cppi41_channel->controller;
-	u32 port;
-	u32 new_mode;
-	u32 old_mode;
-
-	old_mode = controller->auto_req;
-	port = cppi41_channel->port_num;
-	new_mode = update_ep_mode(port, mode, old_mode);
-
-	if (new_mode == old_mode)
-		return;
-	controller->auto_req = new_mode;
-	musb_writel(controller->musb->ctrl_base, USB_CTRL_AUTOREQ, new_mode);
-}
-
-static bool cppi41_configure_channel(struct dma_channel *channel,
-				u16 packet_sz, u8 mode,
-				dma_addr_t dma_addr, u32 len)
-{
-	struct cppi41_dma_channel *cppi41_channel = channel->private_data;
-	struct dma_chan *dc = cppi41_channel->dc;
-	struct dma_async_tx_descriptor *dma_desc;
-	enum dma_transfer_direction direction;
-	struct musb *musb = cppi41_channel->controller->musb;
-	unsigned use_gen_rndis = 0;
-
-	dev_dbg(musb->controller,
-		"configure ep%d/%x packet_sz=%d, mode=%d, dma_addr=0x%llx, len=%d is_tx=%d\n",
-		cppi41_channel->port_num, RNDIS_REG(cppi41_channel->port_num),
-		packet_sz, mode, (unsigned long long) dma_addr,
-		len, cppi41_channel->is_tx);
-
-	cppi41_channel->buf_addr = dma_addr;
-	cppi41_channel->total_len = len;
-	cppi41_channel->transferred = 0;
-	cppi41_channel->packet_sz = packet_sz;
-	cppi41_channel->tx_zlp = (cppi41_channel->is_tx && mode) ? 1 : 0;
-
-	/*
-	 * Due to AM335x' Advisory 1.0.13 we are not allowed to transfer more
-	 * than max packet size at a time.
-	 */
-	if (cppi41_channel->is_tx)
-		use_gen_rndis = 1;
-
-	if (use_gen_rndis) {
-		/* RNDIS mode */
-		if (len > packet_sz) {
-			musb_writel(musb->ctrl_base,
-				RNDIS_REG(cppi41_channel->port_num), len);
-			/* gen rndis */
-			cppi41_set_dma_mode(cppi41_channel,
-					EP_MODE_DMA_GEN_RNDIS);
-
-			/* auto req */
-			cppi41_set_autoreq_mode(cppi41_channel,
-					EP_MODE_AUTOREQ_ALL_NEOP);
-		} else {
-			musb_writel(musb->ctrl_base,
-					RNDIS_REG(cppi41_channel->port_num), 0);
-			cppi41_set_dma_mode(cppi41_channel,
-					EP_MODE_DMA_TRANSPARENT);
-			cppi41_set_autoreq_mode(cppi41_channel,
-					EP_MODE_AUTOREQ_NONE);
-		}
-	} else {
-		/* fallback mode */
-		cppi41_set_dma_mode(cppi41_channel, EP_MODE_DMA_TRANSPARENT);
-		cppi41_set_autoreq_mode(cppi41_channel, EP_MODE_AUTOREQ_NONE);
-		len = min_t(u32, packet_sz, len);
-	}
-	cppi41_channel->prog_len = len;
-	direction = cppi41_channel->is_tx ? DMA_MEM_TO_DEV : DMA_DEV_TO_MEM;
-	dma_desc = dmaengine_prep_slave_single(dc, dma_addr, len, direction,
-			DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
-	if (!dma_desc)
-		return false;
-
-	dma_desc->callback = cppi41_dma_callback;
-	dma_desc->callback_param = channel;
-	cppi41_channel->cookie = dma_desc->tx_submit(dma_desc);
-	cppi41_channel->channel.rx_packet_done = false;
-
-	save_rx_toggle(cppi41_channel);
-	dma_async_issue_pending(dc);
-	return true;
-}
-
-static struct dma_channel *cppi41_dma_channel_allocate(struct dma_controller *c,
-				struct musb_hw_ep *hw_ep, u8 is_tx)
-{
-	struct cppi41_dma_controller *controller = container_of(c,
-			struct cppi41_dma_controller, controller);
-	struct cppi41_dma_channel *cppi41_channel = NULL;
-	u8 ch_num = hw_ep->epnum - 1;
-
-	if (ch_num >= MUSB_DMA_NUM_CHANNELS)
-		return NULL;
-
-	if (is_tx)
-		cppi41_channel = &controller->tx_channel[ch_num];
-	else
-		cppi41_channel = &controller->rx_channel[ch_num];
-
-	if (!cppi41_channel->dc)
-		return NULL;
-
-	if (cppi41_channel->is_allocated)
-		return NULL;
-
-	cppi41_channel->hw_ep = hw_ep;
-	cppi41_channel->is_allocated = 1;
-
-	return &cppi41_channel->channel;
-}
-
-static void cppi41_dma_channel_release(struct dma_channel *channel)
-{
-	struct cppi41_dma_channel *cppi41_channel = channel->private_data;
-
-	if (cppi41_channel->is_allocated) {
-		cppi41_channel->is_allocated = 0;
-		channel->status = MUSB_DMA_STATUS_FREE;
-		channel->actual_len = 0;
-	}
-}
-
-static int cppi41_dma_channel_program(struct dma_channel *channel,
-				u16 packet_sz, u8 mode,
-				dma_addr_t dma_addr, u32 len)
-{
-	int ret;
-	struct cppi41_dma_channel *cppi41_channel = channel->private_data;
-	int hb_mult = 0;
-
-	BUG_ON(channel->status == MUSB_DMA_STATUS_UNKNOWN ||
-		channel->status == MUSB_DMA_STATUS_BUSY);
-
-	if (is_host_active(cppi41_channel->controller->musb)) {
-		if (cppi41_channel->is_tx)
-			hb_mult = cppi41_channel->hw_ep->out_qh->hb_mult;
-		else
-			hb_mult = cppi41_channel->hw_ep->in_qh->hb_mult;
-	}
-
-	channel->status = MUSB_DMA_STATUS_BUSY;
-	channel->actual_len = 0;
-
-	if (hb_mult)
-		packet_sz = hb_mult * (packet_sz & 0x7FF);
-
-	ret = cppi41_configure_channel(channel, packet_sz, mode, dma_addr, len);
-	if (!ret)
-		channel->status = MUSB_DMA_STATUS_FREE;
-
-	return ret;
-}
-
-static int cppi41_is_compatible(struct dma_channel *channel, u16 maxpacket,
-		void *buf, u32 length)
-{
-	struct cppi41_dma_channel *cppi41_channel = channel->private_data;
-	struct cppi41_dma_controller *controller = cppi41_channel->controller;
-	struct musb *musb = controller->musb;
-
-	if (is_host_active(musb)) {
-		WARN_ON(1);
-		return 1;
-	}
-	if (cppi41_channel->hw_ep->ep_in.type != USB_ENDPOINT_XFER_BULK)
-		return 0;
-	if (cppi41_channel->is_tx)
-		return 1;
-	/* AM335x Advisory 1.0.13. No workaround for device RX mode */
-	return 0;
-}
-
-static int cppi41_dma_channel_abort(struct dma_channel *channel)
-{
-	struct cppi41_dma_channel *cppi41_channel = channel->private_data;
-	struct cppi41_dma_controller *controller = cppi41_channel->controller;
-	struct musb *musb = controller->musb;
-	void __iomem *epio = cppi41_channel->hw_ep->regs;
-	int tdbit;
-	int ret;
-	unsigned is_tx;
-	u16 csr;
-
-	is_tx = cppi41_channel->is_tx;
-	dev_dbg(musb->controller, "abort channel=%d, is_tx=%d\n",
-			cppi41_channel->port_num, is_tx);
-
-	if (cppi41_channel->channel.status == MUSB_DMA_STATUS_FREE)
-		return 0;
-
-	list_del_init(&cppi41_channel->tx_check);
-	if (is_tx) {
-		csr = musb_readw(epio, MUSB_TXCSR);
-		csr &= ~MUSB_TXCSR_DMAENAB;
-		musb_writew(epio, MUSB_TXCSR, csr);
-	} else {
-		cppi41_set_autoreq_mode(cppi41_channel, EP_MODE_AUTOREQ_NONE);
-
-		/* delay to drain to cppi dma pipeline for isoch */
-		udelay(250);
-
-		csr = musb_readw(epio, MUSB_RXCSR);
-		csr &= ~(MUSB_RXCSR_H_REQPKT | MUSB_RXCSR_DMAENAB);
-		musb_writew(epio, MUSB_RXCSR, csr);
-
-		/* wait to drain cppi dma pipe line */
-		udelay(50);
-
-		csr = musb_readw(epio, MUSB_RXCSR);
-		if (csr & MUSB_RXCSR_RXPKTRDY) {
-			csr |= MUSB_RXCSR_FLUSHFIFO;
-			musb_writew(epio, MUSB_RXCSR, csr);
-			musb_writew(epio, MUSB_RXCSR, csr);
-		}
-	}
-
-	tdbit = 1 << cppi41_channel->port_num;
-	if (is_tx)
-		tdbit <<= 16;
-
-	do {
-		if (is_tx)
-			musb_writel(musb->ctrl_base, USB_TDOWN, tdbit);
-		ret = dmaengine_terminate_all(cppi41_channel->dc);
-	} while (ret == -EAGAIN);
-
-	if (is_tx) {
-		musb_writel(musb->ctrl_base, USB_TDOWN, tdbit);
-
-		csr = musb_readw(epio, MUSB_TXCSR);
-		if (csr & MUSB_TXCSR_TXPKTRDY) {
-			csr |= MUSB_TXCSR_FLUSHFIFO;
-			musb_writew(epio, MUSB_TXCSR, csr);
-		}
-	}
-
-	cppi41_channel->channel.status = MUSB_DMA_STATUS_FREE;
-	return 0;
-}
-
-static void cppi41_release_all_dma_chans(struct cppi41_dma_controller *ctrl)
-{
-	struct dma_chan *dc;
-	int i;
-
-	for (i = 0; i < MUSB_DMA_NUM_CHANNELS; i++) {
-		dc = ctrl->tx_channel[i].dc;
-		if (dc)
-			dma_release_channel(dc);
-		dc = ctrl->rx_channel[i].dc;
-		if (dc)
-			dma_release_channel(dc);
-	}
-}
-
-static void cppi41_dma_controller_stop(struct cppi41_dma_controller *controller)
-{
-	cppi41_release_all_dma_chans(controller);
-}
-
-static int cppi41_dma_controller_start(struct cppi41_dma_controller *controller)
-{
-	struct musb *musb = controller->musb;
-	struct device *dev = musb->controller;
-	struct device_node *np = dev->parent->of_node;
-	struct cppi41_dma_channel *cppi41_channel;
-	int count;
-	int i;
-	int ret;
-
-	count = of_property_count_strings(np, "dma-names");
-	if (count < 0)
-		return count;
-
-	for (i = 0; i < count; i++) {
-		struct dma_chan *dc;
-		struct dma_channel *musb_dma;
-		const char *str;
-		unsigned is_tx;
-		unsigned int port;
-
-		ret = of_property_read_string_index(np, "dma-names", i, &str);
-		if (ret)
-			goto err;
-		if (strstarts(str, "tx"))
-			is_tx = 1;
-		else if (strstarts(str, "rx"))
-			is_tx = 0;
-		else {
-			dev_err(dev, "Wrong dmatype %s\n", str);
-			goto err;
-		}
-		ret = kstrtouint(str + 2, 0, &port);
-		if (ret)
-			goto err;
-
-		ret = -EINVAL;
-		if (port > MUSB_DMA_NUM_CHANNELS || !port)
-			goto err;
-		if (is_tx)
-			cppi41_channel = &controller->tx_channel[port - 1];
-		else
-			cppi41_channel = &controller->rx_channel[port - 1];
-
-		cppi41_channel->controller = controller;
-		cppi41_channel->port_num = port;
-		cppi41_channel->is_tx = is_tx;
-		INIT_LIST_HEAD(&cppi41_channel->tx_check);
-
-		musb_dma = &cppi41_channel->channel;
-		musb_dma->private_data = cppi41_channel;
-		musb_dma->status = MUSB_DMA_STATUS_FREE;
-		musb_dma->max_len = SZ_4M;
-
-		dc = dma_request_slave_channel(dev->parent, str);
-		if (!dc) {
-			dev_err(dev, "Failed to request %s.\n", str);
-			ret = -EPROBE_DEFER;
-			goto err;
-		}
-		cppi41_channel->dc = dc;
-	}
-	return 0;
-err:
-	cppi41_release_all_dma_chans(controller);
-	return ret;
-}
-
-void cppi41_dma_controller_destroy(struct dma_controller *c)
-{
-	struct cppi41_dma_controller *controller = container_of(c,
-			struct cppi41_dma_controller, controller);
-
-	hrtimer_cancel(&controller->early_tx);
-	cppi41_dma_controller_stop(controller);
-	kfree(controller);
-}
-EXPORT_SYMBOL_GPL(cppi41_dma_controller_destroy);
-
-struct dma_controller *
-cppi41_dma_controller_create(struct musb *musb, void __iomem *base)
-{
-	struct cppi41_dma_controller *controller;
-	int ret = 0;
-
-	if (!musb->controller->parent->of_node) {
-		dev_err(musb->controller, "Need DT for the DMA engine.\n");
-		return NULL;
-	}
-
-	controller = kzalloc(sizeof(*controller), GFP_KERNEL);
-	if (!controller)
-		goto kzalloc_fail;
-
-	hrtimer_init(&controller->early_tx, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	controller->early_tx.function = cppi41_recheck_tx_req;
-	INIT_LIST_HEAD(&controller->early_tx_list);
-	controller->musb = musb;
-
-	controller->controller.channel_alloc = cppi41_dma_channel_allocate;
-	controller->controller.channel_release = cppi41_dma_channel_release;
-	controller->controller.channel_program = cppi41_dma_channel_program;
-	controller->controller.channel_abort = cppi41_dma_channel_abort;
-	controller->controller.is_compatible = cppi41_is_compatible;
-
-	ret = cppi41_dma_controller_start(controller);
-	if (ret)
-		goto plat_get_fail;
-	return &controller->controller;
-
-plat_get_fail:
-	kfree(controller);
-kzalloc_fail:
-	if (ret == -EPROBE_DEFER)
-		return ERR_PTR(ret);
-	return NULL;
-}
-EXPORT_SYMBOL_GPL(cppi41_dma_controller_create);
+  ATOM_COMMON_TABLE_HEADER   sHeader;
+  ULONG  ulBootUpEngineClock;
+  ULONG  ulDentistVCOFreq;
+  ULONG  ulBootUpUMAClock;
+  ATOM_CLK_VOLT_CAPABILITY   sDISPCLK_Voltage[4];
+  ULONG  ulBootUpReqDisplayVector;
+  ULONG  ulOtherDisplayMisc;
+  ULONG  ulGPUCapInfo;
+  ULONG  ulSB_MMIO_Base_Addr;
+  USHORT usRequestedPWMFreqInHz;
+  UCHAR  ucHtcTmpLmt;
+  UCHAR  ucHtcHystLmt;
+  ULONG  ulMinEngineClock;
+  ULONG  ulSystemConfig;
+  ULONG  ulCPUCapInfo;
+  USHORT usNBP0Voltage;
+  USHORT usNBP1Voltage;
+  USHORT usBootUpNBVoltage;
+  USHORT usExtDispConnInfoOffset;
+  USHORT usPanelRefreshRateRange;
+  UCHAR  ucMemoryType;
+  UCHAR  ucUMAChannelNumber;
+  UCHAR  strVBIOSMsg[40];
+  ATOM_TDP_CONFIG  asTdpConfig;
+  ULONG  ulReserved[19];
+  ATOM_AVAILABLE_SCLK_LIST   sAvail_SCLK[5];
+  ULONG  ulGMCRestoreResetTime;
+  ULONG  ulMinimumNClk;
+  ULONG  ulIdleNClk;
+  ULONG  ulDDR_DLL_PowerUpTime;
+  ULONG  ulDDR_PLL_PowerUpTime;
+  USHORT usPCIEClkSSPercentage;
+  USHORT usPCIEClkSSType;
+  USHORT usLvdsSSPercentage;
+  USHORT usLvdsSSpreadRateIn10Hz;
+  USHORT usHDMISSPercentage;
+  USHORT usHDMISSpreadRateIn10Hz;
+  USHORT usDVISSPercentage;
+  USHORT usDVISSpreadRateIn10Hz;
+  ULONG  SclkDpmBoostMargin;
+  ULONG  SclkDpmThrottleMargin;
+  USHORT SclkDpmTdpLimitPG;
+  USHORT SclkDpmTdpLimitBoost;
+  ULONG  ulBoostEngineCLock;
+  UCHAR  ulBoostVid_2bit;
+  UCHAR  EnableBoost;
+  USHORT GnbTdpLimit;
+  USHORT usMaxLVDSPclkFreqInSingleLink;
+  UCHAR  ucLvdsMisc;
+  UCHAR  ucTravisLVDSVolAdjust;
+  UCHAR  ucLVDSPwrOnSeqDIGONtoDE_in4Ms;
+  UCHAR  ucLVDSPwrOnSeqDEtoVARY_BL_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqVARY_BLtoDE_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqDEtoDIGON_in4Ms;
+  UCHAR  ucLVDSOffToOnDelay_in4Ms;
+  UCHAR  ucLVDSPwrOnSeqVARY_BLtoBLON_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqBLONtoVARY_BL_in4Ms;
+  UCHAR  ucMinAllowedBL_Level;
+  ULONG  ulLCDBitDepthControlVal;
+  ULONG  ulNbpStateMemclkFreq[4];
+  USHORT usNBP2Voltage;
+  USHORT usNBP3Voltage;
+  ULONG  ulNbpStateNClkFreq[4];
+  UCHAR  ucNBDPMEnable;
+  UCHAR  ucReserved[3];
+  UCHAR  ucDPMState0VclkFid;
+  UCHAR  ucDPMState0DclkFid;
+  UCHAR  ucDPMState1VclkFid;
+  UCHAR  ucDPMState1DclkFid;
+  UCHAR  ucDPMState2VclkFid;
+  UCHAR  ucDPMState2DclkFid;
+  UCHAR  ucDPMState3VclkFid;
+  UCHAR  ucDPMState3DclkFid;
+  ATOM_EXTERNAL_DISPLAY_CONNECTION_INFO sExtDispConnInfo;
+}ATOM_INTEGRATED_SYSTEM_INFO_V1_7;
+
+// ulOtherDisplayMisc
+#define INTEGRATED_SYSTEM_INFO__GET_EDID_CALLBACK_FUNC_SUPPORT            0x01
+#define INTEGRATED_SYSTEM_INFO__GET_BOOTUP_DISPLAY_CALLBACK_FUNC_SUPPORT  0x02
+#define INTEGRATED_SYSTEM_INFO__GET_EXPANSION_CALLBACK_FUNC_SUPPORT       0x04
+#define INTEGRATED_SYSTEM_INFO__FAST_BOOT_SUPPORT                         0x08
+
+// ulGPUCapInfo
+#define SYS_INFO_GPUCAPS__TMDSHDMI_COHERENT_SINGLEPLL_MODE                0x01
+#define SYS_INFO_GPUCAPS__DP_SINGLEPLL_MODE                               0x02
+#define SYS_INFO_GPUCAPS__DISABLE_AUX_MODE_DETECT                         0x08
+#define SYS_INFO_GPUCAPS__ENABEL_DFS_BYPASS                               0x10
+//ulGPUCapInfo[16]=1 indicate SMC firmware is able to support GNB fast resume function, so that driver can call SMC to program most of GNB register during resuming, from ML
+#define SYS_INFO_GPUCAPS__GNB_FAST_RESUME_CAPABLE                         0x00010000
+
+//ulGPUCapInfo[17]=1 indicate battery boost feature is enable, from ML
+#define SYS_INFO_GPUCAPS__BATTERY_BOOST_ENABLE                            0x00020000
+
+/**********************************************************************************************************************
+  ATOM_INTEGRATED_SYSTEM_INFO_V1_7 Description
+ulBootUpEngineClock:              VBIOS bootup Engine clock frequency, in 10kHz unit. if it is equal 0, then VBIOS use pre-defined bootup engine clock
+ulDentistVCOFreq:                 Dentist VCO clock in 10kHz unit.
+ulBootUpUMAClock:                 System memory boot up clock frequency in 10Khz unit.
+sDISPCLK_Voltage:                 Report Display clock voltage requirement.
+
+ulBootUpReqDisplayVector:         VBIOS boot up display IDs, following are supported devices in Trinity projects:
+                                  ATOM_DEVICE_CRT1_SUPPORT                  0x0001
+                                  ATOM_DEVICE_DFP1_SUPPORT                  0x0008
+                                  ATOM_DEVICE_DFP6_SUPPORT                  0x0040
+                                  ATOM_DEVICE_DFP2_SUPPORT                  0x0080
+                                  ATOM_DEVICE_DFP3_SUPPORT                  0x0200
+                                  ATOM_DEVICE_DFP4_SUPPORT                  0x0400
+                                  ATOM_DEVICE_DFP5_SUPPORT                  0x0800
+                                  ATOM_DEVICE_LCD1_SUPPORT                  0x0002
+ulOtherDisplayMisc:                 bit[0]=0: INT15 callback function Get LCD EDID ( ax=4e08, bl=1b ) is not supported by SBIOS.
+                                        =1: INT15 callback function Get LCD EDID ( ax=4e08, bl=1b ) is supported by SBIOS.
+                                  bit[1]=0: INT15 callback function Get boot display( ax=4e08, bl=01h) is not supported by SBIOS
+                                        =1: INT15 callback function Get boot display( ax=4e08, bl=01h) is supported by SBIOS
+                                  bit[2]=0: INT15 callback function Get panel Expansion ( ax=4e08, bl=02h) is not supported by SBIOS
+                                        =1: INT15 callback function Get panel Expansion ( ax=4e08, bl=02h) is supported by SBIOS
+                                  bit[3]=0: VBIOS fast boot is disable
+                                        =1: VBIOS fast boot is enable. ( VBIOS skip display device detection in every set mode if LCD panel is connect and LID is open)
+ulGPUCapInfo:                     bit[0]=0: TMDS/HDMI Coherent Mode use cascade PLL mode.
+                                        =1: TMDS/HDMI Coherent Mode use signel PLL mode.
+                                  bit[1]=0: DP mode use cascade PLL mode ( New for Trinity )
+                                        =1: DP mode use single PLL mode
+                                  bit[3]=0: Enable AUX HW mode detection logic
+                                        =1: Disable AUX HW mode detection logic
+
+ulSB_MMIO_Base_Addr:              Physical Base address to SB MMIO space. Driver needs to initialize it for SMU usage.
+
+usRequestedPWMFreqInHz:           When it's set to 0x0 by SBIOS: the LCD BackLight is not controlled by GPU(SW).
+                                  Any attempt to change BL using VBIOS function or enable VariBri from PP table is not effective since ATOM_BIOS_INFO_BL_CONTROLLED_BY_GPU==0;
+
+                                  When it's set to a non-zero frequency, the BackLight is controlled by GPU (SW) in one of two ways below:
+                                  1. SW uses the GPU BL PWM output to control the BL, in chis case, this non-zero frequency determines what freq GPU should use;
+                                  VBIOS will set up proper PWM frequency and ATOM_BIOS_INFO_BL_CONTROLLED_BY_GPU==1,as the result,
+                                  Changing BL using VBIOS function is functional in both driver and non-driver present environment;
+                                  and enabling VariBri under the driver environment from PP table is optional.
+
+                                  2. SW uses other means to control BL (like DPCD),this non-zero frequency serves as a flag only indicating
+                                  that BL control from GPU is expected.
+                                  VBIOS will NOT set up PWM frequency but make ATOM_BIOS_INFO_BL_CONTROLLED_BY_GPU==1
+                                  Changing BL using VBIOS function could be functional in both driver and non-driver present environment,but
+                                  it's per platform
+                                  and enabling VariBri under the driver environment from PP table is optional.
+
+ucHtcTmpLmt:                      Refer to D18F3x64 bit[22:16], HtcTmpLmt.
+                                  Threshold on value to enter HTC_active state.
+ucHtcHystLmt:                     Refer to D18F3x64 bit[27:24], HtcHystLmt.
+                                  To calculate threshold off value to exit HTC_active state, which is Threshold on vlaue minus ucHtcHystLmt.
+ulMinEngineClock:                 Minimum SCLK allowed in 10kHz unit. This is calculated based on WRCK Fuse settings.
+ulSystemConfig:                   Bit[0]=0: PCIE Power Gating Disabled
+                                        =1: PCIE Power Gating Enabled
+                                  Bit[1]=0: DDR-DLL shut-down feature disabled.
+                                         1: DDR-DLL shut-down feature enabled.
+                                  Bit[2]=0: DDR-PLL Power down feature disabled.
+                                         1: DDR-PLL Power down feature enabled.
+ulCPUCapInfo:                     TBD
+usNBP0Voltage:                    VID for voltage on NB P0 State
+usNBP1Voltage:                    VID for voltage on NB P1 State
+usNBP2Voltage:                    VID for voltage on NB P2 State
+usNBP3Voltage:                    VID for voltage on NB P3 State
+usBootUpNBVoltage:                Voltage Index of GNB voltage configured by SBIOS, which is suffcient to support VBIOS DISPCLK requirement.
+usExtDispConnInfoOffset:          Offset to sExtDispConnInfo inside the structure
+usPanelRefreshRateRange:          Bit vector for LCD supported refresh rate range. If DRR is requestd by the platform, at least two bits need to be set
+                                  to indicate a range.
+                                  SUPPORTED_LCD_REFRESHRATE_30Hz          0x0004
+                                  SUPPORTED_LCD_REFRESHRATE_40Hz          0x0008
+                                  SUPPORTED_LCD_REFRESHRATE_50Hz          0x0010
+                                  SUPPORTED_LCD_REFRESHRATE_60Hz          0x0020
+ucMemoryType:                     [3:0]=1:DDR1;=2:DDR2;=3:DDR3.[7:4] is reserved.
+ucUMAChannelNumber:                 System memory channel numbers.
+ulCSR_M3_ARB_CNTL_DEFAULT[10]:    Arrays with values for CSR M3 arbiter for default
+ulCSR_M3_ARB_CNTL_UVD[10]:        Arrays with values for CSR M3 arbiter for UVD playback.
+ulCSR_M3_ARB_CNTL_FS3D[10]:       Arrays with values for CSR M3 arbiter for Full Screen 3D applications.
+sAvail_SCLK[5]:                   Arrays to provide availabe list of SLCK and corresponding voltage, order from low to high
+ulGMCRestoreResetTime:            GMC power restore and GMC reset time to calculate data reconnection latency. Unit in ns.
+ulMinimumNClk:                    Minimum NCLK speed among all NB-Pstates to calcualte data reconnection latency. Unit in 10kHz.
+ulIdleNClk:                       NCLK speed while memory runs in self-refresh state. Unit in 10kHz.
+ulDDR_DLL_PowerUpTime:            DDR PHY DLL power up time. Unit in ns.
+ulDDR_PLL_PowerUpTime:            DDR PHY PLL power up time. Unit in ns.
+usPCIEClkSSPercentage:            PCIE Clock Spread Spectrum Percentage in unit 0.01%; 100 mean 1%.
+usPCIEClkSSType:                  PCIE Clock Spread Spectrum Type. 0 for Down spread(default); 1 for Center spread.
+usLvdsSSPercentage:               LVDS panel ( not include eDP ) Spread Spectrum Percentage in unit of 0.01%, =0, use VBIOS default setting.
+usLvdsSSpreadRateIn10Hz:          LVDS panel ( not include eDP ) Spread Spectrum frequency in unit of 10Hz, =0, use VBIOS default setting.
+usHDMISSPercentage:               HDMI Spread Spectrum Percentage in unit 0.01%; 100 mean 1%,  =0, use VBIOS default setting.
+usHDMISSpreadRateIn10Hz:          HDMI Spread Spectrum frequency in unit of 10Hz,  =0, use VBIOS default setting.
+usDVISSPercentage:                DVI Spread Spectrum Percentage in unit 0.01%; 100 mean 1%,  =0, use VBIOS default setting.
+usDVISSpreadRateIn10Hz:           DVI Spread Spectrum frequency in unit of 10Hz,  =0, use VBIOS default setting.
+usMaxLVDSPclkFreqInSingleLink:    Max pixel clock LVDS panel single link, if=0 means VBIOS use default threhold, right now it is 85Mhz
+ucLVDSMisc:                       [bit0] LVDS 888bit panel mode =0: LVDS 888 panel in LDI mode, =1: LVDS 888 panel in FPDI mode
+                                  [bit1] LVDS panel lower and upper link mapping =0: lower link and upper link not swap, =1: lower link and upper link are swapped
+                                  [bit2] LVDS 888bit per color mode  =0: 666 bit per color =1:888 bit per color
+                                  [bit3] LVDS parameter override enable  =0: ucLvdsMisc parameter are not used =1: ucLvdsMisc parameter should be used
+                                  [bit4] Polarity of signal sent to digital BLON output pin. =0: not inverted(active high) =1: inverted ( active low )
+                                  [bit5] Travid LVDS output voltage override enable, when =1, use ucTravisLVDSVolAdjust value to overwrite Traivs register LVDS_CTRL_4
+ucTravisLVDSVolAdjust             When ucLVDSMisc[5]=1,it means platform SBIOS want to overwrite TravisLVDSVoltage. Then VBIOS will use ucTravisLVDSVolAdjust
+                                  value to program Travis register LVDS_CTRL_4
+ucLVDSPwrOnSeqDIGONtoDE_in4Ms:    LVDS power up sequence time in unit of 4ms, time delay from DIGON signal active to data enable signal active( DE ).
+                                  =0 mean use VBIOS default which is 8 ( 32ms ). The LVDS power up sequence is as following: DIGON->DE->VARY_BL->BLON.
+                                  This parameter is used by VBIOS only. VBIOS will patch LVDS_InfoTable.
+ucLVDSPwrOnDEtoVARY_BL_in4Ms:     LVDS power up sequence time in unit of 4ms., time delay from DE( data enable ) active to Vary Brightness enable signal active( VARY_BL ).
+                                  =0 mean use VBIOS default which is 90 ( 360ms ). The LVDS power up sequence is as following: DIGON->DE->VARY_BL->BLON.
+                                  This parameter is used by VBIOS only. VBIOS will patch LVDS_InfoTable.
+
+ucLVDSPwrOffVARY_BLtoDE_in4Ms:    LVDS power down sequence time in unit of 4ms, time delay from data enable ( DE ) signal off to LCDVCC (DIGON) off.
+                                  =0 mean use VBIOS default delay which is 8 ( 32ms ). The LVDS power down sequence is as following: BLON->VARY_BL->DE->DIGON
+                                  This parameter is used by VBIOS only. VBIOS will patch LVDS_InfoTable.
+
+ucLVDSPwrOffDEtoDIGON_in4Ms:      LVDS power down sequence time in unit of 4ms, time delay from vary brightness enable signal( VARY_BL) off to data enable ( DE ) signal off.
+                                  =0 mean use VBIOS default which is 90 ( 360ms ). The LVDS power down sequence is as following: BLON->VARY_BL->

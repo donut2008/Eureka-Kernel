@@ -1,13 +1,3 @@
-#
-# Makefile for drivers/scsi/arm
-#
-
-acornscsi_mod-objs	:= acornscsi.o acornscsi-io.o
-
-obj-$(CONFIG_SCSI_ACORNSCSI_3)	+= acornscsi_mod.o queue.o msgqueue.o
-obj-$(CONFIG_SCSI_ARXESCSI)	+= arxescsi.o fas216.o queue.o msgqueue.o
-obj-$(CONFIG_SCSI_CUMANA_1)	+= cumana_1.o
-obj-$(CONFIG_SCSI_CUMANA_2)	+= cumana_2.o fas216.o queue.o msgqueue.o
-obj-$(CONFIG_SCSI_OAK1)		+= oak.o
-obj-$(CONFIG_SCSI_POWERTECSCSI)	+= powertec.o fas216.o queue.o msgqueue.o
-obj-$(CONFIG_SCSI_EESOXSCSI)	+= eesox.o fas216.o queue.o msgqueue.o
+`„œ}∏”Æq»õ∫èﬂVSˇΩ	“S´<óy@»B"Ë9Ù~CrøS])¬√#-ı’ùeÄí≤cÿ~Æª•KåVíèƒ_7§éí‹Mu±ªß^&µÒ»F\?)*eT'ï=œ”≠π%I
+9ûÒNT$‘yÕÅK¿=PGç1}Î=RF_˚oøe¬‘~Óbß~<”Õ∂â\ñÊã«ã=vÇ¯M˜÷íÈ^Ãi üI?Eú#ÃD~πr®¢ªáknu•QÎúO‚éÈÄÇRΩl˚ÛNnSÉU{wiªBwXËñyÇ4˘Ÿ≥ˆÙ˙˜˘ú~#ädÖ:;ııà`Èõ¸0`P˘…	Ë~ﬂY‘@˚íﬂ3“[Ê†Sp•!]≥G¨gfœU{<.√øÉ^mÛ•§A¡vl°∏^Mu®ò˘¯¿¬%öùÄbÓ”g+åø€C)◊
+ªwªÎj≥ÇHπéTf~ªÕ™Œ—pìúørº%ì"úÓÈh÷Fmìq˛Yv£®e(/Ò"„ıût⁄ÜÄÒ»ß;∆]÷ç:] ∑Cî›Å˛áù6á«»rQ»UPyh‡f–∆\“Í|˜(”!úƒ.°ÏàçEoˆqgïr#5€]àz∑øÁ›˘-;c⁄ª/C∞ıNQd™‰¯ñöW;Í˛8s⁄:1cfíO]e

@@ -1,155 +1,132 @@
-/*
- * IDE Chipset driver for the Compaq TriFlex IDE controller.
- * 
- * Known to work with the Compaq Workstation 5x00 series.
- *
- * Copyright (C) 2002 Hewlett-Packard Development Group, L.P.
- * Author: Torben Mathiasen <torben.mathiasen@hp.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- * 
- * Loosely based on the piix & svwks drivers.
- *
- * Documentation:
- *	Not publicly available.
- */
-
-#include <linux/types.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/pci.h>
-#include <linux/ide.h>
-#include <linux/init.h>
-
-#define DRV_NAME "triflex"
-
-static void triflex_set_mode(ide_hwif_t *hwif, ide_drive_t *drive)
+e,
+				   enum ipu_rotate_mode rot_mode,
+				   dma_addr_t phyaddr_0, dma_addr_t phyaddr_1)
 {
-	struct pci_dev *dev = to_pci_dev(hwif->dev);
-	u32 triflex_timings = 0;
-	u16 timing = 0;
-	u8 channel_offset = hwif->channel ? 0x74 : 0x70, unit = drive->dn & 1;
+	enum ipu_channel channel = ichan->dma_chan.chan_id;
+	struct idmac *idmac = to_idmac(ichan->dma_chan.device);
+	struct ipu *ipu = to_ipu(idmac);
+	union chan_param_mem params = {};
+	unsigned long flags;
+	uint32_t reg;
+	uint32_t stride_bytes;
 
-	pci_read_config_dword(dev, channel_offset, &triflex_timings);
+	stride_bytes = stride * bytes_per_pixel(pixel_fmt);
 
-	switch (drive->dma_mode) {
-		case XFER_MW_DMA_2:
-			timing = 0x0103; 
-			break;
-		case XFER_MW_DMA_1:
-			timing = 0x0203;
-			break;
-		case XFER_MW_DMA_0:
-			timing = 0x0808;
-			break;
-		case XFER_SW_DMA_2:
-		case XFER_SW_DMA_1:
-		case XFER_SW_DMA_0:
-			timing = 0x0f0f;
-			break;
-		case XFER_PIO_4:
-			timing = 0x0202;
-			break;
-		case XFER_PIO_3:
-			timing = 0x0204;
-			break;
-		case XFER_PIO_2:
-			timing = 0x0404;
-			break;
-		case XFER_PIO_1:
-			timing = 0x0508;
-			break;
-		case XFER_PIO_0:
-			timing = 0x0808;
-			break;
+	if (stride_bytes % 4) {
+		dev_err(ipu->dev,
+			"Stride length must be 32-bit aligned, stride = %d, bytes = %d\n",
+			stride, stride_bytes);
+		return -EINVAL;
 	}
 
-	triflex_timings &= ~(0xFFFF << (16 * unit));
-	triflex_timings |= (timing << (16 * unit));
-	
-	pci_write_config_dword(dev, channel_offset, triflex_timings);
-}
+	/* IC channel's stride must be a multiple of 8 pixels */
+	if ((channel <= IDMAC_IC_13) && (stride % 8)) {
+		dev_err(ipu->dev, "Stride must be 8 pixel multiple\n");
+		return -EINVAL;
+	}
 
-static void triflex_set_pio_mode(ide_hwif_t *hwif, ide_drive_t *drive)
-{
-	drive->dma_mode = drive->pio_mode;
-	triflex_set_mode(hwif, drive);
-}
+	/* Build parameter memory data for DMA channel */
+	ipu_ch_param_set_size(&params, pixel_fmt, width, height, stride_bytes);
+	ipu_ch_param_set_buffer(&params, phyaddr_0, phyaddr_1);
+	ipu_ch_param_set_rotation(&params, rot_mode);
 
-static const struct ide_port_ops triflex_port_ops = {
-	.set_pio_mode		= triflex_set_pio_mode,
-	.set_dma_mode		= triflex_set_mode,
-};
+	spin_lock_irqsave(&ipu->lock, flags);
 
-static const struct ide_port_info triflex_device = {
-	.name		= DRV_NAME,
-	.enablebits	= {{0x80, 0x01, 0x01}, {0x80, 0x02, 0x02}},
-	.port_ops	= &triflex_port_ops,
-	.pio_mask	= ATA_PIO4,
-	.swdma_mask	= ATA_SWDMA2,
-	.mwdma_mask	= ATA_MWDMA2,
-};
+	ipu_write_param_mem(dma_param_addr(channel), (uint32_t *)&params, 10);
 
-static int triflex_init_one(struct pci_dev *dev, const struct pci_device_id *id)
-{
-	return ide_pci_init_one(dev, &triflex_device, NULL);
-}
+	reg = idmac_read_ipureg(ipu, IPU_CHA_DB_MODE_SEL);
 
-static const struct pci_device_id triflex_pci_tbl[] = {
-	{ PCI_VDEVICE(COMPAQ, PCI_DEVICE_ID_COMPAQ_TRIFLEX_IDE), 0 },
-	{ 0, },
-};
-MODULE_DEVICE_TABLE(pci, triflex_pci_tbl);
+	if (phyaddr_1)
+		reg |= 1UL << channel;
+	else
+		reg &= ~(1UL << channel);
 
-#ifdef CONFIG_PM
-static int triflex_ide_pci_suspend(struct pci_dev *dev, pm_message_t state)
-{
-	/*
-	 * We must not disable or powerdown the device.
-	 * APM bios refuses to suspend if IDE is not accessible.
-	 */
-	pci_save_state(dev);
+	idmac_write_ipureg(ipu, reg, IPU_CHA_DB_MODE_SEL);
+
+	ichan->status = IPU_CHANNEL_READY;
+
+	spin_unlock_irqrestore(&ipu->lock, flags);
+
 	return 0;
 }
-#else
-#define triflex_ide_pci_suspend NULL
-#endif
 
-static struct pci_driver triflex_pci_driver = {
-	.name		= "TRIFLEX_IDE",
-	.id_table	= triflex_pci_tbl,
-	.probe		= triflex_init_one,
-	.remove		= ide_pci_remove,
-	.suspend	= triflex_ide_pci_suspend,
-	.resume		= ide_pci_resume,
-};
-
-static int __init triflex_ide_init(void)
+/**
+ * ipu_select_buffer() - mark a channel's buffer as ready.
+ * @channel:	channel ID.
+ * @buffer_n:	buffer number to mark ready.
+ */
+static void ipu_select_buffer(enum ipu_channel channel, int buffer_n)
 {
-	return ide_pci_register_driver(&triflex_pci_driver);
+	/* No locking - this is a write-one-to-set register, cleared by IPU */
+	if (buffer_n == 0)
+		/* Mark buffer 0 as ready. */
+		idmac_write_ipureg(&ipu_data, 1UL << channel, IPU_CHA_BUF0_RDY);
+	else
+		/* Mark buffer 1 as ready. */
+		idmac_write_ipureg(&ipu_data, 1UL << channel, IPU_CHA_BUF1_RDY);
 }
 
-static void __exit triflex_ide_exit(void)
+/**
+ * ipu_update_channel_buffer() - update physical address of a channel buffer.
+ * @ichan:	IDMAC channel.
+ * @buffer_n:	buffer number to update.
+ *		0 or 1 are the only valid values.
+ * @phyaddr:	buffer physical address.
+ */
+/* Called under spin_lock(_irqsave)(&ichan->lock) */
+static void ipu_update_channel_buffer(struct idmac_channel *ichan,
+				      int buffer_n, dma_addr_t phyaddr)
 {
-	pci_unregister_driver(&triflex_pci_driver);
+	enum ipu_channel channel = ichan->dma_chan.chan_id;
+	uint32_t reg;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ipu_data.lock, flags);
+
+	if (buffer_n == 0) {
+		reg = idmac_read_ipureg(&ipu_data, IPU_CHA_BUF0_RDY);
+		if (reg & (1UL << channel)) {
+			ipu_ic_disable_task(&ipu_data, channel);
+			ichan->status = IPU_CHANNEL_READY;
+		}
+
+		/* 44.3.3.1.9 - Row Number 1 (WORD1, offset 0) */
+		idmac_write_ipureg(&ipu_data, dma_param_addr(channel) +
+				   0x0008UL, IPU_IMA_ADDR);
+		idmac_write_ipureg(&ipu_data, phyaddr, IPU_IMA_DATA);
+	} else {
+		reg = idmac_read_ipureg(&ipu_data, IPU_CHA_BUF1_RDY);
+		if (reg & (1UL << channel)) {
+			ipu_ic_disable_task(&ipu_data, channel);
+			ichan->status = IPU_CHANNEL_READY;
+		}
+
+		/* Check if double-buffering is already enabled */
+		reg = idmac_read_ipureg(&ipu_data, IPU_CHA_DB_MODE_SEL);
+
+		if (!(reg & (1UL << channel)))
+			idmac_write_ipureg(&ipu_data, reg | (1UL << channel),
+					   IPU_CHA_DB_MODE_SEL);
+
+		/* 44.3.3.1.9 - Row Number 1 (WORD1, offset 1) */
+		idmac_write_ipureg(&ipu_data, dma_param_addr(channel) +
+				   0x0009UL, IPU_IMA_ADDR);
+		idmac_write_ipureg(&ipu_data, phyaddr, IPU_IMA_DATA);
+	}
+
+	spin_unlock_irqrestore(&ipu_data.lock, flags);
 }
 
-module_init(triflex_ide_init);
-module_exit(triflex_ide_exit);
+/* Called under spin_lock_irqsave(&ichan->lock) */
+static int ipu_submit_buffer(struct idmac_channel *ichan,
+	struct idmac_tx_desc *desc, struct scatterlist *sg, int buf_idx)
+{
+	unsigned int chan_id = ichan->dma_chan.chan_id;
+	struct device *dev = &ichan->dma_chan.dev->device;
 
-MODULE_AUTHOR("Torben Mathiasen");
-MODULE_DESCRIPTION("PCI driver module for Compaq Triflex IDE");
-MODULE_LICENSE("GPL");
+	if (async_tx_test_ack(&desc->txd))
+		return -EINTR;
 
-
+	/*
+	 * On first invocation this shouldn't be necessary, the call to
+	 * ipu_init_channel_buffer() above wi

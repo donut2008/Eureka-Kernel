@@ -1,78 +1,110 @@
-#ifndef _ENTRY_H
-#define _ENTRY_H
+r16]=r30,TI_AC_STIME-TI_AC_STAMP	// update stamp
+	sub r18=r30,r19				// elapsed time in user mode
+	;;
+	add r20=r20,r22				// sum stime
+	add r21=r21,r18				// sum utime
+	;;
+	st8 [r16]=r20				// update stime
+	st8 [r17]=r21				// update utime
+	;;
+#endif
+	mov ar.rsc=0x3				// M2   set eager mode, pl 0, LE, loadrs=0
+	mov rp=r14				// I0   set the real return addr
+	and r3=_TIF_SYSCALL_TRACEAUDIT,r3	// A
+	;;
+	SSM_PSR_I(p0, p6, r22)			// M2   we're on kernel stacks now, reenable irqs
+	cmp.eq p8,p0=r3,r0			// A
+(p10)	br.cond.spnt.many ia64_ret_from_syscall	// B    return if bad call-frame or r15 is a NaT
 
-#include <linux/types.h>
-#include <linux/signal.h>
-#include <asm/ptrace.h>
-#include <asm/idle.h>
+	nop.m 0
+(p8)	br.call.sptk.many b6=b6			// B    (ignore return address)
+	br.cond.spnt ia64_trace_syscall		// B
+END(fsys_bubble_down)
 
-extern void *restart_stack;
-extern unsigned long suspend_zero_pages;
+	.rodata
+	.align 8
+	.globl fsyscall_table
 
-void system_call(void);
-void pgm_check_handler(void);
-void ext_int_handler(void);
-void io_int_handler(void);
-void mcck_int_handler(void);
-void restart_int_handler(void);
-void restart_call_handler(void);
-
-asmlinkage long do_syscall_trace_enter(struct pt_regs *regs);
-asmlinkage void do_syscall_trace_exit(struct pt_regs *regs);
-
-void do_protection_exception(struct pt_regs *regs);
-void do_dat_exception(struct pt_regs *regs);
-
-void addressing_exception(struct pt_regs *regs);
-void data_exception(struct pt_regs *regs);
-void default_trap_handler(struct pt_regs *regs);
-void divide_exception(struct pt_regs *regs);
-void execute_exception(struct pt_regs *regs);
-void hfp_divide_exception(struct pt_regs *regs);
-void hfp_overflow_exception(struct pt_regs *regs);
-void hfp_significance_exception(struct pt_regs *regs);
-void hfp_sqrt_exception(struct pt_regs *regs);
-void hfp_underflow_exception(struct pt_regs *regs);
-void illegal_op(struct pt_regs *regs);
-void operand_exception(struct pt_regs *regs);
-void overflow_exception(struct pt_regs *regs);
-void privileged_op(struct pt_regs *regs);
-void space_switch_exception(struct pt_regs *regs);
-void special_op_exception(struct pt_regs *regs);
-void specification_exception(struct pt_regs *regs);
-void transaction_exception(struct pt_regs *regs);
-void translation_exception(struct pt_regs *regs);
-void vector_exception(struct pt_regs *regs);
-
-void do_per_trap(struct pt_regs *regs);
-void do_report_trap(struct pt_regs *regs, int si_signo, int si_code, char *str);
-void syscall_trace(struct pt_regs *regs, int entryexit);
-void kernel_stack_overflow(struct pt_regs * regs);
-void do_signal(struct pt_regs *regs);
-void handle_signal32(struct ksignal *ksig, sigset_t *oldset,
-		     struct pt_regs *regs);
-void do_notify_resume(struct pt_regs *regs);
-
-void __init init_IRQ(void);
-void do_IRQ(struct pt_regs *regs, int irq);
-void do_restart(void);
-void __init startup_init(void);
-void die(struct pt_regs *regs, const char *str);
-int setup_profiling_timer(unsigned int multiplier);
-void __init time_init(void);
-int pfn_is_nosave(unsigned long);
-void s390_early_resume(void);
-unsigned long prepare_ftrace_return(unsigned long parent, unsigned long ip);
-
-struct s390_mmap_arg_struct;
-struct fadvise64_64_args;
-struct old_sigaction;
-
-long sys_rt_sigreturn(void);
-long sys_sigreturn(void);
-
-long sys_s390_personality(unsigned int personality);
-long sys_s390_runtime_instr(int command, int signum);
-long sys_s390_pci_mmio_write(unsigned long, const void __user *, size_t);
-long sys_s390_pci_mmio_read(unsigned long, void __user *, size_t);
-#endif /* _ENTRY_H */
+	data8 fsys_bubble_down
+fsyscall_table:
+	data8 fsys_ni_syscall
+	data8 0				// exit			// 1025
+	data8 0				// read
+	data8 0				// write
+	data8 0				// open
+	data8 0				// close
+	data8 0				// creat		// 1030
+	data8 0				// link
+	data8 0				// unlink
+	data8 0				// execve
+	data8 0				// chdir
+	data8 0				// fchdir		// 1035
+	data8 0				// utimes
+	data8 0				// mknod
+	data8 0				// chmod
+	data8 0				// chown
+	data8 0				// lseek		// 1040
+	data8 fsys_getpid		// getpid
+	data8 0				// getppid
+	data8 0				// mount
+	data8 0				// umount
+	data8 0				// setuid		// 1045
+	data8 0				// getuid
+	data8 0				// geteuid
+	data8 0				// ptrace
+	data8 0				// access
+	data8 0				// sync			// 1050
+	data8 0				// fsync
+	data8 0				// fdatasync
+	data8 0				// kill
+	data8 0				// rename
+	data8 0				// mkdir		// 1055
+	data8 0				// rmdir
+	data8 0				// dup
+	data8 0				// pipe
+	data8 0				// times
+	data8 0				// brk			// 1060
+	data8 0				// setgid
+	data8 0				// getgid
+	data8 0				// getegid
+	data8 0				// acct
+	data8 0				// ioctl		// 1065
+	data8 0				// fcntl
+	data8 0				// umask
+	data8 0				// chroot
+	data8 0				// ustat
+	data8 0				// dup2			// 1070
+	data8 0				// setreuid
+	data8 0				// setregid
+	data8 0				// getresuid
+	data8 0				// setresuid
+	data8 0				// getresgid		// 1075
+	data8 0				// setresgid
+	data8 0				// getgroups
+	data8 0				// setgroups
+	data8 0				// getpgid
+	data8 0				// setpgid		// 1080
+	data8 0				// setsid
+	data8 0				// getsid
+	data8 0				// sethostname
+	data8 0				// setrlimit
+	data8 0				// getrlimit		// 1085
+	data8 0				// getrusage
+	data8 fsys_gettimeofday		// gettimeofday
+	data8 0				// settimeofday
+	data8 0				// select
+	data8 0				// poll			// 1090
+	data8 0				// symlink
+	data8 0				// readlink
+	data8 0				// uselib
+	data8 0				// swapon
+	data8 0				// swapoff		// 1095
+	data8 0				// reboot
+	data8 0				// truncate
+	data8 0				// ftruncate
+	data8 0				// fchmod
+	data8 0				// fchown		// 1100
+	data8 0				// getpriority
+	data8 0				// setpriority
+	data8 0				// statfs
+	data8 0	

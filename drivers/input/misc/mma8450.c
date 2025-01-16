@@ -1,238 +1,241 @@
-/*
- *  Driver for Freescale's 3-Axis Accelerometer MMA8450
- *
- *  Copyright (C) 2011 Freescale Semiconductor, Inc. All Rights Reserved.
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
+efine TC300K_MODE_GLOVE		(1 << 4)
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/delay.h>
-#include <linux/i2c.h>
-#include <linux/input-polldev.h>
-#include <linux/of_device.h>
+/* connecter check */
+#define SUB_DET_DISABLE			0
+#define SUB_DET_ENABLE_CON_OFF	1
+#define SUB_DET_ENABLE_CON_ON	2
 
-#define MMA8450_DRV_NAME	"mma8450"
+/* firmware */
+#define TC300K_FW_PATH_SDCARD	"/sdcard/tc300k.bin"
 
-#define MODE_CHANGE_DELAY_MS	100
-#define POLL_INTERVAL		100
-#define POLL_INTERVAL_MAX	500
+#define TK_UPDATE_PASS		0
+#define TK_UPDATE_DOWN		1
+#define TK_UPDATE_FAIL		2
 
-/* register definitions */
-#define MMA8450_STATUS		0x00
-#define MMA8450_STATUS_ZXYDR	0x08
+/* ISP command */
+#define TC300K_CSYNC1			0xA3
+#define TC300K_CSYNC2			0xAC
+#define TC300K_CSYNC3			0xA5
+#define TC300K_CCFG				0x92
+#define TC300K_PRDATA			0x81
+#define TC300K_PEDATA			0x82
+#define TC300K_PWDATA			0x83
+#define TC300K_PECHIP			0x8A
+#define TC300K_PEDISC			0xB0
+#define TC300K_LDDATA			0xB2
+#define TC300K_LDMODE			0xB8
+#define TC300K_RDDATA			0xB9
+#define TC300K_PCRST			0xB4
+#define TC300K_PCRED			0xB5
+#define TC300K_PCINC			0xB6
+#define TC300K_RDPCH			0xBD
 
-#define MMA8450_OUT_X8		0x01
-#define MMA8450_OUT_Y8		0x02
-#define MMA8450_OUT_Z8		0x03
+/* ISP delay */
+#define TC300K_TSYNC1			300	/* us */
+#define TC300K_TSYNC2			50	/* 1ms~50ms */
+#define TC300K_TSYNC3			100	/* us */
+#define TC300K_TDLY1			1	/* us */
+#define TC300K_TDLY2			2	/* us */
+#define TC300K_TFERASE			10	/* ms */
+#define TC300K_TPROG			20	/* us */
 
-#define MMA8450_OUT_X_LSB	0x05
-#define MMA8450_OUT_X_MSB	0x06
-#define MMA8450_OUT_Y_LSB	0x07
-#define MMA8450_OUT_Y_MSB	0x08
-#define MMA8450_OUT_Z_LSB	0x09
-#define MMA8450_OUT_Z_MSB	0x0a
+#define TC300K_CHECKSUM_DELAY	500
 
-#define MMA8450_XYZ_DATA_CFG	0x16
-
-#define MMA8450_CTRL_REG1	0x38
-#define MMA8450_CTRL_REG2	0x39
-
-/* mma8450 status */
-struct mma8450 {
-	struct i2c_client	*client;
-	struct input_polled_dev	*idev;
+enum {
+	FW_INKERNEL,
+	FW_SDCARD,
 };
 
-static int mma8450_read(struct mma8450 *m, unsigned off)
+struct fw_image {
+	u8 hdr_ver;
+	u8 hdr_len;
+	u16 first_fw_ver;
+	u16 second_fw_ver;
+	u16 third_ver;
+	u32 fw_len;
+	u16 checksum;
+	u16 alignment_dummy;
+	u8 data[0];
+} __attribute__ ((packed));
+
+#define TSK_RELEASE			0x00
+#define TSK_PRESS			0x01
+#define GRIP_RELEASE			0x00
+#define GRIP_PRESS			0x01
+
+struct tsk_event_val {
+	u16 tsk_bitmap;
+	u8 tsk_status;
+	int tsk_keycode;
+	char* tsk_keyname;
+};
+
+#ifdef FEATURE_GRIP_FOR_SAR
+struct grip_event_val {
+	u16 grip_bitmap;
+	u8 grip_status;
+	int grip_code;
+	char* grip_name;
+};
+#endif
+
+struct tsk_event_val tsk_ev_old[8] =
 {
-	struct i2c_client *c = m->client;
-	int ret;
+	{0x01, TSK_PRESS, KEY_BACK, "back"},
+	{0x02, TSK_PRESS, KEY_RECENT, "recent"},
+	{0x03, TSK_PRESS, KEY_DUMMY_BACK, "dummy_back"},
+	{0x04, TSK_PRESS, KEY_DUMMY_MENU, "dummy_menu"},
+	{0x09, TSK_RELEASE, KEY_BACK, "back"},
+	{0x0A, TSK_RELEASE, KEY_RECENT, "recent"},
+	{0x0B, TSK_RELEASE, KEY_DUMMY_BACK, "dummy_back"},
+	{0x0C, TSK_RELEASE, KEY_DUMMY_MENU, "dummy_menu"}
+};
 
-	ret = i2c_smbus_read_byte_data(c, off);
-	if (ret < 0)
-		dev_err(&c->dev,
-			"failed to read register 0x%02x, error %d\n",
-			off, ret);
+#ifdef FEATURE_GRIP_FOR_SAR
+struct grip_event_val grip_ev[4] =
+{
+	{0x01 << 0, GRIP_PRESS, KEY_CP_GRIP, "grip1"},
+	{0x01 << 1, GRIP_PRESS, KEY_CP_GRIP, "grip2"},
+	{0x01 << 4, GRIP_RELEASE, KEY_CP_GRIP, "grip1"},
+	{0x01 << 5, GRIP_RELEASE, KEY_CP_GRIP, "grip2"},
+};
+#endif
 
-	return ret;
+struct tsk_event_val tsk_ev[4] =
+{
+	{0x01 << 0, TSK_PRESS, KEY_RECENT, "recent"},
+	{0x01 << 1, TSK_PRESS, KEY_BACK, "back"},
+	{0x01 << 4, TSK_RELEASE, KEY_RECENT, "recent"},
+	{0x01 << 5, TSK_RELEASE, KEY_BACK, "back"}
+};
+
+
+struct tsk_event_val tsk_ev_swap[4] =
+{
+	{0x01 << 0, TSK_PRESS, KEY_BACK, "back"},
+	{0x01 << 1, TSK_PRESS, KEY_RECENT, "recent"},
+	{0x01 << 4, TSK_RELEASE, KEY_BACK, "back"},
+	{0x01 << 5, TSK_RELEASE, KEY_RECENT, "recent"}
+};
+
+struct tc300k_data {
+	struct device *sec_touchkey;
+	struct i2c_client *client;
+	struct input_dev *input_dev;
+	struct tc300k_platform_data *pdata;
+	struct mutex lock;
+	struct mutex lock_fac;
+#ifdef CONFIG_HAS_EARLYSUSPEND
+	struct early_suspend early_suspend;
+#endif
+	struct fw_image *fw_img;
+	const struct firmware *fw;
+	char phys[32];
+	int irq;
+	u16 checksum;
+	u16 threhold;
+	int mode;
+	int (*power) (bool on);
+	u8 fw_ver;
+	u8 fw_ver_bin;
+	u8 md_ver;
+	u8 md_ver_bin;
+	u8 fw_update_status;
+	bool enabled;
+	bool fw_downloding;
+	bool glove_mode;
+	bool led_on;
+	bool flip_mode;
+
+	int key_num;
+	struct tsk_event_val *tsk_ev_val;
+
+	struct pinctrl *pinctrl_i2c;
+	struct pinctrl *pinctrl_irq;
+	struct pinctrl_state *pin_state[4];
+
+#ifdef FEATURE_GRIP_FOR_SAR
+	struct wake_lock touchkey_wake_lock;
+	u16 grip_p_thd;
+	u16 grip_r_thd;
+	u16 grip_n_thd;
+	u16 grip_s1;
+	u16 grip_s2;
+	u16 grip_baseline;
+	u16 grip_raw1;
+	u16 grip_raw2;
+	u16 grip_event;
+	bool sar_mode;
+	bool sar_enable;
+	bool sar_enable_off;
+	struct delayed_work debug_work;
+	//struct completion resume_done;
+	//bool is_lpm_suspend;
+
+	int grip_num;
+	struct grip_event_val *grip_ev_val;
+	int irq_count;
+	int abnormal_mode;
+	s32 diff;
+	s32 max_diff;
+
+#if defined (CONFIG_VBUS_NOTIFIER)
+	struct notifier_block vbus_nb;
+#endif
+#endif
+};
+
+extern struct class *sec_class;
+
+char *str_states[] = {"on_irq", "off_irq", "on_i2c", "off_i2c"};
+enum {
+	I_STATE_ON_IRQ = 0,
+	I_STATE_OFF_IRQ,
+	I_STATE_ON_I2C,
+	I_STATE_OFF_I2C,
+};
+
+static bool tc300k_power_enabled;
+static bool tc300k_keyled_enabled;
+const char *regulator_ic;
+const char *regulator_led;
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void tc300k_early_suspend(struct early_suspend *h);
+static void tc300k_late_resume(struct early_suspend *h);
+#endif
+
+static void tc300k_input_close(struct input_dev *dev);
+static int tc300k_input_open(struct input_dev *dev);
+static int tc300_pinctrl_init(struct tc300k_data *data);
+static void tc300_config_gpio_i2c(struct tc300k_data *data, int onoff);
+static int tc300_pinctrl(struct tc300k_data *data, int status);
+static int read_tc350k_register_data(struct tc300k_data *data, int read_key_num, int read_offset);
+static int tc300k_mode_enable(struct i2c_client *client, u8 cmd);
+
+static int tc300k_mode_check(struct i2c_client *client)
+{
+	int mode = i2c_smbus_read_byte_data(client, TC300K_MODE);
+	if (mode < 0)
+		input_err(true, &client->dev, "%s: failed to read mode (%d)\n",
+			__func__, mode);
+
+	return mode;
 }
 
-static int mma8450_write(struct mma8450 *m, unsigned off, u8 v)
-{
-	struct i2c_client *c = m->client;
-	int error;
+#ifdef FEATURE_GRIP_FOR_SAR
 
-	error = i2c_smbus_write_byte_data(c, off, v);
-	if (error < 0) {
-		dev_err(&c->dev,
-			"failed to write to register 0x%02x, error %d\n",
-			off, error);
-		return error;
+static void tc300k_set_debug_work(struct tc300k_data *data, u8 enable,
+		unsigned int time_ms)
+{
+	if (enable == true) {
+		schedule_delayed_work(&data->debug_work,
+			msecs_to_jiffies(time_ms));
+	} else {
+		cancel_delayed_work_sync(&data->debug_work);
 	}
-
-	return 0;
 }
 
-static int mma8450_read_block(struct mma8450 *m, unsigned off,
-			      u8 *buf, size_t size)
+static void tc300k_debug_work_func(struct work_struct *work)
 {
-	struct i2c_client *c = m->client;
-	int err;
-
-	err = i2c_smbus_read_i2c_block_data(c, off, size, buf);
-	if (err < 0) {
-		dev_err(&c->dev,
-			"failed to read block data at 0x%02x, error %d\n",
-			MMA8450_OUT_X_LSB, err);
-		return err;
-	}
-
-	return 0;
-}
-
-static void mma8450_poll(struct input_polled_dev *dev)
-{
-	struct mma8450 *m = dev->private;
-	int x, y, z;
-	int ret;
-	u8 buf[6];
-
-	ret = mma8450_read(m, MMA8450_STATUS);
-	if (ret < 0)
-		return;
-
-	if (!(ret & MMA8450_STATUS_ZXYDR))
-		return;
-
-	ret = mma8450_read_block(m, MMA8450_OUT_X_LSB, buf, sizeof(buf));
-	if (ret < 0)
-		return;
-
-	x = ((int)(s8)buf[1] << 4) | (buf[0] & 0xf);
-	y = ((int)(s8)buf[3] << 4) | (buf[2] & 0xf);
-	z = ((int)(s8)buf[5] << 4) | (buf[4] & 0xf);
-
-	input_report_abs(dev->input, ABS_X, x);
-	input_report_abs(dev->input, ABS_Y, y);
-	input_report_abs(dev->input, ABS_Z, z);
-	input_sync(dev->input);
-}
-
-/* Initialize the MMA8450 chip */
-static void mma8450_open(struct input_polled_dev *dev)
-{
-	struct mma8450 *m = dev->private;
-	int err;
-
-	/* enable all events from X/Y/Z, no FIFO */
-	err = mma8450_write(m, MMA8450_XYZ_DATA_CFG, 0x07);
-	if (err)
-		return;
-
-	/*
-	 * Sleep mode poll rate - 50Hz
-	 * System output data rate - 400Hz
-	 * Full scale selection - Active, +/- 2G
-	 */
-	err = mma8450_write(m, MMA8450_CTRL_REG1, 0x01);
-	if (err < 0)
-		return;
-
-	msleep(MODE_CHANGE_DELAY_MS);
-}
-
-static void mma8450_close(struct input_polled_dev *dev)
-{
-	struct mma8450 *m = dev->private;
-
-	mma8450_write(m, MMA8450_CTRL_REG1, 0x00);
-	mma8450_write(m, MMA8450_CTRL_REG2, 0x01);
-}
-
-/*
- * I2C init/probing/exit functions
- */
-static int mma8450_probe(struct i2c_client *c,
-			 const struct i2c_device_id *id)
-{
-	struct input_polled_dev *idev;
-	struct mma8450 *m;
-	int err;
-
-	m = devm_kzalloc(&c->dev, sizeof(*m), GFP_KERNEL);
-	if (!m)
-		return -ENOMEM;
-
-	idev = devm_input_allocate_polled_device(&c->dev);
-	if (!idev)
-		return -ENOMEM;
-
-	m->client = c;
-	m->idev = idev;
-
-	idev->private		= m;
-	idev->input->name	= MMA8450_DRV_NAME;
-	idev->input->id.bustype	= BUS_I2C;
-	idev->poll		= mma8450_poll;
-	idev->poll_interval	= POLL_INTERVAL;
-	idev->poll_interval_max	= POLL_INTERVAL_MAX;
-	idev->open		= mma8450_open;
-	idev->close		= mma8450_close;
-
-	__set_bit(EV_ABS, idev->input->evbit);
-	input_set_abs_params(idev->input, ABS_X, -2048, 2047, 32, 32);
-	input_set_abs_params(idev->input, ABS_Y, -2048, 2047, 32, 32);
-	input_set_abs_params(idev->input, ABS_Z, -2048, 2047, 32, 32);
-
-	err = input_register_polled_device(idev);
-	if (err) {
-		dev_err(&c->dev, "failed to register polled input device\n");
-		return err;
-	}
-
-	i2c_set_clientdata(c, m);
-
-	return 0;
-}
-
-static const struct i2c_device_id mma8450_id[] = {
-	{ MMA8450_DRV_NAME, 0 },
-	{ },
-};
-MODULE_DEVICE_TABLE(i2c, mma8450_id);
-
-static const struct of_device_id mma8450_dt_ids[] = {
-	{ .compatible = "fsl,mma8450", },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, mma8450_dt_ids);
-
-static struct i2c_driver mma8450_driver = {
-	.driver = {
-		.name	= MMA8450_DRV_NAME,
-		.of_match_table = mma8450_dt_ids,
-	},
-	.probe		= mma8450_probe,
-	.id_table	= mma8450_id,
-};
-
-module_i2c_driver(mma8450_driver);
-
-MODULE_AUTHOR("Freescale Semiconductor, Inc.");
-MODULE_DESCRIPTION("MMA8450 3-Axis Accelerometer Driver");
-MODULE_LICENSE("GPL");
+	struct tc300k_data *data = container_of((struct

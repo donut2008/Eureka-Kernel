@@ -1,11 +1,2 @@
-obj-$(CONFIG_FIMC_IS_V3_1_1) += setup-fimc-is.o
-obj-$(CONFIG_FIMC_IS_V3_1_1) += setup-fimc-is-sensor.o
-obj-$(CONFIG_FIMC_IS_V3_1_1) += setup-fimc-is-preprocessor.o
-obj-$(CONFIG_FIMC_IS_V3_1_1) += fimc-is-hw-pwr.o
-obj-$(CONFIG_FIMC_IS_V3_1_1) += fimc-is-hw-chain.o
-ifeq ($(CONFIG_PM_DEVFREQ),y)
-obj-$(CONFIG_FIMC_IS_V3_1_1) += fimc-is-hw-dvfs.o
-endif
-
-EXTRA_CFLAGS += -Idrivers/media/platform/exynos/fimc-legacy
-EXTRA_CFLAGS += -Idrivers/media/platform/exynos/fimc-legacy/include
+QQ	QQÜQ‡RˆR‰RRŠRğR²S.V;V9V2V?V4V)VSVNVWVtV6V/V0V€XŸXX³XœX®X©X¦XmY	[ûZ[õZ[[î[ì[é[ë[d\e\]”]b^_^a^â^Ú^ß^İ^ã^à^H_q_·_µ_vagana]aUa‚aşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ|apaka~a§aa«aa¬aša¤a”a®a.bidodydd²dˆdd°d¥d“d•d©d’d®d­d«dšd¬d™d¢d³duewexe®f«f´f±f#jjèijjjıi!jj
+jóijjíijPkNk¤kÅkÆk?o|o„oQofoTo†omo[oxonoozopodo—oXoÕnoo`o_oŸq¬q±q¨qVr›rNsWsit‹tƒt~t€tu v)vv$v&v!v"všvºvävw‡wŒw‘w‹wËxÅxºxÊx¾xÕx¼xĞx?z<z@z=z7z;z¯z®z­{±{Ä{´{Æ{Ç{Á{ {Ì{Ê

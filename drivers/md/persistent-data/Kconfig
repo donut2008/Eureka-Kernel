@@ -1,18 +1,12 @@
-config DM_PERSISTENT_DATA
-       tristate
-       depends on BLK_DEV_DM
-       select LIBCRC32C
-       select DM_BUFIO
-       ---help---
-	 Library providing immutable on-disk data structure support for
-	 device-mapper targets such as the thin provisioning target.
-
-config DM_DEBUG_BLOCK_STACK_TRACING
-       bool "Keep stack trace of persistent data block lock holders"
-       depends on STACKTRACE_SUPPORT && DM_PERSISTENT_DATA
-       select STACKTRACE
-       ---help---
-	 Enable this for messages that may help debug problems with the
-	 block manager locking used by thin provisioning and caching.
-
-	 If unsure, say N.
+RE_READ_ADDR__RESERVED_MASK 0xfffffc00
+#define TE1_TEMPERATURE_READ_ADDR__RESERVED__SHIFT 0xa
+#define TE2_TEMPERATURE_READ_ADDR__CSR_ADDR_MASK 0x3f
+#define TE2_TEMPERATURE_READ_ADDR__CSR_ADDR__SHIFT 0x0
+#define TE2_TEMPERATURE_READ_ADDR__TCEN_ID_MASK 0x3c0
+#define TE2_TEMPERATURE_READ_ADDR__TCEN_ID__SHIFT 0x6
+#define TE2_TEMPERATURE_READ_ADDR__RESERVED_MASK 0xfffffc00
+#define TE2_TEMPERATURE_READ_ADDR__RESERVED__SHIFT 0xa
+#define NB_DPM_CONFIG_1__Dpm0PgNbPsLo_MASK 0xff
+#define NB_DPM_CONFIG_1__Dpm0PgNbPsLo__SHIFT 0x0
+#define NB_DPM_CONFIG_1__Dpm0PgNbPsHi_MASK 0xff00
+#define NB_DPM_CONFIG_1__Dpm0PgNbPsHi__SHIFT 0x

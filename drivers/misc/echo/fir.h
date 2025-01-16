@@ -1,216 +1,100 @@
-/*
- * SpanDSP - a series of DSP components for telephony
- *
- * fir.h - General telephony FIR routines
- *
- * Written by Steve Underwood <steveu@coppice.org>
- *
- * Copyright (C) 2002 Steve Underwood
- *
- * All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2, as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if !defined(_FIR_H_)
-#define _FIR_H_
-
-/*
-   Blackfin NOTES & IDEAS:
-
-   A simple dot product function is used to implement the filter.  This performs
-   just one MAC/cycle which is inefficient but was easy to implement as a first
-   pass.  The current Blackfin code also uses an unrolled form of the filter
-   history to avoid 0 length hardware loop issues.  This is wasteful of
-   memory.
-
-   Ideas for improvement:
-
-   1/ Rewrite filter for dual MAC inner loop.  The issue here is handling
-   history sample offsets that are 16 bit aligned - the dual MAC needs
-   32 bit aligmnent.  There are some good examples in libbfdsp.
-
-   2/ Use the hardware circular buffer facility tohalve memory usage.
-
-   3/ Consider using internal memory.
-
-   Using less memory might also improve speed as cache misses will be
-   reduced. A drop in MIPs and memory approaching 50% should be
-   possible.
-
-   The foreground and background filters currenlty use a total of
-   about 10 MIPs/ch as measured with speedtest.c on a 256 TAP echo
-   can.
-*/
-
-/*
- * 16 bit integer FIR descriptor. This defines the working state for a single
- * instance of an FIR filter using 16 bit integer coefficients.
- */
-struct fir16_state_t {
-	int taps;
-	int curr_pos;
-	const int16_t *coeffs;
-	int16_t *history;
-};
-
-/*
- * 32 bit integer FIR descriptor. This defines the working state for a single
- * instance of an FIR filter using 32 bit integer coefficients, and filtering
- * 16 bit integer data.
- */
-struct fir32_state_t {
-	int taps;
-	int curr_pos;
-	const int32_t *coeffs;
-	int16_t *history;
-};
-
-/*
- * Floating point FIR descriptor. This defines the working state for a single
- * instance of an FIR filter using floating point coefficients and data.
- */
-struct fir_float_state_t {
-	int taps;
-	int curr_pos;
-	const float *coeffs;
-	float *history;
-};
-
-static inline const int16_t *fir16_create(struct fir16_state_t *fir,
-					      const int16_t *coeffs, int taps)
-{
-	fir->taps = taps;
-	fir->curr_pos = taps - 1;
-	fir->coeffs = coeffs;
-#if defined(__bfin__)
-	fir->history = kcalloc(2 * taps, sizeof(int16_t), GFP_KERNEL);
-#else
-	fir->history = kcalloc(taps, sizeof(int16_t), GFP_KERNEL);
-#endif
-	return fir->history;
-}
-
-static inline void fir16_flush(struct fir16_state_t *fir)
-{
-#if defined(__bfin__)
-	memset(fir->history, 0, 2 * fir->taps * sizeof(int16_t));
-#else
-	memset(fir->history, 0, fir->taps * sizeof(int16_t));
-#endif
-}
-
-static inline void fir16_free(struct fir16_state_t *fir)
-{
-	kfree(fir->history);
-}
-
-#ifdef __bfin__
-static inline int32_t dot_asm(short *x, short *y, int len)
-{
-	int dot;
-
-	len--;
-
-	__asm__("I0 = %1;\n\t"
-		"I1 = %2;\n\t"
-		"A0 = 0;\n\t"
-		"R0.L = W[I0++] || R1.L = W[I1++];\n\t"
-		"LOOP dot%= LC0 = %3;\n\t"
-		"LOOP_BEGIN dot%=;\n\t"
-		"A0 += R0.L * R1.L (IS) || R0.L = W[I0++] || R1.L = W[I1++];\n\t"
-		"LOOP_END dot%=;\n\t"
-		"A0 += R0.L*R1.L (IS);\n\t"
-		"R0 = A0;\n\t"
-		"%0 = R0;\n\t"
-		: "=&d"(dot)
-		: "a"(x), "a"(y), "a"(len)
-		: "I0", "I1", "A1", "A0", "R0", "R1"
-	);
-
-	return dot;
-}
-#endif
-
-static inline int16_t fir16(struct fir16_state_t *fir, int16_t sample)
-{
-	int32_t y;
-#if defined(__bfin__)
-	fir->history[fir->curr_pos] = sample;
-	fir->history[fir->curr_pos + fir->taps] = sample;
-	y = dot_asm((int16_t *) fir->coeffs, &fir->history[fir->curr_pos],
-		    fir->taps);
-#else
-	int i;
-	int offset1;
-	int offset2;
-
-	fir->history[fir->curr_pos] = sample;
-
-	offset2 = fir->curr_pos;
-	offset1 = fir->taps - offset2;
-	y = 0;
-	for (i = fir->taps - 1; i >= offset1; i--)
-		y += fir->coeffs[i] * fir->history[i - offset1];
-	for (; i >= 0; i--)
-		y += fir->coeffs[i] * fir->history[i + offset2];
-#endif
-	if (fir->curr_pos <= 0)
-		fir->curr_pos = fir->taps;
-	fir->curr_pos--;
-	return (int16_t) (y >> 15);
-}
-
-static inline const int16_t *fir32_create(struct fir32_state_t *fir,
-					      const int32_t *coeffs, int taps)
-{
-	fir->taps = taps;
-	fir->curr_pos = taps - 1;
-	fir->coeffs = coeffs;
-	fir->history = kcalloc(taps, sizeof(int16_t), GFP_KERNEL);
-	return fir->history;
-}
-
-static inline void fir32_flush(struct fir32_state_t *fir)
-{
-	memset(fir->history, 0, fir->taps * sizeof(int16_t));
-}
-
-static inline void fir32_free(struct fir32_state_t *fir)
-{
-	kfree(fir->history);
-}
-
-static inline int16_t fir32(struct fir32_state_t *fir, int16_t sample)
-{
-	int i;
-	int32_t y;
-	int offset1;
-	int offset2;
-
-	fir->history[fir->curr_pos] = sample;
-	offset2 = fir->curr_pos;
-	offset1 = fir->taps - offset2;
-	y = 0;
-	for (i = fir->taps - 1; i >= offset1; i--)
-		y += fir->coeffs[i] * fir->history[i - offset1];
-	for (; i >= 0; i--)
-		y += fir->coeffs[i] * fir->history[i + offset2];
-	if (fir->curr_pos <= 0)
-		fir->curr_pos = fir->taps;
-	fir->curr_pos--;
-	return (int16_t) (y >> 15);
-}
-
-#endif
+GE_REQ_CAPACITY__OUTSTAND_PAGE_REQ_CAPACITY__SHIFT 0x0
+#define PCIE_OUTSTAND_PAGE_REQ_ALLOC__OUTSTAND_PAGE_REQ_ALLOC_MASK 0xffffffff
+#define PCIE_OUTSTAND_PAGE_REQ_ALLOC__OUTSTAND_PAGE_REQ_ALLOC__SHIFT 0x0
+#define PCIE_PASID_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_PASID_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_PASID_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_PASID_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_PASID_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_PASID_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_PASID_CAP__PASID_EXE_PERMISSION_SUPPORTED_MASK 0x2
+#define PCIE_PASID_CAP__PASID_EXE_PERMISSION_SUPPORTED__SHIFT 0x1
+#define PCIE_PASID_CAP__PASID_PRIV_MODE_SUPPORTED_MASK 0x4
+#define PCIE_PASID_CAP__PASID_PRIV_MODE_SUPPORTED__SHIFT 0x2
+#define PCIE_PASID_CAP__MAX_PASID_WIDTH_MASK 0x1f00
+#define PCIE_PASID_CAP__MAX_PASID_WIDTH__SHIFT 0x8
+#define PCIE_PASID_CNTL__PASID_ENABLE_MASK 0x1
+#define PCIE_PASID_CNTL__PASID_ENABLE__SHIFT 0x0
+#define PCIE_PASID_CNTL__PASID_EXE_PERMISSION_ENABLE_MASK 0x2
+#define PCIE_PASID_CNTL__PASID_EXE_PERMISSION_ENABLE__SHIFT 0x1
+#define PCIE_PASID_CNTL__PASID_PRIV_MODE_SUPPORTED_ENABLE_MASK 0x4
+#define PCIE_PASID_CNTL__PASID_PRIV_MODE_SUPPORTED_ENABLE__SHIFT 0x2
+#define PCIE_TPH_REQR_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_TPH_REQR_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_TPH_REQR_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_TPH_REQR_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_TPH_REQR_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_TPH_REQR_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_TPH_REQR_CAP__TPH_REQR_NO_ST_MODE_SUPPORTED_MASK 0x1
+#define PCIE_TPH_REQR_CAP__TPH_REQR_NO_ST_MODE_SUPPORTED__SHIFT 0x0
+#define PCIE_TPH_REQR_CAP__TPH_REQR_INT_VEC_MODE_SUPPORTED_MASK 0x2
+#define PCIE_TPH_REQR_CAP__TPH_REQR_INT_VEC_MODE_SUPPORTED__SHIFT 0x1
+#define PCIE_TPH_REQR_CAP__TPH_REQR_DEV_SPC_MODE_SUPPORTED_MASK 0x4
+#define PCIE_TPH_REQR_CAP__TPH_REQR_DEV_SPC_MODE_SUPPORTED__SHIFT 0x2
+#define PCIE_TPH_REQR_CAP__TPH_REQR_EXTND_TPH_REQR_SUPPORED_MASK 0x100
+#define PCIE_TPH_REQR_CAP__TPH_REQR_EXTND_TPH_REQR_SUPPORED__SHIFT 0x8
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_LOCATION_MASK 0x600
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_LOCATION__SHIFT 0x9
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_SIZE_MASK 0x7ff0000
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_SIZE__SHIFT 0x10
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_ST_MODE_SEL_MASK 0x7
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_ST_MODE_SEL__SHIFT 0x0
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_EN_MASK 0x300
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_EN__SHIFT 0x8
+#define PCIE_MC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_MC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_MC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_MC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_MC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_MC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_MC_CAP__MC_MAX_GROUP_MASK 0x3f
+#define PCIE_MC_CAP__MC_MAX_GROUP__SHIFT 0x0
+#define PCIE_MC_CAP__MC_WIN_SIZE_REQ_MASK 0x3f00
+#define PCIE_MC_CAP__MC_WIN_SIZE_REQ__SHIFT 0x8
+#define PCIE_MC_CAP__MC_ECRC_REGEN_SUPP_MASK 0x8000
+#define PCIE_MC_CAP__MC_ECRC_REGEN_SUPP__SHIFT 0xf
+#define PCIE_MC_CNTL__MC_NUM_GROUP_MASK 0x3f
+#define PCIE_MC_CNTL__MC_NUM_GROUP__SHIFT 0x0
+#define PCIE_MC_CNTL__MC_ENABLE_MASK 0x8000
+#define PCIE_MC_CNTL__MC_ENABLE__SHIFT 0xf
+#define PCIE_MC_ADDR0__MC_INDEX_POS_MASK 0x3f
+#define PCIE_MC_ADDR0__MC_INDEX_POS__SHIFT 0x0
+#define PCIE_MC_ADDR0__MC_BASE_ADDR_0_MASK 0xfffff000
+#define PCIE_MC_ADDR0__MC_BASE_ADDR_0__SHIFT 0xc
+#define PCIE_MC_ADDR1__MC_BASE_ADDR_1_MASK 0xffffffff
+#define PCIE_MC_ADDR1__MC_BASE_ADDR_1__SHIFT 0x0
+#define PCIE_MC_RCV0__MC_RECEIVE_0_MASK 0xffffffff
+#define PCIE_MC_RCV0__MC_RECEIVE_0__SHIFT 0x0
+#define PCIE_MC_RCV1__MC_RECEIVE_1_MASK 0xffffffff
+#define PCIE_MC_RCV1__MC_RECEIVE_1__SHIFT 0x0
+#define PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0_MASK 0xffffffff
+#define PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0__SHIFT 0x0
+#define PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1_MASK 0xffffffff
+#define PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1__SHIFT 0x0
+#define PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0_MASK 0xffffffff
+#define PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0__SHIFT 0x0
+#define PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1_MASK 0xffffffff
+#define PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1__SHIFT 0x0
+#define PCIE_LTR_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_LTR_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_LTR_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_LTR_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_LTR_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_LTR_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_LTR_CAP__LTR_MAX_S_LATENCY_VALUE_MASK 0x3ff
+#define PCIE_LTR_CAP__LTR_MAX_S_LATENCY_VALUE__SHIFT 0x0
+#define PCIE_LTR_CAP__LTR_MAX_S_LATENCY_SCALE_MASK 0x1c00
+#define PCIE_LTR_CAP__LTR_MAX_S_LATENCY_SCALE__SHIFT 0xa
+#define PCIE_LTR_CAP__LTR_MAX_NS_LATENCY_VALUE_MASK 0x3ff0000
+#define PCIE_LTR_CAP__LTR_MAX_NS_LATENCY_VALUE__SHIFT 0x10
+#define PCIE_LTR_CAP__LTR_MAX_NS_LATENCY_SCALE_MASK 0x1c000000
+#define PCIE_LTR_CAP__LTR_MAX_NS_LATENCY_SCALE__SHIFT 0x1a
+#define PCIE_INDEX__PCIE_INDEX_MASK 0xffffffff
+#define PCIE_INDEX__PCIE_INDEX__SHIFT 0x0
+#define PCIE_DATA__PCIE_DATA_MASK 0xffffffff
+#define PCIE_DATA__PCIE_DATA__SHIFT 0x0
+#define PCIE_INDEX_2__PCIE_INDEX_MASK 0xffffffff
+#define PCIE_INDEX_2__PCIE_INDEX__SHIFT 0x0
+#define PCIE_DATA_2__PCIE_DATA_MASK 0xffffffff
+#define PCIE_DATA_2__PCIE_DATA__SHIFT 0x0
+#define P

@@ -1,199 +1,109 @@
-/*
- * RapidIO Tsi568 switch support
- *
- * Copyright 2009-2010 Integrated Device Technology, Inc.
- * Alexandre Bounine <alexandre.bounine@idt.com>
- *  - Added EM support
- *  - Modified switch operations initialization.
- *
- * Copyright 2005 MontaVista Software, Inc.
- * Matt Porter <mporter@kernel.crashing.org>
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
- */
-
-#include <linux/rio.h>
-#include <linux/rio_drv.h>
-#include <linux/rio_ids.h>
-#include <linux/delay.h>
-#include <linux/module.h>
-#include "../rio.h"
-
-/* Global (broadcast) route registers */
-#define SPBC_ROUTE_CFG_DESTID	0x10070
-#define SPBC_ROUTE_CFG_PORT	0x10074
-
-/* Per port route registers */
-#define SPP_ROUTE_CFG_DESTID(n)	(0x11070 + 0x100*n)
-#define SPP_ROUTE_CFG_PORT(n)	(0x11074 + 0x100*n)
-
-#define TSI568_SP_MODE(n)	(0x11004 + 0x100*n)
-#define  TSI568_SP_MODE_PW_DIS	0x08000000
-
-static int
-tsi568_route_add_entry(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table, u16 route_destid, u8 route_port)
-{
-	if (table == RIO_GLOBAL_TABLE) {
-		rio_mport_write_config_32(mport, destid, hopcount,
-					SPBC_ROUTE_CFG_DESTID, route_destid);
-		rio_mport_write_config_32(mport, destid, hopcount,
-					SPBC_ROUTE_CFG_PORT, route_port);
-	} else {
-		rio_mport_write_config_32(mport, destid, hopcount,
-					SPP_ROUTE_CFG_DESTID(table),
-					route_destid);
-		rio_mport_write_config_32(mport, destid, hopcount,
-					SPP_ROUTE_CFG_PORT(table), route_port);
-	}
-
-	udelay(10);
-
-	return 0;
-}
-
-static int
-tsi568_route_get_entry(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table, u16 route_destid, u8 *route_port)
-{
-	int ret = 0;
-	u32 result;
-
-	if (table == RIO_GLOBAL_TABLE) {
-		rio_mport_write_config_32(mport, destid, hopcount,
-					SPBC_ROUTE_CFG_DESTID, route_destid);
-		rio_mport_read_config_32(mport, destid, hopcount,
-					SPBC_ROUTE_CFG_PORT, &result);
-	} else {
-		rio_mport_write_config_32(mport, destid, hopcount,
-					SPP_ROUTE_CFG_DESTID(table),
-					route_destid);
-		rio_mport_read_config_32(mport, destid, hopcount,
-					SPP_ROUTE_CFG_PORT(table), &result);
-	}
-
-	*route_port = result;
-	if (*route_port > 15)
-		ret = -1;
-
-	return ret;
-}
-
-static int
-tsi568_route_clr_table(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table)
-{
-	u32 route_idx;
-	u32 lut_size;
-
-	lut_size = (mport->sys_size) ? 0x1ff : 0xff;
-
-	if (table == RIO_GLOBAL_TABLE) {
-		rio_mport_write_config_32(mport, destid, hopcount,
-					SPBC_ROUTE_CFG_DESTID, 0x80000000);
-		for (route_idx = 0; route_idx <= lut_size; route_idx++)
-			rio_mport_write_config_32(mport, destid, hopcount,
-						SPBC_ROUTE_CFG_PORT,
-						RIO_INVALID_ROUTE);
-	} else {
-		rio_mport_write_config_32(mport, destid, hopcount,
-					SPP_ROUTE_CFG_DESTID(table),
-					0x80000000);
-		for (route_idx = 0; route_idx <= lut_size; route_idx++)
-			rio_mport_write_config_32(mport, destid, hopcount,
-						SPP_ROUTE_CFG_PORT(table),
-						RIO_INVALID_ROUTE);
-	}
-
-	return 0;
-}
-
-static int
-tsi568_em_init(struct rio_dev *rdev)
-{
-	u32 regval;
-	int portnum;
-
-	pr_debug("TSI568 %s [%d:%d]\n", __func__, rdev->destid, rdev->hopcount);
-
-	/* Make sure that Port-Writes are disabled (for all ports) */
-	for (portnum = 0;
-	     portnum < RIO_GET_TOTAL_PORTS(rdev->swpinfo); portnum++) {
-		rio_read_config_32(rdev, TSI568_SP_MODE(portnum), &regval);
-		rio_write_config_32(rdev, TSI568_SP_MODE(portnum),
-				    regval | TSI568_SP_MODE_PW_DIS);
-	}
-
-	return 0;
-}
-
-static struct rio_switch_ops tsi568_switch_ops = {
-	.owner = THIS_MODULE,
-	.add_entry = tsi568_route_add_entry,
-	.get_entry = tsi568_route_get_entry,
-	.clr_table = tsi568_route_clr_table,
-	.set_domain = NULL,
-	.get_domain = NULL,
-	.em_init = tsi568_em_init,
-	.em_handle = NULL,
-};
-
-static int tsi568_probe(struct rio_dev *rdev, const struct rio_device_id *id)
-{
-	pr_debug("RIO: %s for %s\n", __func__, rio_name(rdev));
-
-	spin_lock(&rdev->rswitch->lock);
-
-	if (rdev->rswitch->ops) {
-		spin_unlock(&rdev->rswitch->lock);
-		return -EINVAL;
-	}
-
-	rdev->rswitch->ops = &tsi568_switch_ops;
-	spin_unlock(&rdev->rswitch->lock);
-	return 0;
-}
-
-static void tsi568_remove(struct rio_dev *rdev)
-{
-	pr_debug("RIO: %s for %s\n", __func__, rio_name(rdev));
-	spin_lock(&rdev->rswitch->lock);
-	if (rdev->rswitch->ops != &tsi568_switch_ops) {
-		spin_unlock(&rdev->rswitch->lock);
-		return;
-	}
-	rdev->rswitch->ops = NULL;
-	spin_unlock(&rdev->rswitch->lock);
-}
-
-static struct rio_device_id tsi568_id_table[] = {
-	{RIO_DEVICE(RIO_DID_TSI568, RIO_VID_TUNDRA)},
-	{ 0, }	/* terminate list */
-};
-
-static struct rio_driver tsi568_driver = {
-	.name = "tsi568",
-	.id_table = tsi568_id_table,
-	.probe = tsi568_probe,
-	.remove = tsi568_remove,
-};
-
-static int __init tsi568_init(void)
-{
-	return rio_register_driver(&tsi568_driver);
-}
-
-static void __exit tsi568_exit(void)
-{
-	rio_unregister_driver(&tsi568_driver);
-}
-
-device_initcall(tsi568_init);
-module_exit(tsi568_exit);
-
-MODULE_DESCRIPTION("IDT Tsi568 Serial RapidIO switch driver");
-MODULE_AUTHOR("Integrated Device Technology, Inc.");
-MODULE_LICENSE("GPL");
+2_CNTL__STEP_MASK 0x2
+#define SDMA0_F32_CNTL__STEP__SHIFT 0x1
+#define SDMA0_F32_CNTL__DBG_SELECT_BITS_MASK 0xfc
+#define SDMA0_F32_CNTL__DBG_SELECT_BITS__SHIFT 0x2
+#define SDMA0_FREEZE__FREEZE_MASK 0x10
+#define SDMA0_FREEZE__FREEZE__SHIFT 0x4
+#define SDMA0_FREEZE__FROZEN_MASK 0x20
+#define SDMA0_FREEZE__FROZEN__SHIFT 0x5
+#define SDMA0_FREEZE__F32_FREEZE_MASK 0x40
+#define SDMA0_FREEZE__F32_FREEZE__SHIFT 0x6
+#define SDMA0_PHASE0_QUANTUM__UNIT_MASK 0xf
+#define SDMA0_PHASE0_QUANTUM__UNIT__SHIFT 0x0
+#define SDMA0_PHASE0_QUANTUM__VALUE_MASK 0xffff00
+#define SDMA0_PHASE0_QUANTUM__VALUE__SHIFT 0x8
+#define SDMA0_PHASE0_QUANTUM__PREFER_MASK 0x40000000
+#define SDMA0_PHASE0_QUANTUM__PREFER__SHIFT 0x1e
+#define SDMA0_PHASE1_QUANTUM__UNIT_MASK 0xf
+#define SDMA0_PHASE1_QUANTUM__UNIT__SHIFT 0x0
+#define SDMA0_PHASE1_QUANTUM__VALUE_MASK 0xffff00
+#define SDMA0_PHASE1_QUANTUM__VALUE__SHIFT 0x8
+#define SDMA0_PHASE1_QUANTUM__PREFER_MASK 0x40000000
+#define SDMA0_PHASE1_QUANTUM__PREFER__SHIFT 0x1e
+#define SDMA_POWER_GATING__PG_CNTL_ENABLE_MASK 0x1
+#define SDMA_POWER_GATING__PG_CNTL_ENABLE__SHIFT 0x0
+#define SDMA_POWER_GATING__AUTOMATIC_STATUS_ENABLE_MASK 0x2
+#define SDMA_POWER_GATING__AUTOMATIC_STATUS_ENABLE__SHIFT 0x1
+#define SDMA_POWER_GATING__PG_STATE_VALID_MASK 0x4
+#define SDMA_POWER_GATING__PG_STATE_VALID__SHIFT 0x2
+#define SDMA_POWER_GATING__PG_CNTL_STATUS_MASK 0x30
+#define SDMA_POWER_GATING__PG_CNTL_STATUS__SHIFT 0x4
+#define SDMA_POWER_GATING__SDMA0_ON_CONDITION_MASK 0x40
+#define SDMA_POWER_GATING__SDMA0_ON_CONDITION__SHIFT 0x6
+#define SDMA_POWER_GATING__SDMA1_ON_CONDITION_MASK 0x80
+#define SDMA_POWER_GATING__SDMA1_ON_CONDITION__SHIFT 0x7
+#define SDMA_POWER_GATING__POWER_OFF_DELAY_MASK 0xfff00
+#define SDMA_POWER_GATING__POWER_OFF_DELAY__SHIFT 0x8
+#define SDMA_POWER_GATING__POWER_ON_DELAY_MASK 0xfff00000
+#define SDMA_POWER_GATING__POWER_ON_DELAY__SHIFT 0x14
+#define SDMA_PGFSM_CONFIG__FSM_ADDR_MASK 0xff
+#define SDMA_PGFSM_CONFIG__FSM_ADDR__SHIFT 0x0
+#define SDMA_PGFSM_CONFIG__POWER_DOWN_MASK 0x100
+#define SDMA_PGFSM_CONFIG__POWER_DOWN__SHIFT 0x8
+#define SDMA_PGFSM_CONFIG__POWER_UP_MASK 0x200
+#define SDMA_PGFSM_CONFIG__POWER_UP__SHIFT 0x9
+#define SDMA_PGFSM_CONFIG__P1_SELECT_MASK 0x400
+#define SDMA_PGFSM_CONFIG__P1_SELECT__SHIFT 0xa
+#define SDMA_PGFSM_CONFIG__P2_SELECT_MASK 0x800
+#define SDMA_PGFSM_CONFIG__P2_SELECT__SHIFT 0xb
+#define SDMA_PGFSM_CONFIG__WRITE_MASK 0x1000
+#define SDMA_PGFSM_CONFIG__WRITE__SHIFT 0xc
+#define SDMA_PGFSM_CONFIG__READ_MASK 0x2000
+#define SDMA_PGFSM_CONFIG__READ__SHIFT 0xd
+#define SDMA_PGFSM_CONFIG__SRBM_OVERRIDE_MASK 0x8000000
+#define SDMA_PGFSM_CONFIG__SRBM_OVERRIDE__SHIFT 0x1b
+#define SDMA_PGFSM_CONFIG__REG_ADDR_MASK 0xf0000000
+#define SDMA_PGFSM_CONFIG__REG_ADDR__SHIFT 0x1c
+#define SDMA_PGFSM_WRITE__VALUE_MASK 0xffffffff
+#define SDMA_PGFSM_WRITE__VALUE__SHIFT 0x0
+#define SDMA_PGFSM_READ__VALUE_MASK 0xffffff
+#define SDMA_PGFSM_READ__VALUE__SHIFT 0x0
+#define SDMA0_EDC_CONFIG__DIS_EDC_MASK 0x2
+#define SDMA0_EDC_CONFIG__DIS_EDC__SHIFT 0x1
+#define SDMA0_EDC_CONFIG__ECC_INT_ENABLE_MASK 0x4
+#define SDMA0_EDC_CONFIG__ECC_INT_ENABLE__SHIFT 0x2
+#define SDMA0_VM_CNTL__CMD_MASK 0xf
+#define SDMA0_VM_CNTL__CMD__SHIFT 0x0
+#define SDMA0_VM_CTX_LO__ADDR_MASK 0xfffffffc
+#define SDMA0_VM_CTX_LO__ADDR__SHIFT 0x2
+#define SDMA0_VM_CTX_HI__ADDR_MASK 0xffffffff
+#define SDMA0_VM_CTX_HI__ADDR__SHIFT 0x0
+#define SDMA0_STATUS2_REG__ID_MASK 0x3
+#define SDMA0_STATUS2_REG__ID__SHIFT 0x0
+#define SDMA0_STATUS2_REG__F32_INSTR_PTR_MASK 0xffc
+#define SDMA0_STATUS2_REG__F32_INSTR_PTR__SHIFT 0x2
+#define SDMA0_STATUS2_REG__CURRENT_FCN_IDLE_MASK 0xc000
+#define SDMA0_STATUS2_REG__CURRENT_FCN_IDLE__SHIFT 0xe
+#define SDMA0_STATUS2_REG__CMD_OP_MASK 0xffff0000
+#define SDMA0_STATUS2_REG__CMD_OP__SHIFT 0x10
+#define SDMA0_ACTIVE_FCN_ID__VFID_MASK 0xf
+#define SDMA0_ACTIVE_FCN_ID__VFID__SHIFT 0x0
+#define SDMA0_ACTIVE_FCN_ID__VF_MASK 0x80000000
+#define SDMA0_ACTIVE_FCN_ID__VF__SHIFT 0x1f
+#define SDMA0_VM_CTX_CNTL__PRIV_MASK 0x1
+#define SDMA0_VM_CTX_CNTL__PRIV__SHIFT 0x0
+#define SDMA0_VM_CTX_CNTL__VMID_MASK 0xf0
+#define SDMA0_VM_CTX_CNTL__VMID__SHIFT 0x4
+#define SDMA0_VIRT_RESET_REQ__VF_MASK 0xffff
+#define SDMA0_VIRT_RESET_REQ__VF__SHIFT 0x0
+#define SDMA0_VIRT_RESET_REQ__PF_MASK 0x80000000
+#define SDMA0_VIRT_RESET_REQ__PF__SHIFT 0x1f
+#define SDMA0_VF_ENABLE__VF_ENABLE_MASK 0x1
+#define SDMA0_VF_ENABLE__VF_ENABLE__SHIFT 0x0
+#define SDMA0_BA_THRESHOLD__READ_THRES_MASK 0x3ff
+#define SDMA0_BA_THRESHOLD__READ_THRES__SHIFT 0x0
+#define SDMA0_BA_THRESHOLD__WRITE_THRES_MASK 0x3ff0000
+#define SDMA0_BA_THRESHOLD__WRITE_THRES__SHIFT 0x10
+#define SDMA0_ID__DEVICE_ID_MASK 0xff
+#define SDMA0_ID__DEVICE_ID__SHIFT 0x0
+#define SDMA0_VERSION__VALUE_MASK 0xffff
+#define SDMA0_VERSION__VALUE__SHIFT 0x0
+#define SDMA0_ATOMIC_CNTL__LOOP_TIMER_MASK 0x7fffffff
+#define SDMA0_ATOMIC_CNTL__LOOP_TIMER__SHIFT 0x0
+#define SDMA0_ATOMIC_CNTL__ATOMIC_RTN_INT_ENABLE_MASK 0x80000000
+#define SDMA0_ATOMIC_CNTL__ATOMIC_RTN_INT_ENABLE__SHIFT 0x1f
+#define SDMA0_ATOMIC_PREOP_LO__DATA_MASK 0xffffffff
+#define SDMA0_ATOMIC_PREOP_LO__DATA__SHIFT 0x0
+#define SDMA0_ATOMIC_PREOP_HI__DATA_MASK 0xffffffff
+#define SDMA0_ATOMIC_PREOP_HI__DATA__SHIFT 0x0
+#define SDMA0_POWER_CNTL_IDLE__D

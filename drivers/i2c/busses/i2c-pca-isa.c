@@ -1,225 +1,108 @@
-/*
- *  i2c-pca-isa.c driver for PCA9564 on ISA boards
- *    Copyright (C) 2004 Arcom Control Systems
- *    Copyright (C) 2008 Pengutronix
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- */
-
-#include <linux/kernel.h>
-#include <linux/ioport.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/delay.h>
-#include <linux/jiffies.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/wait.h>
-#include <linux/isa.h>
-#include <linux/i2c.h>
-#include <linux/i2c-algo-pca.h>
-#include <linux/io.h>
-
-#include <asm/irq.h>
-
-#define DRIVER "i2c-pca-isa"
-#define IO_SIZE 4
-
-static unsigned long base;
-static int irq = -1;
-
-/* Data sheet recommends 59kHz for 100kHz operation due to variation
- * in the actual clock rate */
-static int clock  = 59000;
-
-static struct i2c_adapter pca_isa_ops;
-static wait_queue_head_t pca_wait;
-
-static void pca_isa_writebyte(void *pd, int reg, int val)
-{
-#ifdef DEBUG_IO
-	static char *names[] = { "T/O", "DAT", "ADR", "CON" };
-	printk(KERN_DEBUG "*** write %s at %#lx <= %#04x\n", names[reg],
-	       base+reg, val);
-#endif
-	outb(val, base+reg);
-}
-
-static int pca_isa_readbyte(void *pd, int reg)
-{
-	int res = inb(base+reg);
-#ifdef DEBUG_IO
-	{
-		static char *names[] = { "STA", "DAT", "ADR", "CON" };
-		printk(KERN_DEBUG "*** read  %s => %#04x\n", names[reg], res);
-	}
-#endif
-	return res;
-}
-
-static int pca_isa_waitforcompletion(void *pd)
-{
-	unsigned long timeout;
-	long ret;
-
-	if (irq > -1) {
-		ret = wait_event_timeout(pca_wait,
-				pca_isa_readbyte(pd, I2C_PCA_CON)
-				& I2C_PCA_CON_SI, pca_isa_ops.timeout);
-	} else {
-		/* Do polling */
-		timeout = jiffies + pca_isa_ops.timeout;
-		do {
-			ret = time_before(jiffies, timeout);
-			if (pca_isa_readbyte(pd, I2C_PCA_CON)
-					& I2C_PCA_CON_SI)
-				break;
-			udelay(100);
-		} while (ret);
-	}
-
-	return ret > 0;
-}
-
-static void pca_isa_resetchip(void *pd)
-{
-	/* apparently only an external reset will do it. not a lot can be done */
-	printk(KERN_WARNING DRIVER ": Haven't figured out how to do a reset yet\n");
-}
-
-static irqreturn_t pca_handler(int this_irq, void *dev_id) {
-	wake_up(&pca_wait);
-	return IRQ_HANDLED;
-}
-
-static struct i2c_algo_pca_data pca_isa_data = {
-	/* .data intentionally left NULL, not needed with ISA */
-	.write_byte		= pca_isa_writebyte,
-	.read_byte		= pca_isa_readbyte,
-	.wait_for_completion	= pca_isa_waitforcompletion,
-	.reset_chip		= pca_isa_resetchip,
-};
-
-static struct i2c_adapter pca_isa_ops = {
-	.owner          = THIS_MODULE,
-	.algo_data	= &pca_isa_data,
-	.name		= "PCA9564/PCA9665 ISA Adapter",
-	.timeout	= HZ,
-};
-
-static int pca_isa_match(struct device *dev, unsigned int id)
-{
-	int match = base != 0;
-
-	if (match) {
-		if (irq <= -1)
-			dev_warn(dev, "Using polling mode (specify irq)\n");
-	} else
-		dev_err(dev, "Please specify I/O base\n");
-
-	return match;
-}
-
-static int pca_isa_probe(struct device *dev, unsigned int id)
-{
-	init_waitqueue_head(&pca_wait);
-
-	dev_info(dev, "i/o base %#08lx. irq %d\n", base, irq);
-
-#ifdef CONFIG_PPC
-	if (check_legacy_ioport(base)) {
-		dev_err(dev, "I/O address %#08lx is not available\n", base);
-		goto out;
-	}
-#endif
-
-	if (!request_region(base, IO_SIZE, "i2c-pca-isa")) {
-		dev_err(dev, "I/O address %#08lx is in use\n", base);
-		goto out;
-	}
-
-	if (irq > -1) {
-		if (request_irq(irq, pca_handler, 0, "i2c-pca-isa", &pca_isa_ops) < 0) {
-			dev_err(dev, "Request irq%d failed\n", irq);
-			goto out_region;
-		}
-	}
-
-	pca_isa_data.i2c_clock = clock;
-	if (i2c_pca_add_bus(&pca_isa_ops) < 0) {
-		dev_err(dev, "Failed to add i2c bus\n");
-		goto out_irq;
-	}
-
-	return 0;
-
- out_irq:
-	if (irq > -1)
-		free_irq(irq, &pca_isa_ops);
- out_region:
-	release_region(base, IO_SIZE);
- out:
-	return -ENODEV;
-}
-
-static int pca_isa_remove(struct device *dev, unsigned int id)
-{
-	i2c_del_adapter(&pca_isa_ops);
-
-	if (irq > -1) {
-		disable_irq(irq);
-		free_irq(irq, &pca_isa_ops);
-	}
-	release_region(base, IO_SIZE);
-
-	return 0;
-}
-
-static struct isa_driver pca_isa_driver = {
-	.match		= pca_isa_match,
-	.probe		= pca_isa_probe,
-	.remove		= pca_isa_remove,
-	.driver = {
-		.owner	= THIS_MODULE,
-		.name	= DRIVER,
-	}
-};
-
-static int __init pca_isa_init(void)
-{
-	return isa_register_driver(&pca_isa_driver, 1);
-}
-
-static void __exit pca_isa_exit(void)
-{
-	isa_unregister_driver(&pca_isa_driver);
-}
-
-MODULE_AUTHOR("Ian Campbell <icampbell@arcom.com>");
-MODULE_DESCRIPTION("ISA base PCA9564/PCA9665 driver");
-MODULE_LICENSE("GPL");
-
-module_param(base, ulong, 0);
-MODULE_PARM_DESC(base, "I/O base address");
-
-module_param(irq, int, 0);
-MODULE_PARM_DESC(irq, "IRQ");
-module_param(clock, int, 0);
-MODULE_PARM_DESC(clock, "Clock rate in hertz.\n\t\t"
-		"For PCA9564: 330000,288000,217000,146000,"
-		"88000,59000,44000,36000\n"
-		"\t\tFor PCA9665:\tStandard: 60300 - 100099\n"
-		"\t\t\t\tFast: 100100 - 400099\n"
-		"\t\t\t\tFast+: 400100 - 10000099\n"
-		"\t\t\t\tTurbo: Up to 1265800");
-
-module_init(pca_isa_init);
-module_exit(pca_isa_exit);
+_SHIFT 0x18
+#define MC_IO_DEBUG_WCDR_CDR_PHSIZE_D1__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_WCDR_CDR_PHSIZE_D1__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_WCDR_CDR_PHSIZE_D1__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_WCDR_CDR_PHSIZE_D1__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_WCDR_CDR_PHSIZE_D1__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_WCDR_CDR_PHSIZE_D1__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_WCDR_CDR_PHSIZE_D1__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_WCDR_CDR_PHSIZE_D1__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_WCDR_RX_EQ_PM_D1__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_WCDR_RX_EQ_PM_D1__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_WCDR_RX_EQ_PM_D1__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_WCDR_RX_EQ_PM_D1__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_WCDR_RX_EQ_PM_D1__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_WCDR_RX_EQ_PM_D1__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_WCDR_RX_EQ_PM_D1__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_WCDR_RX_EQ_PM_D1__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_WCDR_RX_DYN_PM_D1__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_WCDR_RX_DYN_PM_D1__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_WCDR_RX_DYN_PM_D1__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_WCDR_RX_DYN_PM_D1__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_WCDR_RX_DYN_PM_D1__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_WCDR_RX_DYN_PM_D1__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_WCDR_RX_DYN_PM_D1__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_WCDR_RX_DYN_PM_D1__VALUE3__SHIFT 0x18
+#define MC_SEQ_CNTL_3__PIPE_DELAY_OUT_D0_MASK 0x7
+#define MC_SEQ_CNTL_3__PIPE_DELAY_OUT_D0__SHIFT 0x0
+#define MC_SEQ_CNTL_3__PIPE_DELAY_IN_D0_MASK 0x38
+#define MC_SEQ_CNTL_3__PIPE_DELAY_IN_D0__SHIFT 0x3
+#define MC_SEQ_CNTL_3__PIPE_DELAY_OUT_D1_MASK 0x1c0
+#define MC_SEQ_CNTL_3__PIPE_DELAY_OUT_D1__SHIFT 0x6
+#define MC_SEQ_CNTL_3__PIPE_DELAY_IN_D1_MASK 0xe00
+#define MC_SEQ_CNTL_3__PIPE_DELAY_IN_D1__SHIFT 0x9
+#define MC_SEQ_CNTL_3__REPCG_EN_D0_MASK 0x1000
+#define MC_SEQ_CNTL_3__REPCG_EN_D0__SHIFT 0xc
+#define MC_SEQ_CNTL_3__REPCG_EN_D1_MASK 0x2000
+#define MC_SEQ_CNTL_3__REPCG_EN_D1__SHIFT 0xd
+#define MC_SEQ_CNTL_3__REPCG_OFF_DLY_MASK 0xf0000
+#define MC_SEQ_CNTL_3__REPCG_OFF_DLY__SHIFT 0x10
+#define MC_SEQ_CNTL_3__FCK_FRC_MASK 0x100000
+#define MC_SEQ_CNTL_3__FCK_FRC__SHIFT 0x14
+#define MC_SEQ_CNTL_3__DBI_FRC_MASK 0x200000
+#define MC_SEQ_CNTL_3__DBI_FRC__SHIFT 0x15
+#define MC_SEQ_CNTL_3__PRGRM_CDC_MASK 0x400000
+#define MC_SEQ_CNTL_3__PRGRM_CDC__SHIFT 0x16
+#define MC_SEQ_CNTL_3__DQS_FRC_MASK 0x800000
+#define MC_SEQ_CNTL_3__DQS_FRC__SHIFT 0x17
+#define MC_SEQ_CNTL_3__DQS_FRC_PAT_MASK 0xf000000
+#define MC_SEQ_CNTL_3__DQS_FRC_PAT__SHIFT 0x18
+#define MC_SEQ_CNTL_3__IDSC_EN_MASK 0x40000000
+#define MC_SEQ_CNTL_3__IDSC_EN__SHIFT 0x1e
+#define MC_SEQ_CNTL_3__CAC_EN_MASK 0x80000000
+#define MC_SEQ_CNTL_3__CAC_EN__SHIFT 0x1f
+#define MC_SEQ_G5PDX_CTRL__CH0_ENABLE_MASK 0x1
+#define MC_SEQ_G5PDX_CTRL__CH0_ENABLE__SHIFT 0x0
+#define MC_SEQ_G5PDX_CTRL__CH1_ENABLE_MASK 0x2
+#define MC_SEQ_G5PDX_CTRL__CH1_ENABLE__SHIFT 0x1
+#define MC_SEQ_G5PDX_CTRL__WCKOFF_EARLY_MASK 0x4
+#define MC_SEQ_G5PDX_CTRL__WCKOFF_EARLY__SHIFT 0x2
+#define MC_SEQ_G5PDX_CTRL__WCKOFF_LATE_MASK 0x8
+#define MC_SEQ_G5PDX_CTRL__WCKOFF_LATE__SHIFT 0x3
+#define MC_SEQ_G5PDX_CTRL__TPD2MRS_MASK 0x3f0
+#define MC_SEQ_G5PDX_CTRL__TPD2MRS__SHIFT 0x4
+#define MC_SEQ_G5PDX_CTRL__TMRS2WCK_MASK 0xf000
+#define MC_SEQ_G5PDX_CTRL__TMRS2WCK__SHIFT 0xc
+#define MC_SEQ_G5PDX_CTRL__TWCK2MRS_MASK 0xf0000
+#define MC_SEQ_G5PDX_CTRL__TWCK2MRS__SHIFT 0x10
+#define MC_SEQ_G5PDX_CTRL__TMRD_MASK 0xf00000
+#define MC_SEQ_G5PDX_CTRL__TMRD__SHIFT 0x14
+#define MC_SEQ_G5PDX_CTRL_LP__CH0_ENABLE_MASK 0x1
+#define MC_SEQ_G5PDX_CTRL_LP__CH0_ENABLE__SHIFT 0x0
+#define MC_SEQ_G5PDX_CTRL_LP__CH1_ENABLE_MASK 0x2
+#define MC_SEQ_G5PDX_CTRL_LP__CH1_ENABLE__SHIFT 0x1
+#define MC_SEQ_G5PDX_CTRL_LP__WCKOFF_EARLY_MASK 0x4
+#define MC_SEQ_G5PDX_CTRL_LP__WCKOFF_EARLY__SHIFT 0x2
+#define MC_SEQ_G5PDX_CTRL_LP__WCKOFF_LATE_MASK 0x8
+#define MC_SEQ_G5PDX_CTRL_LP__WCKOFF_LATE__SHIFT 0x3
+#define MC_SEQ_G5PDX_CTRL_LP__TPD2MRS_MASK 0x3f0
+#define MC_SEQ_G5PDX_CTRL_LP__TPD2MRS__SHIFT 0x4
+#define MC_SEQ_G5PDX_CTRL_LP__TMRS2WCK_MASK 0xf000
+#define MC_SEQ_G5PDX_CTRL_LP__TMRS2WCK__SHIFT 0xc
+#define MC_SEQ_G5PDX_CTRL_LP__TWCK2MRS_MASK 0xf0000
+#define MC_SEQ_G5PDX_CTRL_LP__TWCK2MRS__SHIFT 0x10
+#define MC_SEQ_G5PDX_CTRL_LP__TMRD_MASK 0xf00000
+#define MC_SEQ_G5PDX_CTRL_LP__TMRD__SHIFT 0x14
+#define MC_SEQ_G5PDX_CMD0__CMD_MASK 0xffffffff
+#define MC_SEQ_G5PDX_CMD0__CMD__SHIFT 0x0
+#define MC_SEQ_G5PDX_CMD0_LP__CMD_MASK 0xffffffff
+#define MC_SEQ_G5PDX_CMD0_LP__CMD__SHIFT 0x0
+#define MC_SEQ_G5PDX_CMD1__CMD_MASK 0xffffffff
+#define MC_SEQ_G5PDX_CMD1__CMD__SHIFT 0x0
+#define MC_SEQ_G5PDX_CMD1_LP__CMD_MASK 0xffffffff
+#define MC_SEQ_G5PDX_CMD1_LP__CMD__SHIFT 0x0
+#define MC_SEQ_SREG_READ__DATA_MASK 0xffffffff
+#define MC_SEQ_SREG_READ__DATA__SHIFT 0x0
+#define MC_SEQ_SREG_STATUS__AVAIL_RTN_MASK 0xf
+#define MC_SEQ_SREG_STATUS__AVAIL_RTN__SHIFT 0x0
+#define MC_SEQ_SREG_STATUS__PND_RD_MASK 0xf00
+#define MC_SEQ_SREG_STATUS__PND_RD__SHIFT 0x8
+#define MC_SEQ_SREG_STATUS__PND_WR_MASK 0xf000
+#define MC_SEQ_SREG_STATUS__PND_WR__SHIFT 0xc
+#define MC_SEQ_PHYREG_BCAST__CH0_EN_MASK 0x1
+#define MC_SEQ_PHYREG_BCAST__CH0_EN__SHIFT 0x0
+#define MC_SEQ_PHYREG_BCAST__CH1_EN_MASK 0x2
+#define MC_SEQ_PHYREG_BCAST__CH1_EN__SHIFT 0x1
+#define MC_SEQ_PHYREG_BCAST__CKE_MASK_MASK 0x80
+#define MC_SEQ_PHYREG_BCAST__CKE_MASK__SHIFT 0x7
+#define MC_S

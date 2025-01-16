@@ -1,158 +1,83 @@
-/*
-    i2c Support for the Apple `Hydra' Mac I/O
-
-    Copyright (c) 1999-2004 Geert Uytterhoeven <geert@linux-m68k.org>
-
-    Based on i2c Support for Via Technologies 82C586B South Bridge
-    Copyright (c) 1998, 1999 Kyösti Mälkki <kmalkki@cc.hut.fi>
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-*/
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/types.h>
-#include <linux/i2c.h>
-#include <linux/i2c-algo-bit.h>
-#include <linux/io.h>
-#include <asm/hydra.h>
-
-
-#define HYDRA_CPD_PD0	0x00000001	/* CachePD lines */
-#define HYDRA_CPD_PD1	0x00000002
-#define HYDRA_CPD_PD2	0x00000004
-#define HYDRA_CPD_PD3	0x00000008
-
-#define HYDRA_SCLK	HYDRA_CPD_PD0
-#define HYDRA_SDAT	HYDRA_CPD_PD1
-#define HYDRA_SCLK_OE	0x00000010
-#define HYDRA_SDAT_OE	0x00000020
-
-static inline void pdregw(void *data, u32 val)
-{
-	struct Hydra *hydra = (struct Hydra *)data;
-	writel(val, &hydra->CachePD);
-}
-
-static inline u32 pdregr(void *data)
-{
-	struct Hydra *hydra = (struct Hydra *)data;
-	return readl(&hydra->CachePD);
-}
-
-static void hydra_bit_setscl(void *data, int state)
-{
-	u32 val = pdregr(data);
-	if (state)
-		val &= ~HYDRA_SCLK_OE;
-	else {
-		val &= ~HYDRA_SCLK;
-		val |= HYDRA_SCLK_OE;
-	}
-	pdregw(data, val);
-}
-
-static void hydra_bit_setsda(void *data, int state)
-{
-	u32 val = pdregr(data);
-	if (state)
-		val &= ~HYDRA_SDAT_OE;
-	else {
-		val &= ~HYDRA_SDAT;
-		val |= HYDRA_SDAT_OE;
-	}
-	pdregw(data, val);
-}
-
-static int hydra_bit_getscl(void *data)
-{
-	return (pdregr(data) & HYDRA_SCLK) != 0;
-}
-
-static int hydra_bit_getsda(void *data)
-{
-	return (pdregr(data) & HYDRA_SDAT) != 0;
-}
-
-/* ------------------------------------------------------------------------ */
-
-static struct i2c_algo_bit_data hydra_bit_data = {
-	.setsda		= hydra_bit_setsda,
-	.setscl		= hydra_bit_setscl,
-	.getsda		= hydra_bit_getsda,
-	.getscl		= hydra_bit_getscl,
-	.udelay		= 5,
-	.timeout	= HZ
-};
-
-static struct i2c_adapter hydra_adap = {
-	.owner		= THIS_MODULE,
-	.name		= "Hydra i2c",
-	.algo_data	= &hydra_bit_data,
-};
-
-static const struct pci_device_id hydra_ids[] = {
-	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, PCI_DEVICE_ID_APPLE_HYDRA) },
-	{ 0, }
-};
-
-MODULE_DEVICE_TABLE (pci, hydra_ids);
-
-static int hydra_probe(struct pci_dev *dev,
-				 const struct pci_device_id *id)
-{
-	unsigned long base = pci_resource_start(dev, 0);
-	int res;
-
-	if (!request_mem_region(base+offsetof(struct Hydra, CachePD), 4,
-				hydra_adap.name))
-		return -EBUSY;
-
-	hydra_bit_data.data = pci_ioremap_bar(dev, 0);
-	if (hydra_bit_data.data == NULL) {
-		release_mem_region(base+offsetof(struct Hydra, CachePD), 4);
-		return -ENODEV;
-	}
-
-	pdregw(hydra_bit_data.data, 0);		/* clear SCLK_OE and SDAT_OE */
-	hydra_adap.dev.parent = &dev->dev;
-	res = i2c_bit_add_bus(&hydra_adap);
-	if (res < 0) {
-		iounmap(hydra_bit_data.data);
-		release_mem_region(base+offsetof(struct Hydra, CachePD), 4);
-		return res;
-	}
-	return 0;
-}
-
-static void hydra_remove(struct pci_dev *dev)
-{
-	pdregw(hydra_bit_data.data, 0);		/* clear SCLK_OE and SDAT_OE */
-	i2c_del_adapter(&hydra_adap);
-	iounmap(hydra_bit_data.data);
-	release_mem_region(pci_resource_start(dev, 0)+
-			   offsetof(struct Hydra, CachePD), 4);
-}
-
-
-static struct pci_driver hydra_driver = {
-	.name		= "hydra_smbus",
-	.id_table	= hydra_ids,
-	.probe		= hydra_probe,
-	.remove		= hydra_remove,
-};
-
-module_pci_driver(hydra_driver);
-
-MODULE_AUTHOR("Geert Uytterhoeven <geert@linux-m68k.org>");
-MODULE_DESCRIPTION("i2c for Apple Hydra Mac I/O");
-MODULE_LICENSE("GPL");
+e MPLL_FUNC_CNTL__BG_135ADJ_MASK 0xf0000
+#define MPLL_FUNC_CNTL__BG_135ADJ__SHIFT 0x10
+#define MPLL_FUNC_CNTL__BWCTRL_MASK 0xff00000
+#define MPLL_FUNC_CNTL__BWCTRL__SHIFT 0x14
+#define MPLL_FUNC_CNTL__REG_BIAS_MASK 0xc0000000
+#define MPLL_FUNC_CNTL__REG_BIAS__SHIFT 0x1e
+#define MPLL_FUNC_CNTL_1__VCO_MODE_MASK 0x3
+#define MPLL_FUNC_CNTL_1__VCO_MODE__SHIFT 0x0
+#define MPLL_FUNC_CNTL_1__SPARE_0_MASK 0xc
+#define MPLL_FUNC_CNTL_1__SPARE_0__SHIFT 0x2
+#define MPLL_FUNC_CNTL_1__CLKFRAC_MASK 0xfff0
+#define MPLL_FUNC_CNTL_1__CLKFRAC__SHIFT 0x4
+#define MPLL_FUNC_CNTL_1__CLKF_MASK 0xfff0000
+#define MPLL_FUNC_CNTL_1__CLKF__SHIFT 0x10
+#define MPLL_FUNC_CNTL_1__SPARE_1_MASK 0xf0000000
+#define MPLL_FUNC_CNTL_1__SPARE_1__SHIFT 0x1c
+#define MPLL_FUNC_CNTL_2__VCTRLADC_EN_MASK 0x1
+#define MPLL_FUNC_CNTL_2__VCTRLADC_EN__SHIFT 0x0
+#define MPLL_FUNC_CNTL_2__TEST_VCTL_EN_MASK 0x2
+#define MPLL_FUNC_CNTL_2__TEST_VCTL_EN__SHIFT 0x1
+#define MPLL_FUNC_CNTL_2__RESET_EN_MASK 0x4
+#define MPLL_FUNC_CNTL_2__RESET_EN__SHIFT 0x2
+#define MPLL_FUNC_CNTL_2__TEST_BYPCLK_EN_MASK 0x8
+#define MPLL_FUNC_CNTL_2__TEST_BYPCLK_EN__SHIFT 0x3
+#define MPLL_FUNC_CNTL_2__TEST_BYPCLK_SRC_MASK 0x10
+#define MPLL_FUNC_CNTL_2__TEST_BYPCLK_SRC__SHIFT 0x4
+#define MPLL_FUNC_CNTL_2__TEST_FBDIV_FRAC_BYPASS_MASK 0x20
+#define MPLL_FUNC_CNTL_2__TEST_FBDIV_FRAC_BYPASS__SHIFT 0x5
+#define MPLL_FUNC_CNTL_2__TEST_BYPMCLK_MASK 0x40
+#define MPLL_FUNC_CNTL_2__TEST_BYPMCLK__SHIFT 0x6
+#define MPLL_FUNC_CNTL_2__MPLL_UNLOCK_CLEAR_MASK 0x80
+#define MPLL_FUNC_CNTL_2__MPLL_UNLOCK_CLEAR__SHIFT 0x7
+#define MPLL_FUNC_CNTL_2__TEST_VCTL_CNTRL_MASK 0x100
+#define MPLL_FUNC_CNTL_2__TEST_VCTL_CNTRL__SHIFT 0x8
+#define MPLL_FUNC_CNTL_2__TEST_FBDIV_SSC_BYPASS_MASK 0x200
+#define MPLL_FUNC_CNTL_2__TEST_FBDIV_SSC_BYPASS__SHIFT 0x9
+#define MPLL_FUNC_CNTL_2__RESET_TIMER_MASK 0xc00
+#define MPLL_FUNC_CNTL_2__RESET_TIMER__SHIFT 0xa
+#define MPLL_FUNC_CNTL_2__PFD_RESET_CNTRL_MASK 0x3000
+#define MPLL_FUNC_CNTL_2__PFD_RESET_CNTRL__SHIFT 0xc
+#define MPLL_FUNC_CNTL_2__RISEFBVCO_EN_MASK 0x4000
+#define MPLL_FUNC_CNTL_2__RISEFBVCO_EN__SHIFT 0xe
+#define MPLL_FUNC_CNTL_2__PWRGOOD_OVR_MASK 0x8000
+#define MPLL_FUNC_CNTL_2__PWRGOOD_OVR__SHIFT 0xf
+#define MPLL_FUNC_CNTL_2__ISO_DIS_P_MASK 0x10000
+#define MPLL_FUNC_CNTL_2__ISO_DIS_P__SHIFT 0x10
+#define MPLL_FUNC_CNTL_2__BACKUP_2_MASK 0xe0000
+#define MPLL_FUNC_CNTL_2__BACKUP_2__SHIFT 0x11
+#define MPLL_FUNC_CNTL_2__LF_CNTRL_MASK 0x7f00000
+#define MPLL_FUNC_CNTL_2__LF_CNTRL__SHIFT 0x14
+#define MPLL_FUNC_CNTL_2__BACKUP_MASK 0xf8000000
+#define MPLL_FUNC_CNTL_2__BACKUP__SHIFT 0x1b
+#define MPLL_AD_FUNC_CNTL__YCLK_POST_DIV_MASK 0x7
+#define MPLL_AD_FUNC_CNTL__YCLK_POST_DIV__SHIFT 0x0
+#define MPLL_AD_FUNC_CNTL__SPARE_MASK 0xfffffff8
+#define MPLL_AD_FUNC_CNTL__SPARE__SHIFT 0x3
+#define MPLL_DQ_FUNC_CNTL__YCLK_POST_DIV_MASK 0x7
+#define MPLL_DQ_FUNC_CNTL__YCLK_POST_DIV__SHIFT 0x0
+#define MPLL_DQ_FUNC_CNTL__SPARE_0_MASK 0x8
+#define MPLL_DQ_FUNC_CNTL__SPARE_0__SHIFT 0x3
+#define MPLL_DQ_FUNC_CNTL__YCLK_SEL_MASK 0x10
+#define MPLL_DQ_FUNC_CNTL__YCLK_SEL__SHIFT 0x4
+#define MPLL_DQ_FUNC_CNTL__SPARE_MASK 0xffffffe0
+#define MPLL_DQ_FUNC_CNTL__SPARE__SHIFT 0x5
+#define MPLL_TIME__MPLL_LOCK_TIME_MASK 0xffff
+#define MPLL_TIME__MPLL_LOCK_TIME__SHIFT 0x0
+#define MPLL_TIME__MPLL_RESET_TIME_MASK 0xffff0000
+#define MPLL_TIME__MPLL_RESET_TIME__SHIFT 0x10
+#define MPLL_SS1__CLKV_MASK 0x3ffffff
+#define MPLL_SS1__CLKV__SHIFT 0x0
+#define MPLL_SS1__SPARE_MASK 0xfc000000
+#define MPLL_SS1__SPARE__SHIFT 0x1a
+#define MPLL_SS2__CLKS_MASK 0xfff
+#define MPLL_SS2__CLKS__SHIFT 0x0
+#define MPLL_SS2__SPARE_MASK 0xfffff000
+#define MPLL_SS2__SPARE__SHIFT 0xc
+#define MPLL_CONTROL__GDDR_PWRON_MASK 0x1
+#define MPLL_CONTROL__GDDR_PWRON__SHIFT 0x0
+#define MPLL_CONTROL__REFCLK_PWRON_MASK 0x2
+#define MPLL_CONTROL__REFCLK_PWRON__SHIFT 0x1
+#define MPLL_CONTROL__PLL_BUF_PWRON_TX_MASK 0x4
+#define MPLL_CONTROL__PLL_BUF_PWRON_TX__SHIFT 0x2
+#define MPLL_CONTROL__AD_BG_PWRON_MASK 0x10

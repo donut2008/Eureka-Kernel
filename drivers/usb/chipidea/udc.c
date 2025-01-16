@@ -1,2027 +1,577 @@
-/*
- * udc.c - ChipIdea UDC driver
+OFT_REGISTERS_TABLE_20                                               0x3f8e8
+#define ixSOFT_REGISTERS_TABLE_21                                               0x3f8ec
+#define ixSOFT_REGISTERS_TABLE_22                                               0x3f8f0
+#define ixSOFT_REGISTERS_TABLE_23                                               0x3f8f4
+#define ixSOFT_REGISTERS_TABLE_24                                               0x3f8f8
+#define ixSOFT_REGISTERS_TABLE_25                                               0x3f8fc
+#define ixSOFT_REGISTERS_TABLE_26                                               0x3f900
+#define ixSOFT_REGISTERS_TABLE_27                                               0x3f904
+#define ixSOFT_REGISTERS_TABLE_28                                               0x3f888
+#define ixSOFT_REGISTERS_TABLE_29                                               0x3f90c
+#define ixSOFT_REGISTERS_TABLE_30                                               0x3f910
+#define ixPM_FUSES_1                                                            0x3f914
+#define ixPM_FUSES_2                                                            0x3f918
+#define ixPM_FUSES_3                                                            0x3f91c
+#define ixPM_FUSES_4                                                            0x3f920
+#define ixPM_FUSES_5                                                            0x3f924
+#define ixPM_FUSES_6                                                            0x3f928
+#define ixPM_FUSES_7                                                            0x3f92c
+#define ixPM_FUSES_8                                                            0x3f930
+#define ixPM_FUSES_9                                                            0x3f934
+#define ixPM_FUSES_10                                                           0x3f938
+#define ixPM_FUSES_11                                                           0x3f93c
+#define ixPM_FUSES_12                                                           0x3f940
+#define ixPM_FUSES_13                                                           0x3f944
+#define ixPM_FUSES_14                                                           0x3f948
+#define ixPM_FUSES_15                                                           0x3f94c
+#define ixSMU_PM_STATUS_0                                                       0x3fe00
+#define ixSMU_PM_STATUS_1                                                       0x3fe04
+#define ixSMU_PM_STATUS_2                                                       0x3fe08
+#define ixSMU_PM_STATUS_3                                                       0x3fe0c
+#define ixSMU_PM_STATUS_4                                                       0x3fe10
+#define ixSMU_PM_STATUS_5                                                       0x3fe14
+#define ixSMU_PM_STATUS_6                                                       0x3fe18
+#define ixSMU_PM_STATUS_7                                                       0x3fe1c
+#define ixSMU_PM_STATUS_8                                                       0x3fe20
+#define ixSMU_PM_STATUS_9                                                       0x3fe24
+#define ixSMU_PM_STATUS_10                                                      0x3fe28
+#define ixSMU_PM_STATUS_11                                                      0x3fe2c
+#define ixSMU_PM_STATUS_12                                                      0x3fe30
+#define ixSMU_PM_STATUS_13                                                      0x3fe34
+#define ixSMU_PM_STATUS_14                                                      0x3fe38
+#define ixSMU_PM_STATUS_15                                                      0x3fe3c
+#define ixSMU_PM_STATUS_16                                                      0x3fe40
+#define ixSMU_PM_STATUS_17                                                      0x3fe44
+#define ixSMU_PM_STATUS_18                                                      0x3fe48
+#define ixSMU_PM_STATUS_19                                                      0x3fe4c
+#define ixSMU_PM_STATUS_20                                                      0x3fe50
+#define ixSMU_PM_STATUS_21                                                      0x3fe54
+#define ixSMU_PM_STATUS_22                                                      0x3fe58
+#define ixSMU_PM_STATUS_23                                                      0x3fe5c
+#define ixSMU_PM_STATUS_24                                                      0x3fe60
+#define ixSMU_PM_STATUS_25                                                      0x3fe64
+#define ixSMU_PM_STATUS_26                                                      0x3fe68
+#define ixSMU_PM_STATUS_27                                                      0x3fe6c
+#define ixSMU_PM_STATUS_28                                                      0x3fe70
+#define ixSMU_PM_STATUS_29                                                      0x3fe74
+#define ixSMU_PM_STATUS_30                                                      0x3fe78
+#define ixSMU_PM_STATUS_31                                                      0x3fe7c
+#define ixSMU_PM_STATUS_32                                                      0x3fe80
+#define ixSMU_PM_STATUS_33                                                      0x3fe84
+#define ixSMU_PM_STATUS_34                                                      0x3fe88
+#define ixSMU_PM_STATUS_35                                                      0x3fe8c
+#define ixSMU_PM_STATUS_36                                                      0x3fe90
+#define ixSMU_PM_STATUS_37                                                      0x3fe94
+#define ixSMU_PM_STATUS_38                                                      0x3fe98
+#define ixSMU_PM_STATUS_39                                                      0x3fe9c
+#define ixSMU_PM_STATUS_40                                                      0x3fea0
+#define ixSMU_PM_STATUS_41                                                      0x3fea4
+#define ixSMU_PM_STATUS_42                                                      0x3fea8
+#define ixSMU_PM_STATUS_43                                                      0x3feac
+#define ixSMU_PM_STATUS_44                                                      0x3feb0
+#define ixSMU_PM_STATUS_45                                                      0x3feb4
+#define ixSMU_PM_STATUS_46                                                      0x3feb8
+#define ixSMU_PM_STATUS_47                                                      0x3febc
+#define ixSMU_PM_STATUS_48                                                      0x3fec0
+#define ixSMU_PM_STATUS_49                                                      0x3fec4
+#define ixSMU_PM_STATUS_50                                                      0x3fec8
+#define ixSMU_PM_STATUS_51                                                      0x3fecc
+#define ixSMU_PM_STATUS_52                                                      0x3fed0
+#define ixSMU_PM_STATUS_53                                                      0x3fed4
+#define ixSMU_PM_STATUS_54                                                      0x3fed8
+#define ixSMU_PM_STATUS_55                                                      0x3fedc
+#define ixSMU_PM_STATUS_56                                                      0x3fee0
+#define ixSMU_PM_STATUS_57                                                      0x3fee4
+#define ixSMU_PM_STATUS_58                                                      0x3fee8
+#define ixSMU_PM_STATUS_59                                                      0x3feec
+#define ixSMU_PM_STATUS_60                                                      0x3fef0
+#define ixSMU_PM_STATUS_61                                                      0x3fef4
+#define ixSMU_PM_STATUS_62                                                      0x3fef8
+#define ixSMU_PM_STATUS_63                                                      0x3fefc
+#define ixSMU_PM_STATUS_64                                                      0x3ff00
+#define ixSMU_PM_STATUS_65                                                      0x3ff04
+#define ixSMU_PM_STATUS_66                                                      0x3ff08
+#define ixSMU_PM_STATUS_67                                                      0x3ff0c
+#define ixSMU_PM_STATUS_68                                                      0x3ff10
+#define ixSMU_PM_STATUS_69                                                      0x3ff14
+#define ixSMU_PM_STATUS_70                                                      0x3ff18
+#define ixSMU_PM_STATUS_71                                                      0x3ff1c
+#define ixSMU_PM_STATUS_72                                                      0x3ff20
+#define ixSMU_PM_STATUS_73                                                      0x3ff24
+#define ixSMU_PM_STATUS_74                                                      0x3ff28
+#define ixSMU_PM_STATUS_75                                                      0x3ff2c
+#define ixSMU_PM_STATUS_76                                                      0x3ff30
+#define ixSMU_PM_STATUS_77                                                      0x3ff34
+#define ixSMU_PM_STATUS_78                                                      0x3ff38
+#define ixSMU_PM_STATUS_79                                                      0x3ff3c
+#define ixSMU_PM_STATUS_80                                                      0x3ff40
+#define ixSMU_PM_STATUS_81                                                      0x3ff44
+#define ixSMU_PM_STATUS_82                                                      0x3ff48
+#define ixSMU_PM_STATUS_83                                                      0x3ff4c
+#define ixSMU_PM_STATUS_84                                                      0x3ff50
+#define ixSMU_PM_STATUS_85                                                      0x3ff54
+#define ixSMU_PM_STATUS_86                                                      0x3ff58
+#define ixSMU_PM_STATUS_87                                                      0x3ff5c
+#define ixSMU_PM_STATUS_88                                                      0x3ff60
+#define ixSMU_PM_STATUS_89                                                      0x3ff64
+#define ixSMU_PM_STATUS_90                                                      0x3ff68
+#define ixSMU_PM_STATUS_91                                                      0x3ff6c
+#define ixSMU_PM_STATUS_92                                                      0x3ff70
+#define ixSMU_PM_STATUS_93                                                      0x3ff74
+#define ixSMU_PM_STATUS_94                                                      0x3ff78
+#define ixSMU_PM_STATUS_95                                                      0x3ff7c
+#define ixSMU_PM_STATUS_96                                                      0x3ff80
+#define ixSMU_PM_STATUS_97                                                      0x3ff84
+#define ixSMU_PM_STATUS_98                                                      0x3ff88
+#define ixSMU_PM_STATUS_99                                                      0x3ff8c
+#define ixSMU_PM_STATUS_100                                                     0x3ff90
+#define ixSMU_PM_STATUS_101                                                     0x3ff94
+#define ixSMU_PM_STATUS_102                                                     0x3ff98
+#define ixSMU_PM_STATUS_103                                                     0x3ff9c
+#define ixSMU_PM_STATUS_104                                                     0x3ffa0
+#define ixSMU_PM_STATUS_105                                                     0x3ffa4
+#define ixSMU_PM_STATUS_106                                                     0x3ffa8
+#define ixSMU_PM_STATUS_107                                                     0x3ffac
+#define ixSMU_PM_STATUS_108                                                     0x3ffb0
+#define ixSMU_PM_STATUS_109                                                     0x3ffb4
+#define ixSMU_PM_STATUS_110                                                     0x3ffb8
+#define ixSMU_PM_STATUS_111                                                     0x3ffbc
+#define ixSMU_PM_STATUS_112                                                     0x3ffc0
+#define ixSMU_PM_STATUS_113                                                     0x3ffc4
+#define ixSMU_PM_STATUS_114                                                     0x3ffc8
+#define ixSMU_PM_STATUS_115                                                     0x3ffcc
+#define ixSMU_PM_STATUS_116                                                     0x3ffd0
+#define ixSMU_PM_STATUS_117                                                     0x3ffd4
+#define ixSMU_PM_STATUS_118                                                     0x3ffd8
+#define ixSMU_PM_STATUS_119                                                     0x3ffdc
+#define ixSMU_PM_STATUS_120                                                     0x3ffe0
+#define ixSMU_PM_STATUS_121                                                     0x3ffe4
+#define ixSMU_PM_STATUS_122                                                     0x3ffe8
+#define ixSMU_PM_STATUS_123                                                     0x3ffec
+#define ixSMU_PM_STATUS_124                                                     0x3fff0
+#define ixSMU_PM_STATUS_125                                                     0x3fff4
+#define ixSMU_PM_STATUS_126                                                     0x3fff8
+#define ixSMU_PM_STATUS_127                                                     0x3fffc
+#define ixCG_THERMAL_INT_ENA                                                    0xc2100024
+#define ixCG_THERMAL_INT_CTRL                                                   0xc2100028
+#define ixCG_THERMAL_INT_STATUS                                                 0xc210002c
+#define ixCG_THERMAL_CTRL                                                       0xc0300004
+#define ixCG_THERMAL_STATUS                                                     0xc0300008
+#define ixCG_THERMAL_INT                                                        0xc030000c
+#define ixCG_MULT_THERMAL_CTRL                                                  0xc0300010
+#define ixCG_MULT_THERMAL_STATUS                                                0xc0300014
+#define ixTHM_TMON2_CTRL                                                        0xc0300034
+#define ixTHM_TMON2_CTRL2                                                       0xc0300038
+#define ixTHM_TMON2_CSR_WR                                                      0xc0300054
+#define ixTHM_TMON2_CSR_RD                                                      0xc0300058
+#define ixCG_FDO_CTRL0                                                          0xc0300064
+#define ixCG_FDO_CTRL1                                                          0xc0300068
+#define ixCG_FDO_CTRL2                                                          0xc030006c
+#define ixCG_TACH_CTRL                                                          0xc0300070
+#define ixCG_TACH_STATUS                                                        0xc0300074
+#define ixCC_THM_STRAPS0                                                        0xc0300080
+#define ixTHM_TMON0_RDIL0_DATA                                                  0xc0300100
+#define ixTHM_TMON0_RDIL1_DATA                                                  0xc0300104
+#define ixTHM_TMON0_RDIL2_DATA                                                  0xc0300108
+#define ixTHM_TMON0_RDIL3_DATA                                                  0xc030010c
+#define ixTHM_TMON0_RDIL4_DATA                                                  0xc0300110
+#define ixTHM_TMON0_RDIL5_DATA                                                  0xc0300114
+#define ixTHM_TMON0_RDIL6_DATA                                                  0xc0300118
+#define ixTHM_TMON0_RDIL7_DATA                                                  0xc030011c
+#define ixTHM_TMON0_RDIL8_DATA                                                  0xc0300120
+#define ixTHM_TMON0_RDIL9_DATA                                                  0xc0300124
+#define ixTHM_TMON0_RDIL10_DATA                                                 0xc0300128
+#define ixTHM_TMON0_RDIL11_DATA                                                 0xc030012c
+#define ixTHM_TMON0_RDIL12_DATA                                                 0xc0300130
+#define ixTHM_TMON0_RDIL13_DATA                                                 0xc0300134
+#define ixTHM_TMON0_RDIL14_DATA                                                 0xc0300138
+#define ixTHM_TMON0_RDIL15_DATA                                                 0xc030013c
+#define ixTHM_TMON0_RDIR0_DATA                                                  0xc0300140
+#define ixTHM_TMON0_RDIR1_DATA                                                  0xc0300144
+#define ixTHM_TMON0_RDIR2_DATA                                                  0xc0300148
+#define ixTHM_TMON0_RDIR3_DATA                                                  0xc030014c
+#define ixTHM_TMON0_RDIR4_DATA                                                  0xc0300150
+#define ixTHM_TMON0_RDIR5_DATA                                                  0xc0300154
+#define ixTHM_TMON0_RDIR6_DATA                                                  0xc0300158
+#define ixTHM_TMON0_RDIR7_DATA                                                  0xc030015c
+#define ixTHM_TMON0_RDIR8_DATA                                                  0xc0300160
+#define ixTHM_TMON0_RDIR9_DATA                                                  0xc0300164
+#define ixTHM_TMON0_RDIR10_DATA                                                 0xc0300168
+#define ixTHM_TMON0_RDIR11_DATA                                                 0xc030016c
+#define ixTHM_TMON0_RDIR12_DATA                                                 0xc0300170
+#define ixTHM_TMON0_RDIR13_DATA                                                 0xc0300174
+#define ixTHM_TMON0_RDIR14_DATA                                                 0xc0300178
+#define ixTHM_TMON0_RDIR15_DATA                                                 0xc030017c
+#define ixTHM_TMON1_RDIL0_DATA                                                  0xc0300180
+#define ixTHM_TMON1_RDIL1_DATA                                                  0xc0300184
+#define ixTHM_TMON1_RDIL2_DATA                                                  0xc0300188
+#define ixTHM_TMON1_RDIL3_DATA                                                  0xc030018c
+#define ixTHM_TMON1_RDIL4_DATA                                                  0xc0300190
+#define ixTHM_TMON1_RDIL5_DATA                                                  0xc0300194
+#define ixTHM_TMON1_RDIL6_DATA                                                  0xc0300198
+#define ixTHM_TMON1_RDIL7_DATA                                                  0xc030019c
+#define ixTHM_TMON1_RDIL8_DATA                                                  0xc03001a0
+#define ixTHM_TMON1_RDIL9_DATA                                                  0xc03001a4
+#define ixTHM_TMON1_RDIL10_DATA                                                 0xc03001a8
+#define ixTHM_TMON1_RDIL11_DATA                                                 0xc03001ac
+#define ixTHM_TMON1_RDIL12_DATA                                                 0xc03001b0
+#define ixTHM_TMON1_RDIL13_DATA                                                 0xc03001b4
+#define ixTHM_TMON1_RDIL14_DATA                                                 0xc03001b8
+#define ixTHM_TMON1_RDIL15_DATA                                                 0xc03001bc
+#define ixTHM_TMON1_RDIR0_DATA                                                  0xc03001c0
+#define ixTHM_TMON1_RDIR1_DATA                                                  0xc03001c4
+#define ixTHM_TMON1_RDIR2_DATA                                                  0xc03001c8
+#define ixTHM_TMON1_RDIR3_DATA                                                  0xc03001cc
+#define ixTHM_TMON1_RDIR4_DATA                                                  0xc03001d0
+#define ixTHM_TMON1_RDIR5_DATA                                                  0xc03001d4
+#define ixTHM_TMON1_RDIR6_DATA                                                  0xc03001d8
+#define ixTHM_TMON1_RDIR7_DATA                                                  0xc03001dc
+#define ixTHM_TMON1_RDIR8_DATA                                                  0xc03001e0
+#define ixTHM_TMON1_RDIR9_DATA                                                  0xc03001e4
+#define ixTHM_TMON1_RDIR10_DATA                                                 0xc03001e8
+#define ixTHM_TMON1_RDIR11_DATA                                                 0xc03001ec
+#define ixTHM_TMON1_RDIR12_DATA                                                 0xc03001f0
+#define ixTHM_TMON1_RDIR13_DATA                                                 0xc03001f4
+#define ixTHM_TMON1_RDIR14_DATA                                                 0xc03001f8
+#define ixTHM_TMON1_RDIR15_DATA                                                 0xc03001fc
+#define ixTHM_TMON2_RDIL0_DATA                                                  0xc0300200
+#define ixTHM_TMON2_RDIL1_DATA                                                  0xc0300204
+#define ixTHM_TMON2_RDIL2_DATA                                                  0xc0300208
+#define ixTHM_TMON2_RDIL3_DATA                                                  0xc030020c
+#define ixTHM_TMON2_RDIL4_DATA                                                  0xc0300210
+#define ixTHM_TMON2_RDIL5_DATA                                                  0xc0300214
+#define ixTHM_TMON2_RDIL6_DATA                                                  0xc0300218
+#define ixTHM_TMON2_RDIL7_DATA                                                  0xc030021c
+#define ixTHM_TMON2_RDIL8_DATA                                                  0xc0300220
+#define ixTHM_TMON2_RDIL9_DATA                                                  0xc0300224
+#define ixTHM_TMON2_RDIL10_DATA                                                 0xc0300228
+#define ixTHM_TMON2_RDIL11_DATA                                                 0xc030022c
+#define ixTHM_TMON2_RDIL12_DATA                                                 0xc0300230
+#define ixTHM_TMON2_RDIL13_DATA                                                 0xc0300234
+#define ixTHM_TMON2_RDIL14_DATA                                                 0xc0300238
+#define ixTHM_TMON2_RDIL15_DATA                                                 0xc030023c
+#define ixTHM_TMON2_RDIR0_DATA                                                  0xc0300240
+#define ixTHM_TMON2_RDIR1_DATA                                                  0xc0300244
+#define ixTHM_TMON2_RDIR2_DATA                                                  0xc0300248
+#define ixTHM_TMON2_RDIR3_DATA                                                  0xc030024c
+#define ixTHM_TMON2_RDIR4_DATA                                                  0xc0300250
+#define ixTHM_TMON2_RDIR5_DATA                                                  0xc0300254
+#define ixTHM_TMON2_RDIR6_DATA                                                  0xc0300258
+#define ixTHM_TMON2_RDIR7_DATA                                                  0xc030025c
+#define ixTHM_TMON2_RDIR8_DATA                                                  0xc0300260
+#define ixTHM_TMON2_RDIR9_DATA                                                  0xc0300264
+#define ixTHM_TMON2_RDIR10_DATA                                                 0xc0300268
+#define ixTHM_TMON2_RDIR11_DATA                                                 0xc030026c
+#define ixTHM_TMON2_RDIR12_DATA                                                 0xc0300270
+#define ixTHM_TMON2_RDIR13_DATA                                                 0xc0300274
+#define ixTHM_TMON2_RDIR14_DATA                                                 0xc0300278
+#define ixTHM_TMON2_RDIR15_DATA                                                 0xc030027c
+#define ixTHM_TMON0_INT_DATA                                                    0xc0300300
+#define ixTHM_TMON1_INT_DATA                                                    0xc0300304
+#define ixTHM_TMON2_INT_DATA                                                    0xc0300308
+#define ixTHM_TMON0_DEBUG                                                       0xc0300310
+#define ixTHM_TMON1_DEBUG                                                       0xc0300314
+#define ixTHM_TMON2_DEBUG                                                       0xc0300318
+#define ixTHM_TMON0_STATUS                                                      0xc0300320
+#define ixTHM_TMON1_STATUS                                                      0xc0300324
+#define ixTHM_TMON2_STATUS                                                      0xc0300328
+#define ixGENERAL_PWRMGT                                                        0xc0200000
+#define ixCNB_PWRMGT_CNTL                                                       0xc0200004
+#define ixSCLK_PWRMGT_CNTL                                                      0xc0200008
+#define ixTARGET_AND_CURRENT_PROFILE_INDEX                                      0xc0200014
+#define ixPWR_PCC_CONTROL                                                       0xc0200018
+#define ixPWR_PCC_GPIO_SELECT                                                   0xc020001c
+#define ixCG_FREQ_TRAN_VOTING_0                                                 0xc02001a8
+#define ixCG_FREQ_TRAN_VOTING_1                                                 0xc02001ac
+#define ixCG_FREQ_TRAN_VOTING_2                                                 0xc02001b0
+#define ixCG_FREQ_TRAN_VOTING_3                                                 0xc02001b4
+#define ixCG_FREQ_TRAN_VOTING_4                                                 0xc02001b8
+#define ixCG_FREQ_TRAN_VOTING_5                                                 0xc02001bc
+#define ixCG_FREQ_TRAN_VOTING_6                                                 0xc02001c0
+#define ixCG_FREQ_TRAN_VOTING_7                                                 0xc02001c4
+#define ixPLL_TEST_CNTL                                                         0xc020003c
+#define ixCG_STATIC_SCREEN_PARAMETER                                            0xc0200044
+#define ixCG_DISPLAY_GAP_CNTL                                                   0xc0200060
+#define ixCG_DISPLAY_GAP_CNTL2                                                  0xc0200230
+#define ixCG_ACPI_CNTL                                                          0xc0200064
+#define ixSCLK_DEEP_SLEEP_CNTL                                                  0xc0200080
+#define ixSCLK_DEEP_SLEEP_CNTL2                                                 0xc0200084
+#define ixSCLK_DEEP_SLEEP_CNTL3                                                 0xc020009c
+#define ixSCLK_DEEP_SLEEP_MISC_CNTL                                             0xc0200088
+#define ixLCLK_DEEP_SLEEP_CNTL                                                  0xc020008c
+#define ixLCLK_DEEP_SLEEP_CNTL2                                                 0xc0200310
+#define ixTARGET_AND_CURRENT_PROFILE_INDEX_1                                    0xc02000f0
+#define ixCG_ULV_PARAMETER                                                      0xc020015c
+#define ixSCLK_MIN_DIV                                                          0xc02003ac
+#define ixPWR_AVFS_SEL                                                          0xc0200384
+#define ixPWR_AVFS_CNTL                                                         0xc0200388
+#define ixPWR_AVFS0_CNTL_STATUS                                                 0xc0200400
+#define ixPWR_AVFS1_CNTL_STATUS                                                 0xc0200404
+#define ixPWR_AVFS2_CNTL_STATUS                                                 0xc0200408
+#define ixPWR_AVFS3_CNTL_STATUS                                                 0xc020040c
+#define ixPWR_AVFS4_CNTL_STATUS                                                 0xc0200410
+#define ixPWR_AVFS5_CNTL_STATUS                                                 0xc0200414
+#define ixPWR_AVFS6_CNTL_STATUS                                                 0xc0200418
+#define ixPWR_AVFS7_CNTL_STATUS                                                 0xc020041c
+#define ixPWR_AVFS8_CNTL_STATUS                                                 0xc0200420
+#define ixPWR_AVFS9_CNTL_STATUS                                                 0xc0200424
+#define ixPWR_AVFS10_CNTL_STATUS                                                0xc0200428
+#define ixPWR_AVFS11_CNTL_STATUS                                                0xc020042c
+#define ixPWR_AVFS12_CNTL_STATUS                                                0xc0200430
+#define ixPWR_AVFS13_CNTL_STATUS                                                0xc0200434
+#define ixPWR_AVFS14_CNTL_STATUS                                                0xc0200438
+#define ixPWR_AVFS15_CNTL_STATUS                                                0xc020043c
+#define ixPWR_AVFS16_CNTL_STATUS                                                0xc0200440
+#define ixPWR_AVFS17_CNTL_STATUS                                                0xc0200444
+#define ixPWR_AVFS18_CNTL_STATUS                                                0xc0200448
+#define ixPWR_AVFS19_CNTL_STATUS                                                0xc020044c
+#define ixPWR_AVFS20_CNTL_STATUS                                                0xc0200450
+#define ixPWR_AVFS21_CNTL_STATUS                                                0xc0200454
+#define ixPWR_AVFS22_CNTL_STATUS                                                0xc0200458
+#define ixPWR_AVFS23_CNTL_STATUS                                                0xc020045c
+#define ixPWR_AVFS24_CNTL_STATUS                                                0xc0200460
+#define ixPWR_AVFS25_CNTL_STATUS                                                0xc0200464
+#define ixPWR_AVFS26_CNTL_STATUS                                                0xc0200468
+#define ixPWR_AVFS27_CNTL_STATUS                                                0xc020046c
+#define ixPWR_CKS_ENABLE                                                        0xc020034c
+#define ixPWR_CKS_CNTL                                                          0xc0200350
+#define ixPWR_DISP_TIMER_CONTROL                                                0xc02003c0
+#define ixPWR_DISP_TIMER_DEBUG                                                  0xc02003c4
+#define ixPWR_DISP_TIMER2_CONTROL                                               0xc02003c8
+#define ixPWR_DISP_TIMER2_DEBUG                                                 0xc02003cc
+#define ixPWR_DISP_TIMER_CONTROL2                                               0xc0200378
+#define ixVDDGFX_IDLE_PARAMETER                                                 0xc020036c
+#define ixVDDGFX_IDLE_CONTROL                                                   0xc0200370
+#define ixVDDGFX_IDLE_EXIT                                                      0xc0200374
+#define ixLCAC_MC0_CNTL                                                         0xc0400130
+#define ixLCAC_MC0_OVR_SEL                                                      0xc0400134
+#define ixLCAC_MC0_OVR_VAL                                                      0xc0400138
+#define ixLCAC_MC1_CNTL                                                         0xc040013c
+#define ixLCAC_MC1_OVR_SEL                                                      0xc0400140
+#define ixLCAC_MC1_OVR_VAL                                                      0xc0400144
+#define ixLCAC_MC2_CNTL                                                         0xc0400148
+#define ixLCAC_MC2_OVR_SEL                                                      0xc040014c
+#define ixLCAC_MC2_OVR_VAL                                                      0xc0400150
+#define ixLCAC_MC3_CNTL                                                         0xc0400154
+#define ixLCAC_MC3_OVR_SEL                                                      0xc0400158
+#define ixLCAC_MC3_OVR_VAL                                                      0xc040015c
+#define ixLCAC_MC4_CNTL                                                         0xc0400d60
+#define ixLCAC_MC4_OVR_SEL                                                      0xc0400d64
+#define ixLCAC_MC4_OVR_VAL                                                      0xc0400d68
+#define ixLCAC_MC5_CNTL                                                         0xc0400d6c
+#define ixLCAC_MC5_OVR_SEL                                                      0xc0400d70
+#define ixLCAC_MC5_OVR_VAL                                                      0xc0400d74
+#define ixLCAC_MC6_CNTL                                                         0xc0400d78
+#define ixLCAC_MC6_OVR_SEL                                                      0xc0400d7c
+#define ixLCAC_MC6_OVR_VAL                                                      0xc0400d80
+#define ixLCAC_MC7_CNTL                                                         0xc0400d84
+#define ixLCAC_MC7_OVR_SEL                                                      0xc0400d88
+#define ixLCAC_MC7_OVR_VAL                                                      0xc0400d8c
+#define ixLCAC_CPL_CNTL                                                         0xc0400160
+#define ixLCAC_CPL_OVR_SEL                                                      0xc0400164
+#define ixLCAC_CPL_OVR_VAL                                                      0xc0400168
+#define mmROM_SMC_IND_INDEX                                                     0x80
+#define mmROM0_ROM_SMC_IND_INDEX                                                0x80
+#define mmROM1_ROM_SMC_IND_INDEX                                                0x82
+#define mmROM2_ROM_SMC_IND_INDEX                                                0x84
+#define mmROM3_ROM_SMC_IND_INDEX                                                0x86
+#define mmROM_SMC_IND_DATA                                                      0x81
+#define mmROM0_ROM_SMC_IND_DATA                                                 0x81
+#define mmROM1_ROM_SMC_IND_DATA                                                 0x83
+#define mmROM2_ROM_SMC_IND_DATA                                                 0x85
+#define mmROM3_ROM_SMC_IND_DATA                                                 0x87
+#define ixROM_CNTL                                                              0xc0600000
+#define ixPAGE_MIRROR_CNTL                                                      0xc0600004
+#define ixROM_STATUS                                                            0xc0600008
+#define ixCGTT_ROM_CLK_CTRL0                                                    0xc060000c
+#define ixROM_INDEX                                                             0xc0600010
+#define ixROM_DATA                                                              0xc0600014
+#define ixROM_START                                                             0xc0600018
+#define ixROM_SW_CNTL                                                           0xc060001c
+#define ixROM_SW_STATUS                                                         0xc0600020
+#define ixROM_SW_COMMAND                                                        0xc0600024
+#define ixROM_SW_DATA_1                                                         0xc0600028
+#define ixROM_SW_DATA_2                                                         0xc060002c
+#define ixROM_SW_DATA_3                                                         0xc0600030
+#define ixROM_SW_DATA_4                                                         0xc0600034
+#define ixROM_SW_DATA_5                                                         0xc0600038
+#define ixROM_SW_DATA_6                                                         0xc060003c
+#define ixROM_SW_DATA_7                                                         0xc0600040
+#define ixROM_SW_DATA_8                                                         0xc0600044
+#define ixROM_SW_DATA_9                                                         0xc0600048
+#define ixROM_SW_DATA_10                                                        0xc060004c
+#define ixROM_SW_DATA_11                                                        0xc0600050
+#define ixROM_SW_DATA_12                                                        0xc0600054
+#define ixROM_SW_DATA_13                                                        0xc0600058
+#define ixROM_SW_DATA_14                                                        0xc060005c
+#define ixROM_SW_DATA_15                                                        0xc0600060
+#define ixROM_SW_DATA_16                                                        0xc0600064
+#define ixROM_SW_DATA_17                                                        0xc0600068
+#define ixROM_SW_DATA_18                                                        0xc060006c
+#define ixROM_SW_DATA_19                                                        0xc0600070
+#define ixROM_SW_DATA_20                                                        0xc0600074
+#define ixROM_SW_DATA_21                                                        0xc0600078
+#define ixROM_SW_DATA_22                                                        0xc060007c
+#define ixROM_SW_DATA_23                                                        0xc0600080
+#define ixROM_SW_DATA_24                                                        0xc0600084
+#define ixROM_SW_DATA_25                                                        0xc0600088
+#define ixROM_SW_DATA_26                                                        0xc060008c
+#define ixROM_SW_DATA_27                                                        0xc0600090
+#define ixROM_SW_DATA_28                                                        0xc0600094
+#define ixROM_SW_DATA_29                                                        0xc0600098
+#define ixROM_SW_DATA_30                                                        0xc060009c
+#define ixROM_SW_DATA_31                                                        0xc06000a0
+#define ixROM_SW_DATA_32                                                        0xc06000a4
+#define ixROM_SW_DATA_33                                                        0xc06000a8
+#define ixROM_SW_DATA_34                                                        0xc06000ac
+#define ixROM_SW_DATA_35                                                        0xc06000b0
+#define ixROM_SW_DATA_36                                                        0xc06000b4
+#define ixROM_SW_DATA_37                                                        0xc06000b8
+#define ixROM_SW_DATA_38                                                        0xc06000bc
+#define ixROM_SW_DATA_39                                                        0xc06000c0
+#define ixROM_SW_DATA_40                                                        0xc06000c4
+#define ixROM_SW_DATA_41                                                        0xc06000c8
+#define ixROM_SW_DATA_42                                                        0xc06000cc
+#define ixROM_SW_DATA_43                                                        0xc06000d0
+#define ixROM_SW_DATA_44                                                        0xc06000d4
+#define ixROM_SW_DATA_45                                                        0xc06000d8
+#define ixROM_SW_DATA_46                                                        0xc06000dc
+#define ixROM_SW_DATA_47                                                        0xc06000e0
+#define ixROM_SW_DATA_48                                                        0xc06000e4
+#define ixROM_SW_DATA_49                                                        0xc06000e8
+#define ixROM_SW_DATA_50                                                        0xc06000ec
+#define ixROM_SW_DATA_51                                                        0xc06000f0
+#define ixROM_SW_DATA_52                                                        0xc06000f4
+#define ixROM_SW_DATA_53                                                        0xc06000f8
+#define ixROM_SW_DATA_54                                                        0xc06000fc
+#define ixROM_SW_DATA_55                                                        0xc0600100
+#define ixROM_SW_DATA_56                                                        0xc0600104
+#define ixROM_SW_DATA_57                                                        0xc0600108
+#define ixROM_SW_DATA_58                                                        0xc060010c
+#define ixROM_SW_DATA_59                                                        0xc0600110
+#define ixROM_SW_DATA_60                                                        0xc0600114
+#define ixROM_SW_DATA_61                                                        0xc0600118
+#define ixROM_SW_DATA_62                                                        0xc060011c
+#define ixROM_SW_DATA_63                                                        0xc0600120
+#define ixROM_SW_DATA_64                                                        0xc0600124
+#define mmGC_CAC_CGTT_CLK_CTRL                                                  0x3292
+#define mmSE_CAC_CGTT_CLK_CTRL                                                  0x3293
+#define mmGC_CAC_LKG_AGGR_LOWER                                                 0x3296
+#define mmGC_CAC_LKG_AGGR_UPPER                                                 0x3297
+#define ixGC_CAC_WEIGHT_CU_0                                                    0x32
+#define ixGC_CAC_WEIGHT_CU_1                                                    0x33
+#define ixGC_CAC_WEIGHT_CU_2                                                    0x34
+#define ixGC_CAC_WEIGHT_CU_3                                                    0x35
+#define ixGC_CAC_WEIGHT_CU_4                                                    0x36
+#define ixGC_CAC_WEIGHT_CU_5                                                    0x37
+#define ixGC_CAC_WEIGHT_CU_6                                                    0x38
+#define ixGC_CAC_WEIGHT_CU_7                                                    0x39
+#define ixGC_CAC_ACC_CU0                                                        0xba
+#define ixGC_CAC_ACC_CU1                                                        0xbb
+#define ixGC_CAC_ACC_CU2                                                        0xbc
+#define ixGC_CAC_ACC_CU3                                                        0xbd
+#define ixGC_CAC_ACC_CU4                                                        0xbe
+#define ixGC_CAC_ACC_CU5                                                        0xbf
+#define ixGC_CAC_ACC_CU6                                                        0xc0
+#define ixGC_CAC_ACC_CU7                                                        0xc1
+#define ixGC_CAC_ACC_CU8                                                        0xc2
+#define ixGC_CAC_ACC_CU9                                                        0xc3
+#define ixGC_CAC_ACC_CU10                                                       0xc4
+#define ixGC_CAC_ACC_CU11                                                       0xc5
+#define ixGC_CAC_ACC_CU12                                                       0xc6
+#define ixGC_CAC_ACC_CU13                                                       0xc7
+#define ixGC_CAC_ACC_CU14                                                       0xc8
+#define ixGC_CAC_ACC_CU15                                                       0xc9
+#define ixGC_CAC_OVRD_CU                                                        0xe7
+
+#endif /* SMU_7_1_3_D_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+ * SMU_7_1_3 Register documentation
  *
- * Copyright (C) 2008 Chipidea - MIPS Technologies, Inc. All rights reserved.
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
  *
- * Author: David Lopo
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/delay.h>
-#include <linux/device.h>
-#include <linux/dmapool.h>
-#include <linux/err.h>
-#include <linux/irqreturn.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/pm_runtime.h>
-#include <linux/usb/ch9.h>
-#include <linux/usb/gadget.h>
-#include <linux/usb/otg-fsm.h>
-#include <linux/usb/chipidea.h>
-
-#include "ci.h"
-#include "udc.h"
-#include "bits.h"
-#include "debug.h"
-#include "otg.h"
-#include "otg_fsm.h"
-
-/* control endpoint description */
-static const struct usb_endpoint_descriptor
-ctrl_endpt_out_desc = {
-	.bLength         = USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType = USB_DT_ENDPOINT,
-
-	.bEndpointAddress = USB_DIR_OUT,
-	.bmAttributes    = USB_ENDPOINT_XFER_CONTROL,
-	.wMaxPacketSize  = cpu_to_le16(CTRL_PAYLOAD_MAX),
-};
-
-static const struct usb_endpoint_descriptor
-ctrl_endpt_in_desc = {
-	.bLength         = USB_DT_ENDPOINT_SIZE,
-	.bDescriptorType = USB_DT_ENDPOINT,
-
-	.bEndpointAddress = USB_DIR_IN,
-	.bmAttributes    = USB_ENDPOINT_XFER_CONTROL,
-	.wMaxPacketSize  = cpu_to_le16(CTRL_PAYLOAD_MAX),
-};
-
-/**
- * hw_ep_bit: calculates the bit number
- * @num: endpoint number
- * @dir: endpoint direction
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
  *
- * This function returns bit number
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-static inline int hw_ep_bit(int num, int dir)
-{
-	return num + (dir ? 16 : 0);
-}
 
-static inline int ep_to_bit(struct ci_hdrc *ci, int n)
-{
-	int fill = 16 - ci->hw_ep_max / 2;
-
-	if (n >= ci->hw_ep_max / 2)
-		n += fill;
-
-	return n;
-}
-
-/**
- * hw_device_state: enables/disables interrupts (execute without interruption)
- * @dma: 0 => disable, !0 => enable and set dma engine
- *
- * This function returns an error code
- */
-static int hw_device_state(struct ci_hdrc *ci, u32 dma)
-{
-	if (dma) {
-		hw_write(ci, OP_ENDPTLISTADDR, ~0, dma);
-		/* interrupt, error, port change, reset, sleep/suspend */
-		hw_write(ci, OP_USBINTR, ~0,
-			     USBi_UI|USBi_UEI|USBi_PCI|USBi_URI|USBi_SLI);
-	} else {
-		hw_write(ci, OP_USBINTR, ~0, 0);
-	}
-	return 0;
-}
-
-/**
- * hw_ep_flush: flush endpoint fifo (execute without interruption)
- * @num: endpoint number
- * @dir: endpoint direction
- *
- * This function returns an error code
- */
-static int hw_ep_flush(struct ci_hdrc *ci, int num, int dir)
-{
-	int n = hw_ep_bit(num, dir);
-
-	do {
-		/* flush any pending transfer */
-		hw_write(ci, OP_ENDPTFLUSH, ~0, BIT(n));
-		while (hw_read(ci, OP_ENDPTFLUSH, BIT(n)))
-			cpu_relax();
-	} while (hw_read(ci, OP_ENDPTSTAT, BIT(n)));
-
-	return 0;
-}
-
-/**
- * hw_ep_disable: disables endpoint (execute without interruption)
- * @num: endpoint number
- * @dir: endpoint direction
- *
- * This function returns an error code
- */
-static int hw_ep_disable(struct ci_hdrc *ci, int num, int dir)
-{
-	hw_ep_flush(ci, num, dir);
-	hw_write(ci, OP_ENDPTCTRL + num,
-		 dir ? ENDPTCTRL_TXE : ENDPTCTRL_RXE, 0);
-	return 0;
-}
-
-/**
- * hw_ep_enable: enables endpoint (execute without interruption)
- * @num:  endpoint number
- * @dir:  endpoint direction
- * @type: endpoint type
- *
- * This function returns an error code
- */
-static int hw_ep_enable(struct ci_hdrc *ci, int num, int dir, int type)
-{
-	u32 mask, data;
-
-	if (dir) {
-		mask  = ENDPTCTRL_TXT;  /* type    */
-		data  = type << __ffs(mask);
-
-		mask |= ENDPTCTRL_TXS;  /* unstall */
-		mask |= ENDPTCTRL_TXR;  /* reset data toggle */
-		data |= ENDPTCTRL_TXR;
-		mask |= ENDPTCTRL_TXE;  /* enable  */
-		data |= ENDPTCTRL_TXE;
-	} else {
-		mask  = ENDPTCTRL_RXT;  /* type    */
-		data  = type << __ffs(mask);
-
-		mask |= ENDPTCTRL_RXS;  /* unstall */
-		mask |= ENDPTCTRL_RXR;  /* reset data toggle */
-		data |= ENDPTCTRL_RXR;
-		mask |= ENDPTCTRL_RXE;  /* enable  */
-		data |= ENDPTCTRL_RXE;
-	}
-	hw_write(ci, OP_ENDPTCTRL + num, mask, data);
-	return 0;
-}
-
-/**
- * hw_ep_get_halt: return endpoint halt status
- * @num: endpoint number
- * @dir: endpoint direction
- *
- * This function returns 1 if endpoint halted
- */
-static int hw_ep_get_halt(struct ci_hdrc *ci, int num, int dir)
-{
-	u32 mask = dir ? ENDPTCTRL_TXS : ENDPTCTRL_RXS;
-
-	return hw_read(ci, OP_ENDPTCTRL + num, mask) ? 1 : 0;
-}
-
-/**
- * hw_ep_prime: primes endpoint (execute without interruption)
- * @num:     endpoint number
- * @dir:     endpoint direction
- * @is_ctrl: true if control endpoint
- *
- * This function returns an error code
- */
-static int hw_ep_prime(struct ci_hdrc *ci, int num, int dir, int is_ctrl)
-{
-	int n = hw_ep_bit(num, dir);
-
-	if (is_ctrl && dir == RX && hw_read(ci, OP_ENDPTSETUPSTAT, BIT(num)))
-		return -EAGAIN;
-
-	hw_write(ci, OP_ENDPTPRIME, ~0, BIT(n));
-
-	while (hw_read(ci, OP_ENDPTPRIME, BIT(n)))
-		cpu_relax();
-	if (is_ctrl && dir == RX && hw_read(ci, OP_ENDPTSETUPSTAT, BIT(num)))
-		return -EAGAIN;
-
-	/* status shoult be tested according with manual but it doesn't work */
-	return 0;
-}
-
-/**
- * hw_ep_set_halt: configures ep halt & resets data toggle after clear (execute
- *                 without interruption)
- * @num:   endpoint number
- * @dir:   endpoint direction
- * @value: true => stall, false => unstall
- *
- * This function returns an error code
- */
-static int hw_ep_set_halt(struct ci_hdrc *ci, int num, int dir, int value)
-{
-	if (value != 0 && value != 1)
-		return -EINVAL;
-
-	do {
-		enum ci_hw_regs reg = OP_ENDPTCTRL + num;
-		u32 mask_xs = dir ? ENDPTCTRL_TXS : ENDPTCTRL_RXS;
-		u32 mask_xr = dir ? ENDPTCTRL_TXR : ENDPTCTRL_RXR;
-
-		/* data toggle - reserved for EP0 but it's in ESS */
-		hw_write(ci, reg, mask_xs|mask_xr,
-			  value ? mask_xs : mask_xr);
-	} while (value != hw_ep_get_halt(ci, num, dir));
-
-	return 0;
-}
-
-/**
- * hw_is_port_high_speed: test if port is high speed
- *
- * This function returns true if high speed port
- */
-static int hw_port_is_high_speed(struct ci_hdrc *ci)
-{
-	return ci->hw_bank.lpm ? hw_read(ci, OP_DEVLC, DEVLC_PSPD) :
-		hw_read(ci, OP_PORTSC, PORTSC_HSP);
-}
-
-/**
- * hw_test_and_clear_complete: test & clear complete status (execute without
- *                             interruption)
- * @n: endpoint number
- *
- * This function returns complete status
- */
-static int hw_test_and_clear_complete(struct ci_hdrc *ci, int n)
-{
-	n = ep_to_bit(ci, n);
-	return hw_test_and_clear(ci, OP_ENDPTCOMPLETE, BIT(n));
-}
-
-/**
- * hw_test_and_clear_intr_active: test & clear active interrupts (execute
- *                                without interruption)
- *
- * This function returns active interrutps
- */
-static u32 hw_test_and_clear_intr_active(struct ci_hdrc *ci)
-{
-	u32 reg = hw_read_intr_status(ci) & hw_read_intr_enable(ci);
-
-	hw_write(ci, OP_USBSTS, ~0, reg);
-	return reg;
-}
-
-/**
- * hw_test_and_clear_setup_guard: test & clear setup guard (execute without
- *                                interruption)
- *
- * This function returns guard value
- */
-static int hw_test_and_clear_setup_guard(struct ci_hdrc *ci)
-{
-	return hw_test_and_write(ci, OP_USBCMD, USBCMD_SUTW, 0);
-}
-
-/**
- * hw_test_and_set_setup_guard: test & set setup guard (execute without
- *                              interruption)
- *
- * This function returns guard value
- */
-static int hw_test_and_set_setup_guard(struct ci_hdrc *ci)
-{
-	return hw_test_and_write(ci, OP_USBCMD, USBCMD_SUTW, USBCMD_SUTW);
-}
-
-/**
- * hw_usb_set_address: configures USB address (execute without interruption)
- * @value: new USB address
- *
- * This function explicitly sets the address, without the "USBADRA" (advance)
- * feature, which is not supported by older versions of the controller.
- */
-static void hw_usb_set_address(struct ci_hdrc *ci, u8 value)
-{
-	hw_write(ci, OP_DEVICEADDR, DEVICEADDR_USBADR,
-		 value << __ffs(DEVICEADDR_USBADR));
-}
-
-/**
- * hw_usb_reset: restart device after a bus reset (execute without
- *               interruption)
- *
- * This function returns an error code
- */
-static int hw_usb_reset(struct ci_hdrc *ci)
-{
-	hw_usb_set_address(ci, 0);
-
-	/* ESS flushes only at end?!? */
-	hw_write(ci, OP_ENDPTFLUSH,    ~0, ~0);
-
-	/* clear setup token semaphores */
-	hw_write(ci, OP_ENDPTSETUPSTAT, 0,  0);
-
-	/* clear complete status */
-	hw_write(ci, OP_ENDPTCOMPLETE,  0,  0);
-
-	/* wait until all bits cleared */
-	while (hw_read(ci, OP_ENDPTPRIME, ~0))
-		udelay(10);             /* not RTOS friendly */
-
-	/* reset all endpoints ? */
-
-	/* reset internal status and wait for further instructions
-	   no need to verify the port reset status (ESS does it) */
-
-	return 0;
-}
-
-/******************************************************************************
- * UTIL block
- *****************************************************************************/
-
-static int add_td_to_list(struct ci_hw_ep *hwep, struct ci_hw_req *hwreq,
-			  unsigned length)
-{
-	int i;
-	u32 temp;
-	struct td_node *lastnode, *node = kzalloc(sizeof(struct td_node),
-						  GFP_ATOMIC);
-
-	if (node == NULL)
-		return -ENOMEM;
-
-	node->ptr = dma_pool_alloc(hwep->td_pool, GFP_ATOMIC,
-				   &node->dma);
-	if (node->ptr == NULL) {
-		kfree(node);
-		return -ENOMEM;
-	}
-
-	memset(node->ptr, 0, sizeof(struct ci_hw_td));
-	node->ptr->token = cpu_to_le32(length << __ffs(TD_TOTAL_BYTES));
-	node->ptr->token &= cpu_to_le32(TD_TOTAL_BYTES);
-	node->ptr->token |= cpu_to_le32(TD_STATUS_ACTIVE);
-	if (hwep->type == USB_ENDPOINT_XFER_ISOC && hwep->dir == TX) {
-		u32 mul = hwreq->req.length / hwep->ep.maxpacket;
-
-		if (hwreq->req.length == 0
-				|| hwreq->req.length % hwep->ep.maxpacket)
-			mul++;
-		node->ptr->token |= mul << __ffs(TD_MULTO);
-	}
-
-	temp = (u32) (hwreq->req.dma + hwreq->req.actual);
-	if (length) {
-		node->ptr->page[0] = cpu_to_le32(temp);
-		for (i = 1; i < TD_PAGE_COUNT; i++) {
-			u32 page = temp + i * CI_HDRC_PAGE_SIZE;
-			page &= ~TD_RESERVED_MASK;
-			node->ptr->page[i] = cpu_to_le32(page);
-		}
-	}
-
-	hwreq->req.actual += length;
-
-	if (!list_empty(&hwreq->tds)) {
-		/* get the last entry */
-		lastnode = list_entry(hwreq->tds.prev,
-				struct td_node, td);
-		lastnode->ptr->next = cpu_to_le32(node->dma);
-	}
-
-	INIT_LIST_HEAD(&node->td);
-	list_add_tail(&node->td, &hwreq->tds);
-
-	return 0;
-}
-
-/**
- * _usb_addr: calculates endpoint address from direction & number
- * @ep:  endpoint
- */
-static inline u8 _usb_addr(struct ci_hw_ep *ep)
-{
-	return ((ep->dir == TX) ? USB_ENDPOINT_DIR_MASK : 0) | ep->num;
-}
-
-/**
- * _hardware_queue: configures a request at hardware level
- * @gadget: gadget
- * @hwep:   endpoint
- *
- * This function returns an error code
- */
-static int _hardware_enqueue(struct ci_hw_ep *hwep, struct ci_hw_req *hwreq)
-{
-	struct ci_hdrc *ci = hwep->ci;
-	int ret = 0;
-	unsigned rest = hwreq->req.length;
-	int pages = TD_PAGE_COUNT;
-	struct td_node *firstnode, *lastnode;
-
-	/* don't queue twice */
-	if (hwreq->req.status == -EALREADY)
-		return -EALREADY;
-
-	hwreq->req.status = -EALREADY;
-
-	ret = usb_gadget_map_request(&ci->gadget, &hwreq->req, hwep->dir);
-	if (ret)
-		return ret;
-
-	/*
-	 * The first buffer could be not page aligned.
-	 * In that case we have to span into one extra td.
-	 */
-	if (hwreq->req.dma % PAGE_SIZE)
-		pages--;
-
-	if (rest == 0)
-		add_td_to_list(hwep, hwreq, 0);
-
-	while (rest > 0) {
-		unsigned count = min(hwreq->req.length - hwreq->req.actual,
-					(unsigned)(pages * CI_HDRC_PAGE_SIZE));
-		add_td_to_list(hwep, hwreq, count);
-		rest -= count;
-	}
-
-	if (hwreq->req.zero && hwreq->req.length && hwep->dir == TX
-	    && (hwreq->req.length % hwep->ep.maxpacket == 0))
-		add_td_to_list(hwep, hwreq, 0);
-
-	firstnode = list_first_entry(&hwreq->tds, struct td_node, td);
-
-	lastnode = list_entry(hwreq->tds.prev,
-		struct td_node, td);
-
-	lastnode->ptr->next = cpu_to_le32(TD_TERMINATE);
-	if (!hwreq->req.no_interrupt)
-		lastnode->ptr->token |= cpu_to_le32(TD_IOC);
-	wmb();
-
-	hwreq->req.actual = 0;
-	if (!list_empty(&hwep->qh.queue)) {
-		struct ci_hw_req *hwreqprev;
-		int n = hw_ep_bit(hwep->num, hwep->dir);
-		int tmp_stat;
-		struct td_node *prevlastnode;
-		u32 next = firstnode->dma & TD_ADDR_MASK;
-
-		hwreqprev = list_entry(hwep->qh.queue.prev,
-				struct ci_hw_req, queue);
-		prevlastnode = list_entry(hwreqprev->tds.prev,
-				struct td_node, td);
-
-		prevlastnode->ptr->next = cpu_to_le32(next);
-		wmb();
-		if (hw_read(ci, OP_ENDPTPRIME, BIT(n)))
-			goto done;
-		do {
-			hw_write(ci, OP_USBCMD, USBCMD_ATDTW, USBCMD_ATDTW);
-			tmp_stat = hw_read(ci, OP_ENDPTSTAT, BIT(n));
-		} while (!hw_read(ci, OP_USBCMD, USBCMD_ATDTW));
-		hw_write(ci, OP_USBCMD, USBCMD_ATDTW, 0);
-		if (tmp_stat)
-			goto done;
-	}
-
-	/*  QH configuration */
-	hwep->qh.ptr->td.next = cpu_to_le32(firstnode->dma);
-	hwep->qh.ptr->td.token &=
-		cpu_to_le32(~(TD_STATUS_HALTED|TD_STATUS_ACTIVE));
-
-	if (hwep->type == USB_ENDPOINT_XFER_ISOC && hwep->dir == RX) {
-		u32 mul = hwreq->req.length / hwep->ep.maxpacket;
-
-		if (hwreq->req.length == 0
-				|| hwreq->req.length % hwep->ep.maxpacket)
-			mul++;
-		hwep->qh.ptr->cap |= mul << __ffs(QH_MULT);
-	}
-
-	wmb();   /* synchronize before ep prime */
-
-	ret = hw_ep_prime(ci, hwep->num, hwep->dir,
-			   hwep->type == USB_ENDPOINT_XFER_CONTROL);
-done:
-	return ret;
-}
-
-/*
- * free_pending_td: remove a pending request for the endpoint
- * @hwep: endpoint
- */
-static void free_pending_td(struct ci_hw_ep *hwep)
-{
-	struct td_node *pending = hwep->pending_td;
-
-	dma_pool_free(hwep->td_pool, pending->ptr, pending->dma);
-	hwep->pending_td = NULL;
-	kfree(pending);
-}
-
-static int reprime_dtd(struct ci_hdrc *ci, struct ci_hw_ep *hwep,
-					   struct td_node *node)
-{
-	hwep->qh.ptr->td.next = node->dma;
-	hwep->qh.ptr->td.token &=
-		cpu_to_le32(~(TD_STATUS_HALTED | TD_STATUS_ACTIVE));
-
-	/* Synchronize before ep prime */
-	wmb();
-
-	return hw_ep_prime(ci, hwep->num, hwep->dir,
-				hwep->type == USB_ENDPOINT_XFER_CONTROL);
-}
-
-/**
- * _hardware_dequeue: handles a request at hardware level
- * @gadget: gadget
- * @hwep:   endpoint
- *
- * This function returns an error code
- */
-static int _hardware_dequeue(struct ci_hw_ep *hwep, struct ci_hw_req *hwreq)
-{
-	u32 tmptoken;
-	struct td_node *node, *tmpnode;
-	unsigned remaining_length;
-	unsigned actual = hwreq->req.length;
-	struct ci_hdrc *ci = hwep->ci;
-
-	if (hwreq->req.status != -EALREADY)
-		return -EINVAL;
-
-	hwreq->req.status = 0;
-
-	list_for_each_entry_safe(node, tmpnode, &hwreq->tds, td) {
-		tmptoken = le32_to_cpu(node->ptr->token);
-		if ((TD_STATUS_ACTIVE & tmptoken) != 0) {
-			int n = hw_ep_bit(hwep->num, hwep->dir);
-
-			if (ci->rev == CI_REVISION_24)
-				if (!hw_read(ci, OP_ENDPTSTAT, BIT(n)))
-					reprime_dtd(ci, hwep, node);
-			hwreq->req.status = -EALREADY;
-			return -EBUSY;
-		}
-
-		remaining_length = (tmptoken & TD_TOTAL_BYTES);
-		remaining_length >>= __ffs(TD_TOTAL_BYTES);
-		actual -= remaining_length;
-
-		hwreq->req.status = tmptoken & TD_STATUS;
-		if ((TD_STATUS_HALTED & hwreq->req.status)) {
-			hwreq->req.status = -EPIPE;
-			break;
-		} else if ((TD_STATUS_DT_ERR & hwreq->req.status)) {
-			hwreq->req.status = -EPROTO;
-			break;
-		} else if ((TD_STATUS_TR_ERR & hwreq->req.status)) {
-			hwreq->req.status = -EILSEQ;
-			break;
-		}
-
-		if (remaining_length) {
-			if (hwep->dir) {
-				hwreq->req.status = -EPROTO;
-				break;
-			}
-		}
-		/*
-		 * As the hardware could still address the freed td
-		 * which will run the udc unusable, the cleanup of the
-		 * td has to be delayed by one.
-		 */
-		if (hwep->pending_td)
-			free_pending_td(hwep);
-
-		hwep->pending_td = node;
-		list_del_init(&node->td);
-	}
-
-	usb_gadget_unmap_request(&hwep->ci->gadget, &hwreq->req, hwep->dir);
-
-	hwreq->req.actual += actual;
-
-	if (hwreq->req.status)
-		return hwreq->req.status;
-
-	return hwreq->req.actual;
-}
-
-/**
- * _ep_nuke: dequeues all endpoint requests
- * @hwep: endpoint
- *
- * This function returns an error code
- * Caller must hold lock
- */
-static int _ep_nuke(struct ci_hw_ep *hwep)
-__releases(hwep->lock)
-__acquires(hwep->lock)
-{
-	struct td_node *node, *tmpnode;
-	if (hwep == NULL)
-		return -EINVAL;
-
-	hw_ep_flush(hwep->ci, hwep->num, hwep->dir);
-
-	while (!list_empty(&hwep->qh.queue)) {
-
-		/* pop oldest request */
-		struct ci_hw_req *hwreq = list_entry(hwep->qh.queue.next,
-						     struct ci_hw_req, queue);
-
-		list_for_each_entry_safe(node, tmpnode, &hwreq->tds, td) {
-			dma_pool_free(hwep->td_pool, node->ptr, node->dma);
-			list_del_init(&node->td);
-			node->ptr = NULL;
-			kfree(node);
-		}
-
-		list_del_init(&hwreq->queue);
-		hwreq->req.status = -ESHUTDOWN;
-
-		if (hwreq->req.complete != NULL) {
-			spin_unlock(hwep->lock);
-			usb_gadget_giveback_request(&hwep->ep, &hwreq->req);
-			spin_lock(hwep->lock);
-		}
-	}
-
-	if (hwep->pending_td)
-		free_pending_td(hwep);
-
-	return 0;
-}
-
-static int _ep_set_halt(struct usb_ep *ep, int value, bool check_transfer)
-{
-	struct ci_hw_ep *hwep = container_of(ep, struct ci_hw_ep, ep);
-	int direction, retval = 0;
-	unsigned long flags;
-
-	if (ep == NULL || hwep->ep.desc == NULL)
-		return -EINVAL;
-
-	if (usb_endpoint_xfer_isoc(hwep->ep.desc))
-		return -EOPNOTSUPP;
-
-	spin_lock_irqsave(hwep->lock, flags);
-
-	if (value && hwep->dir == TX && check_transfer &&
-		!list_empty(&hwep->qh.queue) &&
-			!usb_endpoint_xfer_control(hwep->ep.desc)) {
-		spin_unlock_irqrestore(hwep->lock, flags);
-		return -EAGAIN;
-	}
-
-	direction = hwep->dir;
-	do {
-		retval |= hw_ep_set_halt(hwep->ci, hwep->num, hwep->dir, value);
-
-		if (!value)
-			hwep->wedge = 0;
-
-		if (hwep->type == USB_ENDPOINT_XFER_CONTROL)
-			hwep->dir = (hwep->dir == TX) ? RX : TX;
-
-	} while (hwep->dir != direction);
-
-	spin_unlock_irqrestore(hwep->lock, flags);
-	return retval;
-}
-
-
-/**
- * _gadget_stop_activity: stops all USB activity, flushes & disables all endpts
- * @gadget: gadget
- *
- * This function returns an error code
- */
-static int _gadget_stop_activity(struct usb_gadget *gadget)
-{
-	struct usb_ep *ep;
-	struct ci_hdrc    *ci = container_of(gadget, struct ci_hdrc, gadget);
-	unsigned long flags;
-
-	spin_lock_irqsave(&ci->lock, flags);
-	ci->gadget.speed = USB_SPEED_UNKNOWN;
-	ci->remote_wakeup = 0;
-	ci->suspended = 0;
-	spin_unlock_irqrestore(&ci->lock, flags);
-
-	/* flush all endpoints */
-	gadget_for_each_ep(ep, gadget) {
-		usb_ep_fifo_flush(ep);
-	}
-	usb_ep_fifo_flush(&ci->ep0out->ep);
-	usb_ep_fifo_flush(&ci->ep0in->ep);
-
-	/* make sure to disable all endpoints */
-	gadget_for_each_ep(ep, gadget) {
-		usb_ep_disable(ep);
-	}
-
-	if (ci->status != NULL) {
-		usb_ep_free_request(&ci->ep0in->ep, ci->status);
-		ci->status = NULL;
-	}
-
-	return 0;
-}
-
-/******************************************************************************
- * ISR block
- *****************************************************************************/
-/**
- * isr_reset_handler: USB reset interrupt handler
- * @ci: UDC device
- *
- * This function resets USB engine after a bus reset occurred
- */
-static void isr_reset_handler(struct ci_hdrc *ci)
-__releases(ci->lock)
-__acquires(ci->lock)
-{
-	int retval;
-
-	spin_unlock(&ci->lock);
-	if (ci->gadget.speed != USB_SPEED_UNKNOWN)
-		usb_gadget_udc_reset(&ci->gadget, ci->driver);
-
-	retval = _gadget_stop_activity(&ci->gadget);
-	if (retval)
-		goto done;
-
-	retval = hw_usb_reset(ci);
-	if (retval)
-		goto done;
-
-	ci->status = usb_ep_alloc_request(&ci->ep0in->ep, GFP_ATOMIC);
-	if (ci->status == NULL)
-		retval = -ENOMEM;
-
-done:
-	spin_lock(&ci->lock);
-
-	if (retval)
-		dev_err(ci->dev, "error: %i\n", retval);
-}
-
-/**
- * isr_get_status_complete: get_status request complete function
- * @ep:  endpoint
- * @req: request handled
- *
- * Caller must release lock
- */
-static void isr_get_status_complete(struct usb_ep *ep, struct usb_request *req)
-{
-	if (ep == NULL || req == NULL)
-		return;
-
-	kfree(req->buf);
-	usb_ep_free_request(ep, req);
-}
-
-/**
- * _ep_queue: queues (submits) an I/O request to an endpoint
- *
- * Caller must hold lock
- */
-static int _ep_queue(struct usb_ep *ep, struct usb_request *req,
-		    gfp_t __maybe_unused gfp_flags)
-{
-	struct ci_hw_ep  *hwep  = container_of(ep,  struct ci_hw_ep, ep);
-	struct ci_hw_req *hwreq = container_of(req, struct ci_hw_req, req);
-	struct ci_hdrc *ci = hwep->ci;
-	int retval = 0;
-
-	if (ep == NULL || req == NULL || hwep->ep.desc == NULL)
-		return -EINVAL;
-
-	if (hwep->type == USB_ENDPOINT_XFER_CONTROL) {
-		if (req->length)
-			hwep = (ci->ep0_dir == RX) ?
-			       ci->ep0out : ci->ep0in;
-		if (!list_empty(&hwep->qh.queue)) {
-			_ep_nuke(hwep);
-			retval = -EOVERFLOW;
-			dev_warn(hwep->ci->dev, "endpoint ctrl %X nuked\n",
-				 _usb_addr(hwep));
-		}
-	}
-
-	if (usb_endpoint_xfer_isoc(hwep->ep.desc) &&
-	    hwreq->req.length > (1 + hwep->ep.mult) * hwep->ep.maxpacket) {
-		dev_err(hwep->ci->dev, "request length too big for isochronous\n");
-		return -EMSGSIZE;
-	}
-
-	/* first nuke then test link, e.g. previous status has not sent */
-	if (!list_empty(&hwreq->queue)) {
-		dev_err(hwep->ci->dev, "request already in queue\n");
-		return -EBUSY;
-	}
-
-	/* push request */
-	hwreq->req.status = -EINPROGRESS;
-	hwreq->req.actual = 0;
-
-	retval = _hardware_enqueue(hwep, hwreq);
-
-	if (retval == -EALREADY)
-		retval = 0;
-	if (!retval)
-		list_add_tail(&hwreq->queue, &hwep->qh.queue);
-
-	return retval;
-}
-
-/**
- * isr_get_status_response: get_status request response
- * @ci: ci struct
- * @setup: setup request packet
- *
- * This function returns an error code
- */
-static int isr_get_status_response(struct ci_hdrc *ci,
-				   struct usb_ctrlrequest *setup)
-__releases(hwep->lock)
-__acquires(hwep->lock)
-{
-	struct ci_hw_ep *hwep = ci->ep0in;
-	struct usb_request *req = NULL;
-	gfp_t gfp_flags = GFP_ATOMIC;
-	int dir, num, retval;
-
-	if (hwep == NULL || setup == NULL)
-		return -EINVAL;
-
-	spin_unlock(hwep->lock);
-	req = usb_ep_alloc_request(&hwep->ep, gfp_flags);
-	spin_lock(hwep->lock);
-	if (req == NULL)
-		return -ENOMEM;
-
-	req->complete = isr_get_status_complete;
-	req->length   = 2;
-	req->buf      = kzalloc(req->length, gfp_flags);
-	if (req->buf == NULL) {
-		retval = -ENOMEM;
-		goto err_free_req;
-	}
-
-	if ((setup->bRequestType & USB_RECIP_MASK) == USB_RECIP_DEVICE) {
-		*(u16 *)req->buf = (ci->remote_wakeup << 1) |
-			ci->gadget.is_selfpowered;
-	} else if ((setup->bRequestType & USB_RECIP_MASK) \
-		   == USB_RECIP_ENDPOINT) {
-		dir = (le16_to_cpu(setup->wIndex) & USB_ENDPOINT_DIR_MASK) ?
-			TX : RX;
-		num =  le16_to_cpu(setup->wIndex) & USB_ENDPOINT_NUMBER_MASK;
-		*(u16 *)req->buf = hw_ep_get_halt(ci, num, dir);
-	}
-	/* else do nothing; reserved for future use */
-
-	retval = _ep_queue(&hwep->ep, req, gfp_flags);
-	if (retval)
-		goto err_free_buf;
-
-	return 0;
-
- err_free_buf:
-	kfree(req->buf);
- err_free_req:
-	spin_unlock(hwep->lock);
-	usb_ep_free_request(&hwep->ep, req);
-	spin_lock(hwep->lock);
-	return retval;
-}
-
-/**
- * isr_setup_status_complete: setup_status request complete function
- * @ep:  endpoint
- * @req: request handled
- *
- * Caller must release lock. Put the port in test mode if test mode
- * feature is selected.
- */
-static void
-isr_setup_status_complete(struct usb_ep *ep, struct usb_request *req)
-{
-	struct ci_hdrc *ci = req->context;
-	unsigned long flags;
-
-	if (req->status < 0)
-		return;
-
-	if (ci->setaddr) {
-		hw_usb_set_address(ci, ci->address);
-		ci->setaddr = false;
-		if (ci->address)
-			usb_gadget_set_state(&ci->gadget, USB_STATE_ADDRESS);
-	}
-
-	spin_lock_irqsave(&ci->lock, flags);
-	if (ci->test_mode)
-		hw_port_test_set(ci, ci->test_mode);
-	spin_unlock_irqrestore(&ci->lock, flags);
-}
-
-/**
- * isr_setup_status_phase: queues the status phase of a setup transation
- * @ci: ci struct
- *
- * This function returns an error code
- */
-static int isr_setup_status_phase(struct ci_hdrc *ci)
-{
-	int retval;
-	struct ci_hw_ep *hwep;
-
-	/*
-	 * Unexpected USB controller behavior, caused by bad signal integrity
-	 * or ground reference problems, can lead to isr_setup_status_phase
-	 * being called with ci->status equal to NULL.
-	 * If this situation occurs, you should review your USB hardware design.
-	 */
-	if (WARN_ON_ONCE(!ci->status))
-		return -EPIPE;
-
-	hwep = (ci->ep0_dir == TX) ? ci->ep0out : ci->ep0in;
-	ci->status->context = ci;
-	ci->status->complete = isr_setup_status_complete;
-
-	retval = _ep_queue(&hwep->ep, ci->status, GFP_ATOMIC);
-
-	return retval;
-}
-
-/**
- * isr_tr_complete_low: transaction complete low level handler
- * @hwep: endpoint
- *
- * This function returns an error code
- * Caller must hold lock
- */
-static int isr_tr_complete_low(struct ci_hw_ep *hwep)
-__releases(hwep->lock)
-__acquires(hwep->lock)
-{
-	struct ci_hw_req *hwreq, *hwreqtemp;
-	struct ci_hw_ep *hweptemp = hwep;
-	int retval = 0;
-
-	list_for_each_entry_safe(hwreq, hwreqtemp, &hwep->qh.queue,
-			queue) {
-		retval = _hardware_dequeue(hwep, hwreq);
-		if (retval < 0)
-			break;
-		list_del_init(&hwreq->queue);
-		if (hwreq->req.complete != NULL) {
-			spin_unlock(hwep->lock);
-			if ((hwep->type == USB_ENDPOINT_XFER_CONTROL) &&
-					hwreq->req.length)
-				hweptemp = hwep->ci->ep0in;
-			usb_gadget_giveback_request(&hweptemp->ep, &hwreq->req);
-			spin_lock(hwep->lock);
-		}
-	}
-
-	if (retval == -EBUSY)
-		retval = 0;
-
-	return retval;
-}
-
-static int otg_a_alt_hnp_support(struct ci_hdrc *ci)
-{
-	dev_warn(&ci->gadget.dev,
-		"connect the device to an alternate port if you want HNP\n");
-	return isr_setup_status_phase(ci);
-}
-
-/**
- * isr_setup_packet_handler: setup packet handler
- * @ci: UDC descriptor
- *
- * This function handles setup packet 
- */
-static void isr_setup_packet_handler(struct ci_hdrc *ci)
-__releases(ci->lock)
-__acquires(ci->lock)
-{
-	struct ci_hw_ep *hwep = &ci->ci_hw_ep[0];
-	struct usb_ctrlrequest req;
-	int type, num, dir, err = -EINVAL;
-	u8 tmode = 0;
-
-	/*
-	 * Flush data and handshake transactions of previous
-	 * setup packet.
-	 */
-	_ep_nuke(ci->ep0out);
-	_ep_nuke(ci->ep0in);
-
-	/* read_setup_packet */
-	do {
-		hw_test_and_set_setup_guard(ci);
-		memcpy(&req, &hwep->qh.ptr->setup, sizeof(req));
-	} while (!hw_test_and_clear_setup_guard(ci));
-
-	type = req.bRequestType;
-
-	ci->ep0_dir = (type & USB_DIR_IN) ? TX : RX;
-
-	switch (req.bRequest) {
-	case USB_REQ_CLEAR_FEATURE:
-		if (type == (USB_DIR_OUT|USB_RECIP_ENDPOINT) &&
-				le16_to_cpu(req.wValue) ==
-				USB_ENDPOINT_HALT) {
-			if (req.wLength != 0)
-				break;
-			num  = le16_to_cpu(req.wIndex);
-			dir = num & USB_ENDPOINT_DIR_MASK;
-			num &= USB_ENDPOINT_NUMBER_MASK;
-			if (dir) /* TX */
-				num += ci->hw_ep_max / 2;
-			if (!ci->ci_hw_ep[num].wedge) {
-				spin_unlock(&ci->lock);
-				err = usb_ep_clear_halt(
-					&ci->ci_hw_ep[num].ep);
-				spin_lock(&ci->lock);
-				if (err)
-					break;
-			}
-			err = isr_setup_status_phase(ci);
-		} else if (type == (USB_DIR_OUT|USB_RECIP_DEVICE) &&
-				le16_to_cpu(req.wValue) ==
-				USB_DEVICE_REMOTE_WAKEUP) {
-			if (req.wLength != 0)
-				break;
-			ci->remote_wakeup = 0;
-			err = isr_setup_status_phase(ci);
-		} else {
-			goto delegate;
-		}
-		break;
-	case USB_REQ_GET_STATUS:
-		if (type != (USB_DIR_IN|USB_RECIP_DEVICE)   &&
-		    type != (USB_DIR_IN|USB_RECIP_ENDPOINT) &&
-		    type != (USB_DIR_IN|USB_RECIP_INTERFACE))
-			goto delegate;
-		if (le16_to_cpu(req.wLength) != 2 ||
-		    le16_to_cpu(req.wValue)  != 0)
-			break;
-		err = isr_get_status_response(ci, &req);
-		break;
-	case USB_REQ_SET_ADDRESS:
-		if (type != (USB_DIR_OUT|USB_RECIP_DEVICE))
-			goto delegate;
-		if (le16_to_cpu(req.wLength) != 0 ||
-		    le16_to_cpu(req.wIndex)  != 0)
-			break;
-		ci->address = (u8)le16_to_cpu(req.wValue);
-		ci->setaddr = true;
-		err = isr_setup_status_phase(ci);
-		break;
-	case USB_REQ_SET_FEATURE:
-		if (type == (USB_DIR_OUT|USB_RECIP_ENDPOINT) &&
-				le16_to_cpu(req.wValue) ==
-				USB_ENDPOINT_HALT) {
-			if (req.wLength != 0)
-				break;
-			num  = le16_to_cpu(req.wIndex);
-			dir = num & USB_ENDPOINT_DIR_MASK;
-			num &= USB_ENDPOINT_NUMBER_MASK;
-			if (dir) /* TX */
-				num += ci->hw_ep_max / 2;
-
-			spin_unlock(&ci->lock);
-			err = _ep_set_halt(&ci->ci_hw_ep[num].ep, 1, false);
-			spin_lock(&ci->lock);
-			if (!err)
-				isr_setup_status_phase(ci);
-		} else if (type == (USB_DIR_OUT|USB_RECIP_DEVICE)) {
-			if (req.wLength != 0)
-				break;
-			switch (le16_to_cpu(req.wValue)) {
-			case USB_DEVICE_REMOTE_WAKEUP:
-				ci->remote_wakeup = 1;
-				err = isr_setup_status_phase(ci);
-				break;
-			case USB_DEVICE_TEST_MODE:
-				tmode = le16_to_cpu(req.wIndex) >> 8;
-				switch (tmode) {
-				case TEST_J:
-				case TEST_K:
-				case TEST_SE0_NAK:
-				case TEST_PACKET:
-				case TEST_FORCE_EN:
-					ci->test_mode = tmode;
-					err = isr_setup_status_phase(
-							ci);
-					break;
-				default:
-					break;
-				}
-				break;
-			case USB_DEVICE_B_HNP_ENABLE:
-				if (ci_otg_is_fsm_mode(ci)) {
-					ci->gadget.b_hnp_enable = 1;
-					err = isr_setup_status_phase(
-							ci);
-				}
-				break;
-			case USB_DEVICE_A_ALT_HNP_SUPPORT:
-				if (ci_otg_is_fsm_mode(ci))
-					err = otg_a_alt_hnp_support(ci);
-				break;
-			case USB_DEVICE_A_HNP_SUPPORT:
-				if (ci_otg_is_fsm_mode(ci)) {
-					ci->gadget.a_hnp_support = 1;
-					err = isr_setup_status_phase(
-							ci);
-				}
-				break;
-			default:
-				goto delegate;
-			}
-		} else {
-			goto delegate;
-		}
-		break;
-	default:
-delegate:
-		if (req.wLength == 0)   /* no data phase */
-			ci->ep0_dir = TX;
-
-		spin_unlock(&ci->lock);
-		err = ci->driver->setup(&ci->gadget, &req);
-		spin_lock(&ci->lock);
-		break;
-	}
-
-	if (err < 0) {
-		spin_unlock(&ci->lock);
-		if (_ep_set_halt(&hwep->ep, 1, false))
-			dev_err(ci->dev, "error: _ep_set_halt\n");
-		spin_lock(&ci->lock);
-	}
-}
-
-/**
- * isr_tr_complete_handler: transaction complete interrupt handler
- * @ci: UDC descriptor
- *
- * This function handles traffic events
- */
-static void isr_tr_complete_handler(struct ci_hdrc *ci)
-__releases(ci->lock)
-__acquires(ci->lock)
-{
-	unsigned i;
-	int err;
-
-	for (i = 0; i < ci->hw_ep_max; i++) {
-		struct ci_hw_ep *hwep  = &ci->ci_hw_ep[i];
-
-		if (hwep->ep.desc == NULL)
-			continue;   /* not configured */
-
-		if (hw_test_and_clear_complete(ci, i)) {
-			err = isr_tr_complete_low(hwep);
-			if (hwep->type == USB_ENDPOINT_XFER_CONTROL) {
-				if (err > 0)   /* needs status phase */
-					err = isr_setup_status_phase(ci);
-				if (err < 0) {
-					spin_unlock(&ci->lock);
-					if (_ep_set_halt(&hwep->ep, 1, false))
-						dev_err(ci->dev,
-						"error: _ep_set_halt\n");
-					spin_lock(&ci->lock);
-				}
-			}
-		}
-
-		/* Only handle setup packet below */
-		if (i == 0 &&
-			hw_test_and_clear(ci, OP_ENDPTSETUPSTAT, BIT(0)))
-			isr_setup_packet_handler(ci);
-	}
-}
-
-/******************************************************************************
- * ENDPT block
- *****************************************************************************/
-/**
- * ep_enable: configure endpoint, making it usable
- *
- * Check usb_ep_enable() at "usb_gadget.h" for details
- */
-static int ep_enable(struct usb_ep *ep,
-		     const struct usb_endpoint_descriptor *desc)
-{
-	struct ci_hw_ep *hwep = container_of(ep, struct ci_hw_ep, ep);
-	int retval = 0;
-	unsigned long flags;
-	u32 cap = 0;
-
-	if (ep == NULL || desc == NULL)
-		return -EINVAL;
-
-	spin_lock_irqsave(hwep->lock, flags);
-
-	/* only internal SW should enable ctrl endpts */
-
-	if (!list_empty(&hwep->qh.queue)) {
-		dev_warn(hwep->ci->dev, "enabling a non-empty endpoint!\n");
-		spin_unlock_irqrestore(hwep->lock, flags);
-		return -EBUSY;
-	}
-
-	hwep->ep.desc = desc;
-
-	hwep->dir  = usb_endpoint_dir_in(desc) ? TX : RX;
-	hwep->num  = usb_endpoint_num(desc);
-	hwep->type = usb_endpoint_type(desc);
-
-	hwep->ep.maxpacket = usb_endpoint_maxp(desc) & 0x07ff;
-	hwep->ep.mult = QH_ISO_MULT(usb_endpoint_maxp(desc));
-
-	if (hwep->type == USB_ENDPOINT_XFER_CONTROL)
-		cap |= QH_IOS;
-
-	cap |= QH_ZLT;
-	cap |= (hwep->ep.maxpacket << __ffs(QH_MAX_PKT)) & QH_MAX_PKT;
-	/*
-	 * For ISO-TX, we set mult at QH as the largest value, and use
-	 * MultO at TD as real mult value.
-	 */
-	if (hwep->type == USB_ENDPOINT_XFER_ISOC && hwep->dir == TX)
-		cap |= 3 << __ffs(QH_MULT);
-
-	hwep->qh.ptr->cap = cpu_to_le32(cap);
-
-	hwep->qh.ptr->td.next |= cpu_to_le32(TD_TERMINATE);   /* needed? */
-
-	if (hwep->num != 0 && hwep->type == USB_ENDPOINT_XFER_CONTROL) {
-		dev_err(hwep->ci->dev, "Set control xfer at non-ep0\n");
-		retval = -EINVAL;
-	}
-
-	/*
-	 * Enable endpoints in the HW other than ep0 as ep0
-	 * is always enabled
-	 */
-	if (hwep->num)
-		retval |= hw_ep_enable(hwep->ci, hwep->num, hwep->dir,
-				       hwep->type);
-
-	spin_unlock_irqrestore(hwep->lock, flags);
-	return retval;
-}
-
-/**
- * ep_disable: endpoint is no longer usable
- *
- * Check usb_ep_disable() at "usb_gadget.h" for details
- */
-static int ep_disable(struct usb_ep *ep)
-{
-	struct ci_hw_ep *hwep = container_of(ep, struct ci_hw_ep, ep);
-	int direction, retval = 0;
-	unsigned long flags;
-
-	if (ep == NULL)
-		return -EINVAL;
-	else if (hwep->ep.desc == NULL)
-		return -EBUSY;
-
-	spin_lock_irqsave(hwep->lock, flags);
-
-	/* only internal SW should disable ctrl endpts */
-
-	direction = hwep->dir;
-	do {
-		retval |= _ep_nuke(hwep);
-		retval |= hw_ep_disable(hwep->ci, hwep->num, hwep->dir);
-
-		if (hwep->type == USB_ENDPOINT_XFER_CONTROL)
-			hwep->dir = (hwep->dir == TX) ? RX : TX;
-
-	} while (hwep->dir != direction);
-
-	hwep->ep.desc = NULL;
-
-	spin_unlock_irqrestore(hwep->lock, flags);
-	return retval;
-}
-
-/**
- * ep_alloc_request: allocate a request object to use with this endpoint
- *
- * Check usb_ep_alloc_request() at "usb_gadget.h" for details
- */
-static struct usb_request *ep_alloc_request(struct usb_ep *ep, gfp_t gfp_flags)
-{
-	struct ci_hw_req *hwreq = NULL;
-
-	if (ep == NULL)
-		return NULL;
-
-	hwreq = kzalloc(sizeof(struct ci_hw_req), gfp_flags);
-	if (hwreq != NULL) {
-		INIT_LIST_HEAD(&hwreq->queue);
-		INIT_LIST_HEAD(&hwreq->tds);
-	}
-
-	return (hwreq == NULL) ? NULL : &hwreq->req;
-}
-
-/**
- * ep_free_request: frees a request object
- *
- * Check usb_ep_free_request() at "usb_gadget.h" for details
- */
-static void ep_free_request(struct usb_ep *ep, struct usb_request *req)
-{
-	struct ci_hw_ep  *hwep  = container_of(ep,  struct ci_hw_ep, ep);
-	struct ci_hw_req *hwreq = container_of(req, struct ci_hw_req, req);
-	struct td_node *node, *tmpnode;
-	unsigned long flags;
-
-	if (ep == NULL || req == NULL) {
-		return;
-	} else if (!list_empty(&hwreq->queue)) {
-		dev_err(hwep->ci->dev, "freeing queued request\n");
-		return;
-	}
-
-	spin_lock_irqsave(hwep->lock, flags);
-
-	list_for_each_entry_safe(node, tmpnode, &hwreq->tds, td) {
-		dma_pool_free(hwep->td_pool, node->ptr, node->dma);
-		list_del_init(&node->td);
-		node->ptr = NULL;
-		kfree(node);
-	}
-
-	kfree(hwreq);
-
-	spin_unlock_irqrestore(hwep->lock, flags);
-}
-
-/**
- * ep_queue: queues (submits) an I/O request to an endpoint
- *
- * Check usb_ep_queue()* at usb_gadget.h" for details
- */
-static int ep_queue(struct usb_ep *ep, struct usb_request *req,
-		    gfp_t __maybe_unused gfp_flags)
-{
-	struct ci_hw_ep  *hwep  = container_of(ep,  struct ci_hw_ep, ep);
-	int retval = 0;
-	unsigned long flags;
-
-	if (ep == NULL || req == NULL || hwep->ep.desc == NULL)
-		return -EINVAL;
-
-	spin_lock_irqsave(hwep->lock, flags);
-	retval = _ep_queue(ep, req, gfp_flags);
-	spin_unlock_irqrestore(hwep->lock, flags);
-	return retval;
-}
-
-/**
- * ep_dequeue: dequeues (cancels, unlinks) an I/O request from an endpoint
- *
- * Check usb_ep_dequeue() at "usb_gadget.h" for details
- */
-static int ep_dequeue(struct usb_ep *ep, struct usb_request *req)
-{
-	struct ci_hw_ep  *hwep  = container_of(ep,  struct ci_hw_ep, ep);
-	struct ci_hw_req *hwreq = container_of(req, struct ci_hw_req, req);
-	unsigned long flags;
-	struct td_node *node, *tmpnode;
-
-	if (ep == NULL || req == NULL || hwreq->req.status != -EALREADY ||
-		hwep->ep.desc == NULL || list_empty(&hwreq->queue) ||
-		list_empty(&hwep->qh.queue))
-		return -EINVAL;
-
-	spin_lock_irqsave(hwep->lock, flags);
-
-	hw_ep_flush(hwep->ci, hwep->num, hwep->dir);
-
-	list_for_each_entry_safe(node, tmpnode, &hwreq->tds, td) {
-		dma_pool_free(hwep->td_pool, node->ptr, node->dma);
-		list_del(&node->td);
-		kfree(node);
-	}
-
-	/* pop request */
-	list_del_init(&hwreq->queue);
-
-	usb_gadget_unmap_request(&hwep->ci->gadget, req, hwep->dir);
-
-	req->status = -ECONNRESET;
-
-	if (hwreq->req.complete != NULL) {
-		spin_unlock(hwep->lock);
-		usb_gadget_giveback_request(&hwep->ep, &hwreq->req);
-		spin_lock(hwep->lock);
-	}
-
-	spin_unlock_irqrestore(hwep->lock, flags);
-	return 0;
-}
-
-/**
- * ep_set_halt: sets the endpoint halt feature
- *
- * Check usb_ep_set_halt() at "usb_gadget.h" for details
- */
-static int ep_set_halt(struct usb_ep *ep, int value)
-{
-	return _ep_set_halt(ep, value, true);
-}
-
-/**
- * ep_set_wedge: sets the halt feature and ignores clear requests
- *
- * Check usb_ep_set_wedge() at "usb_gadget.h" for details
- */
-static int ep_set_wedge(struct usb_ep *ep)
-{
-	struct ci_hw_ep *hwep = container_of(ep, struct ci_hw_ep, ep);
-	unsigned long flags;
-
-	if (ep == NULL || hwep->ep.desc == NULL)
-		return -EINVAL;
-
-	spin_lock_irqsave(hwep->lock, flags);
-	hwep->wedge = 1;
-	spin_unlock_irqrestore(hwep->lock, flags);
-
-	return usb_ep_set_halt(ep);
-}
-
-/**
- * ep_fifo_flush: flushes contents of a fifo
- *
- * Check usb_ep_fifo_flush() at "usb_gadget.h" for details
- */
-static void ep_fifo_flush(struct usb_ep *ep)
-{
-	struct ci_hw_ep *hwep = container_of(ep, struct ci_hw_ep, ep);
-	unsigned long flags;
-
-	if (ep == NULL) {
-		dev_err(hwep->ci->dev, "%02X: -EINVAL\n", _usb_addr(hwep));
-		return;
-	}
-
-	spin_lock_irqsave(hwep->lock, flags);
-
-	hw_ep_flush(hwep->ci, hwep->num, hwep->dir);
-
-	spin_unlock_irqrestore(hwep->lock, flags);
-}
-
-/**
- * Endpoint-specific part of the API to the USB controller hardware
- * Check "usb_gadget.h" for details
- */
-static const struct usb_ep_ops usb_ep_ops = {
-	.enable	       = ep_enable,
-	.disable       = ep_disable,
-	.alloc_request = ep_alloc_request,
-	.free_request  = ep_free_request,
-	.queue	       = ep_queue,
-	.dequeue       = ep_dequeue,
-	.set_halt      = ep_set_halt,
-	.set_wedge     = ep_set_wedge,
-	.fifo_flush    = ep_fifo_flush,
-};
-
-/******************************************************************************
- * GADGET block
- *****************************************************************************/
-static int ci_udc_vbus_session(struct usb_gadget *_gadget, int is_active)
-{
-	struct ci_hdrc *ci = container_of(_gadget, struct ci_hdrc, gadget);
-	unsigned long flags;
-	int gadget_ready = 0;
-
-	spin_lock_irqsave(&ci->lock, flags);
-	ci->vbus_active = is_active;
-	if (ci->driver)
-		gadget_ready = 1;
-	spin_unlock_irqrestore(&ci->lock, flags);
-
-	if (gadget_ready) {
-		if (is_active) {
-			pm_runtime_get_sync(&_gadget->dev);
-			hw_device_reset(ci);
-			hw_device_state(ci, ci->ep0out->qh.dma);
-			usb_gadget_set_state(_gadget, USB_STATE_POWERED);
-			usb_udc_vbus_handler(_gadget, true);
-		} else {
-			usb_udc_vbus_handler(_gadget, false);
-			if (ci->driver)
-				ci->driver->disconnect(&ci->gadget);
-			hw_device_state(ci, 0);
-			if (ci->platdata->notify_event)
-				ci->platdata->notify_event(ci,
-				CI_HDRC_CONTROLLER_STOPPED_EVENT);
-			_gadget_stop_activity(&ci->gadget);
-			pm_runtime_put_sync(&_gadget->dev);
-			usb_gadget_set_state(_gadget, USB_STATE_NOTATTACHED);
-		}
-	}
-
-	return 0;
-}
-
-static int ci_udc_wakeup(struct usb_gadget *_gadget)
-{
-	struct ci_hdrc *ci = container_of(_gadget, struct ci_hdrc, gadget);
-	unsigned long flags;
-	int ret = 0;
-
-	spin_lock_irqsave(&ci->lock, flags);
-	if (!ci->remote_wakeup) {
-		ret = -EOPNOTSUPP;
-		goto out;
-	}
-	if (!hw_read(ci, OP_PORTSC, PORTSC_SUSP)) {
-		ret = -EINVAL;
-		goto out;
-	}
-	hw_write(ci, OP_PORTSC, PORTSC_FPR, PORTSC_FPR);
-out:
-	spin_unlock_irqrestore(&ci->lock, flags);
-	return ret;
-}
-
-static int ci_udc_vbus_draw(struct usb_gadget *_gadget, unsigned ma)
-{
-	struct ci_hdrc *ci = container_of(_gadget, struct ci_hdrc, gadget);
-
-	if (ci->usb_phy)
-		return usb_phy_set_power(ci->usb_phy, ma);
-	return -ENOTSUPP;
-}
-
-static int ci_udc_selfpowered(struct usb_gadget *_gadget, int is_on)
-{
-	struct ci_hdrc *ci = container_of(_gadget, struct ci_hdrc, gadget);
-	struct ci_hw_ep *hwep = ci->ep0in;
-	unsigned long flags;
-
-	spin_lock_irqsave(hwep->lock, flags);
-	_gadget->is_selfpowered = (is_on != 0);
-	spin_unlock_irqrestore(hwep->lock, flags);
-
-	return 0;
-}
-
-/* Change Data+ pullup status
- * this func is used by usb_gadget_connect/disconnet
- */
-static int ci_udc_pullup(struct usb_gadget *_gadget, int is_on)
-{
-	struct ci_hdrc *ci = container_of(_gadget, struct ci_hdrc, gadget);
-
-	/*
-	 * Data+ pullup controlled by OTG state machine in OTG fsm mode;
-	 * and don't touch Data+ in host mode for dual role config.
-	 */
-	if (ci_otg_is_fsm_mode(ci) || ci->role == CI_ROLE_HOST)
-		return 0;
-
-	pm_runtime_get_sync(&ci->gadget.dev);
-	if (is_on)
-		hw_write(ci, OP_USBCMD, USBCMD_RS, USBCMD_RS);
-	else
-		hw_write(ci, OP_USBCMD, USBCMD_RS, 0);
-	pm_runtime_put_sync(&ci->gadget.dev);
-
-	return 0;
-}
-
-static int ci_udc_start(struct usb_gadget *gadget,
-			 struct usb_gadget_driver *driver);
-static int ci_udc_stop(struct usb_gadget *gadget);
-
-/* Match ISOC IN from the highest endpoint */
-static struct usb_ep *ci_udc_match_ep(struct usb_gadget *gadget,
-			      struct usb_endpoint_descriptor *desc,
-			      struct usb_ss_ep_comp_descriptor *comp_desc)
-{
-	struct ci_hdrc *ci = container_of(gadget, struct ci_hdrc, gadget);
-	struct usb_ep *ep;
-
-	if (usb_endpoint_xfer_isoc(desc) && usb_endpoint_dir_in(desc)) {
-		list_for_each_entry_reverse(ep, &ci->gadget.ep_list, ep_list) {
-			if (ep->caps.dir_in && !ep->claimed)
-				return ep;
-		}
-	}
-
-	return NULL;
-}
-
-/**
- * Device operations part of the API to the USB controller hardware,
- * which don't involve endpoints (or i/o)
- * Check  "usb_gadget.h" for details
- */
-static const struct usb_gadget_ops usb_gadget_ops = {
-	.vbus_session	= ci_udc_vbus_session,
-	.wakeup		= ci_udc_wakeup,
-	.set_selfpowered	= ci_udc_selfpowered,
-	.pullup		= ci_udc_pullup,
-	.vbus_draw	= ci_udc_vbus_draw,
-	.udc_start	= ci_udc_start,
-	.udc_stop	= ci_udc_stop,
-	.match_ep 	= ci_udc_match_ep,
-};
-
-static int init_eps(struct ci_hdrc *ci)
-{
-	int retval = 0, i, j;
-
-	for (i = 0; i < ci->hw_ep_max/2; i++)
-		for (j = RX; j <= TX; j++) {
-			int k = i + j * ci->hw_ep_max/2;
-			struct ci_hw_ep *hwep = &ci->ci_hw_ep[k];
-
-			scnprintf(hwep->name, sizeof(hwep->name), "ep%i%s", i,
-					(j == TX)  ? "in" : "out");
-
-			hwep->ci          = ci;
-			hwep->lock         = &ci->lock;
-			hwep->td_pool      = ci->td_pool;
-
-			hwep->ep.name      = hwep->name;
-			hwep->ep.ops       = &usb_ep_ops;
-
-			if (i == 0) {
-				hwep->ep.caps.type_control = true;
-			} else {
-				hwep->ep.caps.type_iso = true;
-				hwep->ep.caps.type_bulk = true;
-				hwep->ep.caps.type_int = true;
-			}
-
-			if (j == TX)
-				hwep->ep.caps.dir_in = true;
-			else
-				hwep->ep.caps.dir_out = true;
-
-			/*
-			 * for ep0: maxP defined in desc, for other
-			 * eps, maxP is set by epautoconfig() called
-			 * by gadget layer
-			 */
-			usb_ep_set_maxpacket_limit(&hwep->ep, (unsigned short)~0);
-
-			INIT_LIST_HEAD(&hwep->qh.queue);
-			hwep->qh.ptr = dma_pool_alloc(ci->qh_pool, GFP_KERNEL,
-						     &hwep->qh.dma);
-			if (hwep->qh.ptr == NULL)
-				retval = -ENOMEM;
-			else
-				memset(hwep->qh.ptr, 0, sizeof(*hwep->qh.ptr));
-
-			/*
-			 * set up shorthands for ep0 out and in endpoints,
-			 * don't add to gadget's ep_list
-			 */
-			if (i == 0) {
-				if (j == RX)
-					ci->ep0out = hwep;
-				else
-					ci->ep0in = hwep;
-
-				usb_ep_set_maxpacket_limit(&hwep->ep, CTRL_PAYLOAD_MAX);
-				continue;
-			}
-
-			list_add_tail(&hwep->ep.ep_list, &ci->gadget.ep_list);
-		}
-
-	return retval;
-}
-
-static void destroy_eps(struct ci_hdrc *ci)
-{
-	int i;
-
-	for (i = 0; i < ci->hw_ep_max; i++) {
-		struct ci_hw_ep *hwep = &ci->ci_hw_ep[i];
-
-		if (hwep->pending_td)
-			free_pending_td(hwep);
-		dma_pool_free(ci->qh_pool, hwep->qh.ptr, hwep->qh.dma);
-	}
-}
-
-/**
- * ci_udc_start: register a gadget driver
- * @gadget: our gadget
- * @driver: the driver being registered
- *
- * Interrupts are enabled here.
- */
-static int ci_udc_start(struct usb_gadget *gadget,
-			 struct usb_gadget_driver *driver)
-{
-	struct ci_hdrc *ci = container_of(gadget, struct ci_hdrc, gadget);
-	unsigned long flags;
-	int retval = -ENOMEM;
-
-	if (driver->disconnect == NULL)
-		return -EINVAL;
-
-
-	ci->ep0out->ep.desc = &ctrl_endpt_out_desc;
-	retval = usb_ep_enable(&ci->ep0out->ep);
-	if (retval)
-		return retval;
-
-	ci->ep0in->ep.desc = &ctrl_endpt_in_desc;
-	retval = usb_ep_enable(&ci->ep0in->ep);
-	if (retval)
-		return retval;
-
-	ci->driver = driver;
-
-	/* Start otg fsm for B-device */
-	if (ci_otg_is_fsm_mode(ci) && ci->fsm.id) {
-		ci_hdrc_otg_fsm_start(ci);
-		return retval;
-	}
-
-	pm_runtime_get_sync(&ci->gadget.dev);
-	if (ci->vbus_active) {
-		spin_lock_irqsave(&ci->lock, flags);
-		hw_device_reset(ci);
-	} else {
-		usb_udc_vbus_handler(&ci->gadget, false);
-		pm_runtime_put_sync(&ci->gadget.dev);
-		return retval;
-	}
-
-	retval = hw_device_state(ci, ci->ep0out->qh.dma);
-	spin_unlock_irqrestore(&ci->lock, flags);
-	if (retval)
-		pm_runtime_put_sync(&ci->gadget.dev);
-
-	return retval;
-}
-
-static void ci_udc_stop_for_otg_fsm(struct ci_hdrc *ci)
-{
-	if (!ci_otg_is_fsm_mode(ci))
-		return;
-
-	mutex_lock(&ci->fsm.lock);
-	if (ci->fsm.otg->state == OTG_STATE_A_PERIPHERAL) {
-		ci->fsm.a_bidl_adis_tmout = 1;
-		ci_hdrc_otg_fsm_start(ci);
-	} else if (ci->fsm.otg->state == OTG_STATE_B_PERIPHERAL) {
-		ci->fsm.protocol = PROTO_UNDEF;
-		ci->fsm.otg->state = OTG_STATE_UNDEFINED;
-	}
-	mutex_unlock(&ci->fsm.lock);
-}
-
-/**
- * ci_udc_stop: unregister a gadget driver
- */
-static int ci_udc_stop(struct usb_gadget *gadget)
-{
-	struct ci_hdrc *ci = container_of(gadget, struct ci_hdrc, gadget);
-	unsigned long flags;
-
-	spin_lock_irqsave(&ci->lock, flags);
-
-	if (ci->vbus_active) {
-		hw_device_state(ci, 0);
-		if (ci->platdata->notify_event)
-			ci->platdata->notify_event(ci,
-			CI_HDRC_CONTROLLER_STOPPED_EVENT);
-		spin_unlock_irqrestore(&ci->lock, flags);
-		_gadget_stop_activity(&ci->gadget);
-		spin_lock_irqsave(&ci->lock, flags);
-		pm_runtime_put(&ci->gadget.dev);
-	}
-
-	ci->driver = NULL;
-	spin_unlock_irqrestore(&ci->lock, flags);
-
-	ci_udc_stop_for_otg_fsm(ci);
-	return 0;
-}
-
-/******************************************************************************
- * BUS block
- *****************************************************************************/
-/**
- * udc_irq: ci interrupt handler
- *
- * This function returns IRQ_HANDLED if the IRQ has been handled
- * It locks access to registers
- */
-static irqreturn_t udc_irq(struct ci_hdrc *ci)
-{
-	irqreturn_t retval;
-	u32 intr;
-
-	if (ci == NULL)
-		return IRQ_HANDLED;
-
-	spin_lock(&ci->lock);
-
-	if (ci->platdata->flags & CI_HDRC_REGS_SHARED) {
-		if (hw_read(ci, OP_USBMODE, USBMODE_CM) !=
-				USBMODE_CM_DC) {
-			spin_unlock(&ci->lock);
-			return IRQ_NONE;
-		}
-	}
-	intr = hw_test_and_clear_intr_active(ci);
-
-	if (intr) {
-		/* order defines priority - do NOT change it */
-		if (USBi_URI & intr)
-			isr_reset_handler(ci);
-
-		if (USBi_PCI & intr) {
-			ci->gadget.speed = hw_port_is_high_speed(ci) ?
-				USB_SPEED_HIGH : USB_SPEED_FULL;
-			if (ci->suspended && ci->driver->resume) {
-				spin_unlock(&ci->lock);
-				ci->driver->resume(&ci->gadget);
-				spin_lock(&ci->lock);
-				ci->suspended = 0;
-			}
-		}
-
-		if (USBi_UI  & intr)
-			isr_tr_complete_handler(ci);
-
-		if (USBi_SLI & intr) {
-			if (ci->gadget.speed != USB_SPEED_UNKNOWN &&
-			    ci->driver->suspend) {
-				ci->suspended = 1;
-				spin_unlock(&ci->lock);
-				ci->driver->suspend(&ci->gadget);
-				usb_gadget_set_state(&ci->gadget,
-						USB_STATE_SUSPENDED);
-				spin_lock(&ci->lock);
-			}
-		}
-		retval = IRQ_HANDLED;
-	} else {
-		retval = IRQ_NONE;
-	}
-	spin_unlock(&ci->lock);
-
-	return retval;
-}
-
-/**
- * udc_start: initialize gadget role
- * @ci: chipidea controller
- */
-static int udc_start(struct ci_hdrc *ci)
-{
-	struct device *dev = ci->dev;
-	struct usb_otg_caps *otg_caps = &ci->platdata->ci_otg_caps;
-	int retval = 0;
-
-	ci->gadget.ops          = &usb_gadget_ops;
-	ci->gadget.speed        = USB_SPEED_UNKNOWN;
-	ci->gadget.max_speed    = USB_SPEED_HIGH;
-	ci->gadget.name         = ci->platdata->name;
-	ci->gadget.otg_caps	= otg_caps;
-
-	if (ci->is_otg && (otg_caps->hnp_support || otg_caps->srp_support ||
-						otg_caps->adp_support))
-		ci->gadget.is_otg = 1;
-
-	INIT_LIST_HEAD(&ci->gadget.ep_list);
-
-	/* alloc resources */
-	ci->qh_pool = dma_pool_create("ci_hw_qh", dev,
-				       sizeof(struct ci_hw_qh),
-				       64, CI_HDRC_PAGE_SIZE);
-	if (ci->qh_pool == NULL)
-		return -ENOMEM;
-
-	ci->td_pool = dma_pool_create("ci_hw_td", dev,
-				       sizeof(struct ci_hw_td),
-				       64, CI_HDRC_PAGE_SIZE);
-	if (ci->td_pool == NULL) {
-		retval = -ENOMEM;
-		goto free_qh_pool;
-	}
-
-	retval = init_eps(ci);
-	if (retval)
-		goto free_pools;
-
-	ci->gadget.ep0 = &ci->ep0in->ep;
-
-	retval = usb_add_gadget_udc(dev, &ci->gadget);
-	if (retval)
-		goto destroy_eps;
-
-	pm_runtime_no_callbacks(&ci->gadget.dev);
-	pm_runtime_enable(&ci->gadget.dev);
-
-	return retval;
-
-destroy_eps:
-	destroy_eps(ci);
-free_pools:
-	dma_pool_destroy(ci->td_pool);
-free_qh_pool:
-	dma_pool_destroy(ci->qh_pool);
-	return retval;
-}
-
-/**
- * ci_hdrc_gadget_destroy: parent remove must call this to remove UDC
- *
- * No interrupts active, the IRQ has been released
- */
-void ci_hdrc_gadget_destroy(struct ci_hdrc *ci)
-{
-	if (!ci->roles[CI_ROLE_GADGET])
-		return;
-
-	usb_del_gadget_udc(&ci->gadget);
-
-	destroy_eps(ci);
-
-	dma_pool_destroy(ci->td_pool);
-	dma_pool_destroy(ci->qh_pool);
-}
-
-static int udc_id_switch_for_device(struct ci_hdrc *ci)
-{
-	if (ci->is_otg)
-		/* Clear and enable BSV irq */
-		hw_write_otgsc(ci, OTGSC_BSVIS | OTGSC_BSVIE,
-					OTGSC_BSVIS | OTGSC_BSVIE);
-
-	return 0;
-}
-
-static void udc_id_switch_for_host(struct ci_hdrc *ci)
-{
-	/*
-	 * host doesn't care B_SESSION_VALID event
-	 * so clear and disbale BSV irq
-	 */
-	if (ci->is_otg)
-		hw_write_otgsc(ci, OTGSC_BSVIE | OTGSC_BSVIS, OTGSC_BSVIS);
-}
-
-/**
- * ci_hdrc_gadget_init - initialize device related bits
- * ci: the controller
- *
- * This function initializes the gadget, if the device is "device capable".
- */
-int ci_hdrc_gadget_init(struct ci_hdrc *ci)
-{
-	struct ci_role_driver *rdrv;
-	int ret;
-
-	if (!hw_read(ci, CAP_DCCPARAMS, DCCPARAMS_DC))
-		return -ENXIO;
-
-	rdrv = devm_kzalloc(ci->dev, sizeof(struct ci_role_driver), GFP_KERNEL);
-	if (!rdrv)
-		return -ENOMEM;
-
-	rdrv->start	= udc_id_switch_for_device;
-	rdrv->stop	= udc_id_switch_for_host;
-	rdrv->irq	= udc_irq;
-	rdrv->name	= "gadget";
-
-	ret = udc_start(ci);
-	if (!ret)
-		ci->roles[CI_ROLE_GADGET] = rdrv;
-
-	return ret;
-}
+#ifndef SMU_7_1_3_SH_MASK_H
+#define SMU_7_1_3_SH_MASK_H
+
+#define GCK_SMC_IND_INDEX__SMC_IND_ADDR_MASK 0xffffffff
+#define GCK_SMC_IND_INDEX__SMC_IND_ADDR__SHIFT 0x0
+#define GCK_SMC_IND_DATA__SMC_IND_DATA_MASK 0xffffffff
+#define GCK_SMC_IND_DATA__SMC_IND_DATA__SHIFT 0x0
+#define GCK_MCLK_FUSES__StartupMClkDid_MASK 0x7f
+#define GCK_MCLK_FUSES__StartupMClkDid__SHIFT 0x0
+#define GCK_MCLK_FUSES__MClkADCA_MASK 0x780
+#define GCK_MCLK_FUSES__MClkADCA__SHIFT 0x7
+#define GCK_MCLK_FUSES__MClkDDCA_MASK 0x1800
+#define GCK_MCLK_FUSES__MClkDDCA__SHIFT 0xb
+#define GCK_MCLK_FUSES__MClkDiDtWait_MASK 0xe000
+#define GCK_MCLK_FUSES__MClkDiDtWait__SHIFT 0xd
+#define GCK_MCLK_FUSES__MClkDiDtFloor_MASK 0x30000
+#define GCK_MCLK_FUSES__MClkDiDtFloor__SHIFT 0x10
+#define CG_DCLK_CNTL__DCLK_DIVIDER_MASK 0x7f
+#define CG_DCLK_CNTL__DCLK_DIVIDER__SHIFT 0x0
+#define CG_DCLK_CNTL__DCLK_DIR_CNTL_EN_MASK 0x100
+#define CG_DCLK_CNTL__DCLK_DIR_CNTL_EN__SHIFT 0x8
+#define CG_DCLK_CNTL__DCLK_DIR_CNTL_TOG_MASK 0x200
+#define CG_DCLK_CNTL__DCLK_DIR_CNTL_TOG__SHIFT 0x9
+#define CG_DCLK_CNTL__DCLK_DIR_CNTL_DIVIDER_MASK 0x1fc00
+#define CG_DCLK_CNTL__DCLK_DIR_CNTL_DIVIDER__SHIFT 0xa
+#define CG_DCLK_STATUS__DCLK_STATUS_MASK 0x1
+#define CG_DCLK_STATUS__DCLK_STATUS__SHIFT 0x0
+#define CG_DCLK_STATUS__DCLK_DIR_CNTL_DONETOG_MASK 0x2
+#define CG_DCLK_STATUS__DCLK_DIR_CNTL_DONETOG__SHIFT 0x1
+#define CG_VCLK_CNTL__VCLK_DIVIDER_MASK 0x7f
+#define CG_VCLK_CNTL__VCLK_DIVIDER__SHIFT 0x0
+#define CG_VCLK_CNTL__VCLK_DIR_CNTL_EN_MASK 0x100
+#define CG_VCLK_CNTL__VCLK_DIR_CNTL_EN__SHIFT 0x8
+#define CG_VCLK_CNTL__VCLK_DIR_CNTL_TOG_MASK 0x200
+#define CG_VCLK_CNTL__VCLK_DIR_CNTL_TOG__SHIFT 0x9
+#define CG_VCLK_CNTL__VCLK_DIR_CNTL_DIVIDER_MASK 0x1fc00
+#define CG_VCLK_CNTL__VCLK_DIR_CNTL_DIVIDER__SHIFT 0xa
+#define CG_VCLK_STATUS__VCLK_STATUS_MASK 0x1
+#define CG_VCLK_STATUS__VCLK_STATUS__SHIFT 0x0
+#define CG_VCLK_STATUS__VCLK_DIR_CNTL_DONETOG_MASK 0x2
+#define CG_VCLK_STATUS__VCLK_DIR_CNTL_DONETOG__SHIFT 0x1
+#define CG_ECLK_CNTL__ECLK_DIVIDER_MASK 0x7f
+#define CG_ECLK_CNTL__ECLK_DIVIDER__SHIFT 0x0
+#define CG_ECLK_CNTL__ECLK_DIR_CNTL_EN_MASK 0x100
+#define CG_ECLK_CNTL__ECLK_DIR_CNTL_EN__SHIFT 0x8
+#define CG_ECLK_CNTL__ECLK_DIR_CNTL_TOG_MASK 0x200
+#define CG_ECLK_CNTL__ECLK_DIR_CNTL_TOG__SHIFT 0x9
+#define CG_ECLK_CNTL__ECLK_DIR_CNTL_DIVIDER_MASK 0x1fc00
+#define CG_ECLK_CNTL__ECLK_DIR_CNTL_DIVIDER__SHIFT 0xa
+#define CG_ECLK_STATUS__ECLK_STATUS_MASK 0x1
+#define CG_ECLK_STATUS__ECLK_STATUS__SHIFT 0x0
+#define CG_ECLK_STATUS__ECLK_DIR_CNTL_DONETOG_MASK 0x2
+#define CG_ECLK_STATUS__ECLK_DIR_CNTL_DONETOG__SHIFT 0x1
+#define CG_ACLK_CNTL__ACLK_DIVIDER_MASK 0x7f
+#define CG_ACLK_CNTL__ACLK_DIVIDER__SHIFT 0x0
+#define CG_ACLK_CNTL__ACLK_DIR_CNTL_EN_MASK 0x100
+#define CG_ACLK_CNTL__ACLK_DIR_CNTL_EN__SHIFT 0x8
+#define CG_ACLK_CNTL__ACLK_DIR_CNTL_TOG_MASK 0x200
+#define CG_ACLK_CNTL__ACLK_DIR_CNTL_TOG__SHIFT 0x9
+#define CG_ACLK_CNTL__ACLK_DIR_CNTL_DIVIDER_MASK 0x1fc00
+#define CG_ACLK_CNTL__ACLK_DIR_CNTL_DIVIDER__SHIFT 0xa
+#define CG_MCLK_CNTL__MCLK_DIVIDER_MASK 0x7f
+#define CG_MCLK_CNTL__MCLK_DIVIDER__SHIFT 0x0
+#define CG_MCLK_CNTL__MCLK_DIR_CNTL_EN_MASK 0x100
+#define CG_MCLK_CNTL__MCLK_DIR_CNTL_EN__SHIFT 0x8
+#define CG_MCLK_CNTL__MCLK_DIR_CNTL_TOG_MASK 0x200
+#define CG_MCLK_CNTL__MCLK_DIR_CNTL_TOG__SH

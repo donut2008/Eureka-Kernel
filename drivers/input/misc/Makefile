@@ -1,81 +1,126 @@
-#
-# Makefile for the input misc drivers.
-#
+,		   NULL);
+static DEVICE_ATTR(sgid,	    S_IRUGO, show_sgid,		   NULL);
+static DEVICE_ATTR(dgid,	    S_IRUGO, show_dgid,		   NULL);
+static DEVICE_ATTR(orig_dgid,	    S_IRUGO, show_orig_dgid,	   NULL);
+static DEVICE_ATTR(req_lim,         S_IRUGO, show_req_lim,         NULL);
+static DEVICE_ATTR(zero_req_lim,    S_IRUGO, show_zero_req_lim,	   NULL);
+static DEVICE_ATTR(local_ib_port,   S_IRUGO, show_local_ib_port,   NULL);
+static DEVICE_ATTR(local_ib_device, S_IRUGO, show_local_ib_device, NULL);
+static DEVICE_ATTR(ch_count,        S_IRUGO, show_ch_count,        NULL);
+static DEVICE_ATTR(comp_vector,     S_IRUGO, show_comp_vector,     NULL);
+static DEVICE_ATTR(tl_retry_count,  S_IRUGO, show_tl_retry_count,  NULL);
+static DEVICE_ATTR(cmd_sg_entries,  S_IRUGO, show_cmd_sg_entries,  NULL);
+static DEVICE_ATTR(allow_ext_sg,    S_IRUGO, show_allow_ext_sg,    NULL);
 
-# Each configuration option enables a list of files.
+static struct device_attribute *srp_host_attrs[] = {
+	&dev_attr_id_ext,
+	&dev_attr_ioc_guid,
+	&dev_attr_service_id,
+	&dev_attr_pkey,
+	&dev_attr_sgid,
+	&dev_attr_dgid,
+	&dev_attr_orig_dgid,
+	&dev_attr_req_lim,
+	&dev_attr_zero_req_lim,
+	&dev_attr_local_ib_port,
+	&dev_attr_local_ib_device,
+	&dev_attr_ch_count,
+	&dev_attr_comp_vector,
+	&dev_attr_tl_retry_count,
+	&dev_attr_cmd_sg_entries,
+	&dev_attr_allow_ext_sg,
+	NULL
+};
 
-obj-$(CONFIG_INPUT_88PM860X_ONKEY)	+= 88pm860x_onkey.o
-obj-$(CONFIG_INPUT_88PM80X_ONKEY)	+= 88pm80x_onkey.o
-obj-$(CONFIG_INPUT_AB8500_PONKEY)	+= ab8500-ponkey.o
-obj-$(CONFIG_INPUT_AD714X)		+= ad714x.o
-obj-$(CONFIG_INPUT_AD714X_I2C)		+= ad714x-i2c.o
-obj-$(CONFIG_INPUT_AD714X_SPI)		+= ad714x-spi.o
-obj-$(CONFIG_INPUT_ADXL34X)		+= adxl34x.o
-obj-$(CONFIG_INPUT_ADXL34X_I2C)		+= adxl34x-i2c.o
-obj-$(CONFIG_INPUT_ADXL34X_SPI)		+= adxl34x-spi.o
-obj-$(CONFIG_INPUT_APANEL)		+= apanel.o
-obj-$(CONFIG_INPUT_ARIZONA_HAPTICS)	+= arizona-haptics.o
-obj-$(CONFIG_INPUT_ATI_REMOTE2)		+= ati_remote2.o
-obj-$(CONFIG_INPUT_ATLAS_BTNS)		+= atlas_btns.o
-obj-$(CONFIG_INPUT_BFIN_ROTARY)		+= bfin_rotary.o
-obj-$(CONFIG_INPUT_BMA150)		+= bma150.o
-obj-$(CONFIG_INPUT_CM109)		+= cm109.o
-obj-$(CONFIG_INPUT_CMA3000)		+= cma3000_d0x.o
-obj-$(CONFIG_INPUT_CMA3000_I2C)		+= cma3000_d0x_i2c.o
-obj-$(CONFIG_INPUT_COBALT_BTNS)		+= cobalt_btns.o
-obj-$(CONFIG_INPUT_DA9052_ONKEY)	+= da9052_onkey.o
-obj-$(CONFIG_INPUT_DA9055_ONKEY)	+= da9055_onkey.o
-obj-$(CONFIG_INPUT_DA9063_ONKEY)	+= da9063_onkey.o
-obj-$(CONFIG_INPUT_DM355EVM)		+= dm355evm_keys.o
-obj-$(CONFIG_INPUT_E3X0_BUTTON)		+= e3x0-button.o
-obj-$(CONFIG_INPUT_DRV260X_HAPTICS)	+= drv260x.o
-obj-$(CONFIG_INPUT_DRV2665_HAPTICS)	+= drv2665.o
-obj-$(CONFIG_INPUT_DRV2667_HAPTICS)	+= drv2667.o
-obj-$(CONFIG_INPUT_GP2A)		+= gp2ap002a00f.o
-obj-$(CONFIG_INPUT_GPIO_BEEPER)		+= gpio-beeper.o
-obj-$(CONFIG_INPUT_GPIO_TILT_POLLED)	+= gpio_tilt_polled.o
-obj-$(CONFIG_INPUT_GPIO)		+= gpio_event.o gpio_matrix.o gpio_input.o gpio_output.o gpio_axis.o
-obj-$(CONFIG_HP_SDC_RTC)		+= hp_sdc_rtc.o
-obj-$(CONFIG_INPUT_IMS_PCU)		+= ims-pcu.o
-obj-$(CONFIG_INPUT_IXP4XX_BEEPER)	+= ixp4xx-beeper.o
-obj-$(CONFIG_INPUT_KEYCHORD)		+= keychord.o
-obj-$(CONFIG_INPUT_KEYSPAN_REMOTE)	+= keyspan_remote.o
-obj-$(CONFIG_INPUT_KXTJ9)		+= kxtj9.o
-obj-$(CONFIG_INPUT_M68K_BEEP)		+= m68kspkr.o
-obj-$(CONFIG_INPUT_MAX77693_HAPTIC)	+= max77693-haptic.o
-obj-$(CONFIG_INPUT_MAX8925_ONKEY)	+= max8925_onkey.o
-obj-$(CONFIG_INPUT_MAX8997_HAPTIC)	+= max8997_haptic.o
-obj-$(CONFIG_INPUT_MC13783_PWRBUTTON)	+= mc13783-pwrbutton.o
-obj-$(CONFIG_INPUT_MMA8450)		+= mma8450.o
-obj-$(CONFIG_INPUT_MPU3050)		+= mpu3050.o
-obj-$(CONFIG_INPUT_PALMAS_PWRBUTTON)	+= palmas-pwrbutton.o
-obj-$(CONFIG_INPUT_PCAP)		+= pcap_keys.o
-obj-$(CONFIG_INPUT_PCF50633_PMU)	+= pcf50633-input.o
-obj-$(CONFIG_INPUT_PCF8574)		+= pcf8574_keypad.o
-obj-$(CONFIG_INPUT_PCSPKR)		+= pcspkr.o
-obj-$(CONFIG_INPUT_PM8941_PWRKEY)	+= pm8941-pwrkey.o
-obj-$(CONFIG_INPUT_PM8XXX_VIBRATOR)	+= pm8xxx-vibrator.o
-obj-$(CONFIG_INPUT_PMIC8XXX_PWRKEY)	+= pmic8xxx-pwrkey.o
-obj-$(CONFIG_INPUT_POWERMATE)		+= powermate.o
-obj-$(CONFIG_INPUT_PWM_BEEPER)		+= pwm-beeper.o
-obj-$(CONFIG_INPUT_RB532_BUTTON)	+= rb532_button.o
-obj-$(CONFIG_INPUT_REGULATOR_HAPTIC)	+= regulator-haptic.o
-obj-$(CONFIG_INPUT_RETU_PWRBUTTON)	+= retu-pwrbutton.o
-obj-$(CONFIG_INPUT_AXP20X_PEK)		+= axp20x-pek.o
-obj-$(CONFIG_INPUT_GPIO_ROTARY_ENCODER)	+= rotary_encoder.o
-obj-$(CONFIG_INPUT_SGI_BTNS)		+= sgi_btns.o
-obj-$(CONFIG_INPUT_SIRFSOC_ONKEY)	+= sirfsoc-onkey.o
-obj-$(CONFIG_INPUT_SOC_BUTTON_ARRAY)	+= soc_button_array.o
-obj-$(CONFIG_INPUT_SPARCSPKR)		+= sparcspkr.o
-obj-$(CONFIG_INPUT_TPS65218_PWRBUTTON)	+= tps65218-pwrbutton.o
-obj-$(CONFIG_INPUT_TWL4030_PWRBUTTON)	+= twl4030-pwrbutton.o
-obj-$(CONFIG_INPUT_TWL4030_VIBRA)	+= twl4030-vibra.o
-obj-$(CONFIG_INPUT_TWL6040_VIBRA)	+= twl6040-vibra.o
-obj-$(CONFIG_INPUT_UINPUT)		+= uinput.o
-obj-$(CONFIG_INPUT_WISTRON_BTNS)	+= wistron_btns.o
-obj-$(CONFIG_INPUT_WM831X_ON)		+= wm831x-on.o
-obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
-obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
-obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
-obj-$(CONFIG_FLIP_COVER)	+= flip_cover.o
-obj-y += keypad.o
+static struct scsi_host_template srp_template = {
+	.module				= THIS_MODULE,
+	.name				= "InfiniBand SRP initiator",
+	.proc_name			= DRV_NAME,
+	.slave_configure		= srp_slave_configure,
+	.info				= srp_target_info,
+	.queuecommand			= srp_queuecommand,
+	.change_queue_depth             = srp_change_queue_depth,
+	.eh_abort_handler		= srp_abort,
+	.eh_device_reset_handler	= srp_reset_device,
+	.eh_host_reset_handler		= srp_reset_host,
+	.skip_settle_delay		= true,
+	.sg_tablesize			= SRP_DEF_SG_TABLESIZE,
+	.can_queue			= SRP_DEFAULT_CMD_SQ_SIZE,
+	.this_id			= -1,
+	.cmd_per_lun			= SRP_DEFAULT_CMD_SQ_SIZE,
+	.use_clustering			= ENABLE_CLUSTERING,
+	.shost_attrs			= srp_host_attrs,
+	.track_queue_depth		= 1,
+};
+
+static int srp_sdev_count(struct Scsi_Host *host)
+{
+	struct scsi_device *sdev;
+	int c = 0;
+
+	shost_for_each_device(sdev, host)
+		c++;
+
+	return c;
+}
+
+/*
+ * Return values:
+ * < 0 upon failure. Caller is responsible for SRP target port cleanup.
+ * 0 and target->state == SRP_TARGET_REMOVED if asynchronous target port
+ *    removal has been scheduled.
+ * 0 and target->state != SRP_TARGET_REMOVED upon success.
+ */
+static int srp_add_target(struct srp_host *host, struct srp_target_port *target)
+{
+	struct srp_rport_identifiers ids;
+	struct srp_rport *rport;
+
+	target->state = SRP_TARGET_SCANNING;
+	sprintf(target->target_name, "SRP.T10:%016llX",
+		be64_to_cpu(target->id_ext));
+
+	if (scsi_add_host(target->scsi_host, host->srp_dev->dev->dma_device))
+		return -ENODEV;
+
+	memcpy(ids.port_id, &target->id_ext, 8);
+	memcpy(ids.port_id + 8, &target->ioc_guid, 8);
+	ids.roles = SRP_RPORT_ROLE_TARGET;
+	rport = srp_rport_add(target->scsi_host, &ids);
+	if (IS_ERR(rport)) {
+		scsi_remove_host(target->scsi_host);
+		return PTR_ERR(rport);
+	}
+
+	rport->lld_data = target;
+	target->rport = rport;
+
+	spin_lock(&host->target_lock);
+	list_add_tail(&target->list, &host->target_list);
+	spin_unlock(&host->target_lock);
+
+	scsi_scan_target(&target->scsi_host->shost_gendev,
+			 0, target->scsi_id, SCAN_WILD_CARD, 0);
+
+	if (srp_connected_ch(target) < target->ch_count ||
+	    target->qp_in_error) {
+		shost_printk(KERN_INFO, target->scsi_host,
+			     PFX "SCSI scan failed - removing SCSI host\n");
+		srp_queue_remove_work(target);
+		goto out;
+	}
+
+	pr_debug(PFX "%s: SCSI scan succeeded - detected %d LUNs\n",
+		 dev_name(&target->scsi_host->shost_gendev),
+		 srp_sdev_count(target->scsi_host));
+
+	spin_lock_irq(&target->lock);
+	if (target->state == SRP_TARGET_SCANNING)
+		target->state = SRP_TARGET_LIVE;
+	spin_unlock_irq(&target->lock);
+
+out:
+	return 0;
+}
+
+static voi

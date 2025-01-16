@@ -1,50 +1,35 @@
-/* Header file for Special Initializers for certain USB Mass Storage devices
- *
- * Current development and maintenance by:
- *   (c) 1999, 2000 Matthew Dharm (mdharm-usb@one-eyed-alien.net)
- *
- * This driver is based on the 'USB Mass Storage Class' document. This
- * describes in detail the protocol used to communicate with such
- * devices.  Clearly, the designers had SCSI and ATAPI commands in
- * mind when they created this document.  The commands are all very
- * similar to commands in the SCSI-II and ATAPI specifications.
- *
- * It is important to note that in a number of cases this class
- * exhibits class-specific exemptions from the USB specification.
- * Notably the usage of NAK, STALL and ACK differs from the norm, in
- * that they are used to communicate wait, failed and OK on commands.
- *
- * Also, for certain devices, the interrupt endpoint is used to convey
- * status of a command.
- *
- * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
- * information about this driver.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include "usb.h"
-#include "transport.h"
-
-/* This places the Shuttle/SCM USB<->SCSI bridge devices in multi-target
- * mode */
-int usb_stor_euscsi_init(struct us_data *us);
-
-/* This function is required to activate all four slots on the UCR-61S2B
- * flash reader */
-int usb_stor_ucr61s2b_init(struct us_data *us);
-
-/* This places the HUAWEI E220 devices in multi-port mode */
-int usb_stor_huawei_e220_init(struct us_data *us);
+_MASK 0xffffffff
+#define PCIE_PRBS_ERRCNT_11__PRBS_ERRCNT_11__SHIFT 0x0
+#define PCIE_PRBS_ERRCNT_12__PRBS_ERRCNT_12_MASK 0xffffffff
+#define PCIE_PRBS_ERRCNT_12__PRBS_ERRCNT_12__SHIFT 0x0
+#define PCIE_PRBS_ERRCNT_13__PRBS_ERRCNT_13_MASK 0xffffffff
+#define PCIE_PRBS_ERRCNT_13__PRBS_ERRCNT_13__SHIFT 0x0
+#define PCIE_PRBS_ERRCNT_14__PRBS_ERRCNT_14_MASK 0xffffffff
+#define PCIE_PRBS_ERRCNT_14__PRBS_ERRCNT_14__SHIFT 0x0
+#define PCIE_PRBS_ERRCNT_15__PRBS_ERRCNT_15_MASK 0xffffffff
+#define PCIE_PRBS_ERRCNT_15__PRBS_ERRCNT_15__SHIFT 0x0
+#define PCIE_F0_DPA_CAP__TRANS_LAT_UNIT_MASK 0x300
+#define PCIE_F0_DPA_CAP__TRANS_LAT_UNIT__SHIFT 0x8
+#define PCIE_F0_DPA_CAP__PWR_ALLOC_SCALE_MASK 0x3000
+#define PCIE_F0_DPA_CAP__PWR_ALLOC_SCALE__SHIFT 0xc
+#define PCIE_F0_DPA_CAP__TRANS_LAT_VAL_0_MASK 0xff0000
+#define PCIE_F0_DPA_CAP__TRANS_LAT_VAL_0__SHIFT 0x10
+#define PCIE_F0_DPA_CAP__TRANS_LAT_VAL_1_MASK 0xff000000
+#define PCIE_F0_DPA_CAP__TRANS_LAT_VAL_1__SHIFT 0x18
+#define PCIE_F0_DPA_LATENCY_INDICATOR__TRANS_LAT_INDICATOR_BITS_MASK 0xff
+#define PCIE_F0_DPA_LATENCY_INDICATOR__TRANS_LAT_INDICATOR_BITS__SHIFT 0x0
+#define PCIE_F0_DPA_CNTL__SUBSTATE_STATUS_MASK 0x1f
+#define PCIE_F0_DPA_CNTL__SUBSTATE_STATUS__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_0__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_0__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_P

@@ -1,336 +1,514 @@
-/***************************************************************************
-                          dpti.h  -  description
-                             -------------------
-    begin                : Thu Sep 7 2000
-    copyright            : (C) 2001 by Adaptec
+ We are doing page-based allocations,
+	 * so we must be aligned to a page.
+	 */
+	if (align < EFI_ALLOC_ALIGN)
+		align = EFI_ALLOC_ALIGN;
 
-    See Documentation/scsi/dpti.txt for history, notes, license info
-    and credits
- ***************************************************************************/
+	nr_pages = round_up(size, EFI_ALLOC_ALIGN) / EFI_PAGE_SIZE;
+again:
+	for (i = 0; i < map_size / desc_size; i++) {
+		efi_memory_desc_t *desc;
+		unsigned long m = (unsigned long)map;
+		u64 start, end;
 
-/***************************************************************************
- *                                                                         *
- *   This program is free software; you can redistribute it and/or modify  *
- *   it under the terms of the GNU General Public License as published by  *
- *   the Free Software Foundation; either version 2 of the License, or     *
- *   (at your option) any later version.                                   *
- *                                                                         *
- ***************************************************************************/
+		desc = (efi_memory_desc_t *)(m + (i * desc_size));
+		if (desc->type != EFI_CONVENTIONAL_MEMORY)
+			continue;
 
-#ifndef _DPT_H
-#define _DPT_H
+		if (desc->num_pages < nr_pages)
+			continue;
 
-#define MAX_TO_IOP_MESSAGES   (255)
-#define MAX_FROM_IOP_MESSAGES (255)
+		start = desc->phys_addr;
+		end = start + desc->num_pages * (1UL << EFI_PAGE_SHIFT);
 
+		if (end > max)
+			end = max;
 
-/*
- * SCSI interface function Prototypes
- */
+		if ((start + size) > end)
+			continue;
 
-static int adpt_detect(struct scsi_host_template * sht);
-static int adpt_queue(struct Scsi_Host *h, struct scsi_cmnd * cmd);
-static int adpt_abort(struct scsi_cmnd * cmd);
-static int adpt_reset(struct scsi_cmnd* cmd);
-static int adpt_release(struct Scsi_Host *host);
-static int adpt_slave_configure(struct scsi_device *);
+		if (round_down(end - size, align) < start)
+			continue;
 
-static const char *adpt_info(struct Scsi_Host *pSHost);
-static int adpt_bios_param(struct scsi_device * sdev, struct block_device *dev,
-		sector_t, int geom[]);
+		start = round_down(end - size, align);
 
-static int adpt_bus_reset(struct scsi_cmnd* cmd);
-static int adpt_device_reset(struct scsi_cmnd* cmd);
+		/*
+		 * Don't allocate at 0x0. It will confuse code that
+		 * checks pointers against NULL.
+		 */
+		if (start == 0x0)
+			continue;
 
+		if (start > max_addr)
+			max_addr = start;
+	}
 
-/*
- * struct scsi_host_template (see scsi/scsi_host.h)
- */
+	if (!max_addr)
+		status = EFI_NOT_FOUND;
+	else {
+		status = efi_call_early(allocate_pages,
+					EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
+					nr_pages, &max_addr);
+		if (status != EFI_SUCCESS) {
+			max = max_addr;
+			max_addr = 0;
+			goto again;
+		}
 
-#define DPT_DRIVER_NAME	"Adaptec I2O RAID"
+		*addr = max_addr;
+	}
 
-#ifndef HOSTS_C
-
-#include "dpt/sys_info.h"
-#include <linux/wait.h>
-#include "dpt/dpti_i2o.h"
-#include "dpt/dpti_ioctl.h"
-
-#define DPT_I2O_VERSION "2.4 Build 5go"
-#define DPT_VERSION     2
-#define DPT_REVISION    '4'
-#define DPT_SUBREVISION '5'
-#define DPT_BETA	""
-#define DPT_MONTH      8 
-#define DPT_DAY        7
-#define DPT_YEAR        (2001-1980)
-
-#define DPT_DRIVER	"dpt_i2o"
-#define DPTI_I2O_MAJOR	(151)
-#define DPT_ORGANIZATION_ID (0x1B)        /* For Private Messages */
-#define DPTI_MAX_HBA	(16)
-#define MAX_CHANNEL     (5)	// Maximum Channel # Supported
-#define MAX_ID        	(128)	// Maximum Target ID Supported
-
-/* Sizes in 4 byte words */
-#define REPLY_FRAME_SIZE  (17)
-#define MAX_MESSAGE_SIZE  (128)
-#define SG_LIST_ELEMENTS  (56)
-
-#define EMPTY_QUEUE           0xffffffff
-#define I2O_INTERRUPT_PENDING_B   (0x08)
-
-#define PCI_DPT_VENDOR_ID         (0x1044)	// DPT PCI Vendor ID
-#define PCI_DPT_DEVICE_ID         (0xA501)	// DPT PCI I2O Device ID
-#define PCI_DPT_RAPTOR_DEVICE_ID  (0xA511)	
-
-/* Debugging macro from Linux Device Drivers - Rubini */
-#undef PDEBUG
-#ifdef DEBUG
-//TODO add debug level switch
-#  define PDEBUG(fmt, args...)  printk(KERN_DEBUG "dpti: " fmt, ##args)
-#  define PDEBUGV(fmt, args...) printk(KERN_DEBUG "dpti: " fmt, ##args)
-#else
-# define PDEBUG(fmt, args...) /* not debugging: nothing */
-# define PDEBUGV(fmt, args...) /* not debugging: nothing */
-#endif
-
-#define PERROR(fmt, args...) printk(KERN_ERR fmt, ##args)
-#define PWARN(fmt, args...) printk(KERN_WARNING fmt, ##args)
-#define PINFO(fmt, args...) printk(KERN_INFO fmt, ##args)
-#define PCRIT(fmt, args...) printk(KERN_CRIT fmt, ##args)
-
-#define SHUTDOWN_SIGS	(sigmask(SIGKILL)|sigmask(SIGINT)|sigmask(SIGTERM))
-
-// Command timeouts
-#define FOREVER			(0)
-#define TMOUT_INQUIRY 		(20)
-#define TMOUT_FLUSH		(360/45)
-#define TMOUT_ABORT		(30)
-#define TMOUT_SCSI		(300)
-#define TMOUT_IOPRESET		(360)
-#define TMOUT_GETSTATUS		(15)
-#define TMOUT_INITOUTBOUND	(15)
-#define TMOUT_LCT		(360)
-
-
-#define I2O_SCSI_DEVICE_DSC_MASK                0x00FF
-
-#define I2O_DETAIL_STATUS_UNSUPPORTED_FUNCTION  0x000A
-
-#define I2O_SCSI_DSC_MASK                   0xFF00
-#define I2O_SCSI_DSC_SUCCESS                0x0000
-#define I2O_SCSI_DSC_REQUEST_ABORTED        0x0200
-#define I2O_SCSI_DSC_UNABLE_TO_ABORT        0x0300
-#define I2O_SCSI_DSC_COMPLETE_WITH_ERROR    0x0400
-#define I2O_SCSI_DSC_ADAPTER_BUSY           0x0500
-#define I2O_SCSI_DSC_REQUEST_INVALID        0x0600
-#define I2O_SCSI_DSC_PATH_INVALID           0x0700
-#define I2O_SCSI_DSC_DEVICE_NOT_PRESENT     0x0800
-#define I2O_SCSI_DSC_UNABLE_TO_TERMINATE    0x0900
-#define I2O_SCSI_DSC_SELECTION_TIMEOUT      0x0A00
-#define I2O_SCSI_DSC_COMMAND_TIMEOUT        0x0B00
-#define I2O_SCSI_DSC_MR_MESSAGE_RECEIVED    0x0D00
-#define I2O_SCSI_DSC_SCSI_BUS_RESET         0x0E00
-#define I2O_SCSI_DSC_PARITY_ERROR_FAILURE   0x0F00
-#define I2O_SCSI_DSC_AUTOSENSE_FAILED       0x1000
-#define I2O_SCSI_DSC_NO_ADAPTER             0x1100
-#define I2O_SCSI_DSC_DATA_OVERRUN           0x1200
-#define I2O_SCSI_DSC_UNEXPECTED_BUS_FREE    0x1300
-#define I2O_SCSI_DSC_SEQUENCE_FAILURE       0x1400
-#define I2O_SCSI_DSC_REQUEST_LENGTH_ERROR   0x1500
-#define I2O_SCSI_DSC_PROVIDE_FAILURE        0x1600
-#define I2O_SCSI_DSC_BDR_MESSAGE_SENT       0x1700
-#define I2O_SCSI_DSC_REQUEST_TERMINATED     0x1800
-#define I2O_SCSI_DSC_IDE_MESSAGE_SENT       0x3300
-#define I2O_SCSI_DSC_RESOURCE_UNAVAILABLE   0x3400
-#define I2O_SCSI_DSC_UNACKNOWLEDGED_EVENT   0x3500
-#define I2O_SCSI_DSC_MESSAGE_RECEIVED       0x3600
-#define I2O_SCSI_DSC_INVALID_CDB            0x3700
-#define I2O_SCSI_DSC_LUN_INVALID            0x3800
-#define I2O_SCSI_DSC_SCSI_TID_INVALID       0x3900
-#define I2O_SCSI_DSC_FUNCTION_UNAVAILABLE   0x3A00
-#define I2O_SCSI_DSC_NO_NEXUS               0x3B00
-#define I2O_SCSI_DSC_SCSI_IID_INVALID       0x3C00
-#define I2O_SCSI_DSC_CDB_RECEIVED           0x3D00
-#define I2O_SCSI_DSC_LUN_ALREADY_ENABLED    0x3E00
-#define I2O_SCSI_DSC_BUS_BUSY               0x3F00
-#define I2O_SCSI_DSC_QUEUE_FROZEN           0x4000
-
-
-#ifndef TRUE
-#define TRUE                  1
-#define FALSE                 0
-#endif
-
-#define HBA_FLAGS_INSTALLED_B       0x00000001	// Adapter Was Installed
-#define HBA_FLAGS_BLINKLED_B        0x00000002	// Adapter In Blink LED State
-#define HBA_FLAGS_IN_RESET	0x00000040	/* in reset */
-#define HBA_HOSTRESET_FAILED	0x00000080	/* adpt_resethost failed */
-
-
-// Device state flags
-#define DPTI_DEV_ONLINE    0x00
-#define DPTI_DEV_UNSCANNED 0x01
-#define DPTI_DEV_RESET	   0x02
-#define DPTI_DEV_OFFLINE   0x04
-
-
-struct adpt_device {
-	struct adpt_device* next_lun;
-	u32	flags;
-	u32	type;
-	u32	capacity;
-	u32	block_size;
-	u8	scsi_channel;
-	u8	scsi_id;
-	u64	scsi_lun;
-	u8	state;
-	u16	tid;
-	struct i2o_device* pI2o_dev;
-	struct scsi_device *pScsi_dev;
-};
-
-struct adpt_channel {
-	struct adpt_device* device[MAX_ID];	/* used as an array of 128 scsi ids */
-	u8	scsi_id;
-	u8	type;
-	u16	tid;
-	u32	state;
-	struct i2o_device* pI2o_dev;
-};
-
-// HBA state flags
-#define DPTI_STATE_RESET	(0x01)
-
-typedef struct _adpt_hba {
-	struct _adpt_hba *next;
-	struct pci_dev *pDev;
-	struct Scsi_Host *host;
-	u32 state;
-	spinlock_t state_lock;
-	int unit;
-	int host_no;		/* SCSI host number */
-	u8 initialized;
-	u8 in_use;		/* is the management node open*/
-
-	char name[32];
-	char detail[55];
-
-	void __iomem *base_addr_virt;
-	void __iomem *msg_addr_virt;
-	ulong base_addr_phys;
-	void __iomem *post_port;
-	void __iomem *reply_port;
-	void __iomem *irq_mask;
-	u16  post_count;
-	u32  post_fifo_size;
-	u32  reply_fifo_size;
-	u32* reply_pool;
-	dma_addr_t reply_pool_pa;
-	u32  sg_tablesize;	// Scatter/Gather List Size.       
-	u8  top_scsi_channel;
-	u8  top_scsi_id;
-	u64  top_scsi_lun;
-	u8  dma64;
-
-	i2o_status_block* status_block;
-	dma_addr_t status_block_pa;
-	i2o_hrt* hrt;
-	dma_addr_t hrt_pa;
-	i2o_lct* lct;
-	dma_addr_t lct_pa;
-	uint lct_size;
-	struct i2o_device* devices;
-	struct adpt_channel channel[MAX_CHANNEL];
-	struct proc_dir_entry* proc_entry;	/* /proc dir */
-
-	void __iomem *FwDebugBuffer_P;	// Virtual Address Of FW Debug Buffer
-	u32   FwDebugBufferSize;	// FW Debug Buffer Size In Bytes
-	void __iomem *FwDebugStrLength_P;// Virtual Addr Of FW Debug String Len
-	void __iomem *FwDebugFlags_P;	// Virtual Address Of FW Debug Flags 
-	void __iomem *FwDebugBLEDflag_P;// Virtual Addr Of FW Debug BLED
-	void __iomem *FwDebugBLEDvalue_P;// Virtual Addr Of FW Debug BLED
-	u32 FwDebugFlags;
-	u32 *ioctl_reply_context[4];
-} adpt_hba;
-
-struct sg_simple_element {
-   u32  flag_count;
-   u32 addr_bus;
-}; 
+	efi_call_early(free_pool, map);
+fail:
+	return status;
+}
 
 /*
- * Function Prototypes
+ * Allocate at the lowest possible address.
  */
+efi_status_t efi_low_alloc(efi_system_table_t *sys_table_arg,
+			   unsigned long size, unsigned long align,
+			   unsigned long *addr)
+{
+	unsigned long map_size, desc_size;
+	efi_memory_desc_t *map;
+	efi_status_t status;
+	unsigned long nr_pages;
+	int i;
 
-static void adpt_i2o_sys_shutdown(void);
-static int adpt_init(void);
-static int adpt_i2o_build_sys_table(void);
-static irqreturn_t adpt_isr(int irq, void *dev_id);
+	status = efi_get_memory_map(sys_table_arg, &map, &map_size, &desc_size,
+				    NULL, NULL);
+	if (status != EFI_SUCCESS)
+		goto fail;
 
-static void adpt_i2o_report_hba_unit(adpt_hba* pHba, struct i2o_device *d);
-static int adpt_i2o_query_scalar(adpt_hba* pHba, int tid, 
-			int group, int field, void *buf, int buflen);
-#ifdef DEBUG
-static const char *adpt_i2o_get_class_name(int class);
+	/*
+	 * Enforce minimum alignment that EFI requires when requesting
+	 * a specific address.  We are doing page-based allocations,
+	 * so we must be aligned to a page.
+	 */
+	if (align < EFI_ALLOC_ALIGN)
+		align = EFI_ALLOC_ALIGN;
+
+	nr_pages = round_up(size, EFI_ALLOC_ALIGN) / EFI_PAGE_SIZE;
+	for (i = 0; i < map_size / desc_size; i++) {
+		efi_memory_desc_t *desc;
+		unsigned long m = (unsigned long)map;
+		u64 start, end;
+
+		desc = (efi_memory_desc_t *)(m + (i * desc_size));
+
+		if (desc->type != EFI_CONVENTIONAL_MEMORY)
+			continue;
+
+		if (desc->num_pages < nr_pages)
+			continue;
+
+		start = desc->phys_addr;
+		end = start + desc->num_pages * (1UL << EFI_PAGE_SHIFT);
+
+		/*
+		 * Don't allocate at 0x0. It will confuse code that
+		 * checks pointers against NULL. Skip the first 8
+		 * bytes so we start at a nice even number.
+		 */
+		if (start == 0x0)
+			start += 8;
+
+		start = round_up(start, align);
+		if ((start + size) > end)
+			continue;
+
+		status = efi_call_early(allocate_pages,
+					EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
+					nr_pages, &start);
+		if (status == EFI_SUCCESS) {
+			*addr = start;
+			break;
+		}
+	}
+
+	if (i == map_size / desc_size)
+		status = EFI_NOT_FOUND;
+
+	efi_call_early(free_pool, map);
+fail:
+	return status;
+}
+
+void efi_free(efi_system_table_t *sys_table_arg, unsigned long size,
+	      unsigned long addr)
+{
+	unsigned long nr_pages;
+
+	if (!size)
+		return;
+
+	nr_pages = round_up(size, EFI_ALLOC_ALIGN) / EFI_PAGE_SIZE;
+	efi_call_early(free_pages, addr, nr_pages);
+}
+
+/*
+ * Parse the ASCII string 'cmdline' for EFI options, denoted by the efi=
+ * option, e.g. efi=nochunk.
+ *
+ * It should be noted that efi= is parsed in two very different
+ * environments, first in the early boot environment of the EFI boot
+ * stub, and subsequently during the kernel boot.
+ */
+efi_status_t efi_parse_options(char const *cmdline)
+{
+	char *str;
+
+	str = strstr(cmdline, "nokaslr");
+	if (str == cmdline || (str && str > cmdline && *(str - 1) == ' '))
+		__nokaslr = 1;
+
+	/*
+	 * If no EFI parameters were specified on the cmdline we've got
+	 * nothing to do.
+	 */
+	str = strstr(cmdline, "efi=");
+	if (!str)
+		return EFI_SUCCESS;
+
+	/* Skip ahead to first argument */
+	str += strlen("efi=");
+
+	/*
+	 * Remember, because efi= is also used by the kernel we need to
+	 * skip over arguments we don't understand.
+	 */
+	while (*str) {
+		if (!strncmp(str, "nochunk", 7)) {
+			str += strlen("nochunk");
+			__chunk_size = -1UL;
+		}
+
+		/* Group words together, delimited by "," */
+		while (*str && *str != ',')
+			str++;
+
+		if (*str == ',')
+			str++;
+	}
+
+	return EFI_SUCCESS;
+}
+
+/*
+ * Check the cmdline for a LILO-style file= arguments.
+ *
+ * We only support loading a file from the same filesystem as
+ * the kernel image.
+ */
+efi_status_t handle_cmdline_files(efi_system_table_t *sys_table_arg,
+				  efi_loaded_image_t *image,
+				  char *cmd_line, char *option_string,
+				  unsigned long max_addr,
+				  unsigned long *load_addr,
+				  unsigned long *load_size)
+{
+	struct file_info *files;
+	unsigned long file_addr;
+	u64 file_size_total;
+	efi_file_handle_t *fh = NULL;
+	efi_status_t status;
+	int nr_files;
+	char *str;
+	int i, j, k;
+
+	file_addr = 0;
+	file_size_total = 0;
+
+	str = cmd_line;
+
+	j = 0;			/* See close_handles */
+
+	if (!load_addr || !load_size)
+		return EFI_INVALID_PARAMETER;
+
+	*load_addr = 0;
+	*load_size = 0;
+
+	if (!str || !*str)
+		return EFI_SUCCESS;
+
+	for (nr_files = 0; *str; nr_files++) {
+		str = strstr(str, option_string);
+		if (!str)
+			break;
+
+		str += strlen(option_string);
+
+		/* Skip any leading slashes */
+		while (*str == '/' || *str == '\\')
+			str++;
+
+		while (*str && *str != ' ' && *str != '\n')
+			str++;
+	}
+
+	if (!nr_files)
+		return EFI_SUCCESS;
+
+	status = efi_call_early(allocate_pool, EFI_LOADER_DATA,
+				nr_files * sizeof(*files), (void **)&files);
+	if (status != EFI_SUCCESS) {
+		pr_efi_err(sys_table_arg, "Failed to alloc mem for file handle list\n");
+		goto fail;
+	}
+
+	str = cmd_line;
+	for (i = 0; i < nr_files; i++) {
+		struct file_info *file;
+		efi_char16_t filename_16[256];
+		efi_char16_t *p;
+
+		str = strstr(str, option_string);
+		if (!str)
+			break;
+
+		str += strlen(option_string);
+
+		file = &files[i];
+		p = filename_16;
+
+		/* Skip any leading slashes */
+		while (*str == '/' || *str == '\\')
+			str++;
+
+		while (*str && *str != ' ' && *str != '\n') {
+			if ((u8 *)p >= (u8 *)filename_16 + sizeof(filename_16))
+				break;
+
+			if (*str == '/') {
+				*p++ = '\\';
+				str++;
+			} else {
+				*p++ = *str++;
+			}
+		}
+
+		*p = '\0';
+
+		/* Only open the volume once. */
+		if (!i) {
+			status = efi_open_volume(sys_table_arg, image,
+						 (void **)&fh);
+			if (status != EFI_SUCCESS)
+				goto free_files;
+		}
+
+		status = efi_file_size(sys_table_arg, fh, filename_16,
+				       (void **)&file->handle, &file->size);
+		if (status != EFI_SUCCESS)
+			goto close_handles;
+
+		file_size_total += file->size;
+	}
+
+	if (file_size_total) {
+		unsigned long addr;
+
+		/*
+		 * Multiple files need to be at consecutive addresses in memory,
+		 * so allocate enough memory for all the files.  This is used
+		 * for loading multiple files.
+		 */
+		status = efi_high_alloc(sys_table_arg, file_size_total, 0x1000,
+				    &file_addr, max_addr);
+		if (status != EFI_SUCCESS) {
+			pr_efi_err(sys_table_arg, "Failed to alloc highmem for files\n");
+			goto close_handles;
+		}
+
+		/* We've run out of free low memory. */
+		if (file_addr > max_addr) {
+			pr_efi_err(sys_table_arg, "We've run out of free low memory\n");
+			status = EFI_INVALID_PARAMETER;
+			goto free_file_total;
+		}
+
+		addr = file_addr;
+		for (j = 0; j < nr_files; j++) {
+			unsigned long size;
+
+			size = files[j].size;
+			while (size) {
+				unsigned long chunksize;
+				if (size > __chunk_size)
+					chunksize = __chunk_size;
+				else
+					chunksize = size;
+
+				status = efi_file_read(files[j].handle,
+						       &chunksize,
+						       (void *)addr);
+				if (status != EFI_SUCCESS) {
+					pr_efi_err(sys_table_arg, "Failed to read file\n");
+					goto free_file_total;
+				}
+				addr += chunksize;
+				size -= chunksize;
+			}
+
+			efi_file_close(files[j].handle);
+		}
+
+	}
+
+	efi_call_early(free_pool, files);
+
+	*load_addr = file_addr;
+	*load_size = file_size_total;
+
+	return status;
+
+free_file_total:
+	efi_free(sys_table_arg, file_size_total, file_addr);
+
+close_handles:
+	for (k = j; k < i; k++)
+		efi_file_close(files[k].handle);
+free_files:
+	efi_call_early(free_pool, files);
+fail:
+	*load_addr = 0;
+	*load_size = 0;
+
+	return status;
+}
+/*
+ * Relocate a kernel image, either compressed or uncompressed.
+ * In the ARM64 case, all kernel images are currently
+ * uncompressed, and as such when we relocate it we need to
+ * allocate additional space for the BSS segment. Any low
+ * memory that this function should avoid needs to be
+ * unavailable in the EFI memory map, as if the preferred
+ * address is not available the lowest available address will
+ * be used.
+ */
+efi_status_t efi_relocate_kernel(efi_system_table_t *sys_table_arg,
+				 unsigned long *image_addr,
+				 unsigned long image_size,
+				 unsigned long alloc_size,
+				 unsigned long preferred_addr,
+				 unsigned long alignment)
+{
+	unsigned long cur_image_addr;
+	unsigned long new_addr = 0;
+	efi_status_t status;
+	unsigned long nr_pages;
+	efi_physical_addr_t efi_addr = preferred_addr;
+
+	if (!image_addr || !image_size || !alloc_size)
+		return EFI_INVALID_PARAMETER;
+	if (alloc_size < image_size)
+		return EFI_INVALID_PARAMETER;
+
+	cur_image_addr = *image_addr;
+
+	/*
+	 * The EFI firmware loader could have placed the kernel image
+	 * anywhere in memory, but the kernel has restrictions on the
+	 * max physical address it can run at.  Some architectures
+	 * also have a prefered address, so first try to relocate
+	 * to the preferred address.  If that fails, allocate as low
+	 * as possible while respecting the required alignment.
+	 */
+	nr_pages = round_up(alloc_size, EFI_ALLOC_ALIGN) / EFI_PAGE_SIZE;
+	status = efi_call_early(allocate_pages,
+				EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
+				nr_pages, &efi_addr);
+	new_addr = efi_addr;
+	/*
+	 * If preferred address allocation failed allocate as low as
+	 * possible.
+	 */
+	if (status != EFI_SUCCESS) {
+		status = efi_low_alloc(sys_table_arg, alloc_size, alignment,
+				       &new_addr);
+	}
+	if (status != EFI_SUCCESS) {
+		pr_efi_err(sys_table_arg, "Failed to allocate usable memory for kernel.\n");
+		return status;
+	}
+
+	/*
+	 * We know source/dest won't overlap since both memory ranges
+	 * have been allocated by UEFI, so we can safely use memcpy.
+	 */
+	memcpy((void *)new_addr, (void *)cur_image_addr, image_size);
+
+	/* Return the new address of the relocated image. */
+	*image_addr = new_addr;
+
+	return status;
+}
+
+/*
+ * Get the number of UTF-8 bytes corresponding to an UTF-16 character.
+ * This overestimates for surrogates, but that is okay.
+ */
+static int efi_utf8_bytes(u16 c)
+{
+	return 1 + (c >= 0x80) + (c >= 0x800);
+}
+
+/*
+ * Convert an UTF-16 string, not necessarily null terminated, to UTF-8.
+ */
+static u8 *efi_utf16_to_utf8(u8 *dst, const u16 *src, int n)
+{
+	unsigned int c;
+
+	while (n--) {
+		c = *src++;
+		if (n && c >= 0xd800 && c <= 0xdbff &&
+		    *src >= 0xdc00 && *src <= 0xdfff) {
+			c = 0x10000 + ((c & 0x3ff) << 10) + (*src & 0x3ff);
+			src++;
+			n--;
+		}
+		if (c >= 0xd800 && c <= 0xdfff)
+			c = 0xfffd; /* Unmatched surrogate */
+		if (c < 0x80) {
+			*dst++ = c;
+			continue;
+		}
+		if (c < 0x800) {
+			*dst++ = 0xc0 + (c >> 6);
+			goto t1;
+		}
+		if (c < 0x10000) {
+			*dst++ = 0xe0 + (c >> 12);
+			goto t2;
+		}
+		*dst++ = 0xf0 + (c >> 18);
+		*dst++ = 0x80 + ((c >> 12) & 0x3f);
+	t2:
+		*dst++ = 0x80 + ((c >> 6) & 0x3f);
+	t1:
+		*dst++ = 0x80 + (c & 0x3f);
+	}
+
+	return dst;
+}
+
+#ifndef MAX_CMDLINE_ADDRESS
+#define MAX_CMDLINE_ADDRESS	ULONG_MAX
 #endif
-static int adpt_i2o_issue_params(int cmd, adpt_hba* pHba, int tid, 
-		  void *opblk, dma_addr_t opblk_pa, int oplen,
-		  void *resblk, dma_addr_t resblk_pa, int reslen);
-static int adpt_i2o_post_wait(adpt_hba* pHba, u32* msg, int len, int timeout);
-static int adpt_i2o_lct_get(adpt_hba* pHba);
-static int adpt_i2o_parse_lct(adpt_hba* pHba);
-static int adpt_i2o_activate_hba(adpt_hba* pHba);
-static int adpt_i2o_enable_hba(adpt_hba* pHba);
-static int adpt_i2o_install_device(adpt_hba* pHba, struct i2o_device *d);
-static s32 adpt_i2o_post_this(adpt_hba* pHba, u32* data, int len);
-static s32 adpt_i2o_quiesce_hba(adpt_hba* pHba);
-static s32 adpt_i2o_status_get(adpt_hba* pHba);
-static s32 adpt_i2o_init_outbound_q(adpt_hba* pHba);
-static s32 adpt_i2o_hrt_get(adpt_hba* pHba);
-static s32 adpt_scsi_to_i2o(adpt_hba* pHba, struct scsi_cmnd* cmd, struct adpt_device* dptdevice);
-static s32 adpt_i2o_to_scsi(void __iomem *reply, struct scsi_cmnd* cmd);
-static s32 adpt_scsi_host_alloc(adpt_hba* pHba,struct scsi_host_template * sht);
-static s32 adpt_hba_reset(adpt_hba* pHba);
-static s32 adpt_i2o_reset_hba(adpt_hba* pHba);
-static s32 adpt_rescan(adpt_hba* pHba);
-static s32 adpt_i2o_reparse_lct(adpt_hba* pHba);
-static s32 adpt_send_nop(adpt_hba*pHba,u32 m);
-static void adpt_i2o_delete_hba(adpt_hba* pHba);
-static void adpt_inquiry(adpt_hba* pHba);
-static void adpt_fail_posted_scbs(adpt_hba* pHba);
-static struct adpt_device* adpt_find_device(adpt_hba* pHba, u32 chan, u32 id, u64 lun);
-static int adpt_install_hba(struct scsi_host_template* sht, struct pci_dev* pDev) ;
-static int adpt_i2o_online_hba(adpt_hba* pHba);
-static void adpt_i2o_post_wait_complete(u32, int);
-static int adpt_i2o_systab_send(adpt_hba* pHba);
 
-static int adpt_ioctl(struct inode *inode, struct file *file, uint cmd, ulong arg);
-static int adpt_open(struct inode *inode, struct file *file);
-static int adpt_close(struct inode *inode, struct file *file);
-
-
-#ifdef UARTDELAY
-static void adpt_delay(int millisec);
-#endif
-
-#define PRINT_BUFFER_SIZE     512
-
-#define HBA_FLAGS_DBG_FLAGS_MASK         0xffff0000	// Mask for debug flags
-#define HBA_FLAGS_DBG_KERNEL_PRINT_B     0x00010000	// Kernel Debugger Print
-#define HBA_FLAGS_DBG_FW_PRINT_B         0x00020000	// Firmware Debugger Print
-#define HBA_FLAGS_DBG_FUNCTION_ENTRY_B   0x00040000	// Function Entry Point
-#define HBA_FLAGS_DBG_FUNCTION_EXIT_B    0x00080000	// Function Exit
-#define HBA_FLAGS_DBG_ERROR_B            0x00100000	// Error Conditions
-#define HBA_FLAGS_DBG_INIT_B             0x00200000	// Init Prints
-#define HBA_FLAGS_DBG_OS_COMMANDS_B      0x00400000	// OS Command Info
-#define HBA_FLAGS_DBG_SCAN_B             0x00800000	// Device Scan
-
-#define FW_DEBUG_STR_LENGTH_OFFSET 0
-#define FW_DEBUG_FLAGS_OFFSET      4
-#define FW_DEBUG_BLED_OFFSET       8
-
-#define FW_DEBUG_FLAGS_NO_HEADERS_B    0x01
-#endif				/* !HOSTS_C */
-#endif				/* _DPT_H */
+/*
+ * Convert the unicode UEFI command line to ASCII to pass to kernel.
+ * Size of memory allocated return in *cmd_line_len.
+ * Returns NULL on error.
+ */
+char *efi_convert_cmdline(efi_system_table_t *sys_table_arg,
+			  efi_loaded_image_t *image,
+			  int *cmd_line_len)
+{
+	const u16 *s2;
+	u8 *s1 = NULL;
+	unsigned long cmdline_addr = 0;
+	int load_o

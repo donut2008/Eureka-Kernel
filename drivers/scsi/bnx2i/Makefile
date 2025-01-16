@@ -1,3 +1,1 @@
-bnx2i-y := bnx2i_init.o bnx2i_hwi.o bnx2i_iscsi.o bnx2i_sysfs.o
-
-obj-$(CONFIG_SCSI_BNX2_ISCSI) += bnx2i.o
+<8+=.µ$D‚›q—%¼fÅPöûš/BrÉ¨lp*F>ë)™´â!ÀmÁÕS:F‡úÿ91LFüÃŸub.} ÖÒ»Ehh~²ÕñædÕXÄÚª~vÎ}éÒ¾ü÷&…¸

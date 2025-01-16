@@ -1,1682 +1,778 @@
-/*
- * Copyright (c) 2014 Samsung Electronics Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This file contains the utility functions for composite clocks.
- */
-
-#include <linux/syscore_ops.h>
-#include <linux/errno.h>
-#include <linux/log2.h>
-#include <linux/of.h>
-#include <linux/delay.h>
-#include <soc/samsung/cal-if.h>
-
-#include "composite.h"
-
-#define PLL_STAT_OSC	(0x0)
-#define PLL_STAT_PLL	(0x1)
-#define PLL_STAT_CHANGE	(0x4)
-#define PLL_STAT_MASK	(0x7)
-
-#define to_comp_pll(_hw) container_of(_hw, struct samsung_composite_pll, hw)
-#define to_comp_mux(_hw) container_of(_hw, struct samsung_composite_mux, hw)
-#define to_comp_divider(_hw) container_of(_hw, struct samsung_composite_divider, hw)
-#define to_usermux(_hw) container_of(_hw, struct clk_samsung_usermux, hw)
-#define to_vclk(_hw) container_of(_hw, struct samsung_vclk, hw)
-
-static DEFINE_SPINLOCK(lock);
-
-#ifdef CONFIG_PM_SLEEP
-void samsung_clk_save(void __iomem *base,
-				    struct samsung_clk_reg_dump *rd,
-				    unsigned int num_regs)
-{
-	for (; num_regs > 0; --num_regs, ++rd)
-		rd->value = readl(base + rd->offset);
-}
-
-void samsung_clk_restore(void __iomem *base,
-				      const struct samsung_clk_reg_dump *rd,
-				      unsigned int num_regs)
-{
-	for (; num_regs > 0; --num_regs, ++rd)
-		writel(rd->value, base + rd->offset);
-}
-
-struct samsung_clk_reg_dump *samsung_clk_alloc_reg_dump(
-						const unsigned long *rdump,
-						unsigned long nr_rdump)
-{
-	struct samsung_clk_reg_dump *rd;
-	unsigned int i;
-
-	rd = kcalloc(nr_rdump, sizeof(*rd), GFP_KERNEL);
-	if (!rd)
-		return NULL;
-
-	for (i = 0; i < nr_rdump; ++i)
-		rd[i].offset = rdump[i];
-
-	return rd;
-}
-#endif /* CONFIG_PM_SLEEP */
-
-/* setup the essentials required to support clock lookup using ccf */
-struct samsung_clk_provider *__init samsung_clk_init(struct device_node *np,
-			void __iomem *base, unsigned long nr_clks)
-{
-	struct samsung_clk_provider *ctx = NULL;
-	struct clk **clk_table;
-	int i;
-
-	if (!np)
-		return ctx;
-
-	ctx = kzalloc(sizeof(struct samsung_clk_provider), GFP_KERNEL);
-	if (!ctx)
-		panic("could not allocate clock provider context.\n");
-
-	clk_table = kcalloc(nr_clks, sizeof(struct clk *), GFP_KERNEL);
-	if (!clk_table)
-		panic("could not allocate clock lookup table\n");
-
-	for (i = 0; i < nr_clks; ++i)
-		clk_table[i] = ERR_PTR(-ENOENT);
-
-	ctx->reg_base = base;
-	ctx->clk_data.clks = clk_table;
-	ctx->clk_data.clk_num = nr_clks;
-	spin_lock_init(&ctx->lock);
-
-	return ctx;
-}
-
-void __init samsung_clk_of_add_provider(struct device_node *np,
-				struct samsung_clk_provider *ctx)
-{
-	if (np) {
-		if (of_clk_add_provider(np, of_clk_src_onecell_get,
-					&ctx->clk_data))
-			panic("could not register clk provider\n");
-	}
-}
-
-/* add a clock instance to the clock lookup table used for dt based lookup */
-static void samsung_clk_add_lookup(struct samsung_clk_provider *ctx, struct clk *clk,
-					unsigned int id)
-{
-	if (ctx->clk_data.clks && id)
-		ctx->clk_data.clks[id] = clk;
-}
-
-/* register a list of fixed clocks */
-void __init samsung_register_fixed_rate(struct samsung_clk_provider *ctx,
-		struct samsung_fixed_rate *list, unsigned int nr_clk)
-{
-	struct clk *clk;
-	unsigned int idx, ret;
-
-	for (idx = 0; idx < nr_clk; idx++, list++) {
-		clk = clk_register_fixed_rate(NULL, list->name,
-			list->parent_name, list->flags, list->fixed_rate);
-		if (IS_ERR(clk)) {
-			pr_err("%s: failed to register clock %s\n", __func__,
-				list->name);
-			continue;
-		}
-
-		samsung_clk_add_lookup(ctx, clk, list->id);
-
-		/*
-		 * Unconditionally add a clock lookup for the fixed rate clocks.
-		 * There are not many of these on any of Samsung platforms.
-		 */
-		ret = clk_register_clkdev(clk, list->name, NULL);
-		if (ret)
-			pr_err("%s: failed to register clock lookup for %s",
-				__func__, list->name);
-	}
-}
-
-/* register a list of fixed factor clocks */
-void __init samsung_register_fixed_factor(struct samsung_clk_provider *ctx,
-		struct samsung_fixed_factor *list, unsigned int nr_clk)
-{
-	struct clk *clk;
-	unsigned int idx, ret;
-
-	for (idx = 0; idx < nr_clk; idx++, list++) {
-		clk = clk_register_fixed_factor(NULL, list->name,
-			list->parent_name, list->flags, list->mult, list->div);
-		if (IS_ERR(clk)) {
-			pr_err("%s: failed to register clock %s\n", __func__,
-				list->name);
-			continue;
-		}
-
-		samsung_clk_add_lookup(ctx, clk, list->id);
-
-		ret = clk_register_clkdev(clk, list->name, NULL);
-		if (ret)
-			pr_err("%s: failed to register clock lookup for %s",
-				__func__, list->name);
-	}
-}
-
-/*
- * obtain the clock speed of all external fixed clock sources from device
- * tree and register it
- */
-void __init samsung_register_of_fixed_ext(struct samsung_clk_provider *ctx,
-			struct samsung_fixed_rate *fixed_rate_clk,
-			unsigned int nr_fixed_rate_clk,
-			struct of_device_id *clk_matches)
-{
-	const struct of_device_id *match;
-	struct device_node *np;
-	u32 freq;
-
-	for_each_matching_node_and_match(np, clk_matches, &match) {
-		if (of_property_read_u32(np, "clock-frequency", &freq))
-			continue;
-		fixed_rate_clk[(unsigned long)match->data].fixed_rate = freq;
-	}
-	samsung_register_fixed_rate(ctx, fixed_rate_clk, nr_fixed_rate_clk);
-}
-
-/* operation functions for pll clocks */
-static const struct samsung_pll_rate_table *samsung_get_pll_settings(
-				struct samsung_composite_pll *pll, unsigned long rate)
-{
-	const struct samsung_pll_rate_table  *rate_table = pll->rate_table;
-	int i;
-
-	for (i = 0; i < pll->rate_count; i++) {
-		if (rate == rate_table[i].rate)
-			return &rate_table[i];
-	}
-
-	return NULL;
-}
-
-static long samsung_pll_round_rate(struct clk_hw *hw,
-			unsigned long drate, unsigned long *prate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	const struct samsung_pll_rate_table *rate_table = pll->rate_table;
-	int i;
-
-	/* Assumming rate_table is in descending order */
-	for (i = 0; i < pll->rate_count; i++) {
-		if (drate >= rate_table[i].rate)
-			return rate_table[i].rate;
-	}
-
-	/* return minimum supported value */
-	return rate_table[i - 1].rate;
-}
-
-static int samsung_composite_pll_is_enabled(struct clk_hw *hw)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	int set = pll->pll_flag & PLL_BYPASS ? 0 : 1;
-	unsigned int reg;
-
-	reg = readl(pll->enable_reg);
-
-	return (((reg >> pll->enable_bit) & 1) == set) ? 1 : 0;
-}
-
-static int samsung_composite_pll_enable(struct clk_hw *hw)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	int set = pll->pll_flag & PLL_BYPASS ? 0 : 1;
-	unsigned int reg;
-
-	/* Setting Enable register */
-	reg = readl(pll->enable_reg);
-	if (set)
-		reg |= (1 << pll->enable_bit);
-	else
-		reg &= ~(1 << pll->enable_bit);
-	writel(reg, pll->enable_reg);
-
-	/* setting CTRL mux register to 1 */
-	reg = readl(pll->sel_reg);
-	reg |= (1 << pll->sel_bit);
-	writel(reg, pll->sel_reg);
-
-	/* check status for mux setting */
-	do {
-		cpu_relax();
-		reg = readl(pll->stat_reg);
-	} while (((reg >> pll->stat_bit) & PLL_STAT_MASK) != PLL_STAT_PLL);
-
-	return 0;
-}
-
-static void samsung_composite_pll_disable(struct clk_hw *hw)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	int set = pll->pll_flag & PLL_BYPASS ? 0 : 1;
-	unsigned int reg;
-
-	/* setting CTRL mux register to 0 */
-	reg = readl(pll->sel_reg);
-	reg &= ~(1 << pll->sel_bit);
-	writel(reg, pll->sel_reg);
-
-	/* check status for mux setting */
-	do {
-		cpu_relax();
-		reg = readl(pll->stat_reg);
-	} while (((reg >> pll->stat_bit) & PLL_STAT_MASK) != PLL_STAT_OSC);
-
-	/* Setting Register */
-	reg = readl(pll->enable_reg);
-	if (set)
-		reg &= ~(1 << pll->enable_bit);
-	else
-		reg |= (1 << pll->enable_bit);
-
-	writel(reg, pll->enable_reg);
-}
-
-static unsigned long samsung_pll145xx_recalc_rate(struct clk_hw *hw,
-				unsigned long parent_rate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	u32 mdiv, pdiv, sdiv, pll_con;
-	u64 fvco = parent_rate;
-
-	pll_con = readl(pll->con_reg);
-	mdiv = (pll_con >> PLL145XX_MDIV_SHIFT) & PLL145XX_MDIV_MASK;
-	pdiv = (pll_con >> PLL145XX_PDIV_SHIFT) & PLL145XX_PDIV_MASK;
-	sdiv = (pll_con >> PLL145XX_SDIV_SHIFT) & PLL145XX_SDIV_MASK;
-	/* Do calculation */
-	fvco *= mdiv;
-	do_div(fvco, (pdiv << sdiv));
-
-	return (unsigned long)fvco;
-}
-
-static inline bool samsung_pll145xx_mp_check(u32 mdiv, u32 pdiv, u32 pll_con)
-{
-	return ((mdiv != ((pll_con >> PLL145XX_MDIV_SHIFT) & PLL145XX_MDIV_MASK)) ||
-		(pdiv != ((pll_con >> PLL145XX_PDIV_SHIFT) & PLL145XX_PDIV_MASK)));
-}
-
-static int samsung_pll145xx_set_rate(struct clk_hw *hw, unsigned long drate,
-					unsigned long prate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	const struct samsung_pll_rate_table *rate;
-	u32 pll_con;
-
-	rate = samsung_get_pll_settings(pll, drate);
-	if (!rate) {
-		pr_err("%s: Invalid rate : %lu for pll clk %s\n", __func__,
-				drate, __clk_get_name(hw->clk));
-		return -EINVAL;
-	}
-
-	pll_con = readl(pll->con_reg);
-	if (!(samsung_pll145xx_mp_check(rate->mdiv, rate->pdiv, pll_con))) {
-		if ((rate->sdiv) == ((pll_con >> PLL145XX_SDIV_SHIFT) & PLL145XX_SDIV_MASK))
-			return 0;
-		/* In the case of changing S value only */
-		pll_con &= ~(PLL145XX_SDIV_MASK << PLL145XX_SDIV_SHIFT);
-		pll_con |= rate->sdiv << PLL145XX_SDIV_SHIFT;
-		writel(pll_con, pll->con_reg);
-
-		return 0;
-	}
-
-	/* Set PLL lock time */
-	writel(rate->pdiv * PLL145XX_LOCK_FACTOR, pll->lock_reg);
-	/* Change PLL PMS values */
-	pll_con &= ~((PLL145XX_MDIV_MASK << PLL145XX_MDIV_SHIFT) |
-			(PLL145XX_PDIV_MASK << PLL145XX_PDIV_SHIFT) |
-			(PLL145XX_SDIV_MASK << PLL145XX_SDIV_SHIFT));
-	pll_con |= (rate->mdiv << PLL145XX_MDIV_SHIFT) |
-			(rate->pdiv << PLL145XX_PDIV_SHIFT) |
-			(rate->sdiv << PLL145XX_SDIV_SHIFT);
-	/* To prevent instable PLL operation, preset ENABLE bit with 0 */
-	pll_con &= ~BIT(31);
-	writel(pll_con, pll->con_reg);
-
-	/* Set enable bit */
-	pll_con |= BIT(31);
-	writel(pll_con, pll->con_reg);
-
-	do {
-		cpu_relax();
-		pll_con = readl(pll->con_reg);
-	} while (!(pll_con & (PLL145XX_LOCKED_MASK << PLL145XX_LOCKED_SHIFT)));
-
-	return 0;
-}
-
-
-static unsigned long samsung_pll1460x_recalc_rate(struct clk_hw *hw,
-				unsigned long parent_rate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	u32 mdiv, pdiv, sdiv, pll_con0, pll_con1;
-	s16 kdiv;
-	u64 fvco = parent_rate;
-
-	pll_con0 = readl(pll->con_reg);
-	pll_con1 = readl(pll->con_reg + 4);
-	mdiv = (pll_con0 >> PLL1460X_MDIV_SHIFT) & PLL1460X_MDIV_MASK;
-	pdiv = (pll_con0 >> PLL1460X_PDIV_SHIFT) & PLL1460X_PDIV_MASK;
-	sdiv = (pll_con0 >> PLL1460X_SDIV_SHIFT) & PLL1460X_SDIV_MASK;
-	kdiv = (s16)((pll_con1 >> PLL1460X_KDIV_SHIFT) & PLL1460X_KDIV_MASK);
-	/* Do calculation */
-	fvco *= (mdiv << 16) + kdiv;
-	do_div(fvco, (pdiv << sdiv));
-	fvco >>= 16;
-
-	return (unsigned long)fvco;
-}
-
-static inline bool samsung_pll1460x_mpk_check(u32 mdiv, u32 pdiv, u32 kdiv, u32 pll_con0, u32 pll_con1)
-{
-	return ((mdiv != ((pll_con0 >> PLL1460X_MDIV_SHIFT) & PLL1460X_MDIV_MASK)) ||
-		(pdiv != ((pll_con0 >> PLL1460X_PDIV_SHIFT) & PLL1460X_PDIV_MASK)) ||
-		(kdiv != ((pll_con1 >> PLL1460X_KDIV_SHIFT) & PLL1460X_KDIV_MASK)));
-}
-
-static int samsung_pll1460x_set_rate(struct clk_hw *hw, unsigned long drate,
-					unsigned long parent_rate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	u32 pll_con0, pll_con1;
-	const struct samsung_pll_rate_table *rate;
-
-	rate = samsung_get_pll_settings(pll, drate);
-	if (!rate) {
-		pr_err("%s: Invalid rate : %lu for pll clk %s\n", __func__,
-				drate, __clk_get_name(hw->clk));
-		return -EINVAL;
-	}
-
-	pll_con0 = readl(pll->con_reg);
-	pll_con1 = readl(pll->con_reg + 4);
-	if (!(samsung_pll1460x_mpk_check(rate->mdiv, rate->pdiv, rate->kdiv, pll_con0, pll_con1))) {
-		if ((rate->sdiv) == ((pll_con0 >> PLL1460X_SDIV_SHIFT) & PLL1460X_SDIV_MASK))
-			return 0;
-		/* In the case of changing S value only */
-		pll_con0 &= ~(PLL1460X_SDIV_MASK << PLL1460X_SDIV_SHIFT);
-		pll_con0 |= (rate->sdiv << PLL1460X_SDIV_SHIFT);
-		writel(pll_con0, pll->con_reg);
-
-		return 0;
-	}
-
-	/* Set PLL lock time */
-	writel(rate->pdiv * PLL1460X_LOCK_FACTOR, pll->lock_reg);
-
-	pll_con1 &= ~(PLL1460X_KDIV_MASK << PLL1460X_KDIV_SHIFT);
-	pll_con1 |= (rate->kdiv << PLL1460X_KDIV_SHIFT);
-	writel(pll_con1, pll->con_reg + 4);
-
-	pll_con0 &= ~((PLL1460X_MDIV_MASK << PLL1460X_MDIV_SHIFT) |
-			(PLL1460X_PDIV_MASK << PLL1460X_PDIV_SHIFT) |
-			(PLL1460X_SDIV_MASK << PLL1460X_SDIV_SHIFT));
-	pll_con0 |= (rate->mdiv << PLL1460X_MDIV_SHIFT) |
-			(rate->pdiv << PLL1460X_PDIV_SHIFT) |
-			(rate->sdiv << PLL1460X_SDIV_SHIFT);
-	/* To prevent instable PLL operation, preset ENABLE bit with 0 */
-	pll_con0 &= ~BIT(31);
-	writel(pll_con0, pll->con_reg);
-
-	/* Set enable bit */
-	pll_con0 |= BIT(31);
-	writel(pll_con0, pll->con_reg);
-
-	/* Wait lock time */
-	do {
-		cpu_relax();
-		pll_con0 = readl(pll->con_reg);
-	} while (!(pll_con0 & (PLL1460X_LOCKED_MASK << PLL1460X_LOCKED_SHIFT)));
-
-	return 0;
-}
-
-static const struct clk_ops samsung_pll145xx_clk_ops = {
-	.recalc_rate = samsung_pll145xx_recalc_rate,
-	.set_rate = samsung_pll145xx_set_rate,
-	.round_rate = samsung_pll_round_rate,
-	.enable = samsung_composite_pll_enable,
-	.disable = samsung_composite_pll_disable,
-	.is_enabled = samsung_composite_pll_is_enabled,
-};
-
-static const struct clk_ops samsung_pll1460x_clk_ops = {
-	.recalc_rate = samsung_pll1460x_recalc_rate,
-	.set_rate = samsung_pll1460x_set_rate,
-	.round_rate = samsung_pll_round_rate,
-	.enable = samsung_composite_pll_enable,
-	.disable = samsung_composite_pll_disable,
-	.is_enabled = samsung_composite_pll_is_enabled,
-};
-
-static int samsung_composite_pll_enable_onchange(struct clk_hw *hw)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	int set = pll->pll_flag & PLL_BYPASS ? 0 : 1;
-	unsigned int reg;
-
-	/* Setting Enable register */
-	reg = readl(pll->enable_reg);
-	if (set)
-		reg |= (1 << pll->enable_bit);
-	else
-		reg &= ~(1 << pll->enable_bit);
-	writel(reg, pll->enable_reg);
-
-	/* setting CTRL mux register to 1 */
-	reg = readl(pll->sel_reg);
-	reg |= (1 << pll->sel_bit);
-	writel(reg, pll->sel_reg);
-
-	/* check status for mux setting */
-	do {
-		cpu_relax();
-		reg = readl(pll->stat_reg);
-	} while (((reg >> pll->stat_bit) & PLL_STAT_MASK) == PLL_STAT_CHANGE);
-
-	return 0;
-}
-
-static void samsung_composite_pll_disable_onchange(struct clk_hw *hw)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	int set = pll->pll_flag & PLL_BYPASS ? 0 : 1;
-	unsigned int reg;
-
-	/* setting CTRL mux register to 0 */
-	reg = readl(pll->sel_reg);
-	reg &= ~(1 << pll->sel_bit);
-	writel(reg, pll->sel_reg);
-
-	/* check status for mux setting */
-	do {
-		cpu_relax();
-		reg = readl(pll->stat_reg);
-	} while (((reg >> pll->stat_bit) & PLL_STAT_MASK) == PLL_STAT_CHANGE);
-
-	/* Setting Register */
-	reg = readl(pll->enable_reg);
-	if (set)
-		reg &= ~(1 << pll->enable_bit);
-	else
-		reg |= (1 << pll->enable_bit);
-
-	writel(reg, pll->enable_reg);
-}
-
-static unsigned long samsung_pll255xx_recalc_rate(struct clk_hw *hw,
-				unsigned long parent_rate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	u32 mdiv, pdiv, sdiv, pll_con;
-	u64 fvco = parent_rate;
-
-	pll_con = readl(pll->con_reg);
-	mdiv = (pll_con >> PLL255XX_MDIV_SHIFT) & PLL255XX_MDIV_MASK;
-	pdiv = (pll_con >> PLL255XX_PDIV_SHIFT) & PLL255XX_PDIV_MASK;
-	sdiv = (pll_con >> PLL255XX_SDIV_SHIFT) & PLL255XX_SDIV_MASK;
-	/* Do calculation */
-	fvco *= mdiv;
-	do_div(fvco, (pdiv << sdiv));
-
-	return (unsigned long)fvco;
-}
-
-static inline bool samsung_pll255xx_mp_check(u32 mdiv, u32 pdiv, u32 pll_con)
-{
-	return ((mdiv != ((pll_con >> PLL255XX_MDIV_SHIFT) & PLL255XX_MDIV_MASK)) ||
-		(pdiv != ((pll_con >> PLL255XX_PDIV_SHIFT) & PLL255XX_PDIV_MASK)));
-}
-
-static int samsung_pll255xx_set_rate(struct clk_hw *hw, unsigned long drate,
-					unsigned long prate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	const struct samsung_pll_rate_table *rate;
-	u32 pll_con;
-
-	rate = samsung_get_pll_settings(pll, drate);
-	if (!rate) {
-		pr_err("%s: Invalid rate : %lu for pll clk %s\n", __func__,
-				drate, __clk_get_name(hw->clk));
-		return -EINVAL;
-	}
-
-	pll_con = readl(pll->con_reg);
-	if (!(samsung_pll255xx_mp_check(rate->mdiv, rate->pdiv, pll_con))) {
-		if ((rate->sdiv) == ((pll_con >> PLL255XX_SDIV_SHIFT) & PLL255XX_SDIV_MASK))
-			return 0;
-		/* In the case of changing S value only */
-		pll_con &= ~(PLL255XX_SDIV_MASK << PLL255XX_SDIV_SHIFT);
-		pll_con |= rate->sdiv << PLL255XX_SDIV_SHIFT;
-		writel(pll_con, pll->con_reg);
-
-		return 0;
-	}
-
-	/* Set PLL lock time */
-	writel(rate->pdiv * PLL255XX_LOCK_FACTOR, pll->lock_reg);
-	/* Change PLL PMS values */
-	pll_con &= ~((PLL255XX_MDIV_MASK << PLL255XX_MDIV_SHIFT) |
-			(PLL255XX_PDIV_MASK << PLL255XX_PDIV_SHIFT) |
-			(PLL255XX_SDIV_MASK << PLL255XX_SDIV_SHIFT));
-	pll_con |= (rate->mdiv << PLL255XX_MDIV_SHIFT) |
-			(rate->pdiv << PLL255XX_PDIV_SHIFT) |
-			(rate->sdiv << PLL255XX_SDIV_SHIFT);
-
-	/* To prevent unstable PLL operation, preset enable bit with 0 */
-	pll_con &= ~BIT(31);
-	writel(pll_con, pll->con_reg);
-
-	/* Set enable bit */
-	pll_con |= BIT(31);
-	writel(pll_con, pll->con_reg);
-
-	do {
-		cpu_relax();
-		pll_con = readl(pll->con_reg);
-	} while (!(pll_con & (PLL255XX_LOCKED_MASK << PLL255XX_LOCKED_SHIFT)));
-
-	return 0;
-}
-
-/* register function for pll clocks */
-static const struct clk_ops samsung_pll255xx_clk_ops = {
-	.recalc_rate = samsung_pll255xx_recalc_rate,
-	.set_rate = samsung_pll255xx_set_rate,
-	.round_rate = samsung_pll_round_rate,
-	.enable = samsung_composite_pll_enable_onchange,
-	.disable = samsung_composite_pll_disable_onchange,
-	.is_enabled = samsung_composite_pll_is_enabled,
-};
-
-static unsigned long samsung_pll2650x_recalc_rate(struct clk_hw *hw,
-				unsigned long parent_rate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	u32 mdiv, pdiv, sdiv, pll_con0, pll_con1;
-	s16 kdiv;
-	u64 fvco = parent_rate;
-
-	pll_con0 = readl(pll->con_reg);
-	pll_con1 = readl(pll->con_reg + 4);
-	mdiv = (pll_con0 >> PLL2650X_MDIV_SHIFT) & PLL2650X_MDIV_MASK;
-	pdiv = (pll_con0 >> PLL2650X_PDIV_SHIFT) & PLL2650X_PDIV_MASK;
-	sdiv = (pll_con0 >> PLL2650X_SDIV_SHIFT) & PLL2650X_SDIV_MASK;
-	kdiv = (s16)((pll_con1 >> PLL2650X_KDIV_SHIFT) & PLL2650X_KDIV_MASK);
-	/* Do calculation */
-	fvco *= (mdiv << 16) + kdiv;
-	do_div(fvco, (pdiv << sdiv));
-	fvco >>= 16;
-
-	return (unsigned long)fvco;
-}
-
-static inline bool samsung_pll2650x_mpk_check(u32 mdiv, u32 pdiv, u32 kdiv, u32 pll_con0, u32 pll_con1)
-{
-	return ((mdiv != ((pll_con0 >> PLL2650X_MDIV_SHIFT) & PLL2650X_MDIV_MASK)) ||
-		(pdiv != ((pll_con0 >> PLL2650X_PDIV_SHIFT) & PLL2650X_PDIV_MASK)) ||
-		(kdiv != ((pll_con1 >> PLL2650X_KDIV_SHIFT) & PLL2650X_KDIV_MASK)));
-}
-
-static int samsung_pll2650x_set_rate(struct clk_hw *hw, unsigned long drate,
-					unsigned long parent_rate)
-{
-	struct samsung_composite_pll *pll = to_comp_pll(hw);
-	u32 pll_con0, pll_con1;
-	const struct samsung_pll_rate_table *rate;
-
-	rate = samsung_get_pll_settings(pll, drate);
-	if (!rate) {
-		pr_err("%s: Invalid rate : %lu for pll clk %s\n", __func__,
-				drate, __clk_get_name(hw->clk));
-		return -EINVAL;
-	}
-
-	pll_con0 = readl(pll->con_reg);
-	pll_con1 = readl(pll->con_reg + 4);
-	if (!(samsung_pll2650x_mpk_check(rate->mdiv, rate->pdiv, rate->kdiv, pll_con0, pll_con1))) {
-		if ((rate->sdiv) == ((pll_con0 >> PLL2650X_SDIV_SHIFT) & PLL2650X_SDIV_MASK))
-			return 0;
-		/* In the case of changing S value only */
-		pll_con0 &= ~(PLL2650X_SDIV_MASK << PLL2650X_SDIV_SHIFT);
-		pll_con0 |= (rate->sdiv << PLL2650X_SDIV_SHIFT);
-		writel(pll_con0, pll->con_reg);
-
-		return 0;
-	}
-
-	/* Set PLL lock time */
-	writel(rate->pdiv * PLL2650X_LOCK_FACTOR, pll->lock_reg);
-
-	pll_con1 &= ~(PLL2650X_KDIV_MASK << PLL2650X_KDIV_SHIFT);
-	pll_con1 |= (rate->kdiv << PLL2650X_KDIV_SHIFT);
-	writel(pll_con1, pll->con_reg + 4);
-
-	pll_con0 &= ~((PLL2650X_MDIV_MASK << PLL2650X_MDIV_SHIFT) |
-			(PLL2650X_PDIV_MASK << PLL2650X_PDIV_SHIFT) |
-			(PLL2650X_SDIV_MASK << PLL2650X_SDIV_SHIFT));
-	pll_con0 |= (rate->mdiv << PLL2650X_MDIV_SHIFT) |
-			(rate->pdiv << PLL2650X_PDIV_SHIFT) |
-			(rate->sdiv << PLL2650X_SDIV_SHIFT);
-
-	/* To prevent unstable PLL operation, preset enable bit with 0 */
-	pll_con0 &= ~BIT(31);
-	writel(pll_con0, pll->con_reg);
-
-	/* Set enable bit */
-	pll_con0 |= BIT(31);
-	writel(pll_con0, pll->con_reg);
-
-	/*
-	 * Wait lock time
-	 * unit address translation : us to ms for mdelay
-	 */
-	mdelay(rate->pdiv * PLL2650X_LOCK_FACTOR / 1000);
-
-	return 0;
-}
-
-static const struct clk_ops samsung_pll2650x_clk_ops = {
-	.recalc_rate = samsung_pll2650x_recalc_rate,
-	.set_rate = samsung_pll2650x_set_rate,
-	.round_rate = samsung_pll_round_rate,
-	.enable = samsung_composite_pll_enable_onchange,
-	.disable = samsung_composite_pll_disable_onchange,
-	.is_enabled = samsung_composite_pll_is_enabled,
-};
-
-/* register function for pll clocks */
-static void _samsung_register_comp_pll(struct samsung_clk_provider *ctx,
-				struct samsung_composite_pll *list)
-{
-	struct clk *clk;
-	static const char *pname[1] = {"fin_pll"};
-	int len;
-	unsigned int ret = 0;
-
-	if (list->rate_table) {
-		/* find count of rates in rate_table */
-		for (len = 0; list->rate_table[len].rate != 0; )
-			len++;
-		list->rate_count = len; }
-	else
-		list->rate_count = 0;
-
-	if (list->type == pll_1450x)
-		clk = clk_register_composite(NULL, list->name, pname, 1,
-				NULL, NULL,
-				&list->hw, &samsung_pll145xx_clk_ops,
-				&list->hw, &samsung_pll145xx_clk_ops, list->flag);
-	else if (list->type == pll_1451x || list->type == pll_1452x)
-		clk = clk_register_composite(NULL, list->name, pname, 1,
-				NULL, NULL,
-				&list->hw, &samsung_pll145xx_clk_ops,
-				&list->hw, &samsung_pll145xx_clk_ops, list->flag);
-	else if (list->type == pll_1460x)
-		clk = clk_register_composite(NULL, list->name, pname, 1,
-				NULL, NULL,
-				&list->hw, &samsung_pll1460x_clk_ops,
-				&list->hw, &samsung_pll1460x_clk_ops, list->flag);
-	else if (list->type == pll_2551x || list->type == pll_2555x)
-		clk = clk_register_composite(NULL, list->name, pname, 1,
-				NULL, NULL,
-				&list->hw, &samsung_pll255xx_clk_ops,
-				&list->hw, &samsung_pll255xx_clk_ops, list->flag);
-	else if (list->type == pll_2650x)
-		clk = clk_register_composite(NULL, list->name, pname, 1,
-				NULL, NULL,
-				&list->hw, &samsung_pll2650x_clk_ops,
-				&list->hw, &samsung_pll2650x_clk_ops, list->flag);
-	else {
-		pr_err("%s: invalid pll type %d\n", __func__, list->type);
-		return;
-	}
-
-	if (IS_ERR(clk)) {
-		pr_err("%s: failed to register pll clock %s\n",
-				__func__, list->name);
-		return;
-	}
-
-	samsung_clk_add_lookup(ctx, clk, list->id);
-
-	/* register a clock lookup only if a clock alias is specified */
-	if (list->alias) {
-		ret = clk_register_clkdev(clk, list->alias, NULL);
-		if (ret)
-			pr_err("%s: failed to register lookup %s\n",
-					__func__, list->alias);
-	}
-}
-
-void samsung_register_comp_pll(struct samsung_clk_provider *ctx,
-		struct samsung_composite_pll *list, unsigned int nr_pll)
-{
-	int cnt;
-
-	for (cnt = 0; cnt < nr_pll; cnt++)
-		_samsung_register_comp_pll(ctx, &list[cnt]);
-}
-
-/* operation functions for mux clocks */
-static u8 samsung_mux_get_parent(struct clk_hw *hw)
-{
-	struct samsung_composite_mux *mux = to_comp_mux(hw);
-	u32 val;
-
-	val = readl(mux->sel_reg) >> mux->sel_bit;
-	val &= (BIT(mux->sel_width) - 1);
-
-	return (u8)val;
-}
-
-static int samsung_mux_set_parent(struct clk_hw *hw, u8 index)
-{
-	struct samsung_composite_mux *mux = to_comp_mux(hw);
-	u32 val;
-	unsigned long flags = 0;
-	unsigned int timeout = 1000;
-
-	if (mux->lock)
-		spin_lock_irqsave(mux->lock, flags);
-
-	val = readl(mux->sel_reg);
-	val &= ~((BIT(mux->sel_width) - 1) << mux->sel_bit);
-	val |= index << mux->sel_bit;
-	writel(val, mux->sel_reg);
-
-	if (mux->stat_reg)
-		do {
-			--timeout;
-			if (!timeout) {
-				pr_err("%s: failed to set parent %s.\n",
-						__func__, clk_hw_get_name(hw));
-				pr_err("MUX_REG: %08x, MUX_STAT_REG: %08x\n",
-						readl(mux->sel_reg), readl(mux->stat_reg));
-				if (mux->lock)
-					spin_unlock_irqrestore(mux->lock, flags);
-				return -ETIMEDOUT;
-			}
-			val = readl(mux->stat_reg);
-			val &= ((BIT(mux->stat_width) - 1) << mux->stat_bit);
-		} while (val != (index << mux->stat_bit));
-
-	if (mux->lock)
-		spin_unlock_irqrestore(mux->lock, flags);
-
-	return 0;
-}
-
-static const struct clk_ops samsung_composite_mux_ops = {
-	.get_parent = samsung_mux_get_parent,
-	.set_parent = samsung_mux_set_parent,
-};
-
-/* operation functions for mux clocks checking status with "on changing" */
-
-static int samsung_mux_set_parent_onchange(struct clk_hw *hw, u8 index)
-{
-	struct samsung_composite_mux *mux = to_comp_mux(hw);
-	u32 val;
-	unsigned long flags = 0;
-	unsigned int timeout = 1000;
-
-	if (mux->lock)
-		spin_lock_irqsave(mux->lock, flags);
-
-	val = readl(mux->sel_reg);
-	val &= ~((BIT(mux->sel_width) - 1) << mux->sel_bit);
-	val |= index << mux->sel_bit;
-	writel(val, mux->sel_reg);
-
-	if (mux->stat_reg)
-		do {
-			--timeout;
-			if (!timeout) {
-				pr_err("%s: failed to set parent %s.\n",
-						__func__, clk_hw_get_name(hw));
-				pr_err("MUX_REG: %08x, MUX_STAT_REG: %08x\n",
-						readl(mux->sel_reg), readl(mux->stat_reg));
-				if (mux->lock)
-					spin_unlock_irqrestore(mux->lock, flags);
-				return -ETIMEDOUT;
-			}
-			val = readl(mux->stat_reg);
-			val &= ((BIT(mux->stat_width) - 1) << mux->stat_bit);
-		} while (val == PLL_STAT_CHANGE);
-
-	if (mux->lock)
-		spin_unlock_irqrestore(mux->lock, flags);
-
-	return 0;
-}
-static const struct clk_ops samsung_composite_mux_ops_onchange = {
-	.get_parent = samsung_mux_get_parent,
-	.set_parent = samsung_mux_set_parent_onchange,
-};
-
-/* register function for mux clock */
-static void _samsung_register_comp_mux(struct samsung_clk_provider *ctx,
-				struct samsung_composite_mux *list)
-{
-	struct clk *clk;
-	unsigned int ret = 0;
-
-	list->lock = &lock;
-
-	if (!(list->flag & CLK_ON_CHANGING))
-		clk = clk_register_composite(NULL, list->name, list->parents, list->num_parents,
-				&list->hw, &samsung_composite_mux_ops,
-				NULL, NULL,
-				NULL, NULL, list->flag);
-	else
-		clk = clk_register_composite(NULL, list->name, list->parents, list->num_parents,
-				&list->hw, &samsung_composite_mux_ops_onchange,
-				NULL, NULL,
-				NULL, NULL, list->flag);
-
-	if (IS_ERR(clk)) {
-		pr_err("%s: failed to register mux clock %s\n",
-				__func__, list->name);
-		return;
-	}
-
-	samsung_clk_add_lookup(ctx, clk, list->id);
-
-	/* register a clock lookup only if a clock alias is specified */
-	if (list->alias) {
-		ret = clk_register_clkdev(clk, list->alias, NULL);
-		if (ret)
-			pr_err("%s: failed to register lookup %s\n",
-					__func__, list->alias);
-	}
-}
-
-void samsung_register_comp_mux(struct samsung_clk_provider *ctx,
-		struct samsung_composite_mux *list, unsigned int nr_mux)
-{
-	int cnt;
-
-	for (cnt = 0; cnt < nr_mux; cnt++)
-		_samsung_register_comp_mux(ctx, &list[cnt]);
-}
-
-/* operation functions for divider clocks */
-static unsigned long samsung_divider_recalc_rate(struct clk_hw *hw,
-		unsigned long parent_rate)
-{
-	struct samsung_composite_divider *divider = to_comp_divider(hw);
-	unsigned int val;
-
-	val = readl(divider->rate_reg) >> divider->rate_bit;
-	val &= (1 << divider->rate_width) - 1;
-	val += 1;
-	if (!val)
-		return parent_rate;
-
-	return parent_rate / val;
-}
-
-static int samsung_divider_bestdiv(struct clk_hw *hw, unsigned long rate,
-			unsigned long *best_parent_rate)
-{
-	struct samsung_composite_divider *divider = to_comp_divider(hw);
-	int i, bestdiv = 0;
-	unsigned long parent_rate, maxdiv, now, best = 0;
-	unsigned long parent_rate_saved = *best_parent_rate;
-
-	if (!rate)
-		rate = 1;
-
-	maxdiv = ((1 << (divider->rate_width)) - 1) + 1;
-
-	if (!(clk_hw_get_flags(hw) & CLK_SET_RATE_PARENT)) {
-		parent_rate = *best_parent_rate;
-		bestdiv = (parent_rate + rate - 1) / rate;
-		bestdiv = bestdiv == 0 ? 1 : bestdiv;
-		bestdiv = bestdiv > maxdiv ? maxdiv : bestdiv;
-		return bestdiv;
-	}
-
-	maxdiv = min(ULONG_MAX / rate, maxdiv);
-
-	for (i = 1; i <= maxdiv; i++) {
-		if (rate * i == parent_rate_saved) {
-			/*
-			 * It's the most ideal case if the requested rate can be
-			 * divided from parent clock without needing to change
-			 * parent rate, so return the divider immediately.
-			 */
-			*best_parent_rate = parent_rate_saved;
-			return i;
-		}
-		parent_rate = clk_round_rate(clk_get_parent(hw->clk),
-				((rate * i) + i - 1));
-		now = parent_rate / i;
-		if (now <= rate && now > best) {
-			bestdiv = i;
-			best = now;
-			*best_parent_rate = parent_rate;
-		}
-	}
-
-	if (!bestdiv) {
-		bestdiv = ((1 << (divider->rate_width)) - 1) + 1;
-		*best_parent_rate = clk_round_rate(clk_get_parent(hw->clk), 1);
-	}
-
-	return bestdiv;
-}
-
-static long samsung_divider_round_rate(struct clk_hw *hw, unsigned long rate,
-				unsigned long *prate)
-{
-	int div = 1;
-
-	div = samsung_divider_bestdiv(hw, rate, prate);
-	if (div == 0) {
-		pr_err("%s: divider value should not be %d\n", __func__, div);
-		div = 1;
-	}
-
-	return *prate / div;
-}
-
-static int samsung_divider_set_rate(struct clk_hw *hw, unsigned long rate,
-				unsigned long parent_rate)
-{
-	struct samsung_composite_divider *divider = to_comp_divider(hw);
-	unsigned int div;
-	u32 val;
-	unsigned long flags = 0;
-	unsigned int timeout = 1000;
-
-	div = (parent_rate / rate) - 1;
-
-	if (div > ((1 << divider->rate_width) - 1))
-		div = (1 << divider->rate_width) - 1;
-
-	if (divider->lock)
-		spin_lock_irqsave(divider->lock, flags);
-
-	val = readl(divider->rate_reg);
-	val &= ~(((1 << divider->rate_width) - 1) << divider->rate_bit);
-	val |= div << divider->rate_bit;
-	writel(val, divider->rate_reg);
-
-	if (divider->stat_reg)
-		do {
-			--timeout;
-			if (!timeout) {
-				pr_err("%s: faild to set rate %s.\n",
-						__func__, clk_hw_get_name(hw));
-				pr_err("DIV_REG: %08x, MUX_STAT_REG: %08x\n",
-						readl(divider->rate_reg), readl(divider->stat_reg));
-				if (divider->lock)
-					spin_unlock_irqrestore(divider->lock, flags);
-				return -ETIMEDOUT;
-			}
-			val = readl(divider->stat_reg);
-			val &= BIT(divider->stat_width - 1) << divider->stat_bit;
-		} while (val);
-
-	if (divider->lock)
-		spin_unlock_irqrestore(divider->lock, flags);
-
-	return 0;
-}
-
-static const struct clk_ops samsung_composite_divider_ops = {
-	.recalc_rate = samsung_divider_recalc_rate,
-	.round_rate = samsung_divider_round_rate,
-	.set_rate = samsung_divider_set_rate,
-};
-
-/* register function for divider clocks */
-static void _samsung_register_comp_divider(struct samsung_clk_provider *ctx,
-				struct samsung_composite_divider *list)
-{
-	struct clk *clk;
-	unsigned int ret = 0;
-
-	list->lock = &lock;
-
-	clk = clk_register_composite(NULL, list->name, &list->parent_name, 1,
-			NULL, NULL,
-			&list->hw, &samsung_composite_divider_ops,
-			NULL, NULL, list->flag);
-
-	if (IS_ERR(clk)) {
-		pr_err("%s: failed to register mux clock %s\n",
-				__func__, list->name);
-		return;
-	}
-
-	samsung_clk_add_lookup(ctx, clk, list->id);
-
-	/* register a clock lookup only if a clock alias is specified */
-	if (list->alias) {
-		ret = clk_register_clkdev(clk, list->alias, NULL);
-		if (ret)
-			pr_err("%s: failed to register lookup %s\n",
-					__func__, list->alias);
-	}
-}
-
-void samsung_register_comp_divider(struct samsung_clk_provider *ctx,
-		struct samsung_composite_divider *list,	unsigned int nr_div)
-{
-	int cnt;
-
-	for (cnt = 0; cnt < nr_div; cnt++)
-		_samsung_register_comp_divider(ctx, &list[cnt]);
-}
-
-struct dummy_gate_clk {
-	unsigned long	offset;
-	u8		bit_idx;
-	struct clk	*clk;
-};
-
-static struct dummy_gate_clk **gate_clk_list;
-static unsigned int gate_clk_nr;
-
-int samsung_add_clk_gate_list(struct clk *clk, unsigned long offset, u8 bit_idx, const char *name)
-{
-	struct dummy_gate_clk *tmp_clk;
-
-	if (!clk || !offset)
-		return -EINVAL;
-
-	tmp_clk = kzalloc(sizeof(struct dummy_gate_clk), GFP_KERNEL);
-	if (!tmp_clk) {
-		pr_err("%s: fail to alloc for gate_clk\n", __func__);
-		return -ENOMEM;
-	}
-
-	tmp_clk->offset = offset;
-	tmp_clk->bit_idx = bit_idx;
-	tmp_clk->clk = clk;
-
-	gate_clk_list[gate_clk_nr] = tmp_clk;
-
-	gate_clk_nr++;
-
-	return 0;
-}
-
-struct clk *samsung_clk_get_by_reg(unsigned long offset, u8 bit_idx)
-{
-	unsigned int i;
-
-	for (i = 0; i < gate_clk_nr; i++) {
-		if (gate_clk_list[i]->offset == offset) {
-			if (gate_clk_list[i]->bit_idx == bit_idx)
-				return gate_clk_list[i]->clk;
-		}
-	}
-
-	pr_err("%s: Fail to get clk by register offset\n", __func__);
-
-	return 0;
-}
-
-/* existing register function for gate clocks */
-static struct clk * __init _samsung_register_gate(
-		struct samsung_clk_provider *ctx, struct samsung_gate *list)
-{
-	struct clk *clk;
-	unsigned int ret = 0;
-
-	clk = clk_register_gate(NULL, list->name, list->parent_name,
-			list->flag, list->reg, list->bit,
-			list->flag, &lock);
-
-	if (IS_ERR(clk)) {
-		pr_err("%s: failed to register clock %s\n", __func__,
-				list->name);
-		return 0;
-	}
-
-	samsung_clk_add_lookup(ctx, clk, list->id);
-
-	if (list->alias) {
-		ret = clk_register_clkdev(clk, list->alias, NULL);
-		if (ret)
-			pr_err("%s: failed to register lookup %s\n",
-					__func__, list->alias);
-	}
-
-	return clk;
-}
-
-void __init samsung_register_gate(struct samsung_clk_provider *ctx,
-			struct samsung_gate *list, unsigned int nr_gate)
-{
-	int cnt;
-	struct clk *clk;
-	bool gate_list_fail = false;
-	unsigned int gate_enable_nr = 0;
-	struct clk **gate_enable_list;
-
-	gate_clk_list = kzalloc(sizeof(struct dummy_gate_clk *) * nr_gate, GFP_KERNEL);
-	if (!gate_clk_list) {
-		pr_err("%s: can not alloc for gate clock list\n", __func__);
-		gate_list_fail = true;
-	}
-
-	gate_enable_list = kzalloc(sizeof(struct clk *) * nr_gate, GFP_KERNEL);
-
-	if (!gate_enable_list)
-		pr_err("%s: can not alloc for enable gate clock list\n", __func__);
-
-	for (cnt = 0; cnt < nr_gate; cnt++) {
-		clk = _samsung_register_gate(ctx, &list[cnt]);
-
-		if (((&list[cnt])->flag & CLK_GATE_ENABLE) && gate_enable_list) {
-			gate_enable_list[gate_enable_nr] = clk;
-			gate_enable_nr++;
-		}
-
-		/* Make list for gate clk to used by samsung_clk_get_by_reg */
-		if (!gate_list_fail)
-			samsung_add_clk_gate_list(clk, (unsigned long)(list[cnt].reg), list[cnt].bit, list[cnt].name);
-	}
-
-	/*
-	 * Enable for not controlling gate clocks
-	 */
-	for (cnt = 0; cnt < gate_enable_nr; cnt++)
-		clk_prepare_enable(gate_enable_list[cnt]);
-
-	if (gate_enable_list)
-		kfree(gate_enable_list);
-}
-
-/* operation functions for usermux clocks */
-static int samsung_usermux_is_enabled(struct clk_hw *hw)
-{
-	struct clk_samsung_usermux *usermux = to_usermux(hw);
-	u32 val;
-
-	val = readl(usermux->sel_reg);
-	val &= BIT(usermux->sel_bit);
-
-	return val ? 1 : 0;
-}
-
-static int samsung_usermux_enable(struct clk_hw *hw)
-{
-	struct clk_samsung_usermux *usermux = to_usermux(hw);
-	u32 val;
-	unsigned long flags = 0;
-	unsigned int timeout = 1000;
-
-	if (usermux->lock)
-		spin_lock_irqsave(usermux->lock, flags);
-
-	val = readl(usermux->sel_reg);
-	val &= ~(1 << usermux->sel_bit);
-	val |= (1 << usermux->sel_bit);
-	writel(val, usermux->sel_reg);
-
-	if (usermux->stat_reg)
-		do {
-			--timeout;
-			if (!timeout) {
-				pr_err("%s: failed to enable clock %s.\n",
-						__func__, clk_hw_get_name(hw));
-				if (usermux->lock)
-					spin_unlock_irqrestore(usermux->lock, flags);
-				return -ETIMEDOUT;
-			}
-			val = readl(usermux->stat_reg);
-			val &= BIT(2) << usermux->stat_bit;
-		} while (val);
-
-	if (usermux->lock)
-		spin_unlock_irqrestore(usermux->lock, flags);
-
-	return 0;
-}
-
-static void samsung_usermux_disable(struct clk_hw *hw)
-{
-	struct clk_samsung_usermux *usermux = to_usermux(hw);
-	u32 val;
-	unsigned long flags = 0;
-	unsigned int timeout = 1000;
-
-	if (usermux->lock)
-		spin_lock_irqsave(usermux->lock, flags);
-
-	val = readl(usermux->sel_reg);
-	val &= ~(1 << usermux->sel_bit);
-	writel(val, usermux->sel_reg);
-
-	if (usermux->stat_reg)
-		do {
-			--timeout;
-			if (!timeout) {
-				pr_err("%s: failed to disable clock %s.\n",
-						__func__, clk_hw_get_name(hw));
-				if (usermux->lock)
-					spin_unlock_irqrestore(usermux->lock, flags);
-				return;
-			}
-			val = readl(usermux->stat_reg);
-			val &= BIT(2) << usermux->stat_bit;
-		} while (val);
-
-	if (usermux->lock)
-		spin_unlock_irqrestore(usermux->lock, flags);
-}
-
-static const struct clk_ops samsung_usermux_ops = {
-	.enable = samsung_usermux_enable,
-	.disable = samsung_usermux_disable,
-	.is_enabled = samsung_usermux_is_enabled,
-};
-
-/* register function for usermux clocks */
-static struct clk * __init _samsung_register_comp_usermux(struct samsung_usermux *list)
-{
-	struct clk_samsung_usermux *usermux;
-	struct clk *clk;
-	struct clk_init_data init;
-
-	usermux = kzalloc(sizeof(struct clk_samsung_usermux), GFP_KERNEL);
-	if (!usermux) {
-		pr_err("%s: could not allocate usermux clk\n", __func__);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	init.name = list->name;
-	init.ops = &samsung_usermux_ops;
-	init.flags = list->flag | CLK_IS_BASIC;
-	init.parent_names = (list->parent_name ? &list->parent_name : NULL);
-	init.num_parents = (list->parent_name ? 1 : 0);
-
-	usermux->sel_reg = list->sel_reg;
-	usermux->sel_bit = list->sel_bit;
-	usermux->stat_reg = list->stat_reg;
-	usermux->stat_bit = list->stat_bit;
-	usermux->flag = 0;
-	usermux->lock = &lock;
-	usermux->hw.init = &init;
-
-	clk = clk_register(NULL, &usermux->hw);
-
-	if (IS_ERR(clk))
-		kfree(usermux);
-
-	return clk;
-}
-
-void __init samsung_register_usermux(struct samsung_clk_provider *ctx,
-		struct samsung_usermux *list, unsigned int nr_usermux)
-{
-	struct clk *clk;
-	int cnt;
-	unsigned int ret = 0;
-
-	for (cnt = 0; cnt < nr_usermux; cnt++) {
-		clk = _samsung_register_comp_usermux(&list[cnt]);
-		if (IS_ERR(clk)) {
-			pr_err("%s: failed to register clock %s\n", __func__,
-					(&list[cnt])->name);
-			return;
-		}
-
-		samsung_clk_add_lookup(ctx, clk, (&list[cnt])->id);
-
-		if ((&list[cnt])->alias) {
-			ret = clk_register_clkdev(clk, (&list[cnt])->alias, NULL);
-			if (ret)
-				pr_err("%s: failed to register lookup %s\n",
-						__func__, (&list[cnt])->alias);
-		}
-	}
-}
-
-/**
- * Operations for virtual clock used in cal
- * When cal is used to set clocks, following operations will be executed.
- */
-int cal_vclk_enable(struct clk_hw *hw)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	unsigned long flags = 0;
-	int ret = 0;
-
-	if ((vclk->flags & VCLK_GATE) && !(vclk->flags & VCLK_QCH_DIS))
-		return 0;
-
-	if (vclk->lock)
-		spin_lock_irqsave(vclk->lock, flags);
-
-	exynos_ss_clk(hw, __func__, 1, ESS_FLAG_IN);
-	/* Call cal api to enable virtual clock */
-	ret = cal_clk_enable(vclk->id);
-	if (ret) {
-		pr_err("[CAL]%s failed %d %d.\n", __func__, vclk->id, ret);
-		exynos_ss_clk(hw, __func__, 1, ESS_FLAG_ON);
-		if (vclk->lock)
-			spin_unlock_irqrestore(vclk->lock, flags);
-		return -EAGAIN;
-	}
-	exynos_ss_clk(hw, __func__, 1, ESS_FLAG_OUT);
-
-	if (vclk->lock)
-		spin_unlock_irqrestore(vclk->lock, flags);
-
-	return 0;
-}
-
-void cal_vclk_disable(struct clk_hw *hw)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	unsigned long flags = 0;
-	int ret = 0;
-
-	if ((vclk->flags & VCLK_GATE) && !(vclk->flags & VCLK_QCH_DIS))
-		return ;
-
-	if (vclk->lock)
-		spin_lock_irqsave(vclk->lock, flags);
-
-	exynos_ss_clk(hw, __func__, 0, ESS_FLAG_IN);
-	/* Call cal api to disable virtual clock */
-	ret = cal_clk_disable(vclk->id);
-	if (ret) {
-		pr_err("[CAL]%s failed %d %d.\n", __func__, vclk->id, ret);
-		exynos_ss_clk(hw, __func__, 0, ESS_FLAG_ON);
-		if (vclk->lock)
-			spin_unlock_irqrestore(vclk->lock, flags);
-		return;
-	}
-	exynos_ss_clk(hw, __func__, 0, ESS_FLAG_OUT);
-
-	if (vclk->lock)
-		spin_unlock_irqrestore(vclk->lock, flags);
-}
-
-int cal_vclk_is_enabled(struct clk_hw *hw)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	int ret = 0;
-
-	/*
-	 * Call cal api to check whether clock is enabled or not
-	 * Spinlock is not needed because only read operation will
-	 * be executed
-	 */
-	ret = cal_clk_is_enabled(vclk->id);
-
-	return ret;
-}
-
-unsigned long cal_vclk_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	unsigned long ret = 0;
-
-	exynos_ss_clk(hw, __func__, 0, ESS_FLAG_IN);
-	/* Call cal api to recalculate rate */
-	ret = cal_clk_getrate(vclk->id);
-	exynos_ss_clk(hw, __func__, ret, ESS_FLAG_OUT);
-
-	return ret;
-}
-
-unsigned long cal_vclk_gate_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
-{
-	struct samsung_vclk *vclk;
-	struct clk_hw *parent;
-	unsigned long ret = 0;
-
-	exynos_ss_clk(hw, __func__, 0, ESS_FLAG_IN);
-	parent = clk_hw_get_parent(hw);
-	if (parent) {
-		vclk = to_vclk(parent);
-		/* call cal api to recalculate rate */
-		ret = cal_clk_getrate(vclk->id);
-	}
-	exynos_ss_clk(hw, __func__, ret, ESS_FLAG_OUT);
-
-	return ret;
-}
-
-long cal_vclk_round_rate(struct clk_hw *hw, unsigned long rate,
-				unsigned long *prate)
-{
-	/* round_rate ops is not needed when using cal */
-	return (long)rate;
-}
-
-int cal_vclk_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long prate)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	unsigned long flags = 0;
-	int ret = 0;
-
-	if (vclk->lock)
-		spin_lock_irqsave(vclk->lock, flags);
-
-	exynos_ss_clk(hw, __func__, rate, ESS_FLAG_IN);
-	/* Call cal api to set rate of clock */
-	ret = cal_clk_setrate(vclk->id, rate);
-	if (ret) {
-		pr_err("[CAL]%s failed %d %lu %d.\n", __func__,
-			vclk->id, rate, ret);
-		exynos_ss_clk(hw, __func__, rate, ESS_FLAG_ON);
-		if (vclk->lock)
-			spin_unlock_irqrestore(vclk->lock, flags);
-		return -EAGAIN;
-	}
-	exynos_ss_clk(hw, __func__, rate, ESS_FLAG_OUT);
-
-	if (vclk->lock)
-		spin_unlock_irqrestore(vclk->lock, flags);
-
-	return ret;
-}
-
-unsigned long cal_vclk_dfs_sw_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	unsigned long ret = 0;
-
-	/* Call cal api to recalculate rate */
-	ret = cal_dfs_cached_get_rate(vclk->id);
-
-	return ret;
-}
-unsigned long cal_vclk_dfs_recalc_rate(struct clk_hw *hw, unsigned long parent_rate)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	unsigned long ret = 0;
-
-	/* Call cal api to recalculate rate */
-	ret = cal_dfs_get_rate(vclk->id);
-
-	return ret;
-}
-
-int cal_vclk_dfs_set_rate(struct clk_hw *hw, unsigned long rate, unsigned long prate)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	unsigned long flags = 0;
-	int ret = 0;
-
-	if (vclk->lock)
-		spin_lock_irqsave(vclk->lock, flags);
-
-	exynos_ss_clk(hw, __func__, rate, ESS_FLAG_IN);
-	/* Call cal api to set rate of clock */
-	ret = cal_dfs_set_rate(vclk->id, rate);
-	if (ret) {
-		pr_err("[CAL]%s failed %d %lu %d.\n", __func__,
-			vclk->id, rate, ret);
-		exynos_ss_clk(hw, __func__, rate, ESS_FLAG_ON);
-		if (vclk->lock)
-			spin_unlock_irqrestore(vclk->lock, flags);
-		return -EAGAIN;
-	}
-	exynos_ss_clk(hw, __func__, rate, ESS_FLAG_OUT);
-
-	if (vclk->lock)
-		spin_unlock_irqrestore(vclk->lock, flags);
-
-	return ret;
-}
-
-int cal_vclk_dfs_set_rate_switch(struct clk_hw *hw, unsigned long rate, unsigned long prate)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	unsigned long flags = 0;
-	int ret = 0;
-
-	if (vclk->lock)
-		spin_lock_irqsave(vclk->lock, flags);
-
-	/* Call cal api to set rate of clock */
-	ret = cal_dfs_set_rate_switch(vclk->id, rate);
-	if (ret) {
-		pr_err("[CAL]%s failed.\n", __func__);
-		if (vclk->lock)
-			spin_unlock_irqrestore(vclk->lock, flags);
-		return -EAGAIN;
-	}
-
-	if (vclk->lock)
-		spin_unlock_irqrestore(vclk->lock, flags);
-
-	return ret;
-}
-
-static int cal_vclk_qch_init(struct clk_hw *hw)
-{
-	struct samsung_vclk *vclk = to_vclk(hw);
-	int ret = 0;
-
-	if (vclk->flags & VCLK_QCH_EN)
-		ret = cal_qch_init(vclk->id, 1);
-	else if (vclk->flags & VCLK_QCH_DIS)
-		ret = cal_qch_init(vclk->id, 0);
-
-	return ret;
-}
-
-static const struct clk_ops samsung_vclk_ops = {
-	.enable = cal_vclk_enable,
-	.disable = cal_vclk_disable,
-	.is_enabled = cal_vclk_is_enabled,
-	.recalc_rate = cal_vclk_recalc_rate,
-	.round_rate = cal_vclk_round_rate,
-	.set_rate = cal_vclk_set_rate,
-};
-
-static const struct clk_ops samsung_vclk_dfs_ops = {
-	.recalc_rate = cal_vclk_dfs_recalc_rate,
-	.round_rate = cal_vclk_round_rate,
-	.set_rate = cal_vclk_dfs_set_rate,
-};
-
-static const struct clk_ops samsung_vclk_dfs_sw_ops = {
-	.recalc_rate = cal_vclk_dfs_sw_recalc_rate,
-	.round_rate = cal_vclk_round_rate,
-	.set_rate = cal_vclk_dfs_set_rate_switch,
-};
-
-static const struct clk_ops samsung_vclk_gate_ops = {
-	.enable = cal_vclk_enable,
-	.disable = cal_vclk_disable,
-	.is_enabled = cal_vclk_is_enabled,
-	.recalc_rate = cal_vclk_gate_recalc_rate,
-};
-
-static struct clk * __init _samsung_register_vclk(struct init_vclk *list)
-{
-	struct samsung_vclk *vclk;
-	struct clk *clk;
-	struct clk_init_data init;
-
-	vclk = kzalloc(sizeof(struct samsung_vclk), GFP_KERNEL);
-	if (!vclk) {
-		pr_err("%s: could not allocate struct vclk\n", __func__);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	init.name = list->name;
-	if (list->vclk_flags & VCLK_DFS)
-		init.ops = &samsung_vclk_dfs_ops;
-	else if (list->vclk_flags & VCLK_DFS_SWITCH)
-		init.ops = &samsung_vclk_dfs_sw_ops;
-	else if (list->vclk_flags & VCLK_GATE)
-		init.ops = &samsung_vclk_gate_ops;
-	else
-		init.ops = &samsung_vclk_ops;
-	init.flags = list->flags | (CLK_IS_BASIC | CLK_IS_ROOT | CLK_GET_RATE_NOCACHE | CLK_IGNORE_UNUSED);
-	init.parent_names = (list->parent ? &list->parent : NULL);
-	init.num_parents = (list->parent ? 1 : 0);
-	vclk->id = list->calid;
-	/* Flags for vclk are not defined yet */
-	vclk->flags = list->vclk_flags;
-	vclk->lock = &lock;
-	vclk->hw.init = &init;
-
-	clk = clk_register(NULL, &vclk->hw);
-
-	if (IS_ERR(clk))
-		kfree(vclk);
-
-	return clk;
-}
-
-void __init samsung_register_vclk(struct samsung_clk_provider *ctx,
-			struct init_vclk *list, unsigned int nr_vclk)
-{
-	struct clk *clk;
-	int cnt;
-	unsigned int ret = 0;
-
-	for (cnt = 0; cnt < nr_vclk; cnt++) {
-		clk = _samsung_register_vclk(&list[cnt]);
-		if (IS_ERR(clk)) {
-			pr_err("%s: failed to register virtual clock %s\n",
-				__func__, (&list[cnt])->name);
-			continue;
-		}
-
-		samsung_clk_add_lookup(ctx, clk, (&list[cnt])->id);
-
-		/* Additional array of clocks for finding struct clk */
-		if ((&list[cnt])->alias) {
-			ret = clk_register_clkdev(clk, (&list[cnt])->alias, NULL);
-			if (ret)
-				pr_err("%s: failed to register lookup %s\n",
-						__func__, (&list[cnt])->alias);
-		}
-
-		cal_vclk_qch_init(__clk_get_hw(clk));
-	}
-}
+10000
+#define FBC_COMP_MODE__FBC_IND_EN__SHIFT 0x10
+#define FBC_DEBUG0__FBC_PERF_MUX0_MASK 0xff
+#define FBC_DEBUG0__FBC_PERF_MUX0__SHIFT 0x0
+#define FBC_DEBUG0__FBC_PERF_MUX1_MASK 0xff00
+#define FBC_DEBUG0__FBC_PERF_MUX1__SHIFT 0x8
+#define FBC_DEBUG0__FBC_COMP_WAKE_DIS_MASK 0x10000
+#define FBC_DEBUG0__FBC_COMP_WAKE_DIS__SHIFT 0x10
+#define FBC_DEBUG0__FBC_DEBUG0_MASK 0xfe0000
+#define FBC_DEBUG0__FBC_DEBUG0__SHIFT 0x11
+#define FBC_DEBUG0__FBC_DEBUG_MUX_MASK 0xff000000
+#define FBC_DEBUG0__FBC_DEBUG_MUX__SHIFT 0x18
+#define FBC_DEBUG1__FBC_DEBUG1_MASK 0xffffffff
+#define FBC_DEBUG1__FBC_DEBUG1__SHIFT 0x0
+#define FBC_DEBUG2__FBC_DEBUG2_MASK 0xffffffff
+#define FBC_DEBUG2__FBC_DEBUG2__SHIFT 0x0
+#define FBC_IND_LUT0__FBC_IND_LUT0_MASK 0xffffff
+#define FBC_IND_LUT0__FBC_IND_LUT0__SHIFT 0x0
+#define FBC_IND_LUT1__FBC_IND_LUT1_MASK 0xffffff
+#define FBC_IND_LUT1__FBC_IND_LUT1__SHIFT 0x0
+#define FBC_IND_LUT2__FBC_IND_LUT2_MASK 0xffffff
+#define FBC_IND_LUT2__FBC_IND_LUT2__SHIFT 0x0
+#define FBC_IND_LUT3__FBC_IND_LUT3_MASK 0xffffff
+#define FBC_IND_LUT3__FBC_IND_LUT3__SHIFT 0x0
+#define FBC_IND_LUT4__FBC_IND_LUT4_MASK 0xffffff
+#define FBC_IND_LUT4__FBC_IND_LUT4__SHIFT 0x0
+#define FBC_IND_LUT5__FBC_IND_LUT5_MASK 0xffffff
+#define FBC_IND_LUT5__FBC_IND_LUT5__SHIFT 0x0
+#define FBC_IND_LUT6__FBC_IND_LUT6_MASK 0xffffff
+#define FBC_IND_LUT6__FBC_IND_LUT6__SHIFT 0x0
+#define FBC_IND_LUT7__FBC_IND_LUT7_MASK 0xffffff
+#define FBC_IND_LUT7__FBC_IND_LUT7__SHIFT 0x0
+#define FBC_IND_LUT8__FBC_IND_LUT8_MASK 0xffffff
+#define FBC_IND_LUT8__FBC_IND_LUT8__SHIFT 0x0
+#define FBC_IND_LUT9__FBC_IND_LUT9_MASK 0xffffff
+#define FBC_IND_LUT9__FBC_IND_LUT9__SHIFT 0x0
+#define FBC_IND_LUT10__FBC_IND_LUT10_MASK 0xffffff
+#define FBC_IND_LUT10__FBC_IND_LUT10__SHIFT 0x0
+#define FBC_IND_LUT11__FBC_IND_LUT11_MASK 0xffffff
+#define FBC_IND_LUT11__FBC_IND_LUT11__SHIFT 0x0
+#define FBC_IND_LUT12__FBC_IND_LUT12_MASK 0xffffff
+#define FBC_IND_LUT12__FBC_IND_LUT12__SHIFT 0x0
+#define FBC_IND_LUT13__FBC_IND_LUT13_MASK 0xffffff
+#define FBC_IND_LUT13__FBC_IND_LUT13__SHIFT 0x0
+#define FBC_IND_LUT14__FBC_IND_LUT14_MASK 0xffffff
+#define FBC_IND_LUT14__FBC_IND_LUT14__SHIFT 0x0
+#define FBC_IND_LUT15__FBC_IND_LUT15_MASK 0xffffff
+#define FBC_IND_LUT15__FBC_IND_LUT15__SHIFT 0x0
+#define FBC_CSM_REGION_OFFSET_01__FBC_CSM_REGION_OFFSET_0_MASK 0xfff
+#define FBC_CSM_REGION_OFFSET_01__FBC_CSM_REGION_OFFSET_0__SHIFT 0x0
+#define FBC_CSM_REGION_OFFSET_01__FBC_CSM_REGION_OFFSET_1_MASK 0xfff0000
+#define FBC_CSM_REGION_OFFSET_01__FBC_CSM_REGION_OFFSET_1__SHIFT 0x10
+#define FBC_CSM_REGION_OFFSET_23__FBC_CSM_REGION_OFFSET_2_MASK 0xfff
+#define FBC_CSM_REGION_OFFSET_23__FBC_CSM_REGION_OFFSET_2__SHIFT 0x0
+#define FBC_CSM_REGION_OFFSET_23__FBC_CSM_REGION_OFFSET_3_MASK 0xfff0000
+#define FBC_CSM_REGION_OFFSET_23__FBC_CSM_REGION_OFFSET_3__SHIFT 0x10
+#define FBC_CLIENT_REGION_MASK__FBC_MEMORY_REGION_MASK_MASK 0xf0000
+#define FBC_CLIENT_REGION_MASK__FBC_MEMORY_REGION_MASK__SHIFT 0x10
+#define FBC_DEBUG_COMP__FBC_COMP_SWAP_MASK 0x3
+#define FBC_DEBUG_COMP__FBC_COMP_SWAP__SHIFT 0x0
+#define FBC_DEBUG_COMP__FBC_COMP_RSIZE_MASK 0x8
+#define FBC_DEBUG_COMP__FBC_COMP_RSIZE__SHIFT 0x3
+#define FBC_DEBUG_COMP__FBC_COMP_BUSY_HYSTERESIS_MASK 0xf0
+#define FBC_DEBUG_COMP__FBC_COMP_BUSY_HYSTERESIS__SHIFT 0x4
+#define FBC_DEBUG_COMP__FBC_COMP_CLK_CNTL_MASK 0x300
+#define FBC_DEBUG_COMP__FBC_COMP_CLK_CNTL__SHIFT 0x8
+#define FBC_DEBUG_COMP__FBC_COMP_PRIVILEGED_ACCESS_ENABLE_MASK 0x400
+#define FBC_DEBUG_COMP__FBC_COMP_PRIVILEGED_ACCESS_ENABLE__SHIFT 0xa
+#define FBC_DEBUG_COMP__FBC_COMP_ADDRESS_TRANSLATION_ENABLE_MASK 0x800
+#define FBC_DEBUG_COMP__FBC_COMP_ADDRESS_TRANSLATION_ENABLE__SHIFT 0xb
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_ADDR_MASK 0xfff
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_ADDR__SHIFT 0x0
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_WR_DATA_MASK 0x10000
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_WR_DATA__SHIFT 0x10
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_RD_DATA_MASK 0x20000
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_RD_DATA__SHIFT 0x11
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_EN_MASK 0x80000000
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_EN__SHIFT 0x1f
+#define FBC_DEBUG_CSR_RDATA__FBC_DEBUG_CSR_RDATA_MASK 0xffffffff
+#define FBC_DEBUG_CSR_RDATA__FBC_DEBUG_CSR_RDATA__SHIFT 0x0
+#define FBC_DEBUG_CSR_WDATA__FBC_DEBUG_CSR_WDATA_MASK 0xffffffff
+#define FBC_DEBUG_CSR_WDATA__FBC_DEBUG_CSR_WDATA__SHIFT 0x0
+#define FBC_DEBUG_CSR_RDATA_HI__FBC_DEBUG_CSR_RDATA_HI_MASK 0xff
+#define FBC_DEBUG_CSR_RDATA_HI__FBC_DEBUG_CSR_RDATA_HI__SHIFT 0x0
+#define FBC_DEBUG_CSR_WDATA_HI__FBC_DEBUG_CSR_WDATA_HI_MASK 0xff
+#define FBC_DEBUG_CSR_WDATA_HI__FBC_DEBUG_CSR_WDATA_HI__SHIFT 0x0
+#define FBC_MISC__FBC_DECOMPRESS_ERROR_MASK 0x3
+#define FBC_MISC__FBC_DECOMPRESS_ERROR__SHIFT 0x0
+#define FBC_MISC__FBC_STOP_ON_ERROR_MASK 0x4
+#define FBC_MISC__FBC_STOP_ON_ERROR__SHIFT 0x2
+#define FBC_MISC__FBC_INVALIDATE_ON_ERROR_MASK 0x8
+#define FBC_MISC__FBC_INVALIDATE_ON_ERROR__SHIFT 0x3
+#define FBC_MISC__FBC_ERROR_PIXEL_MASK 0xf0
+#define FBC_MISC__FBC_ERROR_PIXEL__SHIFT 0x4
+#define FBC_MISC__FBC_DIVIDE_X_MASK 0x300
+#define FBC_MISC__FBC_DIVIDE_X__SHIFT 0x8
+#define FBC_MISC__FBC_DIVIDE_Y_MASK 0x400
+#define FBC_MISC__FBC_DIVIDE_Y__SHIFT 0xa
+#define FBC_MISC__FBC_RSM_WRITE_VALUE_MASK 0x800
+#define FBC_MISC__FBC_RSM_WRITE_VALUE__SHIFT 0xb
+#define FBC_MISC__FBC_RSM_UNCOMP_DATA_IMMEDIATELY_MASK 0x1000
+#define FBC_MISC__FBC_RSM_UNCOMP_DATA_IMMEDIATELY__SHIFT 0xc
+#define FBC_MISC__FBC_STOP_ON_HFLIP_EVENT_MASK 0x2000
+#define FBC_MISC__FBC_STOP_ON_HFLIP_EVENT__SHIFT 0xd
+#define FBC_MISC__FBC_DECOMPRESS_ERROR_CLEAR_MASK 0x10000
+#define FBC_MISC__FBC_DECOMPRESS_ERROR_CLEAR__SHIFT 0x10
+#define FBC_MISC__FBC_RESET_AT_ENABLE_MASK 0x100000
+#define FBC_MISC__FBC_RESET_AT_ENABLE__SHIFT 0x14
+#define FBC_MISC__FBC_RESET_AT_DISABLE_MASK 0x200000
+#define FBC_MISC__FBC_RESET_AT_DISABLE__SHIFT 0x15
+#define FBC_MISC__FBC_SLOW_REQ_INTERVAL_MASK 0x1f000000
+#define FBC_MISC__FBC_SLOW_REQ_INTERVAL__SHIFT 0x18
+#define FBC_MISC__FBC_FORCE_DECOMPRESSOR_EN_MASK 0x80000000
+#define FBC_MISC__FBC_FORCE_DECOMPRESSOR_EN__SHIFT 0x1f
+#define FBC_STATUS__FBC_ENABLE_STATUS_MASK 0x1
+#define FBC_STATUS__FBC_ENABLE_STATUS__SHIFT 0x0
+#define FBC_TEST_DEBUG_INDEX__FBC_TEST_DEBUG_INDEX_MASK 0xff
+#define FBC_TEST_DEBUG_INDEX__FBC_TEST_DEBUG_INDEX__SHIFT 0x0
+#define FBC_TEST_DEBUG_INDEX__FBC_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define FBC_TEST_DEBUG_INDEX__FBC_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define FBC_TEST_DEBUG_DATA__FBC_TEST_DEBUG_DATA_MASK 0xffffffff
+#define FBC_TEST_DEBUG_DATA__FBC_TEST_DEBUG_DATA__SHIFT 0x0
+#define FMT_CLAMP_COMPONENT_R__FMT_CLAMP_LOWER_R_MASK 0xffff
+#define FMT_CLAMP_COMPONENT_R__FMT_CLAMP_LOWER_R__SHIFT 0x0
+#define FMT_CLAMP_COMPONENT_R__FMT_CLAMP_UPPER_R_MASK 0xffff0000
+#define FMT_CLAMP_COMPONENT_R__FMT_CLAMP_UPPER_R__SHIFT 0x10
+#define FMT_CLAMP_COMPONENT_G__FMT_CLAMP_LOWER_G_MASK 0xffff
+#define FMT_CLAMP_COMPONENT_G__FMT_CLAMP_LOWER_G__SHIFT 0x0
+#define FMT_CLAMP_COMPONENT_G__FMT_CLAMP_UPPER_G_MASK 0xffff0000
+#define FMT_CLAMP_COMPONENT_G__FMT_CLAMP_UPPER_G__SHIFT 0x10
+#define FMT_CLAMP_COMPONENT_B__FMT_CLAMP_LOWER_B_MASK 0xffff
+#define FMT_CLAMP_COMPONENT_B__FMT_CLAMP_LOWER_B__SHIFT 0x0
+#define FMT_CLAMP_COMPONENT_B__FMT_CLAMP_UPPER_B_MASK 0xffff0000
+#define FMT_CLAMP_COMPONENT_B__FMT_CLAMP_UPPER_B__SHIFT 0x10
+#define FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_EN_MASK 0x1
+#define FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_EN__SHIFT 0x0
+#define FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_MODE_MASK 0x10
+#define FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_MODE__SHIFT 0x4
+#define FMT_CONTROL__FMT_STEREOSYNC_OVERRIDE_MASK 0x1
+#define FMT_CONTROL__FMT_STEREOSYNC_OVERRIDE__SHIFT 0x0
+#define FMT_CONTROL__FMT_STEREOSYNC_OVR_POL_MASK 0x10
+#define FMT_CONTROL__FMT_STEREOSYNC_OVR_POL__SHIFT 0x4
+#define FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_MAX_MASK 0xf00
+#define FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_MAX__SHIFT 0x8
+#define FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_BIT_SWAP_MASK 0x3000
+#define FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_BIT_SWAP__SHIFT 0xc
+#define FMT_CONTROL__FMT_PIXEL_ENCODING_MASK 0x10000
+#define FMT_CONTROL__FMT_PIXEL_ENCODING__SHIFT 0x10
+#define FMT_CONTROL__FMT_SUBSAMPLING_MODE_MASK 0x20000
+#define FMT_CONTROL__FMT_SUBSAMPLING_MODE__SHIFT 0x11
+#define FMT_CONTROL__FMT_SUBSAMPLING_ORDER_MASK 0x40000
+#define FMT_CONTROL__FMT_SUBSAMPLING_ORDER__SHIFT 0x12
+#define FMT_CONTROL__FMT_SRC_SELECT_MASK 0x7000000
+#define FMT_CONTROL__FMT_SRC_SELECT__SHIFT 0x18
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_EN_MASK 0x1
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_EN__SHIFT 0x0
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_MODE_MASK 0x2
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_MODE__SHIFT 0x1
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_DEPTH_MASK 0x30
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_DEPTH__SHIFT 0x4
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_EN_MASK 0x100
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_EN__SHIFT 0x8
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_MODE_MASK 0x600
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_MODE__SHIFT 0x9
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_DEPTH_MASK 0x1800
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_DEPTH__SHIFT 0xb
+#define FMT_BIT_DEPTH_CONTROL__FMT_FRAME_RANDOM_ENABLE_MASK 0x2000
+#define FMT_BIT_DEPTH_CONTROL__FMT_FRAME_RANDOM_ENABLE__SHIFT 0xd
+#define FMT_BIT_DEPTH_CONTROL__FMT_RGB_RANDOM_ENABLE_MASK 0x4000
+#define FMT_BIT_DEPTH_CONTROL__FMT_RGB_RANDOM_ENABLE__SHIFT 0xe
+#define FMT_BIT_DEPTH_CONTROL__FMT_HIGHPASS_RANDOM_ENABLE_MASK 0x8000
+#define FMT_BIT_DEPTH_CONTROL__FMT_HIGHPASS_RANDOM_ENABLE__SHIFT 0xf
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_EN_MASK 0x10000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_EN__SHIFT 0x10
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_DEPTH_MASK 0x60000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_DEPTH__SHIFT 0x11
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_OFFSET_MASK 0x600000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_OFFSET__SHIFT 0x15
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_LEVEL_MASK 0x1000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_LEVEL__SHIFT 0x18
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_RESET_MASK 0x2000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_RESET__SHIFT 0x19
+#define FMT_BIT_DEPTH_CONTROL__FMT_25FRC_SEL_MASK 0xc000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_25FRC_SEL__SHIFT 0x1a
+#define FMT_BIT_DEPTH_CONTROL__FMT_50FRC_SEL_MASK 0x30000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_50FRC_SEL__SHIFT 0x1c
+#define FMT_BIT_DEPTH_CONTROL__FMT_75FRC_SEL_MASK 0xc0000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_75FRC_SEL__SHIFT 0x1e
+#define FMT_DITHER_RAND_R_SEED__FMT_RAND_R_SEED_MASK 0xff
+#define FMT_DITHER_RAND_R_SEED__FMT_RAND_R_SEED__SHIFT 0x0
+#define FMT_DITHER_RAND_R_SEED__FMT_OFFSET_R_CR_MASK 0xffff0000
+#define FMT_DITHER_RAND_R_SEED__FMT_OFFSET_R_CR__SHIFT 0x10
+#define FMT_DITHER_RAND_G_SEED__FMT_RAND_G_SEED_MASK 0xff
+#define FMT_DITHER_RAND_G_SEED__FMT_RAND_G_SEED__SHIFT 0x0
+#define FMT_DITHER_RAND_G_SEED__FMT_OFFSET_G_Y_MASK 0xffff0000
+#define FMT_DITHER_RAND_G_SEED__FMT_OFFSET_G_Y__SHIFT 0x10
+#define FMT_DITHER_RAND_B_SEED__FMT_RAND_B_SEED_MASK 0xff
+#define FMT_DITHER_RAND_B_SEED__FMT_RAND_B_SEED__SHIFT 0x0
+#define FMT_DITHER_RAND_B_SEED__FMT_OFFSET_B_CB_MASK 0xffff0000
+#define FMT_DITHER_RAND_B_SEED__FMT_OFFSET_B_CB__SHIFT 0x10
+#define FMT_TEMPORAL_DITHER_PATTERN_CONTROL__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_SELECT_MASK 0x1
+#define FMT_TEMPORAL_DITHER_PATTERN_CONTROL__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_SELECT__SHIFT 0x0
+#define FMT_TEMPORAL_DITHER_PATTERN_CONTROL__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_RGB1_BGR0_MASK 0x10
+#define FMT_TEMPORAL_DITHER_PATTERN_CONTROL__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_RGB1_BGR0__SHIFT 0x4
+#define FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX_MASK 0xffffffff
+#define FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX__SHIFT 0x0
+#define FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX_MASK 0xffffffff
+#define FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX__SHIFT 0x0
+#define FMT_CLAMP_CNTL__FMT_CLAMP_DATA_EN_MASK 0x1
+#define FMT_CLAMP_CNTL__FMT_CLAMP_DATA_EN__SHIFT 0x0
+#define FMT_CLAMP_CNTL__FMT_CLAMP_COLOR_FORMAT_MASK 0x70000
+#define FMT_CLAMP_CNTL__FMT_CLAMP_COLOR_FORMAT__SHIFT 0x10
+#define FMT_CRC_CNTL__FMT_CRC_EN_MASK 0x1
+#define FMT_CRC_CNTL__FMT_CRC_EN__SHIFT 0x0
+#define FMT_CRC_CNTL__FMT_DTMTEST_CRC_EN_MASK 0x2
+#define FMT_CRC_CNTL__FMT_DTMTEST_CRC_EN__SHIFT 0x1
+#define FMT_CRC_CNTL__FMT_CRC_CONT_EN_MASK 0x10
+#define FMT_CRC_CNTL__FMT_CRC_CONT_EN__SHIFT 0x4
+#define FMT_CRC_CNTL__FMT_ONE_SHOT_CRC_PENDING_MASK 0x20
+#define FMT_CRC_CNTL__FMT_ONE_SHOT_CRC_PENDING__SHIFT 0x5
+#define FMT_CRC_CNTL__FMT_CRC_INCLUDE_OVERSCAN_MASK 0x40
+#define FMT_CRC_CNTL__FMT_CRC_INCLUDE_OVERSCAN__SHIFT 0x6
+#define FMT_CRC_CNTL__FMT_CRC_ONLY_BLANKB_MASK 0x100
+#define FMT_CRC_CNTL__FMT_CRC_ONLY_BLANKB__SHIFT 0x8
+#define FMT_CRC_CNTL__FMT_CRC_PSR_MODE_ENABLE_MASK 0x200
+#define FMT_CRC_CNTL__FMT_CRC_PSR_MODE_ENABLE__SHIFT 0x9
+#define FMT_CRC_CNTL__FMT_CRC_INTERLACE_MODE_MASK 0x3000
+#define FMT_CRC_CNTL__FMT_CRC_INTERLACE_MODE__SHIFT 0xc
+#define FMT_CRC_CNTL__FMT_CRC_USE_NEW_AND_REPEATED_PIXELS_MASK 0x10000
+#define FMT_CRC_CNTL__FMT_CRC_USE_NEW_AND_REPEATED_PIXELS__SHIFT 0x10
+#define FMT_CRC_CNTL__FMT_CRC_EVEN_ODD_PIX_ENABLE_MASK 0x100000
+#define FMT_CRC_CNTL__FMT_CRC_EVEN_ODD_PIX_ENABLE__SHIFT 0x14
+#define FMT_CRC_CNTL__FMT_CRC_EVEN_ODD_PIX_SELECT_MASK 0x1000000
+#define FMT_CRC_CNTL__FMT_CRC_EVEN_ODD_PIX_SELECT__SHIFT 0x18
+#define FMT_CRC_SIG_RED_GREEN_MASK__FMT_CRC_SIG_RED_MASK_MASK 0xffff
+#define FMT_CRC_SIG_RED_GREEN_MASK__FMT_CRC_SIG_RED_MASK__SHIFT 0x0
+#define FMT_CRC_SIG_RED_GREEN_MASK__FMT_CRC_SIG_GREEN_MASK_MASK 0xffff0000
+#define FMT_CRC_SIG_RED_GREEN_MASK__FMT_CRC_SIG_GREEN_MASK__SHIFT 0x10
+#define FMT_CRC_SIG_BLUE_CONTROL_MASK__FMT_CRC_SIG_BLUE_MASK_MASK 0xffff
+#define FMT_CRC_SIG_BLUE_CONTROL_MASK__FMT_CRC_SIG_BLUE_MASK__SHIFT 0x0
+#define FMT_CRC_SIG_BLUE_CONTROL_MASK__FMT_CRC_SIG_CONTROL_MASK_MASK 0xffff0000
+#define FMT_CRC_SIG_BLUE_CONTROL_MASK__FMT_CRC_SIG_CONTROL_MASK__SHIFT 0x10
+#define FMT_CRC_SIG_RED_GREEN__FMT_CRC_SIG_RED_MASK 0xffff
+#define FMT_CRC_SIG_RED_GREEN__FMT_CRC_SIG_RED__SHIFT 0x0
+#define FMT_CRC_SIG_RED_GREEN__FMT_CRC_SIG_GREEN_MASK 0xffff0000
+#define FMT_CRC_SIG_RED_GREEN__FMT_CRC_SIG_GREEN__SHIFT 0x10
+#define FMT_CRC_SIG_BLUE_CONTROL__FMT_CRC_SIG_BLUE_MASK 0xffff
+#define FMT_CRC_SIG_BLUE_CONTROL__FMT_CRC_SIG_BLUE__SHIFT 0x0
+#define FMT_CRC_SIG_BLUE_CONTROL__FMT_CRC_SIG_CONTROL_MASK 0xffff0000
+#define FMT_CRC_SIG_BLUE_CONTROL__FMT_CRC_SIG_CONTROL__SHIFT 0x10
+#define FMT_DEBUG_CNTL__FMT_DEBUG_COLOR_SELECT_MASK 0x3
+#define FMT_DEBUG_CNTL__FMT_DEBUG_COLOR_SELECT__SHIFT 0x0
+#define FMT_TEST_DEBUG_INDEX__FMT_TEST_DEBUG_INDEX_MASK 0xff
+#define FMT_TEST_DEBUG_INDEX__FMT_TEST_DEBUG_INDEX__SHIFT 0x0
+#define FMT_TEST_DEBUG_INDEX__FMT_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define FMT_TEST_DEBUG_INDEX__FMT_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define FMT_TEST_DEBUG_DATA__FMT_TEST_DEBUG_DATA_MASK 0xffffffff
+#define FMT_TEST_DEBUG_DATA__FMT_TEST_DEBUG_DATA__SHIFT 0x0
+#define FMT_DEBUG0__FMT_DEBUG0_MASK 0xffffffff
+#define FMT_DEBUG0__FMT_DEBUG0__SHIFT 0x0
+#define FMT_DEBUG1__FMT_DEBUG1_MASK 0xffffffff
+#define FMT_DEBUG1__FMT_DEBUG1__SHIFT 0x0
+#define FMT_DEBUG2__FMT_DEBUG2_MASK 0xffffffff
+#define FMT_DEBUG2__FMT_DEBUG2__SHIFT 0x0
+#define FMT_DEBUG_ID__FMT_DEBUG_ID_MASK 0xffffffff
+#define FMT_DEBUG_ID__FMT_DEBUG_ID__SHIFT 0x0
+#define LB_DATA_FORMAT__PIXEL_DEPTH_MASK 0x3
+#define LB_DATA_FORMAT__PIXEL_DEPTH__SHIFT 0x0
+#define LB_DATA_FORMAT__PIXEL_EXPAN_MODE_MASK 0x4
+#define LB_DATA_FORMAT__PIXEL_EXPAN_MODE__SHIFT 0x2
+#define LB_DATA_FORMAT__INTERLEAVE_EN_MASK 0x8
+#define LB_DATA_FORMAT__INTERLEAVE_EN__SHIFT 0x3
+#define LB_DATA_FORMAT__PIXEL_REDUCE_MODE_MASK 0x10
+#define LB_DATA_FORMAT__PIXEL_REDUCE_MODE__SHIFT 0x4
+#define LB_DATA_FORMAT__DYNAMIC_PIXEL_DEPTH_MASK 0x20
+#define LB_DATA_FORMAT__DYNAMIC_PIXEL_DEPTH__SHIFT 0x5
+#define LB_DATA_FORMAT__PREFETCH_MASK 0x1000
+#define LB_DATA_FORMAT__PREFETCH__SHIFT 0xc
+#define LB_DATA_FORMAT__REQUEST_MODE_MASK 0x1000000
+#define LB_DATA_FORMAT__REQUEST_MODE__SHIFT 0x18
+#define LB_DATA_FORMAT__ALPHA_EN_MASK 0x80000000
+#define LB_DATA_FORMAT__ALPHA_EN__SHIFT 0x1f
+#define LB_MEMORY_CTRL__LB_MEMORY_SIZE_MASK 0xfff
+#define LB_MEMORY_CTRL__LB_MEMORY_SIZE__SHIFT 0x0
+#define LB_MEMORY_CTRL__LB_NUM_PARTITIONS_MASK 0xf0000
+#define LB_MEMORY_CTRL__LB_NUM_PARTITIONS__SHIFT 0x10
+#define LB_MEMORY_CTRL__LB_MEMORY_CONFIG_MASK 0x300000
+#define LB_MEMORY_CTRL__LB_MEMORY_CONFIG__SHIFT 0x14
+#define LB_MEMORY_SIZE_STATUS__LB_MEMORY_SIZE_STATUS_MASK 0xfff
+#define LB_MEMORY_SIZE_STATUS__LB_MEMORY_SIZE_STATUS__SHIFT 0x0
+#define LB_DESKTOP_HEIGHT__DESKTOP_HEIGHT_MASK 0x7fff
+#define LB_DESKTOP_HEIGHT__DESKTOP_HEIGHT__SHIFT 0x0
+#define LB_VLINE_START_END__VLINE_START_MASK 0x3fff
+#define LB_VLINE_START_END__VLINE_START__SHIFT 0x0
+#define LB_VLINE_START_END__VLINE_END_MASK 0x7fff0000
+#define LB_VLINE_START_END__VLINE_END__SHIFT 0x10
+#define LB_VLINE_START_END__VLINE_INV_MASK 0x80000000
+#define LB_VLINE_START_END__VLINE_INV__SHIFT 0x1f
+#define LB_VLINE2_START_END__VLINE2_START_MASK 0x3fff
+#define LB_VLINE2_START_END__VLINE2_START__SHIFT 0x0
+#define LB_VLINE2_START_END__VLINE2_END_MASK 0x7fff0000
+#define LB_VLINE2_START_END__VLINE2_END__SHIFT 0x10
+#define LB_VLINE2_START_END__VLINE2_INV_MASK 0x80000000
+#define LB_VLINE2_START_END__VLINE2_INV__SHIFT 0x1f
+#define LB_V_COUNTER__V_COUNTER_MASK 0x7fff
+#define LB_V_COUNTER__V_COUNTER__SHIFT 0x0
+#define LB_SNAPSHOT_V_COUNTER__SNAPSHOT_V_COUNTER_MASK 0x7fff
+#define LB_SNAPSHOT_V_COUNTER__SNAPSHOT_V_COUNTER__SHIFT 0x0
+#define LB_INTERRUPT_MASK__VBLANK_INTERRUPT_MASK_MASK 0x1
+#define LB_INTERRUPT_MASK__VBLANK_INTERRUPT_MASK__SHIFT 0x0
+#define LB_INTERRUPT_MASK__VLINE_INTERRUPT_MASK_MASK 0x10
+#define LB_INTERRUPT_MASK__VLINE_INTERRUPT_MASK__SHIFT 0x4
+#define LB_INTERRUPT_MASK__VLINE2_INTERRUPT_MASK_MASK 0x100
+#define LB_INTERRUPT_MASK__VLINE2_INTERRUPT_MASK__SHIFT 0x8
+#define LB_VLINE_STATUS__VLINE_OCCURRED_MASK 0x1
+#define LB_VLINE_STATUS__VLINE_OCCURRED__SHIFT 0x0
+#define LB_VLINE_STATUS__VLINE_ACK_MASK 0x10
+#define LB_VLINE_STATUS__VLINE_ACK__SHIFT 0x4
+#define LB_VLINE_STATUS__VLINE_STAT_MASK 0x1000
+#define LB_VLINE_STATUS__VLINE_STAT__SHIFT 0xc
+#define LB_VLINE_STATUS__VLINE_INTERRUPT_MASK 0x10000
+#define LB_VLINE_STATUS__VLINE_INTERRUPT__SHIFT 0x10
+#define LB_VLINE_STATUS__VLINE_INTERRUPT_TYPE_MASK 0x20000
+#define LB_VLINE_STATUS__VLINE_INTERRUPT_TYPE__SHIFT 0x11
+#define LB_VLINE2_STATUS__VLINE2_OCCURRED_MASK 0x1
+#define LB_VLINE2_STATUS__VLINE2_OCCURRED__SHIFT 0x0
+#define LB_VLINE2_STATUS__VLINE2_ACK_MASK 0x10
+#define LB_VLINE2_STATUS__VLINE2_ACK__SHIFT 0x4
+#define LB_VLINE2_STATUS__VLINE2_STAT_MASK 0x1000
+#define LB_VLINE2_STATUS__VLINE2_STAT__SHIFT 0xc
+#define LB_VLINE2_STATUS__VLINE2_INTERRUPT_MASK 0x10000
+#define LB_VLINE2_STATUS__VLINE2_INTERRUPT__SHIFT 0x10
+#define LB_VLINE2_STATUS__VLINE2_INTERRUPT_TYPE_MASK 0x20000
+#define LB_VLINE2_STATUS__VLINE2_INTERRUPT_TYPE__SHIFT 0x11
+#define LB_VBLANK_STATUS__VBLANK_OCCURRED_MASK 0x1
+#define LB_VBLANK_STATUS__VBLANK_OCCURRED__SHIFT 0x0
+#define LB_VBLANK_STATUS__VBLANK_ACK_MASK 0x10
+#define LB_VBLANK_STATUS__VBLANK_ACK__SHIFT 0x4
+#define LB_VBLANK_STATUS__VBLANK_STAT_MASK 0x1000
+#define LB_VBLANK_STATUS__VBLANK_STAT__SHIFT 0xc
+#define LB_VBLANK_STATUS__VBLANK_INTERRUPT_MASK 0x10000
+#define LB_VBLANK_STATUS__VBLANK_INTERRUPT__SHIFT 0x10
+#define LB_VBLANK_STATUS__VBLANK_INTERRUPT_TYPE_MASK 0x20000
+#define LB_VBLANK_STATUS__VBLANK_INTERRUPT_TYPE__SHIFT 0x11
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_SEL_MASK 0x3
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_SEL__SHIFT 0x0
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_SEL2_MASK 0x10
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_SEL2__SHIFT 0x4
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_DELAY_MASK 0xff00
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_DELAY__SHIFT 0x8
+#define LB_SYNC_RESET_SEL__LB_SYNC_DURATION_MASK 0xc00000
+#define LB_SYNC_RESET_SEL__LB_SYNC_DURATION__SHIFT 0x16
+#define LB_BLACK_KEYER_R_CR__LB_BLACK_KEYER_R_CR_MASK 0xfff0
+#define LB_BLACK_KEYER_R_CR__LB_BLACK_KEYER_R_CR__SHIFT 0x4
+#define LB_BLACK_KEYER_G_Y__LB_BLACK_KEYER_G_Y_MASK 0xfff0
+#define LB_BLACK_KEYER_G_Y__LB_BLACK_KEYER_G_Y__SHIFT 0x4
+#define LB_BLACK_KEYER_B_CB__LB_BLACK_KEYER_B_CB_MASK 0xfff0
+#define LB_BLACK_KEYER_B_CB__LB_BLACK_KEYER_B_CB__SHIFT 0x4
+#define LB_KEYER_COLOR_CTRL__LB_KEYER_COLOR_EN_MASK 0x1
+#define LB_KEYER_COLOR_CTRL__LB_KEYER_COLOR_EN__SHIFT 0x0
+#define LB_KEYER_COLOR_CTRL__LB_KEYER_COLOR_REP_EN_MASK 0x100
+#define LB_KEYER_COLOR_CTRL__LB_KEYER_COLOR_REP_EN__SHIFT 0x8
+#define LB_KEYER_COLOR_R_CR__LB_KEYER_COLOR_R_CR_MASK 0xfff0
+#define LB_KEYER_COLOR_R_CR__LB_KEYER_COLOR_R_CR__SHIFT 0x4
+#define LB_KEYER_COLOR_G_Y__LB_KEYER_COLOR_G_Y_MASK 0xfff0
+#define LB_KEYER_COLOR_G_Y__LB_KEYER_COLOR_G_Y__SHIFT 0x4
+#define LB_KEYER_COLOR_B_CB__LB_KEYER_COLOR_B_CB_MASK 0xfff0
+#define LB_KEYER_COLOR_B_CB__LB_KEYER_COLOR_B_CB__SHIFT 0x4
+#define LB_KEYER_COLOR_REP_R_CR__LB_KEYER_COLOR_REP_R_CR_MASK 0xfff0
+#define LB_KEYER_COLOR_REP_R_CR__LB_KEYER_COLOR_REP_R_CR__SHIFT 0x4
+#define LB_KEYER_COLOR_REP_G_Y__LB_KEYER_COLOR_REP_G_Y_MASK 0xfff0
+#define LB_KEYER_COLOR_REP_G_Y__LB_KEYER_COLOR_REP_G_Y__SHIFT 0x4
+#define LB_KEYER_COLOR_REP_B_CB__LB_KEYER_COLOR_REP_B_CB_MASK 0xfff0
+#define LB_KEYER_COLOR_REP_B_CB__LB_KEYER_COLOR_REP_B_CB__SHIFT 0x4
+#define LB_BUFFER_LEVEL_STATUS__REQ_FIFO_LEVEL_MASK 0x3f
+#define LB_BUFFER_LEVEL_STATUS__REQ_FIFO_LEVEL__SHIFT 0x0
+#define LB_BUFFER_LEVEL_STATUS__REQ_FIFO_FULL_CNTL_MASK 0xfc00
+#define LB_BUFFER_LEVEL_STATUS__REQ_FIFO_FULL_CNTL__SHIFT 0xa
+#define LB_BUFFER_LEVEL_STATUS__DATA_BUFFER_LEVEL_MASK 0xfff0000
+#define LB_BUFFER_LEVEL_STATUS__DATA_BUFFER_LEVEL__SHIFT 0x10
+#define LB_BUFFER_LEVEL_STATUS__DATA_FIFO_FULL_CNTL_MASK 0xf0000000
+#define LB_BUFFER_LEVEL_STATUS__DATA_FIFO_FULL_CNTL__SHIFT 0x1c
+#define LB_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_ON_MASK 0xfff
+#define LB_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_ON__SHIFT 0x0
+#define LB_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_OFF_MASK 0xfff0000
+#define LB_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_OFF__SHIFT 0x10
+#define LB_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_LEVEL_MASK 0xfff
+#define LB_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_LEVEL__SHIFT 0x0
+#define LB_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_STAT_MASK 0x10000
+#define LB_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_STAT__SHIFT 0x10
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_MARGIN_MASK 0xf
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_MARGIN__SHIFT 0x0
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_STAT_MASK 0x10
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_STAT__SHIFT 0x4
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_OCCURRED_MASK 0x100
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_OCCURRED__SHIFT 0x8
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_ACK_MASK 0x1000
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_ACK__SHIFT 0xc
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_STAT_MASK 0x10000
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_STAT__SHIFT 0x10
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_OCCURRED_MASK 0x100000
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_OCCURRED__SHIFT 0x14
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_ACK_MASK 0x1000000
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_ACK__SHIFT 0x18
+#define LB_NO_OUTSTANDING_REQ_STATUS__LB_NO_OUTSTANDING_REQ_STAT_MASK 0x1
+#define LB_NO_OUTSTANDING_REQ_STATUS__LB_NO_OUTSTANDING_REQ_STAT__SHIFT 0x0
+#define MVP_AFR_FLIP_MODE__MVP_AFR_FLIP_MODE_MASK 0x3
+#define MVP_AFR_FLIP_MODE__MVP_AFR_FLIP_MODE__SHIFT 0x0
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_NUM_ENTRIES_MASK 0xf
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_NUM_ENTRIES__SHIFT 0x0
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_MASK 0x10
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET__SHIFT 0x4
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_FLAG_MASK 0x100
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_FLAG__SHIFT 0x8
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_ACK_MASK 0x1000
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_ACK__SHIFT 0xc
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_INSERT_MODE_MASK 0x3
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_INSERT_MODE__SHIFT 0x0
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_INSERT_MASK 0x7fff00
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_INSERT__SHIFT 0x8
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_OFFSET_MASK 0x3f000000
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_OFFSET__SHIFT 0x18
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_AUTO_ENABLE_MASK 0x40000000
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_AUTO_ENABLE__SHIFT 0x1e
+#define DC_MVP_LB_CONTROL__MVP_SWAP_LOCK_IN_MODE_MASK 0x3
+#define DC_MVP_LB_CONTROL__MVP_SWAP_LOCK_IN_MODE__SHIFT 0x0
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_SEL_MASK 0x100
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_SEL__SHIFT 0x8
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_FORCE_ONE_MASK 0x1000
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_FORCE_ONE__SHIFT 0xc
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_FORCE_ZERO_MASK 0x10000
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_FORCE_ZERO__SHIFT 0x10
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_STATUS_MASK 0x100000
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_STATUS__SHIFT 0x14
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_IN_CAP_MASK 0x10000000
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_IN_CAP__SHIFT 0x1c
+#define DC_MVP_LB_CONTROL__DC_MVP_SPARE_FLOPS_MASK 0x80000000
+#define DC_MVP_LB_CONTROL__DC_MVP_SPARE_FLOPS__SHIFT 0x1f
+#define LB_DEBUG__LB_DEBUG_MASK 0xffffffff
+#define LB_DEBUG__LB_DEBUG__SHIFT 0x0
+#define LB_DEBUG2__LB_DEBUG2_MASK 0xffffffff
+#define LB_DEBUG2__LB_DEBUG2__SHIFT 0x0
+#define LB_DEBUG3__LB_DEBUG3_MASK 0xffffffff
+#define LB_DEBUG3__LB_DEBUG3__SHIFT 0x0
+#define LB_TEST_DEBUG_INDEX__LB_TEST_DEBUG_INDEX_MASK 0xff
+#define LB_TEST_DEBUG_INDEX__LB_TEST_DEBUG_INDEX__SHIFT 0x0
+#define LB_TEST_DEBUG_INDEX__LB_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define LB_TEST_DEBUG_INDEX__LB_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define LB_TEST_DEBUG_DATA__LB_TEST_DEBUG_DATA_MASK 0xffffffff
+#define LB_TEST_DEBUG_DATA__LB_TEST_DEBUG_DATA__SHIFT 0x0
+#define LBV_DATA_FORMAT__PIXEL_DEPTH_MASK 0x3
+#define LBV_DATA_FORMAT__PIXEL_DEPTH__SHIFT 0x0
+#define LBV_DATA_FORMAT__PIXEL_EXPAN_MODE_MASK 0x4
+#define LBV_DATA_FORMAT__PIXEL_EXPAN_MODE__SHIFT 0x2
+#define LBV_DATA_FORMAT__INTERLEAVE_EN_MASK 0x8
+#define LBV_DATA_FORMAT__INTERLEAVE_EN__SHIFT 0x3
+#define LBV_DATA_FORMAT__PIXEL_REDUCE_MODE_MASK 0x10
+#define LBV_DATA_FORMAT__PIXEL_REDUCE_MODE__SHIFT 0x4
+#define LBV_DATA_FORMAT__DYNAMIC_PIXEL_DEPTH_MASK 0x20
+#define LBV_DATA_FORMAT__DYNAMIC_PIXEL_DEPTH__SHIFT 0x5
+#define LBV_DATA_FORMAT__DITHER_EN_MASK 0x40
+#define LBV_DATA_FORMAT__DITHER_EN__SHIFT 0x6
+#define LBV_DATA_FORMAT__DOWNSCALE_PREFETCH_EN_MASK 0x80
+#define LBV_DATA_FORMAT__DOWNSCALE_PREFETCH_EN__SHIFT 0x7
+#define LBV_DATA_FORMAT__PREFETCH_MASK 0x1000
+#define LBV_DATA_FORMAT__PREFETCH__SHIFT 0xc
+#define LBV_DATA_FORMAT__REQUEST_MODE_MASK 0x1000000
+#define LBV_DATA_FORMAT__REQUEST_MODE__SHIFT 0x18
+#define LBV_DATA_FORMAT__ALPHA_EN_MASK 0x80000000
+#define LBV_DATA_FORMAT__ALPHA_EN__SHIFT 0x1f
+#define LBV_MEMORY_CTRL__LB_MEMORY_SIZE_MASK 0xfff
+#define LBV_MEMORY_CTRL__LB_MEMORY_SIZE__SHIFT 0x0
+#define LBV_MEMORY_CTRL__LB_NUM_PARTITIONS_MASK 0xf0000
+#define LBV_MEMORY_CTRL__LB_NUM_PARTITIONS__SHIFT 0x10
+#define LBV_MEMORY_CTRL__LB_MEMORY_CONFIG_MASK 0x300000
+#define LBV_MEMORY_CTRL__LB_MEMORY_CONFIG__SHIFT 0x14
+#define LBV_MEMORY_SIZE_STATUS__LB_MEMORY_SIZE_STATUS_MASK 0xfff
+#define LBV_MEMORY_SIZE_STATUS__LB_MEMORY_SIZE_STATUS__SHIFT 0x0
+#define LBV_DESKTOP_HEIGHT__DESKTOP_HEIGHT_MASK 0x7fff
+#define LBV_DESKTOP_HEIGHT__DESKTOP_HEIGHT__SHIFT 0x0
+#define LBV_VLINE_START_END__VLINE_START_MASK 0x3fff
+#define LBV_VLINE_START_END__VLINE_START__SHIFT 0x0
+#define LBV_VLINE_START_END__VLINE_END_MASK 0x7fff0000
+#define LBV_VLINE_START_END__VLINE_END__SHIFT 0x10
+#define LBV_VLINE_START_END__VLINE_INV_MASK 0x80000000
+#define LBV_VLINE_START_END__VLINE_INV__SHIFT 0x1f
+#define LBV_VLINE2_START_END__VLINE2_START_MASK 0x3fff
+#define LBV_VLINE2_START_END__VLINE2_START__SHIFT 0x0
+#define LBV_VLINE2_START_END__VLINE2_END_MASK 0x7fff0000
+#define LBV_VLINE2_START_END__VLINE2_END__SHIFT 0x10
+#define LBV_VLINE2_START_END__VLINE2_INV_MASK 0x80000000
+#define LBV_VLINE2_START_END__VLINE2_INV__SHIFT 0x1f
+#define LBV_V_COUNTER__V_COUNTER_MASK 0x7fff
+#define LBV_V_COUNTER__V_COUNTER__SHIFT 0x0
+#define LBV_SNAPSHOT_V_COUNTER__SNAPSHOT_V_COUNTER_MASK 0x7fff
+#define LBV_SNAPSHOT_V_COUNTER__SNAPSHOT_V_COUNTER__SHIFT 0x0
+#define LBV_V_COUNTER_CHROMA__V_COUNTER_CHROMA_MASK 0x7fff
+#define LBV_V_COUNTER_CHROMA__V_COUNTER_CHROMA__SHIFT 0x0
+#define LBV_SNAPSHOT_V_COUNTER_CHROMA__SNAPSHOT_V_COUNTER_CHROMA_MASK 0x7fff
+#define LBV_SNAPSHOT_V_COUNTER_CHROMA__SNAPSHOT_V_COUNTER_CHROMA__SHIFT 0x0
+#define LBV_INTERRUPT_MASK__VBLANK_INTERRUPT_MASK_MASK 0x1
+#define LBV_INTERRUPT_MASK__VBLANK_INTERRUPT_MASK__SHIFT 0x0
+#define LBV_INTERRUPT_MASK__VLINE_INTERRUPT_MASK_MASK 0x10
+#define LBV_INTERRUPT_MASK__VLINE_INTERRUPT_MASK__SHIFT 0x4
+#define LBV_INTERRUPT_MASK__VLINE2_INTERRUPT_MASK_MASK 0x100
+#define LBV_INTERRUPT_MASK__VLINE2_INTERRUPT_MASK__SHIFT 0x8
+#define LBV_VLINE_STATUS__VLINE_OCCURRED_MASK 0x1
+#define LBV_VLINE_STATUS__VLINE_OCCURRED__SHIFT 0x0
+#define LBV_VLINE_STATUS__VLINE_ACK_MASK 0x10
+#define LBV_VLINE_STATUS__VLINE_ACK__SHIFT 0x4
+#define LBV_VLINE_STATUS__VLINE_STAT_MASK 0x1000
+#define LBV_VLINE_STATUS__VLINE_STAT__SHIFT 0xc
+#define LBV_VLINE_STATUS__VLINE_INTERRUPT_MASK 0x10000
+#define LBV_VLINE_STATUS__VLINE_INTERRUPT__SHIFT 0x10
+#define LBV_VLINE_STATUS__VLINE_INTERRUPT_TYPE_MASK 0x20000
+#define LBV_VLINE_STATUS__VLINE_INTERRUPT_TYPE__SHIFT 0x11
+#define LBV_VLINE2_STATUS__VLINE2_OCCURRED_MASK 0x1
+#define LBV_VLINE2_STATUS__VLINE2_OCCURRED__SHIFT 0x0
+#define LBV_VLINE2_STATUS__VLINE2_ACK_MASK 0x10
+#define LBV_VLINE2_STATUS__VLINE2_ACK__SHIFT 0x4
+#define LBV_VLINE2_STATUS__VLINE2_STAT_MASK 0x1000
+#define LBV_VLINE2_STATUS__VLINE2_STAT__SHIFT 0xc
+#define LBV_VLINE2_STATUS__VLINE2_INTERRUPT_MASK 0x10000
+#define LBV_VLINE2_STATUS__VLINE2_INTERRUPT__SHIFT 0x10
+#define LBV_VLINE2_STATUS__VLINE2_INTERRUPT_TYPE_MASK 0x20000
+#define LBV_VLINE2_STATUS__VLINE2_INTERRUPT_TYPE__SHIFT 0x11
+#define LBV_VBLANK_STATUS__VBLANK_OCCURRED_MASK 0x1
+#define LBV_VBLANK_STATUS__VBLANK_OCCURRED__SHIFT 0x0
+#define LBV_VBLANK_STATUS__VBLANK_ACK_MASK 0x10
+#define LBV_VBLANK_STATUS__VBLANK_ACK__SHIFT 0x4
+#define LBV_VBLANK_STATUS__VBLANK_STAT_MASK 0x1000
+#define LBV_VBLANK_STATUS__VBLANK_STAT__SHIFT 0xc
+#define LBV_VBLANK_STATUS__VBLANK_INTERRUPT_MASK 0x10000
+#define LBV_VBLANK_STATUS__VBLANK_INTERRUPT__SHIFT 0x10
+#define LBV_VBLANK_STATUS__VBLANK_INTERRUPT_TYPE_MASK 0x20000
+#define LBV_VBLANK_STATUS__VBLANK_INTERRUPT_TYPE__SHIFT 0x11
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_SEL_MASK 0x3
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_SEL__SHIFT 0x0
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_SEL2_MASK 0x10
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_SEL2__SHIFT 0x4
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_DELAY_MASK 0xff00
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_DELAY__SHIFT 0x8
+#define LBV_SYNC_RESET_SEL__LB_SYNC_DURATION_MASK 0xc00000
+#define LBV_SYNC_RESET_SEL__LB_SYNC_DURATION__SHIFT 0x16
+#define LBV_BLACK_KEYER_R_CR__LB_BLACK_KEYER_R_CR_MASK 0xfff0
+#define LBV_BLACK_KEYER_R_CR__LB_BLACK_KEYER_R_CR__SHIFT 0x4
+#define LBV_BLACK_KEYER_G_Y__LB_BLACK_KEYER_G_Y_MASK 0xfff0
+#define LBV_BLACK_KEYER_G_Y__LB_BLACK_KEYER_G_Y__SHIFT 0x4
+#define LBV_BLACK_KEYER_B_CB__LB_BLACK_KEYER_B_CB_MASK 0xfff0
+#define LBV_BLACK_KEYER_B_CB__LB_BLACK_KEYER_B_CB__SHIFT 0x4
+#define LBV_KEYER_COLOR_CTRL__LB_KEYER_COLOR_EN_MASK 0x1
+#define LBV_KEYER_COLOR_CTRL__LB_KEYER_COLOR_EN__SHIFT 0x0
+#define LBV_KEYER_COLOR_CTRL__LB_KEYER_COLOR_REP_EN_MASK 0x100
+#define LBV_KEYER_COLOR_CTRL__LB_KEYER_COLOR_REP_EN__SHIFT 0x8
+#define LBV_KEYER_COLOR_R_CR__LB_KEYER_COLOR_R_CR_MASK 0xfff0
+#define LBV_KEYER_COLOR_R_CR__LB_KEYER_COLOR_R_CR__SHIFT 0x4
+#define LBV_KEYER_COLOR_G_Y__LB_KEYER_COLOR_G_Y_MASK 0xfff0
+#define LBV_KEYER_COLOR_G_Y__LB_KEYER_COLOR_G_Y__SHIFT 0x4
+#define LBV_KEYER_COLOR_B_CB__LB_KEYER_COLOR_B_CB_MASK 0xfff0
+#define LBV_KEYER_COLOR_B_CB__LB_KEYER_COLOR_B_CB__SHIFT 0x4
+#define LBV_KEYER_COLOR_REP_R_CR__LB_KEYER_COLOR_REP_R_CR_MASK 0xfff0
+#define LBV_KEYER_COLOR_REP_R_CR__LB_KEYER_COLOR_REP_R_CR__SHIFT 0x4
+#define LBV_KEYER_COLOR_REP_G_Y__LB_KEYER_COLOR_REP_G_Y_MASK 0xfff0
+#define LBV_KEYER_COLOR_REP_G_Y__LB_KEYER_COLOR_REP_G_Y__SHIFT 0x4
+#define LBV_KEYER_COLOR_REP_B_CB__LB_KEYER_COLOR_REP_B_CB_MASK 0xfff0
+#define LBV_KEYER_COLOR_REP_B_CB__LB_KEYER_COLOR_REP_B_CB__SHIFT 0x4
+#define LBV_BUFFER_LEVEL_STATUS__REQ_FIFO_LEVEL_MASK 0x3f
+#define LBV_BUFFER_LEVEL_STATUS__REQ_FIFO_LEVEL__SHIFT 0x0
+#define LBV_BUFFER_LEVEL_STATUS__REQ_FIFO_FULL_CNTL_MASK 0xfc00
+#define LBV_BUFFER_LEVEL_STATUS__REQ_FIFO_FULL_CNTL__SHIFT 0xa
+#define LBV_BUFFER_LEVEL_STATUS__DATA_BUFFER_LEVEL_MASK 0xfff0000
+#define LBV_BUFFER_LEVEL_STATUS__DATA_BUFFER_LEVEL__SHIFT 0x10
+#define LBV_BUFFER_LEVEL_STATUS__DATA_FIFO_FULL_CNTL_MASK 0xf0000000
+#define LBV_BUFFER_LEVEL_STATUS__DATA_FIFO_FULL_CNTL__SHIFT 0x1c
+#define LBV_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_ON_MASK 0xfff
+#define LBV_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_ON__SHIFT 0x0
+#define LBV_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_OFF_MASK 0xfff0000
+#define LBV_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_OFF__SHIFT 0x10
+#define LBV_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_LEVEL_MASK 0xfff
+#define LBV_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_LEVEL__SHIFT 0x0
+#define LBV_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_STAT_MASK 0x10000
+#define LBV_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_STAT__SHIFT 0x10
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_MARGIN_MASK 0xf
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_MARGIN__SHIFT 0x0
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_STAT_MASK 0x10
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_STAT__SHIFT 0x4
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_OCCURRED_MASK 0x100
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_OCCURRED__SHIFT 0x8
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_ACK_MASK 0x1000
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_ACK__SHIFT 0xc
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_STAT_MASK 0x10000
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_STAT__SHIFT 0x10
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_OCCURRED_MASK 0x100000
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_OCCURRED__SHIFT 0x14
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_ACK_MASK 0x1000000
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_ACK__SHIFT 0x18
+#define LBV_NO_OUTSTANDING_REQ_STATUS__LB_NO_OUTSTANDING_REQ_STAT_MASK 0x1
+#define LBV_NO_OUTSTANDING_REQ_STATUS__LB_NO_OUTSTANDING_REQ_STAT__SHIFT 0x0
+#define LBV_DEBUG__LB_DEBUG_MASK 0xffffffff
+#define LBV_DEBUG__LB_DEBUG__SHIFT 0x0
+#define LBV_DEBUG2__LB_DEBUG2_MASK 0xffffffff
+#define LBV_DEBUG2__LB_DEBUG2__SHIFT 0x0
+#define LBV_DEBUG3__LB_DEBUG3_MASK 0xffffffff
+#define LBV_DEBUG3__LB_DEBUG3__SHIFT 0x0
+#define LBV_TEST_DEBUG_INDEX__LB_TEST_DEBUG_INDEX_MASK 0xff
+#define LBV_TEST_DEBUG_INDEX__LB_TEST_DEBUG_INDEX__SHIFT 0x0
+#define LBV_TEST_DEBUG_INDEX__LB_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define LBV_TEST_DEBUG_INDEX__LB_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define LBV_TEST_DEBUG_DATA__LB_TEST_DEBUG_DATA_MASK 0xffffffff
+#define LBV_TEST_DEBUG_DATA__LB_TEST_DEBUG_DATA__SHIFT 0x0
+#define MVP_CONTROL1__MVP_EN_MASK 0x1
+#define MVP_CONTROL1__MVP_EN__SHIFT 0x0
+#define MVP_CONTROL1__MVP_MIXER_MODE_MASK 0x70
+#define MVP_CONTROL1__MVP_MIXER_MODE__SHIFT 0x4
+#define MVP_CONTROL1__MVP_MIXER_SLAVE_SEL_MASK 0x100
+#define MVP_CONTROL1__MVP_MIXER_SLAVE_SEL__SHIFT 0x8
+#define MVP_CONTROL1__MVP_MIXER_SLAVE_SEL_DELAY_UNTIL_END_OF_BLANK_MASK 0x200
+#define MVP_CONTROL1__MVP_MIXER_SLAVE_SEL_DELAY_UNTIL_END_OF_BLANK__SHIFT 0x9
+#define MVP_CONTROL1__MVP_ARBITRATION_MODE_FOR_AFR_MANUAL_SWITCH_MODE_MASK 0x400
+#define MVP_CONTROL1__MVP_ARBITRATION_MODE_FOR_AFR_MANUAL_SWITCH_MODE__SHIFT 0xa
+#define MVP_CONTROL1__MVP_RATE_CONTROL_MASK 0x1000
+#define MVP_CONTROL1__MVP_RATE_CONTROL__SHIFT 0xc
+#define MVP_CONTROL1__MVP_CHANNEL_CONTROL_MASK 0x10000
+#define MVP_CONTROL1__MVP_CHANNEL_CONTROL__SHIFT 0x10
+#define MVP_CONTROL1__MVP_GPU_CHAIN_LOCATION_MASK 0x300000
+#define MVP_CONTROL1__MVP_GPU_CHAIN_LOCATION__SHIFT 0x14
+#define MVP_CONTROL1__MVP_DISABLE_MSB_EXPAND_MASK 0x1000000
+#define MVP_CONTROL1__MVP_DISABLE_MSB_EXPAND__SHIFT 0x18
+#define MVP_CONTROL1__MVP_30BPP_EN_MASK 0x10000000
+#define MVP_CONTROL1__MVP_30BPP_EN__SHIFT 0x1c
+#define MVP_CONTROL1__MVP_TERMINATION_CNTL_A_MASK 0x40000000
+#define MVP_CONTROL1__MVP_TERMINATION_CNTL_A__SHIFT 0x1e
+#define MVP_CONTROL1__MVP_TERMINATION_CNTL_B_MASK 0x80000000
+#define MVP_CONTROL1__MVP_TERMINATION_CNTL_B__SHIFT 0x1f
+#define MVP_CONTROL2__MVP_MUX_DE_DVOCNTL0_SEL_MASK 0x1
+#define MVP_CONTROL2__MVP_MUX_DE_DVOCNTL0_SEL__SHIFT 0x0
+#define MVP_CONTROL2__MVP_MUX_DE_DVOCNTL2_SEL_MASK 0x10
+#define MVP_CONTROL2__MVP_MUX_DE_DVOCNTL2_SEL__SHIFT 0x4
+#define MVP_CONTROL2__MVP_MUXA_CLK_SEL_MASK 0x100
+#define MVP_CONTROL2__MVP_MUXA_CLK_SEL__SHIFT 0x8
+#define MVP_CONTROL2__MVP_MUXB_CLK_SEL_MASK 0x1000
+#define MVP_CONTROL2__MVP_MUXB_CLK_SEL__SHIFT 0xc
+#define MVP_CONTROL2__MVP_DVOCNTL_MUX_MASK 0x10000
+#define MVP_CONTROL2__MVP_DVOCNTL_MUX__SHIFT 0x10
+#define MVP_CONTROL2__MVP_FLOW_CONTROL_OUT_EN_MASK 0x100000
+#define MVP_CONTROL2__MVP_FLOW_CONTROL_OUT_EN__SHIFT 0x14
+#define MVP_CONTROL2__MVP_SWAP_LOCK_OUT_EN_MASK 0x1000000
+#define MVP_CONTROL2__MVP_SWAP_LOCK_OUT_EN__SHIFT 0x18
+#define MVP_CONTROL2__MVP_SWAP_AB_IN_DC_DDR_MASK 0x10000000
+#define MVP_CONTROL2__MVP_SWAP_AB_IN_DC_DDR__SHIFT 0x1c
+#define MVP_FIFO_CONTROL__MVP_STOP_SLAVE_WM_MASK 0xff
+#define MVP_FIFO_CONTROL__MVP_STOP_SLAVE_WM__SHIFT 0x0
+#define MVP_FIFO_CONTROL__MVP_PAUSE_SLAVE_WM_MASK 0xff00
+#define MVP_FIFO_CONTROL__MVP_PAUSE_SLAVE_WM__SHIFT 0x8
+#define MVP_FIFO_CONTROL__MVP_PAUSE_SLAVE_CNT_MASK 0xff0000
+#define MVP_FIFO_CONTROL__MVP_PAUSE_SLAVE_CNT__SHIFT 0x10
+#define MVP_FIFO_STATUS__MVP_FIFO_LEVEL_MASK 0xff
+#define MVP_FIFO_STATUS__MVP_FIFO_LEVEL__SHIFT 0x0
+#define MVP_FIFO_STATUS__MVP_FIFO_OVERFLOW_MASK 0x100
+#define MVP_FIFO_STATUS__MVP_FIFO_OVERFLOW__SHIFT 0x8
+#define MVP_FIFO_STATUS__MVP_FIFO_OVERFLOW_OCCURRED_MASK 0x1000
+#define MVP_FIFO_STATUS__MVP_FIFO_OVERFLOW_OCCURRED__SHIFT 0xc
+#define MVP_FIFO_STATUS__MVP_FIFO_OVERFLOW_ACK_MASK 0x10000
+#define MVP_FIFO_STATUS__MVP_FIFO_OVERFLOW_ACK__SHIFT 0x10
+#define MVP_FIFO_STATUS__MVP_FIFO_UNDERFLOW_MASK 0x100000
+#define MVP_FIFO_STATUS__MVP_FIFO_UNDERFLOW__SHIFT 0x14
+#define MVP_FIFO_STATUS__MVP_FIFO_UNDERFLOW_OCCURRED_MASK 0x1000000
+#define MVP_FIFO_STATUS__MVP_FIFO_UNDERFLOW_OCCURRED__SHIFT 0x18
+#define MVP_FIFO_STATUS__MVP_FIFO_UNDERFLOW_ACK_MASK 0x10000000
+#define MVP_FIFO_STATUS__MVP_FIFO_UNDERFLOW_ACK__SHIFT 0x1c
+#define MVP_FIFO_STATUS__MVP_FIFO_ERROR_MASK_MASK 0x40000000
+#define MVP_FIFO_STATUS__MVP_FIFO_ERROR_MASK__SHIFT 0x1e
+#define MVP_FIFO_STATUS__MVP_FIFO_ERROR_INT_STATUS_MASK 0x80000000
+#define MVP_FIFO_STATUS__MVP_FIFO_ERROR_INT_STATUS__SHIFT 0x1f
+#define MVP_SLAVE_STATUS__MVP_SLAVE_PIXELS_PER_LINE_RCVED_MASK 0x1fff
+#define MVP_SLAVE_STATUS__MVP_SLAVE_PIXELS_PER_LINE_RCVED__SHIFT 0x0
+#define MVP_SLAVE_STATUS__MVP_SLAVE_LINES_PER_FRAME_RCVED_MASK 0x1fff0000
+#define MVP_SLAVE_STATUS__MVP_SLAVE_LINES_PER_FRAME_RCVED__SHIFT 0x10
+#define MVP_INBAND_CNTL_CAP__MVP_IGNOR_INBAND_CNTL_MASK 0x1
+#define MVP_INBAND_CNTL_CAP__MVP_IGNOR_INBAND_CNTL__SHIFT 0x0
+#define MVP_INBAND_CNTL_CAP__MVP_PASSING_INBAND_CNTL_EN_MASK 0x10
+#define MVP_INBAND_CNTL_CAP__MVP_PASSING_INBAND_CNTL_EN__SHIFT 0x4
+#define MVP_INBAND_CNTL_CAP__MVP_INBAND_CNTL_CHAR_CAP_MASK 0xffffff00
+#define MVP_INBAND_CNTL_CAP__MVP_INBAND_CNTL_CHAR_CAP__SHIFT 0x8
+#define MVP_BLACK_KEYER__MVP_BLACK_KEYER_R_MASK 0x3ff
+#define MVP_BLACK_KEYER__MVP_BLACK_KEYER_R__SHIFT 0x0
+#define MVP_BLACK_KEYER__MVP_BLACK_KEYER_G_MASK 0xffc00
+#define MVP_BLACK_KEYER__MVP_BLACK_KEYER_G__SHIFT 0xa
+#define MVP_BLACK_KEYER__MVP_BLACK_KEYER_B_MASK 0x3ff00000
+#define MVP_BLACK_KEYER__MVP_BLACK_KEYER_B__SHIFT 0x14
+#define MVP_CRC_CNTL__MVP_CRC_BLUE_MASK_MASK 0xff
+#define MVP_CRC_CNTL__MVP_CRC_BLUE_MASK__SHIFT 0x0
+#define MVP_CRC_CNTL__MVP_CRC_GREEN_MASK_MASK 0xff00
+#define MVP_CRC_CNTL__MVP_CRC_GREEN_MASK__SHIFT 0x8
+#define MVP_CRC_CNTL__MVP_CRC_RED_MASK_MASK 0xff0000
+#define MVP_CRC_CNTL__MVP_CRC_RED_MASK__SHIFT 0x10
+#define MVP_CRC_CNTL__MVP_CRC_EN_MASK 0x10000000
+#define MVP_CRC_CNTL__MVP_CRC_EN__SHIFT 0x1c
+#define MVP_CRC_CNTL__MVP_CRC_CONT_EN_MASK 0x20000000
+#define MVP_CRC_CNTL__MVP_CRC_CONT_EN__SHIFT 0x1d
+#define MVP_CRC_CNTL__MVP_DC_DDR_CRC_EVEN_ODD_PIX_SEL_MASK 0x40000000
+#define MVP_CRC_CNTL__MVP_DC_DDR_CRC_EVEN_ODD_PIX_SEL__SHIFT 0x1e
+#define MVP_CRC_RESULT_BLUE_GREEN__MVP_CRC_BLUE_RESULT_MASK 0xffff
+#define MVP_CRC_RESULT_BLUE_GREEN__MVP_CRC_BLUE_RESULT__SHIFT 0x0
+#define MVP_CRC_RESULT_BLUE_GREEN__MVP_CRC_GREEN_RESULT_MASK 0xffff0000
+#define MVP_CRC_RESULT_BLUE_GREEN__MVP_CRC_GREEN_RESULT__SHIFT 0x10
+#define MVP_CRC_RESULT_RED__MVP_CRC_RED_RESULT_MASK 0xffff
+#define MVP_CRC_RESULT_RED__MVP_CRC_RED_RESULT__SHIFT 0x0
+#define MVP_CONTROL3__MVP_RESET_IN_BETWEEN_FRAMES_MASK 0x1
+#define MVP_CONTROL3__MVP_RESET_IN_BETWEEN_FRAMES__SHIFT 0x0
+#define MVP_CONTROL3__MVP_DDR_SC_AB_SEL_MASK 0x10
+#define MVP_CONTROL3__MVP_DDR_SC_AB_SEL__SHIFT 0x4
+#define MVP_CONTROL3__MVP_DDR_SC_B_START_MODE_MASK 0x100
+#define MVP_CONTROL3__MVP_DDR_SC_B_START_MODE__SHIFT 0x8
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_OUT_FORCE_ONE_MASK 0x1000
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_OUT_FORCE_ONE__SHIFT 0xc
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_OUT_FORCE_ZERO_MASK 0x10000
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_OUT_FORCE_ZERO__SHIFT 0x10
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_CASCADE_EN_MASK 0x100000
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_CASCADE_EN__SHIFT 0x14
+#define MVP_CONTROL3__MVP_SWAP_48BIT_EN_MASK 0x1000000
+#define MVP_CONTROL3__MVP_SWAP_48BIT_EN__SHIFT 0x18
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_IN_CAP_MASK 0x10000000
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_IN_CAP__SHIFT 0x1c
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_PIXEL_ERROR_CNT_MASK 0x1fff
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_PIXEL_ERROR_CNT__SHIFT 0x0
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_LINE_ERROR_CNT_MASK 0x1fff0000
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_LINE_ERROR_CNT__SHIFT 0x10
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_DATA_CHK_EN_MASK 0x80000000
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_DATA_CHK_EN__SHIFT 0x1f
+#define MVP_RECEIVE_CNT_CNTL2__MVP_SLAVE_FRAME_ERROR_CNT_MASK 0x1fff
+#define MVP_RECEIVE_CNT_CNTL2__MVP_SLAVE_FRAME_ERROR_CNT__SHIFT 0x0
+#define MVP_RECEIVE_CNT_CNTL2__MVP_SLAVE_FRAME_ERROR_CNT_RESET_MASK 0x80000000
+#define MVP_RECEIVE_CNT_CNTL2__MVP_SLAVE_FRAME_ERROR_CNT_RESET__SHIFT 0x1f
+#define MVP_DEBUG__MVP_SWAP_LOCK_IN_EN_MASK 0x1
+#define MVP_DEBUG__MVP_SWAP_LOCK_IN_EN__SHIFT 0x0
+#define MVP_DEBUG__MVP_FLOW_CONTROL_IN_EN_MASK 0x2
+#define MVP_DEBUG__MVP_FLOW_CONTROL_IN_EN__SHIFT 0x1
+#define MVP_DEBUG__MVP_SWAP_LOCK_IN_SEL_MASK 0x4
+#define MVP_DEBUG__MVP_SWAP_LOCK_IN_SEL__SHIFT 0x2
+#define MVP_DEBUG__MVP_FLOW_CONTROL_IN_SEL_MASK 0x8
+#define MVP_DEBUG__MVP_FLOW_CONTROL_IN_SEL__SHIFT 0x3
+#define MVP_DEBUG__MVP_DIS_FIX_AFR_MANUAL_HSYNC_FLIP_MASK 0x10
+#define MVP_DEBUG__MVP_DIS_FIX_AFR_MANUAL_HSYNC_FLIP__SHIFT 0x4
+#define MVP_DEBUG__MVP_DIS_FIX_AFR_AUTO_VSYNC_FLIP_MASK 0x20
+#define MVP_DEBUG__MVP_DIS_FIX_AFR_AUTO_VSYNC_FLIP__SHIFT 0x5
+#define MVP_DEBUG__MVP_EN_FIX_AFR_MANUAL_SWITCH_IN_SFR_MASK 0x40
+#define MVP_DEBUG__MVP_EN_FIX_AFR_MANUAL_SWITCH_IN_SFR__SHIFT 0x6
+#define MVP_DEBUG__MVP_DIS_READ_POINTER_RESET_DELAY_MASK 0x80
+#define MVP_DEBUG__MVP_DIS_READ_POINTER_RESET_DELAY__SHIFT 0x7
+#define MVP_DEBUG__MVP_DEBUG_BITS_MASK 0xffffff00
+#define MVP_DEBUG__MVP_DEBUG_BITS__SHIFT 0x8
+#define MVP_TEST_DEBUG_INDEX__MVP_TEST_DEBUG_INDEX_MASK 0xff
+#define MVP_TEST_DEBUG_INDEX__MVP_TEST_DEBUG_INDEX__SHIFT 0x0
+#define MVP_TEST_DEBUG_INDEX__MVP_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define MVP_TEST_DEBUG_INDEX__MVP_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define MVP_TEST_DEBUG_DATA__MVP_TEST_DEBUG_DATA_MASK 0xffffffff
+#define MVP_TEST_DEBUG_DATA__MVP_TEST_DEBUG_DATA__SHIFT 0x0
+#define MVP_DEBUG_05__IDE0_MVP_GPU_CHAIN_LOCATION_MASK 0x6
+#define MVP_DEBUG_05__IDE0_MVP_GPU_CHAIN_LOCATION__SHIFT 0x1
+#define MVP_DEBUG_09__IDE4_CRTC2_MVP_GPU_CHAIN_LOCATION_MASK 0x6
+#define MVP_DEBUG_09__IDE4_CRTC2_MVP_GPU_CHAIN_LOCATION__SHIFT 0x1
+#define MVP_DEBUG_12__IDEC_MVP_DATA_A_H_MASK 0x1
+#define MVP_DEBUG_12__IDEC_MVP_DATA_A_H__SHIFT 0x0
+#define MVP_DEBUG_12__IDEC_MVP_DATA_A_MASK 0x1fffffe
+#define MVP_DEBUG_12__IDEC_MVP_DATA_A__SHIFT 0x1
+#define MVP_DEBUG_13__IDED_MVP_DATA_B_H_MASK 0x1
+#define MVP_DEBUG_13__IDED_MVP_DATA_B_H__SHIFT 0x0
+#define MVP_DEBUG_13__IDED_MVP_DATA_B_MASK 0x1fffffe
+#define MVP_DEBUG_13__IDED_MVP_DATA_B__SHIFT 0x1
+#define MVP_DEBUG_13__IDED_START_READ_B_MASK 0x2000000
+#define MVP_DEBUG_13__IDED_START_READ_B__SHIFT 0x19
+#define MVP_DEBUG_13__IDED_READ_FIFO_ENTRY_DE_B_MASK 0x4000000
+#define MVP_DEBUG_13__IDED_READ_FIFO_ENTRY_DE_B__SHIFT 0x1a
+#define MVP_DEBUG_13__IDED_WRITE_ADD_B_MASK 0x38000000
+#define MVP_DEBUG_13__IDED_WRITE_ADD_B__SHIFT 0x1b
+#define MVP_DEBUG_14__IDEE_READ_ADD_MASK 0x7
+#define MVP_DEBUG

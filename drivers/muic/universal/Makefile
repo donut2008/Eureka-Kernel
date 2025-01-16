@@ -1,6 +1,8 @@
 
-obj-y	+= muic_usb.o muic-core.o muic_coagent.o muic_state.o muic_apis.o muic_sysfs.o muic_debug.o muic_dt.o muic_i2c.o muic_regmap.o muic_vps.o
-obj-$(CONFIG_MUIC_SUPPORT_CCIC)	+= muic_ccic.o
-obj-$(CONFIG_MUIC_UNIVERSAL_MAX77865)	+= muic_task_max77865.o muic_regmap_max77865.o
-obj-$(CONFIG_MUIC_HV_MAX77865)		+= muic_hv_max77865.o
-
+#define MC_ARB_AGE_RD__ENABLE_GROUP7__SHIFT 0x17
+#define MC_ARB_AGE_RD__DIVIDE_GROUP0_MASK 0x1000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP0__SHIFT 0x18
+#define MC_ARB_AGE_RD__DIVIDE_GROUP1_MASK 0x2000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP1__SHIFT 0x19
+#define MC_ARB_AGE_RD__DIVIDE_GROUP2_MASK 0x4000000
+#define MC_ARB_AGE_RD__DIVID

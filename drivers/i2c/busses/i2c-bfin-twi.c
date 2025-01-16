@@ -1,740 +1,405 @@
-/*
- * Blackfin On-Chip Two Wire Interface Driver
- *
- * Copyright 2005-2007 Analog Devices Inc.
- *
- * Enter bugs at http://blackfin.uclinux.org/
- *
- * Licensed under the GPL-2 or later.
- */
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/i2c.h>
-#include <linux/slab.h>
-#include <linux/io.h>
-#include <linux/mm.h>
-#include <linux/timer.h>
-#include <linux/spinlock.h>
-#include <linux/completion.h>
-#include <linux/interrupt.h>
-#include <linux/platform_device.h>
-#include <linux/delay.h>
-#include <linux/i2c/bfin_twi.h>
-
-#include <asm/irq.h>
-#include <asm/portmux.h>
-#include <asm/bfin_twi.h>
-
-/* SMBus mode*/
-#define TWI_I2C_MODE_STANDARD		1
-#define TWI_I2C_MODE_STANDARDSUB	2
-#define TWI_I2C_MODE_COMBINED		3
-#define TWI_I2C_MODE_REPEAT		4
-
-static void bfin_twi_handle_interrupt(struct bfin_twi_iface *iface,
-					unsigned short twi_int_status)
-{
-	unsigned short mast_stat = read_MASTER_STAT(iface);
-
-	if (twi_int_status & XMTSERV) {
-		if (iface->writeNum <= 0) {
-			/* start receive immediately after complete sending in
-			 * combine mode.
-			 */
-			if (iface->cur_mode == TWI_I2C_MODE_COMBINED)
-				write_MASTER_CTL(iface,
-					read_MASTER_CTL(iface) | MDIR);
-			else if (iface->manual_stop)
-				write_MASTER_CTL(iface,
-					read_MASTER_CTL(iface) | STOP);
-			else if (iface->cur_mode == TWI_I2C_MODE_REPEAT &&
-				iface->cur_msg + 1 < iface->msg_num) {
-				if (iface->pmsg[iface->cur_msg + 1].flags &
-					I2C_M_RD)
-					write_MASTER_CTL(iface,
-						read_MASTER_CTL(iface) |
-						MDIR);
-				else
-					write_MASTER_CTL(iface,
-						read_MASTER_CTL(iface) &
-						~MDIR);
-			}
-		}
-		/* Transmit next data */
-		while (iface->writeNum > 0 &&
-			(read_FIFO_STAT(iface) & XMTSTAT) != XMT_FULL) {
-			write_XMT_DATA8(iface, *(iface->transPtr++));
-			iface->writeNum--;
-		}
-	}
-	if (twi_int_status & RCVSERV) {
-		while (iface->readNum > 0 &&
-			(read_FIFO_STAT(iface) & RCVSTAT)) {
-			/* Receive next data */
-			*(iface->transPtr) = read_RCV_DATA8(iface);
-			if (iface->cur_mode == TWI_I2C_MODE_COMBINED) {
-				/* Change combine mode into sub mode after
-				 * read first data.
-				 */
-				iface->cur_mode = TWI_I2C_MODE_STANDARDSUB;
-				/* Get read number from first byte in block
-				 * combine mode.
-				 */
-				if (iface->readNum == 1 && iface->manual_stop)
-					iface->readNum = *iface->transPtr + 1;
-			}
-			iface->transPtr++;
-			iface->readNum--;
-		}
-
-		if (iface->readNum == 0) {
-			if (iface->manual_stop) {
-				/* Temporary workaround to avoid possible bus stall -
-				 * Flush FIFO before issuing the STOP condition
-				 */
-				read_RCV_DATA16(iface);
-				write_MASTER_CTL(iface,
-					read_MASTER_CTL(iface) | STOP);
-			} else if (iface->cur_mode == TWI_I2C_MODE_REPEAT &&
-					iface->cur_msg + 1 < iface->msg_num) {
-				if (iface->pmsg[iface->cur_msg + 1].flags & I2C_M_RD)
-					write_MASTER_CTL(iface,
-						read_MASTER_CTL(iface) | MDIR);
-				else
-					write_MASTER_CTL(iface,
-						read_MASTER_CTL(iface) & ~MDIR);
-			}
-		}
-	}
-	if (twi_int_status & MERR) {
-		write_INT_MASK(iface, 0);
-		write_MASTER_STAT(iface, 0x3e);
-		write_MASTER_CTL(iface, 0);
-		iface->result = -EIO;
-
-		if (mast_stat & LOSTARB)
-			dev_dbg(&iface->adap.dev, "Lost Arbitration\n");
-		if (mast_stat & ANAK)
-			dev_dbg(&iface->adap.dev, "Address Not Acknowledged\n");
-		if (mast_stat & DNAK)
-			dev_dbg(&iface->adap.dev, "Data Not Acknowledged\n");
-		if (mast_stat & BUFRDERR)
-			dev_dbg(&iface->adap.dev, "Buffer Read Error\n");
-		if (mast_stat & BUFWRERR)
-			dev_dbg(&iface->adap.dev, "Buffer Write Error\n");
-
-		/* Faulty slave devices, may drive SDA low after a transfer
-		 * finishes. To release the bus this code generates up to 9
-		 * extra clocks until SDA is released.
-		 */
-
-		if (read_MASTER_STAT(iface) & SDASEN) {
-			int cnt = 9;
-			do {
-				write_MASTER_CTL(iface, SCLOVR);
-				udelay(6);
-				write_MASTER_CTL(iface, 0);
-				udelay(6);
-			} while ((read_MASTER_STAT(iface) & SDASEN) && cnt--);
-
-			write_MASTER_CTL(iface, SDAOVR | SCLOVR);
-			udelay(6);
-			write_MASTER_CTL(iface, SDAOVR);
-			udelay(6);
-			write_MASTER_CTL(iface, 0);
-		}
-
-		/* If it is a quick transfer, only address without data,
-		 * not an err, return 1.
-		 */
-		if (iface->cur_mode == TWI_I2C_MODE_STANDARD &&
-			iface->transPtr == NULL &&
-			(twi_int_status & MCOMP) && (mast_stat & DNAK))
-			iface->result = 1;
-
-		complete(&iface->complete);
-		return;
-	}
-	if (twi_int_status & MCOMP) {
-		if (twi_int_status & (XMTSERV | RCVSERV) &&
-			(read_MASTER_CTL(iface) & MEN) == 0 &&
-			(iface->cur_mode == TWI_I2C_MODE_REPEAT ||
-			iface->cur_mode == TWI_I2C_MODE_COMBINED)) {
-			iface->result = -1;
-			write_INT_MASK(iface, 0);
-			write_MASTER_CTL(iface, 0);
-		} else if (iface->cur_mode == TWI_I2C_MODE_COMBINED) {
-			if (iface->readNum == 0) {
-				/* set the read number to 1 and ask for manual
-				 * stop in block combine mode
-				 */
-				iface->readNum = 1;
-				iface->manual_stop = 1;
-				write_MASTER_CTL(iface,
-					read_MASTER_CTL(iface) | (0xff << 6));
-			} else {
-				/* set the readd number in other
-				 * combine mode.
-				 */
-				write_MASTER_CTL(iface,
-					(read_MASTER_CTL(iface) &
-					(~(0xff << 6))) |
-					(iface->readNum << 6));
-			}
-			/* remove restart bit and enable master receive */
-			write_MASTER_CTL(iface,
-				read_MASTER_CTL(iface) & ~RSTART);
-		} else if (iface->cur_mode == TWI_I2C_MODE_REPEAT &&
-				iface->cur_msg + 1 < iface->msg_num) {
-			iface->cur_msg++;
-			iface->transPtr = iface->pmsg[iface->cur_msg].buf;
-			iface->writeNum = iface->readNum =
-				iface->pmsg[iface->cur_msg].len;
-			/* Set Transmit device address */
-			write_MASTER_ADDR(iface,
-				iface->pmsg[iface->cur_msg].addr);
-			if (iface->pmsg[iface->cur_msg].flags & I2C_M_RD)
-				iface->read_write = I2C_SMBUS_READ;
-			else {
-				iface->read_write = I2C_SMBUS_WRITE;
-				/* Transmit first data */
-				if (iface->writeNum > 0) {
-					write_XMT_DATA8(iface,
-						*(iface->transPtr++));
-					iface->writeNum--;
-				}
-			}
-
-			if (iface->pmsg[iface->cur_msg].len <= 255) {
-				write_MASTER_CTL(iface,
-					(read_MASTER_CTL(iface) &
-					(~(0xff << 6))) |
-					(iface->pmsg[iface->cur_msg].len << 6));
-				iface->manual_stop = 0;
-			} else {
-				write_MASTER_CTL(iface,
-					(read_MASTER_CTL(iface) |
-					(0xff << 6)));
-				iface->manual_stop = 1;
-			}
-			/* remove restart bit before last message */
-			if (iface->cur_msg + 1 == iface->msg_num)
-				write_MASTER_CTL(iface,
-					read_MASTER_CTL(iface) & ~RSTART);
-		} else {
-			iface->result = 1;
-			write_INT_MASK(iface, 0);
-			write_MASTER_CTL(iface, 0);
-		}
-		complete(&iface->complete);
-	}
-}
-
-/* Interrupt handler */
-static irqreturn_t bfin_twi_interrupt_entry(int irq, void *dev_id)
-{
-	struct bfin_twi_iface *iface = dev_id;
-	unsigned long flags;
-	unsigned short twi_int_status;
-
-	spin_lock_irqsave(&iface->lock, flags);
-	while (1) {
-		twi_int_status = read_INT_STAT(iface);
-		if (!twi_int_status)
-			break;
-		/* Clear interrupt status */
-		write_INT_STAT(iface, twi_int_status);
-		bfin_twi_handle_interrupt(iface, twi_int_status);
-	}
-	spin_unlock_irqrestore(&iface->lock, flags);
-	return IRQ_HANDLED;
-}
-
-/*
- * One i2c master transfer
- */
-static int bfin_twi_do_master_xfer(struct i2c_adapter *adap,
-				struct i2c_msg *msgs, int num)
-{
-	struct bfin_twi_iface *iface = adap->algo_data;
-	struct i2c_msg *pmsg;
-	int rc = 0;
-
-	if (!(read_CONTROL(iface) & TWI_ENA))
-		return -ENXIO;
-
-	if (read_MASTER_STAT(iface) & BUSBUSY)
-		return -EAGAIN;
-
-	iface->pmsg = msgs;
-	iface->msg_num = num;
-	iface->cur_msg = 0;
-
-	pmsg = &msgs[0];
-	if (pmsg->flags & I2C_M_TEN) {
-		dev_err(&adap->dev, "10 bits addr not supported!\n");
-		return -EINVAL;
-	}
-
-	if (iface->msg_num > 1)
-		iface->cur_mode = TWI_I2C_MODE_REPEAT;
-	iface->manual_stop = 0;
-	iface->transPtr = pmsg->buf;
-	iface->writeNum = iface->readNum = pmsg->len;
-	iface->result = 0;
-	init_completion(&(iface->complete));
-	/* Set Transmit device address */
-	write_MASTER_ADDR(iface, pmsg->addr);
-
-	/* FIFO Initiation. Data in FIFO should be
-	 *  discarded before start a new operation.
-	 */
-	write_FIFO_CTL(iface, 0x3);
-	write_FIFO_CTL(iface, 0);
-
-	if (pmsg->flags & I2C_M_RD)
-		iface->read_write = I2C_SMBUS_READ;
-	else {
-		iface->read_write = I2C_SMBUS_WRITE;
-		/* Transmit first data */
-		if (iface->writeNum > 0) {
-			write_XMT_DATA8(iface, *(iface->transPtr++));
-			iface->writeNum--;
-		}
-	}
-
-	/* clear int stat */
-	write_INT_STAT(iface, MERR | MCOMP | XMTSERV | RCVSERV);
-
-	/* Interrupt mask . Enable XMT, RCV interrupt */
-	write_INT_MASK(iface, MCOMP | MERR | RCVSERV | XMTSERV);
-
-	if (pmsg->len <= 255)
-		write_MASTER_CTL(iface, pmsg->len << 6);
-	else {
-		write_MASTER_CTL(iface, 0xff << 6);
-		iface->manual_stop = 1;
-	}
-
-	/* Master enable */
-	write_MASTER_CTL(iface, read_MASTER_CTL(iface) | MEN |
-		(iface->msg_num > 1 ? RSTART : 0) |
-		((iface->read_write == I2C_SMBUS_READ) ? MDIR : 0) |
-		((CONFIG_I2C_BLACKFIN_TWI_CLK_KHZ > 100) ? FAST : 0));
-
-	while (!iface->result) {
-		if (!wait_for_completion_timeout(&iface->complete,
-			adap->timeout)) {
-			iface->result = -1;
-			dev_err(&adap->dev, "master transfer timeout\n");
-		}
-	}
-
-	if (iface->result == 1)
-		rc = iface->cur_msg + 1;
-	else
-		rc = iface->result;
-
-	return rc;
-}
-
-/*
- * Generic i2c master transfer entrypoint
- */
-static int bfin_twi_master_xfer(struct i2c_adapter *adap,
-				struct i2c_msg *msgs, int num)
-{
-	return bfin_twi_do_master_xfer(adap, msgs, num);
-}
-
-/*
- * One I2C SMBus transfer
- */
-int bfin_twi_do_smbus_xfer(struct i2c_adapter *adap, u16 addr,
-			unsigned short flags, char read_write,
-			u8 command, int size, union i2c_smbus_data *data)
-{
-	struct bfin_twi_iface *iface = adap->algo_data;
-	int rc = 0;
-
-	if (!(read_CONTROL(iface) & TWI_ENA))
-		return -ENXIO;
-
-	if (read_MASTER_STAT(iface) & BUSBUSY)
-		return -EAGAIN;
-
-	iface->writeNum = 0;
-	iface->readNum = 0;
-
-	/* Prepare datas & select mode */
-	switch (size) {
-	case I2C_SMBUS_QUICK:
-		iface->transPtr = NULL;
-		iface->cur_mode = TWI_I2C_MODE_STANDARD;
-		break;
-	case I2C_SMBUS_BYTE:
-		if (data == NULL)
-			iface->transPtr = NULL;
-		else {
-			if (read_write == I2C_SMBUS_READ)
-				iface->readNum = 1;
-			else
-				iface->writeNum = 1;
-			iface->transPtr = &data->byte;
-		}
-		iface->cur_mode = TWI_I2C_MODE_STANDARD;
-		break;
-	case I2C_SMBUS_BYTE_DATA:
-		if (read_write == I2C_SMBUS_READ) {
-			iface->readNum = 1;
-			iface->cur_mode = TWI_I2C_MODE_COMBINED;
-		} else {
-			iface->writeNum = 1;
-			iface->cur_mode = TWI_I2C_MODE_STANDARDSUB;
-		}
-		iface->transPtr = &data->byte;
-		break;
-	case I2C_SMBUS_WORD_DATA:
-		if (read_write == I2C_SMBUS_READ) {
-			iface->readNum = 2;
-			iface->cur_mode = TWI_I2C_MODE_COMBINED;
-		} else {
-			iface->writeNum = 2;
-			iface->cur_mode = TWI_I2C_MODE_STANDARDSUB;
-		}
-		iface->transPtr = (u8 *)&data->word;
-		break;
-	case I2C_SMBUS_PROC_CALL:
-		iface->writeNum = 2;
-		iface->readNum = 2;
-		iface->cur_mode = TWI_I2C_MODE_COMBINED;
-		iface->transPtr = (u8 *)&data->word;
-		break;
-	case I2C_SMBUS_BLOCK_DATA:
-		if (read_write == I2C_SMBUS_READ) {
-			iface->readNum = 0;
-			iface->cur_mode = TWI_I2C_MODE_COMBINED;
-		} else {
-			iface->writeNum = data->block[0] + 1;
-			iface->cur_mode = TWI_I2C_MODE_STANDARDSUB;
-		}
-		iface->transPtr = data->block;
-		break;
-	case I2C_SMBUS_I2C_BLOCK_DATA:
-		if (read_write == I2C_SMBUS_READ) {
-			iface->readNum = data->block[0];
-			iface->cur_mode = TWI_I2C_MODE_COMBINED;
-		} else {
-			iface->writeNum = data->block[0];
-			iface->cur_mode = TWI_I2C_MODE_STANDARDSUB;
-		}
-		iface->transPtr = (u8 *)&data->block[1];
-		break;
-	default:
-		return -1;
-	}
-
-	iface->result = 0;
-	iface->manual_stop = 0;
-	iface->read_write = read_write;
-	iface->command = command;
-	init_completion(&(iface->complete));
-
-	/* FIFO Initiation. Data in FIFO should be discarded before
-	 * start a new operation.
-	 */
-	write_FIFO_CTL(iface, 0x3);
-	write_FIFO_CTL(iface, 0);
-
-	/* clear int stat */
-	write_INT_STAT(iface, MERR | MCOMP | XMTSERV | RCVSERV);
-
-	/* Set Transmit device address */
-	write_MASTER_ADDR(iface, addr);
-
-	switch (iface->cur_mode) {
-	case TWI_I2C_MODE_STANDARDSUB:
-		write_XMT_DATA8(iface, iface->command);
-		write_INT_MASK(iface, MCOMP | MERR |
-			((iface->read_write == I2C_SMBUS_READ) ?
-			RCVSERV : XMTSERV));
-
-		if (iface->writeNum + 1 <= 255)
-			write_MASTER_CTL(iface, (iface->writeNum + 1) << 6);
-		else {
-			write_MASTER_CTL(iface, 0xff << 6);
-			iface->manual_stop = 1;
-		}
-		/* Master enable */
-		write_MASTER_CTL(iface, read_MASTER_CTL(iface) | MEN |
-			((CONFIG_I2C_BLACKFIN_TWI_CLK_KHZ>100) ? FAST : 0));
-		break;
-	case TWI_I2C_MODE_COMBINED:
-		write_XMT_DATA8(iface, iface->command);
-		write_INT_MASK(iface, MCOMP | MERR | RCVSERV | XMTSERV);
-
-		if (iface->writeNum > 0)
-			write_MASTER_CTL(iface, (iface->writeNum + 1) << 6);
-		else
-			write_MASTER_CTL(iface, 0x1 << 6);
-		/* Master enable */
-		write_MASTER_CTL(iface, read_MASTER_CTL(iface) | MEN | RSTART |
-			((CONFIG_I2C_BLACKFIN_TWI_CLK_KHZ>100) ? FAST : 0));
-		break;
-	default:
-		write_MASTER_CTL(iface, 0);
-		if (size != I2C_SMBUS_QUICK) {
-			/* Don't access xmit data register when this is a
-			 * read operation.
-			 */
-			if (iface->read_write != I2C_SMBUS_READ) {
-				if (iface->writeNum > 0) {
-					write_XMT_DATA8(iface,
-						*(iface->transPtr++));
-					if (iface->writeNum <= 255)
-						write_MASTER_CTL(iface,
-							iface->writeNum << 6);
-					else {
-						write_MASTER_CTL(iface,
-							0xff << 6);
-						iface->manual_stop = 1;
-					}
-					iface->writeNum--;
-				} else {
-					write_XMT_DATA8(iface, iface->command);
-					write_MASTER_CTL(iface, 1 << 6);
-				}
-			} else {
-				if (iface->readNum > 0 && iface->readNum <= 255)
-					write_MASTER_CTL(iface,
-						iface->readNum << 6);
-				else if (iface->readNum > 255) {
-					write_MASTER_CTL(iface, 0xff << 6);
-					iface->manual_stop = 1;
-				} else
-					break;
-			}
-		}
-		write_INT_MASK(iface, MCOMP | MERR |
-			((iface->read_write == I2C_SMBUS_READ) ?
-			RCVSERV : XMTSERV));
-
-		/* Master enable */
-		write_MASTER_CTL(iface, read_MASTER_CTL(iface) | MEN |
-			((iface->read_write == I2C_SMBUS_READ) ? MDIR : 0) |
-			((CONFIG_I2C_BLACKFIN_TWI_CLK_KHZ > 100) ? FAST : 0));
-		break;
-	}
-
-	while (!iface->result) {
-		if (!wait_for_completion_timeout(&iface->complete,
-			adap->timeout)) {
-			iface->result = -1;
-			dev_err(&adap->dev, "smbus transfer timeout\n");
-		}
-	}
-
-	rc = (iface->result >= 0) ? 0 : -1;
-
-	return rc;
-}
-
-/*
- * Generic I2C SMBus transfer entrypoint
- */
-int bfin_twi_smbus_xfer(struct i2c_adapter *adap, u16 addr,
-			unsigned short flags, char read_write,
-			u8 command, int size, union i2c_smbus_data *data)
-{
-	return bfin_twi_do_smbus_xfer(adap, addr, flags,
-			read_write, command, size, data);
-}
-
-/*
- * Return what the adapter supports
- */
-static u32 bfin_twi_functionality(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
-	       I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA |
-	       I2C_FUNC_SMBUS_BLOCK_DATA | I2C_FUNC_SMBUS_PROC_CALL |
-	       I2C_FUNC_I2C | I2C_FUNC_SMBUS_I2C_BLOCK;
-}
-
-static struct i2c_algorithm bfin_twi_algorithm = {
-	.master_xfer   = bfin_twi_master_xfer,
-	.smbus_xfer    = bfin_twi_smbus_xfer,
-	.functionality = bfin_twi_functionality,
-};
-
-#ifdef CONFIG_PM_SLEEP
-static int i2c_bfin_twi_suspend(struct device *dev)
-{
-	struct bfin_twi_iface *iface = dev_get_drvdata(dev);
-
-	iface->saved_clkdiv = read_CLKDIV(iface);
-	iface->saved_control = read_CONTROL(iface);
-
-	free_irq(iface->irq, iface);
-
-	/* Disable TWI */
-	write_CONTROL(iface, iface->saved_control & ~TWI_ENA);
-
-	return 0;
-}
-
-static int i2c_bfin_twi_resume(struct device *dev)
-{
-	struct bfin_twi_iface *iface = dev_get_drvdata(dev);
-
-	int rc = request_irq(iface->irq, bfin_twi_interrupt_entry,
-		0, to_platform_device(dev)->name, iface);
-	if (rc) {
-		dev_err(dev, "Can't get IRQ %d !\n", iface->irq);
-		return -ENODEV;
-	}
-
-	/* Resume TWI interface clock as specified */
-	write_CLKDIV(iface, iface->saved_clkdiv);
-
-	/* Resume TWI */
-	write_CONTROL(iface, iface->saved_control);
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(i2c_bfin_twi_pm,
-			 i2c_bfin_twi_suspend, i2c_bfin_twi_resume);
-#define I2C_BFIN_TWI_PM_OPS	(&i2c_bfin_twi_pm)
-#else
-#define I2C_BFIN_TWI_PM_OPS	NULL
-#endif
-
-static int i2c_bfin_twi_probe(struct platform_device *pdev)
-{
-	struct bfin_twi_iface *iface;
-	struct i2c_adapter *p_adap;
-	struct resource *res;
-	int rc;
-	unsigned int clkhilow;
-
-	iface = devm_kzalloc(&pdev->dev, sizeof(struct bfin_twi_iface),
-			GFP_KERNEL);
-	if (!iface) {
-		dev_err(&pdev->dev, "Cannot allocate memory\n");
-		return -ENOMEM;
-	}
-
-	spin_lock_init(&(iface->lock));
-
-	/* Find and map our resources */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	iface->regs_base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(iface->regs_base)) {
-		dev_err(&pdev->dev, "Cannot map IO\n");
-		return PTR_ERR(iface->regs_base);
-	}
-
-	iface->irq = platform_get_irq(pdev, 0);
-	if (iface->irq < 0) {
-		dev_err(&pdev->dev, "No IRQ specified\n");
-		return -ENOENT;
-	}
-
-	p_adap = &iface->adap;
-	p_adap->nr = pdev->id;
-	strlcpy(p_adap->name, pdev->name, sizeof(p_adap->name));
-	p_adap->algo = &bfin_twi_algorithm;
-	p_adap->algo_data = iface;
-	p_adap->class = I2C_CLASS_DEPRECATED;
-	p_adap->dev.parent = &pdev->dev;
-	p_adap->timeout = 5 * HZ;
-	p_adap->retries = 3;
-
-	rc = peripheral_request_list(
-			dev_get_platdata(&pdev->dev),
-			"i2c-bfin-twi");
-	if (rc) {
-		dev_err(&pdev->dev, "Can't setup pin mux!\n");
-		return -EBUSY;
-	}
-
-	rc = devm_request_irq(&pdev->dev, iface->irq, bfin_twi_interrupt_entry,
-		0, pdev->name, iface);
-	if (rc) {
-		dev_err(&pdev->dev, "Can't get IRQ %d !\n", iface->irq);
-		rc = -ENODEV;
-		goto out_error;
-	}
-
-	/* Set TWI internal clock as 10MHz */
-	write_CONTROL(iface, ((get_sclk() / 1000 / 1000 + 5) / 10) & 0x7F);
-
-	/*
-	 * We will not end up with a CLKDIV=0 because no one will specify
-	 * 20kHz SCL or less in Kconfig now. (5 * 1000 / 20 = 250)
-	 */
-	clkhilow = ((10 * 1000 / CONFIG_I2C_BLACKFIN_TWI_CLK_KHZ) + 1) / 2;
-
-	/* Set Twi interface clock as specified */
-	write_CLKDIV(iface, (clkhilow << 8) | clkhilow);
-
-	/* Enable TWI */
-	write_CONTROL(iface, read_CONTROL(iface) | TWI_ENA);
-
-	rc = i2c_add_numbered_adapter(p_adap);
-	if (rc < 0) {
-		dev_err(&pdev->dev, "Can't add i2c adapter!\n");
-		goto out_error;
-	}
-
-	platform_set_drvdata(pdev, iface);
-
-	dev_info(&pdev->dev, "Blackfin BF5xx on-chip I2C TWI Controller, "
-		"regs_base@%p\n", iface->regs_base);
-
-	return 0;
-
-out_error:
-	peripheral_free_list(dev_get_platdata(&pdev->dev));
-	return rc;
-}
-
-static int i2c_bfin_twi_remove(struct platform_device *pdev)
-{
-	struct bfin_twi_iface *iface = platform_get_drvdata(pdev);
-
-	i2c_del_adapter(&(iface->adap));
-	peripheral_free_list(dev_get_platdata(&pdev->dev));
-
-	return 0;
-}
-
-static struct platform_driver i2c_bfin_twi_driver = {
-	.probe		= i2c_bfin_twi_probe,
-	.remove		= i2c_bfin_twi_remove,
-	.driver		= {
-		.name	= "i2c-bfin-twi",
-		.pm	= I2C_BFIN_TWI_PM_OPS,
-	},
-};
-
-static int __init i2c_bfin_twi_init(void)
-{
-	return platform_driver_register(&i2c_bfin_twi_driver);
-}
-
-static void __exit i2c_bfin_twi_exit(void)
-{
-	platform_driver_unregister(&i2c_bfin_twi_driver);
-}
-
-subsys_initcall(i2c_bfin_twi_init);
-module_exit(i2c_bfin_twi_exit);
-
-MODULE_AUTHOR("Bryan Wu, Sonic Zhang");
-MODULE_DESCRIPTION("Blackfin BF5xx on-chip I2C TWI Controller Driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:i2c-bfin-twi");
+_SHIFT 0xc
+#define MC_VM_MB_L1_TLS0_CNTL6__PREFETCH_DONE_MASK 0x2000
+#define MC_VM_MB_L1_TLS0_CNTL6__PREFETCH_DONE__SHIFT 0xd
+#define MC_VM_MB_L1_TLS0_CNTL7__REQ_STREAM_ID_MASK 0x1ff
+#define MC_VM_MB_L1_TLS0_CNTL7__REQ_STREAM_ID__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_CNTL7__EN_MASK 0x1000
+#define MC_VM_MB_L1_TLS0_CNTL7__EN__SHIFT 0xc
+#define MC_VM_MB_L1_TLS0_CNTL7__PREFETCH_DONE_MASK 0x2000
+#define MC_VM_MB_L1_TLS0_CNTL7__PREFETCH_DONE__SHIFT 0xd
+#define MC_VM_MB_L1_TLS0_CNTL8__REQ_STREAM_ID_MASK 0x1ff
+#define MC_VM_MB_L1_TLS0_CNTL8__REQ_STREAM_ID__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_CNTL8__EN_MASK 0x1000
+#define MC_VM_MB_L1_TLS0_CNTL8__EN__SHIFT 0xc
+#define MC_VM_MB_L1_TLS0_CNTL8__PREFETCH_DONE_MASK 0x2000
+#define MC_VM_MB_L1_TLS0_CNTL8__PREFETCH_DONE__SHIFT 0xd
+#define MC_VM_MB_L1_TLS0_START_ADDR0__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR0__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_START_ADDR1__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR1__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_START_ADDR2__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR2__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_START_ADDR3__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR3__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_START_ADDR4__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR4__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_START_ADDR5__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR5__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_START_ADDR6__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR6__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_START_ADDR7__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR7__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_START_ADDR8__START_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_START_ADDR8__START_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR0__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR0__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR1__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR1__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR2__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR2__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR3__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR3__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR4__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR4__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR5__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR5__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR6__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR6__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR7__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR7__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_END_ADDR8__END_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_END_ADDR8__END_ADDR__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__PROTECTIONS_MASK 0xff
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__PROTECTIONS__SHIFT 0x0
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_ID_MASK 0x1ff000
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_ID__SHIFT 0xc
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_RW_MASK 0x1000000
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_RW__SHIFT 0x18
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__VMID_MASK 0x1e000000
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__VMID__SHIFT 0x19
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__ATOMIC_MASK 0x20000000
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_STATUS__ATOMIC__SHIFT 0x1d
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_ADDR__LOGICAL_PAGE_ADDR_MASK 0xfffffff
+#define MC_VM_MB_L1_TLS0_PROTECTION_FAULT_ADDR__LOGICAL_PAGE_ADDR__SHIFT 0x0
+#define MC_SEQ_CNTL__MEM_ADDR_MAP_COLS_MASK 0x3
+#define MC_SEQ_CNTL__MEM_ADDR_MAP_COLS__SHIFT 0x0
+#define MC_SEQ_CNTL__MEM_ADDR_MAP_BANK_MASK 0xc
+#define MC_SEQ_CNTL__MEM_ADDR_MAP_BANK__SHIFT 0x2
+#define MC_SEQ_CNTL__SAFE_MODE_MASK 0x30
+#define MC_SEQ_CNTL__SAFE_MODE__SHIFT 0x4
+#define MC_SEQ_CNTL__DAT_INV_MASK 0x40
+#define MC_SEQ_CNTL__DAT_INV__SHIFT 0x6
+#define MC_SEQ_CNTL__MSK_DF1_MASK 0x80
+#define MC_SEQ_CNTL__MSK_DF1__SHIFT 0x7
+#define MC_SEQ_CNTL__CHANNEL_DISABLE_MASK 0x300
+#define MC_SEQ_CNTL__CHANNEL_DISABLE__SHIFT 0x8
+#define MC_SEQ_CNTL__MSKOFF_DAT_TL_MASK 0x4000
+#define MC_SEQ_CNTL__MSKOFF_DAT_TL__SHIFT 0xe
+#define MC_SEQ_CNTL__MSKOFF_DAT_TH_MASK 0x8000
+#define MC_SEQ_CNTL__MSKOFF_DAT_TH__SHIFT 0xf
+#define MC_SEQ_CNTL__RET_HOLD_EOP_MASK 0x10000
+#define MC_SEQ_CNTL__RET_HOLD_EOP__SHIFT 0x10
+#define MC_SEQ_CNTL__BANKGROUP_SIZE_MASK 0x20000
+#define MC_SEQ_CNTL__BANKGROUP_SIZE__SHIFT 0x11
+#define MC_SEQ_CNTL__BANKGROUP_ENB_MASK 0x40000
+#define MC_SEQ_CNTL__BANKGROUP_ENB__SHIFT 0x12
+#define MC_SEQ_CNTL__RTR_OVERRIDE_MASK 0x80000
+#define MC_SEQ_CNTL__RTR_OVERRIDE__SHIFT 0x13
+#define MC_SEQ_CNTL__ARB_REQCMD_WMK_MASK 0xf00000
+#define MC_SEQ_CNTL__ARB_REQCMD_WMK__SHIFT 0x14
+#define MC_SEQ_CNTL__ARB_REQDAT_WMK_MASK 0xf000000
+#define MC_SEQ_CNTL__ARB_REQDAT_WMK__SHIFT 0x18
+#define MC_SEQ_CNTL__ARB_RTDAT_WMK_MASK 0xf0000000
+#define MC_SEQ_CNTL__ARB_RTDAT_WMK__SHIFT 0x1c
+#define MC_SEQ_CNTL_2__DRST_PDRV_MASK 0xf
+#define MC_SEQ_CNTL_2__DRST_PDRV__SHIFT 0x0
+#define MC_SEQ_CNTL_2__DRST_PU_MASK 0x10
+#define MC_SEQ_CNTL_2__DRST_PU__SHIFT 0x4
+#define MC_SEQ_CNTL_2__DRST_PD_MASK 0x20
+#define MC_SEQ_CNTL_2__DRST_PD__SHIFT 0x5
+#define MC_SEQ_CNTL_2__ARB_RTDAT_WMK_MSB_MASK 0x300
+#define MC_SEQ_CNTL_2__ARB_RTDAT_WMK_MSB__SHIFT 0x8
+#define MC_SEQ_CNTL_2__DRST_NSTR_MASK 0xfc00
+#define MC_SEQ_CNTL_2__DRST_NSTR__SHIFT 0xa
+#define MC_SEQ_CNTL_2__DRST_PSTR_MASK 0x3f0000
+#define MC_SEQ_CNTL_2__DRST_PSTR__SHIFT 0x10
+#define MC_SEQ_CNTL_2__PLL_TX_PWRON_D0_MASK 0x400000
+#define MC_SEQ_CNTL_2__PLL_TX_PWRON_D0__SHIFT 0x16
+#define MC_SEQ_CNTL_2__PLL_TX_PWRON_D1_MASK 0x800000
+#define MC_SEQ_CNTL_2__PLL_TX_PWRON_D1__SHIFT 0x17
+#define MC_SEQ_CNTL_2__PLL_RX_PWRON_D0_MASK 0xf000000
+#define MC_SEQ_CNTL_2__PLL_RX_PWRON_D0__SHIFT 0x18
+#define MC_SEQ_CNTL_2__PLL_RX_PWRON_D1_MASK 0xf0000000
+#define MC_SEQ_CNTL_2__PLL_RX_PWRON_D1__SHIFT 0x1c
+#define MC_SEQ_DRAM__ADR_2CK_MASK 0x1
+#define MC_SEQ_DRAM__ADR_2CK__SHIFT 0x0
+#define MC_SEQ_DRAM__ADR_MUX_MASK 0x2
+#define MC_SEQ_DRAM__ADR_MUX__SHIFT 0x1
+#define MC_SEQ_DRAM__ADR_DF1_MASK 0x4
+#define MC_SEQ_DRAM__ADR_DF1__SHIFT 0x2
+#define MC_SEQ_DRAM__AP8_MASK 0x8
+#define MC_SEQ_DRAM__AP8__SHIFT 0x3
+#define MC_SEQ_DRAM__DAT_DF1_MASK 0x10
+#define MC_SEQ_DRAM__DAT_DF1__SHIFT 0x4
+#define MC_SEQ_DRAM__DQS_DF1_MASK 0x20
+#define MC_SEQ_DRAM__DQS_DF1__SHIFT 0x5
+#define MC_SEQ_DRAM__DQM_DF1_MASK 0x40
+#define MC_SEQ_DRAM__DQM_DF1__SHIFT 0x6
+#define MC_SEQ_DRAM__DQM_ACT_MASK 0x80
+#define MC_SEQ_DRAM__DQM_ACT__SHIFT 0x7
+#define MC_SEQ_DRAM__STB_CNT_MASK 0xf00
+#define MC_SEQ_DRAM__STB_CNT__SHIFT 0x8
+#define MC_SEQ_DRAM__CKE_DYN_MASK 0x1000
+#define MC_SEQ_DRAM__CKE_DYN__SHIFT 0xc
+#define MC_SEQ_DRAM__CKE_ACT_MASK 0x2000
+#define MC_SEQ_DRAM__CKE_ACT__SHIFT 0xd
+#define MC_SEQ_DRAM__BO4_MASK 0x4000
+#define MC_SEQ_DRAM__BO4__SHIFT 0xe
+#define MC_SEQ_DRAM__DLL_CLR_MASK 0x8000
+#define MC_SEQ_DRAM__DLL_CLR__SHIFT 0xf
+#define MC_SEQ_DRAM__DLL_CNT_MASK 0xff0000
+#define MC_SEQ_DRAM__DLL_CNT__SHIFT 0x10
+#define MC_SEQ_DRAM__DAT_INV_MASK 0x1000000
+#define MC_SEQ_DRAM__DAT_INV__SHIFT 0x18
+#define MC_SEQ_DRAM__INV_ACM_MASK 0x2000000
+#define MC_SEQ_DRAM__INV_ACM__SHIFT 0x19
+#define MC_SEQ_DRAM__ODT_ENB_MASK 0x4000000
+#define MC_SEQ_DRAM__ODT_ENB__SHIFT 0x1a
+#define MC_SEQ_DRAM__ODT_ACT_MASK 0x8000000
+#define MC_SEQ_DRAM__ODT_ACT__SHIFT 0x1b
+#define MC_SEQ_DRAM__RST_CTL_MASK 0x10000000
+#define MC_SEQ_DRAM__RST_CTL__SHIFT 0x1c
+#define MC_SEQ_DRAM__TRI_MIO_DYN_MASK 0x20000000
+#define MC_SEQ_DRAM__TRI_MIO_DYN__SHIFT 0x1d
+#define MC_SEQ_DRAM__TRI_CKE_MASK 0x40000000
+#define MC_SEQ_DRAM__TRI_CKE__SHIFT 0x1e
+#define MC_SEQ_DRAM__RDSTRB_RSYC_DIS_MASK 0x80000000
+#define MC_SEQ_DRAM__RDSTRB_RSYC_DIS__SHIFT 0x1f
+#define MC_SEQ_DRAM_2__ADR_DDR_MASK 0x1
+#define MC_SEQ_DRAM_2__ADR_DDR__SHIFT 0x0
+#define MC_SEQ_DRAM_2__ADR_DBI_MASK 0x2
+#define MC_SEQ_DRAM_2__ADR_DBI__SHIFT 0x1
+#define MC_SEQ_DRAM_2__ADR_DBI_ACM_MASK 0x4
+#define MC_SEQ_DRAM_2__ADR_DBI_ACM__SHIFT 0x2
+#define MC_SEQ_DRAM_2__CMD_QDR_MASK 0x8
+#define MC_SEQ_DRAM_2__CMD_QDR__SHIFT 0x3
+#define MC_SEQ_DRAM_2__DAT_QDR_MASK 0x10
+#define MC_SEQ_DRAM_2__DAT_QDR__SHIFT 0x4
+#define MC_SEQ_DRAM_2__WDAT_EDC_MASK 0x20
+#define MC_SEQ_DRAM_2__WDAT_EDC__SHIFT 0x5
+#define MC_SEQ_DRAM_2__RDAT_EDC_MASK 0x40
+#define MC_SEQ_DRAM_2__RDAT_EDC__SHIFT 0x6
+#define MC_SEQ_DRAM_2__DQM_EST_MASK 0x80
+#define MC_SEQ_DRAM_2__DQM_EST__SHIFT 0x7
+#define MC_SEQ_DRAM_2__RD_DQS_MASK 0x100
+#define MC_SEQ_DRAM_2__RD_DQS__SHIFT 0x8
+#define MC_SEQ_DRAM_2__WR_DQS_MASK 0x200
+#define MC_SEQ_DRAM_2__WR_DQS__SHIFT 0x9
+#define MC_SEQ_DRAM_2__PLL_EST_MASK 0x400
+#define MC_SEQ_DRAM_2__PLL_EST__SHIFT 0xa
+#define MC_SEQ_DRAM_2__PLL_CLR_MASK 0x800
+#define MC_SEQ_DRAM_2__PLL_CLR__SHIFT 0xb
+#define MC_SEQ_DRAM_2__DLL_EST_MASK 0x1000
+#define MC_SEQ_DRAM_2__DLL_EST__SHIFT 0xc
+#define MC_SEQ_DRAM_2__BNK_MRS_MASK 0x2000
+#define MC_SEQ_DRAM_2__BNK_MRS__SHIFT 0xd
+#define MC_SEQ_DRAM_2__DBI_OVR_MASK 0x4000
+#define MC_SEQ_DRAM_2__DBI_OVR__SHIFT 0xe
+#define MC_SEQ_DRAM_2__TRI_CLK_MASK 0x8000
+#define MC_SEQ_DRAM_2__TRI_CLK__SHIFT 0xf
+#define MC_SEQ_DRAM_2__PLL_CNT_MASK 0xff0000
+#define MC_SEQ_DRAM_2__PLL_CNT__SHIFT 0x10
+#define MC_SEQ_DRAM_2__PCH_BNK_MASK 0x1000000
+#define MC_SEQ_DRAM_2__PCH_BNK__SHIFT 0x18
+#define MC_SEQ_DRAM_2__ADBI_DF1_MASK 0x2000000
+#define MC_SEQ_DRAM_2__ADBI_DF1__SHIFT 0x19
+#define MC_SEQ_DRAM_2__ADBI_ACT_MASK 0x4000000
+#define MC_SEQ_DRAM_2__ADBI_ACT__SHIFT 0x1a
+#define MC_SEQ_DRAM_2__DBI_DF1_MASK 0x8000000
+#define MC_SEQ_DRAM_2__DBI_DF1__SHIFT 0x1b
+#define MC_SEQ_DRAM_2__DBI_ACT_MASK 0x10000000
+#define MC_SEQ_DRAM_2__DBI_ACT__SHIFT 0x1c
+#define MC_SEQ_DRAM_2__DBI_EDC_DF1_MASK 0x20000000
+#define MC_SEQ_DRAM_2__DBI_EDC_DF1__SHIFT 0x1d
+#define MC_SEQ_DRAM_2__TESTCHIP_EN_MASK 0x40000000
+#define MC_SEQ_DRAM_2__TESTCHIP_EN__SHIFT 0x1e
+#define MC_SEQ_DRAM_2__CS_BY16_MASK 0x80000000
+#define MC_SEQ_DRAM_2__CS_BY16__SHIFT 0x1f
+#define MC_SEQ_RAS_TIMING__TRCDW_MASK 0x1f
+#define MC_SEQ_RAS_TIMING__TRCDW__SHIFT 0x0
+#define MC_SEQ_RAS_TIMING__TRCDWA_MASK 0x3e0
+#define MC_SEQ_RAS_TIMING__TRCDWA__SHIFT 0x5
+#define MC_SEQ_RAS_TIMING__TRCDR_MASK 0x7c00
+#define MC_SEQ_RAS_TIMING__TRCDR__SHIFT 0xa
+#define MC_SEQ_RAS_TIMING__TRCDRA_MASK 0xf8000
+#define MC_SEQ_RAS_TIMING__TRCDRA__SHIFT 0xf
+#define MC_SEQ_RAS_TIMING__TRRD_MASK 0xf00000
+#define MC_SEQ_RAS_TIMING__TRRD__SHIFT 0x14
+#define MC_SEQ_RAS_TIMING__TRC_MASK 0x7f000000
+#define MC_SEQ_RAS_TIMING__TRC__SHIFT 0x18
+#define MC_SEQ_CAS_TIMING__TNOPW_MASK 0x3
+#define MC_SEQ_CAS_TIMING__TNOPW__SHIFT 0x0
+#define MC_SEQ_CAS_TIMING__TNOPR_MASK 0xc
+#define MC_SEQ_CAS_TIMING__TNOPR__SHIFT 0x2
+#define MC_SEQ_CAS_TIMING__TR2W_MASK 0x1f0
+#define MC_SEQ_CAS_TIMING__TR2W__SHIFT 0x4
+#define MC_SEQ_CAS_TIMING__TCCDL_MASK 0xe00
+#define MC_SEQ_CAS_TIMING__TCCDL__SHIFT 0x9
+#define MC_SEQ_CAS_TIMING__TR2R_MASK 0xf000
+#define MC_SEQ_CAS_TIMING__TR2R__SHIFT 0xc
+#define MC_SEQ_CAS_TIMING__TW2R_MASK 0x1f0000
+#define MC_SEQ_CAS_TIMING__TW2R__SHIFT 0x10
+#define MC_SEQ_CAS_TIMING__TCL_MASK 0x1f000000
+#define MC_SEQ_CAS_TIMING__TCL__SHIFT 0x18
+#define MC_SEQ_MISC_TIMING__TRP_WRA_MASK 0x3f
+#define MC_SEQ_MISC_TIMING__TRP_WRA__SHIFT 0x0
+#define MC_SEQ_MISC_TIMING__TRP_RDA_MASK 0x3f00
+#define MC_SEQ_MISC_TIMING__TRP_RDA__SHIFT 0x8
+#define MC_SEQ_MISC_TIMING__TRP_MASK 0xf8000
+#define MC_SEQ_MISC_TIMING__TRP__SHIFT 0xf
+#define MC_SEQ_MISC_TIMING__TRFC_MASK 0x1ff00000
+#define MC_SEQ_MISC_TIMING__TRFC__SHIFT 0x14
+#define MC_SEQ_MISC_TIMING2__PA2RDATA_MASK 0x7
+#define MC_SEQ_MISC_TIMING2__PA2RDATA__SHIFT 0x0
+#define MC_SEQ_MISC_TIMING2__PA2WDATA_MASK 0x70
+#define MC_SEQ_MISC_TIMING2__PA2WDATA__SHIFT 0x4
+#define MC_SEQ_MISC_TIMING2__FAW_MASK 0x1f00
+#define MC_SEQ_MISC_TIMING2__FAW__SHIFT 0x8
+#define MC_SEQ_MISC_TIMING2__TREDC_MASK 0xe000
+#define MC_SEQ_MISC_TIMING2__TREDC__SHIFT 0xd
+#define MC_SEQ_MISC_TIMING2__TWEDC_MASK 0x1f0000
+#define MC_SEQ_MISC_TIMING2__TWEDC__SHIFT 0x10
+#define MC_SEQ_MISC_TIMING2__T32AW_MASK 0x1e00000
+#define MC_SEQ_MISC_TIMING2__T32AW__SHIFT 0x15
+#define MC_SEQ_MISC_TIMING2__TWDATATR_MASK 0xf0000000
+#define MC_SEQ_MISC_TIMING2__TWDATATR__SHIFT 0x1c
+#define MC_SEQ_PMG_TIMING__TCKSRE_MASK 0x7
+#define MC_SEQ_PMG_TIMING__TCKSRE__SHIFT 0x0
+#define MC_SEQ_PMG_TIMING__TCKSRX_MASK 0x70
+#define MC_SEQ_PMG_TIMING__TCKSRX__SHIFT 0x4
+#define MC_SEQ_PMG_TIMING__TCKE_PULSE_MASK 0xf00
+#define MC_SEQ_PMG_TIMING__TCKE_PULSE__SHIFT 0x8
+#define MC_SEQ_PMG_TIMING__TCKE_MASK 0x3f000
+#define MC_SEQ_PMG_TIMING__TCKE__SHIFT 0xc
+#define MC_SEQ_PMG_TIMING__SEQ_IDLE_MASK 0x1c0000
+#define MC_SEQ_PMG_TIMING__SEQ_IDLE__SHIFT 0x12
+#define MC_SEQ_PMG_TIMING__TCKE_PULSE_MSB_MASK 0x800000
+#define MC_SEQ_PMG_TIMING__TCKE_PULSE_MSB__SHIFT 0x17
+#define MC_SEQ_PMG_TIMING__SEQ_IDLE_SS_MASK 0xff000000
+#define MC_SEQ_PMG_TIMING__SEQ_IDLE_SS__SHIFT 0x18
+#define MC_SEQ_RD_CTL_D0__RCV_DLY_MASK 0x7
+#define MC_SEQ_RD_CTL_D0__RCV_DLY__SHIFT 0x0
+#define MC_SEQ_RD_CTL_D0__RCV_EXT_MASK 0xf8
+#define MC_SEQ_RD_CTL_D0__RCV_EXT__SHIFT 0x3
+#define MC_SEQ_RD_CTL_D0__RST_SEL_MASK 0x300
+#define MC_SEQ_RD_CTL_D0__RST_SEL__SHIFT 0x8
+#define MC_SEQ_RD_CTL_D0__RXDPWRON_DLY_MASK 0xc00
+#define MC_SEQ_RD_CTL_D0__RXDPWRON_DLY__SHIFT 0xa
+#define MC_SEQ_RD_CTL_D0__RST_HLD_MASK 0xf000
+#define MC_SEQ_RD_CTL_D0__RST_HLD__SHIFT 0xc
+#define MC_SEQ_RD_CTL_D0__STR_PRE_MASK 0x10000
+#define MC_SEQ_RD_CTL_D0__STR_PRE__SHIFT 0x10
+#define MC_SEQ_RD_CTL_D0__STR_PST_MASK 0x20000
+#define MC_SEQ_RD_CTL_D0__STR_PST__SHIFT 0x11
+#define MC_SEQ_RD_CTL_D0__RBS_DLY_MASK 0x1f00000
+#define MC_SEQ_RD_CTL_D0__RBS_DLY__SHIFT 0x14
+#define MC_SEQ_RD_CTL_D0__RBS_WEDC_DLY_MASK 0x3e000000
+#define MC_SEQ_RD_CTL_D0__RBS_WEDC_DLY__SHIFT 0x19
+#define MC_SEQ_RD_CTL_D1__RCV_DLY_MASK 0x7
+#define MC_SEQ_RD_CTL_D1__RCV_DLY__SHIFT 0x0
+#define MC_SEQ_RD_CTL_D1__RCV_EXT_MASK 0xf8
+#define MC_SEQ_RD_CTL_D1__RCV_EXT__SHIFT 0x3
+#define MC_SEQ_RD_CTL_D1__RST_SEL_MASK 0x300
+#define MC_SEQ_RD_CTL_D1__RST_SEL__SHIFT 0x8
+#define MC_SEQ_RD_CTL_D1__RXDPWRON_DLY_MASK 0xc00
+#define MC_SEQ_RD_CTL_D1__RXDPWRON_DLY__SHIFT 0xa
+#define MC_SEQ_RD_CTL_D1__RST_HLD_MASK 0xf000
+#define MC_SEQ_RD_CTL_D1__RST_HLD__SHIFT 0xc
+#define MC_SEQ_RD_CTL_D1__STR_PRE_MASK 0x10000
+#define MC_SEQ_RD_CTL_D1__STR_PRE__SHIFT 0x10
+#define MC_SEQ_RD_CTL_D1__STR_PST_MASK 0x20000
+#define MC_SEQ_RD_CTL_D1__STR_PST__SHIFT 0x11
+#define MC_SEQ_RD_CTL_D1__RBS_DLY_MASK 0x1f00000
+#define MC_SEQ_RD_CTL_D1__RBS_DLY__SHIFT 0x14
+#define MC_SEQ_RD_CTL_D1__RBS_WEDC_DLY_MASK 0x3e000000
+#define MC_SEQ_RD_CTL_D1__RBS_WEDC_DLY__SHIFT 0x19
+#define MC_SEQ_WR_CTL_D0__DAT_DLY_MASK 0xf
+#define MC_SEQ_WR_CTL_D0__DAT_DLY__SHIFT 0x0
+#define MC_SEQ_WR_CTL_D0__DQS_DLY_MASK 0xf0
+#define MC_SEQ_WR_CTL_D0__DQS_DLY__SHIFT 0x4
+#define MC_SEQ_WR_CTL_D0__DQS_XTR_MASK 0x100
+#define MC_SEQ_WR_CTL_D0__DQS_XTR__SHIFT 0x8
+#define MC_SEQ_WR_CTL_D0__DAT_2Y_DLY_MASK 0x200
+#define MC_SEQ_WR_CTL_D0__DAT_2Y_DLY__SHIFT 0x9
+#define MC_SEQ_WR_CTL_D0__ADR_2Y_DLY_MASK 0x400
+#define MC_SEQ_WR_CTL_D0__ADR_2Y_DLY__SHIFT 0xa
+#define MC_SEQ_WR_CTL_D0__CMD_2Y_DLY_MASK 0x800
+#define MC_SEQ_WR_CTL_D0__CMD_2Y_DLY__SHIFT 0xb
+#define MC_SEQ_WR_CTL_D0__OEN_DLY_MASK 0xf000
+#define MC_SEQ_WR_CTL_D0__OEN_DLY__SHIFT 0xc
+#define MC_SEQ_WR_CTL_D0__OEN_EXT_MASK 0xf0000
+#define MC_SEQ_WR_CTL_D0__OEN_EXT__SHIFT 0x10
+#define MC_SEQ_WR_CTL_D0__OEN_SEL_MASK 0x300000
+#define MC_SEQ_WR_CTL_D0__OEN_SEL__SHIFT 0x14
+#define MC_SEQ_WR_CTL_D0__ODT_DLY_MASK 0xf000000
+#define MC_SEQ_WR_CTL_D0__ODT_DLY__SHIFT 0x18
+#define MC_SEQ_WR_CTL_D0__ODT_EXT_MASK 0x10000000
+#define MC_SEQ_WR_CTL_D0__ODT_EXT__SHIFT 0x1c
+#define MC_SEQ_WR_CTL_D0__ADR_DLY_MASK 0x20000000
+#define MC_SEQ_WR_CTL_D0__ADR_DLY__SHIFT 0x1d
+#define MC_SEQ_WR_CTL_D0__CMD_DLY_MASK 0x40000000
+#define MC_SEQ_WR_CTL_D0__CMD_DLY__SHIFT 0x1e
+#define MC_SEQ_WR_CTL_D1__DAT_DLY_MASK 0xf
+#define MC_SEQ_WR_CTL_D1__DAT_DLY__SHIFT 0x0
+#define MC_SEQ_WR_CTL_D1__DQS_DLY_MASK 0xf0
+#define MC_SEQ_WR_CTL_D1__DQS_DLY__SHIFT 0x4
+#define MC_SEQ_WR_CTL_D1__DQS_XTR_MASK 0x100
+#define MC_SEQ_WR_CTL_D1__DQS_XTR__SHIFT 0x8
+#define MC_SEQ_WR_CTL_D1__DAT_2Y_DLY_MASK 0x200
+#define MC_SEQ_WR_CTL_D1__DAT_2Y_DLY__SHIFT 0x9
+#define MC_SEQ_WR_CTL_D1__ADR_2Y_DLY_MASK 0x400
+#define MC_SEQ_WR_CTL_D1__ADR_2Y_DLY__SHIFT 0xa
+#define MC_SEQ_WR_CTL_D1__CMD_2Y_DLY_MASK 0x800
+#define MC_SEQ_WR_CTL_D1__CMD_2Y_DLY__SHIFT 0xb
+#define MC_SEQ_WR_CTL_D1__OEN_DLY_MASK 0xf000
+#define MC_SEQ_WR_CTL_D1__OEN_DLY__SHIFT 0xc
+#define MC_SEQ_WR_CTL_D1__OEN_EXT_MASK 0xf0000
+#define MC_SEQ_WR_CTL_D1__OEN_EXT__SHIFT 0x10
+#define MC_SEQ_WR_CTL_D1__OEN_SEL_MASK 0x300000
+#define MC_SEQ_WR_CTL_D1__OEN_SEL__SHIFT 0x14
+#define MC_SEQ_WR_CTL_D1__ODT_DLY_MASK 0xf000000
+#define MC_SEQ_WR_CTL_D1__ODT_DLY__SHIFT 0x18
+#define MC_SEQ_WR_CTL_D1__ODT_EXT_MASK 0x10000000
+#define MC_SEQ_WR_CTL_D1__ODT_EXT__SHIFT 0x1c
+#define MC_SEQ_WR_CTL_D1__ADR_DLY_MASK 0x20000000
+#define MC_SEQ_WR_CTL_D1__ADR_DLY__SHIFT 0x1d
+#define MC_SEQ_WR_CTL_D1__CMD_DLY_MASK 0x40000000
+#define MC_SEQ_WR_CTL_D1__CMD_DLY__SHIFT 0x1e
+#define MC_SEQ_WR_CTL_2__DAT_DLY_H_D0_MASK 0x1
+#define MC_SEQ_WR_CTL_2__DAT_DLY_H_D0__SHIFT 0x0
+#define MC_SEQ_WR_CTL_2__DQS_DLY_H_D0_MASK 0x2
+#define MC_SEQ_WR_CTL_2__DQS_DLY_H_D0__SHIFT 0x1
+#define MC_SEQ_WR_CTL_2__OEN_DLY_H_D0_MASK 0x4
+#define MC_SEQ_WR_CTL_2__OEN_DLY_H_D0__SHIFT 0x2
+#define MC_SEQ_WR_CTL_2__DAT_DLY_H_D1_MASK 0x8
+#define MC_SEQ_WR_CTL_2__DAT_DLY_H_D1__SHIFT 0x3
+#define MC_SEQ_WR_CTL_2__DQS_DLY_H_D1_MASK 0x10
+#define MC_SEQ_WR_CTL_2__DQS_DLY_H_D1__SHIFT 0x4
+#define MC_SEQ_WR_CTL_2__OEN_DLY_H_D1_MASK 0x20
+#define MC_SEQ_WR_CTL_2__OEN_DLY_H_D1__SHIFT 0x5
+#define MC_SEQ_WR_CTL_2__WCDR_EN_MASK 0x40
+#define MC_SEQ_WR_CTL_2__WCDR_EN__SHIFT 0x6
+#define MC_SEQ_CMD__ADR_MASK 0xffff
+#define MC_SEQ_CMD__ADR__SHIFT 0x0
+#define MC_SEQ_CMD__MOP_MASK 0xf0000
+#define MC_SEQ_CMD__MOP__SHIFT 0x10
+#define MC_SEQ_CMD__END_MASK 0x100000
+#define MC_SEQ_CMD__END__SHIFT 0x14
+#define MC_SEQ_CMD__CSB_MASK 0x600000
+#define MC_SEQ_CMD__CSB__SHIFT 0x15
+#define MC_SEQ_CMD__CHAN0_MASK 0x1000000
+#define MC_SEQ_CMD__CHAN0__SHIFT 0x18
+#define MC_SEQ_CMD__CHAN1_MASK 0x2000000
+#define MC_SEQ_CMD__CHAN1__SHIFT 0x19
+#define MC_SEQ_CMD__ADR_MSB1_MASK 0x10000000
+#define MC_SEQ_CMD__ADR_MSB1__SHIFT 0x1c
+#define MC_SEQ_CMD__ADR_MSB0_MASK 0x20000000
+#define MC_SEQ_CMD__ADR_MSB0__SHIFT 0x1d
+#define MC_PMG_CMD_EMRS__ADR_MASK 0xffff
+#define MC_PMG_CMD_EMRS__ADR__SHIFT 0x0
+#define MC_PMG_CMD_EMRS__MOP_MASK 0x70000
+#define MC_PMG_CMD_EMRS__MOP__SHIFT 0x10
+#define MC_PMG_CMD_EMRS__BNK_MSB_MASK 0x80000
+#define MC_PMG_CMD_EMRS__BNK_MSB__SHIFT 0x13
+#define MC_PMG_CMD_EMRS__END_MASK 0x100000
+#define MC_PMG_CMD_EMRS__END__SHIFT 0x14
+#define MC_PMG_CMD_EMRS__CSB_MASK 0x600000
+#define MC_PMG_CMD_EMRS__CSB__SHIFT 0x15
+#define MC_PMG_CMD_EMRS__ADR_MSB1_MASK 0x10000000
+#define MC_PMG_CMD_EMRS__ADR_MSB1__SHIFT 0x1c
+#define MC_PMG_CMD_EMRS__ADR_MSB0_MASK 0x20000000
+#define MC_PMG_CMD_EMRS__ADR_MSB0__SHIFT 0x1d
+#define MC_PMG_CMD_MRS__ADR_MASK 0xffff
+#define MC_PMG_CMD_MRS__ADR__SHIFT 0x0
+#define MC_PMG_CMD_MRS__MOP_MASK 0x70000
+#define MC_PMG_CMD_MRS__MOP__SHIFT 0x

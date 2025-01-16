@@ -1,133 +1,121 @@
-/*
- *  Copyright IBM Corp. 2008
- *  Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com)
- */
-
-#define KMSG_COMPONENT "cpu"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
-
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/seq_file.h>
-#include <linux/delay.h>
-#include <linux/cpu.h>
-#include <asm/diag.h>
-#include <asm/elf.h>
-#include <asm/facility.h>
-#include <asm/lowcore.h>
-#include <asm/param.h>
-#include <asm/smp.h>
-
-static DEFINE_PER_CPU(struct cpuid, cpu_id);
-
-void notrace cpu_relax(void)
-{
-	if (!smp_cpu_mtid && MACHINE_HAS_DIAG44) {
-		diag_stat_inc(DIAG_STAT_X044);
-		asm volatile("diag 0,0,0x44");
+    md->phys_addr + efi_md_size(md),
+                       vaddr & mask, (vaddr & mask) + IA64_GRANULE_SIZE);
+#endif
+		return __va(md->phys_addr);
 	}
-	barrier();
-}
-EXPORT_SYMBOL(cpu_relax);
-
-/*
- * cpu_init - initializes state that is per-CPU.
- */
-void cpu_init(void)
-{
-	struct cpuid *id = this_cpu_ptr(&cpu_id);
-
-	get_cpu_id(id);
-	atomic_inc(&init_mm.mm_count);
-	current->active_mm = &init_mm;
-	BUG_ON(current->mm);
-	enter_lazy_tlb(&init_mm, current);
+	printk(KERN_WARNING "%s: no PAL-code memory-descriptor found\n",
+	       __func__);
+	return NULL;
 }
 
-/*
- * cpu_have_feature - Test CPU features on module initialization
- */
-int cpu_have_feature(unsigned int num)
+
+static u8 __init palo_checksum(u8 *buffer, u32 length)
 {
-	return elf_hwcap & (1UL << num);
+	u8 sum = 0;
+	u8 *end = buffer + length;
+
+	while (buffer < end)
+		sum = (u8) (sum + *(buffer++));
+
+	return sum;
 }
-EXPORT_SYMBOL(cpu_have_feature);
 
 /*
- * show_cpuinfo - Get information on one CPU for use by procfs.
+ * Parse and handle PALO table which is published at:
+ * http://www.dig64.org/home/DIG64_PALO_R1_0.pdf
  */
-static int show_cpuinfo(struct seq_file *m, void *v)
+static void __init handle_palo(unsigned long phys_addr)
 {
-	static const char *hwcap_str[] = {
-		"esan3", "zarch", "stfle", "msa", "ldisp", "eimm", "dfp",
-		"edat", "etf3eh", "highgprs", "te", "vx"
-	};
-	unsigned long n = (unsigned long) v - 1;
+	struct palo_table *palo = __va(phys_addr);
+	u8  checksum;
+
+	if (strncmp(palo->signature, PALO_SIG, sizeof(PALO_SIG) - 1)) {
+		printk(KERN_INFO "PALO signature incorrect.\n");
+		return;
+	}
+
+	checksum = palo_checksum((u8 *)palo, palo->length);
+	if (checksum) {
+		printk(KERN_INFO "PALO checksum incorrect.\n");
+		return;
+	}
+
+	setup_ptcg_sem(palo->max_tlb_purges, NPTCG_FROM_PALO);
+}
+
+void
+efi_map_pal_code (void)
+{
+	void *pal_vaddr = efi_get_pal_addr ();
+	u64 psr;
+
+	if (!pal_vaddr)
+		return;
+
+	/*
+	 * Cannot write to CRx with PSR.ic=1
+	 */
+	psr = ia64_clear_ic();
+	ia64_itr(0x1, IA64_TR_PALCODE,
+		 GRANULEROUNDDOWN((unsigned long) pal_vaddr),
+		 pte_val(pfn_pte(__pa(pal_vaddr) >> PAGE_SHIFT, PAGE_KERNEL)),
+		 IA64_GRANULE_SHIFT);
+	ia64_set_psr(psr);		/* restore psr */
+}
+
+void __init
+efi_init (void)
+{
+	void *efi_map_start, *efi_map_end;
+	efi_char16_t *c16;
+	u64 efi_desc_size;
+	char *cp, vendor[100] = "unknown";
 	int i;
 
-	if (!n) {
-		s390_adjust_jiffies();
-		seq_printf(m, "vendor_id       : IBM/S390\n"
-			   "# processors    : %i\n"
-			   "bogomips per cpu: %lu.%02lu\n",
-			   num_online_cpus(), loops_per_jiffy/(500000/HZ),
-			   (loops_per_jiffy/(5000/HZ))%100);
-		seq_puts(m, "features\t: ");
-		for (i = 0; i < ARRAY_SIZE(hwcap_str); i++)
-			if (hwcap_str[i] && (elf_hwcap & (1UL << i)))
-				seq_printf(m, "%s ", hwcap_str[i]);
-		seq_puts(m, "\n");
-		show_cacheinfo(m);
+	set_bit(EFI_BOOT, &efi.flags);
+	set_bit(EFI_64BIT, &efi.flags);
+
+	/*
+	 * It's too early to be able to use the standard kernel command line
+	 * support...
+	 */
+	for (cp = boot_command_line; *cp; ) {
+		if (memcmp(cp, "mem=", 4) == 0) {
+			mem_limit = memparse(cp + 4, &cp);
+		} else if (memcmp(cp, "max_addr=", 9) == 0) {
+			max_addr = GRANULEROUNDDOWN(memparse(cp + 9, &cp));
+		} else if (memcmp(cp, "min_addr=", 9) == 0) {
+			min_addr = GRANULEROUNDDOWN(memparse(cp + 9, &cp));
+		} else {
+			while (*cp != ' ' && *cp)
+				++cp;
+			while (*cp == ' ')
+				++cp;
+		}
 	}
-	get_online_cpus();
-	if (cpu_online(n)) {
-		struct cpuid *id = &per_cpu(cpu_id, n);
-		seq_printf(m, "processor %li: "
-			   "version = %02X,  "
-			   "identification = %06X,  "
-			   "machine = %04X\n",
-			   n, id->version, id->ident, id->machine);
-	}
-	put_online_cpus();
-	return 0;
-}
+	if (min_addr != 0UL)
+		printk(KERN_INFO "Ignoring memory below %lluMB\n",
+		       min_addr >> 20);
+	if (max_addr != ~0UL)
+		printk(KERN_INFO "Ignoring memory above %lluMB\n",
+		       max_addr >> 20);
 
-static void *c_start(struct seq_file *m, loff_t *pos)
-{
-	return *pos < nr_cpu_ids ? (void *)((unsigned long) *pos + 1) : NULL;
-}
+	efi.systab = __va(ia64_boot_param->efi_systab);
 
-static void *c_next(struct seq_file *m, void *v, loff_t *pos)
-{
-	++*pos;
-	return c_start(m, pos);
-}
+	/*
+	 * Verify the EFI Table
+	 */
+	if (efi.systab == NULL)
+		panic("Whoa! Can't find EFI system table.\n");
+	if (efi.systab->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+		panic("Whoa! EFI system table signature incorrect\n");
+	if ((efi.systab->hdr.revision >> 16) == 0)
+		printk(KERN_WARNING "Warning: EFI system table version "
+		       "%d.%02d, expected 1.00 or greater\n",
+		       efi.systab->hdr.revision >> 16,
+		       efi.systab->hdr.revision & 0xffff);
 
-static void c_stop(struct seq_file *m, void *v)
-{
-}
-
-const struct seq_operations cpuinfo_op = {
-	.start	= c_start,
-	.next	= c_next,
-	.stop	= c_stop,
-	.show	= show_cpuinfo,
-};
-
-int s390_isolate_bp(void)
-{
-	if (!test_facility(82))
-		return -EOPNOTSUPP;
-	set_thread_flag(TIF_ISOLATE_BP);
-	return 0;
-}
-EXPORT_SYMBOL(s390_isolate_bp);
-
-int s390_isolate_bp_guest(void)
-{
-	if (!test_facility(82))
-		return -EOPNOTSUPP;
-	set_thread_flag(TIF_ISOLATE_BP_GUEST);
-	return 0;
-}
-EXPORT_SYMBOL(s390_isolate_bp_guest);
+	/* Show what we know for posterity */
+	c16 = __va(efi.systab->fw_vendor);
+	if (c16) {
+		for (i = 0;i < (

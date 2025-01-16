@@ -1,64 +1,1 @@
-/* ld script to make m68k Linux kernel */
-
-#include <asm-generic/vmlinux.lds.h>
-#include <asm/page.h>
-#include <asm/thread_info.h>
-
-OUTPUT_FORMAT("elf32-m68k", "elf32-m68k", "elf32-m68k")
-OUTPUT_ARCH(m68k)
-ENTRY(_start)
-jiffies = jiffies_64 + 4;
-SECTIONS
-{
-  . = 0x1000;
-  _text = .;			/* Text and read-only data */
-  .text : {
-	HEAD_TEXT
-	TEXT_TEXT
-	SCHED_TEXT
-	CPUIDLE_TEXT
-	LOCK_TEXT
-	*(.fixup)
-	*(.gnu.warning)
-	} :text = 0x4e75
-
-  _etext = .;			/* End of text section */
-
-  EXCEPTION_TABLE(16)
-
-  _sdata = .;			/* Start of data section */
-
-  RODATA
-
-  RW_DATA_SECTION(16, PAGE_SIZE, THREAD_SIZE)
-
-  BSS_SECTION(0, 0, 0)
-
-  _edata = .;			/* End of data section */
-
-  /* will be freed after init */
-  . = ALIGN(PAGE_SIZE);		/* Init code and data */
-  __init_begin = .;
-  INIT_TEXT_SECTION(PAGE_SIZE) :data
-  INIT_DATA_SECTION(16)
-  .m68k_fixup : {
-	__start_fixup = .;
-	*(.m68k_fixup)
-	__stop_fixup = .;
-  }
-  NOTES
-  .init_end : {
-	/* This ALIGN be in a section so that _end is at the end of the
-	   load segment. */
-	. = ALIGN(PAGE_SIZE);
-	__init_end = .;
-  }
-
-  _end = . ;
-
-  STABS_DEBUG
-  .comment 0 : { *(.comment) }
-
-  /* Sections to be discarded */
-  DISCARDS
-}
+Pร2Pร2่ม2่ม2่ม2่ม2ลม2ลม2ลม2ลม2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2่ม2่ม2่ม2่ม2ลม2ลม2ลม2ลม2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Mย2Pร2Mย2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2Pร2”ม2๕ม2ลม2หม2”ม2๕ม2ลม2หม2Mย2Mย2Mย2Pร2Pร2Pร2Pร2ย2…ย2ฝย2ร2Pร2Pร2Pร2Pร2”ม2๕ม2ลม2หม2Pร2Pร2Pร2Pร2๕ม2”ม2Xย2cย2Pร2Pร2Pร2Pร2”ม2๕ม2ลม2หม2Pร2Pร2Pร2Pร2”ม2๕ม2ลม2หม2Pร2Pร2Pร2Pร2”ม2๕ม2ลม2หม2Pร2Pร2Pร2Pร2”ม2๕ม2ลม2หม2-ร2ร2ร2ร2ร2ร2;ม2;ม2;ม2;ม2;ม2;ม2;ม2;ม2;ม2;ม2;ม2;ม2๊ม2๊ม2๊ม2มม2๊ม2๊ม2๊ม2๊ม2๊ม2ย2๊ม2๊ม2๊ม2;ม2Yม2Yม2๊ม2๊ม2๊ม2๊ม2๊ม2มม2Yม2Yม2๊ม2๊ม2๊ม2๊ม2๊ม2๊ม2๊ม2ย2ย2ย2{ล2{ล2ฤ2ฤ2ฤ2mฦ2ฤ2ฤ2mฦ2บว29ว2ว2Aฦ2เร2เร2ว2Aฦ2เร2กฦ2กฦ2กฦ2กฦ2กฦ2กฦ2Lฦ2Lฦ2Lฦ2เร2เร2เร2เร2เร2Aฦ2Aฦ2Aฦ2รว2Oล27ล2Oล2Gฦ2Gฦ2Gฦ2เร2เร2เร2เร27ล27ล2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2เร2—ฤ27ล2๕ว2กฦ2ว2ล23ฤ2ฤย2ฤย2ฤย2ฤย2ฤย2ฤย2๑ล2%ล2ฤย23ฤ2ฤย2%ล2

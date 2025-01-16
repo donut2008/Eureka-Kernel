@@ -1,49 +1,24 @@
-/* Driver for USB Mass Storage compliant devices
- * SCSI Connecting Glue Header File
- *
- * Current development and maintenance by:
- *   (c) 1999, 2000 Matthew Dharm (mdharm-usb@one-eyed-alien.net)
- *
- * This driver is based on the 'USB Mass Storage Class' document. This
- * describes in detail the protocol used to communicate with such
- * devices.  Clearly, the designers had SCSI and ATAPI commands in
- * mind when they created this document.  The commands are all very
- * similar to commands in the SCSI-II and ATAPI specifications.
- *
- * It is important to note that in a number of cases this class
- * exhibits class-specific exemptions from the USB specification.
- * Notably the usage of NAK, STALL and ACK differs from the norm, in
- * that they are used to communicate wait, failed and OK on commands.
- *
- * Also, for certain devices, the interrupt endpoint is used to convey
- * status of a command.
- *
- * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
- * information about this driver.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#ifndef _SCSIGLUE_H_
-#define _SCSIGLUE_H_
-
-extern void usb_stor_report_device_reset(struct us_data *us);
-extern void usb_stor_report_bus_reset(struct us_data *us);
-extern void usb_stor_host_template_init(struct scsi_host_template *sht,
-					const char *name, struct module *owner);
-
-extern unsigned char usb_stor_sense_invalidCDB[18];
-
-#endif
+                    0x4000041
+#define ixD2F3_PCIE_VENDOR_SPECIFIC1                                            0x4000042
+#define ixD2F3_PCIE_VENDOR_SPECIFIC2                                            0x4000043
+#define ixD2F3_PCIE_VC_ENH_CAP_LIST                                             0x4000044
+#define ixD2F3_PCIE_PORT_VC_CAP_REG1                                            0x4000045
+#define ixD2F3_PCIE_PORT_VC_CAP_REG2                                            0x4000046
+#define ixD2F3_PCIE_PORT_VC_CNTL                                                0x4000047
+#define ixD2F3_PCIE_PORT_VC_STATUS                                              0x4000047
+#define ixD2F3_PCIE_VC0_RESOURCE_CAP                                            0x4000048
+#define ixD2F3_PCIE_VC0_RESOURCE_CNTL                                           0x4000049
+#define ixD2F3_PCIE_VC0_RESOURCE_STATUS                                         0x400004a
+#define ixD2F3_PCIE_VC1_RESOURCE_CAP                                            0x400004b
+#define ixD2F3_PCIE_VC1_RESOURCE_CNTL                                           0x400004c
+#define ixD2F3_PCIE_VC1_RESOURCE_STATUS                                         0x400004d
+#define ixD2F3_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST                                 0x4000050
+#define ixD2F3_PCIE_DEV_SERIAL_NUM_DW1                                          0x4000051
+#define ixD2F3_PCIE_DEV_SERIAL_NUM_DW2                                          0x4000052
+#define ixD2F3_PCIE_ADV_ERR_RPT_ENH_CAP_LIST                                    0x4000054
+#define ixD2F3_PCIE_UNCORR_ERR_STATUS                                           0x4000055
+#define ixD2F3_PCIE_UNCORR_ERR_MASK                                             0x4000056
+#define ixD2F3_PCIE_UNCORR_ERR_SEVERITY                                         0x4000057
+#define ixD2F3_PCIE_CORR_ERR_STATUS                                             0x4000058
+#define ixD2F3_PCIE_CORR_ERR_MASK                                               0x4000059
+#define ixD2F3_PCIE_ADV_ERR_CAP_CNTL 

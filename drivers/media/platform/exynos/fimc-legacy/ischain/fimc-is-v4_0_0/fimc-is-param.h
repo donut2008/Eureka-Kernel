@@ -1,1377 +1,41 @@
-/*
- * Samsung Exynos5 SoC series FIMC-IS driver
- *
- *
- * Copyright (c) 2011 Samsung Electronics Co., Ltd
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#ifndef FIMC_IS_PARAMS_H
-#define FIMC_IS_PARAMS_H
-
-#define IS_REGION_VER 150  /* IS REGION VERSION 1.50 */
-
-#define MAGIC_NUMBER 0x01020304
-
-#define PARAMETER_MAX_SIZE    128  /* in byte */
-#define PARAMETER_MAX_MEMBER  (PARAMETER_MAX_SIZE/4)
-
-#define INC_BIT(bit)			(bit<<1)
-#define INC_NUM(bit)			(bit + 1)
-#define LOWBIT_OF_NUM(num)		(num >= 32 ? 0 : 1<<num)
-#define HIGHBIT_OF_NUM(num)		(num >= 32 ? 1<<(num-32) : 0)
-
-enum is_param {
-	PARAM_GLOBAL_SHOTMODE = 0,
-	PARAM_SENSOR_CONTROL,
-	PARAM_SENSOR_OTF_INPUT,
-	PARAM_SENSOR_OTF_OUTPUT,
-	PARAM_SENSOR_CONFIG,
-	PARAM_SENSOR_DMA_OUTPUT,
-#if 0
-	PARAM_BUFFER_CONTROL,
-	PARAM_BUFFER_OTF_INPUT,
-	PARAM_BUFFER_OTF_OUTPUT,
-	PARAM_3AA_CONTROL,
-#else
-	PARAM_TAALG_AE_CONFIG,
-	PARAM_TAALG_RESERVED1,
-	PARAM_TAALG_RESERVED2,
-	PARAM_3AA_CONTROL,
-#endif
-	PARAM_3AA_OTF_INPUT,
-	PARAM_3AA_VDMA1_INPUT,
-	PARAM_3AA_DDMA_INPUT,
-	PARAM_3AA_OTF_OUTPUT,
-	PARAM_3AA_VDMA4_OUTPUT,
-	PARAM_3AA_VDMA2_OUTPUT,
-	PARAM_3AA_DDMA_OUTPUT,
-	PARAM_ISP_CONTROL,
-	PARAM_ISP_OTF_INPUT,
-	PARAM_ISP_VDMA1_INPUT,
-	PARAM_ISP_VDMA3_INPUT,
-	PARAM_ISP_OTF_OUTPUT,
-	PARAM_ISP_VDMA4_OUTPUT,
-	PARAM_ISP_VDMA5_OUTPUT,
-	PARAM_DRC_CONTROL,
-	PARAM_DRC_OTF_INPUT,
-	PARAM_DRC_DMA_INPUT,
-	PARAM_DRC_OTF_OUTPUT,
-	PARAM_SCALERC_CONTROL,
-	PARAM_SCALERC_OTF_INPUT,
-	PARAM_SCALERC_IMAGE_EFFECT,
-	PARAM_SCALERC_INPUT_CROP,
-	PARAM_SCALERC_OUTPUT_CROP,
-	PARAM_SCALERC_OTF_OUTPUT,
-	PARAM_SCALERC_DMA_OUTPUT,
-	PARAM_TPU_CONTROL,
-	PARAM_TPU_CONFIG,
-	PARAM_TPU_OTF_INPUT,
-	PARAM_TPU_DMA_INPUT,
-	PARAM_TPU_OTF_OUTPUT,
-	PARAM_TPU_DMA_OUTPUT,
-	PARAM_SCALERP_CONTROL,
-	PARAM_SCALERP_OTF_INPUT,
-	PARAM_SCALERP_IMAGE_EFFECT,
-	PARAM_SCALERP_INPUT_CROP,
-	PARAM_SCALERP_OUTPUT_CROP,
-	PARAM_SCALERP_ROTATION,
-	PARAM_SCALERP_FLIP,
-	PARAM_SCALERP_OTF_OUTPUT,
-	PARAM_SCALERP_DMA_OUTPUT,
-	PARAM_FD_CONTROL,
-	PARAM_FD_OTF_INPUT,
-	PARAM_FD_DMA_INPUT,
-	PARAM_FD_CONFIG,
-	PARAM_END,
-};
-
-/* Enumerations
-*
-*/
-
-/* ----------------------  Input  ----------------------------------- */
-enum control_command {
-	CONTROL_COMMAND_STOP	= 0,
-	CONTROL_COMMAND_START	= 1,
-	CONTROL_COMMAND_TEST	= 2
-};
-
-enum bypass_command {
-	CONTROL_BYPASS_DISABLE		= 0,
-	CONTROL_BYPASS_ENABLE		= 1
-};
-
-enum control_error {
-	CONTROL_ERROR_NO		= 0
-};
-
-enum otf_input_command {
-	OTF_INPUT_COMMAND_DISABLE	= 0,
-	OTF_INPUT_COMMAND_ENABLE	= 1
-};
-
-enum otf_input_format {
-	OTF_INPUT_FORMAT_BAYER		= 0, /* 1 Channel */
-	OTF_INPUT_FORMAT_YUV444		= 1, /* 3 Channel */
-	OTF_INPUT_FORMAT_YUV422		= 2, /* 3 Channel */
-	OTF_INPUT_FORMAT_YUV420		= 3, /* 3 Channel */
-	OTF_INPUT_FORMAT_STRGEN_COLORBAR_BAYER = 10,
-	OTF_INPUT_FORMAT_BAYER_DMA	= 11,
-};
-
-enum otf_input_bitwidth {
-	OTF_INPUT_BIT_WIDTH_14BIT	= 14,
-	OTF_INPUT_BIT_WIDTH_12BIT	= 12,
-	OTF_INPUT_BIT_WIDTH_11BIT	= 11,
-	OTF_INPUT_BIT_WIDTH_10BIT	= 10,
-	OTF_INPUT_BIT_WIDTH_9BIT	= 9,
-	OTF_INPUT_BIT_WIDTH_8BIT	= 8
-};
-
-enum otf_input_order {
-	OTF_INPUT_ORDER_BAYER_GR_BG	= 0,
-	OTF_INPUT_ORDER_BAYER_RG_GB	= 1,
-	OTF_INPUT_ORDER_BAYER_BG_GR	= 2,
-	OTF_INPUT_ORDER_BAYER_GB_RG	= 3
-};
-
-enum otf_input_path {
-	OTF_INPUT_SERIAL_PATH = 0,
-	OTF_INPUT_PARAL_PATH = 1
-};
-
-enum otf_intput_error {
-       OTF_INPUT_ERROR_NO		= 0 /* Input setting is done */
-};
-
-enum dma_input_command {
-	DMA_INPUT_COMMAND_DISABLE	= 0,
-	DMA_INPUT_COMMAND_ENABLE	= 1,
-};
-
-enum dma_inut_format {
-	DMA_INPUT_FORMAT_BAYER			= 0,
-	DMA_INPUT_FORMAT_YUV444 		= 1,
-	DMA_INPUT_FORMAT_YUV422 		= 2,
-	DMA_INPUT_FORMAT_YUV420 		= 3,
-	DMA_INPUT_FORMAT_RGB			= 4,
-	DMA_INPUT_FORMAT_BAYER_PACKED	 	= 5,
-	DMA_INPUT_FORMAT_YUV422_CHUNKER 	= 6
-};
-
-enum dma_input_bitwidth {
-	DMA_INPUT_BIT_WIDTH_16BIT	= 16,
-	DMA_INPUT_BIT_WIDTH_14BIT	= 14,
-	DMA_INPUT_BIT_WIDTH_12BIT	= 12,
-	DMA_INPUT_BIT_WIDTH_11BIT	= 11,
-	DMA_INPUT_BIT_WIDTH_10BIT	= 10,
-	DMA_INPUT_BIT_WIDTH_9BIT	= 9,
-	DMA_INPUT_BIT_WIDTH_8BIT	= 8
-};
-
-enum dma_input_plane {
-	DMA_INPUT_PLANE_3	= 3,
-	DMA_INPUT_PLANE_2	= 2,
-	DMA_INPUT_PLANE_1	= 1
-};
-
-enum dma_input_order {
-	/* (for DMA_INPUT_PLANE_3) */
-	DMA_INPUT_ORDER_NO	= 0,
-	/* (only valid at DMA_INPUT_PLANE_2) */
-	DMA_INPUT_ORDER_CbCr	= 1,
-	/* (only valid at DMA_INPUT_PLANE_2) */
-	DMA_INPUT_ORDER_CrCb	= 2,
-	/* (only valid at DMA_INPUT_PLANE_1 & DMA_INPUT_FORMAT_YUV444) */
-	DMA_INPUT_ORDER_YCbCr	= 3,
-	/* (only valid at DMA_INPUT_FORMAT_YUV422 & DMA_INPUT_PLANE_1) */
-	DMA_INPUT_ORDER_YYCbCr	= 4,
-	/* (only valid at DMA_INPUT_FORMAT_YUV422 & DMA_INPUT_PLANE_1) */
-	DMA_INPUT_ORDER_YCbYCr	= 5,
-	/* (only valid at DMA_INPUT_FORMAT_YUV422 & DMA_INPUT_PLANE_1) */
-	DMA_INPUT_ORDER_YCrYCb	= 6,
-	/* (only valid at DMA_INPUT_FORMAT_YUV422 & DMA_INPUT_PLANE_1) */
-	DMA_INPUT_ORDER_CbYCrY	= 7,
-	/* (only valid at DMA_INPUT_FORMAT_YUV422 & DMA_INPUT_PLANE_1) */
-	DMA_INPUT_ORDER_CrYCbY	= 8,
-	/* (only valid at DMA_INPUT_FORMAT_BAYER) */
-	DMA_INPUT_ORDER_GR_BG	= 9
-};
-
-enum dma_input_MemoryWidthBits {
-	DMA_INPUT_MEMORY_WIDTH_16BIT	= 16,
-	DMA_INPUT_MEMORY_WIDTH_12BIT	= 12,
-};
-
-enum dma_input_error {
-	DMA_INPUT_ERROR_NO	= 0 /*  DMA input setting is done */
-};
-
-/* ----------------------  Output  ----------------------------------- */
-enum otf_output_crop {
-	OTF_OUTPUT_CROP_DISABLE		= 0,
-	OTF_OUTPUT_CROP_ENABLE		= 1
-};
-
-enum otf_output_command {
-	OTF_OUTPUT_COMMAND_DISABLE	= 0,
-	OTF_OUTPUT_COMMAND_ENABLE	= 1
-};
-
-enum otf_output_format {
-	OTF_OUTPUT_FORMAT_BAYER			= 0,
-	OTF_OUTPUT_FORMAT_YUV444		= 1,
-	OTF_OUTPUT_FORMAT_YUV422		= 2,
-	OTF_OUTPUT_FORMAT_YUV420		= 3,
-	OTF_OUTPUT_FORMAT_RGB			= 4,
-	OTF_OUTPUT_FORMAT_YUV444_TRUNCATED	= 5,
-	OTF_OUTPUT_FORMAT_YUV422_TRUNCATED	= 6
-};
-
-enum otf_output_bitwidth {
-	OTF_OUTPUT_BIT_WIDTH_14BIT	= 14,
-	OTF_OUTPUT_BIT_WIDTH_12BIT	= 12,
-	OTF_OUTPUT_BIT_WIDTH_11BIT	= 11,
-	OTF_OUTPUT_BIT_WIDTH_10BIT	= 10,
-	OTF_OUTPUT_BIT_WIDTH_9BIT	= 9,
-	OTF_OUTPUT_BIT_WIDTH_8BIT	= 8
-};
-
-enum otf_output_order {
-	OTF_OUTPUT_ORDER_BAYER_GR_BG	= 0,
-};
-
-enum otf_output_error {
-	OTF_OUTPUT_ERROR_NO = 0 /* Output Setting is done */
-};
-
-enum dma_output_command {
-	DMA_OUTPUT_COMMAND_DISABLE	= 0,
-	DMA_OUTPUT_COMMAND_ENABLE	= 1,
-	DMA_OUTPUT_COMMAND_BUF_MNGR	= 2,
-	DMA_OUTPUT_UPDATE_MASK_BITS	= 3
-};
-
-enum dma_output_format {
-	DMA_OUTPUT_FORMAT_BAYER			= 0,
-	DMA_OUTPUT_FORMAT_YUV444		= 1,
-	DMA_OUTPUT_FORMAT_YUV422		= 2,
-	DMA_OUTPUT_FORMAT_YUV420		= 3,
-	DMA_OUTPUT_FORMAT_RGB			= 4,
-	DMA_OUTPUT_FORMAT_BAYER_PACKED		= 5,
-	DMA_OUTPUT_FORMAT_YUV422_CHUNKER	= 6
-};
-
-enum dma_output_bitwidth {
-	DMA_OUTPUT_BIT_WIDTH_16BIT	= 16,
-	DMA_OUTPUT_BIT_WIDTH_14BIT	= 14,
-	DMA_OUTPUT_BIT_WIDTH_12BIT	= 12,
-	DMA_OUTPUT_BIT_WIDTH_11BIT	= 11,
-	DMA_OUTPUT_BIT_WIDTH_10BIT	= 10,
-	DMA_OUTPUT_BIT_WIDTH_9BIT	= 9,
-	DMA_OUTPUT_BIT_WIDTH_8BIT	= 8
-};
-
-enum dma_output_plane {
-	DMA_OUTPUT_PLANE_3		= 3,
-	DMA_OUTPUT_PLANE_2		= 2,
-	DMA_OUTPUT_PLANE_1		= 1
-};
-
-enum dma_output_order {
-	DMA_OUTPUT_ORDER_NO		= 0,
-	/* (for DMA_OUTPUT_PLANE_3) */
-	DMA_OUTPUT_ORDER_CrCb		= 1,
-	/* (only valid at DMA_OUTPUT_PLANE_2) */
-	DMA_OUTPUT_ORDER_CbCr		= 2,
-	/* (only valid at DMA_OUTPUT_PLANE_2) */
-	DMA_OUTPUT_ORDER_YYCbCr		= 3,
-	/* NOT USED */
-	DMA_OUTPUT_ORDER_CrYCbY		= 4,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV422 & DMA_OUTPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_CbYCrY		= 5,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV422 & DMA_OUTPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_YCrYCb		= 6,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV422 & DMA_OUTPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_YCbYCr		= 7,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV422 & DMA_OUTPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_CrCbY		= 8,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV444 & DMA_OUPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_CbYCr		= 9,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV444 & DMA_OUPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_YCbCr		= 10,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV444 & DMA_OUPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_CrYCb		= 11,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV444 & DMA_OUPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_CbCrY		= 12,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV444 & DMA_OUPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_YCrCb		= 13,
-	/* (only valid at DMA_OUTPUT_FORMAT_YUV444 & DMA_OUPUT_PLANE_1) */
-	DMA_OUTPUT_ORDER_BGR		= 14,
-	/* (only valid at DMA_OUTPUT_FORMAT_RGB) */
-	DMA_OUTPUT_ORDER_GB_BG		= 15
-	/* (only valid at DMA_OUTPUT_FORMAT_BAYER) */
-};
-
-enum dma_output_notify_dma_done {
-	DMA_OUTPUT_NOTIFY_DMA_DONE_DISABLE	= 0,
-	DMA_OUTPUT_NOTIFY_DMA_DONE_ENBABLE	= 1,
-};
-
-enum dma_output_error {
-	DMA_OUTPUT_ERROR_NO		= 0 /* DMA output setting is done */
-};
-
-/* ----------------------  Global  ----------------------------------- */
-enum global_shotmode_error {
-	GLOBAL_SHOTMODE_ERROR_NO	= 0 /* shot-mode setting is done */
-};
-
-/* -------------------------  AA  ------------------------------------ */
-enum isp_lock_command {
-	ISP_AA_COMMAND_START	= 0,
-	ISP_AA_COMMAND_STOP	= 1
-};
-
-enum isp_lock_target {
-	ISP_AA_TARGET_AF	= 1,
-	ISP_AA_TARGET_AE	= 2,
-	ISP_AA_TARGET_AWB	= 4
-};
-
-enum isp_af_mode {
-	ISP_AF_MANUAL = 0,
-	ISP_AF_SINGLE,
-	ISP_AF_CONTINUOUS,
-	ISP_AF_REGION,
-	ISP_AF_SLEEP,
-	ISP_AF_INIT,
-	ISP_AF_SET_CENTER_WINDOW,
-	ISP_AF_SET_TOUCH_WINDOW,
-	ISP_AF_SET_FACE_WINDOW
-};
-
-enum isp_af_scene {
-	ISP_AF_SCENE_NORMAL		= 0,
-	ISP_AF_SCENE_MACRO		= 1
-};
-
-enum isp_af_touch {
-	ISP_AF_TOUCH_DISABLE = 0,
-	ISP_AF_TOUCH_ENABLE
-};
-
-enum isp_af_face {
-	ISP_AF_FACE_DISABLE = 0,
-	ISP_AF_FACE_ENABLE
-};
-
-enum isp_af_reponse {
-	ISP_AF_RESPONSE_PREVIEW = 0,
-	ISP_AF_RESPONSE_MOVIE
-};
-
-enum isp_af_sleep {
-	ISP_AF_SLEEP_OFF		= 0,
-	ISP_AF_SLEEP_ON			= 1
-};
-
-enum isp_af_continuous {
-	ISP_AF_CONTINUOUS_DISABLE	= 0,
-	ISP_AF_CONTINUOUS_ENABLE	= 1
-};
-
-enum isp_af_error {
-	ISP_AF_ERROR_NO			= 0, /* AF mode change is done */
-	ISP_AF_EROOR_NO_LOCK_DONE	= 1  /* AF lock is done */
-};
-
-/* -------------------------  Flash  ------------------------------------- */
-enum isp_flash_command {
-	ISP_FLASH_COMMAND_DISABLE	= 0,
-	ISP_FLASH_COMMAND_MANUALON	= 1, /* (forced flash) */
-	ISP_FLASH_COMMAND_AUTO		= 2,
-	ISP_FLASH_COMMAND_TORCH		= 3,   /* 3 sec */
-	ISP_FLASH_COMMAND_FLASH_ON	= 4,
-	ISP_FLASH_COMMAND_CAPTURE	= 5,
-	ISP_FLASH_COMMAND_TRIGGER	= 6,
-	ISP_FLASH_COMMAND_CALIBRATION	= 7,
-	ISP_FLASH_COMMAND_START		= 8,
-	ISP_FLASH_COMMAND_CANCLE	= 9
-};
-
-enum isp_flash_redeye {
-	ISP_FLASH_REDEYE_DISABLE	= 0,
-	ISP_FLASH_REDEYE_ENABLE		= 1
-};
-
-enum isp_flash_error {
-	ISP_FLASH_ERROR_NO		= 0 /* Flash setting is done */
-};
-
-/* --------------------------  AWB  ------------------------------------ */
-enum isp_awb_command {
-	ISP_AWB_COMMAND_AUTO		= 0,
-	ISP_AWB_COMMAND_ILLUMINATION	= 1,
-	ISP_AWB_COMMAND_MANUAL	= 2
-};
-
-enum isp_awb_illumination {
-	ISP_AWB_ILLUMINATION_DAYLIGHT		= 0,
-	ISP_AWB_ILLUMINATION_CLOUDY		= 1,
-	ISP_AWB_ILLUMINATION_TUNGSTEN		= 2,
-	ISP_AWB_ILLUMINATION_FLUORESCENT	= 3
-};
-
-enum isp_awb_error {
-	ISP_AWB_ERROR_NO		= 0 /* AWB setting is done */
-};
-
-/* --------------------------  Effect  ----------------------------------- */
-enum isp_imageeffect_command {
-	ISP_IMAGE_EFFECT_DISABLE		= 0,
-	ISP_IMAGE_EFFECT_MONOCHROME		= 1,
-	ISP_IMAGE_EFFECT_NEGATIVE_MONO		= 2,
-	ISP_IMAGE_EFFECT_NEGATIVE_COLOR		= 3,
-	ISP_IMAGE_EFFECT_SEPIA			= 4,
-	ISP_IMAGE_EFFECT_AQUA			= 5,
-	ISP_IMAGE_EFFECT_EMBOSS			= 6,
-	ISP_IMAGE_EFFECT_EMBOSS_MONO		= 7,
-	ISP_IMAGE_EFFECT_SKETCH			= 8,
-	ISP_IMAGE_EFFECT_RED_YELLOW_POINT	= 9,
-	ISP_IMAGE_EFFECT_GREEN_POINT		= 10,
-	ISP_IMAGE_EFFECT_BLUE_POINT		= 11,
-	ISP_IMAGE_EFFECT_MAGENTA_POINT		= 12,
-	ISP_IMAGE_EFFECT_WARM_VINTAGE		= 13,
-	ISP_IMAGE_EFFECT_COLD_VINTAGE		= 14,
-	ISP_IMAGE_EFFECT_POSTERIZE		= 15,
-	ISP_IMAGE_EFFECT_SOLARIZE		= 16,
-	ISP_IMAGE_EFFECT_WASHED			= 17,
-	ISP_IMAGE_EFFECT_CCM			= 18,
-};
-
-enum isp_imageeffect_error {
-	ISP_IMAGE_EFFECT_ERROR_NO	= 0 /* Image effect setting is done */
-};
-
-/* ---------------------------  ISO  ------------------------------------ */
-enum isp_iso_command {
-	ISP_ISO_COMMAND_AUTO		= 0,
-	ISP_ISO_COMMAND_MANUAL		= 1
-};
-
-enum iso_error {
-	ISP_ISO_ERROR_NO		= 0 /* ISO setting is done */
-};
-
-/* --------------------------  Adjust  ----------------------------------- */
-enum iso_adjust_command {
-	ISP_ADJUST_COMMAND_AUTO			= 0,
-	ISP_ADJUST_COMMAND_MANUAL_CONTRAST	= (1 << 0),
-	ISP_ADJUST_COMMAND_MANUAL_SATURATION	= (1 << 1),
-	ISP_ADJUST_COMMAND_MANUAL_SHARPNESS	= (1 << 2),
-	ISP_ADJUST_COMMAND_MANUAL_EXPOSURE	= (1 << 3),
-	ISP_ADJUST_COMMAND_MANUAL_BRIGHTNESS	= (1 << 4),
-	ISP_ADJUST_COMMAND_MANUAL_HUE		= (1 << 5),
-	ISP_ADJUST_COMMAND_MANUAL_HOTPIXEL	= (1 << 6),
-	ISP_ADJUST_COMMAND_MANUAL_NOISEREDUCTION = (1 << 7),
-	ISP_ADJUST_COMMAND_MANUAL_SHADING	= (1 << 8),
-	ISP_ADJUST_COMMAND_MANUAL_GAMMA		= (1 << 9),
-	ISP_ADJUST_COMMAND_MANUAL_EDGEENHANCEMENT = (1 << 10),
-	ISP_ADJUST_COMMAND_MANUAL_SCENE		= (1 << 11),
-	ISP_ADJUST_COMMAND_MANUAL_FRAMETIME	= (1 << 12),
-	ISP_ADJUST_COMMAND_MANUAL_ALL		= 0x1FFF
-};
-
-enum isp_adjust_scene_index {
-	ISP_ADJUST_SCENE_NORMAL			= 0,
-	ISP_ADJUST_SCENE_NIGHT_PREVIEW		= 1,
-	ISP_ADJUST_SCENE_NIGHT_CAPTURE		= 2
-};
-
-
-enum isp_adjust_error {
-	ISP_ADJUST_ERROR_NO		= 0 /* Adjust setting is done */
-};
-
-/* -------------------------  Metering  ---------------------------------- */
-enum isp_metering_command {
-	ISP_METERING_COMMAND_AVERAGE		= 0,
-	ISP_METERING_COMMAND_SPOT		= 1,
-	ISP_METERING_COMMAND_MATRIX		= 2,
-	ISP_METERING_COMMAND_CENTER		= 3,
-	ISP_METERING_COMMAND_EXPOSURE_MODE	= (1 << 8)
-};
-
-enum isp_exposure_mode {
-	ISP_EXPOSUREMODE_OFF		= 1,
-	ISP_EXPOSUREMODE_AUTO		= 2
-};
-
-enum isp_metering_error {
-	ISP_METERING_ERROR_NO	= 0 /* Metering setting is done */
-};
-
-/* --------------------------  AFC  ----------------------------------- */
-enum isp_afc_command {
-	ISP_AFC_COMMAND_DISABLE		= 0,
-	ISP_AFC_COMMAND_AUTO		= 1,
-	ISP_AFC_COMMAND_MANUAL		= 2
-};
-
-enum isp_afc_manual {
-	ISP_AFC_MANUAL_50HZ		= 50,
-	ISP_AFC_MANUAL_60HZ		= 60
-};
-
-enum isp_afc_error {
-	ISP_AFC_ERROR_NO	= 0 /* AFC setting is done */
-};
-
-enum isp_scene_command {
-	ISP_SCENE_NONE		= 0,
-	ISP_SCENE_PORTRAIT	= 1,
-	ISP_SCENE_LANDSCAPE     = 2,
-	ISP_SCENE_SPORTS        = 3,
-	ISP_SCENE_PARTYINDOOR	= 4,
-	ISP_SCENE_BEACHSNOW	= 5,
-	ISP_SCENE_SUNSET	= 6,
-	ISP_SCENE_DAWN		= 7,
-	ISP_SCENE_FALL		= 8,
-	ISP_SCENE_NIGHT		= 9,
-	ISP_SCENE_AGAINSTLIGHTWLIGHT	= 10,
-	ISP_SCENE_AGAINSTLIGHTWOLIGHT	= 11,
-	ISP_SCENE_FIRE			= 12,
-	ISP_SCENE_TEXT			= 13,
-	ISP_SCENE_CANDLE		= 14
-};
-
-enum ISP_BDSCommandEnum {
-	ISP_BDS_COMMAND_DISABLE		= 0,
-	ISP_BDS_COMMAND_ENABLE		= 1
-};
-
-/* --------------------------  Scaler  --------------------------------- */
-enum scaler_imageeffect_command {
-	SCALER_IMAGE_EFFECT_COMMNAD_DISABLE	= 0,
-	SCALER_IMAGE_EFFECT_COMMNAD_SEPIA_CB	= 1,
-	SCALER_IMAGE_EFFECT_COMMAND_SEPIA_CR	= 2,
-	SCALER_IMAGE_EFFECT_COMMAND_NEGATIVE	= 3,
-	SCALER_IMAGE_EFFECT_COMMAND_ARTFREEZE	= 4,
-	SCALER_IMAGE_EFFECT_COMMAND_EMBOSSING	= 5,
-	SCALER_IMAGE_EFFECT_COMMAND_SILHOUETTE	= 6
-};
-
-enum scaler_imageeffect_error {
-	SCALER_IMAGE_EFFECT_ERROR_NO		= 0
-};
-
-enum scaler_crop_command {
-	SCALER_CROP_COMMAND_DISABLE		= 0,
-	SCALER_CROP_COMMAND_ENABLE		= 1
-};
-
-enum scaler_crop_error {
-	SCALER_CROP_ERROR_NO			= 0 /* crop setting is done */
-};
-
-enum scaler_scaling_command {
-	SCALER_SCALING_COMMNAD_DISABLE		= 0,
-	SCALER_SCALING_COMMAND_UP		= 1,
-	SCALER_SCALING_COMMAND_DOWN		= 2
-};
-
-enum scaler_scaling_error {
-	SCALER_SCALING_ERROR_NO			= 0
-};
-
-enum scaler_rotation_command {
-	SCALER_ROTATION_COMMAND_DISABLE		= 0,
-	SCALER_ROTATION_COMMAND_CLOCKWISE90	= 1
-};
-
-enum scaler_rotation_error {
-	SCALER_ROTATION_ERROR_NO		= 0
-};
-
-enum scaler_flip_command {
-	SCALER_FLIP_COMMAND_NORMAL		= 0,
-	SCALER_FLIP_COMMAND_X_MIRROR		= 1,
-	SCALER_FLIP_COMMAND_Y_MIRROR		= 2,
-	SCALER_FLIP_COMMAND_XY_MIRROR		= 3 /* (180 rotation) */
-};
-
-enum scaler_flip_error {
-	SCALER_FLIP_ERROR_NO			= 0 /* flip setting is done */
-};
-
-enum scaler_dma_out_sel {
-	SCALER_DMA_OUT_IMAGE_EFFECT		= 0,
-	SCALER_DMA_OUT_SCALED			= 1,
-	SCALER_DMA_OUT_UNSCALED			= 2
-};
-
-enum scaler_output_yuv_range {
-	SCALER_OUTPUT_YUV_RANGE_FULL = 0,
-	SCALER_OUTPUT_YUV_RANGE_NARROW = 1,
-};
-
-/* --------------------------  3DNR  ----------------------------------- */
-enum tdnr_1st_frame_command {
-	TDNR_1ST_FRAME_COMMAND_NOPROCESSING	= 0,
-	TDNR_1ST_FRAME_COMMAND_2DNR		= 1
-};
-
-enum tdnr_1st_frame_error {
-	TDNR_1ST_FRAME_ERROR_NO			= 0
-		/*1st frame setting is done*/
-};
-
-/* ----------------------------  FD  ------------------------------------- */
-enum fd_config_command {
-	FD_CONFIG_COMMAND_MAXIMUM_NUMBER	= 0x1,
-	FD_CONFIG_COMMAND_ROLL_ANGLE		= 0x2,
-	FD_CONFIG_COMMAND_YAW_ANGLE		= 0x4,
-	FD_CONFIG_COMMAND_SMILE_MODE		= 0x8,
-	FD_CONFIG_COMMAND_BLINK_MODE		= 0x10,
-	FD_CONFIG_COMMAND_EYES_DETECT		= 0x20,
-	FD_CONFIG_COMMAND_MOUTH_DETECT		= 0x40,
-	FD_CONFIG_COMMAND_ORIENTATION		= 0x80,
-	FD_CONFIG_COMMAND_ORIENTATION_VALUE	= 0x100
-};
-
-enum fd_config_mode {
-	FD_CONFIG_MODE_NORMAL		= 0,
-	FD_CONFIG_MODE_HWONLY		= 1
-};
-
-enum fd_config_roll_angle {
-	FD_CONFIG_ROLL_ANGLE_BASIC		= 0,
-	FD_CONFIG_ROLL_ANGLE_PRECISE_BASIC	= 1,
-	FD_CONFIG_ROLL_ANGLE_SIDES		= 2,
-	FD_CONFIG_ROLL_ANGLE_PRECISE_SIDES	= 3,
-	FD_CONFIG_ROLL_ANGLE_FULL		= 4,
-	FD_CONFIG_ROLL_ANGLE_PRECISE_FULL	= 5,
-};
-
-enum fd_config_yaw_angle {
-	FD_CONFIG_YAW_ANGLE_0			= 0,
-	FD_CONFIG_YAW_ANGLE_45			= 1,
-	FD_CONFIG_YAW_ANGLE_90			= 2,
-	FD_CONFIG_YAW_ANGLE_45_90		= 3,
-};
-
-enum fd_config_smile_mode {
-	FD_CONFIG_SMILE_MODE_DISABLE		= 0,
-	FD_CONFIG_SMILE_MODE_ENABLE		= 1
-};
-
-enum fd_config_blink_mode {
-	FD_CONFIG_BLINK_MODE_DISABLE		= 0,
-	FD_CONFIG_BLINK_MODE_ENABLE		= 1
-};
-
-enum fd_config_eye_result {
-	FD_CONFIG_EYES_DETECT_DISABLE		= 0,
-	FD_CONFIG_EYES_DETECT_ENABLE		= 1
-};
-
-enum fd_config_mouth_result {
-	FD_CONFIG_MOUTH_DETECT_DISABLE		= 0,
-	FD_CONFIG_MOUTH_DETECT_ENABLE		= 1
-};
-
-enum fd_config_orientation {
-	FD_CONFIG_ORIENTATION_DISABLE		= 0,
-	FD_CONFIG_ORIENTATION_ENABLE		= 1
-};
-
-struct param_global_shotmode {
-	u32	cmd;
-	u32	reserved[PARAMETER_MAX_MEMBER-2];
-	u32	err;
-};
-
-struct param_control {
-	u32	cmd;
-	u32	bypass;
-	u32	buffer_address;
-	u32	buffer_number;
-	u32	reserved[PARAMETER_MAX_MEMBER-5];
-	u32	err;
-};
-
-struct param_otf_input {
-	u32	cmd;
-	u32	format;
-	u32	bitwidth;
-	u32	order;
-	u32	width; /* with margin */
-	u32	height; /* with margine */
-	u32	bayer_crop_offset_x;
-	u32	bayer_crop_offset_y;
-	u32	bayer_crop_width; /* BCrop1 output width without considering ISP margin = BDS input width */
-	u32	bayer_crop_height;  /* BCrop1 output height without considering ISP margin = BDS input height */
-	u32	reserved[PARAMETER_MAX_MEMBER-11];
-	u32	err;
-};
-
-struct param_dma_input {
-	u32	cmd;
-	u32	format;
-	u32	bitwidth;
-	u32	order;
-	u32	plane;
-	u32	width;
-	u32	height;
-	u32	dma_crop_offset; /* uiDmaCropOffset[31:16] : X offset, uiDmaCropOffset[15:0] : Y offset */
-	u32	dma_crop_width;
-	u32	dma_crop_height;
-	u32	bayer_crop_offset_x;
-	u32	bayer_crop_offset_y;
-	u32	bayer_crop_width;
-	u32	bayer_crop_height;
-	u32	scene_mode; /* for AE envelop */
-	u32	msb; /* last bit of data in memory size */
-	u32	reserved[PARAMETER_MAX_MEMBER-17];
-	u32	err;
-};
-
-struct param_otf_output {
-	u32	cmd;
-	u32	format;
-	u32	bitwidth;
-	u32	order;
-	u32	width; /* BDS output width */
-	u32	height; /* BDS output height */
-	u32	reserved[PARAMETER_MAX_MEMBER-7];
-	u32	err;
-};
-
-struct param_dma_output {
-	u32	cmd;
-	u32	format;
-	u32	bitwidth;
-	u32	order;
-	u32	plane;
-	u32	width; /* BDS output width */
-	u32	height; /* BDS output height */
-	u32	dma_crop_offset_x;
-	u32	dma_crop_offset_y;
-	u32	dma_crop_width;
-	u32	dma_crop_height;
-	u32	selection; /* IMAGE_EFFECT = 0, SCALED = 1, UNSCALED = 2 */
-	u32	msb; /* last bit of data in memory size */
-	u32	reserved[PARAMETER_MAX_MEMBER-14];
-	u32	err;
-};
-
-struct param_sensor_config {
-	u32	frametime; /* max exposure time(us) */
-	u32	min_target_fps;
-	u32	max_target_fps;
-	u32	width;
-	u32	height;
-	u32	sensor_binning_ratio_x;
-	u32	sensor_binning_ratio_y;
-	u32	bns_binning_ratio_x;
-	u32	bns_binning_ratio_y;
-	u32	bns_margin_left;
-	u32	bns_margin_top;
-	u32	bns_output_width; /* Active scaled image width */
-	u32	bns_output_height; /* Active scaled image height */
-	u32	calibrated_width; /* sensor cal size */
-	u32	calibrated_height;
-	u32	reserved[PARAMETER_MAX_MEMBER-16];
-	u32	err;
-};
-
-struct param_isp_aa {
-	u32	cmd;
-	u32	target;
-	u32	mode;
-	u32	scene;
-	u32	af_touch;
-	u32	af_face;
-	u32	af_response;
-	u32	sleep;
-	u32	touch_x;
-	u32	touch_y;
-	u32	manual_af_setting;
-	/*0: Legacy, 1: Camera 2.0*/
-	u32	cam_api_2p0;
-	/* For android.control.afRegions in Camera 2.0,
-	Resolution based on YUV output size*/
-	u32	af_region_left;
-	/* For android.control.afRegions in Camera 2.0,
-	Resolution based on YUV output size*/
-	u32	af_region_top;
-	/* For android.control.afRegions in Camera 2.0,
-	Resolution based on YUV output size*/
-	u32	af_region_right;
-	/* For android.control.afRegions in Camera 2.0,
-	Resolution based on YUV output size*/
-	u32	af_region_bottom;
-	u32	reserved[PARAMETER_MAX_MEMBER-17];
-	u32	err;
-};
-
-struct param_isp_flash {
-	u32	cmd;
-	u32	redeye;
-	u32	flashintensity;
-	u32	reserved[PARAMETER_MAX_MEMBER-4];
-	u32	err;
-};
-
-struct param_isp_awb {
-	u32	cmd;
-	u32	illumination;
-	u32	reserved[PARAMETER_MAX_MEMBER-3];
-	u32	err;
-};
-
-struct param_isp_imageeffect {
-	u32	cmd;
-	u32	reserved[PARAMETER_MAX_MEMBER-2];
-	u32	err;
-};
-
-struct param_isp_iso {
-	u32	cmd;
-	u32	value;
-	u32	reserved[PARAMETER_MAX_MEMBER-3];
-	u32	err;
-};
-
-struct param_isp_adjust {
-	u32	cmd;
-	s32	contrast;
-	s32	saturation;
-	s32	sharpness;
-	s32	exposure;
-	s32	brightness;
-	s32	hue;
-	/* 0 or 1 */
-	u32	hot_pixel_enable;
-	/* -127 ~ 127 */
-	s32	noise_reduction_strength;
-	/* 0 or 1 */
-	u32	shading_correction_enable;
-	/* 0 or 1 */
-	u32	user_gamma_enable;
-	/* -127 ~ 127 */
-	s32	edge_enhancement_strength;
-	/* ISP_AdjustSceneIndexEnum */
-	u32	user_scene_mode;
-	u32	min_frame_time;
-	u32	max_frame_time;
-	u32	reserved[PARAMETER_MAX_MEMBER-16];
-	u32	err;
-};
-
-struct param_isp_metering {
-	u32	cmd;
-	u32	win_pos_x;
-	u32	win_pos_y;
-	u32	win_width;
-	u32	win_height;
-	u32	exposure_mode;
-	/* 0: Legacy, 1: Camera 2.0 */
-	u32	cam_api_2p0;
-	u32	reserved[PARAMETER_MAX_MEMBER-8];
-	u32	err;
-};
-
-struct param_isp_afc {
-	u32	cmd;
-	u32	manual;
-	u32	reserved[PARAMETER_MAX_MEMBER-3];
-	u32	err;
-};
-
-struct param_scaler_imageeffect {
-	u32	cmd;
-	u32	arbitrary_cb;
-	u32	arbitrary_cr;
-	u32	yuv_range;
-	u32	reserved[PARAMETER_MAX_MEMBER-5];
-	u32	err;
-};
-
-struct param_capture_intent {
-	u32	cmd;
-	u32	reserved[PARAMETER_MAX_MEMBER-2];
-	u32	err;
-};
-
-struct param_scaler_input_crop {
-	u32  cmd;
-	u32  pos_x;
-	u32  pos_y;
-	u32  crop_width;
-	u32  crop_height;
-	u32  in_width;
-	u32  in_height;
-	u32  out_width;
-	u32  out_height;
-	u32  reserved[PARAMETER_MAX_MEMBER-10];
-	u32  err;
-};
-
-struct param_scaler_output_crop {
-	u32  cmd;
-	u32  pos_x;
-	u32  pos_y;
-	u32  crop_width;
-	u32  crop_height;
-	u32  format;
-	u32  reserved[PARAMETER_MAX_MEMBER-7];
-	u32  err;
-};
-
-struct param_scaler_rotation {
-	u32	cmd;
-	u32	reserved[PARAMETER_MAX_MEMBER-2];
-	u32	err;
-};
-
-struct param_scaler_flip {
-	u32	cmd;
-	u32	reserved[PARAMETER_MAX_MEMBER-2];
-	u32	err;
-};
-
-struct param_3dnr_1stframe {
-	u32	cmd;
-	u32	reserved[PARAMETER_MAX_MEMBER-2];
-	u32	err;
-};
-
-struct param_fd_config {
-	u32	cmd;
-	u32	mode;
-	u32	max_number;
-	u32	roll_angle;
-	u32	yaw_angle;
-	s32	smile_mode;
-	s32	blink_mode;
-	u32	eye_detect;
-	u32	mouth_detect;
-	u32	orientation;
-	u32	orientation_value;
-	u32	map_width;
-	u32	map_height;
-	u32	reserved[PARAMETER_MAX_MEMBER-14];
-	u32	err;
-};
-
-struct param_tpu_config {
-	u32	odc_bypass;
-	u32	dis_bypass;
-	u32	tdnr_bypass;
-	u32	reserved[PARAMETER_MAX_MEMBER-4];
-	u32	err;
-};
-
-struct global_param {
-	struct param_global_shotmode	shotmode; /* 0 */
-};
-
-/* To be added */
-struct sensor_param {
-	struct param_control		control;
-	struct param_otf_input		otf_input;
-	struct param_otf_output		otf_output;
-	struct param_sensor_config	config;
-	struct param_dma_output		dma_output;
-};
-
-struct aeconfig_param {
-	u32 uiCameraEntrance;
-	u32 uiReserved[PARAMETER_MAX_MEMBER-2];
-	u32 uiError;
-};
-
-#if 0
-struct buffer_param {
-	struct param_control	control;
-	struct param_otf_input	otf_input;
-	struct param_otf_output	otf_output;
-};
-#else
-struct taalg_param{
-    struct aeconfig_param        ParameterAeConfig;
-    struct aeconfig_param        ParameterReserved1;
-    struct aeconfig_param        ParameterReserved2;
-};
-#endif
-
-struct taa_param {
-	struct param_control		control;
-	struct param_otf_input		otf_input;	/* otf_input */
-	struct param_dma_input		vdma1_input;	/* dma1_input */
-	struct param_dma_input		ddma_input;	/* not use */
-	struct param_otf_output		otf_output;	/* not use */
-	struct param_dma_output		vdma4_output;	/* Before BDS */
-	struct param_dma_output		vdma2_output;	/* After BDS */
-	struct param_dma_output		ddma_output;	/* not use */
-};
-
-struct isp_param {
-	struct param_control		control;
-	struct param_otf_input		otf_input;	/* not use */
-	struct param_dma_input		vdma1_input;	/* dma1_input */
-	struct param_dma_input		vdma3_input;	/* not use */
-	struct param_otf_output		otf_output;	/* otf_out */
-	struct param_dma_output		vdma4_output;	/* pdma : chunk output */
-	struct param_dma_output		vdma5_output;	/* cdma : yuv output */
-};
-
-struct drc_param {
-	struct param_control		control;
-	struct param_otf_input		otf_input;
-	struct param_dma_input		dma_input;
-	struct param_otf_output		otf_output;
-};
-
-struct scc_param {
-	struct param_control		control;
-	struct param_otf_input		otf_input;
-	struct param_scaler_imageeffect effect;
-	struct param_scaler_input_crop	input_crop;
-	struct param_scaler_output_crop output_crop;
-	struct param_otf_output		otf_output;
-	struct param_dma_output		dma_output;
-};
-
-struct tpu_param {
-	struct param_control		control;
-	struct param_tpu_config		config;
-	struct param_otf_input		otf_input;
-	struct param_dma_input		dma_input;
-	struct param_otf_output		otf_output;
-	struct param_dma_output		dma_output;
-};
-
-struct dis_param {
-	struct param_control		control;
-	struct param_otf_input		otf_input;
-	struct param_otf_output		otf_output;
-};
-
-struct odc_param {
-	struct param_control		control;
-	struct param_otf_input		otf_input;
-	struct param_otf_output		otf_output;
-};
-
-struct tdnr_param {
-	struct param_control		control;
-	struct param_otf_input		otf_input;
-	struct param_3dnr_1stframe	frame;
-	struct param_otf_output		otf_output;
-	struct param_dma_output		dma_output;
-};
-
-struct param_mcs_input {
-	u32	otf_cmd; /* DISABLE or ENABLE */
-	u32	otf_format;
-	u32	otf_bitwidth;
-	u32	otf_order;
-	u32	dma_cmd; /* DISABLE or ENABLE */
-	u32	dma_format;
-	u32	dma_bitwidth;
-	u32	dma_order;
-	u32	plane;
-	u32	width;
-	u32	height;
-	u32	dma_crop_offset_x;
-	u32	dma_crop_offset_y;
-	u32	dma_crop_width;
-	u32	dma_crop_height;
-	u32	reserved[PARAMETER_MAX_MEMBER-16];
-	u32	err;
-};
-
-struct param_mcs_output {
-	u32	otf_cmd; /* DISABLE or ENABLE */
-	u32	otf_format;
-	u32	otf_bitwidth;
-	u32	otf_order;
-	u32	dma_cmd; /* DISABLE or ENABLE */
-	u32	dma_format;
-	u32	dma_bitwidth;
-	u32	dma_order;
-	u32	plane;
-	u32	crop_offset_x;
-	u32	crop_offset_y;
-	u32	crop_width;
-	u32	crop_height;
-	u32	width;
-	u32	height;
-	u32	dma_stride_y;
-	u32	dma_stride_c;
-	u32	yuv_range; /* FULL or NARROW */
-	u32	flip; /* NORMAL or X-MIRROR or Y- MIRROR or XY- MIRROR */
-	u32	hwfc; /* DISABLE or ENABLE */
-	u32	reserved[PARAMETER_MAX_MEMBER-21];
-	u32	err;
-};
-
-struct mcs_param {
-	struct param_control			control;
-	struct param_mcs_input			input;
-	struct param_mcs_output			output0;
-	struct param_mcs_output			output1;
-	struct param_mcs_output			output2;
-	struct param_mcs_output			output3;
-	struct param_mcs_output			output4;
-};
-
-struct scp_param {
-	struct param_control			control;
-	struct param_otf_input			otf_input;
-	struct param_scaler_imageeffect		effect;
-	struct param_scaler_input_crop		input_crop;
-	struct param_scaler_output_crop		output_crop;
-	struct param_scaler_rotation		rotation;
-	struct param_scaler_flip		flip;
-	struct param_otf_output			otf_output;
-	struct param_dma_output			dma_output;
-};
-
-struct vra_param {
-	struct param_control			control;
-	struct param_otf_input			otf_input;
-	struct param_dma_input			dma_input;
-	struct param_fd_config			config;
-};
-
-struct is_param_region {
-	struct global_param		global;
-	struct sensor_param		sensor;
-#if 0
-	struct buffer_param		buf;
-#else
-	struct taalg_param		TaAlg;
-#endif
-	struct taa_param		taa;
-	struct isp_param		isp;
-	struct drc_param		drc;
-	struct scc_param		scalerc;
-	struct tpu_param		tpu;
-	struct scp_param		scalerp;
-	struct vra_param		vra;
-};
-
-#define	NUMBER_OF_GAMMA_CURVE_POINTS	32
-
-struct is_sensor_tune {
-	u32 exposure;
-	u32 analog_gain;
-	u32 frame_rate;
-	u32 actuator_pos;
-};
-
-struct is_tune_gammacurve {
-	u32 num_pts_x[NUMBER_OF_GAMMA_CURVE_POINTS];
-	u32 num_pts_y_r[NUMBER_OF_GAMMA_CURVE_POINTS];
-	u32 num_pts_y_g[NUMBER_OF_GAMMA_CURVE_POINTS];
-	u32 num_pts_y_b[NUMBER_OF_GAMMA_CURVE_POINTS];
-};
-
-struct is_isp_tune {
-	/* Brightness level : range 0~100, default : 7 */
-	u32 brightness_level;
-	/* Contrast level : range -127~127, default : 0 */
-	s32 contrast_level;
-	/* Saturation level : range -127~127, default : 0 */
-	s32 saturation_level;
-	s32 gamma_level;
-	struct is_tune_gammacurve gamma_curve[4];
-	/* Hue : range -127~127, default : 0 */
-	s32 hue;
-	/* Sharpness blur : range -127~127, default : 0 */
-	s32 sharpness_blur;
-	/* Despeckle : range -127~127, default : 0 */
-	s32 despeckle;
-	/* Edge color supression : range -127~127, default : 0 */
-	s32 edge_color_supression;
-	/* Noise reduction : range -127~127, default : 0 */
-	s32 noise_reduction;
-	/* (32*4 + 9)*4 = 548 bytes */
-};
-
-struct is_tune_region {
-	struct is_sensor_tune sensor_tune;
-	struct is_isp_tune isp_tune;
-};
-
-struct rational_t {
-	u32 num;
-	u32 den;
-};
-
-struct srational_t {
-	s32 num;
-	s32 den;
-};
-
-#define FLASH_FIRED_SHIFT	0
-#define FLASH_NOT_FIRED		0
-#define FLASH_FIRED		1
-
-#define FLASH_STROBE_SHIFT				1
-#define FLASH_STROBE_NO_DETECTION			0
-#define FLASH_STROBE_RESERVED				1
-#define FLASH_STROBE_RETURN_LIGHT_NOT_DETECTED		2
-#define FLASH_STROBE_RETURN_LIGHT_DETECTED		3
-
-#define FLASH_MODE_SHIFT			3
-#define FLASH_MODE_UNKNOWN			0
-#define FLASH_MODE_COMPULSORY_FLASH_FIRING	1
-#define FLASH_MODE_COMPULSORY_FLASH_SUPPRESSION	2
-#define FLASH_MODE_AUTO_MODE			3
-
-#define FLASH_FUNCTION_SHIFT		5
-#define FLASH_FUNCTION_PRESENT		0
-#define FLASH_FUNCTION_NONE		1
-
-#define FLASH_RED_EYE_SHIFT		6
-#define FLASH_RED_EYE_DISABLED		0
-#define FLASH_RED_EYE_SUPPORTED		1
-
-struct exif_attribute {
-	struct rational_t exposure_time;
-	struct srational_t shutter_speed;
-	u32 iso_speed_rating;
-	u32 flash;
-	struct srational_t brightness;
-};
-
-struct is_frame_header {
-	u32 valid;
-	u32 bad_mark;
-	u32 captured;
-	u32 frame_number;
-	struct exif_attribute	exif;
-};
-
-struct is_fd_rect {
-	u32 offset_x;
-	u32 offset_y;
-	u32 width;
-	u32 height;
-};
-
-struct is_face_marker {
-	u32	frame_number;
-	struct is_fd_rect face;
-	struct is_fd_rect left_eye;
-	struct is_fd_rect right_eye;
-	struct is_fd_rect mouth;
-	u32	roll_angle;
-	u32 yaw_angle;
-	u32	confidence;
-	u32	is_tracked;
-	u32	tracked_face_id;
-	u32	smile_level;
-	u32	blink_level;
-};
-
-struct is_debug_region {
-	u32	frame_count;
-	u32	reserved[PARAMETER_MAX_MEMBER-1];
-};
-
-#define MAX_FRAME_COUNT		8
-#define MAX_FRAME_COUNT_PREVIEW	4
-#define MAX_FRAME_COUNT_CAPTURE	1
-#define MAX_FACE_COUNT		16
-
-#define MAX_SHARED_COUNT	500
-
-struct is_region {
-	struct is_param_region	parameter;
-	struct is_tune_region	tune;
-	struct is_frame_header	header[MAX_FRAME_COUNT];
-	struct is_face_marker	face[MAX_FACE_COUNT];
-	struct is_debug_region	debug;
-	u32			shared[MAX_SHARED_COUNT];
-};
-
-struct is_time_measure_us {
-	u32  min_time_us;
-	u32  max_time_us;
-	u32  avrg_time_us;
-	u32  current_time_us;
-};
-
-struct is_debug_frame_descriptor {
-	u32	sensor_frame_time;
-	u32	sensor_exposure_time;
-	u32	sensor_analog_gain;
-	u32	req_lei;
-};
-
-#define MAX_FRAMEDESCRIPTOR_CONTEXT_NUM	(30 * 20)	/* 600 frame */
-#define MAX_VERSION_DISPLAY_BUF		(32)
-
-struct is_share_region {
-	u32	frame_time;
-	u32	exposure_time;
-	u32	analog_gain;
-
-	u32	r_gain;
-	u32	g_gain;
-	u32	b_gain;
-
-	u32	af_position;
-	u32	af_status;
-	u32 af_scene_type;
-
-	u32	frame_descp_onoff_control;
-	u32	frame_descp_update_done;
-	u32	frame_descp_idx;
-	u32	frame_descp_max_idx;
-
-	struct is_debug_frame_descriptor
-		dbg_frame_descp_ctx[MAX_FRAMEDESCRIPTOR_CONTEXT_NUM];
-
-	u32 chip_id;
-	u32 chip_rev_no;
-	u8	ispfw_version_no[MAX_VERSION_DISPLAY_BUF];
-	u8	ispfw_version_date[MAX_VERSION_DISPLAY_BUF];
-	u8	sirc_sdk_version_no[MAX_VERSION_DISPLAY_BUF];
-	u8	sirc_sdk_revsion_no[MAX_VERSION_DISPLAY_BUF];
-	u8	sirc_sdk_version_date[MAX_VERSION_DISPLAY_BUF];
-
-	/*measure timing*/
-	struct is_time_measure_us	isp_sdk_Time;
-};
-
-struct is_debug_control {
-	u32 write_point;	/* 0~500KB boundary*/
-	u32 assert_flag;	/* 0:Not Inovked, 1:Invoked*/
-	u32 pabort_flag;	/* 0:Not Inovked, 1:Invoked*/
-	u32 dabort_flag;	/* 0:Not Inovked, 1:Invoked*/
-	u32 pd_Ready_flag;	/* 0:Normal, 1:EnterIdle(Ready to power down)*/
-	u32 isp_frameErr;	/* Frame Error Count.*/
-	u32 drc_frame_err;	/* Frame Error Count.*/
-	u32 scc_frame_err;	/* Frame Error Count.*/
-	u32 odc_frame_err;	/* Frame Error Count.*/
-	u32 dis_frame_err;	/* Frame Error Count.*/
-	u32 tdnr_frame_err;	/* Frame Error Count.*/
-	u32 scp_frame_err;	/* Frame Error Count.*/
-	u32 fd_frame_err;	/* Frame Error Count.*/
-	u32 isp_frame_drop;	/* Frame Drop Count.*/
-	u32 drc_frame_drop;	/* Frame Drop Count.*/
-	u32 dis_frame_drop;	/* Frame Drop Count.*/
-	u32 fd_frame_drop;
-};
-#endif
+Å˜{;|;};Æ˜Ç˜È˜É˜Ê˜Ë˜~;!<Ì˜Í˜"<Î˜Ï˜Ð˜#<Ñ˜Ò˜Ó˜Ô˜Õ˜Ö˜×˜$<%<Ø˜&<Ù˜'<Ú˜Û˜Ü˜Ý˜Þ˜ß˜(<à˜á˜â˜)<ã˜ä˜å˜*<æ˜ç˜è˜é˜ê˜ë˜ì˜+<í˜î˜ï˜ð˜,<ñ˜ò˜ó˜ô˜õ˜ö˜-<.</<0<1<÷˜ø˜2<3<ù˜4<5<ú˜û˜ü˜ý˜6<7<þ˜8<9<:<A™B™C™D™;<E™<<=<F™G™><H™I™J™?<K™L™M™N™O™P™Q™@<A<R™B<C<D<S™T™U™V™W™X™E<F<Y™Z™G<a™b™c™H<d™e™f™g™h™i™j™I<J<k™K<L<M<l™m™n™o™p™q™N<r™s™t™O<u™v™w™P<x™y™z™™‚™ƒ™„™…™†™‡™ˆ™‰™Q<Š™‹™Œ™™Ž™™R<S<T<™U<‘™’™“™V<”™W<•™–™—™˜™™™X<Y<š™Z<›™[<œ™™ž™\<Ÿ™ ™]<^<¡™¢™_<£™¤™¥™`<¦™§™¨™©™ª™«™¬™­™®™¯™°™±™a<²™³™´™µ™¶™·™b<¸™¹™º™c<»™¼™½™d<¾™¿™À™Á™Â™Ã™Ä™e<Å™Æ™f<g<Ç™È™É™Ê™Ë™Ì™Í™h<Î™Ï™Ð™i<Ñ™Ò™Ó™j<Ô™Õ™Ö™×™Ø™Ù™Ú™k<l<Û™m<Ü™Ý™Þ™ß™à™á™â™ã™n<o<ä™å™p<æ™ç™è™q<é™ê™ë™ì™í™î™ï™r<s<ð™t<ñ™u<ò™ó™ô™õ™ö™÷™v<w<ø™ù™x<ú™û™y<z<ü™ý™þ™AšBšCšDš{<|<Eš}<Fš~<Gš!=Hš"=#=Iš$=JšKšLšMšNšOšPšQšRšSšTšUšVšWšXšYšZšašbš%=cšdšešfšgšhšiš&='=jškš(=lšmšnš)=ošpšqšršsštšuš*=všwšxšyš+=zšš‚šƒš„š…š,=-=†š‡š.=ˆš‰šŠš/=‹šŒššŽššš‘š0=1=’š2=“š3=”š•š–š—š˜š™š4=5=šš›šœššžšŸš6= š¡š¢š£š¤š¥š¦š7=§š¨š8=©š9=ªš«š¬š­š®š¯š:=;=°š±š<=²š³š´š==>=µš¶š·š¸š¹šºš?=@=»šA=¼šB=½š¾š¿šÀšÁšÂšÃšÄšÅšÆšÇšÈšÉšÊšËšÌšÍšÎšÏšÐšÑšÒšÓšÔšÕšÖš×šØšÙšÚšÛšÜšÝšÞšC=D=ßšàšE=ášâšF=G=ãšäšåšæšçšèšH=I=J=éšK=êšL=ëšìšíšîšM=ïšN=O=ðšP=Q=ñšòšóšR=ôšõšöš÷šøšùšúšS=T=ûšüšU=V=ýšþšA›B›C›W=X=Y=D›E›Z=F›G›H›[=I›J›K›L›M›N›O›\=]=P›Q›^=_=R›S›T›U›V›W›X›Y›Z›a›b›c›d›e›f›g›h›i›j›k›l›m›n›o›p›q›r›`=s›t›u›v›w›x›y›z››‚›ƒ›„›…›†›‡›ˆ›‰›Š›‹›Œ››Ž›››‘›’›“›”›•›–›—›˜›™›š›a=b=››œ›c=›ž›Ÿ›d= ›e=¡›¢›£›¤›¥›f=g=¦›§›h=i=¨›©›ª›«›¬›­›j=®›¯›°›k=±›²›³›l=´›µ›¶›·›¸›¹›º›»›¼›½›¾›¿›À›Á›Â›Ã›Ä›Å›Æ›Ç›È›É›Ê›Ë›Ì›Í›Î›Ï›Ð›Ñ›Ò›Ó›Ô›Õ›Ö›×›Ø›Ù›Ú›Û›Ü›Ý›Þ›ß›à›á›â›ã›ä›å›æ›m=ç›è›é›ê›ë›ì›í›î›ï›ð›ñ›ò›ó›ô›õ›ö›÷›ø›ù›ú›û›ü›ý›n=o=þ›Aœp=BœCœq=r=Dœs=EœFœGœHœIœt=u=JœKœLœv=MœNœOœPœQœRœw=x=SœTœy=UœVœWœXœYœZœaœbœcœdœeœfœgœhœiœz=jœkœlœmœnœoœpœ{=qœrœsœtœuœvœwœxœyœzœœ‚œƒœ„œ…œ†œ‡œˆœ‰œ|=Šœ‹œŒœœŽœœœ}=‘œ’œ“œ~=”œ•œ–œ!>—œ˜œ™œšœ›œœœœ">#>žœŸœ œ¡œ¢œ£œ¤œ¥œ¦œ§œ$>¨œ©œªœ«œ¬œ­œ®œ¯œ°œ±œ²œ³œ´œµœ¶œ·œ¸œ¹œºœ»œ¼œ½œ¾œ¿œÀœÁœÂœ%>&>ÃœÄœ'>ÅœÆœÇœ(>ÈœÉœÊœËœÌœÍœÎœ)>*>ÏœÐœÑœ+>ÒœÓœÔœÕœÖœ×œ,>ØœÙœÚœÛœÜœÝœÞœßœàœáœâœãœäœåœæœçœèœéœêœ->ëœìœíœîœïœðœñœ.>òœóœôœõœöœ÷œøœùœúœûœüœýœþœABCDEFGHIJKLMN/>OPQ0>RSTUVWXYZabcdefghijklmnopqrstuvwxyz‚ƒ„…†‡ˆ‰1>Š‹ŒŽ2>3>‘4>’“”5>•6>–—˜™7>8>9>š›œžŸ ¡¢£:>¤¥¦;>§¨©<>ª«¬­®¯°=>±²³´µ¶·¸¹º»>>?>¼½@>¾¿ÀA>ÁÂÃÄÅÆÇB>C>ÈD>ÉE>ÊËÌÍÎÏF>G>ÐÑH>I>J>ÒK>L>M>ÓÔÕÖN>O>P>×Q>R>S>ØÙÚT>U>ÛV>W>ÜÝX>ÞßàY>áâãäåæçZ>[>è\>]>^>éêëìíî_>`>ïða>ñòób>ôõc>ö÷øùd>e>úf>ûg>üýþh>Aži>j>BžCžDžk>EžFžGžl>HžIžJžKžLžMžNžOžm>PžQžRžSžTžUžVžWžXžYžn>o>Zžažp>q>bžr>s>t>u>cždžežfžgžv>w>x>y>z>{>|>hž}>iž~>jž!?"?kžlž#?mžnžož$?pžqžržsžtžužvž%?&?wž'?xž(?yžzžž‚žƒž„ž)?*?+?…ž,?†ž‡žˆž-?‰ž.?/?Šž‹žŒžž0?1?2?3?4?5?Žžžž6?7?8?9?‘ž’ž“ž:?”ž•ž–ž;?—ž˜ž™žšž›žœžž<?=?žž>???Ÿž ž¡ž¢ž£ž¤ž¥ž@?A?¦ž§žB?¨ž©žªžC?D?E?«žF?¬ž­žG?H?I?®žJ?¯žK?°žL?±ž²ž³ž´žM?N?µž¶žO?·ž¸ž¹žP?ºž»ž¼ž½ž¾ž¿žÀžQ?R?ÁžS?T?U?ÂžÃžÄžÅžÆžÇžV?W?ÈžÉžX?ÊžËžÌžÍžÎžÏžÐžÑžÒžÓžÔžY?ÕžÖžZ?×ž[?ØžÙžÚžÛžÜžÝž\?]?Þžßž^?àžážâž_?ãžäžåžæžçžèžéž`?a?êžb?ëžc?ìžížîžïžðžñžd?e?òžóžf?ôžõžöžg?÷žøžùžúžûžüžýžh?i?þžj?AŸk?BŸCŸDŸEŸFŸGŸl?m?HŸIŸn?JŸKŸLŸo?p?q?MŸNŸOŸPŸQŸr?s?RŸt?SŸu?TŸUŸVŸWŸXŸYŸv?w?ZŸaŸx?bŸcŸdŸy?eŸfŸgŸhŸiŸjŸkŸz?{?lŸmŸ|?}?nŸoŸpŸqŸrŸsŸ~?!@tŸuŸ"@vŸwŸxŸ#@yŸzŸŸ‚ŸƒŸ„Ÿ…Ÿ$@%@†Ÿ‡ŸˆŸ&@‰ŸŠŸ‹ŸŒŸŸŽŸ'@(@ŸŸ)@‘Ÿ’Ÿ“Ÿ*@”Ÿ•Ÿ–Ÿ—Ÿ˜Ÿ™ŸšŸ+@,@›Ÿ-@œŸ.@ŸžŸŸŸ Ÿ¡Ÿ¢Ÿ/@0@£Ÿ¤Ÿ1@¥Ÿ¦Ÿ§Ÿ2@¨Ÿ©ŸªŸ«Ÿ¬Ÿ­Ÿ®Ÿ3@4@¯Ÿ5@°Ÿ6@±Ÿ7@²Ÿ³Ÿ´ŸµŸ8@9@¶Ÿ·Ÿ:@¸Ÿ¹ŸºŸ;@»Ÿ¼Ÿ½Ÿ¾Ÿ¿Ÿ<@ÀŸ=@>@ÁŸ?@ÂŸ@@A@B@C@D@E@F@G@ÃŸÄŸÅŸH@ÆŸÇŸÈŸI@ÉŸÊŸËŸÌŸÍŸÎŸÏŸJ@ÐŸÑŸK@ÒŸÓŸÔŸÕŸÖŸ×ŸØŸÙŸL@M@ÚŸÛŸN@ÜŸÝŸÞŸO@P@Q@ßŸàŸáŸâŸR@S@T@ãŸU@V@W@X@äŸåŸæŸY@çŸZ@[@èŸéŸ\@êŸ]@^@_@ëŸ`@ìŸíŸîŸïŸðŸa@b@ñŸc@d@e@f@òŸóŸôŸõŸöŸg@h@÷ŸøŸi@ùŸúŸûŸj@üŸýŸþŸA B C D k@l@E m@n@o@F G H I J K p@q@L M r@N s@O t@P Q R S T U V u@W X Y Z v@a b c d e f w@g h i x@j k l y@m n o p q r s t u v w x y z  ‚ ƒ „ … z@{@† ‡ |@ˆ ‰ Š }@‹ ~@Œ  Ž   !A"A‘ #A’ $A%A“ ” • – — &A'A˜ ™ (Aš › œ )A ž Ÿ   ¡ ¢ £ *A+A¤ ,A¥ -A¦ § ¨ © ª « .A¬ ­ ® /A¯ ° ± 0A² ³ ´ µ ¶ · ¸ 1A2A¹ º 3A4A» ¼ ½ ¾ ¿ À 5AÁ Â Ã Ä Å Æ Ç È É Ê Ë Ì Í Î Ï Ð Ñ Ò Ó Ô Õ Ö × Ø Ù Ú Û 6A7AÜ Ý 8AÞ ß à 9Aá :Aâ ã ä å æ ;A<Aç =Aè >A?A@Aé ê ë AABACAì í î ï ð ñ DAò ó ô õ ö ÷ ø ù EAú FAû GAü ý þ A¡B¡C¡HAD¡E¡F¡G¡H¡I¡J¡K¡L¡M¡N¡O¡P¡Q¡R¡S¡T¡U¡V¡IAJAW¡X¡Y¡Z¡a¡b¡KAc¡d¡e¡LAf¡g¡h¡MAi¡j¡k¡l¡m¡n¡o¡NAOAp¡PAq¡QAr¡s¡t¡u¡v¡w¡RASAx¡y¡TAz¡¡‚¡ƒ¡„¡…¡†¡‡¡ˆ¡‰¡Š¡‹¡Œ¡¡Ž¡¡UA¡‘¡’¡“¡”¡•¡VAWA–¡—¡XA˜¡™¡š¡YAZA[A›¡œ¡¡ž¡Ÿ¡\A]A ¡^AA¢_AB¢C¢D¢E¢F¢G¢`AH¢I¢J¢K¢L¢M¢N¢O¢P¢Q¢R¢S¢T¢U¢V¢W¢X¢Y¢Z¢aAa¢b¢c¢d¢e¢f¢g¢bAh¢i¢j¢k¢l¢m¢n¢o¢p¢q¢r¢s¢t¢u¢v¢w¢x¢y¢z¢¢‚¢ƒ¢„¢…¢†¢‡¢ˆ¢cAdA‰¢Š¢eA‹¢Œ¢¢fAŽ¢¢¢‘¢’¢“¢”¢gAhA•¢iA–¢—¢˜¢™¢š¢›¢œ¢¢jAž¢Ÿ¢ ¢kAA£B£C£lAD£E£F£G£H£I£J£mAK£L£M£N£O£P£Q£R£S£T£U£nAoAV£W£pAX£Y£Z£qAa£b£c£d£e£f£g£rAsAh£tAi£uAj£k£l£m£n£o£p£q£r£s£t£u£v£w£x£y£z££‚£ƒ£„£…£†£‡£ˆ£‰£Š£‹£Œ££Ž£££‘£vAwA’£“£xA”£•£yAzA–£{A—£˜£™£š£›£|A}Aœ£~A£!B"Bž£Ÿ£#B$B £%B&BA¤B¤'BC¤(BD¤)BE¤F¤*BG¤H¤I¤J¤+B,BK¤-B.B/BL¤M¤N¤O¤P¤Q¤0B1BR¤S¤2BT¤U¤V¤3BW¤X¤Y¤Z¤a¤b¤c¤4B5Bd¤6B7B8Be¤f¤g¤h¤i¤j¤9Bk¤l¤m¤:Bn¤o¤p¤q¤r¤s¤t¤u¤v¤w¤x¤y¤z¤¤‚¤ƒ¤;B„¤…¤†¤‡¤ˆ¤‰¤Š¤‹¤Œ¤¤Ž¤¤¤‘¤’¤“¤”¤•¤–¤—¤˜¤™¤š¤›¤œ¤¤ž¤Ÿ¤ ¤A¥B¥C¥D¥E¥<B=BF¥G¥>BH¥I¥J¥?BK¥L¥M¥N¥O¥P¥Q¥@BABR¥BBCBDBS¥T¥U¥V¥W¥X¥EBY¥Z¥a¥b¥c¥d¥e¥f¥g¥h¥i¥j¥k¥l¥m¥n¥o¥p¥q¥r¥FBs¥t¥u¥v¥w¥x¥GBy¥z¥¥‚¥ƒ¥„¥…¥†¥‡¥ˆ¥‰¥Š¥‹¥Œ¥¥Ž¥¥¥‘¥HB’¥“¥”¥•¥–¥—¥˜¥™¥š¥›¥œ¥¥ž¥Ÿ¥ ¥A¦B¦C¦D¦E¦F¦G¦H¦I¦J¦K¦L¦M¦N¦O¦P¦Q¦R¦S¦T¦IBJBU¦V¦KBW¦X¦Y¦LBZ¦a¦b¦c¦d¦e¦f¦MBNBg¦OBh¦PBi¦QBj¦k¦l¦m¦RBSBn¦o¦p¦q¦r¦s¦TBt¦u¦v¦w¦x¦y¦z¦¦‚¦ƒ¦„¦UB…¦†¦‡¦ˆ¦‰¦Š¦‹¦VBŒ¦¦Ž¦¦¦‘¦’¦“¦”¦•¦–¦—¦˜¦™¦š¦›¦œ¦¦ž¦WBŸ¦ ¦A§B§C§D§E§XBF§G§H§YBI§J§K§ZBL§M§N§O§P§Q§R§[B\BS§T§U§V§W§X§Y§Z§a§b§c§d§e§f§g§h§i§j§k§l§m§n§o§p§q§r§s§t§u§v§w§]Bx§y§z§§‚§ƒ§^B_B„§…§`B†§‡§ˆ§aB‰§Š§‹§Œ§§Ž§§bBcB§‘§’§dB“§”§•§–§—§˜§eB™§š§›§œ§§ž§Ÿ§ §A¨B¨C¨D¨E¨F¨G¨H¨I¨J¨K¨fBgBL¨M¨N¨O¨P¨Q¨R¨S¨T¨U¨V¨W¨X¨Y¨Z¨a¨b¨c¨d¨e¨f¨g¨h¨i¨j¨k¨l¨m¨n¨o¨p¨q¨r¨s¨hBt¨u¨v¨w¨x¨y¨z¨¨‚¨ƒ¨„¨…¨†¨‡¨ˆ¨‰¨Š¨‹¨Œ¨¨Ž¨¨¨‘¨’¨“¨”¨iB•¨–¨—¨˜¨™¨š¨›¨œ¨¨ž¨Ÿ¨ ¨A©B©C©D©E©F©G©H©I©J©K©L©M©N©O©jBP©Q©R©S©T©U©V©W©X©Y©Z©a©b©c©d©kBe©f©lBg©mBh©i©j©k©l©m©n©o©p©q©r©s©t©u©v©w©x©y©z©©‚©ƒ©„©…©†©‡©ˆ©‰©Š©‹©Œ©©Ž©©nBoB©‘©pB’©“©”©qB•©–©—©˜©™©š©›©rBsBœ©©ž©tBuBŸ© ©AªBªvBwBxBCªDªyBEªzBFª{BGªHªIªJªKªLªMª|B}BNª~B!C"C#COªPªQªRªSª$C%CTªUª&CVªWªXª'CYªZªaªbªcªdªeª(C)Cfª*C+C,Cgªhªiªjªkªlª-Cmªnªoª.Cpª/Cqª0Crªsªtªuªvªwªxª1Cyªzªª‚ª2Cƒª„ª…ª†ª‡ªˆª‰ªŠª‹ªŒªªŽªªª‘ª’ª“ª”ª•ª–ª—ª˜ª™ªšª›ªœªªžªŸª ªA«B«C«D«3C4CE«F«5CG«H«I«6CJ«K«L«M«N«O«P«7C8CQ«9C:C;CR«S«T«U«V«W«<C=CX«Y«>CZ«a«b«?Cc«d«e«f«g«h«i«@CACj«BCk«CCl«m«n«o«p«q«DCr«s«t«ECu«v«w«x«y«z««‚«ƒ«„«…«†«‡«ˆ«‰«FCŠ«‹«Œ««Ž«««GC‘«’«“«HC”«•«–«—«˜«™«š«›«œ««ž«Ÿ« «A¬B¬C¬ICD¬E¬F¬G¬H¬I¬JCKCJ¬K¬LCL¬M¬N¬MCO¬P¬Q¬R¬S¬T¬U¬NCOCV¬PCW¬QCX¬Y¬Z¬a¬b¬c¬RCd¬e¬f¬SCg¬h¬i¬TCj¬k¬l¬m¬n¬o¬p¬q¬r¬s¬t¬u¬UCv¬w¬x¬y¬z¬¬‚¬ƒ¬„¬…¬†¬‡¬ˆ¬‰¬Š¬‹¬Œ¬¬Ž¬¬¬‘¬’¬“¬”¬•¬–¬—¬˜¬™¬š¬›¬œ¬¬VCž¬Ÿ¬ ¬WCA­B­C­XCD­E­F­G­H­I­J­YCZCK­[CL­\CM­N­O­P­Q­R­]CS­T­U­V­W­X­Y­Z­a­b­c­d­e­f­g­^Ch­i­j­k­l­m­n­o­p­q­r­_C`Cs­t­aCu­v­w­bCx­y­z­­‚­ƒ­„­cCdC…­eC†­fC‡­ˆ­‰­Š­‹­Œ­gC­Ž­­­‘­’­“­”­•­–­—­˜­™­š­›­œ­­ž­Ÿ­hC ­A®B®C®D®E®F®iCG®H®I®jCJ®K®L®M®N®O®P®Q®R®S®T®U®V®W®X®Y®Z®a®b®c®d®e®f®kCg®h®i®lCj®k®l®mCm®n®o®p®q®r®s®nCoCt®pCu®qCv®w®x®y®z®®rC‚®ƒ®„®sC…®†®‡®tCˆ®‰®Š®‹®Œ®®Ž®uC®®‘®’®vC“®”®•®–®—®˜®wCxC™®š®yC›®œ®®zCž®Ÿ® ®A¯B¯C¯D¯{C|CE¯}CF¯~CG¯H¯I¯J¯K¯L¯M¯N¯O¯P¯Q¯R¯S¯T¯U¯V¯W¯X¯Y¯Z¯a¯b¯c¯d¯e¯f¯g¯h¯i¯j¯k¯l¯m¯n¯!D"Do¯p¯#Dq¯r¯$D%D&Ds¯t¯u¯v¯w¯x¯'D(Dy¯)Dz¯*D¯‚¯ƒ¯„¯…¯†¯+D,D‡¯ˆ¯-D‰¯Š¯‹¯.DŒ¯¯Ž¯¯¯‘¯’¯/D0D“¯1D”¯2D•¯–¯—¯˜¯™¯š¯3D4D›¯œ¯5D¯ž¯Ÿ¯6D ¯A°B°C°D°E°F°7D8DG°9D:D;DH°I°J°K°L°M°<D=DN°O°P°Q°R°S°T°U°V°W°X°Y°Z°a°b°c°d°e°f°>Dg°h°i°j°k°l°m°n°o°p°q°r°s°t°u°v°w°x°y°z°°‚°ƒ°„°…°†°‡°ˆ°‰°Š°‹°Œ°°Ž°?D@D°°AD‘°’°BDCD“°”°•°–°—°˜°™°DDEDš°FDGDHD›°œ°°ž°Ÿ° °IDJDA±B±KDC±D±E±LDF±G±H±I±J±K±L±MDNDM±ODN±PDO±P±Q±R±S±T±QDU±V±W±RDX±Y±Z±SDa±b±c±d±e±f±g±TDUDh±VDWDXDi±j±k±l±m±n±YDo±p±q±r±s±t±u±v±w±x±y±z±±‚±ƒ±„±…±†±‡±ˆ±‰±Š±‹±Œ±±Ž±±ZD[D±‘±\D’±“±”±]D•±–±—±˜±™±š±›±^D_Dœ±`D±aDž±Ÿ± ±A²B²C²bDcDD²E²dDF²G²H²eDI²J²K²L²M²N²O²fDP²Q²R²S²gDT²U²V²W²X²Y²hDZ²a²b²c²d²e²f²g²h²i²j²k²l²m²n²o²p²q²r²s²iDt²u²v²w²x²y²jDz²²‚²ƒ²„²…²†²kD‡²ˆ²‰²Š²‹²Œ²²Ž²²²‘²’²“²”²•²–²—²˜²™²lDš²›²œ²²ž²Ÿ² ²A³B³C³D³E³F³G³H³I³J³K³L³M³N³O³P³Q³R³S³T³mDnDU³V³oDW³X³Y³pDZ³a³b³c³d³e³f³qDrDg³sDh³tDi³j³k³l³m³n³uDo³p³q³vDr³s³t³wDu³v³w³x³y³z³³‚³ƒ³„³…³†³xD‡³ˆ³‰³Š³‹³Œ³yD³Ž³³³‘³’³“³”³•³–³—³˜³™³š³›³œ³³ž³Ÿ³ ³zDA´B´C´D´E´F´{D|DG´H´}DI´J´K´~DL´M´N´O´P´Q´R´!E"ES´#ET´$EU´V´W´X´Y´Z´%Ea´b´c´&Ed´e´f´'Eg´h´i´j´k´l´m´(En´o´p´q´r´s´t´u´v´w´x´)E*Ey´z´+E´‚´ƒ´,E„´…´†´‡´ˆ´‰´Š´-E.E‹´Œ´´/EŽ´´´‘´’´“´”´•´–´—´˜´™´š´›´œ´´ž´Ÿ´ ´AµBµCµDµEµFµGµHµIµJµKµLµMµNµOµ0E1EPµQµ2ERµSµTµ3EUµVµWµXµYµZµaµ4E5Ebµ6Ecµ7Edµeµfµgµhµiµ8E9Ejµkµ:Elµmµnµ;E<Eoµpµqµrµsµtµ=E>Euµ?E@EAEvµwµxµyµzµµBECE‚µƒµDE„µ…µ†µEE‡µˆµ‰µŠµ‹µŒµµFEGEŽµHEIEJEµµ‘µ’µ“µ”µKE•µ–µ—µ˜µ™µšµ›µœµµžµŸµ µA¶B¶C¶D¶E¶F¶G¶H¶LEI¶J¶K¶L¶M¶N¶O¶P¶Q¶R¶S¶T¶U¶V¶W¶X¶Y¶Z¶a¶b¶c¶d¶e¶f¶g¶h¶i¶j¶k¶l¶m¶n¶o¶p¶MENEq¶r¶OEs¶t¶u¶PEv¶QEw¶x¶y¶z¶¶RESE‚¶TEUEVEƒ¶„¶…¶†¶‡¶ˆ¶WEXE‰¶Š¶YE‹¶Œ¶¶ZEŽ¶¶¶‘¶’¶“¶”¶[E\E•¶]E–¶^E—¶˜¶™¶š¶›¶œ¶_E¶ž¶Ÿ¶`E ¶A·B·C·D·E·F·G·H·I·J·K·L·M·N·aEO·P·Q·R·S·T·U·bEV·W·X·cEY·Z·a·b·c·d·e·f·g·h·i·j·k·l·m·n·o·p·q·r·s·t·u·dEeEv·w·fEx·y·z·gE·‚·ƒ·„·…·†·‡·hEiEˆ·jE‰·kEŠ·‹·Œ··lEŽ·mE··‘·nE’·“·”·•·–·—·˜·™·š·›·œ··ž·Ÿ· ·A¸B¸C¸D¸E¸F¸G¸H¸oEI¸J¸K¸L¸M¸N¸O¸P¸Q¸R¸S¸T¸U¸V¸W¸X¸Y¸Z¸a¸b¸c¸d¸e¸f¸g¸h¸i¸pEj¸k¸l¸qEm¸n¸o¸p¸q¸r¸s¸t¸u¸v¸w¸x¸y¸z¸rE¸sE‚¸ƒ¸„¸…¸†¸‡¸tEˆ¸‰¸Š¸‹¸Œ¸¸Ž¸¸¸‘¸’¸“¸”¸•¸–¸—¸˜¸™¸š¸›¸œ¸¸ž¸Ÿ¸ ¸A¹B¹uEvEC¹D¹wEE¹F¹G¹xEH¹I¹J¹K¹L¹M¹N¹yEzEO¹{EP¹|EQ¹R¹S¹T¹U¹V¹}EW¹X¹Y¹Z¹a¹b¹c¹d¹e¹f¹g¹h¹i¹j¹k¹l¹m¹n¹o¹~Ep¹q¹r¹s¹t¹u¹v¹!Fw¹x¹y¹z¹¹‚¹ƒ¹„¹…¹†¹‡¹ˆ¹‰¹Š¹‹¹Œ¹¹Ž¹¹¹‘¹’¹“¹”¹•¹–¹—¹"F#F˜¹™¹$Fš¹›¹œ¹%F¹ž¹Ÿ¹ ¹AºBºCº&F'FDºEºFº(FGºHºIºJºKºLº)FMºNºOº*FPºQºRº+FSºTºUºVºWºXºYº,FZºaºbºcº-Fdºeºfºgºhºiº.F/Fjºkº0Flºmº1F2Fnº3Foºpºqºrºsº4F5Ftº6Fuºvºwºxºyºzºº‚º7Fƒº„º…º8F†º‡ºˆº9F‰ºŠº‹ºŒººŽºº:F;Fº‘º’º“º”º•º–º—º˜º™º<F=Fšº›º>Fœººžº?FŸº ºA»B»C»D»E»@FAFF»BFG»CFH»I»J»K»L»M»DFEFFFN»GFO»P»Q»HFR»IFS»T»U»V»W»JFKFX»LFMFNFY»Z»a»OFb»c»PFQFd»e»RFf»g»h»SFi»j»k»l»m»n»o»TFUFp»VFWFXFq»r»s»t»u»v»YFZFw»x»y»z»»‚»ƒ»„»…»†»‡»ˆ»‰»Š»‹»Œ»»Ž»»»‘»’»“»”»•»–»—»˜»™»š»›»œ»»ž»Ÿ» »A¼B¼C¼D¼E¼F¼G¼H¼I¼J¼K¼L¼M¼N¼O¼P¼Q¼R¼[F\FS¼T¼]FU¼V¼W¼^FX¼Y¼Z¼a¼b¼c¼d¼_F`Fe¼aFbFcFf¼g¼h¼i¼j¼k¼dFeFl¼m¼fFn¼o¼p¼gFq¼r¼s¼t¼u¼v¼w¼hFiFx¼jFy¼kFz¼¼‚¼ƒ¼„¼…¼lF†¼‡¼ˆ¼mF‰¼Š¼‹¼nFŒ¼¼Ž¼¼¼‘¼’¼oFpF“¼”¼qFrF•¼–¼—¼˜¼™¼š¼sF›¼œ¼¼ž¼Ÿ¼ ¼A½tFB½C½D½E½F½G½H½I½uFJ½vFK½L½M½N½O½P½Q½R½wFxFS½T½yFU½V½W½zFX½Y½Z½a½b½c½d½{F|Fe½}Ff½~Fg½h½i½j½k½l½!Gm½n½o½p½q½r½s½t½u½v½w½x½y½z½½‚½ƒ½„½…½†½"G‡½ˆ½‰½Š½‹½Œ½½Ž½½½‘½’½“½”½•½–½—½˜½™½š½›½œ½½ž½Ÿ½ ½A¾B¾C¾D¾E¾F¾G¾H¾#GI¾J¾K¾$GL¾M¾N¾O¾P¾Q¾R¾S¾T¾U¾V¾W¾X¾Y¾Z¾a¾b¾c¾d¾e¾f¾g¾h¾%Gi¾j¾k¾&Gl¾m¾n¾'Go¾p¾q¾r¾s¾t¾u¾v¾(Gw¾)Gx¾y¾z¾¾‚¾ƒ¾„¾…¾*G+G†¾‡¾,Gˆ¾‰¾-G.GŠ¾/G‹¾Œ¾¾Ž¾¾0G1G¾2G‘¾3G’¾“¾”¾•¾–¾—¾4G˜¾™¾š¾›¾œ¾¾ž¾Ÿ¾ ¾A¿B¿C¿D¿E¿F¿G¿H¿I¿J¿K¿5GL¿M¿N¿O¿P¿Q¿R¿S¿T¿U¿V¿W¿X¿Y¿Z¿a¿b¿c¿d¿e¿f¿g¿h¿i¿j¿k¿l¿m¿n¿o¿p¿q¿r¿s¿6Gt¿u¿v¿7Gw¿x¿y¿8Gz¿¿‚¿ƒ¿„¿…¿†¿9G‡¿ˆ¿:G‰¿Š¿‹¿Œ¿¿Ž¿¿¿;G‘¿’¿“¿<G”¿•¿–¿=G—¿˜¿™¿š¿›¿œ¿¿>Gž¿Ÿ¿?G ¿@GAÀBÀCÀDÀEÀFÀAGGÀHÀIÀBGJÀKÀLÀCGMÀNÀOÀPÀQÀRÀSÀDGEGTÀFGUÀVÀWÀXÀYÀZÀaÀbÀcÀdÀeÀfÀgÀhÀiÀjÀkÀlÀmÀnÀoÀpÀqÀrÀsÀtÀuÀvÀwÀxÀyÀzÀÀ‚ÀƒÀ„ÀGGHG…À†ÀIG‡ÀˆÀ‰ÀJGŠÀ‹ÀŒÀÀŽÀÀÀKGLG‘ÀMG’ÀNG“À”À•À–À—À˜ÀOGPG™ÀšÀQG›ÀœÀÀRGžÀŸÀ ÀAÁSGBÁCÁTGUGDÁVGEÁWGFÁGÁHÁIÁJÁKÁXGYGLÁMÁZGNÁOÁPÁ[GQÁRÁSÁTÁUÁVÁWÁ\G]GXÁ^G_G`GYÁZÁaÁbÁcÁdÁaGeÁfÁgÁhÁiÁjÁkÁlÁmÁnÁoÁpÁqÁrÁsÁtÁuÁvÁwÁxÁbGyÁzÁÁ‚ÁƒÁ„Á…Á†Á‡ÁˆÁ‰ÁŠÁ‹ÁŒÁÁŽÁÁÁ‘Á’Á“Á”Á•Á–Á—Á˜Á™ÁšÁ›ÁœÁÁžÁŸÁ ÁcGdGAÂBÂeGCÂDÂEÂfGFÂgGGÂHÂIÂJÂKÂhGiGLÂjGMÂkGNÂOÂPÂQÂRÂSÂlGmGTÂUÂnGVÂWÂXÂoGYÂZÂaÂbÂcÂdÂeÂpGqGfÂrGgÂsGhÂiÂjÂkÂlÂmÂtGuGnÂoÂvGpÂqÂrÂwGsÂtÂuÂvÂwÂxÂyÂxGyGzÂzG{G|GÂ‚ÂƒÂ„Â…Â†Â}G‡ÂˆÂ‰Â~GŠÂ‹ÂŒÂ!HÂŽÂÂÂ‘Â’Â“Â”Â"H•Â–Â—Â˜Â™ÂšÂ›ÂœÂÂžÂ#H$HŸÂ Â%HAÃBÃCÃ&HDÃEÃFÃGÃ'HHÃIÃ(H)HJÃ*HKÃ+HLÃMÃNÃ,HOÃPÃ-H.HQÃRÃ/HSÃTÃUÃ0HVÃWÃXÃYÃZÃaÃbÃcÃdÃeÃ1HfÃ2HgÃhÃiÃjÃkÃlÃ3H4HmÃnÃ5HoÃpÃqÃrÃsÃtÃuÃvÃwÃxÃyÃzÃÃ‚Ã6HƒÃ7H„Ã…Ã†Ã‡ÃˆÃ‰Ã8H9HŠÃ‹Ã:HŒÃÃŽÃ;HÃÃ‘Ã’Ã“Ã”Ã•Ã–Ã<H—Ã=H˜Ã>H™ÃšÃ›ÃœÃÃžÃ?HŸÃ ÃAÄ@HBÄCÄDÄAHEÄFÄGÄHÄIÄJÄKÄLÄBHMÄCHNÄOÄPÄQÄRÄSÄTÄUÄDHEHVÄWÄFHXÄYÄZÄGHaÄbÄcÄdÄHHeÄfÄIHgÄhÄJHiÄKHjÄkÄlÄmÄnÄoÄLHpÄqÄrÄMHsÄtÄuÄNHvÄwÄxÄyÄzÄÄ‚ÄOHƒÄ„Ä…Ä†ÄPH‡ÄˆÄ‰ÄŠÄ‹ÄŒÄQHRHÄŽÄSHÄÄ‘ÄTH’Ä“Ä”Ä•Ä–Ä—Ä˜Ä™ÄšÄ›ÄœÄÄUHžÄŸÄ ÄAÅBÅCÅVHWHDÅEÅXHFÅGÅHÅYHIÅJÅKÅLÅMÅNÅOÅZH[HPÅ\HQÅ]HRÅSÅTÅUÅVÅWÅ^H_HXÅYÅ`HZÅaÅbÅaHcÅdÅeÅfÅgÅhÅiÅbHjÅkÅcHlÅdHmÅnÅoÅpÅqÅrÅeHfHsÅtÅgHuÅhHiHjHkHvÅwÅxÅyÅzÅÅlHmH‚ÅnHƒÅoH„Å…Å†ÅpH‡ÅˆÅqH‰ÅŠÅ‹ÅrHŒÅÅŽÅsHÅÅ‘Å’Å“Å”Å•ÅtHuH–Å—Å˜ÅvH™ÅšÅ›ÅœÅÅžÅwHxHŸÅ ÅyHAÆBÆCÆzHDÆEÆFÆGÆHÆIÆJÆ{H|HKÆ}HLÆ~HMÆNÆOÆPÆQÆRÆPKVKgKOMhM-N{O"P8PPP]PTQUQXQ[Q\Q]Q^Q_Q`QbQcQdQeQfQhQiQjQkQmQoQpQrQvQzQ|Q}Q~Q"R#R'R(R)R*R+R-R2R>RBRCRDRFRGRHRIRJRKRMRNRORPRQRRRSRTRURVRWRYRZR^R_RaRbRdReRfRgRhRiRjRkRpRqRrRsRtRuRwRxRfT|T%U+U.U8VMVKWdWE[d[%\%]U]t]|^~^3_a_h_q`-amauc!d)d.e1e2e9e;e<eDeNePeReVeze{e|e~e!f$f'f-f/f0f1f3f7f8f<fDfFfGfJfRfVfYf\f_fafdfefffhfjfkflfofqfrfufvfwfyf!g&g)g*g,g-g0g?gAgFgGgKgMgOgPgSg_gdgfgwgghhhphqhwhyh{h~h'i,iLiwiAjejtjwj|j~j$k'k)k*k:k;k=kAkBkFkGkLkOkPkQkRkXk&l'l*l/l0l1l2l5l8l:l@lAlElFlIlJlUl]l^laldlglhlwlxlzl!m"m#mnm[n=rzr1s'tnttvvv8wHwSw[xpx!z"zfz)|!#"###$#%#&#'#(#)#*#+#,#-#.#/#0#1#2#3#4#5#6#7#8#9#:#;#<#=#>#?#@#A#B#C#D#E#F#G#H#I#J#K#L#M#N#O#P#Q#R#S#T#U#V#W#X#Y#Z#[#,!]#^#_#`#a#b#c#d#e#f#g#h#i#j#k#l#m#n#o#p#q#r#s#t#u#v#w#x#y#z#{#|#}#&"ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿK!L!~!~#ÿÿM!\#       	
+  	
+   000· % & ¨ 0­  %"<ÿ<"    000	0
+00000000± × ÷ `"d"e""4"° 2 3 !+!àÿáÿåÿB&@& "¥"#""a"R"§ ; &&Ë%Ï%Î%Ç%Æ%¡% %³%²%½%¼%’!!‘!“!”!0j"k""=""5"+","""†"‡"‚"ƒ"*")"'"("âÿÒ!Ô! ""´ ^ÿÇØÝÚÙ¸ Û¡ ¿ Ð."""¤ 	!0 Á%À%·%¶%d&`&a&e&g&c&™"È%£%Ð%Ñ%’%¤%¥%¨%§%¦%©%h&&&&&¶   ! •!—!™!–!˜!m&i&j&l&22!Ç3"!Â3Ø3!!¬ ® ÿÿÿÿÿÿÿÿ	ÿ
+ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ ÿ!ÿ"ÿ#ÿ$ÿ%ÿ&ÿ'ÿ(ÿ)ÿ*ÿ+ÿ,ÿ-ÿ.ÿ/ÿ0ÿ1ÿ2ÿ3ÿ4ÿ5ÿ6ÿ7ÿ8ÿ9ÿ:ÿ;ÿæÿ=ÿ>ÿ?ÿ@ÿAÿBÿCÿDÿEÿFÿGÿHÿIÿJÿKÿLÿMÿNÿOÿPÿQÿRÿSÿTÿUÿVÿWÿXÿYÿZÿ[ÿ\ÿ]ÿãÿ112131415161718191:1;1<1=1>1?1@1A1B1C1D1E1F1G1H1I1J1K1L1M1N1O1P1Q1R1S1T1U1V1W1X1Y1Z1[1\1]1^1_1`1a1b1c1d1e1f1g1h1i1j1k1l1m1n1o1p1q1r1s1t1u1v1w1x1y1z1{1|1}1~11€11‚1ƒ1„1…1†1‡1ˆ1‰1Š1‹1Œ11Ž1p!q!r!s!t!u!v!w!x!y!þÿþÿþÿþÿþÿ`!a!b!c!d!e!f!g!h!i!þÿþÿþÿþÿþÿþÿþÿ‘’“”•–—˜™š›œžŸ ¡£¤¥¦§¨©þÿþÿþÿþÿþÿþÿþÿþÿ±²³´µ¶·¸¹º»¼½¾¿ÀÁÃÄÅÆÇÈÉ %%%%%%%,%$%4%<%%%%%%%#%3%+%;%K% %/%(%7%?%%0%%%8%B%%%%%%%%%%%!%"%&%'%)%*%-%.%1%2%5%6%9%:%=%>%@%A%C%D%E%F%G%H%I%J%•3–3—3!˜3Ä3£3¤3¥3¦3™3š3›3œ33ž3Ÿ3 3¡3¢3Ê33Ž33Ï3ˆ3‰3È3§3¨3°3±3²3³3´3µ3¶3·3¸3¹3€33‚3ƒ3„3º3»3¼3½3¾3¿33‘3’3“3”3&!À3Á3Š3‹3Œ3Ö3Å3­3®3¯3Û3©3ª3«3¬3Ý3Ð3Ó3Ã3É3Ü3Æ3Æ Ð ª &þÿ2þÿ?AØ Rº Þ fJþÿ`2a2b2c2d2e2f2g2h2i2j2k2l2m2n2o2p2q2r2s2t2u2v2w2x2y2z2{2Ð$Ñ$Ò$Ó$Ô$Õ$Ö$×$Ø$Ù$Ú$Û$Ü$Ý$Þ$ß$à$á$â$ã$ä$å$æ$ç$è$é$`$a$b$c$d$e$f$g$h$i$j$k$l$m$n$½ S!T!¼ ¾ [!\!]!^!æ ð '138@Bø Sß þ gKI 222222222	2
+222222222222222222œ$$ž$Ÿ$ $¡$¢$£$¤$¥$¦$§$¨$©$ª$«$¬$­$®$¯$°$±$²$³$´$µ$t$u$v$w$x$y$z${$|$}$~$$€$$‚$¹ ² ³ t   ‚ ƒ „ A0B0C0D0E0F0G0H0I0J0K0L0M0N0O0P0Q0R0S0T0U0V0W0X0Y0Z0[0\0]0^0_0`0a0b0c0d0e0f0g0h0i0j0k0l0m0n0o0p0q0r0s0t0u0v0w0x0y0z0{0|0}0~00€00‚0ƒ0„0…0†0‡0ˆ0‰0Š0‹0Œ00Ž000‘0’0“0¡0¢0£0¤0¥0¦0§0¨0©0ª0«0¬0­0®0¯0°0±0²0³0´0µ0¶0·0¸0¹0º0»0¼0½0¾0¿0À0Á0Â0Ã0Ä0Å0Æ0Ç0È0É0Ê0Ë0Ì0Í0Î0Ï0Ð0Ñ0Ò0Ó0Ô0Õ0Ö0×0Ø0Ù0Ú0Û0Ü0Ý0Þ0ß0à0á0â0ã0ä0å0æ0ç0è0é0ê0ë0ì0í0î0ï0ð0ñ0ò0ó0ô0õ0ö0 !"#$%&'()*+,-./þÿþÿþÿþÿþÿþÿþÿþÿþÿþÿþÿþÿþÿþÿþÿ012345Q6789:;<=>?@ABCDEFGHIJKLMNO ¬¬¬¬¬	¬
+¬¬¬¬¬¬¬¬¬¬¬¬¬¬ ¬$¬,¬-¬/¬0¬1¬8¬9¬<¬@¬K¬M¬T¬X¬\¬p¬q¬t¬w¬x¬z¬€¬¬ƒ¬„¬…¬†¬‰¬Š¬‹¬Œ¬¬”¬œ¬¬Ÿ¬ ¬¡¬¨¬©¬ª¬¬¬¯¬°¬¸¬¹¬»¬¼¬½¬Á¬Ä¬È¬Ì¬Õ¬×¬à¬á¬ä¬ç¬è¬ê¬ì¬ï¬ð¬ñ¬ó¬õ¬ö¬ü¬ý¬ ­­­­­­­­­ ­)­,­-­4­5­8­<­D­E­G­I­P­T­X­a­c­l­m­p­s­t­u­v­{­|­}­­­‚­ˆ­‰­Œ­­œ­­¤­·­À­Á­Ä­È­Ð­Ñ­Ó­Ü­à­ä­ø­ù­ü­ÿ­ ®®®	®®®®0®1®4®7®8®:®@®A®C®E®F®J®L®M®N®P®T®V®\®]®_®`®a®e®h®i®l®p®x®y®{®|®}®„®…®Œ®¼®½®¾®À®Ä®Ì®Í®Ï®Ð®Ñ®Ø®Ù®Ü®è®ë®í®ô®ø®ü®¯¯¯¯,¯-¯0¯2¯4¯<¯=¯?¯A¯B¯C¯H¯I¯P¯\¯]¯d¯e¯y¯€¯„¯ˆ¯¯‘¯•¯œ¯¸¯¹¯¼¯À¯Ç¯È¯É¯Ë¯Í¯Î¯Ô¯Ü¯è¯é¯ð¯ñ¯ô¯ø¯ °°°°°°°°(°D°E°H°J°L°N°S°T°U°W°Y°]°|°}°€°„°Œ°°°‘°˜°™°š°œ°Ÿ° °¡°¢°¨°©°«°¬°­°®°¯°±°³°´°µ°¸°¼°Ä°Å°Ç°È°É°Ð°Ñ°Ô°Ø°à°å°±	±±±±±±±±±±±#±$±%±(±,±4±5±7±8±9±@±A±D±H±P±Q±T±U±X±\±`±x±y±|±€±‚±ˆ±‰±‹±±’±“±”±˜±œ±¨±Ì±Ð±Ô±Ü±Ý±ß±è±é±ì±ð±ù±û±ý±²²²²²²²²² ²4²<²X²\²`²h²i²t²u²|²„²…²‰²²‘²”²˜²™²š² ²¡²£²¥²¦²ª²¬²°²´²È²É²Ì²Ð²Ò²Ø²Ù²Û²Ý²â²ä²å²æ²è²ë²ì²í²î²ï²ó²ô²õ²÷²ø²ù²ú²û²ÿ² ³³³³³³³³³³T³U³V³X³[³\³^³_³d³e³g³i³k³n³p³q³t³x³€³³ƒ³„³…³Œ³³”³ ³¡³¨³¬³Ä³Å³È³Ë³Ì³Î³Ð³Ô³Õ³×³Ù³Û³Ý³à³ä³è³ü³´´´ ´(´)´+´4´P´Q´T´X´`´a´c´e´l´€´ˆ´´¤´¨´¬´µ´·´¹´À´Ä´È´Ð´Õ´Ü´Ý´à´ã´ä´æ´ì´í´ï´ñ´ø´µµµµµ$µ%µ'µ(µ)µ*µ0µ1µ4µ8µ@µAµCµDµEµKµLµMµPµTµ\µ]µ_µ`µaµ µ¡µ¤µ¨µªµ«µ°µ±µ³µ´µµµ»µ¼µ½µÀµÄµÌµÍµÏµÐµÑµØµìµ¶¶¶¶%¶,¶4¶H¶d¶h¶œ¶¶ ¶¤¶«¶¬¶±¶Ô¶ð¶ô¶ø¶ ···(·)·,·/·0·8·9·;·D·H·L·T·U·`·d·h·p·q·s·u·|·}·€·„·Œ····‘·’·–·—·˜·™·œ· ·¨·©·«·¬·­·´·µ·¸·Ç·É·ì·í·ð·ô·ü·ý·ÿ· ¸¸¸¸	¸¸¸¸¸¸¸$¸%¸(¸,¸4¸5¸7¸8¸9¸@¸D¸Q¸S¸\¸]¸`¸d¸l¸m¸o¸q¸x¸|¸¸¨¸°¸´¸¸¸À¸Á¸Ã¸Å¸Ì¸Ð¸Ô¸Ý¸ß¸á¸è¸é¸ì¸ð¸ø¸ù¸û¸ý¸¹¹ ¹<¹=¹@¹D¹L¹O¹Q¹X¹Y¹\¹`¹h¹i¹k¹m¹t¹u¹x¹|¹„¹…¹‡¹‰¹Š¹¹Ž¹¬¹­¹°¹´¹¼¹½¹¿¹Á¹È¹É¹Ì¹Î¹Ï¹Ð¹Ñ¹Ò¹Ø¹Ù¹Û¹Ý¹Þ¹á¹ã¹ä¹å¹è¹ì¹ô¹õ¹÷¹ø¹ù¹ú¹ ºººº8º9º<º@ºBºHºIºKºMºNºSºTºUºXº\ºdºeºgºhºiºpºqºtºxºƒº„º…º‡ºŒº¨º©º«º¬º°º²º¸º¹º»º½ºÄºÈºØºÙºüº »»»»»»» »)»+»4»5»6»8»;»<»=»>»D»E»G»I»M»O»P»T»X»a»c»l»ˆ»Œ»»¤»¨»¬»´»·»À»Ä»È»Ð»Ó»ø»ù»ü»ÿ» ¼¼¼	¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼$¼%¼'¼)¼-¼0¼1¼4¼8¼@¼A¼C¼D¼E¼I¼L¼M¼P¼]¼„¼…¼ˆ¼‹¼Œ¼Ž¼”¼•¼—¼™¼š¼ ¼¡¼¤¼§¼¨¼°¼±¼³¼´¼µ¼¼¼½¼À¼Ä¼Í¼Ï¼Ð¼Ñ¼Õ¼Ø¼Ü¼ô¼õ¼ö¼ø¼ü¼½½½	½½½$½,½@½H½I½L½P½X½Y½d½h½€½½„½‡½ˆ½‰½Š½½‘½“½•½™½š½œ½¤½°½¸½Ô½Õ½Ø½Ü½é½ð½ô½ø½ ¾¾¾¾¾¾¾¾¾¾D¾E¾H¾L¾N¾T¾U¾W¾Y¾Z¾[¾`¾a¾d¾h¾j¾p¾q¾s¾t¾u¾{¾|¾}¾€¾„¾Œ¾¾¾¾‘¾˜¾™¾¨¾Ð¾Ñ¾Ô¾×¾Ø¾à¾ã¾ä¾å¾ì¾¿¿	¿¿¿¿¿¿@¿A¿D¿H¿P¿Q¿U¿”¿°¿Å¿Ì¿Í¿Ð¿Ô¿Ü¿ß¿á¿<ÀQÀXÀ\À`ÀhÀiÀÀ‘À”À˜À À¡À£À¥À¬À­À¯À°À³À´ÀµÀ¶À¼À½À¿ÀÀÀÁÀÅÀÈÀÉÀÌÀÐÀØÀÙÀÛÀÜÀÝÀäÀåÀèÀìÀôÀõÀ÷ÀùÀ ÁÁÁÁÁÁÁÁÁ Á#Á$Á&Á'Á,Á-Á/Á0Á1Á6Á8Á9Á<Á@ÁHÁIÁKÁLÁMÁTÁUÁXÁ\ÁdÁeÁgÁhÁiÁpÁtÁxÁ…ÁŒÁÁŽÁÁ”Á–ÁœÁÁŸÁ¡Á¥Á¨Á©Á¬Á°Á½ÁÄÁÈÁÌÁÔÁ×ÁØÁàÁäÁèÁðÁñÁóÁüÁýÁ ÂÂÂÂÂÂÂÂÂÂ Â(Â)Â+Â-Â/Â1Â2Â4ÂHÂPÂQÂTÂXÂ`ÂeÂlÂmÂpÂtÂ|Â}ÂÂÂˆÂ‰ÂÂ˜Â›ÂÂ¤Â¥Â¨Â¬Â­Â´ÂµÂ·Â¹ÂÜÂÝÂàÂãÂäÂëÂìÂíÂïÂñÂöÂøÂùÂûÂüÂ ÃÃ	ÃÃÃÃÃÃÃÃ$Ã%Ã(Ã)ÃEÃhÃiÃlÃpÃrÃxÃyÃ|Ã}Ã„ÃˆÃŒÃÀÃØÃÙÃÜÃßÃàÃâÃèÃéÃíÃôÃõÃøÃÄÄ$Ä,Ä0Ä4Ä<Ä=ÄHÄdÄeÄhÄlÄtÄuÄyÄ€Ä”ÄœÄ¸Ä¼ÄéÄðÄñÄôÄøÄúÄÿÄ ÅÅÅÅÅÅ(Å)Å,Å0Å8Å9Å;Å=ÅDÅEÅHÅIÅJÅLÅMÅNÅSÅTÅUÅWÅXÅYÅ]Å^Å`ÅaÅdÅhÅpÅqÅsÅtÅuÅ|Å}Å€Å„Å‡ÅŒÅÅÅ‘Å•Å—Å˜ÅœÅ Å©Å´ÅµÅ¸Å¹Å»Å¼Å½Å¾ÅÄÅÅÅÆÅÇÅÈÅÉÅÊÅÌÅÎÅÐÅÑÅÔÅØÅàÅáÅãÅåÅìÅíÅîÅðÅôÅöÅ÷ÅüÅýÅþÅÿÅ ÆÆÆÆÆÆÆÆÆÆÆÆ$Æ%Æ(Æ,Æ-Æ.Æ0Æ3Æ4Æ5Æ7Æ9Æ;Æ@ÆAÆDÆHÆPÆQÆSÆTÆUÆ\Æ]Æ`ÆlÆoÆqÆxÆyÆ|Æ€ÆˆÆ‰Æ‹ÆÆ”Æ•Æ˜ÆœÆ¤Æ¥Æ§Æ©Æ°Æ±Æ´Æ¸Æ¹ÆºÆÀÆÁÆÃÆÅÆÌÆÍÆÐÆÔÆÜÆÝÆàÆáÆèÆéÆìÆðÆøÆùÆýÆÇÇÇÇÇÇÇÇ Ç!Ç$Ç(Ç0Ç1Ç3Ç5Ç7Ç<Ç=Ç@ÇDÇJÇLÇMÇOÇQÇRÇSÇTÇUÇVÇWÇXÇ\Ç`ÇhÇkÇtÇuÇxÇ|Ç}Ç~ÇƒÇ„Ç…Ç‡ÇˆÇ‰ÇŠÇŽÇÇ‘Ç”Ç–Ç—Ç˜ÇšÇ Ç¡Ç£Ç¤Ç¥Ç¦Ç¬Ç­Ç°Ç´Ç¼Ç½Ç¿ÇÀÇÁÇÈÇÉÇÌÇÎÇÐÇØÇÝÇäÇèÇìÇ ÈÈÈÈ
+ÈÈÈÈÈÈÈÈ È$È,È-È/È1È8È<È@ÈHÈIÈLÈMÈTÈpÈqÈtÈxÈzÈ€ÈÈƒÈ…È†È‡È‹ÈŒÈÈ”ÈÈŸÈ¡È¨È¼È½ÈÄÈÈÈÌÈÔÈÕÈ×ÈÙÈàÈáÈäÈõÈüÈýÈ ÉÉÉÉÉÉÉÉÉ,É4ÉPÉQÉTÉXÉ`ÉaÉcÉlÉpÉtÉ|ÉˆÉ‰ÉŒÉÉ˜É™É›ÉÉÀÉÁÉÄÉÇÉÈÉÊÉÐÉÑÉÓÉÕÉÖÉÙÉÚÉÜÉÝÉàÉâÉäÉçÉìÉíÉïÉðÉñÉøÉùÉüÉ ÊÊ	ÊÊÊÊÊÊ)ÊLÊMÊPÊTÊ\Ê]Ê_Ê`ÊaÊhÊ}Ê„Ê˜Ê¼Ê½ÊÀÊÄÊÌÊÍÊÏÊÑÊÓÊØÊÙÊàÊìÊôÊËËËË Ë!ËAËHËIËLËPËXËYË]ËdËxËyËœË¸ËÔËäËçËéËÌÌÌÌÌÌ!Ì"Ì'Ì(Ì)Ì,Ì.Ì0Ì8Ì9Ì;Ì<Ì=Ì>ÌDÌEÌHÌLÌTÌUÌWÌXÌYÌ`ÌdÌfÌhÌpÌuÌ˜Ì™ÌœÌ Ì¨Ì©Ì«Ì¬Ì­Ì´ÌµÌ¸Ì¼ÌÄÌÅÌÇÌÉÌÐÌÔÌäÌìÌðÌÍÍ	ÍÍÍÍÍÍÍ$Í(Í,Í9Í\Í`ÍdÍlÍmÍoÍqÍxÍˆÍ”Í•Í˜ÍœÍ¤Í¥Í§Í©Í°ÍÄÍÌÍÐÍèÍìÍðÍøÍùÍûÍýÍÎÎÎÎÎ Î!Î$Î(Î0Î1Î3Î5ÎXÎYÎ\Î_Î`ÎaÎhÎiÎkÎmÎtÎuÎxÎ|Î„Î…Î‡Î‰ÎÎ‘Î”Î˜Î Î¡Î£Î¤Î¥Î¬Î­ÎÁÎäÎåÎèÎëÎìÎôÎõÎ÷ÎøÎùÎ ÏÏÏÏÏÏÏÏÏ Ï$Ï,Ï-Ï/Ï0Ï1Ï8ÏTÏUÏXÏ\ÏdÏeÏgÏiÏpÏqÏtÏxÏ€Ï…ÏŒÏ¡Ï¨Ï°ÏÄÏàÏáÏäÏèÏðÏñÏóÏõÏüÏ ÐÐÐÐ-Ð4Ð5Ð8Ð<ÐDÐEÐGÐIÐPÐTÐXÐ`ÐlÐmÐpÐtÐ|Ð}ÐÐ¤Ð¥Ð¨Ð¬Ð´ÐµÐ·Ð¹ÐÀÐÁÐÄÐÈÐÉÐÐÐÑÐÓÐÔÐÕÐÜÐÝÐàÐäÐìÐíÐïÐðÐñÐøÐÑ0Ñ1Ñ4Ñ8Ñ:Ñ@ÑAÑCÑDÑEÑLÑMÑPÑTÑ\Ñ]Ñ_ÑaÑhÑlÑ|Ñ„ÑˆÑ Ñ¡Ñ¤Ñ¨Ñ°Ñ±Ñ³ÑµÑºÑ¼ÑÀÑØÑôÑøÑÒ	ÒÒ,Ò-Ò0Ò4Ò<Ò=Ò?ÒAÒHÒ\ÒdÒ€ÒÒ„ÒˆÒÒ‘Ò•ÒœÒ Ò¤Ò¬Ò±Ò¸Ò¹Ò¼Ò¿ÒÀÒÂÒÈÒÉÒËÒÔÒØÒÜÒäÒåÒðÒñÒôÒøÒ ÓÓÓÓÓÓÓÓÓÓÓÓÓ Ó!Ó%Ó(Ó)Ó,Ó0Ó8Ó9Ó;Ó<Ó=ÓDÓEÓ|Ó}Ó€Ó„ÓŒÓÓÓÓ‘Ó˜Ó™ÓœÓ Ó¨Ó©Ó«Ó­Ó´Ó¸Ó¼ÓÄÓÅÓÈÓÉÓÐÓØÓáÓãÓìÓíÓðÓôÓüÓýÓÿÓÔÔÔ@ÔDÔ\Ô`ÔdÔmÔoÔxÔyÔ|ÔÔ€Ô‚ÔˆÔ‰Ô‹ÔÔ”Ô©ÔÌÔÐÔÔÔÜÔßÔèÔìÔðÔøÔûÔýÔÕÕÕÕÕÕ<Õ=Õ@ÕDÕLÕMÕOÕQÕXÕYÕ\Õ`ÕeÕhÕiÕkÕmÕtÕuÕxÕ|Õ„Õ…Õ‡ÕˆÕ‰ÕÕ¥ÕÈÕÉÕÌÕÐÕÒÕØÕÙÕÛÕÝÕäÕåÕèÕìÕôÕõÕ÷ÕùÕ ÖÖÖÖÖÖÖÖÖÖ Ö$Ö-Ö8Ö9Ö<Ö@ÖEÖHÖIÖKÖMÖQÖTÖUÖXÖ\ÖgÖiÖpÖqÖtÖƒÖ…ÖŒÖÖÖ”ÖÖŸÖ¡Ö¨Ö¬Ö°Ö¹Ö»ÖÄÖÅÖÈÖÌÖÑÖÔÖ×ÖÙÖàÖäÖèÖðÖõÖüÖýÖ ×××××× ×(×)×+×-×4×5×8×<×D×G×I×P×Q×T×V×W×X×Y×`×a×c×e×i×l×p×t×|×}××ˆ×‰×Œ××˜×™×›××=OsOGPùP RïSuTåT	VÁZ¶[‡f¶g·gïgLkÂsÂu<zÛ‚ƒWˆˆˆ6ŠÈŒÏûŽæÕ™;RtSTj`da¼kÏsº‰Ò‰£•ƒO
+R¾XxYæYr^y^ÇaÀcFgìgh—oNvwõxzÿz!|€n‚q‚ëŠ“•kNU÷f4n£xíz[„‰N‡¨—ØRNW*XL]a¾a!bbeÑgDjnu³uãv°w:}¯Q”R”•Ÿ#S¬\2uÛ€@’˜•[RXÜY¡\]·^:_J_wa_lzu†uà|s}±}ŒT!‚‘…A‰‹ü’M–GœËN÷NPñQOX7a>aha9eêio¥u†vÖv‡{¥‚Ë„ ù§“‹•€U¢[QWù³|¹µ‘(P»SE\è]ÒbncÚdçd n¬p[yÝŽù}E’ø’~NöNePþ]ú^aWiqT†GŽu“+š^N‘Ppg@h	QR’R¢j¼w’Ôž«R/`òHP©aícÊd<h„jÀoˆ¡‰”–X}r¬ruy}m~©€‹‰t‹cQ‰bzlToP}:#Š|QJa{‹W’Œ“¬NÓOP¾PQÁRÍRSpWƒXš^‘_va¬aÎdleof»fôf—h‡m…pñpŸt¥tÊtÙulxìxßzözE}“}€?€–ƒf‹á“˜8˜Zšè›ÂOSU:XQYc[F\¸`bBh°hèhªnLuxvÎx=zû|k~|~Š¡Š?ŒŽ–ÄäSéSJTqTúVÑYd[;\«^÷b7eEere f¯gÁi½lüuv~w?z”€¡€æ‚ý‚ðƒÁ…1ˆ´ˆ¥Šùœ.“Ç–g˜ØšŸíT›eòfh@z7Œ`ðVdW]f±hÍhþn(tžˆä›hlù¨š›OlQqQŸRT[å]P`m`ñb§c;eÙszz£†¢Œ—2Ná[bœgÜtÑyÓƒ‡Š²ŠèNK“F˜Ó^èiÿ…íù Q˜[ì[caúh>kLp/tØt¡{PÅƒÀ‰«ŒÜ•(™.R]`ìbŠOIQ!SÙXã^àf8mšpÂrÖsP{ñ€[”fS›ckVN€PJXÞX*`'aÐbÐiA›[}±€_¤NÑP¬T¬U[ ]ç]*eNe!hKjárŽvïw^}ù N…ß†NÊ™Uš«›NEN]NÇNñOwQþR@SãSåSŽTVuW¢WÇ[‡]Ð^üaØbQe¸gégËiPkÆkìkBlnxp×r–st¿wéwvz}	€ü‚
+‚ß‚bˆ3‹üŒÀŽ±d’¶’Ò™Ešéœ×œŸW@\Êƒ —«—´žT˜z¤ÙˆÍŽá XH\˜cŸz®[_yz®zŽ‚¬Ž&P8RøRwSWóbrc
+kÃm7w¥SWsh…vŽÕ•:gÃjpomŠÌŽK™ùwfxk´Œ<›ùëS-WNYÆcûiêsExºzÅzþ|u„‰s5¨•ûRGWGu`{Ìƒ’ùXjKQKR‡RbØhui™–ÅP¤RäRÃa¤e9hÿi~tK{¹‚ëƒ²‰9‹ÑI™	ùÊN—YÒdfŽj4ty½y©‚~ˆˆ_‰
+ù&“OÊS%`qbrl}f}˜NbQÜw¯€OOvQ€QÜUhV;WúWüWYGY“YÄ[\]ñ]~^Ì_€b×eãegg^gËhÄh_j:k#l}l‚lÇm˜s&t*t‚t£txuuxïxAyGyHyzy•{ }º}ˆ€-€Œ€ŠO‹HŒw!“$“â˜Q™ššeš’žÊ}vO	TîbThÑ‘«U:QùùZæaùÏbÿbùùùùùù£ùùùùùþŠùùùù–fùVqùùã– ùOczcWS!ùg`isn"ù7u#ù$ù%ù}&ù'ùrˆÊVZ(ù)ù*ù+ù,ùCN-ùgQHYðg€.ùsYt^šdÊyõ_l`Èb{cç[×[ªR/ùtY)_`0ù1ù2ùYt3ù4ù5ù6ù7ù8ùÑ™9ù:ù;ù<ù=ù>ù?ù@ùAùBùCùÃoDùEù¿²ñ`FùGùfHùIù?\JùKùLùMùNùOùPùQùéZ%Š{g}RùSùTùUùVùWùý€XùYù<\ål?SºnY6ƒ9N¶NFO®UWÇXV_·eæe€jµkMníwïz|Þ}Ë†’ˆ2‘[“»d¾ozs¸uTVUMWºaÔdÇfám[nmo¹oðuC€½A…ƒ‰ÇŠZ‹““lSuT{Ž]UXXXb^bždàhvuÖ|³‡èžãNˆWnW'Y\±\6^…_4bád³sú‹ˆ¸ŒŠ–Ûž…[·_³`P R0RW5XWX\`\ö\‹]¦^’_¼`c‰cdChùhÂjØm!nÔnäoþqÜvyw±y;z„©‰íŒóHŽSýM“v–Ü—ÒkpXr¢rhscw¿yä{›~€‹©XÇ`feýe¾fŒlqÉqZŒ˜mNzÝN¬QÍQÕRT§aqgPhßhm|o¼u³wåzô€c„…’\Q—e\g“gØuÇzsƒZùFŒ-˜o\Àš‚Ao’—_]YjÈq{vI{ä…‹'‘0š‡Uöa[ùiv…?†º‡øˆ\ùmÙpÞsa}=„]ùj‘ñ™^ù‚NuSkk>pr-†žLR£P]åd,ekëoC|œ~Í…d‰½‰ÉbØˆÊ^gjmürtot‚‡Þ†O] _
+„·Q ceu®NPiQÉQhj®|±|ç|o‚ÒŠÏ‘¶O7QõRBTì^na>bÅeÚjþo*yÜ…#ˆ­•bšjš—žÎž›RÆfwkp+ybB—a b#e#oIq‰tô}o€î„&#J“½QR£RmÈpÂˆÉ^‚e®kÂo>|usäN6OùV_ùº\º]`²s-{šÎF€4’ö–H—˜aŸ‹O§o®y´‘·–ÞR`ùˆdÄdÓj^oprçv€†\†ï2—o›úužŒxy }Éƒ“ž“žÖŠßX_'g'pÏt`|~€!Q(pbrÊxÂŒÚŒôŒ÷–†NÚPî[Ö^™eÎqBv­wJ€ü„|'›ŸØXAZb\jÚmo;v/}7~…8‰ä“K–‰RÒeóg´iAmœnp	t`tYu$vkx,‹^˜mQ.bx––O+P]êm¸}*‹_Dahaù†–ÒR‹€ÜQÌQ^iz¾}ñƒu–ÚO)R˜STUe\§`Ng¨hlmrørtƒtbùâul|y¸‰ƒÏˆáˆÌ‘Ð‘â–É›T~oÐq˜tú…ªŽ£–WœŸž—gËm3tè—,xËz {’|idjtòu¼xèx¬™T›»žÞ[U^ oœ«ƒˆNMS)ZÒ]N_ba=cifüfÿn+ocpžw,„…;ˆE™;œU¹b+g«l	ƒj‰z—¡N„YØ_Ù_g²}T’‚+ƒ½ƒ™ËW¹Y’ZÐ['fšg…hÏkdqu·ŒãŒE›ŠŒL–@š¥ž_[lsòvßv„ªQ“‰MQ•QÉRÉh”lw w¿}ì}b—µžÅn…¥QT}Tff'iŸn¿v‘wƒÂ„Ÿ‡i‘˜’ôœ‚ˆ®O’QßRÆY=^Uaxdyd®fÐg!jÍkÛk_rarAt8wÛw€¼‚ƒ ‹(‹ŒŒ(glgrîvfwFz©k’l"Y&g™„oS“X™Yß^Ïc4fsg:n+s×z×‚(“ÙRë]®aËa
+bÇb«dàeYifkËk!q÷s]uF~‚ƒj…£Š¿Œ'—a¨XØžPR;TOU‡evl
+}}^€Š†€•ï–ÿR•lirsTšZ>\K]L_®_*g¶hci<nDn	ws|Ž‡…‹÷a—ôž·\¶`a«aOeûeüelïlŸsÉsá}”•Æ[‡‹]RZSÍbd²d4g8jÊlÀsžt”{•|~Š6‚„…ëù–Á™4OJSÍSÛSÌb,d e‘eÃiîlXoísTu"vävüvÐxûx,yF},‚à‡Ô˜ï˜ÃRÔb¥d$nQo|vË±‘b’îšC›#PPJW¨Y(\G^w_?b>e¹eÁe	f‹gœiÂnÅx!}ª€€+‚³‚¡„Œ†*Š‹¦2–ŸPóOcùùW˜_Üb’cogCnqÃvÌ€Ú€ôˆõˆ‰àŒ)M‘j–/OpO^Ïg"h}v~vD›a^
+jiqÔqjudùA~C…é…Ü˜OO{p¥•áQ^µh>lNlÛl¯rÄ{ƒÕl:tûPˆRÁXØd—j§tVv§x†â•9—eù^S_Š‹¨¯Š%R¥wIœŸNPuQ[\w^f:fÄgÅh³puÅuÉyÝz' ™šÝO!X1Xö[nfekmzn}oäs+uéƒÜˆ‰\‹OÕPS\S“[©_gyy/ƒ…‰†‰9;¥™œ,gvNøOIY\ï\ð\gcÒhýp¢q+t+~ì„‡"Ò’óœNØNïO…PVRoR&TTàW+YfZZ[u[Ì[œ^fùvbwe§enm¥n6r&{?|6PQš@‚™‚©ƒŠ ŒæŒûŒtºèÜ‘–D–Ù™çœSR)TtV³XTYnYÿ_¤anbf~lqÆv‰|Þ|}¬‚ÁŒð–gù[O__Âb)]gÚh|xC~lN™PS*SQSƒYbZ‡^²`ŠaIbybe‡g§iÔkÖk×kØk¸lhù5túux‘xÕyØyƒ|Ë}á¥€>Âòƒ‡èˆ¹Šl‹»Œ‘^—Û˜;Ÿ¬V*[l_Œe³j¯k\mñop]r­s§ŒÓŒ;˜‘a7lX€šMN‹N›NÕN:O<OOßOÿPòSøSUãUÛVëXbYZë[ú[\ó]+^™_`hcœe¯eögûg­h{k™l×l#n	pEsx>y@y`yÁyé{}r}†€‚ŽƒÑ„Ç†ßˆPŠ^Š‹ÜŒf­ªü˜ß™žJRiùgjù˜P*Rq\ceUlÊs#uu—{œ„x‘0—wN’dºk^q©…	NkùIgîhnŸ‚…kˆ÷co’¯˜
+N·PÏPQFUªUV@[\à\8^Š^ ^Â^ó`QhajXn=r@rÀrøvey±{Ôóˆô‰sŠaŒÞŒ—^X½týŒÇUlùaz"}r‚rru%umù{…XûX¼]^¶^_U`’bcMe‘fÙføfhòh€r^tn{n}Ö}rå€‚¯…‰“Šä’Íž ŸYmY-^Ü`fsfgPlÅm_oów©xÆ„Ë‘+“ÙNÊPHQ„U[£[Gb~eËe2n}qtDt‡t¿tlvªyÚ}U~¨z³9‚†ì‡uŠãx‘’%”M™®›hSQ\TiÄl)m+n‚›…;‰-ŠªŠê–gŸaR¹f²k–~þ‡ƒ•]–e‰mîqnùÎWÓY¬['`ú`bf_f)sùsÛvwl{V€r€e Š’‘NâRrkmz9{0}où°ŒìS/VQXµ[\\â]@bƒcd-f³h¼lˆm¯np¤pÒq&uuŽuv{à{+| }9},…m…†4Šaµ·’ö—7š×Ol\_g‘mŸ|Œ~‹k[ý]dÀ„\á˜‡s‹[š`~gÞmŠ¦Š˜7RpùQpŽx–“pˆ×‘îO×SýUÚV‚WýXÂZˆ[«\À\%^abKbˆcd6exe9jŠk4lm1oçqérxst²t&vawÀyWzêz¹|}¬}a~ž)1ƒ„Ú„ê…–ˆ°Š‹8Bƒl‘–’¹’‹–§–¨–Ö– —˜–™Óš›ÔS~XYp[¿[ÑmZoŸq!t¹t…€ýƒá]‡_ª_B`ìehoiSj‰k5mómãsþv¬wM{}#‚@ƒô„c…bŠÄŠ‡‘“˜´™bSˆðe’]']i]_th‡ÕoþbÒ6‰r‰NXNçPÝRGSbfi~ˆ^–OS6VËY¤Z8\N\M\^_C`½e/fBf¾gôgsâw:yÅ”„Í„–‰fŠiŠáŠUŒzŒôWÔ[_o`íbi–k\n„qÒ{U‡X‹þŽß˜þ˜8OOáO{T Z¸[<a°ehfüq3u^y3}Nã˜ƒª…Î…‡
+Š«Ž›qùÅ1Y¤[æ[‰`é[\Ã_lrùñmpu¯‚öŠÀNASsùÙ–lžNÄORQ^U%Zè\bYr½‚ªƒþ†YˆŠ?–Å–™	]
+X³\½]D^á`aácj%n‘T“N˜œwŸ‰[¸\	cOfHh<wÁ–—T˜Ÿ›¡e‹ËŽ¼•5U©\Ö]µ^—fLvôƒÇ•ÓX¼bÎr(ðN.Y`;fƒkçy&“SÀTÃW]aÖf¯mx~‚˜–D—„S|b–c²m
+~KM˜ûjL¯ž_N;P¶QYù`öc0i:r6€tùÎ‘1_uùvù}å‚o„»„å…ŽwùoOxùyùäXC[Y`Úceme˜fzùJi#jmplqÒuv³ypz{ùŠ|ùD‰}ù“‹À‘}–~ù
+™W¡_¼eo v¦yžŠ­™Z›lŸQ¶a‘bjÆCP0Xf_	q ŠúŠ|[†úO<Q´VDY©cùmª]mi†QˆNYOù€ùù‚Y‚ùƒù_k]l„ùµty…ù‚E‚9ƒ?]†ù™‡ùˆù‰ù¦NŠùßWy_f‹ùŒù«uy~o‹ù[š¥V'XøYZ´[Žùö^ùùPc;c‘ù=i‡l¿lŽm“mõmo’ùßp6qYq“ùÃqÕq”ùOxox•ùu{ã}–ù/~—ùMˆßŽ˜ù™ùšù[’›ùöœœùùžù…`…mŸù±q ù¡ù±•­S¢ù£ù¤ùÓg¥ùŽp0q0tv‚Ò‚¦ù»•åš}žÄf§ùÁqI„¨ù©ùKXªù«ù¸]q_¬ù fŽfyi®i8lól6nAoÚop/pPqßqps­ù[t®ùÔtÈvNz“~¯ù°ùñ‚`ŠÎ±ùH“²ù—³ù´ùBN*PµùRáSófmlÊo
+swbz®‚Ý…†¶ùÔˆcŠ}‹kŒ·ù³’¸ù—˜”NOÉO²PHS>T3TÚUbXºXgYZä[Ÿ`¹ùÊaVeÿedf§hZl³oÏp¬qRs}{‡¤Š2œŸK\ƒlDs‰s:’«netviz~
+†@QÅXÁdîtupvÁ•Í–T™&næt©zªzåÙ†x‡ŠIZŒ[›[¡h icm©st,t—xé}ëUžƒLŒ.–˜ðf€_úe‰gjl‹s-PZjkîwYl]Í]%sOuºù»ùåPùQ/X-Y–YÚYå[¼ù½ù¢]×bd“dþd¾ùÜf¿ùHjÀùÿqdtÁùˆz¯zG~^~ €pÂùï‡‰ ‹YÃù€R™~a2ktm~%‰±ÑO­P—QÇRÇW‰X¹[¸^Ba•iŒmgn¶n”qbt(u,us€8ƒÉ„
+Ž”“Þ“ÄùŽNQOvP*QÈSËSóS‡[Ó[$\a‚aôe[r—s@tÂvPy‘y¹y}½‹‚Õ…^†ÂGõê‘…–è–é–ÖRg_íe1f/h\q6zÁ
+˜‘NÅùRjžko‰q€¸‚S…K•–ò–û—…1›NŠqÄ–CQŸSáTWW£W›ZÄZÃ[(`?aôc…l9mrnn0r?sWtÑ‚ˆE`Æùb–X˜gŠ^’MOIPÞPqSWÔYZ	\paf-n2rKtï}Ã€„f„?…_‡[ˆ‰‹UË—O›sN‘OQjQÇù/U©Uz[¥[|^}^¾^ `ß`a	aÄc8e	gÈùÔgÚgÉùaibi¹l'mÊù8nËùáo6s7sÌù\t1uÍùRvÎùÏù­}þ8„Õˆ˜ŠÛŠíŠ0ŽBŽJ>zI‘É‘n“ÐùÑù	XÒùÓk‰€²€ÓùÔùAQkY9\ÕùÖùdo§sä€×ù’•ØùÙùÚùÛù€bph}‡Üù Wi`Ga·k¾Š€’±–YNTëm-…p–ó—î˜Öcãl‘ÝQÉaºùOP Qœ[aÿaìdiÅk‘uãw©d‚…û‡cˆ¼Šp‹«‘ŒNåN
+OÝùÞù7YèYßùò]_[_!`àùáùâùãù>råsäùpuÍuåùûyæù€3€„€á‚Qƒçùèù½Œ³Œ‡éùêùô˜™ëùìù7pÊvÊÌü‹ºNÁNRpSíù½TàVûYÅ[_Í_nnîùïùj}5ƒðù“†Šñùm—w—òùóù NZO~OùXåe¢n8°“¹™ûNìXŠYÙYA`ôùõùzöùOƒÃŒeQDS÷ùøùùùÍNiRU[¿‚ÔN:R¨TÉYÿYP[W[\[c`HaËn™pnq†s÷tµuÁx+}€ê(ƒ…É…îŠÇŒÌ–\OúR¼V«e(f|p¸p5r½}‚L‘À–rq[çh˜kzoÞv‘\«f[o´{*|6ˆÜ–N×N S4X»XïXlY\3^„^5_Œc²fVgj£jk?oFrúùPs‹tàz§|xßçŠƒl„#…”…Ï…Ýˆ¬‘w•œ–QÉT(W°[MbPg=h“h=nÓn}p!~Áˆ¡Œ	KŸNŸ-r{ÍŠ“GONO2Q€TÐY•^µbugnij®lnÙr*s½u¸{5}ç‚ùƒW„÷…[Š¯Œ‡Ž¸Î–_ŸãR
+TáZÂ[XdueônÄrûù„vMz{M|>~ß{ƒ+‹ÊŒdá_ŽêùiÑ“COzO³PhQxQMRjRaX|X`Y\U\Û^›`0bh¿kl±oNq t0u8uQurvL{‹{­{Æ{~nŠ>I?’“’"“+”û–Z˜k˜™R*b˜bYmdvÊzÀ{v}`S¾\—^8o¹p˜|—Ž›Þž¥czdv‡N•N­N\PuPHTÃYš[@^­^÷^_Å`:c?eteÌevfxfþghi‰jck@lÀmèmn^np¡pŽsýs:u[w‡xŽyz}z¾|Ž}G‚ŠêŠžŒ-‘J‘Ø‘f’Ì’ “—V—\—˜Ÿ6R‘R|U$X^_Œ`Ðc¯hßomy,{Íº…ýˆøŠDŽ‘d–›–=—L˜JŸÎOFQËQ©R2V_k_ªcÍdéeAfúfùfgh×hýionogqåq*rªt:wVyZyßy z•z—|ß|D}p~‡€û…¤†TŠ¿Š™Ž mã‘;–Õ–åœÏe|³Ã“X[
+\RSÙbs'P—[ž_°`kaÕhÙm.t.zB}œ}1~k*Ž5Ž~“”POPWæ]§^+cj;NOOOZPÝYÄ€jThTþUOY™[Þ]Ú^]f1gñg*hèl2mJno·pàs‡uL|},}¢}‚Û†;Š…ŠpŠŽ31N‘R‘D”Ð™ùz¥|ÊOQÆQÈWï[û\Yf=jZm–nìoqouãz"ˆ!uË–ÿ™ƒ-NòNFˆÍ‘}SÛjkiAlz„žXŽaþfïbÝpuÇuR~¸„I‹KNêS«T0W@W×_ccod/eèezfg³gbk`lšl,oåw%xIyWy}¢€ó‚·‚‡ŒŠüù¾rôvz7zT~w€UÔUuX/c"dIfKfmh›i„k%m±nÍsht¡t[u¹uávw‹wæy	~~û/…—ˆ:ŠÑŒëŽ°2­“c–s–—„OñSêYÉZ^NhÆt¾uéy’z£í†êŒÌíŸegýù÷WWoÝ}/ö“Æ–µ_òa„oN˜OPÉSßUo]î]!kdkËxš{þùIŽÊŽnIc>d@w„z/“”jŸ°d¯oæq¨tÚtÄz|‚~²|˜~š‹
+}”™L™9Rß[æd-g.}íPÃSyXXaYaúa¬eÙz’‹–‹	P!PuR1U<Zà^p_4a^ef6f¢fÍiÄn2os!v“z9Y‚Öƒ¼„µPðWÀ[è[i_¡c&xµ}Üƒ!…Ç‘õ‘ŠQõgV{¬ŒÄQ»Y½`U†PÿùTR:\}abÓbòd¥eÌn v
+`Ž_–»–ßNCS˜U)YÝ]ÅdÉlúm”sz‚¦…äŒŽwç‘á•!–Æ—øQòT†U¹_¤dˆo´}M5”ÉP\¾lûmu»w=|d|yŠÂŠX¾Y^wcRrŠukwÜŠ¼Œó^tføm}€ÁƒËŠQ—Ö› úCRÿf•mïnà}æŠ.^ÔšRRèT”a„bÛb¢hiZi5j’p&q]xyyÒyz–€x‚Õ‚IƒI…‚Œ…b‘‹‘®‘ÃOÑVíq×w ‡ø‰ø[Ö_Qg¨âSZXõ[¤`a`d=~p€%…ƒ’®d¬P] gœX½b¨cixijknºvËy»‚)„ÏŠ¨ý‘K‘œ‘““š“Û–6šœN\u]yúzQ{É{.~Ä„YŽtŽøŽ%f?iCtúQ.gÜžEQà_–lò‡]ˆwˆ´`µ„ÖS9T4V6Z1\ŠpàZ€í£‰‘_šòtPÄN Sû`,nd\ˆO$PäUÙ\_^e`”h»lÄm¾qÔuôuavzIzÇ}û}nô©†É–³™RŸGRÅRí˜ª‰NÒgoµOâ[•gˆlxmt'xÝ‘|“Ä‡äy1zë_ÖN¤T>U®X¥Yð`SbÖb6gUi5‚@–±™Ý™,PSSDU|WúXbúâdkfÝgÁoïo"t8tŠ8”QTVfWH_šaNkXp­p»}•ŠjY+¢cw=€ªŒTX-d»i•[^onúi…LQðS*Y `Ka†kplðl{Î€Ô‚Æ°±˜úÇd¤o‘deNQTWŠ_avhúÛuR{q}XÌi*‰ 9˜xPWY¬Y•b*›]ayrÖ•aWFZô]Šb­dúdwgâl>m,r6t4xw­‚Û˜$RBWgHrãt©Œ¦’*–kQíSLciOU–`We›lmLrýrz‡‰Œm_Žoùp¨a¿OOPAbGrÇ{è}éM­—š¶ŒjWs^°g„UŠ T[c^â^
+_ƒeº€=…‰•[–HOSSS†TúTW^`›b±bUcúálfm±u2xÞ€/Þ‚a„²„ˆ‰ê’ý˜‘›E^´fÝfprúõO}Rj_SaSgjoâthyhˆyŒÇ˜Ä˜CšÁTzSi÷ŠJŒ¨˜®™|_«b²u®v«ˆB–9S<_Å_ÌlÌsbu‹uF{þ‚™ON<NUO¦SYÈ^0f³lUtwƒf‡ÀŒP—œÑXx[P†‹´Ò[h``ñeWl"o£opUð‘•’•P–Ó—rRDýQ+T¸TcUŠU»jµmØ}f‚œ’w–yžTÈTÒvä†¤•Ô•\–¢N	OîYæZ÷]R`—bmgAh†l/n8›€*‚ú	ú˜¥NUP³T“WZYi[³[Èawiwm#pù‡ã‰rŠçŠ‚í™¸š¾R8hPx^OgGƒLˆ«NT®Væs‘ÿ—	™W™™™SVŸX[†1Š²aöj{sÒŽGkª–WšUY rki—ÔOô\&_øa[fël«p„s¹sþs)wMwC}b}#~7‚Rˆ
+úâŒI’o˜Q[tz@ˆ˜ÌZàOTS>Yý\>cymùr¢ƒÏ’0˜¨NDQR‹Wb_ÂlÎnpPp¯p’qésitJƒ¢‡aˆ¢£“¨™nQW_à`ga³fY…JŽ¯‘‹—NN’N|TÕXúX}Yµ\'_6bHb
+fgfëkimÏmVnøn”oàoéo]pÐr%tZtàt“v\yÊ|~á€¦‚k„¿„N†_†t‡w‹jŒ¬“ ˜e˜Ñ`bw‘ZZf÷m>n?tB›ý_Ú`{ÄT_^lÓl*mØp}y†Š;SŒT[:jkpuuy¾y±‚ïƒqŠA‹¨Œt—úôd+eºx»xkz8NšUPY¦[{^£`ÛcakefShneq°t}„iš%œ;mÑn>sAŒÊ•ðQL^¨_M`ö`0aLaCfDf¥iÁl_nÉnboLqœt‡vÁ{'|RƒW‡Q–Ãž/SÞVû^Š_b`”`÷affgœjîm®oppjsj~¾4ƒÔ†¨ŠÄŒƒRrs–[kj”îT†V][He…eÉfŸhmÆm;r´€u‘Mš¯OPšST<T‰UÅU?^Œ_=gfqÝsÛRóRdXÎXqqûq°…Šˆf¨…§U„fJq1„IS™UÁkY_½_îc‰fGqñŠ¾žO:dËpfug†d`N‹øGQöQS6mø€Ñžf#k˜pÕuTy\}Š k=kFk8Tp`=mÕ‚ÖPÞQœUkVÍVìY	[^™a˜a1b^fæf™q¹qºq§r§y z²pŠ¬¬¬¬¬¬¬¬¬¬¬¬!¬"¬#¬%¬&¬'¬(¬)¬*¬+¬.¬2¬3¬4¬þÿþÿþÿþÿþÿþÿ5¬6¬7¬:¬;¬=¬>¬?¬A¬B¬C¬D¬E¬F¬G¬H¬I¬J¬L¬N¬O¬P¬Q¬R¬S¬U¬þÿþÿþÿþÿþÿþÿV¬W¬Y¬Z¬[¬]¬^¬_¬`¬a¬b¬c¬d¬e¬f¬g¬h¬i¬j¬k¬l¬m¬n¬o¬r¬s¬u¬v¬y¬{¬|¬}¬~¬¬‚¬‡¬ˆ¬¬Ž¬¬‘¬’¬“¬•¬–¬—¬˜¬™¬š¬›¬ž¬¢¬£¬¤¬¥¬¦¬§¬«¬­¬®¬±¬²¬³¬´¬µ¬¶¬·¬º¬¾¬¿¬À¬Â¬Ã¬Å¬Æ¬Ç¬É¬Ê¬Ë¬Í¬Î¬Ï¬Ð¬Ñ¬Ò¬Ó¬Ô¬Ö¬Ø¬Ù¬Ú¬Û¬Ü¬Ý¬Þ¬ß¬â¬ã¬å¬æ¬é¬ë¬í¬î¬ò¬ô¬÷¬ø¬ù¬ú¬û¬þ¬ÿ¬­­­­­­	­
+­­­­­­­­­­­­­­­­!­"­#­$­%­&­'­(­*­+­.­/­0­1­2­3­þÿþÿþÿþÿþÿþÿ6­7­9­:­;­=­>­?­@­A­B­C­F­H­J­K­L­M­N­O­Q­R­S­U­V­W­þÿþÿþÿþÿþÿþÿY­Z­[­\­]­^­_­`­b­d­e­f­g­h­i­j­k­n­o­q­r­w­x­y­z­~­€­ƒ­„­…­†­‡­Š­‹­­Ž­­‘­’­“­”­•­–­—­˜­™­š­›­ž­Ÿ­ ­¡­¢­£­¥­¦­§­¨­©­ª­«­¬­­­®­¯­°­±­²­³­´­µ­¶­¸­¹­º­»­¼­½­¾­¿­Â­Ã­Å­Æ­Ç­É­Ê­Ë­Ì­Í­Î­Ï­Ò­Ô­Õ­Ö­×­Ø­Ù­Ú­Û­Ý­Þ­ß­á­â­ã­å­æ­ç­è­é­ê­ë­ì­í­î­ï­ð­ñ­ò­ó­ô­õ­ö­÷­ú­û­ý­þ­®®®®®®
+®®®®®®®®®®®®®®®®þÿþÿþÿþÿþÿþÿ®®® ®!®"®#®$®%®&®'®(®)®*®+®,®-®.®/®2®3®5®6®9®;®<®þÿþÿþÿþÿþÿþÿ=®>®?®B®D®G®H®I®K®O®Q®R®S®U®W®X®Y®Z®[®^®b®c®d®f®g®j®k®m®n®o®q®r®s®t®u®v®w®z®~®®€®®‚®ƒ®†®‡®ˆ®‰®Š®‹®®Ž®®®‘®’®“®”®•®–®—®˜®™®š®›®œ®®ž®Ÿ® ®¡®¢®£®¤®¥®¦®§®¨®©®ª®«®¬®­®®®¯®°®±®²®³®´®µ®¶®·®¸®¹®º®»®¿®Á®Â®Ã®Å®Æ®Ç®È®É®Ê®Ë®Î®Ò®Ó®Ô®Õ®Ö®×®Ú®Û®Ý®Þ®ß®à®á®â®ã®ä®å®æ®ç®é®ê®ì®î®ï®ð®ñ®ò®ó®õ®ö®÷®ù®ú®û®ý®þ®ÿ® ¯¯¯¯¯¯þÿþÿþÿþÿþÿþÿ¯	¯
+¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯ ¯!¯"¯#¯þÿþÿþÿþÿþÿþÿ$¯%¯&¯'¯(¯)¯*¯+¯.¯/¯1¯3¯5¯6¯7¯8¯9¯:¯;¯>¯@¯D¯E¯F¯G¯J¯K¯L¯M¯N¯O¯Q¯R¯S¯T¯U¯V¯W¯X¯Y¯Z¯[¯^¯_¯`¯a¯b¯c¯f¯g¯h¯i¯j¯k¯l¯m¯n¯o¯p¯q¯r¯s¯t¯u¯v¯w¯x¯z¯{¯|¯}¯~¯¯¯‚¯ƒ¯…¯†¯‡¯‰¯Š¯‹¯Œ¯¯Ž¯¯’¯“¯”¯–¯—¯˜¯™¯š¯›¯¯ž¯Ÿ¯ ¯¡¯¢¯£¯¤¯¥¯¦¯§¯¨¯©¯ª¯«¯¬¯­¯®¯¯¯°¯±¯²¯³¯´¯µ¯¶¯·¯º¯»¯½¯¾¯¿¯Á¯Â¯Ã¯Ä¯Å¯Æ¯Ê¯Ì¯Ï¯Ð¯Ñ¯Ò¯Ó¯Õ¯Ö¯×¯Ø¯Ù¯Ú¯Û¯Ý¯Þ¯ß¯à¯á¯þÿþÿþÿþÿþÿþÿâ¯ã¯ä¯å¯æ¯ç¯ê¯ë¯ì¯í¯î¯ï¯ò¯ó¯õ¯ö¯÷¯ù¯ú¯û¯ü¯ý¯þ¯ÿ¯°°þÿþÿþÿþÿþÿþÿ°°°°	°
+°°°°°°°°°°°°°°°°° °!°"°#°$°%°&°'°)°*°+°,°-°.°/°0°1°2°3°4°5°6°7°8°9°:°;°<°=°>°?°@°A°B°C°F°G°I°K°M°O°P°Q°R°V°X°Z°[°\°^°_°`°a°b°c°d°e°f°g°h°i°j°k°l°m°n°o°p°q°r°s°t°u°v°w°x°y°z°{°~°°°‚°ƒ°…°†°‡°ˆ°‰°Š°‹°Ž°°’°“°”°•°–°—°›°°ž°£°¤°¥°¦°§°ª°°°²°¶°·°¹°º°»°½°¾°¿°À°Á°Â°Ã°Æ°Ê°Ë°Ì°Í°Î°Ï°Ò°þÿþÿþÿþÿþÿþÿÓ°Õ°Ö°×°Ù°Ú°Û°Ü°Ý°Þ°ß°á°â°ã°ä°æ°ç°è°é°ê°ë°ì°í°î°ï°ð°þÿþÿþÿþÿþÿþÿñ°ò°ó°ô°õ°ö°÷°ø°ù°ú°û°ü°ý°þ°ÿ° ±±±±±±±±
+±±±±±±±±±±±± ±!±"±&±'±)±*±+±-±.±/±0±1±2±3±6±:±;±<±=±>±?±B±C±E±F±G±I±J±K±L±M±N±O±R±S±V±W±Y±Z±[±]±^±_±a±b±c±d±e±f±g±h±i±j±k±l±m±n±o±p±q±r±s±t±u±v±w±z±{±}±~±±±ƒ±„±…±†±‡±Š±Œ±Ž±±±‘±•±–±—±™±š±›±±ž±Ÿ± ±¡±¢±£±¤±¥±¦±§±©±ª±«±¬±­±®±¯±°±±±²±³±´±µ±¶±·±¸±þÿþÿþÿþÿþÿþÿ¹±º±»±¼±½±¾±¿±À±Á±Â±Ã±Ä±Å±Æ±Ç±È±É±Ê±Ë±Í±Î±Ï±Ñ±Ò±Ó±Õ±þÿþÿþÿþÿþÿþÿÖ±×±Ø±Ù±Ú±Û±Þ±à±á±â±ã±ä±å±æ±ç±ê±ë±í±î±ï±ñ±ò±ó±ô±õ±ö±÷±ø±ú±ü±þ±ÿ± ²²²²²²	²
+²²²²²²²²²²²²²²²²!²"²#²$²%²&²'²(²)²*²+²,²-².²/²0²1²2²3²5²6²7²8²9²:²;²=²>²?²@²A²B²C²D²E²F²G²H²I²J²K²L²M²N²O²P²Q²R²S²T²U²V²W²Y²Z²[²]²^²_²a²b²c²d²e²f²g²j²k²l²m²n²o²p²q²r²s²v²w²x²y²z²{²}²~²²€²²‚²ƒ²†²‡²ˆ²Š²‹²Œ²²Ž²þÿþÿþÿþÿþÿþÿ²’²“²•²–²—²›²œ²²ž²Ÿ²¢²¤²§²¨²©²«²­²®²¯²±²²²³²µ²¶²·²þÿþÿþÿþÿþÿþÿ¸²¹²º²»²¼²½²¾²¿²À²Á²Â²Ã²Ä²Å²Æ²Ç²Ê²Ë²Í²Î²Ï²Ñ²Ó²Ô²Õ²Ö²×²Ú²Ü²Þ²ß²à²á²ã²ç²é²ê²ð²ñ²ò²ö²ü²ý²þ²³³³³³	³
+³³³³³³³³³³³³³³³³ ³!³"³#³$³%³&³'³(³)³*³+³,³-³.³/³0³1³2³3³4³5³6³7³8³9³:³;³<³=³>³?³@³A³B³C³D³E³F³G³H³I³J³K³L³M³N³O³P³Q³R³S³W³Y³Z³]³`³a³b³c³f³h³j³l³m³o³r³s³u³v³w³y³z³{³|³}³~³³‚³†³‡³ˆ³‰³Š³‹³³þÿþÿþÿþÿþÿþÿŽ³³‘³’³“³•³–³—³˜³™³š³›³œ³³ž³Ÿ³¢³£³¤³¥³¦³§³©³ª³«³­³þÿþÿþÿþÿþÿþÿ®³¯³°³±³²³³³´³µ³¶³·³¸³¹³º³»³¼³½³¾³¿³À³Á³Â³Ã³Æ³Ç³É³Ê³Í³Ï³Ñ³Ò³Ó³Ö³Ø³Ú³Ü³Þ³ß³á³â³ã³å³æ³ç³é³ê³ë³ì³í³î³ï³ð³ñ³ò³ó³ô³õ³ö³÷³ø³ù³ú³û³ý³þ³ÿ³ ´´´´´´´´´	´
+´´´´´´´´´´´´´´´´´´´!´"´#´$´%´&´'´*´,´-´.´/´0´1´2´3´5´6´7´8´9´:´;´<´=´>´?´@´A´B´C´D´E´F´G´H´I´J´K´L´M´N´O´R´S´U´V´W´Y´Z´[´\´]´^´_´b´d´f´þÿþÿþÿþÿþÿþÿg´h´i´j´k´m´n´o´p´q´r´s´t´u´v´w´x´y´z´{´|´}´~´´´‚´þÿþÿþÿþÿþÿþÿƒ´„´…´†´‡´‰´Š´‹´Œ´´Ž´´´‘´’´“´”´•´–´—´˜´™´š´›´œ´ž´Ÿ´ ´¡´¢´£´¥´¦´§´©´ª´«´­´®´¯´°´±´²´³´´´¶´¸´º´»´¼´½´¾´¿´Á´Â´Ã´Å´

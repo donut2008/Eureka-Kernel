@@ -1,137 +1,97 @@
-/*
- * Copyright (C) 2011 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-
-#ifndef _LINUX_DM_TRANSACTION_MANAGER_H
-#define _LINUX_DM_TRANSACTION_MANAGER_H
-
-#include "dm-block-manager.h"
-
-struct dm_transaction_manager;
-struct dm_space_map;
-
-/*----------------------------------------------------------------*/
-
-/*
- * This manages the scope of a transaction.  It also enforces immutability
- * of the on-disk data structures by limiting access to writeable blocks.
- *
- * Clients should not fiddle with the block manager directly.
- */
-
-void dm_tm_destroy(struct dm_transaction_manager *tm);
-
-/*
- * The non-blocking version of a transaction manager is intended for use in
- * fast path code that needs to do lookups e.g. a dm mapping function.
- * You create the non-blocking variant from a normal tm.  The interface is
- * the same, except that most functions will just return -EWOULDBLOCK.
- * Methods that return void yet may block should not be called on a clone
- * viz. dm_tm_inc, dm_tm_dec.  Call dm_tm_destroy() as you would with a normal
- * tm when you've finished with it.  You may not destroy the original prior
- * to clones.
- */
-struct dm_transaction_manager *dm_tm_create_non_blocking_clone(struct dm_transaction_manager *real);
-
-/*
- * We use a 2-phase commit here.
- *
- * i) Make all changes for the transaction *except* for the superblock.
- * Then call dm_tm_pre_commit() to flush them to disk.
- *
- * ii) Lock your superblock.  Update.  Then call dm_tm_commit() which will
- * unlock the superblock and flush it.  No other blocks should be updated
- * during this period.  Care should be taken to never unlock a partially
- * updated superblock; perform any operations that could fail *before* you
- * take the superblock lock.
- */
-int dm_tm_pre_commit(struct dm_transaction_manager *tm);
-int dm_tm_commit(struct dm_transaction_manager *tm, struct dm_block *superblock);
-
-/*
- * These methods are the only way to get hold of a writeable block.
- */
-
-/*
- * dm_tm_new_block() is pretty self-explanatory.  Make sure you do actually
- * write to the whole of @data before you unlock, otherwise you could get
- * a data leak.  (The other option is for tm_new_block() to zero new blocks
- * before handing them out, which will be redundant in most, if not all,
- * cases).
- * Zeroes the new block and returns with write lock held.
- */
-int dm_tm_new_block(struct dm_transaction_manager *tm,
-		    struct dm_block_validator *v,
-		    struct dm_block **result);
-
-/*
- * dm_tm_shadow_block() allocates a new block and copies the data from @orig
- * to it.  It then decrements the reference count on original block.  Use
- * this to update the contents of a block in a data structure, don't
- * confuse this with a clone - you shouldn't access the orig block after
- * this operation.  Because the tm knows the scope of the transaction it
- * can optimise requests for a shadow of a shadow to a no-op.  Don't forget
- * to unlock when you've finished with the shadow.
- *
- * The @inc_children flag is used to tell the caller whether it needs to
- * adjust reference counts for children.  (Data in the block may refer to
- * other blocks.)
- *
- * Shadowing implicitly drops a reference on @orig so you must not have
- * it locked when you call this.
- */
-int dm_tm_shadow_block(struct dm_transaction_manager *tm, dm_block_t orig,
-		       struct dm_block_validator *v,
-		       struct dm_block **result, int *inc_children);
-
-/*
- * Read access.  You can lock any block you want.  If there's a write lock
- * on it outstanding then it'll block.
- */
-int dm_tm_read_lock(struct dm_transaction_manager *tm, dm_block_t b,
-		    struct dm_block_validator *v,
-		    struct dm_block **result);
-
-void dm_tm_unlock(struct dm_transaction_manager *tm, struct dm_block *b);
-
-/*
- * Functions for altering the reference count of a block directly.
- */
-void dm_tm_inc(struct dm_transaction_manager *tm, dm_block_t b);
-
-void dm_tm_dec(struct dm_transaction_manager *tm, dm_block_t b);
-
-int dm_tm_ref(struct dm_transaction_manager *tm, dm_block_t b,
-	      uint32_t *result);
-
-struct dm_block_manager *dm_tm_get_bm(struct dm_transaction_manager *tm);
-
-/*
- * If you're using a non-blocking clone the tm will build up a list of
- * requested blocks that weren't in core.  This call will request those
- * blocks to be prefetched.
- */
-void dm_tm_issue_prefetches(struct dm_transaction_manager *tm);
-
-/*
- * A little utility that ties the knot by producing a transaction manager
- * that has a space map managed by the transaction manager...
- *
- * Returns a tm that has an open transaction to write the new disk sm.
- * Caller should store the new sm root and commit.
- *
- * The superblock location is passed so the metadata space map knows it
- * shouldn't be used.
- */
-int dm_tm_create_with_sm(struct dm_block_manager *bm, dm_block_t sb_location,
-			 struct dm_transaction_manager **tm,
-			 struct dm_space_map **sm);
-
-int dm_tm_open_with_sm(struct dm_block_manager *bm, dm_block_t sb_location,
-		       void *sm_root, size_t root_len,
-		       struct dm_transaction_manager **tm,
-		       struct dm_space_map **sm);
-
-#endif	/* _LINUX_DM_TRANSACTION_MANAGER_H */
+MAL_INT_ENA__THERM_TRIGGER_SET__SHIFT 0x2
+#define CG_THERMAL_INT_ENA__THERM_INTH_CLR_MASK 0x8
+#define CG_THERMAL_INT_ENA__THERM_INTH_CLR__SHIFT 0x3
+#define CG_THERMAL_INT_ENA__THERM_INTL_CLR_MASK 0x10
+#define CG_THERMAL_INT_ENA__THERM_INTL_CLR__SHIFT 0x4
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_CLR_MASK 0x20
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_CLR__SHIFT 0x5
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTH_MASK 0xff
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTH__SHIFT 0x0
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTL_MASK 0xff00
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTL__SHIFT 0x8
+#define CG_THERMAL_INT_CTRL__GNB_TEMP_THRESHOLD_MASK 0xff0000
+#define CG_THERMAL_INT_CTRL__GNB_TEMP_THRESHOLD__SHIFT 0x10
+#define CG_THERMAL_INT_CTRL__THERM_INTH_MASK_MASK 0x1000000
+#define CG_THERMAL_INT_CTRL__THERM_INTH_MASK__SHIFT 0x18
+#define CG_THERMAL_INT_CTRL__THERM_INTL_MASK_MASK 0x2000000
+#define CG_THERMAL_INT_CTRL__THERM_INTL_MASK__SHIFT 0x19
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_MASK_MASK 0x4000000
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_MASK__SHIFT 0x1a
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_CNB_MASK_MASK 0x8000000
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_CNB_MASK__SHIFT 0x1b
+#define CG_THERMAL_INT_CTRL__THERM_GNB_HW_ENA_MASK 0x10000000
+#define CG_THERMAL_INT_CTRL__THERM_GNB_HW_ENA__SHIFT 0x1c
+#define CG_THERMAL_INT_STATUS__THERM_INTH_DETECT_MASK 0x1
+#define CG_THERMAL_INT_STATUS__THERM_INTH_DETECT__SHIFT 0x0
+#define CG_THERMAL_INT_STATUS__THERM_INTL_DETECT_MASK 0x2
+#define CG_THERMAL_INT_STATUS__THERM_INTL_DETECT__SHIFT 0x1
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_DETECT_MASK 0x4
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_DETECT__SHIFT 0x2
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_CNB_DETECT_MASK 0x8
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_CNB_DETECT__SHIFT 0x3
+#define GENERAL_PWRMGT__GLOBAL_PWRMGT_EN_MASK 0x1
+#define GENERAL_PWRMGT__GLOBAL_PWRMGT_EN__SHIFT 0x0
+#define GENERAL_PWRMGT__STATIC_PM_EN_MASK 0x2
+#define GENERAL_PWRMGT__STATIC_PM_EN__SHIFT 0x1
+#define GENERAL_PWRMGT__THERMAL_PROTECTION_DIS_MASK 0x4
+#define GENERAL_PWRMGT__THERMAL_PROTECTION_DIS__SHIFT 0x2
+#define GENERAL_PWRMGT__THERMAL_PROTECTION_TYPE_MASK 0x8
+#define GENERAL_PWRMGT__THERMAL_PROTECTION_TYPE__SHIFT 0x3
+#define GENERAL_PWRMGT__SW_SMIO_INDEX_MASK 0x40
+#define GENERAL_PWRMGT__SW_SMIO_INDEX__SHIFT 0x6
+#define GENERAL_PWRMGT__LOW_VOLT_D2_ACPI_MASK 0x100
+#define GENERAL_PWRMGT__LOW_VOLT_D2_ACPI__SHIFT 0x8
+#define GENERAL_PWRMGT__LOW_VOLT_D3_ACPI_MASK 0x200
+#define GENERAL_PWRMGT__LOW_VOLT_D3_ACPI__SHIFT 0x9
+#define GENERAL_PWRMGT__VOLT_PWRMGT_EN_MASK 0x400
+#define GENERAL_PWRMGT__VOLT_PWRMGT_EN__SHIFT 0xa
+#define GENERAL_PWRMGT__SPARE11_MASK 0x800
+#define GENERAL_PWRMGT__SPARE11__SHIFT 0xb
+#define GENERAL_PWRMGT__GPU_COUNTER_ACPI_MASK 0x4000
+#define GENERAL_PWRMGT__GPU_COUNTER_ACPI__SHIFT 0xe
+#define GENERAL_PWRMGT__GPU_COUNTER_CLK_MASK 0x8000
+#define GENERAL_PWRMGT__GPU_COUNTER_CLK__SHIFT 0xf
+#define GENERAL_PWRMGT__GPU_COUNTER_OFF_MASK 0x10000
+#define GENERAL_PWRMGT__GPU_COUNTER_OFF__SHIFT 0x10
+#define GENERAL_PWRMGT__GPU_COUNTER_INTF_OFF_MASK 0x20000
+#define GENERAL_PWRMGT__GPU_COUNTER_INTF_OFF__SHIFT 0x11
+#define GENERAL_PWRMGT__SPARE18_MASK 0x40000
+#define GENERAL_PWRMGT__SPARE18__SHIFT 0x12
+#define GENERAL_PWRMGT__ACPI_D3_VID_MASK 0x180000
+#define GENERAL_PWRMGT__ACPI_D3_VID__SHIFT 0x13
+#define GENERAL_PWRMGT__DYN_SPREAD_SPECTRUM_EN_MASK 0x800000
+#define GENERAL_PWRMGT__DYN_SPREAD_SPECTRUM_EN__SHIFT 0x17
+#define GENERAL_PWRMGT__SPARE27_MASK 0x8000000
+#define GENERAL_PWRMGT__SPARE27__SHIFT 0x1b
+#define GENERAL_PWRMGT__SPARE_MASK 0xf0000000
+#define GENERAL_PWRMGT__SPARE__SHIFT 0x1c
+#define CNB_PWRMGT_CNTL__GNB_SLOW_MODE_MASK 0x3
+#define CNB_PWRMGT_CNTL__GNB_SLOW_MODE__SHIFT 0x0
+#define CNB_PWRMGT_CNTL__GNB_SLOW_MASK 0x4
+#define CNB_PWRMGT_CNTL__GNB_SLOW__SHIFT 0x2
+#define CNB_PWRMGT_CNTL__FORCE_NB_PS1_MASK 0x8
+#define CNB_PWRMGT_CNTL__FORCE_NB_PS1__SHIFT 0x3
+#define CNB_PWRMGT_CNTL__DPM_ENABLED_MASK 0x10
+#define CNB_PWRMGT_CNTL__DPM_ENABLED__SHIFT 0x4
+#define CNB_PWRMGT_CNTL__SPARE_MASK 0xffffffe0
+#define CNB_PWRMGT_CNTL__SPARE__SHIFT 0x5
+#define SCLK_PWRMGT_CNTL__SCLK_PWRMGT_OFF_MASK 0x1
+#define SCLK_PWRMGT_CNTL__SCLK_PWRMGT_OFF__SHIFT 0x0
+#define SCLK_PWRMGT_CNTL__SCLK_LOW_D1_MASK 0x2
+#define SCLK_PWRMGT_CNTL__SCLK_LOW_D1__SHIFT 0x1
+#define SCLK_PWRMGT_CNTL__DYN_PWR_DOWN_EN_MASK 0x4
+#define SCLK_PWRMGT_CNTL__DYN_PWR_DOWN_EN__SHIFT 0x2
+#define SCLK_PWRMGT_CNTL__RESET_BUSY_CNT_MASK 0x10
+#define SCLK_PWRMGT_CNTL__RESET_BUSY_CNT__SHIFT 0x4
+#define SCLK_PWRMGT_CNTL__RESET_SCLK_CNT_MASK 0x20
+#define SCLK_PWRMGT_CNTL__RESET_SCLK_CNT__SHIFT 0x5
+#define SCLK_PWRMGT_CNTL__RESERVED_0_MASK 0x40
+#define SCLK_PWRMGT_CNTL__RESERVED_0__SHIFT 0x6
+#define SCLK_PWRMGT_CNTL__DYN_GFX_CLK_OFF_EN_MASK 0x80
+#define SCLK_PWRMGT_CNTL__DYN_GFX_CLK_OFF_EN__SHIFT 0x7
+#define SCLK_PWRMGT_CNTL__GFX_CLK_FORCE_ON_MASK 0x100
+#define SCLK_PWRMGT_CNTL__GFX_CLK_FORCE_ON__SHIFT 0x8
+#define SCLK_PWRMGT_CNTL__GFX_CLK_REQUEST_OFF_MASK 0x200
+#define SCLK_PWRMGT_CNTL__GFX_CLK_REQUEST_OFF__SHIFT 0x9
+#define SCLK_PWRMGT_CNTL__GFX_CLK_FORCE_OFF_MASK 0x400
+#define SCLK_P

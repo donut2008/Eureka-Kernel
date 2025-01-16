@@ -1,149 +1,133 @@
-/*
- *  w9012_flash.h - Wacom Digitizer Controller Flash Driver
- *
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+prom_data) << 16) +
+				nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		nes_debug(NES_DBG_HW, "rx_threshold = 0x%08X\n", nesadapter->rx_threshold);
+
+		eeprom_offset += 2;
+		eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		eeprom_offset += 2;
+		nesadapter->tcp_timer_core_clk_divisor = (((u32)eeprom_data) << 16) +
+				nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		nes_debug(NES_DBG_HW, "tcp_timer_core_clk_divisor = 0x%08X\n",
+				nesadapter->tcp_timer_core_clk_divisor);
+
+		eeprom_offset += 2;
+		eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		eeprom_offset += 2;
+		nesadapter->iwarp_config = (((u32)eeprom_data) << 16) +
+				nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		nes_debug(NES_DBG_HW, "iwarp_config = 0x%08X\n", nesadapter->iwarp_config);
+
+		eeprom_offset += 2;
+		eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		eeprom_offset += 2;
+		nesadapter->cm_config = (((u32)eeprom_data) << 16) +
+				nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		nes_debug(NES_DBG_HW, "cm_config = 0x%08X\n", nesadapter->cm_config);
+
+		eeprom_offset += 2;
+		eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		eeprom_offset += 2;
+		nesadapter->sws_timer_config = (((u32)eeprom_data) << 16) +
+				nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		nes_debug(NES_DBG_HW, "sws_timer_config = 0x%08X\n", nesadapter->sws_timer_config);
+
+		eeprom_offset += 2;
+		eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		eeprom_offset += 2;
+		nesadapter->tcp_config1 = (((u32)eeprom_data) << 16) +
+				nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		nes_debug(NES_DBG_HW, "tcp_config1 = 0x%08X\n", nesadapter->tcp_config1);
+
+		eeprom_offset += 2;
+		eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		eeprom_offset += 2;
+		nesadapter->wqm_wat = (((u32)eeprom_data) << 16) +
+				nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		nes_debug(NES_DBG_HW, "wqm_wat = 0x%08X\n", nesadapter->wqm_wat);
+
+		eeprom_offset += 2;
+		eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		eeprom_offset += 2;
+		nesadapter->core_clock = (((u32)eeprom_data) << 16) +
+				nes_read16_eeprom(nesdev->regs, eeprom_offset);
+		nes_debug(NES_DBG_HW, "core_clock = 0x%08X\n", nesadapter->core_clock);
+
+		if ((sw_section_ver) && (nesadapter->hw_rev != NE020_REV)) {
+			eeprom_offset += 2;
+			eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+			nesadapter->phy_index[0] = (eeprom_data & 0xff00)>>8;
+			nesadapter->phy_index[1] = eeprom_data & 0x00ff;
+			eeprom_offset += 2;
+			eeprom_data = nes_read16_eeprom(nesdev->regs, eeprom_offset);
+			nesadapter->phy_index[2] = (eeprom_data & 0xff00)>>8;
+			nesadapter->phy_index[3] = eeprom_data & 0x00ff;
+		} else {
+			nesadapter->phy_index[0] = 4;
+			nesadapter->phy_index[1] = 5;
+			nesadapter->phy_index[2] = 6;
+			nesadapter->phy_index[3] = 7;
+		}
+		nes_debug(NES_DBG_HW, "Phy address map = 0 > %u,  1 > %u, 2 > %u, 3 > %u\n",
+			   nesadapter->phy_index[0],nesadapter->phy_index[1],
+			   nesadapter->phy_index[2],nesadapter->phy_index[3]);
+	}
+
+	return 0;
+}
+
+
+/**
+ * nes_read16_eeprom
  */
+static u16 nes_read16_eeprom(void __iomem *addr, u16 offset)
+{
+	writel(NES_EEPROM_READ_REQUEST + (offset >> 1),
+			(void __iomem *)addr + NES_EEPROM_COMMAND);
 
-#ifndef _WACOM_I2C_FLASH_H
-#define _WACOM_I2C_FLASH_H
+	do {
+	} while (readl((void __iomem *)addr + NES_EEPROM_COMMAND) &
+			NES_EEPROM_READ_REQUEST);
 
-#define FLASH_START0		'f'
-#define FLASH_START1		'l'
-#define FLASH_START2		'a'
-#define FLASH_START3		's'
-#define FLASH_START4		'h'
-#define FLASH_START5		'\r'
-#define FLASH_ACK		0x06
+	return readw((void __iomem *)addr + NES_EEPROM_DATA);
+}
 
-/*Address for boot is 0x09 by default, but it may be different in other models*/
-#define WACOM_FLASH_W9014	0x09
-#define WACOM_QUERY_SIZE	19
-#define pen_QUERY		'*'
-#define ACK			0
 
-#define MPU_W9014		0x2f
-#define MPU_W9019		0x43
+/**
+ * nes_write_1G_phy_reg
+ */
+void nes_write_1G_phy_reg(struct nes_device *nesdev, u8 phy_reg, u8 phy_addr, u16 data)
+{
+	u32 u32temp;
+	u32 counter;
 
-#define FLASH_BLOCK_SIZE	64
-#define DATA_SIZE		(65536 * 2)
-#define BLOCK_NUM		127
-#define W9014_START_ADDR	0x2000
-#define W9014_END_ADDR		0x1ffff
+	nes_write_indexed(nesdev, NES_IDX_MAC_MDIO_CONTROL,
+			0x50020000 | data | ((u32)phy_reg << 18) | ((u32)phy_addr << 23));
+	for (counter = 0; counter < 100 ; counter++) {
+		udelay(30);
+		u32temp = nes_read_indexed(nesdev, NES_IDX_MAC_INT_STATUS);
+		if (u32temp & 1) {
+			/* nes_debug(NES_DBG_PHY, "Phy interrupt status = 0x%X.\n", u32temp); */
+			nes_write_indexed(nesdev, NES_IDX_MAC_INT_STATUS, 1);
+			break;
+		}
+	}
+	if (!(u32temp & 1))
+		nes_debug(NES_DBG_PHY, "Phy is not responding. interrupt status = 0x%X.\n",
+				u32temp);
+}
 
-#define CMD_GET_FEATURE		2
-#define CMD_SET_FEATURE		3
 
-/*Added for using this prog. in Linux user-space program*/
-#define RTYPE_FEATURE		0x03 /*: Report type -> feature(11b)*/
-#define GET_FEATURE		0x02
-#define SET_FEATURE		0x03
-#define GFEATURE_SIZE		6
-#define SFEATURE_SIZE		8
+/**
+ * nes_read_1G_phy_reg
+ * This routine only issues the read, the data must be read
+ * separately.
+ */
+void nes_read_1G_phy_reg(struct nes_device *nesdev, u8 phy_reg, u8 phy_addr, u16 *data)
+{
+	u32 u32temp;
+	u32 counter;
 
-#define COMM_REG		0x04
-#define DATA_REG		0x05
-#define REPORT_ID_1		0x07
-#define REPORT_ID_2		0x08
-#define BOOT_QUERY_SIZE		5
+	/* nes_debug(NES_DBG_PHY, "phy addr = %d, mac_index = %d\n",
+			phy_addr, nesdev->mac_index); */
 
-#define BOOT_CMD_SIZE		78
-#define BOOT_RSP_SIZE		6
-#define BOOT_CMD_REPORT_ID	7
-#define BOOT_ERASE_DATAMEM	0x0e
-#define BOOT_ERASE_FLASH	0
-#define BOOT_WRITE_FLASH	1
-#define BOOT_EXIT		3
-#define BOOT_BLVER		4
-#define BOOT_MPU		5
-#define BOOT_QUERY		7
-
-#define QUERY_CMD		0x07
-#define BOOT_CMD		0x04
-#define MPU_CMD			0x05
-#define ERS_CMD			0x00
-#define WRITE_CMD		0x01
-
-#define QUERY_RSP		0x06
-#define ERS_RSP			0x00
-#define WRITE_RSP		0x00
-
-#define CMD_SIZE		(72+6)
-#define RSP_SIZE		6
-
-/*Sector Nos for erasing datamem*/
-#define DATAMEM_SECTOR0		0
-#define DATAMEM_SECTOR1		1
-#define DATAMEM_SECTOR2		2
-#define DATAMEM_SECTOR3		3
-#define DATAMEM_SECTOR4		4
-#define DATAMEM_SECTOR5		5
-#define DATAMEM_SECTOR6		6
-#define DATAMEM_SECTOR7		7
-
-//
-// exit codes
-//
-#define EXIT_OK					(0)
-#define EXIT_REBOOT				(1)
-#define EXIT_FAIL				(2)
-#define EXIT_USAGE				(3)
-#define EXIT_NO_SUCH_FILE			(4)
-#define EXIT_NO_INTEL_HEX			(5)
-#define EXIT_FAIL_OPEN_COM_PORT			(6)
-#define EXIT_FAIL_ENTER_FLASH_MODE		(7)
-#define EXIT_FAIL_FLASH_QUERY			(8)
-#define EXIT_FAIL_BAUDRATE_CHANGE		(9)
-#define EXIT_FAIL_WRITE_FIRMWARE		(10)
-#define EXIT_FAIL_EXIT_FLASH_MODE		(11)
-#define EXIT_CANCEL_UPDATE			(12)
-#define EXIT_SUCCESS_UPDATE			(13)
-#define EXIT_FAIL_HID2SERIAL			(14)
-#define EXIT_FAIL_VERIFY_FIRMWARE		(15)
-#define EXIT_FAIL_MAKE_WRITING_MARK		(16)
-#define EXIT_FAIL_ERASE_WRITING_MARK            (17)
-#define EXIT_FAIL_READ_WRITING_MARK		(18)
-#define EXIT_EXIST_MARKING			(19)
-#define EXIT_FAIL_MISMATCHING			(20)
-#define EXIT_FAIL_ERASE				(21)
-#define EXIT_FAIL_GET_BOOT_LOADER_VERSION	(22)
-#define EXIT_FAIL_GET_MPU_TYPE			(23)
-#define EXIT_MISMATCH_BOOTLOADER		(24)
-#define EXIT_MISMATCH_MPUTYPE			(25)
-#define EXIT_FAIL_ERASE_BOOT			(26)
-#define EXIT_FAIL_WRITE_BOOTLOADER		(27)
-#define EXIT_FAIL_SWAP_BOOT			(28)
-#define EXIT_FAIL_WRITE_DATA			(29)
-#define EXIT_FAIL_GET_FIRMWARE_VERSION	        (30)
-#define EXIT_FAIL_GET_UNIT_ID			(31)
-#define EXIT_FAIL_SEND_STOP_COMMAND		(32)
-#define EXIT_FAIL_SEND_QUERY_COMMAND	        (33)
-#define EXIT_NOT_FILE_FOR_535			(34)
-#define EXIT_NOT_FILE_FOR_514			(35)
-#define EXIT_NOT_FILE_FOR_503			(36)
-#define EXIT_MISMATCH_MPU_TYPE			(37)
-#define EXIT_NOT_FILE_FOR_515			(38)
-#define EXIT_NOT_FILE_FOR_1024			(39)
-#define EXIT_FAIL_VERIFY_WRITING_MARK	        (40)
-#define EXIT_DEVICE_NOT_FOUND			(41)
-#define EXIT_FAIL_WRITING_MARK_NOT_SET	        (42)
-#define EXIT_FAIL_SET_PDCT                      (43)
-#define ERR_SET_PDCT                            (44)
-#define ERR_GET_PDCT                            (45)
-
-/*partial erase*/
-#define PARTIAL_ERASE
-
-#endif /*_WACOM_I2C_FLASH_H*/
+	

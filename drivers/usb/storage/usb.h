@@ -1,221 +1,88 @@
-/* Driver for USB Mass Storage compliant devices
- * Main Header File
- *
- * Current development and maintenance by:
- *   (c) 1999-2002 Matthew Dharm (mdharm-usb@one-eyed-alien.net)
- *
- * Initial work by:
- *   (c) 1999 Michael Gee (michael@linuxspecific.com)
- *
- * This driver is based on the 'USB Mass Storage Class' document. This
- * describes in detail the protocol used to communicate with such
- * devices.  Clearly, the designers had SCSI and ATAPI commands in
- * mind when they created this document.  The commands are all very
- * similar to commands in the SCSI-II and ATAPI specifications.
- *
- * It is important to note that in a number of cases this class
- * exhibits class-specific exemptions from the USB specification.
- * Notably the usage of NAK, STALL and ACK differs from the norm, in
- * that they are used to communicate wait, failed and OK on commands.
- *
- * Also, for certain devices, the interrupt endpoint is used to convey
- * status of a command.
- *
- * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
- * information about this driver.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#ifndef _USB_H_
-#define _USB_H_
-
-#include <linux/usb.h>
-#include <linux/usb_usual.h>
-#include <linux/blkdev.h>
-#include <linux/completion.h>
-#include <linux/mutex.h>
-#include <linux/workqueue.h>
-#include <scsi/scsi_host.h>
-
-struct us_data;
-struct scsi_cmnd;
-
-/*
- * Unusual device list definitions 
- */
-
-struct us_unusual_dev {
-	const char* vendorName;
-	const char* productName;
-	__u8  useProtocol;
-	__u8  useTransport;
-	int (*initFunction)(struct us_data *);
-};
-
-
-/* Dynamic bitflag definitions (us->dflags): used in set_bit() etc. */
-#define US_FLIDX_URB_ACTIVE	0	/* current_urb is in use    */
-#define US_FLIDX_SG_ACTIVE	1	/* current_sg is in use     */
-#define US_FLIDX_ABORTING	2	/* abort is in progress     */
-#define US_FLIDX_DISCONNECTING	3	/* disconnect in progress   */
-#define US_FLIDX_RESETTING	4	/* device reset in progress */
-#define US_FLIDX_TIMED_OUT	5	/* SCSI midlayer timed out  */
-#define US_FLIDX_SCAN_PENDING	6	/* scanning not yet done    */
-#define US_FLIDX_REDO_READ10	7	/* redo READ(10) command    */
-#define US_FLIDX_READ10_WORKED	8	/* previous READ(10) succeeded */
-
-#define USB_STOR_STRING_LEN 32
-
-/*
- * We provide a DMA-mapped I/O buffer for use with small USB transfers.
- * It turns out that CB[I] needs a 12-byte buffer and Bulk-only needs a
- * 31-byte buffer.  But Freecom needs a 64-byte buffer, so that's the
- * size we'll allocate.
- */
-
-#define US_IOBUF_SIZE		64	/* Size of the DMA-mapped I/O buffer */
-#define US_SENSE_SIZE		18	/* Size of the autosense data buffer */
-
-typedef int (*trans_cmnd)(struct scsi_cmnd *, struct us_data*);
-typedef int (*trans_reset)(struct us_data*);
-typedef void (*proto_cmnd)(struct scsi_cmnd*, struct us_data*);
-typedef void (*extra_data_destructor)(void *);	/* extra data destructor */
-typedef void (*pm_hook)(struct us_data *, int);	/* power management hook */
-
-#define US_SUSPEND	0
-#define US_RESUME	1
-
-/* we allocate one of these for every device that we remember */
-struct us_data {
-	/* The device we're working with
-	 * It's important to note:
-	 *    (o) you must hold dev_mutex to change pusb_dev
-	 */
-	struct mutex		dev_mutex;	 /* protect pusb_dev */
-	struct usb_device	*pusb_dev;	 /* this usb_device */
-	struct usb_interface	*pusb_intf;	 /* this interface */
-	struct us_unusual_dev   *unusual_dev;	 /* device-filter entry     */
-	unsigned long		fflags;		 /* fixed flags from filter */
-	unsigned long		dflags;		 /* dynamic atomic bitflags */
-	unsigned int		send_bulk_pipe;	 /* cached pipe values */
-	unsigned int		recv_bulk_pipe;
-	unsigned int		send_ctrl_pipe;
-	unsigned int		recv_ctrl_pipe;
-	unsigned int		recv_intr_pipe;
-
-	/* information about the device */
-	char			*transport_name;
-	char			*protocol_name;
-	__le32			bcs_signature;
-	u8			subclass;
-	u8			protocol;
-	u8			max_lun;
-
-	u8			ifnum;		 /* interface number   */
-	u8			ep_bInterval;	 /* interrupt interval */ 
-
-	/* function pointers for this device */
-	trans_cmnd		transport;	 /* transport function	   */
-	trans_reset		transport_reset; /* transport device reset */
-	proto_cmnd		proto_handler;	 /* protocol handler	   */
-
-	/* SCSI interfaces */
-	struct scsi_cmnd	*srb;		 /* current srb		*/
-	unsigned int		tag;		 /* current dCBWTag	*/
-	char			scsi_name[32];	 /* scsi_host name	*/
-
-	/* control and bulk communications data */
-	struct urb		*current_urb;	 /* USB requests	 */
-	struct usb_ctrlrequest	*cr;		 /* control requests	 */
-	struct usb_sg_request	current_sg;	 /* scatter-gather req.  */
-	unsigned char		*iobuf;		 /* I/O buffer		 */
-	dma_addr_t		iobuf_dma;	 /* buffer DMA addresses */
-	struct task_struct	*ctl_thread;	 /* the control thread   */
-
-	/* mutual exclusion and synchronization structures */
-	struct completion	cmnd_ready;	 /* to sleep thread on	    */
-	struct completion	notify;		 /* thread begin/end	    */
-	wait_queue_head_t	delay_wait;	 /* wait during reset	    */
-	struct delayed_work	scan_dwork;	 /* for async scanning      */
-
-	/* subdriver information */
-	void			*extra;		 /* Any extra data          */
-	extra_data_destructor	extra_destructor;/* extra data destructor   */
-#ifdef CONFIG_PM
-	pm_hook			suspend_resume_hook;
-#endif
-
-	/* hacks for READ CAPACITY bug handling */
-	int			use_last_sector_hacks;
-	int			last_sector_retries;
-};
-
-/* Convert between us_data and the corresponding Scsi_Host */
-static inline struct Scsi_Host *us_to_host(struct us_data *us) {
-	return container_of((void *) us, struct Scsi_Host, hostdata);
-}
-static inline struct us_data *host_to_us(struct Scsi_Host *host) {
-	return (struct us_data *) host->hostdata;
-}
-
-/* Function to fill an inquiry response. See usb.c for details */
-extern void fill_inquiry_response(struct us_data *us,
-	unsigned char *data, unsigned int data_len);
-
-/* The scsi_lock() and scsi_unlock() macros protect the sm_state and the
- * single queue element srb for write access */
-#define scsi_unlock(host)	spin_unlock_irq(host->host_lock)
-#define scsi_lock(host)		spin_lock_irq(host->host_lock)
-
-/* General routines provided by the usb-storage standard core */
-#ifdef CONFIG_PM
-extern int usb_stor_suspend(struct usb_interface *iface, pm_message_t message);
-extern int usb_stor_resume(struct usb_interface *iface);
-extern int usb_stor_reset_resume(struct usb_interface *iface);
-#else
-#define usb_stor_suspend	NULL
-#define usb_stor_resume		NULL
-#define usb_stor_reset_resume	NULL
-#endif
-
-extern int usb_stor_pre_reset(struct usb_interface *iface);
-extern int usb_stor_post_reset(struct usb_interface *iface);
-
-extern int usb_stor_probe1(struct us_data **pus,
-		struct usb_interface *intf,
-		const struct usb_device_id *id,
-		struct us_unusual_dev *unusual_dev,
-		struct scsi_host_template *sht);
-extern int usb_stor_probe2(struct us_data *us);
-extern void usb_stor_disconnect(struct usb_interface *intf);
-
-extern void usb_stor_adjust_quirks(struct usb_device *dev,
-		unsigned long *fflags);
-
-#define module_usb_stor_driver(__driver, __sht, __name) \
-static int __init __driver##_init(void) \
-{ \
-	usb_stor_host_template_init(&(__sht), __name, THIS_MODULE); \
-	return usb_register(&(__driver)); \
-} \
-module_init(__driver##_init); \
-static void __exit __driver##_exit(void) \
-{ \
-	usb_deregister(&(__driver)); \
-} \
-module_exit(__driver##_exit)
-
-#endif
+ine ixPSX80_BIF_LM_PCIETXMUX3                                               0x1400124
+#define ixPSX80_BIF_LM_PCIERXMUX0                                               0x1400125
+#define ixPSX80_BIF_LM_PCIERXMUX1                                               0x1400126
+#define ixPSX80_BIF_LM_PCIERXMUX2                                               0x1400127
+#define ixPSX80_BIF_LM_PCIERXMUX3                                               0x1400128
+#define ixPSX80_BIF_LM_LANEENABLE                                               0x1400129
+#define ixPSX80_BIF_LM_PRBSCONTROL                                              0x140012a
+#define ixPSX80_BIF_LM_POWERCONTROL                                             0x140012b
+#define ixPSX80_BIF_LM_POWERCONTROL1                                            0x140012c
+#define ixPSX80_BIF_LM_POWERCONTROL2                                            0x140012d
+#define ixPSX80_BIF_LM_POWERCONTROL3                                            0x140012e
+#define ixPSX80_BIF_LM_POWERCONTROL4                                            0x140012f
+#define ixPSX81_BIF_PCIE_RESERVED                                               0x1410000
+#define ixPSX81_BIF_PCIE_SCRATCH                                                0x1410001
+#define ixPSX81_BIF_PCIE_HW_DEBUG                                               0x1410002
+#define ixPSX81_BIF_PCIE_RX_NUM_NAK                                             0x141000e
+#define ixPSX81_BIF_PCIE_RX_NUM_NAK_GENERATED                                   0x141000f
+#define ixPSX81_BIF_PCIE_CNTL                                                   0x1410010
+#define ixPSX81_BIF_PCIE_CONFIG_CNTL                                            0x1410011
+#define ixPSX81_BIF_PCIE_DEBUG_CNTL                                             0x1410012
+#define ixPSX81_BIF_PCIE_CNTL2                                                  0x141001c
+#define ixPSX81_BIF_PCIE_RX_CNTL2                                               0x141001d
+#define ixPSX81_BIF_PCIE_TX_F0_ATTR_CNTL                                        0x141001e
+#define ixPSX81_BIF_PCIE_CI_CNTL                                                0x1410020
+#define ixPSX81_BIF_PCIE_BUS_CNTL                                               0x1410021
+#define ixPSX81_BIF_PCIE_LC_STATE6                                              0x1410022
+#define ixPSX81_BIF_PCIE_LC_STATE7                                              0x1410023
+#define ixPSX81_BIF_PCIE_LC_STATE8                                              0x1410024
+#define ixPSX81_BIF_PCIE_LC_STATE9                                              0x1410025
+#define ixPSX81_BIF_PCIE_LC_STATE10                                             0x1410026
+#define ixPSX81_BIF_PCIE_LC_STATE11                                             0x1410027
+#define ixPSX81_BIF_PCIE_LC_STATUS1                                             0x1410028
+#define ixPSX81_BIF_PCIE_LC_STATUS2                                             0x1410029
+#define ixPSX81_BIF_PCIE_WPR_CNTL                                               0x1410030
+#define ixPSX81_BIF_PCIE_RX_LAST_TLP0                                           0x1410031
+#define ixPSX81_BIF_PCIE_RX_LAST_TLP1                                           0x1410032
+#define ixPSX81_BIF_PCIE_RX_LAST_TLP2                                           0x1410033
+#define ixPSX81_BIF_PCIE_RX_LAST_TLP3                                           0x1410034
+#define ixPSX81_BIF_PCIE_TX_LAST_TLP0                                           0x1410035
+#define ixPSX81_BIF_PCIE_TX_LAST_TLP1                                           0x1410036
+#define ixPSX81_BIF_PCIE_TX_LAST_TLP2                                           0x1410037
+#define ixPSX81_BIF_PCIE_TX_LAST_TLP3                                           0x1410038
+#define ixPSX81_BIF_PCIE_I2C_REG_ADDR_EXPAND                                    0x141003a
+#define ixPSX81_BIF_PCIE_I2C_REG_DATA                                           0x141003b
+#define ixPSX81_BIF_PCIE_CFG_CNTL                                               0x141003c
+#define ixPSX81_BIF_PCIE_LC_PM_CNTL                                             0x141003d
+#define ixPSX81_BIF_PCIE_P_CNTL                                                 0x1410040
+#define ixPSX81_BIF_PCIE_P_BUF_STATUS                                           0x1410041
+#define ixPSX81_BIF_PCIE_P_DECODER_STATUS                                       0x1410042
+#define ixPSX81_BIF_PCIE_P_MISC_STATUS                                          0x1410043
+#define ixPSX81_BIF_PCIE_P_RCV_L0S_FTS_DET                                      0x1410050
+#define ixPSX81_BIF_PCIE_PERF_COUNT_CNTL                                        0x1410080
+#define ixPSX81_BIF_PCIE_PERF_CNTL_TXCLK                                        0x1410081
+#define ixPSX81_BIF_PCIE_PERF_COUNT0_TXCLK                                      0x1410082
+#define ixPSX81_BIF_PCIE_PERF_COUNT1_TXCLK                                      0x1410083
+#define ixPSX81_BIF_PCIE_PERF_CNTL_MST_R_CLK                                    0x1410084
+#define ixPSX81_BIF_PCIE_PERF_COUNT0_MST_R_CLK                                  0x1410085
+#define ixPSX81_BIF_PCIE_PERF_COUNT1_MST_R_CLK                                  0x1410086
+#define ixPSX81_BIF_PCIE_PERF_CNTL_MST_C_CLK                                    0x1410087
+#define ixPSX81_BIF_PCIE_PERF_COUNT0_MST_C_CLK                                  0x1410088
+#define ixPSX81_BIF_PCIE_PERF_COUNT1_MST_C_CLK                                  0x1410089
+#define ixPSX81_BIF_PCIE_PERF_CNTL_SLV_R_CLK                                    0x141008a
+#define ixPSX81_BIF_PCIE_PERF_COUNT0_SLV_R_CLK                                  0x141008b
+#define ixPSX81_BIF_PCIE_PERF_COUNT1_SLV_R_CLK                                  0x141008c
+#define ixPSX81_BIF_PCIE_PERF_CNTL_SLV_S_C_CLK                                  0x141008d
+#define ixPSX81_BIF_PCIE_PERF_COUNT0_SLV_S_C_CLK                                0x141008e
+#define ixPSX81_BIF_PCIE_PERF_COUNT1_SLV_S_C_CLK                                0x141008f
+#define ixPSX81_BIF_PCIE_PERF_CNTL_SLV_NS_C_CLK                                 0x1410090
+#define ixPSX81_BIF_PCIE_PERF_COUNT0_SLV_NS_C_CLK                               0x1410091
+#define ixPSX81_BIF_PCIE_PERF_COUNT1_SLV_NS_C_CLK                               0x1410092
+#define ixPSX81_BIF_PCIE_PERF_CNTL_EVENT0_PORT_SEL                              0x1410093
+#define ixPSX81_BIF_PCIE_PERF_CNTL_EVENT1_PORT_SEL                              0x1410094
+#define ixPSX81_BIF_PCIE_PERF_CNTL_TXCLK2                                       0x1410095
+#define ixPSX81_BIF_PCIE_PERF_COUNT0_TXCLK2                                     0x1410096
+#define ixPSX81_BIF_PCIE_PERF_COUNT1_TXCLK2                                     0x1410097
+#define ixPSX81_BIF_PCIE_STRAP_F0                                               0x14100b0
+#define ixPSX81_BIF_PCIE_STRAP_MISC                                             0x14100c0
+#define ixPSX81_BIF_PCIE_STRAP_MISC2                                            0x14100c1
+#define ixPSX81_BIF_PCIE_STRAP_PI                                               0x14100c2
+#define ixPSX81_BIF_PCIE_STRAP_I2C_BD                                           0x14100c4
+#define ixPSX81_BIF_PCIE_PRBS_CLR                                               0x14100c8
+#define ixPSX81_BIF_PCIE_PRBS_STATUS1                                           0x14100c9
+#define ixPSX81_BIF_PCIE_PRBS_STATUS2                                           0x14100ca
+#define ixPSX81_BIF_PCIE_PRBS_FREERUN                                           0x14100cb
+#define ixPSX81_BIF_PCIE_PRBS_MISC                                              0x14100cc
+#define ixPSX81_BIF_PCIE_PRBS_USER_PATTERN                                      0x14100cd
+#define ixPSX81_BIF_PCIE_PRBS_LO_BITCNT                                         0x14100ce
+#define ixPSX81_BIF_PCIE_PRBS_HI_BITCNT                                         0x14100c

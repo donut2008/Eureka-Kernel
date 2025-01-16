@@ -1,29 +1,28 @@
-/*
- * Tracepoint definitions for s390
- *
- * Copyright IBM Corp. 2015
- * Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>
- */
+# UAPI Header export list
+include include/uapi/asm-generic/Kbuild.asm
 
-#include <linux/percpu.h>
-#define CREATE_TRACE_POINTS
-#include <asm/trace/diag.h>
+generic-y += kvm_para.h
 
-EXPORT_TRACEPOINT_SYMBOL(s390_diagnose);
-
-static DEFINE_PER_CPU(unsigned int, diagnose_trace_depth);
-
-void trace_s390_diagnose_norecursion(int diag_nr)
-{
-	unsigned long flags;
-	unsigned int *depth;
-
-	local_irq_save(flags);
-	depth = this_cpu_ptr(&diagnose_trace_depth);
-	if (*depth == 0) {
-		(*depth)++;
-		trace_s390_diagnose(diag_nr);
-		(*depth)--;
-	}
-	local_irq_restore(flags);
-}
+header-y += auxvec.h
+header-y += bitsperlong.h
+header-y += break.h
+header-y += byteorder.h
+header-y += cmpxchg.h
+header-y += errno.h
+header-y += fcntl.h
+header-y += fpu.h
+header-y += gcc_intrin.h
+header-y += ia64regs.h
+header-y += intel_intrin.h
+header-y += intrinsics.h
+header-y += ioctl.h
+header-y += ioctls.h
+header-y += ipcbuf.h
+header-y += kvm_para.h
+header-y += mman.h
+header-y += msgbuf.h
+header-y += param.h
+header-y += perfmon.h
+header-y += perfmon_default_smpl.h
+header-y += poll.h
+header-y

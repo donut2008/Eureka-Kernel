@@ -1,196 +1,106 @@
-/*
- *  Copyright (c) 1999-2001 Vojtech Pavlik
- *
- *  Based on the work of:
- *	Teemu Rantanen		Derrick Cole
- *	Peter Cervasio		Christoph Niemann
- *	Philip Blundell		Russell King
- *	Bob Harris
- */
-
-/*
- * Inport (ATI XL and Microsoft) busmouse driver for Linux
- */
-
-/*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- *
- * Should you need to contact me, the author, you can do so either by
- * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
- * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
- */
-
-#include <linux/module.h>
-#include <linux/ioport.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/input.h>
-
-#include <asm/io.h>
-#include <asm/irq.h>
-
-MODULE_AUTHOR("Vojtech Pavlik <vojtech@ucw.cz>");
-MODULE_DESCRIPTION("Inport (ATI XL and Microsoft) busmouse driver");
-MODULE_LICENSE("GPL");
-
-#define INPORT_BASE		0x23c
-#define INPORT_EXTENT		4
-
-#define INPORT_CONTROL_PORT	INPORT_BASE + 0
-#define INPORT_DATA_PORT	INPORT_BASE + 1
-#define INPORT_SIGNATURE_PORT	INPORT_BASE + 2
-
-#define INPORT_REG_BTNS	0x00
-#define INPORT_REG_X		0x01
-#define INPORT_REG_Y		0x02
-#define INPORT_REG_MODE		0x07
-#define INPORT_RESET		0x80
-
-#ifdef CONFIG_MOUSE_ATIXL
-#define INPORT_NAME		"ATI XL Mouse"
-#define INPORT_VENDOR		0x0002
-#define INPORT_SPEED_30HZ	0x01
-#define INPORT_SPEED_50HZ	0x02
-#define INPORT_SPEED_100HZ	0x03
-#define INPORT_SPEED_200HZ	0x04
-#define INPORT_MODE_BASE	INPORT_SPEED_100HZ
-#define INPORT_MODE_IRQ		0x08
-#else
-#define INPORT_NAME		"Microsoft InPort Mouse"
-#define INPORT_VENDOR		0x0001
-#define INPORT_MODE_BASE	0x10
-#define INPORT_MODE_IRQ		0x01
-#endif
-#define INPORT_MODE_HOLD	0x20
-
-#define INPORT_IRQ		5
-
-static int inport_irq = INPORT_IRQ;
-module_param_named(irq, inport_irq, uint, 0);
-MODULE_PARM_DESC(irq, "IRQ number (5=default)");
-
-static struct input_dev *inport_dev;
-
-static irqreturn_t inport_interrupt(int irq, void *dev_id)
-{
-	unsigned char buttons;
-
-	outb(INPORT_REG_MODE, INPORT_CONTROL_PORT);
-	outb(INPORT_MODE_HOLD | INPORT_MODE_IRQ | INPORT_MODE_BASE, INPORT_DATA_PORT);
-
-	outb(INPORT_REG_X, INPORT_CONTROL_PORT);
-	input_report_rel(inport_dev, REL_X, inb(INPORT_DATA_PORT));
-
-	outb(INPORT_REG_Y, INPORT_CONTROL_PORT);
-	input_report_rel(inport_dev, REL_Y, inb(INPORT_DATA_PORT));
-
-	outb(INPORT_REG_BTNS, INPORT_CONTROL_PORT);
-	buttons = inb(INPORT_DATA_PORT);
-
-	input_report_key(inport_dev, BTN_MIDDLE, buttons & 1);
-	input_report_key(inport_dev, BTN_LEFT,   buttons & 2);
-	input_report_key(inport_dev, BTN_RIGHT,  buttons & 4);
-
-	outb(INPORT_REG_MODE, INPORT_CONTROL_PORT);
-	outb(INPORT_MODE_IRQ | INPORT_MODE_BASE, INPORT_DATA_PORT);
-
-	input_sync(inport_dev);
-	return IRQ_HANDLED;
-}
-
-static int inport_open(struct input_dev *dev)
-{
-	if (request_irq(inport_irq, inport_interrupt, 0, "inport", NULL))
-		return -EBUSY;
-	outb(INPORT_REG_MODE, INPORT_CONTROL_PORT);
-	outb(INPORT_MODE_IRQ | INPORT_MODE_BASE, INPORT_DATA_PORT);
-
-	return 0;
-}
-
-static void inport_close(struct input_dev *dev)
-{
-	outb(INPORT_REG_MODE, INPORT_CONTROL_PORT);
-	outb(INPORT_MODE_BASE, INPORT_DATA_PORT);
-	free_irq(inport_irq, NULL);
-}
-
-static int __init inport_init(void)
-{
-	unsigned char a, b, c;
-	int err;
-
-	if (!request_region(INPORT_BASE, INPORT_EXTENT, "inport")) {
-		printk(KERN_ERR "inport.c: Can't allocate ports at %#x\n", INPORT_BASE);
-		return -EBUSY;
-	}
-
-	a = inb(INPORT_SIGNATURE_PORT);
-	b = inb(INPORT_SIGNATURE_PORT);
-	c = inb(INPORT_SIGNATURE_PORT);
-	if (a == b || a != c) {
-		printk(KERN_INFO "inport.c: Didn't find InPort mouse at %#x\n", INPORT_BASE);
-		err = -ENODEV;
-		goto err_release_region;
-	}
-
-	inport_dev = input_allocate_device();
-	if (!inport_dev) {
-		printk(KERN_ERR "inport.c: Not enough memory for input device\n");
-		err = -ENOMEM;
-		goto err_release_region;
-	}
-
-	inport_dev->name = INPORT_NAME;
-	inport_dev->phys = "isa023c/input0";
-	inport_dev->id.bustype = BUS_ISA;
-	inport_dev->id.vendor  = INPORT_VENDOR;
-	inport_dev->id.product = 0x0001;
-	inport_dev->id.version = 0x0100;
-
-	inport_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REL);
-	inport_dev->keybit[BIT_WORD(BTN_LEFT)] = BIT_MASK(BTN_LEFT) |
-		BIT_MASK(BTN_MIDDLE) | BIT_MASK(BTN_RIGHT);
-	inport_dev->relbit[0] = BIT_MASK(REL_X) | BIT_MASK(REL_Y);
-
-	inport_dev->open  = inport_open;
-	inport_dev->close = inport_close;
-
-	outb(INPORT_RESET, INPORT_CONTROL_PORT);
-	outb(INPORT_REG_MODE, INPORT_CONTROL_PORT);
-	outb(INPORT_MODE_BASE, INPORT_DATA_PORT);
-
-	err = input_register_device(inport_dev);
-	if (err)
-		goto err_free_dev;
-
-	return 0;
-
- err_free_dev:
-	input_free_device(inport_dev);
- err_release_region:
-	release_region(INPORT_BASE, INPORT_EXTENT);
-
-	return err;
-}
-
-static void __exit inport_exit(void)
-{
-	input_unregister_device(inport_dev);
-	release_region(INPORT_BASE, INPORT_EXTENT);
-}
-
-module_init(inport_init);
-module_exit(inport_exit);
+SPI_INTERP_CONTROL_0__PNT_SPRITE_TOP_1_MASK 0x4000
+#define SPI_INTERP_CONTROL_0__PNT_SPRITE_TOP_1__SHIFT 0xe
+#define SPI_PS_IN_CONTROL__NUM_INTERP_MASK 0x3f
+#define SPI_PS_IN_CONTROL__NUM_INTERP__SHIFT 0x0
+#define SPI_PS_IN_CONTROL__PARAM_GEN_MASK 0x40
+#define SPI_PS_IN_CONTROL__PARAM_GEN__SHIFT 0x6
+#define SPI_PS_IN_CONTROL__BC_OPTIMIZE_DISABLE_MASK 0x4000
+#define SPI_PS_IN_CONTROL__BC_OPTIMIZE_DISABLE__SHIFT 0xe
+#define SPI_BARYC_CNTL__PERSP_CENTER_CNTL_MASK 0x1
+#define SPI_BARYC_CNTL__PERSP_CENTER_CNTL__SHIFT 0x0
+#define SPI_BARYC_CNTL__PERSP_CENTROID_CNTL_MASK 0x10
+#define SPI_BARYC_CNTL__PERSP_CENTROID_CNTL__SHIFT 0x4
+#define SPI_BARYC_CNTL__LINEAR_CENTER_CNTL_MASK 0x100
+#define SPI_BARYC_CNTL__LINEAR_CENTER_CNTL__SHIFT 0x8
+#define SPI_BARYC_CNTL__LINEAR_CENTROID_CNTL_MASK 0x1000
+#define SPI_BARYC_CNTL__LINEAR_CENTROID_CNTL__SHIFT 0xc
+#define SPI_BARYC_CNTL__POS_FLOAT_LOCATION_MASK 0x30000
+#define SPI_BARYC_CNTL__POS_FLOAT_LOCATION__SHIFT 0x10
+#define SPI_BARYC_CNTL__POS_FLOAT_ULC_MASK 0x100000
+#define SPI_BARYC_CNTL__POS_FLOAT_ULC__SHIFT 0x14
+#define SPI_BARYC_CNTL__FRONT_FACE_ALL_BITS_MASK 0x1000000
+#define SPI_BARYC_CNTL__FRONT_FACE_ALL_BITS__SHIFT 0x18
+#define SPI_TMPRING_SIZE__WAVES_MASK 0xfff
+#define SPI_TMPRING_SIZE__WAVES__SHIFT 0x0
+#define SPI_TMPRING_SIZE__WAVESIZE_MASK 0x1fff000
+#define SPI_TMPRING_SIZE__WAVESIZE__SHIFT 0xc
+#define SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT_MASK 0xf
+#define SPI_SHADER_POS_FORMAT__POS0_EXPORT_FORMAT__SHIFT 0x0
+#define SPI_SHADER_POS_FORMAT__POS1_EXPORT_FORMAT_MASK 0xf0
+#define SPI_SHADER_POS_FORMAT__POS1_EXPORT_FORMAT__SHIFT 0x4
+#define SPI_SHADER_POS_FORMAT__POS2_EXPORT_FORMAT_MASK 0xf00
+#define SPI_SHADER_POS_FORMAT__POS2_EXPORT_FORMAT__SHIFT 0x8
+#define SPI_SHADER_POS_FORMAT__POS3_EXPORT_FORMAT_MASK 0xf000
+#define SPI_SHADER_POS_FORMAT__POS3_EXPORT_FORMAT__SHIFT 0xc
+#define SPI_SHADER_Z_FORMAT__Z_EXPORT_FORMAT_MASK 0xf
+#define SPI_SHADER_Z_FORMAT__Z_EXPORT_FORMAT__SHIFT 0x0
+#define SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT_MASK 0xf
+#define SPI_SHADER_COL_FORMAT__COL0_EXPORT_FORMAT__SHIFT 0x0
+#define SPI_SHADER_COL_FORMAT__COL1_EXPORT_FORMAT_MASK 0xf0
+#define SPI_SHADER_COL_FORMAT__COL1_EXPORT_FORMAT__SHIFT 0x4
+#define SPI_SHADER_COL_FORMAT__COL2_EXPORT_FORMAT_MASK 0xf00
+#define SPI_SHADER_COL_FORMAT__COL2_EXPORT_FORMAT__SHIFT 0x8
+#define SPI_SHADER_COL_FORMAT__COL3_EXPORT_FORMAT_MASK 0xf000
+#define SPI_SHADER_COL_FORMAT__COL3_EXPORT_FORMAT__SHIFT 0xc
+#define SPI_SHADER_COL_FORMAT__COL4_EXPORT_FORMAT_MASK 0xf0000
+#define SPI_SHADER_COL_FORMAT__COL4_EXPORT_FORMAT__SHIFT 0x10
+#define SPI_SHADER_COL_FORMAT__COL5_EXPORT_FORMAT_MASK 0xf00000
+#define SPI_SHADER_COL_FORMAT__COL5_EXPORT_FORMAT__SHIFT 0x14
+#define SPI_SHADER_COL_FORMAT__COL6_EXPORT_FORMAT_MASK 0xf000000
+#define SPI_SHADER_COL_FORMAT__COL6_EXPORT_FORMAT__SHIFT 0x18
+#define SPI_SHADER_COL_FORMAT__COL7_EXPORT_FORMAT_MASK 0xf0000000
+#define SPI_SHADER_COL_FORMAT__COL7_EXPORT_FORMAT__SHIFT 0x1c
+#define SPI_ARB_PRIORITY__PIPE_ORDER_TS0_MASK 0x7
+#define SPI_ARB_PRIORITY__PIPE_ORDER_TS0__SHIFT 0x0
+#define SPI_ARB_PRIORITY__PIPE_ORDER_TS1_MASK 0x38
+#define SPI_ARB_PRIORITY__PIPE_ORDER_TS1__SHIFT 0x3
+#define SPI_ARB_PRIORITY__PIPE_ORDER_TS2_MASK 0x1c0
+#define SPI_ARB_PRIORITY__PIPE_ORDER_TS2__SHIFT 0x6
+#define SPI_ARB_PRIORITY__PIPE_ORDER_TS3_MASK 0xe00
+#define SPI_ARB_PRIORITY__PIPE_ORDER_TS3__SHIFT 0x9
+#define SPI_ARB_PRIORITY__TS0_DUR_MULT_MASK 0x3000
+#define SPI_ARB_PRIORITY__TS0_DUR_MULT__SHIFT 0xc
+#define SPI_ARB_PRIORITY__TS1_DUR_MULT_MASK 0xc000
+#define SPI_ARB_PRIORITY__TS1_DUR_MULT__SHIFT 0xe
+#define SPI_ARB_PRIORITY__TS2_DUR_MULT_MASK 0x30000
+#define SPI_ARB_PRIORITY__TS2_DUR_MULT__SHIFT 0x10
+#define SPI_ARB_PRIORITY__TS3_DUR_MULT_MASK 0xc0000
+#define SPI_ARB_PRIORITY__TS3_DUR_MULT__SHIFT 0x12
+#define SPI_ARB_CYCLES_0__TS0_DURATION_MASK 0xffff
+#define SPI_ARB_CYCLES_0__TS0_DURATION__SHIFT 0x0
+#define SPI_ARB_CYCLES_0__TS1_DURATION_MASK 0xffff0000
+#define SPI_ARB_CYCLES_0__TS1_DURATION__SHIFT 0x10
+#define SPI_ARB_CYCLES_1__TS2_DURATION_MASK 0xffff
+#define SPI_ARB_CYCLES_1__TS2_DURATION__SHIFT 0x0
+#define SPI_ARB_CYCLES_1__TS3_DURATION_MASK 0xffff0000
+#define SPI_ARB_CYCLES_1__TS3_DURATION__SHIFT 0x10
+#define SPI_CDBG_SYS_GFX__PS_EN_MASK 0x1
+#define SPI_CDBG_SYS_GFX__PS_EN__SHIFT 0x0
+#define SPI_CDBG_SYS_GFX__VS_EN_MASK 0x2
+#define SPI_CDBG_SYS_GFX__VS_EN__SHIFT 0x1
+#define SPI_CDBG_SYS_GFX__GS_EN_MASK 0x4
+#define SPI_CDBG_SYS_GFX__GS_EN__SHIFT 0x2
+#define SPI_CDBG_SYS_GFX__ES_EN_MASK 0x8
+#define SPI_CDBG_SYS_GFX__ES_EN__SHIFT 0x3
+#define SPI_CDBG_SYS_GFX__HS_EN_MASK 0x10
+#define SPI_CDBG_SYS_GFX__HS_EN__SHIFT 0x4
+#define SPI_CDBG_SYS_GFX__LS_EN_MASK 0x20
+#define SPI_CDBG_SYS_GFX__LS_EN__SHIFT 0x5
+#define SPI_CDBG_SYS_GFX__CS_EN_MASK 0x40
+#define SPI_CDBG_SYS_GFX__CS_EN__SHIFT 0x6
+#define SPI_CDBG_SYS_HP3D__PS_EN_MASK 0x1
+#define SPI_CDBG_SYS_HP3D__PS_EN__SHIFT 0x0
+#define SPI_CDBG_SYS_HP3D__VS_EN_MASK 0x2
+#define SPI_CDBG_SYS_HP3D__VS_EN__SHIFT 0x1
+#define SPI_CDBG_SYS_HP3D__GS_EN_MASK 0x4
+#define SPI_CDBG_SYS_HP3D__GS_EN__SHIFT 0x2
+#define SPI_CDBG_SYS_HP3D__ES_EN_MASK 0x8
+#define SPI_CDBG_SYS_HP3D__ES_EN__SHIFT 0x3
+#define SPI_CDBG_SYS_HP3D__HS_EN_MASK 0x10
+#define SPI_CDBG_SYS_HP3D__HS_EN__SHIFT 0x4
+#define SPI_CDBG_SYS_HP3D__LS_EN_MASK 0x20
+#define SPI_CDBG_SYS_HP3D__LS_EN__SHIFT 0x5
+#define SPI_CDBG_SYS_CS0__PIPE0_MASK 0xff
+#define SPI_CDBG_SYS_CS0__PIPE0__SHIFT 0x0
+#define SPI_CDBG_SYS_CS0__PIPE1_MASK 0xff00
+#define SPI_CDBG_SYS_CS

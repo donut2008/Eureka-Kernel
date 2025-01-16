@@ -1,447 +1,505 @@
-/*
- * Renesas RIIC driver
- *
- * Copyright (C) 2013 Wolfram Sang <wsa@sang-engineering.com>
- * Copyright (C) 2013 Renesas Solutions Corp.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- */
+(&wqe->wr, wr, sizeof(wqe->wr));
 
-/*
- * This i2c core has a lot of interrupts, namely 8. We use their chaining as
- * some kind of state machine.
- *
- * 1) The main xfer routine kicks off a transmission by putting the start bit
- * (or repeated start) on the bus and enabling the transmit interrupt (TIE)
- * since we need to send the slave address + RW bit in every case.
- *
- * 2) TIE sends slave address + RW bit and selects how to continue.
- *
- * 3a) Write case: We keep utilizing TIE as long as we have data to send. If we
- * are done, we switch over to the transmission done interrupt (TEIE) and mark
- * the message as completed (includes sending STOP) there.
- *
- * 3b) Read case: We switch over to receive interrupt (RIE). One dummy read is
- * needed to start clocking, then we keep receiving until we are done. Note
- * that we use the RDRFS mode all the time, i.e. we ACK/NACK every byte by
- * writing to the ACKBT bit. I tried using the RDRFS mode only at the end of a
- * message to create the final NACK as sketched in the datasheet. This caused
- * some subtle races (when byte n was processed and byte n+1 was already
- * waiting), though, and I started with the safe approach.
- *
- * 4) If we got a NACK somewhere, we flag the error and stop the transmission
- * via NAKIE.
- *
- * Also check the comments in the interrupt routines for some gory details.
- */
+	wqe->length = 0;
+	j = 0;
+	if (wr->num_sge) {
+		acc = wr->opcode >= IB_WR_RDMA_READ ?
+			IB_ACCESS_LOCAL_WRITE : 0;
+		for (i = 0; i < wr->num_sge; i++) {
+			u32 length = wr->sg_list[i].length;
+			int ok;
 
-#include <linux/clk.h>
-#include <linux/completion.h>
-#include <linux/err.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-
-#define RIIC_ICCR1	0x00
-#define RIIC_ICCR2	0x04
-#define RIIC_ICMR1	0x08
-#define RIIC_ICMR3	0x10
-#define RIIC_ICSER	0x18
-#define RIIC_ICIER	0x1c
-#define RIIC_ICSR2	0x24
-#define RIIC_ICBRL	0x34
-#define RIIC_ICBRH	0x38
-#define RIIC_ICDRT	0x3c
-#define RIIC_ICDRR	0x40
-
-#define ICCR1_ICE	0x80
-#define ICCR1_IICRST	0x40
-#define ICCR1_SOWP	0x10
-
-#define ICCR2_BBSY	0x80
-#define ICCR2_SP	0x08
-#define ICCR2_RS	0x04
-#define ICCR2_ST	0x02
-
-#define ICMR1_CKS_MASK	0x70
-#define ICMR1_BCWP	0x08
-#define ICMR1_CKS(_x)	((((_x) << 4) & ICMR1_CKS_MASK) | ICMR1_BCWP)
-
-#define ICMR3_RDRFS	0x20
-#define ICMR3_ACKWP	0x10
-#define ICMR3_ACKBT	0x08
-
-#define ICIER_TIE	0x80
-#define ICIER_TEIE	0x40
-#define ICIER_RIE	0x20
-#define ICIER_NAKIE	0x10
-#define ICIER_SPIE	0x08
-
-#define ICSR2_NACKF	0x10
-
-/* ICBRx (@ PCLK 33MHz) */
-#define ICBR_RESERVED	0xe0 /* Should be 1 on writes */
-#define ICBRL_SP100K	(19 | ICBR_RESERVED)
-#define ICBRH_SP100K	(16 | ICBR_RESERVED)
-#define ICBRL_SP400K	(21 | ICBR_RESERVED)
-#define ICBRH_SP400K	(9 | ICBR_RESERVED)
-
-#define RIIC_INIT_MSG	-1
-
-struct riic_dev {
-	void __iomem *base;
-	u8 *buf;
-	struct i2c_msg *msg;
-	int bytes_left;
-	int err;
-	int is_last;
-	struct completion msg_done;
-	struct i2c_adapter adapter;
-	struct clk *clk;
-};
-
-struct riic_irq_desc {
-	int res_num;
-	irq_handler_t isr;
-	char *name;
-};
-
-static inline void riic_clear_set_bit(struct riic_dev *riic, u8 clear, u8 set, u8 reg)
-{
-	writeb((readb(riic->base + reg) & ~clear) | set, riic->base + reg);
-}
-
-static int riic_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
-{
-	struct riic_dev *riic = i2c_get_adapdata(adap);
-	unsigned long time_left;
-	int i, ret;
-	u8 start_bit;
-
-	ret = clk_prepare_enable(riic->clk);
-	if (ret)
-		return ret;
-
-	if (readb(riic->base + RIIC_ICCR2) & ICCR2_BBSY) {
-		riic->err = -EBUSY;
-		goto out;
-	}
-
-	reinit_completion(&riic->msg_done);
-	riic->err = 0;
-
-	writeb(0, riic->base + RIIC_ICSR2);
-
-	for (i = 0, start_bit = ICCR2_ST; i < num; i++) {
-		riic->bytes_left = RIIC_INIT_MSG;
-		riic->buf = msgs[i].buf;
-		riic->msg = &msgs[i];
-		riic->is_last = (i == num - 1);
-
-		writeb(ICIER_NAKIE | ICIER_TIE, riic->base + RIIC_ICIER);
-
-		writeb(start_bit, riic->base + RIIC_ICCR2);
-
-		time_left = wait_for_completion_timeout(&riic->msg_done, riic->adapter.timeout);
-		if (time_left == 0)
-			riic->err = -ETIMEDOUT;
-
-		if (riic->err)
-			break;
-
-		start_bit = ICCR2_RS;
-	}
-
- out:
-	clk_disable_unprepare(riic->clk);
-
-	return riic->err ?: num;
-}
-
-static irqreturn_t riic_tdre_isr(int irq, void *data)
-{
-	struct riic_dev *riic = data;
-	u8 val;
-
-	if (!riic->bytes_left)
-		return IRQ_NONE;
-
-	if (riic->bytes_left == RIIC_INIT_MSG) {
-		val = !!(riic->msg->flags & I2C_M_RD);
-		if (val)
-			/* On read, switch over to receive interrupt */
-			riic_clear_set_bit(riic, ICIER_TIE, ICIER_RIE, RIIC_ICIER);
-		else
-			/* On write, initialize length */
-			riic->bytes_left = riic->msg->len;
-
-		val |= (riic->msg->addr << 1);
-	} else {
-		val = *riic->buf;
-		riic->buf++;
-		riic->bytes_left--;
-	}
-
-	/*
-	 * Switch to transmission ended interrupt when done. Do check here
-	 * after bytes_left was initialized to support SMBUS_QUICK (new msg has
-	 * 0 length then)
-	 */
-	if (riic->bytes_left == 0)
-		riic_clear_set_bit(riic, ICIER_TIE, ICIER_TEIE, RIIC_ICIER);
-
-	/*
-	 * This acks the TIE interrupt. We get another TIE immediately if our
-	 * value could be moved to the shadow shift register right away. So
-	 * this must be after updates to ICIER (where we want to disable TIE)!
-	 */
-	writeb(val, riic->base + RIIC_ICDRT);
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t riic_tend_isr(int irq, void *data)
-{
-	struct riic_dev *riic = data;
-
-	if (readb(riic->base + RIIC_ICSR2) & ICSR2_NACKF) {
-		/* We got a NACKIE */
-		readb(riic->base + RIIC_ICDRR);	/* dummy read */
-		riic_clear_set_bit(riic, ICSR2_NACKF, 0, RIIC_ICSR2);
-		riic->err = -ENXIO;
-	} else if (riic->bytes_left) {
-		return IRQ_NONE;
-	}
-
-	if (riic->is_last || riic->err) {
-		riic_clear_set_bit(riic, ICIER_TEIE, ICIER_SPIE, RIIC_ICIER);
-		writeb(ICCR2_SP, riic->base + RIIC_ICCR2);
-	} else {
-		/* Transfer is complete, but do not send STOP */
-		riic_clear_set_bit(riic, ICIER_TEIE, 0, RIIC_ICIER);
-		complete(&riic->msg_done);
-	}
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t riic_rdrf_isr(int irq, void *data)
-{
-	struct riic_dev *riic = data;
-
-	if (!riic->bytes_left)
-		return IRQ_NONE;
-
-	if (riic->bytes_left == RIIC_INIT_MSG) {
-		riic->bytes_left = riic->msg->len;
-		readb(riic->base + RIIC_ICDRR);	/* dummy read */
-		return IRQ_HANDLED;
-	}
-
-	if (riic->bytes_left == 1) {
-		/* STOP must come before we set ACKBT! */
-		if (riic->is_last) {
-			riic_clear_set_bit(riic, 0, ICIER_SPIE, RIIC_ICIER);
-			writeb(ICCR2_SP, riic->base + RIIC_ICCR2);
+			if (length == 0)
+				continue;
+			ok = qib_lkey_ok(rkt, pd, &wqe->sg_list[j],
+					 &wr->sg_list[i], acc);
+			if (!ok)
+				goto bail_inval_free;
+			wqe->length += length;
+			j++;
 		}
+		wqe->wr.num_sge = j;
+	}
+	if (qp->ibqp.qp_type == IB_QPT_UC ||
+	    qp->ibqp.qp_type == IB_QPT_RC) {
+		if (wqe->length > 0x80000000U)
+			goto bail_inval_free;
+	} else if (wqe->length > (dd_from_ibdev(qp->ibqp.device)->pport +
+				  qp->port_num - 1)->ibmtu)
+		goto bail_inval_free;
+	else
+		atomic_inc(&to_iah(ud_wr(wr)->ah)->refcount);
+	wqe->ssn = qp->s_ssn++;
+	qp->s_head = next;
 
-		riic_clear_set_bit(riic, 0, ICMR3_ACKBT, RIIC_ICMR3);
+	ret = 0;
+	goto bail;
 
-	} else {
-		riic_clear_set_bit(riic, ICMR3_ACKBT, 0, RIIC_ICMR3);
+bail_inval_free:
+	while (j) {
+		struct qib_sge *sge = &wqe->sg_list[--j];
+
+		qib_put_mr(sge->mr);
+	}
+bail_inval:
+	ret = -EINVAL;
+bail:
+	if (!ret && !wr->next &&
+	 !qib_sdma_empty(
+	   dd_from_ibdev(qp->ibqp.device)->pport + qp->port_num - 1)) {
+		qib_schedule_send(qp);
+		*scheduled = 1;
+	}
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+	return ret;
+}
+
+/**
+ * qib_post_send - post a send on a QP
+ * @ibqp: the QP to post the send on
+ * @wr: the list of work requests to post
+ * @bad_wr: the first bad WR is put here
+ *
+ * This may be called from interrupt context.
+ */
+static int qib_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
+			 struct ib_send_wr **bad_wr)
+{
+	struct qib_qp *qp = to_iqp(ibqp);
+	int err = 0;
+	int scheduled = 0;
+
+	for (; wr; wr = wr->next) {
+		err = qib_post_one_send(qp, wr, &scheduled);
+		if (err) {
+			*bad_wr = wr;
+			goto bail;
+		}
 	}
 
-	/* Reading acks the RIE interrupt */
-	*riic->buf = readb(riic->base + RIIC_ICDRR);
-	riic->buf++;
-	riic->bytes_left--;
+	/* Try to do the send work in the caller's context. */
+	if (!scheduled)
+		qib_do_send(&qp->s_work);
 
-	return IRQ_HANDLED;
+bail:
+	return err;
 }
 
-static irqreturn_t riic_stop_isr(int irq, void *data)
+/**
+ * qib_post_receive - post a receive on a QP
+ * @ibqp: the QP to post the receive on
+ * @wr: the WR to post
+ * @bad_wr: the first bad WR is put here
+ *
+ * This may be called from interrupt context.
+ */
+static int qib_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+			    struct ib_recv_wr **bad_wr)
 {
-	struct riic_dev *riic = data;
-
-	/* read back registers to confirm writes have fully propagated */
-	writeb(0, riic->base + RIIC_ICSR2);
-	readb(riic->base + RIIC_ICSR2);
-	writeb(0, riic->base + RIIC_ICIER);
-	readb(riic->base + RIIC_ICIER);
-
-	complete(&riic->msg_done);
-
-	return IRQ_HANDLED;
-}
-
-static u32 riic_func(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static const struct i2c_algorithm riic_algo = {
-	.master_xfer	= riic_xfer,
-	.functionality	= riic_func,
-};
-
-static int riic_init_hw(struct riic_dev *riic, u32 spd)
-{
+	struct qib_qp *qp = to_iqp(ibqp);
+	struct qib_rwq *wq = qp->r_rq.wq;
+	unsigned long flags;
 	int ret;
-	unsigned long rate;
 
-	ret = clk_prepare_enable(riic->clk);
-	if (ret)
-		return ret;
-
-	/*
-	 * TODO: Implement formula to calculate the timing values depending on
-	 * variable parent clock rate and arbitrary bus speed
-	 */
-	rate = clk_get_rate(riic->clk);
-	if (rate != 33325000) {
-		dev_err(&riic->adapter.dev,
-			"invalid parent clk (%lu). Must be 33325000Hz\n", rate);
-		clk_disable_unprepare(riic->clk);
-		return -EINVAL;
+	/* Check that state is OK to post receive. */
+	if (!(ib_qib_state_ops[qp->state] & QIB_POST_RECV_OK) || !wq) {
+		*bad_wr = wr;
+		ret = -EINVAL;
+		goto bail;
 	}
 
-	/* Changing the order of accessing IICRST and ICE may break things! */
-	writeb(ICCR1_IICRST | ICCR1_SOWP, riic->base + RIIC_ICCR1);
-	riic_clear_set_bit(riic, 0, ICCR1_ICE, RIIC_ICCR1);
+	for (; wr; wr = wr->next) {
+		struct qib_rwqe *wqe;
+		u32 next;
+		int i;
 
-	switch (spd) {
-	case 100000:
-		writeb(ICMR1_CKS(3), riic->base + RIIC_ICMR1);
-		writeb(ICBRH_SP100K, riic->base + RIIC_ICBRH);
-		writeb(ICBRL_SP100K, riic->base + RIIC_ICBRL);
-		break;
-	case 400000:
-		writeb(ICMR1_CKS(1), riic->base + RIIC_ICMR1);
-		writeb(ICBRH_SP400K, riic->base + RIIC_ICBRH);
-		writeb(ICBRL_SP400K, riic->base + RIIC_ICBRL);
-		break;
-	default:
-		dev_err(&riic->adapter.dev,
-			"unsupported bus speed (%dHz). Use 100000 or 400000\n", spd);
-		clk_disable_unprepare(riic->clk);
-		return -EINVAL;
-	}
-
-	writeb(0, riic->base + RIIC_ICSER);
-	writeb(ICMR3_ACKWP | ICMR3_RDRFS, riic->base + RIIC_ICMR3);
-
-	riic_clear_set_bit(riic, ICCR1_IICRST, 0, RIIC_ICCR1);
-
-	clk_disable_unprepare(riic->clk);
-
-	return 0;
-}
-
-static struct riic_irq_desc riic_irqs[] = {
-	{ .res_num = 0, .isr = riic_tend_isr, .name = "riic-tend" },
-	{ .res_num = 1, .isr = riic_rdrf_isr, .name = "riic-rdrf" },
-	{ .res_num = 2, .isr = riic_tdre_isr, .name = "riic-tdre" },
-	{ .res_num = 3, .isr = riic_stop_isr, .name = "riic-stop" },
-	{ .res_num = 5, .isr = riic_tend_isr, .name = "riic-nack" },
-};
-
-static int riic_i2c_probe(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct riic_dev *riic;
-	struct i2c_adapter *adap;
-	struct resource *res;
-	u32 bus_rate = 0;
-	int i, ret;
-
-	riic = devm_kzalloc(&pdev->dev, sizeof(*riic), GFP_KERNEL);
-	if (!riic)
-		return -ENOMEM;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	riic->base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(riic->base))
-		return PTR_ERR(riic->base);
-
-	riic->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(riic->clk)) {
-		dev_err(&pdev->dev, "missing controller clock");
-		return PTR_ERR(riic->clk);
-	}
-
-	for (i = 0; i < ARRAY_SIZE(riic_irqs); i++) {
-		res = platform_get_resource(pdev, IORESOURCE_IRQ, riic_irqs[i].res_num);
-		if (!res)
-			return -ENODEV;
-
-		ret = devm_request_irq(&pdev->dev, res->start, riic_irqs[i].isr,
-					0, riic_irqs[i].name, riic);
-		if (ret) {
-			dev_err(&pdev->dev, "failed to request irq %s\n", riic_irqs[i].name);
-			return ret;
+		if ((unsigned) wr->num_sge > qp->r_rq.max_sge) {
+			*bad_wr = wr;
+			ret = -EINVAL;
+			goto bail;
 		}
+
+		spin_lock_irqsave(&qp->r_rq.lock, flags);
+		next = wq->head + 1;
+		if (next >= qp->r_rq.size)
+			next = 0;
+		if (next == wq->tail) {
+			spin_unlock_irqrestore(&qp->r_rq.lock, flags);
+			*bad_wr = wr;
+			ret = -ENOMEM;
+			goto bail;
+		}
+
+		wqe = get_rwqe_ptr(&qp->r_rq, wq->head);
+		wqe->wr_id = wr->wr_id;
+		wqe->num_sge = wr->num_sge;
+		for (i = 0; i < wr->num_sge; i++)
+			wqe->sg_list[i] = wr->sg_list[i];
+		/* Make sure queue entry is written before the head index. */
+		smp_wmb();
+		wq->head = next;
+		spin_unlock_irqrestore(&qp->r_rq.lock, flags);
 	}
+	ret = 0;
 
-	adap = &riic->adapter;
-	i2c_set_adapdata(adap, riic);
-	strlcpy(adap->name, "Renesas RIIC adapter", sizeof(adap->name));
-	adap->owner = THIS_MODULE;
-	adap->algo = &riic_algo;
-	adap->dev.parent = &pdev->dev;
-	adap->dev.of_node = pdev->dev.of_node;
-
-	init_completion(&riic->msg_done);
-
-	of_property_read_u32(np, "clock-frequency", &bus_rate);
-	ret = riic_init_hw(riic, bus_rate);
-	if (ret)
-		return ret;
-
-
-	ret = i2c_add_adapter(adap);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to add adapter\n");
-		return ret;
-	}
-
-	platform_set_drvdata(pdev, riic);
-
-	dev_info(&pdev->dev, "registered with %dHz bus speed\n", bus_rate);
-	return 0;
+bail:
+	return ret;
 }
 
-static int riic_i2c_remove(struct platform_device *pdev)
+/**
+ * qib_qp_rcv - processing an incoming packet on a QP
+ * @rcd: the context pointer
+ * @hdr: the packet header
+ * @has_grh: true if the packet has a GRH
+ * @data: the packet data
+ * @tlen: the packet length
+ * @qp: the QP the packet came on
+ *
+ * This is called from qib_ib_rcv() to process an incoming packet
+ * for the given QP.
+ * Called at interrupt level.
+ */
+static void qib_qp_rcv(struct qib_ctxtdata *rcd, struct qib_ib_header *hdr,
+		       int has_grh, void *data, u32 tlen, struct qib_qp *qp)
 {
-	struct riic_dev *riic = platform_get_drvdata(pdev);
+	struct qib_ibport *ibp = &rcd->ppd->ibport_data;
 
-	writeb(0, riic->base + RIIC_ICIER);
-	i2c_del_adapter(&riic->adapter);
+	spin_lock(&qp->r_lock);
 
-	return 0;
+	/* Check for valid receive state. */
+	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK)) {
+		ibp->n_pkt_drops++;
+		goto unlock;
+	}
+
+	switch (qp->ibqp.qp_type) {
+	case IB_QPT_SMI:
+	case IB_QPT_GSI:
+		if (ib_qib_disable_sma)
+			break;
+		/* FALLTHROUGH */
+	case IB_QPT_UD:
+		qib_ud_rcv(ibp, hdr, has_grh, data, tlen, qp);
+		break;
+
+	case IB_QPT_RC:
+		qib_rc_rcv(rcd, hdr, has_grh, data, tlen, qp);
+		break;
+
+	case IB_QPT_UC:
+		qib_uc_rcv(ibp, hdr, has_grh, data, tlen, qp);
+		break;
+
+	default:
+		break;
+	}
+
+unlock:
+	spin_unlock(&qp->r_lock);
 }
 
-static const struct of_device_id riic_i2c_dt_ids[] = {
-	{ .compatible = "renesas,riic-rz" },
-	{ /* Sentinel */ },
-};
+/**
+ * qib_ib_rcv - process an incoming packet
+ * @rcd: the context pointer
+ * @rhdr: the header of the packet
+ * @data: the packet payload
+ * @tlen: the packet length
+ *
+ * This is called from qib_kreceive() to process an incoming packet at
+ * interrupt level. Tlen is the length of the header + data + CRC in bytes.
+ */
+void qib_ib_rcv(struct qib_ctxtdata *rcd, void *rhdr, void *data, u32 tlen)
+{
+	struct qib_pportdata *ppd = rcd->ppd;
+	struct qib_ibport *ibp = &ppd->ibport_data;
+	struct qib_ib_header *hdr = rhdr;
+	struct qib_other_headers *ohdr;
+	struct qib_qp *qp;
+	u32 qp_num;
+	int lnh;
+	u8 opcode;
+	u16 lid;
 
-static struct platform_driver riic_i2c_driver = {
-	.probe		= riic_i2c_probe,
-	.remove		= riic_i2c_remove,
-	.driver		= {
-		.name	= "i2c-riic",
-		.of_match_table = riic_i2c_dt_ids,
-	},
-};
+	/* 24 == LRH+BTH+CRC */
+	if (unlikely(tlen < 24))
+		goto drop;
 
-module_platform_driver(riic_i2c_driver);
+	/* Check for a valid destination LID (see ch. 7.11.1). */
+	lid = be16_to_cpu(hdr->lrh[1]);
+	if (lid < QIB_MULTICAST_LID_BASE) {
+		lid &= ~((1 << ppd->lmc) - 1);
+		if (unlikely(lid != ppd->lid))
+			goto drop;
+	}
 
-MODULE_DESCRIPTION("Renesas RIIC adapter");
-MODULE_AUTHOR("Wolfram Sang <wsa@sang-engineering.com>");
-MODULE_LICENSE("GPL v2");
-MODULE_DEVICE_TABLE(of, riic_i2c_dt_ids);
+	/* Check for GRH */
+	lnh = be16_to_cpu(hdr->lrh[0]) & 3;
+	if (lnh == QIB_LRH_BTH)
+		ohdr = &hdr->u.oth;
+	else if (lnh == QIB_LRH_GRH) {
+		u32 vtf;
+
+		ohdr = &hdr->u.l.oth;
+		if (hdr->u.l.grh.next_hdr != IB_GRH_NEXT_HDR)
+			goto drop;
+		vtf = be32_to_cpu(hdr->u.l.grh.version_tclass_flow);
+		if ((vtf >> IB_GRH_VERSION_SHIFT) != IB_GRH_VERSION)
+			goto drop;
+	} else
+		goto drop;
+
+	opcode = (be32_to_cpu(ohdr->bth[0]) >> 24) & 0x7f;
+#ifdef CONFIG_DEBUG_FS
+	rcd->opstats->stats[opcode].n_bytes += tlen;
+	rcd->opstats->stats[opcode].n_packets++;
+#endif
+
+	/* Get the destination QP number. */
+	qp_num = be32_to_cpu(ohdr->bth[1]) & QIB_QPN_MASK;
+	if (qp_num == QIB_MULTICAST_QPN) {
+		struct qib_mcast *mcast;
+		struct qib_mcast_qp *p;
+
+		if (lnh != QIB_LRH_GRH)
+			goto drop;
+		mcast = qib_mcast_find(ibp, &hdr->u.l.grh.dgid);
+		if (mcast == NULL)
+			goto drop;
+		this_cpu_inc(ibp->pmastats->n_multicast_rcv);
+		list_for_each_entry_rcu(p, &mcast->qp_list, list)
+			qib_qp_rcv(rcd, hdr, 1, data, tlen, p->qp);
+		/*
+		 * Notify qib_multicast_detach() if it is waiting for us
+		 * to finish.
+		 */
+		if (atomic_dec_return(&mcast->refcount) <= 1)
+			wake_up(&mcast->wait);
+	} else {
+		if (rcd->lookaside_qp) {
+			if (rcd->lookaside_qpn != qp_num) {
+				if (atomic_dec_and_test(
+					&rcd->lookaside_qp->refcount))
+					wake_up(
+					 &rcd->lookaside_qp->wait);
+				rcd->lookaside_qp = NULL;
+			}
+		}
+		if (!rcd->lookaside_qp) {
+			qp = qib_lookup_qpn(ibp, qp_num);
+			if (!qp)
+				goto drop;
+			rcd->lookaside_qp = qp;
+			rcd->lookaside_qpn = qp_num;
+		} else
+			qp = rcd->lookaside_qp;
+		this_cpu_inc(ibp->pmastats->n_unicast_rcv);
+		qib_qp_rcv(rcd, hdr, lnh == QIB_LRH_GRH, data, tlen, qp);
+	}
+	return;
+
+drop:
+	ibp->n_pkt_drops++;
+}
+
+/*
+ * This is called from a timer to check for QPs
+ * which need kernel memory in order to send a packet.
+ */
+static void mem_timer(unsigned long data)
+{
+	struct qib_ibdev *dev = (struct qib_ibdev *) data;
+	struct list_head *list = &dev->memwait;
+	struct qib_qp *qp = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->pending_lock, flags);
+	if (!list_empty(list)) {
+		qp = list_entry(list->next, struct qib_qp, iowait);
+		list_del_init(&qp->iowait);
+		atomic_inc(&qp->refcount);
+		if (!list_empty(list))
+			mod_timer(&dev->mem_timer, jiffies + 1);
+	}
+	spin_unlock_irqrestore(&dev->pending_lock, flags);
+
+	if (qp) {
+		spin_lock_irqsave(&qp->s_lock, flags);
+		if (qp->s_flags & QIB_S_WAIT_KMEM) {
+			qp->s_flags &= ~QIB_S_WAIT_KMEM;
+			qib_schedule_send(qp);
+		}
+		spin_unlock_irqrestore(&qp->s_lock, flags);
+		if (atomic_dec_and_test(&qp->refcount))
+			wake_up(&qp->wait);
+	}
+}
+
+static void update_sge(struct qib_sge_state *ss, u32 length)
+{
+	struct qib_sge *sge = &ss->sge;
+
+	sge->vaddr += length;
+	sge->length -= length;
+	sge->sge_length -= length;
+	if (sge->sge_length == 0) {
+		if (--ss->num_sge)
+			*sge = *ss->sg_list++;
+	} else if (sge->length == 0 && sge->mr->lkey) {
+		if (++sge->n >= QIB_SEGSZ) {
+			if (++sge->m >= sge->mr->mapsz)
+				return;
+			sge->n = 0;
+		}
+		sge->vaddr = sge->mr->map[sge->m]->segs[sge->n].vaddr;
+		sge->length = sge->mr->map[sge->m]->segs[sge->n].length;
+	}
+}
+
+#ifdef __LITTLE_ENDIAN
+static inline u32 get_upper_bits(u32 data, u32 shift)
+{
+	return data >> shift;
+}
+
+static inline u32 set_upper_bits(u32 data, u32 shift)
+{
+	return data << shift;
+}
+
+static inline u32 clear_upper_bytes(u32 data, u32 n, u32 off)
+{
+	data <<= ((sizeof(u32) - n) * BITS_PER_BYTE);
+	data >>= ((sizeof(u32) - n - off) * BITS_PER_BYTE);
+	return data;
+}
+#else
+static inline u32 get_upper_bits(u32 data, u32 shift)
+{
+	return data << shift;
+}
+
+static inline u32 set_upper_bits(u32 data, u32 shift)
+{
+	return data >> shift;
+}
+
+static inline u32 clear_upper_bytes(u32 data, u32 n, u32 off)
+{
+	data >>= ((sizeof(u32) - n) * BITS_PER_BYTE);
+	data <<= ((sizeof(u32) - n - off) * BITS_PER_BYTE);
+	return data;
+}
+#endif
+
+static void copy_io(u32 __iomem *piobuf, struct qib_sge_state *ss,
+		    u32 length, unsigned flush_wc)
+{
+	u32 extra = 0;
+	u32 data = 0;
+	u32 last;
+
+	while (1) {
+		u32 len = ss->sge.length;
+		u32 off;
+
+		if (len > length)
+			len = length;
+		if (len > ss->sge.sge_length)
+			len = ss->sge.sge_length;
+		BUG_ON(len == 0);
+		/* If the source address is not aligned, try to align it. */
+		off = (unsigned long)ss->sge.vaddr & (sizeof(u32) - 1);
+		if (off) {
+			u32 *addr = (u32 *)((unsigned long)ss->sge.vaddr &
+					    ~(sizeof(u32) - 1));
+			u32 v = get_upper_bits(*addr, off * BITS_PER_BYTE);
+			u32 y;
+
+			y = sizeof(u32) - off;
+			if (len > y)
+				len = y;
+			if (len + extra >= sizeof(u32)) {
+				data |= set_upper_bits(v, extra *
+						       BITS_PER_BYTE);
+				len = sizeof(u32) - extra;
+				if (len == length) {
+					last = data;
+					break;
+				}
+				__raw_writel(data, piobuf);
+				piobuf++;
+				extra = 0;
+				data = 0;
+			} else {
+				/* Clear unused upper bytes */
+				data |= clear_upper_bytes(v, len, extra);
+				if (len == length) {
+					last = data;
+					break;
+				}
+				extra += len;
+			}
+		} else if (extra) {
+			/* Source address is aligned. */
+			u32 *addr = (u32 *) ss->sge.vaddr;
+			int shift = extra * BITS_PER_BYTE;
+			int ushift = 32 - shift;
+			u32 l = len;
+
+			while (l >= sizeof(u32)) {
+				u32 v = *addr;
+
+				data |= set_upper_bits(v, shift);
+				__raw_writel(data, piobuf);
+				data = get_upper_bits(v, ushift);
+				piobuf++;
+				addr++;
+				l -= sizeof(u32);
+			}
+			/*
+			 * We still have 'extra' number of bytes leftover.
+			 */
+			if (l) {
+				u32 v = *addr;
+
+				if (l + extra >= sizeof(u32)) {
+					data |= set_upper_bits(v, shift);
+					len -= l + extra - sizeof(u32);
+					if (len == length) {
+						last = data;
+						break;
+					}
+					__raw_writel(data, piobuf);
+					piobuf++;
+					extra = 0;
+					data = 0;
+				} else {
+					/* Clear unused upper bytes */
+					data |= clear_upper_bytes(v, l, extra);
+					if (len == length) {
+						last = data;
+						break;
+					}
+					extra += l;
+				}
+			} else if (len == length) {
+				last = data;
+				break;
+			}
+		} else if (len == length) {
+			u32 w;
+
+			/*
+			 * Need to round up for the last dword in the
+			 * packet.
+			 */
+			w = (len + 3) >> 2;
+			qib_pio_copy(piobuf, ss->sge.vaddr, w - 1);
+			piobuf += w - 1;
+			last = ((u32 *) ss->sge.vaddr)[w - 1];
+			break;
+		} else {
+			u32 w = len >> 2;
+
+			qib_pio_copy(piobuf, ss->sge.vaddr, w);
+			piobuf += w;

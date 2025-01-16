@@ -1,234 +1,222 @@
-/* Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
+= dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	u8 r_buf;
+	int ret;
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/platform_device.h>
-#include <linux/input.h>
-#include <linux/slab.h>
-#include <linux/regmap.h>
-
-#define VIB_DRV			0x4A
-
-#define VIB_DRV_SEL_MASK	0xf8
-#define VIB_DRV_SEL_SHIFT	0x03
-#define VIB_DRV_EN_MANUAL_MASK	0xfc
-
-#define VIB_MAX_LEVEL_mV	(3100)
-#define VIB_MIN_LEVEL_mV	(1200)
-#define VIB_MAX_LEVELS		(VIB_MAX_LEVEL_mV - VIB_MIN_LEVEL_mV)
-
-#define MAX_FF_SPEED		0xff
-
-/**
- * struct pm8xxx_vib - structure to hold vibrator data
- * @vib_input_dev: input device supporting force feedback
- * @work: work structure to set the vibration parameters
- * @regmap: regmap for register read/write
- * @speed: speed of vibration set from userland
- * @active: state of vibrator
- * @level: level of vibration to set in the chip
- * @reg_vib_drv: VIB_DRV register value
- */
-struct pm8xxx_vib {
-	struct input_dev *vib_input_dev;
-	struct work_struct work;
-	struct regmap *regmap;
-	int speed;
-	int level;
-	bool active;
-	u8  reg_vib_drv;
-};
-
-/**
- * pm8xxx_vib_set - handler to start/stop vibration
- * @vib: pointer to vibrator structure
- * @on: state to set
- */
-static int pm8xxx_vib_set(struct pm8xxx_vib *vib, bool on)
-{
-	int rc;
-	unsigned int val = vib->reg_vib_drv;
-
-	if (on)
-		val |= ((vib->level << VIB_DRV_SEL_SHIFT) & VIB_DRV_SEL_MASK);
-	else
-		val &= ~VIB_DRV_SEL_MASK;
-
-	rc = regmap_write(vib->regmap, VIB_DRV, val);
-	if (rc < 0)
-		return rc;
-
-	vib->reg_vib_drv = val;
-	return 0;
+	ret = abov_tk_i2c_read(client, ABOV_THRESHOLD, &r_buf, 1);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		r_buf = 0;
+	}
+	return sprintf(buf, "%d\n", r_buf);
 }
 
-/**
- * pm8xxx_work_handler - worker to set vibration level
- * @work: pointer to work_struct
- */
-static void pm8xxx_work_handler(struct work_struct *work)
+static void get_diff_data(struct abov_tk_info *info)
 {
-	struct pm8xxx_vib *vib = container_of(work, struct pm8xxx_vib, work);
-	int rc;
-	unsigned int val;
+	struct i2c_client *client = info->client;
+	u8 r_buf[4];
+	int ret;
 
-	rc = regmap_read(vib->regmap, VIB_DRV, &val);
-	if (rc < 0)
+	ret = abov_tk_i2c_read(client, ABOV_DIFFDATA, r_buf, 4);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		info->menu_s = 0;
+		info->back_s = 0;
 		return;
-
-	/*
-	 * pmic vibrator supports voltage ranges from 1.2 to 3.1V, so
-	 * scale the level to fit into these ranges.
-	 */
-	if (vib->speed) {
-		vib->active = true;
-		vib->level = ((VIB_MAX_LEVELS * vib->speed) / MAX_FF_SPEED) +
-						VIB_MIN_LEVEL_mV;
-		vib->level /= 100;
-	} else {
-		vib->active = false;
-		vib->level = VIB_MIN_LEVEL_mV / 100;
 	}
 
-	pm8xxx_vib_set(vib, vib->active);
+	info->menu_s = (r_buf[0] << 8) | r_buf[1];
+	info->back_s = (r_buf[2] << 8) | r_buf[3];
 }
 
-/**
- * pm8xxx_vib_close - callback of input close callback
- * @dev: input device pointer
- *
- * Turns off the vibrator.
- */
-static void pm8xxx_vib_close(struct input_dev *dev)
+static ssize_t touchkey_menu_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
-	struct pm8xxx_vib *vib = input_get_drvdata(dev);
+	struct abov_tk_info *info = dev_get_drvdata(dev);
 
-	cancel_work_sync(&vib->work);
-	if (vib->active)
-		pm8xxx_vib_set(vib, false);
+	get_diff_data(info);
+
+	return sprintf(buf, "%d\n", info->menu_s);
 }
 
-/**
- * pm8xxx_vib_play_effect - function to handle vib effects.
- * @dev: input device pointer
- * @data: data of effect
- * @effect: effect to play
- *
- * Currently this driver supports only rumble effects.
- */
-static int pm8xxx_vib_play_effect(struct input_dev *dev, void *data,
-				  struct ff_effect *effect)
+static ssize_t touchkey_back_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
-	struct pm8xxx_vib *vib = input_get_drvdata(dev);
+	struct abov_tk_info *info = dev_get_drvdata(dev);
 
-	vib->speed = effect->u.rumble.strong_magnitude >> 8;
-	if (!vib->speed)
-		vib->speed = effect->u.rumble.weak_magnitude >> 9;
+	get_diff_data(info);
 
-	schedule_work(&vib->work);
-
-	return 0;
+	return sprintf(buf, "%d\n", info->back_s);
 }
 
-static int pm8xxx_vib_probe(struct platform_device *pdev)
+static void get_raw_data(struct abov_tk_info *info)
 {
-	struct pm8xxx_vib *vib;
-	struct input_dev *input_dev;
-	int error;
-	unsigned int val;
+	struct i2c_client *client = info->client;
+	u8 r_buf[4];
+	int ret;
 
-	vib = devm_kzalloc(&pdev->dev, sizeof(*vib), GFP_KERNEL);
-	if (!vib)
-		return -ENOMEM;
-
-	vib->regmap = dev_get_regmap(pdev->dev.parent, NULL);
-	if (!vib->regmap)
-		return -ENODEV;
-
-	input_dev = devm_input_allocate_device(&pdev->dev);
-	if (!input_dev)
-		return -ENOMEM;
-
-	INIT_WORK(&vib->work, pm8xxx_work_handler);
-	vib->vib_input_dev = input_dev;
-
-	/* operate in manual mode */
-	error = regmap_read(vib->regmap, VIB_DRV, &val);
-	if (error < 0)
-		return error;
-
-	val &= ~VIB_DRV_EN_MANUAL_MASK;
-	error = regmap_write(vib->regmap, VIB_DRV, val);
-	if (error < 0)
-		return error;
-
-	vib->reg_vib_drv = val;
-
-	input_dev->name = "pm8xxx_vib_ffmemless";
-	input_dev->id.version = 1;
-	input_dev->close = pm8xxx_vib_close;
-	input_set_drvdata(input_dev, vib);
-	input_set_capability(vib->vib_input_dev, EV_FF, FF_RUMBLE);
-
-	error = input_ff_create_memless(input_dev, NULL,
-					pm8xxx_vib_play_effect);
-	if (error) {
-		dev_err(&pdev->dev,
-			"couldn't register vibrator as FF device\n");
-		return error;
+	ret = abov_tk_i2c_read(client, ABOV_RAWDATA, r_buf, 4);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		info->menu_raw = 0;
+		info->back_raw = 0;
+		return;
 	}
 
-	error = input_register_device(input_dev);
-	if (error) {
-		dev_err(&pdev->dev, "couldn't register input device\n");
-		return error;
+	info->menu_raw = (r_buf[0] << 8) | r_buf[1];
+	info->back_raw = (r_buf[2] << 8) | r_buf[3];
+}
+
+static ssize_t touchkey_menu_raw_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+
+	get_raw_data(info);
+
+	return sprintf(buf, "%d\n", info->menu_raw);
+}
+
+static ssize_t touchkey_back_raw_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+
+	get_raw_data(info);
+
+	return sprintf(buf, "%d\n", info->back_raw);
+}
+
+#ifdef CONFIG_TOUCHKEY_GRIP
+static ssize_t touchkey_grip_threshold_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+
+	u8 r_buf[4];
+	int ret;
+
+	ret = abov_tk_i2c_read(info->client, CMD_SAR_THRESHOLD, r_buf, 4);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s fail(%d)\n", __func__, ret);
+		info->grip_p_thd = 0;
+		info->grip_r_thd = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+	info->grip_p_thd = (r_buf[0] << 8) | r_buf[1];
+	info->grip_r_thd = (r_buf[2] << 8) | r_buf[3];
+
+	ret = abov_tk_i2c_read(info->client, CMD_SAR_NOISE_THRESHOLD, r_buf, 2);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s fail(%d)\n", __func__, ret);
+		info->grip_n_thd = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+	info->grip_n_thd = (r_buf[0] << 8) | r_buf[1];
+
+	return sprintf(buf, "%d,%d,%d\n", info->grip_p_thd, info->grip_r_thd, info->grip_n_thd );
+}
+static ssize_t touchkey_total_cap_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	u8 r_buf[2];
+	u8 cmd;
+	int ret;
+	int value;
+
+	cmd = 0x20;
+	ret = abov_tk_i2c_write(info->client, CMD_SAR_TOTALCAP, &cmd, 1);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s write fail(%d)\n", __func__, ret);
 	}
 
-	platform_set_drvdata(pdev, vib);
-	return 0;
-}
+	usleep_range(10, 10);
 
-static int __maybe_unused pm8xxx_vib_suspend(struct device *dev)
+	ret = abov_tk_i2c_read(info->client, CMD_SAR_TOTALCAP_READ, r_buf, 2);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s fail(%d)\n", __func__, ret);
+		return sprintf(buf, "%d\n", 0);
+	}
+	value = (r_buf[0] << 8) | r_buf[1];
+
+	return sprintf(buf, "%d\n", value/100);
+}
+static ssize_t touchkey_grip_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
-	struct pm8xxx_vib *vib = dev_get_drvdata(dev);
+	struct abov_tk_info *info = dev_get_drvdata(dev);
 
-	/* Turn off the vibrator */
-	pm8xxx_vib_set(vib, false);
+	u8 r_buf[4];
+	int ret;
 
-	return 0;
+	ret = abov_tk_i2c_read(info->client, CMD_SAR_DIFFDATA, r_buf, 4);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s fail(%d)\n", __func__, ret);
+		info->grip_s1 = 0;
+		info->grip_s2 = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+	info->grip_s1 = (r_buf[0] << 8) | r_buf[1];
+	info->grip_s2 = (r_buf[2] << 8) | r_buf[3];
+
+
+	return sprintf(buf, "%d,%d\n", info->grip_s1, info->grip_s2);
 }
 
-static SIMPLE_DEV_PM_OPS(pm8xxx_vib_pm_ops, pm8xxx_vib_suspend, NULL);
+static ssize_t touchkey_grip_baseline_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
 
-static const struct of_device_id pm8xxx_vib_id_table[] = {
-	{ .compatible = "qcom,pm8058-vib" },
-	{ .compatible = "qcom,pm8921-vib" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, pm8xxx_vib_id_table);
+	u8 r_buf[2];
+	int ret;
 
-static struct platform_driver pm8xxx_vib_driver = {
-	.probe		= pm8xxx_vib_probe,
-	.driver		= {
-		.name	= "pm8xxx-vib",
-		.pm	= &pm8xxx_vib_pm_ops,
-		.of_match_table = pm8xxx_vib_id_table,
-	},
-};
-module_platform_driver(pm8xxx_vib_driver);
+	ret = abov_tk_i2c_read(info->client, CMD_SAR_BASELINE, r_buf, 2);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s fail(%d)\n", __func__, ret);
+		info->grip_baseline = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+	info->grip_baseline = (r_buf[0] << 8) | r_buf[1];
 
-MODULE_ALIAS("platform:pm8xxx_vib");
-MODULE_DESCRIPTION("PMIC8xxx vibrator driver based on ff-memless framework");
-MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Amy Maloche <amaloche@codeaurora.org>");
+	return sprintf(buf, "%d\n", info->grip_baseline);
+}
+
+static ssize_t touchkey_grip_raw_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+
+	u8 r_buf[4];
+	int ret;
+
+	ret = abov_tk_i2c_read(info->client, CMD_SAR_RAWDATA, r_buf, 4);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s fail(%d)\n", __func__, ret);
+		info->grip_raw1 = 0;
+		info->grip_raw2 = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+	info->grip_raw1 = (r_buf[0] << 8) | r_buf[1];
+	info->grip_raw2 = 0;	//(r_buf[2] << 8) | r_buf[3]; NA
+
+	return sprintf(buf, "%d,%d\n", info->grip_raw1, info->grip_raw2);
+}
+
+static ssize_t touchkey_grip_gain_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d,%d,%d,%d\n", 0, 0, 0, 0);
+}
+
+static ssize_t touchkey_grip_check_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+
+	return sprintf(buf, "%d\n", info->grip_event);
+}
+
+static ssize_t touchkey_grip_sw_reset(struct device *dev,
+		 struct device_attribute *attr, const char *bu

@@ -1,5370 +1,4773 @@
-/*
- * Copyright © 2008-2015 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
- *
- * Authors:
- *    Eric Anholt <eric@anholt.net>
- *
- */
+R_EXCLCREAT_WORD2;
 
-#include <drm/drmP.h>
-#include <drm/drm_vma_manager.h>
-#include <drm/i915_drm.h>
-#include "i915_drv.h"
-#include "i915_vgpu.h"
-#include "i915_trace.h"
-#include "intel_drv.h"
-#include <linux/shmem_fs.h>
-#include <linux/slab.h>
-#include <linux/swap.h>
-#include <linux/pci.h>
-#include <linux/dma-buf.h>
+		status = nfsd4_encode_bitmap(xdr, supp[0], supp[1], supp[2]);
+		if (status)
+			goto out;
+	}
 
-#define RQ_BUG_ON(expr)
+	if (bmval2 & FATTR4_WORD2_SECURITY_LABEL) {
+		status = nfsd4_encode_security_label(xdr, rqstp, context,
+								contextlen);
+		if (status)
+			goto out;
+	}
 
-static void i915_gem_object_flush_gtt_write_domain(struct drm_i915_gem_object *obj);
-static void i915_gem_object_flush_cpu_write_domain(struct drm_i915_gem_object *obj);
-static void
-i915_gem_object_retire__write(struct drm_i915_gem_object *obj);
-static void
-i915_gem_object_retire__read(struct drm_i915_gem_object *obj, int ring);
+	attrlen = htonl(xdr->buf->len - attrlen_offset - 4);
+	write_bytes_to_xdr_buf(xdr->buf, attrlen_offset, &attrlen, 4);
+	status = nfs_ok;
 
-static bool cpu_cache_is_coherent(struct drm_device *dev,
-				  enum i915_cache_level level)
-{
-	return HAS_LLC(dev) || level != I915_CACHE_NONE;
+out:
+#ifdef CONFIG_NFSD_V4_SECURITY_LABEL
+	if (context)
+		security_release_secctx(context, contextlen);
+#endif /* CONFIG_NFSD_V4_SECURITY_LABEL */
+	kfree(acl);
+	if (tempfh) {
+		fh_put(tempfh);
+		kfree(tempfh);
+	}
+	if (status)
+		xdr_truncate_encode(xdr, starting_len);
+	return status;
+out_nfserr:
+	status = nfserrno(err);
+	goto out;
+out_resource:
+	status = nfserr_resource;
+	goto out;
 }
 
-static bool cpu_write_needs_clflush(struct drm_i915_gem_object *obj)
+static void svcxdr_init_encode_from_buffer(struct xdr_stream *xdr,
+				struct xdr_buf *buf, __be32 *p, int bytes)
 {
-	if (!cpu_cache_is_coherent(obj->base.dev, obj->cache_level))
-		return true;
-
-	return obj->pin_display;
+	xdr->scratch.iov_len = 0;
+	memset(buf, 0, sizeof(struct xdr_buf));
+	buf->head[0].iov_base = p;
+	buf->head[0].iov_len = 0;
+	buf->len = 0;
+	xdr->buf = buf;
+	xdr->iov = buf->head;
+	xdr->p = p;
+	xdr->end = (void *)p + bytes;
+	buf->buflen = bytes;
 }
 
-/* some bookkeeping */
-static void i915_gem_info_add_obj(struct drm_i915_private *dev_priv,
-				  size_t size)
+__be32 nfsd4_encode_fattr_to_buf(__be32 **p, int words,
+			struct svc_fh *fhp, struct svc_export *exp,
+			struct dentry *dentry, u32 *bmval,
+			struct svc_rqst *rqstp, int ignore_crossmnt)
 {
-	spin_lock(&dev_priv->mm.object_stat_lock);
-	dev_priv->mm.object_count++;
-	dev_priv->mm.object_memory += size;
-	spin_unlock(&dev_priv->mm.object_stat_lock);
+	struct xdr_buf dummy;
+	struct xdr_stream xdr;
+	__be32 ret;
+
+	svcxdr_init_encode_from_buffer(&xdr, &dummy, *p, words << 2);
+	ret = nfsd4_encode_fattr(&xdr, fhp, exp, dentry, bmval, rqstp,
+							ignore_crossmnt);
+	*p = xdr.p;
+	return ret;
 }
 
-static void i915_gem_info_remove_obj(struct drm_i915_private *dev_priv,
-				     size_t size)
+static inline int attributes_need_mount(u32 *bmval)
 {
-	spin_lock(&dev_priv->mm.object_stat_lock);
-	dev_priv->mm.object_count--;
-	dev_priv->mm.object_memory -= size;
-	spin_unlock(&dev_priv->mm.object_stat_lock);
+	if (bmval[0] & ~(FATTR4_WORD0_RDATTR_ERROR | FATTR4_WORD0_LEASE_TIME))
+		return 1;
+	if (bmval[1] & ~FATTR4_WORD1_MOUNTED_ON_FILEID)
+		return 1;
+	return 0;
+}
+
+static __be32
+nfsd4_encode_dirent_fattr(struct xdr_stream *xdr, struct nfsd4_readdir *cd,
+			const char *name, int namlen)
+{
+	struct svc_export *exp = cd->rd_fhp->fh_export;
+	struct dentry *dentry;
+	__be32 nfserr;
+	int ignore_crossmnt = 0;
+
+	dentry = lookup_one_len(name, cd->rd_fhp->fh_dentry, namlen);
+	if (IS_ERR(dentry))
+		return nfserrno(PTR_ERR(dentry));
+	if (d_really_is_negative(dentry)) {
+		/*
+		 * nfsd_buffered_readdir drops the i_mutex between
+		 * readdir and calling this callback, leaving a window
+		 * where this directory entry could have gone away.
+		 */
+		dput(dentry);
+		return nfserr_noent;
+	}
+
+	exp_get(exp);
+	/*
+	 * In the case of a mountpoint, the client may be asking for
+	 * attributes that are only properties of the underlying filesystem
+	 * as opposed to the cross-mounted file system. In such a case,
+	 * we will not follow the cross mount and will fill the attribtutes
+	 * directly from the mountpoint dentry.
+	 */
+	if (nfsd_mountpoint(dentry, exp)) {
+		int err;
+
+		if (!(exp->ex_flags & NFSEXP_V4ROOT)
+				&& !attributes_need_mount(cd->rd_bmval)) {
+			ignore_crossmnt = 1;
+			goto out_encode;
+		}
+		/*
+		 * Why the heck aren't we just using nfsd_lookup??
+		 * Different "."/".." handling?  Something else?
+		 * At least, add a comment here to explain....
+		 */
+		err = nfsd_cross_mnt(cd->rd_rqstp, &dentry, &exp);
+		if (err) {
+			nfserr = nfserrno(err);
+			goto out_put;
+		}
+		nfserr = check_nfsd_access(exp, cd->rd_rqstp);
+		if (nfserr)
+			goto out_put;
+
+	}
+out_encode:
+	nfserr = nfsd4_encode_fattr(xdr, NULL, exp, dentry, cd->rd_bmval,
+					cd->rd_rqstp, ignore_crossmnt);
+out_put:
+	dput(dentry);
+	exp_put(exp);
+	return nfserr;
+}
+
+static __be32 *
+nfsd4_encode_rdattr_error(struct xdr_stream *xdr, __be32 nfserr)
+{
+	__be32 *p;
+
+	p = xdr_reserve_space(xdr, 20);
+	if (!p)
+		return NULL;
+	*p++ = htonl(2);
+	*p++ = htonl(FATTR4_WORD0_RDATTR_ERROR); /* bmval0 */
+	*p++ = htonl(0);			 /* bmval1 */
+
+	*p++ = htonl(4);     /* attribute length */
+	*p++ = nfserr;       /* no htonl */
+	return p;
 }
 
 static int
-i915_gem_wait_for_error(struct i915_gpu_error *error)
+nfsd4_encode_dirent(void *ccdv, const char *name, int namlen,
+		    loff_t offset, u64 ino, unsigned int d_type)
 {
-	int ret;
+	struct readdir_cd *ccd = ccdv;
+	struct nfsd4_readdir *cd = container_of(ccd, struct nfsd4_readdir, common);
+	struct xdr_stream *xdr = cd->xdr;
+	int start_offset = xdr->buf->len;
+	int cookie_offset;
+	u32 name_and_cookie;
+	int entry_bytes;
+	__be32 nfserr = nfserr_toosmall;
+	__be64 wire_offset;
+	__be32 *p;
 
-#define EXIT_COND (!i915_reset_in_progress(error) || \
-		   i915_terminally_wedged(error))
-	if (EXIT_COND)
+	/* In nfsv4, "." and ".." never make it onto the wire.. */
+	if (name && isdotent(name, namlen)) {
+		cd->common.err = nfs_ok;
 		return 0;
+	}
+
+	if (cd->cookie_offset) {
+		wire_offset = cpu_to_be64(offset);
+		write_bytes_to_xdr_buf(xdr->buf, cd->cookie_offset,
+							&wire_offset, 8);
+	}
+
+	p = xdr_reserve_space(xdr, 4);
+	if (!p)
+		goto fail;
+	*p++ = xdr_one;                             /* mark entry present */
+	cookie_offset = xdr->buf->len;
+	p = xdr_reserve_space(xdr, 3*4 + namlen);
+	if (!p)
+		goto fail;
+	p = xdr_encode_hyper(p, NFS_OFFSET_MAX);    /* offset of next entry */
+	p = xdr_encode_array(p, name, namlen);      /* name length & name */
+
+	nfserr = nfsd4_encode_dirent_fattr(xdr, cd, name, namlen);
+	switch (nfserr) {
+	case nfs_ok:
+		break;
+	case nfserr_resource:
+		nfserr = nfserr_toosmall;
+		goto fail;
+	case nfserr_noent:
+		xdr_truncate_encode(xdr, start_offset);
+		goto skip_entry;
+	case nfserr_jukebox:
+		/*
+		 * The pseudoroot should only display dentries that lead to
+		 * exports. If we get EJUKEBOX here, then we can't tell whether
+		 * this entry should be included. Just fail the whole READDIR
+		 * with NFS4ERR_DELAY in that case, and hope that the situation
+		 * will resolve itself by the client's next attempt.
+		 */
+		if (cd->rd_fhp->fh_export->ex_flags & NFSEXP_V4ROOT)
+			goto fail;
+		/* fallthrough */
+	default:
+		/*
+		 * If the client requested the RDATTR_ERROR attribute,
+		 * we stuff the error code into this attribute
+		 * and continue.  If this attribute was not requested,
+		 * then in accordance with the spec, we fail the
+		 * entire READDIR operation(!)
+		 */
+		if (!(cd->rd_bmval[0] & FATTR4_WORD0_RDATTR_ERROR))
+			goto fail;
+		p = nfsd4_encode_rdattr_error(xdr, nfserr);
+		if (p == NULL) {
+			nfserr = nfserr_toosmall;
+			goto fail;
+		}
+	}
+	nfserr = nfserr_toosmall;
+	entry_bytes = xdr->buf->len - start_offset;
+	if (entry_bytes > cd->rd_maxcount)
+		goto fail;
+	cd->rd_maxcount -= entry_bytes;
+	/*
+	 * RFC 3530 14.2.24 describes rd_dircount as only a "hint", and
+	 * notes that it could be zero. If it is zero, then the server
+	 * should enforce only the rd_maxcount value.
+	 */
+	if (cd->rd_dircount) {
+		name_and_cookie = 4 + 4 * XDR_QUADLEN(namlen) + 8;
+		if (name_and_cookie > cd->rd_dircount && cd->cookie_offset)
+			goto fail;
+		cd->rd_dircount -= min(cd->rd_dircount, name_and_cookie);
+		if (!cd->rd_dircount)
+			cd->rd_maxcount = 0;
+	}
+
+	cd->cookie_offset = cookie_offset;
+skip_entry:
+	cd->common.err = nfs_ok;
+	return 0;
+fail:
+	xdr_truncate_encode(xdr, start_offset);
+	cd->common.err = nfserr;
+	return -EINVAL;
+}
+
+static __be32
+nfsd4_encode_stateid(struct xdr_stream *xdr, stateid_t *sid)
+{
+	__be32 *p;
+
+	p = xdr_reserve_space(xdr, sizeof(stateid_t));
+	if (!p)
+		return nfserr_resource;
+	*p++ = cpu_to_be32(sid->si_generation);
+	p = xdr_encode_opaque_fixed(p, &sid->si_opaque,
+					sizeof(stateid_opaque_t));
+	return 0;
+}
+
+static __be32
+nfsd4_encode_access(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_access *access)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, 8);
+		if (!p)
+			return nfserr_resource;
+		*p++ = cpu_to_be32(access->ac_supported);
+		*p++ = cpu_to_be32(access->ac_resp_access);
+	}
+	return nfserr;
+}
+
+static __be32 nfsd4_encode_bind_conn_to_session(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_bind_conn_to_session *bcts)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, NFS4_MAX_SESSIONID_LEN + 8);
+		if (!p)
+			return nfserr_resource;
+		p = xdr_encode_opaque_fixed(p, bcts->sessionid.data,
+						NFS4_MAX_SESSIONID_LEN);
+		*p++ = cpu_to_be32(bcts->dir);
+		/* Sorry, we do not yet support RDMA over 4.1: */
+		*p++ = cpu_to_be32(0);
+	}
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_close(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_close *close)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+
+	if (!nfserr)
+		nfserr = nfsd4_encode_stateid(xdr, &close->cl_stateid);
+
+	return nfserr;
+}
+
+
+static __be32
+nfsd4_encode_commit(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_commit *commit)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, NFS4_VERIFIER_SIZE);
+		if (!p)
+			return nfserr_resource;
+		p = xdr_encode_opaque_fixed(p, commit->co_verf.data,
+						NFS4_VERIFIER_SIZE);
+	}
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_create(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_create *create)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, 20);
+		if (!p)
+			return nfserr_resource;
+		encode_cinfo(p, &create->cr_cinfo);
+		nfserr = nfsd4_encode_bitmap(xdr, create->cr_bmval[0],
+				create->cr_bmval[1], create->cr_bmval[2]);
+	}
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_getattr(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_getattr *getattr)
+{
+	struct svc_fh *fhp = getattr->ga_fhp;
+	struct xdr_stream *xdr = &resp->xdr;
+
+	if (nfserr)
+		return nfserr;
+
+	nfserr = nfsd4_encode_fattr(xdr, fhp, fhp->fh_export, fhp->fh_dentry,
+				    getattr->ga_bmval,
+				    resp->rqstp, 0);
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_getfh(struct nfsd4_compoundres *resp, __be32 nfserr, struct svc_fh **fhpp)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	struct svc_fh *fhp = *fhpp;
+	unsigned int len;
+	__be32 *p;
+
+	if (!nfserr) {
+		len = fhp->fh_handle.fh_size;
+		p = xdr_reserve_space(xdr, len + 4);
+		if (!p)
+			return nfserr_resource;
+		p = xdr_encode_opaque(p, &fhp->fh_handle.fh_base, len);
+	}
+	return nfserr;
+}
+
+/*
+* Including all fields other than the name, a LOCK4denied structure requires
+*   8(clientid) + 4(namelen) + 8(offset) + 8(length) + 4(type) = 32 bytes.
+*/
+static __be32
+nfsd4_encode_lock_denied(struct xdr_stream *xdr, struct nfsd4_lock_denied *ld)
+{
+	struct xdr_netobj *conf = &ld->ld_owner;
+	__be32 *p;
+
+again:
+	p = xdr_reserve_space(xdr, 32 + XDR_LEN(conf->len));
+	if (!p) {
+		/*
+		 * Don't fail to return the result just because we can't
+		 * return the conflicting open:
+		 */
+		if (conf->len) {
+			kfree(conf->data);
+			conf->len = 0;
+			conf->data = NULL;
+			goto again;
+		}
+		return nfserr_resource;
+	}
+	p = xdr_encode_hyper(p, ld->ld_start);
+	p = xdr_encode_hyper(p, ld->ld_length);
+	*p++ = cpu_to_be32(ld->ld_type);
+	if (conf->len) {
+		p = xdr_encode_opaque_fixed(p, &ld->ld_clientid, 8);
+		p = xdr_encode_opaque(p, conf->data, conf->len);
+		kfree(conf->data);
+	}  else {  /* non - nfsv4 lock in conflict, no clientid nor owner */
+		p = xdr_encode_hyper(p, (u64)0); /* clientid */
+		*p++ = cpu_to_be32(0); /* length of owner name */
+	}
+	return nfserr_denied;
+}
+
+static __be32
+nfsd4_encode_lock(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_lock *lock)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+
+	if (!nfserr)
+		nfserr = nfsd4_encode_stateid(xdr, &lock->lk_resp_stateid);
+	else if (nfserr == nfserr_denied)
+		nfserr = nfsd4_encode_lock_denied(xdr, &lock->lk_denied);
+
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_lockt(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_lockt *lockt)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+
+	if (nfserr == nfserr_denied)
+		nfsd4_encode_lock_denied(xdr, &lockt->lt_denied);
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_locku(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_locku *locku)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+
+	if (!nfserr)
+		nfserr = nfsd4_encode_stateid(xdr, &locku->lu_stateid);
+
+	return nfserr;
+}
+
+
+static __be32
+nfsd4_encode_link(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_link *link)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, 20);
+		if (!p)
+			return nfserr_resource;
+		p = encode_cinfo(p, &link->li_cinfo);
+	}
+	return nfserr;
+}
+
+
+static __be32
+nfsd4_encode_open(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_open *open)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (nfserr)
+		goto out;
+
+	nfserr = nfsd4_encode_stateid(xdr, &open->op_stateid);
+	if (nfserr)
+		goto out;
+	p = xdr_reserve_space(xdr, 24);
+	if (!p)
+		return nfserr_resource;
+	p = encode_cinfo(p, &open->op_cinfo);
+	*p++ = cpu_to_be32(open->op_rflags);
+
+	nfserr = nfsd4_encode_bitmap(xdr, open->op_bmval[0], open->op_bmval[1],
+					open->op_bmval[2]);
+	if (nfserr)
+		goto out;
+
+	p = xdr_reserve_space(xdr, 4);
+	if (!p)
+		return nfserr_resource;
+
+	*p++ = cpu_to_be32(open->op_delegate_type);
+	switch (open->op_delegate_type) {
+	case NFS4_OPEN_DELEGATE_NONE:
+		break;
+	case NFS4_OPEN_DELEGATE_READ:
+		nfserr = nfsd4_encode_stateid(xdr, &open->op_delegate_stateid);
+		if (nfserr)
+			return nfserr;
+		p = xdr_reserve_space(xdr, 20);
+		if (!p)
+			return nfserr_resource;
+		*p++ = cpu_to_be32(open->op_recall);
+
+		/*
+		 * TODO: ACE's in delegations
+		 */
+		*p++ = cpu_to_be32(NFS4_ACE_ACCESS_ALLOWED_ACE_TYPE);
+		*p++ = cpu_to_be32(0);
+		*p++ = cpu_to_be32(0);
+		*p++ = cpu_to_be32(0);   /* XXX: is NULL principal ok? */
+		break;
+	case NFS4_OPEN_DELEGATE_WRITE:
+		nfserr = nfsd4_encode_stateid(xdr, &open->op_delegate_stateid);
+		if (nfserr)
+			return nfserr;
+		p = xdr_reserve_space(xdr, 32);
+		if (!p)
+			return nfserr_resource;
+		*p++ = cpu_to_be32(open->op_recall);
+
+		/*
+		 * TODO: space_limit's in delegations
+		 */
+		*p++ = cpu_to_be32(NFS4_LIMIT_SIZE);
+		*p++ = cpu_to_be32(~(u32)0);
+		*p++ = cpu_to_be32(~(u32)0);
+
+		/*
+		 * TODO: ACE's in delegations
+		 */
+		*p++ = cpu_to_be32(NFS4_ACE_ACCESS_ALLOWED_ACE_TYPE);
+		*p++ = cpu_to_be32(0);
+		*p++ = cpu_to_be32(0);
+		*p++ = cpu_to_be32(0);   /* XXX: is NULL principal ok? */
+		break;
+	case NFS4_OPEN_DELEGATE_NONE_EXT: /* 4.1 */
+		switch (open->op_why_no_deleg) {
+		case WND4_CONTENTION:
+		case WND4_RESOURCE:
+			p = xdr_reserve_space(xdr, 8);
+			if (!p)
+				return nfserr_resource;
+			*p++ = cpu_to_be32(open->op_why_no_deleg);
+			/* deleg signaling not supported yet: */
+			*p++ = cpu_to_be32(0);
+			break;
+		default:
+			p = xdr_reserve_space(xdr, 4);
+			if (!p)
+				return nfserr_resource;
+			*p++ = cpu_to_be32(open->op_why_no_deleg);
+		}
+		break;
+	default:
+		BUG();
+	}
+	/* XXX save filehandle here */
+out:
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_open_confirm(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_open_confirm *oc)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+
+	if (!nfserr)
+		nfserr = nfsd4_encode_stateid(xdr, &oc->oc_resp_stateid);
+
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_open_downgrade(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_open_downgrade *od)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+
+	if (!nfserr)
+		nfserr = nfsd4_encode_stateid(xdr, &od->od_stateid);
+
+	return nfserr;
+}
+
+static __be32 nfsd4_encode_splice_read(
+				struct nfsd4_compoundres *resp,
+				struct nfsd4_read *read,
+				struct file *file, unsigned long maxcount)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	struct xdr_buf *buf = xdr->buf;
+	u32 eof;
+	int space_left;
+	__be32 nfserr;
+	__be32 *p = xdr->p - 2;
+
+	/* Make sure there will be room for padding if needed */
+	if (xdr->end - xdr->p < 1)
+		return nfserr_resource;
+
+	nfserr = nfsd_splice_read(read->rd_rqstp, file,
+				  read->rd_offset, &maxcount);
+	if (nfserr) {
+		/*
+		 * nfsd_splice_actor may have already messed with the
+		 * page length; reset it so as not to confuse
+		 * xdr_truncate_encode:
+		 */
+		buf->page_len = 0;
+		return nfserr;
+	}
+
+	eof = (read->rd_offset + maxcount >=
+	       d_inode(read->rd_fhp->fh_dentry)->i_size);
+
+	*(p++) = htonl(eof);
+	*(p++) = htonl(maxcount);
+
+	buf->page_len = maxcount;
+	buf->len += maxcount;
+	xdr->page_ptr += (buf->page_base + maxcount + PAGE_SIZE - 1)
+							/ PAGE_SIZE;
+
+	/* Use rest of head for padding and remaining ops: */
+	buf->tail[0].iov_base = xdr->p;
+	buf->tail[0].iov_len = 0;
+	xdr->iov = buf->tail;
+	if (maxcount&3) {
+		int pad = 4 - (maxcount&3);
+
+		*(xdr->p++) = 0;
+
+		buf->tail[0].iov_base += maxcount&3;
+		buf->tail[0].iov_len = pad;
+		buf->len += pad;
+	}
+
+	space_left = min_t(int, (void *)xdr->end - (void *)xdr->p,
+				buf->buflen - buf->len);
+	buf->buflen = buf->len + space_left;
+	xdr->end = (__be32 *)((void *)xdr->end + space_left);
+
+	return 0;
+}
+
+static __be32 nfsd4_encode_readv(struct nfsd4_compoundres *resp,
+				 struct nfsd4_read *read,
+				 struct file *file, unsigned long maxcount)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	u32 eof;
+	int v;
+	int starting_len = xdr->buf->len - 8;
+	long len;
+	int thislen;
+	__be32 nfserr;
+	__be32 tmp;
+	__be32 *p;
+	u32 zzz = 0;
+	int pad;
+
+	len = maxcount;
+	v = 0;
+
+	thislen = min_t(long, len, ((void *)xdr->end - (void *)xdr->p));
+	p = xdr_reserve_space(xdr, (thislen+3)&~3);
+	WARN_ON_ONCE(!p);
+	resp->rqstp->rq_vec[v].iov_base = p;
+	resp->rqstp->rq_vec[v].iov_len = thislen;
+	v++;
+	len -= thislen;
+
+	while (len) {
+		thislen = min_t(long, len, PAGE_SIZE);
+		p = xdr_reserve_space(xdr, (thislen+3)&~3);
+		WARN_ON_ONCE(!p);
+		resp->rqstp->rq_vec[v].iov_base = p;
+		resp->rqstp->rq_vec[v].iov_len = thislen;
+		v++;
+		len -= thislen;
+	}
+	read->rd_vlen = v;
+
+	nfserr = nfsd_readv(file, read->rd_offset, resp->rqstp->rq_vec,
+			read->rd_vlen, &maxcount);
+	if (nfserr)
+		return nfserr;
+	xdr_truncate_encode(xdr, starting_len + 8 + ((maxcount+3)&~3));
+
+	eof = (read->rd_offset + maxcount >=
+	       d_inode(read->rd_fhp->fh_dentry)->i_size);
+
+	tmp = htonl(eof);
+	write_bytes_to_xdr_buf(xdr->buf, starting_len    , &tmp, 4);
+	tmp = htonl(maxcount);
+	write_bytes_to_xdr_buf(xdr->buf, starting_len + 4, &tmp, 4);
+
+	pad = (maxcount&3) ? 4 - (maxcount&3) : 0;
+	write_bytes_to_xdr_buf(xdr->buf, starting_len + 8 + maxcount,
+								&zzz, pad);
+	return 0;
+
+}
+
+static __be32
+nfsd4_encode_read(struct nfsd4_compoundres *resp, __be32 nfserr,
+		  struct nfsd4_read *read)
+{
+	unsigned long maxcount;
+	struct xdr_stream *xdr = &resp->xdr;
+	struct file *file = read->rd_filp;
+	int starting_len = xdr->buf->len;
+	struct raparms *ra = NULL;
+	__be32 *p;
+
+	if (nfserr)
+		goto out;
+
+	p = xdr_reserve_space(xdr, 8); /* eof flag and byte count */
+	if (!p) {
+		WARN_ON_ONCE(test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags));
+		nfserr = nfserr_resource;
+		goto out;
+	}
+	if (resp->xdr.buf->page_len &&
+	    test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags)) {
+		WARN_ON_ONCE(1);
+		nfserr = nfserr_resource;
+		goto out;
+	}
+	xdr_commit_encode(xdr);
+
+	maxcount = svc_max_payload(resp->rqstp);
+	maxcount = min_t(unsigned long, maxcount,
+			 (xdr->buf->buflen - xdr->buf->len));
+	maxcount = min_t(unsigned long, maxcount, read->rd_length);
+
+	if (read->rd_tmp_file)
+		ra = nfsd_init_raparms(file);
+
+	if (file->f_op->splice_read &&
+	    test_bit(RQ_SPLICE_OK, &resp->rqstp->rq_flags))
+		nfserr = nfsd4_encode_splice_read(resp, read, file, maxcount);
+	else
+		nfserr = nfsd4_encode_readv(resp, read, file, maxcount);
+
+	if (ra)
+		nfsd_put_raparams(file, ra);
+
+	if (nfserr)
+		xdr_truncate_encode(xdr, starting_len);
+
+out:
+	if (file)
+		fput(file);
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_readlink(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_readlink *readlink)
+{
+	int maxcount;
+	__be32 wire_count;
+	int zero = 0;
+	struct xdr_stream *xdr = &resp->xdr;
+	int length_offset = xdr->buf->len;
+	__be32 *p;
+
+	if (nfserr)
+		return nfserr;
+
+	p = xdr_reserve_space(xdr, 4);
+	if (!p)
+		return nfserr_resource;
+	maxcount = PAGE_SIZE;
+
+	p = xdr_reserve_space(xdr, maxcount);
+	if (!p)
+		return nfserr_resource;
+	/*
+	 * XXX: By default, the ->readlink() VFS op will truncate symlinks
+	 * if they would overflow the buffer.  Is this kosher in NFSv4?  If
+	 * not, one easy fix is: if ->readlink() precisely fills the buffer,
+	 * assume that truncation occurred, and return NFS4ERR_RESOURCE.
+	 */
+	nfserr = nfsd_readlink(readlink->rl_rqstp, readlink->rl_fhp,
+						(char *)p, &maxcount);
+	if (nfserr == nfserr_isdir)
+		nfserr = nfserr_inval;
+	if (nfserr) {
+		xdr_truncate_encode(xdr, length_offset);
+		return nfserr;
+	}
+
+	wire_count = htonl(maxcount);
+	write_bytes_to_xdr_buf(xdr->buf, length_offset, &wire_count, 4);
+	xdr_truncate_encode(xdr, length_offset + 4 + ALIGN(maxcount, 4));
+	if (maxcount & 3)
+		write_bytes_to_xdr_buf(xdr->buf, length_offset + 4 + maxcount,
+						&zero, 4 - (maxcount&3));
+	return 0;
+}
+
+static __be32
+nfsd4_encode_readdir(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_readdir *readdir)
+{
+	int maxcount;
+	int bytes_left;
+	loff_t offset;
+	__be64 wire_offset;
+	struct xdr_stream *xdr = &resp->xdr;
+	int starting_len = xdr->buf->len;
+	__be32 *p;
+
+	if (nfserr)
+		return nfserr;
+
+	p = xdr_reserve_space(xdr, NFS4_VERIFIER_SIZE);
+	if (!p)
+		return nfserr_resource;
+
+	/* XXX: Following NFSv3, we ignore the READDIR verifier for now. */
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(0);
+	resp->xdr.buf->head[0].iov_len = ((char *)resp->xdr.p)
+				- (char *)resp->xdr.buf->head[0].iov_base;
 
 	/*
-	 * Only wait 10 seconds for the gpu reset to complete to avoid hanging
-	 * userspace. If it takes that long something really bad is going on and
-	 * we should simply try to bail out and fail as gracefully as possible.
+	 * Number of bytes left for directory entries allowing for the
+	 * final 8 bytes of the readdir and a following failed op:
 	 */
-	ret = wait_event_interruptible_timeout(error->reset_queue,
-					       EXIT_COND,
-					       10*HZ);
-	if (ret == 0) {
-		DRM_ERROR("Timed out waiting for the gpu reset to complete\n");
-		return -EIO;
-	} else if (ret < 0) {
-		return ret;
+	bytes_left = xdr->buf->buflen - xdr->buf->len
+			- COMPOUND_ERR_SLACK_SPACE - 8;
+	if (bytes_left < 0) {
+		nfserr = nfserr_resource;
+		goto err_no_verf;
 	}
-#undef EXIT_COND
-
-	return 0;
-}
-
-int i915_mutex_lock_interruptible(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	int ret;
-
-	ret = i915_gem_wait_for_error(&dev_priv->gpu_error);
-	if (ret)
-		return ret;
-
-	ret = mutex_lock_interruptible(&dev->struct_mutex);
-	if (ret)
-		return ret;
-
-	WARN_ON(i915_verify_lists(dev));
-	return 0;
-}
-
-int
-i915_gem_get_aperture_ioctl(struct drm_device *dev, void *data,
-			    struct drm_file *file)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct drm_i915_gem_get_aperture *args = data;
-	struct i915_gtt *ggtt = &dev_priv->gtt;
-	struct i915_vma *vma;
-	size_t pinned;
-
-	pinned = 0;
-	mutex_lock(&dev->struct_mutex);
-	list_for_each_entry(vma, &ggtt->base.active_list, mm_list)
-		if (vma->pin_count)
-			pinned += vma->node.size;
-	list_for_each_entry(vma, &ggtt->base.inactive_list, mm_list)
-		if (vma->pin_count)
-			pinned += vma->node.size;
-	mutex_unlock(&dev->struct_mutex);
-
-	args->aper_size = dev_priv->gtt.base.total;
-	args->aper_available_size = args->aper_size - pinned;
-
-	return 0;
-}
-
-static int
-i915_gem_object_get_pages_phys(struct drm_i915_gem_object *obj)
-{
-	struct address_space *mapping = file_inode(obj->base.filp)->i_mapping;
-	char *vaddr = obj->phys_handle->vaddr;
-	struct sg_table *st;
-	struct scatterlist *sg;
-	int i;
-
-	if (WARN_ON(i915_gem_object_needs_bit17_swizzle(obj)))
-		return -EINVAL;
-
-	for (i = 0; i < obj->base.size / PAGE_SIZE; i++) {
-		struct page *page;
-		char *src;
-
-		page = shmem_read_mapping_page(mapping, i);
-		if (IS_ERR(page))
-			return PTR_ERR(page);
-
-		src = kmap_atomic(page);
-		memcpy(vaddr, src, PAGE_SIZE);
-		drm_clflush_virt_range(vaddr, PAGE_SIZE);
-		kunmap_atomic(src);
-
-		page_cache_release(page);
-		vaddr += PAGE_SIZE;
-	}
-
-	i915_gem_chipset_flush(obj->base.dev);
-
-	st = kmalloc(sizeof(*st), GFP_KERNEL);
-	if (st == NULL)
-		return -ENOMEM;
-
-	if (sg_alloc_table(st, 1, GFP_KERNEL)) {
-		kfree(st);
-		return -ENOMEM;
-	}
-
-	sg = st->sgl;
-	sg->offset = 0;
-	sg->length = obj->base.size;
-
-	sg_dma_address(sg) = obj->phys_handle->busaddr;
-	sg_dma_len(sg) = obj->base.size;
-
-	obj->pages = st;
-	return 0;
-}
-
-static void
-i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj)
-{
-	int ret;
-
-	BUG_ON(obj->madv == __I915_MADV_PURGED);
-
-	ret = i915_gem_object_set_to_cpu_domain(obj, true);
-	if (ret) {
-		/* In the event of a disaster, abandon all caches and
-		 * hope for the best.
-		 */
-		WARN_ON(ret != -EIO);
-		obj->base.read_domains = obj->base.write_domain = I915_GEM_DOMAIN_CPU;
-	}
-
-	if (obj->madv == I915_MADV_DONTNEED)
-		obj->dirty = 0;
-
-	if (obj->dirty) {
-		struct address_space *mapping = file_inode(obj->base.filp)->i_mapping;
-		char *vaddr = obj->phys_handle->vaddr;
-		int i;
-
-		for (i = 0; i < obj->base.size / PAGE_SIZE; i++) {
-			struct page *page;
-			char *dst;
-
-			page = shmem_read_mapping_page(mapping, i);
-			if (IS_ERR(page))
-				continue;
-
-			dst = kmap_atomic(page);
-			drm_clflush_virt_range(vaddr, PAGE_SIZE);
-			memcpy(dst, vaddr, PAGE_SIZE);
-			kunmap_atomic(dst);
-
-			set_page_dirty(page);
-			if (obj->madv == I915_MADV_WILLNEED)
-				mark_page_accessed(page);
-			page_cache_release(page);
-			vaddr += PAGE_SIZE;
-		}
-		obj->dirty = 0;
-	}
-
-	sg_free_table(obj->pages);
-	kfree(obj->pages);
-}
-
-static void
-i915_gem_object_release_phys(struct drm_i915_gem_object *obj)
-{
-	drm_pci_free(obj->base.dev, obj->phys_handle);
-}
-
-static const struct drm_i915_gem_object_ops i915_gem_phys_ops = {
-	.get_pages = i915_gem_object_get_pages_phys,
-	.put_pages = i915_gem_object_put_pages_phys,
-	.release = i915_gem_object_release_phys,
-};
-
-static int
-drop_pages(struct drm_i915_gem_object *obj)
-{
-	struct i915_vma *vma, *next;
-	int ret;
-
-	drm_gem_object_reference(&obj->base);
-	list_for_each_entry_safe(vma, next, &obj->vma_list, vma_link)
-		if (i915_vma_unbind(vma))
-			break;
-
-	ret = i915_gem_object_put_pages(obj);
-	drm_gem_object_unreference(&obj->base);
-
-	return ret;
-}
-
-int
-i915_gem_object_attach_phys(struct drm_i915_gem_object *obj,
-			    int align)
-{
-	drm_dma_handle_t *phys;
-	int ret;
-
-	if (obj->phys_handle) {
-		if ((unsigned long)obj->phys_handle->vaddr & (align -1))
-			return -EBUSY;
-
-		return 0;
-	}
-
-	if (obj->madv != I915_MADV_WILLNEED)
-		return -EFAULT;
-
-	if (obj->base.filp == NULL)
-		return -EINVAL;
-
-	ret = drop_pages(obj);
-	if (ret)
-		return ret;
-
-	/* create a new object */
-	phys = drm_pci_alloc(obj->base.dev, obj->base.size, align);
-	if (!phys)
-		return -ENOMEM;
-
-	obj->phys_handle = phys;
-	obj->ops = &i915_gem_phys_ops;
-
-	return i915_gem_object_get_pages(obj);
-}
-
-static int
-i915_gem_phys_pwrite(struct drm_i915_gem_object *obj,
-		     struct drm_i915_gem_pwrite *args,
-		     struct drm_file *file_priv)
-{
-	struct drm_device *dev = obj->base.dev;
-	void *vaddr = obj->phys_handle->vaddr + args->offset;
-	char __user *user_data = u64_to_user_ptr(args->data_ptr);
-	int ret = 0;
-
-	/* We manually control the domain here and pretend that it
-	 * remains coherent i.e. in the GTT domain, like shmem_pwrite.
+	maxcount = svc_max_payload(resp->rqstp);
+	maxcount = min_t(u32, readdir->rd_maxcount, maxcount);
+	/*
+	 * Note the rfc defines rd_maxcount as the size of the
+	 * READDIR4resok structure, which includes the verifier above
+	 * and the 8 bytes encoded at the end of this function:
 	 */
-	ret = i915_gem_object_wait_rendering(obj, false);
-	if (ret)
-		return ret;
+	if (maxcount < 16) {
+		nfserr = nfserr_toosmall;
+		goto err_no_verf;
+	}
+	maxcount = min_t(int, maxcount-16, bytes_left);
 
-	intel_fb_obj_invalidate(obj, ORIGIN_CPU);
-	if (__copy_from_user_inatomic_nocache(vaddr, user_data, args->size)) {
-		unsigned long unwritten;
+	/* RFC 3530 14.2.24 allows us to ignore dircount when it's 0: */
+	if (!readdir->rd_dircount)
+		readdir->rd_dircount = svc_max_payload(resp->rqstp);
 
-		/* The physical object once assigned is fixed for the lifetime
-		 * of the obj, so we can safely drop the lock and continue
-		 * to access vaddr.
-		 */
-		mutex_unlock(&dev->struct_mutex);
-		unwritten = copy_from_user(vaddr, user_data, args->size);
-		mutex_lock(&dev->struct_mutex);
-		if (unwritten) {
-			ret = -EFAULT;
-			goto out;
+	readdir->xdr = xdr;
+	readdir->rd_maxcount = maxcount;
+	readdir->common.err = 0;
+	readdir->cookie_offset = 0;
+
+	offset = readdir->rd_cookie;
+	nfserr = nfsd_readdir(readdir->rd_rqstp, readdir->rd_fhp,
+			      &offset,
+			      &readdir->common, nfsd4_encode_dirent);
+	if (nfserr == nfs_ok &&
+	    readdir->common.err == nfserr_toosmall &&
+	    xdr->buf->len == starting_len + 8) {
+		/* nothing encoded; which limit did we hit?: */
+		if (maxcount - 16 < bytes_left)
+			/* It was the fault of rd_maxcount: */
+			nfserr = nfserr_toosmall;
+		else
+			/* We ran out of buffer space: */
+			nfserr = nfserr_resource;
+	}
+	if (nfserr)
+		goto err_no_verf;
+
+	if (readdir->cookie_offset) {
+		wire_offset = cpu_to_be64(offset);
+		write_bytes_to_xdr_buf(xdr->buf, readdir->cookie_offset,
+							&wire_offset, 8);
+	}
+
+	p = xdr_reserve_space(xdr, 8);
+	if (!p) {
+		WARN_ON_ONCE(1);
+		goto err_no_verf;
+	}
+	*p++ = 0;	/* no more entries */
+	*p++ = htonl(readdir->common.err == nfserr_eof);
+
+	return 0;
+err_no_verf:
+	xdr_truncate_encode(xdr, starting_len);
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_remove(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_remove *remove)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, 20);
+		if (!p)
+			return nfserr_resource;
+		p = encode_cinfo(p, &remove->rm_cinfo);
+	}
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_rename(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_rename *rename)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, 40);
+		if (!p)
+			return nfserr_resource;
+		p = encode_cinfo(p, &rename->rn_sinfo);
+		p = encode_cinfo(p, &rename->rn_tinfo);
+	}
+	return nfserr;
+}
+
+static __be32
+nfsd4_do_encode_secinfo(struct xdr_stream *xdr,
+			 __be32 nfserr, struct svc_export *exp)
+{
+	u32 i, nflavs, supported;
+	struct exp_flavor_info *flavs;
+	struct exp_flavor_info def_flavs[2];
+	__be32 *p, *flavorsp;
+	static bool report = true;
+
+	if (nfserr)
+		goto out;
+	nfserr = nfserr_resource;
+	if (exp->ex_nflavors) {
+		flavs = exp->ex_flavors;
+		nflavs = exp->ex_nflavors;
+	} else { /* Handling of some defaults in absence of real secinfo: */
+		flavs = def_flavs;
+		if (exp->ex_client->flavour->flavour == RPC_AUTH_UNIX) {
+			nflavs = 2;
+			flavs[0].pseudoflavor = RPC_AUTH_UNIX;
+			flavs[1].pseudoflavor = RPC_AUTH_NULL;
+		} else if (exp->ex_client->flavour->flavour == RPC_AUTH_GSS) {
+			nflavs = 1;
+			flavs[0].pseudoflavor
+					= svcauth_gss_flavor(exp->ex_client);
+		} else {
+			nflavs = 1;
+			flavs[0].pseudoflavor
+					= exp->ex_client->flavour->flavour;
 		}
 	}
 
-	drm_clflush_virt_range(vaddr, args->size);
-	i915_gem_chipset_flush(dev);
+	supported = 0;
+	p = xdr_reserve_space(xdr, 4);
+	if (!p)
+		goto out;
+	flavorsp = p++;		/* to be backfilled later */
 
+	for (i = 0; i < nflavs; i++) {
+		rpc_authflavor_t pf = flavs[i].pseudoflavor;
+		struct rpcsec_gss_info info;
+
+		if (rpcauth_get_gssinfo(pf, &info) == 0) {
+			supported++;
+			p = xdr_reserve_space(xdr, 4 + 4 +
+					      XDR_LEN(info.oid.len) + 4 + 4);
+			if (!p)
+				goto out;
+			*p++ = cpu_to_be32(RPC_AUTH_GSS);
+			p = xdr_encode_opaque(p,  info.oid.data, info.oid.len);
+			*p++ = cpu_to_be32(info.qop);
+			*p++ = cpu_to_be32(info.service);
+		} else if (pf < RPC_AUTH_MAXFLAVOR) {
+			supported++;
+			p = xdr_reserve_space(xdr, 4);
+			if (!p)
+				goto out;
+			*p++ = cpu_to_be32(pf);
+		} else {
+			if (report)
+				pr_warn("NFS: SECINFO: security flavor %u "
+					"is not supported\n", pf);
+		}
+	}
+
+	if (nflavs != supported)
+		report = false;
+	*flavorsp = htonl(supported);
+	nfserr = 0;
 out:
-	intel_fb_obj_flush(obj, false, ORIGIN_CPU);
-	return ret;
+	if (exp)
+		exp_put(exp);
+	return nfserr;
 }
 
-void *i915_gem_object_alloc(struct drm_device *dev)
+static __be32
+nfsd4_encode_secinfo(struct nfsd4_compoundres *resp, __be32 nfserr,
+		     struct nfsd4_secinfo *secinfo)
 {
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	return kmem_cache_zalloc(dev_priv->objects, GFP_KERNEL);
+	struct xdr_stream *xdr = &resp->xdr;
+
+	return nfsd4_do_encode_secinfo(xdr, nfserr, secinfo->si_exp);
 }
 
-void i915_gem_object_free(struct drm_i915_gem_object *obj)
+static __be32
+nfsd4_encode_secinfo_no_name(struct nfsd4_compoundres *resp, __be32 nfserr,
+		     struct nfsd4_secinfo_no_name *secinfo)
 {
-	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
-	kmem_cache_free(dev_priv->objects, obj);
-}
+	struct xdr_stream *xdr = &resp->xdr;
 
-static int
-i915_gem_create(struct drm_file *file,
-		struct drm_device *dev,
-		uint64_t size,
-		uint32_t *handle_p)
-{
-	struct drm_i915_gem_object *obj;
-	int ret;
-	u32 handle;
-
-	size = roundup(size, PAGE_SIZE);
-	if (size == 0)
-		return -EINVAL;
-
-	/* Allocate the new object */
-	obj = i915_gem_alloc_object(dev, size);
-	if (obj == NULL)
-		return -ENOMEM;
-
-	ret = drm_gem_handle_create(file, &obj->base, &handle);
-	/* drop reference from allocate - handle holds it now */
-	drm_gem_object_unreference_unlocked(&obj->base);
-	if (ret)
-		return ret;
-
-	*handle_p = handle;
-	return 0;
-}
-
-int
-i915_gem_dumb_create(struct drm_file *file,
-		     struct drm_device *dev,
-		     struct drm_mode_create_dumb *args)
-{
-	/* have to work out size/pitch and return them */
-	args->pitch = ALIGN(args->width * DIV_ROUND_UP(args->bpp, 8), 64);
-	args->size = args->pitch * args->height;
-	return i915_gem_create(file, dev,
-			       args->size, &args->handle);
-}
-
-/**
- * Creates a new mm object and returns a handle to it.
- */
-int
-i915_gem_create_ioctl(struct drm_device *dev, void *data,
-		      struct drm_file *file)
-{
-	struct drm_i915_gem_create *args = data;
-
-	return i915_gem_create(file, dev,
-			       args->size, &args->handle);
-}
-
-static inline int
-__copy_to_user_swizzled(char __user *cpu_vaddr,
-			const char *gpu_vaddr, int gpu_offset,
-			int length)
-{
-	int ret, cpu_offset = 0;
-
-	while (length > 0) {
-		int cacheline_end = ALIGN(gpu_offset + 1, 64);
-		int this_length = min(cacheline_end - gpu_offset, length);
-		int swizzled_gpu_offset = gpu_offset ^ 64;
-
-		ret = __copy_to_user(cpu_vaddr + cpu_offset,
-				     gpu_vaddr + swizzled_gpu_offset,
-				     this_length);
-		if (ret)
-			return ret + length;
-
-		cpu_offset += this_length;
-		gpu_offset += this_length;
-		length -= this_length;
-	}
-
-	return 0;
-}
-
-static inline int
-__copy_from_user_swizzled(char *gpu_vaddr, int gpu_offset,
-			  const char __user *cpu_vaddr,
-			  int length)
-{
-	int ret, cpu_offset = 0;
-
-	while (length > 0) {
-		int cacheline_end = ALIGN(gpu_offset + 1, 64);
-		int this_length = min(cacheline_end - gpu_offset, length);
-		int swizzled_gpu_offset = gpu_offset ^ 64;
-
-		ret = __copy_from_user(gpu_vaddr + swizzled_gpu_offset,
-				       cpu_vaddr + cpu_offset,
-				       this_length);
-		if (ret)
-			return ret + length;
-
-		cpu_offset += this_length;
-		gpu_offset += this_length;
-		length -= this_length;
-	}
-
-	return 0;
+	return nfsd4_do_encode_secinfo(xdr, nfserr, secinfo->sin_exp);
 }
 
 /*
- * Pins the specified object's pages and synchronizes the object with
- * GPU accesses. Sets needs_clflush to non-zero if the caller should
- * flush the object from the CPU cache.
+ * The SETATTR encode routine is special -- it always encodes a bitmap,
+ * regardless of the error status.
  */
-int i915_gem_obj_prepare_shmem_read(struct drm_i915_gem_object *obj,
-				    int *needs_clflush)
+static __be32
+nfsd4_encode_setattr(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_setattr *setattr)
 {
-	int ret;
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
 
-	*needs_clflush = 0;
-
-	if (!obj->base.filp)
-		return -EINVAL;
-
-	if (!(obj->base.read_domains & I915_GEM_DOMAIN_CPU)) {
-		/* If we're not in the cpu read domain, set ourself into the gtt
-		 * read domain and manually flush cachelines (if required). This
-		 * optimizes for the case when the gpu will dirty the data
-		 * anyway again before the next pread happens. */
-		*needs_clflush = !cpu_cache_is_coherent(obj->base.dev,
-							obj->cache_level);
-		ret = i915_gem_object_wait_rendering(obj, true);
-		if (ret)
-			return ret;
+	p = xdr_reserve_space(xdr, 16);
+	if (!p)
+		return nfserr_resource;
+	if (nfserr) {
+		*p++ = cpu_to_be32(3);
+		*p++ = cpu_to_be32(0);
+		*p++ = cpu_to_be32(0);
+		*p++ = cpu_to_be32(0);
 	}
-
-	ret = i915_gem_object_get_pages(obj);
-	if (ret)
-		return ret;
-
-	i915_gem_object_pin_pages(obj);
-
-	return ret;
+	else {
+		*p++ = cpu_to_be32(3);
+		*p++ = cpu_to_be32(setattr->sa_bmval[0]);
+		*p++ = cpu_to_be32(setattr->sa_bmval[1]);
+		*p++ = cpu_to_be32(setattr->sa_bmval[2]);
+	}
+	return nfserr;
 }
 
-/* Per-page copy function for the shmem pread fastpath.
- * Flushes invalid cachelines before reading the target if
- * needs_clflush is set. */
-static int
-shmem_pread_fast(struct page *page, int shmem_page_offset, int page_length,
-		 char __user *user_data,
-		 bool page_do_bit17_swizzling, bool needs_clflush)
+static __be32
+nfsd4_encode_setclientid(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_setclientid *scd)
 {
-	char *vaddr;
-	int ret;
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
 
-	if (unlikely(page_do_bit17_swizzling))
-		return -EINVAL;
-
-	vaddr = kmap_atomic(page);
-	if (needs_clflush)
-		drm_clflush_virt_range(vaddr + shmem_page_offset,
-				       page_length);
-	ret = __copy_to_user_inatomic(user_data,
-				      vaddr + shmem_page_offset,
-				      page_length);
-	kunmap_atomic(vaddr);
-
-	return ret ? -EFAULT : 0;
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, 8 + NFS4_VERIFIER_SIZE);
+		if (!p)
+			return nfserr_resource;
+		p = xdr_encode_opaque_fixed(p, &scd->se_clientid, 8);
+		p = xdr_encode_opaque_fixed(p, &scd->se_confirm,
+						NFS4_VERIFIER_SIZE);
+	}
+	else if (nfserr == nfserr_clid_inuse) {
+		p = xdr_reserve_space(xdr, 8);
+		if (!p)
+			return nfserr_resource;
+		*p++ = cpu_to_be32(0);
+		*p++ = cpu_to_be32(0);
+	}
+	return nfserr;
 }
 
-static void
-shmem_clflush_swizzled_range(char *addr, unsigned long length,
-			     bool swizzled)
+static __be32
+nfsd4_encode_write(struct nfsd4_compoundres *resp, __be32 nfserr, struct nfsd4_write *write)
 {
-	if (unlikely(swizzled)) {
-		unsigned long start = (unsigned long) addr;
-		unsigned long end = (unsigned long) addr + length;
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
 
-		/* For swizzling simply ensure that we always flush both
-		 * channels. Lame, but simple and it works. Swizzled
-		 * pwrite/pread is far from a hotpath - current userspace
-		 * doesn't use it at all. */
-		start = round_down(start, 128);
-		end = round_up(end, 128);
-
-		drm_clflush_virt_range((void *)start, end - start);
-	} else {
-		drm_clflush_virt_range(addr, length);
+	if (!nfserr) {
+		p = xdr_reserve_space(xdr, 16);
+		if (!p)
+			return nfserr_resource;
+		*p++ = cpu_to_be32(write->wr_bytes_written);
+		*p++ = cpu_to_be32(write->wr_how_written);
+		p = xdr_encode_opaque_fixed(p, write->wr_verifier.data,
+							NFS4_VERIFIER_SIZE);
 	}
-
+	return nfserr;
 }
 
-/* Only difference to the fast-path function is that this can handle bit17
- * and uses non-atomic copy and kmap functions. */
-static int
-shmem_pread_slow(struct page *page, int shmem_page_offset, int page_length,
-		 char __user *user_data,
-		 bool page_do_bit17_swizzling, bool needs_clflush)
+static const u32 nfs4_minimal_spo_must_enforce[2] = {
+	[1] = 1 << (OP_BIND_CONN_TO_SESSION - 32) |
+	      1 << (OP_EXCHANGE_ID - 32) |
+	      1 << (OP_CREATE_SESSION - 32) |
+	      1 << (OP_DESTROY_SESSION - 32) |
+	      1 << (OP_DESTROY_CLIENTID - 32)
+};
+
+static __be32
+nfsd4_encode_exchange_id(struct nfsd4_compoundres *resp, __be32 nfserr,
+			 struct nfsd4_exchange_id *exid)
 {
-	char *vaddr;
-	int ret;
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+	char *major_id;
+	char *server_scope;
+	int major_id_sz;
+	int server_scope_sz;
+	uint64_t minor_id = 0;
 
-	vaddr = kmap(page);
-	if (needs_clflush)
-		shmem_clflush_swizzled_range(vaddr + shmem_page_offset,
-					     page_length,
-					     page_do_bit17_swizzling);
+	if (nfserr)
+		return nfserr;
 
-	if (page_do_bit17_swizzling)
-		ret = __copy_to_user_swizzled(user_data,
-					      vaddr, shmem_page_offset,
-					      page_length);
-	else
-		ret = __copy_to_user(user_data,
-				     vaddr + shmem_page_offset,
-				     page_length);
-	kunmap(page);
+	major_id = utsname()->nodename;
+	major_id_sz = strlen(major_id);
+	server_scope = utsname()->nodename;
+	server_scope_sz = strlen(server_scope);
 
-	return ret ? - EFAULT : 0;
-}
+	p = xdr_reserve_space(xdr,
+		8 /* eir_clientid */ +
+		4 /* eir_sequenceid */ +
+		4 /* eir_flags */ +
+		4 /* spr_how */);
+	if (!p)
+		return nfserr_resource;
 
-static int
-i915_gem_shmem_pread(struct drm_device *dev,
-		     struct drm_i915_gem_object *obj,
-		     struct drm_i915_gem_pread *args,
-		     struct drm_file *file)
-{
-	char __user *user_data;
-	ssize_t remain;
-	loff_t offset;
-	int shmem_page_offset, page_length, ret = 0;
-	int obj_do_bit17_swizzling, page_do_bit17_swizzling;
-	int prefaulted = 0;
-	int needs_clflush = 0;
-	struct sg_page_iter sg_iter;
+	p = xdr_encode_opaque_fixed(p, &exid->clientid, 8);
+	*p++ = cpu_to_be32(exid->seqid);
+	*p++ = cpu_to_be32(exid->flags);
 
-	user_data = u64_to_user_ptr(args->data_ptr);
-	remain = args->size;
+	*p++ = cpu_to_be32(exid->spa_how);
 
-	obj_do_bit17_swizzling = i915_gem_object_needs_bit17_swizzle(obj);
+	switch (exid->spa_how) {
+	case SP4_NONE:
+		break;
+	case SP4_MACH_CRED:
+		/* spo_must_enforce, spo_must_allow */
+		p = xdr_reserve_space(xdr, 16);
+		if (!p)
+			return nfserr_resource;
 
-	ret = i915_gem_obj_prepare_shmem_read(obj, &needs_clflush);
-	if (ret)
-		return ret;
+		/* spo_must_enforce bitmap: */
+		*p++ = cpu_to_be32(2);
+		*p++ = cpu_to_be32(nfs4_minimal_spo_must_enforce[0]);
+		*p++ = cpu_to_be32(nfs4_minimal_spo_must_enforce[1]);
+		/* empty spo_must_allow bitmap: */
+		*p++ = cpu_to_be32(0);
 
-	offset = args->offset;
-
-	for_each_sg_page(obj->pages->sgl, &sg_iter, obj->pages->nents,
-			 offset >> PAGE_SHIFT) {
-		struct page *page = sg_page_iter_page(&sg_iter);
-
-		if (remain <= 0)
-			break;
-
-		/* Operation in this page
-		 *
-		 * shmem_page_offset = offset within page in shmem file
-		 * page_length = bytes to copy for this page
-		 */
-		shmem_page_offset = offset_in_page(offset);
-		page_length = remain;
-		if ((shmem_page_offset + page_length) > PAGE_SIZE)
-			page_length = PAGE_SIZE - shmem_page_offset;
-
-		page_do_bit17_swizzling = obj_do_bit17_swizzling &&
-			(page_to_phys(page) & (1 << 17)) != 0;
-
-		ret = shmem_pread_fast(page, shmem_page_offset, page_length,
-				       user_data, page_do_bit17_swizzling,
-				       needs_clflush);
-		if (ret == 0)
-			goto next_page;
-
-		mutex_unlock(&dev->struct_mutex);
-
-		if (likely(!i915.prefault_disable) && !prefaulted) {
-			ret = fault_in_multipages_writeable(user_data, remain);
-			/* Userspace is tricking us, but we've already clobbered
-			 * its pages with the prefault and promised to write the
-			 * data up to the first fault. Hence ignore any errors
-			 * and just continue. */
-			(void)ret;
-			prefaulted = 1;
-		}
-
-		ret = shmem_pread_slow(page, shmem_page_offset, page_length,
-				       user_data, page_do_bit17_swizzling,
-				       needs_clflush);
-
-		mutex_lock(&dev->struct_mutex);
-
-		if (ret)
-			goto out;
-
-next_page:
-		remain -= page_length;
-		user_data += page_length;
-		offset += page_length;
+		break;
+	default:
+		WARN_ON_ONCE(1);
 	}
 
-out:
-	i915_gem_object_unpin_pages(obj);
-
-	return ret;
-}
-
-/**
- * Reads data from the object referenced by handle.
- *
- * On error, the contents of *data are undefined.
- */
-int
-i915_gem_pread_ioctl(struct drm_device *dev, void *data,
-		     struct drm_file *file)
-{
-	struct drm_i915_gem_pread *args = data;
-	struct drm_i915_gem_object *obj;
-	int ret = 0;
-
-	if (args->size == 0)
-		return 0;
-
-	if (!access_ok(VERIFY_WRITE,
-		       u64_to_user_ptr(args->data_ptr),
-		       args->size))
-		return -EFAULT;
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		return ret;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->handle));
-	if (&obj->base == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-
-	/* Bounds check source.  */
-	if (args->offset > obj->base.size ||
-	    args->size > obj->base.size - args->offset) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	/* prime objects have no backing filp to GEM pread/pwrite
-	 * pages from.
-	 */
-	if (!obj->base.filp) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	trace_i915_gem_object_pread(obj, args->offset, args->size);
-
-	ret = i915_gem_shmem_pread(dev, obj, args, file);
-
-out:
-	drm_gem_object_unreference(&obj->base);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-	return ret;
-}
-
-/* This is the fast write path which cannot handle
- * page faults in the source data
- */
-
-static inline int
-fast_user_write(struct io_mapping *mapping,
-		loff_t page_base, int page_offset,
-		char __user *user_data,
-		int length)
-{
-	void __iomem *vaddr_atomic;
-	void *vaddr;
-	unsigned long unwritten;
-
-	vaddr_atomic = io_mapping_map_atomic_wc(mapping, page_base);
-	/* We can use the cpu mem copy function because this is X86. */
-	vaddr = (void __force*)vaddr_atomic + page_offset;
-	unwritten = __copy_from_user_inatomic_nocache(vaddr,
-						      user_data, length);
-	io_mapping_unmap_atomic(vaddr_atomic);
-	return unwritten;
-}
-
-/**
- * This is the fast pwrite path, where we copy the data directly from the
- * user into the GTT, uncached.
- */
-static int
-i915_gem_gtt_pwrite_fast(struct drm_device *dev,
-			 struct drm_i915_gem_object *obj,
-			 struct drm_i915_gem_pwrite *args,
-			 struct drm_file *file)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	ssize_t remain;
-	loff_t offset, page_base;
-	char __user *user_data;
-	int page_offset, page_length, ret;
-
-	ret = i915_gem_obj_ggtt_pin(obj, 0, PIN_MAPPABLE | PIN_NONBLOCK);
-	if (ret)
-		goto out;
-
-	ret = i915_gem_object_set_to_gtt_domain(obj, true);
-	if (ret)
-		goto out_unpin;
-
-	ret = i915_gem_object_put_fence(obj);
-	if (ret)
-		goto out_unpin;
-
-	user_data = u64_to_user_ptr(args->data_ptr);
-	remain = args->size;
-
-	offset = i915_gem_obj_ggtt_offset(obj) + args->offset;
-
-	intel_fb_obj_invalidate(obj, ORIGIN_GTT);
-
-	while (remain > 0) {
-		/* Operation in this page
-		 *
-		 * page_base = page offset within aperture
-		 * page_offset = offset within page
-		 * page_length = bytes to copy for this page
-		 */
-		page_base = offset & PAGE_MASK;
-		page_offset = offset_in_page(offset);
-		page_length = remain;
-		if ((page_offset + remain) > PAGE_SIZE)
-			page_length = PAGE_SIZE - page_offset;
-
-		/* If we get a fault while copying data, then (presumably) our
-		 * source page isn't available.  Return the error and we'll
-		 * retry in the slow path.
-		 */
-		if (fast_user_write(dev_priv->gtt.mappable, page_base,
-				    page_offset, user_data, page_length)) {
-			ret = -EFAULT;
-			goto out_flush;
-		}
-
-		remain -= page_length;
-		user_data += page_length;
-		offset += page_length;
-	}
-
-out_flush:
-	intel_fb_obj_flush(obj, false, ORIGIN_GTT);
-out_unpin:
-	i915_gem_object_ggtt_unpin(obj);
-out:
-	return ret;
-}
-
-/* Per-page copy function for the shmem pwrite fastpath.
- * Flushes invalid cachelines before writing to the target if
- * needs_clflush_before is set and flushes out any written cachelines after
- * writing if needs_clflush is set. */
-static int
-shmem_pwrite_fast(struct page *page, int shmem_page_offset, int page_length,
-		  char __user *user_data,
-		  bool page_do_bit17_swizzling,
-		  bool needs_clflush_before,
-		  bool needs_clflush_after)
-{
-	char *vaddr;
-	int ret;
-
-	if (unlikely(page_do_bit17_swizzling))
-		return -EINVAL;
-
-	vaddr = kmap_atomic(page);
-	if (needs_clflush_before)
-		drm_clflush_virt_range(vaddr + shmem_page_offset,
-				       page_length);
-	ret = __copy_from_user_inatomic(vaddr + shmem_page_offset,
-					user_data, page_length);
-	if (needs_clflush_after)
-		drm_clflush_virt_range(vaddr + shmem_page_offset,
-				       page_length);
-	kunmap_atomic(vaddr);
-
-	return ret ? -EFAULT : 0;
-}
-
-/* Only difference to the fast-path function is that this can handle bit17
- * and uses non-atomic copy and kmap functions. */
-static int
-shmem_pwrite_slow(struct page *page, int shmem_page_offset, int page_length,
-		  char __user *user_data,
-		  bool page_do_bit17_swizzling,
-		  bool needs_clflush_before,
-		  bool needs_clflush_after)
-{
-	char *vaddr;
-	int ret;
-
-	vaddr = kmap(page);
-	if (unlikely(needs_clflush_before || page_do_bit17_swizzling))
-		shmem_clflush_swizzled_range(vaddr + shmem_page_offset,
-					     page_length,
-					     page_do_bit17_swizzling);
-	if (page_do_bit17_swizzling)
-		ret = __copy_from_user_swizzled(vaddr, shmem_page_offset,
-						user_data,
-						page_length);
-	else
-		ret = __copy_from_user(vaddr + shmem_page_offset,
-				       user_data,
-				       page_length);
-	if (needs_clflush_after)
-		shmem_clflush_swizzled_range(vaddr + shmem_page_offset,
-					     page_length,
-					     page_do_bit17_swizzling);
-	kunmap(page);
-
-	return ret ? -EFAULT : 0;
-}
-
-static int
-i915_gem_shmem_pwrite(struct drm_device *dev,
-		      struct drm_i915_gem_object *obj,
-		      struct drm_i915_gem_pwrite *args,
-		      struct drm_file *file)
-{
-	ssize_t remain;
-	loff_t offset;
-	char __user *user_data;
-	int shmem_page_offset, page_length, ret = 0;
-	int obj_do_bit17_swizzling, page_do_bit17_swizzling;
-	int hit_slowpath = 0;
-	int needs_clflush_after = 0;
-	int needs_clflush_before = 0;
-	struct sg_page_iter sg_iter;
-
-	user_data = u64_to_user_ptr(args->data_ptr);
-	remain = args->size;
-
-	obj_do_bit17_swizzling = i915_gem_object_needs_bit17_swizzle(obj);
-
-	if (obj->base.write_domain != I915_GEM_DOMAIN_CPU) {
-		/* If we're not in the cpu write domain, set ourself into the gtt
-		 * write domain and manually flush cachelines (if required). This
-		 * optimizes for the case when the gpu will use the data
-		 * right away and we therefore have to clflush anyway. */
-		needs_clflush_after = cpu_write_needs_clflush(obj);
-		ret = i915_gem_object_wait_rendering(obj, false);
-		if (ret)
-			return ret;
-	}
-	/* Same trick applies to invalidate partially written cachelines read
-	 * before writing. */
-	if ((obj->base.read_domains & I915_GEM_DOMAIN_CPU) == 0)
-		needs_clflush_before =
-			!cpu_cache_is_coherent(dev, obj->cache_level);
-
-	ret = i915_gem_object_get_pages(obj);
-	if (ret)
-		return ret;
-
-	intel_fb_obj_invalidate(obj, ORIGIN_CPU);
-
-	i915_gem_object_pin_pages(obj);
-
-	offset = args->offset;
-	obj->dirty = 1;
-
-	for_each_sg_page(obj->pages->sgl, &sg_iter, obj->pages->nents,
-			 offset >> PAGE_SHIFT) {
-		struct page *page = sg_page_iter_page(&sg_iter);
-		int partial_cacheline_write;
-
-		if (remain <= 0)
-			break;
-
-		/* Operation in this page
-		 *
-		 * shmem_page_offset = offset within page in shmem file
-		 * page_length = bytes to copy for this page
-		 */
-		shmem_page_offset = offset_in_page(offset);
-
-		page_length = remain;
-		if ((shmem_page_offset + page_length) > PAGE_SIZE)
-			page_length = PAGE_SIZE - shmem_page_offset;
-
-		/* If we don't overwrite a cacheline completely we need to be
-		 * careful to have up-to-date data by first clflushing. Don't
-		 * overcomplicate things and flush the entire patch. */
-		partial_cacheline_write = needs_clflush_before &&
-			((shmem_page_offset | page_length)
-				& (boot_cpu_data.x86_clflush_size - 1));
-
-		page_do_bit17_swizzling = obj_do_bit17_swizzling &&
-			(page_to_phys(page) & (1 << 17)) != 0;
-
-		ret = shmem_pwrite_fast(page, shmem_page_offset, page_length,
-					user_data, page_do_bit17_swizzling,
-					partial_cacheline_write,
-					needs_clflush_after);
-		if (ret == 0)
-			goto next_page;
-
-		hit_slowpath = 1;
-		mutex_unlock(&dev->struct_mutex);
-		ret = shmem_pwrite_slow(page, shmem_page_offset, page_length,
-					user_data, page_do_bit17_swizzling,
-					partial_cacheline_write,
-					needs_clflush_after);
-
-		mutex_lock(&dev->struct_mutex);
-
-		if (ret)
-			goto out;
-
-next_page:
-		remain -= page_length;
-		user_data += page_length;
-		offset += page_length;
-	}
-
-out:
-	i915_gem_object_unpin_pages(obj);
-
-	if (hit_slowpath) {
-		/*
-		 * Fixup: Flush cpu caches in case we didn't flush the dirty
-		 * cachelines in-line while writing and the object moved
-		 * out of the cpu write domain while we've dropped the lock.
-		 */
-		if (!needs_clflush_after &&
-		    obj->base.write_domain != I915_GEM_DOMAIN_CPU) {
-			if (i915_gem_clflush_object(obj, obj->pin_display))
-				needs_clflush_after = true;
-		}
-	}
-
-	if (needs_clflush_after)
-		i915_gem_chipset_flush(dev);
-	else
-		obj->cache_dirty = true;
-
-	intel_fb_obj_flush(obj, false, ORIGIN_CPU);
-	return ret;
-}
-
-/**
- * Writes data to the object referenced by handle.
- *
- * On error, the contents of the buffer that were to be modified are undefined.
- */
-int
-i915_gem_pwrite_ioctl(struct drm_device *dev, void *data,
-		      struct drm_file *file)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct drm_i915_gem_pwrite *args = data;
-	struct drm_i915_gem_object *obj;
-	int ret;
-
-	if (args->size == 0)
-		return 0;
-
-	if (!access_ok(VERIFY_READ,
-		       u64_to_user_ptr(args->data_ptr),
-		       args->size))
-		return -EFAULT;
-
-	if (likely(!i915.prefault_disable)) {
-		ret = fault_in_multipages_readable(u64_to_user_ptr(args->data_ptr),
-						   args->size);
-		if (ret)
-			return -EFAULT;
-	}
-
-	intel_runtime_pm_get(dev_priv);
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		goto put_rpm;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->handle));
-	if (&obj->base == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-
-	/* Bounds check destination. */
-	if (args->offset > obj->base.size ||
-	    args->size > obj->base.size - args->offset) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	/* prime objects have no backing filp to GEM pread/pwrite
-	 * pages from.
-	 */
-	if (!obj->base.filp) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	trace_i915_gem_object_pwrite(obj, args->offset, args->size);
-
-	ret = -EFAULT;
-	/* We can only do the GTT pwrite on untiled buffers, as otherwise
-	 * it would end up going through the fenced access, and we'll get
-	 * different detiling behavior between reading and writing.
-	 * pread/pwrite currently are reading and writing from the CPU
-	 * perspective, requiring manual detiling by the client.
-	 */
-	if (obj->tiling_mode == I915_TILING_NONE &&
-	    obj->base.write_domain != I915_GEM_DOMAIN_CPU &&
-	    cpu_write_needs_clflush(obj)) {
-		ret = i915_gem_gtt_pwrite_fast(dev, obj, args, file);
-		/* Note that the gtt paths might fail with non-page-backed user
-		 * pointers (e.g. gtt mappings when moving data between
-		 * textures). Fallback to the shmem path in that case. */
-	}
-
-	if (ret == -EFAULT || ret == -ENOSPC) {
-		if (obj->phys_handle)
-			ret = i915_gem_phys_pwrite(obj, args, file);
-		else
-			ret = i915_gem_shmem_pwrite(dev, obj, args, file);
-	}
-
-out:
-	drm_gem_object_unreference(&obj->base);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-put_rpm:
-	intel_runtime_pm_put(dev_priv);
-
-	return ret;
-}
-
-int
-i915_gem_check_wedge(struct i915_gpu_error *error,
-		     bool interruptible)
-{
-	if (i915_reset_in_progress(error)) {
-		/* Non-interruptible callers can't handle -EAGAIN, hence return
-		 * -EIO unconditionally for these. */
-		if (!interruptible)
-			return -EIO;
-
-		/* Recovery complete, but the reset failed ... */
-		if (i915_terminally_wedged(error))
-			return -EIO;
-
-		/*
-		 * Check if GPU Reset is in progress - we need intel_ring_begin
-		 * to work properly to reinit the hw state while the gpu is
-		 * still marked as reset-in-progress. Handle this with a flag.
-		 */
-		if (!error->reload_in_reset)
-			return -EAGAIN;
-	}
-
+	p = xdr_reserve_space(xdr,
+		8 /* so_minor_id */ +
+		4 /* so_major_id.len */ +
+		(XDR_QUADLEN(major_id_sz) * 4) +
+		4 /* eir_server_scope.len */ +
+		(XDR_QUADLEN(server_scope_sz) * 4) +
+		4 /* eir_server_impl_id.count (0) */);
+	if (!p)
+		return nfserr_resource;
+
+	/* The server_owner struct */
+	p = xdr_encode_hyper(p, minor_id);      /* Minor id */
+	/* major id */
+	p = xdr_encode_opaque(p, major_id, major_id_sz);
+
+	/* Server scope */
+	p = xdr_encode_opaque(p, server_scope, server_scope_sz);
+
+	/* Implementation id */
+	*p++ = cpu_to_be32(0);	/* zero length nfs_impl_id4 array */
 	return 0;
 }
 
-static void fake_irq(unsigned long data)
+static __be32
+nfsd4_encode_create_session(struct nfsd4_compoundres *resp, __be32 nfserr,
+			    struct nfsd4_create_session *sess)
 {
-	wake_up_process((struct task_struct *)data);
-}
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
 
-static bool missed_irq(struct drm_i915_private *dev_priv,
-		       struct intel_engine_cs *ring)
-{
-	return test_bit(ring->id, &dev_priv->gpu_error.missed_irq_rings);
-}
+	if (nfserr)
+		return nfserr;
 
-static unsigned long local_clock_us(unsigned *cpu)
-{
-	unsigned long t;
+	p = xdr_reserve_space(xdr, 24);
+	if (!p)
+		return nfserr_resource;
+	p = xdr_encode_opaque_fixed(p, sess->sessionid.data,
+					NFS4_MAX_SESSIONID_LEN);
+	*p++ = cpu_to_be32(sess->seqid);
+	*p++ = cpu_to_be32(sess->flags);
 
-	/* Cheaply and approximately convert from nanoseconds to microseconds.
-	 * The result and subsequent calculations are also defined in the same
-	 * approximate microseconds units. The principal source of timing
-	 * error here is from the simple truncation.
-	 *
-	 * Note that local_clock() is only defined wrt to the current CPU;
-	 * the comparisons are no longer valid if we switch CPUs. Instead of
-	 * blocking preemption for the entire busywait, we can detect the CPU
-	 * switch and use that as indicator of system load and a reason to
-	 * stop busywaiting, see busywait_stop().
-	 */
-	*cpu = get_cpu();
-	t = local_clock() >> 10;
-	put_cpu();
+	p = xdr_reserve_space(xdr, 28);
+	if (!p)
+		return nfserr_resource;
+	*p++ = cpu_to_be32(0); /* headerpadsz */
+	*p++ = cpu_to_be32(sess->fore_channel.maxreq_sz);
+	*p++ = cpu_to_be32(sess->fore_channel.maxresp_sz);
+	*p++ = cpu_to_be32(sess->fore_channel.maxresp_cached);
+	*p++ = cpu_to_be32(sess->fore_channel.maxops);
+	*p++ = cpu_to_be32(sess->fore_channel.maxreqs);
+	*p++ = cpu_to_be32(sess->fore_channel.nr_rdma_attrs);
 
-	return t;
-}
-
-static bool busywait_stop(unsigned long timeout, unsigned cpu)
-{
-	unsigned this_cpu;
-
-	if (time_after(local_clock_us(&this_cpu), timeout))
-		return true;
-
-	return this_cpu != cpu;
-}
-
-static int __i915_spin_request(struct drm_i915_gem_request *req, int state)
-{
-	unsigned long timeout;
-	unsigned cpu;
-
-	/* When waiting for high frequency requests, e.g. during synchronous
-	 * rendering split between the CPU and GPU, the finite amount of time
-	 * required to set up the irq and wait upon it limits the response
-	 * rate. By busywaiting on the request completion for a short while we
-	 * can service the high frequency waits as quick as possible. However,
-	 * if it is a slow request, we want to sleep as quickly as possible.
-	 * The tradeoff between waiting and sleeping is roughly the time it
-	 * takes to sleep on a request, on the order of a microsecond.
-	 */
-
-	if (req->ring->irq_refcount)
-		return -EBUSY;
-
-	/* Only spin if we know the GPU is processing this request */
-	if (!i915_gem_request_started(req, true))
-		return -EAGAIN;
-
-	timeout = local_clock_us(&cpu) + 5;
-	while (!need_resched()) {
-		if (i915_gem_request_completed(req, true))
-			return 0;
-
-		if (signal_pending_state(state, current))
-			break;
-
-		if (busywait_stop(timeout, cpu))
-			break;
-
-		cpu_relax_lowlatency();
+	if (sess->fore_channel.nr_rdma_attrs) {
+		p = xdr_reserve_space(xdr, 4);
+		if (!p)
+			return nfserr_resource;
+		*p++ = cpu_to_be32(sess->fore_channel.rdma_attrs);
 	}
 
-	if (i915_gem_request_completed(req, false))
-		return 0;
+	p = xdr_reserve_space(xdr, 28);
+	if (!p)
+		return nfserr_resource;
+	*p++ = cpu_to_be32(0); /* headerpadsz */
+	*p++ = cpu_to_be32(sess->back_channel.maxreq_sz);
+	*p++ = cpu_to_be32(sess->back_channel.maxresp_sz);
+	*p++ = cpu_to_be32(sess->back_channel.maxresp_cached);
+	*p++ = cpu_to_be32(sess->back_channel.maxops);
+	*p++ = cpu_to_be32(sess->back_channel.maxreqs);
+	*p++ = cpu_to_be32(sess->back_channel.nr_rdma_attrs);
 
-	return -EAGAIN;
+	if (sess->back_channel.nr_rdma_attrs) {
+		p = xdr_reserve_space(xdr, 4);
+		if (!p)
+			return nfserr_resource;
+		*p++ = cpu_to_be32(sess->back_channel.rdma_attrs);
+	}
+	return 0;
+}
+
+static __be32
+nfsd4_encode_sequence(struct nfsd4_compoundres *resp, __be32 nfserr,
+		      struct nfsd4_sequence *seq)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (nfserr)
+		return nfserr;
+
+	p = xdr_reserve_space(xdr, NFS4_MAX_SESSIONID_LEN + 20);
+	if (!p)
+		return nfserr_resource;
+	p = xdr_encode_opaque_fixed(p, seq->sessionid.data,
+					NFS4_MAX_SESSIONID_LEN);
+	*p++ = cpu_to_be32(seq->seqid);
+	*p++ = cpu_to_be32(seq->slotid);
+	/* Note slotid's are numbered from zero: */
+	*p++ = cpu_to_be32(seq->maxslots - 1); /* sr_highest_slotid */
+	*p++ = cpu_to_be32(seq->maxslots - 1); /* sr_target_highest_slotid */
+	*p++ = cpu_to_be32(seq->status_flags);
+
+	resp->cstate.data_offset = xdr->buf->len; /* DRC cache data pointer */
+	return 0;
+}
+
+static __be32
+nfsd4_encode_test_stateid(struct nfsd4_compoundres *resp, __be32 nfserr,
+			  struct nfsd4_test_stateid *test_stateid)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	struct nfsd4_test_stateid_id *stateid, *next;
+	__be32 *p;
+
+	if (nfserr)
+		return nfserr;
+
+	p = xdr_reserve_space(xdr, 4 + (4 * test_stateid->ts_num_ids));
+	if (!p)
+		return nfserr_resource;
+	*p++ = htonl(test_stateid->ts_num_ids);
+
+	list_for_each_entry_safe(stateid, next, &test_stateid->ts_stateid_list, ts_id_list) {
+		*p++ = stateid->ts_id_status;
+	}
+
+	return nfserr;
+}
+
+#ifdef CONFIG_NFSD_PNFS
+static __be32
+nfsd4_encode_getdeviceinfo(struct nfsd4_compoundres *resp, __be32 nfserr,
+		struct nfsd4_getdeviceinfo *gdev)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	const struct nfsd4_layout_ops *ops;
+	u32 starting_len = xdr->buf->len, needed_len;
+	__be32 *p;
+
+	dprintk("%s: err %d\n", __func__, nfserr);
+	if (nfserr)
+		goto out;
+
+	nfserr = nfserr_resource;
+	p = xdr_reserve_space(xdr, 4);
+	if (!p)
+		goto out;
+
+	*p++ = cpu_to_be32(gdev->gd_layout_type);
+
+	/* If maxcount is 0 then just update notifications */
+	if (gdev->gd_maxcount != 0) {
+		ops = nfsd4_layout_ops[gdev->gd_layout_type];
+		nfserr = ops->encode_getdeviceinfo(xdr, gdev);
+		if (nfserr) {
+			/*
+			 * We don't bother to burden the layout drivers with
+			 * enforcing gd_maxcount, just tell the client to
+			 * come back with a bigger buffer if it's not enough.
+			 */
+			if (xdr->buf->len + 4 > gdev->gd_maxcount)
+				goto toosmall;
+			goto out;
+		}
+	}
+
+	nfserr = nfserr_resource;
+	if (gdev->gd_notify_types) {
+		p = xdr_reserve_space(xdr, 4 + 4);
+		if (!p)
+			goto out;
+		*p++ = cpu_to_be32(1);			/* bitmap length */
+		*p++ = cpu_to_be32(gdev->gd_notify_types);
+	} else {
+		p = xdr_reserve_space(xdr, 4);
+		if (!p)
+			goto out;
+		*p++ = 0;
+	}
+
+	nfserr = 0;
+out:
+	kfree(gdev->gd_device);
+	dprintk("%s: done: %d\n", __func__, be32_to_cpu(nfserr));
+	return nfserr;
+
+toosmall:
+	dprintk("%s: maxcount too small\n", __func__);
+	needed_len = xdr->buf->len + 4 /* notifications */;
+	xdr_truncate_encode(xdr, starting_len);
+	p = xdr_reserve_space(xdr, 4);
+	if (!p) {
+		nfserr = nfserr_resource;
+	} else {
+		*p++ = cpu_to_be32(needed_len);
+		nfserr = nfserr_toosmall;
+	}
+	goto out;
+}
+
+static __be32
+nfsd4_encode_layoutget(struct nfsd4_compoundres *resp, __be32 nfserr,
+		struct nfsd4_layoutget *lgp)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	const struct nfsd4_layout_ops *ops;
+	__be32 *p;
+
+	dprintk("%s: err %d\n", __func__, nfserr);
+	if (nfserr)
+		goto out;
+
+	nfserr = nfserr_resource;
+	p = xdr_reserve_space(xdr, 36 + sizeof(stateid_opaque_t));
+	if (!p)
+		goto out;
+
+	*p++ = cpu_to_be32(1);	/* we always set return-on-close */
+	*p++ = cpu_to_be32(lgp->lg_sid.si_generation);
+	p = xdr_encode_opaque_fixed(p, &lgp->lg_sid.si_opaque,
+				    sizeof(stateid_opaque_t));
+
+	*p++ = cpu_to_be32(1);	/* we always return a single layout */
+	p = xdr_encode_hyper(p, lgp->lg_seg.offset);
+	p = xdr_encode_hyper(p, lgp->lg_seg.length);
+	*p++ = cpu_to_be32(lgp->lg_seg.iomode);
+	*p++ = cpu_to_be32(lgp->lg_layout_type);
+
+	ops = nfsd4_layout_ops[lgp->lg_layout_type];
+	nfserr = ops->encode_layoutget(xdr, lgp);
+out:
+	kfree(lgp->lg_content);
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_layoutcommit(struct nfsd4_compoundres *resp, __be32 nfserr,
+			  struct nfsd4_layoutcommit *lcp)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (nfserr)
+		return nfserr;
+
+	p = xdr_reserve_space(xdr, 4);
+	if (!p)
+		return nfserr_resource;
+	*p++ = cpu_to_be32(lcp->lc_size_chg);
+	if (lcp->lc_size_chg) {
+		p = xdr_reserve_space(xdr, 8);
+		if (!p)
+			return nfserr_resource;
+		p = xdr_encode_hyper(p, lcp->lc_newsize);
+	}
+
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_encode_layoutreturn(struct nfsd4_compoundres *resp, __be32 nfserr,
+		struct nfsd4_layoutreturn *lrp)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	__be32 *p;
+
+	if (nfserr)
+		return nfserr;
+
+	p = xdr_reserve_space(xdr, 4);
+	if (!p)
+		return nfserr_resource;
+	*p++ = cpu_to_be32(lrp->lrs_present);
+	if (lrp->lrs_present)
+		return nfsd4_encode_stateid(xdr, &lrp->lr_sid);
+	return nfs_ok;
+}
+#endif /* CONFIG_NFSD_PNFS */
+
+static __be32
+nfsd4_encode_seek(struct nfsd4_compoundres *resp, __be32 nfserr,
+		  struct nfsd4_seek *seek)
+{
+	__be32 *p;
+
+	if (nfserr)
+		return nfserr;
+
+	p = xdr_reserve_space(&resp->xdr, 4 + 8);
+	*p++ = cpu_to_be32(seek->seek_eof);
+	p = xdr_encode_hyper(p, seek->seek_pos);
+
+	return nfserr;
+}
+
+static __be32
+nfsd4_encode_noop(struct nfsd4_compoundres *resp, __be32 nfserr, void *p)
+{
+	return nfserr;
+}
+
+typedef __be32(* nfsd4_enc)(struct nfsd4_compoundres *, __be32, void *);
+
+/*
+ * Note: nfsd4_enc_ops vector is shared for v4.0 and v4.1
+ * since we don't need to filter out obsolete ops as this is
+ * done in the decoding phase.
+ */
+static nfsd4_enc nfsd4_enc_ops[] = {
+	[OP_ACCESS]		= (nfsd4_enc)nfsd4_encode_access,
+	[OP_CLOSE]		= (nfsd4_enc)nfsd4_encode_close,
+	[OP_COMMIT]		= (nfsd4_enc)nfsd4_encode_commit,
+	[OP_CREATE]		= (nfsd4_enc)nfsd4_encode_create,
+	[OP_DELEGPURGE]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_DELEGRETURN]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_GETATTR]		= (nfsd4_enc)nfsd4_encode_getattr,
+	[OP_GETFH]		= (nfsd4_enc)nfsd4_encode_getfh,
+	[OP_LINK]		= (nfsd4_enc)nfsd4_encode_link,
+	[OP_LOCK]		= (nfsd4_enc)nfsd4_encode_lock,
+	[OP_LOCKT]		= (nfsd4_enc)nfsd4_encode_lockt,
+	[OP_LOCKU]		= (nfsd4_enc)nfsd4_encode_locku,
+	[OP_LOOKUP]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_LOOKUPP]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_NVERIFY]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_OPEN]		= (nfsd4_enc)nfsd4_encode_open,
+	[OP_OPENATTR]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_OPEN_CONFIRM]	= (nfsd4_enc)nfsd4_encode_open_confirm,
+	[OP_OPEN_DOWNGRADE]	= (nfsd4_enc)nfsd4_encode_open_downgrade,
+	[OP_PUTFH]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_PUTPUBFH]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_PUTROOTFH]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_READ]		= (nfsd4_enc)nfsd4_encode_read,
+	[OP_READDIR]		= (nfsd4_enc)nfsd4_encode_readdir,
+	[OP_READLINK]		= (nfsd4_enc)nfsd4_encode_readlink,
+	[OP_REMOVE]		= (nfsd4_enc)nfsd4_encode_remove,
+	[OP_RENAME]		= (nfsd4_enc)nfsd4_encode_rename,
+	[OP_RENEW]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_RESTOREFH]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_SAVEFH]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_SECINFO]		= (nfsd4_enc)nfsd4_encode_secinfo,
+	[OP_SETATTR]		= (nfsd4_enc)nfsd4_encode_setattr,
+	[OP_SETCLIENTID]	= (nfsd4_enc)nfsd4_encode_setclientid,
+	[OP_SETCLIENTID_CONFIRM] = (nfsd4_enc)nfsd4_encode_noop,
+	[OP_VERIFY]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_WRITE]		= (nfsd4_enc)nfsd4_encode_write,
+	[OP_RELEASE_LOCKOWNER]	= (nfsd4_enc)nfsd4_encode_noop,
+
+	/* NFSv4.1 operations */
+	[OP_BACKCHANNEL_CTL]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_BIND_CONN_TO_SESSION] = (nfsd4_enc)nfsd4_encode_bind_conn_to_session,
+	[OP_EXCHANGE_ID]	= (nfsd4_enc)nfsd4_encode_exchange_id,
+	[OP_CREATE_SESSION]	= (nfsd4_enc)nfsd4_encode_create_session,
+	[OP_DESTROY_SESSION]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_FREE_STATEID]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_GET_DIR_DELEGATION]	= (nfsd4_enc)nfsd4_encode_noop,
+#ifdef CONFIG_NFSD_PNFS
+	[OP_GETDEVICEINFO]	= (nfsd4_enc)nfsd4_encode_getdeviceinfo,
+	[OP_GETDEVICELIST]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_LAYOUTCOMMIT]	= (nfsd4_enc)nfsd4_encode_layoutcommit,
+	[OP_LAYOUTGET]		= (nfsd4_enc)nfsd4_encode_layoutget,
+	[OP_LAYOUTRETURN]	= (nfsd4_enc)nfsd4_encode_layoutreturn,
+#else
+	[OP_GETDEVICEINFO]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_GETDEVICELIST]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_LAYOUTCOMMIT]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_LAYOUTGET]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_LAYOUTRETURN]	= (nfsd4_enc)nfsd4_encode_noop,
+#endif
+	[OP_SECINFO_NO_NAME]	= (nfsd4_enc)nfsd4_encode_secinfo_no_name,
+	[OP_SEQUENCE]		= (nfsd4_enc)nfsd4_encode_sequence,
+	[OP_SET_SSV]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_TEST_STATEID]	= (nfsd4_enc)nfsd4_encode_test_stateid,
+	[OP_WANT_DELEGATION]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_DESTROY_CLIENTID]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_RECLAIM_COMPLETE]	= (nfsd4_enc)nfsd4_encode_noop,
+
+	/* NFSv4.2 operations */
+	[OP_ALLOCATE]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_COPY]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_COPY_NOTIFY]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_DEALLOCATE]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_IO_ADVISE]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_LAYOUTERROR]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_LAYOUTSTATS]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_OFFLOAD_CANCEL]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_OFFLOAD_STATUS]	= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_READ_PLUS]		= (nfsd4_enc)nfsd4_encode_noop,
+	[OP_SEEK]		= (nfsd4_enc)nfsd4_encode_seek,
+	[OP_WRITE_SAME]		= (nfsd4_enc)nfsd4_encode_noop,
+};
+
+/*
+ * Calculate whether we still have space to encode repsize bytes.
+ * There are two considerations:
+ *     - For NFS versions >=4.1, the size of the reply must stay within
+ *       session limits
+ *     - For all NFS versions, we must stay within limited preallocated
+ *       buffer space.
+ *
+ * This is called before the operation is processed, so can only provide
+ * an upper estimate.  For some nonidempotent operations (such as
+ * getattr), it's not necessarily a problem if that estimate is wrong,
+ * as we can fail it after processing without significant side effects.
+ */
+__be32 nfsd4_check_resp_size(struct nfsd4_compoundres *resp, u32 respsize)
+{
+	struct xdr_buf *buf = &resp->rqstp->rq_res;
+	struct nfsd4_slot *slot = resp->cstate.slot;
+
+	if (buf->len + respsize <= buf->buflen)
+		return nfs_ok;
+	if (!nfsd4_has_session(&resp->cstate))
+		return nfserr_resource;
+	if (slot->sl_flags & NFSD4_SLOT_CACHETHIS) {
+		WARN_ON_ONCE(1);
+		return nfserr_rep_too_big_to_cache;
+	}
+	return nfserr_rep_too_big;
+}
+
+void
+nfsd4_encode_operation(struct nfsd4_compoundres *resp, struct nfsd4_op *op)
+{
+	struct xdr_stream *xdr = &resp->xdr;
+	struct nfs4_stateowner *so = resp->cstate.replay_owner;
+	struct svc_rqst *rqstp = resp->rqstp;
+	int post_err_offset;
+	nfsd4_enc encoder;
+	__be32 *p;
+
+	p = xdr_reserve_space(xdr, 8);
+	if (!p) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	*p++ = cpu_to_be32(op->opnum);
+	post_err_offset = xdr->buf->len;
+
+	if (op->opnum == OP_ILLEGAL)
+		goto status;
+	BUG_ON(op->opnum < 0 || op->opnum >= ARRAY_SIZE(nfsd4_enc_ops) ||
+	       !nfsd4_enc_ops[op->opnum]);
+	encoder = nfsd4_enc_ops[op->opnum];
+	op->status = encoder(resp, op->status, &op->u);
+	xdr_commit_encode(xdr);
+
+	/* nfsd4_check_resp_size guarantees enough room for error status */
+	if (!op->status) {
+		int space_needed = 0;
+		if (!nfsd4_last_compound_op(rqstp))
+			space_needed = COMPOUND_ERR_SLACK_SPACE;
+		op->status = nfsd4_check_resp_size(resp, space_needed);
+	}
+	if (op->status == nfserr_resource && nfsd4_has_session(&resp->cstate)) {
+		struct nfsd4_slot *slot = resp->cstate.slot;
+
+		if (slot->sl_flags & NFSD4_SLOT_CACHETHIS)
+			op->status = nfserr_rep_too_big_to_cache;
+		else
+			op->status = nfserr_rep_too_big;
+	}
+	if (op->status == nfserr_resource ||
+	    op->status == nfserr_rep_too_big ||
+	    op->status == nfserr_rep_too_big_to_cache) {
+		/*
+		 * The operation may have already been encoded or
+		 * partially encoded.  No op returns anything additional
+		 * in the case of one of these three errors, so we can
+		 * just truncate back to after the status.  But it's a
+		 * bug if we had to do this on a non-idempotent op:
+		 */
+		warn_on_nonidempotent_op(op);
+		xdr_truncate_encode(xdr, post_err_offset);
+	}
+	if (so) {
+		int len = xdr->buf->len - post_err_offset;
+
+		so->so_replay.rp_status = op->status;
+		so->so_replay.rp_buflen = len;
+		read_bytes_from_xdr_buf(xdr->buf, post_err_offset,
+						so->so_replay.rp_buf, len);
+	}
+status:
+	/* Note that op->status is already in network byte order: */
+	write_bytes_to_xdr_buf(xdr->buf, post_err_offset - 4, &op->status, 4);
+}
+
+/* 
+ * Encode the reply stored in the stateowner reply cache 
+ * 
+ * XDR note: do not encode rp->rp_buflen: the buffer contains the
+ * previously sent already encoded operation.
+ */
+void
+nfsd4_encode_replay(struct xdr_stream *xdr, struct nfsd4_op *op)
+{
+	__be32 *p;
+	struct nfs4_replay *rp = op->replay;
+
+	BUG_ON(!rp);
+
+	p = xdr_reserve_space(xdr, 8 + rp->rp_buflen);
+	if (!p) {
+		WARN_ON_ONCE(1);
+		return;
+	}
+	*p++ = cpu_to_be32(op->opnum);
+	*p++ = rp->rp_status;  /* already xdr'ed */
+
+	p = xdr_encode_opaque_fixed(p, rp->rp_buf, rp->rp_buflen);
+}
+
+int
+nfs4svc_encode_voidres(struct svc_rqst *rqstp, __be32 *p, void *dummy)
+{
+        return xdr_ressize_check(rqstp, p);
+}
+
+int nfsd4_release_compoundargs(void *rq, __be32 *p, void *resp)
+{
+	struct svc_rqst *rqstp = rq;
+	struct nfsd4_compoundargs *args = rqstp->rq_argp;
+
+	if (args->ops != args->iops) {
+		kfree(args->ops);
+		args->ops = args->iops;
+	}
+	kfree(args->tmpp);
+	args->tmpp = NULL;
+	while (args->to_free) {
+		struct svcxdr_tmpbuf *tb = args->to_free;
+		args->to_free = tb->next;
+		kfree(tb);
+	}
+	return 1;
+}
+
+int
+nfs4svc_decode_compoundargs(struct svc_rqst *rqstp, __be32 *p, struct nfsd4_compoundargs *args)
+{
+	if (rqstp->rq_arg.head[0].iov_len % 4) {
+		/* client is nuts */
+		dprintk("%s: compound not properly padded! (peeraddr=%pISc xid=0x%x)",
+			__func__, svc_addr(rqstp), be32_to_cpu(rqstp->rq_xid));
+		return 0;
+	}
+	args->p = p;
+	args->end = rqstp->rq_arg.head[0].iov_base + rqstp->rq_arg.head[0].iov_len;
+	args->pagelist = rqstp->rq_arg.pages;
+	args->pagelen = rqstp->rq_arg.page_len;
+	args->tmpp = NULL;
+	args->to_free = NULL;
+	args->ops = args->iops;
+	args->rqstp = rqstp;
+
+	return !nfsd4_decode_compound(args);
+}
+
+int
+nfs4svc_encode_compoundres(struct svc_rqst *rqstp, __be32 *p, struct nfsd4_compoundres *resp)
+{
+	/*
+	 * All that remains is to write the tag and operation count...
+	 */
+	struct xdr_buf *buf = resp->xdr.buf;
+
+	WARN_ON_ONCE(buf->len != buf->head[0].iov_len + buf->page_len +
+				 buf->tail[0].iov_len);
+
+	rqstp->rq_next_page = resp->xdr.page_ptr + 1;
+
+	p = resp->tagp;
+	*p++ = htonl(resp->taglen);
+	memcpy(p, resp->tag, resp->taglen);
+	p += XDR_QUADLEN(resp->taglen);
+	*p++ = htonl(resp->opcnt);
+
+	nfsd4_sequence_done(resp);
+	return 1;
+}
+
+/*
+ * Local variables:
+ *  c-basic-offset: 8
+ * End:
+ */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * segment.c - NILFS segment constructor.
+ *
+ * Copyright (C) 2005-2008 Nippon Telegraph and Telephone Corporation.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ *
+ * Written by Ryusuke Konishi <ryusuke@osrg.net>
+ *
+ */
+
+#include <linux/pagemap.h>
+#include <linux/buffer_head.h>
+#include <linux/writeback.h>
+#include <linux/bitops.h>
+#include <linux/bio.h>
+#include <linux/completion.h>
+#include <linux/blkdev.h>
+#include <linux/backing-dev.h>
+#include <linux/freezer.h>
+#include <linux/kthread.h>
+#include <linux/crc32.h>
+#include <linux/pagevec.h>
+#include <linux/slab.h>
+#include "nilfs.h"
+#include "btnode.h"
+#include "page.h"
+#include "segment.h"
+#include "sufile.h"
+#include "cpfile.h"
+#include "ifile.h"
+#include "segbuf.h"
+
+
+/*
+ * Segment constructor
+ */
+#define SC_N_INODEVEC	16   /* Size of locally allocated inode vector */
+
+#define SC_MAX_SEGDELTA 64   /* Upper limit of the number of segments
+				appended in collection retry loop */
+
+/* Construction mode */
+enum {
+	SC_LSEG_SR = 1,	/* Make a logical segment having a super root */
+	SC_LSEG_DSYNC,	/* Flush data blocks of a given file and make
+			   a logical segment without a super root */
+	SC_FLUSH_FILE,	/* Flush data files, leads to segment writes without
+			   creating a checkpoint */
+	SC_FLUSH_DAT,	/* Flush DAT file. This also creates segments without
+			   a checkpoint */
+};
+
+/* Stage numbers of dirty block collection */
+enum {
+	NILFS_ST_INIT = 0,
+	NILFS_ST_GC,		/* Collecting dirty blocks for GC */
+	NILFS_ST_FILE,
+	NILFS_ST_IFILE,
+	NILFS_ST_CPFILE,
+	NILFS_ST_SUFILE,
+	NILFS_ST_DAT,
+	NILFS_ST_SR,		/* Super root */
+	NILFS_ST_DSYNC,		/* Data sync blocks */
+	NILFS_ST_DONE,
+};
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/nilfs2.h>
+
+/*
+ * nilfs_sc_cstage_inc(), nilfs_sc_cstage_set(), nilfs_sc_cstage_get() are
+ * wrapper functions of stage count (nilfs_sc_info->sc_stage.scnt). Users of
+ * the variable must use them because transition of stage count must involve
+ * trace events (trace_nilfs2_collection_stage_transition).
+ *
+ * nilfs_sc_cstage_get() isn't required for the above purpose because it doesn't
+ * produce tracepoint events. It is provided just for making the intention
+ * clear.
+ */
+static inline void nilfs_sc_cstage_inc(struct nilfs_sc_info *sci)
+{
+	sci->sc_stage.scnt++;
+	trace_nilfs2_collection_stage_transition(sci);
+}
+
+static inline void nilfs_sc_cstage_set(struct nilfs_sc_info *sci, int next_scnt)
+{
+	sci->sc_stage.scnt = next_scnt;
+	trace_nilfs2_collection_stage_transition(sci);
+}
+
+static inline int nilfs_sc_cstage_get(struct nilfs_sc_info *sci)
+{
+	return sci->sc_stage.scnt;
+}
+
+/* State flags of collection */
+#define NILFS_CF_NODE		0x0001	/* Collecting node blocks */
+#define NILFS_CF_IFILE_STARTED	0x0002	/* IFILE stage has started */
+#define NILFS_CF_SUFREED	0x0004	/* segment usages has been freed */
+#define NILFS_CF_HISTORY_MASK	(NILFS_CF_IFILE_STARTED | NILFS_CF_SUFREED)
+
+/* Operations depending on the construction mode and file type */
+struct nilfs_sc_operations {
+	int (*collect_data)(struct nilfs_sc_info *, struct buffer_head *,
+			    struct inode *);
+	int (*collect_node)(struct nilfs_sc_info *, struct buffer_head *,
+			    struct inode *);
+	int (*collect_bmap)(struct nilfs_sc_info *, struct buffer_head *,
+			    struct inode *);
+	void (*write_data_binfo)(struct nilfs_sc_info *,
+				 struct nilfs_segsum_pointer *,
+				 union nilfs_binfo *);
+	void (*write_node_binfo)(struct nilfs_sc_info *,
+				 struct nilfs_segsum_pointer *,
+				 union nilfs_binfo *);
+};
+
+/*
+ * Other definitions
+ */
+static void nilfs_segctor_start_timer(struct nilfs_sc_info *);
+static void nilfs_segctor_do_flush(struct nilfs_sc_info *, int);
+static void nilfs_segctor_do_immediate_flush(struct nilfs_sc_info *);
+static void nilfs_dispose_list(struct the_nilfs *, struct list_head *, int);
+
+#define nilfs_cnt32_gt(a, b)   \
+	(typecheck(__u32, a) && typecheck(__u32, b) && \
+	 ((__s32)(b) - (__s32)(a) < 0))
+#define nilfs_cnt32_ge(a, b)   \
+	(typecheck(__u32, a) && typecheck(__u32, b) && \
+	 ((__s32)(a) - (__s32)(b) >= 0))
+#define nilfs_cnt32_lt(a, b)  nilfs_cnt32_gt(b, a)
+#define nilfs_cnt32_le(a, b)  nilfs_cnt32_ge(b, a)
+
+static int nilfs_prepare_segment_lock(struct nilfs_transaction_info *ti)
+{
+	struct nilfs_transaction_info *cur_ti = current->journal_info;
+	void *save = NULL;
+
+	if (cur_ti) {
+		if (cur_ti->ti_magic == NILFS_TI_MAGIC)
+			return ++cur_ti->ti_count;
+		else {
+			/*
+			 * If journal_info field is occupied by other FS,
+			 * it is saved and will be restored on
+			 * nilfs_transaction_commit().
+			 */
+			printk(KERN_WARNING
+			       "NILFS warning: journal info from a different "
+			       "FS\n");
+			save = current->journal_info;
+		}
+	}
+	if (!ti) {
+		ti = kmem_cache_alloc(nilfs_transaction_cachep, GFP_NOFS);
+		if (!ti)
+			return -ENOMEM;
+		ti->ti_flags = NILFS_TI_DYNAMIC_ALLOC;
+	} else {
+		ti->ti_flags = 0;
+	}
+	ti->ti_count = 0;
+	ti->ti_save = save;
+	ti->ti_magic = NILFS_TI_MAGIC;
+	current->journal_info = ti;
+	return 0;
 }
 
 /**
- * __i915_wait_request - wait until execution of request has finished
- * @req: duh!
- * @reset_counter: reset sequence associated with the given request
- * @interruptible: do an interruptible wait (normally yes)
- * @timeout: in - how long to wait (NULL forever); out - how much time remaining
+ * nilfs_transaction_begin - start indivisible file operations.
+ * @sb: super block
+ * @ti: nilfs_transaction_info
+ * @vacancy_check: flags for vacancy rate checks
  *
- * Note: It is of utmost importance that the passed in seqno and reset_counter
- * values have been read by the caller in an smp safe manner. Where read-side
- * locks are involved, it is sufficient to read the reset_counter before
- * unlocking the lock that protects the seqno. For lockless tricks, the
- * reset_counter _must_ be read before, and an appropriate smp_rmb must be
- * inserted.
+ * nilfs_transaction_begin() acquires a reader/writer semaphore, called
+ * the segment semaphore, to make a segment construction and write tasks
+ * exclusive.  The function is used with nilfs_transaction_commit() in pairs.
+ * The region enclosed by these two functions can be nested.  To avoid a
+ * deadlock, the semaphore is only acquired or released in the outermost call.
  *
- * Returns 0 if the request was found within the alloted time. Else returns the
- * errno with remaining time filled in timeout argument.
+ * This function allocates a nilfs_transaction_info struct to keep context
+ * information on it.  It is initialized and hooked onto the current task in
+ * the outermost call.  If a pre-allocated struct is given to @ti, it is used
+ * instead; otherwise a new struct is assigned from a slab.
+ *
+ * When @vacancy_check flag is set, this function will check the amount of
+ * free space, and will wait for the GC to reclaim disk space if low capacity.
+ *
+ * Return Value: On success, 0 is returned. On error, one of the following
+ * negative error code is returned.
+ *
+ * %-ENOMEM - Insufficient memory available.
+ *
+ * %-ENOSPC - No space left on device
  */
-int __i915_wait_request(struct drm_i915_gem_request *req,
-			unsigned reset_counter,
-			bool interruptible,
-			s64 *timeout,
-			struct intel_rps_client *rps)
+int nilfs_transaction_begin(struct super_block *sb,
+			    struct nilfs_transaction_info *ti,
+			    int vacancy_check)
 {
-	struct intel_engine_cs *ring = i915_gem_request_get_ring(req);
-	struct drm_device *dev = ring->dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	const bool irq_test_in_progress =
-		ACCESS_ONCE(dev_priv->gpu_error.test_irq_rings) & intel_ring_flag(ring);
-	int state = interruptible ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE;
-	DEFINE_WAIT(wait);
-	unsigned long timeout_expire;
-	s64 before, now;
-	int ret;
+	struct the_nilfs *nilfs;
+	int ret = nilfs_prepare_segment_lock(ti);
+	struct nilfs_transaction_info *trace_ti;
 
-	WARN(!intel_irqs_enabled(dev_priv), "IRQs disabled");
+	if (unlikely(ret < 0))
+		return ret;
+	if (ret > 0) {
+		trace_ti = current->journal_info;
 
-	if (list_empty(&req->list))
+		trace_nilfs2_transaction_transition(sb, trace_ti,
+				    trace_ti->ti_count, trace_ti->ti_flags,
+				    TRACE_NILFS2_TRANSACTION_BEGIN);
 		return 0;
-
-	if (i915_gem_request_completed(req, true))
-		return 0;
-
-	timeout_expire = 0;
-	if (timeout) {
-		if (WARN_ON(*timeout < 0))
-			return -EINVAL;
-
-		if (*timeout == 0)
-			return -ETIME;
-
-		timeout_expire = jiffies + nsecs_to_jiffies_timeout(*timeout);
 	}
 
-	if (INTEL_INFO(dev_priv)->gen >= 6)
-		gen6_rps_boost(dev_priv, rps, req->emitted_jiffies);
+	sb_start_intwrite(sb);
 
-	/* Record current time in case interrupted by signal, or wedged */
-	trace_i915_gem_request_wait_begin(req);
-	before = ktime_get_raw_ns();
-
-	/* Optimistic spin for the next jiffie before touching IRQs */
-	ret = __i915_spin_request(req, state);
-	if (ret == 0)
-		goto out;
-
-	if (!irq_test_in_progress && WARN_ON(!ring->irq_get(ring))) {
-		ret = -ENODEV;
-		goto out;
+	nilfs = sb->s_fs_info;
+	down_read(&nilfs->ns_segctor_sem);
+	if (vacancy_check && nilfs_near_disk_full(nilfs)) {
+		up_read(&nilfs->ns_segctor_sem);
+		ret = -ENOSPC;
+		goto failed;
 	}
+
+	trace_ti = current->journal_info;
+	trace_nilfs2_transaction_transition(sb, trace_ti, trace_ti->ti_count,
+					    trace_ti->ti_flags,
+					    TRACE_NILFS2_TRANSACTION_BEGIN);
+	return 0;
+
+ failed:
+	ti = current->journal_info;
+	current->journal_info = ti->ti_save;
+	if (ti->ti_flags & NILFS_TI_DYNAMIC_ALLOC)
+		kmem_cache_free(nilfs_transaction_cachep, ti);
+	sb_end_intwrite(sb);
+	return ret;
+}
+
+/**
+ * nilfs_transaction_commit - commit indivisible file operations.
+ * @sb: super block
+ *
+ * nilfs_transaction_commit() releases the read semaphore which is
+ * acquired by nilfs_transaction_begin(). This is only performed
+ * in outermost call of this function.  If a commit flag is set,
+ * nilfs_transaction_commit() sets a timer to start the segment
+ * constructor.  If a sync flag is set, it starts construction
+ * directly.
+ */
+int nilfs_transaction_commit(struct super_block *sb)
+{
+	struct nilfs_transaction_info *ti = current->journal_info;
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	int err = 0;
+
+	BUG_ON(ti == NULL || ti->ti_magic != NILFS_TI_MAGIC);
+	ti->ti_flags |= NILFS_TI_COMMIT;
+	if (ti->ti_count > 0) {
+		ti->ti_count--;
+		trace_nilfs2_transaction_transition(sb, ti, ti->ti_count,
+			    ti->ti_flags, TRACE_NILFS2_TRANSACTION_COMMIT);
+		return 0;
+	}
+	if (nilfs->ns_writer) {
+		struct nilfs_sc_info *sci = nilfs->ns_writer;
+
+		if (ti->ti_flags & NILFS_TI_COMMIT)
+			nilfs_segctor_start_timer(sci);
+		if (atomic_read(&nilfs->ns_ndirtyblks) > sci->sc_watermark)
+			nilfs_segctor_do_flush(sci, 0);
+	}
+	up_read(&nilfs->ns_segctor_sem);
+	trace_nilfs2_transaction_transition(sb, ti, ti->ti_count,
+			    ti->ti_flags, TRACE_NILFS2_TRANSACTION_COMMIT);
+
+	current->journal_info = ti->ti_save;
+
+	if (ti->ti_flags & NILFS_TI_SYNC)
+		err = nilfs_construct_segment(sb);
+	if (ti->ti_flags & NILFS_TI_DYNAMIC_ALLOC)
+		kmem_cache_free(nilfs_transaction_cachep, ti);
+	sb_end_intwrite(sb);
+	return err;
+}
+
+void nilfs_transaction_abort(struct super_block *sb)
+{
+	struct nilfs_transaction_info *ti = current->journal_info;
+	struct the_nilfs *nilfs = sb->s_fs_info;
+
+	BUG_ON(ti == NULL || ti->ti_magic != NILFS_TI_MAGIC);
+	if (ti->ti_count > 0) {
+		ti->ti_count--;
+		trace_nilfs2_transaction_transition(sb, ti, ti->ti_count,
+			    ti->ti_flags, TRACE_NILFS2_TRANSACTION_ABORT);
+		return;
+	}
+	up_read(&nilfs->ns_segctor_sem);
+
+	trace_nilfs2_transaction_transition(sb, ti, ti->ti_count,
+		    ti->ti_flags, TRACE_NILFS2_TRANSACTION_ABORT);
+
+	current->journal_info = ti->ti_save;
+	if (ti->ti_flags & NILFS_TI_DYNAMIC_ALLOC)
+		kmem_cache_free(nilfs_transaction_cachep, ti);
+	sb_end_intwrite(sb);
+}
+
+void nilfs_relax_pressure_in_lock(struct super_block *sb)
+{
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	struct nilfs_sc_info *sci = nilfs->ns_writer;
+
+	if (sb->s_flags & MS_RDONLY || unlikely(!sci) || !sci->sc_flush_request)
+		return;
+
+	set_bit(NILFS_SC_PRIOR_FLUSH, &sci->sc_flags);
+	up_read(&nilfs->ns_segctor_sem);
+
+	down_write(&nilfs->ns_segctor_sem);
+	if (sci->sc_flush_request &&
+	    test_bit(NILFS_SC_PRIOR_FLUSH, &sci->sc_flags)) {
+		struct nilfs_transaction_info *ti = current->journal_info;
+
+		ti->ti_flags |= NILFS_TI_WRITER;
+		nilfs_segctor_do_immediate_flush(sci);
+		ti->ti_flags &= ~NILFS_TI_WRITER;
+	}
+	downgrade_write(&nilfs->ns_segctor_sem);
+}
+
+static void nilfs_transaction_lock(struct super_block *sb,
+				   struct nilfs_transaction_info *ti,
+				   int gcflag)
+{
+	struct nilfs_transaction_info *cur_ti = current->journal_info;
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	struct nilfs_sc_info *sci = nilfs->ns_writer;
+
+	WARN_ON(cur_ti);
+	ti->ti_flags = NILFS_TI_WRITER;
+	ti->ti_count = 0;
+	ti->ti_save = cur_ti;
+	ti->ti_magic = NILFS_TI_MAGIC;
+	current->journal_info = ti;
 
 	for (;;) {
-		struct timer_list timer;
+		trace_nilfs2_transaction_transition(sb, ti, ti->ti_count,
+			    ti->ti_flags, TRACE_NILFS2_TRANSACTION_TRYLOCK);
 
-		prepare_to_wait(&ring->irq_queue, &wait, state);
-
-		/* We need to check whether any gpu reset happened in between
-		 * the caller grabbing the seqno and now ... */
-		if (reset_counter != atomic_read(&dev_priv->gpu_error.reset_counter)) {
-			/* ... but upgrade the -EAGAIN to an -EIO if the gpu
-			 * is truely gone. */
-			ret = i915_gem_check_wedge(&dev_priv->gpu_error, interruptible);
-			if (ret == 0)
-				ret = -EAGAIN;
+		down_write(&nilfs->ns_segctor_sem);
+		if (!test_bit(NILFS_SC_PRIOR_FLUSH, &sci->sc_flags))
 			break;
-		}
 
-		if (i915_gem_request_completed(req, false)) {
-			ret = 0;
-			break;
-		}
+		nilfs_segctor_do_immediate_flush(sci);
 
-		if (signal_pending_state(state, current)) {
-			ret = -ERESTARTSYS;
-			break;
-		}
-
-		if (timeout && time_after_eq(jiffies, timeout_expire)) {
-			ret = -ETIME;
-			break;
-		}
-
-		timer.function = NULL;
-		if (timeout || missed_irq(dev_priv, ring)) {
-			unsigned long expire;
-
-			setup_timer_on_stack(&timer, fake_irq, (unsigned long)current);
-			expire = missed_irq(dev_priv, ring) ? jiffies + 1 : timeout_expire;
-			mod_timer(&timer, expire);
-		}
-
-		io_schedule();
-
-		if (timer.function) {
-			del_singleshot_timer_sync(&timer);
-			destroy_timer_on_stack(&timer);
-		}
+		up_write(&nilfs->ns_segctor_sem);
+		yield();
 	}
-	if (!irq_test_in_progress)
-		ring->irq_put(ring);
+	if (gcflag)
+		ti->ti_flags |= NILFS_TI_GC;
 
-	finish_wait(&ring->irq_queue, &wait);
+	trace_nilfs2_transaction_transition(sb, ti, ti->ti_count,
+			    ti->ti_flags, TRACE_NILFS2_TRANSACTION_LOCK);
+}
 
-out:
-	now = ktime_get_raw_ns();
-	trace_i915_gem_request_wait_end(req);
+static void nilfs_transaction_unlock(struct super_block *sb)
+{
+	struct nilfs_transaction_info *ti = current->journal_info;
+	struct the_nilfs *nilfs = sb->s_fs_info;
 
-	if (timeout) {
-		s64 tres = *timeout - (now - before);
+	BUG_ON(ti == NULL || ti->ti_magic != NILFS_TI_MAGIC);
+	BUG_ON(ti->ti_count > 0);
 
-		*timeout = tres < 0 ? 0 : tres;
+	up_write(&nilfs->ns_segctor_sem);
+	current->journal_info = ti->ti_save;
 
-		/*
-		 * Apparently ktime isn't accurate enough and occasionally has a
-		 * bit of mismatch in the jiffies<->nsecs<->ktime loop. So patch
-		 * things up to make the test happy. We allow up to 1 jiffy.
-		 *
-		 * This is a regrssion from the timespec->ktime conversion.
-		 */
-		if (ret == -ETIME && *timeout < jiffies_to_usecs(1)*1000)
-			*timeout = 0;
+	trace_nilfs2_transaction_transition(sb, ti, ti->ti_count,
+			    ti->ti_flags, TRACE_NILFS2_TRANSACTION_UNLOCK);
+}
+
+static void *nilfs_segctor_map_segsum_entry(struct nilfs_sc_info *sci,
+					    struct nilfs_segsum_pointer *ssp,
+					    unsigned bytes)
+{
+	struct nilfs_segment_buffer *segbuf = sci->sc_curseg;
+	unsigned blocksize = sci->sc_super->s_blocksize;
+	void *p;
+
+	if (unlikely(ssp->offset + bytes > blocksize)) {
+		ssp->offset = 0;
+		BUG_ON(NILFS_SEGBUF_BH_IS_LAST(ssp->bh,
+					       &segbuf->sb_segsum_buffers));
+		ssp->bh = NILFS_SEGBUF_NEXT_BH(ssp->bh);
 	}
-
-	return ret;
-}
-
-int i915_gem_request_add_to_client(struct drm_i915_gem_request *req,
-				   struct drm_file *file)
-{
-	struct drm_i915_private *dev_private;
-	struct drm_i915_file_private *file_priv;
-
-	WARN_ON(!req || !file || req->file_priv);
-
-	if (!req || !file)
-		return -EINVAL;
-
-	if (req->file_priv)
-		return -EINVAL;
-
-	dev_private = req->ring->dev->dev_private;
-	file_priv = file->driver_priv;
-
-	spin_lock(&file_priv->mm.lock);
-	req->file_priv = file_priv;
-	list_add_tail(&req->client_list, &file_priv->mm.request_list);
-	spin_unlock(&file_priv->mm.lock);
-
-	req->pid = get_pid(task_pid(current));
-
-	return 0;
-}
-
-static inline void
-i915_gem_request_remove_from_client(struct drm_i915_gem_request *request)
-{
-	struct drm_i915_file_private *file_priv = request->file_priv;
-
-	if (!file_priv)
-		return;
-
-	spin_lock(&file_priv->mm.lock);
-	list_del(&request->client_list);
-	request->file_priv = NULL;
-	spin_unlock(&file_priv->mm.lock);
-
-	put_pid(request->pid);
-	request->pid = NULL;
-}
-
-static void i915_gem_request_retire(struct drm_i915_gem_request *request)
-{
-	trace_i915_gem_request_retire(request);
-
-	/* We know the GPU must have read the request to have
-	 * sent us the seqno + interrupt, so use the position
-	 * of tail of the request to update the last known position
-	 * of the GPU head.
-	 *
-	 * Note this requires that we are always called in request
-	 * completion order.
-	 */
-	request->ringbuf->last_retired_head = request->postfix;
-
-	list_del_init(&request->list);
-	i915_gem_request_remove_from_client(request);
-
-	i915_gem_request_unreference(request);
-}
-
-static void
-__i915_gem_request_retire__upto(struct drm_i915_gem_request *req)
-{
-	struct intel_engine_cs *engine = req->ring;
-	struct drm_i915_gem_request *tmp;
-
-	lockdep_assert_held(&engine->dev->struct_mutex);
-
-	if (list_empty(&req->list))
-		return;
-
-	do {
-		tmp = list_first_entry(&engine->request_list,
-				       typeof(*tmp), list);
-
-		i915_gem_request_retire(tmp);
-	} while (tmp != req);
-
-	WARN_ON(i915_verify_lists(engine->dev));
+	p = ssp->bh->b_data + ssp->offset;
+	ssp->offset += bytes;
+	return p;
 }
 
 /**
- * Waits for a request to be signaled, and cleans up the
- * request and object lists appropriately for that event.
+ * nilfs_segctor_reset_segment_buffer - reset the current segment buffer
+ * @sci: nilfs_sc_info
  */
-int
-i915_wait_request(struct drm_i915_gem_request *req)
+static int nilfs_segctor_reset_segment_buffer(struct nilfs_sc_info *sci)
 {
-	struct drm_device *dev;
-	struct drm_i915_private *dev_priv;
-	bool interruptible;
-	int ret;
+	struct nilfs_segment_buffer *segbuf = sci->sc_curseg;
+	struct buffer_head *sumbh;
+	unsigned sumbytes;
+	unsigned flags = 0;
+	int err;
 
-	BUG_ON(req == NULL);
+	if (nilfs_doing_gc())
+		flags = NILFS_SS_GC;
+	err = nilfs_segbuf_reset(segbuf, flags, sci->sc_seg_ctime, sci->sc_cno);
+	if (unlikely(err))
+		return err;
 
-	dev = req->ring->dev;
-	dev_priv = dev->dev_private;
-	interruptible = dev_priv->mm.interruptible;
-
-	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
-
-	ret = i915_gem_check_wedge(&dev_priv->gpu_error, interruptible);
-	if (ret)
-		return ret;
-
-	ret = __i915_wait_request(req,
-				  atomic_read(&dev_priv->gpu_error.reset_counter),
-				  interruptible, NULL, NULL);
-	if (ret)
-		return ret;
-
-	__i915_gem_request_retire__upto(req);
+	sumbh = NILFS_SEGBUF_FIRST_BH(&segbuf->sb_segsum_buffers);
+	sumbytes = segbuf->sb_sum.sumbytes;
+	sci->sc_finfo_ptr.bh = sumbh;  sci->sc_finfo_ptr.offset = sumbytes;
+	sci->sc_binfo_ptr.bh = sumbh;  sci->sc_binfo_ptr.offset = sumbytes;
+	sci->sc_blk_cnt = sci->sc_datablk_cnt = 0;
 	return 0;
 }
 
 /**
- * Ensures that all rendering to the object has completed and the object is
- * safe to unbind from the GTT or access from the CPU.
- */
-int
-i915_gem_object_wait_rendering(struct drm_i915_gem_object *obj,
-			       bool readonly)
-{
-	int ret, i;
-
-	if (!obj->active)
-		return 0;
-
-	if (readonly) {
-		if (obj->last_write_req != NULL) {
-			ret = i915_wait_request(obj->last_write_req);
-			if (ret)
-				return ret;
-
-			i = obj->last_write_req->ring->id;
-			if (obj->last_read_req[i] == obj->last_write_req)
-				i915_gem_object_retire__read(obj, i);
-			else
-				i915_gem_object_retire__write(obj);
-		}
-	} else {
-		for (i = 0; i < I915_NUM_RINGS; i++) {
-			if (obj->last_read_req[i] == NULL)
-				continue;
-
-			ret = i915_wait_request(obj->last_read_req[i]);
-			if (ret)
-				return ret;
-
-			i915_gem_object_retire__read(obj, i);
-		}
-		RQ_BUG_ON(obj->active);
-	}
-
-	return 0;
-}
-
-static void
-i915_gem_object_retire_request(struct drm_i915_gem_object *obj,
-			       struct drm_i915_gem_request *req)
-{
-	int ring = req->ring->id;
-
-	if (obj->last_read_req[ring] == req)
-		i915_gem_object_retire__read(obj, ring);
-	else if (obj->last_write_req == req)
-		i915_gem_object_retire__write(obj);
-
-	__i915_gem_request_retire__upto(req);
-}
-
-/* A nonblocking variant of the above wait. This is a highly dangerous routine
- * as the object state may change during this call.
- */
-static __must_check int
-i915_gem_object_wait_rendering__nonblocking(struct drm_i915_gem_object *obj,
-					    struct intel_rps_client *rps,
-					    bool readonly)
-{
-	struct drm_device *dev = obj->base.dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct drm_i915_gem_request *requests[I915_NUM_RINGS];
-	unsigned reset_counter;
-	int ret, i, n = 0;
-
-	BUG_ON(!mutex_is_locked(&dev->struct_mutex));
-	BUG_ON(!dev_priv->mm.interruptible);
-
-	if (!obj->active)
-		return 0;
-
-	ret = i915_gem_check_wedge(&dev_priv->gpu_error, true);
-	if (ret)
-		return ret;
-
-	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
-
-	if (readonly) {
-		struct drm_i915_gem_request *req;
-
-		req = obj->last_write_req;
-		if (req == NULL)
-			return 0;
-
-		requests[n++] = i915_gem_request_reference(req);
-	} else {
-		for (i = 0; i < I915_NUM_RINGS; i++) {
-			struct drm_i915_gem_request *req;
-
-			req = obj->last_read_req[i];
-			if (req == NULL)
-				continue;
-
-			requests[n++] = i915_gem_request_reference(req);
-		}
-	}
-
-	mutex_unlock(&dev->struct_mutex);
-	for (i = 0; ret == 0 && i < n; i++)
-		ret = __i915_wait_request(requests[i], reset_counter, true,
-					  NULL, rps);
-	mutex_lock(&dev->struct_mutex);
-
-	for (i = 0; i < n; i++) {
-		if (ret == 0)
-			i915_gem_object_retire_request(obj, requests[i]);
-		i915_gem_request_unreference(requests[i]);
-	}
-
-	return ret;
-}
-
-static struct intel_rps_client *to_rps_client(struct drm_file *file)
-{
-	struct drm_i915_file_private *fpriv = file->driver_priv;
-	return &fpriv->rps;
-}
-
-/**
- * Called when user space prepares to use an object with the CPU, either
- * through the mmap ioctl's mapping or a GTT mapping.
- */
-int
-i915_gem_set_domain_ioctl(struct drm_device *dev, void *data,
-			  struct drm_file *file)
-{
-	struct drm_i915_gem_set_domain *args = data;
-	struct drm_i915_gem_object *obj;
-	uint32_t read_domains = args->read_domains;
-	uint32_t write_domain = args->write_domain;
-	int ret;
-
-	/* Only handle setting domains to types used by the CPU. */
-	if (write_domain & I915_GEM_GPU_DOMAINS)
-		return -EINVAL;
-
-	if (read_domains & I915_GEM_GPU_DOMAINS)
-		return -EINVAL;
-
-	/* Having something in the write domain implies it's in the read
-	 * domain, and only that read domain.  Enforce that in the request.
-	 */
-	if (write_domain != 0 && read_domains != write_domain)
-		return -EINVAL;
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		return ret;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->handle));
-	if (&obj->base == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-
-	/* Try to flush the object off the GPU without holding the lock.
-	 * We will repeat the flush holding the lock in the normal manner
-	 * to catch cases where we are gazumped.
-	 */
-	ret = i915_gem_object_wait_rendering__nonblocking(obj,
-							  to_rps_client(file),
-							  !write_domain);
-	if (ret)
-		goto unref;
-
-	if (read_domains & I915_GEM_DOMAIN_GTT)
-		ret = i915_gem_object_set_to_gtt_domain(obj, write_domain != 0);
-	else
-		ret = i915_gem_object_set_to_cpu_domain(obj, write_domain != 0);
-
-	if (write_domain != 0)
-		intel_fb_obj_invalidate(obj,
-					write_domain == I915_GEM_DOMAIN_GTT ?
-					ORIGIN_GTT : ORIGIN_CPU);
-
-unref:
-	drm_gem_object_unreference(&obj->base);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-	return ret;
-}
-
-/**
- * Called when user space has done writes to this buffer
- */
-int
-i915_gem_sw_finish_ioctl(struct drm_device *dev, void *data,
-			 struct drm_file *file)
-{
-	struct drm_i915_gem_sw_finish *args = data;
-	struct drm_i915_gem_object *obj;
-	int ret = 0;
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		return ret;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->handle));
-	if (&obj->base == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-
-	/* Pinned buffers may be scanout, so flush the cache */
-	if (obj->pin_display)
-		i915_gem_object_flush_cpu_write_domain(obj);
-
-	drm_gem_object_unreference(&obj->base);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-	return ret;
-}
-
-/**
- * Maps the contents of an object, returning the address it is mapped
- * into.
+ * nilfs_segctor_zeropad_segsum - zero pad the rest of the segment summary area
+ * @sci: segment constructor object
  *
- * While the mapping holds a reference on the contents of the object, it doesn't
- * imply a ref on the object itself.
- *
- * IMPORTANT:
- *
- * DRM driver writers who look a this function as an example for how to do GEM
- * mmap support, please don't implement mmap support like here. The modern way
- * to implement DRM mmap support is with an mmap offset ioctl (like
- * i915_gem_mmap_gtt) and then using the mmap syscall on the DRM fd directly.
- * That way debug tooling like valgrind will understand what's going on, hiding
- * the mmap call in a driver private ioctl will break that. The i915 driver only
- * does cpu mmaps this way because we didn't know better.
+ * nilfs_segctor_zeropad_segsum() zero-fills unallocated space at the end of
+ * the current segment summary block.
  */
-int
-i915_gem_mmap_ioctl(struct drm_device *dev, void *data,
-		    struct drm_file *file)
+static void nilfs_segctor_zeropad_segsum(struct nilfs_sc_info *sci)
 {
-	struct drm_i915_gem_mmap *args = data;
-	struct drm_gem_object *obj;
-	unsigned long addr;
+	struct nilfs_segsum_pointer *ssp;
 
-	if (args->flags & ~(I915_MMAP_WC))
-		return -EINVAL;
+	ssp = sci->sc_blk_cnt > 0 ? &sci->sc_binfo_ptr : &sci->sc_finfo_ptr;
+	if (ssp->offset < ssp->bh->b_size)
+		memset(ssp->bh->b_data + ssp->offset, 0,
+		       ssp->bh->b_size - ssp->offset);
+}
 
-	if (args->flags & I915_MMAP_WC && !cpu_has_pat)
-		return -ENODEV;
+static int nilfs_segctor_feed_segment(struct nilfs_sc_info *sci)
+{
+	sci->sc_nblk_this_inc += sci->sc_curseg->sb_sum.nblocks;
+	if (NILFS_SEGBUF_IS_LAST(sci->sc_curseg, &sci->sc_segbufs))
+		return -E2BIG; /* The current segment is filled up
+				  (internal code) */
+	nilfs_segctor_zeropad_segsum(sci);
+	sci->sc_curseg = NILFS_NEXT_SEGBUF(sci->sc_curseg);
+	return nilfs_segctor_reset_segment_buffer(sci);
+}
 
-	obj = drm_gem_object_lookup(dev, file, args->handle);
-	if (obj == NULL)
-		return -ENOENT;
+static int nilfs_segctor_add_super_root(struct nilfs_sc_info *sci)
+{
+	struct nilfs_segment_buffer *segbuf = sci->sc_curseg;
+	int err;
 
-	/* prime objects have no backing filp to GEM mmap
-	 * pages from.
-	 */
-	if (!obj->filp) {
-		drm_gem_object_unreference_unlocked(obj);
-		return -EINVAL;
+	if (segbuf->sb_sum.nblocks >= segbuf->sb_rest_blocks) {
+		err = nilfs_segctor_feed_segment(sci);
+		if (err)
+			return err;
+		segbuf = sci->sc_curseg;
 	}
-
-	addr = vm_mmap(obj->filp, 0, args->size,
-		       PROT_READ | PROT_WRITE, MAP_SHARED,
-		       args->offset);
-	if (args->flags & I915_MMAP_WC) {
-		struct mm_struct *mm = current->mm;
-		struct vm_area_struct *vma;
-
-		down_write(&mm->mmap_sem);
-		vma = find_vma(mm, addr);
-		if (vma)
-			vma->vm_page_prot =
-				pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
-		else
-			addr = -ENOMEM;
-		up_write(&mm->mmap_sem);
-	}
-	drm_gem_object_unreference_unlocked(obj);
-	if (IS_ERR((void *)addr))
-		return addr;
-
-	args->addr_ptr = (uint64_t) addr;
-
-	return 0;
-}
-
-/**
- * i915_gem_fault - fault a page into the GTT
- * @vma: VMA in question
- * @vmf: fault info
- *
- * The fault handler is set up by drm_gem_mmap() when a object is GTT mapped
- * from userspace.  The fault handler takes care of binding the object to
- * the GTT (if needed), allocating and programming a fence register (again,
- * only if needed based on whether the old reg is still valid or the object
- * is tiled) and inserting a new PTE into the faulting process.
- *
- * Note that the faulting process may involve evicting existing objects
- * from the GTT and/or fence registers to make room.  So performance may
- * suffer if the GTT working set is large or there are few fence registers
- * left.
- */
-int i915_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
-{
-	struct drm_i915_gem_object *obj = to_intel_bo(vma->vm_private_data);
-	struct drm_device *dev = obj->base.dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct i915_ggtt_view view = i915_ggtt_view_normal;
-	pgoff_t page_offset;
-	unsigned long pfn;
-	int ret = 0;
-	bool write = !!(vmf->flags & FAULT_FLAG_WRITE);
-
-	intel_runtime_pm_get(dev_priv);
-
-	/* We don't use vmf->pgoff since that has the fake offset */
-	page_offset = ((unsigned long)vmf->virtual_address - vma->vm_start) >>
-		PAGE_SHIFT;
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		goto out;
-
-	trace_i915_gem_object_fault(obj, page_offset, true, write);
-
-	/* Try to flush the object off the GPU first without holding the lock.
-	 * Upon reacquiring the lock, we will perform our sanity checks and then
-	 * repeat the flush holding the lock in the normal manner to catch cases
-	 * where we are gazumped.
-	 */
-	ret = i915_gem_object_wait_rendering__nonblocking(obj, NULL, !write);
-	if (ret)
-		goto unlock;
-
-	/* Access to snoopable pages through the GTT is incoherent. */
-	if (obj->cache_level != I915_CACHE_NONE && !HAS_LLC(dev)) {
-		ret = -EFAULT;
-		goto unlock;
-	}
-
-	/* Use a partial view if the object is bigger than the aperture. */
-	if (obj->base.size >= dev_priv->gtt.mappable_end &&
-	    obj->tiling_mode == I915_TILING_NONE) {
-		static const unsigned int chunk_size = 256; // 1 MiB
-
-		memset(&view, 0, sizeof(view));
-		view.type = I915_GGTT_VIEW_PARTIAL;
-		view.params.partial.offset = rounddown(page_offset, chunk_size);
-		view.params.partial.size =
-			min_t(unsigned int,
-			      chunk_size,
-			      (vma->vm_end - vma->vm_start)/PAGE_SIZE -
-			      view.params.partial.offset);
-	}
-
-	/* Now pin it into the GTT if needed */
-	ret = i915_gem_object_ggtt_pin(obj, &view, 0, PIN_MAPPABLE);
-	if (ret)
-		goto unlock;
-
-	ret = i915_gem_object_set_to_gtt_domain(obj, write);
-	if (ret)
-		goto unpin;
-
-	ret = i915_gem_object_get_fence(obj);
-	if (ret)
-		goto unpin;
-
-	/* Finally, remap it using the new GTT offset */
-	pfn = dev_priv->gtt.mappable_base +
-		i915_gem_obj_ggtt_offset_view(obj, &view);
-	pfn >>= PAGE_SHIFT;
-
-	if (unlikely(view.type == I915_GGTT_VIEW_PARTIAL)) {
-		/* Overriding existing pages in partial view does not cause
-		 * us any trouble as TLBs are still valid because the fault
-		 * is due to userspace losing part of the mapping or never
-		 * having accessed it before (at this partials' range).
-		 */
-		unsigned long base = vma->vm_start +
-				     (view.params.partial.offset << PAGE_SHIFT);
-		unsigned int i;
-
-		for (i = 0; i < view.params.partial.size; i++) {
-			ret = vm_insert_pfn(vma, base + i * PAGE_SIZE, pfn + i);
-			if (ret)
-				break;
-		}
-
-		obj->fault_mappable = true;
-	} else {
-		if (!obj->fault_mappable) {
-			unsigned long size = min_t(unsigned long,
-						   vma->vm_end - vma->vm_start,
-						   obj->base.size);
-			int i;
-
-			for (i = 0; i < size >> PAGE_SHIFT; i++) {
-				ret = vm_insert_pfn(vma,
-						    (unsigned long)vma->vm_start + i * PAGE_SIZE,
-						    pfn + i);
-				if (ret)
-					break;
-			}
-
-			obj->fault_mappable = true;
-		} else
-			ret = vm_insert_pfn(vma,
-					    (unsigned long)vmf->virtual_address,
-					    pfn + page_offset);
-	}
-unpin:
-	i915_gem_object_ggtt_unpin_view(obj, &view);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-out:
-	switch (ret) {
-	case -EIO:
-		/*
-		 * We eat errors when the gpu is terminally wedged to avoid
-		 * userspace unduly crashing (gl has no provisions for mmaps to
-		 * fail). But any other -EIO isn't ours (e.g. swap in failure)
-		 * and so needs to be reported.
-		 */
-		if (!i915_terminally_wedged(&dev_priv->gpu_error)) {
-			ret = VM_FAULT_SIGBUS;
-			break;
-		}
-	case -EAGAIN:
-		/*
-		 * EAGAIN means the gpu is hung and we'll wait for the error
-		 * handler to reset everything when re-faulting in
-		 * i915_mutex_lock_interruptible.
-		 */
-	case 0:
-	case -ERESTARTSYS:
-	case -EINTR:
-	case -EBUSY:
-		/*
-		 * EBUSY is ok: this just means that another thread
-		 * already did the job.
-		 */
-		ret = VM_FAULT_NOPAGE;
-		break;
-	case -ENOMEM:
-		ret = VM_FAULT_OOM;
-		break;
-	case -ENOSPC:
-	case -EFAULT:
-		ret = VM_FAULT_SIGBUS;
-		break;
-	default:
-		WARN_ONCE(ret, "unhandled error in i915_gem_fault: %i\n", ret);
-		ret = VM_FAULT_SIGBUS;
-		break;
-	}
-
-	intel_runtime_pm_put(dev_priv);
-	return ret;
-}
-
-/**
- * i915_gem_release_mmap - remove physical page mappings
- * @obj: obj in question
- *
- * Preserve the reservation of the mmapping with the DRM core code, but
- * relinquish ownership of the pages back to the system.
- *
- * It is vital that we remove the page mapping if we have mapped a tiled
- * object through the GTT and then lose the fence register due to
- * resource pressure. Similarly if the object has been moved out of the
- * aperture, than pages mapped into userspace must be revoked. Removing the
- * mapping will then trigger a page fault on the next user access, allowing
- * fixup by i915_gem_fault().
- */
-void
-i915_gem_release_mmap(struct drm_i915_gem_object *obj)
-{
-	if (!obj->fault_mappable)
-		return;
-
-	drm_vma_node_unmap(&obj->base.vma_node,
-			   obj->base.dev->anon_inode->i_mapping);
-	obj->fault_mappable = false;
-}
-
-void
-i915_gem_release_all_mmaps(struct drm_i915_private *dev_priv)
-{
-	struct drm_i915_gem_object *obj;
-
-	list_for_each_entry(obj, &dev_priv->mm.bound_list, global_list)
-		i915_gem_release_mmap(obj);
-}
-
-uint32_t
-i915_gem_get_gtt_size(struct drm_device *dev, uint32_t size, int tiling_mode)
-{
-	uint32_t gtt_size;
-
-	if (INTEL_INFO(dev)->gen >= 4 ||
-	    tiling_mode == I915_TILING_NONE)
-		return size;
-
-	/* Previous chips need a power-of-two fence region when tiling */
-	if (INTEL_INFO(dev)->gen == 3)
-		gtt_size = 1024*1024;
-	else
-		gtt_size = 512*1024;
-
-	while (gtt_size < size)
-		gtt_size <<= 1;
-
-	return gtt_size;
-}
-
-/**
- * i915_gem_get_gtt_alignment - return required GTT alignment for an object
- * @obj: object to check
- *
- * Return the required GTT alignment for an object, taking into account
- * potential fence register mapping.
- */
-uint32_t
-i915_gem_get_gtt_alignment(struct drm_device *dev, uint32_t size,
-			   int tiling_mode, bool fenced)
-{
-	/*
-	 * Minimum alignment is 4k (GTT page size), but might be greater
-	 * if a fence register is needed for the object.
-	 */
-	if (INTEL_INFO(dev)->gen >= 4 || (!fenced && IS_G33(dev)) ||
-	    tiling_mode == I915_TILING_NONE)
-		return 4096;
-
-	/*
-	 * Previous chips need to be aligned to the size of the smallest
-	 * fence register that can contain the object.
-	 */
-	return i915_gem_get_gtt_size(dev, size, tiling_mode);
-}
-
-static int i915_gem_object_create_mmap_offset(struct drm_i915_gem_object *obj)
-{
-	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
-	int ret;
-
-	if (drm_vma_node_has_offset(&obj->base.vma_node))
-		return 0;
-
-	dev_priv->mm.shrinker_no_lock_stealing = true;
-
-	ret = drm_gem_create_mmap_offset(&obj->base);
-	if (ret != -ENOSPC)
-		goto out;
-
-	/* Badly fragmented mmap space? The only way we can recover
-	 * space is by destroying unwanted objects. We can't randomly release
-	 * mmap_offsets as userspace expects them to be persistent for the
-	 * lifetime of the objects. The closest we can is to release the
-	 * offsets on purgeable objects by truncating it and marking it purged,
-	 * which prevents userspace from ever using that object again.
-	 */
-	i915_gem_shrink(dev_priv,
-			obj->base.size >> PAGE_SHIFT,
-			I915_SHRINK_BOUND |
-			I915_SHRINK_UNBOUND |
-			I915_SHRINK_PURGEABLE);
-	ret = drm_gem_create_mmap_offset(&obj->base);
-	if (ret != -ENOSPC)
-		goto out;
-
-	i915_gem_shrink_all(dev_priv);
-	ret = drm_gem_create_mmap_offset(&obj->base);
-out:
-	dev_priv->mm.shrinker_no_lock_stealing = false;
-
-	return ret;
-}
-
-static void i915_gem_object_free_mmap_offset(struct drm_i915_gem_object *obj)
-{
-	drm_gem_free_mmap_offset(&obj->base);
-}
-
-int
-i915_gem_mmap_gtt(struct drm_file *file,
-		  struct drm_device *dev,
-		  uint32_t handle,
-		  uint64_t *offset)
-{
-	struct drm_i915_gem_object *obj;
-	int ret;
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		return ret;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, handle));
-	if (&obj->base == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-
-	if (obj->madv != I915_MADV_WILLNEED) {
-		DRM_DEBUG("Attempting to mmap a purgeable buffer\n");
-		ret = -EFAULT;
-		goto out;
-	}
-
-	ret = i915_gem_object_create_mmap_offset(obj);
-	if (ret)
-		goto out;
-
-	*offset = drm_vma_node_offset_addr(&obj->base.vma_node);
-
-out:
-	drm_gem_object_unreference(&obj->base);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-	return ret;
-}
-
-/**
- * i915_gem_mmap_gtt_ioctl - prepare an object for GTT mmap'ing
- * @dev: DRM device
- * @data: GTT mapping ioctl data
- * @file: GEM object info
- *
- * Simply returns the fake offset to userspace so it can mmap it.
- * The mmap call will end up in drm_gem_mmap(), which will set things
- * up so we can get faults in the handler above.
- *
- * The fault handler will take care of binding the object into the GTT
- * (since it may have been evicted to make room for something), allocating
- * a fence register, and mapping the appropriate aperture address into
- * userspace.
- */
-int
-i915_gem_mmap_gtt_ioctl(struct drm_device *dev, void *data,
-			struct drm_file *file)
-{
-	struct drm_i915_gem_mmap_gtt *args = data;
-
-	return i915_gem_mmap_gtt(file, dev, args->handle, &args->offset);
-}
-
-/* Immediately discard the backing storage */
-static void
-i915_gem_object_truncate(struct drm_i915_gem_object *obj)
-{
-	i915_gem_object_free_mmap_offset(obj);
-
-	if (obj->base.filp == NULL)
-		return;
-
-	/* Our goal here is to return as much of the memory as
-	 * is possible back to the system as we are called from OOM.
-	 * To do this we must instruct the shmfs to drop all of its
-	 * backing pages, *now*.
-	 */
-	shmem_truncate_range(file_inode(obj->base.filp), 0, (loff_t)-1);
-	obj->madv = __I915_MADV_PURGED;
-}
-
-/* Try to discard unwanted pages */
-static void
-i915_gem_object_invalidate(struct drm_i915_gem_object *obj)
-{
-	struct address_space *mapping;
-
-	switch (obj->madv) {
-	case I915_MADV_DONTNEED:
-		i915_gem_object_truncate(obj);
-	case __I915_MADV_PURGED:
-		return;
-	}
-
-	if (obj->base.filp == NULL)
-		return;
-
-	mapping = file_inode(obj->base.filp)->i_mapping,
-	invalidate_mapping_pages(mapping, 0, (loff_t)-1);
-}
-
-static void
-i915_gem_object_put_pages_gtt(struct drm_i915_gem_object *obj)
-{
-	struct sg_page_iter sg_iter;
-	int ret;
-
-	BUG_ON(obj->madv == __I915_MADV_PURGED);
-
-	ret = i915_gem_object_set_to_cpu_domain(obj, true);
-	if (ret) {
-		/* In the event of a disaster, abandon all caches and
-		 * hope for the best.
-		 */
-		WARN_ON(ret != -EIO);
-		i915_gem_clflush_object(obj, true);
-		obj->base.read_domains = obj->base.write_domain = I915_GEM_DOMAIN_CPU;
-	}
-
-	i915_gem_gtt_finish_object(obj);
-
-	if (i915_gem_object_needs_bit17_swizzle(obj))
-		i915_gem_object_save_bit_17_swizzle(obj);
-
-	if (obj->madv == I915_MADV_DONTNEED)
-		obj->dirty = 0;
-
-	for_each_sg_page(obj->pages->sgl, &sg_iter, obj->pages->nents, 0) {
-		struct page *page = sg_page_iter_page(&sg_iter);
-
-		if (obj->dirty)
-			set_page_dirty(page);
-
-		if (obj->madv == I915_MADV_WILLNEED)
-			mark_page_accessed(page);
-
-		page_cache_release(page);
-	}
-	obj->dirty = 0;
-
-	sg_free_table(obj->pages);
-	kfree(obj->pages);
-}
-
-#define _wait_for_us(COND, US, W) ({ \
-	unsigned long timeout__ = jiffies + usecs_to_jiffies(US) + 1;   \
-	int ret__;                                                      \
-	for (;;) {                                                      \
-		bool expired__ = time_after(jiffies, timeout__);        \
-		if (COND) {                                             \
-			ret__ = 0;                                      \
-			break;                                          \
-		}                                                       \
-		if (expired__) {                                        \
-			ret__ = -ETIMEDOUT;                             \
-			break;                                          \
-		}                                                       \
-		usleep_range((W), (W)*2);                               \
-	}                                                               \
-	ret__;                                                          \
-})
-
-static int
-__intel_wait_for_register_fw(struct drm_i915_private *dev_priv,
-			     u32 reg,
-			     const u32 mask,
-			     const u32 value,
-			     const unsigned int timeout_us,
-			     const unsigned int timeout_ms)
-{
-#define done ((I915_READ_FW(reg) & mask) == value)
-	int ret = _wait_for_us(done, timeout_us, 2);
-	if (ret)
-		ret = wait_for(done, timeout_ms);
-	return ret;
-#undef done
-}
-
-static void invalidate_tlbs(struct drm_i915_private *dev_priv)
-{
-	static const u32 gen8_regs[] = {
-		[RCS]  = GEN8_RTCR,
-		[VCS]  = GEN8_M1TCR,
-		[VCS2] = GEN8_M2TCR,
-		[VECS] = GEN8_VTCR,
-		[BCS]  = GEN8_BTCR,
-	};
-	enum intel_ring_id id;
-
-	if (INTEL_INFO(dev_priv)->gen < 8)
-		return;
-
-	mutex_lock(&dev_priv->tlb_invalidate_lock);
-	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
-
-	for (id = 0; id < I915_NUM_RINGS; id++) {
-		struct intel_engine_cs *engine = &dev_priv->ring[id];
-		/*
-		 * HW architecture suggest typical invalidation time at 40us,
-		 * with pessimistic cases up to 100us and a recommendation to
-		 * cap at 1ms. We go a bit higher just in case.
-		 */
-		const unsigned int timeout_us = 100;
-		const unsigned int timeout_ms = 4;
-
-		if (!intel_ring_initialized(engine))
-			continue;
-
-		if (WARN_ON_ONCE(id >= ARRAY_SIZE(gen8_regs) || !gen8_regs[id]))
-			continue;
-
-		I915_WRITE_FW(gen8_regs[id], 1);
-		if (__intel_wait_for_register_fw(dev_priv,
-						 gen8_regs[id], 1, 0,
-						 timeout_us, timeout_ms))
-			DRM_ERROR_RATELIMITED("%s TLB invalidation did not complete in %ums!\n",
-					      engine->name, timeout_ms);
-	}
-
-	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
-	mutex_unlock(&dev_priv->tlb_invalidate_lock);
-}
-
-int
-i915_gem_object_put_pages(struct drm_i915_gem_object *obj)
-{
-	const struct drm_i915_gem_object_ops *ops = obj->ops;
-
-	if (obj->pages == NULL)
-		return 0;
-
-	if (obj->pages_pin_count)
-		return -EBUSY;
-
-	BUG_ON(i915_gem_obj_bound_any(obj));
-
-	/* ->put_pages might need to allocate memory for the bit17 swizzle
-	 * array, hence protect them from being reaped by removing them from gtt
-	 * lists early. */
-	list_del(&obj->global_list);
-
-	if (test_and_clear_bit(I915_BO_WAS_BOUND_BIT, &obj->flags)) {
-		struct drm_i915_private *i915 = to_i915(obj->base.dev);
-
-		intel_runtime_pm_get(i915);
-		invalidate_tlbs(i915);
-		intel_runtime_pm_put(i915);
-	}
-
-	ops->put_pages(obj);
-	obj->pages = NULL;
-
-	i915_gem_object_invalidate(obj);
-
-	return 0;
-}
-
-static int
-i915_gem_object_get_pages_gtt(struct drm_i915_gem_object *obj)
-{
-	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
-	int page_count, i;
-	struct address_space *mapping;
-	struct sg_table *st;
-	struct scatterlist *sg;
-	struct sg_page_iter sg_iter;
-	struct page *page;
-	unsigned long last_pfn = 0;	/* suppress gcc warning */
-	int ret;
-	gfp_t gfp;
-
-	/* Assert that the object is not currently in any GPU domain. As it
-	 * wasn't in the GTT, there shouldn't be any way it could have been in
-	 * a GPU cache
-	 */
-	BUG_ON(obj->base.read_domains & I915_GEM_GPU_DOMAINS);
-	BUG_ON(obj->base.write_domain & I915_GEM_GPU_DOMAINS);
-
-	st = kmalloc(sizeof(*st), GFP_KERNEL);
-	if (st == NULL)
-		return -ENOMEM;
-
-	page_count = obj->base.size / PAGE_SIZE;
-	if (sg_alloc_table(st, page_count, GFP_KERNEL)) {
-		kfree(st);
-		return -ENOMEM;
-	}
-
-	/* Get the list of pages out of our struct file.  They'll be pinned
-	 * at this point until we release them.
-	 *
-	 * Fail silently without starting the shrinker
-	 */
-	mapping = file_inode(obj->base.filp)->i_mapping;
-	gfp = mapping_gfp_constraint(mapping, ~(__GFP_IO | __GFP_RECLAIM));
-	gfp |= __GFP_NORETRY | __GFP_NOWARN;
-	sg = st->sgl;
-	st->nents = 0;
-	for (i = 0; i < page_count; i++) {
-		page = shmem_read_mapping_page_gfp(mapping, i, gfp);
-		if (IS_ERR(page)) {
-			i915_gem_shrink(dev_priv,
-					page_count,
-					I915_SHRINK_BOUND |
-					I915_SHRINK_UNBOUND |
-					I915_SHRINK_PURGEABLE);
-			page = shmem_read_mapping_page_gfp(mapping, i, gfp);
-		}
-		if (IS_ERR(page)) {
-			/* We've tried hard to allocate the memory by reaping
-			 * our own buffer, now let the real VM do its job and
-			 * go down in flames if truly OOM.
-			 */
-			i915_gem_shrink_all(dev_priv);
-			page = shmem_read_mapping_page(mapping, i);
-			if (IS_ERR(page)) {
-				ret = PTR_ERR(page);
-				goto err_pages;
-			}
-		}
-#ifdef CONFIG_SWIOTLB
-		if (swiotlb_nr_tbl()) {
-			st->nents++;
-			sg_set_page(sg, page, PAGE_SIZE, 0);
-			sg = sg_next(sg);
-			continue;
-		}
-#endif
-		if (!i || page_to_pfn(page) != last_pfn + 1) {
-			if (i)
-				sg = sg_next(sg);
-			st->nents++;
-			sg_set_page(sg, page, PAGE_SIZE, 0);
-		} else {
-			sg->length += PAGE_SIZE;
-		}
-		last_pfn = page_to_pfn(page);
-
-		/* Check that the i965g/gm workaround works. */
-		WARN_ON((gfp & __GFP_DMA32) && (last_pfn >= 0x00100000UL));
-	}
-#ifdef CONFIG_SWIOTLB
-	if (!swiotlb_nr_tbl())
-#endif
-		sg_mark_end(sg);
-	obj->pages = st;
-
-	ret = i915_gem_gtt_prepare_object(obj);
-	if (ret)
-		goto err_pages;
-
-	if (i915_gem_object_needs_bit17_swizzle(obj))
-		i915_gem_object_do_bit_17_swizzle(obj);
-
-	if (obj->tiling_mode != I915_TILING_NONE &&
-	    dev_priv->quirks & QUIRK_PIN_SWIZZLED_PAGES)
-		i915_gem_object_pin_pages(obj);
-
-	return 0;
-
-err_pages:
-	sg_mark_end(sg);
-	for_each_sg_page(st->sgl, &sg_iter, st->nents, 0)
-		page_cache_release(sg_page_iter_page(&sg_iter));
-	sg_free_table(st);
-	kfree(st);
-
-	/* shmemfs first checks if there is enough memory to allocate the page
-	 * and reports ENOSPC should there be insufficient, along with the usual
-	 * ENOMEM for a genuine allocation failure.
-	 *
-	 * We use ENOSPC in our driver to mean that we have run out of aperture
-	 * space and so want to translate the error from shmemfs back to our
-	 * usual understanding of ENOMEM.
-	 */
-	if (ret == -ENOSPC)
-		ret = -ENOMEM;
-
-	return ret;
-}
-
-/* Ensure that the associated pages are gathered from the backing storage
- * and pinned into our object. i915_gem_object_get_pages() may be called
- * multiple times before they are released by a single call to
- * i915_gem_object_put_pages() - once the pages are no longer referenced
- * either as a result of memory pressure (reaping pages under the shrinker)
- * or as the object is itself released.
- */
-int
-i915_gem_object_get_pages(struct drm_i915_gem_object *obj)
-{
-	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
-	const struct drm_i915_gem_object_ops *ops = obj->ops;
-	int ret;
-
-	if (obj->pages)
-		return 0;
-
-	if (obj->madv != I915_MADV_WILLNEED) {
-		DRM_DEBUG("Attempting to obtain a purgeable object\n");
-		return -EFAULT;
-	}
-
-	BUG_ON(obj->pages_pin_count);
-
-	ret = ops->get_pages(obj);
-	if (ret)
-		return ret;
-
-	list_add_tail(&obj->global_list, &dev_priv->mm.unbound_list);
-
-	obj->get_page.sg = obj->pages->sgl;
-	obj->get_page.last = 0;
-
-	return 0;
-}
-
-void i915_vma_move_to_active(struct i915_vma *vma,
-			     struct drm_i915_gem_request *req)
-{
-	struct drm_i915_gem_object *obj = vma->obj;
-	struct intel_engine_cs *ring;
-
-	ring = i915_gem_request_get_ring(req);
-
-	/* Add a reference if we're newly entering the active list. */
-	if (obj->active == 0)
-		drm_gem_object_reference(&obj->base);
-	obj->active |= intel_ring_flag(ring);
-
-	list_move_tail(&obj->ring_list[ring->id], &ring->active_list);
-	i915_gem_request_assign(&obj->last_read_req[ring->id], req);
-
-	list_move_tail(&vma->mm_list, &vma->vm->active_list);
-}
-
-static void
-i915_gem_object_retire__write(struct drm_i915_gem_object *obj)
-{
-	RQ_BUG_ON(obj->last_write_req == NULL);
-	RQ_BUG_ON(!(obj->active & intel_ring_flag(obj->last_write_req->ring)));
-
-	i915_gem_request_assign(&obj->last_write_req, NULL);
-	intel_fb_obj_flush(obj, true, ORIGIN_CS);
-}
-
-static void
-i915_gem_object_retire__read(struct drm_i915_gem_object *obj, int ring)
-{
-	struct i915_vma *vma;
-
-	RQ_BUG_ON(obj->last_read_req[ring] == NULL);
-	RQ_BUG_ON(!(obj->active & (1 << ring)));
-
-	list_del_init(&obj->ring_list[ring]);
-	i915_gem_request_assign(&obj->last_read_req[ring], NULL);
-
-	if (obj->last_write_req && obj->last_write_req->ring->id == ring)
-		i915_gem_object_retire__write(obj);
-
-	obj->active &= ~(1 << ring);
-	if (obj->active)
-		return;
-
-	/* Bump our place on the bound list to keep it roughly in LRU order
-	 * so that we don't steal from recently used but inactive objects
-	 * (unless we are forced to ofc!)
-	 */
-	list_move_tail(&obj->global_list,
-		       &to_i915(obj->base.dev)->mm.bound_list);
-
-	list_for_each_entry(vma, &obj->vma_list, vma_link) {
-		if (!list_empty(&vma->mm_list))
-			list_move_tail(&vma->mm_list, &vma->vm->inactive_list);
-	}
-
-	i915_gem_request_assign(&obj->last_fenced_req, NULL);
-	drm_gem_object_unreference(&obj->base);
-}
-
-static int
-i915_gem_init_seqno(struct drm_device *dev, u32 seqno)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct intel_engine_cs *ring;
-	int ret, i, j;
-
-	/* Carefully retire all requests without writing to the rings */
-	for_each_ring(ring, dev_priv, i) {
-		ret = intel_ring_idle(ring);
-		if (ret)
-			return ret;
-	}
-	i915_gem_retire_requests(dev);
-
-	/* Finally reset hw state */
-	for_each_ring(ring, dev_priv, i) {
-		intel_ring_init_seqno(ring, seqno);
-
-		for (j = 0; j < ARRAY_SIZE(ring->semaphore.sync_seqno); j++)
-			ring->semaphore.sync_seqno[j] = 0;
-	}
-
-	return 0;
-}
-
-int i915_gem_set_seqno(struct drm_device *dev, u32 seqno)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	int ret;
-
-	if (seqno == 0)
-		return -EINVAL;
-
-	/* HWS page needs to be set less than what we
-	 * will inject to ring
-	 */
-	ret = i915_gem_init_seqno(dev, seqno - 1);
-	if (ret)
-		return ret;
-
-	/* Carefully set the last_seqno value so that wrap
-	 * detection still works
-	 */
-	dev_priv->next_seqno = seqno;
-	dev_priv->last_seqno = seqno - 1;
-	if (dev_priv->last_seqno == 0)
-		dev_priv->last_seqno--;
-
-	return 0;
-}
-
-int
-i915_gem_get_seqno(struct drm_device *dev, u32 *seqno)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-
-	/* reserve 0 for non-seqno */
-	if (dev_priv->next_seqno == 0) {
-		int ret = i915_gem_init_seqno(dev, 0);
-		if (ret)
-			return ret;
-
-		dev_priv->next_seqno = 1;
-	}
-
-	*seqno = dev_priv->last_seqno = dev_priv->next_seqno++;
-	return 0;
+	err = nilfs_segbuf_extend_payload(segbuf, &segbuf->sb_super_root);
+	if (likely(!err))
+		segbuf->sb_sum.flags |= NILFS_SS_SR;
+	return err;
 }
 
 /*
- * NB: This function is not allowed to fail. Doing so would mean the the
- * request is not being tracked for completion but the work itself is
- * going to happen on the hardware. This would be a Bad Thing(tm).
+ * Functions for making segment summary and payloads
  */
-void __i915_add_request(struct drm_i915_gem_request *request,
-			struct drm_i915_gem_object *obj,
-			bool flush_caches)
+static int nilfs_segctor_segsum_block_required(
+	struct nilfs_sc_info *sci, const struct nilfs_segsum_pointer *ssp,
+	unsigned binfo_size)
 {
-	struct intel_engine_cs *ring;
-	struct drm_i915_private *dev_priv;
-	struct intel_ringbuffer *ringbuf;
-	u32 request_start;
-	int ret;
+	unsigned blocksize = sci->sc_super->s_blocksize;
+	/* Size of finfo and binfo is enough small against blocksize */
 
-	if (WARN_ON(request == NULL))
+	return ssp->offset + binfo_size +
+		(!sci->sc_blk_cnt ? sizeof(struct nilfs_finfo) : 0) >
+		blocksize;
+}
+
+static void nilfs_segctor_begin_finfo(struct nilfs_sc_info *sci,
+				      struct inode *inode)
+{
+	sci->sc_curseg->sb_sum.nfinfo++;
+	sci->sc_binfo_ptr = sci->sc_finfo_ptr;
+	nilfs_segctor_map_segsum_entry(
+		sci, &sci->sc_binfo_ptr, sizeof(struct nilfs_finfo));
+
+	if (NILFS_I(inode)->i_root &&
+	    !test_bit(NILFS_SC_HAVE_DELTA, &sci->sc_flags))
+		set_bit(NILFS_SC_HAVE_DELTA, &sci->sc_flags);
+	/* skip finfo */
+}
+
+static void nilfs_segctor_end_finfo(struct nilfs_sc_info *sci,
+				    struct inode *inode)
+{
+	struct nilfs_finfo *finfo;
+	struct nilfs_inode_info *ii;
+	struct nilfs_segment_buffer *segbuf;
+	__u64 cno;
+
+	if (sci->sc_blk_cnt == 0)
 		return;
 
-	ring = request->ring;
-	dev_priv = ring->dev->dev_private;
-	ringbuf = request->ringbuf;
+	ii = NILFS_I(inode);
 
-	/*
-	 * To ensure that this call will not fail, space for its emissions
-	 * should already have been reserved in the ring buffer. Let the ring
-	 * know that it is time to use that space up.
-	 */
-	intel_ring_reserved_space_use(ringbuf);
-
-	request_start = intel_ring_get_tail(ringbuf);
-	/*
-	 * Emit any outstanding flushes - execbuf can fail to emit the flush
-	 * after having emitted the batchbuffer command. Hence we need to fix
-	 * things up similar to emitting the lazy request. The difference here
-	 * is that the flush _must_ happen before the next request, no matter
-	 * what.
-	 */
-	if (flush_caches) {
-		if (i915.enable_execlists)
-			ret = logical_ring_flush_all_caches(request);
-		else
-			ret = intel_ring_flush_all_caches(request);
-		/* Not allowed to fail! */
-		WARN(ret, "*_ring_flush_all_caches failed: %d!\n", ret);
-	}
-
-	/* Record the position of the start of the request so that
-	 * should we detect the updated seqno part-way through the
-	 * GPU processing the request, we never over-estimate the
-	 * position of the head.
-	 */
-	request->postfix = intel_ring_get_tail(ringbuf);
-
-	if (i915.enable_execlists)
-		ret = ring->emit_request(request);
-	else {
-		ret = ring->add_request(request);
-
-		request->tail = intel_ring_get_tail(ringbuf);
-	}
-	/* Not allowed to fail! */
-	WARN(ret, "emit|add_request failed: %d!\n", ret);
-
-	request->head = request_start;
-
-	/* Whilst this request exists, batch_obj will be on the
-	 * active_list, and so will hold the active reference. Only when this
-	 * request is retired will the the batch_obj be moved onto the
-	 * inactive_list and lose its active reference. Hence we do not need
-	 * to explicitly hold another reference here.
-	 */
-	request->batch_obj = obj;
-
-	request->emitted_jiffies = jiffies;
-	request->previous_seqno = ring->last_submitted_seqno;
-	ring->last_submitted_seqno = request->seqno;
-	list_add_tail(&request->list, &ring->request_list);
-
-	trace_i915_gem_request_add(request);
-
-	i915_queue_hangcheck(ring->dev);
-
-	queue_delayed_work(dev_priv->wq,
-			   &dev_priv->mm.retire_work,
-			   round_jiffies_up_relative(HZ));
-	intel_mark_busy(dev_priv->dev);
-
-	/* Sanity check that the reserved size was large enough. */
-	intel_ring_reserved_space_end(ringbuf);
-}
-
-static bool i915_context_is_banned(struct drm_i915_private *dev_priv,
-				   const struct intel_context *ctx)
-{
-	unsigned long elapsed;
-
-	elapsed = get_seconds() - ctx->hang_stats.guilty_ts;
-
-	if (ctx->hang_stats.banned)
-		return true;
-
-	if (ctx->hang_stats.ban_period_seconds &&
-	    elapsed <= ctx->hang_stats.ban_period_seconds) {
-		if (!i915_gem_context_is_default(ctx)) {
-			DRM_DEBUG("context hanging too fast, banning!\n");
-			return true;
-		} else if (i915_stop_ring_allow_ban(dev_priv)) {
-			if (i915_stop_ring_allow_warn(dev_priv))
-				DRM_ERROR("gpu hanging too fast, banning!\n");
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static void i915_set_reset_status(struct drm_i915_private *dev_priv,
-				  struct intel_context *ctx,
-				  const bool guilty)
-{
-	struct i915_ctx_hang_stats *hs;
-
-	if (WARN_ON(!ctx))
-		return;
-
-	hs = &ctx->hang_stats;
-
-	if (guilty) {
-		hs->banned = i915_context_is_banned(dev_priv, ctx);
-		hs->batch_active++;
-		hs->guilty_ts = get_seconds();
-	} else {
-		hs->batch_pending++;
-	}
-}
-
-void i915_gem_request_free(struct kref *req_ref)
-{
-	struct drm_i915_gem_request *req = container_of(req_ref,
-						 typeof(*req), ref);
-	struct intel_context *ctx = req->ctx;
-
-	if (req->file_priv)
-		i915_gem_request_remove_from_client(req);
-
-	if (ctx) {
-		if (i915.enable_execlists) {
-			if (ctx != req->ring->default_context)
-				intel_lr_context_unpin(req);
-		}
-
-		i915_gem_context_unreference(ctx);
-	}
-
-	kmem_cache_free(req->i915->requests, req);
-}
-
-int i915_gem_request_alloc(struct intel_engine_cs *ring,
-			   struct intel_context *ctx,
-			   struct drm_i915_gem_request **req_out)
-{
-	struct drm_i915_private *dev_priv = to_i915(ring->dev);
-	struct drm_i915_gem_request *req;
-	int ret;
-
-	if (!req_out)
-		return -EINVAL;
-
-	*req_out = NULL;
-
-	req = kmem_cache_zalloc(dev_priv->requests, GFP_KERNEL);
-	if (req == NULL)
-		return -ENOMEM;
-
-	ret = i915_gem_get_seqno(ring->dev, &req->seqno);
-	if (ret)
-		goto err;
-
-	kref_init(&req->ref);
-	req->i915 = dev_priv;
-	req->ring = ring;
-	req->ctx  = ctx;
-	i915_gem_context_reference(req->ctx);
-
-	if (i915.enable_execlists)
-		ret = intel_logical_ring_alloc_request_extras(req);
+	if (test_bit(NILFS_I_GCINODE, &ii->i_state))
+		cno = ii->i_cno;
+	else if (NILFS_ROOT_METADATA_FILE(inode->i_ino))
+		cno = 0;
 	else
-		ret = intel_ring_alloc_request_extras(req);
-	if (ret) {
-		i915_gem_context_unreference(req->ctx);
-		goto err;
-	}
+		cno = sci->sc_cno;
 
-	/*
-	 * Reserve space in the ring buffer for all the commands required to
-	 * eventually emit this request. This is to guarantee that the
-	 * i915_add_request() call can't fail. Note that the reserve may need
-	 * to be redone if the request is not actually submitted straight
-	 * away, e.g. because a GPU scheduler has deferred it.
-	 */
-	if (i915.enable_execlists)
-		ret = intel_logical_ring_reserve_space(req);
-	else
-		ret = intel_ring_reserve_space(req);
-	if (ret) {
-		/*
-		 * At this point, the request is fully allocated even if not
-		 * fully prepared. Thus it can be cleaned up using the proper
-		 * free code.
-		 */
-		i915_gem_request_cancel(req);
-		return ret;
-	}
+	finfo = nilfs_segctor_map_segsum_entry(sci, &sci->sc_finfo_ptr,
+						 sizeof(*finfo));
+	finfo->fi_ino = cpu_to_le64(inode->i_ino);
+	finfo->fi_nblocks = cpu_to_le32(sci->sc_blk_cnt);
+	finfo->fi_ndatablk = cpu_to_le32(sci->sc_datablk_cnt);
+	finfo->fi_cno = cpu_to_le64(cno);
 
-	*req_out = req;
-	return 0;
-
-err:
-	kmem_cache_free(dev_priv->requests, req);
-	return ret;
+	segbuf = sci->sc_curseg;
+	segbuf->sb_sum.sumbytes = sci->sc_binfo_ptr.offset +
+		sci->sc_super->s_blocksize * (segbuf->sb_sum.nsumblk - 1);
+	sci->sc_finfo_ptr = sci->sc_binfo_ptr;
+	sci->sc_blk_cnt = sci->sc_datablk_cnt = 0;
 }
 
-void i915_gem_request_cancel(struct drm_i915_gem_request *req)
+static int nilfs_segctor_add_file_block(struct nilfs_sc_info *sci,
+					struct buffer_head *bh,
+					struct inode *inode,
+					unsigned binfo_size)
 {
-	intel_ring_reserved_space_cancel(req->ringbuf);
+	struct nilfs_segment_buffer *segbuf;
+	int required, err = 0;
 
-	i915_gem_request_unreference(req);
-}
-
-struct drm_i915_gem_request *
-i915_gem_find_active_request(struct intel_engine_cs *ring)
-{
-	struct drm_i915_gem_request *request;
-
-	list_for_each_entry(request, &ring->request_list, list) {
-		if (i915_gem_request_completed(request, false))
-			continue;
-
-		return request;
+ retry:
+	segbuf = sci->sc_curseg;
+	required = nilfs_segctor_segsum_block_required(
+		sci, &sci->sc_binfo_ptr, binfo_size);
+	if (segbuf->sb_sum.nblocks + required + 1 > segbuf->sb_rest_blocks) {
+		nilfs_segctor_end_finfo(sci, inode);
+		err = nilfs_segctor_feed_segment(sci);
+		if (err)
+			return err;
+		goto retry;
 	}
-
-	return NULL;
-}
-
-static void i915_gem_reset_ring_status(struct drm_i915_private *dev_priv,
-				       struct intel_engine_cs *ring)
-{
-	struct drm_i915_gem_request *request;
-	bool ring_hung;
-
-	request = i915_gem_find_active_request(ring);
-
-	if (request == NULL)
-		return;
-
-	ring_hung = ring->hangcheck.score >= HANGCHECK_SCORE_RING_HUNG;
-
-	i915_set_reset_status(dev_priv, request->ctx, ring_hung);
-
-	list_for_each_entry_continue(request, &ring->request_list, list)
-		i915_set_reset_status(dev_priv, request->ctx, false);
-}
-
-static void i915_gem_reset_ring_cleanup(struct drm_i915_private *dev_priv,
-					struct intel_engine_cs *ring)
-{
-	while (!list_empty(&ring->active_list)) {
-		struct drm_i915_gem_object *obj;
-
-		obj = list_first_entry(&ring->active_list,
-				       struct drm_i915_gem_object,
-				       ring_list[ring->id]);
-
-		i915_gem_object_retire__read(obj, ring->id);
+	if (unlikely(required)) {
+		nilfs_segctor_zeropad_segsum(sci);
+		err = nilfs_segbuf_extend_segsum(segbuf);
+		if (unlikely(err))
+			goto failed;
 	}
-
-	/*
-	 * Clear the execlists queue up before freeing the requests, as those
-	 * are the ones that keep the context and ringbuffer backing objects
-	 * pinned in place.
-	 */
-	while (!list_empty(&ring->execlist_queue)) {
-		struct drm_i915_gem_request *submit_req;
-
-		submit_req = list_first_entry(&ring->execlist_queue,
-				struct drm_i915_gem_request,
-				execlist_link);
-		list_del(&submit_req->execlist_link);
-
-		if (submit_req->ctx != ring->default_context)
-			intel_lr_context_unpin(submit_req);
-
-		i915_gem_request_unreference(submit_req);
-	}
-
-	/*
-	 * We must free the requests after all the corresponding objects have
-	 * been moved off active lists. Which is the same order as the normal
-	 * retire_requests function does. This is important if object hold
-	 * implicit references on things like e.g. ppgtt address spaces through
-	 * the request.
-	 */
-	while (!list_empty(&ring->request_list)) {
-		struct drm_i915_gem_request *request;
-
-		request = list_first_entry(&ring->request_list,
-					   struct drm_i915_gem_request,
-					   list);
-
-		i915_gem_request_retire(request);
-	}
-}
-
-void i915_gem_reset(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct intel_engine_cs *ring;
-	int i;
-
-	/*
-	 * Before we free the objects from the requests, we need to inspect
-	 * them for finding the guilty party. As the requests only borrow
-	 * their reference to the objects, the inspection must be done first.
-	 */
-	for_each_ring(ring, dev_priv, i)
-		i915_gem_reset_ring_status(dev_priv, ring);
-
-	for_each_ring(ring, dev_priv, i)
-		i915_gem_reset_ring_cleanup(dev_priv, ring);
-
-	i915_gem_context_reset(dev);
-
-	i915_gem_restore_fences(dev);
-
-	WARN_ON(i915_verify_lists(dev));
-}
-
-/**
- * This function clears the request list as sequence numbers are passed.
- */
-void
-i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
-{
-	WARN_ON(i915_verify_lists(ring->dev));
-
-	/* Retire requests first as we use it above for the early return.
-	 * If we retire requests last, we may use a later seqno and so clear
-	 * the requests lists without clearing the active list, leading to
-	 * confusion.
-	 */
-	while (!list_empty(&ring->request_list)) {
-		struct drm_i915_gem_request *request;
-
-		request = list_first_entry(&ring->request_list,
-					   struct drm_i915_gem_request,
-					   list);
-
-		if (!i915_gem_request_completed(request, true))
-			break;
-
-		i915_gem_request_retire(request);
-	}
-
-	/* Move any buffers on the active list that are no longer referenced
-	 * by the ringbuffer to the flushing/inactive lists as appropriate,
-	 * before we free the context associated with the requests.
-	 */
-	while (!list_empty(&ring->active_list)) {
-		struct drm_i915_gem_object *obj;
-
-		obj = list_first_entry(&ring->active_list,
-				      struct drm_i915_gem_object,
-				      ring_list[ring->id]);
-
-		if (!list_empty(&obj->last_read_req[ring->id]->list))
-			break;
-
-		i915_gem_object_retire__read(obj, ring->id);
-	}
-
-	if (unlikely(ring->trace_irq_req &&
-		     i915_gem_request_completed(ring->trace_irq_req, true))) {
-		ring->irq_put(ring);
-		i915_gem_request_assign(&ring->trace_irq_req, NULL);
-	}
-
-	WARN_ON(i915_verify_lists(ring->dev));
-}
-
-bool
-i915_gem_retire_requests(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct intel_engine_cs *ring;
-	bool idle = true;
-	int i;
-
-	for_each_ring(ring, dev_priv, i) {
-		i915_gem_retire_requests_ring(ring);
-		idle &= list_empty(&ring->request_list);
-		if (i915.enable_execlists) {
-			unsigned long flags;
-
-			spin_lock_irqsave(&ring->execlist_lock, flags);
-			idle &= list_empty(&ring->execlist_queue);
-			spin_unlock_irqrestore(&ring->execlist_lock, flags);
-
-			intel_execlists_retire_requests(ring);
-		}
-	}
-
-	if (idle)
-		mod_delayed_work(dev_priv->wq,
-				   &dev_priv->mm.idle_work,
-				   msecs_to_jiffies(100));
-
-	return idle;
-}
-
-static void
-i915_gem_retire_work_handler(struct work_struct *work)
-{
-	struct drm_i915_private *dev_priv =
-		container_of(work, typeof(*dev_priv), mm.retire_work.work);
-	struct drm_device *dev = dev_priv->dev;
-	bool idle;
-
-	/* Come back later if the device is busy... */
-	idle = false;
-	if (mutex_trylock(&dev->struct_mutex)) {
-		idle = i915_gem_retire_requests(dev);
-		mutex_unlock(&dev->struct_mutex);
-	}
-	if (!idle)
-		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work,
-				   round_jiffies_up_relative(HZ));
-}
-
-static void
-i915_gem_idle_work_handler(struct work_struct *work)
-{
-	struct drm_i915_private *dev_priv =
-		container_of(work, typeof(*dev_priv), mm.idle_work.work);
-	struct drm_device *dev = dev_priv->dev;
-	struct intel_engine_cs *ring;
-	int i;
-
-	for_each_ring(ring, dev_priv, i)
-		if (!list_empty(&ring->request_list))
-			return;
-
-	intel_mark_idle(dev);
-
-	if (mutex_trylock(&dev->struct_mutex)) {
-		struct intel_engine_cs *ring;
-		int i;
-
-		for_each_ring(ring, dev_priv, i)
-			i915_gem_batch_pool_fini(&ring->batch_pool);
-
-		mutex_unlock(&dev->struct_mutex);
-	}
-}
-
-/**
- * Ensures that an object will eventually get non-busy by flushing any required
- * write domains, emitting any outstanding lazy request and retiring and
- * completed requests.
- */
-static int
-i915_gem_object_flush_active(struct drm_i915_gem_object *obj)
-{
-	int i;
-
-	if (!obj->active)
-		return 0;
-
-	for (i = 0; i < I915_NUM_RINGS; i++) {
-		struct drm_i915_gem_request *req;
-
-		req = obj->last_read_req[i];
-		if (req == NULL)
-			continue;
-
-		if (list_empty(&req->list))
-			goto retire;
-
-		if (i915_gem_request_completed(req, true)) {
-			__i915_gem_request_retire__upto(req);
-retire:
-			i915_gem_object_retire__read(obj, i);
-		}
-	}
-
-	return 0;
-}
-
-/**
- * i915_gem_wait_ioctl - implements DRM_IOCTL_I915_GEM_WAIT
- * @DRM_IOCTL_ARGS: standard ioctl arguments
- *
- * Returns 0 if successful, else an error is returned with the remaining time in
- * the timeout parameter.
- *  -ETIME: object is still busy after timeout
- *  -ERESTARTSYS: signal interrupted the wait
- *  -ENONENT: object doesn't exist
- * Also possible, but rare:
- *  -EAGAIN: GPU wedged
- *  -ENOMEM: damn
- *  -ENODEV: Internal IRQ fail
- *  -E?: The add request failed
- *
- * The wait ioctl with a timeout of 0 reimplements the busy ioctl. With any
- * non-zero timeout parameter the wait ioctl will wait for the given number of
- * nanoseconds on an object becoming unbusy. Since the wait itself does so
- * without holding struct_mutex the object may become re-busied before this
- * function completes. A similar but shorter * race condition exists in the busy
- * ioctl
- */
-int
-i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct drm_i915_gem_wait *args = data;
-	struct drm_i915_gem_object *obj;
-	struct drm_i915_gem_request *req[I915_NUM_RINGS];
-	unsigned reset_counter;
-	int i, n = 0;
-	int ret;
-
-	if (args->flags != 0)
-		return -EINVAL;
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		return ret;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->bo_handle));
-	if (&obj->base == NULL) {
-		mutex_unlock(&dev->struct_mutex);
-		return -ENOENT;
-	}
-
-	/* Need to make sure the object gets inactive eventually. */
-	ret = i915_gem_object_flush_active(obj);
-	if (ret)
-		goto out;
-
-	if (!obj->active)
-		goto out;
-
-	/* Do this after OLR check to make sure we make forward progress polling
-	 * on this IOCTL with a timeout == 0 (like busy ioctl)
-	 */
-	if (args->timeout_ns == 0) {
-		ret = -ETIME;
-		goto out;
-	}
-
-	drm_gem_object_unreference(&obj->base);
-	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
-
-	for (i = 0; i < I915_NUM_RINGS; i++) {
-		if (obj->last_read_req[i] == NULL)
-			continue;
-
-		req[n++] = i915_gem_request_reference(obj->last_read_req[i]);
-	}
-
-	mutex_unlock(&dev->struct_mutex);
-
-	for (i = 0; i < n; i++) {
-		if (ret == 0)
-			ret = __i915_wait_request(req[i], reset_counter, true,
-						  args->timeout_ns > 0 ? &args->timeout_ns : NULL,
-						  file->driver_priv);
-		i915_gem_request_unreference__unlocked(req[i]);
-	}
-	return ret;
-
-out:
-	drm_gem_object_unreference(&obj->base);
-	mutex_unlock(&dev->struct_mutex);
-	return ret;
-}
-
-static int
-__i915_gem_object_sync(struct drm_i915_gem_object *obj,
-		       struct intel_engine_cs *to,
-		       struct drm_i915_gem_request *from_req,
-		       struct drm_i915_gem_request **to_req)
-{
-	struct intel_engine_cs *from;
-	int ret;
-
-	from = i915_gem_request_get_ring(from_req);
-	if (to == from)
-		return 0;
-
-	if (i915_gem_request_completed(from_req, true))
-		return 0;
-
-	if (!i915_semaphore_is_enabled(obj->base.dev)) {
-		struct drm_i915_private *i915 = to_i915(obj->base.dev);
-		ret = __i915_wait_request(from_req,
-					  atomic_read(&i915->gpu_error.reset_counter),
-					  i915->mm.interruptible,
-					  NULL,
-					  &i915->rps.semaphores);
-		if (ret)
-			return ret;
-
-		i915_gem_object_retire_request(obj, from_req);
-	} else {
-		int idx = intel_ring_sync_index(from, to);
-		u32 seqno = i915_gem_request_get_seqno(from_req);
-
-		WARN_ON(!to_req);
-
-		if (seqno <= from->semaphore.sync_seqno[idx])
-			return 0;
-
-		if (*to_req == NULL) {
-			ret = i915_gem_request_alloc(to, to->default_context, to_req);
-			if (ret)
-				return ret;
-		}
-
-		trace_i915_gem_ring_sync_to(*to_req, from, from_req);
-		ret = to->semaphore.sync_to(*to_req, from, seqno);
-		if (ret)
-			return ret;
-
-		/* We use last_read_req because sync_to()
-		 * might have just caused seqno wrap under
-		 * the radar.
-		 */
-		from->semaphore.sync_seqno[idx] =
-			i915_gem_request_get_seqno(obj->last_read_req[from->id]);
-	}
-
-	return 0;
-}
-
-/**
- * i915_gem_object_sync - sync an object to a ring.
- *
- * @obj: object which may be in use on another ring.
- * @to: ring we wish to use the object on. May be NULL.
- * @to_req: request we wish to use the object for. See below.
- *          This will be allocated and returned if a request is
- *          required but not passed in.
- *
- * This code is meant to abstract object synchronization with the GPU.
- * Calling with NULL implies synchronizing the object with the CPU
- * rather than a particular GPU ring. Conceptually we serialise writes
- * between engines inside the GPU. We only allow one engine to write
- * into a buffer at any time, but multiple readers. To ensure each has
- * a coherent view of memory, we must:
- *
- * - If there is an outstanding write request to the object, the new
- *   request must wait for it to complete (either CPU or in hw, requests
- *   on the same ring will be naturally ordered).
- *
- * - If we are a write request (pending_write_domain is set), the new
- *   request must wait for outstanding read requests to complete.
- *
- * For CPU synchronisation (NULL to) no request is required. For syncing with
- * rings to_req must be non-NULL. However, a request does not have to be
- * pre-allocated. If *to_req is NULL and sync commands will be emitted then a
- * request will be allocated automatically and returned through *to_req. Note
- * that it is not guaranteed that commands will be emitted (because the system
- * might already be idle). Hence there is no need to create a request that
- * might never have any work submitted. Note further that if a request is
- * returned in *to_req, it is the responsibility of the caller to submit
- * that request (after potentially adding more work to it).
- *
- * Returns 0 if successful, else propagates up the lower layer error.
- */
-int
-i915_gem_object_sync(struct drm_i915_gem_object *obj,
-		     struct intel_engine_cs *to,
-		     struct drm_i915_gem_request **to_req)
-{
-	const bool readonly = obj->base.pending_write_domain == 0;
-	struct drm_i915_gem_request *req[I915_NUM_RINGS];
-	int ret, i, n;
-
-	if (!obj->active)
-		return 0;
-
-	if (to == NULL)
-		return i915_gem_object_wait_rendering(obj, readonly);
-
-	n = 0;
-	if (readonly) {
-		if (obj->last_write_req)
-			req[n++] = obj->last_write_req;
-	} else {
-		for (i = 0; i < I915_NUM_RINGS; i++)
-			if (obj->last_read_req[i])
-				req[n++] = obj->last_read_req[i];
-	}
-	for (i = 0; i < n; i++) {
-		ret = __i915_gem_object_sync(obj, to, req[i], to_req);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-static void i915_gem_object_finish_gtt(struct drm_i915_gem_object *obj)
-{
-	u32 old_write_domain, old_read_domains;
-
-	/* Force a pagefault for domain tracking on next user access */
-	i915_gem_release_mmap(obj);
-
-	if ((obj->base.read_domains & I915_GEM_DOMAIN_GTT) == 0)
-		return;
-
-	/* Wait for any direct GTT access to complete */
-	mb();
-
-	old_read_domains = obj->base.read_domains;
-	old_write_domain = obj->base.write_domain;
-
-	obj->base.read_domains &= ~I915_GEM_DOMAIN_GTT;
-	obj->base.write_domain &= ~I915_GEM_DOMAIN_GTT;
-
-	trace_i915_gem_object_change_domain(obj,
-					    old_read_domains,
-					    old_write_domain);
-}
-
-static int __i915_vma_unbind(struct i915_vma *vma, bool wait)
-{
-	struct drm_i915_gem_object *obj = vma->obj;
-	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
-	int ret;
-
-	if (list_empty(&vma->vma_link))
-		return 0;
-
-	if (!drm_mm_node_allocated(&vma->node)) {
-		i915_gem_vma_destroy(vma);
-		return 0;
-	}
-
-	if (vma->pin_count)
-		return -EBUSY;
-
-	BUG_ON(obj->pages == NULL);
-
-	if (wait) {
-		ret = i915_gem_object_wait_rendering(obj, false);
-		if (ret)
-			return ret;
-	}
-
-	if (i915_is_ggtt(vma->vm) &&
-	    vma->ggtt_view.type == I915_GGTT_VIEW_NORMAL) {
-		i915_gem_object_finish_gtt(obj);
-
-		/* release the fence reg _after_ flushing */
-		ret = i915_gem_object_put_fence(obj);
-		if (ret)
-			return ret;
-	}
-
-	trace_i915_vma_unbind(vma);
-
-	vma->vm->unbind_vma(vma);
-	vma->bound = 0;
-
-	list_del_init(&vma->mm_list);
-	if (i915_is_ggtt(vma->vm)) {
-		if (vma->ggtt_view.type == I915_GGTT_VIEW_NORMAL) {
-			obj->map_and_fenceable = false;
-		} else if (vma->ggtt_view.pages) {
-			sg_free_table(vma->ggtt_view.pages);
-			kfree(vma->ggtt_view.pages);
-		}
-		vma->ggtt_view.pages = NULL;
-	}
-
-	drm_mm_remove_node(&vma->node);
-	i915_gem_vma_destroy(vma);
-
-	/* Since the unbound list is global, only move to that list if
-	 * no more VMAs exist. */
-	if (list_empty(&obj->vma_list))
-		list_move_tail(&obj->global_list, &dev_priv->mm.unbound_list);
-
-	/* And finally now the object is completely decoupled from this vma,
-	 * we can drop its hold on the backing storage and allow it to be
-	 * reaped by the shrinker.
-	 */
-	i915_gem_object_unpin_pages(obj);
-
-	return 0;
-}
-
-int i915_vma_unbind(struct i915_vma *vma)
-{
-	return __i915_vma_unbind(vma, true);
-}
-
-int __i915_vma_unbind_no_wait(struct i915_vma *vma)
-{
-	return __i915_vma_unbind(vma, false);
-}
-
-int i915_gpu_idle(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct intel_engine_cs *ring;
-	int ret, i;
-
-	/* Flush everything onto the inactive list. */
-	for_each_ring(ring, dev_priv, i) {
-		if (!i915.enable_execlists) {
-			struct drm_i915_gem_request *req;
-
-			ret = i915_gem_request_alloc(ring, ring->default_context, &req);
-			if (ret)
-				return ret;
-
-			ret = i915_switch_context(req);
-			if (ret) {
-				i915_gem_request_cancel(req);
-				return ret;
-			}
-
-			i915_add_request_no_flush(req);
-		}
-
-		ret = intel_ring_idle(ring);
-		if (ret)
-			return ret;
-	}
-
-	WARN_ON(i915_verify_lists(dev));
-	return 0;
-}
-
-static bool i915_gem_valid_gtt_space(struct i915_vma *vma,
-				     unsigned long cache_level)
-{
-	struct drm_mm_node *gtt_space = &vma->node;
-	struct drm_mm_node *other;
-
-	/*
-	 * On some machines we have to be careful when putting differing types
-	 * of snoopable memory together to avoid the prefetcher crossing memory
-	 * domains and dying. During vm initialisation, we decide whether or not
-	 * these constraints apply and set the drm_mm.color_adjust
-	 * appropriately.
-	 */
-	if (vma->vm->mm.color_adjust == NULL)
-		return true;
-
-	if (!drm_mm_node_allocated(gtt_space))
-		return true;
-
-	if (list_empty(&gtt_space->node_list))
-		return true;
-
-	other = list_entry(gtt_space->node_list.prev, struct drm_mm_node, node_list);
-	if (other->allocated && !other->hole_follows && other->color != cache_level)
-		return false;
-
-	other = list_entry(gtt_space->node_list.next, struct drm_mm_node, node_list);
-	if (other->allocated && !gtt_space->hole_follows && other->color != cache_level)
-		return false;
-
-	return true;
-}
-
-/**
- * Finds free space in the GTT aperture and binds the object or a view of it
- * there.
- */
-static struct i915_vma *
-i915_gem_object_bind_to_vm(struct drm_i915_gem_object *obj,
-			   struct i915_address_space *vm,
-			   const struct i915_ggtt_view *ggtt_view,
-			   unsigned alignment,
-			   uint64_t flags)
-{
-	struct drm_device *dev = obj->base.dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	u32 fence_alignment, unfenced_alignment;
-	u32 search_flag, alloc_flag;
-	u64 start, end;
-	u64 size, fence_size;
-	struct i915_vma *vma;
-	int ret;
-
-	if (i915_is_ggtt(vm)) {
-		u32 view_size;
-
-		if (WARN_ON(!ggtt_view))
-			return ERR_PTR(-EINVAL);
-
-		view_size = i915_ggtt_view_size(obj, ggtt_view);
-
-		fence_size = i915_gem_get_gtt_size(dev,
-						   view_size,
-						   obj->tiling_mode);
-		fence_alignment = i915_gem_get_gtt_alignment(dev,
-							     view_size,
-							     obj->tiling_mode,
-							     true);
-		unfenced_alignment = i915_gem_get_gtt_alignment(dev,
-								view_size,
-								obj->tiling_mode,
-								false);
-		size = flags & PIN_MAPPABLE ? fence_size : view_size;
-	} else {
-		fence_size = i915_gem_get_gtt_size(dev,
-						   obj->base.size,
-						   obj->tiling_mode);
-		fence_alignment = i915_gem_get_gtt_alignment(dev,
-							     obj->base.size,
-							     obj->tiling_mode,
-							     true);
-		unfenced_alignment =
-			i915_gem_get_gtt_alignment(dev,
-						   obj->base.size,
-						   obj->tiling_mode,
-						   false);
-		size = flags & PIN_MAPPABLE ? fence_size : obj->base.size;
-	}
-
-	start = flags & PIN_OFFSET_BIAS ? flags & PIN_OFFSET_MASK : 0;
-	end = vm->total;
-	if (flags & PIN_MAPPABLE)
-		end = min_t(u64, end, dev_priv->gtt.mappable_end);
-	if (flags & PIN_ZONE_4G)
-		end = min_t(u64, end, (1ULL << 32));
-
-	if (alignment == 0)
-		alignment = flags & PIN_MAPPABLE ? fence_alignment :
-						unfenced_alignment;
-	if (flags & PIN_MAPPABLE && alignment & (fence_alignment - 1)) {
-		DRM_DEBUG("Invalid object (view type=%u) alignment requested %u\n",
-			  ggtt_view ? ggtt_view->type : 0,
-			  alignment);
-		return ERR_PTR(-EINVAL);
-	}
-
-	/* If binding the object/GGTT view requires more space than the entire
-	 * aperture has, reject it early before evicting everything in a vain
-	 * attempt to find space.
-	 */
-	if (size > end) {
-		DRM_DEBUG("Attempting to bind an object (view type=%u) larger than the aperture: size=%llu > %s aperture=%llu\n",
-			  ggtt_view ? ggtt_view->type : 0,
-			  size,
-			  flags & PIN_MAPPABLE ? "mappable" : "total",
-			  end);
-		return ERR_PTR(-E2BIG);
-	}
-
-	ret = i915_gem_object_get_pages(obj);
-	if (ret)
-		return ERR_PTR(ret);
-
-	i915_gem_object_pin_pages(obj);
-
-	vma = ggtt_view ? i915_gem_obj_lookup_or_create_ggtt_vma(obj, ggtt_view) :
-			  i915_gem_obj_lookup_or_create_vma(obj, vm);
-
-	if (IS_ERR(vma))
-		goto err_unpin;
-
-	if (flags & PIN_HIGH) {
-		search_flag = DRM_MM_SEARCH_BELOW;
-		alloc_flag = DRM_MM_CREATE_TOP;
-	} else {
-		search_flag = DRM_MM_SEARCH_DEFAULT;
-		alloc_flag = DRM_MM_CREATE_DEFAULT;
-	}
-
-search_free:
-	ret = drm_mm_insert_node_in_range_generic(&vm->mm, &vma->node,
-						  size, alignment,
-						  obj->cache_level,
-						  start, end,
-						  search_flag,
-						  alloc_flag);
-	if (ret) {
-		ret = i915_gem_evict_something(dev, vm, size, alignment,
-					       obj->cache_level,
-					       start, end,
-					       flags);
-		if (ret == 0)
-			goto search_free;
-
-		goto err_free_vma;
-	}
-	if (WARN_ON(!i915_gem_valid_gtt_space(vma, obj->cache_level))) {
-		ret = -EINVAL;
-		goto err_remove_node;
-	}
-
-	trace_i915_vma_bind(vma, flags);
-	ret = i915_vma_bind(vma, obj->cache_level, flags);
-	if (ret)
-		goto err_remove_node;
-
-	list_move_tail(&obj->global_list, &dev_priv->mm.bound_list);
-	list_add_tail(&vma->mm_list, &vm->inactive_list);
-
-	return vma;
-
-err_remove_node:
-	drm_mm_remove_node(&vma->node);
-err_free_vma:
-	i915_gem_vma_destroy(vma);
-	vma = ERR_PTR(ret);
-err_unpin:
-	i915_gem_object_unpin_pages(obj);
-	return vma;
-}
-
-bool
-i915_gem_clflush_object(struct drm_i915_gem_object *obj,
-			bool force)
-{
-	/* If we don't have a page list set up, then we're not pinned
-	 * to GPU, and we can ignore the cache flush because it'll happen
-	 * again at bind time.
-	 */
-	if (obj->pages == NULL)
-		return false;
-
-	/*
-	 * Stolen memory is always coherent with the GPU as it is explicitly
-	 * marked as wc by the system, or the system is cache-coherent.
-	 */
-	if (obj->stolen || obj->phys_handle)
-		return false;
-
-	/* If the GPU is snooping the contents of the CPU cache,
-	 * we do not need to manually clear the CPU cache lines.  However,
-	 * the caches are only snooped when the render cache is
-	 * flushed/invalidated.  As we always have to emit invalidations
-	 * and flushes when moving into and out of the RENDER domain, correct
-	 * snooping behaviour occurs naturally as the result of our domain
-	 * tracking.
-	 */
-	if (!force && cpu_cache_is_coherent(obj->base.dev, obj->cache_level)) {
-		obj->cache_dirty = true;
-		return false;
-	}
-
-	trace_i915_gem_object_clflush(obj);
-	drm_clflush_sg(obj->pages);
-	obj->cache_dirty = false;
-
-	return true;
-}
-
-/** Flushes the GTT write domain for the object if it's dirty. */
-static void
-i915_gem_object_flush_gtt_write_domain(struct drm_i915_gem_object *obj)
-{
-	uint32_t old_write_domain;
-
-	if (obj->base.write_domain != I915_GEM_DOMAIN_GTT)
-		return;
-
-	/* No actual flushing is required for the GTT write domain.  Writes
-	 * to it immediately go to main memory as far as we know, so there's
-	 * no chipset flush.  It also doesn't land in render cache.
-	 *
-	 * However, we do have to enforce the order so that all writes through
-	 * the GTT land before any writes to the device, such as updates to
-	 * the GATT itself.
-	 */
-	wmb();
-
-	old_write_domain = obj->base.write_domain;
-	obj->base.write_domain = 0;
-
-	intel_fb_obj_flush(obj, false, ORIGIN_GTT);
-
-	trace_i915_gem_object_change_domain(obj,
-					    obj->base.read_domains,
-					    old_write_domain);
-}
-
-/** Flushes the CPU write domain for the object if it's dirty. */
-static void
-i915_gem_object_flush_cpu_write_domain(struct drm_i915_gem_object *obj)
-{
-	uint32_t old_write_domain;
-
-	if (obj->base.write_domain != I915_GEM_DOMAIN_CPU)
-		return;
-
-	if (i915_gem_clflush_object(obj, obj->pin_display))
-		i915_gem_chipset_flush(obj->base.dev);
-
-	old_write_domain = obj->base.write_domain;
-	obj->base.write_domain = 0;
-
-	intel_fb_obj_flush(obj, false, ORIGIN_CPU);
-
-	trace_i915_gem_object_change_domain(obj,
-					    obj->base.read_domains,
-					    old_write_domain);
-}
-
-/**
- * Moves a single object to the GTT read, and possibly write domain.
- *
- * This function returns when the move is complete, including waiting on
- * flushes to occur.
- */
-int
-i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj, bool write)
-{
-	uint32_t old_write_domain, old_read_domains;
-	struct i915_vma *vma;
-	int ret;
-
-	if (obj->base.write_domain == I915_GEM_DOMAIN_GTT)
-		return 0;
-
-	ret = i915_gem_object_wait_rendering(obj, !write);
-	if (ret)
-		return ret;
-
-	/* Flush and acquire obj->pages so that we are coherent through
-	 * direct access in memory with previous cached writes through
-	 * shmemfs and that our cache domain tracking remains valid.
-	 * For example, if the obj->filp was moved to swap without us
-	 * being notified and releasing the pages, we would mistakenly
-	 * continue to assume that the obj remained out of the CPU cached
-	 * domain.
-	 */
-	ret = i915_gem_object_get_pages(obj);
-	if (ret)
-		return ret;
-
-	i915_gem_object_flush_cpu_write_domain(obj);
-
-	/* Serialise direct access to this object with the barriers for
-	 * coherent writes from the GPU, by effectively invalidating the
-	 * GTT domain upon first access.
-	 */
-	if ((obj->base.read_domains & I915_GEM_DOMAIN_GTT) == 0)
-		mb();
-
-	old_write_domain = obj->base.write_domain;
-	old_read_domains = obj->base.read_domains;
-
-	/* It should now be out of any other write domains, and we can update
-	 * the domain values for our changes.
-	 */
-	BUG_ON((obj->base.write_domain & ~I915_GEM_DOMAIN_GTT) != 0);
-	obj->base.read_domains |= I915_GEM_DOMAIN_GTT;
-	if (write) {
-		obj->base.read_domains = I915_GEM_DOMAIN_GTT;
-		obj->base.write_domain = I915_GEM_DOMAIN_GTT;
-		obj->dirty = 1;
-	}
-
-	trace_i915_gem_object_change_domain(obj,
-					    old_read_domains,
-					    old_write_domain);
-
-	/* And bump the LRU for this access */
-	vma = i915_gem_obj_to_ggtt(obj);
-	if (vma && drm_mm_node_allocated(&vma->node) && !obj->active)
-		list_move_tail(&vma->mm_list,
-			       &to_i915(obj->base.dev)->gtt.base.inactive_list);
-
-	return 0;
-}
-
-/**
- * Changes the cache-level of an object across all VMA.
- *
- * After this function returns, the object will be in the new cache-level
- * across all GTT and the contents of the backing storage will be coherent,
- * with respect to the new cache-level. In order to keep the backing storage
- * coherent for all users, we only allow a single cache level to be set
- * globally on the object and prevent it from being changed whilst the
- * hardware is reading from the object. That is if the object is currently
- * on the scanout it will be set to uncached (or equivalent display
- * cache coherency) and all non-MOCS GPU access will also be uncached so
- * that all direct access to the scanout remains coherent.
- */
-int i915_gem_object_set_cache_level(struct drm_i915_gem_object *obj,
-				    enum i915_cache_level cache_level)
-{
-	struct drm_device *dev = obj->base.dev;
-	struct i915_vma *vma, *next;
-	bool bound = false;
-	int ret = 0;
-
-	if (obj->cache_level == cache_level)
-		goto out;
-
-	/* Inspect the list of currently bound VMA and unbind any that would
-	 * be invalid given the new cache-level. This is principally to
-	 * catch the issue of the CS prefetch crossing page boundaries and
-	 * reading an invalid PTE on older architectures.
-	 */
-	list_for_each_entry_safe(vma, next, &obj->vma_list, vma_link) {
-		if (!drm_mm_node_allocated(&vma->node))
-			continue;
-
-		if (vma->pin_count) {
-			DRM_DEBUG("can not change the cache level of pinned objects\n");
-			return -EBUSY;
-		}
-
-		if (!i915_gem_valid_gtt_space(vma, cache_level)) {
-			ret = i915_vma_unbind(vma);
-			if (ret)
-				return ret;
-		} else
-			bound = true;
-	}
-
-	/* We can reuse the existing drm_mm nodes but need to change the
-	 * cache-level on the PTE. We could simply unbind them all and
-	 * rebind with the correct cache-level on next use. However since
-	 * we already have a valid slot, dma mapping, pages etc, we may as
-	 * rewrite the PTE in the belief that doing so tramples upon less
-	 * state and so involves less work.
-	 */
-	if (bound) {
-		/* Before we change the PTE, the GPU must not be accessing it.
-		 * If we wait upon the object, we know that all the bound
-		 * VMA are no longer active.
-		 */
-		ret = i915_gem_object_wait_rendering(obj, false);
-		if (ret)
-			return ret;
-
-		if (!HAS_LLC(dev) && cache_level != I915_CACHE_NONE) {
-			/* Access to snoopable pages through the GTT is
-			 * incoherent and on some machines causes a hard
-			 * lockup. Relinquish the CPU mmaping to force
-			 * userspace to refault in the pages and we can
-			 * then double check if the GTT mapping is still
-			 * valid for that pointer access.
-			 */
-			i915_gem_release_mmap(obj);
-
-			/* As we no longer need a fence for GTT access,
-			 * we can relinquish it now (and so prevent having
-			 * to steal a fence from someone else on the next
-			 * fence request). Note GPU activity would have
-			 * dropped the fence as all snoopable access is
-			 * supposed to be linear.
-			 */
-			ret = i915_gem_object_put_fence(obj);
-			if (ret)
-				return ret;
-		} else {
-			/* We either have incoherent backing store and
-			 * so no GTT access or the architecture is fully
-			 * coherent. In such cases, existing GTT mmaps
-			 * ignore the cache bit in the PTE and we can
-			 * rewrite it without confusing the GPU or having
-			 * to force userspace to fault back in its mmaps.
-			 */
-		}
-
-		list_for_each_entry(vma, &obj->vma_list, vma_link) {
-			if (!drm_mm_node_allocated(&vma->node))
-				continue;
-
-			ret = i915_vma_bind(vma, cache_level, PIN_UPDATE);
-			if (ret)
-				return ret;
-		}
-	}
-
-	list_for_each_entry(vma, &obj->vma_list, vma_link)
-		vma->node.color = cache_level;
-	obj->cache_level = cache_level;
-
-out:
-	/* Flush the dirty CPU caches to the backing storage so that the
-	 * object is now coherent at its new cache level (with respect
-	 * to the access domain).
-	 */
-	if (obj->cache_dirty &&
-	    obj->base.write_domain != I915_GEM_DOMAIN_CPU &&
-	    cpu_write_needs_clflush(obj)) {
-		if (i915_gem_clflush_object(obj, true))
-			i915_gem_chipset_flush(obj->base.dev);
-	}
-
-	return 0;
-}
-
-int i915_gem_get_caching_ioctl(struct drm_device *dev, void *data,
-			       struct drm_file *file)
-{
-	struct drm_i915_gem_caching *args = data;
-	struct drm_i915_gem_object *obj;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->handle));
-	if (&obj->base == NULL)
-		return -ENOENT;
-
-	switch (obj->cache_level) {
-	case I915_CACHE_LLC:
-	case I915_CACHE_L3_LLC:
-		args->caching = I915_CACHING_CACHED;
-		break;
-
-	case I915_CACHE_WT:
-		args->caching = I915_CACHING_DISPLAY;
-		break;
-
-	default:
-		args->caching = I915_CACHING_NONE;
-		break;
-	}
-
-	drm_gem_object_unreference_unlocked(&obj->base);
-	return 0;
-}
-
-int i915_gem_set_caching_ioctl(struct drm_device *dev, void *data,
-			       struct drm_file *file)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct drm_i915_gem_caching *args = data;
-	struct drm_i915_gem_object *obj;
-	enum i915_cache_level level;
-	int ret;
-
-	switch (args->caching) {
-	case I915_CACHING_NONE:
-		level = I915_CACHE_NONE;
-		break;
-	case I915_CACHING_CACHED:
-		/*
-		 * Due to a HW issue on BXT A stepping, GPU stores via a
-		 * snooped mapping may leave stale data in a corresponding CPU
-		 * cacheline, whereas normally such cachelines would get
-		 * invalidated.
-		 */
-		if (IS_BROXTON(dev) && INTEL_REVID(dev) < BXT_REVID_B0)
-			return -ENODEV;
-
-		level = I915_CACHE_LLC;
-		break;
-	case I915_CACHING_DISPLAY:
-		level = HAS_WT(dev) ? I915_CACHE_WT : I915_CACHE_NONE;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	intel_runtime_pm_get(dev_priv);
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		goto rpm_put;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->handle));
-	if (&obj->base == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-
-	ret = i915_gem_object_set_cache_level(obj, level);
-
-	drm_gem_object_unreference(&obj->base);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-rpm_put:
-	intel_runtime_pm_put(dev_priv);
-
-	return ret;
+	if (sci->sc_blk_cnt == 0)
+		nilfs_segctor_begin_finfo(sci, inode);
+
+	nilfs_segctor_map_segsum_entry(sci, &sci->sc_binfo_ptr, binfo_size);
+	/* Substitution to vblocknr is delayed until update_blocknr() */
+	nilfs_segbuf_add_file_buffer(segbuf, bh);
+	sci->sc_blk_cnt++;
+ failed:
+	return err;
 }
 
 /*
- * Prepare buffer for display plane (scanout, cursors, etc).
- * Can be called from an uninterruptible phase (modesetting) and allows
- * any flushes to be pipelined (for pageflips).
+ * Callback functions that enumerate, mark, and collect dirty blocks
  */
-int
-i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
-				     u32 alignment,
-				     struct intel_engine_cs *pipelined,
-				     struct drm_i915_gem_request **pipelined_request,
-				     const struct i915_ggtt_view *view)
+static int nilfs_collect_file_data(struct nilfs_sc_info *sci,
+				   struct buffer_head *bh, struct inode *inode)
 {
-	u32 old_read_domains, old_write_domain;
-	int ret;
+	int err;
 
-	ret = i915_gem_object_sync(obj, pipelined, pipelined_request);
-	if (ret)
-		return ret;
+	err = nilfs_bmap_propagate(NILFS_I(inode)->i_bmap, bh);
+	if (err < 0)
+		return err;
 
-	/* Mark the pin_display early so that we account for the
-	 * display coherency whilst setting up the cache domains.
-	 */
-	obj->pin_display++;
-
-	/* The display engine is not coherent with the LLC cache on gen6.  As
-	 * a result, we make sure that the pinning that is about to occur is
-	 * done with uncached PTEs. This is lowest common denominator for all
-	 * chipsets.
-	 *
-	 * However for gen6+, we could do better by using the GFDT bit instead
-	 * of uncaching, which would allow us to flush all the LLC-cached data
-	 * with that bit in the PTE to main memory with just one PIPE_CONTROL.
-	 */
-	ret = i915_gem_object_set_cache_level(obj,
-					      HAS_WT(obj->base.dev) ? I915_CACHE_WT : I915_CACHE_NONE);
-	if (ret)
-		goto err_unpin_display;
-
-	/* As the user may map the buffer once pinned in the display plane
-	 * (e.g. libkms for the bootup splash), we have to ensure that we
-	 * always use map_and_fenceable for all scanout buffers.
-	 */
-	ret = i915_gem_object_ggtt_pin(obj, view, alignment,
-				       view->type == I915_GGTT_VIEW_NORMAL ?
-				       PIN_MAPPABLE : 0);
-	if (ret)
-		goto err_unpin_display;
-
-	i915_gem_object_flush_cpu_write_domain(obj);
-
-	old_write_domain = obj->base.write_domain;
-	old_read_domains = obj->base.read_domains;
-
-	/* It should now be out of any other write domains, and we can update
-	 * the domain values for our changes.
-	 */
-	obj->base.write_domain = 0;
-	obj->base.read_domains |= I915_GEM_DOMAIN_GTT;
-
-	trace_i915_gem_object_change_domain(obj,
-					    old_read_domains,
-					    old_write_domain);
-
-	return 0;
-
-err_unpin_display:
-	obj->pin_display--;
-	return ret;
+	err = nilfs_segctor_add_file_block(sci, bh, inode,
+					   sizeof(struct nilfs_binfo_v));
+	if (!err)
+		sci->sc_datablk_cnt++;
+	return err;
 }
 
-void
-i915_gem_object_unpin_from_display_plane(struct drm_i915_gem_object *obj,
-					 const struct i915_ggtt_view *view)
+static int nilfs_collect_file_node(struct nilfs_sc_info *sci,
+				   struct buffer_head *bh,
+				   struct inode *inode)
 {
-	if (WARN_ON(obj->pin_display == 0))
-		return;
-
-	i915_gem_object_ggtt_unpin_view(obj, view);
-
-	obj->pin_display--;
+	return nilfs_bmap_propagate(NILFS_I(inode)->i_bmap, bh);
 }
 
-/**
- * Moves a single object to the CPU read, and possibly write domain.
- *
- * This function returns when the move is complete, including waiting on
- * flushes to occur.
- */
-int
-i915_gem_object_set_to_cpu_domain(struct drm_i915_gem_object *obj, bool write)
+static int nilfs_collect_file_bmap(struct nilfs_sc_info *sci,
+				   struct buffer_head *bh,
+				   struct inode *inode)
 {
-	uint32_t old_write_domain, old_read_domains;
-	int ret;
-
-	if (obj->base.write_domain == I915_GEM_DOMAIN_CPU)
-		return 0;
-
-	ret = i915_gem_object_wait_rendering(obj, !write);
-	if (ret)
-		return ret;
-
-	i915_gem_object_flush_gtt_write_domain(obj);
-
-	old_write_domain = obj->base.write_domain;
-	old_read_domains = obj->base.read_domains;
-
-	/* Flush the CPU cache if it's still invalid. */
-	if ((obj->base.read_domains & I915_GEM_DOMAIN_CPU) == 0) {
-		i915_gem_clflush_object(obj, false);
-
-		obj->base.read_domains |= I915_GEM_DOMAIN_CPU;
-	}
-
-	/* It should now be out of any other write domains, and we can update
-	 * the domain values for our changes.
-	 */
-	BUG_ON((obj->base.write_domain & ~I915_GEM_DOMAIN_CPU) != 0);
-
-	/* If we're writing through the CPU, then the GPU read domains will
-	 * need to be invalidated at next use.
-	 */
-	if (write) {
-		obj->base.read_domains = I915_GEM_DOMAIN_CPU;
-		obj->base.write_domain = I915_GEM_DOMAIN_CPU;
-	}
-
-	trace_i915_gem_object_change_domain(obj,
-					    old_read_domains,
-					    old_write_domain);
-
-	return 0;
+	WARN_ON(!buffer_dirty(bh));
+	return nilfs_segctor_add_file_block(sci, bh, inode, sizeof(__le64));
 }
 
-/* Throttle our rendering by waiting until the ring has completed our requests
- * emitted over 20 msec ago.
- *
- * Note that if we were to use the current jiffies each time around the loop,
- * we wouldn't escape the function with any frames outstanding if the time to
- * render a frame was over 20ms.
- *
- * This should get us reasonable parallelism between CPU and GPU but also
- * relatively low latency when blocking on a particular request to finish.
- */
-static int
-i915_gem_ring_throttle(struct drm_device *dev, struct drm_file *file)
+static void nilfs_write_file_data_binfo(struct nilfs_sc_info *sci,
+					struct nilfs_segsum_pointer *ssp,
+					union nilfs_binfo *binfo)
 {
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct drm_i915_file_private *file_priv = file->driver_priv;
-	unsigned long recent_enough = jiffies - DRM_I915_THROTTLE_JIFFIES;
-	struct drm_i915_gem_request *request, *target = NULL;
-	unsigned reset_counter;
-	int ret;
-
-	ret = i915_gem_wait_for_error(&dev_priv->gpu_error);
-	if (ret)
-		return ret;
-
-	ret = i915_gem_check_wedge(&dev_priv->gpu_error, false);
-	if (ret)
-		return ret;
-
-	spin_lock(&file_priv->mm.lock);
-	list_for_each_entry(request, &file_priv->mm.request_list, client_list) {
-		if (time_after_eq(request->emitted_jiffies, recent_enough))
-			break;
-
-		/*
-		 * Note that the request might not have been submitted yet.
-		 * In which case emitted_jiffies will be zero.
-		 */
-		if (!request->emitted_jiffies)
-			continue;
-
-		target = request;
-	}
-	reset_counter = atomic_read(&dev_priv->gpu_error.reset_counter);
-	if (target)
-		i915_gem_request_reference(target);
-	spin_unlock(&file_priv->mm.lock);
-
-	if (target == NULL)
-		return 0;
-
-	ret = __i915_wait_request(target, reset_counter, true, NULL, NULL);
-	if (ret == 0)
-		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work, 0);
-
-	i915_gem_request_unreference__unlocked(target);
-
-	return ret;
+	struct nilfs_binfo_v *binfo_v = nilfs_segctor_map_segsum_entry(
+		sci, ssp, sizeof(*binfo_v));
+	*binfo_v = binfo->bi_v;
 }
 
-static bool
-i915_vma_misplaced(struct i915_vma *vma, uint32_t alignment, uint64_t flags)
+static void nilfs_write_file_node_binfo(struct nilfs_sc_info *sci,
+					struct nilfs_segsum_pointer *ssp,
+					union nilfs_binfo *binfo)
 {
-	struct drm_i915_gem_object *obj = vma->obj;
-
-	if (alignment &&
-	    vma->node.start & (alignment - 1))
-		return true;
-
-	if (flags & PIN_MAPPABLE && !obj->map_and_fenceable)
-		return true;
-
-	if (flags & PIN_OFFSET_BIAS &&
-	    vma->node.start < (flags & PIN_OFFSET_MASK))
-		return true;
-
-	return false;
+	__le64 *vblocknr = nilfs_segctor_map_segsum_entry(
+		sci, ssp, sizeof(*vblocknr));
+	*vblocknr = binfo->bi_v.bi_vblocknr;
 }
 
-void __i915_vma_set_map_and_fenceable(struct i915_vma *vma)
-{
-	struct drm_i915_gem_object *obj = vma->obj;
-	bool mappable, fenceable;
-	u32 fence_size, fence_alignment;
-
-	fence_size = i915_gem_get_gtt_size(obj->base.dev,
-					   obj->base.size,
-					   obj->tiling_mode);
-	fence_alignment = i915_gem_get_gtt_alignment(obj->base.dev,
-						     obj->base.size,
-						     obj->tiling_mode,
-						     true);
-
-	fenceable = (vma->node.size == fence_size &&
-		     (vma->node.start & (fence_alignment - 1)) == 0);
-
-	mappable = (vma->node.start + fence_size <=
-		    to_i915(obj->base.dev)->gtt.mappable_end);
-
-	obj->map_and_fenceable = mappable && fenceable;
-}
-
-static int
-i915_gem_object_do_pin(struct drm_i915_gem_object *obj,
-		       struct i915_address_space *vm,
-		       const struct i915_ggtt_view *ggtt_view,
-		       uint32_t alignment,
-		       uint64_t flags)
-{
-	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
-	struct i915_vma *vma;
-	unsigned bound;
-	int ret;
-
-	if (WARN_ON(vm == &dev_priv->mm.aliasing_ppgtt->base))
-		return -ENODEV;
-
-	if (WARN_ON(flags & (PIN_GLOBAL | PIN_MAPPABLE) && !i915_is_ggtt(vm)))
-		return -EINVAL;
-
-	if (WARN_ON((flags & (PIN_MAPPABLE | PIN_GLOBAL)) == PIN_MAPPABLE))
-		return -EINVAL;
-
-	if (WARN_ON(i915_is_ggtt(vm) != !!ggtt_view))
-		return -EINVAL;
-
-	vma = ggtt_view ? i915_gem_obj_to_ggtt_view(obj, ggtt_view) :
-			  i915_gem_obj_to_vma(obj, vm);
-
-	if (IS_ERR(vma))
-		return PTR_ERR(vma);
-
-	if (vma) {
-		if (WARN_ON(vma->pin_count == DRM_I915_GEM_OBJECT_MAX_PIN_COUNT))
-			return -EBUSY;
-
-		if (i915_vma_misplaced(vma, alignment, flags)) {
-			WARN(vma->pin_count,
-			     "bo is already pinned in %s with incorrect alignment:"
-			     " offset=%08x %08x, req.alignment=%x, req.map_and_fenceable=%d,"
-			     " obj->map_and_fenceable=%d\n",
-			     ggtt_view ? "ggtt" : "ppgtt",
-			     upper_32_bits(vma->node.start),
-			     lower_32_bits(vma->node.start),
-			     alignment,
-			     !!(flags & PIN_MAPPABLE),
-			     obj->map_and_fenceable);
-			ret = i915_vma_unbind(vma);
-			if (ret)
-				return ret;
-
-			vma = NULL;
-		}
-	}
-
-	bound = vma ? vma->bound : 0;
-	if (vma == NULL || !drm_mm_node_allocated(&vma->node)) {
-		vma = i915_gem_object_bind_to_vm(obj, vm, ggtt_view, alignment,
-						 flags);
-		if (IS_ERR(vma))
-			return PTR_ERR(vma);
-	} else {
-		ret = i915_vma_bind(vma, obj->cache_level, flags);
-		if (ret)
-			return ret;
-	}
-
-	if (ggtt_view && ggtt_view->type == I915_GGTT_VIEW_NORMAL &&
-	    (bound ^ vma->bound) & GLOBAL_BIND) {
-		__i915_vma_set_map_and_fenceable(vma);
-		WARN_ON(flags & PIN_MAPPABLE && !obj->map_and_fenceable);
-	}
-
-	vma->pin_count++;
-	return 0;
-}
-
-int
-i915_gem_object_pin(struct drm_i915_gem_object *obj,
-		    struct i915_address_space *vm,
-		    uint32_t alignment,
-		    uint64_t flags)
-{
-	return i915_gem_object_do_pin(obj, vm,
-				      i915_is_ggtt(vm) ? &i915_ggtt_view_normal : NULL,
-				      alignment, flags);
-}
-
-int
-i915_gem_object_ggtt_pin(struct drm_i915_gem_object *obj,
-			 const struct i915_ggtt_view *view,
-			 uint32_t alignment,
-			 uint64_t flags)
-{
-	if (WARN_ONCE(!view, "no view specified"))
-		return -EINVAL;
-
-	return i915_gem_object_do_pin(obj, i915_obj_to_ggtt(obj), view,
-				      alignment, flags | PIN_GLOBAL);
-}
-
-void
-i915_gem_object_ggtt_unpin_view(struct drm_i915_gem_object *obj,
-				const struct i915_ggtt_view *view)
-{
-	struct i915_vma *vma = i915_gem_obj_to_ggtt_view(obj, view);
-
-	BUG_ON(!vma);
-	WARN_ON(vma->pin_count == 0);
-	WARN_ON(!i915_gem_obj_ggtt_bound_view(obj, view));
-
-	--vma->pin_count;
-}
-
-int
-i915_gem_busy_ioctl(struct drm_device *dev, void *data,
-		    struct drm_file *file)
-{
-	struct drm_i915_gem_busy *args = data;
-	struct drm_i915_gem_object *obj;
-	int ret;
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		return ret;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file, args->handle));
-	if (&obj->base == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-
-	/* Count all active objects as busy, even if they are currently not used
-	 * by the gpu. Users of this interface expect objects to eventually
-	 * become non-busy without any further actions, therefore emit any
-	 * necessary flushes here.
-	 */
-	ret = i915_gem_object_flush_active(obj);
-	if (ret)
-		goto unref;
-
-	BUILD_BUG_ON(I915_NUM_RINGS > 16);
-	args->busy = obj->active << 16;
-	if (obj->last_write_req)
-		args->busy |= obj->last_write_req->ring->id;
-
-unref:
-	drm_gem_object_unreference(&obj->base);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-	return ret;
-}
-
-int
-i915_gem_throttle_ioctl(struct drm_device *dev, void *data,
-			struct drm_file *file_priv)
-{
-	return i915_gem_ring_throttle(dev, file_priv);
-}
-
-int
-i915_gem_madvise_ioctl(struct drm_device *dev, void *data,
-		       struct drm_file *file_priv)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct drm_i915_gem_madvise *args = data;
-	struct drm_i915_gem_object *obj;
-	int ret;
-
-	switch (args->madv) {
-	case I915_MADV_DONTNEED:
-	case I915_MADV_WILLNEED:
-	    break;
-	default:
-	    return -EINVAL;
-	}
-
-	ret = i915_mutex_lock_interruptible(dev);
-	if (ret)
-		return ret;
-
-	obj = to_intel_bo(drm_gem_object_lookup(dev, file_priv, args->handle));
-	if (&obj->base == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-
-	if (i915_gem_obj_is_pinned(obj)) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	if (obj->pages &&
-	    obj->tiling_mode != I915_TILING_NONE &&
-	    dev_priv->quirks & QUIRK_PIN_SWIZZLED_PAGES) {
-		if (obj->madv == I915_MADV_WILLNEED)
-			i915_gem_object_unpin_pages(obj);
-		if (args->madv == I915_MADV_WILLNEED)
-			i915_gem_object_pin_pages(obj);
-	}
-
-	if (obj->madv != __I915_MADV_PURGED)
-		obj->madv = args->madv;
-
-	/* if the object is no longer attached, discard its backing storage */
-	if (obj->madv == I915_MADV_DONTNEED && obj->pages == NULL)
-		i915_gem_object_truncate(obj);
-
-	args->retained = obj->madv != __I915_MADV_PURGED;
-
-out:
-	drm_gem_object_unreference(&obj->base);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-	return ret;
-}
-
-void i915_gem_object_init(struct drm_i915_gem_object *obj,
-			  const struct drm_i915_gem_object_ops *ops)
-{
-	int i;
-
-	INIT_LIST_HEAD(&obj->global_list);
-	for (i = 0; i < I915_NUM_RINGS; i++)
-		INIT_LIST_HEAD(&obj->ring_list[i]);
-	INIT_LIST_HEAD(&obj->obj_exec_link);
-	INIT_LIST_HEAD(&obj->vma_list);
-	INIT_LIST_HEAD(&obj->batch_pool_link);
-
-	obj->ops = ops;
-
-	obj->fence_reg = I915_FENCE_REG_NONE;
-	obj->madv = I915_MADV_WILLNEED;
-
-	i915_gem_info_add_obj(obj->base.dev->dev_private, obj->base.size);
-}
-
-static const struct drm_i915_gem_object_ops i915_gem_object_ops = {
-	.get_pages = i915_gem_object_get_pages_gtt,
-	.put_pages = i915_gem_object_put_pages_gtt,
+static struct nilfs_sc_operations nilfs_sc_file_ops = {
+	.collect_data = nilfs_collect_file_data,
+	.collect_node = nilfs_collect_file_node,
+	.collect_bmap = nilfs_collect_file_bmap,
+	.write_data_binfo = nilfs_write_file_data_binfo,
+	.write_node_binfo = nilfs_write_file_node_binfo,
 };
 
-struct drm_i915_gem_object *i915_gem_alloc_object(struct drm_device *dev,
-						  size_t size)
+static int nilfs_collect_dat_data(struct nilfs_sc_info *sci,
+				  struct buffer_head *bh, struct inode *inode)
 {
-	struct drm_i915_gem_object *obj;
-	struct address_space *mapping;
-	gfp_t mask;
+	int err;
 
-	obj = i915_gem_object_alloc(dev);
-	if (obj == NULL)
-		return NULL;
+	err = nilfs_bmap_propagate(NILFS_I(inode)->i_bmap, bh);
+	if (err < 0)
+		return err;
 
-	if (drm_gem_object_init(dev, &obj->base, size) != 0) {
-		i915_gem_object_free(obj);
-		return NULL;
-	}
-
-	mask = GFP_HIGHUSER | __GFP_RECLAIMABLE;
-	if (IS_CRESTLINE(dev) || IS_BROADWATER(dev)) {
-		/* 965gm cannot relocate objects above 4GiB. */
-		mask &= ~__GFP_HIGHMEM;
-		mask |= __GFP_DMA32;
-	}
-
-	mapping = file_inode(obj->base.filp)->i_mapping;
-	mapping_set_gfp_mask(mapping, mask);
-
-	i915_gem_object_init(obj, &i915_gem_object_ops);
-
-	obj->base.write_domain = I915_GEM_DOMAIN_CPU;
-	obj->base.read_domains = I915_GEM_DOMAIN_CPU;
-
-	if (HAS_LLC(dev)) {
-		/* On some devices, we can have the GPU use the LLC (the CPU
-		 * cache) for about a 10% performance improvement
-		 * compared to uncached.  Graphics requests other than
-		 * display scanout are coherent with the CPU in
-		 * accessing this cache.  This means in this mode we
-		 * don't need to clflush on the CPU side, and on the
-		 * GPU side we only need to flush internal caches to
-		 * get data visible to the CPU.
-		 *
-		 * However, we maintain the display planes as UC, and so
-		 * need to rebind when first used as such.
-		 */
-		obj->cache_level = I915_CACHE_LLC;
-	} else
-		obj->cache_level = I915_CACHE_NONE;
-
-	trace_i915_gem_object_create(obj);
-
-	return obj;
+	err = nilfs_segctor_add_file_block(sci, bh, inode, sizeof(__le64));
+	if (!err)
+		sci->sc_datablk_cnt++;
+	return err;
 }
 
-static bool discard_backing_storage(struct drm_i915_gem_object *obj)
+static int nilfs_collect_dat_bmap(struct nilfs_sc_info *sci,
+				  struct buffer_head *bh, struct inode *inode)
 {
-	/* If we are the last user of the backing storage (be it shmemfs
-	 * pages or stolen etc), we know that the pages are going to be
-	 * immediately released. In this case, we can then skip copying
-	 * back the contents from the GPU.
-	 */
-
-	if (obj->madv != I915_MADV_WILLNEED)
-		return false;
-
-	if (obj->base.filp == NULL)
-		return true;
-
-	/* At first glance, this looks racy, but then again so would be
-	 * userspace racing mmap against close. However, the first external
-	 * reference to the filp can only be obtained through the
-	 * i915_gem_mmap_ioctl() which safeguards us against the user
-	 * acquiring such a reference whilst we are in the middle of
-	 * freeing the object.
-	 */
-	return atomic_long_read(&obj->base.filp->f_count) == 1;
+	WARN_ON(!buffer_dirty(bh));
+	return nilfs_segctor_add_file_block(sci, bh, inode,
+					    sizeof(struct nilfs_binfo_dat));
 }
 
-void i915_gem_free_object(struct drm_gem_object *gem_obj)
+static void nilfs_write_dat_data_binfo(struct nilfs_sc_info *sci,
+				       struct nilfs_segsum_pointer *ssp,
+				       union nilfs_binfo *binfo)
 {
-	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
-	struct drm_device *dev = obj->base.dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct i915_vma *vma, *next;
-
-	intel_runtime_pm_get(dev_priv);
-
-	trace_i915_gem_object_destroy(obj);
-
-	list_for_each_entry_safe(vma, next, &obj->vma_list, vma_link) {
-		int ret;
-
-		vma->pin_count = 0;
-		ret = i915_vma_unbind(vma);
-		if (WARN_ON(ret == -ERESTARTSYS)) {
-			bool was_interruptible;
-
-			was_interruptible = dev_priv->mm.interruptible;
-			dev_priv->mm.interruptible = false;
-
-			WARN_ON(i915_vma_unbind(vma));
-
-			dev_priv->mm.interruptible = was_interruptible;
-		}
-	}
-
-	/* Stolen objects don't hold a ref, but do hold pin count. Fix that up
-	 * before progressing. */
-	if (obj->stolen)
-		i915_gem_object_unpin_pages(obj);
-
-	WARN_ON(obj->frontbuffer_bits);
-
-	if (obj->pages && obj->madv == I915_MADV_WILLNEED &&
-	    dev_priv->quirks & QUIRK_PIN_SWIZZLED_PAGES &&
-	    obj->tiling_mode != I915_TILING_NONE)
-		i915_gem_object_unpin_pages(obj);
-
-	if (WARN_ON(obj->pages_pin_count))
-		obj->pages_pin_count = 0;
-	if (discard_backing_storage(obj))
-		obj->madv = I915_MADV_DONTNEED;
-	i915_gem_object_put_pages(obj);
-	i915_gem_object_free_mmap_offset(obj);
-
-	BUG_ON(obj->pages);
-
-	if (obj->base.import_attach)
-		drm_prime_gem_destroy(&obj->base, NULL);
-
-	if (obj->ops->release)
-		obj->ops->release(obj);
-
-	drm_gem_object_release(&obj->base);
-	i915_gem_info_remove_obj(dev_priv, obj->base.size);
-
-	kfree(obj->bit_17);
-	i915_gem_object_free(obj);
-
-	intel_runtime_pm_put(dev_priv);
+	__le64 *blkoff = nilfs_segctor_map_segsum_entry(sci, ssp,
+							  sizeof(*blkoff));
+	*blkoff = binfo->bi_dat.bi_blkoff;
 }
 
-struct i915_vma *i915_gem_obj_to_vma(struct drm_i915_gem_object *obj,
-				     struct i915_address_space *vm)
+static void nilfs_write_dat_node_binfo(struct nilfs_sc_info *sci,
+				       struct nilfs_segsum_pointer *ssp,
+				       union nilfs_binfo *binfo)
 {
-	struct i915_vma *vma;
-	list_for_each_entry(vma, &obj->vma_list, vma_link) {
-		if (i915_is_ggtt(vma->vm) &&
-		    vma->ggtt_view.type != I915_GGTT_VIEW_NORMAL)
-			continue;
-		if (vma->vm == vm)
-			return vma;
-	}
-	return NULL;
+	struct nilfs_binfo_dat *binfo_dat =
+		nilfs_segctor_map_segsum_entry(sci, ssp, sizeof(*binfo_dat));
+	*binfo_dat = binfo->bi_dat;
 }
 
-struct i915_vma *i915_gem_obj_to_ggtt_view(struct drm_i915_gem_object *obj,
-					   const struct i915_ggtt_view *view)
+static struct nilfs_sc_operations nilfs_sc_dat_ops = {
+	.collect_data = nilfs_collect_dat_data,
+	.collect_node = nilfs_collect_file_node,
+	.collect_bmap = nilfs_collect_dat_bmap,
+	.write_data_binfo = nilfs_write_dat_data_binfo,
+	.write_node_binfo = nilfs_write_dat_node_binfo,
+};
+
+static struct nilfs_sc_operations nilfs_sc_dsync_ops = {
+	.collect_data = nilfs_collect_file_data,
+	.collect_node = NULL,
+	.collect_bmap = NULL,
+	.write_data_binfo = nilfs_write_file_data_binfo,
+	.write_node_binfo = NULL,
+};
+
+static size_t nilfs_lookup_dirty_data_buffers(struct inode *inode,
+					      struct list_head *listp,
+					      size_t nlimit,
+					      loff_t start, loff_t end)
 {
-	struct i915_address_space *ggtt = i915_obj_to_ggtt(obj);
-	struct i915_vma *vma;
-
-	if (WARN_ONCE(!view, "no view specified"))
-		return ERR_PTR(-EINVAL);
-
-	list_for_each_entry(vma, &obj->vma_list, vma_link)
-		if (vma->vm == ggtt &&
-		    i915_ggtt_view_equal(&vma->ggtt_view, view))
-			return vma;
-	return NULL;
-}
-
-void i915_gem_vma_destroy(struct i915_vma *vma)
-{
-	struct i915_address_space *vm = NULL;
-	WARN_ON(vma->node.allocated);
-
-	/* Keep the vma as a placeholder in the execbuffer reservation lists */
-	if (!list_empty(&vma->exec_list))
-		return;
-
-	vm = vma->vm;
-
-	if (!i915_is_ggtt(vm))
-		i915_ppgtt_put(i915_vm_to_ppgtt(vm));
-
-	list_del(&vma->vma_link);
-
-	kmem_cache_free(to_i915(vma->obj->base.dev)->vmas, vma);
-}
-
-static void
-i915_gem_stop_ringbuffers(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct intel_engine_cs *ring;
+	struct address_space *mapping = inode->i_mapping;
+	struct pagevec pvec;
+	pgoff_t index = 0, last = ULONG_MAX;
+	size_t ndirties = 0;
 	int i;
 
-	for_each_ring(ring, dev_priv, i)
-		dev_priv->gt.stop_ring(ring);
+	if (unlikely(start != 0 || end != LLONG_MAX)) {
+		/*
+		 * A valid range is given for sync-ing data pages. The
+		 * range is rounded to per-page; extra dirty buffers
+		 * may be included if blocksize < pagesize.
+		 */
+		index = start >> PAGE_SHIFT;
+		last = end >> PAGE_SHIFT;
+	}
+	pagevec_init(&pvec, 0);
+ repeat:
+	if (unlikely(index > last) ||
+	    !pagevec_lookup_range_tag(&pvec, mapping, &index, last,
+				PAGECACHE_TAG_DIRTY))
+		return ndirties;
+
+	for (i = 0; i < pagevec_count(&pvec); i++) {
+		struct buffer_head *bh, *head;
+		struct page *page = pvec.pages[i];
+
+		lock_page(page);
+		if (unlikely(page->mapping != mapping)) {
+			/* Exclude pages removed from the address space */
+			unlock_page(page);
+			continue;
+		}
+		if (!page_has_buffers(page))
+			create_empty_buffers(page, i_blocksize(inode), 0);
+		unlock_page(page);
+
+		bh = head = page_buffers(page);
+		do {
+			if (!buffer_dirty(bh) || buffer_async_write(bh))
+				continue;
+			get_bh(bh);
+			list_add_tail(&bh->b_assoc_buffers, listp);
+			ndirties++;
+			if (unlikely(ndirties >= nlimit)) {
+				pagevec_release(&pvec);
+				cond_resched();
+				return ndirties;
+			}
+		} while (bh = bh->b_this_page, bh != head);
+	}
+	pagevec_release(&pvec);
+	cond_resched();
+	goto repeat;
 }
 
-int
-i915_gem_suspend(struct drm_device *dev)
+static void nilfs_lookup_dirty_node_buffers(struct inode *inode,
+					    struct list_head *listp)
 {
-	struct drm_i915_private *dev_priv = dev->dev_private;
+	struct nilfs_inode_info *ii = NILFS_I(inode);
+	struct address_space *mapping = &ii->i_btnode_cache;
+	struct pagevec pvec;
+	struct buffer_head *bh, *head;
+	unsigned int i;
+	pgoff_t index = 0;
+
+	pagevec_init(&pvec, 0);
+
+	while (pagevec_lookup_tag(&pvec, mapping, &index,
+					PAGECACHE_TAG_DIRTY)) {
+		for (i = 0; i < pagevec_count(&pvec); i++) {
+			bh = head = page_buffers(pvec.pages[i]);
+			do {
+				if (buffer_dirty(bh) &&
+						!buffer_async_write(bh)) {
+					get_bh(bh);
+					list_add_tail(&bh->b_assoc_buffers,
+						      listp);
+				}
+				bh = bh->b_this_page;
+			} while (bh != head);
+		}
+		pagevec_release(&pvec);
+		cond_resched();
+	}
+}
+
+static void nilfs_dispose_list(struct the_nilfs *nilfs,
+			       struct list_head *head, int force)
+{
+	struct nilfs_inode_info *ii, *n;
+	struct nilfs_inode_info *ivec[SC_N_INODEVEC], **pii;
+	unsigned nv = 0;
+
+	while (!list_empty(head)) {
+		spin_lock(&nilfs->ns_inode_lock);
+		list_for_each_entry_safe(ii, n, head, i_dirty) {
+			list_del_init(&ii->i_dirty);
+			if (force) {
+				if (unlikely(ii->i_bh)) {
+					brelse(ii->i_bh);
+					ii->i_bh = NULL;
+				}
+			} else if (test_bit(NILFS_I_DIRTY, &ii->i_state)) {
+				set_bit(NILFS_I_QUEUED, &ii->i_state);
+				list_add_tail(&ii->i_dirty,
+					      &nilfs->ns_dirty_files);
+				continue;
+			}
+			ivec[nv++] = ii;
+			if (nv == SC_N_INODEVEC)
+				break;
+		}
+		spin_unlock(&nilfs->ns_inode_lock);
+
+		for (pii = ivec; nv > 0; pii++, nv--)
+			iput(&(*pii)->vfs_inode);
+	}
+}
+
+static void nilfs_iput_work_func(struct work_struct *work)
+{
+	struct nilfs_sc_info *sci = container_of(work, struct nilfs_sc_info,
+						 sc_iput_work);
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+
+	nilfs_dispose_list(nilfs, &sci->sc_iput_queue, 0);
+}
+
+static int nilfs_test_metadata_dirty(struct the_nilfs *nilfs,
+				     struct nilfs_root *root)
+{
 	int ret = 0;
 
-	mutex_lock(&dev->struct_mutex);
-	ret = i915_gpu_idle(dev);
-	if (ret)
-		goto err;
-
-	i915_gem_retire_requests(dev);
-
-	i915_gem_stop_ringbuffers(dev);
-	mutex_unlock(&dev->struct_mutex);
-
-	cancel_delayed_work_sync(&dev_priv->gpu_error.hangcheck_work);
-	cancel_delayed_work_sync(&dev_priv->mm.retire_work);
-	flush_delayed_work(&dev_priv->mm.idle_work);
-
-	/* Assert that we sucessfully flushed all the work and
-	 * reset the GPU back to its idle, low power state.
-	 */
-	WARN_ON(dev_priv->mm.busy);
-
-	return 0;
-
-err:
-	mutex_unlock(&dev->struct_mutex);
+	if (nilfs_mdt_fetch_dirty(root->ifile))
+		ret++;
+	if (nilfs_mdt_fetch_dirty(nilfs->ns_cpfile))
+		ret++;
+	if (nilfs_mdt_fetch_dirty(nilfs->ns_sufile))
+		ret++;
+	if ((ret || nilfs_doing_gc()) && nilfs_mdt_fetch_dirty(nilfs->ns_dat))
+		ret++;
 	return ret;
 }
 
-int i915_gem_l3_remap(struct drm_i915_gem_request *req, int slice)
+static int nilfs_segctor_clean(struct nilfs_sc_info *sci)
 {
-	struct intel_engine_cs *ring = req->ring;
-	struct drm_device *dev = ring->dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	u32 reg_base = GEN7_L3LOG_BASE + (slice * 0x200);
-	u32 *remap_info = dev_priv->l3_parity.remap_info[slice];
-	int i, ret;
+	return list_empty(&sci->sc_dirty_files) &&
+		!test_bit(NILFS_SC_DIRTY, &sci->sc_flags) &&
+		sci->sc_nfreesegs == 0 &&
+		(!nilfs_doing_gc() || list_empty(&sci->sc_gc_inodes));
+}
 
-	if (!HAS_L3_DPF(dev) || !remap_info)
+static int nilfs_segctor_confirm(struct nilfs_sc_info *sci)
+{
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	int ret = 0;
+
+	if (nilfs_test_metadata_dirty(nilfs, sci->sc_root))
+		set_bit(NILFS_SC_DIRTY, &sci->sc_flags);
+
+	spin_lock(&nilfs->ns_inode_lock);
+	if (list_empty(&nilfs->ns_dirty_files) && nilfs_segctor_clean(sci))
+		ret++;
+
+	spin_unlock(&nilfs->ns_inode_lock);
+	return ret;
+}
+
+static void nilfs_segctor_clear_metadata_dirty(struct nilfs_sc_info *sci)
+{
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+
+	nilfs_mdt_clear_dirty(sci->sc_root->ifile);
+	nilfs_mdt_clear_dirty(nilfs->ns_cpfile);
+	nilfs_mdt_clear_dirty(nilfs->ns_sufile);
+	nilfs_mdt_clear_dirty(nilfs->ns_dat);
+}
+
+static int nilfs_segctor_create_checkpoint(struct nilfs_sc_info *sci)
+{
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	struct buffer_head *bh_cp;
+	struct nilfs_checkpoint *raw_cp;
+	int err;
+
+	/* XXX: this interface will be changed */
+	err = nilfs_cpfile_get_checkpoint(nilfs->ns_cpfile, nilfs->ns_cno, 1,
+					  &raw_cp, &bh_cp);
+	if (likely(!err)) {
+		/* The following code is duplicated with cpfile.  But, it is
+		   needed to collect the checkpoint even if it was not newly
+		   created */
+		mark_buffer_dirty(bh_cp);
+		nilfs_mdt_mark_dirty(nilfs->ns_cpfile);
+		nilfs_cpfile_put_checkpoint(
+			nilfs->ns_cpfile, nilfs->ns_cno, bh_cp);
+	} else if (err == -EINVAL || err == -ENOENT) {
+		nilfs_error(sci->sc_super, __func__,
+			    "checkpoint creation failed due to metadata corruption.");
+		err = -EIO;
+	}
+	return err;
+}
+
+static int nilfs_segctor_fill_in_checkpoint(struct nilfs_sc_info *sci)
+{
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	struct buffer_head *bh_cp;
+	struct nilfs_checkpoint *raw_cp;
+	int err;
+
+	err = nilfs_cpfile_get_checkpoint(nilfs->ns_cpfile, nilfs->ns_cno, 0,
+					  &raw_cp, &bh_cp);
+	if (unlikely(err)) {
+		if (err == -EINVAL || err == -ENOENT) {
+			nilfs_error(sci->sc_super, __func__,
+				    "checkpoint finalization failed due to metadata corruption.");
+			err = -EIO;
+		}
+		goto failed_ibh;
+	}
+	raw_cp->cp_snapshot_list.ssl_next = 0;
+	raw_cp->cp_snapshot_list.ssl_prev = 0;
+	raw_cp->cp_inodes_count =
+		cpu_to_le64(atomic64_read(&sci->sc_root->inodes_count));
+	raw_cp->cp_blocks_count =
+		cpu_to_le64(atomic64_read(&sci->sc_root->blocks_count));
+	raw_cp->cp_nblk_inc =
+		cpu_to_le64(sci->sc_nblk_inc + sci->sc_nblk_this_inc);
+	raw_cp->cp_create = cpu_to_le64(sci->sc_seg_ctime);
+	raw_cp->cp_cno = cpu_to_le64(nilfs->ns_cno);
+
+	if (test_bit(NILFS_SC_HAVE_DELTA, &sci->sc_flags))
+		nilfs_checkpoint_clear_minor(raw_cp);
+	else
+		nilfs_checkpoint_set_minor(raw_cp);
+
+	nilfs_write_inode_common(sci->sc_root->ifile,
+				 &raw_cp->cp_ifile_inode, 1);
+	nilfs_cpfile_put_checkpoint(nilfs->ns_cpfile, nilfs->ns_cno, bh_cp);
+	return 0;
+
+ failed_ibh:
+	return err;
+}
+
+static void nilfs_fill_in_file_bmap(struct inode *ifile,
+				    struct nilfs_inode_info *ii)
+
+{
+	struct buffer_head *ibh;
+	struct nilfs_inode *raw_inode;
+
+	if (test_bit(NILFS_I_BMAP, &ii->i_state)) {
+		ibh = ii->i_bh;
+		BUG_ON(!ibh);
+		raw_inode = nilfs_ifile_map_inode(ifile, ii->vfs_inode.i_ino,
+						  ibh);
+		nilfs_bmap_write(ii->i_bmap, raw_inode);
+		nilfs_ifile_unmap_inode(ifile, ii->vfs_inode.i_ino, ibh);
+	}
+}
+
+static void nilfs_segctor_fill_in_file_bmap(struct nilfs_sc_info *sci)
+{
+	struct nilfs_inode_info *ii;
+
+	list_for_each_entry(ii, &sci->sc_dirty_files, i_dirty) {
+		nilfs_fill_in_file_bmap(sci->sc_root->ifile, ii);
+		set_bit(NILFS_I_COLLECTED, &ii->i_state);
+	}
+}
+
+static void nilfs_segctor_fill_in_super_root(struct nilfs_sc_info *sci,
+					     struct the_nilfs *nilfs)
+{
+	struct buffer_head *bh_sr;
+	struct nilfs_super_root *raw_sr;
+	unsigned isz, srsz;
+
+	bh_sr = NILFS_LAST_SEGBUF(&sci->sc_segbufs)->sb_super_root;
+
+	lock_buffer(bh_sr);
+	raw_sr = (struct nilfs_super_root *)bh_sr->b_data;
+	isz = nilfs->ns_inode_size;
+	srsz = NILFS_SR_BYTES(isz);
+
+	raw_sr->sr_sum = 0;  /* Ensure initialization within this update */
+	raw_sr->sr_bytes = cpu_to_le16(srsz);
+	raw_sr->sr_nongc_ctime
+		= cpu_to_le64(nilfs_doing_gc() ?
+			      nilfs->ns_nongc_ctime : sci->sc_seg_ctime);
+	raw_sr->sr_flags = 0;
+
+	nilfs_write_inode_common(nilfs->ns_dat, (void *)raw_sr +
+				 NILFS_SR_DAT_OFFSET(isz), 1);
+	nilfs_write_inode_common(nilfs->ns_cpfile, (void *)raw_sr +
+				 NILFS_SR_CPFILE_OFFSET(isz), 1);
+	nilfs_write_inode_common(nilfs->ns_sufile, (void *)raw_sr +
+				 NILFS_SR_SUFILE_OFFSET(isz), 1);
+	memset((void *)raw_sr + srsz, 0, nilfs->ns_blocksize - srsz);
+	set_buffer_uptodate(bh_sr);
+	unlock_buffer(bh_sr);
+}
+
+static void nilfs_redirty_inodes(struct list_head *head)
+{
+	struct nilfs_inode_info *ii;
+
+	list_for_each_entry(ii, head, i_dirty) {
+		if (test_bit(NILFS_I_COLLECTED, &ii->i_state))
+			clear_bit(NILFS_I_COLLECTED, &ii->i_state);
+	}
+}
+
+static void nilfs_drop_collected_inodes(struct list_head *head)
+{
+	struct nilfs_inode_info *ii;
+
+	list_for_each_entry(ii, head, i_dirty) {
+		if (!test_and_clear_bit(NILFS_I_COLLECTED, &ii->i_state))
+			continue;
+
+		clear_bit(NILFS_I_INODE_SYNC, &ii->i_state);
+		set_bit(NILFS_I_UPDATED, &ii->i_state);
+	}
+}
+
+static int nilfs_segctor_apply_buffers(struct nilfs_sc_info *sci,
+				       struct inode *inode,
+				       struct list_head *listp,
+				       int (*collect)(struct nilfs_sc_info *,
+						      struct buffer_head *,
+						      struct inode *))
+{
+	struct buffer_head *bh, *n;
+	int err = 0;
+
+	if (collect) {
+		list_for_each_entry_safe(bh, n, listp, b_assoc_buffers) {
+			list_del_init(&bh->b_assoc_buffers);
+			err = collect(sci, bh, inode);
+			brelse(bh);
+			if (unlikely(err))
+				goto dispose_buffers;
+		}
 		return 0;
-
-	ret = intel_ring_begin(req, GEN7_L3LOG_SIZE / 4 * 3);
-	if (ret)
-		return ret;
-
-	/*
-	 * Note: We do not worry about the concurrent register cacheline hang
-	 * here because no other code should access these registers other than
-	 * at initialization time.
-	 */
-	for (i = 0; i < GEN7_L3LOG_SIZE; i += 4) {
-		intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
-		intel_ring_emit(ring, reg_base + i);
-		intel_ring_emit(ring, remap_info[i/4]);
 	}
 
-	intel_ring_advance(ring);
-
-	return ret;
+ dispose_buffers:
+	while (!list_empty(listp)) {
+		bh = list_first_entry(listp, struct buffer_head,
+				      b_assoc_buffers);
+		list_del_init(&bh->b_assoc_buffers);
+		brelse(bh);
+	}
+	return err;
 }
 
-void i915_gem_init_swizzling(struct drm_device *dev)
+static size_t nilfs_segctor_buffer_rest(struct nilfs_sc_info *sci)
 {
-	struct drm_i915_private *dev_priv = dev->dev_private;
+	/* Remaining number of blocks within segment buffer */
+	return sci->sc_segbuf_nblocks -
+		(sci->sc_nblk_this_inc + sci->sc_curseg->sb_sum.nblocks);
+}
 
-	if (INTEL_INFO(dev)->gen < 5 ||
-	    dev_priv->mm.bit_6_swizzle_x == I915_BIT_6_SWIZZLE_NONE)
-		return;
+static int nilfs_segctor_scan_file(struct nilfs_sc_info *sci,
+				   struct inode *inode,
+				   struct nilfs_sc_operations *sc_ops)
+{
+	LIST_HEAD(data_buffers);
+	LIST_HEAD(node_buffers);
+	int err;
 
-	I915_WRITE(DISP_ARB_CTL, I915_READ(DISP_ARB_CTL) |
-				 DISP_TILE_SURFACE_SWIZZLING);
+	if (!(sci->sc_stage.flags & NILFS_CF_NODE)) {
+		size_t n, rest = nilfs_segctor_buffer_rest(sci);
 
-	if (IS_GEN5(dev))
-		return;
+		n = nilfs_lookup_dirty_data_buffers(
+			inode, &data_buffers, rest + 1, 0, LLONG_MAX);
+		if (n > rest) {
+			err = nilfs_segctor_apply_buffers(
+				sci, inode, &data_buffers,
+				sc_ops->collect_data);
+			BUG_ON(!err); /* always receive -E2BIG or true error */
+			goto break_or_fail;
+		}
+	}
+	nilfs_lookup_dirty_node_buffers(inode, &node_buffers);
 
-	I915_WRITE(TILECTL, I915_READ(TILECTL) | TILECTL_SWZCTL);
-	if (IS_GEN6(dev))
-		I915_WRITE(ARB_MODE, _MASKED_BIT_ENABLE(ARB_MODE_SWIZZLE_SNB));
-	else if (IS_GEN7(dev))
-		I915_WRITE(ARB_MODE, _MASKED_BIT_ENABLE(ARB_MODE_SWIZZLE_IVB));
-	else if (IS_GEN8(dev))
-		I915_WRITE(GAMTARBMODE, _MASKED_BIT_ENABLE(ARB_MODE_SWIZZLE_BDW));
-	else
+	if (!(sci->sc_stage.flags & NILFS_CF_NODE)) {
+		err = nilfs_segctor_apply_buffers(
+			sci, inode, &data_buffers, sc_ops->collect_data);
+		if (unlikely(err)) {
+			/* dispose node list */
+			nilfs_segctor_apply_buffers(
+				sci, inode, &node_buffers, NULL);
+			goto break_or_fail;
+		}
+		sci->sc_stage.flags |= NILFS_CF_NODE;
+	}
+	/* Collect node */
+	err = nilfs_segctor_apply_buffers(
+		sci, inode, &node_buffers, sc_ops->collect_node);
+	if (unlikely(err))
+		goto break_or_fail;
+
+	nilfs_bmap_lookup_dirty_buffers(NILFS_I(inode)->i_bmap, &node_buffers);
+	err = nilfs_segctor_apply_buffers(
+		sci, inode, &node_buffers, sc_ops->collect_bmap);
+	if (unlikely(err))
+		goto break_or_fail;
+
+	nilfs_segctor_end_finfo(sci, inode);
+	sci->sc_stage.flags &= ~NILFS_CF_NODE;
+
+ break_or_fail:
+	return err;
+}
+
+static int nilfs_segctor_scan_file_dsync(struct nilfs_sc_info *sci,
+					 struct inode *inode)
+{
+	LIST_HEAD(data_buffers);
+	size_t n, rest = nilfs_segctor_buffer_rest(sci);
+	int err;
+
+	n = nilfs_lookup_dirty_data_buffers(inode, &data_buffers, rest + 1,
+					    sci->sc_dsync_start,
+					    sci->sc_dsync_end);
+
+	err = nilfs_segctor_apply_buffers(sci, inode, &data_buffers,
+					  nilfs_collect_file_data);
+	if (!err) {
+		nilfs_segctor_end_finfo(sci, inode);
+		BUG_ON(n > rest);
+		/* always receive -E2BIG or true error if n > rest */
+	}
+	return err;
+}
+
+static int nilfs_segctor_collect_blocks(struct nilfs_sc_info *sci, int mode)
+{
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	struct list_head *head;
+	struct nilfs_inode_info *ii;
+	size_t ndone;
+	int err = 0;
+
+	switch (nilfs_sc_cstage_get(sci)) {
+	case NILFS_ST_INIT:
+		/* Pre-processes */
+		sci->sc_stage.flags = 0;
+
+		if (!test_bit(NILFS_SC_UNCLOSED, &sci->sc_flags)) {
+			sci->sc_nblk_inc = 0;
+			sci->sc_curseg->sb_sum.flags = NILFS_SS_LOGBGN;
+			if (mode == SC_LSEG_DSYNC) {
+				nilfs_sc_cstage_set(sci, NILFS_ST_DSYNC);
+				goto dsync_mode;
+			}
+		}
+
+		sci->sc_stage.dirty_file_ptr = NULL;
+		sci->sc_stage.gc_inode_ptr = NULL;
+		if (mode == SC_FLUSH_DAT) {
+			nilfs_sc_cstage_set(sci, NILFS_ST_DAT);
+			goto dat_stage;
+		}
+		nilfs_sc_cstage_inc(sci);  /* Fall through */
+	case NILFS_ST_GC:
+		if (nilfs_doing_gc()) {
+			head = &sci->sc_gc_inodes;
+			ii = list_prepare_entry(sci->sc_stage.gc_inode_ptr,
+						head, i_dirty);
+			list_for_each_entry_continue(ii, head, i_dirty) {
+				err = nilfs_segctor_scan_file(
+					sci, &ii->vfs_inode,
+					&nilfs_sc_file_ops);
+				if (unlikely(err)) {
+					sci->sc_stage.gc_inode_ptr = list_entry(
+						ii->i_dirty.prev,
+						struct nilfs_inode_info,
+						i_dirty);
+					goto break_or_fail;
+				}
+				set_bit(NILFS_I_COLLECTED, &ii->i_state);
+			}
+			sci->sc_stage.gc_inode_ptr = NULL;
+		}
+		nilfs_sc_cstage_inc(sci);  /* Fall through */
+	case NILFS_ST_FILE:
+		head = &sci->sc_dirty_files;
+		ii = list_prepare_entry(sci->sc_stage.dirty_file_ptr, head,
+					i_dirty);
+		list_for_each_entry_continue(ii, head, i_dirty) {
+			clear_bit(NILFS_I_DIRTY, &ii->i_state);
+
+			err = nilfs_segctor_scan_file(sci, &ii->vfs_inode,
+						      &nilfs_sc_file_ops);
+			if (unlikely(err)) {
+				sci->sc_stage.dirty_file_ptr =
+					list_entry(ii->i_dirty.prev,
+						   struct nilfs_inode_info,
+						   i_dirty);
+				goto break_or_fail;
+			}
+			/* sci->sc_stage.dirty_file_ptr = NILFS_I(inode); */
+			/* XXX: required ? */
+		}
+		sci->sc_stage.dirty_file_ptr = NULL;
+		if (mode == SC_FLUSH_FILE) {
+			nilfs_sc_cstage_set(sci, NILFS_ST_DONE);
+			return 0;
+		}
+		nilfs_sc_cstage_inc(sci);
+		sci->sc_stage.flags |= NILFS_CF_IFILE_STARTED;
+		/* Fall through */
+	case NILFS_ST_IFILE:
+		err = nilfs_segctor_scan_file(sci, sci->sc_root->ifile,
+					      &nilfs_sc_file_ops);
+		if (unlikely(err))
+			break;
+		nilfs_sc_cstage_inc(sci);
+		/* Creating a checkpoint */
+		err = nilfs_segctor_create_checkpoint(sci);
+		if (unlikely(err))
+			break;
+		/* Fall through */
+	case NILFS_ST_CPFILE:
+		err = nilfs_segctor_scan_file(sci, nilfs->ns_cpfile,
+					      &nilfs_sc_file_ops);
+		if (unlikely(err))
+			break;
+		nilfs_sc_cstage_inc(sci);  /* Fall through */
+	case NILFS_ST_SUFILE:
+		err = nilfs_sufile_freev(nilfs->ns_sufile, sci->sc_freesegs,
+					 sci->sc_nfreesegs, &ndone);
+		if (unlikely(err)) {
+			nilfs_sufile_cancel_freev(nilfs->ns_sufile,
+						  sci->sc_freesegs, ndone,
+						  NULL);
+			break;
+		}
+		sci->sc_stage.flags |= NILFS_CF_SUFREED;
+
+		err = nilfs_segctor_scan_file(sci, nilfs->ns_sufile,
+					      &nilfs_sc_file_ops);
+		if (unlikely(err))
+			break;
+		nilfs_sc_cstage_inc(sci);  /* Fall through */
+	case NILFS_ST_DAT:
+ dat_stage:
+		err = nilfs_segctor_scan_file(sci, nilfs->ns_dat,
+					      &nilfs_sc_dat_ops);
+		if (unlikely(err))
+			break;
+		if (mode == SC_FLUSH_DAT) {
+			nilfs_sc_cstage_set(sci, NILFS_ST_DONE);
+			return 0;
+		}
+		nilfs_sc_cstage_inc(sci);  /* Fall through */
+	case NILFS_ST_SR:
+		if (mode == SC_LSEG_SR) {
+			/* Appending a super root */
+			err = nilfs_segctor_add_super_root(sci);
+			if (unlikely(err))
+				break;
+		}
+		/* End of a logical segment */
+		sci->sc_curseg->sb_sum.flags |= NILFS_SS_LOGEND;
+		nilfs_sc_cstage_set(sci, NILFS_ST_DONE);
+		return 0;
+	case NILFS_ST_DSYNC:
+ dsync_mode:
+		sci->sc_curseg->sb_sum.flags |= NILFS_SS_SYNDT;
+		ii = sci->sc_dsync_inode;
+		if (!test_bit(NILFS_I_BUSY, &ii->i_state))
+			break;
+
+		err = nilfs_segctor_scan_file_dsync(sci, &ii->vfs_inode);
+		if (unlikely(err))
+			break;
+		sci->sc_curseg->sb_sum.flags |= NILFS_SS_LOGEND;
+		nilfs_sc_cstage_set(sci, NILFS_ST_DONE);
+		return 0;
+	case NILFS_ST_DONE:
+		return 0;
+	default:
 		BUG();
-}
-
-static void init_unused_ring(struct drm_device *dev, u32 base)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-
-	I915_WRITE(RING_CTL(base), 0);
-	I915_WRITE(RING_HEAD(base), 0);
-	I915_WRITE(RING_TAIL(base), 0);
-	I915_WRITE(RING_START(base), 0);
-}
-
-static void init_unused_rings(struct drm_device *dev)
-{
-	if (IS_I830(dev)) {
-		init_unused_ring(dev, PRB1_BASE);
-		init_unused_ring(dev, SRB0_BASE);
-		init_unused_ring(dev, SRB1_BASE);
-		init_unused_ring(dev, SRB2_BASE);
-		init_unused_ring(dev, SRB3_BASE);
-	} else if (IS_GEN2(dev)) {
-		init_unused_ring(dev, SRB0_BASE);
-		init_unused_ring(dev, SRB1_BASE);
-	} else if (IS_GEN3(dev)) {
-		init_unused_ring(dev, PRB1_BASE);
-		init_unused_ring(dev, PRB2_BASE);
-	}
-}
-
-int i915_gem_init_rings(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	int ret;
-
-	ret = intel_init_render_ring_buffer(dev);
-	if (ret)
-		return ret;
-
-	if (HAS_BSD(dev)) {
-		ret = intel_init_bsd_ring_buffer(dev);
-		if (ret)
-			goto cleanup_render_ring;
 	}
 
-	if (HAS_BLT(dev)) {
-		ret = intel_init_blt_ring_buffer(dev);
-		if (ret)
-			goto cleanup_bsd_ring;
-	}
-
-	if (HAS_VEBOX(dev)) {
-		ret = intel_init_vebox_ring_buffer(dev);
-		if (ret)
-			goto cleanup_blt_ring;
-	}
-
-	if (HAS_BSD2(dev)) {
-		ret = intel_init_bsd2_ring_buffer(dev);
-		if (ret)
-			goto cleanup_vebox_ring;
-	}
-
-	return 0;
-
-cleanup_vebox_ring:
-	intel_cleanup_ring_buffer(&dev_priv->ring[VECS]);
-cleanup_blt_ring:
-	intel_cleanup_ring_buffer(&dev_priv->ring[BCS]);
-cleanup_bsd_ring:
-	intel_cleanup_ring_buffer(&dev_priv->ring[VCS]);
-cleanup_render_ring:
-	intel_cleanup_ring_buffer(&dev_priv->ring[RCS]);
-
-	return ret;
-}
-
-int
-i915_gem_init_hw(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct intel_engine_cs *ring;
-	int ret, i, j;
-
-	if (INTEL_INFO(dev)->gen < 6 && !intel_enable_gtt())
-		return -EIO;
-
-	/* Double layer security blanket, see i915_gem_init() */
-	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
-
-	if (dev_priv->ellc_size)
-		I915_WRITE(HSW_IDICR, I915_READ(HSW_IDICR) | IDIHASHMSK(0xf));
-
-	if (IS_HASWELL(dev))
-		I915_WRITE(MI_PREDICATE_RESULT_2, IS_HSW_GT3(dev) ?
-			   LOWER_SLICE_ENABLED : LOWER_SLICE_DISABLED);
-
-	if (HAS_PCH_NOP(dev)) {
-		if (IS_IVYBRIDGE(dev)) {
-			u32 temp = I915_READ(GEN7_MSG_CTL);
-			temp &= ~(WAIT_FOR_PCH_FLR_ACK | WAIT_FOR_PCH_RESET_ACK);
-			I915_WRITE(GEN7_MSG_CTL, temp);
-		} else if (INTEL_INFO(dev)->gen >= 7) {
-			u32 temp = I915_READ(HSW_NDE_RSTWRN_OPT);
-			temp &= ~RESET_PCH_HANDSHAKE_ENABLE;
-			I915_WRITE(HSW_NDE_RSTWRN_OPT, temp);
-		}
-	}
-
-	i915_gem_init_swizzling(dev);
-
-	/*
-	 * At least 830 can leave some of the unused rings
-	 * "active" (ie. head != tail) after resume which
-	 * will prevent c3 entry. Makes sure all unused rings
-	 * are totally idle.
-	 */
-	init_unused_rings(dev);
-
-	BUG_ON(!dev_priv->ring[RCS].default_context);
-
-	ret = i915_ppgtt_init_hw(dev);
-	if (ret) {
-		DRM_ERROR("PPGTT enable HW failed %d\n", ret);
-		goto out;
-	}
-
-	/* Need to do basic initialisation of all rings first: */
-	for_each_ring(ring, dev_priv, i) {
-		ret = ring->init_hw(ring);
-		if (ret)
-			goto out;
-	}
-
-	/* We can't enable contexts until all firmware is loaded */
-	if (HAS_GUC_UCODE(dev)) {
-		ret = intel_guc_ucode_load(dev);
-		if (ret) {
-			/*
-			 * If we got an error and GuC submission is enabled, map
-			 * the error to -EIO so the GPU will be declared wedged.
-			 * OTOH, if we didn't intend to use the GuC anyway, just
-			 * discard the error and carry on.
-			 */
-			DRM_ERROR("Failed to initialize GuC, error %d%s\n", ret,
-				  i915.enable_guc_submission ? "" :
-				  " (ignored)");
-			ret = i915.enable_guc_submission ? -EIO : 0;
-			if (ret)
-				goto out;
-		}
-	}
-
-	/*
-	 * Increment the next seqno by 0x100 so we have a visible break
-	 * on re-initialisation
-	 */
-	ret = i915_gem_set_seqno(dev, dev_priv->next_seqno+0x100);
-	if (ret)
-		goto out;
-
-	/* Now it is safe to go back round and do everything else: */
-	for_each_ring(ring, dev_priv, i) {
-		struct drm_i915_gem_request *req;
-
-		WARN_ON(!ring->default_context);
-
-		ret = i915_gem_request_alloc(ring, ring->default_context, &req);
-		if (ret) {
-			i915_gem_cleanup_ringbuffer(dev);
-			goto out;
-		}
-
-		if (ring->id == RCS) {
-			for (j = 0; j < NUM_L3_SLICES(dev); j++)
-				i915_gem_l3_remap(req, j);
-		}
-
-		ret = i915_ppgtt_init_ring(req);
-		if (ret && ret != -EIO) {
-			DRM_ERROR("PPGTT enable ring #%d failed %d\n", i, ret);
-			i915_gem_request_cancel(req);
-			i915_gem_cleanup_ringbuffer(dev);
-			goto out;
-		}
-
-		ret = i915_gem_context_enable(req);
-		if (ret && ret != -EIO) {
-			DRM_ERROR("Context enable ring #%d failed %d\n", i, ret);
-			i915_gem_request_cancel(req);
-			i915_gem_cleanup_ringbuffer(dev);
-			goto out;
-		}
-
-		i915_add_request_no_flush(req);
-	}
-
-out:
-	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
-	return ret;
-}
-
-int i915_gem_init(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	int ret;
-
-	i915.enable_execlists = intel_sanitize_enable_execlists(dev,
-			i915.enable_execlists);
-
-	mutex_lock(&dev->struct_mutex);
-
-	if (IS_VALLEYVIEW(dev)) {
-		/* VLVA0 (potential hack), BIOS isn't actually waking us */
-		I915_WRITE(VLV_GTLC_WAKE_CTRL, VLV_GTLC_ALLOWWAKEREQ);
-		if (wait_for((I915_READ(VLV_GTLC_PW_STATUS) &
-			      VLV_GTLC_ALLOWWAKEACK), 10))
-			DRM_DEBUG_DRIVER("allow wake ack timed out\n");
-	}
-
-	if (!i915.enable_execlists) {
-		dev_priv->gt.execbuf_submit = i915_gem_ringbuffer_submission;
-		dev_priv->gt.init_rings = i915_gem_init_rings;
-		dev_priv->gt.cleanup_ring = intel_cleanup_ring_buffer;
-		dev_priv->gt.stop_ring = intel_stop_ring_buffer;
-	} else {
-		dev_priv->gt.execbuf_submit = intel_execlists_submission;
-		dev_priv->gt.init_rings = intel_logical_rings_init;
-		dev_priv->gt.cleanup_ring = intel_logical_ring_cleanup;
-		dev_priv->gt.stop_ring = intel_logical_ring_stop;
-	}
-
-	/* This is just a security blanket to placate dragons.
-	 * On some systems, we very sporadically observe that the first TLBs
-	 * used by the CS may be stale, despite us poking the TLB reset. If
-	 * we hold the forcewake during initialisation these problems
-	 * just magically go away.
-	 */
-	intel_uncore_forcewake_get(dev_priv, FORCEWAKE_ALL);
-
-	ret = i915_gem_init_userptr(dev);
-	if (ret)
-		goto out_unlock;
-
-	i915_gem_init_global_gtt(dev);
-
-	ret = i915_gem_context_init(dev);
-	if (ret)
-		goto out_unlock;
-
-	ret = dev_priv->gt.init_rings(dev);
-	if (ret)
-		goto out_unlock;
-
-	ret = i915_gem_init_hw(dev);
-	if (ret == -EIO) {
-		/* Allow ring initialisation to fail by marking the GPU as
-		 * wedged. But we only want to do this where the GPU is angry,
-		 * for all other failure, such as an allocation failure, bail.
-		 */
-		DRM_ERROR("Failed to initialize GPU, declaring it wedged\n");
-		atomic_or(I915_WEDGED, &dev_priv->gpu_error.reset_counter);
-		ret = 0;
-	}
-
-out_unlock:
-	intel_uncore_forcewake_put(dev_priv, FORCEWAKE_ALL);
-	mutex_unlock(&dev->struct_mutex);
-
-	return ret;
-}
-
-void
-i915_gem_cleanup_ringbuffer(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	struct intel_engine_cs *ring;
-	int i;
-
-	for_each_ring(ring, dev_priv, i)
-		dev_priv->gt.cleanup_ring(ring);
-
-    if (i915.enable_execlists)
-            /*
-             * Neither the BIOS, ourselves or any other kernel
-             * expects the system to be in execlists mode on startup,
-             * so we need to reset the GPU back to legacy mode.
-             */
-            intel_gpu_reset(dev);
-}
-
-static void
-init_ring_lists(struct intel_engine_cs *ring)
-{
-	INIT_LIST_HEAD(&ring->active_list);
-	INIT_LIST_HEAD(&ring->request_list);
-}
-
-void
-i915_gem_load(struct drm_device *dev)
-{
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	int i;
-
-	dev_priv->objects =
-		kmem_cache_create("i915_gem_object",
-				  sizeof(struct drm_i915_gem_object), 0,
-				  SLAB_HWCACHE_ALIGN,
-				  NULL);
-	dev_priv->vmas =
-		kmem_cache_create("i915_gem_vma",
-				  sizeof(struct i915_vma), 0,
-				  SLAB_HWCACHE_ALIGN,
-				  NULL);
-	dev_priv->requests =
-		kmem_cache_create("i915_gem_request",
-				  sizeof(struct drm_i915_gem_request), 0,
-				  SLAB_HWCACHE_ALIGN,
-				  NULL);
-
-	INIT_LIST_HEAD(&dev_priv->vm_list);
-	INIT_LIST_HEAD(&dev_priv->context_list);
-	INIT_LIST_HEAD(&dev_priv->mm.unbound_list);
-	INIT_LIST_HEAD(&dev_priv->mm.bound_list);
-	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
-	for (i = 0; i < I915_NUM_RINGS; i++)
-		init_ring_lists(&dev_priv->ring[i]);
-	for (i = 0; i < I915_MAX_NUM_FENCES; i++)
-		INIT_LIST_HEAD(&dev_priv->fence_regs[i].lru_list);
-	INIT_DELAYED_WORK(&dev_priv->mm.retire_work,
-			  i915_gem_retire_work_handler);
-	INIT_DELAYED_WORK(&dev_priv->mm.idle_work,
-			  i915_gem_idle_work_handler);
-	init_waitqueue_head(&dev_priv->gpu_error.reset_queue);
-
-	dev_priv->relative_constants_mode = I915_EXEC_CONSTANTS_REL_GENERAL;
-
-	if (INTEL_INFO(dev)->gen >= 7 && !IS_VALLEYVIEW(dev))
-		dev_priv->num_fence_regs = 32;
-	else if (INTEL_INFO(dev)->gen >= 4 || IS_I945G(dev) || IS_I945GM(dev) || IS_G33(dev))
-		dev_priv->num_fence_regs = 16;
-	else
-		dev_priv->num_fence_regs = 8;
-
-	if (intel_vgpu_active(dev))
-		dev_priv->num_fence_regs =
-				I915_READ(vgtif_reg(avail_rs.fence_num));
-
-	/*
-	 * Set initial sequence number for requests.
-	 * Using this number allows the wraparound to happen early,
-	 * catching any obvious problems.
-	 */
-	dev_priv->next_seqno = ((u32)~0 - 0x1100);
-	dev_priv->last_seqno = ((u32)~0 - 0x1101);
-
-	/* Initialize fence registers to zero */
-	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
-	i915_gem_restore_fences(dev);
-
-	i915_gem_detect_bit_6_swizzle(dev);
-	init_waitqueue_head(&dev_priv->pending_flip_queue);
-
-	dev_priv->mm.interruptible = true;
-
-	i915_gem_shrinker_init(dev_priv);
-
-	mutex_init(&dev_priv->fb_tracking.lock);
-
-	mutex_init(&dev_priv->tlb_invalidate_lock);
-}
-
-void i915_gem_release(struct drm_device *dev, struct drm_file *file)
-{
-	struct drm_i915_file_private *file_priv = file->driver_priv;
-
-	/* Clean up our request list when the client is going away, so that
-	 * later retire_requests won't dereference our soon-to-be-gone
-	 * file_priv.
-	 */
-	spin_lock(&file_priv->mm.lock);
-	while (!list_empty(&file_priv->mm.request_list)) {
-		struct drm_i915_gem_request *request;
-
-		request = list_first_entry(&file_priv->mm.request_list,
-					   struct drm_i915_gem_request,
-					   client_list);
-		list_del(&request->client_list);
-		request->file_priv = NULL;
-	}
-	spin_unlock(&file_priv->mm.lock);
-
-	if (!list_empty(&file_priv->rps.link)) {
-		spin_lock(&to_i915(dev)->rps.client_lock);
-		list_del(&file_priv->rps.link);
-		spin_unlock(&to_i915(dev)->rps.client_lock);
-	}
-}
-
-int i915_gem_open(struct drm_device *dev, struct drm_file *file)
-{
-	struct drm_i915_file_private *file_priv;
-	int ret;
-
-	DRM_DEBUG_DRIVER("\n");
-
-	file_priv = kzalloc(sizeof(*file_priv), GFP_KERNEL);
-	if (!file_priv)
-		return -ENOMEM;
-
-	file->driver_priv = file_priv;
-	file_priv->dev_priv = dev->dev_private;
-	file_priv->file = file;
-	INIT_LIST_HEAD(&file_priv->rps.link);
-
-	spin_lock_init(&file_priv->mm.lock);
-	INIT_LIST_HEAD(&file_priv->mm.request_list);
-
-	ret = i915_gem_context_open(dev, file);
-	if (ret)
-		kfree(file_priv);
-
-	return ret;
+ break_or_fail:
+	return err;
 }
 
 /**
- * i915_gem_track_fb - update frontbuffer tracking
- * @old: current GEM buffer for the frontbuffer slots
- * @new: new GEM buffer for the frontbuffer slots
- * @frontbuffer_bits: bitmask of frontbuffer slots
- *
- * This updates the frontbuffer tracking bits @frontbuffer_bits by clearing them
- * from @old and setting them in @new. Both @old and @new can be NULL.
+ * nilfs_segctor_begin_construction - setup segment buffer to make a new log
+ * @sci: nilfs_sc_info
+ * @nilfs: nilfs object
  */
-void i915_gem_track_fb(struct drm_i915_gem_object *old,
-		       struct drm_i915_gem_object *new,
-		       unsigned frontbuffer_bits)
+static int nilfs_segctor_begin_construction(struct nilfs_sc_info *sci,
+					    struct the_nilfs *nilfs)
 {
-	if (old) {
-		WARN_ON(!mutex_is_locked(&old->base.dev->struct_mutex));
-		WARN_ON(!(old->frontbuffer_bits & frontbuffer_bits));
-		old->frontbuffer_bits &= ~frontbuffer_bits;
+	struct nilfs_segment_buffer *segbuf, *prev;
+	__u64 nextnum;
+	int err, alloc = 0;
+
+	segbuf = nilfs_segbuf_new(sci->sc_super);
+	if (unlikely(!segbuf))
+		return -ENOMEM;
+
+	if (list_empty(&sci->sc_write_logs)) {
+		nilfs_segbuf_map(segbuf, nilfs->ns_segnum,
+				 nilfs->ns_pseg_offset, nilfs);
+		if (segbuf->sb_rest_blocks < NILFS_PSEG_MIN_BLOCKS) {
+			nilfs_shift_to_next_segment(nilfs);
+			nilfs_segbuf_map(segbuf, nilfs->ns_segnum, 0, nilfs);
+		}
+
+		segbuf->sb_sum.seg_seq = nilfs->ns_seg_seq;
+		nextnum = nilfs->ns_nextnum;
+
+		if (nilfs->ns_segnum == nilfs->ns_nextnum)
+			/* Start from the head of a new full segment */
+			alloc++;
+	} else {
+		/* Continue logs */
+		prev = NILFS_LAST_SEGBUF(&sci->sc_write_logs);
+		nilfs_segbuf_map_cont(segbuf, prev);
+		segbuf->sb_sum.seg_seq = prev->sb_sum.seg_seq;
+		nextnum = prev->sb_nextnum;
+
+		if (segbuf->sb_rest_blocks < NILFS_PSEG_MIN_BLOCKS) {
+			nilfs_segbuf_map(segbuf, prev->sb_nextnum, 0, nilfs);
+			segbuf->sb_sum.seg_seq++;
+			alloc++;
+		}
 	}
 
-	if (new) {
-		WARN_ON(!mutex_is_locked(&new->base.dev->struct_mutex));
-		WARN_ON(new->frontbuffer_bits & frontbuffer_bits);
-		new->frontbuffer_bits |= frontbuffer_bits;
+	err = nilfs_sufile_mark_dirty(nilfs->ns_sufile, segbuf->sb_segnum);
+	if (err)
+		goto failed;
+
+	if (alloc) {
+		err = nilfs_sufile_alloc(nilfs->ns_sufile, &nextnum);
+		if (err)
+			goto failed;
+	}
+	nilfs_segbuf_set_next_segnum(segbuf, nextnum, nilfs);
+
+	BUG_ON(!list_empty(&sci->sc_segbufs));
+	list_add_tail(&segbuf->sb_list, &sci->sc_segbufs);
+	sci->sc_segbuf_nblocks = segbuf->sb_rest_blocks;
+	return 0;
+
+ failed:
+	nilfs_segbuf_free(segbuf);
+	return err;
+}
+
+static int nilfs_segctor_extend_segments(struct nilfs_sc_info *sci,
+					 struct the_nilfs *nilfs, int nadd)
+{
+	struct nilfs_segment_buffer *segbuf, *prev;
+	struct inode *sufile = nilfs->ns_sufile;
+	__u64 nextnextnum;
+	LIST_HEAD(list);
+	int err, ret, i;
+
+	prev = NILFS_LAST_SEGBUF(&sci->sc_segbufs);
+	/*
+	 * Since the segment specified with nextnum might be allocated during
+	 * the previous construction, the buffer including its segusage may
+	 * not be dirty.  The following call ensures that the buffer is dirty
+	 * and will pin the buffer on memory until the sufile is written.
+	 */
+	err = nilfs_sufile_mark_dirty(sufile, prev->sb_nextnum);
+	if (unlikely(err))
+		return err;
+
+	for (i = 0; i < nadd; i++) {
+		/* extend segment info */
+		err = -ENOMEM;
+		segbuf = nilfs_segbuf_new(sci->sc_super);
+		if (unlikely(!segbuf))
+			goto failed;
+
+		/* map this buffer to region of segment on-disk */
+		nilfs_segbuf_map(segbuf, prev->sb_nextnum, 0, nilfs);
+		sci->sc_segbuf_nblocks += segbuf->sb_rest_blocks;
+
+		/* allocate the next next full segment */
+		err = nilfs_sufile_alloc(sufile, &nextnextnum);
+		if (unlikely(err))
+			goto failed_segbuf;
+
+		segbuf->sb_sum.seg_seq = prev->sb_sum.seg_seq + 1;
+		nilfs_segbuf_set_next_segnum(segbuf, nextnextnum, nilfs);
+
+		list_add_tail(&segbuf->sb_list, &list);
+		prev = segbuf;
+	}
+	list_splice_tail(&list, &sci->sc_segbufs);
+	return 0;
+
+ failed_segbuf:
+	nilfs_segbuf_free(segbuf);
+ failed:
+	list_for_each_entry(segbuf, &list, sb_list) {
+		ret = nilfs_sufile_free(sufile, segbuf->sb_nextnum);
+		WARN_ON(ret); /* never fails */
+	}
+	nilfs_destroy_logs(&list);
+	return err;
+}
+
+static void nilfs_free_incomplete_logs(struct list_head *logs,
+				       struct the_nilfs *nilfs)
+{
+	struct nilfs_segment_buffer *segbuf, *prev;
+	struct inode *sufile = nilfs->ns_sufile;
+	int ret;
+
+	segbuf = NILFS_FIRST_SEGBUF(logs);
+	if (nilfs->ns_nextnum != segbuf->sb_nextnum) {
+		ret = nilfs_sufile_free(sufile, segbuf->sb_nextnum);
+		WARN_ON(ret); /* never fails */
+	}
+	if (atomic_read(&segbuf->sb_err)) {
+		/* Case 1: The first segment failed */
+		if (segbuf->sb_pseg_start != segbuf->sb_fseg_start)
+			/* Case 1a:  Partial segment appended into an existing
+			   segment */
+			nilfs_terminate_segment(nilfs, segbuf->sb_fseg_start,
+						segbuf->sb_fseg_end);
+		else /* Case 1b:  New full segment */
+			set_nilfs_discontinued(nilfs);
+	}
+
+	prev = segbuf;
+	list_for_each_entry_continue(segbuf, logs, sb_list) {
+		if (prev->sb_nextnum != segbuf->sb_nextnum) {
+			ret = nilfs_sufile_free(sufile, segbuf->sb_nextnum);
+			WARN_ON(ret); /* never fails */
+		}
+		if (atomic_read(&segbuf->sb_err) &&
+		    segbuf->sb_segnum != nilfs->ns_nextnum)
+			/* Case 2: extended segment (!= next) failed */
+			nilfs_sufile_set_error(sufile, segbuf->sb_segnum);
+		prev = segbuf;
 	}
 }
 
-/* All the new VM stuff */
-u64 i915_gem_obj_offset(struct drm_i915_gem_object *o,
-			struct i915_address_space *vm)
+static void nilfs_segctor_update_segusage(struct nilfs_sc_info *sci,
+					  struct inode *sufile)
 {
-	struct drm_i915_private *dev_priv = o->base.dev->dev_private;
-	struct i915_vma *vma;
+	struct nilfs_segment_buffer *segbuf;
+	unsigned long live_blocks;
+	int ret;
 
-	WARN_ON(vm == &dev_priv->mm.aliasing_ppgtt->base);
-
-	list_for_each_entry(vma, &o->vma_list, vma_link) {
-		if (i915_is_ggtt(vma->vm) &&
-		    vma->ggtt_view.type != I915_GGTT_VIEW_NORMAL)
-			continue;
-		if (vma->vm == vm)
-			return vma->node.start;
+	list_for_each_entry(segbuf, &sci->sc_segbufs, sb_list) {
+		live_blocks = segbuf->sb_sum.nblocks +
+			(segbuf->sb_pseg_start - segbuf->sb_fseg_start);
+		ret = nilfs_sufile_set_segment_usage(sufile, segbuf->sb_segnum,
+						     live_blocks,
+						     sci->sc_seg_ctime);
+		WARN_ON(ret); /* always succeed because the segusage is dirty */
 	}
-
-	WARN(1, "%s vma for this object not found.\n",
-	     i915_is_ggtt(vm) ? "global" : "ppgtt");
-	return -1;
 }
 
-u64 i915_gem_obj_ggtt_offset_view(struct drm_i915_gem_object *o,
-				  const struct i915_ggtt_view *view)
+static void nilfs_cancel_segusage(struct list_head *logs, struct inode *sufile)
 {
-	struct i915_address_space *ggtt = i915_obj_to_ggtt(o);
-	struct i915_vma *vma;
+	struct nilfs_segment_buffer *segbuf;
+	int ret;
 
-	list_for_each_entry(vma, &o->vma_list, vma_link)
-		if (vma->vm == ggtt &&
-		    i915_ggtt_view_equal(&vma->ggtt_view, view))
-			return vma->node.start;
+	segbuf = NILFS_FIRST_SEGBUF(logs);
+	ret = nilfs_sufile_set_segment_usage(sufile, segbuf->sb_segnum,
+					     segbuf->sb_pseg_start -
+					     segbuf->sb_fseg_start, 0);
+	WARN_ON(ret); /* always succeed because the segusage is dirty */
 
-	WARN(1, "global vma for this object not found. (view=%u)\n", view->type);
-	return -1;
-}
-
-bool i915_gem_obj_bound(struct drm_i915_gem_object *o,
-			struct i915_address_space *vm)
-{
-	struct i915_vma *vma;
-
-	list_for_each_entry(vma, &o->vma_list, vma_link) {
-		if (i915_is_ggtt(vma->vm) &&
-		    vma->ggtt_view.type != I915_GGTT_VIEW_NORMAL)
-			continue;
-		if (vma->vm == vm && drm_mm_node_allocated(&vma->node))
-			return true;
+	list_for_each_entry_continue(segbuf, logs, sb_list) {
+		ret = nilfs_sufile_set_segment_usage(sufile, segbuf->sb_segnum,
+						     0, 0);
+		WARN_ON(ret); /* always succeed */
 	}
-
-	return false;
 }
 
-bool i915_gem_obj_ggtt_bound_view(struct drm_i915_gem_object *o,
-				  const struct i915_ggtt_view *view)
+static void nilfs_segctor_truncate_segments(struct nilfs_sc_info *sci,
+					    struct nilfs_segment_buffer *last,
+					    struct inode *sufile)
 {
-	struct i915_address_space *ggtt = i915_obj_to_ggtt(o);
-	struct i915_vma *vma;
+	struct nilfs_segment_buffer *segbuf = last;
+	int ret;
 
-	list_for_each_entry(vma, &o->vma_list, vma_link)
-		if (vma->vm == ggtt &&
-		    i915_ggtt_view_equal(&vma->ggtt_view, view) &&
-		    drm_mm_node_allocated(&vma->node))
-			return true;
-
-	return false;
+	list_for_each_entry_continue(segbuf, &sci->sc_segbufs, sb_list) {
+		sci->sc_segbuf_nblocks -= segbuf->sb_rest_blocks;
+		ret = nilfs_sufile_free(sufile, segbuf->sb_nextnum);
+		WARN_ON(ret);
+	}
+	nilfs_truncate_logs(&sci->sc_segbufs, last);
 }
 
-bool i915_gem_obj_bound_any(struct drm_i915_gem_object *o)
+
+static int nilfs_segctor_collect(struct nilfs_sc_info *sci,
+				 struct the_nilfs *nilfs, int mode)
 {
-	struct i915_vma *vma;
+	struct nilfs_cstage prev_stage = sci->sc_stage;
+	int err, nadd = 1;
 
-	list_for_each_entry(vma, &o->vma_list, vma_link)
-		if (drm_mm_node_allocated(&vma->node))
-			return true;
+	/* Collection retry loop */
+	for (;;) {
+		sci->sc_nblk_this_inc = 0;
+		sci->sc_curseg = NILFS_FIRST_SEGBUF(&sci->sc_segbufs);
 
-	return false;
+		err = nilfs_segctor_reset_segment_buffer(sci);
+		if (unlikely(err))
+			goto failed;
+
+		err = nilfs_segctor_collect_blocks(sci, mode);
+		sci->sc_nblk_this_inc += sci->sc_curseg->sb_sum.nblocks;
+		if (!err)
+			break;
+
+		if (unlikely(err != -E2BIG))
+			goto failed;
+
+		/* The current segment is filled up */
+		if (mode != SC_LSEG_SR ||
+		    nilfs_sc_cstage_get(sci) < NILFS_ST_CPFILE)
+			break;
+
+		nilfs_clear_logs(&sci->sc_segbufs);
+
+		if (sci->sc_stage.flags & NILFS_CF_SUFREED) {
+			err = nilfs_sufile_cancel_freev(nilfs->ns_sufile,
+							sci->sc_freesegs,
+							sci->sc_nfreesegs,
+							NULL);
+			WARN_ON(err); /* do not happen */
+			sci->sc_stage.flags &= ~NILFS_CF_SUFREED;
+		}
+
+		err = nilfs_segctor_extend_segments(sci, nilfs, nadd);
+		if (unlikely(err))
+			return err;
+
+		nadd = min_t(int, nadd << 1, SC_MAX_SEGDELTA);
+		sci->sc_stage = prev_stage;
+	}
+	nilfs_segctor_zeropad_segsum(sci);
+	nilfs_segctor_truncate_segments(sci, sci->sc_curseg, nilfs->ns_sufile);
+	return 0;
+
+ failed:
+	return err;
 }
 
-unsigned long i915_gem_obj_size(struct drm_i915_gem_object *o,
-				struct i915_address_space *vm)
+static void nilfs_list_replace_buffer(struct buffer_head *old_bh,
+				      struct buffer_head *new_bh)
 {
-	struct drm_i915_private *dev_priv = o->base.dev->dev_private;
-	struct i915_vma *vma;
+	BUG_ON(!list_empty(&new_bh->b_assoc_buffers));
 
-	WARN_ON(vm == &dev_priv->mm.aliasing_ppgtt->base);
+	list_replace_init(&old_bh->b_assoc_buffers, &new_bh->b_assoc_buffers);
+	/* The caller must release old_bh */
+}
 
-	BUG_ON(list_empty(&o->vma_list));
+static int
+nilfs_segctor_update_payload_blocknr(struct nilfs_sc_info *sci,
+				     struct nilfs_segment_buffer *segbuf,
+				     int mode)
+{
+	struct inode *inode = NULL;
+	sector_t blocknr;
+	unsigned long nfinfo = segbuf->sb_sum.nfinfo;
+	unsigned long nblocks = 0, ndatablk = 0;
+	struct nilfs_sc_operations *sc_op = NULL;
+	struct nilfs_segsum_pointer ssp;
+	struct nilfs_finfo *finfo = NULL;
+	union nilfs_binfo binfo;
+	struct buffer_head *bh, *bh_org;
+	ino_t ino = 0;
+	int err = 0;
 
-	list_for_each_entry(vma, &o->vma_list, vma_link) {
-		if (i915_is_ggtt(vma->vm) &&
-		    vma->ggtt_view.type != I915_GGTT_VIEW_NORMAL)
-			continue;
-		if (vma->vm == vm)
-			return vma->node.size;
+	if (!nfinfo)
+		goto out;
+
+	blocknr = segbuf->sb_pseg_start + segbuf->sb_sum.nsumblk;
+	ssp.bh = NILFS_SEGBUF_FIRST_BH(&segbuf->sb_segsum_buffers);
+	ssp.offset = sizeof(struct nilfs_segment_summary);
+
+	list_for_each_entry(bh, &segbuf->sb_payload_buffers, b_assoc_buffers) {
+		if (bh == segbuf->sb_super_root)
+			break;
+		if (!finfo) {
+			finfo =	nilfs_segctor_map_segsum_entry(
+				sci, &ssp, sizeof(*finfo));
+			ino = le64_to_cpu(finfo->fi_ino);
+			nblocks = le32_to_cpu(finfo->fi_nblocks);
+			ndatablk = le32_to_cpu(finfo->fi_ndatablk);
+
+			inode = bh->b_page->mapping->host;
+
+			if (mode == SC_LSEG_DSYNC)
+				sc_op = &nilfs_sc_dsync_ops;
+			else if (ino == NILFS_DAT_INO)
+				sc_op = &nilfs_sc_dat_ops;
+			else /* file blocks */
+				sc_op = &nilfs_sc_file_ops;
+		}
+		bh_org = bh;
+		get_bh(bh_org);
+		err = nilfs_bmap_assign(NILFS_I(inode)->i_bmap, &bh, blocknr,
+					&binfo);
+		if (bh != bh_org)
+			nilfs_list_replace_buffer(bh_org, bh);
+		brelse(bh_org);
+		if (unlikely(err))
+			goto failed_bmap;
+
+		if (ndatablk > 0)
+			sc_op->write_data_binfo(sci, &ssp, &binfo);
+		else
+			sc_op->write_node_binfo(sci, &ssp, &binfo);
+
+		blocknr++;
+		if (--nblocks == 0) {
+			finfo = NULL;
+			if (--nfinfo == 0)
+				break;
+		} else if (ndatablk > 0)
+			ndatablk--;
+	}
+ out:
+	return 0;
+
+ failed_bmap:
+	return err;
+}
+
+static int nilfs_segctor_assign(struct nilfs_sc_info *sci, int mode)
+{
+	struct nilfs_segment_buffer *segbuf;
+	int err;
+
+	list_for_each_entry(segbuf, &sci->sc_segbufs, sb_list) {
+		err = nilfs_segctor_update_payload_blocknr(sci, segbuf, mode);
+		if (unlikely(err))
+			return err;
+		nilfs_segbuf_fill_in_segsum(segbuf);
 	}
 	return 0;
 }
 
-bool i915_gem_obj_is_pinned(struct drm_i915_gem_object *obj)
+static void nilfs_begin_page_io(struct page *page)
 {
-	struct i915_vma *vma;
-	list_for_each_entry(vma, &obj->vma_list, vma_link)
-		if (vma->pin_count > 0)
-			return true;
+	if (!page || PageWriteback(page))
+		/* For split b-tree node pages, this function may be called
+		   twice.  We ignore the 2nd or later calls by this check. */
+		return;
 
-	return false;
+	lock_page(page);
+	clear_page_dirty_for_io(page);
+	set_page_writeback(page);
+	unlock_page(page);
 }
 
-/* Allocate a new GEM object and fill it with the supplied data */
-struct drm_i915_gem_object *
-i915_gem_object_create_from_data(struct drm_device *dev,
-			         const void *data, size_t size)
+static void nilfs_segctor_prepare_write(struct nilfs_sc_info *sci)
 {
-	struct drm_i915_gem_object *obj;
-	struct sg_table *sg;
-	size_t bytes;
+	struct nilfs_segment_buffer *segbuf;
+	struct page *bd_page = NULL, *fs_page = NULL;
+
+	list_for_each_entry(segbuf, &sci->sc_segbufs, sb_list) {
+		struct buffer_head *bh;
+
+		list_for_each_entry(bh, &segbuf->sb_segsum_buffers,
+				    b_assoc_buffers) {
+			if (bh->b_page != bd_page) {
+				if (bd_page) {
+					lock_page(bd_page);
+					clear_page_dirty_for_io(bd_page);
+					set_page_writeback(bd_page);
+					unlock_page(bd_page);
+				}
+				bd_page = bh->b_page;
+			}
+		}
+
+		list_for_each_entry(bh, &segbuf->sb_payload_buffers,
+				    b_assoc_buffers) {
+			set_buffer_async_write(bh);
+			if (bh == segbuf->sb_super_root) {
+				if (bh->b_page != bd_page) {
+					lock_page(bd_page);
+					clear_page_dirty_for_io(bd_page);
+					set_page_writeback(bd_page);
+					unlock_page(bd_page);
+					bd_page = bh->b_page;
+				}
+				break;
+			}
+			if (bh->b_page != fs_page) {
+				nilfs_begin_page_io(fs_page);
+				fs_page = bh->b_page;
+			}
+		}
+	}
+	if (bd_page) {
+		lock_page(bd_page);
+		clear_page_dirty_for_io(bd_page);
+		set_page_writeback(bd_page);
+		unlock_page(bd_page);
+	}
+	nilfs_begin_page_io(fs_page);
+}
+
+static int nilfs_segctor_write(struct nilfs_sc_info *sci,
+			       struct the_nilfs *nilfs)
+{
 	int ret;
 
-	obj = i915_gem_alloc_object(dev, round_up(size, PAGE_SIZE));
-	if (IS_ERR_OR_NULL(obj))
-		return obj;
+	ret = nilfs_write_logs(&sci->sc_segbufs, nilfs);
+	list_splice_tail_init(&sci->sc_segbufs, &sci->sc_write_logs);
+	return ret;
+}
 
-	ret = i915_gem_object_set_to_cpu_domain(obj, true);
-	if (ret)
-		goto fail;
+static void nilfs_end_page_io(struct page *page, int err)
+{
+	if (!page)
+		return;
 
-	ret = i915_gem_object_get_pages(obj);
-	if (ret)
-		goto fail;
-
-	i915_gem_object_pin_pages(obj);
-	sg = obj->pages;
-	bytes = sg_copy_from_buffer(sg->sgl, sg->nents, (void *)data, size);
-	i915_gem_object_unpin_pages(obj);
-
-	if (WARN_ON(bytes != size)) {
-		DRM_ERROR("Incomplete copy, wrote %zu of %zu", bytes, size);
-		ret = -EFAULT;
-		goto fail;
+	if (buffer_nilfs_node(page_buffers(page)) && !PageWriteback(page)) {
+		/*
+		 * For b-tree node pages, this function may be called twice
+		 * or more because they might be split in a segment.
+		 */
+		if (PageDirty(page)) {
+			/*
+			 * For pages holding split b-tree node buffers, dirty
+			 * flag on the buffers may be cleared discretely.
+			 * In that case, the page is once redirtied for
+			 * remaining buffers, and it must be cancelled if
+			 * all the buffers get cleaned later.
+			 */
+			lock_page(page);
+			if (nilfs_page_buffers_clean(page))
+				__nilfs_clear_page_dirty(page);
+			unlock_page(page);
+		}
+		return;
 	}
 
-	return obj;
+	if (!err) {
+		if (!nilfs_page_buffers_clean(page))
+			__set_page_dirty_nobuffers(page);
+		ClearPageError(page);
+	} else {
+		__set_page_dirty_nobuffers(page);
+		SetPageError(page);
+	}
 
-fail:
-	drm_gem_object_unreference(&obj->base);
-	return ERR_PTR(ret);
+	end_page_writeback(page);
 }
+
+static void nilfs_abort_logs(struct list_head *logs, int err)
+{
+	struct nilfs_segment_buffer *segbuf;
+	struct page *bd_page = NULL, *fs_page = NULL;
+	struct buffer_head *bh;
+
+	if (list_empty(logs))
+		return;
+
+	list_for_each_entry(segbuf, logs, sb_list) {
+		list_for_each_entry(bh, &segbuf->sb_segsum_buffers,
+				    b_assoc_buffers) {
+			clear_buffer_uptodate(bh);
+			if (bh->b_page != bd_page) {
+				if (bd_page)
+					end_page_writeback(bd_page);
+				bd_page = bh->b_page;
+			}
+		}
+
+		list_for_each_entry(bh, &segbuf->sb_payload_buffers,
+				    b_assoc_buffers) {
+			clear_buffer_async_write(bh);
+			if (bh == segbuf->sb_super_root) {
+				clear_buffer_uptodate(bh);
+				if (bh->b_page != bd_page) {
+					end_page_writeback(bd_page);
+					bd_page = bh->b_page;
+				}
+				break;
+			}
+			if (bh->b_page != fs_page) {
+				nilfs_end_page_io(fs_page, err);
+				fs_page = bh->b_page;
+			}
+		}
+	}
+	if (bd_page)
+		end_page_writeback(bd_page);
+
+	nilfs_end_page_io(fs_page, err);
+}
+
+static void nilfs_segctor_abort_construction(struct nilfs_sc_info *sci,
+					     struct the_nilfs *nilfs, int err)
+{
+	LIST_HEAD(logs);
+	int ret;
+
+	list_splice_tail_init(&sci->sc_write_logs, &logs);
+	ret = nilfs_wait_on_logs(&logs);
+	nilfs_abort_logs(&logs, ret ? : err);
+
+	list_splice_tail_init(&sci->sc_segbufs, &logs);
+	nilfs_cancel_segusage(&logs, nilfs->ns_sufile);
+	nilfs_free_incomplete_logs(&logs, nilfs);
+
+	if (sci->sc_stage.flags & NILFS_CF_SUFREED) {
+		ret = nilfs_sufile_cancel_freev(nilfs->ns_sufile,
+						sci->sc_freesegs,
+						sci->sc_nfreesegs,
+						NULL);
+		WARN_ON(ret); /* do not happen */
+	}
+
+	nilfs_destroy_logs(&logs);
+}
+
+static void nilfs_set_next_segment(struct the_nilfs *nilfs,
+				   struct nilfs_segment_buffer *segbuf)
+{
+	nilfs->ns_segnum = segbuf->sb_segnum;
+	nilfs->ns_nextnum = segbuf->sb_nextnum;
+	nilfs->ns_pseg_offset = segbuf->sb_pseg_start - segbuf->sb_fseg_start
+		+ segbuf->sb_sum.nblocks;
+	nilfs->ns_seg_seq = segbuf->sb_sum.seg_seq;
+	nilfs->ns_ctime = segbuf->sb_sum.ctime;
+}
+
+static void nilfs_segctor_complete_write(struct nilfs_sc_info *sci)
+{
+	struct nilfs_segment_buffer *segbuf;
+	struct page *bd_page = NULL, *fs_page = NULL;
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	int update_sr = false;
+
+	list_for_each_entry(segbuf, &sci->sc_write_logs, sb_list) {
+		struct buffer_head *bh;
+
+		list_for_each_entry(bh, &segbuf->sb_segsum_buffers,
+				    b_assoc_buffers) {
+			set_buffer_uptodate(bh);
+			clear_buffer_dirty(bh);
+			if (bh->b_page != bd_page) {
+				if (bd_page)
+					end_page_writeback(bd_page);
+				bd_page = bh->b_page;
+			}
+		}
+		/*
+		 * We assume that the buffers which belong to the same page
+		 * continue over the buffer list.
+		 * Under this assumption, the last BHs of pages is
+		 * identifiable by the discontinuity of bh->b_page
+		 * (page != fs_page).
+		 *
+		 * For B-tree node blocks, however, this assumption is not
+		 * guaranteed.  The cleanup code of B-tree node pages needs
+		 * special care.
+		 */
+		list_for_each_entry(bh, &segbuf->sb_payload_buffers,
+				    b_assoc_buffers) {
+			const unsigned long set_bits = (1 << BH_Uptodate);
+			const unsigned long clear_bits =
+				(1 << BH_Dirty | 1 << BH_Async_Write |
+				 1 << BH_Delay | 1 << BH_NILFS_Volatile |
+				 1 << BH_NILFS_Redirected);
+
+			set_mask_bits(&bh->b_state, clear_bits, set_bits);
+			if (bh == segbuf->sb_super_root) {
+				if (bh->b_page != bd_page) {
+					end_page_writeback(bd_page);
+					bd_page = bh->b_page;
+				}
+				update_sr = true;
+				break;
+			}
+			if (bh->b_page != fs_page) {
+				nilfs_end_page_io(fs_page, 0);
+				fs_page = bh->b_page;
+			}
+		}
+
+		if (!nilfs_segbuf_simplex(segbuf)) {
+			if (segbuf->sb_sum.flags & NILFS_SS_LOGBGN) {
+				set_bit(NILFS_SC_UNCLOSED, &sci->sc_flags);
+				sci->sc_lseg_stime = jiffies;
+			}
+			if (segbuf->sb_sum.flags & NILFS_SS_LOGEND)
+				clear_bit(NILFS_SC_UNCLOSED, &sci->sc_flags);
+		}
+	}
+	/*
+	 * Since pages may continue over multiple segment buffers,
+	 * end of the last page must be checked outside of the loop.
+	 */
+	if (bd_page)
+		end_page_writeback(bd_page);
+
+	nilfs_end_page_io(fs_page, 0);
+
+	nilfs_drop_collected_inodes(&sci->sc_dirty_files);
+
+	if (nilfs_doing_gc())
+		nilfs_drop_collected_inodes(&sci->sc_gc_inodes);
+	else
+		nilfs->ns_nongc_ctime = sci->sc_seg_ctime;
+
+	sci->sc_nblk_inc += sci->sc_nblk_this_inc;
+
+	segbuf = NILFS_LAST_SEGBUF(&sci->sc_write_logs);
+	nilfs_set_next_segment(nilfs, segbuf);
+
+	if (update_sr) {
+		nilfs->ns_flushed_device = 0;
+		nilfs_set_last_segment(nilfs, segbuf->sb_pseg_start,
+				       segbuf->sb_sum.seg_seq, nilfs->ns_cno++);
+
+		clear_bit(NILFS_SC_HAVE_DELTA, &sci->sc_flags);
+		clear_bit(NILFS_SC_DIRTY, &sci->sc_flags);
+		set_bit(NILFS_SC_SUPER_ROOT, &sci->sc_flags);
+		nilfs_segctor_clear_metadata_dirty(sci);
+	} else
+		clear_bit(NILFS_SC_SUPER_ROOT, &sci->sc_flags);
+}
+
+static int nilfs_segctor_wait(struct nilfs_sc_info *sci)
+{
+	int ret;
+
+	ret = nilfs_wait_on_logs(&sci->sc_write_logs);
+	if (!ret) {
+		nilfs_segctor_complete_write(sci);
+		nilfs_destroy_logs(&sci->sc_write_logs);
+	}
+	return ret;
+}
+
+static int nilfs_segctor_collect_dirty_files(struct nilfs_sc_info *sci,
+					     struct the_nilfs *nilfs)
+{
+	struct nilfs_inode_info *ii, *n;
+	struct inode *ifile = sci->sc_root->ifile;
+
+	spin_lock(&nilfs->ns_inode_lock);
+ retry:
+	list_for_each_entry_safe(ii, n, &nilfs->ns_dirty_files, i_dirty) {
+		if (!ii->i_bh) {
+			struct buffer_head *ibh;
+			int err;
+
+			spin_unlock(&nilfs->ns_inode_lock);
+			err = nilfs_ifile_get_inode_block(
+				ifile, ii->vfs_inode.i_ino, &ibh);
+			if (unlikely(err)) {
+				nilfs_warning(sci->sc_super, __func__,
+					      "failed to get inode block.\n");
+				return err;
+			}
+			spin_lock(&nilfs->ns_inode_lock);
+			if (likely(!ii->i_bh))
+				ii->i_bh = ibh;
+			else
+				brelse(ibh);
+			goto retry;
+		}
+
+		// Always redirty the buffer to avoid race condition
+		mark_buffer_dirty(ii->i_bh);
+		nilfs_mdt_mark_dirty(ifile);
+
+		clear_bit(NILFS_I_QUEUED, &ii->i_state);
+		set_bit(NILFS_I_BUSY, &ii->i_state);
+		list_move_tail(&ii->i_dirty, &sci->sc_dirty_files);
+	}
+	spin_unlock(&nilfs->ns_inode_lock);
+
+	return 0;
+}
+
+static void nilfs_segctor_drop_written_files(struct nilfs_sc_info *sci,
+					     struct the_nilfs *nilfs)
+{
+	struct nilfs_inode_info *ii, *n;
+	int during_mount = !(sci->sc_super->s_flags & MS_ACTIVE);
+	int defer_iput = false;
+
+	spin_lock(&nilfs->ns_inode_lock);
+	list_for_each_entry_safe(ii, n, &sci->sc_dirty_files, i_dirty) {
+		if (!test_and_clear_bit(NILFS_I_UPDATED, &ii->i_state) ||
+		    test_bit(NILFS_I_DIRTY, &ii->i_state))
+			continue;
+
+		clear_bit(NILFS_I_BUSY, &ii->i_state);
+		brelse(ii->i_bh);
+		ii->i_bh = NULL;
+		list_del_init(&ii->i_dirty);
+		if (!ii->vfs_inode.i_nlink || during_mount) {
+			/*
+			 * Defer calling iput() to avoid deadlocks if
+			 * i_nlink == 0 or mount is not yet finished.
+			 */
+			list_add_tail(&ii->i_dirty, &sci->sc_iput_queue);
+			defer_iput = true;
+		} else {
+			spin_unlock(&nilfs->ns_inode_lock);
+			iput(&ii->vfs_inode);
+			spin_lock(&nilfs->ns_inode_lock);
+		}
+	}
+	spin_unlock(&nilfs->ns_inode_lock);
+
+	if (defer_iput)
+		schedule_work(&sci->sc_iput_work);
+}
+
+/*
+ * Main procedure of segment constructor
+ */
+static int nilfs_segctor_do_construct(struct nilfs_sc_info *sci, int mode)
+{
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	int err;
+
+	if (sci->sc_super->s_flags & MS_RDONLY)
+		return -EROFS;
+
+	nilfs_sc_cstage_set(sci, NILFS_ST_INIT);
+	sci->sc_cno = nilfs->ns_cno;
+
+	err = nilfs_segctor_collect_dirty_files(sci, nilfs);
+	if (unlikely(err))
+		goto out;
+
+	if (nilfs_test_metadata_dirty(nilfs, sci->sc_root))
+		set_bit(NILFS_SC_DIRTY, &sci->sc_flags);
+
+	if (nilfs_segctor_clean(sci))
+		goto out;
+
+	do {
+		sci->sc_stage.flags &= ~NILFS_CF_HISTORY_MASK;
+
+		err = nilfs_segctor_begin_construction(sci, nilfs);
+		if (unlikely(err))
+			goto out;
+
+		/* Update time stamp */
+		sci->sc_seg_ctime = get_seconds();
+
+		err = nilfs_segctor_collect(sci, nilfs, mode);
+		if (unlikely(err))
+			goto failed;
+
+		/* Avoid empty segment */
+		if (nilfs_sc_cstage_get(sci) == NILFS_ST_DONE &&
+		    nilfs_segbuf_empty(sci->sc_curseg)) {
+			nilfs_segctor_abort_construction(sci, nilfs, 1);
+			goto out;
+		}
+
+		err = nilfs_segctor_assign(sci, mode);
+		if (unlikely(err))
+			goto failed;
+
+		if (sci->sc_stage.flags & NILFS_CF_IFILE_STARTED)
+			nilfs_segctor_fill_in_file_bmap(sci);
+
+		if (mode == SC_LSEG_SR &&
+		    nilfs_sc_cstage_get(sci) >= NILFS_ST_CPFILE) {
+			err = nilfs_segctor_fill_in_checkpoint(sci);
+			if (unlikely(err))
+				goto failed_to_write;
+
+			nilfs_segctor_fill_in_super_root(sci, nilfs);
+		}
+		nilfs_segctor_update_segusage(sci, nilfs->ns_sufile);
+
+		/* Write partial segments */
+		nilfs_segctor_prepare_write(sci);
+
+		nilfs_add_checksums_on_logs(&sci->sc_segbufs,
+					    nilfs->ns_crc_seed);
+
+		err = nilfs_segctor_write(sci, nilfs);
+		if (unlikely(err))
+			goto failed_to_write;
+
+		if (nilfs_sc_cstage_get(sci) == NILFS_ST_DONE ||
+		    nilfs->ns_blocksize_bits != PAGE_CACHE_SHIFT) {
+			/*
+			 * At this point, we avoid double buffering
+			 * for blocksize < pagesize because page dirty
+			 * flag is turned off during write and dirty
+			 * buffers are not properly collected for
+			 * pages crossing over segments.
+			 */
+			err = nilfs_segctor_wait(sci);
+			if (err)
+				goto failed_to_write;
+		}
+	} while (nilfs_sc_cstage_get(sci) != NILFS_ST_DONE);
+
+ out:
+	nilfs_segctor_drop_written_files(sci, nilfs);
+	return err;
+
+ failed_to_write:
+	if (sci->sc_stage.flags & NILFS_CF_IFILE_STARTED)
+		nilfs_redirty_inodes(&sci->sc_dirty_files);
+
+ failed:
+	if (nilfs_doing_gc())
+		nilfs_redirty_inodes(&sci->sc_gc_inodes);
+	nilfs_segctor_abort_construction(sci, nilfs, err);
+	goto out;
+}
+
+/**
+ * nilfs_segctor_start_timer - set timer of background write
+ * @sci: nilfs_sc_info
+ *
+ * If the timer has already been set, it ignores the new request.
+ * This function MUST be called within a section locking the segment
+ * semaphore.
+ */
+static void nilfs_segctor_start_timer(struct nilfs_sc_info *sci)
+{
+	spin_lock(&sci->sc_state_lock);
+	if (!(sci->sc_state & NILFS_SEGCTOR_COMMIT)) {
+		sci->sc_timer.expires = jiffies + sci->sc_interval;
+		add_timer(&sci->sc_timer);
+		sci->sc_state |= NILFS_SEGCTOR_COMMIT;
+	}
+	spin_unlock(&sci->sc_state_lock);
+}
+
+static void nilfs_segctor_do_flush(struct nilfs_sc_info *sci, int bn)
+{
+	spin_lock(&sci->sc_state_lock);
+	if (!(sci->sc_flush_request & (1 << bn))) {
+		unsigned long prev_req = sci->sc_flush_request;
+
+		sci->sc_flush_request |= (1 << bn);
+		if (!prev_req)
+			wake_up(&sci->sc_wait_daemon);
+	}
+	spin_unlock(&sci->sc_state_lock);
+}
+
+/**
+ * nilfs_flush_segment - trigger a segment construction for resource control
+ * @sb: super block
+ * @ino: inode number of the file to be flushed out.
+ */
+void nilfs_flush_segment(struct super_block *sb, ino_t ino)
+{
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	struct nilfs_sc_info *sci = nilfs->ns_writer;
+
+	if (!sci || nilfs_doing_construction())
+		return;
+	nilfs_segctor_do_flush(sci, NILFS_MDT_INODE(sb, ino) ? ino : 0);
+					/* assign bit 0 to data files */
+}
+
+struct nilfs_segctor_wait_request {
+	wait_queue_t	wq;
+	__u32		seq;
+	int		err;
+	atomic_t	done;
+};
+
+static int nilfs_segctor_sync(struct nilfs_sc_info *sci)
+{
+	struct nilfs_segctor_wait_request wait_req;
+	int err = 0;
+
+	spin_lock(&sci->sc_state_lock);
+	init_wait(&wait_req.wq);
+	wait_req.err = 0;
+	atomic_set(&wait_req.done, 0);
+	wait_req.seq = ++sci->sc_seq_request;
+	spin_unlock(&sci->sc_state_lock);
+
+	init_waitqueue_entry(&wait_req.wq, current);
+	add_wait_queue(&sci->sc_wait_request, &wait_req.wq);
+	set_current_state(TASK_INTERRUPTIBLE);
+	wake_up(&sci->sc_wait_daemon);
+
+	for (;;) {
+		if (atomic_read(&wait_req.done)) {
+			err = wait_req.err;
+			break;
+		}
+		if (!signal_pending(current)) {
+			schedule();
+			continue;
+		}
+		err = -ERESTARTSYS;
+		break;
+	}
+	finish_wait(&sci->sc_wait_request, &wait_req.wq);
+	return err;
+}
+
+static void nilfs_segctor_wakeup(struct nilfs_sc_info *sci, int err)
+{
+	struct nilfs_segctor_wait_request *wrq, *n;
+	unsigned long flags;
+
+	spin_lock_irqsave(&sci->sc_wait_request.lock, flags);
+	list_for_each_entry_safe(wrq, n, &sci->sc_wait_request.task_list,
+				 wq.task_list) {
+		if (!atomic_read(&wrq->done) &&
+		    nilfs_cnt32_ge(sci->sc_seq_done, wrq->seq)) {
+			wrq->err = err;
+			atomic_set(&wrq->done, 1);
+		}
+		if (atomic_read(&wrq->done)) {
+			wrq->wq.func(&wrq->wq,
+				     TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE,
+				     0, NULL);
+		}
+	}
+	spin_unlock_irqrestore(&sci->sc_wait_request.lock, flags);
+}
+
+/**
+ * nilfs_construct_segment - construct a logical segment
+ * @sb: super block
+ *
+ * Return Value: On success, 0 is retured. On errors, one of the following
+ * negative error code is returned.
+ *
+ * %-EROFS - Read only filesystem.
+ *
+ * %-EIO - I/O error
+ *
+ * %-ENOSPC - No space left on device (only in a panic state).
+ *
+ * %-ERESTARTSYS - Interrupted.
+ *
+ * %-ENOMEM - Insufficient memory available.
+ */
+int nilfs_construct_segment(struct super_block *sb)
+{
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	struct nilfs_sc_info *sci = nilfs->ns_writer;
+	struct nilfs_transaction_info *ti;
+	int err;
+
+	if (sb->s_flags & MS_RDONLY || unlikely(!sci))
+		return -EROFS;
+
+	/* A call inside transactions causes a deadlock. */
+	BUG_ON((ti = current->journal_info) && ti->ti_magic == NILFS_TI_MAGIC);
+
+	err = nilfs_segctor_sync(sci);
+	return err;
+}
+
+/**
+ * nilfs_construct_dsync_segment - construct a data-only logical segment
+ * @sb: super block
+ * @inode: inode whose data blocks should be written out
+ * @start: start byte offset
+ * @end: end byte offset (inclusive)
+ *
+ * Return Value: On success, 0 is retured. On errors, one of the following
+ * negative error code is returned.
+ *
+ * %-EROFS - Read only filesystem.
+ *
+ * %-EIO - I/O error
+ *
+ * %-ENOSPC - No space left on device (only in a panic state).
+ *
+ * %-ERESTARTSYS - Interrupted.
+ *
+ * %-ENOMEM - Insufficient memory available.
+ */
+int nilfs_construct_dsync_segment(struct super_block *sb, struct inode *inode,
+				  loff_t start, loff_t end)
+{
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	struct nilfs_sc_info *sci = nilfs->ns_writer;
+	struct nilfs_inode_info *ii;
+	struct nilfs_transaction_info ti;
+	int err = 0;
+
+	if (sb->s_flags & MS_RDONLY || unlikely(!sci))
+		return -EROFS;
+
+	nilfs_transaction_lock(sb, &ti, 0);
+
+	ii = NILFS_I(inode);
+	if (test_bit(NILFS_I_INODE_SYNC, &ii->i_state) ||
+	    nilfs_test_opt(nilfs, STRICT_ORDER) ||
+	    test_bit(NILFS_SC_UNCLOSED, &sci->sc_flags) ||
+	    nilfs_discontinued(nilfs)) {
+		nilfs_transaction_unlock(sb);
+		err = nilfs_segctor_sync(sci);
+		return err;
+	}
+
+	spin_lock(&nilfs->ns_inode_lock);
+	if (!test_bit(NILFS_I_QUEUED, &ii->i_state) &&
+	    !test_bit(NILFS_I_BUSY, &ii->i_state)) {
+		spin_unlock(&nilfs->ns_inode_lock);
+		nilfs_transaction_unlock(sb);
+		return 0;
+	}
+	spin_unlock(&nilfs->ns_inode_lock);
+	sci->sc_dsync_inode = ii;
+	sci->sc_dsync_start = start;
+	sci->sc_dsync_end = end;
+
+	err = nilfs_segctor_do_construct(sci, SC_LSEG_DSYNC);
+	if (!err)
+		nilfs->ns_flushed_device = 0;
+
+	nilfs_transaction_unlock(sb);
+	return err;
+}
+
+#define FLUSH_FILE_BIT	(0x1) /* data file only */
+#define FLUSH_DAT_BIT	(1 << NILFS_DAT_INO) /* DAT only */
+
+/**
+ * nilfs_segctor_accept - record accepted sequence count of log-write requests
+ * @sci: segment constructor object
+ */
+static void nilfs_segctor_accept(struct nilfs_sc_info *sci)
+{
+	spin_lock(&sci->sc_state_lock);
+	sci->sc_seq_accepted = sci->sc_seq_request;
+	spin_unlock(&sci->sc_state_lock);
+	del_timer_sync(&sci->sc_timer);
+}
+
+/**
+ * nilfs_segctor_notify - notify the result of request to caller threads
+ * @sci: segment constructor object
+ * @mode: mode of log forming
+ * @err: error code to be notified
+ */
+static void nilfs_segctor_notify(struct nilfs_sc_info *sci, int mode, int err)
+{
+	/* Clear requests (even when the construction failed) */
+	spin_lock(&sci->sc_state_lock);
+
+	if (mode == SC_LSEG_SR) {
+		sci->sc_state &= ~NILFS_SEGCTOR_COMMIT;
+		sci->sc_seq_done = sci->sc_seq_accepted;
+		nilfs_segctor_wakeup(sci, err);
+		sci->sc_flush_request = 0;
+	} else {
+		if (mode == SC_FLUSH_FILE)
+			sci->sc_flush_request &= ~FLUSH_FILE_BIT;
+		else if (mode == SC_FLUSH_DAT)
+			sci->sc_flush_request &= ~FLUSH_DAT_BIT;
+
+		/* re-enable timer if checkpoint creation was not done */
+		if ((sci->sc_state & NILFS_SEGCTOR_COMMIT) &&
+		    time_before(jiffies, sci->sc_timer.expires))
+			add_timer(&sci->sc_timer);
+	}
+	spin_unlock(&sci->sc_state_lock);
+}
+
+/**
+ * nilfs_segctor_construct - form logs and write them to disk
+ * @sci: segment constructor object
+ * @mode: mode of log forming
+ */
+static int nilfs_segctor_construct(struct nilfs_sc_info *sci, int mode)
+{
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	struct nilfs_super_block **sbp;
+	int err = 0;
+
+	nilfs_segctor_accept(sci);
+
+	if (nilfs_discontinued(nilfs))
+		mode = SC_LSEG_SR;
+	if (!nilfs_segctor_confirm(sci))
+		err = nilfs_segctor_do_construct(sci, mode);
+
+	if (likely(!err)) {
+		if (mode != SC_FLUSH_DAT)
+			atomic_set(&nilfs->ns_ndirtyblks, 0);
+		if (test_bit(NILFS_SC_SUPER_ROOT, &sci->sc_flags) &&
+		    nilfs_discontinued(nilfs)) {
+			down_write(&nilfs->ns_sem);
+			err = -EIO;
+			sbp = nilfs_prepare_super(sci->sc_super,
+						  nilfs_sb_will_flip(nilfs));
+			if (likely(sbp)) {
+				nilfs_set_log_cursor(sbp[0], nilfs);
+				err = nilfs_commit_super(sci->sc_super,
+							 NILFS_SB_COMMIT);
+			}
+			up_write(&nilfs->ns_sem);
+		}
+	}
+
+	nilfs_segctor_notify(sci, mode, err);
+	return err;
+}
+
+static void nilfs_construction_timeout(unsigned long data)
+{
+	struct task_struct *p = (struct task_struct *)data;
+	wake_up_process(p);
+}
+
+static void
+nilfs_remove_written_gcinodes(struct the_nilfs *nilfs, struct list_head *head)
+{
+	struct nilfs_inode_info *ii, *n;
+
+	list_for_each_entry_safe(ii, n, head, i_dirty) {
+		if (!test_bit(NILFS_I_UPDATED, &ii->i_state))
+			continue;
+		list_del_init(&ii->i_dirty);
+		truncate_inode_pages(&ii->vfs_inode.i_data, 0);
+		nilfs_btnode_cache_clear(&ii->i_btnode_cache);
+		iput(&ii->vfs_inode);
+	}
+}
+
+int nilfs_clean_segments(struct super_block *sb, struct nilfs_argv *argv,
+			 void **kbufs)
+{
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	struct nilfs_sc_info *sci = nilfs->ns_writer;
+	struct nilfs_transaction_info ti;
+	int err;
+
+	if (unlikely(!sci))
+		return -EROFS;
+
+	nilfs_transaction_lock(sb, &ti, 1);
+
+	err = nilfs_mdt_save_to_shadow_map(nilfs->ns_dat);
+	if (unlikely(err))
+		goto out_unlock;
+
+	err = nilfs_ioctl_prepare_clean_segments(nilfs, argv, kbufs);
+	if (unlikely(err)) {
+		nilfs_mdt_restore_from_shadow_map(nilfs->ns_dat);
+		goto out_unlock;
+	}
+
+	sci->sc_freesegs = kbufs[4];
+	sci->sc_nfreesegs = argv[4].v_nmembs;
+	list_splice_tail_init(&nilfs->ns_gc_inodes, &sci->sc_gc_inodes);
+
+	for (;;) {
+		err = nilfs_segctor_construct(sci, SC_LSEG_SR);
+		nilfs_remove_written_gcinodes(nilfs, &sci->sc_gc_inodes);
+
+		if (likely(!err))
+			break;
+
+		nilfs_warning(sb, __func__,
+			      "segment construction failed. (err=%d)", err);
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule_timeout(sci->sc_interval);
+	}
+	if (nilfs_test_opt(nilfs, DISCARD)) {
+		int ret = nilfs_discard_segments(nilfs, sci->sc_freesegs,
+						 sci->sc_nfreesegs);
+		if (ret) {
+			printk(KERN_WARNING
+			       "NILFS warning: error %d on discard request, "
+			       "turning discards off for the device\n", ret);
+			nilfs_clear_opt(nilfs, DISCARD);
+		}
+	}
+
+ out_unlock:
+	sci->sc_freesegs = NULL;
+	sci->sc_nfreesegs = 0;
+	nilfs_mdt_clear_shadow_map(nilfs->ns_dat);
+	nilfs_transaction_unlock(sb);
+	return err;
+}
+
+static void nilfs_segctor_thread_construct(struct nilfs_sc_info *sci, int mode)
+{
+	struct nilfs_transaction_info ti;
+
+	nilfs_transaction_lock(sci->sc_super, &ti, 0);
+	nilfs_segctor_construct(sci, mode);
+
+	/*
+	 * Unclosed segment should be retried.  We do this using sc_timer.
+	 * Timeout of sc_timer will invoke complete construction which leads
+	 * to close the current logical segment.
+	 */
+	if (test_bit(NILFS_SC_UNCLOSED, &sci->sc_flags))
+		nilfs_segctor_start_timer(sci);
+
+	nilfs_transaction_unlock(sci->sc_super);
+}
+
+static void nilfs_segctor_do_immediate_flush(struct nilfs_sc_info *sci)
+{
+	int mode = 0;
+
+	spin_lock(&sci->sc_state_lock);
+	mode = (sci->sc_flush_request & FLUSH_DAT_BIT) ?
+		SC_FLUSH_DAT : SC_FLUSH_FILE;
+	spin_unlock(&sci->sc_state_lock);
+
+	if (mode) {
+		nilfs_segctor_do_construct(sci, mode);
+
+		spin_lock(&sci->sc_state_lock);
+		sci->sc_flush_request &= (mode == SC_FLUSH_FILE) ?
+			~FLUSH_FILE_BIT : ~FLUSH_DAT_BIT;
+		spin_unlock(&sci->sc_state_lock);
+	}
+	clear_bit(NILFS_SC_PRIOR_FLUSH, &sci->sc_flags);
+}
+
+static int nilfs_segctor_flush_mode(struct nilfs_sc_info *sci)
+{
+	if (!test_bit(NILFS_SC_UNCLOSED, &sci->sc_flags) ||
+	    time_before(jiffies, sci->sc_lseg_stime + sci->sc_mjcp_freq)) {
+		if (!(sci->sc_flush_request & ~FLUSH_FILE_BIT))
+			return SC_FLUSH_FILE;
+		else if (!(sci->sc_flush_request & ~FLUSH_DAT_BIT))
+			return SC_FLUSH_DAT;
+	}
+	return SC_LSEG_SR;
+}
+
+/**
+ * nilfs_segctor_thread - main loop of the segment constructor thread.
+ * @arg: pointer to a struct nilfs_sc_info.
+ *
+ * nilfs_segctor_thread() initializes a timer and serves as a daemon
+ * to execute segment constructions.
+ */
+static int nilfs_segctor_thread(void *arg)
+{
+	struct nilfs_sc_info *sci = (struct nilfs_sc_info *)arg;
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	int timeout = 0;
+
+	sci->sc_timer.data = (unsigned long)current;
+	sci->sc_timer.function = nilfs_construction_timeout;
+
+	/* start sync. */
+	sci->sc_task = current;
+	wake_up(&sci->sc_wait_task); /* for nilfs_segctor_start_thread() */
+	printk(KERN_INFO
+	       "segctord starting. Construction interval = %lu seconds, "
+	       "CP frequency < %lu seconds\n",
+	       sci->sc_interval / HZ, sci->sc_mjcp_freq / HZ);
+
+	spin_lock(&sci->sc_state_lock);
+ loop:
+	for (;;) {
+		int mode;
+
+		if (sci->sc_state & NILFS_SEGCTOR_QUIT)
+			goto end_thread;
+
+		if (timeout || sci->sc_seq_request != sci->sc_seq_done)
+			mode = SC_LSEG_SR;
+		else if (!sci->sc_flush_request)
+			break;
+		else
+			mode = nilfs_segctor_flush_mode(sci);
+
+		spin_unlock(&sci->sc_state_lock);
+		nilfs_segctor_thread_construct(sci, mode);
+		spin_lock(&sci->sc_state_lock);
+		timeout = 0;
+	}
+
+
+	if (freezing(current)) {
+		spin_unlock(&sci->sc_state_lock);
+		try_to_freeze();
+		spin_lock(&sci->sc_state_lock);
+	} else {
+		DEFINE_WAIT(wait);
+		int should_sleep = 1;
+
+		prepare_to_wait(&sci->sc_wait_daemon, &wait,
+				TASK_INTERRUPTIBLE);
+
+		if (sci->sc_seq_request != sci->sc_seq_done)
+			should_sleep = 0;
+		else if (sci->sc_flush_request)
+			should_sleep = 0;
+		else if (sci->sc_state & NILFS_SEGCTOR_COMMIT)
+			should_sleep = time_before(jiffies,
+					sci->sc_timer.expires);
+
+		if (should_sleep) {
+			spin_unlock(&sci->sc_state_lock);
+			schedule();
+			spin_lock(&sci->sc_state_lock);
+		}
+		finish_wait(&sci->sc_wait_daemon, &wait);
+		timeout = ((sci->sc_state & NILFS_SEGCTOR_COMMIT) &&
+			   time_after_eq(jiffies, sci->sc_timer.expires));
+
+		if (nilfs_sb_dirty(nilfs) && nilfs_sb_need_update(nilfs))
+			set_nilfs_discontinued(nilfs);
+	}
+	goto loop;
+
+ end_thread:
+	/* end sync. */
+	sci->sc_task = NULL;
+	wake_up(&sci->sc_wait_task); /* for nilfs_segctor_kill_thread() */
+	spin_unlock(&sci->sc_state_lock);
+	return 0;
+}
+
+static int nilfs_segctor_start_thread(struct nilfs_sc_info *sci)
+{
+	struct task_struct *t;
+
+	t = kthread_run(nilfs_segctor_thread, sci, "segctord");
+	if (IS_ERR(t)) {
+		int err = PTR_ERR(t);
+
+		printk(KERN_ERR "NILFS: error %d creating segctord thread\n",
+		       err);
+		return err;
+	}
+	wait_event(sci->sc_wait_task, sci->sc_task != NULL);
+	return 0;
+}
+
+static void nilfs_segctor_kill_thread(struct nilfs_sc_info *sci)
+	__acquires(&sci->sc_state_lock)
+	__releases(&sci->sc_state_lock)
+{
+	sci->sc_state |= NILFS_SEGCTOR_QUIT;
+
+	while (sci->sc_task) {
+		wake_up(&sci->sc_wait_daemon);
+		spin_unlock(&sci->sc_state_lock);
+		wait_event(sci->sc_wait_task, sci->sc_task == NULL);
+		spin_lock(&sci->sc_state_lock);
+	}
+}
+
+/*
+ * Setup & clean-up functions
+ */
+static struct nilfs_sc_info *nilfs_segctor_new(struct super_block *sb,
+					       struct nilfs_root *root)
+{
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	struct nilfs_sc_info *sci;
+
+	sci = kzalloc(sizeof(*sci), GFP_KERNEL);
+	if (!sci)
+		return NULL;
+
+	sci->sc_super = sb;
+
+	nilfs_get_root(root);
+	sci->sc_root = root;
+
+	init_waitqueue_head(&sci->sc_wait_request);
+	init_waitqueue_head(&sci->sc_wait_daemon);
+	init_waitqueue_head(&sci->sc_wait_task);
+	spin_lock_init(&sci->sc_state_lock);
+	INIT_LIST_HEAD(&sci->sc_dirty_files);
+	INIT_LIST_HEAD(&sci->sc_segbufs);
+	INIT_LIST_HEAD(&sci->sc_write_logs);
+	INIT_LIST_HEAD(&sci->sc_gc_inodes);
+	INIT_LIST_HEAD(&sci->sc_iput_queue);
+	INIT_WORK(&sci->sc_iput_work, nilfs_iput_work_func);
+	init_timer(&sci->sc_timer);
+
+	sci->sc_interval = HZ * NILFS_SC_DEFAULT_TIMEOUT;
+	sci->sc_mjcp_freq = HZ * NILFS_SC_DEFAULT_SR_FREQ;
+	sci->sc_watermark = NILFS_SC_DEFAULT_WATERMARK;
+
+	if (nilfs->ns_interval)
+		sci->sc_interval = HZ * nilfs->ns_interval;
+	if (nilfs->ns_watermark)
+		sci->sc_watermark = nilfs->ns_watermark;
+	return sci;
+}
+
+static void nilfs_segctor_write_out(struct nilfs_sc_info *sci)
+{
+	int ret, retrycount = NILFS_SC_CLEANUP_RETRY;
+
+	/* The segctord thread was stopped and its timer was removed.
+	   But some tasks remain. */
+	do {
+		struct nilfs_transaction_info ti;
+
+		nilfs_transaction_lock(sci->sc_super, &ti, 0);
+		ret = nilfs_segctor_construct(sci, SC_LSEG_SR);
+		nilfs_transaction_unlock(sci->sc_super);
+
+		flush_work(&sci->sc_iput_work);
+
+	} while (ret && ret != -EROFS && retrycount-- > 0);
+}
+
+/**
+ * nilfs_segctor_destroy - destroy the segment constructor.
+ * @sci: nilfs_sc_info
+ *
+ * nilfs_segctor_destroy() kills the segctord thread and frees
+ * the nilfs_sc_info struct.
+ * Caller must hold the segment semaphore.
+ */
+static void nilfs_segctor_destroy(struct nilfs_sc_info *sci)
+{
+	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+	int flag;
+
+	up_write(&nilfs->ns_segctor_sem);
+
+	spin_lock(&sci->sc_state_lock);
+	nilfs_segctor_kill_thread(sci);
+	flag = ((sci->sc_state & NILFS_SEGCTOR_COMMIT) || sci->sc_flush_request
+		|| sci->sc_seq_request != sci->sc_seq_done);
+	spin_unlock(&sci->sc_state_lock);
+
+	if (flush_work(&sci->sc_iput_work))
+		flag = true;
+
+	if (flag || !nilfs_segctor_confirm(sci))
+		nilfs_segctor_write_out(sci);
+
+	if (!list_empty(&sci->sc_dirty_files)) {
+		nilfs_warning(sci->sc_super, __func__,
+			      "dirty file(s) after the final construction\n");
+		nilfs_dispose_list(nilfs, &sci->sc_dirty_files, 1);
+	}
+
+	if (!list_empty(&sci->sc_iput_queue)) {
+		nilfs_warning(sci->sc_super, __func__,
+			      "iput queue is not empty\n");
+		nilfs_dispose_list(nilfs, &sci->sc_iput_queue, 1);
+	}
+
+	WARN_ON(!list_empty(&sci->sc_segbufs));
+	WARN_ON(!list_empty(&sci->sc_write_logs));
+
+	nilfs_put_root(sci->sc_root);
+
+	down_write(&nilfs->ns_segctor_sem);
+
+	del_timer_sync(&sci->sc_timer);
+	kfree(sci);
+}
+
+/**
+ * nilfs_attach_log_writer - attach log writer
+ * @sb: super block instance
+ * @root: root object of the current filesystem tree
+ *
+ * This allocates a log writer object, initializes it, and starts the
+ * log writer.
+ *
+ * Return Value: On success, 0 is returned. On error, one of the following
+ * negative error code is returned.
+ *
+ * %-ENOMEM - Insufficient memory available.
+ */
+int nilfs_attach_log_writer(struct super_block *sb, struct nilfs_root *root)
+{
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	int err;
+
+	if (nilfs->ns_writer) {
+		/*
+		 * This happens if the filesystem is made read-only by
+		 * __nilfs_error or nilfs_remount and then remounted
+		 * read/write.  In these cases, reuse the existing
+		 * writer.
+		 */
+		return 0;
+	}
+
+	nilfs->ns_writer = nilfs_segctor_new(sb, root);
+	if (!nilfs->ns_writer)
+		return -ENOMEM;
+
+	inode_attach_wb(nilfs->ns_bdev->bd_inode, NULL);
+
+	err = nilfs_segctor_start_thread(nilfs->ns_writer);
+	if (unlikely(err))
+		nilfs_detach_log_writer(sb);
+
+	return err;
+}
+
+/**
+ * nilfs_detach_log_writer - destroy log writer
+ * @sb: super block instance
+ *
+ * This kills log writer daemon, frees the log writer object, and
+ * destroys list of dirty files.
+ */
+void nilfs_detach_log_writer(struct super_block *sb)
+{
+	struct the_nilfs *nilfs = sb->s_fs_info;
+	LIST_HEAD(garbage_list);
+
+	down_write(&nilfs->ns_segctor_sem);
+	if (nilfs->ns_writer) {
+		nilfs_segctor_destroy(nilfs->ns_writer);
+		nilfs->ns_writer = NULL;
+	}
+	set_nilfs_purging(nilfs);
+
+	/* Force to free the list of dirty files */
+	spin_lock(&nilfs->ns_inode_lock);
+	if (!list_empty(&nilfs->ns_dirty_files)) {
+		list_splice_init(&nilfs->ns_dirty_files, &garbage_list);
+		nilfs_warning(sb, __func__,
+			      "Hit dirty file after stopped log writer\n");
+	}
+	spin_unlock(&nilfs->ns_inode_lock);
+	up_write(&nilfs->ns_segctor_sem);
+
+	nilfs_dispose_list(nilfs, &garbage_list, 1);
+	clear_nilfs_purging(nilfs);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * linux/fs/nls/nls_cp932.c
+ *
+ * Charset cp932 translation tables.
+ * This translation table was generated automatically, the
+ * original table can be download from the Microsoft website.
+ * (http://www.microsoft.com/typography/unicode/unicodecp.htm)
+ */
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
+#include <linux/nls.h>
+#include <linux/errno.h>
+
+static const wchar_t c2u_81[256] = {
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x00-0x07 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x08-0x0F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x10-0x17 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x18-0x1F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x20-0x27 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x28-0x2F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x30-0x37 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x38-0x3F */
+	0x3000,0x3001,0x3002,0xFF0C,0xFF0E,0x30FB,0xFF1A,0xFF1B,/* 0x40-0x47 */
+	0xFF1F,0xFF01,0x309B,0x309C,0x00B4,0xFF40,0x00A8,0xFF3E,/* 0x48-0x4F */
+	0xFFE3,0xFF3F,0x30FD,0x30FE,0x309D,0x309E,0x3003,0x4EDD,/* 0x50-0x57 */
+	0x3005,0x3006,0x3007,0x30FC,0x2015,0x2010,0xFF0F,0xFF3C,/* 0x58-0x5F */
+	0xFF5E,0x2225,0xFF5C,0x2026,0x2025,0x2018,0x2019,0x201C,/* 0x60-0x67 */
+	0x201D,0xFF08,0xFF09,0x3014,0x3015,0xFF3B,0xFF3D,0xFF5B,/* 0x68-0x6F */
+	0xFF5D,0x3008,0x3009,0x300A,0x300B,0x300C,0x300D,0x300E,/* 0x70-0x77 */
+	0x300F,0x3010,0x3011,0xFF0B,0xFF0D,0x00B1,0x00D7,0x0000,/* 0x78-0x7F */
+
+	0x00F7,0xFF1D,0x2260,0xFF1C,0xFF1E,0x2266,0x2267,0x221E,/* 0x80-0x87 */
+	0x2234,0x2642,0x2640,0x00B0,0x2032,0x2033,0x2103,0xFFE5,/* 0x88-0x8F */
+	0xFF04,0xFFE0,0xFFE1,0xFF05,0xFF03,0xFF06,0xFF0A,0xFF20,/* 0x90-0x97 */
+	0x00A7,0x2606,0x2605,0x25CB,0x25CF,0x25CE,0x25C7,0x25C6,/* 0x98-0x9F */
+	0x25A1,0x25A0,0x25B3,0x25B2,0x25BD,0x25BC,0x203B,0x3012,/* 0xA0-0xA7 */
+	0x2192,0x2190,0x2191,0x2193,0x3013,0x0000,0x0000,0x0000,/* 0xA8-0xAF */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0xB0-0xB7 */
+	0x2208,0x220B,0x2286,0x2287,0x2282,0x2283,0x222A,0x2229,/* 0xB8-0xBF */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0xC0-0xC7 */
+	0x2227,0x2228,0xFFE2,0x21D2,0x21D4,0x2200,0x2203,0x0000,/* 0xC8-0xCF */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0xD0-0xD7 */
+	0x0000,0x0000,0x2220,0x22A5,0x2312,0x2202,0x2207,0x2261,/* 0xD8-0xDF */
+	0x2252,0x226A,0x226B,0x221A,0x223D,0x221D,0x2235,0x222B,/* 0xE0-0xE7 */
+	0x222C,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0xE8-0xEF */
+	0x212B,0x2030,0x266F,0x266D,0x266A,0x2020,0x2021,0x00B6,/* 0xF0-0xF7 */
+	0x0000,0x0000,0x0000,0x0000,0x25EF,0x0000,0x0000,0x0000,/* 0xF8-0xFF */
+};
+
+static const wchar_t c2u_82[256] = {
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x00-0x07 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x08-0x0F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x10-0x17 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x18-0x1F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x20-0x27 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x28-0x2F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x30-0x37 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x38-0x3F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x40-0x47 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0xFF10,/* 0x48-0x4F */
+	0xFF11,0xFF12,0xFF13,0xFF14,0xFF15,0xFF16,0xFF17,0xFF18,/* 0x50-0x57 */
+	0xFF19,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x58-0x5F */
+	0xFF21,0xFF22,0xFF23,0xFF24,0xFF25,0xFF26,0xFF27,0xFF28,/* 0x60-0x67 */
+	0xFF29,0xFF2A,0xFF2B,0xFF2C,0xFF2D,0xFF2E,0xFF2F,0xFF30,/* 0x68-0x6F */
+	0xFF31,0xFF32,0xFF33,0xFF34,0xFF35,0xFF36,0xFF37,0xFF38,/* 0x70-0x77 */
+	0xFF39,0xFF3A,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x78-0x7F */
+
+	0x0000,0xFF41,0xFF42,0xFF43,0xFF44,0xFF45,0xFF46,0xFF47,/* 0x80-0x87 */
+	0xFF48,0xFF49,0xFF4A,0xFF4B,0xFF4C,0xFF4D,0xFF4E,0xFF4F,/* 0x88-0x8F */
+	0xFF50,0xFF51,0xFF52,0xFF53,0xFF54,0xFF55,0xFF56,0xFF57,/* 0x90-0x97 */
+	0xFF58,0xFF59,0xFF5A,0x0000,0x0000,0x0000,0x0000,0x3041,/* 0x98-0x9F */
+	0x3042,0x3043,0x3044,0x3045,0x3046,0x3047,0x3048,0x3049,/* 0xA0-0xA7 */
+	0x304A,0x304B,0x304C,0x304D,0x304E,0x304F,0x3050,0x3051,/* 0xA8-0xAF */
+	0x3052,0x3053,0x3054,0x3055,0x3056,0x3057,0x3058,0x3059,/* 0xB0-0xB7 */
+	0x305A,0x305B,0x305C,0x305D,0x305E,0x305F,0x3060,0x3061,/* 0xB8-0xBF */
+	0x3062,0x3063,0x3064,0x3065,0x3066,0x3067,0x3068,0x3069,/* 0xC0-0xC7 */
+	0x306A,0x306B,0x306C,0x306D,0x306E,0x306F,0x3070,0x3071,/* 0xC8-0xCF */
+	0x3072,0x3073,0x3074,0x3075,0x3076,0x3077,0x3078,0x3079,/* 0xD0-0xD7 */
+	0x307A,0x307B,0x307C,0x307D,0x307E,0x307F,0x3080,0x3081,/* 0xD8-0xDF */
+	0x3082,0x3083,0x3084,0x3085,0x3086,0x3087,0x3088,0x3089,/* 0xE0-0xE7 */
+	0x308A,0x308B,0x308C,0x308D,0x308E,0x308F,0x3090,0x3091,/* 0xE8-0xEF */
+	0x3092,0x3093,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0xF0-0xF7 */
+};
+
+static const wchar_t c2u_83[256] = {
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x00-0x07 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x08-0x0F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x10-0x17 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x18-0x1F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x20-0x27 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x28-0x2F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x30-0x37 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x38-0x3F */
+	0x30A1,0x30A2,0x30A3,0x30A4,0x30A5,0x30A6,0x30A7,0x30A8,/* 0x40-0x47 */
+	0x30A9,0x30AA,0x30AB,0x30AC,0x30AD,0x30AE,0x30AF,0x30B0,/* 0x48-0x4F */
+	0x30B1,0x30B2,0x30B3,0x30B4,0x30B5,0x30B6,0x30B7,0x30B8,/* 0x50-0x57 */
+	0x30B9,0x30BA,0x30BB,0x30BC,0x30BD,0x30BE,0x30BF,0x30C0,/* 0x58-0x5F */
+	0x30C1,0x30C2,0x30C3,0x30C4,0x30C5,0x30C6,0x30C7,0x30C8,/* 0x60-0x67 */
+	0x30C9,0x30CA,0x30CB,0x30CC,0x30CD,0x30CE,0x30CF,0x30D0,/* 0x68-0x6F */
+	0x30D1,0x30D2,0x30D3,0x30D4,0x30D5,0x30D6,0x30D7,0x30D8,/* 0x70-0x77 */
+	0x30D9,0x30DA,0x30DB,0x30DC,0x30DD,0x30DE,0x30DF,0x0000,/* 0x78-0x7F */
+
+	0x30E0,0x30E1,0x30E2,0x30E3,0x30E4,0x30E5,0x30E6,0x30E7,/* 0x80-0x87 */
+	0x30E8,0x30E9,0x30EA,0x30EB,0x30EC,0x30ED,0x30EE,0x30EF,/* 0x88-0x8F */
+	0x30F0,0x30F1,0x30F2,0x30F3,0x30F4,0x30F5,0x30F6,0x0000,/* 0x90-0x97 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0391,/* 0x98-0x9F */
+	0x0392,0x0393,0x0394,0x0395,0x0396,0x0397,0x0398,0x0399,/* 0xA0-0xA7 */
+	0x039A,0x039B,0x039C,0x039D,0x039E,0x039F,0x03A0,0x03A1,/* 0xA8-0xAF */
+	0x03A3,0x03A4,0x03A5,0x03A6,0x03A7,0x03A8,0x03A9,0x0000,/* 0xB0-0xB7 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x03B1,/* 0xB8-0xBF */
+	0x03B2,0x03B3,0x03B4,0x03B5,0x03B6,0x03B7,0x03B8,0x03B9,/* 0xC0-0xC7 */
+	0x03BA,0x03BB,0x03BC,0x03BD,0x03BE,0x03BF,0x03C0,0x03C1,/* 0xC8-0xCF */
+	0x03C3,0x03C4,0x03C5,0x03C6,0x03C7,0x03C8,0x03C9,0x0000,/* 0xD0-0xD7 */
+};
+
+static const wchar_t c2u_84[256] = {
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x00-0x07 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x08-0x0F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x10-0x17 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x18-0x1F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x20-0x27 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x28-0x2F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x30-0x37 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x38-0x3F */
+	0x0410,0x0411,0x0412,0x0413,0x0414,0x0415,0x0401,0x0416,/* 0x40-0x47 */
+	0x0417,0x0418,0x0419,0x041A,0x041B,0x041C,0x041D,0x041E,/* 0x48-0x4F */
+	0x041F,0x0420,0x0421,0x0422,0x0423,0x0424,0x0425,0x0426,/* 0x50-0x57 */
+	0x0427,0x0428,0x0429,0x042A,0x042B,0x042C,0x042D,0x042E,/* 0x58-0x5F */
+	0x042F,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x60-0x67 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x68-0x6F */
+	0x0430,0x0431,0x0432,0x0433,0x0434,0x0435,0x0451,0x0436,/* 0x70-0x77 */
+	0x0437,0x0438,0x0439,0x043A,0x043B,0x043C,0x043D,0x0000,/* 0x78-0x7F */
+
+	0x043E,0x043F,0x0440,0x0441,0x0442,0x0443,0x0444,0x0445,/* 0x80-0x87 */
+	0x0446,0x0447,0x0448,0x0449,0x044A,0x044B,0x044C,0x044D,/* 0x88-0x8F */
+	0x044E,0x044F,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x90-0x97 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x2500,/* 0x98-0x9F */
+	0x2502,0x250C,0x2510,0x2518,0x2514,0x251C,0x252C,0x2524,/* 0xA0-0xA7 */
+	0x2534,0x253C,0x2501,0x2503,0x250F,0x2513,0x251B,0x2517,/* 0xA8-0xAF */
+	0x2523,0x2533,0x252B,0x253B,0x254B,0x2520,0x252F,0x2528,/* 0xB0-0xB7 */
+	0x2537,0x253F,0x251D,0x2530,0x2525,0x2538,0x2542,0x0000,/* 0xB8-0xBF */
+};
+
+static const wchar_t c2u_87[256] = {
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x00-0x07 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x08-0x0F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x10-0x17 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x18-0x1F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x20-0x27 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x28-0x2F */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x30-0x37 */
+	0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,0x0000,/* 0x38-0x3F */
+	0x2460,0x2461,0x2462,0x2463,0x2464,0x2465,0x2466,0x2467,/* 0x40-0x47 */
+	0x2468,0x2469,0x246A,0x246B,0x246C,0x246D,0x246E,0x246F,/* 0x48-0x4F */
+	0x2470,0x2471,0x2472,0x2473,0x2160,0x2161,0x2162,0x2163,/* 0x50-0x57 */
+	0x2164,0x2165,0x2166,0x2167,0x2168,0x2169,0x0000,0x33

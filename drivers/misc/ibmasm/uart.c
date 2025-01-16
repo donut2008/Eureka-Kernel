@@ -1,72 +1,28 @@
-
-/*
- * IBM ASM Service Processor Device Driver
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
- *
- * Copyright (C) IBM Corporation, 2004
- *
- * Author: Max Asböck <amax@us.ibm.com>
- *
- */
-
-#include <linux/termios.h>
-#include <linux/tty.h>
-#include <linux/serial_core.h>
-#include <linux/serial_reg.h>
-#include <linux/serial_8250.h>
-#include "ibmasm.h"
-#include "lowlevel.h"
-
-
-void ibmasm_register_uart(struct service_processor *sp)
-{
-	struct uart_8250_port uart;
-	void __iomem *iomem_base;
-
-	iomem_base = sp->base_address + SCOUT_COM_B_BASE;
-
-	/* read the uart scratch register to determine if the UART
-	 * is dedicated to the service processor or if the OS can use it
-	 */
-	if (0 == readl(iomem_base + UART_SCR)) {
-		dev_info(sp->dev, "IBM SP UART not registered, owned by service processor\n");
-		sp->serial_line = -1;
-		return;
-	}
-
-	memset(&uart, 0, sizeof(uart));
-	uart.port.irq		= sp->irq;
-	uart.port.uartclk	= 3686400;
-	uart.port.flags		= UPF_SHARE_IRQ;
-	uart.port.iotype	= UPIO_MEM;
-	uart.port.membase	= iomem_base;
-
-	sp->serial_line = serial8250_register_8250_port(&uart);
-	if (sp->serial_line < 0) {
-		dev_err(sp->dev, "Failed to register serial port\n");
-		return;
-	}
-	enable_uart_interrupts(sp->base_address);
-}
-
-void ibmasm_unregister_uart(struct service_processor *sp)
-{
-	if (sp->serial_line < 0)
-		return;
-
-	disable_uart_interrupts(sp->base_address);
-	serial8250_unregister_port(sp->serial_line);
-}
+efine PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_PWRON_LUT_ENTRY_LS2__SHIFT 0x8
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_LEFT_EN_LUT_ENTRY_LS0_MASK 0x200
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_LEFT_EN_LUT_ENTRY_LS0__SHIFT 0x9
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_LEFT_EN_LUT_ENTRY_LS1_MASK 0x400
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_LEFT_EN_LUT_ENTRY_LS1__SHIFT 0xa
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_LEFT_EN_LUT_ENTRY_LS2_MASK 0x800
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_LEFT_EN_LUT_ENTRY_LS2__SHIFT 0xb
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_RIGHT_EN_LUT_ENTRY_LS0_MASK 0x1000
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_RIGHT_EN_LUT_ENTRY_LS0__SHIFT 0xc
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_RIGHT_EN_LUT_ENTRY_LS1_MASK 0x2000
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_RIGHT_EN_LUT_ENTRY_LS1__SHIFT 0xd
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_RIGHT_EN_LUT_ENTRY_LS2_MASK 0x4000
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_RIGHT_EN_LUT_ENTRY_LS2__SHIFT 0xe
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_RO_HSCLK_LEFT_EN_GATING_EN_MASK 0x8000
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_RO_HSCLK_LEFT_EN_GATING_EN__SHIFT 0xf
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_RO_HSCLK_RIGHT_EN_GATING_EN_MASK 0x10000
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_RO_HSCLK_RIGHT_EN_GATING_EN__SHIFT 0x10
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_LEFT_EN_GATING_EN_MASK 0x20000
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_LEFT_EN_GATING_EN__SHIFT 0x11
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_RIGHT_EN_GATING_EN_MASK 0x40000
+#define PB0_PLL_RO_GLB_CTRL_REG0__PLL_LC_HSCLK_RIGHT_EN_GATING_EN__SHIFT 0x12
+#define PB0_PLL_RO0_CTRL_REG0__PLL_DBG_RO_ANALOG_SEL_0_MASK 0x3
+#define PB0_PLL_RO0_CTRL_REG0__PLL_DBG_RO_ANALOG_SEL_0__SHIFT 0x0
+#define PB0_PLL_RO0_CTRL_REG0__PLL_DBG_RO_EXT_RESET_EN_0_MASK 0x4
+#define PB0_PLL_RO0_CTRL_REG0__PLL_DBG_RO_EXT_RESET_EN_0__SHIFT 0x2
+#define PB0_PLL_RO0_CTRL_REG0__PLL_DBG_RO_VCTL_ADC_EN_0_MASK 0x8
+#define PB0_PLL_RO0_CTRL_REG0__PLL_DBG_RO_VCTL_ADC_EN_0__SHIFT 0x3
+#define PB0_PLL_RO0_CTRL

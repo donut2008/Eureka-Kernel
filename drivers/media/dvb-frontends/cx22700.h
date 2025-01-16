@@ -1,46 +1,6 @@
-/*
-    Conexant CX22700 DVB OFDM demodulator driver
-
-    Copyright (C) 2001-2002 Convergence Integrated Media GmbH
-	Holger Waechtler <holger@convergence.de>
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
-
-*/
-
-#ifndef CX22700_H
-#define CX22700_H
-
-#include <linux/dvb/frontend.h>
-
-struct cx22700_config
-{
-	/* the demodulator's i2c address */
-	u8 demod_address;
-};
-
-#if IS_REACHABLE(CONFIG_DVB_CX22700)
-extern struct dvb_frontend* cx22700_attach(const struct cx22700_config* config,
-					   struct i2c_adapter* i2c);
-#else
-static inline struct dvb_frontend* cx22700_attach(const struct cx22700_config* config,
-					   struct i2c_adapter* i2c)
-{
-	printk(KERN_WARNING "%s: driver disabled by Kconfig\n", __func__);
-	return NULL;
-}
-#endif // CONFIG_DVB_CX22700
-
-#endif // CX22700_H
+ğ÷ÏAÕŠ=¼ä¥8ÿöôå”
+@µzŸXx¥È-Ú5Qö¤ÏÃ’“ò©#İıùıÈİ6ßm}{²ïmcé'",1ısöØrpïo Éåx'Ğ«B@ôú5£ã}"òªÂï—xå˜:½Xøà\´n[@wHè·;{Ì
+/ôÓNkIéäVØ›åo2û^ú»ŠNŸ˜sŠY{_:ğ›,qO0èû+0èR„U“kRJ!ò°Ôƒ:è$iõi,CËïø*^’³Nf ÇÓ*:©×œRÅBÿb¥õa–B¾€Maä|ŸàHx%"àà5’™-z¢×ÛvùhaT”™E9¬ÅA$«ê‡8ajr'JÍ/¦ô­¸C¾d¡ÛÑ[¬û`×\¬è.}I	'2Å‰»€tßÁ:ƒı i(ƒ”:¼~íj}ñç$…ŸOFª˜ğ2½/¿Ô£¶›0“gôŠeZÖSÕÛ~ğè7@ı[(;K4°ŞÚ°kJOU:õ7×â
+´“­ãI²8"A%‚IF!SD0i‘¦ªOûcyQ0#ÔK\Ö-¦ÙªH0…çÉøDpè™ùZúÑk‚@Ç“\SöÑú] ˆúÎÆQ]á·SŞ-9Š§¼û½	É†è.½H}ƒ æŠS1PÜúNŒZÜÆÛù‰cç—[şô‹ä5Óâ¤ø¦ÒÖ(D¶Ô´×ÑgV*rZÊ>`)†—g¤ãÒ:È5œ?‹®w)rµ‚?¾zÖç¢!/€°9QıLg‡ô…²S,A´›Šù òÒúLœ¶·œÚÀòÔöúÂ"cö´§L*·¼ø[ùlòĞ]±ØÓCy+BĞçÜñŸÙffG}/…æN³"6P¶s¬e(¬ş;P7>Lz£NÌävV/û•@šŸÍò™šKì³ĞYeZ‹øyĞw’ÏšĞÿØ}æ‡—5ÜÈaw,>ÚÀ”ù–fzúZD>ª¥äŸÔ—À„³†È='K¶ÄÁªfS;»Ñ²ÓtòWÅJ‡ºRA£×»PŒ4Â é^N‰‰¢ˆ´şTY8Ã±·ÈQÆ§G›.‹¹ël¾ŞMÿ¯ú>»H“UèR@—’–RCÇu±RŞ¦bèÌ£µ7}·÷ıŞƒÅãµ}C/‘"ˆRj·W·¤åÙkˆõ4ıéßºW[,÷’?O'Ã-ûÂ=,òúåÕ=¯Ğøà0-¶ß=k·Ô?›Í3	ˆnôF)«_…+èNWz3Ø&pÕÜOë&Ø4ò¨àykEqmH‹HZ­ZîT”Ö³K.Œg†8×œ%*Xœ’ËU1Çâ†äq¬¹g¸rrJ5zH²÷¸R§2Â”åµ|\Œİæ<DËïçÈŸ·×ûu;Âœ)8¾³¾Ô@‘¶õg[”ô£‰”@‹‹ãû43 q¾©Ÿ‹’FŸçW^)Â«~[îêÃ¨v˜‰BŞæT ºmäÜjå•p!p{ó5Ş
+³êO++ë¹ø-p‡'ºxdô ß¬ˆcŸŒœƒşTQ~g(¹%Ní|@ÍìîSRêùØÈGGì!äs0šÕ=+¯*
+sIÍ»›mçn˜#U\ÏõlÑ'¦)DÊ†Ï'7«m¯ßëçª¡UÃ)—NàTÈ'?bñ, ÏkYˆÃÉ¥Y¶d˜Æ‘ƒ_hø{p#Û°Wu|^÷ øÈ„øCõ*P7ÑÌrê×"lœ¤ÊX–.ÛûM(,•¾HŒ‹•©Õ»°§i§°‚Pİ¡èeØ.İ6ùR'›Fƒ°ù¦Ğ)™¦íaì1ÖĞS¾|Ä?Y‹L;ï?%`]i\5# O-®©x‹\¨Å¨qzK5Ü•ãÚ—EJ‰¥Çe™˜¨®Êµ‰

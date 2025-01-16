@@ -19,7 +19,6 @@
 Devices: A10, A20, A20e, A30, A30s, A40
 
 + Battery protection support for OneUI 6.1+
-+ KernelSU 0.9.4
 + Upstream from 4.4.177 to 4.4.302-p6
 
 >------------------------------------------------<

@@ -1,191 +1,112 @@
-
-#include <linux/kernel.h>
-#include <linux/gfp.h>
-#include <linux/ide.h>
-
-DEFINE_MUTEX(ide_setting_mtx);
-
-ide_devset_get(io_32bit, io_32bit);
-
-static int set_io_32bit(ide_drive_t *drive, int arg)
-{
-	if (drive->dev_flags & IDE_DFLAG_NO_IO_32BIT)
-		return -EPERM;
-
-	if (arg < 0 || arg > 1 + (SUPPORT_VLB_SYNC << 1))
-		return -EINVAL;
-
-	drive->io_32bit = arg;
-
-	return 0;
+c_cnt - 1, len, flags);
 }
 
-ide_devset_get_flag(ksettings, IDE_DFLAG_KEEP_SETTINGS);
-
-static int set_ksettings(ide_drive_t *drive, int arg)
+static void
+dump_pq_desc_dbg(struct ioatdma_chan *ioat_chan, struct ioat_ring_ent *desc,
+		 struct ioat_ring_ent *ext)
 {
-	if (arg < 0 || arg > 1)
-		return -EINVAL;
+	struct device *dev = to_dev(ioat_chan);
+	struct ioat_pq_descriptor *pq = desc->pq;
+	struct ioat_pq_ext_descriptor *pq_ex = ext ? ext->pq_ex : NULL;
+	struct ioat_raw_descriptor *descs[] = { (void *) pq, (void *) pq_ex };
+	int src_cnt = src_cnt_to_sw(pq->ctl_f.src_cnt);
+	int i;
 
-	if (arg)
-		drive->dev_flags |= IDE_DFLAG_KEEP_SETTINGS;
-	else
-		drive->dev_flags &= ~IDE_DFLAG_KEEP_SETTINGS;
-
-	return 0;
+	dev_dbg(dev, "desc[%d]: (%#llx->%#llx) flags: %#x"
+		" sz: %#10.8x ctl: %#x (op: %#x int: %d compl: %d pq: '%s%s'"
+		" src_cnt: %d)\n",
+		desc_id(desc), (unsigned long long) desc->txd.phys,
+		(unsigned long long) (pq_ex ? pq_ex->next : pq->next),
+		desc->txd.flags, pq->size, pq->ctl, pq->ctl_f.op,
+		pq->ctl_f.int_en, pq->ctl_f.compl_write,
+		pq->ctl_f.p_disable ? "" : "p", pq->ctl_f.q_disable ? "" : "q",
+		pq->ctl_f.src_cnt);
+	for (i = 0; i < src_cnt; i++)
+		dev_dbg(dev, "\tsrc[%d]: %#llx coef: %#x\n", i,
+			(unsigned long long) pq_get_src(descs, i), pq->coef[i]);
+	dev_dbg(dev, "\tP: %#llx\n", pq->p_addr);
+	dev_dbg(dev, "\tQ: %#llx\n", pq->q_addr);
+	dev_dbg(dev, "\tNEXT: %#llx\n", pq->next);
 }
 
-ide_devset_get_flag(using_dma, IDE_DFLAG_USING_DMA);
-
-static int set_using_dma(ide_drive_t *drive, int arg)
+static void dump_pq16_desc_dbg(struct ioatdma_chan *ioat_chan,
+			       struct ioat_ring_ent *desc)
 {
-#ifdef CONFIG_BLK_DEV_IDEDMA
-	int err = -EPERM;
+	struct device *dev = to_dev(ioat_chan);
+	struct ioat_pq_descriptor *pq = desc->pq;
+	struct ioat_raw_descriptor *descs[] = { (void *)pq,
+						(void *)pq,
+						(void *)pq };
+	int src_cnt = src16_cnt_to_sw(pq->ctl_f.src_cnt);
+	int i;
 
-	if (arg < 0 || arg > 1)
-		return -EINVAL;
+	if (desc->sed) {
+		descs[1] = (void *)desc->sed->hw;
+		descs[2] = (void *)desc->sed->hw + 64;
+	}
 
-	if (ata_id_has_dma(drive->id) == 0)
-		goto out;
+	dev_dbg(dev, "desc[%d]: (%#llx->%#llx) flags: %#x"
+		" sz: %#x ctl: %#x (op: %#x int: %d compl: %d pq: '%s%s'"
+		" src_cnt: %d)\n",
+		desc_id(desc), (unsigned long long) desc->txd.phys,
+		(unsigned long long) pq->next,
+		desc->txd.flags, pq->size, pq->ctl,
+		pq->ctl_f.op, pq->ctl_f.int_en,
+		pq->ctl_f.compl_write,
+		pq->ctl_f.p_disable ? "" : "p", pq->ctl_f.q_disable ? "" : "q",
+		pq->ctl_f.src_cnt);
+	for (i = 0; i < src_cnt; i++) {
+		dev_dbg(dev, "\tsrc[%d]: %#llx coef: %#x\n", i,
+			(unsigned long long) pq16_get_src(descs, i),
+			pq->coef[i]);
+	}
+	dev_dbg(dev, "\tP: %#llx\n", pq->p_addr);
+	dev_dbg(dev, "\tQ: %#llx\n", pq->q_addr);
+}
 
-	if (drive->hwif->dma_ops == NULL)
-		goto out;
+static struct dma_async_tx_descriptor *
+__ioat_prep_pq_lock(struct dma_chan *c, enum sum_check_flags *result,
+		     const dma_addr_t *dst, const dma_addr_t *src,
+		     unsigned int src_cnt, const unsigned char *scf,
+		     size_t len, unsigned long flags)
+{
+	struct ioatdma_chan *ioat_chan = to_ioat_chan(c);
+	struct ioatdma_device *ioat_dma = ioat_chan->ioat_dma;
+	struct ioat_ring_ent *compl_desc;
+	struct ioat_ring_ent *desc;
+	struct ioat_ring_ent *ext;
+	size_t total_len = len;
+	struct ioat_pq_descriptor *pq;
+	struct ioat_pq_ext_descriptor *pq_ex = NULL;
+	struct ioat_dma_descriptor *hw;
+	u32 offset = 0;
+	u8 op = result ? IOAT_OP_PQ_VAL : IOAT_OP_PQ;
+	int i, s, idx, with_ext, num_descs;
+	int cb32 = (ioat_dma->version < IOAT_VER_3_3) ? 1 : 0;
 
-	err = 0;
+	dev_dbg(to_dev(ioat_chan), "%s\n", __func__);
+	/* the engine requires at least two sources (we provide
+	 * at least 1 implied source in the DMA_PREP_CONTINUE case)
+	 */
+	BUG_ON(src_cnt + dmaf_continue(flags) < 2);
 
-	if (arg) {
-		if (ide_set_dma(drive))
-			err = -EIO;
+	num_descs = ioat_xferlen_to_descs(ioat_chan, len);
+	/* we need 2x the number of descriptors to cover greater than 3
+	 * sources (we need 1 extra source in the q-only continuation
+	 * case and 3 extra sources in the p+q continuation case.
+	 */
+	if (src_cnt + dmaf_p_disabled_continue(flags) > 3 ||
+	    (dmaf_continue(flags) && !dmaf_p_disabled_continue(flags))) {
+		with_ext = 1;
+		num_descs *= 2;
 	} else
-		ide_dma_off(drive);
+		with_ext = 0;
 
-out:
-	return err;
-#else
-	if (arg < 0 || arg > 1)
-		return -EINVAL;
-
-	return -EPERM;
-#endif
-}
-
-/*
- * handle HDIO_SET_PIO_MODE ioctl abusers here, eventually it will go away
- */
-static int set_pio_mode_abuse(ide_hwif_t *hwif, u8 req_pio)
-{
-	switch (req_pio) {
-	case 202:
-	case 201:
-	case 200:
-	case 102:
-	case 101:
-	case 100:
-		return (hwif->host_flags & IDE_HFLAG_ABUSE_DMA_MODES) ? 1 : 0;
-	case 9:
-	case 8:
-		return (hwif->host_flags & IDE_HFLAG_ABUSE_PREFETCH) ? 1 : 0;
-	case 7:
-	case 6:
-		return (hwif->host_flags & IDE_HFLAG_ABUSE_FAST_DEVSEL) ? 1 : 0;
-	default:
-		return 0;
-	}
-}
-
-static int set_pio_mode(ide_drive_t *drive, int arg)
-{
-	ide_hwif_t *hwif = drive->hwif;
-	const struct ide_port_ops *port_ops = hwif->port_ops;
-
-	if (arg < 0 || arg > 255)
-		return -EINVAL;
-
-	if (port_ops == NULL || port_ops->set_pio_mode == NULL ||
-	    (hwif->host_flags & IDE_HFLAG_NO_SET_MODE))
-		return -ENOSYS;
-
-	if (set_pio_mode_abuse(drive->hwif, arg)) {
-		drive->pio_mode = arg + XFER_PIO_0;
-
-		if (arg == 8 || arg == 9) {
-			unsigned long flags;
-
-			/* take lock for IDE_DFLAG_[NO_]UNMASK/[NO_]IO_32BIT */
-			spin_lock_irqsave(&hwif->lock, flags);
-			port_ops->set_pio_mode(hwif, drive);
-			spin_unlock_irqrestore(&hwif->lock, flags);
-		} else
-			port_ops->set_pio_mode(hwif, drive);
-	} else {
-		int keep_dma = !!(drive->dev_flags & IDE_DFLAG_USING_DMA);
-
-		ide_set_pio(drive, arg);
-
-		if (hwif->host_flags & IDE_HFLAG_SET_PIO_MODE_KEEP_DMA) {
-			if (keep_dma)
-				ide_dma_on(drive);
-		}
-	}
-
-	return 0;
-}
-
-ide_devset_get_flag(unmaskirq, IDE_DFLAG_UNMASK);
-
-static int set_unmaskirq(ide_drive_t *drive, int arg)
-{
-	if (drive->dev_flags & IDE_DFLAG_NO_UNMASK)
-		return -EPERM;
-
-	if (arg < 0 || arg > 1)
-		return -EINVAL;
-
-	if (arg)
-		drive->dev_flags |= IDE_DFLAG_UNMASK;
-	else
-		drive->dev_flags &= ~IDE_DFLAG_UNMASK;
-
-	return 0;
-}
-
-ide_ext_devset_rw_sync(io_32bit, io_32bit);
-ide_ext_devset_rw_sync(keepsettings, ksettings);
-ide_ext_devset_rw_sync(unmaskirq, unmaskirq);
-ide_ext_devset_rw_sync(using_dma, using_dma);
-__IDE_DEVSET(pio_mode, DS_SYNC, NULL, set_pio_mode);
-
-int ide_devset_execute(ide_drive_t *drive, const struct ide_devset *setting,
-		       int arg)
-{
-	struct request_queue *q = drive->queue;
-	struct request *rq;
-	int ret = 0;
-
-	if (!(setting->flags & DS_SYNC))
-		return setting->set(drive, arg);
-
-	rq = blk_get_request(q, READ, __GFP_RECLAIM);
-	rq->cmd_type = REQ_TYPE_DRV_PRIV;
-	rq->cmd_len = 5;
-	rq->cmd[0] = REQ_DEVSET_EXEC;
-	*(int *)&rq->cmd[1] = arg;
-	rq->special = setting->set;
-
-	if (blk_execute_rq(q, NULL, rq, 0))
-		ret = rq->errors;
-	blk_put_request(rq);
-
-	return ret;
-}
-
-ide_startstop_t ide_do_devset(ide_drive_t *drive, struct request *rq)
-{
-	int err, (*setfunc)(ide_drive_t *, int) = rq->special;
-
-	err = setfunc(drive, *(int *)&rq->cmd[1]);
-	if (err)
-		rq->errors = err;
-	ide_complete_rq(drive, err, blk_rq_bytes(rq));
-	return ide_stopped;
-}
+	/* completion writes from the raid engine may pass completion
+	 * writes from the legacy engine, so we need one extra null
+	 * (legacy) descriptor to ensure all completion writes arrive in
+	 * order.
+	 */
+	if (likely(num_descs) &&
+	    ioat_check_space_lock(ioat_chan, num_descs + cb32) == 0)
+		idx = ioat_chan-

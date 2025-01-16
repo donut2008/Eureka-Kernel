@@ -1,15 +1,26 @@
-In order to use the Ethernet bridging functionality, you'll need the
-userspace tools.
+MI. The value
+ * is taken straight from the datasheet.
+ */
+#define DEFAULT_DCLK_FREQ 800
 
-Documentation for Linux bridging is on:
-   http://www.linuxfoundation.org/collaborate/workgroups/networking/bridge
+static int get_dclk_freq(void)
+{
+	int dclk_freq = 0;
 
-The bridge-utilities are maintained at:
-   git://git.kernel.org/pub/scm/linux/kernel/git/shemminger/bridge-utils.git
+	dmi_walk(decode_dclk, (void *)&dclk_freq);
 
-Additionally, the iproute2 utilities can be used to configure
-bridge devices.
+	if (dclk_freq < 1)
+		return DEFAULT_DCLK_FREQ;
 
-If you still have questions, don't hesitate to post to the mailing list 
-(more info https://lists.linux-foundation.org/mailman/listinfo/bridge).
+	return dclk_freq;
+}
 
+/*
+ * set_sdram_scrub_rate		This routine sets byte/sec bandwidth scrub rate
+ *				to hardware according to SCRUBINTERVAL formula
+ *				found in datasheet.
+ */
+static int set_sdram_scrub_rate(struct mem_ctl_info *mci, u32 new_bw)
+{
+	struct i7core_pvt *pvt = mci->pvt_info;
+	struct pci_de

@@ -1,484 +1,523 @@
+RIVER_LOAD_MSG "Intel " QIB_DRV_NAME " loaded: "
+#define PFX QIB_DRV_NAME ": "
+
+static const struct pci_device_id qib_pci_tbl[] = {
+	{ PCI_DEVICE(PCI_VENDOR_ID_PATHSCALE, PCI_DEVICE_ID_QLOGIC_IB_6120) },
+	{ PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_IB_7220) },
+	{ PCI_DEVICE(PCI_VENDOR_ID_QLOGIC, PCI_DEVICE_ID_QLOGIC_IB_7322) },
+	{ 0, }
+};
+
+MODULE_DEVICE_TABLE(pci, qib_pci_tbl);
+
+static struct pci_driver qib_driver = {
+	.name = QIB_DRV_NAME,
+	.probe = qib_init_one,
+	.remove = qib_remove_one,
+	.id_table = qib_pci_tbl,
+	.err_handler = &qib_pci_err_handler,
+};
+
+#ifdef CONFIG_INFINIBAND_QIB_DCA
+
+static int qib_notify_dca(struct notifier_block *, unsigned long, void *);
+static struct notifier_block dca_notifier = {
+	.notifier_call  = qib_notify_dca,
+	.next           = NULL,
+	.priority       = 0
+};
+
+static int qib_notify_dca_device(struct device *device, void *data)
+{
+	struct qib_devdata *dd = dev_get_drvdata(device);
+	unsigned long event = *(unsigned long *)data;
+
+	return dd->f_notify_dca(dd, event);
+}
+
+static int qib_notify_dca(struct notifier_block *nb, unsigned long event,
+					  void *p)
+{
+	int rval;
+
+	rval = driver_for_each_device(&qib_driver.driver, NULL,
+				      &event, qib_notify_dca_device);
+	return rval ? NOTIFY_BAD : NOTIFY_DONE;
+}
+
+#endif
+
 /*
- * Copyright (C) 2014 Uwe Kleine-Koenig for Pengutronix
- *
- * This program is free software; you can redistribute it and/or modify it under
- * the terms of the GNU General Public License version 2 as published by the
- * Free Software Foundation.
+ * Do all the generic driver unit- and chip-independent memory
+ * allocation and initialization.
  */
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/i2c.h>
-#include <linux/io.h>
-#include <linux/interrupt.h>
-#include <linux/err.h>
-#include <linux/clk.h>
-
-#define DRIVER_NAME "efm32-i2c"
-
-#define MASK_VAL(mask, val)		((val << __ffs(mask)) & mask)
-
-#define REG_CTRL		0x00
-#define REG_CTRL_EN			0x00001
-#define REG_CTRL_SLAVE			0x00002
-#define REG_CTRL_AUTOACK		0x00004
-#define REG_CTRL_AUTOSE			0x00008
-#define REG_CTRL_AUTOSN			0x00010
-#define REG_CTRL_ARBDIS			0x00020
-#define REG_CTRL_GCAMEN			0x00040
-#define REG_CTRL_CLHR__MASK		0x00300
-#define REG_CTRL_BITO__MASK		0x03000
-#define REG_CTRL_BITO_OFF		0x00000
-#define REG_CTRL_BITO_40PCC		0x01000
-#define REG_CTRL_BITO_80PCC		0x02000
-#define REG_CTRL_BITO_160PCC		0x03000
-#define REG_CTRL_GIBITO			0x08000
-#define REG_CTRL_CLTO__MASK		0x70000
-#define REG_CTRL_CLTO_OFF		0x00000
-
-#define REG_CMD			0x04
-#define REG_CMD_START			0x00001
-#define REG_CMD_STOP			0x00002
-#define REG_CMD_ACK			0x00004
-#define REG_CMD_NACK			0x00008
-#define REG_CMD_CONT			0x00010
-#define REG_CMD_ABORT			0x00020
-#define REG_CMD_CLEARTX			0x00040
-#define REG_CMD_CLEARPC			0x00080
-
-#define REG_STATE		0x08
-#define REG_STATE_BUSY			0x00001
-#define REG_STATE_MASTER		0x00002
-#define REG_STATE_TRANSMITTER		0x00004
-#define REG_STATE_NACKED		0x00008
-#define REG_STATE_BUSHOLD		0x00010
-#define REG_STATE_STATE__MASK		0x000e0
-#define REG_STATE_STATE_IDLE		0x00000
-#define REG_STATE_STATE_WAIT		0x00020
-#define REG_STATE_STATE_START		0x00040
-#define REG_STATE_STATE_ADDR		0x00060
-#define REG_STATE_STATE_ADDRACK		0x00080
-#define REG_STATE_STATE_DATA		0x000a0
-#define REG_STATE_STATE_DATAACK		0x000c0
-
-#define REG_STATUS		0x0c
-#define REG_STATUS_PSTART		0x00001
-#define REG_STATUS_PSTOP		0x00002
-#define REG_STATUS_PACK			0x00004
-#define REG_STATUS_PNACK		0x00008
-#define REG_STATUS_PCONT		0x00010
-#define REG_STATUS_PABORT		0x00020
-#define REG_STATUS_TXC			0x00040
-#define REG_STATUS_TXBL			0x00080
-#define REG_STATUS_RXDATAV		0x00100
-
-#define REG_CLKDIV		0x10
-#define REG_CLKDIV_DIV__MASK		0x001ff
-#define REG_CLKDIV_DIV(div)		MASK_VAL(REG_CLKDIV_DIV__MASK, (div))
-
-#define REG_SADDR		0x14
-#define REG_SADDRMASK		0x18
-#define REG_RXDATA		0x1c
-#define REG_RXDATAP		0x20
-#define REG_TXDATA		0x24
-#define REG_IF			0x28
-#define REG_IF_START			0x00001
-#define REG_IF_RSTART			0x00002
-#define REG_IF_ADDR			0x00004
-#define REG_IF_TXC			0x00008
-#define REG_IF_TXBL			0x00010
-#define REG_IF_RXDATAV			0x00020
-#define REG_IF_ACK			0x00040
-#define REG_IF_NACK			0x00080
-#define REG_IF_MSTOP			0x00100
-#define REG_IF_ARBLOST			0x00200
-#define REG_IF_BUSERR			0x00400
-#define REG_IF_BUSHOLD			0x00800
-#define REG_IF_TXOF			0x01000
-#define REG_IF_RXUF			0x02000
-#define REG_IF_BITO			0x04000
-#define REG_IF_CLTO			0x08000
-#define REG_IF_SSTOP			0x10000
-
-#define REG_IFS			0x2c
-#define REG_IFC			0x30
-#define REG_IFC__MASK			0x1ffcf
-
-#define REG_IEN			0x34
-
-#define REG_ROUTE		0x38
-#define REG_ROUTE_SDAPEN		0x00001
-#define REG_ROUTE_SCLPEN		0x00002
-#define REG_ROUTE_LOCATION__MASK	0x00700
-#define REG_ROUTE_LOCATION(n)		MASK_VAL(REG_ROUTE_LOCATION__MASK, (n))
-
-struct efm32_i2c_ddata {
-	struct i2c_adapter adapter;
-
-	struct clk *clk;
-	void __iomem *base;
-	unsigned int irq;
-	u8 location;
-	unsigned long frequency;
-
-	/* transfer data */
-	struct completion done;
-	struct i2c_msg *msgs;
-	size_t num_msgs;
-	size_t current_word, current_msg;
-	int retval;
-};
-
-static u32 efm32_i2c_read32(struct efm32_i2c_ddata *ddata, unsigned offset)
+static int __init qib_ib_init(void)
 {
-	return readl(ddata->base + offset);
-}
-
-static void efm32_i2c_write32(struct efm32_i2c_ddata *ddata,
-		unsigned offset, u32 value)
-{
-	writel(value, ddata->base + offset);
-}
-
-static void efm32_i2c_send_next_msg(struct efm32_i2c_ddata *ddata)
-{
-	struct i2c_msg *cur_msg = &ddata->msgs[ddata->current_msg];
-
-	efm32_i2c_write32(ddata, REG_CMD, REG_CMD_START);
-	efm32_i2c_write32(ddata, REG_TXDATA, cur_msg->addr << 1 |
-			(cur_msg->flags & I2C_M_RD ? 1 : 0));
-}
-
-static void efm32_i2c_send_next_byte(struct efm32_i2c_ddata *ddata)
-{
-	struct i2c_msg *cur_msg = &ddata->msgs[ddata->current_msg];
-
-	if (ddata->current_word >= cur_msg->len) {
-		/* cur_msg completely transferred */
-		ddata->current_word = 0;
-		ddata->current_msg += 1;
-
-		if (ddata->current_msg >= ddata->num_msgs) {
-			efm32_i2c_write32(ddata, REG_CMD, REG_CMD_STOP);
-			complete(&ddata->done);
-		} else {
-			efm32_i2c_send_next_msg(ddata);
-		}
-	} else {
-		efm32_i2c_write32(ddata, REG_TXDATA,
-				cur_msg->buf[ddata->current_word++]);
-	}
-}
-
-static void efm32_i2c_recv_next_byte(struct efm32_i2c_ddata *ddata)
-{
-	struct i2c_msg *cur_msg = &ddata->msgs[ddata->current_msg];
-
-	cur_msg->buf[ddata->current_word] = efm32_i2c_read32(ddata, REG_RXDATA);
-	ddata->current_word += 1;
-	if (ddata->current_word >= cur_msg->len) {
-		/* cur_msg completely transferred */
-		ddata->current_word = 0;
-		ddata->current_msg += 1;
-
-		efm32_i2c_write32(ddata, REG_CMD, REG_CMD_NACK);
-
-		if (ddata->current_msg >= ddata->num_msgs) {
-			efm32_i2c_write32(ddata, REG_CMD, REG_CMD_STOP);
-			complete(&ddata->done);
-		} else {
-			efm32_i2c_send_next_msg(ddata);
-		}
-	} else {
-		efm32_i2c_write32(ddata, REG_CMD, REG_CMD_ACK);
-	}
-}
-
-static irqreturn_t efm32_i2c_irq(int irq, void *dev_id)
-{
-	struct efm32_i2c_ddata *ddata = dev_id;
-	struct i2c_msg *cur_msg = &ddata->msgs[ddata->current_msg];
-	u32 irqflag = efm32_i2c_read32(ddata, REG_IF);
-	u32 state = efm32_i2c_read32(ddata, REG_STATE);
-
-	efm32_i2c_write32(ddata, REG_IFC, irqflag & REG_IFC__MASK);
-
-	switch (state & REG_STATE_STATE__MASK) {
-	case REG_STATE_STATE_IDLE:
-		/* arbitration lost? */
-		ddata->retval = -EAGAIN;
-		complete(&ddata->done);
-		break;
-	case REG_STATE_STATE_WAIT:
-		/*
-		 * huh, this shouldn't happen.
-		 * Reset hardware state and get out
-		 */
-		ddata->retval = -EIO;
-		efm32_i2c_write32(ddata, REG_CMD,
-				REG_CMD_STOP | REG_CMD_ABORT |
-				REG_CMD_CLEARTX | REG_CMD_CLEARPC);
-		complete(&ddata->done);
-		break;
-	case REG_STATE_STATE_START:
-		/* "caller" is expected to send an address */
-		break;
-	case REG_STATE_STATE_ADDR:
-		/* wait for Ack or NAck of slave */
-		break;
-	case REG_STATE_STATE_ADDRACK:
-		if (state & REG_STATE_NACKED) {
-			efm32_i2c_write32(ddata, REG_CMD, REG_CMD_STOP);
-			ddata->retval = -ENXIO;
-			complete(&ddata->done);
-		} else if (cur_msg->flags & I2C_M_RD) {
-			/* wait for slave to send first data byte */
-		} else {
-			efm32_i2c_send_next_byte(ddata);
-		}
-		break;
-	case REG_STATE_STATE_DATA:
-		if (cur_msg->flags & I2C_M_RD) {
-			efm32_i2c_recv_next_byte(ddata);
-		} else {
-			/* wait for Ack or Nack of slave */
-		}
-		break;
-	case REG_STATE_STATE_DATAACK:
-		if (state & REG_STATE_NACKED) {
-			efm32_i2c_write32(ddata, REG_CMD, REG_CMD_STOP);
-			complete(&ddata->done);
-		} else {
-			efm32_i2c_send_next_byte(ddata);
-		}
-	}
-
-	return IRQ_HANDLED;
-}
-
-static int efm32_i2c_master_xfer(struct i2c_adapter *adap,
-		struct i2c_msg *msgs, int num)
-{
-	struct efm32_i2c_ddata *ddata = i2c_get_adapdata(adap);
 	int ret;
 
-	if (ddata->msgs)
-		return -EBUSY;
-
-	ddata->msgs = msgs;
-	ddata->num_msgs = num;
-	ddata->current_word = 0;
-	ddata->current_msg = 0;
-	ddata->retval = -EIO;
-
-	reinit_completion(&ddata->done);
-
-	dev_dbg(&ddata->adapter.dev, "state: %08x, status: %08x\n",
-			efm32_i2c_read32(ddata, REG_STATE),
-			efm32_i2c_read32(ddata, REG_STATUS));
-
-	efm32_i2c_send_next_msg(ddata);
-
-	wait_for_completion(&ddata->done);
-
-	if (ddata->current_msg >= ddata->num_msgs)
-		ret = ddata->num_msgs;
-	else
-		ret = ddata->retval;
-
-	return ret;
-}
-
-static u32 efm32_i2c_functionality(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static const struct i2c_algorithm efm32_i2c_algo = {
-	.master_xfer = efm32_i2c_master_xfer,
-	.functionality = efm32_i2c_functionality,
-};
-
-static u32 efm32_i2c_get_configured_location(struct efm32_i2c_ddata *ddata)
-{
-	u32 reg = efm32_i2c_read32(ddata, REG_ROUTE);
-
-	return (reg & REG_ROUTE_LOCATION__MASK) >>
-		__ffs(REG_ROUTE_LOCATION__MASK);
-}
-
-static int efm32_i2c_probe(struct platform_device *pdev)
-{
-	struct efm32_i2c_ddata *ddata;
-	struct resource *res;
-	unsigned long rate;
-	struct device_node *np = pdev->dev.of_node;
-	u32 location, frequency;
-	int ret;
-	u32 clkdiv;
-
-	if (!np)
-		return -EINVAL;
-
-	ddata = devm_kzalloc(&pdev->dev, sizeof(*ddata), GFP_KERNEL);
-	if (!ddata)
-		return -ENOMEM;
-	platform_set_drvdata(pdev, ddata);
-
-	init_completion(&ddata->done);
-	strlcpy(ddata->adapter.name, pdev->name, sizeof(ddata->adapter.name));
-	ddata->adapter.owner = THIS_MODULE;
-	ddata->adapter.algo = &efm32_i2c_algo;
-	ddata->adapter.dev.parent = &pdev->dev;
-	ddata->adapter.dev.of_node = pdev->dev.of_node;
-	i2c_set_adapdata(&ddata->adapter, ddata);
-
-	ddata->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(ddata->clk)) {
-		ret = PTR_ERR(ddata->clk);
-		dev_err(&pdev->dev, "failed to get clock: %d\n", ret);
-		return ret;
-	}
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res) {
-		dev_err(&pdev->dev, "failed to determine base address\n");
-		return -ENODEV;
-	}
-
-	if (resource_size(res) < 0x42) {
-		dev_err(&pdev->dev, "memory resource too small\n");
-		return -EINVAL;
-	}
-
-	ddata->base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(ddata->base))
-		return PTR_ERR(ddata->base);
-
-	ret = platform_get_irq(pdev, 0);
-	if (ret <= 0) {
-		dev_err(&pdev->dev, "failed to get irq (%d)\n", ret);
-		if (!ret)
-			ret = -EINVAL;
-		return ret;
-	}
-
-	ddata->irq = ret;
-
-	ret = clk_prepare_enable(ddata->clk);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "failed to enable clock (%d)\n", ret);
-		return ret;
-	}
-
-
-	ret = of_property_read_u32(np, "energymicro,location", &location);
-
+	ret = qib_dev_init();
 	if (ret)
-		/* fall back to wrongly namespaced property */
-		ret = of_property_read_u32(np, "efm32,location", &location);
+		goto bail;
 
-	if (!ret) {
-		dev_dbg(&pdev->dev, "using location %u\n", location);
-	} else {
-		/* default to location configured in hardware */
-		location = efm32_i2c_get_configured_location(ddata);
+	/*
+	 * These must be called before the driver is registered with
+	 * the PCI subsystem.
+	 */
+	idr_init(&qib_unit_table);
 
-		dev_info(&pdev->dev, "fall back to location %u\n", location);
-	}
-
-	ddata->location = location;
-
-	ret = of_property_read_u32(np, "clock-frequency", &frequency);
-	if (!ret) {
-		dev_dbg(&pdev->dev, "using frequency %u\n", frequency);
-	} else {
-		frequency = 100000;
-		dev_info(&pdev->dev, "defaulting to 100 kHz\n");
-	}
-	ddata->frequency = frequency;
-
-	rate = clk_get_rate(ddata->clk);
-	if (!rate) {
-		dev_err(&pdev->dev, "there is no input clock available\n");
-		ret = -EINVAL;
-		goto err_disable_clk;
-	}
-	clkdiv = DIV_ROUND_UP(rate, 8 * ddata->frequency) - 1;
-	if (clkdiv >= 0x200) {
-		dev_err(&pdev->dev,
-				"input clock too fast (%lu) to divide down to bus freq (%lu)",
-				rate, ddata->frequency);
-		ret = -EINVAL;
-		goto err_disable_clk;
-	}
-
-	dev_dbg(&pdev->dev, "input clock = %lu, bus freq = %lu, clkdiv = %lu\n",
-			rate, ddata->frequency, (unsigned long)clkdiv);
-	efm32_i2c_write32(ddata, REG_CLKDIV, REG_CLKDIV_DIV(clkdiv));
-
-	efm32_i2c_write32(ddata, REG_ROUTE, REG_ROUTE_SDAPEN |
-			REG_ROUTE_SCLPEN |
-			REG_ROUTE_LOCATION(ddata->location));
-
-	efm32_i2c_write32(ddata, REG_CTRL, REG_CTRL_EN |
-			REG_CTRL_BITO_160PCC | 0 * REG_CTRL_GIBITO);
-
-	efm32_i2c_write32(ddata, REG_IFC, REG_IFC__MASK);
-	efm32_i2c_write32(ddata, REG_IEN, REG_IF_TXC | REG_IF_ACK | REG_IF_NACK
-			| REG_IF_ARBLOST | REG_IF_BUSERR | REG_IF_RXDATAV);
-
-	/* to make bus idle */
-	efm32_i2c_write32(ddata, REG_CMD, REG_CMD_ABORT);
-
-	ret = request_irq(ddata->irq, efm32_i2c_irq, 0, DRIVER_NAME, ddata);
+#ifdef CONFIG_INFINIBAND_QIB_DCA
+	dca_register_notify(&dca_notifier);
+#endif
+#ifdef CONFIG_DEBUG_FS
+	qib_dbg_init();
+#endif
+	ret = pci_register_driver(&qib_driver);
 	if (ret < 0) {
-		dev_err(&pdev->dev, "failed to request irq (%d)\n", ret);
-		goto err_disable_clk;
+		pr_err("Unable to register driver: error %d\n", -ret);
+		goto bail_dev;
 	}
 
-	ret = i2c_add_adapter(&ddata->adapter);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to add i2c adapter (%d)\n", ret);
-		free_irq(ddata->irq, ddata);
+	/* not fatal if it doesn't work */
+	if (qib_init_qibfs())
+		pr_err("Unable to register ipathfs\n");
+	goto bail; /* all OK */
 
-err_disable_clk:
-		clk_disable_unprepare(ddata->clk);
-	}
+bail_dev:
+#ifdef CONFIG_INFINIBAND_QIB_DCA
+	dca_unregister_notify(&dca_notifier);
+#endif
+#ifdef CONFIG_DEBUG_FS
+	qib_dbg_exit();
+#endif
+	idr_destroy(&qib_unit_table);
+	qib_dev_cleanup();
+bail:
 	return ret;
 }
 
-static int efm32_i2c_remove(struct platform_device *pdev)
+module_init(qib_ib_init);
+
+/*
+ * Do the non-unit driver cleanup, memory free, etc. at unload.
+ */
+static void __exit qib_ib_cleanup(void)
 {
-	struct efm32_i2c_ddata *ddata = platform_get_drvdata(pdev);
+	int ret;
 
-	i2c_del_adapter(&ddata->adapter);
-	free_irq(ddata->irq, ddata);
-	clk_disable_unprepare(ddata->clk);
+	ret = qib_exit_qibfs();
+	if (ret)
+		pr_err(
+			"Unable to cleanup counter filesystem: error %d\n",
+			-ret);
 
-	return 0;
+#ifdef CONFIG_INFINIBAND_QIB_DCA
+	dca_unregister_notify(&dca_notifier);
+#endif
+	pci_unregister_driver(&qib_driver);
+#ifdef CONFIG_DEBUG_FS
+	qib_dbg_exit();
+#endif
+
+	qib_cpulist_count = 0;
+	kfree(qib_cpulist);
+
+	idr_destroy(&qib_unit_table);
+	qib_dev_cleanup();
 }
 
-static const struct of_device_id efm32_i2c_dt_ids[] = {
-	{
-		.compatible = "energymicro,efm32-i2c",
-	}, {
-		/* sentinel */
+module_exit(qib_ib_cleanup);
+
+/* this can only be called after a successful initialization */
+static void cleanup_device_data(struct qib_devdata *dd)
+{
+	int ctxt;
+	int pidx;
+	struct qib_ctxtdata **tmp;
+	unsigned long flags;
+
+	/* users can't do anything more with chip */
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		if (dd->pport[pidx].statusp)
+			*dd->pport[pidx].statusp &= ~QIB_STATUS_CHIP_PRESENT;
+
+		spin_lock(&dd->pport[pidx].cc_shadow_lock);
+
+		kfree(dd->pport[pidx].congestion_entries);
+		dd->pport[pidx].congestion_entries = NULL;
+		kfree(dd->pport[pidx].ccti_entries);
+		dd->pport[pidx].ccti_entries = NULL;
+		kfree(dd->pport[pidx].ccti_entries_shadow);
+		dd->pport[pidx].ccti_entries_shadow = NULL;
+		kfree(dd->pport[pidx].congestion_entries_shadow);
+		dd->pport[pidx].congestion_entries_shadow = NULL;
+
+		spin_unlock(&dd->pport[pidx].cc_shadow_lock);
 	}
-};
-MODULE_DEVICE_TABLE(of, efm32_i2c_dt_ids);
 
-static struct platform_driver efm32_i2c_driver = {
-	.probe = efm32_i2c_probe,
-	.remove = efm32_i2c_remove,
+	qib_disable_wc(dd);
 
-	.driver = {
-		.name = DRIVER_NAME,
-		.of_match_table = efm32_i2c_dt_ids,
-	},
-};
-module_platform_driver(efm32_i2c_driver);
+	if (dd->pioavailregs_dma) {
+		dma_free_coherent(&dd->pcidev->dev, PAGE_SIZE,
+				  (void *) dd->pioavailregs_dma,
+				  dd->pioavailregs_phys);
+		dd->pioavailregs_dma = NULL;
+	}
 
-MODULE_AUTHOR("Uwe Kleine-Koenig <u.kleine-koenig@pengutronix.de>");
-MODULE_DESCRIPTION("EFM32 i2c driver");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:" DRIVER_NAME);
+	if (dd->pageshadow) {
+		struct page **tmpp = dd->pageshadow;
+		dma_addr_t *tmpd = dd->physshadow;
+		int i;
+
+		for (ctxt = 0; ctxt < dd->cfgctxts; ctxt++) {
+			int ctxt_tidbase = ctxt * dd->rcvtidcnt;
+			int maxtid = ctxt_tidbase + dd->rcvtidcnt;
+
+			for (i = ctxt_tidbase; i < maxtid; i++) {
+				if (!tmpp[i])
+					continue;
+				pci_unmap_page(dd->pcidev, tmpd[i],
+					       PAGE_SIZE, PCI_DMA_FROMDEVICE);
+				qib_release_user_pages(&tmpp[i], 1);
+				tmpp[i] = NULL;
+			}
+		}
+
+		dd->pageshadow = NULL;
+		vfree(tmpp);
+		dd->physshadow = NULL;
+		vfree(tmpd);
+	}
+
+	/*
+	 * Free any resources still in use (usually just kernel contexts)
+	 * at unload; we do for ctxtcnt, because that's what we allocate.
+	 * We acquire lock to be really paranoid that rcd isn't being
+	 * accessed from some interrupt-related code (that should not happen,
+	 * but best to be sure).
+	 */
+	spin_lock_irqsave(&dd->uctxt_lock, flags);
+	tmp = dd->rcd;
+	dd->rcd = NULL;
+	spin_unlock_irqrestore(&dd->uctxt_lock, flags);
+	for (ctxt = 0; tmp && ctxt < dd->ctxtcnt; ctxt++) {
+		struct qib_ctxtdata *rcd = tmp[ctxt];
+
+		tmp[ctxt] = NULL; /* debugging paranoia */
+		qib_free_ctxtdata(dd, rcd);
+	}
+	kfree(tmp);
+	kfree(dd->boardname);
+	qib_cq_exit(dd);
+}
+
+/*
+ * Clean up on unit shutdown, or error during unit load after
+ * successful initialization.
+ */
+static void qib_postinit_cleanup(struct qib_devdata *dd)
+{
+	/*
+	 * Clean up chip-specific stuff.
+	 * We check for NULL here, because it's outside
+	 * the kregbase check, and we need to call it
+	 * after the free_irq.  Thus it's possible that
+	 * the function pointers were never initialized.
+	 */
+	if (dd->f_cleanup)
+		dd->f_cleanup(dd);
+
+	qib_pcie_ddcleanup(dd);
+
+	cleanup_device_data(dd);
+
+	qib_free_devdata(dd);
+}
+
+static int qib_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+{
+	int ret, j, pidx, initfail;
+	struct qib_devdata *dd = NULL;
+
+	ret = qib_pcie_init(pdev, ent);
+	if (ret)
+		goto bail;
+
+	/*
+	 * Do device-specific initialiation, function table setup, dd
+	 * allocation, etc.
+	 */
+	switch (ent->device) {
+	case PCI_DEVICE_ID_QLOGIC_IB_6120:
+#ifdef CONFIG_PCI_MSI
+		dd = qib_init_iba6120_funcs(pdev, ent);
+#else
+		qib_early_err(&pdev->dev,
+			"Intel PCIE device 0x%x cannot work if CONFIG_PCI_MSI is not enabled\n",
+			ent->device);
+		dd = ERR_PTR(-ENODEV);
+#endif
+		break;
+
+	case PCI_DEVICE_ID_QLOGIC_IB_7220:
+		dd = qib_init_iba7220_funcs(pdev, ent);
+		break;
+
+	case PCI_DEVICE_ID_QLOGIC_IB_7322:
+		dd = qib_init_iba7322_funcs(pdev, ent);
+		break;
+
+	default:
+		qib_early_err(&pdev->dev,
+			"Failing on unknown Intel deviceid 0x%x\n",
+			ent->device);
+		ret = -ENODEV;
+	}
+
+	if (IS_ERR(dd))
+		ret = PTR_ERR(dd);
+	if (ret)
+		goto bail; /* error already printed */
+
+	ret = qib_create_workqueues(dd);
+	if (ret)
+		goto bail;
+
+	/* do the generic initialization */
+	initfail = qib_init(dd, 0);
+
+	ret = qib_register_ib_device(dd);
+
+	/*
+	 * Now ready for use.  this should be cleared whenever we
+	 * detect a reset, or initiate one.  If earlier failure,
+	 * we still create devices, so diags, etc. can be used
+	 * to determine cause of problem.
+	 */
+	if (!qib_mini_init && !initfail && !ret)
+		dd->flags |= QIB_INITTED;
+
+	j = qib_device_create(dd);
+	if (j)
+		qib_dev_err(dd, "Failed to create /dev devices: %d\n", -j);
+	j = qibfs_add(dd);
+	if (j)
+		qib_dev_err(dd, "Failed filesystem setup for counters: %d\n",
+			    -j);
+
+	if (qib_mini_init || initfail || ret) {
+		qib_stop_timers(dd);
+		flush_workqueue(ib_wq);
+		for (pidx = 0; pidx < dd->num_pports; ++pidx)
+			dd->f_quiet_serdes(dd->pport + pidx);
+		if (qib_mini_init)
+			goto bail;
+		if (!j) {
+			(void) qibfs_remove(dd);
+			qib_device_remove(dd);
+		}
+		if (!ret)
+			qib_unregister_ib_device(dd);
+		qib_postinit_cleanup(dd);
+		if (initfail)
+			ret = initfail;
+		goto bail;
+	}
+
+	ret = qib_enable_wc(dd);
+	if (ret) {
+		qib_dev_err(dd,
+			"Write combining not enabled (err %d): performance may be poor\n",
+			-ret);
+		ret = 0;
+	}
+
+	qib_verify_pioperf(dd);
+bail:
+	return ret;
+}
+
+static void qib_remove_one(struct pci_dev *pdev)
+{
+	struct qib_devdata *dd = pci_get_drvdata(pdev);
+	int ret;
+
+	/* unregister from IB core */
+	qib_unregister_ib_device(dd);
+
+	/*
+	 * Disable the IB link, disable interrupts on the device,
+	 * clear dma engines, etc.
+	 */
+	if (!qib_mini_init)
+		qib_shutdown_device(dd);
+
+	qib_stop_timers(dd);
+
+	/* wait until all of our (qsfp) queue_work() calls complete */
+	flush_workqueue(ib_wq);
+
+	ret = qibfs_remove(dd);
+	if (ret)
+		qib_dev_err(dd, "Failed counters filesystem cleanup: %d\n",
+			    -ret);
+
+	qib_device_remove(dd);
+
+	qib_postinit_cleanup(dd);
+}
+
+/**
+ * qib_create_rcvhdrq - create a receive header queue
+ * @dd: the qlogic_ib device
+ * @rcd: the context data
+ *
+ * This must be contiguous memory (from an i/o perspective), and must be
+ * DMA'able (which means for some systems, it will go through an IOMMU,
+ * or be forced into a low address range).
+ */
+int qib_create_rcvhdrq(struct qib_devdata *dd, struct qib_ctxtdata *rcd)
+{
+	unsigned amt;
+	int old_node_id;
+
+	if (!rcd->rcvhdrq) {
+		dma_addr_t phys_hdrqtail;
+		gfp_t gfp_flags;
+
+		amt = ALIGN(dd->rcvhdrcnt * dd->rcvhdrentsize *
+			    sizeof(u32), PAGE_SIZE);
+		gfp_flags = (rcd->ctxt >= dd->first_user_ctxt) ?
+			GFP_USER : GFP_KERNEL;
+
+		old_node_id = dev_to_node(&dd->pcidev->dev);
+		set_dev_node(&dd->pcidev->dev, rcd->node_id);
+		rcd->rcvhdrq = dma_alloc_coherent(
+			&dd->pcidev->dev, amt, &rcd->rcvhdrq_phys,
+			gfp_flags | __GFP_COMP);
+		set_dev_node(&dd->pcidev->dev, old_node_id);
+
+		if (!rcd->rcvhdrq) {
+			qib_dev_err(dd,
+				"attempt to allocate %d bytes for ctxt %u rcvhdrq failed\n",
+				amt, rcd->ctxt);
+			goto bail;
+		}
+
+		if (rcd->ctxt >= dd->first_user_ctxt) {
+			rcd->user_event_mask = vmalloc_user(PAGE_SIZE);
+			if (!rcd->user_event_mask)
+				goto bail_free_hdrq;
+		}
+
+		if (!(dd->flags & QIB_NODMA_RTAIL)) {
+			set_dev_node(&dd->pcidev->dev, rcd->node_id);
+			rcd->rcvhdrtail_kvaddr = dma_alloc_coherent(
+				&dd->pcidev->dev, PAGE_SIZE, &phys_hdrqtail,
+				gfp_flags);
+			set_dev_node(&dd->pcidev->dev, old_node_id);
+			if (!rcd->rcvhdrtail_kvaddr)
+				goto bail_free;
+			rcd->rcvhdrqtailaddr_phys = phys_hdrqtail;
+		}
+
+		rcd->rcvhdrq_size = amt;
+	}
+
+	/* clear for security and sanity on each use */
+	memset(rcd->rcvhdrq, 0, rcd->rcvhdrq_size);
+	if (rcd->rcvhdrtail_kvaddr)
+		memset(rcd->rcvhdrtail_kvaddr, 0, PAGE_SIZE);
+	return 0;
+
+bail_free:
+	qib_dev_err(dd,
+		"attempt to allocate 1 page for ctxt %u rcvhdrqtailaddr failed\n",
+		rcd->ctxt);
+	vfree(rcd->user_event_mask);
+	rcd->user_event_mask = NULL;
+bail_free_hdrq:
+	dma_free_coherent(&dd->pcidev->dev, amt, rcd->rcvhdrq,
+			  rcd->rcvhdrq_phys);
+	rcd->rcvhdrq = NULL;
+bail:
+	return -ENOMEM;
+}
+
+/**
+ * allocate eager buffers, both kernel and user contexts.
+ * @rcd: the context we are setting up.
+ *
+ * Allocate the eager TID buffers and program them into hip.
+ * They are no longer completely contiguous, we do multiple allocation
+ * calls.  Otherwise we get the OOM code involved, by asking for too
+ * much per call, with disastrous results on some kernels.
+ */
+int qib_setup_eagerbufs(struct qib_ctxtdata *rcd)
+{
+	struct qib_devdata *dd = rcd->dd;
+	unsigned e, egrcnt, egrperchunk, chunk, egrsize, egroff;
+	size_t size;
+	gfp_t gfp_flags;
+	int old_node_id;
+
+	/*
+	 * GFP_USER, but without GFP_FS, so buffer cache can be
+	 * coalesced (we hope); otherwise, even at order 4,
+	 * heavy filesystem activity makes these fail, and we can
+	 * use compound pages.
+	 */
+	gfp_flags = __GFP_RECLAIM | __GFP_IO | __GFP_COMP;
+
+	egrcnt = rcd->rcvegrcnt;
+	egroff = rcd->rcvegr_tid_base;
+	egrsize = dd->rcvegrbufsize;
+
+	chunk = rcd->rcvegrbuf_chunks;
+	egrperchunk = rcd->rcvegrbufs_perchunk;
+	size = rcd->rcvegrbuf_size;
+	if (!rcd->rcvegrbuf) {
+		rcd->rcvegrbuf =
+			kzalloc_node(chunk * sizeof(rcd->rcvegrbuf[0]),
+				GFP_KERNEL, rcd->node_id);
+		if (!rcd->rcvegrbuf)
+			goto bail;
+	}
+	if (!rcd->rcvegrbuf_phys) {
+		rcd->rcvegrbuf_phys =
+			kmalloc_node(chunk * sizeof(rcd->rcvegrbuf_phys[0]),
+				GFP_KERNEL, rcd->node_id);
+		if (!rcd->rcvegrbuf_phys)
+			goto bail_rcvegrbuf;
+	}
+	for (e = 0; e < rcd->rcvegrbuf_chunks; e++) {
+		if (rcd->rcvegrbuf[e])
+			continue;
+
+		old_node_id = dev_to_node(&dd->pcidev->dev);
+		set_dev_node(&dd->pcidev->dev, rcd->node_id);
+		rcd->rcvegrbuf[e] =
+			dma_alloc_coherent(&dd->pcidev->dev, size,
+					   &rcd->rcvegrbuf_phys[e],
+					   gfp_flags);
+		set_dev_node(&dd->pcidev->dev, old_node_id);
+		if (!rcd->rcvegrbuf[e])
+			goto bail_rcvegrbuf_phys;
+	}
+
+	rcd->rcvegr_phys = rcd->rcvegrbuf_phys[0];
+
+	for (e = chunk = 0; chunk < rcd->rcvegrbuf_chunks; chunk++) {
+		dma_addr_t pa = rcd->rcvegrbuf_phys[chunk];
+		unsigned i;
+
+		/* clear for security and sanity on each use */
+		memset(rcd->rcvegrbuf[chunk], 0, size);
+
+		for (i = 0; e < egrcnt && i < egrperchunk; e++, i++) {
+			dd->f_put_tid(dd, e + egroff +
+					  (u64 __iomem *)
+					  ((char __iomem *)
+					   dd->kregbase +
+					   dd->rcvegrbase),
+					  RCVHQ_RCV_TYPE_EAGER, pa);
+			p

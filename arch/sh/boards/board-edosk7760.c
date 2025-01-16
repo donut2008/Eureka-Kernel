@@ -1,191 +1,144 @@
-/*
- * Renesas Europe EDOSK7760 Board Support
- *
- * Copyright (C) 2008 SPES Societa' Progettazione Elettronica e Software Ltd.
- * Author: Luca Santini <luca.santini@spesonline.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+This implements is a proposal V4L2 API to allow SLICED VBI
+ * required for some hardware encoders. It should change without
+ * notice in the definitive implementation.
  */
-#include <linux/init.h>
-#include <linux/types.h>
-#include <linux/platform_device.h>
-#include <linux/smc91x.h>
-#include <linux/interrupt.h>
-#include <linux/sh_intc.h>
-#include <linux/i2c.h>
-#include <linux/mtd/physmap.h>
-#include <asm/machvec.h>
-#include <asm/io.h>
-#include <asm/addrspace.h>
-#include <asm/delay.h>
-#include <asm/i2c-sh7760.h>
-#include <asm/sizes.h>
 
-/* Bus state controller registers for CS4 area */
-#define BSC_CS4BCR	0xA4FD0010
-#define BSC_CS4WCR	0xA4FD0030
-
-#define SMC_IOBASE	0xA2000000
-#define SMC_IO_OFFSET	0x300
-#define SMC_IOADDR	(SMC_IOBASE + SMC_IO_OFFSET)
-
-/* NOR flash */
-static struct mtd_partition edosk7760_nor_flash_partitions[] = {
-	{
-		.name = "bootloader",
-		.offset = 0,
-		.size = SZ_256K,
-		.mask_flags = MTD_WRITEABLE,	/* Read-only */
-	}, {
-		.name = "kernel",
-		.offset = MTDPART_OFS_APPEND,
-		.size = SZ_2M,
-	}, {
-		.name = "fs",
-		.offset = MTDPART_OFS_APPEND,
-		.size = (26 << 20),
-	}, {
-		.name = "other",
-		.offset = MTDPART_OFS_APPEND,
-		.size = MTDPART_SIZ_FULL,
-	},
+struct v4l2_sliced_vbi_format {
+	__u16   service_set;
+	/* service_lines[0][...] specifies lines 0-23 (1-23 used) of the first field
+	   service_lines[1][...] specifies lines 0-23 (1-23 used) of the second field
+				 (equals frame lines 313-336 for 625 line video
+				  standards, 263-286 for 525 line standards) */
+	__u16   service_lines[2][24];
+	__u32   io_size;
+	__u32   reserved[2];            /* must be zero */
 };
 
-static struct physmap_flash_data edosk7760_nor_flash_data = {
-	.width		= 4,
-	.parts		= edosk7760_nor_flash_partitions,
-	.nr_parts	= ARRAY_SIZE(edosk7760_nor_flash_partitions),
+/* Teletext World System Teletext
+   (WST), defined on ITU-R BT.653-2 */
+#define V4L2_SLICED_TELETEXT_B          (0x0001)
+/* Video Program System, defined on ETS 300 231*/
+#define V4L2_SLICED_VPS                 (0x0400)
+/* Closed Caption, defined on EIA-608 */
+#define V4L2_SLICED_CAPTION_525         (0x1000)
+/* Wide Screen System, defined on ITU-R BT1119.1 */
+#define V4L2_SLICED_WSS_625             (0x4000)
+
+#define V4L2_SLICED_VBI_525             (V4L2_SLICED_CAPTION_525)
+#define V4L2_SLICED_VBI_625             (V4L2_SLICED_TELETEXT_B | V4L2_SLICED_VPS | V4L2_SLICED_WSS_625)
+
+struct v4l2_sliced_vbi_cap {
+	__u16   service_set;
+	/* service_lines[0][...] specifies lines 0-23 (1-23 used) of the first field
+	   service_lines[1][...] specifies lines 0-23 (1-23 used) of the second field
+				 (equals frame lines 313-336 for 625 line video
+				  standards, 263-286 for 525 line standards) */
+	__u16   service_lines[2][24];
+	__u32	type;		/* enum v4l2_buf_type */
+	__u32   reserved[3];    /* must be 0 */
 };
 
-static struct resource edosk7760_nor_flash_resources[] = {
-	[0] = {
-		.name	= "NOR Flash",
-		.start	= 0x00000000,
-		.end	= 0x00000000 + SZ_32M - 1,
-		.flags	= IORESOURCE_MEM,
-	}
+struct v4l2_sliced_vbi_data {
+	__u32   id;
+	__u32   field;          /* 0: first field, 1: second field */
+	__u32   line;           /* 1-23 */
+	__u32   reserved;       /* must be 0 */
+	__u8    data[48];
 };
-
-static struct platform_device edosk7760_nor_flash_device = {
-	.name		= "physmap-flash",
-	.resource	= edosk7760_nor_flash_resources,
-	.num_resources	= ARRAY_SIZE(edosk7760_nor_flash_resources),
-	.dev		= {
-		.platform_data = &edosk7760_nor_flash_data,
-	},
-};
-
-/* i2c initialization functions */
-static struct sh7760_i2c_platdata i2c_pd = {
-	.speed_khz	= 400,
-};
-
-static struct resource sh7760_i2c1_res[] = {
-	{
-		.start	= SH7760_I2C1_MMIO,
-		.end	= SH7760_I2C1_MMIOEND,
-		.flags	= IORESOURCE_MEM,
-	},{
-		.start	= evt2irq(0x9e0),
-		.end	= evt2irq(0x9e0),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct platform_device sh7760_i2c1_dev = {
-	.dev    = {
-		.platform_data	= &i2c_pd,
-	},
-
-	.name		= SH7760_I2C_DEVNAME,
-	.id		= 1,
-	.resource	= sh7760_i2c1_res,
-	.num_resources	= ARRAY_SIZE(sh7760_i2c1_res),
-};
-
-static struct resource sh7760_i2c0_res[] = {
-	{
-		.start	= SH7760_I2C0_MMIO,
-		.end	= SH7760_I2C0_MMIOEND,
-		.flags	= IORESOURCE_MEM,
-	}, {
-		.start	= evt2irq(0x9c0),
-		.end	= evt2irq(0x9c0),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct platform_device sh7760_i2c0_dev = {
-	.dev    = {
-		.platform_data	= &i2c_pd,
-	},
-	.name		= SH7760_I2C_DEVNAME,
-	.id		= 0,
-	.resource	= sh7760_i2c0_res,
-	.num_resources	= ARRAY_SIZE(sh7760_i2c0_res),
-};
-
-/* eth initialization functions */
-static struct smc91x_platdata smc91x_info = {
-	.flags = SMC91X_USE_16BIT | SMC91X_IO_SHIFT_1 | IORESOURCE_IRQ_LOWLEVEL,
-};
-
-static struct resource smc91x_res[] = {
-	[0] = {
-		.start	= SMC_IOADDR,
-		.end	= SMC_IOADDR + SZ_32 - 1,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= evt2irq(0x2a0),
-		.end	= evt2irq(0x2a0),
-		.flags	= IORESOURCE_IRQ ,
-	}
-};
-
-static struct platform_device smc91x_dev = {
-	.name		= "smc91x",
-	.id		= -1,
-	.num_resources	= ARRAY_SIZE(smc91x_res),
-	.resource	= smc91x_res,
-
-	.dev	= {
-		.platform_data	= &smc91x_info,
-	},
-};
-
-/* platform init code */
-static struct platform_device *edosk7760_devices[] __initdata = {
-	&smc91x_dev,
-	&edosk7760_nor_flash_device,
-	&sh7760_i2c0_dev,
-	&sh7760_i2c1_dev,
-};
-
-static int __init init_edosk7760_devices(void)
-{
-	plat_irq_setup_pins(IRQ_MODE_IRQ);
-
-	return platform_add_devices(edosk7760_devices,
-				    ARRAY_SIZE(edosk7760_devices));
-}
-device_initcall(init_edosk7760_devices);
 
 /*
- * The Machine Vector
+ * Sliced VBI data inserted into MPEG Streams
  */
-struct sh_machine_vector mv_edosk7760 __initmv = {
-	.mv_name	= "EDOSK7760",
-};
+
+/*
+ * V4L2_MPEG_STREAM_VBI_FMT_IVTV:
+ *
+ * Structure of payload contained in an MPEG 2 Private Stream 1 PES Packet in an
+ * MPEG-2 Program Pack that contains V4L2_MPEG_STREAM_VBI_FMT_IVTV Sliced VBI
+ * data
+ *
+ * Note, the MPEG-2 Program Pack and Private Stream 1 PES packet header
+ * definitions are not included here.  See the MPEG-2 specifications for details
+ * on these headers.
+ */
+
+/* Line type IDs */
+#define V4L2_MPEG_VBI_IVTV_TELETEXT_B     (1)
+#define V4L2_MPEG_VBI_IVTV_CAPTION_525    (4)
+#define V4L2_MPEG_VBI_IVTV_WSS_625        (5)
+#define V4L2_MPEG_VBI_IVTV_VPS            (7)
+
+struct v4l2_mpeg_vbi_itv0_line {
+	__u8 id;	/* One of V4L2_MPEG_VBI_IVTV_* above */
+	__u8 data[42];	/* Sliced VBI data for the line */
+} __attribute__ ((packed));
+
+struct v4l2_mpeg_vbi_itv0 {
+	__le32 linemask[2]; /* Bitmasks of VBI service lines present */
+	struct v4l2_mpeg_vbi_itv0_line line[35];
+} __attribute__ ((packed));
+
+struct v4l2_mpeg_vbi_ITV0 {
+	struct v4l2_mpeg_vbi_itv0_line line[36];
+} __attribute__ ((packed));
+
+#define V4L2_MPEG_VBI_IVTV_MAGIC0	"itv0"
+#define V4L2_MPEG_VBI_IVTV_MAGIC1	"ITV0"
+
+struct v4l2_mpeg_vbi_fmt_ivtv {
+	__u8 magic[4];
+	union {
+		struct v4l2_mpeg_vbi_itv0 itv0;
+		struct v4l2_mpeg_vbi_ITV0 ITV0;
+	};
+} __attribute__ ((packed));
+
+/*
+ *	A G G R E G A T E   S T R U C T U R E S
+ */
+
+/**
+ * struct v4l2_plane_pix_format - additional, per-plane format definition
+ * @sizeimage:		maximum size in bytes required for data, for which
+ *			this plane will be used
+ * @bytesperline:	distance in bytes between the leftmost pixels in two
+ *			adjacent lines
+ */
+struct v4l2_plane_pix_format {
+	__u32		sizeimage;
+	__u32		bytesperline;
+	__u16		reserved[6];
+} __attribute__ ((packed));
+
+/**
+ * struct v4l2_pix_format_mplane - multiplanar format definition
+ * @width:		image width in pixels
+ * @height:		image height in pixels
+ * @pixelformat:	little endian four character code (fourcc)
+ * @field:		enum v4l2_field; field order (for interlaced video)
+ * @colorspace:		enum v4l2_colorspace; supplemental to pixelformat
+ * @plane_fmt:		per-plane information
+ * @num_planes:		number of planes for this format
+ * @flags:		format flags (V4L2_PIX_FMT_FLAG_*)
+ * @ycbcr_enc:		enum v4l2_ycbcr_encoding, Y'CbCr encoding
+ * @quantization:	enum v4l2_quantization, colorspace quantization
+ * @xfer_func:		enum v4l2_xfer_func, colorspace transfer function
+ */
+struct v4l2_pix_format_mplane {
+	__u32				width;
+	__u32				height;
+	__u32				pixelformat;
+	__u32				field;
+	__u32				colorspace;
+
+	struct v4l2_plane_pix_format	plane_fmt[VIDEO_MAX_PLANES];
+	__u8				num_planes;
+	__u8				flags;
+	__u8				ycbcr_enc;
+	__u8				quantization;
+	__u8				xfer_func;
+	__u8				reserved[7];
+} __attribute__ ((packed));
+
+/**
+ * struct v4l2_sdr_format - SDR 

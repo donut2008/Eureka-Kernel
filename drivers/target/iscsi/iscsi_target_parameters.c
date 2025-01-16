@@ -1,1729 +1,547 @@
-/*******************************************************************************
- * This file contains main functions related to iSCSI Parameter negotiation.
- *
- * (c) Copyright 2007-2013 Datera, Inc.
- *
- * Author: Nicholas A. Bellinger <nab@linux-iscsi.org>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- ******************************************************************************/
-
-#include <linux/slab.h>
-
-#include <target/iscsi/iscsi_target_core.h>
-#include "iscsi_target_util.h"
-#include "iscsi_target_parameters.h"
-
-int iscsi_login_rx_data(
-	struct iscsi_conn *conn,
-	char *buf,
-	int length)
-{
-	int rx_got;
-	struct kvec iov;
-
-	memset(&iov, 0, sizeof(struct kvec));
-	iov.iov_len	= length;
-	iov.iov_base	= buf;
-
-	rx_got = rx_data(conn, &iov, 1, length);
-	if (rx_got != length) {
-		pr_err("rx_data returned %d, expecting %d.\n",
-				rx_got, length);
-		return -1;
-	}
-
-	return 0 ;
-}
-
-int iscsi_login_tx_data(
-	struct iscsi_conn *conn,
-	char *pdu_buf,
-	char *text_buf,
-	int text_length)
-{
-	int length, tx_sent, iov_cnt = 1;
-	struct kvec iov[2];
-
-	length = (ISCSI_HDR_LEN + text_length);
-
-	memset(&iov[0], 0, 2 * sizeof(struct kvec));
-	iov[0].iov_len		= ISCSI_HDR_LEN;
-	iov[0].iov_base		= pdu_buf;
-
-	if (text_buf && text_length) {
-		iov[1].iov_len	= text_length;
-		iov[1].iov_base	= text_buf;
-		iov_cnt++;
-	}
-
-	tx_sent = tx_data(conn, &iov[0], iov_cnt, length);
-	if (tx_sent != length) {
-		pr_err("tx_data returned %d, expecting %d.\n",
-				tx_sent, length);
-		return -1;
-	}
-
-	return 0;
-}
-
-void iscsi_dump_conn_ops(struct iscsi_conn_ops *conn_ops)
-{
-	pr_debug("HeaderDigest: %s\n", (conn_ops->HeaderDigest) ?
-				"CRC32C" : "None");
-	pr_debug("DataDigest: %s\n", (conn_ops->DataDigest) ?
-				"CRC32C" : "None");
-	pr_debug("MaxRecvDataSegmentLength: %u\n",
-				conn_ops->MaxRecvDataSegmentLength);
-}
-
-void iscsi_dump_sess_ops(struct iscsi_sess_ops *sess_ops)
-{
-	pr_debug("InitiatorName: %s\n", sess_ops->InitiatorName);
-	pr_debug("InitiatorAlias: %s\n", sess_ops->InitiatorAlias);
-	pr_debug("TargetName: %s\n", sess_ops->TargetName);
-	pr_debug("TargetAlias: %s\n", sess_ops->TargetAlias);
-	pr_debug("TargetPortalGroupTag: %hu\n",
-			sess_ops->TargetPortalGroupTag);
-	pr_debug("MaxConnections: %hu\n", sess_ops->MaxConnections);
-	pr_debug("InitialR2T: %s\n",
-			(sess_ops->InitialR2T) ? "Yes" : "No");
-	pr_debug("ImmediateData: %s\n", (sess_ops->ImmediateData) ?
-			"Yes" : "No");
-	pr_debug("MaxBurstLength: %u\n", sess_ops->MaxBurstLength);
-	pr_debug("FirstBurstLength: %u\n", sess_ops->FirstBurstLength);
-	pr_debug("DefaultTime2Wait: %hu\n", sess_ops->DefaultTime2Wait);
-	pr_debug("DefaultTime2Retain: %hu\n",
-			sess_ops->DefaultTime2Retain);
-	pr_debug("MaxOutstandingR2T: %hu\n",
-			sess_ops->MaxOutstandingR2T);
-	pr_debug("DataPDUInOrder: %s\n",
-			(sess_ops->DataPDUInOrder) ? "Yes" : "No");
-	pr_debug("DataSequenceInOrder: %s\n",
-			(sess_ops->DataSequenceInOrder) ? "Yes" : "No");
-	pr_debug("ErrorRecoveryLevel: %hu\n",
-			sess_ops->ErrorRecoveryLevel);
-	pr_debug("SessionType: %s\n", (sess_ops->SessionType) ?
-			"Discovery" : "Normal");
-}
-
-void iscsi_print_params(struct iscsi_param_list *param_list)
-{
-	struct iscsi_param *param;
-
-	list_for_each_entry(param, &param_list->param_list, p_list)
-		pr_debug("%s: %s\n", param->name, param->value);
-}
-
-static struct iscsi_param *iscsi_set_default_param(struct iscsi_param_list *param_list,
-		char *name, char *value, u8 phase, u8 scope, u8 sender,
-		u16 type_range, u8 use)
-{
-	struct iscsi_param *param = NULL;
-
-	param = kzalloc(sizeof(struct iscsi_param), GFP_KERNEL);
-	if (!param) {
-		pr_err("Unable to allocate memory for parameter.\n");
-		goto out;
-	}
-	INIT_LIST_HEAD(&param->p_list);
-
-	param->name = kstrdup(name, GFP_KERNEL);
-	if (!param->name) {
-		pr_err("Unable to allocate memory for parameter name.\n");
-		goto out;
-	}
-
-	param->value = kstrdup(value, GFP_KERNEL);
-	if (!param->value) {
-		pr_err("Unable to allocate memory for parameter value.\n");
-		goto out;
-	}
-
-	param->phase		= phase;
-	param->scope		= scope;
-	param->sender		= sender;
-	param->use		= use;
-	param->type_range	= type_range;
-
-	switch (param->type_range) {
-	case TYPERANGE_BOOL_AND:
-		param->type = TYPE_BOOL_AND;
-		break;
-	case TYPERANGE_BOOL_OR:
-		param->type = TYPE_BOOL_OR;
-		break;
-	case TYPERANGE_0_TO_2:
-	case TYPERANGE_0_TO_3600:
-	case TYPERANGE_0_TO_32767:
-	case TYPERANGE_0_TO_65535:
-	case TYPERANGE_1_TO_65535:
-	case TYPERANGE_2_TO_3600:
-	case TYPERANGE_512_TO_16777215:
-		param->type = TYPE_NUMBER;
-		break;
-	case TYPERANGE_AUTH:
-	case TYPERANGE_DIGEST:
-		param->type = TYPE_VALUE_LIST | TYPE_STRING;
-		break;
-	case TYPERANGE_ISCSINAME:
-	case TYPERANGE_SESSIONTYPE:
-	case TYPERANGE_TARGETADDRESS:
-	case TYPERANGE_UTF8:
-		param->type = TYPE_STRING;
-		break;
-	default:
-		pr_err("Unknown type_range 0x%02x\n",
-				param->type_range);
-		goto out;
-	}
-	list_add_tail(&param->p_list, &param_list->param_list);
-
-	return param;
-out:
-	if (param) {
-		kfree(param->value);
-		kfree(param->name);
-		kfree(param);
-	}
-
-	return NULL;
-}
-
-/* #warning Add extension keys */
-int iscsi_create_default_params(struct iscsi_param_list **param_list_ptr)
-{
-	struct iscsi_param *param = NULL;
-	struct iscsi_param_list *pl;
-
-	pl = kzalloc(sizeof(struct iscsi_param_list), GFP_KERNEL);
-	if (!pl) {
-		pr_err("Unable to allocate memory for"
-				" struct iscsi_param_list.\n");
-		return -ENOMEM;
-	}
-	INIT_LIST_HEAD(&pl->param_list);
-	INIT_LIST_HEAD(&pl->extra_response_list);
-
-	/*
-	 * The format for setting the initial parameter definitions are:
-	 *
-	 * Parameter name:
-	 * Initial value:
-	 * Allowable phase:
-	 * Scope:
-	 * Allowable senders:
-	 * Typerange:
-	 * Use:
-	 */
-	param = iscsi_set_default_param(pl, AUTHMETHOD, INITIAL_AUTHMETHOD,
-			PHASE_SECURITY, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_AUTH, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, HEADERDIGEST, INITIAL_HEADERDIGEST,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_DIGEST, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, DATADIGEST, INITIAL_DATADIGEST,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_DIGEST, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, MAXCONNECTIONS,
-			INITIAL_MAXCONNECTIONS, PHASE_OPERATIONAL,
-			SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_1_TO_65535, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, SENDTARGETS, INITIAL_SENDTARGETS,
-			PHASE_FFP0, SCOPE_SESSION_WIDE, SENDER_INITIATOR,
-			TYPERANGE_UTF8, 0);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, TARGETNAME, INITIAL_TARGETNAME,
-			PHASE_DECLARATIVE, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_ISCSINAME, USE_ALL);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, INITIATORNAME,
-			INITIAL_INITIATORNAME, PHASE_DECLARATIVE,
-			SCOPE_SESSION_WIDE, SENDER_INITIATOR,
-			TYPERANGE_ISCSINAME, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, TARGETALIAS, INITIAL_TARGETALIAS,
-			PHASE_DECLARATIVE, SCOPE_SESSION_WIDE, SENDER_TARGET,
-			TYPERANGE_UTF8, USE_ALL);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, INITIATORALIAS,
-			INITIAL_INITIATORALIAS, PHASE_DECLARATIVE,
-			SCOPE_SESSION_WIDE, SENDER_INITIATOR, TYPERANGE_UTF8,
-			USE_ALL);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, TARGETADDRESS,
-			INITIAL_TARGETADDRESS, PHASE_DECLARATIVE,
-			SCOPE_SESSION_WIDE, SENDER_TARGET,
-			TYPERANGE_TARGETADDRESS, USE_ALL);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, TARGETPORTALGROUPTAG,
-			INITIAL_TARGETPORTALGROUPTAG,
-			PHASE_DECLARATIVE, SCOPE_SESSION_WIDE, SENDER_TARGET,
-			TYPERANGE_0_TO_65535, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, INITIALR2T, INITIAL_INITIALR2T,
-			PHASE_OPERATIONAL, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_BOOL_OR, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, IMMEDIATEDATA,
-			INITIAL_IMMEDIATEDATA, PHASE_OPERATIONAL,
-			SCOPE_SESSION_WIDE, SENDER_BOTH, TYPERANGE_BOOL_AND,
-			USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, MAXXMITDATASEGMENTLENGTH,
-			INITIAL_MAXXMITDATASEGMENTLENGTH,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_512_TO_16777215, USE_ALL);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, MAXRECVDATASEGMENTLENGTH,
-			INITIAL_MAXRECVDATASEGMENTLENGTH,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_512_TO_16777215, USE_ALL);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, MAXBURSTLENGTH,
-			INITIAL_MAXBURSTLENGTH, PHASE_OPERATIONAL,
-			SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_512_TO_16777215, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, FIRSTBURSTLENGTH,
-			INITIAL_FIRSTBURSTLENGTH,
-			PHASE_OPERATIONAL, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_512_TO_16777215, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, DEFAULTTIME2WAIT,
-			INITIAL_DEFAULTTIME2WAIT,
-			PHASE_OPERATIONAL, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_0_TO_3600, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, DEFAULTTIME2RETAIN,
-			INITIAL_DEFAULTTIME2RETAIN,
-			PHASE_OPERATIONAL, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_0_TO_3600, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, MAXOUTSTANDINGR2T,
-			INITIAL_MAXOUTSTANDINGR2T,
-			PHASE_OPERATIONAL, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_1_TO_65535, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, DATAPDUINORDER,
-			INITIAL_DATAPDUINORDER, PHASE_OPERATIONAL,
-			SCOPE_SESSION_WIDE, SENDER_BOTH, TYPERANGE_BOOL_OR,
-			USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, DATASEQUENCEINORDER,
-			INITIAL_DATASEQUENCEINORDER,
-			PHASE_OPERATIONAL, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_BOOL_OR, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, ERRORRECOVERYLEVEL,
-			INITIAL_ERRORRECOVERYLEVEL,
-			PHASE_OPERATIONAL, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_0_TO_2, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, SESSIONTYPE, INITIAL_SESSIONTYPE,
-			PHASE_DECLARATIVE, SCOPE_SESSION_WIDE, SENDER_INITIATOR,
-			TYPERANGE_SESSIONTYPE, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, IFMARKER, INITIAL_IFMARKER,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_BOOL_AND, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, OFMARKER, INITIAL_OFMARKER,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_BOOL_AND, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, IFMARKINT, INITIAL_IFMARKINT,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_UTF8, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, OFMARKINT, INITIAL_OFMARKINT,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_UTF8, USE_INITIAL_ONLY);
-	if (!param)
-		goto out;
-
-	/*
-	 * Extra parameters for ISER from RFC-5046
-	 */
-	param = iscsi_set_default_param(pl, RDMAEXTENSIONS, INITIAL_RDMAEXTENSIONS,
-			PHASE_OPERATIONAL, SCOPE_SESSION_WIDE, SENDER_BOTH,
-			TYPERANGE_BOOL_AND, USE_LEADING_ONLY);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, INITIATORRECVDATASEGMENTLENGTH,
-			INITIAL_INITIATORRECVDATASEGMENTLENGTH,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_512_TO_16777215, USE_ALL);
-	if (!param)
-		goto out;
-
-	param = iscsi_set_default_param(pl, TARGETRECVDATASEGMENTLENGTH,
-			INITIAL_TARGETRECVDATASEGMENTLENGTH,
-			PHASE_OPERATIONAL, SCOPE_CONNECTION_ONLY, SENDER_BOTH,
-			TYPERANGE_512_TO_16777215, USE_ALL);
-	if (!param)
-		goto out;
-
-	*param_list_ptr = pl;
-	return 0;
-out:
-	iscsi_release_param_list(pl);
-	return -1;
-}
-
-int iscsi_set_keys_to_negotiate(
-	struct iscsi_param_list *param_list,
-	bool iser)
-{
-	struct iscsi_param *param;
-
-	param_list->iser = iser;
-
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		param->state = 0;
-		if (!strcmp(param->name, AUTHMETHOD)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, HEADERDIGEST)) {
-			if (!iser)
-				SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, DATADIGEST)) {
-			if (!iser)
-				SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, MAXCONNECTIONS)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, TARGETNAME)) {
-			continue;
-		} else if (!strcmp(param->name, INITIATORNAME)) {
-			continue;
-		} else if (!strcmp(param->name, TARGETALIAS)) {
-			if (param->value)
-				SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, INITIATORALIAS)) {
-			continue;
-		} else if (!strcmp(param->name, TARGETPORTALGROUPTAG)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, INITIALR2T)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, IMMEDIATEDATA)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, MAXRECVDATASEGMENTLENGTH)) {
-			if (!iser)
-				SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, MAXXMITDATASEGMENTLENGTH)) {
-			continue;
-		} else if (!strcmp(param->name, MAXBURSTLENGTH)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, FIRSTBURSTLENGTH)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, DEFAULTTIME2WAIT)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, DEFAULTTIME2RETAIN)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, MAXOUTSTANDINGR2T)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, DATAPDUINORDER)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, DATASEQUENCEINORDER)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, ERRORRECOVERYLEVEL)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, SESSIONTYPE)) {
-			SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, IFMARKER)) {
-			SET_PSTATE_REJECT(param);
-		} else if (!strcmp(param->name, OFMARKER)) {
-			SET_PSTATE_REJECT(param);
-		} else if (!strcmp(param->name, IFMARKINT)) {
-			SET_PSTATE_REJECT(param);
-		} else if (!strcmp(param->name, OFMARKINT)) {
-			SET_PSTATE_REJECT(param);
-		} else if (!strcmp(param->name, RDMAEXTENSIONS)) {
-			if (iser)
-				SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, INITIATORRECVDATASEGMENTLENGTH)) {
-			if (iser)
-				SET_PSTATE_NEGOTIATE(param);
-		} else if (!strcmp(param->name, TARGETRECVDATASEGMENTLENGTH)) {
-			if (iser)
-				SET_PSTATE_NEGOTIATE(param);
-		}
-	}
-
-	return 0;
-}
-
-int iscsi_set_keys_irrelevant_for_discovery(
-	struct iscsi_param_list *param_list)
-{
-	struct iscsi_param *param;
-
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		if (!strcmp(param->name, MAXCONNECTIONS))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, INITIALR2T))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, IMMEDIATEDATA))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, MAXBURSTLENGTH))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, FIRSTBURSTLENGTH))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, MAXOUTSTANDINGR2T))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, DATAPDUINORDER))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, DATASEQUENCEINORDER))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, ERRORRECOVERYLEVEL))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, DEFAULTTIME2WAIT))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, DEFAULTTIME2RETAIN))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, IFMARKER))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, OFMARKER))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, IFMARKINT))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, OFMARKINT))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, RDMAEXTENSIONS))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, INITIATORRECVDATASEGMENTLENGTH))
-			param->state &= ~PSTATE_NEGOTIATE;
-		else if (!strcmp(param->name, TARGETRECVDATASEGMENTLENGTH))
-			param->state &= ~PSTATE_NEGOTIATE;
-	}
-
-	return 0;
-}
-
-int iscsi_copy_param_list(
-	struct iscsi_param_list **dst_param_list,
-	struct iscsi_param_list *src_param_list,
-	int leading)
-{
-	struct iscsi_param *param = NULL;
-	struct iscsi_param *new_param = NULL;
-	struct iscsi_param_list *param_list = NULL;
-
-	param_list = kzalloc(sizeof(struct iscsi_param_list), GFP_KERNEL);
-	if (!param_list) {
-		pr_err("Unable to allocate memory for struct iscsi_param_list.\n");
-		return -ENOMEM;
-	}
-	INIT_LIST_HEAD(&param_list->param_list);
-	INIT_LIST_HEAD(&param_list->extra_response_list);
-
-	list_for_each_entry(param, &src_param_list->param_list, p_list) {
-		if (!leading && (param->scope & SCOPE_SESSION_WIDE)) {
-			if ((strcmp(param->name, "TargetName") != 0) &&
-			    (strcmp(param->name, "InitiatorName") != 0) &&
-			    (strcmp(param->name, "TargetPortalGroupTag") != 0))
-				continue;
-		}
-
-		new_param = kzalloc(sizeof(struct iscsi_param), GFP_KERNEL);
-		if (!new_param) {
-			pr_err("Unable to allocate memory for struct iscsi_param.\n");
-			goto err_out;
-		}
-
-		new_param->name = kstrdup(param->name, GFP_KERNEL);
-		new_param->value = kstrdup(param->value, GFP_KERNEL);
-		if (!new_param->value || !new_param->name) {
-			kfree(new_param->value);
-			kfree(new_param->name);
-			kfree(new_param);
-			pr_err("Unable to allocate memory for parameter name/value.\n");
-			goto err_out;
-		}
-
-		new_param->set_param = param->set_param;
-		new_param->phase = param->phase;
-		new_param->scope = param->scope;
-		new_param->sender = param->sender;
-		new_param->type = param->type;
-		new_param->use = param->use;
-		new_param->type_range = param->type_range;
-
-		list_add_tail(&new_param->p_list, &param_list->param_list);
-	}
-
-	if (!list_empty(&param_list->param_list)) {
-		*dst_param_list = param_list;
-	} else {
-		pr_err("No parameters allocated.\n");
-		goto err_out;
-	}
-
-	return 0;
-
-err_out:
-	iscsi_release_param_list(param_list);
-	return -ENOMEM;
-}
-
-static void iscsi_release_extra_responses(struct iscsi_param_list *param_list)
-{
-	struct iscsi_extra_response *er, *er_tmp;
-
-	list_for_each_entry_safe(er, er_tmp, &param_list->extra_response_list,
-			er_list) {
-		list_del(&er->er_list);
-		kfree(er);
-	}
-}
-
-void iscsi_release_param_list(struct iscsi_param_list *param_list)
-{
-	struct iscsi_param *param, *param_tmp;
-
-	list_for_each_entry_safe(param, param_tmp, &param_list->param_list,
-			p_list) {
-		list_del(&param->p_list);
-
-		kfree(param->name);
-		kfree(param->value);
-		kfree(param);
-	}
-
-	iscsi_release_extra_responses(param_list);
-
-	kfree(param_list);
-}
-
-struct iscsi_param *iscsi_find_param_from_key(
-	char *key,
-	struct iscsi_param_list *param_list)
-{
-	struct iscsi_param *param;
-
-	if (!key || !param_list) {
-		pr_err("Key or parameter list pointer is NULL.\n");
-		return NULL;
-	}
-
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		if (!strcmp(key, param->name))
-			return param;
-	}
-
-	pr_err("Unable to locate key \"%s\".\n", key);
-	return NULL;
-}
-
-int iscsi_extract_key_value(char *textbuf, char **key, char **value)
-{
-	*value = strchr(textbuf, '=');
-	if (!*value) {
-		pr_err("Unable to locate \"=\" separator for key,"
-				" ignoring request.\n");
-		return -1;
-	}
-
-	*key = textbuf;
-	**value = '\0';
-	*value = *value + 1;
-
-	return 0;
-}
-
-int iscsi_update_param_value(struct iscsi_param *param, char *value)
-{
-	kfree(param->value);
-
-	param->value = kstrdup(value, GFP_KERNEL);
-	if (!param->value) {
-		pr_err("Unable to allocate memory for value.\n");
-		return -ENOMEM;
-	}
-
-	pr_debug("iSCSI Parameter updated to %s=%s\n",
-			param->name, param->value);
-	return 0;
-}
-
-static int iscsi_add_notunderstood_response(
-	char *key,
-	char *value,
-	struct iscsi_param_list *param_list)
-{
-	struct iscsi_extra_response *extra_response;
-
-	if (strlen(value) > VALUE_MAXLEN) {
-		pr_err("Value for notunderstood key \"%s\" exceeds %d,"
-			" protocol error.\n", key, VALUE_MAXLEN);
-		return -1;
-	}
-
-	extra_response = kzalloc(sizeof(struct iscsi_extra_response), GFP_KERNEL);
-	if (!extra_response) {
-		pr_err("Unable to allocate memory for"
-			" struct iscsi_extra_response.\n");
-		return -ENOMEM;
-	}
-	INIT_LIST_HEAD(&extra_response->er_list);
-
-	strlcpy(extra_response->key, key, sizeof(extra_response->key));
-	strlcpy(extra_response->value, NOTUNDERSTOOD,
-		sizeof(extra_response->value));
-
-	list_add_tail(&extra_response->er_list,
-			&param_list->extra_response_list);
-	return 0;
-}
-
-static int iscsi_check_for_auth_key(char *key)
-{
-	/*
-	 * RFC 1994
-	 */
-	if (!strcmp(key, "CHAP_A") || !strcmp(key, "CHAP_I") ||
-	    !strcmp(key, "CHAP_C") || !strcmp(key, "CHAP_N") ||
-	    !strcmp(key, "CHAP_R"))
-		return 1;
-
-	/*
-	 * RFC 2945
-	 */
-	if (!strcmp(key, "SRP_U") || !strcmp(key, "SRP_N") ||
-	    !strcmp(key, "SRP_g") || !strcmp(key, "SRP_s") ||
-	    !strcmp(key, "SRP_A") || !strcmp(key, "SRP_B") ||
-	    !strcmp(key, "SRP_M") || !strcmp(key, "SRP_HM"))
-		return 1;
-
-	return 0;
-}
-
-static void iscsi_check_proposer_for_optional_reply(struct iscsi_param *param,
-						    bool keys_workaround)
-{
-	if (IS_TYPE_BOOL_AND(param)) {
-		if (!strcmp(param->value, NO))
-			SET_PSTATE_REPLY_OPTIONAL(param);
-	} else if (IS_TYPE_BOOL_OR(param)) {
-		if (!strcmp(param->value, YES))
-			SET_PSTATE_REPLY_OPTIONAL(param);
-
-		if (keys_workaround) {
-			/*
-			 * Required for gPXE iSCSI boot client
-			 */
-			if (!strcmp(param->name, IMMEDIATEDATA))
-				SET_PSTATE_REPLY_OPTIONAL(param);
-		}
-	} else if (IS_TYPE_NUMBER(param)) {
-		if (!strcmp(param->name, MAXRECVDATASEGMENTLENGTH))
-			SET_PSTATE_REPLY_OPTIONAL(param);
-
-		if (keys_workaround) {
-			/*
-			 * Required for Mellanox Flexboot PXE boot ROM
-			 */
-			if (!strcmp(param->name, FIRSTBURSTLENGTH))
-				SET_PSTATE_REPLY_OPTIONAL(param);
-
-			/*
-			 * Required for gPXE iSCSI boot client
-			 */
-			if (!strcmp(param->name, MAXCONNECTIONS))
-				SET_PSTATE_REPLY_OPTIONAL(param);
-		}
-	} else if (IS_PHASE_DECLARATIVE(param))
-		SET_PSTATE_REPLY_OPTIONAL(param);
-}
-
-static int iscsi_check_boolean_value(struct iscsi_param *param, char *value)
-{
-	if (strcmp(value, YES) && strcmp(value, NO)) {
-		pr_err("Illegal value for \"%s\", must be either"
-			" \"%s\" or \"%s\".\n", param->name, YES, NO);
-		return -1;
-	}
-
-	return 0;
-}
-
-static int iscsi_check_numerical_value(struct iscsi_param *param, char *value_ptr)
-{
-	char *tmpptr;
-	int value = 0;
-
-	value = simple_strtoul(value_ptr, &tmpptr, 0);
-
-	if (IS_TYPERANGE_0_TO_2(param)) {
-		if ((value < 0) || (value > 2)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" between 0 and 2.\n", param->name);
-			return -1;
-		}
-		return 0;
-	}
-	if (IS_TYPERANGE_0_TO_3600(param)) {
-		if ((value < 0) || (value > 3600)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" between 0 and 3600.\n", param->name);
-			return -1;
-		}
-		return 0;
-	}
-	if (IS_TYPERANGE_0_TO_32767(param)) {
-		if ((value < 0) || (value > 32767)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" between 0 and 32767.\n", param->name);
-			return -1;
-		}
-		return 0;
-	}
-	if (IS_TYPERANGE_0_TO_65535(param)) {
-		if ((value < 0) || (value > 65535)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" between 0 and 65535.\n", param->name);
-			return -1;
-		}
-		return 0;
-	}
-	if (IS_TYPERANGE_1_TO_65535(param)) {
-		if ((value < 1) || (value > 65535)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" between 1 and 65535.\n", param->name);
-			return -1;
-		}
-		return 0;
-	}
-	if (IS_TYPERANGE_2_TO_3600(param)) {
-		if ((value < 2) || (value > 3600)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" between 2 and 3600.\n", param->name);
-			return -1;
-		}
-		return 0;
-	}
-	if (IS_TYPERANGE_512_TO_16777215(param)) {
-		if ((value < 512) || (value > 16777215)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" between 512 and 16777215.\n", param->name);
-			return -1;
-		}
-		return 0;
-	}
-
-	return 0;
-}
-
-static int iscsi_check_string_or_list_value(struct iscsi_param *param, char *value)
-{
-	if (IS_PSTATE_PROPOSER(param))
-		return 0;
-
-	if (IS_TYPERANGE_AUTH_PARAM(param)) {
-		if (strcmp(value, KRB5) && strcmp(value, SPKM1) &&
-		    strcmp(value, SPKM2) && strcmp(value, SRP) &&
-		    strcmp(value, CHAP) && strcmp(value, NONE)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" \"%s\", \"%s\", \"%s\", \"%s\", \"%s\""
-				" or \"%s\".\n", param->name, KRB5,
-					SPKM1, SPKM2, SRP, CHAP, NONE);
-			return -1;
-		}
-	}
-	if (IS_TYPERANGE_DIGEST_PARAM(param)) {
-		if (strcmp(value, CRC32C) && strcmp(value, NONE)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" \"%s\" or \"%s\".\n", param->name,
-					CRC32C, NONE);
-			return -1;
-		}
-	}
-	if (IS_TYPERANGE_SESSIONTYPE(param)) {
-		if (strcmp(value, DISCOVERY) && strcmp(value, NORMAL)) {
-			pr_err("Illegal value for \"%s\", must be"
-				" \"%s\" or \"%s\".\n", param->name,
-					DISCOVERY, NORMAL);
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-static char *iscsi_check_valuelist_for_support(
-	struct iscsi_param *param,
-	char *value)
-{
-	char *tmp1 = NULL, *tmp2 = NULL;
-	char *acceptor_values = NULL, *proposer_values = NULL;
-
-	acceptor_values = param->value;
-	proposer_values = value;
-
-	do {
-		if (!proposer_values)
-			return NULL;
-		tmp1 = strchr(proposer_values, ',');
-		if (tmp1)
-			*tmp1 = '\0';
-		acceptor_values = param->value;
-		do {
-			if (!acceptor_values) {
-				if (tmp1)
-					*tmp1 = ',';
-				return NULL;
-			}
-			tmp2 = strchr(acceptor_values, ',');
-			if (tmp2)
-				*tmp2 = '\0';
-			if (!strcmp(acceptor_values, proposer_values)) {
-				if (tmp2)
-					*tmp2 = ',';
-				goto out;
-			}
-			if (tmp2)
-				*tmp2++ = ',';
-
-			acceptor_values = tmp2;
-		} while (acceptor_values);
-		if (tmp1)
-			*tmp1++ = ',';
-		proposer_values = tmp1;
-	} while (proposer_values);
-
-out:
-	return proposer_values;
-}
-
-static int iscsi_check_acceptor_state(struct iscsi_param *param, char *value,
-				struct iscsi_conn *conn)
-{
-	u8 acceptor_boolean_value = 0, proposer_boolean_value = 0;
-	char *negotiated_value = NULL;
-
-	if (IS_PSTATE_ACCEPTOR(param)) {
-		pr_err("Received key \"%s\" twice, protocol error.\n",
-				param->name);
-		return -1;
-	}
-
-	if (IS_PSTATE_REJECT(param))
-		return 0;
-
-	if (IS_TYPE_BOOL_AND(param)) {
-		if (!strcmp(value, YES))
-			proposer_boolean_value = 1;
-		if (!strcmp(param->value, YES))
-			acceptor_boolean_value = 1;
-		if (acceptor_boolean_value && proposer_boolean_value)
-			do {} while (0);
-		else {
-			if (iscsi_update_param_value(param, NO) < 0)
-				return -1;
-			if (!proposer_boolean_value)
-				SET_PSTATE_REPLY_OPTIONAL(param);
-		}
-	} else if (IS_TYPE_BOOL_OR(param)) {
-		if (!strcmp(value, YES))
-			proposer_boolean_value = 1;
-		if (!strcmp(param->value, YES))
-			acceptor_boolean_value = 1;
-		if (acceptor_boolean_value || proposer_boolean_value) {
-			if (iscsi_update_param_value(param, YES) < 0)
-				return -1;
-			if (proposer_boolean_value)
-				SET_PSTATE_REPLY_OPTIONAL(param);
-		}
-	} else if (IS_TYPE_NUMBER(param)) {
-		char *tmpptr, buf[11];
-		u32 acceptor_value = simple_strtoul(param->value, &tmpptr, 0);
-		u32 proposer_value = simple_strtoul(value, &tmpptr, 0);
-
-		memset(buf, 0, sizeof(buf));
-
-		if (!strcmp(param->name, MAXCONNECTIONS) ||
-		    !strcmp(param->name, MAXBURSTLENGTH) ||
-		    !strcmp(param->name, FIRSTBURSTLENGTH) ||
-		    !strcmp(param->name, MAXOUTSTANDINGR2T) ||
-		    !strcmp(param->name, DEFAULTTIME2RETAIN) ||
-		    !strcmp(param->name, ERRORRECOVERYLEVEL)) {
-			if (proposer_value > acceptor_value) {
-				sprintf(buf, "%u", acceptor_value);
-				if (iscsi_update_param_value(param,
-						&buf[0]) < 0)
-					return -1;
-			} else {
-				if (iscsi_update_param_value(param, value) < 0)
-					return -1;
-			}
-		} else if (!strcmp(param->name, DEFAULTTIME2WAIT)) {
-			if (acceptor_value > proposer_value) {
-				sprintf(buf, "%u", acceptor_value);
-				if (iscsi_update_param_value(param,
-						&buf[0]) < 0)
-					return -1;
-			} else {
-				if (iscsi_update_param_value(param, value) < 0)
-					return -1;
-			}
-		} else {
-			if (iscsi_update_param_value(param, value) < 0)
-				return -1;
-		}
-
-		if (!strcmp(param->name, MAXRECVDATASEGMENTLENGTH)) {
-			struct iscsi_param *param_mxdsl;
-			unsigned long long tmp;
-			int rc;
-
-			rc = kstrtoull(param->value, 0, &tmp);
-			if (rc < 0)
-				return -1;
-
-			conn->conn_ops->MaxRecvDataSegmentLength = tmp;
-			pr_debug("Saving op->MaxRecvDataSegmentLength from"
-				" original initiator received value: %u\n",
-				conn->conn_ops->MaxRecvDataSegmentLength);
-
-			param_mxdsl = iscsi_find_param_from_key(
-						MAXXMITDATASEGMENTLENGTH,
-						conn->param_list);
-			if (!param_mxdsl)
-				return -1;
-
-			rc = iscsi_update_param_value(param,
-						param_mxdsl->value);
-			if (rc < 0)
-				return -1;
-
-			pr_debug("Updated %s to target MXDSL value: %s\n",
-					param->name, param->value);
-		}
-	} else if (IS_TYPE_VALUE_LIST(param)) {
-		negotiated_value = iscsi_check_valuelist_for_support(
-					param, value);
-		if (!negotiated_value) {
-			pr_err("Proposer's value list \"%s\" contains"
-				" no valid values from Acceptor's value list"
-				" \"%s\".\n", value, param->value);
-			return -1;
-		}
-		if (iscsi_update_param_value(param, negotiated_value) < 0)
-			return -1;
-	} else if (IS_PHASE_DECLARATIVE(param)) {
-		if (iscsi_update_param_value(param, value) < 0)
-			return -1;
-		SET_PSTATE_REPLY_OPTIONAL(param);
-	}
-
-	return 0;
-}
-
-static int iscsi_check_proposer_state(struct iscsi_param *param, char *value)
-{
-	if (IS_PSTATE_RESPONSE_GOT(param)) {
-		pr_err("Received key \"%s\" twice, protocol error.\n",
-				param->name);
-		return -1;
-	}
-
-	if (IS_TYPE_VALUE_LIST(param)) {
-		char *comma_ptr = NULL, *tmp_ptr = NULL;
-
-		comma_ptr = strchr(value, ',');
-		if (comma_ptr) {
-			pr_err("Illegal \",\" in response for \"%s\".\n",
-					param->name);
-			return -1;
-		}
-
-		tmp_ptr = iscsi_check_valuelist_for_support(param, value);
-		if (!tmp_ptr)
-			return -1;
-	}
-
-	if (iscsi_update_param_value(param, value) < 0)
-		return -1;
-
-	return 0;
-}
-
-static int iscsi_check_value(struct iscsi_param *param, char *value)
-{
-	char *comma_ptr = NULL;
-
-	if (!strcmp(value, REJECT)) {
-		if (!strcmp(param->name, IFMARKINT) ||
-		    !strcmp(param->name, OFMARKINT)) {
-			/*
-			 * Reject is not fatal for [I,O]FMarkInt,  and causes
-			 * [I,O]FMarker to be reset to No. (See iSCSI v20 A.3.2)
-			 */
-			SET_PSTATE_REJECT(param);
-			return 0;
-		}
-		pr_err("Received %s=%s\n", param->name, value);
-		return -1;
-	}
-	if (!strcmp(value, IRRELEVANT)) {
-		pr_debug("Received %s=%s\n", param->name, value);
-		SET_PSTATE_IRRELEVANT(param);
-		return 0;
-	}
-	if (!strcmp(value, NOTUNDERSTOOD)) {
-		if (!IS_PSTATE_PROPOSER(param)) {
-			pr_err("Received illegal offer %s=%s\n",
-				param->name, value);
-			return -1;
-		}
-
-/* #warning FIXME: Add check for X-ExtensionKey here */
-		pr_err("Standard iSCSI key \"%s\" cannot be answered"
-			" with \"%s\", protocol error.\n", param->name, value);
-		return -1;
-	}
-
-	do {
-		comma_ptr = NULL;
-		comma_ptr = strchr(value, ',');
-
-		if (comma_ptr && !IS_TYPE_VALUE_LIST(param)) {
-			pr_err("Detected value separator \",\", but"
-				" key \"%s\" does not allow a value list,"
-				" protocol error.\n", param->name);
-			return -1;
-		}
-		if (comma_ptr)
-			*comma_ptr = '\0';
-
-		if (strlen(value) > VALUE_MAXLEN) {
-			pr_err("Value for key \"%s\" exceeds %d,"
-				" protocol error.\n", param->name,
-				VALUE_MAXLEN);
-			return -1;
-		}
-
-		if (IS_TYPE_BOOL_AND(param) || IS_TYPE_BOOL_OR(param)) {
-			if (iscsi_check_boolean_value(param, value) < 0)
-				return -1;
-		} else if (IS_TYPE_NUMBER(param)) {
-			if (iscsi_check_numerical_value(param, value) < 0)
-				return -1;
-		} else if (IS_TYPE_STRING(param) || IS_TYPE_VALUE_LIST(param)) {
-			if (iscsi_check_string_or_list_value(param, value) < 0)
-				return -1;
-		} else {
-			pr_err("Huh? 0x%02x\n", param->type);
-			return -1;
-		}
-
-		if (comma_ptr)
-			*comma_ptr++ = ',';
-
-		value = comma_ptr;
-	} while (value);
-
-	return 0;
-}
-
-static struct iscsi_param *__iscsi_check_key(
-	char *key,
-	int sender,
-	struct iscsi_param_list *param_list)
-{
-	struct iscsi_param *param;
-
-	if (strlen(key) > KEY_MAXLEN) {
-		pr_err("Length of key name \"%s\" exceeds %d.\n",
-			key, KEY_MAXLEN);
-		return NULL;
-	}
-
-	param = iscsi_find_param_from_key(key, param_list);
-	if (!param)
-		return NULL;
-
-	if ((sender & SENDER_INITIATOR) && !IS_SENDER_INITIATOR(param)) {
-		pr_err("Key \"%s\" may not be sent to %s,"
-			" protocol error.\n", param->name,
-			(sender & SENDER_RECEIVER) ? "target" : "initiator");
-		return NULL;
-	}
-
-	if ((sender & SENDER_TARGET) && !IS_SENDER_TARGET(param)) {
-		pr_err("Key \"%s\" may not be sent to %s,"
-			" protocol error.\n", param->name,
-			(sender & SENDER_RECEIVER) ? "initiator" : "target");
-		return NULL;
-	}
-
-	return param;
-}
-
-static struct iscsi_param *iscsi_check_key(
-	char *key,
-	int phase,
-	int sender,
-	struct iscsi_param_list *param_list)
-{
-	struct iscsi_param *param;
-	/*
-	 * Key name length must not exceed 63 bytes. (See iSCSI v20 5.1)
-	 */
-	if (strlen(key) > KEY_MAXLEN) {
-		pr_err("Length of key name \"%s\" exceeds %d.\n",
-			key, KEY_MAXLEN);
-		return NULL;
-	}
-
-	param = iscsi_find_param_from_key(key, param_list);
-	if (!param)
-		return NULL;
-
-	if ((sender & SENDER_INITIATOR) && !IS_SENDER_INITIATOR(param)) {
-		pr_err("Key \"%s\" may not be sent to %s,"
-			" protocol error.\n", param->name,
-			(sender & SENDER_RECEIVER) ? "target" : "initiator");
-		return NULL;
-	}
-	if ((sender & SENDER_TARGET) && !IS_SENDER_TARGET(param)) {
-		pr_err("Key \"%s\" may not be sent to %s,"
-				" protocol error.\n", param->name,
-			(sender & SENDER_RECEIVER) ? "initiator" : "target");
-		return NULL;
-	}
-
-	if (IS_PSTATE_ACCEPTOR(param)) {
-		pr_err("Key \"%s\" received twice, protocol error.\n",
-				key);
-		return NULL;
-	}
-
-	if (!phase)
-		return param;
-
-	if (!(param->phase & phase)) {
-		char *phase_name;
-
-		switch (phase) {
-		case PHASE_SECURITY:
-			phase_name = "Security";
-			break;
-		case PHASE_OPERATIONAL:
-			phase_name = "Operational";
-			break;
-		default:
-			phase_name = "Unknown";
-		}
-		pr_err("Key \"%s\" may not be negotiated during %s phase.\n",
-				param->name, phase_name);
-		return NULL;
-	}
-
-	return param;
-}
-
-static int iscsi_enforce_integrity_rules(
-	u8 phase,
-	struct iscsi_param_list *param_list)
-{
-	char *tmpptr;
-	u8 DataSequenceInOrder = 0;
-	u8 ErrorRecoveryLevel = 0, SessionType = 0;
-	u32 FirstBurstLength = 0, MaxBurstLength = 0;
-	struct iscsi_param *param = NULL;
-
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		if (!(param->phase & phase))
-			continue;
-		if (!strcmp(param->name, SESSIONTYPE))
-			if (!strcmp(param->value, NORMAL))
-				SessionType = 1;
-		if (!strcmp(param->name, ERRORRECOVERYLEVEL))
-			ErrorRecoveryLevel = simple_strtoul(param->value,
-					&tmpptr, 0);
-		if (!strcmp(param->name, DATASEQUENCEINORDER))
-			if (!strcmp(param->value, YES))
-				DataSequenceInOrder = 1;
-		if (!strcmp(param->name, MAXBURSTLENGTH))
-			MaxBurstLength = simple_strtoul(param->value,
-					&tmpptr, 0);
-	}
-
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		if (!(param->phase & phase))
-			continue;
-		if (!SessionType && !IS_PSTATE_ACCEPTOR(param))
-			continue;
-		if (!strcmp(param->name, MAXOUTSTANDINGR2T) &&
-		    DataSequenceInOrder && (ErrorRecoveryLevel > 0)) {
-			if (strcmp(param->value, "1")) {
-				if (iscsi_update_param_value(param, "1") < 0)
-					return -1;
-				pr_debug("Reset \"%s\" to \"%s\".\n",
-					param->name, param->value);
-			}
-		}
-		if (!strcmp(param->name, MAXCONNECTIONS) && !SessionType) {
-			if (strcmp(param->value, "1")) {
-				if (iscsi_update_param_value(param, "1") < 0)
-					return -1;
-				pr_debug("Reset \"%s\" to \"%s\".\n",
-					param->name, param->value);
-			}
-		}
-		if (!strcmp(param->name, FIRSTBURSTLENGTH)) {
-			FirstBurstLength = simple_strtoul(param->value,
-					&tmpptr, 0);
-			if (FirstBurstLength > MaxBurstLength) {
-				char tmpbuf[11];
-				memset(tmpbuf, 0, sizeof(tmpbuf));
-				sprintf(tmpbuf, "%u", MaxBurstLength);
-				if (iscsi_update_param_value(param, tmpbuf))
-					return -1;
-				pr_debug("Reset \"%s\" to \"%s\".\n",
-					param->name, param->value);
-			}
-		}
-	}
-
-	return 0;
-}
-
-int iscsi_decode_text_input(
-	u8 phase,
-	u8 sender,
-	char *textbuf,
-	u32 length,
-	struct iscsi_conn *conn)
-{
-	struct iscsi_param_list *param_list = conn->param_list;
-	char *tmpbuf, *start = NULL, *end = NULL;
-
-	tmpbuf = kzalloc(length + 1, GFP_KERNEL);
-	if (!tmpbuf) {
-		pr_err("Unable to allocate %u + 1 bytes for tmpbuf.\n", length);
-		return -ENOMEM;
-	}
-
-	memcpy(tmpbuf, textbuf, length);
-	tmpbuf[length] = '\0';
-	start = tmpbuf;
-	end = (start + length);
-
-	while (start < end) {
-		char *key, *value;
-		struct iscsi_param *param;
-
-		if (iscsi_extract_key_value(start, &key, &value) < 0) {
-			kfree(tmpbuf);
-			return -1;
-		}
-
-		pr_debug("Got key: %s=%s\n", key, value);
-
-		if (phase & PHASE_SECURITY) {
-			if (iscsi_check_for_auth_key(key) > 0) {
-				kfree(tmpbuf);
-				return 1;
-			}
-		}
-
-		param = iscsi_check_key(key, phase, sender, param_list);
-		if (!param) {
-			if (iscsi_add_notunderstood_response(key,
-					value, param_list) < 0) {
-				kfree(tmpbuf);
-				return -1;
-			}
-			start += strlen(key) + strlen(value) + 2;
-			continue;
-		}
-		if (iscsi_check_value(param, value) < 0) {
-			kfree(tmpbuf);
-			return -1;
-		}
-
-		start += strlen(key) + strlen(value) + 2;
-
-		if (IS_PSTATE_PROPOSER(param)) {
-			if (iscsi_check_proposer_state(param, value) < 0) {
-				kfree(tmpbuf);
-				return -1;
-			}
-			SET_PSTATE_RESPONSE_GOT(param);
-		} else {
-			if (iscsi_check_acceptor_state(param, value, conn) < 0) {
-				kfree(tmpbuf);
-				return -1;
-			}
-			SET_PSTATE_ACCEPTOR(param);
-		}
-	}
-
-	kfree(tmpbuf);
-	return 0;
-}
-
-int iscsi_encode_text_output(
-	u8 phase,
-	u8 sender,
-	char *textbuf,
-	u32 *length,
-	struct iscsi_param_list *param_list,
-	bool keys_workaround)
-{
-	char *output_buf = NULL;
-	struct iscsi_extra_response *er;
-	struct iscsi_param *param;
-
-	output_buf = textbuf + *length;
-
-	if (iscsi_enforce_integrity_rules(phase, param_list) < 0)
-		return -1;
-
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		if (!(param->sender & sender))
-			continue;
-		if (IS_PSTATE_ACCEPTOR(param) &&
-		    !IS_PSTATE_RESPONSE_SENT(param) &&
-		    !IS_PSTATE_REPLY_OPTIONAL(param) &&
-		    (param->phase & phase)) {
-			*length += sprintf(output_buf, "%s=%s",
-				param->name, param->value);
-			*length += 1;
-			output_buf = textbuf + *length;
-			SET_PSTATE_RESPONSE_SENT(param);
-			pr_debug("Sending key: %s=%s\n",
-				param->name, param->value);
-			continue;
-		}
-		if (IS_PSTATE_NEGOTIATE(param) &&
-		    !IS_PSTATE_ACCEPTOR(param) &&
-		    !IS_PSTATE_PROPOSER(param) &&
-		    (param->phase & phase)) {
-			*length += sprintf(output_buf, "%s=%s",
-				param->name, param->value);
-			*length += 1;
-			output_buf = textbuf + *length;
-			SET_PSTATE_PROPOSER(param);
-			iscsi_check_proposer_for_optional_reply(param,
-							        keys_workaround);
-			pr_debug("Sending key: %s=%s\n",
-				param->name, param->value);
-		}
-	}
-
-	list_for_each_entry(er, &param_list->extra_response_list, er_list) {
-		*length += sprintf(output_buf, "%s=%s", er->key, er->value);
-		*length += 1;
-		output_buf = textbuf + *length;
-		pr_debug("Sending key: %s=%s\n", er->key, er->value);
-	}
-	iscsi_release_extra_responses(param_list);
-
-	return 0;
-}
-
-int iscsi_check_negotiated_keys(struct iscsi_param_list *param_list)
-{
-	int ret = 0;
-	struct iscsi_param *param;
-
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		if (IS_PSTATE_NEGOTIATE(param) &&
-		    IS_PSTATE_PROPOSER(param) &&
-		    !IS_PSTATE_RESPONSE_GOT(param) &&
-		    !IS_PSTATE_REPLY_OPTIONAL(param) &&
-		    !IS_PHASE_DECLARATIVE(param)) {
-			pr_err("No response for proposed key \"%s\".\n",
-					param->name);
-			ret = -1;
-		}
-	}
-
-	return ret;
-}
-
-int iscsi_change_param_value(
-	char *keyvalue,
-	struct iscsi_param_list *param_list,
-	int check_key)
-{
-	char *key = NULL, *value = NULL;
-	struct iscsi_param *param;
-	int sender = 0;
-
-	if (iscsi_extract_key_value(keyvalue, &key, &value) < 0)
-		return -1;
-
-	if (!check_key) {
-		param = __iscsi_check_key(keyvalue, sender, param_list);
-		if (!param)
-			return -1;
-	} else {
-		param = iscsi_check_key(keyvalue, 0, sender, param_list);
-		if (!param)
-			return -1;
-
-		param->set_param = 1;
-		if (iscsi_check_value(param, value) < 0) {
-			param->set_param = 0;
-			return -1;
-		}
-		param->set_param = 0;
-	}
-
-	if (iscsi_update_param_value(param, value) < 0)
-		return -1;
-
-	return 0;
-}
-
-void iscsi_set_connection_parameters(
-	struct iscsi_conn_ops *ops,
-	struct iscsi_param_list *param_list)
-{
-	char *tmpptr;
-	struct iscsi_param *param;
-
-	pr_debug("---------------------------------------------------"
-			"---------------\n");
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		/*
-		 * Special case to set MAXXMITDATASEGMENTLENGTH from the
-		 * target requested MaxRecvDataSegmentLength, even though
-		 * this key is not sent over the wire.
-		 */
-		if (!strcmp(param->name, MAXXMITDATASEGMENTLENGTH)) {
-			ops->MaxXmitDataSegmentLength =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("MaxXmitDataSegmentLength:     %s\n",
-				param->value);
-		}
-
-		if (!IS_PSTATE_ACCEPTOR(param) && !IS_PSTATE_PROPOSER(param))
-			continue;
-		if (!strcmp(param->name, AUTHMETHOD)) {
-			pr_debug("AuthMethod:                   %s\n",
-				param->value);
-		} else if (!strcmp(param->name, HEADERDIGEST)) {
-			ops->HeaderDigest = !strcmp(param->value, CRC32C);
-			pr_debug("HeaderDigest:                 %s\n",
-				param->value);
-		} else if (!strcmp(param->name, DATADIGEST)) {
-			ops->DataDigest = !strcmp(param->value, CRC32C);
-			pr_debug("DataDigest:                   %s\n",
-				param->value);
-		} else if (!strcmp(param->name, MAXRECVDATASEGMENTLENGTH)) {
-			/*
-			 * At this point iscsi_check_acceptor_state() will have
-			 * set ops->MaxRecvDataSegmentLength from the original
-			 * initiator provided value.
-			 */
-			pr_debug("MaxRecvDataSegmentLength:     %u\n",
-				ops->MaxRecvDataSegmentLength);
-		} else if (!strcmp(param->name, INITIATORRECVDATASEGMENTLENGTH)) {
-			ops->InitiatorRecvDataSegmentLength =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("InitiatorRecvDataSegmentLength: %s\n",
-				param->value);
-			ops->MaxRecvDataSegmentLength =
-					ops->InitiatorRecvDataSegmentLength;
-			pr_debug("Set MRDSL from InitiatorRecvDataSegmentLength\n");
-		} else if (!strcmp(param->name, TARGETRECVDATASEGMENTLENGTH)) {
-			ops->TargetRecvDataSegmentLength =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("TargetRecvDataSegmentLength:  %s\n",
-				param->value);
-			ops->MaxXmitDataSegmentLength =
-					ops->TargetRecvDataSegmentLength;
-			pr_debug("Set MXDSL from TargetRecvDataSegmentLength\n");
-		}
-	}
-	pr_debug("----------------------------------------------------"
-			"--------------\n");
-}
-
-void iscsi_set_session_parameters(
-	struct iscsi_sess_ops *ops,
-	struct iscsi_param_list *param_list,
-	int leading)
-{
-	char *tmpptr;
-	struct iscsi_param *param;
-
-	pr_debug("----------------------------------------------------"
-			"--------------\n");
-	list_for_each_entry(param, &param_list->param_list, p_list) {
-		if (!IS_PSTATE_ACCEPTOR(param) && !IS_PSTATE_PROPOSER(param))
-			continue;
-		if (!strcmp(param->name, INITIATORNAME)) {
-			if (!param->value)
-				continue;
-			if (leading)
-				snprintf(ops->InitiatorName,
-						sizeof(ops->InitiatorName),
-						"%s", param->value);
-			pr_debug("InitiatorName:                %s\n",
-				param->value);
-		} else if (!strcmp(param->name, INITIATORALIAS)) {
-			if (!param->value)
-				continue;
-			snprintf(ops->InitiatorAlias,
-						sizeof(ops->InitiatorAlias),
-						"%s", param->value);
-			pr_debug("InitiatorAlias:               %s\n",
-				param->value);
-		} else if (!strcmp(param->name, TARGETNAME)) {
-			if (!param->value)
-				continue;
-			if (leading)
-				snprintf(ops->TargetName,
-						sizeof(ops->TargetName),
-						"%s", param->value);
-			pr_debug("TargetName:                   %s\n",
-				param->value);
-		} else if (!strcmp(param->name, TARGETALIAS)) {
-			if (!param->value)
-				continue;
-			snprintf(ops->TargetAlias, sizeof(ops->TargetAlias),
-					"%s", param->value);
-			pr_debug("TargetAlias:                  %s\n",
-				param->value);
-		} else if (!strcmp(param->name, TARGETPORTALGROUPTAG)) {
-			ops->TargetPortalGroupTag =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("TargetPortalGroupTag:         %s\n",
-				param->value);
-		} else if (!strcmp(param->name, MAXCONNECTIONS)) {
-			ops->MaxConnections =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("MaxConnections:               %s\n",
-				param->value);
-		} else if (!strcmp(param->name, INITIALR2T)) {
-			ops->InitialR2T = !strcmp(param->value, YES);
-			 pr_debug("InitialR2T:                   %s\n",
-				param->value);
-		} else if (!strcmp(param->name, IMMEDIATEDATA)) {
-			ops->ImmediateData = !strcmp(param->value, YES);
-			pr_debug("ImmediateData:                %s\n",
-				param->value);
-		} else if (!strcmp(param->name, MAXBURSTLENGTH)) {
-			ops->MaxBurstLength =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("MaxBurstLength:               %s\n",
-				param->value);
-		} else if (!strcmp(param->name, FIRSTBURSTLENGTH)) {
-			ops->FirstBurstLength =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("FirstBurstLength:             %s\n",
-				param->value);
-		} else if (!strcmp(param->name, DEFAULTTIME2WAIT)) {
-			ops->DefaultTime2Wait =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("DefaultTime2Wait:             %s\n",
-				param->value);
-		} else if (!strcmp(param->name, DEFAULTTIME2RETAIN)) {
-			ops->DefaultTime2Retain =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("DefaultTime2Retain:           %s\n",
-				param->value);
-		} else if (!strcmp(param->name, MAXOUTSTANDINGR2T)) {
-			ops->MaxOutstandingR2T =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("MaxOutstandingR2T:            %s\n",
-				param->value);
-		} else if (!strcmp(param->name, DATAPDUINORDER)) {
-			ops->DataPDUInOrder = !strcmp(param->value, YES);
-			pr_debug("DataPDUInOrder:               %s\n",
-				param->value);
-		} else if (!strcmp(param->name, DATASEQUENCEINORDER)) {
-			ops->DataSequenceInOrder = !strcmp(param->value, YES);
-			pr_debug("DataSequenceInOrder:          %s\n",
-				param->value);
-		} else if (!strcmp(param->name, ERRORRECOVERYLEVEL)) {
-			ops->ErrorRecoveryLevel =
-				simple_strtoul(param->value, &tmpptr, 0);
-			pr_debug("ErrorRecoveryLevel:           %s\n",
-				param->value);
-		} else if (!strcmp(param->name, SESSIONTYPE)) {
-			ops->SessionType = !strcmp(param->value, DISCOVERY);
-			pr_debug("SessionType:                  %s\n",
-				param->value);
-		} else if (!strcmp(param->name, RDMAEXTENSIONS)) {
-			ops->RDMAExtensions = !strcmp(param->value, YES);
-			pr_debug("RDMAExtensions:               %s\n",
-				param->value);
-		}
-	}
-	pr_debug("----------------------------------------------------"
-			"--------------\n");
-
-}
+UNIPHY_MACRO_CNTL_RESERVED19                             0x4993
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED19                             0x49d3
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED19                             0x49f3
+#define mmUNIPHY_MACRO_CNTL_RESERVED20                                          0x48d4
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED20                             0x48d4
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED20                             0x48f4
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED20                             0x4914
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED20                             0x4934
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED20                             0x4954
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED20                             0x4974
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED20                             0x4994
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED20                             0x49d4
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED20                             0x49f4
+#define mmUNIPHY_MACRO_CNTL_RESERVED21                                          0x48d5
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED21                             0x48d5
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED21                             0x48f5
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED21                             0x4915
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED21                             0x4935
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED21                             0x4955
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED21                             0x4975
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED21                             0x4995
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED21                             0x49d5
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED21                             0x49f5
+#define mmUNIPHY_MACRO_CNTL_RESERVED22                                          0x48d6
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED22                             0x48d6
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED22                             0x48f6
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED22                             0x4916
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED22                             0x4936
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED22                             0x4956
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED22                             0x4976
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED22                             0x4996
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED22                             0x49d6
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED22                             0x49f6
+#define mmUNIPHY_MACRO_CNTL_RESERVED23                                          0x48d7
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED23                             0x48d7
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED23                             0x48f7
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED23                             0x4917
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED23                             0x4937
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED23                             0x4957
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED23                             0x4977
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED23                             0x4997
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED23                             0x49d7
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED23                             0x49f7
+#define mmUNIPHY_MACRO_CNTL_RESERVED24                                          0x48d8
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED24                             0x48d8
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED24                             0x48f8
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED24                             0x4918
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED24                             0x4938
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED24                             0x4958
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED24                             0x4978
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED24                             0x4998
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED24                             0x49d8
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED24                             0x49f8
+#define mmUNIPHY_MACRO_CNTL_RESERVED25                                          0x48d9
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED25                             0x48d9
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED25                             0x48f9
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED25                             0x4919
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED25                             0x4939
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED25                             0x4959
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED25                             0x4979
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED25                             0x4999
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED25                             0x49d9
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED25                             0x49f9
+#define mmUNIPHY_MACRO_CNTL_RESERVED26                                          0x48da
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED26                             0x48da
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED26                             0x48fa
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED26                             0x491a
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED26                             0x493a
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED26                             0x495a
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED26                             0x497a
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED26                             0x499a
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED26                             0x49da
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED26                             0x49fa
+#define mmUNIPHY_MACRO_CNTL_RESERVED27                                          0x48db
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED27                             0x48db
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED27                             0x48fb
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED27                             0x491b
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED27                             0x493b
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED27                             0x495b
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED27                             0x497b
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED27                             0x499b
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED27                             0x49db
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED27                             0x49fb
+#define mmUNIPHY_MACRO_CNTL_RESERVED28                                          0x48dc
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED28                             0x48dc
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED28                             0x48fc
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED28                             0x491c
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED28                             0x493c
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED28                             0x495c
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED28                             0x497c
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED28                             0x499c
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED28                             0x49dc
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED28                             0x49fc
+#define mmUNIPHY_MACRO_CNTL_RESERVED29                                          0x48dd
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED29                             0x48dd
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED29                             0x48fd
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED29                             0x491d
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED29                             0x493d
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED29                             0x495d
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED29                             0x497d
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED29                             0x499d
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED29                             0x49dd
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED29                             0x49fd
+#define mmUNIPHY_MACRO_CNTL_RESERVED30                                          0x48de
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED30                             0x48de
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED30                             0x48fe
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED30                             0x491e
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED30                             0x493e
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED30                             0x495e
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED30                             0x497e
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED30                             0x499e
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED30                             0x49de
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED30                             0x49fe
+#define mmUNIPHY_MACRO_CNTL_RESERVED31                                          0x48df
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED31                             0x48df
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED31                             0x48ff
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED31                             0x491f
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED31                             0x493f
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED31                             0x495f
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED31                             0x497f
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED31                             0x499f
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED31                             0x49df
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED31                             0x49ff
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED0                                         0x5a84
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED1                                         0x5a85
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED2                                         0x5a86
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED3                                         0x5a87
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED4                                         0x5a88
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED5                                         0x5a89
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED6                                         0x5a8a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED7                                         0x5a8b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED8                                         0x5a8c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED9                                         0x5a8d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED10                                        0x5a8e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED11                                        0x5a8f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED12                                        0x5a90
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED13                                        0x5a91
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED14                                        0x5a92
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED15                                        0x5a93
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED16                                        0x5a94
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED17                                        0x5a95
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED18                                        0x5a96
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED19                                        0x5a97
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED20                                        0x5a98
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED21                                        0x5a99
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED22                                        0x5a9a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED23                                        0x5a9b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED24                                        0x5a9c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED25                                        0x5a9d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED26                                        0x5a9e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED27                                        0x5a9f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED28                                        0x5aa0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED29                                        0x5aa1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED30                                        0x5aa2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED31                                        0x5aa3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED32                                        0x5aa4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED33                                        0x5aa5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED34                                        0x5aa6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED35                                        0x5aa7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED36                                        0x5aa8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED37                                        0x5aa9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED38                                        0x5aaa
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED39                                        0x5aab
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED40                                        0x5aac
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED41                                        0x5aad
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED42                                        0x5aae
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED43                                        0x5aaf
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED44                                        0x5ab0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED45                                        0x5ab1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED46                                        0x5ab2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED47                                        0x5ab3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED48                                        0x5ab4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED49                                        0x5ab5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED50                                        0x5ab6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED51                                        0x5ab7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED52                                        0x5ab8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED53                                        0x5ab9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED54                                        0x5aba
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED55                                        0x5abb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED56                                        0x5abc
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED57                                        0x5abd
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED58                                        0x5abe
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED59                                        0x5abf
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED60                                        0x5ac0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED61                                        0x5ac1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED62                                        0x5ac2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED63                                        0x5ac3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED64                                        0x5ac4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED65                                        0x5ac5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED66                                        0x5ac6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED67                                        0x5ac7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED68                                        0x5ac8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED69                                        0x5ac9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED70                                        0x5aca
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED71                                        0x5acb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED72                                        0x5acc
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED73                                        0x5acd
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED74                                        0x5ace
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED75                                        0x5acf
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED76                                        0x5ad0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED77                                        0x5ad1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED78                                        0x5ad2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED79                                        0x5ad3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED80                                        0x5ad4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED81                                        0x5ad5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED82                                        0x5ad6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED83                                        0x5ad7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED84                                        0x5ad8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED85                                        0x5ad9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED86                                        0x5ada
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED87                                        0x5adb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED88                                        0x5adc
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED89                                        0x5add
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED90                                        0x5ade
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED91                                        0x5adf
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED92                                        0x5ae0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED93                                        0x5ae1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED94                                        0x5ae2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED95                                        0x5ae3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED96                                        0x5ae4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED97                                        0x5ae5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED98                                        0x5ae6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED99                                        0x5ae7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED100                                       0x5ae8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED101                                       0x5ae9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED102                                       0x5aea
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED103                                       0x5aeb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED104                                       0x5aec
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED105                                       0x5aed
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED106                                       0x5aee
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED107                                       0x5aef
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED108                                       0x5af0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED109                                       0x5af1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED110                                       0x5af2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED111                                       0x5af3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED112                                       0x5af4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED113                                       0x5af5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED114                                       0x5af6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED115                                       0x5af7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED116                                       0x5af8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED117                                       0x5af9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED118                                       0x5afa
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED119                                       0x5afb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED120                                       0x5afc
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED121                                       0x5afd
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED122                                       0x5afe
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED123                                       0x5aff
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED124                                       0x5b00
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED125                                       0x5b01
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED126                                       0x5b02
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED127                                       0x5b03
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED128                                       0x5b04
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED129                                       0x5b05
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED130                                       0x5b06
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED131                                       0x5b07
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED132                                       0x5b08
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED133                                       0x5b09
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED134                                       0x5b0a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED135                                       0x5b0b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED136                                       0x5b0c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED137                                       0x5b0d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED138                                       0x5b0e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED139                                       0x5b0f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED140                                       0x5b10
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED141                                       0x5b11
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED142                                       0x5b12
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED143                                       0x5b13
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED144                                       0x5b14
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED145                                       0x5b15
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED146                                       0x5b16
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED147                                       0x5b17
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED148                                       0x5b18
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED149                                       0x5b19
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED150                                       0x5b1a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED151                                       0x5b1b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED152                                       0x5b1c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED153                                       0x5b1d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED154                                       0x5b1e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED155                                       0x5b1f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED156                                       0x5b20
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED157                                       0x5b21
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED158                                       0x5b22
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED159                                       0x5b23
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED160                                       0x5b24
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED161                                       0x5b25
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED162                                       0x5b26
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED163                                       0x5b27
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED164                                       0x5b28
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED165                                       0x5b29
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED166                                       0x5b2a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED167                                       0x5b2b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED168                                       0x5b2c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED169                                       0x5b2d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED170                                       0x5b2e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED171                                       0x5b2f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED172                                       0x5b30
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED173                                       0x5b31
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED174                                       0x5b32
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED175                                       0x5b33
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED176                                       0x5b34
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED177                                       0x5b35
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED178                                       0x5b36
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED179                                       0x5b37
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED180                                       0x5b38
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED181                                       0x5b39
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED182                                       0x5b3a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED183                                       0x5b3b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED184                                       0x5b3c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED185                                       0x5b3d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED186                                       0x5b3e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED187                                       0x5b3f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED188                                       0x5b40
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED189                                       0x5b41
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED190                                       0x5b42
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED191                                       0x5b43
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED192                                       0x5b44
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED193                                       0x5b45
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED194                                       0x5b46
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED195                                       0x5b47
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED196                                       0x5b48
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED197                                       0x5b49
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED198                                       0x5b4a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED199                                       0x5b4b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED200                                       0x5b4c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED201                                       0x5b4d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED202                                       0x5b4e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED203                                       0x5b4f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED204                                       0x5b50
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED205                                       0x5b51
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED206                                       0x5b52
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED207                                       0x5b53
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED208                                       0x5b54
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED209                                       0x5b55
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED210                                       0x5b56
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED211                                       0x5b57
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED212                                       0x5b58
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED213                                       0x5b59
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED214                                       0x5b5a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED215                                       0x5b5b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED216                                       0x5b5c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED217                                       0x5b5d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED218                                       0x5b5e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED219                                       0x5b5f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED220                                       0x5b60
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED221                                       0x5b61
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED222                                       0x5b62
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED223                                       0x5b63
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED224                                       0x5b64
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED225                                       0x5b65
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED226                                       0x5b66
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED227                                       0x5b67
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED228                                       0x5b68
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED229                                       0x5b69
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED230                                       0x5b6a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED231                                       0x5b6b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED232                                       0x5b6c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED233                                       0x5b6d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED234                                       0x5b6e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED235                                       0x5b6f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED236                                       0x5b70
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED237                                       0x5b71
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED238                                       0x5b72
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED239                                       0x5b73
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED240                                       0x5b74
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED241                                       0x5b75
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED242                                       0x5b76
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED243                                       0x5b77
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED244                                       0x5b78
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED245                                       0x5b79
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED246                                       0x5b7a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED247                                       0x5b7b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED248                                       0x5b7c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED249                                       0x5b7d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED250                                       0x5b7e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED251                                       0x5b7f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED252                                       0x5b80
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED253                                       0x5b81
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED254                                       0x5b82
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED255                                       0x5b83
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED256                                       0x5b84
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED257                                       0x5b85
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED258                                       0x5b86
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED259                                       0x5b87
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED260                                       0x5b88
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED261                                       0x5b89
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED262                                       0x5b8a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED263                                       0x5b8b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED264                                       0x5b8c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED265                                       0x5b8d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED266                                       0x5b8e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED267                                       0x5b8f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED268                                       0x5b90
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED269                                       0x5b91
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED270                                       0x5b92
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED271                                       0x5b93
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED272                                       0x5b94
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED273                                       0x5b95
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED274                                       0x5b96
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED275                                       0x5b97
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED276                                       0x5b98
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED277                                       0x5b99
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED278                                       0x5b9a
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED279                                       0x5b9b
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED280                                       0x5b9c
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED281                                       0x5b9d
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED282                                       0x5b9e
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED283                                       0x5b9f
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED284                                       0x5ba0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED285                                       0x5ba1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED286                                       0x5ba2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED287                                       0x5ba3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED288                                       0x5ba4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED289                                       0x5ba5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED290                                       0x5ba6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED291                                       0x5ba7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED292                                       0x5ba8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED293                                       0x5ba9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED294                                       0x5baa
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED295                                       0x5bab
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED296                                       0x5bac
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED297                                       0x5bad
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED298                                       0x5bae
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED299                                       0x5baf
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED300                                       0x5bb0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED301                                       0x5bb1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED302                                       0x5bb2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED303                                       0x5bb3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED304                                       0x5bb4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED305                                       0x5bb5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED306                                       0x5bb6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED307                                       0x5bb7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED308                                       0x5bb8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED309                                       0x5bb9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED310                                       0x5bba
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED311                                       0x5bbb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED312                                       0x5bbc
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED313                                       0x5bbd
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED314                                       0x5bbe
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED315                                       0x5bbf
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED316                                       0x5bc0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED317                                       0x5bc1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED318                                       0x5bc2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED319                                       0x5bc3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED320                                       0x5bc4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED321                                       0x5bc5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED322                                       0x5bc6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED323                                       0x5bc7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED324                                       0x5bc8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED325                                       0x5bc9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED326                                       0x5bca
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED327                                       0x5bcb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED328                                       0x5bcc
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED329                                       0x5bcd
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED330                                       0x5bce
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED331                                       0x5bcf
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED332                                       0x5bd0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED333                                       0x5bd1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED334                                       0x5bd2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED335                                       0x5bd3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED336                                       0x5bd4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED337                                       0x5bd5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED338                                       0x5bd6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED339                                       0x5bd7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED340                                       0x5bd8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED341                                       0x5bd9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED342                                       0x5bda
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED343                                       0x5bdb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED344                                       0x5bdc
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED345                                       0x5bdd
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED346                                       0x5bde
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED347                                       0x5bdf
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED348                                       0x5be0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED349                                       0x5be1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED350                                       0x5be2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED351                                       0x5be3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED352                                       0x5be4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED353                                       0x5be5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED354                                       0x5be6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED355                                       0x5be7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED356                                       0x5be8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED357                                       0x5be9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED358                                       0x5bea
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED359                                       0x5beb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED360                                       0x5bec
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED361                                       0x5bed
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED362                                       0x5bee
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED363                                       0x5bef
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED364                                       0x5bf0
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED365                                       0x5bf1
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED366                                       0x5bf2
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED367                                       0x5bf3
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED368                                       0x5bf4
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED369                                       0x5bf5
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED370                                       0x5bf6
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED371                                       0x5bf7
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED372                                       0x5bf8
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED373                                       0x5bf9
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED374                                       0x5bfa
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED375                                       0x5bfb
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED376                                       0x5bfc
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED377                                       0x5bfd
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED378                                       0x5bfe
+#define mmDCRX_PHY_MACRO_CNTL_RESERVED379                                       0x5bff
+#define mmDPHY_MACRO_CNTL_RESERVED0                                             0x5d98
+#define mmDPHY_MACRO_CNTL_RESERVED1                                             0x5d99
+#define mmDPHY_MACRO_CNTL_RESERVED2                                             0x5d9a
+#define mmDPHY_MACRO_CNTL_RESERVED3                                             0x5d9b
+#define mmDPHY_MACRO_CNTL_RESERVED4                                             0x5d9c
+#define mmDPHY_MACRO_CNTL_RESERVED5                                             0x5d9d
+#define mmDPHY_MACRO_CNTL_RESERVED6                                             0x5d9e
+#define mmDPHY_MACRO_CNTL_RESERVED7                                             0x5d9f
+#define mmDPHY_MACRO_CNTL_RESERVED8                                             0x5da0
+#define mmDPHY_MACRO_CNTL_RESERVED9                                             0x5da1
+#define mmDPHY_MACRO_CNTL_RESERVED10                                            0x5da2
+#define mmDPHY_MACRO_CNTL_RESERVED11                                            0x5da3
+#define mmDPHY_MACRO_CNTL_RESERVED12                                            0x5da4
+#define mmDPHY_MACRO_CNTL_RESERVED13                                            0x5da5
+#define mmDPHY_MACRO_CNTL_RESERVED14                                            0x5da6
+#define mmDPHY_MACRO_CNTL_RESERVED15                                            0x5da7
+#define mmDPHY_MACRO_CNTL_RESERVED16                                            0x5da8
+#define mmDPHY_MACRO_CNTL_RESERVED17                                            0x5da9
+#define mmDPHY_MACRO_CNTL_RESERVED18                                            0x5daa
+#define mmDPHY_MACRO_CNTL_RESERVED19                                            0x5dab
+#define mmDPHY_MACRO_CNTL_RESERVED20                                            0x5dac
+#define mmDPHY_MACRO_CNTL_RESERVED21                                            0x5dad
+#define mmDPHY_MACRO_CNTL_RESERVED22                                            0x5dae
+#define mmDPHY_MACRO_CNTL_RESERVED23                                            0x5daf
+#define mmDPHY_MACRO_CNTL_RESERVED24                                            0x5db0
+#define mmDPHY_MACRO_CNTL_RESERVED25                                            0x5db1
+#define mmDPHY_MACRO_CNTL_RESERVED26                                            0x5db2
+#define mmDPHY_MACRO_CNTL_RESERVED27                                            0x5db3
+#define mmDPHY_MACRO_CNTL_RESERVED28                                            0x5db4
+#define mmDPHY_MACRO_CNTL_RESERVED29                                            0x5db5
+#define mmDPHY_MACRO_CNTL_RESERVED30                                            0x5db6
+#define mmDPHY_MACRO_CNTL_RESERVED31                                            0x5db7
+#define mmDPHY_MACRO_CNTL_RESERVED32                                            0x5db8
+#define mmDPHY_MACRO_CNTL_RESERVED33                                            0x5db9
+#define mmDPHY_MACRO_CNTL_RESERVED34                                            0x5dba
+#define mmDPHY_MACRO_CNTL_RESERVED35                                            0x5dbb
+#define mmDPHY_MACRO_CNTL_RESERVED36                                            0x5dbc
+#define mmDPHY_MACRO_CNTL_RESERVED37                                            0x5dbd
+#define mmDPHY_MACRO_CNTL_RESERVED38                                            0x5dbe
+#define mmDPHY_MACRO_CNTL_RESERVED39                                            0x5dbf
+#define mmDPHY_MACRO_CNTL_RESERVED40                                            0x5dc0
+#define mmDPHY_MACRO_CNTL_RESERVED41                                            0x5dc1
+#define mmDPHY_MACRO_CNTL_RESERVED42                                            0x5dc2
+#define mmDPHY_MACRO_CNTL_

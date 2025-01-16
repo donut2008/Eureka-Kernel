@@ -1,112 +1,69 @@
-/*
- * Copyright (C) 2013 STMicroelectronics (R&D) Limited
- * Author: Stephen Gallimore <stephen.gallimore@st.com>
- * Author: Srinivas Kandagatla <srinivas.kandagatla@st.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- */
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
-
-#include <dt-bindings/reset/stih415-resets.h>
-
-#include "reset-syscfg.h"
-
-/*
- * STiH415 Peripheral powerdown definitions.
- */
-static const char stih415_front[] = "st,stih415-front-syscfg";
-static const char stih415_rear[] = "st,stih415-rear-syscfg";
-static const char stih415_sbc[] = "st,stih415-sbc-syscfg";
-static const char stih415_lpm[] = "st,stih415-lpm-syscfg";
-
-#define STIH415_PDN_FRONT(_bit) \
-	_SYSCFG_RST_CH(stih415_front, SYSCFG_114, _bit, SYSSTAT_187, _bit)
-
-#define STIH415_PDN_REAR(_cntl, _stat) \
-	_SYSCFG_RST_CH(stih415_rear, SYSCFG_336, _cntl, SYSSTAT_384, _stat)
-
-#define STIH415_SRST_REAR(_reg, _bit) \
-	_SYSCFG_RST_CH_NO_ACK(stih415_rear, _reg, _bit)
-
-#define STIH415_SRST_SBC(_reg, _bit) \
-	_SYSCFG_RST_CH_NO_ACK(stih415_sbc, _reg, _bit)
-
-#define STIH415_SRST_FRONT(_reg, _bit) \
-	_SYSCFG_RST_CH_NO_ACK(stih415_front, _reg, _bit)
-
-#define STIH415_SRST_LPM(_reg, _bit) \
-	_SYSCFG_RST_CH_NO_ACK(stih415_lpm, _reg, _bit)
-
-#define SYSCFG_114	0x38 /* Powerdown request EMI/NAND/Keyscan */
-#define SYSSTAT_187	0x15c /* Powerdown status EMI/NAND/Keyscan */
-
-#define SYSCFG_336	0x90 /* Powerdown request USB/SATA/PCIe */
-#define SYSSTAT_384	0x150 /* Powerdown status USB/SATA/PCIe */
-
-#define SYSCFG_376	0x130 /* Reset generator 0 control 0 */
-#define SYSCFG_166	0x108 /* Softreset Ethernet 0 */
-#define SYSCFG_31	0x7c /* Softreset Ethernet 1 */
-#define LPM_SYSCFG_1	0x4 /* Softreset IRB */
-
-static const struct syscfg_reset_channel_data stih415_powerdowns[] = {
-	[STIH415_EMISS_POWERDOWN]	= STIH415_PDN_FRONT(0),
-	[STIH415_NAND_POWERDOWN]	= STIH415_PDN_FRONT(1),
-	[STIH415_KEYSCAN_POWERDOWN]	= STIH415_PDN_FRONT(2),
-	[STIH415_USB0_POWERDOWN]	= STIH415_PDN_REAR(0, 0),
-	[STIH415_USB1_POWERDOWN]	= STIH415_PDN_REAR(1, 1),
-	[STIH415_USB2_POWERDOWN]	= STIH415_PDN_REAR(2, 2),
-	[STIH415_SATA0_POWERDOWN]	= STIH415_PDN_REAR(3, 3),
-	[STIH415_SATA1_POWERDOWN]	= STIH415_PDN_REAR(4, 4),
-	[STIH415_PCIE_POWERDOWN]	= STIH415_PDN_REAR(5, 8),
-};
-
-static const struct syscfg_reset_channel_data stih415_softresets[] = {
-	[STIH415_ETH0_SOFTRESET] = STIH415_SRST_FRONT(SYSCFG_166, 0),
-	[STIH415_ETH1_SOFTRESET] = STIH415_SRST_SBC(SYSCFG_31, 0),
-	[STIH415_IRB_SOFTRESET]	 = STIH415_SRST_LPM(LPM_SYSCFG_1, 6),
-	[STIH415_USB0_SOFTRESET] = STIH415_SRST_REAR(SYSCFG_376, 9),
-	[STIH415_USB1_SOFTRESET] = STIH415_SRST_REAR(SYSCFG_376, 10),
-	[STIH415_USB2_SOFTRESET] = STIH415_SRST_REAR(SYSCFG_376, 11),
-	[STIH415_KEYSCAN_SOFTRESET] = STIH415_SRST_LPM(LPM_SYSCFG_1, 8),
-};
-
-static struct syscfg_reset_controller_data stih415_powerdown_controller = {
-	.wait_for_ack = true,
-	.nr_channels = ARRAY_SIZE(stih415_powerdowns),
-	.channels = stih415_powerdowns,
-};
-
-static struct syscfg_reset_controller_data stih415_softreset_controller = {
-	.wait_for_ack = false,
-	.active_low = true,
-	.nr_channels = ARRAY_SIZE(stih415_softresets),
-	.channels = stih415_softresets,
-};
-
-static const struct of_device_id stih415_reset_match[] = {
-	{ .compatible = "st,stih415-powerdown",
-	  .data = &stih415_powerdown_controller, },
-	{ .compatible = "st,stih415-softreset",
-	  .data = &stih415_softreset_controller, },
-	{},
-};
-
-static struct platform_driver stih415_reset_driver = {
-	.probe = syscfg_reset_probe,
-	.driver = {
-		.name = "reset-stih415",
-		.of_match_table = stih415_reset_match,
-	},
-};
-
-static int __init stih415_reset_init(void)
-{
-	return platform_driver_register(&stih415_reset_driver);
-}
-arch_initcall(stih415_reset_init);
+UNUSED12_BY2                        = 0x23,
+	DBG_BLOCK_ID_CB_BY2                              = 0x24,
+	DBG_BLOCK_ID_CB02_BY2                            = 0x25,
+	DBG_BLOCK_ID_CB10_BY2                            = 0x26,
+	DBG_BLOCK_ID_CB12_BY2                            = 0x27,
+	DBG_BLOCK_ID_SXS_BY2                             = 0x28,
+	DBG_BLOCK_ID_SXS2_BY2                            = 0x29,
+	DBG_BLOCK_ID_SXS4_BY2                            = 0x2a,
+	DBG_BLOCK_ID_SXS6_BY2                            = 0x2b,
+	DBG_BLOCK_ID_DB_BY2                              = 0x2c,
+	DBG_BLOCK_ID_DB02_BY2                            = 0x2d,
+	DBG_BLOCK_ID_DB10_BY2                            = 0x2e,
+	DBG_BLOCK_ID_DB12_BY2                            = 0x2f,
+	DBG_BLOCK_ID_TCP_BY2                             = 0x30,
+	DBG_BLOCK_ID_TCP2_BY2                            = 0x31,
+	DBG_BLOCK_ID_TCP4_BY2                            = 0x32,
+	DBG_BLOCK_ID_TCP6_BY2                            = 0x33,
+	DBG_BLOCK_ID_TCP8_BY2                            = 0x34,
+	DBG_BLOCK_ID_TCP10_BY2                           = 0x35,
+	DBG_BLOCK_ID_TCP12_BY2                           = 0x36,
+	DBG_BLOCK_ID_TCP14_BY2                           = 0x37,
+	DBG_BLOCK_ID_TCP16_BY2                           = 0x38,
+	DBG_BLOCK_ID_TCP18_BY2                           = 0x39,
+	DBG_BLOCK_ID_TCP20_BY2                           = 0x3a,
+	DBG_BLOCK_ID_TCP22_BY2                           = 0x3b,
+	DBG_BLOCK_ID_TCP_RESERVED0_BY2                   = 0x3c,
+	DBG_BLOCK_ID_TCP_RESERVED2_BY2                   = 0x3d,
+	DBG_BLOCK_ID_TCP_RESERVED4_BY2                   = 0x3e,
+	DBG_BLOCK_ID_TCP_RESERVED6_BY2                   = 0x3f,
+	DBG_BLOCK_ID_TCC_BY2                             = 0x40,
+	DBG_BLOCK_ID_TCC2_BY2                            = 0x41,
+	DBG_BLOCK_ID_TCC4_BY2                            = 0x42,
+	DBG_BLOCK_ID_TCC6_BY2                            = 0x43,
+	DBG_BLOCK_ID_SPS_BY2                             = 0x44,
+	DBG_BLOCK_ID_SPS02_BY2                           = 0x45,
+	DBG_BLOCK_ID_SPS11_BY2                           = 0x46,
+	DBG_BLOCK_ID_UNUSED14_BY2                        = 0x47,
+	DBG_BLOCK_ID_TA_BY2                              = 0x48,
+	DBG_BLOCK_ID_TA02_BY2                            = 0x49,
+	DBG_BLOCK_ID_TA04_BY2                            = 0x4a,
+	DBG_BLOCK_ID_TA06_BY2                            = 0x4b,
+	DBG_BLOCK_ID_TA08_BY2                            = 0x4c,
+	DBG_BLOCK_ID_TA0A_BY2                            = 0x4d,
+	DBG_BLOCK_ID_UNUSED20_BY2                        = 0x4e,
+	DBG_BLOCK_ID_UNUSED22_BY2                        = 0x4f,
+	DBG_BLOCK_ID_TA10_BY2                            = 0x50,
+	DBG_BLOCK_ID_TA12_BY2                            = 0x51,
+	DBG_BLOCK_ID_TA14_BY2                            = 0x52,
+	DBG_BLOCK_ID_TA16_BY2                            = 0x53,
+	DBG_BLOCK_ID_TA18_BY2                            = 0x54,
+	DBG_BLOCK_ID_TA1A_BY2                            = 0x55,
+	DBG_BLOCK_ID_UNUSED24_BY2                        = 0x56,
+	DBG_BLOCK_ID_UNUSED26_BY2                        = 0x57,
+	DBG_BLOCK_ID_TD_BY2                              = 0x58,
+	DBG_BLOCK_ID_TD02_BY2                            = 0x59,
+	DBG_BLOCK_ID_TD04_BY2                            = 0x5a,
+	DBG_BLOCK_ID_TD06_BY2                            = 0x5b,
+	DBG_BLOCK_ID_TD08_BY2                            = 0x5c,
+	DBG_BLOCK_ID_TD0A_BY2                            = 0x5d,
+	DBG_BLOCK_ID_UNUSED28_BY2                        = 0x5e,
+	DBG_BLOCK_ID_UNUSED30_BY2                        = 0x5f,
+	DBG_BLOCK_ID_TD10_BY2                            = 0x60,
+	DBG_BLOCK_ID_TD12_BY2                            = 0x61,
+	DBG_BLOCK_ID_TD14_BY2                            = 0x62,
+	DBG_BLOCK_ID_TD16_BY2                            = 0x63,
+	DBG_BLOCK_ID_TD18_BY2                            = 0x64,
+	DBG_BLOCK_ID_TD1A_BY2                            = 0x65,
+	DBG_BLOCK_ID_UNUSED32_BY2                        = 0x66,
+	DBG_BLOCK_ID_UNUSED34_BY

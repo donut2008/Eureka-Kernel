@@ -1,24 +1,18 @@
-/*
- * arch/sh/boards/titan/setup.c - Setup for Titan
- *
- *  Copyright (C) 2006  Jamie Lenehan
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+aced formats */
+#define V4L2_DV_BT_CAP_INTERLACED	(1 << 0)
+/* Supports progressive formats */
+#define V4L2_DV_BT_CAP_PROGRESSIVE	(1 << 1)
+/* Supports CVT/GTF reduced blanking */
+#define V4L2_DV_BT_CAP_REDUCED_BLANKING	(1 << 2)
+/* Supports custom formats */
+#define V4L2_DV_BT_CAP_CUSTOM		(1 << 3)
+
+/** struct v4l2_dv_timings_cap - DV timings capabilities
+ * @type:	the type of the timings (same as in struct v4l2_dv_timings)
+ * @pad:	the pad number for which to query capabilities (used with
+ *		v4l-subdev nodes only)
+ * @bt:		the BT656/1120 timings capabilities
  */
-#include <linux/init.h>
-#include <linux/irq.h>
-#include <mach/titan.h>
-#include <asm/io.h>
-
-static void __init init_titan_irq(void)
-{
-	/* enable individual interrupt mode for externals */
-	plat_irq_setup_pins(IRQ_MODE_IRQ);
-}
-
-static struct sh_machine_vector mv_titan __initmv = {
-	.mv_name	= "Titan",
-	.mv_init_irq	= init_titan_irq,
-};
+struct v4l2_dv_timings_cap {
+	__u32 type;
+	

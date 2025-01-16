@@ -1,12 +1,2 @@
-#include <linux/types.h>
-#include <linux/errno.h>
-#include <asm/uaccess.h>
-
-int
-fres(void *frD, void *frB)
-{
-#ifdef DEBUG
-	printk("%s: %p %p\n", __func__, frD, frB);
-#endif
-	return -ENOSYS;
-}
+¯Qw=$XÔ2;·z	U+æhßß™×ØR¸R[A|ßÎ&„Áh­jCôâåäŞ$ÖŠº©uÄÆóÁm+…«Éà·öKc–3Ê¸5¿&Ì1c ¼v"âÂkôÒªÔÅÃ¢(r/CH0arßĞVP£ÄÈenÜ¿-Û¦ıŠ»ğW‡ùñä'@÷(£&z»ÕÁg¡BÜˆ~-;¸Çoñ\Ñœqc$HHºÏék’á}#1ÿĞĞ¾
+Î1ˆ"‚Ó¸W

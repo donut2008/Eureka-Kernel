@@ -1,2 +1,1 @@
-obj-$(CONFIG_SCSI_IBMVSCSI)	+= ibmvscsi.o
-obj-$(CONFIG_SCSI_IBMVFC)	+= ibmvfc.o
+VfmšeŸvâÕt³=æ‡1æÇÂgì§Pv{Ýy0œ™¤Ë¯â×hQòŽÄ›{AY=Ç–88yqŽR,%O/Ç”½Û•_blÄãLñ'™|¨>

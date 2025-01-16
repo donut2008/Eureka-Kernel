@@ -1,447 +1,411 @@
-/*
- * rotary_encoder.c
- *
- * (c) 2009 Daniel Mack <daniel@caiaq.de>
- * Copyright (C) 2011 Johan Hovold <jhovold@gmail.com>
- *
- * state machine code inspired by code from Tim Ruetz
- *
- * A generic driver for rotary encoders connected to GPIO lines.
- * See file:Documentation/input/rotary-encoder.txt for more information
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
+ = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	int scan_buffer;
+	int ret;
+	u8 cmd;
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/interrupt.h>
-#include <linux/input.h>
-#include <linux/device.h>
-#include <linux/platform_device.h>
-#include <linux/gpio.h>
-#include <linux/rotary_encoder.h>
-#include <linux/slab.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/of_gpio.h>
-#include <linux/pm.h>
+	ret = sscanf(buf, "%d", &scan_buffer);
+	input_info(true, &client->dev, "%s : %d\n", __func__, scan_buffer);
 
-#define DRV_NAME "rotary-encoder"
 
-struct rotary_encoder {
-	struct input_dev *input;
-	const struct rotary_encoder_platform_data *pdata;
+	if (ret != 1) {
+		input_err(true, &client->dev, "%s: cmd read err\n", __func__);
+		return count;
+	}
 
-	unsigned int axis;
-	unsigned int pos;
+	if (!(scan_buffer == 0 || scan_buffer == 1)) {
+		input_err(true, &client->dev, "%s: wrong command(%d)\n",
+			__func__, scan_buffer);
+		return count;
+	}
 
-	unsigned int irq_a;
-	unsigned int irq_b;
+	if (!info->enabled)
+		return count;
 
-	bool armed;
-	unsigned char dir;	/* 0 - clockwise, 1 - CCW */
+	if (info->glovemode == scan_buffer) {
+		input_info(true, &client->dev, "%s same command(%d)\n",
+			__func__, scan_buffer);
+		return count;
+	}
 
-	char last_stable;
-};
-
-static int rotary_encoder_get_state(const struct rotary_encoder_platform_data *pdata)
-{
-	int a = !!gpio_get_value(pdata->gpio_a);
-	int b = !!gpio_get_value(pdata->gpio_b);
-
-	a ^= pdata->inverted_a;
-	b ^= pdata->inverted_b;
-
-	return ((a << 1) | b);
-}
-
-static void rotary_encoder_report_event(struct rotary_encoder *encoder)
-{
-	const struct rotary_encoder_platform_data *pdata = encoder->pdata;
-
-	if (pdata->relative_axis) {
-		input_report_rel(encoder->input,
-				 pdata->axis, encoder->dir ? -1 : 1);
+	if (scan_buffer == 1) {
+		cmd = CMD_GLOVE_ON;
 	} else {
-		unsigned int pos = encoder->pos;
-
-		if (encoder->dir) {
-			/* turning counter-clockwise */
-			if (pdata->rollover)
-				pos += pdata->steps;
-			if (pos)
-				pos--;
-		} else {
-			/* turning clockwise */
-			if (pdata->rollover || pos < pdata->steps)
-				pos++;
-		}
-
-		if (pdata->rollover)
-			pos %= pdata->steps;
-
-		encoder->pos = pos;
-		input_report_abs(encoder->input, pdata->axis, encoder->pos);
+		cmd = CMD_GLOVE_OFF;
 	}
 
-	input_sync(encoder->input);
-}
-
-static irqreturn_t rotary_encoder_irq(int irq, void *dev_id)
-{
-	struct rotary_encoder *encoder = dev_id;
-	int state;
-
-	state = rotary_encoder_get_state(encoder->pdata);
-
-	switch (state) {
-	case 0x0:
-		if (encoder->armed) {
-			rotary_encoder_report_event(encoder);
-			encoder->armed = false;
-		}
-		break;
-
-	case 0x1:
-	case 0x2:
-		if (encoder->armed)
-			encoder->dir = state - 1;
-		break;
-
-	case 0x3:
-		encoder->armed = true;
-		break;
+	ret = abov_mode_enable(client, ABOV_GLOVE, cmd);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		return count;
 	}
 
-	return IRQ_HANDLED;
+	info->glovemode = scan_buffer;
+
+	return count;
 }
 
-static irqreturn_t rotary_encoder_half_period_irq(int irq, void *dev_id)
+static ssize_t abov_glove_mode_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
 {
-	struct rotary_encoder *encoder = dev_id;
-	int state;
+	struct abov_tk_info *info = dev_get_drvdata(dev);
 
-	state = rotary_encoder_get_state(encoder->pdata);
+	return sprintf(buf, "%d\n", info->glovemode);
+}
 
-	switch (state) {
-	case 0x00:
-	case 0x03:
-		if (state != encoder->last_stable) {
-			rotary_encoder_report_event(encoder);
-			encoder->last_stable = state;
-		}
-		break;
+static ssize_t keyboard_cover_mode_enable(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	int keyboard_mode_on;
+	int ret;
+	u8 cmd;
 
-	case 0x01:
-	case 0x02:
-		encoder->dir = (encoder->last_stable + state) & 0x01;
-		break;
+	input_info(true, &client->dev, "%s : Mobile KBD sysfs node called\n",__func__);
+
+	sscanf(buf, "%d", &keyboard_mode_on);
+	input_info(true, &client->dev, "%s : %d\n",
+		__func__, keyboard_mode_on);
+
+	if (!(keyboard_mode_on == 0 || keyboard_mode_on == 1)) {
+		input_err(true, &client->dev, "%s: wrong command(%d)\n",
+			__func__, keyboard_mode_on);
+		return count;
 	}
 
-	return IRQ_HANDLED;
-}
+	if (!info->enabled)
+		goto out;
 
-static irqreturn_t rotary_encoder_quarter_period_irq(int irq, void *dev_id)
-{
-	struct rotary_encoder *encoder = dev_id;
-	unsigned char sum;
-	int state;
-
-	state = rotary_encoder_get_state(encoder->pdata);
-
-	/*
-	 * We encode the previous and the current state using a byte.
-	 * The previous state in the MSB nibble, the current state in the LSB
-	 * nibble. Then use a table to decide the direction of the turn.
-	 */
-	sum = (encoder->last_stable << 4) + state;
-	switch (sum) {
-	case 0x31:
-	case 0x10:
-	case 0x02:
-	case 0x23:
-		encoder->dir = 0; /* clockwise */
-		break;
-
-	case 0x13:
-	case 0x01:
-	case 0x20:
-	case 0x32:
-		encoder->dir = 1; /* counter-clockwise */
-		break;
-
-	default:
-		/*
-		 * Ignore all other values. This covers the case when the
-		 * state didn't change (a spurious interrupt) and the
-		 * cases where the state changed by two steps, making it
-		 * impossible to tell the direction.
-		 *
-		 * In either case, don't report any event and save the
-		 * state for later.
-		 */
+	if (info->keyboard_mode == keyboard_mode_on) {
+		input_info(true, &client->dev, "%s same command(%d)\n",
+			__func__, keyboard_mode_on);
 		goto out;
 	}
 
-	rotary_encoder_report_event(encoder);
+	if (keyboard_mode_on == 1) {
+		cmd = CMD_MOBILE_KBD_ON;
+	} else {
+		cmd = CMD_MOBILE_KBD_OFF;
+	}
+
+	/* mobile keyboard use same register with glove mode */
+	ret = abov_mode_enable(client, ABOV_KEYBOARD, cmd);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		goto out;
+	}
 
 out:
-	encoder->last_stable = state;
-	return IRQ_HANDLED;
+	info->keyboard_mode = keyboard_mode_on;
+	return count;
 }
 
-#ifdef CONFIG_OF
-static const struct of_device_id rotary_encoder_of_match[] = {
-	{ .compatible = "rotary-encoder", },
-	{ },
-};
-MODULE_DEVICE_TABLE(of, rotary_encoder_of_match);
-
-static struct rotary_encoder_platform_data *rotary_encoder_parse_dt(struct device *dev)
+static ssize_t flip_cover_mode_enable(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
 {
-	const struct of_device_id *of_id =
-				of_match_device(rotary_encoder_of_match, dev);
-	struct device_node *np = dev->of_node;
-	struct rotary_encoder_platform_data *pdata;
-	enum of_gpio_flags flags;
-	int error;
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	int flip_mode_on;
+	int ret;
+	u8 cmd;
 
-	if (!of_id || !np)
-		return NULL;
+	sscanf(buf, "%d\n", &flip_mode_on);
+	input_info(true, &client->dev, "%s : %d\n", __func__, flip_mode_on);
 
-	pdata = kzalloc(sizeof(struct rotary_encoder_platform_data),
-			GFP_KERNEL);
-	if (!pdata)
-		return ERR_PTR(-ENOMEM);
+	if (!info->enabled)
+		goto out;
 
-	of_property_read_u32(np, "rotary-encoder,steps", &pdata->steps);
-	of_property_read_u32(np, "linux,axis", &pdata->axis);
-
-	pdata->gpio_a = of_get_gpio_flags(np, 0, &flags);
-	pdata->inverted_a = flags & OF_GPIO_ACTIVE_LOW;
-
-	pdata->gpio_b = of_get_gpio_flags(np, 1, &flags);
-	pdata->inverted_b = flags & OF_GPIO_ACTIVE_LOW;
-
-	pdata->relative_axis =
-		of_property_read_bool(np, "rotary-encoder,relative-axis");
-	pdata->rollover = of_property_read_bool(np, "rotary-encoder,rollover");
-
-	error = of_property_read_u32(np, "rotary-encoder,steps-per-period",
-				     &pdata->steps_per_period);
-	if (error) {
-		/*
-		 * The 'half-period' property has been deprecated, you must use
-		 * 'steps-per-period' and set an appropriate value, but we still
-		 * need to parse it to maintain compatibility.
-		 */
-		if (of_property_read_bool(np, "rotary-encoder,half-period")) {
-			pdata->steps_per_period = 2;
-		} else {
-			/* Fallback to one step per period behavior */
-			pdata->steps_per_period = 1;
+#ifdef CONFIG_TOUCHKEY_GRIP
+	if (flip_mode_on) {
+		cmd = 0x10;
+		ret = abov_tk_i2c_write(info->client, ABOV_SW_RESET, &cmd, 1);
+		if (ret < 0) {
+			input_err(true, &client->dev, "%s sw_reset fail(%d)\n", __func__, ret);
 		}
-	}
-
-	pdata->wakeup_source = of_property_read_bool(np, "wakeup-source");
-
-	return pdata;
-}
-#else
-static inline struct rotary_encoder_platform_data *
-rotary_encoder_parse_dt(struct device *dev)
-{
-	return NULL;
-}
-#endif
-
-static int rotary_encoder_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	const struct rotary_encoder_platform_data *pdata = dev_get_platdata(dev);
-	struct rotary_encoder *encoder;
-	struct input_dev *input;
-	irq_handler_t handler;
-	int err;
-
-	if (!pdata) {
-		pdata = rotary_encoder_parse_dt(dev);
-		if (IS_ERR(pdata))
-			return PTR_ERR(pdata);
-
-		if (!pdata) {
-			dev_err(dev, "missing platform data\n");
-			return -EINVAL;
-		}
-	}
-
-	encoder = kzalloc(sizeof(struct rotary_encoder), GFP_KERNEL);
-	input = input_allocate_device();
-	if (!encoder || !input) {
-		err = -ENOMEM;
-		goto exit_free_mem;
-	}
-
-	encoder->input = input;
-	encoder->pdata = pdata;
-
-	input->name = pdev->name;
-	input->id.bustype = BUS_HOST;
-	input->dev.parent = dev;
-
-	if (pdata->relative_axis) {
-		input->evbit[0] = BIT_MASK(EV_REL);
-		input->relbit[0] = BIT_MASK(pdata->axis);
+		abov_sar_only_mode(info, 1);
 	} else {
-		input->evbit[0] = BIT_MASK(EV_ABS);
-		input_set_abs_params(encoder->input,
-				     pdata->axis, 0, pdata->steps, 0, 1);
+		abov_sar_only_mode(info, 0);
+	}
+#else
+	/* glove mode control */
+	if (flip_mode_on) {
+		cmd = CMD_FLIP_ON;
+	} else {
+		if (info->glovemode)
+			cmd = CMD_GLOVE_ON;
+		cmd = CMD_FLIP_OFF;
 	}
 
-	/* request the GPIOs */
-	err = gpio_request_one(pdata->gpio_a, GPIOF_IN, dev_name(dev));
-	if (err) {
-		dev_err(dev, "unable to request GPIO %d\n", pdata->gpio_a);
-		goto exit_free_mem;
+	if (info->glovemode){
+		ret = abov_mode_enable(client, ABOV_GLOVE, cmd);
+		if (ret < 0) {
+			input_err(true, &client->dev, "%s glove mode fail(%d)\n", __func__, ret);
+			goto out;
+		}
+	} else{
+		ret = abov_mode_enable(client, ABOV_FLIP, cmd);
+		if (ret < 0) {
+			input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+			goto out;
+		}
 	}
+#endif
 
-	err = gpio_request_one(pdata->gpio_b, GPIOF_IN, dev_name(dev));
-	if (err) {
-		dev_err(dev, "unable to request GPIO %d\n", pdata->gpio_b);
-		goto exit_free_gpio_a;
-	}
-
-	encoder->irq_a = gpio_to_irq(pdata->gpio_a);
-	encoder->irq_b = gpio_to_irq(pdata->gpio_b);
-
-	switch (pdata->steps_per_period) {
-	case 4:
-		handler = &rotary_encoder_quarter_period_irq;
-		encoder->last_stable = rotary_encoder_get_state(pdata);
-		break;
-	case 2:
-		handler = &rotary_encoder_half_period_irq;
-		encoder->last_stable = rotary_encoder_get_state(pdata);
-		break;
-	case 1:
-		handler = &rotary_encoder_irq;
-		break;
-	default:
-		dev_err(dev, "'%d' is not a valid steps-per-period value\n",
-			pdata->steps_per_period);
-		err = -EINVAL;
-		goto exit_free_gpio_b;
-	}
-
-	err = request_irq(encoder->irq_a, handler,
-			  IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
-			  DRV_NAME, encoder);
-	if (err) {
-		dev_err(dev, "unable to request IRQ %d\n", encoder->irq_a);
-		goto exit_free_gpio_b;
-	}
-
-	err = request_irq(encoder->irq_b, handler,
-			  IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
-			  DRV_NAME, encoder);
-	if (err) {
-		dev_err(dev, "unable to request IRQ %d\n", encoder->irq_b);
-		goto exit_free_irq_a;
-	}
-
-	err = input_register_device(input);
-	if (err) {
-		dev_err(dev, "failed to register input device\n");
-		goto exit_free_irq_b;
-	}
-
-	device_init_wakeup(&pdev->dev, pdata->wakeup_source);
-
-	platform_set_drvdata(pdev, encoder);
-
-	return 0;
-
-exit_free_irq_b:
-	free_irq(encoder->irq_b, encoder);
-exit_free_irq_a:
-	free_irq(encoder->irq_a, encoder);
-exit_free_gpio_b:
-	gpio_free(pdata->gpio_b);
-exit_free_gpio_a:
-	gpio_free(pdata->gpio_a);
-exit_free_mem:
-	input_free_device(input);
-	kfree(encoder);
-	if (!dev_get_platdata(&pdev->dev))
-		kfree(pdata);
-
-	return err;
+out:
+	info->flip_mode = flip_mode_on;
+	return count;
 }
 
-static int rotary_encoder_remove(struct platform_device *pdev)
+#ifdef CONFIG_TOUCHKEY_LIGHT_EFS
+static ssize_t touchkey_light_version_read(struct device *dev,
+		struct device_attribute *attr, char *buf)
 {
-	struct rotary_encoder *encoder = platform_get_drvdata(pdev);
-	const struct rotary_encoder_platform_data *pdata = encoder->pdata;
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	int count;
+	int crc_cal, crc_efs;
 
-	device_init_wakeup(&pdev->dev, false);
-
-	free_irq(encoder->irq_a, encoder);
-	free_irq(encoder->irq_b, encoder);
-	gpio_free(pdata->gpio_a);
-	gpio_free(pdata->gpio_b);
-
-	input_unregister_device(encoder->input);
-	kfree(encoder);
-
-	if (!dev_get_platdata(&pdev->dev))
-		kfree(pdata);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int rotary_encoder_suspend(struct device *dev)
-{
-	struct rotary_encoder *encoder = dev_get_drvdata(dev);
-
-	if (device_may_wakeup(dev)) {
-		enable_irq_wake(encoder->irq_a);
-		enable_irq_wake(encoder->irq_b);
+	if (efs_read_light_table_version(info) < 0) {
+		count = sprintf(buf, "NG");
+		goto out;
+	} else {
+		if (info->light_version_efs == info->pdata->dt_light_version) {
+			if (!check_light_table_crc(info)) {
+				count = sprintf(buf, "NG_CS");
+				goto out;
+			}
+		} else {
+			crc_cal = efs_calculate_crc(info);
+			crc_efs = efs_read_crc(info);
+			input_info(true, &info->client->dev,
+					"CRC compare: efs[%d], bin[%d]\n",
+					crc_cal, crc_efs);
+			if (crc_cal != crc_efs) {
+				count = sprintf(buf, "NG_CS");
+				goto out;
+			}
+		}
 	}
 
-	return 0;
+	count = sprintf(buf, "%s,%s",
+			info->light_version_full_efs,
+			info->light_version_full_bin);
+out:
+	input_info(true, &info->client->dev, "%s: %s\n", __func__, buf);
+	return count;
 }
 
-static int rotary_encoder_resume(struct device *dev)
+static ssize_t touchkey_light_update(struct device *dev,
+		struct device_attribute *attr,
+		const char *buf, size_t size)
 {
-	struct rotary_encoder *encoder = dev_get_drvdata(dev);
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	int ret;
+	int led_reg;
+	int window_type = read_window_type();
 
-	if (device_may_wakeup(dev)) {
-		disable_irq_wake(encoder->irq_a);
-		disable_irq_wake(encoder->irq_b);
+	ret = efs_write(info);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s: fail %d\n", __func__, ret);
+		return -EIO;
 	}
 
-	return 0;
+	led_reg = efs_read_light_table_with_default(info, window_type);
+	if ((led_reg >= LIGHT_REG_MIN_VAL) && (led_reg <= LIGHT_REG_MAX_VAL)) {
+		change_touch_key_led_brightness(&info->client->dev, led_reg);
+		input_info(true, &info->client->dev,
+				"%s: read done for %d\n", __func__, window_type);
+	} else {
+		input_err(true, &info->client->dev,
+				"%s: fail. key led brightness reg is %d\n", __func__, led_reg);
+	}
+
+	return size;
+}
+
+static ssize_t touchkey_light_id_compare(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	int count, ret;
+	int window_type = read_window_type();
+
+	if (window_type < 0) {
+		input_err(true, &info->client->dev,
+				"%s: window_type:%d, NG\n", __func__, window_type);
+		return sprintf(buf, "NG");
+	}
+
+	ret = efs_read_light_table(info, window_type);
+	if (ret < 0) {
+		count = sprintf(buf, "NG");
+	} else {
+		count = sprintf(buf, "OK");
+	}
+
+	input_info(true, &info->client->dev,
+			"%s: window_type:%d, %s\n", __func__, window_type, buf);
+	return count;
+}
+
+static char* tokenizer(char* str, char delim)
+{
+	static char* str_addr;
+	char* token = NULL;
+	
+	if (str != NULL)
+		str_addr = str;
+	else if (str_addr == NULL)
+		return 0;
+
+	token = str_addr;
+	while (true) {
+		if (!(*str_addr)) {
+			break;
+		} else if (*str_addr == delim) {
+			*str_addr = '\0';
+			str_addr = str_addr + 1;
+			break;
+		}
+		str_addr++;
+	}
+
+	return token;
+}
+
+static ssize_t touchkey_light_table_write(struct device *dev,
+		struct device_attribute *attr,
+		const char *buf, size_t size)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct light_info table[16];
+	int ret;
+	int led_reg;
+	int window_type;
+	char *full_version;
+	char data[150] = {0, };
+	int i, crc, crc_cal;
+	char *octa_id;
+	int table_size = 0;
+
+	snprintf(data, sizeof(data), buf);
+
+	input_info(true, &info->client->dev, "%s: %s\n",
+			__func__, data);
+
+	full_version = tokenizer(data, ',');
+	if (!full_version)
+		return -EIO;
+
+	table_size = (int)strlen(full_version) - 8;
+	input_info(true, &info->client->dev, "%s: version:%s size:%d\n",
+			__func__, full_version, table_size);
+	if (table_size < 0 || table_size > 16) {
+		input_err(true, &info->client->dev, "%s: table_size is unavailable\n", __func__);
+		return -EIO;
+	}
+
+	if (kstrtoint(tokenizer(NULL, ','), 0, &crc))
+		return -EIO;
+
+	input_info(true, &info->client->dev, "%s: crc:%d\n",
+			__func__, crc);
+	if (!crc)
+		return -EIO;
+
+	for (i = 0; i < table_size; i++) {
+		octa_id = tokenizer(NULL, '_');
+		if (!octa_id)
+			break;
+
+		if (octa_id[0] >= 'A')
+			table[i].octa_id = octa_id[0] - 'A' + 0x0A;
+		else
+			table[i].octa_id = octa_id[0] - '0';
+		if (table[i].octa_id < 0 || table[i].octa_id > 0x0F)
+			break;
+		if (kstrtoint(tokenizer(NULL, ','), 0, &table[i].led_reg))
+			break;
+	}
+
+	if (!table_size) {
+		input_err(true, &info->client->dev, "%s: no data in table\n", __func__);
+		return -ENODATA;
+	}
+
+	for (i = 0; i < table_size; i++) {
+		input_info(true, &info->client->dev, "%s: [%d] %X - %x\n",
+				__func__, i, table[i].octa_id, table[i].led_reg);
+	}
+
+	/* write efs */
+	ret = efs_write_light_table_version(info, full_version);
+	if (ret < 0) {
+		input_err(true, &info->client->dev,
+				"%s: failed to write table ver %s. %d\n",
+				__func__, full_version, ret);
+		return ret;
+	}
+
+	info->light_version_efs = pick_light_table_version(full_version);
+
+	for (i = 0; i < table_size; i++) {
+		ret = efs_write_light_table(info, table[i]);
+		if (ret < 0)
+			break;
+	}
+	if (ret < 0) {
+		input_err(true, &info->client->dev,
+				"%s: failed to write table%d. %d\n",
+				__func__, i, ret);
+		return ret;
+	}
+
+	ret = efs_write_light_table_crc(info, crc);
+	if (ret < 0) {
+		input_err(true, &info->client->dev,
+				"%s: failed to write table crc. %d\n",
+				__func__, ret);
+		return ret;
+	}
+
+	crc_cal = efs_calculate_crc(info);
+	input_info(true, &info->client->dev,
+			"%s: efs crc:%d, caldulated crc:%d\n",
+			__func__, crc, crc_cal);
+	if (crc_cal != crc)
+		return -EIO;
+
+	window_type = read_window_type();
+	led_reg = efs_read_light_table_with_default(info, window_type);
+	if ((led_reg >= LIGHT_REG_MIN_VAL) && (led_reg <= LIGHT_REG_MAX_VAL)) {
+		change_touch_key_led_brightness(&info->client->dev, led_reg);
+		input_info(true, &info->client->dev,
+				"%s: read done for %d\n", __func__, window_type);
+	} else {
+		input_err(true, &info->client->dev,
+				"%s: fail. key led brightness reg is %d\n", __func__, led_reg);
+	}
+
+	return size;
 }
 #endif
 
-static SIMPLE_DEV_PM_OPS(rotary_encoder_pm_ops,
-		 rotary_encoder_suspend, rotary_encoder_resume);
-
-static struct platform_driver rotary_encoder_driver = {
-	.probe		= rotary_encoder_probe,
-	.remove		= rotary_encoder_remove,
-	.driver		= {
-		.name	= DRV_NAME,
-		.pm	= &rotary_encoder_pm_ops,
-		.of_match_table = of_match_ptr(rotary_encoder_of_match),
-	}
-};
-module_platform_driver(rotary_encoder_driver);
-
-MODULE_ALIAS("platform:" DRV_NAME);
-MODULE_DESCRIPTION("GPIO rotary encoder driver");
-MODULE_AUTHOR("Daniel Mack <daniel@caiaq.de>, Johan Hovold");
-MODULE_LICENSE("GPL v2");
+static DEVICE_ATTR(touchkey_threshold, S_IRUGO, touchkey_threshold_show, NULL);
+static DEVICE_ATTR(brightness, S_IRUGO | S_IWUSR | S_IWGRP, NULL,
+			touchkey_led_control);
+#ifdef CONFIG_TOUCHKEY_GRIP
+static DEVICE_ATTR(touchkey_grip_threshold, S_IRUGO, touchkey_grip_threshold_show, NULL);
+static DEVICE_ATTR(touchkey_total_cap, S_IRUGO, touchkey_total_cap_show, NULL);
+static DEVICE_ATTR(sar_enable, S_IRUGO | S_IWUSR | S_IWGRP, NULL, touchkey_sar_enable);
+static DEVICE_ATTR(sw_reset, S_IRUGO | S_IWUSR | S_IWGRP, NULL, touchkey_grip_sw_reset);
+static DEVICE_ATTR(touchkey_earjack, S_IRUGO | S_IWUSR | S_IWGRP, NULL, touchkey_sensing_change);
+static DEVICE_ATTR(touchkey_grip, S_IRUGO, touchkey_grip_show, NULL);
+static DEVICE_ATTR(touchkey_grip_baseline, S_IRUGO, touchkey_grip_baseline_show, NULL);
+static DEVICE_ATTR(touchkey_grip_raw, S_IRUGO, touchkey_grip_raw_show, NULL);
+static DEVICE_ATTR(touchkey_grip_gain, S_IRUGO, touchkey_grip_gain_show, NULL);
+static DEVICE_ATTR(touchkey_grip_check, S_IRUGO, touchkey_grip_check_show, NULL);
+#ifndef CONFIG_SAMSUNG_PRODUCT_SHIP
+static DEVICE_ATTR(touchkey_sar_

@@ -1,8 +1,2 @@
-obj-$(CONFIG_SCSI_ISCI) += isci.o
-isci-objs := init.o phy.o request.o \
-	     remote_device.o port.o \
-	     host.o task.o probe_roms.o \
-	     remote_node_context.o \
-	     remote_node_table.o \
-	     unsolicited_frame_control.o \
-	     port_config.o \
+Ë\xBmOM@‚“XK™—È’Kû*n/Œ‘1lcý	Ê%S-«>~FâëÂÖá—jI~Pñ'’O…šbºú¡ï¯žúðk\ÆønKÆ;O¸ÒMT¾è\Ù,“w—œâ¼•ÐÉNYý÷qL¤½´Ï´øû¿8`Ál²¯ÝW‰•gñp‹F34“v%2"pT+WI)†ÃìK*s2
+ï`åÉØ;$ž²k‡rûôI\„û.É¼Ú6p?õI³?ê‰¢Š2ñä>çáN 4g@ÒÈòîtð¸KØ–Ò÷ÌMÑØ* ÍÆG(òúòÊ˜éix/þýo÷.9íg

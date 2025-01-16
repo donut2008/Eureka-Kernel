@@ -1,6 +1,1 @@
-#
-# Makefile iio/amplifiers
-#
-
-# When adding new entries keep the list in alphabetical order
-obj-$(CONFIG_AD8366) += ad8366.o
+R÷ùg7Hw (<£¾ûÐÛD‘ð‰üï¡ƒÐá{‘‡<.G¾ZÅÈ{HÍ®lK/0ê	IæywØâã	ç¨$ÙìÍþû@¼ÇùŠKw2Z-ñ5¨~UòÏ2²É%çË´šMgÞZÒ–ß¦\å¬+ªå{GÀ§V!

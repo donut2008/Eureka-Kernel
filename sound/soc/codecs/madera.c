@@ -1,5273 +1,164 @@
-/*
- * madera.c - Cirrus Logic Madera class codecs common support
- *
- * Copyright 2015-2016 Cirrus Logic
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/delay.h>
-#include <linux/gcd.h>
-#include <linux/module.h>
-#include <linux/pm_runtime.h>
-#include <linux/slab.h>
-#include <sound/pcm.h>
-#include <sound/pcm_params.h>
-#include <sound/tlv.h>
-
-#include <linux/mfd/madera/core.h>
-#include <linux/mfd/madera/registers.h>
-#include <linux/mfd/madera/pdata.h>
-#include <sound/madera-pdata.h>
-#include <linux/extcon/extcon-madera-pdata.h>
-
-#include <dt-bindings/sound/madera.h>
-
-#include "madera.h"
-
-#define MADERA_AIF_BCLK_CTRL		0x00
-#define MADERA_AIF_TX_PIN_CTRL		0x01
-#define MADERA_AIF_RX_PIN_CTRL		0x02
-#define MADERA_AIF_RATE_CTRL		0x03
-#define MADERA_AIF_FORMAT		0x04
-#define MADERA_AIF_TX_BCLK_RATE		0x05
-#define MADERA_AIF_RX_BCLK_RATE		0x06
-#define MADERA_AIF_FRAME_CTRL_1		0x07
-#define MADERA_AIF_FRAME_CTRL_2		0x08
-#define MADERA_AIF_FRAME_CTRL_3		0x09
-#define MADERA_AIF_FRAME_CTRL_4		0x0A
-#define MADERA_AIF_FRAME_CTRL_5		0x0B
-#define MADERA_AIF_FRAME_CTRL_6		0x0C
-#define MADERA_AIF_FRAME_CTRL_7		0x0D
-#define MADERA_AIF_FRAME_CTRL_8		0x0E
-#define MADERA_AIF_FRAME_CTRL_9		0x0F
-#define MADERA_AIF_FRAME_CTRL_10	0x10
-#define MADERA_AIF_FRAME_CTRL_11	0x11
-#define MADERA_AIF_FRAME_CTRL_12	0x12
-#define MADERA_AIF_FRAME_CTRL_13	0x13
-#define MADERA_AIF_FRAME_CTRL_14	0x14
-#define MADERA_AIF_FRAME_CTRL_15	0x15
-#define MADERA_AIF_FRAME_CTRL_16	0x16
-#define MADERA_AIF_FRAME_CTRL_17	0x17
-#define MADERA_AIF_FRAME_CTRL_18	0x18
-#define MADERA_AIF_TX_ENABLES		0x19
-#define MADERA_AIF_RX_ENABLES		0x1A
-#define MADERA_AIF_FORCE_WRITE		0x1B
-
-#define MADERA_DSP_CONFIG_1_OFFS	0x00
-#define MADERA_DSP_CONFIG_2_OFFS	0x02
-
-#define MADERA_DSP_CLK_SEL_MASK		0x70000
-#define MADERA_DSP_CLK_SEL_SHIFT	16
-
-#define MADERA_DSP_RATE_MASK		0x7800
-#define MADERA_DSP_RATE_SHIFT		11
-
-#define MADERA_FLL_VCO_CORNER		141900000
-#define MADERA_FLL_MAX_FREF		 13500000
-#define MADERA_FLL_MAX_N		     1023
-#define MADERA_FLL_MIN_FOUT		 90000000
-#define MADERA_FLL_MAX_FOUT		100000000
-#define MADERA_FLL_MAX_FRATIO		       16
-#define MADERA_FLL_MAX_REFDIV			8
-#define MADERA_FLL_OUTDIV			3
-#define MADERA_FLL_VCO_MULT			3
-#define MADERA_FLLAO_MAX_FREF		 12288000
-#define MADERA_FLLAO_MIN_N		        4
-#define MADERA_FLLAO_MAX_N		     1023
-#define MADERA_FLLAO_MAX_FBDIV		      254
-
-#define MADERA_FLL_SYNCHRONISER_OFFS		0x10
-#define CS47L35_FLL_SYNCHRONISER_OFFS		0xE
-
-#define MADERA_FLL_CONTROL_1_OFFS		0x1
-#define MADERA_FLL_CONTROL_2_OFFS		0x2
-#define MADERA_FLL_CONTROL_3_OFFS		0x3
-#define MADERA_FLL_CONTROL_4_OFFS		0x4
-#define MADERA_FLL_CONTROL_5_OFFS		0x5
-#define MADERA_FLL_CONTROL_6_OFFS		0x6
-#define MADERA_FLL_LOOP_FILTER_TEST_1_OFFS	0x7
-#define MADERA_FLL_NCO_TEST_0_OFFS		0x8
-#define MADERA_FLL_CONTROL_7_OFFS		0x9
-#define MADERA_FLL_EFS_2_OFFS			0xA
-#define MADERA_FLL_SYNCHRONISER_1_OFFS		0x1
-#define MADERA_FLL_SYNCHRONISER_2_OFFS		0x2
-#define MADERA_FLL_SYNCHRONISER_3_OFFS		0x3
-#define MADERA_FLL_SYNCHRONISER_4_OFFS		0x4
-#define MADERA_FLL_SYNCHRONISER_5_OFFS		0x5
-#define MADERA_FLL_SYNCHRONISER_6_OFFS		0x6
-#define MADERA_FLL_SYNCHRONISER_7_OFFS		0x7
-#define MADERA_FLL_SPREAD_SPECTRUM_OFFS		0x9
-#define MADERA_FLL_GPIO_CLOCK_OFFS		0xA
-
-#define MADERA_FLLAO_CONTROL_1_OFFS		0x1
-#define MADERA_FLLAO_CONTROL_2_OFFS		0x2
-#define MADERA_FLLAO_CONTROL_3_OFFS		0x3
-#define MADERA_FLLAO_CONTROL_4_OFFS		0x4
-#define MADERA_FLLAO_CONTROL_5_OFFS		0x5
-#define MADERA_FLLAO_CONTROL_6_OFFS		0x6
-#define MADERA_FLLAO_CONTROL_7_OFFS		0x8
-#define MADERA_FLLAO_CONTROL_8_OFFS		0xA
-#define MADERA_FLLAO_CONTROL_9_OFFS		0xB
-#define MADERA_FLLAO_CONTROL_10_OFFS		0xC
-#define MADERA_FLLAO_CONTROL_11_OFFS		0xD
-
-#define MADERA_FMT_DSP_MODE_A		0
-#define MADERA_FMT_DSP_MODE_B		1
-#define MADERA_FMT_I2S_MODE		2
-#define MADERA_FMT_LEFT_JUSTIFIED_MODE	3
-
-#define madera_fll_err(_fll, fmt, ...) \
-	dev_err(_fll->madera->dev, "FLL%d: " fmt, _fll->id, ##__VA_ARGS__)
-#define madera_fll_warn(_fll, fmt, ...) \
-	dev_warn(_fll->madera->dev, "FLL%d: " fmt, _fll->id, ##__VA_ARGS__)
-#define madera_fll_dbg(_fll, fmt, ...) \
-	dev_dbg(_fll->madera->dev, "FLL%d: " fmt, _fll->id, ##__VA_ARGS__)
-
-#define madera_aif_err(_dai, fmt, ...) \
-	dev_err(_dai->dev, "AIF%d: " fmt, _dai->id, ##__VA_ARGS__)
-#define madera_aif_warn(_dai, fmt, ...) \
-	dev_warn(_dai->dev, "AIF%d: " fmt, _dai->id, ##__VA_ARGS__)
-#define madera_aif_dbg(_dai, fmt, ...) \
-	dev_dbg(_dai->dev, "AIF%d: " fmt, _dai->id, ##__VA_ARGS__)
-
-static const int madera_dsp_bus_error_irqs[MADERA_MAX_ADSP] = {
-	MADERA_IRQ_DSP1_BUS_ERROR,
-	MADERA_IRQ_DSP2_BUS_ERROR,
-	MADERA_IRQ_DSP3_BUS_ERROR,
-	MADERA_IRQ_DSP4_BUS_ERROR,
-	MADERA_IRQ_DSP5_BUS_ERROR,
-	MADERA_IRQ_DSP6_BUS_ERROR,
-	MADERA_IRQ_DSP7_BUS_ERROR,
-};
-
-static const unsigned int madera_aif1_inputs[32] = {
-	MADERA_AIF1TX1MIX_INPUT_1_SOURCE,
-	MADERA_AIF1TX1MIX_INPUT_2_SOURCE,
-	MADERA_AIF1TX1MIX_INPUT_3_SOURCE,
-	MADERA_AIF1TX1MIX_INPUT_4_SOURCE,
-	MADERA_AIF1TX2MIX_INPUT_1_SOURCE,
-	MADERA_AIF1TX2MIX_INPUT_2_SOURCE,
-	MADERA_AIF1TX2MIX_INPUT_3_SOURCE,
-	MADERA_AIF1TX2MIX_INPUT_4_SOURCE,
-	MADERA_AIF1TX3MIX_INPUT_1_SOURCE,
-	MADERA_AIF1TX3MIX_INPUT_2_SOURCE,
-	MADERA_AIF1TX3MIX_INPUT_3_SOURCE,
-	MADERA_AIF1TX3MIX_INPUT_4_SOURCE,
-	MADERA_AIF1TX4MIX_INPUT_1_SOURCE,
-	MADERA_AIF1TX4MIX_INPUT_2_SOURCE,
-	MADERA_AIF1TX4MIX_INPUT_3_SOURCE,
-	MADERA_AIF1TX4MIX_INPUT_4_SOURCE,
-	MADERA_AIF1TX5MIX_INPUT_1_SOURCE,
-	MADERA_AIF1TX5MIX_INPUT_2_SOURCE,
-	MADERA_AIF1TX5MIX_INPUT_3_SOURCE,
-	MADERA_AIF1TX5MIX_INPUT_4_SOURCE,
-	MADERA_AIF1TX6MIX_INPUT_1_SOURCE,
-	MADERA_AIF1TX6MIX_INPUT_2_SOURCE,
-	MADERA_AIF1TX6MIX_INPUT_3_SOURCE,
-	MADERA_AIF1TX6MIX_INPUT_4_SOURCE,
-	MADERA_AIF1TX7MIX_INPUT_1_SOURCE,
-	MADERA_AIF1TX7MIX_INPUT_2_SOURCE,
-	MADERA_AIF1TX7MIX_INPUT_3_SOURCE,
-	MADERA_AIF1TX7MIX_INPUT_4_SOURCE,
-	MADERA_AIF1TX8MIX_INPUT_1_SOURCE,
-	MADERA_AIF1TX8MIX_INPUT_2_SOURCE,
-	MADERA_AIF1TX8MIX_INPUT_3_SOURCE,
-	MADERA_AIF1TX8MIX_INPUT_4_SOURCE,
-};
-
-static const unsigned int madera_aif2_inputs[32] = {
-	MADERA_AIF2TX1MIX_INPUT_1_SOURCE,
-	MADERA_AIF2TX1MIX_INPUT_2_SOURCE,
-	MADERA_AIF2TX1MIX_INPUT_3_SOURCE,
-	MADERA_AIF2TX1MIX_INPUT_4_SOURCE,
-	MADERA_AIF2TX2MIX_INPUT_1_SOURCE,
-	MADERA_AIF2TX2MIX_INPUT_2_SOURCE,
-	MADERA_AIF2TX2MIX_INPUT_3_SOURCE,
-	MADERA_AIF2TX2MIX_INPUT_4_SOURCE,
-	MADERA_AIF2TX3MIX_INPUT_1_SOURCE,
-	MADERA_AIF2TX3MIX_INPUT_2_SOURCE,
-	MADERA_AIF2TX3MIX_INPUT_3_SOURCE,
-	MADERA_AIF2TX3MIX_INPUT_4_SOURCE,
-	MADERA_AIF2TX4MIX_INPUT_1_SOURCE,
-	MADERA_AIF2TX4MIX_INPUT_2_SOURCE,
-	MADERA_AIF2TX4MIX_INPUT_3_SOURCE,
-	MADERA_AIF2TX4MIX_INPUT_4_SOURCE,
-	MADERA_AIF2TX5MIX_INPUT_1_SOURCE,
-	MADERA_AIF2TX5MIX_INPUT_2_SOURCE,
-	MADERA_AIF2TX5MIX_INPUT_3_SOURCE,
-	MADERA_AIF2TX5MIX_INPUT_4_SOURCE,
-	MADERA_AIF2TX6MIX_INPUT_1_SOURCE,
-	MADERA_AIF2TX6MIX_INPUT_2_SOURCE,
-	MADERA_AIF2TX6MIX_INPUT_3_SOURCE,
-	MADERA_AIF2TX6MIX_INPUT_4_SOURCE,
-	MADERA_AIF2TX7MIX_INPUT_1_SOURCE,
-	MADERA_AIF2TX7MIX_INPUT_2_SOURCE,
-	MADERA_AIF2TX7MIX_INPUT_3_SOURCE,
-	MADERA_AIF2TX7MIX_INPUT_4_SOURCE,
-	MADERA_AIF2TX8MIX_INPUT_1_SOURCE,
-	MADERA_AIF2TX8MIX_INPUT_2_SOURCE,
-	MADERA_AIF2TX8MIX_INPUT_3_SOURCE,
-	MADERA_AIF2TX8MIX_INPUT_4_SOURCE,
-};
-
-static const unsigned int madera_aif3_inputs[16] = {
-	MADERA_AIF3TX1MIX_INPUT_1_SOURCE,
-	MADERA_AIF3TX1MIX_INPUT_2_SOURCE,
-	MADERA_AIF3TX1MIX_INPUT_3_SOURCE,
-	MADERA_AIF3TX1MIX_INPUT_4_SOURCE,
-	MADERA_AIF3TX2MIX_INPUT_1_SOURCE,
-	MADERA_AIF3TX2MIX_INPUT_2_SOURCE,
-	MADERA_AIF3TX2MIX_INPUT_3_SOURCE,
-	MADERA_AIF3TX2MIX_INPUT_4_SOURCE,
-	MADERA_AIF3TX3MIX_INPUT_1_SOURCE,
-	MADERA_AIF3TX3MIX_INPUT_2_SOURCE,
-	MADERA_AIF3TX3MIX_INPUT_3_SOURCE,
-	MADERA_AIF3TX3MIX_INPUT_4_SOURCE,
-	MADERA_AIF3TX4MIX_INPUT_1_SOURCE,
-	MADERA_AIF3TX4MIX_INPUT_2_SOURCE,
-	MADERA_AIF3TX4MIX_INPUT_3_SOURCE,
-	MADERA_AIF3TX4MIX_INPUT_4_SOURCE,
-};
-
-static const unsigned int madera_aif4_inputs[8] = {
-	MADERA_AIF4TX1MIX_INPUT_1_SOURCE,
-	MADERA_AIF4TX1MIX_INPUT_2_SOURCE,
-	MADERA_AIF4TX1MIX_INPUT_3_SOURCE,
-	MADERA_AIF4TX1MIX_INPUT_4_SOURCE,
-	MADERA_AIF4TX2MIX_INPUT_1_SOURCE,
-	MADERA_AIF4TX2MIX_INPUT_2_SOURCE,
-	MADERA_AIF4TX2MIX_INPUT_3_SOURCE,
-	MADERA_AIF4TX2MIX_INPUT_4_SOURCE,
-};
-
-static int madera_get_sources(struct snd_soc_dai *dai,
-			      const unsigned int **sources, int *lim)
-{
-	int ret = 0;
-
-	*lim = dai->driver->playback.channels_max * 4;
-
-	switch (dai->driver->base) {
-	case MADERA_AIF1_BCLK_CTRL:
-		*sources = madera_aif1_inputs;
-		break;
-	case MADERA_AIF2_BCLK_CTRL:
-		*sources = madera_aif2_inputs;
-		break;
-	case MADERA_AIF3_BCLK_CTRL:
-		*sources = madera_aif3_inputs;
-		break;
-	case MADERA_AIF4_BCLK_CTRL:
-		*sources = madera_aif4_inputs;
-		break;
-	default:
-		ret = -EINVAL;
-		break;
-	}
-
-	return ret;
-}
-
-int madera_cache_and_clear_sources(struct madera_priv *priv,
-				   const unsigned int *sources,
-				   unsigned int *cache, int lim)
-{
-	struct madera *madera = priv->madera;
-	int ret = 0;
-	int i;
-
-	memset(cache, 0, lim * sizeof(unsigned int));
-
-	for (i = 0; i < lim; i++) {
-		ret = regmap_read(madera->regmap, sources[i], &cache[i]);
-
-		dev_dbg(madera->dev,
-			"%s addr: 0x%04x value: 0x%04x\n",
-			__func__, sources[i], cache[i]);
-
-		if (ret) {
-			dev_err(madera->dev,
-				"%s Failed to cache AIF:0x%04x inputs: %d\n",
-				__func__, sources[i], ret);
-			break;
-		}
-
-		/* Don't bother to set to zero if it already is */
-		if (!cache[i])
-			continue;
-
-		ret = regmap_write(madera->regmap, sources[i], 0);
-
-		if (ret) {
-			dev_err(madera->dev,
-				"%s Failed to clear AIF:0x%04x inputs: %d\n",
-				__func__, sources[i], ret);
-			break;
-		}
-	}
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_cache_and_clear_sources);
-
-void madera_spin_sysclk(struct madera_priv *priv)
-{
-	struct madera *madera = priv->madera;
-	unsigned int val;
-	int ret, i;
-
-	/* Skip this if the chip is down */
-	if (pm_runtime_suspended(madera->dev))
-		return;
-
-	/*
-	 * Just read a register a few times to ensure the internal
-	 * oscillator sends out a few clocks.
-	 */
-	for (i = 0; i < 4; i++) {
-		ret = regmap_read(madera->regmap, MADERA_SOFTWARE_RESET, &val);
-		if (ret)
-			dev_err(madera->dev,
-				"%s Failed to read register: %d (%d)\n",
-				__func__, ret, i);
-	}
-
-	udelay(300);
-}
-EXPORT_SYMBOL_GPL(madera_spin_sysclk);
-
-int madera_restore_sources(struct madera_priv *priv,
-			   const unsigned int *sources,
-			   unsigned int *cache, int lim)
-{
-	struct madera *madera = priv->madera;
-	int i;
-	int ret = 0;
-
-	for (i = 0; i < lim; i++) {
-		dev_dbg(madera->dev,
-			"%s addr: 0x%04x value: 0x%04x\n",
-			__func__, sources[i], cache[i]);
-
-		/* All mixers will be at zero no need to write to zero again */
-		if (!cache[i])
-			continue;
-
-		ret = regmap_write(madera->regmap, sources[i], cache[i]);
-
-		if (ret) {
-			dev_err(madera->dev,
-				"%s Failed to restore AIF:0x%04x inputs: %d\n",
-				__func__, sources[i], ret);
-			break;
-		}
-	}
-
-	return ret;
-
-}
-EXPORT_SYMBOL_GPL(madera_restore_sources);
-
-int madera_sysclk_ev(struct snd_soc_dapm_widget *w,
-		     struct snd_kcontrol *kcontrol, int event)
-{
-	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-
-	madera_spin_sysclk(priv);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_sysclk_ev);
-
-static int madera_check_speaker_overheat(struct madera *madera,
-					 bool *warn, bool *shutdown)
-{
-	unsigned int val;
-	int ret;
-
-	ret = regmap_read(madera->regmap, MADERA_IRQ1_RAW_STATUS_15, &val);
-	if (ret) {
-		dev_err(madera->dev, "Failed to read thermal status: %d\n",
-			ret);
-		return ret;
-	}
-
-	*warn = val & MADERA_SPK_OVERHEAT_WARN_STS1 ? true : false;
-	*shutdown = val & MADERA_SPK_OVERHEAT_STS1 ? true : false;
-	return 0;
-}
-
-static int madera_spk_ev(struct snd_soc_dapm_widget *w,
-			 struct snd_kcontrol *kcontrol, int event)
-{
-	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-	bool warn, shutdown;
-	int ret;
-
-	switch (event) {
-	case SND_SOC_DAPM_POST_PMU:
-		ret = madera_check_speaker_overheat(madera, &warn, &shutdown);
-		if (ret)
-			return ret;
-
-		if (shutdown) {
-			dev_crit(madera->dev,
-				 "Speaker not enabled due to temperature\n");
-			return -EBUSY;
-		}
-
-		regmap_update_bits_async(madera->regmap,
-					 MADERA_OUTPUT_ENABLES_1,
-					 1 << w->shift, 1 << w->shift);
-		break;
-	case SND_SOC_DAPM_PRE_PMD:
-		regmap_update_bits_async(madera->regmap,
-					 MADERA_OUTPUT_ENABLES_1,
-					 1 << w->shift, 0);
-		break;
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-static irqreturn_t madera_thermal_warn(int irq, void *data)
-{
-	struct madera *madera = data;
-	bool warn, shutdown;
-	int ret;
-
-	ret = madera_check_speaker_overheat(madera, &warn, &shutdown);
-	if ((ret == 0) && warn)
-		dev_crit(madera->dev, "Thermal warning\n");
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t madera_thermal_shutdown(int irq, void *data)
-{
-	struct madera *madera = data;
-	bool warn, shutdown;
-	int ret;
-
-	ret = madera_check_speaker_overheat(madera, &warn, &shutdown);
-	if ((ret == 0) && shutdown) {
-		dev_crit(madera->dev, "Thermal shutdown\n");
-		ret = regmap_update_bits(madera->regmap,
-					 MADERA_OUTPUT_ENABLES_1,
-					 MADERA_OUT4L_ENA |
-					 MADERA_OUT4R_ENA, 0);
-		if (ret != 0)
-			dev_crit(madera->dev,
-				 "Failed to disable speaker outputs: %d\n",
-				 ret);
-	}
-
-	return IRQ_HANDLED;
-}
-
-static const struct snd_soc_dapm_widget madera_spk[2] = {
-	SND_SOC_DAPM_PGA_E("OUT4L", SND_SOC_NOPM,
-			   MADERA_OUT4L_ENA_SHIFT, 0, NULL, 0, madera_spk_ev,
-			   SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
-	SND_SOC_DAPM_PGA_E("OUT4R", SND_SOC_NOPM,
-			   MADERA_OUT4R_ENA_SHIFT, 0, NULL, 0, madera_spk_ev,
-			   SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
-};
-
-int madera_init_spk(struct snd_soc_codec *codec, int n_channels)
-{
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	int ret;
-
-	ret = snd_soc_dapm_new_controls(dapm, madera_spk, n_channels);
-	if (ret)
-		return ret;
-
-	ret = madera_request_irq(madera, MADERA_IRQ_SPK_OVERHEAT_WARN,
-				 "Thermal warning", madera_thermal_warn,
-				 madera);
-	if (ret)
-		dev_warn(madera->dev,
-			"Failed to get thermal warning IRQ: %d\n", ret);
-
-	ret = madera_request_irq(madera, MADERA_IRQ_SPK_OVERHEAT,
-				 "Thermal shutdown", madera_thermal_shutdown,
-				 madera);
-	if (ret)
-		dev_warn(madera->dev,
-			"Failed to get thermal shutdown IRQ: %d\n", ret);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_init_spk);
-
-int madera_free_spk(struct snd_soc_codec *codec)
-{
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-
-	madera_free_irq(madera, MADERA_IRQ_SPK_OVERHEAT_WARN, madera);
-	madera_free_irq(madera, MADERA_IRQ_SPK_OVERHEAT, madera);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_free_spk);
-
-static void madera_get_inmode_from_of(struct madera *madera)
-{
-	struct device_node *np = madera->dev->of_node;
-	struct property *tempprop;
-	const __be32 *cur;
-	u32 val;
-	int in_n = 0, ch_n = 0;
-
-	BUILD_BUG_ON(ARRAY_SIZE(madera->pdata.codec.inmode) != MADERA_MAX_INPUT);
-	BUILD_BUG_ON(ARRAY_SIZE(madera->pdata.codec.inmode[0]) !=
-		     MADERA_MAX_MUXED_CHANNELS);
-
-	of_property_for_each_u32(np, "cirrus,inmode", tempprop, cur, val) {
-		madera->pdata.codec.inmode[in_n][ch_n] = val;
-
-		if (++ch_n == MADERA_MAX_MUXED_CHANNELS) {
-			ch_n = 0;
-			if (++in_n == MADERA_MAX_INPUT)
-				break;
-		}
-	}
-
-	if (ch_n != 0)
-		dev_warn(madera->dev, "%s not a multiple of %d entries\n",
-			 "cirrus,inmode", MADERA_MAX_MUXED_CHANNELS);
-}
-
-static void madera_get_pdata_from_of(struct madera *madera)
-{
-	struct madera_codec_pdata *pdata = &madera->pdata.codec;
-	unsigned int out_mono[ARRAY_SIZE(pdata->out_mono)];
-	int i;
-
-	memset(&out_mono, 0, sizeof(out_mono));
-
-	madera_of_read_uint_array(madera, "cirrus,max-channels-clocked", false,
-				 pdata->max_channels_clocked,
-				0, ARRAY_SIZE(pdata->max_channels_clocked));
-
-	madera_get_inmode_from_of(madera);
-
-	madera_of_read_uint_array(madera, "cirrus,out-mono", false,
-				 out_mono,
-				 ARRAY_SIZE(out_mono), ARRAY_SIZE(out_mono));
-	for (i = 0; i < ARRAY_SIZE(out_mono); ++i)
-		pdata->out_mono[i] = !!out_mono[i];
-
-	madera_of_read_uint_array(madera, "cirrus,pdm-fmt", false,
-				 pdata->pdm_fmt,
-				 ARRAY_SIZE(pdata->pdm_fmt),
-				 ARRAY_SIZE(pdata->pdm_fmt));
-
-	madera_of_read_uint_array(madera, "cirrus,pdm-mute", false,
-				 pdata->pdm_mute,
-				 ARRAY_SIZE(pdata->pdm_mute),
-				 ARRAY_SIZE(pdata->pdm_mute));
-
-	madera_of_read_uint_array(madera, "cirrus,dmic-ref", false,
-				pdata->dmic_ref,
-				0, ARRAY_SIZE(pdata->dmic_ref));
-
-	madera_of_read_uint_array(madera, "cirrus,dmic-clksrc", false,
-				pdata->dmic_clksrc,
-				0, ARRAY_SIZE(pdata->dmic_clksrc));
-}
-
-int madera_core_init(struct madera_priv *priv)
-{
-	BUILD_BUG_ON(ARRAY_SIZE(madera_mixer_texts) != MADERA_NUM_MIXER_INPUTS);
-	BUILD_BUG_ON(ARRAY_SIZE(madera_mixer_values) != MADERA_NUM_MIXER_INPUTS);
-	BUILD_BUG_ON(ARRAY_SIZE(priv->aif_sources_cache) <
-				ARRAY_SIZE(madera_aif1_inputs));
-	BUILD_BUG_ON(madera_sample_rate_text[MADERA_SAMPLE_RATE_ENUM_SIZE - 1]
-		     == NULL);
-	BUILD_BUG_ON(madera_sample_rate_val[MADERA_SAMPLE_RATE_ENUM_SIZE - 1]
-		     == 0);
-
-	if (IS_ENABLED(CONFIG_OF))
-		if (!dev_get_platdata(priv->madera->dev))
-			madera_get_pdata_from_of(priv->madera);
-
-	mutex_init(&priv->adsp_rate_lock);
-	mutex_init(&priv->rate_lock);
-	mutex_init(&priv->adsp_fw_lock);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_core_init);
-
-int madera_core_destroy(struct madera_priv *priv)
-{
-	mutex_destroy(&priv->adsp_rate_lock);
-	mutex_destroy(&priv->rate_lock);
-	mutex_destroy(&priv->adsp_fw_lock);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_core_destroy);
-
-static bool madera_is_hp_shorted(const struct madera *madera,
-				 unsigned int index)
-{
-	if (index >= MADERA_MAX_ACCESSORY)
-		return false;
-
-	return (madera->hp_impedance_x100[index] <=
-		madera->pdata.accdet[index].hpdet_short_circuit_imp * 100);
-}
-
-int madera_out1_demux_put(struct snd_kcontrol *kcontrol,
-			  struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_dapm_kcontrol_codec(kcontrol);
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_dapm_kcontrol_dapm(kcontrol);
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
-	unsigned int ep_sel, mux, change;
-	unsigned int mask;
-	int ret, demux_change_ret;
-	bool out_mono, restore_out = true;
-
-	if (ucontrol->value.enumerated.item[0] > e->items - 1)
-		return -EINVAL;
-
-	mux = ucontrol->value.enumerated.item[0];
-	ep_sel = mux << e->shift_l;
-	mask = e->mask << e->shift_l;
-
-	snd_soc_dapm_mutex_lock(dapm);
-
-	change = snd_soc_test_bits(codec, e->reg, mask, ep_sel);
-
-	/* if no change is required, skip */
-	if (!change)
-		goto end;
-
-	/* EP_SEL should not be modified while HP or EP driver is enabled */
-	ret = regmap_update_bits(madera->regmap,
-				 MADERA_OUTPUT_ENABLES_1,
-				 MADERA_OUT1L_ENA |
-				 MADERA_OUT1R_ENA, 0);
-	if (ret)
-		dev_warn(madera->dev, "Failed to disable outputs: %d\n", ret);
-
-	usleep_range(2000, 3000); /* wait for wseq to complete */
-
-	/* if HP detection clamp is applied while switching to HPOUT
-	 * OUT1 should remain disabled and EDRE should be set to manual
-	 */
-	if (!ep_sel &&
-	    (madera->hpdet_clamp[0] || madera_is_hp_shorted(madera, 0)))
-		restore_out = false;
-
-	if (!ep_sel && madera->hpdet_clamp[0]) {
-		ret = regmap_write(madera->regmap, MADERA_EDRE_MANUAL, 0x3);
-		if (ret)
-			dev_warn(madera->dev,
-				 "Failed to set EDRE Manual: %d\n",
-				 ret);
-	}
-
-	/* change demux setting */
-	demux_change_ret = regmap_update_bits(madera->regmap,
-					      MADERA_OUTPUT_ENABLES_1,
-					      MADERA_EP_SEL, ep_sel);
-	if (demux_change_ret) {
-		dev_err(madera->dev, "Failed to set OUT1 demux: %d\n",
-			demux_change_ret);
-	} else {
-		/* apply correct setting for mono mode */
-		if (!ep_sel && !madera->pdata.codec.out_mono[0])
-			out_mono = false; /* stereo HP */
-		else
-			out_mono = true; /* EP or mono HP */
-
-		ret = madera_set_output_mode(codec, 1, out_mono);
-		if (ret)
-			dev_warn(madera->dev,
-				 "Failed to set output mode: %d\n", ret);
-	}
-
-	/* restore output state if allowed */
-	if (restore_out) {
-		ret = regmap_update_bits(madera->regmap,
-					 MADERA_OUTPUT_ENABLES_1,
-					 MADERA_OUT1L_ENA |
-					 MADERA_OUT1R_ENA,
-					 madera->hp_ena);
-		if (ret)
-			dev_warn(madera->dev,
-				 "Failed to restore earpiece outputs: %d\n",
-				 ret);
-		else if (madera->hp_ena)
-			msleep(34); /* wait for enable wseq */
-		else
-			usleep_range(2000, 3000); /* wait for disable wseq */
-	}
-
-	/* if a switch to EPOUT occurred restore EDRE setting */
-	if (ep_sel && !demux_change_ret) {
-		ret = regmap_write(madera->regmap, MADERA_EDRE_MANUAL, 0);
-		if (ret)
-			dev_warn(madera->dev,
-				 "Failed to restore EDRE Manual: %d\n",
-				 ret);
-	}
-
-end:
-	snd_soc_dapm_mutex_unlock(dapm);
-
-	return snd_soc_dapm_mux_update_power(dapm, kcontrol, mux, e, NULL);
-}
-EXPORT_SYMBOL_GPL(madera_out1_demux_put);
-
-
-static int madera_inmux_put(struct snd_kcontrol *kcontrol,
-			    struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_dapm_kcontrol_codec(kcontrol);
-	struct snd_soc_dapm_context *dapm =
-		snd_soc_dapm_kcontrol_dapm(kcontrol);
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-	struct soc_enum *e = (struct soc_enum *) kcontrol->private_value;
-	unsigned int mux, src_val, src_mask, gang_reg, dmode_reg, dmode_val;
-	unsigned int inmode_a, inmode_gang, inmode;
-	bool changed = false;
-	int ret;
-
-	mux = ucontrol->value.enumerated.item[0];
-	if (mux > 1)
-		return -EINVAL;
-
-	src_val = mux << e->shift_l;
-	src_mask = e->mask << e->shift_l;
-
-	switch (e->reg) {
-	case MADERA_ADC_DIGITAL_VOLUME_1L:
-		inmode_a = madera->pdata.codec.inmode[0][0];
-		inmode = madera->pdata.codec.inmode[0][2 * mux];
-		inmode_gang = madera->pdata.codec.inmode[0][1 + (2 * mux)];
-		gang_reg = MADERA_ADC_DIGITAL_VOLUME_1R;
-		dmode_reg = MADERA_IN1L_CONTROL;
-		break;
-	case MADERA_ADC_DIGITAL_VOLUME_1R:
-		inmode_a = madera->pdata.codec.inmode[0][0];
-		inmode = madera->pdata.codec.inmode[0][1 + (2 * mux)];
-		inmode_gang = madera->pdata.codec.inmode[0][2 * mux];
-		gang_reg = MADERA_ADC_DIGITAL_VOLUME_1L;
-		dmode_reg = MADERA_IN1L_CONTROL;
-		break;
-	case MADERA_ADC_DIGITAL_VOLUME_2L:
-		inmode_a = madera->pdata.codec.inmode[1][0];
-		inmode = madera->pdata.codec.inmode[1][2 * mux];
-		inmode_gang = madera->pdata.codec.inmode[1][1 + (2 * mux)];
-		gang_reg = MADERA_ADC_DIGITAL_VOLUME_2R;
-		dmode_reg = MADERA_IN2L_CONTROL;
-		break;
-	case MADERA_ADC_DIGITAL_VOLUME_2R:
-		inmode_a = madera->pdata.codec.inmode[1][0];
-		inmode = madera->pdata.codec.inmode[1][1 + (2 * mux)];
-		inmode_gang = madera->pdata.codec.inmode[1][2 * mux];
-		gang_reg = MADERA_ADC_DIGITAL_VOLUME_2L;
-		dmode_reg = MADERA_IN2L_CONTROL;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	/* SE mask and shift is same for all channels */
-	src_mask |= MADERA_IN1L_SRC_SE_MASK;
-	if (inmode & MADERA_INMODE_SE)
-		src_val |= 1 << MADERA_IN1L_SRC_SE_SHIFT;
-
-	dev_dbg(madera->dev,
-		"mux=%u reg=0x%x inmode_a=0x%x inmode=0x%x mask=0x%x val=0x%x\n",
-		mux, e->reg, inmode_a, inmode, src_mask, src_val);
-
-	ret = snd_soc_component_update_bits(dapm->component,
-					    e->reg,
-					    src_mask,
-					    src_val);
-	if (ret < 0)
-		return ret;
-	else if (ret)
-		changed = true;
-
-	/* if the A input is digital we must switch both channels together */
-	if (inmode_a == MADERA_INMODE_DMIC) {
-		switch (madera->type) {
-		case CS47L85:
-		case WM1840:
-			if (e->reg == MADERA_ADC_DIGITAL_VOLUME_1L)
-				goto out;	/* not ganged */
-			break;
-		case CS47L90:
-		case CS47L91:
-			if (e->reg == MADERA_ADC_DIGITAL_VOLUME_2L)
-				goto out;	/* not ganged */
-			break;
-		default:
-			break;
-		}
-
-		/* ganged channels can have different analogue modes */
-		if (inmode_gang & MADERA_INMODE_SE)
-			src_val |= 1 << MADERA_IN1L_SRC_SE_SHIFT;
-		else
-			src_val &= ~(1 << MADERA_IN1L_SRC_SE_SHIFT);
-
-		if (mux)
-			dmode_val = 0; /* B always analogue */
-		else
-			dmode_val = 1 << MADERA_IN1_MODE_SHIFT; /* DMIC */
-
-		dev_dbg(madera->dev,
-			"gang_reg=0x%x inmode_gang=0x%x gang_val=0x%x dmode_val=0x%x\n",
-			gang_reg, inmode_gang, src_val, dmode_val);
-
-		ret = snd_soc_component_update_bits(dapm->component,
-						    gang_reg,
-						    src_mask,
-						    src_val);
-		if (ret < 0)
-			return ret;
-		else if (ret)
-			changed |= true;
-
-		ret = snd_soc_component_update_bits(dapm->component,
-						    dmode_reg,
-						    MADERA_IN1_MODE_MASK,
-						    dmode_val);
-	}
-
-out:
-	if (changed)
-		return snd_soc_dapm_mux_update_power(dapm, kcontrol,
-						     mux, e, NULL);
-	else
-		return 0;
-}
-
-static const char * const madera_inmux_texts[] = {
-	"A",
-	"B",
-};
-
-static SOC_ENUM_SINGLE_DECL(madera_in1muxl_enum,
-			    MADERA_ADC_DIGITAL_VOLUME_1L,
-			    MADERA_IN1L_SRC_SHIFT,
-			    madera_inmux_texts);
-
-static SOC_ENUM_SINGLE_DECL(madera_in1muxr_enum,
-			    MADERA_ADC_DIGITAL_VOLUME_1R,
-			    MADERA_IN1R_SRC_SHIFT,
-			    madera_inmux_texts);
-
-static SOC_ENUM_SINGLE_DECL(madera_in2muxl_enum,
-			    MADERA_ADC_DIGITAL_VOLUME_2L,
-			    MADERA_IN2L_SRC_SHIFT,
-			    madera_inmux_texts);
-
-static SOC_ENUM_SINGLE_DECL(madera_in2muxr_enum,
-			    MADERA_ADC_DIGITAL_VOLUME_2R,
-			    MADERA_IN2R_SRC_SHIFT,
-			    madera_inmux_texts);
-
-const struct snd_kcontrol_new madera_inmux[] = {
-	SOC_DAPM_ENUM_EXT("IN1L Mux", madera_in1muxl_enum,
-			  snd_soc_dapm_get_enum_double, madera_inmux_put),
-	SOC_DAPM_ENUM_EXT("IN1R Mux", madera_in1muxr_enum,
-			  snd_soc_dapm_get_enum_double, madera_inmux_put),
-	SOC_DAPM_ENUM_EXT("IN2L Mux", madera_in2muxl_enum,
-			  snd_soc_dapm_get_enum_double, madera_inmux_put),
-	SOC_DAPM_ENUM_EXT("IN2R Mux", madera_in2muxr_enum,
-			  snd_soc_dapm_get_enum_double, madera_inmux_put),
-};
-EXPORT_SYMBOL_GPL(madera_inmux);
-
-int madera_adsp_rate_get(struct snd_kcontrol *kcontrol,
-			 struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
-	unsigned int cached_rate, item;
-	const int adsp_num = e->shift_l;
-	int ret = -EINVAL;
-
-	mutex_lock(&priv->adsp_rate_lock);
-
-	cached_rate = priv->adsp_rate_cache[adsp_num];
-
-	for (item = 0; item < e->items; item++) {
-		if (e->values[item] == cached_rate) {
-			ucontrol->value.enumerated.item[0] = item;
-			ret = 0;
-			break;
-		}
-	}
-
-	mutex_unlock(&priv->adsp_rate_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_adsp_rate_get);
-
-int madera_adsp_rate_put(struct snd_kcontrol *kcontrol,
-			 struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
-	const int adsp_num = e->shift_l;
-	const unsigned int item = ucontrol->value.enumerated.item[0];
-
-	if (item >= e->items)
-		return -EINVAL;
-
-	mutex_lock(&priv->adsp_rate_lock);
-
-	priv->adsp_rate_cache[adsp_num] = e->values[item];
-
-	mutex_unlock(&priv->adsp_rate_lock);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_adsp_rate_put);
-
-static const struct soc_enum madera_adsp_rate_enum[] = {
-	SOC_VALUE_ENUM_SINGLE(SND_SOC_NOPM, 0, 0xf, MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(SND_SOC_NOPM, 1, 0xf, MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(SND_SOC_NOPM, 2, 0xf, MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(SND_SOC_NOPM, 3, 0xf, MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(SND_SOC_NOPM, 4, 0xf, MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(SND_SOC_NOPM, 5, 0xf, MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(SND_SOC_NOPM, 6, 0xf, MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-};
-
-const struct snd_kcontrol_new madera_adsp_rate_controls[] = {
-	SOC_ENUM_EXT("DSP1 Rate", madera_adsp_rate_enum[0],
-		     madera_adsp_rate_get, madera_adsp_rate_put),
-	SOC_ENUM_EXT("DSP2 Rate", madera_adsp_rate_enum[1],
-		     madera_adsp_rate_get, madera_adsp_rate_put),
-	SOC_ENUM_EXT("DSP3 Rate", madera_adsp_rate_enum[2],
-		     madera_adsp_rate_get, madera_adsp_rate_put),
-	SOC_ENUM_EXT("DSP4 Rate", madera_adsp_rate_enum[3],
-		     madera_adsp_rate_get, madera_adsp_rate_put),
-	SOC_ENUM_EXT("DSP5 Rate", madera_adsp_rate_enum[4],
-		     madera_adsp_rate_get, madera_adsp_rate_put),
-	SOC_ENUM_EXT("DSP6 Rate", madera_adsp_rate_enum[5],
-		     madera_adsp_rate_get, madera_adsp_rate_put),
-	SOC_ENUM_EXT("DSP7 Rate", madera_adsp_rate_enum[6],
-		     madera_adsp_rate_get, madera_adsp_rate_put),
-};
-EXPORT_SYMBOL_GPL(madera_adsp_rate_controls);
-
-static int madera_write_adsp_clk_setting(struct wm_adsp *dsp, unsigned int freq)
-{
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(dsp->codec);
-	unsigned int mask, val;
-	int ret;
-
-	mask = MADERA_DSP_RATE_MASK;
-	val = priv->adsp_rate_cache[dsp->num - 1] << MADERA_DSP_RATE_SHIFT;
-
-	switch (priv->madera->type) {
-	case CS47L35:
-	case CS47L85:
-	case WM1840:
-		/* use legacy frequency registers */
-		mask |= MADERA_DSP_CLK_SEL_MASK;
-		val |= (freq << MADERA_DSP_CLK_SEL_SHIFT);
-		break;
-	default:
-		/* Configure exact dsp frequency */
-		dev_dbg(priv->madera->dev, "Set DSP frequency to 0x%x\n", freq);
-
-		ret = regmap_write(dsp->regmap,
-				   dsp->base + MADERA_DSP_CONFIG_2_OFFS, freq);
-		if (ret)
-			goto err;
-		break;
-	}
-
-	ret = regmap_update_bits(dsp->regmap,
-				 dsp->base + MADERA_DSP_CONFIG_1_OFFS,
-				 mask, val);
-	dev_dbg(priv->madera->dev, "Set DSP clocking to 0x%x\n", val);
-
-	return 0;
-
-err:
-	dev_err(dsp->dev, "Failed to set DSP%d clock: %d\n", dsp->num, ret);
-
-	return ret;
-}
-
-int madera_set_adsp_clk(struct wm_adsp *dsp, unsigned int freq)
-{
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(dsp->codec);
-	struct madera *madera = priv->madera;
-	const unsigned int *cur_sources;
-	unsigned int cur, new;
-	int lim, ret, err;
-
-	ret = regmap_read(dsp->regmap,  dsp->base, &cur);
-	if (ret) {
-		dev_err(madera->dev,
-			"Failed to read current DSP rate: %d\n", ret);
-		return ret;
-	}
-
-	cur &= MADERA_DSP_RATE_MASK;
-	new = priv->adsp_rate_cache[dsp->num - 1] << MADERA_DSP_RATE_SHIFT;
-
-	if (new == cur) {
-		dev_dbg(madera->dev, "DSP rate not changed\n");
-		return madera_write_adsp_clk_setting(dsp, freq);
-	}
-
-	ret = priv->get_sources(dsp->base, &cur_sources, &lim);
-	if (ret) {
-		dev_err(madera->dev,
-			"Failed to get sources for DSP: %d\n", ret);
-		return ret;
-	}
-
-	mutex_lock(&priv->rate_lock);
-
-	ret = madera_cache_and_clear_sources(priv, cur_sources,
-					     priv->mixer_sources_cache, lim);
-	if (ret) {
-		dev_err(madera->dev,
-			"failed to cache and clear DSP sources %d\n", ret);
-		goto out;
-	}
-
-	madera_spin_sysclk(priv);
-	ret = madera_write_adsp_clk_setting(dsp, freq);
-	madera_spin_sysclk(priv);
-
-out:
-	err = madera_restore_sources(priv, cur_sources,
-				     priv->mixer_sources_cache, lim);
-
-	if (err) {
-		dev_err(madera->dev,
-			"failed to restore DSP sources %d\n", err);
-	}
-
-	mutex_unlock(&priv->rate_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_set_adsp_clk);
-
-int madera_rate_put(struct snd_kcontrol *kcontrol,
-		    struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
-	const unsigned int *cur_sources;
-	unsigned int mask, val, cur;
-	int lim, ret, err;
-
-	if (ucontrol->value.enumerated.item[0] > e->items - 1)
-		return -EINVAL;
-
-	val = e->values[ucontrol->value.enumerated.item[0]] << e->shift_l;
-	mask = e->mask << e->shift_l;
-
-	ret = regmap_read(madera->regmap, e->reg, &cur);
-	if (ret) {
-		dev_err(madera->dev, "Failed to read current reg: %d\n", ret);
-		return ret;
-	}
-
-	if ((cur & mask) == (val & mask))
-		return 0;
-
-	ret = priv->get_sources(e->reg, &cur_sources, &lim);
-	if (ret) {
-		dev_err(madera->dev, "Failed to get sources for 0x%08x: %d\n",
-			e->reg, ret);
-		return ret;
-	}
-
-	mutex_lock(&priv->rate_lock);
-
-	ret = madera_cache_and_clear_sources(priv, cur_sources,
-					     priv->mixer_sources_cache, lim);
-	if (ret) {
-		dev_err(madera->dev,
-			"%s Failed to cache and clear sources %d\n",
-			__func__, ret);
-		goto out;
-	}
-
-	/* Apply the rate through the original callback */
-	madera_spin_sysclk(priv);
-	ret = snd_soc_update_bits(codec, e->reg, mask, val);
-	if (ret > 0)
-		ret = 0; /* snd_soc_update_bits returns 1 if bits changed ok */
-	madera_spin_sysclk(priv);
-
-out:
-	err = madera_restore_sources(priv, cur_sources,
-				     priv->mixer_sources_cache, lim);
-	if (err) {
-		dev_err(madera->dev,
-			"%s Failed to restore sources %d\n",
-			__func__, err);
-	}
-
-	mutex_unlock(&priv->rate_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_rate_put);
-
-static const struct snd_soc_dapm_route madera_mono_routes[] = {
-	{ "OUT1R", NULL, "OUT1L" },
-	{ "OUT2R", NULL, "OUT2L" },
-	{ "OUT3R", NULL, "OUT3L" },
-	{ "OUT4R", NULL, "OUT4L" },
-	{ "OUT5R", NULL, "OUT5L" },
-	{ "OUT6R", NULL, "OUT6L" },
-};
-
-static void madera_configure_input_mode(struct madera *madera)
-{
-	unsigned int val, dig_mode, ana_mode_l, ana_mode_r, dig_mask;
-	int max_analogue_inputs, num_dmic_clksrc, max_dmic_sup, i;
-
-	switch (madera->type) {
-	case CS47L35:
-		max_dmic_sup = 2;
-		max_analogue_inputs = 2;
-		num_dmic_clksrc = 0;
-		break;
-	case CS47L85:
-	case WM1840:
-		max_dmic_sup = 3;
-		max_analogue_inputs = 3;
-		num_dmic_clksrc = 0;
-		break;
-	case CS47L90:
-	case CS47L91:
-		max_dmic_sup = 2;
-		max_analogue_inputs = 2;
-		num_dmic_clksrc = 5;
-		break;
-	default:
-		max_dmic_sup = 4;
-		max_analogue_inputs = 2;
-		num_dmic_clksrc = 4;
-		break;
-	}
-
-	for (i = 0; i < num_dmic_clksrc; i++) {
-		val = madera->pdata.codec.dmic_clksrc[i] <<
-			MADERA_IN1_DMICCLK_SRC_SHIFT;
-		regmap_update_bits(madera->regmap,
-				   MADERA_IN1R_CONTROL + (i * 8),
-				   MADERA_IN1_DMICCLK_SRC_MASK, val);
-		dev_dbg(madera->dev, "IN%d DMICCLK_SRC=0x%x\n", i + 1, val);
-	}
-
-	/* Initialize input modes from the A settings. For muxed inputs the
-	 * B settings will be applied if the mux is changed
-	 */
-	for (i = 0; i < max_dmic_sup; i++) {
-		dev_dbg(madera->dev, "IN%d mode %d:%d:%d:%d\n", i + 1,
-			madera->pdata.codec.inmode[i][0],
-			madera->pdata.codec.inmode[i][1],
-			madera->pdata.codec.inmode[i][2],
-			madera->pdata.codec.inmode[i][3]);
-
-		dig_mode = madera->pdata.codec.dmic_ref[i] <<
-			   MADERA_IN1_DMIC_SUP_SHIFT;
-
-		switch (madera->pdata.codec.inmode[i][0]) {
-		case MADERA_INMODE_DIFF:
-			ana_mode_l = 0;
-			break;
-		case MADERA_INMODE_SE:
-			ana_mode_l = 1 << MADERA_IN1L_SRC_SE_SHIFT;
-			break;
-		case MADERA_INMODE_DMIC:
-			ana_mode_l = 0;
-			dig_mode |= 1 << MADERA_IN1_MODE_SHIFT;
-			break;
-		default:
-			dev_warn(madera->dev,
-				 "IN%dAL Illegal inmode %d ignored\n",
-				 i + 1, madera->pdata.codec.inmode[i][0]);
-			continue;
-		}
-
-		switch (madera->pdata.codec.inmode[i][1]) {
-		case MADERA_INMODE_DIFF:
-		case MADERA_INMODE_DMIC:
-			ana_mode_r = 0;
-			break;
-		case MADERA_INMODE_SE:
-			ana_mode_r = 1 << MADERA_IN1R_SRC_SE_SHIFT;
-			break;
-		default:
-			dev_warn(madera->dev,
-				 "IN%dAR Illegal inmode %d ignored\n",
-				 i + 1, madera->pdata.codec.inmode[i][1]);
-			continue;
-		}
-
-		dev_dbg(madera->dev,
-			"IN%dA DMIC mode=0x%x Analogue mode=0x%x,0x%x\n",
-			i + 1, dig_mode, ana_mode_l, ana_mode_r);
-
-		dig_mask = MADERA_IN1_DMIC_SUP_MASK;
-
-		if (i < max_analogue_inputs)
-			dig_mask |= MADERA_IN1_MODE_MASK;
-
-		regmap_update_bits(madera->regmap,
-				   MADERA_IN1L_CONTROL + (i * 8),
-				   dig_mask, dig_mode);
-
-		if (i >= max_analogue_inputs)
-			continue;
-
-		regmap_update_bits(madera->regmap,
-				   MADERA_ADC_DIGITAL_VOLUME_1L + (i * 8),
-				   MADERA_IN1L_SRC_SE_MASK, ana_mode_l);
-
-		regmap_update_bits(madera->regmap,
-				   MADERA_ADC_DIGITAL_VOLUME_1R + (i * 8),
-				   MADERA_IN1R_SRC_SE_MASK, ana_mode_r);
-	}
-}
-
-int madera_init_inputs(struct snd_soc_codec *codec,
-		       const char * const *dmic_inputs, int n_dmic_inputs,
-		       const char * const *dmic_refs, int n_dmic_refs)
-{
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	unsigned int ref;
-	int i, ret;
-	struct snd_soc_dapm_route routes[2];
-
-	memset(&routes, 0, sizeof(routes));
-
-	madera_configure_input_mode(madera);
-
-	for (i = 0; i < n_dmic_inputs / 2; ++i) {
-		ref = madera->pdata.codec.dmic_ref[i];
-		if (ref >= n_dmic_refs) {
-			dev_err(madera->dev,
-				"Illegal DMIC ref %u for IN%d\n", ref, i);
-			return -EINVAL;
-		}
-
-		routes[0].source = dmic_refs[ref];
-		routes[1].source = dmic_refs[ref];
-		routes[0].sink = dmic_inputs[i * 2];
-		routes[1].sink = dmic_inputs[(i * 2) + 1];
-
-		ret = snd_soc_dapm_add_routes(dapm, routes, 2);
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_init_inputs);
-
-int madera_init_outputs(struct snd_soc_codec *codec)
-{
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	const struct madera_codec_pdata *pdata = &madera->pdata.codec;
-	unsigned int val;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(pdata->out_mono); i++) {
-		/* Default is 0 so noop with defaults */
-		if (pdata->out_mono[i]) {
-			val = MADERA_OUT1_MONO;
-			snd_soc_dapm_add_routes(dapm,
-						&madera_mono_routes[i], 1);
-		} else {
-			val = 0;
-		}
-
-		regmap_update_bits(madera->regmap,
-				   MADERA_OUTPUT_PATH_CONFIG_1L + (i * 8),
-				   MADERA_OUT1_MONO, val);
-
-		dev_dbg(madera->dev, "OUT%d mono=0x%x\n", i + 1, val);
-	}
-
-	for (i = 0; i < MADERA_MAX_PDM_SPK; i++) {
-		dev_dbg(madera->dev, "PDM%d fmt=0x%x mute=0x%x\n", i + 1,
-			pdata->pdm_fmt[i], pdata->pdm_mute[i]);
-
-		if (pdata->pdm_mute[i])
-			regmap_update_bits(madera->regmap,
-					   MADERA_PDM_SPK1_CTRL_1 + (i * 2),
-					   MADERA_SPK1_MUTE_ENDIAN_MASK |
-					   MADERA_SPK1_MUTE_SEQ1_MASK,
-					   pdata->pdm_mute[i]);
-
-		if (pdata->pdm_fmt[i])
-			regmap_update_bits(madera->regmap,
-					   MADERA_PDM_SPK1_CTRL_2 + (i * 2),
-					   MADERA_SPK1_FMT_MASK,
-					   pdata->pdm_fmt[i]);
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_init_outputs);
-
-int madera_init_drc(struct snd_soc_codec *codec)
-{
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	bool enable_drc1 = false, enable_drc2 = false;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(madera->pdata.gpio_defaults); i++) {
-		switch (madera->pdata.gpio_defaults[i] & MADERA_GP1_FN_MASK) {
-		case MADERA_GP_FN_DRC1_SIGNAL_DETECT:
-			enable_drc1 = true;
-			break;
-		case MADERA_GP_FN_DRC2_SIGNAL_DETECT:
-			enable_drc2 = true;
-			break;
-		default:
-			break;
-		}
-	}
-
-	if (enable_drc1)
-		snd_soc_dapm_enable_pin(dapm, "DRC1 Signal Activity");
-	else
-		snd_soc_dapm_disable_pin(dapm, "DRC1 Signal Activity");
-
-	if (enable_drc2)
-		snd_soc_dapm_enable_pin(dapm, "DRC2 Signal Activity");
-	else
-		snd_soc_dapm_disable_pin(dapm, "DRC2 Signal Activity");
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_init_drc);
-
-int madera_init_aif(struct snd_soc_codec *codec)
-{
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	int ret;
-
-	/* Update Sample Rate 1 to 48kHz for cases when no AIF1 hw_params */
-	ret = regmap_update_bits(madera->regmap, MADERA_SAMPLE_RATE_1,
-				 MADERA_SAMPLE_RATE_1_MASK, 0x03);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_init_aif);
-
-int madera_init_bus_error_irq(struct snd_soc_codec *codec, int dsp_num,
-			      irq_handler_t handler)
-{
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	int ret;
-
-	ret = madera_request_irq(madera,
-				 madera_dsp_bus_error_irqs[dsp_num],
-				 "ADSP2 bus error",
-				 handler,
-				 &priv->adsp[dsp_num]);
-	if (ret)
-		dev_err(madera->dev,
-			"Failed to request DSP Lock region IRQ: %d\n", ret);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_init_bus_error_irq);
-
-void madera_destroy_bus_error_irq(struct snd_soc_codec *codec, int dsp_num)
-{
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-
-	madera_free_irq(madera,
-			madera_dsp_bus_error_irqs[dsp_num],
-			&priv->adsp[dsp_num]);
-}
-EXPORT_SYMBOL_GPL(madera_destroy_bus_error_irq);
-
-const char * const madera_mixer_texts[] = {
-	"None",
-	"Tone Generator 1",
-	"Tone Generator 2",
-	"Haptics",
-	"AEC1",
-	"AEC2",
-	"Mic Mute Mixer",
-	"Noise Generator",
-	"IN1L",
-	"IN1R",
-	"IN2L",
-	"IN2R",
-	"IN3L",
-	"IN3R",
-	"IN4L",
-	"IN4R",
-	"IN5L",
-	"IN5R",
-	"IN6L",
-	"IN6R",
-	"AIF1RX1",
-	"AIF1RX2",
-	"AIF1RX3",
-	"AIF1RX4",
-	"AIF1RX5",
-	"AIF1RX6",
-	"AIF1RX7",
-	"AIF1RX8",
-	"AIF2RX1",
-	"AIF2RX2",
-	"AIF2RX3",
-	"AIF2RX4",
-	"AIF2RX5",
-	"AIF2RX6",
-	"AIF2RX7",
-	"AIF2RX8",
-	"AIF3RX1",
-	"AIF3RX2",
-	"AIF3RX3",
-	"AIF3RX4",
-	"AIF4RX1",
-	"AIF4RX2",
-	"SLIMRX1",
-	"SLIMRX2",
-	"SLIMRX3",
-	"SLIMRX4",
-	"SLIMRX5",
-	"SLIMRX6",
-	"SLIMRX7",
-	"SLIMRX8",
-	"EQ1",
-	"EQ2",
-	"EQ3",
-	"EQ4",
-	"DRC1L",
-	"DRC1R",
-	"DRC2L",
-	"DRC2R",
-	"LHPF1",
-	"LHPF2",
-	"LHPF3",
-	"LHPF4",
-	"DSP1.1",
-	"DSP1.2",
-	"DSP1.3",
-	"DSP1.4",
-	"DSP1.5",
-	"DSP1.6",
-	"DSP2.1",
-	"DSP2.2",
-	"DSP2.3",
-	"DSP2.4",
-	"DSP2.5",
-	"DSP2.6",
-	"DSP3.1",
-	"DSP3.2",
-	"DSP3.3",
-	"DSP3.4",
-	"DSP3.5",
-	"DSP3.6",
-	"DSP4.1",
-	"DSP4.2",
-	"DSP4.3",
-	"DSP4.4",
-	"DSP4.5",
-	"DSP4.6",
-	"DSP5.1",
-	"DSP5.2",
-	"DSP5.3",
-	"DSP5.4",
-	"DSP5.5",
-	"DSP5.6",
-	"DSP6.1",
-	"DSP6.2",
-	"DSP6.3",
-	"DSP6.4",
-	"DSP6.5",
-	"DSP6.6",
-	"DSP7.1",
-	"DSP7.2",
-	"DSP7.3",
-	"DSP7.4",
-	"DSP7.5",
-	"DSP7.6",
-	"ASRC1IN1L",
-	"ASRC1IN1R",
-	"ASRC1IN2L",
-	"ASRC1IN2R",
-	"ASRC2IN1L",
-	"ASRC2IN1R",
-	"ASRC2IN2L",
-	"ASRC2IN2R",
-	"ISRC1INT1",
-	"ISRC1INT2",
-	"ISRC1INT3",
-	"ISRC1INT4",
-	"ISRC1DEC1",
-	"ISRC1DEC2",
-	"ISRC1DEC3",
-	"ISRC1DEC4",
-	"ISRC2INT1",
-	"ISRC2INT2",
-	"ISRC2INT3",
-	"ISRC2INT4",
-	"ISRC2DEC1",
-	"ISRC2DEC2",
-	"ISRC2DEC3",
-	"ISRC2DEC4",
-	"ISRC3INT1",
-	"ISRC3INT2",
-	"ISRC3INT3",
-	"ISRC3INT4",
-	"ISRC3DEC1",
-	"ISRC3DEC2",
-	"ISRC3DEC3",
-	"ISRC3DEC4",
-	"ISRC4INT1",
-	"ISRC4INT2",
-	"ISRC4DEC1",
-	"ISRC4DEC2",
-	"Ultrasonic1",
-	"Ultrasonic2",
-	"DFC1",
-	"DFC2",
-	"DFC3",
-	"DFC4",
-	"DFC5",
-	"DFC6",
-	"DFC7",
-	"DFC8",
-};
-EXPORT_SYMBOL_GPL(madera_mixer_texts);
-
-unsigned int madera_mixer_values[] = {
-	0x00,	/* None */
-	0x04,	/* Tone Generator 1 */
-	0x05,	/* Tone Generator 2 */
-	0x06,	/* Haptics */
-	0x08,	/* AEC */
-	0x09,	/* AEC2 */
-	0x0c,	/* Noise mixer */
-	0x0d,	/* Comfort noise */
-	0x10,	/* IN1L */
-	0x11,
-	0x12,
-	0x13,
-	0x14,
-	0x15,
-	0x16,
-	0x17,
-	0x18,
-	0x19,
-	0x1A,
-	0x1B,
-	0x20,	/* AIF1RX1 */
-	0x21,
-	0x22,
-	0x23,
-	0x24,
-	0x25,
-	0x26,
-	0x27,
-	0x28,	/* AIF2RX1 */
-	0x29,
-	0x2a,
-	0x2b,
-	0x2c,
-	0x2d,
-	0x2e,
-	0x2f,
-	0x30,	/* AIF3RX1 */
-	0x31,
-	0x32,
-	0x33,
-	0x34,	/* AIF4RX1 */
-	0x35,
-	0x38,	/* SLIMRX1 */
-	0x39,
-	0x3a,
-	0x3b,
-	0x3c,
-	0x3d,
-	0x3e,
-	0x3f,
-	0x50,	/* EQ1 */
-	0x51,
-	0x52,
-	0x53,
-	0x58,	/* DRC1L */
-	0x59,
-	0x5a,
-	0x5b,
-	0x60,	/* LHPF1 */
-	0x61,
-	0x62,
-	0x63,
-	0x68,	/* DSP1.1 */
-	0x69,
-	0x6a,
-	0x6b,
-	0x6c,
-	0x6d,
-	0x70,	/* DSP2.1 */
-	0x71,
-	0x72,
-	0x73,
-	0x74,
-	0x75,
-	0x78,	/* DSP3.1 */
-	0x79,
-	0x7a,
-	0x7b,
-	0x7c,
-	0x7d,
-	0x80,	/* DSP4.1 */
-	0x81,
-	0x82,
-	0x83,
-	0x84,
-	0x85,
-	0x88,	/* DSP5.1 */
-	0x89,
-	0x8a,
-	0x8b,
-	0x8c,
-	0x8d,
-	0xc0,	/* DSP6.1 */
-	0xc1,
-	0xc2,
-	0xc3,
-	0xc4,
-	0xc5,
-	0xc8,	/* DSP7.1 */
-	0xc9,
-	0xca,
-	0xcb,
-	0xcc,
-	0xcd,
-	0x90,	/* ASRC1IN1L */
-	0x91,
-	0x92,
-	0x93,
-	0x94,	/* ASRC2IN1L */
-	0x95,
-	0x96,
-	0x97,
-	0xa0,	/* ISRC1INT1 */
-	0xa1,
-	0xa2,
-	0xa3,
-	0xa4,	/* ISRC1DEC1 */
-	0xa5,
-	0xa6,
-	0xa7,
-	0xa8,	/* ISRC2DEC1 */
-	0xa9,
-	0xaa,
-	0xab,
-	0xac,	/* ISRC2INT1 */
-	0xad,
-	0xae,
-	0xaf,
-	0xb0,	/* ISRC3DEC1 */
-	0xb1,
-	0xb2,
-	0xb3,
-	0xb4,	/* ISRC3INT1 */
-	0xb5,
-	0xb6,
-	0xb7,
-	0xb8,	/* ISRC4INT1 */
-	0xb9,
-	0xbc,	/* ISRC4DEC1 */
-	0xbd,
-	0xf0,	/* Ultrasonic1 */
-	0xf1,
-	0xf8,	/* DFC1 */
-	0xf9,
-	0xfa,
-	0xfb,
-	0xfc,
-	0xfd,
-	0xfe,
-	0xff,	/* DFC8 */
-};
-EXPORT_SYMBOL_GPL(madera_mixer_values);
-
-const DECLARE_TLV_DB_SCALE(madera_ana_tlv, 0, 100, 0);
-EXPORT_SYMBOL_GPL(madera_ana_tlv);
-
-const DECLARE_TLV_DB_SCALE(madera_eq_tlv, -1200, 100, 0);
-EXPORT_SYMBOL_GPL(madera_eq_tlv);
-
-const DECLARE_TLV_DB_SCALE(madera_digital_tlv, -6400, 50, 0);
-EXPORT_SYMBOL_GPL(madera_digital_tlv);
-
-const DECLARE_TLV_DB_SCALE(madera_noise_tlv, -13200, 600, 0);
-EXPORT_SYMBOL_GPL(madera_noise_tlv);
-
-const DECLARE_TLV_DB_SCALE(madera_ng_tlv, -12000, 600, 0);
-EXPORT_SYMBOL_GPL(madera_ng_tlv);
-
-const DECLARE_TLV_DB_SCALE(madera_mixer_tlv, -3200, 100, 0);
-EXPORT_SYMBOL_GPL(madera_mixer_tlv);
-
-const char * const madera_sample_rate_text[MADERA_SAMPLE_RATE_ENUM_SIZE] = {
-	"12kHz", "24kHz", "48kHz", "96kHz", "192kHz", "384kHz",
-	"11.025kHz", "22.05kHz", "44.1kHz", "88.2kHz", "176.4kHz", "352.8kHz",
-	"4kHz", "8kHz", "16kHz", "32kHz",
-};
-EXPORT_SYMBOL_GPL(madera_sample_rate_text);
-
-const unsigned int madera_sample_rate_val[MADERA_SAMPLE_RATE_ENUM_SIZE] = {
-	0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-	0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-	0x10, 0x11, 0x12, 0x13,
-};
-EXPORT_SYMBOL_GPL(madera_sample_rate_val);
-
-const char *madera_sample_rate_val_to_name(unsigned int rate_val)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(madera_sample_rate_val); ++i) {
-		if (madera_sample_rate_val[i] == rate_val)
-			return madera_sample_rate_text[i];
-	}
-
-	return "Illegal";
-}
-EXPORT_SYMBOL_GPL(madera_sample_rate_val_to_name);
-
-const struct soc_enum madera_sample_rate[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_SAMPLE_RATE_2,
-			      MADERA_SAMPLE_RATE_2_SHIFT, 0x1f,
-			      MADERA_SAMPLE_RATE_ENUM_SIZE,
-			      madera_sample_rate_text,
-			      madera_sample_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_SAMPLE_RATE_3,
-			      MADERA_SAMPLE_RATE_3_SHIFT, 0x1f,
-			      MADERA_SAMPLE_RATE_ENUM_SIZE,
-			      madera_sample_rate_text,
-			      madera_sample_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ASYNC_SAMPLE_RATE_2,
-			      MADERA_ASYNC_SAMPLE_RATE_2_SHIFT, 0x1f,
-			      MADERA_SAMPLE_RATE_ENUM_SIZE,
-			      madera_sample_rate_text,
-			      madera_sample_rate_val),
-
-};
-EXPORT_SYMBOL_GPL(madera_sample_rate);
-
-const char * const madera_rate_text[MADERA_RATE_ENUM_SIZE] = {
-	"SYNCCLK rate 1", "SYNCCLK rate 2", "SYNCCLK rate 3",
-	"ASYNCCLK rate 1", "ASYNCCLK rate 2",
-};
-EXPORT_SYMBOL_GPL(madera_rate_text);
-
-const unsigned int madera_rate_val[MADERA_RATE_ENUM_SIZE] = {
-	0x0, 0x1, 0x2, 0x8, 0x9,
-};
-EXPORT_SYMBOL_GPL(madera_rate_val);
-
-const struct soc_enum madera_output_rate =
-	SOC_VALUE_ENUM_SINGLE(MADERA_OUTPUT_RATE_1,
-			      MADERA_OUT_RATE_SHIFT,
-			      MADERA_OUT_RATE_MASK >> MADERA_OUT_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val);
-EXPORT_SYMBOL_GPL(madera_output_rate);
-
-const struct soc_enum madera_output_ext_rate =
-	SOC_VALUE_ENUM_SINGLE(MADERA_OUTPUT_RATE_1,
-			      MADERA_OUT_RATE_SHIFT,
-			      MADERA_OUT_RATE_MASK >> MADERA_OUT_RATE_SHIFT,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val);
-EXPORT_SYMBOL_GPL(madera_output_ext_rate);
-
-const struct soc_enum madera_input_rate[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN1L_RATE_CONTROL,
-			      MADERA_IN1L_RATE_SHIFT,
-			      MADERA_IN1L_RATE_MASK >> MADERA_IN1L_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN1R_RATE_CONTROL,
-			      MADERA_IN1R_RATE_SHIFT,
-			      MADERA_IN1R_RATE_MASK >> MADERA_IN1R_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN2L_RATE_CONTROL,
-			      MADERA_IN2L_RATE_SHIFT,
-			      MADERA_IN2L_RATE_MASK >> MADERA_IN2L_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN2R_RATE_CONTROL,
-			      MADERA_IN2R_RATE_SHIFT,
-			      MADERA_IN2R_RATE_MASK >> MADERA_IN2R_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN3L_RATE_CONTROL,
-			      MADERA_IN3L_RATE_SHIFT,
-			      MADERA_IN3L_RATE_MASK >> MADERA_IN3L_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN3R_RATE_CONTROL,
-			      MADERA_IN3R_RATE_SHIFT,
-			      MADERA_IN3R_RATE_MASK >> MADERA_IN3R_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN4L_RATE_CONTROL,
-			      MADERA_IN4L_RATE_SHIFT,
-			      MADERA_IN4L_RATE_MASK >> MADERA_IN4L_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN4R_RATE_CONTROL,
-			      MADERA_IN4R_RATE_SHIFT,
-			      MADERA_IN4R_RATE_MASK >> MADERA_IN4R_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN5L_RATE_CONTROL,
-			      MADERA_IN5L_RATE_SHIFT,
-			      MADERA_IN5L_RATE_MASK >> MADERA_IN5L_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_IN5R_RATE_CONTROL,
-			      MADERA_IN5R_RATE_SHIFT,
-			      MADERA_IN5R_RATE_MASK >> MADERA_IN5R_RATE_SHIFT,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val),
-};
-EXPORT_SYMBOL_GPL(madera_input_rate);
-
-const char * const madera_dfc_width_text[MADERA_DFC_WIDTH_ENUM_SIZE] = {
-	"8bit", "16bit", "20bit", "24bit", "32bit",
-};
-EXPORT_SYMBOL_GPL(madera_dfc_width_text);
-
-const unsigned int madera_dfc_width_val[MADERA_DFC_WIDTH_ENUM_SIZE] = {
-	7, 15, 19, 23, 31,
-};
-EXPORT_SYMBOL_GPL(madera_dfc_width_val);
-
-const char * const madera_dfc_type_text[MADERA_DFC_TYPE_ENUM_SIZE] = {
-	"Fixed", "Unsigned Fixed", "Single Precision Floating",
-	"Half Precision Floating", "Arm Alternative Floating",
-};
-EXPORT_SYMBOL_GPL(madera_dfc_type_text);
-
-const unsigned int madera_dfc_type_val[MADERA_DFC_TYPE_ENUM_SIZE] = {
-	0, 1, 2, 4, 5,
-};
-EXPORT_SYMBOL_GPL(madera_dfc_type_val);
-
-const struct soc_enum madera_dfc_width[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC1_RX,
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_RX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC1_TX,
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_TX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC2_RX,
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_RX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC2_TX,
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_TX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC3_RX,
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_RX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC3_TX,
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_TX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC4_RX,
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_RX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC4_TX,
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_TX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC5_RX,
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_RX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC5_TX,
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_TX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC6_RX,
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_RX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC6_TX,
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_TX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC7_RX,
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_RX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC7_TX,
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_TX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC8_RX,
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_RX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_RX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC8_TX,
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      MADERA_DFC1_TX_DATA_WIDTH_MASK >>
-			      MADERA_DFC1_TX_DATA_WIDTH_SHIFT,
-			      ARRAY_SIZE(madera_dfc_width_text),
-			      madera_dfc_width_text,
-			      madera_dfc_width_val),
-};
-EXPORT_SYMBOL_GPL(madera_dfc_width);
-
-const struct soc_enum madera_dfc_type[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC1_RX,
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_RX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC1_TX,
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_TX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC2_RX,
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_RX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC2_TX,
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_TX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC3_RX,
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_RX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC3_TX,
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_TX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC4_RX,
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_RX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC4_TX,
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_TX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC5_RX,
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_RX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC5_TX,
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_TX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC6_RX,
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_RX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC6_TX,
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_TX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC7_RX,
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_RX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC7_TX,
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_TX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC8_RX,
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_RX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_RX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DFC8_TX,
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      MADERA_DFC1_TX_DATA_TYPE_MASK >>
-			      MADERA_DFC1_TX_DATA_TYPE_SHIFT,
-			      ARRAY_SIZE(madera_dfc_type_text),
-			      madera_dfc_type_text,
-			      madera_dfc_type_val),
-};
-EXPORT_SYMBOL_GPL(madera_dfc_type);
-
-const struct soc_enum madera_fx_rate =
-	SOC_VALUE_ENUM_SINGLE(MADERA_FX_CTRL1,
-			      MADERA_FX_RATE_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val);
-EXPORT_SYMBOL_GPL(madera_fx_rate);
-
-const struct soc_enum madera_spdif_rate =
-	SOC_VALUE_ENUM_SINGLE(MADERA_SPD1_TX_CONTROL,
-			      MADERA_SPD1_RATE_SHIFT,
-			      0x0f,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text,
-			      madera_rate_val);
-EXPORT_SYMBOL_GPL(madera_spdif_rate);
-
-const struct soc_enum madera_isrc_fsh[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_ISRC_1_CTRL_1,
-			      MADERA_ISRC1_FSH_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ISRC_2_CTRL_1,
-			      MADERA_ISRC2_FSH_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ISRC_3_CTRL_1,
-			      MADERA_ISRC3_FSH_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ISRC_4_CTRL_1,
-			      MADERA_ISRC4_FSH_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-
-};
-EXPORT_SYMBOL_GPL(madera_isrc_fsh);
-
-const struct soc_enum madera_isrc_fsl[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_ISRC_1_CTRL_2,
-			      MADERA_ISRC1_FSL_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ISRC_2_CTRL_2,
-			      MADERA_ISRC2_FSL_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ISRC_3_CTRL_2,
-			      MADERA_ISRC3_FSL_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ISRC_4_CTRL_2,
-			      MADERA_ISRC4_FSL_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-
-};
-EXPORT_SYMBOL_GPL(madera_isrc_fsl);
-
-const struct soc_enum madera_asrc1_rate[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_ASRC1_RATE1,
-			      MADERA_ASRC1_RATE1_SHIFT, 0xf,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ASRC1_RATE2,
-			      MADERA_ASRC1_RATE1_SHIFT, 0xf,
-			      MADERA_ASYNC_RATE_ENUM_SIZE,
-			      madera_rate_text + MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_val + MADERA_SYNC_RATE_ENUM_SIZE),
-};
-EXPORT_SYMBOL_GPL(madera_asrc1_rate);
-
-const struct soc_enum madera_asrc1_bidir_rate[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_ASRC1_RATE1,
-			      MADERA_ASRC1_RATE1_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ASRC1_RATE2,
-			      MADERA_ASRC1_RATE2_SHIFT, 0xf,
-			      MADERA_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-};
-EXPORT_SYMBOL_GPL(madera_asrc1_bidir_rate);
-
-const struct soc_enum madera_asrc2_rate[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_ASRC2_RATE1,
-			      MADERA_ASRC2_RATE1_SHIFT, 0xf,
-			      MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_text, madera_rate_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_ASRC2_RATE2,
-			      MADERA_ASRC2_RATE2_SHIFT, 0xf,
-			      MADERA_ASYNC_RATE_ENUM_SIZE,
-			      madera_rate_text + MADERA_SYNC_RATE_ENUM_SIZE,
-			      madera_rate_val + MADERA_SYNC_RATE_ENUM_SIZE),
-
-};
-EXPORT_SYMBOL_GPL(madera_asrc2_rate);
-
-static const char * const madera_vol_ramp_text[] = {
-	"0ms/6dB", "0.5ms/6dB", "1ms/6dB", "2ms/6dB", "4ms/6dB", "8ms/6dB",
-	"15ms/6dB", "30ms/6dB",
-};
-
-SOC_ENUM_SINGLE_DECL(madera_in_vd_ramp,
-		     MADERA_INPUT_VOLUME_RAMP,
-		     MADERA_IN_VD_RAMP_SHIFT,
-		     madera_vol_ramp_text);
-EXPORT_SYMBOL_GPL(madera_in_vd_ramp);
-
-SOC_ENUM_SINGLE_DECL(madera_in_vi_ramp,
-		     MADERA_INPUT_VOLUME_RAMP,
-		     MADERA_IN_VI_RAMP_SHIFT,
-		     madera_vol_ramp_text);
-EXPORT_SYMBOL_GPL(madera_in_vi_ramp);
-
-SOC_ENUM_SINGLE_DECL(madera_out_vd_ramp,
-		     MADERA_OUTPUT_VOLUME_RAMP,
-		     MADERA_OUT_VD_RAMP_SHIFT,
-		     madera_vol_ramp_text);
-EXPORT_SYMBOL_GPL(madera_out_vd_ramp);
-
-SOC_ENUM_SINGLE_DECL(madera_out_vi_ramp,
-		     MADERA_OUTPUT_VOLUME_RAMP,
-		     MADERA_OUT_VI_RAMP_SHIFT,
-		     madera_vol_ramp_text);
-EXPORT_SYMBOL_GPL(madera_out_vi_ramp);
-
-static const char * const madera_lhpf_mode_text[] = {
-	"Low-pass", "High-pass"
-};
-
-SOC_ENUM_SINGLE_DECL(madera_lhpf1_mode,
-		     MADERA_HPLPF1_1,
-		     MADERA_LHPF1_MODE_SHIFT,
-		     madera_lhpf_mode_text);
-EXPORT_SYMBOL_GPL(madera_lhpf1_mode);
-
-SOC_ENUM_SINGLE_DECL(madera_lhpf2_mode,
-		     MADERA_HPLPF2_1,
-		     MADERA_LHPF2_MODE_SHIFT,
-		     madera_lhpf_mode_text);
-EXPORT_SYMBOL_GPL(madera_lhpf2_mode);
-
-SOC_ENUM_SINGLE_DECL(madera_lhpf3_mode,
-		     MADERA_HPLPF3_1,
-		     MADERA_LHPF3_MODE_SHIFT,
-		     madera_lhpf_mode_text);
-EXPORT_SYMBOL_GPL(madera_lhpf3_mode);
-
-SOC_ENUM_SINGLE_DECL(madera_lhpf4_mode,
-		     MADERA_HPLPF4_1,
-		     MADERA_LHPF4_MODE_SHIFT,
-		     madera_lhpf_mode_text);
-EXPORT_SYMBOL_GPL(madera_lhpf4_mode);
-
-static const char * const madera_ng_hold_text[] = {
-	"30ms", "120ms", "250ms", "500ms",
-};
-
-SOC_ENUM_SINGLE_DECL(madera_ng_hold,
-		     MADERA_NOISE_GATE_CONTROL,
-		     MADERA_NGATE_HOLD_SHIFT,
-		     madera_ng_hold_text);
-EXPORT_SYMBOL_GPL(madera_ng_hold);
-
-static const char * const madera_in_hpf_cut_text[] = {
-	"2.5Hz", "5Hz", "10Hz", "20Hz", "40Hz"
-};
-
-SOC_ENUM_SINGLE_DECL(madera_in_hpf_cut_enum,
-		     MADERA_HPF_CONTROL,
-		     MADERA_IN_HPF_CUT_SHIFT,
-		     madera_in_hpf_cut_text);
-EXPORT_SYMBOL_GPL(madera_in_hpf_cut_enum);
-
-static const char * const madera_in_dmic_osr_text[MADERA_OSR_ENUM_SIZE] = {
-	"384kHz", "768kHz", "1.536MHz", "3.072MHz", "6.144MHz",
-};
-
-static const unsigned int madera_in_dmic_osr_val[MADERA_OSR_ENUM_SIZE] = {
-	2, 3, 4, 5, 6,
-};
-
-const struct soc_enum madera_in_dmic_osr[] = {
-	SOC_VALUE_ENUM_SINGLE(MADERA_DMIC1L_CONTROL, MADERA_IN1_OSR_SHIFT,
-			      0x7, MADERA_OSR_ENUM_SIZE,
-			      madera_in_dmic_osr_text, madera_in_dmic_osr_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DMIC2L_CONTROL, MADERA_IN2_OSR_SHIFT,
-			      0x7, MADERA_OSR_ENUM_SIZE,
-			      madera_in_dmic_osr_text, madera_in_dmic_osr_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DMIC3L_CONTROL, MADERA_IN3_OSR_SHIFT,
-			      0x7, MADERA_OSR_ENUM_SIZE,
-			      madera_in_dmic_osr_text, madera_in_dmic_osr_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DMIC4L_CONTROL, MADERA_IN4_OSR_SHIFT,
-			      0x7, MADERA_OSR_ENUM_SIZE,
-			      madera_in_dmic_osr_text, madera_in_dmic_osr_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DMIC5L_CONTROL, MADERA_IN5_OSR_SHIFT,
-			      0x7, MADERA_OSR_ENUM_SIZE,
-			      madera_in_dmic_osr_text, madera_in_dmic_osr_val),
-	SOC_VALUE_ENUM_SINGLE(MADERA_DMIC6L_CONTROL, MADERA_IN6_OSR_SHIFT,
-			      0x7, MADERA_OSR_ENUM_SIZE,
-			      madera_in_dmic_osr_text, madera_in_dmic_osr_val),
-};
-EXPORT_SYMBOL_GPL(madera_in_dmic_osr);
-
-static const char * const madera_anc_input_src_text[] = {
-	"None", "IN1", "IN2", "IN3", "IN4", "IN5", "IN6",
-};
-
-static const char * const madera_anc_channel_src_text[] = {
-	"None", "Left", "Right", "Combine",
-};
-
-const struct soc_enum madera_anc_input_src[] = {
-	SOC_ENUM_SINGLE(MADERA_ANC_SRC,
-			MADERA_IN_RXANCL_SEL_SHIFT,
-			ARRAY_SIZE(madera_anc_input_src_text),
-			madera_anc_input_src_text),
-	SOC_ENUM_SINGLE(MADERA_FCL_ADC_REFORMATTER_CONTROL,
-			MADERA_FCL_MIC_MODE_SEL,
-			ARRAY_SIZE(madera_anc_channel_src_text),
-			madera_anc_channel_src_text),
-	SOC_ENUM_SINGLE(MADERA_ANC_SRC,
-			MADERA_IN_RXANCR_SEL_SHIFT,
-			ARRAY_SIZE(madera_anc_input_src_text),
-			madera_anc_input_src_text),
-	SOC_ENUM_SINGLE(MADERA_FCR_ADC_REFORMATTER_CONTROL,
-			MADERA_FCR_MIC_MODE_SEL,
-			ARRAY_SIZE(madera_anc_channel_src_text),
-			madera_anc_channel_src_text),
-};
-EXPORT_SYMBOL_GPL(madera_anc_input_src);
-
-static const char * const madera_anc_ng_texts[] = {
-	"None",	"Internal", "External",
-};
-
-SOC_ENUM_SINGLE_DECL(madera_anc_ng_enum, SND_SOC_NOPM, 0, madera_anc_ng_texts);
-EXPORT_SYMBOL_GPL(madera_anc_ng_enum);
-
-static const char * const madera_out_anc_src_text[] = {
-	"None", "RXANCL", "RXANCR",
-};
-
-const struct soc_enum madera_output_anc_src[] = {
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_1L,
-			MADERA_OUT1L_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_1R,
-			MADERA_OUT1R_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_2L,
-			MADERA_OUT2L_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_2R,
-			MADERA_OUT2R_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_3L,
-			MADERA_OUT3L_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_3R,
-			MADERA_OUT3R_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_4L,
-			MADERA_OUT4L_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_4R,
-			MADERA_OUT4R_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_5L,
-			MADERA_OUT5L_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_5R,
-			MADERA_OUT5R_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_6L,
-			MADERA_OUT6L_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-	SOC_ENUM_SINGLE(MADERA_OUTPUT_PATH_CONFIG_6R,
-			MADERA_OUT6R_ANC_SRC_SHIFT,
-			ARRAY_SIZE(madera_out_anc_src_text),
-			madera_out_anc_src_text),
-};
-EXPORT_SYMBOL_GPL(madera_output_anc_src);
-
-static const char * const madera_ip_mode_text[2] = {
-	"Analog", "Digital",
-};
-
-const struct soc_enum madera_ip_mode[] = {
-	SOC_ENUM_SINGLE(MADERA_IN1L_CONTROL, MADERA_IN1_MODE_SHIFT,
-		ARRAY_SIZE(madera_ip_mode_text), madera_ip_mode_text),
-	SOC_ENUM_SINGLE(MADERA_IN2L_CONTROL, MADERA_IN2_MODE_SHIFT,
-		ARRAY_SIZE(madera_ip_mode_text), madera_ip_mode_text),
-	SOC_ENUM_SINGLE(MADERA_IN3L_CONTROL, MADERA_IN3_MODE_SHIFT,
-		ARRAY_SIZE(madera_ip_mode_text), madera_ip_mode_text),
-};
-EXPORT_SYMBOL_GPL(madera_ip_mode);
-
-int madera_ip_mode_put(struct snd_kcontrol *kcontrol,
-		       struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
-	unsigned int reg, ret = 0;
-
-	snd_soc_dapm_mutex_lock(dapm);
-
-	/* Cannot change input mode on an active input*/
-	reg = snd_soc_read(codec, MADERA_INPUT_ENABLES);
-
-	switch (e->reg) {
-	case MADERA_IN1L_CONTROL:
-		if (reg & (MADERA_IN1L_ENA_MASK |MADERA_IN1R_ENA_MASK)) {
-			ret = -EBUSY;
-			goto exit;
-		}
-		break;
-	case MADERA_IN2L_CONTROL:
-		if (reg & (MADERA_IN2L_ENA_MASK |MADERA_IN2R_ENA_MASK)) {
-			ret = -EBUSY;
-			goto exit;
-		}
-		break;
-	case MADERA_IN3L_CONTROL:
-		if (reg & (MADERA_IN3L_ENA_MASK |MADERA_IN3R_ENA_MASK)) {
-			ret = -EBUSY;
-			goto exit;
-		}
-		break;
-	default:
-		ret = -EINVAL;
-		goto exit;
-		break;
-	}
-
-	ret = snd_soc_put_enum_double(kcontrol, ucontrol);
-exit:
-	snd_soc_dapm_mutex_unlock(dapm);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_ip_mode_put);
-
-int madera_in_rate_put(struct snd_kcontrol *kcontrol,
-		       struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
-	unsigned int reg, mask;
-	int ret = 0;
-
-	snd_soc_dapm_mutex_lock(dapm);
-
-	/* Cannot change rate on an active input */
-	reg = snd_soc_read(codec, MADERA_INPUT_ENABLES);
-	mask = (e->reg - MADERA_IN1L_CONTROL) / 4;
-	mask ^= 0x1; /* Flip bottom bit for channel order */
-
-	if ((reg) & (1 << mask)) {
-		ret = -EBUSY;
-		goto exit;
-	}
-
-	ret = snd_soc_put_enum_double(kcontrol, ucontrol);
-exit:
-	snd_soc_dapm_mutex_unlock(dapm);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_in_rate_put);
-
-int madera_dfc_put(struct snd_kcontrol *kcontrol,
-		   struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
-	unsigned int reg = e->reg;
-	unsigned int val;
-	int ret = 0;
-
-	reg = ((reg / 6) * 6) - 2;
-
-	snd_soc_dapm_mutex_lock(dapm);
-
-	/* Cannot change dfc settings when its on */
-	val = snd_soc_read(codec, reg);
-	if (val & MADERA_DFC1_ENA) {
-		ret = -EBUSY;
-		goto exit;
-	}
-
-	ret = snd_soc_put_enum_double(kcontrol, ucontrol);
-exit:
-	snd_soc_dapm_mutex_unlock(dapm);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_dfc_put);
-
-int madera_lp_mode_put(struct snd_kcontrol *kcontrol,
-		       struct snd_ctl_elem_value *ucontrol)
-{
-	struct soc_mixer_control *mc =
-		(struct soc_mixer_control *)kcontrol->private_value;
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	unsigned int reg, mask;
-	int ret;
-
-	snd_soc_dapm_mutex_lock(dapm);
-
-	/* Cannot change lp mode on an active input */
-	reg = snd_soc_read(codec, MADERA_INPUT_ENABLES);
-	mask = (mc->reg - MADERA_ADC_DIGITAL_VOLUME_1L) / 4;
-	mask ^= 0x1; /* Flip bottom bit for channel order */
-
-	if ((reg) & (1 << mask)) {
-		ret = -EBUSY;
-		dev_err(codec->dev,
-			"Can't change lp mode on an active input\n");
-		goto exit;
-	}
-
-	ret = snd_soc_put_volsw(kcontrol, ucontrol);
-
-exit:
-	snd_soc_dapm_mutex_unlock(dapm);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_lp_mode_put);
-
-const struct snd_kcontrol_new madera_dsp_trigger_output_mux[] = {
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-};
-EXPORT_SYMBOL_GPL(madera_dsp_trigger_output_mux);
-
-const struct snd_kcontrol_new madera_drc_activity_output_mux[] = {
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-	SOC_DAPM_SINGLE("Switch", SND_SOC_NOPM, 0, 1, 0),
-};
-EXPORT_SYMBOL_GPL(madera_drc_activity_output_mux);
-
-static void madera_in_set_vu(struct madera_priv *priv, bool enable)
-{
-	unsigned int val;
-	int i, ret;
-
-	if (enable)
-		val = MADERA_IN_VU;
-	else
-		val = 0;
-
-	for (i = 0; i < priv->num_inputs; i++) {
-		ret = regmap_update_bits(priv->madera->regmap,
-				    MADERA_ADC_DIGITAL_VOLUME_1L + (i * 4),
-				    MADERA_IN_VU, val);
-		if (ret)
-			dev_warn(priv->madera->dev,
-				 "Failed to modify VU bits: %d\n", ret);
-	}
-}
-
-int madera_in_ev(struct snd_soc_dapm_widget *w, struct snd_kcontrol *kcontrol,
-		 int event)
-{
-	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	unsigned int ctrl;
-	unsigned int reg;
-
-	if (w->shift % 2) {
-		reg = MADERA_ADC_DIGITAL_VOLUME_1L + ((w->shift / 2) * 8);
-		ctrl = reg - 1;
-	} else {
-		reg = MADERA_ADC_DIGITAL_VOLUME_1R + ((w->shift / 2) * 8);
-		ctrl = reg - 5;
-	}
-
-	switch (event) {
-	case SND_SOC_DAPM_PRE_PMU:
-		priv->in_pending++;
-		break;
-	case SND_SOC_DAPM_POST_PMU:
-		priv->in_pending--;
-		snd_soc_update_bits(codec, reg, MADERA_IN1L_MUTE, 0);
-
-		/* If this is the last input pending then allow VU */
-		if (priv->in_pending == 0) {
-			msleep(1);
-			madera_in_set_vu(priv, true);
-		}
-		break;
-	case SND_SOC_DAPM_PRE_PMD:
-		snd_soc_update_bits(codec, reg,
-				    MADERA_IN1L_MUTE | MADERA_IN_VU,
-				    MADERA_IN1L_MUTE | MADERA_IN_VU);
-		break;
-	case SND_SOC_DAPM_POST_PMD:
-		/* Disable volume updates if no inputs are enabled */
-		reg = snd_soc_read(codec, MADERA_INPUT_ENABLES);
-		if (reg == 0)
-			madera_in_set_vu(priv, false);
-		break;
-	default:
-		break;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_in_ev);
-
-int madera_put_dre(struct snd_kcontrol *kcontrol,
-		   struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	int ret;
-
-	snd_soc_dapm_mutex_lock(dapm);
-
-	ret = snd_soc_put_volsw(kcontrol, ucontrol);
-
-	snd_soc_dapm_mutex_unlock(dapm);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_put_dre);
-
-int madera_out_ev(struct snd_soc_dapm_widget *w,
-		  struct snd_kcontrol *kcontrol, int event)
-{
-	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	int out_up_delay;
-
-	switch (madera->type) {
-	case CS47L90:
-	case CS47L91:
-	case CS47L92:
-	case CS47L93:
-		out_up_delay = 6;
-		break;
-	default:
-		out_up_delay = 17;
-		break;
-	}
-
-	switch (event) {
-	case SND_SOC_DAPM_PRE_PMU:
-		switch (w->shift) {
-		case MADERA_OUT1L_ENA_SHIFT:
-		case MADERA_OUT1R_ENA_SHIFT:
-		case MADERA_OUT2L_ENA_SHIFT:
-		case MADERA_OUT2R_ENA_SHIFT:
-		case MADERA_OUT3L_ENA_SHIFT:
-		case MADERA_OUT3R_ENA_SHIFT:
-			priv->out_up_pending++;
-			priv->out_up_delay += out_up_delay;
-			break;
-		default:
-			break;
-		}
-		break;
-
-	case SND_SOC_DAPM_POST_PMU:
-		switch (w->shift) {
-		case MADERA_OUT1L_ENA_SHIFT:
-		case MADERA_OUT1R_ENA_SHIFT:
-		case MADERA_OUT2L_ENA_SHIFT:
-		case MADERA_OUT2R_ENA_SHIFT:
-		case MADERA_OUT3L_ENA_SHIFT:
-		case MADERA_OUT3R_ENA_SHIFT:
-			priv->out_up_pending--;
-			if (!priv->out_up_pending) {
-				if (priv->out_up_delay < 20) {
-					int delay = priv->out_up_delay * 1000;
-
-					usleep_range(delay, delay + 1000);
-				} else {
-					msleep(priv->out_up_delay);
-				}
-				priv->out_up_delay = 0;
-			}
-			break;
-
-		default:
-			break;
-		}
-		break;
-
-	case SND_SOC_DAPM_PRE_PMD:
-		switch (w->shift) {
-		case MADERA_OUT1L_ENA_SHIFT:
-		case MADERA_OUT1R_ENA_SHIFT:
-		case MADERA_OUT2L_ENA_SHIFT:
-		case MADERA_OUT2R_ENA_SHIFT:
-		case MADERA_OUT3L_ENA_SHIFT:
-		case MADERA_OUT3R_ENA_SHIFT:
-			priv->out_down_pending++;
-			priv->out_down_delay++;
-			break;
-		default:
-			break;
-		}
-		break;
-
-	case SND_SOC_DAPM_POST_PMD:
-		switch (w->shift) {
-		case MADERA_OUT1L_ENA_SHIFT:
-		case MADERA_OUT1R_ENA_SHIFT:
-		case MADERA_OUT2L_ENA_SHIFT:
-		case MADERA_OUT2R_ENA_SHIFT:
-		case MADERA_OUT3L_ENA_SHIFT:
-		case MADERA_OUT3R_ENA_SHIFT:
-			priv->out_down_pending--;
-			if (!priv->out_down_pending) {
-				msleep(priv->out_down_delay);
-				priv->out_down_delay = 0;
-			}
-			break;
-		default:
-			break;
-		}
-		break;
-	default:
-		break;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_out_ev);
-
-int madera_hp_ev(struct snd_soc_dapm_widget *w,
-		 struct snd_kcontrol *kcontrol, int event)
-{
-	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	unsigned int mask = 1 << w->shift;
-	unsigned int out_num;
-	unsigned int val;
-	unsigned int ep_sel = 0;
-
-	switch (event) {
-	case SND_SOC_DAPM_POST_PMU:
-		val = mask;
-		break;
-	case SND_SOC_DAPM_PRE_PMD:
-		val = 0;
-		break;
-	case SND_SOC_DAPM_PRE_PMU:
-	case SND_SOC_DAPM_POST_PMD:
-		return madera_out_ev(w, kcontrol, event);
-	default:
-		return 0;
-	}
-
-	for (out_num = 0; out_num < MADERA_MAX_ACCESSORY; out_num++)
-		if (madera->pdata.accdet[out_num].output == w->shift / 2 + 1)
-			break;
-
-	if (out_num == MADERA_MAX_ACCESSORY) {
-		/* No accdet node associated with this output */
-		regmap_update_bits_async(madera->regmap,
-					 MADERA_OUTPUT_ENABLES_1,
-					 mask, val);
-		return madera_out_ev(w, kcontrol, event);
-	}
-
-	/* Store the desired state for the HP outputs */
-	priv->madera->hp_ena &= ~mask;
-	priv->madera->hp_ena |= val;
-
-	/* in case of parts with muxed outputs, check if EPOUT is set and do
-	 * not disable the muxed output in this case
-	 */
-	switch (madera->type) {
-	case CS47L92:
-	case CS47L93:
-		if (w->shift != MADERA_OUT3L_ENA_SHIFT &&
-		    w->shift != MADERA_OUT3R_ENA_SHIFT)
-			break;
-		/* fall through if this is the muxed output */
-	default:
-		regmap_read(priv->madera->regmap, MADERA_OUTPUT_ENABLES_1,
-			    &ep_sel);
-		ep_sel &= MADERA_EP_SEL_MASK;
-		break;
-	}
-
-	/* Force off if HPDET clamp is active for this output */
-	if ((priv->madera->hpdet_clamp[out_num] ||
-	    madera_is_hp_shorted(madera, out_num)) && !ep_sel)
-		val = 0;
-
-	regmap_update_bits_async(madera->regmap, MADERA_OUTPUT_ENABLES_1,
-				 mask, val);
-
-	return madera_out_ev(w, kcontrol, event);
-}
-EXPORT_SYMBOL_GPL(madera_hp_ev);
-
-int madera_anc_ev(struct snd_soc_dapm_widget *w, struct snd_kcontrol *kcontrol,
-		  int event)
-{
-	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
-	unsigned int val;
-
-	switch (event) {
-	case SND_SOC_DAPM_POST_PMU:
-		val = 1 << w->shift;
-		break;
-	case SND_SOC_DAPM_PRE_PMD:
-		val = 1 << (w->shift + 1);
-		break;
-	default:
-		return 0;
-	}
-
-	snd_soc_write(codec, MADERA_CLOCK_CONTROL, val);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_anc_ev);
-
-static const unsigned int madera_opclk_ref_48k_rates[] = {
-	6144000,
-	12288000,
-	24576000,
-	49152000,
-};
-
-static const unsigned int madera_opclk_ref_44k1_rates[] = {
-	5644800,
-	11289600,
-	22579200,
-	45158400,
-};
-
-static int madera_set_opclk(struct snd_soc_codec *codec, unsigned int clk,
-			    unsigned int freq)
-{
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	unsigned int reg;
-	const unsigned int *rates;
-	int ref, div, refclk;
-
-	BUILD_BUG_ON(ARRAY_SIZE(madera_opclk_ref_48k_rates) !=
-		     ARRAY_SIZE(madera_opclk_ref_44k1_rates));
-
-	switch (clk) {
-	case MADERA_CLK_OPCLK:
-		reg = MADERA_OUTPUT_SYSTEM_CLOCK;
-		refclk = priv->sysclk;
-		break;
-	case MADERA_CLK_ASYNC_OPCLK:
-		reg = MADERA_OUTPUT_ASYNC_CLOCK;
-		refclk = priv->asyncclk;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (refclk % 4000)
-		rates = madera_opclk_ref_44k1_rates;
-	else
-		rates = madera_opclk_ref_48k_rates;
-
-	for (ref = 0; ref < ARRAY_SIZE(madera_opclk_ref_48k_rates); ++ref) {
-		if (rates[ref] > refclk)
-			continue;
-
-		div = 2;
-		while ((rates[ref] / div >= freq) && (div <= 30)) {
-			if (rates[ref] / div == freq) {
-				dev_dbg(codec->dev, "Configured %dHz OPCLK\n",
-					freq);
-				snd_soc_update_bits(codec, reg,
-						    MADERA_OPCLK_DIV_MASK |
-						    MADERA_OPCLK_SEL_MASK,
-						    (div <<
-						     MADERA_OPCLK_DIV_SHIFT) |
-						    ref);
-				return 0;
-			}
-			div += 2;
-		}
-	}
-
-	dev_err(codec->dev, "Unable to generate %dHz OPCLK\n", freq);
-	return -EINVAL;
-}
-
-static int madera_get_sysclk_setting(unsigned int freq)
-{
-	switch (freq) {
-	case 0:
-	case 5644800:
-	case 6144000:
-		return 0;
-	case 11289600:
-	case 12288000:
-		return MADERA_CLK_12MHZ << MADERA_SYSCLK_FREQ_SHIFT;
-	case 22579200:
-	case 24576000:
-		return MADERA_CLK_24MHZ << MADERA_SYSCLK_FREQ_SHIFT;
-	case 45158400:
-	case 49152000:
-		return MADERA_CLK_49MHZ << MADERA_SYSCLK_FREQ_SHIFT;
-	case 90316800:
-	case 98304000:
-		return MADERA_CLK_98MHZ << MADERA_SYSCLK_FREQ_SHIFT;
-	default:
-		return -EINVAL;
-	}
-}
-
-int madera_get_legacy_dspclk_setting(struct madera *madera, unsigned int freq)
-{
-	switch (freq) {
-	case 0:
-		return 0;
-	case 45158400:
-	case 49152000:
-		switch (madera->type) {
-		case CS47L85:
-		case WM1840:
-			if (madera->rev < 3)
-				return -EINVAL;
-			else
-				return MADERA_CLK_49MHZ <<
-				       MADERA_SYSCLK_FREQ_SHIFT;
-		default:
-			return -EINVAL;
-		}
-	case 135475200:
-	case 147456000:
-		return MADERA_DSP_CLK_147MHZ << MADERA_SYSCLK_FREQ_SHIFT;
-	default:
-		return -EINVAL;
-	}
-}
-EXPORT_SYMBOL_GPL(madera_get_legacy_dspclk_setting);
-
-static int madera_get_dspclk_setting(struct madera *madera,
-				     unsigned int freq,
-				     unsigned int *clock_2_val)
-{
-	switch (madera->type) {
-	case CS47L35:
-	case CS47L85:
-	case WM1840:
-		*clock_2_val = 0; /* don't use MADERA_DSP_CLOCK_2 */
-		return madera_get_legacy_dspclk_setting(madera, freq);
-	default:
-		if (freq > 150000000)
-			return -EINVAL;
-
-		/* Use new exact frequency control */
-		*clock_2_val = freq / 15625; /* freq * (2^6) / (10^6) */
-		return 0;
-	}
-}
-
-static int madera_set_outclk(struct snd_soc_codec *codec, unsigned int source,
-			      unsigned int freq)
-{
-	int div, div_inc, rate;
-
-	switch (source) {
-	case MADERA_OUTCLK_SYSCLK:
-		dev_dbg(codec->dev, "Configured OUTCLK to SYSCLK\n");
-		snd_soc_update_bits(codec, MADERA_OUTPUT_RATE_1,
-				    MADERA_OUT_CLK_SRC_MASK, source);
-		return 0;
-	case MADERA_OUTCLK_ASYNCCLK:
-		dev_dbg(codec->dev, "Configured OUTCLK to ASYNCCLK\n");
-		snd_soc_update_bits(codec, MADERA_OUTPUT_RATE_1,
-				    MADERA_OUT_CLK_SRC_MASK, source);
-		return 0;
-	case MADERA_OUTCLK_MCLK1:
-	case MADERA_OUTCLK_MCLK2:
-	case MADERA_OUTCLK_MCLK3:
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (freq % 4000)
-		rate = 5644800;
-	else
-		rate = 6144000;
-
-	div = 1;
-	div_inc = 0;
-	while (div <= 8) {
-		if (freq / div == rate && !(freq % div)) {
-			dev_dbg(codec->dev, "Configured %dHz OUTCLK\n", rate);
-			snd_soc_update_bits(codec, MADERA_OUTPUT_RATE_1,
-					    MADERA_OUT_EXT_CLK_DIV_MASK |
-					    MADERA_OUT_CLK_SRC_MASK,
-					    (div_inc <<
-					     MADERA_OUT_EXT_CLK_DIV_SHIFT) |
-					    source);
-			return 0;
-		}
-		div_inc++;
-		div *= 2;
-	}
-
-	dev_err(codec->dev, "Unable to generate %dHz OUTCLK from %dHz MCLK\n",
-		rate, freq);
-	return -EINVAL;
-}
-
-int madera_set_sysclk(struct snd_soc_codec *codec, int clk_id,
-		      int source, unsigned int freq, int dir)
-{
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	char *name;
-	unsigned int reg, clock_2_val = 0;
-	unsigned int mask = MADERA_SYSCLK_FREQ_MASK | MADERA_SYSCLK_SRC_MASK;
-	unsigned int val = source << MADERA_SYSCLK_SRC_SHIFT;
-	int clk_freq_sel, *clk;
-	int ret = 0;
-
-	switch (clk_id) {
-	case MADERA_CLK_SYSCLK:
-		name = "SYSCLK";
-		reg = MADERA_SYSTEM_CLOCK_1;
-		clk = &priv->sysclk;
-		clk_freq_sel = madera_get_sysclk_setting(freq);
-		mask |= MADERA_SYSCLK_FRAC;
-		break;
-	case MADERA_CLK_ASYNCCLK:
-		name = "ASYNCCLK";
-		reg = MADERA_ASYNC_CLOCK_1;
-		clk = &priv->asyncclk;
-		clk_freq_sel = madera_get_sysclk_setting(freq);
-		break;
-	case MADERA_CLK_OPCLK:
-	case MADERA_CLK_ASYNC_OPCLK:
-		return madera_set_opclk(codec, clk_id, freq);
-	case MADERA_CLK_DSPCLK:
-		name = "DSPCLK";
-		reg = MADERA_DSP_CLOCK_1;
-		clk = &priv->dspclk;
-		clk_freq_sel = madera_get_dspclk_setting(madera, freq,
-							 &clock_2_val);
-		break;
-	case MADERA_CLK_OUTCLK:
-		return madera_set_outclk(codec, source, freq);
-	default:
-		return -EINVAL;
-	}
-
-	if (clk_freq_sel < 0) {
-		dev_err(madera->dev,
-			"Failed to get clk setting for %dHZ\n", freq);
-		return ret;
-	}
-
-	*clk = freq;
-
-	if (freq == 0) {
-		dev_dbg(madera->dev, "%s cleared\n", name);
-		return 0;
-	}
-
-	val |= clk_freq_sel;
-
-	if (clock_2_val) {
-		ret = regmap_write(madera->regmap, MADERA_DSP_CLOCK_2,
-				   clock_2_val);
-		if (ret) {
-			dev_err(madera->dev,
-				"Failed to write DSP_CONFIG2: %d\n", ret);
-			return ret;
-		}
-
-		/* We're using the frequency setting in MADERA_DSP_CLOCK_2 so
-		 * don't change the frequency select bits in MADERA_DSP_CLOCK_1
-		 */
-		mask = MADERA_SYSCLK_SRC_MASK;
-	}
-
-	if (freq % 6144000)
-		val |= MADERA_SYSCLK_FRAC;
-
-	dev_dbg(madera->dev, "%s set to %uHz", name, freq);
-
-	return regmap_update_bits(madera->regmap, reg, mask, val);
-}
-EXPORT_SYMBOL_GPL(madera_set_sysclk);
-
-static int madera_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
-{
-	struct snd_soc_codec *codec = dai->codec;
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	int lrclk, bclk, mode, base;
-
-	base = dai->driver->base;
-
-	lrclk = 0;
-	bclk = 0;
-
-	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
-	case SND_SOC_DAIFMT_DSP_A:
-		mode = MADERA_FMT_DSP_MODE_A;
-		break;
-	case SND_SOC_DAIFMT_DSP_B:
-		if ((fmt & SND_SOC_DAIFMT_MASTER_MASK)
-				!= SND_SOC_DAIFMT_CBM_CFM) {
-			madera_aif_err(dai, "DSP_B not valid in slave mode\n");
-			return -EINVAL;
-		}
-		mode = MADERA_FMT_DSP_MODE_B;
-		break;
-	case SND_SOC_DAIFMT_I2S:
-		mode = MADERA_FMT_I2S_MODE;
-		break;
-	case SND_SOC_DAIFMT_LEFT_J:
-		if ((fmt & SND_SOC_DAIFMT_MASTER_MASK)
-				!= SND_SOC_DAIFMT_CBM_CFM) {
-			madera_aif_err(dai, "LEFT_J not valid in slave mode\n");
-			return -EINVAL;
-		}
-		mode = MADERA_FMT_LEFT_JUSTIFIED_MODE;
-		break;
-	default:
-		madera_aif_err(dai, "Unsupported DAI format %d\n",
-				fmt & SND_SOC_DAIFMT_FORMAT_MASK);
-		return -EINVAL;
-	}
-
-	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBS_CFS:
-		break;
-	case SND_SOC_DAIFMT_CBS_CFM:
-		lrclk |= MADERA_AIF1TX_LRCLK_MSTR;
-		break;
-	case SND_SOC_DAIFMT_CBM_CFS:
-		bclk |= MADERA_AIF1_BCLK_MSTR;
-		break;
-	case SND_SOC_DAIFMT_CBM_CFM:
-		bclk |= MADERA_AIF1_BCLK_MSTR;
-		lrclk |= MADERA_AIF1TX_LRCLK_MSTR;
-		break;
-	default:
-		madera_aif_err(dai, "Unsupported master mode %d\n",
-				fmt & SND_SOC_DAIFMT_MASTER_MASK);
-		return -EINVAL;
-	}
-
-	switch (fmt & SND_SOC_DAIFMT_INV_MASK) {
-	case SND_SOC_DAIFMT_NB_NF:
-		break;
-	case SND_SOC_DAIFMT_IB_IF:
-		bclk |= MADERA_AIF1_BCLK_INV;
-		lrclk |= MADERA_AIF1TX_LRCLK_INV;
-		break;
-	case SND_SOC_DAIFMT_IB_NF:
-		bclk |= MADERA_AIF1_BCLK_INV;
-		break;
-	case SND_SOC_DAIFMT_NB_IF:
-		lrclk |= MADERA_AIF1TX_LRCLK_INV;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	regmap_update_bits_async(madera->regmap, base + MADERA_AIF_BCLK_CTRL,
-				 MADERA_AIF1_BCLK_INV |
-				 MADERA_AIF1_BCLK_MSTR,
-				 bclk);
-	regmap_update_bits_async(madera->regmap, base + MADERA_AIF_TX_PIN_CTRL,
-				 MADERA_AIF1TX_LRCLK_INV |
-				 MADERA_AIF1TX_LRCLK_MSTR, lrclk);
-	regmap_update_bits_async(madera->regmap,
-				 base + MADERA_AIF_RX_PIN_CTRL,
-				 MADERA_AIF1RX_LRCLK_INV |
-				 MADERA_AIF1RX_LRCLK_MSTR, lrclk);
-	regmap_update_bits(madera->regmap, base + MADERA_AIF_FORMAT,
-			   MADERA_AIF1_FMT_MASK, mode);
-
-	return 0;
-}
-
-static const int madera_48k_bclk_rates[] = {
-	-1,
-	48000,
-	64000,
-	96000,
-	128000,
-	192000,
-	256000,
-	384000,
-	512000,
-	768000,
-	1024000,
-	1536000,
-	2048000,
-	3072000,
-	4096000,
-	6144000,
-	8192000,
-	12288000,
-	24576000,
-};
-
-static const int madera_44k1_bclk_rates[] = {
-	-1,
-	44100,
-	58800,
-	88200,
-	117600,
-	177640,
-	235200,
-	352800,
-	470400,
-	705600,
-	940800,
-	1411200,
-	1881600,
-	2822400,
-	3763200,
-	5644800,
-	7526400,
-	11289600,
-	22579200,
-};
-
-static const unsigned int madera_sr_vals[] = {
-	0,
-	12000,
-	24000,
-	48000,
-	96000,
-	192000,
-	384000,
-	768000,
-	0,
-	11025,
-	22050,
-	44100,
-	88200,
-	176400,
-	352800,
-	705600,
-	4000,
-	8000,
-	16000,
-	32000,
-	64000,
-	128000,
-	256000,
-	512000,
-};
-
-#define MADERA_48K_RATE_MASK	0x0F003E
-#define MADERA_44K1_RATE_MASK	0x003E00
-#define MADERA_RATE_MASK	(MADERA_48K_RATE_MASK | MADERA_44K1_RATE_MASK)
-
-static const struct snd_pcm_hw_constraint_list madera_constraint = {
-	.count	= ARRAY_SIZE(madera_sr_vals),
-	.list	= madera_sr_vals,
-};
-
-static int madera_startup(struct snd_pcm_substream *substream,
-			  struct snd_soc_dai *dai)
-{
-	struct snd_soc_codec *codec = dai->codec;
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera_dai_priv *dai_priv = &priv->dai[dai->id - 1];
-	unsigned int base_rate;
-
-	switch (priv->madera->type) {
-	case WM1840:
-	case CS47L91:
-	case CS47L93:
-		return 0;
-	default:
-		break;
-	}
-
-	if (!substream->runtime)
-		return 0;
-
-	switch (dai_priv->clk) {
-	case MADERA_CLK_SYSCLK:
-	case MADERA_CLK_SYSCLK_2:
-	case MADERA_CLK_SYSCLK_3:
-		base_rate = priv->sysclk;
-		break;
-	case MADERA_CLK_ASYNCCLK:
-	case MADERA_CLK_ASYNCCLK_2:
-		base_rate = priv->asyncclk;
-		break;
-	default:
-		return 0;
-	}
-
-	if (base_rate == 0)
-		dai_priv->constraint.mask = MADERA_RATE_MASK;
-	else if (base_rate % 4000)
-		dai_priv->constraint.mask = MADERA_44K1_RATE_MASK;
-	else
-		dai_priv->constraint.mask = MADERA_48K_RATE_MASK;
-
-	return snd_pcm_hw_constraint_list(substream->runtime, 0,
-					  SNDRV_PCM_HW_PARAM_RATE,
-					  &dai_priv->constraint);
-}
-
-static int madera_hw_params_rate(struct snd_pcm_substream *substream,
-				 struct snd_pcm_hw_params *params,
-				 struct snd_soc_dai *dai)
-{
-	struct snd_soc_codec *codec = dai->codec;
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera_dai_priv *dai_priv = &priv->dai[dai->id - 1];
-	int base = dai->driver->base;
-	int ret = 0, err;
-	int i, sr_val, lim = 0;
-	const unsigned int *sources = NULL;
-	unsigned int cur, tar;
-	bool change_rate = true;
-
-	/* currently we use a single sample rate for SYSCLK */
-	for (i = 0; i < ARRAY_SIZE(madera_sr_vals); i++)
-		if (madera_sr_vals[i] == params_rate(params))
-			break;
-
-	if (i == ARRAY_SIZE(madera_sr_vals)) {
-		madera_aif_err(dai, "Unsupported sample rate %dHz\n",
-				params_rate(params));
-		return -EINVAL;
-	}
-	sr_val = i;
-
-	switch (dai_priv->clk) {
-	case MADERA_CLK_SYSCLK:
-		tar = 0 << MADERA_AIF1_RATE_SHIFT;
-		break;
-	case MADERA_CLK_SYSCLK_2:
-		tar = 1 << MADERA_AIF1_RATE_SHIFT;
-		break;
-	case MADERA_CLK_SYSCLK_3:
-		tar = 2 << MADERA_AIF1_RATE_SHIFT;
-		break;
-	case MADERA_CLK_ASYNCCLK:
-		tar = 8 << MADERA_AIF1_RATE_SHIFT;
-		break;
-	case MADERA_CLK_ASYNCCLK_2:
-		tar = 9 << MADERA_AIF1_RATE_SHIFT;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	ret = regmap_read(priv->madera->regmap,
-			  base + MADERA_AIF_RATE_CTRL, &cur);
-	if (ret != 0) {
-		madera_aif_err(dai, "Failed to check rate: %d\n", ret);
-		return ret;
-	}
-
-	if ((cur & MADERA_AIF1_RATE_MASK) == (tar & MADERA_AIF1_RATE_MASK))
-		change_rate = false;
-
-	if (change_rate) {
-		ret = madera_get_sources(dai, &sources, &lim);
-		if (ret != 0) {
-			madera_aif_err(dai,
-					"Failed to get aif sources %d\n", ret);
-			return ret;
-		}
-
-		mutex_lock(&priv->rate_lock);
-
-		ret = madera_cache_and_clear_sources(priv, sources,
-						     priv->aif_sources_cache,
-						     lim);
-		if (ret != 0) {
-			madera_aif_err(dai,
-				"Failed to cache and clear aif sources: %d\n",
-				ret);
-			goto out;
-		}
-
-		madera_spin_sysclk(priv);
-	}
-
-	switch (dai_priv->clk) {
-	case MADERA_CLK_SYSCLK:
-		snd_soc_update_bits(codec, MADERA_SAMPLE_RATE_1,
-				    MADERA_SAMPLE_RATE_1_MASK, sr_val);
-		if (base)
-			snd_soc_update_bits(codec, base + MADERA_AIF_RATE_CTRL,
-					    MADERA_AIF1_RATE_MASK,
-					    0 << MADERA_AIF1_RATE_SHIFT);
-		break;
-	case MADERA_CLK_SYSCLK_2:
-		snd_soc_update_bits(codec, MADERA_SAMPLE_RATE_2,
-				    MADERA_SAMPLE_RATE_2_MASK, sr_val);
-		if (base)
-			snd_soc_update_bits(codec, base + MADERA_AIF_RATE_CTRL,
-					    MADERA_AIF1_RATE_MASK,
-					    1 << MADERA_AIF1_RATE_SHIFT);
-		break;
-	case MADERA_CLK_SYSCLK_3:
-		snd_soc_update_bits(codec, MADERA_SAMPLE_RATE_3,
-				    MADERA_SAMPLE_RATE_3_MASK, sr_val);
-		if (base)
-			snd_soc_update_bits(codec, base + MADERA_AIF_RATE_CTRL,
-					    MADERA_AIF1_RATE_MASK,
-					    2 << MADERA_AIF1_RATE_SHIFT);
-		break;
-	case MADERA_CLK_ASYNCCLK:
-		snd_soc_update_bits(codec, MADERA_ASYNC_SAMPLE_RATE_1,
-				    MADERA_ASYNC_SAMPLE_RATE_1_MASK, sr_val);
-		if (base)
-			snd_soc_update_bits(codec, base + MADERA_AIF_RATE_CTRL,
-					    MADERA_AIF1_RATE_MASK,
-					    8 << MADERA_AIF1_RATE_SHIFT);
-		break;
-	case MADERA_CLK_ASYNCCLK_2:
-		snd_soc_update_bits(codec, MADERA_ASYNC_SAMPLE_RATE_2,
-				    MADERA_ASYNC_SAMPLE_RATE_2_MASK, sr_val);
-		if (base)
-			snd_soc_update_bits(codec, base + MADERA_AIF_RATE_CTRL,
-					    MADERA_AIF1_RATE_MASK,
-					    9 << MADERA_AIF1_RATE_SHIFT);
-		break;
-	default:
-		madera_aif_err(dai, "Invalid clock %d\n", dai_priv->clk);
-		ret = -EINVAL;
-	}
-
-	if (change_rate)
-		madera_spin_sysclk(priv);
-
-out:
-	if (change_rate) {
-		err = madera_restore_sources(priv, sources,
-					     priv->aif_sources_cache, lim);
-		if (err != 0) {
-			madera_aif_err(dai,
-					"Failed to restore sources: %d\n", err);
-		}
-
-		mutex_unlock(&priv->rate_lock);
-	}
-	return ret;
-}
-
-static bool madera_aif_cfg_changed(struct snd_soc_codec *codec,
-				   int base, int bclk, int lrclk, int frame)
-{
-	int val;
-
-	val = snd_soc_read(codec, base + MADERA_AIF_BCLK_CTRL);
-	if (bclk != (val & MADERA_AIF1_BCLK_FREQ_MASK))
-		return true;
-
-	val = snd_soc_read(codec, base + MADERA_AIF_TX_BCLK_RATE);
-	if (lrclk != (val & MADERA_AIF1TX_BCPF_MASK))
-		return true;
-
-	val = snd_soc_read(codec, base + MADERA_AIF_FRAME_CTRL_1);
-	if (frame != (val & (MADERA_AIF1TX_WL_MASK |
-			     MADERA_AIF1TX_SLOT_LEN_MASK)))
-		return true;
-
-	return false;
-}
-
-static int madera_hw_params(struct snd_pcm_substream *substream,
-			    struct snd_pcm_hw_params *params,
-			    struct snd_soc_dai *dai)
-{
-	struct snd_soc_codec *codec = dai->codec;
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	int base = dai->driver->base;
-	const int *rates;
-	int i, ret, val;
-	int channels = params_channels(params);
-	int chan_limit = madera->pdata.codec.max_channels_clocked[dai->id - 1];
-	int tdm_width = priv->tdm_width[dai->id - 1];
-	int tdm_slots = priv->tdm_slots[dai->id - 1];
-	int bclk, lrclk, wl, frame, bclk_target;
-	bool reconfig;
-	unsigned int aif_tx_state = 0, aif_rx_state = 0;
-
-	if (params_rate(params) % 4000)
-		rates = &madera_44k1_bclk_rates[0];
-	else
-		rates = &madera_48k_bclk_rates[0];
-
-	wl = snd_pcm_format_width(params_format(params));
-
-	if (tdm_slots) {
-		madera_aif_dbg(dai, "Configuring for %d %d bit TDM slots\n",
-				tdm_slots, tdm_width);
-		bclk_target = tdm_slots * tdm_width * params_rate(params);
-		channels = tdm_slots;
-	} else {
-		bclk_target = snd_soc_params_to_bclk(params);
-		tdm_width = wl;
-	}
-
-	if (chan_limit && chan_limit < channels) {
-		madera_aif_dbg(dai, "Limiting to %d channels\n", chan_limit);
-		bclk_target /= channels;
-		bclk_target *= chan_limit;
-	}
-
-	/* Force multiple of 2 channels for I2S mode */
-	val = snd_soc_read(codec, base + MADERA_AIF_FORMAT);
-	val &= MADERA_AIF1_FMT_MASK;
-	if ((channels & 1) && (val == MADERA_FMT_I2S_MODE)) {
-		madera_aif_dbg(dai, "Forcing stereo mode\n");
-		bclk_target /= channels;
-		bclk_target *= channels + 1;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(madera_44k1_bclk_rates); i++) {
-		if (rates[i] >= bclk_target &&
-		    rates[i] % params_rate(params) == 0) {
-			bclk = i;
-			break;
-		}
-	}
-	if (i == ARRAY_SIZE(madera_44k1_bclk_rates)) {
-		madera_aif_err(dai, "Unsupported sample rate %dHz\n",
-				params_rate(params));
-		return -EINVAL;
-	}
-
-	lrclk = rates[bclk] / params_rate(params);
-
-	madera_aif_dbg(dai, "BCLK %dHz LRCLK %dHz\n",
-			rates[bclk], rates[bclk] / lrclk);
-
-	frame = wl << MADERA_AIF1TX_WL_SHIFT | tdm_width;
-
-	reconfig = madera_aif_cfg_changed(codec, base, bclk, lrclk, frame);
-
-	if (reconfig) {
-		/* Save AIF TX/RX state */
-		aif_tx_state = snd_soc_read(codec,
-					    base + MADERA_AIF_TX_ENABLES);
-		aif_rx_state = snd_soc_read(codec,
-					    base + MADERA_AIF_RX_ENABLES);
-		/* Disable AIF TX/RX before reconfiguring it */
-		regmap_update_bits_async(madera->regmap,
-				    base + MADERA_AIF_TX_ENABLES, 0xff, 0x0);
-		regmap_update_bits(madera->regmap,
-				    base + MADERA_AIF_RX_ENABLES, 0xff, 0x0);
-	}
-
-	ret = madera_hw_params_rate(substream, params, dai);
-	if (ret != 0)
-		goto restore_aif;
-
-	if (reconfig) {
-		regmap_update_bits_async(madera->regmap,
-					 base + MADERA_AIF_BCLK_CTRL,
-					 MADERA_AIF1_BCLK_FREQ_MASK, bclk);
-		regmap_update_bits_async(madera->regmap,
-					 base + MADERA_AIF_TX_BCLK_RATE,
-					 MADERA_AIF1TX_BCPF_MASK, lrclk);
-		regmap_update_bits_async(madera->regmap,
-					 base + MADERA_AIF_RX_BCLK_RATE,
-					 MADERA_AIF1RX_BCPF_MASK, lrclk);
-		regmap_update_bits_async(madera->regmap,
-					 base + MADERA_AIF_FRAME_CTRL_1,
-					 MADERA_AIF1TX_WL_MASK |
-					 MADERA_AIF1TX_SLOT_LEN_MASK, frame);
-		regmap_update_bits(madera->regmap,
-				   base + MADERA_AIF_FRAME_CTRL_2,
-				   MADERA_AIF1RX_WL_MASK |
-				   MADERA_AIF1RX_SLOT_LEN_MASK, frame);
-	}
-
-restore_aif:
-	if (reconfig) {
-		/* Restore AIF TX/RX state */
-		regmap_update_bits_async(madera->regmap,
-					 base + MADERA_AIF_TX_ENABLES,
-					 0xff, aif_tx_state);
-		regmap_update_bits(madera->regmap,
-				   base + MADERA_AIF_RX_ENABLES,
-				   0xff, aif_rx_state);
-	}
-	return ret;
-}
-
-static const char * const madera_dai_clk_str(int clk_id)
-{
-	switch (clk_id) {
-	case MADERA_CLK_SYSCLK:
-	case MADERA_CLK_SYSCLK_2:
-	case MADERA_CLK_SYSCLK_3:
-		return "SYSCLK";
-	case MADERA_CLK_ASYNCCLK:
-	case MADERA_CLK_ASYNCCLK_2:
-		return "ASYNCCLK";
-	default:
-		return "Unknown clock";
-	}
-}
-
-static int madera_dai_set_sysclk(struct snd_soc_dai *dai,
-				 int clk_id, unsigned int freq, int dir)
-{
-	struct snd_soc_codec *codec = dai->codec;
-	struct snd_soc_dapm_context *dapm = snd_soc_codec_get_dapm(codec);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera_dai_priv *dai_priv = &priv->dai[dai->id - 1];
-	struct snd_soc_dapm_route routes[2];
-
-	switch (clk_id) {
-	case MADERA_CLK_SYSCLK:
-	case MADERA_CLK_SYSCLK_2:
-	case MADERA_CLK_SYSCLK_3:
-	case MADERA_CLK_ASYNCCLK:
-	case MADERA_CLK_ASYNCCLK_2:
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (clk_id == dai_priv->clk)
-		return 0;
-
-	if (dai->active) {
-		dev_err(codec->dev, "Can't change clock on active DAI %d\n",
-			dai->id);
-		return -EBUSY;
-	}
-
-	dev_dbg(codec->dev, "Setting AIF%d to %s\n", dai->id + 1,
-		madera_dai_clk_str(clk_id));
-
-	memset(&routes, 0, sizeof(routes));
-	routes[0].sink = dai->driver->capture.stream_name;
-	routes[1].sink = dai->driver->playback.stream_name;
-
-	switch (clk_id) {
-	case MADERA_CLK_SYSCLK:
-	case MADERA_CLK_SYSCLK_2:
-	case MADERA_CLK_SYSCLK_3:
-		routes[0].source = madera_dai_clk_str(dai_priv->clk);
-		routes[1].source = madera_dai_clk_str(dai_priv->clk);
-		snd_soc_dapm_del_routes(dapm, routes, ARRAY_SIZE(routes));
-		break;
-	default:
-		break;
-	}
-
-	switch (clk_id) {
-	case MADERA_CLK_ASYNCCLK:
-	case MADERA_CLK_ASYNCCLK_2:
-		routes[0].source = madera_dai_clk_str(clk_id);
-		routes[1].source = madera_dai_clk_str(clk_id);
-		snd_soc_dapm_add_routes(dapm, routes, ARRAY_SIZE(routes));
-		break;
-	default:
-		break;
-	}
-
-	dai_priv->clk = clk_id;
-
-	return snd_soc_dapm_sync(dapm);
-}
-
-static int madera_set_tristate(struct snd_soc_dai *dai, int tristate)
-{
-	struct snd_soc_codec *codec = dai->codec;
-	int base = dai->driver->base;
-	unsigned int reg;
-	int ret;
-
-	if (tristate)
-		reg = MADERA_AIF1_TRI;
-	else
-		reg = 0;
-
-	ret = snd_soc_update_bits(codec, base + MADERA_AIF_RATE_CTRL,
-				  MADERA_AIF1_TRI, reg);
-	if (ret < 0)
-		return ret;
-	else
-		return 0;
-}
-
-static void madera_set_channels_to_mask(struct snd_soc_dai *dai,
-					unsigned int base,
-					int channels, unsigned int mask)
-{
-	struct snd_soc_codec *codec = dai->codec;
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	int slot, i;
-
-	for (i = 0; i < channels; ++i) {
-		slot = ffs(mask) - 1;
-		if (slot < 0)
-			return;
-
-		regmap_write(madera->regmap, base + i, slot);
-
-		mask &= ~(1 << slot);
-	}
-
-	if (mask)
-		madera_aif_warn(dai, "Too many channels in TDM mask\n");
-}
-
-static int madera_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
-				unsigned int rx_mask, int slots, int slot_width)
-{
-	struct snd_soc_codec *codec = dai->codec;
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	int base = dai->driver->base;
-	int rx_max_chan = dai->driver->playback.channels_max;
-	int tx_max_chan = dai->driver->capture.channels_max;
-
-	/* Only support TDM for the physical AIFs */
-	if (dai->id > MADERA_MAX_AIF)
-		return -ENOTSUPP;
-
-	if (slots == 0) {
-		tx_mask = (1 << tx_max_chan) - 1;
-		rx_mask = (1 << rx_max_chan) - 1;
-	}
-
-	madera_set_channels_to_mask(dai, base + MADERA_AIF_FRAME_CTRL_3,
-				    tx_max_chan, tx_mask);
-	madera_set_channels_to_mask(dai, base + MADERA_AIF_FRAME_CTRL_11,
-				    rx_max_chan, rx_mask);
-
-	priv->tdm_width[dai->id - 1] = slot_width;
-	priv->tdm_slots[dai->id - 1] = slots;
-
-	return 0;
-}
-
-const struct snd_soc_dai_ops madera_dai_ops = {
-	.startup = madera_startup,
-	.set_fmt = madera_set_fmt,
-	.set_tdm_slot = madera_set_tdm_slot,
-	.hw_params = madera_hw_params,
-	.set_sysclk = madera_dai_set_sysclk,
-	.set_tristate = madera_set_tristate,
-};
-EXPORT_SYMBOL_GPL(madera_dai_ops);
-
-const struct snd_soc_dai_ops madera_simple_dai_ops = {
-	.startup = madera_startup,
-	.hw_params = madera_hw_params_rate,
-	.set_sysclk = madera_dai_set_sysclk,
-};
-EXPORT_SYMBOL_GPL(madera_simple_dai_ops);
-
-int madera_init_dai(struct madera_priv *priv, int id)
-{
-	struct madera_dai_priv *dai_priv = &priv->dai[id];
-
-	dai_priv->clk = MADERA_CLK_SYSCLK;
-	dai_priv->constraint = madera_constraint;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_init_dai);
-
-static const struct {
-	unsigned int min;
-	unsigned int max;
-	u16 fratio;
-	int ratio;
-} fll_sync_fratios[] = {
-	{       0,    64000, 4, 16 },
-	{   64000,   128000, 3,  8 },
-	{  128000,   256000, 2,  4 },
-	{  256000,  1000000, 1,  2 },
-	{ 1000000, 13500000, 0,  1 },
-};
-
-static const unsigned int pseudo_fref_max[MADERA_FLL_MAX_FRATIO] = {
-	13500000,
-	 6144000,
-	 6144000,
-	 3072000,
-	 3072000,
-	 2822400,
-	 2822400,
-	 1536000,
-	 1536000,
-	 1536000,
-	 1536000,
-	 1536000,
-	 1536000,
-	 1536000,
-	 1536000,
-	  768000,
-};
-
-struct madera_fll_gains {
-	unsigned int min;
-	unsigned int max;
-	int gain;		/* main gain */
-	int alt_gain;		/* alternate integer gain */
-};
-
-static const struct madera_fll_gains madera_fll_sync_gains[] = {
-	{       0,   256000, 0, -1 },
-	{  256000,  1000000, 2, -1 },
-	{ 1000000, 13500000, 4, -1 },
-};
-
-static const struct madera_fll_gains madera_fll_main_gains[] = {
-	{       0,   100000, 0, 2 },
-	{  100000,   375000, 2, 2 },
-	{  375000,   768000, 3, 2 },
-	{  768001,  1500000, 3, 3 },
-	{ 1500000,  6000000, 4, 3 },
-	{ 6000000, 13500000, 5, 3 },
-};
-
-static int madera_validate_fll(struct madera_fll *fll,
-				unsigned int Fref,
-				unsigned int Fout)
-{
-	switch (fll->madera->type) {
-	case WM1840:
-	case CS47L91:
-	case CS47L93:
-		return 0;
-	default:
-		break;
-	}
-
-	if (fll->fout && Fout != fll->fout) {
-		madera_fll_err(fll, "Can't change output on active FLL\n");
-		return -EINVAL;
-	}
-
-	if (Fref / MADERA_FLL_MAX_REFDIV > MADERA_FLL_MAX_FREF) {
-		madera_fll_err(fll,
-				"Can't scale %dMHz in to <=13.5MHz\n", Fref);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int madera_find_sync_fratio(unsigned int fref, int *fratio)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(fll_sync_fratios); i++) {
-		if (fll_sync_fratios[i].min <= fref &&
-		    fref <= fll_sync_fratios[i].max) {
-			if (fratio)
-				*fratio = fll_sync_fratios[i].fratio;
-
-			return fll_sync_fratios[i].ratio;
-		}
-	}
-
-	return -EINVAL;
-}
-
-static int madera_find_main_fratio(unsigned int fref, unsigned int fout,
-				   int *fratio)
-{
-	int ratio = 1;
-
-	while ((fout / (ratio * fref)) > MADERA_FLL_MAX_N)
-		ratio++;
-
-	if (fratio)
-		*fratio = ratio - 1;
-
-	return ratio;
-}
-
-static int madera_find_fratio(struct madera_fll *fll, unsigned int fref,
-			      bool sync, int *fratio)
-{
-	switch (fll->madera->type) {
-	case CS47L35:
-		switch(fll->madera->rev) {
-		case 0:
-			/* rev A0 uses sync calculation for both loops */
-			return madera_find_sync_fratio(fref, fratio);
-		default:
-			if (sync)
-				return madera_find_sync_fratio(fref, fratio);
-			else
-				return madera_find_main_fratio(fref,
-							       fll->fout,
-							       fratio);
-		}
-		break;
-	case CS47L85:
-	case WM1840:
-		/* these use the same calculation for main and sync loops */
-		return madera_find_sync_fratio(fref, fratio);
-	default:
-		if (sync)
-			return madera_find_sync_fratio(fref, fratio);
-		else
-			return madera_find_main_fratio(fref, fll->fout, fratio);
-	}
-}
-
-static int madera_calc_fratio(struct madera_fll *fll,
-			      struct madera_fll_cfg *cfg,
-			      unsigned int Fref, bool sync)
-{
-	int init_ratio, ratio;
-	int refdiv, div;
-
-	/* Fref must be <=13.5MHz, find initial refdiv */
-	div = 1;
-	cfg->refdiv = 0;
-	while (Fref > MADERA_FLL_MAX_FREF) {
-		div *= 2;
-		Fref /= 2;
-		cfg->refdiv++;
-
-		if (div > MADERA_FLL_MAX_REFDIV)
-			return -EINVAL;
-	}
-
-	/* Find an appropriate FLL_FRATIO */
-	init_ratio = madera_find_fratio(fll, Fref, sync, &cfg->fratio);
-	if (init_ratio < 0) {
-		madera_fll_err(fll, "Unable to find FRATIO for Fref=%uHz\n",
-				Fref);
-		return init_ratio;
-	}
-
-	if (!sync)
-		cfg->fratio = init_ratio - 1;
-
-	switch (fll->madera->type) {
-	case CS47L35:
-		switch (fll->madera->rev) {
-		case 0:
-			if (sync)
-				return init_ratio;
-			break;
-		default:
-			return init_ratio;
-		}
-		break;
-	case CS47L85:
-	case WM1840:
-		if (sync)
-			return init_ratio;
-		break;
-	default:
-		return init_ratio;
-	}
-
-	/* For CS47L35 rev A0, CS47L85 and WM1840 adjust FRATIO/refdiv to avoid
-	 * integer mode if possible
-	 */
-	refdiv = cfg->refdiv;
-
-	while (div <= MADERA_FLL_MAX_REFDIV) {
-		/* start from init_ratio because this may already give a
-		 * fractional N.K
-		 */
-		for (ratio = init_ratio; ratio > 0; ratio--) {
-			if (fll->fout % (ratio * Fref)) {
-				cfg->refdiv = refdiv;
-				cfg->fratio = ratio - 1;
-				return ratio;
-			}
-		}
-
-		for (ratio = init_ratio + 1; ratio <= MADERA_FLL_MAX_FRATIO;
-		     ratio++) {
-			if ((MADERA_FLL_VCO_CORNER / 2) /
-			    (MADERA_FLL_VCO_MULT * ratio) < Fref)
-				break;
-
-			if (Fref > pseudo_fref_max[ratio - 1])
-				break;
-
-			if (fll->fout % (ratio * Fref)) {
-				cfg->refdiv = refdiv;
-				cfg->fratio = ratio - 1;
-				return ratio;
-			}
-		}
-
-		div *= 2;
-		Fref /= 2;
-		refdiv++;
-		init_ratio = madera_find_fratio(fll, Fref, sync, NULL);
-	}
-
-	madera_fll_warn(fll, "Falling back to integer mode operation\n");
-	return cfg->fratio + 1;
-}
-
-static int madera_find_fll_gain(struct madera_fll *fll,
-				struct madera_fll_cfg *cfg,
-				unsigned int fref,
-				const struct madera_fll_gains *gains,
-				int n_gains)
-{
-	int i;
-
-	for (i = 0; i < n_gains; i++) {
-		if (gains[i].min <= fref && fref <= gains[i].max) {
-			cfg->gain = gains[i].gain;
-			cfg->alt_gain = gains[i].alt_gain;
-			return 0;
-		}
-	}
-
-	madera_fll_err(fll, "Unable to find gain for fref=%uHz\n", fref);
-
-	return -EINVAL;
-}
-
-static int madera_calc_fll(struct madera_fll *fll,
-			   struct madera_fll_cfg *cfg,
-			   unsigned int fref, bool sync)
-{
-	unsigned int gcd_fll;
-	const struct madera_fll_gains *gains;
-	int n_gains;
-	int ratio, ret;
-
-	madera_fll_dbg(fll, "fref=%u Fout=%u fvco=%u\n",
-			fref, fll->fout, fll->fout * MADERA_FLL_VCO_MULT);
-
-	/* Find an appropriate FLL_FRATIO and refdiv */
-	ratio = madera_calc_fratio(fll, cfg, fref, sync);
-	if (ratio < 0)
-		return ratio;
-
-	/* Apply the division for our remaining calculations */
-	fref = fref / (1 << cfg->refdiv);
-
-	cfg->n = fll->fout / (ratio * fref);
-
-	if (fll->fout % (ratio * fref)) {
-		gcd_fll = gcd(fll->fout, ratio * fref);
-		madera_fll_dbg(fll, "GCD=%u\n", gcd_fll);
-
-		cfg->theta = (fll->fout - (cfg->n * ratio * fref))
-			/ gcd_fll;
-		cfg->lambda = (ratio * fref) / gcd_fll;
-	} else {
-		cfg->theta = 0;
-		cfg->lambda = 0;
-	}
-
-	/* Round down to 16bit range with cost of accuracy lost.
-	 * Denominator must be bigger than numerator so we only
-	 * take care of it.
-	 */
-	while (cfg->lambda >= (1 << 16)) {
-		cfg->theta >>= 1;
-		cfg->lambda >>= 1;
-	}
-
-	switch (fll->madera->type) {
-	case CS47L35:
-		switch (fll->madera->rev) {
-		case 0:
-			/* Rev A0 uses the sync gains for both loops */
-			gains = madera_fll_sync_gains,
-			n_gains = ARRAY_SIZE(madera_fll_sync_gains);
-			break;
-		default:
-			if (sync) {
-				gains = madera_fll_sync_gains,
-				n_gains = ARRAY_SIZE(madera_fll_sync_gains);
-			} else {
-				gains = madera_fll_main_gains;
-				n_gains = ARRAY_SIZE(madera_fll_main_gains);
-			}
-			break;
-		}
-		break;
-	case CS47L85:
-	case WM1840:
-		/* These use the sync gains for both loops */
-		gains = madera_fll_sync_gains,
-		n_gains = ARRAY_SIZE(madera_fll_sync_gains);
-		break;
-	default:
-		if (sync) {
-			gains = madera_fll_sync_gains,
-			n_gains = ARRAY_SIZE(madera_fll_sync_gains);
-		} else {
-			gains = madera_fll_main_gains;
-			n_gains = ARRAY_SIZE(madera_fll_main_gains);
-		}
-		break;
-	}
-
-	ret = madera_find_fll_gain(fll, cfg, fref, gains, n_gains);
-	if (ret)
-		return ret;
-
-	madera_fll_dbg(fll, "N=%d THETA=%d LAMBDA=%d\n",
-			cfg->n, cfg->theta, cfg->lambda);
-	madera_fll_dbg(fll, "FRATIO=0x%x(%d) REFCLK_DIV=0x%x(%d)\n",
-			cfg->fratio, ratio, cfg->refdiv, 1 << cfg->refdiv);
-	madera_fll_dbg(fll, "GAIN=0x%x(%d)\n", cfg->gain, 1 << cfg->gain);
-
-	return 0;
-
-}
-
-static bool madera_apply_fll(struct madera *madera, unsigned int base,
-			     struct madera_fll_cfg *cfg, int source,
-			     bool sync, int gain)
-{
-	bool change, fll_change;
-
-	fll_change = false;
-	regmap_update_bits_check_async(madera->regmap,
-				       base + MADERA_FLL_CONTROL_3_OFFS,
-				       MADERA_FLL1_THETA_MASK,
-				       cfg->theta, &change);
-	fll_change |= change;
-	regmap_update_bits_check_async(madera->regmap,
-				       base + MADERA_FLL_CONTROL_4_OFFS,
-				       MADERA_FLL1_LAMBDA_MASK,
-				       cfg->lambda, &change);
-	fll_change |= change;
-	regmap_update_bits_check_async(madera->regmap,
-				       base + MADERA_FLL_CONTROL_5_OFFS,
-				       MADERA_FLL1_FRATIO_MASK,
-				       cfg->fratio << MADERA_FLL1_FRATIO_SHIFT,
-				       &change);
-	fll_change |= change;
-	regmap_update_bits_check_async(madera->regmap,
-				base + MADERA_FLL_CONTROL_6_OFFS,
-				MADERA_FLL1_REFCLK_DIV_MASK |
-				MADERA_FLL1_REFCLK_SRC_MASK,
-				cfg->refdiv << MADERA_FLL1_REFCLK_DIV_SHIFT |
-				source << MADERA_FLL1_REFCLK_SRC_SHIFT,
-				&change);
-	fll_change |= change;
-
-	if (sync) {
-		regmap_update_bits_check_async(madera->regmap,
-				base + MADERA_FLL_SYNCHRONISER_7_OFFS,
-				MADERA_FLL1_GAIN_MASK,
-				gain << MADERA_FLL1_GAIN_SHIFT, &change);
-		fll_change |= change;
-	} else {
-		regmap_update_bits_check_async(madera->regmap,
-				base + MADERA_FLL_CONTROL_7_OFFS,
-				MADERA_FLL1_GAIN_MASK,
-				gain << MADERA_FLL1_GAIN_SHIFT, &change);
-		fll_change |= change;
-	}
-
-	regmap_update_bits_check_async(madera->regmap,
-				base + MADERA_FLL_CONTROL_2_OFFS,
-				MADERA_FLL1_CTRL_UPD | MADERA_FLL1_N_MASK,
-				MADERA_FLL1_CTRL_UPD | cfg->n, &change);
-	fll_change |= change;
-
-	return fll_change;
-}
-
-static int madera_is_enabled_fll(struct madera_fll *fll)
-{
-	struct madera *madera = fll->madera;
-	unsigned int reg;
-	int ret;
-
-	ret = regmap_read(madera->regmap,
-			  fll->base + MADERA_FLL_CONTROL_1_OFFS, &reg);
-	if (ret != 0) {
-		madera_fll_err(fll, "Failed to read current state: %d\n", ret);
-		return ret;
-	}
-
-	return reg & MADERA_FLL1_ENA;
-}
-
-static int madera_wait_for_fll(struct madera_fll *fll, bool requested)
-{
-	struct madera *madera = fll->madera;
-	unsigned int val = 0;
-	bool status;
-	int i;
-
-	madera_fll_dbg(fll, "Waiting for FLL...\n");
-
-	for (i = 0; i < 30; i++) {
-		regmap_read(madera->regmap, MADERA_IRQ1_RAW_STATUS_2, &val);
-		status = val & (MADERA_FLL1_LOCK_STS1 << (fll->id - 1));
-		if (status == requested)
-			return 0;
-
-		switch (i) {
-		case 0 ... 5:
-			usleep_range(75, 125);
-			break;
-		case 11 ... 20:
-			usleep_range(750, 1250);
-			break;
-		default:
-			msleep(20);
-			break;
-		}
-	}
-
-	madera_fll_warn(fll, "Timed out waiting for lock\n");
-
-	return -ETIMEDOUT;
-}
-
-static bool madera_set_fll_phase_integrator(struct madera_fll *fll,
-					    struct madera_fll_cfg *ref_cfg,
-					    bool sync)
-{
-	unsigned int val;
-	bool reg_change;
-
-	if (!sync && (ref_cfg->theta == 0))
-		val = (1 << MADERA_FLL1_PHASE_ENA_SHIFT) |
-			(2 << MADERA_FLL1_PHASE_GAIN_SHIFT);
-	else
-		val = 2 << MADERA_FLL1_PHASE_GAIN_SHIFT;
-
-	regmap_update_bits_check(fll->madera->regmap,
-				 fll->base + MADERA_FLL_EFS_2_OFFS,
-				 MADERA_FLL1_PHASE_ENA_MASK |
-				 MADERA_FLL1_PHASE_GAIN_MASK,
-				 val,
-				 &reg_change);
-
-	return reg_change;
-}
-
-static int madera_enable_fll(struct madera_fll *fll)
-{
-	struct madera *madera = fll->madera;
-	bool have_sync = false;
-	int already_enabled = madera_is_enabled_fll(fll);
-	struct madera_fll_cfg cfg;
-	unsigned int sync_reg_base;
-	int gain;
-	bool fll_change = false;
-
-	if (already_enabled < 0)
-		return already_enabled;	/* error getting current state */
-
-	if ((fll->ref_src < 0) || (fll->ref_freq == 0)) {
-		madera_fll_err(fll, "No REFCLK\n");
-		return -EINVAL;
-	}
-
-	madera_fll_dbg(fll, "Enabling FLL, initially %s\n",
-			already_enabled ? "enabled" : "disabled");
-
-	switch (madera->type) {
-	case CS47L35:
-		sync_reg_base = fll->base + CS47L35_FLL_SYNCHRONISER_OFFS;
-		break;
-	default:
-		sync_reg_base = fll->base + MADERA_FLL_SYNCHRONISER_OFFS;
-		break;
-	}
-
-	if (already_enabled) {
-		/* Facilitate smooth refclk across the transition */
-		regmap_update_bits_async(fll->madera->regmap,
-					 fll->base + MADERA_FLL_CONTROL_7_OFFS,
-					 MADERA_FLL1_GAIN_MASK, 0);
-		regmap_update_bits(fll->madera->regmap,
-				   fll->base + MADERA_FLL_CONTROL_1_OFFS,
-				   MADERA_FLL1_FREERUN,
-				   MADERA_FLL1_FREERUN);
-		udelay(32);
-	}
-
-	/* Apply SYNCCLK setting */
-	if (fll->sync_src >= 0) {
-		madera_calc_fll(fll, &cfg, fll->sync_freq, true);
-
-		fll_change |= madera_apply_fll(madera, sync_reg_base,
-						&cfg, fll->sync_src,
-						true, cfg.gain);
-		have_sync = true;
-	}
-
-	/* Apply REFCLK setting */
-	madera_calc_fll(fll, &cfg, fll->ref_freq, false);
-
-	switch (fll->madera->type) {
-	case CS47L35:
-		switch (fll->madera->rev) {
-		case 0:
-			break;
-		default:
-			fll_change |=
-				madera_set_fll_phase_integrator(fll, &cfg,
-								have_sync);
-			break;
-		}
-		gain = cfg.gain;
-		break;
-	case CS47L85:
-	case WM1840:
-		gain = cfg.gain;
-		break;
-	default:
-		fll_change |= madera_set_fll_phase_integrator(fll, &cfg,
-							      have_sync);
-		if (!have_sync && (cfg.theta == 0))
-			gain = cfg.alt_gain;
-		else
-			gain = cfg.gain;
-		break;
-	}
-
-	fll_change |= madera_apply_fll(madera, fll->base,
-				      &cfg, fll->ref_src,
-				      false, gain);
-
-	/*
-	 * Increase the bandwidth if we're not using a low frequency
-	 * sync source.
-	 */
-	if (have_sync && fll->sync_freq > 100000)
-		regmap_update_bits_async(madera->regmap,
-				sync_reg_base + MADERA_FLL_SYNCHRONISER_7_OFFS,
-				MADERA_FLL1_SYNC_DFSAT_MASK, 0);
-	else
-		regmap_update_bits_async(madera->regmap,
-				sync_reg_base + MADERA_FLL_SYNCHRONISER_7_OFFS,
-				MADERA_FLL1_SYNC_DFSAT_MASK,
-				MADERA_FLL1_SYNC_DFSAT);
-
-	if (!already_enabled)
-		pm_runtime_get(madera->dev);
-
-	/* Clear any pending completions */
-	try_wait_for_completion(&fll->ok);
-
-	regmap_update_bits_async(madera->regmap,
-				 fll->base + MADERA_FLL_CONTROL_1_OFFS,
-				 MADERA_FLL1_ENA, MADERA_FLL1_ENA);
-	if (have_sync)
-		regmap_update_bits_async(madera->regmap,
-				sync_reg_base + MADERA_FLL_SYNCHRONISER_1_OFFS,
-				MADERA_FLL1_SYNC_ENA,
-				MADERA_FLL1_SYNC_ENA);
-
-	if (already_enabled)
-		regmap_update_bits_async(madera->regmap,
-					 fll->base + MADERA_FLL_CONTROL_1_OFFS,
-					 MADERA_FLL1_FREERUN, 0);
-
-	if (fll_change || !already_enabled)
-		madera_wait_for_fll(fll, true);
-
-	return 0;
-}
-
-static void madera_disable_fll(struct madera_fll *fll)
-{
-	struct madera *madera = fll->madera;
-	unsigned int sync_reg_base;
-	bool change;
-
-	switch (madera->type) {
-	case CS47L35:
-		sync_reg_base = fll->base + CS47L35_FLL_SYNCHRONISER_OFFS;
-		break;
-	default:
-		sync_reg_base = fll->base + MADERA_FLL_SYNCHRONISER_OFFS;
-		break;
-	}
-
-	madera_fll_dbg(fll, "Disabling FLL\n");
-
-	regmap_update_bits_async(madera->regmap,
-				 fll->base + MADERA_FLL_CONTROL_1_OFFS,
-				 MADERA_FLL1_FREERUN, MADERA_FLL1_FREERUN);
-	regmap_update_bits_check(madera->regmap,
-				 fll->base + MADERA_FLL_CONTROL_1_OFFS,
-				 MADERA_FLL1_ENA, 0, &change);
-	regmap_update_bits(madera->regmap,
-			   sync_reg_base + MADERA_FLL_SYNCHRONISER_1_OFFS,
-			   MADERA_FLL1_SYNC_ENA, 0);
-	regmap_update_bits_async(madera->regmap,
-				 fll->base + MADERA_FLL_CONTROL_1_OFFS,
-				 MADERA_FLL1_FREERUN, 0);
-
-	madera_wait_for_fll(fll, false);
-
-	if (change)
-		pm_runtime_put_autosuspend(madera->dev);
-}
-
-int madera_set_fll_syncclk(struct madera_fll *fll, int source,
-			   unsigned int fref, unsigned int Fout)
-{
-	int ret = 0;
-
-	if (fll->sync_src == source && fll->sync_freq == fref)
-		return 0;
-
-	if (fll->fout && fref > 0) {
-		ret = madera_validate_fll(fll, fref, fll->fout);
-		if (ret != 0)
-			return ret;
-	}
-
-	fll->sync_src = source;
-	fll->sync_freq = fref;
-
-	if (fll->fout && fref > 0)
-		ret = madera_enable_fll(fll);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_set_fll_syncclk);
-
-int madera_set_fll_refclk(struct madera_fll *fll, int source,
-			   unsigned int fref, unsigned int fout)
-{
-	int ret = 0;
-
-	if (fll->ref_src == source &&
-	    fll->ref_freq == fref && fll->fout == fout)
-		return 0;
-
-	if (fout) {
-		if ((fout < MADERA_FLL_MIN_FOUT) ||
-		    (fout > MADERA_FLL_MAX_FOUT)) {
-			madera_fll_err(fll, "invalid fout %uHz\n", fout);
-			return -EINVAL;
-		}
-
-		ret = madera_validate_fll(fll, fref, fout);
-		if (ret != 0)
-			return ret;
-	}
-
-	fll->ref_src = source;
-	fll->ref_freq = fref;
-	fll->fout = fout;
-
-	if (fout)
-		ret = madera_enable_fll(fll);
-	else
-		madera_disable_fll(fll);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_set_fll_refclk);
-
-int madera_init_fll(struct madera *madera, int id, int base,
-		    struct madera_fll *fll)
-{
-	init_completion(&fll->ok);
-
-	fll->id = id;
-	fll->base = base;
-	fll->madera = madera;
-	fll->ref_src = MADERA_FLL_SRC_NONE;
-	fll->sync_src = MADERA_FLL_SRC_NONE;
-
-	switch (madera->type) {
-	case CS47L92:
-	case CS47L93:
-		break;
-	default:
-		regmap_update_bits(madera->regmap,
-				   fll->base + MADERA_FLL_CONTROL_1_OFFS,
-				   MADERA_FLL1_FREERUN, 0);
-		break;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_init_fll);
-
-static struct reg_sequence fll_cs47l90_32K_49M_patch[] = {
-	{ 0x2, 0x02EE },
-	{ 0x3, 0x0000 },
-	{ 0x4, 0x0001 },
-	{ 0x5, 0x0002 },
-	{ 0x6, 0x8001 },
-	{ 0x8, 0x0004 },
-	{ 0xA, 0x0077 },
-	{ 0xC, 0x06D8 },
-	{ 0xD, 0x0085 },
-};
-
-static struct reg_sequence fll_cs47l90_32K_45M_patch[] = {
-	{ 0x2, 0x02B1 },
-	{ 0x3, 0x0001 },
-	{ 0x4, 0x0010 },
-	{ 0x5, 0x0002 },
-	{ 0x6, 0x8001 },
-	{ 0x8, 0x0004 },
-	{ 0xA, 0x0077 },
-	{ 0xC, 0x06D8 },
-	{ 0xD, 0x0005 },
-};
-
-struct madera_fll_patch {
-	unsigned int fin;
-	unsigned int fout;
-	const struct reg_sequence *patch;
-	unsigned int patch_size;
-};
-
-static const struct madera_fll_patch fll_cs47l90_settings[] = {
-	{
-		.fin = 32768,
-		.fout = 49152000,
-		.patch = fll_cs47l90_32K_49M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l90_32K_49M_patch),
-	},
-	{
-		.fin = 32768,
-		.fout = 45158400,
-		.patch = fll_cs47l90_32K_45M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l90_32K_45M_patch),
-	},
-	{}
-};
-
-static struct reg_sequence fll_cs47l92_32K7645_49M_patch[] = {
-	{ 0x2, 0x0005 },
-	{ 0x3, 0x4961 },
-	{ 0x4, 0x5553 },
-	{ 0x5, 0x0100 },
-	{ 0x6, 0x8000 },
-	{ 0x8, 0x23F0 },
-	{ 0xA, 0xD000 },
-	{ 0xB, 0x0005 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_32K768_49M_patch[] = {
-	{ 0x2, 0x0177 },
-	{ 0x3, 0x0000 },
-	{ 0x4, 0x0001 },
-	{ 0x5, 0x0004 },
-	{ 0x6, 0x8000 },
-	{ 0x8, 0x23F0 },
-	{ 0xA, 0x1000 },
-	{ 0xB, 0x0005 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_19M_49M_patch[] = {
-	{ 0x2, 0x0005 },
-	{ 0x3, 0x0003 },
-	{ 0x4, 0x0019 },
-	{ 0x5, 0x0001 },
-	{ 0x6, 0x8040 },
-	{ 0x8, 0x21F0 },
-	{ 0xA, 0xD000 },
-	{ 0xB, 0x0011 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_24M_49M_patch[] = {
-	{ 0x2, 0x0004 },
-	{ 0x3, 0x0000 },
-	{ 0x4, 0x0001 },
-	{ 0x5, 0x0001 },
-	{ 0x6, 0x8040 },
-	{ 0x8, 0x21F0 },
-	{ 0xA, 0x1000 },
-	{ 0xB, 0x0011 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_26M_49M_patch[] = {
-	{ 0x2, 0x0003 },
-	{ 0x3, 0x04F5 },
-	{ 0x4, 0x0659 },
-	{ 0x5, 0x0001 },
-	{ 0x6, 0x8040 },
-	{ 0x8, 0x21FF },
-	{ 0xA, 0xD000 },
-	{ 0xB, 0x0011 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x72E8 },
-};
-static struct reg_sequence fll_cs47l92_32K7645_45M_patch[] = {
-	{ 0x2, 0x0005 },
-	{ 0x3, 0x0AEB },
-	{ 0x4, 0x1C71 },
-	{ 0x5, 0x0100 },
-	{ 0x6, 0x8000 },
-	{ 0x8, 0x23F0 },
-	{ 0xA, 0xD000 },
-	{ 0xB, 0x0005 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_32K768_45M_patch[] = {
-	{ 0x2, 0x0005 },
-	{ 0x3, 0x0311 },
-	{ 0x4, 0x0800 },
-	{ 0x5, 0x0100 },
-	{ 0x6, 0x8000 },
-	{ 0x8, 0x23F0 },
-	{ 0xA, 0xD000 },
-	{ 0xB, 0x0005 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_19M_45M_patch[] = {
-	{ 0x2, 0x0004 },
-	{ 0x3, 0x0058 },
-	{ 0x4, 0x007D },
-	{ 0x5, 0x0001 },
-	{ 0x6, 0x8040 },
-	{ 0x8, 0x20FF },
-	{ 0xA, 0xD000 },
-	{ 0xB, 0x0011 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_22M_45M_patch[] = {
-	{ 0x2, 0x0004 },
-	{ 0x3, 0x0000 },
-	{ 0x4, 0x0001 },
-	{ 0x5, 0x0001 },
-	{ 0x6, 0x8040 },
-	{ 0x8, 0x21F0 },
-	{ 0xA, 0x1000 },
-	{ 0xB, 0x0011 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_24M_45M_patch[] = {
-	{ 0x2, 0x0003 },
-	{ 0x3, 0x001B },
-	{ 0x4, 0x0028 },
-	{ 0x5, 0x0001 },
-	{ 0x6, 0x8040 },
-	{ 0x8, 0x21F0 },
-	{ 0xA, 0xD000 },
-	{ 0xB, 0x0011 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x32E8 },
-};
-static struct reg_sequence fll_cs47l92_26M_45M_patch[] = {
-	{ 0x2, 0x0003 },
-	{ 0x3, 0x0F09 },
-	{ 0x4, 0x1FBD },
-	{ 0x5, 0x0001 },
-	{ 0x6, 0x8040 },
-	{ 0x8, 0x21FF },
-	{ 0xA, 0xD000 },
-	{ 0xB, 0x0011 },
-	{ 0xC, 0x2077 },
-	{ 0xD, 0x72E8 },
-};
-static const struct madera_fll_patch fll_cs47l92_settings[] = {
-	{
-		.fin = 32764,
-		.fout = 49152000,
-		.patch = fll_cs47l92_32K7645_49M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_32K7645_49M_patch),
-	},
-	{
-		.fin = 32768,
-		.fout = 49152000,
-		.patch = fll_cs47l92_32K768_49M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_32K768_49M_patch),
-	},
-	{
-		.fin = 19200000,
-		.fout = 49152000,
-		.patch = fll_cs47l92_19M_49M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_19M_49M_patch),
-	},
-	{
-		.fin = 24576000,
-		.fout = 49152000,
-		.patch = fll_cs47l92_24M_49M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_24M_49M_patch),
-	},
-	{
-		.fin = 26000000,
-		.fout = 49152000,
-		.patch = fll_cs47l92_26M_49M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_26M_49M_patch),
-	},
-	{
-		.fin = 32764,
-		.fout = 45158400,
-		.patch = fll_cs47l92_32K7645_45M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_32K7645_45M_patch),
-	},
-	{
-		.fin = 32768,
-		.fout = 45158400,
-		.patch = fll_cs47l92_32K768_45M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_32K768_45M_patch),
-	},
-	{
-		.fin = 19200000,
-		.fout = 45158400,
-		.patch = fll_cs47l92_19M_45M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_19M_45M_patch),
-	},
-	{
-		.fin = 22579200,
-		.fout = 45158400,
-		.patch = fll_cs47l92_22M_45M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_22M_45M_patch),
-	},
-	{
-		.fin = 24576000,
-		.fout = 45158400,
-		.patch = fll_cs47l92_24M_45M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_24M_45M_patch),
-	},
-	{
-		.fin = 26000000,
-		.fout = 45158400,
-		.patch = fll_cs47l92_26M_45M_patch,
-		.patch_size = ARRAY_SIZE(fll_cs47l92_26M_45M_patch),
-	},
-	{}
-};
-
-static const struct madera_fll_patch *madera_fllhj_lu(struct madera_fll *fll,
-						      unsigned int fin,
-						      unsigned int fout)
-{
-	struct madera *madera = fll->madera;
-	const struct madera_fll_patch *settings;
-
-	switch (madera->type) {
-	case CS47L90:
-	case CS47L91:
-		settings = fll_cs47l90_settings;
-		break;
-	default:
-		settings = fll_cs47l92_settings;
-		break;
-	}
-
-	while (settings->fin) {
-		if (settings->fin == fin && settings->fout == fout)
-			break;
-		settings++;
-	}
-
-	if (!settings->fin) {
-		madera_fll_err(fll, "No FLL config match for %d => %d\n",
-				fin, fout);
-		return NULL;
-	}
-
-	return settings;
-}
-
-static int madera_apply_fllhj(struct madera_fll *fll, int fin)
-{
-	struct madera *madera = fll->madera;
-	const struct reg_sequence *patch;
-	unsigned int patch_size, base;
-	int i;
-	const struct madera_fll_patch *settings;
-
-	settings = madera_fllhj_lu(fll, fin, fll->fout);
-	if (!settings)
-		return -EINVAL;
-
-	patch = settings->patch;
-	patch_size = settings->patch_size;
-
-	base = fll->base;
-
-	for (i = 0; i < patch_size; i++)
-		regmap_write(madera->regmap, base + patch[i].reg, patch[i].def);
-
-	return 0;
-}
-
-static int madera_enable_fllhj(struct madera_fll *fll)
-{
-	struct madera *madera = fll->madera;
-	int already_enabled = madera_is_enabled_fll(fll);
-	unsigned int src_mask, src_shift, src_offset;
-
-	if (already_enabled < 0)
-		return already_enabled;
-
-	madera_fll_dbg(fll, "Enabling FLL, initially %s\n",
-			already_enabled ? "enabled" : "disabled");
-
-	switch (madera->type) {
-	case CS47L90:
-	case CS47L91:
-		src_mask = MADERA_FLL_AO_REFCLK_SRC_MASK;
-		src_shift = MADERA_FLL_AO_REFCLK_SRC_SHIFT;
-		src_offset = 6;
-		break;
-	default:
-		src_mask = CS47L92_FLL1_REFCLK_SRC_MASK;
-		src_shift = CS47L92_FLL1_REFCLK_SRC_SHIFT;
-		src_offset = 1;
-		break;
-	}
-
-	/* FLLn_HOLD must be set before configuring any registers */
-	regmap_update_bits(fll->madera->regmap, fll->base + 1,
-			   MADERA_FLL1_HOLD_MASK,
-			   MADERA_FLL1_HOLD_MASK);
-
-	/* Apply refclk */
-	madera_apply_fllhj(fll, fll->ref_freq);
-	regmap_update_bits(madera->regmap, fll->base + src_offset,
-			   src_mask, fll->ref_src << src_shift);
-	regmap_update_bits(madera->regmap,
-			   fll->base + MADERA_FLL_SYNCHRONISER_OFFS
-			   + src_offset,
-			   src_mask, 0);
-
-	if (!already_enabled)
-		pm_runtime_get(madera->dev);
-
-	regmap_update_bits(madera->regmap, fll->base + 2,
-			   MADERA_FLL1_CTRL_UPD_MASK,
-			   MADERA_FLL1_CTRL_UPD_MASK);
-
-	regmap_update_bits(madera->regmap, fll->base + 1,
-			   MADERA_FLL1_ENA_MASK, MADERA_FLL1_ENA_MASK);
-
-	/* Release the hold so that flln locks to external frequency */
-	regmap_update_bits(madera->regmap, fll->base + 1,
-			   MADERA_FLL1_HOLD_MASK, 0);
-
-	if (!already_enabled)
-		madera_wait_for_fll(fll, true);
-
-	return 0;
-}
-
-static int madera_disable_fllhj(struct madera_fll *fll)
-{
-	struct madera *madera = fll->madera;
-	bool change;
-
-	madera_fll_dbg(fll, "Disabling FLL\n");
-
-	regmap_update_bits(madera->regmap,
-			   fll->base + MADERA_FLLAO_CONTROL_1_OFFS,
-			   MADERA_FLL_AO_HOLD, MADERA_FLL_AO_HOLD);
-	regmap_update_bits_check(madera->regmap,
-				 fll->base + MADERA_FLLAO_CONTROL_1_OFFS,
-				 MADERA_FLL_AO_ENA, 0, &change);
-
-	madera_wait_for_fll(fll, false);
-
-	/* ctrl_up gates the writes to all the fll's registers, setting it to 0
-	 * here ensures that after a runtime suspend/resume cycle when one
-	 * enables the fll then ctrl_up is the last bit that is configured
-	 * by the fll enable code rather than the cache sync operation which
-	 * would have updated it much earlier before writing out all fll
-	 * registers
-	 */
-	regmap_update_bits(madera->regmap,
-			   fll->base + MADERA_FLLAO_CONTROL_2_OFFS,
-			   MADERA_FLL_AO_CTRL_UPD_MASK, 0);
-
-	if (change)
-		pm_runtime_put_autosuspend(madera->dev);
-
-	return 0;
-}
-
-static int madera_validate_fllhj(struct madera_fll *fll,
-				 unsigned int sync_in,
-				 unsigned int fout)
-{
-	if (sync_in && !madera_fllhj_lu(fll, sync_in, fout))
-		return -EINVAL;
-	if (fout && !sync_in) {
-		madera_fll_err(fll, "fllout set without valid input clk\n");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-int madera_set_fllhj_refclk(struct madera_fll *fll, int source,
-			    unsigned int fin, unsigned int fout)
-{
-	int ret = 0;
-	struct madera *madera = fll->madera;
-
-	if (fll->ref_src == source && fll->ref_freq == fin &&
-	    fll->fout == fout)
-		return 0;
-
-	/* To remain consistent with previous FLLs, we expect fout to be
-	 * provided in the form of the expected sysclk rate, which is
-	 * 2x the calculated fll out.
-	 */
-	switch (madera->type) {
-	case CS47L90:
-	case CS47L91:
-		break;
-	default:
-		if (fout)
-			fout /= 2;
-		break;
-	}
-
-	if (fin && fout && madera_validate_fllhj(fll, fin, fout))
-		return -EINVAL;
-
-	fll->ref_src = source;
-	fll->ref_freq = fin;
-	fll->fout = fout;
-
-	if (fout)
-		ret = madera_enable_fllhj(fll);
-	else
-		madera_disable_fllhj(fll);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_set_fllhj_refclk);
-
-/**
- * madera_set_output_mode - Set the mode of the specified output
- *
- * @codec: Device to configure
- * @output: Output number
- * @diff: True to set the output to differential mode
- *
- * Some systems use external analogue switches to connect more
- * analogue devices to the CODEC than are supported by the device.  In
- * some systems this requires changing the switched output from single
- * ended to differential mode dynamically at runtime, an operation
- * supported using this function.
- *
- * Most systems have a single static configuration and should use
- * platform data instead.
- */
-int madera_set_output_mode(struct snd_soc_codec *codec, int output, bool diff)
-{
-	unsigned int reg, val;
-	int ret;
-
-	if (output < 1 || output > MADERA_MAX_OUTPUT)
-		return -EINVAL;
-
-	reg = MADERA_OUTPUT_PATH_CONFIG_1L + (output - 1) * 8;
-
-	if (diff)
-		val = MADERA_OUT1_MONO;
-	else
-		val = 0;
-
-	ret = snd_soc_update_bits(codec, reg, MADERA_OUT1_MONO, val);
-	if (ret < 0)
-		return ret;
-	else
-		return 0;
-}
-EXPORT_SYMBOL_GPL(madera_set_output_mode);
-
-int madera_set_custom_jd(struct snd_soc_codec *codec,
-			 const struct madera_jd_state *custom_jd,
-			 unsigned int index)
-{
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-
-	if (index >= MADERA_MAX_ACCESSORY)
-		return -EINVAL;
-
-	madera->pdata.accdet[index].custom_jd = custom_jd;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(madera_set_custom_jd);
-
-struct madera_extcon_info *
-madera_get_extcon_info(struct snd_soc_codec *codec)
-{
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-
-	return madera->extcon_info;
-}
-EXPORT_SYMBOL_GPL(madera_get_extcon_info);
-
-static int madera_set_force_bypass(struct snd_soc_codec *codec, bool set_bypass)
-{
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-	struct madera_micbias *micbias = madera->pdata.micbias;
-	unsigned int i, cp_bypass = 0, micbias_bypass = 0;
-	unsigned int num_micbiases;
-
-	if (set_bypass) {
-		cp_bypass = MADERA_CPMIC_BYPASS;
-		micbias_bypass = MADERA_MICB1_BYPASS;
-	}
-
-	if (madera->micvdd_regulated) {
-		if (set_bypass)
-			snd_soc_dapm_disable_pin(madera->dapm, "MICSUPP");
-		else
-			snd_soc_dapm_force_enable_pin(madera->dapm, "MICSUPP");
-
-		snd_soc_dapm_sync(madera->dapm);
-
-		regmap_update_bits(madera->regmap,
-				   MADERA_MIC_CHARGE_PUMP_1,
-				   MADERA_CPMIC_BYPASS, cp_bypass);
-	}
-
-	madera_get_num_micbias(madera, &num_micbiases);
-
-	for (i = 0; i < num_micbiases; i++) {
-		if ((set_bypass) ||
-			(!micbias[i].bypass && micbias[i].mV))
-			regmap_update_bits(madera->regmap,
-					   MADERA_MIC_BIAS_CTRL_1 + i,
-					   MADERA_MICB1_BYPASS,
-					   micbias_bypass);
-	}
-
-	return 0;
-}
-
-int madera_enable_force_bypass(struct snd_soc_codec *codec)
-{
-	return madera_set_force_bypass(codec, true);
-}
-EXPORT_SYMBOL_GPL(madera_enable_force_bypass);
-
-int madera_disable_force_bypass(struct snd_soc_codec *codec)
-{
-	return madera_set_force_bypass(codec, false);
-}
-EXPORT_SYMBOL_GPL(madera_disable_force_bypass);
-
-int madera_frf_bytes_put(struct snd_kcontrol *kcontrol,
-			 struct snd_ctl_elem_value *ucontrol)
-{
-	struct soc_bytes *params = (void *)kcontrol->private_value;
-	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct madera_priv *priv = snd_soc_codec_get_drvdata(codec);
-	struct madera *madera = priv->madera;
-	int ret, len;
-	void *data;
-
-	len = params->num_regs * component->val_bytes;
-
-	data = kmemdup(ucontrol->value.bytes.data, len, GFP_KERNEL | GFP_DMA);
-	if (!data)
-		return -ENOMEM;
-
-	mutex_lock(&madera->reg_setting_lock);
-	regmap_write(madera->regmap, 0x80, 0x3);
-
-	ret = regmap_raw_write(madera->regmap, params->base, data, len);
-
-	regmap_write(madera->regmap, 0x80, 0x0);
-	mutex_unlock(&madera->reg_setting_lock);
-
-	kfree(data);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_frf_bytes_put);
-
-static bool madera_eq_filter_unstable(bool mode, __be16 _a, __be16 _b)
-{
-	s16 a = be16_to_cpu(_a);
-	s16 b = be16_to_cpu(_b);
-
-	if (!mode) {
-		return abs(a) >= 4096;
-	} else {
-		if (abs(b) >= 4096)
-			return true;
-
-		return (abs((a << 16) / (4096 - b)) >= 4096 << 4);
-	}
-}
-
-int madera_eq_coeff_put(struct snd_kcontrol *kcontrol,
-			struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-	struct soc_bytes *params = (void *)kcontrol->private_value;
-	unsigned int val;
-	__be16 *data;
-	int len;
-	int ret;
-
-	len = params->num_regs * regmap_get_val_bytes(madera->regmap);
-
-	data = kmemdup(ucontrol->value.bytes.data, len, GFP_KERNEL | GFP_DMA);
-	if (!data)
-		return -ENOMEM;
-
-	data[0] &= cpu_to_be16(MADERA_EQ1_B1_MODE);
-
-	if (madera_eq_filter_unstable(!!data[0], data[1], data[2]) ||
-	    madera_eq_filter_unstable(true, data[4], data[5]) ||
-	    madera_eq_filter_unstable(true, data[8], data[9]) ||
-	    madera_eq_filter_unstable(true, data[12], data[13]) ||
-	    madera_eq_filter_unstable(false, data[16], data[17])) {
-		dev_err(madera->dev, "Rejecting unstable EQ coefficients\n");
-		ret = -EINVAL;
-		goto out;
-	}
-
-	ret = regmap_read(madera->regmap, params->base, &val);
-	if (ret != 0)
-		goto out;
-
-	val &= ~MADERA_EQ1_B1_MODE;
-	data[0] |= cpu_to_be16(val);
-
-	ret = regmap_raw_write(madera->regmap, params->base, data, len);
-
-out:
-	kfree(data);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(madera_eq_coeff_put);
-
-int madera_lhpf_coeff_put(struct snd_kcontrol *kcontrol,
-			   struct snd_ctl_elem_value *ucontrol)
-{
-	struct snd_soc_codec *codec = snd_soc_kcontrol_codec(kcontrol);
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-	__be16 *data = (__be16 *)ucontrol->value.bytes.data;
-	s16 val = be16_to_cpu(*data);
-
-	if (abs(val) >= 4096) {
-		dev_err(madera->dev, "Rejecting unstable LHPF coefficients\n");
-		return -EINVAL;
-	}
-
-	return snd_soc_bytes_put(kcontrol, ucontrol);
-}
-EXPORT_SYMBOL_GPL(madera_lhpf_coeff_put);
-
-int madera_register_notifier(struct snd_soc_codec *codec,
-			     struct notifier_block *nb)
-{
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-
-	return blocking_notifier_chain_register(&madera->notifier, nb);
-}
-EXPORT_SYMBOL_GPL(madera_register_notifier);
-
-int madera_unregister_notifier(struct snd_soc_codec *codec,
-			       struct notifier_block *nb)
-{
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-
-	return blocking_notifier_chain_unregister(&madera->notifier, nb);
-}
-EXPORT_SYMBOL_GPL(madera_unregister_notifier);
-
-struct regmap *madera_get_regmap_dsp(struct snd_soc_codec *codec)
-{
-	struct madera *madera = dev_get_drvdata(codec->dev->parent);
-
-	return madera->regmap_32bit;
-}
-EXPORT_SYMBOL_GPL(madera_get_regmap_dsp);
-
-MODULE_DESCRIPTION("ASoC Cirrus Logic Madera codec support");
-MODULE_AUTHOR("Charles Keepax <ckeepax@opensource.wolfsonmicro.com>");
-MODULE_AUTHOR("Richard Fitzgerald <rf@opensource.wolfsonmicro.com>");
-MODULE_LICENSE("GPL v2");
+{2}' en tant que paramÃ¨tre de type '{1}' dans le type ou la mÃ©thode gÃ©nÃ©rique '{0}'. La nullabilitÃ© de l'argument de type '{2}' ne correspond pas Ã  la contrainte 'class'.·Impossible d'utiliser le type en tant que paramÃ¨tre de type dans le type ou la mÃ©thode gÃ©nÃ©rique. La nullabilitÃ© de l'argument de type ne correspond pas Ã  la contrainte 'class'.3Le type valeur Nullable peut avoir une valeur null.3Le type valeur Nullable peut avoir une valeur null.§Le membre obligatoire '{0}' ne doit pas Ãªtre attribuÃ© avec 'ObsoleteAttribute', sauf si le type conteneur est obsolÃ¨te ou si tous les constructeurs sont obsolÃ¨tes.¨Les membres attribuÃ©s avec 'ObsoleteAttribute' ne doivent pas Ãªtre obligatoires, sauf si le type conteneur est obsolÃ¨te ou si tous les constructeurs sont obsolÃ¨tes.DLe membre obsolÃ¨te '{0}' se substitue au membre non obsolÃ¨te '{1}';Un membre obsolÃ¨te se substitue Ã  un membre non obsolÃ¨te~Le paramÃ¨tre {0} a une valeur par dÃ©faut '{1:10}' dans lâ€™expression lambda, mais a '{2:10}' dans le type dÃ©lÃ©guÃ© cible.OLa valeur du paramÃ¨tre par dÃ©faut ne correspond pas au type dÃ©lÃ©guÃ© cible.^Le paramÃ¨tre out '{0}' doit Ãªtre assignÃ© avant que le contrÃ´le quitte la mÃ©thode actuelleRUn paramÃ¨tre out doit Ãªtre assignÃ© avant que le contrÃ´le ne quitte la mÃ©thodeULe paramÃ¨tre '{0}' doit avoir une valeur non null au moment de la sortie avec '{1}'.^Le paramÃ¨tre doit avoir une valeur non null au moment de la sortie dans certaines conditions.JLe paramÃ¨tre '{0}' doit avoir une valeur non null au moment de la sortie.DLe paramÃ¨tre doit avoir une valeur non null au moment de la sortie.J'{0}'Â : les types static ne peuvent pas Ãªtre utilisÃ©s comme paramÃ¨tresJLes types statiques ne peuvent pas Ãªtre utilisÃ©s en tant que paramÃ¨tresyLe paramÃ¨tre '{0}' doit avoir une valeur non null au moment de la sortie, car le paramÃ¨tre '{1}' a une valeur non null.Le paramÃ¨tre doit avoir une valeur non null au moment de la sortie, car le paramÃ¨tre rÃ©fÃ©rencÃ© par NotNullIfNotNull a une valeur non null.…Le paramÃ¨tre '{0}' apparaÃ®t aprÃ¨s '{1}' dans la liste des paramÃ¨tres, mais est utilisÃ© comme argument pour les conversions de gestionnaires de chaÃ®nes interpolÃ©es. Cela nÃ©cessitera que l'appelant rÃ©organise les paramÃ¨tres avec des arguments nommÃ©s sur le site d'appel. Envisagez de placer le paramÃ¨tre de gestionnaire de chaÃ®ne interpolÃ© aprÃ¨s tous les arguments impliquÃ©s.mUn paramÃ¨tre de conversion de gestionnaire de chaÃ®ne interpolÃ© a lieu aprÃ¨s un paramÃ¨tre de gestionnaireuLe paramÃ¨tre {0} a un modificateur de paramÃ¨tres dans lâ€™expression lambda mais pas dans le type dÃ©lÃ©guÃ© cible.qLe paramÃ¨tre a un modificateur de paramÃ¨tres dans lâ€™expression lambda mais pas dans le type dÃ©lÃ©guÃ© cible.fLes dÃ©clarations de mÃ©thode partielles Â«Â {0}Â Â» et Â«Â {1}Â Â» ont des diffÃ©rences de signature.KLes dÃ©clarations de mÃ©thode partielles ont des diffÃ©rences de signature.I'{0}' n'implÃ©mente pas le modÃ¨le '{1}'. '{2}' a une signature erronÃ©e.]Un type n'implÃ©mente pas le modÃ¨le de la collectionÂ ; un membre n'a pas la bonne signatureF'{0}' n'implÃ©mente pas le modÃ¨le '{1}'. '{2}' est ambigu avec '{3}'.QUn type n'implÃ©mente pas le modÃ¨le de la collectionÂ ; les membres sont ambigusj'{0}' n'implÃ©mente pas le modÃ¨le '{1}'. '{2}' n'est pas une mÃ©thode d'extension ou d'instance publique.zLe type n'implÃ©mente pas le modÃ¨le de collectionÂ ; le membre n'est pas une mÃ©thode d'extension ou d'instance publique.TLe nom local '{0}' est trop long pour PDB. Raccourcissez-le ou compilez sans /debug.#Le nom local est trop long pour PDB(PossibilitÃ© d'instruction vide erronÃ©e(PossibilitÃ© d'instruction vide erronÃ©eƒL'opÃ©rateur '{0}' ne peut pas Ãªtre utilisÃ© ici en raison de la prÃ©cÃ©dence. Utilisez des parenthÃ¨ses pour lever l'ambiguÃ¯tÃ©.IL'opÃ©rateur ne peut pas Ãªtre utilisÃ© ici en raison de la prÃ©cÃ©dence.?'{0}'Â : nouveau membre protÃ©gÃ© dÃ©clarÃ© dans le type sealed6Nouveau membre protÃ©gÃ© dÃ©clarÃ© dans le type sealed.'{0}' dÃ©finit 'Equals' mais pas 'GetHashCode':L'enregistrement dÃ©finit 'Equals' mais pas 'GetHashCode'.=Les types et les alias ne doivent pas porter le nom 'record'.=Les types et les alias ne doivent pas porter le nom 'record'.yEffectue une attribution par rÃ©fÃ©rence de '{1}' vers '{0}', mais '{1}' a une portÃ©e de sortie plus limitÃ©e que '{0}'.xCette rÃ©fÃ©rence attribue une valeur par rÃ©fÃ©rence dont lâ€™Ã©tendue dâ€™Ã©chappement est plus Ã©troite que la cible.¬Cette rÃ©fÃ©rence effectue une attribution par rÃ©fÃ©rence '{1}' Ã  '{0}', mais '{1}' ne peut Ã©chapper Ã  la mÃ©thode actuelle quâ€™Ã  lâ€™aide dâ€™une instruction return.€Cette rÃ©fÃ©rence effectue une valeur qui ne peut Ã©chapper Ã  la mÃ©thode actuelle quâ€™Ã  lâ€™aide dâ€™une instruction return.ãCette rÃ©fÃ©rence affecte '{1}' Ã  '{0}', mais '{1}' a une Ã©tendue dâ€™Ã©chappement de valeur plus large que '{0}' permettant lâ€™affectation via '{0}' de valeurs avec des Ã©tendues dâ€™Ã©chappement plus restreintes que '{1}'.ÙCette rÃ©fÃ©rence affecte une valeur, mais a une Ã©tendue dâ€™Ã©chappement de valeur plus large que la cible, ce qui permet lâ€™affectation via la cible de valeurs avec des Ã©tendues dâ€™Ã©chappement plus restreintes.ML'assembly rÃ©fÃ©rencÃ© '{0}' a un paramÃ¨tre de culture diffÃ©rentÂ : '{1}'.=L'assembly rÃ©fÃ©rencÃ© a un paramÃ¨tre de culture diffÃ©rentnRetourne une variable locale '{0}' par rÃ©fÃ©rence, mais il ne s'agit pas d'une variable locale de rÃ©fÃ©rencezRetourne un membre de la variable locale '{0}' par rÃ©fÃ©rence, mais il ne s'agit pas d'une variable locale de rÃ©fÃ©rencetRetourne un membre de la variable locale par rÃ©fÃ©rence, mais il ne s'agit pas d'une variable locale de rÃ©fÃ©rencehRetourne une variable locale par rÃ©fÃ©rence, mais il ne s'agit pas d'une variable locale de rÃ©fÃ©rence•La variable local '{0}' est retournÃ©e par rÃ©fÃ©rence, mais elle a Ã©tÃ© initialisÃ©e Ã  une valeur qui ne peut pas Ãªtre retournÃ©e par rÃ©fÃ©renceŒUn membre de '{0}' est retournÃ© par rÃ©fÃ©rence, mais il a Ã©tÃ© initialisÃ© Ã  une valeur qui ne peut pas Ãªtre retournÃ©e par rÃ©fÃ©renceƒUn membre est retournÃ© par rÃ©fÃ©rence, mais il a Ã©tÃ© initialisÃ© Ã  une valeur qui ne peut pas Ãªtre retournÃ©e par rÃ©fÃ©renceLa variable local est retournÃ©e par rÃ©fÃ©rence, mais elle a Ã©tÃ© initialisÃ©e Ã  une valeur qui ne peut pas Ãªtre retournÃ©e par rÃ©fÃ©renceªRetourne un paramÃ¨tre par rÃ©fÃ©rence '{0}' par le biais dâ€™un paramÃ¨tre refÂ ; mais il peut uniquement Ãªtre retournÃ© en toute sÃ©curitÃ© dans une instruction return§Retourne par rÃ©fÃ©rence un membre du paramÃ¨tre '{0}' via un paramÃ¨tre refÂ ; mais il peut uniquement Ãªtre retournÃ© en toute sÃ©curitÃ© dans une instruction return¡Retourne par rÃ©fÃ©rence un membre du paramÃ¨tre via un paramÃ¨tre refÂ ; mais il peut uniquement Ãªtre retournÃ© en toute sÃ©curitÃ© dans une instruction return¤Retourne un paramÃ¨tre par rÃ©fÃ©rence par le biais dâ€™un paramÃ¨tre refÂ ; mais il peut uniquement Ãªtre retournÃ© en toute sÃ©curitÃ© dans une instruction return[Retourne un paramÃ¨tre par rÃ©fÃ©rence '{0}', mais il ne sâ€™agit pas dâ€™un paramÃ¨tre ref_Retourne par rÃ©fÃ©rence un membre du paramÃ¨tre '{0}' qui nâ€™est pas un paramÃ¨tre ref ou outYRetourne par rÃ©fÃ©rence un membre du paramÃ¨tre qui nâ€™est pas un paramÃ¨tre ref ou outURetourne un paramÃ¨tre par rÃ©fÃ©rence, mais il ne sâ€™agit pas dâ€™un paramÃ¨tre refXRetourne un paramÃ¨tre par rÃ©fÃ©rence '{0}' mais il est Ã©tendu Ã  la mÃ©thode actuelle^Retourne par rÃ©fÃ©rence un membre du paramÃ¨tre '{0}' qui est Ã©tendu Ã  la mÃ©thode actuelleXRetourne par rÃ©fÃ©rence un membre du paramÃ¨tre qui est Ã©tendu Ã  la mÃ©thode actuelleSRetourne un paramÃ¨tre par rÃ©fÃ©rence, mais il est Ã©tendu Ã  la mÃ©thode actuelleOLe membre struct retourne 'this' ou d'autres membres d'instance par rÃ©fÃ©renceOLe membre struct retourne 'this' ou d'autres membres d'instance par rÃ©fÃ©rence2L'assembly rÃ©fÃ©rencÃ© '{0}' n'a pas de nom fort.+L'assembly rÃ©fÃ©rencÃ© n'a pas de nom fort†Une rÃ©fÃ©rence a Ã©tÃ© crÃ©Ã©e pour l'assembly d'interopÃ©rabilitÃ© incorporÃ© '{0}' en raison d'une rÃ©fÃ©rence indirecte Ã  cet assembly crÃ©Ã©e par l'assembly '{1}'. Modifiez la propriÃ©tÃ© 'Incorporer les types interop' sur l'un ou l'autre de ces assemblys.ßVous avez ajoutÃ© une rÃ©fÃ©rence Ã  un assembly en utilisant /link (la propriÃ©tÃ© Incorporer les types interop est dÃ©finie sur True). Cette commande ordonne au compilateur d'incorporer les informations de type interop Ã  partir de cet assembly. Cependant, le compilateur ne peut pas incorporer les informations de type interop Ã  partir de cet assembly, car un autre assembly que vous avez rÃ©fÃ©rencÃ© rÃ©fÃ©rence Ã©galement cet assembly en utilisant /reference (la propriÃ©tÃ© Incorporer les types interop est dÃ©finie sur False).
+
+Pour incorporer les informations de type interop pour chaque assembly, utilisez la commande /link pour les rÃ©fÃ©rences de chaque assembly (dÃ©finissez la propriÃ©tÃ© Incorporer les types interop sur True).
+
+Pour supprimer l'avertissement, vous pouvez utiliser la commande /reference (dÃ©finissez la propriÃ©tÃ© Incorporer les types interop sur False). Dans ce cas, un assembly PIA (Primary Interop Assembly) fournit des informations de type interop.…Une rÃ©fÃ©rence a Ã©tÃ© crÃ©Ã©e pour l'assembly d'interopÃ©rabilitÃ© incorporÃ© en raison d'une rÃ©fÃ©rence indirecte Ã  cet assemblyWLa valeur de retour doit Ãªtre non null, car le paramÃ¨tre '{0}' a une valeur non null.QLa valeur de retour doit Ãªtre non null, car le paramÃ¨tre a une valeur non null.T'{0}'Â : les types static ne peuvent pas Ãªtre utilisÃ©s en tant que types de retourNLes types statiques ne peuvent pas Ãªtre utilisÃ©s en tant que types de retourwLe type '{1}' dans '{0}' est en conflit avec le type importÃ© '{3}' dans '{2}'. Utilisation du type dÃ©fini dans '{0}'.,Le type est en conflit avec le type importÃ©€Le type '{1}' dans '{0}' est en conflit avec l'espace de noms importÃ© '{3}' dans '{2}'. Utilisation du type dÃ©fini dans '{0}'.5Le type est en conflit avec l'espace de noms importÃ©ŒL'espace de noms '{1}' dans '{0}' est en conflit avec le type importÃ© '{3}' dans '{2}'. Utilisation de l'espace de noms dÃ©fini dans '{0}'.5L'espace de noms est en conflit avec le type importÃ©dLe modificateur 'scoped' du paramÃ¨tre '{0}' ne correspond pas au membre substituÃ© ou implÃ©mentÃ©.^Le modificateur 'scoped' du paramÃ¨tre ne correspond pas au membre substituÃ© ou implÃ©mentÃ©.NLe modificateur 'scoped' du paramÃ¨tre '{0}' ne correspond pas au '{1}' cible.ELe modificateur 'scoped' du paramÃ¨tre ne correspond pas Ã  la cible.İIl n'existe pas de classement dÃ©fini entre les champs dans plusieurs dÃ©clarations de la structure partielle '{0}'. Pour spÃ©cifier un classement, tous les champs d'instance doivent se trouver dans la mÃªme dÃ©claration.eIl n'existe pas de classement dÃ©fini entre les champs dans plusieurs dÃ©clarations de struct partielCUne mÃ©thode marquÃ©e [DoesNotReturn] ne doit pas Ãªtre retournÃ©e.CUne mÃ©thode marquÃ©e [DoesNotReturn] ne doit pas Ãªtre retournÃ©e.WLe second opÃ©rande d'un opÃ©rateur 'is' ou 'as' ne peut pas Ãªtre du type static '{0}'QLe second opÃ©rande d'un opÃ©rateur 'is' ou 'as' ne peut pas Ãªtre un type static«L'expression switch ne prend pas en charge toutes les valeurs possibles de son type d'entrÃ©e (elle n'est pas exhaustive). Par exemple, le modÃ¨le '{0}' n'est pas couvert.¡L'expression switch ne prend pas en charge certaines entrÃ©es ayant une valeur null (elle n'est pas exhaustive). Par exemple, le modÃ¨le '{0}' n'est pas couvert.ÖL'expression switch ne gÃ¨re pas certaines entrÃ©es null (elle n'est pas exhaustive). Par exemple, le modÃ¨le '{0}' n'est pas couvert. Toutefois, un modÃ¨le avec une clause 'when' peut correspondre Ã  cette valeur.TL'expression switch ne prend pas en charge certaines entrÃ©es ayant une valeur null.TL'expression switch ne prend pas en charge certaines entrÃ©es ayant une valeur null.ÄL'expression switch ne prend pas en charge certaines valeurs de son type d'entrÃ©e (elle n'est pas exhaustive) impliquant une valeur enum sans nom. Par exemple, le modÃ¨le '{0}' n'est pas couvert.“L'expression switch ne prend pas en charge certaines valeurs de son type d'entrÃ©e (elle n'est pas exhaustive) impliquant une valeur enum sans nom.ûL'expression switch ne prend pas en charge toutes les valeurs possibles de son type d'entrÃ©e (elle n'est pas exhaustive). Par exemple, le modÃ¨le '{0}' n'est pas couvert. Toutefois, un modÃ¨le avec une clause 'when' peut correspondre Ã  cette valeur.zL'expression switch ne prend pas en charge toutes les valeurs possibles de son type d'entrÃ©e (elle n'est pas exhaustive).zL'expression switch ne prend pas en charge toutes les valeurs possibles de son type d'entrÃ©e (elle n'est pas exhaustive).|La mÃ©thode '{0}' ne sera pas utilisÃ©e en tant que point d'entrÃ©e, car un point d'entrÃ©e synchrone '{1}' a Ã©tÃ© trouvÃ©.%La valeur levÃ©e est peut-Ãªtre null.%La valeur levÃ©e est peut-Ãªtre null.›Le fichier source a dÃ©passÃ© la limite de 16Â 707Â 565 lignes pouvant Ãªtre reprÃ©sentÃ©es dans le PDBÂ ; les informations de dÃ©bogage seront incorrectes›Le fichier source a dÃ©passÃ© la limite de 16Â 707Â 565 lignes pouvant Ãªtre reprÃ©sentÃ©es dans le PDBÂ ; les informations de dÃ©bogage seront incorrectes­La nullabilitÃ© des types rÃ©fÃ©rence dans le type du paramÃ¨tre '{0}' ne correspond pas au membre implÃ©mentÃ© '{1}' (probablement en raison des attributs de nullabilitÃ©).¡La nullabilitÃ© des types rÃ©fÃ©rence dans le type du paramÃ¨tre ne correspond pas au membre implÃ©mentÃ© (probablement en raison des attributs de nullabilitÃ©).ÄLa nullabilitÃ© des types rÃ©fÃ©rence dans le type du paramÃ¨tre '{0}' de '{1}' ne correspond pas au membre implÃ©mentÃ© implicitement '{2}' (probablement en raison des attributs de nullabilitÃ©).¯La nullabilitÃ© des types rÃ©fÃ©rence dans le type du paramÃ¨tre ne correspond pas au membre implÃ©mentÃ© implicitement (probablement en raison des attributs de nullabilitÃ©).ŠLa nullabilitÃ© de type du paramÃ¨tre '{0}' ne correspond pas au membre substituÃ© (probablement en raison des attributs de nullabilitÃ©).„La nullabilitÃ© de type du paramÃ¨tre ne correspond pas au membre substituÃ© (probablement en raison des attributs de nullabilitÃ©).£La nullabilitÃ© des types rÃ©fÃ©rence dans le type de retour ne correspond pas au membre implÃ©mentÃ© '{0}' (probablement en raison des attributs de nullabilitÃ©).La nullabilitÃ© des types rÃ©fÃ©rence dans le type de retour ne correspond pas au membre implÃ©mentÃ© (probablement en raison des attributs de nullabilitÃ©).ºLa nullabilitÃ© des types rÃ©fÃ©rence dans le type de retour de '{0}' ne correspond pas au membre implÃ©mentÃ© implicitement '{1}' (probablement en raison des attributs de nullabilitÃ©).«La nullabilitÃ© des types rÃ©fÃ©rence dans le type de retour ne correspond pas au membre implÃ©mentÃ© implicitement (probablement en raison des attributs de nullabilitÃ©).€La nullabilitÃ© du type de retour ne correspond pas au membre substituÃ© (probablement en raison des attributs de nullabilitÃ©).€La nullabilitÃ© du type de retour ne correspond pas au membre substituÃ© (probablement en raison des attributs de nullabilitÃ©).¡Le nom d'Ã©lÃ©ment de tuple '{0}' est ignorÃ©, car un autre nom est spÃ©cifiÃ© ou aucun nom n'est spÃ©cifiÃ© de l'autre cÃ´tÃ© de l'opÃ©rateur de tuple == ou !=.›Le nom d'Ã©lÃ©ment de tuple est ignorÃ©, car un autre nom est spÃ©cifiÃ© ou aucun nom n'est spÃ©cifiÃ© de l'autre cÃ´tÃ© de l'opÃ©rateur de tuple == ou !=.‚Le nom d'Ã©lÃ©ment tuple '{0}' est ignorÃ©, car un autre nom est spÃ©cifiÃ© ou aucun nom n'est spÃ©cifiÃ© par le type cible '{1}'.‚Le nom d'Ã©lÃ©ment tuple est ignorÃ©, car un autre nom est spÃ©cifiÃ© ou aucun nom n'est spÃ©cifiÃ© par la cible de l'assignation.aLe paramÃ¨tre de type '{0}' a le mÃªme nom que le paramÃ¨tre de type de la mÃ©thode externe '{1}'WLe paramÃ¨tre de type a le mÃªme type que le paramÃ¨tre de type de la mÃ©thode externe.ZLe paramÃ¨tre de type '{0}' a le mÃªme nom que le paramÃ¨tre de type du type externe '{1}'NLe paramÃ¨tre de type a le mÃªme nom que le paramÃ¨tre de type du type externe4Impossible de charger l'assembly Analyseur {0} : {1}*Impossible de charger l'assembly AnalyseurOLe champ '{0}' n'est jamais assignÃ© et aura toujours sa valeur par dÃ©faut {1}ELe champ n'est jamais assignÃ© et aura toujours sa valeur par dÃ©fautÊLe contrÃ´le est retournÃ© Ã  lâ€™appelant avant que la propriÃ©tÃ© implÃ©mentÃ©e automatiquement '{0}' soit explicitement affectÃ©e, ce qui provoque une attribution implicite prÃ©cÃ©dente de 'default'.ÅLe contrÃ´le est retournÃ© Ã  lâ€™appelant avant lâ€™attribution explicite de la propriÃ©tÃ© implÃ©mentÃ©e automatiquement, ce qui entraÃ®ne une attribution implicite prÃ©cÃ©dente de Â« default Â».şLa propriÃ©tÃ© implÃ©mentÃ©e automatiquement '{0}' doit Ãªtre entiÃ¨rement affectÃ©e avant que le contrÃ´le soit retournÃ© Ã  lâ€™appelant. Envisagez de mettre Ã  jour la version de langue Â«{1}Â» pour dÃ©finir automatiquement la propriÃ©tÃ© par dÃ©faut.íUne propriÃ©tÃ© implÃ©mentÃ©e automatiquement doit Ãªtre entiÃ¨rement affectÃ©e avant que le contrÃ´le soit renvoyÃ© Ã  lâ€™appelant. Envisagez de mettre Ã  jour la version de langage pour utiliser la propriÃ©tÃ© par dÃ©faut automatique.©Le contrÃ´le est retournÃ© Ã  lâ€™appelant avant que le champ '{0}' ne soit explicitement attribuÃ©, ce qui provoque une attribution implicite prÃ©cÃ©dente de 'default'.¦Le contrÃ´le est retournÃ© Ã  lâ€™appelant avant que le champ ne soit explicitement affectÃ©, ce qui provoque une attribution implicite prÃ©cÃ©dente de Â« default Â».ÔLe champ '{0}' doit Ãªtre entiÃ¨rement attribuÃ© avant que le contrÃ´le soit retournÃ© Ã  lâ€™appelant. Envisagez de mettre Ã  jour la version de langue Â«{1}Â» pour dÃ©finir automatiquement le champ par dÃ©faut.…Les champs dâ€™un struct doivent Ãªtre entiÃ¨rement assignÃ©s dans un constructeur avant que le contrÃ´le soit retournÃ© Ã  lâ€™appelant. Envisagez de mettre Ã  jour la version du langage pour quâ€™elle corresponde Ã  la valeur par dÃ©faut automatique du champ.1Conversion unboxing d'une valeur peut-Ãªtre null.1Conversion unboxing d'une valeur peut-Ãªtre null.èLe EnumeratorCancellationAttribute appliquÃ© au paramÃ¨tre '{0}' n'aura aucun effet. L'attribut s'applique uniquement Ã  un paramÃ¨tre de type CancellationToken dans une mÃ©thode d'itÃ©rateur asynchrone qui retourne IAsyncEnumerableÇEnumeratorCancellationAttribute n'aura aucun effet. L'attribut s'applique uniquement Ã  un paramÃ¨tre de type CancellationToken dans une mÃ©thode d'itÃ©rateur asynchrone qui retourne IAsyncEnumerable™L'itÃ©rateur asynchrone '{0}' a un ou plusieurs paramÃ¨tres de type 'CancellationToken' mais aucun d'entre eux n'est dÃ©corÃ© avec l'attribut 'EnumeratorCancellation'. Le paramÃ¨tre de jeton d'annulation du 'IAsyncEnumerable<>.GetAsyncEnumerator' gÃ©nÃ©rÃ© n'est donc pas consommÃ©Le membre d'itÃ©rateur asynchrone a un ou plusieurs paramÃ¨tres de type 'CancellationToken' mais aucun d'entre eux n'est dÃ©corÃ© avec l'attribut 'EnumeratorCancellation'. Le paramÃ¨tre de jeton d'annulation du 'IAsyncEnumerable<>.GetAsyncEnumerator' gÃ©nÃ©rÃ© n'est donc pas consommÃ©¨En supposant que la rÃ©fÃ©rence d'assembly '{0}' utilisÃ©e par '{1}' correspond Ã  l'identitÃ© '{2}' de '{3}', il se peut que vous deviez fournir une stratÃ©gie runtimeøLes numÃ©ros de mise en production et/ou de version des deux assemblys diffÃ¨rent. Pour procÃ©der Ã  l'unification, veuillez spÃ©cifier les directives adÃ©quates dans le fichier .config de l'application et fournir le nom fort correct d'un assembly.DEn supposant que la rÃ©fÃ©rence d'assembly correspond Ã  l'identitÃ©¨En supposant que la rÃ©fÃ©rence d'assembly '{0}' utilisÃ©e par '{1}' correspond Ã  l'identitÃ© '{2}' de '{3}', il se peut que vous deviez fournir une stratÃ©gie runtimeøLes numÃ©ros de mise en production et/ou de version des deux assemblys diffÃ¨rent. Pour procÃ©der Ã  l'unification, veuillez spÃ©cifier les directives adÃ©quates dans le fichier .config de l'application et fournir le nom fort correct d'un assembly.DEn supposant que la rÃ©fÃ©rence d'assembly correspond Ã  l'identitÃ©[Le commutateur de ligne de commande '{0}' n'est pas encore implÃ©mentÃ© et a Ã©tÃ© ignorÃ©.CLe commutateur de ligne de commande nâ€™est pas encore implÃ©mentÃ©Le {0} '{1}' non-nullable doit contenir une valeur non-null lors de la fermeture du constructeur. Envisagez de dÃ©clarer le {0} comme nullable.Un champ non-nullable doit contenir une valeur non-null lors de la fermeture du constructeur. Envisagez de dÃ©clarer le champ comme nullable.nLe commentaire XML sur '{1}' a une balise paramref pour '{0}', alors qu'il n'existe aucun paramÃ¨tre de ce nomYLe commentaire XML a une balise paramref, alors qu'il n'existe aucun paramÃ¨tre de ce nomaLe commentaire XML a une balise param pour '{0}', alors qu'il n'existe aucun paramÃ¨tre de ce nomVLe commentaire XML a une balise param, alors qu'il n'existe aucun paramÃ¨tre de ce nomzLe commentaire XML sur '{1}' a une balise typeparamref pour '{0}', alors qu'il n'existe aucun paramÃ¨tre de type de ce nomeLe commentaire XML a une balise typeparamref, alors qu'il n'existe aucun paramÃ¨tre de type de ce nommLe commentaire XML a une balise typeparam pour '{0}', alors qu'il n'existe aucun paramÃ¨tre de type de ce nombLe commentaire XML a une balise typeparam, alors qu'il n'existe aucun paramÃ¨tre de type de ce nomºDans la mesure oÃ¹ cet appel n'est pas attendu, l'exÃ©cution de la mÃ©thode actuelle continue avant la fin de l'appel. Envisagez d'appliquer l'opÃ©rateur 'await' au rÃ©sultat de l'appel.°
+La mÃ©thode actuelle appelle une mÃ©thode async qui retourne Task ou Task<TResult>. Par ailleurs, elle n'applique pas l'opÃ©rateur await au rÃ©sultat. L'appel de la mÃ©thode async dÃ©marre une tÃ¢che asynchrone. Cependant, comme aucun opÃ©rateur await n'est appliquÃ©, le programme continue sans attendre la fin de la tÃ¢che. GÃ©nÃ©ralement, ce comportement n'est pas celui que vous attendez. La plupart du temps, les autres aspects de la mÃ©thode d'appel dÃ©pendent du rÃ©sultat de l'appel ou, au minimum, la mÃ©thode appelÃ©e doit s'achever avant le retour de la mÃ©thode contenant l'appel.
+
+Un problÃ¨me de mÃªme importance est ce qui arrive aux exceptions levÃ©es dans la mÃ©thode async appelÃ©e. Une exception levÃ©e dans une mÃ©thode qui retourne Task ou Task<TResult> est stockÃ©e dans la tÃ¢che retournÃ©e. Si vous n'attendez pas la tÃ¢che ou la vÃ©rification explicite d'exceptions, l'exception est perdue. Si vous attendez la tÃ¢che, son exception est Ã  nouveau levÃ©e.
+
+Nous vous recommandons de toujours attendre l'appel.
+
+Supprimez l'avertissement seulement si vous Ãªtes sÃ»r de ne pas vouloir attendre la fin de l'appel asynchrone, et que la mÃ©thode appelÃ©e ne lÃ¨vera aucune exception. Dans ce cas, vous pouvez supprimer l'avertissement en affectant le rÃ©sultat de la tÃ¢che de l'appel Ã  une variable.uDans la mesure oÃ¹ cet appel n'est pas attendu, l'exÃ©cution de la mÃ©thode actuelle continue avant la fin de l'appelGLe commentaire XML n'est pas placÃ© dans un Ã©lÃ©ment valide du langageGLe commentaire XML n'est pas placÃ© dans un Ã©lÃ©ment valide du langage]Dans les attributs cref, les types imbriquÃ©s de types gÃ©nÃ©riques doivent Ãªtre qualifiÃ©s.\Dans les attributs cref, les types imbriquÃ©s de types gÃ©nÃ©riques doivent Ãªtre qualifiÃ©sCode inaccessible dÃ©tectÃ©Code inaccessible dÃ©tectÃ©ÉUne clause catch prÃ©cÃ©dente intercepte dÃ©jÃ  toutes les exceptions. Tous les objets levÃ©s autres que les exceptions seront enveloppÃ©es dans System.Runtime.CompilerServices.RuntimeWrappedException.¯Cet avertissement survient lorsqu'un bloc catch() n'a pas de type d'exception spÃ©cifiÃ© aprÃ¨s un bloc catch (System.Exception e). L'avertissement vous informe du fait que le bloc catch() n'interceptera aucune exception.
+
+Un bloc catch() aprÃ¨s un bloc catch (System.Exception e) peut intercepter des exceptions non-CLS si le RuntimeCompatibilityAttribute est dÃ©fini sur false dans le fichier AssemblyInfo.csÂ : [assembly: RuntimeCompatibilityAttribute(WrapNonExceptionThrows = false)]. Si cet attribut n'est pas dÃ©fini sur false de faÃ§on explicite, toutes les exceptions non-CLS levÃ©es sont enveloppÃ©es en tant qu'exceptions et le bloc catch (System.Exception e) les intercepte.EUne clause catch prÃ©cÃ©dente intercepte dÃ©jÃ  toutes les exceptionsParamÃ¨tre '{0}' non lu.ParamÃ¨tre non lu.qLe paramÃ¨tre '{0}' est non lu. Avez-vous oubliÃ© de l'utiliser pour initialiser la propriÃ©tÃ© portant ce nomÂ ?kLe paramÃ¨tre est non lu. Avez-vous oubliÃ© de l'utiliser pour initialiser la propriÃ©tÃ© portant ce nomÂ ?)L'Ã©vÃ©nement '{0}' n'est jamais utilisÃ©#L'Ã©vÃ©nement n'est jamais utilisÃ©$Le champ '{0}' n'est jamais utilisÃ©BLe champ '{0}' est assignÃ©, mais sa valeur n'est jamais utilisÃ©e<Le champ est assignÃ©, mais sa valeur n'est jamais utilisÃ©eLe champ n'est jamais utilisÃ©(Cette Ã©tiquette n'est pas rÃ©fÃ©rencÃ©e(Cette Ã©tiquette n'est pas rÃ©fÃ©rencÃ©e>La fonction locale '{0}' est dÃ©clarÃ©e, mais jamais utilisÃ©e7La fonction locale est dÃ©clarÃ©e mais jamais utilisÃ©e7La variable '{0}' est dÃ©clarÃ©e, mais jamais utilisÃ©eFLa variable '{0}' est assignÃ©e, mais sa valeur n'est jamais utilisÃ©e?La variable est assignÃ©e mais sa valeur n'est jamais utilisÃ©e0La variable est dÃ©clarÃ©e mais jamais utilisÃ©e5Utilisation d'une variable locale non assignÃ©e '{0}'9Utilisation d'un champ potentiellement non assignÃ© '{0}'ƒLe champ '{0}' est lu avant dâ€™Ãªtre explicitement attribuÃ©, ce qui provoque une attribution implicite prÃ©cÃ©dente de 'default'.Le champ est lu avant dâ€™Ãªtre explicitement attribuÃ©, ce qui provoque une attribution implicite prÃ©cÃ©dente de Â« default Â».·Utilisation dâ€™un '{0}' de champ Ã©ventuellement non attribuÃ©. Envisagez de mettre Ã  jour vers la version de langage '{1}' pour utiliser la valeur par dÃ©faut automatique du champ.°Utilisation dâ€™un champ Ã©ventuellement non attribuÃ©. Envisagez de mettre Ã  jour la version du langage pour quâ€™elle soit automatiquement mise Ã  jour par dÃ©faut du champ.3Utilisation d'un champ potentiellement non assignÃ©0Utilisation du paramÃ¨tre out non assignÃ© '{0}',Utilisation d'un paramÃ¨tre out non assignÃ©bUtilisation d'une propriÃ©tÃ© implÃ©mentÃ©e automatiquement Ã©ventuellement non assignÃ©eÂ : '{0}'¨La propriÃ©tÃ© implÃ©mentÃ©e automatiquement '{0}' est lue avant dâ€™Ãªtre explicitement affectÃ©e, ce qui provoque une attribution implicite prÃ©cÃ©dente de 'default'.§La propriÃ©tÃ© implÃ©mentÃ©e automatiquement est lue avant dâ€™Ãªtre affectÃ©e explicitement, ce qui entraÃ®ne une attribution implicite prÃ©cÃ©dente de Â« default Â».ÕUtilisation de la propriÃ©tÃ© implÃ©mentÃ©e automatiquement Â«{0}Â» Ã©ventuellement non assignÃ©e. Envisagez de mettre Ã  jour la version de langue Â«{1}Â» pour dÃ©finir automatiquement la propriÃ©tÃ© par dÃ©faut.ÜUtilisation dâ€™une propriÃ©tÃ© implÃ©mentÃ©e automatiquement Ã©ventuellement non attribuÃ©e. Envisagez de mettre Ã  jour la version du langage pour quâ€™elle soit automatiquement dÃ©finie par dÃ©faut sur la propriÃ©tÃ©.YUtilisation d'une propriÃ©tÃ© implÃ©mentÃ©e automatiquement Ã©ventuellement non assignÃ©e½Lâ€™objet Â« this Â» est lu avant que tous ses champs aient Ã©tÃ© affectÃ©s, ce qui entraÃ®ne les affectations implicites prÃ©cÃ©dentes de 'default' aux champs non explicitement attribuÃ©s.½Lâ€™objet Â« this Â» est lu avant que tous ses champs aient Ã©tÃ© affectÃ©s, ce qui entraÃ®ne les affectations implicites prÃ©cÃ©dentes de 'default' aux champs non explicitement attribuÃ©s.ÔImpossible dâ€™utiliser lâ€™objet 'this' avant lâ€™affectation de tous ses champs. Envisagez de mettre Ã  jour vers la version de langage '{0}' pour dÃ©finir automatiquement les champs non attribuÃ©s par dÃ©faut.õLâ€™objet Â« this Â» ne peut pas Ãªtre utilisÃ© dans un constructeur avant que tous ses champs aient Ã©tÃ© affectÃ©s. Envisagez de mettre Ã  jour la version du langage pour quâ€™elle utilise automatiquement les champs non attribuÃ©s par dÃ©faut./Utilisation d'une variable locale non assignÃ©eoLa comparaison Ã  la constante intÃ©grale est inutile, car la constante est en dehors de la plage du type '{0}'iLa comparaison Ã  la constante intÃ©grale est inutile, car la constante est en dehors de la plage du typeU'{0}'Â : une rÃ©fÃ©rence Ã  un champ volatile ne sera pas considÃ©rÃ©e comme volatileÜNormalement, un champ volatile ne doit pas Ãªtre utilisÃ© en tant que valeur ref ou out, car il n'est pas considÃ©rÃ© comme volatile. Il existe des exceptions Ã  cette situation, par exemple l'appel d'une API Ã  blocage.LUne rÃ©fÃ©rence Ã  un champ volatile ne sera pas considÃ©rÃ©e comme volatile#warningÂ : '{0}'Directive #warning5Le code XML du commentaire XML est incorrect -- '{0}',Le code XML du commentaire XML est incorrectILe fichier de commentaires inclus comporte du code XML incorrect -- '{0}'@Le fichier de commentaires inclus comporte du code XML incorrect$Nombre incorrect d'arguments de typeSemanticModel {0} attendu.PLa chaÃ®ne littÃ©rale ']]>' n'est pas autorisÃ©e dans le contenu de l'Ã©lÃ©ment.Attribut '{0}' en doubleFLa balise de fin '{0}' ne correspond pas Ã  la balise de dÃ©but '{1}'.9Une balise de fin Ã©tait attendue pour l'Ã©lÃ©ment '{0}'.;Une balise de fin n'Ã©tait pas attendue Ã  cet emplacement.6>' ou '/>' Ã©tait attendu pour fermer la balise '{0}'.(CaractÃ¨re inattendu Ã  cet emplacement.!Un identificateur Ã©tait attendu.=Une syntaxe incorrecte a Ã©tÃ© utilisÃ©e dans un commentaire.HUn caractÃ¨re non valide a Ã©tÃ© trouvÃ© dans une rÃ©fÃ©rence d'entitÃ©.CImpossible d'utiliser le(s) caractÃ¨re(s) '{0}' Ã  cet emplacement.CaractÃ¨re Unicode non valide.6L'espace blanc n'est pas autorisÃ© Ã  cet emplacement.HLe caractÃ¨re '<' ne peut pas Ãªtre utilisÃ© dans une valeur d'attribut.>Signe Ã©gal manquant entre l'attribut et la valeur d'attribut.,RÃ©fÃ©rence Ã  l'entitÃ© non dÃ©finie '{0}'.8Guillemet fermant manquant pour le littÃ©ral de chaÃ®ne.WUn littÃ©ral de chaÃ®ne Ã©tait attendu, mais aucun guillemet ouvrant n'a Ã©tÃ© trouvÃ©.WLes guillemets non ASCII ne peuvent pas Ãªtre utilisÃ©s avec les littÃ©raux de chaÃ®ne.(L'espace blanc obligatoire est manquant.       @„;1ZŒ¶ƒ®ˆílYm-6q_vâ»;ÅŸ—ğ |uÖ¾Â'¤¡˜¾œKÛ5Å¢à¸ı+Jº–Â1n	abnæIpJ²#HÃ´Y÷ædøÆWµpiÛšï+ğb©ß/¹*•¦(hyWP5”×Ry}c°sM,                           œ†         ¶†                         ¨†           _CorDllMain mscoree.dll     ÿ%                                                                                                                                                                                                                                                                                                                                           €                  0  €                   H   X  p          p4   V S _ V E R S I O N _ I N F O     ½ïş   X 4e         ?                         D    V a r F i l e I n f o     $    T r a n s l a t i o n       °Ğ   S t r i n g F i l e I n f o   ¬   0 0 0 0 0 4 b 0   L   C o m p a n y N a m e     M i c r o s o f t   C o r p o r a t i o n   d   F i l e D e s c r i p t i o n     M i c r o s o f t . C o d e A n a l y s i s . C S h a r p   >   F i l e V e r s i o n     4 . 6 0 0 . 2 3 . 2 5 9 0 8     x ,  I n t e r n a l N a m e   M i c r o s o f t . C o d e A n a l y s i s . C S h a r p . r e s o u r c e s . d l l   € .  L e g a l C o p y r i g h t   ©   M i c r o s o f t   C o r p o r a t i o n .   A l l   r i g h t s   r e s e r v e d .   € ,  O r i g i n a l F i l e n a m e   M i c r o s o f t . C o d e A n a l y s i s . C S h a r p . r e s o u r c e s . d l l   \   P r o d u c t N a m e     M i c r o s o f t . C o d e A n a l y s i s . C S h a r p   – 9  P r o d u c t V e r s i o n   4 . 6 . 0 - 3 . 2 3 2 5 9 . 8 + c 3 c c 1 d 0 c e e a b 1 a 6 5 d a 0 2 1 7 e 4 0 3 8 5 1 a 1 e 8 a 3 0 0 8 6 a     8   A s s e m b l y   V e r s i o n   4 . 6 . 0 . 0                                                                                                                                                                                                                                                                                                                            €    È6                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      x(    0‚(e	*†H†÷ ‚(V0‚(R10	`†He 0\
++‚7 N0L0
++‚70	  ¢€ 010	`†He  Dã@wßí¨?qn‘$|TR·öîD¥å—¿(§#§È#) ‚å0‚c0‚K 3  Á~Æä    0	*†H†÷ 0~10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1(0&UMicrosoft Code Signing PCA 20110220804202356Z230803202356Z0c10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation10U.NET0‚¢0	*†H†÷ ‚ 0‚Š‚ áİMÀ.Z4azçŒ ÷ğ6ÖğO®d5l¤-Ubåø>‰Œ¿6ú°›3<¸ìŠKªÊâù{ÚW0ˆ™
+Á¿?Õª$sc°fIsãün¥İ^,t+Ö[L8¦RDàØ¿ie6´ë„7TÏj~×<( ƒ#ét¸¶
+‚µI‘·ëu“òŒWfÅ½<A¯^kÄI?B3ğ¤¹t áÇô8&_†·Ïq@„‡Ê|ñ±i"­a†ìÈ÷1a…DeVBé.ólş"*te<…:Å˜Ù—`Ùªé#(¶"rÿE_‚§‚ƒs^Zó2'>‘Hw-¯æ„bj›’ô†*Uı£&µÁj¤×»J(,¨‘4íğe`-™õ[STÇ–#Íó ßçYÉzÀÚUÆ.ĞüõN1êÓÎœ1æ°ñºb¢“¡Ó²åô½ì}¨K:úfÛÎß³uÔç‰|¸´ÔÑ0÷¨¶wRg İğ·cÙ“şí%ÚÅV+‰G²&³ £‚s0‚o0U%0
++‚7L+0Uvš¤jëüÓ°Ò~e'6–ï7–0EU>0<¤:0810UMicrosoft Corporation10U464223+4722360U#0€HndåPÓ‚ª77"µm¨Êu•0TUM0K0I G E†Chttp://www.microsoft.com/pkiops/crl/MicCodSigPCA2011_2011-07-08.crl0a+U0S0Q+0†Ehttp://www.microsoft.com/pkiops/certs/MicCodSigPCA2011_2011-07-08.crt0Uÿ0 0	*†H†÷ ‚ V~àşğf{Od‚ŸêHbÊ?kX ¶BÌYUß‹[ç™Á“¿Ú˜Cæ(·„ùÏé)ÌE)ŸÏx'GËP·1ÁFğÈ-+Q´b_sõG+/?à‰d j«(OÃÒ~ÚzÂ{zşÂ‰‹ÔÉIPió¬rˆûËƒ³G=ræ­é›Q—QbˆfÕ®›ù]´Ää¿èşí¡Å!xXCöıv¡š`‰4ç˜†ım¹r‘Êp¨Pš3”@d:KÀ² ,Ÿb2¯#Ú-”·˜ßèl[cG¥…,afÌøµ†Laº¼)(a¾2øDG“X«†ö EÇğìîth³z^Óe‹~qK „ç®‚—Z_ro_ı¯}jŸfÈ¨¥Úß’É8Ü‡6ôÊúAğı`”kÚYî5N_½£Õ·>†¿¥">aÆî¦+æiğPŒL‚>%Ç ±§ŒŞZœO‰âÔ§fÔ»~Sê¤ö—÷xmÔ.’_ªØ/$rİ¦fÎê*J’Ñ€(ùDbHÈÙëÉ’À’tÿn†Æ,ÿgn©…*y	Öİm›ÀTÛÑ7æ#„5œ¿j×Êuj‚)­‡,­bOQdŒ³1¯ûÑM™|¯÷FíÑPç™c¸Z|}‚oùÜjúP[ÍŸàµ¨0ú€5	4¯ıì‡».×·f0‚z0‚b 
+aÒ     0	*†H†÷ 0ˆ10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1200U)Microsoft Root Certificate Authority 20110110708205909Z260708210909Z0~10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1(0&UMicrosoft Code Signing PCA 20110‚"0	*†H†÷ ‚ 0‚
+‚ «ğúr.­Ønª‚M4ºò¶X!ŸB*kéZPª¸8IºÃİ7kÆØğ8Â™°È9Õ1BÓ‰yd‡~”`$l¯Iœéh^Òß›S²
+,Ã¯Ù©+®z	¯×–YÊ`éfvè2R&/ç«PÏ³D·]ØÄ.u«hóËmó:\¡ôFºà8d¬nd5x¦ c-Ó@“øãŞÕ\y¥I)ç¾ w¾”=ïûã+ZMV(¢zrà:·I^ØííC‘ƒÙ{²{†Ù>±Œ]è‰O„ò¡/Yä;-®3XÅ·>ş2Ó³=±²¯’8~Ò€,õNV‘!5%Ã9ndSºœ­#„Ëôº†÷_ğĞR¿Œ”‡¼À!t%_(¶Ì'(8%˜9J6Ï|±’®#§©fìajá(I_ˆâ%]Ó!K>RÄµW?$ğÑz[/Õ#ãp]QFw³ø á¼¬‚_ÛÀ³½ÔUKç9¡é#I¼¸D|EäÁÃrzàrç$ß¿F™ÅïÂWÛƒìMI0§«ßì[Ÿ¯üİ°fâÁ—{íÖíKçI)§(¦§}g€æŠbx_²/„×Wœ\¿w((ñímÃ(,@7OÁá…D‰Ä	LÅÔ¥C/t•÷nøx X,]`•š>O3„Ú°ˆŞNô–°¼F l˜ÒàÖˆŒ £‚í0‚é0	+‚7 0UHndåPÓ‚ª77"µm¨Êu•0	+‚7
+ S u b C A0U†0Uÿ0ÿ0U#0€r-:1C¹Náê§Ç1Ñ#‰40ZUS0Q0O M K†Ihttp://crl.microsoft.com/pki/crl/products/MicRooCerAut2011_2011_03_22.crl0^+R0P0N+0†Bhttp://www.microsoft.com/pki/certs/MicRooCerAut2011_2011_03_22.crt0ŸU —0”0‘	+‚7.0ƒ0?+3http://www.microsoft.com/pkiops/docs/primarycps.htm0@+042  L e g a l _ p o l i c y _ s t a t e m e n t . 0	*†H†÷ ‚ gò†¥˜àTy.ÓØtg"›–ác’™B–}ÒyÁe_.,>øÃrÑmƒş¾?è
+Ê;¿G©£óiÛc¿"5¥—]e„}‹FPUØ’|ÒKó<B‹RĞ°ıkã>.)›æ=¥Ôµw”9âédÉD=xz#ó}¦tƒôË&F*ÂŠ»¤©›íhúh.• *?*kXIc	inZ˜–äƒôÀóF+Şü;Ğ½5ïn%®å¯'íĞİó¯™(—˜M=ò‰ÖÃ2âğÅ-Î[´I9
+Æ
+ÂÆ­®å²ÙÛˆQEX82q'±ô'øŞ,: i˜²Y‰hno§·tÃ@¦*(>‚?MfÀ³Mõáo}E§vå@*e£Ã]Rb†Ãc6—†ßÚóøò¡š'áÍ¥—Ğî]cAã[œ‡>wÑ±u¾aaµğÜÆ¾ßAÇ(îŞe/ì—ö¡\–Ø Ö¡F½Yó—¥	KH™€Ğ )Å±›¥?Ew5ÆÒ¢¢Ÿzz"úH•«ûG#€õø¿k·K—âëuxìê7™yKÿÖ³#huæ¯úü‹ë€êi;¯ü0íLßßumc‘=ÑVNO¿€W"¡x2!zïA
+±?û¨Ì¤]Á¡ˆ›WqVNHEÀBÉ›v[
+€HkıyŸÁ½mmjÉRszPÍ1‚ó0‚ï0•0~10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1(0&UMicrosoft Code Signing PCA 20113  Á~Æä    0	`†He  ®0	*†H†÷	1
++‚70
++‚710
++‚70/	*†H†÷	1" h=:PğÆ×­w¦î""·tm½øn)Fõ‘F0B
++‚71402 € M i c r o s o f t¡€http://www.microsoft.com0	*†H†÷ ‚€|Ô(Ù[*ï[„Íï)‘ô°ÄèéGEºÜ¬Äò-Bƒëæ.òg×–I}»S|áÓÖO mšXá`”à¡QN¿*­~×äÜ.„‰bb8I%İ‹g%É3å>¤oµ9½L´fˆ˜b¡“€c+oĞ¨\ø*YõÒ|Ş‰ì¯4¥ÚÀò¯ßi„€sîævİv¨}Ğ±µúÇXc¶XuèÛÚsÆ87Oƒ®ftÔãtVè_ûX§ë¥Î×ÿåÅ¹’Ñs¥Uƒ<…ªHË
++Ê±)Q‘%şœ@jŸ" Kòç«!E4F?ËåHkKÌâˆkd¡Ç70-=u7ÿPÁšaMS:ÅœÓó±î§É¸6AòT9â»XÑ^àHÔÖïÉtûo¥ùà¦Õ²½u¤£ØÁíîß“¤şı L¤h‚‡G-ü	zšŞ”Ìà”ú÷ÓİÂpû¤ÒK‰½«ñ@áI¦¾ÂEé¥Ÿ“€¤ÂşÔës“J¡‚ı0‚ù
++‚71‚é0‚å	*†H†÷ ‚Ö0‚Ò10	`†He 0‚Q*†H†÷	 ‚@‚<0‚8
++„Y
+010	`†He  ;Mp’*z‚a¾´Xñ 5éİS¸çÚfÎ¿	ä¥lŒd7ë5¤÷20230509215002.505Z0€ô Ğ¤Í0Ê10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1%0#UMicrosoft America Operations1&0$UThales TSS ESN:DD8C-E337-2FAE1%0#UMicrosoft Time-Stamp Service ‚T0‚0‚ô 3  ÅÍÍ!¡ôï9   Å0	*†H†÷ 0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20100221104190132Z240202190132Z0Ê10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1%0#UMicrosoft America Operations1&0$UThales TSS ESN:DD8C-E337-2FAE1%0#UMicrosoft Time-Stamp Service0‚"0	*†H†÷ ‚ 0‚
+‚ «H]³½_mÉî–©¥¢—FşM>É's¯Uış7ÇÍ§læ68„K÷_ğäE—m—NâmñMeLñJ¾ÊØîˆ÷¼Äeìgç¶şËÔLÌw˜ÈJ¢~y‹¼’tç©ª³ÇA£qdóÏsù»_sŸN1y=u†KJ1ZôMr¸›té·”eµ­EkhÔ²êz‚ş·â®TÀ}=Xa®Ó?=E»[ÈÎy¾``Y_w¦Ù	šÜ¡‚#0¿E;Æ—9ê›¡íÁ—W3‡Ov¿µ>!€²² <û6ixë ³ÔëÃ%“d[ˆ )ßˆş¹·hY“ãGãÒ¡œ˜o8†ƒ„PÑRaÌµ2H-fİ^F AÒo˜=Œû:?)
+`Ôí;şÎ	N}ğ¢kc9½.è†å}I¯À0MË+·¨qñÁP7ĞÃ‚%YÃåŸ(Ê€äêÂÖ|yÍ’òúmjG_Ô»cÉõ©gÀ…Ï¢´ıÖÓÃÎÄ8’ÿRFpªO+kÓ3àüÃII¾ŸÙ¯ğEè!–&$+<c8ÿ‘÷¯ç ´åá5.™2ØS`ÃÁà8VîĞ]e«­z”Ó¹(f‚†(D|€5$¤Ô@¹e~¦•g€š[”Ànò¿í
+ÇUÕï‰¡(GÁ ¦f¦^n˜qåâêÄû‚ºd/ £‚60‚20UTê»8¿Y±5¿®ÚKÂµpzMk0U#0€Ÿ§] ^b]ƒôåÒe§S5ér0_UX0V0T R P†Nhttp://www.microsoft.com/pkiops/crl/Microsoft%20Time-Stamp%20PCA%202010(1).crl0l+`0^0\+0†Phttp://www.microsoft.com/pkiops/certs/Microsoft%20Time-Stamp%20PCA%202010(1).crt0Uÿ0 0U%0
++0	*†H†÷ ‚ Œ¨Ş|~³9'ˆ¯‚vzút¯NÈæ}nô#
+ìM –I÷o±¥â‘	ı×«êu¤¥'d.ğ·WáÃ(²ü·İUrXXgôiM/³ÒÚ ¯ü€À‰CfßcW.Á»CøI¿î	^#:ãTrba¦Paùì–$Ô°Œ‡ÿñ«qöäBØ˜¡¿NkİÃJ6ìXêj'G%PßæoY²p§_¿9 éÿÄ8p÷Ç÷‚Ìà—ĞÛMårÂõ‡ÓŒhâs Ë	âTQ=O,5^vhúÌò@#îèÌ¸Ø«âá[‰+_Y”†~”²Pe”	Ä÷hv/NXX6l’ˆVƒ¾ğõñvA¸ô7çª†{BŒÇ‹´b>–ã‚BLá¥äßı«v{ß‡bBmI <
+ÇÕhâ¿	µw³ØZÆ«/»¹©›¤ß¡›ÖaKZ Ùu÷ø-ë‚ÜÑ¢üö¦U¿eVøæƒ~´€Šş“$÷ÔºØ!¶*EHÄmu'Kj.ß\*ëõ0›¾€Ÿ7©tÍ‘ªm5ÛÔ*š¢PÃ•Vÿ„™Ííi=|r93¹È:¾‰¹ºC9”p)"ÈÛ‚,u¡ğâÂ#™ˆ8-b.ÕCipõå«¢œ.å Éµ?ÙÂ¢Ö¦öSãc×#ÖÎD-¤ÓYßuD˜”#ÙÜ&A ş0‚q0‚Y 3   Åçk›I™     0	*†H†÷ 0ˆ10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1200U)Microsoft Root Certificate Authority 20100210930182225Z300930183225Z0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20100‚"0	*†H†÷ ‚ 0‚
+‚ äá¦Lç´r!y¢Ë×$y½Õ‚ÓıîœÒ©lNuÈÊ5WölJàâ½¹>`3ÿ\OÇf÷•SqZâ~JZş¸6g…F#µÏw2Àè`}jRƒD·¦FkóÅvõ†PÜÁDÈq\Q17 
+8ní×Ø&S|9azÄªıri¯«¬ö6¾5&dÚ˜;º{3­€[~ŒRş¶èb%ÜjÏ]ôşSÏÖì…VMïİ¼¤ã‘²9,QœépiÊ6-p1È5(½ã´‡$ÃàÉ~µTÜúU˜mh;šF½í¤®z)7¬ËëƒEçFnÊ2ÕÀ†0\O,âb²Í¹âˆä–¬J»¾q©[g`Şø’‘=ı Ïs}AšFuÍÄ_4İ‰Öı¥ }~üÙEß¶r/Û}_€ºÛª~6ì6Lö+n¨Qè¿£Ñs¦M7t”4‚ğò·Gí§è™|?LÛ¯^ÂóÕØs=CNÁ39L¼Bh.ê„QFâÑ½jZasÊg¢^×(vâ3r×§ ğÂú
+×coÉ6d‹[ ¦ƒ!]_0t‘””Ø¹Pù‰aó65„GÛÜÑı²ÔÅkö\RQ]Û%º¯PzlÅrïùRÄ…“À<Û7Ç?x«E¶õ‡^ÚriÆ®{··>jâ.­ £‚İ0‚Ù0	+‚7 0#	+‚7*§RşdÄš¾‚‘<F5)Ïÿ/î0UŸ§] ^b]ƒôåÒe§S5ér0\U U0S0Q+‚7Lƒ}0A0?+3http://www.microsoft.com/pkiops/Docs/Repository.htm0U%0
++0	+‚7
+ S u b C A0U†0Uÿ0ÿ0U#0€ÕöVËè¢\bhÑ=”[×ÎšÄ0VUO0M0K I G†Ehttp://crl.microsoft.com/pki/crl/products/MicRooCerAut_2010-06-23.crl0Z+N0L0J+0†>http://www.microsoft.com/pki/certs/MicRooCerAut_2010-06-23.crt0	*†H†÷ ‚ U}ü*­á,g1$[árKü©oê\¶>NGdx±“—=13µ9×Âq6?Údl|Ğu9m»1äÂûlÑ¡”"îéfg:SMİ˜º¶xØ6.œ©‚V °¾‰èiàº	î{ßjo¾)ËnØ?HuÙŞm‚õm#TäxSu$W¹İŸó=Æóhßeö¤Vª÷•¶(U'Ğ$½@ ¿¶]='à@–8¬÷ù)‰Ã¼°T…B³ü‹‰çğjÂBRuŠ6ÂÃas.,k{n?,	xé‘²©[ßI£t¼ì‘€Ò=æJ>f;O»†ú2Ù–ôö‘öÎÆtıöLro«u0Å4°zØPş
+Xİ@<ÇTmctH,±NG-Áq¿dù$¾smÊ	½³WITdÙs×[DZ‘kŸ¤(Üg($º8Kšnû!TkjEG©ñ·®Èè‰^OÒĞLvµWT	±iD~|¡alsş
+»ìAf=iıËÁAI~~“¾Ëø;ä·¿´Î>¥1Q„¼¿Á‚¢{‰pşçµĞ(‰6ÚºLù›ÿ
+é4ø$5g+à¸æŒ™Öá"êğ'B=%”ætt[jÑ>í~ 13}¼Ëé{¿8pDÑñÈ«:Š:bÙpcSMî‚m¥Áqj´U3X³¡pfò¡‚Ë0‚40ø¡Ğ¤Í0Ê10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1%0#UMicrosoft America Operations1&0$UThales TSS ESN:DD8C-E337-2FAE1%0#UMicrosoft Time-Stamp Service¢#
+0+ ! öd’»qJ:Ûâï„Ç¿ç ƒ0€¤~0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20100	*†H†÷  è®!0"20230509193353Z20230510193353Z0t0:
++„Y
+1,0*0
+ è®! 0 â0 0
+ èÿ¡ 06
++„Y
+1(0&0
++„Y
+ 
+0 ¡ ¡
+0 † 0	*†H†÷  ÊbxÅÚÖªäNkÕC5E‹Nc¬»ƒ|iÔnôjÃˆ°LşÁÈµÜñÌbˆáv#W'¬ıc•	»x†X5d€ cL:ˆ¨6-´7…âgvNÎ¨`½½¬Â…°‡JÁ²ßbß0G‚øë-öij4“ØtkÙNS—:1‚0‚	0“0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20103  ÅÍÍ!¡ôï9   Å0	`†He  ‚J0	*†H†÷	1*†H†÷	0/	*†H†÷	1" NİÑeƒË6`­±MâmeGffà€Ø’ö‹½&Õ:0ú*†H†÷	/1ê0ç0ä0½ ±‘ö$wL
+ù]=Àí,;ë&ò Ê>D¸£ê¼Ô?|±0˜0€¤~0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20103  ÅÍÍ!¡ôï9   Å0" òBTFádLN‘Ÿ!Ä4^;³)ÅÔ÷³¢—y™İx®Y0	*†H†÷ ‚ ªç“(œIBVeÔpëÿ˜ Ó+İ-œ*6æUíÕ™‚Ø%·’äW©ùbDgmušÏca— AWÓÓaé8JÒú?ã±"õü[ >#'c4¡ØÇ':Íë/ !ÏTNŞğ·|ƒ±}/ähñÖX<ü[`C'İÖqüÖ$lyæÖ#È€iE×`šååzÈ4÷BÛ	½;º¼ÖA[t(ù[¯¼™4¾ 54")“iÂâì®­
+N©Î¥XÕ63dCTû\à7hLëæ½Cı½:Â]Åšÿ…ÒıAÇÿgÅ(>‘ä„ùYT’È^.%e÷;¦aL ¡4ÕÅ#õbŒv~›±
+kÚ9}Yï4á«;ÎÀó14piü£˜j.JÜ*¡>Š6¾ê£ƒñ¬ıNãøbd¯R0=-äMYYŠlx”òì«{Óo0#["¾Ç¥ı2ãmIBW§Ğm;:‡.ı"XÇ¬“º«Õ4†/Öüv´Ñ™ï¢Ê@ôÉ÷rÓóv”¯—Ü)x dèÓ§×ÎœH7T(~úv“maÃGÃ Rb¡u`°ü«ûòp!8±Œ)²æ¬ñ&À¨­'	‘±y(ÛK…3ÀõDû¬±œ¦o6™HÖ?şxÄøÁ¤´¿V                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                MZ       ÿÿ  ¸       @                                   €   º ´	Í!¸LÍ!This program cannot be run in DOS mode.
+$       PE  L 3ı©        à " 0  X        ¾w      €                          À    Ã  @…                           lw O    € Ì           b €(        Pw                                                              H           .text   ÄW      X                   `.rsrc   Ì   €     Z             @  @.reloc            `             @  B                 w     H     P   h  	       ¸%  Q Ğv €                                   BSJB         v4.0.30319     l   0  #~  œ     #Strings    œ     #US       #GUID   °  ¸  #Blob           	   ú3      
+      	   	                    ‡ i ô i  V ì   Û > À > D > a > § > - >           	 P  P  P
+ ) P 1 P 9 P A P I P Q P .  À .  É .  è . # ñ . + . 3 @. ; T. C ’. K ’€            ‰û            
+            ±     <Module> System.Runtime DebuggableAttribute AssemblyTitleAttribute AssemblyFileVersionAttribute AssemblyInformationalVersionAttribute CompilationRelaxationsAttribute AssemblyProductAttribute AssemblyCopyrightAttribute AssemblyCompanyAttribute RuntimeCompatibilityAttribute Microsoft.CodeAnalysis.CSharp.resources.dll System.Reflection .ctor System.Diagnostics System.Runtime.CompilerServices Microsoft.CodeAnalysis.CSharp.resources Microsoft.CodeAnalysis.CSharp.CSharpResources.it.resources DebuggingModes it       q¿‡LÒãDW»Şnkt>      °?_Õ
+:€  $  €  ”      $  RSA1     µüçg‡w:Ş‰8ÈÔºe¹ `Y>–Ä’eˆœÁ?ëµ?¬1®Ó3Åî`!g-—ê1¨®½ /%Ø}ºoÉıYÔÚ5äL9ŒECèã;„&=®Éõ–ƒo—È÷GPå—\dâŸEŞôk*+G­Ãe+õÃ]©        TWrapNonExceptionThrows       Microsoft Corporation  3 .Â© Microsoft Corporation. All rights reserved.   4.600.23.25908  = 84.6.0-3.23259.8+c3cc1d0ceeab1a65da0217e403851a1e8a30086a  " Microsoft.CodeAnalysis.CSharp     Q ÎÊï¾   ‘   lSystem.Resources.ResourceReader, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089#System.Resources.RuntimeResourceSet   ^	      PADPADPş¥€îœ2€9²<€¬ºI€ºs€-¬t€Ù‹À€~uí€.‡ï€›ª	Ì}YŞ>œ]ğ£/1i‚%¢‡‚sÁ–‚è³‚‹Pƒ{Aƒ¡æEƒÑ}ƒ]€ƒO¶ôƒI“„¾ö„’›>„ıÌh„å“l„øm„Å¥„±%¹„+ÄÔ„Hğİ„ıå÷„ğGû„:d…^Á7…ÙÍ?…ŸHG…,îY…Qø„…nˆ… Ï¢…w‰ã…×?ü…ÿ…ûã†â„†ÇÕ]†_¼d†Êw†é©¡†UVõ† ;‡O ‡ğ°:‡hİa‡ˆàr‡Zß³‡¿d´‡e5÷‡’ˆóA ˆ­$3ˆUc@ˆe>`ˆô~bˆáänˆˆ—šˆ²ˆ³¸Ñˆ{ïˆBìòˆIÂ‰œ• ‰:'@‰;'@‰Ëbs‰¡‘Ì‰—ô‰vWö‰¿Äù‰D|Š2	\ŠÒûdŠ’jŠolnŠg}ŠãŠÈ`òŠò‘?‹ûBE‹'H‹=£K‹AÇ\‹Lrh‹
+¹y‹/ ”‹™ˆ«‹n»‹.æ‹!ô‹¯eŒ–¦ŒyÉ°Œz¥ÓŒOöŒ;[ã/,¨É3øßtîü¥
+³mÃñ×~­Üâ$+Áp-û?6HWKĞñcõmuˆšŠ¬¹û<œA•şB~LwÖ‚’…±ÒÑçîÙşsÛĞÊñƒ>òîjòƒ{h&üs1_Eıïf|0uÇøuLÖv­ÙzöÆ·ü±è¾ÂÃW(Û#‘êYf‘rÓ‘í‘7=2‘§Òy‘w½¡‘Æ$¸‘=³ç‘¾õ‘Q'’eä<’&¹A’ÈÊF’Â0G’£Q’¬Ÿg’¸•ˆ’1P£’ÍÍ’Q|Ï’ÜÒ’ù/“Ÿ2“Ş5“HúI“Ş?S“dW“¨c“uÔj“B#p“Ç3“¨-´“ÃqĞ“~÷“´%ÿ“Ç§,”ÑÌ4”œUE”ÂÓ ”pO­”¥¨¾”À>Ó”.Çİ”,tñ”Ø•ÔA•¼YC•ŒJ}•ì£•½§•r±•Vü»•¯Ñ•0×•>8+–ƒ¦9–nE–`O–¹_–‹c–M¡h–Î½¥–?·9—¾Jo—/<—ßaº—ü»—«ñ—E¤˜¬ï˜'Æ-˜§ê0˜ÕbI˜˜q˜ÓN˜´”‘˜ôÂ“˜u¦Ã˜<WÖ˜^®à˜¶ñ™›á%™¤¾2™˜–;™ÍR™‘…™@ ‡™.Ÿ™3È¨™é(Å™N)Ç™âî0š	>šiPMš ™išNšâú³š“Z¿šÜöÇšóÃßšúçšEÄøšà›W'›ØR››Î„›Úy–›zš½›ƒÍÈ›Bœ‰"œW·!œÂßyœ´†}œù}ƒœÌ¨¸œŸÿÖœH 'NÔ(X:Fnáhiæ{±á®ìËBêY 4p™DRQV÷¢}n£Íd¾#Äø¤æªHèp ŸÆ Ÿ ´NŸİûpŸ¸³„Ÿså‹Ÿ´ ‘j u> £Í1 •€2 ZLI ‡-U ^f\ ¾ )™ ƒiº ¼ bÉ _Ü:¡.v;¡Ü‰b¡Öi¡(é¡e¡Tİ¡ë4¢€†O¢6¶“¢5µ¢ónÜ¢®oò¢-ˆ>£G+m£Y™£ p—£lŸ°£/Ä£¥è£Tbô£g· ¤B1¤Îş9¤ÀŞV¤yÇ^¤¥%v¤šßx¤6á…¤Óï†¤ÿ•¤{¤÷¥¾¤G%Ä¤©*Ó¤×¾¥ ¥×ï.¥	‰A¥xîY¥Òœ¥îG¯¥´9°¥¼FÄ¥k›Ø¥â‹¦°Ø¦½ÉC¦“£J¦|l¦
+¨o¦%ù¦—¦‘¡¨¦"Jª¦=Qí¦hê5§R§G{]§àòƒ§§p¤§ñ7®§$î°§]‹¶§Æ­Ã§ãÏŞ§O¤ê§€¨>B5¨¦Ò<¨€©@¨Ehx¨¾ˆ•¨â1­¨s€·¨ª{Í¨?é¨»Õğ¨†ó1©òs©ı×‰©TSÊ©ãğ©\çğ©ÓªêÿªÛÄ)ªkxœª.M©ªŸ·«ªL:²ªø+¾ªˆÖ«?Ñ«Ùê«:ØG«…jP«eyh« h«ejv«¥(z«oÊ¢«Ô@Á«XğÉ«s’Ø«úl$¬áã5¬qBA¬Å”{¬†€‹¬MÃ¬NÃ¬+¨¬ú}ª¬rÿ±¬óÕ³¬Ì"¼¬“Y¾¬‡ÅÁ¬Ùı¬€
+­ğ€­ç?­´M­åCr­„¸…­y¦¢­F×¼­>Ø­ø˜ì­“A®,)®S I®+r®»„®ŠÃ®—šÛ®«¯šÖ¯ò(¯È~W¯»ÖX¯¯Z¯×_¯V(r¯6}¯Ÿ©†¯Ä¤–¯°#¥¯|±¯ëşÅ¯Ádà¯© ï¯ŸÁ(°Î T°B¾d°·E›°5¦Õ°äŞÙ°ˆPİ°mİD±`	E±a	E±c	E±Iòa±Nó±§¦±“A­±«|Á±&ÿ±Ø~1²¯²>²ê¡@²|wt²D•¡²Âg¤²ü‰Æ²@±ã²/eû²<î,³Ö4`³8gg³²³h‰½³hãÃ³£×³ñ‡ß³)´ãƒ2´c”7´¶@´y(v´í°œ´w|¶´e¹´ÛÅ´—ÇÖ´®àò´ÈÏù´±tû´ùµt{+µ†Õ5µ†›8µAëPµ4]fµ?Ênµİã}µôQµ4ğ’µ¿‚£µ§]Çµ%>¶†•b¶˜<¶¶‡¶ºrš¶‹§¶w¿²¶ù¹¶–Ã¶ô¶^á·…¶3·%64·Ä Q·l`[·‡S«·/sÅ·„ôÌ··-Ï·ïÑÕ·>Ø·c·¸ã×¸\CY¸•îy¸…Õ¸/Ÿ£¸”L×¸
+‹Ş¸ c4¹²äH¹FÂ¾¹ü(Ì¹¢$Ñ¹?Ù¹Ö« º<º,=º>9~ºMLº%‘ºé·º1¶¼º»6¿ºGèÂºš/øº’£'»>8+»¤™J»Õ÷J»—åi»&ª»†Ø’»}P”»3š»\§»¤TË»#iè»ESñ»	H	¼²º¼àC¼ö×t¼’u¼÷àµ¼u½xq½¤+½Ù+½±OD½ı
+H½-*I½(v½ «w½ûˆ½nQÀ½H«Ä½…±Ú½Câ½Hä½¨"ò½Nû½	Û¾lë4¾œåv¾½¾X~œ¾h+¿Ğ†9¿;ßs¿dŒ¿³÷˜¿ËÖ§¿o«¿ëî¿è2ï¿qƒÀ÷ñ'Àÿ·JÀ¿õSÀeøhÀĞóxÀ&~ƒÀ*˜À »ŸÀxŸ¦Àµ;ÌÀ@0ÔÀTÑ-Á¡dJÁ$ NÁTcÁßófÁ´ˆsÁÇÁ«-ÓÁ<ÏåÁ\§éÁøIîÁYÂ$œÂĞÏÂ; ÂOMÂ-±!Âl'*ÂÍò>Â:ÅMÂ$šUÂ…mÂ'ºsÂ‘ÖyÂ¸®zÂ7&ÂÈ¢¤ÂzÂ¤ÂbWÄÂĞàÂm”æÂYà Ã?Ã9%cÃ·5kÃzjwÃ3÷‘ÃÇá—ÃSšÃ£ØÃììçÃUÉôÃ·õÃŠcÄr$/Ä`‹KÄù´–Ä‡QòÄñ@Å²„OÅQ_]Å®ê~ÅBö”ÅàìÅÓYÆÕ;Æ†™Æ!‹_ÆõrÆÚb€ÆÙ‹ƒÆÌe–Æ×N®Æ|·Æä0ÊÆIğæÆT¤ Ç…AVÇ[ÇÙÇNß×ÇÖâÇôÎøÇÚŒ(Èj•+Èie:È-0ZÈ“”È½ıÈ®AÉªéÉJ´=ÉY eÉ‡htÉÍvÉ‡©³ÉpÔÉ Ê¡¼*Êşc:Ê„h;Ê=Ï<Ê¶úDÊÂRÊ'Ú“ÊËº˜Êp¢Ês¢ÊU*ÎÊ„Ë—¦)Ëà67Ë3DË€JËé#RËÂxËæ©ËÎÉÛËCŞËÔıË ‚ÌØ=?ÌØÖJÌzFÌuB“Ì´b”Ìš­œÌd“¤Ìz­ÌÁzºÌâ‚ÊÌß{ÍÌÊñÌvİÍ„ÍÿĞÍ’Ğ%Í19ÍºG?Í-”eÍ¤PtÍ+œvÍÎzÍ1†Í†ˆÍöØ’Í Í›m¿ÍèóÍ¼<ÎĞ Î·3ÎßYÎÉzrÎÍ¶wÎ44¬Î² ÜÎİšóÎdmüÎú/Ï¾VÏ
+<ŠÏÁS–ÏØÄ™Ï­Ïü°ĞG“ĞgÁĞ/O&Ğ„ê?Ğ2DĞ%EĞTNĞ@maĞ¦¼„Ğ|ˆ¥ĞÃ³Ğ´ÇĞŒ(æĞõÑÛBñÑSbÒœSÒ2Õ{ÒÑâ€Ò¦a•Ò1h¡Ò-½Òµ~àÒîÒ×)ÓAMÓ„µ`Ó6HjÓ·@‚Óu‚Ó„Óo6²ÓsDºÓ¢êäÓAxÔ æ9Ô€`¦ÔÑèºÔ:·ÜÔäÆöÔ+ÃÕçù*Õ&R3ÕpP<Õ©8sÕ¿»ÀÕC8ÆÕƒ¬ÖÕ[•øÕØÛıÕ*¼şÕsšÖa)ÖKJÖ$’JÖ®Ë‹Ö9ZšÖ9XŸÖÔ¿ºÖÀ‚ëÖ'¤3×°AM×D(a×ŸEø×ÜË=ØÆàlØ»tØE8©Ø.ƒÙÖËÙ
+ÙvÙÇA'ÙÍzWÙÜ´†ÙÇ™ÙÉ¡Ù(§ÙDÏÒÙ åÙ¤îÙ–öÚ×.+Úd'vÚ5˜xÚ1‹ÚÕê¥Úïd§Ú¥µÚï¿Ú&ÛÚ¡uêÚ¡íÚ]bûÚ®ÛãÛÂ8Û?×SÛ<1yÛI‡Ûdt–Û ÁÁÛù'ëÛ¿rìÛxÜ§„GÜ#îÜ¢òÜåõÜyYİgµ@İ’ÑkİjQnİY‡İÀ¹Ÿİ—¡ÆİŠ”ëİg©íİ ¡Ş¯9ŞÙäJŞöŸ]ŞØ·ŠŞ+V»ŞEßtõßD!ßŒ¾2ß{ğDßV-Qßa^ße‰ßÓxß›/ßÙ… ßñÖßê áß:~yà!ó¶à>ø¸à= Øàá¹Æ3á@'4áÚEHá ˆ]á|Çkáôµqá l„áé?Ÿáo¤á×É»á
+6ÚánéáãUâÿÅ{â*ø›â/–£âl=¬â.³âW.ÌâÊ‡ğâ,ãQ6ãÕédãJrãï6ãFı¶ãÀ¶Èã‡…èã–‹Mä<ªä(1²ä;öÁä‘å2åğ=Yåúa[åÛ~rå¼£xå³åÜ°Şå,ñúå“æ—˜æo€æƒ†)æwT[æ¨r}æ 5‘æGİÂæm'İæ:Õâæ_¸çe-ç<Mç×èMçÚZçænç&£tçîÀÂç;jïçK9øçÎBèÆïUè82èÊ€è'‚èÁwØè2†ØèH•ãè)[sé·éÆVŒé3¦é§…ÜéK`÷é%`êJ''ê†%gê—wnêï°pêÿxqêˆú•ê¬9ÆêÁXÌê¶ëêë7®ë¦Åë·t0ë­6ë†-:ëoCë Çë3?#ì›+ìNœ>ìŒMìåMì_}mì–UìÖe–ì¨¬ìˆ‘³ìD£çìß)÷ìœ&ıìƒí/&í8míëİ„íÒ’ícT§í‚Æí½cÈí:÷îÌ·ZîBStîL6~î3®°î:Ş¸îı¿îàûÓîâ²Hïbï;gïõİmïK!sï\Àï¸ëÏï*óïiVğráğKò.ğBğtLğ.`Pğ¹ªVğ­èyğ ™ğ"d¸ğŠhäğ5Øìğõñ¸CIñf©ñT*Äñ×İñ 
+ò³'òm›0òÍ8`òl	kòí—xòµòKLÂò¦‘Èò¤ÖëòäNùò.eóĞ–óñÄ ó¹È ó…+)ó÷@ó&+^óq‡dó(Òló`'‚ó;«†ó Í±óf ¸óİ/ûóÖ,ôZ`ô+YpôwgœôÈ›®ô	ğ°ô‹Ê$õ³5/õ—êõ½R…õyy•õb…¿õ¥jöoS1öFë>öQ§GöÜmJöòUYö"‚öØ°‹öo¬ö\²ö4&Àöo÷“ ÷7÷à¡;÷"şC÷æï{÷øl~÷Jƒ÷‰Kµ÷™ò÷Eé1ø}Ù8øäâ?øğqøá8wøÀÊ›øoë©ø–Í¯øÄ*Êø¸ÀÜøÛïİøâæèø‘Œù#Ÿùa#ù)(ùõW5ù68ùØFùC¬Lùv Mù?WùÇ@xù£=šù¤ÑÏùìIéùØøùû‘ûùŞ5úi ;úÏ‰Pú#[úÈéœú„ŒÎú1ıİúZâúq*âú¼îú{Ğ1û»’Aû1“FûÑŸXûûgfûÌdxûb=~û&EûKz¤ûOzåûF5óû‰,üQD.üÎDüÙÖUüK~ü£¬®üıŒµüëìûüJdı4§4ı©Ï^ı¢ˆıGÙøı’ş3|ş=şœuGşjNşU|YşKdşjş`ónş=—ş8
+ÖştVíş™5ÿ7¬Cÿ¦ ´ÿİáŞÿÀö 2% ğ7 e(A 6Fx =Ã« ÑjÂ ÛOù _ùù Ò36(O6ŒVÚ%œ½T«ğôqŠr_8t;§Ø{Íp“¤s/¬İ/ıRD(xgÈŠ|ãô™£§Õ‡§<ËÆxyÇ'wŞúpëïbD"éu"á1HïfÓ9x¥e}É˜Ó“°à²·Í
+¾<ˆVZï^¨D¶$
+ÅÀ¤áÍ(ı«)©e2ã÷Võ­À?éı¦j…‚?P7v8õŸÆëÓå›ÙqÒàÿç'ã&ˆÒW/eBö¤†•~»rÙ ŞÜ¦^	z&	¼!8	fÊC	uØD	ê§X	Céd	ãàq	¹åv	wš	s³¿	­Ã	1ùÔ	0ØŞ	ƒXú	¨}
+àû
+J
+JÔ.
+Õª>
+°t•
+õßÄ
+ì_Í
+D”Ş
+`±ğ
+Rnñ
+†û
+b¸'×xa*„d*õ‚/™ùœ¶"êÆ©rƒµ;wCRÖQ€ûW÷c|HpŠ´`ßy ãI”¤L.§ù7d.@V(P	ºc6Ûnql~m™‚öc”ÓÄ¯ÔG•}µ'z~kIˆ°¥7£©m ¶!­Æ§ŒÏu z¼%@3)ü>`ãcöqÊ6ƒ‘‡ÃWdÎ:Ó˜sİÌæIpúg3ıE9:/AÁ;C=WdßÕnÖ9Kî),¿ÏŞoãÛ}4mà9ÔòÜ·VúQÅ
+àf?"Z¼&NŒ1ÿ[Gz¼a>Fgİ/p,§” ÉŞøáº5ãBì¤i»vøUJÑCRº¿s<½à€¡k„¢7ú¿xñë–¸2P4%íRA„SÍ‹Y3S¡ßøÆ73Ô<ï%eûSÅpæA9çM¢ÿX0`e<|Ç\ºwfÂ°MÍ,äı‰ş9'	×Uh0¶÷06×xªr„¿·¡ÌH½HñÎMìĞò ×& œ(ù*SOásc&½“&{·8ÕCg°z?O•©±
+…5nÖZk·\í³gPG|XŠ$¼’º£r¨½<ºô²½šËÍæUİ¸àåğ	‚öÇ¼(ÿ"[«ˆÅ¾¡]Ü_°M‡WVy<]W_p ,„£7 ¤§òï‘R0Xr\’`^Få¾æÄ¿îKŞöÃ*ş«)ÍN(”dIijO'u¤êZ‚ë:õ= `I#ŸUgV'Ÿá†±=X}äõö; ¼Rf S¹f ¤o óht 2*† ±Á A“º Î¾º Á¢Á fÎ hû &‹!?|9!ã;!e
+I!ê&_!5_!ï!ˆ:¯!x¿²!ëœ´!áº! -Õ!Š½å!PÁş!@ì"±""¤&"Ä="–WP"b.”"1ó"QÄ@#MÚi#„#ä)Ÿ#€BË#Rå#Pëş#F>$Ê3£$©$Ğ)%Ûv%¼¦%A8%%àŠb%…Xç%‰r&@å{&Ÿ¼³&‚Ş&·)í&¢§'»€2'éI'…ĞN'‡ƒ‚'Ñ†'X©™'l©¦'Ô™ê'„(ã™(7‰( .("T(GJY( ªr(Ær‰(eÌ(Ò}´(ìì')’X^)ØÆ`)a)Æsx)ˆ†)à£î)n *î*p3:*I+Q*ÔÓS*ŠÃk*à’o*ğÎ§*ßÿÉ*š±Ø*•×Ü*;Ş*òvß*Ñ{ß*$J7+©!x+Qñú+sÒ,3Í
+,+Y,ÿ˜G,	¶Z,	e,·©z,h0¾,ÍÇ,Õ†Ë,ºÕ,ŒŸÙ,o¡å,Œ-­ºK-yÊs-8¼’-#¾-ì#Û-Óäï-%…ø-ÕÌ.tA.x3.S.ÜÊT.¡ÎT.=El.˜ş|.ø–‘.ÁÅ.<ŸÖ.Ã<Ş.s¸ã.‹õæ.ÌÊ /ñ0>/!&D/-mS/¨ºS/ÇF•//â™/¨œÃ/Õˆâ/û0½t0…í!0å1"0+@0´:G0—¡V0‡İu0àô0pK‘0«—Î0j½Ó0û«ó0>-õ0$d1Û*1`Ø-1©=1é¿=1…ÏÁ1èİ1êÙİ1Ó
+â1zãæ1¢ >2¶«@2ğëF2dêR2äøR2Ë”2âºš2L©¼2.oÃ2©Å2
+–â2e€ù2ün3Q×3Í"3×UI3+Ü¥3ÿ‘µ3˜Ó·3[»34‡É3ø¤4éÃ4™µ_4äi¥4 ˆ¬4Â…»4Åå4†Ìé4öèÿ4¬t+5û2e5ˆ5ß+‰5s ­5Ùô6_Œ6ã06Æ{^6ux6²´š6ªí6±îc77hp7£Ê7[š7Ùc¢7yX­7 ÿÀ7]Öß7èvà7Mâì7üù72ëš8(¼ 8PxÆ8sJÎ8²>Ú8Ş+á89%â8ó¸9™o9¦OÂ9©—ä9•õç93.ö9Ô0:rØ:î- :e/:|
+0:fÒE:,¸^:®|:ºS¼:Î¼:ğüÔ:Fç:/|ê:*;˜–/;xEC;¶]V;<Ùl;[£s;øªª;dÿ;" <‘Õ<ï¼<py|<Ù¦‰<vkŒ<±ş< ÿ</.
+=-¼&=Å»B=ÏF=^r=ØÍz=H‚=ˆ-=ùa”=8¹=óWÓ=gæØ=édü=¬>mP>î'>R÷L>‚5k>m>aL{>âX±>£Í>(ÆÎ>3ïë>Sêğ>Şz?!ÇC?a°E?&P?C<^?õÎe?¯Ê€?@¸£?k$Æ?![@@ê
+%@<ÌU@Vf@K[u@ã~@éK@Ø9£@³Ó
+Aø4>Aö”IAXûNAíSaA–‡hAgÚiAnØ»AÇ¢ıAv%B4wB¹"Bfè1BÌBöBÄÿBFªB3ÀØB±èB€íñBDRCëåC¶ğC]”%C¦R<C‰JfCmÄnCgîC8D1ª-D`ÂRD²vD}GDM¥D-bÁD›LÊD¨äÚDMñDppEß†EŠjEdäqE¯E#K»E3u3FÜh7F^Fs„F(Š‡F/G­FI.G!4=GtğËG2®çG}«ëG0$HNd;HÕèXHáÅ\H¼ÈgHÑÿkH”Ò€H%FèHÑhEIdòkIÓ¯lI™rpI9ìzIğ…{IyÌIÎI9àIsäI´³õIråJ“‘Jñ1?J zJs€JÊM‘Jû?ŸJW“ JBo£Jñ¦J¡WÂJg5KÜK9>K1K5ÇPKŞcoK’kwKc™KÓ	õK]m-L¦RL7—vL$+LVÍ—L{! L·!»LqÜÃLœ•ÌL¯ÅMv¦CM¦ÌaMpfvM†ˆ“MdpÂMbÇM	PÓMÕøÜM¨ENÍ‘ZN­ÍN‹ŞNÙ4àNjBãNãrúN¿OG™O
+ OPCHO&¬UO;·YO
+lwO÷~O~i»O”ò¼O³ÁOJJÎOÓaÓOY	İOpğO€6
+PÛLZP¹Æ€P&±ÄPdÌP×¢ÚPêÛPg#Q@5Q·AQl¶kQ×}QyQƒ~QÈ(›Q{¾Q¸?÷Q„&)Rgy4RøÇ9R‡úmRÉvRm­RºĞáRâÉåR–méR´ÎòRô•S°S•S…‡'SıbcSò&dS$oƒS ¤‰Se]™Sf]™S PÛSĞtTu«TÄTprT´å)T6C0T>T!›nTcßwT€TbqŒTÚõÍT¯Uó÷;UÌË–U¾Õ±U¯náU	øğU¾ÿüUğ“VÓ²2V:Ú5Vâ=V9zKVÆõhVåzV"§ÄV®mÍVYÔVIÛVX)ßV¬øüVèIWÂø#Wé*Wyp0W†VW*_ÈWêXÑÅXN-+X3
+vXû€‰XÇX&¶æX¡%YŒc/YÚ\;YÆÀ>Yá´yYT*~YÔŸYÉûY>ıªY{‚¸Yy9ÅYæŞY¨áßYûÑåY›çıY&4ZİeQZ”jZÖ]wZõ%ÈZZ„ËZ#×Z‡KõZVgöZLc[tH[íÛ2[¼ñ‰['Âœ[$EÙ[?ÕJ\áJ\Õòw\cy\¹\¾º„\¼„\ïu°\Õëå\úæ\ó)]?†)]7[<]ê¯P]aX{]´—]’[¿]ïUÏ]e³í]‘°ñ]p¬^C3^¸7^bV^’úW^bõb^Ær^d«|^âƒ^ÎG²^¸ª½^ó!Ã^ÖÂò^˜ô^Yú^ÂI_ò¡Q_~x_ü)¯_ÆùØ_#Ş_şõæ_iÒø_3`mp`‘}`T…`V†³`I¼`V;İ`­lè`øWDaI/aa#üwa¬êa«Ê°aèæ¼aÁ¥ÏauÚaYzéa:)÷a¾Ób4†b›,Ab[Ob£©xbDÉ²b¼bñŞbòŞb<6ábîóbJ,ùbwì]c§cÆ‰«cdÕc¡%ŞcİM÷c¢ûûc}d¹d†•d½d:§dZe_#e|Ú6eäUeÿVe4ÀWepïye{ëe–e^Ô¦eU²Úeğ$ffÿ)fW\fUš±fÂÕÕf_ğf‹ôf,Æg2m g{¿|gZgÜÑ—g4rÜgıˆ!hU…hÁMˆh—GÙhÕaŞhİ8òh¢ñi£ñi¨ñi©ñi«ñi¬ñi­ñi®ñi¯ñi¼i(i`å(i áTiµ—”i©T¶iNWíizÁñiIUöiS³#jÎ£Qj†•_jàéj	êj^Y#kEkØHk¹èJk@’k[U±k+ Ïk¶Ók½¬èkktòksl3l¤]*lM,lL›5lE«Yl¿F\lº6ulõY|l¾ó|li’}lC}l»j’l`2°lœn¸lÏšÃl˜%ØlZ½ßlÄ0?mKmÿ:^mşrmHÖtmN}mj¤€mÓ7–mS¯ümÃnÑ‚
+nğ•'nrCQnßç¸n¢£Ìn+ŠÑn56énõåïnêKünázoâ5oıF§oå>ÀoC^×o–ÙæodMpÄg"pC 5pı lpí p=[“p%ô®p$<ùp,,qù0q–'4qŸ©qq×sqàÕuq<eáqviêqi÷RrG~rr%Â‰rW¹r.¬¼rø†ÜrQZs2fgsÖf‚sƒ¡s"Ós¦?Õs(°ãsóåsàtósHtUWLtjYmt[”vteS}tƒ…tyQšt¸Îtd˜]uÁ…huvuºZvu¤Ø•u®¦u/îËu?Ñuğâ(vf‰`vZúcv4hvÖsve vvù’xvÉ¬ˆvuh¤vi¬v#»vN Îv]tèv!ôvEÍw[:wÕ4w™HwZ+#w¥&wÀk/wûqRw ŠXwãiw3{w K„w<I—w©weÇÛw6îwè x&óxâ°Hx“îaxİšlx({Šx·ª‹xß«xÔX²xš°¾x»ƒy;yaS+y<+Ky‘OXy.•gybjyÆ syDwàyKŸñy£9z¤ABz†Jz|‚z=Æ‡zûzõ>¬z¿zf„İz™{D={Xr~{ë5Ò{4•ÿ{ %|E'|†1|@48|P;|z@?|œ&W|…^|õw|É§|·|:é}ÄÎ}†ğP}F”R}]÷…}O·“}Ğ”–}erÉ}¶ˆÔ}šÈŞ}B5â}Eä}ªì}äC~:~õˆD~”uN~>,†~ğğö~îü~ï0zG1X};şÊV0j®¢kjÆu«gÀ*ŸÄBqåÊù  İ³  › 2  QU Ğá  4– ?K ©… µ‚  šr  ¤e  ğW  ¦" ÉÓ  81  JÒ L\  99  œU  Hy Ä d Æ hY 1 ›\ qB  ² + oU  —Ñ  Tz  bâ ¬°   ‡l  ·£  !'  : ì‡  	X #_ @C 9© ú 	Ì '$  ®} Ú² áÁ  " `¸  È  Ğ;  Ûú H q­ ÈÃ  ì i¦ W  »Ú ´º  g  ¿b 
+  “(  À8  øñ   b „Ü  PŒ gh  ¦   Ñ  ßß K Ü=  Ğ Ê!  _Ë u|  Ğ   ³ ±H ïº ù  !  úN  Wu C  $ æö  ”9 ıN ÿµ 0 É˜  M  °A  qv  ØÛ ÈÎ JJ  öü ˆg ¡• Ø• ğÎ  F Œø  “  … ş“  Ÿ  xƒ Î0 ²Á  &ë  ¸å ô”  …8 ê 9! •H  bµ =ƒ ìX  7ˆ  L CP ¡!  p dQ E  @0 ŒÆ  ¤ w¬ f Ùé ×y Ø Œ ”i ÇÜ  j   ÷  óA ³ç ‹x „# ºa  _  ”¾  °D å   Ø´   Ğ< H# ÷™  -A ®³  >Õ Éx  ©$ ¸4 |É ¶Ô   ú&    «W L !ã >æ 1X  £  ¥*  éò  Ë Š )Ú |È Ám  Rl E‡ ëY  Ô ‰Î èÙ ƒ; ·  Šf  Í,  ãt Ô§ A¢ =6 X³ ¤ óM İÀ  m Kà  ƒ¯ ø   |¥ õù  D B@ Õ6 Ùû ­‘ Oi  nc ¢ Şô €ì $a Q  ˜ü  y  §İ 3ú Té E ’ »  ^Ô  åŠ  ² e’ ³a û½  ’   åM ‡} ÍÎ  }ú TS  [¶ ê‡ ô3  ¥T r!  î ª5  [P  Š  fË  šO êâ Ç  W L5  yĞ â T  BT  hñ  'j Ì— ºU ¡[ É?  ‚C ù(  B	  ¡ º9 †&  É+ uy @Î  Ó9  É> <Í *Z  –¶ +& c“ v  ±- ¢˜  ¿ ‡½  U Œ›  Å2  2u  ˆ* š6  'Ø T 5ğ    æ¥ .` # JI  ºØ ›V [a  ŠC  d”  ùV ãz ÏO ¶j  ÷â  =  D¡  rM  … F8 ¦/  ÿÿ  &c  øê ÌE Î nm ä® şà Æ:  ¢   ¥:  ø× ©  B 2  h÷  }N  c9 &+ |/ qš  ÿc  ™ M•  Œ1  MD  ãÏ õ° vÕ  “  ùó  ¯  Ğ  óv  ß'  Õ—  \  qT  h ¢¯  Ù» 
+n  ã~ a g«  Gø 6=  Ñ“  < L$  }œ ‡‡  ¼¬ ËO ³ö  = = šI 3Š  ã€ ¹S Ö” RŸ  Ê  z 
+ ’  'L ù  .  Uø  ÌÇ  @ö ¡  ÒŸ  Ç}  Â G™  ¦A °  x¬  Á#  ¶€ /W  ¹W  ŠÌ  ÷— ,¶  Z) ì£  (t  F 1ª óª 1™ 2 c  f= x  }   #`  µF Q] ¾"  Ã= Ğ–  3X o? uû ” …  ‘S  Ñ  ªš  : 7 5! ns  MJ   A ë On   W’  ?H  Ï  Hô  4  ÷d  D“ Ş ĞM  8X }"  2 Ç›      k  Û  5s 5‘  X  £    ãØ Û €  Ä î Üê  +> I7 éÊ ? Ûb  × ìK ±L v  'µ  ßu  ®¢  VF »ƒ úï  ½  G  îF ÜW ¨  F  M t  G}  ßõ ÉÒ »( Gg  pE L÷ ìŞ  € –¦ Bh $
+ Òí KS D/  ¬% Kr  ‡Ê  Cš "N ôN Aş şÂ  °T  _  ¾  ° ~   5     g  Ó¸  Rë ª8 ”( $, W<  )¸ ·ã  Ú<  ä› L¥  V¼ ú¤  ™@  *¢  ÄS  ‡
+ ì &  *7  Ÿl çL  7ı  ü  â@  Áp  L aØ  tG >¦ …F  ÛŒ  Š q   #Z ¿Õ  Ö[ ı ñ Hj ¡K  Kq  É¾  Û   TY  º° ¶o /·  ®¿ p% ş y Ô  ¥ »ç  £  
+  Â  s  0 f9  Ÿ„ 7  Ï¶ ï  ßZ  >¨ ój ñ çˆ  ¸é  qÜ Ïo  “  G^ IÑ Ë Â 8d  l¨  ‚  m,  ’  +R e h» ‚2  Ï  œ)  M*  Æ ŒĞ  (å  ˆ KÀ  FM ñ  w#  Qb .9 çR  |s ' ¢¨ –  ëÒ  }—  41 Ñ¥  àî ©c $˜    Xş  :  Ç  á0 ÏŒ ±î  Æ  Ü  ÔD †£  ‚ 3  q¾ ˜u Qƒ  >k  ¥Ç  ª¥  [$ aa ø¹ G‚ f„ ¤  [­  Œß rç  /ç  çú  ó  9ı Â# ÅJ àä £2 ä6  ]5 Â(  
+“ ~’ ûo ›N Ç   Ä’ p0  2p *5 '“ ¤  Öc ÁĞ  Æ“ ¢v  6T ªÿ  Ì£ Ø]  •› ï $ú  #-  Sp  X ºİ  Ñ>  |` äk dV ×e  Är - . ‘ş  â‘ À…  ½’  ? ^ 3 ï Wt  jı  )í 8‡  3§ ş E;  -  P Û1  @å ^_ D' Eq }Õ úU › Ÿ-  ı0  ëÖ  Cì  .{  dO  }£ TØ g	  û4 \Ô E* œ  O›  mw ­P 0[  ²9  A" +T åƒ  ß©  §¬  ˆ ÷B   vÚ Á  &<  ; yr š˜ mj û| 5@ 
+  …# ½  Ù± y&  á$  ¶B Xî  ¾Ì óĞ ×¯  ¨ë Z´  Íÿ (ó  ¿š Ë ­ù îñ Ç kz N« :­  ¨w  05 I Şö 3´ oÎ  ‹¸ [e  â³ £ Î  ô© Äj şç  P_  i7  %% uc  ¢¡ ‡Ã  tR ™  ^ Ï( }é <o  Şh %Z ÎH  Àz  áÁ  ~  ¸â  P  >% ' ø  ƒ èl Áà  ]p á‰ 6‘ Cc —Ÿ  2 ‚ ~‡ x S æ İI ËÅ ¦B  x*  ˆ®  SC  S€  ş  Ì) q³  °M \A $ø ]X Y6  ğG … w%   €:  Ï)  ìÜ  Nx  1v rİ ÷¿  Àd  ûa   Ô  Ã' Vê  s ÖÓ Û¨ v  ²é (  Q£  „q  …Í ­ˆ ÉÈ y  Ù? t  ÷8 Ğ  t M3 {Œ  G  qM :,  á÷ n@ øÒ – «“ Èœ  ëD ¬/ à¾ Yü  K©  X G ğà  õB °V »·  <w    H K¥ jÓ …M ¹•  %À „  É" ñ¢  YŠ †( ÇE  ¸Õ Ú
+  H  © /İ –  ¯»  Ç‘  wd   Õ  8m  ¹+  sò  œ¿  ›
+ â  	` ! ; g{  -ˆ A  f(   A   ãO  P ‡Ÿ BG  Á Áß  :±   î  J +x   İ {¹ Î¼  D w[     x  ”©  ìĞ  L  ® u¤  ó Ü. ^  ÿ   ;!  Ì  GÊ ¬  ³L ü‚ U= Ë œ R Õ²  è< ‰¼  °Ğ ®>  ¥î  ø}  ¡8  ı3 Ïå  2È  NŞ  *  ôƒ o Ö– p· '0 b¦  iR æ$ l  _k ´½  i¢  A~  HV 1s  "û ¬  Ö_ z  a~ ²  :? ìd »  ò•  ~  ÄT O> hÄ  :N C  Wû  9 ‹3 $ û) çw  j- :š  ku  İr  -ş  FÌ dí ä|  Şg ÛÆ  fK     ÉB  ”4      †ï  V Z› ™Ã Jà Äî  jV  ç. À; Ü¬  	­  } ·@ Ù{ @< é8  âY Yä  CP ?  ³ Re L  	 ÜL !  tò ×H —0  ¨ ÒŸ L?  dD ÿ"  âX çt  s œ5 ¼ ½ “ <B \  : Oú  û* | g” ëÉ  é   ø›  Û¦ e 
+‡ ‚º øq  V·  ùÌ –p Ã` *9 ïï ı  Pİ  „” µÂ 9O  ™v Ğ*  Ë4  ˜7  ,J ÉÉ oJ ?G .i  nv SÇ ä `\ ÙJ ½K p  sÒ  H"  â‰  È [œ  îõ  3Ó }\  øı  ,Å  4 õI A Óm  õ!  –{  Ÿ 4æ  @° Uü =  gó  9K  Òs  ù7 „© ü ÌY ao í2 ÅC  …æ  DŒ  z' S ² ½¨  Jí  ,¶ ú& × #  ‡& sj  – S  P ÒÖ ±k Xã Şó LL  p  < Ù~  µQ Ñ  P  z  a2  NM çU ‹÷  2  ª÷ öP  r•    3V † ªn Ša Ón R  `	 ÈR ÌI  "£ òL 1 v  a ÒG  fF É  •í ~W QW o1 pó »‚ ¿â TÂ à  ú¥  £ lZ S°   · (b =8  Ö»  Òa ^ù  fÛ Î^ ©@ > ß9 £Y ´Œ  ¢Š VÃ  %D ¨z xš å   İU  dÑ  6ä  u¡ J   W+  ¡ 	• öu H^  ko  ß†  †3  ·d õÆ ‡| Ò… rõ ›ı  ¸Q  _§  É# á°  R} ak  `ô ˜$ l Œ ×Ñ úX –t  p`  ¿R »Ú  t1 jì  ÿ ·* ;Ì  =· ,  M“  ^  Ş„ <” Û â e ( “_ ¢i  ì% 'ù WQ  ¶ …L  u/  Ã®  ‡N ı ;®  Ä; ég  Cï  Ó  ã“ Îş  Y` ¸f y…    Û† 	  2â  Ù æø Ò  ÷ Ù ÆB ×  ë  \  ½X î $]  Iä ¢ Ù Ë˜ .‹  k $  ÕÇ ~ U/ w° ‡ ÊÄ  R˜  K® Ú^  P ({ o  t  •C ½k  y  "Ã È kÂ  ^l  Ù ’“  ã8 K  k. 3 á  y¥  İ  èè  ¹  { ë J- UÆ  ßh  K  yW $ã  J	 £„  xä 'F — D     Çs >„  ·] ^— µ´ ó ×™ F ê  I :x +?  ~¤ ÎA Ÿ  ÏQ ®J  |  ‡ “ ¦ú  q ­‡   şÕ  …ï u¨ -(  ä_  ™^ ç:   À  # »õ  ‚S –: ¼F  g¯  Š<  ıF  Y  ¹¥ èİ ä! h8 Ò 
+0  a.  Ì ª, i¾  +Ä  T%  áé  ° +z  ÷l  %´  ‡< vP >­ Ó&  ¶. „  ¿ü O) aZ  ã   ¤x  é »ş Ş YÅ  öˆ ¤h  Ôó  =# Ãï  Òv Ö  {¶  ]  f–  ş>  MĞ  º  fL AÕ  E  ;É «  	 k< Å àØ  ˆ×  )Î >½  ·ê Â  Ûò  ¯  ©  õa Ü.  [   ¹ u    àE Š om  øß  h;  (6  vH 0• :   a  q‘ ¾Y  ‡Ş Õ: Ì  »f  {h r^ £1 w   íÄ  }9 ñ¸ ş­  H#  •  Y ¬Æ M( A O  ìã -ê  xş 3Û l! ™´  ÍÅ  Â ¾7 z" ËÌ  iB Q* Á® ü' —F 	 ¯”  À    o4  º	 ˆ  ¸l  l8  ÿ o   Ğ §è  —K ºì  Ë  í ¼«  Á! à  Ê0  ~0 Û ÜÔ Ş  6B  Öı  b  ´[  YO ¡? l² c \  
+! ©à 7V  ?H É  tı t… Û¡ ïÇ  Îx › Îä  ½g ‹z  ?Ü  ¿Z l$ { ¡X . dù ¦ ³`  ƒÁ  ~• ; ½ø  Å3  |* İ{  ¡! t> J  _1  ¶M ‚ø Q ”) * ú  ?Ç  ÍË  ‰Ô  ‹ =ó 1ù  	æ ›M  ú„  „ğ )  Æ Zÿ  c ÷*  Ô  ªI 9  ş˜  [d ñ v ˆ, Ò·  ŞC  uñ ¦ ‚Ú  Z ´'  P¼  Q aÙ  D—  n S {x  ‘ K   ñµ  ) ˆ}  \  Oë  ì¦  @>  ‡ê  J  yV Úæ  ß ’ |> ±=  a7 !  ƒ4 RD Â -Ú  y€ Aê 4$ £ä  WÆ æç A  $C ® G¿  ÇÂ  = ½ë  Ø  ¿  ¹	 u>  +) ¾c  /é    g: “ô õ B& Ìµ Pœ L ÚÍ  { ÛÛ  # P  ‘¦  [± ê´ lÍ  ² İJ  ”µ  8Ÿ d¸ K @ï ü  Ü Ğ? 6O "ğ ªt ³€  .d ¼  Ğ¯ ï\  €® )" ¡² :Ü (k í; ó ¡  ˆb ³  ¬È  ú×  ¸÷  ÚÍ v fˆ ±<  Øe .ª  %Ö  ¨í  NÖ  ,  pè HN  L4  ²Ö  “±  ×œ $û  ‘ ï  +µ wf GM  w ²O  ÿÕ  ˆÅ æ#  ,j  y5   wÖ  ÿŸ  Õ u÷ )²  ¤Z  ø  § ÷j  €û  '  ‘T <¹ †’  ¯ ¾  Ü‹  \X `á  Ó  Åu WQ ‡ å÷  ©Í  ¥µ ”  ½q  ¡  ‰]  İŠ « ç n´ I  ¯ó õ B× µ” Ÿá  ²n  tÿ ‡† < áš   ± İÏ  ]• XH  »4 pW  ÷î  .  o  3— u ›ã /D Ëü  ú# Î    )á  „ü Ã© ‚ê -$   ›’ !› «Ä  *  0+  Í­  z+ /g zß  HÒ  [Ä Ö-  <’ ™  » '” 
+o (e  ÖK  8w Ñ5  , Œ w ¨œ 9è  må  á¤ +¼  k  ¡ª  ã  ™ô  ® Û/  1ñ  À  ÊÜ d  ¨m  ”å  / Iì A¿  J ™ ¼| †  O. ç ì¶  ² ó¡  _O !4  nè  º= Ò1 h ct úì ú· ty  ¶É  _î  ‚K µ« >‰  |R  \-  ø—  E )  )„ ‹ h ÅG Œ†  d H  ]ö  *¡  ó: ¢,  ¦Ä š İ  îş · _á `'  (Ğ ç  B ­Ó o?  œ?  ´\  uí  j
+  Ì Ë×  W‹ ªÒ  Y{ ¥X  øí  ´  Ù  _  Åğ  LE H çT   >  ¥Ù ë  .)   =Ù ˜‰ n 2 ú  Wn 	i –O ŠP  %˜  ‹‰  6Ê  ;‰ ¶L  Ì§    V  á ;È lÏ /  œ Œ  !5  =  ´† ¾ ›;  –3 @   „¢ ³' ¹% GÏ  ‹ì  [ - 9  ÕV kB /\ ·h KI êV  ÔN !¥  ÌV ª&  F† ™  qA gI J2 ái   t oU 8 ¿y  1y  ı  ä+  ¡§ VÎ ±ø Ì
+ (i í& Ù1 –h ûz  ­ k ?0  æ€  ï/   Ó  0Â  á  ŠÑ © û;  ßÔ  wë º¡  ”‚ aL 5' ì( Œª q  *€ Eº  .U  ÿ  ú,  ˜  …Ş  ë> 1¦  g  1 É¤  W3  ö  	  Ï ´w Uã  ŠQ m 6 I  Û} }^  a, 4B  1Ô  •E A  ş  2r SY ³¼ îë  î  ¹U lX  ¼  ÒŞ ƒ  ´~ İë  Q:  ’  ¿  ·ì ub  ‚G ³%  ¦û $* 5ß ³ä ôø  ’Å  ˆÀ  ¿p -Ã  œ¤  ‰A  )Y  P  œ­  ¢{ å$ Å‹ á’ öè %õ  n Œ+  Rú Ó¢ {˜  
+@  î  €‘  c  ª  Š    Æ  ñ  8  Ïû  à «V  ì‹ 8  *h  jğ  v[ ¶ ‰ö ~! – Õ, —6 Ó7  Ñ Ki U×  D  ®Ë O( ¹Ô _  RŞ ú\ F¤  ˜Û  ²á ®—  .  úQ 1 g)     '¤ %  ;Û  Õ× ¨À Î œy WÈ  ¬  „U & 	  Té  ğ@ YÓ  —  ñT -  ˆ.  ÖÊ  ¼$  ù †ë  •Ö Bf İ  |ä  nÙ [2 3Y *U & i ;  ^‚   Å s  ?[ …'  5- Ñ W \
+ ,; µñ  "± ‰  ™Û ÜW e‹  «.  şğ    `  ¡  N¯ æ  í­ {ÿ  <î •  M ¦ú «  °D  I˜ ù ÜC võ  Ş±  º 4 ±5 ÅP  ?”  ˆ“ äô   ! fE  ½ ) ` T ÷A  Ã- =E øš üÈ . fA   Kf  £C · »ı Á &  Ë) ¥D f: _¹  %ô õ ìS  DÖ „  Óí  Á  1  1Í  ¨ò  í   C² Ö¹  > æk  „  Éğ AG ' Ç N  ¹E RT  ¸  Ëi Ã6  ´ï ó Î „k © "W X; ËS ¾¸ ‚€  ›  9@  ¸Ù  rÇ  .¾  ¬ zÁ 1è 0.  Q ’Ê êù Šö  s °­ X@  Mğ ‰G  ‚] ™ àÑ  ˜	  d§ ³G 4b  c=  éq ôÌ  ` f  û ƒ  ÷ä  _C _â  =/ -ÿ ­è ´× —s  så ê q å5 ä  ö¥ <C a l l i n g C o n v e n t i o n T y p e I s I n v a l i d     LC a l l i n g C o n v e n t i o n T y p e s R e q u i r e U n m a n a g e d L   LC a n n o t C r e a t e C o n s t r u c t e d F r o m C o n s t r u c t e d ¥   JC a n n o t C r e a t e C o n s t r u c t e d F r o m N o n g e n e r i c   4C a n t R e f e r e n c e C o m p i l a t i o n O f _  LC h a i n i n g S p e c u l a t i v e M o d e l I s N o t S u p p o r t e d ½  C o m p i l a t i o n C [   C o u l d N o t F i n d F i l e p  *E R R _ A b s t r a c t A n d E x t e r n   *E R R _ A b s t r a c t A n d S e a l e d Ó  4E R R _ A b s t r a c t A t t r i b u t e C l a s s   (E R R _ A b s t r a c t B a s e C a l l a  ^E R R _ A b s t r a c t C o n v e r s i o n N o t I n v o l v i n g C o n t a i n e d T y p e ™  :E R R _ A b s t r a c t E v e n t H a s A c c e s s o r s <  8E R R _ A b s t r a c t E v e n t I n i t i a l i z e r —  "E R R _ A b s t r a c t F i e l d Ğ  &E R R _ A b s t r a c t H a s B o d y *  6E R R _ A b s t r a c t I n C o n c r e t e C l a s s v  ,E R R _ A b s t r a c t N o t V i r t u a l ½  0E R R _ A b s t r a c t S e a l e d S t a t i c   8E R R _ A c c e s s M o d M i s s i n g A c c e s s o r A  <E R R _ A c c e s s o r I m p l e m e n t i n g M e t h o d ğ  *E R R _ A d d M o d u l e A s s e m b l y Œ  .E R R _ A d d O r R e m o v e E x p e c t e d Ş  2E R R _ A d d R e m o v e M u s t H a v e B o d y   PE R R _ A d d r e s s O f M e t h o d G r o u p I n E x p r e s s i o n T r e e J  BE R R _ A d d r e s s O f T o N o n F u n c t i o n P o i n t e r –  6E R R _ A g n o s t i c T o M a c h i n e M o d u l e ú  (E R R _ A l i a s M i s s i n g F i l e J	  "E R R _ A l i a s N o t F o u n d ™	  2E R R _ A l i a s Q u a l A s E x p r e s s i o n ½	  JE R R _ A l i a s Q u a l i f i e d N a m e N o t A n E x p r e s s i o n {
+  \E R R _ A l t I n t e r p o l a t e d V e r b a t i m S t r i n g s N o t A v a i l a b l e °
+  $E R R _ A m b i g B i n a r y O p s 4  6E R R _ A m b i g B i n a r y O p s O n D e f a u l t t  PE R R _ A m b i g B i n a r y O p s O n U n c o n s t r a i n e d D e f a u l t ¯  E R R _ A m b i g C a l l G   E R R _ A m b i g C o n t e x t ‘  E R R _ A m b i g M e m b e r Ä  "E R R _ A m b i g O v e r r i d e â  E R R _ A m b i g Q M \  E R R _ A m b i g U D C o n v è   E R R _ A m b i g U n a r y O p P  ,E R R _ A m b i g u o u s A t t r i b u t e ‹  xE R R _ A m b i g u o u s P r i m a r y C o n s t r u c t o r P a r a m e t e r A s C o l o r C o l o r R e c e i v e r ù  PE R R _ A n n o t a t i o n D i s a l l o w e d I n O b j e c t C r e a t i o n D  .E R R _ A n o n D e l e g a t e C a n t U s e š  8E R R _ A n o n D e l e g a t e C a n t U s e L o c a l D  <E R R _ A n o n D e l e g a t e C a n t U s e R e f L i k e Ç  €E R R _ A n o n D e l e g a t e C a n t U s e S t r u c t P r i m a r y C o n s t r u c t o r P a r a m e t e r C a p t u r e d y  €E R R _ A n o n D e l e g a t e C a n t U s e S t r u c t P r i m a r y C o n s t r u c t o r P a r a m e t e r I n M e m b e r K  0E R R _ A n o n M e t h G r p I n F o r E a c h   (E R R _ A n o n M e t h T o N o n D e l Y  FE R R _ A n o n y m o u s M e t h o d T o E x p r e s s i o n T r e e ©  6E R R _ A n o n y m o u s R e t u r n E x p e c t e d   LE R R _ A n o n y m o u s T y p e D u p l i c a t e P r o p e r t y N a m e T  :E R R _ A n o n y m o u s T y p e N o t A v a i l a b l e —  RE R R _ A n o n y m o u s T y p e P r o p e r t y A s s i g n e d B a d V a l u e Ú  E R R _ A r g s I n v a l i d   >E R R _ A r g u m e n t N a m e I n I T u p l e P a t t e r n t  8E R R _ A r r a y E l e m e n t C a n t B e R e f A n y ø  .E R R _ A r r a y I n i t I n B a d P l a c e 6  6E R R _ A r r a y I n i t T o N o n A r r a y T y p e Ä  8E R R _ A r r a y I n i t i a l i z e r E x p e c t e d W  FE R R _ A r r a y I n i t i a l i z e r I n c o r r e c t L e n g t h ‹  ,E R R _ A r r a y O f S t a t i c C l a s s É  4E R R _ A r r a y S i z e I n D e c l a r a t i o n   6E R R _ A s M u s t H a v e R e f e r e n c e T y p e –  $E R R _ A s N u l l a b l e T y p e 1  "E R R _ A s W i t h T y p e V a r ¥  6E R R _ A s s e m b l y M a t c h B a d V e r s i o n ,  6E R R _ A s s e m b l y N a m e O n N o n M o d u l e Ê  DE R R _ A s s e m b l y S p e c i f i e d F o r L i n k A n d R e f C  ,E R R _ A s s g L v a l u e E x p e c t e d û   E R R _ A s s g R e a d o n l y ^  "E R R _ A s s g R e a d o n l y 2 -  *E R R _ A s s g R e a d o n l y L o c a l ¸  6E R R _ A s s g R e a d o n l y L o c a l 2 C a u s e ÷  4E R R _ A s s g R e a d o n l y L o c a l C a u s e 7  VE R R _ A s s g R e a d o n l y P r i m a r y C o n s t r u c t o r P a r a m e t e r l  XE R R _ A s s g R e a d o n l y P r i m a r y C o n s t r u c t o r P a r a m e t e r 2   (E R R _ A s s g R e a d o n l y P r o p ë  ,E R R _ A s s g R e a d o n l y S t a t i c V   .E R R _ A s s g R e a d o n l y S t a t i c 2 î   4E R R _ A s s i g n R e a d o n l y N o t F i e l d ˜!  6E R R _ A s s i g n R e a d o n l y N o t F i e l d 2 "  ,E R R _ A s s i g n m e n t I n i t O n l y ³"  .E R R _ A t t r A r g W i t h T y p e V a r s ‰#  >E R R _ A t t r D e p e n d e n t T y p e N o t A l l o w e d Ì#  <E R R _ A t t r T y p e A r g C a n n o t B e T y p e V a r 9$  8E R R _ A t t r i b u t e C t o r I n P a r a m e t e r „$  4E R R _ A t t r i b u t e N o t O n A c c e s s o r ß$  >E R R _ A t t r i b u t e N o t O n E v e n t A c c e s s o r ^%  8E R R _ A t t r i b u t e O n B a d S y m b o l T y p e Ğ%  >E R R _ A t t r i b u t e P a r a m e t e r R e q u i r e d 1 <&  >E R R _ A t t r i b u t e P a r a m e t e r R e q u i r e d 2 x&  JE R R _ A t t r i b u t e U s a g e O n N o n A t t r i b u t e C l a s s ¼&  0E R R _ A t t r i b u t e s N o t A l l o w e d '  dE R R _ A t t r i b u t e s R e q u i r e P a r e n t h e s i z e d L a m b d a E x p r e s s i o n 8'  HE R R _ A u t o P r o p e r t y C a n n o t B e R e f R e t u r n i n g ‘'  FE R R _ A u t o P r o p e r t y M u s t H a v e G e t A c c e s s o r ë'  >E R R _ A u t o P r o p e r t y M u s t O v e r r i d e S e t =(  PE R R _ A u t o P r o p e r t y W i t h S e t t e r C a n t B e R e a d O n l y µ(  .E R R _ A u t o P r o p s I n R o S t r u c t F)  8E R R _ A u t o S e t t e r C a n t B e R e a d O n l y ¼)  :E R R _ A w a i t F o r E a c h M i s s i n g M e m b e r -*  NE R R _ A w a i t F o r E a c h M i s s i n g M e m b e r W r o n g A s y n c Û*  0E R R _ A w a i t I n U n s a f e C o n t e x t µ+  LE R R _ B a d A b s t r a c t B i n a r y O p e r a t o r S i g n a t u r e ë+  PE R R _ B a d A b s t r a c t E q u a l i t y O p e r a t o r S i g n a t u r e n,  8E R R _ B a d A b s t r a c t I n c D e c R e t T y p e -  <E R R _ B a d A b s t r a c t I n c D e c S i g n a t u r e .  JE R R _ B a d A b s t r a c t S h i f t O p e r a t o r S i g n a t u r e •.  BE R R _ B a d A b s t r a c t S t a t i c M e m b e r A c c e s s =/  JE R R _ B a d A b s t r a c t U n a r y O p e r a t o r S i g n a t u r e ©/  E R R _ B a d A c c e s s $0  (E R R _ B a d A p p C o n f i g P a t h `0  E R R _ B a d A r g C o u n t …0  $E R R _ B a d A r g E x t r a R e f ½0  E R R _ B a d A r g R e f 1  E R R _ B a d A r g T y p e B1  <E R R _ B a d A r g T y p e D y n a m i c E x t e n s i o n 1  >E R R _ B a d A r g T y p e s F o r C o l l e c t i o n A d d µ2  4E R R _ B a d A r g u m e n t T o A t t r i b u t e %3  E R R _ B a d A r i t y l3  $E R R _ B a d A r r a y S y n t a x ®3  &E R R _ B a d A s s e m b l y N a m e 4  &E R R _ B a d A s y n c A r g T y p e (4  4E R R _ B a d A s y n c E x p r e s s i o n T r e e f4  *E R R _ B a d A s y n c L a c k s B o d y Á4  *E R R _ B a d A s y n c L o c a l T y p e 
+5  JE R R _ B a d A s y n c M e t h o d B u i l d e r T a s k P r o p e r t y Q5  $E R R _ B a d A s y n c R e t u r n à5  8E R R _ B a d A s y n c R e t u r n E x p r e s s i o n n6  0E R R _ B a d A t t r i b u t e A r g u m e n t Û6  HE R R _ B a d A t t r i b u t e P a r a m D e f a u l t A r g u m e n t ˆ7  2E R R _ B a d A t t r i b u t e P a r a m T y p e 8  E R R _ B a d A w a i t A r g ƒ8  0E R R _ B a d A w a i t A r g I n t r i n s i c ×8  .E R R _ B a d A w a i t A r g V o i d C a l l ù8  4E R R _ B a d A w a i t A r g _ N e e d S y s t e m 9  0E R R _ B a d A w a i t A s I d e n t i f i e r ›9  &E R R _ B a d A w a i t I n C a t c h :  2E R R _ B a d A w a i t I n C a t c h F i l t e r R:  *E R R _ B a d A w a i t I n F i n a l l y ±:  $E R R _ B a d A w a i t I n L o c k ;  &E R R _ B a d A w a i t I n Q u e r y O;  NE R R _ B a d A w a i t I n S t a t i c V a r i a b l e I n i t i a l i z e r &<  0E R R _ B a d A w a i t W i t h o u t A s y n c …<  <E R R _ B a d A w a i t W i t h o u t A s y n c L a m b d a =  <E R R _ B a d A w a i t W i t h o u t A s y n c M e t h o d ›=  DE R R _ B a d A w a i t W i t h o u t V o i d A s y n c M e t h o d _>  *E R R _ B a d A w a i t e r P a t t e r n ?  "E R R _ B a d B a s e N u m b e r ò?  E R R _ B a d B a s e T y p e '@   E R R _ B a d B i n O p A r g s F@  <E R R _ B a d B i n a r y O p e r a t o r S i g n a t u r e ƒ@   E R R _ B a d B i n a r y O p s Ò@  LE R R _ B a d B i n a r y R e a d O n l y S p a n C o n c a t e n a t i o n !A  E R R _ B a d B o o l O p œA   E R R _ B a d B o u n d T y p e FB  nE R R _ B a d C a l l e r A r g u m e n t E x p r e s s i o n P a r a m W i t h o u t D e f a u l t V a l u e ÍB  ZE R R _ B a d C a l l e r F i l e P a t h P a r a m W i t h o u t D e f a u l t V a l u e .C  ^E R R _ B a d C a l l e r L i n e N u m b e r P a r a m W i t h o u t D e f a u l t V a l u e …C  ^E R R _ B a d C a l l e r M e m b e r N a m e P a r a m W i t h o u t D e f a u l t V a l u e ŞC  ,E R R _ B a d C a s e I n S w i t c h A r m 7D  $E R R _ B a d C a s t I n F i x e d „D  "E R R _ B a d C o C l a s s S i g âD  "E R R _ B a d C o m p a t M o d e ]E  :E R R _ B a d C o m p i l a t i o n O p t i o n V a l u e ÒE   E R R _ B a d C o n s t T y p e üE  *E R R _ B a d C o n s t r a i n t T y p e 1F  &E R R _ B a d C t o r A r g C o u n t ·F   E R R _ B a d D e b u g T y p e ôF  $E R R _ B a d D e l A r g C o u n t VG  4E R R _ B a d D e l e g a t e C o n s t r u c t o r ƒG  (E R R _ B a d D e l e g a t e L e a v e ³G  *E R R _ B a d D e s t r u c t o r N a m e H  2E R R _ B a d D i r e c t i v e P l a c e m e n t IH  0E R R _ B a d D o c u m e n t a t i o n M o d e “H  4E R R _ B a d D y n a m i c A w a i t F o r E a c h éH  0E R R _ B a d D y n a m i c C o n v e r s i o n BI  .E R R _ B a d D y n a m i c M e t h o d A r g šI  :E R R _ B a d D y n a m i c M e t h o d A r g L a m b d a J  :E R R _ B a d D y n a m i c M e t h o d A r g M e m g r p ¿J  &E R R _ B a d D y n a m i c Q u e r y GK  (E R R _ B a d D y n a m i c T y p e o f ¼K  &E R R _ B a d E m b e d d e d S t m t ùK  "E R R _ B a d E m p t y T h r o w TL  4E R R _ B a d E m p t y T h r o w I n F i n a l l y ºL  "E R R _ B a d E v e n t U s a g e [M  0E R R _ B a d E v e n t U s a g e N o F i e l d ŞM  (E R R _ B a d E x c e p t i o n T y p e +N  &E R R _ B a d E x t e n s i o n A g g jN  (E R R _ B a d E x t e n s i o n M e t h »N  $E R R _ B a d E x t e r n A l i a s èN  .E R R _ B a d E x t e r n I d e n t i f i e r 0O  0E R R _ B a d F i e l d T y p e I n R e c o r d †O  &E R R _ B a d F i n a l l y L e a v e ÆO  (E R R _ B a d F i x e d I n i t T y p e P  $E R R _ B a d F o r e a c h D e c l cP  4E R R _ B a d F u n c P o i n t e r A r g C o u n t ­P  >E R R _ B a d F u n c P o i n t e r P a r a m M o d i f i e r æP  2E R R _ B a d G e t A s y n c E n u m e r a t o r ?Q  (E R R _ B a d G e t E n u m e r a t o r óQ  (E R R _ B a d I n c D e c R e t T y p e ‹R  ,E R R _ B a d I n c D e c S i g n a t u r e îR  "E R R _ B a d I n d e x C o u n t @S  E R R _ B a d I n d e x L H S €S  ,E R R _ B a d I n d e x e r N a m e A t t r ÓS  8E R R _ B a d I n h e r i t a n c e F r o m R e c o r d MT  &E R R _ B a d I n i t A c c e s s o r zT  ,E R R _ B a d I n s t a n c e A r g T y p e ºT  ,E R R _ B a d I t e r a t o r A r g T y p e CU  0E R R _ B a d I t e r a t o r L o c a l T y p e |U  *E R R _ B a d I t e r a t o r R e t u r n ÂU  0E R R _ B a d I t e r a t o r R e t u r n R e f ,V  ,E R R _ B a d L a n g u a g e V e r s i o n ’V  "E R R _ B a d M e m b e r F l a g äV  .E R R _ B a d M e m b e r P r o t e c t i o n W  .E R R _ B a d M o d i f i e r L o c a t i o n LW  6E R R _ B a d M o d i f i e r s O n N a m e s p a c e šW  "E R R _ B a d M o d u l e N a m e èW  (E R R _ B a d N a m e d A r g u m e n t X  JE R R _ B a d N a m e d A r g u m e n t F o r D e l e g a t e I n v o k e LX  :E R R _ B a d N a m e d A t t r i b u t e A r g u m e n t „X  BE R R _ B a d N a m e d A t t r i b u t e A r g u m e n t T y p e wY  E R R _ B a d N e w E x p r éY  >E R R _ B a d N o n T r a i l i n g N a m e d A r g u m e n t =Z  8E R R _ B a d N u l l a b l e C o n t e x t O p t i o n «Z  PE R R _ B a d N u l l a b l e R e f e r e n c e T y p e I n U s i n g A l i a s [  *E R R _ B a d N u l l a b l e T y p e o f R[  :E R R _ B a d O p O n N u l l O r D e f a u l t O r N e w ›[  *E R R _ B a d O p e r a t o r S y n t a x Ü[  (E R R _ B a d P a r a m E x t r a R e f *\  &E R R _ B a d P a r a m M o d T h i s r\  E R R _ B a d P a r a m R e f Ù\   E R R _ B a d P a r a m T y p e ]  2E R R _ B a d P a r a m e t e r M o d i f i e r s i]  0E R R _ B a d P a t t e r n E x p r e s s i o n ¯]  E R R _ B a d P d b D a t a ^  &E R R _ B a d P l a t f o r m T y p e j^  (E R R _ B a d P r e f e r 3 2 O n L i b Ë^  ,E R R _ B a d P r o t e c t e d A c c e s s -_  "E R R _ B a d R e c o r d B a s e È_  RE R R _ B a d R e c o r d M e m b e r F o r P o s i t i o n a l P a r a m e t e r `  ,E R R _ B a d R e f I n U s i n g A l i a s Ÿ`  <E R R _ B a d R e f R e t u r n E x p r e s s i o n T r e e Í`  $E R R _ B a d R e s o u r c e V i s Ca  E R R _ B a d R e t T y p e ¡a  E R R _ B a d S K k n o w n Ía   E R R _ B a d S K u n k n o w n ğa  :E R R _ B a d S h i f t O p e r a t o r S i g n a t u r e <b  *E R R _ B a d S o u r c e C o d e K i n d ¬b  6E R R _ B a d S p e c i a l B y R e f I t e r a t o r şb  0E R R _ B a d S p e c i a l B y R e f L o c a l ƒc  0E R R _ B a d S p e c i a l B y R e f U s i n g ÿc  *E R R _ B a d S t a c k A l l o c E x p r yd  0E R R _ B a d S t a t i c A f t e r U n s a f e »d  E R R _ B a d S w i t c h şd  $E R R _ B a d S w i t c h V a l u e e   E R R _ B a d T h i s P a r a m °e  &E R R _ B a d T y p e A r g u m e n t f  (E R R _ B a d T y p e R e f e r e n c e If  $E R R _ B a d T y p e f o r T h i s £f  E R R _ B a d U n O p A r g s ğf  E R R _ B a d U n a r y O p +g  :E R R _ B a d U n a r y O p e r a t o r S i g n a t u r e tg  :E R R _ B a d U n s a f e I n U s i n g D i r e c t i v e ½g  *E R R _ B a d U s i n g N a m e s p a c e øg   E R R _ B a d U s i n g T y p e ©h  E R R _ B a d V a r D e c l Fi  E R R _ B a d V a r a r g s ¸i  &E R R _ B a d V i s B a s e C l a s s 3j  .E R R _ B a d V i s B a s e I n t e r f a c e ‹j  E R R _ B a d V i s B o u n d îj  .E R R _ B a d V i s D e l e g a t e P a r a m @k  0E R R _ B a d V i s D e l e g a t e R e t u r n ›k  &E R R _ B a d V i s E v e n t T y p e ÷k  &E R R _ B a d V i s F i e l d T y p e Hl  ,E R R _ B a d V i s I n d e x e r P a r a m Ÿl  .E R R _ B a d V i s I n d e x e r R e t u r n  m  "E R R _ B a d V i s O p P a r a m sm  $E R R _ B a d V i s O p R e t u r n Ğm  &E R R _ B a d V i s P a r a m T y p e .n  ,E R R _ B a d V i s P r o p e r t y T y p e ‡n  (E R R _ B a d V i s R e t u r n T y p e ên  &E R R _ B a d W a r n i n g L e v e l Do  E R R _ B a d W i n 3 2 R e s o  &E R R _ B a d Y i e l d I n C a t c h Èo  *E R R _ B a d Y i e l d I n F i n a l l y p  0E R R _ B a d Y i e l d I n T r y O f C a t c h Np  0E R R _ B a s e C l a s s M u s t B e F i r s t  p  4E R R _ B a s e C o n s t r a i n t C o n f l i c t Óp  E R R _ B a s e I l l e g a l q  (E R R _ B a s e I n B a d C o n t e x t _q  (E R R _ B a s e I n S t a t i c M e t h ¡q  E R R _ B i n a r y F i l e âq  E R R _ B i n d T o B o g u s r  (E R R _ B i n d T o B o g u s P r o p 1 ;r  (E R R _ B i n d T o B o g u s P r o p 2 Ùr  <E R R _ B l o c k B o d y A n d E x p r e s s i o n B o d y ~s  *E R R _ B o g u s E x p l i c i t I m p l Ës  E R R _ B o g u s T y p e t  <E R R _ B u i l d e r A t t r i b u t e D i s a l l o w e d Gt  DE R R _ B y R e f P a r a m e t e r I n E x p r e s s i o n T r e e ¯t  *E R R _ B y R e f T y p e A n d A w a i t u  PE R R _ B y R e f e r e n c e V a r i a b l e M u s t B e I n i t i a l i z e d ^u  E R R _ C S t y l e A r r a y ´u  "E R R _ C a l l A r g M i x i n g Äv  BE R R _ C a l l i n g B a s e F i n a l i z e D e p r e c a t e d w  :E R R _ C a l l i n g F i n a l i z e D e p r e c a t e d ñw  6E R R _ C a n n o t B e C o n v e r t e d T o U t f 8 lx  0E R R _ C a n n o t B e M a d e N u l l a b l e Îx  E R R _ C a n n o t C l o n e ôx  HE R R _ C a n n o t C o n v e r t A d d r e s s O f T o D e l e g a t e Jy  8E R R _ C a n n o t D e c o n s t r u c t D y n a m i c ›y  2E R R _ C a n n o t E m b e d W i t h o u t P d b Ëy  6E R R _ C a n n o t I n f e r D e l e g a t e T y p e z  8E R R _ C a n n o t M a t c h O n I N u m b e r B a s e ;z  FE R R _ C a n n o t P a s s N u l l F o r F r i e n d A s s e m b l y 	{  ^E R R _ C a n n o t S p e c i f y M a n a g e d W i t h U n m a n a g e d S p e c i f i e r s D{  PE R R _ C a n n o t U s e F u n c t i o n P o i n t e r A s F i x e d L o c a l À{  \E R R _ C a n n o t U s e M a n a g e d T y p e I n U n m a n a g e d C a l l e r s O n l y 4|  \E R R _ C a n n o t U s e R e d u c e d E x t e n s i o n M e t h o d I n A d d r e s s O f “|  LE R R _ C a n n o t U s e R e f I n U n m a n a g e d C a l l e r s O n l y ü|  hE R R _ C a n n o t U s e S e l f A s I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t g}  2E R R _ C a n t C a l l S p e c i a l M e t h o d ï}  <E R R _ C a n t C h a n g e A c c e s s O n O v e r r i d e H~  @E R R _ C a n t C h a n g e I n i t O n l y O n O v e r r i d e É~  BE R R _ C a n t C h a n g e R e f R e t u r n O n O v e r r i d e 2  DE R R _ C a n t C h a n g e R e t u r n T y p e O n O v e r r i d e ¦  DE R R _ C a n t C h a n g e T u p l e N a m e s O n O v e r r i d e €  8E R R _ C a n t C h a n g e T y p e O n O v e r r i d e ‹€  8E R R _ C a n t C o n v A n o n M e t h N o P a r a m s ë€  4E R R _ C a n t C o n v A n o n M e t h P a r a m s ~  <E R R _ C a n t C o n v A n o n M e t h R e t u r n T y p e ş  6E R R _ C a n t C o n v A n o n M e t h R e t u r n s z‚  @E R R _ C a n t C o n v A s y n c A n o n F u n c R e t u r n s 0ƒ  8E R R _ C a n t D e r i v e F r o m S e a l e d T y p e ìƒ  6E R R _ C a n t H a v e W i n 3 2 R e s A n d I c o n „  >E R R _ C a n t H a v e W i n 3 2 R e s A n d M a n i f e s t l„  2E R R _ C a n t I n f e r M e t h T y p e A r g s Á„  (E R R _ C a n t M a k e T e m p F i l e T…  *E R R _ C a n t O p e n F i l e W r i t e †…   E R R _ C a n t O p e n I c o n ¾…  2E R R _ C a n t O p e n W i n 3 2 M a n i f e s t †  (E R R _ C a n t O p e n W i n 3 2 R e s X†  6E R R _ C a n t O v e r r i d e B o g u s M e t h o d ¯†  0E R R _ C a n t O v e r r i d e N o n E v e n t ‡  6E R R _ C a n t O v e r r i d e N o n F u n c t i o n S‡  6E R R _ C a n t O v e r r i d e N o n P r o p e r t y ›‡  4E R R _ C a n t O v e r r i d e N o n V i r t u a l å‡  ,E R R _ C a n t O v e r r i d e S e a l e d nˆ  ,E R R _ C a n t R e a d C o n f i g F i l e Èˆ  (E R R _ C a n t R e a d R e s o u r c e 
+‰  .E R R _ C a n t R e a d R u l e s e t F i l e U‰  &E R R _ C a n t R e f R e s o u r c e ©‰  $E R R _ C a n t R e t u r n V o i d ü‰  0E R R _ C a n t S e t W i n 3 2 M a n i f e s t 7Š  6E R R _ C a n t U s e I n O r O u t I n A r g l i s t Š  8E R R _ C a n t U s e R e q u i r e d A t t r i b u t e ĞŠ  0E R R _ C a n t U s e V o i d I n A r g l i s t ‹  xE R R _ C h a i n i n g T o S e t s R e q u i r e d M e m b e r s R e q u i r e s S e t s R e q u i r e d M e m b e r s G‹  :E R R _ C h e c k e d O p e r a t o r N e e d s M a t c h À‹  &E R R _ C h e c k e d O v e r f l o w 0Œ  $E R R _ C i r c C o n s t V a l u e uŒ   E R R _ C i r c u l a r B a s e ËŒ  ,E R R _ C i r c u l a r C o n s t r a i n t   ,E R R _ C l a s s B o u n d N o t F i r s t K  BE R R _ C l a s s D o e s n t I m p l e m e n t I n t e r f a c e   *E R R _ C l a s s T y p e E x p e c t e d Ğ  6E R R _ C l o n e D i s a l l o w e d I n R e c o r d ÿ  ,E R R _ C l o s e P a r e n E x p e c t e d :  \E R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r N o t P u b l i c R  \E R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r N o t S t a t i c ×  VE R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r S t a t i c g  dE R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r W r o n g I n i t O n l y ÷  fE R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r W r o n g R e f R e t u r n P  hE R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r W r o n g R e t u r n T y p e ó  8E R R _ C m d O p t i o n C o n f l i c t s S o u r c e ‡‘  .E R R _ C o l C o l W i t h T y p e A l i a s á‘  JE R R _ C o l l e c t i o n I n i t R e q u i r e s I E n u m e r a b l e E’  *E R R _ C o m I m p o r t W i t h B a s e Ï’  *E R R _ C o m I m p o r t W i t h I m p l !“  :E R R _ C o m I m p o r t W i t h I n i t i a l i z e r s o“  2E R R _ C o m I m p o r t W i t h U s e r C t o r Ë“  BE R R _ C o m I m p o r t W i t h o u t U u i d A t t r i b u t e $”  <E R R _ C o m R e f C a l l I n E x p r e s s i o n T r e e h”  (E R R _ C o m p i l e C a n c e l l e d Ü”  <E R R _ C o m p i l e r A n d L a n g u a g e V e r s i o n  •  .E R R _ C o n W i t h U n m a n a g e d C o n @•  "E R R _ C o n W i t h V a l C o n °•  .E R R _ C o n c r e t e M i s s i n g B o d y –  <E R R _ C o n d i t i o n a l I n I n t e r p o l a t i o n }–  :E R R _ C o n d i t i o n a l M u s t R e t u r n V o i d 2—  @E R R _ C o n d i t i o n a l O n I n t e r f a c e M e t h o d Š—  <E R R _ C o n d i t i o n a l O n L o c a l F u n c t i o n Í—  DE R R _ C o n d i t i o n a l O n N o n A t t r i b u t e C l a s s ˜  2E R R _ C o n d i t i o n a l O n O v e r r i d e _˜  <E R R _ C o n d i t i o n a l O n S p e c i a l M e t h o d ±˜  6E R R _ C o n d i t i o n a l W i t h O u t P a r a m V™  4E R R _ C o n f l i c t A l i a s A n d M e m b e r ”™  BE R R _ C o n f l i c t i n g A l i a s A n d D e f i n i t i o n æ™  8E R R _ C o n f l i c t i n g M a c h i n e M o d u l e š  &E R R _ C o n s t O u t O f R a n g e pš  4E R R _ C o n s t O u t O f R a n g e C h e c k e d ¯š  ,E R R _ C o n s t V a l u e R e q u i r e d $›  (E R R _ C o n s t a n t E x p e c t e d Y›  :E R R _ C o n s t a n t P a t t e r n V s O p e n T y p e y›  2E R R _ C o n s t a n t S t r i n g T o o L o n g ?œ  >E R R _ C o n s t a n t V a l u e O f T y p e E x p e c t e d ãœ  6E R R _ C o n s t r a i n t I s S t a t i c C l a s s   LE R R _ C o n s t r a i n t O n l y A l l o w e d O n G e n e r i c D e c l K  BE R R _ C o n s t r u c t e d D y n a m i c T y p e A s B o u n d ‚  8E R R _ C o n s t r u c t o r I n S t a t i c C l a s s µ  NE R R _ C o n v e r s i o n N o t I n v o l v i n g C o n t a i n e d T y p e ò  @E R R _ C o n v e r s i o n N o t T u p l e C o m p a t i b l e U  ,E R R _ C o n v e r s i o n W i t h B a s e œ  2E R R _ C o n v e r s i o n W i t h D e r i v e d ÷  6E R R _ C o n v e r s i o n W i t h I n t e r f a c e SŸ  0E R R _ C o n v e r t T o S t a t i c C l a s s ªŸ  `E R R _ C o p y C o n s t r u c t o r M u s t I n v o k e B a s e C o p y C o n s t r u c t o r ŞŸ  JE R R _ C o p y C o n s t r u c t o r W r o n g A c c e s s i b i l i t y …   (E R R _ C r y p t o H a s h F a i l e d å   >E R R _ C y c l e I n I n t e r f a c e I n h e r i t a n c e /¡  0E R R _ C y c l e I n T y p e F o r w a r d e r ‡¡  XE R R _ D e b u g E n t r y P o i n t N o t S o u r c e M e t h o d D e f i n i t i o n Î¡  "E R R _ D e c C o n s t E r r o r 4¢  JE R R _ D e c l a r a t i o n E x p r e s s i o n N o t P e r m i t t e d w¢  HE R R _ D e c o n s t r u c t P a r a m e t e r N a m e M i s m a t c h °¢  BE R R _ D e c o n s t r u c t R e q u i r e s E x p r e s s i o n £  :E R R _ D e c o n s t r u c t T o o F e w E l e m e n t s Y£  HE R R _ D e c o n s t r u c t V a r i a b l e C a n n o t B e B y R e f £  >E R R _ D e c o n s t r u c t W r o n g C a r d i n a l i t y ğ£  \E R R _ D e c o n s t r u c t i o n V a r F o r m D i s a l l o w s S p e c i f i c T y p e >¤  BE R R _ D e f a u l t C o n s t r a i n t O v e r r i d e O n l y ”¤  ZE R R _ D e f a u l t I n t e r f a c e I m p l e m e n t a t i o n I n N o P I A T y p e  ¥  <E R R _ D e f a u l t L i t e r a l N o T a r g e t T y p e ¨¥  4E R R _ D e f a u l t L i t e r a l N o t V a l i d ô¥  <E R R _ D e f a u l t M e m b e r O n I n d e x e d T y p e ?¦  $E R R _ D e f a u l t P a t t e r n ™¦  8E R R _ D e f a u l t V a l u e B a d V a l u e T y p e ]§  FE R R _ D e f a u l t V a l u e B e f o r e R e q u i r e d V a l u e ±§  JE R R _ D e f a u l t V a l u e F o r E x t e n s i o n P a r a m e t e r ı§  DE R R _ D e f a u l t V a l u e F o r P a r a m s P a r a m e t e r D¨  <E R R _ D e f a u l t V a l u e M u s t B e C o n s t a n t ¨  4E R R _ D e f a u l t V a l u e N o t A l l o w e d ï¨  :E R R _ D e f a u l t V a l u e T y p e M u s t M a t c h ,©  DE R R _ D e f a u l t V a l u e U s e d W i t h A t t r i b u t e s ’©  2E R R _ D e l e g a t e O n C o n d i t i o n a l ª  ,E R R _ D e l e g a t e O n N u l l a b l e ‹ª  .E R R _ D e l e g a t e R e f M i s m a t c h èª  DE R R _ D e p r e c a t e d C o l l e c t i o n I n i t A d d S t r &«  .E R R _ D e p r e c a t e d S y m b o l S t r ‹«  @E R R _ D e r i v e F r o m C o n s t r u c t e d D y n a m i c ¥«  *E R R _ D e r i v e F r o m D y n a m i c é«  :E R R _ D e r i v e F r o m E n u m O r V a l u e T y p e ¬  ,E R R _ D e r i v i n g F r o m A T y V a r R¬  LE R R _ D e s i g n a t o r B e n e a t h P a t t e r n C o m b i n a t o r –¬  6E R R _ D e s t r u c t o r I n S t a t i c C l a s s ê¬  RE R R _ D i c t i o n a r y I n i t i a l i z e r I n E x p r e s s i o n T r e e  ­  FE R R _ D i s c a r d P a t t e r n I n S w i t c h S t a t e m e n t Š­  <E R R _ D i s c a r d T y p e I n f e r e n c e F a i l e d H®  8E R R _ D l l I m p o r t O n G e n e r i c M e t h o d Ÿ®  8E R R _ D l l I m p o r t O n I n v a l i d M e t h o d ¯  6E R R _ D o N o t U s e F i x e d B u f f e r A t t r x¯  JE R R _ D o N o t U s e F i x e d B u f f e r A t t r O n P r o p e r t y ğ¯  E R R _ D o c F i l e G e n G°  NE R R _ D o e s N o t O v e r r i d e B a s e E q u a l i t y C o n t r a c t œ°  :E R R _ D o e s N o t O v e r r i d e B a s e M e t h o d İ°  FE R R _ D o e s N o t O v e r r i d e M e t h o d F r o m O b j e c t ±  BE R R _ D o e s n t I m p l e m e n t A w a i t I n t e r f a c e V±  >E R R _ D o t t e d T y p e N a m e N o t F o u n d I n A g g r±  <E R R _ D o t t e d T y p e N a m e N o t F o u n d I n N S £±  BE R R _ D o t t e d T y p e N a m e N o t F o u n d I n N S F w d ,²  E R R _ D u p P a r a m M o d Ø²  (E R R _ D u p R e t u r n T y p e M o d ³  *E R R _ D u p l i c a t e A c c e s s o r G³  $E R R _ D u p l i c a t e A l i a s €³  ,E R R _ D u p l i c a t e A t t r i b u t e º³  BE R R _ D u p l i c a t e A t t r i b u t e I n N e t M o d u l e Ú³  $E R R _ D u p l i c a t e B o u n d ´  ,E R R _ D u p l i c a t e C a s e L a b e l A´  :E R R _ D u p l i c a t e C o n s t r a i n t C l a u s e  ´  <E R R _ D u p l i c a t e C o n v e r s i o n I n C l a s s Sµ  2E R R _ D u p l i c a t e E x p l i c i t I m p l µ  4E R R _ D u p l i c a t e G e n e r a t e d N a m e Êµ  &E R R _ D u p l i c a t e I m p o r t (¶  2E R R _ D u p l i c a t e I m p o r t S i m p l e Ÿ¶  @E R R _ D u p l i c a t e I n t e r f a c e I n B a s e L i s t S·  ^E R R _ D u p l i c a t e I n t e r f a c e W i t h D i f f e r e n c e s I n B a s e L i s t ˆ·  \E R R _ D u p l i c a t e I n t e r f a c e W i t h T u p l e N a m e s I n B a s e L i s t Ô·  $E R R _ D u p l i c a t e L a b e l G¸  *E R R _ D u p l i c a t e M o d i f i e r j¸  0E R R _ D u p l i c a t e N a m e I n C l a s s ¸  *E R R _ D u p l i c a t e N a m e I n N S Å¸  4E R R _ D u p l i c a t e N a m e d A r g u m e n t ¹  FE R R _ D u p l i c a t e N a m e d A t t r i b u t e A r g u m e n t M¹  8E R R _ D u p l i c a t e N u l l S u p p r e s s i o n †¹  ,E R R _ D u p l i c a t e P a r a m N a m e ¶¹  >E R R _ D u p l i c a t e P r o p e r t y A c c e s s M o d s â¹  BE R R _ D u p l i c a t e P r o p e r t y R e a d O n l y M o d s rº  4E R R _ D u p l i c a t e T y p e F o r w a r d e r ?»  4E R R _ D u p l i c a t e T y p e P a r a m e t e r p»  6E R R _ D y n a m i c A t t r i b u t e M i s s i n g “»  NE R R _ D y n a m i c L o c a l F u n c t i o n P a r a m s P a r a m e t e r B¼  JE R R _ D y n a m i c L o c a l F u n c t i o n T y p e P a r a m e t e r ±¼  >E R R _ D y n a m i c R e q u i r e d T y p e s M i s s i n g +½  ,E R R _ D y n a m i c T y p e A s B o u n d ¨½  E R R _ E O F E x p e c t e d Õ½  8E R R _ E l s e C a n n o t S t a r t S t a t e m e n t *¾  $E R R _ E m p t y C h a r C o n s t W¾  6E R R _ E m p t y E l e m e n t I n i t i a l i z e r ¾  0E R R _ E m p t y F o r m a t S p e c i f i e r ´¾  E R R _ E m p t y Y i e l d Ö¾  *E R R _ E n c N o P I A R e f e r e n c e ¿  :E R R _ E n c R e f e r e n c e T o A d d e d M e m b e r i¿  LE R R _ E n c U p d a t e F a i l e d D e l e g a t e T y p e C h a n g e d ø¿  FE R R _ E n c U p d a t e F a i l e d M i s s i n g A t t r i b u t e YÀ  4E R R _ E n c o d i n g l e s s S y n t a x T r e e –À  .E R R _ E n d O f P P L i n e E x p e c t e d ğÀ  <E R R _ E n d R e g i o n D i r e c t i v e E x p e c t e d )Á  4E R R _ E n d i f D i r e c t i v e E x p e c t e d NÁ  TE R R _ E n t r y P o i n t C a n n o t B e U n m a n a g e d C a l l e r s O n l y oÁ  ,E R R _ E n u m e r a t o r O v e r f l o w ×Á  LE R R _ E n u m s C a n t C o n t a i n D e f a u l t C o n s t r u c t o r Â  DE R R _ E q u a l i t y C o n t r a c t R e q u i r e s G e t t e r dÂ  >E R R _ E r r o r B u i l d i n g W i n 3 2 R e s o u r c e s ÉÂ  $E R R _ E r r o r D i r e c t i v e Ã  :E R R _ E r r o r I n R e f e r e n c e d A s s e m b l y &Ã  E R R _ E s c a p e C a l l \Ã  E R R _ E s c a p e C a l l 2 Ä  E R R _ E s c a p e O t h e r æÄ  (E R R _ E s c a p e S t a c k A l l o c ƒÅ  $E R R _ E s c a p e V a r i a b l e 0Æ   E R R _ E s c a p e d C u r l y ÒÆ  6E R R _ E v e n t N e e d s B o t h A c c e s s o r s KÇ  (E R R _ E v e n t N o t D e l e g a t e ¥Ç  >E R R _ E x p e c t e d C o n t e x t u a l K e y w o r d B y ÖÇ  FE R R _ E x p e c t e d C o n t e x t u a l K e y w o r d E q u a l s È  >E R R _ E x p e c t e d C o n t e x t u a l K e y w o r d O n 8È  $E R R _ E x p e c t e d E n d T r y gÈ  $E R R _ E x p e c t e d P P F i l e È  2E R R _ E x p e c t e d S e l e c t O r G r o u p ÁÈ  0E R R _ E x p e c t e d S i n g l e S c r i p t É  6E R R _ E x p e c t e d V e r b a t i m L i t e r a l `É  .E R R _ E x p l i c i t D y n a m i c A t t r ¿É  4E R R _ E x p l i c i t E v e n t F i e l d I m p l  Ê  *E R R _ E x p l i c i t E x t e n s i o n «Ê  BE R R _ E x p l i c i t I m p l C o l l i s i o n O n R e f O u t Ë  ,E R R _ E x p l i c i t I m p l P a r a m s ³Ë  bE R R _ E x p l i c i t I m p l e m e n t a t i o n O f O p e r a t o r s M u s t B e S t a t i c ùË  jE R R _ E x p l i c i t I n t e r f a c e I m p l e m e n t a t i o n I n N o n C l a s s O r S t r u c t eÌ  ^E R R _ E x p l i c i t I n t e r f a c e I m p l e m e n t a t i o n N o t I n t e r f a c e ìÌ  <E R R _ E x p l i c i t M e t h o d I m p l A c c e s s o r 8Í  :E R R _ E x p l i c i t N u l l a b l e A t t r i b u t e ¦Í  ,E R R _ E x p l i c i t P a r a m A r r a y 
+Î  DE R R _ E x p l i c i t P r o p e r t y A d d i n g A c c e s s o r bÎ  HE R R _ E x p l i c i t P r o p e r t y M i s m a t c h I n i t O n l y ¶Î  FE R R _ E x p l i c i t P r o p e r t y M i s s i n g A c c e s s o r 9Ï  4E R R _ E x p l i c i t R e q u i r e d M e m b e r “Ï  0E R R _ E x p l i c i t R e s e r v e d A t t r *Ğ  *E R R _ E x p l i c i t S c o p e d R e f `Ğ  LE R R _ E x p l i c i t T u p l e E l e m e n t N a m e s A t t r i b u t e ÉĞ  PE R R _ E x p o r t e d T y p e C o n f l i c t s W i t h D e c l a r a t i o n {Ñ  2E R R _ E x p o r t e d T y p e s C o n f l i c t ôÑ  *E R R _ E x p r C a n n o t B e F i x e d \Ò  ,E R R _ E x p r e s s i o n E x p e c t e d ¥Ò  .E R R _ E x p r e s s i o n H a s N o N a m e ÀÒ  FE R R _ E x p r e s s i o n O r D e c l a r a t i o n E x p e c t e d ßÒ  jE R R _ E x p r e s s i o n T r e e C a n t C o n t a i n N u l l C o a l e s c i n g A s s i g n m e n t Ó  LE R R _ E x p r e s s i o n T r e e C a n t C o n t a i n R e f S t r u c t nÓ  hE R R _ E x p r e s s i o n T r e e C o n t a i n s A b s t r a c t S t a t i c M e m b e r A c c e s s ÓÓ  RE R R _ E x p r e s s i o n T r e e C o n t a i n s A n o n y m o u s M e t h o d DÔ  HE R R _ E x p r e s s i o n T r e e C o n t a i n s A s s i g n m e n t •Ô  JE R R _ E x p r e s s i o n T r e e C o n t a i n s B a d C o a l e s c e áÔ  HE R R _ E x p r e s s i o n T r e e C o n t a i n s B a s e A c c e s s †Õ  BE R R _ E x p r e s s i o n T r e e C o n t a i n s D i s c a r d ÈÕ  TE R R _ E x p r e s s i o n T r e e C o n t a i n s D y n a m i c O p e r a t i o n Ö  `E R R _ E x p r e s s i o n T r e e C o n t a i n s F r o m E n d I n d e x E x p r e s s i o n ZÖ  RE R R _ E x p r e s s i o n T r e e C o n t a i n s I n d e x e d P r o p e r t y ³Ö  zE R R _ E x p r e s s i o n T r e e C o n t a i n s I n t e r p o l a t e d S t r i n g H a n d l e r C o n v e r s i o n ıÖ  BE R R _ E x p r e s s i o n T r e e C o n t a i n s I s M a t c h b×  NE R R _ E x p r e s s i o n T r e e C o n t a i n s L o c a l F u n c t i o n ¼×  tE R R _ E x p r e s s i o n T r e e C o n t a i n s M u l t i D i m e n s i o n a l A r r a y I n i t i a l i z e r Ø  NE R R _ E x p r e s s i o n T r e e C o n t a i n s N a m e d A r g u m e n t pØ  TE R R _ E x p r e s s i o n T r e e C o n t a i n s O p t i o n a l A r g u m e n t ÅØ  JE R R _ E x p r e s s i o n T r e e C o n t a i n s O u t V a r i a b l e  Ù  `E R R _ E x p r e s s i o n T r e e C o n t a i n s P a t t e r n I m p l i c i t I n d e x e r ~Ù  FE R R _ E x p r e s s i o n T r e e C o n t a i n s P o i n t e r O p ñÙ  RE R R _ E x p r e s s i o n T r e e C o n t a i n s R a n g e E x p r e s s i o n CÚ  TE R R _ E x p r e s s i o n T r e e C o n t a i n s S w i t c h E x p r e s s i o n ŠÚ  RE R R _ E x p r e s s i o n T r e e C o n t a i n s T h r o w E x p r e s s i o n ÑÚ  HE R R _ E x p r e s s i o n T r e e C o n t a i n s T u p l e B i n O p Û  RE R R _ E x p r e s s i o n T r e e C o n t a i n s T u p l e C o n v e r s i o n eÛ  LE R R _ E x p r e s s i o n T r e e C o n t a i n s T u p l e L i t e r a l ¯Û  XE R R _ E x p r e s s i o n T r e e C o n t a i n s U t f 8 S t r i n g L i t e r a l s ıÛ  PE R R _ E x p r e s s i o n T r e e C o n t a i n s W i t h E x p r e s s i o n eÜ  DE R R _ E x p r e s s i o n T r e e M u s t H a v e D e l e g a t e ªÜ  2E R R _ E x t e n s i o n A t t r N o t F o u n d 7İ  rE R R _ E x t e n s i o n C o l l e c t i o n E l e m e n t I n i t i a l i z e r I n E x p r e s s i o n T r e e Ûİ  0E R R _ E x t e n s i o n M e t h o d s D e c l GŞ  .E R R _ E x t e r n A f t e r E l e m e n t s ÀŞ  2E R R _ E x t e r n A l i a s N o t A l l o w e d *ß  4E R R _ E x t e r n E v e n t I n i t i a l i z e r [ß  "E R R _ E x t e r n H a s B o d y ’ß  FE R R _ E x t e r n H a s C o n s t r u c t o r I n i t i a l i z e r Îß  (E R R _ F e a t u r e I n P r e v i e w "à  2E R R _ F e a t u r e I s E x p e r i m e n t a l Ğà  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 1 3á  DE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 1 0 £á  DE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 1 1 â  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 2 ‰â  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 3 öâ  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 4 cã  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 5 Óã  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 6 @ä  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 7 ­ä  FE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 7 _ 1 å  FE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 7 _ 2 ‹å  FE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 7 _ 3 úå  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 8 læ  FE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 8 _ 0 Şæ  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 9 Pç  FE R R _ F e a t u r e N o t V a l i d I n E x p r e s s i o n T r e e Âç  @E R R _ F i e l d A u t o P r o p C a n t B e B y R e f L i k e øç  *E R R _ F i e l d C a n t B e R e f A n y ‰è  2E R R _ F i e l d C a n t H a v e V o i d T y p e Áè  TE R R _ F i e l d H a s M u l t i p l e D i s t i n c t C o n s t a n t V a l u e s èè  2E R R _ F i e l d I n i t R e f N o n s t a t i c é  @E R R _ F i e l d L i k e E v e n t C a n t B e R e a d O n l y ƒé  :E R R _ F i e l d l i k e E v e n t s I n R o S t r u c t ¾é  (E R R _ F i e l d s I n R o S t r u c t ê  <E R R _ F i l e L o c a l D u p l i c a t e N a m e I n N S Tê   E R R _ F i l e N o t F o u n d ¦ê  FE R R _ F i l e P a t h C a n n o t B e C o n v e r t e d T o U t f 8 Öê  @E R R _ F i l e S c o p e d A n d N o r m a l N a m e s p a c e ‹ë  TE R R _ F i l e S c o p e d N a m e s p a c e N o t B e f o r e A l l M e m b e r s ôë   E R R _ F i l e T y p e B a s e Jì  BE R R _ F i l e T y p e D i s a l l o w e d I n S i g n a t u r e ¨ì  4E R R _ F i l e T y p e N a m e D i s a l l o w e d í  $E R R _ F i l e T y p e N e s t e d Ní  FE R R _ F i l e T y p e N o E x p l i c i t A c c e s s i b i l i t y ºí  2E R R _ F i l e T y p e N o n U n i q u e P a t h î  .E R R _ F i x e d B u f f e r N o t F i x e d î  @E R R _ F i x e d B u f f e r T o o M a n y D i m e n s i o n s ï  *E R R _ F i x e d D i m s R e q u i r e d <ï  4E R R _ F i x e d F i e l d M u s t N o t B e R e f ¹ï  ,E R R _ F i x e d L o c a l I n L a m b d a çï  "E R R _ F i x e d M u s t I n i t lğ  E R R _ F i x e d N e e d e d Çğ  (E R R _ F i x e d N e e d s L v a l u e Bñ  (E R R _ F i x e d N o t I n S t r u c t ñ  $E R R _ F i x e d N o t N e e d e d æñ  "E R R _ F i x e d O v e r f l o w Pò  "E R R _ F l o a t O v e r f l o w  ò  0E R R _ F o r E a c h M i s s i n g M e m b e r ëò  DE R R _ F o r E a c h M i s s i n g M e m b e r W r o n g A s y n c ˆó  RE R R _ F o r w a r d e d T y p e C o n f l i c t s W i t h D e c l a r a t i o n Xô  TE R R _ F o r w a r d e d T y p e C o n f l i c t s W i t h E x p o r t e d T y p e Àô  >E R R _ F o r w a r d e d T y p e I n T h i s A s s e m b l y *õ  2E R R _ F o r w a r d e d T y p e I s N e s t e d ‘õ  4E R R _ F o r w a r d e d T y p e s C o n f l i c t àõ  2E R R _ F r i e n d A s s e m b l y B a d A r g s Lö  .E R R _ F r i e n d A s s e m b l y S N R e q +÷  6E R R _ F r i e n d R e f N o t E q u a l T o T h i s â÷  8E R R _ F r i e n d R e f S i g n i n g M i s m a t c h ¹ø  6E R R _ F u n c P t r M e t h M u s t B e S t a t i c iù  ,E R R _ F u n c P t r R e f M i s m a t c h Åù  ^E R R _ F u n c t i o n P o i n t e r T y p e s I n A t t r i b u t e N o t S u p p o r t e d ú  hE R R _ F u n c t i o n P o i n t e r s C a n n o t B e C a l l e d W i t h N a m e d A r g u m e n t s oú  6E R R _ G e n e r i c A r g I s S t a t i c C l a s s ¼ú  †E R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d I n t e r f a c e W i t h S t a t i c A b s t r a c t M e m b e r s û  ZE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d N u l l a b l e E n u m û  dE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d N u l l a b l e I n t e r f a c e @ü  PE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d R e f T y p e ı  LE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d T y V a r Æı  PE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d V a l T y p e …ş  @E R R _ G e n e r i c s U s e d A c r o s s A s s e m b l i e s !ÿ  6E R R _ G e n e r i c s U s e d I n N o P I A T y p e Ûÿ  (E R R _ G e t O r S e t E x p e c t e d ‚  <E R R _ G l o b a l A t t r i b u t e s N o t A l l o w e d ±  8E R R _ G l o b a l A t t r i b u t e s N o t F i r s t ü  NE R R _ G l o b a l D e f i n i t i o n O r S t a t e m e n t E x p e c t e d § *E R R _ G l o b a l E x t e r n A l i a s ğ @E R R _ G l o b a l S i n g l e T y p e N a m e N o t F o u n d $ FE R R _ G l o b a l S i n g l e T y p e N a m e N o t F o u n d F w d ¶ &E R R _ G l o b a l S t a t e m e n t d 4E R R _ G l o b a l U s i n g I n N a m e s p a c e ¯ 2E R R _ G l o b a l U s i n g O u t O f O r d e r  :E R R _ G l o b a l U s i n g S t a t i c F i l e T y p e p @E R R _ G o T o B a c k w a r d J u m p O v e r U s i n g V a r Ï >E R R _ G o T o F o r w a r d J u m p O v e r U s i n g V a r I "E R R _ H a s N o T y p e V a r s ¤ 4E R R _ H i d d e n P o s i t i o n a l M e m b e r è 0E R R _ H i d i n g A b s t r a c t M e t h o d > ,E R R _ I d e n t i f i e r E x p e c t e d q 0E R R _ I d e n t i f i e r E x p e c t e d K W  ,E R R _ I d e n t i t y C o n v e r s i o n Ò $E R R _ I l l e g a l A r g l i s t  *E R R _ I l l e g a l A t S e q u e n c e ~ "E R R _ I l l e g a l E s c a p e 8 (E R R _ I l l e g a l F i x e d T y p e ] ,E R R _ I l l e g a l I n n e r U n s a f e ñ "E R R _ I l l e g a l P a r a m s $	 &E R R _ I l l e g a l R e f P a r a m M	 (E R R _ I l l e g a l S t a t e m e n t {	 ,E R R _ I l l e g a l S u p p r e s s i o n ş	 "E R R _ I l l e g a l U n s a f e @
+ $E R R _ I l l e g a l V a r A r g s „
+ 2E R R _ I l l e g a l V a r i a n c e S y n t a x °
+ ,E R R _ I m p l B a d C o n s t r a i n t s 3 *E R R _ I m p l B a d T u p l e N a m e s  VE R R _ I m p l i c i t C o n v e r s i o n O p e r a t o r C a n t B e C h e c k e d ¦ nE R R _ I m p l i c i t I m p l e m e n t a t i o n O f I n a c c e s s i b l e I n t e r f a c e M e m b e r  hE R R _ I m p l i c i t I m p l e m e n t a t i o n O f N o n P u b l i c I n t e r f a c e M e m b e r € @E R R _ I m p l i c i t I n d e x I n d e x e r W i t h N a m e E VE R R _ I m p l i c i t O b j e c t C r e a t i o n I l l e g a l T a r g e t T y p e £ LE R R _ I m p l i c i t O b j e c t C r e a t i o n N o T a r g e t T y p e ì DE R R _ I m p l i c i t O b j e c t C r e a t i o n N o t V a l i d  @E R R _ I m p l i c i t R a n g e I n d e x e r W i t h N a m e N DE R R _ I m p l i c i t l y T y p e d A r r a y N o B e s t T y p e ° FE R R _ I m p l i c i t l y T y p e d D e f a u l t P a r a m e t e r  JE R R _ I m p l i c i t l y T y p e d L o c a l C a n n o t B e F i x e d ^ nE R R _ I m p l i c i t l y T y p e d O u t V a r i a b l e U s e d I n T h e S a m e A r g u m e n t L i s t ° fE R R _ I m p l i c i t l y T y p e d V a r i a b l e A s s i g n e d A r r a y I n i t i a l i z e r * VE R R _ I m p l i c i t l y T y p e d V a r i a b l e A s s i g n e d B a d V a l u e  PE R R _ I m p l i c i t l y T y p e d V a r i a b l e C a n n o t B e C o n s t é ZE R R _ I m p l i c i t l y T y p e d V a r i a b l e M u l t i p l e D e c l a r a t o r / XE R R _ I m p l i c i t l y T y p e d V a r i a b l e W i t h N o I n i t i a l i z e r } *E R R _ I m p o r t N o n A s s e m b l y Ã 0E R R _ I m p o r t e d C i r c u l a r B a s e ô (E R R _ I n A t t r O n O u t P a r a m W ,E R R _ I n D y n a m i c M e t h o d A r g ‡ E R R _ I n E x p e c t e d î <E R R _ I n E x t e n s i o n M u s t B e V a l u e T y p e  ,E R R _ I n a c c e s s i b l e G e t t e r m ,E R R _ I n a c c e s s i b l e S e t t e r õ 8E R R _ I n c o n s i s t e n t I n d e x e r N a m e s { HE R R _ I n c o n s i s t e n t L a m b d a P a r a m e t e r U s a g e  6E R R _ I n c r e m e n t L v a l u e E x p e c t e d x XE R R _ I n d e x e d P r o p e r t y M u s t H a v e A l l O p t i o n a l P a r a m s ì BE R R _ I n d e x e d P r o p e r t y R e q u i r e s P a r a m s 8 6E R R _ I n d e x e r C a n t H a v e V o i d T y p e ™ 0E R R _ I n d e x e r I n S t a t i c C l a s s È *E R R _ I n d e x e r N e e d s P a r a m  HE R R _ I n d i r e c t R e c u r s i v e C o n s t r u c t o r C a l l D TE R R _ I n h e r i t i n g F r o m R e c o r d W i t h S e a l e d T o S t r i n g “ 0E R R _ I n i t C a n n o t B e R e a d o n l y , TE R R _ I n i t i a l i z e B y R e f e r e n c e V a r i a b l e W i t h V a l u e   TE R R _ I n i t i a l i z e B y V a l u e V a r i a b l e W i t h R e f e r e n c e ì FE R R _ I n i t i a l i z e r A d d H a s P a r a m M o d i f i e r s 8 FE R R _ I n i t i a l i z e r A d d H a s W r o n g S i g n a t u r e  bE R R _ I n i t i a l i z e r I n S t r u c t W i t h o u t E x p l i c i t C o n s t r u c t o r Ò @E R R _ I n i t i a l i z e r O n N o n A u t o P r o p e r t y + >E R R _ I n s t a n c e M e m b e r I n S t a t i c C l a s s { TE R R _ I n s t a n c e P r o p e r t y I n i t i a l i z e r I n I n t e r f a c e É 8E R R _ I n s t a n t i a t i n g S t a t i c C l a s s  *E R R _ I n s u f f i c i e n t S t a c k V  E R R _ I n t D i v B y Z e r o ‘ E R R _ I n t O v e r f l o w ± 0E R R _ I n t e g r a l T y p e E x p e c t e d Ù :E R R _ I n t e g r a l T y p e V a l u e E x p e c t e d " :E R R _ I n t e r f a c e E v e n t I n i t i a l i z e r K JE R R _ I n t e r f a c e I m p l e m e n t e d B y C o n d i t i o n a l — hE R R _ I n t e r f a c e I m p l e m e n t e d B y U n m a n a g e d C a l l e r s O n l y M e t h o d ù XE R R _ I n t e r f a c e I m p l e m e n t e d I m p l i c i t l y B y V a r i a d i c h 6E R R _ I n t e r f a c e M e m b e r N o t F o u n d Û JE R R _ I n t e r f a c e s C a n t C o n t a i n C o n s t r u c t o r s Q  lE R R _ I n t e r f a c e s C a n t C o n t a i n C o n v e r s i o n O r E q u a l i t y O p e r a t o r s   >E R R _ I n t e r f a c e s C a n t C o n t a i n F i e l d s ! "E R R _ I n t e r n a l E r r o r =! 2E R R _ I n t e r o p M e t h o d W i t h B o d y u! @E R R _ I n t e r o p S t r u c t C o n t a i n s M e t h o d s º! >E R R _ I n t e r o p T y p e M i s s i n g A t t r i b u t e " FE R R _ I n t e r o p T y p e s W i t h S a m e N a m e A n d G u i d Š" nE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t A t t r i b u t e M a l f o r m e d D# †E R R _ I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t L o c a t e d A f t e r I n t e r p o l a t e d S t r i n g õ# rE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t O p t i o n a l N o t S p e c i f i e d ı$ jE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r C r e a t i o n C a n n o t U s e D y n a m i c Ğ% jE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r M e t h o d R e t u r n I n c o n s i s t e n t V& dE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r M e t h o d R e t u r n M a l f o r m e d Ğ& ŒE R R _ I n t e r p o l a t e d S t r i n g s R e f e r e n c i n g I n s t a n c e C a n n o t B e I n O b j e c t I n i t i a l i z e r s D' "E R R _ I n v a l i d A d d r O p ø' PE R R _ I n v a l i d A n o n y m o u s T y p e M e m b e r D e c l a r a t o r 6(  E R R _ I n v a l i d A r r a y İ( 4E R R _ I n v a l i d A s s e m b l y C u l t u r e -) @E R R _ I n v a l i d A s s e m b l y C u l t u r e F o r E x e —) .E R R _ I n v a l i d A s s e m b l y N a m e * 8E R R _ I n v a l i d A t t r i b u t e A r g u m e n t a* DE R R _ I n v a l i d C o n s t a n t D e c l a r a t i o n T y p e «* (E R R _ I n v a l i d D e b u g I n f o ‚+ BE R R _ I n v a l i d D e b u g I n f o r m a t i o n F o r m a t ë+ .E R R _ I n v a l i d D e l e g a t e T y p e  , 6E R R _ I n v a l i d D y n a m i c C o n d i t i o n , &E R R _ I n v a l i d E x p r T e r m .- 0E R R _ I n v a l i d F i l e A l i g n m e n t _- 2E R R _ I n v a l i d F i x e d A r r a y S i z e š- BE R R _ I n v a l i d F o r m a t F o r G u i d F o r O p t i o n ã- PE R R _ I n v a l i d F u n c P o i n t e r R e t u r n T y p e M o d i f i e r M. VE R R _ I n v a l i d F u n c t i o n P o i n t e r C a l l i n g C o n v e n t i o n Ò. $E R R _ I n v a l i d F w d T y p e 1/ &E R R _ I n v a l i d G o t o C a s e |/ 8E R R _ I n v a l i d H a s h A l g o r i t h m N a m e Ê/ PE R R _ I n v a l i d I n i t i a l i z e r E l e m e n t I n i t i a l i z e r ü/ <E R R _ I n v a l i d I n s t r u m e n t a t i o n K i n d 20 `E R R _ I n v a l i d I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t N a m e `0 *E R R _ I n v a l i d L i n e N u m b e r ”0 *E R R _ I n v a l i d M e m b e r D e c l à0 JE R R _ I n v a l i d M o d i f i e r F o r L a n g u a g e V e r s i o n E1 6E R R _ I n v a l i d N a m e I n S u b p a t t e r n È1 0E R R _ I n v a l i d N a m e d A r g u m e n t 2 "E R R _ I n v a l i d N u m b e r R2 2E R R _ I n v a l i d O b j e c t C r e a t i o n e2 *E R R _ I n v a l i d O u t p u t N a m e ƒ2 $E R R _ I n v a l i d P a t h M a p £2 ,E R R _ I n v a l i d P r e p r o c E x p r Õ2 <E R R _ I n v a l i d P r e p r o c e s s i n g S y m b o l 3 ^E R R _ I n v a l i d P r i m a r y C o n s t r u c t o r P a r a m e t e r R e f e r e n c e ]3 8E R R _ I n v a l i d P r o p e r t y A c c e s s M o d µ3 >E R R _ I n v a l i d P r o p e r t y R e a d O n l y M o d s B4 E R R _ I n v a l i d Q M İ4 E R R _ I n v a l i d R e a l Z5 :E R R _ I n v a l i d S i g n a t u r e P u b l i c K e y „5 (E R R _ I n v a l i d S p e c i f i e r İ5 4E R R _ I n v a l i d S t a c k A l l o c A r r a y 6 6E R R _ I n v a l i d S u b s y s t e m V e r s i o n Z6 NE R R _ I n v a l i d U n m a n a g e d C a l l e r s O n l y C a l l C o n v ú6 0E R R _ I n v a l i d V e r s i o n F o r m a t N7 2E R R _ I n v a l i d V e r s i o n F o r m a t 2 Ê7 JE R R _ I n v a l i d V e r s i o n F o r m a t D e t e r m i n i s t i c Y8 6E R R _ I n v a l i d W i t h R e c e i v e r T y p e ;9 $E R R _ I s N u l l a b l e T y p e €9 .E R R _ I s P a t t e r n I m p o s s i b l e ù9 .E R R _ I t e r a t o r M u s t B e A s y n c K: "E R R _ L a b e l N o t F o u n d : E R R _ L a b e l S h a d o w Ü: >E R R _ L a m b d a E x p l i c i t R e t u r n T y p e V a r =;  E R R _ L a m b d a I n I s A s §; PE R R _ L a m b d a W i t h A t t r i b u t e s T o E x p r e s s i o n T r e e &< TE R R _ L a n g u a g e V e r s i o n C a n n o t H a v e L e a d i n g Z e r o e s †< ‚E R R _ L a n g u a g e V e r s i o n D o e s N o t S u p p o r t I n t e r f a c e I m p l e m e n t a t i o n F o r M e m b e r Õ< $E R R _ L b r a c e E x p e c t e d œ= 0E R R _ L e g a c y O b j e c t I d S y n t a x ´= FE R R _ L i n e C o n t a i n s D i f f e r e n t W h i t e s p a c e í= LE R R _ L i n e D o e s N o t S t a r t W i t h S a m e W h i t e s p a c e v> JE R R _ L i n e S p a n D i r e c t i v e E n d L e s s T h a n S t a r t è> BE R R _ L i n e S p a n D i r e c t i v e I n v a l i d V a l u e I? DE R R _ L i n e S p a n D i r e c t i v e R e q u i r e s S p a c e —? bE R R _ L i n k e d N e t m o d u l e M e t a d a t a M u s t P r o v i d e F u l l P E I m a g e @ :E R R _ L i s t P a t t e r n R e q u i r e s L e n g t h o@ *E R R _ L i t e r a l D o u b l e C a s t A JE R R _ L o a d D i r e c t i v e O n l y A l l o w e d I n S c r i p t s °A <E R R _ L o c a l C a n t B e F i x e d A n d H o i s t e d ×A $E R R _ L o c a l D u p l i c a t e yB 8E R R _ L o c a l F u n c t i o n M i s s i n g B o d y ÑB 6E R R _ L o c a l I l l e g a l l y O v e r r i d e s 8C 8E R R _ L o c a l S a m e N a m e A s T y p e P a r a m D ,E R R _ L o c a l T y p e N a m e C l a s h £D ,E R R _ L o c k N e e d s R e f e r e n c e sE 0E R R _ L o o k u p I n T y p e V a r i a b l e ´E *E R R _ M a i n C l a s s I s I m p o r t F *E R R _ M a i n C l a s s N o t C l a s s `F *E R R _ M a i n C l a s s N o t F o u n d åF E R R _ M a n a g e d A d d r +G RE R R _ M a r s h a l U n m a n a g e d T y p e N o t V a l i d F o r F i e l d s ªG TE R R _ M a r s h a l U n m a n a g e d T y p e O n l y V a l i d F o r F i e l d s àG 8E R R _ M e m G r o u p I n E x p r e s s i o n T r e e H .E R R _ M e m b e r A l r e a d y E x i s t s sH 8E R R _ M e m b e r A l r e a d y I n i t i a l i z e d ÍH :E R R _ M e m b e r C a n n o t B e I n i t i a l i z e d úH 0E R R _ M e m b e r N a m e S a m e A s T y p e MI &E R R _ M e m b e r N e e d s T y p e ¡I $E R R _ M e m b e r R e s e r v e d ÊI JE R R _ M e r g e _ c o n f l i c t _ m a r k e r _ e n c o u n t e r e d "J .E R R _ M e t a d a t a N a m e T o o L o n g XJ DE R R _ M e t a d a t a R e f e r e n c e s N o t S u p p o r t e d œJ 0E R R _ M e t h D e l e g a t e M i s m a t c h ÌJ .E R R _ M e t h F u n c P t r M i s m a t c h K &E R R _ M e t h G r p T o N o n D e l JK 2E R R _ M e t h o d A r g C a n t B e R e f A n y ÁK <E R R _ M e t h o d I m p l e m e n t i n g A c c e s s o r L ,E R R _ M e t h o d N a m e E x p e c t e d ¢L 8E R R _ M e t h o d R e t u r n C a n t B e R e f A n y ÄL @E R R _ M i s m a t c h e d R e f E s c a p e I n T e r n a r y M &E R R _ M i s p l a c e d R e c o r d ˜M 2E R R _ M i s p l a c e d S l i c e P a t t e r n ìM ,E R R _ M i s p l a c e d U n c h e c k e d ZN (E R R _ M i s s i n g A d d r e s s O f €N &E R R _ M i s s i n g A r g u m e n t ãN (E R R _ M i s s i n g A r r a y S i z e öN $E R R _ M i s s i n g C o C l a s s hO ,E R R _ M i s s i n g D e b u g S w i t c h øO ,E R R _ M i s s i n g D e c o n s t r u c t >P 0E R R _ M i s s i n g G u i d F o r O p t i o n ÒP DE R R _ M i s s i n g M e t h o d O n S o u r c e I n t e r f a c e "Q :E R R _ M i s s i n g N e t M o d u l e R e f e r e n c e †Q "E R R _ M i s s i n g P P F i l e °Q $E R R _ M i s s i n g P a r t i a l R $E R R _ M i s s i n g P a t t e r n „R 6E R R _ M i s s i n g P r e d e f i n e d M e m b e r —R 4E R R _ M i s s i n g S o u r c e I n t e r f a c e ÑR .E R R _ M i s s i n g S t r u c t O f f s e t FS 2E R R _ M i s s i n g T y p e I n A s s e m b l y ËS .E R R _ M i s s i n g T y p e I n S o u r c e 'T >E R R _ M i x i n g W i n R T E v e n t W i t h R e g u l a r ®T *E R R _ M o d u l e E m i t F a i l u r e U bE R R _ M o d u l e I n i t i a l i z e r C a n n o t B e U n m a n a g e d C a l l e r s O n l y SU zE R R _ M o d u l e I n i t i a l i z e r M e t h o d A n d C o n t a i n i n g T y p e s M u s t N o t B e G e n e r i c ²U |E R R _ M o d u l e I n i t i a l i z e r M e t h o d M u s t B e A c c e s s i b l e O u t s i d e T o p L e v e l T y p e +V RE R R _ M o d u l e I n i t i a l i z e r M e t h o d M u s t B e O r d i n a r y ‡V pE R R _ M o d u l e I n i t i a l i z e r M e t h o d M u s t B e S t a t i c P a r a m e t e r l e s s V o i d ÊV PE R R _ M o s t S p e c i f i c I m p l e m e n t a t i o n I s N o t F o u n d UW 4E R R _ M u l t i T y p e I n D e c l a r a t i o n ÏW HE R R _ M u l t i p l e A n a l y z e r C o n f i g s I n S a m e D i r 0X .E R R _ M u l t i p l e E n t r y P o i n t s X XE R R _ M u l t i p l e E n u m e r a t o r C a n c e l l a t i o n A t t r i b u t e s Y >E R R _ M u l t i p l e F i l e S c o p e d N a m e s p a c e eY 2E R R _ M u l t i p l e I A s y n c E n u m O f T ÃY (E R R _ M u l t i p l e I E n u m O f T ¡Z @E R R _ M u l t i p l e R e c o r d P a r a m e t e r L i s t s u[ >E R R _ M u s t D e c l a r e F o r e a c h I t e r a t i o n Î[  E R R _ M u s t H a v e O p T F \ *E R R _ M u s t H a v e R e f R e t u r n œ\ 0E R R _ M u s t N o t H a v e R e f R e t u r n ] 8E R R _ M u t u a l l y E x c l u s i v e O p t i o n s r] (E R R _ N a m e N o t I n C o n t e x t Í] XE R R _ N a m e N o t I n C o n t e x t P o s s i b l e M i s s i n g R e f e r e n c e ı] 2E R R _ N a m e d A r g u m e n t E x p e c t e d e^ 2E R R _ N a m e d A r g u m e n t F o r A r r a y ™^ bE R R _ N a m e d A r g u m e n t S p e c i f i c a t i o n B e f o r e F i x e d A r g u m e n t ì^ ˆE R R _ N a m e d A r g u m e n t S p e c i f i c a t i o n B e f o r e F i x e d A r g u m e n t I n D y n a m i c I n v o c a t i o n »_ BE R R _ N a m e d A r g u m e n t U s e d I n P o s i t i o n a l 7` 2E R R _ N a m e o f E x t e n s i o n M e t h o d ¨` NE R R _ N a m e o f M e t h o d G r o u p W i t h T y p e P a r a m e t e r s ø` >E R R _ N a m e s p a c e N o t A l l o w e d I n S c r i p t Xa .E R R _ N a m e s p a c e U n e x p e c t e d ša *E R R _ N e g a t i v e A r r a y S i z e öa 4E R R _ N e g a t i v e S t a c k A l l o c S i z e /b 2E R R _ N e t M o d u l e N a m e M i s m a t c h jb :E R R _ N e t M o d u l e N a m e M u s t B e U n i q u e Âb ,E R R _ N e w B o u n d M u s t B e L a s t (c 2E R R _ N e w B o u n d W i t h U n m a n a g e d cc &E R R _ N e w B o u n d W i t h V a l ©c (E R R _ N e w C o C l a s s O n L i n k ìc TE R R _ N e w C o n s t r a i n t C a n n o t H a v e R e q u i r e d M e m b e r s Od :E R R _ N e w C o n s t r a i n t N o t S a t i s f i e d ìd (E R R _ N e w T y v a r W i t h A r g s ’e ,E R R _ N e w V i r t u a l I n S e a l e d ïe 4E R R _ N e w W i t h T u p l e T y p e S y n t a x (f $E R R _ N e w l i n e I n C o n s t ƒf zE R R _ N e w l i n e s A r e N o t A l l o w e d I n s i d e A N o n V e r b a t i m I n t e r p o l a t e d S t r i n g f E R R _ N o A l i a s H e r e >g E R R _ N o B a s e C l a s s ‹g "E R R _ N o B r e a k O r C o n t Äg &E R R _ N o C a n o n i c a l V i e w h $E R R _ N o C o n s t r u c t o r s ¾h ,E R R _ N o C o n v T o I A s y n c D i s p ïh @E R R _ N o C o n v T o I A s y n c D i s p W r o n g A s y n c Ÿi "E R R _ N o C o n v T o I D i s p }j 6E R R _ N o C o n v T o I D i s p W r o n g A s y n c îj `E R R _ N o C o n v e r s i o n F o r C a l l e r A r g u m e n t E x p r e s s i o n P a r a m k LE R R _ N o C o n v e r s i o n F o r C a l l e r F i l e P a t h P a r a m l PE R R _ N o C o n v e r s i o n F o r C a l l e r L i n e N u m b e r P a r a m ™l PE R R _ N o C o n v e r s i o n F o r C a l l e r M e m b e r N a m e P a r a m m >E R R _ N o C o n v e r s i o n F o r D e f a u l t P a r a m ¥m DE R R _ N o C o n v e r s i o n F o r N u b D e f a u l t P a r a m +n >E R R _ N o C o p y C o n s t r u c t o r I n B a s e T y p e ½n 6E R R _ N o C o r r e s p o n d i n g A r g u m e n t o 0E R R _ N o D e l e g a t e C o n s t r a i n t to 4E R R _ N o D y n a m i c P h a n t o m O n B a s e Öo <E R R _ N o D y n a m i c P h a n t o m O n B a s e C t o r ¸p BE R R _ N o D y n a m i c P h a n t o m O n B a s e I n d e x e r †q  E R R _ N o E n t r y P o i n t nr (E R R _ N o E n u m C o n s t r a i n t Çr 2E R R _ N o E x p l i c i t B u i l t i n C o n v )s $E R R _ N o E x p l i c i t C o n v ñs E R R _ N o F i l e S p e c %t &E R R _ N o G e t T o O v e r r i d e Vt $E R R _ N o I m p l i c i t C o n v Ït ,E R R _ N o I m p l i c i t C o n v C a s t u PE R R _ N o I m p l i c i t C o n v T a r g e t T y p e d C o n d i t i o n a l ¡u "E R R _ N o M a i n I n C l a s s ·v E R R _ N o M a i n O n D L L ğv $E R R _ N o M e t a d a t a F i l e ;w 2E R R _ N o M o d i f i e r s O n A c c e s s o r kw 2E R R _ N o M u l t i p l e I n h e r i t a n c e Íw ,E R R _ N o N a m e s p a c e P r i v a t e x PE R R _ N o N e t M o d u l e O u t p u t W h e n R e f O u t O r R e f O n l y °x "E R R _ N o N e w A b s t r a c t üx E R R _ N o N e w T y v a r Ky *E R R _ N o O u t p u t D i r e c t o r y °y BE R R _ N o P I A A s s e m b l y M i s s i n g A t t r i b u t e ëy DE R R _ N o P I A A s s e m b l y M i s s i n g A t t r i b u t e s Zz &E R R _ N o P I A N e s t e d T y p e Ñz .E R R _ N o R e f O u t W h e n R e f O n l y m{ &E R R _ N o S e t T o O v e r r i d e –{  E R R _ N o S o u r c e F i l e |  E R R _ N o S u c h M e m b e r L| 6E R R _ N o S u c h M e m b e r O r E x t e n s i o n z| HE R R _ N o S u c h M e m b e r O r E x t e n s i o n N e e d U s i n g a} E R R _ N o T y p e D e f (~ .E R R _ N o T y p e D e f F r o m M o d u l e ~ E R R _ N o V o i d H e r e  &E R R _ N o V o i d P a r a m e t e r T >E R R _ N o n I n t e r f a c e I n I n t e r f a c e L i s t y 8E R R _ N o n I n v o c a b l e M e m b e r C a l l e d ¸ 2E R R _ N o n P r i v a t e A P I I n R e c o r d ş 6E R R _ N o n P r o t e c t e d A P I I n R e c o r d /€ 0E R R _ N o n P u b l i c A P I I n R e c o r d a€ VE R R _ N o n P u b l i c P a r a m e t e r l e s s S t r u c t C o n s t r u c t o r “€ 4E R R _ N o n T a s k M a i n C a n t B e A s y n c Ğ€ .E R R _ N o t A n A t t r i b u t e C l a s s  2E R R _ N o t C o n s t a n t E x p r e s s i o n > HE R R _ N o t E n o u g h C l o s e B r a c e s F o r R a w S t r i n g w >E R R _ N o t E n o u g h Q u o t e s F o r R a w S t r i n g )‚ vE R R _ N o t I n s t a n c e I n v a l i d I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t N a m e r‚ 0E R R _ N o t N u l l C o n s t R e f F i e l d æ‚ <E R R _ N o t N u l l R e f D e f a u l t P a r a m e t e r aƒ :E R R _ N o t O v e r r i d a b l e A P I I n R e c o r d êƒ :E R R _ N o t Y e t I m p l e m e n t e d I n R o s l y n 9„ hE R R _ N u l l I n v a l i d I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t N a m e ‚„  E R R _ N u l l N o t V a l i d … JE R R _ N u l l P r o p a g a t i n g O p I n E x p r e s s i o n T r e e P… LE R R _ N u l l a b l e D i r e c t i v e Q u a l i f i e r E x p e c t e d »… FE R R _ N u l l a b l e D i r e c t i v e T a r g e t E x p e c t e d è… <E R R _ N u l l a b l e O p t i o n N o t A v a i l a b l e )† LE R R _ N u l l a b l e U n c o n s t r a i n e d T y p e P a r a m e t e r “† @E R R _ O b j e c t C a l l i n g B a s e C o n s t r u c t o r ²‡ .E R R _ O b j e c t C a n t H a v e B a s e s ø‡ jE R R _ O b j e c t O r C o l l e c t i o n I n i t i a l i z e r W i t h D e l e g a t e C r e a t i o n Nˆ (E R R _ O b j e c t P r o h i b i t e d Õˆ $E R R _ O b j e c t R e q u i r e d A‰ .E R R _ O m i t t e d T y p e A r g u m e n t ¥‰ 0E R R _ O n e A l i a s P e r R e f e r e n c e ç‰ HE R R _ O n l y C l a s s e s C a n C o n t a i n D e s t r u c t o r s ŒŠ E R R _ O p T F R e t T y p e ¾Š (E R R _ O p e n E n d e d C o m m e n t ‹ (E R R _ O p e n R e s p o n s e F i l e 0‹ 2E R R _ O p e r a t o r C a n t B e C h e c k e d z‹ 4E R R _ O p e r a t o r C a n t R e t u r n V o i d Å‹ 2E R R _ O p e r a t o r I n S t a t i c C l a s s Œ ,E R R _ O p e r a t o r N e e d s M a t c h UŒ 2E R R _ O p e r a t o r s M u s t B e S t a t i c ªŒ 8E R R _ O p t i o n M u s t B e A b s o l u t e P a t h şŒ (E R R _ O u t A t t r O n I n P a r a m 1 *E R R _ O u t A t t r O n R e f P a r a m b 8E R R _ O u t V a r i a b l e C a n n o t B e B y R e f Ì &E R R _ O u t p u t N e e d s N a m e  *E R R _ O u t p u t W r i t e F a i l e d V &E R R _ O v e r l o a d R e f K i n d ’ RE R R _ O v e r r i d e D e f a u l t C o n s t r a i n t N o t S a t i s f i e d  <E R R _ O v e r r i d e F i n a l i z e D e p r e c a t e d  8E R R _ O v e r r i d e M u s t H a v e R e q u i r e d V .E R R _ O v e r r i d e N o t E x p e c t e d ° $E R R _ O v e r r i d e N o t N e w ú JE R R _ O v e r r i d e R e f C o n s t r a i n t N o t S a t i s f i e d Z‘ JE R R _ O v e r r i d e V a l C o n s t r a i n t N o t S a t i s f i e d :’ 6E R R _ O v e r r i d e W i t h C o n s t r a i n t s 2“ :E R R _ O v l B i n a r y O p e r a t o r E x p e c t e d 
+” .E R R _ O v l O p e r a t o r E x p e c t e d D” 8E R R _ O v l U n a r y O p e r a t o r E x p e c t e d v” *E R R _ P P D e f F o l l o w s T o k e n ¯” .E R R _ P P D i r e c t i v e E x p e c t e d • ,E R R _ P P L o a d F o l l o w s T o k e n J• 6E R R _ P P R e f e r e n c e F o l l o w s T o k e n …• RE R R _ P a r a m D e f a u l t V a l u e D i f f e r s F r o m A t t r i b u t e ½• &E R R _ P a r a m U n a s s i g n e d ğ• 4E R R _ P a r a m e t e r I s S t a t i c C l a s s N– 8E R R _ P a r a m e t e r N o t V a l i d F o r T y p e – JE R R _ P a r a m e t e r N u l l C h e c k i n g N o t S u p p o r t e d Î– 8E R R _ P a r a m s C a n t B e W i t h M o d i f i e r — E R R _ P a r a m s L a s t G— *E R R _ P a r a m s M u s t B e A r r a y •— PE R R _ P a r t i a l M e t h o d A c c e s s i b i l i t y D i f f e r e n c e Ò— LE R R _ P a r t i a l M e t h o d E x t e n d e d M o d D i f f e r e n c e <˜ HE R R _ P a r t i a l M e t h o d E x t e n s i o n D i f f e r e n c e Ì˜ BE R R _ P a r t i a l M e t h o d I n E x p r e s s i o n T r e e J™ PE R R _ P a r t i a l M e t h o d I n c o n s i s t e n t C o n s t r a i n t s á™ NE R R _ P a r t i a l M e t h o d I n c o n s i s t e n t T u p l e N a m e s Lš @E R R _ P a r t i a l M e t h o d I n v a l i d M o d i f i e r »š >E R R _ P a r t i a l M e t h o d M u s t H a v e L a t e n t ıš 8E R R _ P a r t i a l M e t h o d N o t E x p l i c i t t› FE R R _ P a r t i a l M e t h o d O n l y I n P a r t i a l C l a s s É› <E R R _ P a r t i a l M e t h o d O n l y O n e A c t u a l œ <E R R _ P a r t i a l M e t h o d O n l y O n e L a t e n t Qœ BE R R _ P a r t i a l M e t h o d P a r a m s D i f f e r e n c e –œ FE R R _ P a r t i a l M e t h o d R e a d O n l y D i f f e r e n c e  HE R R _ P a r t i a l M e t h o d R e f R e t u r n D i f f e r e n c e h JE R R _ P a r t i a l M e t h o d R e t u r n T y p e D i f f e r e n c e Ï BE R R _ P a r t i a l M e t h o d S t a t i c D i f f e r e n c e ) 6E R R _ P a r t i a l M e t h o d T o D e l e g a t e › BE R R _ P a r t i a l M e t h o d U n s a f e D i f f e r e n c e Ÿ xE R R _ P a r t i a l M e t h o d W i t h A c c e s s i b i l i t y M o d s M u s t H a v e I m p l e m e n t a t i o n oŸ dE R R _ P a r t i a l M e t h o d W i t h E x t e n d e d M o d M u s t H a v e A c c e s s M o d s åŸ hE R R _ P a r t i a l M e t h o d W i t h N o n V o i d R e t u r n M u s t H a v e A c c e s s M o d s   ^E R R _ P a r t i a l M e t h o d W i t h O u t P a r a m M u s t H a v e A c c e s s M o d s ö  (E R R _ P a r t i a l M i s p l a c e d _¡ 6E R R _ P a r t i a l M o d i f i e r C o n f l i c t ò¡ 0E R R _ P a r t i a l M u l t i p l e B a s e s M¢ 6E R R _ P a r t i a l T y p e K i n d C o n f l i c t œ¢ 6E R R _ P a r t i a l W r o n g C o n s t r a i n t s £ 4E R R _ P a r t i a l W r o n g T y p e P a r a m s z£ DE R R _ P a r t i a l W r o n g T y p e P a r a m s V a r i a n c e ä£ ,E R R _ P a t t e r n D y n a m i c T y p e j¤ .E R R _ P a t t e r n N u l l a b l e T y p e ¥¤ JE R R _ P a t t e r n S p a n C h a r C a n n o t B e S t r i n g N u l l ¥ HE R R _ P a t t e r n W r o n g G e n e r i c T y p e I n V e r s i o n w¥ (E R R _ P a t t e r n W r o n g T y p e ¦ (E R R _ P e W r i t i n g F a i l u r e f¦ NE R R _ P e r m i s s i o n S e t A t t r i b u t e F i l e R e a d E r r o r °¦ JE R R _ P e r m i s s i o n S e t A t t r i b u t e I n v a l i d F i l e A§ &E R R _ P o i n t e r I n A s O r I s Ä§ @E R R _ P o i n t e r T y p e I n P a t t e r n M a t c h i n g î§ JE R R _ P o s s i b l e A s y n c I t e r a t o r W i t h o u t Y i e l d 1¨ XE R R _ P o s s i b l e A s y n c I t e r a t o r W i t h o u t Y i e l d O r A w a i t …¨ ,E R R _ P o s s i b l e B a d N e g C a s t <© TE R R _ P r e d e f i n e d T y p e M e m b e r N o t F o u n d I n A s s e m b l y “© 4E R R _ P r e d e f i n e d T y p e N o t F o u n d İ© LE R R _ P r e d e f i n e d V a l u e T u p l e T y p e A m b i g u o u s 3 ª PE R R _ P r e d e f i n e d V a l u e T u p l e T y p e M u s t B e S t r u c t nª HE R R _ P r e d e f i n e d V a l u e T u p l e T y p e N o t F o u n d ¡ª HE R R _ P r i n c i p a l P e r m i s s i o n I n v a l i d A c t i o n Úª 6E R R _ P r i v a t e A b s t r a c t A c c e s s o r /« 8E R R _ P r o p e r t y C a n t H a v e V o i d T y p e |« (E R R _ P r o p e r t y L a c k s G e t À« <E R R _ P r o p e r t y P a t t e r n N a m e M i s s i n g :¬ 6E R R _ P r o p e r t y W i t h N o A c c e s s o r s Æ¬ *E R R _ P r o t e c t e d I n S t a t i c ­ *E R R _ P r o t e c t e d I n S t r u c t Y­ E R R _ P t r E x p e c t e d ˜­ $E R R _ P t r I n d e x S i n g l e Ñ­ :E R R _ P u b l i c K e y C o n t a i n e r F a i l u r e 	® 0E R R _ P u b l i c K e y F i l e F a i l u r e u® ,E R R _ P u b l i c S i g n B u t N o K e y Ú® .E R R _ P u b l i c S i g n N e t M o d u l e V¯ >E R R _ Q u e r y D u p l i c a t e R a n g e V a r i a b l e —¯ "E R R _ Q u e r y I n n e r K e y Ò¯ 4E R R _ Q u e r y

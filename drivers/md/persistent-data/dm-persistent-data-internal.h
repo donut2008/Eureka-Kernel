@@ -1,19 +1,11 @@
-/*
- * Copyright (C) 2011 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-
-#ifndef _DM_PERSISTENT_DATA_INTERNAL_H
-#define _DM_PERSISTENT_DATA_INTERNAL_H
-
-#include "dm-block-manager.h"
-
-static inline unsigned dm_hash_block(dm_block_t b, unsigned hash_mask)
-{
-	const unsigned BIG_PRIME = 4294967291UL;
-
-	return (((unsigned) b) * BIG_PRIME) & hash_mask;
-}
-
-#endif	/* _PERSISTENT_DATA_INTERNAL_H */
+ASK 0xff00
+#define PDM_CNTL_2__CoolPdmTc__SHIFT 0x8
+#define PDM_CNTL_2__GpuPdmTc_MASK 0xff0000
+#define PDM_CNTL_2__GpuPdmTc__SHIFT 0x10
+#define PDM_CNTL_2__GpuActThr_MASK 0xff000000
+#define PDM_CNTL_2__GpuActThr__SHIFT 0x18
+#define PDM_CNTL_3__HeatPdmThr1_MASK 0xff
+#define PDM_CNTL_3__HeatPdmThr1__SHIFT 0x0
+#define PDM_CNTL_3__HeatPdmThr2_MASK 0xff00
+#define PDM_CNTL_3__HeatPdmThr2__SHIFT 0x8
+#define PDM

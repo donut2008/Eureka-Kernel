@@ -1,29 +1,49 @@
-IP dynamic address hack-port v0.03
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-This stuff allows diald ONESHOT connections to get established by
-dynamically changing packet source address (and socket's if local procs).
-It is implemented for TCP diald-box connections(1) and IP_MASQuerading(2).
+/*
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
+ *
+ * Copyright (C) 2009 Wind River Systems,
+ *   written by Ralf Baechle <ralf@linux-mips.org>
+ *
+ * Copyright (c) 2013 by Cisco Systems, Inc.
+ * All rights reserved.
+ */
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/io.h>
+#include <linux/edac.h>
+#include <linux/ctype.h>
 
-If enabled[*] and forwarding interface has changed:
-  1)  Socket (and packet) source address is rewritten ON RETRANSMISSIONS
-      while in SYN_SENT state (diald-box processes).
-  2)  Out-bounded MASQueraded source address changes ON OUTPUT (when
-      internal host does retransmission) until a packet from outside is
-      received by the tunnel.
+#include <asm/octeon/octeon.h>
+#include <asm/octeon/cvmx-lmcx-defs.h>
 
-This is specially helpful for auto dialup links (diald), where the
-``actual'' outgoing address is unknown at the moment the link is
-going up. So, the *same* (local AND masqueraded) connections requests that
-bring the link up will be able to get established.
+#include "edac_core.h"
+#include "edac_module.h"
 
-[*] At boot, by default no address rewriting is attempted. 
-  To enable:
-     # echo 1 > /proc/sys/net/ipv4/ip_dynaddr
-  To enable verbose mode:
-     # echo 2 > /proc/sys/net/ipv4/ip_dynaddr
-  To disable (default)
-     # echo 0 > /proc/sys/net/ipv4/ip_dynaddr
+#define OCTEON_MAX_MC 4
 
-Enjoy!
+#define to_mci(k) container_of(k, struct mem_ctl_info, dev)
 
--- Juanjo  <jjciarla@raiz.uncu.edu.ar>
+struct octeon_lmc_pvt {
+	unsigned long inject;
+	unsigned long error_type;
+	unsigned long dimm;
+	unsigned long rank;
+	unsigned long bank;
+	unsigned long row;
+	unsigned long col;
+};
+
+static void octeon_lmc_edac_poll(struct mem_ctl_info *mci)
+{
+	union cvmx_lmcx_mem_cfg0 cfg0;
+	bool do_clear = false;
+	char msg[64];
+
+	cfg0.u64 = cvmx_read_csr(CVMX_LMCX_MEM_CFG0(mci->mc_idx));
+	if (cfg0.s.sec_err || cfg0.s.ded_err) {
+		union cvmx_lmcx_fadr fadr;
+		fadr.u64 = cvmx_read_csr(CVMX_LMCX_FADR(mci->mc_idx));
+		

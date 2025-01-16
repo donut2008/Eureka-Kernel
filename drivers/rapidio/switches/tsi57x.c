@@ -1,371 +1,173 @@
-/*
- * RapidIO Tsi57x switch family support
- *
- * Copyright 2009-2010 Integrated Device Technology, Inc.
- * Alexandre Bounine <alexandre.bounine@idt.com>
- *  - Added EM support
- *  - Modified switch operations initialization.
- *
- * Copyright 2005 MontaVista Software, Inc.
- * Matt Porter <mporter@kernel.crashing.org>
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
- */
-
-#include <linux/rio.h>
-#include <linux/rio_drv.h>
-#include <linux/rio_ids.h>
-#include <linux/delay.h>
-#include <linux/module.h>
-#include "../rio.h"
-
-/* Global (broadcast) route registers */
-#define SPBC_ROUTE_CFG_DESTID	0x10070
-#define SPBC_ROUTE_CFG_PORT	0x10074
-
-/* Per port route registers */
-#define SPP_ROUTE_CFG_DESTID(n)	(0x11070 + 0x100*n)
-#define SPP_ROUTE_CFG_PORT(n)	(0x11074 + 0x100*n)
-
-#define TSI578_SP_MODE(n)	(0x11004 + n*0x100)
-#define TSI578_SP_MODE_GLBL	0x10004
-#define  TSI578_SP_MODE_PW_DIS	0x08000000
-#define  TSI578_SP_MODE_LUT_512	0x01000000
-
-#define TSI578_SP_CTL_INDEP(n)	(0x13004 + n*0x100)
-#define TSI578_SP_LUT_PEINF(n)	(0x13010 + n*0x100)
-#define TSI578_SP_CS_TX(n)	(0x13014 + n*0x100)
-#define TSI578_SP_INT_STATUS(n) (0x13018 + n*0x100)
-
-#define TSI578_GLBL_ROUTE_BASE	0x10078
-
-static int
-tsi57x_route_add_entry(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table, u16 route_destid, u8 route_port)
-{
-	if (table == RIO_GLOBAL_TABLE) {
-		rio_mport_write_config_32(mport, destid, hopcount,
-					  SPBC_ROUTE_CFG_DESTID, route_destid);
-		rio_mport_write_config_32(mport, destid, hopcount,
-					  SPBC_ROUTE_CFG_PORT, route_port);
-	} else {
-		rio_mport_write_config_32(mport, destid, hopcount,
-				SPP_ROUTE_CFG_DESTID(table), route_destid);
-		rio_mport_write_config_32(mport, destid, hopcount,
-				SPP_ROUTE_CFG_PORT(table), route_port);
-	}
-
-	udelay(10);
-
-	return 0;
-}
-
-static int
-tsi57x_route_get_entry(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table, u16 route_destid, u8 *route_port)
-{
-	int ret = 0;
-	u32 result;
-
-	if (table == RIO_GLOBAL_TABLE) {
-		/* Use local RT of the ingress port to avoid possible
-		   race condition */
-		rio_mport_read_config_32(mport, destid, hopcount,
-			RIO_SWP_INFO_CAR, &result);
-		table = (result & RIO_SWP_INFO_PORT_NUM_MASK);
-	}
-
-	rio_mport_write_config_32(mport, destid, hopcount,
-				SPP_ROUTE_CFG_DESTID(table), route_destid);
-	rio_mport_read_config_32(mport, destid, hopcount,
-				SPP_ROUTE_CFG_PORT(table), &result);
-
-	*route_port = (u8)result;
-	if (*route_port > 15)
-		ret = -1;
-
-	return ret;
-}
-
-static int
-tsi57x_route_clr_table(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table)
-{
-	u32 route_idx;
-	u32 lut_size;
-
-	lut_size = (mport->sys_size) ? 0x1ff : 0xff;
-
-	if (table == RIO_GLOBAL_TABLE) {
-		rio_mport_write_config_32(mport, destid, hopcount,
-					  SPBC_ROUTE_CFG_DESTID, 0x80000000);
-		for (route_idx = 0; route_idx <= lut_size; route_idx++)
-			rio_mport_write_config_32(mport, destid, hopcount,
-						  SPBC_ROUTE_CFG_PORT,
-						  RIO_INVALID_ROUTE);
-	} else {
-		rio_mport_write_config_32(mport, destid, hopcount,
-				SPP_ROUTE_CFG_DESTID(table), 0x80000000);
-		for (route_idx = 0; route_idx <= lut_size; route_idx++)
-			rio_mport_write_config_32(mport, destid, hopcount,
-				SPP_ROUTE_CFG_PORT(table) , RIO_INVALID_ROUTE);
-	}
-
-	return 0;
-}
-
-static int
-tsi57x_set_domain(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u8 sw_domain)
-{
-	u32 regval;
-
-	/*
-	 * Switch domain configuration operates only at global level
-	 */
-
-	/* Turn off flat (LUT_512) mode */
-	rio_mport_read_config_32(mport, destid, hopcount,
-				 TSI578_SP_MODE_GLBL, &regval);
-	rio_mport_write_config_32(mport, destid, hopcount, TSI578_SP_MODE_GLBL,
-				  regval & ~TSI578_SP_MODE_LUT_512);
-	/* Set switch domain base */
-	rio_mport_write_config_32(mport, destid, hopcount,
-				  TSI578_GLBL_ROUTE_BASE,
-				  (u32)(sw_domain << 24));
-	return 0;
-}
-
-static int
-tsi57x_get_domain(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u8 *sw_domain)
-{
-	u32 regval;
-
-	/*
-	 * Switch domain configuration operates only at global level
-	 */
-	rio_mport_read_config_32(mport, destid, hopcount,
-				TSI578_GLBL_ROUTE_BASE, &regval);
-
-	*sw_domain = (u8)(regval >> 24);
-
-	return 0;
-}
-
-static int
-tsi57x_em_init(struct rio_dev *rdev)
-{
-	u32 regval;
-	int portnum;
-
-	pr_debug("TSI578 %s [%d:%d]\n", __func__, rdev->destid, rdev->hopcount);
-
-	for (portnum = 0;
-	     portnum < RIO_GET_TOTAL_PORTS(rdev->swpinfo); portnum++) {
-		/* Make sure that Port-Writes are enabled (for all ports) */
-		rio_read_config_32(rdev,
-				TSI578_SP_MODE(portnum), &regval);
-		rio_write_config_32(rdev,
-				TSI578_SP_MODE(portnum),
-				regval & ~TSI578_SP_MODE_PW_DIS);
-
-		/* Clear all pending interrupts */
-		rio_read_config_32(rdev,
-				rdev->phys_efptr +
-					RIO_PORT_N_ERR_STS_CSR(portnum),
-				&regval);
-		rio_write_config_32(rdev,
-				rdev->phys_efptr +
-					RIO_PORT_N_ERR_STS_CSR(portnum),
-				regval & 0x07120214);
-
-		rio_read_config_32(rdev,
-				TSI578_SP_INT_STATUS(portnum), &regval);
-		rio_write_config_32(rdev,
-				TSI578_SP_INT_STATUS(portnum),
-				regval & 0x000700bd);
-
-		/* Enable all interrupts to allow ports to send a port-write */
-		rio_read_config_32(rdev,
-				TSI578_SP_CTL_INDEP(portnum), &regval);
-		rio_write_config_32(rdev,
-				TSI578_SP_CTL_INDEP(portnum),
-				regval | 0x000b0000);
-
-		/* Skip next (odd) port if the current port is in x4 mode */
-		rio_read_config_32(rdev,
-				rdev->phys_efptr + RIO_PORT_N_CTL_CSR(portnum),
-				&regval);
-		if ((regval & RIO_PORT_N_CTL_PWIDTH) == RIO_PORT_N_CTL_PWIDTH_4)
-			portnum++;
-	}
-
-	/* set TVAL = ~50us */
-	rio_write_config_32(rdev,
-		rdev->phys_efptr + RIO_PORT_LINKTO_CTL_CSR, 0x9a << 8);
-
-	return 0;
-}
-
-static int
-tsi57x_em_handler(struct rio_dev *rdev, u8 portnum)
-{
-	struct rio_mport *mport = rdev->net->hport;
-	u32 intstat, err_status;
-	int sendcount, checkcount;
-	u8 route_port;
-	u32 regval;
-
-	rio_read_config_32(rdev,
-			rdev->phys_efptr + RIO_PORT_N_ERR_STS_CSR(portnum),
-			&err_status);
-
-	if ((err_status & RIO_PORT_N_ERR_STS_PORT_OK) &&
-	    (err_status & (RIO_PORT_N_ERR_STS_PW_OUT_ES |
-			  RIO_PORT_N_ERR_STS_PW_INP_ES))) {
-		/* Remove any queued packets by locking/unlocking port */
-		rio_read_config_32(rdev,
-			rdev->phys_efptr + RIO_PORT_N_CTL_CSR(portnum),
-			&regval);
-		if (!(regval & RIO_PORT_N_CTL_LOCKOUT)) {
-			rio_write_config_32(rdev,
-				rdev->phys_efptr + RIO_PORT_N_CTL_CSR(portnum),
-				regval | RIO_PORT_N_CTL_LOCKOUT);
-			udelay(50);
-			rio_write_config_32(rdev,
-				rdev->phys_efptr + RIO_PORT_N_CTL_CSR(portnum),
-				regval);
-		}
-
-		/* Read from link maintenance response register to clear
-		 * valid bit
-		 */
-		rio_read_config_32(rdev,
-			rdev->phys_efptr + RIO_PORT_N_MNT_RSP_CSR(portnum),
-			&regval);
-
-		/* Send a Packet-Not-Accepted/Link-Request-Input-Status control
-		 * symbol to recover from IES/OES
-		 */
-		sendcount = 3;
-		while (sendcount) {
-			rio_write_config_32(rdev,
-					  TSI578_SP_CS_TX(portnum), 0x40fc8000);
-			checkcount = 3;
-			while (checkcount--) {
-				udelay(50);
-				rio_read_config_32(rdev,
-					rdev->phys_efptr +
-						RIO_PORT_N_MNT_RSP_CSR(portnum),
-					&regval);
-				if (regval & RIO_PORT_N_MNT_RSP_RVAL)
-					goto exit_es;
-			}
-
-			sendcount--;
-		}
-	}
-
-exit_es:
-	/* Clear implementation specific error status bits */
-	rio_read_config_32(rdev, TSI578_SP_INT_STATUS(portnum), &intstat);
-	pr_debug("TSI578[%x:%x] SP%d_INT_STATUS=0x%08x\n",
-		 rdev->destid, rdev->hopcount, portnum, intstat);
-
-	if (intstat & 0x10000) {
-		rio_read_config_32(rdev,
-				TSI578_SP_LUT_PEINF(portnum), &regval);
-		regval = (mport->sys_size) ? (regval >> 16) : (regval >> 24);
-		route_port = rdev->rswitch->route_table[regval];
-		pr_debug("RIO: TSI578[%s] P%d LUT Parity Error (destID=%d)\n",
-			rio_name(rdev), portnum, regval);
-		tsi57x_route_add_entry(mport, rdev->destid, rdev->hopcount,
-				RIO_GLOBAL_TABLE, regval, route_port);
-	}
-
-	rio_write_config_32(rdev, TSI578_SP_INT_STATUS(portnum),
-			    intstat & 0x000700bd);
-
-	return 0;
-}
-
-static struct rio_switch_ops tsi57x_switch_ops = {
-	.owner = THIS_MODULE,
-	.add_entry = tsi57x_route_add_entry,
-	.get_entry = tsi57x_route_get_entry,
-	.clr_table = tsi57x_route_clr_table,
-	.set_domain = tsi57x_set_domain,
-	.get_domain = tsi57x_get_domain,
-	.em_init = tsi57x_em_init,
-	.em_handle = tsi57x_em_handler,
-};
-
-static int tsi57x_probe(struct rio_dev *rdev, const struct rio_device_id *id)
-{
-	pr_debug("RIO: %s for %s\n", __func__, rio_name(rdev));
-
-	spin_lock(&rdev->rswitch->lock);
-
-	if (rdev->rswitch->ops) {
-		spin_unlock(&rdev->rswitch->lock);
-		return -EINVAL;
-	}
-	rdev->rswitch->ops = &tsi57x_switch_ops;
-
-	if (rdev->do_enum) {
-		/* Ensure that default routing is disabled on startup */
-		rio_write_config_32(rdev, RIO_STD_RTE_DEFAULT_PORT,
-				    RIO_INVALID_ROUTE);
-	}
-
-	spin_unlock(&rdev->rswitch->lock);
-	return 0;
-}
-
-static void tsi57x_remove(struct rio_dev *rdev)
-{
-	pr_debug("RIO: %s for %s\n", __func__, rio_name(rdev));
-	spin_lock(&rdev->rswitch->lock);
-	if (rdev->rswitch->ops != &tsi57x_switch_ops) {
-		spin_unlock(&rdev->rswitch->lock);
-		return;
-	}
-	rdev->rswitch->ops = NULL;
-	spin_unlock(&rdev->rswitch->lock);
-}
-
-static struct rio_device_id tsi57x_id_table[] = {
-	{RIO_DEVICE(RIO_DID_TSI572, RIO_VID_TUNDRA)},
-	{RIO_DEVICE(RIO_DID_TSI574, RIO_VID_TUNDRA)},
-	{RIO_DEVICE(RIO_DID_TSI577, RIO_VID_TUNDRA)},
-	{RIO_DEVICE(RIO_DID_TSI578, RIO_VID_TUNDRA)},
-	{ 0, }	/* terminate list */
-};
-
-static struct rio_driver tsi57x_driver = {
-	.name = "tsi57x",
-	.id_table = tsi57x_id_table,
-	.probe = tsi57x_probe,
-	.remove = tsi57x_remove,
-};
-
-static int __init tsi57x_init(void)
-{
-	return rio_register_driver(&tsi57x_driver);
-}
-
-static void __exit tsi57x_exit(void)
-{
-	rio_unregister_driver(&tsi57x_driver);
-}
-
-device_initcall(tsi57x_init);
-module_exit(tsi57x_exit);
-
-MODULE_DESCRIPTION("IDT Tsi57x Serial RapidIO switch family driver");
-MODULE_AUTHOR("Integrated Device Technology, Inc.");
-MODULE_LICENSE("GPL");
+A0_GFX_CONTEXT_STATUS__SHIFT 0x11
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_DOORBELL_MASK 0x40000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_DOORBELL__SHIFT 0x12
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_CONTEXT_CNTL_MASK 0x80000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_CONTEXT_CNTL__SHIFT 0x13
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_VIRTUAL_ADDR_MASK 0x80
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_VIRTUAL_ADDR__SHIFT 0x7
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_APE1_CNTL_MASK 0x100
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_APE1_CNTL__SHIFT 0x8
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_DOORBELL_LOG_MASK 0x200
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_DOORBELL_LOG__SHIFT 0x9
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_WATERMARK_MASK 0x400
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_WATERMARK__SHIFT 0xa
+#define SDMA0_CONTEXT_REG_TYPE1__VOID_REG1_MASK 0x800
+#define SDMA0_CONTEXT_REG_TYPE1__VOID_REG1__SHIFT 0xb
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_CSA_ADDR_LO_MASK 0x1000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_CSA_ADDR_LO__SHIFT 0xc
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_CSA_ADDR_HI_MASK 0x2000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_CSA_ADDR_HI__SHIFT 0xd
+#define SDMA0_CONTEXT_REG_TYPE1__VOID_REG2_MASK 0x4000
+#define SDMA0_CONTEXT_REG_TYPE1__VOID_REG2__SHIFT 0xe
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_IB_SUB_REMAIN_MASK 0x8000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_IB_SUB_REMAIN__SHIFT 0xf
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_PREEMPT_MASK 0x10000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_PREEMPT__SHIFT 0x10
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_DUMMY_REG_MASK 0x20000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_DUMMY_REG__SHIFT 0x11
+#define SDMA0_CONTEXT_REG_TYPE1__RESERVED_MASK 0xfffc0000
+#define SDMA0_CONTEXT_REG_TYPE1__RESERVED__SHIFT 0x12
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA0_MASK 0x1
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA0__SHIFT 0x0
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA1_MASK 0x2
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA1__SHIFT 0x1
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA2_MASK 0x4
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA2__SHIFT 0x2
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA3_MASK 0x8
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA3__SHIFT 0x3
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA4_MASK 0x10
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA4__SHIFT 0x4
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA5_MASK 0x20
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA5__SHIFT 0x5
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_CNTL_MASK 0x40
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_CNTL__SHIFT 0x6
+#define SDMA0_CONTEXT_REG_TYPE2__RESERVED_MASK 0xffffff80
+#define SDMA0_CONTEXT_REG_TYPE2__RESERVED__SHIFT 0x7
+#define SDMA0_PUB_REG_TYPE0__SDMA0_UCODE_ADDR_MASK 0x1
+#define SDMA0_PUB_REG_TYPE0__SDMA0_UCODE_ADDR__SHIFT 0x0
+#define SDMA0_PUB_REG_TYPE0__SDMA0_UCODE_DATA_MASK 0x2
+#define SDMA0_PUB_REG_TYPE0__SDMA0_UCODE_DATA__SHIFT 0x1
+#define SDMA0_PUB_REG_TYPE0__SDMA0_POWER_CNTL_MASK 0x4
+#define SDMA0_PUB_REG_TYPE0__SDMA0_POWER_CNTL__SHIFT 0x2
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CLK_CTRL_MASK 0x8
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CLK_CTRL__SHIFT 0x3
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CNTL_MASK 0x10
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CNTL__SHIFT 0x4
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CHICKEN_BITS_MASK 0x20
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CHICKEN_BITS__SHIFT 0x5
+#define SDMA0_PUB_REG_TYPE0__SDMA0_TILING_CONFIG_MASK 0x40
+#define SDMA0_PUB_REG_TYPE0__SDMA0_TILING_CONFIG__SHIFT 0x6
+#define SDMA0_PUB_REG_TYPE0__SDMA0_HASH_MASK 0x80
+#define SDMA0_PUB_REG_TYPE0__SDMA0_HASH__SHIFT 0x7
+#define SDMA0_PUB_REG_TYPE0__SDMA0_SEM_WAIT_FAIL_TIMER_CNTL_MASK 0x200
+#define SDMA0_PUB_REG_TYPE0__SDMA0_SEM_WAIT_FAIL_TIMER_CNTL__SHIFT 0x9
+#define SDMA0_PUB_REG_TYPE0__SDMA0_RB_RPTR_FETCH_MASK 0x400
+#define SDMA0_PUB_REG_TYPE0__SDMA0_RB_RPTR_FETCH__SHIFT 0xa
+#define SDMA0_PUB_REG_TYPE0__SDMA0_IB_OFFSET_FETCH_MASK 0x800
+#define SDMA0_PUB_REG_TYPE0__SDMA0_IB_OFFSET_FETCH__SHIFT 0xb
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PROGRAM_MASK 0x1000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PROGRAM__SHIFT 0xc
+#define SDMA0_PUB_REG_TYPE0__SDMA0_STATUS_REG_MASK 0x2000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_STATUS_REG__SHIFT 0xd
+#define SDMA0_PUB_REG_TYPE0__SDMA0_STATUS1_REG_MASK 0x4000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_STATUS1_REG__SHIFT 0xe
+#define SDMA0_PUB_REG_TYPE0__SDMA0_RD_BURST_CNTL_MASK 0x8000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_RD_BURST_CNTL__SHIFT 0xf
+#define SDMA0_PUB_REG_TYPE0__RESERVED_16_MASK 0x10000
+#define SDMA0_PUB_REG_TYPE0__RESERVED_16__SHIFT 0x10
+#define SDMA0_PUB_REG_TYPE0__RESERVED_17_MASK 0x20000
+#define SDMA0_PUB_REG_TYPE0__RESERVED_17__SHIFT 0x11
+#define SDMA0_PUB_REG_TYPE0__SDMA0_F32_CNTL_MASK 0x40000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_F32_CNTL__SHIFT 0x12
+#define SDMA0_PUB_REG_TYPE0__SDMA0_FREEZE_MASK 0x80000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_FREEZE__SHIFT 0x13
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PHASE0_QUANTUM_MASK 0x100000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PHASE0_QUANTUM__SHIFT 0x14
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PHASE1_QUANTUM_MASK 0x200000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PHASE1_QUANTUM__SHIFT 0x15
+#define SDMA0_PUB_REG_TYPE0__SDMA_POWER_GATING_MASK 0x400000
+#define SDMA0_PUB_REG_TYPE0__SDMA_POWER_GATING__SHIFT 0x16
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_CONFIG_MASK 0x800000
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_CONFIG__SHIFT 0x17
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_WRITE_MASK 0x1000000
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_WRITE__SHIFT 0x18
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_READ_MASK 0x2000000
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_READ__SHIFT 0x19
+#define SDMA0_PUB_REG_TYPE0__SDMA0_EDC_CONFIG_MASK 0x4000000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_EDC_CONFIG__SHIFT 0x1a
+#define SDMA0_PUB_REG_TYPE0__SDMA0_BA_THRESHOLD_MASK 0x8000000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_BA_THRESHOLD__SHIFT 0x1b
+#define SDMA0_PUB_REG_TYPE0__SDMA0_DEVICE_ID_MASK 0x10000000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_DEVICE_ID__SHIFT 0x1c
+#define SDMA0_PUB_REG_TYPE0__SDMA0_VERSION_MASK 0x20000000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_VERSION__SHIFT 0x1d
+#define SDMA0_PUB_REG_TYPE0__RESERVED_MASK 0xc0000000
+#define SDMA0_PUB_REG_TYPE0__RESERVED__SHIFT 0x1e
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CNTL_MASK 0x1
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CNTL__SHIFT 0x0
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_LO_MASK 0x2
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_LO__SHIFT 0x1
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_HI_MASK 0x4
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_HI__SHIFT 0x2
+#define SDMA0_PUB_REG_TYPE1__SDMA0_STATUS2_REG_MASK 0x8
+#define SDMA0_PUB_REG_TYPE1__SDMA0_STATUS2_REG__SHIFT 0x3
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ACTIVE_FCN_ID_MASK 0x10
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ACTIVE_FCN_ID__SHIFT 0x4
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_CNTL_MASK 0x20
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_CNTL__SHIFT 0x5
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VIRT_RESET_REQ_MASK 0x40
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VIRT_RESET_REQ__SHIFT 0x6
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VF_ENABLE_MASK 0x80
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VF_ENABLE__SHIFT 0x7
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ATOMIC_CNTL_MASK 0x100
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ATOMIC_CNTL__SHIFT 0x8
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ATOMIC_PREOP_LO_MASK 0x200
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ATOMIC_PREOP_LO__SHIFT 0x9
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ATOMIC_PREOP_HI_MASK 0x400
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ATOMIC_PREOP_HI__SHIFT 0xa
+#define SDMA0_PUB_REG_TYPE1__RESERVED_MASK 0xfffff800
+#define SDMA0_PUB_REG_TYPE1__RESERVED__SHIFT 0xb
+#define SDMA0_GFX_RB_CNTL__RB_ENABLE_MASK 0x1
+#define SDMA0_GFX_RB_CNTL__RB_ENABLE__SHIFT 0x0
+#define SDMA0_GFX_RB_CNTL__RB_SIZE_MASK 0x3e
+#define SDMA0_GFX_RB_CNTL__RB_SIZE__SHIFT 0x1
+#define SDMA0_GFX_RB_CNTL__RB_SWAP_ENABLE_MASK 0x200
+#define SDMA0_GFX_RB_CNTL__RB_SWAP_ENABLE__SHIFT 0x9
+#define SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_ENABLE_MASK 0x1000
+#define SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_ENABLE__SHIFT 0xc
+#define SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_SWAP_ENABLE_MASK 0x2000
+#define SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_SWAP_ENABLE__SHIFT 0xd
+#define SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_TIMER_MASK 0x1f0000
+#define SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_TIMER__SHIFT 0x10
+#define SDMA0_GFX_RB_CNTL__RB_PRIV_MASK 0x800000
+#define SDMA0_GFX_RB_CNTL__RB_PRIV__SHIFT 0x17
+#define SDMA0_GFX_RB_CNTL__RB_VMID_MASK 0xf000000
+#define SDMA0_GFX_RB_CNTL__RB_VMID__SHIFT 0x18
+#define SDMA0_GFX_RB_BASE__ADDR_MASK 0xffffffff
+#define SDMA0_GFX_RB_BASE__ADDR__SHIFT 0x0
+#define SDMA0_GFX_RB_BASE_HI__ADDR_MASK 0xffffff
+#define SDMA0_GFX_RB_BASE_HI__ADDR__SHIFT 0x0
+#define SDMA0_GFX_RB_RPTR__OFFSET_MASK 0xfffffffc
+#define SDMA0_GFX_RB_RPTR__OFFSET__SHIFT 0x2
+#define SDMA0_GFX_RB_WPTR__OFFSET_MASK 0xfffffffc
+#define SDMA0_GFX_RB_WPTR__OFFSET__SHIFT 0x2
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__ENABLE_MASK 0x1
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__ENABLE__SHIFT 0x0
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__SWAP_ENABLE_MASK 0x2
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__SWAP_ENABLE__SHIFT 0x1
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE_MASK 0x4
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE__SHIFT 0x2
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__FREQUENCY_MASK 0xfff0
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__FREQUENCY__SHIFT 0x4
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT_MASK 0xffff0000
+#define SDMA0_GFX_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT__SHIFT 0x10
+#define SDMA0_GFX_RB_WPTR_POLL_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA0_GFX_RB_WPTR_POLL_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA0_GFX_RB_WPTR_POLL_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA0_GFX_RB_WPTR_POLL_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA0_GFX_RB_RPTR_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA0_GFX_RB_RPTR_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA0_GFX_RB_RPTR_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA0_GFX_RB_RPTR_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK 0x1
+#define SDMA0_GFX_IB_CNTL__IB_ENAB

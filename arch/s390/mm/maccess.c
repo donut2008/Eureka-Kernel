@@ -1,214 +1,123 @@
 /*
- * Access kernel memory without faulting -- s390 specific implementation.
- *
- * Copyright IBM Corp. 2009, 2015
- *
- *   Author(s): Heiko Carstens <heiko.carstens@de.ibm.com>,
- *
- */
+** linux/atarihw.h -- This header defines some macros and pointers for
+**                    the various Atari custom hardware registers.
+**
+** Copyright 1994 by Björn Brauel
+**
+** 5/1/94 Roman Hodek:
+**   Added definitions for TT specific chips.
+**
+** 1996-09-13 lars brinkhoff <f93labr@dd.chalmers.se>:
+**   Finally added definitions for the matrix/codec and the DSP56001 host
+**   interface.
+**
+** This file is subject to the terms and conditions of the GNU General Public
+** License.  See the file COPYING in the main directory of this archive
+** for more details.
+**
+*/
 
-#include <linux/uaccess.h>
-#include <linux/kernel.h>
+#ifndef _LINUX_ATARIHW_H_
+#define _LINUX_ATARIHW_H_
+
 #include <linux/types.h>
-#include <linux/errno.h>
-#include <linux/gfp.h>
-#include <linux/cpu.h>
-#include <asm/ctl_reg.h>
-#include <asm/io.h>
+#include <asm/bootinfo-atari.h>
+#include <asm/raw_io.h>
 
-static notrace long s390_kernel_write_odd(void *dst, const void *src, size_t size)
-{
-	unsigned long aligned, offset, count;
-	char tmp[8];
+extern u_long atari_mch_cookie;
+extern u_long atari_mch_type;
+extern u_long atari_switches;
+extern int atari_rtc_year_offset;
+extern int atari_dont_touch_floppy_select;
 
-	aligned = (unsigned long) dst & ~7UL;
-	offset = (unsigned long) dst & 7UL;
-	size = min(8UL - offset, size);
-	count = size - 1;
-	asm volatile(
-		"	bras	1,0f\n"
-		"	mvc	0(1,%4),0(%5)\n"
-		"0:	mvc	0(8,%3),0(%0)\n"
-		"	ex	%1,0(1)\n"
-		"	lg	%1,0(%3)\n"
-		"	lra	%0,0(%0)\n"
-		"	sturg	%1,%0\n"
-		: "+&a" (aligned), "+&a" (count), "=m" (tmp)
-		: "a" (&tmp), "a" (&tmp[offset]), "a" (src)
-		: "cc", "memory", "1");
-	return size;
-}
+extern int atari_SCC_reset_done;
 
-/*
- * s390_kernel_write - write to kernel memory bypassing DAT
- * @dst: destination address
- * @src: source address
- * @size: number of bytes to copy
- *
- * This function writes to kernel memory bypassing DAT and possible page table
- * write protection. It writes to the destination using the sturg instruction.
- * Therefore we have a read-modify-write sequence: the function reads eight
- * bytes from destination at an eight byte boundary, modifies the bytes
- * requested and writes the result back in a loop.
- *
- * Note: this means that this function may not be called concurrently on
- *	 several cpus with overlapping words, since this may potentially
- *	 cause data corruption.
- */
-void notrace s390_kernel_write(void *dst, const void *src, size_t size)
-{
-	unsigned long flags;
-	long copied;
+/* convenience macros for testing machine type */
+#define MACH_IS_ST	((atari_mch_cookie >> 16) == ATARI_MCH_ST)
+#define MACH_IS_STE	((atari_mch_cookie >> 16) == ATARI_MCH_STE && \
+			 (atari_mch_cookie & 0xffff) == 0)
+#define MACH_IS_MSTE	((atari_mch_cookie >> 16) == ATARI_MCH_STE && \
+			 (atari_mch_cookie & 0xffff) == 0x10)
+#define MACH_IS_TT	((atari_mch_cookie >> 16) == ATARI_MCH_TT)
+#define MACH_IS_FALCON	((atari_mch_cookie >> 16) == ATARI_MCH_FALCON)
+#define MACH_IS_MEDUSA	(atari_mch_type == ATARI_MACH_MEDUSA)
+#define MACH_IS_AB40	(atari_mch_type == ATARI_MACH_AB40)
 
-	flags = arch_local_save_flags();
-	if (!(flags & PSW_MASK_DAT)) {
-		memcpy(dst, src, size);
-	} else {
-		while (size) {
-			copied = s390_kernel_write_odd(dst, src, size);
-			dst += copied;
-			src += copied;
-			size -= copied;
-		}
-	}
-}
-
-static int __memcpy_real(void *dest, void *src, size_t count)
-{
-	register unsigned long _dest asm("2") = (unsigned long) dest;
-	register unsigned long _len1 asm("3") = (unsigned long) count;
-	register unsigned long _src  asm("4") = (unsigned long) src;
-	register unsigned long _len2 asm("5") = (unsigned long) count;
-	int rc = -EFAULT;
-
-	asm volatile (
-		"0:	mvcle	%1,%2,0x0\n"
-		"1:	jo	0b\n"
-		"	lhi	%0,0x0\n"
-		"2:\n"
-		EX_TABLE(1b,2b)
-		: "+d" (rc), "+d" (_dest), "+d" (_src), "+d" (_len1),
-		  "+d" (_len2), "=m" (*((long *) dest))
-		: "m" (*((long *) src))
-		: "cc", "memory");
-	return rc;
-}
+/* values for atari_switches */
+#define ATARI_SWITCH_IKBD	0x01
+#define ATARI_SWITCH_MIDI	0x02
+#define ATARI_SWITCH_SND6	0x04
+#define ATARI_SWITCH_SND7	0x08
+#define ATARI_SWITCH_OVSC_SHIFT	16
+#define ATARI_SWITCH_OVSC_IKBD	(ATARI_SWITCH_IKBD << ATARI_SWITCH_OVSC_SHIFT)
+#define ATARI_SWITCH_OVSC_MIDI	(ATARI_SWITCH_MIDI << ATARI_SWITCH_OVSC_SHIFT)
+#define ATARI_SWITCH_OVSC_SND6	(ATARI_SWITCH_SND6 << ATARI_SWITCH_OVSC_SHIFT)
+#define ATARI_SWITCH_OVSC_SND7	(ATARI_SWITCH_SND7 << ATARI_SWITCH_OVSC_SHIFT)
+#define ATARI_SWITCH_OVSC_MASK	0xffff0000
 
 /*
- * Copy memory in real mode (kernel to kernel)
+ * Define several Hardware-Chips for indication so that for the ATARI we do
+ * no longer decide whether it is a Falcon or other machine . It's just
+ * important what hardware the machine uses
  */
-int memcpy_real(void *dest, void *src, size_t count)
-{
-	unsigned long flags;
-	int rc;
 
-	if (!count)
-		return 0;
-	local_irq_save(flags);
-	__arch_local_irq_stnsm(0xfbUL);
-	rc = __memcpy_real(dest, src, count);
-	local_irq_restore(flags);
-	return rc;
-}
+/* ++roman 08/08/95: rewritten from ORing constants to a C bitfield */
 
-/*
- * Copy memory in absolute mode (kernel to kernel)
+#define ATARIHW_DECLARE(name)	unsigned name : 1
+#define ATARIHW_SET(name)	(atari_hw_present.name = 1)
+#define ATARIHW_PRESENT(name)	(atari_hw_present.name)
+
+struct atari_hw_present {
+    /* video hardware */
+    ATARIHW_DECLARE(STND_SHIFTER);	/* ST-Shifter - no base low ! */
+    ATARIHW_DECLARE(EXTD_SHIFTER);	/* STe-Shifter - 24 bit address */
+    ATARIHW_DECLARE(TT_SHIFTER);	/* TT-Shifter */
+    ATARIHW_DECLARE(VIDEL_SHIFTER);	/* Falcon-Shifter */
+    /* sound hardware */
+    ATARIHW_DECLARE(YM_2149);		/* Yamaha YM 2149 */
+    ATARIHW_DECLARE(PCM_8BIT);		/* PCM-Sound in STe-ATARI */
+    ATARIHW_DECLARE(CODEC);		/* CODEC Sound (Falcon) */
+    /* disk storage interfaces */
+    ATARIHW_DECLARE(TT_SCSI);		/* Directly mapped NCR5380 */
+    ATARIHW_DECLARE(ST_SCSI);		/* NCR5380 via ST-DMA (Falcon) */
+    ATARIHW_DECLARE(ACSI);		/* Standard ACSI like in STs */
+    ATARIHW_DECLARE(IDE);		/* IDE Interface */
+    ATARIHW_DECLARE(FDCSPEED);		/* 8/16 MHz switch for FDC */
+    /* other I/O hardware */
+    ATARIHW_DECLARE(ST_MFP);		/* The ST-MFP (there should be no Atari
+					   without it... but who knows?) */
+    ATARIHW_DECLARE(TT_MFP);		/* 2nd MFP */
+    ATARIHW_DECLARE(SCC);		/* Serial Communications Contr. */
+    ATARIHW_DECLARE(ST_ESCC);		/* SCC Z83230 in an ST */
+    ATARIHW_DECLARE(ANALOG_JOY);	/* Paddle Interface for STe
+					   and Falcon */
+    ATARIHW_DECLARE(MICROWIRE);		/* Microwire Interface */
+    /* DMA */
+    ATARIHW_DECLARE(STND_DMA);		/* 24 Bit limited ST-DMA */
+    ATARIHW_DECLARE(EXTD_DMA);		/* 32 Bit ST-DMA */
+    ATARIHW_DECLARE(SCSI_DMA);		/* DMA for the NCR5380 */
+    ATARIHW_DECLARE(SCC_DMA);		/* DMA for the SCC */
+    /* real time clocks */
+    ATARIHW_DECLARE(TT_CLK);		/* TT compatible clock chip */
+    ATARIHW_DECLARE(MSTE_CLK);		/* Mega ST(E) clock chip */
+    /* supporting hardware */
+    ATARIHW_DECLARE(SCU);		/* System Control Unit */
+    ATARIHW_DECLARE(BLITTER);		/* Blitter */
+    ATARIHW_DECLARE(VME);		/* VME Bus */
+    ATARIHW_DECLARE(DSP56K);		/* DSP56k processor in Falcon */
+};
+
+extern struct atari_hw_present atari_hw_present;
+
+
+/* Reading the MFP port register gives a machine independent delay, since the
+ * MFP always has a 8 MHz clock. This avoids problems with the varying length
+ * of nops on various machines. Somebody claimed that the tstb takes 600 ns.
  */
-void memcpy_absolute(void *dest, void *src, size_t count)
-{
-	unsigned long cr0, flags, prefix;
+#define	MFPDELAY() \
+	__asm__ __volatile__ ( "tstb %0" : : "m" (st_mfp.par_dt_reg) : "cc" );
 
-	flags = arch_local_irq_save();
-	__ctl_store(cr0, 0, 0);
-	__ctl_clear_bit(0, 28); /* disable lowcore protection */
-	prefix = store_prefix();
-	if (prefix) {
-		local_mcck_disable();
-		set_prefix(0);
-		memcpy(dest, src, count);
-		set_prefix(prefix);
-		local_mcck_enable();
-	} else {
-		memcpy(dest, src, count);
-	}
-	__ctl_load(cr0, 0, 0);
-	arch_local_irq_restore(flags);
-}
-
-/*
- * Copy memory from kernel (real) to user (virtual)
- */
-int copy_to_user_real(void __user *dest, void *src, unsigned long count)
-{
-	int offs = 0, size, rc;
-	char *buf;
-
-	buf = (char *) __get_free_page(GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-	rc = -EFAULT;
-	while (offs < count) {
-		size = min(PAGE_SIZE, count - offs);
-		if (memcpy_real(buf, src + offs, size))
-			goto out;
-		if (copy_to_user(dest + offs, buf, size))
-			goto out;
-		offs += size;
-	}
-	rc = 0;
-out:
-	free_page((unsigned long) buf);
-	return rc;
-}
-
-/*
- * Check if physical address is within prefix or zero page
- */
-static int is_swapped(unsigned long addr)
-{
-	unsigned long lc;
-	int cpu;
-
-	if (addr < sizeof(struct _lowcore))
-		return 1;
-	for_each_online_cpu(cpu) {
-		lc = (unsigned long) lowcore_ptr[cpu];
-		if (addr > lc + sizeof(struct _lowcore) - 1 || addr < lc)
-			continue;
-		return 1;
-	}
-	return 0;
-}
-
-/*
- * Convert a physical pointer for /dev/mem access
- *
- * For swapped prefix pages a new buffer is returned that contains a copy of
- * the absolute memory. The buffer size is maximum one page large.
- */
-void *xlate_dev_mem_ptr(phys_addr_t addr)
-{
-	void *bounce = (void *) addr;
-	unsigned long size;
-
-	get_online_cpus();
-	preempt_disable();
-	if (is_swapped(addr)) {
-		size = PAGE_SIZE - (addr & ~PAGE_MASK);
-		bounce = (void *) __get_free_page(GFP_ATOMIC);
-		if (bounce)
-			memcpy_absolute(bounce, (void *) addr, size);
-	}
-	preempt_enable();
-	put_online_cpus();
-	return bounce;
-}
-
-/*
- * Free converted buffer for /dev/mem access (if necessary)
- */
-void unxlate_dev_mem_ptr(phys_addr_t addr, void *buf)
-{
-	if ((void *) addr != buf)
-		free_page((unsigned long) buf);
-}
+/* Do cache push/invalidate for DMA read/write. This function obeys the
+ * snooping on some machines (Medusa) and processors: The Medusa itself can
+ * snoop, but only the '040 can source data from its cache to DMA writes i.e.,
+ * reads from memory). Both '040 and '060 invalidate cache entries on snooped

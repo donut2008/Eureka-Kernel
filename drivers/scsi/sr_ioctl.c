@@ -1,586 +1,497 @@
-#include <linux/kernel.h>
-#include <linux/mm.h>
-#include <linux/fs.h>
-#include <linux/errno.h>
-#include <linux/string.h>
-#include <linux/blkdev.h>
-#include <linux/module.h>
-#include <linux/blkpg.h>
-#include <linux/cdrom.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
-#include <asm/io.h>
-#include <asm/uaccess.h>
-
-#include <scsi/scsi.h>
-#include <scsi/scsi_dbg.h>
-#include <scsi/scsi_device.h>
-#include <scsi/scsi_eh.h>
-#include <scsi/scsi_host.h>
-#include <scsi/scsi_ioctl.h>
-#include <scsi/scsi_cmnd.h>
-
-#include "sr.h"
-
-#if 0
-#define DEBUG
-#endif
-
-/* The sr_is_xa() seems to trigger firmware bugs with some drives :-(
- * It is off by default and can be turned on with this module parameter */
-static int xa_test = 0;
-
-module_param(xa_test, int, S_IRUGO | S_IWUSR);
-
-/* primitive to determine whether we need to have GFP_DMA set based on
- * the status of the unchecked_isa_dma flag in the host structure */
-#define SR_GFP_DMA(cd) (((cd)->device->host->unchecked_isa_dma) ? GFP_DMA : 0)
-
-static int sr_read_tochdr(struct cdrom_device_info *cdi,
-		struct cdrom_tochdr *tochdr)
-{
-	struct scsi_cd *cd = cdi->handle;
-	struct packet_command cgc;
-	int result;
-	unsigned char *buffer;
-
-	buffer = kmalloc(32, GFP_KERNEL | SR_GFP_DMA(cd));
-	if (!buffer)
-		return -ENOMEM;
-
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.timeout = IOCTL_TIMEOUT;
-	cgc.cmd[0] = GPCMD_READ_TOC_PMA_ATIP;
-	cgc.cmd[8] = 12;		/* LSB of length */
-	cgc.buffer = buffer;
-	cgc.buflen = 12;
-	cgc.quiet = 1;
-	cgc.data_direction = DMA_FROM_DEVICE;
-
-	result = sr_do_ioctl(cd, &cgc);
-
-	tochdr->cdth_trk0 = buffer[2];
-	tochdr->cdth_trk1 = buffer[3];
-
-	kfree(buffer);
-	return result;
-}
-
-static int sr_read_tocentry(struct cdrom_device_info *cdi,
-		struct cdrom_tocentry *tocentry)
-{
-	struct scsi_cd *cd = cdi->handle;
-	struct packet_command cgc;
-	int result;
-	unsigned char *buffer;
-
-	buffer = kmalloc(32, GFP_KERNEL | SR_GFP_DMA(cd));
-	if (!buffer)
-		return -ENOMEM;
-
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.timeout = IOCTL_TIMEOUT;
-	cgc.cmd[0] = GPCMD_READ_TOC_PMA_ATIP;
-	cgc.cmd[1] |= (tocentry->cdte_format == CDROM_MSF) ? 0x02 : 0;
-	cgc.cmd[6] = tocentry->cdte_track;
-	cgc.cmd[8] = 12;		/* LSB of length */
-	cgc.buffer = buffer;
-	cgc.buflen = 12;
-	cgc.data_direction = DMA_FROM_DEVICE;
-
-	result = sr_do_ioctl(cd, &cgc);
-
-	tocentry->cdte_ctrl = buffer[5] & 0xf;
-	tocentry->cdte_adr = buffer[5] >> 4;
-	tocentry->cdte_datamode = (tocentry->cdte_ctrl & 0x04) ? 1 : 0;
-	if (tocentry->cdte_format == CDROM_MSF) {
-		tocentry->cdte_addr.msf.minute = buffer[9];
-		tocentry->cdte_addr.msf.second = buffer[10];
-		tocentry->cdte_addr.msf.frame = buffer[11];
-	} else
-		tocentry->cdte_addr.lba = (((((buffer[8] << 8) + buffer[9]) << 8)
-			+ buffer[10]) << 8) + buffer[11];
-
-	kfree(buffer);
-	return result;
-}
-
-#define IOCTL_RETRIES 3
-
-/* ATAPI drives don't have a SCMD_PLAYAUDIO_TI command.  When these drives
-   are emulating a SCSI device via the idescsi module, they need to have
-   CDROMPLAYTRKIND commands translated into CDROMPLAYMSF commands for them */
-
-static int sr_fake_playtrkind(struct cdrom_device_info *cdi, struct cdrom_ti *ti)
-{
-	struct cdrom_tocentry trk0_te, trk1_te;
-	struct cdrom_tochdr tochdr;
-	struct packet_command cgc;
-	int ntracks, ret;
-
-	ret = sr_read_tochdr(cdi, &tochdr);
-	if (ret)
-		return ret;
-
-	ntracks = tochdr.cdth_trk1 - tochdr.cdth_trk0 + 1;
-	
-	if (ti->cdti_trk1 == ntracks) 
-		ti->cdti_trk1 = CDROM_LEADOUT;
-	else if (ti->cdti_trk1 != CDROM_LEADOUT)
-		ti->cdti_trk1 ++;
-
-	trk0_te.cdte_track = ti->cdti_trk0;
-	trk0_te.cdte_format = CDROM_MSF;
-	trk1_te.cdte_track = ti->cdti_trk1;
-	trk1_te.cdte_format = CDROM_MSF;
-	
-	ret = sr_read_tocentry(cdi, &trk0_te);
-	if (ret)
-		return ret;
-	ret = sr_read_tocentry(cdi, &trk1_te);
-	if (ret)
-		return ret;
-
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.cmd[0] = GPCMD_PLAY_AUDIO_MSF;
-	cgc.cmd[3] = trk0_te.cdte_addr.msf.minute;
-	cgc.cmd[4] = trk0_te.cdte_addr.msf.second;
-	cgc.cmd[5] = trk0_te.cdte_addr.msf.frame;
-	cgc.cmd[6] = trk1_te.cdte_addr.msf.minute;
-	cgc.cmd[7] = trk1_te.cdte_addr.msf.second;
-	cgc.cmd[8] = trk1_te.cdte_addr.msf.frame;
-	cgc.data_direction = DMA_NONE;
-	cgc.timeout = IOCTL_TIMEOUT;
-	return sr_do_ioctl(cdi->handle, &cgc);
-}
-
-static int sr_play_trkind(struct cdrom_device_info *cdi,
-		struct cdrom_ti *ti)
-
-{
-	struct scsi_cd *cd = cdi->handle;
-	struct packet_command cgc;
-	int result;
-
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.timeout = IOCTL_TIMEOUT;
-	cgc.cmd[0] = GPCMD_PLAYAUDIO_TI;
-	cgc.cmd[4] = ti->cdti_trk0;
-	cgc.cmd[5] = ti->cdti_ind0;
-	cgc.cmd[7] = ti->cdti_trk1;
-	cgc.cmd[8] = ti->cdti_ind1;
-	cgc.data_direction = DMA_NONE;
-
-	result = sr_do_ioctl(cd, &cgc);
-	if (result == -EDRIVE_CANT_DO_THIS)
-		result = sr_fake_playtrkind(cdi, ti);
-
-	return result;
-}
-
-/* We do our own retries because we want to know what the specific
-   error code is.  Normally the UNIT_ATTENTION code will automatically
-   clear after one error */
-
-int sr_do_ioctl(Scsi_CD *cd, struct packet_command *cgc)
-{
-	struct scsi_device *SDev;
-	struct scsi_sense_hdr sshdr;
-	int result, err = 0, retries = 0;
-	unsigned char sense_buffer[SCSI_SENSE_BUFFERSIZE];
-
-	SDev = cd->device;
-
-      retry:
-	if (!scsi_block_when_processing_errors(SDev)) {
-		err = -ENODEV;
-		goto out;
-	}
-
-	memset(sense_buffer, 0, sizeof(sense_buffer));
-	result = scsi_execute(SDev, cgc->cmd, cgc->data_direction,
-			      cgc->buffer, cgc->buflen, sense_buffer,
-			      cgc->timeout, IOCTL_RETRIES, 0, NULL);
-
-	scsi_normalize_sense(sense_buffer, sizeof(sense_buffer), &sshdr);
-
-	if (cgc->sense)
-		memcpy(cgc->sense, sense_buffer, sizeof(*cgc->sense));
-
-	/* Minimal error checking.  Ignore cases we know about, and report the rest. */
-	if (driver_byte(result) != 0) {
-		switch (sshdr.sense_key) {
-		case UNIT_ATTENTION:
-			SDev->changed = 1;
-			if (!cgc->quiet)
-				sr_printk(KERN_INFO, cd,
-					  "disc change detected.\n");
-			if (retries++ < 10)
-				goto retry;
-			err = -ENOMEDIUM;
-			break;
-		case NOT_READY:	/* This happens if there is no disc in drive */
-			if (sshdr.asc == 0x04 &&
-			    sshdr.ascq == 0x01) {
-				/* sense: Logical unit is in process of becoming ready */
-				if (!cgc->quiet)
-					sr_printk(KERN_INFO, cd,
-						  "CDROM not ready yet.\n");
-				if (retries++ < 10) {
-					/* sleep 2 sec and try again */
-					ssleep(2);
-					goto retry;
-				} else {
-					/* 20 secs are enough? */
-					err = -ENOMEDIUM;
-					break;
-				}
-			}
-			if (!cgc->quiet)
-				sr_printk(KERN_INFO, cd,
-					  "CDROM not ready.  Make sure there "
-					  "is a disc in the drive.\n");
-			err = -ENOMEDIUM;
-			break;
-		case ILLEGAL_REQUEST:
-			err = -EIO;
-			if (sshdr.asc == 0x20 &&
-			    sshdr.ascq == 0x00)
-				/* sense: Invalid command operation code */
-				err = -EDRIVE_CANT_DO_THIS;
-			break;
-		default:
-			err = -EIO;
-		}
-	}
-
-	/* Wake up a process waiting for device */
-      out:
-	cgc->stat = err;
-	return err;
-}
-
-/* ---------------------------------------------------------------------- */
-/* interface to cdrom.c                                                   */
-
-int sr_tray_move(struct cdrom_device_info *cdi, int pos)
-{
-	Scsi_CD *cd = cdi->handle;
-	struct packet_command cgc;
-
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.cmd[0] = GPCMD_START_STOP_UNIT;
-	cgc.cmd[4] = (pos == 0) ? 0x03 /* close */ : 0x02 /* eject */ ;
-	cgc.data_direction = DMA_NONE;
-	cgc.timeout = IOCTL_TIMEOUT;
-	return sr_do_ioctl(cd, &cgc);
-}
-
-int sr_lock_door(struct cdrom_device_info *cdi, int lock)
-{
-	Scsi_CD *cd = cdi->handle;
-
-	return scsi_set_medium_removal(cd->device, lock ?
-		       SCSI_REMOVAL_PREVENT : SCSI_REMOVAL_ALLOW);
-}
-
-int sr_drive_status(struct cdrom_device_info *cdi, int slot)
-{
-	struct scsi_cd *cd = cdi->handle;
-	struct scsi_sense_hdr sshdr;
-	struct media_event_desc med;
-
-	if (CDSL_CURRENT != slot) {
-		/* we have no changer support */
-		return -EINVAL;
-	}
-	if (!scsi_test_unit_ready(cd->device, SR_TIMEOUT, MAX_RETRIES, &sshdr))
-		return CDS_DISC_OK;
-
-	/* SK/ASC/ASCQ of 2/4/1 means "unit is becoming ready" */
-	if (scsi_sense_valid(&sshdr) && sshdr.sense_key == NOT_READY
-			&& sshdr.asc == 0x04 && sshdr.ascq == 0x01)
-		return CDS_DRIVE_NOT_READY;
-
-	if (!cdrom_get_media_event(cdi, &med)) {
-		if (med.media_present)
-			return CDS_DISC_OK;
-		else if (med.door_open)
-			return CDS_TRAY_OPEN;
-		else
-			return CDS_NO_DISC;
-	}
-
-	/*
-	 * SK/ASC/ASCQ of 2/4/2 means "initialization required"
-	 * Using CD_TRAY_OPEN results in an START_STOP_UNIT to close
-	 * the tray, which resolves the initialization requirement.
-	 */
-	if (scsi_sense_valid(&sshdr) && sshdr.sense_key == NOT_READY
-			&& sshdr.asc == 0x04 && sshdr.ascq == 0x02)
-		return CDS_TRAY_OPEN;
-
-	/*
-	 * 0x04 is format in progress .. but there must be a disc present!
-	 */
-	if (sshdr.sense_key == NOT_READY && sshdr.asc == 0x04)
-		return CDS_DISC_OK;
-
-	/*
-	 * If not using Mt Fuji extended media tray reports,
-	 * just return TRAY_OPEN since ATAPI doesn't provide
-	 * any other way to detect this...
-	 */
-	if (scsi_sense_valid(&sshdr) &&
-	    /* 0x3a is medium not present */
-	    sshdr.asc == 0x3a)
-		return CDS_NO_DISC;
-	else
-		return CDS_TRAY_OPEN;
-
-	return CDS_DRIVE_NOT_READY;
-}
-
-int sr_disk_status(struct cdrom_device_info *cdi)
-{
-	Scsi_CD *cd = cdi->handle;
-	struct cdrom_tochdr toc_h;
-	struct cdrom_tocentry toc_e;
-	int i, rc, have_datatracks = 0;
-
-	/* look for data tracks */
-	rc = sr_read_tochdr(cdi, &toc_h);
-	if (rc)
-		return (rc == -ENOMEDIUM) ? CDS_NO_DISC : CDS_NO_INFO;
-
-	for (i = toc_h.cdth_trk0; i <= toc_h.cdth_trk1; i++) {
-		toc_e.cdte_track = i;
-		toc_e.cdte_format = CDROM_LBA;
-		if (sr_read_tocentry(cdi, &toc_e))
-			return CDS_NO_INFO;
-		if (toc_e.cdte_ctrl & CDROM_DATA_TRACK) {
-			have_datatracks = 1;
-			break;
-		}
-	}
-	if (!have_datatracks)
-		return CDS_AUDIO;
-
-	if (cd->xa_flag)
-		return CDS_XA_2_1;
-	else
-		return CDS_DATA_1;
-}
-
-int sr_get_last_session(struct cdrom_device_info *cdi,
-			struct cdrom_multisession *ms_info)
-{
-	Scsi_CD *cd = cdi->handle;
-
-	ms_info->addr.lba = cd->ms_offset;
-	ms_info->xa_flag = cd->xa_flag || cd->ms_offset > 0;
-
-	return 0;
-}
-
-int sr_get_mcn(struct cdrom_device_info *cdi, struct cdrom_mcn *mcn)
-{
-	Scsi_CD *cd = cdi->handle;
-	struct packet_command cgc;
-	char *buffer = kmalloc(32, GFP_KERNEL | SR_GFP_DMA(cd));
-	int result;
-
-	if (!buffer)
-		return -ENOMEM;
-
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.cmd[0] = GPCMD_READ_SUBCHANNEL;
-	cgc.cmd[2] = 0x40;	/* I do want the subchannel info */
-	cgc.cmd[3] = 0x02;	/* Give me medium catalog number info */
-	cgc.cmd[8] = 24;
-	cgc.buffer = buffer;
-	cgc.buflen = 24;
-	cgc.data_direction = DMA_FROM_DEVICE;
-	cgc.timeout = IOCTL_TIMEOUT;
-	result = sr_do_ioctl(cd, &cgc);
-
-	memcpy(mcn->medium_catalog_number, buffer + 9, 13);
-	mcn->medium_catalog_number[13] = 0;
-
-	kfree(buffer);
-	return result;
-}
-
-int sr_reset(struct cdrom_device_info *cdi)
-{
-	return 0;
-}
-
-int sr_select_speed(struct cdrom_device_info *cdi, int speed)
-{
-	Scsi_CD *cd = cdi->handle;
-	struct packet_command cgc;
-
-	if (speed == 0)
-		speed = 0xffff;	/* set to max */
-	else
-		speed *= 177;	/* Nx to kbyte/s */
-
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.cmd[0] = GPCMD_SET_SPEED;	/* SET CD SPEED */
-	cgc.cmd[2] = (speed >> 8) & 0xff;	/* MSB for speed (in kbytes/sec) */
-	cgc.cmd[3] = speed & 0xff;	/* LSB */
-	cgc.data_direction = DMA_NONE;
-	cgc.timeout = IOCTL_TIMEOUT;
-
-	if (sr_do_ioctl(cd, &cgc))
-		return -EIO;
-	return 0;
-}
-
-/* ----------------------------------------------------------------------- */
-/* this is called by the generic cdrom driver. arg is a _kernel_ pointer,  */
-/* because the generic cdrom driver does the user access stuff for us.     */
-/* only cdromreadtochdr and cdromreadtocentry are left - for use with the  */
-/* sr_disk_status interface for the generic cdrom driver.                  */
-
-int sr_audio_ioctl(struct cdrom_device_info *cdi, unsigned int cmd, void *arg)
-{
-	switch (cmd) {
-	case CDROMREADTOCHDR:
-		return sr_read_tochdr(cdi, arg);
-	case CDROMREADTOCENTRY:
-		return sr_read_tocentry(cdi, arg);
-	case CDROMPLAYTRKIND:
-		return sr_play_trkind(cdi, arg);
-	default:
-		return -EINVAL;
-	}
-}
-
-/* -----------------------------------------------------------------------
- * a function to read all sorts of funny cdrom sectors using the READ_CD
- * scsi-3 mmc command
- *
- * lba:     linear block address
- * format:  0 = data (anything)
- *          1 = audio
- *          2 = data (mode 1)
- *          3 = data (mode 2)
- *          4 = data (mode 2 form1)
- *          5 = data (mode 2 form2)
- * blksize: 2048 | 2336 | 2340 | 2352
- */
-
-static int sr_read_cd(Scsi_CD *cd, unsigned char *dest, int lba, int format, int blksize)
-{
-	struct packet_command cgc;
-
-#ifdef DEBUG
-	sr_printk(KERN_INFO, cd, "sr_read_cd lba=%d format=%d blksize=%d\n",
-		  lba, format, blksize);
-#endif
-
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.cmd[0] = GPCMD_READ_CD;	/* READ_CD */
-	cgc.cmd[1] = ((format & 7) << 2);
-	cgc.cmd[2] = (unsigned char) (lba >> 24) & 0xff;
-	cgc.cmd[3] = (unsigned char) (lba >> 16) & 0xff;
-	cgc.cmd[4] = (unsigned char) (lba >> 8) & 0xff;
-	cgc.cmd[5] = (unsigned char) lba & 0xff;
-	cgc.cmd[8] = 1;
-	switch (blksize) {
-	case 2336:
-		cgc.cmd[9] = 0x58;
-		break;
-	case 2340:
-		cgc.cmd[9] = 0x78;
-		break;
-	case 2352:
-		cgc.cmd[9] = 0xf8;
-		break;
-	default:
-		cgc.cmd[9] = 0x10;
-		break;
-	}
-	cgc.buffer = dest;
-	cgc.buflen = blksize;
-	cgc.data_direction = DMA_FROM_DEVICE;
-	cgc.timeout = IOCTL_TIMEOUT;
-	return sr_do_ioctl(cd, &cgc);
-}
-
+g *reserve_size,
+				 unsigned long dram_base,
+				 efi_loaded_image_t *image);
 /*
- * read sectors with blocksizes other than 2048
+ * EFI entry point for the arm/arm64 EFI stubs.  This is the entrypoint
+ * that is described in the PE/COFF header.  Most of the code is the same
+ * for both archictectures, with the arch-specific code provided in the
+ * handle_kernel_image() function.
  */
-
-static int sr_read_sector(Scsi_CD *cd, int lba, int blksize, unsigned char *dest)
+unsigned long efi_entry(void *handle, efi_system_table_t *sys_table,
+			       unsigned long *image_addr)
 {
-	struct packet_command cgc;
-	int rc;
+	efi_loaded_image_t *image;
+	efi_status_t status;
+	unsigned long image_size = 0;
+	unsigned long dram_base;
+	/* addr/point and size pairs for memory management*/
+	unsigned long initrd_addr;
+	u64 initrd_size = 0;
+	unsigned long fdt_addr = 0;  /* Original DTB */
+	unsigned long fdt_size = 0;
+	char *cmdline_ptr = NULL;
+	int cmdline_size = 0;
+	unsigned long new_fdt_addr;
+	efi_guid_t loaded_image_proto = LOADED_IMAGE_PROTOCOL_GUID;
+	unsigned long reserve_addr = 0;
+	unsigned long reserve_size = 0;
 
-	/* we try the READ CD command first... */
-	if (cd->readcd_known) {
-		rc = sr_read_cd(cd, dest, lba, 0, blksize);
-		if (-EDRIVE_CANT_DO_THIS != rc)
-			return rc;
-		cd->readcd_known = 0;
-		sr_printk(KERN_INFO, cd,
-			  "CDROM does'nt support READ CD (0xbe) command\n");
-		/* fall & retry the other way */
+	/* Check if we were booted by the EFI firmware */
+	if (sys_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+		goto fail;
+
+	pr_efi(sys_table, "Booting Linux Kernel...\n");
+
+	/*
+	 * Get a handle to the loaded image protocol.  This is used to get
+	 * information about the running image, such as size and the command
+	 * line.
+	 */
+	status = sys_table->boottime->handle_protocol(handle,
+					&loaded_image_proto, (void *)&image);
+	if (status != EFI_SUCCESS) {
+		pr_efi_err(sys_table, "Failed to get loaded image protocol\n");
+		goto fail;
 	}
-	/* ... if this fails, we switch the blocksize using MODE SELECT */
-	if (blksize != cd->device->sector_size) {
-		if (0 != (rc = sr_set_blocklength(cd, blksize)))
-			return rc;
+
+	dram_base = get_dram_base(sys_table);
+	if (dram_base == EFI_ERROR) {
+		pr_efi_err(sys_table, "Failed to find DRAM base\n");
+		goto fail;
 	}
-#ifdef DEBUG
-	sr_printk(KERN_INFO, cd, "sr_read_sector lba=%d blksize=%d\n",
-		  lba, blksize);
-#endif
 
-	memset(&cgc, 0, sizeof(struct packet_command));
-	cgc.cmd[0] = GPCMD_READ_10;
-	cgc.cmd[2] = (unsigned char) (lba >> 24) & 0xff;
-	cgc.cmd[3] = (unsigned char) (lba >> 16) & 0xff;
-	cgc.cmd[4] = (unsigned char) (lba >> 8) & 0xff;
-	cgc.cmd[5] = (unsigned char) lba & 0xff;
-	cgc.cmd[8] = 1;
-	cgc.buffer = dest;
-	cgc.buflen = blksize;
-	cgc.data_direction = DMA_FROM_DEVICE;
-	cgc.timeout = IOCTL_TIMEOUT;
-	rc = sr_do_ioctl(cd, &cgc);
+	/*
+	 * Get the command line from EFI, using the LOADED_IMAGE
+	 * protocol. We are going to copy the command line into the
+	 * device tree, so this can be allocated anywhere.
+	 */
+	cmdline_ptr = efi_convert_cmdline(sys_table, image, &cmdline_size);
+	if (!cmdline_ptr) {
+		pr_efi_err(sys_table, "getting command line via LOADED_IMAGE_PROTOCOL\n");
+		goto fail;
+	}
 
-	return rc;
-}
+	status = handle_kernel_image(sys_table, image_addr, &image_size,
+				     &reserve_addr,
+				     &reserve_size,
+				     dram_base, image);
+	if (status != EFI_SUCCESS) {
+		pr_efi_err(sys_table, "Failed to relocate kernel\n");
+		goto fail_free_cmdline;
+	}
 
-/*
- * read a sector in raw mode to check the sector format
- * ret: 1 == mode2 (XA), 0 == mode1, <0 == error 
- */
+	if (IS_ENABLED(CONFIG_CMDLINE_EXTEND) ||
+	    IS_ENABLED(CONFIG_CMDLINE_FORCE) ||
+	    cmdline_size == 0)
+		efi_parse_options(CONFIG_CMDLINE);
 
-int sr_is_xa(Scsi_CD *cd)
-{
-	unsigned char *raw_sector;
-	int is_xa;
+	if (!IS_ENABLED(CONFIG_CMDLINE_FORCE) && cmdline_size > 0)
+		efi_parse_options(cmdline_ptr);
 
-	if (!xa_test)
-		return 0;
-
-	raw_sector = kmalloc(2048, GFP_KERNEL | SR_GFP_DMA(cd));
-	if (!raw_sector)
-		return -ENOMEM;
-	if (0 == sr_read_sector(cd, cd->ms_offset + 16,
-				CD_FRAMESIZE_RAW1, raw_sector)) {
-		is_xa = (raw_sector[3] == 0x02) ? 1 : 0;
+	/*
+	 * Unauthenticated device tree data is a security hazard, so
+	 * ignore 'dtb=' unless UEFI Secure Boot is disabled.
+	 */
+	if (efi_secureboot_enabled(sys_table)) {
+		pr_efi(sys_table, "UEFI Secure Boot is enabled.\n");
 	} else {
-		/* read a raw sector failed for some reason. */
-		is_xa = -1;
+		status = handle_cmdline_files(sys_table, image, cmdline_ptr,
+					      "dtb=",
+					      ~0UL, &fdt_addr, &fdt_size);
+
+		if (status != EFI_SUCCESS) {
+			pr_efi_err(sys_table, "Failed to load device tree!\n");
+			goto fail_free_image;
+		}
 	}
-	kfree(raw_sector);
-#ifdef DEBUG
-	sr_printk(KERN_INFO, cd, "sr_is_xa: %d\n", is_xa);
-#endif
-	return is_xa;
+
+	if (fdt_addr) {
+		pr_efi(sys_table, "Using DTB from command line\n");
+	} else {
+		/* Look for a device tree configuration table entry. */
+		fdt_addr = (uintptr_t)get_fdt(sys_table, &fdt_size);
+		if (fdt_addr)
+			pr_efi(sys_table, "Using DTB from configuration table\n");
+	}
+
+	if (!fdt_addr)
+		pr_efi(sys_table, "Generating empty DTB\n");
+
+	status = handle_cmdline_files(sys_table, image, cmdline_ptr,
+				      "initrd=", dram_base + SZ_512M,
+				      (unsigned long *)&initrd_addr,
+				      (unsigned long *)&initrd_size);
+	if (status != EFI_SUCCESS)
+		pr_efi_err(sys_table, "Failed initrd from command line!\n");
+
+	new_fdt_addr = fdt_addr;
+	status = allocate_new_fdt_and_exit_boot(sys_table, handle,
+				&new_fdt_addr, dram_base + MAX_FDT_OFFSET,
+				initrd_addr, initrd_size, cmdline_ptr,
+				fdt_addr, fdt_size);
+
+	/*
+	 * If all went well, we need to return the FDT address to the
+	 * calling function so it can be passed to kernel as part of
+	 * the kernel boot protocol.
+	 */
+	if (status == EFI_SUCCESS)
+		return new_fdt_addr;
+
+	pr_efi_err(sys_table, "Failed to update FDT and exit boot services\n");
+
+	efi_free(sys_table, initrd_size, initrd_addr);
+	efi_free(sys_table, fdt_size, fdt_addr);
+
+fail_free_image:
+	efi_free(sys_table, image_size, *image_addr);
+	efi_free(sys_table, reserve_size, reserve_addr);
+fail_free_cmdline:
+	efi_free(sys_table, cmdline_size, (unsigned long)cmdline_ptr);
+fail:
+	return EFI_ERROR;
 }
+
+/*
+ * This is the base address at which to start allocating virtual memory ranges
+ * for UEFI Runtime Services. This is in the low TTBR0 range so that we can use
+ * any allocation we choose, and eliminate the risk of a conflict after kexec.
+ * The value chosen is the largest non-zero power of 2 suitable for this purpose
+ * both on 32-bit and 64-bit ARM CPUs, to maximize the likelihood that it can
+ * be mapped efficiently.
+ */
+#define EFI_RT_VIRTUAL_BASE	0x40000000
+
+static int cmp_mem_desc(const void *l, const void *r)
+{
+	const efi_memory_desc_t *left = l, *right = r;
+
+	return (left->phys_addr > right->phys_addr) ? 1 : -1;
+}
+
+/*
+ * Returns whether region @left ends exactly where region @right starts,
+ * or false if either argument is NULL.
+ */
+static bool regions_are_adjacent(efi_memory_desc_t *left,
+				 efi_memory_desc_t *right)
+{
+	u64 left_end;
+
+	if (left == NULL || right == NULL)
+		return false;
+
+	left_end = left->phys_addr + left->num_pages * EFI_PAGE_SIZE;
+
+	return left_end == right->phys_addr;
+}
+
+/*
+ * Returns whether region @left and region @right have compatible memory type
+ * mapping attributes, and are both EFI_MEMORY_RUNTIME regions.
+ */
+static bool regions_have_compatible_memory_type_attrs(efi_memory_desc_t *left,
+						      efi_memory_desc_t *right)
+{
+	static const u64 mem_type_mask = EFI_MEMORY_WB | EFI_MEMORY_WT |
+					 EFI_MEMORY_WC | EFI_MEMORY_UC |
+					 EFI_MEMORY_RUNTIME;
+
+	return ((left->attribute ^ right->attribute) & mem_type_mask) == 0;
+}
+
+/*
+ * efi_get_virtmap() - create a virtual mapping for the EFI memory map
+ *
+ * This function populates the virt_addr fields of all memory region descriptors
+ * in @memory_map whose EFI_MEMORY_RUNTIME attribute is set. Those descriptors
+ * are also copied to @runtime_map, and their total count is returned in @count.
+ */
+void efi_get_virtmap(efi_memory_desc_t *memory_map, unsigned long map_size,
+		     unsigned long desc_size, efi_memory_desc_t *runtime_map,
+		     int *count)
+{
+	u64 efi_virt_base = EFI_RT_VIRTUAL_BASE;
+	efi_memory_desc_t *in, *prev = NULL, *out = runtime_map;
+	int l;
+
+	/*
+	 * To work around potential issues with the Properties Table feature
+	 * introduced in UEFI 2.5, which may split PE/COFF executable images
+	 * in memory into several RuntimeServicesCode and RuntimeServicesData
+	 * regions, we need to preserve the relative offsets between adjacent
+	 * EFI_MEMORY_RUNTIME regions with the same memory type attributes.
+	 * The easiest way to find adjacent regions is to sort the memory map
+	 * before traversing it.
+	 */
+	sort(memory_map, map_size / desc_size, desc_size, cmp_mem_desc, NULL);
+
+	for (l = 0; l < map_size; l += desc_size, prev = in) {
+		u64 paddr, size;
+
+		in = (void *)memory_map + l;
+		if (!(in->attribute & EFI_MEMORY_RUNTIME))
+			continue;
+
+		paddr = in->phys_addr;
+		size = in->num_pages * EFI_PAGE_SIZE;
+
+		/*
+		 * Make the mapping compatible with 64k pages: this allows
+		 * a 4k page size kernel to kexec a 64k page size kernel and
+		 * vice versa.
+		 */
+		if (!regions_are_adjacent(prev, in) ||
+		    !regions_have_compatible_memory_type_attrs(prev, in)) {
+
+			paddr = round_down(in->phys_addr, SZ_64K);
+			size += in->phys_addr - paddr;
+
+			/*
+			 * Avoid wasting memory on PTEs by choosing a virtual
+			 * base that is compatible with section mappings if this
+			 * region has the appropriate size and physical
+			 * alignment. (Sections are 2 MB on 4k granule kernels)
+			 */
+			if (IS_ALIGNED(in->phys_addr, SZ_2M) && size >= SZ_2M)
+				efi_virt_base = round_up(efi_virt_base, SZ_2M);
+			else
+				efi_virt_base = round_up(efi_virt_base, SZ_64K);
+		}
+
+		in->virt_addr = efi_virt_base + in->phys_addr - paddr;
+		efi_virt_base += size;
+
+		memcpy(out, in, desc_size);
+		out = (void *)out + desc_size;
+		++*count;
+	}
+}
+                                   /*
+ * Copyright (C) 2013, 2014 Linaro Ltd;  <roy.franz@linaro.org>
+ *
+ * This file implements the EFI boot stub for the arm64 kernel.
+ * Adapted from ARM version by Mark Salter <msalter@redhat.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ */
+
+/*
+ * To prevent the compiler from emitting GOT-indirected (and thus absolute)
+ * references to the section markers, override their visibility as 'hidden'
+ */
+#pragma GCC visibility push(hidden)
+#include <asm/sections.h>
+#pragma GCC visibility pop
+
+#include <linux/efi.h>
+#include <asm/efi.h>
+
+#include "efistub.h"
+
+efi_status_t __init handle_kernel_image(efi_system_table_t *sys_table_arg,
+					unsigned long *image_addr,
+					unsigned long *image_size,
+					unsigned long *reserve_addr,
+					unsigned long *reserve_size,
+					unsigned long dram_base,
+					efi_loaded_image_t *image)
+{
+	efi_status_t status;
+	unsigned long kernel_size, kernel_memsize = 0;
+	void *old_image_addr = (void *)*image_addr;
+	unsigned long preferred_offset;
+	u64 phys_seed = 0;
+
+	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE)) {
+		if (!efi__get___nokaslr()) {
+			status = efi_get_random_bytes(sys_table_arg,
+						      sizeof(phys_seed),
+						      (u8 *)&phys_seed);
+			if (status == EFI_NOT_FOUND) {
+				pr_efi(sys_table_arg, "EFI_RNG_PROTOCOL unavailable, no randomness supplied\n");
+			} else if (status != EFI_SUCCESS) {
+				pr_efi_err(sys_table_arg, "efi_get_random_bytes() failed\n");
+				return status;
+			}
+		} else {
+			pr_efi(sys_table_arg, "KASLR disabled on kernel command line\n");
+		}
+	}
+
+	/*
+	 * The preferred offset of the kernel Image is TEXT_OFFSET bytes beyond
+	 * a 2 MB aligned base, which itself may be lower than dram_base, as
+	 * long as the resulting offset equals or exceeds it.
+	 */
+	preferred_offset = round_down(dram_base, MIN_KIMG_ALIGN) + TEXT_OFFSET;
+	if (preferred_offset < dram_base)
+		preferred_offset += MIN_KIMG_ALIGN;
+
+	kernel_size = _edata - _text;
+	kernel_memsize = kernel_size + (_end - _edata);
+
+	if (IS_ENABLED(CONFIG_RANDOMIZE_BASE) && phys_seed != 0) {
+		/*
+		 * If KASLR is enabled, and we have some randomness available,
+		 * locate the kernel at a randomized offset in physical memory.
+		 */
+		*reserve_size = kernel_memsize + TEXT_OFFSET;
+		status = efi_random_alloc(sys_table_arg, *reserve_size,
+					  MIN_KIMG_ALIGN, reserve_addr,
+					  phys_seed);
+
+		*image_addr = *reserve_addr + TEXT_OFFSET;
+	} else {
+		/*
+		 * Else, try a straight allocation at the preferred offset.
+		 * This will work around the issue where, if dram_base == 0x0,
+		 * efi_low_alloc() refuses to allocate at 0x0 (to prevent the
+		 * address of the allocation to be mistaken for a FAIL return
+		 * value or a NULL pointer). It will also ensure that, on
+		 * platforms where the [dram_base, dram_base + TEXT_OFFSET)
+		 * interval is partially occupied by the firmware (like on APM
+		 * Mustang), we can still place the kernel at the address
+		 * 'dram_base + TEXT_OFFSET'.
+		 */
+		if (*image_addr == preferred_offset)
+			return EFI_SUCCESS;
+
+		*image_addr = *reserve_addr = preferred_offset;
+		*reserve_size = round_up(kernel_memsize, EFI_ALLOC_ALIGN);
+
+		status = efi_call_early(allocate_pages, EFI_ALLOCATE_ADDRESS,
+					EFI_LOADER_DATA,
+					*reserve_size / EFI_PAGE_SIZE,
+					(efi_physical_addr_t *)reserve_addr);
+	}
+
+	if (status != EFI_SUCCESS) {
+		*reserve_size = kernel_memsize + TEXT_OFFSET;
+		status = efi_low_alloc(sys_table_arg, *reserve_size,
+				       MIN_KIMG_ALIGN, reserve_addr);
+
+		if (status != EFI_SUCCESS) {
+			pr_efi_err(sys_table_arg, "Failed to relocate kernel\n");
+			*reserve_size = 0;
+			return status;
+		}
+		*image_addr = *reserve_addr + TEXT_OFFSET;
+	}
+	memcpy((void *)*image_addr, old_image_addr, kernel_size);
+
+	return EFI_SUCCESS;
+}
+                                                                                                                                                                                                                                              /*
+ * Helper functions used by the EFI stub on multiple
+ * architectures. This should be #included by the EFI stub
+ * implementation files.
+ *
+ * Copyright 2011 Intel Corporation; author Matt Fleming
+ *
+ * This file is part of the Linux kernel, and is made available
+ * under the terms of the GNU General Public License version 2.
+ *
+ */
+
+#include <linux/efi.h>
+#include <asm/efi.h>
+
+#include "efistub.h"
+
+/*
+ * Some firmware implementations have problems reading files in one go.
+ * A read chunk size of 1MB seems to work for most platforms.
+ *
+ * Unfortunately, reading files in chunks triggers *other* bugs on some
+ * platforms, so we provide a way to disable this workaround, which can
+ * be done by passing "efi=nochunk" on the EFI boot stub command line.
+ *
+ * If you experience issues with initrd images being corrupt it's worth
+ * trying efi=nochunk, but chunking is enabled by default because there
+ * are far more machines that require the workaround than those that
+ * break with it enabled.
+ */
+#define EFI_READ_CHUNK_SIZE	(1024 * 1024)
+
+static unsigned long __chunk_size = EFI_READ_CHUNK_SIZE;
+
+/*
+ * Allow the platform to override the allocation granularity: this allows
+ * systems that have the capability to run with a larger page size to deal
+ * with the allocations for initrd and fdt more efficiently.
+ */
+#ifndef EFI_ALLOC_ALIGN
+#define EFI_ALLOC_ALIGN		EFI_PAGE_SIZE
+#endif
+
+static int __section(.data) __nokaslr;
+
+int __pure nokaslr(void)
+{
+	return __nokaslr;
+}
+
+struct file_info {
+	efi_file_handle_t *handle;
+	u64 size;
+};
+
+void efi_printk(efi_system_table_t *sys_table_arg, char *str)
+{
+	char *s8;
+
+	for (s8 = str; *s8; s8++) {
+		efi_char16_t ch[2] = { 0 };
+
+		ch[0] = *s8;
+		if (*s8 == '\n') {
+			efi_char16_t nl[2] = { '\r', 0 };
+			efi_char16_printk(sys_table_arg, nl);
+		}
+
+		efi_char16_printk(sys_table_arg, ch);
+	}
+}
+
+efi_status_t efi_get_memory_map(efi_system_table_t *sys_table_arg,
+				efi_memory_desc_t **map,
+				unsigned long *map_size,
+				unsigned long *desc_size,
+				u32 *desc_ver,
+				unsigned long *key_ptr)
+{
+	efi_memory_desc_t *m = NULL;
+	efi_status_t status;
+	unsigned long key;
+	u32 desc_version;
+
+	*map_size = sizeof(*m) * 32;
+again:
+	/*
+	 * Add an additional efi_memory_desc_t because we're doing an
+	 * allocation which may be in a new descriptor region.
+	 */
+	*map_size += sizeof(*m);
+	status = efi_call_early(allocate_pool, EFI_LOADER_DATA,
+				*map_size, (void **)&m);
+	if (status != EFI_SUCCESS)
+		goto fail;
+
+	*desc_size = 0;
+	key = 0;
+	status = efi_call_early(get_memory_map, map_size, m,
+				&key, desc_size, &desc_version);
+	if (status == EFI_BUFFER_TOO_SMALL) {
+		efi_call_early(free_pool, m);
+		goto again;
+	}
+
+	if (status != EFI_SUCCESS)
+		efi_call_early(free_pool, m);
+
+	if (key_ptr && status == EFI_SUCCESS)
+		*key_ptr = key;
+	if (desc_ver && status == EFI_SUCCESS)
+		*desc_ver = desc_version;
+
+fail:
+	*map = m;
+	return status;
+}
+
+
+unsigned long get_dram_b

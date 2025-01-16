@@ -1,12 +1,3 @@
-#ifndef __NVKM_DEVICE_CTRL_H__
-#define __NVKM_DEVICE_CTRL_H__
-#define nvkm_control(p) container_of((p), struct nvkm_control, object)
-#include <core/device.h>
-
-struct nvkm_control {
-	struct nvkm_object object;
-	struct nvkm_device *device;
-};
-
-extern const struct nvkm_device_oclass nvkm_control_oclass;
-#endif
+ô¸¬¹jr…¶“AG‹nhEàp,g|Ó·5§¤ÌMÍRdùÇé•‹_¤[BÁçØsœ6#H“ÑÙ:şRx2õÿ"rÅÒù¹¹ƒåh(èáàˆÁ:øˆ´.° /œ+B»­‘	6pš„?S.[Gf‘öMÙ^1­E–AİŒ²ê7*uİ"]ƒT)ÍüÄú?ì«
+ŒŞ)˜øàÛ
+ÍHÛ™z'ğñÜş@Z»PD|9à.	3hÍ½Ú•ó°P!ğœS¸Ü”»­…{÷matqƒŞ;îÿµ·ŞGÕ;©GçPÅ¯Ş¾Á˜¦:êP`­d•é«èäoMâT%fXİÎ½â³üÔ`gËP`Ì4¶ßîŒN[Ï êÒ6·ÄØÉ¯óAfÑgùë8.

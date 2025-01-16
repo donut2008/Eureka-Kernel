@@ -1,69 +1,42 @@
-/*
- * Copyright (C) 2013 STMicroelectronics (R&D) Limited
- * Author: Stephen Gallimore <stephen.gallimore@st.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- */
-#ifndef __STI_RESET_SYSCFG_H
-#define __STI_RESET_SYSCFG_H
-
-#include <linux/device.h>
-#include <linux/regmap.h>
-#include <linux/reset-controller.h>
-
-/**
- * Reset channel description for a system configuration register based
- * reset controller.
- *
- * @compatible: Compatible string of the syscon regmap containing this
- *              channel's control and ack (status) bits.
- * @reset: Regmap field description of the channel's reset bit.
- * @ack: Regmap field description of the channel's acknowledge bit.
- */
-struct syscfg_reset_channel_data {
-	const char *compatible;
-	struct reg_field reset;
-	struct reg_field ack;
-};
-
-#define _SYSCFG_RST_CH(_c, _rr, _rb, _ar, _ab)		\
-	{ .compatible	= _c,				\
-	  .reset	= REG_FIELD(_rr, _rb, _rb),	\
-	  .ack		= REG_FIELD(_ar, _ab, _ab), }
-
-#define _SYSCFG_RST_CH_NO_ACK(_c, _rr, _rb)		\
-	{ .compatible	= _c,			\
-	  .reset	= REG_FIELD(_rr, _rb, _rb), }
-
-/**
- * Description of a system configuration register based reset controller.
- *
- * @wait_for_ack: The controller will wait for reset assert and de-assert to
- *                be "ack'd" in a channel's ack field.
- * @active_low: Are the resets in this controller active low, i.e. clearing
- *              the reset bit puts the hardware into reset.
- * @nr_channels: The number of reset channels in this controller.
- * @channels: An array of reset channel descriptions.
- */
-struct syscfg_reset_controller_data {
-	bool wait_for_ack;
-	bool active_low;
-	int nr_channels;
-	const struct syscfg_reset_channel_data *channels;
-};
-
-/**
- * syscfg_reset_probe(): platform device probe function used by syscfg
- *                       reset controller drivers. This registers a reset
- *                       controller configured by the OF match data for
- *                       the compatible device which should be of type
- *                       "struct syscfg_reset_controller_data".
- *
- * @pdev: platform device
- */
-int syscfg_reset_probe(struct platform_device *pdev);
-
-#endif /* __STI_RESET_SYSCFG_H */
+4e,
+	DBG_BLOCK_ID_CB00                                = 0x4f,
+	DBG_BLOCK_ID_CB01                                = 0x50,
+	DBG_BLOCK_ID_CB02                                = 0x51,
+	DBG_BLOCK_ID_CB03                                = 0x52,
+	DBG_BLOCK_ID_CB04                                = 0x53,
+	DBG_BLOCK_ID_UNUSED9                             = 0x54,
+	DBG_BLOCK_ID_UNUSED10                            = 0x55,
+	DBG_BLOCK_ID_UNUSED11                            = 0x56,
+	DBG_BLOCK_ID_CB10                                = 0x57,
+	DBG_BLOCK_ID_CB11                                = 0x58,
+	DBG_BLOCK_ID_CB12                                = 0x59,
+	DBG_BLOCK_ID_CB13                                = 0x5a,
+	DBG_BLOCK_ID_CB14                                = 0x5b,
+	DBG_BLOCK_ID_UNUSED12                            = 0x5c,
+	DBG_BLOCK_ID_UNUSED13                            = 0x5d,
+	DBG_BLOCK_ID_UNUSED14                            = 0x5e,
+	DBG_BLOCK_ID_TCP0                                = 0x5f,
+	DBG_BLOCK_ID_TCP1                                = 0x60,
+	DBG_BLOCK_ID_TCP2                                = 0x61,
+	DBG_BLOCK_ID_TCP3                                = 0x62,
+	DBG_BLOCK_ID_TCP4                                = 0x63,
+	DBG_BLOCK_ID_TCP5                                = 0x64,
+	DBG_BLOCK_ID_TCP6                                = 0x65,
+	DBG_BLOCK_ID_TCP7                                = 0x66,
+	DBG_BLOCK_ID_TCP8                                = 0x67,
+	DBG_BLOCK_ID_TCP9                                = 0x68,
+	DBG_BLOCK_ID_TCP10                               = 0x69,
+	DBG_BLOCK_ID_TCP11                               = 0x6a,
+	DBG_BLOCK_ID_TCP12                               = 0x6b,
+	DBG_BLOCK_ID_TCP13                               = 0x6c,
+	DBG_BLOCK_ID_TCP14                               = 0x6d,
+	DBG_BLOCK_ID_TCP15                               = 0x6e,
+	DBG_BLOCK_ID_TCP16                               = 0x6f,
+	DBG_BLOCK_ID_TCP17                               = 0x70,
+	DBG_BLOCK_ID_TCP18                               = 0x71,
+	DBG_BLOCK_ID_TCP19                               = 0x72,
+	DBG_BLOCK_ID_TCP20                               = 0x73,
+	DBG_BLOCK_ID_TCP21                               = 0x74,
+	DBG_BLOCK_ID_TCP22                               = 0x75,
+	DBG_BLOCK_ID_TCP23                               = 0x76,
+	DBG_BLOCK_ID_TCP_RESERVED0              

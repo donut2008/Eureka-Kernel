@@ -1,148 +1,140 @@
+#ifndef _ASM_IA64_TERMBITS_H
+#define _ASM_IA64_TERMBITS_H
+
 /*
- *  arch/s390/kernel/base.S
+ * Based on <asm-i386/termbits.h>.
  *
- *    Copyright IBM Corp. 2006, 2007
- *    Author(s): Heiko Carstens <heiko.carstens@de.ibm.com>
- *		 Michael Holzheu <holzheu@de.ibm.com>
+ * Modified 1999
+ *	David Mosberger-Tang <davidm@hpl.hp.com>, Hewlett-Packard Co
+ *
+ * 99/01/28	Added new baudrates
  */
 
-#include <linux/linkage.h>
-#include <asm/asm-offsets.h>
-#include <asm/nospec-insn.h>
-#include <asm/ptrace.h>
-#include <asm/sigp.h>
+#include <linux/posix_types.h>
 
-	GEN_BR_THUNK %r9
-	GEN_BR_THUNK %r14
+typedef unsigned char	cc_t;
+typedef unsigned int	speed_t;
+typedef unsigned int	tcflag_t;
 
-ENTRY(s390_base_mcck_handler)
-	basr	%r13,0
-0:	lg	%r15,__LC_PANIC_STACK	# load panic stack
-	aghi	%r15,-STACK_FRAME_OVERHEAD
-	larl	%r1,s390_base_mcck_handler_fn
-	lg	%r9,0(%r1)
-	ltgr	%r9,%r9
-	jz	1f
-	BASR_EX	%r14,%r9
-1:	la	%r1,4095
-	lmg	%r0,%r15,__LC_GPREGS_SAVE_AREA-4095(%r1)
-	lpswe	__LC_MCK_OLD_PSW
+#define NCCS 19
+struct termios {
+	tcflag_t c_iflag;		/* input mode flags */
+	tcflag_t c_oflag;		/* output mode flags */
+	tcflag_t c_cflag;		/* control mode flags */
+	tcflag_t c_lflag;		/* local mode flags */
+	cc_t c_line;			/* line discipline */
+	cc_t c_cc[NCCS];		/* control characters */
+};
 
-	.section .bss
-	.align 8
-	.globl	s390_base_mcck_handler_fn
-s390_base_mcck_handler_fn:
-	.quad	0
-	.previous
+struct termios2 {
+	tcflag_t c_iflag;		/* input mode flags */
+	tcflag_t c_oflag;		/* output mode flags */
+	tcflag_t c_cflag;		/* control mode flags */
+	tcflag_t c_lflag;		/* local mode flags */
+	cc_t c_line;			/* line discipline */
+	cc_t c_cc[NCCS];		/* control characters */
+	speed_t c_ispeed;		/* input speed */
+	speed_t c_ospeed;		/* output speed */
+};
 
-ENTRY(s390_base_ext_handler)
-	stmg	%r0,%r15,__LC_SAVE_AREA_ASYNC
-	basr	%r13,0
-0:	aghi	%r15,-STACK_FRAME_OVERHEAD
-	larl	%r1,s390_base_ext_handler_fn
-	lg	%r9,0(%r1)
-	ltgr	%r9,%r9
-	jz	1f
-	BASR_EX	%r14,%r9
-1:	lmg	%r0,%r15,__LC_SAVE_AREA_ASYNC
-	ni	__LC_EXT_OLD_PSW+1,0xfd	# clear wait state bit
-	lpswe	__LC_EXT_OLD_PSW
+struct ktermios {
+	tcflag_t c_iflag;		/* input mode flags */
+	tcflag_t c_oflag;		/* output mode flags */
+	tcflag_t c_cflag;		/* control mode flags */
+	tcflag_t c_lflag;		/* local mode flags */
+	cc_t c_line;			/* line discipline */
+	cc_t c_cc[NCCS];		/* control characters */
+	speed_t c_ispeed;		/* input speed */
+	speed_t c_ospeed;		/* output speed */
+};
 
-	.section .bss
-	.align 8
-	.globl s390_base_ext_handler_fn
-s390_base_ext_handler_fn:
-	.quad	0
-	.previous
+/* c_cc characters */
+#define VINTR 0
+#define VQUIT 1
+#define VERASE 2
+#define VKILL 3
+#define VEOF 4
+#define VTIME 5
+#define VMIN 6
+#define VSWTC 7
+#define VSTART 8
+#define VSTOP 9
+#define VSUSP 10
+#define VEOL 11
+#define VREPRINT 12
+#define VDISCARD 13
+#define VWERASE 14
+#define VLNEXT 15
+#define VEOL2 16
 
-ENTRY(s390_base_pgm_handler)
-	stmg	%r0,%r15,__LC_SAVE_AREA_SYNC
-	basr	%r13,0
-0:	aghi	%r15,-STACK_FRAME_OVERHEAD
-	larl	%r1,s390_base_pgm_handler_fn
-	lg	%r9,0(%r1)
-	ltgr	%r9,%r9
-	jz	1f
-	BASR_EX	%r14,%r9
-	lmg	%r0,%r15,__LC_SAVE_AREA_SYNC
-	lpswe	__LC_PGM_OLD_PSW
-1:	lpswe	disabled_wait_psw-0b(%r13)
+/* c_iflag bits */
+#define IGNBRK	0000001
+#define BRKINT	0000002
+#define IGNPAR	0000004
+#define PARMRK	0000010
+#define INPCK	0000020
+#define ISTRIP	0000040
+#define INLCR	0000100
+#define IGNCR	0000200
+#define ICRNL	0000400
+#define IUCLC	0001000
+#define IXON	0002000
+#define IXANY	0004000
+#define IXOFF	0010000
+#define IMAXBEL	0020000
+#define IUTF8	0040000
 
-	.align	8
-disabled_wait_psw:
-	.quad	0x0002000180000000,0x0000000000000000 + s390_base_pgm_handler
+/* c_oflag bits */
+#define OPOST	0000001
+#define OLCUC	0000002
+#define ONLCR	0000004
+#define OCRNL	0000010
+#define ONOCR	0000020
+#define ONLRET	0000040
+#define OFILL	0000100
+#define OFDEL	0000200
+#define NLDLY	0000400
+#define   NL0	0000000
+#define   NL1	0000400
+#define CRDLY	0003000
+#define   CR0	0000000
+#define   CR1	0001000
+#define   CR2	0002000
+#define   CR3	0003000
+#define TABDLY	0014000
+#define   TAB0	0000000
+#define   TAB1	0004000
+#define   TAB2	0010000
+#define   TAB3	0014000
+#define   XTABS	0014000
+#define BSDLY	0020000
+#define   BS0	0000000
+#define   BS1	0020000
+#define VTDLY	0040000
+#define   VT0	0000000
+#define   VT1	0040000
+#define FFDLY	0100000
+#define   FF0	0000000
+#define   FF1	0100000
 
-	.section .bss
-	.align 8
-	.globl s390_base_pgm_handler_fn
-s390_base_pgm_handler_fn:
-	.quad	0
-	.previous
-
-#
-# Calls diag 308 subcode 1 and continues execution
-#
-ENTRY(diag308_reset)
-	larl	%r4,.Lctlregs		# Save control registers
-	stctg	%c0,%c15,0(%r4)
-	lg	%r2,0(%r4)		# Disable lowcore protection
-	nilh	%r2,0xefff
-	larl	%r4,.Lctlreg0
-	stg	%r2,0(%r4)
-	lctlg	%c0,%c0,0(%r4)
-	larl	%r4,.Lfpctl		# Floating point control register
-	stfpc	0(%r4)
-	larl	%r4,.Lprefix		# Save prefix register
-	stpx	0(%r4)
-	larl	%r4,.Lprefix_zero	# Set prefix register to 0
-	spx	0(%r4)
-	larl	%r4,.Lcontinue_psw	# Save PSW flags
-	epsw	%r2,%r3
-	stm	%r2,%r3,0(%r4)
-	larl	%r4,.Lrestart_psw	# Setup restart PSW at absolute 0
-	lghi	%r3,0
-	lg	%r4,0(%r4)		# Save PSW
-	sturg	%r4,%r3			# Use sturg, because of large pages
-	lghi	%r1,1
-	lghi	%r0,0
-	diag	%r0,%r1,0x308
-.Lrestart_part2:
-	lhi	%r0,0			# Load r0 with zero
-	lhi	%r1,2			# Use mode 2 = ESAME (dump)
-	sigp	%r1,%r0,SIGP_SET_ARCHITECTURE	# Switch to ESAME mode
-	sam64				# Switch to 64 bit addressing mode
-	larl	%r4,.Lctlregs		# Restore control registers
-	lctlg	%c0,%c15,0(%r4)
-	larl	%r4,.Lfpctl		# Restore floating point ctl register
-	lfpc	0(%r4)
-	larl	%r4,.Lprefix		# Restore prefix register
-	spx	0(%r4)
-	larl	%r4,.Lcontinue_psw	# Restore PSW flags
-	lpswe	0(%r4)
-.Lcontinue:
-	BR_EX	%r14
-.align 16
-.Lrestart_psw:
-	.long	0x00080000,0x80000000 + .Lrestart_part2
-
-	.section .data..nosave,"aw",@progbits
-.align 8
-.Lcontinue_psw:
-	.quad	0,.Lcontinue
-	.previous
-
-	.section .bss
-.align 8
-.Lctlreg0:
-	.quad	0
-.Lctlregs:
-	.rept	16
-	.quad	0
-	.endr
-.Lfpctl:
-	.long	0
-.Lprefix:
-	.long	0
-.Lprefix_zero:
-	.long	0
-	.previous
+/* c_cflag bit meaning */
+#define CBAUD	0010017
+#define  B0	0000000		/* hang up */
+#define  B50	0000001
+#define  B75	0000002
+#define  B110	0000003
+#define  B134	0000004
+#define  B150	0000005
+#define  B200	0000006
+#define  B300	0000007
+#define  B600	0000010
+#define  B1200	0000011
+#define  B1800	0000012
+#define  B2400	0000013
+#define  B4800	0000014
+#define  B9600	0000015
+#define  B19200	0000016
+#define  B38400	0000017
+#define EXTA B19200
+#define EXTB B38400
+#define CS

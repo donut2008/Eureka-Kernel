@@ -1,26 +1,14 @@
-#
-# MCU_IPC Device Driver
-#
-
-config MCU_IPC
-     bool "MCU IPC Support"
-     default n
-	 help
-	   This enables MCU_IPC driver to control the MCU_IPC Device.
-
-	   MCU_IPC is the Mailbox which has 16 interrupts for TX/RX each
-	   and 256 bytes memory for communicating messages.
-	   AP and CP can share the messages through this device.
-
-config MCU_IPC_TEST
-     bool "MCU_IPC driver test"
-     depends on MCU_IPC
-     help
-	This enables MCU_IPC_TEST for checking mailbox at probe time.
-
-config SHM_IPC
-	bool "Shared Memory for IPC support"
-	default n
-	help
-	This enables SHM_IPC driver to control the Shared memory
-	for AP-CP Interface.
+PL_BOUNDARY_MASK 0x8
+#define LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define LINK_CNTL__LINK_DIS_MASK 0x10
+#define LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0

@@ -1,5 +1,2 @@
-#
-# Makefile for the VME board drivers.
-#
-
-obj-$(CONFIG_VMIVME_7805)	+= vme_vmivme7805.o
+A_F0_CODEC_INPUT_PIN_PARAMETER_CAPABILITIES_I_O_PINS_NOT_BALANCED= 0x0,
+	AZALIA_F0_CODEC_

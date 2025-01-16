@@ -1,7 +1,9 @@
-/*
- *  User level driver support for input subsystem
+/*******************************************************************************
+ * This file contains iSCSI extentions for RDMA (iSER) Verbs
  *
- * Heavily based on evdev.c by Vojtech Pavlik
+ * (c) Copyright 2013 Datera, Inc.
+ *
+ * Nicholas A. Bellinger <nab@linux-iscsi.org>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -12,980 +14,901 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- *
- * Author: Aristeu Sergio Rozanski Filho <aris@cathedrallabs.org>
- *
- * Changes/Revisions:
- *	0.4	01/09/2014 (Benjamin Tissoires <benjamin.tissoires@redhat.com>)
- *		- add UI_GET_SYSNAME ioctl
- *	0.3	09/04/2006 (Anssi Hannula <anssi.hannula@gmail.com>)
- *		- updated ff support for the changes in kernel interface
- *		- added MODULE_VERSION
- *	0.2	16/10/2004 (Micah Dowty <micah@navi.cx>)
- *		- added force feedback support
- *              - added UI_SET_PHYS
- *	0.1	20/06/2002
- *		- first public version
- */
-#include <linux/poll.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
+ ****************************************************************************/
+
+#include <linux/string.h>
 #include <linux/module.h>
-#include <linux/init.h>
-#include <linux/fs.h>
-#include <linux/miscdevice.h>
-#include <linux/uinput.h>
-#include <linux/input/mt.h>
-#include "../input-compat.h"
+#include <linux/scatterlist.h>
+#include <linux/socket.h>
+#include <linux/in.h>
+#include <linux/in6.h>
+#include <rdma/ib_verbs.h>
+#include <rdma/rdma_cm.h>
+#include <target/target_core_base.h>
+#include <target/target_core_fabric.h>
+#include <target/iscsi/iscsi_transport.h>
+#include <linux/semaphore.h>
 
-static bool enable_hall_ic;
-module_param(enable_hall_ic, bool, 0644);
+#include "isert_proto.h"
+#include "ib_isert.h"
 
-static int uinput_dev_event(struct input_dev *dev,
-			    unsigned int type, unsigned int code, int value)
+#define	ISERT_MAX_CONN		8
+#define ISER_MAX_RX_CQ_LEN	(ISERT_QP_MAX_RECV_DTOS * ISERT_MAX_CONN)
+#define ISER_MAX_TX_CQ_LEN	(ISERT_QP_MAX_REQ_DTOS  * ISERT_MAX_CONN)
+#define ISER_MAX_CQ_LEN		(ISER_MAX_RX_CQ_LEN + ISER_MAX_TX_CQ_LEN + \
+				 ISERT_MAX_CONN)
+
+static int isert_debug_level;
+module_param_named(debug_level, isert_debug_level, int, 0644);
+MODULE_PARM_DESC(debug_level, "Enable debug tracing if > 0 (default:0)");
+
+static DEFINE_MUTEX(device_list_mutex);
+static LIST_HEAD(device_list);
+static struct workqueue_struct *isert_comp_wq;
+static struct workqueue_struct *isert_release_wq;
+
+static void
+isert_unmap_cmd(struct isert_cmd *isert_cmd, struct isert_conn *isert_conn);
+static int
+isert_map_rdma(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
+	       struct isert_rdma_wr *wr);
+static void
+isert_unreg_rdma(struct isert_cmd *isert_cmd, struct isert_conn *isert_conn);
+static int
+isert_reg_rdma(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
+	       struct isert_rdma_wr *wr);
+static int
+isert_put_response(struct iscsi_conn *conn, struct iscsi_cmd *cmd);
+static int
+isert_rdma_post_recvl(struct isert_conn *isert_conn);
+static int
+isert_rdma_accept(struct isert_conn *isert_conn);
+struct rdma_cm_id *isert_setup_id(struct isert_np *isert_np);
+
+static void isert_release_work(struct work_struct *work);
+static void isert_wait4flush(struct isert_conn *isert_conn);
+
+static inline bool
+isert_prot_cmd(struct isert_conn *conn, struct se_cmd *cmd)
 {
-	struct uinput_device	*udev = input_get_drvdata(dev);
+	return (conn->pi_support &&
+		cmd->prot_op != TARGET_PROT_NORMAL);
+}
 
-	udev->buff[udev->head].type = type;
-	udev->buff[udev->head].code = code;
-	udev->buff[udev->head].value = value;
-	do_gettimeofday(&udev->buff[udev->head].time);
-	udev->head = (udev->head + 1) % UINPUT_BUFFER_SIZE;
 
-	wake_up_interruptible(&udev->waitq);
+static void
+isert_qp_event_callback(struct ib_event *e, void *context)
+{
+	struct isert_conn *isert_conn = context;
+
+	isert_err("%s (%d): conn %p\n",
+		  ib_event_msg(e->event), e->event, isert_conn);
+
+	switch (e->event) {
+	case IB_EVENT_COMM_EST:
+		rdma_notify(isert_conn->cm_id, IB_EVENT_COMM_EST);
+		break;
+	case IB_EVENT_QP_LAST_WQE_REACHED:
+		isert_warn("Reached TX IB_EVENT_QP_LAST_WQE_REACHED\n");
+		break;
+	default:
+		break;
+	}
+}
+
+static int
+isert_query_device(struct ib_device *ib_dev, struct ib_device_attr *devattr)
+{
+	int ret;
+
+	ret = ib_query_device(ib_dev, devattr);
+	if (ret) {
+		isert_err("ib_query_device() failed: %d\n", ret);
+		return ret;
+	}
+	isert_dbg("devattr->max_sge: %d\n", devattr->max_sge);
+	isert_dbg("devattr->max_sge_rd: %d\n", devattr->max_sge_rd);
 
 	return 0;
 }
 
-/* Atomically allocate an ID for the given request. Returns 0 on success. */
-static bool uinput_request_alloc_id(struct uinput_device *udev,
-				    struct uinput_request *request)
+static struct isert_comp *
+isert_comp_get(struct isert_conn *isert_conn)
 {
-	unsigned int id;
-	bool reserved = false;
+	struct isert_device *device = isert_conn->device;
+	struct isert_comp *comp;
+	int i, min = 0;
 
-	spin_lock(&udev->requests_lock);
+	mutex_lock(&device_list_mutex);
+	for (i = 0; i < device->comps_used; i++)
+		if (device->comps[i].active_qps <
+		    device->comps[min].active_qps)
+			min = i;
+	comp = &device->comps[min];
+	comp->active_qps++;
+	mutex_unlock(&device_list_mutex);
 
-	for (id = 0; id < UINPUT_NUM_REQUESTS; id++) {
-		if (!udev->requests[id]) {
-			request->id = id;
-			udev->requests[id] = request;
-			reserved = true;
-			break;
-		}
+	isert_info("conn %p, using comp %p min_index: %d\n",
+		   isert_conn, comp, min);
+
+	return comp;
+}
+
+static void
+isert_comp_put(struct isert_comp *comp)
+{
+	mutex_lock(&device_list_mutex);
+	comp->active_qps--;
+	mutex_unlock(&device_list_mutex);
+}
+
+static struct ib_qp *
+isert_create_qp(struct isert_conn *isert_conn,
+		struct isert_comp *comp,
+		struct rdma_cm_id *cma_id)
+{
+	struct isert_device *device = isert_conn->device;
+	struct ib_qp_init_attr attr;
+	int ret;
+
+	memset(&attr, 0, sizeof(struct ib_qp_init_attr));
+	attr.event_handler = isert_qp_event_callback;
+	attr.qp_context = isert_conn;
+	attr.send_cq = comp->cq;
+	attr.recv_cq = comp->cq;
+	attr.cap.max_send_wr = ISERT_QP_MAX_REQ_DTOS;
+	attr.cap.max_recv_wr = ISERT_QP_MAX_RECV_DTOS + 1;
+	attr.cap.max_send_sge = device->dev_attr.max_sge;
+	isert_conn->max_sge = min(device->dev_attr.max_sge,
+				  device->dev_attr.max_sge_rd);
+	attr.cap.max_recv_sge = 1;
+	attr.sq_sig_type = IB_SIGNAL_REQ_WR;
+	attr.qp_type = IB_QPT_RC;
+	if (device->pi_capable)
+		attr.create_flags |= IB_QP_CREATE_SIGNATURE_EN;
+
+	ret = rdma_create_qp(cma_id, device->pd, &attr);
+	if (ret) {
+		isert_err("rdma_create_qp failed for cma_id %d\n", ret);
+		return ERR_PTR(ret);
 	}
 
-	spin_unlock(&udev->requests_lock);
-	return reserved;
+	return cma_id->qp;
 }
 
-static struct uinput_request *uinput_request_find(struct uinput_device *udev,
-						  unsigned int id)
+static int
+isert_conn_setup_qp(struct isert_conn *isert_conn, struct rdma_cm_id *cma_id)
 {
-	/* Find an input request, by ID. Returns NULL if the ID isn't valid. */
-	if (id >= UINPUT_NUM_REQUESTS)
-		return NULL;
+	struct isert_comp *comp;
+	int ret;
 
-	return udev->requests[id];
-}
-
-static int uinput_request_reserve_slot(struct uinput_device *udev,
-				       struct uinput_request *request)
-{
-	/* Allocate slot. If none are available right away, wait. */
-	return wait_event_interruptible(udev->requests_waitq,
-					uinput_request_alloc_id(udev, request));
-}
-
-static void uinput_request_done(struct uinput_device *udev,
-				struct uinput_request *request)
-{
-	/* Mark slot as available */
-	udev->requests[request->id] = NULL;
-	wake_up(&udev->requests_waitq);
-
-	complete(&request->done);
-}
-
-static int uinput_request_send(struct uinput_device *udev,
-			       struct uinput_request *request)
-{
-	int retval;
-
-	retval = mutex_lock_interruptible(&udev->mutex);
-	if (retval)
-		return retval;
-
-	if (udev->state != UIST_CREATED) {
-		retval = -ENODEV;
-		goto out;
+	comp = isert_comp_get(isert_conn);
+	isert_conn->qp = isert_create_qp(isert_conn, comp, cma_id);
+	if (IS_ERR(isert_conn->qp)) {
+		ret = PTR_ERR(isert_conn->qp);
+		goto err;
 	}
 
-	init_completion(&request->done);
-
-	/*
-	 * Tell our userspace application about this new request
-	 * by queueing an input event.
-	 */
-	uinput_dev_event(udev->dev, EV_UINPUT, request->code, request->id);
-
- out:
-	mutex_unlock(&udev->mutex);
-	return retval;
+	return 0;
+err:
+	isert_comp_put(comp);
+	return ret;
 }
 
-static int uinput_request_submit(struct uinput_device *udev,
-				 struct uinput_request *request)
+static void
+isert_cq_event_callback(struct ib_event *e, void *context)
 {
-	int error;
+	isert_dbg("event: %d\n", e->event);
+}
 
-	error = uinput_request_reserve_slot(udev, request);
-	if (error)
-		return error;
+static int
+isert_alloc_rx_descriptors(struct isert_conn *isert_conn)
+{
+	struct isert_device *device = isert_conn->device;
+	struct ib_device *ib_dev = device->ib_device;
+	struct iser_rx_desc *rx_desc;
+	struct ib_sge *rx_sg;
+	u64 dma_addr;
+	int i, j;
 
-	error = uinput_request_send(udev, request);
-	if (error) {
-		uinput_request_done(udev, request);
-		return error;
+	isert_conn->rx_descs = kzalloc(ISERT_QP_MAX_RECV_DTOS *
+				sizeof(struct iser_rx_desc), GFP_KERNEL);
+	if (!isert_conn->rx_descs)
+		goto fail;
+
+	rx_desc = isert_conn->rx_descs;
+
+	for (i = 0; i < ISERT_QP_MAX_RECV_DTOS; i++, rx_desc++)  {
+		dma_addr = ib_dma_map_single(ib_dev, (void *)rx_desc,
+					ISER_RX_PAYLOAD_SIZE, DMA_FROM_DEVICE);
+		if (ib_dma_mapping_error(ib_dev, dma_addr))
+			goto dma_map_fail;
+
+		rx_desc->dma_addr = dma_addr;
+
+		rx_sg = &rx_desc->rx_sg;
+		rx_sg->addr = rx_desc->dma_addr;
+		rx_sg->length = ISER_RX_PAYLOAD_SIZE;
+		rx_sg->lkey = device->pd->local_dma_lkey;
 	}
 
-	wait_for_completion(&request->done);
-	return request->retval;
+	return 0;
+
+dma_map_fail:
+	rx_desc = isert_conn->rx_descs;
+	for (j = 0; j < i; j++, rx_desc++) {
+		ib_dma_unmap_single(ib_dev, rx_desc->dma_addr,
+				    ISER_RX_PAYLOAD_SIZE, DMA_FROM_DEVICE);
+	}
+	kfree(isert_conn->rx_descs);
+	isert_conn->rx_descs = NULL;
+fail:
+	isert_err("conn %p failed to allocate rx descriptors\n", isert_conn);
+
+	return -ENOMEM;
 }
 
-/*
- * Fail all outstanding requests so handlers don't wait for the userspace
- * to finish processing them.
- */
-static void uinput_flush_requests(struct uinput_device *udev)
+static void
+isert_free_rx_descriptors(struct isert_conn *isert_conn)
 {
-	struct uinput_request *request;
+	struct ib_device *ib_dev = isert_conn->device->ib_device;
+	struct iser_rx_desc *rx_desc;
 	int i;
 
-	spin_lock(&udev->requests_lock);
+	if (!isert_conn->rx_descs)
+		return;
 
-	for (i = 0; i < UINPUT_NUM_REQUESTS; i++) {
-		request = udev->requests[i];
-		if (request) {
-			request->retval = -ENODEV;
-			uinput_request_done(udev, request);
+	rx_desc = isert_conn->rx_descs;
+	for (i = 0; i < ISERT_QP_MAX_RECV_DTOS; i++, rx_desc++)  {
+		ib_dma_unmap_single(ib_dev, rx_desc->dma_addr,
+				    ISER_RX_PAYLOAD_SIZE, DMA_FROM_DEVICE);
+	}
+
+	kfree(isert_conn->rx_descs);
+	isert_conn->rx_descs = NULL;
+}
+
+static void isert_cq_work(struct work_struct *);
+static void isert_cq_callback(struct ib_cq *, void *);
+
+static void
+isert_free_comps(struct isert_device *device)
+{
+	int i;
+
+	for (i = 0; i < device->comps_used; i++) {
+		struct isert_comp *comp = &device->comps[i];
+
+		if (comp->cq) {
+			cancel_work_sync(&comp->work);
+			ib_destroy_cq(comp->cq);
 		}
 	}
-
-	spin_unlock(&udev->requests_lock);
+	kfree(device->comps);
 }
 
-static void uinput_dev_set_gain(struct input_dev *dev, u16 gain)
+static int
+isert_alloc_comps(struct isert_device *device,
+		  struct ib_device_attr *attr)
 {
-	uinput_dev_event(dev, EV_FF, FF_GAIN, gain);
-}
+	int i, max_cqe, ret = 0;
 
-static void uinput_dev_set_autocenter(struct input_dev *dev, u16 magnitude)
-{
-	uinput_dev_event(dev, EV_FF, FF_AUTOCENTER, magnitude);
-}
+	device->comps_used = min(ISERT_MAX_CQ, min_t(int, num_online_cpus(),
+				 device->ib_device->num_comp_vectors));
 
-static int uinput_dev_playback(struct input_dev *dev, int effect_id, int value)
-{
-	return uinput_dev_event(dev, EV_FF, effect_id, value);
-}
+	isert_info("Using %d CQs, %s supports %d vectors support "
+		   "Fast registration %d pi_capable %d\n",
+		   device->comps_used, device->ib_device->name,
+		   device->ib_device->num_comp_vectors, device->use_fastreg,
+		   device->pi_capable);
 
-static int uinput_dev_upload_effect(struct input_dev *dev,
-				    struct ff_effect *effect,
-				    struct ff_effect *old)
-{
-	struct uinput_device *udev = input_get_drvdata(dev);
-	struct uinput_request request;
-
-	/*
-	 * uinput driver does not currently support periodic effects with
-	 * custom waveform since it does not have a way to pass buffer of
-	 * samples (custom_data) to userspace. If ever there is a device
-	 * supporting custom waveforms we would need to define an additional
-	 * ioctl (UI_UPLOAD_SAMPLES) but for now we just bail out.
-	 */
-	if (effect->type == FF_PERIODIC &&
-			effect->u.periodic.waveform == FF_CUSTOM)
-		return -EINVAL;
-
-	request.code = UI_FF_UPLOAD;
-	request.u.upload.effect = effect;
-	request.u.upload.old = old;
-
-	return uinput_request_submit(udev, &request);
-}
-
-static int uinput_dev_erase_effect(struct input_dev *dev, int effect_id)
-{
-	struct uinput_device *udev = input_get_drvdata(dev);
-	struct uinput_request request;
-
-	if (!test_bit(EV_FF, dev->evbit))
-		return -ENOSYS;
-
-	request.code = UI_FF_ERASE;
-	request.u.effect_id = effect_id;
-
-	return uinput_request_submit(udev, &request);
-}
-
-static int uinput_dev_flush(struct input_dev *dev, struct file *file)
-{
-	/*
-	 * If we are called with file == NULL that means we are tearing
-	 * down the device, and therefore we can not handle FF erase
-	 * requests: either we are handling UI_DEV_DESTROY (and holding
-	 * the udev->mutex), or the file descriptor is closed and there is
-	 * nobody on the other side anymore.
-	 */
-	return file ? input_ff_flush(dev, file) : 0;
-}
-
-static void uinput_destroy_device(struct uinput_device *udev)
-{
-	const char *name, *phys;
-	struct input_dev *dev = udev->dev;
-	enum uinput_state old_state = udev->state;
-
-	udev->state = UIST_NEW_DEVICE;
-
-	if (dev) {
-		name = dev->name;
-		phys = dev->phys;
-		if (old_state == UIST_CREATED) {
-			uinput_flush_requests(udev);
-			input_unregister_device(dev);
-		} else {
-			input_free_device(dev);
-		}
-		kfree(name);
-		kfree(phys);
-		udev->dev = NULL;
-	}
-}
-
-static int uinput_create_device(struct uinput_device *udev)
-{
-	struct input_dev *dev = udev->dev;
-	int error;
-
-	if (udev->state != UIST_SETUP_COMPLETE) {
-		printk(KERN_DEBUG "%s: write device info first\n", UINPUT_NAME);
-		return -EINVAL;
-	}
-
-	if (udev->ff_effects_max) {
-		error = input_ff_create(dev, udev->ff_effects_max);
-		if (error)
-			goto fail1;
-
-		dev->ff->upload = uinput_dev_upload_effect;
-		dev->ff->erase = uinput_dev_erase_effect;
-		dev->ff->playback = uinput_dev_playback;
-		dev->ff->set_gain = uinput_dev_set_gain;
-		dev->ff->set_autocenter = uinput_dev_set_autocenter;
-		/*
-		 * The standard input_ff_flush() implementation does
-		 * not quite work for uinput as we can't reasonably
-		 * handle FF requests during device teardown.
-		 */
-		dev->flush = uinput_dev_flush;
-	}
-
-	error = input_register_device(udev->dev);
-	if (error)
-		goto fail2;
-
-	udev->state = UIST_CREATED;
-
-	return 0;
-
- fail2:	input_ff_destroy(dev);
- fail1: uinput_destroy_device(udev);
-	return error;
-}
-
-static int uinput_open(struct inode *inode, struct file *file)
-{
-	struct uinput_device *newdev;
-
-	newdev = kzalloc(sizeof(struct uinput_device), GFP_KERNEL);
-	if (!newdev)
+	device->comps = kcalloc(device->comps_used, sizeof(struct isert_comp),
+				GFP_KERNEL);
+	if (!device->comps) {
+		isert_err("Unable to allocate completion contexts\n");
 		return -ENOMEM;
+	}
 
-	mutex_init(&newdev->mutex);
-	spin_lock_init(&newdev->requests_lock);
-	init_waitqueue_head(&newdev->requests_waitq);
-	init_waitqueue_head(&newdev->waitq);
-	newdev->state = UIST_NEW_DEVICE;
+	max_cqe = min(ISER_MAX_CQ_LEN, attr->max_cqe);
 
-	file->private_data = newdev;
-	nonseekable_open(inode, file);
+	for (i = 0; i < device->comps_used; i++) {
+		struct ib_cq_init_attr cq_attr = {};
+		struct isert_comp *comp = &device->comps[i];
 
-	return 0;
-}
-
-static int uinput_validate_absbits(struct input_dev *dev)
-{
-	unsigned int cnt;
-	int nslot;
-
-	if (!test_bit(EV_ABS, dev->evbit))
-		return 0;
-
-	/*
-	 * Check if absmin/absmax/absfuzz/absflat are sane.
-	 */
-
-	for_each_set_bit(cnt, dev->absbit, ABS_CNT) {
-		int min, max;
-
-		min = input_abs_get_min(dev, cnt);
-		max = input_abs_get_max(dev, cnt);
-
-		if ((min != 0 || max != 0) && max <= min) {
-			printk(KERN_DEBUG
-				"%s: invalid abs[%02x] min:%d max:%d\n",
-				UINPUT_NAME, cnt,
-				input_abs_get_min(dev, cnt),
-				input_abs_get_max(dev, cnt));
-			return -EINVAL;
+		comp->device = device;
+		INIT_WORK(&comp->work, isert_cq_work);
+		cq_attr.cqe = max_cqe;
+		cq_attr.comp_vector = i;
+		comp->cq = ib_create_cq(device->ib_device,
+					isert_cq_callback,
+					isert_cq_event_callback,
+					(void *)comp,
+					&cq_attr);
+		if (IS_ERR(comp->cq)) {
+			isert_err("Unable to allocate cq\n");
+			ret = PTR_ERR(comp->cq);
+			comp->cq = NULL;
+			goto out_cq;
 		}
 
-		if (input_abs_get_flat(dev, cnt) >
-		    input_abs_get_max(dev, cnt) - input_abs_get_min(dev, cnt)) {
-			printk(KERN_DEBUG
-				"%s: abs_flat #%02x out of range: %d "
-				"(min:%d/max:%d)\n",
-				UINPUT_NAME, cnt,
-				input_abs_get_flat(dev, cnt),
-				input_abs_get_min(dev, cnt),
-				input_abs_get_max(dev, cnt));
-			return -EINVAL;
-		}
-	}
-
-	if (test_bit(ABS_MT_SLOT, dev->absbit)) {
-		nslot = input_abs_get_max(dev, ABS_MT_SLOT) + 1;
-		input_mt_init_slots(dev, nslot, 0);
-	} else if (test_bit(ABS_MT_POSITION_X, dev->absbit)) {
-		input_set_events_per_packet(dev, 60);
+		ret = ib_req_notify_cq(comp->cq, IB_CQ_NEXT_COMP);
+		if (ret)
+			goto out_cq;
 	}
 
 	return 0;
+out_cq:
+	isert_free_comps(device);
+	return ret;
 }
 
-static int uinput_allocate_device(struct uinput_device *udev)
+static int
+isert_create_device_ib_res(struct isert_device *device)
 {
-	udev->dev = input_allocate_device();
-	if (!udev->dev)
-		return -ENOMEM;
-
-	udev->dev->event = uinput_dev_event;
-	input_set_drvdata(udev->dev, udev);
-
-	return 0;
-}
-
-static int uinput_setup_device(struct uinput_device *udev,
-			       const char __user *buffer, size_t count)
-{
-	struct uinput_user_dev	*user_dev;
-	struct input_dev	*dev;
-	int			i;
-	int			retval;
-
-	if (count != sizeof(struct uinput_user_dev))
-		return -EINVAL;
-
-	if (!udev->dev) {
-		retval = uinput_allocate_device(udev);
-		if (retval)
-			return retval;
-	}
-
-	dev = udev->dev;
-
-	user_dev = memdup_user(buffer, sizeof(struct uinput_user_dev));
-	if (IS_ERR(user_dev))
-		return PTR_ERR(user_dev);
-
-	udev->ff_effects_max = user_dev->ff_effects_max;
-
-	/* Ensure name is filled in */
-	if (!user_dev->name[0]) {
-		retval = -EINVAL;
-		goto exit;
-	}
-
-	kfree(dev->name);
-	dev->name = kstrndup(user_dev->name, UINPUT_MAX_NAME_SIZE,
-			     GFP_KERNEL);
-	if (!dev->name) {
-		retval = -ENOMEM;
-		goto exit;
-	}
-
-	dev->id.bustype	= user_dev->id.bustype;
-	dev->id.vendor	= user_dev->id.vendor;
-	dev->id.product	= user_dev->id.product;
-	dev->id.version	= user_dev->id.version;
-
-	for (i = 0; i < ABS_CNT; i++) {
-		input_abs_set_max(dev, i, user_dev->absmax[i]);
-		input_abs_set_min(dev, i, user_dev->absmin[i]);
-		input_abs_set_fuzz(dev, i, user_dev->absfuzz[i]);
-		input_abs_set_flat(dev, i, user_dev->absflat[i]);
-	}
-
-	retval = uinput_validate_absbits(dev);
-	if (retval < 0)
-		goto exit;
-
-	udev->state = UIST_SETUP_COMPLETE;
-	retval = count;
-
- exit:
-	kfree(user_dev);
-	return retval;
-}
-
-static ssize_t uinput_inject_events(struct uinput_device *udev,
-				    const char __user *buffer, size_t count)
-{
-	struct input_event ev;
-	size_t bytes = 0;
-
-	if (count != 0 && count < input_event_size())
-		return -EINVAL;
-
-	while (bytes + input_event_size() <= count) {
-		/*
-		 * Note that even if some events were fetched successfully
-		 * we are still going to return EFAULT instead of partial
-		 * count to let userspace know that it got it's buffers
-		 * all wrong.
-		 */
-		if (input_event_from_user(buffer + bytes, &ev))
-			return -EFAULT;
-
-		if (!enable_hall_ic && ev.type == EV_SW) {
-			bytes += input_event_size();
-			continue;
-		}
-
-		input_event(udev->dev, ev.type, ev.code, ev.value);
-		bytes += input_event_size();
-	}
-
-	return bytes;
-}
-
-static ssize_t uinput_write(struct file *file, const char __user *buffer,
-			    size_t count, loff_t *ppos)
-{
-	struct uinput_device *udev = file->private_data;
-	int retval;
-
-	if (count == 0)
-		return 0;
-
-	retval = mutex_lock_interruptible(&udev->mutex);
-	if (retval)
-		return retval;
-
-	retval = udev->state == UIST_CREATED ?
-			uinput_inject_events(udev, buffer, count) :
-			uinput_setup_device(udev, buffer, count);
-
-	mutex_unlock(&udev->mutex);
-
-	return retval;
-}
-
-static bool uinput_fetch_next_event(struct uinput_device *udev,
-				    struct input_event *event)
-{
-	bool have_event;
-
-	spin_lock_irq(&udev->dev->event_lock);
-
-	have_event = udev->head != udev->tail;
-	if (have_event) {
-		*event = udev->buff[udev->tail];
-		udev->tail = (udev->tail + 1) % UINPUT_BUFFER_SIZE;
-	}
-
-	spin_unlock_irq(&udev->dev->event_lock);
-
-	return have_event;
-}
-
-static ssize_t uinput_events_to_user(struct uinput_device *udev,
-				     char __user *buffer, size_t count)
-{
-	struct input_event event;
-	size_t read = 0;
-
-	while (read + input_event_size() <= count &&
-	       uinput_fetch_next_event(udev, &event)) {
-
-		if (input_event_to_user(buffer + read, &event))
-			return -EFAULT;
-
-		read += input_event_size();
-	}
-
-	return read;
-}
-
-static ssize_t uinput_read(struct file *file, char __user *buffer,
-			   size_t count, loff_t *ppos)
-{
-	struct uinput_device *udev = file->private_data;
-	ssize_t retval;
-
-	if (count != 0 && count < input_event_size())
-		return -EINVAL;
-
-	do {
-		retval = mutex_lock_interruptible(&udev->mutex);
-		if (retval)
-			return retval;
-
-		if (udev->state != UIST_CREATED)
-			retval = -ENODEV;
-		else if (udev->head == udev->tail &&
-			 (file->f_flags & O_NONBLOCK))
-			retval = -EAGAIN;
-		else
-			retval = uinput_events_to_user(udev, buffer, count);
-
-		mutex_unlock(&udev->mutex);
-
-		if (retval || count == 0)
-			break;
-
-		if (!(file->f_flags & O_NONBLOCK))
-			retval = wait_event_interruptible(udev->waitq,
-						  udev->head != udev->tail ||
-						  udev->state != UIST_CREATED);
-	} while (retval == 0);
-
-	return retval;
-}
-
-static unsigned int uinput_poll(struct file *file, poll_table *wait)
-{
-	struct uinput_device *udev = file->private_data;
-
-	poll_wait(file, &udev->waitq, wait);
-
-	if (udev->head != udev->tail)
-		return POLLIN | POLLRDNORM;
-
-	return 0;
-}
-
-static int uinput_release(struct inode *inode, struct file *file)
-{
-	struct uinput_device *udev = file->private_data;
-
-	uinput_destroy_device(udev);
-	kfree(udev);
-
-	return 0;
-}
-
-#ifdef CONFIG_COMPAT
-struct uinput_ff_upload_compat {
-	__u32			request_id;
-	__s32			retval;
-	struct ff_effect_compat	effect;
-	struct ff_effect_compat	old;
-};
-
-static int uinput_ff_upload_to_user(char __user *buffer,
-				    const struct uinput_ff_upload *ff_up)
-{
-	if (INPUT_COMPAT_TEST) {
-		struct uinput_ff_upload_compat ff_up_compat;
-
-		ff_up_compat.request_id = ff_up->request_id;
-		ff_up_compat.retval = ff_up->retval;
-		/*
-		 * It so happens that the pointer that gives us the trouble
-		 * is the last field in the structure. Since we don't support
-		 * custom waveforms in uinput anyway we can just copy the whole
-		 * thing (to the compat size) and ignore the pointer.
-		 */
-		memcpy(&ff_up_compat.effect, &ff_up->effect,
-			sizeof(struct ff_effect_compat));
-		memcpy(&ff_up_compat.old, &ff_up->old,
-			sizeof(struct ff_effect_compat));
-
-		if (copy_to_user(buffer, &ff_up_compat,
-				 sizeof(struct uinput_ff_upload_compat)))
-			return -EFAULT;
-	} else {
-		if (copy_to_user(buffer, ff_up,
-				 sizeof(struct uinput_ff_upload)))
-			return -EFAULT;
-	}
-
-	return 0;
-}
-
-static int uinput_ff_upload_from_user(const char __user *buffer,
-				      struct uinput_ff_upload *ff_up)
-{
-	if (INPUT_COMPAT_TEST) {
-		struct uinput_ff_upload_compat ff_up_compat;
-
-		if (copy_from_user(&ff_up_compat, buffer,
-				   sizeof(struct uinput_ff_upload_compat)))
-			return -EFAULT;
-
-		ff_up->request_id = ff_up_compat.request_id;
-		ff_up->retval = ff_up_compat.retval;
-		memcpy(&ff_up->effect, &ff_up_compat.effect,
-			sizeof(struct ff_effect_compat));
-		memcpy(&ff_up->old, &ff_up_compat.old,
-			sizeof(struct ff_effect_compat));
-
-	} else {
-		if (copy_from_user(ff_up, buffer,
-				   sizeof(struct uinput_ff_upload)))
-			return -EFAULT;
-	}
-
-	return 0;
-}
-
-#else
-
-static int uinput_ff_upload_to_user(char __user *buffer,
-				    const struct uinput_ff_upload *ff_up)
-{
-	if (copy_to_user(buffer, ff_up, sizeof(struct uinput_ff_upload)))
-		return -EFAULT;
-
-	return 0;
-}
-
-static int uinput_ff_upload_from_user(const char __user *buffer,
-				      struct uinput_ff_upload *ff_up)
-{
-	if (copy_from_user(ff_up, buffer, sizeof(struct uinput_ff_upload)))
-		return -EFAULT;
-
-	return 0;
-}
-
-#endif
-
-#define uinput_set_bit(_arg, _bit, _max)		\
-({							\
-	int __ret = 0;					\
-	if (udev->state == UIST_CREATED)		\
-		__ret =  -EINVAL;			\
-	else if ((_arg) > (_max))			\
-		__ret = -EINVAL;			\
-	else set_bit((_arg), udev->dev->_bit);		\
-	__ret;						\
-})
-
-static int uinput_str_to_user(void __user *dest, const char *str,
-			      unsigned int maxlen)
-{
-	char __user *p = dest;
-	int len, ret;
-
-	if (!str)
-		return -ENOENT;
-
-	if (maxlen == 0)
-		return -EINVAL;
-
-	len = strlen(str) + 1;
-	if (len > maxlen)
-		len = maxlen;
-
-	ret = copy_to_user(p, str, len);
+	struct ib_device_attr *dev_attr;
+	int ret;
+
+	dev_attr = &device->dev_attr;
+	ret = isert_query_device(device->ib_device, dev_attr);
 	if (ret)
-		return -EFAULT;
+		return ret;
 
-	/* force terminating '\0' */
-	ret = put_user(0, p + len - 1);
-	return ret ? -EFAULT : len;
+	/* asign function handlers */
+	if (dev_attr->device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS &&
+	    dev_attr->device_cap_flags & IB_DEVICE_SIGNATURE_HANDOVER) {
+		device->use_fastreg = 1;
+		device->reg_rdma_mem = isert_reg_rdma;
+		device->unreg_rdma_mem = isert_unreg_rdma;
+	} else {
+		device->use_fastreg = 0;
+		device->reg_rdma_mem = isert_map_rdma;
+		device->unreg_rdma_mem = isert_unmap_cmd;
+	}
+
+	ret = isert_alloc_comps(device, dev_attr);
+	if (ret)
+		return ret;
+
+	device->pd = ib_alloc_pd(device->ib_device);
+	if (IS_ERR(device->pd)) {
+		ret = PTR_ERR(device->pd);
+		isert_err("failed to allocate pd, device %p, ret=%d\n",
+			  device, ret);
+		goto out_cq;
+	}
+
+	/* Check signature cap */
+	device->pi_capable = dev_attr->device_cap_flags &
+			     IB_DEVICE_SIGNATURE_HANDOVER ? true : false;
+
+	return 0;
+
+out_cq:
+	isert_free_comps(device);
+	return ret;
 }
 
-static long uinput_ioctl_handler(struct file *file, unsigned int cmd,
-				 unsigned long arg, void __user *p)
+static void
+isert_free_device_ib_res(struct isert_device *device)
 {
-	int			retval;
-	struct uinput_device	*udev = file->private_data;
-	struct uinput_ff_upload ff_up;
-	struct uinput_ff_erase  ff_erase;
-	struct uinput_request   *req;
-	char			*phys;
-	const char		*name;
-	unsigned int		size;
+	isert_info("device %p\n", device);
 
-	retval = mutex_lock_interruptible(&udev->mutex);
-	if (retval)
-		return retval;
+	ib_dealloc_pd(device->pd);
+	isert_free_comps(device);
+}
 
-	if (!udev->dev) {
-		retval = uinput_allocate_device(udev);
-		if (retval)
-			goto out;
+static void
+isert_device_put(struct isert_device *device)
+{
+	mutex_lock(&device_list_mutex);
+	device->refcount--;
+	isert_info("device %p refcount %d\n", device, device->refcount);
+	if (!device->refcount) {
+		isert_free_device_ib_res(device);
+		list_del(&device->dev_node);
+		kfree(device);
 	}
+	mutex_unlock(&device_list_mutex);
+}
 
-	switch (cmd) {
-		case UI_GET_VERSION:
-			if (put_user(UINPUT_VERSION,
-				     (unsigned int __user *)p))
-				retval = -EFAULT;
-			goto out;
+static struct isert_device *
+isert_device_get(struct rdma_cm_id *cma_id)
+{
+	struct isert_device *device;
+	int ret;
 
-		case UI_DEV_CREATE:
-			retval = uinput_create_device(udev);
-			goto out;
-
-		case UI_DEV_DESTROY:
-			uinput_destroy_device(udev);
-			goto out;
-
-		case UI_SET_EVBIT:
-			retval = uinput_set_bit(arg, evbit, EV_MAX);
-			goto out;
-
-		case UI_SET_KEYBIT:
-			retval = uinput_set_bit(arg, keybit, KEY_MAX);
-			goto out;
-
-		case UI_SET_RELBIT:
-			retval = uinput_set_bit(arg, relbit, REL_MAX);
-			goto out;
-
-		case UI_SET_ABSBIT:
-			retval = uinput_set_bit(arg, absbit, ABS_MAX);
-			goto out;
-
-		case UI_SET_MSCBIT:
-			retval = uinput_set_bit(arg, mscbit, MSC_MAX);
-			goto out;
-
-		case UI_SET_LEDBIT:
-			retval = uinput_set_bit(arg, ledbit, LED_MAX);
-			goto out;
-
-		case UI_SET_SNDBIT:
-			retval = uinput_set_bit(arg, sndbit, SND_MAX);
-			goto out;
-
-		case UI_SET_FFBIT:
-			retval = uinput_set_bit(arg, ffbit, FF_MAX);
-			goto out;
-
-		case UI_SET_SWBIT:
-			retval = uinput_set_bit(arg, swbit, SW_MAX);
-			goto out;
-
-		case UI_SET_PROPBIT:
-			retval = uinput_set_bit(arg, propbit, INPUT_PROP_MAX);
-			goto out;
-
-		case UI_SET_PHYS:
-			if (udev->state == UIST_CREATED) {
-				retval = -EINVAL;
-				goto out;
-			}
-
-			phys = strndup_user(p, 1024);
-			if (IS_ERR(phys)) {
-				retval = PTR_ERR(phys);
-				goto out;
-			}
-
-			kfree(udev->dev->phys);
-			udev->dev->phys = phys;
-			goto out;
-
-		case UI_BEGIN_FF_UPLOAD:
-			retval = uinput_ff_upload_from_user(p, &ff_up);
-			if (retval)
-				goto out;
-
-			req = uinput_request_find(udev, ff_up.request_id);
-			if (!req || req->code != UI_FF_UPLOAD ||
-			    !req->u.upload.effect) {
-				retval = -EINVAL;
-				goto out;
-			}
-
-			ff_up.retval = 0;
-			ff_up.effect = *req->u.upload.effect;
-			if (req->u.upload.old)
-				ff_up.old = *req->u.upload.old;
-			else
-				memset(&ff_up.old, 0, sizeof(struct ff_effect));
-
-			retval = uinput_ff_upload_to_user(p, &ff_up);
-			goto out;
-
-		case UI_BEGIN_FF_ERASE:
-			if (copy_from_user(&ff_erase, p, sizeof(ff_erase))) {
-				retval = -EFAULT;
-				goto out;
-			}
-
-			req = uinput_request_find(udev, ff_erase.request_id);
-			if (!req || req->code != UI_FF_ERASE) {
-				retval = -EINVAL;
-				goto out;
-			}
-
-			ff_erase.retval = 0;
-			ff_erase.effect_id = req->u.effect_id;
-			if (copy_to_user(p, &ff_erase, sizeof(ff_erase))) {
-				retval = -EFAULT;
-				goto out;
-			}
-
-			goto out;
-
-		case UI_END_FF_UPLOAD:
-			retval = uinput_ff_upload_from_user(p, &ff_up);
-			if (retval)
-				goto out;
-
-			req = uinput_request_find(udev, ff_up.request_id);
-			if (!req || req->code != UI_FF_UPLOAD ||
-			    !req->u.upload.effect) {
-				retval = -EINVAL;
-				goto out;
-			}
-
-			req->retval = ff_up.retval;
-			uinput_request_done(udev, req);
-			goto out;
-
-		case UI_END_FF_ERASE:
-			if (copy_from_user(&ff_erase, p, sizeof(ff_erase))) {
-				retval = -EFAULT;
-				goto out;
-			}
-
-			req = uinput_request_find(udev, ff_erase.request_id);
-			if (!req || req->code != UI_FF_ERASE) {
-				retval = -EINVAL;
-				goto out;
-			}
-
-			req->retval = ff_erase.retval;
-			uinput_request_done(udev, req);
-			goto out;
-	}
-
-	size = _IOC_SIZE(cmd);
-
-	/* Now check variable-length commands */
-	switch (cmd & ~IOCSIZE_MASK) {
-	case UI_GET_SYSNAME(0):
-		if (udev->state != UIST_CREATED) {
-			retval = -ENOENT;
-			goto out;
+	mutex_lock(&device_list_mutex);
+	list_for_each_entry(device, &device_list, dev_node) {
+		if (device->ib_device->node_guid == cma_id->device->node_guid) {
+			device->refcount++;
+			isert_info("Found iser device %p refcount %d\n",
+				   device, device->refcount);
+			mutex_unlock(&device_list_mutex);
+			return device;
 		}
-		name = dev_name(&udev->dev->dev);
-		retval = uinput_str_to_user(p, name, size);
+	}
+
+	device = kzalloc(sizeof(struct isert_device), GFP_KERNEL);
+	if (!device) {
+		mutex_unlock(&device_list_mutex);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	INIT_LIST_HEAD(&device->dev_node);
+
+	device->ib_device = cma_id->device;
+	ret = isert_create_device_ib_res(device);
+	if (ret) {
+		kfree(device);
+		mutex_unlock(&device_list_mutex);
+		return ERR_PTR(ret);
+	}
+
+	device->refcount++;
+	list_add_tail(&device->dev_node, &device_list);
+	isert_info("Created a new iser device %p refcount %d\n",
+		   device, device->refcount);
+	mutex_unlock(&device_list_mutex);
+
+	return device;
+}
+
+static void
+isert_conn_free_fastreg_pool(struct isert_conn *isert_conn)
+{
+	struct fast_reg_descriptor *fr_desc, *tmp;
+	int i = 0;
+
+	if (list_empty(&isert_conn->fr_pool))
+		return;
+
+	isert_info("Freeing conn %p fastreg pool", isert_conn);
+
+	list_for_each_entry_safe(fr_desc, tmp,
+				 &isert_conn->fr_pool, list) {
+		list_del(&fr_desc->list);
+		ib_dereg_mr(fr_desc->data_mr);
+		if (fr_desc->pi_ctx) {
+			ib_dereg_mr(fr_desc->pi_ctx->prot_mr);
+			ib_dereg_mr(fr_desc->pi_ctx->sig_mr);
+			kfree(fr_desc->pi_ctx);
+		}
+		kfree(fr_desc);
+		++i;
+	}
+
+	if (i < isert_conn->fr_pool_size)
+		isert_warn("Pool still has %d regions registered\n",
+			isert_conn->fr_pool_size - i);
+}
+
+static int
+isert_create_pi_ctx(struct fast_reg_descriptor *desc,
+		    struct ib_device *device,
+		    struct ib_pd *pd)
+{
+	struct pi_context *pi_ctx;
+	int ret;
+
+	pi_ctx = kzalloc(sizeof(*desc->pi_ctx), GFP_KERNEL);
+	if (!pi_ctx) {
+		isert_err("Failed to allocate pi context\n");
+		return -ENOMEM;
+	}
+
+	pi_ctx->prot_mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG,
+				      ISCSI_ISER_SG_TABLESIZE);
+	if (IS_ERR(pi_ctx->prot_mr)) {
+		isert_err("Failed to allocate prot frmr err=%ld\n",
+			  PTR_ERR(pi_ctx->prot_mr));
+		ret = PTR_ERR(pi_ctx->prot_mr);
+		goto err_pi_ctx;
+	}
+	desc->ind |= ISERT_PROT_KEY_VALID;
+
+	pi_ctx->sig_mr = ib_alloc_mr(pd, IB_MR_TYPE_SIGNATURE, 2);
+	if (IS_ERR(pi_ctx->sig_mr)) {
+		isert_err("Failed to allocate signature enabled mr err=%ld\n",
+			  PTR_ERR(pi_ctx->sig_mr));
+		ret = PTR_ERR(pi_ctx->sig_mr);
+		goto err_prot_mr;
+	}
+
+	desc->pi_ctx = pi_ctx;
+	desc->ind |= ISERT_SIG_KEY_VALID;
+	desc->ind &= ~ISERT_PROTECTED;
+
+	return 0;
+
+err_prot_mr:
+	ib_dereg_mr(pi_ctx->prot_mr);
+err_pi_ctx:
+	kfree(pi_ctx);
+
+	return ret;
+}
+
+static int
+isert_create_fr_desc(struct ib_device *ib_device, struct ib_pd *pd,
+		     struct fast_reg_descriptor *fr_desc)
+{
+	fr_desc->data_mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG,
+				       ISCSI_ISER_SG_TABLESIZE);
+	if (IS_ERR(fr_desc->data_mr)) {
+		isert_err("Failed to allocate data frmr err=%ld\n",
+			  PTR_ERR(fr_desc->data_mr));
+		return PTR_ERR(fr_desc->data_mr);
+	}
+	fr_desc->ind |= ISERT_DATA_KEY_VALID;
+
+	isert_dbg("Created fr_desc %p\n", fr_desc);
+
+	return 0;
+}
+
+static int
+isert_conn_create_fastreg_pool(struct isert_conn *isert_conn)
+{
+	struct fast_reg_descriptor *fr_desc;
+	struct isert_device *device = isert_conn->device;
+	struct se_session *se_sess = isert_conn->conn->sess->se_sess;
+	struct se_node_acl *se_nacl = se_sess->se_node_acl;
+	int i, ret, tag_num;
+	/*
+	 * Setup the number of FRMRs based upon the number of tags
+	 * available to session in iscsi_target_locate_portal().
+	 */
+	tag_num = max_t(u32, ISCSIT_MIN_TAGS, se_nacl->queue_depth);
+	tag_num = (tag_num * 2) + ISCSIT_EXTRA_TAGS;
+
+	isert_conn->fr_pool_size = 0;
+	for (i = 0; i < tag_num; i++) {
+		fr_desc = kzalloc(sizeof(*fr_desc), GFP_KERNEL);
+		if (!fr_desc) {
+			isert_err("Failed to allocate fast_reg descriptor\n");
+			ret = -ENOMEM;
+			goto err;
+		}
+
+		ret = isert_create_fr_desc(device->ib_device,
+					   device->pd, fr_desc);
+		if (ret) {
+			isert_err("Failed to create fastreg descriptor err=%d\n",
+			       ret);
+			kfree(fr_desc);
+			goto err;
+		}
+
+		list_add_tail(&fr_desc->list, &isert_conn->fr_pool);
+		isert_conn->fr_pool_size++;
+	}
+
+	isert_dbg("Creating conn %p fastreg pool size=%d",
+		 isert_conn, isert_conn->fr_pool_size);
+
+	return 0;
+
+err:
+	isert_conn_free_fastreg_pool(isert_conn);
+	return ret;
+}
+
+static void
+isert_init_conn(struct isert_conn *isert_conn)
+{
+	isert_conn->state = ISER_CONN_INIT;
+	INIT_LIST_HEAD(&isert_conn->node);
+	init_completion(&isert_conn->login_comp);
+	init_completion(&isert_conn->login_req_comp);
+	init_completion(&isert_conn->wait);
+	kref_init(&isert_conn->kref);
+	mutex_init(&isert_conn->mutex);
+	spin_lock_init(&isert_conn->pool_lock);
+	INIT_LIST_HEAD(&isert_conn->fr_pool);
+	INIT_WORK(&isert_conn->release_work, isert_release_work);
+}
+
+static void
+isert_free_login_buf(struct isert_conn *isert_conn)
+{
+	struct ib_device *ib_dev = isert_conn->device->ib_device;
+
+	ib_dma_unmap_single(ib_dev, isert_conn->login_rsp_dma,
+			    ISER_RX_LOGIN_SIZE, DMA_TO_DEVICE);
+	ib_dma_unmap_single(ib_dev, isert_conn->login_req_dma,
+			    ISCSI_DEF_MAX_RECV_SEG_LEN,
+			    DMA_FROM_DEVICE);
+	kfree(isert_conn->login_buf);
+}
+
+static int
+isert_alloc_login_buf(struct isert_conn *isert_conn,
+		      struct ib_device *ib_dev)
+{
+	int ret;
+
+	isert_conn->login_buf = kzalloc(ISCSI_DEF_MAX_RECV_SEG_LEN +
+					ISER_RX_LOGIN_SIZE, GFP_KERNEL);
+	if (!isert_conn->login_buf) {
+		isert_err("Unable to allocate isert_conn->login_buf\n");
+		return -ENOMEM;
+	}
+
+	isert_conn->login_req_buf = isert_conn->login_buf;
+	isert_conn->login_rsp_buf = isert_conn->login_buf +
+				    ISCSI_DEF_MAX_RECV_SEG_LEN;
+
+	isert_dbg("Set login_buf: %p login_req_buf: %p login_rsp_buf: %p\n",
+		 isert_conn->login_buf, isert_conn->login_req_buf,
+		 isert_conn->login_rsp_buf);
+
+	isert_conn->login_req_dma = ib_dma_map_single(ib_dev,
+				(void *)isert_conn->login_req_buf,
+				ISCSI_DEF_MAX_RECV_SEG_LEN, DMA_FROM_DEVICE);
+
+	ret = ib_dma_mapping_error(ib_dev, isert_conn->login_req_dma);
+	if (ret) {
+		isert_err("login_req_dma mapping error: %d\n", ret);
+		isert_conn->login_req_dma = 0;
+		goto out_login_buf;
+	}
+
+	isert_conn->login_rsp_dma = ib_dma_map_single(ib_dev,
+					(void *)isert_conn->login_rsp_buf,
+					ISER_RX_LOGIN_SIZE, DMA_TO_DEVICE);
+
+	ret = ib_dma_mapping_error(ib_dev, isert_conn->login_rsp_dma);
+	if (ret) {
+		isert_err("login_rsp_dma mapping error: %d\n", ret);
+		isert_conn->login_rsp_dma = 0;
+		goto out_req_dma_map;
+	}
+
+	return 0;
+
+out_req_dma_map:
+	ib_dma_unmap_single(ib_dev, isert_conn->login_req_dma,
+			    ISCSI_DEF_MAX_RECV_SEG_LEN, DMA_FROM_DEVICE);
+out_login_buf:
+	kfree(isert_conn->login_buf);
+	return ret;
+}
+
+static int
+isert_connect_request(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+{
+	struct isert_np *isert_np = cma_id->context;
+	struct iscsi_np *np = isert_np->np;
+	struct isert_conn *isert_conn;
+	struct isert_device *device;
+	int ret = 0;
+
+	spin_lock_bh(&np->np_thread_lock);
+	if (!np->enabled) {
+		spin_unlock_bh(&np->np_thread_lock);
+		isert_dbg("iscsi_np is not enabled, reject connect request\n");
+		return rdma_reject(cma_id, NULL, 0);
+	}
+	spin_unlock_bh(&np->np_thread_lock);
+
+	isert_dbg("cma_id: %p, portal: %p\n",
+		 cma_id, cma_id->context);
+
+	isert_conn = kzalloc(sizeof(struct isert_conn), GFP_KERNEL);
+	if (!isert_conn)
+		return -ENOMEM;
+
+	isert_init_conn(isert_conn);
+	isert_conn->cm_id = cma_id;
+
+	ret = isert_alloc_login_buf(isert_conn, cma_id->device);
+	if (ret)
 		goto out;
+
+	device = isert_device_get(cma_id);
+	if (IS_ERR(device)) {
+		ret = PTR_ERR(device);
+		goto out_rsp_dma_map;
+	}
+	isert_conn->device = device;
+
+	/* Set max inflight RDMA READ requests */
+	isert_conn->initiator_depth = min_t(u8,
+				event->param.conn.initiator_depth,
+				device->dev_attr.max_qp_init_rd_atom);
+	isert_dbg("Using initiator_depth: %u\n", isert_conn->initiator_depth);
+
+	ret = isert_conn_setup_qp(isert_conn, cma_id);
+	if (ret)
+		goto out_conn_dev;
+
+	ret = isert_rdma_post_recvl(isert_conn);
+	if (ret)
+		goto out_conn_dev;
+
+	ret = isert_rdma_accept(isert_conn);
+	if (ret)
+		goto out_conn_dev;
+
+	mutex_lock(&isert_np->mutex);
+	list_add_tail(&isert_conn->node, &isert_np->accepted);
+	mutex_unlock(&isert_np->mutex);
+
+	return 0;
+
+out_conn_dev:
+	isert_device_put(device);
+out_rsp_dma_map:
+	isert_free_login_buf(isert_conn);
+out:
+	kfree(isert_conn);
+	rdma_reject(cma_id, NULL, 0);
+	return ret;
+}
+
+static void
+isert_connect_release(struct isert_conn *isert_conn)
+{
+	struct isert_device *device = isert_conn->device;
+
+	isert_dbg("conn %p\n", isert_conn);
+
+	BUG_ON(!device);
+
+	if (device->use_fastreg)
+		isert_conn_free_fastreg_pool(isert_conn);
+
+	isert_free_rx_descriptors(isert_conn);
+	if (isert_conn->cm_id)
+		rdma_destroy_id(isert_conn->cm_id);
+
+	if (isert_conn->qp) {
+		struct isert_comp *comp = isert_conn->qp->recv_cq->cq_context;
+
+		isert_comp_put(comp);
+		ib_destroy_qp(isert_conn->qp);
 	}
 
-	retval = -EINVAL;
- out:
-	mutex_unlock(&udev->mutex);
-	return retval;
+	if (isert_conn->login_buf)
+		isert_free_login_buf(isert_conn);
+
+	isert_device_put(device);
+
+	kfree(isert_conn);
 }
 
-static long uinput_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static void
+isert_connected_handler(struct rdma_cm_id *cma_id)
 {
-	return uinput_ioctl_handler(file, cmd, arg, (void __user *)arg);
+	struct isert_conn *isert_conn = cma_id->qp->qp_context;
+	struct isert_np *isert_np = cma_id->context;
+
+	isert_info("conn %p\n", isert_conn);
+
+	mutex_lock(&isert_conn->mutex);
+	isert_conn->state = ISER_CONN_UP;
+	kref_get(&isert_conn->kref);
+	mutex_unlock(&isert_conn->mutex);
+
+	mutex_lock(&isert_np->mutex);
+	list_move_tail(&isert_conn->node, &isert_np->pending);
+	mutex_unlock(&isert_np->mutex);
+
+	isert_info("np %p: Allow accept_np to continue\n", isert_np);
+	up(&isert_np->sem);
 }
 
-#ifdef CONFIG_COMPAT
+static void
+isert_release_kref(struct kref *kref)
+{
+	struct isert_conn *isert_conn = container_of(kref,
+				struct isert_conn, kref);
 
-/*
- * These IOCTLs change their size and thus their numbers between
- * 32 and 64 bits.
+	isert_info("conn %p final kref %s/%d\n", isert_conn, current->comm,
+		   current->pid);
+
+	isert_connect_release(isert_conn);
+}
+
+static void
+isert_put_conn(struct isert_conn *isert_conn)
+{
+	kref_put(&isert_conn->kref, isert_release_kref);
+}
+
+static void
+isert_handle_unbound_conn(struct isert_conn *isert_conn)
+{
+	struct isert_np *isert_np = isert_conn->cm_id->context;
+
+	mutex_lock(&isert_np->mutex);
+	if (!list_empty(&isert_conn->node)) {
+		/*
+		 * This means iscsi doesn't know this connection
+		 * so schedule a cleanup ourselves
+		 */
+		list_del_init(&isert_conn->node);
+		isert_put_conn(isert_conn);
+		complete(&isert_conn->wait);
+		queue_work(isert_release_wq, &isert_conn->release_work);
+	}
+	mutex_unlock(&isert_np->mutex);
+}
+
+/**
+ * isert_conn_terminate() - Initiate connection termination
+ * @isert_conn: isert connection struct
+ *
+ * Notes:
+ * In case the connection state is BOUND, move state
+ * to TEMINATING and start teardown sequence (rdma_disconnect).
+ * In case the connection state is UP, complete flush as well.
+ *
+ * This routine must be called with mutex held. Thus it is
+ * safe to call multiple times.
  */
-#define UI_SET_PHYS_COMPAT		\
-	_IOW(UINPUT_IOCTL_BASE, 108, compat_uptr_t)
-#define UI_BEGIN_FF_UPLOAD_COMPAT	\
-	_IOWR(UINPUT_IOCTL_BASE, 200, struct uinput_ff_upload_compat)
-#define UI_END_FF_UPLOAD_COMPAT		\
-	_IOW(UINPUT_IOCTL_BASE, 201, struct uinput_ff_upload_compat)
-
-static long uinput_compat_ioctl(struct file *file,
-				unsigned int cmd, unsigned long arg)
+static void
+isert_conn_terminate(struct isert_conn *isert_conn)
 {
-	switch (cmd) {
-	case UI_SET_PHYS_COMPAT:
-		cmd = UI_SET_PHYS;
+	int err;
+
+	if (isert_conn->state >= ISER_CONN_TERMINATING)
+		return;
+
+	isert_info("Terminating conn %p state %d\n",
+		   isert_conn, isert_conn->state);
+	isert_conn->state = ISER_CONN_TERMINATING;
+	err = rdma_disconnect(isert_conn->cm_id);
+	if (err)
+		isert_warn("Failed rdma_disconnect isert_conn %p\n",
+			   isert_conn);
+
+	isert_info("conn %p completing wait\n", isert_conn);
+	complete(&isert_conn->wait);
+}
+
+static int
+isert_np_cma_handler(struct isert_np *isert_np,
+		     enum rdma_cm_event_type event)
+{
+	isert_dbg("%s (%d): isert np %p\n",
+		  rdma_event_msg(event), event, isert_np);
+
+	switch (event) {
+	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+		isert_np->cm_id = NULL;
 		break;
-	case UI_BEGIN_FF_UPLOAD_COMPAT:
-		cmd = UI_BEGIN_FF_UPLOAD;
+	case RDMA_CM_EVENT_ADDR_CHANGE:
+		isert_np->cm_id = isert_setup_id(isert_np);
+		if (IS_ERR(isert_np->cm_id)) {
+			isert_err("isert np %p setup id failed: %ld\n",
+				  isert_np, PTR_ERR(isert_np->cm_id));
+			isert_np->cm_id = NULL;
+		}
 		break;
-	case UI_END_FF_UPLOAD_COMPAT:
-		cmd = UI_END_FF_UPLOAD;
-		break;
+	default:
+		isert_err("isert np %p Unexpected event %d\n",
+			  isert_np, event);
 	}
 
-	return uinput_ioctl_handler(file, cmd, arg, compat_ptr(arg));
+	return -1;
 }
-#endif
 
-static const struct file_operations uinput_fops = {
-	.owner		= THIS_MODULE,
-	.open		= uinput_open,
-	.release	= uinput_release,
-	.read		= uinput_read,
-	.write		= uinput_write,
-	.poll		= uinput_poll,
-	.unlocked_ioctl	= uinput_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl	= uinput_compat_ioctl,
-#endif
-	.llseek		= no_llseek,
-};
-
-static struct miscdevice uinput_misc = {
-	.fops		= &uinput_fops,
-	.minor		= UINPUT_MINOR,
-	.name		= UINPUT_NAME,
-};
-MODULE_ALIAS_MISCDEV(UINPUT_MINOR);
-MODULE_ALIAS("devname:" UINPUT_NAME);
-
-static int __init uinput_init(void)
+static int
+isert_disconnected_handler(struct rdma_cm_id *cma_id,
+			   enum rdma_cm_event_type event)
 {
-	return misc_register(&uinput_misc);
-}
+	struct isert_conn *isert_conn = cma_id->qp->qp_context;
 
-static void __exit uinput_exit(void)
-{
-	misc_deregister(&uinput_misc);
-}
-
-MODULE_AUTHOR("Aristeu Sergio Rozanski Filho");
-MODULE_DESCRIPTION("User level driver support for input subsystem");
-MODULE_LICENSE("GPL");
-MODULE_VERSION("0.3");
-
-module_init(uinput_init);
-module_exit(uinput_exit);
+	mutex_lock(&isert_conn->mutex);
+	switch (isert_conn->state) {
+	case ISER_CONN_TERMINATING:
+		break;
+	case ISER_CONN_UP:
+		isert_conn_terminate(isert_conn);
+		isert_wait4flush(isert_conn);
+		isert_handle_unbound_conn(isert_conn);
+		break;
+	case ISER_CONN_BOUND:
+	case ISER_CONN_FULL_FEATURE: /* FALLTHRU */
+		iscsit_cause_

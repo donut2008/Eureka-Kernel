@@ -1,514 +1,428 @@
+pu_pte); /* PTE to map per-CPU area */
+DEFINE_PER_CPU(u64, ia64_mca_pal_pte);	    /* PTE to map PAL code */
+DEFINE_PER_CPU(u64, ia64_mca_pal_base);    /* vaddr PAL code granule */
+DEFINE_PER_CPU(u64, ia64_mca_tr_reload);   /* Flag for TR reload */
+
+unsigned long __per_cpu_mca[NR_CPUS];
+
+/* In mca_asm.S */
+extern void			ia64_os_init_dispatch_monarch (void);
+extern void			ia64_os_init_dispatch_slave (void);
+
+static int monarch_cpu = -1;
+
+static ia64_mc_info_t		ia64_mc_info;
+
+#define MAX_CPE_POLL_INTERVAL (15*60*HZ) /* 15 minutes */
+#define MIN_CPE_POLL_INTERVAL (2*60*HZ)  /* 2 minutes */
+#define CMC_POLL_INTERVAL     (1*60*HZ)  /* 1 minute */
+#define CPE_HISTORY_LENGTH    5
+#define CMC_HISTORY_LENGTH    5
+
+#ifdef CONFIG_ACPI
+static struct timer_list cpe_poll_timer;
+#endif
+static struct timer_list cmc_poll_timer;
 /*
- * S390 Version
- *   Copyright IBM Corp. 2002, 2011
- *   Author(s): Thomas Spatzier (tspat@de.ibm.com)
- *   Author(s): Mahesh Salgaonkar (mahesh@linux.vnet.ibm.com)
- *   Author(s): Heinz Graalfs (graalfs@linux.vnet.ibm.com)
- *   Author(s): Andreas Krebbel (krebbel@linux.vnet.ibm.com)
- *
- * @remark Copyright 2002-2011 OProfile authors
+ * This variable tells whether we are currently in polling mode.
+ * Start with this in the wrong state so we won't play w/ timers
+ * before the system is ready.
+ */
+static int cmc_polling_enabled = 1;
+
+/*
+ * Clearing this variable prevents CPE polling from getting activated
+ * in mca_late_init.  Use it if your system doesn't provide a CPEI,
+ * but encounters problems retrieving CPE logs.  This should only be
+ * necessary for debugging.
+ */
+static int cpe_poll_enabled = 1;
+
+extern void salinfo_log_wakeup(int type, u8 *buffer, u64 size, int irqsafe);
+
+static int mca_init __initdata;
+
+/*
+ * limited & delayed printing support for MCA/INIT handler
  */
 
-#include <linux/oprofile.h>
-#include <linux/perf_event.h>
-#include <linux/init.h>
-#include <linux/errno.h>
-#include <linux/fs.h>
-#include <linux/module.h>
-#include <asm/processor.h>
-#include <asm/perf_event.h>
+#define mprintk(fmt...) ia64_mca_printk(fmt)
 
-#include "../../../drivers/oprofile/oprof.h"
+#define MLOGBUF_SIZE (512+256*NR_CPUS)
+#define MLOGBUF_MSGMAX 256
+static char mlogbuf[MLOGBUF_SIZE];
+static DEFINE_SPINLOCK(mlogbuf_wlock);	/* mca context only */
+static DEFINE_SPINLOCK(mlogbuf_rlock);	/* normal context only */
+static unsigned long mlogbuf_start;
+static unsigned long mlogbuf_end;
+static unsigned int mlogbuf_finished = 0;
+static unsigned long mlogbuf_timestamp = 0;
 
-extern void s390_backtrace(struct pt_regs * const regs, unsigned int depth);
+static int loglevel_save = -1;
+#define BREAK_LOGLEVEL(__console_loglevel)		\
+	oops_in_progress = 1;				\
+	if (loglevel_save < 0)				\
+		loglevel_save = __console_loglevel;	\
+	__console_loglevel = 15;
 
-#include "hwsampler.h"
-#include "op_counter.h"
+#define RESTORE_LOGLEVEL(__console_loglevel)		\
+	if (loglevel_save >= 0) {			\
+		__console_loglevel = loglevel_save;	\
+		loglevel_save = -1;			\
+	}						\
+	mlogbuf_finished = 0;				\
+	oops_in_progress = 0;
 
-#define DEFAULT_INTERVAL	4127518
-
-#define DEFAULT_SDBT_BLOCKS	1
-#define DEFAULT_SDB_BLOCKS	511
-
-static unsigned long oprofile_hw_interval = DEFAULT_INTERVAL;
-static unsigned long oprofile_min_interval;
-static unsigned long oprofile_max_interval;
-
-static unsigned long oprofile_sdbt_blocks = DEFAULT_SDBT_BLOCKS;
-static unsigned long oprofile_sdb_blocks = DEFAULT_SDB_BLOCKS;
-
-static int hwsampler_enabled;
-static int hwsampler_running;	/* start_mutex must be held to change */
-static int hwsampler_available;
-
-static struct oprofile_operations timer_ops;
-
-struct op_counter_config counter_config;
-
-enum __force_cpu_type {
-	reserved = 0,		/* do not force */
-	timer,
-};
-static int force_cpu_type;
-
-static int set_cpu_type(const char *str, struct kernel_param *kp)
+/*
+ * Push messages into buffer, print them later if not urgent.
+ */
+void ia64_mca_printk(const char *fmt, ...)
 {
-	if (!strcmp(str, "timer")) {
-		force_cpu_type = timer;
-		printk(KERN_INFO "oprofile: forcing timer to be returned "
-		                 "as cpu type\n");
+	va_list args;
+	int printed_len;
+	char temp_buf[MLOGBUF_MSGMAX];
+	char *p;
+
+	va_start(args, fmt);
+	printed_len = vscnprintf(temp_buf, sizeof(temp_buf), fmt, args);
+	va_end(args);
+
+	/* Copy the output into mlogbuf */
+	if (oops_in_progress) {
+		/* mlogbuf was abandoned, use printk directly instead. */
+		printk("%s", temp_buf);
 	} else {
-		force_cpu_type = 0;
+		spin_lock(&mlogbuf_wlock);
+		for (p = temp_buf; *p; p++) {
+			unsigned long next = (mlogbuf_end + 1) % MLOGBUF_SIZE;
+			if (next != mlogbuf_start) {
+				mlogbuf[mlogbuf_end] = *p;
+				mlogbuf_end = next;
+			} else {
+				/* buffer full */
+				break;
+			}
+		}
+		mlogbuf[mlogbuf_end] = '\0';
+		spin_unlock(&mlogbuf_wlock);
 	}
-
-	return 0;
 }
-module_param_call(cpu_type, set_cpu_type, NULL, NULL, 0);
-MODULE_PARM_DESC(cpu_type, "Force legacy basic mode sampling"
-		           "(report cpu_type \"timer\"");
+EXPORT_SYMBOL(ia64_mca_printk);
 
-static int __oprofile_hwsampler_start(void)
+/*
+ * Print buffered messages.
+ *  NOTE: call this after returning normal context. (ex. from salinfod)
+ */
+void ia64_mlogbuf_dump(void)
 {
-	int retval;
+	char temp_buf[MLOGBUF_MSGMAX];
+	char *p;
+	unsigned long index;
+	unsigned long flags;
+	unsigned int printed_len;
 
-	retval = hwsampler_allocate(oprofile_sdbt_blocks, oprofile_sdb_blocks);
-	if (retval)
-		return retval;
+	/* Get output from mlogbuf */
+	while (mlogbuf_start != mlogbuf_end) {
+		temp_buf[0] = '\0';
+		p = temp_buf;
+		printed_len = 0;
 
-	retval = hwsampler_start_all(oprofile_hw_interval);
-	if (retval)
-		hwsampler_deallocate();
+		spin_lock_irqsave(&mlogbuf_rlock, flags);
 
-	return retval;
+		index = mlogbuf_start;
+		while (index != mlogbuf_end) {
+			*p = mlogbuf[index];
+			index = (index + 1) % MLOGBUF_SIZE;
+			if (!*p)
+				break;
+			p++;
+			if (++printed_len >= MLOGBUF_MSGMAX - 1)
+				break;
+		}
+		*p = '\0';
+		if (temp_buf[0])
+			printk("%s", temp_buf);
+		mlogbuf_start = index;
+
+		mlogbuf_timestamp = 0;
+		spin_unlock_irqrestore(&mlogbuf_rlock, flags);
+	}
+}
+EXPORT_SYMBOL(ia64_mlogbuf_dump);
+
+/*
+ * Call this if system is going to down or if immediate flushing messages to
+ * console is required. (ex. recovery was failed, crash dump is going to be
+ * invoked, long-wait rendezvous etc.)
+ *  NOTE: this should be called from monarch.
+ */
+static void ia64_mlogbuf_finish(int wait)
+{
+	BREAK_LOGLEVEL(console_loglevel);
+
+	spin_lock_init(&mlogbuf_rlock);
+	ia64_mlogbuf_dump();
+	printk(KERN_EMERG "mlogbuf_finish: printing switched to urgent mode, "
+		"MCA/INIT might be dodgy or fail.\n");
+
+	if (!wait)
+		return;
+
+	/* wait for console */
+	printk("Delaying for 5 seconds...\n");
+	udelay(5*1000000);
+
+	mlogbuf_finished = 1;
 }
 
-static int oprofile_hwsampler_start(void)
+/*
+ * Print buffered messages from INIT context.
+ */
+static void ia64_mlogbuf_dump_from_init(void)
 {
-	int retval;
+	if (mlogbuf_finished)
+		return;
 
-	hwsampler_running = hwsampler_enabled;
-
-	if (!hwsampler_running)
-		return timer_ops.start();
-
-	retval = perf_reserve_sampling();
-	if (retval)
-		return retval;
-
-	retval = __oprofile_hwsampler_start();
-	if (retval)
-		perf_release_sampling();
-
-	return retval;
-}
-
-static void oprofile_hwsampler_stop(void)
-{
-	if (!hwsampler_running) {
-		timer_ops.stop();
+	if (mlogbuf_timestamp &&
+			time_before(jiffies, mlogbuf_timestamp + 30 * HZ)) {
+		printk(KERN_ERR "INIT: mlogbuf_dump is interrupted by INIT "
+			" and the system seems to be messed up.\n");
+		ia64_mlogbuf_finish(0);
 		return;
 	}
 
-	hwsampler_stop_all();
-	hwsampler_deallocate();
-	perf_release_sampling();
-	return;
-}
-
-/*
- * File ops used for:
- * /dev/oprofile/0/enabled
- * /dev/oprofile/hwsampling/hwsampler  (cpu_type = timer)
- */
-
-static ssize_t hwsampler_read(struct file *file, char __user *buf,
-		size_t count, loff_t *offset)
-{
-	return oprofilefs_ulong_to_user(hwsampler_enabled, buf, count, offset);
-}
-
-static ssize_t hwsampler_write(struct file *file, char const __user *buf,
-		size_t count, loff_t *offset)
-{
-	unsigned long val;
-	int retval;
-
-	if (*offset)
-		return -EINVAL;
-
-	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval <= 0)
-		return retval;
-
-	if (val != 0 && val != 1)
-		return -EINVAL;
-
-	if (oprofile_started)
-		/*
-		 * save to do without locking as we set
-		 * hwsampler_running in start() when start_mutex is
-		 * held
-		 */
-		return -EBUSY;
-
-	hwsampler_enabled = val;
-
-	return count;
-}
-
-static const struct file_operations hwsampler_fops = {
-	.read		= hwsampler_read,
-	.write		= hwsampler_write,
-};
-
-/*
- * File ops used for:
- * /dev/oprofile/0/count
- * /dev/oprofile/hwsampling/hw_interval  (cpu_type = timer)
- *
- * Make sure that the value is within the hardware range.
- */
-
-static ssize_t hw_interval_read(struct file *file, char __user *buf,
-				size_t count, loff_t *offset)
-{
-	return oprofilefs_ulong_to_user(oprofile_hw_interval, buf,
-					count, offset);
-}
-
-static ssize_t hw_interval_write(struct file *file, char const __user *buf,
-				 size_t count, loff_t *offset)
-{
-	unsigned long val;
-	int retval;
-
-	if (*offset)
-		return -EINVAL;
-	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval <= 0)
-		return retval;
-	if (val < oprofile_min_interval)
-		oprofile_hw_interval = oprofile_min_interval;
-	else if (val > oprofile_max_interval)
-		oprofile_hw_interval = oprofile_max_interval;
-	else
-		oprofile_hw_interval = val;
-
-	return count;
-}
-
-static const struct file_operations hw_interval_fops = {
-	.read		= hw_interval_read,
-	.write		= hw_interval_write,
-};
-
-/*
- * File ops used for:
- * /dev/oprofile/0/event
- * Only a single event with number 0 is supported with this counter.
- *
- * /dev/oprofile/0/unit_mask
- * This is a dummy file needed by the user space tools.
- * No value other than 0 is accepted or returned.
- */
-
-static ssize_t hwsampler_zero_read(struct file *file, char __user *buf,
-				    size_t count, loff_t *offset)
-{
-	return oprofilefs_ulong_to_user(0, buf, count, offset);
-}
-
-static ssize_t hwsampler_zero_write(struct file *file, char const __user *buf,
-				     size_t count, loff_t *offset)
-{
-	unsigned long val;
-	int retval;
-
-	if (*offset)
-		return -EINVAL;
-
-	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval <= 0)
-		return retval;
-	if (val != 0)
-		return -EINVAL;
-	return count;
-}
-
-static const struct file_operations zero_fops = {
-	.read		= hwsampler_zero_read,
-	.write		= hwsampler_zero_write,
-};
-
-/* /dev/oprofile/0/kernel file ops.  */
-
-static ssize_t hwsampler_kernel_read(struct file *file, char __user *buf,
-				     size_t count, loff_t *offset)
-{
-	return oprofilefs_ulong_to_user(counter_config.kernel,
-					buf, count, offset);
-}
-
-static ssize_t hwsampler_kernel_write(struct file *file, char const __user *buf,
-				      size_t count, loff_t *offset)
-{
-	unsigned long val;
-	int retval;
-
-	if (*offset)
-		return -EINVAL;
-
-	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval <= 0)
-		return retval;
-
-	if (val != 0 && val != 1)
-		return -EINVAL;
-
-	counter_config.kernel = val;
-
-	return count;
-}
-
-static const struct file_operations kernel_fops = {
-	.read		= hwsampler_kernel_read,
-	.write		= hwsampler_kernel_write,
-};
-
-/* /dev/oprofile/0/user file ops. */
-
-static ssize_t hwsampler_user_read(struct file *file, char __user *buf,
-				   size_t count, loff_t *offset)
-{
-	return oprofilefs_ulong_to_user(counter_config.user,
-					buf, count, offset);
-}
-
-static ssize_t hwsampler_user_write(struct file *file, char const __user *buf,
-				    size_t count, loff_t *offset)
-{
-	unsigned long val;
-	int retval;
-
-	if (*offset)
-		return -EINVAL;
-
-	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval <= 0)
-		return retval;
-
-	if (val != 0 && val != 1)
-		return -EINVAL;
-
-	counter_config.user = val;
-
-	return count;
-}
-
-static const struct file_operations user_fops = {
-	.read		= hwsampler_user_read,
-	.write		= hwsampler_user_write,
-};
-
-
-/*
- * File ops used for: /dev/oprofile/timer/enabled
- * The value always has to be the inverted value of hwsampler_enabled. So
- * no separate variable is created. That way we do not need locking.
- */
-
-static ssize_t timer_enabled_read(struct file *file, char __user *buf,
-				  size_t count, loff_t *offset)
-{
-	return oprofilefs_ulong_to_user(!hwsampler_enabled, buf, count, offset);
-}
-
-static ssize_t timer_enabled_write(struct file *file, char const __user *buf,
-				   size_t count, loff_t *offset)
-{
-	unsigned long val;
-	int retval;
-
-	if (*offset)
-		return -EINVAL;
-
-	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval <= 0)
-		return retval;
-
-	if (val != 0 && val != 1)
-		return -EINVAL;
-
-	/* Timer cannot be disabled without having hardware sampling.  */
-	if (val == 0 && !hwsampler_available)
-		return -EINVAL;
-
-	if (oprofile_started)
-		/*
-		 * save to do without locking as we set
-		 * hwsampler_running in start() when start_mutex is
-		 * held
-		 */
-		return -EBUSY;
-
-	hwsampler_enabled = !val;
-
-	return count;
-}
-
-static const struct file_operations timer_enabled_fops = {
-	.read		= timer_enabled_read,
-	.write		= timer_enabled_write,
-};
-
-
-static int oprofile_create_hwsampling_files(struct dentry *root)
-{
-	struct dentry *dir;
-
-	dir = oprofilefs_mkdir(root, "timer");
-	if (!dir)
-		return -EINVAL;
-
-	oprofilefs_create_file(dir, "enabled", &timer_enabled_fops);
-
-	if (!hwsampler_available)
-		return 0;
-
-	/* reinitialize default values */
-	hwsampler_enabled = 1;
-	counter_config.kernel = 1;
-	counter_config.user = 1;
-
-	if (!force_cpu_type) {
-		/*
-		 * Create the counter file system.  A single virtual
-		 * counter is created which can be used to
-		 * enable/disable hardware sampling dynamically from
-		 * user space.  The user space will configure a single
-		 * counter with a single event.  The value of 'event'
-		 * and 'unit_mask' are not evaluated by the kernel code
-		 * and can only be set to 0.
-		 */
-
-		dir = oprofilefs_mkdir(root, "0");
-		if (!dir)
-			return -EINVAL;
-
-		oprofilefs_create_file(dir, "enabled", &hwsampler_fops);
-		oprofilefs_create_file(dir, "event", &zero_fops);
-		oprofilefs_create_file(dir, "count", &hw_interval_fops);
-		oprofilefs_create_file(dir, "unit_mask", &zero_fops);
-		oprofilefs_create_file(dir, "kernel", &kernel_fops);
-		oprofilefs_create_file(dir, "user", &user_fops);
-		oprofilefs_create_ulong(dir, "hw_sdbt_blocks",
-					&oprofile_sdbt_blocks);
-
-	} else {
-		/*
-		 * Hardware sampling can be used but the cpu_type is
-		 * forced to timer in order to deal with legacy user
-		 * space tools.  The /dev/oprofile/hwsampling fs is
-		 * provided in that case.
-		 */
-		dir = oprofilefs_mkdir(root, "hwsampling");
-		if (!dir)
-			return -EINVAL;
-
-		oprofilefs_create_file(dir, "hwsampler",
-				       &hwsampler_fops);
-		oprofilefs_create_file(dir, "hw_interval",
-				       &hw_interval_fops);
-		oprofilefs_create_ro_ulong(dir, "hw_min_interval",
-					   &oprofile_min_interval);
-		oprofilefs_create_ro_ulong(dir, "hw_max_interval",
-					   &oprofile_max_interval);
-		oprofilefs_create_ulong(dir, "hw_sdbt_blocks",
-					&oprofile_sdbt_blocks);
+	if (!spin_trylock(&mlogbuf_rlock)) {
+		printk(KERN_ERR "INIT: mlogbuf_dump is interrupted by INIT. "
+			"Generated messages other than stack dump will be "
+			"buffered to mlogbuf and will be printed later.\n");
+		printk(KERN_ERR "INIT: If messages would not printed after "
+			"this INIT, wait 30sec and assert INIT again.\n");
+		if (!mlogbuf_timestamp)
+			mlogbuf_timestamp = jiffies;
+		return;
 	}
-	return 0;
+	spin_unlock(&mlogbuf_rlock);
+	ia64_mlogbuf_dump();
 }
 
-static int oprofile_hwsampler_init(struct oprofile_operations *ops)
+static void inline
+ia64_mca_spin(const char *func)
 {
-	/*
-	 * Initialize the timer mode infrastructure as well in order
-	 * to be able to switch back dynamically.  oprofile_timer_init
-	 * is not supposed to fail.
-	 */
-	if (oprofile_timer_init(ops))
-		BUG();
+	if (monarch_cpu == smp_processor_id())
+		ia64_mlogbuf_finish(0);
+	mprintk(KERN_EMERG "%s: spinning here, not returning to SAL\n", func);
+	while (1)
+		cpu_relax();
+}
+/*
+ * IA64_MCA log support
+ */
+#define IA64_MAX_LOGS		2	/* Double-buffering for nested MCAs */
+#define IA64_MAX_LOG_TYPES      4   /* MCA, INIT, CMC, CPE */
 
-	memcpy(&timer_ops, ops, sizeof(timer_ops));
-	ops->create_files = oprofile_create_hwsampling_files;
+typedef struct ia64_state_log_s
+{
+	spinlock_t	isl_lock;
+	int		isl_index;
+	unsigned long	isl_count;
+	ia64_err_rec_t  *isl_log[IA64_MAX_LOGS]; /* need space to store header + error log */
+} ia64_state_log_t;
 
-	/*
-	 * If the user space tools do not support newer cpu types,
-	 * the force_cpu_type module parameter
-	 * can be used to always return \"timer\" as cpu type.
-	 */
-	if (force_cpu_type != timer) {
-		struct cpuid id;
+static ia64_state_log_t ia64_state_log[IA64_MAX_LOG_TYPES];
 
-		get_cpu_id (&id);
+#define IA64_LOG_ALLOCATE(it, size) \
+	{ia64_state_log[it].isl_log[IA64_LOG_CURR_INDEX(it)] = \
+		(ia64_err_rec_t *)alloc_bootmem(size); \
+	ia64_state_log[it].isl_log[IA64_LOG_NEXT_INDEX(it)] = \
+		(ia64_err_rec_t *)alloc_bootmem(size);}
+#define IA64_LOG_LOCK_INIT(it) spin_lock_init(&ia64_state_log[it].isl_lock)
+#define IA64_LOG_LOCK(it)      spin_lock_irqsave(&ia64_state_log[it].isl_lock, s)
+#define IA64_LOG_UNLOCK(it)    spin_unlock_irqrestore(&ia64_state_log[it].isl_lock,s)
+#define IA64_LOG_NEXT_INDEX(it)    ia64_state_log[it].isl_index
+#define IA64_LOG_CURR_INDEX(it)    1 - ia64_state_log[it].isl_index
+#define IA64_LOG_INDEX_INC(it) \
+    {ia64_state_log[it].isl_index = 1 - ia64_state_log[it].isl_index; \
+    ia64_state_log[it].isl_count++;}
+#define IA64_LOG_INDEX_DEC(it) \
+    ia64_state_log[it].isl_index = 1 - ia64_state_log[it].isl_index
+#define IA64_LOG_NEXT_BUFFER(it)   (void *)((ia64_state_log[it].isl_log[IA64_LOG_NEXT_INDEX(it)]))
+#define IA64_LOG_CURR_BUFFER(it)   (void *)((ia64_state_log[it].isl_log[IA64_LOG_CURR_INDEX(it)]))
+#define IA64_LOG_COUNT(it)         ia64_state_log[it].isl_count
 
-		switch (id.machine) {
-		case 0x2097: case 0x2098: ops->cpu_type = "s390/z10"; break;
-		case 0x2817: case 0x2818: ops->cpu_type = "s390/z196"; break;
-		case 0x2827: case 0x2828: ops->cpu_type = "s390/zEC12"; break;
-		default: return -ENODEV;
+/*
+ * ia64_log_init
+ *	Reset the OS ia64 log buffer
+ * Inputs   :   info_type   (SAL_INFO_TYPE_{MCA,INIT,CMC,CPE})
+ * Outputs	:	None
+ */
+static void __init
+ia64_log_init(int sal_info_type)
+{
+	u64	max_size = 0;
+
+	IA64_LOG_NEXT_INDEX(sal_info_type) = 0;
+	IA64_LOG_LOCK_INIT(sal_info_type);
+
+	// SAL will tell us the maximum size of any error record of this type
+	max_size = ia64_sal_get_state_info_size(sal_info_type);
+	if (!max_size)
+		/* alloc_bootmem() doesn't like zero-sized allocations! */
+		return;
+
+	// set up OS data structures to hold error info
+	IA64_LOG_ALLOCATE(sal_info_type, max_size);
+	memset(IA64_LOG_CURR_BUFFER(sal_info_type), 0, max_size);
+	memset(IA64_LOG_NEXT_BUFFER(sal_info_type), 0, max_size);
+}
+
+/*
+ * ia64_log_get
+ *
+ *	Get the current MCA log from SAL and copy it into the OS log buffer.
+ *
+ *  Inputs  :   info_type   (SAL_INFO_TYPE_{MCA,INIT,CMC,CPE})
+ *              irq_safe    whether you can use printk at this point
+ *  Outputs :   size        (total record length)
+ *              *buffer     (ptr to error record)
+ *
+ */
+static u64
+ia64_log_get(int sal_info_type, u8 **buffer, int irq_safe)
+{
+	sal_log_record_header_t     *log_buffer;
+	u64                         total_len = 0;
+	unsigned long               s;
+
+	IA64_LOG_LOCK(sal_info_type);
+
+	/* Get the process state information */
+	log_buffer = IA64_LOG_NEXT_BUFFER(sal_info_type);
+
+	total_len = ia64_sal_get_state_info(sal_info_type, (u64 *)log_buffer);
+
+	if (total_len) {
+		IA64_LOG_INDEX_INC(sal_info_type);
+		IA64_LOG_UNLOCK(sal_info_type);
+		if (irq_safe) {
+			IA64_MCA_DEBUG("%s: SAL error record type %d retrieved. Record length = %ld\n",
+				       __func__, sal_info_type, total_len);
 		}
+		*buffer = (u8 *) log_buffer;
+		return total_len;
+	} else {
+		IA64_LOG_UNLOCK(sal_info_type);
+		return 0;
 	}
-
-	if (hwsampler_setup())
-		return -ENODEV;
-
-	/*
-	 * Query the range for the sampling interval from the
-	 * hardware.
-	 */
-	oprofile_min_interval = hwsampler_query_min_interval();
-	if (oprofile_min_interval == 0)
-		return -ENODEV;
-	oprofile_max_interval = hwsampler_query_max_interval();
-	if (oprofile_max_interval == 0)
-		return -ENODEV;
-
-	/* The initial value should be sane */
-	if (oprofile_hw_interval < oprofile_min_interval)
-		oprofile_hw_interval = oprofile_min_interval;
-	if (oprofile_hw_interval > oprofile_max_interval)
-		oprofile_hw_interval = oprofile_max_interval;
-
-	printk(KERN_INFO "oprofile: System z hardware sampling "
-	       "facility found.\n");
-
-	ops->start = oprofile_hwsampler_start;
-	ops->stop = oprofile_hwsampler_stop;
-
-	return 0;
 }
 
-static void oprofile_hwsampler_exit(void)
+/*
+ *  ia64_mca_log_sal_error_record
+ *
+ *  This function retrieves a specified error record type from SAL
+ *  and wakes up any processes waiting for error records.
+ *
+ *  Inputs  :   sal_info_type   (Type of error record MCA/CMC/CPE)
+ *              FIXME: remove MCA and irq_safe.
+ */
+static void
+ia64_mca_log_sal_error_record(int sal_info_type)
 {
-	hwsampler_shutdown();
+	u8 *buffer;
+	sal_log_record_header_t *rh;
+	u64 size;
+	int irq_safe = sal_info_type != SAL_INFO_TYPE_MCA;
+#ifdef IA64_MCA_DEBUG_INFO
+	static const char * const rec_name[] = { "MCA", "INIT", "CMC", "CPE" };
+#endif
+
+	size = ia64_log_get(sal_info_type, &buffer, irq_safe);
+	if (!size)
+		return;
+
+	salinfo_log_wakeup(sal_info_type, buffer, size, irq_safe);
+
+	if (irq_safe)
+		IA64_MCA_DEBUG("CPU %d: SAL log contains %s error record\n",
+			smp_processor_id(),
+			sal_info_type < ARRAY_SIZE(rec_name) ? rec_name[sal_info_type] : "UNKNOWN");
+
+	/* Clear logs from corrected errors in case there's no user-level logger */
+	rh = (sal_log_record_header_t *)buffer;
+	if (rh->severity == sal_log_severity_corrected)
+		ia64_sal_clear_state_info(sal_info_type);
 }
 
-int __init oprofile_arch_init(struct oprofile_operations *ops)
+/*
+ * search_mca_table
+ *  See if the MCA surfaced in an instruction range
+ *  that has been tagged as recoverable.
+ *
+ *  Inputs
+ *	first	First address range to check
+ *	last	Last address range to check
+ *	ip	Instruction pointer, address we are looking for
+ *
+ * Return value:
+ *      1 on Success (in the table)/ 0 on Failure (not in the  table)
+ */
+int
+search_mca_table (const struct mca_table_entry *first,
+                const struct mca_table_entry *last,
+                unsigned long ip)
 {
-	ops->backtrace = s390_backtrace;
+        const struct mca_table_entry *curr;
+        u64 curr_start, curr_end;
 
-	/*
-	 * -ENODEV is not reported to the caller.  The module itself
-         * will use the timer mode sampling as fallback and this is
-         * always available.
-	 */
-	hwsampler_available = oprofile_hwsampler_init(ops) == 0;
+        curr = first;
+        while (curr <= last) {
+                curr_start = (u64) &curr->start_addr + curr->start_addr;
+                curr_end = (u64) &curr->end_addr + curr->end_addr;
 
-	return 0;
+                if ((ip >= curr_start) && (ip <= curr_end)) {
+                        return 1;
+                }
+                curr++;
+        }
+        return 0;
 }
 
-void oprofile_arch_exit(void)
+/* Given an address, look for it in the mca tables. */
+int mca_recover_range(unsigned long addr)
 {
-	oprofile_hwsampler_exit();
+	extern struct mca_table_entry __start___mca_table[];
+	extern struct mca_table_entry __stop___mca_table[];
+
+	return search_mca_table(__start___mca_table, __stop___mca_table-1, addr);
 }
+EXPORT_SYMBOL_GPL(mca_recover_range);
+
+#ifdef CONFIG_ACPI
+
+int cpe_vector = -1;
+int ia64_cpe_irq = -1;
+
+static irqreturn_t
+ia64_mca_cpe_int_handler (int cpe_irq, void *arg)
+{
+	static unsigned long	cpe_history[CPE_HISTORY_LENGTH];
+	static int		index;
+	static DEFINE_SPINLOCK(cpe_history_lock);
+
+	IA64_MCA_DEBUG("%s: received interrupt vector = %#x on CPU %d\n",
+		       __func__, cpe_irq, smp_processor_id());
+
+	/* SAL spec states this should run w/ interrupts enabled */
+	local_irq_enable();
+
+	spin_lock(&cpe_history_lock);
+	if (!cpe_poll_enabled && cpe_vector >= 0) {
+
+		int i, count = 1; /* we know 1 happened now */
+		unsigned long now = jiffies;
+
+		for (i = 0; i < CPE_HISTORY_LENGTH; i++) {
+			if (now - cpe_history[i] <= HZ)
+				count++;
+		}
+
+		IA64_MCA_DEBUG(KERN_INFO "CPE threshold %d/%

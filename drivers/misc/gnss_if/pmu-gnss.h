@@ -1,99 +1,53 @@
-/*
- * Copyright (c) 2015 Samsung Electronics Co., Ltd.
- *		http://www.samsung.com/
- *
- * EXYNOS - PMU(Power Management Unit) support
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
-*/
-
-#ifndef __EXYNOS_PMU_GNSS_H
-#define __EXYNOS_PMU_GNSS_H __FILE__
-
-/* BLK_ALIVE: GNSS related SFRs */
-#define EXYNOS_PMU_GNSS_CTRL_NS			0x0040
-#define EXYNOS_PMU_GNSS_CTRL_S			0x0044
-#define EXYNOS_PMU_GNSS_STAT			0x0048
-#define EXYNOS_PMU_GNSS_DEBUG			0x004C
-#define EXYNOS_PMU_GNSS2AP_MEM_CONFIG0		0x7250 /* GNSS_MEM_SIZE0 */
-#define EXYNOS_PMU_GNSS2AP_MEM_CONFIG1		0x7254 /* GNSS_MEM_BA0 */
-#define EXYNOS_PMU_GNSS2AP_MIF_ACCESS_WIN0	0X7260
-#define EXYNOS_PMU_GNSS2AP_PERI_ACCESS_WIN0	0x7278
-#define EXYNOS_PMU_GNSS2AP_PERI_ACCESS_WIN1	0x727C
-#define EXYNOS_PMU_GNSS_BOOT_TEST_RST_CONFIG	0x7290
-
-#define EXYNOS_PMU_CENTRAL_SEQ_GNSS_CONFIGURATION	0x02C0
-#define EXYNOS_PMU_RESET_AHEAD_GNSS_SYS_PWR_REG	0x1340
-#define EXYNOS_PMU_CLEANY_BUS_SYS_PWR_REG	0x1344
-#define EXYNOS_PMU_LOGIC_RESET_GNSS_SYS_PWR_REG	0x1348
-#define EXYNOS_PMU_TCXO_GATE_GNSS_SYS_PWR_REG	0x134C
-#define EXYNOS_PMU_GNSS_DISABLE_ISO_SYS_PWR_REG	0X1350
-#define EXYNOS_PMU_GNSS_RESET_ISO_SYS_PWR_REG	0X1354
-
-/* GNSS PMU */
-/* For EXYNOS_PMU_GNSS_CTRL Register */
-#define GNSS_PWRON		BIT(1)
-#define GNSS_RESET_SET		BIT(2)
-#define GNSS_START		BIT(3)
-#define GNSS_ACTIVE_REQ_EN	BIT(5)
-#define GNSS_ACTIVE_REQ_CLR	BIT(6)
-#define GNSS_RESET_REQ_EN	BIT(7)
-#define GNSS_RESET_REQ_CLR	BIT(8)
-#define MASK_GNSS_PWRDN_DONE	BIT(9)
-#define RTC_OUT_EN		BIT(10)
-#define TCXO_ENABLE_SW		BIT(11)
-#define MASK_SLEEP_START_REQ	BIT(12)
-#define SET_SW_SLEEP_START_REQ	BIT(13)
-#define GNSS_WAKEUP_REQ_EN	BIT(14)
-#define GNSS_WAKEUP_REQ_CLR	BIT(15)
-#define CLEANY_BYPASS_END	BIT(16)
-#define SFR_SERIALIZER_DUR_DATA2REQ	GENMASK(21,20)
-
-#define MEMSIZE_MASK	(GENMASK(19, 0))
-#define MEMSIZE_OFFSET	0
-#define MEMSIZE_RES	(SZ_4K)
-
-#define MEMBASE_ADDR_SHIFT	12
-#define MEMBASE_ADDR_MASK	(GENMASK(23, 0))
-#define MEMBASE_ADDR_OFFSET	0
-
-#ifndef CONFIG_ARCH_EXYNOS
-/* Exynos PMU API functions are only available when ARCH_EXYNOS is defined.
- * Otherwise, we must hardcode the PMU address for setting the PMU registers.
- */
-#define USE_IOREMAP_NOPMU
-#endif
-
-enum gnss_mode {
-	GNSS_POWER_OFF,
-	GNSS_POWER_ON,
-	GNSS_RESET,
-	NUM_GNSS_MODE,
-};
-
-enum gnss_int_clear {
-	GNSS_INT_WDT_RESET_CLEAR,
-	GNSS_INT_ACTIVE_CLEAR,
-	GNSS_INT_WAKEUP_CLEAR,
-};
-
-enum gnss_tcxo_mode {
-	TCXO_SHARED_MODE = 0,
-	TCXO_NON_SHARED_MODE = 1,
-};
-
-struct gnss_ctl;
-
-struct gnssctl_pmu_ops {
-	int (*init_conf)(struct gnss_ctl *);
-	int (*hold_reset)(void);
-	int (*release_reset)(void);
-	int (*power_on)(enum gnss_mode);
-	int (*clear_int)(enum gnss_int_clear);
-	int (*change_tcxo_mode)(enum gnss_tcxo_mode);
-};
-
-void gnss_get_pmu_ops(struct gnss_ctl *);
-#endif /* __EXYNOS_PMU_GNSS_H */
+         = 0xdd,
+	DBG_BLOCK_ID_UNUSED49                            = 0xde,
+	DBG_BLOCK_ID_UNUSED50                            = 0xdf,
+	DBG_BLOCK_ID_MCD0                                = 0xe0,
+	DBG_BLOCK_ID_MCD1                                = 0xe1,
+	DBG_BLOCK_ID_MCD2                                = 0xe2,
+	DBG_BLOCK_ID_MCD3                                = 0xe3,
+	DBG_BLOCK_ID_MCD4                                = 0xe4,
+	DBG_BLOCK_ID_MCD5                                = 0xe5,
+	DBG_BLOCK_ID_UNUSED51                            = 0xe6,
+	DBG_BLOCK_ID_UNUSED52                            = 0xe7,
+} DebugBlockId_OLD;
+typedef enum DebugBlockId_BY2 {
+	DBG_BLOCK_ID_RESERVED_BY2                        = 0x0,
+	DBG_BLOCK_ID_VMC_BY2                             = 0x1,
+	DBG_BLOCK_ID_CG_BY2                              = 0x2,
+	DBG_BLOCK_ID_GRBM_BY2                            = 0x3,
+	DBG_BLOCK_ID_CSC_BY2                             = 0x4,
+	DBG_BLOCK_ID_IH_BY2                              = 0x5,
+	DBG_BLOCK_ID_SQ_BY2                              = 0x6,
+	DBG_BLOCK_ID_GMCON_BY2                           = 0x7,
+	DBG_BLOCK_ID_DMA0_BY2                            = 0x8,
+	DBG_BLOCK_ID_SPIM_BY2                            = 0x9,
+	DBG_BLOCK_ID_SPIS_BY2                            = 0xa,
+	DBG_BLOCK_ID_PA0_BY2                             = 0xb,
+	DBG_BLOCK_ID_CP0_BY2                             = 0xc,
+	DBG_BLOCK_ID_CP2_BY2                             = 0xd,
+	DBG_BLOCK_ID_UVDU_BY2                            = 0xe,
+	DBG_BLOCK_ID_VCE_BY2                             = 0xf,
+	DBG_BLOCK_ID_VGT0_BY2                            = 0x10,
+	DBG_BLOCK_ID_IA_BY2                              = 0x11,
+	DBG_BLOCK_ID_SCT0_BY2                            = 0x12,
+	DBG_BLOCK_ID_SPM0_BY2                            = 0x13,
+	DBG_BLOCK_ID_TCAA_BY2                            = 0x14,
+	DBG_BLOCK_ID_TCCA_BY2                            = 0x15,
+	DBG_BLOCK_ID_MCC0_BY2                            = 0x16,
+	DBG_BLOCK_ID_MCC2_BY2                            = 0x17,
+	DBG_BLOCK_ID_SX0_BY2                             = 0x18,
+	DBG_BLOCK_ID_SX2_BY2                             = 0x19,
+	DBG_BLOCK_ID_UNUSED4_BY2                         = 0x1a,
+	DBG_BLOCK_ID_UNUSED6_BY2                         = 0x1b,
+	DBG_BLOCK_ID_PC0_BY2                             = 0x1c,
+	DBG_BLOCK_ID_UNUSED8_BY2                         = 0x1d,
+	DBG_BLOCK_ID_UNUSED10_BY2                        = 0x1e,
+	DBG_BLOCK_ID_MCB_BY2                             = 0x1f,
+	DBG_BLOCK_ID_SCB0_BY2                            = 0x20,
+	DBG_BLOCK_ID_UNUSED13_BY2                        = 0x21,
+	DBG_BLOCK_ID_SCF0_BY2                            = 0x22,
+	DBG_BLOCK_ID_UNUSED15_BY2                        = 0x23,
+	DBG_BLOCK_ID_BCI0_BY2                            = 0x24,
+	DBG_BLOCK_ID_BCI2_BY2                            = 0x25,
+	DBG_BLOCK_ID_UNUSED17_BY2                        = 0x26,
+	DBG_BLOCK_ID_UNUSED19_B

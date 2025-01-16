@@ -1,106 +1,85 @@
+#ifndef _ASM_IA64_SPINLOCK_H
+#define _ASM_IA64_SPINLOCK_H
+
 /*
- * Jump label s390 support
+ * Copyright (C) 1998-2003 Hewlett-Packard Co
+ *	David Mosberger-Tang <davidm@hpl.hp.com>
+ * Copyright (C) 1999 Walt Drummond <drummond@valinux.com>
  *
- * Copyright IBM Corp. 2011
- * Author(s): Jan Glauber <jang@linux.vnet.ibm.com>
+ * This file is used for SMP configurations only.
  */
-#include <linux/module.h>
-#include <linux/uaccess.h>
-#include <linux/stop_machine.h>
-#include <linux/jump_label.h>
-#include <asm/ipl.h>
 
-#ifdef HAVE_JUMP_LABEL
+#include <linux/compiler.h>
+#include <linux/kernel.h>
+#include <linux/bitops.h>
 
-struct insn {
-	u16 opcode;
-	s32 offset;
-} __packed;
+#include <linux/atomic.h>
+#include <asm/intrinsics.h>
 
-struct insn_args {
-	struct jump_entry *entry;
-	enum jump_label_type type;
-};
+#define arch_spin_lock_init(x)			((x)->lock = 0)
 
-static void jump_label_make_nop(struct jump_entry *entry, struct insn *insn)
+/*
+ * Ticket locks are conceptually two parts, one indicating the current head of
+ * the queue, and the other indicating the current tail. The lock is acquired
+ * by atomically noting the tail and incrementing it by one (thus adding
+ * ourself to the queue and noting our position), then waiting until the head
+ * becomes equal to the the initial value of the tail.
+ * The pad bits in the middle are used to prevent the next_ticket number
+ * overflowing into the now_serving number.
+ *
+ *   31             17  16    15  14                    0
+ *  +----------------------------------------------------+
+ *  |  now_serving     | padding |   next_ticket         |
+ *  +----------------------------------------------------+
+ */
+
+#define TICKET_SHIFT	17
+#define TICKET_BITS	15
+#define	TICKET_MASK	((1 << TICKET_BITS) - 1)
+
+static __always_inline void __ticket_spin_lock(arch_spinlock_t *lock)
 {
-	/* brcl 0,0 */
-	insn->opcode = 0xc004;
-	insn->offset = 0;
-}
+	int	*p = (int *)&lock->lock, ticket, serve;
 
-static void jump_label_make_branch(struct jump_entry *entry, struct insn *insn)
-{
-	/* brcl 15,offset */
-	insn->opcode = 0xc0f4;
-	insn->offset = (entry->target - entry->code) >> 1;
-}
+	ticket = ia64_fetchadd(1, p, acq);
 
-static void jump_label_bug(struct jump_entry *entry, struct insn *expected,
-			   struct insn *new)
-{
-	unsigned char *ipc = (unsigned char *)entry->code;
-	unsigned char *ipe = (unsigned char *)expected;
-	unsigned char *ipn = (unsigned char *)new;
+	if (!(((ticket >> TICKET_SHIFT) ^ ticket) & TICKET_MASK))
+		return;
 
-	pr_emerg("Jump label code mismatch at %pS [%px]\n", ipc, ipc);
-	pr_emerg("Found:    %6ph\n", ipc);
-	pr_emerg("Expected: %6ph\n", ipe);
-	pr_emerg("New:      %6ph\n", ipn);
-	panic("Corrupted kernel text");
-}
+	ia64_invala();
 
-static struct insn orignop = {
-	.opcode = 0xc004,
-	.offset = JUMP_LABEL_NOP_OFFSET >> 1,
-};
+	for (;;) {
+		asm volatile ("ld4.c.nc %0=[%1]" : "=r"(serve) : "r"(p) : "memory");
 
-static void __jump_label_transform(struct jump_entry *entry,
-				   enum jump_label_type type,
-				   int init)
-{
-	struct insn old, new;
-
-	if (type == JUMP_LABEL_JMP) {
-		jump_label_make_nop(entry, &old);
-		jump_label_make_branch(entry, &new);
-	} else {
-		jump_label_make_branch(entry, &old);
-		jump_label_make_nop(entry, &new);
+		if (!(((serve >> TICKET_SHIFT) ^ ticket) & TICKET_MASK))
+			return;
+		cpu_relax();
 	}
-	if (init) {
-		if (memcmp((void *)entry->code, &orignop, sizeof(orignop)))
-			jump_label_bug(entry, &orignop, &new);
-	} else {
-		if (memcmp((void *)entry->code, &old, sizeof(old)))
-			jump_label_bug(entry, &old, &new);
-	}
-	s390_kernel_write((void *)entry->code, &new, sizeof(new));
 }
 
-static int __sm_arch_jump_label_transform(void *data)
+static __always_inline int __ticket_spin_trylock(arch_spinlock_t *lock)
 {
-	struct insn_args *args = data;
+	int tmp = ACCESS_ONCE(lock->lock);
 
-	__jump_label_transform(args->entry, args->type, 0);
+	if (!(((tmp >> TICKET_SHIFT) ^ tmp) & TICKET_MASK))
+		return ia64_cmpxchg(acq, &lock->lock, tmp, tmp + 1, sizeof (tmp)) == tmp;
 	return 0;
 }
 
-void arch_jump_label_transform(struct jump_entry *entry,
-			       enum jump_label_type type)
+static __always_inline void __ticket_spin_unlock(arch_spinlock_t *lock)
 {
-	struct insn_args args;
+	unsigned short	*p = (unsigned short *)&lock->lock + 1, tmp;
 
-	args.entry = entry;
-	args.type = type;
-
-	stop_machine(__sm_arch_jump_label_transform, &args, NULL);
+	asm volatile ("ld2.bias %0=[%1]" : "=r"(tmp) : "r"(p));
+	ACCESS_ONCE(*p) = (tmp + 2) & ~1;
 }
 
-void arch_jump_label_transform_static(struct jump_entry *entry,
-				      enum jump_label_type type)
+static __always_inline void __ticket_spin_unlock_wait(arch_spinlock_t *lock)
 {
-	__jump_label_transform(entry, type, 1);
-}
+	int	*p = (int *)&lock->lock, ticket;
 
-#endif
+	ia64_invala();
+
+	for (;;) {
+		asm volatile ("ld4.c.nc %0=[%1]" : "=r"(ticket) : "r"(p) : "memory");
+		if (!(((ticket >> TICKET_SHIFT) ^ tic

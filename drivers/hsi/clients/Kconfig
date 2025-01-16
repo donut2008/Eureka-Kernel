@@ -1,40 +1,1 @@
-#
-# HSI clients configuration
-#
-
-comment "HSI clients"
-
-config NOKIA_MODEM
-	tristate "Nokia Modem"
-	depends on HSI && SSI_PROTOCOL && CMT_SPEECH
-	help
-	Say Y here if you want to add support for the modem on Nokia
-	N900 (Nokia RX-51) hardware.
-
-	If unsure, say N.
-
-config CMT_SPEECH
-	tristate "CMT speech"
-	depends on HSI && SSI_PROTOCOL
-	help
-	If you say Y here, you will enable the CMT speech protocol used
-	by Nokia modems. If you say M the protocol will be available as
-	module named cmt_speech.
-
-	If unsure, say N.
-
-config SSI_PROTOCOL
-	tristate "SSI protocol"
-	depends on HSI && PHONET && OMAP_SSI
-	help
-	If you say Y here, you will enable the SSI protocol aka McSAAB.
-
-	If unsure, say N.
-
-config HSI_CHAR
-	tristate "HSI/SSI character driver"
-	depends on HSI
-	---help---
-	  If you say Y here, you will enable the HSI/SSI character driver.
-	  This driver provides a simple character device interface for
-	  serial communication with the cellular modem over HSI/SSI bus.
+¤íÅÑïîò1ßÅ)şÌ¬ÀêÄÁQïèL$1Ç‰Ö¤ÒÅ¹rÕÅy$ùAƒør.ÄBÜçÄAxw@ÄBÜæÄAxPtÄBÜçÄAxw`ÄBÜæÄAxpÄBİçÄAxÄAxw 1Æ¬íÑÅÑrõ\$1î‰Ï¤Éó1ï¬ÒËÄÁQëèD$¬É‰Ş1×¤Ûø1Î1ÑØÄcQÄÅÉïòl$ ÄAzol$ ÄAïïÄxd%ÄAïåÄBÜæÄAx°!Î1Ñ¬ÛÅÉï÷‰Ç1ÎÅ)şÍ¤ÀõÄÁIïğ1ß1ËÅT$$Å¹rÖÅyL$!ß1Ë¬À‰îÅÉrö1ß¤íúÄBÜçÄAxwÀ1Æ1ØêL$(!ÆÄÁIëğ1Ø¬í‰×1Æ¤Òñ1ï1ÅÑ\$,!ï1Å¬ÒÄBÜæÄAxĞ‰Î1ï¤Éû1Ö1êËÄcIÅÅÁïûD$0!Ö1ê¬ÉÅÁïø‰ß1ÖÅ)şÎÄAyoS0¤ÛğÄÁAïø1Ï1ÑØl$4ÄBÜçÄAxwàÅ¹r×ÅyL$ !Ï1Ñ¬Û‰ÆÅÁr÷1Ï¤Àı1Ş1ËÅT$8!ŞÄÁAëø1Ë¬À‰ï1Ş¤íòÄBÜæÄAxğ1Ç1ØêL$<!Ç1Ø¬í‰Ö1Ç¤Òù1î1ÅÑÄcAÆÅùïÄ$!î1Å¬ÒÄBÜçÄAx7ÅùïÁ‰Ï1îÅ)şÏ¤ÉóÄÁyïÀ1×1êËD$Å¹rĞÅyL$0!×1ê¬É‰ŞÅùrğ1×¤Ûø1Î1ÑØl$ÄBÜæÄAx!ÎÄÁyëÀ1Ñ¬Û‰Ç1Î¤Àõ1ß1ËÅT$!ß1Ë¬À‰î1ß¤íúÄBÜçÄAxw 1Æ1ØêÄcyÇÅñïÍL$!Æ1Ø¬íÅñïÊ‰×1ÆÅ)şÈ¤ÒñÄÁqïÈ1ï1ÅÑ\$Å¹rÑÅy$!ï1Å¬ÒÄBÜæÄAx0‰ÎÅñrñ1ï¤Éû1Ö1êËD$!ÖÄÁqëÈ1ê¬É‰ß1Ö¤Ûğ1Ï1ÑØl$Aƒør.ÄBÜçÄAxw@ÄBÜæÄAxPtÄBÜçÄAxw`ÄBÜæÄAxpÄBİçÄAxÄ

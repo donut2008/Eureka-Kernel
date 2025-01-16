@@ -1,6 +1,3 @@
-#
-# MCU_IPC Device Driver
-#
-
-obj-$(CONFIG_MCU_IPC)	+= mcu_ipc.o
-obj-$(CONFIG_SHM_IPC)	+= shm_ipc.o
+N_FREQUENCY_SEL__SHIFT 0x18
+#define SMBUS_SLV_CNTL1__SMB_TIMEOUT_DIS_MASK 0x2000000
+#define SMBUS_S

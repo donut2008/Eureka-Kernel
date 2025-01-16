@@ -1,912 +1,785 @@
-/*
- * ADXL345/346 Three-Axis Digital Accelerometers
+
+	return ret;
+}
+
+#ifdef CONFIG_OF
+static int abov_parse_dt(struct device *dev,
+			struct abov_touchkey_platform_data *pdata)
+{
+	struct device_node *np = dev->of_node;
+	int ret;
+#ifdef CONFIG_TOUCHKEY_LIGHT_EFS
+	int i;
+	u32 tmp[LIGHT_TABLE_MAX] = {0, };
+#endif
+
+	pdata->gpio_int = of_get_named_gpio(np, "abov,irq-gpio", 0);
+	if(pdata->gpio_int < 0){
+		input_err(true, dev, "unable to get gpio_int\n");
+		return pdata->gpio_int;
+	}
+
+	pdata->gpio_scl = of_get_named_gpio(np, "abov,scl-gpio", 0);
+	if(pdata->gpio_scl < 0){
+		input_err(true, dev, "unable to get gpio_scl\n");
+		return pdata->gpio_scl;
+	}
+
+	pdata->gpio_sda = of_get_named_gpio(np, "abov,sda-gpio", 0);
+	if(pdata->gpio_sda < 0){
+		input_err(true, dev, "unable to get gpio_sda\n");
+		return pdata->gpio_sda;
+	}
+
+	pdata->sub_det = of_get_named_gpio(np, "abov,sub-det",0);
+	if(pdata->sub_det < 0){
+		input_info(true, dev, "unable to get sub_det\n");
+	}else{
+		input_info(true, dev, "%s: sub_det:%d\n",__func__,pdata->sub_det);
+	}
+
+	if (of_property_read_bool(np, "abov,use_gpio_ldo")) {
+		input_info(true, dev, "%s: use use_gpio_ldo\n", __func__);
+
+		pdata->gpio_ldo_en = of_get_named_gpio(np, "abov,gpio_ldo_en", 0);
+		if (gpio_is_valid(pdata->gpio_ldo_en)) {
+			gpio_request_one(pdata->gpio_ldo_en, GPIOF_OUT_INIT_LOW, "TOUCHKEY_GPIO_OUTPUT_LOW");
+		} else {
+			input_err(true, dev, "failed to get tsp_ldo_en\n");
+			return -EINVAL;
+		}
+	}
+
+	ret = of_property_read_string(np, "abov,fw_path", (const char **)&pdata->fw_path);
+	if (ret) {
+		input_err(true, dev, "touchkey:failed to read fw_path %d\n", ret);
+		pdata->fw_path = TK_FW_PATH_BIN;
+	}
+	input_info(true, dev, "%s: fw path %s\n", __func__, pdata->fw_path);
+
+	pdata->boot_on_ldo = of_property_read_bool(np, "abov,boot-on-ldo");
+	pdata->bringup = of_property_read_bool(np, "abov,bringup");
+	pdata->ta_notifier = of_property_read_bool(np, "abov,ta-notifier");
+
+	input_info(true, dev, "%s: gpio_int:%d, gpio_scl:%d, gpio_sda:%d\n",
+			__func__, pdata->gpio_int, pdata->gpio_scl,
+			pdata->gpio_sda);
+
+#ifdef CONFIG_TOUCHKEY_LIGHT_EFS
+	ret = of_property_read_u32_array(np, "abov,light_version", tmp, 2);
+	if (ret) {
+		input_err(true, dev, "touchkey:failed to read light_version %d\n", ret);
+	}
+	pdata->dt_light_version = tmp[0];
+	pdata->dt_light_table = tmp[1];
+
+	input_info(true, dev, "%s: light_version:%d, light_table:%d\n",
+			__func__, pdata->dt_light_version, pdata->dt_light_table);
+
+	if(pdata->dt_light_table > 0){
+		ret = of_property_read_u32_array(np, "abov,octa_id", tmp, pdata->dt_light_table);
+		if (ret) {
+			input_err(true, dev, "touchkey:failed to read light_version %d\n", ret);
+		}
+		for(i = 0 ; i < pdata->dt_light_table ; i++){
+			tkey_light_reg_table[i].octa_id = tmp[i];
+		}
+
+		ret = of_property_read_u32_array(np, "abov,light_reg", tmp, pdata->dt_light_table);
+		if (ret) {
+			input_err(true, dev, "touchkey:failed to read light_version %d\n", ret);
+		}
+		for(i = 0 ; i < pdata->dt_light_table ; i++){
+			tkey_light_reg_table[i].led_reg = tmp[i];
+		}
+
+		for(i = 0 ; i < pdata->dt_light_table ; i++){
+			input_info(true, dev, "%s: tkey_light_reg_table: %d 0x%02x\n",
+				__func__, tkey_light_reg_table[i].octa_id, tkey_light_reg_table[i].led_reg);
+		}
+	}
+#endif
+	return 0;
+}
+#else
+static int abov_parse_dt(struct device *dev,
+			struct abov_touchkey_platform_data *pdata)
+{
+	return -ENODEV;
+}
+#endif
+
+static int abov_tk_probe(struct i2c_client *client,
+				  const struct i2c_device_id *id)
+{
+	struct abov_tk_info *info;
+	struct input_dev *input_dev;
+	int ret = 0;
+#ifdef CONFIG_TOUCHKEY_LIGHT_EFS
+	int i;
+	char tmp[2] = {0, };
+#endif
+
+#ifdef LED_TWINKLE_BOOTING
+	if (get_samsung_lcd_attached() == 0) {
+                input_err(true, &client->dev, "%s : get_samsung_lcd_attached()=0 \n", __func__);
+                return -EIO;
+        }
+#endif
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+		input_err(true, &client->dev,
+			"i2c_check_functionality fail\n");
+		return -EIO;
+	}
+
+	info = kzalloc(sizeof(struct abov_tk_info), GFP_KERNEL);
+	if (!info) {
+		input_err(true, &client->dev, "Failed to allocate memory\n");
+		ret = -ENOMEM;
+		goto err_alloc;
+	}
+
+	input_dev = input_allocate_device();
+	if (!input_dev) {
+		input_err(true, &client->dev,
+			"Failed to allocate memory for input device\n");
+		ret = -ENOMEM;
+		goto err_input_alloc;
+	}
+
+	info->client = client;
+	info->input_dev = input_dev;
+
+#ifdef CONFIG_TOUCHKEY_GRIP
+	wake_lock_init(&info->touckey_wake_lock, WAKE_LOCK_SUSPEND, "touchkey wake lock");
+#endif
+
+	if (client->dev.of_node) {
+		struct abov_touchkey_platform_data *pdata;
+		pdata = devm_kzalloc(&client->dev,
+			sizeof(struct abov_touchkey_platform_data), GFP_KERNEL);
+		if (!pdata) {
+			input_err(true, &client->dev, "Failed to allocate memory\n");
+			ret = -ENOMEM;
+			goto err_config;
+		}
+
+		ret = abov_parse_dt(&client->dev, pdata);
+		if (ret){
+			input_err(true, &client->dev, "failed to abov_parse_dt\n");
+			ret = -ENOMEM;
+			goto err_config;
+		}
+
+		info->pdata = pdata;
+	} else
+		info->pdata = client->dev.platform_data;
+
+	if (info->pdata == NULL) {
+		input_err(true, &client->dev, "failed to get platform data\n");
+		goto err_config;
+	}
+#if 1
+	/* Get pinctrl if target uses pinctrl */
+		info->pinctrl = devm_pinctrl_get(&client->dev);
+		if (IS_ERR(info->pinctrl)) {
+			if (PTR_ERR(info->pinctrl) == -EPROBE_DEFER)
+				goto err_config;
+
+			input_err(true, &client->dev, "%s: Target does not use pinctrl\n", __func__);
+			info->pinctrl = NULL;
+		}
+
+		if (info->pinctrl) {
+			ret = abov_pinctrl_configure(info, true);
+			if (ret)
+				input_err(true, &client->dev,
+					"%s: cannot set ts pinctrl active state\n", __func__);
+		}
+
+		/* sub-det pinctrl */
+		if (gpio_is_valid(info->pdata->sub_det)) {
+			info->pinctrl_det = devm_pinctrl_get(&client->dev);
+			if (IS_ERR(info->pinctrl_det)) {
+				input_err(true, &client->dev, "%s: Failed to get pinctrl\n", __func__);
+				goto err_config;
+			}
+
+			info->pins_default = pinctrl_lookup_state(info->pinctrl_det, "sub_det");
+			if (IS_ERR(info->pins_default)) {
+				input_err(true, &client->dev, "%s: Failed to get pinctrl state\n", __func__);
+				devm_pinctrl_put(info->pinctrl_det);
+				goto err_config;
+			}
+
+			ret = pinctrl_select_state(info->pinctrl_det, info->pins_default);
+			if (ret < 0)
+				input_err(true, &client->dev, "%s: Failed to configure sub_det pin\n", __func__);
+		}
+#endif
+	ret = abov_gpio_reg_init(&client->dev, info->pdata);
+	if(ret){
+		input_err(true, &client->dev, "failed to init reg\n");
+		goto pwr_config;
+	}
+	if (info->pdata->power)
+		info->pdata->power(info, true);
+
+	if(!info->pdata->boot_on_ldo)
+		abov_delay(ABOV_RESET_DELAY);
+
+	if (gpio_is_valid(info->pdata->sub_det)) {
+		ret = gpio_get_value(info->pdata->sub_det);
+		if (ret) {
+			input_err(true, &client->dev, "Device wasn't connected to board \n");
+			ret = -ENODEV;
+			goto err_i2c_check;
+		}
+	}
+
+	info->enabled = true;
+	info->irq = -1;
+	client->irq = gpio_to_irq(info->pdata->gpio_int);
+
+	mutex_init(&info->lock);
+
+	info->input_event = info->pdata->input_event;
+	info->touchkey_count = sizeof(touchkey_keycode) / sizeof(int);
+	i2c_set_clientdata(client, info);
+
+	ret = abov_tk_fw_check(info);
+	if (ret) {
+		input_err(true, &client->dev,
+			"failed to firmware check (%d)\n", ret);
+		goto err_reg_input_dev;
+	}
+
+	ret = get_tk_fw_version(info, false);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s read fail\n", __func__);
+		goto err_reg_input_dev;
+	}
+
+	snprintf(info->phys, sizeof(info->phys),
+		 "%s/input0", dev_name(&client->dev));
+	input_dev->name = "sec_touchkey";
+	input_dev->phys = info->phys;
+	input_dev->id.bustype = BUS_HOST;
+	input_dev->dev.parent = &client->dev;
+#if 1 //def CONFIG_INPUT_ENABLED
+	input_dev->open = abov_tk_input_open;
+	input_dev->close = abov_tk_input_close;
+#endif
+	set_bit(EV_KEY, input_dev->evbit);
+	set_bit(KEY_RECENT, input_dev->keybit);
+	set_bit(KEY_BACK, input_dev->keybit);
+	set_bit(KEY_CP_GRIP, input_dev->keybit);
+	set_bit(EV_LED, input_dev->evbit);
+	set_bit(LED_MISC, input_dev->ledbit);
+	input_set_drvdata(input_dev, info);
+
+	ret = input_register_device(input_dev);
+	if (ret) {
+		input_err(true, &client->dev, "failed to register input dev (%d)\n",
+			ret);
+		goto err_reg_input_dev;
+	}
+
+	if (!info->pdata->irq_flag) {
+		input_err(true, &client->dev, "no irq_flag\n");
+		ret = request_threaded_irq(client->irq, NULL, abov_tk_interrupt,
+			IRQF_TRIGGER_FALLING | IRQF_ONESHOT, ABOV_TK_NAME, info);
+	} else {
+		ret = request_threaded_irq(client->irq, NULL, abov_tk_interrupt,
+			info->pdata->irq_flag, ABOV_TK_NAME, info);
+	}
+	if (ret < 0) {
+		input_err(true, &client->dev, "Failed to register interrupt\n");
+		goto err_req_irq;
+	}
+	info->irq = client->irq;
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+	info->early_suspend.level = EARLY_SUSPEND_LEVEL_STOP_DRAWING;
+	info->early_suspend.suspend = abov_tk_early_suspend;
+	info->early_suspend.resume = abov_tk_late_resume;
+	register_early_suspend(&info->early_suspend);
+#endif
+
+	info->dev = sec_device_create(info, "sec_touchkey");
+	if (IS_ERR(info->dev))
+		input_err(true, &client->dev,
+		"Failed to create device for the touchkey sysfs\n");
+
+	ret = sysfs_create_group(&info->dev ->kobj,
+		&sec_touchkey_attr_group);
+	if (ret)
+		input_err(true, &client->dev, "Failed to create sysfs group\n");
+
+	ret = sysfs_create_link(&info->dev ->kobj,
+		&info->input_dev->dev.kobj, "input");
+	if (ret < 0) {
+		input_err(true, &client->dev,
+			"%s: Failed to create input symbolic link\n",
+			__func__);
+	}
+
+
+#ifdef LED_TWINKLE_BOOTING
+	if (get_samsung_lcd_attached() == 0) {
+		input_err(true, &client->dev,
+			"%s : get_samsung_lcd_attached()=0, so start LED twinkle \n", __func__);
+
+		INIT_DELAYED_WORK(&info->led_twinkle_work, led_twinkle_work);
+		info->led_twinkle_check =  1;
+
+		schedule_delayed_work(&info->led_twinkle_work, msecs_to_jiffies(400));
+	}
+#endif
+#ifdef CONFIG_TOUCHKEY_GRIP
+	info->sar_sensing = 1;
+	device_init_wakeup(&client->dev, true);
+#endif
+
+	input_err(true, &client->dev, "%s done\n", __func__);
+
+#ifdef CONFIG_TOUCHKEY_GRIP
+	if (lpcharge == 1) {
+		disable_irq(info->irq);
+		input_err(true, &client->dev, "%s disable_irq\n", __func__);
+		abov_sar_only_mode(info, 1);
+	}
+#endif
+
+#ifdef CONFIG_VBUS_NOTIFIER
+	if (info->pdata->ta_notifier) {
+		vbus_notifier_register(&info->vbus_nb, abov_touchkey_vbus_notification,
+					VBUS_NOTIFY_DEV_CHARGER);
+	}
+#endif
+
+#ifdef CONFIG_TOUCHKEY_LIGHT_EFS
+	INIT_DELAYED_WORK(&info->efs_open_work, touchkey_efs_open_work);
+
+	info->light_table_crc = info->pdata->dt_light_version;
+	sprintf(info->light_version_full_bin, "T%d.", info->pdata->dt_light_version);
+	for (i = 0; i < info->pdata->dt_light_table; i++) {
+		info->light_table_crc += tkey_light_reg_table[i].octa_id;
+		info->light_table_crc += tkey_light_reg_table[i].led_reg;
+		snprintf(tmp, 2, "%X", tkey_light_reg_table[i].octa_id);
+		strncat(info->light_version_full_bin, tmp, 1);
+	}
+	input_info(true, &client->dev, "%s: light version of kernel : %s\n",
+			__func__, info->light_version_full_bin);
+
+	schedule_delayed_work(&info->efs_open_work, msecs_to_jiffies(2000));
+#endif
+
+	return 0;
+
+err_req_irq:
+	input_unregister_device(input_dev);
+err_reg_input_dev:
+	mutex_destroy(&info->lock);
+	gpio_free(info->pdata->gpio_int);
+err_i2c_check:
+	if (info->pdata->power)
+		info->pdata->power(info, false);
+pwr_config:
+err_config:
+#ifdef CONFIG_TOUCHKEY_GRIP
+	wake_lock_destroy(&info->touckey_wake_lock);
+#endif
+	input_free_device(input_dev);
+err_input_alloc:
+	kfree(info);
+err_alloc:
+	input_err(true, &client->dev, "%s fail\n",__func__);
+	return ret;
+
+}
+
+
+#ifdef LED_TWINKLE_BOOTING
+static void led_twinkle_work(struct work_struct *work)
+{
+	struct abov_tk_info *info = container_of(work, struct abov_tk_info,
+						led_twinkle_work.work);
+	static bool led_on = 1;
+	static int count = 0;
+	input_info(true, &info->client->dev, "%s, on=%d, c=%d\n",__func__, led_on, count++ );
+
+	if(info->led_twinkle_check == 1){
+
+		touchkey_led_set(info,led_on);
+		if(led_on)	led_on = 0;
+		else		led_on = 1;
+
+		schedule_delayed_work(&info->led_twinkle_work, msecs_to_jiffies(400));
+	}else{
+
+		if(led_on == 0)
+			touchkey_led_set(info, 0);
+	}
+
+}
+#endif
+
+static int abov_tk_remove(struct i2c_client *client)
+{
+	struct abov_tk_info *info = i2c_get_clientdata(client);
+
+/*	if (info->enabled)
+		info->pdata->power(0);
+*/
+	info->enabled = false;
+#ifdef CONFIG_TOUCHKEY_GRIP
+	device_init_wakeup(&client->dev, false);
+	wake_lock_destroy(&info->touckey_wake_lock);
+#endif
+#ifdef CONFIG_HAS_EARLYSUSPEND
+	unregister_early_suspend(&info->early_suspend);
+#endif
+	if (info->irq >= 0)
+		free_irq(info->irq, info);
+	input_unregister_device(info->input_dev);
+	input_free_device(info->input_dev);
+	kfree(info);
+
+	return 0;
+}
+
+static void abov_tk_shutdown(struct i2c_client *client)
+{
+	struct abov_tk_info *info = i2c_get_clientdata(client);
+	u8 cmd = CMD_LED_OFF;
+	input_info(true, &client->dev, "Inside abov_tk_shutdown \n");
+
+	if (info->enabled){
+		disable_irq(info->irq);
+	abov_tk_i2c_write(client, ABOV_BTNSTATUS, &cmd, 1);
+		info->pdata->power(info, false);
+	}
+	info->enabled = false;
+#ifdef CONFIG_TOUCHKEY_LIGHT_EFS
+	cancel_delayed_work(&info->efs_open_work);
+#endif
+// just power off.
+//	if (info->irq >= 0)
+//		free_irq(info->irq, info);
+//	kfree(info);
+}
+
+#if defined(CONFIG_PM) && !defined(CONFIG_TOUCHKEY_GRIP)
+static int abov_tk_suspend(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct abov_tk_info *info = i2c_get_clientdata(client);
+
+	if (!info->enabled) {
+		input_info(true, &client->dev, "%s: already power off\n", __func__);
+		return 0;
+	}
+
+	input_info(true, &client->dev, "%s: users=%d\n", __func__,
+		   info->input_dev->users);
+
+	disable_irq(info->irq);
+	info->enabled = false;
+	release_all_fingers(info);
+
+	if (info->pdata->power)
+		info->pdata->power(info, false);
+	return 0;
+}
+
+static int abov_tk_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct abov_tk_info *info = i2c_get_clientdata(client);
+	u8 led_data;
+
+	if (info->enabled) {
+		input_info(true, &client->dev, "%s: already power on\n", __func__);
+		return 0;
+	}
+
+	input_info(true, &info->client->dev, "%s: users=%d\n", __func__,
+		   info->input_dev->users);
+
+	if (info->pdata->power) {
+		info->pdata->power(info, true);
+		abov_delay(ABOV_RESET_DELAY);
+	} else /* touchkey on by i2c */
+		get_tk_fw_version(info, true);
+
+	info->enabled = true;
+
+	if (abov_touchled_cmd_reserved && \
+		abov_touchkey_led_status == CMD_LED_ON) {
+		abov_touchled_cmd_reserved = 0;
+		led_data=abov_touchkey_led_status;
+
+		abov_tk_i2c_write(client, ABOV_BTNSTATUS, &led_data, 1);
+
+		input_info(true, &info->client->dev, "%s: LED reserved on\n", __func__);
+	}
+	enable_irq(info->irq);
+
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void abov_tk_early_suspend(struct early_suspend *h)
+{
+	struct abov_tk_info *info;
+	info = container_of(h, struct abov_tk_info, early_suspend);
+	abov_tk_suspend(&info->client->dev);
+
+}
+
+static void abov_tk_late_resume(struct early_suspend *h)
+{
+	struct abov_tk_info *info;
+	info = container_of(h, struct abov_tk_info, early_suspend);
+	abov_tk_resume(&info->client->dev);
+}
+#endif
+
+#if 1//def CONFIG_INPUT_ENABLED
+static int abov_tk_input_open(struct input_dev *dev)
+{
+	struct abov_tk_info *info = input_get_drvdata(dev);
+
+	input_info(true, &info->client->dev, "%s: users=%d, v:0x%02x, g(%d), f(%d), k(%d)\n", __func__,
+		info->input_dev->users, info->fw_ver, info->flip_mode, info->glovemode, info->keyboard_mode);
+#ifdef CONFIG_TOUCHKEY_GRIP
+	if (lpcharge == 1) {
+		input_info(true, &info->client->dev, "%s(lpcharge): sar_enable(%d)\n", __func__, info->sar_enable);
+		return 0;
+	}
+
+	input_info(true, &info->client->dev, "%s: sar_enable(%d)\n", __func__, info->sar_enable);
+
+	/* abov_led_power(info, true); */
+
+	if (info->flip_mode)
+		abov_sar_only_mode(info, 1);
+	else
+		abov_sar_only_mode(info, 0);
+
+	if (device_may_wakeup(&info->client->dev))
+		disable_irq_wake(info->irq );
+#else
+	abov_tk_resume(&info->client->dev);
+	if (info->pinctrl)
+		abov_pinctrl_configure(info, true);
+
+#ifdef CONFIG_VBUS_NOTIFIER
+	if (info->pdata->ta_notifier && g_ta_connected) {
+		abov_set_ta_status(info);
+	}
+#endif
+
+	if (info->flip_mode){
+		abov_mode_enable(info->client, ABOV_FLIP, CMD_FLIP_ON);
+	} else {
+		if (info->glovemode)
+			abov_mode_enable(info->client, ABOV_GLOVE, CMD_GLOVE_ON);
+	}
+	if (info->keyboard_mode)
+		abov_mode_enable(info->client, ABOV_KEYBOARD, CMD_MOBILE_KBD_ON);
+#endif
+	return 0;
+}
+static void abov_tk_input_close(struct input_dev *dev)
+{
+	struct abov_tk_info *info = input_get_drvdata(dev);
+
+	input_info(true, &info->client->dev, "%s: users=%d\n", __func__,
+		   info->input_dev->users);
+#ifdef CONFIG_TOUCHKEY_GRIP
+	input_info(true, &info->client->dev, "%s: sar_enable(%d)\n", __func__, info->sar_enable);
+	abov_sar_only_mode(info, 1);
+
+	if (device_may_wakeup(&info->client->dev))
+		enable_irq_wake(info->irq );
+
+	/* abov_led_power(info, false); */
+
+#else
+	abov_tk_suspend(&info->client->dev);
+	if (info->pinctrl)
+		abov_pinctrl_configure(info, false);
+#endif
+
+#ifdef LED_TWINKLE_BOOTING
+	info->led_twinkle_check = 0;
+#endif
+
+}
+#endif
+
+#if 0//defined(CONFIG_PM) && !defined(CONFIG_HAS_EARLYSUSPEND) &&!defined(CONFIG_INPUT_ENABLED)
+static const struct dev_pm_ops abov_tk_pm_ops = {
+	.suspend = abov_tk_suspend,
+	.resume = abov_tk_resume,
+};
+#endif
+
+static const struct i2c_device_id abov_tk_id[] = {
+	{ABOV_TK_NAME, 0},
+	{}
+};
+
+MODULE_DEVICE_TABLE(i2c, abov_tk_id);
+
+#ifdef CONFIG_OF
+static struct of_device_id abov_match_table[] = {
+	{ .compatible = "abov,mc96ft18xx",},
+	{ },
+};
+#else
+#define abov_match_table NULL
+#endif
+
+static struct i2c_driver abov_tk_driver = {
+	.probe = abov_tk_probe,
+	.remove = abov_tk_remove,
+	.shutdown = abov_tk_shutdown,
+	.driver = {
+		   .name = ABOV_TK_NAME,
+		   .of_match_table = abov_match_table,
+#if 0//defined(CONFIG_PM) && !defined(CONFIG_HAS_EARLYSUSPEND) &&!defined(CONFIG_INPUT_ENABLED)
+		   .pm = &abov_tk_pm_ops,
+#endif
+	},
+	.id_table = abov_tk_id,
+};
+
+static int __init touchkey_init(void)
+{
+#if defined(CONFIG_BATTERY_SAMSUNG) && !defined(CONFIG_TOUCHKEY_GRIP)
+	if (lpcharge == 1) {
+			pr_notice("%s : Do not load driver due to : lpm %d\n",
+			 __func__, lpcharge);
+		return 0;
+	}
+#endif
+
+	return i2c_add_driver(&abov_tk_driver);
+}
+
+static void __exit touchkey_exit(void)
+{
+	i2c_del_driver(&abov_tk_driver);
+}
+
+module_init(touchkey_init);
+module_exit(touchkey_exit);
+
+/* Module information */
+MODULE_AUTHOR("Samsung Electronics");
+MODULE_DESCRIPTION("Touchkey driver for Abov MF18xx chip");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /* tc300k.c -- Linux driver for coreriver chip as touchkey
  *
- * Enter bugs at http://blackfin.uclinux.org/
+ * Copyright (C) 2013 Samsung Electronics Co.Ltd
+ * Author: Junkyeong Kim <jk0430.kim@samsung.com>
  *
- * Copyright (C) 2009 Michael Hennerich, Analog Devices Inc.
- * Licensed under the GPL-2 or later.
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
  */
 
-#include <linux/device.h>
 #include <linux/delay.h>
+#include <linux/firmware.h>
+#include <linux/of_gpio.h>
+#include <linux/gpio.h>
+#include <linux/i2c.h>
+#include <linux/init.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
-#include <linux/slab.h>
-#include <linux/workqueue.h>
-#include <linux/input/adxl34x.h>
+#include <linux/kernel.h>
+#include <linux/leds.h>
 #include <linux/module.h>
-
-#include "adxl34x.h"
-
-/* ADXL345/6 Register Map */
-#define DEVID		0x00	/* R   Device ID */
-#define THRESH_TAP	0x1D	/* R/W Tap threshold */
-#define OFSX		0x1E	/* R/W X-axis offset */
-#define OFSY		0x1F	/* R/W Y-axis offset */
-#define OFSZ		0x20	/* R/W Z-axis offset */
-#define DUR		0x21	/* R/W Tap duration */
-#define LATENT		0x22	/* R/W Tap latency */
-#define WINDOW		0x23	/* R/W Tap window */
-#define THRESH_ACT	0x24	/* R/W Activity threshold */
-#define THRESH_INACT	0x25	/* R/W Inactivity threshold */
-#define TIME_INACT	0x26	/* R/W Inactivity time */
-#define ACT_INACT_CTL	0x27	/* R/W Axis enable control for activity and */
-				/* inactivity detection */
-#define THRESH_FF	0x28	/* R/W Free-fall threshold */
-#define TIME_FF		0x29	/* R/W Free-fall time */
-#define TAP_AXES	0x2A	/* R/W Axis control for tap/double tap */
-#define ACT_TAP_STATUS	0x2B	/* R   Source of tap/double tap */
-#define BW_RATE		0x2C	/* R/W Data rate and power mode control */
-#define POWER_CTL	0x2D	/* R/W Power saving features control */
-#define INT_ENABLE	0x2E	/* R/W Interrupt enable control */
-#define INT_MAP		0x2F	/* R/W Interrupt mapping control */
-#define INT_SOURCE	0x30	/* R   Source of interrupts */
-#define DATA_FORMAT	0x31	/* R/W Data format control */
-#define DATAX0		0x32	/* R   X-Axis Data 0 */
-#define DATAX1		0x33	/* R   X-Axis Data 1 */
-#define DATAY0		0x34	/* R   Y-Axis Data 0 */
-#define DATAY1		0x35	/* R   Y-Axis Data 1 */
-#define DATAZ0		0x36	/* R   Z-Axis Data 0 */
-#define DATAZ1		0x37	/* R   Z-Axis Data 1 */
-#define FIFO_CTL	0x38	/* R/W FIFO control */
-#define FIFO_STATUS	0x39	/* R   FIFO status */
-#define TAP_SIGN	0x3A	/* R   Sign and source for tap/double tap */
-/* Orientation ADXL346 only */
-#define ORIENT_CONF	0x3B	/* R/W Orientation configuration */
-#define ORIENT		0x3C	/* R   Orientation status */
-
-/* DEVIDs */
-#define ID_ADXL345	0xE5
-#define ID_ADXL346	0xE6
-
-/* INT_ENABLE/INT_MAP/INT_SOURCE Bits */
-#define DATA_READY	(1 << 7)
-#define SINGLE_TAP	(1 << 6)
-#define DOUBLE_TAP	(1 << 5)
-#define ACTIVITY	(1 << 4)
-#define INACTIVITY	(1 << 3)
-#define FREE_FALL	(1 << 2)
-#define WATERMARK	(1 << 1)
-#define OVERRUN		(1 << 0)
-
-/* ACT_INACT_CONTROL Bits */
-#define ACT_ACDC	(1 << 7)
-#define ACT_X_EN	(1 << 6)
-#define ACT_Y_EN	(1 << 5)
-#define ACT_Z_EN	(1 << 4)
-#define INACT_ACDC	(1 << 3)
-#define INACT_X_EN	(1 << 2)
-#define INACT_Y_EN	(1 << 1)
-#define INACT_Z_EN	(1 << 0)
-
-/* TAP_AXES Bits */
-#define SUPPRESS	(1 << 3)
-#define TAP_X_EN	(1 << 2)
-#define TAP_Y_EN	(1 << 1)
-#define TAP_Z_EN	(1 << 0)
-
-/* ACT_TAP_STATUS Bits */
-#define ACT_X_SRC	(1 << 6)
-#define ACT_Y_SRC	(1 << 5)
-#define ACT_Z_SRC	(1 << 4)
-#define ASLEEP		(1 << 3)
-#define TAP_X_SRC	(1 << 2)
-#define TAP_Y_SRC	(1 << 1)
-#define TAP_Z_SRC	(1 << 0)
-
-/* BW_RATE Bits */
-#define LOW_POWER	(1 << 4)
-#define RATE(x)		((x) & 0xF)
-
-/* POWER_CTL Bits */
-#define PCTL_LINK	(1 << 5)
-#define PCTL_AUTO_SLEEP (1 << 4)
-#define PCTL_MEASURE	(1 << 3)
-#define PCTL_SLEEP	(1 << 2)
-#define PCTL_WAKEUP(x)	((x) & 0x3)
-
-/* DATA_FORMAT Bits */
-#define SELF_TEST	(1 << 7)
-#define SPI		(1 << 6)
-#define INT_INVERT	(1 << 5)
-#define FULL_RES	(1 << 3)
-#define JUSTIFY		(1 << 2)
-#define RANGE(x)	((x) & 0x3)
-#define RANGE_PM_2g	0
-#define RANGE_PM_4g	1
-#define RANGE_PM_8g	2
-#define RANGE_PM_16g	3
-
-/*
- * Maximum value our axis may get in full res mode for the input device
- * (signed 13 bits)
- */
-#define ADXL_FULLRES_MAX_VAL 4096
-
-/*
- * Maximum value our axis may get in fixed res mode for the input device
- * (signed 10 bits)
- */
-#define ADXL_FIXEDRES_MAX_VAL 512
-
-/* FIFO_CTL Bits */
-#define FIFO_MODE(x)	(((x) & 0x3) << 6)
-#define FIFO_BYPASS	0
-#define FIFO_FIFO	1
-#define FIFO_STREAM	2
-#define FIFO_TRIGGER	3
-#define TRIGGER		(1 << 5)
-#define SAMPLES(x)	((x) & 0x1F)
-
-/* FIFO_STATUS Bits */
-#define FIFO_TRIG	(1 << 7)
-#define ENTRIES(x)	((x) & 0x3F)
-
-/* TAP_SIGN Bits ADXL346 only */
-#define XSIGN		(1 << 6)
-#define YSIGN		(1 << 5)
-#define ZSIGN		(1 << 4)
-#define XTAP		(1 << 3)
-#define YTAP		(1 << 2)
-#define ZTAP		(1 << 1)
-
-/* ORIENT_CONF ADXL346 only */
-#define ORIENT_DEADZONE(x)	(((x) & 0x7) << 4)
-#define ORIENT_DIVISOR(x)	((x) & 0x7)
-
-/* ORIENT ADXL346 only */
-#define ADXL346_2D_VALID		(1 << 6)
-#define ADXL346_2D_ORIENT(x)		(((x) & 0x30) >> 4)
-#define ADXL346_3D_VALID		(1 << 3)
-#define ADXL346_3D_ORIENT(x)		((x) & 0x7)
-#define ADXL346_2D_PORTRAIT_POS		0	/* +X */
-#define ADXL346_2D_PORTRAIT_NEG		1	/* -X */
-#define ADXL346_2D_LANDSCAPE_POS	2	/* +Y */
-#define ADXL346_2D_LANDSCAPE_NEG	3	/* -Y */
-
-#define ADXL346_3D_FRONT		3	/* +X */
-#define ADXL346_3D_BACK			4	/* -X */
-#define ADXL346_3D_RIGHT		2	/* +Y */
-#define ADXL346_3D_LEFT			5	/* -Y */
-#define ADXL346_3D_TOP			1	/* +Z */
-#define ADXL346_3D_BOTTOM		6	/* -Z */
-
-#undef ADXL_DEBUG
-
-#define ADXL_X_AXIS			0
-#define ADXL_Y_AXIS			1
-#define ADXL_Z_AXIS			2
-
-#define AC_READ(ac, reg)	((ac)->bops->read((ac)->dev, reg))
-#define AC_WRITE(ac, reg, val)	((ac)->bops->write((ac)->dev, reg, val))
-
-struct axis_triple {
-	int x;
-	int y;
-	int z;
-};
-
-struct adxl34x {
-	struct device *dev;
-	struct input_dev *input;
-	struct mutex mutex;	/* reentrant protection for struct */
-	struct adxl34x_platform_data pdata;
-	struct axis_triple swcal;
-	struct axis_triple hwcal;
-	struct axis_triple saved;
-	char phys[32];
-	unsigned orient2d_saved;
-	unsigned orient3d_saved;
-	bool disabled;	/* P: mutex */
-	bool opened;	/* P: mutex */
-	bool suspended;	/* P: mutex */
-	bool fifo_delay;
-	int irq;
-	unsigned model;
-	unsigned int_mask;
-
-	const struct adxl34x_bus_ops *bops;
-};
-
-static const struct adxl34x_platform_data adxl34x_default_init = {
-	.tap_threshold = 35,
-	.tap_duration = 3,
-	.tap_latency = 20,
-	.tap_window = 20,
-	.tap_axis_control = ADXL_TAP_X_EN | ADXL_TAP_Y_EN | ADXL_TAP_Z_EN,
-	.act_axis_control = 0xFF,
-	.activity_threshold = 6,
-	.inactivity_threshold = 4,
-	.inactivity_time = 3,
-	.free_fall_threshold = 8,
-	.free_fall_time = 0x20,
-	.data_rate = 8,
-	.data_range = ADXL_FULL_RES,
-
-	.ev_type = EV_ABS,
-	.ev_code_x = ABS_X,	/* EV_REL */
-	.ev_code_y = ABS_Y,	/* EV_REL */
-	.ev_code_z = ABS_Z,	/* EV_REL */
-
-	.ev_code_tap = {BTN_TOUCH, BTN_TOUCH, BTN_TOUCH}, /* EV_KEY {x,y,z} */
-	.power_mode = ADXL_AUTO_SLEEP | ADXL_LINK,
-	.fifo_mode = ADXL_FIFO_STREAM,
-	.watermark = 0,
-};
-
-static void adxl34x_get_triple(struct adxl34x *ac, struct axis_triple *axis)
-{
-	short buf[3];
-
-	ac->bops->read_block(ac->dev, DATAX0, DATAZ1 - DATAX0 + 1, buf);
-
-	mutex_lock(&ac->mutex);
-	ac->saved.x = (s16) le16_to_cpu(buf[0]);
-	axis->x = ac->saved.x;
-
-	ac->saved.y = (s16) le16_to_cpu(buf[1]);
-	axis->y = ac->saved.y;
-
-	ac->saved.z = (s16) le16_to_cpu(buf[2]);
-	axis->z = ac->saved.z;
-	mutex_unlock(&ac->mutex);
-}
-
-static void adxl34x_service_ev_fifo(struct adxl34x *ac)
-{
-	struct adxl34x_platform_data *pdata = &ac->pdata;
-	struct axis_triple axis;
-
-	adxl34x_get_triple(ac, &axis);
-
-	input_event(ac->input, pdata->ev_type, pdata->ev_code_x,
-		    axis.x - ac->swcal.x);
-	input_event(ac->input, pdata->ev_type, pdata->ev_code_y,
-		    axis.y - ac->swcal.y);
-	input_event(ac->input, pdata->ev_type, pdata->ev_code_z,
-		    axis.z - ac->swcal.z);
-}
-
-static void adxl34x_report_key_single(struct input_dev *input, int key)
-{
-	input_report_key(input, key, true);
-	input_sync(input);
-	input_report_key(input, key, false);
-}
-
-static void adxl34x_send_key_events(struct adxl34x *ac,
-		struct adxl34x_platform_data *pdata, int status, int press)
-{
-	int i;
-
-	for (i = ADXL_X_AXIS; i <= ADXL_Z_AXIS; i++) {
-		if (status & (1 << (ADXL_Z_AXIS - i)))
-			input_report_key(ac->input,
-					 pdata->ev_code_tap[i], press);
-	}
-}
-
-static void adxl34x_do_tap(struct adxl34x *ac,
-		struct adxl34x_platform_data *pdata, int status)
-{
-	adxl34x_send_key_events(ac, pdata, status, true);
-	input_sync(ac->input);
-	adxl34x_send_key_events(ac, pdata, status, false);
-}
-
-static irqreturn_t adxl34x_irq(int irq, void *handle)
-{
-	struct adxl34x *ac = handle;
-	struct adxl34x_platform_data *pdata = &ac->pdata;
-	int int_stat, tap_stat, samples, orient, orient_code;
-
-	/*
-	 * ACT_TAP_STATUS should be read before clearing the interrupt
-	 * Avoid reading ACT_TAP_STATUS in case TAP detection is disabled
-	 */
-
-	if (pdata->tap_axis_control & (TAP_X_EN | TAP_Y_EN | TAP_Z_EN))
-		tap_stat = AC_READ(ac, ACT_TAP_STATUS);
-	else
-		tap_stat = 0;
-
-	int_stat = AC_READ(ac, INT_SOURCE);
-
-	if (int_stat & FREE_FALL)
-		adxl34x_report_key_single(ac->input, pdata->ev_code_ff);
-
-	if (int_stat & OVERRUN)
-		dev_dbg(ac->dev, "OVERRUN\n");
-
-	if (int_stat & (SINGLE_TAP | DOUBLE_TAP)) {
-		adxl34x_do_tap(ac, pdata, tap_stat);
-
-		if (int_stat & DOUBLE_TAP)
-			adxl34x_do_tap(ac, pdata, tap_stat);
-	}
-
-	if (pdata->ev_code_act_inactivity) {
-		if (int_stat & ACTIVITY)
-			input_report_key(ac->input,
-					 pdata->ev_code_act_inactivity, 1);
-		if (int_stat & INACTIVITY)
-			input_report_key(ac->input,
-					 pdata->ev_code_act_inactivity, 0);
-	}
-
-	/*
-	 * ORIENTATION SENSING ADXL346 only
-	 */
-	if (pdata->orientation_enable) {
-		orient = AC_READ(ac, ORIENT);
-		if ((pdata->orientation_enable & ADXL_EN_ORIENTATION_2D) &&
-		    (orient & ADXL346_2D_VALID)) {
-
-			orient_code = ADXL346_2D_ORIENT(orient);
-			/* Report orientation only when it changes */
-			if (ac->orient2d_saved != orient_code) {
-				ac->orient2d_saved = orient_code;
-				adxl34x_report_key_single(ac->input,
-					pdata->ev_codes_orient_2d[orient_code]);
-			}
-		}
-
-		if ((pdata->orientation_enable & ADXL_EN_ORIENTATION_3D) &&
-		    (orient & ADXL346_3D_VALID)) {
-
-			orient_code = ADXL346_3D_ORIENT(orient) - 1;
-			/* Report orientation only when it changes */
-			if (ac->orient3d_saved != orient_code) {
-				ac->orient3d_saved = orient_code;
-				adxl34x_report_key_single(ac->input,
-					pdata->ev_codes_orient_3d[orient_code]);
-			}
-		}
-	}
-
-	if (int_stat & (DATA_READY | WATERMARK)) {
-
-		if (pdata->fifo_mode)
-			samples = ENTRIES(AC_READ(ac, FIFO_STATUS)) + 1;
-		else
-			samples = 1;
-
-		for (; samples > 0; samples--) {
-			adxl34x_service_ev_fifo(ac);
-			/*
-			 * To ensure that the FIFO has
-			 * completely popped, there must be at least 5 us between
-			 * the end of reading the data registers, signified by the
-			 * transition to register 0x38 from 0x37 or the CS pin
-			 * going high, and the start of new reads of the FIFO or
-			 * reading the FIFO_STATUS register. For SPI operation at
-			 * 1.5 MHz or lower, the register addressing portion of the
-			 * transmission is sufficient delay to ensure the FIFO has
-			 * completely popped. It is necessary for SPI operation
-			 * greater than 1.5 MHz to de-assert the CS pin to ensure a
-			 * total of 5 us, which is at most 3.4 us at 5 MHz
-			 * operation.
-			 */
-			if (ac->fifo_delay && (samples > 1))
-				udelay(3);
-		}
-	}
-
-	input_sync(ac->input);
-
-	return IRQ_HANDLED;
-}
-
-static void __adxl34x_disable(struct adxl34x *ac)
-{
-	/*
-	 * A '0' places the ADXL34x into standby mode
-	 * with minimum power consumption.
-	 */
-	AC_WRITE(ac, POWER_CTL, 0);
-}
-
-static void __adxl34x_enable(struct adxl34x *ac)
-{
-	AC_WRITE(ac, POWER_CTL, ac->pdata.power_mode | PCTL_MEASURE);
-}
-
-void adxl34x_suspend(struct adxl34x *ac)
-{
-	mutex_lock(&ac->mutex);
-
-	if (!ac->suspended && !ac->disabled && ac->opened)
-		__adxl34x_disable(ac);
-
-	ac->suspended = true;
-
-	mutex_unlock(&ac->mutex);
-}
-EXPORT_SYMBOL_GPL(adxl34x_suspend);
-
-void adxl34x_resume(struct adxl34x *ac)
-{
-	mutex_lock(&ac->mutex);
-
-	if (ac->suspended && !ac->disabled && ac->opened)
-		__adxl34x_enable(ac);
-
-	ac->suspended = false;
-
-	mutex_unlock(&ac->mutex);
-}
-EXPORT_SYMBOL_GPL(adxl34x_resume);
-
-static ssize_t adxl34x_disable_show(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-
-	return sprintf(buf, "%u\n", ac->disabled);
-}
-
-static ssize_t adxl34x_disable_store(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t count)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-	unsigned int val;
-	int error;
-
-	error = kstrtouint(buf, 10, &val);
-	if (error)
-		return error;
-
-	mutex_lock(&ac->mutex);
-
-	if (!ac->suspended && ac->opened) {
-		if (val) {
-			if (!ac->disabled)
-				__adxl34x_disable(ac);
-		} else {
-			if (ac->disabled)
-				__adxl34x_enable(ac);
-		}
-	}
-
-	ac->disabled = !!val;
-
-	mutex_unlock(&ac->mutex);
-
-	return count;
-}
-
-static DEVICE_ATTR(disable, 0664, adxl34x_disable_show, adxl34x_disable_store);
-
-static ssize_t adxl34x_calibrate_show(struct device *dev,
-				      struct device_attribute *attr, char *buf)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-	ssize_t count;
-
-	mutex_lock(&ac->mutex);
-	count = sprintf(buf, "%d,%d,%d\n",
-			ac->hwcal.x * 4 + ac->swcal.x,
-			ac->hwcal.y * 4 + ac->swcal.y,
-			ac->hwcal.z * 4 + ac->swcal.z);
-	mutex_unlock(&ac->mutex);
-
-	return count;
-}
-
-static ssize_t adxl34x_calibrate_store(struct device *dev,
-				       struct device_attribute *attr,
-				       const char *buf, size_t count)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-
-	/*
-	 * Hardware offset calibration has a resolution of 15.6 mg/LSB.
-	 * We use HW calibration and handle the remaining bits in SW. (4mg/LSB)
-	 */
-
-	mutex_lock(&ac->mutex);
-	ac->hwcal.x -= (ac->saved.x / 4);
-	ac->swcal.x = ac->saved.x % 4;
-
-	ac->hwcal.y -= (ac->saved.y / 4);
-	ac->swcal.y = ac->saved.y % 4;
-
-	ac->hwcal.z -= (ac->saved.z / 4);
-	ac->swcal.z = ac->saved.z % 4;
-
-	AC_WRITE(ac, OFSX, (s8) ac->hwcal.x);
-	AC_WRITE(ac, OFSY, (s8) ac->hwcal.y);
-	AC_WRITE(ac, OFSZ, (s8) ac->hwcal.z);
-	mutex_unlock(&ac->mutex);
-
-	return count;
-}
-
-static DEVICE_ATTR(calibrate, 0664,
-		   adxl34x_calibrate_show, adxl34x_calibrate_store);
-
-static ssize_t adxl34x_rate_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-
-	return sprintf(buf, "%u\n", RATE(ac->pdata.data_rate));
-}
-
-static ssize_t adxl34x_rate_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-	unsigned char val;
-	int error;
-
-	error = kstrtou8(buf, 10, &val);
-	if (error)
-		return error;
-
-	mutex_lock(&ac->mutex);
-
-	ac->pdata.data_rate = RATE(val);
-	AC_WRITE(ac, BW_RATE,
-		 ac->pdata.data_rate |
-			(ac->pdata.low_power_mode ? LOW_POWER : 0));
-
-	mutex_unlock(&ac->mutex);
-
-	return count;
-}
-
-static DEVICE_ATTR(rate, 0664, adxl34x_rate_show, adxl34x_rate_store);
-
-static ssize_t adxl34x_autosleep_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-
-	return sprintf(buf, "%u\n",
-		ac->pdata.power_mode & (PCTL_AUTO_SLEEP | PCTL_LINK) ? 1 : 0);
-}
-
-static ssize_t adxl34x_autosleep_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-	unsigned int val;
-	int error;
-
-	error = kstrtouint(buf, 10, &val);
-	if (error)
-		return error;
-
-	mutex_lock(&ac->mutex);
-
-	if (val)
-		ac->pdata.power_mode |= (PCTL_AUTO_SLEEP | PCTL_LINK);
-	else
-		ac->pdata.power_mode &= ~(PCTL_AUTO_SLEEP | PCTL_LINK);
-
-	if (!ac->disabled && !ac->suspended && ac->opened)
-		AC_WRITE(ac, POWER_CTL, ac->pdata.power_mode | PCTL_MEASURE);
-
-	mutex_unlock(&ac->mutex);
-
-	return count;
-}
-
-static DEVICE_ATTR(autosleep, 0664,
-		   adxl34x_autosleep_show, adxl34x_autosleep_store);
-
-static ssize_t adxl34x_position_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-	ssize_t count;
-
-	mutex_lock(&ac->mutex);
-	count = sprintf(buf, "(%d, %d, %d)\n",
-			ac->saved.x, ac->saved.y, ac->saved.z);
-	mutex_unlock(&ac->mutex);
-
-	return count;
-}
-
-static DEVICE_ATTR(position, S_IRUGO, adxl34x_position_show, NULL);
-
-#ifdef ADXL_DEBUG
-static ssize_t adxl34x_write_store(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t count)
-{
-	struct adxl34x *ac = dev_get_drvdata(dev);
-	unsigned int val;
-	int error;
-
-	/*
-	 * This allows basic ADXL register write access for debug purposes.
-	 */
-	error = kstrtouint(buf, 16, &val);
-	if (error)
-		return error;
-
-	mutex_lock(&ac->mutex);
-	AC_WRITE(ac, val >> 8, val & 0xFF);
-	mutex_unlock(&ac->mutex);
-
-	return count;
-}
-
-static DEVICE_ATTR(write, 0664, NULL, adxl34x_write_store);
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/wakelock.h>
+#include <linux/workqueue.h>
+#include <linux/uaccess.h>
+#include <linux/i2c/tc300k.h>
+//#include <plat/gpio-cfg.h>
+#ifdef CONFIG_HAS_EARLYSUSPEND
+#include <linux/earlysuspend.h>
+#endif
+#ifdef CONFIG_INPUT_BOOSTER
+#include <linux/input/input_booster.h>
+#endif
+#include <linux/regulator/consumer.h>
+#include <linux/sec_sysfs.h>
+#ifdef CONFIG_BATTERY_SAMSUNG
+#include <linux/sec_batt.h>
 #endif
 
-static struct attribute *adxl34x_attributes[] = {
-	&dev_attr_disable.attr,
-	&dev_attr_calibrate.attr,
-	&dev_attr_rate.attr,
-	&dev_attr_autosleep.attr,
-	&dev_attr_position.attr,
-#ifdef ADXL_DEBUG
-	&dev_attr_write.attr,
+#ifdef CONFIG_TOUCHKEY_GRIP
+#define FEATURE_GRIP_FOR_SAR
 #endif
-	NULL
-};
 
-static const struct attribute_group adxl34x_attr_group = {
-	.attrs = adxl34x_attributes,
-};
+#if defined (CONFIG_VBUS_NOTIFIER) && defined(FEATURE_GRIP_FOR_SAR)
+#include <linux/muic/muic.h>
+#include <linux/muic/muic_notifier.h>
+#include <linux/vbus_notifier.h>
+#endif
 
-static int adxl34x_input_open(struct input_dev *input)
-{
-	struct adxl34x *ac = input_get_drvdata(input);
+/* TSK IC */
+#define TC300K_TSK_IC	0x00
+#define TC350K_TSK_IC	0x01
 
-	mutex_lock(&ac->mutex);
+/* registers */
+#define TC300K_KEYCODE		0x00
+#define TC300K_FWVER		0x01
+#define TC300K_MDVER		0x02
+#define TC300K_MODE			0x03
+#define TC300K_CHECKS_H		0x04
+#define TC300K_CHECKS_L		0x05
+#define TC300K_THRES_H		0x06
+#define TC300K_THRES_L		0x07
+#define TC300K_1KEY_DATA	0x08
+#define TC300K_2KEY_DATA	0x0E
+#define TC300K_3KEY_DATA	0x14
+#define TC300K_4KEY_DATA	0x1A
+#define TC300K_5KEY_DATA	0x20
+#define TC300K_6KEY_DATA	0x26
 
-	if (!ac->suspended && !ac->disabled)
-		__adxl34x_enable(ac);
+#define TC300K_CH_PCK_H_OFFSET	0x00
+#define TC300K_CH_PCK_L_OFFSET	0x01
+#define TC300K_DIFF_H_OFFSET	0x02
+#define TC300K_DIFF_L_OFFSET	0x03
+#define TC300K_RAW_H_OFFSET		0x04
+#define TC300K_RAW_L_OFFSET		0x05
 
-	ac->opened = true;
+/* registers for tabs2(tc350k) */
+#define TC350K_1KEY		0x10	// recent inner
+#define TC350K_2KEY		0x18	// back inner
+#define TC350K_3KEY		0x20	// recent outer
+#define TC350K_4KEY		0x28	// back outer
 
-	mutex_unlock(&ac->mutex);
-
-	return 0;
-}
-
-static void adxl34x_input_close(struct input_dev *input)
-{
-	struct adxl34x *ac = input_get_drvdata(input);
-
-	mutex_lock(&ac->mutex);
-
-	if (!ac->suspended && !ac->disabled)
-		__adxl34x_disable(ac);
-
-	ac->opened = false;
-
-	mutex_unlock(&ac->mutex);
-}
-
-struct adxl34x *adxl34x_probe(struct device *dev, int irq,
-			      bool fifo_delay_default,
-			      const struct adxl34x_bus_ops *bops)
-{
-	struct adxl34x *ac;
-	struct input_dev *input_dev;
-	const struct adxl34x_platform_data *pdata;
-	int err, range, i;
-	int revid;
-
-	if (!irq) {
-		dev_err(dev, "no IRQ?\n");
-		err = -ENODEV;
-		goto err_out;
-	}
-
-	ac = kzalloc(sizeof(*ac), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!ac || !input_dev) {
-		err = -ENOMEM;
-		goto err_free_mem;
-	}
-
-	ac->fifo_delay = fifo_delay_default;
-
-	pdata = dev_get_platdata(dev);
-	if (!pdata) {
-		dev_dbg(dev,
-			"No platform data: Using default initialization\n");
-		pdata = &adxl34x_default_init;
-	}
-
-	ac->pdata = *pdata;
-	pdata = &ac->pdata;
-
-	ac->input = input_dev;
-	ac->dev = dev;
-	ac->irq = irq;
-	ac->bops = bops;
-
-	mutex_init(&ac->mutex);
-
-	input_dev->name = "ADXL34x accelerometer";
-	revid = AC_READ(ac, DEVID);
-
-	switch (revid) {
-	case ID_ADXL345:
-		ac->model = 345;
-		break;
-	case ID_ADXL346:
-		ac->model = 346;
-		break;
-	default:
-		dev_err(dev, "Failed to probe %s\n", input_dev->name);
-		err = -ENODEV;
-		goto err_free_mem;
-	}
-
-	snprintf(ac->phys, sizeof(ac->phys), "%s/input0", dev_name(dev));
-
-	input_dev->phys = ac->phys;
-	input_dev->dev.parent = dev;
-	input_dev->id.product = ac->model;
-	input_dev->id.bustype = bops->bustype;
-	input_dev->open = adxl34x_input_open;
-	input_dev->close = adxl34x_input_close;
-
-	input_set_drvdata(input_dev, ac);
-
-	__set_bit(ac->pdata.ev_type, input_dev->evbit);
-
-	if (ac->pdata.ev_type == EV_REL) {
-		__set_bit(REL_X, input_dev->relbit);
-		__set_bit(REL_Y, input_dev->relbit);
-		__set_bit(REL_Z, input_dev->relbit);
-	} else {
-		/* EV_ABS */
-		__set_bit(ABS_X, input_dev->absbit);
-		__set_bit(ABS_Y, input_dev->absbit);
-		__set_bit(ABS_Z, input_dev->absbit);
-
-		if (pdata->data_range & FULL_RES)
-			range = ADXL_FULLRES_MAX_VAL;	/* Signed 13-bit */
-		else
-			range = ADXL_FIXEDRES_MAX_VAL;	/* Signed 10-bit */
-
-		input_set_abs_params(input_dev, ABS_X, -range, range, 3, 3);
-		input_set_abs_params(input_dev, ABS_Y, -range, range, 3, 3);
-		input_set_abs_params(input_dev, ABS_Z, -range, range, 3, 3);
-	}
-
-	__set_bit(EV_KEY, input_dev->evbit);
-	__set_bit(pdata->ev_code_tap[ADXL_X_AXIS], input_dev->keybit);
-	__set_bit(pdata->ev_code_tap[ADXL_Y_AXIS], input_dev->keybit);
-	__set_bit(pdata->ev_code_tap[ADXL_Z_AXIS], input_dev->keybit);
-
-	if (pdata->ev_code_ff) {
-		ac->int_mask = FREE_FALL;
-		__set_bit(pdata->ev_code_ff, input_dev->keybit);
-	}
-
-	if (pdata->ev_code_act_inactivity)
-		__set_bit(pdata->ev_code_act_inactivity, input_dev->keybit);
-
-	ac->int_mask |= ACTIVITY | INACTIVITY;
-
-	if (pdata->watermark) {
-		ac->int_mask |= WATERMARK;
-		if (!FIFO_MODE(pdata->fifo_mode))
-			ac->pdata.fifo_mode |= FIFO_STREAM;
-	} else {
-		ac->int_mask |= DATA_READY;
-	}
-
-	if (pdata->tap_axis_control & (TAP_X_EN | TAP_Y_EN | TAP_Z_EN))
-		ac->int_mask |= SINGLE_TAP | DOUBLE_TAP;
-
-	if (FIFO_MODE(pdata->fifo_mode) == FIFO_BYPASS)
-		ac->fifo_delay = false;
-
-	AC_WRITE(ac, POWER_CTL, 0);
-
-	err = request_threaded_irq(ac->irq, NULL, adxl34x_irq,
-				   IRQF_ONESHOT, dev_name(dev), ac);
-	if (err) {
-		dev_err(dev, "irq %d busy?\n", ac->irq);
-		goto err_free_mem;
-	}
-
-	err = sysfs_create_group(&dev->kobj, &adxl34x_attr_group);
-	if (err)
-		goto err_free_irq;
-
-	err = input_register_device(input_dev);
-	if (err)
-		goto err_remove_attr;
-
-	AC_WRITE(ac, OFSX, pdata->x_axis_offset);
-	ac->hwcal.x = pdata->x_axis_offset;
-	AC_WRITE(ac, OFSY, pdata->y_axis_offset);
-	ac->hwcal.y = pdata->y_axis_offset;
-	AC_WRITE(ac, OFSZ, pdata->z_axis_offset);
-	ac->hwcal.z = pdata->z_axis_offset;
-	AC_WRITE(ac, THRESH_TAP, pdata->tap_threshold);
-	AC_WRITE(ac, DUR, pdata->tap_duration);
-	AC_WRITE(ac, LATENT, pdata->tap_latency);
-	AC_WRITE(ac, WINDOW, pdata->tap_window);
-	AC_WRITE(ac, THRESH_ACT, pdata->activity_threshold);
-	AC_WRITE(ac, THRESH_INACT, pdata->inactivity_threshold);
-	AC_WRITE(ac, TIME_INACT, pdata->inactivity_time);
-	AC_WRITE(ac, THRESH_FF, pdata->free_fall_threshold);
-	AC_WRITE(ac, TIME_FF, pdata->free_fall_time);
-	AC_WRITE(ac, TAP_AXES, pdata->tap_axis_control);
-	AC_WRITE(ac, ACT_INACT_CTL, pdata->act_axis_control);
-	AC_WRITE(ac, BW_RATE, RATE(ac->pdata.data_rate) |
-		 (pdata->low_power_mode ? LOW_POWER : 0));
-	AC_WRITE(ac, DATA_FORMAT, pdata->data_range);
-	AC_WRITE(ac, FIFO_CTL, FIFO_MODE(pdata->fifo_mode) |
-			SAMPLES(pdata->watermark));
-
-	if (pdata->use_int2) {
-		/* Map all INTs to INT2 */
-		AC_WRITE(ac, INT_MAP, ac->int_mask | OVERRUN);
-	} else {
-		/* Map all INTs to INT1 */
-		AC_WRITE(ac, INT_MAP, 0);
-	}
-
-	if (ac->model == 346 && ac->pdata.orientation_enable) {
-		AC_WRITE(ac, ORIENT_CONF,
-			ORIENT_DEADZONE(ac->pdata.deadzone_angle) |
-			ORIENT_DIVISOR(ac->pdata.divisor_length));
-
-		ac->orient2d_saved = 1234;
-		ac->orient3d_saved = 1234;
-
-		if (pdata->orientation_enable & ADXL_EN_ORIENTATION_3D)
-			for (i = 0; i < ARRAY_SIZE(pdata->ev_codes_orient_3d); i++)
-				__set_bit(pdata->ev_codes_orient_3d[i],
-					  input_dev->keybit);
-
-		if (pdata->orientation_enable & ADXL_EN_ORIENTATION_2D)
-			for (i = 0; i < ARRAY_SIZE(pdata->ev_codes_orient_2d); i++)
-				__set_bit(pdata->ev_codes_orient_2d[i],
-					  input_dev->keybit);
-	} else {
-		ac->pdata.orientation_enable = 0;
-	}
-
-	AC_WRITE(ac, INT_ENABLE, ac->int_mask | OVERRUN);
-
-	ac->pdata.power_mode &= (PCTL_AUTO_SLEEP | PCTL_LINK);
-
-	return ac;
-
- err_remove_attr:
-	sysfs_remove_group(&dev->kobj, &adxl34x_attr_group);
- err_free_irq:
-	free_irq(ac->irq, ac);
- err_free_mem:
-	input_free_device(input_dev);
-	kfree(ac);
- err_out:
-	return ERR_PTR(err);
-}
-EXPORT_SYMBOL_GPL(adxl34x_probe);
-
-int adxl34x_remove(struct adxl34x *ac)
-{
-	sysfs_remove_group(&ac->dev->kobj, &adxl34x_attr_group);
-	free_irq(ac->irq, ac);
-	input_unregister_device(ac->input);
-	dev_dbg(ac->dev, "unregistered accelerometer\n");
-	kfree(ac);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(adxl34x_remove);
-
-MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
-MODULE_DESCRIPTION("ADXL345/346 Three-Axis Digital Accelerometer Driver");
-MODULE_LICENSE("GPL");
+#ifdef FEATURE_GRIP_FOR_SAR
+/* registers for grip sensor */
+#define TC305K_GRIPCODE			0x0F
+#define TC305K_GRIP_THD_PRESS		0x00
+#define TC305K_GRIP_THD_RELEASE		0x02
+#define TC305K_GRIP_THD_NOISE		0x04
+#define TC305K_GRIP_CH_PERCENT		0x06
+#define TC305K_GRIP_DIFF_DATA		0x08
+#

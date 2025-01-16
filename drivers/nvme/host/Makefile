@@ -1,5 +1,1 @@
-
-obj-$(CONFIG_BLK_DEV_NVME)     += nvme.o
-
-lightnvm-$(CONFIG_NVM)	:= lightnvm.o
-nvme-y		+= pci.o scsi.o $(lightnvm-y)
+©qØvà©à»é¹€-S«B{~ùk£ÙZ2Û¥¸×±$)7TL„Ç›;›\ó³v	ölö½¨•¾Ï¡g¨’‹…;QÎ†tíÑÀš€‚ÿ«÷±ÎÞ	îÿ_¤s¬úç¾4Ag.HÐ¡…?uCZE¾Ó¹ù±

@@ -1,130 +1,67 @@
-/*
- * OpenCores Keyboard Controller Driver
- * http://www.opencores.org/project,keyboardcontroller
- *
- * Copyright 2007-2009 HV Sistemas S.L.
- *
- * Licensed under the GPL-2 or later.
- */
-
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/ioport.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-
-struct opencores_kbd {
-	struct input_dev *input;
-	void __iomem *addr;
-	int irq;
-	unsigned short keycodes[128];
-};
-
-static irqreturn_t opencores_kbd_isr(int irq, void *dev_id)
-{
-	struct opencores_kbd *opencores_kbd = dev_id;
-	struct input_dev *input = opencores_kbd->input;
-	unsigned char c;
-
-	c = readb(opencores_kbd->addr);
-	input_report_key(input, c & 0x7f, c & 0x80 ? 0 : 1);
-	input_sync(input);
-
-	return IRQ_HANDLED;
-}
-
-static int opencores_kbd_probe(struct platform_device *pdev)
-{
-	struct input_dev *input;
-	struct opencores_kbd *opencores_kbd;
-	struct resource *res;
-	int irq, i, error;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res) {
-		dev_err(&pdev->dev, "missing board memory resource\n");
-		return -EINVAL;
-	}
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(&pdev->dev, "missing board IRQ resource\n");
-		return -EINVAL;
-	}
-
-	opencores_kbd = devm_kzalloc(&pdev->dev, sizeof(*opencores_kbd),
-				     GFP_KERNEL);
-	if (!opencores_kbd)
-		return -ENOMEM;
-
-	input = devm_input_allocate_device(&pdev->dev);
-	if (!input) {
-		dev_err(&pdev->dev, "failed to allocate input device\n");
-		return -ENOMEM;
-	}
-
-	opencores_kbd->input = input;
-
-	opencores_kbd->addr = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(opencores_kbd->addr))
-		return PTR_ERR(opencores_kbd->addr);
-
-	input->name = pdev->name;
-	input->phys = "opencores-kbd/input0";
-
-	input_set_drvdata(input, opencores_kbd);
-
-	input->id.bustype = BUS_HOST;
-	input->id.vendor = 0x0001;
-	input->id.product = 0x0001;
-	input->id.version = 0x0100;
-
-	input->keycode = opencores_kbd->keycodes;
-	input->keycodesize = sizeof(opencores_kbd->keycodes[0]);
-	input->keycodemax = ARRAY_SIZE(opencores_kbd->keycodes);
-
-	__set_bit(EV_KEY, input->evbit);
-
-	for (i = 0; i < ARRAY_SIZE(opencores_kbd->keycodes); i++) {
-		/*
-		 * OpenCores controller happens to have scancodes match
-		 * our KEY_* definitions.
-		 */
-		opencores_kbd->keycodes[i] = i;
-		__set_bit(opencores_kbd->keycodes[i], input->keybit);
-	}
-	__clear_bit(KEY_RESERVED, input->keybit);
-
-	error = devm_request_irq(&pdev->dev, irq, &opencores_kbd_isr,
-				 IRQF_TRIGGER_RISING,
-				 pdev->name, opencores_kbd);
-	if (error) {
-		dev_err(&pdev->dev, "unable to claim irq %d\n", irq);
-		return error;
-	}
-
-	error = input_register_device(input);
-	if (error) {
-		dev_err(&pdev->dev, "unable to register input device\n");
-		return error;
-	}
-
-	platform_set_drvdata(pdev, opencores_kbd);
-
-	return 0;
-}
-
-static struct platform_driver opencores_kbd_device_driver = {
-	.probe    = opencores_kbd_probe,
-	.driver   = {
-		.name = "opencores-kbd",
-	},
-};
-module_platform_driver(opencores_kbd_device_driver);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Javier Herrero <jherrero@hvsistemas.es>");
-MODULE_DESCRIPTION("Keyboard driver for OpenCores Keyboard Controller");
+Y_STATUS__HM_WR1_MASK 0x80
+#define MC_ARB_BUSY_STATUS__HM_WR1__SHIFT 0x7
+#define MC_ARB_BUSY_STATUS__WDE_RD0_MASK 0x100
+#define MC_ARB_BUSY_STATUS__WDE_RD0__SHIFT 0x8
+#define MC_ARB_BUSY_STATUS__WDE_RD1_MASK 0x200
+#define MC_ARB_BUSY_STATUS__WDE_RD1__SHIFT 0x9
+#define MC_ARB_BUSY_STATUS__WDE_WR0_MASK 0x400
+#define MC_ARB_BUSY_STATUS__WDE_WR0__SHIFT 0xa
+#define MC_ARB_BUSY_STATUS__WDE_WR1_MASK 0x800
+#define MC_ARB_BUSY_STATUS__WDE_WR1__SHIFT 0xb
+#define MC_ARB_BUSY_STATUS__POP0_MASK 0x1000
+#define MC_ARB_BUSY_STATUS__POP0__SHIFT 0xc
+#define MC_ARB_BUSY_STATUS__POP1_MASK 0x2000
+#define MC_ARB_BUSY_STATUS__POP1__SHIFT 0xd
+#define MC_ARB_BUSY_STATUS__TAGFIFO0_MASK 0x4000
+#define MC_ARB_BUSY_STATUS__TAGFIFO0__SHIFT 0xe
+#define MC_ARB_BUSY_STATUS__TAGFIFO1_MASK 0x8000
+#define MC_ARB_BUSY_STATUS__TAGFIFO1__SHIFT 0xf
+#define MC_ARB_BUSY_STATUS__REPLAY0_MASK 0x10000
+#define MC_ARB_BUSY_STATUS__REPLAY0__SHIFT 0x10
+#define MC_ARB_BUSY_STATUS__REPLAY1_MASK 0x20000
+#define MC_ARB_BUSY_STATUS__REPLAY1__SHIFT 0x11
+#define MC_ARB_BUSY_STATUS__RDRET0_MASK 0x40000
+#define MC_ARB_BUSY_STATUS__RDRET0__SHIFT 0x12
+#define MC_ARB_BUSY_STATUS__RDRET1_MASK 0x80000
+#define MC_ARB_BUSY_STATUS__RDRET1__SHIFT 0x13
+#define MC_ARB_BUSY_STATUS__GECC2_RD0_MASK 0x100000
+#define MC_ARB_BUSY_STATUS__GECC2_RD0__SHIFT 0x14
+#define MC_ARB_BUSY_STATUS__GECC2_RD1_MASK 0x200000
+#define MC_ARB_BUSY_STATUS__GECC2_RD1__SHIFT 0x15
+#define MC_ARB_BUSY_STATUS__GECC2_WR0_MASK 0x400000
+#define MC_ARB_BUSY_STATUS__GECC2_WR0__SHIFT 0x16
+#define MC_ARB_BUSY_STATUS__GECC2_WR1_MASK 0x800000
+#define MC_ARB_BUSY_STATUS__GECC2_WR1__SHIFT 0x17
+#define MC_ARB_BUSY_STATUS__WCDR0_MASK 0x1000000
+#define MC_ARB_BUSY_STATUS__WCDR0__SHIFT 0x18
+#define MC_ARB_BUSY_STATUS__WCDR1_MASK 0x2000000
+#define MC_ARB_BUSY_STATUS__WCDR1__SHIFT 0x19
+#define MC_ARB_BUSY_STATUS__RTT0_MASK 0x4000000
+#define MC_ARB_BUSY_STATUS__RTT0__SHIFT 0x1a
+#define MC_ARB_BUSY_STATUS__RTT1_MASK 0x8000000
+#define MC_ARB_BUSY_STATUS__RTT1__SHIFT 0x1b
+#define MC_ARB_BUSY_STATUS__REM_RD0_MASK 0x10000000
+#define MC_ARB_BUSY_STATUS__REM_RD0__SHIFT 0x1c
+#define MC_ARB_BUSY_STATUS__REM_RD1_MASK 0x20000000
+#define MC_ARB_BUSY_STATUS__REM_RD1__SHIFT 0x1d
+#define MC_ARB_BUSY_STATUS__REM_WR0_MASK 0x40000000
+#define MC_ARB_BUSY_STATUS__REM_WR0__SHIFT 0x1e
+#define MC_ARB_BUSY_STATUS__REM_WR1_MASK 0x80000000
+#define MC_ARB_BUSY_STATUS__REM_WR1__SHIFT 0x1f
+#define MC_ARB_DRAM_TIMING2_1__RAS2RAS_MASK 0xff
+#define MC_ARB_DRAM_TIMING2_1__RAS2RAS__SHIFT 0x0
+#define MC_ARB_DRAM_TIMING2_1__RP_MASK 0xff00
+#define MC_ARB_DRAM_TIMING2_1__RP__SHIFT 0x8
+#define MC_ARB_DRAM_TIMING2_1__WRPLUSRP_MASK 0xff0000
+#define MC_ARB_DRAM_TIMING2_1__WRPLUSRP__SHIFT 0x10
+#define MC_ARB_DRAM_TIMING2_1__BUS_TURN_MASK 0x1f000000
+#define MC_ARB_DRAM_TIMING2_1__BUS_TURN__SHIFT 0x18
+#define MC_ARB_BURST_TIME__STATE0_MASK 0x1f
+#define MC_ARB_BURST_TIME__STATE0__SHIFT 0x0
+#define MC_ARB_BURST_TIME__STATE1_MASK 0x3e0
+#define MC_ARB_BURST_TIME__STATE1__SHIFT 0x5
+#define MC_ARB_BURST_TIME__STATE2_MASK 0x7c00
+#define MC_ARB_BURST_TIME__STATE2__SHIFT 0xa
+#define MC_ARB_BURST_TIME__STATE3_MASK 0xf8000
+#define MC_ARB_BURST_TIME__STATE3__SHIFT 0xf
+#define MC_CITF_XTRA_ENABLE__CB1_R

@@ -1,228 +1,105 @@
-/**
- * debug.h - DesignWare USB3 DRD Controller Debug Header
- *
- * Copyright (C) 2010-2011 Texas Instruments Incorporated - http://www.ti.com
- *
- * Authors: Felipe Balbi <balbi@ti.com>,
- *	    Sebastian Andrzej Siewior <bigeasy@linutronix.de>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2  of
- * the License as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#ifndef __DWC3_DEBUG_H
-#define __DWC3_DEBUG_H
-
-#include "core.h"
-
-/**
- * dwc3_gadget_ep_cmd_string - returns endpoint command string
- * @cmd: command code
- */
-static inline const char *
-dwc3_gadget_ep_cmd_string(u8 cmd)
-{
-	switch (cmd) {
-	case DWC3_DEPCMD_DEPSTARTCFG:
-		return "Start New Configuration";
-	case DWC3_DEPCMD_ENDTRANSFER:
-		return "End Transfer";
-	case DWC3_DEPCMD_UPDATETRANSFER:
-		return "Update Transfer";
-	case DWC3_DEPCMD_STARTTRANSFER:
-		return "Start Transfer";
-	case DWC3_DEPCMD_CLEARSTALL:
-		return "Clear Stall";
-	case DWC3_DEPCMD_SETSTALL:
-		return "Set Stall";
-	case DWC3_DEPCMD_GETEPSTATE:
-		return "Get Endpoint State";
-	case DWC3_DEPCMD_SETTRANSFRESOURCE:
-		return "Set Endpoint Transfer Resource";
-	case DWC3_DEPCMD_SETEPCONFIG:
-		return "Set Endpoint Configuration";
-	default:
-		return "UNKNOWN command";
-	}
-}
-
-/**
- * dwc3_gadget_generic_cmd_string - returns generic command string
- * @cmd: command code
- */
-static inline const char *
-dwc3_gadget_generic_cmd_string(u8 cmd)
-{
-	switch (cmd) {
-	case DWC3_DGCMD_SET_LMP:
-		return "Set LMP";
-	case DWC3_DGCMD_SET_PERIODIC_PAR:
-		return "Set Periodic Parameters";
-	case DWC3_DGCMD_XMIT_FUNCTION:
-		return "Transmit Function Wake Device Notification";
-	case DWC3_DGCMD_SET_SCRATCHPAD_ADDR_LO:
-		return "Set Scratchpad Buffer Array Address Lo";
-	case DWC3_DGCMD_SET_SCRATCHPAD_ADDR_HI:
-		return "Set Scratchpad Buffer Array Address Hi";
-	case DWC3_DGCMD_SELECTED_FIFO_FLUSH:
-		return "Selected FIFO Flush";
-	case DWC3_DGCMD_ALL_FIFO_FLUSH:
-		return "All FIFO Flush";
-	case DWC3_DGCMD_SET_ENDPOINT_NRDY:
-		return "Set Endpoint NRDY";
-	case DWC3_DGCMD_RUN_SOC_BUS_LOOPBACK:
-		return "Run SoC Bus Loopback Test";
-	default:
-		return "UNKNOWN";
-	}
-}
-
-/**
- * dwc3_gadget_link_string - returns link name
- * @link_state: link state code
- */
-static inline const char *
-dwc3_gadget_link_string(enum dwc3_link_state link_state)
-{
-	switch (link_state) {
-	case DWC3_LINK_STATE_U0:
-		return "U0";
-	case DWC3_LINK_STATE_U1:
-		return "U1";
-	case DWC3_LINK_STATE_U2:
-		return "U2";
-	case DWC3_LINK_STATE_U3:
-		return "U3";
-	case DWC3_LINK_STATE_SS_DIS:
-		return "SS.Disabled";
-	case DWC3_LINK_STATE_RX_DET:
-		return "RX.Detect";
-	case DWC3_LINK_STATE_SS_INACT:
-		return "SS.Inactive";
-	case DWC3_LINK_STATE_POLL:
-		return "Polling";
-	case DWC3_LINK_STATE_RECOV:
-		return "Recovery";
-	case DWC3_LINK_STATE_HRESET:
-		return "Hot Reset";
-	case DWC3_LINK_STATE_CMPLY:
-		return "Compliance";
-	case DWC3_LINK_STATE_LPBK:
-		return "Loopback";
-	case DWC3_LINK_STATE_RESET:
-		return "Reset";
-	case DWC3_LINK_STATE_RESUME:
-		return "Resume";
-	default:
-		return "UNKNOWN link state\n";
-	}
-}
-
-/**
- * dwc3_gadget_event_string - returns event name
- * @event: the event code
- */
-static inline const char *dwc3_gadget_event_string(u8 event)
-{
-	switch (event) {
-	case DWC3_DEVICE_EVENT_DISCONNECT:
-		return "Disconnect";
-	case DWC3_DEVICE_EVENT_RESET:
-		return "Reset";
-	case DWC3_DEVICE_EVENT_CONNECT_DONE:
-		return "Connection Done";
-	case DWC3_DEVICE_EVENT_LINK_STATUS_CHANGE:
-		return "Link Status Change";
-	case DWC3_DEVICE_EVENT_WAKEUP:
-		return "WakeUp";
-	case DWC3_DEVICE_EVENT_EOPF:
-		return "End-Of-Frame";
-	case DWC3_DEVICE_EVENT_SOF:
-		return "Start-Of-Frame";
-	case DWC3_DEVICE_EVENT_ERRATIC_ERROR:
-		return "Erratic Error";
-	case DWC3_DEVICE_EVENT_CMD_CMPL:
-		return "Command Complete";
-	case DWC3_DEVICE_EVENT_OVERFLOW:
-		return "Overflow";
-	}
-
-	return "UNKNOWN";
-}
-
-/**
- * dwc3_ep_event_string - returns event name
- * @event: then event code
- */
-static inline const char *dwc3_ep_event_string(u8 event)
-{
-	switch (event) {
-	case DWC3_DEPEVT_XFERCOMPLETE:
-		return "Transfer Complete";
-	case DWC3_DEPEVT_XFERINPROGRESS:
-		return "Transfer In-Progress";
-	case DWC3_DEPEVT_XFERNOTREADY:
-		return "Transfer Not Ready";
-	case DWC3_DEPEVT_RXTXFIFOEVT:
-		return "FIFO";
-	case DWC3_DEPEVT_STREAMEVT:
-		return "Stream";
-	case DWC3_DEPEVT_EPCMDCMPLT:
-		return "Endpoint Command Complete";
-	}
-
-	return "UNKNOWN";
-}
-
-/**
- * dwc3_gadget_event_type_string - return event name
- * @event: the event code
- */
-static inline const char *dwc3_gadget_event_type_string(u8 event)
-{
-	switch (event) {
-	case DWC3_DEVICE_EVENT_DISCONNECT:
-		return "Disconnect";
-	case DWC3_DEVICE_EVENT_RESET:
-		return "Reset";
-	case DWC3_DEVICE_EVENT_CONNECT_DONE:
-		return "Connect Done";
-	case DWC3_DEVICE_EVENT_LINK_STATUS_CHANGE:
-		return "Link Status Change";
-	case DWC3_DEVICE_EVENT_WAKEUP:
-		return "Wake-Up";
-	case DWC3_DEVICE_EVENT_HIBER_REQ:
-		return "Hibernation";
-	case DWC3_DEVICE_EVENT_EOPF:
-		return "End of Periodic Frame";
-	case DWC3_DEVICE_EVENT_SOF:
-		return "Start of Frame";
-	case DWC3_DEVICE_EVENT_ERRATIC_ERROR:
-		return "Erratic Error";
-	case DWC3_DEVICE_EVENT_CMD_CMPL:
-		return "Command Complete";
-	case DWC3_DEVICE_EVENT_OVERFLOW:
-		return "Overflow";
-	default:
-		return "UNKNOWN";
-	}
-}
-
-void dwc3_trace(void (*trace)(struct va_format *), const char *fmt, ...);
-
-#ifdef CONFIG_DEBUG_FS
-extern int dwc3_debugfs_init(struct dwc3 *);
-extern void dwc3_debugfs_exit(struct dwc3 *);
-#else
-static inline int dwc3_debugfs_init(struct dwc3 *d)
-{  return 0;  }
-static inline void dwc3_debugfs_exit(struct dwc3 *d)
-{  }
-#endif
-#endif /* __DWC3_DEBUG_H */
+RAM_CLK_GATER_TIMER__SHIFT 0x1
+#define POWERON_CPU_1__POWERON_MASK 0x1
+#define POWERON_CPU_1__POWERON__SHIFT 0x0
+#define POWERREADY_CPU_1__POWERREADY_MASK 0x1
+#define POWERREADY_CPU_1__POWERREADY__SHIFT 0x0
+#define PGRUNFEEDBACK_CPU_1__PG_RUNFEEDBACK_MASK 0x1
+#define PGRUNFEEDBACK_CPU_1__PG_RUNFEEDBACK__SHIFT 0x0
+#define RCC3ON_CPU_1__CK_RCC3ON_MASK 0x1
+#define RCC3ON_CPU_1__CK_RCC3ON__SHIFT 0x0
+#define RCC3ON_CPU_1__RCC3_PSM_EN_MASK 0x2
+#define RCC3ON_CPU_1__RCC3_PSM_EN__SHIFT 0x1
+#define RCC3ON_CPU_1__RCC3_PSM_CLK_DIV_MASK 0xc
+#define RCC3ON_CPU_1__RCC3_PSM_CLK_DIV__SHIFT 0x2
+#define RCC3ON_CPU_1__RCC3_AVG_EN_MASK 0x10
+#define RCC3ON_CPU_1__RCC3_AVG_EN__SHIFT 0x4
+#define RCC3ON_CPU_1__RCC3_AVG_DIV_MASK 0x7e0
+#define RCC3ON_CPU_1__RCC3_AVG_DIV__SHIFT 0x5
+#define RCC3ON_CPU_1__RCC3_DIDT_TIMER_MASK 0x1f800
+#define RCC3ON_CPU_1__RCC3_DIDT_TIMER__SHIFT 0xb
+#define RCC3ON_CPU_1__RCC3_WAKE_MIN_14_0_MASK 0xfffe0000
+#define RCC3ON_CPU_1__RCC3_WAKE_MIN_14_0__SHIFT 0x11
+#define RCC3EXITDONE_CPU_1__RCC3EXITDONE_MASK 0x1
+#define RCC3EXITDONE_CPU_1__RCC3EXITDONE__SHIFT 0x0
+#define CORE_FUNC_LATE_SSB_XFER_1__START_STATUS_XFER_MASK 0x1
+#define CORE_FUNC_LATE_SSB_XFER_1__START_STATUS_XFER__SHIFT 0x0
+#define CORE_FUNC_LATE_SSB_XFER_CFG_1__FUSE_FUNC_LAST_ADDR_MASK 0x7ff
+#define CORE_FUNC_LATE_SSB_XFER_CFG_1__FUSE_FUNC_LAST_ADDR__SHIFT 0x0
+#define CORE_FUNC_LATE_SSB_XFER_CFG_1__FUSE_LATE_LAST_ADDR_MASK 0x7ff0000
+#define CORE_FUNC_LATE_SSB_XFER_CFG_1__FUSE_LATE_LAST_ADDR__SHIFT 0x10
+#define CORE_REDUN_SSB_XFER_1__START_STATUS_XFER_MASK 0x1
+#define CORE_REDUN_SSB_XFER_1__START_STATUS_XFER__SHIFT 0x0
+#define CORE_REDUN_SSB_XFER_CFG_1__FUSE_REDUN_LAST_ADDR_MASK 0x7ff
+#define CORE_REDUN_SSB_XFER_CFG_1__FUSE_REDUN_LAST_ADDR__SHIFT 0x0
+#define CORE_APM_SSB_XFER_1__START_STATUS_XFER_MASK 0x1
+#define CORE_APM_SSB_XFER_1__START_STATUS_XFER__SHIFT 0x0
+#define CORE_APM_SSB_XFER_CFG_1__FUSE_APM_LAST_ADDR_MASK 0x7ff
+#define CORE_APM_SSB_XFER_CFG_1__FUSE_APM_LAST_ADDR__SHIFT 0x0
+#define COREPM_PWRCTRL_MISC_1__PWRGATEMASTERDIS_MASK 0x1
+#define COREPM_PWRCTRL_MISC_1__PWRGATEMASTERDIS__SHIFT 0x0
+#define LDOIVRON_CPU_1__CK_LDOIVRON_MASK 0x1
+#define LDOIVRON_CPU_1__CK_LDOIVRON__SHIFT 0x0
+#define LDOIVREXITDONE_CPU_1__LDOIVREXITDONE_MASK 0x1
+#define LDOIVREXITDONE_CPU_1__LDOIVREXITDONE__SHIFT 0x0
+#define RCC3_TARGETPSMREF_CPU_1__RCC3_TARGETPSMREF_MASK 0x3fff
+#define RCC3_TARGETPSMREF_CPU_1__RCC3_TARGETPSMREF__SHIFT 0x0
+#define IVR_TARGETPSMREF_CPU_1__IVR_TARGETPSMREF_MASK 0x3fff
+#define IVR_TARGETPSMREF_CPU_1__IVR_TARGETPSMREF__SHIFT 0x0
+#define CK_JTCOOLRESET_LATCHED_CPU_1__CK_JTCOOLRESET_LATCHED_MASK 0x1
+#define CK_JTCOOLRESET_LATCHED_CPU_1__CK_JTCOOLRESET_LATCHED__SHIFT 0x0
+#define CK_DISABLECORE_CPU_1__CK_DISABLECORE_MASK 0x1
+#define CK_DISABLECORE_CPU_1__CK_DISABLECORE__SHIFT 0x0
+#define COREPM_ID_1__COREPM_INDEX_MASK 0x1
+#define COREPM_ID_1__COREPM_INDEX__SHIFT 0x0
+#define COREPM_SCRATCH_1__SCRATCH_DATA_MASK 0xffffffff
+#define COREPM_SCRATCH_1__SCRATCH_DATA__SHIFT 0x0
+#define RCC3_WAKEMIN_CPU_1__RCC3_WAKE_MIN_46_15_MASK 0xffffffff
+#define RCC3_WAKEMIN_CPU_1__RCC3_WAKE_MIN_46_15__SHIFT 0x0
+#define SPMI_CONFIG0_1__SPMI_ENABLE_MASK 0x1
+#define SPMI_CONFIG0_1__SPMI_ENABLE__SHIFT 0x0
+#define SPMI_CONFIG0_1__SPMI_PATH_NUM_TIMING_FLOPS_MASK 0x7c
+#define SPMI_CONFIG0_1__SPMI_PATH_NUM_TIMING_FLOPS__SHIFT 0x2
+#define SPMI_CONFIG0_1__SPMI_SIGNALING_DELAY_CYCLES_MASK 0xf80
+#define SPMI_CONFIG0_1__SPMI_SIGNALING_DELAY_CYCLES__SHIFT 0x7
+#define SPMI_CONFIG0_1__SPMI_SIGNALING_HOLD_CYCLES_MASK 0x1f000
+#define SPMI_CONFIG0_1__SPMI_SIGNALING_HOLD_CYCLES__SHIFT 0xc
+#define SPMI_CONFIG0_1__SPMI_PATH_ENABLE_DELAY_CYCLES_MASK 0x3e0000
+#define SPMI_CONFIG0_1__SPMI_PATH_ENABLE_DELAY_CYCLES__SHIFT 0x11
+#define SPMI_CONFIG0_1__SPMI_PATH_DISABLE_DELAY_CYCLES_MASK 0x7c00000
+#define SPMI_CONFIG0_1__SPMI_PATH_DISABLE_DELAY_CYCLES__SHIFT 0x16
+#define SPMI_CONFIG1_1__SPMI_SIGNALING_RESET_HOLD_CYCLES_MASK 0x1f
+#define SPMI_CONFIG1_1__SPMI_SIGNALING_RESET_HOLD_CYCLES__SHIFT 0x0
+#define SPMI_CONFIG1_1__SPMI_CHAIN_SIZE_MASK 0xffe0
+#define SPMI_CONFIG1_1__SPMI_CHAIN_SIZE__SHIFT 0x5
+#define SPMI_FSM_READ_TRIGGER_1__FSM_READ_TRIGGER_MASK 0x1
+#define SPMI_FSM_READ_TRIGGER_1__FSM_READ_TRIGGER__SHIFT 0x0
+#define SPMI_FSM_WRITE_TRIGGER_1__FSM_WRITE_TRIGGER_MASK 0x1
+#define SPMI_FSM_WRITE_TRIGGER_1__FSM_WRITE_TRIGGER__SHIFT 0x0
+#define SPMI_FSM_RESET_TRIGGER_1__FSM_RESET_TRIGGER_MASK 0x1
+#define SPMI_FSM_RESET_TRIGGER_1__FSM_RESET_TRIGGER__SHIFT 0x0
+#define SPMI_FSM_BUSY_1__FSM_BUSY_MASK 0x1
+#define SPMI_FSM_BUSY_1__FSM_BUSY__SHIFT 0x0
+#define SPMI_PATH_1__PATH_ENABLE_REQ_MASK 0x1
+#define SPMI_PATH_1__PATH_ENABLE_REQ__SHIFT 0x0
+#define SPMI_PATH_1__PATH_ENABLE_ACK_MASK 0x2
+#define SPMI_PATH_1__PATH_ENABLE_ACK__SHIFT 0x1
+#define SPMI_PATH_1__PATH_ENABLE_REQ_auto_clear_MASK 0x10
+#define SPMI_PATH_1__PATH_ENABLE_REQ_auto_clear__SHIFT 0x4
+#define SPMI_C6_STATE_1__SPMI_IF_C6_STATE_ENTERED_MASK 0x1
+#define SPMI_C6_STATE_1__SPMI_IF_C6_STATE_ENTERED__SHIFT 0x0
+#define SPMI_C6_STATE_1__SPMI_IF_C6_STATE_ENTERED_WHEN_FSM_BUSY_MASK 0x2
+#define SPMI_C6_STATE_1__SPMI_IF_C6_STATE_ENTERED_WHEN_FSM_BUSY__SHIFT 0x1
+#define SPMI_C6_STATE_1__SPMI_IF_COUNTER_ADDRESS_C6_MASK 0xfffc
+#define SPMI_C6_STATE_1__SPMI_IF_COUNTER_ADDRESS_C6__SHIFT 0x2
+#define SPMI_JTAG_OVER_1__SPMI_IF_JTAG_OVER_HAPPENED_MASK 0x1
+#define SPMI_JTAG_OVER_1__SPMI_IF_JTAG_OVER_HAPPENED__SHIFT 0x0
+#define SPMI_SRAM_ADDRESS_1__SRAM_ADDRESS_MASK 0xffffffff
+#define SPMI_SRAM_ADDRESS_1__SRAM_ADDRESS__SHIFT 0x0
+#define SPMI_SRAM_DATA_1__SRAM_DATA_MASK 0xffffffff
+#define SPMI_SRAM_DATA_1__SRAM_DATA__SHIFT 0x0
+#define SPMI_RESET_1__ASYNC_RESET_0_MASK 0x1
+#define SPMI_RESET_1__ASYNC_RESET_0__SHIFT 0x0
+#define SPMI_RESET_1__SYNC_RESET_MASK 0x80000000
+#define SPMI_RESET_1__SYNC_RESET__SHIFT 0x1f
+#define SPMI_FORCE_CLOCK_GATERS_1__CLOCK_GATER_0_FORCE_MASK 0x1
+#define SPMI_FORCE_CLOCK_GATERS_1__CLOCK_GATER_0_FORCE__SH

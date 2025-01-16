@@ -1,418 +1,353 @@
-#if !defined(_TRACE_KVM_H) || defined(TRACE_HEADER_MULTI_READ)
-#define _TRACE_KVM_H
+ -> bit 16 */
+		| ((b1 & 0x0000100000000000) >> 23)		/* ic -> bit 21 */
+		| ((b0 >> 46) << 22) | ((b1 & 0x7fffff) << 40)	/* imm41 -> bit 22 */
+		| ((b1 & 0x0800000000000000) <<  4));		/* i -> bit 63 */
+}
 
-#include <linux/tracepoint.h>
-#include <asm/sie.h>
-#include <asm/debug.h>
-#include <asm/dis.h>
+#endif /* !USE_BRL */
 
-#undef TRACE_SYSTEM
-#define TRACE_SYSTEM kvm
-#define TRACE_INCLUDE_PATH .
-#undef TRACE_INCLUDE_FILE
-#define TRACE_INCLUDE_FILE trace
+void
+module_arch_freeing_init (struct module *mod)
+{
+	if (mod->arch.init_unw_table) {
+		unw_remove_unwind_table(mod->arch.init_unw_table);
+		mod->arch.init_unw_table = NULL;
+	}
+}
 
-/*
- * Helpers for vcpu-specific tracepoints containing the same information
- * as s390dbf VCPU_EVENTs.
- */
-#define VCPU_PROTO_COMMON struct kvm_vcpu *vcpu
-#define VCPU_ARGS_COMMON vcpu
-#define VCPU_FIELD_COMMON __field(int, id)			\
-	__field(unsigned long, pswmask)				\
-	__field(unsigned long, pswaddr)
-#define VCPU_ASSIGN_COMMON do {						\
-	__entry->id = vcpu->vcpu_id;					\
-	__entry->pswmask = vcpu->arch.sie_block->gpsw.mask;		\
-	__entry->pswaddr = vcpu->arch.sie_block->gpsw.addr;		\
-	} while (0);
-#define VCPU_TP_PRINTK(p_str, p_args...)				\
-	TP_printk("%02d[%016lx-%016lx]: " p_str, __entry->id,		\
-		  __entry->pswmask, __entry->pswaddr, p_args)
+/* Have we already seen one of these relocations? */
+/* FIXME: we could look in other sections, too --RR */
+static int
+duplicate_reloc (const Elf64_Rela *rela, unsigned int num)
+{
+	unsigned int i;
 
-TRACE_EVENT(kvm_s390_skey_related_inst,
-	    TP_PROTO(VCPU_PROTO_COMMON),
-	    TP_ARGS(VCPU_ARGS_COMMON),
+	for (i = 0; i < num; i++) {
+		if (rela[i].r_info == rela[num].r_info && rela[i].r_addend == rela[num].r_addend)
+			return 1;
+	}
+	return 0;
+}
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    ),
+/* Count how many GOT entries we may need */
+static unsigned int
+count_gots (const Elf64_Rela *rela, unsigned int num)
+{
+	unsigned int i, ret = 0;
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    ),
-	    VCPU_TP_PRINTK("%s", "first instruction related to skeys on vcpu")
-	);
+	/* Sure, this is order(n^2), but it's usually short, and not
+           time critical */
+	for (i = 0; i < num; i++) {
+		switch (ELF64_R_TYPE(rela[i].r_info)) {
+		      case R_IA64_LTOFF22:
+		      case R_IA64_LTOFF22X:
+		      case R_IA64_LTOFF64I:
+		      case R_IA64_LTOFF_FPTR22:
+		      case R_IA64_LTOFF_FPTR64I:
+		      case R_IA64_LTOFF_FPTR32MSB:
+		      case R_IA64_LTOFF_FPTR32LSB:
+		      case R_IA64_LTOFF_FPTR64MSB:
+		      case R_IA64_LTOFF_FPTR64LSB:
+			if (!duplicate_reloc(rela, i))
+				ret++;
+			break;
+		}
+	}
+	return ret;
+}
 
-TRACE_EVENT(kvm_s390_major_guest_pfault,
-	    TP_PROTO(VCPU_PROTO_COMMON),
-	    TP_ARGS(VCPU_ARGS_COMMON),
+/* Count how many PLT entries we may need */
+static unsigned int
+count_plts (const Elf64_Rela *rela, unsigned int num)
+{
+	unsigned int i, ret = 0;
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    ),
+	/* Sure, this is order(n^2), but it's usually short, and not
+           time critical */
+	for (i = 0; i < num; i++) {
+		switch (ELF64_R_TYPE(rela[i].r_info)) {
+		      case R_IA64_PCREL21B:
+		      case R_IA64_PLTOFF22:
+		      case R_IA64_PLTOFF64I:
+		      case R_IA64_PLTOFF64MSB:
+		      case R_IA64_PLTOFF64LSB:
+		      case R_IA64_IPLTMSB:
+		      case R_IA64_IPLTLSB:
+			if (!duplicate_reloc(rela, i))
+				ret++;
+			break;
+		}
+	}
+	return ret;
+}
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    ),
-	    VCPU_TP_PRINTK("%s", "major fault, maybe applicable for pfault")
-	);
+/* We need to create an function-descriptors for any internal function
+   which is referenced. */
+static unsigned int
+count_fdescs (const Elf64_Rela *rela, unsigned int num)
+{
+	unsigned int i, ret = 0;
 
-TRACE_EVENT(kvm_s390_pfault_init,
-	    TP_PROTO(VCPU_PROTO_COMMON, long pfault_token),
-	    TP_ARGS(VCPU_ARGS_COMMON, pfault_token),
+	/* Sure, this is order(n^2), but it's usually short, and not time critical.  */
+	for (i = 0; i < num; i++) {
+		switch (ELF64_R_TYPE(rela[i].r_info)) {
+		      case R_IA64_FPTR64I:
+		      case R_IA64_FPTR32LSB:
+		      case R_IA64_FPTR32MSB:
+		      case R_IA64_FPTR64LSB:
+		      case R_IA64_FPTR64MSB:
+		      case R_IA64_LTOFF_FPTR22:
+		      case R_IA64_LTOFF_FPTR32LSB:
+		      case R_IA64_LTOFF_FPTR32MSB:
+		      case R_IA64_LTOFF_FPTR64I:
+		      case R_IA64_LTOFF_FPTR64LSB:
+		      case R_IA64_LTOFF_FPTR64MSB:
+		      case R_IA64_IPLTMSB:
+		      case R_IA64_IPLTLSB:
+			/*
+			 * Jumps to static functions sometimes go straight to their
+			 * offset.  Of course, that may not be possible if the jump is
+			 * from init -> core or vice. versa, so we need to generate an
+			 * FDESC (and PLT etc) for that.
+			 */
+		      case R_IA64_PCREL21B:
+			if (!duplicate_reloc(rela, i))
+				ret++;
+			break;
+		}
+	}
+	return ret;
+}
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(long, pfault_token)
-		    ),
+int
+module_frob_arch_sections (Elf_Ehdr *ehdr, Elf_Shdr *sechdrs, char *secstrings,
+			   struct module *mod)
+{
+	unsigned long core_plts = 0, init_plts = 0, gots = 0, fdescs = 0;
+	Elf64_Shdr *s, *sechdrs_end = sechdrs + ehdr->e_shnum;
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->pfault_token = pfault_token;
-		    ),
-	    VCPU_TP_PRINTK("init pfault token %ld", __entry->pfault_token)
-	);
+	/*
+	 * To store the PLTs and function-descriptors, we expand the .text section for
+	 * core module-code and the .init.text section for initialization code.
+	 */
+	for (s = sechdrs; s < sechdrs_end; ++s)
+		if (strcmp(".core.plt", secstrings + s->sh_name) == 0)
+			mod->arch.core_plt = s;
+		else if (strcmp(".init.plt", secstrings + s->sh_name) == 0)
+			mod->arch.init_plt = s;
+		else if (strcmp(".got", secstrings + s->sh_name) == 0)
+			mod->arch.got = s;
+		else if (strcmp(".opd", secstrings + s->sh_name) == 0)
+			mod->arch.opd = s;
+		else if (strcmp(".IA_64.unwind", secstrings + s->sh_name) == 0)
+			mod->arch.unwind = s;
 
-TRACE_EVENT(kvm_s390_pfault_done,
-	    TP_PROTO(VCPU_PROTO_COMMON, long pfault_token),
-	    TP_ARGS(VCPU_ARGS_COMMON, pfault_token),
+	if (!mod->arch.core_plt || !mod->arch.init_plt || !mod->arch.got || !mod->arch.opd) {
+		printk(KERN_ERR "%s: sections missing\n", mod->name);
+		return -ENOEXEC;
+	}
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(long, pfault_token)
-		    ),
+	/* GOT and PLTs can occur in any relocated section... */
+	for (s = sechdrs + 1; s < sechdrs_end; ++s) {
+		const Elf64_Rela *rels = (void *)ehdr + s->sh_offset;
+		unsigned long numrels = s->sh_size/sizeof(Elf64_Rela);
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->pfault_token = pfault_token;
-		    ),
-	    VCPU_TP_PRINTK("done pfault token %ld", __entry->pfault_token)
-	);
+		if (s->sh_type != SHT_RELA)
+			continue;
 
-/*
- * Tracepoints for SIE entry and exit.
- */
-TRACE_EVENT(kvm_s390_sie_enter,
-	    TP_PROTO(VCPU_PROTO_COMMON, int cpuflags),
-	    TP_ARGS(VCPU_ARGS_COMMON, cpuflags),
+		gots += count_gots(rels, numrels);
+		fdescs += count_fdescs(rels, numrels);
+		if (strstr(secstrings + s->sh_name, ".init"))
+			init_plts += count_plts(rels, numrels);
+		else
+			core_plts += count_plts(rels, numrels);
+	}
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(int, cpuflags)
-		    ),
+	mod->arch.core_plt->sh_type = SHT_NOBITS;
+	mod->arch.core_plt->sh_flags = SHF_EXECINSTR | SHF_ALLOC;
+	mod->arch.core_plt->sh_addralign = 16;
+	mod->arch.core_plt->sh_size = core_plts * sizeof(struct plt_entry);
+	mod->arch.init_plt->sh_type = SHT_NOBITS;
+	mod->arch.init_plt->sh_flags = SHF_EXECINSTR | SHF_ALLOC;
+	mod->arch.init_plt->sh_addralign = 16;
+	mod->arch.init_plt->sh_size = init_plts * sizeof(struct plt_entry);
+	mod->arch.got->sh_type = SHT_NOBITS;
+	mod->arch.got->sh_flags = ARCH_SHF_SMALL | SHF_ALLOC;
+	mod->arch.got->sh_addralign = 8;
+	mod->arch.got->sh_size = gots * sizeof(struct got_entry);
+	mod->arch.opd->sh_type = SHT_NOBITS;
+	mod->arch.opd->sh_flags = SHF_ALLOC;
+	mod->arch.opd->sh_addralign = 8;
+	mod->arch.opd->sh_size = fdescs * sizeof(struct fdesc);
+	DEBUGP("%s: core.plt=%lx, init.plt=%lx, got=%lx, fdesc=%lx\n",
+	       __func__, mod->arch.core_plt->sh_size, mod->arch.init_plt->sh_size,
+	       mod->arch.got->sh_size, mod->arch.opd->sh_size);
+	return 0;
+}
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->cpuflags = cpuflags;
-		    ),
+static inline int
+in_init (const struct module *mod, uint64_t addr)
+{
+	return addr - (uint64_t) mod->module_init < mod->init_size;
+}
 
-	    VCPU_TP_PRINTK("entering sie flags %x", __entry->cpuflags)
-	);
+static inline int
+in_core (const struct module *mod, uint64_t addr)
+{
+	return addr - (uint64_t) mod->module_core < mod->core_size;
+}
 
-TRACE_EVENT(kvm_s390_sie_fault,
-	    TP_PROTO(VCPU_PROTO_COMMON),
-	    TP_ARGS(VCPU_ARGS_COMMON),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    ),
-
-	    VCPU_TP_PRINTK("%s", "fault in sie instruction")
-	);
-
-TRACE_EVENT(kvm_s390_sie_exit,
-	    TP_PROTO(VCPU_PROTO_COMMON, u8 icptcode),
-	    TP_ARGS(VCPU_ARGS_COMMON, icptcode),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(u8, icptcode)
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->icptcode = icptcode;
-		    ),
-
-	    VCPU_TP_PRINTK("exit sie icptcode %d (%s)", __entry->icptcode,
-			   __print_symbolic(__entry->icptcode,
-					    sie_intercept_code))
-	);
-
-/*
- * Trace point for intercepted instructions.
- */
-TRACE_EVENT(kvm_s390_intercept_instruction,
-	    TP_PROTO(VCPU_PROTO_COMMON, __u16 ipa, __u32 ipb),
-	    TP_ARGS(VCPU_ARGS_COMMON, ipa, ipb),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(__u64, instruction)
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->instruction = ((__u64)ipa << 48) |
-		    ((__u64)ipb << 16);
-		    ),
-
-	    VCPU_TP_PRINTK("intercepted instruction %016llx (%s)",
-			   __entry->instruction,
-			   __print_symbolic(icpt_insn_decoder(__entry->instruction),
-					    icpt_insn_codes))
-	);
-
-/*
- * Trace point for intercepted program interruptions.
- */
-TRACE_EVENT(kvm_s390_intercept_prog,
-	    TP_PROTO(VCPU_PROTO_COMMON, __u16 code),
-	    TP_ARGS(VCPU_ARGS_COMMON, code),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(__u16, code)
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->code = code;
-		    ),
-
-	    VCPU_TP_PRINTK("intercepted program interruption %04x",
-			   __entry->code)
-	);
-
-/*
- * Trace point for validity intercepts.
- */
-TRACE_EVENT(kvm_s390_intercept_validity,
-	    TP_PROTO(VCPU_PROTO_COMMON, __u16 viwhy),
-	    TP_ARGS(VCPU_ARGS_COMMON, viwhy),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(__u16, viwhy)
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->viwhy = viwhy;
-		    ),
-
-	    VCPU_TP_PRINTK("got validity intercept %04x", __entry->viwhy)
-	);
+static inline int
+is_internal (const struct module *mod, uint64_t value)
+{
+	return in_init(mod, value) || in_core(mod, value);
+}
 
 /*
- * Trace points for instructions that are of special interest.
+ * Get gp-relative offset for the linkage-table entry of VALUE.
  */
+static uint64_t
+get_ltoff (struct module *mod, uint64_t value, int *okp)
+{
+	struct got_entry *got, *e;
 
-TRACE_EVENT(kvm_s390_handle_sigp,
-	    TP_PROTO(VCPU_PROTO_COMMON, __u8 order_code, __u16 cpu_addr, \
-		     __u32 parameter),
-	    TP_ARGS(VCPU_ARGS_COMMON, order_code, cpu_addr, parameter),
+	if (!*okp)
+		return 0;
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(__u8, order_code)
-		    __field(__u16, cpu_addr)
-		    __field(__u32, parameter)
-		    ),
+	got = (void *) mod->arch.got->sh_addr;
+	for (e = got; e < got + mod->arch.next_got_entry; ++e)
+		if (e->val == value)
+			goto found;
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->order_code = order_code;
-		    __entry->cpu_addr = cpu_addr;
-		    __entry->parameter = parameter;
-		    ),
+	/* Not enough GOT entries? */
+	BUG_ON(e >= (struct got_entry *) (mod->arch.got->sh_addr + mod->arch.got->sh_size));
 
-	    VCPU_TP_PRINTK("handle sigp order %02x (%s), cpu address %04x, " \
-			   "parameter %08x", __entry->order_code,
-			   __print_symbolic(__entry->order_code,
-					    sigp_order_codes),
-			   __entry->cpu_addr, __entry->parameter)
-	);
+	e->val = value;
+	++mod->arch.next_got_entry;
+  found:
+	return (uint64_t) e - mod->arch.gp;
+}
 
-TRACE_EVENT(kvm_s390_handle_sigp_pei,
-	    TP_PROTO(VCPU_PROTO_COMMON, __u8 order_code, __u16 cpu_addr),
-	    TP_ARGS(VCPU_ARGS_COMMON, order_code, cpu_addr),
+static inline int
+gp_addressable (struct module *mod, uint64_t value)
+{
+	return value - mod->arch.gp + MAX_LTOFF/2 < MAX_LTOFF;
+}
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(__u8, order_code)
-		    __field(__u16, cpu_addr)
-		    ),
+/* Get PC-relative PLT entry for this value.  Returns 0 on failure. */
+static uint64_t
+get_plt (struct module *mod, const struct insn *insn, uint64_t value, int *okp)
+{
+	struct plt_entry *plt, *plt_end;
+	uint64_t target_ip, target_gp;
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->order_code = order_code;
-		    __entry->cpu_addr = cpu_addr;
-		    ),
+	if (!*okp)
+		return 0;
 
-	    VCPU_TP_PRINTK("handle sigp pei order %02x (%s), cpu address %04x",
-			   __entry->order_code,
-			   __print_symbolic(__entry->order_code,
-					    sigp_order_codes),
-			   __entry->cpu_addr)
-	);
+	if (in_init(mod, (uint64_t) insn)) {
+		plt = (void *) mod->arch.init_plt->sh_addr;
+		plt_end = (void *) plt + mod->arch.init_plt->sh_size;
+	} else {
+		plt = (void *) mod->arch.core_plt->sh_addr;
+		plt_end = (void *) plt + mod->arch.core_plt->sh_size;
+	}
 
-TRACE_EVENT(kvm_s390_handle_diag,
-	    TP_PROTO(VCPU_PROTO_COMMON, __u16 code),
-	    TP_ARGS(VCPU_ARGS_COMMON, code),
+	/* "value" is a pointer to a function-descriptor; fetch the target ip/gp from it: */
+	target_ip = ((uint64_t *) value)[0];
+	target_gp = ((uint64_t *) value)[1];
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(__u16, code)
-		    ),
+	/* Look for existing PLT entry. */
+	while (plt->bundle[0][0]) {
+		if (plt_target(plt) == target_ip)
+			goto found;
+		if (++plt >= plt_end)
+			BUG();
+	}
+	*plt = ia64_plt_template;
+	if (!patch_plt(mod, plt, target_ip, target_gp)) {
+		*okp = 0;
+		return 0;
+	}
+#if ARCH_MODULE_DEBUG
+	if (plt_target(plt) != target_ip) {
+		printk("%s: mistargeted PLT: wanted %lx, got %lx\n",
+		       __func__, target_ip, plt_target(plt));
+		*okp = 0;
+		return 0;
+	}
+#endif
+  found:
+	return (uint64_t) plt;
+}
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->code = code;
-		    ),
+/* Get function descriptor for VALUE. */
+static uint64_t
+get_fdesc (struct module *mod, uint64_t value, int *okp)
+{
+	struct fdesc *fdesc = (void *) mod->arch.opd->sh_addr;
 
-	    VCPU_TP_PRINTK("handle diagnose call %04x (%s)", __entry->code,
-			   __print_symbolic(__entry->code, diagnose_codes))
-	);
+	if (!*okp)
+		return 0;
 
-TRACE_EVENT(kvm_s390_handle_lctl,
-	    TP_PROTO(VCPU_PROTO_COMMON, int g, int reg1, int reg3, u64 addr),
-	    TP_ARGS(VCPU_ARGS_COMMON, g, reg1, reg3, addr),
+	if (!value) {
+		printk(KERN_ERR "%s: fdesc for zero requested!\n", mod->name);
+		return 0;
+	}
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(int, g)
-		    __field(int, reg1)
-		    __field(int, reg3)
-		    __field(u64, addr)
-		    ),
+	if (!is_internal(mod, value))
+		/*
+		 * If it's not a module-local entry-point, "value" already points to a
+		 * function-descriptor.
+		 */
+		return value;
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->g = g;
-		    __entry->reg1 = reg1;
-		    __entry->reg3 = reg3;
-		    __entry->addr = addr;
-		    ),
+	/* Look for existing function descriptor. */
+	while (fdesc->ip) {
+		if (fdesc->ip == value)
+			return (uint64_t)fdesc;
+		if ((uint64_t) ++fdesc >= mod->arch.opd->sh_addr + mod->arch.opd->sh_size)
+			BUG();
+	}
 
-	    VCPU_TP_PRINTK("%s: loading cr %x-%x from %016llx",
-			   __entry->g ? "lctlg" : "lctl",
-			   __entry->reg1, __entry->reg3, __entry->addr)
-	);
+	/* Create new one */
+	fdesc->ip = value;
+	fdesc->gp = mod->arch.gp;
+	return (uint64_t) fdesc;
+}
 
-TRACE_EVENT(kvm_s390_handle_stctl,
-	    TP_PROTO(VCPU_PROTO_COMMON, int g, int reg1, int reg3, u64 addr),
-	    TP_ARGS(VCPU_ARGS_COMMON, g, reg1, reg3, addr),
+static inline int
+do_reloc (struct module *mod, uint8_t r_type, Elf64_Sym *sym, uint64_t addend,
+	  Elf64_Shdr *sec, void *location)
+{
+	enum reloc_target_format format = (r_type >> FORMAT_SHIFT) & FORMAT_MASK;
+	enum reloc_value_formula formula = (r_type >> VALUE_SHIFT) & VALUE_MASK;
+	uint64_t val;
+	int ok = 1;
 
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(int, g)
-		    __field(int, reg1)
-		    __field(int, reg3)
-		    __field(u64, addr)
-		    ),
+	val = sym->st_value + addend;
 
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->g = g;
-		    __entry->reg1 = reg1;
-		    __entry->reg3 = reg3;
-		    __entry->addr = addr;
-		    ),
+	switch (formula) {
+	      case RV_SEGREL:	/* segment base is arbitrarily chosen to be 0 for kernel modules */
+	      case RV_DIRECT:
+		break;
 
-	    VCPU_TP_PRINTK("%s: storing cr %x-%x to %016llx",
-			   __entry->g ? "stctg" : "stctl",
-			   __entry->reg1, __entry->reg3, __entry->addr)
-	);
+	      case RV_GPREL:	  val -= mod->arch.gp; break;
+	      case RV_LTREL:	  val = get_ltoff(mod, val, &ok); break;
+	      case RV_PLTREL:	  val = get_plt(mod, location, val, &ok); break;
+	      case RV_FPTR:	  val = get_fdesc(mod, val, &ok); break;
+	      case RV_SECREL:	  val -= sec->sh_addr; break;
+	      case RV_LTREL_FPTR: val = get_ltoff(mod, get_fdesc(mod, val, &ok), &ok); break;
 
-TRACE_EVENT(kvm_s390_handle_prefix,
-	    TP_PROTO(VCPU_PROTO_COMMON, int set, u32 address),
-	    TP_ARGS(VCPU_ARGS_COMMON, set, address),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(int, set)
-		    __field(u32, address)
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->set = set;
-		    __entry->address = address;
-		    ),
-
-	    VCPU_TP_PRINTK("%s prefix to %08x",
-			   __entry->set ? "setting" : "storing",
-			   __entry->address)
-	);
-
-TRACE_EVENT(kvm_s390_handle_stap,
-	    TP_PROTO(VCPU_PROTO_COMMON, u64 address),
-	    TP_ARGS(VCPU_ARGS_COMMON, address),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(u64, address)
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->address = address;
-		    ),
-
-	    VCPU_TP_PRINTK("storing cpu address to %016llx",
-			   __entry->address)
-	);
-
-TRACE_EVENT(kvm_s390_handle_stfl,
-	    TP_PROTO(VCPU_PROTO_COMMON, unsigned int facility_list),
-	    TP_ARGS(VCPU_ARGS_COMMON, facility_list),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(unsigned int, facility_list)
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->facility_list = facility_list;
-		    ),
-
-	    VCPU_TP_PRINTK("store facility list value %08x",
-			   __entry->facility_list)
-	);
-
-TRACE_EVENT(kvm_s390_handle_stsi,
-	    TP_PROTO(VCPU_PROTO_COMMON, int fc, int sel1, int sel2, u64 addr),
-	    TP_ARGS(VCPU_ARGS_COMMON, fc, sel1, sel2, addr),
-
-	    TP_STRUCT__entry(
-		    VCPU_FIELD_COMMON
-		    __field(int, fc)
-		    __field(int, sel1)
-		    __field(int, sel2)
-		    __field(u64, addr)
-		    ),
-
-	    TP_fast_assign(
-		    VCPU_ASSIGN_COMMON
-		    __entry->fc = fc;
-		    __entry->sel1 = sel1;
-		    __entry->sel2 = sel2;
-		    __entry->addr = addr;
-		    ),
-
-	    VCPU_TP_PRINTK("STSI %d.%d.%d information stored to %016llx",
-			   __entry->fc, __entry->sel1, __entry->sel2,
-			   __entry->addr)
-	);
-
-#endif /* _TRACE_KVM_H */
-
-/* This part must be outside protection */
-#include <trace/define_trace.h>
+	      case RV_PCREL:
+		switch (r_type) {
+		      case R_IA64_PCREL21B:
+			if ((in_init(mod, val) && in_core(mod, (uint64_t)location)) ||
+			    (in_core(mod, val) && in_init(mod, (uint64_t)location))) {
+				/*
+				 * Init section may have been allocated far away from core,
+				 * if the branch won't reach, then allocate a plt for it.
+				 */
+				uint64_t delta = ((int64_t)val - (int64_t)location) / 16;
+				if (delta + (1 << 20) >= (1 << 21)) {
+					val = get_fdesc(mod, val, &ok);
+					val = get_p

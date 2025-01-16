@@ -1,1407 +1,1297 @@
-/*
- * Wistron laptop button driver
- * Copyright (C) 2005 Miloslav Trmac <mitr@volny.cz>
- * Copyright (C) 2005 Bernhard Rosenkraenzer <bero@arklinux.org>
- * Copyright (C) 2005 Dmitry Torokhov <dtor@mail.ru>
- *
- * You can redistribute and/or modify this program under the terms of the
- * GNU General Public License version 2 as published by the Free Software
- * Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
- * Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 59 Temple Place Suite 330, Boston, MA 02111-1307, USA.
- */
-#include <linux/io.h>
-#include <linux/dmi.h>
-#include <linux/init.h>
-#include <linux/input-polldev.h>
-#include <linux/input/sparse-keymap.h>
-#include <linux/interrupt.h>
-#include <linux/jiffies.h>
-#include <linux/kernel.h>
-#include <linux/mc146818rtc.h>
-#include <linux/module.h>
-#include <linux/preempt.h>
-#include <linux/string.h>
-#include <linux/slab.h>
-#include <linux/types.h>
-#include <linux/platform_device.h>
-#include <linux/leds.h>
-
-/* How often we poll keys - msecs */
-#define POLL_INTERVAL_DEFAULT	500 /* when idle */
-#define POLL_INTERVAL_BURST	100 /* when a key was recently pressed */
-
-/* BIOS subsystem IDs */
-#define WIFI		0x35
-#define BLUETOOTH	0x34
-#define MAIL_LED	0x31
-
-MODULE_AUTHOR("Miloslav Trmac <mitr@volny.cz>");
-MODULE_DESCRIPTION("Wistron laptop button driver");
-MODULE_LICENSE("GPL v2");
-
-static bool force; /* = 0; */
-module_param(force, bool, 0);
-MODULE_PARM_DESC(force, "Load even if computer is not in database");
-
-static char *keymap_name; /* = NULL; */
-module_param_named(keymap, keymap_name, charp, 0);
-MODULE_PARM_DESC(keymap, "Keymap name, if it can't be autodetected [generic, 1557/MS2141]");
-
-static struct platform_device *wistron_device;
-
- /* BIOS interface implementation */
-
-static void __iomem *bios_entry_point; /* BIOS routine entry point */
-static void __iomem *bios_code_map_base;
-static void __iomem *bios_data_map_base;
-
-static u8 cmos_address;
-
-struct regs {
-	u32 eax, ebx, ecx;
-};
-
-static void call_bios(struct regs *regs)
-{
-	unsigned long flags;
-
-	preempt_disable();
-	local_irq_save(flags);
-	asm volatile ("pushl %%ebp;"
-		      "movl %7, %%ebp;"
-		      "call *%6;"
-		      "popl %%ebp"
-		      : "=a" (regs->eax), "=b" (regs->ebx), "=c" (regs->ecx)
-		      : "0" (regs->eax), "1" (regs->ebx), "2" (regs->ecx),
-			"m" (bios_entry_point), "m" (bios_data_map_base)
-		      : "edx", "edi", "esi", "memory");
-	local_irq_restore(flags);
-	preempt_enable();
-}
-
-static ssize_t __init locate_wistron_bios(void __iomem *base)
-{
-	static unsigned char __initdata signature[] =
-		{ 0x42, 0x21, 0x55, 0x30 };
-	ssize_t offset;
-
-	for (offset = 0; offset < 0x10000; offset += 0x10) {
-		if (check_signature(base + offset, signature,
-				    sizeof(signature)) != 0)
-			return offset;
-	}
-	return -1;
-}
-
-static int __init map_bios(void)
-{
-	void __iomem *base;
-	ssize_t offset;
-	u32 entry_point;
-
-	base = ioremap(0xF0000, 0x10000); /* Can't fail */
-	offset = locate_wistron_bios(base);
-	if (offset < 0) {
-		printk(KERN_ERR "wistron_btns: BIOS entry point not found\n");
-		iounmap(base);
-		return -ENODEV;
+ event->event);
+		break;
+	case RDMA_CM_EVENT_REJECTED:       /* FALLTHRU */
+	case RDMA_CM_EVENT_UNREACHABLE:    /* FALLTHRU */
+	case RDMA_CM_EVENT_CONNECT_ERROR:
+		ret = isert_connect_error(cma_id);
+		break;
+	default:
+		isert_err("Unhandled RDMA CMA event: %d\n", event->event);
+		break;
 	}
 
-	entry_point = readl(base + offset + 5);
-	printk(KERN_DEBUG
-		"wistron_btns: BIOS signature found at %p, entry point %08X\n",
-		base + offset, entry_point);
+	return ret;
+}
 
-	if (entry_point >= 0xF0000) {
-		bios_code_map_base = base;
-		bios_entry_point = bios_code_map_base + (entry_point & 0xFFFF);
+static int
+isert_post_recvm(struct isert_conn *isert_conn, u32 count)
+{
+	struct ib_recv_wr *rx_wr, *rx_wr_failed;
+	int i, ret;
+	struct iser_rx_desc *rx_desc;
+
+	for (rx_wr = isert_conn->rx_wr, i = 0; i < count; i++, rx_wr++) {
+		rx_desc = &isert_conn->rx_descs[i];
+		rx_wr->wr_id = (uintptr_t)rx_desc;
+		rx_wr->sg_list = &rx_desc->rx_sg;
+		rx_wr->num_sge = 1;
+		rx_wr->next = rx_wr + 1;
+	}
+	rx_wr--;
+	rx_wr->next = NULL; /* mark end of work requests list */
+
+	ret = ib_post_recv(isert_conn->qp, isert_conn->rx_wr,
+			   &rx_wr_failed);
+	if (ret)
+		isert_err("ib_post_recv() failed with ret: %d\n", ret);
+
+	return ret;
+}
+
+static int
+isert_post_recv(struct isert_conn *isert_conn, struct iser_rx_desc *rx_desc)
+{
+	struct ib_recv_wr *rx_wr_failed, rx_wr;
+	int ret;
+
+	rx_wr.wr_id = (uintptr_t)rx_desc;
+	rx_wr.sg_list = &rx_desc->rx_sg;
+	rx_wr.num_sge = 1;
+	rx_wr.next = NULL;
+
+	ret = ib_post_recv(isert_conn->qp, &rx_wr, &rx_wr_failed);
+	if (ret)
+		isert_err("ib_post_recv() failed with ret: %d\n", ret);
+
+	return ret;
+}
+
+static int
+isert_post_send(struct isert_conn *isert_conn, struct iser_tx_desc *tx_desc)
+{
+	struct ib_device *ib_dev = isert_conn->cm_id->device;
+	struct ib_send_wr send_wr, *send_wr_failed;
+	int ret;
+
+	ib_dma_sync_single_for_device(ib_dev, tx_desc->dma_addr,
+				      ISER_HEADERS_LEN, DMA_TO_DEVICE);
+
+	send_wr.next	= NULL;
+	send_wr.wr_id	= (uintptr_t)tx_desc;
+	send_wr.sg_list	= tx_desc->tx_sg;
+	send_wr.num_sge	= tx_desc->num_sge;
+	send_wr.opcode	= IB_WR_SEND;
+	send_wr.send_flags = IB_SEND_SIGNALED;
+
+	ret = ib_post_send(isert_conn->qp, &send_wr, &send_wr_failed);
+	if (ret)
+		isert_err("ib_post_send() failed, ret: %d\n", ret);
+
+	return ret;
+}
+
+static void
+isert_create_send_desc(struct isert_conn *isert_conn,
+		       struct isert_cmd *isert_cmd,
+		       struct iser_tx_desc *tx_desc)
+{
+	struct isert_device *device = isert_conn->device;
+	struct ib_device *ib_dev = device->ib_device;
+
+	ib_dma_sync_single_for_cpu(ib_dev, tx_desc->dma_addr,
+				   ISER_HEADERS_LEN, DMA_TO_DEVICE);
+
+	memset(&tx_desc->iser_header, 0, sizeof(struct iser_hdr));
+	tx_desc->iser_header.flags = ISER_VER;
+
+	tx_desc->num_sge = 1;
+	tx_desc->isert_cmd = isert_cmd;
+
+	if (tx_desc->tx_sg[0].lkey != device->pd->local_dma_lkey) {
+		tx_desc->tx_sg[0].lkey = device->pd->local_dma_lkey;
+		isert_dbg("tx_desc %p lkey mismatch, fixing\n", tx_desc);
+	}
+}
+
+static int
+isert_init_tx_hdrs(struct isert_conn *isert_conn,
+		   struct iser_tx_desc *tx_desc)
+{
+	struct isert_device *device = isert_conn->device;
+	struct ib_device *ib_dev = device->ib_device;
+	u64 dma_addr;
+
+	dma_addr = ib_dma_map_single(ib_dev, (void *)tx_desc,
+			ISER_HEADERS_LEN, DMA_TO_DEVICE);
+	if (ib_dma_mapping_error(ib_dev, dma_addr)) {
+		isert_err("ib_dma_mapping_error() failed\n");
+		return -ENOMEM;
+	}
+
+	tx_desc->dma_addr = dma_addr;
+	tx_desc->tx_sg[0].addr	= tx_desc->dma_addr;
+	tx_desc->tx_sg[0].length = ISER_HEADERS_LEN;
+	tx_desc->tx_sg[0].lkey = device->pd->local_dma_lkey;
+
+	isert_dbg("Setup tx_sg[0].addr: 0x%llx length: %u lkey: 0x%x\n",
+		  tx_desc->tx_sg[0].addr, tx_desc->tx_sg[0].length,
+		  tx_desc->tx_sg[0].lkey);
+
+	return 0;
+}
+
+static void
+isert_init_send_wr(struct isert_conn *isert_conn, struct isert_cmd *isert_cmd,
+		   struct ib_send_wr *send_wr)
+{
+	struct iser_tx_desc *tx_desc = &isert_cmd->tx_desc;
+
+	isert_cmd->rdma_wr.iser_ib_op = ISER_IB_SEND;
+	send_wr->wr_id = (uintptr_t)&isert_cmd->tx_desc;
+	send_wr->opcode = IB_WR_SEND;
+	send_wr->sg_list = &tx_desc->tx_sg[0];
+	send_wr->num_sge = isert_cmd->tx_desc.num_sge;
+	send_wr->send_flags = IB_SEND_SIGNALED;
+}
+
+static int
+isert_rdma_post_recvl(struct isert_conn *isert_conn)
+{
+	struct ib_recv_wr rx_wr, *rx_wr_fail;
+	struct ib_sge sge;
+	int ret;
+
+	memset(&sge, 0, sizeof(struct ib_sge));
+	sge.addr = isert_conn->login_req_dma;
+	sge.length = ISER_RX_LOGIN_SIZE;
+	sge.lkey = isert_conn->device->pd->local_dma_lkey;
+
+	isert_dbg("Setup sge: addr: %llx length: %d 0x%08x\n",
+		sge.addr, sge.length, sge.lkey);
+
+	memset(&rx_wr, 0, sizeof(struct ib_recv_wr));
+	rx_wr.wr_id = (uintptr_t)isert_conn->login_req_buf;
+	rx_wr.sg_list = &sge;
+	rx_wr.num_sge = 1;
+
+	ret = ib_post_recv(isert_conn->qp, &rx_wr, &rx_wr_fail);
+	if (ret)
+		isert_err("ib_post_recv() failed: %d\n", ret);
+
+	return ret;
+}
+
+static int
+isert_put_login_tx(struct iscsi_conn *conn, struct iscsi_login *login,
+		   u32 length)
+{
+	struct isert_conn *isert_conn = conn->context;
+	struct isert_device *device = isert_conn->device;
+	struct ib_device *ib_dev = device->ib_device;
+	struct iser_tx_desc *tx_desc = &isert_conn->login_tx_desc;
+	int ret;
+
+	isert_create_send_desc(isert_conn, NULL, tx_desc);
+
+	memcpy(&tx_desc->iscsi_header, &login->rsp[0],
+	       sizeof(struct iscsi_hdr));
+
+	isert_init_tx_hdrs(isert_conn, tx_desc);
+
+	if (length > 0) {
+		struct ib_sge *tx_dsg = &tx_desc->tx_sg[1];
+
+		ib_dma_sync_single_for_cpu(ib_dev, isert_conn->login_rsp_dma,
+					   length, DMA_TO_DEVICE);
+
+		memcpy(isert_conn->login_rsp_buf, login->rsp_buf, length);
+
+		ib_dma_sync_single_for_device(ib_dev, isert_conn->login_rsp_dma,
+					      length, DMA_TO_DEVICE);
+
+		tx_dsg->addr	= isert_conn->login_rsp_dma;
+		tx_dsg->length	= length;
+		tx_dsg->lkey	= isert_conn->device->pd->local_dma_lkey;
+		tx_desc->num_sge = 2;
+	}
+	if (!login->login_failed) {
+		if (login->login_complete) {
+			if (!conn->sess->sess_ops->SessionType &&
+			    isert_conn->device->use_fastreg) {
+				ret = isert_conn_create_fastreg_pool(isert_conn);
+				if (ret) {
+					isert_err("Conn: %p failed to create"
+					       " fastreg pool\n", isert_conn);
+					return ret;
+				}
+			}
+
+			ret = isert_alloc_rx_descriptors(isert_conn);
+			if (ret)
+				return ret;
+
+			ret = isert_post_recvm(isert_conn,
+					       ISERT_QP_MAX_RECV_DTOS);
+			if (ret)
+				return ret;
+
+			/* Now we are in FULL_FEATURE phase */
+			mutex_lock(&isert_conn->mutex);
+			isert_conn->state = ISER_CONN_FULL_FEATURE;
+			mutex_unlock(&isert_conn->mutex);
+			goto post_send;
+		}
+
+		ret = isert_rdma_post_recvl(isert_conn);
+		if (ret)
+			return ret;
+	}
+post_send:
+	ret = isert_post_send(isert_conn, tx_desc);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static void
+isert_rx_login_req(struct isert_conn *isert_conn)
+{
+	struct iser_rx_desc *rx_desc = (void *)isert_conn->login_req_buf;
+	int rx_buflen = isert_conn->login_req_len;
+	struct iscsi_conn *conn = isert_conn->conn;
+	struct iscsi_login *login = conn->conn_login;
+	int size;
+
+	isert_info("conn %p\n", isert_conn);
+
+	WARN_ON_ONCE(!login);
+
+	if (login->first_request) {
+		struct iscsi_login_req *login_req =
+			(struct iscsi_login_req *)&rx_desc->iscsi_header;
+		/*
+		 * Setup the initial iscsi_login values from the leading
+		 * login request PDU.
+		 */
+		login->leading_connection = (!login_req->tsih) ? 1 : 0;
+		login->current_stage =
+			(login_req->flags & ISCSI_FLAG_LOGIN_CURRENT_STAGE_MASK)
+			 >> 2;
+		login->version_min	= login_req->min_version;
+		login->version_max	= login_req->max_version;
+		memcpy(login->isid, login_req->isid, 6);
+		login->cmd_sn		= be32_to_cpu(login_req->cmdsn);
+		login->init_task_tag	= login_req->itt;
+		login->initial_exp_statsn = be32_to_cpu(login_req->exp_statsn);
+		login->cid		= be16_to_cpu(login_req->cid);
+		login->tsih		= be16_to_cpu(login_req->tsih);
+	}
+
+	memcpy(&login->req[0], (void *)&rx_desc->iscsi_header, ISCSI_HDR_LEN);
+
+	size = min(rx_buflen, MAX_KEY_VALUE_PAIRS);
+	isert_dbg("Using login payload size: %d, rx_buflen: %d "
+		  "MAX_KEY_VALUE_PAIRS: %d\n", size, rx_buflen,
+		  MAX_KEY_VALUE_PAIRS);
+	memcpy(login->req_buf, &rx_desc->data[0], size);
+
+	if (login->first_request) {
+		complete(&isert_conn->login_comp);
+		return;
+	}
+	schedule_delayed_work(&conn->login_work, 0);
+}
+
+static struct iscsi_cmd
+*isert_allocate_cmd(struct iscsi_conn *conn, struct iser_rx_desc *rx_desc)
+{
+	struct isert_conn *isert_conn = conn->context;
+	struct isert_cmd *isert_cmd;
+	struct iscsi_cmd *cmd;
+
+	cmd = iscsit_allocate_cmd(conn, TASK_INTERRUPTIBLE);
+	if (!cmd) {
+		isert_err("Unable to allocate iscsi_cmd + isert_cmd\n");
+		return NULL;
+	}
+	isert_cmd = iscsit_priv_cmd(cmd);
+	isert_cmd->conn = isert_conn;
+	isert_cmd->iscsi_cmd = cmd;
+	isert_cmd->rx_desc = rx_desc;
+
+	return cmd;
+}
+
+static int
+isert_handle_scsi_cmd(struct isert_conn *isert_conn,
+		      struct isert_cmd *isert_cmd, struct iscsi_cmd *cmd,
+		      struct iser_rx_desc *rx_desc, unsigned char *buf)
+{
+	struct iscsi_conn *conn = isert_conn->conn;
+	struct iscsi_scsi_req *hdr = (struct iscsi_scsi_req *)buf;
+	int imm_data, imm_data_len, unsol_data, sg_nents, rc;
+	bool dump_payload = false;
+	unsigned int data_len;
+
+	rc = iscsit_setup_scsi_cmd(conn, cmd, buf);
+	if (rc < 0)
+		return rc;
+
+	imm_data = cmd->immediate_data;
+	imm_data_len = cmd->first_burst_len;
+	unsol_data = cmd->unsolicited_data;
+	data_len = cmd->se_cmd.data_length;
+
+	if (imm_data && imm_data_len == data_len)
+		cmd->se_cmd.se_cmd_flags |= SCF_PASSTHROUGH_SG_TO_MEM_NOALLOC;
+	rc = iscsit_process_scsi_cmd(conn, cmd, hdr);
+	if (rc < 0) {
+		return 0;
+	} else if (rc > 0) {
+		dump_payload = true;
+		goto sequence_cmd;
+	}
+
+	if (!imm_data)
+		return 0;
+
+	if (imm_data_len != data_len) {
+		sg_nents = max(1UL, DIV_ROUND_UP(imm_data_len, PAGE_SIZE));
+		sg_copy_from_buffer(cmd->se_cmd.t_data_sg, sg_nents,
+				    &rx_desc->data[0], imm_data_len);
+		isert_dbg("Copy Immediate sg_nents: %u imm_data_len: %d\n",
+			  sg_nents, imm_data_len);
 	} else {
-		iounmap(base);
-		bios_code_map_base = ioremap(entry_point & ~0x3FFF, 0x4000);
-		if (bios_code_map_base == NULL) {
-			printk(KERN_ERR
-				"wistron_btns: Can't map BIOS code at %08X\n",
-				entry_point & ~0x3FFF);
-			goto err;
-		}
-		bios_entry_point = bios_code_map_base + (entry_point & 0x3FFF);
+		sg_init_table(&isert_cmd->sg, 1);
+		cmd->se_cmd.t_data_sg = &isert_cmd->sg;
+		cmd->se_cmd.t_data_nents = 1;
+		sg_set_buf(&isert_cmd->sg, &rx_desc->data[0], imm_data_len);
+		isert_dbg("Transfer Immediate imm_data_len: %d\n",
+			  imm_data_len);
 	}
-	/* The Windows driver maps 0x10000 bytes, we keep only one page... */
-	bios_data_map_base = ioremap(0x400, 0xc00);
-	if (bios_data_map_base == NULL) {
-		printk(KERN_ERR "wistron_btns: Can't map BIOS data\n");
-		goto err_code;
+
+	cmd->write_data_done += imm_data_len;
+
+	if (cmd->write_data_done == cmd->se_cmd.data_length) {
+		spin_lock_bh(&cmd->istate_lock);
+		cmd->cmd_flags |= ICF_GOT_LAST_DATAOUT;
+		cmd->i_state = ISTATE_RECEIVED_LAST_DATAOUT;
+		spin_unlock_bh(&cmd->istate_lock);
 	}
-	return 0;
 
-err_code:
-	iounmap(bios_code_map_base);
-err:
-	return -ENOMEM;
-}
+sequence_cmd:
+	rc = iscsit_sequence_cmd(conn, cmd, buf, hdr->cmdsn);
 
-static inline void unmap_bios(void)
-{
-	iounmap(bios_code_map_base);
-	iounmap(bios_data_map_base);
-}
-
- /* BIOS calls */
-
-static u16 bios_pop_queue(void)
-{
-	struct regs regs;
-
-	memset(&regs, 0, sizeof (regs));
-	regs.eax = 0x9610;
-	regs.ebx = 0x061C;
-	regs.ecx = 0x0000;
-	call_bios(&regs);
-
-	return regs.eax;
-}
-
-static void bios_attach(void)
-{
-	struct regs regs;
-
-	memset(&regs, 0, sizeof (regs));
-	regs.eax = 0x9610;
-	regs.ebx = 0x012E;
-	call_bios(&regs);
-}
-
-static void bios_detach(void)
-{
-	struct regs regs;
-
-	memset(&regs, 0, sizeof (regs));
-	regs.eax = 0x9610;
-	regs.ebx = 0x002E;
-	call_bios(&regs);
-}
-
-static u8 bios_get_cmos_address(void)
-{
-	struct regs regs;
-
-	memset(&regs, 0, sizeof (regs));
-	regs.eax = 0x9610;
-	regs.ebx = 0x051C;
-	call_bios(&regs);
-
-	return regs.ecx;
-}
-
-static u16 bios_get_default_setting(u8 subsys)
-{
-	struct regs regs;
-
-	memset(&regs, 0, sizeof (regs));
-	regs.eax = 0x9610;
-	regs.ebx = 0x0200 | subsys;
-	call_bios(&regs);
-
-	return regs.eax;
-}
-
-static void bios_set_state(u8 subsys, int enable)
-{
-	struct regs regs;
-
-	memset(&regs, 0, sizeof (regs));
-	regs.eax = 0x9610;
-	regs.ebx = (enable ? 0x0100 : 0x0000) | subsys;
-	call_bios(&regs);
-}
-
-/* Hardware database */
-
-#define KE_WIFI		(KE_LAST + 1)
-#define KE_BLUETOOTH	(KE_LAST + 2)
-
-#define FE_MAIL_LED 0x01
-#define FE_WIFI_LED 0x02
-#define FE_UNTESTED 0x80
-
-static struct key_entry *keymap; /* = NULL; Current key map */
-static bool have_wifi;
-static bool have_bluetooth;
-static int leds_present;	/* bitmask of leds present */
-
-static int __init dmi_matched(const struct dmi_system_id *dmi)
-{
-	const struct key_entry *key;
-
-	keymap = dmi->driver_data;
-	for (key = keymap; key->type != KE_END; key++) {
-		if (key->type == KE_WIFI)
-			have_wifi = true;
-		else if (key->type == KE_BLUETOOTH)
-			have_bluetooth = true;
-	}
-	leds_present = key->code & (FE_MAIL_LED | FE_WIFI_LED);
-
-	return 1;
-}
-
-static struct key_entry keymap_empty[] __initdata = {
-	{ KE_END, 0 }
-};
-
-static struct key_entry keymap_fs_amilo_pro_v2000[] __initdata = {
-	{ KE_KEY,  0x01, {KEY_HELP} },
-	{ KE_KEY,  0x11, {KEY_PROG1} },
-	{ KE_KEY,  0x12, {KEY_PROG2} },
-	{ KE_WIFI, 0x30 },
-	{ KE_KEY,  0x31, {KEY_MAIL} },
-	{ KE_KEY,  0x36, {KEY_WWW} },
-	{ KE_END,  0 }
-};
-
-static struct key_entry keymap_fs_amilo_pro_v3505[] __initdata = {
-	{ KE_KEY,       0x01, {KEY_HELP} },          /* Fn+F1 */
-	{ KE_KEY,       0x06, {KEY_DISPLAYTOGGLE} }, /* Fn+F4 */
-	{ KE_BLUETOOTH, 0x30 },                      /* Fn+F10 */
-	{ KE_KEY,       0x31, {KEY_MAIL} },          /* mail button */
-	{ KE_KEY,       0x36, {KEY_WWW} },           /* www button */
-	{ KE_WIFI,      0x78 },                      /* satellite dish button */
-	{ KE_END,       0 }
-};
-
-static struct key_entry keymap_fs_amilo_pro_v8210[] __initdata = {
-	{ KE_KEY,       0x01, {KEY_HELP} },          /* Fn+F1 */
-	{ KE_KEY,       0x06, {KEY_DISPLAYTOGGLE} }, /* Fn+F4 */
-	{ KE_BLUETOOTH, 0x30 },                      /* Fn+F10 */
-	{ KE_KEY,       0x31, {KEY_MAIL} },          /* mail button */
-	{ KE_KEY,       0x36, {KEY_WWW} },           /* www button */
-	{ KE_WIFI,      0x78 },                      /* satelite dish button */
-	{ KE_END,       FE_WIFI_LED }
-};
-
-static struct key_entry keymap_fujitsu_n3510[] __initdata = {
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x71, {KEY_STOPCD} },
-	{ KE_KEY, 0x72, {KEY_PLAYPAUSE} },
-	{ KE_KEY, 0x74, {KEY_REWIND} },
-	{ KE_KEY, 0x78, {KEY_FORWARD} },
-	{ KE_END, 0 }
-};
-
-static struct key_entry keymap_wistron_ms2111[] __initdata = {
-	{ KE_KEY,  0x11, {KEY_PROG1} },
-	{ KE_KEY,  0x12, {KEY_PROG2} },
-	{ KE_KEY,  0x13, {KEY_PROG3} },
-	{ KE_KEY,  0x31, {KEY_MAIL} },
-	{ KE_KEY,  0x36, {KEY_WWW} },
-	{ KE_END, FE_MAIL_LED }
-};
-
-static struct key_entry keymap_wistron_md40100[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x37, {KEY_DISPLAYTOGGLE} }, /* Display on/off */
-	{ KE_END, FE_MAIL_LED | FE_WIFI_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_wistron_ms2141[] __initdata = {
-	{ KE_KEY,  0x11, {KEY_PROG1} },
-	{ KE_KEY,  0x12, {KEY_PROG2} },
-	{ KE_WIFI, 0x30 },
-	{ KE_KEY,  0x22, {KEY_REWIND} },
-	{ KE_KEY,  0x23, {KEY_FORWARD} },
-	{ KE_KEY,  0x24, {KEY_PLAYPAUSE} },
-	{ KE_KEY,  0x25, {KEY_STOPCD} },
-	{ KE_KEY,  0x31, {KEY_MAIL} },
-	{ KE_KEY,  0x36, {KEY_WWW} },
-	{ KE_END,  0 }
-};
-
-static struct key_entry keymap_acer_aspire_1500[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x03, {KEY_POWER} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_WIFI, 0x30 },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x49, {KEY_CONFIG} },
-	{ KE_BLUETOOTH, 0x44 },
-	{ KE_END, FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_aspire_1600[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x03, {KEY_POWER} },
-	{ KE_KEY, 0x08, {KEY_MUTE} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x13, {KEY_PROG3} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x49, {KEY_CONFIG} },
-	{ KE_WIFI, 0x30 },
-	{ KE_BLUETOOTH, 0x44 },
-	{ KE_END, FE_MAIL_LED | FE_UNTESTED }
-};
-
-/* 3020 has been tested */
-static struct key_entry keymap_acer_aspire_5020[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x03, {KEY_POWER} },
-	{ KE_KEY, 0x05, {KEY_SWITCHVIDEOMODE} }, /* Display selection */
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x6a, {KEY_CONFIG} },
-	{ KE_WIFI, 0x30 },
-	{ KE_BLUETOOTH, 0x44 },
-	{ KE_END, FE_MAIL_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_travelmate_2410[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x6d, {KEY_POWER} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x6a, {KEY_CONFIG} },
-	{ KE_WIFI, 0x30 },
-	{ KE_BLUETOOTH, 0x44 },
-	{ KE_END, FE_MAIL_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_travelmate_110[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x03, {KEY_POWER} },
-	{ KE_KEY, 0x08, {KEY_MUTE} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x20, {KEY_VOLUMEUP} },
-	{ KE_KEY, 0x21, {KEY_VOLUMEDOWN} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_SW, 0x4a, {.sw = {SW_LID, 1}} }, /* lid close */
-	{ KE_SW, 0x4b, {.sw = {SW_LID, 0}} }, /* lid open */
-	{ KE_WIFI, 0x30 },
-	{ KE_END, FE_MAIL_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_travelmate_300[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x03, {KEY_POWER} },
-	{ KE_KEY, 0x08, {KEY_MUTE} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x20, {KEY_VOLUMEUP} },
-	{ KE_KEY, 0x21, {KEY_VOLUMEDOWN} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_WIFI, 0x30 },
-	{ KE_BLUETOOTH, 0x44 },
-	{ KE_END, FE_MAIL_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_travelmate_380[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x03, {KEY_POWER} }, /* not 370 */
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x13, {KEY_PROG3} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_WIFI, 0x30 },
-	{ KE_END, FE_MAIL_LED | FE_UNTESTED }
-};
-
-/* unusual map */
-static struct key_entry keymap_acer_travelmate_220[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x11, {KEY_MAIL} },
-	{ KE_KEY, 0x12, {KEY_WWW} },
-	{ KE_KEY, 0x13, {KEY_PROG2} },
-	{ KE_KEY, 0x31, {KEY_PROG1} },
-	{ KE_END, FE_WIFI_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_travelmate_230[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_END, FE_WIFI_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_travelmate_240[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x03, {KEY_POWER} },
-	{ KE_KEY, 0x08, {KEY_MUTE} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_BLUETOOTH, 0x44 },
-	{ KE_WIFI, 0x30 },
-	{ KE_END, FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_travelmate_350[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x13, {KEY_MAIL} },
-	{ KE_KEY, 0x14, {KEY_PROG3} },
-	{ KE_KEY, 0x15, {KEY_WWW} },
-	{ KE_END, FE_MAIL_LED | FE_WIFI_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_acer_travelmate_360[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x13, {KEY_MAIL} },
-	{ KE_KEY, 0x14, {KEY_PROG3} },
-	{ KE_KEY, 0x15, {KEY_WWW} },
-	{ KE_KEY, 0x40, {KEY_WLAN} },
-	{ KE_END, FE_WIFI_LED | FE_UNTESTED } /* no mail led */
-};
-
-/* Wifi subsystem only activates the led. Therefore we need to pass
- * wifi event as a normal key, then userspace can really change the wifi state.
- * TODO we need to export led state to userspace (wifi and mail) */
-static struct key_entry keymap_acer_travelmate_610[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x13, {KEY_PROG3} },
-	{ KE_KEY, 0x14, {KEY_MAIL} },
-	{ KE_KEY, 0x15, {KEY_WWW} },
-	{ KE_KEY, 0x40, {KEY_WLAN} },
-	{ KE_END, FE_MAIL_LED | FE_WIFI_LED }
-};
-
-static struct key_entry keymap_acer_travelmate_630[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x03, {KEY_POWER} },
-	{ KE_KEY, 0x08, {KEY_MUTE} }, /* not 620 */
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x13, {KEY_PROG3} },
-	{ KE_KEY, 0x20, {KEY_VOLUMEUP} },
-	{ KE_KEY, 0x21, {KEY_VOLUMEDOWN} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_WIFI, 0x30 },
-	{ KE_END, FE_MAIL_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_aopen_1559as[] __initdata = {
-	{ KE_KEY,  0x01, {KEY_HELP} },
-	{ KE_KEY,  0x06, {KEY_PROG3} },
-	{ KE_KEY,  0x11, {KEY_PROG1} },
-	{ KE_KEY,  0x12, {KEY_PROG2} },
-	{ KE_WIFI, 0x30 },
-	{ KE_KEY,  0x31, {KEY_MAIL} },
-	{ KE_KEY,  0x36, {KEY_WWW} },
-	{ KE_END,  0 },
-};
-
-static struct key_entry keymap_fs_amilo_d88x0[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x08, {KEY_MUTE} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x13, {KEY_PROG3} },
-	{ KE_END, FE_MAIL_LED | FE_WIFI_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_wistron_md2900[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_WIFI, 0x30 },
-	{ KE_END, FE_MAIL_LED | FE_UNTESTED }
-};
-
-static struct key_entry keymap_wistron_md96500[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x05, {KEY_SWITCHVIDEOMODE} }, /* Display selection */
-	{ KE_KEY, 0x06, {KEY_DISPLAYTOGGLE} }, /* Display on/off */
-	{ KE_KEY, 0x08, {KEY_MUTE} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x20, {KEY_VOLUMEUP} },
-	{ KE_KEY, 0x21, {KEY_VOLUMEDOWN} },
-	{ KE_KEY, 0x22, {KEY_REWIND} },
-	{ KE_KEY, 0x23, {KEY_FORWARD} },
-	{ KE_KEY, 0x24, {KEY_PLAYPAUSE} },
-	{ KE_KEY, 0x25, {KEY_STOPCD} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_WIFI, 0x30 },
-	{ KE_BLUETOOTH, 0x44 },
-	{ KE_END, 0 }
-};
-
-static struct key_entry keymap_wistron_generic[] __initdata = {
-	{ KE_KEY, 0x01, {KEY_HELP} },
-	{ KE_KEY, 0x02, {KEY_CONFIG} },
-	{ KE_KEY, 0x03, {KEY_POWER} },
-	{ KE_KEY, 0x05, {KEY_SWITCHVIDEOMODE} }, /* Display selection */
-	{ KE_KEY, 0x06, {KEY_DISPLAYTOGGLE} }, /* Display on/off */
-	{ KE_KEY, 0x08, {KEY_MUTE} },
-	{ KE_KEY, 0x11, {KEY_PROG1} },
-	{ KE_KEY, 0x12, {KEY_PROG2} },
-	{ KE_KEY, 0x13, {KEY_PROG3} },
-	{ KE_KEY, 0x14, {KEY_MAIL} },
-	{ KE_KEY, 0x15, {KEY_WWW} },
-	{ KE_KEY, 0x20, {KEY_VOLUMEUP} },
-	{ KE_KEY, 0x21, {KEY_VOLUMEDOWN} },
-	{ KE_KEY, 0x22, {KEY_REWIND} },
-	{ KE_KEY, 0x23, {KEY_FORWARD} },
-	{ KE_KEY, 0x24, {KEY_PLAYPAUSE} },
-	{ KE_KEY, 0x25, {KEY_STOPCD} },
-	{ KE_KEY, 0x31, {KEY_MAIL} },
-	{ KE_KEY, 0x36, {KEY_WWW} },
-	{ KE_KEY, 0x37, {KEY_DISPLAYTOGGLE} }, /* Display on/off */
-	{ KE_KEY, 0x40, {KEY_WLAN} },
-	{ KE_KEY, 0x49, {KEY_CONFIG} },
-	{ KE_SW, 0x4a, {.sw = {SW_LID, 1}} }, /* lid close */
-	{ KE_SW, 0x4b, {.sw = {SW_LID, 0}} }, /* lid open */
-	{ KE_KEY, 0x6a, {KEY_CONFIG} },
-	{ KE_KEY, 0x6d, {KEY_POWER} },
-	{ KE_KEY, 0x71, {KEY_STOPCD} },
-	{ KE_KEY, 0x72, {KEY_PLAYPAUSE} },
-	{ KE_KEY, 0x74, {KEY_REWIND} },
-	{ KE_KEY, 0x78, {KEY_FORWARD} },
-	{ KE_WIFI, 0x30 },
-	{ KE_BLUETOOTH, 0x44 },
-	{ KE_END, 0 }
-};
-
-static struct key_entry keymap_aopen_1557[] __initdata = {
-	{ KE_KEY,  0x01, {KEY_HELP} },
-	{ KE_KEY,  0x11, {KEY_PROG1} },
-	{ KE_KEY,  0x12, {KEY_PROG2} },
-	{ KE_WIFI, 0x30 },
-	{ KE_KEY,  0x22, {KEY_REWIND} },
-	{ KE_KEY,  0x23, {KEY_FORWARD} },
-	{ KE_KEY,  0x24, {KEY_PLAYPAUSE} },
-	{ KE_KEY,  0x25, {KEY_STOPCD} },
-	{ KE_KEY,  0x31, {KEY_MAIL} },
-	{ KE_KEY,  0x36, {KEY_WWW} },
-	{ KE_END,  0 }
-};
-
-static struct key_entry keymap_prestigio[] __initdata = {
-	{ KE_KEY,  0x11, {KEY_PROG1} },
-	{ KE_KEY,  0x12, {KEY_PROG2} },
-	{ KE_WIFI, 0x30 },
-	{ KE_KEY,  0x22, {KEY_REWIND} },
-	{ KE_KEY,  0x23, {KEY_FORWARD} },
-	{ KE_KEY,  0x24, {KEY_PLAYPAUSE} },
-	{ KE_KEY,  0x25, {KEY_STOPCD} },
-	{ KE_KEY,  0x31, {KEY_MAIL} },
-	{ KE_KEY,  0x36, {KEY_WWW} },
-	{ KE_END,  0 }
-};
-
-
-/*
- * If your machine is not here (which is currently rather likely), please send
- * a list of buttons and their key codes (reported when loading this module
- * with force=1) and the output of dmidecode to $MODULE_AUTHOR.
- */
-static const struct dmi_system_id dmi_ids[] __initconst = {
-	{
-		/* Fujitsu-Siemens Amilo Pro V2000 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU SIEMENS"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "AMILO Pro V2000"),
-		},
-		.driver_data = keymap_fs_amilo_pro_v2000
-	},
-	{
-		/* Fujitsu-Siemens Amilo Pro Edition V3505 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU SIEMENS"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "AMILO Pro Edition V3505"),
-		},
-		.driver_data = keymap_fs_amilo_pro_v3505
-	},
-	{
-		/* Fujitsu-Siemens Amilo Pro Edition V8210 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU SIEMENS"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "AMILO Pro Series V8210"),
-		},
-		.driver_data = keymap_fs_amilo_pro_v8210
-	},
-	{
-		/* Fujitsu-Siemens Amilo M7400 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU SIEMENS"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "AMILO M        "),
-		},
-		.driver_data = keymap_fs_amilo_pro_v2000
-	},
-	{
-		/* Maxdata Pro 7000 DX */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "MAXDATA"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "Pro 7000"),
-		},
-		.driver_data = keymap_fs_amilo_pro_v2000
-	},
-	{
-		/* Fujitsu N3510 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "N3510"),
-		},
-		.driver_data = keymap_fujitsu_n3510
-	},
-	{
-		/* Acer Aspire 1500 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1500"),
-		},
-		.driver_data = keymap_acer_aspire_1500
-	},
-	{
-		/* Acer Aspire 1600 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 1600"),
-		},
-		.driver_data = keymap_acer_aspire_1600
-	},
-	{
-		/* Acer Aspire 3020 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 3020"),
-		},
-		.driver_data = keymap_acer_aspire_5020
-	},
-	{
-		/* Acer Aspire 5020 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire 5020"),
-		},
-		.driver_data = keymap_acer_aspire_5020
-	},
-	{
-		/* Acer TravelMate 2100 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 2100"),
-		},
-		.driver_data = keymap_acer_aspire_5020
-	},
-	{
-		/* Acer TravelMate 2410 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 2410"),
-		},
-		.driver_data = keymap_acer_travelmate_2410
-	},
-	{
-		/* Acer TravelMate C300 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate C300"),
-		},
-		.driver_data = keymap_acer_travelmate_300
-	},
-	{
-		/* Acer TravelMate C100 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate C100"),
-		},
-		.driver_data = keymap_acer_travelmate_300
-	},
-	{
-		/* Acer TravelMate C110 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate C110"),
-		},
-		.driver_data = keymap_acer_travelmate_110
-	},
-	{
-		/* Acer TravelMate 380 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 380"),
-		},
-		.driver_data = keymap_acer_travelmate_380
-	},
-	{
-		/* Acer TravelMate 370 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 370"),
-		},
-		.driver_data = keymap_acer_travelmate_380 /* keyboard minus 1 key */
-	},
-	{
-		/* Acer TravelMate 220 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 220"),
-		},
-		.driver_data = keymap_acer_travelmate_220
-	},
-	{
-		/* Acer TravelMate 260 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 260"),
-		},
-		.driver_data = keymap_acer_travelmate_220
-	},
-	{
-		/* Acer TravelMate 230 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 230"),
-			/* acerhk looks for "TravelMate F4..." ?! */
-		},
-		.driver_data = keymap_acer_travelmate_230
-	},
-	{
-		/* Acer TravelMate 280 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 280"),
-		},
-		.driver_data = keymap_acer_travelmate_230
-	},
-	{
-		/* Acer TravelMate 240 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 240"),
-		},
-		.driver_data = keymap_acer_travelmate_240
-	},
-	{
-		/* Acer TravelMate 250 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 250"),
-		},
-		.driver_data = keymap_acer_travelmate_240
-	},
-	{
-		/* Acer TravelMate 2424NWXCi */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 2420"),
-		},
-		.driver_data = keymap_acer_travelmate_240
-	},
-	{
-		/* Acer TravelMate 350 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 350"),
-		},
-		.driver_data = keymap_acer_travelmate_350
-	},
-	{
-		/* Acer TravelMate 360 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 360"),
-		},
-		.driver_data = keymap_acer_travelmate_360
-	},
-	{
-		/* Acer TravelMate 610 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "ACER"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 610"),
-		},
-		.driver_data = keymap_acer_travelmate_610
-	},
-	{
-		/* Acer TravelMate 620 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 620"),
-		},
-		.driver_data = keymap_acer_travelmate_630
-	},
-	{
-		/* Acer TravelMate 630 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "TravelMate 630"),
-		},
-		.driver_data = keymap_acer_travelmate_630
-	},
-	{
-		/* AOpen 1559AS */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_PRODUCT_NAME, "E2U"),
-			DMI_MATCH(DMI_BOARD_NAME, "E2U"),
-		},
-		.driver_data = keymap_aopen_1559as
-	},
-	{
-		/* Medion MD 9783 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "MEDIONNB"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "MD 9783"),
-		},
-		.driver_data = keymap_wistron_ms2111
-	},
-	{
-		/* Medion MD 40100 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "MEDIONNB"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "WID2000"),
-		},
-		.driver_data = keymap_wistron_md40100
-	},
-	{
-		/* Medion MD 2900 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "MEDIONNB"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "WIM 2000"),
-		},
-		.driver_data = keymap_wistron_md2900
-	},
-	{
-		/* Medion MD 42200 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Medion"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "WIM 2030"),
-		},
-		.driver_data = keymap_fs_amilo_pro_v2000
-	},
-	{
-		/* Medion MD 96500 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "MEDIONPC"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "WIM 2040"),
-		},
-		.driver_data = keymap_wistron_md96500
-	},
-	{
-		/* Medion MD 95400 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "MEDIONPC"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "WIM 2050"),
-		},
-		.driver_data = keymap_wistron_md96500
-	},
-	{
-		/* Fujitsu Siemens Amilo D7820 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU SIEMENS"), /* not sure */
-			DMI_MATCH(DMI_PRODUCT_NAME, "Amilo D"),
-		},
-		.driver_data = keymap_fs_amilo_d88x0
-	},
-	{
-		/* Fujitsu Siemens Amilo D88x0 */
-		.callback = dmi_matched,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU SIEMENS"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "AMILO D"),
-		},
-		.driver_data = keymap_fs_amilo_d88x0
-	},
-	{ NULL, }
-};
-MODULE_DEVICE_TABLE(dmi, dmi_ids);
-
-/* Copy the good keymap, as the original ones are free'd */
-static int __init copy_keymap(void)
-{
-	const struct key_entry *key;
-	struct key_entry *new_keymap;
-	unsigned int length = 1;
-
-	for (key = keymap; key->type != KE_END; key++)
-		length++;
-
-	new_keymap = kmemdup(keymap, length * sizeof(struct key_entry),
-			     GFP_KERNEL);
-	if (!new_keymap)
-		return -ENOMEM;
-
-	keymap = new_keymap;
+	if (!rc && dump_payload == false && unsol_data)
+		iscsit_set_unsoliticed_dataout(cmd);
+	else if (dump_payload && imm_data)
+		target_put_sess_cmd(&cmd->se_cmd);
 
 	return 0;
 }
 
-static int __init select_keymap(void)
+static int
+isert_handle_iscsi_dataout(struct isert_conn *isert_conn,
+			   struct iser_rx_desc *rx_desc, unsigned char *buf)
 {
-	dmi_check_system(dmi_ids);
-	if (keymap_name != NULL) {
-		if (strcmp (keymap_name, "1557/MS2141") == 0)
-			keymap = keymap_wistron_ms2141;
-		else if (strcmp (keymap_name, "aopen1557") == 0)
-			keymap = keymap_aopen_1557;
-		else if (strcmp (keymap_name, "prestigio") == 0)
-			keymap = keymap_prestigio;
-		else if (strcmp (keymap_name, "generic") == 0)
-			keymap = keymap_wistron_generic;
-		else {
-			printk(KERN_ERR "wistron_btns: Keymap unknown\n");
-			return -EINVAL;
+	struct scatterlist *sg_start;
+	struct iscsi_conn *conn = isert_conn->conn;
+	struct iscsi_cmd *cmd = NULL;
+	struct iscsi_data *hdr = (struct iscsi_data *)buf;
+	u32 unsol_data_len = ntoh24(hdr->dlength);
+	int rc, sg_nents, sg_off, page_off;
+
+	rc = iscsit_check_dataout_hdr(conn, buf, &cmd);
+	if (rc < 0)
+		return rc;
+	else if (!cmd)
+		return 0;
+	/*
+	 * FIXME: Unexpected unsolicited_data out
+	 */
+	if (!cmd->unsolicited_data) {
+		isert_err("Received unexpected solicited data payload\n");
+		dump_stack();
+		return -1;
+	}
+
+	isert_dbg("Unsolicited DataOut unsol_data_len: %u, "
+		  "write_data_done: %u, data_length: %u\n",
+		  unsol_data_len,  cmd->write_data_done,
+		  cmd->se_cmd.data_length);
+
+	sg_off = cmd->write_data_done / PAGE_SIZE;
+	sg_start = &cmd->se_cmd.t_data_sg[sg_off];
+	sg_nents = max(1UL, DIV_ROUND_UP(unsol_data_len, PAGE_SIZE));
+	page_off = cmd->write_data_done % PAGE_SIZE;
+	/*
+	 * FIXME: Non page-aligned unsolicited_data out
+	 */
+	if (page_off) {
+		isert_err("unexpected non-page aligned data payload\n");
+		dump_stack();
+		return -1;
+	}
+	isert_dbg("Copying DataOut: sg_start: %p, sg_off: %u "
+		  "sg_nents: %u from %p %u\n", sg_start, sg_off,
+		  sg_nents, &rx_desc->data[0], unsol_data_len);
+
+	sg_copy_from_buffer(sg_start, sg_nents, &rx_desc->data[0],
+			    unsol_data_len);
+
+	rc = iscsit_check_dataout_payload(cmd, hdr, false);
+	if (rc < 0)
+		return rc;
+
+	/*
+	 * multiple data-outs on the same command can arrive -
+	 * so post the buffer before hand
+	 */
+	rc = isert_post_recv(isert_conn, rx_desc);
+	if (rc) {
+		isert_err("ib_post_recv failed with %d\n", rc);
+		return rc;
+	}
+	return 0;
+}
+
+static int
+isert_handle_nop_out(struct isert_conn *isert_conn, struct isert_cmd *isert_cmd,
+		     struct iscsi_cmd *cmd, struct iser_rx_desc *rx_desc,
+		     unsigned char *buf)
+{
+	struct iscsi_conn *conn = isert_conn->conn;
+	struct iscsi_nopout *hdr = (struct iscsi_nopout *)buf;
+	int rc;
+
+	rc = iscsit_setup_nop_out(conn, cmd, hdr);
+	if (rc < 0)
+		return rc;
+	/*
+	 * FIXME: Add support for NOPOUT payload using unsolicited RDMA payload
+	 */
+
+	return iscsit_process_nop_out(conn, cmd, hdr);
+}
+
+static int
+isert_handle_text_cmd(struct isert_conn *isert_conn, struct isert_cmd *isert_cmd,
+		      struct iscsi_cmd *cmd, struct iser_rx_desc *rx_desc,
+		      struct iscsi_text *hdr)
+{
+	struct iscsi_conn *conn = isert_conn->conn;
+	u32 payload_length = ntoh24(hdr->dlength);
+	int rc;
+	unsigned char *text_in = NULL;
+
+	rc = iscsit_setup_text_cmd(conn, cmd, hdr);
+	if (rc < 0)
+		return rc;
+
+	if (payload_length) {
+		text_in = kzalloc(payload_length, GFP_KERNEL);
+		if (!text_in) {
+			isert_err("Unable to allocate text_in of payload_length: %u\n",
+				  payload_length);
+			return -ENOMEM;
 		}
 	}
-	if (keymap == NULL) {
-		if (!force) {
-			printk(KERN_ERR "wistron_btns: System unknown\n");
-			return -ENODEV;
-		}
-		keymap = keymap_empty;
+	cmd->text_in_ptr = text_in;
+
+	memcpy(cmd->text_in_ptr, &rx_desc->data[0], payload_length);
+
+	return iscsit_process_text_cmd(conn, cmd, hdr);
+}
+
+static int
+isert_rx_opcode(struct isert_conn *isert_conn, struct iser_rx_desc *rx_desc,
+		uint32_t read_stag, uint64_t read_va,
+		uint32_t write_stag, uint64_t write_va)
+{
+	struct iscsi_hdr *hdr = &rx_desc->iscsi_header;
+	struct iscsi_conn *conn = isert_conn->conn;
+	struct iscsi_cmd *cmd;
+	struct isert_cmd *isert_cmd;
+	int ret = -EINVAL;
+	u8 opcode = (hdr->opcode & ISCSI_OPCODE_MASK);
+
+	if (conn->sess->sess_ops->SessionType &&
+	   (!(opcode & ISCSI_OP_TEXT) || !(opcode & ISCSI_OP_LOGOUT))) {
+		isert_err("Got illegal opcode: 0x%02x in SessionType=Discovery,"
+			  " ignoring\n", opcode);
+		return 0;
 	}
 
-	return copy_keymap();
-}
+	switch (opcode) {
+	case ISCSI_OP_SCSI_CMD:
+		cmd = isert_allocate_cmd(conn, rx_desc);
+		if (!cmd)
+			break;
 
- /* Input layer interface */
+		isert_cmd = iscsit_priv_cmd(cmd);
+		isert_cmd->read_stag = read_stag;
+		isert_cmd->read_va = read_va;
+		isert_cmd->write_stag = write_stag;
+		isert_cmd->write_va = write_va;
 
-static struct input_polled_dev *wistron_idev;
-static unsigned long jiffies_last_press;
-static bool wifi_enabled;
-static bool bluetooth_enabled;
+		ret = isert_handle_scsi_cmd(isert_conn, isert_cmd, cmd,
+					rx_desc, (unsigned char *)hdr);
+		break;
+	case ISCSI_OP_NOOP_OUT:
+		cmd = isert_allocate_cmd(conn, rx_desc);
+		if (!cmd)
+			break;
 
- /* led management */
-static void wistron_mail_led_set(struct led_classdev *led_cdev,
-				enum led_brightness value)
-{
-	bios_set_state(MAIL_LED, (value != LED_OFF) ? 1 : 0);
-}
+		isert_cmd = iscsit_priv_cmd(cmd);
+		ret = isert_handle_nop_out(isert_conn, isert_cmd, cmd,
+					   rx_desc, (unsigned char *)hdr);
+		break;
+	case ISCSI_OP_SCSI_DATA_OUT:
+		ret = isert_handle_iscsi_dataout(isert_conn, rx_desc,
+						(unsigned char *)hdr);
+		break;
+	case ISCSI_OP_SCSI_TMFUNC:
+		cmd = isert_allocate_cmd(conn, rx_desc);
+		if (!cmd)
+			break;
 
-/* same as setting up wifi card, but for laptops on which the led is managed */
-static void wistron_wifi_led_set(struct led_classdev *led_cdev,
-				enum led_brightness value)
-{
-	bios_set_state(WIFI, (value != LED_OFF) ? 1 : 0);
-}
+		ret = iscsit_handle_task_mgt_cmd(conn, cmd,
+						(unsigned char *)hdr);
+		break;
+	case ISCSI_OP_LOGOUT:
+		cmd = isert_allocate_cmd(conn, rx_desc);
+		if (!cmd)
+			break;
 
-static struct led_classdev wistron_mail_led = {
-	.name			= "wistron:green:mail",
-	.brightness_set		= wistron_mail_led_set,
-};
-
-static struct led_classdev wistron_wifi_led = {
-	.name			= "wistron:red:wifi",
-	.brightness_set		= wistron_wifi_led_set,
-};
-
-static void wistron_led_init(struct device *parent)
-{
-	if (leds_present & FE_WIFI_LED) {
-		u16 wifi = bios_get_default_setting(WIFI);
-		if (wifi & 1) {
-			wistron_wifi_led.brightness = (wifi & 2) ? LED_FULL : LED_OFF;
-			if (led_classdev_register(parent, &wistron_wifi_led))
-				leds_present &= ~FE_WIFI_LED;
-			else
-				bios_set_state(WIFI, wistron_wifi_led.brightness);
-
-		} else
-			leds_present &= ~FE_WIFI_LED;
-	}
-
-	if (leds_present & FE_MAIL_LED) {
-		/* bios_get_default_setting(MAIL) always retuns 0, so just turn the led off */
-		wistron_mail_led.brightness = LED_OFF;
-		if (led_classdev_register(parent, &wistron_mail_led))
-			leds_present &= ~FE_MAIL_LED;
+		ret = iscsit_handle_logout_cmd(conn, cmd, (unsigned char *)hdr);
+		break;
+	case ISCSI_OP_TEXT:
+		if (be32_to_cpu(hdr->ttt) != 0xFFFFFFFF)
+			cmd = iscsit_find_cmd_from_itt(conn, hdr->itt);
 		else
-			bios_set_state(MAIL_LED, wistron_mail_led.brightness);
+			cmd = isert_allocate_cmd(conn, rx_desc);
+
+		if (!cmd)
+			break;
+
+		isert_cmd = iscsit_priv_cmd(cmd);
+		ret = isert_handle_text_cmd(isert_conn, isert_cmd, cmd,
+					    rx_desc, (struct iscsi_text *)hdr);
+		break;
+	default:
+		isert_err("Got unknown iSCSI OpCode: 0x%02x\n", opcode);
+		dump_stack();
+		break;
+	}
+
+	return ret;
+}
+
+static void
+isert_rx_do_work(struct iser_rx_desc *rx_desc, struct isert_conn *isert_conn)
+{
+	struct iser_hdr *iser_hdr = &rx_desc->iser_header;
+	uint64_t read_va = 0, write_va = 0;
+	uint32_t read_stag = 0, write_stag = 0;
+
+	switch (iser_hdr->flags & 0xF0) {
+	case ISCSI_CTRL:
+		if (iser_hdr->flags & ISER_RSV) {
+			read_stag = be32_to_cpu(iser_hdr->read_stag);
+			read_va = be64_to_cpu(iser_hdr->read_va);
+			isert_dbg("ISER_RSV: read_stag: 0x%x read_va: 0x%llx\n",
+				  read_stag, (unsigned long long)read_va);
+		}
+		if (iser_hdr->flags & ISER_WSV) {
+			write_stag = be32_to_cpu(iser_hdr->write_stag);
+			write_va = be64_to_cpu(iser_hdr->write_va);
+			isert_dbg("ISER_WSV: write_stag: 0x%x write_va: 0x%llx\n",
+				  write_stag, (unsigned long long)write_va);
+		}
+
+		isert_dbg("ISER ISCSI_CTRL PDU\n");
+		break;
+	case ISER_HELLO:
+		isert_err("iSER Hello message\n");
+		break;
+	default:
+		isert_warn("Unknown iSER hdr flags: 0x%02x\n", iser_hdr->flags);
+		break;
+	}
+
+	isert_rx_opcode(isert_conn, rx_desc,
+			read_stag, read_va, write_stag, write_va);
+}
+
+static void
+isert_rcv_completion(struct iser_rx_desc *desc,
+		     struct isert_conn *isert_conn,
+		     u32 xfer_len)
+{
+	struct ib_device *ib_dev = isert_conn->device->ib_device;
+	struct iscsi_hdr *hdr;
+	u64 rx_dma;
+	int rx_buflen;
+
+	if ((char *)desc == isert_conn->login_req_buf) {
+		rx_dma = isert_conn->login_req_dma;
+		rx_buflen = ISER_RX_LOGIN_SIZE;
+		isert_dbg("login_buf: Using rx_dma: 0x%llx, rx_buflen: %d\n",
+			 rx_dma, rx_buflen);
+	} else {
+		rx_dma = desc->dma_addr;
+		rx_buflen = ISER_RX_PAYLOAD_SIZE;
+		isert_dbg("req_buf: Using rx_dma: 0x%llx, rx_buflen: %d\n",
+			 rx_dma, rx_buflen);
+	}
+
+	ib_dma_sync_single_for_cpu(ib_dev, rx_dma, rx_buflen, DMA_FROM_DEVICE);
+
+	hdr = &desc->iscsi_header;
+	isert_dbg("iSCSI opcode: 0x%02x, ITT: 0x%08x, flags: 0x%02x dlen: %d\n",
+		 hdr->opcode, hdr->itt, hdr->flags,
+		 (int)(xfer_len - ISER_HEADERS_LEN));
+
+	if ((char *)desc == isert_conn->login_req_buf) {
+		isert_conn->login_req_len = xfer_len - ISER_HEADERS_LEN;
+		if (isert_conn->conn) {
+			struct iscsi_login *login = isert_conn->conn->conn_login;
+
+			if (login && !login->first_request)
+				isert_rx_login_req(isert_conn);
+		}
+		mutex_lock(&isert_conn->mutex);
+		complete(&isert_conn->login_req_comp);
+		mutex_unlock(&isert_conn->mutex);
+	} else {
+		isert_rx_do_work(desc, isert_conn);
+	}
+
+	ib_dma_sync_single_for_device(ib_dev, rx_dma, rx_buflen,
+				      DMA_FROM_DEVICE);
+
+}
+
+static int
+isert_map_data_buf(struct isert_conn *isert_conn, struct isert_cmd *isert_cmd,
+		   struct scatterlist *sg, u32 nents, u32 length, u32 offset,
+		   enum iser_ib_op_code op, struct isert_data_buf *data)
+{
+	struct ib_device *ib_dev = isert_conn->cm_id->device;
+
+	data->dma_dir = op == ISER_IB_RDMA_WRITE ?
+			      DMA_TO_DEVICE : DMA_FROM_DEVICE;
+
+	data->len = length - offset;
+	data->offset = offset;
+	data->sg_off = data->offset / PAGE_SIZE;
+
+	data->sg = &sg[data->sg_off];
+	data->nents = min_t(unsigned int, nents - data->sg_off,
+					  ISCSI_ISER_SG_TABLESIZE);
+	data->len = min_t(unsigned int, data->len, ISCSI_ISER_SG_TABLESIZE *
+					PAGE_SIZE);
+
+	data->dma_nents = ib_dma_map_sg(ib_dev, data->sg, data->nents,
+					data->dma_dir);
+	if (unlikely(!data->dma_nents)) {
+		isert_err("Cmd: unable to dma map SGs %p\n", sg);
+		return -EINVAL;
+	}
+
+	isert_dbg("Mapped cmd: %p count: %u sg: %p sg_nents: %u rdma_len %d\n",
+		  isert_cmd, data->dma_nents, data->sg, data->nents, data->len);
+
+	return 0;
+}
+
+static void
+isert_unmap_data_buf(struct isert_conn *isert_conn, struct isert_data_buf *data)
+{
+	struct ib_device *ib_dev = isert_conn->cm_id->device;
+
+	ib_dma_unmap_sg(ib_dev, data->sg, data->nents, data->dma_dir);
+	memset(data, 0, sizeof(*data));
+}
+
+
+
+static void
+isert_unmap_cmd(struct isert_cmd *isert_cmd, struct isert_conn *isert_conn)
+{
+	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
+
+	isert_dbg("Cmd %p\n", isert_cmd);
+
+	if (wr->data.sg) {
+		isert_dbg("Cmd %p unmap_sg op\n", isert_cmd);
+		isert_unmap_data_buf(isert_conn, &wr->data);
+	}
+
+	if (wr->rdma_wr) {
+		isert_dbg("Cmd %p free send_wr\n", isert_cmd);
+		kfree(wr->rdma_wr);
+		wr->rdma_wr = NULL;
+	}
+
+	if (wr->ib_sge) {
+		isert_dbg("Cmd %p free ib_sge\n", isert_cmd);
+		kfree(wr->ib_sge);
+		wr->ib_sge = NULL;
 	}
 }
 
-static void wistron_led_remove(void)
+static void
+isert_unreg_rdma(struct isert_cmd *isert_cmd, struct isert_conn *isert_conn)
 {
-	if (leds_present & FE_MAIL_LED)
-		led_classdev_unregister(&wistron_mail_led);
+	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
 
-	if (leds_present & FE_WIFI_LED)
-		led_classdev_unregister(&wistron_wifi_led);
+	isert_dbg("Cmd %p\n", isert_cmd);
+
+	if (wr->fr_desc) {
+		isert_dbg("Cmd %p free fr_desc %p\n", isert_cmd, wr->fr_desc);
+		if (wr->fr_desc->ind & ISERT_PROTECTED) {
+			isert_unmap_data_buf(isert_conn, &wr->prot);
+			wr->fr_desc->ind &= ~ISERT_PROTECTED;
+		}
+		spin_lock_bh(&isert_conn->pool_lock);
+		list_add_tail(&wr->fr_desc->list, &isert_conn->fr_pool);
+		spin_unlock_bh(&isert_conn->pool_lock);
+		wr->fr_desc = NULL;
+	}
+
+	if (wr->data.sg) {
+		isert_dbg("Cmd %p unmap_sg op\n", isert_cmd);
+		isert_unmap_data_buf(isert_conn, &wr->data);
+	}
+
+	wr->ib_sge = NULL;
+	wr->rdma_wr = NULL;
 }
 
-static inline void wistron_led_suspend(void)
+static void
+isert_put_cmd(struct isert_cmd *isert_cmd, bool comp_err)
 {
-	if (leds_present & FE_MAIL_LED)
-		led_classdev_suspend(&wistron_mail_led);
+	struct iscsi_cmd *cmd = isert_cmd->iscsi_cmd;
+	struct isert_conn *isert_conn = isert_cmd->conn;
+	struct iscsi_conn *conn = isert_conn->conn;
+	struct isert_device *device = isert_conn->device;
+	struct iscsi_text_rsp *hdr;
 
-	if (leds_present & FE_WIFI_LED)
-		led_classdev_suspend(&wistron_wifi_led);
-}
+	isert_dbg("Cmd %p\n", isert_cmd);
 
-static inline void wistron_led_resume(void)
-{
-	if (leds_present & FE_MAIL_LED)
-		led_classdev_resume(&wistron_mail_led);
+	switch (cmd->iscsi_opcode) {
+	case ISCSI_OP_SCSI_CMD:
+		spin_lock_bh(&conn->cmd_lock);
+		if (!list_empty(&cmd->i_conn_node))
+			list_del_init(&cmd->i_conn_node);
+		spin_unlock_bh(&conn->cmd_lock);
 
-	if (leds_present & FE_WIFI_LED)
-		led_classdev_resume(&wistron_wifi_led);
-}
+		if (cmd->data_direction == DMA_TO_DEVICE) {
+			iscsit_stop_dataout_timer(cmd);
+			/*
+			 * Check for special case during comp_err where
+			 * WRITE_PENDING has been handed off from core,
+			 * but requires an extra target_put_sess_cmd()
+			 * before transport_generic_free_cmd() below.
+			 */
+			if (comp_err &&
+			    cmd->se_cmd.t_state == TRANSPORT_WRITE_PENDING) {
+				struct se_cmd *se_cmd = &cmd->se_cmd;
 
-static void handle_key(u8 code)
-{
-	const struct key_entry *key =
-		sparse_keymap_entry_from_scancode(wistron_idev->input, code);
-
-	if (key) {
-		switch (key->type) {
-		case KE_WIFI:
-			if (have_wifi) {
-				wifi_enabled = !wifi_enabled;
-				bios_set_state(WIFI, wifi_enabled);
+				target_put_sess_cmd(se_cmd);
 			}
+		}
+
+		device->unreg_rdma_mem(isert_cmd, isert_conn);
+		transport_generic_free_cmd(&cmd->se_cmd, 0);
+		break;
+	case ISCSI_OP_SCSI_TMFUNC:
+		spin_lock_bh(&conn->cmd_lock);
+		if (!list_empty(&cmd->i_conn_node))
+			list_del_init(&cmd->i_conn_node);
+		spin_unlock_bh(&conn->cmd_lock);
+
+		transport_generic_free_cmd(&cmd->se_cmd, 0);
+		break;
+	case ISCSI_OP_REJECT:
+	case ISCSI_OP_NOOP_OUT:
+	case ISCSI_OP_TEXT:
+		hdr = (struct iscsi_text_rsp *)&isert_cmd->tx_desc.iscsi_header;
+		/* If the continue bit is on, keep the command alive */
+		if (hdr->flags & ISCSI_FLAG_TEXT_CONTINUE)
 			break;
 
-		case KE_BLUETOOTH:
-			if (have_bluetooth) {
-				bluetooth_enabled = !bluetooth_enabled;
-				bios_set_state(BLUETOOTH, bluetooth_enabled);
-			}
-			break;
+		spin_lock_bh(&conn->cmd_lock);
+		if (!list_empty(&cmd->i_conn_node))
+			list_del_init(&cmd->i_conn_node);
+		spin_unlock_bh(&conn->cmd_lock);
 
-		default:
-			sparse_keymap_report_entry(wistron_idev->input,
-						   key, 1, true);
+		/*
+		 * Handle special case for REJECT when iscsi_add_reject*() has
+		 * overwritten the original iscsi_opcode assignment, and the
+		 * associated cmd->se_cmd needs to be released.
+		 */
+		if (cmd->se_cmd.se_tfo != NULL) {
+			isert_dbg("Calling transport_generic_free_cmd for 0x%02x\n",
+				 cmd->iscsi_opcode);
+			transport_generic_free_cmd(&cmd->se_cmd, 0);
 			break;
 		}
-		jiffies_last_press = jiffies;
-	} else
-		printk(KERN_NOTICE
-			"wistron_btns: Unknown key code %02X\n", code);
-}
-
-static void poll_bios(bool discard)
-{
-	u8 qlen;
-	u16 val;
-
-	for (;;) {
-		qlen = CMOS_READ(cmos_address);
-		if (qlen == 0)
-			break;
-		val = bios_pop_queue();
-		if (val != 0 && !discard)
-			handle_key((u8)val);
+		/*
+		 * Fall-through
+		 */
+	default:
+		iscsit_release_cmd(cmd);
+		break;
 	}
 }
 
-static void wistron_flush(struct input_polled_dev *dev)
+static void
+isert_unmap_tx_desc(struct iser_tx_desc *tx_desc, struct ib_device *ib_dev)
 {
-	/* Flush stale event queue */
-	poll_bios(true);
+	if (tx_desc->dma_addr != 0) {
+		isert_dbg("unmap single for tx_desc->dma_addr\n");
+		ib_dma_unmap_single(ib_dev, tx_desc->dma_addr,
+				    ISER_HEADERS_LEN, DMA_TO_DEVICE);
+		tx_desc->dma_addr = 0;
+	}
 }
 
-static void wistron_poll(struct input_polled_dev *dev)
+static void
+isert_completion_put(struct iser_tx_desc *tx_desc, struct isert_cmd *isert_cmd,
+		     struct ib_device *ib_dev, bool comp_err)
 {
-	poll_bios(false);
+	if (isert_cmd->pdu_buf_dma != 0) {
+		isert_dbg("unmap single for isert_cmd->pdu_buf_dma\n");
+		ib_dma_unmap_single(ib_dev, isert_cmd->pdu_buf_dma,
+				    isert_cmd->pdu_buf_len, DMA_TO_DEVICE);
+		isert_cmd->pdu_buf_dma = 0;
+	}
 
-	/* Increase poll frequency if user is currently pressing keys (< 2s ago) */
-	if (time_before(jiffies, jiffies_last_press + 2 * HZ))
-		dev->poll_interval = POLL_INTERVAL_BURST;
+	isert_unmap_tx_desc(tx_desc, ib_dev);
+	isert_put_cmd(isert_cmd, comp_err);
+}
+
+static int
+isert_check_pi_status(struct se_cmd *se_cmd, struct ib_mr *sig_mr)
+{
+	struct ib_mr_status mr_status;
+	int ret;
+
+	ret = ib_check_mr_status(sig_mr, IB_MR_CHECK_SIG_STATUS, &mr_status);
+	if (ret) {
+		isert_err("ib_check_mr_status failed, ret %d\n", ret);
+		goto fail_mr_status;
+	}
+
+	if (mr_status.fail_status & IB_MR_CHECK_SIG_STATUS) {
+		u64 sec_offset_err;
+		u32 block_size = se_cmd->se_dev->dev_attrib.block_size + 8;
+
+		switch (mr_status.sig_err.err_type) {
+		case IB_SIG_BAD_GUARD:
+			se_cmd->pi_err = TCM_LOGICAL_BLOCK_GUARD_CHECK_FAILED;
+			break;
+		case IB_SIG_BAD_REFTAG:
+			se_cmd->pi_err = TCM_LOGICAL_BLOCK_REF_TAG_CHECK_FAILED;
+			break;
+		case IB_SIG_BAD_APPTAG:
+			se_cmd->pi_err = TCM_LOGICAL_BLOCK_APP_TAG_CHECK_FAILED;
+			break;
+		}
+		sec_offset_err = mr_status.sig_err.sig_err_offset;
+		do_div(sec_offset_err, block_size);
+		se_cmd->bad_sector = sec_offset_err + se_cmd->t_task_lba;
+
+		isert_err("PI error found type %d at sector 0x%llx "
+			  "expected 0x%x vs actual 0x%x\n",
+			  mr_status.sig_err.err_type,
+			  (unsigned long long)se_cmd->bad_sector,
+			  mr_status.sig_err.expected,
+			  mr_status.sig_err.actual);
+		ret = 1;
+	}
+
+fail_mr_status:
+	return ret;
+}
+
+static void
+isert_completion_rdma_write(struct iser_tx_desc *tx_desc,
+			    struct isert_cmd *isert_cmd)
+{
+	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
+	struct iscsi_cmd *cmd = isert_cmd->iscsi_cmd;
+	struct se_cmd *se_cmd = &cmd->se_cmd;
+	struct isert_conn *isert_conn = isert_cmd->conn;
+	struct isert_device *device = isert_conn->device;
+	int ret = 0;
+
+	if (wr->fr_desc && wr->fr_desc->ind & ISERT_PROTECTED) {
+		ret = isert_check_pi_status(se_cmd,
+					    wr->fr_desc->pi_ctx->sig_mr);
+		wr->fr_desc->ind &= ~ISERT_PROTECTED;
+	}
+
+	device->unreg_rdma_mem(isert_cmd, isert_conn);
+	wr->rdma_wr_num = 0;
+	if (ret)
+		transport_send_check_condition_and_sense(se_cmd,
+							 se_cmd->pi_err, 0);
 	else
-		dev->poll_interval = POLL_INTERVAL_DEFAULT;
+		isert_put_response(isert_conn->conn, cmd);
 }
 
-static int wistron_setup_keymap(struct input_dev *dev,
-					  struct key_entry *entry)
+static void
+isert_completion_rdma_read(struct iser_tx_desc *tx_desc,
+			   struct isert_cmd *isert_cmd)
 {
-	switch (entry->type) {
+	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
+	struct iscsi_cmd *cmd = isert_cmd->iscsi_cmd;
+	struct se_cmd *se_cmd = &cmd->se_cmd;
+	struct isert_conn *isert_conn = isert_cmd->conn;
+	struct isert_device *device = isert_conn->device;
+	int ret = 0;
 
-	/* if wifi or bluetooth are not available, create normal keys */
-	case KE_WIFI:
-		if (!have_wifi) {
-			entry->type = KE_KEY;
-			entry->keycode = KEY_WLAN;
-		}
-		break;
-
-	case KE_BLUETOOTH:
-		if (!have_bluetooth) {
-			entry->type = KE_KEY;
-			entry->keycode = KEY_BLUETOOTH;
-		}
-		break;
-
-	case KE_END:
-		if (entry->code & FE_UNTESTED)
-			printk(KERN_WARNING "Untested laptop multimedia keys, "
-				"please report success or failure to "
-				"eric.piel@tremplin-utc.net\n");
-		break;
+	if (wr->fr_desc && wr->fr_desc->ind & ISERT_PROTECTED) {
+		ret = isert_check_pi_status(se_cmd,
+					    wr->fr_desc->pi_ctx->sig_mr);
+		wr->fr_desc->ind &= ~ISERT_PROTECTED;
 	}
 
-	return 0;
+	iscsit_stop_dataout_timer(cmd);
+	device->unreg_rdma_mem(isert_cmd, isert_conn);
+	cmd->write_data_done = wr->data.len;
+	wr->rdma_wr_num = 0;
+
+	isert_dbg("Cmd: %p RDMA_READ comp calling execute_cmd\n", isert_cmd);
+	spin_lock_bh(&cmd->istate_lock);
+	cmd->cmd_flags |= ICF_GOT_LAST_DATAOUT;
+	cmd->i_state = ISTATE_RECEIVED_LAST_DATAOUT;
+	spin_unlock_bh(&cmd->istate_lock);
+
+	if (ret) {
+		target_put_sess_cmd(se_cmd);
+		transport_send_check_condition_and_sense(se_cmd,
+							 se_cmd->pi_err, 0);
+	} else {
+		target_execute_cmd(se_cmd);
+	}
 }
 
-static int setup_input_dev(void)
+static void
+isert_do_control_comp(struct work_struct *work)
 {
-	struct input_dev *input_dev;
-	int error;
+	struct isert_cmd *isert_cmd = container_of(work,
+			struct isert_cmd, comp_work);
+	struct isert_conn *isert_conn = isert_cmd->conn;
+	struct ib_device *ib_dev = isert_conn->cm_id->device;
+	struct iscsi_cmd *cmd = isert_cmd->iscsi_cmd;
 
-	wistron_idev = input_allocate_polled_device();
-	if (!wistron_idev)
-		return -ENOMEM;
+	isert_dbg("Cmd %p i_state %d\n", isert_cmd, cmd->i_state);
 
-	wistron_idev->open = wistron_flush;
-	wistron_idev->poll = wistron_poll;
-	wistron_idev->poll_interval = POLL_INTERVAL_DEFAULT;
-
-	input_dev = wistron_idev->input;
-	input_dev->name = "Wistron laptop buttons";
-	input_dev->phys = "wistron/input0";
-	input_dev->id.bustype = BUS_HOST;
-	input_dev->dev.parent = &wistron_device->dev;
-
-	error = sparse_keymap_setup(input_dev, keymap, wistron_setup_keymap);
-	if (error)
-		goto err_free_dev;
-
-	error = input_register_polled_device(wistron_idev);
-	if (error)
-		goto err_free_keymap;
-
-	return 0;
-
- err_free_keymap:
-	sparse_keymap_free(input_dev);
- err_free_dev:
-	input_free_polled_device(wistron_idev);
-	return error;
+	switch (cmd->i_state) {
+	case ISTATE_SEND_TASKMGTRSP:
+		iscsit_tmr_post_handler(cmd, cmd->conn);
+	case ISTATE_SEND_REJECT:   /* FALLTHRU */
+	case ISTATE_SEND_TEXTRSP:  /* FALLTHRU */
+		cmd->i_state = ISTATE_SENT_STATUS;
+		isert_completion_put(&isert_cmd->tx_desc, isert_cmd,
+				     ib_dev, false);
+		break;
+	case ISTATE_SEND_LOGOUTRSP:
+		iscsit_logout_post_handler(cmd, cmd->conn);
+		break;
+	default:
+		isert_err("Unknown i_state %d\n", cmd->i_state);
+		dump_stack();
+		break;
+	}
 }
 
-/* Driver core */
-
-static int wistron_probe(struct platform_device *dev)
+static void
+isert_response_completion(struct iser_tx_desc *tx_desc,
+			  struct isert_cmd *isert_cmd,
+			  struct isert_conn *isert_conn,
+			  struct ib_device *ib_dev)
 {
-	int err;
+	struct iscsi_cmd *cmd = isert_cmd->iscsi_cmd;
 
-	bios_attach();
-	cmos_address = bios_get_cmos_address();
+	if (cmd->i_state == ISTATE_SEND_TASKMGTRSP ||
+	    cmd->i_state == ISTATE_SEND_LOGOUTRSP ||
+	    cmd->i_state == ISTATE_SEND_REJECT ||
+	    cmd->i_state == ISTATE_SEND_TEXTRSP) {
+		isert_unmap_tx_desc(tx_desc, ib_dev);
 
-	if (have_wifi) {
-		u16 wifi = bios_get_default_setting(WIFI);
-		if (wifi & 1)
-			wifi_enabled = wifi & 2;
+		INIT_WORK(&isert_cmd->comp_work, isert_do_control_comp);
+		queue_work(isert_comp_wq, &isert_cmd->comp_work);
+		return;
+	}
+
+	cmd->i_state = ISTATE_SENT_STATUS;
+	isert_completion_put(tx_desc, isert_cmd, ib_dev, false);
+}
+
+static void
+isert_snd_completion(struct iser_tx_desc *tx_desc,
+		      struct isert_conn *isert_conn)
+{
+	struct ib_device *ib_dev = isert_conn->cm_id->device;
+	struct isert_cmd *isert_cmd = tx_desc->isert_cmd;
+	struct isert_rdma_wr *wr;
+
+	if (!isert_cmd) {
+		isert_unmap_tx_desc(tx_desc, ib_dev);
+		return;
+	}
+	wr = &isert_cmd->rdma_wr;
+
+	isert_dbg("Cmd %p iser_ib_op %d\n", isert_cmd, wr->iser_ib_op);
+
+	switch (wr->iser_ib_op) {
+	case ISER_IB_SEND:
+		isert_response_completion(tx_desc, isert_cmd,
+					  isert_conn, ib_dev);
+		break;
+	case ISER_IB_RDMA_WRITE:
+		isert_completion_rdma_write(tx_desc, isert_cmd);
+		break;
+	case ISER_IB_RDMA_READ:
+		isert_completion_rdma_read(tx_desc, isert_cmd);
+		break;
+	default:
+		isert_err("Unknown wr->iser_ib_op: 0x%x\n", wr->iser_ib_op);
+		dump_stack();
+		break;
+	}
+}
+
+/**
+ * is_isert_tx_desc() - Indicate if the completion wr_id
+ *     is a TX descriptor or not.
+ * @isert_conn: iser connection
+ * @wr_id: completion WR identifier
+ *
+ * Since we cannot rely on wc opcode in FLUSH errors
+ * we must work around it by checking if the wr_id address
+ * falls in the iser connection rx_descs buffer. If so
+ * it is an RX descriptor, otherwize it is a TX.
+ */
+static inline bool
+is_isert_tx_desc(struct isert_conn *isert_conn, void *wr_id)
+{
+	void *start = isert_conn->rx_descs;
+	int len = ISERT_QP_MAX_RECV_DTOS * sizeof(*isert_conn->rx_descs);
+
+	if ((wr_id >= start && wr_id < start + len) ||
+	    (wr_id == isert_conn->login_req_buf))
+		return false;
+
+	return true;
+}
+
+static void
+isert_cq_comp_err(struct isert_conn *isert_conn, struct ib_wc *wc)
+{
+	if (wc->wr_id == ISER_BEACON_WRID) {
+		isert_info("conn %p completing wait_comp_err\n",
+			   isert_conn);
+		complete(&isert_conn->wait_comp_err);
+	} else if (is_isert_tx_desc(isert_conn, (void *)(uintptr_t)wc->wr_id)) {
+		struct ib_device *ib_dev = isert_conn->cm_id->device;
+		struct isert_cmd *isert_cmd;
+		struct iser_tx_desc *desc;
+
+		desc = (struct iser_tx_desc *)(uintptr_t)wc->wr_id;
+		isert_cmd = desc->isert_cmd;
+		if (!isert_cmd)
+			isert_unmap_tx_desc(desc, ib_dev);
 		else
-			have_wifi = 0;
-
-		if (have_wifi)
-			bios_set_state(WIFI, wifi_enabled);
+			isert_completion_put(desc, isert_cmd, ib_dev, true);
 	}
+}
 
-	if (have_bluetooth) {
-		u16 bt = bios_get_default_setting(BLUETOOTH);
-		if (bt & 1)
-			bluetooth_enabled = bt & 2;
+static void
+isert_handle_wc(struct ib_wc *wc)
+{
+	struct isert_conn *isert_conn;
+	struct iser_tx_desc *tx_desc;
+	struct iser_rx_desc *rx_desc;
+
+	isert_conn = wc->qp->qp_context;
+	if (likely(wc->status == IB_WC_SUCCESS)) {
+		if (wc->opcode == IB_WC_RECV) {
+			rx_desc = (struct iser_rx_desc *)(uintptr_t)wc->wr_id;
+			isert_rcv_completion(rx_desc, isert_conn, wc->byte_len);
+		} else {
+			tx_desc = (struct iser_tx_desc *)(uintptr_t)wc->wr_id;
+			isert_snd_completion(tx_desc, isert_conn);
+		}
+	} else {
+		if (wc->status != IB_WC_WR_FLUSH_ERR)
+			isert_err("%s (%d): wr id %llx vend_err %x\n",
+				  ib_wc_status_msg(wc->status), wc->status,
+				  wc->wr_id, wc->vendor_err);
 		else
-			have_bluetooth = false;
+			isert_dbg("%s (%d): wr id %llx\n",
+				  ib_wc_status_msg(wc->status), wc->status,
+				  wc->wr_id);
 
-		if (have_bluetooth)
-			bios_set_state(BLUETOOTH, bluetooth_enabled);
+		if (wc->wr_id != ISER_FASTREG_LI_WRID)
+			isert_cq_comp_err(isert_conn, wc);
+	}
+}
+
+static void
+isert_cq_work(struct work_struct *work)
+{
+	enum { isert_poll_budget = 65536 };
+	struct isert_comp *comp = container_of(work, struct isert_comp,
+					       work);
+	struct ib_wc *const wcs = comp->wcs;
+	int i, n, completed = 0;
+
+	while ((n = ib_poll_cq(comp->cq, ARRAY_SIZE(comp->wcs), wcs)) > 0) {
+		for (i = 0; i < n; i++)
+			isert_handle_wc(&wcs[i]);
+
+		completed += n;
+		if (completed >= isert_poll_budget)
+			break;
 	}
 
-	wistron_led_init(&dev->dev);
+	ib_req_notify_cq(comp->cq, IB_CQ_NEXT_COMP);
+}
 
-	err = setup_input_dev();
-	if (err) {
-		bios_detach();
-		return err;
+static void
+isert_cq_callback(struct ib_cq *cq, void *context)
+{
+	struct isert_comp *comp = context;
+
+	queue_work(isert_comp_wq, &comp->work);
+}
+
+static int
+isert_post_response(struct isert_conn *isert_conn, struct isert_cmd *isert_cmd)
+{
+	struct ib_send_wr *wr_failed;
+	int ret;
+
+	ret = isert_post_recv(isert_conn, isert_cmd->rx_desc);
+	if (ret) {
+		isert_err("ib_post_recv failed with %d\n", ret);
+		return ret;
 	}
 
-	return 0;
+	ret = ib_post_send(isert_conn->qp, &isert_cmd->tx_desc.send_wr,
+			   &wr_failed);
+	if (ret) {
+		isert_err("ib_post_send failed with %d\n", ret);
+		return ret;
+	}
+	return ret;
 }
 
-static int wistron_remove(struct platform_device *dev)
+static int
+isert_put_response(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
 {
-	wistron_led_remove();
-	input_unregister_polled_device(wistron_idev);
-	sparse_keymap_free(wistron_idev->input);
-	input_free_polled_device(wistron_idev);
-	bios_detach();
+	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+	struct isert_conn *isert_conn = conn->context;
+	struct ib_send_wr *send_wr = &isert_cmd->tx_desc.send_wr;
+	struct iscsi_scsi_rsp *hdr = (struct iscsi_scsi_rsp *)
+				&isert_cmd->tx_desc.iscsi_header;
 
-	return 0;
-}
+	isert_create_send_desc(isert_conn, isert_cmd, &isert_cmd->tx_desc);
+	iscsit_build_rsp_pdu(cmd, conn, true, hdr);
+	isert_init_tx_hdrs(isert_conn, &isert_cmd->tx_desc);
+	/*
+	 * Attach SENSE DATA payload to iSCSI Response PDU
+	 */
+	if (cmd->se_cmd.sense_buffer &&
+	    ((cmd->se_cmd.se_cmd_flags & SCF_TRANSPORT_TASK_SENSE) ||
+	    (cmd->se_cmd.se_cmd_flags & SCF_EMULATED_TASK_SENSE))) {
+		struct isert_device *device = isert_conn->device;
+		struct ib_device *ib_dev = device->ib_device;
+		struct ib_sge *tx_dsg = &isert_cmd->tx_desc.tx_sg[1];
+		u32 padding, pdu_len;
 
-#ifdef CONFIG_PM
-static int wistron_suspend(struct device *dev)
-{
-	if (have_wifi)
-		bios_set_state(WIFI, 0);
+		put_unaligned_be16(cmd->se_cmd.scsi_sense_length,
+				   cmd->sense_buffer);
+		cmd->se_cmd.scsi_sense_length += sizeof(__be16);
 
-	if (have_bluetooth)
-		bios_set_state(BLUETOOTH, 0);
+		padding = -(cmd->se_cmd.scsi_sense_length) & 3;
+		hton24(hdr->dlength, (u32)cmd->se_cmd.scsi_sense_length);
+		pdu_len = cmd->se_cmd.scsi_sense_length + padding;
 
-	wistron_led_suspend();
+		isert_cmd->pdu_buf_dma = ib_dma_map_single(ib_dev,
+				(void *)cmd->sense_buffer, pdu_len,
+				DMA_TO_DEVICE);
 
-	return 0;
-}
-
-static int wistron_resume(struct device *dev)
-{
-	if (have_wifi)
-		bios_set_state(WIFI, wifi_enabled);
-
-	if (have_bluetooth)
-		bios_set_state(BLUETOOTH, bluetooth_enabled);
-
-	wistron_led_resume();
-
-	poll_bios(true);
-
-	return 0;
-}
-
-static const struct dev_pm_ops wistron_pm_ops = {
-	.suspend	= wistron_suspend,
-	.resume		= wistron_resume,
-	.poweroff	= wistron_suspend,
-	.restore	= wistron_resume,
-};
-#endif
-
-static struct platform_driver wistron_driver = {
-	.driver		= {
-		.name	= "wistron-bios",
-#ifdef CONFIG_PM
-		.pm	= &wistron_pm_ops,
-#endif
-	},
-	.probe		= wistron_probe,
-	.remove		= wistron_remove,
-};
-
-static int __init wb_module_init(void)
-{
-	int err;
-
-	err = select_keymap();
-	if (err)
-		return err;
-
-	err = map_bios();
-	if (err)
-		goto err_free_keymap;
-
-	err = platform_driver_register(&wistron_driver);
-	if (err)
-		goto err_unmap_bios;
-
-	wistron_device = platform_device_alloc("wistron-bios", -1);
-	if (!wistron_device) {
-		err = -ENOMEM;
-		goto err_unregister_driver;
+		isert_cmd->pdu_buf_len = pdu_len;
+		tx_dsg->addr	= isert_cmd->pdu_buf_dma;
+		tx_dsg->length	= pdu_len;
+		tx_dsg->lkey	= device->pd->local_dma_lkey;
+		isert_cmd->tx_desc.num_sge = 2;
 	}
 
-	err = platform_device_add(wistron_device);
-	if (err)
-		goto err_free_device;
+	isert_init_send_wr(isert_conn, isert_cmd, send_wr);
 
-	return 0;
+	isert_dbg("Posting SCSI Response\n");
 
- err_free_device:
-	platform_device_put(wistron_device);
- err_unregister_driver:
-	platform_driver_unregister(&wistron_driver);
- err_unmap_bios:
-	unmap_bios();
- err_free_keymap:
-	kfree(keymap);
-
-	return err;
+	return isert_post_response(isert_conn, isert_cmd);
 }
 
-static void __exit wb_module_exit(void)
+static void
+isert_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
 {
-	platform_device_unregister(wistron_device);
-	platform_driver_unregister(&wistron_driver);
-	unmap_bios();
-	kfree(keymap);
+	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+	struct isert_conn *isert_conn = conn->context;
+	struct isert_device *device = isert_conn->device;
+
+	spin_lock_bh(&conn->cmd_lock);
+	if (!list_empty(&cmd->i_conn_node))
+		list_del_init(&cmd->i_conn_node);
+	spin_unlock_bh(&conn->cmd_lock);
+
+	if (cmd->data_direction == DMA_TO_DEVICE)
+		iscsit_stop_dataout_timer(cmd);
+
+	device->unreg_rdma_mem(isert_cmd, isert_conn);
 }
 
-module_init(wb_module_init);
-module_exit(wb_module_exit);
+static enum target_prot_op
+isert_get_sup_prot_ops(struct iscsi_conn *conn)
+{
+	struct isert_conn *isert_conn = conn->context;
+	struct isert_device *device = isert_conn->device;
+
+	if (conn->tpg->tpg_attrib.t10_pi) {
+		if (device->pi_capable) {
+			isert_info("conn %p PI offload enabled\n", isert_conn);
+			isert_conn->pi_support = true;
+			return TARGET_PROT_ALL;
+		}
+	}
+
+	isert_info("conn %p PI offload disabled\n", isert_conn);
+	isert_conn->pi_support = false;
+
+	return TARGET_PROT_NORMAL;
+}
+
+static int
+isert_put_nopin(struct iscsi_cmd *cmd, struct iscsi_conn *conn,
+		bool nopout_response)
+{
+	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+	struct isert_conn *isert_conn = conn->context;
+	struct ib_send_wr *send_wr = &isert_cmd->tx_desc.send_wr;
+
+	isert_create_send_desc(isert_conn, isert_cmd, &isert_cmd->tx_desc);
+	iscsit_build_nopin_rsp(cmd, conn, (struct iscsi_nopin *)
+			       &isert_cmd->tx_desc.iscsi_header,
+			       nopout_response);
+	isert_init_tx_hdrs(isert_conn, &isert_cmd->tx_desc);
+	isert_init_send_wr(isert_conn, isert_cmd, send_wr);
+
+	isert_dbg("conn %p Posting NOPIN Response\n", isert_conn);
+
+	return isert_post_response(isert_conn, isert_cmd);
+}
+
+static int
+isert_put_logout_rsp(struct iscsi_cmd *cmd, struct iscsi_conn *conn)
+{
+	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);

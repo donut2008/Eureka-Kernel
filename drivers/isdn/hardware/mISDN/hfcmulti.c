@@ -1,5593 +1,4682 @@
+ * Since we're under a transaction reserve_metadata_bytes could
+		 * try to commit the transaction which will make it return
+		 * EAGAIN to make us stop the transaction we have, so return
+		 * ENOSPC instead so that btrfs_dirty_inode knows what to do.
+		 */
+		if (ret == -EAGAIN)
+			ret = -ENOSPC;
+		if (!ret) {
+			node->bytes_reserved = num_bytes;
+			trace_btrfs_space_reservation(root->fs_info,
+						      "delayed_inode",
+						      btrfs_ino(inode),
+						      num_bytes, 1);
+		}
+		return ret;
+	} else if (src_rsv->type == BTRFS_BLOCK_RSV_DELALLOC) {
+		spin_lock(&BTRFS_I(inode)->lock);
+		if (test_and_clear_bit(BTRFS_INODE_DELALLOC_META_RESERVED,
+				       &BTRFS_I(inode)->runtime_flags)) {
+			spin_unlock(&BTRFS_I(inode)->lock);
+			release = true;
+			goto migrate;
+		}
+		spin_unlock(&BTRFS_I(inode)->lock);
+
+		/* Ok we didn't have space pre-reserved.  This shouldn't happen
+		 * too often but it can happen if we do delalloc to an existing
+		 * inode which gets dirtied because of the time update, and then
+		 * isn't touched again until after the transaction commits and
+		 * then we try to write out the data.  First try to be nice and
+		 * reserve something strictly for us.  If not be a pain and try
+		 * to steal from the delalloc block rsv.
+		 */
+		ret = btrfs_block_rsv_add(root, dst_rsv, num_bytes,
+					  BTRFS_RESERVE_NO_FLUSH);
+		if (!ret)
+			goto out;
+
+		ret = btrfs_block_rsv_migrate(src_rsv, dst_rsv, num_bytes);
+		if (!WARN_ON(ret))
+			goto out;
+
+		/*
+		 * Ok this is a problem, let's just steal from the global rsv
+		 * since this really shouldn't happen that often.
+		 */
+		ret = btrfs_block_rsv_migrate(&root->fs_info->global_block_rsv,
+					      dst_rsv, num_bytes);
+		goto out;
+	}
+
+migrate:
+	ret = btrfs_block_rsv_migrate(src_rsv, dst_rsv, num_bytes);
+
+out:
+	/*
+	 * Migrate only takes a reservation, it doesn't touch the size of the
+	 * block_rsv.  This is to simplify people who don't normally have things
+	 * migrated from their block rsv.  If they go to release their
+	 * reservation, that will decrease the size as well, so if migrate
+	 * reduced size we'd end up with a negative size.  But for the
+	 * delalloc_meta_reserved stuff we will only know to drop 1 reservation,
+	 * but we could in fact do this reserve/migrate dance several times
+	 * between the time we did the original reservation and we'd clean it
+	 * up.  So to take care of this, release the space for the meta
+	 * reservation here.  I think it may be time for a documentation page on
+	 * how block rsvs. work.
+	 */
+	if (!ret) {
+		trace_btrfs_space_reservation(root->fs_info, "delayed_inode",
+					      btrfs_ino(inode), num_bytes, 1);
+		node->bytes_reserved = num_bytes;
+	}
+
+	if (release) {
+		trace_btrfs_space_reservation(root->fs_info, "delalloc",
+					      btrfs_ino(inode), num_bytes, 0);
+		btrfs_block_rsv_release(root, src_rsv, num_bytes);
+	}
+
+	return ret;
+}
+
+static void btrfs_delayed_inode_release_metadata(struct btrfs_root *root,
+						struct btrfs_delayed_node *node)
+{
+	struct btrfs_block_rsv *rsv;
+
+	if (!node->bytes_reserved)
+		return;
+
+	rsv = &root->fs_info->delayed_block_rsv;
+	trace_btrfs_space_reservation(root->fs_info, "delayed_inode",
+				      node->inode_id, node->bytes_reserved, 0);
+	btrfs_block_rsv_release(root, rsv,
+				node->bytes_reserved);
+	node->bytes_reserved = 0;
+}
+
 /*
- * hfcmulti.c  low level driver for hfc-4s/hfc-8s/hfc-e1 based cards
+ * This helper will insert some continuous items into the same leaf according
+ * to the free space of the leaf.
+ */
+static int btrfs_batch_insert_items(struct btrfs_root *root,
+				    struct btrfs_path *path,
+				    struct btrfs_delayed_item *item)
+{
+	struct btrfs_delayed_item *curr, *next;
+	int free_space;
+	int total_data_size = 0, total_size = 0;
+	struct extent_buffer *leaf;
+	char *data_ptr;
+	struct btrfs_key *keys;
+	u32 *data_size;
+	struct list_head head;
+	int slot;
+	int nitems;
+	int i;
+	int ret = 0;
+
+	BUG_ON(!path->nodes[0]);
+
+	leaf = path->nodes[0];
+	free_space = btrfs_leaf_free_space(root, leaf);
+	INIT_LIST_HEAD(&head);
+
+	next = item;
+	nitems = 0;
+
+	/*
+	 * count the number of the continuous items that we can insert in batch
+	 */
+	while (total_size + next->data_len + sizeof(struct btrfs_item) <=
+	       free_space) {
+		total_data_size += next->data_len;
+		total_size += next->data_len + sizeof(struct btrfs_item);
+		list_add_tail(&next->tree_list, &head);
+		nitems++;
+
+		curr = next;
+		next = __btrfs_next_delayed_item(curr);
+		if (!next)
+			break;
+
+		if (!btrfs_is_continuous_delayed_item(curr, next))
+			break;
+	}
+
+	if (!nitems) {
+		ret = 0;
+		goto out;
+	}
+
+	/*
+	 * we need allocate some memory space, but it might cause the task
+	 * to sleep, so we set all locked nodes in the path to blocking locks
+	 * first.
+	 */
+	btrfs_set_path_blocking(path);
+
+	keys = kmalloc_array(nitems, sizeof(struct btrfs_key), GFP_NOFS);
+	if (!keys) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	data_size = kmalloc_array(nitems, sizeof(u32), GFP_NOFS);
+	if (!data_size) {
+		ret = -ENOMEM;
+		goto error;
+	}
+
+	/* get keys of all the delayed items */
+	i = 0;
+	list_for_each_entry(next, &head, tree_list) {
+		keys[i] = next->key;
+		data_size[i] = next->data_len;
+		i++;
+	}
+
+	/* reset all the locked nodes in the patch to spinning locks. */
+	btrfs_clear_path_blocking(path, NULL, 0);
+
+	/* insert the keys of the items */
+	setup_items_for_insert(root, path, keys, data_size,
+			       total_data_size, total_size, nitems);
+
+	/* insert the dir index items */
+	slot = path->slots[0];
+	list_for_each_entry_safe(curr, next, &head, tree_list) {
+		data_ptr = btrfs_item_ptr(leaf, slot, char);
+		write_extent_buffer(leaf, &curr->data,
+				    (unsigned long)data_ptr,
+				    curr->data_len);
+		slot++;
+
+		btrfs_delayed_item_release_metadata(root, curr);
+
+		list_del(&curr->tree_list);
+		btrfs_release_delayed_item(curr);
+	}
+
+error:
+	kfree(data_size);
+	kfree(keys);
+out:
+	return ret;
+}
+
+/*
+ * This helper can just do simple insertion that needn't extend item for new
+ * data, such as directory name index insertion, inode insertion.
+ */
+static int btrfs_insert_delayed_item(struct btrfs_trans_handle *trans,
+				     struct btrfs_root *root,
+				     struct btrfs_path *path,
+				     struct btrfs_delayed_item *delayed_item)
+{
+	struct extent_buffer *leaf;
+	char *ptr;
+	int ret;
+
+	ret = btrfs_insert_empty_item(trans, root, path, &delayed_item->key,
+				      delayed_item->data_len);
+	if (ret < 0 && ret != -EEXIST)
+		return ret;
+
+	leaf = path->nodes[0];
+
+	ptr = btrfs_item_ptr(leaf, path->slots[0], char);
+
+	write_extent_buffer(leaf, delayed_item->data, (unsigned long)ptr,
+			    delayed_item->data_len);
+	btrfs_mark_buffer_dirty(leaf);
+
+	btrfs_delayed_item_release_metadata(root, delayed_item);
+	return 0;
+}
+
+/*
+ * we insert an item first, then if there are some continuous items, we try
+ * to insert those items into the same leaf.
+ */
+static int btrfs_insert_delayed_items(struct btrfs_trans_handle *trans,
+				      struct btrfs_path *path,
+				      struct btrfs_root *root,
+				      struct btrfs_delayed_node *node)
+{
+	struct btrfs_delayed_item *curr, *prev;
+	int ret = 0;
+
+do_again:
+	mutex_lock(&node->mutex);
+	curr = __btrfs_first_delayed_insertion_item(node);
+	if (!curr)
+		goto insert_end;
+
+	ret = btrfs_insert_delayed_item(trans, root, path, curr);
+	if (ret < 0) {
+		btrfs_release_path(path);
+		goto insert_end;
+	}
+
+	prev = curr;
+	curr = __btrfs_next_delayed_item(prev);
+	if (curr && btrfs_is_continuous_delayed_item(prev, curr)) {
+		/* insert the continuous items into the same leaf */
+		path->slots[0]++;
+		btrfs_batch_insert_items(root, path, curr);
+	}
+	btrfs_release_delayed_item(prev);
+	btrfs_mark_buffer_dirty(path->nodes[0]);
+
+	btrfs_release_path(path);
+	mutex_unlock(&node->mutex);
+	goto do_again;
+
+insert_end:
+	mutex_unlock(&node->mutex);
+	return ret;
+}
+
+static int btrfs_batch_delete_items(struct btrfs_trans_handle *trans,
+				    struct btrfs_root *root,
+				    struct btrfs_path *path,
+				    struct btrfs_delayed_item *item)
+{
+	struct btrfs_delayed_item *curr, *next;
+	struct extent_buffer *leaf;
+	struct btrfs_key key;
+	struct list_head head;
+	int nitems, i, last_item;
+	int ret = 0;
+
+	BUG_ON(!path->nodes[0]);
+
+	leaf = path->nodes[0];
+
+	i = path->slots[0];
+	last_item = btrfs_header_nritems(leaf) - 1;
+	if (i > last_item)
+		return -ENOENT;	/* FIXME: Is errno suitable? */
+
+	next = item;
+	INIT_LIST_HEAD(&head);
+	btrfs_item_key_to_cpu(leaf, &key, i);
+	nitems = 0;
+	/*
+	 * count the number of the dir index items that we can delete in batch
+	 */
+	while (btrfs_comp_cpu_keys(&next->key, &key) == 0) {
+		list_add_tail(&next->tree_list, &head);
+		nitems++;
+
+		curr = next;
+		next = __btrfs_next_delayed_item(curr);
+		if (!next)
+			break;
+
+		if (!btrfs_is_continuous_delayed_item(curr, next))
+			break;
+
+		i++;
+		if (i > last_item)
+			break;
+		btrfs_item_key_to_cpu(leaf, &key, i);
+	}
+
+	if (!nitems)
+		return 0;
+
+	ret = btrfs_del_items(trans, root, path, path->slots[0], nitems);
+	if (ret)
+		goto out;
+
+	list_for_each_entry_safe(curr, next, &head, tree_list) {
+		btrfs_delayed_item_release_metadata(root, curr);
+		list_del(&curr->tree_list);
+		btrfs_release_delayed_item(curr);
+	}
+
+out:
+	return ret;
+}
+
+static int btrfs_delete_delayed_items(struct btrfs_trans_handle *trans,
+				      struct btrfs_path *path,
+				      struct btrfs_root *root,
+				      struct btrfs_delayed_node *node)
+{
+	struct btrfs_delayed_item *curr, *prev;
+	int ret = 0;
+
+do_again:
+	mutex_lock(&node->mutex);
+	curr = __btrfs_first_delayed_deletion_item(node);
+	if (!curr)
+		goto delete_fail;
+
+	ret = btrfs_search_slot(trans, root, &curr->key, path, -1, 1);
+	if (ret < 0)
+		goto delete_fail;
+	else if (ret > 0) {
+		/*
+		 * can't find the item which the node points to, so this node
+		 * is invalid, just drop it.
+		 */
+		prev = curr;
+		curr = __btrfs_next_delayed_item(prev);
+		btrfs_release_delayed_item(prev);
+		ret = 0;
+		btrfs_release_path(path);
+		if (curr) {
+			mutex_unlock(&node->mutex);
+			goto do_again;
+		} else
+			goto delete_fail;
+	}
+
+	btrfs_batch_delete_items(trans, root, path, curr);
+	btrfs_release_path(path);
+	mutex_unlock(&node->mutex);
+	goto do_again;
+
+delete_fail:
+	btrfs_release_path(path);
+	mutex_unlock(&node->mutex);
+	return ret;
+}
+
+static void btrfs_release_delayed_inode(struct btrfs_delayed_node *delayed_node)
+{
+	struct btrfs_delayed_root *delayed_root;
+
+	if (delayed_node &&
+	    test_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &delayed_node->flags)) {
+		BUG_ON(!delayed_node->root);
+		clear_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &delayed_node->flags);
+		delayed_node->count--;
+
+		delayed_root = delayed_node->root->fs_info->delayed_root;
+		finish_one_item(delayed_root);
+	}
+}
+
+static void btrfs_release_delayed_iref(struct btrfs_delayed_node *delayed_node)
+{
+	struct btrfs_delayed_root *delayed_root;
+
+	ASSERT(delayed_node->root);
+	clear_bit(BTRFS_DELAYED_NODE_DEL_IREF, &delayed_node->flags);
+	delayed_node->count--;
+
+	delayed_root = delayed_node->root->fs_info->delayed_root;
+	finish_one_item(delayed_root);
+}
+
+static int __btrfs_update_delayed_inode(struct btrfs_trans_handle *trans,
+					struct btrfs_root *root,
+					struct btrfs_path *path,
+					struct btrfs_delayed_node *node)
+{
+	struct btrfs_key key;
+	struct btrfs_inode_item *inode_item;
+	struct extent_buffer *leaf;
+	int mod;
+	int ret;
+
+	key.objectid = node->inode_id;
+	key.type = BTRFS_INODE_ITEM_KEY;
+	key.offset = 0;
+
+	if (test_bit(BTRFS_DELAYED_NODE_DEL_IREF, &node->flags))
+		mod = -1;
+	else
+		mod = 1;
+
+	ret = btrfs_lookup_inode(trans, root, path, &key, mod);
+	if (ret > 0) {
+		btrfs_release_path(path);
+		return -ENOENT;
+	} else if (ret < 0) {
+		return ret;
+	}
+
+	leaf = path->nodes[0];
+	inode_item = btrfs_item_ptr(leaf, path->slots[0],
+				    struct btrfs_inode_item);
+	write_extent_buffer(leaf, &node->inode_item, (unsigned long)inode_item,
+			    sizeof(struct btrfs_inode_item));
+	btrfs_mark_buffer_dirty(leaf);
+
+	if (!test_bit(BTRFS_DELAYED_NODE_DEL_IREF, &node->flags))
+		goto no_iref;
+
+	path->slots[0]++;
+	if (path->slots[0] >= btrfs_header_nritems(leaf))
+		goto search;
+again:
+	btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);
+	if (key.objectid != node->inode_id)
+		goto out;
+
+	if (key.type != BTRFS_INODE_REF_KEY &&
+	    key.type != BTRFS_INODE_EXTREF_KEY)
+		goto out;
+
+	/*
+	 * Delayed iref deletion is for the inode who has only one link,
+	 * so there is only one iref. The case that several irefs are
+	 * in the same item doesn't exist.
+	 */
+	btrfs_del_item(trans, root, path);
+out:
+	btrfs_release_delayed_iref(node);
+no_iref:
+	btrfs_release_path(path);
+err_out:
+	btrfs_delayed_inode_release_metadata(root, node);
+	btrfs_release_delayed_inode(node);
+
+	return ret;
+
+search:
+	btrfs_release_path(path);
+
+	key.type = BTRFS_INODE_EXTREF_KEY;
+	key.offset = -1;
+	ret = btrfs_search_slot(trans, root, &key, path, -1, 1);
+	if (ret < 0)
+		goto err_out;
+	ASSERT(ret);
+
+	ret = 0;
+	leaf = path->nodes[0];
+	path->slots[0]--;
+	goto again;
+}
+
+static inline int btrfs_update_delayed_inode(struct btrfs_trans_handle *trans,
+					     struct btrfs_root *root,
+					     struct btrfs_path *path,
+					     struct btrfs_delayed_node *node)
+{
+	int ret;
+
+	mutex_lock(&node->mutex);
+	if (!test_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &node->flags)) {
+		mutex_unlock(&node->mutex);
+		return 0;
+	}
+
+	ret = __btrfs_update_delayed_inode(trans, root, path, node);
+	mutex_unlock(&node->mutex);
+	return ret;
+}
+
+static inline int
+__btrfs_commit_inode_delayed_items(struct btrfs_trans_handle *trans,
+				   struct btrfs_path *path,
+				   struct btrfs_delayed_node *node)
+{
+	int ret;
+
+	ret = btrfs_insert_delayed_items(trans, path, node->root, node);
+	if (ret)
+		return ret;
+
+	ret = btrfs_delete_delayed_items(trans, path, node->root, node);
+	if (ret)
+		return ret;
+
+	ret = btrfs_update_delayed_inode(trans, node->root, path, node);
+	return ret;
+}
+
+/*
+ * Called when committing the transaction.
+ * Returns 0 on success.
+ * Returns < 0 on error and returns with an aborted transaction with any
+ * outstanding delayed items cleaned up.
+ */
+static int __btrfs_run_delayed_items(struct btrfs_trans_handle *trans,
+				     struct btrfs_root *root, int nr)
+{
+	struct btrfs_delayed_root *delayed_root;
+	struct btrfs_delayed_node *curr_node, *prev_node;
+	struct btrfs_path *path;
+	struct btrfs_block_rsv *block_rsv;
+	int ret = 0;
+	bool count = (nr > 0);
+
+	if (trans->aborted)
+		return -EIO;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+	path->leave_spinning = 1;
+
+	block_rsv = trans->block_rsv;
+	trans->block_rsv = &root->fs_info->delayed_block_rsv;
+
+	delayed_root = btrfs_get_delayed_root(root);
+
+	curr_node = btrfs_first_delayed_node(delayed_root);
+	while (curr_node && (!count || (count && nr--))) {
+		ret = __btrfs_commit_inode_delayed_items(trans, path,
+							 curr_node);
+		if (ret) {
+			btrfs_abort_transaction(trans, root, ret);
+			break;
+		}
+
+		prev_node = curr_node;
+		curr_node = btrfs_next_delayed_node(curr_node);
+		/*
+		 * See the comment below about releasing path before releasing
+		 * node. If the commit of delayed items was successful the path
+		 * should always be released, but in case of an error, it may
+		 * point to locked extent buffers (a leaf at the very least).
+		 */
+		ASSERT(path->nodes[0] == NULL);
+		btrfs_release_delayed_node(prev_node);
+	}
+
+	/*
+	 * Release the path to avoid a potential deadlock and lockdep splat when
+	 * releasing the delayed node, as that requires taking the delayed node's
+	 * mutex. If another task starts running delayed items before we take
+	 * the mutex, it will first lock the mutex and then it may try to lock
+	 * the same btree path (leaf).
+	 */
+	btrfs_free_path(path);
+
+	if (curr_node)
+		btrfs_release_delayed_node(curr_node);
+	trans->block_rsv = block_rsv;
+
+	return ret;
+}
+
+int btrfs_run_delayed_items(struct btrfs_trans_handle *trans,
+			    struct btrfs_root *root)
+{
+	return __btrfs_run_delayed_items(trans, root, -1);
+}
+
+int btrfs_run_delayed_items_nr(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root, int nr)
+{
+	return __btrfs_run_delayed_items(trans, root, nr);
+}
+
+int btrfs_commit_inode_delayed_items(struct btrfs_trans_handle *trans,
+				     struct inode *inode)
+{
+	struct btrfs_delayed_node *delayed_node = btrfs_get_delayed_node(inode);
+	struct btrfs_path *path;
+	struct btrfs_block_rsv *block_rsv;
+	int ret;
+
+	if (!delayed_node)
+		return 0;
+
+	mutex_lock(&delayed_node->mutex);
+	if (!delayed_node->count) {
+		mutex_unlock(&delayed_node->mutex);
+		btrfs_release_delayed_node(delayed_node);
+		return 0;
+	}
+	mutex_unlock(&delayed_node->mutex);
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		btrfs_release_delayed_node(delayed_node);
+		return -ENOMEM;
+	}
+	path->leave_spinning = 1;
+
+	block_rsv = trans->block_rsv;
+	trans->block_rsv = &delayed_node->root->fs_info->delayed_block_rsv;
+
+	ret = __btrfs_commit_inode_delayed_items(trans, path, delayed_node);
+
+	btrfs_release_delayed_node(delayed_node);
+	btrfs_free_path(path);
+	trans->block_rsv = block_rsv;
+
+	return ret;
+}
+
+int btrfs_commit_inode_delayed_inode(struct inode *inode)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_delayed_node *delayed_node = btrfs_get_delayed_node(inode);
+	struct btrfs_path *path;
+	struct btrfs_block_rsv *block_rsv;
+	int ret;
+
+	if (!delayed_node)
+		return 0;
+
+	mutex_lock(&delayed_node->mutex);
+	if (!test_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &delayed_node->flags)) {
+		mutex_unlock(&delayed_node->mutex);
+		btrfs_release_delayed_node(delayed_node);
+		return 0;
+	}
+	mutex_unlock(&delayed_node->mutex);
+
+	trans = btrfs_join_transaction(delayed_node->root);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		goto out;
+	}
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto trans_out;
+	}
+	path->leave_spinning = 1;
+
+	block_rsv = trans->block_rsv;
+	trans->block_rsv = &delayed_node->root->fs_info->delayed_block_rsv;
+
+	mutex_lock(&delayed_node->mutex);
+	if (test_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &delayed_node->flags))
+		ret = __btrfs_update_delayed_inode(trans, delayed_node->root,
+						   path, delayed_node);
+	else
+		ret = 0;
+	mutex_unlock(&delayed_node->mutex);
+
+	btrfs_free_path(path);
+	trans->block_rsv = block_rsv;
+trans_out:
+	btrfs_end_transaction(trans, delayed_node->root);
+	btrfs_btree_balance_dirty(delayed_node->root);
+out:
+	btrfs_release_delayed_node(delayed_node);
+
+	return ret;
+}
+
+void btrfs_remove_delayed_node(struct inode *inode)
+{
+	struct btrfs_delayed_node *delayed_node;
+
+	delayed_node = ACCESS_ONCE(BTRFS_I(inode)->delayed_node);
+	if (!delayed_node)
+		return;
+
+	BTRFS_I(inode)->delayed_node = NULL;
+	btrfs_release_delayed_node(delayed_node);
+}
+
+struct btrfs_async_delayed_work {
+	struct btrfs_delayed_root *delayed_root;
+	int nr;
+	struct btrfs_work work;
+};
+
+static void btrfs_async_run_delayed_root(struct btrfs_work *work)
+{
+	struct btrfs_async_delayed_work *async_work;
+	struct btrfs_delayed_root *delayed_root;
+	struct btrfs_trans_handle *trans;
+	struct btrfs_path *path;
+	struct btrfs_delayed_node *delayed_node = NULL;
+	struct btrfs_root *root;
+	struct btrfs_block_rsv *block_rsv;
+	int total_done = 0;
+
+	async_work = container_of(work, struct btrfs_async_delayed_work, work);
+	delayed_root = async_work->delayed_root;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		goto out;
+
+again:
+	if (atomic_read(&delayed_root->items) < BTRFS_DELAYED_BACKGROUND / 2)
+		goto free_path;
+
+	delayed_node = btrfs_first_prepared_delayed_node(delayed_root);
+	if (!delayed_node)
+		goto free_path;
+
+	path->leave_spinning = 1;
+	root = delayed_node->root;
+
+	trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans))
+		goto release_path;
+
+	block_rsv = trans->block_rsv;
+	trans->block_rsv = &root->fs_info->delayed_block_rsv;
+
+	__btrfs_commit_inode_delayed_items(trans, path, delayed_node);
+
+	trans->block_rsv = block_rsv;
+	btrfs_end_transaction(trans, root);
+	btrfs_btree_balance_dirty_nodelay(root);
+
+release_path:
+	btrfs_release_path(path);
+	total_done++;
+
+	btrfs_release_prepared_delayed_node(delayed_node);
+	if ((async_work->nr == 0 && total_done < BTRFS_DELAYED_WRITEBACK) ||
+	    total_done < async_work->nr)
+		goto again;
+
+free_path:
+	btrfs_free_path(path);
+out:
+	wake_up(&delayed_root->wait);
+	kfree(async_work);
+}
+
+
+static int btrfs_wq_run_delayed_node(struct btrfs_delayed_root *delayed_root,
+				     struct btrfs_fs_info *fs_info, int nr)
+{
+	struct btrfs_async_delayed_work *async_work;
+
+	if (atomic_read(&delayed_root->items) < BTRFS_DELAYED_BACKGROUND ||
+	    btrfs_workqueue_normal_congested(fs_info->delayed_workers))
+		return 0;
+
+	async_work = kmalloc(sizeof(*async_work), GFP_NOFS);
+	if (!async_work)
+		return -ENOMEM;
+
+	async_work->delayed_root = delayed_root;
+	btrfs_init_work(&async_work->work, btrfs_delayed_meta_helper,
+			btrfs_async_run_delayed_root, NULL, NULL);
+	async_work->nr = nr;
+
+	btrfs_queue_work(fs_info->delayed_workers, &async_work->work);
+	return 0;
+}
+
+void btrfs_assert_delayed_root_empty(struct btrfs_root *root)
+{
+	struct btrfs_delayed_root *delayed_root;
+	delayed_root = btrfs_get_delayed_root(root);
+	WARN_ON(btrfs_first_delayed_node(delayed_root));
+}
+
+static int could_end_wait(struct btrfs_delayed_root *delayed_root, int seq)
+{
+	int val = atomic_read(&delayed_root->items_seq);
+
+	if (val < seq || val >= seq + BTRFS_DELAYED_BATCH)
+		return 1;
+
+	if (atomic_read(&delayed_root->items) < BTRFS_DELAYED_BACKGROUND)
+		return 1;
+
+	return 0;
+}
+
+void btrfs_balance_delayed_items(struct btrfs_root *root)
+{
+	struct btrfs_delayed_root *delayed_root;
+	struct btrfs_fs_info *fs_info = root->fs_info;
+
+	delayed_root = btrfs_get_delayed_root(root);
+
+	if (atomic_read(&delayed_root->items) < BTRFS_DELAYED_BACKGROUND)
+		return;
+
+	if (atomic_read(&delayed_root->items) >= BTRFS_DELAYED_WRITEBACK) {
+		int seq;
+		int ret;
+
+		seq = atomic_read(&delayed_root->items_seq);
+
+		ret = btrfs_wq_run_delayed_node(delayed_root, fs_info, 0);
+		if (ret)
+			return;
+
+		wait_event_interruptible(delayed_root->wait,
+					 could_end_wait(delayed_root, seq));
+		return;
+	}
+
+	btrfs_wq_run_delayed_node(delayed_root, fs_info, BTRFS_DELAYED_BATCH);
+}
+
+/* Will return 0 or -ENOMEM */
+int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+				   struct btrfs_root *root, const char *name,
+				   int name_len, struct inode *dir,
+				   struct btrfs_disk_key *disk_key, u8 type,
+				   u64 index)
+{
+	struct btrfs_delayed_node *delayed_node;
+	struct btrfs_delayed_item *delayed_item;
+	struct btrfs_dir_item *dir_item;
+	int ret;
+
+	delayed_node = btrfs_get_or_create_delayed_node(dir);
+	if (IS_ERR(delayed_node))
+		return PTR_ERR(delayed_node);
+
+	delayed_item = btrfs_alloc_delayed_item(sizeof(*dir_item) + name_len);
+	if (!delayed_item) {
+		ret = -ENOMEM;
+		goto release_node;
+	}
+
+	delayed_item->key.objectid = btrfs_ino(dir);
+	delayed_item->key.type = BTRFS_DIR_INDEX_KEY;
+	delayed_item->key.offset = index;
+
+	dir_item = (struct btrfs_dir_item *)delayed_item->data;
+	dir_item->location = *disk_key;
+	btrfs_set_stack_dir_transid(dir_item, trans->transid);
+	btrfs_set_stack_dir_data_len(dir_item, 0);
+	btrfs_set_stack_dir_name_len(dir_item, name_len);
+	btrfs_set_stack_dir_type(dir_item, type);
+	memcpy((char *)(dir_item + 1), name, name_len);
+
+	ret = btrfs_delayed_item_reserve_metadata(trans, root, delayed_item);
+	/*
+	 * we have reserved enough space when we start a new transaction,
+	 * so reserving metadata failure is impossible
+	 */
+	BUG_ON(ret);
+
+
+	mutex_lock(&delayed_node->mutex);
+	ret = __btrfs_add_delayed_insertion_item(delayed_node, delayed_item);
+	if (unlikely(ret)) {
+		btrfs_err(root->fs_info, "err add delayed dir index item(name: %.*s) "
+				"into the insertion tree of the delayed node"
+				"(root id: %llu, inode id: %llu, errno: %d)",
+				name_len, name, delayed_node->root->objectid,
+				delayed_node->inode_id, ret);
+		BUG();
+	}
+	mutex_unlock(&delayed_node->mutex);
+
+release_node:
+	btrfs_release_delayed_node(delayed_node);
+	return ret;
+}
+
+static int btrfs_delete_delayed_insertion_item(struct btrfs_root *root,
+					       struct btrfs_delayed_node *node,
+					       struct btrfs_key *key)
+{
+	struct btrfs_delayed_item *item;
+
+	mutex_lock(&node->mutex);
+	item = __btrfs_lookup_delayed_insertion_item(node, key);
+	if (!item) {
+		mutex_unlock(&node->mutex);
+		return 1;
+	}
+
+	btrfs_delayed_item_release_metadata(root, item);
+	btrfs_release_delayed_item(item);
+	mutex_unlock(&node->mutex);
+	return 0;
+}
+
+int btrfs_delete_delayed_dir_index(struct btrfs_trans_handle *trans,
+				   struct btrfs_root *root, struct inode *dir,
+				   u64 index)
+{
+	struct btrfs_delayed_node *node;
+	struct btrfs_delayed_item *item;
+	struct btrfs_key item_key;
+	int ret;
+
+	node = btrfs_get_or_create_delayed_node(dir);
+	if (IS_ERR(node))
+		return PTR_ERR(node);
+
+	item_key.objectid = btrfs_ino(dir);
+	item_key.type = BTRFS_DIR_INDEX_KEY;
+	item_key.offset = index;
+
+	ret = btrfs_delete_delayed_insertion_item(root, node, &item_key);
+	if (!ret)
+		goto end;
+
+	item = btrfs_alloc_delayed_item(0);
+	if (!item) {
+		ret = -ENOMEM;
+		goto end;
+	}
+
+	item->key = item_key;
+
+	ret = btrfs_delayed_item_reserve_metadata(trans, root, item);
+	/*
+	 * we have reserved enough space when we start a new transaction,
+	 * so reserving metadata failure is impossible.
+	 */
+	BUG_ON(ret);
+
+	mutex_lock(&node->mutex);
+	ret = __btrfs_add_delayed_deletion_item(node, item);
+	if (unlikely(ret)) {
+		btrfs_err(root->fs_info, "err add delayed dir index item(index: %llu) "
+				"into the deletion tree of the delayed node"
+				"(root id: %llu, inode id: %llu, errno: %d)",
+				index, node->root->objectid, node->inode_id,
+				ret);
+		BUG();
+	}
+	mutex_unlock(&node->mutex);
+end:
+	btrfs_release_delayed_node(node);
+	return ret;
+}
+
+int btrfs_inode_delayed_dir_index_count(struct inode *inode)
+{
+	struct btrfs_delayed_node *delayed_node = btrfs_get_delayed_node(inode);
+
+	if (!delayed_node)
+		return -ENOENT;
+
+	/*
+	 * Since we have held i_mutex of this directory, it is impossible that
+	 * a new directory index is added into the delayed node and index_cnt
+	 * is updated now. So we needn't lock the delayed node.
+	 */
+	if (!delayed_node->index_cnt) {
+		btrfs_release_delayed_node(delayed_node);
+		return -EINVAL;
+	}
+
+	BTRFS_I(inode)->index_cnt = delayed_node->index_cnt;
+	btrfs_release_delayed_node(delayed_node);
+	return 0;
+}
+
+void btrfs_get_delayed_items(struct inode *inode, struct list_head *ins_list,
+			     struct list_head *del_list)
+{
+	struct btrfs_delayed_node *delayed_node;
+	struct btrfs_delayed_item *item;
+
+	delayed_node = btrfs_get_delayed_node(inode);
+	if (!delayed_node)
+		return;
+
+	mutex_lock(&delayed_node->mutex);
+	item = __btrfs_first_delayed_insertion_item(delayed_node);
+	while (item) {
+		atomic_inc(&item->refs);
+		list_add_tail(&item->readdir_list, ins_list);
+		item = __btrfs_next_delayed_item(item);
+	}
+
+	item = __btrfs_first_delayed_deletion_item(delayed_node);
+	while (item) {
+		atomic_inc(&item->refs);
+		list_add_tail(&item->readdir_list, del_list);
+		item = __btrfs_next_delayed_item(item);
+	}
+	mutex_unlock(&delayed_node->mutex);
+	/*
+	 * This delayed node is still cached in the btrfs inode, so refs
+	 * must be > 1 now, and we needn't check it is going to be freed
+	 * or not.
+	 *
+	 * Besides that, this function is used to read dir, we do not
+	 * insert/delete delayed items in this period. So we also needn't
+	 * requeue or dequeue this delayed node.
+	 */
+	atomic_dec(&delayed_node->refs);
+}
+
+void btrfs_put_delayed_items(struct list_head *ins_list,
+			     struct list_head *del_list)
+{
+	struct btrfs_delayed_item *curr, *next;
+
+	list_for_each_entry_safe(curr, next, ins_list, readdir_list) {
+		list_del(&curr->readdir_list);
+		if (atomic_dec_and_test(&curr->refs))
+			kfree(curr);
+	}
+
+	list_for_each_entry_safe(curr, next, del_list, readdir_list) {
+		list_del(&curr->readdir_list);
+		if (atomic_dec_and_test(&curr->refs))
+			kfree(curr);
+	}
+}
+
+int btrfs_should_delete_dir_index(struct list_head *del_list,
+				  u64 index)
+{
+	struct btrfs_delayed_item *curr, *next;
+	int ret;
+
+	if (list_empty(del_list))
+		return 0;
+
+	list_for_each_entry_safe(curr, next, del_list, readdir_list) {
+		if (curr->key.offset > index)
+			break;
+
+		list_del(&curr->readdir_list);
+		ret = (curr->key.offset == index);
+
+		if (atomic_dec_and_test(&curr->refs))
+			kfree(curr);
+
+		if (ret)
+			return 1;
+		else
+			continue;
+	}
+	return 0;
+}
+
+/*
+ * btrfs_readdir_delayed_dir_index - read dir info stored in the delayed tree
  *
- * Author	Andreas Eversberg (jolly@eversberg.eu)
- * ported to mqueue mechanism:
- *		Peter Sprenger (sprengermoving-bytes.de)
+ */
+int btrfs_readdir_delayed_dir_index(struct dir_context *ctx,
+				    struct list_head *ins_list, bool *emitted)
+{
+	struct btrfs_dir_item *di;
+	struct btrfs_delayed_item *curr, *next;
+	struct btrfs_key location;
+	char *name;
+	int name_len;
+	int over = 0;
+	unsigned char d_type;
+
+	if (list_empty(ins_list))
+		return 0;
+
+	/*
+	 * Changing the data of the delayed item is impossible. So
+	 * we needn't lock them. And we have held i_mutex of the
+	 * directory, nobody can delete any directory indexes now.
+	 */
+	list_for_each_entry_safe(curr, next, ins_list, readdir_list) {
+		list_del(&curr->readdir_list);
+
+		if (curr->key.offset < ctx->pos) {
+			if (atomic_dec_and_test(&curr->refs))
+				kfree(curr);
+			continue;
+		}
+
+		ctx->pos = curr->key.offset;
+
+		di = (struct btrfs_dir_item *)curr->data;
+		name = (char *)(di + 1);
+		name_len = btrfs_stack_dir_name_len(di);
+
+		d_type = btrfs_filetype_table[di->type];
+		btrfs_disk_key_to_cpu(&location, &di->location);
+
+		over = !dir_emit(ctx, name, name_len,
+			       location.objectid, d_type);
+
+		if (atomic_dec_and_test(&curr->refs))
+			kfree(curr);
+
+		if (over)
+			return 1;
+		*emitted = true;
+	}
+	return 0;
+}
+
+static void fill_stack_inode_item(struct btrfs_trans_handle *trans,
+				  struct btrfs_inode_item *inode_item,
+				  struct inode *inode)
+{
+	btrfs_set_stack_inode_uid(inode_item, i_uid_read(inode));
+	btrfs_set_stack_inode_gid(inode_item, i_gid_read(inode));
+	btrfs_set_stack_inode_size(inode_item, BTRFS_I(inode)->disk_i_size);
+	btrfs_set_stack_inode_mode(inode_item, inode->i_mode);
+	btrfs_set_stack_inode_nlink(inode_item, inode->i_nlink);
+	btrfs_set_stack_inode_nbytes(inode_item, inode_get_bytes(inode));
+	btrfs_set_stack_inode_generation(inode_item,
+					 BTRFS_I(inode)->generation);
+	btrfs_set_stack_inode_sequence(inode_item, inode->i_version);
+	btrfs_set_stack_inode_transid(inode_item, trans->transid);
+	btrfs_set_stack_inode_rdev(inode_item, inode->i_rdev);
+	btrfs_set_stack_inode_flags(inode_item, BTRFS_I(inode)->flags);
+	btrfs_set_stack_inode_block_group(inode_item, 0);
+
+	btrfs_set_stack_timespec_sec(&inode_item->atime,
+				     inode->i_atime.tv_sec);
+	btrfs_set_stack_timespec_nsec(&inode_item->atime,
+				      inode->i_atime.tv_nsec);
+
+	btrfs_set_stack_timespec_sec(&inode_item->mtime,
+				     inode->i_mtime.tv_sec);
+	btrfs_set_stack_timespec_nsec(&inode_item->mtime,
+				      inode->i_mtime.tv_nsec);
+
+	btrfs_set_stack_timespec_sec(&inode_item->ctime,
+				     inode->i_ctime.tv_sec);
+	btrfs_set_stack_timespec_nsec(&inode_item->ctime,
+				      inode->i_ctime.tv_nsec);
+
+	btrfs_set_stack_timespec_sec(&inode_item->otime,
+				     BTRFS_I(inode)->i_otime.tv_sec);
+	btrfs_set_stack_timespec_nsec(&inode_item->otime,
+				     BTRFS_I(inode)->i_otime.tv_nsec);
+}
+
+int btrfs_fill_inode(struct inode *inode, u32 *rdev)
+{
+	struct btrfs_delayed_node *delayed_node;
+	struct btrfs_inode_item *inode_item;
+
+	delayed_node = btrfs_get_delayed_node(inode);
+	if (!delayed_node)
+		return -ENOENT;
+
+	mutex_lock(&delayed_node->mutex);
+	if (!test_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &delayed_node->flags)) {
+		mutex_unlock(&delayed_node->mutex);
+		btrfs_release_delayed_node(delayed_node);
+		return -ENOENT;
+	}
+
+	inode_item = &delayed_node->inode_item;
+
+	i_uid_write(inode, btrfs_stack_inode_uid(inode_item));
+	i_gid_write(inode, btrfs_stack_inode_gid(inode_item));
+	btrfs_i_size_write(inode, btrfs_stack_inode_size(inode_item));
+	inode->i_mode = btrfs_stack_inode_mode(inode_item);
+	set_nlink(inode, btrfs_stack_inode_nlink(inode_item));
+	inode_set_bytes(inode, btrfs_stack_inode_nbytes(inode_item));
+	BTRFS_I(inode)->generation = btrfs_stack_inode_generation(inode_item);
+        BTRFS_I(inode)->last_trans = btrfs_stack_inode_transid(inode_item);
+
+	inode->i_version = btrfs_stack_inode_sequence(inode_item);
+	inode->i_rdev = 0;
+	*rdev = btrfs_stack_inode_rdev(inode_item);
+	BTRFS_I(inode)->flags = btrfs_stack_inode_flags(inode_item);
+
+	inode->i_atime.tv_sec = btrfs_stack_timespec_sec(&inode_item->atime);
+	inode->i_atime.tv_nsec = btrfs_stack_timespec_nsec(&inode_item->atime);
+
+	inode->i_mtime.tv_sec = btrfs_stack_timespec_sec(&inode_item->mtime);
+	inode->i_mtime.tv_nsec = btrfs_stack_timespec_nsec(&inode_item->mtime);
+
+	inode->i_ctime.tv_sec = btrfs_stack_timespec_sec(&inode_item->ctime);
+	inode->i_ctime.tv_nsec = btrfs_stack_timespec_nsec(&inode_item->ctime);
+
+	BTRFS_I(inode)->i_otime.tv_sec =
+		btrfs_stack_timespec_sec(&inode_item->otime);
+	BTRFS_I(inode)->i_otime.tv_nsec =
+		btrfs_stack_timespec_nsec(&inode_item->otime);
+
+	inode->i_generation = BTRFS_I(inode)->generation;
+	BTRFS_I(inode)->index_cnt = (u64)-1;
+
+	mutex_unlock(&delayed_node->mutex);
+	btrfs_release_delayed_node(delayed_node);
+	return 0;
+}
+
+int btrfs_delayed_update_inode(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root, struct inode *inode)
+{
+	struct btrfs_delayed_node *delayed_node;
+	int ret = 0;
+
+	delayed_node = btrfs_get_or_create_delayed_node(inode);
+	if (IS_ERR(delayed_node))
+		return PTR_ERR(delayed_node);
+
+	mutex_lock(&delayed_node->mutex);
+	if (test_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &delayed_node->flags)) {
+		fill_stack_inode_item(trans, &delayed_node->inode_item, inode);
+		goto release_node;
+	}
+
+	ret = btrfs_delayed_inode_reserve_metadata(trans, root, inode,
+						   delayed_node);
+	if (ret)
+		goto release_node;
+
+	fill_stack_inode_item(trans, &delayed_node->inode_item, inode);
+	set_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &delayed_node->flags);
+	delayed_node->count++;
+	atomic_inc(&root->fs_info->delayed_root->items);
+release_node:
+	mutex_unlock(&delayed_node->mutex);
+	btrfs_release_delayed_node(delayed_node);
+	return ret;
+}
+
+int btrfs_delayed_delete_inode_ref(struct inode *inode)
+{
+	struct btrfs_delayed_node *delayed_node;
+
+	/*
+	 * we don't do delayed inode updates during log recovery because it
+	 * leads to enospc problems.  This means we also can't do
+	 * delayed inode refs
+	 */
+	if (BTRFS_I(inode)->root->fs_info->log_root_recovering)
+		return -EAGAIN;
+
+	delayed_node = btrfs_get_or_create_delayed_node(inode);
+	if (IS_ERR(delayed_node))
+		return PTR_ERR(delayed_node);
+
+	/*
+	 * We don't reserve space for inode ref deletion is because:
+	 * - We ONLY do async inode ref deletion for the inode who has only
+	 *   one link(i_nlink == 1), it means there is only one inode ref.
+	 *   And in most case, the inode ref and the inode item are in the
+	 *   same leaf, and we will deal with them at the same time.
+	 *   Since we are sure we will reserve the space for the inode item,
+	 *   it is unnecessary to reserve space for inode ref deletion.
+	 * - If the inode ref and the inode item are not in the same leaf,
+	 *   We also needn't worry about enospc problem, because we reserve
+	 *   much more space for the inode update than it needs.
+	 * - At the worst, we can steal some space from the global reservation.
+	 *   It is very rare.
+	 */
+	mutex_lock(&delayed_node->mutex);
+	if (test_bit(BTRFS_DELAYED_NODE_DEL_IREF, &delayed_node->flags))
+		goto release_node;
+
+	set_bit(BTRFS_DELAYED_NODE_DEL_IREF, &delayed_node->flags);
+	delayed_node->count++;
+	atomic_inc(&BTRFS_I(inode)->root->fs_info->delayed_root->items);
+release_node:
+	mutex_unlock(&delayed_node->mutex);
+	btrfs_release_delayed_node(delayed_node);
+	return 0;
+}
+
+static void __btrfs_kill_delayed_node(struct btrfs_delayed_node *delayed_node)
+{
+	struct btrfs_root *root = delayed_node->root;
+	struct btrfs_delayed_item *curr_item, *prev_item;
+
+	mutex_lock(&delayed_node->mutex);
+	curr_item = __btrfs_first_delayed_insertion_item(delayed_node);
+	while (curr_item) {
+		btrfs_delayed_item_release_metadata(root, curr_item);
+		prev_item = curr_item;
+		curr_item = __btrfs_next_delayed_item(prev_item);
+		btrfs_release_delayed_item(prev_item);
+	}
+
+	curr_item = __btrfs_first_delayed_deletion_item(delayed_node);
+	while (curr_item) {
+		btrfs_delayed_item_release_metadata(root, curr_item);
+		prev_item = curr_item;
+		curr_item = __btrfs_next_delayed_item(prev_item);
+		btrfs_release_delayed_item(prev_item);
+	}
+
+	if (test_bit(BTRFS_DELAYED_NODE_DEL_IREF, &delayed_node->flags))
+		btrfs_release_delayed_iref(delayed_node);
+
+	if (test_bit(BTRFS_DELAYED_NODE_INODE_DIRTY, &delayed_node->flags)) {
+		btrfs_delayed_inode_release_metadata(root, delayed_node);
+		btrfs_release_delayed_inode(delayed_node);
+	}
+	mutex_unlock(&delayed_node->mutex);
+}
+
+void btrfs_kill_delayed_inode_items(struct inode *inode)
+{
+	struct btrfs_delayed_node *delayed_node;
+
+	delayed_node = btrfs_get_delayed_node(inode);
+	if (!delayed_node)
+		return;
+
+	__btrfs_kill_delayed_node(delayed_node);
+	btrfs_release_delayed_node(delayed_node);
+}
+
+void btrfs_kill_all_delayed_nodes(struct btrfs_root *root)
+{
+	u64 inode_id = 0;
+	struct btrfs_delayed_node *delayed_nodes[8];
+	int i, n;
+
+	while (1) {
+		spin_lock(&root->inode_lock);
+		n = radix_tree_gang_lookup(&root->delayed_nodes_tree,
+					   (void **)delayed_nodes, inode_id,
+					   ARRAY_SIZE(delayed_nodes));
+		if (!n) {
+			spin_unlock(&root->inode_lock);
+			break;
+		}
+
+		inode_id = delayed_nodes[n - 1]->inode_id + 1;
+
+		for (i = 0; i < n; i++)
+			atomic_inc(&delayed_nodes[i]->refs);
+		spin_unlock(&root->inode_lock);
+
+		for (i = 0; i < n; i++) {
+			__btrfs_kill_delayed_node(delayed_nodes[i]);
+			btrfs_release_delayed_node(delayed_nodes[i]);
+		}
+	}
+}
+
+void btrfs_destroy_delayed_inodes(struct btrfs_root *root)
+{
+	struct btrfs_delayed_root *delayed_root;
+	struct btrfs_delayed_node *curr_node, *prev_node;
+
+	delayed_root = btrfs_get_delayed_root(root);
+
+	curr_node = btrfs_first_delayed_node(delayed_root);
+	while (curr_node) {
+		__btrfs_kill_delayed_node(curr_node);
+
+		prev_node = curr_node;
+		curr_node = btrfs_next_delayed_node(curr_node);
+		btrfs_release_delayed_node(prev_node);
+	}
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * Copyright (C) 2011 Fujitsu.  All rights reserved.
+ * Written by Miao Xie <miaox@cn.fujitsu.com>
  *
- * inspired by existing hfc-pci driver:
- * Copyright 1999  by Werner Cornelius (werner@isdn-development.de)
- * Copyright 2008  by Karsten Keil (kkeil@suse.de)
- * Copyright 2008  by Andreas Eversberg (jolly@eversberg.eu)
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- *
- *
- * Thanks to Cologne Chip AG for this great controller!
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
  */
 
-/*
- * module parameters:
- * type:
- *	By default (0), the card is automatically detected.
- *	Or use the following combinations:
- *	Bit 0-7   = 0x00001 = HFC-E1 (1 port)
- * or	Bit 0-7   = 0x00004 = HFC-4S (4 ports)
- * or	Bit 0-7   = 0x00008 = HFC-8S (8 ports)
- *	Bit 8     = 0x00100 = uLaw (instead of aLaw)
- *	Bit 9     = 0x00200 = Disable DTMF detect on all B-channels via hardware
- *	Bit 10    = spare
- *	Bit 11    = 0x00800 = Force PCM bus into slave mode. (otherwhise auto)
- * or   Bit 12    = 0x01000 = Force PCM bus into master mode. (otherwhise auto)
- *	Bit 13	  = spare
- *	Bit 14    = 0x04000 = Use external ram (128K)
- *	Bit 15    = 0x08000 = Use external ram (512K)
- *	Bit 16    = 0x10000 = Use 64 timeslots instead of 32
- * or	Bit 17    = 0x20000 = Use 128 timeslots instead of anything else
- *	Bit 18    = spare
- *	Bit 19    = 0x80000 = Send the Watchdog a Signal (Dual E1 with Watchdog)
- * (all other bits are reserved and shall be 0)
- *	example: 0x20204 one HFC-4S with dtmf detection and 128 timeslots on PCM
- *		 bus (PCM master)
+#ifndef __DELAYED_TREE_OPERATION_H
+#define __DELAYED_TREE_OPERATION_H
+
+#include <linux/rbtree.h>
+#include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/list.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
+
+#include "ctree.h"
+
+/* types of the delayed item */
+#define BTRFS_DELAYED_INSERTION_ITEM	1
+#define BTRFS_DELAYED_DELETION_ITEM	2
+
+struct btrfs_delayed_root {
+	spinlock_t lock;
+	struct list_head node_list;
+	/*
+	 * Used for delayed nodes which is waiting to be dealt with by the
+	 * worker. If the delayed node is inserted into the work queue, we
+	 * drop it from this list.
+	 */
+	struct list_head prepare_list;
+	atomic_t items;		/* for delayed items */
+	atomic_t items_seq;	/* for delayed items */
+	int nodes;		/* for delayed nodes */
+	wait_queue_head_t wait;
+};
+
+#define BTRFS_DELAYED_NODE_IN_LIST	0
+#define BTRFS_DELAYED_NODE_INODE_DIRTY	1
+#define BTRFS_DELAYED_NODE_DEL_IREF	2
+
+struct btrfs_delayed_node {
+	u64 inode_id;
+	u64 bytes_reserved;
+	struct btrfs_root *root;
+	/* Used to add the node into the delayed root's node list. */
+	struct list_head n_list;
+	/*
+	 * Used to add the node into the prepare list, the nodes in this list
+	 * is waiting to be dealt with by the async worker.
+	 */
+	struct list_head p_list;
+	struct rb_root ins_root;
+	struct rb_root del_root;
+	struct mutex mutex;
+	struct btrfs_inode_item inode_item;
+	atomic_t refs;
+	u64 index_cnt;
+	unsigned long flags;
+	int count;
+};
+
+struct btrfs_delayed_item {
+	struct rb_node rb_node;
+	struct btrfs_key key;
+	struct list_head tree_list;	/* used for batch insert/delete items */
+	struct list_head readdir_list;	/* used for readdir items */
+	u64 bytes_reserved;
+	struct btrfs_delayed_node *delayed_node;
+	atomic_t refs;
+	int ins_or_del;
+	u32 data_len;
+	char data[0];
+};
+
+static inline void btrfs_init_delayed_root(
+				struct btrfs_delayed_root *delayed_root)
+{
+	atomic_set(&delayed_root->items, 0);
+	atomic_set(&delayed_root->items_seq, 0);
+	delayed_root->nodes = 0;
+	spin_lock_init(&delayed_root->lock);
+	init_waitqueue_head(&delayed_root->wait);
+	INIT_LIST_HEAD(&delayed_root->node_list);
+	INIT_LIST_HEAD(&delayed_root->prepare_list);
+}
+
+int btrfs_insert_delayed_dir_index(struct btrfs_trans_handle *trans,
+				   struct btrfs_root *root, const char *name,
+				   int name_len, struct inode *dir,
+				   struct btrfs_disk_key *disk_key, u8 type,
+				   u64 index);
+
+int btrfs_delete_delayed_dir_index(struct btrfs_trans_handle *trans,
+				   struct btrfs_root *root, struct inode *dir,
+				   u64 index);
+
+int btrfs_inode_delayed_dir_index_count(struct inode *inode);
+
+int btrfs_run_delayed_items(struct btrfs_trans_handle *trans,
+			    struct btrfs_root *root);
+int btrfs_run_delayed_items_nr(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root, int nr);
+
+void btrfs_balance_delayed_items(struct btrfs_root *root);
+
+int btrfs_commit_inode_delayed_items(struct btrfs_trans_handle *trans,
+				     struct inode *inode);
+/* Used for evicting the inode. */
+void btrfs_remove_delayed_node(struct inode *inode);
+void btrfs_kill_delayed_inode_items(struct inode *inode);
+int btrfs_commit_inode_delayed_inode(struct inode *inode);
+
+
+int btrfs_delayed_update_inode(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root, struct inode *inode);
+int btrfs_fill_inode(struct inode *inode, u32 *rdev);
+int btrfs_delayed_delete_inode_ref(struct inode *inode);
+
+/* Used for drop dead root */
+void btrfs_kill_all_delayed_nodes(struct btrfs_root *root);
+
+/* Used for clean the transaction */
+void btrfs_destroy_delayed_inodes(struct btrfs_root *root);
+
+/* Used for readdir() */
+void btrfs_get_delayed_items(struct inode *inode, struct list_head *ins_list,
+			     struct list_head *del_list);
+void btrfs_put_delayed_items(struct list_head *ins_list,
+			     struct list_head *del_list);
+int btrfs_should_delete_dir_index(struct list_head *del_list,
+				  u64 index);
+int btrfs_readdir_delayed_dir_index(struct dir_context *ctx,
+				    struct list_head *ins_list, bool *emitted);
+
+/* for init */
+int __init btrfs_delayed_inode_init(void);
+void btrfs_delayed_inode_exit(void);
+
+/* for debugging */
+void btrfs_assert_delayed_root_empty(struct btrfs_root *root);
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * Copyright (C) 2009 Oracle.  All rights reserved.
  *
- * port: (optional or required for all ports on all installed cards)
- *	HFC-4S/HFC-8S only bits:
- *	Bit 0	  = 0x001 = Use master clock for this S/T interface
- *			    (ony once per chip).
- *	Bit 1     = 0x002 = transmitter line setup (non capacitive mode)
- *			    Don't use this unless you know what you are doing!
- *	Bit 2     = 0x004 = Disable E-channel. (No E-channel processing)
- *	example: 0x0001,0x0000,0x0000,0x0000 one HFC-4S with master clock
- *		 received from port 1
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
  *
- *	HFC-E1 only bits:
- *	Bit 0     = 0x0001 = interface: 0=copper, 1=optical
- *	Bit 1     = 0x0002 = reserved (later for 32 B-channels transparent mode)
- *	Bit 2     = 0x0004 = Report LOS
- *	Bit 3     = 0x0008 = Report AIS
- *	Bit 4     = 0x0010 = Report SLIP
- *	Bit 5     = 0x0020 = Report RDI
- *	Bit 8     = 0x0100 = Turn off CRC-4 Multiframe Mode, use double frame
- *			     mode instead.
- *	Bit 9	  = 0x0200 = Force get clock from interface, even in NT mode.
- * or	Bit 10	  = 0x0400 = Force put clock to interface, even in TE mode.
- *	Bit 11    = 0x0800 = Use direct RX clock for PCM sync rather than PLL.
- *			     (E1 only)
- *	Bit 12-13 = 0xX000 = elastic jitter buffer (1-3), Set both bits to 0
- *			     for default.
- * (all other bits are reserved and shall be 0)
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
  *
- * debug:
- *	NOTE: only one debug value must be given for all cards
- *	enable debugging (see hfc_multi.h for debug options)
- *
- * poll:
- *	NOTE: only one poll value must be given for all cards
- *	Give the number of samples for each fifo process.
- *	By default 128 is used. Decrease to reduce delay, increase to
- *	reduce cpu load. If unsure, don't mess with it!
- *	Valid is 8, 16, 32, 64, 128, 256.
- *
- * pcm:
- *	NOTE: only one pcm value must be given for every card.
- *	The PCM bus id tells the mISDNdsp module about the connected PCM bus.
- *	By default (0), the PCM bus id is 100 for the card that is PCM master.
- *	If multiple cards are PCM master (because they are not interconnected),
- *	each card with PCM master will have increasing PCM id.
- *	All PCM busses with the same ID are expected to be connected and have
- *	common time slots slots.
- *	Only one chip of the PCM bus must be master, the others slave.
- *	-1 means no support of PCM bus not even.
- *	Omit this value, if all cards are interconnected or none is connected.
- *	If unsure, don't give this parameter.
- *
- * dmask and bmask:
- *	NOTE: One dmask value must be given for every HFC-E1 card.
- *	If omitted, the E1 card has D-channel on time slot 16, which is default.
- *	dmask is a 32 bit mask. The bit must be set for an alternate time slot.
- *	If multiple bits are set, multiple virtual card fragments are created.
- *	For each bit set, a bmask value must be given. Each bit on the bmask
- *	value stands for a B-channel. The bmask may not overlap with dmask or
- *	with other bmask values for that card.
- *	Example: dmask=0x00020002 bmask=0x0000fffc,0xfffc0000
- *		This will create one fragment with D-channel on slot 1 with
- *		B-channels on slots 2..15, and a second fragment with D-channel
- *		on slot 17 with B-channels on slot 18..31. Slot 16 is unused.
- *	If bit 0 is set (dmask=0x00000001) the D-channel is on slot 0 and will
- *	not function.
- *	Example: dmask=0x00000001 bmask=0xfffffffe
- *		This will create a port with all 31 usable timeslots as
- *		B-channels.
- *	If no bits are set on bmask, no B-channel is created for that fragment.
- *	Example: dmask=0xfffffffe bmask=0,0,0,0.... (31 0-values for bmask)
- *		This will create 31 ports with one D-channel only.
- *	If you don't know how to use it, you don't need it!
- *
- * iomode:
- *	NOTE: only one mode value must be given for every card.
- *	-> See hfc_multi.h for HFC_IO_MODE_* values
- *	By default, the IO mode is pci memory IO (MEMIO).
- *	Some cards require specific IO mode, so it cannot be changed.
- *	It may be useful to set IO mode to register io (REGIO) to solve
- *	PCI bridge problems.
- *	If unsure, don't give this parameter.
- *
- * clockdelay_nt:
- *	NOTE: only one clockdelay_nt value must be given once for all cards.
- *	Give the value of the clock control register (A_ST_CLK_DLY)
- *	of the S/T interfaces in NT mode.
- *	This register is needed for the TBR3 certification, so don't change it.
- *
- * clockdelay_te:
- *	NOTE: only one clockdelay_te value must be given once
- *	Give the value of the clock control register (A_ST_CLK_DLY)
- *	of the S/T interfaces in TE mode.
- *	This register is needed for the TBR3 certification, so don't change it.
- *
- * clock:
- *	NOTE: only one clock value must be given once
- *	Selects interface with clock source for mISDN and applications.
- *	Set to card number starting with 1. Set to -1 to disable.
- *	By default, the first card is used as clock source.
- *
- * hwid:
- *	NOTE: only one hwid value must be given once
- *	Enable special embedded devices with XHFC controllers.
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
  */
 
-/*
- * debug register access (never use this, it will flood your system log)
- * #define HFC_REGISTER_DEBUG
- */
-
-#define HFC_MULTI_VERSION	"2.03"
-
-#include <linux/interrupt.h>
-#include <linux/module.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
-#include <linux/pci.h>
-#include <linux/delay.h>
-#include <linux/mISDNhw.h>
-#include <linux/mISDNdsp.h>
+#include <linux/sort.h>
+#include "ctree.h"
+#include "delayed-ref.h"
+#include "transaction.h"
+#include "qgroup.h"
 
+struct kmem_cache *btrfs_delayed_ref_head_cachep;
+struct kmem_cache *btrfs_delayed_tree_ref_cachep;
+struct kmem_cache *btrfs_delayed_data_ref_cachep;
+struct kmem_cache *btrfs_delayed_extent_op_cachep;
 /*
-  #define IRQCOUNT_DEBUG
-  #define IRQ_DEBUG
-*/
-
-#include "hfc_multi.h"
-#ifdef ECHOPREP
-#include "gaintab.h"
-#endif
-
-#define	MAX_CARDS	8
-#define	MAX_PORTS	(8 * MAX_CARDS)
-#define	MAX_FRAGS	(32 * MAX_CARDS)
-
-static LIST_HEAD(HFClist);
-static spinlock_t HFClock; /* global hfc list lock */
-
-static void ph_state_change(struct dchannel *);
-
-static struct hfc_multi *syncmaster;
-static int plxsd_master; /* if we have a master card (yet) */
-static spinlock_t plx_lock; /* may not acquire other lock inside */
-
-#define	TYP_E1		1
-#define	TYP_4S		4
-#define TYP_8S		8
-
-static int poll_timer = 6;	/* default = 128 samples = 16ms */
-/* number of POLL_TIMER interrupts for G2 timeout (ca 1s) */
-static int nt_t1_count[] = { 3840, 1920, 960, 480, 240, 120, 60, 30  };
-#define	CLKDEL_TE	0x0f	/* CLKDEL in TE mode */
-#define	CLKDEL_NT	0x6c	/* CLKDEL in NT mode
-				   (0x60 MUST be included!) */
-
-#define	DIP_4S	0x1		/* DIP Switches for Beronet 1S/2S/4S cards */
-#define	DIP_8S	0x2		/* DIP Switches for Beronet 8S+ cards */
-#define	DIP_E1	0x3		/* DIP Switches for Beronet E1 cards */
-
-/*
- * module stuff
+ * delayed back reference update tracking.  For subvolume trees
+ * we queue up extent allocations and backref maintenance for
+ * delayed processing.   This avoids deep call chains where we
+ * add extents in the middle of btrfs_search_slot, and it allows
+ * us to buffer up frequently modified backrefs in an rb tree instead
+ * of hammering updates on the extent allocation tree.
  */
 
-static uint	type[MAX_CARDS];
-static int	pcm[MAX_CARDS];
-static uint	dmask[MAX_CARDS];
-static uint	bmask[MAX_FRAGS];
-static uint	iomode[MAX_CARDS];
-static uint	port[MAX_PORTS];
-static uint	debug;
-static uint	poll;
-static int	clock;
-static uint	timer;
-static uint	clockdelay_te = CLKDEL_TE;
-static uint	clockdelay_nt = CLKDEL_NT;
-#define HWID_NONE	0
-#define HWID_MINIP4	1
-#define HWID_MINIP8	2
-#define HWID_MINIP16	3
-static uint	hwid = HWID_NONE;
-
-static int	HFC_cnt, E1_cnt, bmask_cnt, Port_cnt, PCM_cnt = 99;
-
-MODULE_AUTHOR("Andreas Eversberg");
-MODULE_LICENSE("GPL");
-MODULE_VERSION(HFC_MULTI_VERSION);
-module_param(debug, uint, S_IRUGO | S_IWUSR);
-module_param(poll, uint, S_IRUGO | S_IWUSR);
-module_param(clock, int, S_IRUGO | S_IWUSR);
-module_param(timer, uint, S_IRUGO | S_IWUSR);
-module_param(clockdelay_te, uint, S_IRUGO | S_IWUSR);
-module_param(clockdelay_nt, uint, S_IRUGO | S_IWUSR);
-module_param_array(type, uint, NULL, S_IRUGO | S_IWUSR);
-module_param_array(pcm, int, NULL, S_IRUGO | S_IWUSR);
-module_param_array(dmask, uint, NULL, S_IRUGO | S_IWUSR);
-module_param_array(bmask, uint, NULL, S_IRUGO | S_IWUSR);
-module_param_array(iomode, uint, NULL, S_IRUGO | S_IWUSR);
-module_param_array(port, uint, NULL, S_IRUGO | S_IWUSR);
-module_param(hwid, uint, S_IRUGO | S_IWUSR); /* The hardware ID */
-
-#ifdef HFC_REGISTER_DEBUG
-#define HFC_outb(hc, reg, val)					\
-	(hc->HFC_outb(hc, reg, val, __func__, __LINE__))
-#define HFC_outb_nodebug(hc, reg, val)					\
-	(hc->HFC_outb_nodebug(hc, reg, val, __func__, __LINE__))
-#define HFC_inb(hc, reg)				\
-	(hc->HFC_inb(hc, reg, __func__, __LINE__))
-#define HFC_inb_nodebug(hc, reg)				\
-	(hc->HFC_inb_nodebug(hc, reg, __func__, __LINE__))
-#define HFC_inw(hc, reg)				\
-	(hc->HFC_inw(hc, reg, __func__, __LINE__))
-#define HFC_inw_nodebug(hc, reg)				\
-	(hc->HFC_inw_nodebug(hc, reg, __func__, __LINE__))
-#define HFC_wait(hc)				\
-	(hc->HFC_wait(hc, __func__, __LINE__))
-#define HFC_wait_nodebug(hc)				\
-	(hc->HFC_wait_nodebug(hc, __func__, __LINE__))
-#else
-#define HFC_outb(hc, reg, val)		(hc->HFC_outb(hc, reg, val))
-#define HFC_outb_nodebug(hc, reg, val)	(hc->HFC_outb_nodebug(hc, reg, val))
-#define HFC_inb(hc, reg)		(hc->HFC_inb(hc, reg))
-#define HFC_inb_nodebug(hc, reg)	(hc->HFC_inb_nodebug(hc, reg))
-#define HFC_inw(hc, reg)		(hc->HFC_inw(hc, reg))
-#define HFC_inw_nodebug(hc, reg)	(hc->HFC_inw_nodebug(hc, reg))
-#define HFC_wait(hc)			(hc->HFC_wait(hc))
-#define HFC_wait_nodebug(hc)		(hc->HFC_wait_nodebug(hc))
-#endif
-
-#ifdef CONFIG_MISDN_HFCMULTI_8xx
-#include "hfc_multi_8xx.h"
-#endif
-
-/* HFC_IO_MODE_PCIMEM */
-static void
-#ifdef HFC_REGISTER_DEBUG
-HFC_outb_pcimem(struct hfc_multi *hc, u_char reg, u_char val,
-		const char *function, int line)
-#else
-	HFC_outb_pcimem(struct hfc_multi *hc, u_char reg, u_char val)
-#endif
+/*
+ * compare two delayed tree backrefs with same bytenr and type
+ */
+static int comp_tree_refs(struct btrfs_delayed_tree_ref *ref2,
+			  struct btrfs_delayed_tree_ref *ref1, int type)
 {
-	writeb(val, hc->pci_membase + reg);
-}
-static u_char
-#ifdef HFC_REGISTER_DEBUG
-HFC_inb_pcimem(struct hfc_multi *hc, u_char reg, const char *function, int line)
-#else
-	HFC_inb_pcimem(struct hfc_multi *hc, u_char reg)
-#endif
-{
-	return readb(hc->pci_membase + reg);
-}
-static u_short
-#ifdef HFC_REGISTER_DEBUG
-HFC_inw_pcimem(struct hfc_multi *hc, u_char reg, const char *function, int line)
-#else
-	HFC_inw_pcimem(struct hfc_multi *hc, u_char reg)
-#endif
-{
-	return readw(hc->pci_membase + reg);
-}
-static void
-#ifdef HFC_REGISTER_DEBUG
-HFC_wait_pcimem(struct hfc_multi *hc, const char *function, int line)
-#else
-	HFC_wait_pcimem(struct hfc_multi *hc)
-#endif
-{
-	while (readb(hc->pci_membase + R_STATUS) & V_BUSY)
-		cpu_relax();
-}
-
-/* HFC_IO_MODE_REGIO */
-static void
-#ifdef HFC_REGISTER_DEBUG
-HFC_outb_regio(struct hfc_multi *hc, u_char reg, u_char val,
-	       const char *function, int line)
-#else
-	HFC_outb_regio(struct hfc_multi *hc, u_char reg, u_char val)
-#endif
-{
-	outb(reg, hc->pci_iobase + 4);
-	outb(val, hc->pci_iobase);
-}
-static u_char
-#ifdef HFC_REGISTER_DEBUG
-HFC_inb_regio(struct hfc_multi *hc, u_char reg, const char *function, int line)
-#else
-	HFC_inb_regio(struct hfc_multi *hc, u_char reg)
-#endif
-{
-	outb(reg, hc->pci_iobase + 4);
-	return inb(hc->pci_iobase);
-}
-static u_short
-#ifdef HFC_REGISTER_DEBUG
-HFC_inw_regio(struct hfc_multi *hc, u_char reg, const char *function, int line)
-#else
-	HFC_inw_regio(struct hfc_multi *hc, u_char reg)
-#endif
-{
-	outb(reg, hc->pci_iobase + 4);
-	return inw(hc->pci_iobase);
-}
-static void
-#ifdef HFC_REGISTER_DEBUG
-HFC_wait_regio(struct hfc_multi *hc, const char *function, int line)
-#else
-	HFC_wait_regio(struct hfc_multi *hc)
-#endif
-{
-	outb(R_STATUS, hc->pci_iobase + 4);
-	while (inb(hc->pci_iobase) & V_BUSY)
-		cpu_relax();
-}
-
-#ifdef HFC_REGISTER_DEBUG
-static void
-HFC_outb_debug(struct hfc_multi *hc, u_char reg, u_char val,
-	       const char *function, int line)
-{
-	char regname[256] = "", bits[9] = "xxxxxxxx";
-	int i;
-
-	i = -1;
-	while (hfc_register_names[++i].name) {
-		if (hfc_register_names[i].reg == reg)
-			strcat(regname, hfc_register_names[i].name);
+	if (type == BTRFS_TREE_BLOCK_REF_KEY) {
+		if (ref1->root < ref2->root)
+			return -1;
+		if (ref1->root > ref2->root)
+			return 1;
+	} else {
+		if (ref1->parent < ref2->parent)
+			return -1;
+		if (ref1->parent > ref2->parent)
+			return 1;
 	}
-	if (regname[0] == '\0')
-		strcpy(regname, "register");
-
-	bits[7] = '0' + (!!(val & 1));
-	bits[6] = '0' + (!!(val & 2));
-	bits[5] = '0' + (!!(val & 4));
-	bits[4] = '0' + (!!(val & 8));
-	bits[3] = '0' + (!!(val & 16));
-	bits[2] = '0' + (!!(val & 32));
-	bits[1] = '0' + (!!(val & 64));
-	bits[0] = '0' + (!!(val & 128));
-	printk(KERN_DEBUG
-	       "HFC_outb(chip %d, %02x=%s, 0x%02x=%s); in %s() line %d\n",
-	       hc->id, reg, regname, val, bits, function, line);
-	HFC_outb_nodebug(hc, reg, val);
-}
-static u_char
-HFC_inb_debug(struct hfc_multi *hc, u_char reg, const char *function, int line)
-{
-	char regname[256] = "", bits[9] = "xxxxxxxx";
-	u_char val = HFC_inb_nodebug(hc, reg);
-	int i;
-
-	i = 0;
-	while (hfc_register_names[i++].name)
-		;
-	while (hfc_register_names[++i].name) {
-		if (hfc_register_names[i].reg == reg)
-			strcat(regname, hfc_register_names[i].name);
-	}
-	if (regname[0] == '\0')
-		strcpy(regname, "register");
-
-	bits[7] = '0' + (!!(val & 1));
-	bits[6] = '0' + (!!(val & 2));
-	bits[5] = '0' + (!!(val & 4));
-	bits[4] = '0' + (!!(val & 8));
-	bits[3] = '0' + (!!(val & 16));
-	bits[2] = '0' + (!!(val & 32));
-	bits[1] = '0' + (!!(val & 64));
-	bits[0] = '0' + (!!(val & 128));
-	printk(KERN_DEBUG
-	       "HFC_inb(chip %d, %02x=%s) = 0x%02x=%s; in %s() line %d\n",
-	       hc->id, reg, regname, val, bits, function, line);
-	return val;
-}
-static u_short
-HFC_inw_debug(struct hfc_multi *hc, u_char reg, const char *function, int line)
-{
-	char regname[256] = "";
-	u_short val = HFC_inw_nodebug(hc, reg);
-	int i;
-
-	i = 0;
-	while (hfc_register_names[i++].name)
-		;
-	while (hfc_register_names[++i].name) {
-		if (hfc_register_names[i].reg == reg)
-			strcat(regname, hfc_register_names[i].name);
-	}
-	if (regname[0] == '\0')
-		strcpy(regname, "register");
-
-	printk(KERN_DEBUG
-	       "HFC_inw(chip %d, %02x=%s) = 0x%04x; in %s() line %d\n",
-	       hc->id, reg, regname, val, function, line);
-	return val;
-}
-static void
-HFC_wait_debug(struct hfc_multi *hc, const char *function, int line)
-{
-	printk(KERN_DEBUG "HFC_wait(chip %d); in %s() line %d\n",
-	       hc->id, function, line);
-	HFC_wait_nodebug(hc);
-}
-#endif
-
-/* write fifo data (REGIO) */
-static void
-write_fifo_regio(struct hfc_multi *hc, u_char *data, int len)
-{
-	outb(A_FIFO_DATA0, (hc->pci_iobase) + 4);
-	while (len >> 2) {
-		outl(cpu_to_le32(*(u32 *)data), hc->pci_iobase);
-		data += 4;
-		len -= 4;
-	}
-	while (len >> 1) {
-		outw(cpu_to_le16(*(u16 *)data), hc->pci_iobase);
-		data += 2;
-		len -= 2;
-	}
-	while (len) {
-		outb(*data, hc->pci_iobase);
-		data++;
-		len--;
-	}
-}
-/* write fifo data (PCIMEM) */
-static void
-write_fifo_pcimem(struct hfc_multi *hc, u_char *data, int len)
-{
-	while (len >> 2) {
-		writel(cpu_to_le32(*(u32 *)data),
-		       hc->pci_membase + A_FIFO_DATA0);
-		data += 4;
-		len -= 4;
-	}
-	while (len >> 1) {
-		writew(cpu_to_le16(*(u16 *)data),
-		       hc->pci_membase + A_FIFO_DATA0);
-		data += 2;
-		len -= 2;
-	}
-	while (len) {
-		writeb(*data, hc->pci_membase + A_FIFO_DATA0);
-		data++;
-		len--;
-	}
+	return 0;
 }
 
-/* read fifo data (REGIO) */
-static void
-read_fifo_regio(struct hfc_multi *hc, u_char *data, int len)
+/*
+ * compare two delayed data backrefs with same bytenr and type
+ */
+static int comp_data_refs(struct btrfs_delayed_data_ref *ref2,
+			  struct btrfs_delayed_data_ref *ref1)
 {
-	outb(A_FIFO_DATA0, (hc->pci_iobase) + 4);
-	while (len >> 2) {
-		*(u32 *)data = le32_to_cpu(inl(hc->pci_iobase));
-		data += 4;
-		len -= 4;
+	if (ref1->node.type == BTRFS_EXTENT_DATA_REF_KEY) {
+		if (ref1->root < ref2->root)
+			return -1;
+		if (ref1->root > ref2->root)
+			return 1;
+		if (ref1->objectid < ref2->objectid)
+			return -1;
+		if (ref1->objectid > ref2->objectid)
+			return 1;
+		if (ref1->offset < ref2->offset)
+			return -1;
+		if (ref1->offset > ref2->offset)
+			return 1;
+	} else {
+		if (ref1->parent < ref2->parent)
+			return -1;
+		if (ref1->parent > ref2->parent)
+			return 1;
 	}
-	while (len >> 1) {
-		*(u16 *)data = le16_to_cpu(inw(hc->pci_iobase));
-		data += 2;
-		len -= 2;
-	}
-	while (len) {
-		*data = inb(hc->pci_iobase);
-		data++;
-		len--;
-	}
+	return 0;
 }
 
-/* read fifo data (PCIMEM) */
-static void
-read_fifo_pcimem(struct hfc_multi *hc, u_char *data, int len)
+/* insert a new ref to head ref rbtree */
+static struct btrfs_delayed_ref_head *htree_insert(struct rb_root *root,
+						   struct rb_node *node)
 {
-	while (len >> 2) {
-		*(u32 *)data =
-			le32_to_cpu(readl(hc->pci_membase + A_FIFO_DATA0));
-		data += 4;
-		len -= 4;
+	struct rb_node **p = &root->rb_node;
+	struct rb_node *parent_node = NULL;
+	struct btrfs_delayed_ref_head *entry;
+	struct btrfs_delayed_ref_head *ins;
+	u64 bytenr;
+
+	ins = rb_entry(node, struct btrfs_delayed_ref_head, href_node);
+	bytenr = ins->node.bytenr;
+	while (*p) {
+		parent_node = *p;
+		entry = rb_entry(parent_node, struct btrfs_delayed_ref_head,
+				 href_node);
+
+		if (bytenr < entry->node.bytenr)
+			p = &(*p)->rb_left;
+		else if (bytenr > entry->node.bytenr)
+			p = &(*p)->rb_right;
+		else
+			return entry;
 	}
-	while (len >> 1) {
-		*(u16 *)data =
-			le16_to_cpu(readw(hc->pci_membase + A_FIFO_DATA0));
-		data += 2;
-		len -= 2;
+
+	rb_link_node(node, parent_node, p);
+	rb_insert_color(node, root);
+	return NULL;
+}
+
+/*
+ * find an head entry based on bytenr. This returns the delayed ref
+ * head if it was able to find one, or NULL if nothing was in that spot.
+ * If return_bigger is given, the next bigger entry is returned if no exact
+ * match is found.
+ */
+static struct btrfs_delayed_ref_head *
+find_ref_head(struct rb_root *root, u64 bytenr,
+	      int return_bigger)
+{
+	struct rb_node *n;
+	struct btrfs_delayed_ref_head *entry;
+
+	n = root->rb_node;
+	entry = NULL;
+	while (n) {
+		entry = rb_entry(n, struct btrfs_delayed_ref_head, href_node);
+
+		if (bytenr < entry->node.bytenr)
+			n = n->rb_left;
+		else if (bytenr > entry->node.bytenr)
+			n = n->rb_right;
+		else
+			return entry;
 	}
-	while (len) {
-		*data = readb(hc->pci_membase + A_FIFO_DATA0);
-		data++;
-		len--;
+	if (entry && return_bigger) {
+		if (bytenr > entry->node.bytenr) {
+			n = rb_next(&entry->href_node);
+			if (!n)
+				n = rb_first(root);
+			entry = rb_entry(n, struct btrfs_delayed_ref_head,
+					 href_node);
+			return entry;
+		}
+		return entry;
 	}
+	return NULL;
 }
 
-static void
-enable_hwirq(struct hfc_multi *hc)
+int btrfs_delayed_ref_lock(struct btrfs_trans_handle *trans,
+			   struct btrfs_delayed_ref_head *head)
 {
-	hc->hw.r_irq_ctrl |= V_GLOB_IRQ_EN;
-	HFC_outb(hc, R_IRQ_CTRL, hc->hw.r_irq_ctrl);
-}
+	struct btrfs_delayed_ref_root *delayed_refs;
 
-static void
-disable_hwirq(struct hfc_multi *hc)
-{
-	hc->hw.r_irq_ctrl &= ~((u_char)V_GLOB_IRQ_EN);
-	HFC_outb(hc, R_IRQ_CTRL, hc->hw.r_irq_ctrl);
-}
-
-#define	NUM_EC 2
-#define	MAX_TDM_CHAN 32
-
-
-inline void
-enablepcibridge(struct hfc_multi *c)
-{
-	HFC_outb(c, R_BRG_PCM_CFG, (0x0 << 6) | 0x3); /* was _io before */
-}
-
-inline void
-disablepcibridge(struct hfc_multi *c)
-{
-	HFC_outb(c, R_BRG_PCM_CFG, (0x0 << 6) | 0x2); /* was _io before */
-}
-
-inline unsigned char
-readpcibridge(struct hfc_multi *hc, unsigned char address)
-{
-	unsigned short cipv;
-	unsigned char data;
-
-	if (!hc->pci_iobase)
+	delayed_refs = &trans->transaction->delayed_refs;
+	assert_spin_locked(&delayed_refs->lock);
+	if (mutex_trylock(&head->mutex))
 		return 0;
 
-	/* slow down a PCI read access by 1 PCI clock cycle */
-	HFC_outb(hc, R_CTRL, 0x4); /*was _io before*/
+	atomic_inc(&head->node.refs);
+	spin_unlock(&delayed_refs->lock);
 
-	if (address == 0)
-		cipv = 0x4000;
-	else
-		cipv = 0x5800;
-
-	/* select local bridge port address by writing to CIP port */
-	/* data = HFC_inb(c, cipv); * was _io before */
-	outw(cipv, hc->pci_iobase + 4);
-	data = inb(hc->pci_iobase);
-
-	/* restore R_CTRL for normal PCI read cycle speed */
-	HFC_outb(hc, R_CTRL, 0x0); /* was _io before */
-
-	return data;
+	mutex_lock(&head->mutex);
+	spin_lock(&delayed_refs->lock);
+	if (!head->node.in_tree) {
+		mutex_unlock(&head->mutex);
+		btrfs_put_delayed_ref(&head->node);
+		return -EAGAIN;
+	}
+	btrfs_put_delayed_ref(&head->node);
+	return 0;
 }
 
-inline void
-writepcibridge(struct hfc_multi *hc, unsigned char address, unsigned char data)
+static inline void drop_delayed_ref(struct btrfs_trans_handle *trans,
+				    struct btrfs_delayed_ref_root *delayed_refs,
+				    struct btrfs_delayed_ref_head *head,
+				    struct btrfs_delayed_ref_node *ref)
 {
-	unsigned short cipv;
-	unsigned int datav;
+	if (btrfs_delayed_ref_is_head(ref)) {
+		head = btrfs_delayed_node_to_head(ref);
+		rb_erase(&head->href_node, &delayed_refs->href_root);
+	} else {
+		assert_spin_locked(&head->lock);
+		list_del(&ref->list);
+	}
+	ref->in_tree = 0;
+	btrfs_put_delayed_ref(ref);
+	atomic_dec(&delayed_refs->num_entries);
+}
 
-	if (!hc->pci_iobase)
+static bool merge_ref(struct btrfs_trans_handle *trans,
+		      struct btrfs_delayed_ref_root *delayed_refs,
+		      struct btrfs_delayed_ref_head *head,
+		      struct btrfs_delayed_ref_node *ref,
+		      u64 seq)
+{
+	struct btrfs_delayed_ref_node *next;
+	bool done = false;
+
+	next = list_first_entry(&head->ref_list, struct btrfs_delayed_ref_node,
+				list);
+	while (!done && &next->list != &head->ref_list) {
+		int mod;
+		struct btrfs_delayed_ref_node *next2;
+
+		next2 = list_next_entry(next, list);
+
+		if (next == ref)
+			goto next;
+
+		if (seq && next->seq >= seq)
+			goto next;
+
+		if (next->type != ref->type)
+			goto next;
+
+		if ((ref->type == BTRFS_TREE_BLOCK_REF_KEY ||
+		     ref->type == BTRFS_SHARED_BLOCK_REF_KEY) &&
+		    comp_tree_refs(btrfs_delayed_node_to_tree_ref(ref),
+				   btrfs_delayed_node_to_tree_ref(next),
+				   ref->type))
+			goto next;
+		if ((ref->type == BTRFS_EXTENT_DATA_REF_KEY ||
+		     ref->type == BTRFS_SHARED_DATA_REF_KEY) &&
+		    comp_data_refs(btrfs_delayed_node_to_data_ref(ref),
+				   btrfs_delayed_node_to_data_ref(next)))
+			goto next;
+
+		if (ref->action == next->action) {
+			mod = next->ref_mod;
+		} else {
+			if (ref->ref_mod < next->ref_mod) {
+				swap(ref, next);
+				done = true;
+			}
+			mod = -next->ref_mod;
+		}
+
+		drop_delayed_ref(trans, delayed_refs, head, next);
+		ref->ref_mod += mod;
+		if (ref->ref_mod == 0) {
+			drop_delayed_ref(trans, delayed_refs, head, ref);
+			done = true;
+		} else {
+			/*
+			 * Can't have multiples of the same ref on a tree block.
+			 */
+			WARN_ON(ref->type == BTRFS_TREE_BLOCK_REF_KEY ||
+				ref->type == BTRFS_SHARED_BLOCK_REF_KEY);
+		}
+next:
+		next = next2;
+	}
+
+	return done;
+}
+
+void btrfs_merge_delayed_refs(struct btrfs_trans_handle *trans,
+			      struct btrfs_fs_info *fs_info,
+			      struct btrfs_delayed_ref_root *delayed_refs,
+			      struct btrfs_delayed_ref_head *head)
+{
+	struct btrfs_delayed_ref_node *ref;
+	u64 seq = 0;
+
+	assert_spin_locked(&head->lock);
+
+	if (list_empty(&head->ref_list))
 		return;
 
-	if (address == 0)
-		cipv = 0x4000;
-	else
-		cipv = 0x5800;
+	/* We don't have too many refs to merge for data. */
+	if (head->is_data)
+		return;
 
-	/* select local bridge port address by writing to CIP port */
-	outw(cipv, hc->pci_iobase + 4);
-	/* define a 32 bit dword with 4 identical bytes for write sequence */
-	datav = data | ((__u32) data << 8) | ((__u32) data << 16) |
-		((__u32) data << 24);
+	read_lock(&fs_info->tree_mod_log_lock);
+	if (!list_empty(&fs_info->tree_mod_seq_list)) {
+		struct seq_list *elem;
+
+		elem = list_first_entry(&fs_info->tree_mod_seq_list,
+					struct seq_list, list);
+		seq = elem->seq;
+	}
+	read_unlock(&fs_info->tree_mod_log_lock);
+
+	ref = list_first_entry(&head->ref_list, struct btrfs_delayed_ref_node,
+			       list);
+	while (&ref->list != &head->ref_list) {
+		if (seq && ref->seq >= seq)
+			goto next;
+
+		if (merge_ref(trans, delayed_refs, head, ref, seq)) {
+			if (list_empty(&head->ref_list))
+				break;
+			ref = list_first_entry(&head->ref_list,
+					       struct btrfs_delayed_ref_node,
+					       list);
+			continue;
+		}
+next:
+		ref = list_next_entry(ref, list);
+	}
+}
+
+int btrfs_check_delayed_seq(struct btrfs_fs_info *fs_info,
+			    struct btrfs_delayed_ref_root *delayed_refs,
+			    u64 seq)
+{
+	struct seq_list *elem;
+	int ret = 0;
+
+	read_lock(&fs_info->tree_mod_log_lock);
+	if (!list_empty(&fs_info->tree_mod_seq_list)) {
+		elem = list_first_entry(&fs_info->tree_mod_seq_list,
+					struct seq_list, list);
+		if (seq >= elem->seq) {
+			pr_debug("holding back delayed_ref %#x.%x, lowest is %#x.%x (%p)\n",
+				 (u32)(seq >> 32), (u32)seq,
+				 (u32)(elem->seq >> 32), (u32)elem->seq,
+				 delayed_refs);
+			ret = 1;
+		}
+	}
+
+	read_unlock(&fs_info->tree_mod_log_lock);
+	return ret;
+}
+
+struct btrfs_delayed_ref_head *
+btrfs_select_ref_head(struct btrfs_trans_handle *trans)
+{
+	struct btrfs_delayed_ref_root *delayed_refs;
+	struct btrfs_delayed_ref_head *head;
+	u64 start;
+	bool loop = false;
+
+	delayed_refs = &trans->transaction->delayed_refs;
+
+again:
+	start = delayed_refs->run_delayed_start;
+	head = find_ref_head(&delayed_refs->href_root, start, 1);
+	if (!head && !loop) {
+		delayed_refs->run_delayed_start = 0;
+		start = 0;
+		loop = true;
+		head = find_ref_head(&delayed_refs->href_root, start, 1);
+		if (!head)
+			return NULL;
+	} else if (!head && loop) {
+		return NULL;
+	}
+
+	while (head->processing) {
+		struct rb_node *node;
+
+		node = rb_next(&head->href_node);
+		if (!node) {
+			if (loop)
+				return NULL;
+			delayed_refs->run_delayed_start = 0;
+			start = 0;
+			loop = true;
+			goto again;
+		}
+		head = rb_entry(node, struct btrfs_delayed_ref_head,
+				href_node);
+	}
+
+	head->processing = 1;
+	WARN_ON(delayed_refs->num_heads_ready == 0);
+	delayed_refs->num_heads_ready--;
+	delayed_refs->run_delayed_start = head->node.bytenr +
+		head->node.num_bytes;
+	return head;
+}
+
+/*
+ * Helper to insert the ref_node to the tail or merge with tail.
+ *
+ * Return 0 for insert.
+ * Return >0 for merge.
+ */
+static int
+add_delayed_ref_tail_merge(struct btrfs_trans_handle *trans,
+			   struct btrfs_delayed_ref_root *root,
+			   struct btrfs_delayed_ref_head *href,
+			   struct btrfs_delayed_ref_node *ref)
+{
+	struct btrfs_delayed_ref_node *exist;
+	int mod;
+	int ret = 0;
+
+	spin_lock(&href->lock);
+	/* Check whether we can merge the tail node with ref */
+	if (list_empty(&href->ref_list))
+		goto add_tail;
+	exist = list_entry(href->ref_list.prev, struct btrfs_delayed_ref_node,
+			   list);
+	/* No need to compare bytenr nor is_head */
+	if (exist->type != ref->type || exist->seq != ref->seq)
+		goto add_tail;
+
+	if ((exist->type == BTRFS_TREE_BLOCK_REF_KEY ||
+	     exist->type == BTRFS_SHARED_BLOCK_REF_KEY) &&
+	    comp_tree_refs(btrfs_delayed_node_to_tree_ref(exist),
+			   btrfs_delayed_node_to_tree_ref(ref),
+			   ref->type))
+		goto add_tail;
+	if ((exist->type == BTRFS_EXTENT_DATA_REF_KEY ||
+	     exist->type == BTRFS_SHARED_DATA_REF_KEY) &&
+	    comp_data_refs(btrfs_delayed_node_to_data_ref(exist),
+			   btrfs_delayed_node_to_data_ref(ref)))
+		goto add_tail;
+
+	/* Now we are sure we can merge */
+	ret = 1;
+	if (exist->action == ref->action) {
+		mod = ref->ref_mod;
+	} else {
+		/* Need to change action */
+		if (exist->ref_mod < ref->ref_mod) {
+			exist->action = ref->action;
+			mod = -exist->ref_mod;
+			exist->ref_mod = ref->ref_mod;
+		} else
+			mod = -ref->ref_mod;
+	}
+	exist->ref_mod += mod;
+
+	/* remove existing tail if its ref_mod is zero */
+	if (exist->ref_mod == 0)
+		drop_delayed_ref(trans, root, href, exist);
+	spin_unlock(&href->lock);
+	return ret;
+
+add_tail:
+	list_add_tail(&ref->list, &href->ref_list);
+	atomic_inc(&root->num_entries);
+	spin_unlock(&href->lock);
+	return ret;
+}
+
+/*
+ * helper function to update the accounting in the head ref
+ * existing and update must have the same bytenr
+ */
+static noinline void
+update_existing_head_ref(struct btrfs_delayed_ref_root *delayed_refs,
+			 struct btrfs_delayed_ref_node *existing,
+			 struct btrfs_delayed_ref_node *update)
+{
+	struct btrfs_delayed_ref_head *existing_ref;
+	struct btrfs_delayed_ref_head *ref;
+	int old_ref_mod;
+
+	existing_ref = btrfs_delayed_node_to_head(existing);
+	ref = btrfs_delayed_node_to_head(update);
+	BUG_ON(existing_ref->is_data != ref->is_data);
+
+	spin_lock(&existing_ref->lock);
+	if (ref->must_insert_reserved) {
+		/* if the extent was freed and then
+		 * reallocated before the delayed ref
+		 * entries were processed, we can end up
+		 * with an existing head ref without
+		 * the must_insert_reserved flag set.
+		 * Set it again here
+		 */
+		existing_ref->must_insert_reserved = ref->must_insert_reserved;
+
+		/*
+		 * update the num_bytes so we make sure the accounting
+		 * is done correctly
+		 */
+		existing->num_bytes = update->num_bytes;
+
+	}
+
+	if (ref->extent_op) {
+		if (!existing_ref->extent_op) {
+			existing_ref->extent_op = ref->extent_op;
+		} else {
+			if (ref->extent_op->update_key) {
+				memcpy(&existing_ref->extent_op->key,
+				       &ref->extent_op->key,
+				       sizeof(ref->extent_op->key));
+				existing_ref->extent_op->update_key = 1;
+			}
+			if (ref->extent_op->update_flags) {
+				existing_ref->extent_op->flags_to_set |=
+					ref->extent_op->flags_to_set;
+				existing_ref->extent_op->update_flags = 1;
+			}
+			btrfs_free_delayed_extent_op(ref->extent_op);
+		}
+	}
+	/*
+	 * update the reference mod on the head to reflect this new operation,
+	 * only need the lock for this case cause we could be processing it
+	 * currently, for refs we just added we know we're a-ok.
+	 */
+	old_ref_mod = existing_ref->total_ref_mod;
+	existing->ref_mod += update->ref_mod;
+	existing_ref->total_ref_mod += update->ref_mod;
 
 	/*
-	 * write this 32 bit dword to the bridge data port
-	 * this will initiate a write sequence of up to 4 writes to the same
-	 * address on the local bus interface the number of write accesses
-	 * is undefined but >=1 and depends on the next PCI transaction
-	 * during write sequence on the local bus
+	 * If we are going to from a positive ref mod to a negative or vice
+	 * versa we need to make sure to adjust pending_csums accordingly.
 	 */
-	outl(datav, hc->pci_iobase);
+	if (existing_ref->is_data) {
+		if (existing_ref->total_ref_mod >= 0 && old_ref_mod < 0)
+			delayed_refs->pending_csums -= existing->num_bytes;
+		if (existing_ref->total_ref_mod < 0 && old_ref_mod >= 0)
+			delayed_refs->pending_csums += existing->num_bytes;
+	}
+	spin_unlock(&existing_ref->lock);
 }
 
-inline void
-cpld_set_reg(struct hfc_multi *hc, unsigned char reg)
+/*
+ * helper function to actually insert a head node into the rbtree.
+ * this does all the dirty work in terms of maintaining the correct
+ * overall modification count.
+ */
+static noinline struct btrfs_delayed_ref_head *
+add_delayed_ref_head(struct btrfs_fs_info *fs_info,
+		     struct btrfs_trans_handle *trans,
+		     struct btrfs_delayed_ref_node *ref,
+		     struct btrfs_qgroup_extent_record *qrecord,
+		     u64 bytenr, u64 num_bytes, u64 ref_root, u64 reserved,
+		     int action, int is_data)
 {
-	/* Do data pin read low byte */
-	HFC_outb(hc, R_GPIO_OUT1, reg);
-}
+	struct btrfs_delayed_ref_head *existing;
+	struct btrfs_delayed_ref_head *head_ref = NULL;
+	struct btrfs_delayed_ref_root *delayed_refs;
+	struct btrfs_qgroup_extent_record *qexisting;
+	int count_mod = 1;
+	int must_insert_reserved = 0;
 
-inline void
-cpld_write_reg(struct hfc_multi *hc, unsigned char reg, unsigned char val)
-{
-	cpld_set_reg(hc, reg);
+	/* If reserved is provided, it must be a data extent. */
+	BUG_ON(!is_data && reserved);
 
-	enablepcibridge(hc);
-	writepcibridge(hc, 1, val);
-	disablepcibridge(hc);
+	/*
+	 * the head node stores the sum of all the mods, so dropping a ref
+	 * should drop the sum in the head node by one.
+	 */
+	if (action == BTRFS_UPDATE_DELAYED_HEAD)
+		count_mod = 0;
+	else if (action == BTRFS_DROP_DELAYED_REF)
+		count_mod = -1;
 
-	return;
-}
-
-inline unsigned char
-cpld_read_reg(struct hfc_multi *hc, unsigned char reg)
-{
-	unsigned char bytein;
-
-	cpld_set_reg(hc, reg);
-
-	/* Do data pin read low byte */
-	HFC_outb(hc, R_GPIO_OUT1, reg);
-
-	enablepcibridge(hc);
-	bytein = readpcibridge(hc, 1);
-	disablepcibridge(hc);
-
-	return bytein;
-}
-
-inline void
-vpm_write_address(struct hfc_multi *hc, unsigned short addr)
-{
-	cpld_write_reg(hc, 0, 0xff & addr);
-	cpld_write_reg(hc, 1, 0x01 & (addr >> 8));
-}
-
-inline unsigned short
-vpm_read_address(struct hfc_multi *c)
-{
-	unsigned short addr;
-	unsigned short highbit;
-
-	addr = cpld_read_reg(c, 0);
-	highbit = cpld_read_reg(c, 1);
-
-	addr = addr | (highbit << 8);
-
-	return addr & 0x1ff;
-}
-
-inline unsigned char
-vpm_in(struct hfc_multi *c, int which, unsigned short addr)
-{
-	unsigned char res;
-
-	vpm_write_address(c, addr);
-
-	if (!which)
-		cpld_set_reg(c, 2);
+	/*
+	 * BTRFS_ADD_DELAYED_EXTENT means that we need to update
+	 * the reserved accounting when the extent is finally added, or
+	 * if a later modification deletes the delayed ref without ever
+	 * inserting the extent into the extent allocation tree.
+	 * ref->must_insert_reserved is the flag used to record
+	 * that accounting mods are required.
+	 *
+	 * Once we record must_insert_reserved, switch the action to
+	 * BTRFS_ADD_DELAYED_REF because other special casing is not required.
+	 */
+	if (action == BTRFS_ADD_DELAYED_EXTENT)
+		must_insert_reserved = 1;
 	else
-		cpld_set_reg(c, 3);
+		must_insert_reserved = 0;
 
-	enablepcibridge(c);
-	res = readpcibridge(c, 1);
-	disablepcibridge(c);
+	delayed_refs = &trans->transaction->delayed_refs;
 
-	cpld_set_reg(c, 0);
+	/* first set the basic ref node struct up */
+	atomic_set(&ref->refs, 1);
+	ref->bytenr = bytenr;
+	ref->num_bytes = num_bytes;
+	ref->ref_mod = count_mod;
+	ref->type  = 0;
+	ref->action  = 0;
+	ref->is_head = 1;
+	ref->in_tree = 1;
+	ref->seq = 0;
 
-	return res;
-}
+	head_ref = btrfs_delayed_node_to_head(ref);
+	head_ref->must_insert_reserved = must_insert_reserved;
+	head_ref->is_data = is_data;
+	INIT_LIST_HEAD(&head_ref->ref_list);
+	head_ref->processing = 0;
+	head_ref->total_ref_mod = count_mod;
+	head_ref->qgroup_reserved = 0;
+	head_ref->qgroup_ref_root = 0;
 
-inline void
-vpm_out(struct hfc_multi *c, int which, unsigned short addr,
-	unsigned char data)
-{
-	vpm_write_address(c, addr);
+	/* Record qgroup extent info if provided */
+	if (qrecord) {
+		if (ref_root && reserved) {
+			head_ref->qgroup_ref_root = ref_root;
+			head_ref->qgroup_reserved = reserved;
+		}
 
-	enablepcibridge(c);
+		qrecord->bytenr = bytenr;
+		qrecord->num_bytes = num_bytes;
+		qrecord->old_roots = NULL;
 
-	if (!which)
-		cpld_set_reg(c, 2);
-	else
-		cpld_set_reg(c, 3);
-
-	writepcibridge(c, 1, data);
-
-	cpld_set_reg(c, 0);
-
-	disablepcibridge(c);
-
-	{
-		unsigned char regin;
-		regin = vpm_in(c, which, addr);
-		if (regin != data)
-			printk(KERN_DEBUG "Wrote 0x%x to register 0x%x but got back "
-			       "0x%x\n", data, addr, regin);
+		qexisting = btrfs_qgroup_insert_dirty_extent(delayed_refs,
+							     qrecord);
+		if (qexisting)
+			kfree(qrecord);
 	}
 
-}
+	spin_lock_init(&head_ref->lock);
+	mutex_init(&head_ref->mutex);
 
+	trace_add_delayed_ref_head(ref, head_ref, action);
 
-static void
-vpm_init(struct hfc_multi *wc)
-{
-	unsigned char reg;
-	unsigned int mask;
-	unsigned int i, x, y;
-	unsigned int ver;
-
-	for (x = 0; x < NUM_EC; x++) {
-		/* Setup GPIO's */
-		if (!x) {
-			ver = vpm_in(wc, x, 0x1a0);
-			printk(KERN_DEBUG "VPM: Chip %d: ver %02x\n", x, ver);
-		}
-
-		for (y = 0; y < 4; y++) {
-			vpm_out(wc, x, 0x1a8 + y, 0x00); /* GPIO out */
-			vpm_out(wc, x, 0x1ac + y, 0x00); /* GPIO dir */
-			vpm_out(wc, x, 0x1b0 + y, 0x00); /* GPIO sel */
-		}
-
-		/* Setup TDM path - sets fsync and tdm_clk as inputs */
-		reg = vpm_in(wc, x, 0x1a3); /* misc_con */
-		vpm_out(wc, x, 0x1a3, reg & ~2);
-
-		/* Setup Echo length (256 taps) */
-		vpm_out(wc, x, 0x022, 1);
-		vpm_out(wc, x, 0x023, 0xff);
-
-		/* Setup timeslots */
-		vpm_out(wc, x, 0x02f, 0x00);
-		mask = 0x02020202 << (x * 4);
-
-		/* Setup the tdm channel masks for all chips */
-		for (i = 0; i < 4; i++)
-			vpm_out(wc, x, 0x33 - i, (mask >> (i << 3)) & 0xff);
-
-		/* Setup convergence rate */
-		printk(KERN_DEBUG "VPM: A-law mode\n");
-		reg = 0x00 | 0x10 | 0x01;
-		vpm_out(wc, x, 0x20, reg);
-		printk(KERN_DEBUG "VPM reg 0x20 is %x\n", reg);
-		/*vpm_out(wc, x, 0x20, (0x00 | 0x08 | 0x20 | 0x10)); */
-
-		vpm_out(wc, x, 0x24, 0x02);
-		reg = vpm_in(wc, x, 0x24);
-		printk(KERN_DEBUG "NLP Thresh is set to %d (0x%x)\n", reg, reg);
-
-		/* Initialize echo cans */
-		for (i = 0; i < MAX_TDM_CHAN; i++) {
-			if (mask & (0x00000001 << i))
-				vpm_out(wc, x, i, 0x00);
-		}
-
+	existing = htree_insert(&delayed_refs->href_root,
+				&head_ref->href_node);
+	if (existing) {
+		WARN_ON(ref_root && reserved && existing->qgroup_ref_root
+			&& existing->qgroup_reserved);
+		update_existing_head_ref(delayed_refs, &existing->node, ref);
 		/*
-		 * ARM arch at least disallows a udelay of
-		 * more than 2ms... it gives a fake "__bad_udelay"
-		 * reference at link-time.
-		 * long delays in kernel code are pretty sucky anyway
-		 * for now work around it using 5 x 2ms instead of 1 x 10ms
+		 * we've updated the existing ref, free the newly
+		 * allocated ref
 		 */
-
-		udelay(2000);
-		udelay(2000);
-		udelay(2000);
-		udelay(2000);
-		udelay(2000);
-
-		/* Put in bypass mode */
-		for (i = 0; i < MAX_TDM_CHAN; i++) {
-			if (mask & (0x00000001 << i))
-				vpm_out(wc, x, i, 0x01);
-		}
-
-		/* Enable bypass */
-		for (i = 0; i < MAX_TDM_CHAN; i++) {
-			if (mask & (0x00000001 << i))
-				vpm_out(wc, x, 0x78 + i, 0x01);
-		}
-
-	}
-}
-
-#ifdef UNUSED
-static void
-vpm_check(struct hfc_multi *hctmp)
-{
-	unsigned char gpi2;
-
-	gpi2 = HFC_inb(hctmp, R_GPI_IN2);
-
-	if ((gpi2 & 0x3) != 0x3)
-		printk(KERN_DEBUG "Got interrupt 0x%x from VPM!\n", gpi2);
-}
-#endif /* UNUSED */
-
-
-/*
- * Interface to enable/disable the HW Echocan
- *
- * these functions are called within a spin_lock_irqsave on
- * the channel instance lock, so we are not disturbed by irqs
- *
- * we can later easily change the interface to make  other
- * things configurable, for now we configure the taps
- *
- */
-
-static void
-vpm_echocan_on(struct hfc_multi *hc, int ch, int taps)
-{
-	unsigned int timeslot;
-	unsigned int unit;
-	struct bchannel *bch = hc->chan[ch].bch;
-#ifdef TXADJ
-	int txadj = -4;
-	struct sk_buff *skb;
-#endif
-	if (hc->chan[ch].protocol != ISDN_P_B_RAW)
-		return;
-
-	if (!bch)
-		return;
-
-#ifdef TXADJ
-	skb = _alloc_mISDN_skb(PH_CONTROL_IND, HFC_VOL_CHANGE_TX,
-			       sizeof(int), &txadj, GFP_ATOMIC);
-	if (skb)
-		recv_Bchannel_skb(bch, skb);
-#endif
-
-	timeslot = ((ch / 4) * 8) + ((ch % 4) * 4) + 1;
-	unit = ch % 4;
-
-	printk(KERN_NOTICE "vpm_echocan_on called taps [%d] on timeslot %d\n",
-	       taps, timeslot);
-
-	vpm_out(hc, unit, timeslot, 0x7e);
-}
-
-static void
-vpm_echocan_off(struct hfc_multi *hc, int ch)
-{
-	unsigned int timeslot;
-	unsigned int unit;
-	struct bchannel *bch = hc->chan[ch].bch;
-#ifdef TXADJ
-	int txadj = 0;
-	struct sk_buff *skb;
-#endif
-
-	if (hc->chan[ch].protocol != ISDN_P_B_RAW)
-		return;
-
-	if (!bch)
-		return;
-
-#ifdef TXADJ
-	skb = _alloc_mISDN_skb(PH_CONTROL_IND, HFC_VOL_CHANGE_TX,
-			       sizeof(int), &txadj, GFP_ATOMIC);
-	if (skb)
-		recv_Bchannel_skb(bch, skb);
-#endif
-
-	timeslot = ((ch / 4) * 8) + ((ch % 4) * 4) + 1;
-	unit = ch % 4;
-
-	printk(KERN_NOTICE "vpm_echocan_off called on timeslot %d\n",
-	       timeslot);
-	/* FILLME */
-	vpm_out(hc, unit, timeslot, 0x01);
-}
-
-
-/*
- * Speech Design resync feature
- * NOTE: This is called sometimes outside interrupt handler.
- * We must lock irqsave, so no other interrupt (other card) will occur!
- * Also multiple interrupts may nest, so must lock each access (lists, card)!
- */
-static inline void
-hfcmulti_resync(struct hfc_multi *locked, struct hfc_multi *newmaster, int rm)
-{
-	struct hfc_multi *hc, *next, *pcmmaster = NULL;
-	void __iomem *plx_acc_32;
-	u_int pv;
-	u_long flags;
-
-	spin_lock_irqsave(&HFClock, flags);
-	spin_lock(&plx_lock); /* must be locked inside other locks */
-
-	if (debug & DEBUG_HFCMULTI_PLXSD)
-		printk(KERN_DEBUG "%s: RESYNC(syncmaster=0x%p)\n",
-		       __func__, syncmaster);
-
-	/* select new master */
-	if (newmaster) {
-		if (debug & DEBUG_HFCMULTI_PLXSD)
-			printk(KERN_DEBUG "using provided controller\n");
+		kmem_cache_free(btrfs_delayed_ref_head_cachep, head_ref);
+		head_ref = existing;
 	} else {
-		list_for_each_entry_safe(hc, next, &HFClist, list) {
-			if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-				if (hc->syncronized) {
-					newmaster = hc;
-					break;
-				}
-			}
-		}
+		if (is_data && count_mod < 0)
+			delayed_refs->pending_csums += num_bytes;
+		delayed_refs->num_heads++;
+		delayed_refs->num_heads_ready++;
+		atomic_inc(&delayed_refs->num_entries);
+		trans->delayed_ref_updates++;
 	}
-
-	/* Disable sync of all cards */
-	list_for_each_entry_safe(hc, next, &HFClist, list) {
-		if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-			plx_acc_32 = hc->plx_membase + PLX_GPIOC;
-			pv = readl(plx_acc_32);
-			pv &= ~PLX_SYNC_O_EN;
-			writel(pv, plx_acc_32);
-			if (test_bit(HFC_CHIP_PCM_MASTER, &hc->chip)) {
-				pcmmaster = hc;
-				if (hc->ctype == HFC_TYPE_E1) {
-					if (debug & DEBUG_HFCMULTI_PLXSD)
-						printk(KERN_DEBUG
-						       "Schedule SYNC_I\n");
-					hc->e1_resync |= 1; /* get SYNC_I */
-				}
-			}
-		}
-	}
-
-	if (newmaster) {
-		hc = newmaster;
-		if (debug & DEBUG_HFCMULTI_PLXSD)
-			printk(KERN_DEBUG "id=%d (0x%p) = syncronized with "
-			       "interface.\n", hc->id, hc);
-		/* Enable new sync master */
-		plx_acc_32 = hc->plx_membase + PLX_GPIOC;
-		pv = readl(plx_acc_32);
-		pv |= PLX_SYNC_O_EN;
-		writel(pv, plx_acc_32);
-		/* switch to jatt PLL, if not disabled by RX_SYNC */
-		if (hc->ctype == HFC_TYPE_E1
-		    && !test_bit(HFC_CHIP_RX_SYNC, &hc->chip)) {
-			if (debug & DEBUG_HFCMULTI_PLXSD)
-				printk(KERN_DEBUG "Schedule jatt PLL\n");
-			hc->e1_resync |= 2; /* switch to jatt */
-		}
-	} else {
-		if (pcmmaster) {
-			hc = pcmmaster;
-			if (debug & DEBUG_HFCMULTI_PLXSD)
-				printk(KERN_DEBUG
-				       "id=%d (0x%p) = PCM master syncronized "
-				       "with QUARTZ\n", hc->id, hc);
-			if (hc->ctype == HFC_TYPE_E1) {
-				/* Use the crystal clock for the PCM
-				   master card */
-				if (debug & DEBUG_HFCMULTI_PLXSD)
-					printk(KERN_DEBUG
-					       "Schedule QUARTZ for HFC-E1\n");
-				hc->e1_resync |= 4; /* switch quartz */
-			} else {
-				if (debug & DEBUG_HFCMULTI_PLXSD)
-					printk(KERN_DEBUG
-					       "QUARTZ is automatically "
-					       "enabled by HFC-%dS\n", hc->ctype);
-			}
-			plx_acc_32 = hc->plx_membase + PLX_GPIOC;
-			pv = readl(plx_acc_32);
-			pv |= PLX_SYNC_O_EN;
-			writel(pv, plx_acc_32);
-		} else
-			if (!rm)
-				printk(KERN_ERR "%s no pcm master, this MUST "
-				       "not happen!\n", __func__);
-	}
-	syncmaster = newmaster;
-
-	spin_unlock(&plx_lock);
-	spin_unlock_irqrestore(&HFClock, flags);
-}
-
-/* This must be called AND hc must be locked irqsave!!! */
-inline void
-plxsd_checksync(struct hfc_multi *hc, int rm)
-{
-	if (hc->syncronized) {
-		if (syncmaster == NULL) {
-			if (debug & DEBUG_HFCMULTI_PLXSD)
-				printk(KERN_DEBUG "%s: GOT sync on card %d"
-				       " (id=%d)\n", __func__, hc->id + 1,
-				       hc->id);
-			hfcmulti_resync(hc, hc, rm);
-		}
-	} else {
-		if (syncmaster == hc) {
-			if (debug & DEBUG_HFCMULTI_PLXSD)
-				printk(KERN_DEBUG "%s: LOST sync on card %d"
-				       " (id=%d)\n", __func__, hc->id + 1,
-				       hc->id);
-			hfcmulti_resync(hc, NULL, rm);
-		}
-	}
-}
-
-
-/*
- * free hardware resources used by driver
- */
-static void
-release_io_hfcmulti(struct hfc_multi *hc)
-{
-	void __iomem *plx_acc_32;
-	u_int	pv;
-	u_long	plx_flags;
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: entered\n", __func__);
-
-	/* soft reset also masks all interrupts */
-	hc->hw.r_cirm |= V_SRES;
-	HFC_outb(hc, R_CIRM, hc->hw.r_cirm);
-	udelay(1000);
-	hc->hw.r_cirm &= ~V_SRES;
-	HFC_outb(hc, R_CIRM, hc->hw.r_cirm);
-	udelay(1000); /* instead of 'wait' that may cause locking */
-
-	/* release Speech Design card, if PLX was initialized */
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip) && hc->plx_membase) {
-		if (debug & DEBUG_HFCMULTI_PLXSD)
-			printk(KERN_DEBUG "%s: release PLXSD card %d\n",
-			       __func__, hc->id + 1);
-		spin_lock_irqsave(&plx_lock, plx_flags);
-		plx_acc_32 = hc->plx_membase + PLX_GPIOC;
-		writel(PLX_GPIOC_INIT, plx_acc_32);
-		pv = readl(plx_acc_32);
-		/* Termination off */
-		pv &= ~PLX_TERM_ON;
-		/* Disconnect the PCM */
-		pv |= PLX_SLAVE_EN_N;
-		pv &= ~PLX_MASTER_EN;
-		pv &= ~PLX_SYNC_O_EN;
-		/* Put the DSP in Reset */
-		pv &= ~PLX_DSP_RES_N;
-		writel(pv, plx_acc_32);
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: PCM off: PLX_GPIO=%x\n",
-			       __func__, pv);
-		spin_unlock_irqrestore(&plx_lock, plx_flags);
-	}
-
-	/* disable memory mapped ports / io ports */
-	test_and_clear_bit(HFC_CHIP_PLXSD, &hc->chip); /* prevent resync */
-	if (hc->pci_dev)
-		pci_write_config_word(hc->pci_dev, PCI_COMMAND, 0);
-	if (hc->pci_membase)
-		iounmap(hc->pci_membase);
-	if (hc->plx_membase)
-		iounmap(hc->plx_membase);
-	if (hc->pci_iobase)
-		release_region(hc->pci_iobase, 8);
-	if (hc->xhfc_membase)
-		iounmap((void *)hc->xhfc_membase);
-
-	if (hc->pci_dev) {
-		pci_disable_device(hc->pci_dev);
-		pci_set_drvdata(hc->pci_dev, NULL);
-	}
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: done\n", __func__);
+	return head_ref;
 }
 
 /*
- * function called to reset the HFC chip. A complete software reset of chip
- * and fifos is done. All configuration of the chip is done.
+ * helper to insert a delayed tree ref into the rbtree.
  */
-
-static int
-init_chip(struct hfc_multi *hc)
+static noinline void
+add_delayed_tree_ref(struct btrfs_fs_info *fs_info,
+		     struct btrfs_trans_handle *trans,
+		     struct btrfs_delayed_ref_head *head_ref,
+		     struct btrfs_delayed_ref_node *ref, u64 bytenr,
+		     u64 num_bytes, u64 parent, u64 ref_root, int level,
+		     int action)
 {
-	u_long			flags, val, val2 = 0, rev;
-	int			i, err = 0;
-	u_char			r_conf_en, rval;
-	void __iomem		*plx_acc_32;
-	u_int			pv;
-	u_long			plx_flags, hfc_flags;
-	int			plx_count;
-	struct hfc_multi	*pos, *next, *plx_last_hc;
+	struct btrfs_delayed_tree_ref *full_ref;
+	struct btrfs_delayed_ref_root *delayed_refs;
+	u64 seq = 0;
+	int ret;
 
-	spin_lock_irqsave(&hc->lock, flags);
-	/* reset all registers */
-	memset(&hc->hw, 0, sizeof(struct hfcm_hw));
+	if (action == BTRFS_ADD_DELAYED_EXTENT)
+		action = BTRFS_ADD_DELAYED_REF;
 
-	/* revision check */
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: entered\n", __func__);
-	val = HFC_inb(hc, R_CHIP_ID);
-	if ((val >> 4) != 0x8 && (val >> 4) != 0xc && (val >> 4) != 0xe &&
-	    (val >> 1) != 0x31) {
-		printk(KERN_INFO "HFC_multi: unknown CHIP_ID:%x\n", (u_int)val);
-		err = -EIO;
+	if (is_fstree(ref_root))
+		seq = atomic64_read(&fs_info->tree_mod_seq);
+	delayed_refs = &trans->transaction->delayed_refs;
+
+	/* first set the basic ref node struct up */
+	atomic_set(&ref->refs, 1);
+	ref->bytenr = bytenr;
+	ref->num_bytes = num_bytes;
+	ref->ref_mod = 1;
+	ref->action = action;
+	ref->is_head = 0;
+	ref->in_tree = 1;
+	ref->seq = seq;
+
+	full_ref = btrfs_delayed_node_to_tree_ref(ref);
+	full_ref->parent = parent;
+	full_ref->root = ref_root;
+	if (parent)
+		ref->type = BTRFS_SHARED_BLOCK_REF_KEY;
+	else
+		ref->type = BTRFS_TREE_BLOCK_REF_KEY;
+	full_ref->level = level;
+
+	trace_add_delayed_tree_ref(ref, full_ref, action);
+
+	ret = add_delayed_ref_tail_merge(trans, delayed_refs, head_ref, ref);
+
+	/*
+	 * XXX: memory should be freed at the same level allocated.
+	 * But bad practice is anywhere... Follow it now. Need cleanup.
+	 */
+	if (ret > 0)
+		kmem_cache_free(btrfs_delayed_tree_ref_cachep, full_ref);
+}
+
+/*
+ * helper to insert a delayed data ref into the rbtree.
+ */
+static noinline void
+add_delayed_data_ref(struct btrfs_fs_info *fs_info,
+		     struct btrfs_trans_handle *trans,
+		     struct btrfs_delayed_ref_head *head_ref,
+		     struct btrfs_delayed_ref_node *ref, u64 bytenr,
+		     u64 num_bytes, u64 parent, u64 ref_root, u64 owner,
+		     u64 offset, int action)
+{
+	struct btrfs_delayed_data_ref *full_ref;
+	struct btrfs_delayed_ref_root *delayed_refs;
+	u64 seq = 0;
+	int ret;
+
+	if (action == BTRFS_ADD_DELAYED_EXTENT)
+		action = BTRFS_ADD_DELAYED_REF;
+
+	delayed_refs = &trans->transaction->delayed_refs;
+
+	if (is_fstree(ref_root))
+		seq = atomic64_read(&fs_info->tree_mod_seq);
+
+	/* first set the basic ref node struct up */
+	atomic_set(&ref->refs, 1);
+	ref->bytenr = bytenr;
+	ref->num_bytes = num_bytes;
+	ref->ref_mod = 1;
+	ref->action = action;
+	ref->is_head = 0;
+	ref->in_tree = 1;
+	ref->seq = seq;
+
+	full_ref = btrfs_delayed_node_to_data_ref(ref);
+	full_ref->parent = parent;
+	full_ref->root = ref_root;
+	if (parent)
+		ref->type = BTRFS_SHARED_DATA_REF_KEY;
+	else
+		ref->type = BTRFS_EXTENT_DATA_REF_KEY;
+
+	full_ref->objectid = owner;
+	full_ref->offset = offset;
+
+	trace_add_delayed_data_ref(ref, full_ref, action);
+
+	ret = add_delayed_ref_tail_merge(trans, delayed_refs, head_ref, ref);
+
+	if (ret > 0)
+		kmem_cache_free(btrfs_delayed_data_ref_cachep, full_ref);
+}
+
+/*
+ * add a delayed tree ref.  This does all of the accounting required
+ * to make sure the delayed ref is eventually processed before this
+ * transaction commits.
+ */
+int btrfs_add_delayed_tree_ref(struct btrfs_fs_info *fs_info,
+			       struct btrfs_trans_handle *trans,
+			       u64 bytenr, u64 num_bytes, u64 parent,
+			       u64 ref_root,  int level, int action,
+			       struct btrfs_delayed_extent_op *extent_op)
+{
+	struct btrfs_delayed_tree_ref *ref;
+	struct btrfs_delayed_ref_head *head_ref;
+	struct btrfs_delayed_ref_root *delayed_refs;
+	struct btrfs_qgroup_extent_record *record = NULL;
+
+	BUG_ON(extent_op && extent_op->is_data);
+	ref = kmem_cache_alloc(btrfs_delayed_tree_ref_cachep, GFP_NOFS);
+	if (!ref)
+		return -ENOMEM;
+
+	head_ref = kmem_cache_alloc(btrfs_delayed_ref_head_cachep, GFP_NOFS);
+	if (!head_ref)
+		goto free_ref;
+
+	if (fs_info->quota_enabled && is_fstree(ref_root)) {
+		record = kmalloc(sizeof(*record), GFP_NOFS);
+		if (!record)
+			goto free_head_ref;
+	}
+
+	head_ref->extent_op = extent_op;
+
+	delayed_refs = &trans->transaction->delayed_refs;
+	spin_lock(&delayed_refs->lock);
+
+	/*
+	 * insert both the head node and the new ref without dropping
+	 * the spin lock
+	 */
+	head_ref = add_delayed_ref_head(fs_info, trans, &head_ref->node, record,
+					bytenr, num_bytes, 0, 0, action, 0);
+
+	add_delayed_tree_ref(fs_info, trans, head_ref, &ref->node, bytenr,
+			     num_bytes, parent, ref_root, level, action);
+	spin_unlock(&delayed_refs->lock);
+
+	return 0;
+
+free_head_ref:
+	kmem_cache_free(btrfs_delayed_ref_head_cachep, head_ref);
+free_ref:
+	kmem_cache_free(btrfs_delayed_tree_ref_cachep, ref);
+
+	return -ENOMEM;
+}
+
+/*
+ * add a delayed data ref. it's similar to btrfs_add_delayed_tree_ref.
+ */
+int btrfs_add_delayed_data_ref(struct btrfs_fs_info *fs_info,
+			       struct btrfs_trans_handle *trans,
+			       u64 bytenr, u64 num_bytes,
+			       u64 parent, u64 ref_root,
+			       u64 owner, u64 offset, u64 reserved, int action,
+			       struct btrfs_delayed_extent_op *extent_op)
+{
+	struct btrfs_delayed_data_ref *ref;
+	struct btrfs_delayed_ref_head *head_ref;
+	struct btrfs_delayed_ref_root *delayed_refs;
+	struct btrfs_qgroup_extent_record *record = NULL;
+
+	BUG_ON(extent_op && !extent_op->is_data);
+	ref = kmem_cache_alloc(btrfs_delayed_data_ref_cachep, GFP_NOFS);
+	if (!ref)
+		return -ENOMEM;
+
+	head_ref = kmem_cache_alloc(btrfs_delayed_ref_head_cachep, GFP_NOFS);
+	if (!head_ref) {
+		kmem_cache_free(btrfs_delayed_data_ref_cachep, ref);
+		return -ENOMEM;
+	}
+
+	if (fs_info->quota_enabled && is_fstree(ref_root)) {
+		record = kmalloc(sizeof(*record), GFP_NOFS);
+		if (!record) {
+			kmem_cache_free(btrfs_delayed_data_ref_cachep, ref);
+			kmem_cache_free(btrfs_delayed_ref_head_cachep,
+					head_ref);
+			return -ENOMEM;
+		}
+	}
+
+	head_ref->extent_op = extent_op;
+
+	delayed_refs = &trans->transaction->delayed_refs;
+	spin_lock(&delayed_refs->lock);
+
+	/*
+	 * insert both the head node and the new ref without dropping
+	 * the spin lock
+	 */
+	head_ref = add_delayed_ref_head(fs_info, trans, &head_ref->node, record,
+					bytenr, num_bytes, ref_root, reserved,
+					action, 1);
+
+	add_delayed_data_ref(fs_info, trans, head_ref, &ref->node, bytenr,
+				   num_bytes, parent, ref_root, owner, offset,
+				   action);
+	spin_unlock(&delayed_refs->lock);
+
+	return 0;
+}
+
+int btrfs_add_delayed_qgroup_reserve(struct btrfs_fs_info *fs_info,
+				     struct btrfs_trans_handle *trans,
+				     u64 ref_root, u64 bytenr, u64 num_bytes)
+{
+	struct btrfs_delayed_ref_root *delayed_refs;
+	struct btrfs_delayed_ref_head *ref_head;
+	int ret = 0;
+
+	if (!fs_info->quota_enabled || !is_fstree(ref_root))
+		return 0;
+
+	delayed_refs = &trans->transaction->delayed_refs;
+
+	spin_lock(&delayed_refs->lock);
+	ref_head = find_ref_head(&delayed_refs->href_root, bytenr, 0);
+	if (!ref_head) {
+		ret = -ENOENT;
 		goto out;
 	}
-	rev = HFC_inb(hc, R_CHIP_RV);
-	printk(KERN_INFO
-	       "HFC_multi: detected HFC with chip ID=0x%lx revision=%ld%s\n",
-	       val, rev, (rev == 0 && (hc->ctype != HFC_TYPE_XHFC)) ?
-	       " (old FIFO handling)" : "");
-	if (hc->ctype != HFC_TYPE_XHFC && rev == 0) {
-		test_and_set_bit(HFC_CHIP_REVISION0, &hc->chip);
-		printk(KERN_WARNING
-		       "HFC_multi: NOTE: Your chip is revision 0, "
-		       "ask Cologne Chip for update. Newer chips "
-		       "have a better FIFO handling. Old chips "
-		       "still work but may have slightly lower "
-		       "HDLC transmit performance.\n");
+	WARN_ON(ref_head->qgroup_reserved || ref_head->qgroup_ref_root);
+	ref_head->qgroup_ref_root = ref_root;
+	ref_head->qgroup_reserved = num_bytes;
+out:
+	spin_unlock(&delayed_refs->lock);
+	return ret;
+}
+
+int btrfs_add_delayed_extent_op(struct btrfs_fs_info *fs_info,
+				struct btrfs_trans_handle *trans,
+				u64 bytenr, u64 num_bytes,
+				struct btrfs_delayed_extent_op *extent_op)
+{
+	struct btrfs_delayed_ref_head *head_ref;
+	struct btrfs_delayed_ref_root *delayed_refs;
+
+	head_ref = kmem_cache_alloc(btrfs_delayed_ref_head_cachep, GFP_NOFS);
+	if (!head_ref)
+		return -ENOMEM;
+
+	head_ref->extent_op = extent_op;
+
+	delayed_refs = &trans->transaction->delayed_refs;
+	spin_lock(&delayed_refs->lock);
+
+	add_delayed_ref_head(fs_info, trans, &head_ref->node, NULL, bytenr,
+			     num_bytes, 0, 0, BTRFS_UPDATE_DELAYED_HEAD,
+			     extent_op->is_data);
+
+	spin_unlock(&delayed_refs->lock);
+	return 0;
+}
+
+/*
+ * this does a simple search for the head node for a given extent.
+ * It must be called with the delayed ref spinlock held, and it returns
+ * the head node if any where found, or NULL if not.
+ */
+struct btrfs_delayed_ref_head *
+btrfs_find_delayed_ref_head(struct btrfs_trans_handle *trans, u64 bytenr)
+{
+	struct btrfs_delayed_ref_root *delayed_refs;
+
+	delayed_refs = &trans->transaction->delayed_refs;
+	return find_ref_head(&delayed_refs->href_root, bytenr, 0);
+}
+
+void btrfs_delayed_ref_exit(void)
+{
+	if (btrfs_delayed_ref_head_cachep)
+		kmem_cache_destroy(btrfs_delayed_ref_head_cachep);
+	if (btrfs_delayed_tree_ref_cachep)
+		kmem_cache_destroy(btrfs_delayed_tree_ref_cachep);
+	if (btrfs_delayed_data_ref_cachep)
+		kmem_cache_destroy(btrfs_delayed_data_ref_cachep);
+	if (btrfs_delayed_extent_op_cachep)
+		kmem_cache_destroy(btrfs_delayed_extent_op_cachep);
+}
+
+int btrfs_delayed_ref_init(void)
+{
+	btrfs_delayed_ref_head_cachep = kmem_cache_create(
+				"btrfs_delayed_ref_head",
+				sizeof(struct btrfs_delayed_ref_head), 0,
+				SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD, NULL);
+	if (!btrfs_delayed_ref_head_cachep)
+		goto fail;
+
+	btrfs_delayed_tree_ref_cachep = kmem_cache_create(
+				"btrfs_delayed_tree_ref",
+				sizeof(struct btrfs_delayed_tree_ref), 0,
+				SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD, NULL);
+	if (!btrfs_delayed_tree_ref_cachep)
+		goto fail;
+
+	btrfs_delayed_data_ref_cachep = kmem_cache_create(
+				"btrfs_delayed_data_ref",
+				sizeof(struct btrfs_delayed_data_ref), 0,
+				SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD, NULL);
+	if (!btrfs_delayed_data_ref_cachep)
+		goto fail;
+
+	btrfs_delayed_extent_op_cachep = kmem_cache_create(
+				"btrfs_delayed_extent_op",
+				sizeof(struct btrfs_delayed_extent_op), 0,
+				SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD, NULL);
+	if (!btrfs_delayed_extent_op_cachep)
+		goto fail;
+
+	return 0;
+fail:
+	btrfs_delayed_ref_exit();
+	return -ENOMEM;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+ * Copyright (C) 2008 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+#ifndef __DELAYED_REF__
+#define __DELAYED_REF__
+
+/* these are the possible values of struct btrfs_delayed_ref_node->action */
+#define BTRFS_ADD_DELAYED_REF    1 /* add one backref to the tree */
+#define BTRFS_DROP_DELAYED_REF   2 /* delete one backref from the tree */
+#define BTRFS_ADD_DELAYED_EXTENT 3 /* record a full extent allocation */
+#define BTRFS_UPDATE_DELAYED_HEAD 4 /* not changing ref count on head ref */
+
+/*
+ * XXX: Qu: I really hate the design that ref_head and tree/data ref shares the
+ * same ref_node structure.
+ * Ref_head is in a higher logic level than tree/data ref, and duplicated
+ * bytenr/num_bytes in ref_node is really a waste or memory, they should be
+ * referred from ref_head.
+ * This gets more disgusting after we use list to store tree/data ref in
+ * ref_head. Must clean this mess up later.
+ */
+struct btrfs_delayed_ref_node {
+	/*
+	 * ref_head use rb tree, stored in ref_root->href.
+	 * indexed by bytenr
+	 */
+	struct rb_node rb_node;
+
+	/*data/tree ref use list, stored in ref_head->ref_list. */
+	struct list_head list;
+
+	/* the starting bytenr of the extent */
+	u64 bytenr;
+
+	/* the size of the extent */
+	u64 num_bytes;
+
+	/* seq number to keep track of insertion order */
+	u64 seq;
+
+	/* ref count on this data structure */
+	atomic_t refs;
+
+	/*
+	 * how many refs is this entry adding or deleting.  For
+	 * head refs, this may be a negative number because it is keeping
+	 * track of the total mods done to the reference count.
+	 * For individual refs, this will always be a positive number
+	 *
+	 * It may be more than one, since it is possible for a single
+	 * parent to have more than one ref on an extent
+	 */
+	int ref_mod;
+
+	unsigned int action:8;
+	unsigned int type:8;
+	/* is this node still in the rbtree? */
+	unsigned int is_head:1;
+	unsigned int in_tree:1;
+};
+
+struct btrfs_delayed_extent_op {
+	struct btrfs_disk_key key;
+	u64 flags_to_set;
+	int level;
+	unsigned int update_key:1;
+	unsigned int update_flags:1;
+	unsigned int is_data:1;
+};
+
+/*
+ * the head refs are used to hold a lock on a given extent, which allows us
+ * to make sure that only one process is running the delayed refs
+ * at a time for a single extent.  They also store the sum of all the
+ * reference count modifications we've queued up.
+ */
+struct btrfs_delayed_ref_head {
+	struct btrfs_delayed_ref_node node;
+
+	/*
+	 * the mutex is held while running the refs, and it is also
+	 * held when checking the sum of reference modifications.
+	 */
+	struct mutex mutex;
+
+	spinlock_t lock;
+	struct list_head ref_list;
+
+	struct rb_node href_node;
+
+	struct btrfs_delayed_extent_op *extent_op;
+
+	/*
+	 * This is used to track the final ref_mod from all the refs associated
+	 * with this head ref, this is not adjusted as delayed refs are run,
+	 * this is meant to track if we need to do the csum accounting or not.
+	 */
+	int total_ref_mod;
+
+	/*
+	 * For qgroup reserved space freeing.
+	 *
+	 * ref_root and reserved will be recorded after
+	 * BTRFS_ADD_DELAYED_EXTENT is called.
+	 * And will be used to free reserved qgroup space at
+	 * run_delayed_refs() time.
+	 */
+	u64 qgroup_ref_root;
+	u64 qgroup_reserved;
+
+	/*
+	 * when a new extent is allocated, it is just reserved in memory
+	 * The actual extent isn't inserted into the extent allocation tree
+	 * until the delayed ref is processed.  must_insert_reserved is
+	 * used to flag a delayed ref so the accounting can be updated
+	 * when a full insert is done.
+	 *
+	 * It is possible the extent will be freed before it is ever
+	 * inserted into the extent allocation tree.  In this case
+	 * we need to update the in ram accounting to properly reflect
+	 * the free has happened.
+	 */
+	unsigned int must_insert_reserved:1;
+	unsigned int is_data:1;
+	unsigned int processing:1;
+};
+
+struct btrfs_delayed_tree_ref {
+	struct btrfs_delayed_ref_node node;
+	u64 root;
+	u64 parent;
+	int level;
+};
+
+struct btrfs_delayed_data_ref {
+	struct btrfs_delayed_ref_node node;
+	u64 root;
+	u64 parent;
+	u64 objectid;
+	u64 offset;
+};
+
+struct btrfs_delayed_ref_root {
+	/* head ref rbtree */
+	struct rb_root href_root;
+
+	/* dirty extent records */
+	struct rb_root dirty_extent_root;
+
+	/* this spin lock protects the rbtree and the entries inside */
+	spinlock_t lock;
+
+	/* how many delayed ref updates we've queued, used by the
+	 * throttling code
+	 */
+	atomic_t num_entries;
+
+	/* total number of head nodes in tree */
+	unsigned long num_heads;
+
+	/* total number of head nodes ready for processing */
+	unsigned long num_heads_ready;
+
+	u64 pending_csums;
+
+	/*
+	 * set when the tree is flushing before a transaction commit,
+	 * used by the throttling code to decide if new updates need
+	 * to be run right away
+	 */
+	int flushing;
+
+	u64 run_delayed_start;
+
+	/*
+	 * To make qgroup to skip given root.
+	 * This is for snapshot, as btrfs_qgroup_inherit() will manully
+	 * modify counters for snapshot and its source, so we should skip
+	 * the snapshot in new_root/old_roots or it will get calculated twice
+	 */
+	u64 qgroup_to_skip;
+};
+
+extern struct kmem_cache *btrfs_delayed_ref_head_cachep;
+extern struct kmem_cache *btrfs_delayed_tree_ref_cachep;
+extern struct kmem_cache *btrfs_delayed_data_ref_cachep;
+extern struct kmem_cache *btrfs_delayed_extent_op_cachep;
+
+int btrfs_delayed_ref_init(void);
+void btrfs_delayed_ref_exit(void);
+
+static inline struct btrfs_delayed_extent_op *
+btrfs_alloc_delayed_extent_op(void)
+{
+	return kmem_cache_alloc(btrfs_delayed_extent_op_cachep, GFP_NOFS);
+}
+
+static inline void
+btrfs_free_delayed_extent_op(struct btrfs_delayed_extent_op *op)
+{
+	if (op)
+		kmem_cache_free(btrfs_delayed_extent_op_cachep, op);
+}
+
+static inline void btrfs_put_delayed_ref(struct btrfs_delayed_ref_node *ref)
+{
+	WARN_ON(atomic_read(&ref->refs) == 0);
+	if (atomic_dec_and_test(&ref->refs)) {
+		WARN_ON(ref->in_tree);
+		switch (ref->type) {
+		case BTRFS_TREE_BLOCK_REF_KEY:
+		case BTRFS_SHARED_BLOCK_REF_KEY:
+			kmem_cache_free(btrfs_delayed_tree_ref_cachep, ref);
+			break;
+		case BTRFS_EXTENT_DATA_REF_KEY:
+		case BTRFS_SHARED_DATA_REF_KEY:
+			kmem_cache_free(btrfs_delayed_data_ref_cachep, ref);
+			break;
+		case 0:
+			kmem_cache_free(btrfs_delayed_ref_head_cachep, ref);
+			break;
+		default:
+			BUG();
+		}
 	}
-	if (rev > 1) {
-		printk(KERN_WARNING "HFC_multi: WARNING: This driver doesn't "
-		       "consider chip revision = %ld. The chip / "
-		       "bridge may not work.\n", rev);
+}
+
+int btrfs_add_delayed_tree_ref(struct btrfs_fs_info *fs_info,
+			       struct btrfs_trans_handle *trans,
+			       u64 bytenr, u64 num_bytes, u64 parent,
+			       u64 ref_root, int level, int action,
+			       struct btrfs_delayed_extent_op *extent_op);
+int btrfs_add_delayed_data_ref(struct btrfs_fs_info *fs_info,
+			       struct btrfs_trans_handle *trans,
+			       u64 bytenr, u64 num_bytes,
+			       u64 parent, u64 ref_root,
+			       u64 owner, u64 offset, u64 reserved, int action,
+			       struct btrfs_delayed_extent_op *extent_op);
+int btrfs_add_delayed_qgroup_reserve(struct btrfs_fs_info *fs_info,
+				     struct btrfs_trans_handle *trans,
+				     u64 ref_root, u64 bytenr, u64 num_bytes);
+int btrfs_add_delayed_extent_op(struct btrfs_fs_info *fs_info,
+				struct btrfs_trans_handle *trans,
+				u64 bytenr, u64 num_bytes,
+				struct btrfs_delayed_extent_op *extent_op);
+void btrfs_merge_delayed_refs(struct btrfs_trans_handle *trans,
+			      struct btrfs_fs_info *fs_info,
+			      struct btrfs_delayed_ref_root *delayed_refs,
+			      struct btrfs_delayed_ref_head *head);
+
+struct btrfs_delayed_ref_head *
+btrfs_find_delayed_ref_head(struct btrfs_trans_handle *trans, u64 bytenr);
+int btrfs_delayed_ref_lock(struct btrfs_trans_handle *trans,
+			   struct btrfs_delayed_ref_head *head);
+static inline void btrfs_delayed_ref_unlock(struct btrfs_delayed_ref_head *head)
+{
+	mutex_unlock(&head->mutex);
+}
+
+
+struct btrfs_delayed_ref_head *
+btrfs_select_ref_head(struct btrfs_trans_handle *trans);
+
+int btrfs_check_delayed_seq(struct btrfs_fs_info *fs_info,
+			    struct btrfs_delayed_ref_root *delayed_refs,
+			    u64 seq);
+
+/*
+ * a node might live in a head or a regular ref, this lets you
+ * test for the proper type to use.
+ */
+static int btrfs_delayed_ref_is_head(struct btrfs_delayed_ref_node *node)
+{
+	return node->is_head;
+}
+
+/*
+ * helper functions to cast a node into its container
+ */
+static inline struct btrfs_delayed_tree_ref *
+btrfs_delayed_node_to_tree_ref(struct btrfs_delayed_ref_node *node)
+{
+	WARN_ON(btrfs_delayed_ref_is_head(node));
+	return container_of(node, struct btrfs_delayed_tree_ref, node);
+}
+
+static inline struct btrfs_delayed_data_ref *
+btrfs_delayed_node_to_data_ref(struct btrfs_delayed_ref_node *node)
+{
+	WARN_ON(btrfs_delayed_ref_is_head(node));
+	return container_of(node, struct btrfs_delayed_data_ref, node);
+}
+
+static inline struct btrfs_delayed_ref_head *
+btrfs_delayed_node_to_head(struct btrfs_delayed_ref_node *node)
+{
+	WARN_ON(!btrfs_delayed_ref_is_head(node));
+	return container_of(node, struct btrfs_delayed_ref_head, node);
+}
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Copyright (C) STRATO AG 2012.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+#include <linux/sched.h>
+#include <linux/bio.h>
+#include <linux/slab.h>
+#include <linux/buffer_head.h>
+#include <linux/blkdev.h>
+#include <linux/random.h>
+#include <linux/iocontext.h>
+#include <linux/capability.h>
+#include <linux/kthread.h>
+#include <linux/math64.h>
+#include <asm/div64.h>
+#include "ctree.h"
+#include "extent_map.h"
+#include "disk-io.h"
+#include "transaction.h"
+#include "print-tree.h"
+#include "volumes.h"
+#include "async-thread.h"
+#include "check-integrity.h"
+#include "rcu-string.h"
+#include "dev-replace.h"
+#include "sysfs.h"
+
+static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
+				       int scrub_ret);
+static void btrfs_dev_replace_update_device_in_mapping_tree(
+						struct btrfs_fs_info *fs_info,
+						struct btrfs_device *srcdev,
+						struct btrfs_device *tgtdev);
+static int btrfs_dev_replace_find_srcdev(struct btrfs_root *root, u64 srcdevid,
+					 char *srcdev_name,
+					 struct btrfs_device **device);
+static u64 __btrfs_dev_replace_cancel(struct btrfs_fs_info *fs_info);
+static int btrfs_dev_replace_kthread(void *data);
+static int btrfs_dev_replace_continue_on_mount(struct btrfs_fs_info *fs_info);
+
+
+int btrfs_init_dev_replace(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_key key;
+	struct btrfs_root *dev_root = fs_info->dev_root;
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	struct extent_buffer *eb;
+	int slot;
+	int ret = 0;
+	struct btrfs_path *path = NULL;
+	int item_size;
+	struct btrfs_dev_replace_item *ptr;
+	u64 src_devid;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto out;
 	}
 
-	/* set s-ram size */
-	hc->Flen = 0x10;
-	hc->Zmin = 0x80;
-	hc->Zlen = 384;
-	hc->DTMFbase = 0x1000;
-	if (test_bit(HFC_CHIP_EXRAM_128, &hc->chip)) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: changing to 128K external RAM\n",
-			       __func__);
-		hc->hw.r_ctrl |= V_EXT_RAM;
-		hc->hw.r_ram_sz = 1;
-		hc->Flen = 0x20;
-		hc->Zmin = 0xc0;
-		hc->Zlen = 1856;
-		hc->DTMFbase = 0x2000;
+	key.objectid = 0;
+	key.type = BTRFS_DEV_REPLACE_KEY;
+	key.offset = 0;
+	ret = btrfs_search_slot(NULL, dev_root, &key, path, 0, 0);
+	if (ret) {
+no_valid_dev_replace_entry_found:
+		ret = 0;
+		dev_replace->replace_state =
+			BTRFS_DEV_REPLACE_ITEM_STATE_NEVER_STARTED;
+		dev_replace->cont_reading_from_srcdev_mode =
+		    BTRFS_DEV_REPLACE_ITEM_CONT_READING_FROM_SRCDEV_MODE_ALWAYS;
+		dev_replace->replace_state = 0;
+		dev_replace->time_started = 0;
+		dev_replace->time_stopped = 0;
+		atomic64_set(&dev_replace->num_write_errors, 0);
+		atomic64_set(&dev_replace->num_uncorrectable_read_errors, 0);
+		dev_replace->cursor_left = 0;
+		dev_replace->committed_cursor_left = 0;
+		dev_replace->cursor_left_last_write_of_item = 0;
+		dev_replace->cursor_right = 0;
+		dev_replace->srcdev = NULL;
+		dev_replace->tgtdev = NULL;
+		dev_replace->is_valid = 0;
+		dev_replace->item_needs_writeback = 0;
+		goto out;
 	}
-	if (test_bit(HFC_CHIP_EXRAM_512, &hc->chip)) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: changing to 512K external RAM\n",
-			       __func__);
-		hc->hw.r_ctrl |= V_EXT_RAM;
-		hc->hw.r_ram_sz = 2;
-		hc->Flen = 0x20;
-		hc->Zmin = 0xc0;
-		hc->Zlen = 8000;
-		hc->DTMFbase = 0x2000;
-	}
-	if (hc->ctype == HFC_TYPE_XHFC) {
-		hc->Flen = 0x8;
-		hc->Zmin = 0x0;
-		hc->Zlen = 64;
-		hc->DTMFbase = 0x0;
-	}
-	hc->max_trans = poll << 1;
-	if (hc->max_trans > hc->Zlen)
-		hc->max_trans = hc->Zlen;
+	slot = path->slots[0];
+	eb = path->nodes[0];
+	item_size = btrfs_item_size_nr(eb, slot);
+	ptr = btrfs_item_ptr(eb, slot, struct btrfs_dev_replace_item);
 
-	/* Speech Design PLX bridge */
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-		if (debug & DEBUG_HFCMULTI_PLXSD)
-			printk(KERN_DEBUG "%s: initializing PLXSD card %d\n",
-			       __func__, hc->id + 1);
-		spin_lock_irqsave(&plx_lock, plx_flags);
-		plx_acc_32 = hc->plx_membase + PLX_GPIOC;
-		writel(PLX_GPIOC_INIT, plx_acc_32);
-		pv = readl(plx_acc_32);
-		/* The first and the last cards are terminating the PCM bus */
-		pv |= PLX_TERM_ON; /* hc is currently the last */
-		/* Disconnect the PCM */
-		pv |= PLX_SLAVE_EN_N;
-		pv &= ~PLX_MASTER_EN;
-		pv &= ~PLX_SYNC_O_EN;
-		/* Put the DSP in Reset */
-		pv &= ~PLX_DSP_RES_N;
-		writel(pv, plx_acc_32);
-		spin_unlock_irqrestore(&plx_lock, plx_flags);
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: slave/term: PLX_GPIO=%x\n",
-			       __func__, pv);
+	if (item_size != sizeof(struct btrfs_dev_replace_item)) {
+		btrfs_warn(fs_info,
+			"dev_replace entry found has unexpected size, ignore entry");
+		goto no_valid_dev_replace_entry_found;
+	}
+
+	src_devid = btrfs_dev_replace_src_devid(eb, ptr);
+	dev_replace->cont_reading_from_srcdev_mode =
+		btrfs_dev_replace_cont_reading_from_srcdev_mode(eb, ptr);
+	dev_replace->replace_state = btrfs_dev_replace_replace_state(eb, ptr);
+	dev_replace->time_started = btrfs_dev_replace_time_started(eb, ptr);
+	dev_replace->time_stopped =
+		btrfs_dev_replace_time_stopped(eb, ptr);
+	atomic64_set(&dev_replace->num_write_errors,
+		     btrfs_dev_replace_num_write_errors(eb, ptr));
+	atomic64_set(&dev_replace->num_uncorrectable_read_errors,
+		     btrfs_dev_replace_num_uncorrectable_read_errors(eb, ptr));
+	dev_replace->cursor_left = btrfs_dev_replace_cursor_left(eb, ptr);
+	dev_replace->committed_cursor_left = dev_replace->cursor_left;
+	dev_replace->cursor_left_last_write_of_item = dev_replace->cursor_left;
+	dev_replace->cursor_right = btrfs_dev_replace_cursor_right(eb, ptr);
+	dev_replace->is_valid = 1;
+
+	dev_replace->item_needs_writeback = 0;
+	switch (dev_replace->replace_state) {
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED:
+		dev_replace->srcdev = NULL;
+		dev_replace->tgtdev = NULL;
+		break;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED:
+		dev_replace->srcdev = btrfs_find_device(fs_info, src_devid,
+							NULL, NULL);
+		dev_replace->tgtdev = btrfs_find_device(fs_info,
+							BTRFS_DEV_REPLACE_DEVID,
+							NULL, NULL);
 		/*
-		 * If we are the 3rd PLXSD card or higher, we must turn
-		 * termination of last PLXSD card off.
+		 * allow 'btrfs dev replace_cancel' if src/tgt device is
+		 * missing
 		 */
-		spin_lock_irqsave(&HFClock, hfc_flags);
-		plx_count = 0;
-		plx_last_hc = NULL;
-		list_for_each_entry_safe(pos, next, &HFClist, list) {
-			if (test_bit(HFC_CHIP_PLXSD, &pos->chip)) {
-				plx_count++;
-				if (pos != hc)
-					plx_last_hc = pos;
+		if (!dev_replace->srcdev &&
+		    !btrfs_test_opt(dev_root, DEGRADED)) {
+			ret = -EIO;
+			btrfs_warn(fs_info,
+			   "cannot mount because device replace operation is ongoing and");
+			btrfs_warn(fs_info,
+			   "srcdev (devid %llu) is missing, need to run 'btrfs dev scan'?",
+			   src_devid);
+		}
+		if (!dev_replace->tgtdev &&
+		    !btrfs_test_opt(dev_root, DEGRADED)) {
+			ret = -EIO;
+			btrfs_warn(fs_info,
+			   "cannot mount because device replace operation is ongoing and");
+			btrfs_warn(fs_info,
+			   "tgtdev (devid %llu) is missing, need to run 'btrfs dev scan'?",
+				BTRFS_DEV_REPLACE_DEVID);
+		}
+		if (dev_replace->tgtdev) {
+			if (dev_replace->srcdev) {
+				dev_replace->tgtdev->total_bytes =
+					dev_replace->srcdev->total_bytes;
+				dev_replace->tgtdev->disk_total_bytes =
+					dev_replace->srcdev->disk_total_bytes;
+				dev_replace->tgtdev->commit_total_bytes =
+					dev_replace->srcdev->commit_total_bytes;
+				dev_replace->tgtdev->bytes_used =
+					dev_replace->srcdev->bytes_used;
+				dev_replace->tgtdev->commit_bytes_used =
+					dev_replace->srcdev->commit_bytes_used;
 			}
+			dev_replace->tgtdev->is_tgtdev_for_dev_replace = 1;
+			btrfs_init_dev_replace_tgtdev_for_resume(fs_info,
+				dev_replace->tgtdev);
 		}
-		if (plx_count >= 3) {
-			if (debug & DEBUG_HFCMULTI_PLXSD)
-				printk(KERN_DEBUG "%s: card %d is between, so "
-				       "we disable termination\n",
-				       __func__, plx_last_hc->id + 1);
-			spin_lock_irqsave(&plx_lock, plx_flags);
-			plx_acc_32 = plx_last_hc->plx_membase + PLX_GPIOC;
-			pv = readl(plx_acc_32);
-			pv &= ~PLX_TERM_ON;
-			writel(pv, plx_acc_32);
-			spin_unlock_irqrestore(&plx_lock, plx_flags);
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG
-				       "%s: term off: PLX_GPIO=%x\n",
-				       __func__, pv);
-		}
-		spin_unlock_irqrestore(&HFClock, hfc_flags);
-		hc->hw.r_pcm_md0 = V_F0_LEN; /* shift clock for DSP */
+		break;
 	}
 
-	if (test_bit(HFC_CHIP_EMBSD, &hc->chip))
-		hc->hw.r_pcm_md0 = V_F0_LEN; /* shift clock for DSP */
+out:
+	btrfs_free_path(path);
+	return ret;
+}
 
-	/* we only want the real Z2 read-pointer for revision > 0 */
-	if (!test_bit(HFC_CHIP_REVISION0, &hc->chip))
-		hc->hw.r_ram_sz |= V_FZ_MD;
+/*
+ * called from commit_transaction. Writes changed device replace state to
+ * disk.
+ */
+int btrfs_run_dev_replace(struct btrfs_trans_handle *trans,
+			  struct btrfs_fs_info *fs_info)
+{
+	int ret;
+	struct btrfs_root *dev_root = fs_info->dev_root;
+	struct btrfs_path *path;
+	struct btrfs_key key;
+	struct extent_buffer *eb;
+	struct btrfs_dev_replace_item *ptr;
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
 
-	/* select pcm mode */
-	if (test_bit(HFC_CHIP_PCM_SLAVE, &hc->chip)) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: setting PCM into slave mode\n",
-			       __func__);
-	} else
-		if (test_bit(HFC_CHIP_PCM_MASTER, &hc->chip) && !plxsd_master) {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG "%s: setting PCM into master mode\n",
-				       __func__);
-			hc->hw.r_pcm_md0 |= V_PCM_MD;
-		} else {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG "%s: performing PCM auto detect\n",
-				       __func__);
-		}
+	btrfs_dev_replace_lock(dev_replace);
+	if (!dev_replace->is_valid ||
+	    !dev_replace->item_needs_writeback) {
+		btrfs_dev_replace_unlock(dev_replace);
+		return 0;
+	}
+	btrfs_dev_replace_unlock(dev_replace);
 
-	/* soft reset */
-	HFC_outb(hc, R_CTRL, hc->hw.r_ctrl);
-	if (hc->ctype == HFC_TYPE_XHFC)
-		HFC_outb(hc, 0x0C /* R_FIFO_THRES */,
-			 0x11 /* 16 Bytes TX/RX */);
-	else
-		HFC_outb(hc, R_RAM_SZ, hc->hw.r_ram_sz);
-	HFC_outb(hc, R_FIFO_MD, 0);
-	if (hc->ctype == HFC_TYPE_XHFC)
-		hc->hw.r_cirm = V_SRES | V_HFCRES | V_PCMRES | V_STRES;
-	else
-		hc->hw.r_cirm = V_SRES | V_HFCRES | V_PCMRES | V_STRES
-			| V_RLD_EPR;
-	HFC_outb(hc, R_CIRM, hc->hw.r_cirm);
-	udelay(100);
-	hc->hw.r_cirm = 0;
-	HFC_outb(hc, R_CIRM, hc->hw.r_cirm);
-	udelay(100);
-	if (hc->ctype != HFC_TYPE_XHFC)
-		HFC_outb(hc, R_RAM_SZ, hc->hw.r_ram_sz);
+	key.objectid = 0;
+	key.type = BTRFS_DEV_REPLACE_KEY;
+	key.offset = 0;
 
-	/* Speech Design PLX bridge pcm and sync mode */
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-		spin_lock_irqsave(&plx_lock, plx_flags);
-		plx_acc_32 = hc->plx_membase + PLX_GPIOC;
-		pv = readl(plx_acc_32);
-		/* Connect PCM */
-		if (hc->hw.r_pcm_md0 & V_PCM_MD) {
-			pv |= PLX_MASTER_EN | PLX_SLAVE_EN_N;
-			pv |= PLX_SYNC_O_EN;
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG "%s: master: PLX_GPIO=%x\n",
-				       __func__, pv);
-		} else {
-			pv &= ~(PLX_MASTER_EN | PLX_SLAVE_EN_N);
-			pv &= ~PLX_SYNC_O_EN;
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG "%s: slave: PLX_GPIO=%x\n",
-				       __func__, pv);
-		}
-		writel(pv, plx_acc_32);
-		spin_unlock_irqrestore(&plx_lock, plx_flags);
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	ret = btrfs_search_slot(trans, dev_root, &key, path, -1, 1);
+	if (ret < 0) {
+		btrfs_warn(fs_info, "error %d while searching for dev_replace item!",
+			ret);
+		goto out;
 	}
 
-	/* PCM setup */
-	HFC_outb(hc, R_PCM_MD0, hc->hw.r_pcm_md0 | 0x90);
-	if (hc->slots == 32)
-		HFC_outb(hc, R_PCM_MD1, 0x00);
-	if (hc->slots == 64)
-		HFC_outb(hc, R_PCM_MD1, 0x10);
-	if (hc->slots == 128)
-		HFC_outb(hc, R_PCM_MD1, 0x20);
-	HFC_outb(hc, R_PCM_MD0, hc->hw.r_pcm_md0 | 0xa0);
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip))
-		HFC_outb(hc, R_PCM_MD2, V_SYNC_SRC); /* sync via SYNC_I / O */
-	else if (test_bit(HFC_CHIP_EMBSD, &hc->chip))
-		HFC_outb(hc, R_PCM_MD2, 0x10); /* V_C2O_EN */
-	else
-		HFC_outb(hc, R_PCM_MD2, 0x00); /* sync from interface */
-	HFC_outb(hc, R_PCM_MD0, hc->hw.r_pcm_md0 | 0x00);
-	for (i = 0; i < 256; i++) {
-		HFC_outb_nodebug(hc, R_SLOT, i);
-		HFC_outb_nodebug(hc, A_SL_CFG, 0);
-		if (hc->ctype != HFC_TYPE_XHFC)
-			HFC_outb_nodebug(hc, A_CONF, 0);
-		hc->slot_owner[i] = -1;
-	}
-
-	/* set clock speed */
-	if (test_bit(HFC_CHIP_CLOCK2, &hc->chip)) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG
-			       "%s: setting double clock\n", __func__);
-		HFC_outb(hc, R_BRG_PCM_CFG, V_PCM_CLK);
-	}
-
-	if (test_bit(HFC_CHIP_EMBSD, &hc->chip))
-		HFC_outb(hc, 0x02 /* R_CLK_CFG */, 0x40 /* V_CLKO_OFF */);
-
-	/* B410P GPIO */
-	if (test_bit(HFC_CHIP_B410P, &hc->chip)) {
-		printk(KERN_NOTICE "Setting GPIOs\n");
-		HFC_outb(hc, R_GPIO_SEL, 0x30);
-		HFC_outb(hc, R_GPIO_EN1, 0x3);
-		udelay(1000);
-		printk(KERN_NOTICE "calling vpm_init\n");
-		vpm_init(hc);
-	}
-
-	/* check if R_F0_CNT counts (8 kHz frame count) */
-	val = HFC_inb(hc, R_F0_CNTL);
-	val += HFC_inb(hc, R_F0_CNTH) << 8;
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG
-		       "HFC_multi F0_CNT %ld after reset\n", val);
-	spin_unlock_irqrestore(&hc->lock, flags);
-	set_current_state(TASK_UNINTERRUPTIBLE);
-	schedule_timeout((HZ / 100) ? : 1); /* Timeout minimum 10ms */
-	spin_lock_irqsave(&hc->lock, flags);
-	val2 = HFC_inb(hc, R_F0_CNTL);
-	val2 += HFC_inb(hc, R_F0_CNTH) << 8;
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG
-		       "HFC_multi F0_CNT %ld after 10 ms (1st try)\n",
-		       val2);
-	if (val2 >= val + 8) { /* 1 ms */
-		/* it counts, so we keep the pcm mode */
-		if (test_bit(HFC_CHIP_PCM_MASTER, &hc->chip))
-			printk(KERN_INFO "controller is PCM bus MASTER\n");
-		else
-			if (test_bit(HFC_CHIP_PCM_SLAVE, &hc->chip))
-				printk(KERN_INFO "controller is PCM bus SLAVE\n");
-			else {
-				test_and_set_bit(HFC_CHIP_PCM_SLAVE, &hc->chip);
-				printk(KERN_INFO "controller is PCM bus SLAVE "
-				       "(auto detected)\n");
-			}
-	} else {
-		/* does not count */
-		if (test_bit(HFC_CHIP_PCM_MASTER, &hc->chip)) {
-		controller_fail:
-			printk(KERN_ERR "HFC_multi ERROR, getting no 125us "
-			       "pulse. Seems that controller fails.\n");
-			err = -EIO;
+	if (ret == 0 &&
+	    btrfs_item_size_nr(path->nodes[0], path->slots[0]) < sizeof(*ptr)) {
+		/*
+		 * need to delete old one and insert a new one.
+		 * Since no attempt is made to recover any old state, if the
+		 * dev_replace state is 'running', the data on the target
+		 * drive is lost.
+		 * It would be possible to recover the state: just make sure
+		 * that the beginning of the item is never changed and always
+		 * contains all the essential information. Then read this
+		 * minimal set of information and use it as a base for the
+		 * new state.
+		 */
+		ret = btrfs_del_item(trans, dev_root, path);
+		if (ret != 0) {
+			btrfs_warn(fs_info, "delete too small dev_replace item failed %d!",
+				ret);
 			goto out;
 		}
-		if (test_bit(HFC_CHIP_PCM_SLAVE, &hc->chip)) {
-			printk(KERN_INFO "controller is PCM bus SLAVE "
-			       "(ignoring missing PCM clock)\n");
-		} else {
-			/* only one pcm master */
-			if (test_bit(HFC_CHIP_PLXSD, &hc->chip)
-			    && plxsd_master) {
-				printk(KERN_ERR "HFC_multi ERROR, no clock "
-				       "on another Speech Design card found. "
-				       "Please be sure to connect PCM cable.\n");
-				err = -EIO;
-				goto out;
-			}
-			/* retry with master clock */
-			if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-				spin_lock_irqsave(&plx_lock, plx_flags);
-				plx_acc_32 = hc->plx_membase + PLX_GPIOC;
-				pv = readl(plx_acc_32);
-				pv |= PLX_MASTER_EN | PLX_SLAVE_EN_N;
-				pv |= PLX_SYNC_O_EN;
-				writel(pv, plx_acc_32);
-				spin_unlock_irqrestore(&plx_lock, plx_flags);
-				if (debug & DEBUG_HFCMULTI_INIT)
-					printk(KERN_DEBUG "%s: master: "
-					       "PLX_GPIO=%x\n", __func__, pv);
-			}
-			hc->hw.r_pcm_md0 |= V_PCM_MD;
-			HFC_outb(hc, R_PCM_MD0, hc->hw.r_pcm_md0 | 0x00);
-			spin_unlock_irqrestore(&hc->lock, flags);
-			set_current_state(TASK_UNINTERRUPTIBLE);
-			schedule_timeout((HZ / 100) ?: 1); /* Timeout min. 10ms */
-			spin_lock_irqsave(&hc->lock, flags);
-			val2 = HFC_inb(hc, R_F0_CNTL);
-			val2 += HFC_inb(hc, R_F0_CNTH) << 8;
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG "HFC_multi F0_CNT %ld after "
-				       "10 ms (2nd try)\n", val2);
-			if (val2 >= val + 8) { /* 1 ms */
-				test_and_set_bit(HFC_CHIP_PCM_MASTER,
-						 &hc->chip);
-				printk(KERN_INFO "controller is PCM bus MASTER "
-				       "(auto detected)\n");
-			} else
-				goto controller_fail;
+		ret = 1;
+	}
+
+	if (ret == 1) {
+		/* need to insert a new item */
+		btrfs_release_path(path);
+		ret = btrfs_insert_empty_item(trans, dev_root, path,
+					      &key, sizeof(*ptr));
+		if (ret < 0) {
+			btrfs_warn(fs_info, "insert dev_replace item failed %d!",
+				ret);
+			goto out;
 		}
 	}
 
-	/* Release the DSP Reset */
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-		if (test_bit(HFC_CHIP_PCM_MASTER, &hc->chip))
-			plxsd_master = 1;
-		spin_lock_irqsave(&plx_lock, plx_flags);
-		plx_acc_32 = hc->plx_membase + PLX_GPIOC;
-		pv = readl(plx_acc_32);
-		pv |=  PLX_DSP_RES_N;
-		writel(pv, plx_acc_32);
-		spin_unlock_irqrestore(&plx_lock, plx_flags);
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: reset off: PLX_GPIO=%x\n",
-			       __func__, pv);
-	}
+	eb = path->nodes[0];
+	ptr = btrfs_item_ptr(eb, path->slots[0],
+			     struct btrfs_dev_replace_item);
 
-	/* pcm id */
-	if (hc->pcm)
-		printk(KERN_INFO "controller has given PCM BUS ID %d\n",
-		       hc->pcm);
-	else {
-		if (test_bit(HFC_CHIP_PCM_MASTER, &hc->chip)
-		    || test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-			PCM_cnt++; /* SD has proprietary bridging */
-		}
-		hc->pcm = PCM_cnt;
-		printk(KERN_INFO "controller has PCM BUS ID %d "
-		       "(auto selected)\n", hc->pcm);
-	}
-
-	/* set up timer */
-	HFC_outb(hc, R_TI_WD, poll_timer);
-	hc->hw.r_irqmsk_misc |= V_TI_IRQMSK;
-
-	/* set E1 state machine IRQ */
-	if (hc->ctype == HFC_TYPE_E1)
-		hc->hw.r_irqmsk_misc |= V_STA_IRQMSK;
-
-	/* set DTMF detection */
-	if (test_bit(HFC_CHIP_DTMF, &hc->chip)) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: enabling DTMF detection "
-			       "for all B-channel\n", __func__);
-		hc->hw.r_dtmf = V_DTMF_EN | V_DTMF_STOP;
-		if (test_bit(HFC_CHIP_ULAW, &hc->chip))
-			hc->hw.r_dtmf |= V_ULAW_SEL;
-		HFC_outb(hc, R_DTMF_N, 102 - 1);
-		hc->hw.r_irqmsk_misc |= V_DTMF_IRQMSK;
-	}
-
-	/* conference engine */
-	if (test_bit(HFC_CHIP_ULAW, &hc->chip))
-		r_conf_en = V_CONF_EN | V_ULAW;
+	btrfs_dev_replace_lock(dev_replace);
+	if (dev_replace->srcdev)
+		btrfs_set_dev_replace_src_devid(eb, ptr,
+			dev_replace->srcdev->devid);
 	else
-		r_conf_en = V_CONF_EN;
-	if (hc->ctype != HFC_TYPE_XHFC)
-		HFC_outb(hc, R_CONF_EN, r_conf_en);
+		btrfs_set_dev_replace_src_devid(eb, ptr, (u64)-1);
+	btrfs_set_dev_replace_cont_reading_from_srcdev_mode(eb, ptr,
+		dev_replace->cont_reading_from_srcdev_mode);
+	btrfs_set_dev_replace_replace_state(eb, ptr,
+		dev_replace->replace_state);
+	btrfs_set_dev_replace_time_started(eb, ptr, dev_replace->time_started);
+	btrfs_set_dev_replace_time_stopped(eb, ptr, dev_replace->time_stopped);
+	btrfs_set_dev_replace_num_write_errors(eb, ptr,
+		atomic64_read(&dev_replace->num_write_errors));
+	btrfs_set_dev_replace_num_uncorrectable_read_errors(eb, ptr,
+		atomic64_read(&dev_replace->num_uncorrectable_read_errors));
+	dev_replace->cursor_left_last_write_of_item =
+		dev_replace->cursor_left;
+	btrfs_set_dev_replace_cursor_left(eb, ptr,
+		dev_replace->cursor_left_last_write_of_item);
+	btrfs_set_dev_replace_cursor_right(eb, ptr,
+		dev_replace->cursor_right);
+	dev_replace->item_needs_writeback = 0;
+	btrfs_dev_replace_unlock(dev_replace);
 
-	/* setting leds */
-	switch (hc->leds) {
-	case 1: /* HFC-E1 OEM */
-		if (test_bit(HFC_CHIP_WATCHDOG, &hc->chip))
-			HFC_outb(hc, R_GPIO_SEL, 0x32);
-		else
-			HFC_outb(hc, R_GPIO_SEL, 0x30);
+	btrfs_mark_buffer_dirty(eb);
 
-		HFC_outb(hc, R_GPIO_EN1, 0x0f);
-		HFC_outb(hc, R_GPIO_OUT1, 0x00);
+out:
+	btrfs_free_path(path);
 
-		HFC_outb(hc, R_GPIO_EN0, V_GPIO_EN2 | V_GPIO_EN3);
+	return ret;
+}
+
+void btrfs_after_dev_replace_commit(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+
+	dev_replace->committed_cursor_left =
+		dev_replace->cursor_left_last_write_of_item;
+}
+
+int btrfs_dev_replace_start(struct btrfs_root *root,
+			    struct btrfs_ioctl_dev_replace_args *args)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	int ret;
+	struct btrfs_device *tgt_device = NULL;
+	struct btrfs_device *src_device = NULL;
+
+	switch (args->start.cont_reading_from_srcdev_mode) {
+	case BTRFS_IOCTL_DEV_REPLACE_CONT_READING_FROM_SRCDEV_MODE_ALWAYS:
+	case BTRFS_IOCTL_DEV_REPLACE_CONT_READING_FROM_SRCDEV_MODE_AVOID:
 		break;
+	default:
+		return -EINVAL;
+	}
 
-	case 2: /* HFC-4S OEM */
-	case 3:
-		HFC_outb(hc, R_GPIO_SEL, 0xf0);
-		HFC_outb(hc, R_GPIO_EN1, 0xff);
-		HFC_outb(hc, R_GPIO_OUT1, 0x00);
+	if ((args->start.srcdevid == 0 && args->start.srcdev_name[0] == '\0') ||
+	    args->start.tgtdev_name[0] == '\0')
+		return -EINVAL;
+
+	/* the disk copy procedure reuses the scrub code */
+	mutex_lock(&fs_info->volume_mutex);
+	ret = btrfs_dev_replace_find_srcdev(root, args->start.srcdevid,
+					    args->start.srcdev_name,
+					    &src_device);
+	if (ret) {
+		mutex_unlock(&fs_info->volume_mutex);
+		return ret;
+	}
+
+	ret = btrfs_init_dev_replace_tgtdev(root, args->start.tgtdev_name,
+					    src_device, &tgt_device);
+	mutex_unlock(&fs_info->volume_mutex);
+	if (ret)
+		return ret;
+
+	/*
+	 * Here we commit the transaction to make sure commit_total_bytes
+	 * of all the devices are updated.
+	 */
+	trans = btrfs_attach_transaction(root);
+	if (!IS_ERR(trans)) {
+		ret = btrfs_commit_transaction(trans, root);
+		if (ret)
+			return ret;
+	} else if (PTR_ERR(trans) != -ENOENT) {
+		return PTR_ERR(trans);
+	}
+
+	btrfs_dev_replace_lock(dev_replace);
+	switch (dev_replace->replace_state) {
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED:
 		break;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED:
+		args->result = BTRFS_IOCTL_DEV_REPLACE_RESULT_ALREADY_STARTED;
+		goto leave;
 	}
 
-	if (test_bit(HFC_CHIP_EMBSD, &hc->chip)) {
-		hc->hw.r_st_sync = 0x10; /* V_AUTO_SYNCI */
-		HFC_outb(hc, R_ST_SYNC, hc->hw.r_st_sync);
+	dev_replace->cont_reading_from_srcdev_mode =
+		args->start.cont_reading_from_srcdev_mode;
+	WARN_ON(!src_device);
+	dev_replace->srcdev = src_device;
+	WARN_ON(!tgt_device);
+	dev_replace->tgtdev = tgt_device;
+
+	btrfs_info_in_rcu(root->fs_info,
+		      "dev_replace from %s (devid %llu) to %s started",
+		      src_device->missing ? "<missing disk>" :
+		        rcu_str_deref(src_device->name),
+		      src_device->devid,
+		      rcu_str_deref(tgt_device->name));
+
+	/*
+	 * from now on, the writes to the srcdev are all duplicated to
+	 * go to the tgtdev as well (refer to btrfs_map_block()).
+	 */
+	dev_replace->replace_state = BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED;
+	dev_replace->time_started = get_seconds();
+	dev_replace->cursor_left = 0;
+	dev_replace->committed_cursor_left = 0;
+	dev_replace->cursor_left_last_write_of_item = 0;
+	dev_replace->cursor_right = 0;
+	dev_replace->is_valid = 1;
+	dev_replace->item_needs_writeback = 1;
+	args->result = BTRFS_IOCTL_DEV_REPLACE_RESULT_NO_ERROR;
+	btrfs_dev_replace_unlock(dev_replace);
+
+	ret = btrfs_sysfs_add_device_link(tgt_device->fs_devices, tgt_device);
+	if (ret)
+		btrfs_err(root->fs_info, "kobj add dev failed %d\n", ret);
+
+	btrfs_wait_ordered_roots(root->fs_info, -1);
+
+	/* force writing the updated state information to disk */
+	trans = btrfs_start_transaction(root, 0);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		btrfs_dev_replace_lock(dev_replace);
+		goto leave;
 	}
 
-	/* set master clock */
-	if (hc->masterclk >= 0) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: setting ST master clock "
-			       "to port %d (0..%d)\n",
-			       __func__, hc->masterclk, hc->ports - 1);
-		hc->hw.r_st_sync |= (hc->masterclk | V_AUTO_SYNC);
-		HFC_outb(hc, R_ST_SYNC, hc->hw.r_st_sync);
+	ret = btrfs_commit_transaction(trans, root);
+	WARN_ON(ret);
+
+	/* the disk copy procedure reuses the scrub code */
+	ret = btrfs_scrub_dev(fs_info, src_device->devid, 0,
+			      btrfs_device_get_total_bytes(src_device),
+			      &dev_replace->scrub_progress, 0, 1);
+
+	ret = btrfs_dev_replace_finishing(root->fs_info, ret);
+	/* don't warn if EINPROGRESS, someone else might be running scrub */
+	if (ret == -EINPROGRESS) {
+		args->result = BTRFS_IOCTL_DEV_REPLACE_RESULT_SCRUB_INPROGRESS;
+		ret = 0;
+	} else {
+		WARN_ON(ret);
 	}
 
+	return ret;
 
+leave:
+	dev_replace->srcdev = NULL;
+	dev_replace->tgtdev = NULL;
+	btrfs_dev_replace_unlock(dev_replace);
+	btrfs_destroy_dev_replace_tgtdev(fs_info, tgt_device);
+	return ret;
+}
 
-	/* setting misc irq */
-	HFC_outb(hc, R_IRQMSK_MISC, hc->hw.r_irqmsk_misc);
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "r_irqmsk_misc.2: 0x%x\n",
-		       hc->hw.r_irqmsk_misc);
+/*
+ * blocked until all flighting bios are finished.
+ */
+static void btrfs_rm_dev_replace_blocked(struct btrfs_fs_info *fs_info)
+{
+	set_bit(BTRFS_FS_STATE_DEV_REPLACING, &fs_info->fs_state);
+	wait_event(fs_info->replace_wait, !percpu_counter_sum(
+		   &fs_info->bio_counter));
+}
 
-	/* RAM access test */
-	HFC_outb(hc, R_RAM_ADDR0, 0);
-	HFC_outb(hc, R_RAM_ADDR1, 0);
-	HFC_outb(hc, R_RAM_ADDR2, 0);
-	for (i = 0; i < 256; i++) {
-		HFC_outb_nodebug(hc, R_RAM_ADDR0, i);
-		HFC_outb_nodebug(hc, R_RAM_DATA, ((i * 3) & 0xff));
+/*
+ * we have removed target device, it is safe to allow new bios request.
+ */
+static void btrfs_rm_dev_replace_unblocked(struct btrfs_fs_info *fs_info)
+{
+	clear_bit(BTRFS_FS_STATE_DEV_REPLACING, &fs_info->fs_state);
+	wake_up(&fs_info->replace_wait);
+}
+
+static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
+				       int scrub_ret)
+{
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	struct btrfs_device *tgt_device;
+	struct btrfs_device *src_device;
+	struct btrfs_root *root = fs_info->tree_root;
+	u8 uuid_tmp[BTRFS_UUID_SIZE];
+	struct btrfs_trans_handle *trans;
+	int ret = 0;
+
+	/* don't allow cancel or unmount to disturb the finishing procedure */
+	mutex_lock(&dev_replace->lock_finishing_cancel_unmount);
+
+	btrfs_dev_replace_lock(dev_replace);
+	/* was the operation canceled, or is it finished? */
+	if (dev_replace->replace_state !=
+	    BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED) {
+		btrfs_dev_replace_unlock(dev_replace);
+		mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+		return 0;
 	}
-	for (i = 0; i < 256; i++) {
-		HFC_outb_nodebug(hc, R_RAM_ADDR0, i);
-		HFC_inb_nodebug(hc, R_RAM_DATA);
-		rval = HFC_inb_nodebug(hc, R_INT_DATA);
-		if (rval != ((i * 3) & 0xff)) {
-			printk(KERN_DEBUG
-			       "addr:%x val:%x should:%x\n", i, rval,
-			       (i * 3) & 0xff);
-			err++;
+
+	tgt_device = dev_replace->tgtdev;
+	src_device = dev_replace->srcdev;
+	btrfs_dev_replace_unlock(dev_replace);
+
+	/*
+	 * flush all outstanding I/O and inode extent mappings before the
+	 * copy operation is declared as being finished
+	 */
+	ret = btrfs_start_delalloc_roots(root->fs_info, 0, -1);
+	if (ret) {
+		mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+		return ret;
+	}
+	btrfs_wait_ordered_roots(root->fs_info, -1);
+
+	while (1) {
+		trans = btrfs_start_transaction(root, 0);
+		if (IS_ERR(trans)) {
+			mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+			return PTR_ERR(trans);
+		}
+		ret = btrfs_commit_transaction(trans, root);
+		WARN_ON(ret);
+		mutex_lock(&uuid_mutex);
+		/* keep away write_all_supers() during the finishing procedure */
+		mutex_lock(&root->fs_info->fs_devices->device_list_mutex);
+		mutex_lock(&root->fs_info->chunk_mutex);
+		if (src_device->has_pending_chunks) {
+			mutex_unlock(&root->fs_info->chunk_mutex);
+			mutex_unlock(&root->fs_info->fs_devices->device_list_mutex);
+			mutex_unlock(&uuid_mutex);
+		} else {
+			break;
 		}
 	}
-	if (err) {
-		printk(KERN_DEBUG "aborting - %d RAM access errors\n", err);
-		err = -EIO;
+
+	btrfs_dev_replace_lock(dev_replace);
+	dev_replace->replace_state =
+		scrub_ret ? BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED
+			  : BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED;
+	dev_replace->tgtdev = NULL;
+	dev_replace->srcdev = NULL;
+	dev_replace->time_stopped = get_seconds();
+	dev_replace->item_needs_writeback = 1;
+
+	/* replace old device with new one in mapping tree */
+	if (!scrub_ret) {
+		btrfs_dev_replace_update_device_in_mapping_tree(fs_info,
+								src_device,
+								tgt_device);
+	} else {
+		btrfs_err_in_rcu(root->fs_info,
+			      "btrfs_scrub_dev(%s, %llu, %s) failed %d",
+			      src_device->missing ? "<missing disk>" :
+			        rcu_str_deref(src_device->name),
+			      src_device->devid,
+			      rcu_str_deref(tgt_device->name), scrub_ret);
+		btrfs_dev_replace_unlock(dev_replace);
+		mutex_unlock(&root->fs_info->chunk_mutex);
+		mutex_unlock(&root->fs_info->fs_devices->device_list_mutex);
+		mutex_unlock(&uuid_mutex);
+		if (tgt_device)
+			btrfs_destroy_dev_replace_tgtdev(fs_info, tgt_device);
+		mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+
+		return scrub_ret;
+	}
+
+	btrfs_info_in_rcu(root->fs_info,
+		      "dev_replace from %s (devid %llu) to %s finished",
+		      src_device->missing ? "<missing disk>" :
+		        rcu_str_deref(src_device->name),
+		      src_device->devid,
+		      rcu_str_deref(tgt_device->name));
+	tgt_device->is_tgtdev_for_dev_replace = 0;
+	tgt_device->devid = src_device->devid;
+	src_device->devid = BTRFS_DEV_REPLACE_DEVID;
+	memcpy(uuid_tmp, tgt_device->uuid, sizeof(uuid_tmp));
+	memcpy(tgt_device->uuid, src_device->uuid, sizeof(tgt_device->uuid));
+	memcpy(src_device->uuid, uuid_tmp, sizeof(src_device->uuid));
+	btrfs_device_set_total_bytes(tgt_device, src_device->total_bytes);
+	btrfs_device_set_disk_total_bytes(tgt_device,
+					  src_device->disk_total_bytes);
+	btrfs_device_set_bytes_used(tgt_device, src_device->bytes_used);
+	ASSERT(list_empty(&src_device->resized_list));
+	tgt_device->commit_total_bytes = src_device->commit_total_bytes;
+	tgt_device->commit_bytes_used = src_device->bytes_used;
+	if (fs_info->sb->s_bdev == src_device->bdev)
+		fs_info->sb->s_bdev = tgt_device->bdev;
+	if (fs_info->fs_devices->latest_bdev == src_device->bdev)
+		fs_info->fs_devices->latest_bdev = tgt_device->bdev;
+	list_add(&tgt_device->dev_alloc_list, &fs_info->fs_devices->alloc_list);
+	fs_info->fs_devices->rw_devices++;
+
+	btrfs_dev_replace_unlock(dev_replace);
+
+	btrfs_rm_dev_replace_blocked(fs_info);
+
+	btrfs_rm_dev_replace_remove_srcdev(fs_info, src_device);
+
+	btrfs_rm_dev_replace_unblocked(fs_info);
+
+	/*
+	 * Increment dev_stats_ccnt so that btrfs_run_dev_stats() will
+	 * update on-disk dev stats value during commit transaction
+	 */
+	atomic_inc(&tgt_device->dev_stats_ccnt);
+
+	/*
+	 * this is again a consistent state where no dev_replace procedure
+	 * is running, the target device is part of the filesystem, the
+	 * source device is not part of the filesystem anymore and its 1st
+	 * superblock is scratched out so that it is no longer marked to
+	 * belong to this filesystem.
+	 */
+	mutex_unlock(&root->fs_info->chunk_mutex);
+	mutex_unlock(&root->fs_info->fs_devices->device_list_mutex);
+	mutex_unlock(&uuid_mutex);
+
+	/* replace the sysfs entry */
+	btrfs_sysfs_rm_device_link(fs_info->fs_devices, src_device);
+	btrfs_rm_dev_replace_free_srcdev(fs_info, src_device);
+
+	/* write back the superblocks */
+	trans = btrfs_start_transaction(root, 0);
+	if (!IS_ERR(trans))
+		btrfs_commit_transaction(trans, root);
+
+	mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+
+	return 0;
+}
+
+static void btrfs_dev_replace_update_device_in_mapping_tree(
+						struct btrfs_fs_info *fs_info,
+						struct btrfs_device *srcdev,
+						struct btrfs_device *tgtdev)
+{
+	struct extent_map_tree *em_tree = &fs_info->mapping_tree.map_tree;
+	struct extent_map *em;
+	struct map_lookup *map;
+	u64 start = 0;
+	int i;
+
+	write_lock(&em_tree->lock);
+	do {
+		em = lookup_extent_mapping(em_tree, start, (u64)-1);
+		if (!em)
+			break;
+		map = em->map_lookup;
+		for (i = 0; i < map->num_stripes; i++)
+			if (srcdev == map->stripes[i].dev)
+				map->stripes[i].dev = tgtdev;
+		start = em->start + em->len;
+		free_extent_map(em);
+	} while (start);
+	write_unlock(&em_tree->lock);
+}
+
+static int btrfs_dev_replace_find_srcdev(struct btrfs_root *root, u64 srcdevid,
+					 char *srcdev_name,
+					 struct btrfs_device **device)
+{
+	int ret;
+
+	if (srcdevid) {
+		ret = 0;
+		*device = btrfs_find_device(root->fs_info, srcdevid, NULL,
+					    NULL);
+		if (!*device)
+			ret = -ENOENT;
+	} else {
+		ret = btrfs_find_device_missing_or_by_path(root, srcdev_name,
+							   device);
+	}
+	return ret;
+}
+
+void btrfs_dev_replace_status(struct btrfs_fs_info *fs_info,
+			      struct btrfs_ioctl_dev_replace_args *args)
+{
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	struct btrfs_device *srcdev;
+
+	btrfs_dev_replace_lock(dev_replace);
+	/* even if !dev_replace_is_valid, the values are good enough for
+	 * the replace_status ioctl */
+	args->result = BTRFS_IOCTL_DEV_REPLACE_RESULT_NO_ERROR;
+	args->status.replace_state = dev_replace->replace_state;
+	args->status.time_started = dev_replace->time_started;
+	args->status.time_stopped = dev_replace->time_stopped;
+	args->status.num_write_errors =
+		atomic64_read(&dev_replace->num_write_errors);
+	args->status.num_uncorrectable_read_errors =
+		atomic64_read(&dev_replace->num_uncorrectable_read_errors);
+	switch (dev_replace->replace_state) {
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED:
+		args->status.progress_1000 = 0;
+		break;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED:
+		args->status.progress_1000 = 1000;
+		break;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED:
+		srcdev = dev_replace->srcdev;
+		args->status.progress_1000 = div_u64(dev_replace->cursor_left,
+			div_u64(btrfs_device_get_total_bytes(srcdev), 1000));
+		break;
+	}
+	btrfs_dev_replace_unlock(dev_replace);
+}
+
+int btrfs_dev_replace_cancel(struct btrfs_fs_info *fs_info,
+			     struct btrfs_ioctl_dev_replace_args *args)
+{
+	args->result = __btrfs_dev_replace_cancel(fs_info);
+	return 0;
+}
+
+static u64 __btrfs_dev_replace_cancel(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	struct btrfs_device *tgt_device = NULL;
+	struct btrfs_trans_handle *trans;
+	struct btrfs_root *root = fs_info->tree_root;
+	u64 result;
+	int ret;
+
+	if (fs_info->sb->s_flags & MS_RDONLY)
+		return -EROFS;
+
+	mutex_lock(&dev_replace->lock_finishing_cancel_unmount);
+	btrfs_dev_replace_lock(dev_replace);
+	switch (dev_replace->replace_state) {
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED:
+		result = BTRFS_IOCTL_DEV_REPLACE_RESULT_NOT_STARTED;
+		btrfs_dev_replace_unlock(dev_replace);
+		goto leave;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED:
+		result = BTRFS_IOCTL_DEV_REPLACE_RESULT_NO_ERROR;
+		tgt_device = dev_replace->tgtdev;
+		dev_replace->tgtdev = NULL;
+		dev_replace->srcdev = NULL;
+		break;
+	}
+	dev_replace->replace_state = BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED;
+	dev_replace->time_stopped = get_seconds();
+	dev_replace->item_needs_writeback = 1;
+	btrfs_dev_replace_unlock(dev_replace);
+	btrfs_scrub_cancel(fs_info);
+
+	trans = btrfs_start_transaction(root, 0);
+	if (IS_ERR(trans)) {
+		mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+		return PTR_ERR(trans);
+	}
+	ret = btrfs_commit_transaction(trans, root);
+	WARN_ON(ret);
+	if (tgt_device)
+		btrfs_destroy_dev_replace_tgtdev(fs_info, tgt_device);
+
+leave:
+	mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+	return result;
+}
+
+void btrfs_dev_replace_suspend_for_unmount(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+
+	mutex_lock(&dev_replace->lock_finishing_cancel_unmount);
+	btrfs_dev_replace_lock(dev_replace);
+	switch (dev_replace->replace_state) {
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED:
+		break;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+		dev_replace->replace_state =
+			BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED;
+		dev_replace->time_stopped = get_seconds();
+		dev_replace->item_needs_writeback = 1;
+		btrfs_info(fs_info, "suspending dev_replace for unmount");
+		break;
+	}
+
+	btrfs_dev_replace_unlock(dev_replace);
+	mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
+}
+
+/* resume dev_replace procedure that was interrupted by unmount */
+int btrfs_resume_dev_replace_async(struct btrfs_fs_info *fs_info)
+{
+	struct task_struct *task;
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+
+	btrfs_dev_replace_lock(dev_replace);
+	switch (dev_replace->replace_state) {
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED:
+		btrfs_dev_replace_unlock(dev_replace);
+		return 0;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+		break;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED:
+		dev_replace->replace_state =
+			BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED;
+		break;
+	}
+	if (!dev_replace->tgtdev || !dev_replace->tgtdev->bdev) {
+		btrfs_info(fs_info, "cannot continue dev_replace, tgtdev is missing");
+		btrfs_info(fs_info,
+			"you may cancel the operation after 'mount -o degraded'");
+		btrfs_dev_replace_unlock(dev_replace);
+		return 0;
+	}
+	btrfs_dev_replace_unlock(dev_replace);
+
+	WARN_ON(atomic_xchg(
+		&fs_info->mutually_exclusive_operation_running, 1));
+	task = kthread_run(btrfs_dev_replace_kthread, fs_info, "btrfs-devrepl");
+	return PTR_ERR_OR_ZERO(task);
+}
+
+static int btrfs_dev_replace_kthread(void *data)
+{
+	struct btrfs_fs_info *fs_info = data;
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	struct btrfs_ioctl_dev_replace_args *status_args;
+	u64 progress;
+
+	status_args = kzalloc(sizeof(*status_args), GFP_NOFS);
+	if (status_args) {
+		btrfs_dev_replace_status(fs_info, status_args);
+		progress = status_args->status.progress_1000;
+		kfree(status_args);
+		progress = div_u64(progress, 10);
+		btrfs_info_in_rcu(fs_info,
+			"continuing dev_replace from %s (devid %llu) to %s @%u%%",
+			dev_replace->srcdev->missing ? "<missing disk>" :
+			rcu_str_deref(dev_replace->srcdev->name),
+			dev_replace->srcdev->devid,
+			dev_replace->tgtdev ?
+			rcu_str_deref(dev_replace->tgtdev->name) :
+			"<missing target disk>",
+			(unsigned int)progress);
+	}
+	btrfs_dev_replace_continue_on_mount(fs_info);
+	atomic_set(&fs_info->mutually_exclusive_operation_running, 0);
+
+	return 0;
+}
+
+static int btrfs_dev_replace_continue_on_mount(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_dev_replace *dev_replace = &fs_info->dev_replace;
+	int ret;
+
+	ret = btrfs_scrub_dev(fs_info, dev_replace->srcdev->devid,
+			      dev_replace->committed_cursor_left,
+			      btrfs_device_get_total_bytes(dev_replace->srcdev),
+			      &dev_replace->scrub_progress, 0, 1);
+	ret = btrfs_dev_replace_finishing(fs_info, ret);
+	WARN_ON(ret);
+	return 0;
+}
+
+int btrfs_dev_replace_is_ongoing(struct btrfs_dev_replace *dev_replace)
+{
+	if (!dev_replace->is_valid)
+		return 0;
+
+	switch (dev_replace->replace_state) {
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_NEVER_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_FINISHED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_CANCELED:
+		return 0;
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_STARTED:
+	case BTRFS_IOCTL_DEV_REPLACE_STATE_SUSPENDED:
+		/*
+		 * return true even if tgtdev is missing (this is
+		 * something that can happen if the dev_replace
+		 * procedure is suspended by an umount and then
+		 * the tgtdev is missing (or "btrfs dev scan") was
+		 * not called and the the filesystem is remounted
+		 * in degraded state. This does not stop the
+		 * dev_replace procedure. It needs to be canceled
+		 * manually if the cancelation is wanted.
+		 */
+		break;
+	}
+	return 1;
+}
+
+void btrfs_dev_replace_lock(struct btrfs_dev_replace *dev_replace)
+{
+	/* the beginning is just an optimization for the typical case */
+	if (atomic_read(&dev_replace->nesting_level) == 0) {
+acquire_lock:
+		/* this is not a nested case where the same thread
+		 * is trying to acqurire the same lock twice */
+		mutex_lock(&dev_replace->lock);
+		mutex_lock(&dev_replace->lock_management_lock);
+		dev_replace->lock_owner = current->pid;
+		atomic_inc(&dev_replace->nesting_level);
+		mutex_unlock(&dev_replace->lock_management_lock);
+		return;
+	}
+
+	mutex_lock(&dev_replace->lock_management_lock);
+	if (atomic_read(&dev_replace->nesting_level) > 0 &&
+	    dev_replace->lock_owner == current->pid) {
+		WARN_ON(!mutex_is_locked(&dev_replace->lock));
+		atomic_inc(&dev_replace->nesting_level);
+		mutex_unlock(&dev_replace->lock_management_lock);
+		return;
+	}
+
+	mutex_unlock(&dev_replace->lock_management_lock);
+	goto acquire_lock;
+}
+
+void btrfs_dev_replace_unlock(struct btrfs_dev_replace *dev_replace)
+{
+	WARN_ON(!mutex_is_locked(&dev_replace->lock));
+	mutex_lock(&dev_replace->lock_management_lock);
+	WARN_ON(atomic_read(&dev_replace->nesting_level) < 1);
+	WARN_ON(dev_replace->lock_owner != current->pid);
+	atomic_dec(&dev_replace->nesting_level);
+	if (atomic_read(&dev_replace->nesting_level) == 0) {
+		dev_replace->lock_owner = 0;
+		mutex_unlock(&dev_replace->lock_management_lock);
+		mutex_unlock(&dev_replace->lock);
+	} else {
+		mutex_unlock(&dev_replace->lock_management_lock);
+	}
+}
+
+void btrfs_bio_counter_inc_noblocked(struct btrfs_fs_info *fs_info)
+{
+	percpu_counter_inc(&fs_info->bio_counter);
+}
+
+void btrfs_bio_counter_sub(struct btrfs_fs_info *fs_info, s64 amount)
+{
+	percpu_counter_sub(&fs_info->bio_counter, amount);
+
+	if (waitqueue_active(&fs_info->replace_wait))
+		wake_up(&fs_info->replace_wait);
+}
+
+void btrfs_bio_counter_inc_blocked(struct btrfs_fs_info *fs_info)
+{
+	while (1) {
+		percpu_counter_inc(&fs_info->bio_counter);
+		if (likely(!test_bit(BTRFS_FS_STATE_DEV_REPLACING,
+				     &fs_info->fs_state)))
+			break;
+
+		btrfs_bio_counter_dec(fs_info);
+		wait_event(fs_info->replace_wait,
+			   !test_bit(BTRFS_FS_STATE_DEV_REPLACING,
+				     &fs_info->fs_state));
+	}
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+ * Copyright (C) STRATO AG 2012.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#if !defined(__BTRFS_DEV_REPLACE__)
+#define __BTRFS_DEV_REPLACE__
+
+struct btrfs_ioctl_dev_replace_args;
+
+int btrfs_init_dev_replace(struct btrfs_fs_info *fs_info);
+int btrfs_run_dev_replace(struct btrfs_trans_handle *trans,
+			  struct btrfs_fs_info *fs_info);
+void btrfs_after_dev_replace_commit(struct btrfs_fs_info *fs_info);
+int btrfs_dev_replace_start(struct btrfs_root *root,
+			    struct btrfs_ioctl_dev_replace_args *args);
+void btrfs_dev_replace_status(struct btrfs_fs_info *fs_info,
+			      struct btrfs_ioctl_dev_replace_args *args);
+int btrfs_dev_replace_cancel(struct btrfs_fs_info *fs_info,
+			     struct btrfs_ioctl_dev_replace_args *args);
+void btrfs_dev_replace_suspend_for_unmount(struct btrfs_fs_info *fs_info);
+int btrfs_resume_dev_replace_async(struct btrfs_fs_info *fs_info);
+int btrfs_dev_replace_is_ongoing(struct btrfs_dev_replace *dev_replace);
+void btrfs_dev_replace_lock(struct btrfs_dev_replace *dev_replace);
+void btrfs_dev_replace_unlock(struct btrfs_dev_replace *dev_replace);
+
+static inline void btrfs_dev_replace_stats_inc(atomic64_t *stat_value)
+{
+	atomic64_inc(stat_value);
+}
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Copyright (C) 2007 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include "ctree.h"
+#include "disk-io.h"
+#include "hash.h"
+#include "transaction.h"
+
+/*
+ * insert a name into a directory, doing overflow properly if there is a hash
+ * collision.  data_size indicates how big the item inserted should be.  On
+ * success a struct btrfs_dir_item pointer is returned, otherwise it is
+ * an ERR_PTR.
+ *
+ * The name is not copied into the dir item, you have to do that yourself.
+ */
+static struct btrfs_dir_item *insert_with_overflow(struct btrfs_trans_handle
+						   *trans,
+						   struct btrfs_root *root,
+						   struct btrfs_path *path,
+						   struct btrfs_key *cpu_key,
+						   u32 data_size,
+						   const char *name,
+						   int name_len)
+{
+	int ret;
+	char *ptr;
+	struct btrfs_item *item;
+	struct extent_buffer *leaf;
+
+	ret = btrfs_insert_empty_item(trans, root, path, cpu_key, data_size);
+	if (ret == -EEXIST) {
+		struct btrfs_dir_item *di;
+		di = btrfs_match_dir_item_name(root, path, name, name_len);
+		if (di)
+			return ERR_PTR(-EEXIST);
+		btrfs_extend_item(root, path, data_size);
+	} else if (ret < 0)
+		return ERR_PTR(ret);
+	WARN_ON(ret > 0);
+	leaf = path->nodes[0];
+	item = btrfs_item_nr(path->slots[0]);
+	ptr = btrfs_item_ptr(leaf, path->slots[0], char);
+	BUG_ON(data_size > btrfs_item_size(leaf, item));
+	ptr += btrfs_item_size(leaf, item) - data_size;
+	return (struct btrfs_dir_item *)ptr;
+}
+
+/*
+ * xattrs work a lot like directories, this inserts an xattr item
+ * into the tree
+ */
+int btrfs_insert_xattr_item(struct btrfs_trans_handle *trans,
+			    struct btrfs_root *root,
+			    struct btrfs_path *path, u64 objectid,
+			    const char *name, u16 name_len,
+			    const void *data, u16 data_len)
+{
+	int ret = 0;
+	struct btrfs_dir_item *dir_item;
+	unsigned long name_ptr, data_ptr;
+	struct btrfs_key key, location;
+	struct btrfs_disk_key disk_key;
+	struct extent_buffer *leaf;
+	u32 data_size;
+
+	BUG_ON(name_len + data_len > BTRFS_MAX_XATTR_SIZE(root));
+
+	key.objectid = objectid;
+	key.type = BTRFS_XATTR_ITEM_KEY;
+	key.offset = btrfs_name_hash(name, name_len);
+
+	data_size = sizeof(*dir_item) + name_len + data_len;
+	dir_item = insert_with_overflow(trans, root, path, &key, data_size,
+					name, name_len);
+	if (IS_ERR(dir_item))
+		return PTR_ERR(dir_item);
+	memset(&location, 0, sizeof(location));
+
+	leaf = path->nodes[0];
+	btrfs_cpu_key_to_disk(&disk_key, &location);
+	btrfs_set_dir_item_key(leaf, dir_item, &disk_key);
+	btrfs_set_dir_type(leaf, dir_item, BTRFS_FT_XATTR);
+	btrfs_set_dir_name_len(leaf, dir_item, name_len);
+	btrfs_set_dir_transid(leaf, dir_item, trans->transid);
+	btrfs_set_dir_data_len(leaf, dir_item, data_len);
+	name_ptr = (unsigned long)(dir_item + 1);
+	data_ptr = (unsigned long)((char *)name_ptr + name_len);
+
+	write_extent_buffer(leaf, name, name_ptr, name_len);
+	write_extent_buffer(leaf, data, data_ptr, data_len);
+	btrfs_mark_buffer_dirty(path->nodes[0]);
+
+	return ret;
+}
+
+/*
+ * insert a directory item in the tree, doing all the magic for
+ * both indexes. 'dir' indicates which objectid to insert it into,
+ * 'location' is the key to stuff into the directory item, 'type' is the
+ * type of the inode we're pointing to, and 'index' is the sequence number
+ * to use for the second index (if one is created).
+ * Will return 0 or -ENOMEM
+ */
+int btrfs_insert_dir_item(struct btrfs_trans_handle *trans, struct btrfs_root
+			  *root, const char *name, int name_len,
+			  struct inode *dir, struct btrfs_key *location,
+			  u8 type, u64 index)
+{
+	int ret = 0;
+	int ret2 = 0;
+	struct btrfs_path *path;
+	struct btrfs_dir_item *dir_item;
+	struct extent_buffer *leaf;
+	unsigned long name_ptr;
+	struct btrfs_key key;
+	struct btrfs_disk_key disk_key;
+	u32 data_size;
+
+	key.objectid = btrfs_ino(dir);
+	key.type = BTRFS_DIR_ITEM_KEY;
+	key.offset = btrfs_name_hash(name, name_len);
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+	path->leave_spinning = 1;
+
+	btrfs_cpu_key_to_disk(&disk_key, location);
+
+	data_size = sizeof(*dir_item) + name_len;
+	dir_item = insert_with_overflow(trans, root, path, &key, data_size,
+					name, name_len);
+	if (IS_ERR(dir_item)) {
+		ret = PTR_ERR(dir_item);
+		if (ret == -EEXIST)
+			goto second_insert;
+		goto out_free;
+	}
+
+	leaf = path->nodes[0];
+	btrfs_set_dir_item_key(leaf, dir_item, &disk_key);
+	btrfs_set_dir_type(leaf, dir_item, type);
+	btrfs_set_dir_data_len(leaf, dir_item, 0);
+	btrfs_set_dir_name_len(leaf, dir_item, name_len);
+	btrfs_set_dir_transid(leaf, dir_item, trans->transid);
+	name_ptr = (unsigned long)(dir_item + 1);
+
+	write_extent_buffer(leaf, name, name_ptr, name_len);
+	btrfs_mark_buffer_dirty(leaf);
+
+second_insert:
+	/* FIXME, use some real flag for selecting the extra index */
+	if (root == root->fs_info->tree_root) {
+		ret = 0;
+		goto out_free;
+	}
+	btrfs_release_path(path);
+
+	ret2 = btrfs_insert_delayed_dir_index(trans, root, name, name_len, dir,
+					      &disk_key, type, index);
+out_free:
+	btrfs_free_path(path);
+	if (ret)
+		return ret;
+	if (ret2)
+		return ret2;
+	return 0;
+}
+
+/*
+ * lookup a directory item based on name.  'dir' is the objectid
+ * we're searching in, and 'mod' tells us if you plan on deleting the
+ * item (use mod < 0) or changing the options (use mod > 0)
+ */
+struct btrfs_dir_item *btrfs_lookup_dir_item(struct btrfs_trans_handle *trans,
+					     struct btrfs_root *root,
+					     struct btrfs_path *path, u64 dir,
+					     const char *name, int name_len,
+					     int mod)
+{
+	int ret;
+	struct btrfs_key key;
+	int ins_len = mod < 0 ? -1 : 0;
+	int cow = mod != 0;
+
+	key.objectid = dir;
+	key.type = BTRFS_DIR_ITEM_KEY;
+
+	key.offset = btrfs_name_hash(name, name_len);
+
+	ret = btrfs_search_slot(trans, root, &key, path, ins_len, cow);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (ret > 0)
+		return NULL;
+
+	return btrfs_match_dir_item_name(root, path, name, name_len);
+}
+
+int btrfs_check_dir_item_collision(struct btrfs_root *root, u64 dir,
+				   const char *name, int name_len)
+{
+	int ret;
+	struct btrfs_key key;
+	struct btrfs_dir_item *di;
+	int data_size;
+	struct extent_buffer *leaf;
+	int slot;
+	struct btrfs_path *path;
+
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	key.objectid = dir;
+	key.type = BTRFS_DIR_ITEM_KEY;
+	key.offset = btrfs_name_hash(name, name_len);
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+
+	/* return back any errors */
+	if (ret < 0)
+		goto out;
+
+	/* nothing found, we're safe */
+	if (ret > 0) {
+		ret = 0;
 		goto out;
 	}
 
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: done\n", __func__);
-out:
-	spin_unlock_irqrestore(&hc->lock, flags);
-	return err;
-}
-
-
-/*
- * control the watchdog
- */
-static void
-hfcmulti_watchdog(struct hfc_multi *hc)
-{
-	hc->wdcount++;
-
-	if (hc->wdcount > 10) {
-		hc->wdcount = 0;
-		hc->wdbyte = hc->wdbyte == V_GPIO_OUT2 ?
-			V_GPIO_OUT3 : V_GPIO_OUT2;
-
-		/* printk("Sending Watchdog Kill %x\n",hc->wdbyte); */
-		HFC_outb(hc, R_GPIO_EN0, V_GPIO_EN2 | V_GPIO_EN3);
-		HFC_outb(hc, R_GPIO_OUT0, hc->wdbyte);
-	}
-}
-
-
-
-/*
- * output leds
- */
-static void
-hfcmulti_leds(struct hfc_multi *hc)
-{
-	unsigned long lled;
-	unsigned long leddw;
-	int i, state, active, leds;
-	struct dchannel *dch;
-	int led[4];
-
-	switch (hc->leds) {
-	case 1: /* HFC-E1 OEM */
-		/* 2 red steady:       LOS
-		 * 1 red steady:       L1 not active
-		 * 2 green steady:     L1 active
-		 * 1st green flashing: activity on TX
-		 * 2nd green flashing: activity on RX
-		 */
-		led[0] = 0;
-		led[1] = 0;
-		led[2] = 0;
-		led[3] = 0;
-		dch = hc->chan[hc->dnum[0]].dch;
-		if (dch) {
-			if (hc->chan[hc->dnum[0]].los)
-				led[1] = 1;
-			if (hc->e1_state != 1) {
-				led[0] = 1;
-				hc->flash[2] = 0;
-				hc->flash[3] = 0;
-			} else {
-				led[2] = 1;
-				led[3] = 1;
-				if (!hc->flash[2] && hc->activity_tx)
-					hc->flash[2] = poll;
-				if (!hc->flash[3] && hc->activity_rx)
-					hc->flash[3] = poll;
-				if (hc->flash[2] && hc->flash[2] < 1024)
-					led[2] = 0;
-				if (hc->flash[3] && hc->flash[3] < 1024)
-					led[3] = 0;
-				if (hc->flash[2] >= 2048)
-					hc->flash[2] = 0;
-				if (hc->flash[3] >= 2048)
-					hc->flash[3] = 0;
-				if (hc->flash[2])
-					hc->flash[2] += poll;
-				if (hc->flash[3])
-					hc->flash[3] += poll;
-			}
-		}
-		leds = (led[0] | (led[1]<<2) | (led[2]<<1) | (led[3]<<3))^0xF;
-		/* leds are inverted */
-		if (leds != (int)hc->ledstate) {
-			HFC_outb_nodebug(hc, R_GPIO_OUT1, leds);
-			hc->ledstate = leds;
-		}
-		break;
-
-	case 2: /* HFC-4S OEM */
-		/* red steady:     PH_DEACTIVATE
-		 * green steady:   PH_ACTIVATE
-		 * green flashing: activity on TX
-		 */
-		for (i = 0; i < 4; i++) {
-			state = 0;
-			active = -1;
-			dch = hc->chan[(i << 2) | 2].dch;
-			if (dch) {
-				state = dch->state;
-				if (dch->dev.D.protocol == ISDN_P_NT_S0)
-					active = 3;
-				else
-					active = 7;
-			}
-			if (state) {
-				if (state == active) {
-					led[i] = 1; /* led green */
-					hc->activity_tx |= hc->activity_rx;
-					if (!hc->flash[i] &&
-						(hc->activity_tx & (1 << i)))
-							hc->flash[i] = poll;
-					if (hc->flash[i] && hc->flash[i] < 1024)
-						led[i] = 0; /* led off */
-					if (hc->flash[i] >= 2048)
-						hc->flash[i] = 0;
-					if (hc->flash[i])
-						hc->flash[i] += poll;
-				} else {
-					led[i] = 2; /* led red */
-					hc->flash[i] = 0;
-				}
-			} else
-				led[i] = 0; /* led off */
-		}
-		if (test_bit(HFC_CHIP_B410P, &hc->chip)) {
-			leds = 0;
-			for (i = 0; i < 4; i++) {
-				if (led[i] == 1) {
-					/*green*/
-					leds |= (0x2 << (i * 2));
-				} else if (led[i] == 2) {
-					/*red*/
-					leds |= (0x1 << (i * 2));
-				}
-			}
-			if (leds != (int)hc->ledstate) {
-				vpm_out(hc, 0, 0x1a8 + 3, leds);
-				hc->ledstate = leds;
-			}
-		} else {
-			leds = ((led[3] > 0) << 0) | ((led[1] > 0) << 1) |
-				((led[0] > 0) << 2) | ((led[2] > 0) << 3) |
-				((led[3] & 1) << 4) | ((led[1] & 1) << 5) |
-				((led[0] & 1) << 6) | ((led[2] & 1) << 7);
-			if (leds != (int)hc->ledstate) {
-				HFC_outb_nodebug(hc, R_GPIO_EN1, leds & 0x0F);
-				HFC_outb_nodebug(hc, R_GPIO_OUT1, leds >> 4);
-				hc->ledstate = leds;
-			}
-		}
-		break;
-
-	case 3: /* HFC 1S/2S Beronet */
-		/* red steady:     PH_DEACTIVATE
-		 * green steady:   PH_ACTIVATE
-		 * green flashing: activity on TX
-		 */
-		for (i = 0; i < 2; i++) {
-			state = 0;
-			active = -1;
-			dch = hc->chan[(i << 2) | 2].dch;
-			if (dch) {
-				state = dch->state;
-				if (dch->dev.D.protocol == ISDN_P_NT_S0)
-					active = 3;
-				else
-					active = 7;
-			}
-			if (state) {
-				if (state == active) {
-					led[i] = 1; /* led green */
-					hc->activity_tx |= hc->activity_rx;
-					if (!hc->flash[i] &&
-						(hc->activity_tx & (1 << i)))
-							hc->flash[i] = poll;
-					if (hc->flash[i] < 1024)
-						led[i] = 0; /* led off */
-					if (hc->flash[i] >= 2048)
-						hc->flash[i] = 0;
-					if (hc->flash[i])
-						hc->flash[i] += poll;
-				} else {
-					led[i] = 2; /* led red */
-					hc->flash[i] = 0;
-				}
-			} else
-				led[i] = 0; /* led off */
-		}
-		leds = (led[0] > 0) | ((led[1] > 0) << 1) | ((led[0]&1) << 2)
-			| ((led[1]&1) << 3);
-		if (leds != (int)hc->ledstate) {
-			HFC_outb_nodebug(hc, R_GPIO_EN1,
-					 ((led[0] > 0) << 2) | ((led[1] > 0) << 3));
-			HFC_outb_nodebug(hc, R_GPIO_OUT1,
-					 ((led[0] & 1) << 2) | ((led[1] & 1) << 3));
-			hc->ledstate = leds;
-		}
-		break;
-	case 8: /* HFC 8S+ Beronet */
-		/* off:      PH_DEACTIVATE
-		 * steady:   PH_ACTIVATE
-		 * flashing: activity on TX
-		 */
-		lled = 0xff; /* leds off */
-		for (i = 0; i < 8; i++) {
-			state = 0;
-			active = -1;
-			dch = hc->chan[(i << 2) | 2].dch;
-			if (dch) {
-				state = dch->state;
-				if (dch->dev.D.protocol == ISDN_P_NT_S0)
-					active = 3;
-				else
-					active = 7;
-			}
-			if (state) {
-				if (state == active) {
-					lled &= ~(1 << i); /* led on */
-					hc->activity_tx |= hc->activity_rx;
-					if (!hc->flash[i] &&
-						(hc->activity_tx & (1 << i)))
-							hc->flash[i] = poll;
-					if (hc->flash[i] < 1024)
-						lled |= 1 << i; /* led off */
-					if (hc->flash[i] >= 2048)
-						hc->flash[i] = 0;
-					if (hc->flash[i])
-						hc->flash[i] += poll;
-				} else
-					hc->flash[i] = 0;
-			}
-		}
-		leddw = lled << 24 | lled << 16 | lled << 8 | lled;
-		if (leddw != hc->ledstate) {
-			/* HFC_outb(hc, R_BRG_PCM_CFG, 1);
-			   HFC_outb(c, R_BRG_PCM_CFG, (0x0 << 6) | 0x3); */
-			/* was _io before */
-			HFC_outb_nodebug(hc, R_BRG_PCM_CFG, 1 | V_PCM_CLK);
-			outw(0x4000, hc->pci_iobase + 4);
-			outl(leddw, hc->pci_iobase);
-			HFC_outb_nodebug(hc, R_BRG_PCM_CFG, V_PCM_CLK);
-			hc->ledstate = leddw;
-		}
-		break;
-	}
-	hc->activity_tx = 0;
-	hc->activity_rx = 0;
-}
-/*
- * read dtmf coefficients
- */
-
-static void
-hfcmulti_dtmf(struct hfc_multi *hc)
-{
-	s32		*coeff;
-	u_int		mantissa;
-	int		co, ch;
-	struct bchannel	*bch = NULL;
-	u8		exponent;
-	int		dtmf = 0;
-	int		addr;
-	u16		w_float;
-	struct sk_buff	*skb;
-	struct mISDNhead *hh;
-
-	if (debug & DEBUG_HFCMULTI_DTMF)
-		printk(KERN_DEBUG "%s: dtmf detection irq\n", __func__);
-	for (ch = 0; ch <= 31; ch++) {
-		/* only process enabled B-channels */
-		bch = hc->chan[ch].bch;
-		if (!bch)
-			continue;
-		if (!hc->created[hc->chan[ch].port])
-			continue;
-		if (!test_bit(FLG_TRANSPARENT, &bch->Flags))
-			continue;
-		if (debug & DEBUG_HFCMULTI_DTMF)
-			printk(KERN_DEBUG "%s: dtmf channel %d:",
-			       __func__, ch);
-		coeff = &(hc->chan[ch].coeff[hc->chan[ch].coeff_count * 16]);
-		dtmf = 1;
-		for (co = 0; co < 8; co++) {
-			/* read W(n-1) coefficient */
-			addr = hc->DTMFbase + ((co << 7) | (ch << 2));
-			HFC_outb_nodebug(hc, R_RAM_ADDR0, addr);
-			HFC_outb_nodebug(hc, R_RAM_ADDR1, addr >> 8);
-			HFC_outb_nodebug(hc, R_RAM_ADDR2, (addr >> 16)
-					 | V_ADDR_INC);
-			w_float = HFC_inb_nodebug(hc, R_RAM_DATA);
-			w_float |= (HFC_inb_nodebug(hc, R_RAM_DATA) << 8);
-			if (debug & DEBUG_HFCMULTI_DTMF)
-				printk(" %04x", w_float);
-
-			/* decode float (see chip doc) */
-			mantissa = w_float & 0x0fff;
-			if (w_float & 0x8000)
-				mantissa |= 0xfffff000;
-			exponent = (w_float >> 12) & 0x7;
-			if (exponent) {
-				mantissa ^= 0x1000;
-				mantissa <<= (exponent - 1);
-			}
-
-			/* store coefficient */
-			coeff[co << 1] = mantissa;
-
-			/* read W(n) coefficient */
-			w_float = HFC_inb_nodebug(hc, R_RAM_DATA);
-			w_float |= (HFC_inb_nodebug(hc, R_RAM_DATA) << 8);
-			if (debug & DEBUG_HFCMULTI_DTMF)
-				printk(" %04x", w_float);
-
-			/* decode float (see chip doc) */
-			mantissa = w_float & 0x0fff;
-			if (w_float & 0x8000)
-				mantissa |= 0xfffff000;
-			exponent = (w_float >> 12) & 0x7;
-			if (exponent) {
-				mantissa ^= 0x1000;
-				mantissa <<= (exponent - 1);
-			}
-
-			/* store coefficient */
-			coeff[(co << 1) | 1] = mantissa;
-		}
-		if (debug & DEBUG_HFCMULTI_DTMF)
-			printk(" DTMF ready %08x %08x %08x %08x "
-			       "%08x %08x %08x %08x\n",
-			       coeff[0], coeff[1], coeff[2], coeff[3],
-			       coeff[4], coeff[5], coeff[6], coeff[7]);
-		hc->chan[ch].coeff_count++;
-		if (hc->chan[ch].coeff_count == 8) {
-			hc->chan[ch].coeff_count = 0;
-			skb = mI_alloc_skb(512, GFP_ATOMIC);
-			if (!skb) {
-				printk(KERN_DEBUG "%s: No memory for skb\n",
-				       __func__);
-				continue;
-			}
-			hh = mISDN_HEAD_P(skb);
-			hh->prim = PH_CONTROL_IND;
-			hh->id = DTMF_HFC_COEF;
-			memcpy(skb_put(skb, 512), hc->chan[ch].coeff, 512);
-			recv_Bchannel_skb(bch, skb);
-		}
-	}
-
-	/* restart DTMF processing */
-	hc->dtmf = dtmf;
-	if (dtmf)
-		HFC_outb_nodebug(hc, R_DTMF, hc->hw.r_dtmf | V_RST_DTMF);
-}
-
-
-/*
- * fill fifo as much as possible
- */
-
-static void
-hfcmulti_tx(struct hfc_multi *hc, int ch)
-{
-	int i, ii, temp, len = 0;
-	int Zspace, z1, z2; /* must be int for calculation */
-	int Fspace, f1, f2;
-	u_char *d;
-	int *txpending, slot_tx;
-	struct	bchannel *bch;
-	struct  dchannel *dch;
-	struct  sk_buff **sp = NULL;
-	int *idxp;
-
-	bch = hc->chan[ch].bch;
-	dch = hc->chan[ch].dch;
-	if ((!dch) && (!bch))
-		return;
-
-	txpending = &hc->chan[ch].txpending;
-	slot_tx = hc->chan[ch].slot_tx;
-	if (dch) {
-		if (!test_bit(FLG_ACTIVE, &dch->Flags))
-			return;
-		sp = &dch->tx_skb;
-		idxp = &dch->tx_idx;
-	} else {
-		if (!test_bit(FLG_ACTIVE, &bch->Flags))
-			return;
-		sp = &bch->tx_skb;
-		idxp = &bch->tx_idx;
-	}
-	if (*sp)
-		len = (*sp)->len;
-
-	if ((!len) && *txpending != 1)
-		return; /* no data */
-
-	if (test_bit(HFC_CHIP_B410P, &hc->chip) &&
-	    (hc->chan[ch].protocol == ISDN_P_B_RAW) &&
-	    (hc->chan[ch].slot_rx < 0) &&
-	    (hc->chan[ch].slot_tx < 0))
-		HFC_outb_nodebug(hc, R_FIFO, 0x20 | (ch << 1));
-	else
-		HFC_outb_nodebug(hc, R_FIFO, ch << 1);
-	HFC_wait_nodebug(hc);
-
-	if (*txpending == 2) {
-		/* reset fifo */
-		HFC_outb_nodebug(hc, R_INC_RES_FIFO, V_RES_F);
-		HFC_wait_nodebug(hc);
-		HFC_outb(hc, A_SUBCH_CFG, 0);
-		*txpending = 1;
-	}
-next_frame:
-	if (dch || test_bit(FLG_HDLC, &bch->Flags)) {
-		f1 = HFC_inb_nodebug(hc, A_F1);
-		f2 = HFC_inb_nodebug(hc, A_F2);
-		while (f2 != (temp = HFC_inb_nodebug(hc, A_F2))) {
-			if (debug & DEBUG_HFCMULTI_FIFO)
-				printk(KERN_DEBUG
-				       "%s(card %d): reread f2 because %d!=%d\n",
-				       __func__, hc->id + 1, temp, f2);
-			f2 = temp; /* repeat until F2 is equal */
-		}
-		Fspace = f2 - f1 - 1;
-		if (Fspace < 0)
-			Fspace += hc->Flen;
-		/*
-		 * Old FIFO handling doesn't give us the current Z2 read
-		 * pointer, so we cannot send the next frame before the fifo
-		 * is empty. It makes no difference except for a slightly
-		 * lower performance.
-		 */
-		if (test_bit(HFC_CHIP_REVISION0, &hc->chip)) {
-			if (f1 != f2)
-				Fspace = 0;
-			else
-				Fspace = 1;
-		}
-		/* one frame only for ST D-channels, to allow resending */
-		if (hc->ctype != HFC_TYPE_E1 && dch) {
-			if (f1 != f2)
-				Fspace = 0;
-		}
-		/* F-counter full condition */
-		if (Fspace == 0)
-			return;
-	}
-	z1 = HFC_inw_nodebug(hc, A_Z1) - hc->Zmin;
-	z2 = HFC_inw_nodebug(hc, A_Z2) - hc->Zmin;
-	while (z2 != (temp = (HFC_inw_nodebug(hc, A_Z2) - hc->Zmin))) {
-		if (debug & DEBUG_HFCMULTI_FIFO)
-			printk(KERN_DEBUG "%s(card %d): reread z2 because "
-			       "%d!=%d\n", __func__, hc->id + 1, temp, z2);
-		z2 = temp; /* repeat unti Z2 is equal */
-	}
-	hc->chan[ch].Zfill = z1 - z2;
-	if (hc->chan[ch].Zfill < 0)
-		hc->chan[ch].Zfill += hc->Zlen;
-	Zspace = z2 - z1;
-	if (Zspace <= 0)
-		Zspace += hc->Zlen;
-	Zspace -= 4; /* keep not too full, so pointers will not overrun */
-	/* fill transparent data only to maxinum transparent load (minus 4) */
-	if (bch && test_bit(FLG_TRANSPARENT, &bch->Flags))
-		Zspace = Zspace - hc->Zlen + hc->max_trans;
-	if (Zspace <= 0) /* no space of 4 bytes */
-		return;
-
-	/* if no data */
-	if (!len) {
-		if (z1 == z2) { /* empty */
-			/* if done with FIFO audio data during PCM connection */
-			if (bch && (!test_bit(FLG_HDLC, &bch->Flags)) &&
-			    *txpending && slot_tx >= 0) {
-				if (debug & DEBUG_HFCMULTI_MODE)
-					printk(KERN_DEBUG
-					       "%s: reconnecting PCM due to no "
-					       "more FIFO data: channel %d "
-					       "slot_tx %d\n",
-					       __func__, ch, slot_tx);
-				/* connect slot */
-				if (hc->ctype == HFC_TYPE_XHFC)
-					HFC_outb(hc, A_CON_HDLC, 0xc0
-						 | 0x07 << 2 | V_HDLC_TRP | V_IFF);
-				/* Enable FIFO, no interrupt */
-				else
-					HFC_outb(hc, A_CON_HDLC, 0xc0 | 0x00 |
-						 V_HDLC_TRP | V_IFF);
-				HFC_outb_nodebug(hc, R_FIFO, ch << 1 | 1);
-				HFC_wait_nodebug(hc);
-				if (hc->ctype == HFC_TYPE_XHFC)
-					HFC_outb(hc, A_CON_HDLC, 0xc0
-						 | 0x07 << 2 | V_HDLC_TRP | V_IFF);
-				/* Enable FIFO, no interrupt */
-				else
-					HFC_outb(hc, A_CON_HDLC, 0xc0 | 0x00 |
-						 V_HDLC_TRP | V_IFF);
-				HFC_outb_nodebug(hc, R_FIFO, ch << 1);
-				HFC_wait_nodebug(hc);
-			}
-			*txpending = 0;
-		}
-		return; /* no data */
-	}
-
-	/* "fill fifo if empty" feature */
-	if (bch && test_bit(FLG_FILLEMPTY, &bch->Flags)
-	    && !test_bit(FLG_HDLC, &bch->Flags) && z2 == z1) {
-		if (debug & DEBUG_HFCMULTI_FILL)
-			printk(KERN_DEBUG "%s: buffer empty, so we have "
-			       "underrun\n", __func__);
-		/* fill buffer, to prevent future underrun */
-		hc->write_fifo(hc, hc->silence_data, poll >> 1);
-		Zspace -= (poll >> 1);
-	}
-
-	/* if audio data and connected slot */
-	if (bch && (!test_bit(FLG_HDLC, &bch->Flags)) && (!*txpending)
-	    && slot_tx >= 0) {
-		if (debug & DEBUG_HFCMULTI_MODE)
-			printk(KERN_DEBUG "%s: disconnecting PCM due to "
-			       "FIFO data: channel %d slot_tx %d\n",
-			       __func__, ch, slot_tx);
-		/* disconnect slot */
-		if (hc->ctype == HFC_TYPE_XHFC)
-			HFC_outb(hc, A_CON_HDLC, 0x80
-				 | 0x07 << 2 | V_HDLC_TRP | V_IFF);
-		/* Enable FIFO, no interrupt */
-		else
-			HFC_outb(hc, A_CON_HDLC, 0x80 | 0x00 |
-				 V_HDLC_TRP | V_IFF);
-		HFC_outb_nodebug(hc, R_FIFO, ch << 1 | 1);
-		HFC_wait_nodebug(hc);
-		if (hc->ctype == HFC_TYPE_XHFC)
-			HFC_outb(hc, A_CON_HDLC, 0x80
-				 | 0x07 << 2 | V_HDLC_TRP | V_IFF);
-		/* Enable FIFO, no interrupt */
-		else
-			HFC_outb(hc, A_CON_HDLC, 0x80 | 0x00 |
-				 V_HDLC_TRP | V_IFF);
-		HFC_outb_nodebug(hc, R_FIFO, ch << 1);
-		HFC_wait_nodebug(hc);
-	}
-	*txpending = 1;
-
-	/* show activity */
-	if (dch)
-		hc->activity_tx |= 1 << hc->chan[ch].port;
-
-	/* fill fifo to what we have left */
-	ii = len;
-	if (dch || test_bit(FLG_HDLC, &bch->Flags))
-		temp = 1;
-	else
-		temp = 0;
-	i = *idxp;
-	d = (*sp)->data + i;
-	if (ii - i > Zspace)
-		ii = Zspace + i;
-	if (debug & DEBUG_HFCMULTI_FIFO)
-		printk(KERN_DEBUG "%s(card %d): fifo(%d) has %d bytes space "
-		       "left (z1=%04x, z2=%04x) sending %d of %d bytes %s\n",
-		       __func__, hc->id + 1, ch, Zspace, z1, z2, ii-i, len-i,
-		       temp ? "HDLC" : "TRANS");
-
-	/* Have to prep the audio data */
-	hc->write_fifo(hc, d, ii - i);
-	hc->chan[ch].Zfill += ii - i;
-	*idxp = ii;
-
-	/* if not all data has been written */
-	if (ii != len) {
-		/* NOTE: fifo is started by the calling function */
-		return;
-	}
-
-	/* if all data has been written, terminate frame */
-	if (dch || test_bit(FLG_HDLC, &bch->Flags)) {
-		/* increment f-counter */
-		HFC_outb_nodebug(hc, R_INC_RES_FIFO, V_INC_F);
-		HFC_wait_nodebug(hc);
-	}
-
-	dev_kfree_skb(*sp);
-	/* check for next frame */
-	if (bch && get_next_bframe(bch)) {
-		len = (*sp)->len;
-		goto next_frame;
-	}
-	if (dch && get_next_dframe(dch)) {
-		len = (*sp)->len;
-		goto next_frame;
+	/* we found an item, look for our name in the item */
+	di = btrfs_match_dir_item_name(root, path, name, name_len);
+	if (di) {
+		/* our exact name was found */
+		ret = -EEXIST;
+		goto out;
 	}
 
 	/*
-	 * now we have no more data, so in case of transparent,
-	 * we set the last byte in fifo to 'silence' in case we will get
-	 * no more data at all. this prevents sending an undefined value.
+	 * see if there is room in the item to insert this
+	 * name
 	 */
-	if (bch && test_bit(FLG_TRANSPARENT, &bch->Flags))
-		HFC_outb_nodebug(hc, A_FIFO_DATA0_NOINC, hc->silence);
-}
-
-
-/* NOTE: only called if E1 card is in active state */
-static void
-hfcmulti_rx(struct hfc_multi *hc, int ch)
-{
-	int temp;
-	int Zsize, z1, z2 = 0; /* = 0, to make GCC happy */
-	int f1 = 0, f2 = 0; /* = 0, to make GCC happy */
-	int again = 0;
-	struct	bchannel *bch;
-	struct  dchannel *dch = NULL;
-	struct sk_buff	*skb, **sp = NULL;
-	int	maxlen;
-
-	bch = hc->chan[ch].bch;
-	if (bch) {
-		if (!test_bit(FLG_ACTIVE, &bch->Flags))
-			return;
-	} else if (hc->chan[ch].dch) {
-		dch = hc->chan[ch].dch;
-		if (!test_bit(FLG_ACTIVE, &dch->Flags))
-			return;
+	data_size = sizeof(*di) + name_len;
+	leaf = path->nodes[0];
+	slot = path->slots[0];
+	if (data_size + btrfs_item_size_nr(leaf, slot) +
+	    sizeof(struct btrfs_item) > BTRFS_LEAF_DATA_SIZE(root)) {
+		ret = -EOVERFLOW;
 	} else {
-		return;
-	}
-next_frame:
-	/* on first AND before getting next valid frame, R_FIFO must be written
-	   to. */
-	if (test_bit(HFC_CHIP_B410P, &hc->chip) &&
-	    (hc->chan[ch].protocol == ISDN_P_B_RAW) &&
-	    (hc->chan[ch].slot_rx < 0) &&
-	    (hc->chan[ch].slot_tx < 0))
-		HFC_outb_nodebug(hc, R_FIFO, 0x20 | (ch << 1) | 1);
-	else
-		HFC_outb_nodebug(hc, R_FIFO, (ch << 1) | 1);
-	HFC_wait_nodebug(hc);
-
-	/* ignore if rx is off BUT change fifo (above) to start pending TX */
-	if (hc->chan[ch].rx_off) {
-		if (bch)
-			bch->dropcnt += poll; /* not exact but fair enough */
-		return;
-	}
-
-	if (dch || test_bit(FLG_HDLC, &bch->Flags)) {
-		f1 = HFC_inb_nodebug(hc, A_F1);
-		while (f1 != (temp = HFC_inb_nodebug(hc, A_F1))) {
-			if (debug & DEBUG_HFCMULTI_FIFO)
-				printk(KERN_DEBUG
-				       "%s(card %d): reread f1 because %d!=%d\n",
-				       __func__, hc->id + 1, temp, f1);
-			f1 = temp; /* repeat until F1 is equal */
-		}
-		f2 = HFC_inb_nodebug(hc, A_F2);
-	}
-	z1 = HFC_inw_nodebug(hc, A_Z1) - hc->Zmin;
-	while (z1 != (temp = (HFC_inw_nodebug(hc, A_Z1) - hc->Zmin))) {
-		if (debug & DEBUG_HFCMULTI_FIFO)
-			printk(KERN_DEBUG "%s(card %d): reread z2 because "
-			       "%d!=%d\n", __func__, hc->id + 1, temp, z2);
-		z1 = temp; /* repeat until Z1 is equal */
-	}
-	z2 = HFC_inw_nodebug(hc, A_Z2) - hc->Zmin;
-	Zsize = z1 - z2;
-	if ((dch || test_bit(FLG_HDLC, &bch->Flags)) && f1 != f2)
-		/* complete hdlc frame */
-		Zsize++;
-	if (Zsize < 0)
-		Zsize += hc->Zlen;
-	/* if buffer is empty */
-	if (Zsize <= 0)
-		return;
-
-	if (bch) {
-		maxlen = bchannel_get_rxbuf(bch, Zsize);
-		if (maxlen < 0) {
-			pr_warning("card%d.B%d: No bufferspace for %d bytes\n",
-				   hc->id + 1, bch->nr, Zsize);
-			return;
-		}
-		sp = &bch->rx_skb;
-		maxlen = bch->maxlen;
-	} else { /* Dchannel */
-		sp = &dch->rx_skb;
-		maxlen = dch->maxlen + 3;
-		if (*sp == NULL) {
-			*sp = mI_alloc_skb(maxlen, GFP_ATOMIC);
-			if (*sp == NULL) {
-				pr_warning("card%d: No mem for dch rx_skb\n",
-					   hc->id + 1);
-				return;
-			}
-		}
-	}
-	/* show activity */
-	if (dch)
-		hc->activity_rx |= 1 << hc->chan[ch].port;
-
-	/* empty fifo with what we have */
-	if (dch || test_bit(FLG_HDLC, &bch->Flags)) {
-		if (debug & DEBUG_HFCMULTI_FIFO)
-			printk(KERN_DEBUG "%s(card %d): fifo(%d) reading %d "
-			       "bytes (z1=%04x, z2=%04x) HDLC %s (f1=%d, f2=%d) "
-			       "got=%d (again %d)\n", __func__, hc->id + 1, ch,
-			       Zsize, z1, z2, (f1 == f2) ? "fragment" : "COMPLETE",
-			       f1, f2, Zsize + (*sp)->len, again);
-		/* HDLC */
-		if ((Zsize + (*sp)->len) > maxlen) {
-			if (debug & DEBUG_HFCMULTI_FIFO)
-				printk(KERN_DEBUG
-				       "%s(card %d): hdlc-frame too large.\n",
-				       __func__, hc->id + 1);
-			skb_trim(*sp, 0);
-			HFC_outb_nodebug(hc, R_INC_RES_FIFO, V_RES_F);
-			HFC_wait_nodebug(hc);
-			return;
-		}
-
-		hc->read_fifo(hc, skb_put(*sp, Zsize), Zsize);
-
-		if (f1 != f2) {
-			/* increment Z2,F2-counter */
-			HFC_outb_nodebug(hc, R_INC_RES_FIFO, V_INC_F);
-			HFC_wait_nodebug(hc);
-			/* check size */
-			if ((*sp)->len < 4) {
-				if (debug & DEBUG_HFCMULTI_FIFO)
-					printk(KERN_DEBUG
-					       "%s(card %d): Frame below minimum "
-					       "size\n", __func__, hc->id + 1);
-				skb_trim(*sp, 0);
-				goto next_frame;
-			}
-			/* there is at least one complete frame, check crc */
-			if ((*sp)->data[(*sp)->len - 1]) {
-				if (debug & DEBUG_HFCMULTI_CRC)
-					printk(KERN_DEBUG
-					       "%s: CRC-error\n", __func__);
-				skb_trim(*sp, 0);
-				goto next_frame;
-			}
-			skb_trim(*sp, (*sp)->len - 3);
-			if ((*sp)->len < MISDN_COPY_SIZE) {
-				skb = *sp;
-				*sp = mI_alloc_skb(skb->len, GFP_ATOMIC);
-				if (*sp) {
-					memcpy(skb_put(*sp, skb->len),
-					       skb->data, skb->len);
-					skb_trim(skb, 0);
-				} else {
-					printk(KERN_DEBUG "%s: No mem\n",
-					       __func__);
-					*sp = skb;
-					skb = NULL;
-				}
-			} else {
-				skb = NULL;
-			}
-			if (debug & DEBUG_HFCMULTI_FIFO) {
-				printk(KERN_DEBUG "%s(card %d):",
-				       __func__, hc->id + 1);
-				temp = 0;
-				while (temp < (*sp)->len)
-					printk(" %02x", (*sp)->data[temp++]);
-				printk("\n");
-			}
-			if (dch)
-				recv_Dchannel(dch);
-			else
-				recv_Bchannel(bch, MISDN_ID_ANY, false);
-			*sp = skb;
-			again++;
-			goto next_frame;
-		}
-		/* there is an incomplete frame */
-	} else {
-		/* transparent */
-		hc->read_fifo(hc, skb_put(*sp, Zsize), Zsize);
-		if (debug & DEBUG_HFCMULTI_FIFO)
-			printk(KERN_DEBUG
-			       "%s(card %d): fifo(%d) reading %d bytes "
-			       "(z1=%04x, z2=%04x) TRANS\n",
-			       __func__, hc->id + 1, ch, Zsize, z1, z2);
-		/* only bch is transparent */
-		recv_Bchannel(bch, hc->chan[ch].Zfill, false);
-	}
-}
-
-
-/*
- * Interrupt handler
- */
-static void
-signal_state_up(struct dchannel *dch, int info, char *msg)
-{
-	struct sk_buff	*skb;
-	int		id, data = info;
-
-	if (debug & DEBUG_HFCMULTI_STATE)
-		printk(KERN_DEBUG "%s: %s\n", __func__, msg);
-
-	id = TEI_SAPI | (GROUP_TEI << 8); /* manager address */
-
-	skb = _alloc_mISDN_skb(MPH_INFORMATION_IND, id, sizeof(data), &data,
-			       GFP_ATOMIC);
-	if (!skb)
-		return;
-	recv_Dchannel_skb(dch, skb);
-}
-
-static inline void
-handle_timer_irq(struct hfc_multi *hc)
-{
-	int		ch, temp;
-	struct dchannel	*dch;
-	u_long		flags;
-
-	/* process queued resync jobs */
-	if (hc->e1_resync) {
-		/* lock, so e1_resync gets not changed */
-		spin_lock_irqsave(&HFClock, flags);
-		if (hc->e1_resync & 1) {
-			if (debug & DEBUG_HFCMULTI_PLXSD)
-				printk(KERN_DEBUG "Enable SYNC_I\n");
-			HFC_outb(hc, R_SYNC_CTRL, V_EXT_CLK_SYNC);
-			/* disable JATT, if RX_SYNC is set */
-			if (test_bit(HFC_CHIP_RX_SYNC, &hc->chip))
-				HFC_outb(hc, R_SYNC_OUT, V_SYNC_E1_RX);
-		}
-		if (hc->e1_resync & 2) {
-			if (debug & DEBUG_HFCMULTI_PLXSD)
-				printk(KERN_DEBUG "Enable jatt PLL\n");
-			HFC_outb(hc, R_SYNC_CTRL, V_SYNC_OFFS);
-		}
-		if (hc->e1_resync & 4) {
-			if (debug & DEBUG_HFCMULTI_PLXSD)
-				printk(KERN_DEBUG
-				       "Enable QUARTZ for HFC-E1\n");
-			/* set jatt to quartz */
-			HFC_outb(hc, R_SYNC_CTRL, V_EXT_CLK_SYNC
-				 | V_JATT_OFF);
-			/* switch to JATT, in case it is not already */
-			HFC_outb(hc, R_SYNC_OUT, 0);
-		}
-		hc->e1_resync = 0;
-		spin_unlock_irqrestore(&HFClock, flags);
-	}
-
-	if (hc->ctype != HFC_TYPE_E1 || hc->e1_state == 1)
-		for (ch = 0; ch <= 31; ch++) {
-			if (hc->created[hc->chan[ch].port]) {
-				hfcmulti_tx(hc, ch);
-				/* fifo is started when switching to rx-fifo */
-				hfcmulti_rx(hc, ch);
-				if (hc->chan[ch].dch &&
-				    hc->chan[ch].nt_timer > -1) {
-					dch = hc->chan[ch].dch;
-					if (!(--hc->chan[ch].nt_timer)) {
-						schedule_event(dch,
-							       FLG_PHCHANGE);
-						if (debug &
-						    DEBUG_HFCMULTI_STATE)
-							printk(KERN_DEBUG
-							       "%s: nt_timer at "
-							       "state %x\n",
-							       __func__,
-							       dch->state);
-					}
-				}
-			}
-		}
-	if (hc->ctype == HFC_TYPE_E1 && hc->created[0]) {
-		dch = hc->chan[hc->dnum[0]].dch;
-		/* LOS */
-		temp = HFC_inb_nodebug(hc, R_SYNC_STA) & V_SIG_LOS;
-		hc->chan[hc->dnum[0]].los = temp;
-		if (test_bit(HFC_CFG_REPORT_LOS, &hc->chan[hc->dnum[0]].cfg)) {
-			if (!temp && hc->chan[hc->dnum[0]].los)
-				signal_state_up(dch, L1_SIGNAL_LOS_ON,
-						"LOS detected");
-			if (temp && !hc->chan[hc->dnum[0]].los)
-				signal_state_up(dch, L1_SIGNAL_LOS_OFF,
-						"LOS gone");
-		}
-		if (test_bit(HFC_CFG_REPORT_AIS, &hc->chan[hc->dnum[0]].cfg)) {
-			/* AIS */
-			temp = HFC_inb_nodebug(hc, R_SYNC_STA) & V_AIS;
-			if (!temp && hc->chan[hc->dnum[0]].ais)
-				signal_state_up(dch, L1_SIGNAL_AIS_ON,
-						"AIS detected");
-			if (temp && !hc->chan[hc->dnum[0]].ais)
-				signal_state_up(dch, L1_SIGNAL_AIS_OFF,
-						"AIS gone");
-			hc->chan[hc->dnum[0]].ais = temp;
-		}
-		if (test_bit(HFC_CFG_REPORT_SLIP, &hc->chan[hc->dnum[0]].cfg)) {
-			/* SLIP */
-			temp = HFC_inb_nodebug(hc, R_SLIP) & V_FOSLIP_RX;
-			if (!temp && hc->chan[hc->dnum[0]].slip_rx)
-				signal_state_up(dch, L1_SIGNAL_SLIP_RX,
-						" bit SLIP detected RX");
-			hc->chan[hc->dnum[0]].slip_rx = temp;
-			temp = HFC_inb_nodebug(hc, R_SLIP) & V_FOSLIP_TX;
-			if (!temp && hc->chan[hc->dnum[0]].slip_tx)
-				signal_state_up(dch, L1_SIGNAL_SLIP_TX,
-						" bit SLIP detected TX");
-			hc->chan[hc->dnum[0]].slip_tx = temp;
-		}
-		if (test_bit(HFC_CFG_REPORT_RDI, &hc->chan[hc->dnum[0]].cfg)) {
-			/* RDI */
-			temp = HFC_inb_nodebug(hc, R_RX_SL0_0) & V_A;
-			if (!temp && hc->chan[hc->dnum[0]].rdi)
-				signal_state_up(dch, L1_SIGNAL_RDI_ON,
-						"RDI detected");
-			if (temp && !hc->chan[hc->dnum[0]].rdi)
-				signal_state_up(dch, L1_SIGNAL_RDI_OFF,
-						"RDI gone");
-			hc->chan[hc->dnum[0]].rdi = temp;
-		}
-		temp = HFC_inb_nodebug(hc, R_JATT_DIR);
-		switch (hc->chan[hc->dnum[0]].sync) {
-		case 0:
-			if ((temp & 0x60) == 0x60) {
-				if (debug & DEBUG_HFCMULTI_SYNC)
-					printk(KERN_DEBUG
-					       "%s: (id=%d) E1 now "
-					       "in clock sync\n",
-					       __func__, hc->id);
-				HFC_outb(hc, R_RX_OFF,
-				    hc->chan[hc->dnum[0]].jitter | V_RX_INIT);
-				HFC_outb(hc, R_TX_OFF,
-				    hc->chan[hc->dnum[0]].jitter | V_RX_INIT);
-				hc->chan[hc->dnum[0]].sync = 1;
-				goto check_framesync;
-			}
-			break;
-		case 1:
-			if ((temp & 0x60) != 0x60) {
-				if (debug & DEBUG_HFCMULTI_SYNC)
-					printk(KERN_DEBUG
-					       "%s: (id=%d) E1 "
-					       "lost clock sync\n",
-					       __func__, hc->id);
-				hc->chan[hc->dnum[0]].sync = 0;
-				break;
-			}
-		check_framesync:
-			temp = HFC_inb_nodebug(hc, R_SYNC_STA);
-			if (temp == 0x27) {
-				if (debug & DEBUG_HFCMULTI_SYNC)
-					printk(KERN_DEBUG
-					       "%s: (id=%d) E1 "
-					       "now in frame sync\n",
-					       __func__, hc->id);
-				hc->chan[hc->dnum[0]].sync = 2;
-			}
-			break;
-		case 2:
-			if ((temp & 0x60) != 0x60) {
-				if (debug & DEBUG_HFCMULTI_SYNC)
-					printk(KERN_DEBUG
-					       "%s: (id=%d) E1 lost "
-					       "clock & frame sync\n",
-					       __func__, hc->id);
-				hc->chan[hc->dnum[0]].sync = 0;
-				break;
-			}
-			temp = HFC_inb_nodebug(hc, R_SYNC_STA);
-			if (temp != 0x27) {
-				if (debug & DEBUG_HFCMULTI_SYNC)
-					printk(KERN_DEBUG
-					       "%s: (id=%d) E1 "
-					       "lost frame sync\n",
-					       __func__, hc->id);
-				hc->chan[hc->dnum[0]].sync = 1;
-			}
-			break;
-		}
-	}
-
-	if (test_bit(HFC_CHIP_WATCHDOG, &hc->chip))
-		hfcmulti_watchdog(hc);
-
-	if (hc->leds)
-		hfcmulti_leds(hc);
-}
-
-static void
-ph_state_irq(struct hfc_multi *hc, u_char r_irq_statech)
-{
-	struct dchannel	*dch;
-	int		ch;
-	int		active;
-	u_char		st_status, temp;
-
-	/* state machine */
-	for (ch = 0; ch <= 31; ch++) {
-		if (hc->chan[ch].dch) {
-			dch = hc->chan[ch].dch;
-			if (r_irq_statech & 1) {
-				HFC_outb_nodebug(hc, R_ST_SEL,
-						 hc->chan[ch].port);
-				/* undocumented: delay after R_ST_SEL */
-				udelay(1);
-				/* undocumented: status changes during read */
-				st_status = HFC_inb_nodebug(hc, A_ST_RD_STATE);
-				while (st_status != (temp =
-						     HFC_inb_nodebug(hc, A_ST_RD_STATE))) {
-					if (debug & DEBUG_HFCMULTI_STATE)
-						printk(KERN_DEBUG "%s: reread "
-						       "STATE because %d!=%d\n",
-						       __func__, temp,
-						       st_status);
-					st_status = temp; /* repeat */
-				}
-
-				/* Speech Design TE-sync indication */
-				if (test_bit(HFC_CHIP_PLXSD, &hc->chip) &&
-				    dch->dev.D.protocol == ISDN_P_TE_S0) {
-					if (st_status & V_FR_SYNC_ST)
-						hc->syncronized |=
-							(1 << hc->chan[ch].port);
-					else
-						hc->syncronized &=
-							~(1 << hc->chan[ch].port);
-				}
-				dch->state = st_status & 0x0f;
-				if (dch->dev.D.protocol == ISDN_P_NT_S0)
-					active = 3;
-				else
-					active = 7;
-				if (dch->state == active) {
-					HFC_outb_nodebug(hc, R_FIFO,
-							 (ch << 1) | 1);
-					HFC_wait_nodebug(hc);
-					HFC_outb_nodebug(hc,
-							 R_INC_RES_FIFO, V_RES_F);
-					HFC_wait_nodebug(hc);
-					dch->tx_idx = 0;
-				}
-				schedule_event(dch, FLG_PHCHANGE);
-				if (debug & DEBUG_HFCMULTI_STATE)
-					printk(KERN_DEBUG
-					       "%s: S/T newstate %x port %d\n",
-					       __func__, dch->state,
-					       hc->chan[ch].port);
-			}
-			r_irq_statech >>= 1;
-		}
-	}
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip))
-		plxsd_checksync(hc, 0);
-}
-
-static void
-fifo_irq(struct hfc_multi *hc, int block)
-{
-	int	ch, j;
-	struct dchannel	*dch;
-	struct bchannel	*bch;
-	u_char r_irq_fifo_bl;
-
-	r_irq_fifo_bl = HFC_inb_nodebug(hc, R_IRQ_FIFO_BL0 + block);
-	j = 0;
-	while (j < 8) {
-		ch = (block << 2) + (j >> 1);
-		dch = hc->chan[ch].dch;
-		bch = hc->chan[ch].bch;
-		if (((!dch) && (!bch)) || (!hc->created[hc->chan[ch].port])) {
-			j += 2;
-			continue;
-		}
-		if (dch && (r_irq_fifo_bl & (1 << j)) &&
-		    test_bit(FLG_ACTIVE, &dch->Flags)) {
-			hfcmulti_tx(hc, ch);
-			/* start fifo */
-			HFC_outb_nodebug(hc, R_FIFO, 0);
-			HFC_wait_nodebug(hc);
-		}
-		if (bch && (r_irq_fifo_bl & (1 << j)) &&
-		    test_bit(FLG_ACTIVE, &bch->Flags)) {
-			hfcmulti_tx(hc, ch);
-			/* start fifo */
-			HFC_outb_nodebug(hc, R_FIFO, 0);
-			HFC_wait_nodebug(hc);
-		}
-		j++;
-		if (dch && (r_irq_fifo_bl & (1 << j)) &&
-		    test_bit(FLG_ACTIVE, &dch->Flags)) {
-			hfcmulti_rx(hc, ch);
-		}
-		if (bch && (r_irq_fifo_bl & (1 << j)) &&
-		    test_bit(FLG_ACTIVE, &bch->Flags)) {
-			hfcmulti_rx(hc, ch);
-		}
-		j++;
-	}
-}
-
-#ifdef IRQ_DEBUG
-int irqsem;
-#endif
-static irqreturn_t
-hfcmulti_interrupt(int intno, void *dev_id)
-{
-#ifdef IRQCOUNT_DEBUG
-	static int iq1 = 0, iq2 = 0, iq3 = 0, iq4 = 0,
-		iq5 = 0, iq6 = 0, iqcnt = 0;
-#endif
-	struct hfc_multi	*hc = dev_id;
-	struct dchannel		*dch;
-	u_char			r_irq_statech, status, r_irq_misc, r_irq_oview;
-	int			i;
-	void __iomem		*plx_acc;
-	u_short			wval;
-	u_char			e1_syncsta, temp, temp2;
-	u_long			flags;
-
-	if (!hc) {
-		printk(KERN_ERR "HFC-multi: Spurious interrupt!\n");
-		return IRQ_NONE;
-	}
-
-	spin_lock(&hc->lock);
-
-#ifdef IRQ_DEBUG
-	if (irqsem)
-		printk(KERN_ERR "irq for card %d during irq from "
-		       "card %d, this is no bug.\n", hc->id + 1, irqsem);
-	irqsem = hc->id + 1;
-#endif
-#ifdef CONFIG_MISDN_HFCMULTI_8xx
-	if (hc->immap->im_cpm.cp_pbdat & hc->pb_irqmsk)
-		goto irq_notforus;
-#endif
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-		spin_lock_irqsave(&plx_lock, flags);
-		plx_acc = hc->plx_membase + PLX_INTCSR;
-		wval = readw(plx_acc);
-		spin_unlock_irqrestore(&plx_lock, flags);
-		if (!(wval & PLX_INTCSR_LINTI1_STATUS))
-			goto irq_notforus;
-	}
-
-	status = HFC_inb_nodebug(hc, R_STATUS);
-	r_irq_statech = HFC_inb_nodebug(hc, R_IRQ_STATECH);
-#ifdef IRQCOUNT_DEBUG
-	if (r_irq_statech)
-		iq1++;
-	if (status & V_DTMF_STA)
-		iq2++;
-	if (status & V_LOST_STA)
-		iq3++;
-	if (status & V_EXT_IRQSTA)
-		iq4++;
-	if (status & V_MISC_IRQSTA)
-		iq5++;
-	if (status & V_FR_IRQSTA)
-		iq6++;
-	if (iqcnt++ > 5000) {
-		printk(KERN_ERR "iq1:%x iq2:%x iq3:%x iq4:%x iq5:%x iq6:%x\n",
-		       iq1, iq2, iq3, iq4, iq5, iq6);
-		iqcnt = 0;
-	}
-#endif
-
-	if (!r_irq_statech &&
-	    !(status & (V_DTMF_STA | V_LOST_STA | V_EXT_IRQSTA |
-			V_MISC_IRQSTA | V_FR_IRQSTA))) {
-		/* irq is not for us */
-		goto irq_notforus;
-	}
-	hc->irqcnt++;
-	if (r_irq_statech) {
-		if (hc->ctype != HFC_TYPE_E1)
-			ph_state_irq(hc, r_irq_statech);
-	}
-	if (status & V_EXT_IRQSTA)
-		; /* external IRQ */
-	if (status & V_LOST_STA) {
-		/* LOST IRQ */
-		HFC_outb(hc, R_INC_RES_FIFO, V_RES_LOST); /* clear irq! */
-	}
-	if (status & V_MISC_IRQSTA) {
-		/* misc IRQ */
-		r_irq_misc = HFC_inb_nodebug(hc, R_IRQ_MISC);
-		r_irq_misc &= hc->hw.r_irqmsk_misc; /* ignore disabled irqs */
-		if (r_irq_misc & V_STA_IRQ) {
-			if (hc->ctype == HFC_TYPE_E1) {
-				/* state machine */
-				dch = hc->chan[hc->dnum[0]].dch;
-				e1_syncsta = HFC_inb_nodebug(hc, R_SYNC_STA);
-				if (test_bit(HFC_CHIP_PLXSD, &hc->chip)
-				    && hc->e1_getclock) {
-					if (e1_syncsta & V_FR_SYNC_E1)
-						hc->syncronized = 1;
-					else
-						hc->syncronized = 0;
-				}
-				/* undocumented: status changes during read */
-				temp = HFC_inb_nodebug(hc, R_E1_RD_STA);
-				while (temp != (temp2 =
-						      HFC_inb_nodebug(hc, R_E1_RD_STA))) {
-					if (debug & DEBUG_HFCMULTI_STATE)
-						printk(KERN_DEBUG "%s: reread "
-						       "STATE because %d!=%d\n",
-						    __func__, temp, temp2);
-					temp = temp2; /* repeat */
-				}
-				/* broadcast state change to all fragments */
-				if (debug & DEBUG_HFCMULTI_STATE)
-					printk(KERN_DEBUG
-					       "%s: E1 (id=%d) newstate %x\n",
-					    __func__, hc->id, temp & 0x7);
-				for (i = 0; i < hc->ports; i++) {
-					dch = hc->chan[hc->dnum[i]].dch;
-					dch->state = temp & 0x7;
-					schedule_event(dch, FLG_PHCHANGE);
-				}
-
-				if (test_bit(HFC_CHIP_PLXSD, &hc->chip))
-					plxsd_checksync(hc, 0);
-			}
-		}
-		if (r_irq_misc & V_TI_IRQ) {
-			if (hc->iclock_on)
-				mISDN_clock_update(hc->iclock, poll, NULL);
-			handle_timer_irq(hc);
-		}
-
-		if (r_irq_misc & V_DTMF_IRQ)
-			hfcmulti_dtmf(hc);
-
-		if (r_irq_misc & V_IRQ_PROC) {
-			static int irq_proc_cnt;
-			if (!irq_proc_cnt++)
-				printk(KERN_DEBUG "%s: got V_IRQ_PROC -"
-				       " this should not happen\n", __func__);
-		}
-
-	}
-	if (status & V_FR_IRQSTA) {
-		/* FIFO IRQ */
-		r_irq_oview = HFC_inb_nodebug(hc, R_IRQ_OVIEW);
-		for (i = 0; i < 8; i++) {
-			if (r_irq_oview & (1 << i))
-				fifo_irq(hc, i);
-		}
-	}
-
-#ifdef IRQ_DEBUG
-	irqsem = 0;
-#endif
-	spin_unlock(&hc->lock);
-	return IRQ_HANDLED;
-
-irq_notforus:
-#ifdef IRQ_DEBUG
-	irqsem = 0;
-#endif
-	spin_unlock(&hc->lock);
-	return IRQ_NONE;
-}
-
-
-/*
- * timer callback for D-chan busy resolution. Currently no function
- */
-
-static void
-hfcmulti_dbusy_timer(struct hfc_multi *hc)
-{
-}
-
-
-/*
- * activate/deactivate hardware for selected channels and mode
- *
- * configure B-channel with the given protocol
- * ch eqals to the HFC-channel (0-31)
- * ch is the number of channel (0-4,4-7,8-11,12-15,16-19,20-23,24-27,28-31
- * for S/T, 1-31 for E1)
- * the hdlc interrupts will be set/unset
- */
-static int
-mode_hfcmulti(struct hfc_multi *hc, int ch, int protocol, int slot_tx,
-	      int bank_tx, int slot_rx, int bank_rx)
-{
-	int flow_tx = 0, flow_rx = 0, routing = 0;
-	int oslot_tx, oslot_rx;
-	int conf;
-
-	if (ch < 0 || ch > 31)
-		return -EINVAL;
-	oslot_tx = hc->chan[ch].slot_tx;
-	oslot_rx = hc->chan[ch].slot_rx;
-	conf = hc->chan[ch].conf;
-
-	if (debug & DEBUG_HFCMULTI_MODE)
-		printk(KERN_DEBUG
-		       "%s: card %d channel %d protocol %x slot old=%d new=%d "
-		       "bank new=%d (TX) slot old=%d new=%d bank new=%d (RX)\n",
-		       __func__, hc->id, ch, protocol, oslot_tx, slot_tx,
-		       bank_tx, oslot_rx, slot_rx, bank_rx);
-
-	if (oslot_tx >= 0 && slot_tx != oslot_tx) {
-		/* remove from slot */
-		if (debug & DEBUG_HFCMULTI_MODE)
-			printk(KERN_DEBUG "%s: remove from slot %d (TX)\n",
-			       __func__, oslot_tx);
-		if (hc->slot_owner[oslot_tx << 1] == ch) {
-			HFC_outb(hc, R_SLOT, oslot_tx << 1);
-			HFC_outb(hc, A_SL_CFG, 0);
-			if (hc->ctype != HFC_TYPE_XHFC)
-				HFC_outb(hc, A_CONF, 0);
-			hc->slot_owner[oslot_tx << 1] = -1;
-		} else {
-			if (debug & DEBUG_HFCMULTI_MODE)
-				printk(KERN_DEBUG
-				       "%s: we are not owner of this tx slot "
-				       "anymore, channel %d is.\n",
-				       __func__, hc->slot_owner[oslot_tx << 1]);
-		}
-	}
-
-	if (oslot_rx >= 0 && slot_rx != oslot_rx) {
-		/* remove from slot */
-		if (debug & DEBUG_HFCMULTI_MODE)
-			printk(KERN_DEBUG
-			       "%s: remove from slot %d (RX)\n",
-			       __func__, oslot_rx);
-		if (hc->slot_owner[(oslot_rx << 1) | 1] == ch) {
-			HFC_outb(hc, R_SLOT, (oslot_rx << 1) | V_SL_DIR);
-			HFC_outb(hc, A_SL_CFG, 0);
-			hc->slot_owner[(oslot_rx << 1) | 1] = -1;
-		} else {
-			if (debug & DEBUG_HFCMULTI_MODE)
-				printk(KERN_DEBUG
-				       "%s: we are not owner of this rx slot "
-				       "anymore, channel %d is.\n",
-				       __func__,
-				       hc->slot_owner[(oslot_rx << 1) | 1]);
-		}
-	}
-
-	if (slot_tx < 0) {
-		flow_tx = 0x80; /* FIFO->ST */
-		/* disable pcm slot */
-		hc->chan[ch].slot_tx = -1;
-		hc->chan[ch].bank_tx = 0;
-	} else {
-		/* set pcm slot */
-		if (hc->chan[ch].txpending)
-			flow_tx = 0x80; /* FIFO->ST */
-		else
-			flow_tx = 0xc0; /* PCM->ST */
-		/* put on slot */
-		routing = bank_tx ? 0xc0 : 0x80;
-		if (conf >= 0 || bank_tx > 1)
-			routing = 0x40; /* loop */
-		if (debug & DEBUG_HFCMULTI_MODE)
-			printk(KERN_DEBUG "%s: put channel %d to slot %d bank"
-			       " %d flow %02x routing %02x conf %d (TX)\n",
-			       __func__, ch, slot_tx, bank_tx,
-			       flow_tx, routing, conf);
-		HFC_outb(hc, R_SLOT, slot_tx << 1);
-		HFC_outb(hc, A_SL_CFG, (ch << 1) | routing);
-		if (hc->ctype != HFC_TYPE_XHFC)
-			HFC_outb(hc, A_CONF,
-				 (conf < 0) ? 0 : (conf | V_CONF_SL));
-		hc->slot_owner[slot_tx << 1] = ch;
-		hc->chan[ch].slot_tx = slot_tx;
-		hc->chan[ch].bank_tx = bank_tx;
-	}
-	if (slot_rx < 0) {
-		/* disable pcm slot */
-		flow_rx = 0x80; /* ST->FIFO */
-		hc->chan[ch].slot_rx = -1;
-		hc->chan[ch].bank_rx = 0;
-	} else {
-		/* set pcm slot */
-		if (hc->chan[ch].txpending)
-			flow_rx = 0x80; /* ST->FIFO */
-		else
-			flow_rx = 0xc0; /* ST->(FIFO,PCM) */
-		/* put on slot */
-		routing = bank_rx ? 0x80 : 0xc0; /* reversed */
-		if (conf >= 0 || bank_rx > 1)
-			routing = 0x40; /* loop */
-		if (debug & DEBUG_HFCMULTI_MODE)
-			printk(KERN_DEBUG "%s: put channel %d to slot %d bank"
-			       " %d flow %02x routing %02x conf %d (RX)\n",
-			       __func__, ch, slot_rx, bank_rx,
-			       flow_rx, routing, conf);
-		HFC_outb(hc, R_SLOT, (slot_rx << 1) | V_SL_DIR);
-		HFC_outb(hc, A_SL_CFG, (ch << 1) | V_CH_DIR | routing);
-		hc->slot_owner[(slot_rx << 1) | 1] = ch;
-		hc->chan[ch].slot_rx = slot_rx;
-		hc->chan[ch].bank_rx = bank_rx;
-	}
-
-	switch (protocol) {
-	case (ISDN_P_NONE):
-		/* disable TX fifo */
-		HFC_outb(hc, R_FIFO, ch << 1);
-		HFC_wait(hc);
-		HFC_outb(hc, A_CON_HDLC, flow_tx | 0x00 | V_IFF);
-		HFC_outb(hc, A_SUBCH_CFG, 0);
-		HFC_outb(hc, A_IRQ_MSK, 0);
-		HFC_outb(hc, R_INC_RES_FIFO, V_RES_F);
-		HFC_wait(hc);
-		/* disable RX fifo */
-		HFC_outb(hc, R_FIFO, (ch << 1) | 1);
-		HFC_wait(hc);
-		HFC_outb(hc, A_CON_HDLC, flow_rx | 0x00);
-		HFC_outb(hc, A_SUBCH_CFG, 0);
-		HFC_outb(hc, A_IRQ_MSK, 0);
-		HFC_outb(hc, R_INC_RES_FIFO, V_RES_F);
-		HFC_wait(hc);
-		if (hc->chan[ch].bch && hc->ctype != HFC_TYPE_E1) {
-			hc->hw.a_st_ctrl0[hc->chan[ch].port] &=
-				((ch & 0x3) == 0) ? ~V_B1_EN : ~V_B2_EN;
-			HFC_outb(hc, R_ST_SEL, hc->chan[ch].port);
-			/* undocumented: delay after R_ST_SEL */
-			udelay(1);
-			HFC_outb(hc, A_ST_CTRL0,
-				 hc->hw.a_st_ctrl0[hc->chan[ch].port]);
-		}
-		if (hc->chan[ch].bch) {
-			test_and_clear_bit(FLG_HDLC, &hc->chan[ch].bch->Flags);
-			test_and_clear_bit(FLG_TRANSPARENT,
-					   &hc->chan[ch].bch->Flags);
-		}
-		break;
-	case (ISDN_P_B_RAW): /* B-channel */
-
-		if (test_bit(HFC_CHIP_B410P, &hc->chip) &&
-		    (hc->chan[ch].slot_rx < 0) &&
-		    (hc->chan[ch].slot_tx < 0)) {
-
-			printk(KERN_DEBUG
-			       "Setting B-channel %d to echo cancelable "
-			       "state on PCM slot %d\n", ch,
-			       ((ch / 4) * 8) + ((ch % 4) * 4) + 1);
-			printk(KERN_DEBUG
-			       "Enabling pass through for channel\n");
-			vpm_out(hc, ch, ((ch / 4) * 8) +
-				((ch % 4) * 4) + 1, 0x01);
-			/* rx path */
-			/* S/T -> PCM */
-			HFC_outb(hc, R_FIFO, (ch << 1));
-			HFC_wait(hc);
-			HFC_outb(hc, A_CON_HDLC, 0xc0 | V_HDLC_TRP | V_IFF);
-			HFC_outb(hc, R_SLOT, (((ch / 4) * 8) +
-					      ((ch % 4) * 4) + 1) << 1);
-			HFC_outb(hc, A_SL_CFG, 0x80 | (ch << 1));
-
-			/* PCM -> FIFO */
-			HFC_outb(hc, R_FIFO, 0x20 | (ch << 1) | 1);
-			HFC_wait(hc);
-			HFC_outb(hc, A_CON_HDLC, 0x20 | V_HDLC_TRP | V_IFF);
-			HFC_outb(hc, A_SUBCH_CFG, 0);
-			HFC_outb(hc, A_IRQ_MSK, 0);
-			if (hc->chan[ch].protocol != protocol) {
-				HFC_outb(hc, R_INC_RES_FIFO, V_RES_F);
-				HFC_wait(hc);
-			}
-			HFC_outb(hc, R_SLOT, ((((ch / 4) * 8) +
-					       ((ch % 4) * 4) + 1) << 1) | 1);
-			HFC_outb(hc, A_SL_CFG, 0x80 | 0x20 | (ch << 1) | 1);
-
-			/* tx path */
-			/* PCM -> S/T */
-			HFC_outb(hc, R_FIFO, (ch << 1) | 1);
-			HFC_wait(hc);
-			HFC_outb(hc, A_CON_HDLC, 0xc0 | V_HDLC_TRP | V_IFF);
-			HFC_outb(hc, R_SLOT, ((((ch / 4) * 8) +
-					       ((ch % 4) * 4)) << 1) | 1);
-			HFC_outb(hc, A_SL_CFG, 0x80 | 0x40 | (ch << 1) | 1);
-
-			/* FIFO -> PCM */
-			HFC_outb(hc, R_FIFO, 0x20 | (ch << 1));
-			HFC_wait(hc);
-			HFC_outb(hc, A_CON_HDLC, 0x20 | V_HDLC_TRP | V_IFF);
-			HFC_outb(hc, A_SUBCH_CFG, 0);
-			HFC_outb(hc, A_IRQ_MSK, 0);
-			if (hc->chan[ch].protocol != protocol) {
-				HFC_outb(hc, R_INC_RES_FIFO, V_RES_F);
-				HFC_wait(hc);
-			}
-			/* tx silence */
-			HFC_outb_nodebug(hc, A_FIFO_DATA0_NOINC, hc->silence);
-			HFC_outb(hc, R_SLOT, (((ch / 4) * 8) +
-					      ((ch % 4) * 4)) << 1);
-			HFC_outb(hc, A_SL_CFG, 0x80 | 0x20 | (ch << 1));
-		} else {
-			/* enable TX fifo */
-			HFC_outb(hc, R_FIFO, ch << 1);
-			HFC_wait(hc);
-			if (hc->ctype == HFC_TYPE_XHFC)
-				HFC_outb(hc, A_CON_HDLC, flow_tx | 0x07 << 2 |
-					 V_HDLC_TRP | V_IFF);
-			/* Enable FIFO, no interrupt */
-			else
-				HFC_outb(hc, A_CON_HDLC, flow_tx | 0x00 |
-					 V_HDLC_TRP | V_IFF);
-			HFC_outb(hc, A_SUBCH_CFG, 0);
-			HFC_outb(hc, A_IRQ_MSK, 0);
-			if (hc->chan[ch].protocol != protocol) {
-				HFC_outb(hc, R_INC_RES_FIFO, V_RES_F);
-				HFC_wait(hc);
-			}
-			/* tx silence */
-			HFC_outb_nodebug(hc, A_FIFO_DATA0_NOINC, hc->silence);
-			/* enable RX fifo */
-			HFC_outb(hc, R_FIFO, (ch << 1) | 1);
-			HFC_wait(hc);
-			if (hc->ctype == HFC_TYPE_XHFC)
-				HFC_outb(hc, A_CON_HDLC, flow_rx | 0x07 << 2 |
-					 V_HDLC_TRP);
-			/* Enable FIFO, no interrupt*/
-			else
-				HFC_outb(hc, A_CON_HDLC, flow_rx | 0x00 |
-					 V_HDLC_TRP);
-			HFC_outb(hc, A_SUBCH_CFG, 0);
-			HFC_outb(hc, A_IRQ_MSK, 0);
-			if (hc->chan[ch].protocol != protocol) {
-				HFC_outb(hc, R_INC_RES_FIFO, V_RES_F);
-				HFC_wait(hc);
-			}
-		}
-		if (hc->ctype != HFC_TYPE_E1) {
-			hc->hw.a_st_ctrl0[hc->chan[ch].port] |=
-				((ch & 0x3) == 0) ? V_B1_EN : V_B2_EN;
-			HFC_outb(hc, R_ST_SEL, hc->chan[ch].port);
-			/* undocumented: delay after R_ST_SEL */
-			udelay(1);
-			HFC_outb(hc, A_ST_CTRL0,
-				 hc->hw.a_st_ctrl0[hc->chan[ch].port]);
-		}
-		if (hc->chan[ch].bch)
-			test_and_set_bit(FLG_TRANSPARENT,
-					 &hc->chan[ch].bch->Flags);
-		break;
-	case (ISDN_P_B_HDLC): /* B-channel */
-	case (ISDN_P_TE_S0): /* D-channel */
-	case (ISDN_P_NT_S0):
-	case (ISDN_P_TE_E1):
-	case (ISDN_P_NT_E1):
-		/* enable TX fifo */
-		HFC_outb(hc, R_FIFO, ch << 1);
-		HFC_wait(hc);
-		if (hc->ctype == HFC_TYPE_E1 || hc->chan[ch].bch) {
-			/* E1 or B-channel */
-			HFC_outb(hc, A_CON_HDLC, flow_tx | 0x04);
-			HFC_outb(hc, A_SUBCH_CFG, 0);
-		} else {
-			/* D-Channel without HDLC fill flags */
-			HFC_outb(hc, A_CON_HDLC, flow_tx | 0x04 | V_IFF);
-			HFC_outb(hc, A_SUBCH_CFG, 2);
-		}
-		HFC_outb(hc, A_IRQ_MSK, V_IRQ);
-		HFC_outb(hc, R_INC_RES_FIFO, V_RES_F);
-		HFC_wait(hc);
-		/* enable RX fifo */
-		HFC_outb(hc, R_FIFO, (ch << 1) | 1);
-		HFC_wait(hc);
-		HFC_outb(hc, A_CON_HDLC, flow_rx | 0x04);
-		if (hc->ctype == HFC_TYPE_E1 || hc->chan[ch].bch)
-			HFC_outb(hc, A_SUBCH_CFG, 0); /* full 8 bits */
-		else
-			HFC_outb(hc, A_SUBCH_CFG, 2); /* 2 bits dchannel */
-		HFC_outb(hc, A_IRQ_MSK, V_IRQ);
-		HFC_outb(hc, R_INC_RES_FIFO, V_RES_F);
-		HFC_wait(hc);
-		if (hc->chan[ch].bch) {
-			test_and_set_bit(FLG_HDLC, &hc->chan[ch].bch->Flags);
-			if (hc->ctype != HFC_TYPE_E1) {
-				hc->hw.a_st_ctrl0[hc->chan[ch].port] |=
-					((ch & 0x3) == 0) ? V_B1_EN : V_B2_EN;
-				HFC_outb(hc, R_ST_SEL, hc->chan[ch].port);
-				/* undocumented: delay after R_ST_SEL */
-				udelay(1);
-				HFC_outb(hc, A_ST_CTRL0,
-					 hc->hw.a_st_ctrl0[hc->chan[ch].port]);
-			}
-		}
-		break;
-	default:
-		printk(KERN_DEBUG "%s: protocol not known %x\n",
-		       __func__, protocol);
-		hc->chan[ch].protocol = ISDN_P_NONE;
-		return -ENOPROTOOPT;
-	}
-	hc->chan[ch].protocol = protocol;
-	return 0;
-}
-
-
-/*
- * connect/disconnect PCM
- */
-
-static void
-hfcmulti_pcm(struct hfc_multi *hc, int ch, int slot_tx, int bank_tx,
-	     int slot_rx, int bank_rx)
-{
-	if (slot_tx < 0 || slot_rx < 0 || bank_tx < 0 || bank_rx < 0) {
-		/* disable PCM */
-		mode_hfcmulti(hc, ch, hc->chan[ch].protocol, -1, 0, -1, 0);
-		return;
-	}
-
-	/* enable pcm */
-	mode_hfcmulti(hc, ch, hc->chan[ch].protocol, slot_tx, bank_tx,
-		      slot_rx, bank_rx);
-}
-
-/*
- * set/disable conference
- */
-
-static void
-hfcmulti_conf(struct hfc_multi *hc, int ch, int num)
-{
-	if (num >= 0 && num <= 7)
-		hc->chan[ch].conf = num;
-	else
-		hc->chan[ch].conf = -1;
-	mode_hfcmulti(hc, ch, hc->chan[ch].protocol, hc->chan[ch].slot_tx,
-		      hc->chan[ch].bank_tx, hc->chan[ch].slot_rx,
-		      hc->chan[ch].bank_rx);
-}
-
-
-/*
- * set/disable sample loop
- */
-
-/* NOTE: this function is experimental and therefore disabled */
-
-/*
- * Layer 1 callback function
- */
-static int
-hfcm_l1callback(struct dchannel *dch, u_int cmd)
-{
-	struct hfc_multi	*hc = dch->hw;
-	struct sk_buff_head	free_queue;
-	u_long	flags;
-
-	switch (cmd) {
-	case INFO3_P8:
-	case INFO3_P10:
-		break;
-	case HW_RESET_REQ:
-		/* start activation */
-		spin_lock_irqsave(&hc->lock, flags);
-		if (hc->ctype == HFC_TYPE_E1) {
-			if (debug & DEBUG_HFCMULTI_MSG)
-				printk(KERN_DEBUG
-				       "%s: HW_RESET_REQ no BRI\n",
-				       __func__);
-		} else {
-			HFC_outb(hc, R_ST_SEL, hc->chan[dch->slot].port);
-			/* undocumented: delay after R_ST_SEL */
-			udelay(1);
-			HFC_outb(hc, A_ST_WR_STATE, V_ST_LD_STA | 3); /* F3 */
-			udelay(6); /* wait at least 5,21us */
-			HFC_outb(hc, A_ST_WR_STATE, 3);
-			HFC_outb(hc, A_ST_WR_STATE, 3 | (V_ST_ACT * 3));
-			/* activate */
-		}
-		spin_unlock_irqrestore(&hc->lock, flags);
-		l1_event(dch->l1, HW_POWERUP_IND);
-		break;
-	case HW_DEACT_REQ:
-		__skb_queue_head_init(&free_queue);
-		/* start deactivation */
-		spin_lock_irqsave(&hc->lock, flags);
-		if (hc->ctype == HFC_TYPE_E1) {
-			if (debug & DEBUG_HFCMULTI_MSG)
-				printk(KERN_DEBUG
-				       "%s: HW_DEACT_REQ no BRI\n",
-				       __func__);
-		} else {
-			HFC_outb(hc, R_ST_SEL, hc->chan[dch->slot].port);
-			/* undocumented: delay after R_ST_SEL */
-			udelay(1);
-			HFC_outb(hc, A_ST_WR_STATE, V_ST_ACT * 2);
-			/* deactivate */
-			if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-				hc->syncronized &=
-					~(1 << hc->chan[dch->slot].port);
-				plxsd_checksync(hc, 0);
-			}
-		}
-		skb_queue_splice_init(&dch->squeue, &free_queue);
-		if (dch->tx_skb) {
-			__skb_queue_tail(&free_queue, dch->tx_skb);
-			dch->tx_skb = NULL;
-		}
-		dch->tx_idx = 0;
-		if (dch->rx_skb) {
-			__skb_queue_tail(&free_queue, dch->rx_skb);
-			dch->rx_skb = NULL;
-		}
-		test_and_clear_bit(FLG_TX_BUSY, &dch->Flags);
-		if (test_and_clear_bit(FLG_BUSY_TIMER, &dch->Flags))
-			del_timer(&dch->timer);
-		spin_unlock_irqrestore(&hc->lock, flags);
-		__skb_queue_purge(&free_queue);
-		break;
-	case HW_POWERUP_REQ:
-		spin_lock_irqsave(&hc->lock, flags);
-		if (hc->ctype == HFC_TYPE_E1) {
-			if (debug & DEBUG_HFCMULTI_MSG)
-				printk(KERN_DEBUG
-				       "%s: HW_POWERUP_REQ no BRI\n",
-				       __func__);
-		} else {
-			HFC_outb(hc, R_ST_SEL, hc->chan[dch->slot].port);
-			/* undocumented: delay after R_ST_SEL */
-			udelay(1);
-			HFC_outb(hc, A_ST_WR_STATE, 3 | 0x10); /* activate */
-			udelay(6); /* wait at least 5,21us */
-			HFC_outb(hc, A_ST_WR_STATE, 3); /* activate */
-		}
-		spin_unlock_irqrestore(&hc->lock, flags);
-		break;
-	case PH_ACTIVATE_IND:
-		test_and_set_bit(FLG_ACTIVE, &dch->Flags);
-		_queue_data(&dch->dev.D, cmd, MISDN_ID_ANY, 0, NULL,
-			    GFP_ATOMIC);
-		break;
-	case PH_DEACTIVATE_IND:
-		test_and_clear_bit(FLG_ACTIVE, &dch->Flags);
-		_queue_data(&dch->dev.D, cmd, MISDN_ID_ANY, 0, NULL,
-			    GFP_ATOMIC);
-		break;
-	default:
-		if (dch->debug & DEBUG_HW)
-			printk(KERN_DEBUG "%s: unknown command %x\n",
-			       __func__, cmd);
-		return -1;
-	}
-	return 0;
-}
-
-/*
- * Layer2 -> Layer 1 Transfer
- */
-
-static int
-handle_dmsg(struct mISDNchannel *ch, struct sk_buff *skb)
-{
-	struct mISDNdevice	*dev = container_of(ch, struct mISDNdevice, D);
-	struct dchannel		*dch = container_of(dev, struct dchannel, dev);
-	struct hfc_multi	*hc = dch->hw;
-	struct mISDNhead	*hh = mISDN_HEAD_P(skb);
-	int			ret = -EINVAL;
-	unsigned int		id;
-	u_long			flags;
-
-	switch (hh->prim) {
-	case PH_DATA_REQ:
-		if (skb->len < 1)
-			break;
-		spin_lock_irqsave(&hc->lock, flags);
-		ret = dchannel_senddata(dch, skb);
-		if (ret > 0) { /* direct TX */
-			id = hh->id; /* skb can be freed */
-			hfcmulti_tx(hc, dch->slot);
-			ret = 0;
-			/* start fifo */
-			HFC_outb(hc, R_FIFO, 0);
-			HFC_wait(hc);
-			spin_unlock_irqrestore(&hc->lock, flags);
-			queue_ch_frame(ch, PH_DATA_CNF, id, NULL);
-		} else
-			spin_unlock_irqrestore(&hc->lock, flags);
-		return ret;
-	case PH_ACTIVATE_REQ:
-		if (dch->dev.D.protocol != ISDN_P_TE_S0) {
-			spin_lock_irqsave(&hc->lock, flags);
-			ret = 0;
-			if (debug & DEBUG_HFCMULTI_MSG)
-				printk(KERN_DEBUG
-				       "%s: PH_ACTIVATE port %d (0..%d)\n",
-				       __func__, hc->chan[dch->slot].port,
-				       hc->ports - 1);
-			/* start activation */
-			if (hc->ctype == HFC_TYPE_E1) {
-				ph_state_change(dch);
-				if (debug & DEBUG_HFCMULTI_STATE)
-					printk(KERN_DEBUG
-					       "%s: E1 report state %x \n",
-					       __func__, dch->state);
-			} else {
-				HFC_outb(hc, R_ST_SEL,
-					 hc->chan[dch->slot].port);
-				/* undocumented: delay after R_ST_SEL */
-				udelay(1);
-				HFC_outb(hc, A_ST_WR_STATE, V_ST_LD_STA | 1);
-				/* G1 */
-				udelay(6); /* wait at least 5,21us */
-				HFC_outb(hc, A_ST_WR_STATE, 1);
-				HFC_outb(hc, A_ST_WR_STATE, 1 |
-					 (V_ST_ACT * 3)); /* activate */
-				dch->state = 1;
-			}
-			spin_unlock_irqrestore(&hc->lock, flags);
-		} else
-			ret = l1_event(dch->l1, hh->prim);
-		break;
-	case PH_DEACTIVATE_REQ:
-		test_and_clear_bit(FLG_L2_ACTIVATED, &dch->Flags);
-		if (dch->dev.D.protocol != ISDN_P_TE_S0) {
-			struct sk_buff_head free_queue;
-
-			__skb_queue_head_init(&free_queue);
-			spin_lock_irqsave(&hc->lock, flags);
-			if (debug & DEBUG_HFCMULTI_MSG)
-				printk(KERN_DEBUG
-				       "%s: PH_DEACTIVATE port %d (0..%d)\n",
-				       __func__, hc->chan[dch->slot].port,
-				       hc->ports - 1);
-			/* start deactivation */
-			if (hc->ctype == HFC_TYPE_E1) {
-				if (debug & DEBUG_HFCMULTI_MSG)
-					printk(KERN_DEBUG
-					       "%s: PH_DEACTIVATE no BRI\n",
-					       __func__);
-			} else {
-				HFC_outb(hc, R_ST_SEL,
-					 hc->chan[dch->slot].port);
-				/* undocumented: delay after R_ST_SEL */
-				udelay(1);
-				HFC_outb(hc, A_ST_WR_STATE, V_ST_ACT * 2);
-				/* deactivate */
-				dch->state = 1;
-			}
-			skb_queue_splice_init(&dch->squeue, &free_queue);
-			if (dch->tx_skb) {
-				__skb_queue_tail(&free_queue, dch->tx_skb);
-				dch->tx_skb = NULL;
-			}
-			dch->tx_idx = 0;
-			if (dch->rx_skb) {
-				__skb_queue_tail(&free_queue, dch->rx_skb);
-				dch->rx_skb = NULL;
-			}
-			test_and_clear_bit(FLG_TX_BUSY, &dch->Flags);
-			if (test_and_clear_bit(FLG_BUSY_TIMER, &dch->Flags))
-				del_timer(&dch->timer);
-#ifdef FIXME
-			if (test_and_clear_bit(FLG_L1_BUSY, &dch->Flags))
-				dchannel_sched_event(&hc->dch, D_CLEARBUSY);
-#endif
-			ret = 0;
-			spin_unlock_irqrestore(&hc->lock, flags);
-			__skb_queue_purge(&free_queue);
-		} else
-			ret = l1_event(dch->l1, hh->prim);
-		break;
-	}
-	if (!ret)
-		dev_kfree_skb(skb);
-	return ret;
-}
-
-static void
-deactivate_bchannel(struct bchannel *bch)
-{
-	struct hfc_multi	*hc = bch->hw;
-	u_long			flags;
-
-	spin_lock_irqsave(&hc->lock, flags);
-	mISDN_clear_bchannel(bch);
-	hc->chan[bch->slot].coeff_count = 0;
-	hc->chan[bch->slot].rx_off = 0;
-	hc->chan[bch->slot].conf = -1;
-	mode_hfcmulti(hc, bch->slot, ISDN_P_NONE, -1, 0, -1, 0);
-	spin_unlock_irqrestore(&hc->lock, flags);
-}
-
-static int
-handle_bmsg(struct mISDNchannel *ch, struct sk_buff *skb)
-{
-	struct bchannel		*bch = container_of(ch, struct bchannel, ch);
-	struct hfc_multi	*hc = bch->hw;
-	int			ret = -EINVAL;
-	struct mISDNhead	*hh = mISDN_HEAD_P(skb);
-	unsigned long		flags;
-
-	switch (hh->prim) {
-	case PH_DATA_REQ:
-		if (!skb->len)
-			break;
-		spin_lock_irqsave(&hc->lock, flags);
-		ret = bchannel_senddata(bch, skb);
-		if (ret > 0) { /* direct TX */
-			hfcmulti_tx(hc, bch->slot);
-			ret = 0;
-			/* start fifo */
-			HFC_outb_nodebug(hc, R_FIFO, 0);
-			HFC_wait_nodebug(hc);
-		}
-		spin_unlock_irqrestore(&hc->lock, flags);
-		return ret;
-	case PH_ACTIVATE_REQ:
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: PH_ACTIVATE ch %d (0..32)\n",
-			       __func__, bch->slot);
-		spin_lock_irqsave(&hc->lock, flags);
-		/* activate B-channel if not already activated */
-		if (!test_and_set_bit(FLG_ACTIVE, &bch->Flags)) {
-			hc->chan[bch->slot].txpending = 0;
-			ret = mode_hfcmulti(hc, bch->slot,
-					    ch->protocol,
-					    hc->chan[bch->slot].slot_tx,
-					    hc->chan[bch->slot].bank_tx,
-					    hc->chan[bch->slot].slot_rx,
-					    hc->chan[bch->slot].bank_rx);
-			if (!ret) {
-				if (ch->protocol == ISDN_P_B_RAW && !hc->dtmf
-				    && test_bit(HFC_CHIP_DTMF, &hc->chip)) {
-					/* start decoder */
-					hc->dtmf = 1;
-					if (debug & DEBUG_HFCMULTI_DTMF)
-						printk(KERN_DEBUG
-						       "%s: start dtmf decoder\n",
-						       __func__);
-					HFC_outb(hc, R_DTMF, hc->hw.r_dtmf |
-						 V_RST_DTMF);
-				}
-			}
-		} else
-			ret = 0;
-		spin_unlock_irqrestore(&hc->lock, flags);
-		if (!ret)
-			_queue_data(ch, PH_ACTIVATE_IND, MISDN_ID_ANY, 0, NULL,
-				    GFP_KERNEL);
-		break;
-	case PH_CONTROL_REQ:
-		spin_lock_irqsave(&hc->lock, flags);
-		switch (hh->id) {
-		case HFC_SPL_LOOP_ON: /* set sample loop */
-			if (debug & DEBUG_HFCMULTI_MSG)
-				printk(KERN_DEBUG
-				       "%s: HFC_SPL_LOOP_ON (len = %d)\n",
-				       __func__, skb->len);
-			ret = 0;
-			break;
-		case HFC_SPL_LOOP_OFF: /* set silence */
-			if (debug & DEBUG_HFCMULTI_MSG)
-				printk(KERN_DEBUG "%s: HFC_SPL_LOOP_OFF\n",
-				       __func__);
-			ret = 0;
-			break;
-		default:
-			printk(KERN_ERR
-			       "%s: unknown PH_CONTROL_REQ info %x\n",
-			       __func__, hh->id);
-			ret = -EINVAL;
-		}
-		spin_unlock_irqrestore(&hc->lock, flags);
-		break;
-	case PH_DEACTIVATE_REQ:
-		deactivate_bchannel(bch); /* locked there */
-		_queue_data(ch, PH_DEACTIVATE_IND, MISDN_ID_ANY, 0, NULL,
-			    GFP_KERNEL);
+		/* plenty of insertion room */
 		ret = 0;
-		break;
 	}
-	if (!ret)
-		dev_kfree_skb(skb);
+out:
+	btrfs_free_path(path);
 	return ret;
 }
 
 /*
- * bchannel control function
- */
-static int
-channel_bctrl(struct bchannel *bch, struct mISDN_ctrl_req *cq)
-{
-	int			ret = 0;
-	struct dsp_features	*features =
-		(struct dsp_features *)(*((u_long *)&cq->p1));
-	struct hfc_multi	*hc = bch->hw;
-	int			slot_tx;
-	int			bank_tx;
-	int			slot_rx;
-	int			bank_rx;
-	int			num;
-
-	switch (cq->op) {
-	case MISDN_CTRL_GETOP:
-		ret = mISDN_ctrl_bchannel(bch, cq);
-		cq->op |= MISDN_CTRL_HFC_OP | MISDN_CTRL_HW_FEATURES_OP;
-		break;
-	case MISDN_CTRL_RX_OFF: /* turn off / on rx stream */
-		ret = mISDN_ctrl_bchannel(bch, cq);
-		hc->chan[bch->slot].rx_off = !!cq->p1;
-		if (!hc->chan[bch->slot].rx_off) {
-			/* reset fifo on rx on */
-			HFC_outb_nodebug(hc, R_FIFO, (bch->slot << 1) | 1);
-			HFC_wait_nodebug(hc);
-			HFC_outb_nodebug(hc, R_INC_RES_FIFO, V_RES_F);
-			HFC_wait_nodebug(hc);
-		}
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: RX_OFF request (nr=%d off=%d)\n",
-			       __func__, bch->nr, hc->chan[bch->slot].rx_off);
-		break;
-	case MISDN_CTRL_FILL_EMPTY:
-		ret = mISDN_ctrl_bchannel(bch, cq);
-		hc->silence = bch->fill[0];
-		memset(hc->silence_data, hc->silence, sizeof(hc->silence_data));
-		break;
-	case MISDN_CTRL_HW_FEATURES: /* fill features structure */
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: HW_FEATURE request\n",
-			       __func__);
-		/* create confirm */
-		features->hfc_id = hc->id;
-		if (test_bit(HFC_CHIP_DTMF, &hc->chip))
-			features->hfc_dtmf = 1;
-		if (test_bit(HFC_CHIP_CONF, &hc->chip))
-			features->hfc_conf = 1;
-		features->hfc_loops = 0;
-		if (test_bit(HFC_CHIP_B410P, &hc->chip)) {
-			features->hfc_echocanhw = 1;
-		} else {
-			features->pcm_id = hc->pcm;
-			features->pcm_slots = hc->slots;
-			features->pcm_banks = 2;
-		}
-		break;
-	case MISDN_CTRL_HFC_PCM_CONN: /* connect to pcm timeslot (0..N) */
-		slot_tx = cq->p1 & 0xff;
-		bank_tx = cq->p1 >> 8;
-		slot_rx = cq->p2 & 0xff;
-		bank_rx = cq->p2 >> 8;
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG
-			       "%s: HFC_PCM_CONN slot %d bank %d (TX) "
-			       "slot %d bank %d (RX)\n",
-			       __func__, slot_tx, bank_tx,
-			       slot_rx, bank_rx);
-		if (slot_tx < hc->slots && bank_tx <= 2 &&
-		    slot_rx < hc->slots && bank_rx <= 2)
-			hfcmulti_pcm(hc, bch->slot,
-				     slot_tx, bank_tx, slot_rx, bank_rx);
-		else {
-			printk(KERN_WARNING
-			       "%s: HFC_PCM_CONN slot %d bank %d (TX) "
-			       "slot %d bank %d (RX) out of range\n",
-			       __func__, slot_tx, bank_tx,
-			       slot_rx, bank_rx);
-			ret = -EINVAL;
-		}
-		break;
-	case MISDN_CTRL_HFC_PCM_DISC: /* release interface from pcm timeslot */
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: HFC_PCM_DISC\n",
-			       __func__);
-		hfcmulti_pcm(hc, bch->slot, -1, 0, -1, 0);
-		break;
-	case MISDN_CTRL_HFC_CONF_JOIN: /* join conference (0..7) */
-		num = cq->p1 & 0xff;
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: HFC_CONF_JOIN conf %d\n",
-			       __func__, num);
-		if (num <= 7)
-			hfcmulti_conf(hc, bch->slot, num);
-		else {
-			printk(KERN_WARNING
-			       "%s: HW_CONF_JOIN conf %d out of range\n",
-			       __func__, num);
-			ret = -EINVAL;
-		}
-		break;
-	case MISDN_CTRL_HFC_CONF_SPLIT: /* split conference */
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: HFC_CONF_SPLIT\n", __func__);
-		hfcmulti_conf(hc, bch->slot, -1);
-		break;
-	case MISDN_CTRL_HFC_ECHOCAN_ON:
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: HFC_ECHOCAN_ON\n", __func__);
-		if (test_bit(HFC_CHIP_B410P, &hc->chip))
-			vpm_echocan_on(hc, bch->slot, cq->p1);
-		else
-			ret = -EINVAL;
-		break;
-
-	case MISDN_CTRL_HFC_ECHOCAN_OFF:
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: HFC_ECHOCAN_OFF\n",
-			       __func__);
-		if (test_bit(HFC_CHIP_B410P, &hc->chip))
-			vpm_echocan_off(hc, bch->slot);
-		else
-			ret = -EINVAL;
-		break;
-	default:
-		ret = mISDN_ctrl_bchannel(bch, cq);
-		break;
-	}
-	return ret;
-}
-
-static int
-hfcm_bctrl(struct mISDNchannel *ch, u_int cmd, void *arg)
-{
-	struct bchannel		*bch = container_of(ch, struct bchannel, ch);
-	struct hfc_multi	*hc = bch->hw;
-	int			err = -EINVAL;
-	u_long	flags;
-
-	if (bch->debug & DEBUG_HW)
-		printk(KERN_DEBUG "%s: cmd:%x %p\n",
-		       __func__, cmd, arg);
-	switch (cmd) {
-	case CLOSE_CHANNEL:
-		test_and_clear_bit(FLG_OPEN, &bch->Flags);
-		deactivate_bchannel(bch); /* locked there */
-		ch->protocol = ISDN_P_NONE;
-		ch->peer = NULL;
-		module_put(THIS_MODULE);
-		err = 0;
-		break;
-	case CONTROL_CHANNEL:
-		spin_lock_irqsave(&hc->lock, flags);
-		err = channel_bctrl(bch, arg);
-		spin_unlock_irqrestore(&hc->lock, flags);
-		break;
-	default:
-		printk(KERN_WARNING "%s: unknown prim(%x)\n",
-		       __func__, cmd);
-	}
-	return err;
-}
-
-/*
- * handle D-channel events
+ * lookup a directory item based on index.  'dir' is the objectid
+ * we're searching in, and 'mod' tells us if you plan on deleting the
+ * item (use mod < 0) or changing the options (use mod > 0)
  *
- * handle state change event
+ * The name is used to make sure the index really points to the name you were
+ * looking for.
  */
-static void
-ph_state_change(struct dchannel *dch)
+struct btrfs_dir_item *
+btrfs_lookup_dir_index_item(struct btrfs_trans_handle *trans,
+			    struct btrfs_root *root,
+			    struct btrfs_path *path, u64 dir,
+			    u64 objectid, const char *name, int name_len,
+			    int mod)
 {
-	struct hfc_multi *hc;
-	int ch, i;
+	int ret;
+	struct btrfs_key key;
+	int ins_len = mod < 0 ? -1 : 0;
+	int cow = mod != 0;
 
-	if (!dch) {
-		printk(KERN_WARNING "%s: ERROR given dch is NULL\n", __func__);
-		return;
-	}
-	hc = dch->hw;
-	ch = dch->slot;
+	key.objectid = dir;
+	key.type = BTRFS_DIR_INDEX_KEY;
+	key.offset = objectid;
 
-	if (hc->ctype == HFC_TYPE_E1) {
-		if (dch->dev.D.protocol == ISDN_P_TE_E1) {
-			if (debug & DEBUG_HFCMULTI_STATE)
-				printk(KERN_DEBUG
-				       "%s: E1 TE (id=%d) newstate %x\n",
-				       __func__, hc->id, dch->state);
-		} else {
-			if (debug & DEBUG_HFCMULTI_STATE)
-				printk(KERN_DEBUG
-				       "%s: E1 NT (id=%d) newstate %x\n",
-				       __func__, hc->id, dch->state);
-		}
-		switch (dch->state) {
-		case (1):
-			if (hc->e1_state != 1) {
-				for (i = 1; i <= 31; i++) {
-					/* reset fifos on e1 activation */
-					HFC_outb_nodebug(hc, R_FIFO,
-							 (i << 1) | 1);
-					HFC_wait_nodebug(hc);
-					HFC_outb_nodebug(hc, R_INC_RES_FIFO,
-							 V_RES_F);
-					HFC_wait_nodebug(hc);
-				}
-			}
-			test_and_set_bit(FLG_ACTIVE, &dch->Flags);
-			_queue_data(&dch->dev.D, PH_ACTIVATE_IND,
-				    MISDN_ID_ANY, 0, NULL, GFP_ATOMIC);
-			break;
+	ret = btrfs_search_slot(trans, root, &key, path, ins_len, cow);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (ret > 0)
+		return ERR_PTR(-ENOENT);
+	return btrfs_match_dir_item_name(root, path, name, name_len);
+}
 
-		default:
-			if (hc->e1_state != 1)
-				return;
-			test_and_clear_bit(FLG_ACTIVE, &dch->Flags);
-			_queue_data(&dch->dev.D, PH_DEACTIVATE_IND,
-				    MISDN_ID_ANY, 0, NULL, GFP_ATOMIC);
-		}
-		hc->e1_state = dch->state;
-	} else {
-		if (dch->dev.D.protocol == ISDN_P_TE_S0) {
-			if (debug & DEBUG_HFCMULTI_STATE)
-				printk(KERN_DEBUG
-				       "%s: S/T TE newstate %x\n",
-				       __func__, dch->state);
-			switch (dch->state) {
-			case (0):
-				l1_event(dch->l1, HW_RESET_IND);
+struct btrfs_dir_item *
+btrfs_search_dir_index_item(struct btrfs_root *root,
+			    struct btrfs_path *path, u64 dirid,
+			    const char *name, int name_len)
+{
+	struct extent_buffer *leaf;
+	struct btrfs_dir_item *di;
+	struct btrfs_key key;
+	u32 nritems;
+	int ret;
+
+	key.objectid = dirid;
+	key.type = BTRFS_DIR_INDEX_KEY;
+	key.offset = 0;
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (ret < 0)
+		return ERR_PTR(ret);
+
+	leaf = path->nodes[0];
+	nritems = btrfs_header_nritems(leaf);
+
+	while (1) {
+		if (path->slots[0] >= nritems) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0)
+				return ERR_PTR(ret);
+			if (ret > 0)
 				break;
-			case (3):
-				l1_event(dch->l1, HW_DEACT_IND);
-				break;
-			case (5):
-			case (8):
-				l1_event(dch->l1, ANYSIGNAL);
-				break;
-			case (6):
-				l1_event(dch->l1, INFO2);
-				break;
-			case (7):
-				l1_event(dch->l1, INFO4_P8);
-				break;
-			}
-		} else {
-			if (debug & DEBUG_HFCMULTI_STATE)
-				printk(KERN_DEBUG "%s: S/T NT newstate %x\n",
-				       __func__, dch->state);
-			switch (dch->state) {
-			case (2):
-				if (hc->chan[ch].nt_timer == 0) {
-					hc->chan[ch].nt_timer = -1;
-					HFC_outb(hc, R_ST_SEL,
-						 hc->chan[ch].port);
-					/* undocumented: delay after R_ST_SEL */
-					udelay(1);
-					HFC_outb(hc, A_ST_WR_STATE, 4 |
-						 V_ST_LD_STA); /* G4 */
-					udelay(6); /* wait at least 5,21us */
-					HFC_outb(hc, A_ST_WR_STATE, 4);
-					dch->state = 4;
-				} else {
-					/* one extra count for the next event */
-					hc->chan[ch].nt_timer =
-						nt_t1_count[poll_timer] + 1;
-					HFC_outb(hc, R_ST_SEL,
-						 hc->chan[ch].port);
-					/* undocumented: delay after R_ST_SEL */
-					udelay(1);
-					/* allow G2 -> G3 transition */
-					HFC_outb(hc, A_ST_WR_STATE, 2 |
-						 V_SET_G2_G3);
-				}
-				break;
-			case (1):
-				hc->chan[ch].nt_timer = -1;
-				test_and_clear_bit(FLG_ACTIVE, &dch->Flags);
-				_queue_data(&dch->dev.D, PH_DEACTIVATE_IND,
-					    MISDN_ID_ANY, 0, NULL, GFP_ATOMIC);
-				break;
-			case (4):
-				hc->chan[ch].nt_timer = -1;
-				break;
-			case (3):
-				hc->chan[ch].nt_timer = -1;
-				test_and_set_bit(FLG_ACTIVE, &dch->Flags);
-				_queue_data(&dch->dev.D, PH_ACTIVATE_IND,
-					    MISDN_ID_ANY, 0, NULL, GFP_ATOMIC);
-				break;
-			}
-		}
-	}
-}
-
-/*
- * called for card mode init message
- */
-
-static void
-hfcmulti_initmode(struct dchannel *dch)
-{
-	struct hfc_multi *hc = dch->hw;
-	u_char		a_st_wr_state, r_e1_wr_sta;
-	int		i, pt;
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: entered\n", __func__);
-
-	i = dch->slot;
-	pt = hc->chan[i].port;
-	if (hc->ctype == HFC_TYPE_E1) {
-		/* E1 */
-		hc->chan[hc->dnum[pt]].slot_tx = -1;
-		hc->chan[hc->dnum[pt]].slot_rx = -1;
-		hc->chan[hc->dnum[pt]].conf = -1;
-		if (hc->dnum[pt]) {
-			mode_hfcmulti(hc, dch->slot, dch->dev.D.protocol,
-				      -1, 0, -1, 0);
-			dch->timer.function = (void *) hfcmulti_dbusy_timer;
-			dch->timer.data = (long) dch;
-			init_timer(&dch->timer);
-		}
-		for (i = 1; i <= 31; i++) {
-			if (!((1 << i) & hc->bmask[pt])) /* skip unused chan */
-				continue;
-			hc->chan[i].slot_tx = -1;
-			hc->chan[i].slot_rx = -1;
-			hc->chan[i].conf = -1;
-			mode_hfcmulti(hc, i, ISDN_P_NONE, -1, 0, -1, 0);
-		}
-	}
-	if (hc->ctype == HFC_TYPE_E1 && pt == 0) {
-		/* E1, port 0 */
-		dch = hc->chan[hc->dnum[0]].dch;
-		if (test_bit(HFC_CFG_REPORT_LOS, &hc->chan[hc->dnum[0]].cfg)) {
-			HFC_outb(hc, R_LOS0, 255); /* 2 ms */
-			HFC_outb(hc, R_LOS1, 255); /* 512 ms */
-		}
-		if (test_bit(HFC_CFG_OPTICAL, &hc->chan[hc->dnum[0]].cfg)) {
-			HFC_outb(hc, R_RX0, 0);
-			hc->hw.r_tx0 = 0 | V_OUT_EN;
-		} else {
-			HFC_outb(hc, R_RX0, 1);
-			hc->hw.r_tx0 = 1 | V_OUT_EN;
-		}
-		hc->hw.r_tx1 = V_ATX | V_NTRI;
-		HFC_outb(hc, R_TX0, hc->hw.r_tx0);
-		HFC_outb(hc, R_TX1, hc->hw.r_tx1);
-		HFC_outb(hc, R_TX_FR0, 0x00);
-		HFC_outb(hc, R_TX_FR1, 0xf8);
-
-		if (test_bit(HFC_CFG_CRC4, &hc->chan[hc->dnum[0]].cfg))
-			HFC_outb(hc, R_TX_FR2, V_TX_MF | V_TX_E | V_NEG_E);
-
-		HFC_outb(hc, R_RX_FR0, V_AUTO_RESYNC | V_AUTO_RECO | 0);
-
-		if (test_bit(HFC_CFG_CRC4, &hc->chan[hc->dnum[0]].cfg))
-			HFC_outb(hc, R_RX_FR1, V_RX_MF | V_RX_MF_SYNC);
-
-		if (dch->dev.D.protocol == ISDN_P_NT_E1) {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG "%s: E1 port is NT-mode\n",
-				       __func__);
-			r_e1_wr_sta = 0; /* G0 */
-			hc->e1_getclock = 0;
-		} else {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG "%s: E1 port is TE-mode\n",
-				       __func__);
-			r_e1_wr_sta = 0; /* F0 */
-			hc->e1_getclock = 1;
-		}
-		if (test_bit(HFC_CHIP_RX_SYNC, &hc->chip))
-			HFC_outb(hc, R_SYNC_OUT, V_SYNC_E1_RX);
-		else
-			HFC_outb(hc, R_SYNC_OUT, 0);
-		if (test_bit(HFC_CHIP_E1CLOCK_GET, &hc->chip))
-			hc->e1_getclock = 1;
-		if (test_bit(HFC_CHIP_E1CLOCK_PUT, &hc->chip))
-			hc->e1_getclock = 0;
-		if (test_bit(HFC_CHIP_PCM_SLAVE, &hc->chip)) {
-			/* SLAVE (clock master) */
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG
-				       "%s: E1 port is clock master "
-				       "(clock from PCM)\n", __func__);
-			HFC_outb(hc, R_SYNC_CTRL, V_EXT_CLK_SYNC | V_PCM_SYNC);
-		} else {
-			if (hc->e1_getclock) {
-				/* MASTER (clock slave) */
-				if (debug & DEBUG_HFCMULTI_INIT)
-					printk(KERN_DEBUG
-					       "%s: E1 port is clock slave "
-					       "(clock to PCM)\n", __func__);
-				HFC_outb(hc, R_SYNC_CTRL, V_SYNC_OFFS);
-			} else {
-				/* MASTER (clock master) */
-				if (debug & DEBUG_HFCMULTI_INIT)
-					printk(KERN_DEBUG "%s: E1 port is "
-					       "clock master "
-					       "(clock from QUARTZ)\n",
-					       __func__);
-				HFC_outb(hc, R_SYNC_CTRL, V_EXT_CLK_SYNC |
-					 V_PCM_SYNC | V_JATT_OFF);
-				HFC_outb(hc, R_SYNC_OUT, 0);
-			}
-		}
-		HFC_outb(hc, R_JATT_ATT, 0x9c); /* undoc register */
-		HFC_outb(hc, R_PWM_MD, V_PWM0_MD);
-		HFC_outb(hc, R_PWM0, 0x50);
-		HFC_outb(hc, R_PWM1, 0xff);
-		/* state machine setup */
-		HFC_outb(hc, R_E1_WR_STA, r_e1_wr_sta | V_E1_LD_STA);
-		udelay(6); /* wait at least 5,21us */
-		HFC_outb(hc, R_E1_WR_STA, r_e1_wr_sta);
-		if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-			hc->syncronized = 0;
-			plxsd_checksync(hc, 0);
-		}
-	}
-	if (hc->ctype != HFC_TYPE_E1) {
-		/* ST */
-		hc->chan[i].slot_tx = -1;
-		hc->chan[i].slot_rx = -1;
-		hc->chan[i].conf = -1;
-		mode_hfcmulti(hc, i, dch->dev.D.protocol, -1, 0, -1, 0);
-		dch->timer.function = (void *) hfcmulti_dbusy_timer;
-		dch->timer.data = (long) dch;
-		init_timer(&dch->timer);
-		hc->chan[i - 2].slot_tx = -1;
-		hc->chan[i - 2].slot_rx = -1;
-		hc->chan[i - 2].conf = -1;
-		mode_hfcmulti(hc, i - 2, ISDN_P_NONE, -1, 0, -1, 0);
-		hc->chan[i - 1].slot_tx = -1;
-		hc->chan[i - 1].slot_rx = -1;
-		hc->chan[i - 1].conf = -1;
-		mode_hfcmulti(hc, i - 1, ISDN_P_NONE, -1, 0, -1, 0);
-		/* select interface */
-		HFC_outb(hc, R_ST_SEL, pt);
-		/* undocumented: delay after R_ST_SEL */
-		udelay(1);
-		if (dch->dev.D.protocol == ISDN_P_NT_S0) {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG
-				       "%s: ST port %d is NT-mode\n",
-				       __func__, pt);
-			/* clock delay */
-			HFC_outb(hc, A_ST_CLK_DLY, clockdelay_nt);
-			a_st_wr_state = 1; /* G1 */
-			hc->hw.a_st_ctrl0[pt] = V_ST_MD;
-		} else {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG
-				       "%s: ST port %d is TE-mode\n",
-				       __func__, pt);
-			/* clock delay */
-			HFC_outb(hc, A_ST_CLK_DLY, clockdelay_te);
-			a_st_wr_state = 2; /* F2 */
-			hc->hw.a_st_ctrl0[pt] = 0;
-		}
-		if (!test_bit(HFC_CFG_NONCAP_TX, &hc->chan[i].cfg))
-			hc->hw.a_st_ctrl0[pt] |= V_TX_LI;
-		if (hc->ctype == HFC_TYPE_XHFC) {
-			hc->hw.a_st_ctrl0[pt] |= 0x40 /* V_ST_PU_CTRL */;
-			HFC_outb(hc, 0x35 /* A_ST_CTRL3 */,
-				 0x7c << 1 /* V_ST_PULSE */);
-		}
-		/* line setup */
-		HFC_outb(hc, A_ST_CTRL0,  hc->hw.a_st_ctrl0[pt]);
-		/* disable E-channel */
-		if ((dch->dev.D.protocol == ISDN_P_NT_S0) ||
-		    test_bit(HFC_CFG_DIS_ECHANNEL, &hc->chan[i].cfg))
-			HFC_outb(hc, A_ST_CTRL1, V_E_IGNO);
-		else
-			HFC_outb(hc, A_ST_CTRL1, 0);
-		/* enable B-channel receive */
-		HFC_outb(hc, A_ST_CTRL2,  V_B1_RX_EN | V_B2_RX_EN);
-		/* state machine setup */
-		HFC_outb(hc, A_ST_WR_STATE, a_st_wr_state | V_ST_LD_STA);
-		udelay(6); /* wait at least 5,21us */
-		HFC_outb(hc, A_ST_WR_STATE, a_st_wr_state);
-		hc->hw.r_sci_msk |= 1 << pt;
-		/* state machine interrupts */
-		HFC_outb(hc, R_SCI_MSK, hc->hw.r_sci_msk);
-		/* unset sync on port */
-		if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-			hc->syncronized &=
-				~(1 << hc->chan[dch->slot].port);
-			plxsd_checksync(hc, 0);
-		}
-	}
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk("%s: done\n", __func__);
-}
-
-
-static int
-open_dchannel(struct hfc_multi *hc, struct dchannel *dch,
-	      struct channel_req *rq)
-{
-	int	err = 0;
-	u_long	flags;
-
-	if (debug & DEBUG_HW_OPEN)
-		printk(KERN_DEBUG "%s: dev(%d) open from %p\n", __func__,
-		       dch->dev.id, __builtin_return_address(0));
-	if (rq->protocol == ISDN_P_NONE)
-		return -EINVAL;
-	if ((dch->dev.D.protocol != ISDN_P_NONE) &&
-	    (dch->dev.D.protocol != rq->protocol)) {
-		if (debug & DEBUG_HFCMULTI_MODE)
-			printk(KERN_DEBUG "%s: change protocol %x to %x\n",
-			       __func__, dch->dev.D.protocol, rq->protocol);
-	}
-	if ((dch->dev.D.protocol == ISDN_P_TE_S0) &&
-	    (rq->protocol != ISDN_P_TE_S0))
-		l1_event(dch->l1, CLOSE_CHANNEL);
-	if (dch->dev.D.protocol != rq->protocol) {
-		if (rq->protocol == ISDN_P_TE_S0) {
-			err = create_l1(dch, hfcm_l1callback);
-			if (err)
-				return err;
-		}
-		dch->dev.D.protocol = rq->protocol;
-		spin_lock_irqsave(&hc->lock, flags);
-		hfcmulti_initmode(dch);
-		spin_unlock_irqrestore(&hc->lock, flags);
-	}
-	if (test_bit(FLG_ACTIVE, &dch->Flags))
-		_queue_data(&dch->dev.D, PH_ACTIVATE_IND, MISDN_ID_ANY,
-			    0, NULL, GFP_KERNEL);
-	rq->ch = &dch->dev.D;
-	if (!try_module_get(THIS_MODULE))
-		printk(KERN_WARNING "%s:cannot get module\n", __func__);
-	return 0;
-}
-
-static int
-open_bchannel(struct hfc_multi *hc, struct dchannel *dch,
-	      struct channel_req *rq)
-{
-	struct bchannel	*bch;
-	int		ch;
-
-	if (!test_channelmap(rq->adr.channel, dch->dev.channelmap))
-		return -EINVAL;
-	if (rq->protocol == ISDN_P_NONE)
-		return -EINVAL;
-	if (hc->ctype == HFC_TYPE_E1)
-		ch = rq->adr.channel;
-	else
-		ch = (rq->adr.channel - 1) + (dch->slot - 2);
-	bch = hc->chan[ch].bch;
-	if (!bch) {
-		printk(KERN_ERR "%s:internal error ch %d has no bch\n",
-		       __func__, ch);
-		return -EINVAL;
-	}
-	if (test_and_set_bit(FLG_OPEN, &bch->Flags))
-		return -EBUSY; /* b-channel can be only open once */
-	bch->ch.protocol = rq->protocol;
-	hc->chan[ch].rx_off = 0;
-	rq->ch = &bch->ch;
-	if (!try_module_get(THIS_MODULE))
-		printk(KERN_WARNING "%s:cannot get module\n", __func__);
-	return 0;
-}
-
-/*
- * device control function
- */
-static int
-channel_dctrl(struct dchannel *dch, struct mISDN_ctrl_req *cq)
-{
-	struct hfc_multi	*hc = dch->hw;
-	int	ret = 0;
-	int	wd_mode, wd_cnt;
-
-	switch (cq->op) {
-	case MISDN_CTRL_GETOP:
-		cq->op = MISDN_CTRL_HFC_OP | MISDN_CTRL_L1_TIMER3;
-		break;
-	case MISDN_CTRL_HFC_WD_INIT: /* init the watchdog */
-		wd_cnt = cq->p1 & 0xf;
-		wd_mode = !!(cq->p1 >> 4);
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: MISDN_CTRL_HFC_WD_INIT mode %s"
-			       ", counter 0x%x\n", __func__,
-			       wd_mode ? "AUTO" : "MANUAL", wd_cnt);
-		/* set the watchdog timer */
-		HFC_outb(hc, R_TI_WD, poll_timer | (wd_cnt << 4));
-		hc->hw.r_bert_wd_md = (wd_mode ? V_AUTO_WD_RES : 0);
-		if (hc->ctype == HFC_TYPE_XHFC)
-			hc->hw.r_bert_wd_md |= 0x40 /* V_WD_EN */;
-		/* init the watchdog register and reset the counter */
-		HFC_outb(hc, R_BERT_WD_MD, hc->hw.r_bert_wd_md | V_WD_RES);
-		if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-			/* enable the watchdog output for Speech-Design */
-			HFC_outb(hc, R_GPIO_SEL,  V_GPIO_SEL7);
-			HFC_outb(hc, R_GPIO_EN1,  V_GPIO_EN15);
-			HFC_outb(hc, R_GPIO_OUT1, 0);
-			HFC_outb(hc, R_GPIO_OUT1, V_GPIO_OUT15);
-		}
-		break;
-	case MISDN_CTRL_HFC_WD_RESET: /* reset the watchdog counter */
-		if (debug & DEBUG_HFCMULTI_MSG)
-			printk(KERN_DEBUG "%s: MISDN_CTRL_HFC_WD_RESET\n",
-			       __func__);
-		HFC_outb(hc, R_BERT_WD_MD, hc->hw.r_bert_wd_md | V_WD_RES);
-		break;
-	case MISDN_CTRL_L1_TIMER3:
-		ret = l1_event(dch->l1, HW_TIMER3_VALUE | (cq->p1 & 0xff));
-		break;
-	default:
-		printk(KERN_WARNING "%s: unknown Op %x\n",
-		       __func__, cq->op);
-		ret = -EINVAL;
-		break;
-	}
-	return ret;
-}
-
-static int
-hfcm_dctrl(struct mISDNchannel *ch, u_int cmd, void *arg)
-{
-	struct mISDNdevice	*dev = container_of(ch, struct mISDNdevice, D);
-	struct dchannel		*dch = container_of(dev, struct dchannel, dev);
-	struct hfc_multi	*hc = dch->hw;
-	struct channel_req	*rq;
-	int			err = 0;
-	u_long			flags;
-
-	if (dch->debug & DEBUG_HW)
-		printk(KERN_DEBUG "%s: cmd:%x %p\n",
-		       __func__, cmd, arg);
-	switch (cmd) {
-	case OPEN_CHANNEL:
-		rq = arg;
-		switch (rq->protocol) {
-		case ISDN_P_TE_S0:
-		case ISDN_P_NT_S0:
-			if (hc->ctype == HFC_TYPE_E1) {
-				err = -EINVAL;
-				break;
-			}
-			err = open_dchannel(hc, dch, rq); /* locked there */
-			break;
-		case ISDN_P_TE_E1:
-		case ISDN_P_NT_E1:
-			if (hc->ctype != HFC_TYPE_E1) {
-				err = -EINVAL;
-				break;
-			}
-			err = open_dchannel(hc, dch, rq); /* locked there */
-			break;
-		default:
-			spin_lock_irqsave(&hc->lock, flags);
-			err = open_bchannel(hc, dch, rq);
-			spin_unlock_irqrestore(&hc->lock, flags);
-		}
-		break;
-	case CLOSE_CHANNEL:
-		if (debug & DEBUG_HW_OPEN)
-			printk(KERN_DEBUG "%s: dev(%d) close from %p\n",
-			       __func__, dch->dev.id,
-			       __builtin_return_address(0));
-		module_put(THIS_MODULE);
-		break;
-	case CONTROL_CHANNEL:
-		spin_lock_irqsave(&hc->lock, flags);
-		err = channel_dctrl(dch, arg);
-		spin_unlock_irqrestore(&hc->lock, flags);
-		break;
-	default:
-		if (dch->debug & DEBUG_HW)
-			printk(KERN_DEBUG "%s: unknown command %x\n",
-			       __func__, cmd);
-		err = -EINVAL;
-	}
-	return err;
-}
-
-static int
-clockctl(void *priv, int enable)
-{
-	struct hfc_multi *hc = priv;
-
-	hc->iclock_on = enable;
-	return 0;
-}
-
-/*
- * initialize the card
- */
-
-/*
- * start timer irq, wait some time and check if we have interrupts.
- * if not, reset chip and try again.
- */
-static int
-init_card(struct hfc_multi *hc)
-{
-	int	err = -EIO;
-	u_long	flags;
-	void	__iomem *plx_acc;
-	u_long	plx_flags;
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: entered\n", __func__);
-
-	spin_lock_irqsave(&hc->lock, flags);
-	/* set interrupts but leave global interrupt disabled */
-	hc->hw.r_irq_ctrl = V_FIFO_IRQ;
-	disable_hwirq(hc);
-	spin_unlock_irqrestore(&hc->lock, flags);
-
-	if (request_irq(hc->irq, hfcmulti_interrupt, IRQF_SHARED,
-			"HFC-multi", hc)) {
-		printk(KERN_WARNING "mISDN: Could not get interrupt %d.\n",
-		       hc->irq);
-		hc->irq = 0;
-		return -EIO;
-	}
-
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-		spin_lock_irqsave(&plx_lock, plx_flags);
-		plx_acc = hc->plx_membase + PLX_INTCSR;
-		writew((PLX_INTCSR_PCIINT_ENABLE | PLX_INTCSR_LINTI1_ENABLE),
-		       plx_acc); /* enable PCI & LINT1 irq */
-		spin_unlock_irqrestore(&plx_lock, plx_flags);
-	}
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: IRQ %d count %d\n",
-		       __func__, hc->irq, hc->irqcnt);
-	err = init_chip(hc);
-	if (err)
-		goto error;
-	/*
-	 * Finally enable IRQ output
-	 * this is only allowed, if an IRQ routine is already
-	 * established for this HFC, so don't do that earlier
-	 */
-	spin_lock_irqsave(&hc->lock, flags);
-	enable_hwirq(hc);
-	spin_unlock_irqrestore(&hc->lock, flags);
-	/* printk(KERN_DEBUG "no master irq set!!!\n"); */
-	set_current_state(TASK_UNINTERRUPTIBLE);
-	schedule_timeout((100 * HZ) / 1000); /* Timeout 100ms */
-	/* turn IRQ off until chip is completely initialized */
-	spin_lock_irqsave(&hc->lock, flags);
-	disable_hwirq(hc);
-	spin_unlock_irqrestore(&hc->lock, flags);
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: IRQ %d count %d\n",
-		       __func__, hc->irq, hc->irqcnt);
-	if (hc->irqcnt) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: done\n", __func__);
-
-		return 0;
-	}
-	if (test_bit(HFC_CHIP_PCM_SLAVE, &hc->chip)) {
-		printk(KERN_INFO "ignoring missing interrupts\n");
-		return 0;
-	}
-
-	printk(KERN_ERR "HFC PCI: IRQ(%d) getting no interrupts during init.\n",
-	       hc->irq);
-
-	err = -EIO;
-
-error:
-	if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-		spin_lock_irqsave(&plx_lock, plx_flags);
-		plx_acc = hc->plx_membase + PLX_INTCSR;
-		writew(0x00, plx_acc); /*disable IRQs*/
-		spin_unlock_irqrestore(&plx_lock, plx_flags);
-	}
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: free irq %d\n", __func__, hc->irq);
-	if (hc->irq) {
-		free_irq(hc->irq, hc);
-		hc->irq = 0;
-	}
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: done (err=%d)\n", __func__, err);
-	return err;
-}
-
-/*
- * find pci device and set it up
- */
-
-static int
-setup_pci(struct hfc_multi *hc, struct pci_dev *pdev,
-	  const struct pci_device_id *ent)
-{
-	struct hm_map	*m = (struct hm_map *)ent->driver_data;
-
-	printk(KERN_INFO
-	       "HFC-multi: card manufacturer: '%s' card name: '%s' clock: %s\n",
-	       m->vendor_name, m->card_name, m->clock2 ? "double" : "normal");
-
-	hc->pci_dev = pdev;
-	if (m->clock2)
-		test_and_set_bit(HFC_CHIP_CLOCK2, &hc->chip);
-
-	if (ent->vendor == PCI_VENDOR_ID_DIGIUM &&
-	    ent->device == PCI_DEVICE_ID_DIGIUM_HFC4S) {
-		test_and_set_bit(HFC_CHIP_B410P, &hc->chip);
-		test_and_set_bit(HFC_CHIP_PCM_MASTER, &hc->chip);
-		test_and_clear_bit(HFC_CHIP_PCM_SLAVE, &hc->chip);
-		hc->slots = 32;
-	}
-
-	if (hc->pci_dev->irq <= 0) {
-		printk(KERN_WARNING "HFC-multi: No IRQ for PCI card found.\n");
-		return -EIO;
-	}
-	if (pci_enable_device(hc->pci_dev)) {
-		printk(KERN_WARNING "HFC-multi: Error enabling PCI card.\n");
-		return -EIO;
-	}
-	hc->leds = m->leds;
-	hc->ledstate = 0xAFFEAFFE;
-	hc->opticalsupport = m->opticalsupport;
-
-	hc->pci_iobase = 0;
-	hc->pci_membase = NULL;
-	hc->plx_membase = NULL;
-
-	/* set memory access methods */
-	if (m->io_mode) /* use mode from card config */
-		hc->io_mode = m->io_mode;
-	switch (hc->io_mode) {
-	case HFC_IO_MODE_PLXSD:
-		test_and_set_bit(HFC_CHIP_PLXSD, &hc->chip);
-		hc->slots = 128; /* required */
-		hc->HFC_outb = HFC_outb_pcimem;
-		hc->HFC_inb = HFC_inb_pcimem;
-		hc->HFC_inw = HFC_inw_pcimem;
-		hc->HFC_wait = HFC_wait_pcimem;
-		hc->read_fifo = read_fifo_pcimem;
-		hc->write_fifo = write_fifo_pcimem;
-		hc->plx_origmembase =  hc->pci_dev->resource[0].start;
-		/* MEMBASE 1 is PLX PCI Bridge */
-
-		if (!hc->plx_origmembase) {
-			printk(KERN_WARNING
-			       "HFC-multi: No IO-Memory for PCI PLX bridge found\n");
-			pci_disable_device(hc->pci_dev);
-			return -EIO;
-		}
-
-		hc->plx_membase = ioremap(hc->plx_origmembase, 0x80);
-		if (!hc->plx_membase) {
-			printk(KERN_WARNING
-			       "HFC-multi: failed to remap plx address space. "
-			       "(internal error)\n");
-			pci_disable_device(hc->pci_dev);
-			return -EIO;
-		}
-		printk(KERN_INFO
-		       "HFC-multi: plx_membase:%#lx plx_origmembase:%#lx\n",
-		       (u_long)hc->plx_membase, hc->plx_origmembase);
-
-		hc->pci_origmembase =  hc->pci_dev->resource[2].start;
-		/* MEMBASE 1 is PLX PCI Bridge */
-		if (!hc->pci_origmembase) {
-			printk(KERN_WARNING
-			       "HFC-multi: No IO-Memory for PCI card found\n");
-			pci_disable_device(hc->pci_dev);
-			return -EIO;
-		}
-
-		hc->pci_membase = ioremap(hc->pci_origmembase, 0x400);
-		if (!hc->pci_membase) {
-			printk(KERN_WARNING "HFC-multi: failed to remap io "
-			       "address space. (internal error)\n");
-			pci_disable_device(hc->pci_dev);
-			return -EIO;
-		}
-
-		printk(KERN_INFO
-		       "card %d: defined at MEMBASE %#lx (%#lx) IRQ %d HZ %d "
-		       "leds-type %d\n",
-		       hc->id, (u_long)hc->pci_membase, hc->pci_origmembase,
-		       hc->pci_dev->irq, HZ, hc->leds);
-		pci_write_config_word(hc->pci_dev, PCI_COMMAND, PCI_ENA_MEMIO);
-		break;
-	case HFC_IO_MODE_PCIMEM:
-		hc->HFC_outb = HFC_outb_pcimem;
-		hc->HFC_inb = HFC_inb_pcimem;
-		hc->HFC_inw = HFC_inw_pcimem;
-		hc->HFC_wait = HFC_wait_pcimem;
-		hc->read_fifo = read_fifo_pcimem;
-		hc->write_fifo = write_fifo_pcimem;
-		hc->pci_origmembase = hc->pci_dev->resource[1].start;
-		if (!hc->pci_origmembase) {
-			printk(KERN_WARNING
-			       "HFC-multi: No IO-Memory for PCI card found\n");
-			pci_disable_device(hc->pci_dev);
-			return -EIO;
-		}
-
-		hc->pci_membase = ioremap(hc->pci_origmembase, 256);
-		if (!hc->pci_membase) {
-			printk(KERN_WARNING
-			       "HFC-multi: failed to remap io address space. "
-			       "(internal error)\n");
-			pci_disable_device(hc->pci_dev);
-			return -EIO;
-		}
-		printk(KERN_INFO "card %d: defined at MEMBASE %#lx (%#lx) IRQ "
-		       "%d HZ %d leds-type %d\n", hc->id, (u_long)hc->pci_membase,
-		       hc->pci_origmembase, hc->pci_dev->irq, HZ, hc->leds);
-		pci_write_config_word(hc->pci_dev, PCI_COMMAND, PCI_ENA_MEMIO);
-		break;
-	case HFC_IO_MODE_REGIO:
-		hc->HFC_outb = HFC_outb_regio;
-		hc->HFC_inb = HFC_inb_regio;
-		hc->HFC_inw = HFC_inw_regio;
-		hc->HFC_wait = HFC_wait_regio;
-		hc->read_fifo = read_fifo_regio;
-		hc->write_fifo = write_fifo_regio;
-		hc->pci_iobase = (u_int) hc->pci_dev->resource[0].start;
-		if (!hc->pci_iobase) {
-			printk(KERN_WARNING
-			       "HFC-multi: No IO for PCI card found\n");
-			pci_disable_device(hc->pci_dev);
-			return -EIO;
-		}
-
-		if (!request_region(hc->pci_iobase, 8, "hfcmulti")) {
-			printk(KERN_WARNING "HFC-multi: failed to request "
-			       "address space at 0x%08lx (internal error)\n",
-			       hc->pci_iobase);
-			pci_disable_device(hc->pci_dev);
-			return -EIO;
-		}
-
-		printk(KERN_INFO
-		       "%s %s: defined at IOBASE %#x IRQ %d HZ %d leds-type %d\n",
-		       m->vendor_name, m->card_name, (u_int) hc->pci_iobase,
-		       hc->pci_dev->irq, HZ, hc->leds);
-		pci_write_config_word(hc->pci_dev, PCI_COMMAND, PCI_ENA_REGIO);
-		break;
-	default:
-		printk(KERN_WARNING "HFC-multi: Invalid IO mode.\n");
-		pci_disable_device(hc->pci_dev);
-		return -EIO;
-	}
-
-	pci_set_drvdata(hc->pci_dev, hc);
-
-	/* At this point the needed PCI config is done */
-	/* fifos are still not enabled */
-	return 0;
-}
-
-
-/*
- * remove port
- */
-
-static void
-release_port(struct hfc_multi *hc, struct dchannel *dch)
-{
-	int	pt, ci, i = 0;
-	u_long	flags;
-	struct bchannel *pb;
-
-	ci = dch->slot;
-	pt = hc->chan[ci].port;
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: entered for port %d\n",
-		       __func__, pt + 1);
-
-	if (pt >= hc->ports) {
-		printk(KERN_WARNING "%s: ERROR port out of range (%d).\n",
-		       __func__, pt + 1);
-		return;
-	}
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: releasing port=%d\n",
-		       __func__, pt + 1);
-
-	if (dch->dev.D.protocol == ISDN_P_TE_S0)
-		l1_event(dch->l1, CLOSE_CHANNEL);
-
-	hc->chan[ci].dch = NULL;
-
-	if (hc->created[pt]) {
-		hc->created[pt] = 0;
-		mISDN_unregister_device(&dch->dev);
-	}
-
-	spin_lock_irqsave(&hc->lock, flags);
-
-	if (dch->timer.function) {
-		del_timer(&dch->timer);
-		dch->timer.function = NULL;
-	}
-
-	if (hc->ctype == HFC_TYPE_E1) { /* E1 */
-		/* remove sync */
-		if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-			hc->syncronized = 0;
-			plxsd_checksync(hc, 1);
-		}
-		/* free channels */
-		for (i = 0; i <= 31; i++) {
-			if (!((1 << i) & hc->bmask[pt])) /* skip unused chan */
-				continue;
-			if (hc->chan[i].bch) {
-				if (debug & DEBUG_HFCMULTI_INIT)
-					printk(KERN_DEBUG
-					       "%s: free port %d channel %d\n",
-					       __func__, hc->chan[i].port + 1, i);
-				pb = hc->chan[i].bch;
-				hc->chan[i].bch = NULL;
-				spin_unlock_irqrestore(&hc->lock, flags);
-				mISDN_freebchannel(pb);
-				kfree(pb);
-				kfree(hc->chan[i].coeff);
-				spin_lock_irqsave(&hc->lock, flags);
-			}
-		}
-	} else {
-		/* remove sync */
-		if (test_bit(HFC_CHIP_PLXSD, &hc->chip)) {
-			hc->syncronized &=
-				~(1 << hc->chan[ci].port);
-			plxsd_checksync(hc, 1);
-		}
-		/* free channels */
-		if (hc->chan[ci - 2].bch) {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG
-				       "%s: free port %d channel %d\n",
-				       __func__, hc->chan[ci - 2].port + 1,
-				       ci - 2);
-			pb = hc->chan[ci - 2].bch;
-			hc->chan[ci - 2].bch = NULL;
-			spin_unlock_irqrestore(&hc->lock, flags);
-			mISDN_freebchannel(pb);
-			kfree(pb);
-			kfree(hc->chan[ci - 2].coeff);
-			spin_lock_irqsave(&hc->lock, flags);
-		}
-		if (hc->chan[ci - 1].bch) {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG
-				       "%s: free port %d channel %d\n",
-				       __func__, hc->chan[ci - 1].port + 1,
-				       ci - 1);
-			pb = hc->chan[ci - 1].bch;
-			hc->chan[ci - 1].bch = NULL;
-			spin_unlock_irqrestore(&hc->lock, flags);
-			mISDN_freebchannel(pb);
-			kfree(pb);
-			kfree(hc->chan[ci - 1].coeff);
-			spin_lock_irqsave(&hc->lock, flags);
-		}
-	}
-
-	spin_unlock_irqrestore(&hc->lock, flags);
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: free port %d channel D(%d)\n", __func__,
-			pt+1, ci);
-	mISDN_freedchannel(dch);
-	kfree(dch);
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: done!\n", __func__);
-}
-
-static void
-release_card(struct hfc_multi *hc)
-{
-	u_long	flags;
-	int	ch;
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: release card (%d) entered\n",
-		       __func__, hc->id);
-
-	/* unregister clock source */
-	if (hc->iclock)
-		mISDN_unregister_clock(hc->iclock);
-
-	/* disable and free irq */
-	spin_lock_irqsave(&hc->lock, flags);
-	disable_hwirq(hc);
-	spin_unlock_irqrestore(&hc->lock, flags);
-	udelay(1000);
-	if (hc->irq) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: free irq %d (hc=%p)\n",
-			    __func__, hc->irq, hc);
-		free_irq(hc->irq, hc);
-		hc->irq = 0;
-
-	}
-
-	/* disable D-channels & B-channels */
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: disable all channels (d and b)\n",
-		       __func__);
-	for (ch = 0; ch <= 31; ch++) {
-		if (hc->chan[ch].dch)
-			release_port(hc, hc->chan[ch].dch);
-	}
-
-	/* dimm leds */
-	if (hc->leds)
-		hfcmulti_leds(hc);
-
-	/* release hardware */
-	release_io_hfcmulti(hc);
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: remove instance from list\n",
-		       __func__);
-	list_del(&hc->list);
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: delete instance\n", __func__);
-	if (hc == syncmaster)
-		syncmaster = NULL;
-	kfree(hc);
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: card successfully removed\n",
-		       __func__);
-}
-
-static void
-init_e1_port_hw(struct hfc_multi *hc, struct hm_map *m)
-{
-	/* set optical line type */
-	if (port[Port_cnt] & 0x001) {
-		if (!m->opticalsupport)  {
-			printk(KERN_INFO
-			       "This board has no optical "
-			       "support\n");
-		} else {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG
-				       "%s: PORT set optical "
-				       "interfacs: card(%d) "
-				       "port(%d)\n",
-				       __func__,
-				       HFC_cnt + 1, 1);
-			test_and_set_bit(HFC_CFG_OPTICAL,
-			    &hc->chan[hc->dnum[0]].cfg);
-		}
-	}
-	/* set LOS report */
-	if (port[Port_cnt] & 0x004) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: PORT set "
-			       "LOS report: card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, 1);
-		test_and_set_bit(HFC_CFG_REPORT_LOS,
-		    &hc->chan[hc->dnum[0]].cfg);
-	}
-	/* set AIS report */
-	if (port[Port_cnt] & 0x008) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: PORT set "
-			       "AIS report: card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, 1);
-		test_and_set_bit(HFC_CFG_REPORT_AIS,
-		    &hc->chan[hc->dnum[0]].cfg);
-	}
-	/* set SLIP report */
-	if (port[Port_cnt] & 0x010) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG
-			       "%s: PORT set SLIP report: "
-			       "card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, 1);
-		test_and_set_bit(HFC_CFG_REPORT_SLIP,
-		    &hc->chan[hc->dnum[0]].cfg);
-	}
-	/* set RDI report */
-	if (port[Port_cnt] & 0x020) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG
-			       "%s: PORT set RDI report: "
-			       "card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, 1);
-		test_and_set_bit(HFC_CFG_REPORT_RDI,
-		    &hc->chan[hc->dnum[0]].cfg);
-	}
-	/* set CRC-4 Mode */
-	if (!(port[Port_cnt] & 0x100)) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: PORT turn on CRC4 report:"
-			       " card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, 1);
-		test_and_set_bit(HFC_CFG_CRC4,
-		    &hc->chan[hc->dnum[0]].cfg);
-	} else {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: PORT turn off CRC4"
-			       " report: card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, 1);
-	}
-	/* set forced clock */
-	if (port[Port_cnt] & 0x0200) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: PORT force getting clock from "
-			       "E1: card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, 1);
-		test_and_set_bit(HFC_CHIP_E1CLOCK_GET, &hc->chip);
-	} else
-		if (port[Port_cnt] & 0x0400) {
-			if (debug & DEBUG_HFCMULTI_INIT)
-				printk(KERN_DEBUG "%s: PORT force putting clock to "
-				       "E1: card(%d) port(%d)\n",
-				       __func__, HFC_cnt + 1, 1);
-			test_and_set_bit(HFC_CHIP_E1CLOCK_PUT, &hc->chip);
-		}
-	/* set JATT PLL */
-	if (port[Port_cnt] & 0x0800) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG "%s: PORT disable JATT PLL on "
-			       "E1: card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, 1);
-		test_and_set_bit(HFC_CHIP_RX_SYNC, &hc->chip);
-	}
-	/* set elastic jitter buffer */
-	if (port[Port_cnt] & 0x3000) {
-		hc->chan[hc->dnum[0]].jitter = (port[Port_cnt]>>12) & 0x3;
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG
-			       "%s: PORT set elastic "
-			       "buffer to %d: card(%d) port(%d)\n",
-			    __func__, hc->chan[hc->dnum[0]].jitter,
-			       HFC_cnt + 1, 1);
-	} else
-		hc->chan[hc->dnum[0]].jitter = 2; /* default */
-}
-
-static int
-init_e1_port(struct hfc_multi *hc, struct hm_map *m, int pt)
-{
-	struct dchannel	*dch;
-	struct bchannel	*bch;
-	int		ch, ret = 0;
-	char		name[MISDN_MAX_IDLEN];
-	int		bcount = 0;
-
-	dch = kzalloc(sizeof(struct dchannel), GFP_KERNEL);
-	if (!dch)
-		return -ENOMEM;
-	dch->debug = debug;
-	mISDN_initdchannel(dch, MAX_DFRAME_LEN_L1, ph_state_change);
-	dch->hw = hc;
-	dch->dev.Dprotocols = (1 << ISDN_P_TE_E1) | (1 << ISDN_P_NT_E1);
-	dch->dev.Bprotocols = (1 << (ISDN_P_B_RAW & ISDN_P_B_MASK)) |
-	    (1 << (ISDN_P_B_HDLC & ISDN_P_B_MASK));
-	dch->dev.D.send = handle_dmsg;
-	dch->dev.D.ctrl = hfcm_dctrl;
-	dch->slot = hc->dnum[pt];
-	hc->chan[hc->dnum[pt]].dch = dch;
-	hc->chan[hc->dnum[pt]].port = pt;
-	hc->chan[hc->dnum[pt]].nt_timer = -1;
-	for (ch = 1; ch <= 31; ch++) {
-		if (!((1 << ch) & hc->bmask[pt])) /* skip unused channel */
+			leaf = path->nodes[0];
+			nritems = btrfs_header_nritems(leaf);
 			continue;
-		bch = kzalloc(sizeof(struct bchannel), GFP_KERNEL);
-		if (!bch) {
-			printk(KERN_ERR "%s: no memory for bchannel\n",
-			    __func__);
-			ret = -ENOMEM;
-			goto free_chan;
 		}
-		hc->chan[ch].coeff = kzalloc(512, GFP_KERNEL);
-		if (!hc->chan[ch].coeff) {
-			printk(KERN_ERR "%s: no memory for coeffs\n",
-			    __func__);
-			ret = -ENOMEM;
-			kfree(bch);
-			goto free_chan;
-		}
-		bch->nr = ch;
-		bch->slot = ch;
-		bch->debug = debug;
-		mISDN_initbchannel(bch, MAX_DATA_MEM, poll >> 1);
-		bch->hw = hc;
-		bch->ch.send = handle_bmsg;
-		bch->ch.ctrl = hfcm_bctrl;
-		bch->ch.nr = ch;
-		list_add(&bch->ch.list, &dch->dev.bchannels);
-		hc->chan[ch].bch = bch;
-		hc->chan[ch].port = pt;
-		set_channelmap(bch->nr, dch->dev.channelmap);
-		bcount++;
+
+		btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);
+		if (key.objectid != dirid || key.type != BTRFS_DIR_INDEX_KEY)
+			break;
+
+		di = btrfs_match_dir_item_name(root, path, name, name_len);
+		if (di)
+			return di;
+
+		path->slots[0]++;
 	}
-	dch->dev.nrbchan = bcount;
-	if (pt == 0)
-		init_e1_port_hw(hc, m);
-	if (hc->ports > 1)
-		snprintf(name, MISDN_MAX_IDLEN - 1, "hfc-e1.%d-%d",
-				HFC_cnt + 1, pt+1);
-	else
-		snprintf(name, MISDN_MAX_IDLEN - 1, "hfc-e1.%d", HFC_cnt + 1);
-	ret = mISDN_register_device(&dch->dev, &hc->pci_dev->dev, name);
-	if (ret)
-		goto free_chan;
-	hc->created[pt] = 1;
-	return ret;
-free_chan:
-	release_port(hc, dch);
-	return ret;
+	return NULL;
 }
 
-static int
-init_multi_port(struct hfc_multi *hc, int pt)
+struct btrfs_dir_item *btrfs_lookup_xattr(struct btrfs_trans_handle *trans,
+					  struct btrfs_root *root,
+					  struct btrfs_path *path, u64 dir,
+					  const char *name, u16 name_len,
+					  int mod)
 {
-	struct dchannel	*dch;
-	struct bchannel	*bch;
-	int		ch, i, ret = 0;
-	char		name[MISDN_MAX_IDLEN];
+	int ret;
+	struct btrfs_key key;
+	int ins_len = mod < 0 ? -1 : 0;
+	int cow = mod != 0;
 
-	dch = kzalloc(sizeof(struct dchannel), GFP_KERNEL);
-	if (!dch)
-		return -ENOMEM;
-	dch->debug = debug;
-	mISDN_initdchannel(dch, MAX_DFRAME_LEN_L1, ph_state_change);
-	dch->hw = hc;
-	dch->dev.Dprotocols = (1 << ISDN_P_TE_S0) | (1 << ISDN_P_NT_S0);
-	dch->dev.Bprotocols = (1 << (ISDN_P_B_RAW & ISDN_P_B_MASK)) |
-		(1 << (ISDN_P_B_HDLC & ISDN_P_B_MASK));
-	dch->dev.D.send = handle_dmsg;
-	dch->dev.D.ctrl = hfcm_dctrl;
-	dch->dev.nrbchan = 2;
-	i = pt << 2;
-	dch->slot = i + 2;
-	hc->chan[i + 2].dch = dch;
-	hc->chan[i + 2].port = pt;
-	hc->chan[i + 2].nt_timer = -1;
-	for (ch = 0; ch < dch->dev.nrbchan; ch++) {
-		bch = kzalloc(sizeof(struct bchannel), GFP_KERNEL);
-		if (!bch) {
-			printk(KERN_ERR "%s: no memory for bchannel\n",
-			       __func__);
-			ret = -ENOMEM;
-			goto free_chan;
-		}
-		hc->chan[i + ch].coeff = kzalloc(512, GFP_KERNEL);
-		if (!hc->chan[i + ch].coeff) {
-			printk(KERN_ERR "%s: no memory for coeffs\n",
-			       __func__);
-			ret = -ENOMEM;
-			kfree(bch);
-			goto free_chan;
-		}
-		bch->nr = ch + 1;
-		bch->slot = i + ch;
-		bch->debug = debug;
-		mISDN_initbchannel(bch, MAX_DATA_MEM, poll >> 1);
-		bch->hw = hc;
-		bch->ch.send = handle_bmsg;
-		bch->ch.ctrl = hfcm_bctrl;
-		bch->ch.nr = ch + 1;
-		list_add(&bch->ch.list, &dch->dev.bchannels);
-		hc->chan[i + ch].bch = bch;
-		hc->chan[i + ch].port = pt;
-		set_channelmap(bch->nr, dch->dev.channelmap);
+	key.objectid = dir;
+	key.type = BTRFS_XATTR_ITEM_KEY;
+	key.offset = btrfs_name_hash(name, name_len);
+	ret = btrfs_search_slot(trans, root, &key, path, ins_len, cow);
+	if (ret < 0)
+		return ERR_PTR(ret);
+	if (ret > 0)
+		return NULL;
+
+	return btrfs_match_dir_item_name(root, path, name, name_len);
+}
+
+/*
+ * helper function to look at the directory item pointed to by 'path'
+ * this walks through all the entries in a dir item and finds one
+ * for a specific name.
+ */
+struct btrfs_dir_item *btrfs_match_dir_item_name(struct btrfs_root *root,
+						 struct btrfs_path *path,
+						 const char *name, int name_len)
+{
+	struct btrfs_dir_item *dir_item;
+	unsigned long name_ptr;
+	u32 total_len;
+	u32 cur = 0;
+	u32 this_len;
+	struct extent_buffer *leaf;
+
+	leaf = path->nodes[0];
+	dir_item = btrfs_item_ptr(leaf, path->slots[0], struct btrfs_dir_item);
+	if (verify_dir_item(root, leaf, dir_item))
+		return NULL;
+
+	total_len = btrfs_item_size_nr(leaf, path->slots[0]);
+	while (cur < total_len) {
+		this_len = sizeof(*dir_item) +
+			btrfs_dir_name_len(leaf, dir_item) +
+			btrfs_dir_data_len(leaf, dir_item);
+		name_ptr = (unsigned long)(dir_item + 1);
+
+		if (btrfs_dir_name_len(leaf, dir_item) == name_len &&
+		    memcmp_extent_buffer(leaf, name, name_ptr, name_len) == 0)
+			return dir_item;
+
+		cur += this_len;
+		dir_item = (struct btrfs_dir_item *)((char *)dir_item +
+						     this_len);
 	}
-	/* set master clock */
-	if (port[Port_cnt] & 0x001) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG
-			       "%s: PROTOCOL set master clock: "
-			       "card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, pt + 1);
-		if (dch->dev.D.protocol != ISDN_P_TE_S0) {
-			printk(KERN_ERR "Error: Master clock "
-			       "for port(%d) of card(%d) is only"
-			       " possible with TE-mode\n",
-			       pt + 1, HFC_cnt + 1);
-			ret = -EINVAL;
-			goto free_chan;
-		}
-		if (hc->masterclk >= 0) {
-			printk(KERN_ERR "Error: Master clock "
-			       "for port(%d) of card(%d) already "
-			       "defined for port(%d)\n",
-			       pt + 1, HFC_cnt + 1, hc->masterclk + 1);
-			ret = -EINVAL;
-			goto free_chan;
-		}
-		hc->masterclk = pt;
-	}
-	/* set transmitter line to non capacitive */
-	if (port[Port_cnt] & 0x002) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG
-			       "%s: PROTOCOL set non capacitive "
-			       "transmitter: card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, pt + 1);
-		test_and_set_bit(HFC_CFG_NONCAP_TX,
-				 &hc->chan[i + 2].cfg);
-	}
-	/* disable E-channel */
-	if (port[Port_cnt] & 0x004) {
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG
-			       "%s: PROTOCOL disable E-channel: "
-			       "card(%d) port(%d)\n",
-			       __func__, HFC_cnt + 1, pt + 1);
-		test_and_set_bit(HFC_CFG_DIS_ECHANNEL,
-				 &hc->chan[i + 2].cfg);
-	}
-	if (hc->ctype == HFC_TYPE_XHFC) {
-		snprintf(name, MISDN_MAX_IDLEN - 1, "xhfc.%d-%d",
-			 HFC_cnt + 1, pt + 1);
-		ret = mISDN_register_device(&dch->dev, NULL, name);
+	return NULL;
+}
+
+/*
+ * given a pointer into a directory item, delete it.  This
+ * handles items that have more than one entry in them.
+ */
+int btrfs_delete_one_dir_name(struct btrfs_trans_handle *trans,
+			      struct btrfs_root *root,
+			      struct btrfs_path *path,
+			      struct btrfs_dir_item *di)
+{
+
+	struct extent_buffer *leaf;
+	u32 sub_item_len;
+	u32 item_len;
+	int ret = 0;
+
+	leaf = path->nodes[0];
+	sub_item_len = sizeof(*di) + btrfs_dir_name_len(leaf, di) +
+		btrfs_dir_data_len(leaf, di);
+	item_len = btrfs_item_size_nr(leaf, path->slots[0]);
+	if (sub_item_len == item_len) {
+		ret = btrfs_del_item(trans, root, path);
 	} else {
-		snprintf(name, MISDN_MAX_IDLEN - 1, "hfc-%ds.%d-%d",
-			 hc->ctype, HFC_cnt + 1, pt + 1);
-		ret = mISDN_register_device(&dch->dev, &hc->pci_dev->dev, name);
+		/* MARKER */
+		unsigned long ptr = (unsigned long)di;
+		unsigned long start;
+
+		start = btrfs_item_ptr_offset(leaf, path->slots[0]);
+		memmove_extent_buffer(leaf, ptr, ptr + sub_item_len,
+			item_len - (ptr + sub_item_len - start));
+		btrfs_truncate_item(root, path, item_len - sub_item_len, 1);
 	}
-	if (ret)
-		goto free_chan;
-	hc->created[pt] = 1;
-	return ret;
-free_chan:
-	release_port(hc, dch);
 	return ret;
 }
 
-static int
-hfcmulti_init(struct hm_map *m, struct pci_dev *pdev,
-	      const struct pci_device_id *ent)
+int verify_dir_item(struct btrfs_root *root,
+		    struct extent_buffer *leaf,
+		    struct btrfs_dir_item *dir_item)
 {
-	int		ret_err = 0;
-	int		pt;
-	struct hfc_multi	*hc;
-	u_long		flags;
-	u_char		dips = 0, pmj = 0; /* dip settings, port mode Jumpers */
-	int		i, ch;
-	u_int		maskcheck;
+	u16 namelen = BTRFS_NAME_LEN;
+	u8 type = btrfs_dir_type(leaf, dir_item);
 
-	if (HFC_cnt >= MAX_CARDS) {
-		printk(KERN_ERR "too many cards (max=%d).\n",
-		       MAX_CARDS);
-		return -EINVAL;
-	}
-	if ((type[HFC_cnt] & 0xff) && (type[HFC_cnt] & 0xff) != m->type) {
-		printk(KERN_WARNING "HFC-MULTI: Card '%s:%s' type %d found but "
-		       "type[%d] %d was supplied as module parameter\n",
-		       m->vendor_name, m->card_name, m->type, HFC_cnt,
-		       type[HFC_cnt] & 0xff);
-		printk(KERN_WARNING "HFC-MULTI: Load module without parameters "
-		       "first, to see cards and their types.");
-		return -EINVAL;
-	}
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: Registering %s:%s chip type %d (0x%x)\n",
-		       __func__, m->vendor_name, m->card_name, m->type,
-		       type[HFC_cnt]);
-
-	/* allocate card+fifo structure */
-	hc = kzalloc(sizeof(struct hfc_multi), GFP_KERNEL);
-	if (!hc) {
-		printk(KERN_ERR "No kmem for HFC-Multi card\n");
-		return -ENOMEM;
-	}
-	spin_lock_init(&hc->lock);
-	hc->mtyp = m;
-	hc->ctype =  m->type;
-	hc->ports = m->ports;
-	hc->id = HFC_cnt;
-	hc->pcm = pcm[HFC_cnt];
-	hc->io_mode = iomode[HFC_cnt];
-	if (hc->ctype == HFC_TYPE_E1 && dmask[E1_cnt]) {
-		/* fragment card */
-		pt = 0;
-		maskcheck = 0;
-		for (ch = 0; ch <= 31; ch++) {
-			if (!((1 << ch) & dmask[E1_cnt]))
-				continue;
-			hc->dnum[pt] = ch;
-			hc->bmask[pt] = bmask[bmask_cnt++];
-			if ((maskcheck & hc->bmask[pt])
-			 || (dmask[E1_cnt] & hc->bmask[pt])) {
-				printk(KERN_INFO
-				       "HFC-E1 #%d has overlapping B-channels on fragment #%d\n",
-				       E1_cnt + 1, pt);
-				kfree(hc);
-				return -EINVAL;
-			}
-			maskcheck |= hc->bmask[pt];
-			printk(KERN_INFO
-			       "HFC-E1 #%d uses D-channel on slot %d and a B-channel map of 0x%08x\n",
-				E1_cnt + 1, ch, hc->bmask[pt]);
-			pt++;
-		}
-		hc->ports = pt;
-	}
-	if (hc->ctype == HFC_TYPE_E1 && !dmask[E1_cnt]) {
-		/* default card layout */
-		hc->dnum[0] = 16;
-		hc->bmask[0] = 0xfffefffe;
-		hc->ports = 1;
+	if (type >= BTRFS_FT_MAX) {
+		btrfs_crit(root->fs_info, "invalid dir item type: %d",
+		       (int)type);
+		return 1;
 	}
 
-	/* set chip specific features */
-	hc->masterclk = -1;
-	if (type[HFC_cnt] & 0x100) {
-		test_and_set_bit(HFC_CHIP_ULAW, &hc->chip);
-		hc->silence = 0xff; /* ulaw silence */
-	} else
-		hc->silence = 0x2a; /* alaw silence */
-	if ((poll >> 1) > sizeof(hc->silence_data)) {
-		printk(KERN_ERR "HFCMULTI error: silence_data too small, "
-		       "please fix\n");
-		kfree(hc);
-		return -EINVAL;
-	}
-	for (i = 0; i < (poll >> 1); i++)
-		hc->silence_data[i] = hc->silence;
+	if (type == BTRFS_FT_XATTR)
+		namelen = XATTR_NAME_MAX;
 
-	if (hc->ctype != HFC_TYPE_XHFC) {
-		if (!(type[HFC_cnt] & 0x200))
-			test_and_set_bit(HFC_CHIP_DTMF, &hc->chip);
-		test_and_set_bit(HFC_CHIP_CONF, &hc->chip);
+	if (btrfs_dir_name_len(leaf, dir_item) > namelen) {
+		btrfs_crit(root->fs_info, "invalid dir item name len: %u",
+		       (unsigned)btrfs_dir_data_len(leaf, dir_item));
+		return 1;
 	}
 
-	if (type[HFC_cnt] & 0x800)
-		test_and_set_bit(HFC_CHIP_PCM_SLAVE, &hc->chip);
-	if (type[HFC_cnt] & 0x1000) {
-		test_and_set_bit(HFC_CHIP_PCM_MASTER, &hc->chip);
-		test_and_clear_bit(HFC_CHIP_PCM_SLAVE, &hc->chip);
-	}
-	if (type[HFC_cnt] & 0x4000)
-		test_and_set_bit(HFC_CHIP_EXRAM_128, &hc->chip);
-	if (type[HFC_cnt] & 0x8000)
-		test_and_set_bit(HFC_CHIP_EXRAM_512, &hc->chip);
-	hc->slots = 32;
-	if (type[HFC_cnt] & 0x10000)
-		hc->slots = 64;
-	if (type[HFC_cnt] & 0x20000)
-		hc->slots = 128;
-	if (type[HFC_cnt] & 0x80000) {
-		test_and_set_bit(HFC_CHIP_WATCHDOG, &hc->chip);
-		hc->wdcount = 0;
-		hc->wdbyte = V_GPIO_OUT2;
-		printk(KERN_NOTICE "Watchdog enabled\n");
+	/* BTRFS_MAX_XATTR_SIZE is the same for all dir items */
+	if ((btrfs_dir_data_len(leaf, dir_item) +
+	     btrfs_dir_name_len(leaf, dir_item)) > BTRFS_MAX_XATTR_SIZE(root)) {
+		btrfs_crit(root->fs_info, "invalid dir item name + data len: %u + %u",
+		       (unsigned)btrfs_dir_name_len(leaf, dir_item),
+		       (unsigned)btrfs_dir_data_len(leaf, dir_item));
+		return 1;
 	}
 
-	if (pdev && ent)
-		/* setup pci, hc->slots may change due to PLXSD */
-		ret_err = setup_pci(hc, pdev, ent);
-	else
-#ifdef CONFIG_MISDN_HFCMULTI_8xx
-		ret_err = setup_embedded(hc, m);
+	return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Copyright (C) 2007 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#ifndef __DISKIO__
+#define __DISKIO__
+
+#define BTRFS_SUPER_INFO_OFFSET (64 * 1024)
+#define BTRFS_SUPER_INFO_SIZE 4096
+
+#define BTRFS_SUPER_MIRROR_MAX	 3
+#define BTRFS_SUPER_MIRROR_SHIFT 12
+
+enum btrfs_wq_endio_type {
+	BTRFS_WQ_ENDIO_DATA = 0,
+	BTRFS_WQ_ENDIO_METADATA = 1,
+	BTRFS_WQ_ENDIO_FREE_SPACE = 2,
+	BTRFS_WQ_ENDIO_RAID56 = 3,
+	BTRFS_WQ_ENDIO_DIO_REPAIR = 4,
+};
+
+static inline u64 btrfs_sb_offset(int mirror)
+{
+	u64 start = 16 * 1024;
+	if (mirror)
+		return start << (BTRFS_SUPER_MIRROR_SHIFT * mirror);
+	return BTRFS_SUPER_INFO_OFFSET;
+}
+
+struct btrfs_device;
+struct btrfs_fs_devices;
+
+struct extent_buffer *read_tree_block(struct btrfs_root *root, u64 bytenr,
+				      u64 parent_transid);
+void readahead_tree_block(struct btrfs_root *root, u64 bytenr);
+int reada_tree_block_flagged(struct btrfs_root *root, u64 bytenr,
+			 int mirror_num, struct extent_buffer **eb);
+struct extent_buffer *btrfs_find_create_tree_block(struct btrfs_root *root,
+						   u64 bytenr);
+void clean_tree_block(struct btrfs_trans_handle *trans,
+		      struct btrfs_fs_info *fs_info, struct extent_buffer *buf);
+int open_ctree(struct super_block *sb,
+	       struct btrfs_fs_devices *fs_devices,
+	       char *options);
+void close_ctree(struct btrfs_root *root);
+int write_ctree_super(struct btrfs_trans_handle *trans,
+		      struct btrfs_root *root, int max_mirrors);
+struct buffer_head *btrfs_read_dev_super(struct block_device *bdev);
+int btrfs_read_dev_one_super(struct block_device *bdev, int copy_num,
+			struct buffer_head **bh_ret);
+int btrfs_commit_super(struct btrfs_root *root);
+struct extent_buffer *btrfs_find_tree_block(struct btrfs_fs_info *fs_info,
+					    u64 bytenr);
+struct btrfs_root *btrfs_read_fs_root(struct btrfs_root *tree_root,
+				      struct btrfs_key *location);
+int btrfs_init_fs_root(struct btrfs_root *root);
+struct btrfs_root *btrfs_lookup_fs_root(struct btrfs_fs_info *fs_info,
+					u64 root_id);
+int btrfs_insert_fs_root(struct btrfs_fs_info *fs_info,
+			 struct btrfs_root *root);
+void btrfs_free_fs_roots(struct btrfs_fs_info *fs_info);
+
+struct btrfs_root *btrfs_get_fs_root(struct btrfs_fs_info *fs_info,
+				     struct btrfs_key *key,
+				     bool check_ref);
+static inline struct btrfs_root *
+btrfs_read_fs_root_no_name(struct btrfs_fs_info *fs_info,
+			   struct btrfs_key *location)
+{
+	return btrfs_get_fs_root(fs_info, location, true);
+}
+
+int btrfs_cleanup_fs_roots(struct btrfs_fs_info *fs_info);
+void btrfs_btree_balance_dirty(struct btrfs_root *root);
+void btrfs_btree_balance_dirty_nodelay(struct btrfs_root *root);
+void btrfs_drop_and_free_fs_root(struct btrfs_fs_info *fs_info,
+				 struct btrfs_root *root);
+void btrfs_free_fs_root(struct btrfs_root *root);
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+struct btrfs_root *btrfs_alloc_dummy_root(void);
+#endif
+
+/*
+ * This function is used to grab the root, and avoid it is freed when we
+ * access it. But it doesn't ensure that the tree is not dropped.
+ *
+ * If you want to ensure the whole tree is safe, you should use
+ * 	fs_info->subvol_srcu
+ */
+static inline struct btrfs_root *btrfs_grab_fs_root(struct btrfs_root *root)
+{
+	if (atomic_inc_not_zero(&root->refs))
+		return root;
+	return NULL;
+}
+
+static inline void btrfs_put_fs_root(struct btrfs_root *root)
+{
+	if (atomic_dec_and_test(&root->refs))
+		kfree(root);
+}
+
+void btrfs_mark_buffer_dirty(struct extent_buffer *buf);
+int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid,
+			  int atomic);
+int btrfs_set_buffer_uptodate(struct extent_buffer *buf);
+int btrfs_read_buffer(struct extent_buffer *buf, u64 parent_transid);
+u32 btrfs_csum_data(char *data, u32 seed, size_t len);
+void btrfs_csum_final(u32 crc, char *result);
+int btrfs_bio_wq_end_io(struct btrfs_fs_info *info, struct bio *bio,
+			enum btrfs_wq_endio_type metadata);
+int btrfs_wq_submit_bio(struct btrfs_fs_info *fs_info, struct inode *inode,
+			int rw, struct bio *bio, int mirror_num,
+			unsigned long bio_flags, u64 bio_offset,
+			extent_submit_bio_hook_t *submit_bio_start,
+			extent_submit_bio_hook_t *submit_bio_done);
+unsigned long btrfs_async_submit_limit(struct btrfs_fs_info *info);
+int btrfs_write_tree_block(struct extent_buffer *buf);
+int btrfs_wait_tree_block_writeback(struct extent_buffer *buf);
+int btrfs_init_log_root_tree(struct btrfs_trans_handle *trans,
+			     struct btrfs_fs_info *fs_info);
+int btrfs_add_log_tree(struct btrfs_trans_handle *trans,
+		       struct btrfs_root *root);
+void btrfs_cleanup_one_transaction(struct btrfs_transaction *trans,
+				  struct btrfs_root *root);
+struct btrfs_root *btrfs_create_tree(struct btrfs_trans_handle *trans,
+				     struct btrfs_fs_info *fs_info,
+				     u64 objectid);
+int btree_lock_page_hook(struct page *page, void *data,
+				void (*flush_fn)(void *));
+int btrfs_get_num_tolerated_disk_barrier_failures(u64 flags);
+int btrfs_calc_num_tolerated_disk_barrier_failures(
+	struct btrfs_fs_info *fs_info);
+int __init btrfs_end_io_wq_init(void);
+void btrfs_end_io_wq_exit(void);
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+void btrfs_init_lockdep(void);
+void btrfs_set_buffer_lockdep_class(u64 objectid,
+			            struct extent_buffer *eb, int level);
 #else
-	{
-		printk(KERN_WARNING "Embedded IO Mode not selected\n");
-		ret_err = -EIO;
-	}
+static inline void btrfs_init_lockdep(void)
+{ }
+static inline void btrfs_set_buffer_lockdep_class(u64 objectid,
+					struct extent_buffer *eb, int level)
+{
+}
 #endif
-	if (ret_err) {
-		if (hc == syncmaster)
-			syncmaster = NULL;
-		kfree(hc);
-		return ret_err;
-	}
-
-	hc->HFC_outb_nodebug = hc->HFC_outb;
-	hc->HFC_inb_nodebug = hc->HFC_inb;
-	hc->HFC_inw_nodebug = hc->HFC_inw;
-	hc->HFC_wait_nodebug = hc->HFC_wait;
-#ifdef HFC_REGISTER_DEBUG
-	hc->HFC_outb = HFC_outb_debug;
-	hc->HFC_inb = HFC_inb_debug;
-	hc->HFC_inw = HFC_inw_debug;
-	hc->HFC_wait = HFC_wait_debug;
 #endif
-	/* create channels */
-	for (pt = 0; pt < hc->ports; pt++) {
-		if (Port_cnt >= MAX_PORTS) {
-			printk(KERN_ERR "too many ports (max=%d).\n",
-			       MAX_PORTS);
-			ret_err = -EINVAL;
-			goto free_card;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        #include <linux/fs.h>
+#include <linux/types.h>
+#include "ctree.h"
+#include "disk-io.h"
+#include "btrfs_inode.h"
+#include "print-tree.h"
+#include "export.h"
+
+#define BTRFS_FID_SIZE_NON_CONNECTABLE (offsetof(struct btrfs_fid, \
+						 parent_objectid) / 4)
+#define BTRFS_FID_SIZE_CONNECTABLE (offsetof(struct btrfs_fid, \
+					     parent_root_objectid) / 4)
+#define BTRFS_FID_SIZE_CONNECTABLE_ROOT (sizeof(struct btrfs_fid) / 4)
+
+static int btrfs_encode_fh(struct inode *inode, u32 *fh, int *max_len,
+			   struct inode *parent)
+{
+	struct btrfs_fid *fid = (struct btrfs_fid *)fh;
+	int len = *max_len;
+	int type;
+
+	if (parent && (len < BTRFS_FID_SIZE_CONNECTABLE)) {
+		*max_len = BTRFS_FID_SIZE_CONNECTABLE;
+		return FILEID_INVALID;
+	} else if (len < BTRFS_FID_SIZE_NON_CONNECTABLE) {
+		*max_len = BTRFS_FID_SIZE_NON_CONNECTABLE;
+		return FILEID_INVALID;
+	}
+
+	len  = BTRFS_FID_SIZE_NON_CONNECTABLE;
+	type = FILEID_BTRFS_WITHOUT_PARENT;
+
+	fid->objectid = btrfs_ino(inode);
+	fid->root_objectid = BTRFS_I(inode)->root->objectid;
+	fid->gen = inode->i_generation;
+
+	if (parent) {
+		u64 parent_root_id;
+
+		fid->parent_objectid = BTRFS_I(parent)->location.objectid;
+		fid->parent_gen = parent->i_generation;
+		parent_root_id = BTRFS_I(parent)->root->objectid;
+
+		if (parent_root_id != fid->root_objectid) {
+			fid->parent_root_objectid = parent_root_id;
+			len = BTRFS_FID_SIZE_CONNECTABLE_ROOT;
+			type = FILEID_BTRFS_WITH_PARENT_ROOT;
+		} else {
+			len = BTRFS_FID_SIZE_CONNECTABLE;
+			type = FILEID_BTRFS_WITH_PARENT;
 		}
-		if (hc->ctype == HFC_TYPE_E1)
-			ret_err = init_e1_port(hc, m, pt);
-		else
-			ret_err = init_multi_port(hc, pt);
-		if (debug & DEBUG_HFCMULTI_INIT)
-			printk(KERN_DEBUG
-			    "%s: Registering D-channel, card(%d) port(%d) "
-			       "result %d\n",
-			    __func__, HFC_cnt + 1, pt + 1, ret_err);
-
-		if (ret_err) {
-			while (pt) { /* release already registered ports */
-				pt--;
-				if (hc->ctype == HFC_TYPE_E1)
-					release_port(hc,
-						hc->chan[hc->dnum[pt]].dch);
-				else
-					release_port(hc,
-						hc->chan[(pt << 2) + 2].dch);
-			}
-			goto free_card;
-		}
-		if (hc->ctype != HFC_TYPE_E1)
-			Port_cnt++; /* for each S0 port */
-	}
-	if (hc->ctype == HFC_TYPE_E1) {
-		Port_cnt++; /* for each E1 port */
-		E1_cnt++;
 	}
 
-	/* disp switches */
-	switch (m->dip_type) {
-	case DIP_4S:
-		/*
-		 * Get DIP setting for beroNet 1S/2S/4S cards
-		 * DIP Setting: (collect GPIO 13/14/15 (R_GPIO_IN1) +
-		 * GPI 19/23 (R_GPI_IN2))
-		 */
-		dips = ((~HFC_inb(hc, R_GPIO_IN1) & 0xE0) >> 5) |
-			((~HFC_inb(hc, R_GPI_IN2) & 0x80) >> 3) |
-			(~HFC_inb(hc, R_GPI_IN2) & 0x08);
-
-		/* Port mode (TE/NT) jumpers */
-		pmj = ((HFC_inb(hc, R_GPI_IN3) >> 4)  & 0xf);
-
-		if (test_bit(HFC_CHIP_B410P, &hc->chip))
-			pmj = ~pmj & 0xf;
-
-		printk(KERN_INFO "%s: %s DIPs(0x%x) jumpers(0x%x)\n",
-		       m->vendor_name, m->card_name, dips, pmj);
-		break;
-	case DIP_8S:
-		/*
-		 * Get DIP Setting for beroNet 8S0+ cards
-		 * Enable PCI auxbridge function
-		 */
-		HFC_outb(hc, R_BRG_PCM_CFG, 1 | V_PCM_CLK);
-		/* prepare access to auxport */
-		outw(0x4000, hc->pci_iobase + 4);
-		/*
-		 * some dummy reads are required to
-		 * read valid DIP switch data
-		 */
-		dips = inb(hc->pci_iobase);
-		dips = inb(hc->pci_iobase);
-		dips = inb(hc->pci_iobase);
-		dips = ~inb(hc->pci_iobase) & 0x3F;
-		outw(0x0, hc->pci_iobase + 4);
-		/* disable PCI auxbridge function */
-		HFC_outb(hc, R_BRG_PCM_CFG, V_PCM_CLK);
-		printk(KERN_INFO "%s: %s DIPs(0x%x)\n",
-		       m->vendor_name, m->card_name, dips);
-		break;
-	case DIP_E1:
-		/*
-		 * get DIP Setting for beroNet E1 cards
-		 * DIP Setting: collect GPI 4/5/6/7 (R_GPI_IN0)
-		 */
-		dips = (~HFC_inb(hc, R_GPI_IN0) & 0xF0) >> 4;
-		printk(KERN_INFO "%s: %s DIPs(0x%x)\n",
-		       m->vendor_name, m->card_name, dips);
-		break;
-	}
-
-	/* add to list */
-	spin_lock_irqsave(&HFClock, flags);
-	list_add_tail(&hc->list, &HFClist);
-	spin_unlock_irqrestore(&HFClock, flags);
-
-	/* use as clock source */
-	if (clock == HFC_cnt + 1)
-		hc->iclock = mISDN_register_clock("HFCMulti", 0, clockctl, hc);
-
-	/* initialize hardware */
-	hc->irq = (m->irq) ? : hc->pci_dev->irq;
-	ret_err = init_card(hc);
-	if (ret_err) {
-		printk(KERN_ERR "init card returns %d\n", ret_err);
-		release_card(hc);
-		return ret_err;
-	}
-
-	/* start IRQ and return */
-	spin_lock_irqsave(&hc->lock, flags);
-	enable_hwirq(hc);
-	spin_unlock_irqrestore(&hc->lock, flags);
-	return 0;
-
-free_card:
-	release_io_hfcmulti(hc);
-	if (hc == syncmaster)
-		syncmaster = NULL;
-	kfree(hc);
-	return ret_err;
+	*max_len = len;
+	return type;
 }
 
-static void hfc_remove_pci(struct pci_dev *pdev)
+struct dentry *btrfs_get_dentry(struct super_block *sb, u64 objectid,
+				u64 root_objectid, u64 generation,
+				int check_generation)
 {
-	struct hfc_multi	*card = pci_get_drvdata(pdev);
-	u_long			flags;
+	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
+	struct btrfs_root *root;
+	struct inode *inode;
+	struct btrfs_key key;
+	int index;
+	int err = 0;
 
-	if (debug)
-		printk(KERN_INFO "removing hfc_multi card vendor:%x "
-		       "device:%x subvendor:%x subdevice:%x\n",
-		       pdev->vendor, pdev->device,
-		       pdev->subsystem_vendor, pdev->subsystem_device);
+	if (objectid < BTRFS_FIRST_FREE_OBJECTID)
+		return ERR_PTR(-ESTALE);
 
-	if (card) {
-		spin_lock_irqsave(&HFClock, flags);
-		release_card(card);
-		spin_unlock_irqrestore(&HFClock, flags);
-	}  else {
-		if (debug)
-			printk(KERN_DEBUG "%s: drvdata already removed\n",
-			       __func__);
+	key.objectid = root_objectid;
+	key.type = BTRFS_ROOT_ITEM_KEY;
+	key.offset = (u64)-1;
+
+	index = srcu_read_lock(&fs_info->subvol_srcu);
+
+	root = btrfs_read_fs_root_no_name(fs_info, &key);
+	if (IS_ERR(root)) {
+		err = PTR_ERR(root);
+		goto fail;
 	}
+
+	key.objectid = objectid;
+	key.type = BTRFS_INODE_ITEM_KEY;
+	key.offset = 0;
+
+	inode = btrfs_iget(sb, &key, root, NULL);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		goto fail;
+	}
+
+	srcu_read_unlock(&fs_info->subvol_srcu, index);
+
+	if (check_generation && generation != inode->i_generation) {
+		iput(inode);
+		return ERR_PTR(-ESTALE);
+	}
+
+	return d_obtain_alias(inode);
+fail:
+	srcu_read_unlock(&fs_info->subvol_srcu, index);
+	return ERR_PTR(err);
 }
 
-#define	VENDOR_CCD	"Cologne Chip AG"
-#define	VENDOR_BN	"beroNet GmbH"
-#define	VENDOR_DIG	"Digium Inc."
-#define VENDOR_JH	"Junghanns.NET GmbH"
-#define VENDOR_PRIM	"PrimuX"
-
-static const struct hm_map hfcm_map[] = {
-	/*0*/	{VENDOR_BN, "HFC-1S Card (mini PCI)", 4, 1, 1, 3, 0, DIP_4S, 0, 0},
-	/*1*/	{VENDOR_BN, "HFC-2S Card", 4, 2, 1, 3, 0, DIP_4S, 0, 0},
-	/*2*/	{VENDOR_BN, "HFC-2S Card (mini PCI)", 4, 2, 1, 3, 0, DIP_4S, 0, 0},
-	/*3*/	{VENDOR_BN, "HFC-4S Card", 4, 4, 1, 2, 0, DIP_4S, 0, 0},
-	/*4*/	{VENDOR_BN, "HFC-4S Card (mini PCI)", 4, 4, 1, 2, 0, 0, 0, 0},
-	/*5*/	{VENDOR_CCD, "HFC-4S Eval (old)", 4, 4, 0, 0, 0, 0, 0, 0},
-	/*6*/	{VENDOR_CCD, "HFC-4S IOB4ST", 4, 4, 1, 2, 0, DIP_4S, 0, 0},
-	/*7*/	{VENDOR_CCD, "HFC-4S", 4, 4, 1, 2, 0, 0, 0, 0},
-	/*8*/	{VENDOR_DIG, "HFC-4S Card", 4, 4, 0, 2, 0, 0, HFC_IO_MODE_REGIO, 0},
-	/*9*/	{VENDOR_CCD, "HFC-4S Swyx 4xS0 SX2 QuadBri", 4, 4, 1, 2, 0, 0, 0, 0},
-	/*10*/	{VENDOR_JH, "HFC-4S (junghanns 2.0)", 4, 4, 1, 2, 0, 0, 0, 0},
-	/*11*/	{VENDOR_PRIM, "HFC-2S Primux Card", 4, 2, 0, 0, 0, 0, 0, 0},
-
-	/*12*/	{VENDOR_BN, "HFC-8S Card", 8, 8, 1, 0, 0, 0, 0, 0},
-	/*13*/	{VENDOR_BN, "HFC-8S Card (+)", 8, 8, 1, 8, 0, DIP_8S,
-		 HFC_IO_MODE_REGIO, 0},
-	/*14*/	{VENDOR_CCD, "HFC-8S Eval (old)", 8, 8, 0, 0, 0, 0, 0, 0},
-	/*15*/	{VENDOR_CCD, "HFC-8S IOB4ST Recording", 8, 8, 1, 0, 0, 0, 0, 0},
-
-	/*16*/	{VENDOR_CCD, "HFC-8S IOB8ST", 8, 8, 1, 0, 0, 0, 0, 0},
-	/*17*/	{VENDOR_CCD, "HFC-8S", 8, 8, 1, 0, 0, 0, 0, 0},
-	/*18*/	{VENDOR_CCD, "HFC-8S", 8, 8, 1, 0, 0, 0, 0, 0},
-
-	/*19*/	{VENDOR_BN, "HFC-E1 Card", 1, 1, 0, 1, 0, DIP_E1, 0, 0},
-	/*20*/	{VENDOR_BN, "HFC-E1 Card (mini PCI)", 1, 1, 0, 1, 0, 0, 0, 0},
-	/*21*/	{VENDOR_BN, "HFC-E1+ Card (Dual)", 1, 1, 0, 1, 0, DIP_E1, 0, 0},
-	/*22*/	{VENDOR_BN, "HFC-E1 Card (Dual)", 1, 1, 0, 1, 0, DIP_E1, 0, 0},
-
-	/*23*/	{VENDOR_CCD, "HFC-E1 Eval (old)", 1, 1, 0, 0, 0, 0, 0, 0},
-	/*24*/	{VENDOR_CCD, "HFC-E1 IOB1E1", 1, 1, 0, 1, 0, 0, 0, 0},
-	/*25*/	{VENDOR_CCD, "HFC-E1", 1, 1, 0, 1, 0, 0, 0, 0},
-
-	/*26*/	{VENDOR_CCD, "HFC-4S Speech Design", 4, 4, 0, 0, 0, 0,
-		 HFC_IO_MODE_PLXSD, 0},
-	/*27*/	{VENDOR_CCD, "HFC-E1 Speech Design", 1, 1, 0, 0, 0, 0,
-		 HFC_IO_MODE_PLXSD, 0},
-	/*28*/	{VENDOR_CCD, "HFC-4S OpenVox", 4, 4, 1, 0, 0, 0, 0, 0},
-	/*29*/	{VENDOR_CCD, "HFC-2S OpenVox", 4, 2, 1, 0, 0, 0, 0, 0},
-	/*30*/	{VENDOR_CCD, "HFC-8S OpenVox", 8, 8, 1, 0, 0, 0, 0, 0},
-	/*31*/	{VENDOR_CCD, "XHFC-4S Speech Design", 5, 4, 0, 0, 0, 0,
-		 HFC_IO_MODE_EMBSD, XHFC_IRQ},
-	/*32*/	{VENDOR_JH, "HFC-8S (junghanns)", 8, 8, 1, 0, 0, 0, 0, 0},
-	/*33*/	{VENDOR_BN, "HFC-2S Beronet Card PCIe", 4, 2, 1, 3, 0, DIP_4S, 0, 0},
-	/*34*/	{VENDOR_BN, "HFC-4S Beronet Card PCIe", 4, 4, 1, 2, 0, DIP_4S, 0, 0},
-};
-
-#undef H
-#define H(x)	((unsigned long)&hfcm_map[x])
-static struct pci_device_id hfmultipci_ids[] = {
-
-	/* Cards with HFC-4S Chip */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BN1SM, 0, 0, H(0)}, /* BN1S mini PCI */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BN2S, 0, 0, H(1)}, /* BN2S */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BN2SM, 0, 0, H(2)}, /* BN2S mini PCI */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BN4S, 0, 0, H(3)}, /* BN4S */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BN4SM, 0, 0, H(4)}, /* BN4S mini PCI */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_DEVICE_ID_CCD_HFC4S, 0, 0, H(5)}, /* Old Eval */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_IOB4ST, 0, 0, H(6)}, /* IOB4ST */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_HFC4S, 0, 0, H(7)}, /* 4S */
-	{ PCI_VENDOR_ID_DIGIUM, PCI_DEVICE_ID_DIGIUM_HFC4S,
-	  PCI_VENDOR_ID_DIGIUM, PCI_DEVICE_ID_DIGIUM_HFC4S, 0, 0, H(8)},
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_SWYX4S, 0, 0, H(9)}, /* 4S Swyx */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_JH4S20, 0, 0, H(10)},
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_PMX2S, 0, 0, H(11)}, /* Primux */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_OV4S, 0, 0, H(28)}, /* OpenVox 4 */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_OV2S, 0, 0, H(29)}, /* OpenVox 2 */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  0xb761, 0, 0, H(33)}, /* BN2S PCIe */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC4S, PCI_VENDOR_ID_CCD,
-	  0xb762, 0, 0, H(34)}, /* BN4S PCIe */
-
-	/* Cards with HFC-8S Chip */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BN8S, 0, 0, H(12)}, /* BN8S */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BN8SP, 0, 0, H(13)}, /* BN8S+ */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_DEVICE_ID_CCD_HFC8S, 0, 0, H(14)}, /* old Eval */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_IOB8STR, 0, 0, H(15)}, /* IOB8ST Recording */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_IOB8ST, 0, 0, H(16)}, /* IOB8ST  */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_IOB8ST_1, 0, 0, H(17)}, /* IOB8ST  */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_HFC8S, 0, 0, H(18)}, /* 8S */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_OV8S, 0, 0, H(30)}, /* OpenVox 8 */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFC8S, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_JH8S, 0, 0, H(32)}, /* Junganns 8S  */
-
-
-	/* Cards with HFC-E1 Chip */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFCE1, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BNE1, 0, 0, H(19)}, /* BNE1 */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFCE1, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BNE1M, 0, 0, H(20)}, /* BNE1 mini PCI */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFCE1, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BNE1DP, 0, 0, H(21)}, /* BNE1 + (Dual) */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFCE1, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_BNE1D, 0, 0, H(22)}, /* BNE1 (Dual) */
-
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFCE1, PCI_VENDOR_ID_CCD,
-	  PCI_DEVICE_ID_CCD_HFCE1, 0, 0, H(23)}, /* Old Eval */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFCE1, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_IOB1E1, 0, 0, H(24)}, /* IOB1E1 */
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFCE1, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_HFCE1, 0, 0, H(25)}, /* E1 */
-
-	{ PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9030, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_SPD4S, 0, 0, H(26)}, /* PLX PCI Bridge */
-	{ PCI_VENDOR_ID_PLX, PCI_DEVICE_ID_PLX_9030, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_SPDE1, 0, 0, H(27)}, /* PLX PCI Bridge */
-
-	{ PCI_VENDOR_ID_CCD, PCI_DEVICE_ID_CCD_HFCE1, PCI_VENDOR_ID_CCD,
-	  PCI_SUBDEVICE_ID_CCD_JHSE1, 0, 0, H(25)}, /* Junghanns E1 */
-
-	{ PCI_VDEVICE(CCD, PCI_DEVICE_ID_CCD_HFC4S), 0 },
-	{ PCI_VDEVICE(CCD, PCI_DEVICE_ID_CCD_HFC8S), 0 },
-	{ PCI_VDEVICE(CCD, PCI_DEVICE_ID_CCD_HFCE1), 0 },
-	{0, }
-};
-#undef H
-
-MODULE_DEVICE_TABLE(pci, hfmultipci_ids);
-
-static int
-hfcmulti_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+static struct dentry *btrfs_fh_to_parent(struct super_block *sb, struct fid *fh,
+					 int fh_len, int fh_type)
 {
-	struct hm_map	*m = (struct hm_map *)ent->driver_data;
-	int		ret;
+	struct btrfs_fid *fid = (struct btrfs_fid *) fh;
+	u64 objectid, root_objectid;
+	u32 generation;
 
-	if (m == NULL && ent->vendor == PCI_VENDOR_ID_CCD && (
-		    ent->device == PCI_DEVICE_ID_CCD_HFC4S ||
-		    ent->device == PCI_DEVICE_ID_CCD_HFC8S ||
-		    ent->device == PCI_DEVICE_ID_CCD_HFCE1)) {
-		printk(KERN_ERR
-		       "Unknown HFC multiport controller (vendor:%04x device:%04x "
-		       "subvendor:%04x subdevice:%04x)\n", pdev->vendor,
-		       pdev->device, pdev->subsystem_vendor,
-		       pdev->subsystem_device);
-		printk(KERN_ERR
-		       "Please contact the driver maintainer for support.\n");
-		return -ENODEV;
-	}
-	ret = hfcmulti_init(m, pdev, ent);
-	if (ret)
-		return ret;
-	HFC_cnt++;
-	printk(KERN_INFO "%d devices registered\n", HFC_cnt);
-	return 0;
+	if (fh_type == FILEID_BTRFS_WITH_PARENT) {
+		if (fh_len <  BTRFS_FID_SIZE_CONNECTABLE)
+			return NULL;
+		root_objectid = fid->root_objectid;
+	} else if (fh_type == FILEID_BTRFS_WITH_PARENT_ROOT) {
+		if (fh_len < BTRFS_FID_SIZE_CONNECTABLE_ROOT)
+			return NULL;
+		root_objectid = fid->parent_root_objectid;
+	} else
+		return NULL;
+
+	objectid = fid->parent_objectid;
+	generation = fid->parent_gen;
+
+	return btrfs_get_dentry(sb, objectid, root_objectid, generation, 1);
 }
 
-static struct pci_driver hfcmultipci_driver = {
-	.name		= "hfc_multi",
-	.probe		= hfcmulti_probe,
-	.remove		= hfc_remove_pci,
-	.id_table	= hfmultipci_ids,
-};
-
-static void __exit
-HFCmulti_cleanup(void)
+static struct dentry *btrfs_fh_to_dentry(struct super_block *sb, struct fid *fh,
+					 int fh_len, int fh_type)
 {
-	struct hfc_multi *card, *next;
+	struct btrfs_fid *fid = (struct btrfs_fid *) fh;
+	u64 objectid, root_objectid;
+	u32 generation;
 
-	/* get rid of all devices of this driver */
-	list_for_each_entry_safe(card, next, &HFClist, list)
-		release_card(card);
-	pci_unregister_driver(&hfcmultipci_driver);
+	if ((fh_type != FILEID_BTRFS_WITH_PARENT ||
+	     fh_len < BTRFS_FID_SIZE_CONNECTABLE) &&
+	    (fh_type != FILEID_BTRFS_WITH_PARENT_ROOT ||
+	     fh_len < BTRFS_FID_SIZE_CONNECTABLE_ROOT) &&
+	    (fh_type != FILEID_BTRFS_WITHOUT_PARENT ||
+	     fh_len < BTRFS_FID_SIZE_NON_CONNECTABLE))
+		return NULL;
+
+	objectid = fid->objectid;
+	root_objectid = fid->root_objectid;
+	generation = fid->gen;
+
+	return btrfs_get_dentry(sb, objectid, root_objectid, generation, 1);
 }
 
-static int __init
-HFCmulti_init(void)
+struct dentry *btrfs_get_parent(struct dentry *child)
 {
-	int err;
-	int i, xhfc = 0;
-	struct hm_map m;
+	struct inode *dir = d_inode(child);
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_root_ref *ref;
+	struct btrfs_key key;
+	struct btrfs_key found_key;
+	int ret;
 
-	printk(KERN_INFO "mISDN: HFC-multi driver %s\n", HFC_MULTI_VERSION);
+	path = btrfs_alloc_path();
+	if (!path)
+		return ERR_PTR(-ENOMEM);
 
-#ifdef IRQ_DEBUG
-	printk(KERN_DEBUG "%s: IRQ_DEBUG IS ENABLED!\n", __func__);
-#endif
-
-	spin_lock_init(&HFClock);
-	spin_lock_init(&plx_lock);
-
-	if (debug & DEBUG_HFCMULTI_INIT)
-		printk(KERN_DEBUG "%s: init entered\n", __func__);
-
-	switch (poll) {
-	case 0:
-		poll_timer = 6;
-		poll = 128;
-		break;
-	case 8:
-		poll_timer = 2;
-		break;
-	case 16:
-		poll_timer = 3;
-		break;
-	case 32:
-		poll_timer = 4;
-		break;
-	case 64:
-		poll_timer = 5;
-		break;
-	case 128:
-		poll_timer = 6;
-		break;
-	case 256:
-		poll_timer = 7;
-		break;
-	default:
-		printk(KERN_ERR
-		       "%s: Wrong poll value (%d).\n", __func__, poll);
-		err = -EINVAL;
-		return err;
-
+	if (btrfs_ino(dir) == BTRFS_FIRST_FREE_OBJECTID) {
+		key.objectid = root->root_key.objectid;
+		key.type = BTRFS_ROOT_BACKREF_KEY;
+		key.offset = (u64)-1;
+		root = root->fs_info->tree_root;
+	} else {
+		key.objectid = btrfs_ino(dir);
+		key.type = BTRFS_INODE_REF_KEY;
+		key.offset = (u64)-1;
 	}
 
-	if (!clock)
-		clock = 1;
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (ret < 0)
+		goto fail;
 
-	/* Register the embedded devices.
-	 * This should be done before the PCI cards registration */
-	switch (hwid) {
-	case HWID_MINIP4:
-		xhfc = 1;
-		m = hfcm_map[31];
-		break;
-	case HWID_MINIP8:
-		xhfc = 2;
-		m = hfcm_map[31];
-		break;
-	case HWID_MINIP16:
-		xhfc = 4;
-		m = hfcm_map[31];
-		break;
-	default:
-		xhfc = 0;
+	BUG_ON(ret == 0); /* Key with offset of -1 found */
+	if (path->slots[0] == 0) {
+		ret = -ENOENT;
+		goto fail;
 	}
 
-	for (i = 0; i < xhfc; ++i) {
-		err = hfcmulti_init(&m, NULL, NULL);
-		if (err) {
-			printk(KERN_ERR "error registering embedded driver: "
-			       "%x\n", err);
-			return err;
-		}
-		HFC_cnt++;
-		printk(KERN_INFO "%d devices registered\n", HFC_cnt);
+	path->slots[0]--;
+	leaf = path->nodes[0];
+
+	btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+	if (found_key.objectid != key.objectid || found_key.type != key.type) {
+		ret = -ENOENT;
+		goto fail;
 	}
 
-	/* Register the PCI cards */
-	err = pci_register_driver(&hfcmultipci_driver);
-	if (err < 0) {
-		printk(KERN_ERR "error registering pci driver: %x\n", err);
-		return err;
-	}
-
-	return 0;
-}
-
-
-module_init(HFCmulti_init);
-module_exit(HFCmulti_cleanup);
+	if (found_key.type == BTRFS_ROOT_BACKREF

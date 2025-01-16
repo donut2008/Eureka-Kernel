@@ -1,162 +1,82 @@
 /*
- * Intel BayTrail PMIC I2C bus semaphore implementaion
- * Copyright (c) 2014, Intel Corporation.
+ * GMC_8_2 Register documentation
  *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
  *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-#include <linux/module.h>
-#include <linux/delay.h>
-#include <linux/device.h>
-#include <linux/acpi.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
 
-#include <asm/iosf_mbi.h>
+#ifndef GMC_8_2_SH_MASK_H
+#define GMC_8_2_SH_MASK_H
 
-#include "i2c-designware-core.h"
-
-#define SEMAPHORE_TIMEOUT	100
-#define PUNIT_SEMAPHORE		0x7
-#define PUNIT_SEMAPHORE_BIT	BIT(0)
-#define PUNIT_SEMAPHORE_ACQUIRE	BIT(1)
-
-static unsigned long acquired;
-
-static int get_sem(struct device *dev, u32 *sem)
-{
-	u32 data;
-	int ret;
-
-	ret = iosf_mbi_read(BT_MBI_UNIT_PMC, BT_MBI_BUNIT_READ, PUNIT_SEMAPHORE,
-				&data);
-	if (ret) {
-		dev_err(dev, "iosf failed to read punit semaphore\n");
-		return ret;
-	}
-
-	*sem = data & PUNIT_SEMAPHORE_BIT;
-
-	return 0;
-}
-
-static void reset_semaphore(struct device *dev)
-{
-	u32 data;
-
-	if (iosf_mbi_read(BT_MBI_UNIT_PMC, BT_MBI_BUNIT_READ,
-				PUNIT_SEMAPHORE, &data)) {
-		dev_err(dev, "iosf failed to reset punit semaphore during read\n");
-		return;
-	}
-
-	data &= ~PUNIT_SEMAPHORE_BIT;
-	if (iosf_mbi_write(BT_MBI_UNIT_PMC, BT_MBI_BUNIT_WRITE,
-				PUNIT_SEMAPHORE, data))
-		dev_err(dev, "iosf failed to reset punit semaphore during write\n");
-}
-
-static int baytrail_i2c_acquire(struct dw_i2c_dev *dev)
-{
-	u32 sem;
-	int ret;
-	unsigned long start, end;
-
-	might_sleep();
-
-	if (!dev || !dev->dev)
-		return -ENODEV;
-
-	if (!dev->release_lock)
-		return 0;
-
-	/* host driver writes to side band semaphore register */
-	ret = iosf_mbi_write(BT_MBI_UNIT_PMC, BT_MBI_BUNIT_WRITE,
-				PUNIT_SEMAPHORE, PUNIT_SEMAPHORE_ACQUIRE);
-	if (ret) {
-		dev_err(dev->dev, "iosf punit semaphore request failed\n");
-		return ret;
-	}
-
-	/* host driver waits for bit 0 to be set in semaphore register */
-	start = jiffies;
-	end = start + msecs_to_jiffies(SEMAPHORE_TIMEOUT);
-	do {
-		ret = get_sem(dev->dev, &sem);
-		if (!ret && sem) {
-			acquired = jiffies;
-			dev_dbg(dev->dev, "punit semaphore acquired after %ums\n",
-				jiffies_to_msecs(jiffies - start));
-			return 0;
-		}
-
-		usleep_range(1000, 2000);
-	} while (time_before(jiffies, end));
-
-	dev_err(dev->dev, "punit semaphore timed out, resetting\n");
-	reset_semaphore(dev->dev);
-
-	ret = iosf_mbi_read(BT_MBI_UNIT_PMC, BT_MBI_BUNIT_READ,
-				PUNIT_SEMAPHORE, &sem);
-	if (ret)
-		dev_err(dev->dev, "iosf failed to read punit semaphore\n");
-	else
-		dev_err(dev->dev, "PUNIT SEM: %d\n", sem);
-
-	WARN_ON(1);
-
-	return -ETIMEDOUT;
-}
-
-static void baytrail_i2c_release(struct dw_i2c_dev *dev)
-{
-	if (!dev || !dev->dev)
-		return;
-
-	if (!dev->acquire_lock)
-		return;
-
-	reset_semaphore(dev->dev);
-	dev_dbg(dev->dev, "punit semaphore held for %ums\n",
-		jiffies_to_msecs(jiffies - acquired));
-}
-
-int i2c_dw_eval_lock_support(struct dw_i2c_dev *dev)
-{
-	acpi_status status;
-	unsigned long long shared_host = 0;
-	acpi_handle handle;
-
-	if (!dev || !dev->dev)
-		return 0;
-
-	handle = ACPI_HANDLE(dev->dev);
-	if (!handle)
-		return 0;
-
-	status = acpi_evaluate_integer(handle, "_SEM", NULL, &shared_host);
-	if (ACPI_FAILURE(status))
-		return 0;
-
-	if (shared_host) {
-		dev_info(dev->dev, "I2C bus managed by PUNIT\n");
-		dev->acquire_lock = baytrail_i2c_acquire;
-		dev->release_lock = baytrail_i2c_release;
-		dev->pm_runtime_disabled = true;
-	}
-
-	if (!iosf_mbi_available())
-		return -EPROBE_DEFER;
-
-	return 0;
-}
-
-MODULE_AUTHOR("David E. Box <david.e.box@linux.intel.com>");
-MODULE_DESCRIPTION("Baytrail I2C Semaphore driver");
-MODULE_LICENSE("GPL v2");
+#define MC_CONFIG__MCDW_WR_ENABLE_MASK 0x1
+#define MC_CONFIG__MCDW_WR_ENABLE__SHIFT 0x0
+#define MC_CONFIG__MCDX_WR_ENABLE_MASK 0x2
+#define MC_CONFIG__MCDX_WR_ENABLE__SHIFT 0x1
+#define MC_CONFIG__MCDY_WR_ENABLE_MASK 0x4
+#define MC_CONFIG__MCDY_WR_ENABLE__SHIFT 0x2
+#define MC_CONFIG__MCDZ_WR_ENABLE_MASK 0x8
+#define MC_CONFIG__MCDZ_WR_ENABLE__SHIFT 0x3
+#define MC_CONFIG__MCDS_WR_ENABLE_MASK 0x10
+#define MC_CONFIG__MCDS_WR_ENABLE__SHIFT 0x4
+#define MC_CONFIG__MCDT_WR_ENABLE_MASK 0x20
+#define MC_CONFIG__MCDT_WR_ENABLE__SHIFT 0x5
+#define MC_CONFIG__MCDU_WR_ENABLE_MASK 0x40
+#define MC_CONFIG__MCDU_WR_ENABLE__SHIFT 0x6
+#define MC_CONFIG__MCDV_WR_ENABLE_MASK 0x80
+#define MC_CONFIG__MCDV_WR_ENABLE__SHIFT 0x7
+#define MC_CONFIG__MC_RD_ENABLE_MASK 0x700
+#define MC_CONFIG__MC_RD_ENABLE__SHIFT 0x8
+#define MC_CONFIG__MCC_INDEX_MODE_ENABLE_MASK 0x80000000
+#define MC_CONFIG__MCC_INDEX_MODE_ENABLE__SHIFT 0x1f
+#define MC_ARB_ATOMIC__TC_GRP_MASK 0x7
+#define MC_ARB_ATOMIC__TC_GRP__SHIFT 0x0
+#define MC_ARB_ATOMIC__TC_GRP_EN_MASK 0x8
+#define MC_ARB_ATOMIC__TC_GRP_EN__SHIFT 0x3
+#define MC_ARB_ATOMIC__SDMA_GRP_MASK 0x70
+#define MC_ARB_ATOMIC__SDMA_GRP__SHIFT 0x4
+#define MC_ARB_ATOMIC__SDMA_GRP_EN_MASK 0x80
+#define MC_ARB_ATOMIC__SDMA_GRP_EN__SHIFT 0x7
+#define MC_ARB_ATOMIC__OUTSTANDING_MASK 0xff00
+#define MC_ARB_ATOMIC__OUTSTANDING__SHIFT 0x8
+#define MC_ARB_ATOMIC__ATOMIC_RTN_GRP_MASK 0xff0000
+#define MC_ARB_ATOMIC__ATOMIC_RTN_GRP__SHIFT 0x10
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP0_MASK 0x1
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP0__SHIFT 0x0
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP1_MASK 0x2
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP1__SHIFT 0x1
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP2_MASK 0x4
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP2__SHIFT 0x2
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP3_MASK 0x8
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP3__SHIFT 0x3
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP4_MASK 0x10
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP4__SHIFT 0x4
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP5_MASK 0x20
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP5__SHIFT 0x5
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP6_MASK 0x40
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP6__SHIFT 0x6
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP7_MASK 0x80
+#define MC_ARB_AGE_CNTL__RESET_RD_GROUP7__SHIFT 0x7
+#define MC_ARB_AGE_CNTL__RESET_WR_GROUP0_MASK 0x100
+#define MC_ARB_AGE_CNTL__RESET_WR_GROUP0__SHIFT 0x8
+#define MC_ARB_AGE_CNTL__RESET_WR_GROUP1_MASK 0x200
+#define MC_ARB_AGE_CNTL__RESET_WR_GROUP1__SHIFT 0x9
+#define MC_ARB_AGE_CNTL__RESET_WR_GROUP2_MASK 0x400
+#define MC_ARB_AGE_CNTL__RESET_WR_GROUP2__SHIFT 0xa
+#define MC_ARB_AGE_CNTL__RESET_WR_GROUP3_MASK 0x800
+#define MC_ARB_AGE_CNTL

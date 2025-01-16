@@ -1,307 +1,308 @@
-/*
- * driver for the i2c-tiny-usb adapter - 1.0
- * http://www.harbaum.org/till/i2c_tiny_usb
- *
- * Copyright (C) 2006-2007 Till Harbaum (Till@Harbaum.org)
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation, version 2.
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/types.h>
-
-/* include interfaces to usb layer */
-#include <linux/usb.h>
-
-/* include interface to i2c layer */
-#include <linux/i2c.h>
-
-/* commands via USB, must match command ids in the firmware */
-#define CMD_ECHO		0
-#define CMD_GET_FUNC		1
-#define CMD_SET_DELAY		2
-#define CMD_GET_STATUS		3
-
-#define CMD_I2C_IO		4
-#define CMD_I2C_IO_BEGIN	(1<<0)
-#define CMD_I2C_IO_END		(1<<1)
-
-/* i2c bit delay, default is 10us -> 100kHz max
-   (in practice, due to additional delays in the i2c bitbanging
-   code this results in a i2c clock of about 50kHz) */
-static unsigned short delay = 10;
-module_param(delay, ushort, 0);
-MODULE_PARM_DESC(delay, "bit delay in microseconds "
-		 "(default is 10us for 100kHz max)");
-
-static int usb_read(struct i2c_adapter *adapter, int cmd,
-		    int value, int index, void *data, int len);
-
-static int usb_write(struct i2c_adapter *adapter, int cmd,
-		     int value, int index, void *data, int len);
-
-/* ----- begin of i2c layer ---------------------------------------------- */
-
-#define STATUS_IDLE		0
-#define STATUS_ADDRESS_ACK	1
-#define STATUS_ADDRESS_NAK	2
-
-static int usb_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int num)
-{
-	unsigned char *pstatus;
-	struct i2c_msg *pmsg;
-	int i, ret;
-
-	dev_dbg(&adapter->dev, "master xfer %d messages:\n", num);
-
-	pstatus = kmalloc(sizeof(*pstatus), GFP_KERNEL);
-	if (!pstatus)
-		return -ENOMEM;
-
-	for (i = 0 ; i < num ; i++) {
-		int cmd = CMD_I2C_IO;
-
-		if (i == 0)
-			cmd |= CMD_I2C_IO_BEGIN;
-
-		if (i == num-1)
-			cmd |= CMD_I2C_IO_END;
-
-		pmsg = &msgs[i];
-
-		dev_dbg(&adapter->dev,
-			"  %d: %s (flags %d) %d bytes to 0x%02x\n",
-			i, pmsg->flags & I2C_M_RD ? "read" : "write",
-			pmsg->flags, pmsg->len, pmsg->addr);
-
-		/* and directly send the message */
-		if (pmsg->flags & I2C_M_RD) {
-			/* read data */
-			if (usb_read(adapter, cmd,
-				     pmsg->flags, pmsg->addr,
-				     pmsg->buf, pmsg->len) != pmsg->len) {
-				dev_err(&adapter->dev,
-					"failure reading data\n");
-				ret = -EREMOTEIO;
-				goto out;
-			}
-		} else {
-			/* write data */
-			if (usb_write(adapter, cmd,
-				      pmsg->flags, pmsg->addr,
-				      pmsg->buf, pmsg->len) != pmsg->len) {
-				dev_err(&adapter->dev,
-					"failure writing data\n");
-				ret = -EREMOTEIO;
-				goto out;
-			}
-		}
-
-		/* read status */
-		if (usb_read(adapter, CMD_GET_STATUS, 0, 0, pstatus, 1) != 1) {
-			dev_err(&adapter->dev, "failure reading status\n");
-			ret = -EREMOTEIO;
-			goto out;
-		}
-
-		dev_dbg(&adapter->dev, "  status = %d\n", *pstatus);
-		if (*pstatus == STATUS_ADDRESS_NAK) {
-			ret = -EREMOTEIO;
-			goto out;
+d->physshadow[ctxttid + tid] = dd->tidinvalid;
+			/* PERFORMANCE: below should almost certainly be
+			 * cached
+			 */
+			dd->f_put_tid(dd, &tidbase[tid],
+				      RCVHQ_RCV_TYPE_EXPECTED, dd->tidinvalid);
+			pci_unmap_page(dd->pcidev, phys, PAGE_SIZE,
+				       PCI_DMA_FROMDEVICE);
+			qib_release_user_pages(&p, 1);
 		}
 	}
-
-	ret = i;
-out:
-	kfree(pstatus);
+done:
 	return ret;
 }
 
-static u32 usb_func(struct i2c_adapter *adapter)
+/**
+ * qib_set_part_key - set a partition key
+ * @rcd: the context
+ * @key: the key
+ *
+ * We can have up to 4 active at a time (other than the default, which is
+ * always allowed).  This is somewhat tricky, since multiple contexts may set
+ * the same key, so we reference count them, and clean up at exit.  All 4
+ * partition keys are packed into a single qlogic_ib register.  It's an
+ * error for a process to set the same pkey multiple times.  We provide no
+ * mechanism to de-allocate a pkey at this time, we may eventually need to
+ * do that.  I've used the atomic operations, and no locking, and only make
+ * a single pass through what's available.  This should be more than
+ * adequate for some time. I'll think about spinlocks or the like if and as
+ * it's necessary.
+ */
+static int qib_set_part_key(struct qib_ctxtdata *rcd, u16 key)
 {
-	__le32 *pfunc;
-	u32 ret;
+	struct qib_pportdata *ppd = rcd->ppd;
+	int i, any = 0, pidx = -1;
+	u16 lkey = key & 0x7FFF;
+	int ret;
 
-	pfunc = kmalloc(sizeof(*pfunc), GFP_KERNEL);
-
-	/* get functionality from adapter */
-	if (!pfunc || usb_read(adapter, CMD_GET_FUNC, 0, 0, pfunc,
-			       sizeof(*pfunc)) != sizeof(*pfunc)) {
-		dev_err(&adapter->dev, "failure reading functionality\n");
+	if (lkey == (QIB_DEFAULT_P_KEY & 0x7FFF)) {
+		/* nothing to do; this key always valid */
 		ret = 0;
-		goto out;
+		goto bail;
 	}
 
-	ret = le32_to_cpup(pfunc);
-out:
-	kfree(pfunc);
+	if (!lkey) {
+		ret = -EINVAL;
+		goto bail;
+	}
+
+	/*
+	 * Set the full membership bit, because it has to be
+	 * set in the register or the packet, and it seems
+	 * cleaner to set in the register than to force all
+	 * callers to set it.
+	 */
+	key |= 0x8000;
+
+	for (i = 0; i < ARRAY_SIZE(rcd->pkeys); i++) {
+		if (!rcd->pkeys[i] && pidx == -1)
+			pidx = i;
+		if (rcd->pkeys[i] == key) {
+			ret = -EEXIST;
+			goto bail;
+		}
+	}
+	if (pidx == -1) {
+		ret = -EBUSY;
+		goto bail;
+	}
+	for (any = i = 0; i < ARRAY_SIZE(ppd->pkeys); i++) {
+		if (!ppd->pkeys[i]) {
+			any++;
+			continue;
+		}
+		if (ppd->pkeys[i] == key) {
+			atomic_t *pkrefs = &ppd->pkeyrefs[i];
+
+			if (atomic_inc_return(pkrefs) > 1) {
+				rcd->pkeys[pidx] = key;
+				ret = 0;
+				goto bail;
+			} else {
+				/*
+				 * lost race, decrement count, catch below
+				 */
+				atomic_dec(pkrefs);
+				any++;
+			}
+		}
+		if ((ppd->pkeys[i] & 0x7FFF) == lkey) {
+			/*
+			 * It makes no sense to have both the limited and
+			 * full membership PKEY set at the same time since
+			 * the unlimited one will disable the limited one.
+			 */
+			ret = -EEXIST;
+			goto bail;
+		}
+	}
+	if (!any) {
+		ret = -EBUSY;
+		goto bail;
+	}
+	for (any = i = 0; i < ARRAY_SIZE(ppd->pkeys); i++) {
+		if (!ppd->pkeys[i] &&
+		    atomic_inc_return(&ppd->pkeyrefs[i]) == 1) {
+			rcd->pkeys[pidx] = key;
+			ppd->pkeys[i] = key;
+			(void) ppd->dd->f_set_ib_cfg(ppd, QIB_IB_CFG_PKEYS, 0);
+			ret = 0;
+			goto bail;
+		}
+	}
+	ret = -EBUSY;
+
+bail:
 	return ret;
 }
 
-/* This is the actual algorithm we define */
-static const struct i2c_algorithm usb_algorithm = {
-	.master_xfer	= usb_xfer,
-	.functionality	= usb_func,
-};
-
-/* ----- end of i2c layer ------------------------------------------------ */
-
-/* ----- begin of usb layer ---------------------------------------------- */
-
-/*
- * Initially the usb i2c interface uses a vid/pid pair donated by
- * Future Technology Devices International Ltd., later a pair was
- * bought from EZPrototypes
+/**
+ * qib_manage_rcvq - manage a context's receive queue
+ * @rcd: the context
+ * @subctxt: the subcontext
+ * @start_stop: action to carry out
+ *
+ * start_stop == 0 disables receive on the context, for use in queue
+ * overflow conditions.  start_stop==1 re-enables, to be used to
+ * re-init the software copy of the head register
  */
-static const struct usb_device_id i2c_tiny_usb_table[] = {
-	{ USB_DEVICE(0x0403, 0xc631) },   /* FTDI */
-	{ USB_DEVICE(0x1c40, 0x0534) },   /* EZPrototypes */
-	{ }                               /* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, i2c_tiny_usb_table);
-
-/* Structure to hold all of our device specific stuff */
-struct i2c_tiny_usb {
-	struct usb_device *usb_dev; /* the usb device for this device */
-	struct usb_interface *interface; /* the interface for this device */
-	struct i2c_adapter adapter; /* i2c related things */
-};
-
-static int usb_read(struct i2c_adapter *adapter, int cmd,
-		    int value, int index, void *data, int len)
+static int qib_manage_rcvq(struct qib_ctxtdata *rcd, unsigned subctxt,
+			   int start_stop)
 {
-	struct i2c_tiny_usb *dev = (struct i2c_tiny_usb *)adapter->algo_data;
-	void *dmadata = kmalloc(len, GFP_KERNEL);
-	int ret;
+	struct qib_devdata *dd = rcd->dd;
+	unsigned int rcvctrl_op;
 
-	if (!dmadata)
-		return -ENOMEM;
-
-	/* do control transfer */
-	ret = usb_control_msg(dev->usb_dev, usb_rcvctrlpipe(dev->usb_dev, 0),
-			       cmd, USB_TYPE_VENDOR | USB_RECIP_INTERFACE |
-			       USB_DIR_IN, value, index, dmadata, len, 2000);
-
-	memcpy(data, dmadata, len);
-	kfree(dmadata);
-	return ret;
-}
-
-static int usb_write(struct i2c_adapter *adapter, int cmd,
-		     int value, int index, void *data, int len)
-{
-	struct i2c_tiny_usb *dev = (struct i2c_tiny_usb *)adapter->algo_data;
-	void *dmadata = kmemdup(data, len, GFP_KERNEL);
-	int ret;
-
-	if (!dmadata)
-		return -ENOMEM;
-
-	/* do control transfer */
-	ret = usb_control_msg(dev->usb_dev, usb_sndctrlpipe(dev->usb_dev, 0),
-			       cmd, USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-			       value, index, dmadata, len, 2000);
-
-	kfree(dmadata);
-	return ret;
-}
-
-static void i2c_tiny_usb_free(struct i2c_tiny_usb *dev)
-{
-	usb_put_dev(dev->usb_dev);
-	kfree(dev);
-}
-
-static int i2c_tiny_usb_probe(struct usb_interface *interface,
-			      const struct usb_device_id *id)
-{
-	struct i2c_tiny_usb *dev;
-	int retval = -ENOMEM;
-	u16 version;
-
-	dev_dbg(&interface->dev, "probing usb device\n");
-
-	/* allocate memory for our device state and initialize it */
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (dev == NULL) {
-		dev_err(&interface->dev, "Out of memory\n");
-		goto error;
-	}
-
-	dev->usb_dev = usb_get_dev(interface_to_usbdev(interface));
-	dev->interface = interface;
-
-	/* save our data pointer in this interface device */
-	usb_set_intfdata(interface, dev);
-
-	version = le16_to_cpu(dev->usb_dev->descriptor.bcdDevice);
-	dev_info(&interface->dev,
-		 "version %x.%02x found at bus %03d address %03d\n",
-		 version >> 8, version & 0xff,
-		 dev->usb_dev->bus->busnum, dev->usb_dev->devnum);
-
-	/* setup i2c adapter description */
-	dev->adapter.owner = THIS_MODULE;
-	dev->adapter.class = I2C_CLASS_HWMON;
-	dev->adapter.algo = &usb_algorithm;
-	dev->adapter.algo_data = dev;
-	snprintf(dev->adapter.name, sizeof(dev->adapter.name),
-		 "i2c-tiny-usb at bus %03d device %03d",
-		 dev->usb_dev->bus->busnum, dev->usb_dev->devnum);
-
-	if (usb_write(&dev->adapter, CMD_SET_DELAY, delay, 0, NULL, 0) != 0) {
-		dev_err(&dev->adapter.dev,
-			"failure setting delay to %dus\n", delay);
-		retval = -EIO;
-		goto error;
-	}
-
-	dev->adapter.dev.parent = &dev->interface->dev;
-
-	/* and finally attach to i2c layer */
-	i2c_add_adapter(&dev->adapter);
-
-	/* inform user about successful attachment to i2c layer */
-	dev_info(&dev->adapter.dev, "connected i2c-tiny-usb device\n");
-
+	if (subctxt)
+		goto bail;
+	/* atomically clear receive enable ctxt. */
+	if (start_stop) {
+		/*
+		 * On enable, force in-memory copy of the tail register to
+		 * 0, so that protocol code doesn't have to worry about
+		 * whether or not the chip has yet updated the in-memory
+		 * copy or not on return from the system call. The chip
+		 * always resets it's tail register back to 0 on a
+		 * transition from disabled to enabled.
+		 */
+		if (rcd->rcvhdrtail_kvaddr)
+			qib_clear_rcvhdrtail(rcd);
+		rcvctrl_op = QIB_RCVCTRL_CTXT_ENB;
+	} else
+		rcvctrl_op = QIB_RCVCTRL_CTXT_DIS;
+	dd->f_rcvctrl(rcd->ppd, rcvctrl_op, rcd->ctxt);
+	/* always; new head should be equal to new tail; see above */
+bail:
 	return 0;
-
- error:
-	if (dev)
-		i2c_tiny_usb_free(dev);
-
-	return retval;
 }
 
-static void i2c_tiny_usb_disconnect(struct usb_interface *interface)
+static void qib_clean_part_key(struct qib_ctxtdata *rcd,
+			       struct qib_devdata *dd)
 {
-	struct i2c_tiny_usb *dev = usb_get_intfdata(interface);
+	int i, j, pchanged = 0;
+	u64 oldpkey;
+	struct qib_pportdata *ppd = rcd->ppd;
 
-	i2c_del_adapter(&dev->adapter);
-	usb_set_intfdata(interface, NULL);
-	i2c_tiny_usb_free(dev);
+	/* for debugging only */
+	oldpkey = (u64) ppd->pkeys[0] |
+		((u64) ppd->pkeys[1] << 16) |
+		((u64) ppd->pkeys[2] << 32) |
+		((u64) ppd->pkeys[3] << 48);
 
-	dev_dbg(&interface->dev, "disconnected\n");
+	for (i = 0; i < ARRAY_SIZE(rcd->pkeys); i++) {
+		if (!rcd->pkeys[i])
+			continue;
+		for (j = 0; j < ARRAY_SIZE(ppd->pkeys); j++) {
+			/* check for match independent of the global bit */
+			if ((ppd->pkeys[j] & 0x7fff) !=
+			    (rcd->pkeys[i] & 0x7fff))
+				continue;
+			if (atomic_dec_and_test(&ppd->pkeyrefs[j])) {
+				ppd->pkeys[j] = 0;
+				pchanged++;
+			}
+			break;
+		}
+		rcd->pkeys[i] = 0;
+	}
+	if (pchanged)
+		(void) ppd->dd->f_set_ib_cfg(ppd, QIB_IB_CFG_PKEYS, 0);
 }
 
-static struct usb_driver i2c_tiny_usb_driver = {
-	.name		= "i2c-tiny-usb",
-	.probe		= i2c_tiny_usb_probe,
-	.disconnect	= i2c_tiny_usb_disconnect,
-	.id_table	= i2c_tiny_usb_table,
-};
+/* common code for the mappings on dma_alloc_coherent mem */
+static int qib_mmap_mem(struct vm_area_struct *vma, struct qib_ctxtdata *rcd,
+			unsigned len, void *kvaddr, u32 write_ok, char *what)
+{
+	struct qib_devdata *dd = rcd->dd;
+	unsigned long pfn;
+	int ret;
 
-module_usb_driver(i2c_tiny_usb_driver);
+	if ((vma->vm_end - vma->vm_start) > len) {
+		qib_devinfo(dd->pcidev,
+			 "FAIL on %s: len %lx > %x\n", what,
+			 vma->vm_end - vma->vm_start, len);
+		ret = -EFAULT;
+		goto bail;
+	}
 
-/* ----- end of usb layer ------------------------------------------------ */
+	/*
+	 * shared context user code requires rcvhdrq mapped r/w, others
+	 * only allowed readonly mapping.
+	 */
+	if (!write_ok) {
+		if (vma->vm_flags & VM_WRITE) {
+			qib_devinfo(dd->pcidev,
+				 "%s must be mapped readonly\n", what);
+			ret = -EPERM;
+			goto bail;
+		}
 
-MODULE_AUTHOR("Till Harbaum <Till@Harbaum.org>");
-MODULE_DESCRIPTION("i2c-tiny-usb driver v1.0");
-MODULE_LICENSE("GPL");
+		/* don't allow them to later change with mprotect */
+		vma->vm_flags &= ~VM_MAYWRITE;
+	}
+
+	pfn = virt_to_phys(kvaddr) >> PAGE_SHIFT;
+	ret = remap_pfn_range(vma, vma->vm_start, pfn,
+			      len, vma->vm_page_prot);
+	if (ret)
+		qib_devinfo(dd->pcidev,
+			"%s ctxt%u mmap of %lx, %x bytes failed: %d\n",
+			what, rcd->ctxt, pfn, len, ret);
+bail:
+	return ret;
+}
+
+static int mmap_ureg(struct vm_area_struct *vma, struct qib_devdata *dd,
+		     u64 ureg)
+{
+	unsigned long phys;
+	unsigned long sz;
+	int ret;
+
+	/*
+	 * This is real hardware, so use io_remap.  This is the mechanism
+	 * for the user process to update the head registers for their ctxt
+	 * in the chip.
+	 */
+	sz = dd->flags & QIB_HAS_HDRSUPP ? 2 * PAGE_SIZE : PAGE_SIZE;
+	if ((vma->vm_end - vma->vm_start) > sz) {
+		qib_devinfo(dd->pcidev,
+			"FAIL mmap userreg: reqlen %lx > PAGE\n",
+			vma->vm_end - vma->vm_start);
+		ret = -EFAULT;
+	} else {
+		phys = dd->physaddr + ureg;
+		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+		vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND;
+		ret = io_remap_pfn_range(vma, vma->vm_start,
+					 phys >> PAGE_SHIFT,
+					 vma->vm_end - vma->vm_start,
+					 vma->vm_page_prot);
+	}
+	return ret;
+}
+
+static int mmap_piobufs(struct vm_area_struct *vma,
+			struct qib_devdata *dd,
+			struct qib_ctxtdata *rcd,
+			unsigned piobufs, unsigned piocnt)
+{
+	unsigned long phys;
+	int ret;
+
+	/*
+	 * When we map the PIO buffers in the chip, we want to map them as
+	 * writeonly, no read possible; unfortunately, x86 doesn't allow
+	 * for this in hardware, but we still prevent users from asking
+	 * for it.
+	 */
+	if ((vma->vm_end - vma->vm_start) > (piocnt * dd->palign)) {
+		qib_devinfo(dd->pcidev,
+			"FAIL mmap piobufs: reqlen %lx > PAGE\n",
+			 vma->vm_end - vma->vm_start);
+		ret = -EINVAL;
+		goto bail;
+	}
+
+	phys = dd->physaddr + piobufs;
+
+#if defined(__powerpc__)
+	/* There isn't a generic way to specify writethrough mappings */
+	pgprot_val(vma->vm_page_prot) |= _PAGE_NO_CACHE;
+	pgprot_val(vma->vm_page_prot) |= _PAGE_WRITETHRU;
+	pgprot_val(vma->vm_page_prot) &= ~_PAGE_GUARDED;
+#endif
+
+	/*
+	 * don't allow them to later change to readable with mprotect (for when
+	 * not initially mapped readable, as is normally the case)
+	 */
+	vma->vm_flags &= ~VM_MAYREAD;
+	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND;
+
+	/* We used PAT if wc_cookie == 0 */
+	if (!dd->wc_cookie)
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+
+	ret = io_r

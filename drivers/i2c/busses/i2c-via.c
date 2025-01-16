@@ -1,163 +1,151 @@
-/*
-    i2c Support for Via Technologies 82C586B South Bridge
-
-    Copyright (c) 1998, 1999 Kyösti Mälkki <kmalkki@cc.hut.fi>
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-*/
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/ioport.h>
-#include <linux/i2c.h>
-#include <linux/i2c-algo-bit.h>
-#include <linux/io.h>
-
-/* Power management registers */
-#define PM_CFG_REVID	0x08	/* silicon revision code */
-#define PM_CFG_IOBASE0	0x20
-#define PM_CFG_IOBASE1	0x48
-
-#define I2C_DIR		(pm_io_base+0x40)
-#define I2C_OUT		(pm_io_base+0x42)
-#define I2C_IN		(pm_io_base+0x44)
-#define I2C_SCL		0x02	/* clock bit in DIR/OUT/IN register */
-#define I2C_SDA		0x04
-
-/* io-region reservation */
-#define IOSPACE		0x06
-
-static struct pci_driver vt586b_driver;
-static u16 pm_io_base;
-
-/*
-   It does not appear from the datasheet that the GPIO pins are
-   open drain. So a we set a low value by setting the direction to
-   output and a high value by setting the direction to input and
-   relying on the required I2C pullup. The data value is initialized
-   to 0 in via_init() and never changed.
-*/
-static void bit_via_setscl(void *data, int state)
+oid *data, u32 tlen, struct qib_qp *qp)
 {
-	outb(state ? inb(I2C_DIR) & ~I2C_SCL : inb(I2C_DIR) | I2C_SCL, I2C_DIR);
-}
+	struct qib_other_headers *ohdr;
+	int opcode;
+	u32 hdrsize;
+	u32 pad;
+	struct ib_wc wc;
+	u32 qkey;
+	u32 src_qp;
+	u16 dlid;
 
-static void bit_via_setsda(void *data, int state)
-{
-	outb(state ? inb(I2C_DIR) & ~I2C_SDA : inb(I2C_DIR) | I2C_SDA, I2C_DIR);
-}
+	/* Check for GRH */
+	if (!has_grh) {
+		ohdr = &hdr->u.oth;
+		hdrsize = 8 + 12 + 8;   /* LRH + BTH + DETH */
+	} else {
+		ohdr = &hdr->u.l.oth;
+		hdrsize = 8 + 40 + 12 + 8; /* LRH + GRH + BTH + DETH */
+	}
+	qkey = be32_to_cpu(ohdr->u.ud.deth[0]);
+	src_qp = be32_to_cpu(ohdr->u.ud.deth[1]) & QIB_QPN_MASK;
 
-static int bit_via_getscl(void *data)
-{
-	return (0 != (inb(I2C_IN) & I2C_SCL));
-}
+	/*
+	 * Get the number of bytes the message was padded by
+	 * and drop incomplete packets.
+	 */
+	pad = (be32_to_cpu(ohdr->bth[0]) >> 20) & 3;
+	if (unlikely(tlen < (hdrsize + pad + 4)))
+		goto drop;
 
-static int bit_via_getsda(void *data)
-{
-	return (0 != (inb(I2C_IN) & I2C_SDA));
-}
+	tlen -= hdrsize + pad + 4;
 
+	/*
+	 * Check that the permissive LID is only used on QP0
+	 * and the QKEY matches (see 9.6.1.4.1 and 9.6.1.5.1).
+	 */
+	if (qp->ibqp.qp_num) {
+		if (unlikely(hdr->lrh[1] == IB_LID_PERMISSIVE ||
+			     hdr->lrh[3] == IB_LID_PERMISSIVE))
+			goto drop;
+		if (qp->ibqp.qp_num > 1) {
+			u16 pkey1, pkey2;
 
-static struct i2c_algo_bit_data bit_data = {
-	.setsda		= bit_via_setsda,
-	.setscl		= bit_via_setscl,
-	.getsda		= bit_via_getsda,
-	.getscl		= bit_via_getscl,
-	.udelay		= 5,
-	.timeout	= HZ
-};
+			pkey1 = be32_to_cpu(ohdr->bth[0]);
+			pkey2 = qib_get_pkey(ibp, qp->s_pkey_index);
+			if (unlikely(!qib_pkey_ok(pkey1, pkey2))) {
+				qib_bad_pqkey(ibp, IB_NOTICE_TRAP_BAD_PKEY,
+					      pkey1,
+					      (be16_to_cpu(hdr->lrh[0]) >> 4) &
+						0xF,
+					      src_qp, qp->ibqp.qp_num,
+					      hdr->lrh[3], hdr->lrh[1]);
+				return;
+			}
+		}
+		if (unlikely(qkey != qp->qkey)) {
+			qib_bad_pqkey(ibp, IB_NOTICE_TRAP_BAD_QKEY, qkey,
+				      (be16_to_cpu(hdr->lrh[0]) >> 4) & 0xF,
+				      src_qp, qp->ibqp.qp_num,
+				      hdr->lrh[3], hdr->lrh[1]);
+			return;
+		}
+		/* Drop invalid MAD packets (see 13.5.3.1). */
+		if (unlikely(qp->ibqp.qp_num == 1 &&
+			     (tlen != 256 ||
+			      (be16_to_cpu(hdr->lrh[0]) >> 12) == 15)))
+			goto drop;
+	} else {
+		struct ib_smp *smp;
 
-static struct i2c_adapter vt586b_adapter = {
-	.owner		= THIS_MODULE,
-	.class          = I2C_CLASS_HWMON | I2C_CLASS_SPD,
-	.name		= "VIA i2c",
-	.algo_data	= &bit_data,
-};
-
-
-static const struct pci_device_id vt586b_ids[] = {
-	{ PCI_DEVICE(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_82C586_3) },
-	{ 0, }
-};
-
-MODULE_DEVICE_TABLE (pci, vt586b_ids);
-
-static int vt586b_probe(struct pci_dev *dev, const struct pci_device_id *id)
-{
-	u16 base;
-	u8 rev;
-	int res;
-
-	if (pm_io_base) {
-		dev_err(&dev->dev, "i2c-via: Will only support one host\n");
-		return -ENODEV;
+		/* Drop invalid MAD packets (see 13.5.3.1). */
+		if (tlen != 256 || (be16_to_cpu(hdr->lrh[0]) >> 12) != 15)
+			goto drop;
+		smp = (struct ib_smp *) data;
+		if ((hdr->lrh[1] == IB_LID_PERMISSIVE ||
+		     hdr->lrh[3] == IB_LID_PERMISSIVE) &&
+		    smp->mgmt_class != IB_MGMT_CLASS_SUBN_DIRECTED_ROUTE)
+			goto drop;
 	}
 
-	pci_read_config_byte(dev, PM_CFG_REVID, &rev);
+	/*
+	 * The opcode is in the low byte when its in network order
+	 * (top byte when in host order).
+	 */
+	opcode = be32_to_cpu(ohdr->bth[0]) >> 24;
+	if (qp->ibqp.qp_num > 1 &&
+	    opcode == IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE) {
+		wc.ex.imm_data = ohdr->u.ud.imm_data;
+		wc.wc_flags = IB_WC_WITH_IMM;
+	} else if (opcode == IB_OPCODE_UD_SEND_ONLY) {
+		wc.ex.imm_data = 0;
+		wc.wc_flags = 0;
+	} else
+		goto drop;
 
-	switch (rev) {
-	case 0x00:
-		base = PM_CFG_IOBASE0;
-		break;
-	case 0x01:
-	case 0x10:
-		base = PM_CFG_IOBASE1;
-		break;
+	/*
+	 * A GRH is expected to precede the data even if not
+	 * present on the wire.
+	 */
+	wc.byte_len = tlen + sizeof(struct ib_grh);
 
-	default:
-		base = PM_CFG_IOBASE1;
-		/* later revision */
+	/*
+	 * Get the next work request entry to find where to put the data.
+	 */
+	if (qp->r_flags & QIB_R_REUSE_SGE)
+		qp->r_flags &= ~QIB_R_REUSE_SGE;
+	else {
+		int ret;
+
+		ret = qib_get_rwqe(qp, 0);
+		if (ret < 0) {
+			qib_rc_error(qp, IB_WC_LOC_QP_OP_ERR);
+			return;
+		}
+		if (!ret) {
+			if (qp->ibqp.qp_num == 0)
+				ibp->n_vl15_dropped++;
+			return;
+		}
 	}
-
-	pci_read_config_word(dev, base, &pm_io_base);
-	pm_io_base &= (0xff << 8);
-
-	if (!request_region(I2C_DIR, IOSPACE, vt586b_driver.name)) {
-		dev_err(&dev->dev, "IO 0x%x-0x%x already in use\n", I2C_DIR, I2C_DIR + IOSPACE);
-		return -ENODEV;
+	/* Silently drop packets which are too big. */
+	if (unlikely(wc.byte_len > qp->r_len)) {
+		qp->r_flags |= QIB_R_REUSE_SGE;
+		goto drop;
 	}
-
-	outb(inb(I2C_DIR) & ~(I2C_SDA | I2C_SCL), I2C_DIR);
-	outb(inb(I2C_OUT) & ~(I2C_SDA | I2C_SCL), I2C_OUT);
-
-	/* set up the sysfs linkage to our parent device */
-	vt586b_adapter.dev.parent = &dev->dev;
-
-	res = i2c_bit_add_bus(&vt586b_adapter);
-	if ( res < 0 ) {
-		release_region(I2C_DIR, IOSPACE);
-		pm_io_base = 0;
-		return res;
-	}
-	return 0;
-}
-
-static void vt586b_remove(struct pci_dev *dev)
-{
-	i2c_del_adapter(&vt586b_adapter);
-	release_region(I2C_DIR, IOSPACE);
-	pm_io_base = 0;
-}
-
-
-static struct pci_driver vt586b_driver = {
-	.name		= "vt586b_smbus",
-	.id_table	= vt586b_ids,
-	.probe		= vt586b_probe,
-	.remove		= vt586b_remove,
-};
-
-module_pci_driver(vt586b_driver);
-
-MODULE_AUTHOR("Kyösti Mälkki <kmalkki@cc.hut.fi>");
-MODULE_DESCRIPTION("i2c for Via vt82c586b southbridge");
-MODULE_LICENSE("GPL");
+	if (has_grh) {
+		qib_copy_sge(&qp->r_sge, &hdr->u.l.grh,
+			     sizeof(struct ib_grh), 1);
+		wc.wc_flags |= IB_WC_GRH;
+	} else
+		qib_skip_sge(&qp->r_sge, sizeof(struct ib_grh), 1);
+	qib_copy_sge(&qp->r_sge, data, wc.byte_len - sizeof(struct ib_grh), 1);
+	qib_put_ss(&qp->r_sge);
+	if (!test_and_clear_bit(QIB_R_WRID_VALID, &qp->r_aflags))
+		return;
+	wc.wr_id = qp->r_wr_id;
+	wc.status = IB_WC_SUCCESS;
+	wc.opcode = IB_WC_RECV;
+	wc.vendor_err = 0;
+	wc.qp = &qp->ibqp;
+	wc.src_qp = src_qp;
+	wc.pkey_index = qp->ibqp.qp_type == IB_QPT_GSI ?
+		qib_lookup_pkey(ibp, be32_to_cpu(ohdr->bth[0])) : 0;
+	wc.slid = be16_to_cpu(hdr->lrh[3]);
+	wc.sl = (be16_to_cpu(hdr->lrh[0]) >> 4) & 0xF;
+	dlid = be16_to_cpu(hdr->lrh[1]);
+	/*
+	 * Save the LMC lower bits if the destination LID is a unicast LID.
+	 */
+	wc.dlid_path_bits = dlid >= QIB_MULTICAST_LID_BASE ? 0 :
+		dlid & ((1 << ppd_from

@@ -1,1482 +1,669 @@
-/*******************************************************************************
- * This file contains the iSCSI Target specific utility functions.
+SX2_BY2                             = 0x19,
+	DBG_BLOCK_ID_UNUSED4_BY2                         = 0x1a,
+	DBG_BLOCK_ID_UNUSED6_BY2                         = 0x1b,
+	DBG_BLOCK_ID_PC0_BY2                             = 0x1c,
+	DBG_BLOCK_ID_UNUSED8_BY2                         = 0x1d,
+	DBG_BLOCK_ID_UNUSED10_BY2                        = 0x1e,
+	DBG_BLOCK_ID_MCB_BY2                             = 0x1f,
+	DBG_BLOCK_ID_SCB0_BY2                            = 0x20,
+	DBG_BLOCK_ID_UNUSED13_BY2                        = 0x21,
+	DBG_BLOCK_ID_SCF0_BY2                            = 0x22,
+	DBG_BLOCK_ID_UNUSED15_BY2                        = 0x23,
+	DBG_BLOCK_ID_BCI0_BY2                            = 0x24,
+	DBG_BLOCK_ID_BCI2_BY2                            = 0x25,
+	DBG_BLOCK_ID_UNUSED17_BY2                        = 0x26,
+	DBG_BLOCK_ID_UNUSED19_BY2                        = 0x27,
+	DBG_BLOCK_ID_CB00_BY2                            = 0x28,
+	DBG_BLOCK_ID_CB02_BY2                            = 0x29,
+	DBG_BLOCK_ID_CB04_BY2                            = 0x2a,
+	DBG_BLOCK_ID_UNUSED22_BY2                        = 0x2b,
+	DBG_BLOCK_ID_CB10_BY2                            = 0x2c,
+	DBG_BLOCK_ID_CB12_BY2                            = 0x2d,
+	DBG_BLOCK_ID_CB14_BY2                            = 0x2e,
+	DBG_BLOCK_ID_UNUSED25_BY2                        = 0x2f,
+	DBG_BLOCK_ID_TCP0_BY2                            = 0x30,
+	DBG_BLOCK_ID_TCP2_BY2                            = 0x31,
+	DBG_BLOCK_ID_TCP4_BY2                            = 0x32,
+	DBG_BLOCK_ID_TCP6_BY2                            = 0x33,
+	DBG_BLOCK_ID_TCP8_BY2                            = 0x34,
+	DBG_BLOCK_ID_TCP10_BY2                           = 0x35,
+	DBG_BLOCK_ID_TCP12_BY2                           = 0x36,
+	DBG_BLOCK_ID_TCP14_BY2                           = 0x37,
+	DBG_BLOCK_ID_TCP16_BY2                           = 0x38,
+	DBG_BLOCK_ID_TCP18_BY2                           = 0x39,
+	DBG_BLOCK_ID_TCP20_BY2                           = 0x3a,
+	DBG_BLOCK_ID_TCP22_BY2                           = 0x3b,
+	DBG_BLOCK_ID_TCP_RESERVED0_BY2                   = 0x3c,
+	DBG_BLOCK_ID_TCP_RESERVED2_BY2                   = 0x3d,
+	DBG_BLOCK_ID_TCP_RESERVED4_BY2                   = 0x3e,
+	DBG_BLOCK_ID_TCP_RESERVED6_BY2                   = 0x3f,
+	DBG_BLOCK_ID_DB00_BY2                            = 0x40,
+	DBG_BLOCK_ID_DB02_BY2                            = 0x41,
+	DBG_BLOCK_ID_DB04_BY2                            = 0x42,
+	DBG_BLOCK_ID_UNUSED28_BY2                        = 0x43,
+	DBG_BLOCK_ID_DB10_BY2                            = 0x44,
+	DBG_BLOCK_ID_DB12_BY2                            = 0x45,
+	DBG_BLOCK_ID_DB14_BY2                            = 0x46,
+	DBG_BLOCK_ID_UNUSED31_BY2                        = 0x47,
+	DBG_BLOCK_ID_TCC0_BY2                            = 0x48,
+	DBG_BLOCK_ID_TCC2_BY2                            = 0x49,
+	DBG_BLOCK_ID_TCC4_BY2                            = 0x4a,
+	DBG_BLOCK_ID_TCC6_BY2                            = 0x4b,
+	DBG_BLOCK_ID_SPS00_BY2                           = 0x4c,
+	DBG_BLOCK_ID_SPS02_BY2                           = 0x4d,
+	DBG_BLOCK_ID_SPS11_BY2                           = 0x4e,
+	DBG_BLOCK_ID_UNUSED33_BY2                        = 0x4f,
+	DBG_BLOCK_ID_TA00_BY2                            = 0x50,
+	DBG_BLOCK_ID_TA02_BY2                            = 0x51,
+	DBG_BLOCK_ID_TA04_BY2                            = 0x52,
+	DBG_BLOCK_ID_TA06_BY2                            = 0x53,
+	DBG_BLOCK_ID_TA08_BY2                            = 0x54,
+	DBG_BLOCK_ID_TA0A_BY2                            = 0x55,
+	DBG_BLOCK_ID_UNUSED35_BY2                        = 0x56,
+	DBG_BLOCK_ID_UNUSED37_BY2                        = 0x57,
+	DBG_BLOCK_ID_TA10_BY2                            = 0x58,
+	DBG_BLOCK_ID_TA12_BY2                            = 0x59,
+	DBG_BLOCK_ID_TA14_BY2                            = 0x5a,
+	DBG_BLOCK_ID_TA16_BY2                            = 0x5b,
+	DBG_BLOCK_ID_TA18_BY2                            = 0x5c,
+	DBG_BLOCK_ID_TA1A_BY2                            = 0x5d,
+	DBG_BLOCK_ID_UNUSED39_BY2                        = 0x5e,
+	DBG_BLOCK_ID_UNUSED41_BY2                        = 0x5f,
+	DBG_BLOCK_ID_TD00_BY2                            = 0x60,
+	DBG_BLOCK_ID_TD02_BY2                            = 0x61,
+	DBG_BLOCK_ID_TD04_BY2                            = 0x62,
+	DBG_BLOCK_ID_TD06_BY2                            = 0x63,
+	DBG_BLOCK_ID_TD08_BY2                            = 0x64,
+	DBG_BLOCK_ID_TD0A_BY2                            = 0x65,
+	DBG_BLOCK_ID_UNUSED43_BY2                        = 0x66,
+	DBG_BLOCK_ID_UNUSED45_BY2                        = 0x67,
+	DBG_BLOCK_ID_TD10_BY2                            = 0x68,
+	DBG_BLOCK_ID_TD12_BY2                            = 0x69,
+	DBG_BLOCK_ID_TD14_BY2                            = 0x6a,
+	DBG_BLOCK_ID_TD16_BY2                            = 0x6b,
+	DBG_BLOCK_ID_TD18_BY2                            = 0x6c,
+	DBG_BLOCK_ID_TD1A_BY2                            = 0x6d,
+	DBG_BLOCK_ID_UNUSED47_BY2                        = 0x6e,
+	DBG_BLOCK_ID_UNUSED49_BY2                        = 0x6f,
+	DBG_BLOCK_ID_MCD0_BY2                            = 0x70,
+	DBG_BLOCK_ID_MCD2_BY2                            = 0x71,
+	DBG_BLOCK_ID_MCD4_BY2                            = 0x72,
+	DBG_BLOCK_ID_UNUSED51_BY2                        = 0x73,
+} DebugBlockId_BY2;
+typedef enum DebugBlockId_BY4 {
+	DBG_BLOCK_ID_RESERVED_BY4                        = 0x0,
+	DBG_BLOCK_ID_CG_BY4                              = 0x1,
+	DBG_BLOCK_ID_CSC_BY4                             = 0x2,
+	DBG_BLOCK_ID_SQ_BY4                              = 0x3,
+	DBG_BLOCK_ID_DMA0_BY4                            = 0x4,
+	DBG_BLOCK_ID_SPIS_BY4                            = 0x5,
+	DBG_BLOCK_ID_CP0_BY4                             = 0x6,
+	DBG_BLOCK_ID_UVDU_BY4                            = 0x7,
+	DBG_BLOCK_ID_VGT0_BY4                            = 0x8,
+	DBG_BLOCK_ID_SCT0_BY4                            = 0x9,
+	DBG_BLOCK_ID_TCAA_BY4                            = 0xa,
+	DBG_BLOCK_ID_MCC0_BY4                            = 0xb,
+	DBG_BLOCK_ID_SX0_BY4                             = 0xc,
+	DBG_BLOCK_ID_UNUSED4_BY4                         = 0xd,
+	DBG_BLOCK_ID_PC0_BY4                             = 0xe,
+	DBG_BLOCK_ID_UNUSED10_BY4                        = 0xf,
+	DBG_BLOCK_ID_SCB0_BY4                            = 0x10,
+	DBG_BLOCK_ID_SCF0_BY4                            = 0x11,
+	DBG_BLOCK_ID_BCI0_BY4                            = 0x12,
+	DBG_BLOCK_ID_UNUSED17_BY4                        = 0x13,
+	DBG_BLOCK_ID_CB00_BY4                            = 0x14,
+	DBG_BLOCK_ID_CB04_BY4                            = 0x15,
+	DBG_BLOCK_ID_CB10_BY4                            = 0x16,
+	DBG_BLOCK_ID_CB14_BY4                            = 0x17,
+	DBG_BLOCK_ID_TCP0_BY4                            = 0x18,
+	DBG_BLOCK_ID_TCP4_BY4                            = 0x19,
+	DBG_BLOCK_ID_TCP8_BY4                            = 0x1a,
+	DBG_BLOCK_ID_TCP12_BY4                           = 0x1b,
+	DBG_BLOCK_ID_TCP16_BY4                           = 0x1c,
+	DBG_BLOCK_ID_TCP20_BY4                           = 0x1d,
+	DBG_BLOCK_ID_TCP_RESERVED0_BY4                   = 0x1e,
+	DBG_BLOCK_ID_TCP_RESERVED4_BY4                   = 0x1f,
+	DBG_BLOCK_ID_DB_BY4                              = 0x20,
+	DBG_BLOCK_ID_DB04_BY4                            = 0x21,
+	DBG_BLOCK_ID_DB10_BY4                            = 0x22,
+	DBG_BLOCK_ID_DB14_BY4                            = 0x23,
+	DBG_BLOCK_ID_TCC0_BY4                            = 0x24,
+	DBG_BLOCK_ID_TCC4_BY4                            = 0x25,
+	DBG_BLOCK_ID_SPS00_BY4                           = 0x26,
+	DBG_BLOCK_ID_SPS11_BY4                           = 0x27,
+	DBG_BLOCK_ID_TA00_BY4                            = 0x28,
+	DBG_BLOCK_ID_TA04_BY4                            = 0x29,
+	DBG_BLOCK_ID_TA08_BY4                            = 0x2a,
+	DBG_BLOCK_ID_UNUSED35_BY4                        = 0x2b,
+	DBG_BLOCK_ID_TA10_BY4                            = 0x2c,
+	DBG_BLOCK_ID_TA14_BY4                            = 0x2d,
+	DBG_BLOCK_ID_TA18_BY4                            = 0x2e,
+	DBG_BLOCK_ID_UNUSED39_BY4                        = 0x2f,
+	DBG_BLOCK_ID_TD00_BY4                            = 0x30,
+	DBG_BLOCK_ID_TD04_BY4                            = 0x31,
+	DBG_BLOCK_ID_TD08_BY4                            = 0x32,
+	DBG_BLOCK_ID_UNUSED43_BY4                        = 0x33,
+	DBG_BLOCK_ID_TD10_BY4                            = 0x34,
+	DBG_BLOCK_ID_TD14_BY4                            = 0x35,
+	DBG_BLOCK_ID_TD18_BY4                            = 0x36,
+	DBG_BLOCK_ID_UNUSED47_BY4                        = 0x37,
+	DBG_BLOCK_ID_MCD0_BY4                            = 0x38,
+	DBG_BLOCK_ID_MCD4_BY4                            = 0x39,
+} DebugBlockId_BY4;
+typedef enum DebugBlockId_BY8 {
+	DBG_BLOCK_ID_RESERVED_BY8                        = 0x0,
+	DBG_BLOCK_ID_CSC_BY8                             = 0x1,
+	DBG_BLOCK_ID_DMA0_BY8                            = 0x2,
+	DBG_BLOCK_ID_CP0_BY8                             = 0x3,
+	DBG_BLOCK_ID_VGT0_BY8                            = 0x4,
+	DBG_BLOCK_ID_TCAA_BY8                            = 0x5,
+	DBG_BLOCK_ID_SX0_BY8                             = 0x6,
+	DBG_BLOCK_ID_PC0_BY8                             = 0x7,
+	DBG_BLOCK_ID_SCB0_BY8                            = 0x8,
+	DBG_BLOCK_ID_BCI0_BY8                            = 0x9,
+	DBG_BLOCK_ID_CB00_BY8                            = 0xa,
+	DBG_BLOCK_ID_CB10_BY8                            = 0xb,
+	DBG_BLOCK_ID_TCP0_BY8                            = 0xc,
+	DBG_BLOCK_ID_TCP8_BY8                            = 0xd,
+	DBG_BLOCK_ID_TCP16_BY8                           = 0xe,
+	DBG_BLOCK_ID_TCP_RESERVED0_BY8                   = 0xf,
+	DBG_BLOCK_ID_DB00_BY8                            = 0x10,
+	DBG_BLOCK_ID_DB10_BY8                            = 0x11,
+	DBG_BLOCK_ID_TCC0_BY8                            = 0x12,
+	DBG_BLOCK_ID_SPS00_BY8                           = 0x13,
+	DBG_BLOCK_ID_TA00_BY8                            = 0x14,
+	DBG_BLOCK_ID_TA08_BY8                            = 0x15,
+	DBG_BLOCK_ID_TA10_BY8                            = 0x16,
+	DBG_BLOCK_ID_TA18_BY8                            = 0x17,
+	DBG_BLOCK_ID_TD00_BY8                            = 0x18,
+	DBG_BLOCK_ID_TD08_BY8                            = 0x19,
+	DBG_BLOCK_ID_TD10_BY8                            = 0x1a,
+	DBG_BLOCK_ID_TD18_BY8                            = 0x1b,
+	DBG_BLOCK_ID_MCD0_BY8                            = 0x1c,
+} DebugBlockId_BY8;
+typedef enum DebugBlockId_BY16 {
+	DBG_BLOCK_ID_RESERVED_BY16                       = 0x0,
+	DBG_BLOCK_ID_DMA0_BY16                           = 0x1,
+	DBG_BLOCK_ID_VGT0_BY16                           = 0x2,
+	DBG_BLOCK_ID_SX0_BY16                            = 0x3,
+	DBG_BLOCK_ID_SCB0_BY16                           = 0x4,
+	DBG_BLOCK_ID_CB00_BY16                           = 0x5,
+	DBG_BLOCK_ID_TCP0_BY16                           = 0x6,
+	DBG_BLOCK_ID_TCP16_BY16                          = 0x7,
+	DBG_BLOCK_ID_DB00_BY16                           = 0x8,
+	DBG_BLOCK_ID_TCC0_BY16                           = 0x9,
+	DBG_BLOCK_ID_TA00_BY16                           = 0xa,
+	DBG_BLOCK_ID_TA10_BY16                           = 0xb,
+	DBG_BLOCK_ID_TD00_BY16                           = 0xc,
+	DBG_BLOCK_ID_TD10_BY16                           = 0xd,
+	DBG_BLOCK_ID_MCD0_BY16                           = 0xe,
+} DebugBlockId_BY16;
+typedef enum ColorTransform {
+	DCC_CT_AUTO                                      = 0x0,
+	DCC_CT_NONE                                      = 0x1,
+	ABGR_TO_A_BG_G_RB                                = 0x2,
+	BGRA_TO_BG_G_RB_A                                = 0x3,
+} ColorTransform;
+typedef enum CompareRef {
+	REF_NEVER                                        = 0x0,
+	REF_LESS                                         = 0x1,
+	REF_EQUAL                                        = 0x2,
+	REF_LEQUAL                                       = 0x3,
+	REF_GREATER                                      = 0x4,
+	REF_NOTEQUAL                                     = 0x5,
+	REF_GEQUAL                                       = 0x6,
+	REF_ALWAYS                                       = 0x7,
+} CompareRef;
+typedef enum ReadSize {
+	READ_256_BITS                                    = 0x0,
+	READ_512_BITS                                    = 0x1,
+} ReadSize;
+typedef enum DepthFormat {
+	DEPTH_INVALID                                    = 0x0,
+	DEPTH_16                                         = 0x1,
+	DEPTH_X8_24                                      = 0x2,
+	DEPTH_8_24                                       = 0x3,
+	DEPTH_X8_24_FLOAT                                = 0x4,
+	DEPTH_8_24_FLOAT                                 = 0x5,
+	DEPTH_32_FLOAT                                   = 0x6,
+	DEPTH_X24_8_32_FLOAT                             = 0x7,
+} DepthFormat;
+typedef enum ZFormat {
+	Z_INVALID                                        = 0x0,
+	Z_16                                             = 0x1,
+	Z_24                                             = 0x2,
+	Z_32_FLOAT                                       = 0x3,
+} ZFormat;
+typedef enum StencilFormat {
+	STENCIL_INVALID                                  = 0x0,
+	STENCIL_8                                        = 0x1,
+} StencilFormat;
+typedef enum CmaskMode {
+	CMASK_CLEAR_NONE                                 = 0x0,
+	CMASK_CLEAR_ONE                                  = 0x1,
+	CMASK_CLEAR_ALL                                  = 0x2,
+	CMASK_ANY_EXPANDED                               = 0x3,
+	CMASK_ALPHA0_FRAG1                               = 0x4,
+	CMASK_ALPHA0_FRAG2                               = 0x5,
+	CMASK_ALPHA0_FRAG4                               = 0x6,
+	CMASK_ALPHA0_FRAGS                               = 0x7,
+	CMASK_ALPHA1_FRAG1                               = 0x8,
+	CMASK_ALPHA1_FRAG2                               = 0x9,
+	CMASK_ALPHA1_FRAG4                               = 0xa,
+	CMASK_ALPHA1_FRAGS                               = 0xb,
+	CMASK_ALPHAX_FRAG1                               = 0xc,
+	CMASK_ALPHAX_FRAG2                               = 0xd,
+	CMASK_ALPHAX_FRAG4                               = 0xe,
+	CMASK_ALPHAX_FRAGS                               = 0xf,
+} CmaskMode;
+typedef enum QuadExportFormat {
+	EXPORT_UNUSED                                    = 0x0,
+	EXPORT_32_R                                      = 0x1,
+	EXPORT_32_GR                                     = 0x2,
+	EXPORT_32_AR                                     = 0x3,
+	EXPORT_FP16_ABGR                                 = 0x4,
+	EXPORT_UNSIGNED16_ABGR                           = 0x5,
+	EXPORT_SIGNED16_ABGR                             = 0x6,
+	EXPORT_32_ABGR                                   = 0x7,
+} QuadExportFormat;
+typedef enum QuadExportFormatOld {
+	EXPORT_4P_32BPC_ABGR                             = 0x0,
+	EXPORT_4P_16BPC_ABGR                             = 0x1,
+	EXPORT_4P_32BPC_GR                               = 0x2,
+	EXPORT_4P_32BPC_AR                               = 0x3,
+	EXPORT_2P_32BPC_ABGR                             = 0x4,
+	EXPORT_8P_32BPC_R                                = 0x5,
+} QuadExportFormatOld;
+typedef enum ColorFormat {
+	COLOR_INVALID                                    = 0x0,
+	COLOR_8                                          = 0x1,
+	COLOR_16                                         = 0x2,
+	COLOR_8_8                                        = 0x3,
+	COLOR_32                                         = 0x4,
+	COLOR_16_16                                      = 0x5,
+	COLOR_10_11_11                                   = 0x6,
+	COLOR_11_11_10                                   = 0x7,
+	COLOR_10_10_10_2                                 = 0x8,
+	COLOR_2_10_10_10                                 = 0x9,
+	COLOR_8_8_8_8                                    = 0xa,
+	COLOR_32_32                                      = 0xb,
+	COLOR_16_16_16_16                                = 0xc,
+	COLOR_RESERVED_13                                = 0xd,
+	COLOR_32_32_32_32                                = 0xe,
+	COLOR_RESERVED_15                                = 0xf,
+	COLOR_5_6_5                                      = 0x10,
+	COLOR_1_5_5_5                                    = 0x11,
+	COLOR_5_5_5_1                                    = 0x12,
+	COLOR_4_4_4_4                                    = 0x13,
+	COLOR_8_24                                       = 0x14,
+	COLOR_24_8                                       = 0x15,
+	COLOR_X24_8_32_FLOAT                             = 0x16,
+	COLOR_RESERVED_23                                = 0x17,
+} ColorFormat;
+typedef enum SurfaceFormat {
+	FMT_INVALID                                      = 0x0,
+	FMT_8                                            = 0x1,
+	FMT_16                                           = 0x2,
+	FMT_8_8                                          = 0x3,
+	FMT_32                                           = 0x4,
+	FMT_16_16                                        = 0x5,
+	FMT_10_11_11                                     = 0x6,
+	FMT_11_11_10                                     = 0x7,
+	FMT_10_10_10_2                                   = 0x8,
+	FMT_2_10_10_10                                   = 0x9,
+	FMT_8_8_8_8                                      = 0xa,
+	FMT_32_32                                        = 0xb,
+	FMT_16_16_16_16                                  = 0xc,
+	FMT_32_32_32                                     = 0xd,
+	FMT_32_32_32_32                                  = 0xe,
+	FMT_RESERVED_4                                   = 0xf,
+	FMT_5_6_5                                        = 0x10,
+	FMT_1_5_5_5                                      = 0x11,
+	FMT_5_5_5_1                                      = 0x12,
+	FMT_4_4_4_4                                      = 0x13,
+	FMT_8_24                                         = 0x14,
+	FMT_24_8                                         = 0x15,
+	FMT_X24_8_32_FLOAT                               = 0x16,
+	FMT_RESERVED_33                                  = 0x17,
+	FMT_11_11_10_FLOAT                               = 0x18,
+	FMT_16_FLOAT                                     = 0x19,
+	FMT_32_FLOAT                                     = 0x1a,
+	FMT_16_16_FLOAT                                  = 0x1b,
+	FMT_8_24_FLOAT                                   = 0x1c,
+	FMT_24_8_FLOAT                                   = 0x1d,
+	FMT_32_32_FLOAT                                  = 0x1e,
+	FMT_10_11_11_FLOAT                               = 0x1f,
+	FMT_16_16_16_16_FLOAT                            = 0x20,
+	FMT_3_3_2                                        = 0x21,
+	FMT_6_5_5                                        = 0x22,
+	FMT_32_32_32_32_FLOAT                            = 0x23,
+	FMT_RESERVED_36                                  = 0x24,
+	FMT_1                                            = 0x25,
+	FMT_1_REVERSED                                   = 0x26,
+	FMT_GB_GR                                        = 0x27,
+	FMT_BG_RG                                        = 0x28,
+	FMT_32_AS_8                                      = 0x29,
+	FMT_32_AS_8_8                                    = 0x2a,
+	FMT_5_9_9_9_SHAREDEXP                            = 0x2b,
+	FMT_8_8_8                                        = 0x2c,
+	FMT_16_16_16                                     = 0x2d,
+	FMT_16_16_16_FLOAT                               = 0x2e,
+	FMT_4_4                                          = 0x2f,
+	FMT_32_32_32_FLOAT                               = 0x30,
+	FMT_BC1                                          = 0x31,
+	FMT_BC2                                          = 0x32,
+	FMT_BC3                                          = 0x33,
+	FMT_BC4                                          = 0x34,
+	FMT_BC5                                          = 0x35,
+	FMT_BC6                                          = 0x36,
+	FMT_BC7                                          = 0x37,
+	FMT_32_AS_32_32_32_32                            = 0x38,
+	FMT_APC3                                         = 0x39,
+	FMT_APC4                                         = 0x3a,
+	FMT_APC5                                         = 0x3b,
+	FMT_APC6                                         = 0x3c,
+	FMT_APC7                                         = 0x3d,
+	FMT_CTX1                                         = 0x3e,
+	FMT_RESERVED_63                                  = 0x3f,
+} SurfaceFormat;
+typedef enum BUF_DATA_FORMAT {
+	BUF_DATA_FORMAT_INVALID                          = 0x0,
+	BUF_DATA_FORMAT_8                                = 0x1,
+	BUF_DATA_FORMAT_16                               = 0x2,
+	BUF_DATA_FORMAT_8_8                              = 0x3,
+	BUF_DATA_FORMAT_32                               = 0x4,
+	BUF_DATA_FORMAT_16_16                            = 0x5,
+	BUF_DATA_FORMAT_10_11_11                         = 0x6,
+	BUF_DATA_FORMAT_11_11_10                         = 0x7,
+	BUF_DATA_FORMAT_10_10_10_2                       = 0x8,
+	BUF_DATA_FORMAT_2_10_10_10                       = 0x9,
+	BUF_DATA_FORMAT_8_8_8_8                          = 0xa,
+	BUF_DATA_FORMAT_32_32                            = 0xb,
+	BUF_DATA_FORMAT_16_16_16_16                      = 0xc,
+	BUF_DATA_FORMAT_32_32_32                         = 0xd,
+	BUF_DATA_FORMAT_32_32_32_32                      = 0xe,
+	BUF_DATA_FORMAT_RESERVED_15                      = 0xf,
+} BUF_DATA_FORMAT;
+typedef enum IMG_DATA_FORMAT {
+	IMG_DATA_FORMAT_INVALID                          = 0x0,
+	IMG_DATA_FORMAT_8                                = 0x1,
+	IMG_DATA_FORMAT_16                               = 0x2,
+	IMG_DATA_FORMAT_8_8                              = 0x3,
+	IMG_DATA_FORMAT_32                               = 0x4,
+	IMG_DATA_FORMAT_16_16                            = 0x5,
+	IMG_DATA_FORMAT_10_11_11                         = 0x6,
+	IMG_DATA_FORMAT_11_11_10                         = 0x7,
+	IMG_DATA_FORMAT_10_10_10_2                       = 0x8,
+	IMG_DATA_FORMAT_2_10_10_10                       = 0x9,
+	IMG_DATA_FORMAT_8_8_8_8                          = 0xa,
+	IMG_DATA_FORMAT_32_32                            = 0xb,
+	IMG_DATA_FORMAT_16_16_16_16                      = 0xc,
+	IMG_DATA_FORMAT_32_32_32                         = 0xd,
+	IMG_DATA_FORMAT_32_32_32_32                      = 0xe,
+	IMG_DATA_FORMAT_RESERVED_15                      = 0xf,
+	IMG_DATA_FORMAT_5_6_5                            = 0x10,
+	IMG_DATA_FORMAT_1_5_5_5                          = 0x11,
+	IMG_DATA_FORMAT_5_5_5_1                          = 0x12,
+	IMG_DATA_FORMAT_4_4_4_4                          = 0x13,
+	IMG_DATA_FORMAT_8_24                             = 0x14,
+	IMG_DATA_FORMAT_24_8                             = 0x15,
+	IMG_DATA_FORMAT_X24_8_32                         = 0x16,
+	IMG_DATA_FORMAT_RESERVED_23                      = 0x17,
+	IMG_DATA_FORMAT_RESERVED_24                      = 0x18,
+	IMG_DATA_FORMAT_RESERVED_25                      = 0x19,
+	IMG_DATA_FORMAT_RESERVED_26                      = 0x1a,
+	IMG_DATA_FORMAT_RESERVED_27                      = 0x1b,
+	IMG_DATA_FORMAT_RESERVED_28                      = 0x1c,
+	IMG_DATA_FORMAT_RESERVED_29                      = 0x1d,
+	IMG_DATA_FORMAT_RESERVED_30                      = 0x1e,
+	IMG_DATA_FORMAT_RESERVED_31                      = 0x1f,
+	IMG_DATA_FORMAT_GB_GR                            = 0x20,
+	IMG_DATA_FORMAT_BG_RG                            = 0x21,
+	IMG_DATA_FORMAT_5_9_9_9                          = 0x22,
+	IMG_DATA_FORMAT_BC1                              = 0x23,
+	IMG_DATA_FORMAT_BC2                              = 0x24,
+	IMG_DATA_FORMAT_BC3                              = 0x25,
+	IMG_DATA_FORMAT_BC4                              = 0x26,
+	IMG_DATA_FORMAT_BC5                              = 0x27,
+	IMG_DATA_FORMAT_BC6                              = 0x28,
+	IMG_DATA_FORMAT_BC7                              = 0x29,
+	IMG_DATA_FORMAT_RESERVED_42                      = 0x2a,
+	IMG_DATA_FORMAT_RESERVED_43                      = 0x2b,
+	IMG_DATA_FORMAT_FMASK8_S2_F1                     = 0x2c,
+	IMG_DATA_FORMAT_FMASK8_S4_F1                     = 0x2d,
+	IMG_DATA_FORMAT_FMASK8_S8_F1                     = 0x2e,
+	IMG_DATA_FORMAT_FMASK8_S2_F2                     = 0x2f,
+	IMG_DATA_FORMAT_FMASK8_S4_F2                     = 0x30,
+	IMG_DATA_FORMAT_FMASK8_S4_F4                     = 0x31,
+	IMG_DATA_FORMAT_FMASK16_S16_F1                   = 0x32,
+	IMG_DATA_FORMAT_FMASK16_S8_F2                    = 0x33,
+	IMG_DATA_FORMAT_FMASK32_S16_F2                   = 0x34,
+	IMG_DATA_FORMAT_FMASK32_S8_F4                    = 0x35,
+	IMG_DATA_FORMAT_FMASK32_S8_F8                    = 0x36,
+	IMG_DATA_FORMAT_FMASK64_S16_F4                   = 0x37,
+	IMG_DATA_FORMAT_FMASK64_S16_F8                   = 0x38,
+	IMG_DATA_FORMAT_4_4                              = 0x39,
+	IMG_DATA_FORMAT_6_5_5                            = 0x3a,
+	IMG_DATA_FORMAT_1                                = 0x3b,
+	IMG_DATA_FORMAT_1_REVERSED                       = 0x3c,
+	IMG_DATA_FORMAT_32_AS_8                          = 0x3d,
+	IMG_DATA_FORMAT_32_AS_8_8                        = 0x3e,
+	IMG_DATA_FORMAT_32_AS_32_32_32_32                = 0x3f,
+} IMG_DATA_FORMAT;
+typedef enum BUF_NUM_FORMAT {
+	BUF_NUM_FORMAT_UNORM                             = 0x0,
+	BUF_NUM_FORMAT_SNORM                             = 0x1,
+	BUF_NUM_FORMAT_USCALED                           = 0x2,
+	BUF_NUM_FORMAT_SSCALED                           = 0x3,
+	BUF_NUM_FORMAT_UINT                              = 0x4,
+	BUF_NUM_FORMAT_SINT                              = 0x5,
+	BUF_NUM_FORMAT_RESERVED_6                        = 0x6,
+	BUF_NUM_FORMAT_FLOAT                             = 0x7,
+} BUF_NUM_FORMAT;
+typedef enum IMG_NUM_FORMAT {
+	IMG_NUM_FORMAT_UNORM                             = 0x0,
+	IMG_NUM_FORMAT_SNORM                             = 0x1,
+	IMG_NUM_FORMAT_USCALED                           = 0x2,
+	IMG_NUM_FORMAT_SSCALED                           = 0x3,
+	IMG_NUM_FORMAT_UINT                              = 0x4,
+	IMG_NUM_FORMAT_SINT                              = 0x5,
+	IMG_NUM_FORMAT_RESERVED_6                        = 0x6,
+	IMG_NUM_FORMAT_FLOAT                             = 0x7,
+	IMG_NUM_FORMAT_RESERVED_8                        = 0x8,
+	IMG_NUM_FORMAT_SRGB                              = 0x9,
+	IMG_NUM_FORMAT_RESERVED_10                       = 0xa,
+	IMG_NUM_FORMAT_RESERVED_11                       = 0xb,
+	IMG_NUM_FORMAT_RESERVED_12                       = 0xc,
+	IMG_NUM_FORMAT_RESERVED_13                       = 0xd,
+	IMG_NUM_FORMAT_RESERVED_14                       = 0xe,
+	IMG_NUM_FORMAT_RESERVED_15                       = 0xf,
+} IMG_NUM_FORMAT;
+typedef enum TileType {
+	ARRAY_COLOR_TILE                                 = 0x0,
+	ARRAY_DEPTH_TILE                                 = 0x1,
+} TileType;
+typedef enum NonDispTilingOrder {
+	ADDR_SURF_MICRO_TILING_DISPLAY                   = 0x0,
+	ADDR_SURF_MICRO_TILING_NON_DISPLAY               = 0x1,
+} NonDispTilingOrder;
+typedef enum MicroTileMode {
+	ADDR_SURF_DISPLAY_MICRO_TILING                   = 0x0,
+	ADDR_SURF_THIN_MICRO_TILING                      = 0x1,
+	ADDR_SURF_DEPTH_MICRO_TILING                     = 0x2,
+	ADDR_SURF_ROTATED_MICRO_TILING                   = 0x3,
+	ADDR_SURF_THICK_MICRO_TILING                     = 0x4,
+} MicroTileMode;
+typedef enum TileSplit {
+	ADDR_SURF_TILE_SPLIT_64B                         = 0x0,
+	ADDR_SURF_TILE_SPLIT_128B                        = 0x1,
+	ADDR_SURF_TILE_SPLIT_256B                        = 0x2,
+	ADDR_SURF_TILE_SPLIT_512B                        = 0x3,
+	ADDR_SURF_TILE_SPLIT_1KB                         = 0x4,
+	ADDR_SURF_TILE_SPLIT_2KB                         = 0x5,
+	ADDR_SURF_TILE_SPLIT_4KB                         = 0x6,
+} TileSplit;
+typedef enum SampleSplit {
+	ADDR_SURF_SAMPLE_SPLIT_1                         = 0x0,
+	ADDR_SURF_SAMPLE_SPLIT_2                         = 0x1,
+	ADDR_SURF_SAMPLE_SPLIT_4                         = 0x2,
+	ADDR_SURF_SAMPLE_SPLIT_8                         = 0x3,
+} SampleSplit;
+typedef enum PipeConfig {
+	ADDR_SURF_P2                                     = 0x0,
+	ADDR_SURF_P2_RESERVED0                           = 0x1,
+	ADDR_SURF_P2_RESERVED1                           = 0x2,
+	ADDR_SURF_P2_RESERVED2                           = 0x3,
+	ADDR_SURF_P4_8x16                                = 0x4,
+	ADDR_SURF_P4_16x16                               = 0x5,
+	ADDR_SURF_P4_16x32                               = 0x6,
+	ADDR_SURF_P4_32x32                               = 0x7,
+	ADDR_SURF_P8_16x16_8x16                          = 0x8,
+	ADDR_SURF_P8_16x32_8x16                          = 0x9,
+	ADDR_SURF_P8_32x32_8x16                          = 0xa,
+	ADDR_SURF_P8_16x32_16x16                         = 0xb,
+	ADDR_SURF_P8_32x32_16x16                         = 0xc,
+	ADDR_SURF_P8_32x32_16x32                         = 0xd,
+	ADDR_SURF_P8_32x64_32x32                         = 0xe,
+	ADDR_SURF_P8_RESERVED0                           = 0xf,
+	ADDR_SURF_P16_32x32_8x16                         = 0x10,
+	ADDR_SURF_P16_32x32_16x16                        = 0x11,
+} PipeConfig;
+typedef enum NumBanks {
+	ADDR_SURF_2_BANK                                 = 0x0,
+	ADDR_SURF_4_BANK                                 = 0x1,
+	ADDR_SURF_8_BANK                                 = 0x2,
+	ADDR_SURF_16_BANK                                = 0x3,
+} NumBanks;
+typedef enum BankWidth {
+	ADDR_SURF_BANK_WIDTH_1                           = 0x0,
+	ADDR_SURF_BANK_WIDTH_2                           = 0x1,
+	ADDR_SURF_BANK_WIDTH_4                           = 0x2,
+	ADDR_SURF_BANK_WIDTH_8                           = 0x3,
+} BankWidth;
+typedef enum BankHeight {
+	ADDR_SURF_BANK_HEIGHT_1                          = 0x0,
+	ADDR_SURF_BANK_HEIGHT_2                          = 0x1,
+	ADDR_SURF_BANK_HEIGHT_4                          = 0x2,
+	ADDR_SURF_BANK_HEIGHT_8                          = 0x3,
+} BankHeight;
+typedef enum BankWidthHeight {
+	ADDR_SURF_BANK_WH_1                              = 0x0,
+	ADDR_SURF_BANK_WH_2                              = 0x1,
+	ADDR_SURF_BANK_WH_4                              = 0x2,
+	ADDR_SURF_BANK_WH_8                              = 0x3,
+} BankWidthHeight;
+typedef enum MacroTileAspect {
+	ADDR_SURF_MACRO_ASPECT_1                         = 0x0,
+	ADDR_SURF_MACRO_ASPECT_2                         = 0x1,
+	ADDR_SURF_MACRO_ASPECT_4                         = 0x2,
+	ADDR_SURF_MACRO_ASPECT_8                         = 0x3,
+} MacroTileAspect;
+typedef enum GATCL1RequestType {
+	GATCL1_TYPE_NORMAL                               = 0x0,
+	GATCL1_TYPE_SHOOTDOWN                            = 0x1,
+	GATCL1_TYPE_BYPASS                               = 0x2,
+} GATCL1RequestType;
+typedef enum TCC_CACHE_POLICIES {
+	TCC_CACHE_POLICY_LRU                             = 0x0,
+	TCC_CACHE_POLICY_STREAM                          = 0x1,
+} TCC_CACHE_POLICIES;
+typedef enum MTYPE {
+	MTYPE_NC_NV                                      = 0x0,
+	MTYPE_NC                                         = 0x1,
+	MTYPE_CC                                         = 0x2,
+	MTYPE_UC                                         = 0x3,
+} MTYPE;
+typedef enum PERFMON_COUNTER_MODE {
+	PERFMON_COUNTER_MODE_ACCUM                       = 0x0,
+	PERFMON_COUNTER_MODE_ACTIVE_CYCLES               = 0x1,
+	PERFMON_COUNTER_MODE_MAX                         = 0x2,
+	PERFMON_COUNTER_MODE_DIRTY                       = 0x3,
+	PERFMON_COUNTER_MODE_SAMPLE                      = 0x4,
+	PERFMON_COUNTER_MODE_CYCLES_SINCE_FIRST_EVENT    = 0x5,
+	PERFMON_COUNTER_MODE_CYCLES_SINCE_LAST_EVENT     = 0x6,
+	PERFMON_COUNTER_MODE_CYCLES_GE_HI                = 0x7,
+	PERFMON_COUNTER_MODE_CYCLES_EQ_HI                = 0x8,
+	PERFMON_COUNTER_MODE_INACTIVE_CYCLES             = 0x9,
+	PERFMON_COUNTER_MODE_RESERVED                    = 0xf,
+} PERFMON_COUNTER_MODE;
+typedef enum PERFMON_SPM_MODE {
+	PERFMON_SPM_MODE_OFF                             = 0x0,
+	PERFMON_SPM_MODE_16BIT_CLAMP                     = 0x1,
+	PERFMON_SPM_MODE_16BIT_NO_CLAMP                  = 0x2,
+	PERFMON_SPM_MODE_32BIT_CLAMP                     = 0x3,
+	PERFMON_SPM_MODE_32BIT_NO_CLAMP                  = 0x4,
+	PERFMON_SPM_MODE_RESERVED_5                      = 0x5,
+	PERFMON_SPM_MODE_RESERVED_6                      = 0x6,
+	PERFMON_SPM_MODE_RESERVED_7                      = 0x7,
+	PERFMON_SPM_MODE_TEST_MODE_0                     = 0x8,
+	PERFMON_SPM_MODE_TEST_MODE_1                     = 0x9,
+	PERFMON_SPM_MODE_TEST_MODE_2                     = 0xa,
+} PERFMON_SPM_MODE;
+typedef enum SurfaceTiling {
+	ARRAY_LINEAR                                     = 0x0,
+	ARRAY_TILED                                      = 0x1,
+} SurfaceTiling;
+typedef enum SurfaceArray {
+	ARRAY_1D                                         = 0x0,
+	ARRAY_2D                                         = 0x1,
+	ARRAY_3D                                         = 0x2,
+	ARRAY_3D_SLICE                                   = 0x3,
+} SurfaceArray;
+typedef enum ColorArray {
+	ARRAY_2D_ALT_COLOR                               = 0x0,
+	ARRAY_2D_COLOR                                   = 0x1,
+	ARRAY_3D_SLICE_COLOR                             = 0x3,
+} ColorArray;
+typedef enum DepthArray {
+	ARRAY_2D_ALT_DEPTH                               = 0x0,
+	ARRAY_2D_DEPTH                                   = 0x1,
+} DepthArray;
+typedef enum ENUM_NUM_SIMD_PER_CU {
+	NUM_SIMD_PER_CU                                  = 0x4,
+} ENUM_NUM_SIMD_PER_CU;
+typedef enum MEM_PWR_FORCE_CTRL {
+	NO_FORCE_REQUEST                                 = 0x0,
+	FORCE_LIGHT_SLEEP_REQUEST                        = 0x1,
+	FORCE_DEEP_SLEEP_REQUEST                         = 0x2,
+	FORCE_SHUT_DOWN_REQUEST                          = 0x3,
+} MEM_PWR_FORCE_CTRL;
+typedef enum MEM_PWR_FORCE_CTRL2 {
+	NO_FORCE_REQ                                     = 0x0,
+	FORCE_LIGHT_SLEEP_REQ                            = 0x1,
+} MEM_PWR_FORCE_CTRL2;
+typedef enum MEM_PWR_DIS_CTRL {
+	ENABLE_MEM_PWR_CTRL                              = 0x0,
+	DISABLE_MEM_PWR_CTRL                             = 0x1,
+} MEM_PWR_DIS_CTRL;
+typedef enum MEM_PWR_SEL_CTRL {
+	DYNAMIC_SHUT_DOWN_ENABLE                         = 0x0,
+	DYNAMIC_DEEP_SLEEP_ENABLE                        = 0x1,
+	DYNAMIC_LIGHT_SLEEP_ENABLE                       = 0x2,
+} MEM_PWR_SEL_CTRL;
+typedef enum MEM_PWR_SEL_CTRL2 {
+	DYNAMIC_DEEP_SLEEP_EN                            = 0x0,
+	DYNAMIC_LIGHT_SLEEP_EN                           = 0x1,
+} MEM_PWR_SEL_CTRL2;
+
+#endif /* SMU_7_1_2_ENUM_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * SMU_7_1_3 Register documentation
  *
- * (c) Copyright 2007-2013 Datera, Inc.
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
  *
- * Author: Nicholas A. Bellinger <nab@linux-iscsi.org>
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- ******************************************************************************/
-
-#include <linux/list.h>
-#include <linux/percpu_ida.h>
-#include <scsi/scsi_tcq.h>
-#include <scsi/iscsi_proto.h>
-#include <target/target_core_base.h>
-#include <target/target_core_fabric.h>
-#include <target/iscsi/iscsi_transport.h>
-
-#include <target/iscsi/iscsi_target_core.h>
-#include "iscsi_target_parameters.h"
-#include "iscsi_target_seq_pdu_list.h"
-#include "iscsi_target_datain_values.h"
-#include "iscsi_target_erl0.h"
-#include "iscsi_target_erl1.h"
-#include "iscsi_target_erl2.h"
-#include "iscsi_target_tpg.h"
-#include "iscsi_target_util.h"
-#include "iscsi_target.h"
-
-#define PRINT_BUFF(buff, len)					\
-{								\
-	int zzz;						\
-								\
-	pr_debug("%d:\n", __LINE__);				\
-	for (zzz = 0; zzz < len; zzz++) {			\
-		if (zzz % 16 == 0) {				\
-			if (zzz)				\
-				pr_debug("\n");			\
-			pr_debug("%4i: ", zzz);			\
-		}						\
-		pr_debug("%02x ", (unsigned char) (buff)[zzz]);	\
-	}							\
-	if ((len + 1) % 16)					\
-		pr_debug("\n");					\
-}
-
-extern struct list_head g_tiqn_list;
-extern spinlock_t tiqn_lock;
-
-/*
- *	Called with cmd->r2t_lock held.
- */
-int iscsit_add_r2t_to_list(
-	struct iscsi_cmd *cmd,
-	u32 offset,
-	u32 xfer_len,
-	int recovery,
-	u32 r2t_sn)
-{
-	struct iscsi_r2t *r2t;
-
-	r2t = kmem_cache_zalloc(lio_r2t_cache, GFP_ATOMIC);
-	if (!r2t) {
-		pr_err("Unable to allocate memory for struct iscsi_r2t.\n");
-		return -1;
-	}
-	INIT_LIST_HEAD(&r2t->r2t_list);
-
-	r2t->recovery_r2t = recovery;
-	r2t->r2t_sn = (!r2t_sn) ? cmd->r2t_sn++ : r2t_sn;
-	r2t->offset = offset;
-	r2t->xfer_len = xfer_len;
-	list_add_tail(&r2t->r2t_list, &cmd->cmd_r2t_list);
-	spin_unlock_bh(&cmd->r2t_lock);
-
-	iscsit_add_cmd_to_immediate_queue(cmd, cmd->conn, ISTATE_SEND_R2T);
-
-	spin_lock_bh(&cmd->r2t_lock);
-	return 0;
-}
-
-struct iscsi_r2t *iscsit_get_r2t_for_eos(
-	struct iscsi_cmd *cmd,
-	u32 offset,
-	u32 length)
-{
-	struct iscsi_r2t *r2t;
-
-	spin_lock_bh(&cmd->r2t_lock);
-	list_for_each_entry(r2t, &cmd->cmd_r2t_list, r2t_list) {
-		if ((r2t->offset <= offset) &&
-		    (r2t->offset + r2t->xfer_len) >= (offset + length)) {
-			spin_unlock_bh(&cmd->r2t_lock);
-			return r2t;
-		}
-	}
-	spin_unlock_bh(&cmd->r2t_lock);
-
-	pr_err("Unable to locate R2T for Offset: %u, Length:"
-			" %u\n", offset, length);
-	return NULL;
-}
-
-struct iscsi_r2t *iscsit_get_r2t_from_list(struct iscsi_cmd *cmd)
-{
-	struct iscsi_r2t *r2t;
-
-	spin_lock_bh(&cmd->r2t_lock);
-	list_for_each_entry(r2t, &cmd->cmd_r2t_list, r2t_list) {
-		if (!r2t->sent_r2t) {
-			spin_unlock_bh(&cmd->r2t_lock);
-			return r2t;
-		}
-	}
-	spin_unlock_bh(&cmd->r2t_lock);
-
-	pr_err("Unable to locate next R2T to send for ITT:"
-			" 0x%08x.\n", cmd->init_task_tag);
-	return NULL;
-}
-
-/*
- *	Called with cmd->r2t_lock held.
- */
-void iscsit_free_r2t(struct iscsi_r2t *r2t, struct iscsi_cmd *cmd)
-{
-	list_del(&r2t->r2t_list);
-	kmem_cache_free(lio_r2t_cache, r2t);
-}
-
-void iscsit_free_r2ts_from_list(struct iscsi_cmd *cmd)
-{
-	struct iscsi_r2t *r2t, *r2t_tmp;
-
-	spin_lock_bh(&cmd->r2t_lock);
-	list_for_each_entry_safe(r2t, r2t_tmp, &cmd->cmd_r2t_list, r2t_list)
-		iscsit_free_r2t(r2t, cmd);
-	spin_unlock_bh(&cmd->r2t_lock);
-}
-
-/*
- * May be called from software interrupt (timer) context for allocating
- * iSCSI NopINs.
- */
-struct iscsi_cmd *iscsit_allocate_cmd(struct iscsi_conn *conn, int state)
-{
-	struct iscsi_cmd *cmd;
-	struct se_session *se_sess = conn->sess->se_sess;
-	int size, tag;
-
-	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, state);
-	if (tag < 0)
-		return NULL;
-
-	size = sizeof(struct iscsi_cmd) + conn->conn_transport->priv_size;
-	cmd = (struct iscsi_cmd *)(se_sess->sess_cmd_map + (tag * size));
-	memset(cmd, 0, size);
-
-	cmd->se_cmd.map_tag = tag;
-	cmd->conn = conn;
-	INIT_LIST_HEAD(&cmd->i_conn_node);
-	INIT_LIST_HEAD(&cmd->datain_list);
-	INIT_LIST_HEAD(&cmd->cmd_r2t_list);
-	spin_lock_init(&cmd->datain_lock);
-	spin_lock_init(&cmd->dataout_timeout_lock);
-	spin_lock_init(&cmd->istate_lock);
-	spin_lock_init(&cmd->error_lock);
-	spin_lock_init(&cmd->r2t_lock);
-
-	return cmd;
-}
-EXPORT_SYMBOL(iscsit_allocate_cmd);
-
-struct iscsi_seq *iscsit_get_seq_holder_for_datain(
-	struct iscsi_cmd *cmd,
-	u32 seq_send_order)
-{
-	u32 i;
-
-	for (i = 0; i < cmd->seq_count; i++)
-		if (cmd->seq_list[i].seq_send_order == seq_send_order)
-			return &cmd->seq_list[i];
-
-	return NULL;
-}
-
-struct iscsi_seq *iscsit_get_seq_holder_for_r2t(struct iscsi_cmd *cmd)
-{
-	u32 i;
-
-	if (!cmd->seq_list) {
-		pr_err("struct iscsi_cmd->seq_list is NULL!\n");
-		return NULL;
-	}
-
-	for (i = 0; i < cmd->seq_count; i++) {
-		if (cmd->seq_list[i].type != SEQTYPE_NORMAL)
-			continue;
-		if (cmd->seq_list[i].seq_send_order == cmd->seq_send_order) {
-			cmd->seq_send_order++;
-			return &cmd->seq_list[i];
-		}
-	}
-
-	return NULL;
-}
-
-struct iscsi_r2t *iscsit_get_holder_for_r2tsn(
-	struct iscsi_cmd *cmd,
-	u32 r2t_sn)
-{
-	struct iscsi_r2t *r2t;
-
-	spin_lock_bh(&cmd->r2t_lock);
-	list_for_each_entry(r2t, &cmd->cmd_r2t_list, r2t_list) {
-		if (r2t->r2t_sn == r2t_sn) {
-			spin_unlock_bh(&cmd->r2t_lock);
-			return r2t;
-		}
-	}
-	spin_unlock_bh(&cmd->r2t_lock);
-
-	return NULL;
-}
-
-static inline int iscsit_check_received_cmdsn(struct iscsi_session *sess, u32 cmdsn)
-{
-	u32 max_cmdsn;
-	int ret;
-
-	/*
-	 * This is the proper method of checking received CmdSN against
-	 * ExpCmdSN and MaxCmdSN values, as well as accounting for out
-	 * or order CmdSNs due to multiple connection sessions and/or
-	 * CRC failures.
-	 */
-	max_cmdsn = atomic_read(&sess->max_cmd_sn);
-	if (iscsi_sna_gt(cmdsn, max_cmdsn)) {
-		pr_err("Received CmdSN: 0x%08x is greater than"
-		       " MaxCmdSN: 0x%08x, ignoring.\n", cmdsn, max_cmdsn);
-		ret = CMDSN_MAXCMDSN_OVERRUN;
-
-	} else if (cmdsn == sess->exp_cmd_sn) {
-		sess->exp_cmd_sn++;
-		pr_debug("Received CmdSN matches ExpCmdSN,"
-		      " incremented ExpCmdSN to: 0x%08x\n",
-		      sess->exp_cmd_sn);
-		ret = CMDSN_NORMAL_OPERATION;
-
-	} else if (iscsi_sna_gt(cmdsn, sess->exp_cmd_sn)) {
-		pr_debug("Received CmdSN: 0x%08x is greater"
-		      " than ExpCmdSN: 0x%08x, not acknowledging.\n",
-		      cmdsn, sess->exp_cmd_sn);
-		ret = CMDSN_HIGHER_THAN_EXP;
-
-	} else {
-		pr_err("Received CmdSN: 0x%08x is less than"
-		       " ExpCmdSN: 0x%08x, ignoring.\n", cmdsn,
-		       sess->exp_cmd_sn);
-		ret = CMDSN_LOWER_THAN_EXP;
-	}
-
-	return ret;
-}
-
-/*
- * Commands may be received out of order if MC/S is in use.
- * Ensure they are executed in CmdSN order.
- */
-int iscsit_sequence_cmd(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
-			unsigned char *buf, __be32 cmdsn)
-{
-	int ret, cmdsn_ret;
-	bool reject = false;
-	u8 reason = ISCSI_REASON_BOOKMARK_NO_RESOURCES;
-
-	mutex_lock(&conn->sess->cmdsn_mutex);
-
-	cmdsn_ret = iscsit_check_received_cmdsn(conn->sess, be32_to_cpu(cmdsn));
-	switch (cmdsn_ret) {
-	case CMDSN_NORMAL_OPERATION:
-		ret = iscsit_execute_cmd(cmd, 0);
-		if ((ret >= 0) && !list_empty(&conn->sess->sess_ooo_cmdsn_list))
-			iscsit_execute_ooo_cmdsns(conn->sess);
-		else if (ret < 0) {
-			reject = true;
-			ret = CMDSN_ERROR_CANNOT_RECOVER;
-		}
-		break;
-	case CMDSN_HIGHER_THAN_EXP:
-		ret = iscsit_handle_ooo_cmdsn(conn->sess, cmd, be32_to_cpu(cmdsn));
-		if (ret < 0) {
-			reject = true;
-			ret = CMDSN_ERROR_CANNOT_RECOVER;
-			break;
-		}
-		ret = CMDSN_HIGHER_THAN_EXP;
-		break;
-	case CMDSN_LOWER_THAN_EXP:
-	case CMDSN_MAXCMDSN_OVERRUN:
-	default:
-		cmd->i_state = ISTATE_REMOVE;
-		iscsit_add_cmd_to_immediate_queue(cmd, conn, cmd->i_state);
-		/*
-		 * Existing callers for iscsit_sequence_cmd() will silently
-		 * ignore commands with CMDSN_LOWER_THAN_EXP, so force this
-		 * return for CMDSN_MAXCMDSN_OVERRUN as well..
-		 */
-		ret = CMDSN_LOWER_THAN_EXP;
-		break;
-	}
-	mutex_unlock(&conn->sess->cmdsn_mutex);
-
-	if (reject)
-		iscsit_reject_cmd(cmd, reason, buf);
-
-	return ret;
-}
-EXPORT_SYMBOL(iscsit_sequence_cmd);
-
-int iscsit_check_unsolicited_dataout(struct iscsi_cmd *cmd, unsigned char *buf)
-{
-	struct iscsi_conn *conn = cmd->conn;
-	struct se_cmd *se_cmd = &cmd->se_cmd;
-	struct iscsi_data *hdr = (struct iscsi_data *) buf;
-	u32 payload_length = ntoh24(hdr->dlength);
-
-	if (conn->sess->sess_ops->InitialR2T) {
-		pr_err("Received unexpected unsolicited data"
-			" while InitialR2T=Yes, protocol error.\n");
-		transport_send_check_condition_and_sense(se_cmd,
-				TCM_UNEXPECTED_UNSOLICITED_DATA, 0);
-		return -1;
-	}
-
-	if ((cmd->first_burst_len + payload_length) >
-	     conn->sess->sess_ops->FirstBurstLength) {
-		pr_err("Total %u bytes exceeds FirstBurstLength: %u"
-			" for this Unsolicited DataOut Burst.\n",
-			(cmd->first_burst_len + payload_length),
-				conn->sess->sess_ops->FirstBurstLength);
-		transport_send_check_condition_and_sense(se_cmd,
-				TCM_INCORRECT_AMOUNT_OF_DATA, 0);
-		return -1;
-	}
-
-	if (!(hdr->flags & ISCSI_FLAG_CMD_FINAL))
-		return 0;
-
-	if (((cmd->first_burst_len + payload_length) != cmd->se_cmd.data_length) &&
-	    ((cmd->first_burst_len + payload_length) !=
-	      conn->sess->sess_ops->FirstBurstLength)) {
-		pr_err("Unsolicited non-immediate data received %u"
-			" does not equal FirstBurstLength: %u, and does"
-			" not equal ExpXferLen %u.\n",
-			(cmd->first_burst_len + payload_length),
-			conn->sess->sess_ops->FirstBurstLength, cmd->se_cmd.data_length);
-		transport_send_check_condition_and_sense(se_cmd,
-				TCM_INCORRECT_AMOUNT_OF_DATA, 0);
-		return -1;
-	}
-	return 0;
-}
-
-struct iscsi_cmd *iscsit_find_cmd_from_itt(
-	struct iscsi_conn *conn,
-	itt_t init_task_tag)
-{
-	struct iscsi_cmd *cmd;
-
-	spin_lock_bh(&conn->cmd_lock);
-	list_for_each_entry(cmd, &conn->conn_cmd_list, i_conn_node) {
-		if (cmd->init_task_tag == init_task_tag) {
-			spin_unlock_bh(&conn->cmd_lock);
-			return cmd;
-		}
-	}
-	spin_unlock_bh(&conn->cmd_lock);
-
-	pr_err("Unable to locate ITT: 0x%08x on CID: %hu",
-			init_task_tag, conn->cid);
-	return NULL;
-}
-EXPORT_SYMBOL(iscsit_find_cmd_from_itt);
-
-struct iscsi_cmd *iscsit_find_cmd_from_itt_or_dump(
-	struct iscsi_conn *conn,
-	itt_t init_task_tag,
-	u32 length)
-{
-	struct iscsi_cmd *cmd;
-
-	spin_lock_bh(&conn->cmd_lock);
-	list_for_each_entry(cmd, &conn->conn_cmd_list, i_conn_node) {
-		if (cmd->cmd_flags & ICF_GOT_LAST_DATAOUT)
-			continue;
-		if (cmd->init_task_tag == init_task_tag) {
-			spin_unlock_bh(&conn->cmd_lock);
-			return cmd;
-		}
-	}
-	spin_unlock_bh(&conn->cmd_lock);
-
-	pr_err("Unable to locate ITT: 0x%08x on CID: %hu,"
-			" dumping payload\n", init_task_tag, conn->cid);
-	if (length)
-		iscsit_dump_data_payload(conn, length, 1);
-
-	return NULL;
-}
-
-struct iscsi_cmd *iscsit_find_cmd_from_ttt(
-	struct iscsi_conn *conn,
-	u32 targ_xfer_tag)
-{
-	struct iscsi_cmd *cmd = NULL;
-
-	spin_lock_bh(&conn->cmd_lock);
-	list_for_each_entry(cmd, &conn->conn_cmd_list, i_conn_node) {
-		if (cmd->targ_xfer_tag == targ_xfer_tag) {
-			spin_unlock_bh(&conn->cmd_lock);
-			return cmd;
-		}
-	}
-	spin_unlock_bh(&conn->cmd_lock);
-
-	pr_err("Unable to locate TTT: 0x%08x on CID: %hu\n",
-			targ_xfer_tag, conn->cid);
-	return NULL;
-}
-
-int iscsit_find_cmd_for_recovery(
-	struct iscsi_session *sess,
-	struct iscsi_cmd **cmd_ptr,
-	struct iscsi_conn_recovery **cr_ptr,
-	itt_t init_task_tag)
-{
-	struct iscsi_cmd *cmd = NULL;
-	struct iscsi_conn_recovery *cr;
-	/*
-	 * Scan through the inactive connection recovery list's command list.
-	 * If init_task_tag matches the command is still alligent.
-	 */
-	spin_lock(&sess->cr_i_lock);
-	list_for_each_entry(cr, &sess->cr_inactive_list, cr_list) {
-		spin_lock(&cr->conn_recovery_cmd_lock);
-		list_for_each_entry(cmd, &cr->conn_recovery_cmd_list, i_conn_node) {
-			if (cmd->init_task_tag == init_task_tag) {
-				spin_unlock(&cr->conn_recovery_cmd_lock);
-				spin_unlock(&sess->cr_i_lock);
-
-				*cr_ptr = cr;
-				*cmd_ptr = cmd;
-				return -2;
-			}
-		}
-		spin_unlock(&cr->conn_recovery_cmd_lock);
-	}
-	spin_unlock(&sess->cr_i_lock);
-	/*
-	 * Scan through the active connection recovery list's command list.
-	 * If init_task_tag matches the command is ready to be reassigned.
-	 */
-	spin_lock(&sess->cr_a_lock);
-	list_for_each_entry(cr, &sess->cr_active_list, cr_list) {
-		spin_lock(&cr->conn_recovery_cmd_lock);
-		list_for_each_entry(cmd, &cr->conn_recovery_cmd_list, i_conn_node) {
-			if (cmd->init_task_tag == init_task_tag) {
-				spin_unlock(&cr->conn_recovery_cmd_lock);
-				spin_unlock(&sess->cr_a_lock);
-
-				*cr_ptr = cr;
-				*cmd_ptr = cmd;
-				return 0;
-			}
-		}
-		spin_unlock(&cr->conn_recovery_cmd_lock);
-	}
-	spin_unlock(&sess->cr_a_lock);
-
-	return -1;
-}
-
-void iscsit_add_cmd_to_immediate_queue(
-	struct iscsi_cmd *cmd,
-	struct iscsi_conn *conn,
-	u8 state)
-{
-	struct iscsi_queue_req *qr;
-
-	qr = kmem_cache_zalloc(lio_qr_cache, GFP_ATOMIC);
-	if (!qr) {
-		pr_err("Unable to allocate memory for"
-				" struct iscsi_queue_req\n");
-		return;
-	}
-	INIT_LIST_HEAD(&qr->qr_list);
-	qr->cmd = cmd;
-	qr->state = state;
-
-	spin_lock_bh(&conn->immed_queue_lock);
-	list_add_tail(&qr->qr_list, &conn->immed_queue_list);
-	atomic_inc(&cmd->immed_queue_count);
-	atomic_set(&conn->check_immediate_queue, 1);
-	spin_unlock_bh(&conn->immed_queue_lock);
-
-	wake_up(&conn->queues_wq);
-}
-
-struct iscsi_queue_req *iscsit_get_cmd_from_immediate_queue(struct iscsi_conn *conn)
-{
-	struct iscsi_queue_req *qr;
-
-	spin_lock_bh(&conn->immed_queue_lock);
-	if (list_empty(&conn->immed_queue_list)) {
-		spin_unlock_bh(&conn->immed_queue_lock);
-		return NULL;
-	}
-	qr = list_first_entry(&conn->immed_queue_list,
-			      struct iscsi_queue_req, qr_list);
-
-	list_del(&qr->qr_list);
-	if (qr->cmd)
-		atomic_dec(&qr->cmd->immed_queue_count);
-	spin_unlock_bh(&conn->immed_queue_lock);
-
-	return qr;
-}
-
-static void iscsit_remove_cmd_from_immediate_queue(
-	struct iscsi_cmd *cmd,
-	struct iscsi_conn *conn)
-{
-	struct iscsi_queue_req *qr, *qr_tmp;
-
-	spin_lock_bh(&conn->immed_queue_lock);
-	if (!atomic_read(&cmd->immed_queue_count)) {
-		spin_unlock_bh(&conn->immed_queue_lock);
-		return;
-	}
-
-	list_for_each_entry_safe(qr, qr_tmp, &conn->immed_queue_list, qr_list) {
-		if (qr->cmd != cmd)
-			continue;
-
-		atomic_dec(&qr->cmd->immed_queue_count);
-		list_del(&qr->qr_list);
-		kmem_cache_free(lio_qr_cache, qr);
-	}
-	spin_unlock_bh(&conn->immed_queue_lock);
-
-	if (atomic_read(&cmd->immed_queue_count)) {
-		pr_err("ITT: 0x%08x immed_queue_count: %d\n",
-			cmd->init_task_tag,
-			atomic_read(&cmd->immed_queue_count));
-	}
-}
-
-void iscsit_add_cmd_to_response_queue(
-	struct iscsi_cmd *cmd,
-	struct iscsi_conn *conn,
-	u8 state)
-{
-	struct iscsi_queue_req *qr;
-
-	qr = kmem_cache_zalloc(lio_qr_cache, GFP_ATOMIC);
-	if (!qr) {
-		pr_err("Unable to allocate memory for"
-			" struct iscsi_queue_req\n");
-		return;
-	}
-	INIT_LIST_HEAD(&qr->qr_list);
-	qr->cmd = cmd;
-	qr->state = state;
-
-	spin_lock_bh(&conn->response_queue_lock);
-	list_add_tail(&qr->qr_list, &conn->response_queue_list);
-	atomic_inc(&cmd->response_queue_count);
-	spin_unlock_bh(&conn->response_queue_lock);
-
-	wake_up(&conn->queues_wq);
-}
-
-struct iscsi_queue_req *iscsit_get_cmd_from_response_queue(struct iscsi_conn *conn)
-{
-	struct iscsi_queue_req *qr;
-
-	spin_lock_bh(&conn->response_queue_lock);
-	if (list_empty(&conn->response_queue_list)) {
-		spin_unlock_bh(&conn->response_queue_lock);
-		return NULL;
-	}
-
-	qr = list_first_entry(&conn->response_queue_list,
-			      struct iscsi_queue_req, qr_list);
-
-	list_del(&qr->qr_list);
-	if (qr->cmd)
-		atomic_dec(&qr->cmd->response_queue_count);
-	spin_unlock_bh(&conn->response_queue_lock);
-
-	return qr;
-}
-
-static void iscsit_remove_cmd_from_response_queue(
-	struct iscsi_cmd *cmd,
-	struct iscsi_conn *conn)
-{
-	struct iscsi_queue_req *qr, *qr_tmp;
-
-	spin_lock_bh(&conn->response_queue_lock);
-	if (!atomic_read(&cmd->response_queue_count)) {
-		spin_unlock_bh(&conn->response_queue_lock);
-		return;
-	}
-
-	list_for_each_entry_safe(qr, qr_tmp, &conn->response_queue_list,
-				qr_list) {
-		if (qr->cmd != cmd)
-			continue;
-
-		atomic_dec(&qr->cmd->response_queue_count);
-		list_del(&qr->qr_list);
-		kmem_cache_free(lio_qr_cache, qr);
-	}
-	spin_unlock_bh(&conn->response_queue_lock);
-
-	if (atomic_read(&cmd->response_queue_count)) {
-		pr_err("ITT: 0x%08x response_queue_count: %d\n",
-			cmd->init_task_tag,
-			atomic_read(&cmd->response_queue_count));
-	}
-}
-
-bool iscsit_conn_all_queues_empty(struct iscsi_conn *conn)
-{
-	bool empty;
-
-	spin_lock_bh(&conn->immed_queue_lock);
-	empty = list_empty(&conn->immed_queue_list);
-	spin_unlock_bh(&conn->immed_queue_lock);
-
-	if (!empty)
-		return empty;
-
-	spin_lock_bh(&conn->response_queue_lock);
-	empty = list_empty(&conn->response_queue_list);
-	spin_unlock_bh(&conn->response_queue_lock);
-
-	return empty;
-}
-
-void iscsit_free_queue_reqs_for_conn(struct iscsi_conn *conn)
-{
-	struct iscsi_queue_req *qr, *qr_tmp;
-
-	spin_lock_bh(&conn->immed_queue_lock);
-	list_for_each_entry_safe(qr, qr_tmp, &conn->immed_queue_list, qr_list) {
-		list_del(&qr->qr_list);
-		if (qr->cmd)
-			atomic_dec(&qr->cmd->immed_queue_count);
-
-		kmem_cache_free(lio_qr_cache, qr);
-	}
-	spin_unlock_bh(&conn->immed_queue_lock);
-
-	spin_lock_bh(&conn->response_queue_lock);
-	list_for_each_entry_safe(qr, qr_tmp, &conn->response_queue_list,
-			qr_list) {
-		list_del(&qr->qr_list);
-		if (qr->cmd)
-			atomic_dec(&qr->cmd->response_queue_count);
-
-		kmem_cache_free(lio_qr_cache, qr);
-	}
-	spin_unlock_bh(&conn->response_queue_lock);
-}
-
-void iscsit_release_cmd(struct iscsi_cmd *cmd)
-{
-	struct iscsi_session *sess;
-	struct se_cmd *se_cmd = &cmd->se_cmd;
-
-	if (cmd->conn)
-		sess = cmd->conn->sess;
-	else
-		sess = cmd->sess;
-
-	BUG_ON(!sess || !sess->se_sess);
-
-	kfree(cmd->buf_ptr);
-	kfree(cmd->pdu_list);
-	kfree(cmd->seq_list);
-	kfree(cmd->tmr_req);
-	kfree(cmd->iov_data);
-	kfree(cmd->text_in_ptr);
-
-	percpu_ida_free(&sess->se_sess->sess_tag_pool, se_cmd->map_tag);
-}
-EXPORT_SYMBOL(iscsit_release_cmd);
-
-void __iscsit_free_cmd(struct iscsi_cmd *cmd, bool scsi_cmd,
-		       bool check_queues)
-{
-	struct iscsi_conn *conn = cmd->conn;
-
-	if (scsi_cmd) {
-		if (cmd->data_direction == DMA_TO_DEVICE) {
-			iscsit_stop_dataout_timer(cmd);
-			iscsit_free_r2ts_from_list(cmd);
-		}
-		if (cmd->data_direction == DMA_FROM_DEVICE)
-			iscsit_free_all_datain_reqs(cmd);
-	}
-
-	if (conn && check_queues) {
-		iscsit_remove_cmd_from_immediate_queue(cmd, conn);
-		iscsit_remove_cmd_from_response_queue(cmd, conn);
-	}
-}
-
-void iscsit_free_cmd(struct iscsi_cmd *cmd, bool shutdown)
-{
-	struct se_cmd *se_cmd = NULL;
-	int rc;
-	bool op_scsi = false;
-	/*
-	 * Determine if a struct se_cmd is associated with
-	 * this struct iscsi_cmd.
-	 */
-	switch (cmd->iscsi_opcode) {
-	case ISCSI_OP_SCSI_CMD:
-		op_scsi = true;
-		/*
-		 * Fallthrough
-		 */
-	case ISCSI_OP_SCSI_TMFUNC:
-		se_cmd = &cmd->se_cmd;
-		__iscsit_free_cmd(cmd, op_scsi, shutdown);
-		rc = transport_generic_free_cmd(se_cmd, shutdown);
-		if (!rc && shutdown && se_cmd->se_sess) {
-			__iscsit_free_cmd(cmd, op_scsi, shutdown);
-			target_put_sess_cmd(se_cmd);
-		}
-		break;
-	case ISCSI_OP_REJECT:
-		/*
-		 * Handle special case for REJECT when iscsi_add_reject*() has
-		 * overwritten the original iscsi_opcode assignment, and the
-		 * associated cmd->se_cmd needs to be released.
-		 */
-		if (cmd->se_cmd.se_tfo != NULL) {
-			se_cmd = &cmd->se_cmd;
-			__iscsit_free_cmd(cmd, true, shutdown);
-
-			rc = transport_generic_free_cmd(&cmd->se_cmd, shutdown);
-			if (!rc && shutdown && se_cmd->se_sess) {
-				__iscsit_free_cmd(cmd, true, shutdown);
-				target_put_sess_cmd(se_cmd);
-			}
-			break;
-		}
-		/* Fall-through */
-	default:
-		__iscsit_free_cmd(cmd, false, shutdown);
-		iscsit_release_cmd(cmd);
-		break;
-	}
-}
-
-int iscsit_check_session_usage_count(struct iscsi_session *sess)
-{
-	spin_lock_bh(&sess->session_usage_lock);
-	if (sess->session_usage_count != 0) {
-		sess->session_waiting_on_uc = 1;
-		spin_unlock_bh(&sess->session_usage_lock);
-		if (in_interrupt())
-			return 2;
-
-		wait_for_completion(&sess->session_waiting_on_uc_comp);
-		return 1;
-	}
-	spin_unlock_bh(&sess->session_usage_lock);
-
-	return 0;
-}
-
-void iscsit_dec_session_usage_count(struct iscsi_session *sess)
-{
-	spin_lock_bh(&sess->session_usage_lock);
-	sess->session_usage_count--;
-
-	if (!sess->session_usage_count && sess->session_waiting_on_uc)
-		complete(&sess->session_waiting_on_uc_comp);
-
-	spin_unlock_bh(&sess->session_usage_lock);
-}
-
-void iscsit_inc_session_usage_count(struct iscsi_session *sess)
-{
-	spin_lock_bh(&sess->session_usage_lock);
-	sess->session_usage_count++;
-	spin_unlock_bh(&sess->session_usage_lock);
-}
-
-struct iscsi_conn *iscsit_get_conn_from_cid(struct iscsi_session *sess, u16 cid)
-{
-	struct iscsi_conn *conn;
-
-	spin_lock_bh(&sess->conn_lock);
-	list_for_each_entry(conn, &sess->sess_conn_list, conn_list) {
-		if ((conn->cid == cid) &&
-		    (conn->conn_state == TARG_CONN_STATE_LOGGED_IN)) {
-			iscsit_inc_conn_usage_count(conn);
-			spin_unlock_bh(&sess->conn_lock);
-			return conn;
-		}
-	}
-	spin_unlock_bh(&sess->conn_lock);
-
-	return NULL;
-}
-
-struct iscsi_conn *iscsit_get_conn_from_cid_rcfr(struct iscsi_session *sess, u16 cid)
-{
-	struct iscsi_conn *conn;
-
-	spin_lock_bh(&sess->conn_lock);
-	list_for_each_entry(conn, &sess->sess_conn_list, conn_list) {
-		if (conn->cid == cid) {
-			iscsit_inc_conn_usage_count(conn);
-			spin_lock(&conn->state_lock);
-			atomic_set(&conn->connection_wait_rcfr, 1);
-			spin_unlock(&conn->state_lock);
-			spin_unlock_bh(&sess->conn_lock);
-			return conn;
-		}
-	}
-	spin_unlock_bh(&sess->conn_lock);
-
-	return NULL;
-}
-
-void iscsit_check_conn_usage_count(struct iscsi_conn *conn)
-{
-	spin_lock_bh(&conn->conn_usage_lock);
-	if (conn->conn_usage_count != 0) {
-		conn->conn_waiting_on_uc = 1;
-		spin_unlock_bh(&conn->conn_usage_lock);
-
-		wait_for_completion(&conn->conn_waiting_on_uc_comp);
-		return;
-	}
-	spin_unlock_bh(&conn->conn_usage_lock);
-}
-
-void iscsit_dec_conn_usage_count(struct iscsi_conn *conn)
-{
-	spin_lock_bh(&conn->conn_usage_lock);
-	conn->conn_usage_count--;
-
-	if (!conn->conn_usage_count && conn->conn_waiting_on_uc)
-		complete(&conn->conn_waiting_on_uc_comp);
-
-	spin_unlock_bh(&conn->conn_usage_lock);
-}
-
-void iscsit_inc_conn_usage_count(struct iscsi_conn *conn)
-{
-	spin_lock_bh(&conn->conn_usage_lock);
-	conn->conn_usage_count++;
-	spin_unlock_bh(&conn->conn_usage_lock);
-}
-
-static int iscsit_add_nopin(struct iscsi_conn *conn, int want_response)
-{
-	u8 state;
-	struct iscsi_cmd *cmd;
-
-	cmd = iscsit_allocate_cmd(conn, TASK_RUNNING);
-	if (!cmd)
-		return -1;
-
-	cmd->iscsi_opcode = ISCSI_OP_NOOP_IN;
-	state = (want_response) ? ISTATE_SEND_NOPIN_WANT_RESPONSE :
-				ISTATE_SEND_NOPIN_NO_RESPONSE;
-	cmd->init_task_tag = RESERVED_ITT;
-	cmd->targ_xfer_tag = (want_response) ?
-			     session_get_next_ttt(conn->sess) : 0xFFFFFFFF;
-	spin_lock_bh(&conn->cmd_lock);
-	list_add_tail(&cmd->i_conn_node, &conn->conn_cmd_list);
-	spin_unlock_bh(&conn->cmd_lock);
-
-	if (want_response)
-		iscsit_start_nopin_response_timer(conn);
-	iscsit_add_cmd_to_immediate_queue(cmd, conn, state);
-
-	return 0;
-}
-
-static void iscsit_handle_nopin_response_timeout(unsigned long data)
-{
-	struct iscsi_conn *conn = (struct iscsi_conn *) data;
-
-	iscsit_inc_conn_usage_count(conn);
-
-	spin_lock_bh(&conn->nopin_timer_lock);
-	if (conn->nopin_response_timer_flags & ISCSI_TF_STOP) {
-		spin_unlock_bh(&conn->nopin_timer_lock);
-		iscsit_dec_conn_usage_count(conn);
-		return;
-	}
-
-	pr_debug("Did not receive response to NOPIN on CID: %hu on"
-		" SID: %u, failing connection.\n", conn->cid,
-			conn->sess->sid);
-	conn->nopin_response_timer_flags &= ~ISCSI_TF_RUNNING;
-	spin_unlock_bh(&conn->nopin_timer_lock);
-
-	{
-	struct iscsi_portal_group *tpg = conn->sess->tpg;
-	struct iscsi_tiqn *tiqn = tpg->tpg_tiqn;
-
-	if (tiqn) {
-		spin_lock_bh(&tiqn->sess_err_stats.lock);
-		strcpy(tiqn->sess_err_stats.last_sess_fail_rem_name,
-				conn->sess->sess_ops->InitiatorName);
-		tiqn->sess_err_stats.last_sess_failure_type =
-				ISCSI_SESS_ERR_CXN_TIMEOUT;
-		tiqn->sess_err_stats.cxn_timeout_errors++;
-		atomic_long_inc(&conn->sess->conn_timeout_errors);
-		spin_unlock_bh(&tiqn->sess_err_stats.lock);
-	}
-	}
-
-	iscsit_cause_connection_reinstatement(conn, 0);
-	iscsit_dec_conn_usage_count(conn);
-}
-
-void iscsit_mod_nopin_response_timer(struct iscsi_conn *conn)
-{
-	struct iscsi_session *sess = conn->sess;
-	struct iscsi_node_attrib *na = iscsit_tpg_get_node_attrib(sess);
-
-	spin_lock_bh(&conn->nopin_timer_lock);
-	if (!(conn->nopin_response_timer_flags & ISCSI_TF_RUNNING)) {
-		spin_unlock_bh(&conn->nopin_timer_lock);
-		return;
-	}
-
-	mod_timer(&conn->nopin_response_timer,
-		(get_jiffies_64() + na->nopin_response_timeout * HZ));
-	spin_unlock_bh(&conn->nopin_timer_lock);
-}
-
-/*
- *	Called with conn->nopin_timer_lock held.
- */
-void iscsit_start_nopin_response_timer(struct iscsi_conn *conn)
-{
-	struct iscsi_session *sess = conn->sess;
-	struct iscsi_node_attrib *na = iscsit_tpg_get_node_attrib(sess);
-
-	spin_lock_bh(&conn->nopin_timer_lock);
-	if (conn->nopin_response_timer_flags & ISCSI_TF_RUNNING) {
-		spin_unlock_bh(&conn->nopin_timer_lock);
-		return;
-	}
-
-	init_timer(&conn->nopin_response_timer);
-	conn->nopin_response_timer.expires =
-		(get_jiffies_64() + na->nopin_response_timeout * HZ);
-	conn->nopin_response_timer.data = (unsigned long)conn;
-	conn->nopin_response_timer.function = iscsit_handle_nopin_response_timeout;
-	conn->nopin_response_timer_flags &= ~ISCSI_TF_STOP;
-	conn->nopin_response_timer_flags |= ISCSI_TF_RUNNING;
-	add_timer(&conn->nopin_response_timer);
-
-	pr_debug("Started NOPIN Response Timer on CID: %d to %u"
-		" seconds\n", conn->cid, na->nopin_response_timeout);
-	spin_unlock_bh(&conn->nopin_timer_lock);
-}
-
-void iscsit_stop_nopin_response_timer(struct iscsi_conn *conn)
-{
-	spin_lock_bh(&conn->nopin_timer_lock);
-	if (!(conn->nopin_response_timer_flags & ISCSI_TF_RUNNING)) {
-		spin_unlock_bh(&conn->nopin_timer_lock);
-		return;
-	}
-	conn->nopin_response_timer_flags |= ISCSI_TF_STOP;
-	spin_unlock_bh(&conn->nopin_timer_lock);
-
-	del_timer_sync(&conn->nopin_response_timer);
-
-	spin_lock_bh(&conn->nopin_timer_lock);
-	conn->nopin_response_timer_flags &= ~ISCSI_TF_RUNNING;
-	spin_unlock_bh(&conn->nopin_timer_lock);
-}
-
-static void iscsit_handle_nopin_timeout(unsigned long data)
-{
-	struct iscsi_conn *conn = (struct iscsi_conn *) data;
-
-	iscsit_inc_conn_usage_count(conn);
-
-	spin_lock_bh(&conn->nopin_timer_lock);
-	if (conn->nopin_timer_flags & ISCSI_TF_STOP) {
-		spin_unlock_bh(&conn->nopin_timer_lock);
-		iscsit_dec_conn_usage_count(conn);
-		return;
-	}
-	conn->nopin_timer_flags &= ~ISCSI_TF_RUNNING;
-	spin_unlock_bh(&conn->nopin_timer_lock);
-
-	iscsit_add_nopin(conn, 1);
-	iscsit_dec_conn_usage_count(conn);
-}
-
-/*
- * Called with conn->nopin_timer_lock held.
- */
-void __iscsit_start_nopin_timer(struct iscsi_conn *conn)
-{
-	struct iscsi_session *sess = conn->sess;
-	struct iscsi_node_attrib *na = iscsit_tpg_get_node_attrib(sess);
-	/*
-	* NOPIN timeout is disabled.
-	 */
-	if (!na->nopin_timeout)
-		return;
-
-	if (conn->nopin_timer_flags & ISCSI_TF_RUNNING)
-		return;
-
-	init_timer(&conn->nopin_timer);
-	conn->nopin_timer.expires = (get_jiffies_64() + na->nopin_timeout * HZ);
-	conn->nopin_timer.data = (unsigned long)conn;
-	conn->nopin_timer.function = iscsit_handle_nopin_timeout;
-	conn->nopin_timer_flags &= ~ISCSI_TF_STOP;
-	conn->nopin_timer_flags |= ISCSI_TF_RUNNING;
-	add_timer(&conn->nopin_timer);
-
-	pr_debug("Started NOPIN Timer on CID: %d at %u second"
-		" interval\n", conn->cid, na->nopin_timeout);
-}
-
-void iscsit_start_nopin_timer(struct iscsi_conn *conn)
-{
-	struct iscsi_session *sess = conn->sess;
-	struct iscsi_node_attrib *na = iscsit_tpg_get_node_attrib(sess);
-	/*
-	 * NOPIN timeout is disabled..
-	 */
-	if (!na->nopin_timeout)
-		return;
-
-	spin_lock_bh(&conn->nopin_timer_lock);
-	if (conn->nopin_timer_flags & ISCSI_TF_RUNNING) {
-		spin_unlock_bh(&conn->nopin_timer_lock);
-		return;
-	}
-
-	init_timer(&conn->nopin_timer);
-	conn->nopin_timer.expires = (get_jiffies_64() + na->nopin_timeout * HZ);
-	conn->nopin_timer.data = (unsigned long)conn;
-	conn->nopin_timer.function = iscsit_handle_nopin_timeout;
-	conn->nopin_timer_flags &= ~ISCSI_TF_STOP;
-	conn->nopin_timer_flags |= ISCSI_TF_RUNNING;
-	add_timer(&conn->nopin_timer);
-
-	pr_debug("Started NOPIN Timer on CID: %d at %u second"
-			" interval\n", conn->cid, na->nopin_timeout);
-	spin_unlock_bh(&conn->nopin_timer_lock);
-}
-
-void iscsit_stop_nopin_timer(struct iscsi_conn *conn)
-{
-	spin_lock_bh(&conn->nopin_timer_lock);
-	if (!(conn->nopin_timer_flags & ISCSI_TF_RUNNING)) {
-		spin_unlock_bh(&conn->nopin_timer_lock);
-		return;
-	}
-	conn->nopin_timer_flags |= ISCSI_TF_STOP;
-	spin_unlock_bh(&conn->nopin_timer_lock);
-
-	del_timer_sync(&conn->nopin_timer);
-
-	spin_lock_bh(&conn->nopin_timer_lock);
-	conn->nopin_timer_flags &= ~ISCSI_TF_RUNNING;
-	spin_unlock_bh(&conn->nopin_timer_lock);
-}
-
-int iscsit_send_tx_data(
-	struct iscsi_cmd *cmd,
-	struct iscsi_conn *conn,
-	int use_misc)
-{
-	int tx_sent, tx_size;
-	u32 iov_count;
-	struct kvec *iov;
-
-send_data:
-	tx_size = cmd->tx_size;
-
-	if (!use_misc) {
-		iov = &cmd->iov_data[0];
-		iov_count = cmd->iov_data_count;
-	} else {
-		iov = &cmd->iov_misc[0];
-		iov_count = cmd->iov_misc_count;
-	}
-
-	tx_sent = tx_data(conn, &iov[0], iov_count, tx_size);
-	if (tx_size != tx_sent) {
-		if (tx_sent == -EAGAIN) {
-			pr_err("tx_data() returned -EAGAIN\n");
-			goto send_data;
-		} else
-			return -1;
-	}
-	cmd->tx_size = 0;
-
-	return 0;
-}
-
-int iscsit_fe_sendpage_sg(
-	struct iscsi_cmd *cmd,
-	struct iscsi_conn *conn)
-{
-	struct scatterlist *sg = cmd->first_data_sg;
-	struct kvec iov;
-	u32 tx_hdr_size, data_len;
-	u32 offset = cmd->first_data_sg_off;
-	int tx_sent, iov_off;
-
-send_hdr:
-	tx_hdr_size = ISCSI_HDR_LEN;
-	if (conn->conn_ops->HeaderDigest)
-		tx_hdr_size += ISCSI_CRC_LEN;
-
-	iov.iov_base = cmd->pdu;
-	iov.iov_len = tx_hdr_size;
-
-	tx_sent = tx_data(conn, &iov, 1, tx_hdr_size);
-	if (tx_hdr_size != tx_sent) {
-		if (tx_sent == -EAGAIN) {
-			pr_err("tx_data() returned -EAGAIN\n");
-			goto send_hdr;
-		}
-		return -1;
-	}
-
-	data_len = cmd->tx_size - tx_hdr_size - cmd->padding;
-	/*
-	 * Set iov_off used by padding and data digest tx_data() calls below
-	 * in order to determine proper offset into cmd->iov_data[]
-	 */
-	if (conn->conn_ops->DataDigest) {
-		data_len -= ISCSI_CRC_LEN;
-		if (cmd->padding)
-			iov_off = (cmd->iov_data_count - 2);
-		else
-			iov_off = (cmd->iov_data_count - 1);
-	} else {
-		iov_off = (cmd->iov_data_count - 1);
-	}
-	/*
-	 * Perform sendpage() for each page in the scatterlist
-	 */
-	while (data_len) {
-		u32 space = (sg->length - offset);
-		u32 sub_len = min_t(u32, data_len, space);
-send_pg:
-		tx_sent = conn->sock->ops->sendpage(conn->sock,
-					sg_page(sg), sg->offset + offset, sub_len, 0);
-		if (tx_sent != sub_len) {
-			if (tx_sent == -EAGAIN) {
-				pr_err("tcp_sendpage() returned"
-						" -EAGAIN\n");
-				goto send_pg;
-			}
-
-			pr_err("tcp_sendpage() failure: %d\n",
-					tx_sent);
-			return -1;
-		}
-
-		data_len -= sub_len;
-		offset = 0;
-		sg = sg_next(sg);
-	}
-
-send_padding:
-	if (cmd->padding) {
-		struct kvec *iov_p = &cmd->iov_data[iov_off++];
-
-		tx_sent = tx_data(conn, iov_p, 1, cmd->padding);
-		if (cmd->padding != tx_sent) {
-			if (tx_sent == -EAGAIN) {
-				pr_err("tx_data() returned -EAGAIN\n");
-				goto send_padding;
-			}
-			return -1;
-		}
-	}
-
-send_datacrc:
-	if (conn->conn_ops->DataDigest) {
-		struct kvec *iov_d = &cmd->iov_data[iov_off];
-
-		tx_sent = tx_data(conn, iov_d, 1, ISCSI_CRC_LEN);
-		if (ISCSI_CRC_LEN != tx_sent) {
-			if (tx_sent == -EAGAIN) {
-				pr_err("tx_data() returned -EAGAIN\n");
-				goto send_datacrc;
-			}
-			return -1;
-		}
-	}
-
-	return 0;
-}
-
-/*
- *      This function is used for mainly sending a ISCSI_TARG_LOGIN_RSP PDU
- *      back to the Initiator when an expection condition occurs with the
- *      errors set in status_class and status_detail.
- *
- *      Parameters:     iSCSI Connection, Status Class, Status Detail.
- *      Returns:        0 on success, -1 on error.
- */
-int iscsit_tx_login_rsp(struct iscsi_conn *conn, u8 status_class, u8 status_detail)
-{
-	struct iscsi_login_rsp *hdr;
-	struct iscsi_login *login = conn->conn_login;
-
-	login->login_failed = 1;
-	iscsit_collect_login_stats(conn, status_class, status_detail);
-
-	memset(&login->rsp[0], 0, ISCSI_HDR_LEN);
-
-	hdr	= (struct iscsi_login_rsp *)&login->rsp[0];
-	hdr->opcode		= ISCSI_OP_LOGIN_RSP;
-	hdr->status_class	= status_class;
-	hdr->status_detail	= status_detail;
-	hdr->itt		= conn->login_itt;
-
-	return conn->conn_transport->iscsit_put_login_tx(conn, login, 0);
-}
-
-void iscsit_print_session_params(struct iscsi_session *sess)
-{
-	struct iscsi_conn *conn;
-
-	pr_debug("-----------------------------[Session Params for"
-		" SID: %u]-----------------------------\n", sess->sid);
-	spin_lock_bh(&sess->conn_lock);
-	list_for_each_entry(conn, &sess->sess_conn_list, conn_list)
-		iscsi_dump_conn_ops(conn->conn_ops);
-	spin_unlock_bh(&sess->conn_lock);
-
-	iscsi_dump_sess_ops(sess->sess_ops);
-}
-
-static int iscsit_do_rx_data(
-	struct iscsi_conn *conn,
-	struct iscsi_data_count *count)
-{
-	int data = count->data_length, rx_loop = 0, total_rx = 0;
-	struct msghdr msg;
-
-	if (!conn || !conn->sock || !conn->conn_ops)
-		return -1;
-
-	memset(&msg, 0, sizeof(struct msghdr));
-	iov_iter_kvec(&msg.msg_iter, READ | ITER_KVEC,
-		      count->iov, count->iov_count, data);
-
-	while (total_rx < data) {
-		rx_loop = sock_recvmsg(conn->sock, &msg,
-				      (data - total_rx), MSG_WAITALL);
-		if (rx_loop <= 0) {
-			pr_debug("rx_loop: %d total_rx: %d\n",
-				rx_loop, total_rx);
-			return rx_loop;
-		}
-		total_rx += rx_loop;
-		pr_debug("rx_loop: %d, total_rx: %d, data: %d\n",
-				rx_loop, total_rx, data);
-	}
-
-	return total_rx;
-}
-
-static int iscsit_do_tx_data(
-	struct iscsi_conn *conn,
-	struct iscsi_data_count *count)
-{
-	int ret, iov_len;
-	struct kvec *iov_p;
-	struct msghdr msg;
-
-	if (!conn || !conn->sock || !conn->conn_ops)
-		return -1;
-
-	if (count->data_length <= 0) {
-		pr_err("Data length is: %d\n", count->data_length);
-		return -1;
-	}
-
-	memset(&msg, 0, sizeof(struct msghdr));
-
-	iov_p = count->iov;
-	iov_len = count->iov_count;
-
-	ret = kernel_sendmsg(conn->sock, &msg, iov_p, iov_len,
-			     count->data_length);
-	if (ret != count->data_length) {
-		pr_err("Unexpected ret: %d send data %d\n",
-		       ret, count->data_length);
-		return -EPIPE;
-	}
-	pr_debug("ret: %d, sent data: %d\n", ret, count->data_length);
-
-	return ret;
-}
-
-int rx_data(
-	struct iscsi_conn *conn,
-	struct kvec *iov,
-	int iov_count,
-	int data)
-{
-	struct iscsi_data_count c;
-
-	if (!conn || !conn->sock || !conn->conn_ops)
-		return -1;
-
-	memset(&c, 0, sizeof(struct iscsi_data_count));
-	c.iov = iov;
-	c.iov_count = iov_count;
-	c.data_length = data;
-	c.type = ISCSI_RX_DATA;
-
-	return iscsit_do_rx_data(conn, &c);
-}
-
-int tx_data(
-	struct iscsi_conn *conn,
-	struct kvec *iov,
-	int iov_count,
-	int data)
-{
-	struct iscsi_data_count c;
-
-	if (!conn || !conn->sock || !conn->conn_ops)
-		return -1;
-
-	memset(&c, 0, sizeof(struct iscsi_data_count));
-	c.iov = iov;
-	c.iov_count = iov_count;
-	c.data_length = data;
-	c.type = ISCSI_TX_DATA;
-
-	return iscsit_do_tx_data(conn, &c);
-}
-
-static bool sockaddr_equal(struct sockaddr_storage *x, struct sockaddr_storage *y)
-{
-	switch (x->ss_family) {
-	case AF_INET: {
-		struct sockaddr_in *sinx = (struct sockaddr_in *)x;
-		struct sockaddr_in *siny = (struct sockaddr_in *)y;
-		if (sinx->sin_addr.s_addr != siny->sin_addr.s_addr)
-			return false;
-		if (sinx->sin_port != siny->sin_port)
-			return false;
-		break;
-	}
-	case AF_INET6: {
-		struct sockaddr_in6 *sinx = (struct sockaddr_in6 *)x;
-		struct sockaddr_in6 *siny = (struct sockaddr_in6 *)y;
-		if (!ipv6_addr_equal(&sinx->sin6_addr, &siny->sin6_addr))
-			return false;
-		if (sinx->sin6_port != siny->sin6_port)
-			return false;
-		break;
-	}
-	default:
-		return false;
-	}
-	return true;
-}
-
-void iscsit_collect_login_stats(
-	struct iscsi_conn *conn,
-	u8 status_class,
-	u8 status_detail)
-{
-	struct iscsi_param *intrname = NULL;
-	struct iscsi_tiqn *tiqn;
-	struct iscsi_login_stats *ls;
-
-	tiqn = iscsit_snmp_get_tiqn(conn);
-	if (!tiqn)
-		return;
-
-	ls = &tiqn->login_stats;
-
-	spin_lock(&ls->lock);
-	if (sockaddr_equal(&conn->login_sockaddr, &ls->last_intr_fail_sockaddr) &&
-	    ((get_jiffies_64() - ls->last_fail_time) < 10)) {
-		/* We already have the failure info for this login */
-		spin_unlock(&ls->lock);
-		return;
-	}
-
-	if (status_class == ISCSI_STATUS_CLS_SUCCESS)
-		ls->accepts++;
-	else if (status_class == ISCSI_STATUS_CLS_REDIRECT) {
-		ls->redirects++;
-		ls->last_fail_type = ISCSI_LOGIN_FAIL_REDIRECT;
-	} else if ((status_class == ISCSI_STATUS_CLS_INITIATOR_ERR)  &&
-		 (status_detail == ISCSI_LOGIN_STATUS_AUTH_FAILED)) {
-		ls->authenticate_fails++;
-		ls->last_fail_type =  ISCSI_LOGIN_FAIL_AUTHENTICATE;
-	} else if ((status_class == ISCSI_STATUS_CLS_INITIATOR_ERR)  &&
-		 (status_detail == ISCSI_LOGIN_STATUS_TGT_FORBIDDEN)) {
-		ls->authorize_fails++;
-		ls->last_fail_type = ISCSI_LOGIN_FAIL_AUTHORIZE;
-	} else if ((status_class == ISCSI_STATUS_CLS_INITIATOR_ERR) &&
-		 (status_detail == ISCSI_LOGIN_STATUS_INIT_ERR)) {
-		ls->negotiate_fails++;
-		ls->last_fail_type = ISCSI_LOGIN_FAIL_NEGOTIATE;
-	} else {
-		ls->other_fails++;
-		ls->last_fail_type = ISCSI_LOGIN_FAIL_OTHER;
-	}
-
-	/* Save initiator name, ip address and time, if it is a failed login */
-	if (status_class != ISCSI_STATUS_CLS_SUCCESS) {
-		if (conn->param_list)
-			intrname = iscsi_find_param_from_key(INITIATORNAME,
-							     conn->param_list);
-		strlcpy(ls->last_intr_fail_name,
-		       (intrname ? intrname->value : "Unknown"),
-		       sizeof(ls->last_intr_fail_name));
-
-		ls->last_intr_fail_ip_family = conn->login_family;
-
-		ls->last_intr_fail_sockaddr = conn->login_sockaddr;
-		ls->last_fail_time = get_jiffies_64();
-	}
-
-	spin_unlock(&ls->lock);
-}
-
-struct iscsi_tiqn *iscsit_snmp_get_tiqn(struct iscsi_conn *conn)
-{
-	struct iscsi_portal_group *tpg;
-
-	if (!conn || !conn->sess)
-		return NULL;
-
-	tpg = conn->sess->tpg;
-	if (!tpg)
-		return NULL;
-
-	if (!tpg->tpg_tiqn)
-		return NULL;
-
-	return tpg->tpg_tiqn;
-}
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE 

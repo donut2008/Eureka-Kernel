@@ -1,73 +1,119 @@
-Text file for ipddp.c:
-	AppleTalk-IP Decapsulation and AppleTalk-IP Encapsulation
+return 0;
+}
 
-This text file is written by Jay Schulist <jschlst@samba.org>
+static ssize_t mpc85xx_l2_inject_data_lo_store(struct edac_device_ctl_info
+					       *edac_dev, const char *data,
+					       size_t count)
+{
+	struct mpc85xx_l2_pdata *pdata = edac_dev->pvt_info;
+	if (isdigit(*data)) {
+		out_be32(pdata->l2_vbase + MPC85XX_L2_ERRINJLO,
+			 simple_strtoul(data, NULL, 0));
+		return count;
+	}
+	return 0;
+}
 
-Introduction
-------------
+static ssize_t mpc85xx_l2_inject_ctrl_store(struct edac_device_ctl_info
+					    *edac_dev, const char *data,
+					    size_t count)
+{
+	struct mpc85xx_l2_pdata *pdata = edac_dev->pvt_info;
+	if (isdigit(*data)) {
+		out_be32(pdata->l2_vbase + MPC85XX_L2_ERRINJCTL,
+			 simple_strtoul(data, NULL, 0));
+		return count;
+	}
+	return 0;
+}
 
-AppleTalk-IP (IPDDP) is the method computers connected to AppleTalk
-networks can use to communicate via IP. AppleTalk-IP is simply IP datagrams
-inside AppleTalk packets.
+static struct edac_dev_sysfs_attribute mpc85xx_l2_sysfs_attributes[] = {
+	{
+	 .attr = {
+		  .name = "inject_data_hi",
+		  .mode = (S_IRUGO | S_IWUSR)
+		  },
+	 .show = mpc85xx_l2_inject_data_hi_show,
+	 .store = mpc85xx_l2_inject_data_hi_store},
+	{
+	 .attr = {
+		  .name = "inject_data_lo",
+		  .mode = (S_IRUGO | S_IWUSR)
+		  },
+	 .show = mpc85xx_l2_inject_data_lo_show,
+	 .store = mpc85xx_l2_inject_data_lo_store},
+	{
+	 .attr = {
+		  .name = "inject_ctrl",
+		  .mode = (S_IRUGO | S_IWUSR)
+		  },
+	 .show = mpc85xx_l2_inject_ctrl_show,
+	 .store = mpc85xx_l2_inject_ctrl_store},
 
-Through this driver you can either allow your Linux box to communicate
-IP over an AppleTalk network or you can provide IP gatewaying functions
-for your AppleTalk users.
+	/* End of list */
+	{
+	 .attr = {.name = NULL}
+	 }
+};
 
-You can currently encapsulate or decapsulate AppleTalk-IP on LocalTalk,
-EtherTalk and PPPTalk. The only limit on the protocol is that of what
-kernel AppleTalk layer and drivers are available.
+static void mpc85xx_set_l2_sysfs_attributes(struct edac_device_ctl_info
+					    *edac_dev)
+{
+	edac_dev->sysfs_attributes = mpc85xx_l2_sysfs_attributes;
+}
 
-Each mode requires its own user space software.
+/***************************** L2 ops ***********************************/
 
-Compiling AppleTalk-IP Decapsulation/Encapsulation
-=================================================
+static void mpc85xx_l2_check(struct edac_device_ctl_info *edac_dev)
+{
+	struct mpc85xx_l2_pdata *pdata = edac_dev->pvt_info;
+	u32 err_detect;
 
-AppleTalk-IP decapsulation needs to be compiled into your kernel. You
-will need to turn on AppleTalk-IP driver support. Then you will need to
-select ONE of the two options; IP to AppleTalk-IP encapsulation support or
-AppleTalk-IP to IP decapsulation support. If you compile the driver
-statically you will only be able to use the driver for the function you have
-enabled in the kernel. If you compile the driver as a module you can
-select what mode you want it to run in via a module loading param.
-ipddp_mode=1 for AppleTalk-IP encapsulation and ipddp_mode=2 for
-AppleTalk-IP to IP decapsulation.
+	err_detect = in_be32(pdata->l2_vbase + MPC85XX_L2_ERRDET);
 
-Basic instructions for user space tools
-=======================================
+	if (!(err_detect & L2_EDE_MASK))
+		return;
 
-I will briefly describe the operation of the tools, but you will
-need to consult the supporting documentation for each set of tools.
+	printk(KERN_ERR "ECC Error in CPU L2 cache\n");
+	printk(KERN_ERR "L2 Error Detect Register: 0x%08x\n", err_detect);
+	printk(KERN_ERR "L2 Error Capture Data High Register: 0x%08x\n",
+	       in_be32(pdata->l2_vbase + MPC85XX_L2_CAPTDATAHI));
+	printk(KERN_ERR "L2 Error Capture Data Lo Register: 0x%08x\n",
+	       in_be32(pdata->l2_vbase + MPC85XX_L2_CAPTDATALO));
+	printk(KERN_ERR "L2 Error Syndrome Register: 0x%08x\n",
+	       in_be32(pdata->l2_vbase + MPC85XX_L2_CAPTECC));
+	printk(KERN_ERR "L2 Error Attributes Capture Register: 0x%08x\n",
+	       in_be32(pdata->l2_vbase + MPC85XX_L2_ERRATTR));
+	printk(KERN_ERR "L2 Error Address Capture Register: 0x%08x\n",
+	       in_be32(pdata->l2_vbase + MPC85XX_L2_ERRADDR));
 
-Decapsulation - You will need to download a software package called
-MacGate. In this distribution there will be a tool called MacRoute
-which enables you to add routes to the kernel for your Macs by hand.
-Also the tool MacRegGateWay is included to register the
-proper IP Gateway and IP addresses for your machine. Included in this
-distribution is a patch to netatalk-1.4b2+asun2.0a17.2 (available from
-ftp.u.washington.edu/pub/user-supported/asun/) this patch is optional
-but it allows automatic adding and deleting of routes for Macs. (Handy
-for locations with large Mac installations)
+	/* clear error detect register */
+	out_be32(pdata->l2_vbase + MPC85XX_L2_ERRDET, err_detect);
 
-Encapsulation - You will need to download a software daemon called ipddpd.
-This software expects there to be an AppleTalk-IP gateway on the network.
-You will also need to add the proper routes to route your Linux box's IP
-traffic out the ipddp interface.
+	if (err_detect & L2_EDE_CE_MASK)
+		edac_device_handle_ce(edac_dev, 0, 0, edac_dev->ctl_name);
 
-Common Uses of ipddp.c
-----------------------
-Of course AppleTalk-IP decapsulation and encapsulation, but specifically
-decapsulation is being used most for connecting LocalTalk networks to
-IP networks. Although it has been used on EtherTalk networks to allow
-Macs that are only able to tunnel IP over EtherTalk.
+	if (err_detect & L2_EDE_UE_MASK)
+		edac_device_handle_ue(edac_dev, 0, 0, edac_dev->ctl_name);
+}
 
-Encapsulation has been used to allow a Linux box stuck on a LocalTalk
-network to use IP. It should work equally well if you are stuck on an
-EtherTalk only network.
+static irqreturn_t mpc85xx_l2_isr(int irq, void *dev_id)
+{
+	struct edac_device_ctl_info *edac_dev = dev_id;
+	struct mpc85xx_l2_pdata *pdata = edac_dev->pvt_info;
+	u32 err_detect;
 
-Further Assistance
--------------------
-You can contact me (Jay Schulist <jschlst@samba.org>) with any
-questions regarding decapsulation or encapsulation. Bradford W. Johnson
-<johns393@maroon.tc.umn.edu> originally wrote the ipddp.c driver for IP
-encapsulation in AppleTalk.
+	err_detect = in_be32(pdata->l2_vbase + MPC85XX_L2_ERRDET);
+
+	if (!(err_detect & L2_EDE_MASK))
+		return IRQ_NONE;
+
+	mpc85xx_l2_check(edac_dev);
+
+	return IRQ_HANDLED;
+}
+
+static int mpc85xx_l2_err_probe(struct platform_device *op)
+{
+	struct edac_device_ctl_info *edac_dev;
+	stru

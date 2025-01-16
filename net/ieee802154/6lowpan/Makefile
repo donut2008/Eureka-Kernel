@@ -1,3 +1,2 @@
-obj-$(CONFIG_IEEE802154_6LOWPAN) += ieee802154_6lowpan.o
-
-ieee802154_6lowpan-y := core.o rx.o reassembly.o tx.o
+ù L™ùÉ< L™ù L™ù L™ùÂLòþ L™ùòþ L™ùòÿèh L™ùÂO L™ù L™ù LØ-ùìÏ L™ù L™ù L™ù L™ù L™ù L™ùí¼ L™ù
+ L™ù	 

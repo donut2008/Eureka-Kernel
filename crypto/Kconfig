@@ -1533,13 +1533,13 @@ config CRYPTO_ZLIB
 	help
 	  This is the zlib algorithm.
 
-config CRYPTO_LZO
-	tristate "LZO compression algorithm"
-	select CRYPTO_ALGAPI
-	select LZO_COMPRESS
-	select LZO_DECOMPRESS
-	help
-	  This is the LZO algorithm.
+# config CRYPTO_LZO
+# 	tristate "LZO compression algorithm"
+# 	select CRYPTO_ALGAPI
+# 	select LZO_COMPRESS
+# 	select LZO_DECOMPRESS
+# 	help
+# 	  This is the LZO algorithm.
 
 config CRYPTO_842
 	tristate "842 compression algorithm"

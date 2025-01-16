@@ -1,103 +1,65 @@
-/* Driver for USB Mass Storage compliant devices
- * Transport Functions Header File
- *
- * Current development and maintenance by:
- *   (c) 1999, 2000 Matthew Dharm (mdharm-usb@one-eyed-alien.net)
- *
- * This driver is based on the 'USB Mass Storage Class' document. This
- * describes in detail the protocol used to communicate with such
- * devices.  Clearly, the designers had SCSI and ATAPI commands in
- * mind when they created this document.  The commands are all very
- * similar to commands in the SCSI-II and ATAPI specifications.
- *
- * It is important to note that in a number of cases this class
- * exhibits class-specific exemptions from the USB specification.
- * Notably the usage of NAK, STALL and ACK differs from the norm, in
- * that they are used to communicate wait, failed and OK on commands.
- *
- * Also, for certain devices, the interrupt endpoint is used to convey
- * status of a command.
- *
- * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
- * information about this driver.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#ifndef _TRANSPORT_H_
-#define _TRANSPORT_H_
-
-#include <linux/blkdev.h>
-
-/*
- * usb_stor_bulk_transfer_xxx() return codes, in order of severity
- */
-
-#define USB_STOR_XFER_GOOD	0	/* good transfer                 */
-#define USB_STOR_XFER_SHORT	1	/* transferred less than expected */
-#define USB_STOR_XFER_STALLED	2	/* endpoint stalled              */
-#define USB_STOR_XFER_LONG	3	/* device tried to send too much */
-#define USB_STOR_XFER_ERROR	4	/* transfer died in the middle   */
-
-/*
- * Transport return codes
- */
-
-#define USB_STOR_TRANSPORT_GOOD	   0   /* Transport good, command good	   */
-#define USB_STOR_TRANSPORT_FAILED  1   /* Transport good, command failed   */
-#define USB_STOR_TRANSPORT_NO_SENSE 2  /* Command failed, no auto-sense    */
-#define USB_STOR_TRANSPORT_ERROR   3   /* Transport bad (i.e. device dead) */
-
-/*
- * We used to have USB_STOR_XFER_ABORTED and USB_STOR_TRANSPORT_ABORTED
- * return codes.  But now the transport and low-level transfer routines
- * treat an abort as just another error (-ENOENT for a cancelled URB).
- * It is up to the invoke_transport() function to test for aborts and
- * distinguish them from genuine communication errors.
- */
-
-/*
- * CBI accept device specific command
- */
-
-#define US_CBI_ADSC		0
-
-extern int usb_stor_CB_transport(struct scsi_cmnd *, struct us_data*);
-extern int usb_stor_CB_reset(struct us_data*);
-
-extern int usb_stor_Bulk_transport(struct scsi_cmnd *, struct us_data*);
-extern int usb_stor_Bulk_max_lun(struct us_data*);
-extern int usb_stor_Bulk_reset(struct us_data*);
-
-extern void usb_stor_invoke_transport(struct scsi_cmnd *, struct us_data*);
-extern void usb_stor_stop_transport(struct us_data*);
-
-extern int usb_stor_control_msg(struct us_data *us, unsigned int pipe,
-		u8 request, u8 requesttype, u16 value, u16 index,
-		void *data, u16 size, int timeout);
-extern int usb_stor_clear_halt(struct us_data *us, unsigned int pipe);
-
-extern int usb_stor_ctrl_transfer(struct us_data *us, unsigned int pipe,
-		u8 request, u8 requesttype, u16 value, u16 index,
-		void *data, u16 size);
-extern int usb_stor_bulk_transfer_buf(struct us_data *us, unsigned int pipe,
-		void *buf, unsigned int length, unsigned int *act_len);
-extern int usb_stor_bulk_transfer_sg(struct us_data *us, unsigned int pipe,
-		void *buf, unsigned int length, int use_sg, int *residual);
-extern int usb_stor_bulk_srb(struct us_data* us, unsigned int pipe,
-		struct scsi_cmnd* srb);
-
-extern int usb_stor_port_reset(struct us_data *us);
-#endif
+ine PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_ACS_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_ACS_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_ACS_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_ACS_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_ACS_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_ACS_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_ACS_CAP__SOURCE_VALIDATION_MASK 0x1
+#define PCIE_ACS_CAP__SOURCE_VALIDATION__SHIFT 0x0
+#define PCIE_ACS_CAP__TRANSLATION_BLOCKING_MASK 0x2
+#define PCIE_ACS_CAP__TRANSLATION_BLOCKING__SHIFT 0x1
+#define PCIE_ACS_CAP__P2P_REQUEST_REDIRECT_MASK 0x4
+#define PCIE_ACS_CAP__P2P_REQUEST_REDIRECT__SHIFT 0x2
+#define PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT_MASK 0x8
+#define PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT__SHIFT 0x3
+#define PCIE_ACS_CAP__UPSTREAM_FORWARDING_MASK 0x10
+#define PCIE_ACS_CAP__UPSTREAM_FORWARDING__SHIFT 0x4
+#define PCIE_ACS_CAP__P2P_EGRESS_CONTROL_MASK 0x20
+#define PCIE_ACS_CAP__P2P_EGRESS_CONTROL__SHIFT 0x5
+#define PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P_MASK 0x40
+#define PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P__SHIFT 0x6
+#define PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE_MASK 0xff00
+#define PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE__SHIFT 0x8
+#define PCIE_ACS_CNTL__SOURCE_VALIDATION_EN_MASK 0x1
+#define PCIE_ACS_CNTL__SOURCE_VALIDATION_EN__SHIFT 0x0
+#define PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN_MASK 0x2
+#define PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN__SHIFT 0x1
+#define PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN_MASK 0x4
+#define PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN__SHIFT 0x2
+#de

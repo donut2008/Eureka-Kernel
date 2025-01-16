@@ -1,1011 +1,866 @@
-/*
- * drivers/usb/input/yealink.c
- *
- * Copyright (c) 2005 Henk Vergonet <Henk.Vergonet@gmail.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation; either version 2 of
- * the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- */
-/*
- * Description:
- *   Driver for the USB-P1K voip usb phone.
- *   This device is produced by Yealink Network Technology Co Ltd
- *   but may be branded under several names:
- *	- Yealink usb-p1k
- *	- Tiptel 115
- *	- ...
- *
- * This driver is based on:
- *   - the usbb2k-api	http://savannah.nongnu.org/projects/usbb2k-api/
- *   - information from	http://memeteau.free.fr/usbb2k
- *   - the xpad-driver	drivers/input/joystick/xpad.c
- *
- * Thanks to:
- *   - Olivier Vandorpe, for providing the usbb2k-api.
- *   - Martin Diehl, for spotting my memory allocation bug.
- *
- * History:
- *   20050527 henk	First version, functional keyboard. Keyboard events
- *			will pop-up on the ../input/eventX bus.
- *   20050531 henk	Added led, LCD, dialtone and sysfs interface.
- *   20050610 henk	Cleanups, make it ready for public consumption.
- *   20050630 henk	Cleanups, fixes in response to comments.
- *   20050701 henk	sysfs write serialisation, fix potential unload races
- *   20050801 henk	Added ringtone, restructure USB
- *   20050816 henk	Merge 2.6.13-rc6
- */
+ &client->dev, "%s : detach\n",__func__);
+		// if sar_mode is on => must send wake-up command
+		if (tkey_data->sar_mode)
+			ret = tc300k_wake_up(client, TC300K_CMD_WAKE_UP);
 
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/rwsem.h>
-#include <linux/usb/input.h>
-#include <linux/map_to_7segment.h>
-
-#include "yealink.h"
-
-#define DRIVER_VERSION "yld-20051230"
-#define DRIVER_AUTHOR "Henk Vergonet"
-#define DRIVER_DESC "Yealink phone driver"
-
-#define YEALINK_POLLING_FREQUENCY	10	/* in [Hz] */
-
-struct yld_status {
-	u8	lcd[24];
-	u8	led;
-	u8	dialtone;
-	u8	ringtone;
-	u8	keynum;
-} __attribute__ ((packed));
-
-/*
- * Register the LCD segment and icon map
- */
-#define _LOC(k,l)	{ .a = (k), .m = (l) }
-#define _SEG(t, a, am, b, bm, c, cm, d, dm, e, em, f, fm, g, gm)	\
-	{ .type	= (t),							\
-	  .u = { .s = {	_LOC(a, am), _LOC(b, bm), _LOC(c, cm),		\
-		        _LOC(d, dm), _LOC(e, em), _LOC(g, gm),		\
-			_LOC(f, fm) } } }
-#define _PIC(t, h, hm, n)						\
-	{ .type	= (t),							\
- 	  .u = { .p = { .name = (n), .a = (h), .m = (hm) } } }
-
-static const struct lcd_segment_map {
-	char	type;
-	union {
-		struct pictogram_map {
-			u8	a,m;
-			char	name[10];
-		}	p;
-		struct segment_map {
-			u8	a,m;
-		} s[7];
-	} u;
-} lcdMap[] = {
-#include "yealink.h"
-};
-
-struct yealink_dev {
-	struct input_dev *idev;		/* input device */
-	struct usb_device *udev;	/* usb device */
-	struct usb_interface *intf;	/* usb interface */
-
-	/* irq input channel */
-	struct yld_ctl_packet	*irq_data;
-	dma_addr_t		irq_dma;
-	struct urb		*urb_irq;
-
-	/* control output channel */
-	struct yld_ctl_packet	*ctl_data;
-	dma_addr_t		ctl_dma;
-	struct usb_ctrlrequest	*ctl_req;
-	struct urb		*urb_ctl;
-
-	char phys[64];			/* physical device path */
-
-	u8 lcdMap[ARRAY_SIZE(lcdMap)];	/* state of LCD, LED ... */
-	int key_code;			/* last reported key	 */
-
-	unsigned int shutdown:1;
-
-	int	stat_ix;
-	union {
-		struct yld_status s;
-		u8		  b[sizeof(struct yld_status)];
-	} master, copy;
-};
-
-
-/*******************************************************************************
- * Yealink lcd interface
- ******************************************************************************/
-
-/*
- * Register a default 7 segment character set
- */
-static SEG7_DEFAULT_MAP(map_seg7);
-
- /* Display a char,
-  * char '\9' and '\n' are placeholders and do not overwrite the original text.
-  * A space will always hide an icon.
-  */
-static int setChar(struct yealink_dev *yld, int el, int chr)
-{
-	int i, a, m, val;
-
-	if (el >= ARRAY_SIZE(lcdMap))
-		return -EINVAL;
-
-	if (chr == '\t' || chr == '\n')
-	    return 0;
-
-	yld->lcdMap[el] = chr;
-
-	if (lcdMap[el].type == '.') {
-		a = lcdMap[el].u.p.a;
-		m = lcdMap[el].u.p.m;
-		if (chr != ' ')
-			yld->master.b[a] |= m;
-		else
-			yld->master.b[a] &= ~m;
-		return 0;
-	}
-
-	val = map_to_seg7(&map_seg7, chr);
-	for (i = 0; i < ARRAY_SIZE(lcdMap[0].u.s); i++) {
-		m = lcdMap[el].u.s[i].m;
-
-		if (m == 0)
-			continue;
-
-		a = lcdMap[el].u.s[i].a;
-		if (val & 1)
-			yld->master.b[a] |= m;
-		else
-			yld->master.b[a] &= ~m;
-		val = val >> 1;
-	}
-	return 0;
-};
-
-/*******************************************************************************
- * Yealink key interface
- ******************************************************************************/
-
-/* Map device buttons to internal key events.
- *
- * USB-P1K button layout:
- *
- *             up
- *       IN           OUT
- *            down
- *
- *     pickup   C    hangup
- *       1      2      3
- *       4      5      6
- *       7      8      9
- *       *      0      #
- *
- * The "up" and "down" keys, are symbolised by arrows on the button.
- * The "pickup" and "hangup" keys are symbolised by a green and red phone
- * on the button.
- */
-static int map_p1k_to_key(int scancode)
-{
-	switch(scancode) {		/* phone key:	*/
-	case 0x23: return KEY_LEFT;	/*   IN		*/
-	case 0x33: return KEY_UP;	/*   up		*/
-	case 0x04: return KEY_RIGHT;	/*   OUT	*/
-	case 0x24: return KEY_DOWN;	/*   down	*/
-	case 0x03: return KEY_ENTER;	/*   pickup	*/
-	case 0x14: return KEY_BACKSPACE; /*  C		*/
-	case 0x13: return KEY_ESC;	/*   hangup	*/
-	case 0x00: return KEY_1;	/*   1		*/
-	case 0x01: return KEY_2;	/*   2 		*/
-	case 0x02: return KEY_3;	/*   3		*/
-	case 0x10: return KEY_4;	/*   4		*/
-	case 0x11: return KEY_5;	/*   5		*/
-	case 0x12: return KEY_6;	/*   6		*/
-	case 0x20: return KEY_7;	/*   7		*/
-	case 0x21: return KEY_8;	/*   8		*/
-	case 0x22: return KEY_9;	/*   9		*/
-	case 0x30: return KEY_KPASTERISK; /* *		*/
-	case 0x31: return KEY_0;	/*   0		*/
-	case 0x32: return KEY_LEFTSHIFT |
-			  KEY_3 << 8;	/*   #		*/
-	}
-	return -EINVAL;
-}
-
-/* Completes a request by converting the data into events for the
- * input subsystem.
- *
- * The key parameter can be cascaded: key2 << 8 | key1
- */
-static void report_key(struct yealink_dev *yld, int key)
-{
-	struct input_dev *idev = yld->idev;
-
-	if (yld->key_code >= 0) {
-		/* old key up */
-		input_report_key(idev, yld->key_code & 0xff, 0);
-		if (yld->key_code >> 8)
-			input_report_key(idev, yld->key_code >> 8, 0);
-	}
-
-	yld->key_code = key;
-	if (key >= 0) {
-		/* new valid key */
-		input_report_key(idev, key & 0xff, 1);
-		if (key >> 8)
-			input_report_key(idev, key >> 8, 1);
-	}
-	input_sync(idev);
-}
-
-/*******************************************************************************
- * Yealink usb communication interface
- ******************************************************************************/
-
-static int yealink_cmd(struct yealink_dev *yld, struct yld_ctl_packet *p)
-{
-	u8	*buf = (u8 *)p;
-	int	i;
-	u8	sum = 0;
-
-	for(i=0; i<USB_PKT_LEN-1; i++)
-		sum -= buf[i];
-	p->sum = sum;
-	return usb_control_msg(yld->udev,
-			usb_sndctrlpipe(yld->udev, 0),
-			USB_REQ_SET_CONFIGURATION,
-			USB_TYPE_CLASS | USB_RECIP_INTERFACE | USB_DIR_OUT,
-			0x200, 3,
-			p, sizeof(*p),
-			USB_CTRL_SET_TIMEOUT);
-}
-
-static u8 default_ringtone[] = {
-	0xEF,			/* volume [0-255] */
-	0xFB, 0x1E, 0x00, 0x0C,	/* 1250 [hz], 12/100 [s] */
-	0xFC, 0x18, 0x00, 0x0C,	/* 1000 [hz], 12/100 [s] */
-	0xFB, 0x1E, 0x00, 0x0C,
-	0xFC, 0x18, 0x00, 0x0C,
-	0xFB, 0x1E, 0x00, 0x0C,
-	0xFC, 0x18, 0x00, 0x0C,
-	0xFB, 0x1E, 0x00, 0x0C,
-	0xFC, 0x18, 0x00, 0x0C,
-	0xFF, 0xFF, 0x01, 0x90,	/* silent, 400/100 [s] */
-	0x00, 0x00		/* end of sequence */
-};
-
-static int yealink_set_ringtone(struct yealink_dev *yld, u8 *buf, size_t size)
-{
-	struct yld_ctl_packet *p = yld->ctl_data;
-	int	ix, len;
-
-	if (size <= 0)
-		return -EINVAL;
-
-	/* Set the ringtone volume */
-	memset(yld->ctl_data, 0, sizeof(*(yld->ctl_data)));
-	yld->ctl_data->cmd	= CMD_RING_VOLUME;
-	yld->ctl_data->size	= 1;
-	yld->ctl_data->data[0]	= buf[0];
-	yealink_cmd(yld, p);
-
-	buf++;
-	size--;
-
-	p->cmd = CMD_RING_NOTE;
-	ix = 0;
-	while (size != ix) {
-		len = size - ix;
-		if (len > sizeof(p->data))
-			len = sizeof(p->data);
-		p->size	  = len;
-		p->offset = cpu_to_be16(ix);
-		memcpy(p->data, &buf[ix], len);
-		yealink_cmd(yld, p);
-		ix += len;
-	}
-	return 0;
-}
-
-/* keep stat_master & stat_copy in sync.
- */
-static int yealink_do_idle_tasks(struct yealink_dev *yld)
-{
-	u8 val;
-	int i, ix, len;
-
-	ix = yld->stat_ix;
-
-	memset(yld->ctl_data, 0, sizeof(*(yld->ctl_data)));
-	yld->ctl_data->cmd  = CMD_KEYPRESS;
-	yld->ctl_data->size = 1;
-	yld->ctl_data->sum  = 0xff - CMD_KEYPRESS;
-
-	/* If state update pointer wraps do a KEYPRESS first. */
-	if (ix >= sizeof(yld->master)) {
-		yld->stat_ix = 0;
-		return 0;
-	}
-
-	/* find update candidates: copy != master */
-	do {
-		val = yld->master.b[ix];
-		if (val != yld->copy.b[ix])
-			goto send_update;
-	} while (++ix < sizeof(yld->master));
-
-	/* nothing todo, wait a bit and poll for a KEYPRESS */
-	yld->stat_ix = 0;
-	/* TODO how can we wait abit. ??
-	 * msleep_interruptible(1000 / YEALINK_POLLING_FREQUENCY);
-	 */
-	return 0;
-
-send_update:
-
-	/* Setup an appropriate update request */
-	yld->copy.b[ix] = val;
-	yld->ctl_data->data[0] = val;
-
-	switch(ix) {
-	case offsetof(struct yld_status, led):
-		yld->ctl_data->cmd	= CMD_LED;
-		yld->ctl_data->sum	= -1 - CMD_LED - val;
-		break;
-	case offsetof(struct yld_status, dialtone):
-		yld->ctl_data->cmd	= CMD_DIALTONE;
-		yld->ctl_data->sum	= -1 - CMD_DIALTONE - val;
-		break;
-	case offsetof(struct yld_status, ringtone):
-		yld->ctl_data->cmd	= CMD_RINGTONE;
-		yld->ctl_data->sum	= -1 - CMD_RINGTONE - val;
-		break;
-	case offsetof(struct yld_status, keynum):
-		val--;
-		val &= 0x1f;
-		yld->ctl_data->cmd	= CMD_SCANCODE;
-		yld->ctl_data->offset	= cpu_to_be16(val);
-		yld->ctl_data->data[0]	= 0;
-		yld->ctl_data->sum	= -1 - CMD_SCANCODE - val;
+		ret = tc300k_mode_enable(client, TC300K_CMD_TA_OFF);
+		if (ret < 0)
+			input_err(true, &client->dev, "%s TA mode OFF fail(%d)\n", __func__, ret);
 		break;
 	default:
-		len = sizeof(yld->master.s.lcd) - ix;
-		if (len > sizeof(yld->ctl_data->data))
-			len = sizeof(yld->ctl_data->data);
+		break;
+	}
 
-		/* Combine up to <len> consecutive LCD bytes in a singe request
-		 */
-		yld->ctl_data->cmd	= CMD_LCD;
-		yld->ctl_data->offset	= cpu_to_be16(ix);
-		yld->ctl_data->size	= len;
-		yld->ctl_data->sum	= -CMD_LCD - ix - val - len;
-		for(i=1; i<len; i++) {
-			ix++;
-			val = yld->master.b[ix];
-			yld->copy.b[ix]		= val;
-			yld->ctl_data->data[i]	= val;
-			yld->ctl_data->sum     -= val;
+	return 0;
+}
+
+#endif
+
+static int tc300k_connecter_check(struct tc300k_data *data)
+{
+	struct i2c_client *client = data->client;
+
+	if (data->pdata->gpio_sub_det == 0) {
+		input_err(true, &client->dev, "%s: Not use sub_det pin\n", __func__);
+		return SUB_DET_DISABLE;
+
+	} else {
+		if (gpio_get_value(data->pdata->gpio_sub_det)) {
+			return SUB_DET_ENABLE_CON_OFF;
+		} else {
+			return SUB_DET_ENABLE_CON_ON;
+		}
+
+	}
+
+}
+static int tc300k_fw_check(struct tc300k_data *data)
+{
+	struct i2c_client *client = data->client;
+	int ret;
+	int tsk_connecter_status;
+
+	tsk_connecter_status = tc300k_connecter_check(data);
+
+	if (tsk_connecter_status == SUB_DET_ENABLE_CON_OFF) {
+		input_err(true, &client->dev, "%s : TSK IC is disconnected! skip probe(%d)\n",
+						__func__, gpio_get_value(data->pdata->gpio_sub_det));
+		return -1;
+	}
+
+	ret = tc300k_get_fw_version(data, true);
+
+	if (ret < 0) {
+		if ((tsk_connecter_status == SUB_DET_ENABLE_CON_ON)||(tsk_connecter_status == SUB_DET_DISABLE)) {
+			input_err(true, &client->dev, 
+				"%s: i2c fail, But TSK IC is connected!\n", __func__);
+			data->fw_ver = 0xFF;
+		} else {
+			input_err(true, &client->dev,
+				"%s: i2c fail...[%d], addr[%d]\n",
+				__func__, ret, data->client->addr);
+			input_err(true, &client->dev, 
+				"%s: touchkey driver unload\n", __func__);
+			return ret;
 		}
 	}
-	yld->stat_ix = ix + 1;
-	return 1;
-}
 
-/* Decide on how to handle responses
- *
- * The state transition diagram is somethhing like:
- *
- *          syncState<--+
- *               |      |
- *               |    idle
- *              \|/     |
- * init --ok--> waitForKey --ok--> getKey
- *  ^               ^                |
- *  |               +-------ok-------+
- * error,start
- *
- */
-static void urb_irq_callback(struct urb *urb)
-{
-	struct yealink_dev *yld = urb->context;
-	int ret, status = urb->status;
 
-	if (status)
-		dev_err(&yld->intf->dev, "%s - urb status %d\n",
-			__func__, status);
-
-	switch (yld->irq_data->cmd) {
-	case CMD_KEYPRESS:
-
-		yld->master.s.keynum = yld->irq_data->data[0];
-		break;
-
-	case CMD_SCANCODE:
-		dev_dbg(&yld->intf->dev, "get scancode %x\n",
-			yld->irq_data->data[0]);
-
-		report_key(yld, map_p1k_to_key(yld->irq_data->data[0]));
-		break;
-
-	default:
-		dev_err(&yld->intf->dev, "unexpected response %x\n",
-			yld->irq_data->cmd);
-	}
-
-	yealink_do_idle_tasks(yld);
-
-	if (!yld->shutdown) {
-		ret = usb_submit_urb(yld->urb_ctl, GFP_ATOMIC);
-		if (ret && ret != -EPERM)
-			dev_err(&yld->intf->dev,
-				"%s - usb_submit_urb failed %d\n",
-				__func__, ret);
-	}
-}
-
-static void urb_ctl_callback(struct urb *urb)
-{
-	struct yealink_dev *yld = urb->context;
-	int ret = 0, status = urb->status;
-
-	if (status)
-		dev_err(&yld->intf->dev, "%s - urb status %d\n",
-			__func__, status);
-
-	switch (yld->ctl_data->cmd) {
-	case CMD_KEYPRESS:
-	case CMD_SCANCODE:
-		/* ask for a response */
-		if (!yld->shutdown)
-			ret = usb_submit_urb(yld->urb_irq, GFP_ATOMIC);
-		break;
-	default:
-		/* send new command */
-		yealink_do_idle_tasks(yld);
-		if (!yld->shutdown)
-			ret = usb_submit_urb(yld->urb_ctl, GFP_ATOMIC);
-		break;
-	}
-
-	if (ret && ret != -EPERM)
-		dev_err(&yld->intf->dev, "%s - usb_submit_urb failed %d\n",
-			__func__, ret);
-}
-
-/*******************************************************************************
- * input event interface
- ******************************************************************************/
-
-/* TODO should we issue a ringtone on a SND_BELL event?
-static int input_ev(struct input_dev *dev, unsigned int type,
-		unsigned int code, int value)
-{
-
-	if (type != EV_SND)
-		return -EINVAL;
-
-	switch (code) {
-	case SND_BELL:
-	case SND_TONE:
-		break;
-	default:
-		return -EINVAL;
+	if (data->fw_ver == 0xFF) {
+		input_info(true, &client->dev,
+			"fw version 0xFF, Excute firmware update!\n");
+		ret = tc300k_fw_update(data, FW_INKERNEL, true);
+		if (ret)
+			return -1;
+	} else {
+		ret = tc300k_fw_update(data, FW_INKERNEL, false);
+		if (ret)
+			return -1;
 	}
 
 	return 0;
 }
-*/
 
-static int input_open(struct input_dev *dev)
+static int tc300_pinctrl_init(struct tc300k_data *data)
 {
-	struct yealink_dev *yld = input_get_drvdata(dev);
-	int i, ret;
+	struct device *dev = &data->client->dev;
+	int i;
+	input_info(true, &data->client->dev, "%s\n",__func__);
+	// IRQ
+	data->pinctrl_irq = devm_pinctrl_get(dev);
+	if (IS_ERR(data->pinctrl_irq)) {
+		input_dbg(true, &data->client->dev, "%s: Failed to get irq pinctrl\n", __func__);
+		data->pinctrl_irq = NULL;
+		goto i2c_pinctrl_get;
+	}
+	for (i = 0; i < 2; ++i) {
+		data->pin_state[i] = pinctrl_lookup_state(data->pinctrl_irq, str_states[i]);
+		if (IS_ERR(data->pin_state[i])) {
+			input_dbg(true, &data->client->dev, "%s: Failed to get irq pinctrl state\n", __func__);
+			devm_pinctrl_put(data->pinctrl_irq);
+			data->pinctrl_irq = NULL;
+			goto i2c_pinctrl_get;
+		}
+	}
 
-	dev_dbg(&yld->intf->dev, "%s\n", __func__);
+i2c_pinctrl_get:
+	/* for h/w i2c */
+	dev = data->client->dev.parent->parent;
+	input_info(true, &data->client->dev, "%s: use dev's parent\n", __func__);
 
-	/* force updates to device */
-	for (i = 0; i<sizeof(yld->master); i++)
-		yld->copy.b[i] = ~yld->master.b[i];
-	yld->key_code = -1;	/* no keys pressed */
+	// I2C
+	data->pinctrl_i2c = devm_pinctrl_get(dev);
+	if (IS_ERR(data->pinctrl_i2c)) {
+		input_err(true, &data->client->dev, "%s: Failed to get i2c pinctrl\n", __func__);
+		goto err_pinctrl_get_i2c;
+	}
+	for (i = 2; i < 4; ++i) {
+		data->pin_state[i] = pinctrl_lookup_state(data->pinctrl_i2c, str_states[i]);
+		if (IS_ERR(data->pin_state[i])) {
+			input_err(true, &data->client->dev, "%s: Failed to get i2c pinctrl state\n", __func__);
+			goto err_pinctrl_get_state_i2c;
+		}
+	}
+	return 0;
 
-        yealink_set_ringtone(yld, default_ringtone, sizeof(default_ringtone));
+err_pinctrl_get_state_i2c:
+	devm_pinctrl_put(data->pinctrl_i2c);
+err_pinctrl_get_i2c:
+	return -ENODEV;
+}
 
-	/* issue INIT */
-	memset(yld->ctl_data, 0, sizeof(*(yld->ctl_data)));
-	yld->ctl_data->cmd	= CMD_INIT;
-	yld->ctl_data->size	= 10;
-	yld->ctl_data->sum	= 0x100-CMD_INIT-10;
-	if ((ret = usb_submit_urb(yld->urb_ctl, GFP_KERNEL)) != 0) {
-		dev_dbg(&yld->intf->dev,
-			"%s - usb_submit_urb failed with result %d\n",
-			__func__, ret);
+static int tc300_pinctrl(struct tc300k_data *data, int state)
+{
+	struct pinctrl *pinctrl_i2c = data->pinctrl_i2c;
+	struct pinctrl *pinctrl_irq = data->pinctrl_irq;
+	int ret=0;
+
+	switch (state) {
+		case I_STATE_ON_IRQ:
+		case I_STATE_OFF_IRQ:
+			if (pinctrl_irq)
+				ret = pinctrl_select_state(pinctrl_irq, data->pin_state[state]);
+			break;
+		case I_STATE_ON_I2C:
+		case I_STATE_OFF_I2C:
+			if (pinctrl_i2c)
+				ret = pinctrl_select_state(pinctrl_i2c, data->pin_state[state]);
+			break;
+	}
+	if (ret < 0) {
+		input_err(true, &data->client->dev, 
+		"%s: Failed to configure tc300_pinctrl state[%d]\n", __func__, state);
 		return ret;
 	}
+
 	return 0;
 }
 
-static void input_close(struct input_dev *dev)
+static void tc300_config_gpio_i2c(struct tc300k_data *data, int onoff)
 {
-	struct yealink_dev *yld = input_get_drvdata(dev);
+	input_err(true, &data->client->dev, "%s\n",__func__);
 
-	yld->shutdown = 1;
-	/*
-	 * Make sure the flag is seen by other CPUs before we start
-	 * killing URBs so new URBs won't be submitted
-	 */
-	smp_wmb();
-
-	usb_kill_urb(yld->urb_ctl);
-	usb_kill_urb(yld->urb_irq);
-
-	yld->shutdown = 0;
-	smp_wmb();
+	tc300_pinctrl(data, onoff ? I_STATE_ON_I2C : I_STATE_OFF_I2C);
+	mdelay(100);
 }
 
-/*******************************************************************************
- * sysfs interface
- ******************************************************************************/
-
-static DECLARE_RWSEM(sysfs_rwsema);
-
-/* Interface to the 7-segments translation table aka. char set.
- */
-static ssize_t show_map(struct device *dev, struct device_attribute *attr,
-				char *buf)
+static int tc300k_probe(struct i2c_client *client,
+		const struct i2c_device_id *id)
 {
-	memcpy(buf, &map_seg7, sizeof(map_seg7));
-	return sizeof(map_seg7);
-}
+	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
+	struct tc300k_platform_data *pdata;
+	struct input_dev *input_dev;
+	struct tc300k_data *data;
+	int ret=0;
+	int i=0;
+	int err=0;
+	input_dbg(true, &client->dev, "%s\n",__func__);
 
-static ssize_t store_map(struct device *dev, struct device_attribute *attr,
-				const char *buf, size_t cnt)
-{
-	if (cnt != sizeof(map_seg7))
-		return -EINVAL;
-	memcpy(&map_seg7, buf, sizeof(map_seg7));
-	return sizeof(map_seg7);
-}
-
-/* Interface to the LCD.
- */
-
-/* Reading /sys/../lineX will return the format string with its settings:
- *
- * Example:
- * cat ./line3
- * 888888888888
- * Linux Rocks!
- */
-static ssize_t show_line(struct device *dev, char *buf, int a, int b)
-{
-	struct yealink_dev *yld;
-	int i;
-
-	down_read(&sysfs_rwsema);
-	yld = dev_get_drvdata(dev);
-	if (yld == NULL) {
-		up_read(&sysfs_rwsema);
+#ifdef CONFIG_BATTERY_SAMSUNG
+	if (lpcharge == 1) {
+		input_err(true, &client->dev, "%s : Do not load driver due to : lpm %d\n",
+			 __func__, lpcharge);
 		return -ENODEV;
 	}
+#endif
 
-	for (i = a; i < b; i++)
-		*buf++ = lcdMap[i].type;
-	*buf++ = '\n';
-	for (i = a; i < b; i++)
-		*buf++ = yld->lcdMap[i];
-	*buf++ = '\n';
-	*buf = 0;
-
-	up_read(&sysfs_rwsema);
-	return 3 + ((b - a) << 1);
-}
-
-static ssize_t show_line1(struct device *dev, struct device_attribute *attr,
-			char *buf)
-{
-	return show_line(dev, buf, LCD_LINE1_OFFSET, LCD_LINE2_OFFSET);
-}
-
-static ssize_t show_line2(struct device *dev, struct device_attribute *attr,
-			char *buf)
-{
-	return show_line(dev, buf, LCD_LINE2_OFFSET, LCD_LINE3_OFFSET);
-}
-
-static ssize_t show_line3(struct device *dev, struct device_attribute *attr,
-			char *buf)
-{
-	return show_line(dev, buf, LCD_LINE3_OFFSET, LCD_LINE4_OFFSET);
-}
-
-/* Writing to /sys/../lineX will set the coresponding LCD line.
- * - Excess characters are ignored.
- * - If less characters are written than allowed, the remaining digits are
- *   unchanged.
- * - The '\n' or '\t' char is a placeholder, it does not overwrite the
- *   original content.
- */
-static ssize_t store_line(struct device *dev, const char *buf, size_t count,
-		int el, size_t len)
-{
-	struct yealink_dev *yld;
-	int i;
-
-	down_write(&sysfs_rwsema);
-	yld = dev_get_drvdata(dev);
-	if (yld == NULL) {
-		up_write(&sysfs_rwsema);
-		return -ENODEV;
+	if (!i2c_check_functionality(adapter, I2C_FUNC_I2C)) {
+		input_err(true, &client->dev,
+			"i2c_check_functionality fail\n");
+		return -EIO;
 	}
 
-	if (len > count)
-		len = count;
-	for (i = 0; i < len; i++)
-		setChar(yld, el++, buf[i]);
+	if (client->dev.of_node) {
+		pdata = devm_kzalloc(&client->dev,
+			sizeof(struct tc300k_platform_data),
+				GFP_KERNEL);
+		if (!pdata) {
+			input_err(true, &client->dev, "Failed to allocate memory\n");
+			goto err_alloc_data;
+		}
 
-	up_write(&sysfs_rwsema);
-	return count;
-}
+		err = tc300k_parse_dt(&client->dev, pdata);
+		if (err)
+			goto err_alloc_data;
+	}else
+		pdata = client->dev.platform_data;
 
-static ssize_t store_line1(struct device *dev, struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	return store_line(dev, buf, count, LCD_LINE1_OFFSET, LCD_LINE1_SIZE);
-}
-
-static ssize_t store_line2(struct device *dev, struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	return store_line(dev, buf, count, LCD_LINE2_OFFSET, LCD_LINE2_SIZE);
-}
-
-static ssize_t store_line3(struct device *dev, struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	return store_line(dev, buf, count, LCD_LINE3_OFFSET, LCD_LINE3_SIZE);
-}
-
-/* Interface to visible and audible "icons", these include:
- * pictures on the LCD, the LED, and the dialtone signal.
- */
-
-/* Get a list of "switchable elements" with their current state. */
-static ssize_t get_icons(struct device *dev, struct device_attribute *attr,
-			char *buf)
-{
-	struct yealink_dev *yld;
-	int i, ret = 1;
-
-	down_read(&sysfs_rwsema);
-	yld = dev_get_drvdata(dev);
-	if (yld == NULL) {
-		up_read(&sysfs_rwsema);
-		return -ENODEV;
+	data = kzalloc(sizeof(struct tc300k_data), GFP_KERNEL);
+	if (!data) {
+		input_err(true, &client->dev, "Failed to allocate memory\n");
+		ret = -ENOMEM;
+		goto err_alloc_data;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(lcdMap); i++) {
-		if (lcdMap[i].type != '.')
-			continue;
-		ret += sprintf(&buf[ret], "%s %s\n",
-				yld->lcdMap[i] == ' ' ? "  " : "on",
-				lcdMap[i].u.p.name);
+	data->pdata = pdata;
+
+	input_dev = input_allocate_device();
+	if (!input_dev) {
+		input_err(true, &client->dev,
+			"Failed to allocate memory for input device\n");
+		ret = -ENOMEM;
+		goto err_alloc_input;
 	}
-	up_read(&sysfs_rwsema);
+
+	data->client = client;
+	data->input_dev = input_dev;
+
+	if (data->pdata == NULL) {
+		input_err(true, &client->dev, "failed to get platform data\n");
+		ret = -EINVAL;
+		goto err_platform_data;
+	}
+	data->irq = -1;
+	mutex_init(&data->lock);
+	mutex_init(&data->lock_fac);
+
+#ifdef FEATURE_GRIP_FOR_SAR
+	wake_lock_init(&data->touchkey_wake_lock, WAKE_LOCK_SUSPEND, "touchkey wake lock");
+	INIT_DELAYED_WORK(&data->debug_work, tc300k_debug_work_func);
+#endif
+
+	pdata->power = tc300k_touchkey_power;
+	pdata->keyled = tc300k_touchkey_led_control;
+
+	i2c_set_clientdata(client, data);
+	tc300k_gpio_request(data);
+
+	ret = tc300_pinctrl_init(data);
+	if (ret < 0) {
+		input_err(true, &client->dev,
+			"%s: Failed to init pinctrl: %d\n", __func__, ret);
+		goto err_platform_data;
+	}
+
+	if(pdata->boot_on_ldo){
+		data->pdata->power(data, true);
+		data->pdata->keyled(data, true);
+	} else {
+		data->pdata->power(data, true);
+		data->pdata->keyled(data, true);
+		msleep(200);
+	}
+	data->enabled = true;
+
+	client->irq=gpio_to_irq(pdata->gpio_int);
+
+	ret = tc300k_fw_check(data);
+	if (ret) {
+		input_err(true, &client->dev,
+			"failed to firmware check(%d)\n", ret);
+		goto err_fw_check;
+	}
+
+	snprintf(data->phys, sizeof(data->phys),
+		"%s/input0", dev_name(&client->dev));
+	input_dev->name = "sec_touchkey";
+	input_dev->phys = data->phys;
+	input_dev->id.bustype = BUS_I2C;
+	input_dev->dev.parent = &client->dev;
+	input_dev->open = tc300k_input_open;
+	input_dev->close = tc300k_input_close;
+
+	if (pdata->use_bitmap) {
+		data->tsk_ev_val = tsk_ev;
+		data->key_num = ARRAY_SIZE(tsk_ev)/2;
+	} else {
+		data->tsk_ev_val = tsk_ev_old;
+		data->key_num = ARRAY_SIZE(tsk_ev_old)/2;
+	}
+	input_info(true, &client->dev, "number of keys = %d\n", data->key_num);
+#ifdef FEATURE_GRIP_FOR_SAR
+	data->grip_ev_val = grip_ev;
+	data->grip_num = ARRAY_SIZE(grip_ev)/2;
+	input_info(true, &client->dev, "number of grips = %d\n", data->grip_num);
+#endif
+
+	set_bit(EV_KEY, input_dev->evbit);
+	set_bit(EV_LED, input_dev->evbit);
+	set_bit(LED_MISC, input_dev->ledbit);
+	for (i = 0; i < data->key_num; i++) {
+		set_bit(data->tsk_ev_val[i].tsk_keycode, input_dev->keybit);
+
+#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+		input_info(true, &client->dev, "keycode[%d]= %3d\n",
+						i, data->tsk_ev_val[i].tsk_keycode);
+#endif
+	}
+#ifdef FEATURE_GRIP_FOR_SAR
+	for (i = 0; i < data->grip_num; i++) {
+		set_bit(data->grip_ev_val[i].grip_code, input_dev->keybit);
+#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
+		input_info(true, &client->dev, "gripcode[%d]= %3d\n",
+						i, data->grip_ev_val[i].grip_code);
+#endif
+	}
+#endif
+	input_set_drvdata(input_dev, data);
+
+	ret = input_register_device(input_dev);
+	if (ret) {
+		input_err(true, &client->dev, "fail to register input_dev (%d)\n",
+			ret);
+		goto err_register_input_dev;
+	}
+
+	ret = request_threaded_irq(client->irq, NULL, tc300k_interrupt,
+				IRQF_DISABLED | IRQF_TRIGGER_FALLING |
+				IRQF_ONESHOT, TC300K_NAME, data);
+	if (ret < 0) {
+		input_err(true, &client->dev, "fail to request irq (%d).\n",
+			pdata->gpio_int);
+		goto err_request_irq;
+	}
+	data->irq = pdata->gpio_int;
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+	data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
+	data->early_suspend.suspend = tc300k_early_suspend;
+	data->early_suspend.resume = tc300k_late_resume;
+	register_early_suspend(&data->early_suspend);
+#endif
+
+	data->sec_touchkey = sec_device_create(client, "sec_touchkey");
+	if (IS_ERR(data->sec_touchkey))
+		input_err(true, &client->dev,
+			"Failed to create device for the touchkey sysfs\n");
+
+	if (data->pdata->tsk_ic_num == TC350K_TSK_IC) {
+		ret = sysfs_create_group(&data->sec_touchkey->kobj,
+			&sec_touchkey_attr_group_350k);
+	} else {
+		ret = sysfs_create_group(&data->sec_touchkey->kobj,
+			&sec_touchkey_attr_group);
+	}
+
+	if (ret)
+		input_err(true, &client->dev, "Failed to create sysfs group\n");
+
+
+	ret = sysfs_create_link(&data->sec_touchkey->kobj, &input_dev->dev.kobj, "input");
+		if (ret < 0) {
+			input_err(true, &client->dev,
+					"%s: Failed to create input symbolic link\n",
+					__func__);
+		}
+
+	dev_set_drvdata(data->sec_touchkey, data);
+
+#if defined (CONFIG_VBUS_NOTIFIER) && defined(FEATURE_GRIP_FOR_SAR)
+	vbus_notifier_register(&data->vbus_nb, tkey_vbus_notification,
+			       VBUS_NOTIFY_DEV_CHARGER);
+#endif
+
+#ifdef FEATURE_GRIP_FOR_SAR
+	ret = tc300k_mode_check(client);
+	if (ret >= 0) {
+		data->sar_enable = !!(ret & TC300K_MODE_SAR);
+		input_info(true, &client->dev, "%s: mode %d, sar %d\n",
+				__func__, ret, data->sar_enable);
+	}
+	device_init_wakeup(&client->dev, true);
+#endif
+	input_info(true, &client->dev, "%s done\n", __func__);
+	return 0;
+
+err_request_irq:
+	input_unregister_device(input_dev);
+	input_dev = NULL;
+err_register_input_dev:
+err_fw_check:
+	mutex_destroy(&data->lock);
+	mutex_destroy(&data->lock_fac);
+	data->pdata->keyled(data, false);
+	data->pdata->power(data, false);
+err_platform_data:
+#ifdef FEATURE_GRIP_FOR_SAR
+	wake_lock_destroy(&data->touchkey_wake_lock);
+#endif
+	input_free_device(input_dev);
+err_alloc_input:
+	kfree(data);
+err_alloc_data:
 	return ret;
 }
 
-/* Change the visibility of a particular element. */
-static ssize_t set_icon(struct device *dev, const char *buf, size_t count,
-			int chr)
+static int tc300k_remove(struct i2c_client *client)
 {
-	struct yealink_dev *yld;
-	int i;
+	struct tc300k_data *data = i2c_get_clientdata(client);
 
-	down_write(&sysfs_rwsema);
-	yld = dev_get_drvdata(dev);
-	if (yld == NULL) {
-		up_write(&sysfs_rwsema);
-		return -ENODEV;
-	}
+#ifdef CONFIG_HAS_EARLYSUSPEND
+	unregister_early_suspend(&data->early_suspend);
+#endif
+#ifdef FEATURE_GRIP_FOR_SAR
+	device_init_wakeup(&client->dev, false);
+	wake_lock_destroy(&data->touchkey_wake_lock);
+	cancel_delayed_work_sync(&data->debug_work);
+	flush_delayed_work(&data->debug_work);
+#endif
+	free_irq(client->irq, data);
+	input_unregister_device(data->input_dev);
+	mutex_destroy(&data->lock);
+	mutex_destroy(&data->lock_fac);
+	data->pdata->keyled(data, false);
+	data->pdata->power(data, false);
+	gpio_free(data->pdata->gpio_int);
+	gpio_free(data->pdata->gpio_sda);
+	gpio_free(data->pdata->gpio_scl);
+	kfree(data);
 
-	for (i = 0; i < ARRAY_SIZE(lcdMap); i++) {
-		if (lcdMap[i].type != '.')
-			continue;
-		if (strncmp(buf, lcdMap[i].u.p.name, count) == 0) {
-			setChar(yld, i, chr);
-			break;
-		}
-	}
-
-	up_write(&sysfs_rwsema);
-	return count;
-}
-
-static ssize_t show_icon(struct device *dev, struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-	return set_icon(dev, buf, count, buf[0]);
-}
-
-static ssize_t hide_icon(struct device *dev, struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-	return set_icon(dev, buf, count, ' ');
-}
-
-/* Upload a ringtone to the device.
- */
-
-/* Stores raw ringtone data in the phone */
-static ssize_t store_ringtone(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-	struct yealink_dev *yld;
-
-	down_write(&sysfs_rwsema);
-	yld = dev_get_drvdata(dev);
-	if (yld == NULL) {
-		up_write(&sysfs_rwsema);
-		return -ENODEV;
-	}
-
-	/* TODO locking with async usb control interface??? */
-	yealink_set_ringtone(yld, (char *)buf, count);
-	up_write(&sysfs_rwsema);
-	return count;
-}
-
-#define _M444	S_IRUGO
-#define _M664	S_IRUGO|S_IWUSR|S_IWGRP
-#define _M220	S_IWUSR|S_IWGRP
-
-static DEVICE_ATTR(map_seg7	, _M664, show_map	, store_map	);
-static DEVICE_ATTR(line1	, _M664, show_line1	, store_line1	);
-static DEVICE_ATTR(line2	, _M664, show_line2	, store_line2	);
-static DEVICE_ATTR(line3	, _M664, show_line3	, store_line3	);
-static DEVICE_ATTR(get_icons	, _M444, get_icons	, NULL		);
-static DEVICE_ATTR(show_icon	, _M220, NULL		, show_icon	);
-static DEVICE_ATTR(hide_icon	, _M220, NULL		, hide_icon	);
-static DEVICE_ATTR(ringtone	, _M220, NULL		, store_ringtone);
-
-static struct attribute *yld_attributes[] = {
-	&dev_attr_line1.attr,
-	&dev_attr_line2.attr,
-	&dev_attr_line3.attr,
-	&dev_attr_get_icons.attr,
-	&dev_attr_show_icon.attr,
-	&dev_attr_hide_icon.attr,
-	&dev_attr_map_seg7.attr,
-	&dev_attr_ringtone.attr,
-	NULL
-};
-
-static struct attribute_group yld_attr_group = {
-	.attrs = yld_attributes
-};
-
-/*******************************************************************************
- * Linux interface and usb initialisation
- ******************************************************************************/
-
-struct driver_info {
-	char *name;
-};
-
-static const struct driver_info info_P1K = {
-	.name	= "Yealink usb-p1k",
-};
-
-static const struct usb_device_id usb_table [] = {
-	{
-		.match_flags		= USB_DEVICE_ID_MATCH_DEVICE |
-						USB_DEVICE_ID_MATCH_INT_INFO,
-		.idVendor		= 0x6993,
-		.idProduct		= 0xb001,
-		.bInterfaceClass	= USB_CLASS_HID,
-		.bInterfaceSubClass	= 0,
-		.bInterfaceProtocol	= 0,
-		.driver_info		= (kernel_ulong_t)&info_P1K
-	},
-	{ }
-};
-
-static int usb_cleanup(struct yealink_dev *yld, int err)
-{
-	if (yld == NULL)
-		return err;
-
-        if (yld->idev) {
-		if (err)
-			input_free_device(yld->idev);
-		else
-			input_unregister_device(yld->idev);
-	}
-
-	usb_free_urb(yld->urb_irq);
-	usb_free_urb(yld->urb_ctl);
-
-	kfree(yld->ctl_req);
-	usb_free_coherent(yld->udev, USB_PKT_LEN, yld->ctl_data, yld->ctl_dma);
-	usb_free_coherent(yld->udev, USB_PKT_LEN, yld->irq_data, yld->irq_dma);
-
-	kfree(yld);
-	return err;
-}
-
-static void usb_disconnect(struct usb_interface *intf)
-{
-	struct yealink_dev *yld;
-
-	down_write(&sysfs_rwsema);
-	yld = usb_get_intfdata(intf);
-	sysfs_remove_group(&intf->dev.kobj, &yld_attr_group);
-	usb_set_intfdata(intf, NULL);
-	up_write(&sysfs_rwsema);
-
-	usb_cleanup(yld, 0);
-}
-
-static int usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
-{
-	struct usb_device *udev = interface_to_usbdev (intf);
-	struct driver_info *nfo = (struct driver_info *)id->driver_info;
-	struct usb_host_interface *interface;
-	struct usb_endpoint_descriptor *endpoint;
-	struct yealink_dev *yld;
-	struct input_dev *input_dev;
-	int ret, pipe, i;
-
-	interface = intf->cur_altsetting;
-
-	if (interface->desc.bNumEndpoints < 1)
-		return -ENODEV;
-
-	endpoint = &interface->endpoint[0].desc;
-	if (!usb_endpoint_is_int_in(endpoint))
-		return -ENODEV;
-
-	yld = kzalloc(sizeof(struct yealink_dev), GFP_KERNEL);
-	if (!yld)
-		return -ENOMEM;
-
-	yld->udev = udev;
-	yld->intf = intf;
-
-	yld->idev = input_dev = input_allocate_device();
-	if (!input_dev)
-		return usb_cleanup(yld, -ENOMEM);
-
-	/* allocate usb buffers */
-	yld->irq_data = usb_alloc_coherent(udev, USB_PKT_LEN,
-					   GFP_ATOMIC, &yld->irq_dma);
-	if (yld->irq_data == NULL)
-		return usb_cleanup(yld, -ENOMEM);
-
-	yld->ctl_data = usb_alloc_coherent(udev, USB_PKT_LEN,
-					   GFP_ATOMIC, &yld->ctl_dma);
-	if (!yld->ctl_data)
-		return usb_cleanup(yld, -ENOMEM);
-
-	yld->ctl_req = kmalloc(sizeof(*(yld->ctl_req)), GFP_KERNEL);
-	if (yld->ctl_req == NULL)
-		return usb_cleanup(yld, -ENOMEM);
-
-	/* allocate urb structures */
-	yld->urb_irq = usb_alloc_urb(0, GFP_KERNEL);
-        if (yld->urb_irq == NULL)
-		return usb_cleanup(yld, -ENOMEM);
-
-	yld->urb_ctl = usb_alloc_urb(0, GFP_KERNEL);
-        if (yld->urb_ctl == NULL)
-		return usb_cleanup(yld, -ENOMEM);
-
-	/* get a handle to the interrupt data pipe */
-	pipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
-	ret = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
-	if (ret != USB_PKT_LEN)
-		dev_err(&intf->dev, "invalid payload size %d, expected %zd\n",
-			ret, USB_PKT_LEN);
-
-	/* initialise irq urb */
-	usb_fill_int_urb(yld->urb_irq, udev, pipe, yld->irq_data,
-			USB_PKT_LEN,
-			urb_irq_callback,
-			yld, endpoint->bInterval);
-	yld->urb_irq->transfer_dma = yld->irq_dma;
-	yld->urb_irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	yld->urb_irq->dev = udev;
-
-	/* initialise ctl urb */
-	yld->ctl_req->bRequestType = USB_TYPE_CLASS | USB_RECIP_INTERFACE |
-				      USB_DIR_OUT;
-	yld->ctl_req->bRequest	= USB_REQ_SET_CONFIGURATION;
-	yld->ctl_req->wValue	= cpu_to_le16(0x200);
-	yld->ctl_req->wIndex	= cpu_to_le16(interface->desc.bInterfaceNumber);
-	yld->ctl_req->wLength	= cpu_to_le16(USB_PKT_LEN);
-
-	usb_fill_control_urb(yld->urb_ctl, udev, usb_sndctrlpipe(udev, 0),
-			(void *)yld->ctl_req, yld->ctl_data, USB_PKT_LEN,
-			urb_ctl_callback, yld);
-	yld->urb_ctl->transfer_dma	= yld->ctl_dma;
-	yld->urb_ctl->transfer_flags	|= URB_NO_TRANSFER_DMA_MAP;
-	yld->urb_ctl->dev = udev;
-
-	/* find out the physical bus location */
-	usb_make_path(udev, yld->phys, sizeof(yld->phys));
-	strlcat(yld->phys,  "/input0", sizeof(yld->phys));
-
-	/* register settings for the input device */
-	input_dev->name = nfo->name;
-	input_dev->phys = yld->phys;
-	usb_to_input_id(udev, &input_dev->id);
-	input_dev->dev.parent = &intf->dev;
-
-	input_set_drvdata(input_dev, yld);
-
-	input_dev->open = input_open;
-	input_dev->close = input_close;
-	/* input_dev->event = input_ev;	TODO */
-
-	/* register available key events */
-	input_dev->evbit[0] = BIT_MASK(EV_KEY);
-	for (i = 0; i < 256; i++) {
-		int k = map_p1k_to_key(i);
-		if (k >= 0) {
-			set_bit(k & 0xff, input_dev->keybit);
-			if (k >> 8)
-				set_bit(k >> 8, input_dev->keybit);
-		}
-	}
-
-	ret = input_register_device(yld->idev);
-	if (ret)
-		return usb_cleanup(yld, ret);
-
-	usb_set_intfdata(intf, yld);
-
-	/* clear visible elements */
-	for (i = 0; i < ARRAY_SIZE(lcdMap); i++)
-		setChar(yld, i, ' ');
-
-	/* display driver version on LCD line 3 */
-	store_line3(&intf->dev, NULL,
-			DRIVER_VERSION, sizeof(DRIVER_VERSION));
-
-	/* Register sysfs hooks (don't care about failure) */
-	ret = sysfs_create_group(&intf->dev.kobj, &yld_attr_group);
 	return 0;
 }
 
-static struct usb_driver yealink_driver = {
-	.name		= "yealink",
-	.probe		= usb_probe,
-	.disconnect	= usb_disconnect,
-	.id_table	= usb_table,
+static void tc300k_shutdown(struct i2c_client *client)
+{
+	struct tc300k_data *data = i2c_get_clientdata(client);
+
+	input_info(true, &client->dev, "%s\n", __func__);
+
+#ifdef FEATURE_GRIP_FOR_SAR
+	device_init_wakeup(&client->dev, false);
+	wake_lock_destroy(&data->touchkey_wake_lock);
+	cancel_delayed_work_sync(&data->debug_work);
+	flush_delayed_work(&data->debug_work);
+#endif
+	disable_irq(client->irq);
+	data->pdata->keyled(data, false);
+	data->pdata->power(data, false);
+}
+
+#if defined(CONFIG_PM)
+#ifndef FEATURE_GRIP_FOR_SAR
+static int tc300k_suspend(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct tc300k_data *data = i2c_get_clientdata(client);
+
+	mutex_lock(&data->lock);
+
+	if (!data->enabled) {
+		mutex_unlock(&data->lock);
+		return 0;
+	}
+
+	input_info(true, &client->dev, "%s: users=%d\n",
+		__func__, data->input_dev->users);
+
+	disable_irq(client->irq);
+	data->enabled = false;
+	tc300k_release_all_fingers(data);
+	data->pdata->keyled(data, false);
+	data->pdata->power(data, false);
+	data->led_on = false;
+
+	mutex_unlock(&data->lock);
+
+	return 0;
+}
+
+static int tc300k_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct tc300k_data *data = i2c_get_clientdata(client);
+	int ret;
+	u8 cmd;
+
+	mutex_lock(&data->lock);
+	if (data->enabled) {
+		mutex_unlock(&data->lock);
+		return 0;
+	}
+	input_info(true, &client->dev, "%s: users=%d\n", __func__, data->input_dev->users);
+
+	data->pdata->power(data, true);
+	data->pdata->keyled(data, true);
+	msleep(200);
+	enable_irq(client->irq);
+
+	data->enabled = true;
+	if (regulator_led){
+		if (data->led_on == true) {
+			data->led_on = false;
+			input_info(true, &client->dev, "led on(resume)\n");
+			cmd = TC300K_CMD_LED_ON;
+			ret = i2c_smbus_write_byte_data(client, TC300K_CMD_ADDR, cmd);
+			if (ret < 0)
+				input_err(true, &client->dev, "%s led on fail(%d)\n", __func__, ret);
+			else
+				msleep(TC300K_CMD_DELAY);
+		}
+	}
+
+	if (data->glove_mode) {
+		ret = tc300k_mode_enable(client, TC300K_CMD_GLOVE_ON);
+		if (ret < 0)
+			input_err(true, &client->dev, "%s glovemode fail(%d)\n", __func__, ret);
+	}
+
+	if (data->flip_mode) {
+		ret = tc300k_mode_enable(client, TC300K_CMD_FLIP_ON);
+		if (ret < 0)
+			input_err(true, &client->dev, "%s flipmode fail(%d)\n", __func__, ret);
+	}
+
+	mutex_unlock(&data->lock);
+
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void tc300k_early_suspend(struct early_suspend *h)
+{
+	struct tc300k_data *data;
+	data = container_of(h, struct tc300k_data, early_suspend);
+	tc300k_suspend(&data->client->dev);
+}
+
+static void tc300k_late_resume(struct early_suspend *h)
+{
+	struct tc300k_data *data;
+	data = container_of(h, struct tc300k_data, early_suspend);
+	tc300k_resume(&data->client->dev);
+}
+#endif
+
+static void tc300k_input_close(struct input_dev *dev)
+{
+	struct tc300k_data *data = input_get_drvdata(dev);
+#ifdef FEATURE_GRIP_FOR_SAR
+	input_info(true, &data->client->dev, 
+			"%s: sar_enable(%d)\n", __func__, data->sar_enable);
+	tc300k_stop_mode(data, 1);
+
+	if (device_may_wakeup(&data->client->dev))
+		enable_irq_wake(data->client->irq);
+#else
+	input_info(true, &data->client->dev, "%s: users=%d\n", __func__,
+		   data->input_dev->users);
+
+	tc300k_suspend(&data->client->dev);
+	tc300_pinctrl(data, I_STATE_OFF_IRQ);
+#endif
+}
+
+static int tc300k_input_open(struct input_dev *dev)
+{
+	struct tc300k_data *data = input_get_drvdata(dev);
+
+#ifdef FEATURE_GRIP_FOR_SAR
+	input_info(true, &data->client->dev, 
+			"%s: sar_enable(%d)\n", __func__, data->sar_enable);
+	tc300k_stop_mode(data, 0);
+
+	if (device_may_wakeup(&data->client->dev))
+		disable_irq_wake(data->client->irq);
+#else
+	input_info(true, &data->client->dev, "%s: users=%d\n", __func__,
+		   data->input_dev->users);
+
+	tc300_pinctrl(data, I_STATE_ON_IRQ);
+	tc300k_resume(&data->client->dev);
+#endif
+
+	return 0;
+}
+#endif /* CONFIG_PM */
+
+#if 0
+#if defined(CONFIG_PM) || defined(CONFIG_HAS_EARLYSUSPEND)
+static const struct dev_pm_ops tc300k_pm_ops = {
+	.suspend = tc300k_suspend,
+	.resume = tc300k_resume,
+};
+#endif
+#endif
+
+static const struct i2c_device_id tc300k_id[] = {
+	{TC300K_NAME, 0},
+	{ }
 };
 
-module_usb_driver(yealink_driver);
+#ifdef CONFIG_OF
+static struct of_device_id coreriver_match_table[] = {
+	{ .compatible = "coreriver,tc300-keypad",},
+	{ },
+};
+#else
+#define coreriver_match_table	NULL
+#endif
+MODULE_DEVICE_TABLE(i2c, tc300k_id);
 
-MODULE_DEVICE_TABLE (usb, usb_table);
+static struct i2c_driver tc300k_driver = {
+	.probe = tc300k_probe,
+	.remove = tc300k_remove,
+	.shutdown = tc300k_shutdown,
+	.driver = {
+		.name = TC300K_NAME,
+		.owner = THIS_MODULE,
+#ifdef CONFIG_OF
+		.of_match_table = coreriver_match_table,
+#endif
+#if 0
+#if defined(CONFIG_PM) && !defined(CONFIG_HAS_EARLYSUSPEND)
+		.pm	= &tc300_pm_ops,
+#endif
+#endif
+	},
+	.id_table = tc300k_id,
+};
 
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
+static int __init tc300k_init(void)
+{
+	int ret = 0;
+
+	ret = i2c_add_driver(&tc300k_driver);
+	if (ret) {
+		printk(KERN_ERR "[TK] coreriver touch keypad registration failed. ret= %d\n",
+			ret);
+	}
+	printk(KERN_ERR "[TK] %s: init done %d\n", __func__, ret);
+
+	return ret;
+}
+
+static void __exit tc300k_exit(void)
+{
+	i2c_del_driver(&tc300k_driver);
+}
+
+module_init(tc300k_init);
+module_exit(tc300k_exit);
+
+MODULE_AUTHOR("Samsung Electronics");
+MODULE_DESCRIPTION("Touchkey driver for Coreriver TC300K");
 MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ *  Copyright (C) 2010,Imagis Technology Co. Ltd. All Rights Reserved.
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ */
+
+#include <linux/kernel.h>
+#include <linux/input.h>
+#include <linux/interrupt.h>
+#include <linux/delay.h>
+#include <linux/platform_device.h>
+#include <linux/device.h>
+#include <linux/mutex.h>
+#include <linux/input/mt.h>
+
+#ifdef CONFIG_OF
+#include <linux/of.h>
+#include <linux/of_gpio.h>
+#include <linux/of_device.h>
+#endif
+
+#include "ist40xx.h"
+#include "ist40xx_misc.h"
+#include "ist40xx_update.h"
+#include "ist40xx_cmcs.h"
+
+#if defined(CONFIG_VBUS_NOTIFIER) || defined(CONFIG_MUIC_NOTIFIER)
+#include <linux/muic/muic.h>
+#include <linux/muic/muic_notifier.h>
+#include <linux/vbus_notifier.h>
+#endif
+#if defined(CONFIG_USB_TYPEC_MANAGER_NOTIFIER)
+#include <linux/usb/manager/usb_typec_manager_notifier.h>
+#endif
+
+#ifdef CONFIG_TRUSTONIC_TRUSTED_UI
+#include <linux/t-base-tui.h>
+#endif
+#ifdef CONFIG_SAMSUNG_TUI
+#include "stui_inf.h"
+#endif
+
+struct ist40xx_data *ts_data;
+
+#ifdef CONFIG_DISPLAY_SAMSUNG
+extern int get_lcd_attached(char *mode);
+#endif
+
+#ifdef CONFIG_TRUSTONIC_TRUSTED_UI
+struct ist40xx_data *tui_tsp_info;
+extern int tui_force_close(uint32_t arg);
+#endif
+
+#ifdef CONFIG_SAMSUNG_TUI
+struct ist40xx_data *stui_tsp_info;
+#endif
+
+int ist40xx_log_level = IST40XX_LOG_LEVEL;
+void tsp_printk(int level, const char *fmt, ...)
+{
+	struct va_format vaf;
+	va_list args;
+
+	if (ist40xx_log_level < level)
+		return;
+
+	va_start(args, fmt);
+
+	vaf.fmt = fmt;
+	vaf.va = &args;
+
+	printk("%s %pV", IST40XX_LOG_TAG, &vaf);
+
+	va_end(args);
+}
+
+long get_milli_second(struct ist40xx_data *data)
+{
+	ktime_get_ts(&data->t_current);
+
+	return data->t_current.tv_sec * 1000 +
+		data->t_current.tv_nsec / 1000000;
+}
+
+void ist40xx_delay(unsigned int ms)
+{
+	if (ms < 20)
+		usleep_range(ms * 1000, ms * 1000);
+	else
+		msleep(ms);
+}
+
+int ist40xx_intr_wait(struct ist40xx_data *data, long ms)
+{
+	long start_ms = get_milli_second(data);
+	long curr_ms = 0;
+
+	while (1) {
+		if (!data->irq_working)
+			break;
+
+		curr_ms = get_milli_second(data);
+		if ((curr_ms < 0) || (start_ms < 0)
+			|| (curr_ms - start_ms > ms)) {
+			input_info(true, &data->client->dev, "%s: timeout(%dms)\n",
+				   __func__, ms);
+			return -EPERM;
+		}
+
+		ist40xx_delay(2);
+	}
+	return 0;
+}
+
+void ist40xx_disable_irq(struct ist40xx_data *data)
+{
+	if (data->irq_enabled) {
+		disable_irq(data->client->irq);
+		data->irq_enabled = false;
+		data->status.event_mode = false;
+	}
+}
+
+void ist40xx_enable_irq(struct ist40xx_data *data)
+{
+	if (!data->irq_enabled) {
+		enable_irq(data->client->irq);
+		ist40xx_delay(10);
+		data->irq_enabled = true;
+		data->status.event_mode = true;
+	}
+}
+
+void ist40xx_scheduled_reset(struct ist40xx_data *data)
+{
+#ifdef CONFIG_TRUSTONIC_TRUSTED_UI
+	if (TRUSTEDUI_MODE_INPUT_SECURED & trustedui_get_current_mode()) {
+		input_err(true, &data->client->dev, "%s return, TUI is enabled!\n",
+			  __func__);
+		return;
+	}
+#endif
+#ifdef CONFIG_INPUT_SEC_SECURE_TOUCH
+		if (atomic_read(&data->st_enabled) == SECURE_TOUCH_ENABLED) {
+			input_err(true, &data->client->dev,
+				  "%s: TSP no accessible from Linux, TUI is enabled!\n",
+				  __func__);
+			return;
+		}
+#endif
+#ifdef CONFIG_SAMSUNG_TUI
+	if (STUI_MODE_TOUCH_SEC & stui_get_mode())
+		return;
+#endif
+
+	if (data->initialized)
+		schedule_delayed_work(&data->work_reset_check, 0);
+}
+
+static void ist40xx_request_reset(struct ist40xx_data *data)
+{
+	data->irq_err_cnt++;
+	if (data->irq_err_cnt >= data->max_irq_err_cnt) {
+		input_info(true, &data->client->dev, "%s\n", __func__);
+		ist40xx_scheduled_reset(data);
+		data->irq_err_cnt = 0;
+	}
+}
+
+void ist40xx_start(struct ist40xx_data *data)
+{
+	if (data->initialized) {
+		data->scan_count = 0;
+		data->scan_retry = 0;
+		mod_timer(&data->event_timer,
+				get_jiffies_64() + EVENT_TIMER_INTERVAL);
+	}
+
+	data->ignore_delay = true;
+
+	/* TA mode */
+	ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+			((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+
+	if ((data->noise_mode >> NOISE_MODE_REJECTZONE) & 1) {
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_REJECTZONE_TOP << 16) | data->rejectzone_t));
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_REJECTZONE_BOTTOM << 16) | data->rejectzone_b));
+		input_info(true, &data->client->dev, "%s: rejectzone T:%d, B:%d\n",
+			   __func__, data->rejectzone_t, data->rejectzone_b);
+	}
+
+	if (data->report_rate >= 0) {
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_TIME_ACTIVE << 16) | (data->report_rate & 0xFFFF)));
+		input_info(true, &data->client->dev, "%s: active rate : %dus\n",
+			   __func__, data->report_rate);
+	}
+
+	if (data->idle_rate >= 0) {
+		ist40xx_w

@@ -1,508 +1,224 @@
-/**
- * IBM Accelerator Family 'GenWQE'
- *
- * (C) Copyright IBM Corp. 2013
- *
- * Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
- * Author: Joerg-Stephan Vogt <jsvogt@de.ibm.com>
- * Author: Michael Jung <mijung@gmx.net>
- * Author: Michael Ruettger <michael@ibmra.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License (version 2 only)
- * as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
-
-/*
- * Debugfs interfaces for the GenWQE card. Help to debug potential
- * problems. Dump internal chip state for debugging and failure
- * determination.
- */
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
-#include <linux/uaccess.h>
-
-#include "card_base.h"
-#include "card_ddcb.h"
-
-#define GENWQE_DEBUGFS_RO(_name, _showfn)				\
-	static int genwqe_debugfs_##_name##_open(struct inode *inode,	\
-						 struct file *file)	\
-	{								\
-		return single_open(file, _showfn, inode->i_private);	\
-	}								\
-	static const struct file_operations genwqe_##_name##_fops = {	\
-		.open = genwqe_debugfs_##_name##_open,			\
-		.read = seq_read,					\
-		.llseek = seq_lseek,					\
-		.release = single_release,				\
-	}
-
-static void dbg_uidn_show(struct seq_file *s, struct genwqe_reg *regs,
-			  int entries)
-{
-	unsigned int i;
-	u32 v_hi, v_lo;
-
-	for (i = 0; i < entries; i++) {
-		v_hi = (regs[i].val >> 32) & 0xffffffff;
-		v_lo = (regs[i].val)       & 0xffffffff;
-
-		seq_printf(s, "  0x%08x 0x%08x 0x%08x 0x%08x EXT_ERR_REC\n",
-			   regs[i].addr, regs[i].idx, v_hi, v_lo);
-	}
-}
-
-static int curr_dbg_uidn_show(struct seq_file *s, void *unused, int uid)
-{
-	struct genwqe_dev *cd = s->private;
-	int entries;
-	struct genwqe_reg *regs;
-
-	entries = genwqe_ffdc_buff_size(cd, uid);
-	if (entries < 0)
-		return -EINVAL;
-
-	if (entries == 0)
-		return 0;
-
-	regs = kcalloc(entries, sizeof(*regs), GFP_KERNEL);
-	if (regs == NULL)
-		return -ENOMEM;
-
-	genwqe_stop_traps(cd); /* halt the traps while dumping data */
-	genwqe_ffdc_buff_read(cd, uid, regs, entries);
-	genwqe_start_traps(cd);
-
-	dbg_uidn_show(s, regs, entries);
-	kfree(regs);
-	return 0;
-}
-
-static int genwqe_curr_dbg_uid0_show(struct seq_file *s, void *unused)
-{
-	return curr_dbg_uidn_show(s, unused, 0);
-}
-
-GENWQE_DEBUGFS_RO(curr_dbg_uid0, genwqe_curr_dbg_uid0_show);
-
-static int genwqe_curr_dbg_uid1_show(struct seq_file *s, void *unused)
-{
-	return curr_dbg_uidn_show(s, unused, 1);
-}
-
-GENWQE_DEBUGFS_RO(curr_dbg_uid1, genwqe_curr_dbg_uid1_show);
-
-static int genwqe_curr_dbg_uid2_show(struct seq_file *s, void *unused)
-{
-	return curr_dbg_uidn_show(s, unused, 2);
-}
-
-GENWQE_DEBUGFS_RO(curr_dbg_uid2, genwqe_curr_dbg_uid2_show);
-
-static int prev_dbg_uidn_show(struct seq_file *s, void *unused, int uid)
-{
-	struct genwqe_dev *cd = s->private;
-
-	dbg_uidn_show(s, cd->ffdc[uid].regs,  cd->ffdc[uid].entries);
-	return 0;
-}
-
-static int genwqe_prev_dbg_uid0_show(struct seq_file *s, void *unused)
-{
-	return prev_dbg_uidn_show(s, unused, 0);
-}
-
-GENWQE_DEBUGFS_RO(prev_dbg_uid0, genwqe_prev_dbg_uid0_show);
-
-static int genwqe_prev_dbg_uid1_show(struct seq_file *s, void *unused)
-{
-	return prev_dbg_uidn_show(s, unused, 1);
-}
-
-GENWQE_DEBUGFS_RO(prev_dbg_uid1, genwqe_prev_dbg_uid1_show);
-
-static int genwqe_prev_dbg_uid2_show(struct seq_file *s, void *unused)
-{
-	return prev_dbg_uidn_show(s, unused, 2);
-}
-
-GENWQE_DEBUGFS_RO(prev_dbg_uid2, genwqe_prev_dbg_uid2_show);
-
-static int genwqe_curr_regs_show(struct seq_file *s, void *unused)
-{
-	struct genwqe_dev *cd = s->private;
-	unsigned int i;
-	struct genwqe_reg *regs;
-
-	regs = kcalloc(GENWQE_FFDC_REGS, sizeof(*regs), GFP_KERNEL);
-	if (regs == NULL)
-		return -ENOMEM;
-
-	genwqe_stop_traps(cd);
-	genwqe_read_ffdc_regs(cd, regs, GENWQE_FFDC_REGS, 1);
-	genwqe_start_traps(cd);
-
-	for (i = 0; i < GENWQE_FFDC_REGS; i++) {
-		if (regs[i].addr == 0xffffffff)
-			break;  /* invalid entries */
-
-		if (regs[i].val == 0x0ull)
-			continue;  /* do not print 0x0 FIRs */
-
-		seq_printf(s, "  0x%08x 0x%016llx\n",
-			   regs[i].addr, regs[i].val);
-	}
-	return 0;
-}
-
-GENWQE_DEBUGFS_RO(curr_regs, genwqe_curr_regs_show);
-
-static int genwqe_prev_regs_show(struct seq_file *s, void *unused)
-{
-	struct genwqe_dev *cd = s->private;
-	unsigned int i;
-	struct genwqe_reg *regs = cd->ffdc[GENWQE_DBG_REGS].regs;
-
-	if (regs == NULL)
-		return -EINVAL;
-
-	for (i = 0; i < GENWQE_FFDC_REGS; i++) {
-		if (regs[i].addr == 0xffffffff)
-			break;  /* invalid entries */
-
-		if (regs[i].val == 0x0ull)
-			continue;  /* do not print 0x0 FIRs */
-
-		seq_printf(s, "  0x%08x 0x%016llx\n",
-			   regs[i].addr, regs[i].val);
-	}
-	return 0;
-}
-
-GENWQE_DEBUGFS_RO(prev_regs, genwqe_prev_regs_show);
-
-static int genwqe_jtimer_show(struct seq_file *s, void *unused)
-{
-	struct genwqe_dev *cd = s->private;
-	unsigned int vf_num;
-	u64 jtimer;
-
-	jtimer = genwqe_read_vreg(cd, IO_SLC_VF_APPJOB_TIMEOUT, 0);
-	seq_printf(s, "  PF   0x%016llx %d msec\n", jtimer,
-		   genwqe_pf_jobtimeout_msec);
-
-	for (vf_num = 0; vf_num < cd->num_vfs; vf_num++) {
-		jtimer = genwqe_read_vreg(cd, IO_SLC_VF_APPJOB_TIMEOUT,
-					  vf_num + 1);
-		seq_printf(s, "  VF%-2d 0x%016llx %d msec\n", vf_num, jtimer,
-			   cd->vf_jobtimeout_msec[vf_num]);
-	}
-	return 0;
-}
-
-GENWQE_DEBUGFS_RO(jtimer, genwqe_jtimer_show);
-
-static int genwqe_queue_working_time_show(struct seq_file *s, void *unused)
-{
-	struct genwqe_dev *cd = s->private;
-	unsigned int vf_num;
-	u64 t;
-
-	t = genwqe_read_vreg(cd, IO_SLC_VF_QUEUE_WTIME, 0);
-	seq_printf(s, "  PF   0x%016llx\n", t);
-
-	for (vf_num = 0; vf_num < cd->num_vfs; vf_num++) {
-		t = genwqe_read_vreg(cd, IO_SLC_VF_QUEUE_WTIME, vf_num + 1);
-		seq_printf(s, "  VF%-2d 0x%016llx\n", vf_num, t);
-	}
-	return 0;
-}
-
-GENWQE_DEBUGFS_RO(queue_working_time, genwqe_queue_working_time_show);
-
-static int genwqe_ddcb_info_show(struct seq_file *s, void *unused)
-{
-	struct genwqe_dev *cd = s->private;
-	unsigned int i;
-	struct ddcb_queue *queue;
-	struct ddcb *pddcb;
-
-	queue = &cd->queue;
-	seq_puts(s, "DDCB QUEUE:\n");
-	seq_printf(s, "  ddcb_max:            %d\n"
-		   "  ddcb_daddr:          %016llx - %016llx\n"
-		   "  ddcb_vaddr:          %016llx\n"
-		   "  ddcbs_in_flight:     %u\n"
-		   "  ddcbs_max_in_flight: %u\n"
-		   "  ddcbs_completed:     %u\n"
-		   "  return_on_busy:      %u\n"
-		   "  wait_on_busy:        %u\n"
-		   "  irqs_processed:      %u\n",
-		   queue->ddcb_max, (long long)queue->ddcb_daddr,
-		   (long long)queue->ddcb_daddr +
-		   (queue->ddcb_max * DDCB_LENGTH),
-		   (long long)queue->ddcb_vaddr, queue->ddcbs_in_flight,
-		   queue->ddcbs_max_in_flight, queue->ddcbs_completed,
-		   queue->return_on_busy, queue->wait_on_busy,
-		   cd->irqs_processed);
-
-	/* Hardware State */
-	seq_printf(s, "  0x%08x 0x%016llx IO_QUEUE_CONFIG\n"
-		   "  0x%08x 0x%016llx IO_QUEUE_STATUS\n"
-		   "  0x%08x 0x%016llx IO_QUEUE_SEGMENT\n"
-		   "  0x%08x 0x%016llx IO_QUEUE_INITSQN\n"
-		   "  0x%08x 0x%016llx IO_QUEUE_WRAP\n"
-		   "  0x%08x 0x%016llx IO_QUEUE_OFFSET\n"
-		   "  0x%08x 0x%016llx IO_QUEUE_WTIME\n"
-		   "  0x%08x 0x%016llx IO_QUEUE_ERRCNTS\n"
-		   "  0x%08x 0x%016llx IO_QUEUE_LRW\n",
-		   queue->IO_QUEUE_CONFIG,
-		   __genwqe_readq(cd, queue->IO_QUEUE_CONFIG),
-		   queue->IO_QUEUE_STATUS,
-		   __genwqe_readq(cd, queue->IO_QUEUE_STATUS),
-		   queue->IO_QUEUE_SEGMENT,
-		   __genwqe_readq(cd, queue->IO_QUEUE_SEGMENT),
-		   queue->IO_QUEUE_INITSQN,
-		   __genwqe_readq(cd, queue->IO_QUEUE_INITSQN),
-		   queue->IO_QUEUE_WRAP,
-		   __genwqe_readq(cd, queue->IO_QUEUE_WRAP),
-		   queue->IO_QUEUE_OFFSET,
-		   __genwqe_readq(cd, queue->IO_QUEUE_OFFSET),
-		   queue->IO_QUEUE_WTIME,
-		   __genwqe_readq(cd, queue->IO_QUEUE_WTIME),
-		   queue->IO_QUEUE_ERRCNTS,
-		   __genwqe_readq(cd, queue->IO_QUEUE_ERRCNTS),
-		   queue->IO_QUEUE_LRW,
-		   __genwqe_readq(cd, queue->IO_QUEUE_LRW));
-
-	seq_printf(s, "DDCB list (ddcb_act=%d/ddcb_next=%d):\n",
-		   queue->ddcb_act, queue->ddcb_next);
-
-	pddcb = queue->ddcb_vaddr;
-	for (i = 0; i < queue->ddcb_max; i++) {
-		seq_printf(s, "  %-3d: RETC=%03x SEQ=%04x HSI/SHI=%02x/%02x ",
-			   i, be16_to_cpu(pddcb->retc_16),
-			   be16_to_cpu(pddcb->seqnum_16),
-			   pddcb->hsi, pddcb->shi);
-		seq_printf(s, "PRIV=%06llx CMD=%02x\n",
-			   be64_to_cpu(pddcb->priv_64), pddcb->cmd);
-		pddcb++;
-	}
-	return 0;
-}
-
-GENWQE_DEBUGFS_RO(ddcb_info, genwqe_ddcb_info_show);
-
-static int genwqe_info_show(struct seq_file *s, void *unused)
-{
-	struct genwqe_dev *cd = s->private;
-	u16 val16, type;
-	u64 app_id, slu_id, bitstream = -1;
-	struct pci_dev *pci_dev = cd->pci_dev;
-
-	slu_id = __genwqe_readq(cd, IO_SLU_UNITCFG);
-	app_id = __genwqe_readq(cd, IO_APP_UNITCFG);
-
-	if (genwqe_is_privileged(cd))
-		bitstream = __genwqe_readq(cd, IO_SLU_BITSTREAM);
-
-	val16 = (u16)(slu_id & 0x0fLLU);
-	type  = (u16)((slu_id >> 20) & 0xffLLU);
-
-	seq_printf(s, "%s driver version: %s\n"
-		   "    Device Name/Type: %s %s CardIdx: %d\n"
-		   "    SLU/APP Config  : 0x%016llx/0x%016llx\n"
-		   "    Build Date      : %u/%x/%u\n"
-		   "    Base Clock      : %u MHz\n"
-		   "    Arch/SVN Release: %u/%llx\n"
-		   "    Bitstream       : %llx\n",
-		   GENWQE_DEVNAME, DRV_VERSION, dev_name(&pci_dev->dev),
-		   genwqe_is_privileged(cd) ?
-		   "Physical" : "Virtual or no SR-IOV",
-		   cd->card_idx, slu_id, app_id,
-		   (u16)((slu_id >> 12) & 0x0fLLU),	   /* month */
-		   (u16)((slu_id >>  4) & 0xffLLU),	   /* day */
-		   (u16)((slu_id >> 16) & 0x0fLLU) + 2010, /* year */
-		   genwqe_base_clock_frequency(cd),
-		   (u16)((slu_id >> 32) & 0xffLLU), slu_id >> 40,
-		   bitstream);
-
-	return 0;
-}
-
-GENWQE_DEBUGFS_RO(info, genwqe_info_show);
-
-int genwqe_init_debugfs(struct genwqe_dev *cd)
-{
-	struct dentry *root;
-	struct dentry *file;
-	int ret;
-	char card_name[64];
-	char name[64];
-	unsigned int i;
-
-	sprintf(card_name, "%s%d_card", GENWQE_DEVNAME, cd->card_idx);
-
-	root = debugfs_create_dir(card_name, cd->debugfs_genwqe);
-	if (!root) {
-		ret = -ENOMEM;
-		goto err0;
-	}
-
-	/* non privileged interfaces are done here */
-	file = debugfs_create_file("ddcb_info", S_IRUGO, root, cd,
-				   &genwqe_ddcb_info_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("info", S_IRUGO, root, cd,
-				   &genwqe_info_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_x64("err_inject", 0666, root, &cd->err_inject);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_u32("ddcb_software_timeout", 0666, root,
-				  &cd->ddcb_software_timeout);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_u32("kill_timeout", 0666, root,
-				  &cd->kill_timeout);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	/* privileged interfaces follow here */
-	if (!genwqe_is_privileged(cd)) {
-		cd->debugfs_root = root;
-		return 0;
-	}
-
-	file = debugfs_create_file("curr_regs", S_IRUGO, root, cd,
-				   &genwqe_curr_regs_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("curr_dbg_uid0", S_IRUGO, root, cd,
-				   &genwqe_curr_dbg_uid0_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("curr_dbg_uid1", S_IRUGO, root, cd,
-				   &genwqe_curr_dbg_uid1_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("curr_dbg_uid2", S_IRUGO, root, cd,
-				   &genwqe_curr_dbg_uid2_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("prev_regs", S_IRUGO, root, cd,
-				   &genwqe_prev_regs_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("prev_dbg_uid0", S_IRUGO, root, cd,
-				   &genwqe_prev_dbg_uid0_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("prev_dbg_uid1", S_IRUGO, root, cd,
-				   &genwqe_prev_dbg_uid1_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("prev_dbg_uid2", S_IRUGO, root, cd,
-				   &genwqe_prev_dbg_uid2_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	for (i = 0; i <  GENWQE_MAX_VFS; i++) {
-		sprintf(name, "vf%u_jobtimeout_msec", i);
-
-		file = debugfs_create_u32(name, 0666, root,
-					  &cd->vf_jobtimeout_msec[i]);
-		if (!file) {
-			ret = -ENOMEM;
-			goto err1;
-		}
-	}
-
-	file = debugfs_create_file("jobtimer", S_IRUGO, root, cd,
-				   &genwqe_jtimer_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("queue_working_time", S_IRUGO, root, cd,
-				   &genwqe_queue_working_time_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_u32("skip_recovery", 0666, root,
-				  &cd->skip_recovery);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_u32("use_platform_recovery", 0666, root,
-				  &cd->use_platform_recovery);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	cd->debugfs_root = root;
-	return 0;
-err1:
-	debugfs_remove_recursive(root);
-err0:
-	return ret;
-}
-
-void genqwe_exit_debugfs(struct genwqe_dev *cd)
-{
-	debugfs_remove_recursive(cd->debugfs_root);
-}
+_TX_CREDITS_ERR_PD_MASK 0x1
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD__SHIFT 0x0
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH_MASK 0x2
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH__SHIFT 0x1
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD_MASK 0x4
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD__SHIFT 0x2
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH_MASK 0x8
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH__SHIFT 0x3
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD_MASK 0x10
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD__SHIFT 0x4
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH_MASK 0x20
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH__SHIFT 0x5
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD_MASK 0x10000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD__SHIFT 0x10
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH_MASK 0x20000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH__SHIFT 0x11
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD_MASK 0x40000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD__SHIFT 0x12
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH_MASK 0x80000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH__SHIFT 0x13
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD_MASK 0x100000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD__SHIFT 0x14
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH_MASK 0x200000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH__SHIFT 0x15
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0_MASK 0x7
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0__SHIFT 0x0
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0_MASK 0x70
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0__SHIFT 0x4
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0_MASK 0x700
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0__SHIFT 0x8
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1_MASK 0x70000
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1__SHIFT 0x10
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1_MASK 0x700000
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1__SHIFT 0x14
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1_MASK 0x7000000
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1__SHIFT 0x18
+#define PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL_MASK 0x1
+#define PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL__SHIFT 0x0
+#define PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH_MASK 0x7e
+#define PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH__SHIFT 0x1
+#define PCIE_FC_P__PD_CREDITS_MASK 0xff
+#define PCIE_FC_P__PD_CREDITS__SHIFT 0x0
+#define PCIE_FC_P__PH_CREDITS_MASK 0xff00
+#define PCIE_FC_P__PH_CREDITS__SHIFT 0x8
+#define PCIE_FC_NP__NPD_CREDITS_MASK 0xff
+#define PCIE_FC_NP__NPD_CREDITS__SHIFT 0x0
+#define PCIE_FC_NP__NPH_CREDITS_MASK 0xff00
+#define PCIE_FC_NP__NPH_CREDITS__SHIFT 0x8
+#define PCIE_FC_CPL__CPLD_CREDITS_MASK 0xff
+#define PCIE_FC_CPL__CPLD_CREDITS__SHIFT 0x0
+#define PCIE_FC_CPL__CPLH_CREDITS_MASK 0xff00
+#define PCIE_FC_CPL__CPLH_CREDITS__SHIFT 0x8
+#define PCIE_ERR_CNTL__ERR_REPORTING_DIS_MASK 0x1
+#define PCIE_ERR_CNTL__ERR_REPORTING_DIS__SHIFT 0x0
+#define PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG_MASK 0x2
+#define PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG__SHIFT 0x1
+#define PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES_MASK 0x4
+#define PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES__SHIFT 0x2
+#define PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR_MASK 0x10
+#define PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR__SHIFT 0x4
+#define PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR_MASK 0x20
+#define PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR__SHIFT 0x5
+#define PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR_MASK 0x40
+#define PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR__SHIFT 0x6
+#define PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR_MASK 0x80
+#define PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR__SHIFT 0x7
+#define PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT_MASK 0x700
+#define PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT__SHIFT 0x8
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED_MASK 0x800
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED__SHIFT 0xb
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F1_TIMER_EXPIRED_MASK 0x1000
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F1_TIMER_EXPIRED__SHIFT 0xc
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F2_TIMER_EXPIRED_MASK 0x2000
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F2_TIMER_EXPIRED__SHIFT 0xd
+#define PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS_MASK 0x4000
+#define PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS__SHIFT 0xe
+#define PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS_MASK 0x8000
+#define PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS__SHIFT 0xf
+#define PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET_MASK 0x10000
+#define PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET__SHIFT 0x10
+#define PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY_MASK 0x20000
+#define PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY__SHIFT 0x11
+#define PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL_MASK 0x40000
+#define PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL__SHIFT 0x12
+#define PCIE_RX_CNTL__RX_IGNORE_IO_ERR_MASK 0x1
+#define PCIE_RX_CNTL__RX_IGNORE_IO_ERR__SHIFT 0x0
+#define PCIE_RX_CNTL__RX_IGNORE_BE_ERR_MASK 0x2
+#define PCIE_RX_CNTL__RX_IGNORE_BE_ERR__SHIFT 0x1
+#define PCIE_RX_CNTL__RX_IGNORE_MSG_ERR_MASK 0x4
+#define PCIE_RX_CNTL__RX_IGNORE_MSG_ERR__SHIFT 0x2
+#define PCIE_RX_CNTL__RX_IGNORE_CRC_ERR_MASK 0x8
+#define PCIE_RX_CNTL__RX_IGNORE_CRC_ERR__SHIFT 0x3
+#define PCIE_RX_CNTL__RX_IGNORE_CFG_ERR_MASK 0x10
+#define PCIE_RX_CNTL__RX_IGNORE_CFG_ERR__SHIFT 0x4
+#define PCIE_RX_CNTL__RX_IGNORE_CPL_ERR_MASK 0x20
+#define PCIE_RX_CNTL__RX_IGNORE_CPL_ERR__SHIFT 0x5
+#define PCIE_RX_CNTL__RX_IGNORE_EP_ERR_MASK 0x40
+#define PCIE_RX_CNTL__RX_IGNORE_EP_ERR__SHIFT 0x6
+#define PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR_MASK 0x80
+#define PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR__SHIFT 0x7
+#define PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR_MASK 0x100
+#define PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR__SHIFT 0x8
+#define PCIE_RX_CNTL__RX_IGNORE_TC_ERR_MASK 0x200
+#define PCIE_RX_CNTL__RX_IGNORE_TC_ERR__SHIFT 0x9
+#define PCIE_RX_CNTL__RX_IGNORE_CFG_UR_MASK 0x400
+#define PCIE_RX_CNTL__RX_IGNORE_CFG_UR__SHIFT 0xa
+#define PCIE_RX_CNTL__RX_IGNORE_IO_UR_MASK 0x800
+#define PCIE_RX_CNTL__RX_IGNORE_IO_UR__SHIFT 0xb
+#define PCIE_RX_CNTL__RX_IGNORE_AT_ERR_MASK 0x1000
+#define PCIE_RX_CNTL__RX_IGNORE_AT_ERR__SHIFT 0xc
+#define PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL_MASK 0x2000
+#define PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL__SHIFT 0xd
+#define PCIE_RX_CNTL__RX_GEN_ONE_NAK_MASK 0x4000
+#define PCIE_RX_CNTL__RX_GEN_ONE_NAK__SHIFT 0xe
+#define PCIE_RX_CNTL__RX_FC_INIT_FROM_REG_MASK 0x8000
+#define PCIE_RX_CNTL__RX_FC_INIT_FROM_REG__SHIFT 0xf
+#define PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MASK 0x70000
+#define PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT__SHIFT 0x10
+#define PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE_MASK 0x80000
+#define PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE__SHIFT 0x13
+#define PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS_MASK 0x100000
+#define PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS__SHIFT 0x14
+#define PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR_MASK 0x200000
+#define PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR__SHIFT 0x15
+#define PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR_MASK 0x400000
+#define PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR__SHIFT 0x16
+#define PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR_MASK 0x800000
+#define PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR__SHIFT 0x17
+#define PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR_MASK 0x1000000
+#define PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR__SHIFT 0x18
+#define PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR_MASK 0x2000000
+#define PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR__SHIFT 0x19
+#define PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM_MASK 0xfff
+#define PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM__SHIFT 0x0
+#define PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA_MASK 0xffffff
+#define PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA__SHIFT 0x0
+#define PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS_MASK 0x1000000
+#define PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS__SHIFT 0x18
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR_MASK 0x1
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR__SHIFT 0x0
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR_MASK 0x2
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR__SHIFT 0x1
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR_MASK 0x4
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR__SHIFT 0x2
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR_MASK 0x8
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR__SHIFT 0x3
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR_MASK 0x10
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR__SHIFT 0x4
+#define PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD_MASK 0xfff
+#define PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD__SHIFT 0x0
+#define PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH_MASK 0xff0000
+#define PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH__SHIFT 0x10
+#define PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD_MASK 0xfff
+#define PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD__SHIFT 0x0
+#define PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH_MASK 0xff0000
+#define PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH__SHIFT 0x10
+#define PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD_MASK 0xfff
+#define PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD__SHIFT 0x0
+#define PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH_MASK 0xff0000
+#define PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH__SHIFT 0x10
+#define PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0_MASK 0x2
+#define PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0__SHIFT 0x1
+#define PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN_MASK 0x4
+#define PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN__SHIFT 0x2
+#define PCIE_LC_CNTL__LC_RESET_LINK_MASK 0x8
+#define PCIE_LC_CNTL__LC_RESET_LINK__SHIFT 0x3
+#define PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE_MASK 0xf0
+#define PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE__SHIFT 0x4
+#define PCIE_LC_CNTL__LC_L0S_INACTIVITY_MASK 0xf00
+#define PCIE_LC_CNTL__LC_L0S_INACTIVITY__SHIFT 0x8
+#define PCIE_LC_CNTL__LC_L1_INACTIVITY_MASK 0xf000
+#define PCIE_LC_CNTL__LC_L1_INACTIVITY__SHIFT 0xc
+#define PCIE_LC_CNTL__LC_PMI_TO_L1_DIS_MASK 0x10000
+#define PCIE_LC_CNTL__LC_PMI_TO_L1_DIS__SHIFT 0x10
+#define PCIE_LC_CNTL__LC_INC_N_FTS_EN_MASK 0x20000
+#define PCIE_LC_CNTL__LC_INC_N_FTS_EN__SHIFT 0x11
+#define PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23_MASK 0xc0000
+#define PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23__SHIFT 0x12
+#define PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC_MASK 0x100000
+#define PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC__SHIFT 0x14
+#define PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS_MASK 0x200000
+#define PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS__SHIFT 0x15
+#define PCIE_LC_CNTL__LC_WAKE_FROM_L23_MASK 0x400000
+#define PCIE_LC_CNTL__LC_WAKE_FROM_L23__SHIFT 0x16
+#define PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK_MASK 0x800000
+#define PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK__SHIFT 0x17
+#define PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS_MASK 0x1000000
+#define PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS__SHIFT 0x18
+#define PCIE_LC_CNTL__LC_DELAY_COUNT_MASK 0x6000000
+#define PCIE_LC_CNTL__LC_DELAY_COUNT__SHIFT 0x19
+#define PCIE_LC_CNTL__LC_DELAY_L0S_EXIT_MASK 0x8000000
+#define PCIE_LC_CNTL__LC_DELAY_L0S_EXIT__SHIFT 0x1b
+#define PCIE_LC_CNTL__LC_DELAY_L1_EXIT_MASK 0x10000000
+#define PCIE_LC_CNTL__LC_DELAY_L1_EXIT__SHIFT 0x1c
+#define PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE_MASK 0x20000000
+#define PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE__SHIFT 0x1d
+#define PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN_MASK 0x40000000
+#define PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN__SHIFT 0x1e
+#define PCIE_LC_CNTL__LC_GATE_RCVR_IDLE_MASK 0x80000000
+#define PCIE_LC_CNTL__LC_GATE_RCVR_IDLE__SHIFT 0x1f
+#define PCIE_LC_CNTL2__LC_TIMED_OUT_STATE_MASK 0x3f
+#define PCIE_LC_CNTL2__LC_TIMED_OUT_STATE__SHIFT 0x0
+#define PCIE_LC_CNTL2__LC_STATE_TIMED_OUT_MASK 0x40
+#define PCIE_LC_CNTL2__LC_STATE_TIMED_OUT__SHIFT 0x6
+#define PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION_MASK 0x80
+#define PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION__SHIFT 0x7
+#define PCIE_LC_CNTL2__LC_MORE_TS2_EN_MASK 0x100
+#define PCIE_LC_CNTL2__LC_MORE_TS2_EN__SHIFT 0x8
+#define PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS_MASK 0x200
+#define PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS__SHIFT 0x9
+#define PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN_MASK 0x400
+#define PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN__SHIFT 0xa
+#define PCIE_LC_CNTL2__LC_ILLEGAL_STATE_MASK 0x800
+#define PCIE_LC_CNTL2__LC_ILLEGAL_STATE__SHIFT 0xb
+#define PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN_MASK 0x1000
+#define PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN__SHIFT 0xc
+#define PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE_MASK 0x2000
+#define PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE__SHIFT 0xd
+#define PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE_MASK 0xc000
+#define PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE__SHIFT 0xe
+#define PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET_MASK 0x10000
+#define PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET__SHIFT 0x10
+#define PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1_MASK 0x20000
+#define PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1__S

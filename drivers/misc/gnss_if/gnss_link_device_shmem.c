@@ -1,1018 +1,875 @@
-/*
- * Copyright (C) 2010 Samsung Electronics.
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
-
-#include <linux/irq.h>
-#include <linux/gpio.h>
-#include <linux/time.h>
-#include <linux/interrupt.h>
-#include <linux/timer.h>
-#include <linux/wakelock.h>
-#include <linux/delay.h>
-#include <linux/wait.h>
-#include <linux/sched.h>
-#include <linux/vmalloc.h>
-#include <linux/if_arp.h>
-#include <linux/platform_device.h>
-#include <linux/kallsyms.h>
-#include <linux/suspend.h>
-#include <linux/notifier.h>
-#include <linux/smc.h>
-
-#include <linux/skbuff.h>
-#ifdef CONFIG_OF_RESERVED_MEM
-#include <linux/of_reserved_mem.h>
-#endif
-
-#include "include/gnss.h"
-#include "gnss_link_device_shmem.h"
-
-#include "gnss_prj.h"
-
-void gnss_write_reg(struct shmem_link_device *shmd,
-		enum gnss_reg_type reg, u32 value)
-{
-	struct gnss_shared_reg *gnss_reg = shmd->reg[reg];
-	if (gnss_reg) {
-		switch(gnss_reg->device) {
-		case GNSS_IPC_MBOX:
-			mbox_set_value(shmd->mbx->id, gnss_reg->value.index, value);
-			break;
-		case GNSS_IPC_SHMEM:
-			iowrite32(value, gnss_reg->value.addr);
-			break;
-		default:
-			gif_err("Don't know where to write register! (%d)\n",
-					gnss_reg->device);
-		}
-	}
-	else {
-		gif_err("Couldn't find the register node.\n");
-	}
-	return;
-}
-
-u32 gnss_read_reg(struct shmem_link_device *shmd, enum gnss_reg_type reg)
-{
-	struct gnss_shared_reg *gnss_reg = shmd->reg[reg];
-	u32 ret = 0;
-
-	if (gnss_reg) {
-		switch(gnss_reg->device) {
-		case GNSS_IPC_MBOX:
-			ret = mbox_get_value(shmd->mbx->id, gnss_reg->value.index);
-			break;
-		case GNSS_IPC_SHMEM:
-			ret = ioread32(gnss_reg->value.addr);
-			break;
-		default:
-			gif_err("Don't know where to read register from! (%d)\n",
-					gnss_reg->device);
-		}
-	}
-	else {
-		gif_err("Couldn't find the register node.\n");
-	}
-
-	return ret;
-}
-
-/**
- * recv_int2ap
- * @shmd: pointer to an instance of shmem_link_device structure
- *
- * Returns the value of the GNSS-to-AP interrupt register.
- */
-static inline u16 recv_int2ap(struct shmem_link_device *shmd)
-{
-	return (u16)mbox_get_value(shmd->mbx->id, shmd->mbx->irq_gnss2ap_ipc_msg);
-}
-
-/**
- * send_int2cp
- * @shmd: pointer to an instance of shmem_link_device structure
- * @mask: value to be written to the AP-to-GNSS interrupt register
- */
-static inline void send_int2gnss(struct shmem_link_device *shmd, u16 mask)
-{
-	gnss_write_reg(shmd, GNSS_REG_TX_IPC_MSG, mask);
-	mbox_set_interrupt(shmd->mbx->id, shmd->mbx->int_ap2gnss_ipc_msg);
-}
-
-/**
- * get_shmem_status
- * @shmd: pointer to an instance of shmem_link_device structure
- * @dir: direction of communication (TX or RX)
- * @mst: pointer to an instance of mem_status structure
- *
- * Takes a snapshot of the current status of a SHMEM.
- */
-static void get_shmem_status(struct shmem_link_device *shmd,
-		enum direction dir, struct mem_status *mst)
-{
-	mst->dir = dir;
-	mst->head[TX] = get_txq_head(shmd);
-	mst->tail[TX] = get_txq_tail(shmd);
-	mst->head[RX] = get_rxq_head(shmd);
-	mst->tail[RX] = get_rxq_tail(shmd);
-	mst->int2ap = recv_int2ap(shmd);
-	mst->int2gnss = read_int2gnss(shmd);
-
-	gif_debug("----- %s -----\n", __func__);
-	gif_debug("%s: mst->dir      = %d\n", __func__, mst->dir);
-	gif_debug("%s: mst->head[TX] = %d\n", __func__, mst->head[TX]);
-	gif_debug("%s: mst->tail[TX] = %d\n", __func__, mst->tail[TX]);
-	gif_debug("%s: mst->head[RX] = %d\n", __func__, mst->head[RX]);
-	gif_debug("%s: mst->tail[RX] = %d\n", __func__, mst->tail[RX]);
-	gif_debug("%s: mst->int2ap   = %d\n", __func__, mst->int2ap);
-	gif_debug("%s: mst->int2gnss = %d\n", __func__, mst->int2gnss);
-	gif_debug("----- %s -----\n", __func__);
-}
-
-static inline void update_rxq_tail_status(struct shmem_link_device *shmd,
-                                          struct mem_status *mst)
-{
-	mst->tail[RX] = get_rxq_tail(shmd);
-}
-
-/**
- * ipc_rx_work
- * @ws: pointer to an instance of work_struct structure
- *
- * Invokes the recv method in the io_device instance to perform receiving IPC
- * messages from each skb.
- */
-static void msg_rx_work(struct work_struct *ws)
-{
-	struct shmem_link_device *shmd;
-	struct link_device *ld;
-	struct io_device *iod;
-	struct sk_buff *skb;
-
-	shmd = container_of(ws, struct shmem_link_device, msg_rx_dwork.work);
-	ld = &shmd->ld;
-
-	iod = ld->iod;
-	while (1) {
-		skb = skb_dequeue(ld->skb_rxq);
-		if (!skb)
-			break;
-		if (iod->recv_skb_single)
-			iod->recv_skb_single(iod, ld, skb);
-		else
-			gif_err("ERR! iod->recv_skb_single undefined!\n");
-	}
-}
-
-/**
- * rx_ipc_frames
- * @shmd: pointer to an instance of shmem_link_device structure
- * @mst: pointer to an instance of mem_status structure
- *
- * Returns
- *   ret < 0  : error
- *   ret == 0 : ILLEGAL status
- *   ret > 0  : valid data
- *
- * Must be invoked only when there is data in the corresponding RXQ.
- *
- * Requires a recv_skb method in the io_device instance, so this function must
- * be used for only EXYNOS.
- */
-static int rx_ipc_frames(struct shmem_link_device *shmd,
-			struct circ_status *circ)
-{
-	struct link_device *ld = &shmd->ld;
-	struct io_device *iod;
-	struct sk_buff_head *rxq = ld->skb_rxq;
-	struct sk_buff *skb;
-	/**
-	 * variables for the status of the circular queue
+ed, but who's crtc changes it's
+	 * configuration. This must be done before calling mode_fixup in case a
+	 * crtc only changed its mode but has the same set of connectors.
 	 */
-	u8 *src;
-	u8 hdr[EXYNOS_HEADER_SIZE];
-	/**
-	 * variables for RX processing
-	 */
-	int qsize;	/* size of the queue			*/
-	int rcvd;	/* size of data in the RXQ or error	*/
-	int rest;	/* size of the rest data		*/
-	int out;	/* index to the start of current frame	*/
-	int tot;	/* total length including padding data	*/
-
-	src = circ->buff;
-	qsize = circ->qsize;
-	out = circ->out;
-	rcvd = circ->size;
-
-	rest = circ->size;
-	tot = 0;
-
-	while (rest > 0) {
-		u8 ch;
-
-		/* Copy the header in the frame to the header buffer */
-		circ_read(hdr, src, qsize, out, EXYNOS_HEADER_SIZE);
+	for_each_crtc_in_state(state, crtc, crtc_state, i) {
+		int num_connectors;
 
 		/*
-		gif_err("src : 0x%p, out : 0x%x, recvd : 0x%x, qsize : 0x%x\n",
-				src, out, rcvd, qsize);
-		*/
-
-		/* Check the config field in the header */
-		if (unlikely(!exynos_start_valid(hdr))) {
-			gif_err("%s: ERR! %s INVALID config 0x%02X (rcvd %d, rest %d)\n",
-				ld->name, "FMT", hdr[0],
-				rcvd, rest);
-			goto bad_msg;
+		 * We must set ->active_changed after walking connectors for
+		 * otherwise an update that only changes active would result in
+		 * a full modeset because update_connector_routing force that.
+		 */
+		if (crtc->state->active != crtc_state->active) {
+			DRM_DEBUG_ATOMIC("[CRTC:%d] active changed\n",
+					 crtc->base.id);
+			crtc_state->active_changed = true;
 		}
 
-		/* Verify the total length of the frame (data + padding) */
-		tot = exynos_get_total_len(hdr);
-		if (unlikely(tot > rest)) {
-			gif_err("%s: ERR! %s tot %d > rest %d (rcvd %d)\n",
-				ld->name, "FMT", tot, rest, rcvd);
-			goto bad_msg;
+		if (!drm_atomic_crtc_needs_modeset(crtc_state))
+			continue;
+
+		DRM_DEBUG_ATOMIC("[CRTC:%d] needs all connectors, enable: %c, active: %c\n",
+				 crtc->base.id,
+				 crtc_state->enable ? 'y' : 'n',
+			      crtc_state->active ? 'y' : 'n');
+
+		ret = drm_atomic_add_affected_connectors(state, crtc);
+		if (ret != 0)
+			return ret;
+
+		ret = drm_atomic_add_affected_planes(state, crtc);
+		if (ret != 0)
+			return ret;
+
+		num_connectors = drm_atomic_connectors_for_crtc(state,
+								crtc);
+
+		if (crtc_state->enable != !!num_connectors) {
+			DRM_DEBUG_ATOMIC("[CRTC:%d] enabled/connectors mismatch\n",
+					 crtc->base.id);
+
+			return -EINVAL;
 		}
+	}
 
-		/* Allocate an skb */
-		skb = dev_alloc_skb(tot);
-		if (!skb) {
-			gif_err("%s: ERR! %s dev_alloc_skb(%d) fail\n",
-				ld->name, "FMT", tot);
-			goto no_mem;
+	return mode_fixup(state);
+}
+EXPORT_SYMBOL(drm_atomic_helper_check_modeset);
+
+/**
+ * drm_atomic_helper_check_planes - validate state object for planes changes
+ * @dev: DRM device
+ * @state: the driver state object
+ *
+ * Check the state object to see if the requested state is physically possible.
+ * This does all the plane update related checks using by calling into the
+ * ->atomic_check hooks provided by the driver.
+ *
+ * It also sets crtc_state->planes_changed to indicate that a crtc has
+ * updated planes.
+ *
+ * RETURNS
+ * Zero for success or -errno
+ */
+int
+drm_atomic_helper_check_planes(struct drm_device *dev,
+			       struct drm_atomic_state *state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	struct drm_plane *plane;
+	struct drm_plane_state *plane_state;
+	int i, ret = 0;
+
+	for_each_plane_in_state(state, plane, plane_state, i) {
+		const struct drm_plane_helper_funcs *funcs;
+
+		funcs = plane->helper_private;
+
+		drm_atomic_helper_plane_changed(state, plane_state, plane);
+
+		if (!funcs || !funcs->atomic_check)
+			continue;
+
+		ret = funcs->atomic_check(plane, plane_state);
+		if (ret) {
+			DRM_DEBUG_ATOMIC("[PLANE:%d] atomic driver check failed\n",
+					 plane->base.id);
+			return ret;
 		}
+	}
 
-		/* Set the attribute of the skb as "single frame" */
-		skbpriv(skb)->single_frame = true;
+	for_each_crtc_in_state(state, crtc, crtc_state, i) {
+		const struct drm_crtc_helper_funcs *funcs;
 
-		/* Read the frame from the RXQ */
-		circ_read(skb_put(skb, tot), src, qsize, out, tot);
+		funcs = crtc->helper_private;
 
-		/* Store the skb to the corresponding skb_rxq */
-		skb_queue_tail(rxq, skb);
+		if (!funcs || !funcs->atomic_check)
+			continue;
 
-		ch = exynos_get_ch(skb->data);
-		iod = ld->iod;
-		if (!iod) {
-			gif_err("%s: ERR! no IPC_BOOT iod\n", ld->name);
-			break;
+		ret = funcs->atomic_check(crtc, state->crtc_states[i]);
+		if (ret) {
+			DRM_DEBUG_ATOMIC("[CRTC:%d] atomic driver check failed\n",
+					 crtc->base.id);
+			return ret;
 		}
-
-		skbpriv(skb)->lnk_hdr = iod->link_header;
-		skbpriv(skb)->exynos_ch = ch;
-
-		/* Calculate new out value */
-		rest -= tot;
-		out += tot;
-		if (unlikely(out >= qsize))
-			out -= qsize;
 	}
 
-	/* Update tail (out) pointer to empty out the RXQ */
-	set_rxq_tail(shmd, circ->in);
-	return rcvd;
-
-no_mem:
-	/* Update tail (out) pointer to the frame to be read in the future */
-	set_rxq_tail(shmd, out);
-	rcvd -= rest;
-	return rcvd;
-
-bad_msg:
-	return -EBADMSG;
-}
-
-/**
- * msg_handler: receives IPC messages from every RXQ
- * @shmd: pointer to an instance of shmem_link_device structure
- * @mst: pointer to an instance of mem_status structure
- *
- * 1) Receives all IPC message frames currently in every IPC RXQ.
- * 2) Sends RES_ACK responses if there are REQ_ACK requests from a GNSS.
- * 3) Completes all threads waiting for the corresponding RES_ACK from a GNSS if
- *    there is any RES_ACK response.
- */
-static void msg_handler(struct shmem_link_device *shmd, struct mem_status *mst)
-{
-	struct link_device *ld = &shmd->ld;
-	struct circ_status circ;
-	int ret = 0;
-
-	/*
-	if (!ipc_active(shmd)) {
-		gif_err("%s: ERR! IPC is NOT ACTIVE!!!\n", ld->name);
-		trigger_forced_cp_crash(shmd);
-		return;
-	}
-	*/
-
-	/* Skip RX processing if there is no data in the RXQ */
-	if (mst->head[RX] == mst->tail[RX]) {
-		/* Release wakelock */
-		/* Write 0x0 to mbox register 6 */
-		/* done_req_ack(shmd); */
-		return;
-
-	}
-
-	/* Get the size of data in the RXQ */
-	ret = get_rxq_rcvd(shmd, mst, &circ);
-	if (unlikely(ret < 0)) {
-		gif_err("%s: ERR! get_rxq_rcvd fail (err %d)\n",
-			ld->name, ret);
-		return;
-	}
-
-	/* Read data in the RXQ */
-	ret = rx_ipc_frames(shmd, &circ);
-	if (unlikely(ret < 0)) {
-		return;
-	}
-}
-
-/**
- * ipc_rx_task: processes a SHMEM command or receives IPC messages
- * @shmd: pointer to an instance of shmem_link_device structure
- * @mst: pointer to an instance of mem_status structure
- *
- * Invokes cmd_handler for commands or msg_handler for IPC messages.
- */
-static void ipc_rx_task(unsigned long data)
-{
-	struct shmem_link_device *shmd = (struct shmem_link_device *)data;
-
-	while (1) {
-		struct mem_status *mst;
-
-		mst = gnss_msq_get_data_slot(&shmd->rx_msq);
-		if (!mst)
-			break;
-		memset(mst, 0, sizeof(struct mem_status));
-
-		get_shmem_status(shmd, RX, mst);
-
-		/* Update tail variables with the current tail pointers */
-		//update_rxq_tail_status(shmd, mst);
-
-		msg_handler(shmd, mst);
-
-		queue_delayed_work(system_wq, &shmd->msg_rx_dwork, 0);
-	}
-}
-
-/**
- * shmem_irq_handler: interrupt handler for a MCU_IPC interrupt
- * @data: pointer to a data
- *
- * 1) Reads the interrupt value
- * 2) Performs interrupt handling
- *
- * Flow for normal interrupt handling:
- *   shmem_irq_handler -> udl_handler
- *   shmem_irq_handler -> ipc_rx_task -> msg_handler -> rx_ipc_frames ->  ...
- */
-static void shmem_irq_msg_handler(void *data)
-{
-	struct shmem_link_device *shmd = (struct shmem_link_device *)data;
-	//struct mem_status *mst = gnss_msq_get_free_slot(&shmd->rx_msq);
-
-	gnss_msq_get_free_slot(&shmd->rx_msq);
-
-	/*
-	intr = recv_int2ap(shmd);
-	if (unlikely(!INT_VALID(intr))) {
-		gif_debug("%s: ERR! invalid intr 0x%X\n", ld->name, intr);
-		return;
-	}
-	*/
-
-	tasklet_hi_schedule(&shmd->rx_tsk);
-}
-
-/**
- * write_ipc_to_txq
- * @shmd: pointer to an instance of shmem_link_device structure
- * @circ: pointer to an instance of circ_status structure
- * @skb: pointer to an instance of sk_buff structure
- *
- * Must be invoked only when there is enough space in the TXQ.
- */
-static void write_ipc_to_txq(struct shmem_link_device *shmd,
-			struct circ_status *circ, struct sk_buff *skb)
-{
-	u32 qsize = circ->qsize;
-	u32 in = circ->in;
-	u8 *buff = circ->buff;
-	u8 *src = skb->data;
-	u32 len = skb->len;
-
-	/* Print send data to GNSS */
-	/* gnss_log_ipc_pkt(skb, TX); */
-
-	/* Write data to the TXQ */
-	circ_write(buff, src, qsize, in, len);
-
-	/* Update new head (in) pointer */
-	set_txq_head(shmd, circ_new_pointer(qsize, in, len));
-}
-
-/**
- * xmit_ipc_msg
- * @shmd: pointer to an instance of shmem_link_device structure
- *
- * Tries to transmit IPC messages in the skb_txq of @dev as many as possible.
- *
- * Returns total length of IPC messages transmit or an error code.
- */
-static int xmit_ipc_msg(struct shmem_link_device *shmd)
-{
-	struct link_device *ld = &shmd->ld;
-	struct sk_buff_head *txq = ld->skb_txq;
-	struct sk_buff *skb;
-	unsigned long flags;
-	struct circ_status circ;
-	int space;
-	int copied = 0;
-	bool chk_nospc = false;
-
-	/* Acquire the spin lock for a TXQ */
-	spin_lock_irqsave(&shmd->tx_lock, flags);
-
-	while (1) {
-		/* Get the size of free space in the TXQ */
-		space = get_txq_space(shmd, &circ);
-		if (unlikely(space < 0)) {
-			/* Empty out the TXQ */
-			reset_txq_circ(shmd);
-			copied = -EIO;
-			break;
-		}
-
-		skb = skb_dequeue(txq);
-		if (unlikely(!skb))
-			break;
-
-		/* CAUTION : Uplink size is limited to 16KB and
-			     this limitation is used ONLY in North America Prj.
-		   Check the free space size,
-		  - FMT : comparing with skb->len
-		  - RAW : check used buffer size  */
-		chk_nospc = (space < skb->len) ? true : false;
-		if (unlikely(chk_nospc)) {
-			/* Set res_required flag */
-			atomic_set(&shmd->res_required, skb->len);
-
-			/* Take the skb back to the skb_txq */
-			skb_queue_head(txq, skb);
-
-			gif_err("%s: <by %pf> NOSPC in %s_TXQ {qsize:%u in:%u out:%u} free:%u < len:%u\n",
-				ld->name, CALLER, "FMT",
-				circ.qsize, circ.in, circ.out, space, skb->len);
-			copied = -ENOSPC;
-			break;
-		}
-
-		/* TX only when there is enough space in the TXQ */
-		write_ipc_to_txq(shmd, &circ, skb);
-		copied += skb->len;
-		dev_kfree_skb_any(skb);
-	}
-
-	/* Release the spin lock */
-	spin_unlock_irqrestore(&shmd->tx_lock, flags);
-
-	return copied;
-}
-
-/**
- * fmt_tx_work: performs TX for FMT IPC device under SHMEM flow control
- * @ws: pointer to an instance of the work_struct structure
- *
- * 1) Starts waiting for RES_ACK of FMT IPC device.
- * 2) Returns immediately if the wait is interrupted.
- * 3) Restarts SHMEM flow control if there is a timeout from the wait.
- * 4) Otherwise, it performs processing RES_ACK for FMT IPC device.
- */
-static void fmt_tx_work(struct work_struct *ws)
-{
-	struct link_device *ld;
-	struct shmem_link_device *shmd;
-	struct circ_status circ;
-	int space;
-	int space_needed;
-
-	ld = container_of(ws, struct link_device, fmt_tx_dwork.work);
-	shmd = to_shmem_link_device(ld);
-
-	space = get_txq_space(shmd, &circ);
-	space_needed = atomic_read(&shmd->res_required);
-
-	if (unlikely(space_needed < space))
-		queue_delayed_work(ld->tx_wq, ld->tx_dwork,
-				msecs_to_jiffies(1));
-	else
-		atomic_set(&shmd->res_required, 0);
-
-	return;
-}
-
-/**
- * shmem_send_ipc
- * @shmd: pointer to an instance of shmem_link_device structure
- * @skb: pointer to an skb that will be transmitted
- *
- * 1) Tries to transmit IPC messages in the skb_txq with xmit_ipc_msg().
- * 2) Sends an interrupt to GNSS if there is no error from xmit_ipc_msg().
- * 3) Starts SHMEM flow control if xmit_ipc_msg() returns -ENOSPC.
- */
-static int shmem_send_ipc(struct shmem_link_device *shmd)
-{
-	struct link_device *ld = &shmd->ld;
-	int ret;
-
-	if (atomic_read(&shmd->res_required) > 0) {
-		gif_err("%s: %s_TXQ is full\n", ld->name, "FMT");
-		return 0;
-	}
-
-	ret = xmit_ipc_msg(shmd);
-	if (likely(ret > 0)) {
-		send_int2gnss(shmd, 0x82);
-		goto exit;
-	}
-
-	/* If there was no TX, just exit */
-	if (ret == 0)
-		goto exit;
-
-	/* At this point, ret < 0 */
-	if (ret == -ENOSPC || ret == -EBUSY) {
-		/*----------------------------------------------------*/
-		/* shmd->res_required was set in xmit_ipc_msg(). */
-		/*----------------------------------------------------*/
-
-		queue_delayed_work(ld->tx_wq, ld->tx_dwork,
-				   msecs_to_jiffies(1));
-	}
-
-exit:
 	return ret;
 }
+EXPORT_SYMBOL(drm_atomic_helper_check_planes);
 
 /**
- * shmem_try_send_ipc
- * @shmd: pointer to an instance of shmem_link_device structure
- * @iod: pointer to an instance of the io_device structure
- * @skb: pointer to an skb that will be transmitted
+ * drm_atomic_helper_check - validate state object
+ * @dev: DRM device
+ * @state: the driver state object
  *
- * 1) Enqueues an skb to the skb_txq for @dev in the link device instance.
- * 2) Tries to transmit IPC messages with shmem_send_ipc().
+ * Check the state object to see if the requested state is physically possible.
+ * Only crtcs and planes have check callbacks, so for any additional (global)
+ * checking that a driver needs it can simply wrap that around this function.
+ * Drivers without such needs can directly use this as their ->atomic_check()
+ * callback.
+ *
+ * This just wraps the two parts of the state checking for planes and modeset
+ * state in the default order: First it calls drm_atomic_helper_check_modeset()
+ * and then drm_atomic_helper_check_planes(). The assumption is that the
+ * ->atomic_check functions depend upon an updated adjusted_mode.clock to
+ * e.g. properly compute watermarks.
+ *
+ * RETURNS
+ * Zero for success or -errno
  */
-static void shmem_try_send_ipc(struct shmem_link_device *shmd,
-			struct io_device *iod, struct sk_buff *skb)
+int drm_atomic_helper_check(struct drm_device *dev,
+			    struct drm_atomic_state *state)
 {
-	struct link_device *ld = &shmd->ld;
-	struct sk_buff_head *txq = ld->skb_txq;
 	int ret;
 
-	if (unlikely(txq->qlen >= MAX_SKB_TXQ_DEPTH)) {
-		gif_err("%s: %s txq->qlen %d >= %d\n", ld->name,
-			"FMT", txq->qlen, MAX_SKB_TXQ_DEPTH);
-		dev_kfree_skb_any(skb);
-		return;
+	ret = drm_atomic_helper_check_modeset(dev, state);
+	if (ret)
+		return ret;
+
+	ret = drm_atomic_helper_check_planes(dev, state);
+	if (ret)
+		return ret;
+
+	return ret;
+}
+EXPORT_SYMBOL(drm_atomic_helper_check);
+
+static void
+disable_outputs(struct drm_device *dev, struct drm_atomic_state *old_state)
+{
+	struct drm_connector *connector;
+	struct drm_connector_state *old_conn_state;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
+	int i;
+
+	for_each_connector_in_state(old_state, connector, old_conn_state, i) {
+		const struct drm_encoder_helper_funcs *funcs;
+		struct drm_encoder *encoder;
+		struct drm_crtc_state *old_crtc_state;
+
+		/* Shut down everything that's in the changeset and currently
+		 * still on. So need to check the old, saved state. */
+		if (!old_conn_state->crtc)
+			continue;
+
+		old_crtc_state = old_state->crtc_states[drm_crtc_index(old_conn_state->crtc)];
+
+		if (!old_crtc_state->active ||
+		    !drm_atomic_crtc_needs_modeset(old_conn_state->crtc->state))
+			continue;
+
+		encoder = old_conn_state->best_encoder;
+
+		/* We shouldn't get this far if we didn't previously have
+		 * an encoder.. but WARN_ON() rather than explode.
+		 */
+		if (WARN_ON(!encoder))
+			continue;
+
+		funcs = encoder->helper_private;
+
+		DRM_DEBUG_ATOMIC("disabling [ENCODER:%d:%s]\n",
+				 encoder->base.id, encoder->name);
+
+		/*
+		 * Each encoder has at most one connector (since we always steal
+		 * it away), so we won't call disable hooks twice.
+		 */
+		drm_bridge_disable(encoder->bridge);
+
+		/* Right function depends upon target state. */
+		if (connector->state->crtc && funcs->prepare)
+			funcs->prepare(encoder);
+		else if (funcs->disable)
+			funcs->disable(encoder);
+		else
+			funcs->dpms(encoder, DRM_MODE_DPMS_OFF);
+
+		drm_bridge_post_disable(encoder->bridge);
 	}
 
-	skb_queue_tail(txq, skb);
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		const struct drm_crtc_helper_funcs *funcs;
 
-	ret = shmem_send_ipc(shmd);
-	if (ret < 0) {
-		gif_err("%s->%s: ERR! shmem_send_ipc fail (err %d)\n",
-			iod->name, ld->name, ret);
+		/* Shut down everything that needs a full modeset. */
+		if (!drm_atomic_crtc_needs_modeset(crtc->state))
+			continue;
+
+		if (!old_crtc_state->active)
+			continue;
+
+		funcs = crtc->helper_private;
+
+		DRM_DEBUG_ATOMIC("disabling [CRTC:%d]\n",
+				 crtc->base.id);
+
+
+		/* Right function depends upon target state. */
+		if (crtc->state->enable && funcs->prepare)
+			funcs->prepare(crtc);
+		else if (funcs->disable)
+			funcs->disable(crtc);
+		else
+			funcs->dpms(crtc, DRM_MODE_DPMS_OFF);
 	}
 }
 
 /**
- * shmem_send
- * @ld: pointer to an instance of the link_device structure
- * @iod: pointer to an instance of the io_device structure
- * @skb: pointer to an skb that will be transmitted
+ * drm_atomic_helper_update_legacy_modeset_state - update legacy modeset state
+ * @dev: DRM device
+ * @old_state: atomic state object with old state structures
  *
- * Returns the length of data transmitted or an error code.
+ * This function updates all the various legacy modeset state pointers in
+ * connectors, encoders and crtcs. It also updates the timestamping constants
+ * used for precise vblank timestamps by calling
+ * drm_calc_timestamping_constants().
  *
- * Normal call flow for an IPC message:
- *   shmem_try_send_ipc -> shmem_send_ipc -> xmit_ipc_msg -> write_ipc_to_txq
- *
- * Call flow on congestion in a IPC TXQ:
- *   shmem_try_send_ipc -> shmem_send_ipc -> xmit_ipc_msg ,,, queue_delayed_work
- *   => xxx_tx_work -> wait_for_res_ack
- *   => msg_handler
- *   => process_res_ack -> xmit_ipc_msg (,,, queue_delayed_work ...)
+ * Drivers can use this for building their own atomic commit if they don't have
+ * a pure helper-based modeset implementation.
  */
-static int shmem_send(struct link_device *ld, struct io_device *iod,
-			struct sk_buff *skb)
+void
+drm_atomic_helper_update_legacy_modeset_state(struct drm_device *dev,
+					      struct drm_atomic_state *old_state)
 {
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-	int len = skb->len;
-
-#ifndef USE_SIMPLE_WAKE_LOCK
-	wake_lock_timeout(&shmd->wlock, IPC_WAKELOCK_TIMEOUT);
-#endif
-
-	shmem_try_send_ipc(shmd, iod, skb);
-
-	return len;
-}
-
-static void shmem_remap_ipc_region(struct shmem_link_device *shmd)
-{
-	struct shmem_ipc_device *dev;
-	struct gnss_shared_reg *shreg;
-	u32 tx_size, rx_size, sh_reg_size;
-	u8 *tmap;
-	u32 *reg_base;
+	struct drm_connector *connector;
+	struct drm_connector_state *old_conn_state;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
 	int i;
 
-	tmap = (u8 *)shmd->ipc_mem.vaddr;
+	/* clear out existing links and update dpms */
+	for_each_connector_in_state(old_state, connector, old_conn_state, i) {
+		if (connector->encoder) {
+			WARN_ON(!connector->encoder->crtc);
 
-	/* FMT */
-	dev = &shmd->ipc_map.dev;
-
-	sh_reg_size = shmd->ipc_reg_cnt * sizeof(u32);
-	rx_size = shmd->ipc_mem.size / 2;
-	tx_size = shmd->ipc_mem.size / 2 - sh_reg_size;
-
-	dev->rxq.buff = (u8 __iomem *)(tmap);
-	dev->rxq.size = rx_size;
-
-	dev->txq.buff = (u8 __iomem *)(tmap + rx_size);
-	dev->txq.size = tx_size;
-
-	reg_base = (u32 *)(tmap + shmd->ipc_mem.size - sh_reg_size);
-
-	gif_err("RX region : %x @ %p\n", dev->rxq.size, dev->rxq.buff);
-	gif_err("TX region : %x @ %p\n", dev->txq.size, dev->txq.buff);
-
-	for (i = 0; i < GNSS_REG_COUNT; i++) {
-		shreg = shmd->reg[i];
-		if (shreg && (shreg->device == GNSS_IPC_SHMEM)) {
-			shreg->value.addr = reg_base + shreg->value.index;
-			gif_err("Reg %s -> %p\n", shreg->name, shreg->value.addr);
+			connector->encoder->crtc = NULL;
+			connector->encoder = NULL;
 		}
+
+		crtc = connector->state->crtc;
+		if ((!crtc && old_conn_state->crtc) ||
+		    (crtc && drm_atomic_crtc_needs_modeset(crtc->state))) {
+			struct drm_property *dpms_prop =
+				dev->mode_config.dpms_property;
+			int mode = DRM_MODE_DPMS_OFF;
+
+			if (crtc && crtc->state->active)
+				mode = DRM_MODE_DPMS_ON;
+
+			connector->dpms = mode;
+			drm_object_property_set_value(&connector->base,
+						      dpms_prop, mode);
+		}
+	}
+
+	/* set new links */
+	for_each_connector_in_state(old_state, connector, old_conn_state, i) {
+		if (!connector->state->crtc)
+			continue;
+
+		if (WARN_ON(!connector->state->best_encoder))
+			continue;
+
+		connector->encoder = connector->state->best_encoder;
+		connector->encoder->crtc = connector->state->crtc;
+	}
+
+	/* set legacy state in the crtc structure */
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		struct drm_plane *primary = crtc->primary;
+
+		crtc->mode = crtc->state->mode;
+		crtc->enabled = crtc->state->enable;
+
+		if (drm_atomic_get_existing_plane_state(old_state, primary) &&
+		    primary->state->crtc == crtc) {
+			crtc->x = primary->state->src_x >> 16;
+			crtc->y = primary->state->src_y >> 16;
+		}
+
+		if (crtc->state->enable)
+			drm_calc_timestamping_constants(crtc,
+							&crtc->state->adjusted_mode);
+	}
+}
+EXPORT_SYMBOL(drm_atomic_helper_update_legacy_modeset_state);
+
+static void
+crtc_set_mode(struct drm_device *dev, struct drm_atomic_state *old_state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
+	struct drm_connector *connector;
+	struct drm_connector_state *old_conn_state;
+	int i;
+
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		const struct drm_crtc_helper_funcs *funcs;
+
+		if (!crtc->state->mode_changed)
+			continue;
+
+		funcs = crtc->helper_private;
+
+		if (crtc->state->enable && funcs->mode_set_nofb) {
+			DRM_DEBUG_ATOMIC("modeset on [CRTC:%d]\n",
+					 crtc->base.id);
+
+			funcs->mode_set_nofb(crtc);
+		}
+	}
+
+	for_each_connector_in_state(old_state, connector, old_conn_state, i) {
+		const struct drm_encoder_helper_funcs *funcs;
+		struct drm_crtc_state *new_crtc_state;
+		struct drm_encoder *encoder;
+		struct drm_display_mode *mode, *adjusted_mode;
+
+		if (!connector->state->best_encoder)
+			continue;
+
+		encoder = connector->state->best_encoder;
+		funcs = encoder->helper_private;
+		new_crtc_state = connector->state->crtc->state;
+		mode = &new_crtc_state->mode;
+		adjusted_mode = &new_crtc_state->adjusted_mode;
+
+		if (!new_crtc_state->mode_changed)
+			continue;
+
+		DRM_DEBUG_ATOMIC("modeset on [ENCODER:%d:%s]\n",
+				 encoder->base.id, encoder->name);
+
+		/*
+		 * Each encoder has at most one connector (since we always steal
+		 * it away), so we won't call mode_set hooks twice.
+		 */
+		if (funcs->mode_set)
+			funcs->mode_set(encoder, mode, adjusted_mode);
+
+		drm_bridge_mode_set(encoder->bridge, mode, adjusted_mode);
 	}
 }
 
-static int shmem_init_ipc_map(struct shmem_link_device *shmd)
+/**
+ * drm_atomic_helper_commit_modeset_disables - modeset commit to disable outputs
+ * @dev: DRM device
+ * @old_state: atomic state object with old state structures
+ *
+ * This function shuts down all the outputs that need to be shut down and
+ * prepares them (if required) with the new mode.
+ *
+ * For compatibility with legacy crtc helpers this should be called before
+ * drm_atomic_helper_commit_planes(), which is what the default commit function
+ * does. But drivers with different needs can group the modeset commits together
+ * and do the plane commits at the end. This is useful for drivers doing runtime
+ * PM since planes updates then only happen when the CRTC is actually enabled.
+ */
+void drm_atomic_helper_commit_modeset_disables(struct drm_device *dev,
+					       struct drm_atomic_state *old_state)
 {
-	shmem_remap_ipc_region(shmd);
+	disable_outputs(dev, old_state);
 
-	memset(shmd->ipc_mem.vaddr, 0, shmd->ipc_mem.size);
+	drm_atomic_helper_update_legacy_modeset_state(dev, old_state);
 
-	shmd->dev = &shmd->ipc_map.dev;
+	crtc_set_mode(dev, old_state);
+}
+EXPORT_SYMBOL(drm_atomic_helper_commit_modeset_disables);
+
+/**
+ * drm_atomic_helper_commit_modeset_enables - modeset commit to enable outputs
+ * @dev: DRM device
+ * @old_state: atomic state object with old state structures
+ *
+ * This function enables all the outputs with the new configuration which had to
+ * be turned off for the update.
+ *
+ * For compatibility with legacy crtc helpers this should be called after
+ * drm_atomic_helper_commit_planes(), which is what the default commit function
+ * does. But drivers with different needs can group the modeset commits together
+ * and do the plane commits at the end. This is useful for drivers doing runtime
+ * PM since planes updates then only happen when the CRTC is actually enabled.
+ */
+void drm_atomic_helper_commit_modeset_enables(struct drm_device *dev,
+					      struct drm_atomic_state *old_state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
+	struct drm_connector *connector;
+	struct drm_connector_state *old_conn_state;
+	int i;
+
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		const struct drm_crtc_helper_funcs *funcs;
+
+		/* Need to filter out CRTCs where only planes change. */
+		if (!drm_atomic_crtc_needs_modeset(crtc->state))
+			continue;
+
+		if (!crtc->state->active)
+			continue;
+
+		funcs = crtc->helper_private;
+
+		if (crtc->state->enable) {
+			DRM_DEBUG_ATOMIC("enabling [CRTC:%d]\n",
+					 crtc->base.id);
+
+			if (funcs->enable)
+				funcs->enable(crtc);
+			else
+				funcs->commit(crtc);
+		}
+	}
+
+	for_each_connector_in_state(old_state, connector, old_conn_state, i) {
+		const struct drm_encoder_helper_funcs *funcs;
+		struct drm_encoder *encoder;
+
+		if (!connector->state->best_encoder)
+			continue;
+
+		if (!connector->state->crtc->state->active ||
+		    !drm_atomic_crtc_needs_modeset(connector->state->crtc->state))
+			continue;
+
+		encoder = connector->state->best_encoder;
+		funcs = encoder->helper_private;
+
+		DRM_DEBUG_ATOMIC("enabling [ENCODER:%d:%s]\n",
+				 encoder->base.id, encoder->name);
+
+		/*
+		 * Each encoder has at most one connector (since we always steal
+		 * it away), so we won't call enable hooks twice.
+		 */
+		drm_bridge_pre_enable(encoder->bridge);
+
+		if (funcs->enable)
+			funcs->enable(encoder);
+		else
+			funcs->commit(encoder);
+
+		drm_bridge_enable(encoder->bridge);
+	}
+}
+EXPORT_SYMBOL(drm_atomic_helper_commit_modeset_enables);
+
+static void wait_for_fences(struct drm_device *dev,
+			    struct drm_atomic_state *state)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *plane_state;
+	int i;
+
+	for_each_plane_in_state(state, plane, plane_state, i) {
+		if (!plane->state->fence)
+			continue;
+
+		WARN_ON(!plane->state->fb);
+
+		fence_wait(plane->state->fence, false);
+		fence_put(plane->state->fence);
+		plane->state->fence = NULL;
+	}
+}
+
+static bool framebuffer_changed(struct drm_device *dev,
+				struct drm_atomic_state *old_state,
+				struct drm_crtc *crtc)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *old_plane_state;
+	int i;
+
+	for_each_plane_in_state(old_state, plane, old_plane_state, i) {
+		if (plane->state->crtc != crtc &&
+		    old_plane_state->crtc != crtc)
+			continue;
+
+		if (plane->state->fb != old_plane_state->fb)
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * drm_atomic_helper_wait_for_vblanks - wait for vblank on crtcs
+ * @dev: DRM device
+ * @old_state: atomic state object with old state structures
+ *
+ * Helper to, after atomic commit, wait for vblanks on all effected
+ * crtcs (ie. before cleaning up old framebuffers using
+ * drm_atomic_helper_cleanup_planes()). It will only wait on crtcs where the
+ * framebuffers have actually changed to optimize for the legacy cursor and
+ * plane update use-case.
+ */
+void
+drm_atomic_helper_wait_for_vblanks(struct drm_device *dev,
+		struct drm_atomic_state *old_state)
+{
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
+	int i, ret;
+
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		/* No one cares about the old state, so abuse it for tracking
+		 * and store whether we hold a vblank reference (and should do a
+		 * vblank wait) in the ->enable boolean. */
+		old_crtc_state->enable = false;
+
+		if (!crtc->state->enable)
+			continue;
+
+		/* Legacy cursor ioctls are completely unsynced, and userspace
+		 * relies on that (by doing tons of cursor updates). */
+		if (old_state->legacy_cursor_update)
+			continue;
+
+		if (!framebuffer_changed(dev, old_state, crtc))
+			continue;
+
+		ret = drm_crtc_vblank_get(crtc);
+		if (ret != 0)
+			continue;
+
+		old_crtc_state->enable = true;
+		old_crtc_state->last_vblank_count = drm_crtc_vblank_count(crtc);
+	}
+
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		if (!old_crtc_state->enable)
+			continue;
+
+		ret = wait_event_timeout(dev->vblank[i].queue,
+				old_crtc_state->last_vblank_count !=
+					drm_crtc_vblank_count(crtc),
+				msecs_to_jiffies(50));
+
+		drm_crtc_vblank_put(crtc);
+	}
+}
+EXPORT_SYMBOL(drm_atomic_helper_wait_for_vblanks);
+
+/**
+ * drm_atomic_helper_commit - commit validated state object
+ * @dev: DRM device
+ * @state: the driver state object
+ * @async: asynchronous commit
+ *
+ * This function commits a with drm_atomic_helper_check() pre-validated state
+ * object. This can still fail when e.g. the framebuffer reservation fails. For
+ * now this doesn't implement asynchronous commits.
+ *
+ * Note that right now this function does not support async commits, and hence
+ * driver writers must implement their own version for now. Also note that the
+ * default ordering of how the various stages are called is to match the legacy
+ * modeset helper library closest. One peculiarity of that is that it doesn't
+ * mesh well with runtime PM at all.
+ *
+ * For drivers supporting runtime PM the recommended sequence is
+ *
+ *     drm_atomic_helper_commit_modeset_disables(dev, state);
+ *
+ *     drm_atomic_helper_commit_modeset_enables(dev, state);
+ *
+ *     drm_atomic_helper_commit_planes(dev, state, true);
+ *
+ * See the kerneldoc entries for these three functions for more details.
+ *
+ * RETURNS
+ * Zero for success or -errno.
+ */
+int drm_atomic_helper_commit(struct drm_device *dev,
+			     struct drm_atomic_state *state,
+			     bool async)
+{
+	int ret;
+
+	if (async)
+		return -EBUSY;
+
+	ret = drm_atomic_helper_prepare_planes(dev, state);
+	if (ret)
+		return ret;
+
+	/*
+	 * This is the point of no return - everything below never fails except
+	 * when the hw goes bonghits. Which means we can commit the new state on
+	 * the software side now.
+	 */
+
+	drm_atomic_helper_swap_state(dev, state);
+
+	/*
+	 * Everything below can be run asynchronously without the need to grab
+	 * any modeset locks at all under one condition: It must be guaranteed
+	 * that the asynchronous work has either been cancelled (if the driver
+	 * supports it, which at least requires that the framebuffers get
+	 * cleaned up with drm_atomic_helper_cleanup_planes()) or completed
+	 * before the new state gets committed on the software side with
+	 * drm_atomic_helper_swap_state().
+	 *
+	 * This scheme allows new atomic state updates to be prepared and
+	 * checked in parallel to the asynchronous completion of the previous
+	 * update. Which is important since compositors need to figure out the
+	 * composition of the next frame right after having submitted the
+	 * current layout.
+	 */
+
+	wait_for_fences(dev, state);
+
+	drm_atomic_helper_commit_modeset_disables(dev, state);
+
+	drm_atomic_helper_commit_planes(dev, state, false);
+
+	drm_atomic_helper_commit_modeset_enables(dev, state);
+
+	drm_atomic_helper_wait_for_vblanks(dev, state);
+
+	drm_atomic_helper_cleanup_planes(dev, state);
+
+	drm_atomic_state_free(state);
 
 	return 0;
 }
+EXPORT_SYMBOL(drm_atomic_helper_commit);
 
-static void shmem_reset_buffers(struct link_device *ld)
+/**
+ * DOC: implementing async commit
+ *
+ * For now the atomic helpers don't support async commit directly. If there is
+ * real need it could be added though, using the dma-buf fence infrastructure
+ * for generic synchronization with outstanding rendering.
+ *
+ * For now drivers have to implement async commit themselves, with the following
+ * sequence being the recommended one:
+ *
+ * 1. Run drm_atomic_helper_prepare_planes() first. This is the only function
+ * which commit needs to call which can fail, so we want to run it first and
+ * synchronously.
+ *
+ * 2. Synchronize with any outstanding asynchronous commit worker threads which
+ * might be affected the new state update. This can be done by either cancelling
+ * or flushing the work items, depending upon whether the driver can deal with
+ * cancelled updates. Note that it is important to ensure that the framebuffer
+ * cleanup is still done when cancelling.
+ *
+ * For sufficient parallelism it is recommended to have a work item per crtc
+ * (for updates which don't touch global state) and a global one. Then we only
+ * need to synchronize with the crtc work items for changed crtcs and the global
+ * work item, which allows nice concurrent updates on disjoint sets of crtcs.
+ *
+ * 3. The software state is updated synchronously with
+ * drm_atomic_helper_swap_state(). Doing this under the protection of all modeset
+ * locks means concurrent callers never see inconsistent state. And doing this
+ * while it's guaranteed that no relevant async worker runs means that async
+ * workers do not need grab any locks. Actually they must not grab locks, for
+ * otherwise the work flushing will deadlock.
+ *
+ * 4. Schedule a work item to do all subsequent steps, using the split-out
+ * commit helpers: a) pre-plane commit b) plane commit c) post-plane commit and
+ * then cleaning up the framebuffers after the old framebuffer is no longer
+ * being displayed.
+ */
+
+/**
+ * drm_atomic_helper_prepare_planes - prepare plane resources before commit
+ * @dev: DRM device
+ * @state: atomic state object with new state structures
+ *
+ * This function prepares plane state, specifically framebuffers, for the new
+ * configuration. If any failure is encountered this function will call
+ * ->cleanup_fb on any already successfully prepared framebuffer.
+ *
+ * Returns:
+ * 0 on success, negative error code on failure.
+ */
+int drm_atomic_helper_prepare_planes(struct drm_device *dev,
+				     struct drm_atomic_state *state)
 {
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-	purge_txq(ld);
-	purge_rxq(ld);
-	clear_shmem_map(shmd);
+	int nplanes = dev->mode_config.num_total_plane;
+	int ret, i;
 
-	return;
+	for (i = 0; i < nplanes; i++) {
+		const struct drm_plane_helper_funcs *funcs;
+		struct drm_plane *plane = state->planes[i];
+		struct drm_plane_state *plane_state = state->plane_states[i];
+
+		if (!plane)
+			continue;
+
+		funcs = plane->helper_private;
+
+		if (funcs->prepare_fb) {
+			ret = funcs->prepare_fb(plane, plane_state);
+			if (ret)
+				goto fail;
+		}
+	}
+
+	return 0;
+
+fail:
+	for (i--; i >= 0; i--) {
+		const struct drm_plane_helper_funcs *funcs;
+		struct drm_plane *plane = state->planes[i];
+		struct drm_plane_state *plane_state = state->plane_states[i];
+
+		if (!plane)
+			continue;
+
+		funcs = plane->helper_private;
+
+		if (funcs->cleanup_fb)
+			funcs->cleanup_fb(plane, plane_state);
+
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL(drm_atomic_helper_prepare_planes);
+
+bool plane_crtc_active(struct drm_plane_state *state)
+{
+	return state->crtc && state->crtc->state->active;
 }
 
-static int shmem_copy_reserved_to_user(struct link_device *ld, u32 offset,
-			void __user *user_dst, u32 size)
+/**
+ * drm_atomic_helper_commit_planes - commit plane state
+ * @dev: DRM device
+ * @old_state: atomic state object with old state structures
+ * @active_only: Only commit on active CRTC if set
+ *
+ * This function commits the new plane state using the plane and atomic helper
+ * functions for planes and crtcs. It assumes that the atomic state has already
+ * been pushed into the relevant object state pointers, since this step can no
+ * longer fail.
+ *
+ * It still requires the global state object @old_state to know which planes and
+ * crtcs need to be updated though.
+ *
+ * Note that this function does all plane updates across all CRTCs in one step.
+ * If the hardware can't support this approach look at
+ * drm_atomic_helper_commit_planes_on_crtc() instead.
+ *
+ * Plane parameters can be updated by applications while the associated CRTC is
+ * disabled. The DRM/KMS core will store the parameters in the plane state,
+ * which will be available to the driver when the CRTC is turned on. As a result
+ * most drivers don't need to be immediately notified of plane updates for a
+ * disabled CRTC.
+ *
+ * Unless otherwise needed, drivers are advised to set the @active_only
+ * parameters to true in order not to receive plane update notifications related
+ * to a disabled CRTC. This avoids the need to manually ignore plane updates in
+ * driver code when the driver and/or hardware can't or just don't need to deal
+ * with updates on disabled CRTCs, for example when supporting runtime PM.
+ *
+ * The drm_atomic_helper_commit() default implementation only sets @active_only
+ * to false to most closely match the behaviour of the legacy helpers. This should
+ * not be copied blindly by drivers.
+ */
+void drm_atomic_helper_commit_planes(struct drm_device *dev,
+				     struct drm_atomic_state *old_state,
+				     bool active_only)
 {
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-	int err = 0;
-
-	if (offset + size > shmd->res_mem.size) {
-		gif_err("Unable to read %d bytes @ 0x%p+0x%x\n", size,
-				shmd->res_mem.vaddr, offset);
-		err = -EFAULT;
-		goto shmem_copy_to_fault;
-	}
-
-	gif_debug("base addr = 0x%p\n", shmd->res_mem.vaddr);
-	err = copy_to_user(user_dst, (void *)shmd->res_mem.vaddr + offset,
-				size);
-	if (err) {
-		gif_err("copy_to_user fail\n");
-		err = -EFAULT;
-		goto shmem_copy_to_fault;
-	}
-
-shmem_copy_to_fault:
-	return err;
-}
-
-static void shmem_set_autorun_cmd(struct link_device *ld, u32 size)
-{
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-	u32 *cmd = (u32 *)shmd->res_mem.vaddr;
-
-	gif_err("+++\n");
-
-	cmd[0] = GNSS_AUTO_RUN;	/* command */
-	cmd[1] = 0;		/* fw start address */
-	cmd[2] = size;		/* firmware size */
-	cmd[3] = 0;		/* reserved */
-}
-
-static int shmem_copy_reserved_from_user(struct link_device *ld, u32 offset,
-			void __user *user_src, u32 size)
-{
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-	int err = 0;
-
-	if (offset + size > shmd->res_mem.size) {
-		gif_err("Unable to load %d bytes @ 0x%p+0x%x\n", size,
-				shmd->res_mem.vaddr, offset);
-		err = -EFAULT;
-		goto shmem_copy_from_fault;
-	}
-
-	gif_debug("base addr = 0x%p\n", shmd->res_mem.vaddr);
-	err = copy_from_user((void *)shmd->res_mem.vaddr + offset,
-				user_src, size);
-	if (err) {
-		gif_err("copy_from_user fail\n");
-		err = -EFAULT;
-		goto shmem_copy_from_fault;
-	}
-
-shmem_copy_from_fault:
-	return err;
-}
-
-static int shmem_dump_fault_mem_to_user(struct link_device *ld,
-			void __user *user_dst, u32 size)
-{
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-	int err = 0;
-
-	if (size > shmd->fault_mem.size) {
-		gif_err("Unable to dump %d bytes (max %d bytes)\n", size,
-				shmd->fault_mem.size);
-		err = -EFAULT;
-		goto shmem_dump_mem_to_fault;
-	}
-
-	gif_debug("fault addr = 0x%p\n", shmd->fault_mem.vaddr);
-	err = copy_to_user(user_dst, shmd->fault_mem.vaddr, size);
-
-	if (err) {
-		gif_err("copy_to_user fail\n");
-		err = -EFAULT;
-		goto shmem_dump_mem_to_fault;
-	}
-
-shmem_dump_mem_to_fault:
-	return err;
-}
-
-static int shmem_dump_fault_mbx_to_user(struct link_device *ld,
-			void __user *user_dst, u32 size)
-{
-	struct gnss_data *pdata;
-	struct gnss_mbox *mbx;
-	u32 *dump_info;
-	unsigned int max_size;
-	int reg_cnt;
-	int err = 0;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *old_crtc_state;
+	struct drm_plane *plane;
+	struct drm_plane_state *old_plane_state;
 	int i;
 
-	pdata = ld->gnss_data;
-	mbx = pdata->mbx;
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		const struct drm_crtc_helper_funcs *funcs;
 
-	reg_cnt = pdata->fault_info.size;
-	max_size = reg_cnt * sizeof(u32);
+		funcs = crtc->helper_private;
 
-	if (size > max_size) {
-		gif_err("Unable to dump %d bytes (max %d bytes)\n", size,
-				max_size);
-		err = -EFAULT;
-		goto shmem_dump_mbx_to_fault;
+		if (!funcs || !funcs->atomic_begin)
+			continue;
+
+		if (active_only && !crtc->state->active)
+			continue;
+
+		funcs->atomic_begin(crtc, old_crtc_state);
 	}
 
-	dump_info = kzalloc(max_size, GFP_KERNEL);
-	if (!dump_info) {
-		gif_err("Could not allocate fault info memory\n");
-		err = -ENOMEM;
-		goto shmem_dump_mbx_to_fault;
-	}
+	for_each_plane_in_state(old_state, plane, old_plane_state, i) {
+		const struct drm_plane_helper_funcs *funcs;
+		bool disabling;
 
-	for (i = 0; i < reg_cnt; i++)
-		dump_info[i] = mbox_get_value(mbx->id,
-				pdata->fault_info.value.index + i);
+		funcs = plane->helper_private;
 
-	err = copy_to_user(user_dst, dump_info, size);
-	kfree(dump_info);
-	if (err) {
-		gif_err("copy_to_user fail\n");
-		err = -EFAULT;
-		goto shmem_dump_mbx_to_fault;
-	}
+		if (!funcs)
+			continue;
 
-shmem_dump_mbx_to_fault:
-	return err;
-}
+		disabling = drm_atomic_plane_disabling(plane, old_plane_state);
 
-static void __iomem *shm_request_region(unsigned long sh_addr, unsigned size)
-{	int i;
-	unsigned int num_pages = (size >> PAGE_SHIFT);
-	pgprot_t prot = pgprot_writecombine(PAGE_KERNEL);
-	struct page **pages;
-	void *v_addr;
-	if (!sh_addr)
-		return NULL;
-
-	if (size > (num_pages << PAGE_SHIFT))
-		num_pages++;
-
-	pages = kmalloc(sizeof(struct page *) * num_pages, GFP_ATOMIC);
-	if (!pages) {
-		pr_err("%s: pages allocation fail!\n", __func__);
-		return NULL;
-	}
-
-	for (i = 0; i < (num_pages); i++)
-	{
-		pages[i] = phys_to_page(sh_addr);
-		sh_addr += PAGE_SIZE;
-	}
-
-	v_addr = vmap(pages, num_pages, VM_MAP, prot);
-	if (v_addr == NULL)
-		pr_err("%s: Failed to vmap pages\n", __func__);
-
-	kfree(pages);
-
-	return (void __iomem *)v_addr;
-}
-
-struct link_device *create_link_device_shmem(struct platform_device *pdev)
-{
-	struct shmem_link_device *shmd = NULL;
-	struct link_device *ld = NULL;
-	struct gnss_data *gnss = NULL;
-	struct device *dev = &pdev->dev;
-	int err = 0;
-	gif_debug("+++\n");
-
-	/* Get the gnss (platform) data */
-	gnss = (struct gnss_data *)dev->platform_data;
-	if (!gnss) {
-		gif_err("ERR! gnss == NULL\n");
-		return NULL;
-	}
-	gif_err("%s: %s\n", "SHMEM", gnss->name);
-
-	if (!gnss->mbx) {
-		gif_err("%s: ERR! %s->mbx == NULL\n",
-			"SHMEM", gnss->name);
-		return NULL;
-	}
-
-	/* Alloc an instance of shmem_link_device structure */
-	shmd = devm_kzalloc(dev, sizeof(struct shmem_link_device), GFP_KERNEL);
-	if (!shmd) {
-		gif_err("%s: ERR! shmd kzalloc fail\n", "SHMEM");
-		goto error;
-	}
-	ld = &shmd->ld;
-	shmd->mbx = gnss->mbx;
-
-	/* Retrieve gnss data and SHMEM control data from the gnss data */
-	ld->gnss_data = gnss;
-	ld->timeout_cnt = 0;
-	ld->name = "GNSS_SHDMEM";
-
-	ld->set_autorun_cmd = shmem_set_autorun_cmd;
-
-	/* Assign reserved memory methods */
-	ld->copy_reserved_from_user = shmem_copy_reserved_from_user;
-	ld->copy_reserved_to_user = shmem_copy_reserved_to_user;
-
-	ld->reset_buffers = shmem_reset_buffers;
-
-	/* Set attributes as a link device */
-	ld->send = shmem_send;
-
-	skb_queue_head_init(&ld->sk_fmt_tx_q);
-	ld->skb_txq = &ld->sk_fmt_tx_q;
-
-	skb_queue_head_init(&ld->sk_fmt_rx_q);
-	ld->skb_rxq = &ld->sk_fmt_rx_q;
-
-	/* Initialize GNSS Reserved mem */
-	shmd->res_mem.size = gnss->ipcmem_offset;
-	shmd->res_mem.paddr = gnss->shmem_base;
-	shmd->res_mem.vaddr = shm_request_region(shmd->res_mem.paddr,
-			shmd->res_mem.size);
-	if (!shmd->res_mem.vaddr) {
-		gif_err("%s: ERR! gnss_reserved_region fail\n", ld->name);
-		goto error;
-	}
-	gif_err("%s: Reserved Region "
-		"phys_addr:0x%08X virt_addr:0x%p size: %d\n", ld->name,
-		shmd->res_mem.paddr, shmd->res_mem.vaddr, shmd->res_mem.size);
-
-	/* Initialize GNSS fault info area */
-	if (gnss->fault_info.device == GNSS_IPC_SHMEM) {
-		ld->dump_fault_to_user = shmem_dump_fault_mem_to_user;
-		shmd->fault_mem.size = gnss->fault_info.size;
-		shmd->fault_mem.paddr = gnss->shmem_base + gnss->fault_info.value.index;
-		shmd->fault_mem.vaddr = shm_request_region(
-				shmd->fault_mem.paddr, shmd->fault_mem.size);
-		if (!shmd->fault_mem.vaddr) {
-			gif_err("%s: ERR! fault shm_request_region fail\n",
-					ld->name);
-			goto error;
+		if (active_only) {
+			/*
+			 * Skip planes related to inactive CRTCs. If the plane
+			 * is enabled use the state of the current CRTC. If the
+			 * plane is being disabled use the state of the old
+			 * CRTC to avoid skipping planes being disabled on an
+			 * active CRTC.
+			 */
+			if (!disabling && !plane_crtc_active(plane->state))
+				continue;
+			if (disabling && !plane_crtc_active(old_plane_state))
+				continue;
 		}
-		gif_err("%s: Fault Region "
-			"phys_addr:0x%08X virt_addr:0x%p size:%d\n", ld->name,
-			shmd->fault_mem.paddr, shmd->fault_mem.vaddr,
-			shmd->fault_mem.size);
-	} else {
-		ld->dump_fault_to_user = shmem_dump_fault_mbx_to_user;
-		shmd->fault_mem.size = gnss->fault_info.size;
+
+		/*
+		 * Special-case disabling the plane if drivers support it.
+		 */
+		if (disabling && funcs->atomic_disable)
+			funcs->atomic_disable(plane, old_plane_state);
+		else if (plane->state->crtc || disabling)
+			funcs->atomic_update(plane, old_plane_state);
 	}
 
-	/* Initialize GNSS IPC region */
-	shmd->ipc_reg_cnt = gnss->ipc_reg_cnt;
-	shmd->reg = gnss->reg;
+	for_each_crtc_in_state(old_state, crtc, old_crtc_state, i) {
+		const struct drm_crtc_helper_funcs *funcs;
 
-	shmd->ipc_mem.size = gnss->ipc_size;
-	shmd->ipc_mem.paddr = shmd->res_mem.paddr + shmd->res_mem.size;
-	shmd->ipc_mem.vaddr = shm_request_region(shmd->ipc_mem.paddr,
-			shmd->ipc_mem.size);
-	if (!shmd->ipc_mem.vaddr) {
-		gif_err("%s: ERR! shm_request_region fail\n", ld->name);
-		goto error;
+		funcs = crtc->helper_private;
+
+		if (!funcs || !funcs->atomic_flush)
+			continue;
+
+		if (active_only && !crtc->state->active)
+			continue;
+
+		funcs->atomic_flush(crtc, old_crtc_state);
 	}
-	gif_err("%s: IPC Region "
-		"phys_addr:0x%08X virt_addr:0x%8p size:%d\n", ld->name,
-		shmd->ipc_mem.paddr, shmd->ipc_mem.vaddr, shmd->ipc_mem.size);
-
-	/* Initialize SHMEM maps (physical map -> logical map) */
-	err = shmem_init_ipc_map(shmd);
-	if (err < 0) {
-		gif_err("%s: ERR! shmem_init_ipc_map fail (err %d)\n",
-			ld->name, err);
-		goto error;
-	}
-
-#ifndef USE_SIMPLE_WAKE_LOCK
-	/* Initialize locks, completions, and bottom halves */
-	snprintf(shmd->wlock_name, MIF_MAX_NAME_LEN, "%s_wlock", ld->name);
-	wake_lock_init(&shmd->wlock, WAKE_LOCK_SUSPEND, shmd->wlock_name);
-#endif
-
-	tasklet_init(&shmd->rx_tsk, ipc_rx_task, (unsigned long)shmd);
-	INIT_DELAYED_WORK(&shmd->msg_rx_dwork, msg_rx_work);
-
-	spin_lock_init(&shmd->tx_lock);
-
-	ld->tx_wq = create_singlethread_workqueue("shmem_tx_wq");
-	if (!ld->tx_wq) {
-		gif_err("%s: ERR! fail to create tx_wq\n", ld->name);
-		goto error;
-	}
-
-	INIT_DELAYED_WORK(&ld->fmt_tx_dwork, fmt_tx_work);
-	ld->tx_dwork = &ld->fmt_tx_dwork;
-
-	spin_lock_init(&shmd->tx_msq.lock);
-	spin_lock_init(&shmd->rx_msq.lock);
-
-	/* Register interrupt handlers */
-	err = mbox_request_irq(shmd->mbx->id, shmd->mbx->irq_gnss2ap_ipc_msg,
-			       shmem_irq_msg_handler, shmd);
-	if (err) {
-		gif_err("%s: ERR! mbox_request_irq fail (err %d)\n",
-			ld->name, err);
-		goto error;
-	}
-
-	gif_debug("---\n");
-	return ld;
-
-error:
-	gif_err("xxx\n");
-	devm_kfree(dev, shmd);
-	return NULL;
 }
+EXPORT_SYMBOL(drm_atomic_helper_commit_planes);
+
+/**
+ * drm_atomic_helper_commit_planes_on_crtc - commit plane state for a crtc
+ * @old_crtc_state: atomic state object with the old crtc state
+ *
+ * This function commits the new plane state using the plane and atomic helper
+ * functions for planes on the specific crtc. It assumes that the atomic state
+ * has already been pushed into the relevant object state pointers, since this
+ * step can no longer fail.
+ *
+ * This function is useful when plane updates should be done crtc-by-crtc
+ * instead of one global step like drm_atomic_helper_commit_planes() does.
+ *
+ * This function can only be savely used when planes are not allowed to move
+ * between different CRTCs because this function doesn't handle inter-CRTC
+ * depencies. Call

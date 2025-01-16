@@ -1,4 +1,3 @@
-#include "common.h"
-
-extern const struct renesas_usbhs_platform_callback
-	usbhs_rcar2_ops;
+N1_RDIR4_DATA__VALID_MASK 0x800
+#define THM_TMON1_RDIR4_DATA__VALID__SHIFT 0xb
+#define THM_

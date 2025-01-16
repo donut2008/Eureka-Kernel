@@ -1,886 +1,618 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/kernel.h>
-#include <linux/device.h>
-#include <linux/slab.h>
-#include <linux/fs.h>
-#include <linux/errno.h>
-#include <linux/types.h>
-#include <linux/fcntl.h>
-#include <linux/poll.h>
-#include <linux/init.h>
-#include <linux/ioctl.h>
-#include <linux/cdev.h>
-#include <linux/sched.h>
-#include <linux/uuid.h>
-#include <linux/compat.h>
-#include <linux/jiffies.h>
-#include <linux/interrupt.h>
+um ||
+		    !strlen(data->temp_label[src])) {
+			dev_info(dev,
+				 "Invalid temperature source %d at index %d, source register 0x%x, temp register 0x%x\n",
+				 src, i, data->REG_TEMP_SOURCE[i], reg_temp[i]);
+			continue;
+		}
 
-#include <linux/mei.h>
+		mask |= 1 << src;
 
-#include "mei_dev.h"
-#include "client.h"
+		/* Use fixed index for SYSTIN(1), CPUTIN(2), AUXTIN(3) */
+		if (src <= data->temp_fixed_num) {
+			data->have_temp |= 1 << (src - 1);
+			data->have_temp_fixed |= 1 << (src - 1);
+			data->reg_temp[0][src - 1] = reg_temp[i];
+			data->reg_temp[1][src - 1] = reg_temp_over[i];
+			data->reg_temp[2][src - 1] = reg_temp_hyst[i];
+			if (reg_temp_crit_h && reg_temp_crit_h[i])
+				data->reg_temp[3][src - 1] = reg_temp_crit_h[i];
+			else if (reg_temp_crit[src - 1])
+				data->reg_temp[3][src - 1]
+				  = reg_temp_crit[src - 1];
+			if (reg_temp_crit_l && reg_temp_crit_l[i])
+				data->reg_temp[4][src - 1] = reg_temp_crit_l[i];
+			data->reg_temp_config[src - 1] = reg_temp_config[i];
+			data->temp_src[src - 1] = src;
+			continue;
+		}
 
-/**
- * mei_open - the open function
- *
- * @inode: pointer to inode structure
- * @file: pointer to file structure
- *
- * Return: 0 on success, <0 on error
- */
-static int mei_open(struct inode *inode, struct file *file)
+		if (s >= NUM_TEMP)
+			continue;
+
+		/* Use dynamic index for other sources */
+		data->have_temp |= 1 << s;
+		data->reg_temp[0][s] = reg_temp[i];
+		data->reg_temp[1][s] = reg_temp_over[i];
+		data->reg_temp[2][s] = reg_temp_hyst[i];
+		data->reg_temp_config[s] = reg_temp_config[i];
+		if (reg_temp_crit_h && reg_temp_crit_h[i])
+			data->reg_temp[3][s] = reg_temp_crit_h[i];
+		else if (reg_temp_crit[src - 1])
+			data->reg_temp[3][s] = reg_temp_crit[src - 1];
+		if (reg_temp_crit_l && reg_temp_crit_l[i])
+			data->reg_temp[4][s] = reg_temp_crit_l[i];
+
+		data->temp_src[s] = src;
+		s++;
+	}
+
+	/*
+	 * Repeat with temperatures used for fan control.
+	 * This set of registers does not support limits.
+	 */
+	for (i = 0; i < num_reg_temp_mon; i++) {
+		if (reg_temp_mon[i] == 0)
+			continue;
+
+		src = nct6775_read_value(data, data->REG_TEMP_SEL[i]) & 0x1f;
+		if (!src || (mask & (1 << src)))
+			continue;
+
+		if (src >= data->temp_label_num ||
+		    !strlen(data->temp_label[src])) {
+			dev_info(dev,
+				 "Invalid temperature source %d at index %d, source register 0x%x, temp register 0x%x\n",
+				 src, i, data->REG_TEMP_SEL[i],
+				 reg_temp_mon[i]);
+			continue;
+		}
+
+		mask |= 1 << src;
+
+		/* Use fixed index for SYSTIN(1), CPUTIN(2), AUXTIN(3) */
+		if (src <= data->temp_fixed_num) {
+			if (data->have_temp & (1 << (src - 1)))
+				continue;
+			data->have_temp |= 1 << (src - 1);
+			data->have_temp_fixed |= 1 << (src - 1);
+			data->reg_temp[0][src - 1] = reg_temp_mon[i];
+			data->temp_src[src - 1] = src;
+			continue;
+		}
+
+		if (s >= NUM_TEMP)
+			continue;
+
+		/* Use dynamic index for other sources */
+		data->have_temp |= 1 << s;
+		data->reg_temp[0][s] = reg_temp_mon[i];
+		data->temp_src[s] = src;
+		s++;
+	}
+
+#ifdef USE_ALTERNATE
+	/*
+	 * Go through the list of alternate temp registers and enable
+	 * if possible.
+	 * The temperature is already monitored if the respective bit in <mask>
+	 * is set.
+	 */
+	for (i = 0; i < data->temp_label_num - 1; i++) {
+		if (!reg_temp_alternate[i])
+			continue;
+		if (mask & (1 << (i + 1)))
+			continue;
+		if (i < data->temp_fixed_num) {
+			if (data->have_temp & (1 << i))
+				continue;
+			data->have_temp |= 1 << i;
+			data->have_temp_fixed |= 1 << i;
+			data->reg_temp[0][i] = reg_temp_alternate[i];
+			if (i < num_reg_temp) {
+				data->reg_temp[1][i] = reg_temp_over[i];
+				data->reg_temp[2][i] = reg_temp_hyst[i];
+			}
+			data->temp_src[i] = i + 1;
+			continue;
+		}
+
+		if (s >= NUM_TEMP)	/* Abort if no more space */
+			break;
+
+		data->have_temp |= 1 << s;
+		data->reg_temp[0][s] = reg_temp_alternate[i];
+		data->temp_src[s] = i + 1;
+		s++;
+	}
+#endif /* USE_ALTERNATE */
+
+	/* Initialize the chip */
+	nct6775_init_device(data);
+
+	err = superio_enter(sio_data->sioreg);
+	if (err)
+		return err;
+
+	cr2a = superio_inb(sio_data->sioreg, 0x2a);
+	switch (data->kind) {
+	case nct6775:
+		data->have_vid = (cr2a & 0x40);
+		break;
+	case nct6776:
+		data->have_vid = (cr2a & 0x60) == 0x40;
+		break;
+	case nct6106:
+	case nct6779:
+	case nct6791:
+	case nct6792:
+	case nct6793:
+		break;
+	}
+
+	/*
+	 * Read VID value
+	 * We can get the VID input values directly at logical device D 0xe3.
+	 */
+	if (data->have_vid) {
+		superio_select(sio_data->sioreg, NCT6775_LD_VID);
+		data->vid = superio_inb(sio_data->sioreg, 0xe3);
+		data->vrm = vid_which_vrm();
+	}
+
+	if (fan_debounce) {
+		u8 tmp;
+
+		superio_select(sio_data->sioreg, NCT6775_LD_HWM);
+		tmp = superio_inb(sio_data->sioreg,
+				  NCT6775_REG_CR_FAN_DEBOUNCE);
+		switch (data->kind) {
+		case nct6106:
+			tmp |= 0xe0;
+			break;
+		case nct6775:
+			tmp |= 0x1e;
+			break;
+		case nct6776:
+		case nct6779:
+			tmp |= 0x3e;
+			break;
+		case nct6791:
+		case nct6792:
+		case nct6793:
+			tmp |= 0x7e;
+			break;
+		}
+		superio_outb(sio_data->sioreg, NCT6775_REG_CR_FAN_DEBOUNCE,
+			     tmp);
+		dev_info(&pdev->dev, "Enabled fan debounce for chip %s\n",
+			 data->name);
+	}
+
+	nct6775_check_fan_inputs(data);
+
+	superio_exit(sio_data->sioreg);
+
+	/* Read fan clock dividers immediately */
+	nct6775_init_fan_common(dev, data);
+
+	/* Register sysfs hooks */
+	group = nct6775_create_attr_group(dev, &nct6775_pwm_template_group,
+					  data->pwm_num);
+	if (IS_ERR(group))
+		return PTR_ERR(group);
+
+	data->groups[num_attr_groups++] = group;
+
+	group = nct6775_create_attr_group(dev, &nct6775_in_template_group,
+					  fls(data->have_in));
+	if (IS_ERR(group))
+		return PTR_ERR(group);
+
+	data->groups[num_attr_groups++] = group;
+
+	group = nct6775_create_attr_group(dev, &nct6775_fan_template_group,
+					  fls(data->has_fan));
+	if (IS_ERR(group))
+		return PTR_ERR(group);
+
+	data->groups[num_attr_groups++] = group;
+
+	group = nct6775_create_attr_group(dev, &nct6775_temp_template_group,
+					  fls(data->have_temp));
+	if (IS_ERR(group))
+		return PTR_ERR(group);
+
+	data->groups[num_attr_groups++] = group;
+	data->groups[num_attr_groups++] = &nct6775_group_other;
+
+	hwmon_dev = devm_hwmon_device_register_with_groups(dev, data->name,
+							   data, data->groups);
+	return PTR_ERR_OR_ZERO(hwmon_dev);
+}
+
+static void nct6791_enable_io_mapping(int sioaddr)
 {
-	struct mei_device *dev;
-	struct mei_cl *cl;
+	int val;
 
-	int err;
+	val = superio_inb(sioaddr, NCT6791_REG_HM_IO_SPACE_LOCK_ENABLE);
+	if (val & 0x10) {
+		pr_info("Enabling hardware monitor logical device mappings.\n");
+		superio_outb(sioaddr, NCT6791_REG_HM_IO_SPACE_LOCK_ENABLE,
+			     val & ~0x10);
+	}
+}
 
-	dev = container_of(inode->i_cdev, struct mei_device, cdev);
-	if (!dev)
-		return -ENODEV;
+static int __maybe_unused nct6775_suspend(struct device *dev)
+{
+	struct nct6775_data *data = nct6775_update_device(dev);
 
-	mutex_lock(&dev->device_lock);
+	mutex_lock(&data->update_lock);
+	data->vbat = nct6775_read_value(data, data->REG_VBAT);
+	if (data->kind == nct6775) {
+		data->fandiv1 = nct6775_read_value(data, NCT6775_REG_FANDIV1);
+		data->fandiv2 = nct6775_read_value(data, NCT6775_REG_FANDIV2);
+	}
+	mutex_unlock(&data->update_lock);
 
-	if (dev->dev_state != MEI_DEV_ENABLED) {
-		dev_dbg(dev->dev, "dev_state != MEI_ENABLED  dev_state = %s\n",
-		    mei_dev_state_str(dev->dev_state));
-		err = -ENODEV;
-		goto err_unlock;
+	return 0;
+}
+
+static int __maybe_unused nct6775_resume(struct device *dev)
+{
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	int sioreg = data->sioreg;
+	int i, j, err = 0;
+	u8 reg;
+
+	mutex_lock(&data->update_lock);
+	data->bank = 0xff;		/* Force initial bank selection */
+
+	err = superio_enter(sioreg);
+	if (err)
+		goto abort;
+
+	superio_select(sioreg, NCT6775_LD_HWM);
+	reg = superio_inb(sioreg, SIO_REG_ENABLE);
+	if (reg != data->sio_reg_enable)
+		superio_outb(sioreg, SIO_REG_ENABLE, data->sio_reg_enable);
+
+	if (data->kind == nct6791 || data->kind == nct6792 ||
+	    data->kind == nct6793)
+		nct6791_enable_io_mapping(sioreg);
+
+	superio_exit(sioreg);
+
+	/* Restore limits */
+	for (i = 0; i < data->in_num; i++) {
+		if (!(data->have_in & (1 << i)))
+			continue;
+
+		nct6775_write_value(data, data->REG_IN_MINMAX[0][i],
+				    data->in[i][1]);
+		nct6775_write_value(data, data->REG_IN_MINMAX[1][i],
+				    data->in[i][2]);
 	}
 
-	cl = mei_cl_alloc_linked(dev, MEI_HOST_CLIENT_ID_ANY);
-	if (IS_ERR(cl)) {
-		err = PTR_ERR(cl);
-		goto err_unlock;
+	for (i = 0; i < ARRAY_SIZE(data->fan_min); i++) {
+		if (!(data->has_fan_min & (1 << i)))
+			continue;
+
+		nct6775_write_value(data, data->REG_FAN_MIN[i],
+				    data->fan_min[i]);
 	}
 
-	file->private_data = cl;
+	for (i = 0; i < NUM_TEMP; i++) {
+		if (!(data->have_temp & (1 << i)))
+			continue;
 
-	mutex_unlock(&dev->device_lock);
+		for (j = 1; j < ARRAY_SIZE(data->reg_temp); j++)
+			if (data->reg_temp[j][i])
+				nct6775_write_temp(data, data->reg_temp[j][i],
+						   data->temp[j][i]);
+	}
 
-	return nonseekable_open(inode, file);
+	/* Restore other settings */
+	nct6775_write_value(data, data->REG_VBAT, data->vbat);
+	if (data->kind == nct6775) {
+		nct6775_write_value(data, NCT6775_REG_FANDIV1, data->fandiv1);
+		nct6775_write_value(data, NCT6775_REG_FANDIV2, data->fandiv2);
+	}
 
-err_unlock:
-	mutex_unlock(&dev->device_lock);
+abort:
+	/* Force re-reading all values */
+	data->valid = false;
+	mutex_unlock(&data->update_lock);
+
 	return err;
 }
 
-/**
- * mei_release - the release function
- *
- * @inode: pointer to inode structure
- * @file: pointer to file structure
- *
- * Return: 0 on success, <0 on error
- */
-static int mei_release(struct inode *inode, struct file *file)
-{
-	struct mei_cl *cl = file->private_data;
-	struct mei_device *dev;
-	int rets;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	mutex_lock(&dev->device_lock);
-	if (cl == &dev->iamthif_cl) {
-		rets = mei_amthif_release(dev, file);
-		goto out;
-	}
-	rets = mei_cl_disconnect(cl);
-
-	mei_cl_flush_queues(cl, file);
-	cl_dbg(dev, cl, "removing\n");
-
-	mei_cl_unlink(cl);
-
-	file->private_data = NULL;
-
-	kfree(cl);
-out:
-	mutex_unlock(&dev->device_lock);
-	return rets;
-}
-
-
-/**
- * mei_read - the read function.
- *
- * @file: pointer to file structure
- * @ubuf: pointer to user buffer
- * @length: buffer length
- * @offset: data offset in buffer
- *
- * Return: >=0 data length on success , <0 on error
- */
-static ssize_t mei_read(struct file *file, char __user *ubuf,
-			size_t length, loff_t *offset)
-{
-	struct mei_cl *cl = file->private_data;
-	struct mei_device *dev;
-	struct mei_cl_cb *cb = NULL;
-	int rets;
-	int err;
-
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-
-	mutex_lock(&dev->device_lock);
-	if (dev->dev_state != MEI_DEV_ENABLED) {
-		rets = -ENODEV;
-		goto out;
-	}
-
-	if (length == 0) {
-		rets = 0;
-		goto out;
-	}
-
-	if (cl == &dev->iamthif_cl) {
-		rets = mei_amthif_read(dev, file, ubuf, length, offset);
-		goto out;
-	}
-
-	cb = mei_cl_read_cb(cl, file);
-	if (cb) {
-		/* read what left */
-		if (cb->buf_idx > *offset)
-			goto copy_buffer;
-		/* offset is beyond buf_idx we have no more data return 0 */
-		if (cb->buf_idx > 0 && cb->buf_idx <= *offset) {
-			rets = 0;
-			goto free;
-		}
-		/* Offset needs to be cleaned for contiguous reads*/
-		if (cb->buf_idx == 0 && *offset > 0)
-			*offset = 0;
-	} else if (*offset > 0) {
-		*offset = 0;
-	}
-
-	err = mei_cl_read_start(cl, length, file);
-	if (err && err != -EBUSY) {
-		cl_dbg(dev, cl, "mei start read failure status = %d\n", err);
-		rets = err;
-		goto out;
-	}
-
-	if (list_empty(&cl->rd_completed) && !waitqueue_active(&cl->rx_wait)) {
-		if (file->f_flags & O_NONBLOCK) {
-			rets = -EAGAIN;
-			goto out;
-		}
-
-		mutex_unlock(&dev->device_lock);
-
-		if (wait_event_interruptible(cl->rx_wait,
-				(!list_empty(&cl->rd_completed)) ||
-				(!mei_cl_is_connected(cl)))) {
-
-			if (signal_pending(current))
-				return -EINTR;
-			return -ERESTARTSYS;
-		}
-
-		mutex_lock(&dev->device_lock);
-		if (!mei_cl_is_connected(cl)) {
-			rets = -ENODEV;
-			goto out;
-		}
-	}
-
-	cb = mei_cl_read_cb(cl, file);
-	if (!cb) {
-		if (mei_cl_is_fixed_address(cl) && dev->allow_fixed_address) {
-			cb = mei_cl_read_cb(cl, NULL);
-			if (cb)
-				goto copy_buffer;
-		}
-		rets = 0;
-		goto out;
-	}
-
-copy_buffer:
-	/* now copy the data to user space */
-	if (cb->status) {
-		rets = cb->status;
-		cl_dbg(dev, cl, "read operation failed %d\n", rets);
-		goto free;
-	}
-
-	cl_dbg(dev, cl, "buf.size = %d buf.idx = %ld\n",
-	    cb->buf.size, cb->buf_idx);
-	if (length == 0 || ubuf == NULL || *offset > cb->buf_idx) {
-		rets = -EMSGSIZE;
-		goto free;
-	}
-
-	/* length is being truncated to PAGE_SIZE,
-	 * however buf_idx may point beyond that */
-	length = min_t(size_t, length, cb->buf_idx - *offset);
-
-	if (copy_to_user(ubuf, cb->buf.data + *offset, length)) {
-		dev_dbg(dev->dev, "failed to copy data to userland\n");
-		rets = -EFAULT;
-		goto free;
-	}
-
-	rets = length;
-	*offset += length;
-	if ((unsigned long)*offset < cb->buf_idx)
-		goto out;
-
-free:
-	mei_io_cb_free(cb);
-
-out:
-	cl_dbg(dev, cl, "end mei read rets = %d\n", rets);
-	mutex_unlock(&dev->device_lock);
-	return rets;
-}
-/**
- * mei_write - the write function.
- *
- * @file: pointer to file structure
- * @ubuf: pointer to user buffer
- * @length: buffer length
- * @offset: data offset in buffer
- *
- * Return: >=0 data length on success , <0 on error
- */
-static ssize_t mei_write(struct file *file, const char __user *ubuf,
-			 size_t length, loff_t *offset)
-{
-	struct mei_cl *cl = file->private_data;
-	struct mei_cl_cb *write_cb = NULL;
-	struct mei_device *dev;
-	unsigned long timeout = 0;
-	int rets;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	mutex_lock(&dev->device_lock);
-
-	if (dev->dev_state != MEI_DEV_ENABLED) {
-		rets = -ENODEV;
-		goto out;
-	}
-
-	if (!mei_cl_is_connected(cl)) {
-		cl_err(dev, cl, "is not connected");
-		rets = -ENODEV;
-		goto out;
-	}
-
-	if (!mei_me_cl_is_active(cl->me_cl)) {
-		rets = -ENOTTY;
-		goto out;
-	}
-
-	if (length > mei_cl_mtu(cl)) {
-		rets = -EFBIG;
-		goto out;
-	}
-
-	if (length == 0) {
-		rets = 0;
-		goto out;
-	}
-
-	if (cl == &dev->iamthif_cl) {
-		write_cb = mei_amthif_find_read_list_entry(dev, file);
-
-		if (write_cb) {
-			timeout = write_cb->read_time +
-				mei_secs_to_jiffies(MEI_IAMTHIF_READ_TIMER);
-
-			if (time_after(jiffies, timeout)) {
-				*offset = 0;
-				mei_io_cb_free(write_cb);
-				write_cb = NULL;
-			}
-		}
-	}
-
-	*offset = 0;
-	write_cb = mei_cl_alloc_cb(cl, length, MEI_FOP_WRITE, file);
-	if (!write_cb) {
-		rets = -ENOMEM;
-		goto out;
-	}
-
-	rets = copy_from_user(write_cb->buf.data, ubuf, length);
-	if (rets) {
-		dev_dbg(dev->dev, "failed to copy data from userland\n");
-		rets = -EFAULT;
-		goto out;
-	}
-
-	if (cl == &dev->iamthif_cl) {
-		rets = mei_amthif_write(cl, write_cb);
-
-		if (rets) {
-			dev_err(dev->dev,
-				"amthif write failed with status = %d\n", rets);
-			goto out;
-		}
-		mutex_unlock(&dev->device_lock);
-		return length;
-	}
-
-	rets = mei_cl_write(cl, write_cb, false);
-out:
-	mutex_unlock(&dev->device_lock);
-	if (rets < 0)
-		mei_io_cb_free(write_cb);
-	return rets;
-}
-
-/**
- * mei_ioctl_connect_client - the connect to fw client IOCTL function
- *
- * @file: private data of the file object
- * @data: IOCTL connect data, input and output parameters
- *
- * Locking: called under "dev->device_lock" lock
- *
- * Return: 0 on success, <0 on failure.
- */
-static int mei_ioctl_connect_client(struct file *file,
-			struct mei_connect_client_data *data)
-{
-	struct mei_device *dev;
-	struct mei_client *client;
-	struct mei_me_client *me_cl;
-	struct mei_cl *cl;
-	int rets;
-
-	cl = file->private_data;
-	dev = cl->dev;
-
-	if (dev->dev_state != MEI_DEV_ENABLED)
-		return -ENODEV;
-
-	if (cl->state != MEI_FILE_INITIALIZING &&
-	    cl->state != MEI_FILE_DISCONNECTED)
-		return  -EBUSY;
-
-	/* find ME client we're trying to connect to */
-	me_cl = mei_me_cl_by_uuid(dev, &data->in_client_uuid);
-	if (!me_cl ||
-	    (me_cl->props.fixed_address && !dev->allow_fixed_address)) {
-		dev_dbg(dev->dev, "Cannot connect to FW Client UUID = %pUl\n",
-			&data->in_client_uuid);
-		mei_me_cl_put(me_cl);
-		return  -ENOTTY;
-	}
-
-	dev_dbg(dev->dev, "Connect to FW Client ID = %d\n",
-			me_cl->client_id);
-	dev_dbg(dev->dev, "FW Client - Protocol Version = %d\n",
-			me_cl->props.protocol_version);
-	dev_dbg(dev->dev, "FW Client - Max Msg Len = %d\n",
-			me_cl->props.max_msg_length);
-
-	/* if we're connecting to amthif client then we will use the
-	 * existing connection
-	 */
-	if (uuid_le_cmp(data->in_client_uuid, mei_amthif_guid) == 0) {
-		dev_dbg(dev->dev, "FW Client is amthi\n");
-		if (!mei_cl_is_connected(&dev->iamthif_cl)) {
-			rets = -ENODEV;
-			goto end;
-		}
-		mei_cl_unlink(cl);
-
-		kfree(cl);
-		cl = NULL;
-		dev->iamthif_open_count++;
-		file->private_data = &dev->iamthif_cl;
-
-		client = &data->out_client_properties;
-		client->max_msg_length = me_cl->props.max_msg_length;
-		client->protocol_version = me_cl->props.protocol_version;
-		rets = dev->iamthif_cl.status;
-
-		goto end;
-	}
-
-	/* prepare the output buffer */
-	client = &data->out_client_properties;
-	client->max_msg_length = me_cl->props.max_msg_length;
-	client->protocol_version = me_cl->props.protocol_version;
-	dev_dbg(dev->dev, "Can connect?\n");
-
-	rets = mei_cl_connect(cl, me_cl, file);
-
-end:
-	mei_me_cl_put(me_cl);
-	return rets;
-}
-
-/**
- * mei_ioctl_client_notify_request -
- *     propagate event notification request to client
- *
- * @file: pointer to file structure
- * @request: 0 - disable, 1 - enable
- *
- * Return: 0 on success , <0 on error
- */
-static int mei_ioctl_client_notify_request(struct file *file, u32 request)
-{
-	struct mei_cl *cl = file->private_data;
-
-	if (request != MEI_HBM_NOTIFICATION_START &&
-	    request != MEI_HBM_NOTIFICATION_STOP)
-		return -EINVAL;
-
-	return mei_cl_notify_request(cl, file, (u8)request);
-}
-
-/**
- * mei_ioctl_client_notify_get -  wait for notification request
- *
- * @file: pointer to file structure
- * @notify_get: 0 - disable, 1 - enable
- *
- * Return: 0 on success , <0 on error
- */
-static int mei_ioctl_client_notify_get(struct file *file, u32 *notify_get)
-{
-	struct mei_cl *cl = file->private_data;
-	bool notify_ev;
-	bool block = (file->f_flags & O_NONBLOCK) == 0;
-	int rets;
-
-	rets = mei_cl_notify_get(cl, block, &notify_ev);
-	if (rets)
-		return rets;
-
-	*notify_get = notify_ev ? 1 : 0;
-	return 0;
-}
-
-/**
- * mei_ioctl - the IOCTL function
- *
- * @file: pointer to file structure
- * @cmd: ioctl command
- * @data: pointer to mei message structure
- *
- * Return: 0 on success , <0 on error
- */
-static long mei_ioctl(struct file *file, unsigned int cmd, unsigned long data)
-{
-	struct mei_device *dev;
-	struct mei_cl *cl = file->private_data;
-	struct mei_connect_client_data connect_data;
-	u32 notify_get, notify_req;
-	int rets;
-
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	dev_dbg(dev->dev, "IOCTL cmd = 0x%x", cmd);
-
-	mutex_lock(&dev->device_lock);
-	if (dev->dev_state != MEI_DEV_ENABLED) {
-		rets = -ENODEV;
-		goto out;
-	}
-
-	switch (cmd) {
-	case IOCTL_MEI_CONNECT_CLIENT:
-		dev_dbg(dev->dev, ": IOCTL_MEI_CONNECT_CLIENT.\n");
-		if (copy_from_user(&connect_data, (char __user *)data,
-				sizeof(struct mei_connect_client_data))) {
-			dev_dbg(dev->dev, "failed to copy data from userland\n");
-			rets = -EFAULT;
-			goto out;
-		}
-
-		rets = mei_ioctl_connect_client(file, &connect_data);
-		if (rets)
-			goto out;
-
-		/* if all is ok, copying the data back to user. */
-		if (copy_to_user((char __user *)data, &connect_data,
-				sizeof(struct mei_connect_client_data))) {
-			dev_dbg(dev->dev, "failed to copy data to userland\n");
-			rets = -EFAULT;
-			goto out;
-		}
-
-		break;
-
-	case IOCTL_MEI_NOTIFY_SET:
-		dev_dbg(dev->dev, ": IOCTL_MEI_NOTIFY_SET.\n");
-		if (copy_from_user(&notify_req,
-				   (char __user *)data, sizeof(notify_req))) {
-			dev_dbg(dev->dev, "failed to copy data from userland\n");
-			rets = -EFAULT;
-			goto out;
-		}
-		rets = mei_ioctl_client_notify_request(file, notify_req);
-		break;
-
-	case IOCTL_MEI_NOTIFY_GET:
-		dev_dbg(dev->dev, ": IOCTL_MEI_NOTIFY_GET.\n");
-		rets = mei_ioctl_client_notify_get(file, &notify_get);
-		if (rets)
-			goto out;
-
-		dev_dbg(dev->dev, "copy connect data to user\n");
-		if (copy_to_user((char __user *)data,
-				&notify_get, sizeof(notify_get))) {
-			dev_dbg(dev->dev, "failed to copy data to userland\n");
-			rets = -EFAULT;
-			goto out;
-
-		}
-		break;
-
-	default:
-		rets = -ENOIOCTLCMD;
-	}
-
-out:
-	mutex_unlock(&dev->device_lock);
-	return rets;
-}
-
-/**
- * mei_compat_ioctl - the compat IOCTL function
- *
- * @file: pointer to file structure
- * @cmd: ioctl command
- * @data: pointer to mei message structure
- *
- * Return: 0 on success , <0 on error
- */
-#ifdef CONFIG_COMPAT
-static long mei_compat_ioctl(struct file *file,
-			unsigned int cmd, unsigned long data)
-{
-	return mei_ioctl(file, cmd, (unsigned long)compat_ptr(data));
-}
-#endif
-
-
-/**
- * mei_poll - the poll function
- *
- * @file: pointer to file structure
- * @wait: pointer to poll_table structure
- *
- * Return: poll mask
- */
-static unsigned int mei_poll(struct file *file, poll_table *wait)
-{
-	unsigned long req_events = poll_requested_events(wait);
-	struct mei_cl *cl = file->private_data;
-	struct mei_device *dev;
-	unsigned int mask = 0;
-	bool notify_en;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return POLLERR;
-
-	dev = cl->dev;
-
-	mutex_lock(&dev->device_lock);
-
-	notify_en = cl->notify_en && (req_events & POLLPRI);
-
-	if (dev->dev_state != MEI_DEV_ENABLED ||
-	    !mei_cl_is_connected(cl)) {
-		mask = POLLERR;
-		goto out;
-	}
-
-	if (cl == &dev->iamthif_cl) {
-		mask = mei_amthif_poll(dev, file, wait);
-		goto out;
-	}
-
-	if (notify_en) {
-		poll_wait(file, &cl->ev_wait, wait);
-		if (cl->notify_ev)
-			mask |= POLLPRI;
-	}
-
-	if (req_events & (POLLIN | POLLRDNORM)) {
-		poll_wait(file, &cl->rx_wait, wait);
-
-		if (!list_empty(&cl->rd_completed))
-			mask |= POLLIN | POLLRDNORM;
-		else
-			mei_cl_read_start(cl, 0, file);
-	}
-
-out:
-	mutex_unlock(&dev->device_lock);
-	return mask;
-}
-
-/**
- * mei_fasync - asynchronous io support
- *
- * @fd: file descriptor
- * @file: pointer to file structure
- * @band: band bitmap
- *
- * Return: negative on error,
- *         0 if it did no changes,
- *         and positive a process was added or deleted
- */
-static int mei_fasync(int fd, struct file *file, int band)
-{
-
-	struct mei_cl *cl = file->private_data;
-
-	if (!mei_cl_is_connected(cl))
-		return -ENODEV;
-
-	return fasync_helper(fd, file, band, &cl->ev_async);
-}
-
-/**
- * fw_status_show - mei device attribute show method
- *
- * @device: device pointer
- * @attr: attribute pointer
- * @buf:  char out buffer
- *
- * Return: number of the bytes printed into buf or error
- */
-static ssize_t fw_status_show(struct device *device,
-		struct device_attribute *attr, char *buf)
-{
-	struct mei_device *dev = dev_get_drvdata(device);
-	struct mei_fw_status fw_status;
-	int err, i;
-	ssize_t cnt = 0;
-
-	mutex_lock(&dev->device_lock);
-	err = mei_fw_status(dev, &fw_status);
-	mutex_unlock(&dev->device_lock);
-	if (err) {
-		dev_err(device, "read fw_status error = %d\n", err);
-		return err;
-	}
-
-	for (i = 0; i < fw_status.count; i++)
-		cnt += scnprintf(buf + cnt, PAGE_SIZE - cnt, "%08X\n",
-				fw_status.status[i]);
-	return cnt;
-}
-static DEVICE_ATTR_RO(fw_status);
-
-static struct attribute *mei_attrs[] = {
-	&dev_attr_fw_status.attr,
-	NULL
+static SIMPLE_DEV_PM_OPS(nct6775_dev_pm_ops, nct6775_suspend, nct6775_resume);
+
+static struct platform_driver nct6775_driver = {
+	.driver = {
+		.name	= DRVNAME,
+		.pm	= &nct6775_dev_pm_ops,
+	},
+	.probe		= nct6775_probe,
 };
-ATTRIBUTE_GROUPS(mei);
+
+/* nct6775_find() looks for a '627 in the Super-I/O config space */
+static int __init nct6775_find(int sioaddr, struct nct6775_sio_data *sio_data)
+{
+	u16 val;
+	int err;
+	int addr;
+
+	err = superio_enter(sioaddr);
+	if (err)
+		return err;
+
+	if (force_id)
+		val = force_id;
+	else
+		val = (superio_inb(sioaddr, SIO_REG_DEVID) << 8)
+		    | superio_inb(sioaddr, SIO_REG_DEVID + 1);
+	switch (val & SIO_ID_MASK) {
+	case SIO_NCT6106_ID:
+		sio_data->kind = nct6106;
+		break;
+	case SIO_NCT6775_ID:
+		sio_data->kind = nct6775;
+		break;
+	case SIO_NCT6776_ID:
+		sio_data->kind = nct6776;
+		break;
+	case SIO_NCT6779_ID:
+		sio_data->kind = nct6779;
+		break;
+	case SIO_NCT6791_ID:
+		sio_data->kind = nct6791;
+		break;
+	case SIO_NCT6792_ID:
+		sio_data->kind = nct6792;
+		break;
+	case SIO_NCT6793_ID:
+		sio_data->kind = nct6793;
+		break;
+	default:
+		if (val != 0xffff)
+			pr_debug("unsupported chip ID: 0x%04x\n", val);
+		superio_exit(sioaddr);
+		return -ENODEV;
+	}
+
+	/* We have a known chip, find the HWM I/O address */
+	superio_select(sioaddr, NCT6775_LD_HWM);
+	val = (superio_inb(sioaddr, SIO_REG_ADDR) << 8)
+	    | superio_inb(sioaddr, SIO_REG_ADDR + 1);
+	addr = val & IOREGION_ALIGNMENT;
+	if (addr == 0) {
+		pr_err("Refusing to enable a Super-I/O device with a base I/O port 0\n");
+		superio_exit(sioaddr);
+		return -ENODEV;
+	}
+
+	/* Activate logical device if needed */
+	val = superio_inb(sioaddr, SIO_REG_ENABLE);
+	if (!(val & 0x01)) {
+		pr_warn("Forcibly enabling Super-I/O. Sensor is probably unusable.\n");
+		superio_outb(sioaddr, SIO_REG_ENABLE, val | 0x01);
+	}
+
+	if (sio_data->kind == nct6791 || sio_data->kind == nct6792 ||
+	    sio_data->kind == nct6793)
+		nct6791_enable_io_mapping(sioaddr);
+
+	superio_exit(sioaddr);
+	pr_info("Found %s or compatible chip at %#x:%#x\n",
+		nct6775_sio_names[sio_data->kind], sioaddr, addr);
+	sio_data->sioreg = sioaddr;
+
+	return addr;
+}
 
 /*
- * file operations structure will be used for mei char device.
+ * when Super-I/O functions move to a separate file, the Super-I/O
+ * bus will manage the lifetime of the device and this module will only keep
+ * track of the nct6775 driver. But since we use platform_device_alloc(), we
+ * must keep track of the device
  */
-static const struct file_operations mei_fops = {
-	.owner = THIS_MODULE,
-	.read = mei_read,
-	.unlocked_ioctl = mei_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl = mei_compat_ioctl,
+static struct platform_device *pdev[2];
+
+static int __init sensors_nct6775_init(void)
+{
+	int i, err;
+	bool found = false;
+	int address;
+	struct resource res;
+	struct nct6775_sio_data sio_data;
+	int sioaddr[2] = { 0x2e, 0x4e };
+
+	err = platform_driver_register(&nct6775_driver);
+	if (err)
+		return err;
+
+	/*
+	 * initialize sio_data->kind and sio_data->sioreg.
+	 *
+	 * when Super-I/O functions move to a separate file, the Super-I/O
+	 * driver will probe 0x2e and 0x4e and auto-detect the presence of a
+	 * nct6775 hardware monitor, and call probe()
+	 */
+	for (i = 0; i < ARRAY_SIZE(pdev); i++) {
+		address = nct6775_find(sioaddr[i], &sio_data);
+		if (address <= 0)
+			continue;
+
+		found = true;
+
+		pdev[i] = platform_device_alloc(DRVNAME, address);
+		if (!pdev[i]) {
+			err = -ENOMEM;
+			goto exit_device_unregister;
+		}
+
+		err = platform_device_add_data(pdev[i], &sio_data,
+					       sizeof(struct nct6775_sio_data));
+		if (err)
+			goto exit_device_put;
+
+		memset(&res, 0, sizeof(res));
+		res.name = DRVNAME;
+		res.start = address + IOREGION_OFFSET;
+		res.end = address + IOREGION_OFFSET + IOREGION_LENGTH - 1;
+		res.flags = IORESOURCE_IO;
+
+		err = acpi_check_resource_conflict(&res);
+		if (err) {
+			platform_device_put(pdev[i]);
+			pdev[i] = NULL;
+			continue;
+		}
+
+		err = platform_device_add_resources(pdev[i], &res, 1);
+		if (err)
+			goto exit_device_put;
+
+		/* platform_device_add calls probe() */
+		err = platform_device_add(pdev[i]);
+		if (err)
+			goto exit_device_put;
+	}
+	if (!found) {
+		err = -ENODEV;
+		goto exit_unregister;
+	}
+
+	return 0;
+
+exit_device_put:
+	platform_device_put(pdev[i]);
+exit_device_unregister:
+	while (--i >= 0) {
+		if (pdev[i])
+			platform_device_unregister(pdev[i]);
+	}
+exit_unregister:
+	platform_driver_unregister(&nct6775_driver);
+	return err;
+}
+
+static void __exit sensors_nct6775_exit(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(pdev); i++) {
+		if (pdev[i])
+			platform_device_unregister(pdev[i]);
+	}
+	platform_driver_unregister(&nct6775_driver);
+}
+
+MODULE_AUTHOR("Guenter Roeck <linux@roeck-us.net>");
+MODULE_DESCRIPTION("Driver for NCT6775F and compatible chips");
+MODULE_LICENSE("GPL");
+
+module_init(sensors_nct6775_init);
+module_exit(sensors_nct6775_exit);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+    MaxLinear MXL5005S VSB/QAM/DVBT tuner driver
+
+    Copyright (C) 2008 MaxLinear
+    Copyright (C) 2006 Steven Toth <stoth@linuxtv.org>
+      Functions:
+	mxl5005s_reset()
+	mxl5005s_writereg()
+	mxl5005s_writeregs()
+	mxl5005s_init()
+	mxl5005s_reconfigure()
+	mxl5005s_AssignTunerMode()
+	mxl5005s_set_params()
+	mxl5005s_get_frequency()
+	mxl5005s_get_bandwidth()
+	mxl5005s_release()
+	mxl5005s_attach()
+
+    Copyright (C) 2008 Realtek
+    Copyright (C) 2008 Jan Hoogenraad
+      Functions:
+	mxl5005s_SetRfFreqHz()
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+*/
+
+/*
+    History of this driver (Steven Toth):
+      I was given a public release of a linux driver that included
+      support for the MaxLinear MXL5005S silicon tuner. Analysis of
+      the tuner driver showed clearly three things.
+
+      1. The tuner driver didn't support the LinuxTV tuner API
+	 so the code Realtek added had to be removed.
+
+      2. A significant amount of the driver is reference driver code
+	 from MaxLinear, I felt it was important to identify and
+	 preserve this.
+
+      3. New code has to be added to interface correctly with the
+	 LinuxTV API, as a regular kernel module.
+
+      Other than the reference driver enum's, I've clearly marked
+      sections of the code and retained the copyright of the
+      respective owners.
+*/
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/string.h>
+#include <linux/slab.h>
+#include <linux/delay.h>
+#include "dvb_frontend.h"
+#include "mxl5005s.h"
+
+static int debug;
+
+#define dprintk(level, arg...) do {    \
+	if (level <= debug)            \
+		printk(arg);    \
+	} while (0)
+
+#define TUNER_REGS_NUM          104
+#define INITCTRL_NUM            40
+
+#ifdef _MXL_PRODUCTION
+#define CHCTRL_NUM              39
+#else
+#define CHCTRL_NUM              36
 #endif
-	.open = mei_open,
-	.release = mei_release,
-	.write = mei_write,
-	.poll = mei_poll,
-	.fasync = mei_fasync,
-	.llseek = no_llseek
+
+#define MXLCTRL_NUM             189
+#define MASTER_CONTROL_ADDR     9
+
+/* Enumeration of Master Control Register State */
+enum master_control_state {
+	MC_LOAD_START = 1,
+	MC_POWER_DOWN,
+	MC_SYNTH_RESET,
+	MC_SEQ_OFF
 };
 
-static struct class *mei_class;
-static dev_t mei_devt;
-#define MEI_MAX_DEVS  MINORMASK
-static DEFINE_MUTEX(mei_minor_lock);
-static DEFINE_IDR(mei_idr);
-
-/**
- * mei_minor_get - obtain next free device minor number
- *
- * @dev:  device pointer
- *
- * Return: allocated minor, or -ENOSPC if no free minor left
- */
-static int mei_minor_get(struct mei_device *dev)
-{
-	int ret;
-
-	mutex_lock(&mei_minor_lock);
-	ret = idr_alloc(&mei_idr, dev, 0, MEI_MAX_DEVS, GFP_KERNEL);
-	if (ret >= 0)
-		dev->minor = ret;
-	else if (ret == -ENOSPC)
-		dev_err(dev->dev, "too many mei devices\n");
-
-	mutex_unlock(&mei_minor_lock);
-	return ret;
-}
-
-/**
- * mei_minor_free - mark device minor number as free
- *
- * @dev:  device pointer
- */
-static void mei_minor_free(struct mei_device *dev)
-{
-	mutex_lock(&mei_minor_lock);
-	idr_remove(&mei_idr, dev->minor);
-	mutex_unlock(&mei_minor_lock);
-}
-
-int mei_register(struct mei_device *dev, struct device *parent)
-{
-	struct device *clsdev; /* class device */
-	int ret, devno;
-
-	ret = mei_minor_get(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Fill in the data structures */
-	devno = MKDEV(MAJOR(mei_devt), dev->minor);
-	cdev_init(&dev->cdev, &mei_fops);
-	dev->cdev.owner = parent->driver->owner;
-
-	/* Add the device */
-	ret = cdev_add(&dev->cdev, devno, 1);
-	if (ret) {
-		dev_err(parent, "unable to add device %d:%d\n",
-			MAJOR(mei_devt), dev->minor);
-		goto err_dev_add;
-	}
-
-	clsdev = device_create_with_groups(mei_class, parent, devno,
-					   dev, mei_groups,
-					   "mei%d", dev->minor);
-
-	if (IS_ERR(clsdev)) {
-		dev_err(parent, "unable to create device %d:%d\n",
-			MAJOR(mei_devt), dev->minor);
-		ret = PTR_ERR(clsdev);
-		goto err_dev_create;
-	}
-
-	ret = mei_dbgfs_register(dev, dev_name(clsdev));
-	if (ret) {
-		dev_err(clsdev, "cannot register debugfs ret = %d\n", ret);
-		goto err_dev_dbgfs;
-	}
-
-	return 0;
-
-err_dev_dbgfs:
-	device_destroy(mei_class, devno);
-err_dev_create:
-	cdev_del(&dev->cdev);
-err_dev_add:
-	mei_minor_free(dev);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(mei_register);
-
-void mei_deregister(struct mei_device *dev)
-{
-	int devno;
-
-	devno = dev->cdev.dev;
-	cdev_del(&dev->cdev);
-
-	mei_dbgfs_deregister(dev);
-
-	device_destroy(mei_class, devno);
-
-	mei_minor_free(dev);
-}
-EXPORT_SYMBOL_GPL(mei_deregister);
-
-static int __init mei_init(void)
-{
-	int ret;
-
-	mei_class = class_create(THIS_MODULE, "mei");
-	if (IS_ERR(mei_class)) {
-		pr_err("couldn't create class\n");
-		ret = PTR_ERR(mei_class);
-		goto err;
-	}
-
-	ret = alloc_chrdev_region(&mei_devt, 0, MEI_MAX_DEVS, "mei");
-	if (ret < 0) {
-		pr_err("unable to allocate char dev region\n");
-		goto err_class;
-	}
-
-	ret = mei_cl_bus_init();
-	if (ret < 0) {
-		pr_err("unable to initialize bus\n");
-		goto err_chrdev;
-	}
-
-	return 0;
-
-err_chrdev:
-	unregister_chrdev_region(mei_devt, MEI_MAX_DEVS);
-err_class:
-	class_destroy(mei_class);
-err:
-	return ret;
-}
-
-static void __exit mei_exit(void)
-{
-	unregister_chrdev_region(mei_devt, MEI_MAX_DEVS);
-	class_destroy(mei_class);
-	mei_cl_bus_exit();
-}
-
-module_init(mei_init);
-module_exit(mei_exit);
-
-MODULE_AUTHOR("Intel Corporation");
-MODULE_DESCRIPTION("Intel(R) Management Engine Interface");
-MODULE_LICENSE("GPL v2");
-
+/* Enumeration of MXL5005 Tuner Modulation Type */
+enum {
+	MXL_DEFAULT_MODULATION = 0,
+	MXL_DVBT,
+	MXL_ATSC

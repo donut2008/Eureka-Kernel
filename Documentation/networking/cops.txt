@@ -1,63 +1,102 @@
-Text File for the COPS LocalTalk Linux driver (cops.c).
-	By Jay Schulist <jschlst@samba.org>
+te);
+	edac_dbg(2, "DRAMC register = %#0x\n", dramcr);
+	layers[0].type = EDAC_MC_LAYER_CHIP_SELECT;
+	layers[0].size = R82600_NR_CSROWS;
+	layers[0].is_virt_csrow = true;
+	layers[1].type = EDAC_MC_LAYER_CHANNEL;
+	layers[1].size = R82600_NR_CHANS;
+	layers[1].is_virt_csrow = false;
+	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers, 0);
+	if (mci == NULL)
+		return -ENOMEM;
 
-This driver has two modes and they are: Dayna mode and Tangent mode.
-Each mode corresponds with the type of card. It has been found
-that there are 2 main types of cards and all other cards are
-the same and just have different names or only have minor differences
-such as more IO ports. As this driver is tested it will
-become more clear exactly what cards are supported. 
+	edac_dbg(0, "mci = %p\n", mci);
+	mci->pdev = &pdev->dev;
+	mci->mtype_cap = MEM_FLAG_RDDR | MEM_FLAG_DDR;
+	mci->edac_ctl_cap = EDAC_FLAG_NONE | EDAC_FLAG_EC | EDAC_FLAG_SECDED;
+	/* FIXME try to work out if the chip leads have been used for COM2
+	 * instead on this board? [MA6?] MAYBE:
+	 */
 
-Right now these cards are known to work with the COPS driver. The
-LT-200 cards work in a somewhat more limited capacity than the
-DL200 cards, which work very well and are in use by many people.
+	/* On the R82600, the pins for memory bits 72:65 - i.e. the   *
+	 * EC bits are shared with the pins for COM2 (!), so if COM2  *
+	 * is enabled, we assume COM2 is wired up, and thus no EDAC   *
+	 * is possible.                                               */
+	mci->edac_cap = EDAC_FLAG_NONE | EDAC_FLAG_EC | EDAC_FLAG_SECDED;
 
-TANGENT driver mode:
-	Tangent ATB-II, Novell NL-1000, Daystar Digital LT-200
-DAYNA driver mode:
-	Dayna DL2000/DaynaTalk PC (Half Length), COPS LT-95,
-	Farallon PhoneNET PC III, Farallon PhoneNET PC II
-Other cards possibly supported mode unknown though:
-	Dayna DL2000 (Full length)
+	if (ecc_enabled(dramcr)) {
+		if (scrub_disabled)
+			edac_dbg(3, "mci = %p - Scrubbing disabled! EAP: %#0x\n",
+				 mci, eapr);
+	} else
+		mci->edac_cap = EDAC_FLAG_NONE;
 
-The COPS driver defaults to using Dayna mode. To change the driver's 
-mode if you built a driver with dual support use board_type=1 or
-board_type=2 for Dayna or Tangent with insmod.
+	mci->mod_name = EDAC_MOD_STR;
+	mci->mod_ver = R82600_REVISION;
+	mci->ctl_name = "R82600";
+	mci->dev_name = pci_name(pdev);
+	mci->edac_check = r82600_check;
+	mci->ctl_page_to_phys = NULL;
+	r82600_init_csrows(mci, pdev, dramcr);
+	r82600_get_error_info(mci, &discard);	/* clear counters */
 
-** Operation/loading of the driver.
-Use modprobe like this:	/sbin/modprobe cops.o (IO #) (IRQ #)
-If you do not specify any options the driver will try and use the IO = 0x240,
-IRQ = 5. As of right now I would only use IRQ 5 for the card, if autoprobing.
+	/* Here we assume that we will never see multiple instances of this
+	 * type of memory controller.  The ID is therefore hardcoded to 0.
+	 */
+	if (edac_mc_add_mc(mci)) {
+		edac_dbg(3, "failed edac_mc_add_mc()\n");
+		goto fail;
+	}
 
-To load multiple COPS driver Localtalk cards you can do one of the following.
+	/* get this far and it's successful */
 
-insmod cops io=0x240 irq=5
-insmod -o cops2 cops io=0x260 irq=3
+	if (disable_hardware_scrub) {
+		edac_dbg(3, "Disabling Hardware Scrub (scrub on error)\n");
+		pci_write_bits32(pdev, R82600_EAP, BIT(31), BIT(31));
+	}
 
-Or in lilo.conf put something like this:
-	append="ether=5,0x240,lt0 ether=3,0x260,lt1"
+	/* allocating generic PCI control info */
+	r82600_pci = edac_pci_create_generic_ctl(&pdev->dev, EDAC_MOD_STR);
+	if (!r82600_pci) {
+		printk(KERN_WARNING
+			"%s(): Unable to create PCI control\n",
+			__func__);
+		printk(KERN_WARNING
+			"%s(): PCI error report via EDAC not setup\n",
+			__func__);
+	}
 
-Then bring up the interface with ifconfig. It will look something like this:
-lt0       Link encap:UNSPEC  HWaddr 00-00-00-00-00-00-00-F7-00-00-00-00-00-00-00-00
-          inet addr:192.168.1.2  Bcast:192.168.1.255  Mask:255.255.255.0
-          UP BROADCAST RUNNING NOARP MULTICAST  MTU:600  Metric:1
-          RX packets:0 errors:0 dropped:0 overruns:0 frame:0
-          TX packets:0 errors:0 dropped:0 overruns:0 carrier:0 coll:0
+	edac_dbg(3, "success\n");
+	return 0;
 
-** Netatalk Configuration
-You will need to configure atalkd with something like the following to make
-it work with the cops.c driver.
+fail:
+	edac_mc_free(mci);
+	return -ENODEV;
+}
 
-* For single LTalk card use.
-dummy -seed -phase 2 -net 2000 -addr 2000.10 -zone "1033"
-lt0 -seed -phase 1 -net 1000 -addr 1000.50 -zone "1033"
+/* returns count (>= 0), or negative on error */
+static int r82600_init_one(struct pci_dev *pdev,
+			   const struct pci_device_id *ent)
+{
+	edac_dbg(0, "\n");
 
-* For multiple cards, Ethernet and LocalTalk.
-eth0 -seed -phase 2 -net 3000 -addr 3000.20 -zone "1033"
-lt0 -seed -phase 1 -net 1000 -addr 1000.50 -zone "1033"
+	/* don't need to call pci_enable_device() */
+	return r82600_probe1(pdev, ent->driver_data);
+}
 
-* For multiple LocalTalk cards, and an Ethernet card.
-* Order seems to matter here, Ethernet last.
-lt0 -seed -phase 1 -net 1000 -addr 1000.10 -zone "LocalTalk1"
-lt1 -seed -phase 1 -net 2000 -addr 2000.20 -zone "LocalTalk2"
-eth0 -seed -phase 2 -net 3000 -addr 3000.30 -zone "EtherTalk"
+static void r82600_remove_one(struct pci_dev *pdev)
+{
+	struct mem_ctl_info *mci;
+
+	edac_dbg(0, "\n");
+
+	if (r82600_pci)
+		edac_pci_release_generic_ctl(r82600_pci);
+
+	if ((mci = edac_mc_del_mc(&pdev->dev)) == NULL)
+		return;
+
+	edac_mc_free(mci);
+}
+
+s

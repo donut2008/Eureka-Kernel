@@ -1,573 +1,305 @@
-#ifndef _BCACHE_BSET_H
-#define _BCACHE_BSET_H
-
-#include <linux/bcache.h>
-#include <linux/kernel.h>
-#include <linux/types.h>
-
-#include "util.h" /* for time_stats */
-
-/*
- * BKEYS:
- *
- * A bkey contains a key, a size field, a variable number of pointers, and some
- * ancillary flag bits.
- *
- * We use two different functions for validating bkeys, bch_ptr_invalid and
- * bch_ptr_bad().
- *
- * bch_ptr_invalid() primarily filters out keys and pointers that would be
- * invalid due to some sort of bug, whereas bch_ptr_bad() filters out keys and
- * pointer that occur in normal practice but don't point to real data.
- *
- * The one exception to the rule that ptr_invalid() filters out invalid keys is
- * that it also filters out keys of size 0 - these are keys that have been
- * completely overwritten. It'd be safe to delete these in memory while leaving
- * them on disk, just unnecessary work - so we filter them out when resorting
- * instead.
- *
- * We can't filter out stale keys when we're resorting, because garbage
- * collection needs to find them to ensure bucket gens don't wrap around -
- * unless we're rewriting the btree node those stale keys still exist on disk.
- *
- * We also implement functions here for removing some number of sectors from the
- * front or the back of a bkey - this is mainly used for fixing overlapping
- * extents, by removing the overlapping sectors from the older key.
- *
- * BSETS:
- *
- * A bset is an array of bkeys laid out contiguously in memory in sorted order,
- * along with a header. A btree node is made up of a number of these, written at
- * different times.
- *
- * There could be many of them on disk, but we never allow there to be more than
- * 4 in memory - we lazily resort as needed.
- *
- * We implement code here for creating and maintaining auxiliary search trees
- * (described below) for searching an individial bset, and on top of that we
- * implement a btree iterator.
- *
- * BTREE ITERATOR:
- *
- * Most of the code in bcache doesn't care about an individual bset - it needs
- * to search entire btree nodes and iterate over them in sorted order.
- *
- * The btree iterator code serves both functions; it iterates through the keys
- * in a btree node in sorted order, starting from either keys after a specific
- * point (if you pass it a search key) or the start of the btree node.
- *
- * AUXILIARY SEARCH TREES:
- *
- * Since keys are variable length, we can't use a binary search on a bset - we
- * wouldn't be able to find the start of the next key. But binary searches are
- * slow anyways, due to terrible cache behaviour; bcache originally used binary
- * searches and that code topped out at under 50k lookups/second.
- *
- * So we need to construct some sort of lookup table. Since we only insert keys
- * into the last (unwritten) set, most of the keys within a given btree node are
- * usually in sets that are mostly constant. We use two different types of
- * lookup tables to take advantage of this.
- *
- * Both lookup tables share in common that they don't index every key in the
- * set; they index one key every BSET_CACHELINE bytes, and then a linear search
- * is used for the rest.
- *
- * For sets that have been written to disk and are no longer being inserted
- * into, we construct a binary search tree in an array - traversing a binary
- * search tree in an array gives excellent locality of reference and is very
- * fast, since both children of any node are adjacent to each other in memory
- * (and their grandchildren, and great grandchildren...) - this means
- * prefetching can be used to great effect.
- *
- * It's quite useful performance wise to keep these nodes small - not just
- * because they're more likely to be in L2, but also because we can prefetch
- * more nodes on a single cacheline and thus prefetch more iterations in advance
- * when traversing this tree.
- *
- * Nodes in the auxiliary search tree must contain both a key to compare against
- * (we don't want to fetch the key from the set, that would defeat the purpose),
- * and a pointer to the key. We use a few tricks to compress both of these.
- *
- * To compress the pointer, we take advantage of the fact that one node in the
- * search tree corresponds to precisely BSET_CACHELINE bytes in the set. We have
- * a function (to_inorder()) that takes the index of a node in a binary tree and
- * returns what its index would be in an inorder traversal, so we only have to
- * store the low bits of the offset.
- *
- * The key is 84 bits (KEY_DEV + key->key, the offset on the device). To
- * compress that,  we take advantage of the fact that when we're traversing the
- * search tree at every iteration we know that both our search key and the key
- * we're looking for lie within some range - bounded by our previous
- * comparisons. (We special case the start of a search so that this is true even
- * at the root of the tree).
- *
- * So we know the key we're looking for is between a and b, and a and b don't
- * differ higher than bit 50, we don't need to check anything higher than bit
- * 50.
- *
- * We don't usually need the rest of the bits, either; we only need enough bits
- * to partition the key range we're currently checking.  Consider key n - the
- * key our auxiliary search tree node corresponds to, and key p, the key
- * immediately preceding n.  The lowest bit we need to store in the auxiliary
- * search tree is the highest bit that differs between n and p.
- *
- * Note that this could be bit 0 - we might sometimes need all 80 bits to do the
- * comparison. But we'd really like our nodes in the auxiliary search tree to be
- * of fixed size.
- *
- * The solution is to make them fixed size, and when we're constructing a node
- * check if p and n differed in the bits we needed them to. If they don't we
- * flag that node, and when doing lookups we fallback to comparing against the
- * real key. As long as this doesn't happen to often (and it seems to reliably
- * happen a bit less than 1% of the time), we win - even on failures, that key
- * is then more likely to be in cache than if we were doing binary searches all
- * the way, since we're touching so much less memory.
- *
- * The keys in the auxiliary search tree are stored in (software) floating
- * point, with an exponent and a mantissa. The exponent needs to be big enough
- * to address all the bits in the original key, but the number of bits in the
- * mantissa is somewhat arbitrary; more bits just gets us fewer failures.
- *
- * We need 7 bits for the exponent and 3 bits for the key's offset (since keys
- * are 8 byte aligned); using 22 bits for the mantissa means a node is 4 bytes.
- * We need one node per 128 bytes in the btree node, which means the auxiliary
- * search trees take up 3% as much memory as the btree itself.
- *
- * Constructing these auxiliary search trees is moderately expensive, and we
- * don't want to be constantly rebuilding the search tree for the last set
- * whenever we insert another key into it. For the unwritten set, we use a much
- * simpler lookup table - it's just a flat array, so index i in the lookup table
- * corresponds to the i range of BSET_CACHELINE bytes in the set. Indexing
- * within each byte range works the same as with the auxiliary search trees.
- *
- * These are much easier to keep up to date when we insert a key - we do it
- * somewhat lazily; when we shift a key up we usually just increment the pointer
- * to it, only when it would overflow do we go to the trouble of finding the
- * first key in that range of bytes again.
- */
-
-struct btree_keys;
-struct btree_iter;
-struct btree_iter_set;
-struct bkey_float;
-
-#define MAX_BSETS		4U
-
-struct bset_tree {
-	/*
-	 * We construct a binary tree in an array as if the array
-	 * started at 1, so that things line up on the same cachelines
-	 * better: see comments in bset.c at cacheline_to_bkey() for
-	 * details
-	 */
-
-	/* size of the binary tree and prev array */
-	unsigned		size;
-
-	/* function of size - precalculated for to_inorder() */
-	unsigned		extra;
-
-	/* copy of the last key in the set */
-	struct bkey		end;
-	struct bkey_float	*tree;
-
-	/*
-	 * The nodes in the bset tree point to specific keys - this
-	 * array holds the sizes of the previous key.
-	 *
-	 * Conceptually it's a member of struct bkey_float, but we want
-	 * to keep bkey_float to 4 bytes and prev isn't used in the fast
-	 * path.
-	 */
-	uint8_t			*prev;
-
-	/* The actual btree node, with pointers to each sorted set */
-	struct bset		*data;
-};
-
-struct btree_keys_ops {
-	bool		(*sort_cmp)(struct btree_iter_set,
-				    struct btree_iter_set);
-	struct bkey	*(*sort_fixup)(struct btree_iter *, struct bkey *);
-	bool		(*insert_fixup)(struct btree_keys *, struct bkey *,
-					struct btree_iter *, struct bkey *);
-	bool		(*key_invalid)(struct btree_keys *,
-				       const struct bkey *);
-	bool		(*key_bad)(struct btree_keys *, const struct bkey *);
-	bool		(*key_merge)(struct btree_keys *,
-				     struct bkey *, struct bkey *);
-	void		(*key_to_text)(char *, size_t, const struct bkey *);
-	void		(*key_dump)(struct btree_keys *, const struct bkey *);
-
-	/*
-	 * Only used for deciding whether to use START_KEY(k) or just the key
-	 * itself in a couple places
-	 */
-	bool		is_extents;
-};
-
-struct btree_keys {
-	const struct btree_keys_ops	*ops;
-	uint8_t			page_order;
-	uint8_t			nsets;
-	unsigned		last_set_unwritten:1;
-	bool			*expensive_debug_checks;
-
-	/*
-	 * Sets of sorted keys - the real btree node - plus a binary search tree
-	 *
-	 * set[0] is special; set[0]->tree, set[0]->prev and set[0]->data point
-	 * to the memory we have allocated for this btree node. Additionally,
-	 * set[0]->data points to the entire btree node as it exists on disk.
-	 */
-	struct bset_tree	set[MAX_BSETS];
-};
-
-static inline struct bset_tree *bset_tree_last(struct btree_keys *b)
-{
-	return b->set + b->nsets;
-}
-
-static inline bool bset_written(struct btree_keys *b, struct bset_tree *t)
-{
-	return t <= b->set + b->nsets - b->last_set_unwritten;
-}
-
-static inline bool bkey_written(struct btree_keys *b, struct bkey *k)
-{
-	return !b->last_set_unwritten || k < b->set[b->nsets].data->start;
-}
-
-static inline unsigned bset_byte_offset(struct btree_keys *b, struct bset *i)
-{
-	return ((size_t) i) - ((size_t) b->set->data);
-}
-
-static inline unsigned bset_sector_offset(struct btree_keys *b, struct bset *i)
-{
-	return bset_byte_offset(b, i) >> 9;
-}
-
-#define __set_bytes(i, k)	(sizeof(*(i)) + (k) * sizeof(uint64_t))
-#define set_bytes(i)		__set_bytes(i, i->keys)
-
-#define __set_blocks(i, k, block_bytes)				\
-	DIV_ROUND_UP(__set_bytes(i, k), block_bytes)
-#define set_blocks(i, block_bytes)				\
-	__set_blocks(i, (i)->keys, block_bytes)
-
-static inline size_t bch_btree_keys_u64s_remaining(struct btree_keys *b)
-{
-	struct bset_tree *t = bset_tree_last(b);
-
-	BUG_ON((PAGE_SIZE << b->page_order) <
-	       (bset_byte_offset(b, t->data) + set_bytes(t->data)));
-
-	if (!b->last_set_unwritten)
-		return 0;
-
-	return ((PAGE_SIZE << b->page_order) -
-		(bset_byte_offset(b, t->data) + set_bytes(t->data))) /
-		sizeof(u64);
-}
-
-static inline struct bset *bset_next_set(struct btree_keys *b,
-					 unsigned block_bytes)
-{
-	struct bset *i = bset_tree_last(b)->data;
-
-	return ((void *) i) + roundup(set_bytes(i), block_bytes);
-}
-
-void bch_btree_keys_free(struct btree_keys *);
-int bch_btree_keys_alloc(struct btree_keys *, unsigned, gfp_t);
-void bch_btree_keys_init(struct btree_keys *, const struct btree_keys_ops *,
-			 bool *);
-
-void bch_bset_init_next(struct btree_keys *, struct bset *, uint64_t);
-void bch_bset_build_written_tree(struct btree_keys *);
-void bch_bset_fix_invalidated_key(struct btree_keys *, struct bkey *);
-bool bch_bkey_try_merge(struct btree_keys *, struct bkey *, struct bkey *);
-void bch_bset_insert(struct btree_keys *, struct bkey *, struct bkey *);
-unsigned bch_btree_insert_key(struct btree_keys *, struct bkey *,
-			      struct bkey *);
-
-enum {
-	BTREE_INSERT_STATUS_NO_INSERT = 0,
-	BTREE_INSERT_STATUS_INSERT,
-	BTREE_INSERT_STATUS_BACK_MERGE,
-	BTREE_INSERT_STATUS_OVERWROTE,
-	BTREE_INSERT_STATUS_FRONT_MERGE,
-};
-
-/* Btree key iteration */
-
-struct btree_iter {
-	size_t size, used;
-#ifdef CONFIG_BCACHE_DEBUG
-	struct btree_keys *b;
-#endif
-	struct btree_iter_set {
-		struct bkey *k, *end;
-	} data[MAX_BSETS];
-};
-
-typedef bool (*ptr_filter_fn)(struct btree_keys *, const struct bkey *);
-
-struct bkey *bch_btree_iter_next(struct btree_iter *);
-struct bkey *bch_btree_iter_next_filter(struct btree_iter *,
-					struct btree_keys *, ptr_filter_fn);
-
-void bch_btree_iter_push(struct btree_iter *, struct bkey *, struct bkey *);
-struct bkey *bch_btree_iter_init(struct btree_keys *, struct btree_iter *,
-				 struct bkey *);
-
-struct bkey *__bch_bset_search(struct btree_keys *, struct bset_tree *,
-			       const struct bkey *);
-
-/*
- * Returns the first key that is strictly greater than search
- */
-static inline struct bkey *bch_bset_search(struct btree_keys *b,
-					   struct bset_tree *t,
-					   const struct bkey *search)
-{
-	return search ? __bch_bset_search(b, t, search) : t->data->start;
-}
-
-#define for_each_key_filter(b, k, iter, filter)				\
-	for (bch_btree_iter_init((b), (iter), NULL);			\
-	     ((k) = bch_btree_iter_next_filter((iter), (b), filter));)
-
-#define for_each_key(b, k, iter)					\
-	for (bch_btree_iter_init((b), (iter), NULL);			\
-	     ((k) = bch_btree_iter_next(iter));)
-
-/* Sorting */
-
-struct bset_sort_state {
-	mempool_t		*pool;
-
-	unsigned		page_order;
-	unsigned		crit_factor;
-
-	struct time_stats	time;
-};
-
-void bch_bset_sort_state_free(struct bset_sort_state *);
-int bch_bset_sort_state_init(struct bset_sort_state *, unsigned);
-void bch_btree_sort_lazy(struct btree_keys *, struct bset_sort_state *);
-void bch_btree_sort_into(struct btree_keys *, struct btree_keys *,
-			 struct bset_sort_state *);
-void bch_btree_sort_and_fix_extents(struct btree_keys *, struct btree_iter *,
-				    struct bset_sort_state *);
-void bch_btree_sort_partial(struct btree_keys *, unsigned,
-			    struct bset_sort_state *);
-
-static inline void bch_btree_sort(struct btree_keys *b,
-				  struct bset_sort_state *state)
-{
-	bch_btree_sort_partial(b, 0, state);
-}
-
-struct bset_stats {
-	size_t sets_written, sets_unwritten;
-	size_t bytes_written, bytes_unwritten;
-	size_t floats, failed;
-};
-
-void bch_btree_keys_stats(struct btree_keys *, struct bset_stats *);
-
-/* Bkey utility code */
-
-#define bset_bkey_last(i)	bkey_idx((struct bkey *) (i)->d, \
-					 (unsigned int)(i)->keys)
-
-static inline struct bkey *bset_bkey_idx(struct bset *i, unsigned idx)
-{
-	return bkey_idx(i->start, idx);
-}
-
-static inline void bkey_init(struct bkey *k)
-{
-	*k = ZERO_KEY;
-}
-
-static __always_inline int64_t bkey_cmp(const struct bkey *l,
-					const struct bkey *r)
-{
-	return unlikely(KEY_INODE(l) != KEY_INODE(r))
-		? (int64_t) KEY_INODE(l) - (int64_t) KEY_INODE(r)
-		: (int64_t) KEY_OFFSET(l) - (int64_t) KEY_OFFSET(r);
-}
-
-void bch_bkey_copy_single_ptr(struct bkey *, const struct bkey *,
-			      unsigned);
-bool __bch_cut_front(const struct bkey *, struct bkey *);
-bool __bch_cut_back(const struct bkey *, struct bkey *);
-
-static inline bool bch_cut_front(const struct bkey *where, struct bkey *k)
-{
-	BUG_ON(bkey_cmp(where, k) > 0);
-	return __bch_cut_front(where, k);
-}
-
-static inline bool bch_cut_back(const struct bkey *where, struct bkey *k)
-{
-	BUG_ON(bkey_cmp(where, &START_KEY(k)) < 0);
-	return __bch_cut_back(where, k);
-}
-
-/*
- * Pointer '*preceding_key_p' points to a memory object to store preceding
- * key of k. If the preceding key does not exist, set '*preceding_key_p' to
- * NULL. So the caller of preceding_key() needs to take care of memory
- * which '*preceding_key_p' pointed to before calling preceding_key().
- * Currently the only caller of preceding_key() is bch_btree_insert_key(),
- * and it points to an on-stack variable, so the memory release is handled
- * by stackframe itself.
- */
-static inline void preceding_key(struct bkey *k, struct bkey **preceding_key_p)
-{
-	if (KEY_INODE(k) || KEY_OFFSET(k)) {
-		(**preceding_key_p) = KEY(KEY_INODE(k), KEY_OFFSET(k), 0);
-		if (!(*preceding_key_p)->low)
-			(*preceding_key_p)->high--;
-		(*preceding_key_p)->low--;
-	} else {
-		(*preceding_key_p) = NULL;
-	}
-}
-
-static inline bool bch_ptr_invalid(struct btree_keys *b, const struct bkey *k)
-{
-	return b->ops->key_invalid(b, k);
-}
-
-static inline bool bch_ptr_bad(struct btree_keys *b, const struct bkey *k)
-{
-	return b->ops->key_bad(b, k);
-}
-
-static inline void bch_bkey_to_text(struct btree_keys *b, char *buf,
-				    size_t size, const struct bkey *k)
-{
-	return b->ops->key_to_text(buf, size, k);
-}
-
-static inline bool bch_bkey_equal_header(const struct bkey *l,
-					 const struct bkey *r)
-{
-	return (KEY_DIRTY(l) == KEY_DIRTY(r) &&
-		KEY_PTRS(l) == KEY_PTRS(r) &&
-		KEY_CSUM(l) == KEY_CSUM(r));
-}
-
-/* Keylists */
-
-struct keylist {
-	union {
-		struct bkey		*keys;
-		uint64_t		*keys_p;
-	};
-	union {
-		struct bkey		*top;
-		uint64_t		*top_p;
-	};
-
-	/* Enough room for btree_split's keys without realloc */
-#define KEYLIST_INLINE		16
-	uint64_t		inline_keys[KEYLIST_INLINE];
-};
-
-static inline void bch_keylist_init(struct keylist *l)
-{
-	l->top_p = l->keys_p = l->inline_keys;
-}
-
-static inline void bch_keylist_init_single(struct keylist *l, struct bkey *k)
-{
-	l->keys = k;
-	l->top = bkey_next(k);
-}
-
-static inline void bch_keylist_push(struct keylist *l)
-{
-	l->top = bkey_next(l->top);
-}
-
-static inline void bch_keylist_add(struct keylist *l, struct bkey *k)
-{
-	bkey_copy(l->top, k);
-	bch_keylist_push(l);
-}
-
-static inline bool bch_keylist_empty(struct keylist *l)
-{
-	return l->top == l->keys;
-}
-
-static inline void bch_keylist_reset(struct keylist *l)
-{
-	l->top = l->keys;
-}
-
-static inline void bch_keylist_free(struct keylist *l)
-{
-	if (l->keys_p != l->inline_keys)
-		kfree(l->keys_p);
-}
-
-static inline size_t bch_keylist_nkeys(struct keylist *l)
-{
-	return l->top_p - l->keys_p;
-}
-
-static inline size_t bch_keylist_bytes(struct keylist *l)
-{
-	return bch_keylist_nkeys(l) * sizeof(uint64_t);
-}
-
-struct bkey *bch_keylist_pop(struct keylist *);
-void bch_keylist_pop_front(struct keylist *);
-int __bch_keylist_realloc(struct keylist *, unsigned);
-
-/* Debug stuff */
-
-#ifdef CONFIG_BCACHE_DEBUG
-
-int __bch_count_data(struct btree_keys *);
-void __bch_check_keys(struct btree_keys *, const char *, ...);
-void bch_dump_bset(struct btree_keys *, struct bset *, unsigned);
-void bch_dump_bucket(struct btree_keys *);
-
-#else
-
-static inline int __bch_count_data(struct btree_keys *b) { return -1; }
-static inline void __bch_check_keys(struct btree_keys *b, const char *fmt, ...) {}
-static inline void bch_dump_bucket(struct btree_keys *b) {}
-void bch_dump_bset(struct btree_keys *, struct bset *, unsigned);
-
-#endif
-
-static inline bool btree_keys_expensive_checks(struct btree_keys *b)
-{
-#ifdef CONFIG_BCACHE_DEBUG
-	return *b->expensive_debug_checks;
-#else
-	return false;
-#endif
-}
-
-static inline int bch_count_data(struct btree_keys *b)
-{
-	return btree_keys_expensive_checks(b) ? __bch_count_data(b) : -1;
-}
-
-#define bch_check_keys(b, ...)						\
-do {									\
-	if (btree_keys_expensive_checks(b))				\
-		__bch_check_keys(b, __VA_ARGS__);			\
-} while (0)
-
-#endif
+SHIFT 0x10
+#define DPM_TABLE_194__MemoryACPILevel_UpHyst_MASK 0xff000000
+#define DPM_TABLE_194__MemoryACPILevel_UpHyst__SHIFT 0x18
+#define DPM_TABLE_195__MemoryACPILevel_padding1_1_MASK 0xff
+#define DPM_TABLE_195__MemoryACPILevel_padding1_1__SHIFT 0x0
+#define DPM_TABLE_195__MemoryACPILevel_padding1_0_MASK 0xff00
+#define DPM_TABLE_195__MemoryACPILevel_padding1_0__SHIFT 0x8
+#define DPM_TABLE_195__MemoryACPILevel_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_195__MemoryACPILevel_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_196__MemoryACPILevel_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_196__MemoryACPILevel_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_197__MemoryACPILevel_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_197__MemoryACPILevel_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_198__MemoryACPILevel_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_198__MemoryACPILevel_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_199__MemoryACPILevel_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_199__MemoryACPILevel_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_200__MemoryACPILevel_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_200__MemoryACPILevel_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_201__MemoryACPILevel_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_201__MemoryACPILevel_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_202__MemoryACPILevel_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_202__MemoryACPILevel_DllCntl__SHIFT 0x0
+#define DPM_TABLE_203__MemoryACPILevel_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_203__MemoryACPILevel_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_204__MemoryACPILevel_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_204__MemoryACPILevel_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_205__MemoryLevel_0_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_205__MemoryLevel_0_MinVddc__SHIFT 0x0
+#define DPM_TABLE_206__MemoryLevel_0_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_206__MemoryLevel_0_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_207__MemoryLevel_0_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_207__MemoryLevel_0_MinVddci__SHIFT 0x0
+#define DPM_TABLE_208__MemoryLevel_0_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_208__MemoryLevel_0_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_209__MemoryLevel_0_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_209__MemoryLevel_0_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_210__MemoryLevel_0_StutterEnable_MASK 0xff
+#define DPM_TABLE_210__MemoryLevel_0_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_210__MemoryLevel_0_RttEnable_MASK 0xff00
+#define DPM_TABLE_210__MemoryLevel_0_RttEnable__SHIFT 0x8
+#define DPM_TABLE_210__MemoryLevel_0_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_210__MemoryLevel_0_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_210__MemoryLevel_0_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_210__MemoryLevel_0_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_211__MemoryLevel_0_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_211__MemoryLevel_0_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_211__MemoryLevel_0_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_211__MemoryLevel_0_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_211__MemoryLevel_0_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_211__MemoryLevel_0_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_211__MemoryLevel_0_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_211__MemoryLevel_0_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_212__MemoryLevel_0_padding_MASK 0xff
+#define DPM_TABLE_212__MemoryLevel_0_padding__SHIFT 0x0
+#define DPM_TABLE_212__MemoryLevel_0_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_212__MemoryLevel_0_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_212__MemoryLevel_0_DownHyst_MASK 0xff0000
+#define DPM_TABLE_212__MemoryLevel_0_DownHyst__SHIFT 0x10
+#define DPM_TABLE_212__MemoryLevel_0_UpHyst_MASK 0xff000000
+#define DPM_TABLE_212__MemoryLevel_0_UpHyst__SHIFT 0x18
+#define DPM_TABLE_213__MemoryLevel_0_padding1_1_MASK 0xff
+#define DPM_TABLE_213__MemoryLevel_0_padding1_1__SHIFT 0x0
+#define DPM_TABLE_213__MemoryLevel_0_padding1_0_MASK 0xff00
+#define DPM_TABLE_213__MemoryLevel_0_padding1_0__SHIFT 0x8
+#define DPM_TABLE_213__MemoryLevel_0_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_213__MemoryLevel_0_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_214__MemoryLevel_0_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_214__MemoryLevel_0_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_215__MemoryLevel_0_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_215__MemoryLevel_0_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_216__MemoryLevel_0_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_216__MemoryLevel_0_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_217__MemoryLevel_0_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_217__MemoryLevel_0_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_218__MemoryLevel_0_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_218__MemoryLevel_0_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_219__MemoryLevel_0_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_219__MemoryLevel_0_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_220__MemoryLevel_0_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_220__MemoryLevel_0_DllCntl__SHIFT 0x0
+#define DPM_TABLE_221__MemoryLevel_0_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_221__MemoryLevel_0_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_222__MemoryLevel_0_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_222__MemoryLevel_0_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_223__MemoryLevel_1_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_223__MemoryLevel_1_MinVddc__SHIFT 0x0
+#define DPM_TABLE_224__MemoryLevel_1_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_224__MemoryLevel_1_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_225__MemoryLevel_1_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_225__MemoryLevel_1_MinVddci__SHIFT 0x0
+#define DPM_TABLE_226__MemoryLevel_1_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_226__MemoryLevel_1_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_227__MemoryLevel_1_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_227__MemoryLevel_1_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_228__MemoryLevel_1_StutterEnable_MASK 0xff
+#define DPM_TABLE_228__MemoryLevel_1_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_228__MemoryLevel_1_RttEnable_MASK 0xff00
+#define DPM_TABLE_228__MemoryLevel_1_RttEnable__SHIFT 0x8
+#define DPM_TABLE_228__MemoryLevel_1_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_228__MemoryLevel_1_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_228__MemoryLevel_1_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_228__MemoryLevel_1_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_229__MemoryLevel_1_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_229__MemoryLevel_1_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_229__MemoryLevel_1_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_229__MemoryLevel_1_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_229__MemoryLevel_1_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_229__MemoryLevel_1_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_229__MemoryLevel_1_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_229__MemoryLevel_1_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_230__MemoryLevel_1_padding_MASK 0xff
+#define DPM_TABLE_230__MemoryLevel_1_padding__SHIFT 0x0
+#define DPM_TABLE_230__MemoryLevel_1_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_230__MemoryLevel_1_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_230__MemoryLevel_1_DownHyst_MASK 0xff0000
+#define DPM_TABLE_230__MemoryLevel_1_DownHyst__SHIFT 0x10
+#define DPM_TABLE_230__MemoryLevel_1_UpHyst_MASK 0xff000000
+#define DPM_TABLE_230__MemoryLevel_1_UpHyst__SHIFT 0x18
+#define DPM_TABLE_231__MemoryLevel_1_padding1_1_MASK 0xff
+#define DPM_TABLE_231__MemoryLevel_1_padding1_1__SHIFT 0x0
+#define DPM_TABLE_231__MemoryLevel_1_padding1_0_MASK 0xff00
+#define DPM_TABLE_231__MemoryLevel_1_padding1_0__SHIFT 0x8
+#define DPM_TABLE_231__MemoryLevel_1_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_231__MemoryLevel_1_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_232__MemoryLevel_1_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_232__MemoryLevel_1_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_233__MemoryLevel_1_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_233__MemoryLevel_1_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_234__MemoryLevel_1_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_234__MemoryLevel_1_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_235__MemoryLevel_1_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_235__MemoryLevel_1_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_236__MemoryLevel_1_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_236__MemoryLevel_1_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_237__MemoryLevel_1_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_237__MemoryLevel_1_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_238__MemoryLevel_1_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_238__MemoryLevel_1_DllCntl__SHIFT 0x0
+#define DPM_TABLE_239__MemoryLevel_1_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_239__MemoryLevel_1_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_240__MemoryLevel_1_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_240__MemoryLevel_1_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_241__MemoryLevel_2_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_241__MemoryLevel_2_MinVddc__SHIFT 0x0
+#define DPM_TABLE_242__MemoryLevel_2_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_242__MemoryLevel_2_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_243__MemoryLevel_2_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_243__MemoryLevel_2_MinVddci__SHIFT 0x0
+#define DPM_TABLE_244__MemoryLevel_2_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_244__MemoryLevel_2_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_245__MemoryLevel_2_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_245__MemoryLevel_2_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_246__MemoryLevel_2_StutterEnable_MASK 0xff
+#define DPM_TABLE_246__MemoryLevel_2_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_246__MemoryLevel_2_RttEnable_MASK 0xff00
+#define DPM_TABLE_246__MemoryLevel_2_RttEnable__SHIFT 0x8
+#define DPM_TABLE_246__MemoryLevel_2_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_246__MemoryLevel_2_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_246__MemoryLevel_2_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_246__MemoryLevel_2_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_247__MemoryLevel_2_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_247__MemoryLevel_2_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_247__MemoryLevel_2_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_247__MemoryLevel_2_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_247__MemoryLevel_2_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_247__MemoryLevel_2_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_247__MemoryLevel_2_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_247__MemoryLevel_2_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_248__MemoryLevel_2_padding_MASK 0xff
+#define DPM_TABLE_248__MemoryLevel_2_padding__SHIFT 0x0
+#define DPM_TABLE_248__MemoryLevel_2_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_248__MemoryLevel_2_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_248__MemoryLevel_2_DownHyst_MASK 0xff0000
+#define DPM_TABLE_248__MemoryLevel_2_DownHyst__SHIFT 0x10
+#define DPM_TABLE_248__MemoryLevel_2_UpHyst_MASK 0xff000000
+#define DPM_TABLE_248__MemoryLevel_2_UpHyst__SHIFT 0x18
+#define DPM_TABLE_249__MemoryLevel_2_padding1_1_MASK 0xff
+#define DPM_TABLE_249__MemoryLevel_2_padding1_1__SHIFT 0x0
+#define DPM_TABLE_249__MemoryLevel_2_padding1_0_MASK 0xff00
+#define DPM_TABLE_249__MemoryLevel_2_padding1_0__SHIFT 0x8
+#define DPM_TABLE_249__MemoryLevel_2_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_249__MemoryLevel_2_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_250__MemoryLevel_2_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_250__MemoryLevel_2_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_251__MemoryLevel_2_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_251__MemoryLevel_2_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_252__MemoryLevel_2_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_252__MemoryLevel_2_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_253__MemoryLevel_2_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_253__MemoryLevel_2_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_254__MemoryLevel_2_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_254__MemoryLevel_2_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_255__MemoryLevel_2_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_255__MemoryLevel_2_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_256__MemoryLevel_2_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_256__MemoryLevel_2_DllCntl__SHIFT 0x0
+#define DPM_TABLE_257__MemoryLevel_2_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_257__MemoryLevel_2_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_258__MemoryLevel_2_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_258__MemoryLevel_2_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_259__MemoryLevel_3_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_259__MemoryLevel_3_MinVddc__SHIFT 0x0
+#define DPM_TABLE_260__MemoryLevel_3_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_260__MemoryLevel_3_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_261__MemoryLevel_3_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_261__MemoryLevel_3_MinVddci__SHIFT 0x0
+#define DPM_TABLE_262__MemoryLevel_3_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_262__MemoryLevel_3_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_263__MemoryLevel_3_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_263__MemoryLevel_3_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_264__MemoryLevel_3_StutterEnable_MASK 0xff
+#define DPM_TABLE_264__MemoryLevel_3_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_264__MemoryLevel_3_RttEnable_MASK 0xff00
+#define DPM_TABLE_264__MemoryLevel_3_RttEnable__SHIFT 0x8
+#define DPM_TABLE_264__MemoryLevel_3_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_264__MemoryLevel_3_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_264__MemoryLevel_3_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_264__MemoryLevel_3_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_265__MemoryLevel_3_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_265__MemoryLevel_3_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_265__MemoryLevel_3_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_265__MemoryLevel_3_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_265__MemoryLevel_3_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_265__MemoryLevel_3_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_265__MemoryLevel_3_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_265__MemoryLevel_3_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_266__MemoryLevel_3_padding_MASK 0xff
+#define DPM_TABLE_266__MemoryLevel_3_padding__SHIFT 0x0
+#define DPM_TABLE_266__MemoryLevel_3_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_266__MemoryLevel_3_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_266__MemoryLevel_3_DownHyst_MASK 0xff0000
+#define DPM_TABLE_266__MemoryLevel_3_DownHyst__SHIFT 0x10
+#define DPM_TABLE_266__MemoryLevel_3_UpHyst_MASK 0xff000000
+#define DPM_TABLE_266__MemoryLevel_3_UpHyst__SHIFT 0x18
+#define DPM_TABLE_267__MemoryLevel_3_padding1_1_MASK 0xff
+#define DPM_TABLE_267__MemoryLevel_3_padding1_1__SHIFT 0x0
+#define DPM_TABLE_267__MemoryLevel_3_padding1_0_MASK 0xff00
+#define DPM_TABLE_267__MemoryLevel_3_padding1_0__SHIFT 0x8
+#define DPM_TABLE_267__MemoryLevel_3_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_267__MemoryLevel_3_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_268__MemoryLevel_3_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_268__MemoryLevel_3_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_269__MemoryLevel_3_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_269__MemoryLevel_3_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_270__MemoryLevel_3_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_270__MemoryLevel_3_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_271__MemoryLevel_3_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_271__MemoryLevel_3_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_272__MemoryLevel_3_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_272__MemoryLevel_3_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_273__MemoryLevel_3_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_273__MemoryLevel_3_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_274__MemoryLevel_3_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_274__MemoryLevel_3_DllCntl__SHIFT 0x0
+#define DPM_TABLE_275__MemoryLevel_3_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_275__MemoryLevel_3_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_276__MemoryLevel_3_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_276__MemoryLevel_3_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_277__MemoryLevel_4_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_277__MemoryLevel_4_MinVddc__SHIFT 0x0
+#define DPM_TABLE_278__MemoryLevel_4_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_278__MemoryLevel_4_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_279__MemoryLevel_4_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_279__MemoryLevel_4_MinVddci__SHIFT 0x0
+#define DPM_TABLE_280__MemoryLevel_4_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_280__MemoryLevel_4_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_281__MemoryLevel_4_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_281__MemoryLevel_4_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_282__MemoryLevel_4_StutterEnable_MASK 0xff
+#define DPM_TABLE_282__MemoryLevel_4_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_282__MemoryLevel_4_RttEnable_MASK 0xff00
+#define DPM_TABLE_282__MemoryLevel_4_RttEnable__SHIFT 0x8
+#define DPM_TABLE_282__MemoryLevel_4_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_282__MemoryLevel_4_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_282__MemoryLevel_4_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_282__MemoryLevel_4_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_283__MemoryLevel_4_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_283__MemoryLevel_4_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_283__MemoryLevel_4_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_283__MemoryLevel_4_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_283__MemoryLevel_4_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_283__MemoryLevel_4_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_283__MemoryLevel_4_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_283__MemoryLevel_4_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_284__MemoryLevel_4_padding_MASK 0xff
+#define DPM_TABLE_284__MemoryLevel_4_padding__SHIFT 0x0
+#define DPM_TABLE_284__MemoryLevel_4_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_284__MemoryLevel_4_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_284__MemoryLevel_4_DownHyst_MASK 0xff0000
+#define DPM_TABLE_284__MemoryLevel_4_DownHyst__SHIFT 0x10
+#define DPM_TABLE_284__MemoryLevel_4_UpHyst_MASK 0xff000000
+#define DPM_TABLE_284__MemoryLevel_4_UpHyst__SHIFT 0x18
+#define DPM_TABLE_285__MemoryLevel_4_padding1_1_MASK 0xff
+#define DPM_TABLE_285__MemoryLevel_4_padding1_1__SHIFT 0x0
+#define DPM_TABLE_285__MemoryLevel_4_padding1_0_MASK 0xff00
+#define DPM_TABLE_285__MemoryLevel_4_padding1_0__SHIFT 0x8
+#define DPM_TABLE_285__MemoryLevel_4_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_285__MemoryLevel_4_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_286__MemoryLevel_4_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_286__MemoryLevel_4_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_287__MemoryLevel_4_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_287__MemoryLevel_4_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_288__MemoryLevel_4_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_288__MemoryLevel_4_MpllFuncCntl_2__SHIFT 0x

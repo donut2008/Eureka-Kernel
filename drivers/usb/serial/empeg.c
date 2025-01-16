@@ -1,129 +1,65 @@
-/*
- * USB Empeg empeg-car player driver
- *
- *	Copyright (C) 2000, 2001
- *	    Gary Brubaker (xavyer@ix.netcom.com)
- *
- *	Copyright (C) 1999 - 2001
- *	    Greg Kroah-Hartman (greg@kroah.com)
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License, as published by
- *	the Free Software Foundation, version 2.
- *
- * See Documentation/usb/usb-serial.txt for more information on using this
- * driver
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/spinlock.h>
-#include <linux/uaccess.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-
-#define DRIVER_AUTHOR "Greg Kroah-Hartman <greg@kroah.com>, Gary Brubaker <xavyer@ix.netcom.com>"
-#define DRIVER_DESC "USB Empeg Mark I/II Driver"
-
-#define EMPEG_VENDOR_ID			0x084f
-#define EMPEG_PRODUCT_ID		0x0001
-
-/* function prototypes for an empeg-car player */
-static int  empeg_startup(struct usb_serial *serial);
-static void empeg_init_termios(struct tty_struct *tty);
-
-static const struct usb_device_id id_table[] = {
-	{ USB_DEVICE(EMPEG_VENDOR_ID, EMPEG_PRODUCT_ID) },
-	{ }					/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, id_table);
-
-static struct usb_serial_driver empeg_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"empeg",
-	},
-	.id_table =		id_table,
-	.num_ports =		1,
-	.bulk_out_size =	256,
-	.throttle =		usb_serial_generic_throttle,
-	.unthrottle =		usb_serial_generic_unthrottle,
-	.attach =		empeg_startup,
-	.init_termios =		empeg_init_termios,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&empeg_device, NULL
-};
-
-static int empeg_startup(struct usb_serial *serial)
-{
-	int r;
-
-	if (serial->dev->actconfig->desc.bConfigurationValue != 1) {
-		dev_err(&serial->dev->dev, "active config #%d != 1 ??\n",
-			serial->dev->actconfig->desc.bConfigurationValue);
-		return -ENODEV;
-	}
-
-	r = usb_reset_configuration(serial->dev);
-
-	/* continue on with initialization */
-	return r;
-}
-
-static void empeg_init_termios(struct tty_struct *tty)
-{
-	struct ktermios *termios = &tty->termios;
-
-	/*
-	 * The empeg-car player wants these particular tty settings.
-	 * You could, for example, change the baud rate, however the
-	 * player only supports 115200 (currently), so there is really
-	 * no point in support for changes to the tty settings.
-	 * (at least for now)
-	 *
-	 * The default requirements for this device are:
-	 */
-	termios->c_iflag
-		&= ~(IGNBRK	/* disable ignore break */
-		| BRKINT	/* disable break causes interrupt */
-		| PARMRK	/* disable mark parity errors */
-		| ISTRIP	/* disable clear high bit of input characters */
-		| INLCR		/* disable translate NL to CR */
-		| IGNCR		/* disable ignore CR */
-		| ICRNL		/* disable translate CR to NL */
-		| IXON);	/* disable enable XON/XOFF flow control */
-
-	termios->c_oflag
-		&= ~OPOST;	/* disable postprocess output characters */
-
-	termios->c_lflag
-		&= ~(ECHO	/* disable echo input characters */
-		| ECHONL	/* disable echo new line */
-		| ICANON	/* disable erase, kill, werase, and rprnt special characters */
-		| ISIG		/* disable interrupt, quit, and suspend special characters */
-		| IEXTEN);	/* disable non-POSIX special characters */
-
-	termios->c_cflag
-		&= ~(CSIZE	/* no size */
-		| PARENB	/* disable parity bit */
-		| CBAUD);	/* clear current baud rate */
-
-	termios->c_cflag
-		|= CS8;		/* character size 8 bits */
-
-	tty_encode_baud_rate(tty, 115200, 115200);
-}
-
-module_usb_serial_driver(serial_drivers, id_table);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+PPORTED_MASK 0x10
+#define D3F5_DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED__SHIFT 0x4
+#define D3F5_DEVICE_CAP2__ARI_FORWARDING_SUPPORTED_MASK 0x20
+#define D3F5_DEVICE_CAP2__ARI_FORWARDING_SUPPORTED__SHIFT 0x5
+#define D3F5_DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED_MASK 0x40
+#define D3F5_DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED__SHIFT 0x6
+#define D3F5_DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED_MASK 0x80
+#define D3F5_DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED__SHIFT 0x7
+#define D3F5_DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED_MASK 0x100
+#define D3F5_DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED__SHIFT 0x8
+#define D3F5_DEVICE_CAP2__CAS128_CMPLT_SUPPORTED_MASK 0x200
+#define D3F5_DEVICE_CAP2__CAS128_CMPLT_SUPPORTED__SHIFT 0x9
+#define D3F5_DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING_MASK 0x400
+#define D3F5_DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING__SHIFT 0xa
+#define D3F5_DEVICE_CAP2__LTR_SUPPORTED_MASK 0x800
+#define D3F5_DEVICE_CAP2__LTR_SUPPORTED__SHIFT 0xb
+#define D3F5_DEVICE_CAP2__TPH_CPLR_SUPPORTED_MASK 0x3000
+#define D3F5_DEVICE_CAP2__TPH_CPLR_SUPPORTED__SHIFT 0xc
+#define D3F5_DEVICE_CAP2__OBFF_SUPPORTED_MASK 0xc0000
+#define D3F5_DEVICE_CAP2__OBFF_SUPPORTED__SHIFT 0x12
+#define D3F5_DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED_MASK 0x100000
+#define D3F5_DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED__SHIFT 0x14
+#define D3F5_DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED_MASK 0x200000
+#define D3F5_DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED__SHIFT 0x15
+#define D3F5_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES_MASK 0xc00000
+#define D3F5_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES__SHIFT 0x16
+#define D3F5_DEVICE_CNTL2__CPL_TIMEOUT_VALUE_MASK 0xf
+#define D3F5_DEVICE_CNTL2__CPL_TIMEOUT_VALUE__SHIFT 0x0
+#define D3F5_DEVICE_CNTL2__CPL_TIMEOUT_DIS_MASK 0x10
+#define D3F5_DEVICE_CNTL2__CPL_TIMEOUT_DIS__SHIFT 0x4
+#define D3F5_DEVICE_CNTL2__ARI_FORWARDING_EN_MASK 0x20
+#define D3F5_DEVICE_CNTL2__ARI_FORWARDING_EN__SHIFT 0x5
+#define D3F5_DEVICE_CNTL2__ATOMICOP_REQUEST_EN_MASK 0x40
+#define D3F5_DEVICE_CNTL2__ATOMICOP_REQUEST_EN__SHIFT 0x6
+#define D3F5_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING_MASK 0x80
+#define D3F5_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING__SHIFT 0x7
+#define D3F5_DEVICE_CNTL2__IDO_REQUEST_ENABLE_MASK 0x100
+#define D3F5_DEVICE_CNTL2__IDO_REQUEST_ENABLE__SHIFT 0x8
+#define D3F5_DEVICE_CNTL2__IDO_COMPLETION_ENABLE_MASK 0x200
+#define D3F5_DEVICE_CNTL2__IDO_COMPLETION_ENABLE__SHIFT 0x9
+#define D3F5_DEVICE_CNTL2__LTR_EN_MASK 0x400
+#define D3F5_DEVICE_CNTL2__LTR_EN__SHIFT 0xa
+#define D3F5_DEVICE_CNTL2__OBFF_EN_MASK 0x6000
+#define D3F5_DEVICE_CNTL2__OBFF_EN__SHIFT 0xd
+#define D3F5_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING_MASK 0x8000
+#define D3F5_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING__SHIFT 0xf
+#define D3F5_DEVICE_STATUS2__RESERVED_MASK 0xffff0000
+#define D3F5_DEVICE_STATUS2__RESERVED__SHIFT 0x10
+#define D3F5_LINK_CAP2__SUPPORTED_LINK_SPEED_MASK 0xfe
+#define D3F5_LINK_CAP2__SUPPORTED_LINK_SPEED__SHIFT 0x1
+#define D3F5_LINK_CAP2__CROSSLINK_SUPPORTED_MASK 0x100
+#define D3F5_LINK_CAP2__CROSSLINK_SUPPORTED__SHIFT 0x8
+#define D3F5_LINK_CAP2__RESERVED_MASK 0xfffffe00
+#define D3F5_LINK_CAP2__RESERVED__SHIFT 0x9
+#define D3F5_LINK_CNTL2__TARGET_LINK_SPEED_MASK 0xf
+#define D3F5_LINK_CNTL2__TARGET_LINK_SPEED__SHIFT 0x0
+#define D3F5_LINK_CNTL2__ENTER_COMPLIANCE_MASK 0x10
+#define D3F5_LINK_CNTL2__ENTER_COMPLIANCE__SHIFT 0x4
+#define D3F5_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE_MASK 0x20
+#define D3F5_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define D3F5_LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define D3F5_LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define D3F5_LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define D3F5_LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define D3F5_LINK_CNTL2__ENTER

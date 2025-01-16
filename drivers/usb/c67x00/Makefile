@@ -1,7 +1,4 @@
-#
-# Makefile for Cypress C67X00 USB Controller
-#
-
-obj-$(CONFIG_USB_C67X00_HCD)	+= c67x00.o
-
-c67x00-y := c67x00-drv.o c67x00-ll-hpi.o c67x00-hcd.o c67x00-sched.o
+l_1_MASK 0xffffffff
+#define DPM_TABLE_255__MemoryLevel_3_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_256__MemoryLevel_3_MpllFuncCntl_2_MASK 0xffffffff
+#define DP

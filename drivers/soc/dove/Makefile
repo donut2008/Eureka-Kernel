@@ -1,1 +1,1 @@
-obj-y		+= pmu.o
+define DPM_TABLE

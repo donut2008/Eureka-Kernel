@@ -1,637 +1,265 @@
-/* linux/drivers/modem/modem.c
- *
- * Copyright (C) 2010 Google, Inc.
- * Copyright (C) 2010 Samsung Electronics.
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
-
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/interrupt.h>
-#include <linux/platform_device.h>
-#include <linux/miscdevice.h>
-#include <linux/if_arp.h>
-
-#include <linux/uaccess.h>
-#include <linux/fs.h>
-#include <linux/io.h>
-#include <linux/wait.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
-#include <linux/mutex.h>
-#include <linux/irq.h>
-#include <linux/gpio.h>
-#include <linux/delay.h>
-#include <linux/wakelock.h>
-#ifdef CONFIG_OF
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#endif
-#include <linux/shm_ipc.h>
-
-#include "modem_prj.h"
-#include "modem_variation.h"
-#include "modem_utils.h"
-
-#define FMT_WAKE_TIME	(HZ/2)
-#define RAW_WAKE_TIME	(HZ*6)
-
-struct mif_log log_info;
-
-static int set_log_info(char *str)
-{
-	log_info.debug_log = true;
-	log_info.fmt_msg = strstr(str, "fmt") ? 1 : 0;
-	log_info.boot_msg = strstr(str, "boot") ? 1 : 0;
-	log_info.dump_msg = strstr(str, "dump") ? 1 : 0;
-	log_info.rfs_msg = strstr(str, "rfs") ? 1 : 0;
-	log_info.log_msg = strstr(str, "log") ? 1 : 0;
-	log_info.ps_msg = strstr(str, "ps") ? 1 : 0;
-	log_info.router_msg = strstr(str, "router") ? 1 : 0;
-	log_info.rcs_msg = strstr(str, "rcs") ? 1 : 0;
-	log_info.ppt_msg = strstr(str, "ppt") ? 1 : 0;
-
-	mif_err("modemIF log info: %s\n", str);
-
-	return 0;
-}
-__setup("log_info=", set_log_info);
-
-static struct modem_shared *create_modem_shared_data(
-				struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct modem_shared *msd;
-	int size = MAX_MIF_BUFF_SIZE;
-
-	msd = devm_kzalloc(dev, sizeof(struct modem_shared), GFP_KERNEL);
-	if (msd == NULL)
-		return NULL;
-
-	/* initialize link device list */
-	INIT_LIST_HEAD(&msd->link_dev_list);
-
-	/* initialize tree of io devices */
-	msd->iodevs_tree_chan = RB_ROOT;
-	msd->iodevs_tree_fmt = RB_ROOT;
-
-	msd->storage.cnt = 0;
-	msd->storage.addr = devm_kzalloc(dev, MAX_MIF_BUFF_SIZE +
-		(MAX_MIF_SEPA_SIZE * 2), GFP_KERNEL);
-	if (msd->storage.addr == NULL) {
-		mif_err("IPC logger buff alloc failed!!\n");
-		return NULL;
-	}
-	memset(msd->storage.addr, 0, MAX_MIF_BUFF_SIZE +
-			(MAX_MIF_SEPA_SIZE * 2));
-	memcpy(msd->storage.addr, MIF_SEPARATOR, strlen(MIF_SEPARATOR));
-	msd->storage.addr += MAX_MIF_SEPA_SIZE;
-	memcpy(msd->storage.addr, &size, sizeof(int));
-	msd->storage.addr += MAX_MIF_SEPA_SIZE;
-	spin_lock_init(&msd->lock);
-
-	return msd;
-}
-
-static struct modem_ctl *create_modemctl_device(struct platform_device *pdev,
-		struct modem_shared *msd)
-{
-	struct device *dev = &pdev->dev;
-	struct modem_data *pdata = pdev->dev.platform_data;
-	struct modem_ctl *modemctl;
-	int ret;
-
-	/* create modem control device */
-	modemctl = devm_kzalloc(dev, sizeof(struct modem_ctl), GFP_KERNEL);
-	if (!modemctl) {
-		mif_err("%s: modemctl devm_kzalloc fail\n", pdata->name);
-		mif_err("%s: xxx\n", pdata->name);
-		return NULL;
-	}
-
-	modemctl->msd = msd;
-	modemctl->dev = dev;
-	modemctl->phone_state = STATE_OFFLINE;
-
-	modemctl->mdm_data = pdata;
-	modemctl->name = pdata->name;
-
-	/* init modemctl device for getting modemctl operations */
-
-	ret = init_modemctl_device(modemctl, pdata);
-	if (ret) {
-		mif_err("%s: init_modemctl_device fail (err %d)\n",
-			pdata->name, ret);
-		mif_err("%s: xxx\n", pdata->name);
-		kfree(modemctl);
-		return NULL;
-	}
-
-	mif_info("%s is created!!!\n", pdata->name);
-
-	return modemctl;
-}
-
-static struct io_device *create_io_device(struct platform_device *pdev,
-		struct modem_io_t *io_t, struct modem_shared *msd,
-		struct modem_ctl *modemctl,	struct modem_data *pdata)
-{
-	int ret;
-	struct device *dev = &pdev->dev;
-	struct io_device *iod;
-
-	iod = devm_kzalloc(dev, sizeof(struct io_device), GFP_KERNEL);
-	if (!iod) {
-		mif_err("iod == NULL\n");
-		return NULL;
-	}
-
-	RB_CLEAR_NODE(&iod->node_chan);
-	RB_CLEAR_NODE(&iod->node_fmt);
-
-	iod->name = io_t->name;
-	iod->id = io_t->id;
-	iod->format = io_t->format;
-	iod->io_typ = io_t->io_type;
-	iod->link_types = io_t->links;
-	iod->attrs = io_t->attrs;
-	iod->app = io_t->app;
-	iod->use_handover = pdata->use_handover;
-	atomic_set(&iod->opened, 0);
-
-	/* link between io device and modem control */
-	iod->mc = modemctl;
-
-	if (iod->format == IPC_FMT)
-		modemctl->iod = iod;
-
-	if (iod->format == IPC_BOOT) {
-		modemctl->bootd = iod;
-		mif_err("BOOT device = %s\n", iod->name);
-	}
-
-	/* link between io device and modem shared */
-	iod->msd = msd;
-
-	/* add iod to rb_tree */
-	if (iod->format != IPC_RAW)
-		insert_iod_with_format(msd, iod->format, iod);
-
-	if (exynos_is_not_reserved_channel(iod->id))
-		insert_iod_with_channel(msd, iod->id, iod);
-
-	/* register misc device or net device */
-	ret = exynos_init_io_device(iod);
-	if (ret) {
-		kfree(iod);
-		mif_err("exynos_init_io_device fail (%d)\n", ret);
-		return NULL;
-	}
-
-	mif_info("%s created\n", iod->name);
-	return iod;
-}
-
-static int attach_devices(struct io_device *iod, enum modem_link tx_link)
-{
-	struct modem_shared *msd = iod->msd;
-	struct link_device *ld;
-
-	/* find link type for this io device */
-	list_for_each_entry(ld, &msd->link_dev_list, list) {
-		if (IS_CONNECTED(iod, ld)) {
-			/* The count 1 bits of iod->link_types is count
-			 * of link devices of this iod.
-			 * If use one link device,
-			 * or, 2+ link devices and this link is tx_link,
-			 * set iod's link device with ld
-			 */
-
-			if ((countbits(iod->link_types) <= 1) ||
-					(tx_link == ld->link_type)) {
-				mif_debug("set %s->%s\n", iod->name, ld->name);
-				set_current_link(iod, ld);
-			}
-		}
-	}
-
-	/* if use rx dynamic switch, set tx_link at modem_io_t of
-	 * board-*-modems.c
-	 */
-	if (!get_current_link(iod)) {
-		mif_err("%s->link == NULL\n", iod->name);
-		BUG();
-	}
-
-	switch (iod->format) {
-	case IPC_FMT:
-		wake_lock_init(&iod->wakelock, WAKE_LOCK_SUSPEND, iod->name);
-		iod->waketime = FMT_WAKE_TIME;
-		break;
-
-	case IPC_RAW:
-		wake_lock_init(&iod->wakelock, WAKE_LOCK_SUSPEND, iod->name);
-		iod->waketime = RAW_WAKE_TIME;
-		break;
-
-	case IPC_RFS:
-		wake_lock_init(&iod->wakelock, WAKE_LOCK_SUSPEND, iod->name);
-		iod->waketime = RAW_WAKE_TIME;
-		break;
-
-	case IPC_MULTI_RAW:
-		wake_lock_init(&iod->wakelock, WAKE_LOCK_SUSPEND, iod->name);
-		iod->waketime = RAW_WAKE_TIME;
-		break;
-
-	case IPC_BOOT:
-		wake_lock_init(&iod->wakelock, WAKE_LOCK_SUSPEND, iod->name);
-		iod->waketime = RAW_WAKE_TIME;
-		break;
-
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-#ifdef CONFIG_OF
-static int parse_dt_common_pdata(struct device_node *np,
-					struct modem_data *pdata)
-{
-	mif_dt_read_string(np, "mif,name", pdata->name);
-	mif_dt_read_bool(np, "mif,use_handover", pdata->use_handover);
-	mif_dt_read_u32(np, "mif,link_types", pdata->link_types);
-	mif_dt_read_string(np, "mif,link_name", pdata->link_name);
-	mif_dt_read_u32(np, "mif,num_iodevs", pdata->num_iodevs);
-
-	mif_dt_read_u32(np, "shmem,dump_offset", pdata->dump_offset);
-	return 0;
-}
-
-static int parse_dt_mbox_pdata(struct device *dev, struct device_node *np,
-					struct modem_data *pdata)
-{
-	struct modem_mbox *mbox = pdata->mbx;
-#ifdef CONFIG_PCI_EXYNOS
-	const struct property *prop;
-	const __be32 *val;
-	int nr;
-#endif
-
-	mbox = devm_kzalloc(dev, sizeof(struct modem_mbox), GFP_KERNEL);
-	if (!mbox) {
-		mif_err("mbox: failed to alloc memory\n");
-		return -ENOMEM;
-	}
-	pdata->mbx = mbox;
-
-#ifdef CONFIG_PCI_EXYNOS
-	mif_dt_read_u32 (np, "mif,irq_cp2ap_pcie_l1ss_disable",
-		mbox->irq_cp2ap_pcie_l1ss_disable);
-	mif_dt_read_u32 (np, "mbx_cp2ap_pcie_l1ss_disable",
-				mbox->mbx_cp2ap_pcie_l1ss_disable);
-#endif
-
-	mif_dt_read_u32 (np, "mbx_ap2cp_msg", mbox->mbx_ap2cp_msg);
-	mif_dt_read_u32 (np, "mbx_cp2ap_msg", mbox->mbx_cp2ap_msg);
-	mif_dt_read_u32 (np, "mbx_ap2cp_united_status",
-				mbox->mbx_ap2cp_status);
-	mif_dt_read_u32 (np, "mbx_cp2ap_united_status",
-				mbox->mbx_cp2ap_status);
-
-	mif_dt_read_u32 (np, "mif,int_ap2cp_msg", mbox->int_ap2cp_msg);
-	mif_dt_read_u32 (np, "mif,int_ap2cp_wakeup", mbox->int_ap2cp_wakeup);
-	mif_dt_read_u32 (np, "mif,int_ap2cp_status", mbox->int_ap2cp_status);
-	mif_dt_read_u32 (np, "mif,int_ap2cp_active", mbox->int_ap2cp_active);
-
-	mif_dt_read_u32 (np, "mif,irq_cp2ap_msg", mbox->irq_cp2ap_msg);
-	mif_dt_read_u32 (np, "mif,irq_cp2ap_status", mbox->irq_cp2ap_status);
-	mif_dt_read_u32 (np, "mif,irq_cp2ap_active", mbox->irq_cp2ap_active);
-	mif_dt_read_u32 (np, "mif,irq_cp2ap_wake_lock",
-				mbox->irq_cp2ap_wake_lock);
-
-	/* Value for Performance Request */
-	mif_dt_read_u32 (np, "mbx_cp2ap_dvfsreq", mbox->mbx_cp2ap_perf_req);
-	mif_dt_read_u32 (np, "mbx_cp2ap_dvfsreq_cpu",
-				mbox->mbx_cp2ap_perf_req_cpu);
-	mif_dt_read_u32 (np, "mbx_cp2ap_dvfsreq_mif",
-				mbox->mbx_cp2ap_perf_req_mif);
-	mif_dt_read_u32 (np, "mbx_cp2ap_dvfsreq_int",
-				mbox->mbx_cp2ap_perf_req_int);
-
-	mif_dt_read_u32 (np, "mif,irq_cp2ap_perf_req_cpu",
-				mbox->irq_cp2ap_perf_req_cpu);
-	mif_dt_read_u32 (np, "mif,irq_cp2ap_perf_req_mif",
-				mbox->irq_cp2ap_perf_req_mif);
-	mif_dt_read_u32 (np, "mif,irq_cp2ap_perf_req_int",
-				mbox->irq_cp2ap_perf_req_int);
-
-	/* Status Bit Info */
-	mif_dt_read_u32 (np, "sbi_lte_active_mask", mbox->sbi_lte_active_mask);
-	mif_dt_read_u32 (np, "sbi_lte_active_pos", mbox->sbi_lte_active_pos);
-	mif_dt_read_u32 (np, "sbi_wake_lock_mask", mbox->sbi_wake_lock_mask);
-	mif_dt_read_u32 (np, "sbi_wake_lock_pos", mbox->sbi_wake_lock_pos);
-	mif_dt_read_u32 (np, "sbi_cp_status_mask", mbox->sbi_cp_status_mask);
-	mif_dt_read_u32 (np, "sbi_cp_status_pos", mbox->sbi_cp_status_pos);
-	mif_dt_read_u32 (np, "sbi_pda_active_mask", mbox->sbi_pda_active_mask);
-	mif_dt_read_u32 (np, "sbi_pda_active_pos", mbox->sbi_pda_active_pos);
-	mif_dt_read_u32 (np, "sbi_ap_status_mask", mbox->sbi_ap_status_mask);
-	mif_dt_read_u32 (np, "sbi_ap_status_pos", mbox->sbi_ap_status_pos);
-
-	return 0;
-}
-
-static int parse_dt_iodevs_pdata(struct device *dev, struct device_node *np,
-				struct modem_data *pdata)
-{
-	struct device_node *child = NULL;
-	struct modem_io_t *iod = NULL;
-	size_t size = sizeof(struct modem_io_t) * pdata->num_iodevs;
-	int i = 0;
-
-	pdata->iodevs = devm_kzalloc(dev, size, GFP_KERNEL);
-	if (!pdata->iodevs) {
-		mif_err("iodevs: failed to alloc memory\n");
-		return -ENOMEM;
-	}
-
-	for_each_child_of_node(np, child) {
-		iod = &pdata->iodevs[i];
-		mif_dt_read_string(child, "iod,name", iod->name);
-		mif_dt_read_u32(child, "iod,id", iod->id);
-		mif_dt_read_enum(child, "iod,format", iod->format);
-		mif_dt_read_enum(child, "iod,io_type", iod->io_type);
-		mif_dt_read_u32(child, "iod,links", iod->links);
-		if (countbits(iod->links) > 1)
-			mif_dt_read_enum(child, "iod,tx_link", iod->tx_link);
-		mif_dt_read_u32(child, "iod,attrs", iod->attrs);
-		mif_dt_read_string(child, "iod,app", iod->app);
-
-		i++;
-	}
-	return 0;
-}
-
-static struct modem_data *modem_if_parse_dt_pdata(struct device *dev)
-{
-	struct modem_data *pdata;
-	struct device_node *iodevs = NULL;
-
-	pdata = devm_kzalloc(dev, sizeof(struct modem_data), GFP_KERNEL);
-
-	if (!pdata) {
-		mif_err("modem_data: alloc fail\n");
-		return ERR_PTR(-ENOMEM);
-	}
-
-	if (parse_dt_common_pdata(dev->of_node, pdata)) {
-		mif_err("DT error: failed to parse common\n");
-		goto error;
-	}
-
-	if (parse_dt_mbox_pdata(dev, dev->of_node, pdata)) {
-		mif_err("DT error: failed to parse mbox\n");
-		goto error;
-	}
-
-	iodevs = of_get_child_by_name(dev->of_node, "iodevs");
-	if (!iodevs) {
-		mif_err("DT error: failed to get child node\n");
-		goto error;
-	}
-
-	if (parse_dt_iodevs_pdata(dev, iodevs, pdata)) {
-		mif_err("DT error: failed to parse iodevs\n");
-		goto error;
-	}
-
-	dev->platform_data = pdata;
-	mif_info("DT parse complete!\n");
-	return pdata;
-
-error:
-	if (pdata) {
-		if (pdata->iodevs)
-			devm_kfree(dev, pdata->iodevs);
-		devm_kfree(dev, pdata);
-	}
-
-	return ERR_PTR(-EINVAL);
-}
-
-static const struct of_device_id sec_modem_match[] = {
-	{ .compatible = "sec_modem,modem_pdata", },
-	{},
-};
-MODULE_DEVICE_TABLE(of, sec_modem_match);
-#else
-static struct modem_data *modem_if_parse_dt_pdata(struct device *dev)
-{
-	return ERR_PTR(-ENODEV);
-}
-#endif
-
-static void modem_get_shmem_base(struct modem_data *pdata)
-{
-	pdata->shmem_base = shm_get_phys_base();
-	pdata->ipcmem_offset = shm_get_ipc_rgn_offset();
-	pdata->ipc_size = shm_get_ipc_rgn_size();
-	mif_err("shmem_base:%x ipcmem_offset:%x, ipc_size:%x\n",
-		pdata->shmem_base, pdata->ipcmem_offset, pdata->ipc_size);
-}
-
-struct io_device *iod_test;
-
-static ssize_t do_cp_crash_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct modem_ctl *mc = dev_get_drvdata(dev);
-	unsigned int val = 0;
-
-	if (kstrtouint(buf, 10, &val))
-		return -EINVAL;
-
-	if (mc->bootd)
-		mc->bootd->modem_state_changed(mc->bootd, val);
-	return count;
-}
-
-static ssize_t modem_state_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct modem_ctl *mc = dev_get_drvdata(dev);
-	return sprintf(buf, "%s\n", cp_state_str[mc->phone_state]);
-}
-static DEVICE_ATTR_WO(do_cp_crash);
-static DEVICE_ATTR_RO(modem_state);
-
-static struct attribute *modem_attrs[] = {
-	&dev_attr_do_cp_crash.attr,
-	&dev_attr_modem_state.attr,
-	NULL,
-};
-ATTRIBUTE_GROUPS(modem);
-
-static int modem_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct modem_data *pdata = dev->platform_data;
-	struct modem_shared *msd;
-	struct modem_ctl *modemctl;
-	struct io_device **iod;
-	struct link_device *ld;
-	unsigned size;
-	int i;
-
-	mif_err("%s: +++\n", pdev->name);
-
-	if (dev->of_node) {
-		pdata = modem_if_parse_dt_pdata(dev);
-		if (IS_ERR(pdata)) {
-			mif_err("MIF DT pasrse error!\n");
-			return PTR_ERR(pdata);
-		}
-	}
-	modem_get_shmem_base(pdata);
-
-	msd = create_modem_shared_data(pdev);
-	if (!msd) {
-		mif_err("%s: msd == NULL\n", pdata->name);
-		return -ENOMEM;
-	}
-
-	modemctl = create_modemctl_device(pdev, msd);
-	if (!modemctl) {
-		mif_err("%s: modemctl == NULL\n", pdata->name);
-		kfree(msd);
-		return -ENOMEM;
-	}
-
-	/* create link device */
-	/* support multi-link device */
-	for (i = 0; i < LINKDEV_MAX; i++) {
-		/* find matching link type */
-		if (pdata->link_types & LINKTYPE(i)) {
-			ld = call_link_init_func(pdev, i);
-			if (!ld)
-				goto free_mc;
-
-			mif_err("%s: %s link created\n", pdata->name, ld->name);
-			ld->link_type = i;
-			ld->mc = modemctl;
-			ld->msd = msd;
-			list_add(&ld->list, &msd->link_dev_list);
-		}
-	}
-
-	/* create io deivces and connect to modemctl device */
-	size = sizeof(struct io_device *) * pdata->num_iodevs;
-	iod = (struct io_device **)devm_kzalloc(dev, size, GFP_KERNEL);
-	for (i = 0; i < pdata->num_iodevs; i++) {
-		iod[i] = create_io_device(pdev, &pdata->iodevs[i], msd,
-					modemctl, pdata);
-		if (!iod[i]) {
-			mif_err("%s: iod[%d] == NULL\n", pdata->name, i);
-			goto free_iod;
-		}
-
-		attach_devices(iod[i], pdata->iodevs[i].tx_link);
-	}
-
-	platform_set_drvdata(pdev, modemctl);
-
-	if (sysfs_create_groups(&dev->kobj, modem_groups))
-		mif_err("failed to create modem groups node\n");
-
-	mif_err("%s: ---\n", pdata->name);
-
-	return 0;
-
-free_iod:
-	for (i = 0; i < pdata->num_iodevs; i++)
-		kfree(iod[i]);
-
-free_mc:
-	kfree(modemctl);
-	kfree(msd);
-
-	mif_err("%s: xxx\n", pdata->name);
-
-	return -ENOMEM;
-}
-
-static void modem_shutdown(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct modem_ctl *mc = dev_get_drvdata(dev);
-	struct utc_time utc;
-
-	mc->phone_state = STATE_OFFLINE;
-
-	get_utc_time(&utc);
-	mif_info("%s: at [%02d:%02d:%02d.%03d]\n",
-		mc->name, utc.hour, utc.min, utc.sec, utc.msec);
-}
-
-#ifdef CONFIG_OF
-static int modem_suspend(struct device *pdev)
-{
-	struct modem_ctl *mc = dev_get_drvdata(pdev);
-
-	if (mc->ops.suspend_modem_ctrl != NULL) {
-		mif_err("%s: pd_active:0\n", mc->name);
-		mc->ops.suspend_modem_ctrl(mc);
-	}
-
-	return 0;
-}
-
-static int modem_resume(struct device *pdev)
-{
-	struct modem_ctl *mc = dev_get_drvdata(pdev);
-
-	if (mc->ops.suspend_modem_ctrl != NULL) {
-		mif_err("%s: pd_active:1\n", mc->name);
-		mc->ops.resume_modem_ctrl(mc);
-	}
-
-	return 0;
-}
-#else
-#define modem_suspend	NULL
-#define modem_resume	NULL
-#endif
-
-static const struct dev_pm_ops modem_pm_ops = {
-	.suspend = modem_suspend,
-	.resume = modem_resume,
-};
-
-static struct platform_driver modem_driver = {
-	.probe = modem_probe,
-	.shutdown = modem_shutdown,
-	.driver = {
-		.name = "mif_exynos",
-		.owner = THIS_MODULE,
-		.pm = &modem_pm_ops,
-
-#ifdef CONFIG_OF
-		.of_match_table = of_match_ptr(sec_modem_match),
-#endif
-	},
-};
-
-module_platform_driver(modem_driver);
-
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Samsung Modem Interface Driver");
+B0_TX_LANE12_CTRL_REG0__TX_DBG_PRBS_EN_12_MASK 0x8
+#define PB0_TX_LANE12_CTRL_REG0__TX_DBG_PRBS_EN_12__SHIFT 0x3
+#define PB0_TX_LANE12_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_12_MASK 0x1
+#define PB0_TX_LANE12_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_12__SHIFT 0x0
+#define PB0_TX_LANE12_OVRD_REG0__TX_DCLK_EN_OVRD_EN_12_MASK 0x2
+#define PB0_TX_LANE12_OVRD_REG0__TX_DCLK_EN_OVRD_EN_12__SHIFT 0x1
+#define PB0_TX_LANE12_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_12_MASK 0x4
+#define PB0_TX_LANE12_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_12__SHIFT 0x2
+#define PB0_TX_LANE12_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_12_MASK 0x8
+#define PB0_TX_LANE12_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_12__SHIFT 0x3
+#define PB0_TX_LANE12_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_12_MASK 0x10
+#define PB0_TX_LANE12_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_12__SHIFT 0x4
+#define PB0_TX_LANE12_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_12_MASK 0x20
+#define PB0_TX_LANE12_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_12__SHIFT 0x5
+#define PB0_TX_LANE12_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_12_MASK 0x40
+#define PB0_TX_LANE12_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_12__SHIFT 0x6
+#define PB0_TX_LANE12_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_12_MASK 0x80
+#define PB0_TX_LANE12_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_12__SHIFT 0x7
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__TXPWR_12_MASK 0x7
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__TXPWR_12__SHIFT 0x0
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__TXMARG_12_MASK 0x70
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__TXMARG_12__SHIFT 0x4
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__DEEMPH_12_MASK 0x80
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__DEEMPH_12__SHIFT 0x7
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__COEFFICIENTID_12_MASK 0x300
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__COEFFICIENTID_12__SHIFT 0x8
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__COEFFICIENT_12_MASK 0xfc00
+#define PB0_TX_LANE12_SCI_STAT_OVRD_REG0__COEFFICIENT_12__SHIFT 0xa
+#define PB0_TX_LANE13_CTRL_REG0__TX_CFG_DISPCLK_MODE_13_MASK 0x1
+#define PB0_TX_LANE13_CTRL_REG0__TX_CFG_DISPCLK_MODE_13__SHIFT 0x0
+#define PB0_TX_LANE13_CTRL_REG0__TX_CFG_INV_DATA_13_MASK 0x2
+#define PB0_TX_LANE13_CTRL_REG0__TX_CFG_INV_DATA_13__SHIFT 0x1
+#define PB0_TX_LANE13_CTRL_REG0__TX_CFG_SWING_BOOST_EN_13_MASK 0x4
+#define PB0_TX_LANE13_CTRL_REG0__TX_CFG_SWING_BOOST_EN_13__SHIFT 0x2
+#define PB0_TX_LANE13_CTRL_REG0__TX_DBG_PRBS_EN_13_MASK 0x8
+#define PB0_TX_LANE13_CTRL_REG0__TX_DBG_PRBS_EN_13__SHIFT 0x3
+#define PB0_TX_LANE13_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_13_MASK 0x1
+#define PB0_TX_LANE13_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_13__SHIFT 0x0
+#define PB0_TX_LANE13_OVRD_REG0__TX_DCLK_EN_OVRD_EN_13_MASK 0x2
+#define PB0_TX_LANE13_OVRD_REG0__TX_DCLK_EN_OVRD_EN_13__SHIFT 0x1
+#define PB0_TX_LANE13_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_13_MASK 0x4
+#define PB0_TX_LANE13_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_13__SHIFT 0x2
+#define PB0_TX_LANE13_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_13_MASK 0x8
+#define PB0_TX_LANE13_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_13__SHIFT 0x3
+#define PB0_TX_LANE13_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_13_MASK 0x10
+#define PB0_TX_LANE13_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_13__SHIFT 0x4
+#define PB0_TX_LANE13_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_13_MASK 0x20
+#define PB0_TX_LANE13_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_13__SHIFT 0x5
+#define PB0_TX_LANE13_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_13_MASK 0x40
+#define PB0_TX_LANE13_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_13__SHIFT 0x6
+#define PB0_TX_LANE13_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_13_MASK 0x80
+#define PB0_TX_LANE13_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_13__SHIFT 0x7
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__TXPWR_13_MASK 0x7
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__TXPWR_13__SHIFT 0x0
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__TXMARG_13_MASK 0x70
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__TXMARG_13__SHIFT 0x4
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__DEEMPH_13_MASK 0x80
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__DEEMPH_13__SHIFT 0x7
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__COEFFICIENTID_13_MASK 0x300
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__COEFFICIENTID_13__SHIFT 0x8
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__COEFFICIENT_13_MASK 0xfc00
+#define PB0_TX_LANE13_SCI_STAT_OVRD_REG0__COEFFICIENT_13__SHIFT 0xa
+#define PB0_TX_LANE14_CTRL_REG0__TX_CFG_DISPCLK_MODE_14_MASK 0x1
+#define PB0_TX_LANE14_CTRL_REG0__TX_CFG_DISPCLK_MODE_14__SHIFT 0x0
+#define PB0_TX_LANE14_CTRL_REG0__TX_CFG_INV_DATA_14_MASK 0x2
+#define PB0_TX_LANE14_CTRL_REG0__TX_CFG_INV_DATA_14__SHIFT 0x1
+#define PB0_TX_LANE14_CTRL_REG0__TX_CFG_SWING_BOOST_EN_14_MASK 0x4
+#define PB0_TX_LANE14_CTRL_REG0__TX_CFG_SWING_BOOST_EN_14__SHIFT 0x2
+#define PB0_TX_LANE14_CTRL_REG0__TX_DBG_PRBS_EN_14_MASK 0x8
+#define PB0_TX_LANE14_CTRL_REG0__TX_DBG_PRBS_EN_14__SHIFT 0x3
+#define PB0_TX_LANE14_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_14_MASK 0x1
+#define PB0_TX_LANE14_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_14__SHIFT 0x0
+#define PB0_TX_LANE14_OVRD_REG0__TX_DCLK_EN_OVRD_EN_14_MASK 0x2
+#define PB0_TX_LANE14_OVRD_REG0__TX_DCLK_EN_OVRD_EN_14__SHIFT 0x1
+#define PB0_TX_LANE14_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_14_MASK 0x4
+#define PB0_TX_LANE14_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_14__SHIFT 0x2
+#define PB0_TX_LANE14_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_14_MASK 0x8
+#define PB0_TX_LANE14_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_14__SHIFT 0x3
+#define PB0_TX_LANE14_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_14_MASK 0x10
+#define PB0_TX_LANE14_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_14__SHIFT 0x4
+#define PB0_TX_LANE14_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_14_MASK 0x20
+#define PB0_TX_LANE14_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_14__SHIFT 0x5
+#define PB0_TX_LANE14_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_14_MASK 0x40
+#define PB0_TX_LANE14_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_14__SHIFT 0x6
+#define PB0_TX_LANE14_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_14_MASK 0x80
+#define PB0_TX_LANE14_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_14__SHIFT 0x7
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__TXPWR_14_MASK 0x7
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__TXPWR_14__SHIFT 0x0
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__TXMARG_14_MASK 0x70
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__TXMARG_14__SHIFT 0x4
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__DEEMPH_14_MASK 0x80
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__DEEMPH_14__SHIFT 0x7
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__COEFFICIENTID_14_MASK 0x300
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__COEFFICIENTID_14__SHIFT 0x8
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__COEFFICIENT_14_MASK 0xfc00
+#define PB0_TX_LANE14_SCI_STAT_OVRD_REG0__COEFFICIENT_14__SHIFT 0xa
+#define PB0_TX_LANE15_CTRL_REG0__TX_CFG_DISPCLK_MODE_15_MASK 0x1
+#define PB0_TX_LANE15_CTRL_REG0__TX_CFG_DISPCLK_MODE_15__SHIFT 0x0
+#define PB0_TX_LANE15_CTRL_REG0__TX_CFG_INV_DATA_15_MASK 0x2
+#define PB0_TX_LANE15_CTRL_REG0__TX_CFG_INV_DATA_15__SHIFT 0x1
+#define PB0_TX_LANE15_CTRL_REG0__TX_CFG_SWING_BOOST_EN_15_MASK 0x4
+#define PB0_TX_LANE15_CTRL_REG0__TX_CFG_SWING_BOOST_EN_15__SHIFT 0x2
+#define PB0_TX_LANE15_CTRL_REG0__TX_DBG_PRBS_EN_15_MASK 0x8
+#define PB0_TX_LANE15_CTRL_REG0__TX_DBG_PRBS_EN_15__SHIFT 0x3
+#define PB0_TX_LANE15_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_15_MASK 0x1
+#define PB0_TX_LANE15_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_15__SHIFT 0x0
+#define PB0_TX_LANE15_OVRD_REG0__TX_DCLK_EN_OVRD_EN_15_MASK 0x2
+#define PB0_TX_LANE15_OVRD_REG0__TX_DCLK_EN_OVRD_EN_15__SHIFT 0x1
+#define PB0_TX_LANE15_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_15_MASK 0x4
+#define PB0_TX_LANE15_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_15__SHIFT 0x2
+#define PB0_TX_LANE15_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_15_MASK 0x8
+#define PB0_TX_LANE15_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_15__SHIFT 0x3
+#define PB0_TX_LANE15_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_15_MASK 0x10
+#define PB0_TX_LANE15_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_15__SHIFT 0x4
+#define PB0_TX_LANE15_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_15_MASK 0x20
+#define PB0_TX_LANE15_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_15__SHIFT 0x5
+#define PB0_TX_LANE15_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_15_MASK 0x40
+#define PB0_TX_LANE15_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_15__SHIFT 0x6
+#define PB0_TX_LANE15_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_15_MASK 0x80
+#define PB0_TX_LANE15_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_15__SHIFT 0x7
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__TXPWR_15_MASK 0x7
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__TXPWR_15__SHIFT 0x0
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__TXMARG_15_MASK 0x70
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__TXMARG_15__SHIFT 0x4
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__DEEMPH_15_MASK 0x80
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__DEEMPH_15__SHIFT 0x7
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__COEFFICIENTID_15_MASK 0x300
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__COEFFICIENTID_15__SHIFT 0x8
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__COEFFICIENT_15_MASK 0xfc00
+#define PB0_TX_LANE15_SCI_STAT_OVRD_REG0__COEFFICIENT_15__SHIFT 0xa
+#define PB1_GLB_CTRL_REG0__BACKUP_MASK 0xffff
+#define PB1_GLB_CTRL_REG0__BACKUP__SHIFT 0x0
+#define PB1_GLB_CTRL_REG0__CFG_IDLEDET_TH_MASK 0x30000
+#define PB1_GLB_CTRL_REG0__CFG_IDLEDET_TH__SHIFT 0x10
+#define PB1_GLB_CTRL_REG0__DBG_RX2TXBYP_SEL_MASK 0x700000
+#define PB1_GLB_CTRL_REG0__DBG_RX2TXBYP_SEL__SHIFT 0x14
+#define PB1_GLB_CTRL_REG0__DBG_RXFEBYP_EN_MASK 0x800000
+#define PB1_GLB_CTRL_REG0__DBG_RXFEBYP_EN__SHIFT 0x17
+#define PB1_GLB_CTRL_REG0__DBG_RXPRBS_CLR_MASK 0x1000000
+#define PB1_GLB_CTRL_REG0__DBG_RXPRBS_CLR__SHIFT 0x18
+#define PB1_GLB_CTRL_REG0__DBG_RXTOGGLE_EN_MASK 0x2000000
+#define PB1_GLB_CTRL_REG0__DBG_RXTOGGLE_EN__SHIFT 0x19
+#define PB1_GLB_CTRL_REG0__DBG_TX2RXLBACK_EN_MASK 0x4000000
+#define PB1_GLB_CTRL_REG0__DBG_TX2RXLBACK_EN__SHIFT 0x1a
+#define PB1_GLB_CTRL_REG0__TXCFG_CMGOOD_RANGE_MASK 0xc0000000
+#define PB1_GLB_CTRL_REG0__TXCFG_CMGOOD_RANGE__SHIFT 0x1e
+#define PB1_GLB_CTRL_REG1__RXDBG_CDR_FR_BYP_EN_MASK 0x1
+#define PB1_GLB_CTRL_REG1__RXDBG_CDR_FR_BYP_EN__SHIFT 0x0
+#define PB1_GLB_CTRL_REG1__RXDBG_CDR_FR_BYP_VAL_MASK 0x7e
+#define PB1_GLB_CTRL_REG1__RXDBG_CDR_FR_BYP_VAL__SHIFT 0x1
+#define PB1_GLB_CTRL_REG1__RXDBG_CDR_PH_BYP_EN_MASK 0x80
+#define PB1_GLB_CTRL_REG1__RXDBG_CDR_PH_BYP_EN__SHIFT 0x7
+#define PB1_GLB_CTRL_REG1__RXDBG_CDR_PH_BYP_VAL_MASK 0x3f00
+#define PB1_GLB_CTRL_REG1__RXDBG_CDR_PH_BYP_VAL__SHIFT 0x8
+#define PB1_GLB_CTRL_REG1__RXDBG_D0TH_BYP_EN_MASK 0x4000
+#define PB1_GLB_CTRL_REG1__RXDBG_D0TH_BYP_EN__SHIFT 0xe
+#define PB1_GLB_CTRL_REG1__RXDBG_D0TH_BYP_VAL_MASK 0x3f8000
+#define PB1_GLB_CTRL_REG1__RXDBG_D0TH_BYP_VAL__SHIFT 0xf
+#define PB1_GLB_CTRL_REG1__RXDBG_D1TH_BYP_EN_MASK 0x400000
+#define PB1_GLB_CTRL_REG1__RXDBG_D1TH_BYP_EN__SHIFT 0x16
+#define PB1_GLB_CTRL_REG1__RXDBG_D1TH_BYP_VAL_MASK 0x3f800000
+#define PB1_GLB_CTRL_REG1__RXDBG_D1TH_BYP_VAL__SHIFT 0x17
+#define PB1_GLB_CTRL_REG1__TST_LOSPDTST_EN_MASK 0x40000000
+#define PB1_GLB_CTRL_REG1__TST_LOSPDTST_EN__SHIFT 0x1e
+#define PB1_GLB_CTRL_REG1__PLL_CFG_DISPCLK_DIV_MASK 0x80000000
+#define PB1_GLB_CTRL_REG1__PLL_CFG_DISPCLK_DIV__SHIFT 0x1f
+#define PB1_GLB_CTRL_REG2__RXDBG_D2TH_BYP_EN_MASK 0x1
+#define PB1_GLB_CTRL_REG2__RXDBG_D2TH_BYP_EN__SHIFT 0x0
+#define PB1_GLB_CTRL_REG2__RXDBG_D2TH_BYP_VAL_MASK 0xfe
+#define PB1_GLB_CTRL_REG2__RXDBG_D2TH_BYP_VAL__SHIFT 0x1
+#define PB1_GLB_CTRL_REG2__RXDBG_D3TH_BYP_EN_MASK 0x100
+#define PB1_GLB_CTRL_REG2__RXDBG_D3TH_BYP_EN__SHIFT 0x8
+#define PB1_GLB_CTRL_REG2__RXDBG_D3TH_BYP_VAL_MASK 0xfe00
+#define PB1_GLB_CTRL_REG2__RXDBG_D3TH_BYP_VAL__SHIFT 0x9
+#define PB1_GLB_CTRL_REG2__RXDBG_DXTH_BYP_EN_MASK 0x10000
+#define PB1_GLB_CTRL_REG2__RXDBG_DXTH_BYP_EN__SHIFT 0x10
+#define PB1_GLB_CTRL_REG2__RXDBG_DXTH_BYP_VAL_MASK 0xfe0000
+#define PB1_GLB_CTRL_REG2__RXDBG_DXTH_BYP_VAL__SHIFT 0x11
+#define PB1_GLB_CTRL_REG2__RXDBG_ETH_BYP_EN_MASK 0x1000000
+#define PB1_GLB_CTRL_REG2__RXDBG_ETH_BYP_EN__SHIFT 0x18
+#define PB1_GLB_CTRL_REG2__RXDBG_ETH_BYP_VAL_MASK 0xfe000000
+#define PB1_GLB_CTRL_REG2__RXDBG_ETH_BYP_VAL__SHIFT 0x19
+#define PB1_GLB_CTRL_REG3__RXDBG_SEL_MASK 0x1f
+#define PB1_GLB_CTRL_REG3__RXDBG_SEL__SHIFT 0x0
+#define PB1_GLB_CTRL_REG3__BG_CFG_LC_REG_VREF0_SEL_MASK 0x60
+#define PB1_GLB_CTRL_REG3__BG_CFG_LC_REG_VREF0_SEL__SHIFT 0x5
+#define PB1_GLB_CTRL_REG3__BG_CFG_LC_REG_VREF1_SEL_MASK 0x180
+#define PB1_GLB_CTRL_REG3__BG_CFG_LC_REG_VREF1_SEL__SHIFT 0x7
+#define PB1_GLB_CTRL_REG3__BG_CFG_RO_REG_VREF_SEL_MASK 0x600
+#define PB1_GLB_CTRL_REG3__BG_CFG_RO_REG_VREF_SEL__SHIFT 0x9
+#define PB1_GLB_CTRL_REG3__BG_DBG_VREFBYP_EN_MASK 0x800
+#define PB1_GLB_CTRL_REG3__BG_DBG_VREFBYP_EN__SHIFT 0xb
+#define PB1_GLB_CTRL_REG3__BG_DBG_IREFBYP_EN_MASK 0x1000
+#define PB1_GLB_CTRL_REG3__BG_DBG_IREFBYP_EN__SHIFT 0xc
+#define PB1_GLB_CTRL_REG3__BG_DBG_ANALOG_SEL_MASK 0x1c000
+#define PB1_GLB_CTRL_REG3__BG_DBG_ANALOG_SEL__SHIFT 0xe
+#define PB1_GLB_CTRL_REG3__DBG_DLL_CLK_SEL_MASK 0x1c0000
+#define PB1_GLB_CTRL_REG3__DBG_DLL_CLK_SEL__SHIFT 0x12
+#define PB1_GLB_CTRL_REG3__PLL_DISPCLK_CMOS_SEL_MASK 0x200000
+#define PB1_GLB_CTRL_REG3__PLL_DISPCLK_CMOS_SEL__SHIFT 0x15
+#define PB1_GLB_CTRL_REG3__DBG_RXPI_OFFSET_BYP_EN_MASK 0x400000
+#define PB1_GLB_CTRL_REG3__DBG_RXPI_OFFSET_BYP_EN__SHIFT 0x16
+#define PB1_GLB_CTRL_REG3__DBG_RXPI_OFFSET_BYP_VAL_MASK 0x7800000
+#define PB1_GLB_CTRL_REG3__DBG_RXPI_OFFSET_BYP_VAL__SHIFT 0x17
+#define PB1_GLB_CTRL_REG3__DBG_RXSWAPDX_BYP_EN_MASK 0x8000000
+#define PB1_GLB_CTRL_REG3__DBG_RXSWAPDX_BYP_EN__SHIFT 0x1b
+#define PB1_GLB_CTRL_REG3__DBG_RXSWAPDX_BYP_VAL_MASK 0x70000000
+#define PB1_GLB_CTRL_REG3__DBG_RXSWAPDX_BYP_VAL__SHIFT 0x1c
+#define PB1_GLB_CTRL_REG3__DBG_RXLEQ_DCATTN_BYP_OVR_DISABLE_MASK 0x80000000
+#define PB1_GLB_CTRL_REG3__DBG_RXLEQ_DCATTN_BYP_OVR_DISABLE__SHIFT 0x1f
+#define PB1_GLB_CTRL_REG4__DBG_RXAPU_INST_MASK 0xffff
+#define PB1_GLB_CTRL_REG4__DBG_RXAPU_INST__SHIFT 0x0
+#define PB1_GLB_CTRL_REG4__DBG_RXDFEMUX_BYP_VAL_MASK 0x30000
+#define PB1_GLB_CTRL_REG4__DBG_RXDFEMUX_BYP_VAL__SHIFT 0x10
+#define PB1_GLB_CTRL_REG4__DBG_RXDFEMUX_BYP_EN_MASK 0x40000
+#define PB1_GLB_CTRL_REG4__DBG_RXDFEMUX_BYP_EN__SHIFT 0x12
+#define PB1_GLB_CTRL_REG4__DBG_RXAPU_EXEC_MASK 0x3c00000
+#define PB1_GLB_CTRL_REG4__DBG_RXAPU_EXEC__SHIFT 0x16
+#define PB1_GLB_CTRL_REG4__DBG_RXDLL_VREG_REF_SEL_MASK 0x4000000
+#define PB1_GLB_CTRL_REG4__DBG_RXDLL_VREG_REF_SEL__SHIFT 0x1a
+#define PB1_GLB_CTRL_REG4__PWRGOOD_OVRD_MASK 0x8000000
+#define PB1_GLB_CTRL_REG4__PWRGOOD_OVRD__SHIFT 0x1b
+#define PB1_GLB_CTRL_REG4__DBG_RXRDATA_GATING_DISABLE_MASK 0x10000000
+#define PB1_GLB_CTRL_REG4__DBG_RXRDATA_GATING_DISABLE__SHIFT 0x1c
+#define PB1_GLB_CTRL_REG5__DBG_RXAPU_MODE_MASK 0xff
+#define PB1_GLB_CTRL_REG5__DBG_RXAPU_MODE__SHIFT 0x0
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_CBI_UPDT_L0T3_MASK 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_CBI_UPDT_L0T3__SHIFT 0x0
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_CBI_UPDT_L4T7_MASK 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_CBI_UPDT_L4T7__SHIFT 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_CBI_UPDT_L8T11_MASK 0x4
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_CBI_UPDT_L8T11__SHIFT 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_CBI_UPDT_L12T15_MASK 0x8
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_CBI_UPDT_L12T15__SHIFT 0x3
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_IMPCAL_ACTIVE_CBI_UPDT_MASK 0x10
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_IMPCAL_ACTIVE_CBI_UPDT__SHIFT 0x4
+#define PB1_GLB_SCI_STAT_OVRD_REG0__TXNIMP_MASK 0xf00
+#define PB1_GLB_SCI_STAT_OVRD_REG0__TXNIMP__SHIFT 0x8
+#define PB1_GLB_SCI_STAT_OVRD_REG0__TXPIMP_MASK 0xf000
+#define PB1_GLB_SCI_STAT_OVRD_REG0__TXPIMP__SHIFT 0xc
+#define PB1_GLB_SCI_STAT_OVRD_REG0__RXIMP_MASK 0xf0000
+#define PB1_GLB_SCI_STAT_OVRD_REG0__RXIMP__SHIFT 0x10
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IMPCAL_ACTIVE_MASK 0x100000
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IMPCAL_ACTIVE__SHIFT 0x14
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_LINKSPEED_CBI_UPDT_L0T3_MASK 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_LINKSPEED_CBI_UPDT_L0T3__SHIFT 0x0
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_FREQDIV_CBI_UPDT_L0T3_MASK 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_FREQDIV_CBI_UPDT_L0T3__SHIFT 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_DLL_LOCK_CBI_UPDT_L0T3_MASK 0x4
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_DLL_LOCK_CBI_UPDT_L0T3__SHIFT 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_0_MASK 0x1000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_0__SHIFT 0xc
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_1_MASK 0x2000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_1__SHIFT 0xd
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_2_MASK 0x4000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_2__SHIFT 0xe
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_3_MASK 0x8000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_3__SHIFT 0xf
+#define PB1_GLB_SCI_STAT_OVRD_REG1__LINKSPEED_0_MASK 0x30000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__LINKSPEED_0__SHIFT 0x10
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_0_MASK 0xc0000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_0__SHIFT 0x12
+#define PB1_GLB_SCI_STAT_OVRD_REG1__LINKSPEED_1_MASK 0x300000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__LINKSPEED_1__SHIFT 0x14
+#define PB1_GLB_SCI

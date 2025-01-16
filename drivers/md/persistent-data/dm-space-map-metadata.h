@@ -1,44 +1,23 @@
-/*
- * Copyright (C) 2011 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-
-#ifndef DM_SPACE_MAP_METADATA_H
-#define DM_SPACE_MAP_METADATA_H
-
-#include "dm-transaction-manager.h"
-
-#define DM_SM_METADATA_BLOCK_SIZE (4096 >> SECTOR_SHIFT)
-
-/*
- * The metadata device is currently limited in size.
- *
- * We have one block of index, which can hold 255 index entries.  Each
- * index entry contains allocation info about ~16k metadata blocks.
- */
-#define DM_SM_METADATA_MAX_BLOCKS (255 * ((1 << 14) - 64))
-#define DM_SM_METADATA_MAX_SECTORS (DM_SM_METADATA_MAX_BLOCKS * DM_SM_METADATA_BLOCK_SIZE)
-
-/*
- * Unfortunately we have to use two-phase construction due to the cycle
- * between the tm and sm.
- */
-struct dm_space_map *dm_sm_metadata_init(void);
-
-/*
- * Create a fresh space map.
- */
-int dm_sm_metadata_create(struct dm_space_map *sm,
-			  struct dm_transaction_manager *tm,
-			  dm_block_t nr_blocks,
-			  dm_block_t superblock);
-
-/*
- * Open from a previously-recorded root.
- */
-int dm_sm_metadata_open(struct dm_space_map *sm,
-			struct dm_transaction_manager *tm,
-			void *root_le, size_t len);
-
-#endif	/* DM_SPACE_MAP_METADATA_H */
+DMA1_RLC0_VIRTUAL_ADDR__INVAL_MASK 0x2
+#define SDMA1_RLC0_VIRTUAL_ADDR__INVAL__SHIFT 0x1
+#define SDMA1_RLC0_VIRTUAL_ADDR__PTR32_MASK 0x10
+#define SDMA1_RLC0_VIRTUAL_ADDR__PTR32__SHIFT 0x4
+#define SDMA1_RLC0_VIRTUAL_ADDR__SHARED_BASE_MASK 0x700
+#define SDMA1_RLC0_VIRTUAL_ADDR__SHARED_BASE__SHIFT 0x8
+#define SDMA1_RLC0_VIRTUAL_ADDR__VM_HOLE_MASK 0x40000000
+#define SDMA1_RLC0_VIRTUAL_ADDR__VM_HOLE__SHIFT 0x1e
+#define SDMA1_RLC0_APE1_CNTL__BASE_MASK 0xffff
+#define SDMA1_RLC0_APE1_CNTL__BASE__SHIFT 0x0
+#define SDMA1_RLC0_APE1_CNTL__LIMIT_MASK 0xffff0000
+#define SDMA1_RLC0_APE1_CNTL__LIMIT__SHIFT 0x10
+#define SDMA1_RLC0_DOORBELL_LOG__BE_ERROR_MASK 0x1
+#define SDMA1_RLC0_DOORBELL_LOG__BE_ERROR__SHIFT 0x0
+#define SDMA1_RLC0_DOORBELL_LOG__DATA_MASK 0xfffffffc
+#define SDMA1_RLC0_DOORBELL_LOG__DATA__SHIFT 0x2
+#define SDMA1_RLC0_WATERMARK__RD_OUTSTANDING_MASK 0xfff
+#define SDMA1_RLC0_WATERMARK__RD_OUTSTANDING__SHIFT 0x0
+#define SDMA1_RLC0_WATERMARK__WR_OUTSTANDING_MASK 0x1ff0000
+#define SDMA1_RLC0_WATERMARK__WR_OUTSTANDING__SHIFT 0x10
+#define SDMA1_RLC0_CSA_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA1_RLC0_CSA_ADDR_LO__ADDR__SHIFT 0x2
+#d

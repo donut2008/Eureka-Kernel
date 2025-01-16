@@ -1,106 +1,153 @@
+->desc, chan);
+	mxs_chan->desc.tx_submit = mxs_dma_tx_submit;
+
+	/* the descriptor is ready */
+	async_tx_ack(&mxs_chan->desc);
+
+	return 0;
+
+err_clk:
+	free_irq(mxs_chan->chan_irq, mxs_dma);
+err_irq:
+	dma_free_coherent(mxs_dma->dma_device.dev, CCW_BLOCK_SIZE,
+			mxs_chan->ccw, mxs_chan->ccw_phys);
+err_alloc:
+	return ret;
+}
+
+static void mxs_dma_free_chan_resources(struct dma_chan *chan)
+{
+	struct mxs_dma_chan *mxs_chan = to_mxs_dma_chan(chan);
+	struct mxs_dma_engine *mxs_dma = mxs_chan->mxs_dma;
+
+	mxs_dma_disable_chan(chan);
+
+	free_irq(mxs_chan->chan_irq, mxs_dma);
+
+	dma_free_coherent(mxs_dma->dma_device.dev, CCW_BLOCK_SIZE,
+			mxs_chan->ccw, mxs_chan->ccw_phys);
+
+	clk_disable_unprepare(mxs_dma->clk);
+}
+
 /*
-   The compile-time configurable defaults for the Linux SCSI tape driver.
+ * How to use the flags for ->device_prep_slave_sg() :
+ *    [1] If there is only one DMA command in the DMA chain, the code should be:
+ *            ......
+ *            ->device_prep_slave_sg(DMA_CTRL_ACK);
+ *            ......
+ *    [2] If there are two DMA commands in the DMA chain, the code should be
+ *            ......
+ *            ->device_prep_slave_sg(0);
+ *            ......
+ *            ->device_prep_slave_sg(DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+ *            ......
+ *    [3] If there are more than two DMA commands in the DMA chain, the code
+ *        should be:
+ *            ......
+ *            ->device_prep_slave_sg(0);                                // First
+ *            ......
+ *            ->device_prep_slave_sg(DMA_PREP_INTERRUPT [| DMA_CTRL_ACK]);
+ *            ......
+ *            ->device_prep_slave_sg(DMA_PREP_INTERRUPT | DMA_CTRL_ACK); // Last
+ *            ......
+ */
+static struct dma_async_tx_descriptor *mxs_dma_prep_slave_sg(
+		struct dma_chan *chan, struct scatterlist *sgl,
+		unsigned int sg_len, enum dma_transfer_direction direction,
+		unsigned long flags, void *context)
+{
+	struct mxs_dma_chan *mxs_chan = to_mxs_dma_chan(chan);
+	struct mxs_dma_engine *mxs_dma = mxs_chan->mxs_dma;
+	struct mxs_dma_ccw *ccw;
+	struct scatterlist *sg;
+	u32 i, j;
+	u32 *pio;
+	bool append = flags & DMA_PREP_INTERRUPT;
+	int idx = append ? mxs_chan->desc_count : 0;
 
-   Copyright 1995 Kai Makisara.
-   
-   Last modified: Wed Sep  2 21:24:07 1998 by root@home
-   
-   Changed (and renamed) for OnStream SCSI drives garloff@suse.de
-   2000-06-21
+	if (mxs_chan->status == DMA_IN_PROGRESS && !append)
+		return NULL;
 
-   $Header: /cvsroot/osst/Driver/osst_options.h,v 1.6 2003/12/23 14:22:12 wriede Exp $
-*/
+	if (sg_len + (append ? idx : 0) > NUM_CCW) {
+		dev_err(mxs_dma->dma_device.dev,
+				"maximum number of sg exceeded: %d > %d\n",
+				sg_len, NUM_CCW);
+		goto err_out;
+	}
 
-#ifndef _OSST_OPTIONS_H
-#define _OSST_OPTIONS_H
+	mxs_chan->status = DMA_IN_PROGRESS;
+	mxs_chan->flags = 0;
 
-/* The minimum limit for the number of SCSI tape devices is determined by
-   OSST_MAX_TAPES. If the number of tape devices and the "slack" defined by
-   OSST_EXTRA_DEVS exceeds OSST_MAX_TAPES, the large number is used. */
-#define OSST_MAX_TAPES 4
+	/*
+	 * If the sg is prepared with append flag set, the sg
+	 * will be appended to the last prepared sg.
+	 */
+	if (append) {
+		BUG_ON(idx < 1);
+		ccw = &mxs_chan->ccw[idx - 1];
+		ccw->next = mxs_chan->ccw_phys + sizeof(*ccw) * idx;
+		ccw->bits |= CCW_CHAIN;
+		ccw->bits &= ~CCW_IRQ;
+		ccw->bits &= ~CCW_DEC_SEM;
+	} else {
+		idx = 0;
+	}
 
-/* If OSST_IN_FILE_POS is nonzero, the driver positions the tape after the
-   record been read by the user program even if the tape has moved further
-   because of buffered reads. Should be set to zero to support also drives
-   that can't space backwards over records. NOTE: The tape will be
-   spaced backwards over an "accidentally" crossed filemark in any case. */
-#define OSST_IN_FILE_POS 1
+	if (direction == DMA_TRANS_NONE) {
+		ccw = &mxs_chan->ccw[idx++];
+		pio = (u32 *) sgl;
 
-/* The tape driver buffer size in kilobytes. */
-/* Don't change, as this is the HW blocksize */
-#define OSST_BUFFER_BLOCKS 32
+		for (j = 0; j < sg_len;)
+			ccw->pio_words[j++] = *pio++;
 
-/* The number of kilobytes of data in the buffer that triggers an
-   asynchronous write in fixed block mode. See also OSST_ASYNC_WRITES
-   below. */
-#define OSST_WRITE_THRESHOLD_BLOCKS 32
+		ccw->bits = 0;
+		ccw->bits |= CCW_IRQ;
+		ccw->bits |= CCW_DEC_SEM;
+		if (flags & DMA_CTRL_ACK)
+			ccw->bits |= CCW_WAIT4END;
+		ccw->bits |= CCW_HALT_ON_TERM;
+		ccw->bits |= CCW_TERM_FLUSH;
+		ccw->bits |= BF_CCW(sg_len, PIO_NUM);
+		ccw->bits |= BF_CCW(MXS_DMA_CMD_NO_XFER, COMMAND);
+	} else {
+		for_each_sg(sgl, sg, sg_len, i) {
+			if (sg_dma_len(sg) > MAX_XFER_BYTES) {
+				dev_err(mxs_dma->dma_device.dev, "maximum bytes for sg entry exceeded: %d > %d\n",
+						sg_dma_len(sg), MAX_XFER_BYTES);
+				goto err_out;
+			}
 
-/* OSST_EOM_RESERVE defines the number of frames are kept in reserve for
- *  * write error recovery when writing near end of medium. ENOSPC is returned
- *   * when write() is called and the tape write position is within this number
- *    * of blocks from the tape capacity. */
-#define OSST_EOM_RESERVE 300
+			ccw = &mxs_chan->ccw[idx++];
 
-/* The maximum number of tape buffers the driver allocates. The number
-   is also constrained by the number of drives detected. Determines the
-   maximum number of concurrently active tape drives. */
-#define OSST_MAX_BUFFERS OSST_MAX_TAPES 
+			ccw->next = mxs_chan->ccw_phys + sizeof(*ccw) * idx;
+			ccw->bufaddr = sg->dma_address;
+			ccw->xfer_bytes = sg_dma_len(sg);
 
-/* Maximum number of scatter/gather segments */
-/* Fit one buffer in pages and add one for the AUX header */
-#define OSST_MAX_SG      (((OSST_BUFFER_BLOCKS*1024) / PAGE_SIZE) + 1)
+			ccw->bits = 0;
+			ccw->bits |= CCW_CHAIN;
+			ccw->bits |= CCW_HALT_ON_TERM;
+			ccw->bits |= CCW_TERM_FLUSH;
+			ccw->bits |= BF_CCW(direction == DMA_DEV_TO_MEM ?
+					MXS_DMA_CMD_WRITE : MXS_DMA_CMD_READ,
+					COMMAND);
 
-/* The number of scatter/gather segments to allocate at first try (must be
-   smaller or equal to the maximum). */
-#define OSST_FIRST_SG    ((OSST_BUFFER_BLOCKS*1024) / PAGE_SIZE)
+			if (i + 1 == sg_len) {
+				ccw->bits &= ~CCW_CHAIN;
+				ccw->bits |= CCW_IRQ;
+				ccw->bits |= CCW_DEC_SEM;
+				if (flags & DMA_CTRL_ACK)
+					ccw->bits |= CCW_WAIT4END;
+			}
+		}
+	}
+	mxs_chan->desc_count = idx;
 
-/* The size of the first scatter/gather segments (determines the maximum block
-   size for SCSI adapters not supporting scatter/gather). The default is set
-   to try to allocate the buffer as one chunk. */
-#define OSST_FIRST_ORDER  (15-PAGE_SHIFT)
+	return &mxs_chan->desc;
 
+err_out:
+	mxs_chan->status = DMA_ERROR;
+	return NULL;
+}
 
-/* The following lines define defaults for properties that can be set
-   separately for each drive using the MTSTOPTIONS ioctl. */
-
-/* If OSST_TWO_FM is non-zero, the driver writes two filemarks after a
-   file being written. Some drives can't handle two filemarks at the
-   end of data. */
-#define OSST_TWO_FM 0
-
-/* If OSST_BUFFER_WRITES is non-zero, writes in fixed block mode are
-   buffered until the driver buffer is full or asynchronous write is
-   triggered. */
-#define OSST_BUFFER_WRITES 1
-
-/* If OSST_ASYNC_WRITES is non-zero, the SCSI write command may be started
-   without waiting for it to finish. May cause problems in multiple
-   tape backups. */
-#define OSST_ASYNC_WRITES 1
-
-/* If OSST_READ_AHEAD is non-zero, blocks are read ahead in fixed block
-   mode. */
-#define OSST_READ_AHEAD 1
-
-/* If OSST_AUTO_LOCK is non-zero, the drive door is locked at the first
-   read or write command after the device is opened. The door is opened
-   when the device is closed. */
-#define OSST_AUTO_LOCK 0
-
-/* If OSST_FAST_MTEOM is non-zero, the MTEOM ioctl is done using the
-   direct SCSI command. The file number status is lost but this method
-   is fast with some drives. Otherwise MTEOM is done by spacing over
-   files and the file number status is retained. */
-#define OSST_FAST_MTEOM 0
-
-/* If OSST_SCSI2LOGICAL is nonzero, the logical block addresses are used for
-   MTIOCPOS and MTSEEK by default. Vendor addresses are used if OSST_SCSI2LOGICAL
-   is zero. */
-#define OSST_SCSI2LOGICAL 0
-
-/* If OSST_SYSV is non-zero, the tape behaves according to the SYS V semantics.
-   The default is BSD semantics. */
-#define OSST_SYSV 0
-
-
-#endif
+static struct dma_async_tx_descriptor *mxs_dma_prep_dma_cyc

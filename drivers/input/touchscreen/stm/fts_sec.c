@@ -1,6264 +1,7181 @@
-#ifdef SEC_TSP_FACTORY_TEST
-
-#define BUFFER_MAX			((256 * 1024) - 16)
-#define READ_CHUNK_SIZE			128 // (2 * 1024) - 16
-
-enum {
-	TYPE_RAW_DATA = 0,
-	TYPE_FILTERED_DATA = 2,
-	TYPE_STRENGTH_DATA = 4,
-	TYPE_BASELINE_DATA = 6
-};
-
-enum {
-	BUILT_IN = 0,
-	UMS,
-};
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-enum {
-	TYPE_TOUCHKEY_RAW	= 0x34,
-	TYPE_TOUCHKEY_STRENGTH	= 0x36,
-};
-#endif
-
-#define FTS_FLASH_DATA_OFFSET_BASE			16
-
-enum fts_nvm_data_type {		/* Write Command */
-	FTS_NVM_OFFSET_FAC_RESULT = 1,
-	FTS_NVM_OFFSET_CAL_COUNT,
-	FTS_NVM_OFFSET_DISASSEMBLE_COUNT,
-	FTS_NVM_OFFSET_TUNE_VERSION,
-	FTS_NVM_OFFSET_CAL_POSITION,
-	FTS_NVM_OFFSET_HISTORY_QUEUE_COUNT,
-	FTS_NVM_OFFSET_HISTORY_QUEUE_LASTP,
-	FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO,
-	FTS_NVM_OFFSET_TCLM_TEST_LEVEL,
-	FTS_NVM_OFFSET_TCLM_TEST_AFE_BASE,
-	FTS_NVM_OFFSET_PRESSURE_BASE_CAL_COUNT,
-	FTS_NVM_OFFSET_PRESSURE_DELTA_CAL_COUNT,
-	FTS_NVM_OFFSET_PRESSURE_INDEX,
-};
-
-struct fts_nvm_data_map {
-	int type;
-	int offset;
-	int length;
-};
-
-#define NVM_CMD(mtype, moffset, mlength)		.type = mtype,	.offset = moffset,	.length = mlength
-
-/* This Flash Meory Map is FIXED by STM firmware
- * Do not change MAP.
+/*
+ * Copyright (C) 2007 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
  */
-struct fts_nvm_data_map nvm_data[] = {
-	{NVM_CMD(0,						0x00, 0),},
-	{NVM_CMD(FTS_NVM_OFFSET_FAC_RESULT,			0x00, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_CAL_COUNT,			0x01, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_DISASSEMBLE_COUNT,		0x02, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_TUNE_VERSION,			0x03, 2),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_CAL_POSITION,			0x05, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_HISTORY_QUEUE_COUNT,		0x06, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_HISTORY_QUEUE_LASTP,		0x07, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO,		0x08, 20),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_TCLM_TEST_LEVEL,		0x1E, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_TCLM_TEST_AFE_BASE,		0x1F, 2),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_PRESSURE_BASE_CAL_COUNT,	0x23, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_PRESSURE_DELTA_CAL_COUNT,	0x24, 1),},	/* SEC */
-	{NVM_CMD(FTS_NVM_OFFSET_PRESSURE_INDEX,			0x25, 1),},	/* SEC */
-};
-#define FTS_NVM_OFFSET_ALL	28
 
-#define FTS_NVM_OFFSET_TCLM_TEST_SIZE		3
-#define FTS_OFFSET_TCLM_TEST_LEVEL	0
-#define FTS_OFFSET_TCLM_TEST_AFE_BASE	1
+#include <linux/kernel.h>
+#include <linux/bio.h>
+#include <linux/buffer_head.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/pagemap.h>
+#include <linux/highmem.h>
+#include <linux/time.h>
+#include <linux/init.h>
+#include <linux/string.h>
+#include <linux/backing-dev.h>
+#include <linux/mpage.h>
+#include <linux/swap.h>
+#include <linux/writeback.h>
+#include <linux/statfs.h>
+#include <linux/compat.h>
+#include <linux/bit_spinlock.h>
+#include <linux/xattr.h>
+#include <linux/posix_acl.h>
+#include <linux/falloc.h>
+#include <linux/slab.h>
+#include <linux/ratelimit.h>
+#include <linux/mount.h>
+#include <linux/btrfs.h>
+#include <linux/blkdev.h>
+#include <linux/posix_acl_xattr.h>
+#include <linux/uio.h>
+#include "ctree.h"
+#include "disk-io.h"
+#include "transaction.h"
+#include "btrfs_inode.h"
+#include "print-tree.h"
+#include "ordered-data.h"
+#include "xattr.h"
+#include "tree-log.h"
+#include "volumes.h"
+#include "compression.h"
+#include "locking.h"
+#include "free-space-cache.h"
+#include "inode-map.h"
+#include "backref.h"
+#include "hash.h"
+#include "props.h"
+#include "qgroup.h"
 
-static void fw_update(void *device_data);
-static void get_fw_ver_bin(void *device_data);
-static void get_fw_ver_ic(void *device_data);
-static void get_config_ver(void *device_data);
-static void get_threshold(void *device_data);
-static void module_off_master(void *device_data);
-static void module_on_master(void *device_data);
-static void get_chip_vendor(void *device_data);
-static void get_chip_name(void *device_data);
-static void get_mis_cal_info(void *device_data);
-static void get_wet_mode(void *device_data);
-static void get_x_num(void *device_data);
-static void get_y_num(void *device_data);
-static void get_checksum_data(void *device_data);
-static void run_reference_read(void *device_data);
-static void get_reference(void *device_data);
-static void run_rawcap_read(void *device_data);
-static void run_rawcap_read_all(void *device_data);
-static void get_rawcap(void *device_data);
-static void run_delta_read(void *device_data);
-static void get_delta(void *device_data);
-#ifdef TCLM_CONCEPT
-static void get_pat_information(void *device_data);
-static void set_external_factory(void *device_data);
-#endif
-#ifdef FTS_SUPPORT_HOVER
-static void run_abscap_read(void *device_data);
-static void run_absdelta_read(void *device_data);
-#endif
-static void run_ix_data_read(void *device_data);
-static void run_ix_data_read_all(void *device_data);
-static void run_self_raw_read(void *device_data);
-static void run_self_raw_read_all(void *device_data);
-static void run_trx_short_test(void *device_data);
-static void check_connection(void *device_data);
-static void get_cx_data(void *device_data);
-static void run_cx_data_read(void *device_data);
-static void get_cx_all_data(void *device_data);
-static void get_strength_all_data(void *device_data);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-static void run_key_cx_data_read(void *device_data);
-#endif
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-static void run_force_pressure_calibration(void *device_data);
-static void set_pressure_test_mode(void *device_data);
-static void run_pressure_strength_read_all(void *device_data);
-static void run_pressure_rawdata_read_all(void *device_data);
-static void run_pressure_ix_data_read_all(void *device_data);
-static void set_pressure_strength(void *device_data);
-static void set_pressure_rawdata(void *device_data);
-static void set_pressure_data_index(void *device_data);
-static void get_pressure_strength(void *device_data);
-static void get_pressure_rawdata(void *device_data);
-static void get_pressure_data_index(void *device_data);
-static void set_pressure_strength_clear(void *device_data);
-static void get_pressure_threshold(void *device_data);
-static void set_pressure_user_level(void *device_data);
-static void get_pressure_user_level(void *device_data);
-#endif
-
-static void set_tsp_test_result(void *device_data);
-static void get_tsp_test_result(void *device_data);
-static void increase_disassemble_count(void *device_data);
-static void get_disassemble_count(void *device_data);
-#ifdef FTS_SUPPORT_HOVER
-static void hover_enable(void *device_data);
-/* static void hover_no_sleep_enable(void *device_data); */
-#endif
-#ifdef CONFIG_GLOVE_TOUCH
-static void glove_mode(void *device_data);
-static void get_glove_sensitivity(void *device_data);
-static void fast_glove_mode(void *device_data);
-#endif
-static void clear_cover_mode(void *device_data);
-static void report_rate(void *device_data);
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-static void interrupt_control(void *device_data);
-#endif
-
-static void set_wirelesscharger_mode(void *device_data);
-static void set_grip_data(void *device_data);
-static void set_dead_zone(void *device_data);
-static void dead_zone_enable(void *device_data);
-static void drawing_test_enable(void *device_data);
-static void spay_enable(void *device_data);
-static void aod_enable(void *device_data);
-static void set_aod_rect(void *device_data);
-static void get_aod_rect(void *device_data);
-static void dex_enable(void *device_data);
-static void brush_enable(void *device_data);
-static void set_touchable_area(void *device_data);
-static void delay(void *device_data);
-static void debug(void *device_data);
-static void factory_cmd_result_all(void *device_data);
-static void run_force_calibration(void *device_data);
-static void set_factory_level(void *device_data);
-
-static void not_support_cmd(void *device_data);
-
-static ssize_t fts_scrub_position(struct device *dev,
-				struct device_attribute *attr, char *buf);
-
-#ifdef CONFIG_TRUSTONIC_TRUSTED_UI
-extern int tui_force_close(uint32_t arg);
-extern void tui_cover_mode_set(bool arg);
-#endif
-
-struct sec_cmd ft_commands[] = {
-	{SEC_CMD("fw_update", fw_update),},
-	{SEC_CMD("get_fw_ver_bin", get_fw_ver_bin),},
-	{SEC_CMD("get_fw_ver_ic", get_fw_ver_ic),},
-	{SEC_CMD("get_config_ver", get_config_ver),},
-	{SEC_CMD("get_threshold", get_threshold),},
-	{SEC_CMD("module_off_master", module_off_master),},
-	{SEC_CMD("module_on_master", module_on_master),},
-	{SEC_CMD("module_off_slave", not_support_cmd),},
-	{SEC_CMD("module_on_slave", not_support_cmd),},
-	{SEC_CMD("get_chip_vendor", get_chip_vendor),},
-	{SEC_CMD("get_chip_name", get_chip_name),},
-	{SEC_CMD("get_mis_cal_info", get_mis_cal_info),},
-	{SEC_CMD("get_wet_mode", get_wet_mode),},
-	{SEC_CMD("get_module_vendor", not_support_cmd),},
-	{SEC_CMD("get_x_num", get_x_num),},
-	{SEC_CMD("get_y_num", get_y_num),},
-	{SEC_CMD("get_checksum_data", get_checksum_data),},
-	{SEC_CMD("run_reference_read", run_reference_read),},
-	{SEC_CMD("get_reference", get_reference),},
-	{SEC_CMD("run_rawcap_read", run_rawcap_read),},
-	{SEC_CMD("run_rawcap_read_all", run_rawcap_read_all),},
-	{SEC_CMD("get_rawcap", get_rawcap),},
-	{SEC_CMD("run_delta_read", run_delta_read),},
-	{SEC_CMD("get_delta", get_delta),},
-#ifdef TCLM_CONCEPT
-	{SEC_CMD("get_pat_information", get_pat_information),},
-	{SEC_CMD("set_external_factory", set_external_factory),},
-#endif
-#ifdef FTS_SUPPORT_HOVER
-	{SEC_CMD("run_abscap_read" , run_abscap_read),},
-	{SEC_CMD("run_absdelta_read", run_absdelta_read),},
-#endif
-	{SEC_CMD("run_ix_data_read", run_ix_data_read),},
-	{SEC_CMD("run_ix_data_read_all", run_ix_data_read_all),},
-	{SEC_CMD("run_self_raw_read", run_self_raw_read),},
-	{SEC_CMD("run_self_raw_read_all", run_self_raw_read_all),},
-	{SEC_CMD("run_trx_short_test", run_trx_short_test),},
-	{SEC_CMD("check_connection", check_connection),},
-	{SEC_CMD("get_cx_data", get_cx_data),},
-	{SEC_CMD("run_cx_data_read", run_cx_data_read),},
-	{SEC_CMD("run_cx_data_read_all", get_cx_all_data),},
-	{SEC_CMD("get_cx_all_data", get_cx_all_data),},
-	{SEC_CMD("get_strength_all_data", get_strength_all_data),},
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	{SEC_CMD("run_key_cx_data_read", run_key_cx_data_read),},
-#endif
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	{SEC_CMD("run_force_pressure_calibration", run_force_pressure_calibration),},
-	{SEC_CMD("set_pressure_test_mode", set_pressure_test_mode),},
-	{SEC_CMD("run_pressure_strength_read_all", run_pressure_strength_read_all),},
-	{SEC_CMD("run_pressure_rawdata_read_all", run_pressure_rawdata_read_all),},
-	{SEC_CMD("run_pressure_ix_data_read_all", run_pressure_ix_data_read_all),},
-	{SEC_CMD("set_pressure_strength", set_pressure_strength),},
-	{SEC_CMD("set_pressure_rawdata", set_pressure_rawdata),},
-	{SEC_CMD("set_pressure_data_index", set_pressure_data_index),},
-	{SEC_CMD("get_pressure_strength", get_pressure_strength),},
-	{SEC_CMD("get_pressure_rawdata", get_pressure_rawdata),},
-	{SEC_CMD("get_pressure_data_index", get_pressure_data_index),},
-	{SEC_CMD("set_pressure_strength_clear", set_pressure_strength_clear),},
-	{SEC_CMD("get_pressure_threshold", get_pressure_threshold),},
-	{SEC_CMD("set_pressure_user_level", set_pressure_user_level),},
-	{SEC_CMD("get_pressure_user_level", get_pressure_user_level),},
-#endif
-	{SEC_CMD("set_tsp_test_result", set_tsp_test_result),},
-	{SEC_CMD("get_tsp_test_result", get_tsp_test_result),},
-	{SEC_CMD("increase_disassemble_count", increase_disassemble_count),},
-	{SEC_CMD("get_disassemble_count", get_disassemble_count),},
-#ifdef FTS_SUPPORT_HOVER
-	{SEC_CMD("hover_enable", hover_enable),},
-#endif
-#ifdef CONFIG_GLOVE_TOUCH
-	{SEC_CMD("glove_mode", glove_mode),},
-	{SEC_CMD("get_glove_sensitivity", get_glove_sensitivity),},
-	{SEC_CMD("fast_glove_mode", fast_glove_mode),},
-#endif
-	{SEC_CMD("clear_cover_mode", clear_cover_mode),},
-	{SEC_CMD("report_rate", report_rate),},
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-	{SEC_CMD("interrupt_control", interrupt_control),},
-#endif
-	{SEC_CMD("set_wirelesscharger_mode", set_wirelesscharger_mode),},
-	{SEC_CMD("set_grip_data", set_grip_data),},
-	{SEC_CMD("set_dead_zone", set_dead_zone),},
-	{SEC_CMD("dead_zone_enable", dead_zone_enable),},
-	{SEC_CMD("drawing_test_enable", drawing_test_enable),},
-	{SEC_CMD("spay_enable", spay_enable),},
-	{SEC_CMD("aod_enable", aod_enable),},
-	{SEC_CMD("set_aod_rect", set_aod_rect),},
-	{SEC_CMD("get_aod_rect", get_aod_rect),},
-	{SEC_CMD("dex_enable", dex_enable),},
-	{SEC_CMD("brush_enable", brush_enable),},
-	{SEC_CMD("set_touchable_area", set_touchable_area),},
-	{SEC_CMD("delay", delay),},
-	{SEC_CMD("debug", debug),},
-	{SEC_CMD("factory_cmd_result_all", factory_cmd_result_all),},
-	{SEC_CMD("run_force_calibration", run_force_calibration),},
-	{SEC_CMD("set_factory_level", set_factory_level),},
-	{SEC_CMD("not_support_cmd", not_support_cmd),},
+struct btrfs_iget_args {
+	struct btrfs_key *location;
+	struct btrfs_root *root;
 };
 
-static ssize_t read_ito_check_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
+static const struct inode_operations btrfs_dir_inode_operations;
+static const struct inode_operations btrfs_symlink_inode_operations;
+static const struct inode_operations btrfs_dir_ro_inode_operations;
+static const struct inode_operations btrfs_special_inode_operations;
+static const struct inode_operations btrfs_file_inode_operations;
+static const struct address_space_operations btrfs_aops;
+static const struct address_space_operations btrfs_symlink_aops;
+static const struct file_operations btrfs_dir_file_operations;
+static struct extent_io_ops btrfs_extent_io_ops;
+
+static struct kmem_cache *btrfs_inode_cachep;
+static struct kmem_cache *btrfs_delalloc_work_cachep;
+struct kmem_cache *btrfs_trans_handle_cachep;
+struct kmem_cache *btrfs_transaction_cachep;
+struct kmem_cache *btrfs_path_cachep;
+struct kmem_cache *btrfs_free_space_cachep;
+
+#define S_SHIFT 12
+static unsigned char btrfs_type_by_mode[S_IFMT >> S_SHIFT] = {
+	[S_IFREG >> S_SHIFT]	= BTRFS_FT_REG_FILE,
+	[S_IFDIR >> S_SHIFT]	= BTRFS_FT_DIR,
+	[S_IFCHR >> S_SHIFT]	= BTRFS_FT_CHRDEV,
+	[S_IFBLK >> S_SHIFT]	= BTRFS_FT_BLKDEV,
+	[S_IFIFO >> S_SHIFT]	= BTRFS_FT_FIFO,
+	[S_IFSOCK >> S_SHIFT]	= BTRFS_FT_SOCK,
+	[S_IFLNK >> S_SHIFT]	= BTRFS_FT_SYMLINK,
+};
+
+static int btrfs_setsize(struct inode *inode, struct iattr *attr);
+static int btrfs_truncate(struct inode *inode);
+static int btrfs_finish_ordered_io(struct btrfs_ordered_extent *ordered_extent);
+static noinline int cow_file_range(struct inode *inode,
+				   struct page *locked_page,
+				   u64 start, u64 end, int *page_started,
+				   unsigned long *nr_written, int unlock);
+static struct extent_map *create_pinned_em(struct inode *inode, u64 start,
+					   u64 len, u64 orig_start,
+					   u64 block_start, u64 block_len,
+					   u64 orig_block_len, u64 ram_bytes,
+					   int type);
+
+static int btrfs_dirty_inode(struct inode *inode);
+
+#ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+void btrfs_test_inode_set_ops(struct inode *inode)
 {
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
+	BTRFS_I(inode)->io_tree.ops = &btrfs_extent_io_ops;
+}
+#endif
 
-	input_info(true, &info->client->dev, "%s: %02X%02X%02X%02X\n", __func__,
-		info->ito_test[0], info->ito_test[1],
-		info->ito_test[2], info->ito_test[3]);
+static int btrfs_init_inode_security(struct btrfs_trans_handle *trans,
+				     struct inode *inode,  struct inode *dir,
+				     const struct qstr *qstr)
+{
+	int err;
 
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%02X%02X%02X%02X",
-		info->ito_test[0], info->ito_test[1],
-		info->ito_test[2], info->ito_test[3]);
+	err = btrfs_init_acl(trans, inode, dir);
+	if (!err)
+		err = btrfs_xattr_security_init(trans, inode, dir, qstr);
+	return err;
 }
 
-static ssize_t read_raw_check_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
+/*
+ * this does all the hard work for inserting an inline extent into
+ * the btree.  The caller should have done a btrfs_drop_extents so that
+ * no overlapping inline items exist in the btree
+ */
+static int insert_inline_extent(struct btrfs_trans_handle *trans,
+				struct btrfs_path *path, int extent_inserted,
+				struct btrfs_root *root, struct inode *inode,
+				u64 start, size_t size, size_t compressed_size,
+				int compress_type,
+				struct page **compressed_pages)
 {
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	int ii, ret = 0;
-	char *buffer = NULL;
-	char temp[10] = { 0 };
+	struct extent_buffer *leaf;
+	struct page *page = NULL;
+	char *kaddr;
+	unsigned long ptr;
+	struct btrfs_file_extent_item *ei;
+	int err = 0;
+	int ret;
+	size_t cur_size = size;
+	unsigned long offset;
 
-	buffer = kzalloc(info->SenseChannelLength * info->ForceChannelLength * 6, GFP_KERNEL);
-	if (!buffer)
+	if (compressed_size && compressed_pages)
+		cur_size = compressed_size;
+
+	inode_add_bytes(inode, size);
+
+	if (!extent_inserted) {
+		struct btrfs_key key;
+		size_t datasize;
+
+		key.objectid = btrfs_ino(inode);
+		key.offset = start;
+		key.type = BTRFS_EXTENT_DATA_KEY;
+
+		datasize = btrfs_file_extent_calc_inline_size(cur_size);
+		path->leave_spinning = 1;
+		ret = btrfs_insert_empty_item(trans, root, path, &key,
+					      datasize);
+		if (ret) {
+			err = ret;
+			goto fail;
+		}
+	}
+	leaf = path->nodes[0];
+	ei = btrfs_item_ptr(leaf, path->slots[0],
+			    struct btrfs_file_extent_item);
+	btrfs_set_file_extent_generation(leaf, ei, trans->transid);
+	btrfs_set_file_extent_type(leaf, ei, BTRFS_FILE_EXTENT_INLINE);
+	btrfs_set_file_extent_encryption(leaf, ei, 0);
+	btrfs_set_file_extent_other_encoding(leaf, ei, 0);
+	btrfs_set_file_extent_ram_bytes(leaf, ei, size);
+	ptr = btrfs_file_extent_inline_start(ei);
+
+	if (compress_type != BTRFS_COMPRESS_NONE) {
+		struct page *cpage;
+		int i = 0;
+		while (compressed_size > 0) {
+			cpage = compressed_pages[i];
+			cur_size = min_t(unsigned long, compressed_size,
+				       PAGE_CACHE_SIZE);
+
+			kaddr = kmap_atomic(cpage);
+			write_extent_buffer(leaf, kaddr, ptr, cur_size);
+			kunmap_atomic(kaddr);
+
+			i++;
+			ptr += cur_size;
+			compressed_size -= cur_size;
+		}
+		btrfs_set_file_extent_compression(leaf, ei,
+						  compress_type);
+	} else {
+		page = find_get_page(inode->i_mapping,
+				     start >> PAGE_CACHE_SHIFT);
+		btrfs_set_file_extent_compression(leaf, ei, 0);
+		kaddr = kmap_atomic(page);
+		offset = start & (PAGE_CACHE_SIZE - 1);
+		write_extent_buffer(leaf, kaddr + offset, ptr, size);
+		kunmap_atomic(kaddr);
+		page_cache_release(page);
+	}
+	btrfs_mark_buffer_dirty(leaf);
+	btrfs_release_path(path);
+
+	/*
+	 * we're an inline extent, so nobody can
+	 * extend the file past i_size without locking
+	 * a page we already have locked.
+	 *
+	 * We must do any isize and inode updates
+	 * before we unlock the pages.  Otherwise we
+	 * could end up racing with unlink.
+	 */
+	BTRFS_I(inode)->disk_i_size = inode->i_size;
+	ret = btrfs_update_inode(trans, root, inode);
+
+	return ret;
+fail:
+	return err;
+}
+
+
+/*
+ * conditionally insert an inline extent into the file.  This
+ * does the checks required to make sure the data is small enough
+ * to fit as an inline extent.
+ */
+static noinline int cow_file_range_inline(struct btrfs_root *root,
+					  struct inode *inode, u64 start,
+					  u64 end, size_t compressed_size,
+					  int compress_type,
+					  struct page **compressed_pages)
+{
+	struct btrfs_trans_handle *trans;
+	u64 isize = i_size_read(inode);
+	u64 actual_end = min(end + 1, isize);
+	u64 inline_len = actual_end - start;
+	u64 aligned_end = ALIGN(end, root->sectorsize);
+	u64 data_len = inline_len;
+	int ret;
+	struct btrfs_path *path;
+	int extent_inserted = 0;
+	u32 extent_item_size;
+
+	if (compressed_size)
+		data_len = compressed_size;
+
+	if (start > 0 ||
+	    actual_end > PAGE_CACHE_SIZE ||
+	    data_len > BTRFS_MAX_INLINE_DATA_SIZE(root) ||
+	    (!compressed_size &&
+	    (actual_end & (root->sectorsize - 1)) == 0) ||
+	    end + 1 < isize ||
+	    data_len > root->fs_info->max_inline) {
+		return 1;
+	}
+
+	path = btrfs_alloc_path();
+	if (!path)
 		return -ENOMEM;
 
-	for (ii = 0; ii < (info->SenseChannelLength * info->ForceChannelLength - 1); ii++) {
-		snprintf(temp, 6, "%d ", info->pFrame[ii]);
-		strncat(buffer, temp, 6);
+	trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans)) {
+		btrfs_free_path(path);
+		return PTR_ERR(trans);
+	}
+	trans->block_rsv = &root->fs_info->delalloc_block_rsv;
 
-		memset(temp, 0x00, 10);
+	if (compressed_size && compressed_pages)
+		extent_item_size = btrfs_file_extent_calc_inline_size(
+		   compressed_size);
+	else
+		extent_item_size = btrfs_file_extent_calc_inline_size(
+		    inline_len);
+
+	ret = __btrfs_drop_extents(trans, root, inode, path,
+				   start, aligned_end, NULL,
+				   1, 1, extent_item_size, &extent_inserted);
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto out;
 	}
 
-	snprintf(temp, 6, "%d", info->pFrame[ii]);
-	strncat(buffer, temp, 6);
+	if (isize > actual_end)
+		inline_len = min_t(u64, isize, actual_end);
+	ret = insert_inline_extent(trans, path, extent_inserted,
+				   root, inode, start,
+				   inline_len, compressed_size,
+				   compress_type, compressed_pages);
+	if (ret && ret != -ENOSPC) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto out;
+	} else if (ret == -ENOSPC) {
+		ret = 1;
+		goto out;
+	}
 
-	ret = snprintf(buf, info->SenseChannelLength * info->ForceChannelLength * 6, buffer);
-	kfree(buffer);
-
+	set_bit(BTRFS_INODE_NEEDS_FULL_SYNC, &BTRFS_I(inode)->runtime_flags);
+	btrfs_delalloc_release_metadata(inode, end + 1 - start);
+	btrfs_drop_extent_cache(inode, start, aligned_end - 1, 0);
+out:
+	/*
+	 * Don't forget to free the reserved space, as for inlined extent
+	 * it won't count as data extent, free them directly here.
+	 * And at reserve time, it's always aligned to page size, so
+	 * just free one page here.
+	 */
+	btrfs_qgroup_free_data(inode, 0, PAGE_CACHE_SIZE);
+	btrfs_free_path(path);
+	btrfs_end_transaction(trans, root);
 	return ret;
 }
 
-static ssize_t read_multi_count_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
+struct async_extent {
+	u64 start;
+	u64 ram_size;
+	u64 compressed_size;
+	struct page **pages;
+	unsigned long nr_pages;
+	int compress_type;
+	struct list_head list;
+};
+
+struct async_cow {
+	struct inode *inode;
+	struct btrfs_root *root;
+	struct page *locked_page;
+	u64 start;
+	u64 end;
+	struct list_head extents;
+	struct btrfs_work work;
+};
+
+static noinline int add_async_extent(struct async_cow *cow,
+				     u64 start, u64 ram_size,
+				     u64 compressed_size,
+				     struct page **pages,
+				     unsigned long nr_pages,
+				     int compress_type)
 {
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
+	struct async_extent *async_extent;
 
-	input_info(true, &info->client->dev, "%s: %d\n", __func__, info->multi_count);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%d", info->multi_count);
+	async_extent = kmalloc(sizeof(*async_extent), GFP_NOFS);
+	BUG_ON(!async_extent); /* -ENOMEM */
+	async_extent->start = start;
+	async_extent->ram_size = ram_size;
+	async_extent->compressed_size = compressed_size;
+	async_extent->pages = pages;
+	async_extent->nr_pages = nr_pages;
+	async_extent->compress_type = compress_type;
+	list_add_tail(&async_extent->list, &cow->extents);
+	return 0;
 }
 
-static ssize_t clear_multi_count_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
+static inline int inode_need_compress(struct inode *inode)
 {
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
+	struct btrfs_root *root = BTRFS_I(inode)->root;
 
-	info->multi_count = 0;
-	input_info(true, &info->client->dev, "%s: clear\n", __func__);
-
-	return count;
+	/* force compress */
+	if (btrfs_test_opt(root, FORCE_COMPRESS))
+		return 1;
+	/* bad compression ratios */
+	if (BTRFS_I(inode)->flags & BTRFS_INODE_NOCOMPRESS)
+		return 0;
+	if (btrfs_test_opt(root, COMPRESS) ||
+	    BTRFS_I(inode)->flags & BTRFS_INODE_COMPRESS ||
+	    BTRFS_I(inode)->force_compress)
+		return 1;
+	return 0;
 }
 
-static ssize_t read_wet_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
+/*
+ * we create compressed extents in two phases.  The first
+ * phase compresses a range of pages that have already been
+ * locked (both pages and state bits are locked).
+ *
+ * This is done inside an ordered work queue, and the compression
+ * is spread across many cpus.  The actual IO submission is step
+ * two, and the ordered work queue takes care of making sure that
+ * happens in the same order things were put onto the queue by
+ * writepages and friends.
+ *
+ * If this code finds it can't get good compression, it puts an
+ * entry onto the work queue to write the uncompressed bytes.  This
+ * makes sure that both compressed inodes and uncompressed inodes
+ * are written in the same order that the flusher thread sent them
+ * down.
+ */
+static noinline void compress_file_range(struct inode *inode,
+					struct page *locked_page,
+					u64 start, u64 end,
+					struct async_cow *async_cow,
+					int *num_added)
 {
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	input_info(true, &info->client->dev, "%s: %d\n", __func__, info->wet_count);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%d", info->wet_count);
-}
-
-
-static ssize_t clear_wet_mode_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	info->wet_count = 0;
-	info->dive_count= 0;
-
-	input_info(true, &info->client->dev, "%s: clear\n", __func__);
-
-	return count;
-}
-
-static ssize_t read_comm_err_count_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	input_info(true, &info->client->dev, "%s: %d\n", __func__, info->comm_err_count);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%d", info->comm_err_count);
-}
-
-
-static ssize_t clear_comm_err_count_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	info->comm_err_count = 0;
-
-	input_info(true, &info->client->dev, "%s: clear\n", __func__);
-
-	return count;
-}
-
-static ssize_t read_module_id_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "ST%02X%04X%02X%c%01X",
-		info->panel_revision, info->fw_main_version_of_ic,
-			info->test_result.data[0],
-			info->tdata->tclm_string[info->tdata->nvdata.cal_position].s_name,
-			info->tdata->nvdata.cal_count & 0xF);
-}
-
-static ssize_t read_vendor_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	unsigned char buffer[10] = { 0 };
-
-	snprintf(buffer, 9, info->board->firmware_name + 8);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "STM_%s", buffer);
-}
-
-static ssize_t read_checksum_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	input_info(true, &info->client->dev, "%s: crc fail count in NV: %d\n", __func__, info->nv_crc_fail_count);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%d", info->nv_crc_fail_count);
-}
-
-
-static ssize_t clear_checksum_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-//	info->checksum_result = 0;
-
-	input_info(true, &info->client->dev, "%s:nothing\n", __func__);
-
-	return count;
-}
-
-static ssize_t clear_holding_time_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	info->time_longest = 0;
-
-	input_info(true, &info->client->dev, "%s: clear\n", __func__);
-
-	return count;
-}
-
-static ssize_t read_holding_time_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	input_info(true, &info->client->dev, "%s: %ld\n", __func__,
-		info->time_longest);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%ld", info->time_longest);
-}
-
-static ssize_t read_all_touch_count_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	input_info(true, &info->client->dev, "%s: touch:%d, force:%d, aod:%d, spay:%d\n", __func__,
-			info->all_finger_count, info->all_force_count,
-			info->all_aod_tap_count, info->all_spay_count);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE,
-			"\"TTCN\":\"%d\",\"TFCN\":\"%d\",\"TACN\":\"%d\",\"TSCN\":\"%d\"",
-			info->all_finger_count, info->all_force_count,
-			info->all_aod_tap_count, info->all_spay_count);
-}
-
-static ssize_t clear_all_touch_count_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	info->all_force_count = 0;
-	info->all_aod_tap_count = 0;
-	info->all_spay_count = 0;
-
-	input_info(true, &info->client->dev, "%s: clear\n", __func__);
-
-	return count;
-}
-
-static ssize_t read_z_value_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	input_info(true, &info->client->dev, "%s: max:%d, min:%d, sum:%d\n", __func__,
-			info->max_z_value, info->min_z_value,
-			info->sum_z_value);
-
-	if (info->all_finger_count > 0)
-		return snprintf(buf, SEC_CMD_BUF_SIZE,
-				"\"TMXZ\":\"%d\",\"TMNZ\":\"%d\",\"TAVZ\":\"%d\"",
-				info->max_z_value, info->min_z_value,
-				info->sum_z_value / info->all_finger_count);
-	else
-		return snprintf(buf, SEC_CMD_BUF_SIZE,
-				"\"TMXZ\":\"%d\",\"TMNZ\":\"%d\"",
-				info->max_z_value, info->min_z_value);
-
-}
-
-static ssize_t clear_z_value_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	info->max_z_value= 0;
-	info->min_z_value= 0xFFFFFFFF;
-	info->sum_z_value= 0;
-	info->all_finger_count = 0;
-
-	input_info(true, &info->client->dev, "%s: clear\n", __func__);
-
-	return count;
-}
-
-static ssize_t sensitivity_mode_store(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	unsigned char wbuf[3] = { 0 };
-	unsigned long value = 0;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	u64 num_bytes;
+	u64 blocksize = root->sectorsize;
+	u64 actual_end;
+	u64 isize = i_size_read(inode);
 	int ret = 0;
+	struct page **pages = NULL;
+	unsigned long nr_pages;
+	unsigned long nr_pages_ret = 0;
+	unsigned long total_compressed = 0;
+	unsigned long total_in = 0;
+	unsigned long max_compressed = 128 * 1024;
+	unsigned long max_uncompressed = 128 * 1024;
+	int i;
+	int will_compress;
+	int compress_type = root->fs_info->compress_type;
+	int redirty = 0;
 
-	if (count > 2)
-		return -EINVAL;
+	/* if this is a small write inside eof, kick off a defrag */
+	if ((end - start + 1) < 16 * 1024 &&
+	    (start > 0 || end + 1 < BTRFS_I(inode)->disk_i_size))
+		btrfs_add_inode_defrag(NULL, inode);
 
-	ret = kstrtoul(buf, 10, &value);
-	if (ret != 0)
-		return ret;
+	actual_end = min_t(u64, isize, end + 1);
+again:
+	will_compress = 0;
+	nr_pages = (end >> PAGE_CACHE_SHIFT) - (start >> PAGE_CACHE_SHIFT) + 1;
+	nr_pages = min(nr_pages, (128 * 1024UL) / PAGE_CACHE_SIZE);
 
-	if (info->fts_power_state == FTS_POWER_STATE_POWERDOWN) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n", __func__);
-		return -EPERM;
+	/*
+	 * we don't want to send crud past the end of i_size through
+	 * compression, that's just a waste of CPU time.  So, if the
+	 * end of the file is before the start of our current
+	 * requested range of bytes, we bail out to the uncompressed
+	 * cleanup code that can deal with all of this.
+	 *
+	 * It isn't really the fastest way to fix things, but this is a
+	 * very uncommon corner.
+	 */
+	if (actual_end <= start)
+		goto cleanup_and_bail_uncompressed;
+
+	total_compressed = actual_end - start;
+
+	/*
+	 * skip compression for a small file range(<=blocksize) that
+	 * isn't an inline extent, since it dosen't save disk space at all.
+	 */
+	if (total_compressed <= blocksize &&
+	   (start > 0 || end + 1 < BTRFS_I(inode)->disk_i_size))
+		goto cleanup_and_bail_uncompressed;
+
+	/* we want to make sure that amount of ram required to uncompress
+	 * an extent is reasonable, so we limit the total size in ram
+	 * of a compressed extent to 128k.  This is a crucial number
+	 * because it also controls how easily we can spread reads across
+	 * cpus for decompression.
+	 *
+	 * We also want to make sure the amount of IO required to do
+	 * a random read is reasonably small, so we limit the size of
+	 * a compressed extent to 128k.
+	 */
+	total_compressed = min(total_compressed, max_uncompressed);
+	num_bytes = ALIGN(end - start + 1, blocksize);
+	num_bytes = max(blocksize,  num_bytes);
+	total_in = 0;
+	ret = 0;
+
+	/*
+	 * we do compression for mount -o compress and when the
+	 * inode has not been flagged as nocompress.  This flag can
+	 * change at any time if we discover bad compression ratios.
+	 */
+	if (inode_need_compress(inode)) {
+		WARN_ON(pages);
+		pages = kcalloc(nr_pages, sizeof(struct page *), GFP_NOFS);
+		if (!pages) {
+			/* just bail out to the uncompressed code */
+			nr_pages = 0;
+			goto cont;
+		}
+
+		if (BTRFS_I(inode)->force_compress)
+			compress_type = BTRFS_I(inode)->force_compress;
+
+		/*
+		 * we need to call clear_page_dirty_for_io on each
+		 * page in the range.  Otherwise applications with the file
+		 * mmap'd can wander in and change the page contents while
+		 * we are compressing them.
+		 *
+		 * If the compression fails for any reason, we set the pages
+		 * dirty again later on.
+		 */
+		extent_range_clear_dirty_for_io(inode, start, end);
+		redirty = 1;
+		ret = btrfs_compress_pages(compress_type,
+					   inode->i_mapping, start,
+					   total_compressed, pages,
+					   nr_pages, &nr_pages_ret,
+					   &total_in,
+					   &total_compressed,
+					   max_compressed);
+
+		if (!ret) {
+			unsigned long offset = total_compressed &
+				(PAGE_CACHE_SIZE - 1);
+			struct page *page = pages[nr_pages_ret - 1];
+			char *kaddr;
+
+			/* zero the tail end of the last page, we might be
+			 * sending it down to disk
+			 */
+			if (offset) {
+				kaddr = kmap_atomic(page);
+				memset(kaddr + offset, 0,
+				       PAGE_CACHE_SIZE - offset);
+				kunmap_atomic(kaddr);
+			}
+			will_compress = 1;
+		}
+	}
+cont:
+	if (start == 0) {
+		/* lets try to make an inline extent */
+		if (ret || total_in < (actual_end - start)) {
+			/* we didn't compress the entire range, try
+			 * to make an uncompressed inline extent.
+			 */
+			ret = cow_file_range_inline(root, inode, start, end,
+						    0, 0, NULL);
+		} else {
+			/* try making a compressed inline extent */
+			ret = cow_file_range_inline(root, inode, start, end,
+						    total_compressed,
+						    compress_type, pages);
+		}
+		if (ret <= 0) {
+			unsigned long clear_flags = EXTENT_DELALLOC |
+				EXTENT_DEFRAG;
+			unsigned long page_error_op;
+
+			clear_flags |= (ret < 0) ? EXTENT_DO_ACCOUNTING : 0;
+			page_error_op = ret < 0 ? PAGE_SET_ERROR : 0;
+
+			/*
+			 * inline extent creation worked or returned error,
+			 * we don't need to create any more async work items.
+			 * Unlock and free up our temp pages.
+			 */
+			extent_clear_unlock_delalloc(inode, start, end, NULL,
+						     clear_flags, PAGE_UNLOCK |
+						     PAGE_CLEAR_DIRTY |
+						     PAGE_SET_WRITEBACK |
+						     page_error_op |
+						     PAGE_END_WRITEBACK);
+			goto free_pages_out;
+		}
 	}
 
-	wbuf[0] = 0xC7;
-	wbuf[1] = 0x03;
-	if (value)
-		wbuf[2] = 0x01; /* enable */
-	else
-		wbuf[2] = 0x00; /* disable */
+	if (will_compress) {
+		/*
+		 * we aren't doing an inline extent round the compressed size
+		 * up to a block size boundary so the allocator does sane
+		 * things
+		 */
+		total_compressed = ALIGN(total_compressed, blocksize);
 
-	ret = fts_write_reg(info, &wbuf[0], 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev,
-				"%s: write failed. ret: %d\n", __func__, ret);
-		return ret;
+		/*
+		 * one last check to make sure the compression is really a
+		 * win, compare the page count read with the blocks on disk
+		 */
+		total_in = ALIGN(total_in, PAGE_CACHE_SIZE);
+		if (total_compressed >= total_in) {
+			will_compress = 0;
+		} else {
+			num_bytes = total_in;
+		}
 	}
+	if (!will_compress && pages) {
+		/*
+		 * the compression code ran but failed to make things smaller,
+		 * free any pages it allocated and our page pointer array
+		 */
+		for (i = 0; i < nr_pages_ret; i++) {
+			WARN_ON(pages[i]->mapping);
+			page_cache_release(pages[i]);
+		}
+		kfree(pages);
+		pages = NULL;
+		total_compressed = 0;
+		nr_pages_ret = 0;
 
-	fts_delay(30);
-
-	input_info(true, &info->client->dev, "%s: %d\n", __func__, value);
-	return count;
-}
-
-static ssize_t sensitivity_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	u8 rbuf[11] = { 0 };
-	u8 reg_read[3] = { 0xD0, 0x00, 0x9E };
-	int ret, i;
-	s16 value[5];
-
-	if (info->fts_power_state == FTS_POWER_STATE_POWERDOWN) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n", __func__);
-		return -EPERM;
+		/* flag the file so we don't compress in the future */
+		if (!btrfs_test_opt(root, FORCE_COMPRESS) &&
+		    !(BTRFS_I(inode)->force_compress)) {
+			BTRFS_I(inode)->flags |= BTRFS_INODE_NOCOMPRESS;
+		}
 	}
+	if (will_compress) {
+		*num_added += 1;
 
-	ret = info->fts_read_reg(info, &reg_read[0], 3, &rbuf[0], 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: read failed ret = %d\n", __func__, ret);
-		return ret;
-	}
-	
-	reg_read[1] = rbuf[2];
-	reg_read[2] = rbuf[1];
-	ret = info->fts_read_reg(info, &reg_read[0], 3, &rbuf[0], 11);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: read failed ret = %d\n", __func__, ret);
-		return ret;
-	}
+		/* the async work queues will take care of doing actual
+		 * allocation on disk for these compressed pages,
+		 * and will submit them to the elevator.
+		 */
+		add_async_extent(async_cow, start, num_bytes,
+				 total_compressed, pages, nr_pages_ret,
+				 compress_type);
 
-	for (i = 0; i < 5; i++)
-		value[i] = rbuf[i * 2 + 1] + (rbuf[i * 2 + 2] << 8);
-
-	input_info(true, &info->client->dev, "%s: %d,%d,%d,%d,%d\n", __func__,
-			value[0], value[1], value[2], value[3], value[4]);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%d,%d,%d,%d,%d",
-			value[0], value[1], value[2], value[3], value[4]);
-}
-
-static ssize_t pressure_enable_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[256] = { 0 };
-
-	if (info->lowpower_flag & FTS_MODE_PRESSURE)
-		snprintf(buff, sizeof(buff), "1");
-	else
-		snprintf(buff, sizeof(buff), "0");
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%s\n", buff);
-}
-
-static ssize_t pressure_enable_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	int ret;
-	unsigned long value = 0;
-#ifdef FTS_SUPPORT_STRINGLIB
-	unsigned short addr = FTS_CMD_STRING_ACCESS;
-#endif
-
-	if (count > 2)
-		return -EINVAL;
-
-	ret = kstrtoul(buf, 10, &value);
-	if (ret != 0)
-		return ret;
-
-	if (value == 1) {
-		info->lowpower_flag |= FTS_MODE_PRESSURE;
+		if (start + num_bytes < end) {
+			start += num_bytes;
+			pages = NULL;
+			cond_resched();
+			goto again;
+		}
 	} else {
-		info->lowpower_flag &= ~FTS_MODE_PRESSURE;
-	}
-
-#ifdef FTS_SUPPORT_STRINGLIB
-	ret = info->fts_write_to_string(info, &addr, &info->lowpower_flag, sizeof(info->lowpower_flag));
-	if (ret < 0)
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-#endif
-
-	input_info(true, &info->client->dev, "%s: %d\n", __func__, value);
-	return count;
-}
-
-static DEVICE_ATTR(ito_check, S_IRUGO, read_ito_check_show, NULL);
-static DEVICE_ATTR(raw_check, S_IRUGO, read_raw_check_show, NULL);
-static DEVICE_ATTR(multi_count, S_IRUGO | S_IWUSR | S_IWGRP, read_multi_count_show, clear_multi_count_store);
-static DEVICE_ATTR(wet_mode, S_IRUGO | S_IWUSR | S_IWGRP, read_wet_mode_show, clear_wet_mode_store);
-static DEVICE_ATTR(comm_err_count, S_IRUGO | S_IWUSR | S_IWGRP, read_comm_err_count_show, clear_comm_err_count_store);
-static DEVICE_ATTR(module_id, S_IRUGO, read_module_id_show, NULL);
-static DEVICE_ATTR(vendor, S_IRUGO, read_vendor_show, NULL);
-static DEVICE_ATTR(checksum, S_IRUGO | S_IWUSR | S_IWGRP, read_checksum_show, clear_checksum_store);
-static DEVICE_ATTR(holding_time, S_IRUGO | S_IWUSR | S_IWGRP, read_holding_time_show, clear_holding_time_store);
-static DEVICE_ATTR(all_touch_count, S_IRUGO | S_IWUSR | S_IWGRP, read_all_touch_count_show, clear_all_touch_count_store);
-static DEVICE_ATTR(z_value, S_IRUGO | S_IWUSR | S_IWGRP, read_z_value_show, clear_z_value_store);
-static DEVICE_ATTR(sensitivity_mode, S_IRUGO | S_IWUSR | S_IWGRP, sensitivity_mode_show, sensitivity_mode_store);
-static DEVICE_ATTR(scrub_pos, S_IRUGO, fts_scrub_position, NULL);
-static DEVICE_ATTR(pressure_enable, S_IRUGO | S_IWUSR | S_IWGRP, pressure_enable_show, pressure_enable_store);
-
-static struct attribute *sec_touch_facotry_attributes[] = {
-	&dev_attr_scrub_pos.attr,
-	&dev_attr_ito_check.attr,
-	&dev_attr_raw_check.attr,
-	&dev_attr_multi_count.attr,
-	&dev_attr_wet_mode.attr,
-	&dev_attr_comm_err_count.attr,
-	&dev_attr_module_id.attr,
-	&dev_attr_vendor.attr,
-	&dev_attr_checksum.attr,
-	&dev_attr_holding_time.attr,
-	&dev_attr_all_touch_count.attr,
-	&dev_attr_z_value.attr,
-	&dev_attr_sensitivity_mode.attr,
-	&dev_attr_pressure_enable.attr,
-	NULL,
-};
-
-static struct attribute_group sec_touch_factory_attr_group = {
-	.attrs = sec_touch_facotry_attributes,
-};
-
-static int fts_check_index(struct fts_ts_info *info)
-{
-	struct sec_cmd_data *sec = &info->sec;
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	int node;
-
-	if (sec->cmd_param[0] < 0
-		|| sec->cmd_param[0] >= info->SenseChannelLength
-		|| sec->cmd_param[1] < 0
-		|| sec->cmd_param[1] >= info->ForceChannelLength) {
-
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		input_err(true, &info->client->dev, "%s: parameter error: %u,%u\n",
-			   __func__, sec->cmd_param[0], sec->cmd_param[1]);
-		node = -1;
-		return node;
-	}
-	node = sec->cmd_param[1] * info->SenseChannelLength + sec->cmd_param[0];
-	/* input_info(true, &info->client->dev, "%s: node = %d\n", __func__, node); */
-	return node;
-}
-
-static ssize_t fts_scrub_position(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct sec_cmd_data *sec = dev_get_drvdata(dev);
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	input_info(true, &info->client->dev, "%s: %d %d %d\n",
-				__func__, info->scrub_id, info->scrub_x, info->scrub_y);
-	snprintf(buff, sizeof(buff), "%d %d %d", info->scrub_id, info->scrub_x, info->scrub_y);
-
-	info->scrub_x = 0;
-	info->scrub_y = 0;
-
-	return snprintf(buf, SEC_CMD_BUF_SIZE, "%s\n", buff);
-}
-
-#if 0 //def CONFIG_TRUSTONIC_TRUSTED_UI
-static void tui_mode_cmd(struct fts_ts_info *info)
-{
-	struct sec_cmd_data *sec = &info->sec;
-	char buff[16] = "TUImode:FAIL";
-
-	sec_cmd_set_default_result(sec);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-	sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-#endif
-
-static void not_support_cmd(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-	snprintf(buff, sizeof(buff), "%s", "NA");
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void fw_update(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[64] = { 0 };
-	int retval = 0;
-
-	sec_cmd_set_default_result(sec);
-#if defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-	if (sec->cmd_param[0] == 1) {
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-		input_info(true, &info->client->dev, "%s: user_ship, success [%d]\n", __func__, retval);
-		return;
-	}
-#endif
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	retval = fts_fw_update_on_hidden_menu(info, sec->cmd_param[0]);
-
-	if (retval < 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		input_err(true, &info->client->dev, "%s: failed [%d]\n", __func__, retval);
-	} else {
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-		input_info(true, &info->client->dev, "%s: success [%d]\n", __func__, retval);
+cleanup_and_bail_uncompressed:
+		/*
+		 * No compression, but we still need to write the pages in
+		 * the file we've been given so far.  redirty the locked
+		 * page if it corresponds to our extent and set things up
+		 * for the async work queue to run cow_file_range to do
+		 * the normal delalloc dance
+		 */
+		if (page_offset(locked_page) >= start &&
+		    page_offset(locked_page) <= end) {
+			__set_page_dirty_nobuffers(locked_page);
+			/* unlocked later on in the async handlers */
+		}
+		if (redirty)
+			extent_range_redirty_for_io(inode, start, end);
+		add_async_extent(async_cow, start, end - start + 1,
+				 0, NULL, 0, BTRFS_COMPRESS_NONE);
+		*num_added += 1;
 	}
 
 	return;
+
+free_pages_out:
+	for (i = 0; i < nr_pages_ret; i++) {
+		WARN_ON(pages[i]->mapping);
+		page_cache_release(pages[i]);
+	}
+	kfree(pages);
 }
 
-static int fts_get_channel_info(struct fts_ts_info *info)   // Need to change function for sysinfo
+static void free_async_extent_pages(struct async_extent *async_extent)
 {
-	int rc = -1;
-	unsigned char data[FTS_EVENT_SIZE] = { 0 };
+	int i;
 
-	memset(data, 0x0, FTS_EVENT_SIZE);
-
-	fts_interrupt_set(info, INT_DISABLE);
-	fts_command(info, FLUSHBUFFER);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	// Read Sense Channel
-	rc = info->fts_get_sysinfo_data(info, FTS_SI_SENSE_CH_LENGTH, 3, data);
-	if (rc <= 0) {
-		info->SenseChannelLength = 0;
-		input_err(true, info->dev, "%s: Get channel info Read Fail!! [Data : %2X]\n", __func__, data[0]);
-		return rc;
-	}
-	info->SenseChannelLength = data[0];
-
-	// Read Force Channel
-	rc = info->fts_get_sysinfo_data(info, FTS_SI_FORCE_CH_LENGTH, 3, data);
-	if (rc <= 0) {
-		info->ForceChannelLength = 0;
-		input_err(true, info->dev, "%s: Get channel info Read Fail!! [Data : %2X]\n", __func__, data[0]);
-		return rc;
-	}
-	info->ForceChannelLength = data[0];
-
-	fts_interrupt_set(info, INT_ENABLE);
-
-	return rc;
-}
-
-void fts_print_frame(struct fts_ts_info *info, short *min, short *max)
-{
-	int i = 0;
-	int j = 0;
-	unsigned char *pStr = NULL;
-	unsigned char pTmp[16] = { 0 };
-
-	pStr = kzalloc(6 * (info->SenseChannelLength + 1), GFP_KERNEL);
-	if (pStr == NULL) {
-		input_err(true, &info->client->dev, "%s: pStr kzalloc failed\n", __func__);
+	if (!async_extent->pages)
 		return;
+
+	for (i = 0; i < async_extent->nr_pages; i++) {
+		WARN_ON(async_extent->pages[i]->mapping);
+		page_cache_release(async_extent->pages[i]);
 	}
-
-	snprintf(pTmp, 4, "    ");
-	strncat(pStr, pTmp, 4);
-
-
-	for (i = 0; i < info->SenseChannelLength; i++) {
-		snprintf(pTmp, 6, "Rx%02d  ", i);
-		strncat(pStr, pTmp, 6);
-	}
-
-	input_raw_info(true, &info->client->dev, "%s\n", pStr);
-
-	memset(pStr, 0x0, 6 * (info->SenseChannelLength + 1));
-	snprintf(pTmp, 2, " +");
-	strncat(pStr, pTmp, 2);
-
-	for (i = 0; i < info->SenseChannelLength; i++) {
-		snprintf(pTmp, 6, "------");
-		strncat(pStr, pTmp, 6);
-
-	}
-
-	input_raw_info(true, &info->client->dev, "%s\n", pStr);
-
-	for (i = 0; i < info->ForceChannelLength; i++) {
-		memset(pStr, 0x0, 6 * (info->SenseChannelLength + 1));
-		snprintf(pTmp, 7, "Tx%02d | ", i);
-		strncat(pStr, pTmp, 7);
-
-
-		for (j = 0; j < info->SenseChannelLength; j++) {
-			snprintf(pTmp, 6, "%5d ", info->pFrame[(i * info->SenseChannelLength) + j]);
-
-			if (i > 0) {
-				if (info->pFrame[(i * info->SenseChannelLength) + j] < *min)
-					*min = info->pFrame[(i * info->SenseChannelLength) + j];
-
-				if (info->pFrame[(i * info->SenseChannelLength) + j] > *max)
-					*max = info->pFrame[(i * info->SenseChannelLength) + j];
-			}
-			strncat(pStr, pTmp, 6);
-		}
-		input_raw_info(true, &info->client->dev, "%s\n", pStr);
-	}
-
-	kfree(pStr);
+	kfree(async_extent->pages);
+	async_extent->nr_pages = 0;
+	async_extent->pages = NULL;
 }
 
-int fts_read_frame(struct fts_ts_info *info, unsigned char type, short *min,
-		 short *max)
+/*
+ * phase two of compressed writeback.  This is the ordered portion
+ * of the code, which only gets called in the order the work was
+ * queued.  We walk all the async extents created by compress_file_range
+ * and send them down to the disk.
+ */
+static noinline void submit_compressed_extents(struct inode *inode,
+					      struct async_cow *async_cow)
 {
-	unsigned char pFrameAddress[8] =
-	{ 0xD0, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00 };
-	unsigned int FrameAddress = 0;
-	unsigned int writeAddr = 0;
-	unsigned int start_addr = 0;
-	unsigned int end_addr = 0;
-	unsigned int totalbytes = 0;
-	unsigned int remained = 0;
-	unsigned int readbytes = 0xFF;
-	unsigned int dataposition = 0;
-	unsigned char *pRead = NULL;
-	int rc = 0;
+	struct async_extent *async_extent;
+	u64 alloc_hint = 0;
+	struct btrfs_key ins;
+	struct extent_map *em;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct extent_map_tree *em_tree = &BTRFS_I(inode)->extent_tree;
+	struct extent_io_tree *io_tree;
 	int ret = 0;
-	int i = 0;
 
-	pRead = kzalloc(BUFFER_MAX, GFP_KERNEL);
-	if (pRead == NULL) {
-		input_err(true, &info->client->dev, "%s: pRead kzalloc failed\n", __func__);
-		rc = 1;
-		goto ErrorExit;
-	}
+again:
+	while (!list_empty(&async_cow->extents)) {
+		async_extent = list_entry(async_cow->extents.next,
+					  struct async_extent, list);
+		list_del(&async_extent->list);
 
-	pFrameAddress[2] = type;
-	totalbytes = info->SenseChannelLength * info->ForceChannelLength * 2;
-	ret = fts_read_reg(info, &pFrameAddress[0], 3, pRead, pFrameAddress[3]);
+		io_tree = &BTRFS_I(inode)->io_tree;
 
-	if (ret >= 0) {
-		FrameAddress = pRead[1] + (pRead[2] << 8);
+retry:
+		/* did the compression code fall back to uncompressed IO? */
+		if (!async_extent->pages) {
+			int page_started = 0;
+			unsigned long nr_written = 0;
 
-		start_addr = FrameAddress+info->SenseChannelLength * 2;
-		end_addr = start_addr + totalbytes;
-	} else {
-		input_err(true, &info->client->dev, "%s: read failed rc = %d\n", __func__, ret);
-		rc = 2;
-		goto ErrorExit;
-	}
+			lock_extent(io_tree, async_extent->start,
+					 async_extent->start +
+					 async_extent->ram_size - 1);
 
-#ifdef DEBUG_MSG
-	input_info(true, &info->client->dev, "%s: FrameAddress = %X\n", __func__, FrameAddress);
-	input_info(true, &info->client->dev, "%s: start_addr = %X, end_addr = %X\n", __func__, start_addr, end_addr);
-#endif
+			/* allocate blocks */
+			ret = cow_file_range(inode, async_cow->locked_page,
+					     async_extent->start,
+					     async_extent->start +
+					     async_extent->ram_size - 1,
+					     &page_started, &nr_written, 0);
 
-	remained = totalbytes;
-	for (writeAddr = start_addr; writeAddr < end_addr; writeAddr += READ_CHUNK_SIZE) {
-		pFrameAddress[1] = (writeAddr >> 8) & 0xFF;
-		pFrameAddress[2] = writeAddr & 0xFF;
+			/* JDM XXX */
 
-		if (remained >= READ_CHUNK_SIZE)
-			readbytes = READ_CHUNK_SIZE;
-		else
-			readbytes = remained;
-
-		memset(pRead, 0x0, readbytes);
-
-#ifdef DEBUG_MSG
-		input_info(true, &info->client->dev, "%s: %02X%02X%02X readbytes=%d\n", __func__,
-			   pFrameAddress[0], pFrameAddress[1],
-			   pFrameAddress[2], readbytes);
-
-#endif
-
-		fts_read_reg(info, &pFrameAddress[0], 3, pRead, readbytes + 1);
-		remained -= readbytes;
-
-		for (i = 1; i < (readbytes+1); i += 2) {
-			info->pFrame[dataposition++] =
-			pRead[i] + (pRead[i + 1] << 8);
+			/*
+			 * if page_started, cow_file_range inserted an
+			 * inline extent and took care of all the unlocking
+			 * and IO for us.  Otherwise, we need to submit
+			 * all those pages down to the drive.
+			 */
+			if (!page_started && !ret)
+				extent_write_locked_range(io_tree,
+						  inode, async_extent->start,
+						  async_extent->start +
+						  async_extent->ram_size - 1,
+						  btrfs_get_extent,
+						  WB_SYNC_ALL);
+			else if (ret)
+				unlock_page(async_cow->locked_page);
+			kfree(async_extent);
+			cond_resched();
+			continue;
 		}
 
+		lock_extent(io_tree, async_extent->start,
+			    async_extent->start + async_extent->ram_size - 1);
+
+		ret = btrfs_reserve_extent(root,
+					   async_extent->compressed_size,
+					   async_extent->compressed_size,
+					   0, alloc_hint, &ins, 1, 1);
+		if (ret) {
+			free_async_extent_pages(async_extent);
+
+			if (ret == -ENOSPC) {
+				unlock_extent(io_tree, async_extent->start,
+					      async_extent->start +
+					      async_extent->ram_size - 1);
+
+				/*
+				 * we need to redirty the pages if we decide to
+				 * fallback to uncompressed IO, otherwise we
+				 * will not submit these pages down to lower
+				 * layers.
+				 */
+				extent_range_redirty_for_io(inode,
+						async_extent->start,
+						async_extent->start +
+						async_extent->ram_size - 1);
+
+				goto retry;
+			}
+			goto out_free;
+		}
+		/*
+		 * here we're doing allocation and writeback of the
+		 * compressed pages
+		 */
+		btrfs_drop_extent_cache(inode, async_extent->start,
+					async_extent->start +
+					async_extent->ram_size - 1, 0);
+
+		em = alloc_extent_map();
+		if (!em) {
+			ret = -ENOMEM;
+			goto out_free_reserve;
+		}
+		em->start = async_extent->start;
+		em->len = async_extent->ram_size;
+		em->orig_start = em->start;
+		em->mod_start = em->start;
+		em->mod_len = em->len;
+
+		em->block_start = ins.objectid;
+		em->block_len = ins.offset;
+		em->orig_block_len = ins.offset;
+		em->ram_bytes = async_extent->ram_size;
+		em->bdev = root->fs_info->fs_devices->latest_bdev;
+		em->compress_type = async_extent->compress_type;
+		set_bit(EXTENT_FLAG_PINNED, &em->flags);
+		set_bit(EXTENT_FLAG_COMPRESSED, &em->flags);
+		em->generation = -1;
+
+		while (1) {
+			write_lock(&em_tree->lock);
+			ret = add_extent_mapping(em_tree, em, 1);
+			write_unlock(&em_tree->lock);
+			if (ret != -EEXIST) {
+				free_extent_map(em);
+				break;
+			}
+			btrfs_drop_extent_cache(inode, async_extent->start,
+						async_extent->start +
+						async_extent->ram_size - 1, 0);
+		}
+
+		if (ret)
+			goto out_free_reserve;
+
+		ret = btrfs_add_ordered_extent_compress(inode,
+						async_extent->start,
+						ins.objectid,
+						async_extent->ram_size,
+						ins.offset,
+						BTRFS_ORDERED_COMPRESSED,
+						async_extent->compress_type);
+		if (ret) {
+			btrfs_drop_extent_cache(inode, async_extent->start,
+						async_extent->start +
+						async_extent->ram_size - 1, 0);
+			goto out_free_reserve;
+		}
+
+		/*
+		 * clear dirty, set writeback and unlock the pages.
+		 */
+		extent_clear_unlock_delalloc(inode, async_extent->start,
+				async_extent->start +
+				async_extent->ram_size - 1,
+				NULL, EXTENT_LOCKED | EXTENT_DELALLOC,
+				PAGE_UNLOCK | PAGE_CLEAR_DIRTY |
+				PAGE_SET_WRITEBACK);
+		ret = btrfs_submit_compressed_write(inode,
+				    async_extent->start,
+				    async_extent->ram_size,
+				    ins.objectid,
+				    ins.offset, async_extent->pages,
+				    async_extent->nr_pages);
+		if (ret) {
+			struct extent_io_tree *tree = &BTRFS_I(inode)->io_tree;
+			struct page *p = async_extent->pages[0];
+			const u64 start = async_extent->start;
+			const u64 end = start + async_extent->ram_size - 1;
+
+			p->mapping = inode->i_mapping;
+			tree->ops->writepage_end_io_hook(p, start, end,
+							 NULL, 0);
+			p->mapping = NULL;
+			extent_clear_unlock_delalloc(inode, start, end, NULL, 0,
+						     PAGE_END_WRITEBACK |
+						     PAGE_SET_ERROR);
+			free_async_extent_pages(async_extent);
+		}
+		alloc_hint = ins.objectid + ins.offset;
+		kfree(async_extent);
+		cond_resched();
 	}
-	kfree(pRead);
-
-#ifdef DEBUG_MSG
-	input_info(true, &info->client->dev,
-		   "%s: writeAddr = %X, start_addr = %X, end_addr = %X\n", __func__,
-		   writeAddr, start_addr, end_addr);
-#endif
-
-	switch (type) {
-	case TYPE_RAW_DATA:
-		input_raw_info(true, &info->client->dev, "%s: [Raw Data : 0x%X%X]\n", __func__, pFrameAddress[0],
-			FrameAddress);
-		break;
-	case TYPE_FILTERED_DATA:
-		input_raw_info(true, &info->client->dev, "%s: [Filtered Data : 0x%X%X]\n", __func__,
-			pFrameAddress[0], FrameAddress);
-		break;
-	case TYPE_STRENGTH_DATA:
-		input_raw_info(true, &info->client->dev, "%s: [Strength Data : 0x%X%X]\n", __func__,
-			pFrameAddress[0], FrameAddress);
-		break;
-	case TYPE_BASELINE_DATA:
-		input_raw_info(true, &info->client->dev, "%s: [Baseline Data : 0x%X%X]\n", __func__,
-			pFrameAddress[0], FrameAddress);
-		break;
-	}
-	fts_print_frame(info, min, max);
-
-ErrorExit:
-	return rc;
+	return;
+out_free_reserve:
+	btrfs_free_reserved_extent(root, ins.objectid, ins.offset, 1);
+out_free:
+	extent_clear_unlock_delalloc(inode, async_extent->start,
+				     async_extent->start +
+				     async_extent->ram_size - 1,
+				     NULL, EXTENT_LOCKED | EXTENT_DELALLOC |
+				     EXTENT_DEFRAG | EXTENT_DO_ACCOUNTING,
+				     PAGE_UNLOCK | PAGE_CLEAR_DIRTY |
+				     PAGE_SET_WRITEBACK | PAGE_END_WRITEBACK |
+				     PAGE_SET_ERROR);
+	free_async_extent_pages(async_extent);
+	kfree(async_extent);
+	goto again;
 }
 
-void fts_get_sec_ito_test_result(struct fts_ts_info *info)
+static u64 get_extent_allocation_hint(struct inode *inode, u64 start,
+				      u64 num_bytes)
 {
-	struct sec_cmd_data *sec = &info->sec;
-	struct fts_sec_panel_test_result result[10];
-	u8 regAdd[3] = { 0 };
-	u8 regAddData[3] = { 0 };
-	u8 data[sizeof(struct fts_sec_panel_test_result) * 10 + 3] = { 0 };
-	int ret, i, max_count = 0;
-	u8 length = sizeof(data);
-	u8 buff[100] = { 0 };
-	u8 pos_buf[6] = { 0 };
-	u8 doffset = 1;
+	struct extent_map_tree *em_tree = &BTRFS_I(inode)->extent_tree;
+	struct extent_map *em;
+	u64 alloc_hint = 0;
 
-	regAdd[0] = 0xB8;
-	regAdd[1] = 0x00;
-	regAdd[2] = 0x20;
-	ret = info->fts_write_reg(info, regAdd, 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed to write request cmd, %d\n", __func__, ret);
-		goto done;
+	read_lock(&em_tree->lock);
+	em = search_extent_mapping(em_tree, start, num_bytes);
+	if (em) {
+		/*
+		 * if block start isn't an actual block number then find the
+		 * first block in this inode and use that as a hint.  If that
+		 * block is also bogus then just don't worry about it.
+		 */
+		if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+			free_extent_map(em);
+			em = search_extent_mapping(em_tree, 0, 0);
+			if (em && em->block_start < EXTENT_MAP_LAST_BYTE)
+				alloc_hint = em->block_start;
+			if (em)
+				free_extent_map(em);
+		} else {
+			alloc_hint = em->block_start;
+			free_extent_map(em);
+		}
 	}
-	fts_delay(10);
+	read_unlock(&em_tree->lock);
 
-	regAdd[0] = 0xD0;
-	regAdd[1] = 0x00;
-	regAdd[2] = 0x50;
-	ret = info->fts_read_reg(info, regAdd, 3, regAddData, 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed to read data, %d\n", __func__, ret);
-		goto done;
+	return alloc_hint;
+}
+
+/*
+ * when extent_io.c finds a delayed allocation range in the file,
+ * the call backs end up in this code.  The basic idea is to
+ * allocate extents on disk for the range, and create ordered data structs
+ * in ram to track those extents.
+ *
+ * locked_page is the page that writepage had locked already.  We use
+ * it to make sure we don't do extra locks or unlocks.
+ *
+ * *page_started is set to one if we unlock locked_page and do everything
+ * required to start IO on it.  It may be clean and already done with
+ * IO when we return.
+ */
+static noinline int cow_file_range(struct inode *inode,
+				   struct page *locked_page,
+				   u64 start, u64 end, int *page_started,
+				   unsigned long *nr_written,
+				   int unlock)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	u64 alloc_hint = 0;
+	u64 num_bytes;
+	unsigned long ram_size;
+	u64 min_alloc_size;
+	u64 cur_alloc_size;
+	u64 blocksize = root->sectorsize;
+	struct btrfs_key ins;
+	struct extent_map *em;
+	struct extent_map_tree *em_tree = &BTRFS_I(inode)->extent_tree;
+	int ret = 0;
+
+	if (btrfs_is_free_space_inode(inode)) {
+		WARN_ON_ONCE(1);
+		ret = -EINVAL;
+		goto out_unlock;
 	}
 
-	regAdd[1] = regAddData[2];
-	regAdd[2] = regAddData[1];
-	ret = info->fts_read_reg(info, regAdd, 3, data, length);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed to read data, %d\n", __func__, ret);
-		goto done;
+	num_bytes = ALIGN(end - start + 1, blocksize);
+	num_bytes = max(blocksize,  num_bytes);
+
+	/* if this is a small write inside eof, kick off defrag */
+	if (num_bytes < 64 * 1024 &&
+	    (start > 0 || end + 1 < BTRFS_I(inode)->disk_i_size))
+		btrfs_add_inode_defrag(NULL, inode);
+
+	if (start == 0) {
+		/* lets try to make an inline extent */
+		ret = cow_file_range_inline(root, inode, start, end, 0, 0,
+					    NULL);
+		if (ret == 0) {
+			extent_clear_unlock_delalloc(inode, start, end, NULL,
+				     EXTENT_LOCKED | EXTENT_DELALLOC |
+				     EXTENT_DEFRAG, PAGE_UNLOCK |
+				     PAGE_CLEAR_DIRTY | PAGE_SET_WRITEBACK |
+				     PAGE_END_WRITEBACK);
+
+			*nr_written = *nr_written +
+			     (end - start + PAGE_CACHE_SIZE) / PAGE_CACHE_SIZE;
+			*page_started = 1;
+			goto out;
+		} else if (ret < 0) {
+			goto out_unlock;
+		}
 	}
-	memcpy(result, &data[2 + doffset], length - (2 + doffset));
-	memset(info->ito_result, 0x00, FTS_ITO_RESULT_PRINT_SIZE);
 
-	snprintf(buff, sizeof(buff), "%s: test count - sub:%d, main:%d\n", __func__, data[0 + doffset], data[1 + doffset]);
-	input_info(true, &info->client->dev, "%s", buff);
-	strncat(info->ito_result, buff, sizeof(buff));
+	BUG_ON(num_bytes > btrfs_super_total_bytes(root->fs_info->super_copy));
 
-	snprintf(buff, sizeof(buff), "ITO:              /   TX_GAP_MAX   /   RX_GAP_MAX\n");
-	input_info(true, &info->client->dev, "%s", buff);
-	strncat(info->ito_result, buff, sizeof(buff));
+	alloc_hint = get_extent_allocation_hint(inode, start, num_bytes);
+	btrfs_drop_extent_cache(inode, start, start + num_bytes - 1, 0);
 
-	for (i = 0; i < 10; i++) {
-		switch (result[i].flag) {
-		case OFFSET_FAC_SUB:
-			snprintf(pos_buf, sizeof(pos_buf), "SUB ");
-			break;
-		case OFFSET_FAC_MAIN:
-			snprintf(pos_buf, sizeof(pos_buf), "MAIN");
-			break;
-		case OFFSET_FAC_NOSAVE:
-		default:
-			snprintf(pos_buf, sizeof(pos_buf), "NONE");
-			break;
+	/*
+	 * Relocation relies on the relocated extents to have exactly the same
+	 * size as the original extents. Normally writeback for relocation data
+	 * extents follows a NOCOW path because relocation preallocates the
+	 * extents. However, due to an operation such as scrub turning a block
+	 * group to RO mode, it may fallback to COW mode, so we must make sure
+	 * an extent allocated during COW has exactly the requested size and can
+	 * not be split into smaller extents, otherwise relocation breaks and
+	 * fails during the stage where it updates the bytenr of file extent
+	 * items.
+	 */
+	if (root->root_key.objectid == BTRFS_DATA_RELOC_TREE_OBJECTID)
+		min_alloc_size = num_bytes;
+	else
+		min_alloc_size = root->sectorsize;
+
+	while (num_bytes > 0) {
+		unsigned long op;
+
+		cur_alloc_size = num_bytes;
+		ret = btrfs_reserve_extent(root, cur_alloc_size,
+					   min_alloc_size, 0, alloc_hint,
+					   &ins, 1, 1);
+		if (ret < 0)
+			goto out_unlock;
+
+		em = alloc_extent_map();
+		if (!em) {
+			ret = -ENOMEM;
+			goto out_reserve;
+		}
+		em->start = start;
+		em->orig_start = em->start;
+		ram_size = ins.offset;
+		em->len = ins.offset;
+		em->mod_start = em->start;
+		em->mod_len = em->len;
+
+		em->block_start = ins.objectid;
+		em->block_len = ins.offset;
+		em->orig_block_len = ins.offset;
+		em->ram_bytes = ram_size;
+		em->bdev = root->fs_info->fs_devices->latest_bdev;
+		set_bit(EXTENT_FLAG_PINNED, &em->flags);
+		em->generation = -1;
+
+		while (1) {
+			write_lock(&em_tree->lock);
+			ret = add_extent_mapping(em_tree, em, 1);
+			write_unlock(&em_tree->lock);
+			if (ret != -EEXIST) {
+				free_extent_map(em);
+				break;
+			}
+			btrfs_drop_extent_cache(inode, start,
+						start + ram_size - 1, 0);
+		}
+		if (ret)
+			goto out_reserve;
+
+		cur_alloc_size = ins.offset;
+		ret = btrfs_add_ordered_extent(inode, start, ins.objectid,
+					       ram_size, cur_alloc_size, 0);
+		if (ret)
+			goto out_drop_extent_cache;
+
+		if (root->root_key.objectid ==
+		    BTRFS_DATA_RELOC_TREE_OBJECTID) {
+			ret = btrfs_reloc_clone_csums(inode, start,
+						      cur_alloc_size);
+			if (ret)
+				goto out_drop_extent_cache;
 		}
 
-		snprintf(buff, sizeof(buff), "ITO: [%3d] %d-%s / Tx%02d,Rx%02d: %3d / Tx%02d,Rx%02d: %3d\n",
-				result[i].num_of_test, result[i].flag, pos_buf,
-				result[i].tx_of_txmax_gap, result[i].rx_of_txmax_gap,
-				result[i].max_of_tx_gap,
-				result[i].tx_of_rxmax_gap, result[i].rx_of_rxmax_gap,
-				result[i].max_of_rx_gap);
-		input_info(true, &info->client->dev, "%s", buff);
-		strncat(info->ito_result, buff, sizeof(buff));
+		if (num_bytes < cur_alloc_size)
+			break;
 
-		/* when count is over 200, it restart from 1 */
-		if (result[i].num_of_test > result[max_count].num_of_test + 100)
-			continue;
-		if (result[i].num_of_test > result[max_count].num_of_test)
-			max_count = i;
-		if (result[i].num_of_test == 1 && result[max_count].num_of_test == 200)
-			max_count = i;
+		/* we're not doing compressed IO, don't unlock the first
+		 * page (which the caller expects to stay locked), don't
+		 * clear any dirty bits and don't set any writeback bits
+		 *
+		 * Do set the Private2 bit so we know this page was properly
+		 * setup for writepage
+		 */
+		op = unlock ? PAGE_UNLOCK : 0;
+		op |= PAGE_SET_PRIVATE2;
+
+		extent_clear_unlock_delalloc(inode, start,
+					     start + ram_size - 1, locked_page,
+					     EXTENT_LOCKED | EXTENT_DELALLOC,
+					     op);
+		if (num_bytes < cur_alloc_size)
+			num_bytes = 0;
+		else
+			num_bytes -= cur_alloc_size;
+		alloc_hint = ins.objectid + ins.offset;
+		start += cur_alloc_size;
+	}
+out:
+	return ret;
+
+out_drop_extent_cache:
+	btrfs_drop_extent_cache(inode, start, start + ram_size - 1, 0);
+out_reserve:
+	btrfs_free_reserved_extent(root, ins.objectid, ins.offset, 1);
+out_unlock:
+	extent_clear_unlock_delalloc(inode, start, end, locked_page,
+				     EXTENT_LOCKED | EXTENT_DO_ACCOUNTING |
+				     EXTENT_DELALLOC | EXTENT_DEFRAG,
+				     PAGE_UNLOCK | PAGE_CLEAR_DIRTY |
+				     PAGE_SET_WRITEBACK | PAGE_END_WRITEBACK);
+	goto out;
+}
+
+/*
+ * work queue call back to started compression on a file and pages
+ */
+static noinline void async_cow_start(struct btrfs_work *work)
+{
+	struct async_cow *async_cow;
+	int num_added = 0;
+	async_cow = container_of(work, struct async_cow, work);
+
+	compress_file_range(async_cow->inode, async_cow->locked_page,
+			    async_cow->start, async_cow->end, async_cow,
+			    &num_added);
+	if (num_added == 0) {
+		btrfs_add_delayed_iput(async_cow->inode);
+		async_cow->inode = NULL;
+	}
+}
+
+/*
+ * work queue call back to submit previously compressed pages
+ */
+static noinline void async_cow_submit(struct btrfs_work *work)
+{
+	struct async_cow *async_cow;
+	struct btrfs_root *root;
+	unsigned long nr_pages;
+
+	async_cow = container_of(work, struct async_cow, work);
+
+	root = async_cow->root;
+	nr_pages = (async_cow->end - async_cow->start + PAGE_CACHE_SIZE) >>
+		PAGE_CACHE_SHIFT;
+
+	/*
+	 * atomic_sub_return implies a barrier for waitqueue_active
+	 */
+	if (atomic_sub_return(nr_pages, &root->fs_info->async_delalloc_pages) <
+	    5 * 1024 * 1024 &&
+	    waitqueue_active(&root->fs_info->async_submit_wait))
+		wake_up(&root->fs_info->async_submit_wait);
+
+	if (async_cow->inode)
+		submit_compressed_extents(async_cow->inode, async_cow);
+}
+
+static noinline void async_cow_free(struct btrfs_work *work)
+{
+	struct async_cow *async_cow;
+	async_cow = container_of(work, struct async_cow, work);
+	if (async_cow->inode)
+		btrfs_add_delayed_iput(async_cow->inode);
+	kfree(async_cow);
+}
+
+static int cow_file_range_async(struct inode *inode, struct page *locked_page,
+				u64 start, u64 end, int *page_started,
+				unsigned long *nr_written)
+{
+	struct async_cow *async_cow;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	unsigned long nr_pages;
+	u64 cur_end;
+	int limit = 10 * 1024 * 1024;
+
+	clear_extent_bit(&BTRFS_I(inode)->io_tree, start, end, EXTENT_LOCKED,
+			 1, 0, NULL, GFP_NOFS);
+	while (start < end) {
+		async_cow = kmalloc(sizeof(*async_cow), GFP_NOFS);
+		BUG_ON(!async_cow); /* -ENOMEM */
+		async_cow->inode = igrab(inode);
+		async_cow->root = root;
+		async_cow->locked_page = locked_page;
+		async_cow->start = start;
+
+		if (BTRFS_I(inode)->flags & BTRFS_INODE_NOCOMPRESS &&
+		    !btrfs_test_opt(root, FORCE_COMPRESS))
+			cur_end = end;
+		else
+			cur_end = min(end, start + 512 * 1024 - 1);
+
+		async_cow->end = cur_end;
+		INIT_LIST_HEAD(&async_cow->extents);
+
+		btrfs_init_work(&async_cow->work,
+				btrfs_delalloc_helper,
+				async_cow_start, async_cow_submit,
+				async_cow_free);
+
+		nr_pages = (cur_end - start + PAGE_CACHE_SIZE) >>
+			PAGE_CACHE_SHIFT;
+		atomic_add(nr_pages, &root->fs_info->async_delalloc_pages);
+
+		btrfs_queue_work(root->fs_info->delalloc_workers,
+				 &async_cow->work);
+
+		if (atomic_read(&root->fs_info->async_delalloc_pages) > limit) {
+			wait_event(root->fs_info->async_submit_wait,
+			   (atomic_read(&root->fs_info->async_delalloc_pages) <
+			    limit));
+		}
+
+		while (atomic_read(&root->fs_info->async_submit_draining) &&
+		      atomic_read(&root->fs_info->async_delalloc_pages)) {
+			wait_event(root->fs_info->async_submit_wait,
+			  (atomic_read(&root->fs_info->async_delalloc_pages) ==
+			   0));
+		}
+
+		*nr_written += nr_pages;
+		start = cur_end + 1;
+	}
+	*page_started = 1;
+	return 0;
+}
+
+static noinline int csum_exist_in_range(struct btrfs_root *root,
+					u64 bytenr, u64 num_bytes)
+{
+	int ret;
+	struct btrfs_ordered_sum *sums;
+	LIST_HEAD(list);
+
+	ret = btrfs_lookup_csums_range(root->fs_info->csum_root, bytenr,
+				       bytenr + num_bytes - 1, &list, 0);
+	if (ret == 0 && list_empty(&list))
+		return 0;
+
+	while (!list_empty(&list)) {
+		sums = list_entry(list.next, struct btrfs_ordered_sum, list);
+		list_del(&sums->list);
+		kfree(sums);
+	}
+	if (ret < 0)
+		return ret;
+	return 1;
+}
+
+/*
+ * when nowcow writeback call back.  This checks for snapshots or COW copies
+ * of the extents that exist in the file, and COWs the file as required.
+ *
+ * If no cow copies or snapshots exist, we write directly to the existing
+ * blocks on disk
+ */
+static noinline int run_delalloc_nocow(struct inode *inode,
+				       struct page *locked_page,
+			      u64 start, u64 end, int *page_started, int force,
+			      unsigned long *nr_written)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_trans_handle *trans;
+	struct extent_buffer *leaf;
+	struct btrfs_path *path;
+	struct btrfs_file_extent_item *fi;
+	struct btrfs_key found_key;
+	u64 cow_start;
+	u64 cur_offset;
+	u64 extent_end;
+	u64 extent_offset;
+	u64 disk_bytenr;
+	u64 num_bytes;
+	u64 disk_num_bytes;
+	u64 ram_bytes;
+	int extent_type;
+	int ret, err;
+	int type;
+	int nocow;
+	int check_prev = 1;
+	bool nolock;
+	u64 ino = btrfs_ino(inode);
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		extent_clear_unlock_delalloc(inode, start, end, locked_page,
+					     EXTENT_LOCKED | EXTENT_DELALLOC |
+					     EXTENT_DO_ACCOUNTING |
+					     EXTENT_DEFRAG, PAGE_UNLOCK |
+					     PAGE_CLEAR_DIRTY |
+					     PAGE_SET_WRITEBACK |
+					     PAGE_END_WRITEBACK);
+		return -ENOMEM;
 	}
 
-	input_info(true, &info->client->dev, "%s: latest test is %d\n",
-			__func__, result[max_count].num_of_test);
+	nolock = btrfs_is_free_space_inode(inode);
 
-done:
-	if (sec->cmd_all_factory_state != SEC_CMD_STATUS_RUNNING)
+	if (nolock)
+		trans = btrfs_join_transaction_nolock(root);
+	else
+		trans = btrfs_join_transaction(root);
+
+	if (IS_ERR(trans)) {
+		extent_clear_unlock_delalloc(inode, start, end, locked_page,
+					     EXTENT_LOCKED | EXTENT_DELALLOC |
+					     EXTENT_DO_ACCOUNTING |
+					     EXTENT_DEFRAG, PAGE_UNLOCK |
+					     PAGE_CLEAR_DIRTY |
+					     PAGE_SET_WRITEBACK |
+					     PAGE_END_WRITEBACK);
+		btrfs_free_path(path);
+		return PTR_ERR(trans);
+	}
+
+	trans->block_rsv = &root->fs_info->delalloc_block_rsv;
+
+	cow_start = (u64)-1;
+	cur_offset = start;
+	while (1) {
+		ret = btrfs_lookup_file_extent(trans, root, path, ino,
+					       cur_offset, 0);
+		if (ret < 0)
+			goto error;
+		if (ret > 0 && path->slots[0] > 0 && check_prev) {
+			leaf = path->nodes[0];
+			btrfs_item_key_to_cpu(leaf, &found_key,
+					      path->slots[0] - 1);
+			if (found_key.objectid == ino &&
+			    found_key.type == BTRFS_EXTENT_DATA_KEY)
+				path->slots[0]--;
+		}
+		check_prev = 0;
+next_slot:
+		leaf = path->nodes[0];
+		if (path->slots[0] >= btrfs_header_nritems(leaf)) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0) {
+				if (cow_start != (u64)-1)
+					cur_offset = cow_start;
+				goto error;
+			}
+			if (ret > 0)
+				break;
+			leaf = path->nodes[0];
+		}
+
+		nocow = 0;
+		disk_bytenr = 0;
+		num_bytes = 0;
+		btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+
+		if (found_key.objectid > ino)
+			break;
+		if (WARN_ON_ONCE(found_key.objectid < ino) ||
+		    found_key.type < BTRFS_EXTENT_DATA_KEY) {
+			path->slots[0]++;
+			goto next_slot;
+		}
+		if (found_key.type > BTRFS_EXTENT_DATA_KEY ||
+		    found_key.offset > end)
+			break;
+
+		if (found_key.offset > cur_offset) {
+			extent_end = found_key.offset;
+			extent_type = 0;
+			goto out_check;
+		}
+
+		fi = btrfs_item_ptr(leaf, path->slots[0],
+				    struct btrfs_file_extent_item);
+		extent_type = btrfs_file_extent_type(leaf, fi);
+
+		ram_bytes = btrfs_file_extent_ram_bytes(leaf, fi);
+		if (extent_type == BTRFS_FILE_EXTENT_REG ||
+		    extent_type == BTRFS_FILE_EXTENT_PREALLOC) {
+			disk_bytenr = btrfs_file_extent_disk_bytenr(leaf, fi);
+			extent_offset = btrfs_file_extent_offset(leaf, fi);
+			extent_end = found_key.offset +
+				btrfs_file_extent_num_bytes(leaf, fi);
+			disk_num_bytes =
+				btrfs_file_extent_disk_num_bytes(leaf, fi);
+			if (extent_end <= start) {
+				path->slots[0]++;
+				goto next_slot;
+			}
+			if (disk_bytenr == 0)
+				goto out_check;
+			if (btrfs_file_extent_compression(leaf, fi) ||
+			    btrfs_file_extent_encryption(leaf, fi) ||
+			    btrfs_file_extent_other_encoding(leaf, fi))
+				goto out_check;
+			if (extent_type == BTRFS_FILE_EXTENT_REG && !force)
+				goto out_check;
+			if (btrfs_extent_readonly(root, disk_bytenr))
+				goto out_check;
+			ret = btrfs_cross_ref_exist(trans, root, ino,
+						  found_key.offset -
+						  extent_offset, disk_bytenr);
+			if (ret) {
+				/*
+				 * ret could be -EIO if the above fails to read
+				 * metadata.
+				 */
+				if (ret < 0) {
+					if (cow_start != (u64)-1)
+						cur_offset = cow_start;
+					goto error;
+				}
+
+				WARN_ON_ONCE(nolock);
+				goto out_check;
+			}
+			disk_bytenr += extent_offset;
+			disk_bytenr += cur_offset - found_key.offset;
+			num_bytes = min(end + 1, extent_end) - cur_offset;
+			/*
+			 * if there are pending snapshots for this root,
+			 * we fall into common COW way.
+			 */
+			if (!nolock) {
+				err = btrfs_start_write_no_snapshoting(root);
+				if (!err)
+					goto out_check;
+			}
+			/*
+			 * force cow if csum exists in the range.
+			 * this ensure that csum for a given extent are
+			 * either valid or do not exist.
+			 */
+			ret = csum_exist_in_range(root, disk_bytenr, num_bytes);
+			if (ret) {
+				/*
+				 * ret could be -EIO if the above fails to read
+				 * metadata.
+				 */
+				if (ret < 0) {
+					if (cow_start != (u64)-1)
+						cur_offset = cow_start;
+					goto error;
+				}
+				WARN_ON_ONCE(nolock);
+				goto out_check;
+			}
+			nocow = 1;
+		} else if (extent_type == BTRFS_FILE_EXTENT_INLINE) {
+			extent_end = found_key.offset +
+				btrfs_file_extent_inline_len(leaf,
+						     path->slots[0], fi);
+			extent_end = ALIGN(extent_end, root->sectorsize);
+		} else {
+			BUG_ON(1);
+		}
+out_check:
+		if (extent_end <= start) {
+			path->slots[0]++;
+			if (!nolock && nocow)
+				btrfs_end_write_no_snapshoting(root);
+			goto next_slot;
+		}
+		if (!nocow) {
+			if (cow_start == (u64)-1)
+				cow_start = cur_offset;
+			cur_offset = extent_end;
+			if (cur_offset > end)
+				break;
+			path->slots[0]++;
+			goto next_slot;
+		}
+
+		btrfs_release_path(path);
+		if (cow_start != (u64)-1) {
+			ret = cow_file_range(inode, locked_page,
+					     cow_start, found_key.offset - 1,
+					     page_started, nr_written, 1);
+			if (ret) {
+				if (!nolock && nocow)
+					btrfs_end_write_no_snapshoting(root);
+				goto error;
+			}
+			cow_start = (u64)-1;
+		}
+
+		if (extent_type == BTRFS_FILE_EXTENT_PREALLOC) {
+			struct extent_map *em;
+			struct extent_map_tree *em_tree;
+			em_tree = &BTRFS_I(inode)->extent_tree;
+			em = alloc_extent_map();
+			BUG_ON(!em); /* -ENOMEM */
+			em->start = cur_offset;
+			em->orig_start = found_key.offset - extent_offset;
+			em->len = num_bytes;
+			em->block_len = num_bytes;
+			em->block_start = disk_bytenr;
+			em->orig_block_len = disk_num_bytes;
+			em->ram_bytes = ram_bytes;
+			em->bdev = root->fs_info->fs_devices->latest_bdev;
+			em->mod_start = em->start;
+			em->mod_len = em->len;
+			set_bit(EXTENT_FLAG_PINNED, &em->flags);
+			set_bit(EXTENT_FLAG_FILLING, &em->flags);
+			em->generation = -1;
+			while (1) {
+				write_lock(&em_tree->lock);
+				ret = add_extent_mapping(em_tree, em, 1);
+				write_unlock(&em_tree->lock);
+				if (ret != -EEXIST) {
+					free_extent_map(em);
+					break;
+				}
+				btrfs_drop_extent_cache(inode, em->start,
+						em->start + em->len - 1, 0);
+			}
+			type = BTRFS_ORDERED_PREALLOC;
+		} else {
+			type = BTRFS_ORDERED_NOCOW;
+		}
+
+		ret = btrfs_add_ordered_extent(inode, cur_offset, disk_bytenr,
+					       num_bytes, num_bytes, type);
+		BUG_ON(ret); /* -ENOMEM */
+
+		if (root->root_key.objectid ==
+		    BTRFS_DATA_RELOC_TREE_OBJECTID) {
+			ret = btrfs_reloc_clone_csums(inode, cur_offset,
+						      num_bytes);
+			if (ret) {
+				if (!nolock && nocow)
+					btrfs_end_write_no_snapshoting(root);
+				goto error;
+			}
+		}
+
+		extent_clear_unlock_delalloc(inode, cur_offset,
+					     cur_offset + num_bytes - 1,
+					     locked_page, EXTENT_LOCKED |
+					     EXTENT_DELALLOC, PAGE_UNLOCK |
+					     PAGE_SET_PRIVATE2);
+		if (!nolock && nocow)
+			btrfs_end_write_no_snapshoting(root);
+		cur_offset = extent_end;
+		if (cur_offset > end)
+			break;
+	}
+	btrfs_release_path(path);
+
+	if (cur_offset <= end && cow_start == (u64)-1) {
+		cow_start = cur_offset;
+		cur_offset = end;
+	}
+
+	if (cow_start != (u64)-1) {
+		ret = cow_file_range(inode, locked_page, cow_start, end,
+				     page_started, nr_written, 1);
+		if (ret)
+			goto error;
+	}
+
+error:
+	err = btrfs_end_transaction(trans, root);
+	if (!ret)
+		ret = err;
+
+	if (ret && cur_offset < end)
+		extent_clear_unlock_delalloc(inode, cur_offset, end,
+					     locked_page, EXTENT_LOCKED |
+					     EXTENT_DELALLOC | EXTENT_DEFRAG |
+					     EXTENT_DO_ACCOUNTING, PAGE_UNLOCK |
+					     PAGE_CLEAR_DIRTY |
+					     PAGE_SET_WRITEBACK |
+					     PAGE_END_WRITEBACK);
+	btrfs_free_path(path);
+	return ret;
+}
+
+static inline int need_force_cow(struct inode *inode, u64 start, u64 end)
+{
+
+	if (!(BTRFS_I(inode)->flags & BTRFS_INODE_NODATACOW) &&
+	    !(BTRFS_I(inode)->flags & BTRFS_INODE_PREALLOC))
+		return 0;
+
+	/*
+	 * @defrag_bytes is a hint value, no spinlock held here,
+	 * if is not zero, it means the file is defragging.
+	 * Force cow if given extent needs to be defragged.
+	 */
+	if (BTRFS_I(inode)->defrag_bytes &&
+	    test_range_bit(&BTRFS_I(inode)->io_tree, start, end,
+			   EXTENT_DEFRAG, 0, NULL))
+		return 1;
+
+	return 0;
+}
+
+/*
+ * extent_io.c call back to do delayed allocation processing
+ */
+static int run_delalloc_range(struct inode *inode, struct page *locked_page,
+			      u64 start, u64 end, int *page_started,
+			      unsigned long *nr_written)
+{
+	int ret;
+	int force_cow = need_force_cow(inode, start, end);
+
+	if (BTRFS_I(inode)->flags & BTRFS_INODE_NODATACOW && !force_cow) {
+		ret = run_delalloc_nocow(inode, locked_page, start, end,
+					 page_started, 1, nr_written);
+	} else if (BTRFS_I(inode)->flags & BTRFS_INODE_PREALLOC && !force_cow) {
+		ret = run_delalloc_nocow(inode, locked_page, start, end,
+					 page_started, 0, nr_written);
+	} else if (!inode_need_compress(inode)) {
+		ret = cow_file_range(inode, locked_page, start, end,
+				      page_started, nr_written, 1);
+	} else {
+		set_bit(BTRFS_INODE_HAS_ASYNC_EXTENT,
+			&BTRFS_I(inode)->runtime_flags);
+		ret = cow_file_range_async(inode, locked_page, start, end,
+					   page_started, nr_written);
+	}
+	return ret;
+}
+
+static void btrfs_split_extent_hook(struct inode *inode,
+				    struct extent_state *orig, u64 split)
+{
+	u64 size;
+
+	/* not delalloc, ignore it */
+	if (!(orig->state & EXTENT_DELALLOC))
 		return;
 
-	if (ret < 0) {
-		snprintf(buff, sizeof(buff), "NG");
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CH_OPEN/SHORT_TEST_X");
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CH_OPEN/SHORT_TEST_Y");
-	} else {
-		snprintf(buff, sizeof(buff), "0,%d", result[max_count].max_of_rx_gap);
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CH_OPEN/SHORT_TEST_X");
-		snprintf(buff, sizeof(buff), "0,%d", result[max_count].max_of_tx_gap);
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CH_OPEN/SHORT_TEST_Y");
+	size = orig->end - orig->start + 1;
+	if (size > BTRFS_MAX_EXTENT_SIZE) {
+		u64 num_extents;
+		u64 new_size;
+
+		/*
+		 * See the explanation in btrfs_merge_extent_hook, the same
+		 * applies here, just in reverse.
+		 */
+		new_size = orig->end - split + 1;
+		num_extents = div64_u64(new_size + BTRFS_MAX_EXTENT_SIZE - 1,
+					BTRFS_MAX_EXTENT_SIZE);
+		new_size = split - orig->start;
+		num_extents += div64_u64(new_size + BTRFS_MAX_EXTENT_SIZE - 1,
+					BTRFS_MAX_EXTENT_SIZE);
+		if (div64_u64(size + BTRFS_MAX_EXTENT_SIZE - 1,
+			      BTRFS_MAX_EXTENT_SIZE) >= num_extents)
+			return;
+	}
+
+	spin_lock(&BTRFS_I(inode)->lock);
+	BTRFS_I(inode)->outstanding_extents++;
+	spin_unlock(&BTRFS_I(inode)->lock);
+}
+
+/*
+ * extent_io.c merge_extent_hook, used to track merged delayed allocation
+ * extents so we can keep track of new extents that are just merged onto old
+ * extents, such as when we are doing sequential writes, so we can properly
+ * account for the metadata space we'll need.
+ */
+static void btrfs_merge_extent_hook(struct inode *inode,
+				    struct extent_state *new,
+				    struct extent_state *other)
+{
+	u64 new_size, old_size;
+	u64 num_extents;
+
+	/* not delalloc, ignore it */
+	if (!(other->state & EXTENT_DELALLOC))
+		return;
+
+	if (new->start > other->start)
+		new_size = new->end - other->start + 1;
+	else
+		new_size = other->end - new->start + 1;
+
+	/* we're not bigger than the max, unreserve the space and go */
+	if (new_size <= BTRFS_MAX_EXTENT_SIZE) {
+		spin_lock(&BTRFS_I(inode)->lock);
+		BTRFS_I(inode)->outstanding_extents--;
+		spin_unlock(&BTRFS_I(inode)->lock);
+		return;
+	}
+
+	/*
+	 * We have to add up either side to figure out how many extents were
+	 * accounted for before we merged into one big extent.  If the number of
+	 * extents we accounted for is <= the amount we need for the new range
+	 * then we can return, otherwise drop.  Think of it like this
+	 *
+	 * [ 4k][MAX_SIZE]
+	 *
+	 * So we've grown the extent by a MAX_SIZE extent, this would mean we
+	 * need 2 outstanding extents, on one side we have 1 and the other side
+	 * we have 1 so they are == and we can return.  But in this case
+	 *
+	 * [MAX_SIZE+4k][MAX_SIZE+4k]
+	 *
+	 * Each range on their own accounts for 2 extents, but merged together
+	 * they are only 3 extents worth of accounting, so we need to drop in
+	 * this case.
+	 */
+	old_size = other->end - other->start + 1;
+	num_extents = div64_u64(old_size + BTRFS_MAX_EXTENT_SIZE - 1,
+				BTRFS_MAX_EXTENT_SIZE);
+	old_size = new->end - new->start + 1;
+	num_extents += div64_u64(old_size + BTRFS_MAX_EXTENT_SIZE - 1,
+				 BTRFS_MAX_EXTENT_SIZE);
+
+	if (div64_u64(new_size + BTRFS_MAX_EXTENT_SIZE - 1,
+		      BTRFS_MAX_EXTENT_SIZE) >= num_extents)
+		return;
+
+	spin_lock(&BTRFS_I(inode)->lock);
+	BTRFS_I(inode)->outstanding_extents--;
+	spin_unlock(&BTRFS_I(inode)->lock);
+}
+
+static void btrfs_add_delalloc_inodes(struct btrfs_root *root,
+				      struct inode *inode)
+{
+	spin_lock(&root->delalloc_lock);
+	if (list_empty(&BTRFS_I(inode)->delalloc_inodes)) {
+		list_add_tail(&BTRFS_I(inode)->delalloc_inodes,
+			      &root->delalloc_inodes);
+		set_bit(BTRFS_INODE_IN_DELALLOC_LIST,
+			&BTRFS_I(inode)->runtime_flags);
+		root->nr_delalloc_inodes++;
+		if (root->nr_delalloc_inodes == 1) {
+			spin_lock(&root->fs_info->delalloc_root_lock);
+			BUG_ON(!list_empty(&root->delalloc_root));
+			list_add_tail(&root->delalloc_root,
+				      &root->fs_info->delalloc_roots);
+			spin_unlock(&root->fs_info->delalloc_root_lock);
+		}
+	}
+	spin_unlock(&root->delalloc_lock);
+}
+
+static void btrfs_del_delalloc_inode(struct btrfs_root *root,
+				     struct inode *inode)
+{
+	spin_lock(&root->delalloc_lock);
+	if (!list_empty(&BTRFS_I(inode)->delalloc_inodes)) {
+		list_del_init(&BTRFS_I(inode)->delalloc_inodes);
+		clear_bit(BTRFS_INODE_IN_DELALLOC_LIST,
+			  &BTRFS_I(inode)->runtime_flags);
+		root->nr_delalloc_inodes--;
+		if (!root->nr_delalloc_inodes) {
+			spin_lock(&root->fs_info->delalloc_root_lock);
+			BUG_ON(list_empty(&root->delalloc_root));
+			list_del_init(&root->delalloc_root);
+			spin_unlock(&root->fs_info->delalloc_root_lock);
+		}
+	}
+	spin_unlock(&root->delalloc_lock);
+}
+
+/*
+ * extent_io.c set_bit_hook, used to track delayed allocation
+ * bytes in this file, and to maintain the list of inodes that
+ * have pending delalloc work to be done.
+ */
+static void btrfs_set_bit_hook(struct inode *inode,
+			       struct extent_state *state, unsigned *bits)
+{
+
+	if ((*bits & EXTENT_DEFRAG) && !(*bits & EXTENT_DELALLOC))
+		WARN_ON(1);
+	/*
+	 * set_bit and clear bit hooks normally require _irqsave/restore
+	 * but in this case, we are only testing for the DELALLOC
+	 * bit, which is only set or cleared with irqs on
+	 */
+	if (!(state->state & EXTENT_DELALLOC) && (*bits & EXTENT_DELALLOC)) {
+		struct btrfs_root *root = BTRFS_I(inode)->root;
+		u64 len = state->end + 1 - state->start;
+		bool do_list = !btrfs_is_free_space_inode(inode);
+
+		if (*bits & EXTENT_FIRST_DELALLOC) {
+			*bits &= ~EXTENT_FIRST_DELALLOC;
+		} else {
+			spin_lock(&BTRFS_I(inode)->lock);
+			BTRFS_I(inode)->outstanding_extents++;
+			spin_unlock(&BTRFS_I(inode)->lock);
+		}
+
+		/* For sanity tests */
+		if (btrfs_test_is_dummy_root(root))
+			return;
+
+		__percpu_counter_add(&root->fs_info->delalloc_bytes, len,
+				     root->fs_info->delalloc_batch);
+		spin_lock(&BTRFS_I(inode)->lock);
+		BTRFS_I(inode)->delalloc_bytes += len;
+		if (*bits & EXTENT_DEFRAG)
+			BTRFS_I(inode)->defrag_bytes += len;
+		if (do_list && !test_bit(BTRFS_INODE_IN_DELALLOC_LIST,
+					 &BTRFS_I(inode)->runtime_flags))
+			btrfs_add_delalloc_inodes(root, inode);
+		spin_unlock(&BTRFS_I(inode)->lock);
 	}
 }
 
-int fts_set_sec_ito_test_result(struct fts_ts_info *info)
+/*
+ * extent_io.c clear_bit_hook, see set_bit_hook for why
+ */
+static void btrfs_clear_bit_hook(struct inode *inode,
+				 struct extent_state *state,
+				 unsigned *bits)
 {
-	struct sec_cmd_data *sec = &info->sec;
-	u8 regAdd[3] = { 0 };
-	int ret = -EINVAL;
-	u8 buff[10] = { 0 };
+	u64 len = state->end + 1 - state->start;
+	u64 num_extents = div64_u64(len + BTRFS_MAX_EXTENT_SIZE -1,
+				    BTRFS_MAX_EXTENT_SIZE);
 
-	if (!info->factory_position) {
-		input_err(true, &info->client->dev, "%s: not save, factory level = %d\n",
-				__func__, info->factory_position);
-		goto out;
+	spin_lock(&BTRFS_I(inode)->lock);
+	if ((state->state & EXTENT_DEFRAG) && (*bits & EXTENT_DEFRAG))
+		BTRFS_I(inode)->defrag_bytes -= len;
+	spin_unlock(&BTRFS_I(inode)->lock);
+
+	/*
+	 * set_bit and clear bit hooks normally require _irqsave/restore
+	 * but in this case, we are only testing for the DELALLOC
+	 * bit, which is only set or cleared with irqs on
+	 */
+	if ((state->state & EXTENT_DELALLOC) && (*bits & EXTENT_DELALLOC)) {
+		struct btrfs_root *root = BTRFS_I(inode)->root;
+		bool do_list = !btrfs_is_free_space_inode(inode);
+
+		if (*bits & EXTENT_FIRST_DELALLOC) {
+			*bits &= ~EXTENT_FIRST_DELALLOC;
+		} else if (!(*bits & EXTENT_DO_ACCOUNTING)) {
+			spin_lock(&BTRFS_I(inode)->lock);
+			BTRFS_I(inode)->outstanding_extents -= num_extents;
+			spin_unlock(&BTRFS_I(inode)->lock);
+		}
+
+		/*
+		 * We don't reserve metadata space for space cache inodes so we
+		 * don't need to call dellalloc_release_metadata if there is an
+		 * error.
+		 */
+		if (*bits & EXTENT_DO_ACCOUNTING &&
+		    root != root->fs_info->tree_root)
+			btrfs_delalloc_release_metadata(inode, len);
+
+		/* For sanity tests. */
+		if (btrfs_test_is_dummy_root(root))
+			return;
+
+		if (root->root_key.objectid != BTRFS_DATA_RELOC_TREE_OBJECTID
+		    && do_list && !(state->state & EXTENT_NORESERVE))
+			btrfs_free_reserved_data_space_noquota(inode,
+					state->start, len);
+
+		__percpu_counter_add(&root->fs_info->delalloc_bytes, -len,
+				     root->fs_info->delalloc_batch);
+		spin_lock(&BTRFS_I(inode)->lock);
+		BTRFS_I(inode)->delalloc_bytes -= len;
+		if (do_list && BTRFS_I(inode)->delalloc_bytes == 0 &&
+		    test_bit(BTRFS_INODE_IN_DELALLOC_LIST,
+			     &BTRFS_I(inode)->runtime_flags))
+			btrfs_del_delalloc_inode(root, inode);
+		spin_unlock(&BTRFS_I(inode)->lock);
 	}
+}
 
-	fts_systemreset(info, 10);
-	fts_command(info, 0xA5); // HF ITO test
-	ret = fts_fw_wait_for_specific_event(info, EVENTID_STATUS_EVENT, 0x20, 0x00);
-	if(ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed HF ito test , %d\n", __func__, ret);
-		goto out;
-	}
-	
-	regAdd[0] = 0xC7;
-	regAdd[1] = 0x06;
-	regAdd[2] = info->factory_position;
-	ret = info->fts_write_reg(info, regAdd, 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed to write fac position, %d\n", __func__, ret);
-		goto out;
-	}
+/*
+ * extent_io.c merge_bio_hook, this must check the chunk tree to make sure
+ * we don't create bios that span stripes or chunks
+ */
+int btrfs_merge_bio_hook(int rw, struct page *page, unsigned long offset,
+			 size_t size, struct bio *bio,
+			 unsigned long bio_flags)
+{
+	struct btrfs_root *root = BTRFS_I(page->mapping->host)->root;
+	u64 logical = (u64)bio->bi_iter.bi_sector << 9;
+	u64 length = 0;
+	u64 map_length;
+	int ret;
 
-	fts_delay(10);
-	fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-	fts_delay(230);
-	fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
+	if (bio_flags & EXTENT_BIO_COMPRESSED)
+		return 0;
 
-	input_info(true, &info->client->dev, "%s: position %d result is saved\n", __func__, info->factory_position);
+	length = bio->bi_iter.bi_size;
+	map_length = length;
+	ret = btrfs_map_block(root->fs_info, rw, logical,
+			      &map_length, NULL, 0);
+	/* Will always return 0 with map_multi == NULL */
+	BUG_ON(ret < 0);
+	if (map_length < length + size)
+		return 1;
 	return 0;
+}
+
+/*
+ * in order to insert checksums into the metadata in large chunks,
+ * we wait until bio submission time.   All the pages in the bio are
+ * checksummed and sums are attached onto the ordered extent record.
+ *
+ * At IO completion time the cums attached on the ordered extent record
+ * are inserted into the btree
+ */
+static int __btrfs_submit_bio_start(struct inode *inode, int rw,
+				    struct bio *bio, int mirror_num,
+				    unsigned long bio_flags,
+				    u64 bio_offset)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	int ret = 0;
+
+	ret = btrfs_csum_one_bio(root, inode, bio, 0, 0);
+	BUG_ON(ret); /* -ENOMEM */
+	return 0;
+}
+
+/*
+ * in order to insert checksums into the metadata in large chunks,
+ * we wait until bio submission time.   All the pages in the bio are
+ * checksummed and sums are attached onto the ordered extent record.
+ *
+ * At IO completion time the cums attached on the ordered extent record
+ * are inserted into the btree
+ */
+static int __btrfs_submit_bio_done(struct inode *inode, int rw, struct bio *bio,
+			  int mirror_num, unsigned long bio_flags,
+			  u64 bio_offset)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	int ret;
+
+	ret = btrfs_map_bio(root, rw, bio, mirror_num, 1);
+	if (ret) {
+		bio->bi_error = ret;
+		bio_endio(bio);
+	}
+	return ret;
+}
+
+/*
+ * extent_io.c submission hook. This does the right thing for csum calculation
+ * on write, or reading the csums from the tree before a read
+ */
+static int btrfs_submit_bio_hook(struct inode *inode, int rw, struct bio *bio,
+			  int mirror_num, unsigned long bio_flags,
+			  u64 bio_offset)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	enum btrfs_wq_endio_type metadata = BTRFS_WQ_ENDIO_DATA;
+	int ret = 0;
+	int skip_sum;
+	int async = !atomic_read(&BTRFS_I(inode)->sync_writers);
+
+	skip_sum = BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM;
+
+	if (btrfs_is_free_space_inode(inode))
+		metadata = BTRFS_WQ_ENDIO_FREE_SPACE;
+
+	if (!(rw & REQ_WRITE)) {
+		ret = btrfs_bio_wq_end_io(root->fs_info, bio, metadata);
+		if (ret)
+			goto out;
+
+		if (bio_flags & EXTENT_BIO_COMPRESSED) {
+			ret = btrfs_submit_compressed_read(inode, bio,
+							   mirror_num,
+							   bio_flags);
+			goto out;
+		} else if (!skip_sum) {
+			ret = btrfs_lookup_bio_sums(root, inode, bio, NULL);
+			if (ret)
+				goto out;
+		}
+		goto mapit;
+	} else if (async && !skip_sum) {
+		/* csum items have already been cloned */
+		if (root->root_key.objectid == BTRFS_DATA_RELOC_TREE_OBJECTID)
+			goto mapit;
+		/* we're doing a write, do the async checksumming */
+		ret = btrfs_wq_submit_bio(BTRFS_I(inode)->root->fs_info,
+				   inode, rw, bio, mirror_num,
+				   bio_flags, bio_offset,
+				   __btrfs_submit_bio_start,
+				   __btrfs_submit_bio_done);
+		goto out;
+	} else if (!skip_sum) {
+		ret = btrfs_csum_one_bio(root, inode, bio, 0, 0);
+		if (ret)
+			goto out;
+	}
+
+mapit:
+	ret = btrfs_map_bio(root, rw, bio, mirror_num, 0);
 
 out:
-	if (sec->cmd_all_factory_state != SEC_CMD_STATUS_RUNNING)
-		return ret;
-
-	snprintf(buff, sizeof(buff), "NG");
-	sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CH_OPEN/SHORT_TEST_X");
-	sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CH_OPEN/SHORT_TEST_Y");
+	if (ret < 0) {
+		bio->bi_error = ret;
+		bio_endio(bio);
+	}
 	return ret;
 }
 
-void fts_checking_miscal(struct fts_ts_info *info, int testmode)
+/*
+ * given a list of ordered sums record them in the inode.  This happens
+ * at IO completion time based on sums calculated at bio submission time.
+ */
+static noinline int add_pending_csums(struct btrfs_trans_handle *trans,
+			     struct inode *inode, u64 file_offset,
+			     struct list_head *list)
 {
-	u8 regAdd[4] = { 0 };
-	u8 data[3] = { 0 };
-	u16 jitter_avg = 0, miscal_thd = 0;
-	int ret, diff_sum = 0, i;
-	short min = 0x7FFF;
-	short max = 0x8000;
+	struct btrfs_ordered_sum *sum;
 
-	info->miscal_result = MISCAL_PASS;
-
-	if (testmode == SAVE_MISCAL_REF_RAW) {
-		/* store miscal ref raw data after CX2=0 : in autotune */
-		fts_read_frame(info, TYPE_RAW_DATA, &min, &max);
-		memcpy(&info->miscal_ref_raw[0], &info->pFrame[0],
-				info->ForceChannelLength * info->SenseChannelLength * sizeof(short));
-		input_info(true, &info->client->dev, "%s: miscal ref raw data is saved\n", __func__);
-		return;
-	} else if (testmode != OPEN_SHORT_CRACK_TEST) {
-		return;
+	list_for_each_entry(sum, list, list) {
+		trans->adding_csums = 1;
+		btrfs_csum_file_blocks(trans,
+		       BTRFS_I(inode)->root->fs_info->csum_root, sum);
+		trans->adding_csums = 0;
 	}
-
-	/* checking miscal ref raw is saved or not */
-	for (i = 0; i < info->ForceChannelLength * info->SenseChannelLength; i++) {
-		if (info->miscal_ref_raw[i] != 0)
-			break;
-	}
-
-	if (i == info->ForceChannelLength * info->SenseChannelLength) {
-		input_info(true, &info->client->dev,
-				"%s: miscal ref raw data is not saved\n", __func__);
-		return;
-	}
-
-	info->miscal_result = MISCAL_FAIL;
-
-	/* get the raw data after CX2=0 : in selftest */
-	fts_read_frame(info, TYPE_RAW_DATA, &min, &max);
-
-	regAdd[0] = 0xD0;
-	regAdd[1] = 0x00;
-	regAdd[2] = 0x98;
-	ret = info->fts_read_reg(info, regAdd, 3, data, 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed to read jitter avg\n", __func__);
-		return;
-	}
-
-	jitter_avg = data[2] << 8 | data[1];
-
-	regAdd[0] = 0xD0;
-	regAdd[1] = 0x00;
-	regAdd[2] = 0x9A;
-	ret = info->fts_read_reg(info, regAdd, 3, data, 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed to read miscal threshold\n", __func__);
-		return;
-	}
-
-	miscal_thd = data[2] << 8 | data[1];
-
-	/* compare raw data between autotune and selftest */
-	for (i = 0; i < info->ForceChannelLength * info->SenseChannelLength; i++) {
-		short node_diff = abs(info->miscal_ref_raw[i] - info->pFrame[i]);
-
-		if (node_diff > jitter_avg)
-			diff_sum += node_diff - jitter_avg;
-	}
-
-	if (diff_sum < miscal_thd)
-		info->miscal_result = MISCAL_PASS;
-
-	input_info(true, &info->client->dev, "%s: jitter avg:%d, threshold:%d, diff sum:%d, miscal:%s\n",
-			__func__, jitter_avg, miscal_thd, diff_sum,
-			info->miscal_result == MISCAL_PASS ? "PASS" : "FAIL");
+	return 0;
 }
 
-int fts_panel_ito_test(struct fts_ts_info *info, int testmode)
+int btrfs_set_extent_delalloc(struct inode *inode, u64 start, u64 end,
+			      struct extent_state **cached_state)
 {
-	unsigned char cmd = READ_ONE_EVENT;
-	unsigned char data[FTS_EVENT_SIZE];
-	u8 regAdd[4] = { 0 };
-	u8 regAddOff[4] = { 0 };
-	int retry = 0;
-	int result = -1;
+	WARN_ON((end & (PAGE_CACHE_SIZE - 1)) == 0);
+	return set_extent_delalloc(&BTRFS_I(inode)->io_tree, start, end,
+				   cached_state, GFP_NOFS);
+}
 
-	fts_systemreset(info, 10);
+/* see btrfs_writepage_start_hook for details on why this is required */
+struct btrfs_writepage_fixup {
+	struct page *page;
+	struct btrfs_work work;
+};
 
-	disable_irq(info->irq);
-	fts_interrupt_set(info, INT_DISABLE);
-	fts_command(info, FLUSHBUFFER);
+static void btrfs_writepage_fixup_worker(struct btrfs_work *work)
+{
+	struct btrfs_writepage_fixup *fixup;
+	struct btrfs_ordered_extent *ordered;
+	struct extent_state *cached_state = NULL;
+	struct page *page;
+	struct inode *inode;
+	u64 page_start;
+	u64 page_end;
+	int ret;
 
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	switch(testmode) {
-		case OPEN_TEST:	/* connection test */
-		case SAVE_MISCAL_REF_RAW:
-			fts_command(info, 0xA6);
-			break;
-
-		case OPEN_SHORT_CRACK_TEST:
-		default:
-			fts_command(info, 0xA7);	/* ITO test command */
-			break;
+	fixup = container_of(work, struct btrfs_writepage_fixup, work);
+	page = fixup->page;
+again:
+	lock_page(page);
+	if (!page->mapping || !PageDirty(page) || !PageChecked(page)) {
+		ClearPageChecked(page);
+		goto out_page;
 	}
-	fts_delay(200);
-	memset(data, 0x0, FTS_EVENT_SIZE);
-	while (fts_read_reg(info, &cmd, 1, (unsigned char *)data, FTS_EVENT_SIZE)) {
-		if ((data[0] == 0x0F) && (data[1] == 0x05)) {
 
-			info->ito_test[0] = 0x0;
-			info->ito_test[1] = 0x0;
-			info->ito_test[2] = data[2];
-			info->ito_test[3] = data[3];
+	inode = page->mapping->host;
+	page_start = page_offset(page);
+	page_end = page_offset(page) + PAGE_CACHE_SIZE - 1;
 
-			switch (data[2]) {
-			case 0x00 :
-				result = 0;
-				break;
-			case 0x01 :
-				input_info(true, &info->client->dev, "%s: Force channel [%d] open\n", __func__,
-					data[3]);
-				break;
-			case 0x02 :
-				input_info(true, &info->client->dev, "%s: Sense channel [%d] open\n", __func__,
-					data[3]);
-				break;
-			case 0x03 :
-				input_info(true, &info->client->dev, "%s: Force channel [%d] short to GND\n", __func__,
-					data[3]);
-				break;
-			case 0x04 :
-				input_info(true, &info->client->dev, "%s: Sense channel [%d] short to GND\n", __func__,
-					data[3]);
-				break;
-			case 0x05 :
-				input_info(true, &info->client->dev, "%s: Force channel [%d] short to VDD\n", __func__,
-					data[3]);
-				break;
-			case 0x06 :
-				input_info(true, &info->client->dev, "%s: Sense channel [%d] short to VDD\n", __func__,
-					data[3]);
-				break;
-			case 0x07 :
-				input_info(true, &info->client->dev, "%s: Force channel [%d] short to force\n", __func__,
-					data[3]);
-				break;
-			case 0x08 :
-				input_info(true, &info->client->dev, "%s: Sennse channel [%d] short to sense\n", __func__,
-					data[3]);
-				break;
-			default:
-				break;
+	lock_extent_bits(&BTRFS_I(inode)->io_tree, page_start, page_end, 0,
+			 &cached_state);
+
+	/* already ordered? We're done */
+	if (PagePrivate2(page))
+		goto out;
+
+	ordered = btrfs_lookup_ordered_extent(inode, page_start);
+	if (ordered) {
+		unlock_extent_cached(&BTRFS_I(inode)->io_tree, page_start,
+				     page_end, &cached_state, GFP_NOFS);
+		unlock_page(page);
+		btrfs_start_ordered_extent(inode, ordered, 1);
+		btrfs_put_ordered_extent(ordered);
+		goto again;
+	}
+
+	ret = btrfs_delalloc_reserve_space(inode, page_start,
+					   PAGE_CACHE_SIZE);
+	if (ret) {
+		mapping_set_error(page->mapping, ret);
+		end_extent_writepage(page, ret, page_start, page_end);
+		ClearPageChecked(page);
+		goto out;
+	 }
+
+	ret = btrfs_set_extent_delalloc(inode, page_start, page_end,
+					&cached_state);
+	if (ret) {
+		mapping_set_error(page->mapping, ret);
+		end_extent_writepage(page, ret, page_start, page_end);
+		ClearPageChecked(page);
+		goto out;
+	}
+
+	ClearPageChecked(page);
+	set_page_dirty(page);
+out:
+	unlock_extent_cached(&BTRFS_I(inode)->io_tree, page_start, page_end,
+			     &cached_state, GFP_NOFS);
+out_page:
+	unlock_page(page);
+	page_cache_release(page);
+	kfree(fixup);
+}
+
+/*
+ * There are a few paths in the higher layers of the kernel that directly
+ * set the page dirty bit without asking the filesystem if it is a
+ * good idea.  This causes problems because we want to make sure COW
+ * properly happens and the data=ordered rules are followed.
+ *
+ * In our case any range that doesn't have the ORDERED bit set
+ * hasn't been properly setup for IO.  We kick off an async process
+ * to fix it up.  The async helper will wait for ordered extents, set
+ * the delalloc bit and make it safe to write the page.
+ */
+static int btrfs_writepage_start_hook(struct page *page, u64 start, u64 end)
+{
+	struct inode *inode = page->mapping->host;
+	struct btrfs_writepage_fixup *fixup;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+
+	/* this page is properly in the ordered list */
+	if (TestClearPagePrivate2(page))
+		return 0;
+
+	if (PageChecked(page))
+		return -EAGAIN;
+
+	fixup = kzalloc(sizeof(*fixup), GFP_NOFS);
+	if (!fixup)
+		return -EAGAIN;
+
+	SetPageChecked(page);
+	page_cache_get(page);
+	btrfs_init_work(&fixup->work, btrfs_fixup_helper,
+			btrfs_writepage_fixup_worker, NULL, NULL);
+	fixup->page = page;
+	btrfs_queue_work(root->fs_info->fixup_workers, &fixup->work);
+	return -EBUSY;
+}
+
+static int insert_reserved_file_extent(struct btrfs_trans_handle *trans,
+				       struct inode *inode, u64 file_pos,
+				       u64 disk_bytenr, u64 disk_num_bytes,
+				       u64 num_bytes, u64 ram_bytes,
+				       u8 compression, u8 encryption,
+				       u16 other_encoding, int extent_type)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_file_extent_item *fi;
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_key ins;
+	int extent_inserted = 0;
+	int ret;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	/*
+	 * we may be replacing one extent in the tree with another.
+	 * The new extent is pinned in the extent map, and we don't want
+	 * to drop it from the cache until it is completely in the btree.
+	 *
+	 * So, tell btrfs_drop_extents to leave this extent in the cache.
+	 * the caller is expected to unpin it and allow it to be merged
+	 * with the others.
+	 */
+	ret = __btrfs_drop_extents(trans, root, inode, path, file_pos,
+				   file_pos + num_bytes, NULL, 0,
+				   1, sizeof(*fi), &extent_inserted);
+	if (ret)
+		goto out;
+
+	if (!extent_inserted) {
+		ins.objectid = btrfs_ino(inode);
+		ins.offset = file_pos;
+		ins.type = BTRFS_EXTENT_DATA_KEY;
+
+		path->leave_spinning = 1;
+		ret = btrfs_insert_empty_item(trans, root, path, &ins,
+					      sizeof(*fi));
+		if (ret)
+			goto out;
+	}
+	leaf = path->nodes[0];
+	fi = btrfs_item_ptr(leaf, path->slots[0],
+			    struct btrfs_file_extent_item);
+	btrfs_set_file_extent_generation(leaf, fi, trans->transid);
+	btrfs_set_file_extent_type(leaf, fi, extent_type);
+	btrfs_set_file_extent_disk_bytenr(leaf, fi, disk_bytenr);
+	btrfs_set_file_extent_disk_num_bytes(leaf, fi, disk_num_bytes);
+	btrfs_set_file_extent_offset(leaf, fi, 0);
+	btrfs_set_file_extent_num_bytes(leaf, fi, num_bytes);
+	btrfs_set_file_extent_ram_bytes(leaf, fi, ram_bytes);
+	btrfs_set_file_extent_compression(leaf, fi, compression);
+	btrfs_set_file_extent_encryption(leaf, fi, encryption);
+	btrfs_set_file_extent_other_encoding(leaf, fi, other_encoding);
+
+	btrfs_mark_buffer_dirty(leaf);
+	btrfs_release_path(path);
+
+	inode_add_bytes(inode, num_bytes);
+
+	ins.objectid = disk_bytenr;
+	ins.offset = disk_num_bytes;
+	ins.type = BTRFS_EXTENT_ITEM_KEY;
+	ret = btrfs_alloc_reserved_file_extent(trans, root,
+					root->root_key.objectid,
+					btrfs_ino(inode), file_pos,
+					ram_bytes, &ins);
+	/*
+	 * Release the reserved range from inode dirty range map, as it is
+	 * already moved into delayed_ref_head
+	 */
+	btrfs_qgroup_release_data(inode, file_pos, ram_bytes);
+out:
+	btrfs_free_path(path);
+
+	return ret;
+}
+
+/* snapshot-aware defrag */
+struct sa_defrag_extent_backref {
+	struct rb_node node;
+	struct old_sa_defrag_extent *old;
+	u64 root_id;
+	u64 inum;
+	u64 file_pos;
+	u64 extent_offset;
+	u64 num_bytes;
+	u64 generation;
+};
+
+struct old_sa_defrag_extent {
+	struct list_head list;
+	struct new_sa_defrag_extent *new;
+
+	u64 extent_offset;
+	u64 bytenr;
+	u64 offset;
+	u64 len;
+	int count;
+};
+
+struct new_sa_defrag_extent {
+	struct rb_root root;
+	struct list_head head;
+	struct btrfs_path *path;
+	struct inode *inode;
+	u64 file_pos;
+	u64 len;
+	u64 bytenr;
+	u64 disk_len;
+	u8 compress_type;
+};
+
+static int backref_comp(struct sa_defrag_extent_backref *b1,
+			struct sa_defrag_extent_backref *b2)
+{
+	if (b1->root_id < b2->root_id)
+		return -1;
+	else if (b1->root_id > b2->root_id)
+		return 1;
+
+	if (b1->inum < b2->inum)
+		return -1;
+	else if (b1->inum > b2->inum)
+		return 1;
+
+	if (b1->file_pos < b2->file_pos)
+		return -1;
+	else if (b1->file_pos > b2->file_pos)
+		return 1;
+
+	/*
+	 * [------------------------------] ===> (a range of space)
+	 *     |<--->|   |<---->| =============> (fs/file tree A)
+	 * |<---------------------------->| ===> (fs/file tree B)
+	 *
+	 * A range of space can refer to two file extents in one tree while
+	 * refer to only one file extent in another tree.
+	 *
+	 * So we may process a disk offset more than one time(two extents in A)
+	 * and locate at the same extent(one extent in B), then insert two same
+	 * backrefs(both refer to the extent in B).
+	 */
+	return 0;
+}
+
+static void backref_insert(struct rb_root *root,
+			   struct sa_defrag_extent_backref *backref)
+{
+	struct rb_node **p = &root->rb_node;
+	struct rb_node *parent = NULL;
+	struct sa_defrag_extent_backref *entry;
+	int ret;
+
+	while (*p) {
+		parent = *p;
+		entry = rb_entry(parent, struct sa_defrag_extent_backref, node);
+
+		ret = backref_comp(backref, entry);
+		if (ret < 0)
+			p = &(*p)->rb_left;
+		else
+			p = &(*p)->rb_right;
+	}
+
+	rb_link_node(&backref->node, parent, p);
+	rb_insert_color(&backref->node, root);
+}
+
+/*
+ * Note the backref might has changed, and in this case we just return 0.
+ */
+static noinline int record_one_backref(u64 inum, u64 offset, u64 root_id,
+				       void *ctx)
+{
+	struct btrfs_file_extent_item *extent;
+	struct btrfs_fs_info *fs_info;
+	struct old_sa_defrag_extent *old = ctx;
+	struct new_sa_defrag_extent *new = old->new;
+	struct btrfs_path *path = new->path;
+	struct btrfs_key key;
+	struct btrfs_root *root;
+	struct sa_defrag_extent_backref *backref;
+	struct extent_buffer *leaf;
+	struct inode *inode = new->inode;
+	int slot;
+	int ret;
+	u64 extent_offset;
+	u64 num_bytes;
+
+	if (BTRFS_I(inode)->root->root_key.objectid == root_id &&
+	    inum == btrfs_ino(inode))
+		return 0;
+
+	key.objectid = root_id;
+	key.type = BTRFS_ROOT_ITEM_KEY;
+	key.offset = (u64)-1;
+
+	fs_info = BTRFS_I(inode)->root->fs_info;
+	root = btrfs_read_fs_root_no_name(fs_info, &key);
+	if (IS_ERR(root)) {
+		if (PTR_ERR(root) == -ENOENT)
+			return 0;
+		WARN_ON(1);
+		pr_debug("inum=%llu, offset=%llu, root_id=%llu\n",
+			 inum, offset, root_id);
+		return PTR_ERR(root);
+	}
+
+	key.objectid = inum;
+	key.type = BTRFS_EXTENT_DATA_KEY;
+	if (offset > (u64)-1 << 32)
+		key.offset = 0;
+	else
+		key.offset = offset;
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (WARN_ON(ret < 0))
+		return ret;
+	ret = 0;
+
+	while (1) {
+		cond_resched();
+
+		leaf = path->nodes[0];
+		slot = path->slots[0];
+
+		if (slot >= btrfs_header_nritems(leaf)) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0) {
+				goto out;
+			} else if (ret > 0) {
+				ret = 0;
+				goto out;
 			}
-		}else if ((data[0] == 0x16) && (data[1] == 0xA6)) {
-			if(testmode == OPEN_TEST) {
-				regAdd[0] = 0xD0;
-				regAdd[1] = 0x00;
-				regAdd[2] = 0x9C;
+			continue;
+		}
 
-				fts_read_reg(info, regAdd, 3, regAddOff, 3);
-				fts_delay(10);
+		path->slots[0]++;
 
-				regAdd[1] = regAddOff[2];
-				regAdd[2] = regAddOff[1];
+		btrfs_item_key_to_cpu(leaf, &key, slot);
 
-				fts_read_reg(info, regAdd, 3, data, 3);
+		if (key.objectid > inum)
+			goto out;
 
-				if((data[1] & 0xff) == 0x0) {
-					result = 0;
-					input_info(true, &info->client->dev, "%s: Connection Checking success \n", __func__);
-				} else {
-					result = -1;
-					input_info(true, &info->client->dev, "%s: Connection Checking fail \n", __func__);
+		if (key.objectid < inum || key.type != BTRFS_EXTENT_DATA_KEY)
+			continue;
+
+		extent = btrfs_item_ptr(leaf, slot,
+					struct btrfs_file_extent_item);
+
+		if (btrfs_file_extent_disk_bytenr(leaf, extent) != old->bytenr)
+			continue;
+
+		/*
+		 * 'offset' refers to the exact key.offset,
+		 * NOT the 'offset' field in btrfs_extent_data_ref, ie.
+		 * (key.offset - extent_offset).
+		 */
+		if (key.offset != offset)
+			continue;
+
+		extent_offset = btrfs_file_extent_offset(leaf, extent);
+		num_bytes = btrfs_file_extent_num_bytes(leaf, extent);
+
+		if (extent_offset >= old->extent_offset + old->offset +
+		    old->len || extent_offset + num_bytes <=
+		    old->extent_offset + old->offset)
+			continue;
+		break;
+	}
+
+	backref = kmalloc(sizeof(*backref), GFP_NOFS);
+	if (!backref) {
+		ret = -ENOENT;
+		goto out;
+	}
+
+	backref->root_id = root_id;
+	backref->inum = inum;
+	backref->file_pos = offset;
+	backref->num_bytes = num_bytes;
+	backref->extent_offset = extent_offset;
+	backref->generation = btrfs_file_extent_generation(leaf, extent);
+	backref->old = old;
+	backref_insert(&new->root, backref);
+	old->count++;
+out:
+	btrfs_release_path(path);
+	WARN_ON(ret);
+	return ret;
+}
+
+static noinline bool record_extent_backrefs(struct btrfs_path *path,
+				   struct new_sa_defrag_extent *new)
+{
+	struct btrfs_fs_info *fs_info = BTRFS_I(new->inode)->root->fs_info;
+	struct old_sa_defrag_extent *old, *tmp;
+	int ret;
+
+	new->path = path;
+
+	list_for_each_entry_safe(old, tmp, &new->head, list) {
+		ret = iterate_inodes_from_logical(old->bytenr +
+						  old->extent_offset, fs_info,
+						  path, record_one_backref,
+						  old);
+		if (ret < 0 && ret != -ENOENT)
+			return false;
+
+		/* no backref to be processed for this extent */
+		if (!old->count) {
+			list_del(&old->list);
+			kfree(old);
+		}
+	}
+
+	if (list_empty(&new->head))
+		return false;
+
+	return true;
+}
+
+static int relink_is_mergable(struct extent_buffer *leaf,
+			      struct btrfs_file_extent_item *fi,
+			      struct new_sa_defrag_extent *new)
+{
+	if (btrfs_file_extent_disk_bytenr(leaf, fi) != new->bytenr)
+		return 0;
+
+	if (btrfs_file_extent_type(leaf, fi) != BTRFS_FILE_EXTENT_REG)
+		return 0;
+
+	if (btrfs_file_extent_compression(leaf, fi) != new->compress_type)
+		return 0;
+
+	if (btrfs_file_extent_encryption(leaf, fi) ||
+	    btrfs_file_extent_other_encoding(leaf, fi))
+		return 0;
+
+	return 1;
+}
+
+/*
+ * Note the backref might has changed, and in this case we just return 0.
+ */
+static noinline int relink_extent_backref(struct btrfs_path *path,
+				 struct sa_defrag_extent_backref *prev,
+				 struct sa_defrag_extent_backref *backref)
+{
+	struct btrfs_file_extent_item *extent;
+	struct btrfs_file_extent_item *item;
+	struct btrfs_ordered_extent *ordered;
+	struct btrfs_trans_handle *trans;
+	struct btrfs_fs_info *fs_info;
+	struct btrfs_root *root;
+	struct btrfs_key key;
+	struct extent_buffer *leaf;
+	struct old_sa_defrag_extent *old = backref->old;
+	struct new_sa_defrag_extent *new = old->new;
+	struct inode *src_inode = new->inode;
+	struct inode *inode;
+	struct extent_state *cached = NULL;
+	int ret = 0;
+	u64 start;
+	u64 len;
+	u64 lock_start;
+	u64 lock_end;
+	bool merge = false;
+	int index;
+
+	if (prev && prev->root_id == backref->root_id &&
+	    prev->inum == backref->inum &&
+	    prev->file_pos + prev->num_bytes == backref->file_pos)
+		merge = true;
+
+	/* step 1: get root */
+	key.objectid = backref->root_id;
+	key.type = BTRFS_ROOT_ITEM_KEY;
+	key.offset = (u64)-1;
+
+	fs_info = BTRFS_I(src_inode)->root->fs_info;
+	index = srcu_read_lock(&fs_info->subvol_srcu);
+
+	root = btrfs_read_fs_root_no_name(fs_info, &key);
+	if (IS_ERR(root)) {
+		srcu_read_unlock(&fs_info->subvol_srcu, index);
+		if (PTR_ERR(root) == -ENOENT)
+			return 0;
+		return PTR_ERR(root);
+	}
+
+	if (btrfs_root_readonly(root)) {
+		srcu_read_unlock(&fs_info->subvol_srcu, index);
+		return 0;
+	}
+
+	/* step 2: get inode */
+	key.objectid = backref->inum;
+	key.type = BTRFS_INODE_ITEM_KEY;
+	key.offset = 0;
+
+	inode = btrfs_iget(fs_info->sb, &key, root, NULL);
+	if (IS_ERR(inode)) {
+		srcu_read_unlock(&fs_info->subvol_srcu, index);
+		return 0;
+	}
+
+	srcu_read_unlock(&fs_info->subvol_srcu, index);
+
+	/* step 3: relink backref */
+	lock_start = backref->file_pos;
+	lock_end = backref->file_pos + backref->num_bytes - 1;
+	lock_extent_bits(&BTRFS_I(inode)->io_tree, lock_start, lock_end,
+			 0, &cached);
+
+	ordered = btrfs_lookup_first_ordered_extent(inode, lock_end);
+	if (ordered) {
+		btrfs_put_ordered_extent(ordered);
+		goto out_unlock;
+	}
+
+	trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		goto out_unlock;
+	}
+
+	key.objectid = backref->inum;
+	key.type = BTRFS_EXTENT_DATA_KEY;
+	key.offset = backref->file_pos;
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (ret < 0) {
+		goto out_free_path;
+	} else if (ret > 0) {
+		ret = 0;
+		goto out_free_path;
+	}
+
+	extent = btrfs_item_ptr(path->nodes[0], path->slots[0],
+				struct btrfs_file_extent_item);
+
+	if (btrfs_file_extent_generation(path->nodes[0], extent) !=
+	    backref->generation)
+		goto out_free_path;
+
+	btrfs_release_path(path);
+
+	start = backref->file_pos;
+	if (backref->extent_offset < old->extent_offset + old->offset)
+		start += old->extent_offset + old->offset -
+			 backref->extent_offset;
+
+	len = min(backref->extent_offset + backref->num_bytes,
+		  old->extent_offset + old->offset + old->len);
+	len -= max(backref->extent_offset, old->extent_offset + old->offset);
+
+	ret = btrfs_drop_extents(trans, root, inode, start,
+				 start + len, 1);
+	if (ret)
+		goto out_free_path;
+again:
+	key.objectid = btrfs_ino(inode);
+	key.type = BTRFS_EXTENT_DATA_KEY;
+	key.offset = start;
+
+	path->leave_spinning = 1;
+	if (merge) {
+		struct btrfs_file_extent_item *fi;
+		u64 extent_len;
+		struct btrfs_key found_key;
+
+		ret = btrfs_search_slot(trans, root, &key, path, 0, 1);
+		if (ret < 0)
+			goto out_free_path;
+
+		path->slots[0]--;
+		leaf = path->nodes[0];
+		btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+
+		fi = btrfs_item_ptr(leaf, path->slots[0],
+				    struct btrfs_file_extent_item);
+		extent_len = btrfs_file_extent_num_bytes(leaf, fi);
+
+		if (extent_len + found_key.offset == start &&
+		    relink_is_mergable(leaf, fi, new)) {
+			btrfs_set_file_extent_num_bytes(leaf, fi,
+							extent_len + len);
+			btrfs_mark_buffer_dirty(leaf);
+			inode_add_bytes(inode, len);
+
+			ret = 1;
+			goto out_free_path;
+		} else {
+			merge = false;
+			btrfs_release_path(path);
+			goto again;
+		}
+	}
+
+	ret = btrfs_insert_empty_item(trans, root, path, &key,
+					sizeof(*extent));
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto out_free_path;
+	}
+
+	leaf = path->nodes[0];
+	item = btrfs_item_ptr(leaf, path->slots[0],
+				struct btrfs_file_extent_item);
+	btrfs_set_file_extent_disk_bytenr(leaf, item, new->bytenr);
+	btrfs_set_file_extent_disk_num_bytes(leaf, item, new->disk_len);
+	btrfs_set_file_extent_offset(leaf, item, start - new->file_pos);
+	btrfs_set_file_extent_num_bytes(leaf, item, len);
+	btrfs_set_file_extent_ram_bytes(leaf, item, new->len);
+	btrfs_set_file_extent_generation(leaf, item, trans->transid);
+	btrfs_set_file_extent_type(leaf, item, BTRFS_FILE_EXTENT_REG);
+	btrfs_set_file_extent_compression(leaf, item, new->compress_type);
+	btrfs_set_file_extent_encryption(leaf, item, 0);
+	btrfs_set_file_extent_other_encoding(leaf, item, 0);
+
+	btrfs_mark_buffer_dirty(leaf);
+	inode_add_bytes(inode, len);
+	btrfs_release_path(path);
+
+	ret = btrfs_inc_extent_ref(trans, root, new->bytenr,
+			new->disk_len, 0,
+			backref->root_id, backref->inum,
+			new->file_pos);	/* start - extent_offset */
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto out_free_path;
+	}
+
+	ret = 1;
+out_free_path:
+	btrfs_release_path(path);
+	path->leave_spinning = 0;
+	btrfs_end_transaction(trans, root);
+out_unlock:
+	unlock_extent_cached(&BTRFS_I(inode)->io_tree, lock_start, lock_end,
+			     &cached, GFP_NOFS);
+	iput(inode);
+	return ret;
+}
+
+static void free_sa_defrag_extent(struct new_sa_defrag_extent *new)
+{
+	struct old_sa_defrag_extent *old, *tmp;
+
+	if (!new)
+		return;
+
+	list_for_each_entry_safe(old, tmp, &new->head, list) {
+		kfree(old);
+	}
+	kfree(new);
+}
+
+static void relink_file_extents(struct new_sa_defrag_extent *new)
+{
+	struct btrfs_path *path;
+	struct sa_defrag_extent_backref *backref;
+	struct sa_defrag_extent_backref *prev = NULL;
+	struct inode *inode;
+	struct btrfs_root *root;
+	struct rb_node *node;
+	int ret;
+
+	inode = new->inode;
+	root = BTRFS_I(inode)->root;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return;
+
+	if (!record_extent_backrefs(path, new)) {
+		btrfs_free_path(path);
+		goto out;
+	}
+	btrfs_release_path(path);
+
+	while (1) {
+		node = rb_first(&new->root);
+		if (!node)
+			break;
+		rb_erase(node, &new->root);
+
+		backref = rb_entry(node, struct sa_defrag_extent_backref, node);
+
+		ret = relink_extent_backref(path, prev, backref);
+		WARN_ON(ret < 0);
+
+		kfree(prev);
+
+		if (ret == 1)
+			prev = backref;
+		else
+			prev = NULL;
+		cond_resched();
+	}
+	kfree(prev);
+
+	btrfs_free_path(path);
+out:
+	free_sa_defrag_extent(new);
+
+	atomic_dec(&root->fs_info->defrag_running);
+	wake_up(&root->fs_info->transaction_wait);
+}
+
+static struct new_sa_defrag_extent *
+record_old_file_extents(struct inode *inode,
+			struct btrfs_ordered_extent *ordered)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_path *path;
+	struct btrfs_key key;
+	struct old_sa_defrag_extent *old;
+	struct new_sa_defrag_extent *new;
+	int ret;
+
+	new = kmalloc(sizeof(*new), GFP_NOFS);
+	if (!new)
+		return NULL;
+
+	new->inode = inode;
+	new->file_pos = ordered->file_offset;
+	new->len = ordered->len;
+	new->bytenr = ordered->start;
+	new->disk_len = ordered->disk_len;
+	new->compress_type = ordered->compress_type;
+	new->root = RB_ROOT;
+	INIT_LIST_HEAD(&new->head);
+
+	path = btrfs_alloc_path();
+	if (!path)
+		goto out_kfree;
+
+	key.objectid = btrfs_ino(inode);
+	key.type = BTRFS_EXTENT_DATA_KEY;
+	key.offset = new->file_pos;
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (ret < 0)
+		goto out_free_path;
+	if (ret > 0 && path->slots[0] > 0)
+		path->slots[0]--;
+
+	/* find out all the old extents for the file range */
+	while (1) {
+		struct btrfs_file_extent_item *extent;
+		struct extent_buffer *l;
+		int slot;
+		u64 num_bytes;
+		u64 offset;
+		u64 end;
+		u64 disk_bytenr;
+		u64 extent_offset;
+
+		l = path->nodes[0];
+		slot = path->slots[0];
+
+		if (slot >= btrfs_header_nritems(l)) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0)
+				goto out_free_path;
+			else if (ret > 0)
+				break;
+			continue;
+		}
+
+		btrfs_item_key_to_cpu(l, &key, slot);
+
+		if (key.objectid != btrfs_ino(inode))
+			break;
+		if (key.type != BTRFS_EXTENT_DATA_KEY)
+			break;
+		if (key.offset >= new->file_pos + new->len)
+			break;
+
+		extent = btrfs_item_ptr(l, slot, struct btrfs_file_extent_item);
+
+		num_bytes = btrfs_file_extent_num_bytes(l, extent);
+		if (key.offset + num_bytes < new->file_pos)
+			goto next;
+
+		disk_bytenr = btrfs_file_extent_disk_bytenr(l, extent);
+		if (!disk_bytenr)
+			goto next;
+
+		extent_offset = btrfs_file_extent_offset(l, extent);
+
+		old = kmalloc(sizeof(*old), GFP_NOFS);
+		if (!old)
+			goto out_free_path;
+
+		offset = max(new->file_pos, key.offset);
+		end = min(new->file_pos + new->len, key.offset + num_bytes);
+
+		old->bytenr = disk_bytenr;
+		old->extent_offset = extent_offset;
+		old->offset = offset - key.offset;
+		old->len = end - offset;
+		old->new = new;
+		old->count = 0;
+		list_add_tail(&old->list, &new->head);
+next:
+		path->slots[0]++;
+		cond_resched();
+	}
+
+	btrfs_free_path(path);
+	atomic_inc(&root->fs_info->defrag_running);
+
+	return new;
+
+out_free_path:
+	btrfs_free_path(path);
+out_kfree:
+	free_sa_defrag_extent(new);
+	return NULL;
+}
+
+static void btrfs_release_delalloc_bytes(struct btrfs_root *root,
+					 u64 start, u64 len)
+{
+	struct btrfs_block_group_cache *cache;
+
+	cache = btrfs_lookup_block_group(root->fs_info, start);
+	ASSERT(cache);
+
+	spin_lock(&cache->lock);
+	cache->delalloc_bytes -= len;
+	spin_unlock(&cache->lock);
+
+	btrfs_put_block_group(cache);
+}
+
+/* as ordered data IO finishes, this gets called so we can finish
+ * an ordered extent if the range of bytes in the file it covers are
+ * fully written.
+ */
+static int btrfs_finish_ordered_io(struct btrfs_ordered_extent *ordered_extent)
+{
+	struct inode *inode = ordered_extent->inode;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_trans_handle *trans = NULL;
+	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+	struct extent_state *cached_state = NULL;
+	struct new_sa_defrag_extent *new = NULL;
+	int compress_type = 0;
+	int ret = 0;
+	u64 logical_len = ordered_extent->len;
+	bool nolock;
+	bool truncated = false;
+
+	nolock = btrfs_is_free_space_inode(inode);
+
+	if (test_bit(BTRFS_ORDERED_IOERR, &ordered_extent->flags)) {
+		ret = -EIO;
+		goto out;
+	}
+
+	btrfs_free_io_failure_record(inode, ordered_extent->file_offset,
+				     ordered_extent->file_offset +
+				     ordered_extent->len - 1);
+
+	if (test_bit(BTRFS_ORDERED_TRUNCATED, &ordered_extent->flags)) {
+		truncated = true;
+		logical_len = ordered_extent->truncated_len;
+		/* Truncated the entire extent, don't bother adding */
+		if (!logical_len)
+			goto out;
+	}
+
+	if (test_bit(BTRFS_ORDERED_NOCOW, &ordered_extent->flags)) {
+		BUG_ON(!list_empty(&ordered_extent->list)); /* Logic error */
+
+		/*
+		 * For mwrite(mmap + memset to write) case, we still reserve
+		 * space for NOCOW range.
+		 * As NOCOW won't cause a new delayed ref, just free the space
+		 */
+		btrfs_qgroup_free_data(inode, ordered_extent->file_offset,
+				       ordered_extent->len);
+		btrfs_ordered_update_i_size(inode, 0, ordered_extent);
+		if (nolock)
+			trans = btrfs_join_transaction_nolock(root);
+		else
+			trans = btrfs_join_transaction(root);
+		if (IS_ERR(trans)) {
+			ret = PTR_ERR(trans);
+			trans = NULL;
+			goto out;
+		}
+		trans->block_rsv = &root->fs_info->delalloc_block_rsv;
+		ret = btrfs_update_inode_fallback(trans, root, inode);
+		if (ret) /* -ENOMEM or corruption */
+			btrfs_abort_transaction(trans, root, ret);
+		goto out;
+	}
+
+	lock_extent_bits(io_tree, ordered_extent->file_offset,
+			 ordered_extent->file_offset + ordered_extent->len - 1,
+			 0, &cached_state);
+
+	ret = test_range_bit(io_tree, ordered_extent->file_offset,
+			ordered_extent->file_offset + ordered_extent->len - 1,
+			EXTENT_DEFRAG, 1, cached_state);
+	if (ret) {
+		u64 last_snapshot = btrfs_root_last_snapshot(&root->root_item);
+		if (0 && last_snapshot >= BTRFS_I(inode)->generation)
+			/* the inode is shared */
+			new = record_old_file_extents(inode, ordered_extent);
+
+		clear_extent_bit(io_tree, ordered_extent->file_offset,
+			ordered_extent->file_offset + ordered_extent->len - 1,
+			EXTENT_DEFRAG, 0, 0, &cached_state, GFP_NOFS);
+	}
+
+	if (nolock)
+		trans = btrfs_join_transaction_nolock(root);
+	else
+		trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans)) {
+		ret = PTR_ERR(trans);
+		trans = NULL;
+		goto out_unlock;
+	}
+
+	trans->block_rsv = &root->fs_info->delalloc_block_rsv;
+
+	if (test_bit(BTRFS_ORDERED_COMPRESSED, &ordered_extent->flags))
+		compress_type = ordered_extent->compress_type;
+	if (test_bit(BTRFS_ORDERED_PREALLOC, &ordered_extent->flags)) {
+		BUG_ON(compress_type);
+		ret = btrfs_mark_extent_written(trans, inode,
+						ordered_extent->file_offset,
+						ordered_extent->file_offset +
+						logical_len);
+	} else {
+		BUG_ON(root == root->fs_info->tree_root);
+		ret = insert_reserved_file_extent(trans, inode,
+						ordered_extent->file_offset,
+						ordered_extent->start,
+						ordered_extent->disk_len,
+						logical_len, logical_len,
+						compress_type, 0, 0,
+						BTRFS_FILE_EXTENT_REG);
+		if (!ret)
+			btrfs_release_delalloc_bytes(root,
+						     ordered_extent->start,
+						     ordered_extent->disk_len);
+	}
+	unpin_extent_cache(&BTRFS_I(inode)->extent_tree,
+			   ordered_extent->file_offset, ordered_extent->len,
+			   trans->transid);
+	if (ret < 0) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto out_unlock;
+	}
+
+	add_pending_csums(trans, inode, ordered_extent->file_offset,
+			  &ordered_extent->list);
+
+	btrfs_ordered_update_i_size(inode, 0, ordered_extent);
+	ret = btrfs_update_inode_fallback(trans, root, inode);
+	if (ret) { /* -ENOMEM or corruption */
+		btrfs_abort_transaction(trans, root, ret);
+		goto out_unlock;
+	}
+	ret = 0;
+out_unlock:
+	unlock_extent_cached(io_tree, ordered_extent->file_offset,
+			     ordered_extent->file_offset +
+			     ordered_extent->len - 1, &cached_state, GFP_NOFS);
+out:
+	if (root != root->fs_info->tree_root)
+		btrfs_delalloc_release_metadata(inode, ordered_extent->len);
+	if (trans)
+		btrfs_end_transaction(trans, root);
+
+	if (ret || truncated) {
+		u64 start, end;
+
+		if (truncated)
+			start = ordered_extent->file_offset + logical_len;
+		else
+			start = ordered_extent->file_offset;
+		end = ordered_extent->file_offset + ordered_extent->len - 1;
+		clear_extent_uptodate(io_tree, start, end, NULL, GFP_NOFS);
+
+		/* Drop the cache for the part of the extent we didn't write. */
+		btrfs_drop_extent_cache(inode, start, end, 0);
+
+		/*
+		 * If the ordered extent had an IOERR or something else went
+		 * wrong we need to return the space for this ordered extent
+		 * back to the allocator.  We only free the extent in the
+		 * truncated case if we didn't write out the extent at all.
+		 */
+		if ((ret || !logical_len) &&
+		    !test_bit(BTRFS_ORDERED_NOCOW, &ordered_extent->flags) &&
+		    !test_bit(BTRFS_ORDERED_PREALLOC, &ordered_extent->flags))
+			btrfs_free_reserved_extent(root, ordered_extent->start,
+						   ordered_extent->disk_len, 1);
+	}
+
+
+	/*
+	 * This needs to be done to make sure anybody waiting knows we are done
+	 * updating everything for this ordered extent.
+	 */
+	btrfs_remove_ordered_extent(inode, ordered_extent);
+
+	/* for snapshot-aware defrag */
+	if (new) {
+		if (ret) {
+			free_sa_defrag_extent(new);
+			atomic_dec(&root->fs_info->defrag_running);
+		} else {
+			relink_file_extents(new);
+		}
+	}
+
+	/* once for us */
+	btrfs_put_ordered_extent(ordered_extent);
+	/* once for the tree */
+	btrfs_put_ordered_extent(ordered_extent);
+
+	return ret;
+}
+
+static void finish_ordered_fn(struct btrfs_work *work)
+{
+	struct btrfs_ordered_extent *ordered_extent;
+	ordered_extent = container_of(work, struct btrfs_ordered_extent, work);
+	btrfs_finish_ordered_io(ordered_extent);
+}
+
+static int btrfs_writepage_end_io_hook(struct page *page, u64 start, u64 end,
+				struct extent_state *state, int uptodate)
+{
+	struct inode *inode = page->mapping->host;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_ordered_extent *ordered_extent = NULL;
+	struct btrfs_workqueue *wq;
+	btrfs_work_func_t func;
+
+	trace_btrfs_writepage_end_io_hook(page, start, end, uptodate);
+
+	ClearPagePrivate2(page);
+	if (!btrfs_dec_test_ordered_pending(inode, &ordered_extent, start,
+					    end - start + 1, uptodate))
+		return 0;
+
+	if (btrfs_is_free_space_inode(inode)) {
+		wq = root->fs_info->endio_freespace_worker;
+		func = btrfs_freespace_write_helper;
+	} else {
+		wq = root->fs_info->endio_write_workers;
+		func = btrfs_endio_write_helper;
+	}
+
+	btrfs_init_work(&ordered_extent->work, func, finish_ordered_fn, NULL,
+			NULL);
+	btrfs_queue_work(wq, &ordered_extent->work);
+
+	return 0;
+}
+
+static int __readpage_endio_check(struct inode *inode,
+				  struct btrfs_io_bio *io_bio,
+				  int icsum, struct page *page,
+				  int pgoff, u64 start, size_t len)
+{
+	char *kaddr;
+	u32 csum_expected;
+	u32 csum = ~(u32)0;
+
+	csum_expected = *(((u32 *)io_bio->csum) + icsum);
+
+	kaddr = kmap_atomic(page);
+	csum = btrfs_csum_data(kaddr + pgoff, csum,  len);
+	btrfs_csum_final(csum, (char *)&csum);
+	if (csum != csum_expected)
+		goto zeroit;
+
+	kunmap_atomic(kaddr);
+	return 0;
+zeroit:
+	btrfs_warn_rl(BTRFS_I(inode)->root->fs_info,
+		"csum failed ino %llu off %llu csum %u expected csum %u",
+			   btrfs_ino(inode), start, csum, csum_expected);
+	memset(kaddr + pgoff, 1, len);
+	flush_dcache_page(page);
+	kunmap_atomic(kaddr);
+	if (csum_expected == 0)
+		return 0;
+	return -EIO;
+}
+
+/*
+ * when reads are done, we need to check csums to verify the data is correct
+ * if there's a match, we allow the bio to finish.  If not, the code in
+ * extent_io.c will try to find good copies for us.
+ */
+static int btrfs_readpage_end_io_hook(struct btrfs_io_bio *io_bio,
+				      u64 phy_offset, struct page *page,
+				      u64 start, u64 end, int mirror)
+{
+	size_t offset = start - page_offset(page);
+	struct inode *inode = page->mapping->host;
+	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+
+	if (PageChecked(page)) {
+		ClearPageChecked(page);
+		return 0;
+	}
+
+	if (BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM)
+		return 0;
+
+	if (root->root_key.objectid == BTRFS_DATA_RELOC_TREE_OBJECTID &&
+	    test_range_bit(io_tree, start, end, EXTENT_NODATASUM, 1, NULL)) {
+		clear_extent_bits(io_tree, start, end, EXTENT_NODATASUM,
+				  GFP_NOFS);
+		return 0;
+	}
+
+	phy_offset >>= inode->i_sb->s_blocksize_bits;
+	return __readpage_endio_check(inode, io_bio, phy_offset, page, offset,
+				      start, (size_t)(end - start + 1));
+}
+
+struct delayed_iput {
+	struct list_head list;
+	struct inode *inode;
+};
+
+/* JDM: If this is fs-wide, why can't we add a pointer to
+ * btrfs_inode instead and avoid the allocation? */
+void btrfs_add_delayed_iput(struct inode *inode)
+{
+	struct btrfs_fs_info *fs_info = BTRFS_I(inode)->root->fs_info;
+	struct delayed_iput *delayed;
+
+	if (atomic_add_unless(&inode->i_count, -1, 1))
+		return;
+
+	delayed = kmalloc(sizeof(*delayed), GFP_NOFS | __GFP_NOFAIL);
+	delayed->inode = inode;
+
+	spin_lock(&fs_info->delayed_iput_lock);
+	list_add_tail(&delayed->list, &fs_info->delayed_iputs);
+	spin_unlock(&fs_info->delayed_iput_lock);
+}
+
+void btrfs_run_delayed_iputs(struct btrfs_root *root)
+{
+	LIST_HEAD(list);
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct delayed_iput *delayed;
+	int empty;
+
+	spin_lock(&fs_info->delayed_iput_lock);
+	empty = list_empty(&fs_info->delayed_iputs);
+	spin_unlock(&fs_info->delayed_iput_lock);
+	if (empty)
+		return;
+
+	spin_lock(&fs_info->delayed_iput_lock);
+	list_splice_init(&fs_info->delayed_iputs, &list);
+	spin_unlock(&fs_info->delayed_iput_lock);
+
+	while (!list_empty(&list)) {
+		delayed = list_entry(list.next, struct delayed_iput, list);
+		list_del(&delayed->list);
+		iput(delayed->inode);
+		kfree(delayed);
+	}
+}
+
+/*
+ * This is called in transaction commit time. If there are no orphan
+ * files in the subvolume, it removes orphan item and frees block_rsv
+ * structure.
+ */
+void btrfs_orphan_commit_root(struct btrfs_trans_handle *trans,
+			      struct btrfs_root *root)
+{
+	struct btrfs_block_rsv *block_rsv;
+	int ret;
+
+	if (atomic_read(&root->orphan_inodes) ||
+	    root->orphan_cleanup_state != ORPHAN_CLEANUP_DONE)
+		return;
+
+	spin_lock(&root->orphan_lock);
+	if (atomic_read(&root->orphan_inodes)) {
+		spin_unlock(&root->orphan_lock);
+		return;
+	}
+
+	if (root->orphan_cleanup_state != ORPHAN_CLEANUP_DONE) {
+		spin_unlock(&root->orphan_lock);
+		return;
+	}
+
+	block_rsv = root->orphan_block_rsv;
+	root->orphan_block_rsv = NULL;
+	spin_unlock(&root->orphan_lock);
+
+	if (test_bit(BTRFS_ROOT_ORPHAN_ITEM_INSERTED, &root->state) &&
+	    btrfs_root_refs(&root->root_item) > 0) {
+		ret = btrfs_del_orphan_item(trans, root->fs_info->tree_root,
+					    root->root_key.objectid);
+		if (ret)
+			btrfs_abort_transaction(trans, root, ret);
+		else
+			clear_bit(BTRFS_ROOT_ORPHAN_ITEM_INSERTED,
+				  &root->state);
+	}
+
+	if (block_rsv) {
+		WARN_ON(block_rsv->size > 0);
+		btrfs_free_block_rsv(root, block_rsv);
+	}
+}
+
+/*
+ * This creates an orphan entry for the given inode in case something goes
+ * wrong in the middle of an unlink/truncate.
+ *
+ * NOTE: caller of this function should reserve 5 units of metadata for
+ *	 this function.
+ */
+int btrfs_orphan_add(struct btrfs_trans_handle *trans, struct inode *inode)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_block_rsv *block_rsv = NULL;
+	int reserve = 0;
+	int insert = 0;
+	int ret;
+
+	if (!root->orphan_block_rsv) {
+		block_rsv = btrfs_alloc_block_rsv(root, BTRFS_BLOCK_RSV_TEMP);
+		if (!block_rsv)
+			return -ENOMEM;
+	}
+
+	spin_lock(&root->orphan_lock);
+	if (!root->orphan_block_rsv) {
+		root->orphan_block_rsv = block_rsv;
+	} else if (block_rsv) {
+		btrfs_free_block_rsv(root, block_rsv);
+		block_rsv = NULL;
+	}
+
+	if (!test_and_set_bit(BTRFS_INODE_HAS_ORPHAN_ITEM,
+			      &BTRFS_I(inode)->runtime_flags)) {
+#if 0
+		/*
+		 * For proper ENOSPC handling, we should do orphan
+		 * cleanup when mounting. But this introduces backward
+		 * compatibility issue.
+		 */
+		if (!xchg(&root->orphan_item_inserted, 1))
+			insert = 2;
+		else
+			insert = 1;
+#endif
+		insert = 1;
+		atomic_inc(&root->orphan_inodes);
+	}
+
+	if (!test_and_set_bit(BTRFS_INODE_ORPHAN_META_RESERVED,
+			      &BTRFS_I(inode)->runtime_flags))
+		reserve = 1;
+	spin_unlock(&root->orphan_lock);
+
+	/* grab metadata reservation from transaction handle */
+	if (reserve) {
+		ret = btrfs_orphan_reserve_metadata(trans, inode);
+		BUG_ON(ret); /* -ENOSPC in reservation; Logic error? JDM */
+	}
+
+	/* insert an orphan item to track this unlinked/truncated file */
+	if (insert >= 1) {
+		ret = btrfs_insert_orphan_item(trans, root, btrfs_ino(inode));
+		if (ret) {
+			atomic_dec(&root->orphan_inodes);
+			if (reserve) {
+				clear_bit(BTRFS_INODE_ORPHAN_META_RESERVED,
+					  &BTRFS_I(inode)->runtime_flags);
+				btrfs_orphan_release_metadata(inode);
+			}
+			if (ret != -EEXIST) {
+				clear_bit(BTRFS_INODE_HAS_ORPHAN_ITEM,
+					  &BTRFS_I(inode)->runtime_flags);
+				btrfs_abort_transaction(trans, root, ret);
+				return ret;
+			}
+		}
+		ret = 0;
+	}
+
+	/* insert an orphan item to track subvolume contains orphan files */
+	if (insert >= 2) {
+		ret = btrfs_insert_orphan_item(trans, root->fs_info->tree_root,
+					       root->root_key.objectid);
+		if (ret && ret != -EEXIST) {
+			btrfs_abort_transaction(trans, root, ret);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+/*
+ * We have done the truncate/delete so we can go ahead and remove the orphan
+ * item for this particular inode.
+ */
+static int btrfs_orphan_del(struct btrfs_trans_handle *trans,
+			    struct inode *inode)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	int delete_item = 0;
+	int release_rsv = 0;
+	int ret = 0;
+
+	spin_lock(&root->orphan_lock);
+	if (test_and_clear_bit(BTRFS_INODE_HAS_ORPHAN_ITEM,
+			       &BTRFS_I(inode)->runtime_flags))
+		delete_item = 1;
+
+	if (test_and_clear_bit(BTRFS_INODE_ORPHAN_META_RESERVED,
+			       &BTRFS_I(inode)->runtime_flags))
+		release_rsv = 1;
+	spin_unlock(&root->orphan_lock);
+
+	if (delete_item) {
+		atomic_dec(&root->orphan_inodes);
+		if (trans)
+			ret = btrfs_del_orphan_item(trans, root,
+						    btrfs_ino(inode));
+	}
+
+	if (release_rsv)
+		btrfs_orphan_release_metadata(inode);
+
+	return ret;
+}
+
+/*
+ * this cleans up any orphans that may be left on the list from the last use
+ * of this root.
+ */
+int btrfs_orphan_cleanup(struct btrfs_root *root)
+{
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_key key, found_key;
+	struct btrfs_trans_handle *trans;
+	struct inode *inode;
+	u64 last_objectid = 0;
+	int ret = 0, nr_unlink = 0, nr_truncate = 0;
+
+	if (cmpxchg(&root->orphan_cleanup_state, 0, ORPHAN_CLEANUP_STARTED))
+		return 0;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	path->reada = -1;
+
+	key.objectid = BTRFS_ORPHAN_OBJECTID;
+	key.type = BTRFS_ORPHAN_ITEM_KEY;
+	key.offset = (u64)-1;
+
+	while (1) {
+		ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+		if (ret < 0)
+			goto out;
+
+		/*
+		 * if ret == 0 means we found what we were searching for, which
+		 * is weird, but possible, so only screw with path if we didn't
+		 * find the key and see if we have stuff that matches
+		 */
+		if (ret > 0) {
+			ret = 0;
+			if (path->slots[0] == 0)
+				break;
+			path->slots[0]--;
+		}
+
+		/* pull out the item */
+		leaf = path->nodes[0];
+		btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+
+		/* make sure the item matches what we want */
+		if (found_key.objectid != BTRFS_ORPHAN_OBJECTID)
+			break;
+		if (found_key.type != BTRFS_ORPHAN_ITEM_KEY)
+			break;
+
+		/* release the path since we're done with it */
+		btrfs_release_path(path);
+
+		/*
+		 * this is where we are basically btrfs_lookup, without the
+		 * crossing root thing.  we store the inode number in the
+		 * offset of the orphan item.
+		 */
+
+		if (found_key.offset == last_objectid) {
+			btrfs_err(root->fs_info,
+				"Error removing orphan entry, stopping orphan cleanup");
+			ret = -EINVAL;
+			goto out;
+		}
+
+		last_objectid = found_key.offset;
+
+		found_key.objectid = found_key.offset;
+		found_key.type = BTRFS_INODE_ITEM_KEY;
+		found_key.offset = 0;
+		inode = btrfs_iget(root->fs_info->sb, &found_key, root, NULL);
+		ret = PTR_ERR_OR_ZERO(inode);
+		if (ret && ret != -ESTALE)
+			goto out;
+
+		if (ret == -ESTALE && root == root->fs_info->tree_root) {
+			struct btrfs_root *dead_root;
+			struct btrfs_fs_info *fs_info = root->fs_info;
+			int is_dead_root = 0;
+
+			/*
+			 * this is an orphan in the tree root. Currently these
+			 * could come from 2 sources:
+			 *  a) a snapshot deletion in progress
+			 *  b) a free space cache inode
+			 * We need to distinguish those two, as the snapshot
+			 * orphan must not get deleted.
+			 * find_dead_roots already ran before us, so if this
+			 * is a snapshot deletion, we should find the root
+			 * in the dead_roots list
+			 */
+			spin_lock(&fs_info->trans_lock);
+			list_for_each_entry(dead_root, &fs_info->dead_roots,
+					    root_list) {
+				if (dead_root->root_key.objectid ==
+				    found_key.objectid) {
+					is_dead_root = 1;
+					break;
 				}
 			}
-			break;
+			spin_unlock(&fs_info->trans_lock);
+			if (is_dead_root) {
+				/* prevent this orphan from being found again */
+				key.offset = found_key.objectid - 1;
+				continue;
+			}
+		}
+		/*
+		 * Inode is already gone but the orphan item is still there,
+		 * kill the orphan item.
+		 */
+		if (ret == -ESTALE) {
+			trans = btrfs_start_transaction(root, 1);
+			if (IS_ERR(trans)) {
+				ret = PTR_ERR(trans);
+				goto out;
+			}
+			btrfs_debug(root->fs_info, "auto deleting %Lu",
+				found_key.objectid);
+			ret = btrfs_del_orphan_item(trans, root,
+						    found_key.objectid);
+			btrfs_end_transaction(trans, root);
+			if (ret)
+				goto out;
+			continue;
 		}
 
-		if (retry++ > 30) {
-			input_err(true, &info->client->dev, "%s: Time over - wait for result of ITO test\n", __func__);
+		/*
+		 * add this inode to the orphan list so btrfs_orphan_del does
+		 * the proper thing when we hit it
+		 */
+		set_bit(BTRFS_INODE_HAS_ORPHAN_ITEM,
+			&BTRFS_I(inode)->runtime_flags);
+		atomic_inc(&root->orphan_inodes);
+
+		/* if we have links, this was a truncate, lets do that */
+		if (inode->i_nlink) {
+			if (WARN_ON(!S_ISREG(inode->i_mode))) {
+				iput(inode);
+				continue;
+			}
+			nr_truncate++;
+
+			/* 1 for the orphan item deletion. */
+			trans = btrfs_start_transaction(root, 1);
+			if (IS_ERR(trans)) {
+				iput(inode);
+				ret = PTR_ERR(trans);
+				goto out;
+			}
+			ret = btrfs_orphan_add(trans, inode);
+			btrfs_end_transaction(trans, root);
+			if (ret) {
+				iput(inode);
+				goto out;
+			}
+
+			ret = btrfs_truncate(inode);
+			if (ret)
+				btrfs_orphan_del(NULL, inode);
+		} else {
+			nr_unlink++;
+		}
+
+		/* this will do delete_inode and everything for us */
+		iput(inode);
+		if (ret)
+			goto out;
+	}
+	/* release the path since we're done with it */
+	btrfs_release_path(path);
+
+	root->orphan_cleanup_state = ORPHAN_CLEANUP_DONE;
+
+	if (root->orphan_block_rsv)
+		btrfs_block_rsv_release(root, root->orphan_block_rsv,
+					(u64)-1);
+
+	if (root->orphan_block_rsv ||
+	    test_bit(BTRFS_ROOT_ORPHAN_ITEM_INSERTED, &root->state)) {
+		trans = btrfs_join_transaction(root);
+		if (!IS_ERR(trans))
+			btrfs_end_transaction(trans, root);
+	}
+
+	if (nr_unlink)
+		btrfs_debug(root->fs_info, "unlinked %d orphans", nr_unlink);
+	if (nr_truncate)
+		btrfs_debug(root->fs_info, "truncated %d orphans", nr_truncate);
+
+out:
+	if (ret)
+		btrfs_err(root->fs_info,
+			"could not do orphan cleanup %d", ret);
+	btrfs_free_path(path);
+	return ret;
+}
+
+/*
+ * very simple check to peek ahead in the leaf looking for xattrs.  If we
+ * don't find any xattrs, we know there can't be any acls.
+ *
+ * slot is the slot the inode is in, objectid is the objectid of the inode
+ */
+static noinline int acls_after_inode_item(struct extent_buffer *leaf,
+					  int slot, u64 objectid,
+					  int *first_xattr_slot)
+{
+	u32 nritems = btrfs_header_nritems(leaf);
+	struct btrfs_key found_key;
+	static u64 xattr_access = 0;
+	static u64 xattr_default = 0;
+	int scanned = 0;
+
+	if (!xattr_access) {
+		xattr_access = btrfs_name_hash(POSIX_ACL_XATTR_ACCESS,
+					strlen(POSIX_ACL_XATTR_ACCESS));
+		xattr_default = btrfs_name_hash(POSIX_ACL_XATTR_DEFAULT,
+					strlen(POSIX_ACL_XATTR_DEFAULT));
+	}
+
+	slot++;
+	*first_xattr_slot = -1;
+	while (slot < nritems) {
+		btrfs_item_key_to_cpu(leaf, &found_key, slot);
+
+		/* we found a different objectid, there must not be acls */
+		if (found_key.objectid != objectid)
+			return 0;
+
+		/* we found an xattr, assume we've got an acl */
+		if (found_key.type == BTRFS_XATTR_ITEM_KEY) {
+			if (*first_xattr_slot == -1)
+				*first_xattr_slot = slot;
+			if (found_key.offset == xattr_access ||
+			    found_key.offset == xattr_default)
+				return 1;
+		}
+
+		/*
+		 * we found a key greater than an xattr key, there can't
+		 * be any acls later on
+		 */
+		if (found_key.type > BTRFS_XATTR_ITEM_KEY)
+			return 0;
+
+		slot++;
+		scanned++;
+
+		/*
+		 * it goes inode, inode backrefs, xattrs, extents,
+		 * so if there are a ton of hard links to an inode there can
+		 * be a lot of backrefs.  Don't waste time searching too hard,
+		 * this is just an optimization
+		 */
+		if (scanned >= 8)
+			break;
+	}
+	/* we hit the end of the leaf before we found an xattr or
+	 * something larger than an xattr.  We have to assume the inode
+	 * has acls
+	 */
+	if (*first_xattr_slot == -1)
+		*first_xattr_slot = slot;
+	return 1;
+}
+
+/*
+ * read an inode from the btree into the in-memory inode
+ */
+static void btrfs_read_locked_inode(struct inode *inode)
+{
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_inode_item *inode_item;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_key location;
+	unsigned long ptr;
+	int maybe_acls;
+	u32 rdev;
+	int ret;
+	bool filled = false;
+	int first_xattr_slot;
+
+	ret = btrfs_fill_inode(inode, &rdev);
+	if (!ret)
+		filled = true;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		goto make_bad;
+
+	memcpy(&location, &BTRFS_I(inode)->location, sizeof(location));
+
+	ret = btrfs_lookup_inode(NULL, root, path, &location, 0);
+	if (ret)
+		goto make_bad;
+
+	leaf = path->nodes[0];
+
+	if (filled)
+		goto cache_index;
+
+	inode_item = btrfs_item_ptr(leaf, path->slots[0],
+				    struct btrfs_inode_item);
+	inode->i_mode = btrfs_inode_mode(leaf, inode_item);
+	set_nlink(inode, btrfs_inode_nlink(leaf, inode_item));
+	i_uid_write(inode, btrfs_inode_uid(leaf, inode_item));
+	i_gid_write(inode, btrfs_inode_gid(leaf, inode_item));
+	btrfs_i_size_write(inode, btrfs_inode_size(leaf, inode_item));
+
+	inode->i_atime.tv_sec = btrfs_timespec_sec(leaf, &inode_item->atime);
+	inode->i_atime.tv_nsec = btrfs_timespec_nsec(leaf, &inode_item->atime);
+
+	inode->i_mtime.tv_sec = btrfs_timespec_sec(leaf, &inode_item->mtime);
+	inode->i_mtime.tv_nsec = btrfs_timespec_nsec(leaf, &inode_item->mtime);
+
+	inode->i_ctime.tv_sec = btrfs_timespec_sec(leaf, &inode_item->ctime);
+	inode->i_ctime.tv_nsec = btrfs_timespec_nsec(leaf, &inode_item->ctime);
+
+	BTRFS_I(inode)->i_otime.tv_sec =
+		btrfs_timespec_sec(leaf, &inode_item->otime);
+	BTRFS_I(inode)->i_otime.tv_nsec =
+		btrfs_timespec_nsec(leaf, &inode_item->otime);
+
+	inode_set_bytes(inode, btrfs_inode_nbytes(leaf, inode_item));
+	BTRFS_I(inode)->generation = btrfs_inode_generation(leaf, inode_item);
+	BTRFS_I(inode)->last_trans = btrfs_inode_transid(leaf, inode_item);
+
+	inode->i_version = btrfs_inode_sequence(leaf, inode_item);
+	inode->i_generation = BTRFS_I(inode)->generation;
+	inode->i_rdev = 0;
+	rdev = btrfs_inode_rdev(leaf, inode_item);
+
+	BTRFS_I(inode)->index_cnt = (u64)-1;
+	BTRFS_I(inode)->flags = btrfs_inode_flags(leaf, inode_item);
+
+cache_index:
+	/*
+	 * If we were modified in the current generation and evicted from memory
+	 * and then re-read we need to do a full sync since we don't have any
+	 * idea about which extents were modified before we were evicted from
+	 * cache.
+	 *
+	 * This is required for both inode re-read from disk and delayed inode
+	 * in delayed_nodes_tree.
+	 */
+	if (BTRFS_I(inode)->last_trans == root->fs_info->generation)
+		set_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+			&BTRFS_I(inode)->runtime_flags);
+
+	/*
+	 * We don't persist the id of the transaction where an unlink operation
+	 * against the inode was last made. So here we assume the inode might
+	 * have been evicted, and therefore the exact value of last_unlink_trans
+	 * lost, and set it to last_trans to avoid metadata inconsistencies
+	 * between the inode and its parent if the inode is fsync'ed and the log
+	 * replayed. For example, in the scenario:
+	 *
+	 * touch mydir/foo
+	 * ln mydir/foo mydir/bar
+	 * sync
+	 * unlink mydir/bar
+	 * echo 2 > /proc/sys/vm/drop_caches   # evicts inode
+	 * xfs_io -c fsync mydir/foo
+	 * <power failure>
+	 * mount fs, triggers fsync log replay
+	 *
+	 * We must make sure that when we fsync our inode foo we also log its
+	 * parent inode, otherwise after log replay the parent still has the
+	 * dentry with the "bar" name but our inode foo has a link count of 1
+	 * and doesn't have an inode ref with the name "bar" anymore.
+	 *
+	 * Setting last_unlink_trans to last_trans is a pessimistic approach,
+	 * but it guarantees correctness at the expense of ocassional full
+	 * transaction commits on fsync if our inode is a directory, or if our
+	 * inode is not a directory, logging its parent unnecessarily.
+	 */
+	BTRFS_I(inode)->last_unlink_trans = BTRFS_I(inode)->last_trans;
+
+	path->slots[0]++;
+	if (inode->i_nlink != 1 ||
+	    path->slots[0] >= btrfs_header_nritems(leaf))
+		goto cache_acl;
+
+	btrfs_item_key_to_cpu(leaf, &location, path->slots[0]);
+	if (location.objectid != btrfs_ino(inode))
+		goto cache_acl;
+
+	ptr = btrfs_item_ptr_offset(leaf, path->slots[0]);
+	if (location.type == BTRFS_INODE_REF_KEY) {
+		struct btrfs_inode_ref *ref;
+
+		ref = (struct btrfs_inode_ref *)ptr;
+		BTRFS_I(inode)->dir_index = btrfs_inode_ref_index(leaf, ref);
+	} else if (location.type == BTRFS_INODE_EXTREF_KEY) {
+		struct btrfs_inode_extref *extref;
+
+		extref = (struct btrfs_inode_extref *)ptr;
+		BTRFS_I(inode)->dir_index = btrfs_inode_extref_index(leaf,
+								     extref);
+	}
+cache_acl:
+	/*
+	 * try to precache a NULL acl entry for files that don't have
+	 * any xattrs or acls
+	 */
+	maybe_acls = acls_after_inode_item(leaf, path->slots[0],
+					   btrfs_ino(inode), &first_xattr_slot);
+	if (first_xattr_slot != -1) {
+		path->slots[0] = first_xattr_slot;
+		ret = btrfs_load_inode_props(inode, path);
+		if (ret)
+			btrfs_err(root->fs_info,
+				  "error loading props for ino %llu (root %llu): %d",
+				  btrfs_ino(inode),
+				  root->root_key.objectid, ret);
+	}
+	btrfs_free_path(path);
+
+	if (!maybe_acls)
+		cache_no_acl(inode);
+
+	switch (inode->i_mode & S_IFMT) {
+	case S_IFREG:
+		inode->i_mapping->a_ops = &btrfs_aops;
+		BTRFS_I(inode)->io_tree.ops = &btrfs_extent_io_ops;
+		inode->i_fop = &btrfs_file_operations;
+		inode->i_op = &btrfs_file_inode_operations;
+		break;
+	case S_IFDIR:
+		inode->i_fop = &btrfs_dir_file_operations;
+		if (root == root->fs_info->tree_root)
+			inode->i_op = &btrfs_dir_ro_inode_operations;
+		else
+			inode->i_op = &btrfs_dir_inode_operations;
+		break;
+	case S_IFLNK:
+		inode->i_op = &btrfs_symlink_inode_operations;
+		inode->i_mapping->a_ops = &btrfs_symlink_aops;
+		break;
+	default:
+		inode->i_op = &btrfs_special_inode_operations;
+		init_special_inode(inode, inode->i_mode, rdev);
+		break;
+	}
+
+	btrfs_update_iflags(inode);
+	return;
+
+make_bad:
+	btrfs_free_path(path);
+	make_bad_inode(inode);
+}
+
+/*
+ * given a leaf and an inode, copy the inode fields into the leaf
+ */
+static void fill_inode_item(struct btrfs_trans_handle *trans,
+			    struct extent_buffer *leaf,
+			    struct btrfs_inode_item *item,
+			    struct inode *inode)
+{
+	struct btrfs_map_token token;
+
+	btrfs_init_map_token(&token);
+
+	btrfs_set_token_inode_uid(leaf, item, i_uid_read(inode), &token);
+	btrfs_set_token_inode_gid(leaf, item, i_gid_read(inode), &token);
+	btrfs_set_token_inode_size(leaf, item, BTRFS_I(inode)->disk_i_size,
+				   &token);
+	btrfs_set_token_inode_mode(leaf, item, inode->i_mode, &token);
+	btrfs_set_token_inode_nlink(leaf, item, inode->i_nlink, &token);
+
+	btrfs_set_token_timespec_sec(leaf, &item->atime,
+				     inode->i_atime.tv_sec, &token);
+	btrfs_set_token_timespec_nsec(leaf, &item->atime,
+				      inode->i_atime.tv_nsec, &token);
+
+	btrfs_set_token_timespec_sec(leaf, &item->mtime,
+				     inode->i_mtime.tv_sec, &token);
+	btrfs_set_token_timespec_nsec(leaf, &item->mtime,
+				      inode->i_mtime.tv_nsec, &token);
+
+	btrfs_set_token_timespec_sec(leaf, &item->ctime,
+				     inode->i_ctime.tv_sec, &token);
+	btrfs_set_token_timespec_nsec(leaf, &item->ctime,
+				      inode->i_ctime.tv_nsec, &token);
+
+	btrfs_set_token_timespec_sec(leaf, &item->otime,
+				     BTRFS_I(inode)->i_otime.tv_sec, &token);
+	btrfs_set_token_timespec_nsec(leaf, &item->otime,
+				      BTRFS_I(inode)->i_otime.tv_nsec, &token);
+
+	btrfs_set_token_inode_nbytes(leaf, item, inode_get_bytes(inode),
+				     &token);
+	btrfs_set_token_inode_generation(leaf, item, BTRFS_I(inode)->generation,
+					 &token);
+	btrfs_set_token_inode_sequence(leaf, item, inode->i_version, &token);
+	btrfs_set_token_inode_transid(leaf, item, trans->transid, &token);
+	btrfs_set_token_inode_rdev(leaf, item, inode->i_rdev, &token);
+	btrfs_set_token_inode_flags(leaf, item, BTRFS_I(inode)->flags, &token);
+	btrfs_set_token_inode_block_group(leaf, item, 0, &token);
+}
+
+/*
+ * copy everything in the in-memory inode into the btree.
+ */
+static noinline int btrfs_update_inode_item(struct btrfs_trans_handle *trans,
+				struct btrfs_root *root, struct inode *inode)
+{
+	struct btrfs_inode_item *inode_item;
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	int ret;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	path->leave_spinning = 1;
+	ret = btrfs_lookup_inode(trans, root, path, &BTRFS_I(inode)->location,
+				 1);
+	if (ret) {
+		if (ret > 0)
+			ret = -ENOENT;
+		goto failed;
+	}
+
+	leaf = path->nodes[0];
+	inode_item = btrfs_item_ptr(leaf, path->slots[0],
+				    struct btrfs_inode_item);
+
+	fill_inode_item(trans, leaf, inode_item, inode);
+	btrfs_mark_buffer_dirty(leaf);
+	btrfs_set_inode_last_trans(trans, inode);
+	ret = 0;
+failed:
+	btrfs_free_path(path);
+	return ret;
+}
+
+/*
+ * copy everything in the in-memory inode into the btree.
+ */
+noinline int btrfs_update_inode(struct btrfs_trans_handle *trans,
+				struct btrfs_root *root, struct inode *inode)
+{
+	int ret;
+
+	/*
+	 * If the inode is a free space inode, we can deadlock during commit
+	 * if we put it into the delayed code.
+	 *
+	 * The data relocation inode should also be directly updated
+	 * without delay
+	 */
+	if (!btrfs_is_free_space_inode(inode)
+	    && root->root_key.objectid != BTRFS_DATA_RELOC_TREE_OBJECTID
+	    && !root->fs_info->log_root_recovering) {
+		btrfs_update_root_times(trans, root);
+
+		ret = btrfs_delayed_update_inode(trans, root, inode);
+		if (!ret)
+			btrfs_set_inode_last_trans(trans, inode);
+		return ret;
+	}
+
+	return btrfs_update_inode_item(trans, root, inode);
+}
+
+noinline int btrfs_update_inode_fallback(struct btrfs_trans_handle *trans,
+					 struct btrfs_root *root,
+					 struct inode *inode)
+{
+	int ret;
+
+	ret = btrfs_update_inode(trans, root, inode);
+	if (ret == -ENOSPC)
+		return btrfs_update_inode_item(trans, root, inode);
+	return ret;
+}
+
+/*
+ * unlink helper that gets used here in inode.c and in the tree logging
+ * recovery code.  It remove a link in a directory with a given name, and
+ * also drops the back refs in the inode to the directory
+ */
+static int __btrfs_unlink_inode(struct btrfs_trans_handle *trans,
+				struct btrfs_root *root,
+				struct inode *dir, struct inode *inode,
+				const char *name, int name_len)
+{
+	struct btrfs_path *path;
+	int ret = 0;
+	struct extent_buffer *leaf;
+	struct btrfs_dir_item *di;
+	struct btrfs_key key;
+	u64 index;
+	u64 ino = btrfs_ino(inode);
+	u64 dir_ino = btrfs_ino(dir);
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	path->leave_spinning = 1;
+	di = btrfs_lookup_dir_item(trans, root, path, dir_ino,
+				    name, name_len, -1);
+	if (IS_ERR(di)) {
+		ret = PTR_ERR(di);
+		goto err;
+	}
+	if (!di) {
+		ret = -ENOENT;
+		goto err;
+	}
+	leaf = path->nodes[0];
+	btrfs_dir_item_key_to_cpu(leaf, di, &key);
+	ret = btrfs_delete_one_dir_name(trans, root, path, di);
+	if (ret)
+		goto err;
+	btrfs_release_path(path);
+
+	/*
+	 * If we don't have dir index, we have to get it by looking up
+	 * the inode ref, since we get the inode ref, remove it directly,
+	 * it is unnecessary to do delayed deletion.
+	 *
+	 * But if we have dir index, needn't search inode ref to get it.
+	 * Since the inode ref is close to the inode item, it is better
+	 * that we delay to delete it, and just do this deletion when
+	 * we update the inode item.
+	 */
+	if (BTRFS_I(inode)->dir_index) {
+		ret = btrfs_delayed_delete_inode_ref(inode);
+		if (!ret) {
+			index = BTRFS_I(inode)->dir_index;
+			goto skip_backref;
+		}
+	}
+
+	ret = btrfs_del_inode_ref(trans, root, name, name_len, ino,
+				  dir_ino, &index);
+	if (ret) {
+		btrfs_info(root->fs_info,
+			"failed to delete reference to %.*s, inode %llu parent %llu",
+			name_len, name, ino, dir_ino);
+		btrfs_abort_transaction(trans, root, ret);
+		goto err;
+	}
+skip_backref:
+	ret = btrfs_delete_delayed_dir_index(trans, root, dir, index);
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto err;
+	}
+
+	ret = btrfs_del_inode_ref_in_log(trans, root, name, name_len,
+					 inode, dir_ino);
+	if (ret != 0 && ret != -ENOENT) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto err;
+	}
+
+	ret = btrfs_del_dir_entries_in_log(trans, root, name, name_len,
+					   dir, index);
+	if (ret == -ENOENT)
+		ret = 0;
+	else if (ret)
+		btrfs_abort_transaction(trans, root, ret);
+err:
+	btrfs_free_path(path);
+	if (ret)
+		goto out;
+
+	btrfs_i_size_write(dir, dir->i_size - name_len * 2);
+	inode_inc_iversion(inode);
+	inode_inc_iversion(dir);
+	inode->i_ctime = dir->i_mtime = dir->i_ctime = CURRENT_TIME;
+	ret = btrfs_update_inode(trans, root, dir);
+out:
+	return ret;
+}
+
+int btrfs_unlink_inode(struct btrfs_trans_handle *trans,
+		       struct btrfs_root *root,
+		       struct inode *dir, struct inode *inode,
+		       const char *name, int name_len)
+{
+	int ret;
+	ret = __btrfs_unlink_inode(trans, root, dir, inode, name, name_len);
+	if (!ret) {
+		drop_nlink(inode);
+		ret = btrfs_update_inode(trans, root, inode);
+	}
+	return ret;
+}
+
+/*
+ * helper to start transaction for unlink and rmdir.
+ *
+ * unlink and rmdir are special in btrfs, they do not always free space, so
+ * if we cannot make our reservations the normal way try and see if there is
+ * plenty of slack room in the global reserve to migrate, otherwise we cannot
+ * allow the unlink to occur.
+ */
+static struct btrfs_trans_handle *__unlink_start_trans(struct inode *dir)
+{
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+
+	/*
+	 * 1 for the possible orphan item
+	 * 1 for the dir item
+	 * 1 for the dir index
+	 * 1 for the inode ref
+	 * 1 for the inode
+	 */
+	return btrfs_start_transaction_fallback_global_rsv(root, 5, 5);
+}
+
+static int btrfs_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	struct btrfs_trans_handle *trans;
+	struct inode *inode = d_inode(dentry);
+	int ret;
+
+	trans = __unlink_start_trans(dir);
+	if (IS_ERR(trans))
+		return PTR_ERR(trans);
+
+	btrfs_record_unlink_dir(trans, dir, d_inode(dentry), 0);
+
+	ret = btrfs_unlink_inode(trans, root, dir, d_inode(dentry),
+				 dentry->d_name.name, dentry->d_name.len);
+	if (ret)
+		goto out;
+
+	if (inode->i_nlink == 0) {
+		ret = btrfs_orphan_add(trans, inode);
+		if (ret)
+			goto out;
+	}
+
+out:
+	btrfs_end_transaction(trans, root);
+	btrfs_btree_balance_dirty(root);
+	return ret;
+}
+
+int btrfs_unlink_subvol(struct btrfs_trans_handle *trans,
+			struct btrfs_root *root,
+			struct inode *dir, u64 objectid,
+			const char *name, int name_len)
+{
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_dir_item *di;
+	struct btrfs_key key;
+	u64 index;
+	int ret;
+	u64 dir_ino = btrfs_ino(dir);
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	di = btrfs_lookup_dir_item(trans, root, path, dir_ino,
+				   name, name_len, -1);
+	if (IS_ERR_OR_NULL(di)) {
+		if (!di)
+			ret = -ENOENT;
+		else
+			ret = PTR_ERR(di);
+		goto out;
+	}
+
+	leaf = path->nodes[0];
+	btrfs_dir_item_key_to_cpu(leaf, di, &key);
+	WARN_ON(key.type != BTRFS_ROOT_ITEM_KEY || key.objectid != objectid);
+	ret = btrfs_delete_one_dir_name(trans, root, path, di);
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto out;
+	}
+	btrfs_release_path(path);
+
+	ret = btrfs_del_root_ref(trans, root->fs_info->tree_root,
+				 objectid, root->root_key.objectid,
+				 dir_ino, &index, name, name_len);
+	if (ret < 0) {
+		if (ret != -ENOENT) {
+			btrfs_abort_transaction(trans, root, ret);
+			goto out;
+		}
+		di = btrfs_search_dir_index_item(root, path, dir_ino,
+						 name, name_len);
+		if (IS_ERR_OR_NULL(di)) {
+			if (!di)
+				ret = -ENOENT;
+			else
+				ret = PTR_ERR(di);
+			btrfs_abort_transaction(trans, root, ret);
+			goto out;
+		}
+
+		leaf = path->nodes[0];
+		btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);
+		btrfs_release_path(path);
+		index = key.offset;
+	}
+	btrfs_release_path(path);
+
+	ret = btrfs_delete_delayed_dir_index(trans, root, dir, index);
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto out;
+	}
+
+	btrfs_i_size_write(dir, dir->i_size - name_len * 2);
+	inode_inc_iversion(dir);
+	dir->i_mtime = dir->i_ctime = CURRENT_TIME;
+	ret = btrfs_update_inode_fallback(trans, root, dir);
+	if (ret)
+		btrfs_abort_transaction(trans, root, ret);
+out:
+	btrfs_free_path(path);
+	return ret;
+}
+
+static int btrfs_rmdir(struct inode *dir, struct dentry *dentry)
+{
+	struct inode *inode = d_inode(dentry);
+	int err = 0;
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	struct btrfs_trans_handle *trans;
+
+	if (inode->i_size > BTRFS_EMPTY_DIR_SIZE)
+		return -ENOTEMPTY;
+	if (btrfs_ino(inode) == BTRFS_FIRST_FREE_OBJECTID)
+		return -EPERM;
+
+	trans = __unlink_start_trans(dir);
+	if (IS_ERR(trans))
+		return PTR_ERR(trans);
+
+	if (unlikely(btrfs_ino(inode) == BTRFS_EMPTY_SUBVOL_DIR_OBJECTID)) {
+		err = btrfs_unlink_subvol(trans, root, dir,
+					  BTRFS_I(inode)->location.objectid,
+					  dentry->d_name.name,
+					  dentry->d_name.len);
+		goto out;
+	}
+
+	err = btrfs_orphan_add(trans, inode);
+	if (err)
+		goto out;
+
+	/* now the directory is empty */
+	err = btrfs_unlink_inode(trans, root, dir, d_inode(dentry),
+				 dentry->d_name.name, dentry->d_name.len);
+	if (!err)
+		btrfs_i_size_write(inode, 0);
+out:
+	btrfs_end_transaction(trans, root);
+	btrfs_btree_balance_dirty(root);
+
+	return err;
+}
+
+static int truncate_space_check(struct btrfs_trans_handle *trans,
+				struct btrfs_root *root,
+				u64 bytes_deleted)
+{
+	int ret;
+
+	bytes_deleted = btrfs_csum_bytes_to_leaves(root, bytes_deleted);
+	ret = btrfs_block_rsv_add(root, &root->fs_info->trans_block_rsv,
+				  bytes_deleted, BTRFS_RESERVE_NO_FLUSH);
+	if (!ret)
+		trans->bytes_reserved += bytes_deleted;
+	return ret;
+
+}
+
+static int truncate_inline_extent(struct inode *inode,
+				  struct btrfs_path *path,
+				  struct btrfs_key *found_key,
+				  const u64 item_end,
+				  const u64 new_size)
+{
+	struct extent_buffer *leaf = path->nodes[0];
+	int slot = path->slots[0];
+	struct btrfs_file_extent_item *fi;
+	u32 size = (u32)(new_size - found_key->offset);
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+
+	fi = btrfs_item_ptr(leaf, slot, struct btrfs_file_extent_item);
+
+	if (btrfs_file_extent_compression(leaf, fi) != BTRFS_COMPRESS_NONE) {
+		loff_t offset = new_size;
+		loff_t page_end = ALIGN(offset, PAGE_CACHE_SIZE);
+
+		/*
+		 * Zero out the remaining of the last page of our inline extent,
+		 * instead of directly truncating our inline extent here - that
+		 * would be much more complex (decompressing all the data, then
+		 * compressing the truncated data, which might be bigger than
+		 * the size of the inline extent, resize the extent, etc).
+		 * We release the path because to get the page we might need to
+		 * read the extent item from disk (data not in the page cache).
+		 */
+		btrfs_release_path(path);
+		return btrfs_truncate_page(inode, offset, page_end - offset, 0);
+	}
+
+	btrfs_set_file_extent_ram_bytes(leaf, fi, size);
+	size = btrfs_file_extent_calc_inline_size(size);
+	btrfs_truncate_item(root, path, size, 1);
+
+	if (test_bit(BTRFS_ROOT_REF_COWS, &root->state))
+		inode_sub_bytes(inode, item_end + 1 - new_size);
+
+	return 0;
+}
+
+/*
+ * this can truncate away extent items, csum items and directory items.
+ * It starts at a high offset and removes keys until it can't find
+ * any higher than new_size
+ *
+ * csum items that cross the new i_size are truncated to the new size
+ * as well.
+ *
+ * min_type is the minimum key type to truncate down to.  If set to 0, this
+ * will kill all the items on this inode, including the INODE_ITEM_KEY.
+ */
+int btrfs_truncate_inode_items(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root,
+			       struct inode *inode,
+			       u64 new_size, u32 min_type)
+{
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_file_extent_item *fi;
+	struct btrfs_key key;
+	struct btrfs_key found_key;
+	u64 extent_start = 0;
+	u64 extent_num_bytes = 0;
+	u64 extent_offset = 0;
+	u64 item_end = 0;
+	u64 last_size = new_size;
+	u32 found_type = (u8)-1;
+	int found_extent;
+	int del_item;
+	int pending_del_nr = 0;
+	int pending_del_slot = 0;
+	int extent_type = -1;
+	int ret;
+	int err = 0;
+	u64 ino = btrfs_ino(inode);
+	u64 bytes_deleted = 0;
+	bool be_nice = 0;
+	bool should_throttle = 0;
+	bool should_end = 0;
+
+	BUG_ON(new_size > 0 && min_type != BTRFS_EXTENT_DATA_KEY);
+
+	/*
+	 * for non-free space inodes and ref cows, we want to back off from
+	 * time to time
+	 */
+	if (!btrfs_is_free_space_inode(inode) &&
+	    test_bit(BTRFS_ROOT_REF_COWS, &root->state))
+		be_nice = 1;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+	path->reada = -1;
+
+	/*
+	 * We want to drop from the next block forward in case this new size is
+	 * not block aligned since we will be keeping the last block of the
+	 * extent just the way it is.
+	 */
+	if (test_bit(BTRFS_ROOT_REF_COWS, &root->state) ||
+	    root == root->fs_info->tree_root)
+		btrfs_drop_extent_cache(inode, ALIGN(new_size,
+					root->sectorsize), (u64)-1, 0);
+
+	/*
+	 * This function is also used to drop the items in the log tree before
+	 * we relog the inode, so if root != BTRFS_I(inode)->root, it means
+	 * it is used to drop the loged items. So we shouldn't kill the delayed
+	 * items.
+	 */
+	if (min_type == 0 && root == BTRFS_I(inode)->root)
+		btrfs_kill_delayed_inode_items(inode);
+
+	key.objectid = ino;
+	key.offset = (u64)-1;
+	key.type = (u8)-1;
+
+search_again:
+	/*
+	 * with a 16K leaf size and 128MB extents, you can actually queue
+	 * up a huge file in a single leaf.  Most of the time that
+	 * bytes_deleted is > 0, it will be huge by the time we get here
+	 */
+	if (be_nice && bytes_deleted > 32 * 1024 * 1024) {
+		if (btrfs_should_end_transaction(trans, root)) {
+			err = -EAGAIN;
+			goto error;
+		}
+	}
+
+
+	path->leave_spinning = 1;
+	ret = btrfs_search_slot(trans, root, &key, path, -1, 1);
+	if (ret < 0) {
+		err = ret;
+		goto out;
+	}
+
+	if (ret > 0) {
+		/* there are no items in the tree for us to truncate, we're
+		 * done
+		 */
+		if (path->slots[0] == 0)
+			goto out;
+		path->slots[0]--;
+	}
+
+	while (1) {
+		fi = NULL;
+		leaf = path->nodes[0];
+		btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+		found_type = found_key.type;
+
+		if (found_key.objectid != ino)
+			break;
+
+		if (found_type < min_type)
+			break;
+
+		item_end = found_key.offset;
+		if (found_type == BTRFS_EXTENT_DATA_KEY) {
+			fi = btrfs_item_ptr(leaf, path->slots[0],
+					    struct btrfs_file_extent_item);
+			extent_type = btrfs_file_extent_type(leaf, fi);
+			if (extent_type != BTRFS_FILE_EXTENT_INLINE) {
+				item_end +=
+				    btrfs_file_extent_num_bytes(leaf, fi);
+			} else if (extent_type == BTRFS_FILE_EXTENT_INLINE) {
+				item_end += btrfs_file_extent_inline_len(leaf,
+							 path->slots[0], fi);
+			}
+			item_end--;
+		}
+		if (found_type > min_type) {
+			del_item = 1;
+		} else {
+			if (item_end < new_size) {
+				/*
+				 * With NO_HOLES mode, for the following mapping
+				 *
+				 * [0-4k][hole][8k-12k]
+				 *
+				 * if truncating isize down to 6k, it ends up
+				 * isize being 8k.
+				 */
+				if (btrfs_fs_incompat(root->fs_info, NO_HOLES))
+					last_size = new_size;
+				break;
+			}
+			if (found_key.offset >= new_size)
+				del_item = 1;
+			else
+				del_item = 0;
+		}
+		found_extent = 0;
+		/* FIXME, shrink the extent if the ref count is only 1 */
+		if (found_type != BTRFS_EXTENT_DATA_KEY)
+			goto delete;
+
+		if (del_item)
+			last_size = found_key.offset;
+		else
+			last_size = new_size;
+
+		if (extent_type != BTRFS_FILE_EXTENT_INLINE) {
+			u64 num_dec;
+			extent_start = btrfs_file_extent_disk_bytenr(leaf, fi);
+			if (!del_item) {
+				u64 orig_num_bytes =
+					btrfs_file_extent_num_bytes(leaf, fi);
+				extent_num_bytes = ALIGN(new_size -
+						found_key.offset,
+						root->sectorsize);
+				btrfs_set_file_extent_num_bytes(leaf, fi,
+							 extent_num_bytes);
+				num_dec = (orig_num_bytes -
+					   extent_num_bytes);
+				if (test_bit(BTRFS_ROOT_REF_COWS,
+					     &root->state) &&
+				    extent_start != 0)
+					inode_sub_bytes(inode, num_dec);
+				btrfs_mark_buffer_dirty(leaf);
+			} else {
+				extent_num_bytes =
+					btrfs_file_extent_disk_num_bytes(leaf,
+									 fi);
+				extent_offset = found_key.offset -
+					btrfs_file_extent_offset(leaf, fi);
+
+				/* FIXME blocksize != 4096 */
+				num_dec = btrfs_file_extent_num_bytes(leaf, fi);
+				if (extent_start != 0) {
+					found_extent = 1;
+					if (test_bit(BTRFS_ROOT_REF_COWS,
+						     &root->state))
+						inode_sub_bytes(inode, num_dec);
+				}
+			}
+		} else if (extent_type == BTRFS_FILE_EXTENT_INLINE) {
+			/*
+			 * we can't truncate inline items that have had
+			 * special encodings
+			 */
+			if (!del_item &&
+			    btrfs_file_extent_encryption(leaf, fi) == 0 &&
+			    btrfs_file_extent_other_encoding(leaf, fi) == 0) {
+
+				/*
+				 * Need to release path in order to truncate a
+				 * compressed extent. So delete any accumulated
+				 * extent items so far.
+				 */
+				if (btrfs_file_extent_compression(leaf, fi) !=
+				    BTRFS_COMPRESS_NONE && pending_del_nr) {
+					err = btrfs_del_items(trans, root, path,
+							      pending_del_slot,
+							      pending_del_nr);
+					if (err) {
+						btrfs_abort_transaction(trans,
+									root,
+									err);
+						goto error;
+					}
+					pending_del_nr = 0;
+				}
+
+				err = truncate_inline_extent(inode, path,
+							     &found_key,
+							     item_end,
+							     new_size);
+				if (err) {
+					btrfs_abort_transaction(trans,
+								root, err);
+					goto error;
+				}
+			} else if (test_bit(BTRFS_ROOT_REF_COWS,
+					    &root->state)) {
+				inode_sub_bytes(inode, item_end + 1 - new_size);
+			}
+		}
+delete:
+		if (del_item) {
+			if (!pending_del_nr) {
+				/* no pending yet, add ourselves */
+				pending_del_slot = path->slots[0];
+				pending_del_nr = 1;
+			} else if (pending_del_nr &&
+				   path->slots[0] + 1 == pending_del_slot) {
+				/* hop on the pending chunk */
+				pending_del_nr++;
+				pending_del_slot = path->slots[0];
+			} else {
+				BUG();
+			}
+		} else {
 			break;
 		}
-		fts_delay(10);
+		should_throttle = 0;
+
+		if (found_extent &&
+		    (test_bit(BTRFS_ROOT_REF_COWS, &root->state) ||
+		     root == root->fs_info->tree_root)) {
+			btrfs_set_path_blocking(path);
+			bytes_deleted += extent_num_bytes;
+			ret = btrfs_free_extent(trans, root, extent_start,
+						extent_num_bytes, 0,
+						btrfs_header_owner(leaf),
+						ino, extent_offset);
+			BUG_ON(ret);
+			if (btrfs_should_throttle_delayed_refs(trans, root))
+				btrfs_async_run_delayed_refs(root,
+					trans->delayed_ref_updates * 2, 0);
+			if (be_nice) {
+				if (truncate_space_check(trans, root,
+							 extent_num_bytes)) {
+					should_end = 1;
+				}
+				if (btrfs_should_throttle_delayed_refs(trans,
+								       root)) {
+					should_throttle = 1;
+				}
+			}
+		}
+
+		if (found_type == BTRFS_INODE_ITEM_KEY)
+			break;
+
+		if (path->slots[0] == 0 ||
+		    path->slots[0] != pending_del_slot ||
+		    should_throttle || should_end) {
+			if (pending_del_nr) {
+				ret = btrfs_del_items(trans, root, path,
+						pending_del_slot,
+						pending_del_nr);
+				if (ret) {
+					btrfs_abort_transaction(trans,
+								root, ret);
+					goto error;
+				}
+				pending_del_nr = 0;
+			}
+			btrfs_release_path(path);
+			if (should_throttle) {
+				unsigned long updates = trans->delayed_ref_updates;
+				if (updates) {
+					trans->delayed_ref_updates = 0;
+					ret = btrfs_run_delayed_refs(trans, root, updates * 2);
+					if (ret && !err)
+						err = ret;
+				}
+			}
+			/*
+			 * if we failed to refill our space rsv, bail out
+			 * and let the transaction restart
+			 */
+			if (should_end) {
+				err = -EAGAIN;
+				goto error;
+			}
+			goto search_again;
+		} else {
+			path->slots[0]--;
+		}
 	}
-
-	if (info->board->item_version > 1) {
-		if (fts_set_sec_ito_test_result(info) >= 0)
-			fts_get_sec_ito_test_result(info);
+out:
+	if (pending_del_nr) {
+		ret = btrfs_del_items(trans, root, path, pending_del_slot,
+				      pending_del_nr);
+		if (ret)
+			btrfs_abort_transaction(trans, root, ret);
 	}
+error:
+	if (root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID)
+		btrfs_ordered_update_i_size(inode, last_size, NULL);
 
-	if((testmode == OPEN_SHORT_CRACK_TEST) || (info->factory_position != 0)) {
-		fts_systemreset(info, 10);
-		fts_command(info, 0xA6);
-		fts_fw_wait_for_specific_event(info, EVENTID_STATUS_EVENT, 0xA6, 0x00);
+	btrfs_free_path(path);
+
+	if (be_nice && bytes_deleted > 32 * 1024 * 1024) {
+		unsigned long updates = trans->delayed_ref_updates;
+		if (updates) {
+			trans->delayed_ref_updates = 0;
+			ret = btrfs_run_delayed_refs(trans, root, updates * 2);
+			if (ret && !err)
+				err = ret;
+		}
 	}
-
-	fts_checking_miscal(info, testmode);
-
-	fts_systemreset(info, 10);
-
-#ifdef FTS_SUPPORT_NOISE_PARAM
-	fts_set_noise_param(info);
-#endif
-
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-	fts_command(info, SENSEON);
-	fts_fw_wait_for_event (info, STATUS_EVENT_FORCE_CAL_DONE_D3);
-
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_command(info, FTS_CMD_KEY_SENSE_ON);
-#endif
-#ifdef FTS_SUPPORT_HOVER
-	if (info->hover_enabled)
-		fts_command(info, FTS_CMD_HOVER_ON);
-#endif
-	if (info->flip_enable) {
-		fts_set_cover_type(info, true);
-	}
-#ifdef CONFIG_GLOVE_TOUCH
-	else {
-		if (info->glove_enabled)
-			fts_command(info, FTS_CMD_GLOVE_ON);
-	}
-#endif
-#ifdef FTS_SUPPORT_TA_MODE
-	if (info->TA_Pluged)
-		fts_command(info, FTS_CMD_CHARGER_PLUGGED);
-#endif
-
-	info->touch_count = 0;
-
-	fts_interrupt_set(info, INT_ENABLE);
-	enable_irq(info->irq);
-
-	return result;
+	return err;
 }
 
-static void get_fw_ver_bin(void *device_data)
+/*
+ * btrfs_truncate_page - read, zero a chunk and write a page
+ * @inode - inode that we're zeroing
+ * @from - the offset to start zeroing
+ * @len - the length to zero, 0 to zero the entire range respective to the
+ *	offset
+ * @front - zero up to the offset instead of from the offset on
+ *
+ * This will find the page for the "from" offset and cow the page and zero the
+ * part we want to zero.  This is used with truncate and hole punching.
+ */
+int btrfs_truncate_page(struct inode *inode, loff_t from, loff_t len,
+			int front)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	snprintf(buff, sizeof(buff), "ST%02X%04X",
-			info->panel_revision,
-			info->fw_main_version_of_bin);
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "FW_VER_BIN");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_fw_ver_ic(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-				__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-			sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "FW_VER_IC");
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	disable_irq(info->irq);
-	fts_get_version_info(info);
-	enable_irq(info->irq);
-
-	snprintf(buff, sizeof(buff), "ST%02X%04X",
-			info->panel_revision,
-			info->fw_main_version_of_ic);
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "FW_VER_IC");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_config_ver(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[20] = { 0 };
-
-	snprintf(buff, sizeof(buff), "%s_ST_%04X",
-		info->board->model_name ?: info->board->project_name ?: "STM",
-		info->config_version_of_ic);
-
-	sec_cmd_set_default_result(sec);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_threshold(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	unsigned char buff[16] = { 0 };
-	unsigned char data[5] = { 0 };
-	unsigned short finger_threshold = 0;
-	int rc;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-				__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	sec->cmd_state = SEC_CMD_STATUS_RUNNING;
-	rc = info->fts_get_sysinfo_data(info, FTS_SI_FINGER_THRESHOLD, 4, data);
-	if (rc <= 0) {
-		input_err(true, info->dev, "%s: Get threshold Read Fail!! [Data : %2X%2X]\n", __func__, data[0], data[1]);
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	finger_threshold = (unsigned short)(data[0] + (data[1] << 8));
-
-	snprintf(buff, sizeof(buff), "%d", finger_threshold);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void module_off_master(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[3] = { 0 };
+	struct address_space *mapping = inode->i_mapping;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+	struct btrfs_ordered_extent *ordered;
+	struct extent_state *cached_state = NULL;
+	char *kaddr;
+	u32 blocksize = root->sectorsize;
+	pgoff_t index = from >> PAGE_CACHE_SHIFT;
+	unsigned offset = from & (PAGE_CACHE_SIZE-1);
+	struct page *page;
+	gfp_t mask = btrfs_alloc_write_mask(mapping);
 	int ret = 0;
+	u64 page_start;
+	u64 page_end;
 
-	ret = fts_stop_device(info, false);
+	if ((offset & (blocksize - 1)) == 0 &&
+	    (!len || ((len & (blocksize - 1)) == 0)))
+		goto out;
+	ret = btrfs_delalloc_reserve_space(inode,
+			round_down(from, PAGE_CACHE_SIZE), PAGE_CACHE_SIZE);
+	if (ret)
+		goto out;
 
-	if (ret == 0)
-		snprintf(buff, sizeof(buff), "%s", "OK");
-	else
-		snprintf(buff, sizeof(buff), "%s", "NG");
+again:
+	page = find_or_create_page(mapping, index, mask);
+	if (!page) {
+		btrfs_delalloc_release_space(inode,
+				round_down(from, PAGE_CACHE_SIZE),
+				PAGE_CACHE_SIZE);
+		ret = -ENOMEM;
+		goto out;
+	}
 
-	sec_cmd_set_default_result(sec);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (strncmp(buff, "OK", 2) == 0)
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	else
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
+	page_start = page_offset(page);
+	page_end = page_start + PAGE_CACHE_SIZE - 1;
+
+	if (!PageUptodate(page)) {
+		ret = btrfs_readpage(NULL, page);
+		lock_page(page);
+		if (page->mapping != mapping) {
+			unlock_page(page);
+			page_cache_release(page);
+			goto again;
+		}
+		if (!PageUptodate(page)) {
+			ret = -EIO;
+			goto out_unlock;
+		}
+	}
+	wait_on_page_writeback(page);
+
+	lock_extent_bits(io_tree, page_start, page_end, 0, &cached_state);
+	set_page_extent_mapped(page);
+
+	ordered = btrfs_lookup_ordered_extent(inode, page_start);
+	if (ordered) {
+		unlock_extent_cached(io_tree, page_start, page_end,
+				     &cached_state, GFP_NOFS);
+		unlock_page(page);
+		page_cache_release(page);
+		btrfs_start_ordered_extent(inode, ordered, 1);
+		btrfs_put_ordered_extent(ordered);
+		goto again;
+	}
+
+	clear_extent_bit(&BTRFS_I(inode)->io_tree, page_start, page_end,
+			  EXTENT_DIRTY | EXTENT_DELALLOC |
+			  EXTENT_DO_ACCOUNTING | EXTENT_DEFRAG,
+			  0, 0, &cached_state, GFP_NOFS);
+
+	ret = btrfs_set_extent_delalloc(inode, page_start, page_end,
+					&cached_state);
+	if (ret) {
+		unlock_extent_cached(io_tree, page_start, page_end,
+				     &cached_state, GFP_NOFS);
+		goto out_unlock;
+	}
+
+	if (offset != PAGE_CACHE_SIZE) {
+		if (!len)
+			len = PAGE_CACHE_SIZE - offset;
+		kaddr = kmap(page);
+		if (front)
+			memset(kaddr, 0, offset);
+		else
+			memset(kaddr + offset, 0, len);
+		flush_dcache_page(page);
+		kunmap(page);
+	}
+	ClearPageChecked(page);
+	set_page_dirty(page);
+	unlock_extent_cached(io_tree, page_start, page_end, &cached_state,
+			     GFP_NOFS);
+
+out_unlock:
+	if (ret)
+		btrfs_delalloc_release_space(inode, page_start,
+					     PAGE_CACHE_SIZE);
+	unlock_page(page);
+	page_cache_release(page);
+out:
+	return ret;
 }
 
-static void module_on_master(void *device_data)
+static int maybe_insert_hole(struct btrfs_root *root, struct inode *inode,
+			     u64 offset, u64 len)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[3] = { 0 };
-	int ret = 0;
+	struct btrfs_trans_handle *trans;
+	int ret;
 
-	ret = fts_start_device(info);
+	/*
+	 * Still need to make sure the inode looks like it's been updated so
+	 * that any holes get logged if we fsync.
+	 */
+	if (btrfs_fs_incompat(root->fs_info, NO_HOLES)) {
+		BTRFS_I(inode)->last_trans = root->fs_info->generation;
+		BTRFS_I(inode)->last_sub_trans = root->log_transid;
+		BTRFS_I(inode)->last_log_commit = root->last_log_commit;
+		return 0;
+	}
 
-	if (info->input_dev->disabled)
-		fts_stop_device(info, info->lowpower_flag);
+	/*
+	 * 1 - for the one we're dropping
+	 * 1 - for the one we're adding
+	 * 1 - for updating the inode.
+	 */
+	trans = btrfs_start_transaction(root, 3);
+	if (IS_ERR(trans))
+		return PTR_ERR(trans);
 
-	if (ret == 0)
-		snprintf(buff, sizeof(buff), "%s", "OK");
+	ret = btrfs_drop_extents(trans, root, inode, offset, offset + len, 1);
+	if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		btrfs_end_transaction(trans, root);
+		return ret;
+	}
+
+	ret = btrfs_insert_file_extent(trans, root, btrfs_ino(inode), offset,
+				       0, 0, len, 0, len, 0, 0, 0);
+	if (ret)
+		btrfs_abort_transaction(trans, root, ret);
 	else
-		snprintf(buff, sizeof(buff), "%s", "NG");
-
-	sec_cmd_set_default_result(sec);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (strncmp(buff, "OK", 2) == 0)
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	else
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
+		btrfs_update_inode(trans, root, inode);
+	btrfs_end_transaction(trans, root);
+	return ret;
 }
 
-static void get_chip_vendor(void *device_data)
+/*
+ * This function puts in dummy file extents for the area we're creating a hole
+ * for.  So if we are truncating this file to a larger size we need to insert
+ * these file extents so that btrfs_get_extent will return a EXTENT_MAP_HOLE for
+ * the range between oldsize and size
+ */
+int btrfs_cont_expand(struct inode *inode, loff_t oldsize, loff_t size)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+	struct extent_map *em = NULL;
+	struct extent_state *cached_state = NULL;
+	struct extent_map_tree *em_tree = &BTRFS_I(inode)->extent_tree;
+	u64 hole_start = ALIGN(oldsize, root->sectorsize);
+	u64 block_end = ALIGN(size, root->sectorsize);
+	u64 last_byte;
+	u64 cur_offset;
+	u64 hole_size;
+	int err = 0;
 
-	strncpy(buff, "STM", sizeof(buff));
-	sec_cmd_set_default_result(sec);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "IC_VENDOR");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
+	/*
+	 * If our size started in the middle of a page we need to zero out the
+	 * rest of the page before we expand the i_size, otherwise we could
+	 * expose stale data.
+	 */
+	err = btrfs_truncate_page(inode, oldsize, 0, 0);
+	if (err)
+		return err;
+
+	if (size <= hole_start)
+		return 0;
+
+	while (1) {
+		struct btrfs_ordered_extent *ordered;
+
+		lock_extent_bits(io_tree, hole_start, block_end - 1, 0,
+				 &cached_state);
+		ordered = btrfs_lookup_ordered_range(inode, hole_start,
+						     block_end - hole_start);
+		if (!ordered)
+			break;
+		unlock_extent_cached(io_tree, hole_start, block_end - 1,
+				     &cached_state, GFP_NOFS);
+		btrfs_start_ordered_extent(inode, ordered, 1);
+		btrfs_put_ordered_extent(ordered);
+	}
+
+	cur_offset = hole_start;
+	while (1) {
+		em = btrfs_get_extent(inode, NULL, 0, cur_offset,
+				block_end - cur_offset, 0);
+		if (IS_ERR(em)) {
+			err = PTR_ERR(em);
+			em = NULL;
+			break;
+		}
+		last_byte = min(extent_map_end(em), block_end);
+		last_byte = ALIGN(last_byte , root->sectorsize);
+		if (!test_bit(EXTENT_FLAG_PREALLOC, &em->flags)) {
+			struct extent_map *hole_em;
+			hole_size = last_byte - cur_offset;
+
+			err = maybe_insert_hole(root, inode, cur_offset,
+						hole_size);
+			if (err)
+				break;
+			btrfs_drop_extent_cache(inode, cur_offset,
+						cur_offset + hole_size - 1, 0);
+			hole_em = alloc_extent_map();
+			if (!hole_em) {
+				set_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+					&BTRFS_I(inode)->runtime_flags);
+				goto next;
+			}
+			hole_em->start = cur_offset;
+			hole_em->len = hole_size;
+			hole_em->orig_start = cur_offset;
+
+			hole_em->block_start = EXTENT_MAP_HOLE;
+			hole_em->block_len = 0;
+			hole_em->orig_block_len = 0;
+			hole_em->ram_bytes = hole_size;
+			hole_em->bdev = root->fs_info->fs_devices->latest_bdev;
+			hole_em->compress_type = BTRFS_COMPRESS_NONE;
+			hole_em->generation = root->fs_info->generation;
+
+			while (1) {
+				write_lock(&em_tree->lock);
+				err = add_extent_mapping(em_tree, hole_em, 1);
+				write_unlock(&em_tree->lock);
+				if (err != -EEXIST)
+					break;
+				btrfs_drop_extent_cache(inode, cur_offset,
+							cur_offset +
+							hole_size - 1, 0);
+			}
+			free_extent_map(hole_em);
+		}
+next:
+		free_extent_map(em);
+		em = NULL;
+		cur_offset = last_byte;
+		if (cur_offset >= block_end)
+			break;
+	}
+	free_extent_map(em);
+	unlock_extent_cached(io_tree, hole_start, block_end - 1, &cached_state,
+			     GFP_NOFS);
+	return err;
 }
 
-static void get_chip_name(void *device_data)
+static int wait_snapshoting_atomic_t(atomic_t *a)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
-
-	memcpy(buff, info->firmware_name + 8, 9);
-
-	sec_cmd_set_default_result(sec);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "IC_NAME");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
+	schedule();
+	return 0;
 }
 
-static void get_mis_cal_info(void *device_data)
+static void wait_for_snapshot_creation(struct btrfs_root *root)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
+	while (true) {
+		int ret;
 
-	sec_cmd_set_default_result(sec);
+		ret = btrfs_start_write_no_snapshoting(root);
+		if (ret)
+			break;
+		wait_on_atomic_t(&root->will_be_snapshoted,
+				 wait_snapshoting_atomic_t,
+				 TASK_UNINTERRUPTIBLE);
+	}
+}
 
-	snprintf(buff, sizeof(buff), "%d", info->miscal_result);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "MIS_CAL");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
+static int btrfs_setsize(struct inode *inode, struct iattr *attr)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_trans_handle *trans;
+	loff_t oldsize = i_size_read(inode);
+	loff_t newsize = attr->ia_size;
+	int mask = attr->ia_valid;
+	int ret;
+
+	/*
+	 * The regular truncate() case without ATTR_CTIME and ATTR_MTIME is a
+	 * special case where we need to update the times despite not having
+	 * these flags set.  For all other operations the VFS set these flags
+	 * explicitly if it wants a timestamp update.
+	 */
+	if (newsize != oldsize) {
+		inode_inc_iversion(inode);
+		if (!(mask & (ATTR_CTIME | ATTR_MTIME)))
+			inode->i_ctime = inode->i_mtime =
+				current_fs_time(inode->i_sb);
+	}
+
+	if (newsize > oldsize) {
+		truncate_pagecache(inode, newsize);
+		/*
+		 * Don't do an expanding truncate while snapshoting is ongoing.
+		 * This is to ensure the snapshot captures a fully consistent
+		 * state of this file - if the snapshot captures this expanding
+		 * truncation, it must capture all writes that happened before
+		 * this truncation.
+		 */
+		wait_for_snapshot_creation(root);
+		ret = btrfs_cont_expand(inode, oldsize, newsize);
+		if (ret) {
+			btrfs_end_write_no_snapshoting(root);
+			return ret;
+		}
+
+		trans = btrfs_start_transaction(root, 1);
+		if (IS_ERR(trans)) {
+			btrfs_end_write_no_snapshoting(root);
+			return PTR_ERR(trans);
+		}
+
+		i_size_write(inode, newsize);
+		btrfs_ordered_update_i_size(inode, i_size_read(inode), NULL);
+		ret = btrfs_update_inode(trans, root, inode);
+		btrfs_end_write_no_snapshoting(root);
+		btrfs_end_transaction(trans, root);
+	} else {
+
+		/*
+		 * We're truncating a file that used to have good data down to
+		 * zero. Make sure it gets into the ordered flush list so that
+		 * any new writes get down to disk quickly.
+		 */
+		if (newsize == 0)
+			set_bit(BTRFS_INODE_ORDERED_DATA_CLOSE,
+				&BTRFS_I(inode)->runtime_flags);
+
+		/*
+		 * 1 for the orphan item we're going to add
+		 * 1 for the orphan item deletion.
+		 */
+		trans = btrfs_start_transaction(root, 2);
+		if (IS_ERR(trans))
+			return PTR_ERR(trans);
+
+		/*
+		 * We need to do this in case we fail at _any_ point during the
+		 * actual truncate.  Once we do the truncate_setsize we could
+		 * invalidate pages which forces any outstanding ordered io to
+		 * be instantly completed which will give us extents that need
+		 * to be truncated.  If we fail to get an orphan inode down we
+		 * could have left over extents that were never meant to live,
+		 * so we need to garuntee from this point on that everything
+		 * will be consistent.
+		 */
+		ret = btrfs_orphan_add(trans, inode);
+		btrfs_end_transaction(trans, root);
+		if (ret)
+			return ret;
+
+		/* we don't support swapfiles, so vmtruncate shouldn't fail */
+		truncate_setsize(inode, newsize);
+
+		/* Disable nonlocked read DIO to avoid the end less truncate */
+		btrfs_inode_block_unlocked_dio(inode);
+		inode_dio_wait(inode);
+		btrfs_inode_resume_unlocked_dio(inode);
+
+		ret = btrfs_truncate(inode);
+		if (ret && inode->i_nlink) {
+			int err;
+
+			/*
+			 * failed to truncate, disk_i_size is only adjusted down
+			 * as we remove extents, so it should represent the true
+			 * size of the inode, so reset the in memory size and
+			 * delete our orphan entry.
+			 */
+			trans = btrfs_join_transaction(root);
+			if (IS_ERR(trans)) {
+				btrfs_orphan_del(NULL, inode);
+				return ret;
+			}
+			i_size_write(inode, BTRFS_I(inode)->disk_i_size);
+			err = btrfs_orphan_del(trans, inode);
+			if (err)
+				btrfs_abort_transaction(trans, root, err);
+			btrfs_end_transaction(trans, root);
+		}
+	}
+
+	return ret;
+}
+
+static int btrfs_setattr(struct dentry *dentry, struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	int err;
+
+	if (btrfs_root_readonly(root))
+		return -EROFS;
+
+	err = inode_change_ok(inode, attr);
+	if (err)
+		return err;
+
+	if (S_ISREG(inode->i_mode) && (attr->ia_valid & ATTR_SIZE)) {
+		err = btrfs_setsize(inode, attr);
+		if (err)
+			return err;
+	}
+
+	if (attr->ia_valid) {
+		setattr_copy(inode, attr);
+		inode_inc_iversion(inode);
+		err = btrfs_dirty_inode(inode);
+
+		if (!err && attr->ia_valid & ATTR_MODE)
+			err = posix_acl_chmod(inode, inode->i_mode);
+	}
+
+	return err;
+}
+
+/*
+ * While truncating the inode pages during eviction, we get the VFS calling
+ * btrfs_invalidatepage() against each page of the inode. This is slow because
+ * the calls to btrfs_invalidatepage() result in a huge amount of calls to
+ * lock_extent_bits() and clear_extent_bit(), which keep merging and splitting
+ * extent_state structures over and over, wasting lots of time.
+ *
+ * Therefore if the inode is being evicted, let btrfs_invalidatepage() skip all
+ * those expensive operations on a per page basis and do only the ordered io
+ * finishing, while we release here the extent_map and extent_state structures,
+ * without the excessive merging and splitting.
+ */
+static void evict_inode_truncate_pages(struct inode *inode)
+{
+	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+	struct extent_map_tree *map_tree = &BTRFS_I(inode)->extent_tree;
+	struct rb_node *node;
+
+	ASSERT(inode->i_state & I_FREEING);
+	truncate_inode_pages_final(&inode->i_data);
+
+	write_lock(&map_tree->lock);
+	while (!RB_EMPTY_ROOT(&map_tree->map)) {
+		struct extent_map *em;
+
+		node = rb_first(&map_tree->map);
+		em = rb_entry(node, struct extent_map, rb_node);
+		clear_bit(EXTENT_FLAG_PINNED, &em->flags);
+		clear_bit(EXTENT_FLAG_LOGGING, &em->flags);
+		remove_extent_mapping(map_tree, em);
+		free_extent_map(em);
+		if (need_resched()) {
+			write_unlock(&map_tree->lock);
+			cond_resched();
+			write_lock(&map_tree->lock);
+		}
+	}
+	write_unlock(&map_tree->lock);
+
+	/*
+	 * Keep looping until we have no more ranges in the io tree.
+	 * We can have ongoing bios started by readpages (called from readahead)
+	 * that have their endio callback (extent_io.c:end_bio_extent_readpage)
+	 * still in progress (unlocked the pages in the bio but did not yet
+	 * unlocked the ranges in the io tree). Therefore this means some
+	 * ranges can still be locked and eviction started because before
+	 * submitting those bios, which are executed by a separate task (work
+	 * queue kthread), inode references (inode->i_count) were not taken
+	 * (which would be dropped in the end io callback of each bio).
+	 * Therefore here we effectively end up waiting for those bios and
+	 * anyone else holding locked ranges without having bumped the inode's
+	 * reference count - if we don't do it, when they access the inode's
+	 * io_tree to unlock a range it may be too late, leading to an
+	 * use-after-free issue.
+	 */
+	spin_lock(&io_tree->lock);
+	while (!RB_EMPTY_ROOT(&io_tree->state)) {
+		struct extent_state *state;
+		struct extent_state *cached_state = NULL;
+		u64 start;
+		u64 end;
+
+		node = rb_first(&io_tree->state);
+		state = rb_entry(node, struct extent_state, rb_node);
+		start = state->start;
+		end = state->end;
+		spin_unlock(&io_tree->lock);
+
+		lock_extent_bits(io_tree, start, end, 0, &cached_state);
+
+		/*
+		 * If still has DELALLOC flag, the extent didn't reach disk,
+		 * and its reserved space won't be freed by delayed_ref.
+		 * So we need to free its reserved space here.
+		 * (Refer to comment in btrfs_invalidatepage, case 2)
+		 *
+		 * Note, end is the bytenr of last byte, so we need + 1 here.
+		 */
+		if (state->state & EXTENT_DELALLOC)
+			btrfs_qgroup_free_data(inode, start, end - start + 1);
+
+		clear_extent_bit(io_tree, start, end,
+				 EXTENT_LOCKED | EXTENT_DIRTY |
+				 EXTENT_DELALLOC | EXTENT_DO_ACCOUNTING |
+				 EXTENT_DEFRAG, 1, 1,
+				 &cached_state, GFP_NOFS);
+
+		cond_resched();
+		spin_lock(&io_tree->lock);
+	}
+	spin_unlock(&io_tree->lock);
+}
+
+void btrfs_evict_inode(struct inode *inode)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_block_rsv *rsv, *global_rsv;
+	int steal_from_global = 0;
+	u64 min_size = btrfs_calc_trunc_metadata_size(root, 1);
+	int ret;
+
+	trace_btrfs_inode_evict(inode);
+
+	evict_inode_truncate_pages(inode);
+
+	if (inode->i_nlink &&
+	    ((btrfs_root_refs(&root->root_item) != 0 &&
+	      root->root_key.objectid != BTRFS_ROOT_TREE_OBJECTID) ||
+	     btrfs_is_free_space_inode(inode)))
+		goto no_delete;
+
+	if (is_bad_inode(inode)) {
+		btrfs_orphan_del(NULL, inode);
+		goto no_delete;
+	}
+	/* do we really want it for ->i_nlink > 0 and zero btrfs_root_refs? */
+	if (!special_file(inode->i_mode))
+		btrfs_wait_ordered_range(inode, 0, (u64)-1);
+
+	btrfs_free_io_failure_record(inode, 0, (u64)-1);
+
+	if (root->fs_info->log_root_recovering) {
+		BUG_ON(test_bit(BTRFS_INODE_HAS_ORPHAN_ITEM,
+				 &BTRFS_I(inode)->runtime_flags));
+		goto no_delete;
+	}
+
+	if (inode->i_nlink > 0) {
+		BUG_ON(btrfs_root_refs(&root->root_item) != 0 &&
+		       root->root_key.objectid != BTRFS_ROOT_TREE_OBJECTID);
+		goto no_delete;
+	}
+
+	ret = btrfs_commit_inode_delayed_inode(inode);
+	if (ret) {
+		btrfs_orphan_del(NULL, inode);
+		goto no_delete;
+	}
+
+	rsv = btrfs_alloc_block_rsv(root, BTRFS_BLOCK_RSV_TEMP);
+	if (!rsv) {
+		btrfs_orphan_del(NULL, inode);
+		goto no_delete;
+	}
+	rsv->size = min_size;
+	rsv->failfast = 1;
+	global_rsv = &root->fs_info->global_block_rsv;
+
+	btrfs_i_size_write(inode, 0);
+
+	/*
+	 * This is a bit simpler than btrfs_truncate since we've already
+	 * reserved our space for our orphan item in the unlink, so we just
+	 * need to reserve some slack space in case we add bytes and update
+	 * inode item when doing the truncate.
+	 */
+	while (1) {
+		ret = btrfs_block_rsv_refill(root, rsv, min_size,
+					     BTRFS_RESERVE_FLUSH_LIMIT);
+
+		/*
+		 * Try and steal from the global reserve since we will
+		 * likely not use this space anyway, we want to try as
+		 * hard as possible to get this to work.
+		 */
+		if (ret)
+			steal_from_global++;
+		else
+			steal_from_global = 0;
+		ret = 0;
+
+		/*
+		 * steal_from_global == 0: we reserved stuff, hooray!
+		 * steal_from_global == 1: we didn't reserve stuff, boo!
+		 * steal_from_global == 2: we've committed, still not a lot of
+		 * room but maybe we'll have room in the global reserve this
+		 * time.
+		 * steal_from_global == 3: abandon all hope!
+		 */
+		if (steal_from_global > 2) {
+			btrfs_warn(root->fs_info,
+				"Could not get space for a delete, will truncate on mount %d",
+				ret);
+			btrfs_orphan_del(NULL, inode);
+			btrfs_free_block_rsv(root, rsv);
+			goto no_delete;
+		}
+
+		trans = btrfs_join_transaction(root);
+		if (IS_ERR(trans)) {
+			btrfs_orphan_del(NULL, inode);
+			btrfs_free_block_rsv(root, rsv);
+			goto no_delete;
+		}
+
+		/*
+		 * We can't just steal from the global reserve, we need tomake
+		 * sure there is room to do it, if not we need to commit and try
+		 * again.
+		 */
+		if (steal_from_global) {
+			if (!btrfs_check_space_for_delayed_refs(trans, root))
+				ret = btrfs_block_rsv_migrate(global_rsv, rsv,
+							      min_size);
+			else
+				ret = -ENOSPC;
+		}
+
+		/*
+		 * Couldn't steal from the global reserve, we have too much
+		 * pending stuff built up, commit the transaction and try it
+		 * again.
+		 */
+		if (ret) {
+			ret = btrfs_commit_transaction(trans, root);
+			if (ret) {
+				btrfs_orphan_del(NULL, inode);
+				btrfs_free_block_rsv(root, rsv);
+				goto no_delete;
+			}
+			continue;
+		} else {
+			steal_from_global = 0;
+		}
+
+		trans->block_rsv = rsv;
+
+		ret = btrfs_truncate_inode_items(trans, root, inode, 0, 0);
+		if (ret != -ENOSPC && ret != -EAGAIN)
+			break;
+
+		trans->block_rsv = &root->fs_info->trans_block_rsv;
+		btrfs_end_transaction(trans, root);
+		trans = NULL;
+		btrfs_btree_balance_dirty(root);
+	}
+
+	btrfs_free_block_rsv(root, rsv);
+
+	/*
+	 * Errors here aren't a big deal, it just means we leave orphan items
+	 * in the tree.  They will be cleaned up on the next mount.
+	 */
+	if (ret == 0) {
+		trans->block_rsv = root->orphan_block_rsv;
+		btrfs_orphan_del(trans, inode);
+	} else {
+		btrfs_orphan_del(NULL, inode);
+	}
+
+	trans->block_rsv = &root->fs_info->trans_block_rsv;
+	if (!(root == root->fs_info->tree_root ||
+	      root->root_key.objectid == BTRFS_TREE_RELOC_OBJECTID))
+		btrfs_return_ino(root, btrfs_ino(inode));
+
+	btrfs_end_transaction(trans, root);
+	btrfs_btree_balance_dirty(root);
+no_delete:
+	btrfs_remove_delayed_node(inode);
+	clear_inode(inode);
 	return;
 }
 
-static void get_wet_mode(void *device_data)
+/*
+ * Return the key found in the dir entry in the location pointer, fill @type
+ * with BTRFS_FT_*, and return 0.
+ *
+ * If no dir entries were found, location->objectid is 0.
+ */
+static int btrfs_inode_by_name(struct inode *dir, struct dentry *dentry,
+			       struct btrfs_key *location, u8 *type)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAdd[3] = { 0 };
-	unsigned char data[2] = { 0 };
+	const char *name = dentry->d_name.name;
+	int namelen = dentry->d_name.len;
+	struct btrfs_dir_item *di;
+	struct btrfs_path *path;
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	int ret = 0;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	di = btrfs_lookup_dir_item(NULL, root, path, btrfs_ino(dir), name,
+				    namelen, 0);
+	if (IS_ERR(di))
+		ret = PTR_ERR(di);
+
+	if (IS_ERR_OR_NULL(di))
+		goto out_err;
+
+	btrfs_dir_item_key_to_cpu(path->nodes[0], di, location);
+	if (!ret)
+		*type = btrfs_dir_type(path->nodes[0], di);
+out:
+	btrfs_free_path(path);
+	return ret;
+out_err:
+	location->objectid = 0;
+	goto out;
+}
+
+/*
+ * when we hit a tree root in a directory, the btrfs part of the inode
+ * needs to be changed to reflect the root directory of the tree root.  This
+ * is kind of like crossing a mount point.
+ */
+static int fixup_tree_root_location(struct btrfs_root *root,
+				    struct inode *dir,
+				    struct dentry *dentry,
+				    struct btrfs_key *location,
+				    struct btrfs_root **sub_root)
+{
+	struct btrfs_path *path;
+	struct btrfs_root *new_root;
+	struct btrfs_root_ref *ref;
+	struct extent_buffer *leaf;
+	struct btrfs_key key;
 	int ret;
+	int err = 0;
 
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n", __func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
+	path = btrfs_alloc_path();
+	if (!path) {
+		err = -ENOMEM;
+		goto out;
 	}
 
-	regAdd[0] = 0xD0;
-	regAdd[1] = 0x00;
-	regAdd[2] = 0x66;
+	err = -ENOENT;
+	key.objectid = BTRFS_I(dir)->root->root_key.objectid;
+	key.type = BTRFS_ROOT_REF_KEY;
+	key.offset = location->objectid;
 
-	ret = fts_read_reg(info, regAdd, 3, data, 2);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to read\n", __func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
+	ret = btrfs_search_slot(NULL, root->fs_info->tree_root, &key, path,
+				0, 0);
+	if (ret) {
+		if (ret < 0)
+			err = ret;
+		goto out;
 	}
 
-	input_err(true, &info->client->dev, "%s: %02X, %02X\n", __func__, data[0], data[1]);
+	leaf = path->nodes[0];
+	ref = btrfs_item_ptr(leaf, path->slots[0], struct btrfs_root_ref);
+	if (btrfs_root_ref_dirid(leaf, ref) != btrfs_ino(dir) ||
+	    btrfs_root_ref_name_len(leaf, ref) != dentry->d_name.len)
+		goto out;
 
-	snprintf(buff, sizeof(buff), "%d", data[1]);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
+	ret = memcmp_extent_buffer(leaf, dentry->d_name.name,
+				   (unsigned long)(ref + 1),
+				   dentry->d_name.len);
+	if (ret)
+		goto out;
 
-static void get_x_num(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
+	btrfs_release_path(path);
 
-	sec_cmd_set_default_result(sec);
-	snprintf(buff, sizeof(buff), "%d", info->SenseChannelLength);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_y_num(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-	snprintf(buff, sizeof(buff), "%d", info->ForceChannelLength);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_checksum_data(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
-	int rc;
-	unsigned char data[6] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
+	new_root = btrfs_read_fs_root_no_name(root->fs_info, location);
+	if (IS_ERR(new_root)) {
+		err = PTR_ERR(new_root);
+		goto out;
 	}
 
-	rc = fts_systemreset(info, 10);
-	if (rc != FTS_NOT_ERROR) {
-		snprintf(buff, sizeof(buff), "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-	} else {
-		fts_reinit(info);
+	*sub_root = new_root;
+	location->objectid = btrfs_root_dirid(&new_root->root_item);
+	location->type = BTRFS_INODE_ITEM_KEY;
+	location->offset = 0;
+	err = 0;
+out:
+	btrfs_free_path(path);
+	return err;
+}
 
-		fts_interrupt_set(info, INT_DISABLE);
+static void inode_tree_add(struct inode *inode)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_inode *entry;
+	struct rb_node **p;
+	struct rb_node *parent;
+	struct rb_node *new = &BTRFS_I(inode)->rb_node;
+	u64 ino = btrfs_ino(inode);
 
-		rc = info->fts_get_sysinfo_data(info, FTS_SI_CONFIG_CHECKSUM, 5, data);
-		if (rc <= 0) {
-			input_err(true, info->dev, "%s: Get checksum data Read Fail!! [Data : %2X%2X%2X%2X]\n", __func__, data[1], data[0], data[3], data[2]);
-			sec->cmd_state = SEC_CMD_STATUS_FAIL;
+	if (inode_unhashed(inode))
+		return;
+	parent = NULL;
+	spin_lock(&root->inode_lock);
+	p = &root->inode_tree.rb_node;
+	while (*p) {
+		parent = *p;
+		entry = rb_entry(parent, struct btrfs_inode, rb_node);
+
+		if (ino < btrfs_ino(&entry->vfs_inode))
+			p = &parent->rb_left;
+		else if (ino > btrfs_ino(&entry->vfs_inode))
+			p = &parent->rb_right;
+		else {
+			WARN_ON(!(entry->vfs_inode.i_state &
+				  (I_WILL_FREE | I_FREEING)));
+			rb_replace_node(parent, new, &root->inode_tree);
+			RB_CLEAR_NODE(parent);
+			spin_unlock(&root->inode_lock);
 			return;
 		}
+	}
+	rb_link_node(new, parent, p);
+	rb_insert_color(new, &root->inode_tree);
+	spin_unlock(&root->inode_lock);
+}
 
-		fts_interrupt_set(info, INT_ENABLE);
+static void inode_tree_del(struct inode *inode)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	int empty = 0;
 
-		snprintf(buff, sizeof(buff), "%02X%02X%02X%02X", data[1], data[0], data[3], data[2]);
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-		input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
+	spin_lock(&root->inode_lock);
+	if (!RB_EMPTY_NODE(&BTRFS_I(inode)->rb_node)) {
+		rb_erase(&BTRFS_I(inode)->rb_node, &root->inode_tree);
+		RB_CLEAR_NODE(&BTRFS_I(inode)->rb_node);
+		empty = RB_EMPTY_ROOT(&root->inode_tree);
+	}
+	spin_unlock(&root->inode_lock);
+
+	if (empty && btrfs_root_refs(&root->root_item) == 0) {
+		spin_lock(&root->inode_lock);
+		empty = RB_EMPTY_ROOT(&root->inode_tree);
+		spin_unlock(&root->inode_lock);
+		if (empty)
+			btrfs_add_dead_root(root);
 	}
 }
 
-static void run_reference_read(void *device_data)
+void btrfs_invalidate_inodes(struct btrfs_root *root)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short min = 0x7FFF;
-	short max = 0x8000;
+	struct rb_node *node;
+	struct rb_node *prev;
+	struct btrfs_inode *entry;
+	struct inode *inode;
+	u64 objectid = 0;
 
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
+	if (!test_bit(BTRFS_FS_STATE_ERROR, &root->fs_info->fs_state))
+		WARN_ON(btrfs_root_refs(&root->root_item) != 0);
 
-	fts_read_frame(info, TYPE_BASELINE_DATA, &min, &max);
-	snprintf(buff, sizeof(buff), "%d,%d", min, max);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
+	spin_lock(&root->inode_lock);
+again:
+	node = root->inode_tree.rb_node;
+	prev = NULL;
+	while (node) {
+		prev = node;
+		entry = rb_entry(node, struct btrfs_inode, rb_node);
 
-static void get_reference(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short val = 0;
-	int node = 0;
-
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	node = fts_check_index(info);
-	if (node < 0)
-		return;
-
-	val = info->pFrame[node];
-	snprintf(buff, sizeof(buff), "%d", val);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void run_rawcap_read(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short min = 0x7FFF;
-	short max = 0x8000;
-
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-			sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "RAW_DATA");
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	fts_read_frame(info, TYPE_FILTERED_DATA, &min, &max);
-	snprintf(buff, sizeof(buff), "%d,%d", min, max);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "RAW_DATA");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void run_rawcap_read_all(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short min = 0x7FFF;
-	short max = 0x8000;
-	char *all_strbuff;
-	int i, j;
-
-	sec_cmd_set_default_result(sec);
-	if (info->fts_power_state == FTS_POWER_STATE_POWERDOWN) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-				__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	all_strbuff = kzalloc(info->ForceChannelLength * info->SenseChannelLength * 7 + 1, GFP_KERNEL);
-	if (!all_strbuff) {
-		input_err(true, &info->client->dev, "%s: alloc failed\n", __func__);
-		snprintf(buff, sizeof(buff), "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	fts_read_frame(info, TYPE_FILTERED_DATA, &min, &max);
-	for (j = 0; j < info->ForceChannelLength; j++) {
-		for (i = 0; i < info->SenseChannelLength; i++) {
-			snprintf(buff, sizeof(buff), "%d,", info->pFrame[j * info->SenseChannelLength + i]);
-			strncat(all_strbuff, buff, sizeof(buff));
-		}
-	}
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, all_strbuff, strlen(all_strbuff));
-	input_info(true, &info->client->dev, "%s: %ld\n", __func__, strlen(all_strbuff));
-	kfree(all_strbuff);
-}
-
-static void get_rawcap(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short val = 0;
-	int node = 0;
-
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	node = fts_check_index(info);
-	if (node < 0)
-		return;
-
-	val = info->pFrame[node];
-	snprintf(buff, sizeof(buff), "%d", val);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void run_delta_read(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short min = 0x7FFF;
-	short max = 0x8000;
-
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	fts_read_frame(info, TYPE_STRENGTH_DATA, &min, &max);
-	snprintf(buff, sizeof(buff), "%d,%d", min, max);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_strength_all_data(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short min = 0x7FFF;
-	short max = 0x8000;
-	char all_strbuff[(info->ForceChannelLength)*(info->SenseChannelLength)*5];
-	int i, j;
-
-	memset(all_strbuff,0,sizeof(char)*((info->ForceChannelLength)*(info->SenseChannelLength)*5));	//size 5  ex(1125,)
-
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	fts_read_frame(info, TYPE_STRENGTH_DATA, &min, &max);
-
-
-	for (i = 0; i < info->ForceChannelLength; i++) {
-		for (j = 0; j < info->SenseChannelLength; j++) {
-
-			snprintf(buff, sizeof(buff), "%d,", info->pFrame[(i * info->SenseChannelLength) + j]);
-			strncat(all_strbuff, buff, sizeof(buff));
-		}
-	}
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-
-	sec_cmd_set_cmd_result(sec, all_strbuff, strnlen(all_strbuff, sizeof(all_strbuff)));
-	input_info(true, &info->client->dev, "%s: %ld (%ld)\n", __func__, strnlen(all_strbuff, sizeof(all_strbuff)),sizeof(all_strbuff));
-}
-
-static void get_delta(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short val = 0;
-	int node = 0;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	node = fts_check_index(info);
-	if (node < 0)
-		return;
-
-	val = info->pFrame[node];
-	snprintf(buff, sizeof(buff), "%d", val);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-#ifdef TCLM_CONCEPT
-static void get_pat_information(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[50] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	/* fixed tune version will be saved at excute autotune */
-	snprintf(buff, sizeof(buff), "C%02XT%04X.%4s%s%c%d%c%d%c%d",
-		info->tdata->nvdata.cal_count, info->tdata->nvdata.tune_fix_ver,
-		info->tdata->tclm_string[info->tdata->nvdata.cal_position].f_name,
-		(info->tdata->tclm_level == TCLM_LEVEL_LOCKDOWN) ? ".L " : " ",
-		info->tdata->cal_pos_hist_last3[0], info->tdata->cal_pos_hist_last3[1],
-		info->tdata->cal_pos_hist_last3[2], info->tdata->cal_pos_hist_last3[3],
-		info->tdata->cal_pos_hist_last3[4], info->tdata->cal_pos_hist_last3[5]);
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void set_external_factory(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	info->tdata->external_factory = true;
-	snprintf(buff, sizeof(buff), "OK");
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-#endif
-
-#ifdef FTS_SUPPORT_HOVER
-void fts_read_self_frame(struct fts_ts_info *info, unsigned short oAddr)
-{
-	struct sec_cmd_data *sec = &info->sec;
-	char buff[66] = {0, };
-	short *data = 0;
-	char temp[9] = {0, };
-	char temp2[512] = {0, };
-	int i;
-	int rc;
-	int retry=1;
-	unsigned char regAdd[6] = {0xD0, 0x00, 0x00, 0xD0, 0x00, 0x00};
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	if (!info->hover_enabled) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Hover is disabled\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP Hover disabled");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	while (!info->hover_ready) {
-		if (retry++ > 500) {
-			input_err(true, &info->client->dev, "%s: Timeout - Abs Raw Data Ready Event\n",
-					  __func__);
+		if (objectid < btrfs_ino(&entry->vfs_inode))
+			node = node->rb_left;
+		else if (objectid > btrfs_ino(&entry->vfs_inode))
+			node = node->rb_right;
+		else
 			break;
-		}
-		fts_delay(10);
 	}
-
-	regAdd[1] = (oAddr >> 8) & 0xff;
-	regAdd[2] = oAddr & 0xff;
-	rc = info->fts_read_reg(info, &regAdd[0], 3, (unsigned char *)&buff[0], 5);
-	if (rc <= 0) {
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: Force Address : %02x%02x\n",
-			__func__, buff[2], buff[1]);
-	input_info(true, &info->client->dev, "%s: Sense Address : %02x%02x\n",
-			__func__, buff[4], buff[3]);
-	regAdd[1] = buff[4];
-	regAdd[2] = buff[3];
-	regAdd[4] = buff[2];
-	regAdd[5] = buff[1];
-
-	rc = info->fts_read_reg(info, &regAdd[0], 3,
-					(unsigned char *)&buff[0],
-					info->SenseChannelLength * 2 + 1);
-	if (rc <= 0) {
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	data = (short *)&buff[1];
-
-	memset(temp, 0x00, ARRAY_SIZE(temp));
-	memset(temp2, 0x00, ARRAY_SIZE(temp2));
-
-	for (i = 0; i < info->SenseChannelLength; i++) {
-		input_info(true, &info->client->dev,
-				"%s: Rx [%d] = %d\n", __func__, i, *data);
-		snprintf(temp, sizeof(temp), "%d,", *data);
-		strncat(temp2, temp, 9);
-		data++;
-	}
-
-	rc = info->fts_read_reg(info, &regAdd[3], 3,
-							(unsigned char *)&buff[0],
-							info->ForceChannelLength * 2 + 1);
-	if (rc <= 0) {
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	data = (short *)&buff[1];
-
-	for (i = 0; i < info->ForceChannelLength; i++) {
-		input_info(true, &info->client->dev,
-				"%s: Tx [%d] = %d\n", __func__, i, *data);
-		snprintf(temp, sizeof(temp), "%d,", *data);
-		strncat(temp2, temp, 9);
-		data++;
-	}
-
-	sec_cmd_set_cmd_result(sec, temp2, strnlen(temp2, sizeof(temp2)));
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-}
-
-static void run_abscap_read(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	sec_cmd_set_default_result(sec);
-	fts_read_self_frame(info, 0x000E);
-}
-
-static void run_absdelta_read(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	sec_cmd_set_default_result(sec);
-	fts_read_self_frame(info, 0x0012);
-}
-#endif
-
-#define FTS_WATER_SELF_RAW_ADDR	0x1A
-
-static void fts_read_ix_data(struct fts_ts_info *info, bool allnode)
-{
-	struct sec_cmd_data *sec = &info->sec;
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	unsigned short max_tx_ix_sum = 0;
-	unsigned short min_tx_ix_sum = 0xFFFF;
-
-	unsigned short max_rx_ix_sum = 0;
-	unsigned short min_rx_ix_sum = 0xFFFF;
-
-	unsigned char tx_ix2[info->ForceChannelLength + 4];
-	unsigned char rx_ix2[info->SenseChannelLength + 4];
-
-	unsigned char regAdd[FTS_EVENT_SIZE];
-	unsigned short tx_ix1 = 0, rx_ix1 = 0;
-
-	unsigned short force_ix_data[info->ForceChannelLength * 2 + 1];
-	unsigned short sense_ix_data[info->SenseChannelLength * 2 + 1];
-	int buff_size,j;
-	char *mbuff = NULL;
-	int num,n,a,fzero;
-	char cnum;
-	int i = 0;
-	int comp_header_addr, comp_start_tx_addr, comp_start_rx_addr;
-	unsigned int rx_num, tx_num;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-		       __func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-			sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "IX_DATA");
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	disable_irq(info->irq);
-	fts_interrupt_set(info, INT_DISABLE);
-
-	fts_command(info, SENSEOFF);
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey) {
-		fts_command(info, FTS_CMD_KEY_SENSE_OFF);
-	}
-#endif
-
-	fts_command(info, FLUSHBUFFER);                 // Clear FIFO
-	fts_delay(50);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	/* Request compensation data */
-	regAdd[0] = 0xB8;
-	regAdd[1] = 0x20;		// SELF IX
-	regAdd[2] = 0x00;
-	fts_write_reg(info, &regAdd[0], 3);
-	fts_fw_wait_for_specific_event(info, EVENTID_STATUS_REQUEST_COMP, 0x20, 0x00);
-
-	/* Read an address of compensation data */
-	regAdd[0] = 0xD0;
-	regAdd[1] = 0x00;
-	regAdd[2] = FTS_SI_COMPENSATION_OFFSET_ADDR;
-	fts_read_reg(info, regAdd, 3, &buff[0], 4);
-	comp_header_addr = buff[1] + (buff[2] << 8);
-
-	/* Read header of compensation area */
-	regAdd[0] = 0xD0;
-	regAdd[1] = (comp_header_addr >> 8) & 0xFF;
-	regAdd[2] = comp_header_addr & 0xFF;
-	fts_read_reg(info, regAdd, 3, &buff[0], 16 + 1);
-	tx_num = buff[5];
-	rx_num = buff[6];
-
-	tx_ix1 = (short) buff[10] * FTS_SEC_IX1_TX_MULTIPLIER;		// Self TX Ix1
-	rx_ix1 = (short) buff[11] * FTS_SEC_IX1_RX_MULTIPLIER;		// Self RX Ix1
-
-	comp_start_tx_addr = comp_header_addr + 0x10;
-	comp_start_rx_addr = comp_start_tx_addr + tx_num;
-
-	memset(tx_ix2, 0x0, tx_num);
-	memset(rx_ix2, 0x0, rx_num);
-
-	/* Read Self TX Ix2 */
-	regAdd[0] = 0xD0;
-	regAdd[1] = (comp_start_tx_addr >> 8) & 0xFF;
-	regAdd[2] = comp_start_tx_addr & 0xFF;
-	fts_read_reg(info, regAdd, 3, &tx_ix2[0], tx_num + 1);
-
-	/* Read Self RX Ix2 */
-	regAdd[0] = 0xD0;
-	regAdd[1] = (comp_start_rx_addr >> 8) & 0xFF;
-	regAdd[2] = comp_start_rx_addr & 0xFF;
-	fts_read_reg(info, regAdd, 3, &rx_ix2[0], rx_num + 1);
-
-	for(i = 0; i < info->ForceChannelLength; i++) {
-		force_ix_data[i] = tx_ix1 + (tx_ix2[i + 1] * 2);
-		if(max_tx_ix_sum < force_ix_data[i])
-			max_tx_ix_sum = force_ix_data[i];
-		if(min_tx_ix_sum > force_ix_data[i])
-			min_tx_ix_sum = force_ix_data[i];
-	}
-
-	for(i = 0; i < info->SenseChannelLength; i++) {
-		sense_ix_data[i] = rx_ix1 + rx_ix2[i + 1];
-		if(max_rx_ix_sum < sense_ix_data[i])
-			max_rx_ix_sum = sense_ix_data[i];
-		if(min_rx_ix_sum > sense_ix_data[i])
-			min_rx_ix_sum = sense_ix_data[i];
-	}
-
-	input_info(true, &info->client->dev, "%s: MIN_TX_IX_SUM : %d MAX_TX_IX_SUM : %d\n",
-				__func__, min_tx_ix_sum, max_tx_ix_sum );
-	input_info(true, &info->client->dev, "%s: MIN_RX_IX_SUM : %d MAX_RX_IX_SUM : %d\n",
-				__func__, min_rx_ix_sum, max_rx_ix_sum );
-
-	fts_systemreset(info, 10);
-
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_fw_wait_for_event (info, STATUS_EVENT_FORCE_CAL_DONE_D3);
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_command(info, FTS_CMD_KEY_SENSE_ON);
-#endif
-
-	enable_irq(info->irq);
-	fts_interrupt_set(info, INT_ENABLE);
-
-	if (allnode == true) {
-		buff_size = (info->ForceChannelLength + info->SenseChannelLength + 2) * 5;
-		mbuff = kzalloc(buff_size, GFP_KERNEL);
-	}
-	if (mbuff != NULL) {
-		char *pBuf = mbuff;
-		for (i = 0; i < info->ForceChannelLength; i++) {
-			num =  force_ix_data[i];
-			n = 100000;
-			fzero = 0;
-			for (j = 5; j > 0; j--) {
-				n = n / 10;
-				a = num / n;
-				if (a)
-					fzero = 1;
-				cnum = a + '0';
-				num  = num - a*n;
-				if (fzero)
-					*pBuf++ = cnum;
+	if (!node) {
+		while (prev) {
+			entry = rb_entry(prev, struct btrfs_inode, rb_node);
+			if (objectid <= btrfs_ino(&entry->vfs_inode)) {
+				node = prev;
+				break;
 			}
-			if (!fzero)
-				*pBuf++ = '0';
-			*pBuf++ = ',';
-			input_info(true, &info->client->dev, "Force[%d] %d\n", i, force_ix_data[i]);
+			prev = rb_next(prev);
 		}
-		for (i = 0; i < info->SenseChannelLength; i++) {
-			num =  sense_ix_data[i];
-			n = 100000;
-			fzero = 0;
-			for (j = 5; j > 0; j--) {
-				n = n / 10;
-				a = num / n;
-				if (a)
-					fzero = 1;
-				cnum = a + '0';
-				num  = num - a * n;
-				if (fzero)
-					*pBuf++ = cnum;
-			}
-			if (!fzero)
-				*pBuf++ = '0';
-			if (i < (info->SenseChannelLength - 1))
-				*pBuf++ = ',';
-			input_info(true, &info->client->dev, "Sense[%d] %d\n", i, sense_ix_data[i]);
+	}
+	while (node) {
+		entry = rb_entry(node, struct btrfs_inode, rb_node);
+		objectid = btrfs_ino(&entry->vfs_inode) + 1;
+		inode = igrab(&entry->vfs_inode);
+		if (inode) {
+			spin_unlock(&root->inode_lock);
+			if (atomic_read(&inode->i_count) > 1)
+				d_prune_aliases(inode);
+			/*
+			 * btrfs_drop_inode will have it removed from
+			 * the inode cache when its usage count
+			 * hits zero.
+			 */
+			iput(inode);
+			cond_resched();
+			spin_lock(&root->inode_lock);
+			goto again;
 		}
 
-		sec_cmd_set_cmd_result(sec, mbuff, buff_size);
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-		kfree(mbuff);
-	} else {
-		if (allnode == true) {
-		   snprintf(buff, sizeof(buff), "%s", "kzalloc failed");
-		   sec->cmd_state = SEC_CMD_STATUS_FAIL;
+		if (cond_resched_lock(&root->inode_lock))
+			goto again;
+
+		node = rb_next(node);
+	}
+	spin_unlock(&root->inode_lock);
+}
+
+static int btrfs_init_locked_inode(struct inode *inode, void *p)
+{
+	struct btrfs_iget_args *args = p;
+	inode->i_ino = args->location->objectid;
+	memcpy(&BTRFS_I(inode)->location, args->location,
+	       sizeof(*args->location));
+	BTRFS_I(inode)->root = args->root;
+	return 0;
+}
+
+static int btrfs_find_actor(struct inode *inode, void *opaque)
+{
+	struct btrfs_iget_args *args = opaque;
+	return args->location->objectid == BTRFS_I(inode)->location.objectid &&
+		args->root == BTRFS_I(inode)->root;
+}
+
+static struct inode *btrfs_iget_locked(struct super_block *s,
+				       struct btrfs_key *location,
+				       struct btrfs_root *root)
+{
+	struct inode *inode;
+	struct btrfs_iget_args args;
+	unsigned long hashval = btrfs_inode_hash(location->objectid, root);
+
+	args.location = location;
+	args.root = root;
+
+	inode = iget5_locked(s, hashval, btrfs_find_actor,
+			     btrfs_init_locked_inode,
+			     (void *)&args);
+	return inode;
+}
+
+/* Get an inode object given its location and corresponding root.
+ * Returns in *is_new if the inode was read from disk
+ */
+struct inode *btrfs_iget(struct super_block *s, struct btrfs_key *location,
+			 struct btrfs_root *root, int *new)
+{
+	struct inode *inode;
+
+	inode = btrfs_iget_locked(s, location, root);
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	if (inode->i_state & I_NEW) {
+		btrfs_read_locked_inode(inode);
+		if (!is_bad_inode(inode)) {
+			inode_tree_add(inode);
+			unlock_new_inode(inode);
+			if (new)
+				*new = 1;
 		} else {
-			snprintf(buff, sizeof(buff), "%d,%d,%d,%d", min_tx_ix_sum, max_tx_ix_sum, min_rx_ix_sum, max_rx_ix_sum);
-			if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING) {
-				char ret_buff[SEC_CMD_STR_LEN] = { 0 };
-				snprintf(ret_buff, sizeof(ret_buff), "%d,%d", min_rx_ix_sum, max_rx_ix_sum);
-				sec_cmd_set_cmd_result_all(sec, ret_buff, strnlen(ret_buff, sizeof(ret_buff)), "IX_DATA_X");
-				snprintf(ret_buff, sizeof(ret_buff), "%d,%d", min_tx_ix_sum, max_tx_ix_sum);
-				sec_cmd_set_cmd_result_all(sec, ret_buff, strnlen(ret_buff, sizeof(ret_buff)), "IX_DATA_Y");
-			}
-			sec->cmd_state = SEC_CMD_STATUS_OK;
+			unlock_new_inode(inode);
+			iput(inode);
+			inode = ERR_PTR(-ESTALE);
 		}
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
 	}
+
+	return inode;
 }
 
-static void run_ix_data_read(void *device_data)
+static struct inode *new_simple_dir(struct super_block *s,
+				    struct btrfs_key *key,
+				    struct btrfs_root *root)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
+	struct inode *inode = new_inode(s);
 
-	sec_cmd_set_default_result(sec);
-	fts_read_ix_data(info, false);
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	BTRFS_I(inode)->root = root;
+	memcpy(&BTRFS_I(inode)->location, key, sizeof(*key));
+	set_bit(BTRFS_INODE_DUMMY, &BTRFS_I(inode)->runtime_flags);
+
+	inode->i_ino = BTRFS_EMPTY_SUBVOL_DIR_OBJECTID;
+	inode->i_op = &btrfs_dir_ro_inode_operations;
+	inode->i_fop = &simple_dir_operations;
+	inode->i_mode = S_IFDIR | S_IRUGO | S_IWUSR | S_IXUGO;
+	inode->i_mtime = CURRENT_TIME;
+	inode->i_atime = inode->i_mtime;
+	inode->i_ctime = inode->i_mtime;
+	BTRFS_I(inode)->i_otime = inode->i_mtime;
+
+	return inode;
 }
 
-static void run_ix_data_read_all(void *device_data)
+static inline u8 btrfs_inode_type(struct inode *inode)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	sec_cmd_set_default_result(sec);
-	fts_read_ix_data(info, true);
+	return btrfs_type_by_mode[(inode->i_mode & S_IFMT) >> S_SHIFT];
 }
 
-static void fts_read_self_raw_frame(struct fts_ts_info *info, unsigned short oAddr, bool allnode)
+struct inode *btrfs_lookup_dentry(struct inode *dir, struct dentry *dentry)
 {
-	struct sec_cmd_data *sec = &info->sec;
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char D0_offset = 1;
-	unsigned char regAdd[3] = {0xD0, 0x00, 0x00};
-	unsigned char ReadData[(info->ForceChannelLength + info->SenseChannelLength) * 2 + 1];
-	unsigned short self_force_raw_data[info->ForceChannelLength * 2 + 1];
-	unsigned short self_sense_raw_data[info->SenseChannelLength * 2 + 1];
-	unsigned int FrameAddress = 0;
-	unsigned char count=0;
-	int buff_size,i,j;
-	char *mbuff = NULL;
-	int num,n,a,fzero;
-	char cnum;
-	unsigned short min_tx_self_raw_data = 0xFFFF;
-	unsigned short max_tx_self_raw_data = 0;
-	unsigned short min_rx_self_raw_data = 0xFFFF;
-	unsigned short max_rx_self_raw_data = 0;
-	unsigned char cmd[4] = {0xC7, 0x00, FTS_CFG_APWR, 0x00}; // Don't enter to IDLE
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-			sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "RAW_DATA");
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	fts_systemreset(info, 60);
-
-	// Don't enter to IDLE mode
-	fts_write_reg(info, &cmd[0], 4);
-	fts_delay(20);
-
-	fts_command(info, FLUSHBUFFER);                 // Clear FIFO
-	fts_delay(20);
-
-	// Auto-Tune
-	fts_command(info, CX_TUNNING);
-	msleep(300);
-	fts_fw_wait_for_event_D3(info, STATUS_EVENT_MUTUAL_AUTOTUNE_DONE, 0x00);
-
-	fts_command(info, SELF_AUTO_TUNE);
-	msleep(300);
-	fts_fw_wait_for_event_D3(info, STATUS_EVENT_SELF_AUTOTUNE_DONE_D3, 0x00);
-
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_delay(150);
-
-	fts_command(info, SENSEOFF);
-	fts_delay(100);
-
-	disable_irq(info->irq);
-	fts_interrupt_set(info, INT_DISABLE);
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey) {
-		fts_command(info, FTS_CMD_KEY_SENSE_OFF);
-	}
-#endif
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	regAdd[1] = 0x00;
-	regAdd[2] = oAddr;
-	fts_read_reg(info, regAdd, 3, &ReadData[0], 4);
-
-	FrameAddress = ReadData[D0_offset] + (ReadData[D0_offset + 1] << 8);           // D1 : DOFFSET = 0, D2 : DOFFSET : 1
-
-	regAdd[1] = (FrameAddress >> 8) & 0xFF;
-	regAdd[2] = FrameAddress & 0xFF;
-
-	fts_read_reg(info, regAdd, 3, &ReadData[0], info->ForceChannelLength * 2 + 1);
-
-	for(count = 0; count < info->ForceChannelLength; count++) {
-		self_force_raw_data[count] = ReadData[count*2+D0_offset] + (ReadData[count*2+D0_offset+1]<<8);
-
-		if(max_tx_self_raw_data < self_force_raw_data[count])
-			max_tx_self_raw_data = self_force_raw_data[count];
-		if(min_tx_self_raw_data > self_force_raw_data[count])
-			min_tx_self_raw_data = self_force_raw_data[count];
-	}
-
-	regAdd[1] = 0x00;
-	regAdd[2] = oAddr + 2;
-	fts_read_reg(info, regAdd, 3, &ReadData[0], 4);
-
-	FrameAddress = ReadData[D0_offset] + (ReadData[D0_offset + 1] << 8);           // D1 : DOFFSET = 0, D2 : DOFFSET : 1
-
-	regAdd[1] = (FrameAddress >> 8) & 0xFF;
-	regAdd[2] = FrameAddress & 0xFF;
-
-	fts_read_reg(info, regAdd, 3, &ReadData[0], info->SenseChannelLength * 2 + 1);
-
-	for(count = 0; count < info->SenseChannelLength; count++) {
-		self_sense_raw_data[count] = ReadData[count*2+D0_offset] + (ReadData[count*2+D0_offset+1]<<8);
-
-		if(max_rx_self_raw_data < self_sense_raw_data[count])
-			max_rx_self_raw_data = self_sense_raw_data[count];
-		if(min_rx_self_raw_data > self_sense_raw_data[count])
-			min_rx_self_raw_data = self_sense_raw_data[count];
-	}
-
-	input_info(true, &info->client->dev, "%s: MIN_TX_SELF_RAW: %d MAX_TX_SELF_RAW : %d\n",
-				__func__, min_tx_self_raw_data, max_tx_self_raw_data );
-	input_info(true, &info->client->dev, "%s: MIN_RX_SELF_RAW : %d MIN_RX_SELF_RAW : %d\n",
-				__func__, min_rx_self_raw_data, max_rx_self_raw_data );
-
-
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_delay(50);
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_command(info, FTS_CMD_KEY_SENSE_ON);
-#endif
-
-	enable_irq(info->irq);
-	fts_interrupt_set(info, INT_ENABLE);
-
-	if (allnode == true) {
-		buff_size = (info->ForceChannelLength + info->SenseChannelLength + 2) * 7;
-		mbuff = kzalloc(buff_size, GFP_KERNEL);
-	}
-	if (mbuff != NULL) {
-		char *pBuf = mbuff;
-		for (i = 0; i < info->ForceChannelLength; i++) {
-			num =  self_force_raw_data[i];
-			n = 100000;
-			fzero = 0;
-			for (j = 5; j > 0; j--) {
-				n = n / 10;
-				a = num / n;
-				if (a)
-					fzero = 1;
-				cnum = a + '0';
-				num  = num - a * n;
-				if (fzero)
-					*pBuf++ = cnum;
-			}
-			if (!fzero)
-				*pBuf++ = '0';
-			*pBuf++ = ',';
-			input_info(true, &info->client->dev, "Force[%d] %d\n", i, self_force_raw_data[i]);
-		}
-		for (i = 0; i < info->SenseChannelLength; i++) {
-			num =  self_sense_raw_data[i];
-			n = 100000;
-			fzero = 0;
-			for (j = 5; j > 0; j--) {
-				n = n / 10;
-				a = num / n;
-				if (a)
-					fzero = 1;
-				cnum = a + '0';
-				num  = num - a * n;
-				if (fzero)
-					*pBuf++ = cnum;
-			}
-			if (!fzero)
-				*pBuf++ = '0';
-			if (i < (info->SenseChannelLength - 1))
-				*pBuf++ = ',';
-			input_info(true, &info->client->dev, "Sense[%d] %d\n", i, self_sense_raw_data[i]);
-		}
-
-		sec_cmd_set_cmd_result(sec, mbuff, buff_size);
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-		kfree(mbuff);
-	} else {
-		if (allnode == true) {
-		   snprintf(buff, sizeof(buff), "%s", "kzalloc failed");
-		   sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		} else {
-			snprintf(buff, sizeof(buff), "%d,%d,%d,%d", min_tx_self_raw_data, max_tx_self_raw_data, min_rx_self_raw_data, max_rx_self_raw_data);
-			if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING) {
-				char ret_buff[SEC_CMD_STR_LEN] = { 0 };
-				snprintf(ret_buff, sizeof(ret_buff), "%d,%d", (s16)min_rx_self_raw_data, (s16)max_rx_self_raw_data);
-				sec_cmd_set_cmd_result_all(sec, ret_buff, strnlen(ret_buff, sizeof(ret_buff)), "SELF_RAW_DATA_X");
-				snprintf(ret_buff, sizeof(ret_buff), "%d,%d", (s16)min_tx_self_raw_data, (s16)max_tx_self_raw_data);
-				sec_cmd_set_cmd_result_all(sec, ret_buff, strnlen(ret_buff, sizeof(ret_buff)), "SELF_RAW_DATA_Y");
-			}
-			sec->cmd_state = SEC_CMD_STATUS_OK;
-		}
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-	}
-}
-
-static void run_self_raw_read(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	sec_cmd_set_default_result(sec);
-	fts_read_self_raw_frame(info, FTS_WATER_SELF_RAW_ADDR,false);
-}
-
-static void run_self_raw_read_all(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-
-	sec_cmd_set_default_result(sec);
-	fts_read_self_raw_frame(info, FTS_WATER_SELF_RAW_ADDR,true);
-}
-
-static void run_trx_short_test(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
+	struct inode *inode;
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	struct btrfs_root *sub_root = root;
+	struct btrfs_key location;
+	u8 di_type = 0;
+	int index;
 	int ret = 0;
 
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
+	if (dentry->d_name.len > BTRFS_NAME_LEN)
+		return ERR_PTR(-ENAMETOOLONG);
 
-	ret = fts_panel_ito_test(info, OPEN_SHORT_CRACK_TEST);
-	if (ret == 0)
-		snprintf(buff, sizeof(buff), "%s", "OK");
-	else
-		snprintf(buff, sizeof(buff), "%s", "FAIL");
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void check_connection(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	int ret = 0;
-
-	sec_cmd_set_default_result(sec);
-	if (info->fts_power_state == FTS_POWER_STATE_POWERDOWN) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-				__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	ret = fts_panel_ito_test(info, OPEN_TEST);
-	if (ret == 0)
-		snprintf(buff, sizeof(buff), "OK");
-	else
-		snprintf(buff, sizeof(buff), "NG");
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-#define FTS_MAX_TX_LENGTH		44
-#define FTS_MAX_RX_LENGTH		64
-
-#define FTS_CX2_READ_LENGTH		4
-#define FTS_CX2_ADDR_OFFSET		3
-#define FTS_CX2_TX_START		0
-
-static void get_cx_data(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	short val = 0;
-	int node = 0;
-
-	sec_cmd_set_default_result(sec);
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	node = fts_check_index(info);
-	if (node < 0)
-		return;
-
-	if (info->cx_data)
-		val = info->cx_data[node];
-	snprintf(buff, sizeof(buff), "%d", val);
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	/* input_info(true, &info->client->dev, "%s: %s\n", __func__, buff); */
-
-}
-
-static void run_cx_data_read(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char ReadData[info->ForceChannelLength][info->SenseChannelLength + FTS_CX2_READ_LENGTH];
-	unsigned char regAdd[8];
-	unsigned int addr, rx_num, tx_num;
-	unsigned char cx1;
-	unsigned char cx_min = 255, cx_max = 0;
-	int i, j;
-	unsigned char *pStr = NULL;
-	unsigned char pTmp[16] = { 0 };
-	int ret;
-
-	int comp_header_addr, comp_start_addr;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-			sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CX_DATA");
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	pStr = kzalloc(4 * (info->SenseChannelLength + 1), GFP_KERNEL);
-	if (pStr == NULL) {
-		input_err(true, &info->client->dev, "%s: pStr kzalloc failed\n", __func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-			sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CX_DATA");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: start\n", __func__);
-
-	disable_irq(info->irq);
-
-	ret = fts_interrupt_set(info, INT_DISABLE);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev,
-				"%s: failed to set of interrupt(%d)\n",
-				__func__, INT_DISABLE);
-		goto out;
-	}
-
-	ret = fts_command(info, SENSEOFF);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev,
-				"%s: failed to send cmd(%d)\n",
-				__func__, SENSEOFF);
-		goto out;
-	}
-	fts_delay(50);
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey) {
-		ret = fts_command(info, FTS_CMD_KEY_SENSE_OFF); // Key Sensor OFF
-		if (ret <= 0) {
-			input_err(true, &info->client->dev,
-					"%s: failed to send cmd(%d)\n",
-					__func__, FTS_CMD_KEY_SENSE_OFF);
-			goto out;
-		}
-	}
-#endif
-	ret = fts_command(info, FLUSHBUFFER);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev,
-				"%s: failed to send cmd(%d)\n",
-				__func__, FLUSHBUFFER);
-		goto out;
-	}
-	fts_delay(50);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	/* Request compensation data */
-	regAdd[0] = 0xB8;
-	regAdd[1] = 0x04;		// MUTUAL CX
-	regAdd[2] = 0x00;
-	ret = fts_write_reg(info, &regAdd[0], 3);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev,
-				"%s: failed to write reg\n", __func__);
-		goto out;
-	}
-
-	ret = fts_fw_wait_for_specific_event(info, EVENTID_STATUS_REQUEST_COMP, regAdd[1], regAdd[2]);
-	if (ret) {
-		input_err(true, &info->client->dev,
-				"%s: failed to wait for specific event\n",
-				__func__);
-		goto out;
-	}
-
-	/* Read an address of compensation data */
-	regAdd[0] = 0xD0;
-	regAdd[1] = 0x00;
-	regAdd[2] = FTS_SI_COMPENSATION_OFFSET_ADDR;
-	ret = fts_read_reg(info, regAdd, 3, &buff[0], 4);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev,
-				"%s: failed to read reg\n", __func__);
-		goto out;
-	}
-
-	comp_header_addr = buff[1] + (buff[2] << 8);
-
-	/* Read header of compensation area */
-	regAdd[0] = 0xD0;
-	regAdd[1] = (comp_header_addr >> 8) & 0xFF;
-	regAdd[2] = comp_header_addr & 0xFF;
-	ret = fts_read_reg(info, regAdd, 3, &buff[0], 16 + 1);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev,
-				"%s: failed to read reg\n", __func__);
-		goto out;
-	}
-
-	tx_num = buff[5];
-	rx_num = buff[6];
-	cx1 = buff[10] * 8; 
-	comp_start_addr = comp_header_addr + 0x10;
-
-	/* Read compensation data */
-	for (j = 0; j < tx_num; j++) {
-		memset(&ReadData[j], 0x0, (rx_num + 1));
-		memset(pStr, 0x0, 4 * (rx_num + 1));
-		snprintf(pTmp, sizeof(pTmp), "Tx%02d | ", j);
-		strncat(pStr, pTmp, 4 * rx_num);
-
-		addr = comp_start_addr + (rx_num * j);
-		regAdd[0] = 0xD0;
-		regAdd[1] = (addr >> 8) & 0xFF;
-		regAdd[2] = addr & 0xFF;
-		ret = fts_read_reg(info, regAdd, 3, &ReadData[j][0], rx_num + 1);
-		if (ret <= 0) {
-			input_err(true, &info->client->dev,
-				"%s: failed to read reg\n", __func__);
-			goto out;
-		}
-
-		for (i = 0; i < rx_num; i++) {
-			snprintf(pTmp, sizeof(pTmp), "%3d", ReadData[j][i + 1]);
-			strncat(pStr, pTmp, 4 * rx_num);
-		}
-		input_raw_info(true, &info->client->dev, "%s\n", pStr);
-	}
-
-	if (info->cx_data) {
-		for (j = 0; j < tx_num; j++) {
-			for(i = 0; i < rx_num; i++) {
-				info->cx_data[(j * rx_num) + i] = ReadData[j][i + 1] + cx1;
-				cx_min = min(cx_min, info->cx_data[(j * rx_num) + i]);
-				cx_max = max(cx_max, info->cx_data[(j * rx_num) + i]);
-			}
-		}
-	}
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey) {
-		fts_command(info, FTS_CMD_KEY_SENSE_ON);
-	}
-#endif
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_command(info, SENSEON);
-	fts_interrupt_set(info, INT_ENABLE);
-
-	kfree(pStr);
-
-	enable_irq(info->irq);
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING) {
-		char ret_buff[SEC_CMD_STR_LEN] = { 0 };
-		snprintf(ret_buff, sizeof(ret_buff), "%d,%d", (s16)cx_min, (s16)cx_max);
-		sec_cmd_set_cmd_result_all(sec, ret_buff, strnlen(ret_buff, sizeof(ret_buff)), "CX_DATA");
-	}
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-
-	return;
-
-out:
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey) {
-		fts_command(info, FTS_CMD_KEY_SENSE_ON);
-	}
-#endif
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_command(info, SENSEON);
-	fts_interrupt_set(info, INT_ENABLE);
-
-	kfree(pStr);
-
-	enable_irq(info->irq);
-	snprintf(buff, sizeof(buff), "%s", "NG");
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING)
-		sec_cmd_set_cmd_result_all(sec, buff, strnlen(buff, sizeof(buff)), "CX_DATA");
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_cx_all_data(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char ReadData[info->ForceChannelLength][info->SenseChannelLength + FTS_CX2_READ_LENGTH];
-	unsigned char regAdd[8];
-	unsigned int addr, rx_num, tx_num;
-	unsigned char cx1;
-	int i, j;
-	unsigned char *pStr = NULL;
-	unsigned char pTmp[16] = { 0 };
-	char all_strbuff[(info->ForceChannelLength)*(info->SenseChannelLength)*3];
-	int comp_header_addr, comp_start_addr;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: start\n", __func__);
-
-	pStr = kzalloc(4 * (info->SenseChannelLength + 1), GFP_KERNEL);
-	if (pStr == NULL) {
-		input_err(true, &info->client->dev, "%s: pStr kzalloc failed\n", __func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	fts_command(info, SENSEOFF);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey) {
-		fts_command(info, FTS_CMD_KEY_SENSE_OFF); // Key Sensor OFF
-	}
-#endif
-	disable_irq(info->irq);
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(50);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	tx_num = info->ForceChannelLength;
-	rx_num = info->SenseChannelLength;
-
-	memset(all_strbuff, 0, sizeof(char) * (tx_num*rx_num*3));	//size 3  ex(45,)
-
-	/* Request compensation data */
-	regAdd[0] = 0xB8;
-	regAdd[1] = 0x04;		// MUTUAL CX
-	regAdd[2] = 0x00;
-	fts_write_reg(info, &regAdd[0], 3);
-	fts_fw_wait_for_specific_event(info, EVENTID_STATUS_REQUEST_COMP, regAdd[1], regAdd[2]);
-
-	/* Read an address of compensation data */
-	regAdd[0] = 0xD0;
-	regAdd[1] = 0x00;
-	regAdd[2] = FTS_SI_COMPENSATION_OFFSET_ADDR;
-	fts_read_reg(info, regAdd, 3, &buff[0], 4);
-	comp_header_addr = buff[1] + (buff[2] << 8);
-
-	/* Read header of compensation area */
-	regAdd[0] = 0xD0;
-	regAdd[1] = (comp_header_addr >> 8) & 0xFF;
-	regAdd[2] = comp_header_addr & 0xFF;
-	fts_read_reg(info, regAdd, 3, &buff[0], 16 + 1);
-	tx_num = buff[5];
-	rx_num = buff[6];
-	cx1 = buff[10] * 8; 
-	comp_start_addr = comp_header_addr + 0x10;
-
-	/* Read compensation data */
-	for (j = 0; j < tx_num; j++) {
-		memset(&ReadData[j], 0x0, (rx_num + 1));
-		memset(pStr, 0x0, 4 * (rx_num + 1));
-		snprintf(pTmp, sizeof(pTmp), "Tx%02d | ", j);
-		strncat(pStr, pTmp, 4 * rx_num);
-
-		addr = comp_start_addr + (rx_num * j);
-		regAdd[0] = 0xD0;
-		regAdd[1] = (addr >> 8) & 0xFF;
-		regAdd[2] = addr & 0xFF;
-		fts_read_reg(info, regAdd, 3, &ReadData[j][0], rx_num + 1);
-		for (i = 0; i < rx_num; i++) {
-			snprintf(pTmp, sizeof(pTmp), "%3d", ReadData[j][i + 1]);
-			strncat(pStr, pTmp, 4 * rx_num);
-		}
-		input_info(true, &info->client->dev, "%s\n", pStr);
-	}
-
-	if (info->cx_data) {
-		for (j = 0; j < tx_num; j++) {
-			for(i = 0; i < rx_num; i++){
-				info->cx_data[(j * rx_num) + i] = ReadData[j][i + 1] + cx1;
-				snprintf(buff, sizeof(buff), "%d,", ReadData[j][i + 1] + cx1);
-				strncat(all_strbuff, buff, sizeof(buff));
-			}
-		}
-	}
-
-	kfree(pStr);
-
-	enable_irq(info->irq);
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey) {
-		fts_command(info, FTS_CMD_KEY_SENSE_ON);
-	}
-#endif
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, all_strbuff, strnlen(all_strbuff, sizeof(all_strbuff)));
-	input_info(true, &info->client->dev, "%s: %ld (%ld)\n", __func__, strnlen(all_strbuff, sizeof(all_strbuff)),sizeof(all_strbuff));
-}
-
-static void get_cx_gap_data(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	int rx_max = 0, tx_max = 0, ii;
-
-	for (ii = 0; ii < (info->SenseChannelLength * info->ForceChannelLength); ii++) {
-		/* rx(x) gap max */
-		if ((ii + 1) % (info->SenseChannelLength) != 0)
-			rx_max = max(rx_max, (int)abs(info->cx_data[ii + 1] - info->cx_data[ii]));
-
-		/* tx(y) gap max */
-		if (ii < (info->ForceChannelLength - 1) * info->SenseChannelLength)
-			tx_max = max(tx_max, (int)abs(info->cx_data[ii + info->SenseChannelLength] - info->cx_data[ii]));
-	}
-
-	input_raw_info(true, &info->client->dev, "%s: rx max:%d, tx max:%d\n", __func__, rx_max, tx_max);
-
-	if (sec->cmd_all_factory_state == SEC_CMD_STATUS_RUNNING) {
-		snprintf(buff, sizeof(buff), "%d,%d", 0, rx_max);
-		sec_cmd_set_cmd_result_all(sec, buff, SEC_CMD_STR_LEN, "CX_DATA_GAP_X");
-		snprintf(buff, sizeof(buff), "%d,%d", 0, tx_max);
-		sec_cmd_set_cmd_result_all(sec, buff, SEC_CMD_STR_LEN, "CX_DATA_GAP_Y");
-	}
-}
-
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-int fts_read_pressure_data(struct fts_ts_info *info)
-{
-	unsigned char pressure_reg[3] = {0, };
-	unsigned char buf[32] = {0, };
-	short value[10] = {0, };
-	int rtn, i = 0;
-	int pressure_sensor_value = 0;
-
-	pressure_reg[0] = 0xD0;
-	pressure_reg[1] = 0x00;
-	pressure_reg[2] = FTS_SI_PRESSURE_STRENGTH_ADDR;
-
-	rtn = fts_read_reg(info, pressure_reg, 3, &buf[0], 4);
-	if (rtn <= 0) {
-		input_err(true, &info->client->dev, "%s: Pressure read failed rc = %d\n", __func__, rtn);
-		return rtn;
-	} else {
-		pressure_reg[1] = buf[2];
-		pressure_reg[2] = buf[1];
-	}
-
-	rtn = fts_read_reg(info, pressure_reg, 3, &buf[0], PRESSURE_SENSOR_COUNT * 2 + 1);
-	if (rtn <= 0) {
-		input_err(true, &info->client->dev, "%s: Pressure read failed rc = %d\n", __func__, rtn);
-		return rtn;
-	} else {
-		for (i = 0; i < PRESSURE_SENSOR_COUNT; i++) {
-			value[i] = buf[i * 2 + 1] + (buf[i * 2 + 1 + 1] << 8);
-			pressure_sensor_value += value[i];
-		}
-	}
-
-	if (info->debug_string & 0x2)
-		input_info(true, &info->client->dev, "%s: %d %d %d %d %d %d %d %d %d %d %d\n", __func__,
-			value[0], value[1], value[2], value[3], value[4],
-			value[5], value[6], value[7], value[8], value[9],
-			pressure_sensor_value);
-
-	return pressure_sensor_value;
-}
-#endif
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-#define USE_KEY_NUM 2
-static void run_key_cx_data_read(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char key_cx2_data[2], key_cx1_data, total_cx_data[USE_KEY_NUM];
-	unsigned char ReadData[USE_KEY_NUM * FTS_CX2_READ_LENGTH];
-	unsigned char regAdd[8];
-	unsigned int addr;
-	int /*tx_num, */rx_num, DOFFSET = 1;
-	int comp_start_addr, comp_header_addr;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-		            __func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	disable_irq(info->irq);
-
-	/* Request compensation data */
-	regAdd[0] = 0xB8;
-	regAdd[1] = 0x10;   // For button
-	regAdd[2] = 0x00;
-	fts_write_reg(info, &regAdd[0], 3);
-	fts_fw_wait_for_specific_event(info, EVENTID_STATUS_REQUEST_COMP, regAdd[1], 0x00);
-
-	/* Read an address of compensation data */
-	regAdd[0] = 0xD0;
-	regAdd[1] = 0x00;
-	regAdd[2] = FTS_SI_COMPENSATION_OFFSET_ADDR;
-	fts_read_reg(info, regAdd, 3, &buff[0], 4);
-	comp_header_addr = buff[0 + DOFFSET] + (buff[1 + DOFFSET] << 8);
-
-	/* Read header of compensation area */
-	regAdd[0] = 0xD0;
-	regAdd[1] = (comp_header_addr >> 8) & 0xFF;
-	regAdd[2] = comp_header_addr & 0xFF;
-	fts_read_reg(info, regAdd, 3, &buff[0], 16 + DOFFSET);
-	/*tx_num = buff[4 + DOFFSET];*/
-	rx_num = buff[5 + DOFFSET];
-	key_cx1_data = buff[9 + DOFFSET];
-	comp_start_addr = comp_header_addr + 0x10;
-
-	memset(&ReadData[0], 0x0, rx_num);
-	/* Read compensation data */
-	addr = comp_start_addr;
-	regAdd[0] = 0xD0;
-	regAdd[1] = (addr >> 8) & 0xFF;
-	regAdd[2] = addr & 0xFF;
-	fts_read_reg(info, regAdd, 3, &ReadData[0], rx_num + DOFFSET);
-	key_cx2_data[0] = ReadData[0 + DOFFSET];
-	key_cx2_data[1] = ReadData[1 + DOFFSET];
-	total_cx_data[0] = key_cx1_data * 2 + key_cx2_data[0];
-	total_cx_data[1] = key_cx1_data * 2 + key_cx2_data[1];
-
-	//snprintf(buff, sizeof(buff), "%s", "OK");
-	snprintf(buff, sizeof(buff), "%d,%d,%d,%d", key_cx2_data[0], key_cx2_data[1], total_cx_data[0], total_cx_data[1]);
-
-	enable_irq(info->irq);
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-#endif
-
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-static void run_force_pressure_calibration(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = {0};
-#ifdef FTS_SUPPORT_STRINGLIB
-	unsigned short addr = FTS_CMD_STRING_ACCESS;
-	int ret;
-#endif
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_info(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	if (info->touch_count > 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG_FINGER_ON");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		goto out_force_pressure_cal;
-	}
-
-	disable_irq(info->irq);
-	fts_interrupt_set(info, INT_DISABLE);
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_OFF);
-
-	info->fts_systemreset(info, 30);
-
-	fts_command(info, PRESSURE_AUTO_TUNE);
-	fts_delay(300);
-	fts_fw_wait_for_event_D3(info, STATUS_EVENT_SELF_AUTOTUNE_DONE_D3, 0x00);
-
-	fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-	fts_delay(230);
-	fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-
-	info->fts_systemreset(info, 30);
-
-	fts_command(info, SENSEON);
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-	fts_fw_wait_for_event (info, STATUS_EVENT_FORCE_CAL_DONE_D3);
-	fts_interrupt_set(info, INT_ENABLE);
-	enable_irq(info->irq);
-
-#ifdef FTS_SUPPORT_STRINGLIB
-	ret = info->fts_write_to_string(info, &addr, &info->lowpower_flag, sizeof(info->lowpower_flag));
+	ret = btrfs_inode_by_name(dir, dentry, &location, &di_type);
 	if (ret < 0)
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-#endif
+		return ERR_PTR(ret);
 
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
+	if (location.objectid == 0)
+		return ERR_PTR(-ENOENT);
 
-out_force_pressure_cal:
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
+	if (location.type == BTRFS_INODE_ITEM_KEY) {
+		inode = btrfs_iget(dir->i_sb, &location, root, NULL);
+		if (IS_ERR(inode))
+			return inode;
 
-/*
- * index is 0 : cleared, do not calibrated
- * index is 1 : Ass'y
- * index is 2 : Rear
- * index is 3 : BackGlass
- */
-
-static void set_pressure_test_mode(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAdd[4] = {0xC7, 0x03, 0x00, 0x00};
-	int ret = 0;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_info(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
+		/* Do extra check against inode mode with di_type */
+		if (btrfs_inode_type(inode) != di_type) {
+			btrfs_crit(root->fs_info,
+"inode mode mismatch with dir: inode mode=0%o btrfs type=%u dir type=%u",
+				  inode->i_mode, btrfs_inode_type(inode),
+				  di_type);
+			iput(inode);
+			return ERR_PTR(-EUCLEAN);
+		}
+		return inode;
 	}
 
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		regAdd[3] = sec->cmd_param[0];
-		ret = fts_write_reg(info, regAdd, 4);
+	BUG_ON(location.type != BTRFS_ROOT_ITEM_KEY);
 
-		if (ret < 0) {
-			snprintf(buff, sizeof(buff), "NG");
-			sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		} else {
-			snprintf(buff, sizeof(buff), "%s", "OK");
-			sec->cmd_state = SEC_CMD_STATUS_OK;
+	index = srcu_read_lock(&root->fs_info->subvol_srcu);
+	ret = fixup_tree_root_location(root, dir, dentry,
+				       &location, &sub_root);
+	if (ret < 0) {
+		if (ret != -ENOENT)
+			inode = ERR_PTR(ret);
+		else
+			inode = new_simple_dir(dir->i_sb, &location, sub_root);
+	} else {
+		inode = btrfs_iget(dir->i_sb, &location, sub_root, NULL);
+	}
+	srcu_read_unlock(&root->fs_info->subvol_srcu, index);
+
+	if (!IS_ERR(inode) && root != sub_root) {
+		down_read(&root->fs_info->cleanup_work_sem);
+		if (!(inode->i_sb->s_flags & MS_RDONLY))
+			ret = btrfs_orphan_cleanup(sub_root);
+		up_read(&root->fs_info->cleanup_work_sem);
+		if (ret) {
+			iput(inode);
+			inode = ERR_PTR(ret);
 		}
 	}
 
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
+	return inode;
 }
 
-static void run_pressure_strength_read_all(void *device_data)
+static int btrfs_dentry_delete(const struct dentry *dentry)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAddr[3] = {0xD0, 0x00, FTS_SI_PRESSURE_STRENGTH_ADDR};
-	unsigned char data[PRESSURE_SENSOR_COUNT * 2 + 1];
-	int ret, i;
-	short value[3] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	memset(data, 3, PRESSURE_SENSOR_COUNT * 2 + 1);
-
-	ret = fts_read_reg(info, regAddr, 3, data, 4);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to read pressure strength addr\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	regAddr[1] = data[2];
-	regAddr[2] = data[1];
-
-	memset(data, 0x00, PRESSURE_SENSOR_COUNT * 2 + 1);
-
-	ret = fts_read_reg(info, regAddr, 3, data, PRESSURE_SENSOR_COUNT * 2 + 1);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to read pressure strength\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	input_err(true, &info->client->dev, "%s: [3] %02X, %02X, %02X, %02X, %02X, %02X, %02X\n",
-		__func__, data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
-
-	for (i = 0; i < PRESSURE_SENSOR_COUNT; i++)
-		value[i] = (short)(data[i * 2 + 1] | (data[i * 2 + 1 + 1] << 8));
-
-	snprintf(buff, sizeof(buff), "%d,%d,%d", value[0], value[1], value[2]);
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void run_pressure_rawdata_read_all(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAddr[3] = {0xD0, 0x00, 0x00};
-	unsigned char data[PRESSURE_SENSOR_COUNT * 2 + 1];
-	int ret, i;
-	short value[3] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	memset(data, 3, PRESSURE_SENSOR_COUNT * 2 + 1);
-
-	ret = info->fts_get_sysinfo_data(info, FTS_SI_PRESSURE_FILTERED_RAW_ADDR, 3, data);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to read pressure rawdata addr\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	regAddr[1] = data[1];
-	regAddr[2] = data[0];
-
-	memset(data, 0x00, PRESSURE_SENSOR_COUNT * 2 + 1);
-
-	ret = fts_read_reg(info, regAddr, 3, data, PRESSURE_SENSOR_COUNT * 2 + 1);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to read pressure rawdata\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	input_err(true, &info->client->dev, "%s: [3] %02X, %02X, %02X, %02X, %02X, %02X, %02X\n",
-		__func__, data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
-
-	for (i = 0; i < PRESSURE_SENSOR_COUNT; i++)
-		value[i] = (short)(data[i * 2 + 1] | (data[i * 2 + 1 + 1] << 8));
-
-	snprintf(buff, sizeof(buff), "%d,%d,%d", value[0], value[1], value[2]);
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-
-#define FTS_PRESSURE_IX1	10
-#define FTS_PRESSIRE_IX2	17
-static void run_pressure_ix_data_read_all(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAdd[3] = {0xB8, 0x00, 0x02};
-	unsigned char data[32];
-	int ret, i;
-	int value[3] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	disable_irq(info->irq);
-	fts_interrupt_set(info, INT_DISABLE);
-	fts_command(info, SENSEOFF);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_command(info, FTS_CMD_KEY_SENSE_OFF);
-#endif
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(50);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	ret = fts_write_reg(info, regAdd, 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to write pressure ix\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	fts_fw_wait_for_specific_event(info, EVENTID_STATUS_REQUEST_COMP, regAdd[1], regAdd[2]);
-
-	memset(data, 0x00, 32);
-
-	ret = info->fts_get_sysinfo_data(info, FTS_SI_COMPENSATION_OFFSET_ADDR, 7, data);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to read ix offset addr\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: [0] 0x%02X, [0x%02X, 0x%02X], 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X\n",
-		__func__, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
-
-	regAdd[0] = 0xD0;
-	regAdd[1] = data[1];
-	regAdd[2] = data[0];
-
-	memset(data, 0x00, 32);
-
-	ret = fts_read_reg(info, &regAdd[0], 3, data, 32);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to read ix\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-
-	for (i = 0; i < 4; i++)
-		input_info(true, &info->client->dev, "%s: [%d] 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X\n",
-			__func__, i, data[i * 8 + 0], data[i * 8 + 1], data[i * 8 + 2], data[i * 8 + 3],
-			data[i * 8 + 4], data[i * 8 + 5], data[i * 8 + 6], data[i * 8 + 7]);
-
-	for (i = 0; i < PRESSURE_SENSOR_COUNT; i++)
-		value[i] = ((data[FTS_PRESSURE_IX1] * 2) + data[FTS_PRESSIRE_IX2 + i]);
-
-	snprintf(buff, sizeof(buff), "%d,%d,%d", value[0], value[1], value[2]);
-
-	enable_irq(info->irq);
-	fts_interrupt_set(info, INT_ENABLE);
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_command(info, FTS_CMD_KEY_SENSE_ON);
-#endif
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void set_pressure_strength(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char strength[12] = { 0 };
-	int ret, index;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: [index:%d], [1: %d], [2:%d], [3:%d]\n",
-		__func__, sec->cmd_param[0], sec->cmd_param[1], sec->cmd_param[2], sec->cmd_param[3]);
-
-	if ((sec->cmd_param[0] < 1) || (sec->cmd_param[0] > 4)) {
-		input_err(true, &info->client->dev, "%s: wrong index.\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "WRONG INDEX");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	index = sec->cmd_param[0];
-
-	strength[0] = 0xC7;
-	strength[1] = 0x03;
-	strength[2] = 0x02;
-	strength[3] = (char)index;
-	strength[4] = (char)(sec->cmd_param[1] & 0xFF);
-	strength[5] = (char)(sec->cmd_param[1] >> 8);
-	strength[6] = (char)(sec->cmd_param[2] & 0xFF);
-	strength[7] = (char)(sec->cmd_param[2] >> 8);
-	strength[8] = (char)(sec->cmd_param[3] & 0xFF);
-	strength[9] = (char)(sec->cmd_param[3] >> 8);
-	strength[10] = 0x00;
-	strength[11] = 0x00;
-
-	fts_command(info, SENSEOFF);
-	fts_delay(50);
-	fts_command(info, FLUSHBUFFER);
-	fts_interrupt_set(info, INT_DISABLE);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	ret = fts_write_reg(info, strength, 12);
-	if (ret <= 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-		fts_delay(230);
-		fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-
-		fts_command(info, FLUSHBUFFER);
-		fts_delay(10);
-		fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-		fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-		fts_interrupt_set(info, INT_ENABLE);
-		return;
-	}
-
-	fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-	fts_delay(230);
-	fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_interrupt_set(info, INT_ENABLE);
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void set_pressure_rawdata(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char rawdata[12] = { 0 };
-	int ret, index;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: [index:%d], [1: %d], [2:%d], [3:%d]\n",
-		__func__, sec->cmd_param[0], sec->cmd_param[1], sec->cmd_param[2], sec->cmd_param[3]);
-
-	if ((sec->cmd_param[0] < 1) || (sec->cmd_param[0] > 4)) {
-		input_err(true, &info->client->dev, "%s: wrong index.\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "WRONG INDEX");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	index = sec->cmd_param[0];
-
-	rawdata[0] = 0xC7;
-	rawdata[1] = 0x03;
-	rawdata[2] = 0x03;
-	rawdata[3] = (char)index;
-	rawdata[4] = (char)(sec->cmd_param[1] & 0xFF);
-	rawdata[5] = (char)(sec->cmd_param[1] >> 8);
-	rawdata[6] = (char)(sec->cmd_param[2] & 0xFF);
-	rawdata[7] = (char)(sec->cmd_param[2] >> 8);
-	rawdata[8] = (char)(sec->cmd_param[3] & 0xFF);
-	rawdata[9] = (char)(sec->cmd_param[3] >> 8);
-	rawdata[10] = 0x00;
-	rawdata[11] = 0x00;
-
-	fts_command(info, SENSEOFF);
-	fts_delay(50);
-	fts_command(info, FLUSHBUFFER);
-	fts_interrupt_set(info, INT_DISABLE);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	ret = fts_write_reg(info, rawdata, 12);
-	if (ret <= 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-		fts_delay(230);
-		fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-
-		fts_command(info, FLUSHBUFFER);
-		fts_delay(10);
-		fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-		fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-		fts_interrupt_set(info, INT_ENABLE);
-		return;
-	}
-
-	fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-	fts_delay(230);
-	fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_interrupt_set(info, INT_ENABLE);
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void set_pressure_data_index(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char data[12] = { 0 };
-	int ret, index;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: %d\n",
-		__func__, sec->cmd_param[0]);
-
-	if ((sec->cmd_param[0] < 0) || (sec->cmd_param[0] > 4)) {
-		input_err(true, &info->client->dev, "%s: wrong index.\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "WRONG INDEX");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	if (sec->cmd_param[0] == 0)
-		input_info(true, &info->client->dev, "%s: disable calibrated strength\n", __func__);
-
-	index = sec->cmd_param[0];
-
-	data[0] = 0xC7;
-	data[1] = 0x03;
-	data[2] = 0x01;
-	data[3] = (char)index;
-
-	fts_command(info, SENSEOFF);
-	fts_delay(50);
-	fts_command(info, FLUSHBUFFER);
-	fts_interrupt_set(info, INT_DISABLE);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	ret = fts_write_reg(info, data, 4);
-	if (ret <= 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-
-		if (index != 0x00) {
-			fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-			fts_delay(230);
-			fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-		}
-
-		fts_command(info, FLUSHBUFFER);
-		fts_delay(10);
-		fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-		fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-		fts_interrupt_set(info, INT_ENABLE);
-		return;
-	}
-
-	if (index != 0x00) {
-		fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-		fts_delay(230);
-		fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-	}
-
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_interrupt_set(info, INT_ENABLE);
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_pressure_strength(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char *data = NULL;
-	short strength[3] = { 0 };
-	int ret, index;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: index: %d\n",
-		__func__, sec->cmd_param[0]);
-
-	if ((sec->cmd_param[0] < 1) || (sec->cmd_param[0] > 4)) {
-		input_err(true, &info->client->dev, "%s: wrong index.\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "WRONG INDEX");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	index = sec->cmd_param[0] - 1;
-
-	data = kzalloc(nvm_data[PRESSURE_STRENGTH].length, GFP_KERNEL);
-	if (!data) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		input_err(true, &info->client->dev, "%s: failed to alloc mem\n",
-				__func__);
-		return;
-	}
-
-	ret = get_nvm_data(info, PRESSURE_STRENGTH, data);
-	if (ret <= 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		kfree(data);
-		return;
-	}
-
-	if ((data[index * 8 + 6] == 0xFF) && (data[index * 8 + 7] == 0xFF)) {
-		input_info(true, &info->client->dev, "%s: flash is initailized, clear\n", __func__);
-		memset(&data[index * 8], 0x00, 8);
-	}
-
-	strength[0] = (short)(data[index * 8 + 0] | ((data[index * 8 + 1] << 8) & 0xFF00));
-	strength[1] = (short)(data[index * 8 + 2] | ((data[index * 8 + 3] << 8) & 0xFF00));
-	strength[2] = (short)(data[index * 8 + 4] | ((data[index * 8 + 5] << 8) & 0xFF00));
-
-	snprintf(buff, sizeof(buff), "%d,%d,%d", strength[0], strength[1], strength[2]);
-
-	kfree(data);
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_pressure_rawdata(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char *data = NULL;
-	short rawdata[3] = { 0 };
-	int ret, index;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: index: %d\n",
-		__func__, sec->cmd_param[0]);
-
-	if ((sec->cmd_param[0] < 1) || (sec->cmd_param[0] > 4)) {
-		input_err(true, &info->client->dev, "%s: wrong index.\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "WRONG INDEX");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	index = sec->cmd_param[0] - 1;
-
-	data = kzalloc(nvm_data[PRESSURE_RAWDATA].length, GFP_KERNEL);
-	if (!data) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		input_err(true, &info->client->dev, "%s: failed to alloc mem\n",
-				__func__);
-		return;
-	}
-
-	ret = get_nvm_data(info, PRESSURE_RAWDATA, data);
-	if (ret <= 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		kfree(data);
-		return;
-	}
-
-	if ((data[index * 8 + 6] == 0xFF) && (data[index * 8 + 7] == 0xFF)) {
-		input_info(true, &info->client->dev, "%s: flash is initailized, clear\n", __func__);
-		memset(&data[index * 8], 0x00, 8);
-	}
-
-	rawdata[0] = (short)(data[index * 8 + 0] | ((data[index * 8 + 1] << 8) & 0xFF00));
-	rawdata[1] = (short)(data[index * 8 + 2] | ((data[index * 8 + 3] << 8) & 0xFF00));
-	rawdata[2] = (short)(data[index * 8 + 4] | ((data[index * 8 + 5] << 8) & 0xFF00));
-
-	snprintf(buff, sizeof(buff), "%d,%d,%d", rawdata[0], rawdata[1], rawdata[2]);
-
-	kfree(data);
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_pressure_data_index(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char *data = NULL;
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	input_info(true, &info->client->dev, "%s: index: %d\n",
-		__func__, sec->cmd_param[0]);
-
-	data = kzalloc(nvm_data[GROUP_INDEX].length, GFP_KERNEL);
-	if (!data) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		input_err(true, &info->client->dev, "%s: failed to alloc mem\n",
-				__func__);
-		return;
-	}
-
-	ret = get_nvm_data(info, GROUP_INDEX, data);
-	if (ret <= 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		kfree(data);
-		return;
-	}
-
-	if (data[0] == 0xFF) {
-		input_info(true, &info->client->dev, "%s: flash is initailized, clear\n", __func__);
-		memset(&data[0], 0x00, 1);
-	}
-
-	snprintf(buff, sizeof(buff), "%d", data[0]);
-
-	kfree(data);
-
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void set_pressure_strength_clear(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char data[12] = { 0 };
-	int ret;
-	int ii = 0;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-
-	fts_command(info, SENSEOFF);
-	fts_delay(50);
-	fts_command(info, FLUSHBUFFER);
-	fts_interrupt_set(info, INT_DISABLE);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-	for (ii = 1; ii < 4; ii++) {
-		data[0] = 0xC7;
-		data[1] = 0x03;
-		data[2] = 0x02;
-		data[3] = ii;
-		ret = fts_write_reg(info, data, 12);
-		if (ret <= 0) {
-			goto err_write_reg;
-		}
-	}
-
-	input_info(true, &info->client->dev, "%s: clear strength\n", __func__);
-
-	for (ii = 1; ii < 4; ii++) {
-		data[0] = 0xC7;
-		data[1] = 0x03;
-		data[2] = 0x03;
-		data[3] = ii;
-
-		ret = fts_write_reg(info, data, 12);
-		if (ret <= 0) {
-			goto err_write_reg;
-		}
-	}
-
-	input_info(true, &info->client->dev, "%s: clear rawdata\n", __func__);
-
-	data[0] = 0xC7;
-	data[1] = 0x03;
-	data[2] = 0x01;
-	data[3] = 0;
-
-	ret = fts_write_reg(info, data, 4);
-	if (ret <= 0) {
-		goto err_write_reg;
-	}
-
-	input_info(true, &info->client->dev, "%s: clear group index\n", __func__);
-
-	fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-	fts_delay(230);
-	fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_interrupt_set(info, INT_ENABLE);
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-
-	return;
-
-err_write_reg:
-	snprintf(buff, sizeof(buff), "%s", "NG");
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-	fts_delay(230);
-	fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_interrupt_set(info, INT_ENABLE);
-	return;
-}
-
-static void get_pressure_threshold(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char data[3] = { 0 };
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	ret = info->fts_get_sysinfo_data(info, FTS_SI_PRESSURE_THRESHOLD, 3, data);
-	if (ret <= 0)
-		input_err(true, info->dev, "%s: failed to read pressure threshold\n", __func__);
-
-	snprintf(buff, sizeof(buff), "%d", ((data[2] << 8) + data[1]));
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-/* low level is more sensitivity, except level-0(value 0) */
-static void set_pressure_user_level(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char data[1] = { 0 };
-	unsigned short addr;
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	if ((sec->cmd_param[0] < 1) || (sec->cmd_param[0] > 5)) {
-		input_err(true, &info->client->dev, "%s: wrong index.\n",
-					__func__);
-		snprintf(buff, sizeof(buff), "%s", "WRONG INDEX");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	addr = FTS_CMD_STRING_ACCESS + FTS_CMD_OFFSET_PRESSURE_LEVEL;
-	data[0] = sec->cmd_param[0];
-
-	ret = info->fts_write_to_string(info, &addr, data, 1);
-	if (ret <= 0)
-		goto out_set_user_level;
-
-	ret = info->fts_read_from_string(info, &addr, data, 1);
-	if (ret <= 0)
-		goto out_set_user_level;
-
-	input_info(true, &info->client->dev, "%s: set user level: %d\n", __func__, data[0]);
-
-	info->pressure_user_level = data[0];
-
-	fts_delay(20);
-
-	addr = FTS_CMD_STRING_ACCESS + FTS_CMD_OFFSET_PRESSURE_THD_HIGH;
-	data[0] = 0;
-	ret = info->fts_read_from_string(info, &addr, data, 1);
-	if (ret <= 0)
-		goto out_set_user_level;
-
-	input_info(true, &info->client->dev, "%s: HIGH THD: %d\n", __func__, data[0]);
-
-	addr = FTS_CMD_STRING_ACCESS + FTS_CMD_OFFSET_PRESSURE_THD_LOW;
-	data[0] = 0;
-	ret = info->fts_read_from_string(info, &addr, data, 1);
-	if (ret <= 0)
-		goto out_set_user_level;
-
-	input_info(true, &info->client->dev, "%s: HIGH LOW: %d\n", __func__, data[0]);
-
-	snprintf(buff, sizeof(buff), "OK");
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-	return;
-
-out_set_user_level:
-	snprintf(buff, sizeof(buff), "FAIL");
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_pressure_user_level(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char data[1] = { 0 };
-	unsigned short addr;
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	data[0] = sec->cmd_param[0];
-	addr = FTS_CMD_STRING_ACCESS + FTS_CMD_OFFSET_PRESSURE_LEVEL;
-
-	ret = info->fts_write_to_string(info, &addr, data, 1);
-	if (ret <= 0)
-		goto out_get_user_level;
-
-	ret = info->fts_read_from_string(info, &addr, data, 1);
-	if (ret <= 0)
-		goto out_get_user_level;
-
-	input_info(true, &info->client->dev, "%s: set user level: %d\n", __func__, data[0]);
-
-	info->pressure_user_level = data[0];
-
-	snprintf(buff, sizeof(buff), "%d", info->pressure_user_level);
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-	return;
-
-out_get_user_level:
-	snprintf(buff, sizeof(buff), "NG");
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-#endif
-
-static void factory_cmd_result_all(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[16] = { 0 };
-
-	memset(sec->cmd_result_all, 0x00, SEC_CMD_RESULT_STR_LEN);
-
-	if (info->fts_power_state == FTS_POWER_STATE_POWERDOWN) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-				__func__);
-		sec->cmd_all_factory_state = SEC_CMD_STATUS_FAIL;
-		goto out;
-	}
-
-	sec->cmd_all_factory_state = SEC_CMD_STATUS_RUNNING;
-
-	snprintf(buff, sizeof(buff), "%d", info->board->item_version);
-	sec_cmd_set_cmd_result_all(sec, buff, sizeof(buff), "ITEM_VERSION");
-
-	get_chip_vendor(sec);
-	get_chip_name(sec);
-	get_fw_ver_bin(sec);
-	get_fw_ver_ic(sec);
-
-	/* mis cal check */
-	fts_panel_ito_test(info, OPEN_SHORT_CRACK_TEST);
-
-	info->fts_command(info, SENSEOFF);
-	fts_delay(50);
-	fts_interrupt_set(info, INT_DISABLE);
-
-	info->fts_command(info, CX_TUNNING);
-	fts_delay(300);
-	fts_fw_wait_for_event_D3(info, STATUS_EVENT_MUTUAL_AUTOTUNE_DONE, 0x00);
-
-	info->fts_command(info, SELF_AUTO_TUNE);
-	fts_delay(300);
-	fts_fw_wait_for_event_D3(info, STATUS_EVENT_SELF_AUTOTUNE_DONE_D3, 0x00);
-
-	fts_delay(50);
-	fts_command(info, SENSEON);
-	fts_fw_wait_for_event (info, STATUS_EVENT_FORCE_CAL_DONE_D3);
-
-	run_rawcap_read(sec);
-	run_self_raw_read(sec);
-
-	run_cx_data_read(sec);
-	get_cx_gap_data(sec);
-	
-	run_ix_data_read(sec);
-
-	get_mis_cal_info(sec);
-
-	sec->cmd_all_factory_state = SEC_CMD_STATUS_OK;
-
-out:
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, sec->cmd_result_all);
-}
-
-static void set_factory_level(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->fts_power_state == FTS_POWER_STATE_POWERDOWN) {
-		input_err(true, &info->client->dev, "%s: Touch is stopped!\n", __func__);
-		goto NG;
-	}
-
-	if (sec->cmd_param[0] < OFFSET_FAC_SUB || sec->cmd_param[0] > OFFSET_FAC_MAIN) {
-		input_err(true, &info->client->dev,
-				"%s: cmd data is abnormal, %d\n", __func__, sec->cmd_param[0]);
-		goto NG;
-	}
-
-	info->factory_position = sec->cmd_param[0];
-
-	input_info(true, &info->client->dev, "%s: %d\n", __func__, info->factory_position);
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	return;
-
-NG:
-	snprintf(buff, sizeof(buff), "%s", "NG");
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-}
-
-int fts_get_tsp_test_result(struct fts_ts_info *info)
-{
-	unsigned char *data = NULL;
-	int ret;
-
-	data = kzalloc(nvm_data[FTS_NVM_OFFSET_FAC_RESULT].length, GFP_KERNEL);
-	if (!data) {
-		input_err(true, &info->client->dev, "%s: failed to alloc mem\n",
-				__func__);
-		return -ENOMEM;
-	}
-
-	ret = get_nvm_data(info, FTS_NVM_OFFSET_FAC_RESULT, data);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev,
-			"%s: get failed. ret: %d\n", __func__, ret);
-		goto err_read;
-	}
-
-	if (data[0] == 0xFF)
-		data[0] = 0;
-	if (data[1] == 0xFF)
-		data[1] = 0;
-
-	info->test_result.data[0] = data[0];
-	info->disassemble_count = data[1];
-
-err_read:
-	kfree(data);
-	return ret;
-}
-EXPORT_SYMBOL(fts_get_tsp_test_result);
-
-static void get_tsp_test_result(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	ret = fts_get_tsp_test_result(info);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed to get result\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		snprintf(buff, sizeof(buff), "M:%s, M:%d, A:%s, A:%d",
-				info->test_result.module_result == 0 ? "NONE" :
-				info->test_result.module_result == 1 ? "FAIL" :
-				info->test_result.module_result == 2 ? "PASS" : "A",
-				info->test_result.module_count,
-				info->test_result.assy_result == 0 ? "NONE" :
-				info->test_result.assy_result == 1 ? "FAIL" :
-				info->test_result.assy_result == 2 ? "PASS" : "A",
-				info->test_result.assy_count);
-
-		sec_cmd_set_cmd_result(sec, buff, strlen(buff));
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-}
-
-/* FACTORY TEST RESULT SAVING FUNCTION
- * bit 3 ~ 0 : OCTA Assy
- * bit 7 ~ 4 : OCTA module
- * param[0] : OCTA module(1) / OCTA Assy(2)
- * param[1] : TEST NONE(0) / TEST FAIL(1) / TEST PASS(2) : 2 bit
- */
-static int fts_set_tsp_test_result(struct fts_ts_info *info)
-{
-	unsigned char *data = NULL;
-	int ret;
-
-	input_info(true, &info->client->dev, "%s: [0x%X] M:%s, M:%d, A:%s, A:%d\n",
-		__func__, info->test_result.data[0],
-		info->test_result.module_result == 0 ? "NONE" :
-		info->test_result.module_result == 1 ? "FAIL" :
-		info->test_result.module_result == 2 ? "PASS" : "A",
-		info->test_result.module_count,
-		info->test_result.assy_result == 0 ? "NONE" :
-		info->test_result.assy_result == 1 ? "FAIL" :
-		info->test_result.assy_result == 2 ? "PASS" : "A",
-		info->test_result.assy_count);
-
-	data = kzalloc(nvm_data[FTS_NVM_OFFSET_FAC_RESULT].length, GFP_KERNEL);
-	if (!data) {
-		input_err(true, &info->client->dev, "%s: failed to alloc mem\n",
-				__func__);
-		return -ENOMEM;
-	}
-
-	data[0] = info->test_result.data[0];
-	data[1] = info->disassemble_count;
-
-	ret = set_nvm_data(info, FTS_NVM_OFFSET_FAC_RESULT, data);
-	if (ret <= 0)
-		input_err(true, &info->client->dev,
-			"%s: set failed. ret: %d\n", __func__, ret);
-
-	kfree(data);
-	return ret;
-}
-
-static void set_tsp_test_result(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	ret = fts_get_tsp_test_result(info);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to get_tsp_test_result\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-	sec->cmd_state = SEC_CMD_STATUS_RUNNING;
-
-	if (info->test_result.data[0] == 0xFF) {
-		input_info(true, &info->client->dev,
-			"%s: clear factory_result as zero\n",
-			__func__);
-		info->test_result.data[0] = 0;
-	}
-
-	if (sec->cmd_param[0] == TEST_OCTA_ASSAY) {
-		info->test_result.assy_result = sec->cmd_param[1];
-		if (info->test_result.assy_count < 3)
-			info->test_result.assy_count++;
-
-	} else if (sec->cmd_param[0] == TEST_OCTA_MODULE) {
-		info->test_result.module_result = sec->cmd_param[1];
-		if (info->test_result.module_count < 3)
-			info->test_result.module_count++;
-	}
-
-	ret = fts_set_tsp_test_result(info);
-	if (ret < 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void increase_disassemble_count(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	ret = fts_get_tsp_test_result(info);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: [ERROR] failed to get_tsp_test_result\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		return;
-	}
-	sec->cmd_state = SEC_CMD_STATUS_RUNNING;
-
-	if (info->disassemble_count < 0xFE)
-		info->disassemble_count++;
-
-	ret = fts_set_tsp_test_result(info);
-	if (ret < 0) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-
-}
-
-static void get_disassemble_count(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	ret = fts_get_tsp_test_result(info);
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed to get result\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-
-		snprintf(buff, sizeof(buff), "%d", info->disassemble_count);
-
-		sec_cmd_set_cmd_result(sec, buff, strlen(buff));
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-}
-
-int fts_get_tsp_flash_data(struct fts_ts_info *info, int offset, unsigned char cnt, unsigned char* buf)
-{
-	unsigned char regAdd[3] = {0xB8, 0x00, 0x08};
-  	unsigned char data[255] = { 0 };
-	unsigned short offset_addr;
-	int ret;
-
-	ret = fts_write_reg(info, &regAdd[0], 3);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev,
-			"%s: failed. ret: %d\n", __func__, ret);
-		return -EINVAL;
-	}
-
-	ret = info->fts_get_sysinfo_data(info, FTS_SI_COMPENSATION_OFFSET_ADDR, 4, data);
-	if (ret < 0) {
-		input_err(true, &info->client->dev,
-			"%s: failed. ret: %d\n", __func__, ret);
-		return -EINVAL;
-	}
-
-	offset_addr = data[0] + (data[1] << 8);
-
-	regAdd[0] = 0xD0;
-	regAdd[1] = (offset_addr >> 8) & 0xFF;
-	regAdd[2] = (offset_addr & 0xFF) + offset;
-
-	ret = fts_read_reg(info, &regAdd[0], 3, (unsigned char *)buf, cnt + 1);
-	if (ret <= 0) {
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n",
-			__func__, ret);
-		return ret;
+	struct btrfs_root *root;
+	struct inode *inode = d_inode(dentry);
+
+	if (!inode && !IS_ROOT(dentry))
+		inode = d_inode(dentry->d_parent);
+
+	if (inode) {
+		root = BTRFS_I(inode)->root;
+		if (btrfs_root_refs(&root->root_item) == 0)
+			return 1;
+
+		if (btrfs_ino(inode) == BTRFS_EMPTY_SUBVOL_DIR_OBJECTID)
+			return 1;
 	}
 	return 0;
 }
 
-int set_nvm_data_by_size(struct fts_ts_info *info, u8 offset, int length, u8 *buf)
+static void btrfs_dentry_release(struct dentry *dentry)
 {
-	u8 regAdd[256] = { 0 };
-	u8 remaining, index, sendinglength;
-	const u8 max_write_size = 11;	// Total write size 15 bytes [Command(4byte) + User data(11bytes)]
-	int ret;
-
-	fts_command(info, SENSEOFF);
-	fts_delay(50);
-	fts_command(info, FLUSHBUFFER);
-	fts_interrupt_set(info, INT_DISABLE);
-	fts_release_all_finger(info);
-
-	remaining = length;
-	index = 0;
-	sendinglength = 0;
-
-	while (remaining) {
-		regAdd[0] = 0xC7;
-		regAdd[1] = 0x02;
-		regAdd[2] = offset + index;
-
-		// write data up to 11 bytes available
-		if (remaining < max_write_size) {
-			regAdd[3] = remaining;
-			memcpy(&regAdd[4], &buf[index], remaining);
-			sendinglength = remaining;
-		} else {
-			regAdd[3] = max_write_size;
-			memcpy(&regAdd[4], &buf[index], max_write_size);
-			index += max_write_size;
-			sendinglength = max_write_size;
-		}
-		ret = fts_write_reg(info, &regAdd[0], sendinglength + 4);
-		if (ret < 0) {
-			input_err(true, &info->client->dev,
-						"%s: failed. ret: %d\n", __func__, ret);
-			return ret;
-		}
-
-		remaining -= sendinglength;
-	}
-
-	fts_command(info, FTS_CMD_SAVE_CX_TUNING);
-	fts_delay(230);
-	fts_fw_wait_for_event(info, STATUS_EVENT_FLASH_WRITE_CXTUNE_VALUE);
-
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-	fts_command(info, SENSEON);
-	fts_interrupt_set(info, INT_ENABLE);
-
-	return ret;
+	kfree(dentry->d_fsdata);
 }
 
-int set_nvm_data(struct fts_ts_info *info, u8 type, u8 *buf)
+static struct dentry *btrfs_lookup(struct inode *dir, struct dentry *dentry,
+				   unsigned int flags)
 {
-	return set_nvm_data_by_size(info, nvm_data[type].offset, nvm_data[type].length, buf);
+	struct inode *inode;
+
+	inode = btrfs_lookup_dentry(dir, dentry);
+	if (IS_ERR(inode)) {
+		if (PTR_ERR(inode) == -ENOENT)
+			inode = NULL;
+		else
+			return ERR_CAST(inode);
+	}
+
+	return d_splice_alias(inode, dentry);
 }
 
-int get_nvm_data_by_size(struct fts_ts_info *info, u8 offset, int length, u8 *nvdata)
-{
-	u8 regAdd[3] = {0};
-	u8 data[128 + 1] = { 0 };
-	u8 r_data[8] = { 0 };
-	int ret;
-
-	fts_command(info, SENSEOFF);
-	fts_delay(50);
-	fts_command(info, FLUSHBUFFER);
-	fts_interrupt_set(info, INT_DISABLE);
-	fts_release_all_finger(info);
-
-	// Request SEC factory debug data from flash
-	regAdd[0] = 0xB8;
-	regAdd[1] = 0x00;
-	regAdd[2] = 0x10;
-	ret = fts_write_reg(info, &regAdd[0], 3);
-	if (ret < 0) {
-		input_err(true, &info->client->dev,
-					"%s: failed. ret: %d\n", __func__, ret);
-		goto err_mode;
-	}
-	
-	fts_delay(50);
-	fts_interrupt_set(info, INT_ENABLE);
-
-	ret = info->fts_get_sysinfo_data(info, FTS_SI_COMPENSATION_OFFSET_ADDR, 7, r_data);
-	if (ret < 0) {
-		input_err(true, &info->client->dev,
-					"%s: get failed. ret: %d\n", __func__, ret);
-		goto err_mode;
-	}
-
-	input_info(true, &info->client->dev, "%s: 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X, 0x%02X\n",
-				__func__, r_data[0], r_data[1], r_data[2], r_data[3], r_data[4], r_data[5], r_data[6], r_data[7]);
-
-	regAdd[0] = 0xD0;
-	regAdd[1] = r_data[1];
-	regAdd[2] = r_data[0] + offset;
-	ret = fts_read_reg(info, &regAdd[0], 3, data, length + 1);
-	if (ret < 0) {
-		input_err(true, &info->client->dev,
-					"%s: read failed. ret: %d\n", __func__, ret);
-		goto err_mode;
-	}
-
-	memcpy(nvdata, &data[1], length);
-
-	err_mode:
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-	fts_command(info, SENSEON);
-	fts_interrupt_set(info, INT_ENABLE);
-
-	return ret;
-}
-
-int get_nvm_data(struct fts_ts_info *info, int type, u8 *nvdata)
-{
-	int size = sizeof(nvm_data) / sizeof(struct fts_nvm_data_map);
-
-	if (type >= size)
-		return -EINVAL;
-
-	return get_nvm_data_by_size(info, nvm_data[type].offset, nvm_data[type].length, nvdata);
-}
-
-#ifdef TCLM_CONCEPT
-int sec_tclm_data_read(struct i2c_client *client, int address)
-{
-	struct fts_ts_info *info = i2c_get_clientdata(client);
-	int ret = 0;
-	int i = 0;
-	u8 nbuff[FTS_NVM_OFFSET_ALL];
-
-	switch (address) {
-	case SEC_TCLM_NVM_OFFSET_IC_FIRMWARE_VER:
-		ret = info->fts_get_version_info(info);
-		return info->fw_main_version_of_ic;
-	case SEC_TCLM_NVM_ALL_DATA:
-		ret = get_nvm_data_by_size(info, nvm_data[FTS_NVM_OFFSET_FAC_RESULT].offset,
-				FTS_NVM_OFFSET_ALL, nbuff);
-		if (ret < 0)
-			return ret;
-		info->tdata->nvdata.cal_count = nbuff[nvm_data[FTS_NVM_OFFSET_CAL_COUNT].offset];
-		info->tdata->nvdata.tune_fix_ver = (nbuff[nvm_data[FTS_NVM_OFFSET_TUNE_VERSION].offset] << 8) |
-							nbuff[nvm_data[FTS_NVM_OFFSET_TUNE_VERSION].offset + 1];
-		info->tdata->nvdata.cal_position = nbuff[nvm_data[FTS_NVM_OFFSET_CAL_POSITION].offset];
-		info->tdata->nvdata.cal_pos_hist_cnt = nbuff[nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_COUNT].offset];
-		info->tdata->nvdata.cal_pos_hist_lastp = nbuff[nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_LASTP].offset];
-		for (i = nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO].offset;
-				i < nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO].offset +
-				nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO].length; i++)
-			info->tdata->nvdata.cal_pos_hist_queue[i - nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO].offset] = nbuff[i];
-
-		info->fac_nv = nbuff[nvm_data[FTS_NVM_OFFSET_FAC_RESULT].offset];
-		info->disassemble_count = nbuff[nvm_data[FTS_NVM_OFFSET_DISASSEMBLE_COUNT].offset];
-
-		return ret;
-	default:
-		return ret;
-	}
-}
-
-int sec_tclm_data_write(struct i2c_client *client)
-{
-	struct fts_ts_info *info = i2c_get_clientdata(client);
-	int ret = 1;
-	int i = 0;
-	u8 nbuff[FTS_NVM_OFFSET_ALL];
-
-	memset(nbuff, 0x00, FTS_NVM_OFFSET_ALL);
-	nbuff[nvm_data[FTS_NVM_OFFSET_FAC_RESULT].offset] = info->fac_nv;
-	nbuff[nvm_data[FTS_NVM_OFFSET_DISASSEMBLE_COUNT].offset] = info->disassemble_count;
-	nbuff[nvm_data[FTS_NVM_OFFSET_CAL_COUNT].offset] = info->tdata->nvdata.cal_count;
-	nbuff[nvm_data[FTS_NVM_OFFSET_TUNE_VERSION].offset] = (u8)(info->tdata->nvdata.tune_fix_ver >> 8);
-	nbuff[nvm_data[FTS_NVM_OFFSET_TUNE_VERSION].offset + 1] = (u8)(0xff & info->tdata->nvdata.tune_fix_ver);
-	nbuff[nvm_data[FTS_NVM_OFFSET_CAL_POSITION].offset] = info->tdata->nvdata.cal_position;
-	nbuff[nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_COUNT].offset] = info->tdata->nvdata.cal_pos_hist_cnt;
-	nbuff[nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_LASTP].offset] = info->tdata->nvdata.cal_pos_hist_lastp;
-	for (i = nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO].offset;
-			i < nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO].offset +
-			nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO].length; i++)
-		nbuff[i] = info->tdata->nvdata.cal_pos_hist_queue[i - nvm_data[FTS_NVM_OFFSET_HISTORY_QUEUE_ZERO].offset];
-	ret = set_nvm_data_by_size(info, nvm_data[FTS_NVM_OFFSET_FAC_RESULT].offset, FTS_NVM_OFFSET_ALL, nbuff);
-
-	return ret;
-}
-#endif
-
-#ifdef FTS_SUPPORT_HOVER
-static void hover_enable(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped || !(info->reinit_done) || (info->fts_power_state != FTS_POWER_STATE_ACTIVE)) {
-		input_err(true, &info->client->dev,
-			"%s: [ERROR] Touch is stopped:%d, reinit_done:%d, power_state:%d\n",
-			__func__, info->touch_stopped, info->reinit_done, info->fts_power_state);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-
-		if(sec->cmd_param[0]==1){
-			info->retry_hover_enable_after_wakeup = 1;
-			input_info(true, &info->client->dev, "%s: retry_hover_on_after_wakeup\n", __func__);
-		}
-
-		goto out;
-	}
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		int enables;
-		enables = sec->cmd_param[0];
-		if (enables == info->hover_enabled) {
-			input_dbg(true, &info->client->dev,
-				"%s: Skip duplicate command. Hover is already %s.\n",
-				__func__, info->hover_enabled ? "enabled" : "disabled");
-		} else {
-			if (enables) {
-				unsigned char regAdd[4] = {0xB0, 0x01, 0x29, 0x41};
-				unsigned char Dly_regAdd[4] = {0xB0, 0x01, 0x72, 0x04};
-				fts_write_reg(info, &Dly_regAdd[0], 4);
-				fts_write_reg(info, &regAdd[0], 4);
-				fts_command(info, FTS_CMD_HOVER_ON);
-				info->hover_enabled = true;
-				info->hover_ready = false;
-			} else {
-				unsigned char Dly_regAdd[4] = {0xB0, 0x01, 0x72, 0x08};
-				fts_write_reg(info, &Dly_regAdd[0], 4);
-				fts_command(info, FTS_CMD_HOVER_OFF);
-				info->hover_enabled = false;
-				info->hover_ready = false;
-			}
-		}
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-
-out:
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-/* static void hover_no_sleep_enable(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	unsigned char regAdd[4] = {0xB0, 0x01, 0x18, 0x00};
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		if (sec->cmd_param[0]) {
-			regAdd[3]=0x0F;
-		} else {
-			regAdd[3]=0x08;
-		}
-		fts_write_reg(info, &regAdd[0], 4);
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-} */
-#endif
-
-#ifdef CONFIG_GLOVE_TOUCH
-static void glove_mode(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		info->glove_enabled = sec->cmd_param[0];
-
-		if (!info->touch_stopped && info->reinit_done) {
-			if (info->glove_enabled)
-				fts_command(info, FTS_CMD_GLOVE_ON);
-			else
-				fts_command(info, FTS_CMD_GLOVE_OFF);
-		}
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void get_glove_sensitivity(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	unsigned char cmd[4] =
-		{ 0xB2, 0x01, 0xC6, 0x02 };
-	int timeout=0;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		char buff[SEC_CMD_STR_LEN] = { 0 };
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		return;
-	}
-
-	fts_write_reg(info, &cmd[0], 4);
-	sec->cmd_state = SEC_CMD_STATUS_RUNNING;
-
-	while (sec->cmd_state == SEC_CMD_STATUS_RUNNING) {
-		if (timeout++>30) {
-			sec->cmd_state = SEC_CMD_STATUS_FAIL;
-			break;
-		}
-		msleep(10);
-	}
-}
-
-static void fast_glove_mode(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		info->fast_glove_enabled = sec->cmd_param[0];
-
-		if (!info->touch_stopped && info->reinit_done) {
-			if (info->fast_glove_enabled)
-				fts_command(info, FTS_CMD_SET_FAST_GLOVE_MODE);
-			else
-				fts_command(info, FTS_CMD_SET_NOR_GLOVE_MODE);
-		}
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
+unsigned char btrfs_filetype_table[] = {
+	DT_UNKNOWN, DT_REG, DT_DIR, DT_CHR, DT_BLK, DT_FIFO, DT_SOCK, DT_LNK
 };
-#endif
 
-static void clear_cover_mode(void *device_data)
+static int btrfs_real_readdir(struct file *file, struct dir_context *ctx)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
+	struct inode *inode = file_inode(file);
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_item *item;
+	struct btrfs_dir_item *di;
+	struct btrfs_key key;
+	struct btrfs_key found_key;
+	struct btrfs_path *path;
+	struct list_head ins_list;
+	struct list_head del_list;
+	int ret;
+	struct extent_buffer *leaf;
+	int slot;
+	unsigned char d_type;
+	int over = 0;
+	u32 di_cur;
+	u32 di_total;
+	u32 di_len;
+	int key_type = BTRFS_DIR_INDEX_KEY;
+	char tmp_name[32];
+	char *name_ptr;
+	int name_len;
+	int is_curr = 0;	/* ctx->pos points to the current index? */
+	bool emitted;
 
-	sec_cmd_set_default_result(sec);
+	/* FIXME, use a real flag for deciding about the key type */
+	if (root->fs_info->tree_root == root)
+		key_type = BTRFS_DIR_ITEM_KEY;
 
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 3) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		if (sec->cmd_param[0] > 1) {
-			info->flip_enable = true;
-			info->cover_type = sec->cmd_param[1];
-#ifdef CONFIG_TRUSTONIC_TRUSTED_UI
-			if (TRUSTEDUI_MODE_TUI_SESSION & trustedui_get_current_mode()) {
-				fts_delay(500);
-				tui_force_close(1);
-				fts_delay(200);
-				if (TRUSTEDUI_MODE_TUI_SESSION & trustedui_get_current_mode()) {
-					trustedui_clear_mask(TRUSTEDUI_MODE_VIDEO_SECURED|TRUSTEDUI_MODE_INPUT_SECURED);
-					trustedui_set_mode(TRUSTEDUI_MODE_OFF);
+	if (!dir_emit_dots(file, ctx))
+		return 0;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	path->reada = 1;
+
+	if (key_type == BTRFS_DIR_INDEX_KEY) {
+		INIT_LIST_HEAD(&ins_list);
+		INIT_LIST_HEAD(&del_list);
+		btrfs_get_delayed_items(inode, &ins_list, &del_list);
+	}
+
+	key.type = key_type;
+	key.offset = ctx->pos;
+	key.objectid = btrfs_ino(inode);
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (ret < 0)
+		goto err;
+
+	emitted = false;
+	while (1) {
+		leaf = path->nodes[0];
+		slot = path->slots[0];
+		if (slot >= btrfs_header_nritems(leaf)) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0)
+				goto err;
+			else if (ret > 0)
+				break;
+			continue;
+		}
+
+		item = btrfs_item_nr(slot);
+		btrfs_item_key_to_cpu(leaf, &found_key, slot);
+
+		if (found_key.objectid != key.objectid)
+			break;
+		if (found_key.type != key_type)
+			break;
+		if (found_key.offset < ctx->pos)
+			goto next;
+		if (key_type == BTRFS_DIR_INDEX_KEY &&
+		    btrfs_should_delete_dir_index(&del_list,
+						  found_key.offset))
+			goto next;
+
+		ctx->pos = found_key.offset;
+		is_curr = 1;
+
+		di = btrfs_item_ptr(leaf, slot, struct btrfs_dir_item);
+		di_cur = 0;
+		di_total = btrfs_item_size(leaf, item);
+
+		while (di_cur < di_total) {
+			struct btrfs_key location;
+
+			if (verify_dir_item(root, leaf, di))
+				break;
+
+			name_len = btrfs_dir_name_len(leaf, di);
+			if (name_len <= sizeof(tmp_name)) {
+				name_ptr = tmp_name;
+			} else {
+				name_ptr = kmalloc(name_len, GFP_NOFS);
+				if (!name_ptr) {
+					ret = -ENOMEM;
+					goto err;
 				}
 			}
+			read_extent_buffer(leaf, name_ptr,
+					   (unsigned long)(di + 1), name_len);
 
-			tui_cover_mode_set(true);
-#endif			
-		} else {
-			info->flip_enable = false;
-#ifdef CONFIG_TRUSTONIC_TRUSTED_UI
-			tui_cover_mode_set(false);
-#endif
-		}
+			d_type = btrfs_filetype_table[btrfs_dir_type(leaf, di)];
+			btrfs_dir_item_key_to_cpu(leaf, di, &location);
 
-		if (!info->touch_stopped && info->reinit_done) {
-			if (info->flip_enable) {
-#ifdef CONFIG_GLOVE_TOUCH
-				if (info->glove_enabled
-					&& (strncmp(info->board->project_name, "TB", 2) != 0))
-					fts_command(info, FTS_CMD_GLOVE_OFF);
-#endif
-				fts_set_cover_type(info, true);
-			} else {
-				fts_set_cover_type(info, false);
-#ifdef CONFIG_GLOVE_TOUCH
-				if (info->fast_glove_enabled)
-					fts_command(info, FTS_CMD_SET_FAST_GLOVE_MODE);
-				else if (info->glove_enabled)
-					fts_command(info, FTS_CMD_GLOVE_ON);
-#endif
+
+			/* is this a reference to our own snapshot? If so
+			 * skip it.
+			 *
+			 * In contrast to old kernels, we insert the snapshot's
+			 * dir item and dir index after it has been created, so
+			 * we won't find a reference to our own snapshot. We
+			 * still keep the following code for backward
+			 * compatibility.
+			 */
+			if (location.type == BTRFS_ROOT_ITEM_KEY &&
+			    location.objectid == root->root_key.objectid) {
+				over = 0;
+				goto skip;
 			}
+			over = !dir_emit(ctx, name_ptr, name_len,
+				       location.objectid, d_type);
+
+skip:
+			if (name_ptr != tmp_name)
+				kfree(name_ptr);
+
+			if (over)
+				goto nopos;
+			emitted = true;
+			di_len = btrfs_dir_name_len(leaf, di) +
+				 btrfs_dir_data_len(leaf, di) + sizeof(*di);
+			di_cur += di_len;
+			di = (struct btrfs_dir_item *)((char *)di + di_len);
 		}
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-};
-
-static void report_rate(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		goto out;
+next:
+		path->slots[0]++;
 	}
 
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 2) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		if (sec->cmd_param[0] == REPORT_RATE_90HZ)
-			fts_change_scan_rate(info, FTS_CMD_FAST_SCAN);
-		else if (sec->cmd_param[0] == REPORT_RATE_60HZ)
-			fts_change_scan_rate(info, FTS_CMD_SLOW_SCAN);
-		else if (sec->cmd_param[0] == REPORT_RATE_30HZ)
-			fts_change_scan_rate(info, FTS_CMD_USLOW_SCAN);
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-
-out:
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-static void interrupt_control(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		goto out;
+	if (key_type == BTRFS_DIR_INDEX_KEY) {
+		if (is_curr)
+			ctx->pos++;
+		ret = btrfs_readdir_delayed_dir_index(ctx, &ins_list, &emitted);
+		if (ret)
+			goto nopos;
 	}
 
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		int enables;
-		enables = sec->cmd_param[0];
-		if (enables)
-			fts_irq_enable(info, true);
+	/*
+	 * If we haven't emitted any dir entry, we must not touch ctx->pos as
+	 * it was was set to the termination value in previous call. We assume
+	 * that "." and ".." were emitted if we reach this point and set the
+	 * termination value as well for an empty directory.
+	 */
+	if (ctx->pos > 2 && !emitted)
+		goto nopos;
+
+	/* Reached end of directory/root. Bump pos past the last item. */
+	ctx->pos++;
+
+	/*
+	 * Stop new entries from being returned after we return the last
+	 * entry.
+	 *
+	 * New directory entries are assigned a strictly increasing
+	 * offset.  This means that new entries created during readdir
+	 * are *guaranteed* to be seen in the future by that readdir.
+	 * This has broken buggy programs which operate on names as
+	 * they're returned by readdir.  Until we re-use freed offsets
+	 * we have this hack to stop new entries from being returned
+	 * under the assumption that they'll never reach this huge
+	 * offset.
+	 *
+	 * This is being careful not to overflow 32bit loff_t unless the
+	 * last entry requires it because doing so has broken 32bit apps
+	 * in the past.
+	 */
+	if (key_type == BTRFS_DIR_INDEX_KEY) {
+		if (ctx->pos >= INT_MAX)
+			ctx->pos = LLONG_MAX;
 		else
-			fts_irq_enable(info, false);
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
+			ctx->pos = INT_MAX;
 	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-
-out:
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-#endif
-
-static void set_wirelesscharger_mode(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		info->wirelesscharger_mode = sec->cmd_param[0];
-
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		goto out;
-	}
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		info->wirelesscharger_mode = sec->cmd_param[0];
-
-		fts_wirelesscharger_mode(info);
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-
-out:
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-};
-
-/* ######################################################
-    flag     1  :  set edge handler
-              2  :  set (portrait, normal) edge zone data
-              4  :  set (portrait, normal) dead zone data
-              8  :  set landscape mode data
-              16 :  mode clear
-    data
-              0x30, FFF (y start), FFF (y end),  FF(direction)
-              0x31, FFFF (edge zone)
-              0x32, FF (up x), FF (down x), FFFF (y)
-              0x33, FF (mode), FFF (edge), FFF (dead zone)
-    case
-           edge handler set :  0x30....
-           booting time :  0x30...  + 0x31...
-           normal mode : 0x32...  (+0x31...)
-           landscape mode : 0x33...
-           landscape -> normal (if same with old data) : 0x33, 0
-           landscape -> normal (etc) : 0x32....  + 0x33, 0
-    ###################################################### */
-
-void fts_set_grip_data_to_ic(struct fts_ts_info *info, u8 flag){
-	u8 data[4] = { 0 };
-	u8 regAdd[6] = {0xC6, 0x00, 0x00, 0x00, 0x00, 0x00};
-
-	input_info(true, &info->client->dev, "%s: flag: %02X (clr,lan,nor,edg,han)\n", __func__, flag);
-
-	if (flag & G_SET_EDGE_HANDLER) {
-		if (info->grip_edgehandler_direction == 0) {
-			data[0] = 0x0;
-			data[1] = 0x0;
-			data[2] = 0x0;
-			data[3] = 0x0;
-		} else {
-			data[0] = (info->grip_edgehandler_start_y >> 4) & 0xFF;
-			data[1] = (info->grip_edgehandler_start_y << 4 & 0xF0) | ((info->grip_edgehandler_end_y >> 8) & 0xF);
-			data[2] = info->grip_edgehandler_end_y & 0xFF;
-			data[3] = info->grip_edgehandler_direction & 0x3;
-		}
-
-		regAdd[1] = FTS_CMD_EDGE_HANDLER;
-		regAdd[2] = data[0];
-		regAdd[3] = data[1];
-		regAdd[4] = data[2];
-		regAdd[5] = data[3];
-
-		fts_write_reg(info, regAdd, 6);
-		input_info(true, &info->client->dev, "%s: 0x%02X %02X,%02X,%02X,%02X\n",
-			__func__, FTS_CMD_EDGE_HANDLER, data[0], data[1], data[2], data[3]);
-	}
-
-	if (flag & G_SET_EDGE_ZONE) {
-		data[0] = (info->grip_edge_range >> 8) & 0xFF;
-		data[1] = info->grip_edge_range  & 0xFF;
-
-		regAdd[1] = FTS_CMD_EDGE_AREA;
-		regAdd[2] = data[0];
-		regAdd[3] = data[1];
-
-		fts_write_reg(info, regAdd, 4);
-		input_info(true, &info->client->dev, "%s: 0x%02X %02X,%02X\n",
-			__func__, FTS_CMD_EDGE_AREA, data[0], data[1]);
-	}
-
-	if (flag & G_SET_NORMAL_MODE) {
-		data[0] = info->grip_deadzone_up_x & 0xFF;
-		data[1] = info->grip_deadzone_dn_x & 0xFF;
-		data[2] = (info->grip_deadzone_y >> 8) & 0xFF;
-		data[3] = info->grip_deadzone_y & 0xFF;
-
-		regAdd[1] = FTS_CMD_DEAD_ZONE;
-		regAdd[2] = data[0];
-		regAdd[3] = data[1];
-		regAdd[4] = data[2];
-		regAdd[5] = data[3];
-
-		fts_write_reg(info, regAdd, 6);
-		input_info(true, &info->client->dev, "%s: 0x%02X %02X,%02X,%02X,%02X\n",
-			__func__, FTS_CMD_DEAD_ZONE, data[0], data[1], data[2], data[3]);
-	}
-
-	if (flag & G_SET_LANDSCAPE_MODE) {
-		data[0] = info->grip_landscape_mode & 0x1;
-		data[1] = (info->grip_landscape_edge >> 4) & 0xFF;
-		data[2] = (info->grip_landscape_edge << 4 & 0xF0) | ((info->grip_landscape_deadzone >> 8) & 0xF);
-		data[3] = info->grip_landscape_deadzone & 0xFF;
-
-		regAdd[1] = FTS_CMD_LANDSCAPE_MODE;
-		regAdd[2] = data[0];
-		regAdd[3] = data[1];
-		regAdd[4] = data[2];
-		regAdd[5] = data[3];
-
-		fts_write_reg(info, regAdd, 6);
-		input_info(true, &info->client->dev, "%s: 0x%02X %02X,%02X,%02X,%02X\n",
-			__func__, FTS_CMD_LANDSCAPE_MODE, data[0], data[1], data[2], data[3]);
-	}
-
-	if (flag & G_CLR_LANDSCAPE_MODE) {
-		data[0] = info->grip_landscape_mode;
-
-		regAdd[1] = FTS_CMD_LANDSCAPE_MODE;
-		regAdd[2] = data[0];
-
-		fts_write_reg(info, regAdd, 3);
-		input_info(true, &info->client->dev, "%s: 0x%02X %02X\n",
-			__func__, FTS_CMD_LANDSCAPE_MODE, data[0]);
-	}
+nopos:
+	ret = 0;
+err:
+	if (key_type == BTRFS_DIR_INDEX_KEY)
+		btrfs_put_delayed_items(&ins_list, &del_list);
+	btrfs_free_path(path);
+	return ret;
 }
 
-/* ######################################################
-    index  0 :  set edge handler
-              1 :  portrait (normal) mode
-              2 :  landscape mode
-    data
-              0, X (direction), X (y start), X (y end)
-                     direction : 0 (off), 1 (left), 2 (right)
-                     ex) echo set_grip_data,0,2,600,900 > cmd
-
-              1, X (edge zone), X (dead zone up x), X (dead zone down x), X (dead zone y)
-                     ex) echo set_grip_data,1,200,10,50,1500 > cmd
-
-              2, 1 (landscape mode), X (edge zone), X (dead zone)
-                     ex) echo set_grip_data,2,1,200,100 > cmd
-
-              2, 0 (portrait mode)
-                     ex) echo set_grip_data,2,0  > cmd
-###################################################### */
-
-static void set_grip_data(void *device_data)
+int btrfs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	u8 mode = G_NONE;
-
-	sec_cmd_set_default_result(sec);
-
-	memset(buff, 0, sizeof(buff));
-
-	mutex_lock(&info->device_mutex);
-
-	if (sec->cmd_param[0] == 0) {	// edge handler
-		if (sec->cmd_param[1] == 0) {	// clear
-			info->grip_edgehandler_direction = 0;
-		} else if (sec->cmd_param[1] < 3) {
-			info->grip_edgehandler_direction = sec->cmd_param[1];
-			info->grip_edgehandler_start_y = sec->cmd_param[2];
-			info->grip_edgehandler_end_y = sec->cmd_param[3];
-		} else {
-			input_err(true, &info->client->dev, "%s: cmd1 is abnormal, %d (%d)\n",
-				__func__,sec->cmd_param[1], __LINE__);
-			goto err_grip_data;
-		}
-
-		mode = mode | G_SET_EDGE_HANDLER;
-		fts_set_grip_data_to_ic(info, mode);
-	} else if (sec->cmd_param[0] == 1) {	// normal mode
-		if (info->grip_edge_range != sec->cmd_param[1])
-			mode = mode | G_SET_EDGE_ZONE;
-
-		info->grip_edge_range = sec->cmd_param[1];
-		info->grip_deadzone_up_x = sec->cmd_param[2];
-		info->grip_deadzone_dn_x = sec->cmd_param[3];
-		info->grip_deadzone_y = sec->cmd_param[4];
-		mode = mode | G_SET_NORMAL_MODE;
-
-		if (info->grip_landscape_mode == 1) {
-			info->grip_landscape_mode = 0;
-			mode = mode | G_CLR_LANDSCAPE_MODE;
-		}
-
-		fts_set_grip_data_to_ic(info, mode);
-	} else if (sec->cmd_param[0] == 2) {	// landscape mode
-		if (sec->cmd_param[1] == 0) { 	// normal mode
-			info->grip_landscape_mode = 0;
-			mode = mode | G_CLR_LANDSCAPE_MODE;
-		} else if (sec->cmd_param[1] == 1) {
-			info->grip_landscape_mode = 1;
-			info->grip_landscape_edge = sec->cmd_param[2];
-			info->grip_landscape_deadzone = sec->cmd_param[3];
-			mode = mode | G_SET_LANDSCAPE_MODE;
-		} else {
-			input_err(true, &info->client->dev, "%s: cmd1 is abnormal, %d (%d)\n",
-				__func__,sec->cmd_param[1], __LINE__);
-			goto err_grip_data;
-		}
-
-		fts_set_grip_data_to_ic(info, mode);
-	} else {
-		input_err(true, &info->client->dev, "%s: cmd0 is abnormal, %d", __func__,sec->cmd_param[0]);
-		goto err_grip_data;
-	}
-
-	mutex_unlock(&info->device_mutex);
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec_cmd_set_cmd_exit(sec);
-	return;
-
-err_grip_data:
-	mutex_unlock(&info->device_mutex);
-
-	snprintf(buff, sizeof(buff), "%s", "NG");
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec_cmd_set_cmd_exit(sec);
-	return;
-}
-
-static void set_dead_zone(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAdd[2] = {0xC4, 0x00};
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 6) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		if (sec->cmd_param[0]==1)
-			regAdd[1] = 0x01;	/* side edge top */
-		else if (sec->cmd_param[0]==2)
-			regAdd[1] = 0x02;	/* side edge bottom */
-		else if (sec->cmd_param[0]==3)
-			regAdd[1] = 0x03;	/* side edge All On */
-		else if (sec->cmd_param[0]==4)
-			regAdd[1] = 0x04;	/* side edge Left Off */
-		else if (sec->cmd_param[0]==5)
-			regAdd[1] = 0x05;	/* side edge Right Off */
-		else if (sec->cmd_param[0]==6)
-			regAdd[1] = 0x06;	/* side edge All Off */
-		else
-			regAdd[1] = 0x0;	/* none	*/
-
-		ret = fts_write_reg(info, regAdd, 2);
-
-		if (ret < 0)
-			input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-		else
-			input_info(true, &info->client->dev, "%s: reg:%d, ret: %d\n", __func__, sec->cmd_param[0], ret);
-
-		fts_delay(1);
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void dead_zone_enable(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAdd[2] = {0xC2, 0x0C};
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		if (sec->cmd_param[0]==0) {
-			regAdd[0] = 0xC1;	/* dead zone disable */
-		} else {
-			regAdd[0] = 0xC2;	/* dead zone enable */
-		}
-
-		ret = fts_write_reg(info, regAdd, 2);
-
-		if (ret < 0)
-			input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-		else
-			input_info(true, &info->client->dev, "%s: reg:%d, ret: %d\n", __func__, sec->cmd_param[0], ret);
-
-		fts_delay(1);
-
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void drawing_test_enable(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-#ifdef FTS_SUPPORT_STRINGLIB
-	unsigned short addr = FTS_CMD_STRING_ACCESS;
-#endif
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_trans_handle *trans;
 	int ret = 0;
-	char buff[SEC_CMD_STR_LEN] = { 0 };
+	bool nolock = false;
 
-	sec_cmd_set_default_result(sec);
+	if (test_bit(BTRFS_INODE_DUMMY, &BTRFS_I(inode)->runtime_flags))
+		return 0;
 
-	if (!sec->cmd_param[0]) {
-		info->lowpower_flag |= FTS_MODE_PRESSURE;
-	} else {
-		info->lowpower_flag &= ~FTS_MODE_PRESSURE;
+	if (btrfs_fs_closing(root->fs_info) && btrfs_is_free_space_inode(inode))
+		nolock = true;
+
+	if (wbc->sync_mode == WB_SYNC_ALL) {
+		if (nolock)
+			trans = btrfs_join_transaction_nolock(root);
+		else
+			trans = btrfs_join_transaction(root);
+		if (IS_ERR(trans))
+			return PTR_ERR(trans);
+		ret = btrfs_commit_transaction(trans, root);
 	}
-
-#ifdef FTS_SUPPORT_STRINGLIB
-	ret = info->fts_write_to_string(info, &addr, &info->lowpower_flag, sizeof(info->lowpower_flag));
-#endif
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-
-		goto out;
-	}
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-out:
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void spay_enable(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-#ifdef FTS_SUPPORT_STRINGLIB
-	unsigned short addr = FTS_CMD_STRING_ACCESS;
-#endif
-	int ret = 0;
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (sec->cmd_param[0]) {
-		info->lowpower_flag |= FTS_MODE_SPAY;
-	} else {
-		info->lowpower_flag &= ~FTS_MODE_SPAY;
-	}
-
-#ifdef FTS_SUPPORT_STRINGLIB
-	ret = info->fts_write_to_string(info, &addr, &info->lowpower_flag, sizeof(info->lowpower_flag));
-#endif
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-
-		goto out;
-	}
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-out:
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void aod_enable(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-#ifdef FTS_SUPPORT_STRINGLIB
-	unsigned short addr = FTS_CMD_STRING_ACCESS;
-#endif
-	int ret = 0;
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	if (sec->cmd_param[0]) {
-		info->lowpower_flag |= FTS_MODE_AOD;
-	} else {
-		info->lowpower_flag &= ~FTS_MODE_AOD;
-	}
-
-#ifdef FTS_SUPPORT_STRINGLIB
-	ret = info->fts_write_to_string(info, &addr, &info->lowpower_flag, sizeof(info->lowpower_flag));
-#endif
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-
-		goto out;
-	}
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-out:
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void set_aod_rect(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	u8 data[8] = {0, };
-	int i, ret = -1;
-#ifdef FTS_SUPPORT_STRINGLIB
-	unsigned short addr = FTS_CMD_STRING_ACCESS + 2;
-#endif
-
-	sec_cmd_set_default_result(sec);
-
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-	input_info(true, &info->client->dev, "%s: w:%d, h:%d, x:%d, y:%d\n",
-			__func__, sec->cmd_param[0], sec->cmd_param[1],
-			sec->cmd_param[2], sec->cmd_param[3]);
-#endif
-
-	for (i = 0; i < 4; i++) {
-		data[i * 2] = sec->cmd_param[i] & 0xFF;
-		data[i * 2 + 1] = (sec->cmd_param[i] >> 8) & 0xFF;
-		info->rect_data[i] = sec->cmd_param[i];
-	}
-
-	disable_irq(info->client->irq);
-#ifdef FTS_SUPPORT_STRINGLIB
-	ret = info->fts_write_to_string(info, &addr, data, sizeof(data));
-#endif
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-		goto NG;
-	}
-
-	enable_irq(info->client->irq);
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec_cmd_set_cmd_exit(sec);
-	return;
-NG:
-	enable_irq(info->client->irq);
-	snprintf(buff, sizeof(buff), "%s", "NG");
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec_cmd_set_cmd_exit(sec);
-}
-
-static void get_aod_rect(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	u8 data[8] = {0, };
-	u16 rect_data[4] = {0, };
-	int i, ret = -1;
-#ifdef FTS_SUPPORT_STRINGLIB
-	unsigned short addr = FTS_CMD_STRING_ACCESS + 2;
-#endif
-
-	sec_cmd_set_default_result(sec);
-
-	disable_irq(info->client->irq);
-#ifdef FTS_SUPPORT_STRINGLIB
-	ret = info->fts_read_from_string(info, &addr, data, sizeof(data));
-#endif
-	if (ret < 0) {
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-		goto NG;
-	}
-
-	enable_irq(info->client->irq);
-
-	for (i = 0; i < 4; i++)
-		rect_data[i] = (data[i * 2 + 1] & 0xFF) << 8 | (data[i * 2] & 0xFF);
-
-#if !defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-	input_info(true, &info->client->dev, "%s: w:%d, h:%d, x:%d, y:%d\n",
-			__func__, rect_data[0], rect_data[1], rect_data[2], rect_data[3]);
-#endif
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec_cmd_set_cmd_exit(sec);
-	return;
-NG:
-	enable_irq(info->client->irq);
-	snprintf(buff, sizeof(buff), "%s", "NG");
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec_cmd_set_cmd_exit(sec);
+	return ret;
 }
 
 /*
- *  C2 13: Disable dex mode
- *  C1 13 01: Full screen mode
- *  C1 13 02: Iris mode
+ * This is somewhat expensive, updating the tree every time the
+ * inode changes.  But, it is most likely to find the inode in cache.
+ * FIXME, needs more benchmarking...there are no reasons other than performance
+ * to keep or drop this code.
  */
-static void dex_enable(void *device_data)
+static int btrfs_dirty_inode(struct inode *inode)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAdd[3] = {0xC1, 0x13};
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_trans_handle *trans;
 	int ret;
 
-	sec_cmd_set_default_result(sec);
+	if (test_bit(BTRFS_INODE_DUMMY, &BTRFS_I(inode)->runtime_flags))
+		return 0;
 
-	if (!info->board->support_dex) {
-		input_err(true, &info->client->dev, "%s: not support DeX mode\n", __func__);
-		goto out;
+	trans = btrfs_join_transaction(root);
+	if (IS_ERR(trans))
+		return PTR_ERR(trans);
+
+	ret = btrfs_update_inode(trans, root, inode);
+	if (ret && ret == -ENOSPC) {
+		/* whoops, lets try again with the full transaction */
+		btrfs_end_transaction(trans, root);
+		trans = btrfs_start_transaction(root, 1);
+		if (IS_ERR(trans))
+			return PTR_ERR(trans);
+
+		ret = btrfs_update_inode(trans, root, inode);
 	}
+	btrfs_end_transaction(trans, root);
+	if (BTRFS_I(inode)->delayed_node)
+		btrfs_balance_delayed_items(root);
 
-	if ((sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) &&
-		(sec->cmd_param[1] < 0 || sec->cmd_param[1] > 1)) {
-		input_err(true, &info->client->dev, "%s: not support param\n", __func__);
-		goto out;
-	}
+	return ret;
+}
 
-	info->dex_mode = sec->cmd_param[0];
-	if (info->dex_mode) {
-		input_err(true, &info->client->dev, "%s: set DeX touch_pad mode%s\n",
-			__func__, sec->cmd_param[1] ? " & Iris mode" : "");
-		info->input_dev = info->input_dev_pad;
-		regAdd[0] = 0xC1;
-		if (sec->cmd_param[1]) {
-			/* Iris mode */
-			info->dex_mode = 0x02;
-			info->dex_name = "[DeXI]";
-		} else {
-			info->dex_name = "[DeX]";
-		}
-		regAdd[2] = info->dex_mode;
-	} else {
-		input_err(true, &info->client->dev, "%s: set touch mode\n", __func__);
-		info->input_dev = info->input_dev_touch;
-		info->dex_name = "";
-		regAdd[0] = 0xC2;
-	}
+/*
+ * This is a copy of file_update_time.  We need this so we can return error on
+ * ENOSPC for updating the inode in the case of file write and mmap writes.
+ */
+static int btrfs_update_time(struct inode *inode, struct timespec *now,
+			     int flags)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
 
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		goto out;
-	}
+	if (btrfs_root_readonly(root))
+		return -EROFS;
 
-	ret = fts_write_reg(info, regAdd, info->dex_mode ? 3 : 2);
+	if (flags & S_VERSION)
+		inode_inc_iversion(inode);
+	if (flags & S_CTIME)
+		inode->i_ctime = *now;
+	if (flags & S_MTIME)
+		inode->i_mtime = *now;
+	if (flags & S_ATIME)
+		inode->i_atime = *now;
+	return btrfs_dirty_inode(inode);
+}
+
+/*
+ * find the highest existing sequence number in a directory
+ * and then set the in-memory index_cnt variable to reflect
+ * free sequence numbers
+ */
+static int btrfs_set_inode_index_count(struct inode *inode)
+{
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_key key, found_key;
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	int ret;
+
+	key.objectid = btrfs_ino(inode);
+	key.type = BTRFS_DIR_INDEX_KEY;
+	key.offset = (u64)-1;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
 	if (ret < 0)
-		input_err(true, &info->client->dev, "%s: failed. ret: %d\n", __func__, ret);
-	else
-		input_info(true, &info->client->dev, "%s: reg:%d, ret: %d\n", __func__, regAdd[2], ret);
+		goto out;
+	/* FIXME: we should be able to handle this */
+	if (ret == 0)
+		goto out;
+	ret = 0;
 
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-	sec_cmd_set_cmd_exit(sec);
-	return;
+	/*
+	 * MAGIC NUMBER EXPLANATION:
+	 * since we search a directory based on f_pos we have to start at 2
+	 * since '.' and '..' have f_pos of 0 and 1 respectively, so everybody
+	 * else has to start at 2
+	 */
+	if (path->slots[0] == 0) {
+		BTRFS_I(inode)->index_cnt = 2;
+		goto out;
+	}
 
+	path->slots[0]--;
+
+	leaf = path->nodes[0];
+	btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+
+	if (found_key.objectid != btrfs_ino(inode) ||
+	    found_key.type != BTRFS_DIR_INDEX_KEY) {
+		BTRFS_I(inode)->index_cnt = 2;
+		goto out;
+	}
+
+	BTRFS_I(inode)->index_cnt = found_key.offset + 1;
 out:
-	snprintf(buff, sizeof(buff), "%s", "NG");
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	sec_cmd_set_cmd_exit(sec);
+	btrfs_free_path(path);
+	return ret;
 }
 
-static void brush_enable(void *device_data)
+/*
+ * helper to find a free sequence number in a given directory.  This current
+ * code is very simple, later versions will do smarter things in the btree
+ */
+int btrfs_set_inode_index(struct inode *dir, u64 *index)
 {
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAdd[2] = {0xC1, 0x14};
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		goto out;
-	}
-
-	info->brush_mode = sec->cmd_param[0];
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		goto out;
-	}
-
-	input_info(true, &info->client->dev,
-		"%s: set brush mode %s\n", __func__, info->brush_mode ? "enable" : "disable");
-
-	if (info->brush_mode == 0)
-		regAdd[0] = 0xC2;	/* 0: Disable Artcanvas min phi mode */
-	else
-		regAdd[0] = 0xC1;	/* 1: Enable Artcanvas min phi mode  */
-
-	ret = fts_write_reg(info, regAdd, 2);
-	if (ret < 0) {
-		input_err(true, &info->client->dev,
-					"%s: failed to set brush mode\n", __func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		goto out;
-	}
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-
-out:
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void set_touchable_area(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	unsigned char regAdd[2] = {0xC1, 0x15};
-	int ret;
-
-	sec_cmd_set_default_result(sec);
-
-	if (sec->cmd_param[0] < 0 || sec->cmd_param[0] > 1) {
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		goto out;
-	}
-
-	info->touchable_area = sec->cmd_param[0];
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		sec->cmd_state = SEC_CMD_STATUS_NOT_APPLICABLE;
-		goto out;
-	}
-
-	input_info(true, &info->client->dev,
-		"%s: set 16:9 mode %s\n", __func__, info->touchable_area ? "enable" : "disable");
-
-	if (info->touchable_area == 0)
-		regAdd[0] = 0xC2;	/* 0: Disable 16:9 mode */
-	else
-		regAdd[0] = 0xC1;	/* 1: Enable 16:9 mode  */
-
-	ret = fts_write_reg(info, regAdd, 2);
-	if (ret < 0) {
-		input_err(true, &info->client->dev,
-					"%s: failed to set 16:9 mode\n", __func__);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-		goto out;
-	}
-
-	snprintf(buff, sizeof(buff), "%s", "OK");
-	sec->cmd_state = SEC_CMD_STATUS_OK;
-
-out:
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void delay(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	info->delay_time = sec->cmd_param[0];
-
-	input_info(true, &info->client->dev, "%s: delay time is %d\n", __func__, info->delay_time);
-	snprintf(buff, sizeof(buff), "%d", info->delay_time);
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static void debug(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-
-	sec_cmd_set_default_result(sec);
-
-	info->debug_string = sec->cmd_param[0];
-
-	input_info(true, &info->client->dev, "%s: command is %d\n", __func__, info->debug_string);
-
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-	sec->cmd_state = SEC_CMD_STATUS_WAITING;
-	sec_cmd_set_cmd_exit(sec);
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-}
-
-static bool tsp_connection_check(struct fts_ts_info *info)
-{
-	int ret;
-
-	ret = fts_panel_ito_test(info, OPEN_TEST);
-
-	return (ret == 0) ? true : false;
-}
-
-static void run_force_calibration(void *device_data)
-{
-	struct sec_cmd_data *sec = (struct sec_cmd_data *)device_data;
-	struct fts_ts_info *info = container_of(sec, struct fts_ts_info, sec);
-	char buff[SEC_CMD_STR_LEN] = { 0 };
-	bool touch_on = false;
-
-	sec_cmd_set_default_result(sec);
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n",
-			__func__);
-		snprintf(buff, sizeof(buff), "%s", "TSP turned off");
-		goto autotune_fail;
-	}
-
-	if (info->rawdata_read_lock == 1) {
-		input_err(true, &info->client->dev, "%s: ramdump mode is runing, %d\n", __func__, info->rawdata_read_lock);
-		snprintf(buff, sizeof(buff), "%s", "NG");
-		goto autotune_fail;
-	}
-
-	if (info->touch_count > 0) {
-		touch_on = true;
-		input_err(true, info->dev, "%s: finger on touch(%d)\n", __func__, info->touch_count);
-	}
-
-	/* for Tablet model : TSP connection check at pretest apk */
-	if (info->tdata->external_factory && !tsp_connection_check(info)) {
-		input_err(true, info->dev, "%s: TSP is not connected. Do not run calibration\n", __func__);
-		snprintf(buff, sizeof(buff), "%s", "NG_TSP_NOT_CONNECT");
-		goto autotune_fail;
-	}
-
-	disable_irq(info->irq);
-
-	fts_interrupt_set(info, INT_DISABLE);
-
-	fts_command(info, SENSEOFF);
-	fts_delay(50);
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey) {
-		fts_command(info, FTS_CMD_KEY_SENSE_OFF);
-	}
-#endif
-	fts_command(info, FLUSHBUFFER);
-	fts_delay(10);
-
-	fts_release_all_finger(info);
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_release_all_key(info);
-#endif
-
-	fts_command(info,FTS_CMD_FORCE_AUTOTUNE);
-
-	if (touch_on) {
-		input_err(true, info->dev, "%s: finger! do not run autotune\n", __func__);
-	} else {
-		input_info(true, info->dev, "%s: run autotune\n", __func__);
-		input_err(true, &info->client->dev, "%s: RUN OFFSET CALIBRATION \n", __func__);
-		
-		fts_execute_autotune(info, true);
-#ifdef TCLM_CONCEPT
-		/* devide tclm case */
-		sec_tclm_case(info->tdata, sec->cmd_param[0]);
-
-		input_info(true, &info->client->dev, "%s: param, %d, %c, %d\n", __func__,
-			sec->cmd_param[0], sec->cmd_param[0], info->tdata->root_of_calibration);
-
-		if (sec_execute_tclm_package(info->tdata, 1) < 0)
-			input_err(true, &info->client->dev,
-						"%s: sec_execute_tclm_package\n", __func__);
-
-		sec_tclm_root_of_cal(info->tdata, CALPOSITION_NONE);
-#endif
-	}
-
-	fts_command(info, SENSEON);
-#ifdef FTS_SUPPORT_PRESSURE_SENSOR
-	fts_command(info, FTS_CMD_PRESSURE_SENSE_ON);
-#endif
-	fts_fw_wait_for_event (info, STATUS_EVENT_FORCE_CAL_DONE_D3);
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-	if (info->board->support_mskey)
-		fts_command(info, FTS_CMD_KEY_SENSE_ON);
-#endif
-
-	fts_interrupt_set(info, INT_ENABLE);
-	enable_irq(info->irq);
-
-	if (touch_on) {
-		snprintf(buff, sizeof(buff), "NG_FINGER_ON");
-		sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	} else {
-		snprintf(buff, sizeof(buff), "%s", "OK");
-		sec->cmd_state = SEC_CMD_STATUS_OK;
-	}
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-#ifdef TCLM_CONCEPT
-	info->tdata->external_factory = false;
-#endif
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-	return;
-
-autotune_fail:
-#ifdef TCLM_CONCEPT
-	info->tdata->external_factory = false;
-#endif
-	snprintf(buff, sizeof(buff), "%s", "NG");
-	sec->cmd_state = SEC_CMD_STATUS_FAIL;
-	sec_cmd_set_cmd_result(sec, buff, strnlen(buff, sizeof(buff)));
-
-	input_info(true, &info->client->dev, "%s: %s\n", __func__, buff);
-	return;
-}
-
-#ifdef FTS_SUPPORT_TOUCH_KEY
-int read_touchkey_data(struct fts_ts_info *info, unsigned char type, unsigned int keycode)
-{
-	unsigned char pCMD[3] = { 0xD0, 0x00, 0x00};
-	unsigned char buf[9] = { 0 };
-	int i;
 	int ret = 0;
 
-	pCMD[2] = type;
-
-	ret = fts_read_reg(info, &pCMD[0], 3, buf, 3);
-	if (ret >= 0) {
-		pCMD[1] = buf[2];
-		pCMD[2] = buf[1];
-	} else
-		return -1;
-
-	ret = fts_read_reg(info, &pCMD[0], 3, buf, 9);
-	if (ret < 0)
-		return -2;
-
-	for (i = 0 ; i < info->board->num_touchkey ; i++)
-		if (info->board->touchkey[i].keycode == keycode) {
-			return *(short *)&buf[(info->board->touchkey[i].value - 1) * 2 + 1];
+	if (BTRFS_I(dir)->index_cnt == (u64)-1) {
+		ret = btrfs_inode_delayed_dir_index_count(dir);
+		if (ret) {
+			ret = btrfs_set_inode_index_count(dir);
+			if (ret)
+				return ret;
 		}
-
-	return -3;
-}
-
-static ssize_t touchkey_recent_strength(struct device *dev,
-				       struct device_attribute *attr, char *buf) {
-	struct fts_ts_info *info = dev_get_drvdata(dev);
-	int value = 0;
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n", __func__);
-		return sprintf(buf, "%d\n", value);
 	}
 
-	value = read_touchkey_data(info, TYPE_TOUCHKEY_STRENGTH, KEY_RECENT);
+	*index = BTRFS_I(dir)->index_cnt;
+	BTRFS_I(dir)->index_cnt++;
 
-	return sprintf(buf, "%d\n", value);
+	return ret;
 }
 
-static ssize_t touchkey_back_strength(struct device *dev,
-				       struct device_attribute *attr, char *buf) {
-	struct fts_ts_info *info = dev_get_drvdata(dev);
-	int value = 0;
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n", __func__);
-		return sprintf(buf, "%d\n", value);
-	}
-
-	value = read_touchkey_data(info, TYPE_TOUCHKEY_STRENGTH, KEY_BACK);
-
-	return sprintf(buf, "%d\n", value);
-}
-
-static ssize_t touchkey_recent_raw(struct device *dev,
-				       struct device_attribute *attr, char *buf) {
-	struct fts_ts_info *info = dev_get_drvdata(dev);
-	int value = 0;
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n", __func__);
-		return sprintf(buf, "%d\n", value);
-	}
-
-	value = read_touchkey_data(info, TYPE_TOUCHKEY_RAW, KEY_RECENT);
-
-	return sprintf(buf, "%d\n", value);
-}
-
-static ssize_t touchkey_back_raw(struct device *dev,
-				       struct device_attribute *attr, char *buf) {
-	struct fts_ts_info *info = dev_get_drvdata(dev);
-	int value = 0;
-
-	if (info->touch_stopped) {
-		input_err(true, &info->client->dev, "%s: [ERROR] Touch is stopped\n", __func__);
-		return sprintf(buf, "%d\n", value);
-	}
-
-	value = read_touchkey_data(info, TYPE_TOUCHKEY_RAW, KEY_BACK);
-
-	return sprintf(buf, "%d\n", value);
-}
-
-static ssize_t touchkey_threshold(struct device *dev,
-				       struct device_attribute *attr, char *buf) {
-	struct fts_ts_info *info = dev_get_drvdata(dev);
-	unsigned char pCMD[3] = { 0xD0, 0x00, 0x00};
-	int value;
-	int ret = 0;
-
-	value = -1;
-	pCMD[2] = FTS_SI_SS_KEY_THRESHOLD;
-	ret = fts_read_reg(info, &pCMD[0], 3, buf, 3);
-	if (ret >= 0) {
-		value = *(unsigned short *)&buf[1];
-	}
-
-	info->touchkey_threshold = value;
-	return sprintf(buf, "%d\n", info->touchkey_threshold);
-}
-
-static ssize_t fts_touchkey_led_control(struct device *dev,
-				 struct device_attribute *attr, const char *buf,
-				 size_t size)
+static int btrfs_insert_inode_locked(struct inode *inode)
 {
-	struct fts_ts_info *info = dev_get_drvdata(dev);
-	int ret;
-	unsigned long data;
+	struct btrfs_iget_args args;
+	args.location = &BTRFS_I(inode)->location;
+	args.root = BTRFS_I(inode)->root;
 
-	if (size > 2) {
-		input_err(true, &info->client->dev,
-			"%s: cmd length is over (%s,%d)!!\n",
-			__func__, buf, (int)strlen(buf));
-		return -EINVAL;
+	return insert_inode_locked4(inode,
+		   btrfs_inode_hash(inode->i_ino, BTRFS_I(inode)->root),
+		   btrfs_find_actor, &args);
+}
+
+static struct inode *btrfs_new_inode(struct btrfs_trans_handle *trans,
+				     struct btrfs_root *root,
+				     struct inode *dir,
+				     const char *name, int name_len,
+				     u64 ref_objectid, u64 objectid,
+				     umode_t mode, u64 *index)
+{
+	struct inode *inode;
+	struct btrfs_inode_item *inode_item;
+	struct btrfs_key *location;
+	struct btrfs_path *path;
+	struct btrfs_inode_ref *ref;
+	struct btrfs_key key[2];
+	u32 sizes[2];
+	int nitems = name ? 2 : 1;
+	unsigned long ptr;
+	int ret;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return ERR_PTR(-ENOMEM);
+
+	inode = new_inode(root->fs_info->sb);
+	if (!inode) {
+		btrfs_free_path(path);
+		return ERR_PTR(-ENOMEM);
 	}
 
-	ret = kstrtoul(buf, 10, &data);
+	/*
+	 * O_TMPFILE, set link count to 0, so that after this point,
+	 * we fill in an inode item with the correct link count.
+	 */
+	if (!name)
+		set_nlink(inode, 0);
+
+	/*
+	 * we have to initialize this early, so we can reclaim the inode
+	 * number if we fail afterwards in this function.
+	 */
+	inode->i_ino = objectid;
+
+	if (dir && name) {
+		trace_btrfs_inode_request(dir);
+
+		ret = btrfs_set_inode_index(dir, index);
+		if (ret) {
+			btrfs_free_path(path);
+			iput(inode);
+			return ERR_PTR(ret);
+		}
+	} else if (dir) {
+		*index = 0;
+	}
+	/*
+	 * index_cnt is ignored for everything but a dir,
+	 * btrfs_get_inode_index_count has an explanation for the magic
+	 * number
+	 */
+	BTRFS_I(inode)->index_cnt = 2;
+	BTRFS_I(inode)->dir_index = *index;
+	BTRFS_I(inode)->root = root;
+	BTRFS_I(inode)->generation = trans->transid;
+	inode->i_generation = BTRFS_I(inode)->generation;
+
+	/*
+	 * We could have gotten an inode number from somebody who was fsynced
+	 * and then removed in this same transaction, so let's just set full
+	 * sync since it will be a full sync anyway and this will blow away the
+	 * old info in the log.
+	 */
+	set_bit(BTRFS_INODE_NEEDS_FULL_SYNC, &BTRFS_I(inode)->runtime_flags);
+
+	key[0].objectid = objectid;
+	key[0].type = BTRFS_INODE_ITEM_KEY;
+	key[0].offset = 0;
+
+	sizes[0] = sizeof(struct btrfs_inode_item);
+
+	if (name) {
+		/*
+		 * Start new inodes with an inode_ref. This is slightly more
+		 * efficient for small numbers of hard links since they will
+		 * be packed into one item. Extended refs will kick in if we
+		 * add more hard links than can fit in the ref item.
+		 */
+		key[1].objectid = objectid;
+		key[1].type = BTRFS_INODE_REF_KEY;
+		key[1].offset = ref_objectid;
+
+		sizes[1] = name_len + sizeof(*ref);
+	}
+
+	location = &BTRFS_I(inode)->location;
+	location->objectid = objectid;
+	location->offset = 0;
+	location->type = BTRFS_INODE_ITEM_KEY;
+
+	ret = btrfs_insert_inode_locked(inode);
+	if (ret < 0)
+		goto fail;
+
+	path->leave_spinning = 1;
+	ret = btrfs_insert_empty_items(trans, root, path, key, sizes, nitems);
+	if (ret != 0)
+		goto fail_unlock;
+
+	inode_init_owner(inode, dir, mode);
+	inode_set_bytes(inode, 0);
+
+	inode->i_mtime = CURRENT_TIME;
+	inode->i_atime = inode->i_mtime;
+	inode->i_ctime = inode->i_mtime;
+	BTRFS_I(inode)->i_otime = inode->i_mtime;
+
+	inode_item = btrfs_item_ptr(path->nodes[0], path->slots[0],
+				  struct btrfs_inode_item);
+	memset_extent_buffer(path->nodes[0], 0, (unsigned long)inode_item,
+			     sizeof(*inode_item));
+	fill_inode_item(trans, path->nodes[0], inode_item, inode);
+
+	if (name) {
+		ref = btrfs_item_ptr(path->nodes[0], path->slots[0] + 1,
+				     struct btrfs_inode_ref);
+		btrfs_set_inode_ref_name_len(path->nodes[0], ref, name_len);
+		btrfs_set_inode_ref_index(path->nodes[0], ref, *index);
+		ptr = (unsigned long)(ref + 1);
+		write_extent_buffer(path->nodes[0], name, ptr, name_len);
+	}
+
+	btrfs_mark_buffer_dirty(path->nodes[0]);
+	btrfs_free_path(path);
+
+	btrfs_inherit_iflags(inode, dir);
+
+	if (S_ISREG(mode)) {
+		if (btrfs_test_opt(root, NODATASUM))
+			BTRFS_I(inode)->flags |= BTRFS_INODE_NODATASUM;
+		if (btrfs_test_opt(root, NODATACOW))
+			BTRFS_I(inode)->flags |= BTRFS_INODE_NODATACOW |
+				BTRFS_INODE_NODATASUM;
+	}
+
+	inode_tree_add(inode);
+
+	trace_btrfs_inode_new(inode);
+	btrfs_set_inode_last_trans(trans, inode);
+
+	btrfs_update_root_times(trans, root);
+
+	ret = btrfs_inode_inherit_props(trans, inode, dir);
+	if (ret)
+		btrfs_err(root->fs_info,
+			  "error inheriting props for ino %llu (root %llu): %d",
+			  btrfs_ino(inode), root->root_key.objectid, ret);
+
+	return inode;
+
+fail_unlock:
+	unlock_new_inode(inode);
+fail:
+	if (dir && name)
+		BTRFS_I(dir)->index_cnt--;
+	btrfs_free_path(path);
+	iput(inode);
+	return ERR_PTR(ret);
+}
+
+/*
+ * utility function to add 'inode' into 'parent_inode' with
+ * a give name and a given sequence number.
+ * if 'add_backref' is true, also insert a backref from the
+ * inode to the parent directory.
+ */
+int btrfs_add_link(struct btrfs_trans_handle *trans,
+		   struct inode *parent_inode, struct inode *inode,
+		   const char *name, int name_len, int add_backref, u64 index)
+{
+	int ret = 0;
+	struct btrfs_key key;
+	struct btrfs_root *root = BTRFS_I(parent_inode)->root;
+	u64 ino = btrfs_ino(inode);
+	u64 parent_ino = btrfs_ino(parent_inode);
+
+	if (unlikely(ino == BTRFS_FIRST_FREE_OBJECTID)) {
+		memcpy(&key, &BTRFS_I(inode)->root->root_key, sizeof(key));
+	} else {
+		key.objectid = ino;
+		key.type = BTRFS_INODE_ITEM_KEY;
+		key.offset = 0;
+	}
+
+	if (unlikely(ino == BTRFS_FIRST_FREE_OBJECTID)) {
+		ret = btrfs_add_root_ref(trans, root->fs_info->tree_root,
+					 key.objectid, root->root_key.objectid,
+					 parent_ino, index, name, name_len);
+	} else if (add_backref) {
+		ret = btrfs_insert_inode_ref(trans, root, name, name_len, ino,
+					     parent_ino, index);
+	}
+
+	/* Nothing to clean up yet */
+	if (ret)
+		return ret;
+
+	ret = btrfs_insert_dir_item(trans, root, name, name_len,
+				    parent_inode, &key,
+				    btrfs_inode_type(inode), index);
+	if (ret == -EEXIST || ret == -EOVERFLOW)
+		goto fail_dir_item;
+	else if (ret) {
+		btrfs_abort_transaction(trans, root, ret);
+		return ret;
+	}
+
+	btrfs_i_size_write(parent_inode, parent_inode->i_size +
+			   name_len * 2);
+	inode_inc_iversion(parent_inode);
+	parent_inode->i_mtime = parent_inode->i_ctime = CURRENT_TIME;
+	ret = btrfs_update_inode(trans, root, parent_inode);
+	if (ret)
+		btrfs_abort_transaction(trans, root, ret);
+	return ret;
+
+fail_dir_item:
+	if (unlikely(ino == BTRFS_FIRST_FREE_OBJECTID)) {
+		u64 local_index;
+		int err;
+		err = btrfs_del_root_ref(trans, root->fs_info->tree_root,
+				 key.objectid, root->root_key.objectid,
+				 parent_ino, &local_index, name, name_len);
+
+	} else if (add_backref) {
+		u64 local_index;
+		int err;
+
+		err = btrfs_del_inode_ref(trans, root, name, name_len,
+					  ino, parent_ino, &local_index);
+	}
+	return ret;
+}
+
+static int btrfs_add_nondir(struct btrfs_trans_handle *trans,
+			    struct inode *dir, struct dentry *dentry,
+			    struct inode *inode, int backref, u64 index)
+{
+	int err = btrfs_add_link(trans, dir, inode,
+				 dentry->d_name.name, dentry->d_name.len,
+				 backref, index);
+	if (err > 0)
+		err = -EEXIST;
+	return err;
+}
+
+static int btrfs_mknod(struct inode *dir, struct dentry *dentry,
+			umode_t mode, dev_t rdev)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	struct inode *inode = NULL;
+	int err;
+	int drop_inode = 0;
+	u64 objectid;
+	u64 index = 0;
+
+	/*
+	 * 2 for inode item and ref
+	 * 2 for dir items
+	 * 1 for xattr if selinux is on
+	 */
+	trans = btrfs_start_transaction(root, 5);
+	if (IS_ERR(trans))
+		return PTR_ERR(trans);
+
+	err = btrfs_find_free_ino(root, &objectid);
+	if (err)
+		goto out_unlock;
+
+	inode = btrfs_new_inode(trans, root, dir, dentry->d_name.name,
+				dentry->d_name.len, btrfs_ino(dir), objectid,
+				mode, &index);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		goto out_unlock;
+	}
+
+	/*
+	* If the active LSM wants to access the inode during
+	* d_instantiate it needs these. Smack checks to see
+	* if the filesystem supports xattrs by looking at the
+	* ops vector.
+	*/
+	inode->i_op = &btrfs_special_inode_operations;
+	init_special_inode(inode, inode->i_mode, rdev);
+
+	err = btrfs_init_inode_security(trans, inode, dir, &dentry->d_name);
+	if (err)
+		goto out_unlock_inode;
+
+	err = btrfs_add_nondir(trans, dir, dentry, inode, 0, index);
+	if (err) {
+		goto out_unlock_inode;
+	} else {
+		btrfs_update_inode(trans, root, inode);
+		d_instantiate_new(dentry, inode);
+	}
+
+out_unlock:
+	btrfs_end_transaction(trans, root);
+	btrfs_balance_delayed_items(root);
+	btrfs_btree_balance_dirty(root);
+	if (drop_inode) {
+		inode_dec_link_count(inode);
+		iput(inode);
+	}
+	return err;
+
+out_unlock_inode:
+	drop_inode = 1;
+	unlock_new_inode(inode);
+	goto out_unlock;
+
+}
+
+static int btrfs_create(struct inode *dir, struct dentry *dentry,
+			umode_t mode, bool excl)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	struct inode *inode = NULL;
+	int drop_inode_on_err = 0;
+	int err;
+	u64 objectid;
+	u64 index = 0;
+
+	/*
+	 * 2 for inode item and ref
+	 * 2 for dir items
+	 * 1 for xattr if selinux is on
+	 */
+	trans = btrfs_start_transaction(root, 5);
+	if (IS_ERR(trans))
+		return PTR_ERR(trans);
+
+	err = btrfs_find_free_ino(root, &objectid);
+	if (err)
+		goto out_unlock;
+
+	inode = btrfs_new_inode(trans, root, dir, dentry->d_name.name,
+				dentry->d_name.len, btrfs_ino(dir), objectid,
+				mode, &index);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		goto out_unlock;
+	}
+	drop_inode_on_err = 1;
+	/*
+	* If the active LSM wants to access the inode during
+	* d_instantiate it needs these. Smack checks to see
+	* if the filesystem supports xattrs by looking at the
+	* ops vector.
+	*/
+	inode->i_fop = &btrfs_file_operations;
+	inode->i_op = &btrfs_file_inode_operations;
+	inode->i_mapping->a_ops = &btrfs_aops;
+
+	err = btrfs_init_inode_security(trans, inode, dir, &dentry->d_name);
+	if (err)
+		goto out_unlock_inode;
+
+	err = btrfs_update_inode(trans, root, inode);
+	if (err)
+		goto out_unlock_inode;
+
+	err = btrfs_add_nondir(trans, dir, dentry, inode, 0, index);
+	if (err)
+		goto out_unlock_inode;
+
+	BTRFS_I(inode)->io_tree.ops = &btrfs_extent_io_ops;
+	d_instantiate_new(dentry, inode);
+
+out_unlock:
+	btrfs_end_transaction(trans, root);
+	if (err && drop_inode_on_err) {
+		inode_dec_link_count(inode);
+		iput(inode);
+	}
+	btrfs_balance_delayed_items(root);
+	btrfs_btree_balance_dirty(root);
+	return err;
+
+out_unlock_inode:
+	unlock_new_inode(inode);
+	goto out_unlock;
+
+}
+
+static int btrfs_link(struct dentry *old_dentry, struct inode *dir,
+		      struct dentry *dentry)
+{
+	struct btrfs_trans_handle *trans = NULL;
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	struct inode *inode = d_inode(old_dentry);
+	u64 index;
+	int err;
+	int drop_inode = 0;
+
+	/* do not allow sys_link's with other subvols of the same device */
+	if (root->objectid != BTRFS_I(inode)->root->objectid)
+		return -EXDEV;
+
+	if (inode->i_nlink >= BTRFS_LINK_MAX)
+		return -EMLINK;
+
+	err = btrfs_set_inode_index(dir, &index);
+	if (err)
+		goto fail;
+
+	/*
+	 * 2 items for inode and inode ref
+	 * 2 items for dir items
+	 * 1 item for parent inode
+	 */
+	trans = btrfs_start_transaction(root, 5);
+	if (IS_ERR(trans)) {
+		err = PTR_ERR(trans);
+		trans = NULL;
+		goto fail;
+	}
+
+	/* There are several dir indexes for this inode, clear the cache. */
+	BTRFS_I(inode)->dir_index = 0ULL;
+	inc_nlink(inode);
+	inode_inc_iversion(inode);
+	inode->i_ctime = CURRENT_TIME;
+	ihold(inode);
+	set_bit(BTRFS_INODE_COPY_EVERYTHING, &BTRFS_I(inode)->runtime_flags);
+
+	err = btrfs_add_nondir(trans, dir, dentry, inode, 1, index);
+
+	if (err) {
+		drop_inode = 1;
+	} else {
+		struct dentry *parent = dentry->d_parent;
+		err = btrfs_update_inode(trans, root, inode);
+		if (err)
+			goto fail;
+		if (inode->i_nlink == 1) {
+			/*
+			 * If new hard link count is 1, it's a file created
+			 * with open(2) O_TMPFILE flag.
+			 */
+			err = btrfs_orphan_del(trans, inode);
+			if (err)
+				goto fail;
+		}
+		d_instantiate(dentry, inode);
+		btrfs_log_new_name(trans, inode, NULL, parent);
+	}
+
+	btrfs_balance_delayed_items(root);
+fail:
+	if (trans)
+		btrfs_end_transaction(trans, root);
+	if (drop_inode) {
+		inode_dec_link_count(inode);
+		iput(inode);
+	}
+	btrfs_btree_balance_dirty(root);
+	return err;
+}
+
+static int btrfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+	struct inode *inode = NULL;
+	struct btrfs_trans_handle *trans;
+	struct btrfs_root *root = BTRFS_I(dir)->root;
+	int err = 0;
+	int drop_on_err = 0;
+	u64 objectid = 0;
+	u64 index = 0;
+
+	/*
+	 * 2 items for inode and ref
+	 * 2 items for dir items
+	 * 1 for xattr if selinux is on
+	 */
+	trans = btrfs_start_transaction(root, 5);
+	if (IS_ERR(trans))
+		return PTR_ERR(trans);
+
+	err = btrfs_find_free_ino(root, &objectid);
+	if (err)
+		goto out_fail;
+
+	inode = btrfs_new_inode(trans, root, dir, dentry->d_name.name,
+				dentry->d_name.len, btrfs_ino(dir), objectid,
+				S_IFDIR | mode, &index);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		goto out_fail;
+	}
+
+	drop_on_err = 1;
+	/* these must be set before we unlock the inode */
+	inode->i_op = &btrfs_dir_inode_operations;
+	inode->i_fop = &btrfs_dir_file_operations;
+
+	err = btrfs_init_inode_security(trans, inode, dir, &dentry->d_name);
+	if (err)
+		goto out_fail_inode;
+
+	btrfs_i_size_write(inode, 0);
+	err = btrfs_update_inode(trans, root, inode);
+	if (err)
+		goto out_fail_inode;
+
+	err = btrfs_add_link(trans, dir, inode, dentry->d_name.name,
+			     dentry->d_name.len, 0, index);
+	if (err)
+		goto out_fail_inode;
+
+	d_instantiate_new(dentry, inode);
+	drop_on_err = 0;
+
+out_fail:
+	btrfs_end_transaction(trans, root);
+	if (drop_on_err) {
+		inode_dec_link_count(inode);
+		iput(inode);
+	}
+	btrfs_balance_delayed_items(root);
+	btrfs_btree_balance_dirty(root);
+	return err;
+
+out_fail_inode:
+	unlock_new_inode(inode);
+	goto out_fail;
+}
+
+/* Find next extent map of a given extent map, caller needs to ensure locks */
+static struct extent_map *next_extent_map(struct extent_map *em)
+{
+	struct rb_node *next;
+
+	next = rb_next(&em->rb_node);
+	if (!next)
+		return NULL;
+	return container_of(next, struct extent_map, rb_node);
+}
+
+static struct extent_map *prev_extent_map(struct extent_map *em)
+{
+	struct rb_node *prev;
+
+	prev = rb_prev(&em->rb_node);
+	if (!prev)
+		return NULL;
+	return container_of(prev, struct extent_map, rb_node);
+}
+
+/* helper for btfs_get_extent.  Given an existing extent in the tree,
+ * the existing extent is the nearest extent to map_start,
+ * and an extent that you want to insert, deal with overlap and insert
+ * the best fitted new extent into the tree.
+ */
+static int merge_extent_mapping(struct extent_map_tree *em_tree,
+				struct extent_map *existing,
+				struct extent_map *em,
+				u64 map_start)
+{
+	struct extent_map *prev;
+	struct extent_map *next;
+	u64 start;
+	u64 end;
+	u64 start_diff;
+
+	BUG_ON(map_start < em->start || map_start >= extent_map_end(em));
+
+	if (existing->start > map_start) {
+		next = existing;
+		prev = prev_extent_map(next);
+	} else {
+		prev = existing;
+		next = next_extent_map(prev);
+	}
+
+	start = prev ? extent_map_end(prev) : em->start;
+	start = max_t(u64, start, em->start);
+	end = next ? next->start : extent_map_end(em);
+	end = min_t(u64, end, extent_map_end(em));
+	start_diff = start - em->start;
+	em->start = start;
+	em->len = end - start;
+	if (em->block_start < EXTENT_MAP_LAST_BYTE &&
+	    !test_bit(EXTENT_FLAG_COMPRESSED, &em->flags)) {
+		em->block_start += start_diff;
+		em->block_len -= start_diff;
+	}
+	return add_extent_mapping(em_tree, em, 0);
+}
+
+static noinline int uncompress_inline(struct btrfs_path *path,
+				      struct inode *inode, struct page *page,
+				      size_t pg_offset, u64 extent_offset,
+				      struct btrfs_file_extent_item *item)
+{
+	int ret;
+	struct extent_buffer *leaf = path->nodes[0];
+	char *tmp;
+	size_t max_size;
+	unsigned long inline_size;
+	unsigned long ptr;
+	int compress_type;
+
+	WARN_ON(pg_offset != 0);
+	compress_type = btrfs_file_extent_compression(leaf, item);
+	max_size = btrfs_file_extent_ram_bytes(leaf, item);
+	inline_size = btrfs_file_extent_inline_item_len(leaf,
+					btrfs_item_nr(path->slots[0]));
+	tmp = kmalloc(inline_size, GFP_NOFS);
+	if (!tmp)
+		return -ENOMEM;
+	ptr = btrfs_file_extent_inline_start(item);
+
+	read_extent_buffer(leaf, tmp, ptr, inline_size);
+
+	max_size = min_t(unsigned long, PAGE_CACHE_SIZE, max_size);
+	ret = btrfs_decompress(compress_type, tmp, page,
+			       extent_offset, inline_size, max_size);
+
+	/*
+	 * decompression code contains a memset to fill in any space between the end
+	 * of the uncompressed data and the end of max_size in case the decompressed
+	 * data ends up shorter than ram_bytes.  That doesn't cover the hole between
+	 * the end of an inline extent and the beginning of the next block, so we
+	 * cover that region here.
+	 */
+
+	if (max_size + pg_offset < PAGE_SIZE) {
+		char *map = kmap(page);
+		memset(map + pg_offset + max_size, 0, PAGE_SIZE - max_size - pg_offset);
+		kunmap(page);
+	}
+	kfree(tmp);
+	return ret;
+}
+
+/*
+ * a bit scary, this does extent mapping from logical file offset to the disk.
+ * the ugly parts come from merging extents from the disk with the in-ram
+ * representation.  This gets more complex because of the data=ordered code,
+ * where the in-ram extents might be locked pending data=ordered completion.
+ *
+ * This also copies inline extents directly into the page.
+ */
+
+struct extent_map *btrfs_get_extent(struct inode *inode, struct page *page,
+				    size_t pg_offset, u64 start, u64 len,
+				    int create)
+{
+	int ret;
+	int err = 0;
+	u64 extent_start = 0;
+	u64 extent_end = 0;
+	u64 objectid = btrfs_ino(inode);
+	u32 found_type;
+	struct btrfs_path *path = NULL;
+	struct btrfs_root *root = BTRFS_I(inode)->root;
+	struct btrfs_file_extent_item *item;
+	struct extent_buffer *leaf;
+	struct btrfs_key found_key;
+	struct extent_map *em = NULL;
+	struct extent_map_tree *em_tree = &BTRFS_I(inode)->extent_tree;
+	struct extent_io_tree *io_tree = &BTRFS_I(inode)->io_tree;
+	struct btrfs_trans_handle *trans = NULL;
+	const bool new_inline = !page || create;
+
+again:
+	read_lock(&em_tree->lock);
+	em = lookup_extent_mapping(em_tree, start, len);
+	if (em)
+		em->bdev = root->fs_info->fs_devices->latest_bdev;
+	read_unlock(&em_tree->lock);
+
+	if (em) {
+		if (em->start > start || em->start + em->len <= start)
+			free_extent_map(em);
+		else if (em->block_start == EXTENT_MAP_INLINE && page)
+			free_extent_map(em);
+		else
+			goto out;
+	}
+	em = alloc_extent_map();
+	if (!em) {
+		err = -ENOMEM;
+		goto out;
+	}
+	em->bdev = root->fs_info->fs_devices->latest_bdev;
+	em->start = EXTENT_MAP_HOLE;
+	em->orig_start = EXTENT_MAP_HOLE;
+	em->len = (u64)-1;
+	em->block_len = (u64)-1;
+
+	if (!path) {
+		path = btrfs_alloc_path();
+		if (!path) {
+			err = -ENOMEM;
+			goto out;
+		}
+		/*
+		 * Chances are we'll be called again, so go ahead and do
+		 * readahead
+		 */
+		path->reada = 1;
+	}
+
+	ret = btrfs_lookup_file_extent(trans, root, path,
+				       objectid, start, trans != NULL);
+	if (ret < 0) {
+		err = ret;
+		goto out;
+	}
+
 	if (ret != 0) {
-		input_err(true, &info->client->dev, "%s: failed to read:%d\n",
-					__func__, ret);
-		return -EINVAL;
-	}
-	input_dbg(true, &info->client->dev, "%s: %d\n", __func__, data);
-
-	if (data != 0 && data != 1) {
-		input_err(true, &info->client->dev, "%s: wrong cmd %x\n",
-			__func__, data);
-		return size;
+		if (path->slots[0] == 0)
+			goto not_found;
+		path->slots[0]--;
 	}
 
-	ret = info->board->led_power(info, (bool)data);
-	if (ret) {
-		input_err(true, &info->client->dev, "%s: Error turn on led %d\n",
-			__func__, ret);
+	leaf = path->nodes[0];
+	item = btrfs_item_ptr(leaf, path->slots[0],
+			      struct btrfs_file_extent_item);
+	/* are we inside the extent that was found? */
+	btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+	found_type = found_key.type;
+	if (found_key.objectid != objectid ||
+	    found_type != BTRFS_EXTENT_DATA_KEY) {
+		/*
+		 * If we backup past the first extent we want to move forward
+		 * and see if there is an extent in front of us, otherwise we'll
+		 * say there is a hole for our whole search range which can
+		 * cause problems.
+		 */
+		extent_end = start;
+		goto next;
+	}
 
+	found_type = btrfs_file_extent_type(leaf, item);
+	extent_start = found_key.offset;
+	if (found_type == BTRFS_FILE_EXTENT_REG ||
+	    found_type == BTRFS_FILE_EXTENT_PREALLOC) {
+		/* Only regular file could have regular/prealloc extent */
+		if (!S_ISREG(inode->i_mode)) {
+			err = -EUCLEAN;
+			btrfs_crit(root->fs_info,
+		"regular/prealloc extent found for non-regular inode %llu",
+				   btrfs_ino(inode));
+			goto out;
+		}
+		extent_end = extent_start +
+		       btrfs_file_extent_num_bytes(leaf, item);
+	} else if (found_type == BTRFS_FILE_EXTENT_INLINE) {
+		size_t size;
+		size = btrfs_file_extent_inline_len(leaf, path->slots[0], item);
+		extent_end = ALIGN(extent_start + size, root->sectorsize);
+	}
+next:
+	if (start >= extent_end) {
+		path->slots[0]++;
+		if (path->slots[0] >= btrfs_header_nritems(leaf)) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0) {
+				err = ret;
+				goto out;
+			}
+			if (ret > 0)
+				goto not_found;
+			leaf = path->nodes[0];
+		}
+		btrfs_item_key_to_cpu(leaf, &found_key, path->slots[0]);
+		if (found_key.objectid != objectid ||
+		    found_key.type != BTRFS_EXTENT_DATA_KEY)
+			goto not_found;
+		if (start + len <= found_key.offset)
+			goto not_found;
+		if (start > found_key.offset)
+			goto next;
+		em->start = start;
+		em->orig_start = start;
+		em->len = found_key.offset - start;
+		goto not_found_em;
+	}
+
+	btrfs_extent_item_to_extent_map(inode, path, item, new_inline, em);
+
+	if (found_type == BTRFS_FILE_EXTENT_REG ||
+	    found_type == BTRFS_FILE_EXTENT_PREALLOC) {
+		goto insert;
+	} else if (found_type == BTRFS_FILE_EXTENT_INLINE) {
+		unsigned long ptr;
+		char *map;
+		size_t size;
+		size_t extent_offset;
+		size_t copy_size;
+
+		if (new_inline)
+			goto out;
+
+		size = btrfs_file_extent_inline_len(leaf, path->slots[0], item);
+		extent_offset = page_offset(page) + pg_offset - extent_start;
+		copy_size = min_t(u64, PAGE_CACHE_SIZE - pg_offset,
+				size - extent_offset);
+		em->start = extent_start + extent_offset;
+		em->len = ALIGN(copy_size, root->sectorsize);
+		em->orig_block_len = em->len;
+		em->orig_start = em->start;
+		ptr = btrfs_file_extent_inline_start(item) + extent_offset;
+		if (create == 0 && !PageUptodate(page)) {
+			if (btrfs_file_extent_compression(leaf, item) !=
+			    BTRFS_COMPRESS_NONE) {
+				ret = uncompress_inline(path, inode, page,
+							pg_offset,
+							extent_offset, item);
+				if (ret) {
+					err = ret;
+					goto out;
+				}
+			} else {
+				map = kmap(page);
+				read_extent_buffer(leaf, map + pg_offset, ptr,
+						   copy_size);
+				if (pg_offset + copy_size < PAGE_CACHE_SIZE) {
+					memset(map + pg_offset + copy_size, 0,
+					       PAGE_CACHE_SIZE - pg_offset -
+					       copy_size);
+				}
+				kunmap(page);
+			}
+			flush_dcache_page(page);
+		} else if (create && PageUptodate(page)) {
+			BUG();
+			if (!trans) {
+				kunmap(page);
+				free_extent_map(em);
+				em = NULL;
+
+				btrfs_release_path(path);
+				trans = btrfs_join_transaction(root);
+
+				if (IS_ERR(trans))
+					return ERR_CAST(trans);
+				goto again;
+			}
+			map = kmap(page);
+			write_extent_buffer(leaf, map + pg_offset, ptr,
+					    copy_size);
+			kunmap(page);
+			btrfs_mark_buffer_dirty(leaf);
+		}
+		set_extent_uptodate(io_tree, em->start,
+				    extent_map_end(em) - 1, NULL, GFP_NOFS);
+		goto insert;
+	}
+not_found:
+	em->start = start;
+	em->orig_start = start;
+	em->len = len;
+not_found_em:
+	em->block_start = EXTENT_MAP_HOLE;
+	set_bit(EXTENT_FLAG_VACANCY, &em->flags);
+insert:
+	btrfs_release_path(path);
+	if (em->start > start || extent_map_end(em) <= start) {
+		btrfs_err(root->fs_info, "bad extent! em: [%llu %llu] passed [%llu %llu]",
+			em->start, em->len, start, len);
+		err = -EIO;
 		goto out;
 	}
-	msleep(30);
 
+	err = 0;
+	write_lock(&em_tree->lock);
+	ret = add_extent_mapping(em_tree, em, 0);
+	/* it is possible that someone inserted the extent into the tree
+	 * while we had the lock dropped.  It is also possible that
+	 * an overlapping map exists in the tree
+	 */
+	if (ret == -EEXIST) {
+		struct extent_map *existing;
+
+		ret = 0;
+
+		existing = search_extent_mapping(em_tree, start, len);
+		/*
+		 * existing will always be non-NULL, since there must be
+		 * extent causing the -EEXIST.
+		 */
+		if (start >= extent_map_end(existing) ||
+		    start <= existing->start) {
+			/*
+			 * The existing extent map is the one nearest to
+			 * the [start, start + len) range which overlaps
+			 */
+			err = merge_extent_mapping(em_tree, existing,
+						   em, start);
+			free_extent_map(existing);
+			if (err) {
+				free_extent_map(em);
+				em = NULL;
+			}
+		} else {
+			free_extent_map(em);
+			em = existing;
+			err = 0;
+		}
+	}
+	write_unlock(&em_tree->lock);
 out:
-	return size;
+
+	trace_btrfs_get_extent(root, em);
+
+	btrfs_free_path(path);
+	if (trans) {
+		ret = btrfs_end_transaction(trans, root);
+		if (!err)
+			err = ret;
+	}
+	if (err) {
+		free_extent_map(em);
+		return ERR_PTR(err);
+	}
+	BUG_ON(!em); /* Error is always set */
+	return em;
 }
 
-static DEVICE_ATTR(brightness, S_IRUGO | S_IWUSR | S_IWGRP, NULL, fts_touchkey_led_control);
-static DEVICE_ATTR(touchkey_recent, S_IRUGO, touchkey_recent_strength, NULL);
-static DEVICE_ATTR(touchkey_back, S_IRUGO, touchkey_back_strength, NULL);
-static DEVICE_ATTR(touchkey_recent_raw, S_IRUGO, touchkey_recent_raw, NULL);
-static DEVICE_ATTR(touchkey_back_raw, S_IRUGO, touchkey_back_raw, NULL);
-static DEVICE_ATTR(touchkey_threshold, S_IRUGO, touchkey_threshold, NULL);
+struct extent_map *btrfs_get_extent_fiemap(struct inode *inode, struct page *page,
+					   size_t pg_offset, u64 start, u64 len,
+					   int create)
+{
+	struct extent_map *em;
+	struct extent_map *hole_em = NULL;
+	u64 range_start = start;
+	u64 end;
+	u64 found;
+	u64 found_end;
+	int err = 0;
 
-static struct attribute *sec_touchkey_factory_attributes[] = {
-	&dev_attr_touchkey_recent.attr,
-	&dev_attr_touchkey_back.attr,
-	&dev_attr_touchkey_recent_raw.attr,
-	&dev_attr_touchkey_back_raw.attr,
-	&dev_attr_touchkey_threshold.attr,
-	&dev_attr_brightness.attr,
-	NULL,
-};
+	em = btrfs_get_extent(inode, page, pg_offset, start, len, create);
+	if (IS_ERR(em))
+		return em;
+	if (em) {
+		/*
+		 * if our em maps to
+		 * -  a hole or
+		 * -  a pre-alloc extent,
+		 * there might actually be delalloc bytes behind it.
+		 */
+		if (em->block_start != EXTENT_MAP_HOLE &&
+		    !test_bit(EXTENT_FLAG_PREALLOC, &em->flags))
+			return em;
+		else
+			hole_em = em;
+	}
 
-static struct attribute_group sec_touchkey_factory_attr_group = {
-	.attrs = sec_touchkey_factory_attributes,
-};
-#endif
+	/* check to see if we've wrapped (len == -1 or similar) */
+	end = start + len;
+	if (end < start)
+		end = (u64)-1;
+	else
+		end -= 1;
 
-#endif
+	em = NULL;
+
+	/* ok, we didn't find anything, lets look for delalloc */
+	found = count_range_bits(&BTRFS_I(inode)->io_tree, &range_start,
+				 end, len, EXTENT_DELALLOC, 1);
+	found_end = range_start + found;
+	if (found_end < range_start)
+		found_end = (u64)-1;
+
+	/*
+	 * we didn't find anything useful, return
+	 * the original results from get_extent()
+	 */
+	if (range_start > end || found_end <= start) {
+		em = hole_em;
+		hole_em = NULL;
+		goto out;
+	}
+
+	/* adjust the range_start to make sure it doesn't
+	 * go backwards from the start they passed in
+	 */
+	range_start = max(start, range_start);
+	found = found_end - range_start;
+
+	if (found > 0) {
+		u64 hole_start = start;
+		u64 hole_len = len;
+
+		em = alloc_extent_map();
+		if (!em) {
+			err = -ENOMEM;
+			goto out;
+		}
+		/*
+		 * when btrfs_get_extent can't find anything it
+		 * returns one huge hole
+		 *
+		 * ma

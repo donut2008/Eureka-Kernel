@@ -1,82 +1,24 @@
-/*
- * Copyright (C) 2011 Google, Inc.
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
-
-#include <linux/export.h>
-#include <linux/kernel.h>
-#include <linux/usb.h>
-#include <linux/io.h>
-#include <linux/usb/otg.h>
-#include <linux/usb/ulpi.h>
-
-#define ULPI_VIEW_WAKEUP	(1 << 31)
-#define ULPI_VIEW_RUN		(1 << 30)
-#define ULPI_VIEW_WRITE		(1 << 29)
-#define ULPI_VIEW_READ		(0 << 29)
-#define ULPI_VIEW_ADDR(x)	(((x) & 0xff) << 16)
-#define ULPI_VIEW_DATA_READ(x)	(((x) >> 8) & 0xff)
-#define ULPI_VIEW_DATA_WRITE(x)	((x) & 0xff)
-
-static int ulpi_viewport_wait(void __iomem *view, u32 mask)
-{
-	unsigned long usec = 2000;
-
-	while (usec--) {
-		if (!(readl(view) & mask))
-			return 0;
-
-		udelay(1);
-	}
-
-	return -ETIMEDOUT;
-}
-
-static int ulpi_viewport_read(struct usb_phy *otg, u32 reg)
-{
-	int ret;
-	void __iomem *view = otg->io_priv;
-
-	writel(ULPI_VIEW_WAKEUP | ULPI_VIEW_WRITE, view);
-	ret = ulpi_viewport_wait(view, ULPI_VIEW_WAKEUP);
-	if (ret)
-		return ret;
-
-	writel(ULPI_VIEW_RUN | ULPI_VIEW_READ | ULPI_VIEW_ADDR(reg), view);
-	ret = ulpi_viewport_wait(view, ULPI_VIEW_RUN);
-	if (ret)
-		return ret;
-
-	return ULPI_VIEW_DATA_READ(readl(view));
-}
-
-static int ulpi_viewport_write(struct usb_phy *otg, u32 val, u32 reg)
-{
-	int ret;
-	void __iomem *view = otg->io_priv;
-
-	writel(ULPI_VIEW_WAKEUP | ULPI_VIEW_WRITE, view);
-	ret = ulpi_viewport_wait(view, ULPI_VIEW_WAKEUP);
-	if (ret)
-		return ret;
-
-	writel(ULPI_VIEW_RUN | ULPI_VIEW_WRITE | ULPI_VIEW_DATA_WRITE(val) |
-						 ULPI_VIEW_ADDR(reg), view);
-
-	return ulpi_viewport_wait(view, ULPI_VIEW_RUN);
-}
-
-struct usb_phy_io_ops ulpi_viewport_access_ops = {
-	.read	= ulpi_viewport_read,
-	.write	= ulpi_viewport_write,
-};
-EXPORT_SYMBOL_GPL(ulpi_viewport_access_ops);
+ROL__COMPRESSED_CHANNEL_COUNT__SHIFT 0x4
+#define AZALIA_F0_CODEC_RESYNC_FIFO_CONTROL__RESYNC_FIFO_STARTUP_KEEPOUT_WINDOW_MASK 0x3f
+#define AZALIA_F0_CODEC_RESYNC_FIFO_CONTROL__RESYNC_FIFO_STARTUP_KEEPOUT_WINDOW__SHIFT 0x0
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_GROUP_TYPE__AZALIA_CODEC_FUNCTION_PARAMETER_GROUP_TYPE_MASK 0xffffffff
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_GROUP_TYPE__AZALIA_CODEC_FUNCTION_PARAMETER_GROUP_TYPE__SHIFT 0x0
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_RATE_CAPABILITIES_MASK 0xfff
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_RATE_CAPABILITIES__SHIFT 0x0
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_BIT_CAPABILITIES_MASK 0x1f0000
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_BIT_CAPABILITIES__SHIFT 0x10
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS__AZALIA_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS_MASK 0xffffffff
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS__AZALIA_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS__SHIFT 0x0
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__AZALIA_CODEC_FUNCTION_PARAMETER_POWER_STATES_MASK 0x3fffffff
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__AZALIA_CODEC_FUNCTION_PARAMETER_POWER_STATES__SHIFT 0x0
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__CLKSTOP_MASK 0x40000000
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__CLKSTOP__SHIFT 0x1e
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__EPSS_MASK 0x80000000
+#define AZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES__EPSS__SHIFT 0x1f
+#define AZALIA_F0_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_SET_MASK 0xf
+#define AZALIA_F0_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_SET__SHIFT 0x0
+#define AZALIA_F0_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_ACT_MASK 0xf0
+#define AZALIA_F0_CODEC_FUNCTION_CONTROL_POWER_STATE__POWER_STATE_ACT__SHIFT 0x4
+#define AZALIA_F0_CODEC_FUNCTION_CONTROL_POWER_STATE__CLKSTOPOK_MASK 0x200
+#define AZALIA_F0_CODEC_FUNCTION_CONTROL_POWER_STATE__CLKSTOPOK__SHIFT 0x9
+#define AZALIA_F0_

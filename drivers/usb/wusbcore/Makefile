@@ -1,25 +1,8 @@
-ccflags-$(CONFIG_USB_WUSB_CBAF_DEBUG) := -DDEBUG
-
-obj-$(CONFIG_USB_WUSB)		+= wusbcore.o
-obj-$(CONFIG_USB_HWA_HCD)	+= wusb-wa.o
-obj-$(CONFIG_USB_WUSB_CBAF)	+= wusb-cbaf.o
-
-
-wusbcore-y :=		\
-	crypto.o	\
-	devconnect.o	\
-	dev-sysfs.o	\
-	mmc.o		\
-	pal.o		\
-	rh.o		\
-	reservation.o	\
-	security.o	\
-	wusbhc.o
-
-wusb-cbaf-y := cbaf.o
-
-wusb-wa-y :=		\
-	wa-hc.o		\
-	wa-nep.o	\
-	wa-rpipe.o	\
-	wa-xfer.o
+NTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT__SHIFT 0x9
+#define PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN_MASK 0x400
+#define PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN__SHIFT 0xa
+#define PCIE_LC_CNTL3__LC_RCVR_DET_EN_OVERRIDE_MASK 0x800
+#define PCIE_LC_CNTL3__LC_RCVR_DET_EN_OVERRIDE__SHIFT 0xb
+#define PCIE_LC_CNTL3__LC_EHP_RX_PHY_CMD_MASK 0x3000
+#define PCIE_LC_CNTL3__LC_EHP_RX_PHY_CMD__SHIFT 0xc
+#de

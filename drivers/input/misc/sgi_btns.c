@@ -1,164 +1,161 @@
-/*
- *  SGI Volume Button interface driver
- *
- *  Copyright (C) 2008  Thomas Bogendoerfer <tsbogend@alpha.franken.de>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
- */
-#include <linux/input-polldev.h>
-#include <linux/ioport.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
+t_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
 
-#ifdef CONFIG_SGI_IP22
-#include <asm/sgi/ioc.h>
-
-static inline u8 button_status(void)
-{
-	u8 status;
-
-	status = readb(&sgioc->panel) ^ 0xa0;
-	return ((status & 0x80) >> 6) | ((status & 0x20) >> 5);
-}
-#endif
-
-#ifdef CONFIG_SGI_IP32
-#include <asm/ip32/mace.h>
-
-static inline u8 button_status(void)
-{
-	u64 status;
-
-	status = readq(&mace->perif.audio.control);
-	writeq(status & ~(3U << 23), &mace->perif.audio.control);
-
-	return (status >> 23) & 3;
-}
-#endif
-
-#define BUTTONS_POLL_INTERVAL	30	/* msec */
-#define BUTTONS_COUNT_THRESHOLD	3
-
-static const unsigned short sgi_map[] = {
-	KEY_VOLUMEDOWN,
-	KEY_VOLUMEUP
-};
-
-struct buttons_dev {
-	struct input_polled_dev *poll_dev;
-	unsigned short keymap[ARRAY_SIZE(sgi_map)];
-	int count[ARRAY_SIZE(sgi_map)];
-};
-
-static void handle_buttons(struct input_polled_dev *dev)
-{
-	struct buttons_dev *bdev = dev->private;
-	struct input_dev *input = dev->input;
-	u8 status;
-	int i;
-
-	status = button_status();
-
-	for (i = 0; i < ARRAY_SIZE(bdev->keymap); i++) {
-		if (status & (1U << i)) {
-			if (++bdev->count[i] == BUTTONS_COUNT_THRESHOLD) {
-				input_event(input, EV_MSC, MSC_SCAN, i);
-				input_report_key(input, bdev->keymap[i], 1);
-				input_sync(input);
-			}
-		} else {
-			if (bdev->count[i] >= BUTTONS_COUNT_THRESHOLD) {
-				input_event(input, EV_MSC, MSC_SCAN, i);
-				input_report_key(input, bdev->keymap[i], 0);
-				input_sync(input);
-			}
-			bdev->count[i] = 0;
-		}
-	}
+out:
+	data->flip_mode = flip_mode_on;
+	return count;
 }
 
-static int sgi_buttons_probe(struct platform_device *pdev)
+#ifdef FEATURE_GRIP_FOR_SAR
+static ssize_t touchkey_sar_enable(struct device *dev,
+		 struct device_attribute *attr, const char *buf,
+		 size_t count)
 {
-	struct buttons_dev *bdev;
-	struct input_polled_dev *poll_dev;
-	struct input_dev *input;
-	int error, i;
+	struct tc300k_data *data = dev_get_drvdata(dev);
+	struct i2c_client *client = data->client;
+	int buff;
+	int ret;
+	bool on;
+	int cmd;
 
-	bdev = kzalloc(sizeof(struct buttons_dev), GFP_KERNEL);
-	poll_dev = input_allocate_polled_device();
-	if (!bdev || !poll_dev) {
-		error = -ENOMEM;
-		goto err_free_mem;
+	ret = sscanf(buf, "%d", &buff);
+	if (ret != 1) {
+		input_err(true, &client->dev, "%s: cmd read err\n", __func__);
+		return count;
 	}
 
-	memcpy(bdev->keymap, sgi_map, sizeof(bdev->keymap));
+	input_info(true, &client->dev, "%s (%d)\n", __func__, buff);
+//return count;	//temp
 
-	poll_dev->private = bdev;
-	poll_dev->poll = handle_buttons;
-	poll_dev->poll_interval = BUTTONS_POLL_INTERVAL;
+	if (!(buff >= 0 && buff <= 3)) {
+		input_err(true, &client->dev, "%s: wrong command(%d)\n",
+				__func__, buff);
+		return count;
+	}
 
-	input = poll_dev->input;
-	input->name = "SGI buttons";
-	input->phys = "sgi/input0";
-	input->id.bustype = BUS_HOST;
-	input->dev.parent = &pdev->dev;
+	/*	sar enable param
+	  *	0	off
+	  *	1	on
+	  *	2	force off
+	  *	3	force off -> on
+	  */
 
-	input->keycode = bdev->keymap;
-	input->keycodemax = ARRAY_SIZE(bdev->keymap);
-	input->keycodesize = sizeof(unsigned short);
+	if (buff == 3) {
+		data->sar_enable_off = 0;
+		input_info(true, &client->dev, 
+				"%s : Power back off _ force off -> on (%d)\n",
+				__func__, data->sar_enable);
+		if (data->sar_enable)
+			buff = 1;
+		else
+			return count;
+	}
 
-	input_set_capability(input, EV_MSC, MSC_SCAN);
-	__set_bit(EV_KEY, input->evbit);
-	for (i = 0; i < ARRAY_SIZE(sgi_map); i++)
-		__set_bit(bdev->keymap[i], input->keybit);
-	__clear_bit(KEY_RESERVED, input->keybit);
+	if (data->sar_enable_off) {
+		if (buff == 1)
+			data->sar_enable = true;
+		else
+			data->sar_enable = false;
+		input_info(true, &client->dev, 
+				"%s skip, Power back off _ force off mode (%d)\n",
+				__func__, data->sar_enable);
+		return count;
+	}
 
-	bdev->poll_dev = poll_dev;
-	platform_set_drvdata(pdev, bdev);
+	if (buff == 1) {
+		on = true;
+		cmd = TC300K_CMD_SAR_ENABLE;
+	} else if (buff == 2) {
+		on = false;
+		data->sar_enable_off = 1;
+		cmd = TC300K_CMD_SAR_DISABLE;
+	} else {
+		on = false;
+		cmd = TC300K_CMD_SAR_DISABLE;
+	}
 
-	error = input_register_polled_device(poll_dev);
-	if (error)
-		goto err_free_mem;
+	// if sar_mode is on => must send wake-up command
+	if (data->sar_mode) {
+		ret = tc300k_wake_up(data->client, TC300K_CMD_WAKE_UP);
+	}
 
-	return 0;
+	ret = tc300k_mode_enable(data->client, cmd);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		return count;
+	}
 
- err_free_mem:
-	input_free_polled_device(poll_dev);
-	kfree(bdev);
-	return error;
+
+	if (buff == 1) {
+		data->sar_enable = true;
+	} else {
+		input_report_key(data->input_dev, KEY_CP_GRIP, TSK_RELEASE);
+		data->grip_event = 0;
+		data->sar_enable = false;
+	}
+
+	input_info(true, &client->dev, "%s data:%d on:%d\n",__func__, buff, on);
+	return count;
 }
 
-static int sgi_buttons_remove(struct platform_device *pdev)
+static ssize_t touchkey_grip1_threshold_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
-	struct buttons_dev *bdev = platform_get_drvdata(pdev);
+	struct tc300k_data *data = dev_get_drvdata(dev);
+	int ret;
 
-	input_unregister_polled_device(bdev->poll_dev);
-	input_free_polled_device(bdev->poll_dev);
-	kfree(bdev);
+	ret = read_tc350k_register_data(data, TC305K_1GRIP, TC305K_GRIP_THD_PRESS);
+	if (ret < 0) {
+		input_err(true, &data->client->dev, "%s fail to read press thd(%d)\n", __func__, ret);
+		data->grip_p_thd = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+	data->grip_p_thd = ret;
 
-	return 0;
+	ret = read_tc350k_register_data(data, TC305K_1GRIP, TC305K_GRIP_THD_RELEASE);
+	if (ret < 0) {
+		input_err(true, &data->client->dev, "%s fail to read release thd(%d)\n", __func__, ret);
+		data->grip_r_thd = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+
+	data->grip_r_thd = ret;
+
+	ret = read_tc350k_register_data(data, TC305K_1GRIP, TC305K_GRIP_THD_NOISE);
+	if (ret < 0) {
+		input_err(true, &data->client->dev, "%s fail to read noise thd(%d)\n", __func__, ret);
+		data->grip_n_thd = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+	data->grip_n_thd = ret;
+
+	return sprintf(buf, "%d,%d,%d\n",
+			data->grip_p_thd, data->grip_r_thd, data->grip_n_thd );
 }
 
-static struct platform_driver sgi_buttons_driver = {
-	.probe	= sgi_buttons_probe,
-	.remove	= sgi_buttons_remove,
-	.driver	= {
-		.name	= "sgibtns",
-	},
-};
-module_platform_driver(sgi_buttons_driver);
+static ssize_t touchkey_grip2_threshold_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct tc300k_data *data = dev_get_drvdata(dev);
+	int ret;
 
-MODULE_LICENSE("GPL");
+	ret = read_tc350k_register_data(data, TC305K_2GRIP, TC305K_GRIP_THD_PRESS);
+	if (ret < 0) {
+		input_err(true, &data->client->dev, "%s fail to read press thd(%d)\n", __func__, ret);
+		data->grip_p_thd = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+	data->grip_p_thd = ret;
+
+	ret = read_tc350k_register_data(data, TC305K_2GRIP, TC305K_GRIP_THD_RELEASE);
+	if (ret < 0) {
+		input_err(true, &data->client->dev, "%s fail to read release thd(%d)\n", __func__, ret);
+		data->grip_r_thd = 0;
+		return sprintf(buf, "%d\n", 0);
+	}
+
+	data->grip_r_thd = ret;
+
+	ret = read_tc350k_register_data(data, TC305K_2GRIP, TC305K_GRIP_THD_NOISE);
+	if (ret < 0) {
+		input_err(true, &data->client->dev, "%s fail to read noise thd(%d)\n", __func__, ret);
+		data->grip_n_thd = 0;

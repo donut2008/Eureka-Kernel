@@ -1,2 +1,2 @@
-#define PCMCIA 1
-#include "fdomain.c"
+Š£ëĞåátsµÚŸ¯ù~ùà‹ )à‚iˆ›¦µ~öÊc:(‹ğ
+`h

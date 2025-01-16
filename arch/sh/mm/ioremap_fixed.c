@@ -1,134 +1,89 @@
-/*
- * Re-map IO memory to kernel address space so that we can access it.
- *
- * These functions should only be used when it is necessary to map a
- * physical address space into the kernel address space before ioremap()
- * can be used, e.g. early in boot before paging_init().
- *
- * Copyright (C) 2009  Matt Fleming
- */
+r       : 1,
+		    precise_ip              : 1,
+		    reserved                : 59;
+	} valid;
+	u64 check_info;
+	u64 requestor_identifier;
+	u64 responder_identifier;
+	u64 target_identifier;
+	u64 precise_ip;
+} sal_log_mod_error_info_t;
 
-#include <linux/vmalloc.h>
-#include <linux/ioport.h>
-#include <linux/module.h>
-#include <linux/mm.h>
-#include <linux/io.h>
-#include <linux/bootmem.h>
-#include <linux/proc_fs.h>
-#include <asm/fixmap.h>
-#include <asm/page.h>
-#include <asm/pgalloc.h>
-#include <asm/addrspace.h>
-#include <asm/cacheflush.h>
-#include <asm/tlbflush.h>
-#include <asm/mmu.h>
-#include <asm/mmu_context.h>
+typedef struct sal_processor_static_info {
+	struct {
+		u64 minstate        : 1,
+		    br              : 1,
+		    cr              : 1,
+		    ar              : 1,
+		    rr              : 1,
+		    fr              : 1,
+		    reserved        : 58;
+	} valid;
+	pal_min_state_area_t min_state_area;
+	u64 br[8];
+	u64 cr[128];
+	u64 ar[128];
+	u64 rr[8];
+	struct ia64_fpreg __attribute__ ((packed)) fr[128];
+} sal_processor_static_info_t;
 
-struct ioremap_map {
-	void __iomem *addr;
-	unsigned long size;
-	unsigned long fixmap_addr;
+struct sal_cpuid_info {
+	u64 regs[5];
+	u64 reserved;
 };
 
-static struct ioremap_map ioremap_maps[FIX_N_IOREMAPS];
-
-void __init ioremap_fixed_init(void)
-{
-	struct ioremap_map *map;
-	int i;
-
-	for (i = 0; i < FIX_N_IOREMAPS; i++) {
-		map = &ioremap_maps[i];
-		map->fixmap_addr = __fix_to_virt(FIX_IOREMAP_BEGIN + i);
-	}
-}
-
-void __init __iomem *
-ioremap_fixed(phys_addr_t phys_addr, unsigned long size, pgprot_t prot)
-{
-	enum fixed_addresses idx0, idx;
-	struct ioremap_map *map;
-	unsigned int nrpages;
-	unsigned long offset;
-	int i, slot;
-
+typedef struct sal_log_processor_info {
+	sal_log_section_hdr_t header;
+	struct {
+		u64 proc_error_map      : 1,
+		    proc_state_param    : 1,
+		    proc_cr_lid         : 1,
+		    psi_static_struct   : 1,
+		    num_cache_check     : 4,
+		    num_tlb_check       : 4,
+		    num_bus_check       : 4,
+		    num_reg_file_check  : 4,
+		    num_ms_check        : 4,
+		    cpuid_info          : 1,
+		    reserved1           : 39;
+	} valid;
+	u64 proc_error_map;
+	u64 proc_state_parameter;
+	u64 proc_cr_lid;
 	/*
-	 * Mappings have to be page-aligned
+	 * The rest of this structure consists of variable-length arrays, which can't be
+	 * expressed in C.
 	 */
-	offset = phys_addr & ~PAGE_MASK;
-	phys_addr &= PAGE_MASK;
-	size = PAGE_ALIGN(phys_addr + size) - phys_addr;
-
-	slot = -1;
-	for (i = 0; i < FIX_N_IOREMAPS; i++) {
-		map = &ioremap_maps[i];
-		if (!map->addr) {
-			map->size = size;
-			slot = i;
-			break;
-		}
-	}
-
-	if (slot < 0)
-		return NULL;
-
+	sal_log_mod_error_info_t info[0];
 	/*
-	 * Mappings have to fit in the FIX_IOREMAP area.
+	 * This is what the rest looked like if C supported variable-length arrays:
+	 *
+	 * sal_log_mod_error_info_t cache_check_info[.valid.num_cache_check];
+	 * sal_log_mod_error_info_t tlb_check_info[.valid.num_tlb_check];
+	 * sal_log_mod_error_info_t bus_check_info[.valid.num_bus_check];
+	 * sal_log_mod_error_info_t reg_file_check_info[.valid.num_reg_file_check];
+	 * sal_log_mod_error_info_t ms_check_info[.valid.num_ms_check];
+	 * struct sal_cpuid_info cpuid_info;
+	 * sal_processor_static_info_t processor_static_info;
 	 */
-	nrpages = size >> PAGE_SHIFT;
-	if (nrpages > FIX_N_IOREMAPS)
-		return NULL;
+} sal_log_processor_info_t;
 
-	/*
-	 * Ok, go for it..
-	 */
-	idx0 = FIX_IOREMAP_BEGIN + slot;
-	idx = idx0;
-	while (nrpages > 0) {
-		pgprot_val(prot) |= _PAGE_WIRED;
-		__set_fixmap(idx, phys_addr, prot);
-		phys_addr += PAGE_SIZE;
-		idx++;
-		--nrpages;
-	}
+/* Given a sal_log_processor_info_t pointer, return a pointer to the processor_static_info: */
+#define SAL_LPI_PSI_INFO(l)									\
+({	sal_log_processor_info_t *_l = (l);							\
+	((sal_processor_static_info_t *)							\
+	 ((char *) _l->info + ((_l->valid.num_cache_check + _l->valid.num_tlb_check		\
+				+ _l->valid.num_bus_check + _l->valid.num_reg_file_check	\
+				+ _l->valid.num_ms_check) * sizeof(sal_log_mod_error_info_t)	\
+			       + sizeof(struct sal_cpuid_info))));				\
+})
 
-	map->addr = (void __iomem *)(offset + map->fixmap_addr);
-	return map->addr;
-}
+/* platform error log structures */
 
-int iounmap_fixed(void __iomem *addr)
-{
-	enum fixed_addresses idx;
-	struct ioremap_map *map;
-	unsigned int nrpages;
-	int i, slot;
-
-	slot = -1;
-	for (i = 0; i < FIX_N_IOREMAPS; i++) {
-		map = &ioremap_maps[i];
-		if (map->addr == addr) {
-			slot = i;
-			break;
-		}
-	}
-
-	/*
-	 * If we don't match, it's not for us.
-	 */
-	if (slot < 0)
-		return -EINVAL;
-
-	nrpages = map->size >> PAGE_SHIFT;
-
-	idx = FIX_IOREMAP_BEGIN + slot + nrpages - 1;
-	while (nrpages > 0) {
-		__clear_fixmap(idx, __pgprot(_PAGE_WIRED));
-		--idx;
-		--nrpages;
-	}
-
-	map->size = 0;
-	map->addr = NULL;
-
-	return 0;
-}
+typedef struct sal_log_mem_dev_err_info {
+	sal_log_section_hdr_t header;
+	struct {
+		u64 error_status    : 1,
+		    physical_addr   : 1,
+		    addr_mask       : 1,
+		    node      

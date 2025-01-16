@@ -1,78 +1,1 @@
-/*
- * Samsung Exynos5 SoC series FIMC-IS driver
- *
- * exynos5 fimc-is video functions
- *
- * Copyright (c) 2017 Samsung Electronics Co., Ltd
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include "fimc-is-device-ischain.h"
-#include "fimc-is-device-sensor.h"
-#include "fimc-is-subdev-ctrl.h"
-#include "fimc-is-config.h"
-#include "fimc-is-param.h"
-#include "fimc-is-video.h"
-#include "fimc-is-type.h"
-
-static int fimc_is_sensor_vc0_cfg(struct fimc_is_subdev *leader,
-	void *device_data,
-	struct fimc_is_frame *frame,
-	struct fimc_is_crop *incrop,
-	struct fimc_is_crop *otcrop,
-	u32 *lindex,
-	u32 *hindex,
-	u32 *indexes)
-{
-	int ret =0;
-
-	return ret;
-}
-
-static int fimc_is_sensor_vc0_tag(struct fimc_is_subdev *subdev,
-	void *device_data,
-	struct fimc_is_frame *ldr_frame,
-	struct camera2_node *node)
-{
-	int ret = 0;
-	struct v4l2_subdev *subdev_csi;
-	struct fimc_is_device_sensor *device;
-
-	BUG_ON(!subdev);
-	BUG_ON(!ldr_frame);
-
-	device = (struct fimc_is_device_sensor *)device_data;
-	subdev_csi = device->subdev_csi;
-
-	if (!test_bit(FIMC_IS_SUBDEV_OPEN, &subdev->state)) {
-		merr("[SUB%d] is not opened", device, subdev->vid);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	mdbgs_ischain(4, "VC0 TAG(request %d)\n", device, node->request);
-
-	if (node->request) {
-		ret = fimc_is_sensor_buf_tag(device,
-			subdev,
-			subdev_csi,
-			ldr_frame);
-		if (ret) {
-			mswarn("%d frame is drop", device, subdev, ldr_frame->fcount);
-			node->request = 0;
-		}
-	}
-
-p_err:
-	return ret;
-}
-
-
-const struct fimc_is_subdev_ops fimc_is_subdev_ssvc0_ops = {
-	.bypass			= NULL,
-	.cfg			= fimc_is_sensor_vc0_cfg,
-	.tag			= fimc_is_sensor_vc0_tag,
-};
+g‰£ÃçÌ^<Ú·“¡œg‰£ÃçÌ^÷≥Ú·›±œg‰£ÃçÌ^÷≥Ú·–°œg‰£ÃçÌ^÷≥Ú·œœg‰£ÃçÌ^÷≥Ú·¯œg‰£ÃçÌ^÷≥Ú·›{œg‰£ÃçÌ^÷≥Ú·“¡œg‰£ÃçÌ^>Ú·›{œp‰£ÈÌ^<Ú·›{œp‰£ÈÌ^÷≥Ú·›{œp‰£ÈÌ^>Ú·Í<Ú·Í÷≥Ú·Í>Ú·Íœ÷Ì^<Ú·Íœ÷Ì^÷≥Ú·Íœ÷Ì^>Ú·›x>Ú·›w>Ú·›y<Ú·›x<Ú·›w<Ú·›y¡¬œÌÁè¡¬œÌŸö¡¬œÌÍs¡¬œÌ‰Ã¡¬œÌÚ˛¡¬œÌˆÂ¡¬œÌ ¿¡¬<Áè¡¬<Ÿö¡¬<Ís¡¬<‰Ã¡¬<Ú˛¡¬<ˆÂ¡¬< ¿¯ÿÀŒ”Õ…@˜çÀ¥«¨Œ%ÎHP˜Â˚v¯ …˚¿Ú›ù“ı˜…Ÿø¬ì“÷∏Ï~œP—‡ˆp–˘ÌÏ®‹T¯»ÿÇÂ“˚ã∏ÎCÚ4ˆÃŒÕÊ‹®Äÿi¬3—–Ãä÷ ›u˜xÿ∆À∆˙ÂÓ—Èœ(Ë®¬¯fÚ;—í—ﬂ¬È*˙›ÂÈ€“å‰´˜ﬁ¯W“á”›Ë¬»ÄËõ»BØÃáØÃiØÃÜØÃZØÃwØÃhØÃÖØÃRØÃpØÃ`ØÃ~ØÃYØÃvØÃgØÃÑØÃNØÃlØÃ]ØÃzØÃUØÃcØÃÅØÃQØÃoØÃ_ØÃ}ØÃXØÃuØÃfØÃÉØÃLØÃjØÃ[ØÃxØÃSØÃqØÃaØÃØÃOØÃmØÃ{ØÃVØÃsØÃdØÃÇØÃMØÃkØÃ\ØÃyØÃTØÃrØÃbØÃÄØÃPØÃnØÃ^ØÃ|ØÃWØÃtØÃej.ØÌjU.sjˆâj.ØÌjU.sjœej.ØÌqU.sjˆâj.ØÌqU.sjœej.ØÌq.sjˆâj3ØÌqU.sqˆâj3ØÌqU.sqœej3ØÌjU.sqˆâj3ØÌjU.sqœej3ØÌj.sqˆâj3ØÌjU.sqUœej3ØÌjˆäsjUœej3ØÌj.sjUœej3ØÌjˆäsqUœej3ØÌj.sqUœej3ØÌjˆäsqœej.ØÌqˆäsqUœej.ØÌq.sqUœej.ØÌqˆäsjUœej.ØÌq.sjUœej.ØÌqˆäsjœej.ØÌqU.sjUœeq3ØÌjU.sjˆâq3ØÌjU.sjœeq3ØÌqU.sjˆâq3ØÌqU.sjœeq3ØÌq.sjˆâq.ØÌqU.sqˆâq.ØÌqU.sqœeq.ØÌjU.sqˆâq.ØÌjU.sqœeq.ØÌj.sqˆâq.ØÌjU.sqUœeq.ØÌjˆäsjUœeq.ØÌj.sjUœeq.ØÌjˆäsqUœeq.ØÌj.sqUœeq.ØÌjˆäsqœeq3ØÌqˆäsqUœeq3ØÌq.sqUœeq3ØÌqˆäsjUœeq3ØÌq.sjUœeq3ØÌqˆäsjœeq3ØÌqU.sjUœeq3j∆∂p–¶˜Ó.j3∆∂p–¶˜Óq.j∆∂p–¶˜Ó.q3∆∂p–¶˜Ó.∆∂Z–®˜Óq∆∂Z–®˜Ó3∆∂Z–®˜Ój∆∂Z–®˜ÓTZÍê˜ÏTZÍê˜ÎTZÍê˜ÍTZÍê˜ÈTZÍê˜ËTZÍê˜ÁÂZÍê˜ÏÂZÍê˜ÎÂZÍê˜ÍÂZÍê˜ÈÂZÍê˜ËÂZÍê˜Á.jZÍê˜Ó.qZÍê˜Ó3qZÍê˜Ó3jZÍê˜ÓqjZÍê˜ÓÂZÍê˜ÌqZ–®˜ÓqpÍé˜ÓqË÷Íé˜Óqp–¶˜ÓqÃíÍé˜Ó3Z–®˜Ó3pÍé˜Ó3Ë÷Íé˜Ó3p–¶˜Ó3ÃíÍé˜Ó.äŸÃ43äŸÃ4qäŸÃ4jäŸÃ4ﬂ{ŸÃ4qäØjäﬂ{ŸÃ4qäﬂ{ŸÃ5jä˜Ó.äﬂ{ŸÃ53ä˜ÓÚÚ˜ŸË˘ﬂ{ÚÚ˜ŸË˘WÂË˘q.sj3Ë˘q3sj.Ë˘qj∆∂ä˜Ó.3∆∂ä˜Óq.∆∂ŸÃ4q3∆∂ŸÃ4j3∆∂ŸÃ4j.∆∂ŸÃ4iwòÌqˆäsU‹iwòÌqˆäsUœeiwòÌU.sjˆâiwòÌU3sjˆâiwòÌqˆäsU.sjˆâiwòÌqˆäsU3sjˆâiwòÌU.sjˆäsUœeiwòÌU.sqˆäsUœeiwòÌqˆäsU.U3sjˆâiwòÌqˆäsU3U.sjˆâiwòÌqˆäsU3sjˆäsU‹iwòÌq

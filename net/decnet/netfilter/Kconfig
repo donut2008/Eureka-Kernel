@@ -1,16 +1,1 @@
-#
-# DECnet netfilter configuration
-#
-
-menu "DECnet: Netfilter Configuration"
-	depends on DECNET && NETFILTER
-	depends on NETFILTER_ADVANCED
-
-config DECNET_NF_GRABULATOR
-	tristate "Routing message grabulator (for userland routing daemon)"
-	help
-	  Enable this module if you want to use the userland DECnet routing
-	  daemon. You will also need to enable routing support for DECnet
-	  unless you just want to monitor routing messages from other nodes.
-
-endmenu
+"М	°a4	"ны°a4	"Ь_Я&a4	"Ь_[a4	"a°a4	"aЯ&a4	"a[a4	"[[a4	"Рй[a4	"Х|°a4	"Рй[°X	"Ь_°[X	"ы:[a4	"ЮЊ[a4	"Х|Я&°X	"[Эцa4	"Ь_Я&[X	"ЮЊ[[4	"Ь_Я&[4	"Х|Я&°4	"Я&°a4	"°Я&a4	"[Я&a4	"й#[a4	"шa°a4	"ЮЊ[[X	"ы:Я&[X	"ОW[[X	"НКЭцa4	"Х|Я&a4	"О:Еъ>ЭPЙпH	"РеЕъ>ЭPЙпH	"ыH	"ы)H	"Ш:H	"О;H	"РH	"ыH	"В‹H	"О:H	"О9ыВЉ	"Я5ПЏ9	"шъЃъ‚AНјAНMAН	AМюAМуAМиAМЭAМТAМЗAН»AН°AНҐAНљAНЏAН„AНyСiи€'T

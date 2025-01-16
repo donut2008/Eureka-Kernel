@@ -1,10 +1,5 @@
-#ifndef _SCORE_DEBUG_PRINT_H_
-#define _SCORE_DEBUG_PRINT_H_
-
-#include "score-fw-common.h"
-
-int score_printf_buf_init(struct score_fw_dev *dev, void *msg_kva, unsigned long msg_dva);
-int score_printf_buf_release(struct score_fw_dev *dev);
-void score_printf_work_flush(void);
-
-#endif
+fine D3F5_LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x20000
+#define D3F5_LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x11
+#define D3F5_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x40000
+#define D3F5_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x12
+#define D3F5_LINK_STATUS2__

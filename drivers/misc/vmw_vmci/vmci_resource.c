@@ -1,227 +1,104 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#include <linux/vmw_vmci_defs.h>
-#include <linux/hash.h>
-#include <linux/types.h>
-#include <linux/rculist.h>
-
-#include "vmci_resource.h"
-#include "vmci_driver.h"
-
-
-#define VMCI_RESOURCE_HASH_BITS         7
-#define VMCI_RESOURCE_HASH_BUCKETS      (1 << VMCI_RESOURCE_HASH_BITS)
-
-struct vmci_hash_table {
-	spinlock_t lock;
-	struct hlist_head entries[VMCI_RESOURCE_HASH_BUCKETS];
-};
-
-static struct vmci_hash_table vmci_resource_table = {
-	.lock = __SPIN_LOCK_UNLOCKED(vmci_resource_table.lock),
-};
-
-static unsigned int vmci_resource_hash(struct vmci_handle handle)
-{
-	return hash_32(handle.resource, VMCI_RESOURCE_HASH_BITS);
-}
-
-/*
- * Gets a resource (if one exists) matching given handle from the hash table.
- */
-static struct vmci_resource *vmci_resource_lookup(struct vmci_handle handle,
-						  enum vmci_resource_type type)
-{
-	struct vmci_resource *r, *resource = NULL;
-	unsigned int idx = vmci_resource_hash(handle);
-
-	rcu_read_lock();
-	hlist_for_each_entry_rcu(r,
-				 &vmci_resource_table.entries[idx], node) {
-		u32 cid = r->handle.context;
-		u32 rid = r->handle.resource;
-
-		if (r->type == type &&
-		    rid == handle.resource &&
-		    (cid == handle.context || cid == VMCI_INVALID_ID)) {
-			resource = r;
-			break;
-		}
-	}
-	rcu_read_unlock();
-
-	return resource;
-}
-
-/*
- * Find an unused resource ID and return it. The first
- * VMCI_RESERVED_RESOURCE_ID_MAX are reserved so we start from
- * its value + 1.
- * Returns VMCI resource id on success, VMCI_INVALID_ID on failure.
- */
-static u32 vmci_resource_find_id(u32 context_id,
-				 enum vmci_resource_type resource_type)
-{
-	static u32 resource_id = VMCI_RESERVED_RESOURCE_ID_MAX + 1;
-	u32 old_rid = resource_id;
-	u32 current_rid;
-
-	/*
-	 * Generate a unique resource ID.  Keep on trying until we wrap around
-	 * in the RID space.
-	 */
-	do {
-		struct vmci_handle handle;
-
-		current_rid = resource_id;
-		resource_id++;
-		if (unlikely(resource_id == VMCI_INVALID_ID)) {
-			/* Skip the reserved rids. */
-			resource_id = VMCI_RESERVED_RESOURCE_ID_MAX + 1;
-		}
-
-		handle = vmci_make_handle(context_id, current_rid);
-		if (!vmci_resource_lookup(handle, resource_type))
-			return current_rid;
-	} while (resource_id != old_rid);
-
-	return VMCI_INVALID_ID;
-}
-
-
-int vmci_resource_add(struct vmci_resource *resource,
-		      enum vmci_resource_type resource_type,
-		      struct vmci_handle handle)
-
-{
-	unsigned int idx;
-	int result;
-
-	spin_lock(&vmci_resource_table.lock);
-
-	if (handle.resource == VMCI_INVALID_ID) {
-		handle.resource = vmci_resource_find_id(handle.context,
-			resource_type);
-		if (handle.resource == VMCI_INVALID_ID) {
-			result = VMCI_ERROR_NO_HANDLE;
-			goto out;
-		}
-	} else if (vmci_resource_lookup(handle, resource_type)) {
-		result = VMCI_ERROR_ALREADY_EXISTS;
-		goto out;
-	}
-
-	resource->handle = handle;
-	resource->type = resource_type;
-	INIT_HLIST_NODE(&resource->node);
-	kref_init(&resource->kref);
-	init_completion(&resource->done);
-
-	idx = vmci_resource_hash(resource->handle);
-	hlist_add_head_rcu(&resource->node, &vmci_resource_table.entries[idx]);
-
-	result = VMCI_SUCCESS;
-
-out:
-	spin_unlock(&vmci_resource_table.lock);
-	return result;
-}
-
-void vmci_resource_remove(struct vmci_resource *resource)
-{
-	struct vmci_handle handle = resource->handle;
-	unsigned int idx = vmci_resource_hash(handle);
-	struct vmci_resource *r;
-
-	/* Remove resource from hash table. */
-	spin_lock(&vmci_resource_table.lock);
-
-	hlist_for_each_entry(r, &vmci_resource_table.entries[idx], node) {
-		if (vmci_handle_is_equal(r->handle, resource->handle)) {
-			hlist_del_init_rcu(&r->node);
-			break;
-		}
-	}
-
-	spin_unlock(&vmci_resource_table.lock);
-	synchronize_rcu();
-
-	vmci_resource_put(resource);
-	wait_for_completion(&resource->done);
-}
-
-struct vmci_resource *
-vmci_resource_by_handle(struct vmci_handle resource_handle,
-			enum vmci_resource_type resource_type)
-{
-	struct vmci_resource *r, *resource = NULL;
-
-	rcu_read_lock();
-
-	r = vmci_resource_lookup(resource_handle, resource_type);
-	if (r &&
-	    (resource_type == r->type ||
-	     resource_type == VMCI_RESOURCE_TYPE_ANY)) {
-		resource = vmci_resource_get(r);
-	}
-
-	rcu_read_unlock();
-
-	return resource;
-}
-
-/*
- * Get a reference to given resource.
- */
-struct vmci_resource *vmci_resource_get(struct vmci_resource *resource)
-{
-	kref_get(&resource->kref);
-
-	return resource;
-}
-
-static void vmci_release_resource(struct kref *kref)
-{
-	struct vmci_resource *resource =
-		container_of(kref, struct vmci_resource, kref);
-
-	/* Verify the resource has been unlinked from hash table */
-	WARN_ON(!hlist_unhashed(&resource->node));
-
-	/* Signal that container of this resource can now be destroyed */
-	complete(&resource->done);
-}
-
-/*
- * Resource's release function will get called if last reference.
- * If it is the last reference, then we are sure that nobody else
- * can increment the count again (it's gone from the resource hash
- * table), so there's no need for locking here.
- */
-int vmci_resource_put(struct vmci_resource *resource)
-{
-	/*
-	 * We propagate the information back to caller in case it wants to know
-	 * whether entry was freed.
-	 */
-	return kref_put(&resource->kref, vmci_release_resource) ?
-		VMCI_SUCCESS_ENTRY_DEAD : VMCI_SUCCESS;
-}
-
-struct vmci_handle vmci_resource_handle(struct vmci_resource *resource)
-{
-	return resource->handle;
-}
+TOMIC_ROUTING_EN_MASK 0x100000
+#define PCIE_STRAP_F2__STRAP_F2_ATOMIC_ROUTING_EN__SHIFT 0x14
+#define PCIE_STRAP_F2__STRAP_F2_MSI_MULTI_CAP_MASK 0xe00000
+#define PCIE_STRAP_F2__STRAP_F2_MSI_MULTI_CAP__SHIFT 0x15
+#define PCIE_STRAP_F2__STRAP_F2_MSI_PERVECTOR_MASK_CAP_MASK 0x8000000
+#define PCIE_STRAP_F2__STRAP_F2_MSI_PERVECTOR_MASK_CAP__SHIFT 0x1b
+#define PCIE_STRAP_F3__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F3__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_F4__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F4__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_F5__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F5__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_F6__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F6__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_MSIX__STRAP_F0_MSIX_EN_MASK 0x1
+#define PCIE_STRAP_MSIX__STRAP_F0_MSIX_EN__SHIFT 0x0
+#define PCIE_STRAP_MSIX__STRAP_F0_MSIX_TABLE_BIR_MASK 0xe
+#define PCIE_STRAP_MSIX__STRAP_F0_MSIX_TABLE_BIR__SHIFT 0x1
+#define PCIE_STRAP_MSIX__STRAP_F0_MSIX_TABLE_OFFSET_MASK 0xfffff000
+#define PCIE_STRAP_MSIX__STRAP_F0_MSIX_TABLE_OFFSET__SHIFT 0xc
+#define PCIE_STRAP_MISC__STRAP_TL_ALT_BUF_EN_MASK 0x10
+#define PCIE_STRAP_MISC__STRAP_TL_ALT_BUF_EN__SHIFT 0x4
+#define PCIE_STRAP_MISC__STRAP_MAX_PASID_WIDTH_MASK 0x1f00
+#define PCIE_STRAP_MISC__STRAP_MAX_PASID_WIDTH__SHIFT 0x8
+#define PCIE_STRAP_MISC__STRAP_PASID_EXE_PERMISSION_SUPPORTED_MASK 0x2000
+#define PCIE_STRAP_MISC__STRAP_PASID_EXE_PERMISSION_SUPPORTED__SHIFT 0xd
+#define PCIE_STRAP_MISC__STRAP_PASID_PRIV_MODE_SUPPORTED_MASK 0x4000
+#define PCIE_STRAP_MISC__STRAP_PASID_PRIV_MODE_SUPPORTED__SHIFT 0xe
+#define PCIE_STRAP_MISC__STRAP_PASID_GLOBAL_INVALIDATE_SUPPORTED_MASK 0x8000
+#define PCIE_STRAP_MISC__STRAP_PASID_GLOBAL_INVALIDATE_SUPPORTED__SHIFT 0xf
+#define PCIE_STRAP_MISC__STRAP_CLK_PM_EN_MASK 0x1000000
+#define PCIE_STRAP_MISC__STRAP_CLK_PM_EN__SHIFT 0x18
+#define PCIE_STRAP_MISC__STRAP_ECN1P1_EN_MASK 0x2000000
+#define PCIE_STRAP_MISC__STRAP_ECN1P1_EN__SHIFT 0x19
+#define PCIE_STRAP_MISC__STRAP_EXT_VC_COUNT_MASK 0x4000000
+#define PCIE_STRAP_MISC__STRAP_EXT_VC_COUNT__SHIFT 0x1a
+#define PCIE_STRAP_MISC__STRAP_REVERSE_ALL_MASK 0x10000000
+#define PCIE_STRAP_MISC__STRAP_REVERSE_ALL__SHIFT 0x1c
+#define PCIE_STRAP_MISC__STRAP_MST_ADR64_EN_MASK 0x20000000
+#define PCIE_STRAP_MISC__STRAP_MST_ADR64_EN__SHIFT 0x1d
+#define PCIE_STRAP_MISC__STRAP_FLR_EN_MASK 0x40000000
+#define PCIE_STRAP_MISC__STRAP_FLR_EN__SHIFT 0x1e
+#define PCIE_STRAP_MISC__STRAP_INTERNAL_ERR_EN_MASK 0x80000000
+#define PCIE_STRAP_MISC__STRAP_INTERNAL_ERR_EN__SHIFT 0x1f
+#define PCIE_STRAP_MISC2__STRAP_GEN2_COMPLIANCE_MASK 0x2
+#define PCIE_STRAP_MISC2__STRAP_GEN2_COMPLIANCE__SHIFT 0x1
+#define PCIE_STRAP_MISC2__STRAP_MSTCPL_TIMEOUT_EN_MASK 0x4
+#define PCIE_STRAP_MISC2__STRAP_MSTCPL_TIMEOUT_EN__SHIFT 0x2
+#define PCIE_STRAP_MISC2__STRAP_GEN3_COMPLIANCE_MASK 0x8
+#define PCIE_STRAP_MISC2__STRAP_GEN3_COMPLIANCE__SHIFT 0x3
+#define PCIE_STRAP_MISC2__STRAP_TPH_SUPPORTED_MASK 0x10
+#define PCIE_STRAP_MISC2__STRAP_TPH_SUPPORTED__SHIFT 0x4
+#define PCIE_STRAP_PI__STRAP_QUICKSIM_START_MASK 0x1
+#define PCIE_STRAP_PI__STRAP_QUICKSIM_START__SHIFT 0x0
+#define PCIE_STRAP_PI__STRAP_TEST_TOGGLE_PATTERN_MASK 0x10000000
+#define PCIE_STRAP_PI__STRAP_TEST_TOGGLE_PATTERN__SHIFT 0x1c
+#define PCIE_STRAP_PI__STRAP_TEST_TOGGLE_MODE_MASK 0x20000000
+#define PCIE_STRAP_PI__STRAP_TEST_TOGGLE_MODE__SHIFT 0x1d
+#define PCIE_STRAP_I2C_BD__STRAP_BIF_I2C_SLV_ADR_MASK 0x7f
+#define PCIE_STRAP_I2C_BD__STRAP_BIF_I2C_SLV_ADR__SHIFT 0x0
+#define PCIE_STRAP_I2C_BD__STRAP_BIF_DBG_I2C_EN_MASK 0x80
+#define PCIE_STRAP_I2C_BD__STRAP_BIF_DBG_I2C_EN__SHIFT 0x7
+#define PCIE_PRBS_CLR__PRBS_CLR_MASK 0xffff
+#define PCIE_PRBS_CLR__PRBS_CLR__SHIFT 0x0
+#define PCIE_PRBS_CLR__PRBS_CHECKER_DEBUG_BUS_SELECT_MASK 0xf0000
+#define PCIE_PRBS_CLR__PRBS_CHECKER_DEBUG_BUS_SELECT__SHIFT 0x10
+#define PCIE_PRBS_CLR__PRBS_POLARITY_EN_MASK 0x1000000
+#define PCIE_PRBS_CLR__PRBS_POLARITY_EN__SHIFT 0x18
+#define PCIE_PRBS_STATUS1__PRBS_ERRSTAT_MASK 0xffff
+#define PCIE_PRBS_STATUS1__PRBS_ERRSTAT__SHIFT 0x0
+#define PCIE_PRBS_STATUS1__PRBS_LOCKED_MASK 0xffff0000
+#define PCIE_PRBS_STATUS1__PRBS_LOCKED__SHIFT 0x10
+#define PCIE_PRBS_STATUS2__PRBS_BITCNT_DONE_MASK 0xffff
+#define PCIE_PRBS_STATUS2__PRBS_BITCNT_DONE__SHIFT 0x0
+#define PCIE_PRBS_FREERUN__PRBS_FREERUN_MASK 0xffff
+#define PCIE_PRBS_FREERUN__PRBS_FREERUN__SHIFT 0x0
+#define PCIE_PRBS_MISC__PRBS_EN_MASK 0x1
+#define PCIE_PRBS_MISC__PRBS_EN__SHIFT 0x0
+#define PCIE_PRBS_MISC__PRBS_TEST_MODE_MASK 0xe
+#define PCIE_PRBS_MISC__PRBS_TEST_MODE__SHIFT 0x1
+#define PCIE_PRBS_MISC__PRBS_USER_PATTERN_TOGGLE_MASK 0x10
+#define PCIE_PRBS_MISC__PRBS_USER_PATTERN_TOGGLE__SHIFT 0x4
+#define PCIE_PRBS_MISC__PRBS_8BIT_SEL_MASK 0x20
+#define PCIE_PRBS_MISC__PRBS_8BIT_SEL__SHIFT 0x5
+#define PCIE_PRBS_MISC__PRBS_COMMA_NUM_MASK 0xc0
+#define PCIE_PRBS_MISC__PRBS_COMMA_NUM__SHIFT 0x6
+#define PCIE_PRBS_MISC__PRBS_LOCK_CNT_MASK 0x1f00
+#define PCIE_PRBS_MISC__PRBS_LOCK_CNT__SHIFT 0x8
+#define PCIE_PRBS_MISC__PRBS_DATA_RATE_MASK 0xc000
+#define PCIE_PRBS_MISC__PRBS_DATA_RATE__SHIFT 0xe
+#define PCIE_PRBS_MISC__PRBS_CHK_ERR_MASK_MASK 0xffff0000
+#define PCIE_PRBS_MISC__PRBS_CHK_ERR_MASK__SHIFT 0x10
+#define PCIE_PRBS_USER_PATTERN__PRBS_USER_PATTERN_MASK 0x3fffffff
+#define PCIE_PRBS_USER_PATTERN__PRBS_USER_PATTERN__SHIFT 0x0
+#define PCIE_PRBS_LO_BITCNT__PRBS_LO_BITCNT_MASK 0xffffffff
+#define PCIE_PRBS_LO_BITCNT__PRBS_LO_BITCNT__SHIFT 0x0
+#define PCIE_PRBS_HI_BITCNT__PRBS_HI_BITCNT_MASK 0xff
+#define PCIE_PRBS_HI_BITCNT__PRBS_HI_BITCNT__SHIFT 0x0
+#define PCIE_PRBS_ERRCNT_0__PRBS_ERRCNT_0_MASK 0xffffffff
+#define PCIE_PRBS_ERRCNT_0__PRBS_ERRCNT_0__SHIFT 0x0
+#define PCIE_PRBS_ERRCNT_1__PRBS_ERRCNT_1_MASK 0xffffffff
+#define PCIE_PRBS_ERRCNT_1__PRBS_ERRCNT_1__SHIFT 0x0
+#define PCIE_PRBS_ERRCNT_2__PRBS_ERRCNT_2_MASK 0xffffffff
+#define PCIE_PRBS_ERRCNT_2__PRBS_ERRCNT_2

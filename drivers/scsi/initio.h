@@ -1,667 +1,905 @@
-/**************************************************************************
- * Initio 9100 device driver for Linux.
- *
- * Copyright (c) 1994-1998 Initio Corporation
- * All rights reserved.
- *
- * Cleanups (c) Copyright 2007 Red Hat <alan@lxorguk.ukuu.org.uk>
+_relaxed(XOR_ACTIVATION(chan));
+	dev_err(mv_chan_to_devp(chan), "activation   0x%08x\n", val);
+
+	val = readl_relaxed(XOR_INTR_CAUSE(chan));
+	dev_err(mv_chan_to_devp(chan), "intr cause   0x%08x\n", val);
+
+	val = readl_relaxed(XOR_INTR_MASK(chan));
+	dev_err(mv_chan_to_devp(chan), "intr mask    0x%08x\n", val);
+
+	val = readl_relaxed(XOR_ERROR_CAUSE(chan));
+	dev_err(mv_chan_to_devp(chan), "error cause  0x%08x\n", val);
+
+	val = readl_relaxed(XOR_ERROR_ADDR(chan));
+	dev_err(mv_chan_to_devp(chan), "error addr   0x%08x\n", val);
+}
+
+static void mv_chan_err_interrupt_handler(struct mv_xor_chan *chan,
+					  u32 intr_cause)
+{
+	if (intr_cause & XOR_INT_ERR_DECODE) {
+		dev_dbg(mv_chan_to_devp(chan), "ignoring address decode error\n");
+		return;
+	}
+
+	dev_err(mv_chan_to_devp(chan), "error on chan %d. intr cause 0x%08x\n",
+		chan->idx, intr_cause);
+
+	mv_chan_dump_regs(chan);
+	WARN_ON(1);
+}
+
+static irqreturn_t mv_xor_interrupt_handler(int irq, void *data)
+{
+	struct mv_xor_chan *chan = data;
+	u32 intr_cause = mv_chan_get_intr_cause(chan);
+
+	dev_dbg(mv_chan_to_devp(chan), "intr cause %x\n", intr_cause);
+
+	if (intr_cause & XOR_INTR_ERRORS)
+		mv_chan_err_interrupt_handler(chan, intr_cause);
+
+	tasklet_schedule(&chan->irq_tasklet);
+
+	mv_chan_clear_eoc_cause(chan);
+
+	return IRQ_HANDLED;
+}
+
+static void mv_xor_issue_pending(struct dma_chan *chan)
+{
+	struct mv_xor_chan *mv_chan = to_mv_xor_chan(chan);
+
+	if (mv_chan->pending >= MV_XOR_THRESHOLD) {
+		mv_chan->pending = 0;
+		mv_chan_activate(mv_chan);
+	}
+}
+
+/*
+ * Perform a transaction to verify the HW works.
+ */
+
+static int mv_chan_memcpy_self_test(struct mv_xor_chan *mv_chan)
+{
+	int i, ret;
+	void *src, *dest;
+	dma_addr_t src_dma, dest_dma;
+	struct dma_chan *dma_chan;
+	dma_cookie_t cookie;
+	struct dma_async_tx_descriptor *tx;
+	struct dmaengine_unmap_data *unmap;
+	int err = 0;
+
+	src = kmalloc(sizeof(u8) * PAGE_SIZE, GFP_KERNEL);
+	if (!src)
+		return -ENOMEM;
+
+	dest = kzalloc(sizeof(u8) * PAGE_SIZE, GFP_KERNEL);
+	if (!dest) {
+		kfree(src);
+		return -ENOMEM;
+	}
+
+	/* Fill in src buffer */
+	for (i = 0; i < PAGE_SIZE; i++)
+		((u8 *) src)[i] = (u8)i;
+
+	dma_chan = &mv_chan->dmachan;
+	if (mv_xor_alloc_chan_resources(dma_chan) < 1) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	unmap = dmaengine_get_unmap_data(dma_chan->device->dev, 2, GFP_KERNEL);
+	if (!unmap) {
+		err = -ENOMEM;
+		goto free_resources;
+	}
+
+	src_dma = dma_map_page(dma_chan->device->dev, virt_to_page(src), 0,
+				 PAGE_SIZE, DMA_TO_DEVICE);
+	unmap->addr[0] = src_dma;
+
+	ret = dma_mapping_error(dma_chan->device->dev, src_dma);
+	if (ret) {
+		err = -ENOMEM;
+		goto free_resources;
+	}
+	unmap->to_cnt = 1;
+
+	dest_dma = dma_map_page(dma_chan->device->dev, virt_to_page(dest), 0,
+				  PAGE_SIZE, DMA_FROM_DEVICE);
+	unmap->addr[1] = dest_dma;
+
+	ret = dma_mapping_error(dma_chan->device->dev, dest_dma);
+	if (ret) {
+		err = -ENOMEM;
+		goto free_resources;
+	}
+	unmap->from_cnt = 1;
+	unmap->len = PAGE_SIZE;
+
+	tx = mv_xor_prep_dma_memcpy(dma_chan, dest_dma, src_dma,
+				    PAGE_SIZE, 0);
+	if (!tx) {
+		dev_err(dma_chan->device->dev,
+			"Self-test cannot prepare operation, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	cookie = mv_xor_tx_submit(tx);
+	if (dma_submit_error(cookie)) {
+		dev_err(dma_chan->device->dev,
+			"Self-test submit error, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	mv_xor_issue_pending(dma_chan);
+	async_tx_ack(tx);
+	msleep(1);
+
+	if (mv_xor_status(dma_chan, cookie, NULL) !=
+	    DMA_COMPLETE) {
+		dev_err(dma_chan->device->dev,
+			"Self-test copy timed out, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	dma_sync_single_for_cpu(dma_chan->device->dev, dest_dma,
+				PAGE_SIZE, DMA_FROM_DEVICE);
+	if (memcmp(src, dest, PAGE_SIZE)) {
+		dev_err(dma_chan->device->dev,
+			"Self-test copy failed compare, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+free_resources:
+	dmaengine_unmap_put(unmap);
+	mv_xor_free_chan_resources(dma_chan);
+out:
+	kfree(src);
+	kfree(dest);
+	return err;
+}
+
+#define MV_XOR_NUM_SRC_TEST 4 /* must be <= 15 */
+static int
+mv_chan_xor_self_test(struct mv_xor_chan *mv_chan)
+{
+	int i, src_idx, ret;
+	struct page *dest;
+	struct page *xor_srcs[MV_XOR_NUM_SRC_TEST];
+	dma_addr_t dma_srcs[MV_XOR_NUM_SRC_TEST];
+	dma_addr_t dest_dma;
+	struct dma_async_tx_descriptor *tx;
+	struct dmaengine_unmap_data *unmap;
+	struct dma_chan *dma_chan;
+	dma_cookie_t cookie;
+	u8 cmp_byte = 0;
+	u32 cmp_word;
+	int err = 0;
+	int src_count = MV_XOR_NUM_SRC_TEST;
+
+	for (src_idx = 0; src_idx < src_count; src_idx++) {
+		xor_srcs[src_idx] = alloc_page(GFP_KERNEL);
+		if (!xor_srcs[src_idx]) {
+			while (src_idx--)
+				__free_page(xor_srcs[src_idx]);
+			return -ENOMEM;
+		}
+	}
+
+	dest = alloc_page(GFP_KERNEL);
+	if (!dest) {
+		while (src_idx--)
+			__free_page(xor_srcs[src_idx]);
+		return -ENOMEM;
+	}
+
+	/* Fill in src buffers */
+	for (src_idx = 0; src_idx < src_count; src_idx++) {
+		u8 *ptr = page_address(xor_srcs[src_idx]);
+		for (i = 0; i < PAGE_SIZE; i++)
+			ptr[i] = (1 << src_idx);
+	}
+
+	for (src_idx = 0; src_idx < src_count; src_idx++)
+		cmp_byte ^= (u8) (1 << src_idx);
+
+	cmp_word = (cmp_byte << 24) | (cmp_byte << 16) |
+		(cmp_byte << 8) | cmp_byte;
+
+	memset(page_address(dest), 0, PAGE_SIZE);
+
+	dma_chan = &mv_chan->dmachan;
+	if (mv_xor_alloc_chan_resources(dma_chan) < 1) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	unmap = dmaengine_get_unmap_data(dma_chan->device->dev, src_count + 1,
+					 GFP_KERNEL);
+	if (!unmap) {
+		err = -ENOMEM;
+		goto free_resources;
+	}
+
+	/* test xor */
+	for (i = 0; i < src_count; i++) {
+		unmap->addr[i] = dma_map_page(dma_chan->device->dev, xor_srcs[i],
+					      0, PAGE_SIZE, DMA_TO_DEVICE);
+		dma_srcs[i] = unmap->addr[i];
+		ret = dma_mapping_error(dma_chan->device->dev, unmap->addr[i]);
+		if (ret) {
+			err = -ENOMEM;
+			goto free_resources;
+		}
+		unmap->to_cnt++;
+	}
+
+	unmap->addr[src_count] = dma_map_page(dma_chan->device->dev, dest, 0, PAGE_SIZE,
+				      DMA_FROM_DEVICE);
+	dest_dma = unmap->addr[src_count];
+	ret = dma_mapping_error(dma_chan->device->dev, unmap->addr[src_count]);
+	if (ret) {
+		err = -ENOMEM;
+		goto free_resources;
+	}
+	unmap->from_cnt = 1;
+	unmap->len = PAGE_SIZE;
+
+	tx = mv_xor_prep_dma_xor(dma_chan, dest_dma, dma_srcs,
+				 src_count, PAGE_SIZE, 0);
+	if (!tx) {
+		dev_err(dma_chan->device->dev,
+			"Self-test cannot prepare operation, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	cookie = mv_xor_tx_submit(tx);
+	if (dma_submit_error(cookie)) {
+		dev_err(dma_chan->device->dev,
+			"Self-test submit error, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	mv_xor_issue_pending(dma_chan);
+	async_tx_ack(tx);
+	msleep(8);
+
+	if (mv_xor_status(dma_chan, cookie, NULL) !=
+	    DMA_COMPLETE) {
+		dev_err(dma_chan->device->dev,
+			"Self-test xor timed out, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	dma_sync_single_for_cpu(dma_chan->device->dev, dest_dma,
+				PAGE_SIZE, DMA_FROM_DEVICE);
+	for (i = 0; i < (PAGE_SIZE / sizeof(u32)); i++) {
+		u32 *ptr = page_address(dest);
+		if (ptr[i] != cmp_word) {
+			dev_err(dma_chan->device->dev,
+				"Self-test xor failed compare, disabling. index %d, data %x, expected %x\n",
+				i, ptr[i], cmp_word);
+			err = -ENODEV;
+			goto free_resources;
+		}
+	}
+
+free_resources:
+	dmaengine_unmap_put(unmap);
+	mv_xor_free_chan_resources(dma_chan);
+out:
+	src_idx = src_count;
+	while (src_idx--)
+		__free_page(xor_srcs[src_idx]);
+	__free_page(dest);
+	return err;
+}
+
+static int mv_xor_channel_remove(struct mv_xor_chan *mv_chan)
+{
+	struct dma_chan *chan, *_chan;
+	struct device *dev = mv_chan->dmadev.dev;
+
+	dma_async_device_unregister(&mv_chan->dmadev);
+
+	dma_free_coherent(dev, MV_XOR_POOL_SIZE,
+			  mv_chan->dma_desc_pool_virt, mv_chan->dma_desc_pool);
+	dma_unmap_single(dev, mv_chan->dummy_src_addr,
+			 MV_XOR_MIN_BYTE_COUNT, DMA_FROM_DEVICE);
+	dma_unmap_single(dev, mv_chan->dummy_dst_addr,
+			 MV_XOR_MIN_BYTE_COUNT, DMA_TO_DEVICE);
+
+	list_for_each_entry_safe(chan, _chan, &mv_chan->dmadev.channels,
+				 device_node) {
+		list_del(&chan->device_node);
+	}
+
+	free_irq(mv_chan->irq, mv_chan);
+
+	return 0;
+}
+
+static struct mv_xor_chan *
+mv_xor_channel_add(struct mv_xor_device *xordev,
+		   struct platform_device *pdev,
+		   int idx, dma_cap_mask_t cap_mask, int irq, int op_in_desc)
+{
+	int ret = 0;
+	struct mv_xor_chan *mv_chan;
+	struct dma_device *dma_dev;
+
+	mv_chan = devm_kzalloc(&pdev->dev, sizeof(*mv_chan), GFP_KERNEL);
+	if (!mv_chan)
+		return ERR_PTR(-ENOMEM);
+
+	mv_chan->idx = idx;
+	mv_chan->irq = irq;
+	mv_chan->op_in_desc = op_in_desc;
+
+	dma_dev = &mv_chan->dmadev;
+
+	/*
+	 * These source and destination dummy buffers are used to implement
+	 * a DMA_INTERRUPT operation as a minimum-sized XOR operation.
+	 * Hence, we only need to map the buffers at initialization-time.
+	 */
+	mv_chan->dummy_src_addr = dma_map_single(dma_dev->dev,
+		mv_chan->dummy_src, MV_XOR_MIN_BYTE_COUNT, DMA_FROM_DEVICE);
+	mv_chan->dummy_dst_addr = dma_map_single(dma_dev->dev,
+		mv_chan->dummy_dst, MV_XOR_MIN_BYTE_COUNT, DMA_TO_DEVICE);
+
+	/* allocate coherent memory for hardware descriptors
+	 * note: writecombine gives slightly better performance, but
+	 * requires that we explicitly flush the writes
+	 */
+	mv_chan->dma_desc_pool_virt =
+	  dma_alloc_writecombine(&pdev->dev, MV_XOR_POOL_SIZE,
+				 &mv_chan->dma_desc_pool, GFP_KERNEL);
+	if (!mv_chan->dma_desc_pool_virt)
+		return ERR_PTR(-ENOMEM);
+
+	/* discover transaction capabilites from the platform data */
+	dma_dev->cap_mask = cap_mask;
+
+	INIT_LIST_HEAD(&dma_dev->channels);
+
+	/* set base routines */
+	dma_dev->device_alloc_chan_resources = mv_xor_alloc_chan_resources;
+	dma_dev->device_free_chan_resources = mv_xor_free_chan_resources;
+	dma_dev->device_tx_status = mv_xor_status;
+	dma_dev->device_issue_pending = mv_xor_issue_pending;
+	dma_dev->dev = &pdev->dev;
+
+	/* set prep routines based on capability */
+	if (dma_has_cap(DMA_INTERRUPT, dma_dev->cap_mask))
+		dma_dev->device_prep_dma_interrupt = mv_xor_prep_dma_interrupt;
+	if (dma_has_cap(DMA_MEMCPY, dma_dev->cap_mask))
+		dma_dev->device_prep_dma_memcpy = mv_xor_prep_dma_memcpy;
+	if (dma_has_cap(DMA_XOR, dma_dev->cap_mask)) {
+		dma_dev->max_xor = 8;
+		dma_dev->device_prep_dma_xor = mv_xor_prep_dma_xor;
+	}
+
+	mv_chan->mmr_base = xordev->xor_base;
+	mv_chan->mmr_high_base = xordev->xor_high_base;
+	tasklet_init(&mv_chan->irq_tasklet, mv_xor_tasklet, (unsigned long)
+		     mv_chan);
+
+	/* clear errors before enabling interrupts */
+	mv_chan_clear_err_status(mv_chan);
+
+	ret = request_irq(mv_chan->irq, mv_xor_interrupt_handler,
+			  0, dev_name(&pdev->dev), mv_chan);
+	if (ret)
+		goto err_free_dma;
+
+	mv_chan_unmask_interrupts(mv_chan);
+
+	if (mv_chan->op_in_desc == XOR_MODE_IN_DESC)
+		mv_chan_set_mode_to_desc(mv_chan);
+	else
+		mv_chan_set_mode(mv_chan, DMA_XOR);
+
+	spin_lock_init(&mv_chan->lock);
+	INIT_LIST_HEAD(&mv_chan->chain);
+	INIT_LIST_HEAD(&mv_chan->completed_slots);
+	INIT_LIST_HEAD(&mv_chan->free_slots);
+	INIT_LIST_HEAD(&mv_chan->allocated_slots);
+	mv_chan->dmachan.device = dma_dev;
+	dma_cookie_init(&mv_chan->dmachan);
+
+	list_add_tail(&mv_chan->dmachan.device_node, &dma_dev->channels);
+
+	if (dma_has_cap(DMA_MEMCPY, dma_dev->cap_mask)) {
+		ret = mv_chan_memcpy_self_test(mv_chan);
+		dev_dbg(&pdev->dev, "memcpy self test returned %d\n", ret);
+		if (ret)
+			goto err_free_irq;
+	}
+
+	if (dma_has_cap(DMA_XOR, dma_dev->cap_mask)) {
+		ret = mv_chan_xor_self_test(mv_chan);
+		dev_dbg(&pdev->dev, "xor self test returned %d\n", ret);
+		if (ret)
+			goto err_free_irq;
+	}
+
+	dev_info(&pdev->dev, "Marvell XOR (%s): ( %s%s%s)\n",
+		 mv_chan->op_in_desc ? "Descriptor Mode" : "Registers Mode",
+		 dma_has_cap(DMA_XOR, dma_dev->cap_mask) ? "xor " : "",
+		 dma_has_cap(DMA_MEMCPY, dma_dev->cap_mask) ? "cpy " : "",
+		 dma_has_cap(DMA_INTERRUPT, dma_dev->cap_mask) ? "intr " : "");
+
+	dma_async_device_register(dma_dev);
+	return mv_chan;
+
+err_free_irq:
+	free_irq(mv_chan->irq, mv_chan);
+ err_free_dma:
+	dma_free_coherent(&pdev->dev, MV_XOR_POOL_SIZE,
+			  mv_chan->dma_desc_pool_virt, mv_chan->dma_desc_pool);
+	return ERR_PTR(ret);
+}
+
+static void
+mv_xor_conf_mbus_windows(struct mv_xor_device *xordev,
+			 const struct mbus_dram_target_info *dram)
+{
+	void __iomem *base = xordev->xor_high_base;
+	u32 win_enable = 0;
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		writel(0, base + WINDOW_BASE(i));
+		writel(0, base + WINDOW_SIZE(i));
+		if (i < 4)
+			writel(0, base + WINDOW_REMAP_HIGH(i));
+	}
+
+	for (i = 0; i < dram->num_cs; i++) {
+		const struct mbus_dram_window *cs = dram->cs + i;
+
+		writel((cs->base & 0xffff0000) |
+		       (cs->mbus_attr << 8) |
+		       dram->mbus_dram_target_id, base + WINDOW_BASE(i));
+		writel((cs->size - 1) & 0xffff0000, base + WINDOW_SIZE(i));
+
+		win_enable |= (1 << i);
+		win_enable |= 3 << (16 + (2 * i));
+	}
+
+	writel(win_enable, base + WINDOW_BAR_ENABLE(0));
+	writel(win_enable, base + WINDOW_BAR_ENABLE(1));
+	writel(0, base + WINDOW_OVERRIDE_CTRL(0));
+	writel(0, base + WINDOW_OVERRIDE_CTRL(1));
+}
+
+static const struct of_device_id mv_xor_dt_ids[] = {
+	{ .compatible = "marvell,orion-xor", .data = (void *)XOR_MODE_IN_REG },
+	{ .compatible = "marvell,armada-380-xor", .data = (void *)XOR_MODE_IN_DESC },
+	{},
+};
+
+static unsigned int mv_xor_engine_count;
+
+static int mv_xor_probe(struct platform_device *pdev)
+{
+	const struct mbus_dram_target_info *dram;
+	struct mv_xor_device *xordev;
+	struct mv_xor_platform_data *pdata = dev_get_platdata(&pdev->dev);
+	struct resource *res;
+	unsigned int max_engines, max_channels;
+	int i, ret;
+	int op_in_desc;
+
+	dev_notice(&pdev->dev, "Marvell shared XOR driver\n");
+
+	xordev = devm_kzalloc(&pdev->dev, sizeof(*xordev), GFP_KERNEL);
+	if (!xordev)
+		return -ENOMEM;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return -ENODEV;
+
+	xordev->xor_base = devm_ioremap(&pdev->dev, res->start,
+					resource_size(res));
+	if (!xordev->xor_base)
+		return -EBUSY;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!res)
+		return -ENODEV;
+
+	xordev->xor_high_base = devm_ioremap(&pdev->dev, res->start,
+					     resource_size(res));
+	if (!xordev->xor_high_base)
+		return -EBUSY;
+
+	platform_set_drvdata(pdev, xordev);
+
+	/*
+	 * (Re-)program MBUS remapping windows if we are asked to.
+	 */
+	dram = mv_mbus_dram_info();
+	if (dram)
+		mv_xor_conf_mbus_windows(xordev, dram);
+
+	/* Not all platforms can gate the clock, so it is not
+	 * an error if the clock does not exists.
+	 */
+	xordev->clk = clk_get(&pdev->dev, NULL);
+	if (!IS_ERR(xordev->clk))
+		clk_prepare_enable(xordev->clk);
+
+	/*
+	 * We don't want to have more than one channel per CPU in
+	 * order for async_tx to perform well. So we limit the number
+	 * of engines and channels so that we take into account this
+	 * constraint. Note that we also want to use channels from
+	 * separate engines when possible.
+	 */
+	max_engines = num_present_cpus();
+	max_channels = min_t(unsigned int,
+			     MV_XOR_MAX_CHANNELS,
+			     DIV_ROUND_UP(num_present_cpus(), 2));
+
+	if (mv_xor_engine_count >= max_engines)
+		return 0;
+
+	if (pdev->dev.of_node) {
+		struct device_node *np;
+		int i = 0;
+		const struct of_device_id *of_id =
+			of_match_device(mv_xor_dt_ids,
+					&pdev->dev);
+
+		for_each_child_of_node(pdev->dev.of_node, np) {
+			struct mv_xor_chan *chan;
+			dma_cap_mask_t cap_mask;
+			int irq;
+			op_in_desc = (int)of_id->data;
+
+			if (i >= max_channels)
+				continue;
+
+			dma_cap_zero(cap_mask);
+			dma_cap_set(DMA_MEMCPY, cap_mask);
+			dma_cap_set(DMA_XOR, cap_mask);
+			dma_cap_set(DMA_INTERRUPT, cap_mask);
+
+			irq = irq_of_parse_and_map(np, 0);
+			if (!irq) {
+				ret = -ENODEV;
+				goto err_channel_add;
+			}
+
+			chan = mv_xor_channel_add(xordev, pdev, i,
+						  cap_mask, irq, op_in_desc);
+			if (IS_ERR(chan)) {
+				ret = PTR_ERR(chan);
+				irq_dispose_mapping(irq);
+				goto err_channel_add;
+			}
+
+			xordev->channels[i] = chan;
+			i++;
+		}
+	} else if (pdata && pdata->channels) {
+		for (i = 0; i < max_channels; i++) {
+			struct mv_xor_channel_data *cd;
+			struct mv_xor_chan *chan;
+			int irq;
+
+			cd = &pdata->channels[i];
+			if (!cd) {
+				ret = -ENODEV;
+				goto err_channel_add;
+			}
+
+			irq = platform_get_irq(pdev, i);
+			if (irq < 0) {
+				ret = irq;
+				goto err_channel_add;
+			}
+
+			chan = mv_xor_channel_add(xordev, pdev, i,
+						  cd->cap_mask, irq,
+						  XOR_MODE_IN_REG);
+			if (IS_ERR(chan)) {
+				ret = PTR_ERR(chan);
+				goto err_channel_add;
+			}
+
+			xordev->channels[i] = chan;
+		}
+	}
+
+	return 0;
+
+err_channel_add:
+	for (i = 0; i < MV_XOR_MAX_CHANNELS; i++)
+		if (xordev->channels[i]) {
+			mv_xor_channel_remove(xordev->channels[i]);
+			if (pdev->dev.of_node)
+				irq_dispose_mapping(xordev->channels[i]->irq);
+		}
+
+	if (!IS_ERR(xordev->clk)) {
+		clk_disable_unprepare(xordev->clk);
+		clk_put(xordev->clk);
+	}
+
+	return ret;
+}
+
+static struct platform_driver mv_xor_driver = {
+	.probe		= mv_xor_probe,
+	.driver		= {
+		.name	        = MV_XOR_NAME,
+		.of_match_table = of_match_ptr(mv_xor_dt_ids),
+	},
+};
+
+
+static int __init mv_xor_init(void)
+{
+	return platform_driver_register(&mv_xor_driver);
+}
+device_initcall(mv_xor_init);
+
+/*
+MODULE_AUTHOR("Saeed Bishara <saeed@marvell.com>");
+MODULE_DESCRIPTION("DMA engine driver for Marvell's XOR engine");
+MODULE_LICENSE("GPL");
+*/
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ * Copyright (C) 2007, 2008, Marvell International Ltd.
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
+ * it under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; see the file COPYING.  If not, write to
- * the Free Software Foundation, 675 Mass Ave, Cambridge, MA 02139, USA.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
- *
- **************************************************************************/
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * for more details.
+ */
 
+#ifndef MV_XOR_H
+#define MV_XOR_H
 
 #include <linux/types.h>
+#include <linux/io.h>
+#include <linux/dmaengine.h>
+#include <linux/interrupt.h>
 
-#define TOTAL_SG_ENTRY		32
-#define MAX_SUPPORTED_ADAPTERS  8
-#define MAX_OFFSET		15
-#define MAX_TARGETS		16
+#define MV_XOR_POOL_SIZE		(MV_XOR_SLOT_SIZE * 3072)
+#define MV_XOR_SLOT_SIZE		64
+#define MV_XOR_THRESHOLD		1
+#define MV_XOR_MAX_CHANNELS             2
 
-typedef struct {
-	unsigned short base;
-	unsigned short vec;
-} i91u_config;
+#define MV_XOR_MIN_BYTE_COUNT		SZ_128
+#define MV_XOR_MAX_BYTE_COUNT		(SZ_16M - 1)
 
-/***************************************/
-/*  Tulip Configuration Register Set */
-/***************************************/
-#define TUL_PVID        0x00	/* Vendor ID                    */
-#define TUL_PDID        0x02	/* Device ID                    */
-#define TUL_PCMD        0x04	/* Command                      */
-#define TUL_PSTUS       0x06	/* Status                       */
-#define TUL_PRID        0x08	/* Revision number              */
-#define TUL_PPI         0x09	/* Programming interface        */
-#define TUL_PSC         0x0A	/* Sub Class                    */
-#define TUL_PBC         0x0B	/* Base Class                   */
-#define TUL_PCLS        0x0C	/* Cache line size              */
-#define TUL_PLTR        0x0D	/* Latency timer                */
-#define TUL_PHDT        0x0E	/* Header type                  */
-#define TUL_PBIST       0x0F	/* BIST                         */
-#define TUL_PBAD        0x10	/* Base address                 */
-#define TUL_PBAD1       0x14	/* Base address                 */
-#define TUL_PBAD2       0x18	/* Base address                 */
-#define TUL_PBAD3       0x1C	/* Base address                 */
-#define TUL_PBAD4       0x20	/* Base address                 */
-#define TUL_PBAD5       0x24	/* Base address                 */
-#define TUL_PRSVD       0x28	/* Reserved                     */
-#define TUL_PRSVD1      0x2C	/* Reserved                     */
-#define TUL_PRAD        0x30	/* Expansion ROM base address   */
-#define TUL_PRSVD2      0x34	/* Reserved                     */
-#define TUL_PRSVD3      0x38	/* Reserved                     */
-#define TUL_PINTL       0x3C	/* Interrupt line               */
-#define TUL_PINTP       0x3D	/* Interrupt pin                */
-#define TUL_PIGNT       0x3E	/* MIN_GNT                      */
-#define TUL_PMGNT       0x3F	/* MAX_GNT                      */
+/* Values for the XOR_CONFIG register */
+#define XOR_OPERATION_MODE_XOR		0
+#define XOR_OPERATION_MODE_MEMCPY	2
+#define XOR_OPERATION_MODE_IN_DESC      7
+#define XOR_DESCRIPTOR_SWAP		BIT(14)
+#define XOR_DESC_SUCCESS		0x40000000
 
-/************************/
-/*  Jasmin Register Set */
-/************************/
-#define TUL_HACFG0      0x40	/* H/A Configuration Register 0         */
-#define TUL_HACFG1      0x41	/* H/A Configuration Register 1         */
-#define TUL_HACFG2      0x42	/* H/A Configuration Register 2         */
+#define XOR_DESC_OPERATION_XOR          (0 << 24)
+#define XOR_DESC_OPERATION_CRC32C       (1 << 24)
+#define XOR_DESC_OPERATION_MEMCPY       (2 << 24)
 
-#define TUL_SDCFG0      0x44	/* SCSI Device Configuration 0          */
-#define TUL_SDCFG1      0x45	/* SCSI Device Configuration 1          */
-#define TUL_SDCFG2      0x46	/* SCSI Device Configuration 2          */
-#define TUL_SDCFG3      0x47	/* SCSI Device Configuration 3          */
+#define XOR_DESC_DMA_OWNED		BIT(31)
+#define XOR_DESC_EOD_INT_EN		BIT(31)
 
-#define TUL_GINTS       0x50	/* Global Interrupt Status Register     */
-#define TUL_GIMSK       0x52	/* Global Interrupt MASK Register       */
-#define TUL_GCTRL       0x54	/* Global Control Register              */
-#define TUL_GCTRL_EEPROM_BIT    0x04
-#define TUL_GCTRL1      0x55	/* Global Control Register              */
-#define TUL_DMACFG      0x5B	/* DMA configuration                    */
-#define TUL_NVRAM       0x5D	/* Non-volatile RAM port                */
+#define XOR_CURR_DESC(chan)	(chan->mmr_high_base + 0x10 + (chan->idx * 4))
+#define XOR_NEXT_DESC(chan)	(chan->mmr_high_base + 0x00 + (chan->idx * 4))
+#define XOR_BYTE_COUNT(chan)	(chan->mmr_high_base + 0x20 + (chan->idx * 4))
+#define XOR_DEST_POINTER(chan)	(chan->mmr_high_base + 0xB0 + (chan->idx * 4))
+#define XOR_BLOCK_SIZE(chan)	(chan->mmr_high_base + 0xC0 + (chan->idx * 4))
+#define XOR_INIT_VALUE_LOW(chan)	(chan->mmr_high_base + 0xE0)
+#define XOR_INIT_VALUE_HIGH(chan)	(chan->mmr_high_base + 0xE4)
 
-#define TUL_SCnt0       0x80	/* 00 R/W Transfer Counter Low          */
-#define TUL_SCnt1       0x81	/* 01 R/W Transfer Counter Mid          */
-#define TUL_SCnt2       0x82	/* 02 R/W Transfer Count High           */
-#define TUL_SFifoCnt    0x83	/* 03 R   FIFO counter                  */
-#define TUL_SIntEnable  0x84	/* 03 W   Interrupt enble               */
-#define TUL_SInt        0x84	/* 04 R   Interrupt Register            */
-#define TUL_SCtrl0      0x85	/* 05 W   Control 0                     */
-#define TUL_SStatus0    0x85	/* 05 R   Status 0                      */
-#define TUL_SCtrl1      0x86	/* 06 W   Control 1                     */
-#define TUL_SStatus1    0x86	/* 06 R   Status 1                      */
-#define TUL_SConfig     0x87	/* 07 W   Configuration                 */
-#define TUL_SStatus2    0x87	/* 07 R   Status 2                      */
-#define TUL_SPeriod     0x88	/* 08 W   Sync. Transfer Period & Offset */
-#define TUL_SOffset     0x88	/* 08 R   Offset                        */
-#define TUL_SScsiId     0x89	/* 09 W   SCSI ID                       */
-#define TUL_SBusId      0x89	/* 09 R   SCSI BUS ID                   */
-#define TUL_STimeOut    0x8A	/* 0A W   Sel/Resel Time Out Register   */
-#define TUL_SIdent      0x8A	/* 0A R   Identify Message Register     */
-#define TUL_SAvail      0x8A	/* 0A R   Available Counter Register   */
-#define TUL_SData       0x8B	/* 0B R/W SCSI data in/out              */
-#define TUL_SFifo       0x8C	/* 0C R/W FIFO                          */
-#define TUL_SSignal     0x90	/* 10 R/W SCSI signal in/out            */
-#define TUL_SCmd        0x91	/* 11 R/W Command                       */
-#define TUL_STest0      0x92	/* 12 R/W Test0                         */
-#define TUL_STest1      0x93	/* 13 R/W Test1                         */
-#define TUL_SCFG1	0x94	/* 14 R/W Configuration                 */
+#define XOR_CONFIG(chan)	(chan->mmr_base + 0x10 + (chan->idx * 4))
+#define XOR_ACTIVATION(chan)	(chan->mmr_base + 0x20 + (chan->idx * 4))
+#define XOR_INTR_CAUSE(chan)	(chan->mmr_base + 0x30)
+#define XOR_INTR_MASK(chan)	(chan->mmr_base + 0x40)
+#define XOR_ERROR_CAUSE(chan)	(chan->mmr_base + 0x50)
+#define XOR_ERROR_ADDR(chan)	(chan->mmr_base + 0x60)
 
-#define TUL_XAddH       0xC0	/*DMA Transfer Physical Address         */
-#define TUL_XAddW       0xC8	/*DMA Current Transfer Physical Address */
-#define TUL_XCntH       0xD0	/*DMA Transfer Counter                  */
-#define TUL_XCntW       0xD4	/*DMA Current Transfer Counter          */
-#define TUL_XCmd        0xD8	/*DMA Command Register                  */
-#define TUL_Int         0xDC	/*Interrupt Register                    */
-#define TUL_XStatus     0xDD	/*DMA status Register                   */
-#define TUL_Mask        0xE0	/*Interrupt Mask Register               */
-#define TUL_XCtrl       0xE4	/*DMA Control Register                  */
-#define TUL_XCtrl1      0xE5	/*DMA Control Register 1                */
-#define TUL_XFifo       0xE8	/*DMA FIFO                              */
+#define XOR_INT_END_OF_DESC	BIT(0)
+#define XOR_INT_END_OF_CHAIN	BIT(1)
+#define XOR_INT_STOPPED		BIT(2)
+#define XOR_INT_PAUSED		BIT(3)
+#define XOR_INT_ERR_DECODE	BIT(4)
+#define XOR_INT_ERR_RDPROT	BIT(5)
+#define XOR_INT_ERR_WRPROT	BIT(6)
+#define XOR_INT_ERR_OWN		BIT(7)
+#define XOR_INT_ERR_PAR		BIT(8)
+#define XOR_INT_ERR_MBUS	BIT(9)
 
-#define TUL_WCtrl       0xF7	/*Bus master wait state control         */
-#define TUL_DCtrl       0xFB	/*DMA delay control                     */
+#define XOR_INTR_ERRORS		(XOR_INT_ERR_DECODE | XOR_INT_ERR_RDPROT | \
+				 XOR_INT_ERR_WRPROT | XOR_INT_ERR_OWN    | \
+				 XOR_INT_ERR_PAR    | XOR_INT_ERR_MBUS)
 
-/*----------------------------------------------------------------------*/
-/*   bit definition for Command register of Configuration Space Header  */
-/*----------------------------------------------------------------------*/
-#define BUSMS           0x04	/* BUS MASTER Enable                    */
-#define IOSPA           0x01	/* IO Space Enable                      */
+#define XOR_INTR_MASK_VALUE	(XOR_INT_END_OF_DESC | XOR_INT_END_OF_CHAIN | \
+				 XOR_INT_STOPPED     | XOR_INTR_ERRORS)
 
-/*----------------------------------------------------------------------*/
-/* Command Codes of Tulip SCSI Command register                         */
-/*----------------------------------------------------------------------*/
-#define TSC_EN_RESEL    0x80	/* Enable Reselection                   */
-#define TSC_CMD_COMP    0x84	/* Command Complete Sequence            */
-#define TSC_SEL         0x01	/* Select Without ATN Sequence          */
-#define TSC_SEL_ATN     0x11	/* Select With ATN Sequence             */
-#define TSC_SEL_ATN_DMA 0x51	/* Select With ATN Sequence with DMA    */
-#define TSC_SEL_ATN3    0x31	/* Select With ATN3 Sequence            */
-#define TSC_SEL_ATNSTOP 0x12	/* Select With ATN and Stop Sequence    */
-#define TSC_SELATNSTOP  0x1E	/* Select With ATN and Stop Sequence    */
+#define WINDOW_BASE(w)		(0x50 + ((w) << 2))
+#define WINDOW_SIZE(w)		(0x70 + ((w) << 2))
+#define WINDOW_REMAP_HIGH(w)	(0x90 + ((w) << 2))
+#define WINDOW_BAR_ENABLE(chan)	(0x40 + ((chan) << 2))
+#define WINDOW_OVERRIDE_CTRL(chan)	(0xA0 + ((chan) << 2))
 
-#define TSC_SEL_ATN_DIRECT_IN   0x95	/* Select With ATN Sequence     */
-#define TSC_SEL_ATN_DIRECT_OUT  0x15	/* Select With ATN Sequence     */
-#define TSC_SEL_ATN3_DIRECT_IN  0xB5	/* Select With ATN3 Sequence    */
-#define TSC_SEL_ATN3_DIRECT_OUT 0x35	/* Select With ATN3 Sequence    */
-#define TSC_XF_DMA_OUT_DIRECT   0x06	/* DMA Xfer Information out      */
-#define TSC_XF_DMA_IN_DIRECT    0x86	/* DMA Xfer Information in       */
-
-#define TSC_XF_DMA_OUT  0x43	/* DMA Xfer Information out              */
-#define TSC_XF_DMA_IN   0xC3	/* DMA Xfer Information in               */
-#define TSC_XF_FIFO_OUT 0x03	/* FIFO Xfer Information out             */
-#define TSC_XF_FIFO_IN  0x83	/* FIFO Xfer Information in              */
-
-#define TSC_MSG_ACCEPT  0x0F	/* Message Accept                       */
-
-/*----------------------------------------------------------------------*/
-/* bit definition for Tulip SCSI Control 0 Register                     */
-/*----------------------------------------------------------------------*/
-#define TSC_RST_SEQ     0x20	/* Reset sequence counter               */
-#define TSC_FLUSH_FIFO  0x10	/* Flush FIFO                           */
-#define TSC_ABT_CMD     0x04	/* Abort command (sequence)             */
-#define TSC_RST_CHIP    0x02	/* Reset SCSI Chip                      */
-#define TSC_RST_BUS     0x01	/* Reset SCSI Bus                       */
-
-/*----------------------------------------------------------------------*/
-/* bit definition for Tulip SCSI Control 1 Register                     */
-/*----------------------------------------------------------------------*/
-#define TSC_EN_SCAM     0x80	/* Enable SCAM                          */
-#define TSC_TIMER       0x40	/* Select timeout unit                  */
-#define TSC_EN_SCSI2    0x20	/* SCSI-2 mode                          */
-#define TSC_PWDN        0x10	/* Power down mode                      */
-#define TSC_WIDE_CPU    0x08	/* Wide CPU                             */
-#define TSC_HW_RESELECT 0x04	/* Enable HW reselect                   */
-#define TSC_EN_BUS_OUT  0x02	/* Enable SCSI data bus out latch       */
-#define TSC_EN_BUS_IN   0x01	/* Enable SCSI data bus in latch        */
-
-/*----------------------------------------------------------------------*/
-/* bit definition for Tulip SCSI Configuration Register                 */
-/*----------------------------------------------------------------------*/
-#define TSC_EN_LATCH    0x80	/* Enable phase latch                   */
-#define TSC_INITIATOR   0x40	/* Initiator mode                       */
-#define TSC_EN_SCSI_PAR 0x20	/* Enable SCSI parity                   */
-#define TSC_DMA_8BIT    0x10	/* Alternate dma 8-bits mode            */
-#define TSC_DMA_16BIT   0x08	/* Alternate dma 16-bits mode           */
-#define TSC_EN_WDACK    0x04	/* Enable DACK while wide SCSI xfer     */
-#define TSC_ALT_PERIOD  0x02	/* Alternate sync period mode           */
-#define TSC_DIS_SCSIRST 0x01	/* Disable SCSI bus reset us            */
-
-#define TSC_INITDEFAULT (TSC_INITIATOR | TSC_EN_LATCH | TSC_ALT_PERIOD | TSC_DIS_SCSIRST)
-
-#define TSC_WIDE_SCSI   0x80	/* Enable Wide SCSI                     */
-
-/*----------------------------------------------------------------------*/
-/* bit definition for Tulip SCSI signal Register                        */
-/*----------------------------------------------------------------------*/
-#define TSC_RST_ACK     0x00	/* Release ACK signal                   */
-#define TSC_RST_ATN     0x00	/* Release ATN signal                   */
-#define TSC_RST_BSY     0x00	/* Release BSY signal                   */
-
-#define TSC_SET_ACK     0x40	/* ACK signal                           */
-#define TSC_SET_ATN     0x08	/* ATN signal                           */
-
-#define TSC_REQI        0x80	/* REQ signal                           */
-#define TSC_ACKI        0x40	/* ACK signal                           */
-#define TSC_BSYI        0x20	/* BSY signal                           */
-#define TSC_SELI        0x10	/* SEL signal                           */
-#define TSC_ATNI        0x08	/* ATN signal                           */
-#define TSC_MSGI        0x04	/* MSG signal                           */
-#define TSC_CDI         0x02	/* C/D signal                           */
-#define TSC_IOI         0x01	/* I/O signal                           */
-
-
-/*----------------------------------------------------------------------*/
-/* bit definition for Tulip SCSI Status 0 Register                      */
-/*----------------------------------------------------------------------*/
-#define TSS_INT_PENDING 0x80	/* Interrupt pending            */
-#define TSS_SEQ_ACTIVE  0x40	/* Sequencer active             */
-#define TSS_XFER_CNT    0x20	/* Transfer counter zero        */
-#define TSS_FIFO_EMPTY  0x10	/* FIFO empty                   */
-#define TSS_PAR_ERROR   0x08	/* SCSI parity error            */
-#define TSS_PH_MASK     0x07	/* SCSI phase mask              */
-
-/*----------------------------------------------------------------------*/
-/* bit definition for Tulip SCSI Status 1 Register                      */
-/*----------------------------------------------------------------------*/
-#define TSS_STATUS_RCV  0x08	/* Status received              */
-#define TSS_MSG_SEND    0x40	/* Message sent                 */
-#define TSS_CMD_PH_CMP  0x20	/* command phase done              */
-#define TSS_DATA_PH_CMP 0x10	/* Data phase done              */
-#define TSS_STATUS_SEND 0x08	/* Status sent                  */
-#define TSS_XFER_CMP    0x04	/* Transfer completed           */
-#define TSS_SEL_CMP     0x02	/* Selection completed          */
-#define TSS_ARB_CMP     0x01	/* Arbitration completed        */
-
-/*----------------------------------------------------------------------*/
-/* bit definition for Tulip SCSI Status 2 Register                      */
-/*----------------------------------------------------------------------*/
-#define TSS_CMD_ABTED   0x80	/* Command aborted              */
-#define TSS_OFFSET_0    0x40	/* Offset counter zero          */
-#define TSS_FIFO_FULL   0x20	/* FIFO full                    */
-#define TSS_TIMEOUT_0   0x10	/* Timeout counter zero         */
-#define TSS_BUSY_RLS    0x08	/* Busy release                 */
-#define TSS_PH_MISMATCH 0x04	/* Phase mismatch               */
-#define TSS_SCSI_BUS_EN 0x02	/* SCSI data bus enable         */
-#define TSS_SCSIRST     0x01	/* SCSI bus reset in progress   */
-
-/*----------------------------------------------------------------------*/
-/* bit definition for Tulip SCSI Interrupt Register                     */
-/*----------------------------------------------------------------------*/
-#define TSS_RESEL_INT   0x80	/* Reselected interrupt         */
-#define TSS_SEL_TIMEOUT 0x40	/* Selected/reselected timeout  */
-#define TSS_BUS_SERV    0x20
-#define TSS_SCSIRST_INT 0x10	/* SCSI bus reset detected      */
-#define TSS_DISC_INT    0x08	/* Disconnected interrupt       */
-#define TSS_SEL_INT     0x04	/* Select interrupt             */
-#define TSS_SCAM_SEL    0x02	/* SCAM selected                */
-#define TSS_FUNC_COMP   0x01
-
-/*----------------------------------------------------------------------*/
-/* SCSI Phase Codes.                                                    */
-/*----------------------------------------------------------------------*/
-#define DATA_OUT        0
-#define DATA_IN         1	/* 4                            */
-#define CMD_OUT         2
-#define STATUS_IN       3	/* 6                            */
-#define MSG_OUT         6	/* 3                            */
-#define MSG_IN          7
-
-
-
-/*----------------------------------------------------------------------*/
-/* Command Codes of Tulip xfer Command register                         */
-/*----------------------------------------------------------------------*/
-#define TAX_X_FORC      0x02
-#define TAX_X_ABT       0x04
-#define TAX_X_CLR_FIFO  0x08
-
-#define TAX_X_IN        0x21
-#define TAX_X_OUT       0x01
-#define TAX_SG_IN       0xA1
-#define TAX_SG_OUT      0x81
-
-/*----------------------------------------------------------------------*/
-/* Tulip Interrupt Register                                             */
-/*----------------------------------------------------------------------*/
-#define XCMP            0x01
-#define FCMP            0x02
-#define XABT            0x04
-#define XERR            0x08
-#define SCMP            0x10
-#define IPEND           0x80
-
-/*----------------------------------------------------------------------*/
-/* Tulip DMA Status Register                                            */
-/*----------------------------------------------------------------------*/
-#define XPEND           0x01	/* Transfer pending             */
-#define FEMPTY          0x02	/* FIFO empty                   */
-
-
-
-/*----------------------------------------------------------------------*/
-/* bit definition for TUL_GCTRL                                         */
-/*----------------------------------------------------------------------*/
-#define EXTSG           0x80
-#define EXTAD           0x60
-#define SEG4K           0x08
-#define EEPRG           0x04
-#define MRMUL           0x02
-
-/*----------------------------------------------------------------------*/
-/* bit definition for TUL_NVRAM                                         */
-/*----------------------------------------------------------------------*/
-#define SE2CS           0x08
-#define SE2CLK          0x04
-#define SE2DO           0x02
-#define SE2DI           0x01
-
-
-/************************************************************************/
-/*              Scatter-Gather Element Structure                        */
-/************************************************************************/
-struct sg_entry {
-	u32 data;		/* Data Pointer */
-	u32 len;		/* Data Length */
+struct mv_xor_device {
+	void __iomem	     *xor_base;
+	void __iomem	     *xor_high_base;
+	struct clk	     *clk;
+	struct mv_xor_chan   *channels[MV_XOR_MAX_CHANNELS];
 };
 
-/***********************************************************************
-		SCSI Control Block
-************************************************************************/
-struct scsi_ctrl_blk {
-	struct scsi_ctrl_blk *next;
-	u8 status;	/*4 */
-	u8 next_state;	/*5 */
-	u8 mode;		/*6 */
-	u8 msgin;	/*7 SCB_Res0 */
-	u16 sgidx;	/*8 */
-	u16 sgmax;	/*A */
-#ifdef ALPHA
-	u32 reserved[2];	/*C */
+/**
+ * struct mv_xor_chan - internal representation of a XOR channel
+ * @pending: allows batching of hardware operations
+ * @lock: serializes enqueue/dequeue operations to the descriptors pool
+ * @mmr_base: memory mapped register base
+ * @idx: the index of the xor channel
+ * @chain: device chain view of the descriptors
+ * @free_slots: free slots usable by the channel
+ * @allocated_slots: slots allocated by the driver
+ * @completed_slots: slots completed by HW but still need to be acked
+ * @device: parent device
+ * @common: common dmaengine channel object members
+ * @slots_allocated: records the actual size of the descriptor slot pool
+ * @irq_tasklet: bottom half where mv_xor_slot_cleanup runs
+ * @op_in_desc: new mode of driver, each op is writen to descriptor.
+ */
+struct mv_xor_chan {
+	int			pending;
+	spinlock_t		lock; /* protects the descriptor slot pool */
+	void __iomem		*mmr_base;
+	void __iomem		*mmr_high_base;
+	unsigned int		idx;
+	int                     irq;
+	enum dma_transaction_type	current_type;
+	struct list_head	chain;
+	struct list_head	free_slots;
+	struct list_head	allocated_slots;
+	struct list_head	completed_slots;
+	dma_addr_t		dma_desc_pool;
+	void			*dma_desc_pool_virt;
+	size_t                  pool_size;
+	struct dma_device	dmadev;
+	struct dma_chan		dmachan;
+	int			slots_allocated;
+	struct tasklet_struct	irq_tasklet;
+	int                     op_in_desc;
+	char			dummy_src[MV_XOR_MIN_BYTE_COUNT];
+	char			dummy_dst[MV_XOR_MIN_BYTE_COUNT];
+	dma_addr_t		dummy_src_addr, dummy_dst_addr;
+};
+
+/**
+ * struct mv_xor_desc_slot - software descriptor
+ * @node: node on the mv_xor_chan lists
+ * @hw_desc: virtual address of the hardware descriptor chain
+ * @phys: hardware address of the hardware descriptor chain
+ * @slot_used: slot in use or not
+ * @idx: pool index
+ * @tx_list: list of slots that make up a multi-descriptor transaction
+ * @async_tx: support for the async_tx api
+ */
+struct mv_xor_desc_slot {
+	struct list_head	node;
+	enum dma_transaction_type	type;
+	void			*hw_desc;
+	u16			idx;
+	struct dma_async_tx_descriptor	async_tx;
+};
+
+/*
+ * This structure describes XOR descriptor size 64bytes. The
+ * mv_phy_src_idx() macro must be used when indexing the values of the
+ * phy_src_addr[] array. This is due to the fact that the 'descriptor
+ * swap' feature, used on big endian systems, swaps descriptors data
+ * within blocks of 8 bytes. So two consecutive values of the
+ * phy_src_addr[] array are actually swapped in big-endian, which
+ * explains the different mv_phy_src_idx() implementation.
+ */
+#if defined(__LITTLE_ENDIAN)
+struct mv_xor_desc {
+	u32 status;		/* descriptor execution status */
+	u32 crc32_result;	/* result of CRC-32 calculation */
+	u32 desc_command;	/* type of operation to be carried out */
+	u32 phy_next_desc;	/* next descriptor address pointer */
+	u32 byte_count;		/* size of src/dst blocks in bytes */
+	u32 phy_dest_addr;	/* destination block address */
+	u32 phy_src_addr[8];	/* source block addresses */
+	u32 reserved0;
+	u32 reserved1;
+};
+#define mv_phy_src_idx(src_idx) (src_idx)
 #else
-	u32 reserved[3];	/*C */
+struct mv_xor_desc {
+	u32 crc32_result;	/* result of CRC-32 calculation */
+	u32 status;		/* descriptor execution status */
+	u32 phy_next_desc;	/* next descriptor address pointer */
+	u32 desc_command;	/* type of operation to be carried out */
+	u32 phy_dest_addr;	/* destination block address */
+	u32 byte_count;		/* size of src/dst blocks in bytes */
+	u32 phy_src_addr[8];	/* source block addresses */
+	u32 reserved1;
+	u32 reserved0;
+};
+#define mv_phy_src_idx(src_idx) (src_idx ^ 1)
 #endif
 
-	u32 xferlen;	/*18 Current xfer len           */
-	u32 totxlen;	/*1C Total xfer len             */
-	u32 paddr;		/*20 SCB phy. Addr. */
+#define to_mv_sw_desc(addr_hw_desc)		\
+	container_of(addr_hw_desc, struct mv_xor_desc_slot, hw_desc)
 
-	u8 opcode;	/*24 SCB command code */
-	u8 flags;	/*25 SCB Flags */
-	u8 target;	/*26 Target Id */
-	u8 lun;		/*27 Lun */
-	u32 bufptr;		/*28 Data Buffer Pointer */
-	u32 buflen;		/*2C Data Allocation Length */
-	u8 sglen;	/*30 SG list # */
-	u8 senselen;	/*31 Sense Allocation Length */
-	u8 hastat;	/*32 */
-	u8 tastat;	/*33 */
-	u8 cdblen;	/*34 CDB Length */
-	u8 ident;	/*35 Identify */
-	u8 tagmsg;	/*36 Tag Message */
-	u8 tagid;	/*37 Queue Tag */
-	u8 cdb[12];	/*38 */
-	u32 sgpaddr;	/*44 SG List/Sense Buf phy. Addr. */
-	u32 senseptr;	/*48 Sense data pointer */
-	void (*post) (u8 *, u8 *);	/*4C POST routine */
-	struct scsi_cmnd *srb;	/*50 SRB Pointer */
-	struct sg_entry sglist[TOTAL_SG_ENTRY];	/*54 Start of SG list */
-};
+#define mv_hw_desc_slot_idx(hw_desc, idx)	\
+	((void *)(((unsigned long)hw_desc) + ((idx) << 5)))
 
-/* Bit Definition for status */
-#define SCB_RENT        0x01
-#define SCB_PEND        0x02
-#define SCB_CONTIG      0x04	/* Contingent Allegiance */
-#define SCB_SELECT      0x08
-#define SCB_BUSY        0x10
-#define SCB_DONE        0x20
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+ * Copyright 2011 Freescale Semiconductor, Inc. All Rights Reserved.
+ *
+ * Refer to drivers/dma/imx-sdma.c
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ */
 
+#include <linux/init.h>
+#include <linux/types.h>
+#include <linux/mm.h>
+#include <linux/interrupt.h>
+#include <linux/clk.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
+#include <linux/semaphore.h>
+#include <linux/device.h>
+#include <linux/dma-mapping.h>
+#include <linux/slab.h>
+#include <linux/platform_device.h>
+#include <linux/dmaengine.h>
+#include <linux/delay.h>
+#include <linux/module.h>
+#include <linux/stmp_device.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/of_dma.h>
+#include <linux/list.h>
 
-/* Opcodes for opcode */
-#define ExecSCSI        0x1
-#define BusDevRst       0x2
-#define AbortCmd        0x3
+#include <asm/irq.h>
 
+#include "dmaengine.h"
 
-/* Bit Definition for mode */
-#define SCM_RSENS       0x01	/* request sense mode */
+/*
+ * NOTE: The term "PIO" throughout the mxs-dma implementation means
+ * PIO mode of mxs apbh-dma and apbx-dma.  With this working mode,
+ * dma can program the controller registers of peripheral devices.
+ */
 
+#define dma_is_apbh(mxs_dma)	((mxs_dma)->type == MXS_DMA_APBH)
+#define apbh_is_old(mxs_dma)	((mxs_dma)->dev_id == IMX23_DMA)
 
-/* Bit Definition for flags */
-#define SCF_DONE        0x01
-#define SCF_POST        0x02
-#define SCF_SENSE       0x04
-#define SCF_DIR         0x18
-#define SCF_NO_DCHK     0x00
-#define SCF_DIN         0x08
-#define SCF_DOUT        0x10
-#define SCF_NO_XF       0x18
-#define SCF_WR_VF       0x20	/* Write verify turn on         */
-#define SCF_POLL        0x40
-#define SCF_SG          0x80
-
-/* Error Codes for SCB_HaStat */
-#define HOST_SEL_TOUT   0x11
-#define HOST_DO_DU      0x12
-#define HOST_BUS_FREE   0x13
-#define HOST_BAD_PHAS   0x14
-#define HOST_INV_CMD    0x16
-#define HOST_ABORTED    0x1A	/* 07/21/98 */
-#define HOST_SCSI_RST   0x1B
-#define HOST_DEV_RST    0x1C
-
-/* Error Codes for SCB_TaStat */
-#define TARGET_CHKCOND  0x02
-#define TARGET_BUSY     0x08
-#define INI_QUEUE_FULL	0x28
-
-/* SCSI MESSAGE */
-#define MSG_COMP        0x00
-#define MSG_EXTEND      0x01
-#define MSG_SDP         0x02
-#define MSG_RESTORE     0x03
-#define MSG_DISC        0x04
-#define MSG_IDE         0x05
-#define MSG_ABORT       0x06
-#define MSG_REJ         0x07
-#define MSG_NOP         0x08
-#define MSG_PARITY      0x09
-#define MSG_LINK_COMP   0x0A
-#define MSG_LINK_FLAG   0x0B
-#define MSG_DEVRST      0x0C
-#define MSG_ABORT_TAG   0x0D
-
-/* Queue tag msg: Simple_quque_tag, Head_of_queue_tag, Ordered_queue_tag */
-#define MSG_STAG        0x20
-#define MSG_HTAG        0x21
-#define MSG_OTAG        0x22
-
-#define MSG_IGNOREWIDE  0x23
-
-#define MSG_IDENT   0x80
-
-/***********************************************************************
-		Target Device Control Structure
-**********************************************************************/
-
-struct target_control {
-	u16 flags;
-	u8 js_period;
-	u8 sconfig0;
-	u16 drv_flags;
-	u8 heads;
-	u8 sectors;
-};
-
-/***********************************************************************
-		Target Device Control Structure
-**********************************************************************/
-
-/* Bit Definition for TCF_Flags */
-#define TCF_SCSI_RATE           0x0007
-#define TCF_EN_DISC             0x0008
-#define TCF_NO_SYNC_NEGO        0x0010
-#define TCF_NO_WDTR             0x0020
-#define TCF_EN_255              0x0040
-#define TCF_EN_START            0x0080
-#define TCF_WDTR_DONE           0x0100
-#define TCF_SYNC_DONE           0x0200
-#define TCF_BUSY                0x0400
-
-
-/* Bit Definition for TCF_DrvFlags */
-#define TCF_DRV_BUSY            0x01	/* Indicate target busy(driver) */
-#define TCF_DRV_EN_TAG          0x0800
-#define TCF_DRV_255_63          0x0400
-
-/***********************************************************************
-	      Host Adapter Control Structure
-************************************************************************/
-struct initio_host {
-	u16 addr;		/* 00 */
-	u16 bios_addr;		/* 02 */
-	u8 irq;			/* 04 */
-	u8 scsi_id;		/* 05 */
-	u8 max_tar;		/* 06 */
-	u8 num_scbs;		/* 07 */
-
-	u8 flags;		/* 08 */
-	u8 index;		/* 09 */
-	u8 ha_id;		/* 0A */
-	u8 config;		/* 0B */
-	u16 idmask;		/* 0C */
-	u8 semaph;		/* 0E */
-	u8 phase;		/* 0F */
-	u8 jsstatus0;		/* 10 */
-	u8 jsint;		/* 11 */
-	u8 jsstatus1;		/* 12 */
-	u8 sconf1;		/* 13 */
-
-	u8 msg[8];		/* 14 */
-	struct scsi_ctrl_blk *next_avail;	/* 1C */
-	struct scsi_ctrl_blk *scb;		/* 20 */
-	struct scsi_ctrl_blk *scb_end;		/* 24 */ /*UNUSED*/
-	struct scsi_ctrl_blk *next_pending;	/* 28 */
-	struct scsi_ctrl_blk *next_contig;	/* 2C */ /*UNUSED*/
-	struct scsi_ctrl_blk *active;		/* 30 */
-	struct target_control *active_tc;	/* 34 */
-
-	struct scsi_ctrl_blk *first_avail;	/* 38 */
-	struct scsi_ctrl_blk *last_avail;	/* 3C */
-	struct scsi_ctrl_blk *first_pending;	/* 40 */
-	struct scsi_ctrl_blk *last_pending;	/* 44 */
-	struct scsi_ctrl_blk *first_busy;	/* 48 */
-	struct scsi_ctrl_blk *last_busy;	/* 4C */
-	struct scsi_ctrl_blk *first_done;	/* 50 */
-	struct scsi_ctrl_blk *last_done;	/* 54 */
-	u8 max_tags[16];	/* 58 */
-	u8 act_tags[16];	/* 68 */
-	struct target_control targets[MAX_TARGETS];	/* 78 */
-	spinlock_t avail_lock;
-	spinlock_t semaph_lock;
-	struct pci_dev *pci_dev;
-};
-
-/* Bit Definition for HCB_Config */
-#define HCC_SCSI_RESET          0x01
-#define HCC_EN_PAR              0x02
-#define HCC_ACT_TERM1           0x04
-#define HCC_ACT_TERM2           0x08
-#define HCC_AUTO_TERM           0x10
-#define HCC_EN_PWR              0x80
-
-/* Bit Definition for HCB_Flags */
-#define HCF_EXPECT_DISC         0x01
-#define HCF_EXPECT_SELECT       0x02
-#define HCF_EXPECT_RESET        0x10
-#define HCF_EXPECT_DONE_DISC    0x20
-
-/******************************************************************
-	Serial EEProm
-*******************************************************************/
-
-typedef struct _NVRAM_SCSI {	/* SCSI channel configuration   */
-	u8 NVM_ChSCSIID;	/* 0Ch -> Channel SCSI ID       */
-	u8 NVM_ChConfig1;	/* 0Dh -> Channel config 1      */
-	u8 NVM_ChConfig2;	/* 0Eh -> Channel config 2      */
-	u8 NVM_NumOfTarg;	/* 0Fh -> Number of SCSI target */
-	/* SCSI target configuration    */
-	u8 NVM_Targ0Config;	/* 10h -> Target 0 configuration */
-	u8 NVM_Targ1Config;	/* 11h -> Target 1 configuration */
-	u8 NVM_Targ2Config;	/* 12h -> Target 2 configuration */
-	u8 NVM_Targ3Config;	/* 13h -> Target 3 configuration */
-	u8 NVM_Targ4Config;	/* 14h -> Target 4 configuration */
-	u8 NVM_Targ5Config;	/* 15h -> Target 5 configuration */
-	u8 NVM_Targ6Config;	/* 16h -> Target 6 configuration */
-	u8 NVM_Targ7Config;	/* 17h -> Target 7 configuration */
-	u8 NVM_Targ8Config;	/* 18h -> Target 8 configuration */
-	u8 NVM_Targ9Config;	/* 19h -> Target 9 configuration */
-	u8 NVM_TargAConfig;	/* 1Ah -> Target A configuration */
-	u8 NVM_TargBConfig;	/* 1Bh -> Target B configuration */
-	u8 NVM_TargCConfig;	/* 1Ch -> Target C configuration */
-	u8 NVM_TargDConfig;	/* 1Dh -> Target D configuration */
-	u8 NVM_TargEConfig;	/* 1Eh -> Target E configuration */
-	u8 NVM_TargFConfig;	/* 1Fh -> Target F configuration */
-} NVRAM_SCSI;
-
-typedef struct _NVRAM {
-/*----------header ---------------*/
-	u16 NVM_Signature;	/* 0,1: Signature */
-	u8 NVM_Size;		/* 2:   Size of data structure */
-	u8 NVM_Revision;	/* 3:   Revision of data structure */
-	/* ----Host Adapter Structure ---- */
-	u8 NVM_ModelByte0;	/* 4:   Model number (byte 0) */
-	u8 NVM_ModelByte1;	/* 5:   Model number (byte 1) */
-	u8 NVM_ModelInfo;	/* 6:   Model information         */
-	u8 NVM_NumOfCh;	/* 7:   Number of SCSI channel */
-	u8 NVM_BIOSConfig1;	/* 8:   BIOS configuration 1  */
-	u8 NVM_BIOSConfig2;	/* 9:   BIOS configuration 2  */
-	u8 NVM_HAConfig1;	/* A:   Hoat adapter configuration 1 */
-	u8 NVM_HAConfig2;	/* B:   Hoat adapter configuration 2 */
-	NVRAM_SCSI NVM_SCSIInfo[2];
-	u8 NVM_reserved[10];
-	/* ---------- CheckSum ----------       */
-	u16 NVM_CheckSum;	/* 0x3E, 0x3F: Checksum of NVRam        */
-} NVRAM, *PNVRAM;
-
-/* Bios Configuration for nvram->BIOSConfig1                            */
-#define NBC1_ENABLE             0x01	/* BIOS enable                  */
-#define NBC1_8DRIVE             0x02	/* Support more than 2 drives   */
-#define NBC1_REMOVABLE          0x04	/* Support removable drive      */
-#define NBC1_INT19              0x08	/* Intercept int 19h            */
-#define NBC1_BIOSSCAN           0x10	/* Dynamic BIOS scan            */
-#define NBC1_LUNSUPPORT         0x40	/* Support LUN                  */
-
-/* HA Configuration Byte 1                                              */
-#define NHC1_BOOTIDMASK 0x0F	/* Boot ID number               */
-#define NHC1_LUNMASK    0x70	/* Boot LUN number              */
-#define NHC1_CHANMASK   0x80	/* Boot Channel number          */
-
-/* Bit definition for nvram->SCSIconfig1                                */
-#define NCC1_BUSRESET           0x01	/* Reset SCSI bus at power up   */
-#define NCC1_PARITYCHK          0x02	/* SCSI parity enable           */
-#define NCC1_ACTTERM1           0x04	/* Enable active terminator 1   */
-#define NCC1_ACTTERM2           0x08	/* Enable active terminator 2   */
-#define NCC1_AUTOTERM           0x10	/* Enable auto terminator       */
-#define NCC1_PWRMGR             0x80	/* Enable power management      */
-
-/* Bit definition for SCSI Target configuration byte                    */
-#define NTC_DISCONNECT          0x08	/* Enable SCSI disconnect       */
-#define NTC_SYNC                0x10	/* SYNC_NEGO                    */
-#define NTC_NO_WDTR             0x20	/* SYNC_NEGO                    */
-#define NTC_1GIGA               0x40	/* 255 head / 63 sectors (64/32) */
-#define NTC_SPINUP              0x80	/* Start disk drive             */
-
-/*      Default NVRam values                                            */
-#define INI_SIGNATURE           0xC925
-#define NBC1_DEFAULT            (NBC1_ENABLE)
-#define NCC1_DEFAULT            (NCC1_BUSRESET | NCC1_AUTOTERM | NCC1_PARITYCHK)
-#define NTC_DEFAULT             (NTC_NO_WDTR | NTC_1GIGA | NTC_DISCONNECT)
-
-/* SCSI related definition                                              */
-#define DISC_NOT_ALLOW          0x80	/* Disconnect is not allowed    */
-#define DISC_ALLOW              0xC0	/* Disconnect is allowed        */
-#define SCSICMD_RequestSense    0x03
-
-#define SCSI_ABORT_SNOOZE 0
-#define SCSI_ABORT_SUCCESS 1
-#define SCSI_ABORT_PENDING 2
-#define SCSI_ABORT_BUSY 3
-#define SCSI_ABORT_NOT_RUNNING 4
-#define SCSI_ABORT_ERROR 5
-
-#define SCSI_RESET_SNOOZE 0
-#define SCSI_RESET_PUNT 1
-#define SCSI_RESET_SUCCESS 2
-#define SCSI_RESET_PENDING 3
-#define SCSI_RESET_WAKEUP 4
-#define SCSI_RESET_NOT_RUNNING 5
-#define SCSI_RESET_ERROR 6
-
-#define SCSI_RESET_SYNCHRONOUS		0x01
-#define SCSI_RESET_ASYNCHRONOUS		0x02
-#define SCSI_RESET_SUGGEST_BUS_RESET	0x04
-#define SCSI_RESET_SUGGEST_HOST_RESET	0x08
-
-#define SCSI_RESET_BUS_RESET 0x100
-#define SCSI_RESET_HOST_RESET 0x200
-#define SCSI_RESET_ACTION   0xff
-
+#define HW_APBHX_CTRL0				0x000
+#define BM_APBH_CTRL0_APB_BURST8_EN		(1 << 29)
+#define BM_APBH

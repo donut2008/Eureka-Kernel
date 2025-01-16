@@ -1,583 +1,259 @@
-/*
- * usb-serial driver for Quatech SSU-100
- *
- * based on ftdi_sio.c and the original serqt_usb.c from Quatech
- *
- */
-
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/serial.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-#include <linux/serial_reg.h>
-#include <linux/uaccess.h>
-
-#define QT_OPEN_CLOSE_CHANNEL       0xca
-#define QT_SET_GET_DEVICE           0xc2
-#define QT_SET_GET_REGISTER         0xc0
-#define QT_GET_SET_PREBUF_TRIG_LVL  0xcc
-#define QT_SET_ATF                  0xcd
-#define QT_GET_SET_UART             0xc1
-#define QT_TRANSFER_IN              0xc0
-#define QT_HW_FLOW_CONTROL_MASK     0xc5
-#define QT_SW_FLOW_CONTROL_MASK     0xc6
-
-#define  SERIAL_MSR_MASK            0xf0
-
-#define  SERIAL_CRTSCTS ((UART_MCR_RTS << 8) | UART_MSR_CTS)
-
-#define  SERIAL_EVEN_PARITY         (UART_LCR_PARITY | UART_LCR_EPAR)
-
-#define  MAX_BAUD_RATE              460800
-
-#define ATC_DISABLED                0x00
-#define DUPMODE_BITS        0xc0
-#define RR_BITS             0x03
-#define LOOPMODE_BITS       0x41
-#define RS232_MODE          0x00
-#define RTSCTS_TO_CONNECTOR 0x40
-#define CLKS_X4             0x02
-#define FULLPWRBIT          0x00000080
-#define NEXT_BOARD_POWER_BIT        0x00000004
-
-#define DRIVER_DESC "Quatech SSU-100 USB to Serial Driver"
-
-#define	USB_VENDOR_ID_QUATECH	0x061d	/* Quatech VID */
-#define QUATECH_SSU100	0xC020	/* SSU100 */
-
-static const struct usb_device_id id_table[] = {
-	{USB_DEVICE(USB_VENDOR_ID_QUATECH, QUATECH_SSU100)},
-	{}			/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, id_table);
-
-struct ssu100_port_private {
-	spinlock_t status_lock;
-	u8 shadowLSR;
-	u8 shadowMSR;
-};
-
-static inline int ssu100_control_msg(struct usb_device *dev,
-				     u8 request, u16 data, u16 index)
-{
-	return usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-			       request, 0x40, data, index,
-			       NULL, 0, 300);
-}
-
-static inline int ssu100_setdevice(struct usb_device *dev, u8 *data)
-{
-	u16 x = ((u16)(data[1] << 8) | (u16)(data[0]));
-
-	return ssu100_control_msg(dev, QT_SET_GET_DEVICE, x, 0);
-}
-
-
-static inline int ssu100_getdevice(struct usb_device *dev, u8 *data)
-{
-	int ret;
-
-	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-			      QT_SET_GET_DEVICE, 0xc0, 0, 0,
-			      data, 3, 300);
-	if (ret < 3) {
-		if (ret >= 0)
-			ret = -EIO;
-	}
-
-	return ret;
-}
-
-static inline int ssu100_getregister(struct usb_device *dev,
-				     unsigned short uart,
-				     unsigned short reg,
-				     u8 *data)
-{
-	int ret;
-
-	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-			      QT_SET_GET_REGISTER, 0xc0, reg,
-			      uart, data, sizeof(*data), 300);
-	if (ret < sizeof(*data)) {
-		if (ret >= 0)
-			ret = -EIO;
-	}
-
-	return ret;
-}
-
-
-static inline int ssu100_setregister(struct usb_device *dev,
-				     unsigned short uart,
-				     unsigned short reg,
-				     u16 data)
-{
-	u16 value = (data << 8) | reg;
-
-	return usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-			       QT_SET_GET_REGISTER, 0x40, value, uart,
-			       NULL, 0, 300);
-
-}
-
-#define set_mctrl(dev, set)		update_mctrl((dev), (set), 0)
-#define clear_mctrl(dev, clear)	update_mctrl((dev), 0, (clear))
-
-/* these do not deal with device that have more than 1 port */
-static inline int update_mctrl(struct usb_device *dev, unsigned int set,
-			       unsigned int clear)
-{
-	unsigned urb_value;
-	int result;
-
-	if (((set | clear) & (TIOCM_DTR | TIOCM_RTS)) == 0) {
-		dev_dbg(&dev->dev, "%s - DTR|RTS not being set|cleared\n", __func__);
-		return 0;	/* no change */
-	}
-
-	clear &= ~set;	/* 'set' takes precedence over 'clear' */
-	urb_value = 0;
-	if (set & TIOCM_DTR)
-		urb_value |= UART_MCR_DTR;
-	if (set & TIOCM_RTS)
-		urb_value |= UART_MCR_RTS;
-
-	result = ssu100_setregister(dev, 0, UART_MCR, urb_value);
-	if (result < 0)
-		dev_dbg(&dev->dev, "%s Error from MODEM_CTRL urb\n", __func__);
-
-	return result;
-}
-
-static int ssu100_initdevice(struct usb_device *dev)
-{
-	u8 *data;
-	int result = 0;
-
-	data = kzalloc(3, GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-
-	result = ssu100_getdevice(dev, data);
-	if (result < 0) {
-		dev_dbg(&dev->dev, "%s - get_device failed %i\n", __func__, result);
-		goto out;
-	}
-
-	data[1] &= ~FULLPWRBIT;
-
-	result = ssu100_setdevice(dev, data);
-	if (result < 0) {
-		dev_dbg(&dev->dev, "%s - setdevice failed %i\n", __func__, result);
-		goto out;
-	}
-
-	result = ssu100_control_msg(dev, QT_GET_SET_PREBUF_TRIG_LVL, 128, 0);
-	if (result < 0) {
-		dev_dbg(&dev->dev, "%s - set prebuffer level failed %i\n", __func__, result);
-		goto out;
-	}
-
-	result = ssu100_control_msg(dev, QT_SET_ATF, ATC_DISABLED, 0);
-	if (result < 0) {
-		dev_dbg(&dev->dev, "%s - set ATFprebuffer level failed %i\n", __func__, result);
-		goto out;
-	}
-
-	result = ssu100_getdevice(dev, data);
-	if (result < 0) {
-		dev_dbg(&dev->dev, "%s - get_device failed %i\n", __func__, result);
-		goto out;
-	}
-
-	data[0] &= ~(RR_BITS | DUPMODE_BITS);
-	data[0] |= CLKS_X4;
-	data[1] &= ~(LOOPMODE_BITS);
-	data[1] |= RS232_MODE;
-
-	result = ssu100_setdevice(dev, data);
-	if (result < 0) {
-		dev_dbg(&dev->dev, "%s - setdevice failed %i\n", __func__, result);
-		goto out;
-	}
-
-out:	kfree(data);
-	return result;
-
-}
-
-
-static void ssu100_set_termios(struct tty_struct *tty,
-			       struct usb_serial_port *port,
-			       struct ktermios *old_termios)
-{
-	struct usb_device *dev = port->serial->dev;
-	struct ktermios *termios = &tty->termios;
-	u16 baud, divisor, remainder;
-	unsigned int cflag = termios->c_cflag;
-	u16 urb_value = 0; /* will hold the new flags */
-	int result;
-
-	if (cflag & PARENB) {
-		if (cflag & PARODD)
-			urb_value |= UART_LCR_PARITY;
-		else
-			urb_value |= SERIAL_EVEN_PARITY;
-	}
-
-	switch (cflag & CSIZE) {
-	case CS5:
-		urb_value |= UART_LCR_WLEN5;
-		break;
-	case CS6:
-		urb_value |= UART_LCR_WLEN6;
-		break;
-	case CS7:
-		urb_value |= UART_LCR_WLEN7;
-		break;
-	default:
-	case CS8:
-		urb_value |= UART_LCR_WLEN8;
-		break;
-	}
-
-	baud = tty_get_baud_rate(tty);
-	if (!baud)
-		baud = 9600;
-
-	dev_dbg(&port->dev, "%s - got baud = %d\n", __func__, baud);
-
-
-	divisor = MAX_BAUD_RATE / baud;
-	remainder = MAX_BAUD_RATE % baud;
-	if (((remainder * 2) >= baud) && (baud != 110))
-		divisor++;
-
-	urb_value = urb_value << 8;
-
-	result = ssu100_control_msg(dev, QT_GET_SET_UART, divisor, urb_value);
-	if (result < 0)
-		dev_dbg(&port->dev, "%s - set uart failed\n", __func__);
-
-	if (cflag & CRTSCTS)
-		result = ssu100_control_msg(dev, QT_HW_FLOW_CONTROL_MASK,
-					    SERIAL_CRTSCTS, 0);
-	else
-		result = ssu100_control_msg(dev, QT_HW_FLOW_CONTROL_MASK,
-					    0, 0);
-	if (result < 0)
-		dev_dbg(&port->dev, "%s - set HW flow control failed\n", __func__);
-
-	if (I_IXOFF(tty) || I_IXON(tty)) {
-		u16 x = ((u16)(START_CHAR(tty) << 8) | (u16)(STOP_CHAR(tty)));
-
-		result = ssu100_control_msg(dev, QT_SW_FLOW_CONTROL_MASK,
-					    x, 0);
-	} else
-		result = ssu100_control_msg(dev, QT_SW_FLOW_CONTROL_MASK,
-					    0, 0);
-
-	if (result < 0)
-		dev_dbg(&port->dev, "%s - set SW flow control failed\n", __func__);
-
-}
-
-
-static int ssu100_open(struct tty_struct *tty, struct usb_serial_port *port)
-{
-	struct usb_device *dev = port->serial->dev;
-	struct ssu100_port_private *priv = usb_get_serial_port_data(port);
-	u8 *data;
-	int result;
-	unsigned long flags;
-
-	data = kzalloc(2, GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-
-	result = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-				 QT_OPEN_CLOSE_CHANNEL,
-				 QT_TRANSFER_IN, 0x01,
-				 0, data, 2, 300);
-	if (result < 2) {
-		dev_dbg(&port->dev, "%s - open failed %i\n", __func__, result);
-		if (result >= 0)
-			result = -EIO;
-		kfree(data);
-		return result;
-	}
-
-	spin_lock_irqsave(&priv->status_lock, flags);
-	priv->shadowLSR = data[0];
-	priv->shadowMSR = data[1];
-	spin_unlock_irqrestore(&priv->status_lock, flags);
-
-	kfree(data);
-
-/* set to 9600 */
-	result = ssu100_control_msg(dev, QT_GET_SET_UART, 0x30, 0x0300);
-	if (result < 0)
-		dev_dbg(&port->dev, "%s - set uart failed\n", __func__);
-
-	if (tty)
-		ssu100_set_termios(tty, port, &tty->termios);
-
-	return usb_serial_generic_open(tty, port);
-}
-
-static int get_serial_info(struct usb_serial_port *port,
-			   struct serial_struct __user *retinfo)
-{
-	struct serial_struct tmp;
-
-	if (!retinfo)
-		return -EFAULT;
-
-	memset(&tmp, 0, sizeof(tmp));
-	tmp.line		= port->minor;
-	tmp.port		= 0;
-	tmp.irq			= 0;
-	tmp.flags		= ASYNC_SKIP_TEST | ASYNC_AUTO_IRQ;
-	tmp.xmit_fifo_size	= port->bulk_out_size;
-	tmp.baud_base		= 9600;
-	tmp.close_delay		= 5*HZ;
-	tmp.closing_wait	= 30*HZ;
-
-	if (copy_to_user(retinfo, &tmp, sizeof(*retinfo)))
-		return -EFAULT;
-	return 0;
-}
-
-static int ssu100_ioctl(struct tty_struct *tty,
-		    unsigned int cmd, unsigned long arg)
-{
-	struct usb_serial_port *port = tty->driver_data;
-
-	switch (cmd) {
-	case TIOCGSERIAL:
-		return get_serial_info(port,
-				       (struct serial_struct __user *) arg);
-	default:
-		break;
-	}
-
-	return -ENOIOCTLCMD;
-}
-
-static int ssu100_attach(struct usb_serial *serial)
-{
-	return ssu100_initdevice(serial->dev);
-}
-
-static int ssu100_port_probe(struct usb_serial_port *port)
-{
-	struct ssu100_port_private *priv;
-
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	spin_lock_init(&priv->status_lock);
-
-	usb_set_serial_port_data(port, priv);
-
-	return 0;
-}
-
-static int ssu100_port_remove(struct usb_serial_port *port)
-{
-	struct ssu100_port_private *priv;
-
-	priv = usb_get_serial_port_data(port);
-	kfree(priv);
-
-	return 0;
-}
-
-static int ssu100_tiocmget(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct usb_device *dev = port->serial->dev;
-	u8 *d;
-	int r;
-
-	d = kzalloc(2, GFP_KERNEL);
-	if (!d)
-		return -ENOMEM;
-
-	r = ssu100_getregister(dev, 0, UART_MCR, d);
-	if (r < 0)
-		goto mget_out;
-
-	r = ssu100_getregister(dev, 0, UART_MSR, d+1);
-	if (r < 0)
-		goto mget_out;
-
-	r = (d[0] & UART_MCR_DTR ? TIOCM_DTR : 0) |
-		(d[0] & UART_MCR_RTS ? TIOCM_RTS : 0) |
-		(d[1] & UART_MSR_CTS ? TIOCM_CTS : 0) |
-		(d[1] & UART_MSR_DCD ? TIOCM_CAR : 0) |
-		(d[1] & UART_MSR_RI ? TIOCM_RI : 0) |
-		(d[1] & UART_MSR_DSR ? TIOCM_DSR : 0);
-
-mget_out:
-	kfree(d);
-	return r;
-}
-
-static int ssu100_tiocmset(struct tty_struct *tty,
-			   unsigned int set, unsigned int clear)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct usb_device *dev = port->serial->dev;
-
-	return update_mctrl(dev, set, clear);
-}
-
-static void ssu100_dtr_rts(struct usb_serial_port *port, int on)
-{
-	struct usb_device *dev = port->serial->dev;
-
-	/* Disable flow control */
-	if (!on) {
-		if (ssu100_setregister(dev, 0, UART_MCR, 0) < 0)
-			dev_err(&port->dev, "error from flowcontrol urb\n");
-	}
-	/* drop RTS and DTR */
-	if (on)
-		set_mctrl(dev, TIOCM_DTR | TIOCM_RTS);
-	else
-		clear_mctrl(dev, TIOCM_DTR | TIOCM_RTS);
-}
-
-static void ssu100_update_msr(struct usb_serial_port *port, u8 msr)
-{
-	struct ssu100_port_private *priv = usb_get_serial_port_data(port);
-	unsigned long flags;
-
-	spin_lock_irqsave(&priv->status_lock, flags);
-	priv->shadowMSR = msr;
-	spin_unlock_irqrestore(&priv->status_lock, flags);
-
-	if (msr & UART_MSR_ANY_DELTA) {
-		/* update input line counters */
-		if (msr & UART_MSR_DCTS)
-			port->icount.cts++;
-		if (msr & UART_MSR_DDSR)
-			port->icount.dsr++;
-		if (msr & UART_MSR_DDCD)
-			port->icount.dcd++;
-		if (msr & UART_MSR_TERI)
-			port->icount.rng++;
-		wake_up_interruptible(&port->port.delta_msr_wait);
-	}
-}
-
-static void ssu100_update_lsr(struct usb_serial_port *port, u8 lsr,
-			      char *tty_flag)
-{
-	struct ssu100_port_private *priv = usb_get_serial_port_data(port);
-	unsigned long flags;
-
-	spin_lock_irqsave(&priv->status_lock, flags);
-	priv->shadowLSR = lsr;
-	spin_unlock_irqrestore(&priv->status_lock, flags);
-
-	*tty_flag = TTY_NORMAL;
-	if (lsr & UART_LSR_BRK_ERROR_BITS) {
-		/* we always want to update icount, but we only want to
-		 * update tty_flag for one case */
-		if (lsr & UART_LSR_BI) {
-			port->icount.brk++;
-			*tty_flag = TTY_BREAK;
-			usb_serial_handle_break(port);
-		}
-		if (lsr & UART_LSR_PE) {
-			port->icount.parity++;
-			if (*tty_flag == TTY_NORMAL)
-				*tty_flag = TTY_PARITY;
-		}
-		if (lsr & UART_LSR_FE) {
-			port->icount.frame++;
-			if (*tty_flag == TTY_NORMAL)
-				*tty_flag = TTY_FRAME;
-		}
-		if (lsr & UART_LSR_OE) {
-			port->icount.overrun++;
-			tty_insert_flip_char(&port->port, 0, TTY_OVERRUN);
-		}
-	}
-
-}
-
-static void ssu100_process_read_urb(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	char *packet = (char *)urb->transfer_buffer;
-	char flag = TTY_NORMAL;
-	u32 len = urb->actual_length;
-	int i;
-	char *ch;
-
-	if ((len >= 4) &&
-	    (packet[0] == 0x1b) && (packet[1] == 0x1b) &&
-	    ((packet[2] == 0x00) || (packet[2] == 0x01))) {
-		if (packet[2] == 0x00)
-			ssu100_update_lsr(port, packet[3], &flag);
-		if (packet[2] == 0x01)
-			ssu100_update_msr(port, packet[3]);
-
-		len -= 4;
-		ch = packet + 4;
-	} else
-		ch = packet;
-
-	if (!len)
-		return;	/* status only */
-
-	if (port->port.console && port->sysrq) {
-		for (i = 0; i < len; i++, ch++) {
-			if (!usb_serial_handle_sysrq_char(port, *ch))
-				tty_insert_flip_char(&port->port, *ch, flag);
-		}
-	} else
-		tty_insert_flip_string_fixed_flag(&port->port, ch, flag, len);
-
-	tty_flip_buffer_push(&port->port);
-}
-
-static struct usb_serial_driver ssu100_device = {
-	.driver = {
-		.owner = THIS_MODULE,
-		.name = "ssu100",
-	},
-	.description	     = DRIVER_DESC,
-	.id_table	     = id_table,
-	.num_ports	     = 1,
-	.open		     = ssu100_open,
-	.attach              = ssu100_attach,
-	.port_probe          = ssu100_port_probe,
-	.port_remove         = ssu100_port_remove,
-	.dtr_rts             = ssu100_dtr_rts,
-	.process_read_urb    = ssu100_process_read_urb,
-	.tiocmget            = ssu100_tiocmget,
-	.tiocmset            = ssu100_tiocmset,
-	.tiocmiwait          = usb_serial_generic_tiocmiwait,
-	.get_icount	     = usb_serial_generic_get_icount,
-	.ioctl               = ssu100_ioctl,
-	.set_termios         = ssu100_set_termios,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&ssu100_device, NULL
-};
-
-module_usb_serial_driver(serial_drivers, id_table);
-
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+4
+#define D3F2_PREF_BASE_UPPER__PREF_BASE_UPPER_MASK 0xffffffff
+#define D3F2_PREF_BASE_UPPER__PREF_BASE_UPPER__SHIFT 0x0
+#define D3F2_PREF_LIMIT_UPPER__PREF_LIMIT_UPPER_MASK 0xffffffff
+#define D3F2_PREF_LIMIT_UPPER__PREF_LIMIT_UPPER__SHIFT 0x0
+#define D3F2_IO_BASE_LIMIT_HI__IO_BASE_31_16_MASK 0xffff
+#define D3F2_IO_BASE_LIMIT_HI__IO_BASE_31_16__SHIFT 0x0
+#define D3F2_IO_BASE_LIMIT_HI__IO_LIMIT_31_16_MASK 0xffff0000
+#define D3F2_IO_BASE_LIMIT_HI__IO_LIMIT_31_16__SHIFT 0x10
+#define D3F2_IRQ_BRIDGE_CNTL__PARITY_RESPONSE_EN_MASK 0x10000
+#define D3F2_IRQ_BRIDGE_CNTL__PARITY_RESPONSE_EN__SHIFT 0x10
+#define D3F2_IRQ_BRIDGE_CNTL__SERR_EN_MASK 0x20000
+#define D3F2_IRQ_BRIDGE_CNTL__SERR_EN__SHIFT 0x11
+#define D3F2_IRQ_BRIDGE_CNTL__ISA_EN_MASK 0x40000
+#define D3F2_IRQ_BRIDGE_CNTL__ISA_EN__SHIFT 0x12
+#define D3F2_IRQ_BRIDGE_CNTL__VGA_EN_MASK 0x80000
+#define D3F2_IRQ_BRIDGE_CNTL__VGA_EN__SHIFT 0x13
+#define D3F2_IRQ_BRIDGE_CNTL__VGA_DEC_MASK 0x100000
+#define D3F2_IRQ_BRIDGE_CNTL__VGA_DEC__SHIFT 0x14
+#define D3F2_IRQ_BRIDGE_CNTL__MASTER_ABORT_MODE_MASK 0x200000
+#define D3F2_IRQ_BRIDGE_CNTL__MASTER_ABORT_MODE__SHIFT 0x15
+#define D3F2_IRQ_BRIDGE_CNTL__SECONDARY_BUS_RESET_MASK 0x400000
+#define D3F2_IRQ_BRIDGE_CNTL__SECONDARY_BUS_RESET__SHIFT 0x16
+#define D3F2_IRQ_BRIDGE_CNTL__FAST_B2B_EN_MASK 0x800000
+#define D3F2_IRQ_BRIDGE_CNTL__FAST_B2B_EN__SHIFT 0x17
+#define D3F2_CAP_PTR__CAP_PTR_MASK 0xff
+#define D3F2_CAP_PTR__CAP_PTR__SHIFT 0x0
+#define D3F2_INTERRUPT_LINE__INTERRUPT_LINE_MASK 0xff
+#define D3F2_INTERRUPT_LINE__INTERRUPT_LINE__SHIFT 0x0
+#define D3F2_INTERRUPT_PIN__INTERRUPT_PIN_MASK 0xff00
+#define D3F2_INTERRUPT_PIN__INTERRUPT_PIN__SHIFT 0x8
+#define D3F2_EXT_BRIDGE_CNTL__IO_PORT_80_EN_MASK 0x1
+#define D3F2_EXT_BRIDGE_CNTL__IO_PORT_80_EN__SHIFT 0x0
+#define D3F2_PMI_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F2_PMI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F2_PMI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F2_PMI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F2_PMI_CAP__VERSION_MASK 0x70000
+#define D3F2_PMI_CAP__VERSION__SHIFT 0x10
+#define D3F2_PMI_CAP__PME_CLOCK_MASK 0x80000
+#define D3F2_PMI_CAP__PME_CLOCK__SHIFT 0x13
+#define D3F2_PMI_CAP__DEV_SPECIFIC_INIT_MASK 0x200000
+#define D3F2_PMI_CAP__DEV_SPECIFIC_INIT__SHIFT 0x15
+#define D3F2_PMI_CAP__AUX_CURRENT_MASK 0x1c00000
+#define D3F2_PMI_CAP__AUX_CURRENT__SHIFT 0x16
+#define D3F2_PMI_CAP__D1_SUPPORT_MASK 0x2000000
+#define D3F2_PMI_CAP__D1_SUPPORT__SHIFT 0x19
+#define D3F2_PMI_CAP__D2_SUPPORT_MASK 0x4000000
+#define D3F2_PMI_CAP__D2_SUPPORT__SHIFT 0x1a
+#define D3F2_PMI_CAP__PME_SUPPORT_MASK 0xf8000000
+#define D3F2_PMI_CAP__PME_SUPPORT__SHIFT 0x1b
+#define D3F2_PMI_STATUS_CNTL__POWER_STATE_MASK 0x3
+#define D3F2_PMI_STATUS_CNTL__POWER_STATE__SHIFT 0x0
+#define D3F2_PMI_STATUS_CNTL__NO_SOFT_RESET_MASK 0x8
+#define D3F2_PMI_STATUS_CNTL__NO_SOFT_RESET__SHIFT 0x3
+#define D3F2_PMI_STATUS_CNTL__PME_EN_MASK 0x100
+#define D3F2_PMI_STATUS_CNTL__PME_EN__SHIFT 0x8
+#define D3F2_PMI_STATUS_CNTL__DATA_SELECT_MASK 0x1e00
+#define D3F2_PMI_STATUS_CNTL__DATA_SELECT__SHIFT 0x9
+#define D3F2_PMI_STATUS_CNTL__DATA_SCALE_MASK 0x6000
+#define D3F2_PMI_STATUS_CNTL__DATA_SCALE__SHIFT 0xd
+#define D3F2_PMI_STATUS_CNTL__PME_STATUS_MASK 0x8000
+#define D3F2_PMI_STATUS_CNTL__PME_STATUS__SHIFT 0xf
+#define D3F2_PMI_STATUS_CNTL__B2_B3_SUPPORT_MASK 0x400000
+#define D3F2_PMI_STATUS_CNTL__B2_B3_SUPPORT__SHIFT 0x16
+#define D3F2_PMI_STATUS_CNTL__BUS_PWR_EN_MASK 0x800000
+#define D3F2_PMI_STATUS_CNTL__BUS_PWR_EN__SHIFT 0x17
+#define D3F2_PMI_STATUS_CNTL__PMI_DATA_MASK 0xff000000
+#define D3F2_PMI_STATUS_CNTL__PMI_DATA__SHIFT 0x18
+#define D3F2_PCIE_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F2_PCIE_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F2_PCIE_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F2_PCIE_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F2_PCIE_CAP__VERSION_MASK 0xf0000
+#define D3F2_PCIE_CAP__VERSION__SHIFT 0x10
+#define D3F2_PCIE_CAP__DEVICE_TYPE_MASK 0xf00000
+#define D3F2_PCIE_CAP__DEVICE_TYPE__SHIFT 0x14
+#define D3F2_PCIE_CAP__SLOT_IMPLEMENTED_MASK 0x1000000
+#define D3F2_PCIE_CAP__SLOT_IMPLEMENTED__SHIFT 0x18
+#define D3F2_PCIE_CAP__INT_MESSAGE_NUM_MASK 0x3e000000
+#define D3F2_PCIE_CAP__INT_MESSAGE_NUM__SHIFT 0x19
+#define D3F2_DEVICE_CAP__MAX_PAYLOAD_SUPPORT_MASK 0x7
+#define D3F2_DEVICE_CAP__MAX_PAYLOAD_SUPPORT__SHIFT 0x0
+#define D3F2_DEVICE_CAP__PHANTOM_FUNC_MASK 0x18
+#define D3F2_DEVICE_CAP__PHANTOM_FUNC__SHIFT 0x3
+#define D3F2_DEVICE_CAP__EXTENDED_TAG_MASK 0x20
+#define D3F2_DEVICE_CAP__EXTENDED_TAG__SHIFT 0x5
+#define D3F2_DEVICE_CAP__L0S_ACCEPTABLE_LATENCY_MASK 0x1c0
+#define D3F2_DEVICE_CAP__L0S_ACCEPTABLE_LATENCY__SHIFT 0x6
+#define D3F2_DEVICE_CAP__L1_ACCEPTABLE_LATENCY_MASK 0xe00
+#define D3F2_DEVICE_CAP__L1_ACCEPTABLE_LATENCY__SHIFT 0x9
+#define D3F2_DEVICE_CAP__ROLE_BASED_ERR_REPORTING_MASK 0x8000
+#define D3F2_DEVICE_CAP__ROLE_BASED_ERR_REPORTING__SHIFT 0xf
+#define D3F2_DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT_MASK 0x3fc0000
+#define D3F2_DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT__SHIFT 0x12
+#define D3F2_DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE_MASK 0xc000000
+#define D3F2_DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE__SHIFT 0x1a
+#define D3F2_DEVICE_CAP__FLR_CAPABLE_MASK 0x10000000
+#define D3F2_DEVICE_CAP__FLR_CAPABLE__SHIFT 0x1c
+#define D3F2_DEVICE_CNTL__CORR_ERR_EN_MASK 0x1
+#define D3F2_DEVICE_CNTL__CORR_ERR_EN__SHIFT 0x0
+#define D3F2_DEVICE_CNTL__NON_FATAL_ERR_EN_MASK 0x2
+#define D3F2_DEVICE_CNTL__NON_FATAL_ERR_EN__SHIFT 0x1
+#define D3F2_DEVICE_CNTL__FATAL_ERR_EN_MASK 0x4
+#define D3F2_DEVICE_CNTL__FATAL_ERR_EN__SHIFT 0x2
+#define D3F2_DEVICE_CNTL__USR_REPORT_EN_MASK 0x8
+#define D3F2_DEVICE_CNTL__USR_REPORT_EN__SHIFT 0x3
+#define D3F2_DEVICE_CNTL__RELAXED_ORD_EN_MASK 0x10
+#define D3F2_DEVICE_CNTL__RELAXED_ORD_EN__SHIFT 0x4
+#define D3F2_DEVICE_CNTL__MAX_PAYLOAD_SIZE_MASK 0xe0
+#define D3F2_DEVICE_CNTL__MAX_PAYLOAD_SIZE__SHIFT 0x5
+#define D3F2_DEVICE_CNTL__EXTENDED_TAG_EN_MASK 0x100
+#define D3F2_DEVICE_CNTL__EXTENDED_TAG_EN__SHIFT 0x8
+#define D3F2_DEVICE_CNTL__PHANTOM_FUNC_EN_MASK 0x200
+#define D3F2_DEVICE_CNTL__PHANTOM_FUNC_EN__SHIFT 0x9
+#define D3F2_DEVICE_CNTL__AUX_POWER_PM_EN_MASK 0x400
+#define D3F2_DEVICE_CNTL__AUX_POWER_PM_EN__SHIFT 0xa
+#define D3F2_DEVICE_CNTL__NO_SNOOP_EN_MASK 0x800
+#define D3F2_DEVICE_CNTL__NO_SNOOP_EN__SHIFT 0xb
+#define D3F2_DEVICE_CNTL__MAX_READ_REQUEST_SIZE_MASK 0x7000
+#define D3F2_DEVICE_CNTL__MAX_READ_REQUEST_SIZE__SHIFT 0xc
+#define D3F2_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN_MASK 0x8000
+#define D3F2_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN__SHIFT 0xf
+#define D3F2_DEVICE_STATUS__CORR_ERR_MASK 0x10000
+#define D3F2_DEVICE_STATUS__CORR_ERR__SHIFT 0x10
+#define D3F2_DEVICE_STATUS__NON_FATAL_ERR_MASK 0x20000
+#define D3F2_DEVICE_STATUS__NON_FATAL_ERR__SHIFT 0x11
+#define D3F2_DEVICE_STATUS__FATAL_ERR_MASK 0x40000
+#define D3F2_DEVICE_STATUS__FATAL_ERR__SHIFT 0x12
+#define D3F2_DEVICE_STATUS__USR_DETECTED_MASK 0x80000
+#define D3F2_DEVICE_STATUS__USR_DETECTED__SHIFT 0x13
+#define D3F2_DEVICE_STATUS__AUX_PWR_MASK 0x100000
+#define D3F2_DEVICE_STATUS__AUX_PWR__SHIFT 0x14
+#define D3F2_DEVICE_STATUS__TRANSACTIONS_PEND_MASK 0x200000
+#define D3F2_DEVICE_STATUS__TRANSACTIONS_PEND__SHIFT 0x15
+#define D3F2_LINK_CAP__LINK_SPEED_MASK 0xf
+#define D3F2_LINK_CAP__LINK_SPEED__SHIFT 0x0
+#define D3F2_LINK_CAP__LINK_WIDTH_MASK 0x3f0
+#define D3F2_LINK_CAP__LINK_WIDTH__SHIFT 0x4
+#define D3F2_LINK_CAP__PM_SUPPORT_MASK 0xc00
+#define D3F2_LINK_CAP__PM_SUPPORT__SHIFT 0xa
+#define D3F2_LINK_CAP__L0S_EXIT_LATENCY_MASK 0x7000
+#define D3F2_LINK_CAP__L0S_EXIT_LATENCY__SHIFT 0xc
+#define D3F2_LINK_CAP__L1_EXIT_LATENCY_MASK 0x38000
+#define D3F2_LINK_CAP__L1_EXIT_LATENCY__SHIFT 0xf
+#define D3F2_LINK_CAP__CLOCK_POWER_MANAGEMENT_MASK 0x40000
+#define D3F2_LINK_CAP__CLOCK_POWER_MANAGEMENT__SHIFT 0x12
+#define D3F2_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING_MASK 0x80000
+#define D3F2_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING__SHIFT 0x13
+#define D3F2_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE_MASK 0x100000
+#define D3F2_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE__SHIFT 0x14
+#define D3F2_LINK_CAP__LINK_BW_NOTIFICATION_CAP_MASK 0x200000
+#define D3F2_LINK_CAP__LINK_BW_NOTIFICATION_CAP__SHIFT 0x15
+#define D3F2_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE_MASK 0x400000
+#define D3F2_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE__SHIFT 0x16
+#define D3F2_LINK_CAP__PORT_NUMBER_MASK 0xff000000
+#define D3F2_LINK_CAP__PORT_NUMBER__SHIFT 0x18
+#define D3F2_LINK_CNTL__PM_CONTROL_MASK 0x3
+#define D3F2_LINK_CNTL__PM_CONTROL__SHIFT 0x0
+#define D3F2_LINK_CNTL__READ_CPL_BOUNDARY_MASK 0x8
+#define D3F2_LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define D3F2_LINK_CNTL__LINK_DIS_MASK 0x10
+#define D3F2_LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define D3F2_LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define D3F2_LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define D3F2_LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define D3F2_LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define D3F2_LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define D3F2_LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define D3F2_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define D3F2_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define D3F2_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define D3F2_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0x9
+#define D3F2_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN_MASK 0x400
+#define D3F2_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN__SHIFT 0xa
+#define D3F2_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN_MASK 0x800
+#define D3F2_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN__SHIFT 0xb
+#define D3F2_LINK_STATUS__CURRENT_LINK_SPEED_MASK 0xf0000
+#define D3F2_LINK_STATUS__CURRENT_LINK_SPEED__SHIFT 0x10
+#define D3F2_LINK_STATUS__NEGOTIATED_LINK_WIDTH_MASK 0x3f00000
+#define D3F2_LINK_STATUS__NEGOTIATED_LINK_WIDTH__SHIFT 0x14
+#define D3F2_LINK_STATUS__LINK_TRAINING_MASK 0x8000000
+#define D3F2_LINK_STATUS__LINK_TRAINING__SHIFT 0x1b
+#define D3F2_LINK_STATUS__SLOT_CLOCK_CFG_MASK 0x10000000
+#define D3F2_LINK_STATUS__SLOT_CLOCK_CFG__SHIFT 0x1c
+#define D3F2_LINK_STATUS__DL_ACTIVE_MASK 0x20000000
+#define D3F2_LINK_STATUS__DL_ACTIVE__SHIFT 0x1d
+#define D3F2_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS_MASK 0x40000000
+#define D3F2_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS__SHIFT 0x1e
+#define D3F2_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS_MASK 0x80000000
+#define D3F2_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS__SHIFT 0x1f
+#define D3F2_SLOT_CAP__ATTN_BUTTON_PRESENT_MASK 0x1
+#define D3F2_SLOT_CAP__ATTN_BUTTON_PRESENT__SHIFT 0x0
+#define D3F2_SLOT_CAP__PWR_CONTROLLER_PRESENT_MASK 0x2
+#define D3F2_SLOT_CAP__PWR_CONTROLLER_PRESENT__SHIFT 0x1
+#define D3F2_SLOT_CAP__MRL_SENSOR_PRESENT_MASK 0x4
+#define D3F2_SLOT_CAP__MRL_SENSOR_PRESENT__SHIFT 0x2
+#define D3F2_SLOT_CAP__ATTN_INDICATOR_PRESENT_MASK 0x8
+#define D3F2_SLOT_CAP__ATTN_INDICATOR_PRESENT__SHIFT 0x3
+#define D3F2_SLOT_CAP__PWR_INDICATOR_PRESENT_MASK 0x10
+#define D3F2_SLOT_CAP__PWR_INDICATOR_PRESENT__SHIFT 0x4
+#define D3F2_SLOT_CAP__HOTPLUG_SURPRISE_MASK 0x20
+#define D3F2_SLOT_CAP__HOTPLUG_SURPRISE__SHIFT 0x5
+#define D3F2_SLOT_CAP__HOTPLUG_CAPABLE_MASK 0x40
+#define D3F2_SLOT_CAP__HOTPLUG_CAPABLE__SHIFT 0x6
+#define D3F2_SLOT_CAP__SLOT_PWR_LIMIT_VALUE_MASK 0x7f80
+#define D3F2_SLOT_CAP__SLOT_PWR_LIMIT_VALUE__SHIFT 0x7
+#define D3F2_SLOT_CAP__SLOT_PWR_LIMIT_SCALE_MASK 0x18000
+#define D3F2_SLOT_CAP__SLOT_PWR_LIMIT_SCALE__SHIFT 0xf
+#define D3F2_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT_MASK 0x20000
+#define D3F2_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT__SHIFT 0x11
+#define D3F2_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED_MASK 0x40000
+#define D3F2_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED__SHIFT 0x12
+#define D3F2_SLOT_CAP__PHYSICAL_SLOT_NUM_MASK 0xfff80000
+#define D3F2_SLOT_CAP__PHYSICAL_SLOT_NUM__SHIFT 0x13
+#define D3F2_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN_MASK 0x1
+#define D3F2_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN__SHIFT 0x0
+#define D3F2_SLOT_CNTL__PWR_FAULT_DETECTED_EN_MASK 0x2
+#define D3F2_SLOT_CNTL__PWR_FAULT_DETECTED_EN__SHIFT 0x1
+#define D3F2_SLOT_CNTL__MRL_SENSOR_CHANGED_EN_MASK 0x4
+#define D3F2_SLOT_CNTL__MRL_SENSOR_CHANGED_EN__SHIFT 0x2
+#define D3F2_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN_MASK 0x8
+#define D3F2_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN__SHIFT 0x3
+#define D3F2_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN_MASK 0x10
+#define D3F2_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN__SHIFT 0x4
+#define D3F2_SLOT_CNTL__HOTPLUG_INTR_EN_MASK 0x20
+#define D3F2_SLOT_CNTL__HOTPLUG_INTR_EN__SHIFT 0x5
+#define D3F2_SLOT_CNTL__ATTN_INDICATOR_CNTL_MASK 0xc0
+#define D3F2_SLOT_CNTL__ATTN_INDICATOR_CNTL__SHIFT 0x6
+#define D3F2_SLOT_CNTL__PWR_INDICATOR_CNTL_MASK 0x300
+#define D3F2_SLOT_CNTL__PWR_INDICATOR_CNTL__SHIFT 0x8
+#define D3F2_SLOT_CNTL__PWR_CONTROLLER_CNTL_MASK 0x400
+#define D3F2_SLOT_CNTL__PWR_CONTROLLER_CNTL__SHIFT 0xa
+#define D3F2_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL_MASK 0x800
+#define D3F2_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL__SHIFT 0xb
+#define D3F2_SLOT_CNTL__DL_STATE_CHANGED_EN_MASK 0x1000
+#define D3F2_SLOT_CNTL__DL_STATE_CHANGED_EN__SHIFT 0xc
+#define D3F2_SLOT_STATUS__ATTN_BUTTON_PRESSED_MASK 0x10000
+#define D3F2_SLOT_STATUS__ATTN_BUTTON_PRESSED__SHIFT 0x10
+#define D3F2_SLOT_STATUS__PWR_FAULT_DETECTED_MASK 0x20000
+#define D3F2_SLOT_STATUS__PWR_FAULT_DETECTED__SHIFT 0x11
+#define D3F2_SLOT_STATUS__MRL_SENSOR_CHANGED_MASK 0x40000
+#define D3F2_SLOT_STATUS__MRL_SENSOR_CHANGED__SHIFT 0x12
+#define D3F2_SLOT_STATUS__PRESENCE_DETECT_CHANGED_MASK 0x80000
+#define D3F2_SLOT_STATUS__PRESENCE_DETECT_CHANGED__SHIFT 0x13
+#define D3F2_SLOT_STATUS__COMMAND_COMPLETED_MASK 0x100000
+#define D3F2_SLOT_STATUS__COMMAND_COMPLETED__SHIFT 0x14
+#define D3F2_SLOT_STATUS__MRL_SENSOR_STATE_MASK 0x200000
+#define D3F2_SLOT_STATUS__MRL_SENSOR_STATE__SHIFT 0x15
+#define D3F2_SLOT_STATUS__PRESENCE_DETECT_STATE_MASK 0x400000
+#define D3F2_SLOT_STATUS__PRESENCE_DETECT_STATE__SHIFT 0x16
+#define D3F2_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS_MASK 0x800000
+#define D3F2_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS__SHIFT 0x17
+#define D3F2_SLOT_STATUS__DL_STATE_CHANGED_MASK 0x1000000
+#define D3F2_SLOT_STATUS__DL_STATE_CHANGED__SHIFT 0x18
+#define D3F2_ROOT_CNTL__SERR_ON_CORR_ERR_EN_MASK 0x1
+#define D3F2_ROOT_CNTL__SERR_ON_CORR_ERR_EN__SHIFT 0x0
+#define D3F2_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN_MASK 0x2
+#define D3F2_ROOT_CNTL__S

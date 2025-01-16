@@ -1,2 +1,2 @@
-obj-$(CONFIG_POWER_AVS_OMAP)		+= smartreflex.o
-obj-$(CONFIG_ROCKCHIP_IODOMAIN)		+= rockchip-io-domain.o
+~‘š®¸°~hD<ÚVƒºý´8ÇP ØœfÛ¿Ì>q–©1]o—½£W[¯½i ºhÙˆË}…{ª&šy§Ê-S:ËK\7ƒþË€³æ<Ÿû!çqjU\)az®‰6þÞ#È¼
+¦6]å

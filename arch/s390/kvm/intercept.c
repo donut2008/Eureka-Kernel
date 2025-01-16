@@ -1,363 +1,239 @@
+define SPI_IRQ_NUM	SPIM_IRQ_NUM
+#define TMR_IRQ_NUM	TMR1_IRQ_NUM
+ 
 /*
- * in-kernel handling for sie intercepts
- *
- * Copyright IBM Corp. 2008, 2014
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License (version 2 only)
- * as published by the Free Software Foundation.
- *
- *    Author(s): Carsten Otte <cotte@de.ibm.com>
- *               Christian Borntraeger <borntraeger@de.ibm.com>
+ * Here go the bitmasks themselves
  */
+#define IMR_MSPIM 	(1 << SPIM_IRQ_NUM)	/* Mask SPI Master interrupt */
+#define	IMR_MTMR2	(1 << TMR2_IRQ_NUM)	/* Mask Timer 2 interrupt */
+#define IMR_MUART	(1 << UART_IRQ_NUM)	/* Mask UART interrupt */	
+#define	IMR_MWDT	(1 << WDT_IRQ_NUM)	/* Mask Watchdog Timer interrupt */
+#define IMR_MRTC	(1 << RTC_IRQ_NUM)	/* Mask RTC interrupt */
+#define	IMR_MKB		(1 << KB_IRQ_NUM)	/* Mask Keyboard Interrupt */
+#define IMR_MPWM	(1 << PWM_IRQ_NUM)	/* Mask Pulse-Width Modulator int. */
+#define	IMR_MINT0	(1 << INT0_IRQ_NUM)	/* Mask External INT0 */
+#define	IMR_MINT1	(1 << INT1_IRQ_NUM)	/* Mask External INT1 */
+#define	IMR_MINT2	(1 << INT2_IRQ_NUM)	/* Mask External INT2 */
+#define	IMR_MINT3	(1 << INT3_IRQ_NUM)	/* Mask External INT3 */
+#define	IMR_MINT4	(1 << INT4_IRQ_NUM)	/* Mask External INT4 */
+#define	IMR_MINT5	(1 << INT5_IRQ_NUM)	/* Mask External INT5 */
+#define	IMR_MINT6	(1 << INT6_IRQ_NUM)	/* Mask External INT6 */
+#define	IMR_MINT7	(1 << INT7_IRQ_NUM)	/* Mask External INT7 */
+#define IMR_MIRQ1	(1 << IRQ1_IRQ_NUM)	/* Mask IRQ1 */
+#define IMR_MIRQ2	(1 << IRQ2_IRQ_NUM)	/* Mask IRQ2 */
+#define IMR_MIRQ3	(1 << IRQ3_IRQ_NUM)	/* Mask IRQ3 */
+#define IMR_MIRQ6	(1 << IRQ6_IRQ_NUM)	/* Mask IRQ6 */
+#define IMR_MPEN	(1 << PEN_IRQ_NUM)	/* Mask Pen Interrupt */
+#define IMR_MSPIS	(1 << SPIS_IRQ_NUM)	/* Mask SPI Slave Interrupt */
+#define IMR_MTMR1	(1 << TMR1_IRQ_NUM)	/* Mask Timer 1 interrupt */
+#define IMR_MIRQ7	(1 << IRQ7_IRQ_NUM)	/* Mask IRQ7 */
 
-#include <linux/kvm_host.h>
-#include <linux/errno.h>
-#include <linux/pagemap.h>
+/* 'EZ328-compatible definitions */
+#define IMR_MSPI	IMR_MSPIM
+#define IMR_MTMR	IMR_MTMR1
 
-#include <asm/kvm_host.h>
-#include <asm/asm-offsets.h>
-#include <asm/irq.h>
+/* 
+ * Interrupt Wake-Up Enable Register
+ */
+#define IWR_ADDR	0xfffff308
+#define IWR		LONG_REF(IWR_ADDR)
 
-#include "kvm-s390.h"
-#include "gaccess.h"
-#include "trace.h"
-#include "trace-s390.h"
+#define IWR_SPIM 	(1 << SPIM_IRQ_NUM)	/* SPI Master interrupt */
+#define	IWR_TMR2	(1 << TMR2_IRQ_NUM)	/* Timer 2 interrupt */
+#define IWR_UART	(1 << UART_IRQ_NUM)	/* UART interrupt */	
+#define	IWR_WDT		(1 << WDT_IRQ_NUM)	/* Watchdog Timer interrupt */
+#define IWR_RTC		(1 << RTC_IRQ_NUM)	/* RTC interrupt */
+#define	IWR_KB		(1 << KB_IRQ_NUM)	/* Keyboard Interrupt */
+#define IWR_PWM		(1 << PWM_IRQ_NUM)	/* Pulse-Width Modulator int. */
+#define	IWR_INT0	(1 << INT0_IRQ_NUM)	/* External INT0 */
+#define	IWR_INT1	(1 << INT1_IRQ_NUM)	/* External INT1 */
+#define	IWR_INT2	(1 << INT2_IRQ_NUM)	/* External INT2 */
+#define	IWR_INT3	(1 << INT3_IRQ_NUM)	/* External INT3 */
+#define	IWR_INT4	(1 << INT4_IRQ_NUM)	/* External INT4 */
+#define	IWR_INT5	(1 << INT5_IRQ_NUM)	/* External INT5 */
+#define	IWR_INT6	(1 << INT6_IRQ_NUM)	/* External INT6 */
+#define	IWR_INT7	(1 << INT7_IRQ_NUM)	/* External INT7 */
+#define IWR_IRQ1	(1 << IRQ1_IRQ_NUM)	/* IRQ1 */
+#define IWR_IRQ2	(1 << IRQ2_IRQ_NUM)	/* IRQ2 */
+#define IWR_IRQ3	(1 << IRQ3_IRQ_NUM)	/* IRQ3 */
+#define IWR_IRQ6	(1 << IRQ6_IRQ_NUM)	/* IRQ6 */
+#define IWR_PEN		(1 << PEN_IRQ_NUM)	/* Pen Interrupt */
+#define IWR_SPIS	(1 << SPIS_IRQ_NUM)	/* SPI Slave Interrupt */
+#define IWR_TMR1	(1 << TMR1_IRQ_NUM)	/* Timer 1 interrupt */
+#define IWR_IRQ7	(1 << IRQ7_IRQ_NUM)	/* IRQ7 */
 
+/* 
+ * Interrupt Status Register 
+ */
+#define ISR_ADDR	0xfffff30c
+#define ISR		LONG_REF(ISR_ADDR)
 
-static const intercept_handler_t instruction_handlers[256] = {
-	[0x01] = kvm_s390_handle_01,
-	[0x82] = kvm_s390_handle_lpsw,
-	[0x83] = kvm_s390_handle_diag,
-	[0xae] = kvm_s390_handle_sigp,
-	[0xb2] = kvm_s390_handle_b2,
-	[0xb6] = kvm_s390_handle_stctl,
-	[0xb7] = kvm_s390_handle_lctl,
-	[0xb9] = kvm_s390_handle_b9,
-	[0xe5] = kvm_s390_handle_e5,
-	[0xeb] = kvm_s390_handle_eb,
-};
+#define ISR_SPIM 	(1 << SPIM_IRQ_NUM)	/* SPI Master interrupt */
+#define	ISR_TMR2	(1 << TMR2_IRQ_NUM)	/* Timer 2 interrupt */
+#define ISR_UART	(1 << UART_IRQ_NUM)	/* UART interrupt */	
+#define	ISR_WDT		(1 << WDT_IRQ_NUM)	/* Watchdog Timer interrupt */
+#define ISR_RTC		(1 << RTC_IRQ_NUM)	/* RTC interrupt */
+#define	ISR_KB		(1 << KB_IRQ_NUM)	/* Keyboard Interrupt */
+#define ISR_PWM		(1 << PWM_IRQ_NUM)	/* Pulse-Width Modulator int. */
+#define	ISR_INT0	(1 << INT0_IRQ_NUM)	/* External INT0 */
+#define	ISR_INT1	(1 << INT1_IRQ_NUM)	/* External INT1 */
+#define	ISR_INT2	(1 << INT2_IRQ_NUM)	/* External INT2 */
+#define	ISR_INT3	(1 << INT3_IRQ_NUM)	/* External INT3 */
+#define	ISR_INT4	(1 << INT4_IRQ_NUM)	/* External INT4 */
+#define	ISR_INT5	(1 << INT5_IRQ_NUM)	/* External INT5 */
+#define	ISR_INT6	(1 << INT6_IRQ_NUM)	/* External INT6 */
+#define	ISR_INT7	(1 << INT7_IRQ_NUM)	/* External INT7 */
+#define ISR_IRQ1	(1 << IRQ1_IRQ_NUM)	/* IRQ1 */
+#define ISR_IRQ2	(1 << IRQ2_IRQ_NUM)	/* IRQ2 */
+#define ISR_IRQ3	(1 << IRQ3_IRQ_NUM)	/* IRQ3 */
+#define ISR_IRQ6	(1 << IRQ6_IRQ_NUM)	/* IRQ6 */
+#define ISR_PEN		(1 << PEN_IRQ_NUM)	/* Pen Interrupt */
+#define ISR_SPIS	(1 << SPIS_IRQ_NUM)	/* SPI Slave Interrupt */
+#define ISR_TMR1	(1 << TMR1_IRQ_NUM)	/* Timer 1 interrupt */
+#define ISR_IRQ7	(1 << IRQ7_IRQ_NUM)	/* IRQ7 */
 
-void kvm_s390_rewind_psw(struct kvm_vcpu *vcpu, int ilc)
-{
-	struct kvm_s390_sie_block *sie_block = vcpu->arch.sie_block;
+/* 'EZ328-compatible definitions */
+#define ISR_SPI	ISR_SPIM
+#define ISR_TMR	ISR_TMR1
 
-	/* Use the length of the EXECUTE instruction if necessary */
-	if (sie_block->icptstatus & 1) {
-		ilc = (sie_block->icptstatus >> 4) & 0x6;
-		if (!ilc)
-			ilc = 4;
-	}
-	sie_block->gpsw.addr = __rewind_psw(sie_block->gpsw, ilc);
-}
+/* 
+ * Interrupt Pending Register 
+ */
+#define IPR_ADDR	0xfffff310
+#define IPR		LONG_REF(IPR_ADDR)
 
-static int handle_noop(struct kvm_vcpu *vcpu)
-{
-	switch (vcpu->arch.sie_block->icptcode) {
-	case 0x0:
-		vcpu->stat.exit_null++;
-		break;
-	case 0x10:
-		vcpu->stat.exit_external_request++;
-		break;
-	default:
-		break; /* nothing */
-	}
-	return 0;
-}
+#define IPR_SPIM 	(1 << SPIM_IRQ_NUM)	/* SPI Master interrupt */
+#define	IPR_TMR2	(1 << TMR2_IRQ_NUM)	/* Timer 2 interrupt */
+#define IPR_UART	(1 << UART_IRQ_NUM)	/* UART interrupt */	
+#define	IPR_WDT		(1 << WDT_IRQ_NUM)	/* Watchdog Timer interrupt */
+#define IPR_RTC		(1 << RTC_IRQ_NUM)	/* RTC interrupt */
+#define	IPR_KB		(1 << KB_IRQ_NUM)	/* Keyboard Interrupt */
+#define IPR_PWM		(1 << PWM_IRQ_NUM)	/* Pulse-Width Modulator int. */
+#define	IPR_INT0	(1 << INT0_IRQ_NUM)	/* External INT0 */
+#define	IPR_INT1	(1 << INT1_IRQ_NUM)	/* External INT1 */
+#define	IPR_INT2	(1 << INT2_IRQ_NUM)	/* External INT2 */
+#define	IPR_INT3	(1 << INT3_IRQ_NUM)	/* External INT3 */
+#define	IPR_INT4	(1 << INT4_IRQ_NUM)	/* External INT4 */
+#define	IPR_INT5	(1 << INT5_IRQ_NUM)	/* External INT5 */
+#define	IPR_INT6	(1 << INT6_IRQ_NUM)	/* External INT6 */
+#define	IPR_INT7	(1 << INT7_IRQ_NUM)	/* External INT7 */
+#define IPR_IRQ1	(1 << IRQ1_IRQ_NUM)	/* IRQ1 */
+#define IPR_IRQ2	(1 << IRQ2_IRQ_NUM)	/* IRQ2 */
+#define IPR_IRQ3	(1 << IRQ3_IRQ_NUM)	/* IRQ3 */
+#define IPR_IRQ6	(1 << IRQ6_IRQ_NUM)	/* IRQ6 */
+#define IPR_PEN		(1 << PEN_IRQ_NUM)	/* Pen Interrupt */
+#define IPR_SPIS	(1 << SPIS_IRQ_NUM)	/* SPI Slave Interrupt */
+#define IPR_TMR1	(1 << TMR1_IRQ_NUM)	/* Timer 1 interrupt */
+#define IPR_IRQ7	(1 << IRQ7_IRQ_NUM)	/* IRQ7 */
 
-static int handle_stop(struct kvm_vcpu *vcpu)
-{
-	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
-	int rc = 0;
-	uint8_t flags, stop_pending;
+/* 'EZ328-compatible definitions */
+#define IPR_SPI	IPR_SPIM
+#define IPR_TMR	IPR_TMR1
 
-	vcpu->stat.exit_stop_request++;
-
-	/* delay the stop if any non-stop irq is pending */
-	if (kvm_s390_vcpu_has_irq(vcpu, 1))
-		return 0;
-
-	/* avoid races with the injection/SIGP STOP code */
-	spin_lock(&li->lock);
-	flags = li->irq.stop.flags;
-	stop_pending = kvm_s390_is_stop_irq_pending(vcpu);
-	spin_unlock(&li->lock);
-
-	trace_kvm_s390_stop_request(stop_pending, flags);
-	if (!stop_pending)
-		return 0;
-
-	if (flags & KVM_S390_STOP_FLAG_STORE_STATUS) {
-		rc = kvm_s390_vcpu_store_status(vcpu,
-						KVM_S390_STORE_STATUS_NOADDR);
-		if (rc)
-			return rc;
-	}
-
-	if (!kvm_s390_user_cpu_state_ctrl(vcpu->kvm))
-		kvm_s390_vcpu_stop(vcpu);
-	return -EOPNOTSUPP;
-}
-
-static int handle_validity(struct kvm_vcpu *vcpu)
-{
-	int viwhy = vcpu->arch.sie_block->ipb >> 16;
-
-	vcpu->stat.exit_validity++;
-	trace_kvm_s390_intercept_validity(vcpu, viwhy);
-	WARN_ONCE(true, "kvm: unhandled validity intercept 0x%x\n", viwhy);
-	return -EOPNOTSUPP;
-}
-
-static int handle_instruction(struct kvm_vcpu *vcpu)
-{
-	intercept_handler_t handler;
-
-	vcpu->stat.exit_instruction++;
-	trace_kvm_s390_intercept_instruction(vcpu,
-					     vcpu->arch.sie_block->ipa,
-					     vcpu->arch.sie_block->ipb);
-	handler = instruction_handlers[vcpu->arch.sie_block->ipa >> 8];
-	if (handler)
-		return handler(vcpu);
-	return -EOPNOTSUPP;
-}
-
-static void __extract_prog_irq(struct kvm_vcpu *vcpu,
-			       struct kvm_s390_pgm_info *pgm_info)
-{
-	memset(pgm_info, 0, sizeof(struct kvm_s390_pgm_info));
-	pgm_info->code = vcpu->arch.sie_block->iprcc;
-
-	switch (vcpu->arch.sie_block->iprcc & ~PGM_PER) {
-	case PGM_AFX_TRANSLATION:
-	case PGM_ASX_TRANSLATION:
-	case PGM_EX_TRANSLATION:
-	case PGM_LFX_TRANSLATION:
-	case PGM_LSTE_SEQUENCE:
-	case PGM_LSX_TRANSLATION:
-	case PGM_LX_TRANSLATION:
-	case PGM_PRIMARY_AUTHORITY:
-	case PGM_SECONDARY_AUTHORITY:
-	case PGM_SPACE_SWITCH:
-		pgm_info->trans_exc_code = vcpu->arch.sie_block->tecmc;
-		break;
-	case PGM_ALEN_TRANSLATION:
-	case PGM_ALE_SEQUENCE:
-	case PGM_ASTE_INSTANCE:
-	case PGM_ASTE_SEQUENCE:
-	case PGM_ASTE_VALIDITY:
-	case PGM_EXTENDED_AUTHORITY:
-		pgm_info->exc_access_id = vcpu->arch.sie_block->eai;
-		break;
-	case PGM_ASCE_TYPE:
-	case PGM_PAGE_TRANSLATION:
-	case PGM_REGION_FIRST_TRANS:
-	case PGM_REGION_SECOND_TRANS:
-	case PGM_REGION_THIRD_TRANS:
-	case PGM_SEGMENT_TRANSLATION:
-		pgm_info->trans_exc_code = vcpu->arch.sie_block->tecmc;
-		pgm_info->exc_access_id  = vcpu->arch.sie_block->eai;
-		pgm_info->op_access_id  = vcpu->arch.sie_block->oai;
-		break;
-	case PGM_MONITOR:
-		pgm_info->mon_class_nr = vcpu->arch.sie_block->mcn;
-		pgm_info->mon_code = vcpu->arch.sie_block->tecmc;
-		break;
-	case PGM_VECTOR_PROCESSING:
-	case PGM_DATA:
-		pgm_info->data_exc_code = vcpu->arch.sie_block->dxc;
-		break;
-	case PGM_PROTECTION:
-		pgm_info->trans_exc_code = vcpu->arch.sie_block->tecmc;
-		pgm_info->exc_access_id  = vcpu->arch.sie_block->eai;
-		break;
-	default:
-		break;
-	}
-
-	if (vcpu->arch.sie_block->iprcc & PGM_PER) {
-		pgm_info->per_code = vcpu->arch.sie_block->perc;
-		pgm_info->per_atmid = vcpu->arch.sie_block->peratmid;
-		pgm_info->per_address = vcpu->arch.sie_block->peraddr;
-		pgm_info->per_access_id = vcpu->arch.sie_block->peraid;
-	}
-}
+/**********
+ *
+ * 0xFFFFF4xx -- Parallel Ports
+ *
+ **********/
 
 /*
- * restore ITDB to program-interruption TDB in guest lowcore
- * and set TX abort indication if required
-*/
-static int handle_itdb(struct kvm_vcpu *vcpu)
-{
-	struct kvm_s390_itdb *itdb;
-	int rc;
-
-	if (!IS_TE_ENABLED(vcpu) || !IS_ITDB_VALID(vcpu))
-		return 0;
-	if (current->thread.per_flags & PER_FLAG_NO_TE)
-		return 0;
-	itdb = (struct kvm_s390_itdb *)vcpu->arch.sie_block->itdba;
-	rc = write_guest_lc(vcpu, __LC_PGM_TDB, itdb, sizeof(*itdb));
-	if (rc)
-		return rc;
-	memset(itdb, 0, sizeof(*itdb));
-
-	return 0;
-}
-
-#define per_event(vcpu) (vcpu->arch.sie_block->iprcc & PGM_PER)
-
-static int handle_prog(struct kvm_vcpu *vcpu)
-{
-	struct kvm_s390_pgm_info pgm_info;
-	psw_t psw;
-	int rc;
-
-	vcpu->stat.exit_program_interruption++;
-
-	if (guestdbg_enabled(vcpu) && per_event(vcpu)) {
-		kvm_s390_handle_per_event(vcpu);
-		/* the interrupt might have been filtered out completely */
-		if (vcpu->arch.sie_block->iprcc == 0)
-			return 0;
-	}
-
-	trace_kvm_s390_intercept_prog(vcpu, vcpu->arch.sie_block->iprcc);
-	if (vcpu->arch.sie_block->iprcc == PGM_SPECIFICATION) {
-		rc = read_guest_lc(vcpu, __LC_PGM_NEW_PSW, &psw, sizeof(psw_t));
-		if (rc)
-			return rc;
-		/* Avoid endless loops of specification exceptions */
-		if (!is_valid_psw(&psw))
-			return -EOPNOTSUPP;
-	}
-	rc = handle_itdb(vcpu);
-	if (rc)
-		return rc;
-
-	__extract_prog_irq(vcpu, &pgm_info);
-	return kvm_s390_inject_prog_irq(vcpu, &pgm_info);
-}
-
-/**
- * handle_external_interrupt - used for external interruption interceptions
- *
- * This interception only occurs if the CPUSTAT_EXT_INT bit was set, or if
- * the new PSW does not have external interrupts disabled. In the first case,
- * we've got to deliver the interrupt manually, and in the second case, we
- * drop to userspace to handle the situation there.
+ * Port A
  */
-static int handle_external_interrupt(struct kvm_vcpu *vcpu)
-{
-	u16 eic = vcpu->arch.sie_block->eic;
-	struct kvm_s390_irq irq;
-	psw_t newpsw;
-	int rc;
+#define PADIR_ADDR	0xfffff400		/* Port A direction reg */
+#define PADATA_ADDR	0xfffff401		/* Port A data register */
+#define PASEL_ADDR	0xfffff403		/* Port A Select register */
 
-	vcpu->stat.exit_external_interrupt++;
+#define PADIR		BYTE_REF(PADIR_ADDR)
+#define PADATA		BYTE_REF(PADATA_ADDR)
+#define PASEL		BYTE_REF(PASEL_ADDR)
 
-	rc = read_guest_lc(vcpu, __LC_EXT_NEW_PSW, &newpsw, sizeof(psw_t));
-	if (rc)
-		return rc;
-	/* We can not handle clock comparator or timer interrupt with bad PSW */
-	if ((eic == EXT_IRQ_CLK_COMP || eic == EXT_IRQ_CPU_TIMER) &&
-	    (newpsw.mask & PSW_MASK_EXT))
-		return -EOPNOTSUPP;
+#define PA(x)           (1 << (x))
+#define PA_A(x)		PA((x) - 16)	/* This is specific to PA only! */
 
-	switch (eic) {
-	case EXT_IRQ_CLK_COMP:
-		irq.type = KVM_S390_INT_CLOCK_COMP;
-		break;
-	case EXT_IRQ_CPU_TIMER:
-		irq.type = KVM_S390_INT_CPU_TIMER;
-		break;
-	case EXT_IRQ_EXTERNAL_CALL:
-		irq.type = KVM_S390_INT_EXTERNAL_CALL;
-		irq.u.extcall.code = vcpu->arch.sie_block->extcpuaddr;
-		rc = kvm_s390_inject_vcpu(vcpu, &irq);
-		/* ignore if another external call is already pending */
-		if (rc == -EBUSY)
-			return 0;
-		return rc;
-	default:
-		return -EOPNOTSUPP;
-	}
+#define PA_A16		PA(0)		/* Use A16 as PA(0) */
+#define PA_A17		PA(1)		/* Use A17 as PA(1) */
+#define PA_A18		PA(2)		/* Use A18 as PA(2) */
+#define PA_A19		PA(3)		/* Use A19 as PA(3) */
+#define PA_A20		PA(4)		/* Use A20 as PA(4) */
+#define PA_A21		PA(5)		/* Use A21 as PA(5) */
+#define PA_A22		PA(6)		/* Use A22 as PA(6) */
+#define PA_A23		PA(7)		/* Use A23 as PA(7) */
 
-	return kvm_s390_inject_vcpu(vcpu, &irq);
-}
-
-/**
- * Handle MOVE PAGE partial execution interception.
- *
- * This interception can only happen for guests with DAT disabled and
- * addresses that are currently not mapped in the host. Thus we try to
- * set up the mappings for the corresponding user pages here (or throw
- * addressing exceptions in case of illegal guest addresses).
+/* 
+ * Port B
  */
-static int handle_mvpg_pei(struct kvm_vcpu *vcpu)
-{
-	unsigned long srcaddr, dstaddr;
-	int reg1, reg2, rc;
+#define PBDIR_ADDR	0xfffff408		/* Port B direction reg */
+#define PBDATA_ADDR	0xfffff409		/* Port B data register */
+#define PBSEL_ADDR	0xfffff40b		/* Port B Select Register */
 
-	kvm_s390_get_regs_rre(vcpu, &reg1, &reg2);
+#define PBDIR		BYTE_REF(PBDIR_ADDR)
+#define PBDATA		BYTE_REF(PBDATA_ADDR)
+#define PBSEL		BYTE_REF(PBSEL_ADDR)
 
-	/* Make sure that the source is paged-in */
-	rc = guest_translate_address(vcpu, vcpu->run->s.regs.gprs[reg2],
-				     reg2, &srcaddr, 0);
-	if (rc)
-		return kvm_s390_inject_prog_cond(vcpu, rc);
-	rc = kvm_arch_fault_in_page(vcpu, srcaddr, 0);
-	if (rc != 0)
-		return rc;
+#define PB(x)           (1 << (x))
+#define PB_D(x)		PB(x)		/* This is specific to port B only */
 
-	/* Make sure that the destination is paged-in */
-	rc = guest_translate_address(vcpu, vcpu->run->s.regs.gprs[reg1],
-				     reg1, &dstaddr, 1);
-	if (rc)
-		return kvm_s390_inject_prog_cond(vcpu, rc);
-	rc = kvm_arch_fault_in_page(vcpu, dstaddr, 1);
-	if (rc != 0)
-		return rc;
+#define PB_D0		PB(0)		/* Use D0 as PB(0) */
+#define PB_D1		PB(1)		/* Use D1 as PB(1) */
+#define PB_D2		PB(2)		/* Use D2 as PB(2) */
+#define PB_D3		PB(3)		/* Use D3 as PB(3) */
+#define PB_D4		PB(4)		/* Use D4 as PB(4) */
+#define PB_D5		PB(5)		/* Use D5 as PB(5) */
+#define PB_D6		PB(6)		/* Use D6 as PB(6) */
+#define PB_D7		PB(7)		/* Use D7 as PB(7) */
 
-	kvm_s390_rewind_psw(vcpu, 4);
+/* 
+ * Port C
+ */
+#define PCDIR_ADDR	0xfffff410		/* Port C direction reg */
+#define PCDATA_ADDR	0xfffff411		/* Port C data register */
+#define PCSEL_ADDR	0xfffff413		/* Port C Select Register */
 
-	return 0;
-}
+#define PCDIR		BYTE_REF(PCDIR_ADDR)
+#define PCDATA		BYTE_REF(PCDATA_ADDR)
+#define PCSEL		BYTE_REF(PCSEL_ADDR)
 
-static int handle_partial_execution(struct kvm_vcpu *vcpu)
-{
-	if (vcpu->arch.sie_block->ipa == 0xb254)	/* MVPG */
-		return handle_mvpg_pei(vcpu);
-	if (vcpu->arch.sie_block->ipa >> 8 == 0xae)	/* SIGP */
-		return kvm_s390_handle_sigp_pei(vcpu);
+#define PC(x)           (1 << (x))
 
-	return -EOPNOTSUPP;
-}
+#define PC_WE		PC(6)		/* Use WE    as PC(6) */
+#define PC_DTACK	PC(5)		/* Use DTACK as PC(5) */
+#define PC_IRQ7		PC(4)		/* Use IRQ7  as PC(4) */
+#define PC_LDS		PC(2)		/* Use LDS   as PC(2) */
+#define PC_UDS		PC(1)		/* Use UDS   as PC(1) */
+#define PC_MOCLK	PC(0)		/* Use MOCLK as PC(0) */
 
-int kvm_handle_sie_intercept(struct kvm_vcpu *vcpu)
-{
-	switch (vcpu->arch.sie_block->icptcode) {
-	case 0x00:
-	case 0x10:
-	case 0x18:
-		return handle_noop(vcpu);
-	case 0x04:
-		return handle_instruction(vcpu);
-	case 0x08:
-		return handle_prog(vcpu);
-	case 0x14:
-		return handle_external_interrupt(vcpu);
-	case 0x1c:
-		return kvm_s390_handle_wait(vcpu);
-	case 0x20:
-		return handle_validity(vcpu);
-	case 0x28:
-		return handle_stop(vcpu);
-	case 0x38:
-		return handle_partial_execution(vcpu);
-	default:
-		return -EOPNOTSUPP;
-	}
-}
+/* 
+ * Port D
+ */
+#define PDDIR_ADDR	0xfffff418		/* Port D direction reg */
+#define PDDATA_ADDR	0xfffff419		/* Port D data register */
+#define PDPUEN_ADDR	0xfffff41a		/* Port D Pull-Up enable reg */
+#define PDPOL_ADDR	0xfffff41c		/* Port D Polarity Register */
+#define PDIRQEN_ADDR	0xfffff41d		/* Port D IRQ enable register */
+#define	PDIQEG_ADDR	0xfffff41f		/* Port D IRQ Edge Register */
+
+#define PDDIR		BYTE_REF(PDDIR_ADDR)
+#define PDDATA		BYTE_REF(PDDATA_ADDR)
+#define PDPUEN		BYTE_REF(PDPUEN_ADDR)
+#define	PDPOL		BYTE_REF(PDPOL_ADDR)
+#define PDIRQEN		BYTE_REF(PDIRQEN_ADDR)
+#define PDIQEG		BYTE_REF(PDIQEG_ADDR)
+
+#define PD(x)           (1 << (x))
+#define PD_KB(x)	PD(x)		/* This is specific for Port D only */
+
+#define PD_KB0		PD(0)	/* Use KB0 as PD(0) */
+#define PD_KB1		PD(1)	/* Use KB1 as PD(1) */
+#define PD_KB2		PD(2)	/* Use KB2 as PD(2) */
+#define PD_KB3		PD(3)	/* Use KB3 as PD(3) */
+#define PD_KB4		PD(4)	/* Use KB4 as PD(4) */
+#define PD_KB5		PD(5)	/* Use KB5 as PD(5) */
+#define PD_KB6		PD(6)	/* Use KB6 as PD(6) */
+#define PD_KB7		PD(7)	/* Use KB7 as PD(7) */
+
+/* 
+ * Port E
+ */
+#define PEDIR_ADDR	0xfffff420		/* Port E direction reg */
+#define PEDATA_ADDR	0xfffff421		/* Port E data register */
+#define PEPUEN_ADDR	0xfffff42

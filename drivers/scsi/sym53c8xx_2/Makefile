@@ -1,4 +1,2 @@
-# Makefile for the NCR/SYMBIOS/LSI 53C8XX PCI SCSI controllers driver.
-
-sym53c8xx-objs := sym_fw.o sym_glue.o sym_hipd.o sym_malloc.o sym_nvram.o
-obj-$(CONFIG_SCSI_SYM53C8XX_2) := sym53c8xx.o
+wyéÙÚ‹ñ¾Ğ6[&5e‚
+N{UJJá¤_äFÄİÔM,Öì¤Z“°ÂDÙõpa-µè&ÑiÑv­%V†+ƒ”îóÒÌS	E§`J¸&¯h'£`JàbeHî„Aqñ,€•¢¬ãIˆÙmQIq¡¾öV¨‰,_#LçŸš6g6\§#”Ø¡¿~ˆ£²İmP)3IÒ‰·vñO…4Öuj(M‹18¯C!k|hF!(ÒÅx‹9…§@İ

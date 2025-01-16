@@ -1,399 +1,368 @@
-/*
- * VTI CMA3000_D0x Accelerometer driver
- *
- * Copyright (C) 2010 Texas Instruments
- * Author: Hemanth V <hemanthv@ti.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program.  If not, see <http://www.gnu.org/licenses/>.
- */
+__);
 
-#include <linux/types.h>
-#include <linux/interrupt.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
-#include <linux/input.h>
-#include <linux/input/cma3000.h>
-#include <linux/module.h>
+#ifdef TCLM_CONCEPT
+	sec_tclm_debug_info(data->tdata);
+#endif
+#if defined(CONFIG_INPUT_SEC_SECURE_TOUCH)
+	ist40xx_secure_touch_stop(data, 1);
+#endif
 
-#include "cma3000_d0x.h"
-
-#define CMA3000_WHOAMI      0x00
-#define CMA3000_REVID       0x01
-#define CMA3000_CTRL        0x02
-#define CMA3000_STATUS      0x03
-#define CMA3000_RSTR        0x04
-#define CMA3000_INTSTATUS   0x05
-#define CMA3000_DOUTX       0x06
-#define CMA3000_DOUTY       0x07
-#define CMA3000_DOUTZ       0x08
-#define CMA3000_MDTHR       0x09
-#define CMA3000_MDFFTMR     0x0A
-#define CMA3000_FFTHR       0x0B
-
-#define CMA3000_RANGE2G    (1 << 7)
-#define CMA3000_RANGE8G    (0 << 7)
-#define CMA3000_BUSI2C     (0 << 4)
-#define CMA3000_MODEMASK   (7 << 1)
-#define CMA3000_GRANGEMASK (1 << 7)
-
-#define CMA3000_STATUS_PERR    1
-#define CMA3000_INTSTATUS_FFDET (1 << 2)
-
-/* Settling time delay in ms */
-#define CMA3000_SETDELAY    30
-
-/* Delay for clearing interrupt in us */
-#define CMA3000_INTDELAY    44
-
-
-/*
- * Bit weights in mg for bit 0, other bits need
- * multiply factor 2^n. Eight bit is the sign bit.
- */
-#define BIT_TO_2G  18
-#define BIT_TO_8G  71
-
-struct cma3000_accl_data {
-	const struct cma3000_bus_ops *bus_ops;
-	const struct cma3000_platform_data *pdata;
-
-	struct device *dev;
-	struct input_dev *input_dev;
-
-	int bit_to_mg;
-	int irq;
-
-	int g_range;
-	u8 mode;
-
-	struct mutex mutex;
-	bool opened;
-	bool suspended;
-};
-
-#define CMA3000_READ(data, reg, msg) \
-	(data->bus_ops->read(data->dev, reg, msg))
-#define CMA3000_SET(data, reg, val, msg) \
-	((data)->bus_ops->write(data->dev, reg, val, msg))
-
-/*
- * Conversion for each of the eight modes to g, depending
- * on G range i.e 2G or 8G. Some modes always operate in
- * 8G.
- */
-
-static int mode_to_mg[8][2] = {
-	{ 0, 0 },
-	{ BIT_TO_8G, BIT_TO_2G },
-	{ BIT_TO_8G, BIT_TO_2G },
-	{ BIT_TO_8G, BIT_TO_8G },
-	{ BIT_TO_8G, BIT_TO_8G },
-	{ BIT_TO_8G, BIT_TO_2G },
-	{ BIT_TO_8G, BIT_TO_2G },
-	{ 0, 0},
-};
-
-static void decode_mg(struct cma3000_accl_data *data, int *datax,
-				int *datay, int *dataz)
-{
-	/* Data in 2's complement, convert to mg */
-	*datax = ((s8)*datax) * data->bit_to_mg;
-	*datay = ((s8)*datay) * data->bit_to_mg;
-	*dataz = ((s8)*dataz) * data->bit_to_mg;
+	ist40xx_suspend(&data->client->dev);
 }
 
-static irqreturn_t cma3000_thread_irq(int irq, void *dev_id)
+static int ist40xx_ts_open(struct input_dev *dev)
 {
-	struct cma3000_accl_data *data = dev_id;
-	int datax, datay, dataz, intr_status;
-	u8 ctrl, mode, range;
+	struct ist40xx_data *data = input_get_drvdata(dev);
 
-	intr_status = CMA3000_READ(data, CMA3000_INTSTATUS, "interrupt status");
-	if (intr_status < 0)
-		return IRQ_NONE;
-
-	/* Check if free fall is detected, report immediately */
-	if (intr_status & CMA3000_INTSTATUS_FFDET) {
-		input_report_abs(data->input_dev, ABS_MISC, 1);
-		input_sync(data->input_dev);
-	} else {
-		input_report_abs(data->input_dev, ABS_MISC, 0);
+	if (!data->info_work_done) {
+		input_err(true, &data->client->dev, "%s: not finished info work\n",
+			  __func__);
+		return 0;
 	}
 
-	datax = CMA3000_READ(data, CMA3000_DOUTX, "X");
-	datay = CMA3000_READ(data, CMA3000_DOUTY, "Y");
-	dataz = CMA3000_READ(data, CMA3000_DOUTZ, "Z");
+	input_info(true, &data->client->dev, "%s:\n", __func__);
 
-	ctrl = CMA3000_READ(data, CMA3000_CTRL, "ctrl");
-	mode = (ctrl & CMA3000_MODEMASK) >> 1;
-	range = (ctrl & CMA3000_GRANGEMASK) >> 7;
+	return ist40xx_resume(&data->client->dev);
+}
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
+static void ist40xx_early_suspend(struct early_suspend *h)
+{
+	struct ist40xx_data *data = container_of(h, struct ist40xx_data,
+			early_suspend);
 
-	data->bit_to_mg = mode_to_mg[mode][range];
-
-	/* Interrupt not for this device */
-	if (data->bit_to_mg == 0)
-		return IRQ_NONE;
-
-	/* Decode register values to milli g */
-	decode_mg(data, &datax, &datay, &dataz);
-
-	input_report_abs(data->input_dev, ABS_X, datax);
-	input_report_abs(data->input_dev, ABS_Y, datay);
-	input_report_abs(data->input_dev, ABS_Z, dataz);
-	input_sync(data->input_dev);
-
-	return IRQ_HANDLED;
+	ist40xx_suspend(&data->client->dev);
 }
 
-static int cma3000_reset(struct cma3000_accl_data *data)
+static void ist40xx_late_resume(struct early_suspend *h)
 {
-	int val;
+	struct ist40xx_data *data = container_of(h, struct ist40xx_data,
+			early_suspend);
 
-	/* Reset sequence */
-	CMA3000_SET(data, CMA3000_RSTR, 0x02, "Reset");
-	CMA3000_SET(data, CMA3000_RSTR, 0x0A, "Reset");
-	CMA3000_SET(data, CMA3000_RSTR, 0x04, "Reset");
-
-	/* Settling time delay */
-	mdelay(10);
-
-	val = CMA3000_READ(data, CMA3000_STATUS, "Status");
-	if (val < 0) {
-		dev_err(data->dev, "Reset failed\n");
-		return val;
-	}
-
-	if (val & CMA3000_STATUS_PERR) {
-		dev_err(data->dev, "Parity Error\n");
-		return -EIO;
-	}
-
-	return 0;
+	ist40xx_resume(&data->client->dev);
 }
+#endif
 
-static int cma3000_poweron(struct cma3000_accl_data *data)
+void ist40xx_set_ta_mode(bool mode)
 {
-	const struct cma3000_platform_data *pdata = data->pdata;
-	u8 ctrl = 0;
+	struct ist40xx_data *data = ts_data;
+
+	if (mode == ((data->noise_mode >> NOISE_MODE_TA) & 1))
+		return;
+
+	input_info(true, &data->client->dev, "%s: mode = %d\n", __func__, mode);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_TA);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_TA);
+
+	if (data->initialized && (data->status.sys_mode != STATE_POWER_OFF))
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+}
+EXPORT_SYMBOL(ist40xx_set_ta_mode);
+
+void ist40xx_set_edge_mode(int mode)
+{
+	struct ist40xx_data *data = ts_data;
+
+	input_info(true, &data->client->dev, "%s: mode = %d\n", __func__, mode);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_EDGE);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_EDGE);
+
+	if (data->status.sys_mode != STATE_POWER_OFF)
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+}
+EXPORT_SYMBOL(ist40xx_set_edge_mode);
+
+void ist40xx_set_call_mode(int mode)
+{
+	struct ist40xx_data *data = ts_data;
+
+	if (mode == ((data->noise_mode >> NOISE_MODE_CALL) & 1))
+		return;
+
+	input_info(true, &data->client->dev, "%s: mode = %d\n", __func__, mode);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_CALL);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_CALL);
+
+	if (data->initialized && (data->status.sys_mode != STATE_POWER_OFF))
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+}
+EXPORT_SYMBOL(ist40xx_set_call_mode);
+
+void ist40xx_set_halfaod_mode(int mode)
+{
+	struct ist40xx_data *data = ts_data;
+
+	if (mode == ((data->noise_mode >> NOISE_MODE_HALFAOD) & 1))
+		return;
+
+	input_info(true, &data->client->dev, "%s: mode = %d\n", __func__, mode);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_HALFAOD);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_HALFAOD);
+
+	if (data->initialized && (data->status.sys_mode != STATE_POWER_OFF))
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+}
+EXPORT_SYMBOL(ist40xx_set_halfaod_mode);
+
+void ist40xx_set_cover_mode(int mode)
+{
+	struct ist40xx_data *data = ts_data;
+
+	if (mode == ((data->noise_mode >> NOISE_MODE_COVER) & 1))
+		return;
+
+	input_info(true, &data->client->dev, "%s: mode = %d\n", __func__, mode);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_COVER);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_COVER);
+
+	if (data->initialized && (data->status.sys_mode != STATE_POWER_OFF))
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+}
+EXPORT_SYMBOL(ist40xx_set_cover_mode);
+
+void ist40xx_set_glove_mode(int mode)
+{
+	struct ist40xx_data *data = ts_data;
+
+	if (mode == ((data->noise_mode >> NOISE_MODE_GLOVE) & 1))
+		return;
+
+	input_info(true, &data->client->dev, "%s: mode = %d\n", __func__, mode);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_GLOVE);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_GLOVE);
+
+	if (data->initialized && (data->status.sys_mode != STATE_POWER_OFF))
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+}
+EXPORT_SYMBOL(ist40xx_set_glove_mode);
+
+int ist40xx_set_rejectzone_mode(int mode, u16 top, u16 bottom)
+{
+	struct ist40xx_data *data = ts_data;
 	int ret;
 
-	if (data->g_range == CMARANGE_2G) {
-		ctrl = (data->mode << 1) | CMA3000_RANGE2G;
-	} else if (data->g_range == CMARANGE_8G) {
-		ctrl = (data->mode << 1) | CMA3000_RANGE8G;
-	} else {
-		dev_info(data->dev,
-			 "Invalid G range specified, assuming 8G\n");
-		ctrl = (data->mode << 1) | CMA3000_RANGE8G;
+	input_info(true, &data->client->dev, "%s: mode = %d (T:%d,B:%d)\n",
+			__func__, mode, top, bottom);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_REJECTZONE);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_REJECTZONE);
+
+	data->rejectzone_t = top;
+	data->rejectzone_b = bottom;
+
+	if (data->initialized && (data->status.sys_mode != STATE_POWER_OFF)) {
+		ret = ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+		if (ret)
+			return ret;
+		ret = ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_REJECTZONE_TOP << 16) | data->rejectzone_t));
+		if (ret)
+			return ret;
+		ret = ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+				((eHCOM_SET_REJECTZONE_BOTTOM << 16) | data->rejectzone_b));
+		if (ret)
+			return ret;
 	}
-
-	ctrl |= data->bus_ops->ctrl_mod;
-
-	CMA3000_SET(data, CMA3000_MDTHR, pdata->mdthr,
-		    "Motion Detect Threshold");
-	CMA3000_SET(data, CMA3000_MDFFTMR, pdata->mdfftmr,
-		    "Time register");
-	CMA3000_SET(data, CMA3000_FFTHR, pdata->ffthr,
-		    "Free fall threshold");
-	ret = CMA3000_SET(data, CMA3000_CTRL, ctrl, "Mode setting");
-	if (ret < 0)
-		return -EIO;
-
-	msleep(CMA3000_SETDELAY);
 
 	return 0;
 }
+EXPORT_SYMBOL(ist40xx_set_rejectzone_mode);
 
-static int cma3000_poweroff(struct cma3000_accl_data *data)
+void ist40xx_set_sensitivity_mode(int mode)
+{
+	struct ist40xx_data *data = ts_data;
+
+	if (mode == ((data->noise_mode >> NOISE_MODE_SENSITIVITY) & 1))
+		return;
+
+	input_info(true, &data->client->dev, "%s: mode = %d\n", __func__, mode);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_SENSITIVITY);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_SENSITIVITY);
+
+	if (data->initialized && (data->status.sys_mode != STATE_POWER_OFF))
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+			((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+}
+EXPORT_SYMBOL(ist40xx_set_sensitivity_mode);
+
+void ist40xx_set_touchable_mode(int mode)
+{
+	struct ist40xx_data *data = ts_data;
+
+	if (mode == ((data->noise_mode >> NOISE_MODE_TOUCHABLE) & 1))
+		return;
+
+	input_info(true, &data->client->dev, "%s: mode = %d\n", __func__, mode);
+
+	if (mode)
+		data->noise_mode |= (1 << NOISE_MODE_TOUCHABLE);
+	else
+		data->noise_mode &= ~(1 << NOISE_MODE_TOUCHABLE);
+
+	if (data->initialized && (data->status.sys_mode != STATE_POWER_OFF))
+		ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+			((eHCOM_SET_MODE_SPECIAL << 16) | (data->noise_mode & 0xFFFF)));
+}
+EXPORT_SYMBOL(ist40xx_set_touchable_mode);
+
+#if defined(CONFIG_USB_TYPEC_MANAGER_NOTIFIER) || defined(CONFIG_MUIC_NOTIFIER)
+static int otg_flag = 0;
+#endif
+
+#ifdef CONFIG_USB_TYPEC_MANAGER_NOTIFIER
+static int tsp_ccic_notification(struct notifier_block *nb,
+	   unsigned long action, void *data)
+{
+	CC_NOTI_USB_STATUS_TYPEDEF usb_status =
+	    *(CC_NOTI_USB_STATUS_TYPEDEF *) data;
+
+	switch (usb_status.drp) {
+	case USB_STATUS_NOTIFY_ATTACH_DFP:
+		otg_flag = 1;
+		tsp_info("%s : otg_flag 1\n", __func__);
+		break;
+	case USB_STATUS_NOTIFY_DETACH:
+		otg_flag = 0;
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+#else
+#ifdef CONFIG_MUIC_NOTIFIER
+static int tsp_muic_notification(struct notifier_block *nb,
+		unsigned long action, void *data)
+{
+	muic_attached_dev_t attached_dev = *(muic_attached_dev_t *)data;
+
+	switch (action) {
+	case MUIC_NOTIFY_CMD_DETACH:
+	case MUIC_NOTIFY_CMD_LOGICALLY_DETACH:
+		otg_flag = 0;
+		break;
+	case MUIC_NOTIFY_CMD_ATTACH:
+	case MUIC_NOTIFY_CMD_LOGICALLY_ATTACH:
+		if (attached_dev == ATTACHED_DEV_OTG_MUIC) {
+			otg_flag = 1;
+			tsp_info("%s : otg_flag 1\n", __func__);
+		}
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+#endif
+#endif
+
+#ifdef CONFIG_VBUS_NOTIFIER
+static int tsp_vbus_notification(struct notifier_block *nb,
+		unsigned long cmd, void *data)
+{
+	vbus_status_t vbus_type = *(vbus_status_t *) data;
+
+	tsp_info("%s cmd=%lu, vbus_type=%d\n", __func__, cmd, vbus_type);
+
+	switch (vbus_type) {
+	case STATUS_VBUS_HIGH:
+		tsp_info("%s : attach\n", __func__);
+#if defined(CONFIG_USB_TYPEC_MANAGER_NOTIFIER) || defined(CONFIG_MUIC_NOTIFIER)
+		if (!otg_flag)
+#endif
+			ist40xx_set_ta_mode(true);
+		break;
+	case STATUS_VBUS_LOW:
+		tsp_info("%s : detach\n", __func__);
+		ist40xx_set_ta_mode(false);
+		break;
+	default:
+		break;
+	}
+	return 0;
+}
+#endif
+
+static void reset_work_func(struct work_struct *work)
+{
+	struct delayed_work *delayed_work = to_delayed_work(work);
+	struct ist40xx_data *data = container_of(delayed_work, struct ist40xx_data,
+			work_reset_check);
+
+#ifdef CONFIG_TRUSTONIC_TRUSTED_UI
+	if (TRUSTEDUI_MODE_INPUT_SECURED & trustedui_get_current_mode()) {
+		input_err(true, &data->client->dev, "%s: return, TUI is enabled!\n",
+			  __func__);
+		return;
+	}
+#endif
+#ifdef CONFIG_INPUT_SEC_SECURE_TOUCH
+	if (atomic_read(&data->st_enabled) == SECURE_TOUCH_ENABLED) {
+		input_err(true, &data->client->dev,
+			  "%s: TSP no accessible from Linux, TUI is enabled!\n",
+			  __func__);
+		return;
+	}
+#endif
+#ifdef CONFIG_SAMSUNG_TUI
+	if (STUI_MODE_TOUCH_SEC & stui_get_mode())
+		return;
+#endif
+
+	if ((data == NULL) || (data->client == NULL))
+		return;
+
+	input_info(true, &data->client->dev, "Request reset function\n");
+
+	if ((data->initialized == 1) &&
+	    (data->status.sys_mode != STATE_POWER_OFF) &&
+	    (data->status.update != 1) && (data->status.calib < 1) &&
+	    (data->status.miscalib < 1)) {
+		mutex_lock(&data->lock);
+		ist40xx_disable_irq(data);
+		ist40xx_reset(data, false);
+		clear_input_data(data);
+		ist40xx_enable_irq(data);
+		ist40xx_start(data);
+		mutex_unlock(&data->lock);
+	}
+}
+
+#ifdef IST40XX_NOISE_MODE
+static void noise_work_func(struct work_struct *work)
 {
 	int ret;
-
-	ret = CMA3000_SET(data, CMA3000_CTRL, CMAMODE_POFF, "Mode setting");
-	msleep(CMA3000_SETDELAY);
-
-	return ret;
-}
-
-static int cma3000_open(struct input_dev *input_dev)
-{
-	struct cma3000_accl_data *data = input_get_drvdata(input_dev);
-
-	mutex_lock(&data->mutex);
-
-	if (!data->suspended)
-		cma3000_poweron(data);
-
-	data->opened = true;
-
-	mutex_unlock(&data->mutex);
-
-	return 0;
-}
-
-static void cma3000_close(struct input_dev *input_dev)
-{
-	struct cma3000_accl_data *data = input_get_drvdata(input_dev);
-
-	mutex_lock(&data->mutex);
-
-	if (!data->suspended)
-		cma3000_poweroff(data);
-
-	data->opened = false;
-
-	mutex_unlock(&data->mutex);
-}
-
-void cma3000_suspend(struct cma3000_accl_data *data)
-{
-	mutex_lock(&data->mutex);
-
-	if (!data->suspended && data->opened)
-		cma3000_poweroff(data);
-
-	data->suspended = true;
-
-	mutex_unlock(&data->mutex);
-}
-EXPORT_SYMBOL(cma3000_suspend);
-
-
-void cma3000_resume(struct cma3000_accl_data *data)
-{
-	mutex_lock(&data->mutex);
-
-	if (data->suspended && data->opened)
-		cma3000_poweron(data);
-
-	data->suspended = false;
-
-	mutex_unlock(&data->mutex);
-}
-EXPORT_SYMBOL(cma3000_resume);
-
-struct cma3000_accl_data *cma3000_init(struct device *dev, int irq,
-				       const struct cma3000_bus_ops *bops)
-{
-	const struct cma3000_platform_data *pdata = dev_get_platdata(dev);
-	struct cma3000_accl_data *data;
-	struct input_dev *input_dev;
-	int rev;
-	int error;
-
-	if (!pdata) {
-		dev_err(dev, "platform data not found\n");
-		error = -EINVAL;
-		goto err_out;
-	}
-
-
-	/* if no IRQ return error */
-	if (irq == 0) {
-		error = -EINVAL;
-		goto err_out;
-	}
-
-	data = kzalloc(sizeof(struct cma3000_accl_data), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!data || !input_dev) {
-		error = -ENOMEM;
-		goto err_free_mem;
-	}
-
-	data->dev = dev;
-	data->input_dev = input_dev;
-	data->bus_ops = bops;
-	data->pdata = pdata;
-	data->irq = irq;
-	mutex_init(&data->mutex);
-
-	data->mode = pdata->mode;
-	if (data->mode > CMAMODE_POFF) {
-		data->mode = CMAMODE_MOTDET;
-		dev_warn(dev,
-			 "Invalid mode specified, assuming Motion Detect\n");
-	}
-
-	data->g_range = pdata->g_range;
-	if (data->g_range != CMARANGE_2G && data->g_range != CMARANGE_8G) {
-		dev_info(dev,
-			 "Invalid G range specified, assuming 8G\n");
-		data->g_range = CMARANGE_8G;
-	}
-
-	input_dev->name = "cma3000-accelerometer";
-	input_dev->id.bustype = bops->bustype;
-	input_dev->open = cma3000_open;
-	input_dev->close = cma3000_close;
-
-	 __set_bit(EV_ABS, input_dev->evbit);
-
-	input_set_abs_params(input_dev, ABS_X,
-			-data->g_range, data->g_range, pdata->fuzz_x, 0);
-	input_set_abs_params(input_dev, ABS_Y,
-			-data->g_range, data->g_range, pdata->fuzz_y, 0);
-	input_set_abs_params(input_dev, ABS_Z,
-			-data->g_range, data->g_range, pdata->fuzz_z, 0);
-	input_set_abs_params(input_dev, ABS_MISC, 0, 1, 0, 0);
-
-	input_set_drvdata(input_dev, data);
-
-	error = cma3000_reset(data);
-	if (error)
-		goto err_free_mem;
-
-	rev = CMA3000_READ(data, CMA3000_REVID, "Revid");
-	if (rev < 0) {
-		error = rev;
-		goto err_free_mem;
-	}
-
-	pr_info("CMA3000 Accelerometer: Revision %x\n", rev);
-
-	error = request_threaded_irq(irq, NULL, cma3000_thread_irq,
-				     pdata->irqflags | IRQF_ONESHOT,
-				     "cma3000_d0x", data);
-	if (error) {
-		dev_err(dev, "request_threaded_irq failed\n");
-		goto err_free_mem;
-	}
-
-	error = input_register_device(data->input_dev);
-	if (error) {
-		dev_err(dev, "Unable to register input device\n");
-		goto err_free_irq;
-	}
-
-	return data;
-
-err_free_irq:
-	free_irq(irq, data);
-err_free_mem:
-	input_free_device(input_dev);
-	kfree(data);
-err_out:
-	return ERR_PTR(error);
-}
-EXPORT_SYMBOL(cma3000_init);
-
-void cma3000_exit(struct cma3000_accl_data *data)
-{
-	free_irq(data->irq, data);
-	input_unregister_device(data->input_dev);
-	kfree(data);
-}
-EXPORT_SYMBOL(cma3000_exit);
-
-MODULE_DESCRIPTION("CMA3000-D0x Accelerometer Driver");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Hemanth V <hemanthv@ti.com>");
+	u32 touch_status = 0;
+	u32 scan_count = 0;
+	struct delayed_work *

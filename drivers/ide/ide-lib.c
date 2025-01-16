@@ -1,171 +1,117 @@
-#include <linux/types.h>
-#include <linux/string.h>
-#include <linux/kernel.h>
-#include <linux/export.h>
-#include <linux/interrupt.h>
-#include <linux/ide.h>
-#include <linux/bitops.h>
+tus Register */
+#define IOAT_CHANSTS_OFFSET(ver)		((ver) < IOAT_VER_2_0 \
+						? IOAT1_CHANSTS_OFFSET : IOAT2_CHANSTS_OFFSET)
+#define IOAT1_CHANSTS_OFFSET_LOW	0x04
+#define IOAT2_CHANSTS_OFFSET_LOW	0x08
+#define IOAT_CHANSTS_OFFSET_LOW(ver)		((ver) < IOAT_VER_2_0 \
+						? IOAT1_CHANSTS_OFFSET_LOW : IOAT2_CHANSTS_OFFSET_LOW)
+#define IOAT1_CHANSTS_OFFSET_HIGH	0x08
+#define IOAT2_CHANSTS_OFFSET_HIGH	0x0C
+#define IOAT_CHANSTS_OFFSET_HIGH(ver)		((ver) < IOAT_VER_2_0 \
+						? IOAT1_CHANSTS_OFFSET_HIGH : IOAT2_CHANSTS_OFFSET_HIGH)
+#define IOAT_CHANSTS_COMPLETED_DESCRIPTOR_ADDR	(~0x3fULL)
+#define IOAT_CHANSTS_SOFT_ERR			0x10ULL
+#define IOAT_CHANSTS_UNAFFILIATED_ERR		0x8ULL
+#define IOAT_CHANSTS_STATUS	0x7ULL
+#define IOAT_CHANSTS_ACTIVE	0x0
+#define IOAT_CHANSTS_DONE	0x1
+#define IOAT_CHANSTS_SUSPENDED	0x2
+#define IOAT_CHANSTS_HALTED	0x3
 
-/**
- *	ide_toggle_bounce	-	handle bounce buffering
- *	@drive: drive to update
- *	@on: on/off boolean
- *
- *	Enable or disable bounce buffering for the device. Drives move
- *	between PIO and DMA and that changes the rules we need.
- */
 
-void ide_toggle_bounce(ide_drive_t *drive, int on)
-{
-	u64 addr = BLK_BOUNCE_HIGH;	/* dma64_addr_t */
 
-	if (!PCI_DMA_BUS_IS_PHYS) {
-		addr = BLK_BOUNCE_ANY;
-	} else if (on && drive->media == ide_disk) {
-		struct device *dev = drive->hwif->dev;
+#define IOAT_CHAN_DMACOUNT_OFFSET	0x06    /* 16-bit DMA Count register */
 
-		if (dev && dev->dma_mask)
-			addr = *dev->dma_mask;
-	}
+#define IOAT_DCACTRL_OFFSET         0x30   /* 32 bit Direct Cache Access Control Register */
+#define IOAT_DCACTRL_CMPL_WRITE_ENABLE 0x10000
+#define IOAT_DCACTRL_TARGET_CPU_MASK   0xFFFF /* APIC ID */
 
-	if (drive->queue)
-		blk_queue_bounce_limit(drive->queue, addr);
-}
+/* CB DCA Memory Space Registers */
+#define IOAT_DCAOFFSET_OFFSET       0x14
+/* CB_BAR + IOAT_DCAOFFSET value */
+#define IOAT_DCA_VER_OFFSET         0x00
+#define IOAT_DCA_VER_MAJOR_MASK     0xF0
+#define IOAT_DCA_VER_MINOR_MASK     0x0F
 
-u64 ide_get_lba_addr(struct ide_cmd *cmd, int lba48)
-{
-	struct ide_taskfile *tf = &cmd->tf;
-	u32 high, low;
+#define IOAT_DCA_COMP_OFFSET        0x02
+#define IOAT_DCA_COMP_V1            0x1
 
-	low  = (tf->lbah << 16) | (tf->lbam << 8) | tf->lbal;
-	if (lba48) {
-		tf = &cmd->hob;
-		high = (tf->lbah << 16) | (tf->lbam << 8) | tf->lbal;
-	} else
-		high = tf->device & 0xf;
+#define IOAT_FSB_CAPABILITY_OFFSET  0x04
+#define IOAT_FSB_CAPABILITY_PREFETCH    0x1
 
-	return ((u64)high << 24) | low;
-}
-EXPORT_SYMBOL_GPL(ide_get_lba_addr);
+#define IOAT_PCI_CAPABILITY_OFFSET  0x06
+#define IOAT_PCI_CAPABILITY_MEMWR   0x1
 
-static void ide_dump_sector(ide_drive_t *drive)
-{
-	struct ide_cmd cmd;
-	struct ide_taskfile *tf = &cmd.tf;
-	u8 lba48 = !!(drive->dev_flags & IDE_DFLAG_LBA48);
+#define IOAT_FSB_CAP_ENABLE_OFFSET  0x08
+#define IOAT_FSB_CAP_ENABLE_PREFETCH    0x1
 
-	memset(&cmd, 0, sizeof(cmd));
-	if (lba48) {
-		cmd.valid.in.tf  = IDE_VALID_LBA;
-		cmd.valid.in.hob = IDE_VALID_LBA;
-		cmd.tf_flags = IDE_TFLAG_LBA48;
-	} else
-		cmd.valid.in.tf  = IDE_VALID_LBA | IDE_VALID_DEVICE;
+#define IOAT_PCI_CAP_ENABLE_OFFSET  0x0A
+#define IOAT_PCI_CAP_ENABLE_MEMWR   0x1
 
-	ide_tf_readback(drive, &cmd);
+#define IOAT_APICID_TAG_MAP_OFFSET  0x0C
+#define IOAT_APICID_TAG_MAP_TAG0    0x0000000F
+#define IOAT_APICID_TAG_MAP_TAG0_SHIFT 0
+#define IOAT_APICID_TAG_MAP_TAG1    0x000000F0
+#define IOAT_APICID_TAG_MAP_TAG1_SHIFT 4
+#define IOAT_APICID_TAG_MAP_TAG2    0x00000F00
+#define IOAT_APICID_TAG_MAP_TAG2_SHIFT 8
+#define IOAT_APICID_TAG_MAP_TAG3    0x0000F000
+#define IOAT_APICID_TAG_MAP_TAG3_SHIFT 12
+#define IOAT_APICID_TAG_MAP_TAG4    0x000F0000
+#define IOAT_APICID_TAG_MAP_TAG4_SHIFT 16
+#define IOAT_APICID_TAG_CB2_VALID   0x8080808080
 
-	if (lba48 || (tf->device & ATA_LBA))
-		printk(KERN_CONT ", LBAsect=%llu",
-			(unsigned long long)ide_get_lba_addr(&cmd, lba48));
-	else
-		printk(KERN_CONT ", CHS=%d/%d/%d", (tf->lbah << 8) + tf->lbam,
-			tf->device & 0xf, tf->lbal);
-}
+#define IOAT_DCA_GREQID_OFFSET      0x10
+#define IOAT_DCA_GREQID_SIZE        0x04
+#define IOAT_DCA_GREQID_MASK        0xFFFF
+#define IOAT_DCA_GREQID_IGNOREFUN   0x10000000
+#define IOAT_DCA_GREQID_VALID       0x20000000
+#define IOAT_DCA_GREQID_LASTID      0x80000000
 
-static void ide_dump_ata_error(ide_drive_t *drive, u8 err)
-{
-	printk(KERN_CONT "{ ");
-	if (err & ATA_ABORTED)
-		printk(KERN_CONT "DriveStatusError ");
-	if (err & ATA_ICRC)
-		printk(KERN_CONT "%s",
-			(err & ATA_ABORTED) ? "BadCRC " : "BadSector ");
-	if (err & ATA_UNC)
-		printk(KERN_CONT "UncorrectableError ");
-	if (err & ATA_IDNF)
-		printk(KERN_CONT "SectorIdNotFound ");
-	if (err & ATA_TRK0NF)
-		printk(KERN_CONT "TrackZeroNotFound ");
-	if (err & ATA_AMNF)
-		printk(KERN_CONT "AddrMarkNotFound ");
-	printk(KERN_CONT "}");
-	if ((err & (ATA_BBK | ATA_ABORTED)) == ATA_BBK ||
-	    (err & (ATA_UNC | ATA_IDNF | ATA_AMNF))) {
-		struct request *rq = drive->hwif->rq;
+#define IOAT3_CSI_CAPABILITY_OFFSET 0x08
+#define IOAT3_CSI_CAPABILITY_PREFETCH    0x1
 
-		ide_dump_sector(drive);
+#define IOAT3_PCI_CAPABILITY_OFFSET 0x0A
+#define IOAT3_PCI_CAPABILITY_MEMWR  0x1
 
-		if (rq)
-			printk(KERN_CONT ", sector=%llu",
-			       (unsigned long long)blk_rq_pos(rq));
-	}
-	printk(KERN_CONT "\n");
-}
+#define IOAT3_CSI_CONTROL_OFFSET    0x0C
+#define IOAT3_CSI_CONTROL_PREFETCH  0x1
 
-static void ide_dump_atapi_error(ide_drive_t *drive, u8 err)
-{
-	printk(KERN_CONT "{ ");
-	if (err & ATAPI_ILI)
-		printk(KERN_CONT "IllegalLengthIndication ");
-	if (err & ATAPI_EOM)
-		printk(KERN_CONT "EndOfMedia ");
-	if (err & ATA_ABORTED)
-		printk(KERN_CONT "AbortedCommand ");
-	if (err & ATA_MCR)
-		printk(KERN_CONT "MediaChangeRequested ");
-	if (err & ATAPI_LFS)
-		printk(KERN_CONT "LastFailedSense=0x%02x ",
-			(err & ATAPI_LFS) >> 4);
-	printk(KERN_CONT "}\n");
-}
+#define IOAT3_PCI_CONTROL_OFFSET    0x0E
+#define IOAT3_PCI_CONTROL_MEMWR     0x1
 
-/**
- *	ide_dump_status		-	translate ATA/ATAPI error
- *	@drive: drive that status applies to
- *	@msg: text message to print
- *	@stat: status byte to decode
- *
- *	Error reporting, in human readable form (luxurious, but a memory hog).
- *	Combines the drive name, message and status byte to provide a
- *	user understandable explanation of the device error.
- */
+#define IOAT3_APICID_TAG_MAP_OFFSET 0x10
+#define IOAT3_APICID_TAG_MAP_OFFSET_LOW  0x10
+#define IOAT3_APICID_TAG_MAP_OFFSET_HIGH 0x14
 
-u8 ide_dump_status(ide_drive_t *drive, const char *msg, u8 stat)
-{
-	u8 err = 0;
+#define IOAT3_DCA_GREQID_OFFSET     0x02
 
-	printk(KERN_ERR "%s: %s: status=0x%02x { ", drive->name, msg, stat);
-	if (stat & ATA_BUSY)
-		printk(KERN_CONT "Busy ");
-	else {
-		if (stat & ATA_DRDY)
-			printk(KERN_CONT "DriveReady ");
-		if (stat & ATA_DF)
-			printk(KERN_CONT "DeviceFault ");
-		if (stat & ATA_DSC)
-			printk(KERN_CONT "SeekComplete ");
-		if (stat & ATA_DRQ)
-			printk(KERN_CONT "DataRequest ");
-		if (stat & ATA_CORR)
-			printk(KERN_CONT "CorrectedError ");
-		if (stat & ATA_SENSE)
-			printk(KERN_CONT "Sense ");
-		if (stat & ATA_ERR)
-			printk(KERN_CONT "Error ");
-	}
-	printk(KERN_CONT "}\n");
-	if ((stat & (ATA_BUSY | ATA_ERR)) == ATA_ERR) {
-		err = ide_read_error(drive);
-		printk(KERN_ERR "%s: %s: error=0x%02x ", drive->name, msg, err);
-		if (drive->media == ide_disk)
-			ide_dump_ata_error(drive, err);
-		else
-			ide_dump_atapi_error(drive, err);
-	}
+#define IOAT1_CHAINADDR_OFFSET		0x0C	/* 64-bit Descriptor Chain Address Register */
+#define IOAT2_CHAINADDR_OFFSET		0x10	/* 64-bit Descriptor Chain Address Register */
+#define IOAT_CHAINADDR_OFFSET(ver)		((ver) < IOAT_VER_2_0 \
+						? IOAT1_CHAINADDR_OFFSET : IOAT2_CHAINADDR_OFFSET)
+#define IOAT1_CHAINADDR_OFFSET_LOW	0x0C
+#define IOAT2_CHAINADDR_OFFSET_LOW	0x10
+#define IOAT_CHAINADDR_OFFSET_LOW(ver)		((ver) < IOAT_VER_2_0 \
+						? IOAT1_CHAINADDR_OFFSET_LOW : IOAT2_CHAINADDR_OFFSET_LOW)
+#define IOAT1_CHAINADDR_OFFSET_HIGH	0x10
+#define IOAT2_CHAINADDR_OFFSET_HIGH	0x14
+#define IOAT_CHAINADDR_OFFSET_HIGH(ver)		((ver) < IOAT_VER_2_0 \
+						? IOAT1_CHAINADDR_OFFSET_HIGH : IOAT2_CHAINADDR_OFFSET_HIGH)
 
-	printk(KERN_ERR "%s: possibly failed opcode: 0x%02x\n",
-		drive->name, drive->hwif->cmd.tf.command);
+#define IOAT1_CHANCMD_OFFSET		0x14	/*  8-bit DMA Channel Command Register */
+#define IOAT2_CHANCMD_OFFSET		0x04	/*  8-bit DMA Channel Command Register */
+#define IOAT_CHANCMD_OFFSET(ver)		((ver) < IOAT_VER_2_0 \
+						? IOAT1_CHANCMD_OFFSET : IOAT2_CHANCMD_OFFSET)
+#define IOAT_CHANCMD_RESET			0x20
+#define IOAT_CHANCMD_RESUME			0x10
+#define IOAT_CHANCMD_ABORT			0x08
+#define IOAT_CHANCMD_SUSPEND			0x04
+#define IOAT_CHANCMD_APPEND			0x02
+#define IOAT_CHANCMD_START			0x01
 
-	return err;
-}
-EXPORT_SYMBOL(ide_dump_status);
+#define IOAT_CHANCMP_OFFSET			0x18	/* 64-bit Channel Completion Address Register */
+#define IOAT_CHANCMP_OFFSET_LOW			0x18
+#define IOAT_CHANCMP_OFFSET_HIGH		0x1C
+
+#define IOAT_CDAR_OFFSET			0x20	/* 64-bit Current Descriptor Add

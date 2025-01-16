@@ -1,263 +1,119 @@
-/*
- * Driver for the Diolan DLN-2 USB-I2C adapter
- *
- * Copyright (c) 2014 Intel Corporation
- *
- * Derived from:
- *  i2c-diolan-u2c.c
- *  Copyright (c) 2010-2011 Ericsson AB
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation, version 2.
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/types.h>
-#include <linux/slab.h>
-#include <linux/i2c.h>
-#include <linux/platform_device.h>
-#include <linux/mfd/dln2.h>
-
-#define DLN2_I2C_MODULE_ID		0x03
-#define DLN2_I2C_CMD(cmd)		DLN2_CMD(cmd, DLN2_I2C_MODULE_ID)
-
-/* I2C commands */
-#define DLN2_I2C_GET_PORT_COUNT		DLN2_I2C_CMD(0x00)
-#define DLN2_I2C_ENABLE			DLN2_I2C_CMD(0x01)
-#define DLN2_I2C_DISABLE		DLN2_I2C_CMD(0x02)
-#define DLN2_I2C_IS_ENABLED		DLN2_I2C_CMD(0x03)
-#define DLN2_I2C_WRITE			DLN2_I2C_CMD(0x06)
-#define DLN2_I2C_READ			DLN2_I2C_CMD(0x07)
-#define DLN2_I2C_SCAN_DEVICES		DLN2_I2C_CMD(0x08)
-#define DLN2_I2C_PULLUP_ENABLE		DLN2_I2C_CMD(0x09)
-#define DLN2_I2C_PULLUP_DISABLE		DLN2_I2C_CMD(0x0A)
-#define DLN2_I2C_PULLUP_IS_ENABLED	DLN2_I2C_CMD(0x0B)
-#define DLN2_I2C_TRANSFER		DLN2_I2C_CMD(0x0C)
-#define DLN2_I2C_SET_MAX_REPLY_COUNT	DLN2_I2C_CMD(0x0D)
-#define DLN2_I2C_GET_MAX_REPLY_COUNT	DLN2_I2C_CMD(0x0E)
-
-#define DLN2_I2C_MAX_XFER_SIZE		256
-#define DLN2_I2C_BUF_SIZE		(DLN2_I2C_MAX_XFER_SIZE + 16)
-
-struct dln2_i2c {
-	struct platform_device *pdev;
-	struct i2c_adapter adapter;
-	u8 port;
-	/*
-	 * Buffer to hold the packet for read or write transfers. One is enough
-	 * since we can't have multiple transfers in parallel on the i2c bus.
-	 */
-	void *buf;
-};
-
-static int dln2_i2c_enable(struct dln2_i2c *dln2, bool enable)
-{
-	u16 cmd;
-	struct {
-		u8 port;
-	} tx;
-
-	tx.port = dln2->port;
-
-	if (enable)
-		cmd = DLN2_I2C_ENABLE;
-	else
-		cmd = DLN2_I2C_DISABLE;
-
-	return dln2_transfer_tx(dln2->pdev, cmd, &tx, sizeof(tx));
-}
-
-static int dln2_i2c_write(struct dln2_i2c *dln2, u8 addr,
-			  u8 *data, u16 data_len)
-{
-	int ret;
-	struct {
-		u8 port;
-		u8 addr;
-		u8 mem_addr_len;
-		__le32 mem_addr;
-		__le16 buf_len;
-		u8 buf[DLN2_I2C_MAX_XFER_SIZE];
-	} __packed *tx = dln2->buf;
-	unsigned len;
-
-	BUILD_BUG_ON(sizeof(*tx) > DLN2_I2C_BUF_SIZE);
-
-	tx->port = dln2->port;
-	tx->addr = addr;
-	tx->mem_addr_len = 0;
-	tx->mem_addr = 0;
-	tx->buf_len = cpu_to_le16(data_len);
-	memcpy(tx->buf, data, data_len);
-
-	len = sizeof(*tx) + data_len - DLN2_I2C_MAX_XFER_SIZE;
-	ret = dln2_transfer_tx(dln2->pdev, DLN2_I2C_WRITE, tx, len);
-	if (ret < 0)
-		return ret;
-
-	return data_len;
-}
-
-static int dln2_i2c_read(struct dln2_i2c *dln2, u16 addr, u8 *data,
-			 u16 data_len)
-{
-	int ret;
-	struct {
-		u8 port;
-		u8 addr;
-		u8 mem_addr_len;
-		__le32 mem_addr;
-		__le16 buf_len;
-	} __packed tx;
-	struct {
-		__le16 buf_len;
-		u8 buf[DLN2_I2C_MAX_XFER_SIZE];
-	} __packed *rx = dln2->buf;
-	unsigned rx_len = sizeof(*rx);
-
-	BUILD_BUG_ON(sizeof(*rx) > DLN2_I2C_BUF_SIZE);
-
-	tx.port = dln2->port;
-	tx.addr = addr;
-	tx.mem_addr_len = 0;
-	tx.mem_addr = 0;
-	tx.buf_len = cpu_to_le16(data_len);
-
-	ret = dln2_transfer(dln2->pdev, DLN2_I2C_READ, &tx, sizeof(tx),
-			    rx, &rx_len);
-	if (ret < 0)
-		return ret;
-	if (rx_len < sizeof(rx->buf_len) + data_len)
-		return -EPROTO;
-	if (le16_to_cpu(rx->buf_len) != data_len)
-		return -EPROTO;
-
-	memcpy(data, rx->buf, data_len);
-
-	return data_len;
-}
-
-static int dln2_i2c_xfer(struct i2c_adapter *adapter,
-			 struct i2c_msg *msgs, int num)
-{
-	struct dln2_i2c *dln2 = i2c_get_adapdata(adapter);
-	struct i2c_msg *pmsg;
-	int i;
-
-	for (i = 0; i < num; i++) {
-		int ret;
-
-		pmsg = &msgs[i];
-
-		if (pmsg->flags & I2C_M_RD) {
-			ret = dln2_i2c_read(dln2, pmsg->addr, pmsg->buf,
-					    pmsg->len);
-			if (ret < 0)
-				return ret;
-
-			pmsg->len = ret;
-		} else {
-			ret = dln2_i2c_write(dln2, pmsg->addr, pmsg->buf,
-					     pmsg->len);
-			if (ret != pmsg->len)
-				return -EPROTO;
-		}
-	}
-
-	return num;
-}
-
-static u32 dln2_i2c_func(struct i2c_adapter *a)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA |
-		I2C_FUNC_SMBUS_WORD_DATA | I2C_FUNC_SMBUS_BLOCK_PROC_CALL |
-		I2C_FUNC_SMBUS_I2C_BLOCK;
-}
-
-static const struct i2c_algorithm dln2_i2c_usb_algorithm = {
-	.master_xfer = dln2_i2c_xfer,
-	.functionality = dln2_i2c_func,
-};
-
-static struct i2c_adapter_quirks dln2_i2c_quirks = {
-	.max_read_len = DLN2_I2C_MAX_XFER_SIZE,
-	.max_write_len = DLN2_I2C_MAX_XFER_SIZE,
-};
-
-static int dln2_i2c_probe(struct platform_device *pdev)
-{
-	int ret;
-	struct dln2_i2c *dln2;
-	struct device *dev = &pdev->dev;
-	struct dln2_platform_data *pdata = dev_get_platdata(&pdev->dev);
-
-	dln2 = devm_kzalloc(dev, sizeof(*dln2), GFP_KERNEL);
-	if (!dln2)
-		return -ENOMEM;
-
-	dln2->buf = devm_kmalloc(dev, DLN2_I2C_BUF_SIZE, GFP_KERNEL);
-	if (!dln2->buf)
-		return -ENOMEM;
-
-	dln2->pdev = pdev;
-	dln2->port = pdata->port;
-
-	/* setup i2c adapter description */
-	dln2->adapter.owner = THIS_MODULE;
-	dln2->adapter.class = I2C_CLASS_HWMON;
-	dln2->adapter.algo = &dln2_i2c_usb_algorithm;
-	dln2->adapter.quirks = &dln2_i2c_quirks;
-	dln2->adapter.dev.parent = dev;
-	dln2->adapter.dev.of_node = dev->of_node;
-	i2c_set_adapdata(&dln2->adapter, dln2);
-	snprintf(dln2->adapter.name, sizeof(dln2->adapter.name), "%s-%s-%d",
-		 "dln2-i2c", dev_name(pdev->dev.parent), dln2->port);
-
-	platform_set_drvdata(pdev, dln2);
-
-	/* initialize the i2c interface */
-	ret = dln2_i2c_enable(dln2, true);
-	if (ret < 0) {
-		dev_err(dev, "failed to initialize adapter: %d\n", ret);
-		return ret;
-	}
-
-	/* and finally attach to i2c layer */
-	ret = i2c_add_adapter(&dln2->adapter);
-	if (ret < 0) {
-		dev_err(dev, "failed to add I2C adapter: %d\n", ret);
-		goto out_disable;
-	}
-
-	return 0;
-
-out_disable:
-	dln2_i2c_enable(dln2, false);
-
-	return ret;
-}
-
-static int dln2_i2c_remove(struct platform_device *pdev)
-{
-	struct dln2_i2c *dln2 = platform_get_drvdata(pdev);
-
-	i2c_del_adapter(&dln2->adapter);
-	dln2_i2c_enable(dln2, false);
-
-	return 0;
-}
-
-static struct platform_driver dln2_i2c_driver = {
-	.driver.name	= "dln2-i2c",
-	.probe		= dln2_i2c_probe,
-	.remove		= dln2_i2c_remove,
-};
-
-module_platform_driver(dln2_i2c_driver);
-
-MODULE_AUTHOR("Laurentiu Palcu <laurentiu.palcu@intel.com>");
-MODULE_DESCRIPTION("Driver for the Diolan DLN2 I2C master interface");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:dln2-i2c");
+UNT_MASK 0x3fff
+#define SDMA1_RLC0_SKIP_CNTL__SKIP_COUNT__SHIFT 0x0
+#define SDMA1_RLC0_CONTEXT_STATUS__SELECTED_MASK 0x1
+#define SDMA1_RLC0_CONTEXT_STATUS__SELECTED__SHIFT 0x0
+#define SDMA1_RLC0_CONTEXT_STATUS__IDLE_MASK 0x4
+#define SDMA1_RLC0_CONTEXT_STATUS__IDLE__SHIFT 0x2
+#define SDMA1_RLC0_CONTEXT_STATUS__EXPIRED_MASK 0x8
+#define SDMA1_RLC0_CONTEXT_STATUS__EXPIRED__SHIFT 0x3
+#define SDMA1_RLC0_CONTEXT_STATUS__EXCEPTION_MASK 0x70
+#define SDMA1_RLC0_CONTEXT_STATUS__EXCEPTION__SHIFT 0x4
+#define SDMA1_RLC0_CONTEXT_STATUS__CTXSW_ABLE_MASK 0x80
+#define SDMA1_RLC0_CONTEXT_STATUS__CTXSW_ABLE__SHIFT 0x7
+#define SDMA1_RLC0_CONTEXT_STATUS__CTXSW_READY_MASK 0x100
+#define SDMA1_RLC0_CONTEXT_STATUS__CTXSW_READY__SHIFT 0x8
+#define SDMA1_RLC0_CONTEXT_STATUS__PREEMPTED_MASK 0x200
+#define SDMA1_RLC0_CONTEXT_STATUS__PREEMPTED__SHIFT 0x9
+#define SDMA1_RLC0_CONTEXT_STATUS__PREEMPT_DISABLE_MASK 0x400
+#define SDMA1_RLC0_CONTEXT_STATUS__PREEMPT_DISABLE__SHIFT 0xa
+#define SDMA1_RLC0_DOORBELL__OFFSET_MASK 0x1fffff
+#define SDMA1_RLC0_DOORBELL__OFFSET__SHIFT 0x0
+#define SDMA1_RLC0_DOORBELL__ENABLE_MASK 0x10000000
+#define SDMA1_RLC0_DOORBELL__ENABLE__SHIFT 0x1c
+#define SDMA1_RLC0_DOORBELL__CAPTURED_MASK 0x40000000
+#define SDMA1_RLC0_DOORBELL__CAPTURED__SHIFT 0x1e
+#define SDMA1_RLC0_VIRTUAL_ADDR__ATC_MASK 0x1
+#define SDMA1_RLC0_VIRTUAL_ADDR__ATC__SHIFT 0x0
+#define SDMA1_RLC0_VIRTUAL_ADDR__INVAL_MASK 0x2
+#define SDMA1_RLC0_VIRTUAL_ADDR__INVAL__SHIFT 0x1
+#define SDMA1_RLC0_VIRTUAL_ADDR__PTR32_MASK 0x10
+#define SDMA1_RLC0_VIRTUAL_ADDR__PTR32__SHIFT 0x4
+#define SDMA1_RLC0_VIRTUAL_ADDR__SHARED_BASE_MASK 0x700
+#define SDMA1_RLC0_VIRTUAL_ADDR__SHARED_BASE__SHIFT 0x8
+#define SDMA1_RLC0_VIRTUAL_ADDR__VM_HOLE_MASK 0x40000000
+#define SDMA1_RLC0_VIRTUAL_ADDR__VM_HOLE__SHIFT 0x1e
+#define SDMA1_RLC0_APE1_CNTL__BASE_MASK 0xffff
+#define SDMA1_RLC0_APE1_CNTL__BASE__SHIFT 0x0
+#define SDMA1_RLC0_APE1_CNTL__LIMIT_MASK 0xffff0000
+#define SDMA1_RLC0_APE1_CNTL__LIMIT__SHIFT 0x10
+#define SDMA1_RLC0_DOORBELL_LOG__BE_ERROR_MASK 0x1
+#define SDMA1_RLC0_DOORBELL_LOG__BE_ERROR__SHIFT 0x0
+#define SDMA1_RLC0_DOORBELL_LOG__DATA_MASK 0xfffffffc
+#define SDMA1_RLC0_DOORBELL_LOG__DATA__SHIFT 0x2
+#define SDMA1_RLC0_WATERMARK__RD_OUTSTANDING_MASK 0xfff
+#define SDMA1_RLC0_WATERMARK__RD_OUTSTANDING__SHIFT 0x0
+#define SDMA1_RLC0_WATERMARK__WR_OUTSTANDING_MASK 0x1ff0000
+#define SDMA1_RLC0_WATERMARK__WR_OUTSTANDING__SHIFT 0x10
+#define SDMA1_RLC0_CSA_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA1_RLC0_CSA_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA1_RLC0_CSA_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC0_CSA_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC0_IB_SUB_REMAIN__SIZE_MASK 0x3fff
+#define SDMA1_RLC0_IB_SUB_REMAIN__SIZE__SHIFT 0x0
+#define SDMA1_RLC0_PREEMPT__IB_PREEMPT_MASK 0x1
+#define SDMA1_RLC0_PREEMPT__IB_PREEMPT__SHIFT 0x0
+#define SDMA1_RLC0_DUMMY_REG__DUMMY_MASK 0xffffffff
+#define SDMA1_RLC0_DUMMY_REG__DUMMY__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA0__DATA0_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA0__DATA0__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA1__DATA1_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA1__DATA1__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA2__DATA2_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA2__DATA2__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA3__DATA3_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA3__DATA3__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA4__DATA4_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA4__DATA4__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA5__DATA5_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA5__DATA5__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA6__DATA6_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA6__DATA6__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA7__DATA7_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA7__DATA7__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_DATA8__DATA8_MASK 0xffffffff
+#define SDMA1_RLC0_MIDCMD_DATA8__DATA8__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_CNTL__DATA_VALID_MASK 0x1
+#define SDMA1_RLC0_MIDCMD_CNTL__DATA_VALID__SHIFT 0x0
+#define SDMA1_RLC0_MIDCMD_CNTL__COPY_MODE_MASK 0x2
+#define SDMA1_RLC0_MIDCMD_CNTL__COPY_MODE__SHIFT 0x1
+#define SDMA1_RLC0_MIDCMD_CNTL__SPLIT_STATE_MASK 0xf0
+#define SDMA1_RLC0_MIDCMD_CNTL__SPLIT_STATE__SHIFT 0x4
+#define SDMA1_RLC0_MIDCMD_CNTL__ALLOW_PREEMPT_MASK 0x100
+#define SDMA1_RLC0_MIDCMD_CNTL__ALLOW_PREEMPT__SHIFT 0x8
+#define SDMA1_RLC1_RB_CNTL__RB_ENABLE_MASK 0x1
+#define SDMA1_RLC1_RB_CNTL__RB_ENABLE__SHIFT 0x0
+#define SDMA1_RLC1_RB_CNTL__RB_SIZE_MASK 0x3e
+#define SDMA1_RLC1_RB_CNTL__RB_SIZE__SHIFT 0x1
+#define SDMA1_RLC1_RB_CNTL__RB_SWAP_ENABLE_MASK 0x200
+#define SDMA1_RLC1_RB_CNTL__RB_SWAP_ENABLE__SHIFT 0x9
+#define SDMA1_RLC1_RB_CNTL__RPTR_WRITEBACK_ENABLE_MASK 0x1000
+#define SDMA1_RLC1_RB_CNTL__RPTR_WRITEBACK_ENABLE__SHIFT 0xc
+#define SDMA1_RLC1_RB_CNTL__RPTR_WRITEBACK_SWAP_ENABLE_MASK 0x2000
+#define SDMA1_RLC1_RB_CNTL__RPTR_WRITEBACK_SWAP_ENABLE__SHIFT 0xd
+#define SDMA1_RLC1_RB_CNTL__RPTR_WRITEBACK_TIMER_MASK 0x1f0000
+#define SDMA1_RLC1_RB_CNTL__RPTR_WRITEBACK_TIMER__SHIFT 0x10
+#define SDMA1_RLC1_RB_CNTL__RB_PRIV_MASK 0x800000
+#define SDMA1_RLC1_RB_CNTL__RB_PRIV__SHIFT 0x17
+#define SDMA1_RLC1_RB_CNTL__RB_VMID_MASK 0xf000000
+#define SDMA1_RLC1_RB_CNTL__RB_VMID__SHIFT 0x18
+#define SDMA1_RLC1_RB_BASE__ADDR_MASK 0xffffffff
+#define SDMA1_RLC1_RB_BASE__ADDR__SHIFT 0x0
+#define SDMA1_RLC1_RB_BASE_HI__ADDR_MASK 0xffffff
+#define SDMA1_RLC1_RB_BASE_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC1_RB_RPTR__OFFSET_MASK 0xfffffffc
+#define SDMA1_RLC1_RB_RPTR__OFFSET__SHIFT 0x2
+#define SDMA1_RLC1_RB_WPTR__OFFSET_MASK 0xfffffffc
+#define SDMA1_RLC1_RB_WPTR__OFFSET__SHIFT 0x2
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__ENABLE_MASK 0x1
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__ENABLE__SHIFT 0x0
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__SWAP_ENABLE_MASK 0x2
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__SWAP_ENABLE__SHIFT 0x1
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE_MASK 0x4
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE__SHIFT 0x2
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__FREQUENCY_MASK 0xfff0
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__FREQUENCY__SHIFT 0x4
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT_MASK 0xffff0000
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT__SHIFT 0x10
+#define SDMA1_RLC1_RB_WPTR_POLL_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC1_RB_WPTR_POLL_ADDR_HI__ADDR__SHIFT 0x0
+#define 

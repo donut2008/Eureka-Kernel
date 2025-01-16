@@ -1,350 +1,278 @@
+MD_RSP_SENT
+		    && state != SRPT_STATE_MGMT_RSP_SENT
+		    && state != SRPT_STATE_DONE))
+		pr_debug("state = %d\n", state);
+
+	if (state != SRPT_STATE_DONE) {
+		srpt_unmap_sg_to_ib_sge(ch, ioctx);
+		transport_generic_free_cmd(&ioctx->cmd, 0);
+	} else {
+		pr_err("IB completion has been received too late for"
+		       " wr_id = %u.\n", ioctx->ioctx.index);
+	}
+}
+
+/**
+ * srpt_handle_rdma_comp() - Process an IB RDMA completion notification.
+ *
+ * XXX: what is now target_execute_cmd used to be asynchronous, and unmapping
+ * the data that has been transferred via IB RDMA had to be postponed until the
+ * check_stop_free() callback.  None of this is necessary anymore and needs to
+ * be cleaned up.
+ */
+static void srpt_handle_rdma_comp(struct srpt_rdma_ch *ch,
+				  struct srpt_send_ioctx *ioctx,
+				  enum srpt_opcode opcode)
+{
+	WARN_ON(ioctx->n_rdma <= 0);
+	atomic_add(ioctx->n_rdma, &ch->sq_wr_avail);
+
+	if (opcode == SRPT_RDMA_READ_LAST) {
+		if (srpt_test_and_set_cmd_state(ioctx, SRPT_STATE_NEED_DATA,
+						SRPT_STATE_DATA_IN))
+			target_execute_cmd(&ioctx->cmd);
+		else
+			pr_err("%s[%d]: wrong state = %d\n", __func__,
+			       __LINE__, srpt_get_cmd_state(ioctx));
+	} else if (opcode == SRPT_RDMA_ABORT) {
+		ioctx->rdma_aborted = true;
+	} else {
+		WARN(true, "unexpected opcode %d\n", opcode);
+	}
+}
+
+/**
+ * srpt_handle_rdma_err_comp() - Process an IB RDMA error completion.
+ */
+static void srpt_handle_rdma_err_comp(struct srpt_rdma_ch *ch,
+				      struct srpt_send_ioctx *ioctx,
+				      enum srpt_opcode opcode)
+{
+	enum srpt_command_state state;
+
+	state = srpt_get_cmd_state(ioctx);
+	switch (opcode) {
+	case SRPT_RDMA_READ_LAST:
+		if (ioctx->n_rdma <= 0) {
+			pr_err("Received invalid RDMA read"
+			       " error completion with idx %d\n",
+			       ioctx->ioctx.index);
+			break;
+		}
+		atomic_add(ioctx->n_rdma, &ch->sq_wr_avail);
+		if (state == SRPT_STATE_NEED_DATA)
+			srpt_abort_cmd(ioctx);
+		else
+			pr_err("%s[%d]: wrong state = %d\n",
+			       __func__, __LINE__, state);
+		break;
+	case SRPT_RDMA_WRITE_LAST:
+		break;
+	default:
+		pr_err("%s[%d]: opcode = %u\n", __func__, __LINE__, opcode);
+		break;
+	}
+}
+
+/**
+ * srpt_build_cmd_rsp() - Build an SRP_RSP response.
+ * @ch: RDMA channel through which the request has been received.
+ * @ioctx: I/O context associated with the SRP_CMD request. The response will
+ *   be built in the buffer ioctx->buf points at and hence this function will
+ *   overwrite the request data.
+ * @tag: tag of the request for which this response is being generated.
+ * @status: value for the STATUS field of the SRP_RSP information unit.
+ *
+ * Returns the size in bytes of the SRP_RSP response.
+ *
+ * An SRP_RSP response contains a SCSI status or service response. See also
+ * section 6.9 in the SRP r16a document for the format of an SRP_RSP
+ * response. See also SPC-2 for more information about sense data.
+ */
+static int srpt_build_cmd_rsp(struct srpt_rdma_ch *ch,
+			      struct srpt_send_ioctx *ioctx, u64 tag,
+			      int status)
+{
+	struct se_cmd *cmd = &ioctx->cmd;
+	struct srp_rsp *srp_rsp;
+	const u8 *sense_data;
+	int sense_data_len, max_sense_len;
+	u32 resid = cmd->residual_count;
+
+	/*
+	 * The lowest bit of all SAM-3 status codes is zero (see also
+	 * paragraph 5.3 in SAM-3).
+	 */
+	WARN_ON(status & 1);
+
+	srp_rsp = ioctx->ioctx.buf;
+	BUG_ON(!srp_rsp);
+
+	sense_data = ioctx->sense_data;
+	sense_data_len = ioctx->cmd.scsi_sense_length;
+	WARN_ON(sense_data_len > sizeof(ioctx->sense_data));
+
+	memset(srp_rsp, 0, sizeof *srp_rsp);
+	srp_rsp->opcode = SRP_RSP;
+	srp_rsp->req_lim_delta =
+		cpu_to_be32(1 + atomic_xchg(&ch->req_lim_delta, 0));
+	srp_rsp->tag = tag;
+	srp_rsp->status = status;
+
+	if (cmd->se_cmd_flags & SCF_UNDERFLOW_BIT) {
+		if (cmd->data_direction == DMA_TO_DEVICE) {
+			/* residual data from an underflow write */
+			srp_rsp->flags = SRP_RSP_FLAG_DOUNDER;
+			srp_rsp->data_out_res_cnt = cpu_to_be32(resid);
+		} else if (cmd->data_direction == DMA_FROM_DEVICE) {
+			/* residual data from an underflow read */
+			srp_rsp->flags = SRP_RSP_FLAG_DIUNDER;
+			srp_rsp->data_in_res_cnt = cpu_to_be32(resid);
+		}
+	} else if (cmd->se_cmd_flags & SCF_OVERFLOW_BIT) {
+		if (cmd->data_direction == DMA_TO_DEVICE) {
+			/* residual data from an overflow write */
+			srp_rsp->flags = SRP_RSP_FLAG_DOOVER;
+			srp_rsp->data_out_res_cnt = cpu_to_be32(resid);
+		} else if (cmd->data_direction == DMA_FROM_DEVICE) {
+			/* residual data from an overflow read */
+			srp_rsp->flags = SRP_RSP_FLAG_DIOVER;
+			srp_rsp->data_in_res_cnt = cpu_to_be32(resid);
+		}
+	}
+
+	if (sense_data_len) {
+		BUILD_BUG_ON(MIN_MAX_RSP_SIZE <= sizeof(*srp_rsp));
+		max_sense_len = ch->max_ti_iu_len - sizeof(*srp_rsp);
+		if (sense_data_len > max_sense_len) {
+			pr_warn("truncated sense data from %d to %d"
+				" bytes\n", sense_data_len, max_sense_len);
+			sense_data_len = max_sense_len;
+		}
+
+		srp_rsp->flags |= SRP_RSP_FLAG_SNSVALID;
+		srp_rsp->sense_data_len = cpu_to_be32(sense_data_len);
+		memcpy(srp_rsp + 1, sense_data, sense_data_len);
+	}
+
+	return sizeof(*srp_rsp) + sense_data_len;
+}
+
+/**
+ * srpt_build_tskmgmt_rsp() - Build a task management response.
+ * @ch:       RDMA channel through which the request has been received.
+ * @ioctx:    I/O context in which the SRP_RSP response will be built.
+ * @rsp_code: RSP_CODE that will be stored in the response.
+ * @tag:      Tag of the request for which this response is being generated.
+ *
+ * Returns the size in bytes of the SRP_RSP response.
+ *
+ * An SRP_RSP response contains a SCSI status or service response. See also
+ * section 6.9 in the SRP r16a document for the format of an SRP_RSP
+ * response.
+ */
+static int srpt_build_tskmgmt_rsp(struct srpt_rdma_ch *ch,
+				  struct srpt_send_ioctx *ioctx,
+				  u8 rsp_code, u64 tag)
+{
+	struct srp_rsp *srp_rsp;
+	int resp_data_len;
+	int resp_len;
+
+	resp_data_len = 4;
+	resp_len = sizeof(*srp_rsp) + resp_data_len;
+
+	srp_rsp = ioctx->ioctx.buf;
+	BUG_ON(!srp_rsp);
+	memset(srp_rsp, 0, sizeof *srp_rsp);
+
+	srp_rsp->opcode = SRP_RSP;
+	srp_rsp->req_lim_delta =
+		cpu_to_be32(1 + atomic_xchg(&ch->req_lim_delta, 0));
+	srp_rsp->tag = tag;
+
+	srp_rsp->flags |= SRP_RSP_FLAG_RSPVALID;
+	srp_rsp->resp_data_len = cpu_to_be32(resp_data_len);
+	srp_rsp->data[3] = rsp_code;
+
+	return resp_len;
+}
+
+#define NO_SUCH_LUN ((uint64_t)-1LL)
+
 /*
- *  Fujitsu Lifebook Application Panel button drive
- *
- *  Copyright (C) 2007 Stephen Hemminger <shemminger@linux-foundation.org>
- *  Copyright (C) 2001-2003 Jochen Eisinger <jochen@penguin-breeder.org>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- *
- * Many Fujitsu Lifebook laptops have a small panel of buttons that are
- * accessible via the i2c/smbus interface. This driver polls those
- * buttons and generates input events.
- *
- * For more details see:
- *	http://apanel.sourceforge.net/tech.php
+ * SCSI LUN addressing method. See also SAM-2 and the section about
+ * eight byte LUNs.
  */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/ioport.h>
-#include <linux/io.h>
-#include <linux/input-polldev.h>
-#include <linux/i2c.h>
-#include <linux/workqueue.h>
-#include <linux/leds.h>
-
-#define APANEL_NAME	"Fujitsu Application Panel"
-#define APANEL_VERSION	"1.3.1"
-#define APANEL		"apanel"
-
-/* How often we poll keys - msecs */
-#define POLL_INTERVAL_DEFAULT	1000
-
-/* Magic constants in BIOS that tell about buttons */
-enum apanel_devid {
-	APANEL_DEV_NONE	  = 0,
-	APANEL_DEV_APPBTN = 1,
-	APANEL_DEV_CDBTN  = 2,
-	APANEL_DEV_LCD	  = 3,
-	APANEL_DEV_LED	  = 4,
-
-	APANEL_DEV_MAX,
+enum scsi_lun_addr_method {
+	SCSI_LUN_ADDR_METHOD_PERIPHERAL   = 0,
+	SCSI_LUN_ADDR_METHOD_FLAT         = 1,
+	SCSI_LUN_ADDR_METHOD_LUN          = 2,
+	SCSI_LUN_ADDR_METHOD_EXTENDED_LUN = 3,
 };
 
-enum apanel_chip {
-	CHIP_NONE    = 0,
-	CHIP_OZ992C  = 1,
-	CHIP_OZ163T  = 2,
-	CHIP_OZ711M3 = 4,
-};
-
-/* Result of BIOS snooping/probing -- what features are supported */
-static enum apanel_chip device_chip[APANEL_DEV_MAX];
-
-#define MAX_PANEL_KEYS	12
-
-struct apanel {
-	struct input_polled_dev *ipdev;
-	struct i2c_client *client;
-	unsigned short keymap[MAX_PANEL_KEYS];
-	u16    nkeys;
-	u16    led_bits;
-	struct work_struct led_work;
-	struct led_classdev mail_led;
-};
-
-
-static int apanel_probe(struct i2c_client *, const struct i2c_device_id *);
-
-static void report_key(struct input_dev *input, unsigned keycode)
-{
-	pr_debug(APANEL ": report key %#x\n", keycode);
-	input_report_key(input, keycode, 1);
-	input_sync(input);
-
-	input_report_key(input, keycode, 0);
-	input_sync(input);
-}
-
-/* Poll for key changes
+/*
+ * srpt_unpack_lun() - Convert from network LUN to linear LUN.
  *
- * Read Application keys via SMI
- *  A (0x4), B (0x8), Internet (0x2), Email (0x1).
- *
- * CD keys:
- * Forward (0x100), Rewind (0x200), Stop (0x400), Pause (0x800)
+ * Convert an 2-byte, 4-byte, 6-byte or 8-byte LUN structure in network byte
+ * order (big endian) to a linear LUN. Supports three LUN addressing methods:
+ * peripheral, flat and logical unit. See also SAM-2, section 4.9.4 (page 40).
  */
-static void apanel_poll(struct input_polled_dev *ipdev)
+static uint64_t srpt_unpack_lun(const uint8_t *lun, int len)
 {
-	struct apanel *ap = ipdev->private;
-	struct input_dev *idev = ipdev->input;
-	u8 cmd = device_chip[APANEL_DEV_APPBTN] == CHIP_OZ992C ? 0 : 8;
-	s32 data;
-	int i;
+	uint64_t res = NO_SUCH_LUN;
+	int addressing_method;
 
-	data = i2c_smbus_read_word_data(ap->client, cmd);
-	if (data < 0)
-		return;	/* ignore errors (due to ACPI??) */
-
-	/* write back to clear latch */
-	i2c_smbus_write_word_data(ap->client, cmd, 0);
-
-	if (!data)
-		return;
-
-	dev_dbg(&idev->dev, APANEL ": data %#x\n", data);
-	for (i = 0; i < idev->keycodemax; i++)
-		if ((1u << i) & data)
-			report_key(idev, ap->keymap[i]);
-}
-
-/* Track state changes of LED */
-static void led_update(struct work_struct *work)
-{
-	struct apanel *ap = container_of(work, struct apanel, led_work);
-
-	i2c_smbus_write_word_data(ap->client, 0x10, ap->led_bits);
-}
-
-static void mail_led_set(struct led_classdev *led,
-			 enum led_brightness value)
-{
-	struct apanel *ap = container_of(led, struct apanel, mail_led);
-
-	if (value != LED_OFF)
-		ap->led_bits |= 0x8000;
-	else
-		ap->led_bits &= ~0x8000;
-
-	schedule_work(&ap->led_work);
-}
-
-static int apanel_remove(struct i2c_client *client)
-{
-	struct apanel *ap = i2c_get_clientdata(client);
-
-	if (device_chip[APANEL_DEV_LED] != CHIP_NONE)
-		led_classdev_unregister(&ap->mail_led);
-
-	input_unregister_polled_device(ap->ipdev);
-	input_free_polled_device(ap->ipdev);
-
-	return 0;
-}
-
-static void apanel_shutdown(struct i2c_client *client)
-{
-	apanel_remove(client);
-}
-
-static const struct i2c_device_id apanel_id[] = {
-	{ "fujitsu_apanel", 0 },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, apanel_id);
-
-static struct i2c_driver apanel_driver = {
-	.driver = {
-		.name = APANEL,
-	},
-	.probe		= &apanel_probe,
-	.remove		= &apanel_remove,
-	.shutdown	= &apanel_shutdown,
-	.id_table	= apanel_id,
-};
-
-static struct apanel apanel = {
-	.keymap = {
-		[0] = KEY_MAIL,
-		[1] = KEY_WWW,
-		[2] = KEY_PROG2,
-		[3] = KEY_PROG1,
-
-		[8] = KEY_FORWARD,
-		[9] = KEY_REWIND,
-		[10] = KEY_STOPCD,
-		[11] = KEY_PLAYPAUSE,
-
-	},
-	.mail_led = {
-		.name = "mail:blue",
-		.brightness_set = mail_led_set,
-	},
-};
-
-/* NB: Only one panel on the i2c. */
-static int apanel_probe(struct i2c_client *client,
-			const struct i2c_device_id *id)
-{
-	struct apanel *ap;
-	struct input_polled_dev *ipdev;
-	struct input_dev *idev;
-	u8 cmd = device_chip[APANEL_DEV_APPBTN] == CHIP_OZ992C ? 0 : 8;
-	int i, err = -ENOMEM;
-
-	ap = &apanel;
-
-	ipdev = input_allocate_polled_device();
-	if (!ipdev)
-		goto out1;
-
-	ap->ipdev = ipdev;
-	ap->client = client;
-
-	i2c_set_clientdata(client, ap);
-
-	err = i2c_smbus_write_word_data(client, cmd, 0);
-	if (err) {
-		dev_warn(&client->dev, APANEL ": smbus write error %d\n",
-			 err);
-		goto out3;
+	if (unlikely(len < 2)) {
+		pr_err("Illegal LUN length %d, expected 2 bytes or more\n",
+		       len);
+		goto out;
 	}
 
-	ipdev->poll = apanel_poll;
-	ipdev->poll_interval = POLL_INTERVAL_DEFAULT;
-	ipdev->private = ap;
-
-	idev = ipdev->input;
-	idev->name = APANEL_NAME " buttons";
-	idev->phys = "apanel/input0";
-	idev->id.bustype = BUS_HOST;
-	idev->dev.parent = &client->dev;
-
-	set_bit(EV_KEY, idev->evbit);
-
-	idev->keycode = ap->keymap;
-	idev->keycodesize = sizeof(ap->keymap[0]);
-	idev->keycodemax = (device_chip[APANEL_DEV_CDBTN] != CHIP_NONE) ? 12 : 4;
-
-	for (i = 0; i < idev->keycodemax; i++)
-		if (ap->keymap[i])
-			set_bit(ap->keymap[i], idev->keybit);
-
-	err = input_register_polled_device(ipdev);
-	if (err)
-		goto out3;
-
-	INIT_WORK(&ap->led_work, led_update);
-	if (device_chip[APANEL_DEV_LED] != CHIP_NONE) {
-		err = led_classdev_register(&client->dev, &ap->mail_led);
-		if (err)
-			goto out4;
+	switch (len) {
+	case 8:
+		if ((*((__be64 *)lun) &
+		     cpu_to_be64(0x0000FFFFFFFFFFFFLL)) != 0)
+			goto out_err;
+		break;
+	case 4:
+		if (*((__be16 *)&lun[2]) != 0)
+			goto out_err;
+		break;
+	case 6:
+		if (*((__be32 *)&lun[2]) != 0)
+			goto out_err;
+		break;
+	case 2:
+		break;
+	default:
+		goto out_err;
 	}
 
-	return 0;
-out4:
-	input_unregister_polled_device(ipdev);
-out3:
-	input_free_polled_device(ipdev);
-out1:
-	return err;
+	addressing_method = (*lun) >> 6; /* highest two bits of byte 0 */
+	switch (addressing_method) {
+	case SCSI_LUN_ADDR_METHOD_PERIPHERAL:
+	case SCSI_LUN_ADDR_METHOD_FLAT:
+	case SCSI_LUN_ADDR_METHOD_LUN:
+		res = *(lun + 1) | (((*lun) & 0x3f) << 8);
+		break;
+
+	case SCSI_LUN_ADDR_METHOD_EXTENDED_LUN:
+	default:
+		pr_err("Unimplemented LUN addressing method %u\n",
+		       addressing_method);
+		break;
+	}
+
+out:
+	return res;
+
+out_err:
+	pr_err("Support for multi-level LUNs has not yet been implemented\n");
+	goto out;
 }
 
-/* Scan the system ROM for the signature "FJKEYINF" */
-static __init const void __iomem *bios_signature(const void __iomem *bios)
+static int srpt_check_stop_free(struct se_cmd *cmd)
 {
-	ssize_t offset;
-	const unsigned char signature[] = "FJKEYINF";
-
-	for (offset = 0; offset < 0x10000; offset += 0x10) {
-		if (check_signature(bios + offset, signature,
-				    sizeof(signature)-1))
-			return bios + offset;
-	}
-	pr_notice(APANEL ": Fujitsu BIOS signature '%s' not found...\n",
-		  signature);
-	return NULL;
-}
-
-static int __init apanel_init(void)
-{
-	void __iomem *bios;
-	const void __iomem *p;
-	u8 devno;
-	unsigned char i2c_addr;
-	int found = 0;
-
-	bios = ioremap(0xF0000, 0x10000); /* Can't fail */
-
-	p = bios_signature(bios);
-	if (!p) {
-		iounmap(bios);
-		return -ENODEV;
-	}
-
-	/* just use the first address */
-	p += 8;
-	i2c_addr = readb(p + 3) >> 1;
-
-	for ( ; (devno = readb(p)) & 0x7f; p += 4) {
-		unsigned char method, slave, chip;
-
-		method = readb(p + 1);
-		chip = readb(p + 2);
-		slave = readb(p + 3) >> 1;
-
-		if (slave != i2c_addr) {
-			pr_notice(APANEL ": only one SMBus slave "
-				  "address supported, skiping device...\n");
-			continue;
-		}
-
-		/* translate alternative device numbers */
-		switch (devno) {
-		case 6:
-			devno = APANEL_DEV_APPBTN;
-			break;
-		case 7:
-			devno = APANEL_DEV_LED;
-			break;
-		}
-
-		if (devno >= APANEL_DEV_MAX)
-			pr_notice(APANEL ": unknown device %u found\n", devno);
-		else if (device_chip[devno] != CHIP_NONE)
-			pr_warning(APANEL ": duplicate entry for devno %u\n", devno);
-
-		else if (method != 1 && method != 2 && method != 4) {
-			pr_notice(APANEL ": unknown method %u for devno %u\n",
-				  method, devno);
-		} else {
-			device_chip[devno] = (enum apanel_chip) chip;
-			++found;
-		}
-	}
-	iounmap(bios);
-
-	if (found == 0) {
-		pr_info(APANEL ": no input devices reported by BIOS\n");
-		return -EIO;
-	}
-
-	return i2c_add_driver(&apanel_driver);
-}
-module_init(apanel_init);
-
-static void __exit apanel_cleanup(void)
-{
-	i2c_del_driver(&apanel_driver);
-}
-module_exit(apanel_cleanup);
-
-MODULE_AUTHOR("Stephen Hemminger <shemminger@linux-foundation.org>");
-MODULE_DESCRIPTION(APANEL_NAME " driver");
-MODULE_LICENSE("GPL");
-MODULE_VERSION(APANEL_VERSION);
-
-MODULE_ALIAS("dmi:*:svnFUJITSU:pnLifeBook*:pvr*:rvnFUJITSU:*");
-MODULE_ALIAS("dmi:*:svnFUJITSU:pnLifebook*:pvr*:rvnFUJITSU:*");
+	struct srpt_send_ioctx *ioctx = container_of(cmd,
+				struct srpt_send_ioctx, cmd);

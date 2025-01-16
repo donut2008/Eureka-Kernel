@@ -1,137 +1,74 @@
-/*
- *
- * Includes for cdc-acm.c
- *
- * Mainly take from usbnet's cdc-ether part
- *
- */
-
-/*
- * CMSPAR, some architectures can't have space and mark parity.
- */
-
-#ifndef CMSPAR
-#define CMSPAR			0
-#endif
-
-/*
- * Major and minor numbers.
- */
-
-#define ACM_TTY_MAJOR		166
-#define ACM_TTY_MINORS		256
-
-/*
- * Requests.
- */
-
-#define USB_RT_ACM		(USB_TYPE_CLASS | USB_RECIP_INTERFACE)
-
-/*
- * Output control lines.
- */
-
-#define ACM_CTRL_DTR		0x01
-#define ACM_CTRL_RTS		0x02
-
-/*
- * Input control lines and line errors.
- */
-
-#define ACM_CTRL_DCD		0x01
-#define ACM_CTRL_DSR		0x02
-#define ACM_CTRL_BRK		0x04
-#define ACM_CTRL_RI		0x08
-
-#define ACM_CTRL_FRAMING	0x10
-#define ACM_CTRL_PARITY		0x20
-#define ACM_CTRL_OVERRUN	0x40
-
-/*
- * Internal driver structures.
- */
-
-/*
- * The only reason to have several buffers is to accommodate assumptions
- * in line disciplines. They ask for empty space amount, receive our URB size,
- * and proceed to issue several 1-character writes, assuming they will fit.
- * The very first write takes a complete URB. Fortunately, this only happens
- * when processing onlcr, so we only need 2 buffers. These values must be
- * powers of 2.
- */
-#define ACM_NW  16
-#define ACM_NR  16
-
-struct acm_wb {
-	unsigned char *buf;
-	dma_addr_t dmah;
-	int len;
-	int use;
-	struct urb		*urb;
-	struct acm		*instance;
-};
-
-struct acm_rb {
-	int			size;
-	unsigned char		*base;
-	dma_addr_t		dma;
-	int			index;
-	struct acm		*instance;
-};
-
-struct acm {
-	struct usb_device *dev;				/* the corresponding usb device */
-	struct usb_interface *control;			/* control interface */
-	struct usb_interface *data;			/* data interface */
-	struct tty_port port;			 	/* our tty port data */
-	struct urb *ctrlurb;				/* urbs */
-	u8 *ctrl_buffer;				/* buffers of urbs */
-	dma_addr_t ctrl_dma;				/* dma handles of buffers */
-	u8 *country_codes;				/* country codes from device */
-	unsigned int country_code_size;			/* size of this buffer */
-	unsigned int country_rel_date;			/* release date of version */
-	struct acm_wb wb[ACM_NW];
-	unsigned long read_urbs_free;
-	struct urb *read_urbs[ACM_NR];
-	struct acm_rb read_buffers[ACM_NR];
-	int rx_buflimit;
-	spinlock_t read_lock;
-	int write_used;					/* number of non-empty write buffers */
-	int transmitting;
-	spinlock_t write_lock;
-	struct mutex mutex;
-	bool disconnected;
-	struct usb_cdc_line_coding line;		/* bits, stop, parity */
-	struct work_struct work;			/* work queue entry for line discipline waking up */
-	unsigned int ctrlin;				/* input control lines (DCD, DSR, RI, break, overruns) */
-	unsigned int ctrlout;				/* output control lines (DTR, RTS) */
-	struct async_icount iocount;			/* counters for control line changes */
-	struct async_icount oldcount;			/* for comparison of counter */
-	wait_queue_head_t wioctl;			/* for ioctl */
-	unsigned int writesize;				/* max packet size for the output bulk endpoint */
-	unsigned int readsize,ctrlsize;			/* buffer sizes for freeing */
-	unsigned int minor;				/* acm minor number */
-	unsigned char clocal;				/* termios CLOCAL */
-	unsigned int ctrl_caps;				/* control capabilities from the class specific header */
-	unsigned int susp_count;			/* number of suspended interfaces */
-	unsigned int combined_interfaces:1;		/* control and data collapsed */
-	unsigned int is_int_ep:1;			/* interrupt endpoints contrary to spec used */
-	unsigned int throttled:1;			/* actually throttled */
-	unsigned int throttle_req:1;			/* throttle requested */
-	u8 bInterval;
-	struct usb_anchor delayed;			/* writes queued for a device about to be woken */
-	unsigned long quirks;
-};
-
-#define CDC_DATA_INTERFACE_TYPE	0x0a
-
-/* constants describing various quirks and errors */
-#define NO_UNION_NORMAL			BIT(0)
-#define SINGLE_RX_URB			BIT(1)
-#define NO_CAP_LINE			BIT(2)
-#define NO_DATA_INTERFACE		BIT(4)
-#define IGNORE_DEVICE			BIT(5)
-#define QUIRK_CONTROL_LINE_STATE	BIT(6)
-#define CLEAR_HALT_CONDITIONS		BIT(7)
-#define SEND_ZERO_PACKET		BIT(8)
-#define DISABLE_ECHO			BIT(9)
+_MASK 0x20
+#define D2F3_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define D2F3_LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define D2F3_LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define D2F3_LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define D2F3_LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define D2F3_LINK_CNTL2__ENTER_MOD_COMPLIANCE_MASK 0x400
+#define D2F3_LINK_CNTL2__ENTER_MOD_COMPLIANCE__SHIFT 0xa
+#define D2F3_LINK_CNTL2__COMPLIANCE_SOS_MASK 0x800
+#define D2F3_LINK_CNTL2__COMPLIANCE_SOS__SHIFT 0xb
+#define D2F3_LINK_CNTL2__COMPLIANCE_DEEMPHASIS_MASK 0xf000
+#define D2F3_LINK_CNTL2__COMPLIANCE_DEEMPHASIS__SHIFT 0xc
+#define D2F3_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL_MASK 0x10000
+#define D2F3_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL__SHIFT 0x10
+#define D2F3_LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x20000
+#define D2F3_LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x11
+#define D2F3_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x40000
+#define D2F3_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x12
+#define D2F3_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS_MASK 0x80000
+#define D2F3_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS__SHIFT 0x13
+#define D2F3_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS_MASK 0x100000
+#define D2F3_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS__SHIFT 0x14
+#define D2F3_LINK_STATUS2__LINK_EQUALIZATION_REQUEST_MASK 0x200000
+#define D2F3_LINK_STATUS2__LINK_EQUALIZATION_REQUEST__SHIFT 0x15
+#define D2F3_SLOT_CAP2__RESERVED_MASK 0xffffffff
+#define D2F3_SLOT_CAP2__RESERVED__SHIFT 0x0
+#define D2F3_SLOT_CNTL2__RESERVED_MASK 0xffff
+#define D2F3_SLOT_CNTL2__RESERVED__SHIFT 0x0
+#define D2F3_SLOT_STATUS2__RESERVED_MASK 0xffff0000
+#define D2F3_SLOT_STATUS2__RESERVED__SHIFT 0x10
+#define D2F3_MSI_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F3_MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F3_MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F3_MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F3_MSI_MSG_CNTL__MSI_EN_MASK 0x10000
+#define D2F3_MSI_MSG_CNTL__MSI_EN__SHIFT 0x10
+#define D2F3_MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe0000
+#define D2F3_MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x11
+#define D2F3_MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x700000
+#define D2F3_MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x14
+#define D2F3_MSI_MSG_CNTL__MSI_64BIT_MASK 0x800000
+#define D2F3_MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x17
+#define D2F3_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP_MASK 0x1000000
+#define D2F3_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP__SHIFT 0x18
+#define D2F3_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define D2F3_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define D2F3_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define D2F3_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define D2F3_MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define D2F3_MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define D2F3_MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define D2F3_MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define D2F3_SSID_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F3_SSID_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F3_SSID_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F3_SSID_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F3_SSID_CAP__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define D2F3_SSID_CAP__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define D2F3_SSID_CAP__SUBSYSTEM_ID_MASK 0xffff0000
+#define D2F3_SSID_CAP__SUBSYSTEM_ID__SHIFT 0x10
+#define D2F3_MSI_MAP_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F3_MSI_MAP_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F3_MSI_MAP_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F3_MSI_MAP_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F3_MSI_MAP_CAP__EN_MASK 0x10000
+#define D2F3_MSI_MAP_CAP__EN__SHIFT 0x10
+#define D2F3_MSI_MAP_CAP__FIXD_MASK 0x20000
+#define D2F3_MSI_MAP_CAP__FIXD__SHIFT 0x11
+#define D2F3_MSI_MAP_CAP__CAP_TYPE_MASK 0xf8000000
+#define D2F3_MSI_MAP_CAP__CAP_TYPE__SHIFT 0x1b
+#define D2F3_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO_MASK 0xfff00000
+#define D2F3_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO__SHIFT 0x14
+#define D2F3_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI_MASK 0xffffffff
+#define D2F3_MSI_MAP_AD

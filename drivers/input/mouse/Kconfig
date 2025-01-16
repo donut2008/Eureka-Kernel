@@ -1,422 +1,248 @@
-#
-# Mouse driver configuration
-#
-menuconfig INPUT_MOUSE
-	bool "Mice"
-	default y
-	help
-	  Say Y here, and a list of supported mice will be displayed.
-	  This option doesn't affect the kernel.
-
-	  If unsure, say Y.
-
-if INPUT_MOUSE
-
-config MOUSE_PS2
-	tristate "PS/2 mouse"
-	default y
-	select SERIO
-	select SERIO_LIBPS2
-	select SERIO_I8042 if ARCH_MIGHT_HAVE_PC_SERIO
-	select SERIO_GSCPS2 if GSC
-	help
-	  Say Y here if you have a PS/2 mouse connected to your system. This
-	  includes the standard 2 or 3-button PS/2 mouse, as well as PS/2
-	  mice with wheels and extra buttons, Microsoft, Logitech or Genius
-	  compatible.
-
-	  Synaptics, ALPS or Elantech TouchPad users might be interested
-	  in a specialized Xorg/XFree86 driver at:
-		<http://w1.894.telia.com/~u89404340/touchpad/index.html>
-	  and a new version of GPM at:
-		<http://www.geocities.com/dt_or/gpm/gpm.html>
-		<http://xorg.freedesktop.org/archive/individual/driver/>
-	  to take advantage of the advanced features of the touchpad.
-
-	  If unsure, say Y.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called psmouse.
-
-config MOUSE_PS2_ALPS
-	bool "ALPS PS/2 mouse protocol extension" if EXPERT
-	default y
-	depends on MOUSE_PS2
-	help
-	  Say Y here if you have an ALPS PS/2 touchpad connected to
-	  your system.
-
-	  If unsure, say Y.
-
-config MOUSE_PS2_LOGIPS2PP
-	bool "Logitech PS/2++ mouse protocol extension" if EXPERT
-	default y
-	depends on MOUSE_PS2
-	help
-	  Say Y here if you have a Logitech PS/2++ mouse connected to
-	  your system.
-
-	  If unsure, say Y.
-
-config MOUSE_PS2_SYNAPTICS
-	bool "Synaptics PS/2 mouse protocol extension" if EXPERT
-	default y
-	depends on MOUSE_PS2
-	help
-	  Say Y here if you have a Synaptics PS/2 TouchPad connected to
-	  your system.
-
-	  If unsure, say Y.
-
-config MOUSE_PS2_CYPRESS
-       bool "Cypress PS/2 mouse protocol extension" if EXPERT
-       default y
-       depends on MOUSE_PS2
-       help
-         Say Y here if you have a Cypress PS/2 Trackpad connected to
-         your system.
-
-         If unsure, say Y.
-
-config MOUSE_PS2_LIFEBOOK
-	bool "Fujitsu Lifebook PS/2 mouse protocol extension" if EXPERT
-	default y
-	depends on MOUSE_PS2 && X86 && DMI
-	help
-	  Say Y here if you have a Fujitsu B-series Lifebook PS/2
-	  TouchScreen connected to your system.
-
-	  If unsure, say Y.
-
-config MOUSE_PS2_TRACKPOINT
-	bool "IBM Trackpoint PS/2 mouse protocol extension" if EXPERT
-	default y
-	depends on MOUSE_PS2
-	help
-	  Say Y here if you have an IBM Trackpoint PS/2 mouse connected
-	  to your system.
-
-	  If unsure, say Y.
-
-config MOUSE_PS2_ELANTECH
-	bool "Elantech PS/2 protocol extension"
-	depends on MOUSE_PS2
-	help
-	  Say Y here if you have an Elantech PS/2 touchpad connected
-	  to your system.
-
-	  This driver exposes some configuration registers via sysfs
-	  entries. For further information,
-	  see <file:Documentation/input/elantech.txt>.
-
-	  If unsure, say N.
-
-config MOUSE_PS2_SENTELIC
-	bool "Sentelic Finger Sensing Pad PS/2 protocol extension"
-	depends on MOUSE_PS2
-	help
-	  Say Y here if you have a laptop (such as MSI WIND Netbook)
-	  with Sentelic Finger Sensing Pad touchpad.
-
-	  If unsure, say N.
-
-config MOUSE_PS2_TOUCHKIT
-	bool "eGalax TouchKit PS/2 protocol extension"
-	depends on MOUSE_PS2
-	help
-	  Say Y here if you have an eGalax TouchKit PS/2 touchscreen
-	  connected to your system.
-
-	  If unsure, say N.
-
-config MOUSE_PS2_OLPC
-	bool "OLPC PS/2 mouse protocol extension"
-	depends on MOUSE_PS2 && OLPC
-	help
-	  Say Y here if you have an OLPC XO-1 laptop (with built-in
-	  PS/2 touchpad/tablet device).  The manufacturer calls the
-	  touchpad an HGPK.
-
-	  If unsure, say N.
-
-config MOUSE_PS2_FOCALTECH
-	bool "FocalTech PS/2 mouse protocol extension" if EXPERT
-	default y
-	depends on MOUSE_PS2
-	help
-	  Say Y here if you have a FocalTech PS/2 TouchPad connected to
-	  your system.
-
-	  If unsure, say Y.
-
-config MOUSE_PS2_VMMOUSE
-	bool "Virtual mouse (vmmouse)"
-	depends on MOUSE_PS2 && X86 && HYPERVISOR_GUEST
-	help
-	  Say Y here if you are running under control of VMware hypervisor
-	  (ESXi, Workstation or Fusion). Also make sure that when you enable
-	  this option, you remove the xf86-input-vmmouse user-space driver
-	  or upgrade it to at least xf86-input-vmmouse 13.1.0, which doesn't
-	  load in the presence of an in-kernel vmmouse driver.
-
-	  If unsure, say N.
-
-config MOUSE_SERIAL
-	tristate "Serial mouse"
-	select SERIO
-	help
-	  Say Y here if you have a serial (RS-232, COM port) mouse connected
-	  to your system. This includes Sun, MouseSystems, Microsoft,
-	  Logitech and all other compatible serial mice.
-
-	  If unsure, say N.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called sermouse.
-
-config MOUSE_APPLETOUCH
-	tristate "Apple USB Touchpad support"
-	depends on USB_ARCH_HAS_HCD
-	select USB
-	help
-	  Say Y here if you want to use an Apple USB Touchpad.
-
-	  These are the touchpads that can be found on post-February 2005
-	  Apple Powerbooks (prior models have a Synaptics touchpad connected
-	  to the ADB bus).
-
-	  This driver provides a basic mouse driver but can be interfaced
-	  with the synaptics X11 driver to provide acceleration and
-	  scrolling in X11.
-
-	  For further information, see
-	  <file:Documentation/input/appletouch.txt>.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called appletouch.
-
-config MOUSE_BCM5974
-	tristate "Apple USB BCM5974 Multitouch trackpad support"
-	depends on USB_ARCH_HAS_HCD
-	select USB
-	help
-	  Say Y here if you have an Apple USB BCM5974 Multitouch
-	  trackpad.
-
-	  The BCM5974 is the multitouch trackpad found in the Macbook
-	  Air (JAN2008) and Macbook Pro Penryn (FEB2008) laptops.
-
-	  It is also found in the IPhone (2007) and Ipod Touch (2008).
-
-	  This driver provides multitouch functionality together with
-	  the synaptics X11 driver.
-
-	  The interface is currently identical to the appletouch interface,
-	  for further information, see
-	  <file:Documentation/input/appletouch.txt>.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called bcm5974.
-
-config MOUSE_CYAPA
-	tristate "Cypress APA I2C Trackpad support"
-	depends on I2C
-	select CRC_ITU_T
-	help
-	  This driver adds support for Cypress All Points Addressable (APA)
-	  I2C Trackpads, including the ones used in 2012 Samsung Chromebooks.
-
-	  Say Y here if you have a Cypress APA I2C Trackpad.
-
-	  To compile this driver as a module, choose M here: the module will be
-	  called cyapa.
-
-config MOUSE_ELAN_I2C
-	tristate "ELAN I2C Touchpad support"
-	depends on I2C
-	help
-	  This driver adds support for Elan I2C/SMbus Trackpads.
-
-	  Say Y here if you have a ELAN I2C/SMbus Touchpad.
-
-	  To compile this driver as a module, choose M here: the module will be
-	  called elan_i2c.
-
-config MOUSE_ELAN_I2C_I2C
-	bool "Enable I2C support"
-	depends on MOUSE_ELAN_I2C
-	default y
-	help
-	   Say Y here if Elan Touchpad in your system is connected to
-	   a standard I2C controller.
-
-	   If unsure, say Y.
-
-config MOUSE_ELAN_I2C_SMBUS
-	bool "Enable SMbus support"
-	depends on MOUSE_ELAN_I2C
-	help
-	   Say Y here if Elan Touchpad in your system is connected to
-	   a SMbus adapter.
-
-	   If unsure, say Y.
-
-config MOUSE_INPORT
-	tristate "InPort/MS/ATIXL busmouse"
-	depends on ISA
-	help
-	  Say Y here if you have an InPort, Microsoft or ATI XL busmouse.
-	  They are rather rare these days.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called inport.
-
-config MOUSE_ATIXL
-	bool "ATI XL variant"
-	depends on MOUSE_INPORT
-	help
-	  Say Y here if your mouse is of the ATI XL variety.
-
-config MOUSE_LOGIBM
-	tristate "Logitech busmouse"
-	depends on ISA
-	help
-	  Say Y here if you have a Logitech busmouse.
-	  They are rather rare these days.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called logibm.
-
-config MOUSE_PC110PAD
-	tristate "IBM PC110 touchpad"
-	depends on ISA
-	help
-	  Say Y if you have the IBM PC-110 micro-notebook and want its
-	  touchpad supported.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called pc110pad.
-
-config MOUSE_AMIGA
-	tristate "Amiga mouse"
-	depends on AMIGA
-	help
-	  Say Y here if you have an Amiga and want its native mouse
-	  supported by the kernel.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called amimouse.
-
-config MOUSE_ATARI
-	tristate "Atari mouse"
-	depends on ATARI
-	select ATARI_KBD_CORE
-	help
-	  Say Y here if you have an Atari and want its native mouse
-	  supported by the kernel.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called atarimouse.
-
-config MOUSE_RISCPC
-	tristate "Acorn RiscPC mouse"
-	depends on ARCH_ACORN
-	help
-	  Say Y here if you have the Acorn RiscPC computer and want its
-	  native mouse supported.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called rpcmouse.
-
-config MOUSE_VSXXXAA
-	tristate "DEC VSXXX-AA/GA mouse and VSXXX-AB tablet"
-	select SERIO
-	help
-	  Say Y (or M) if you want to use a DEC VSXXX-AA (hockey
-	  puck) or a VSXXX-GA (rectangular) mouse. Theses mice are
-	  typically used on DECstations or VAXstations, but can also
-	  be used on any box capable of RS232 (with some adaptor
-	  described in the source file). This driver also works with the
-	  digitizer (VSXXX-AB) DEC produced.
-
-config MOUSE_GPIO
-	tristate "GPIO mouse"
-	depends on GPIOLIB || COMPILE_TEST
-	select INPUT_POLLDEV
-	help
-	  This driver simulates a mouse on GPIO lines of various CPUs (and some
-	  other chips).
-
-	  Say Y here if your device has buttons or a simple joystick connected
-	  directly to GPIO lines. Your board-specific setup logic must also
-	  provide a platform device and platform data saying which GPIOs are
-	  used.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called gpio_mouse.
-
-config MOUSE_PXA930_TRKBALL
-	tristate "PXA930 Trackball mouse"
-	depends on CPU_PXA930 || CPU_PXA935
-	help
-	  Say Y here to support PXA930 Trackball mouse.
-
-config MOUSE_MAPLE
-	tristate "Maple mouse (for the Dreamcast)"
-	depends on MAPLE
-	help
-	  This driver supports the Maple mouse on the SEGA Dreamcast.
-
-	  Most Dreamcast users, who have a mouse, will say Y here.
-
-	  To compile this driver as a module choose M here: the module will be
-	  called maplemouse.
-
-config MOUSE_SYNAPTICS_I2C
-	tristate "Synaptics I2C Touchpad support"
-	depends on I2C
-	help
-	  This driver supports Synaptics I2C touchpad controller on eXeda
-	  mobile device.
-	  The device will not work the synaptics X11 driver because
-	  (i) it  reports only relative coordinates and has no capabilities
-	  to report absolute coordinates
-	  (ii) the eXeda device itself uses Xfbdev as X Server and it does
-	  not allow using xf86-input-* drivers.
-
-	  Say y here if you have eXeda device and want to use a Synaptics
-	  I2C Touchpad.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called synaptics_i2c.
-
-config MOUSE_SYNAPTICS_USB
-	tristate "Synaptics USB device support"
-	depends on USB_ARCH_HAS_HCD
-	select USB
-	help
-	  Say Y here if you want to use a Synaptics USB touchpad or pointing
-	  stick.
-
-	  While these devices emulate an USB mouse by default and can be used
-	  with standard usbhid driver, this driver, together with its X.Org
-	  counterpart, allows you to fully utilize capabilities of the device.
-	  More information can be found at:
-	  <http://jan-steinhoff.de/linux/synaptics-usb.html>
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called synaptics_usb.
-
-config MOUSE_NAVPOINT_PXA27x
-	tristate "Synaptics NavPoint (PXA27x SSP/SPI)"
-	depends on PXA27x && PXA_SSP
-	help
-	  This driver adds support for the Synaptics NavPoint touchpad connected
-	  to a PXA27x SSP port in SPI slave mode. The device emulates a mouse;
-	  a tap or tap-and-a-half drag gesture emulates the left mouse button.
-	  For example, use the xf86-input-evdev driver for an X pointing device.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called navpoint.
-
-endif
+00
+#define SQ_MIMG_0__DA__SHIFT 0xe
+#define SQ_MIMG_0__R128_MASK 0x8000
+#define SQ_MIMG_0__R128__SHIFT 0xf
+#define SQ_MIMG_0__TFE_MASK 0x10000
+#define SQ_MIMG_0__TFE__SHIFT 0x10
+#define SQ_MIMG_0__LWE_MASK 0x20000
+#define SQ_MIMG_0__LWE__SHIFT 0x11
+#define SQ_MIMG_0__OP_MASK 0x1fc0000
+#define SQ_MIMG_0__OP__SHIFT 0x12
+#define SQ_MIMG_0__SLC_MASK 0x2000000
+#define SQ_MIMG_0__SLC__SHIFT 0x19
+#define SQ_MIMG_0__ENCODING_MASK 0xfc000000
+#define SQ_MIMG_0__ENCODING__SHIFT 0x1a
+#define SQ_SOPK__SIMM16_MASK 0xffff
+#define SQ_SOPK__SIMM16__SHIFT 0x0
+#define SQ_SOPK__SDST_MASK 0x7f0000
+#define SQ_SOPK__SDST__SHIFT 0x10
+#define SQ_SOPK__OP_MASK 0xf800000
+#define SQ_SOPK__OP__SHIFT 0x17
+#define SQ_SOPK__ENCODING_MASK 0xf0000000
+#define SQ_SOPK__ENCODING__SHIFT 0x1c
+#define SQ_DS_0__OFFSET0_MASK 0xff
+#define SQ_DS_0__OFFSET0__SHIFT 0x0
+#define SQ_DS_0__OFFSET1_MASK 0xff00
+#define SQ_DS_0__OFFSET1__SHIFT 0x8
+#define SQ_DS_0__GDS_MASK 0x10000
+#define SQ_DS_0__GDS__SHIFT 0x10
+#define SQ_DS_0__OP_MASK 0x1fe0000
+#define SQ_DS_0__OP__SHIFT 0x11
+#define SQ_DS_0__ENCODING_MASK 0xfc000000
+#define SQ_DS_0__ENCODING__SHIFT 0x1a
+#define SQ_VOP_DPP__SRC0_MASK 0xff
+#define SQ_VOP_DPP__SRC0__SHIFT 0x0
+#define SQ_VOP_DPP__DPP_CTRL_MASK 0x1ff00
+#define SQ_VOP_DPP__DPP_CTRL__SHIFT 0x8
+#define SQ_VOP_DPP__BOUND_CTRL_MASK 0x80000
+#define SQ_VOP_DPP__BOUND_CTRL__SHIFT 0x13
+#define SQ_VOP_DPP__SRC0_NEG_MASK 0x100000
+#define SQ_VOP_DPP__SRC0_NEG__SHIFT 0x14
+#define SQ_VOP_DPP__SRC0_ABS_MASK 0x200000
+#define SQ_VOP_DPP__SRC0_ABS__SHIFT 0x15
+#define SQ_VOP_DPP__SRC1_NEG_MASK 0x400000
+#define SQ_VOP_DPP__SRC1_NEG__SHIFT 0x16
+#define SQ_VOP_DPP__SRC1_ABS_MASK 0x800000
+#define SQ_VOP_DPP__SRC1_ABS__SHIFT 0x17
+#define SQ_VOP_DPP__BANK_MASK_MASK 0xf000000
+#define SQ_VOP_DPP__BANK_MASK__SHIFT 0x18
+#define SQ_VOP_DPP__ROW_MASK_MASK 0xf0000000
+#define SQ_VOP_DPP__ROW_MASK__SHIFT 0x1c
+#define SQ_VOPC__SRC0_MASK 0x1ff
+#define SQ_VOPC__SRC0__SHIFT 0x0
+#define SQ_VOPC__VSRC1_MASK 0x1fe00
+#define SQ_VOPC__VSRC1__SHIFT 0x9
+#define SQ_VOPC__OP_MASK 0x1fe0000
+#define SQ_VOPC__OP__SHIFT 0x11
+#define SQ_VOPC__ENCODING_MASK 0xfe000000
+#define SQ_VOPC__ENCODING__SHIFT 0x19
+#define SQ_VINTRP__VSRC_MASK 0xff
+#define SQ_VINTRP__VSRC__SHIFT 0x0
+#define SQ_VINTRP__ATTRCHAN_MASK 0x300
+#define SQ_VINTRP__ATTRCHAN__SHIFT 0x8
+#define SQ_VINTRP__ATTR_MASK 0xfc00
+#define SQ_VINTRP__ATTR__SHIFT 0xa
+#define SQ_VINTRP__OP_MASK 0x30000
+#define SQ_VINTRP__OP__SHIFT 0x10
+#define SQ_VINTRP__VDST_MASK 0x3fc0000
+#define SQ_VINTRP__VDST__SHIFT 0x12
+#define SQ_VINTRP__ENCODING_MASK 0xfc000000
+#define SQ_VINTRP__ENCODING__SHIFT 0x1a
+#define CGTT_SX_CLK_CTRL0__ON_DELAY_MASK 0xf
+#define CGTT_SX_CLK_CTRL0__ON_DELAY__SHIFT 0x0
+#define CGTT_SX_CLK_CTRL0__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_SX_CLK_CTRL0__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_SX_CLK_CTRL0__RESERVED_MASK 0xfff000
+#define CGTT_SX_CLK_CTRL0__RESERVED__SHIFT 0xc
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE7_MASK 0x1000000
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE7__SHIFT 0x18
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE6_MASK 0x2000000
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE6__SHIFT 0x19
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE5_MASK 0x4000000
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE5__SHIFT 0x1a
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE4_MASK 0x8000000
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE4__SHIFT 0x1b
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE3_MASK 0x10000000
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE3__SHIFT 0x1c
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE2_MASK 0x20000000
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE2__SHIFT 0x1d
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE1_MASK 0x40000000
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE1__SHIFT 0x1e
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE0_MASK 0x80000000
+#define CGTT_SX_CLK_CTRL0__SOFT_OVERRIDE0__SHIFT 0x1f
+#define CGTT_SX_CLK_CTRL1__ON_DELAY_MASK 0xf
+#define CGTT_SX_CLK_CTRL1__ON_DELAY__SHIFT 0x0
+#define CGTT_SX_CLK_CTRL1__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_SX_CLK_CTRL1__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_SX_CLK_CTRL1__RESERVED_MASK 0xfff000
+#define CGTT_SX_CLK_CTRL1__RESERVED__SHIFT 0xc
+#define CGTT_SX_CLK_CTRL1__DBG_EN_MASK 0x1000000
+#define CGTT_SX_CLK_CTRL1__DBG_EN__SHIFT 0x18
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE6_MASK 0x2000000
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE6__SHIFT 0x19
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE5_MASK 0x4000000
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE5__SHIFT 0x1a
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE4_MASK 0x8000000
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE4__SHIFT 0x1b
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE3_MASK 0x10000000
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE3__SHIFT 0x1c
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE2_MASK 0x20000000
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE2__SHIFT 0x1d
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE1_MASK 0x40000000
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE1__SHIFT 0x1e
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE0_MASK 0x80000000
+#define CGTT_SX_CLK_CTRL1__SOFT_OVERRIDE0__SHIFT 0x1f
+#define CGTT_SX_CLK_CTRL2__ON_DELAY_MASK 0xf
+#define CGTT_SX_CLK_CTRL2__ON_DELAY__SHIFT 0x0
+#define CGTT_SX_CLK_CTRL2__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_SX_CLK_CTRL2__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_SX_CLK_CTRL2__RESERVED_MASK 0xfff000
+#define CGTT_SX_CLK_CTRL2__RESERVED__SHIFT 0xc
+#define CGTT_SX_CLK_CTRL2__DBG_EN_MASK 0x1000000
+#define CGTT_SX_CLK_CTRL2__DBG_EN__SHIFT 0x18
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE6_MASK 0x2000000
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE6__SHIFT 0x19
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE5_MASK 0x4000000
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE5__SHIFT 0x1a
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE4_MASK 0x8000000
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE4__SHIFT 0x1b
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE3_MASK 0x10000000
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE3__SHIFT 0x1c
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE2_MASK 0x20000000
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE2__SHIFT 0x1d
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE1_MASK 0x40000000
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE1__SHIFT 0x1e
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE0_MASK 0x80000000
+#define CGTT_SX_CLK_CTRL2__SOFT_OVERRIDE0__SHIFT 0x1f
+#define CGTT_SX_CLK_CTRL3__ON_DELAY_MASK 0xf
+#define CGTT_SX_CLK_CTRL3__ON_DELAY__SHIFT 0x0
+#define CGTT_SX_CLK_CTRL3__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_SX_CLK_CTRL3__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_SX_CLK_CTRL3__RESERVED_MASK 0xfff000
+#define CGTT_SX_CLK_CTRL3__RESERVED__SHIFT 0xc
+#define CGTT_SX_CLK_CTRL3__DBG_EN_MASK 0x1000000
+#define CGTT_SX_CLK_CTRL3__DBG_EN__SHIFT 0x18
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE6_MASK 0x2000000
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE6__SHIFT 0x19
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE5_MASK 0x4000000
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE5__SHIFT 0x1a
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE4_MASK 0x8000000
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE4__SHIFT 0x1b
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE3_MASK 0x10000000
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE3__SHIFT 0x1c
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE2_MASK 0x20000000
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE2__SHIFT 0x1d
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE1_MASK 0x40000000
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE1__SHIFT 0x1e
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE0_MASK 0x80000000
+#define CGTT_SX_CLK_CTRL3__SOFT_OVERRIDE0__SHIFT 0x1f
+#define CGTT_SX_CLK_CTRL4__ON_DELAY_MASK 0xf
+#define CGTT_SX_CLK_CTRL4__ON_DELAY__SHIFT 0x0
+#define CGTT_SX_CLK_CTRL4__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_SX_CLK_CTRL4__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_SX_CLK_CTRL4__RESERVED_MASK 0xfff000
+#define CGTT_SX_CLK_CTRL4__RESERVED__SHIFT 0xc
+#define CGTT_SX_CLK_CTRL4__DBG_EN_MASK 0x1000000
+#define CGTT_SX_CLK_CTRL4__DBG_EN__SHIFT 0x18
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE6_MASK 0x2000000
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE6__SHIFT 0x19
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE5_MASK 0x4000000
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE5__SHIFT 0x1a
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE4_MASK 0x8000000
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE4__SHIFT 0x1b
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE3_MASK 0x10000000
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE3__SHIFT 0x1c
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE2_MASK 0x20000000
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE2__SHIFT 0x1d
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE1_MASK 0x40000000
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE1__SHIFT 0x1e
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE0_MASK 0x80000000
+#define CGTT_SX_CLK_CTRL4__SOFT_OVERRIDE0__SHIFT 0x1f
+#define SX_DEBUG_BUSY__POS_FREE_OR_VALIDS_MASK 0x1
+#define SX_DEBUG_BUSY__POS_FREE_OR_VALIDS__SHIFT 0x0
+#define SX_DEBUG_BUSY__POS_REQUESTER_BUSY_MASK 0x2
+#define SX_DEBUG_BUSY__POS_REQUESTER_BUSY__SHIFT 0x1
+#define SX_DEBUG_BUSY__PA_SX_BUSY_MASK 0x4
+#define SX_DEBUG_BUSY__PA_SX_BUSY__SHIFT 0x2
+#define SX_DEBUG_BUSY__POS_SCBD_BUSY_MASK 0x8
+#define SX_DEBUG_BUSY__POS_SCBD_BUSY__SHIFT 0x3
+#define SX_DEBUG_BUSY__POS_BANK3VAL3_BUSY_MASK 0x10
+#define SX_DEBUG_BUSY__POS_BANK3VAL3_BUSY__SHIFT 0x4
+#define SX_DEBUG_BUSY__POS_BANK3VAL2_BUSY_MASK 0x20
+#define SX_DEBUG_BUSY__POS_BANK3VAL2_BUSY__SHIFT 0x5
+#define SX_DEBUG_BUSY__POS_BANK3VAL1_BUSY_MASK 0x40
+#define SX_DEBUG_BUSY__POS_BANK3VAL1_BUSY__SHIFT 0x6
+#define SX_DEBUG_BUSY__POS_BANK3VAL0_BUSY_MASK 0x80
+#define SX_DEBUG_BUSY__POS_BANK3VAL0_BUSY__SHIFT 0x7
+#define SX_DEBUG_BUSY__POS_BANK2VAL3_BUSY_MASK 0x100
+#define SX_DEBUG_BUSY__POS_BANK2VAL3_BUSY__SHIFT 0x8
+#define SX_DEBUG_BUSY__POS_BANK2VAL2_BUSY_MASK 0x200
+#define SX_DEBUG_BUSY__POS_BANK2VAL2_BUSY__SHIFT 0x9
+#define SX_DEBUG_BUSY__POS_BANK2VAL1_BUSY_MASK 0x400
+#define SX_DEBUG_BUSY__POS_BANK2VAL1_BUSY__SHIFT 0xa
+#define SX_DEBUG_BUSY__POS_BANK2VAL0_BUSY_MASK 0x800
+#define SX_DEBUG_BUSY__POS_BANK2VAL0_BUSY__SHIFT 0xb
+#define SX_DEBUG_BUSY__POS_BANK1VAL3_BUSY_MASK 0x1000
+#define SX_DEBUG_BUSY__POS_BANK1VAL3_BUSY__SHIFT 0xc
+#define SX_DEBUG_BUSY__POS_BANK1VAL2_BUSY_MASK 0x2000
+#define SX_DEBUG_BUSY__POS_BANK1VAL2_BUSY__SHIFT 0xd
+#define SX_DEBUG_BUSY__POS_BANK1VAL1_BUSY_MASK 0x4000
+#define SX_DEBUG_BUSY__POS_BANK1VAL1_BUSY__SHIFT 0xe
+#define SX_DEBUG_BUSY__POS_BANK1VAL0_BUSY_MASK 0x8000
+#define SX_DEBUG_BUSY__POS_BANK1VAL0_BUSY__SHIFT 0xf
+#define SX_DEBUG_BUSY__POS_BANK0VAL3_BUSY_MASK 0x10000
+#define SX_DEBUG_BUSY__POS_BANK0VAL3_BUSY__SHIFT 0x10
+#define SX_DEBUG_BUSY__POS_BANK0VAL2_BUSY_MASK 0x20000
+#define SX_DEBUG_BUSY__POS_BANK0VAL2_BUSY__SHIFT 0x11
+#define SX_DEBUG_BUSY__POS_BANK0VAL1_BUSY_MASK 0x40000
+#define SX_DEBUG_BUSY__POS_BANK0VAL1_BUSY__SHIFT 0x12
+#define SX_DEBUG_BUSY__POS_BANK0VAL0_BUSY_MASK 0x80000
+#define SX_DEBUG_BUSY__POS_BANK0VAL0_BUSY__SHIFT 0x13
+#define SX_DEBUG_BUSY__POS_INMUX_VALID_MASK 0x100000
+#define SX_DEBUG_BUSY__POS_INMUX_VALID__SHIFT 0x14
+#define SX_DEBUG_BUSY__WRCTRL1_VALIDQ3_MASK 0x200000
+#define SX_DEBUG_BUSY__WRCTRL1_VALIDQ3__SHIFT 0x15
+#define SX_DEBUG_BUSY__WRCTRL1_VALIDQ2_MASK 0x400000
+#define SX_DEBUG_BUSY__WRCTRL1_VALIDQ2__SHIFT 0x16
+#define SX_DEBUG_BUSY__WRCTRL1_VALIDQ1_MASK 0x800000
+#define SX_DEBUG_BUSY__WRCTRL1_VALIDQ1__SHIFT 0x17
+#define SX_DEBUG_BUSY__WRCTRL0_VALIDQ3_MASK 0x1000000
+#define SX_DEBUG_BUSY__WRCTRL0_VALIDQ3__SHIFT 0x18
+#define SX_DEBUG_BUSY__WRCTRL0_VALIDQ2_MASK 0x2000000
+#define SX_DEBUG_BUSY__WRCTRL0_VALIDQ2__SHIFT 0x19
+#define SX_DEBUG_BUSY__WRCTRL0_VALIDQ1_MASK 0x4000000
+#define SX_DEBUG_BUSY__WRCTRL0_VALIDQ1__SHIFT 0x1a
+#define SX_DEBUG_BUSY__PCCMD_VALID_MASK 0x8000000
+#define SX_DEBUG_BUSY__PCCMD_VALID__SHIFT 0x1b
+#define SX_DEBUG_BUSY__VDATA1_VALID_MASK 0x10000000
+#define SX_DEBUG_BUSY__VDATA1_VALID__SHIFT 0x1c
+#define SX_DEBUG_BUSY__VDATA0_VALID_MASK 0x20000000
+#define SX_DEBUG_BUSY__VDATA0_VALID__SHIFT 0x1d
+#define SX_DEBUG_BUSY__CMD_BUSYORVAL_MASK 0x40000000
+#define SX_DEBUG_BUSY__CMD_BUSYORVAL__SHIFT 0x1e
+#define SX_DEBUG_BUSY__ADDR_BUSYORVAL_MASK 0x80000000
+#define SX_DEBUG_BUSY__ADDR_BUSYORVAL__SHIFT 0x1f
+#define SX_DEBUG_BUSY_2__COL_SCBD_BUSY_MASK 0x1
+#define SX_DEBUG_BUSY_2__COL_SCBD_BUSY__SHIFT 0x0
+#define SX_DEBUG_BUSY_2__COL_REQ3_FREECNT_NE0_MASK 0x2
+#define SX_DEBUG_BUSY_2__COL_REQ3_FREECNT

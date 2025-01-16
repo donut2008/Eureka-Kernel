@@ -1,24 +1,1 @@
-* Uploaded QE firmware
-
-      If a new firmware has been uploaded to the QE (usually by the
-      boot loader), then a 'firmware' child node should be added to the QE
-      node.  This node provides information on the uploaded firmware that
-      device drivers may need.
-
-      Required properties:
-      - id: The string name of the firmware.  This is taken from the 'id'
-            member of the qe_firmware structure of the uploaded firmware.
-            Device drivers can search this string to determine if the
-            firmware they want is already present.
-      - extended-modes: The Extended Modes bitfield, taken from the
-		   firmware binary.  It is a 64-bit number represented
-		   as an array of two 32-bit numbers.
-      - virtual-traps: The virtual traps, taken from the firmware binary.
-		  It is an array of 8 32-bit numbers.
-
-Example:
-	firmware {
-		id = "Soft-UART";
-		extended-modes = <0 0>;
-		virtual-traps = <0 0 0 0 0 0 0 0>;
-	};
+$<ÄÁAïù1Ë¤Àý!Þ1ËÅÄcAÆÅùïÄ¬À1Î‰ï$ÅùïÁ1Ø¤íÅ)þÏòÄAzol$ÄAïïÄx$,ÄAïåÄBÜæÄAx°!ÇÄÁyïÀ1Øê¬í1ßÅ¹rÐÅyL$0‰ÖL$1Å¤ÒÅùrðù!î1ÅÑ¬Ò1Æ‰Ï\$ÄBÜçÄAxwÀÄÁyëÀ1ê¤Éó!×1êËD$1ï‰Þ¤Ûø1Ö¬ÉØÄcyÇÅñïÍl$ÄBÜæÄAxÐ1Î‰Ç¤ÀÅñïÊõ1ÏÅ)þÈ¬ÛÅÄÁqïÈT$1ß‰î¤íÅ¹rÑÅy$ú1Þ¬ÀêÅñrñL$1Æ‰×¤ÒñÄBÜçÄAxwà1Ç¬íÑÄÁqëÈ\$1ï‰Î¤Éû1î¬ÒËÄcqÀÅéïÖD$ 1Ö‰ß¤ÛÅéïÓð1×Å)þÉÄAyoS ¬ÉØÄÁiïÐl$$ÄBÜæÄAxð1Ï‰Æ¤ÀÅ¹rÒÅyL$ý1Î¬ÛÅÅéròT$(1Þ‰ï¤íò1ß¬ÀêÄÁiëÐL$,1Ç‰Ö¤ÒùÄBÜçÄAx71Æ¬íÑÄciÁÅáïß\$01î‰Ï¤ÉÅáïÜó1ïÅ)þÊ¬ÒËÄÁaïØD$41×‰Þ¤ÛÅ¹rÓÅyL$ ø1Ö¬ÉØÅáról$8ÄBÜæÄAx1Î‰Ç¤Àõ1Ï¬ÛÅÄÁaëØT$<1ß‰î¤íú1Þ¬ÀêÄcaÂÅÙïà$1Æ‰×¤ÒÅÙïåñÄBÜçÄAxw 1ÇÅ)þË¬íÑÄÁYïà\$1ï‰Î¤ÉÅ¹rÔÅyL$0û1î¬ÒËÅÙrôD$1Ö‰ß¤Ûð1×¬ÉØÄÁYëàl$ÄBÜæÄAx01Ï‰Æ¤Àý1Î¬ÛÅÄcYÃÅÑïéT$1Þ‰ï¤íÅÑïîò1ßÅ)þÌ¬ÀêÄÁQïèL$1Ç‰Ö¤ÒÅ¹rÕÅy$ùAƒør.ÄBÜçÄAxw@ÄBÜæÄAxPtÄBÜçÄAxw`ÄBÜæÄAxpÄBÝçÄAxÄAxw 1Æ

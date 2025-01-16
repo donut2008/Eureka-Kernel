@@ -1,166 +1,112 @@
-/*
- * Copyright (C) 2012 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-#ifndef _LINUX_DM_BITSET_H
-#define _LINUX_DM_BITSET_H
-
-#include "dm-array.h"
-
-/*----------------------------------------------------------------*/
-
-/*
- * This bitset type is a thin wrapper round a dm_array of 64bit words.  It
- * uses a tiny, one word cache to reduce the number of array lookups and so
- * increase performance.
- *
- * Like the dm-array that it's based on, the caller needs to keep track of
- * the size of the bitset separately.  The underlying dm-array implicitly
- * knows how many words it's storing and will return -ENODATA if you try
- * and access an out of bounds word.  However, an out of bounds bit in the
- * final word will _not_ be detected, you have been warned.
- *
- * Bits are indexed from zero.
-
- * Typical use:
- *
- * a) Initialise a dm_disk_bitset structure with dm_disk_bitset_init().
- *    This describes the bitset and includes the cache.  It's not called it
- *    dm_bitset_info in line with other data structures because it does
- *    include instance data.
- *
- * b) Get yourself a root.  The root is the index of a block of data on the
- *    disk that holds a particular instance of an bitset.  You may have a
- *    pre existing root in your metadata that you wish to use, or you may
- *    want to create a brand new, empty bitset with dm_bitset_empty().
- *
- * Like the other data structures in this library, dm_bitset objects are
- * immutable between transactions.  Update functions will return you the
- * root for a _new_ array.  If you've incremented the old root, via
- * dm_tm_inc(), before calling the update function you may continue to use
- * it in parallel with the new root.
- *
- * Even read operations may trigger the cache to be flushed and as such
- * return a root for a new, updated bitset.
- *
- * c) resize a bitset with dm_bitset_resize().
- *
- * d) Set a bit with dm_bitset_set_bit().
- *
- * e) Clear a bit with dm_bitset_clear_bit().
- *
- * f) Test a bit with dm_bitset_test_bit().
- *
- * g) Flush all updates from the cache with dm_bitset_flush().
- *
- * h) Destroy the bitset with dm_bitset_del().  This tells the transaction
- *    manager that you're no longer using this data structure so it can
- *    recycle it's blocks.  (dm_bitset_dec() would be a better name for it,
- *    but del is in keeping with dm_btree_del()).
- */
-
-/*
- * Opaque object.  Unlike dm_array_info, you should have one of these per
- * bitset.  Initialise with dm_disk_bitset_init().
- */
-struct dm_disk_bitset {
-	struct dm_array_info array_info;
-
-	uint32_t current_index;
-	uint64_t current_bits;
-
-	bool current_index_set:1;
-	bool dirty:1;
-};
-
-/*
- * Sets up a dm_disk_bitset structure.  You don't need to do anything with
- * this structure when you finish using it.
- *
- * tm - the transaction manager that should supervise this structure
- * info - the structure being initialised
- */
-void dm_disk_bitset_init(struct dm_transaction_manager *tm,
-			 struct dm_disk_bitset *info);
-
-/*
- * Create an empty, zero length bitset.
- *
- * info - describes the bitset
- * new_root - on success, points to the new root block
- */
-int dm_bitset_empty(struct dm_disk_bitset *info, dm_block_t *new_root);
-
-/*
- * Resize the bitset.
- *
- * info - describes the bitset
- * old_root - the root block of the array on disk
- * old_nr_entries - the number of bits in the old bitset
- * new_nr_entries - the number of bits you want in the new bitset
- * default_value - the value for any new bits
- * new_root - on success, points to the new root block
- */
-int dm_bitset_resize(struct dm_disk_bitset *info, dm_block_t old_root,
-		     uint32_t old_nr_entries, uint32_t new_nr_entries,
-		     bool default_value, dm_block_t *new_root);
-
-/*
- * Frees the bitset.
- */
-int dm_bitset_del(struct dm_disk_bitset *info, dm_block_t root);
-
-/*
- * Set a bit.
- *
- * info - describes the bitset
- * root - the root block of the bitset
- * index - the bit index
- * new_root - on success, points to the new root block
- *
- * -ENODATA will be returned if the index is out of bounds.
- */
-int dm_bitset_set_bit(struct dm_disk_bitset *info, dm_block_t root,
-		      uint32_t index, dm_block_t *new_root);
-
-/*
- * Clears a bit.
- *
- * info - describes the bitset
- * root - the root block of the bitset
- * index - the bit index
- * new_root - on success, points to the new root block
- *
- * -ENODATA will be returned if the index is out of bounds.
- */
-int dm_bitset_clear_bit(struct dm_disk_bitset *info, dm_block_t root,
-			uint32_t index, dm_block_t *new_root);
-
-/*
- * Tests a bit.
- *
- * info - describes the bitset
- * root - the root block of the bitset
- * index - the bit index
- * new_root - on success, points to the new root block (cached values may have been written)
- * result - the bit value you're after
- *
- * -ENODATA will be returned if the index is out of bounds.
- */
-int dm_bitset_test_bit(struct dm_disk_bitset *info, dm_block_t root,
-		       uint32_t index, dm_block_t *new_root, bool *result);
-
-/*
- * Flush any cached changes to disk.
- *
- * info - describes the bitset
- * root - the root block of the bitset
- * new_root - on success, points to the new root block
- */
-int dm_bitset_flush(struct dm_disk_bitset *info, dm_block_t root,
-		    dm_block_t *new_root);
-
-/*----------------------------------------------------------------*/
-
-#endif /* _LINUX_DM_BITSET_H */
+IN_DATA_0_1__byte3_MASK 0xff000000
+#define EXT_API_IN_DATA_0_1__byte3__SHIFT 0x18
+#define EXT_API_IN_DATA_0_2__byte0_MASK 0xff
+#define EXT_API_IN_DATA_0_2__byte0__SHIFT 0x0
+#define EXT_API_IN_DATA_0_2__byte1_MASK 0xff00
+#define EXT_API_IN_DATA_0_2__byte1__SHIFT 0x8
+#define EXT_API_IN_DATA_0_2__byte2_MASK 0xff0000
+#define EXT_API_IN_DATA_0_2__byte2__SHIFT 0x10
+#define EXT_API_IN_DATA_0_2__byte3_MASK 0xff000000
+#define EXT_API_IN_DATA_0_2__byte3__SHIFT 0x18
+#define EXT_API_IN_DATA_0_3__byte0_MASK 0xff
+#define EXT_API_IN_DATA_0_3__byte0__SHIFT 0x0
+#define EXT_API_IN_DATA_0_3__byte1_MASK 0xff00
+#define EXT_API_IN_DATA_0_3__byte1__SHIFT 0x8
+#define EXT_API_IN_DATA_0_3__byte2_MASK 0xff0000
+#define EXT_API_IN_DATA_0_3__byte2__SHIFT 0x10
+#define EXT_API_IN_DATA_0_3__byte3_MASK 0xff000000
+#define EXT_API_IN_DATA_0_3__byte3__SHIFT 0x18
+#define EXT_API_OUT_DATA_0_0__byte0_MASK 0xff
+#define EXT_API_OUT_DATA_0_0__byte0__SHIFT 0x0
+#define EXT_API_OUT_DATA_0_0__byte1_MASK 0xff00
+#define EXT_API_OUT_DATA_0_0__byte1__SHIFT 0x8
+#define EXT_API_OUT_DATA_0_0__byte2_MASK 0xff0000
+#define EXT_API_OUT_DATA_0_0__byte2__SHIFT 0x10
+#define EXT_API_OUT_DATA_0_0__byte3_MASK 0xff000000
+#define EXT_API_OUT_DATA_0_0__byte3__SHIFT 0x18
+#define EXT_API_OUT_DATA_0_1__byte0_MASK 0xff
+#define EXT_API_OUT_DATA_0_1__byte0__SHIFT 0x0
+#define EXT_API_OUT_DATA_0_1__byte1_MASK 0xff00
+#define EXT_API_OUT_DATA_0_1__byte1__SHIFT 0x8
+#define EXT_API_OUT_DATA_0_1__byte2_MASK 0xff0000
+#define EXT_API_OUT_DATA_0_1__byte2__SHIFT 0x10
+#define EXT_API_OUT_DATA_0_1__byte3_MASK 0xff000000
+#define EXT_API_OUT_DATA_0_1__byte3__SHIFT 0x18
+#define EXT_API_OUT_DATA_0_2__byte0_MASK 0xff
+#define EXT_API_OUT_DATA_0_2__byte0__SHIFT 0x0
+#define EXT_API_OUT_DATA_0_2__byte1_MASK 0xff00
+#define EXT_API_OUT_DATA_0_2__byte1__SHIFT 0x8
+#define EXT_API_OUT_DATA_0_2__byte2_MASK 0xff0000
+#define EXT_API_OUT_DATA_0_2__byte2__SHIFT 0x10
+#define EXT_API_OUT_DATA_0_2__byte3_MASK 0xff000000
+#define EXT_API_OUT_DATA_0_2__byte3__SHIFT 0x18
+#define EXT_API_OUT_DATA_0_3__byte0_MASK 0xff
+#define EXT_API_OUT_DATA_0_3__byte0__SHIFT 0x0
+#define EXT_API_OUT_DATA_0_3__byte1_MASK 0xff00
+#define EXT_API_OUT_DATA_0_3__byte1__SHIFT 0x8
+#define EXT_API_OUT_DATA_0_3__byte2_MASK 0xff0000
+#define EXT_API_OUT_DATA_0_3__byte2__SHIFT 0x10
+#define EXT_API_OUT_DATA_0_3__byte3_MASK 0xff000000
+#define EXT_API_OUT_DATA_0_3__byte3__SHIFT 0x18
+#define BAPM_PARAMETERS__MaxPwrCpu_1_MASK 0xff
+#define BAPM_PARAMETERS__MaxPwrCpu_1__SHIFT 0x0
+#define BAPM_PARAMETERS__NomPwrCpu_1_MASK 0xff00
+#define BAPM_PARAMETERS__NomPwrCpu_1__SHIFT 0x8
+#define BAPM_PARAMETERS__MaxPwrCpu_0_MASK 0xff0000
+#define BAPM_PARAMETERS__MaxPwrCpu_0__SHIFT 0x10
+#define BAPM_PARAMETERS__NomPwrCpu_0_MASK 0xff000000
+#define BAPM_PARAMETERS__NomPwrCpu_0__SHIFT 0x18
+#define BAPM_PARAMETERS_2__MaxPwrGpu_MASK 0xffff
+#define BAPM_PARAMETERS_2__MaxPwrGpu__SHIFT 0x0
+#define BAPM_PARAMETERS_2__NomPwrGpu_MASK 0xffff0000
+#define BAPM_PARAMETERS_2__NomPwrGpu__SHIFT 0x10
+#define BAPM_PARAMETERS_3__TjOffset_MASK 0xff
+#define BAPM_PARAMETERS_3__TjOffset__SHIFT 0x0
+#define BAPM_PARAMETERS_3__EnergyCntNorm_MASK 0x3ff00
+#define BAPM_PARAMETERS_3__EnergyCntNorm__SHIFT 0x8
+#define BAPM_PARAMETERS_3__Reserved_MASK 0xfffc0000
+#define BAPM_PARAMETERS_3__Reserved__SHIFT 0x12
+#define BAPM_PARAMETERS_4__MinPwrGpu_MASK 0xffff
+#define BAPM_PARAMETERS_4__MinPwrGpu__SHIFT 0x0
+#define BAPM_PARAMETERS_4__MidPwrCpu_1_MASK 0xff0000
+#define BAPM_PARAMETERS_4__MidPwrCpu_1__SHIFT 0x10
+#define BAPM_PARAMETERS_4__MidPwrCpu_0_MASK 0xff000000
+#define BAPM_PARAMETERS_4__MidPwrCpu_0__SHIFT 0x18
+#define SMU_SVI_TELEMETRY__Iddspike_OCP_MASK 0xffff
+#define SMU_SVI_TELEMETRY__Iddspike_OCP__SHIFT 0x0
+#define SMU_SVI_TELEMETRY__IddNbspike_OCP_MASK 0xffff0000
+#define SMU_SVI_TELEMETRY__IddNbspike_OCP__SHIFT 0x10
+#define BAPM_STATUS__THROTTLE_MASK 0xff
+#define BAPM_STATUS__THROTTLE__SHIFT 0x0
+#define BAPM_STATUS__THROTTLE_LAST_MASK 0xff00
+#define BAPM_STATUS__THROTTLE_LAST__SHIFT 0x8
+#define BAPM_STATUS__COUNT_CORE1_MASK 0xff0000
+#define BAPM_STATUS__COUNT_CORE1__SHIFT 0x10
+#define BAPM_STATUS__COUNT_CORE0_MASK 0xff000000
+#define BAPM_STATUS__COUNT_CORE0__SHIFT 0x18
+#define SMU_HTC_STATUS__HTC_ACTIVE_MASK 0x1
+#define SMU_HTC_STATUS__HTC_ACTIVE__SHIFT 0x0
+#define SMU_HTC_STATUS__Reserved_MASK 0xfffffffe
+#define SMU_HTC_STATUS__Reserved__SHIFT 0x1
+#define SMU_VPC_STATUS__AllCpuIdleLast_MASK 0x1
+#define SMU_VPC_STATUS__AllCpuIdleLast__SHIFT 0x0
+#define SMU_VPC_STATUS__Reserved_MASK 0xfffffffe
+#define SMU_VPC_STATUS__Reserved__SHIFT 0x1
+#define ENTITY_TEMPERATURES_1__CORE0_MASK 0xffffffff
+#define ENTITY_TEMPERATURES_1__CORE0__SHIFT 0x0
+#define ENTITY_TEMPERATURES_2__CORE1_MASK 0xffffffff
+#define ENTITY_TEMPERATURES_2__CORE1__SHIFT 0x0
+#define ENTITY_TEMPERATURES_3__GPU_MASK 0xffffffff
+#define ENTITY_TEMPERATURES_3__GPU__SHIFT 0x0
+#define CU_POWER__CU0_POWER_MASK 0xffff
+#define CU_POWER__CU0_POWER__SHIFT 0x0
+#define CU_POWER__CU1_POWER_MASK 0xffff0000
+#define CU_POWER__CU1_POWER__SHIFT 0x10
+#define GPU_POWER__IGPU_POWER_MASK 0xffff
+#define GPU_POWER__IGPU_POWER__SHIFT 0x0
+#define GPU_POWER__DGPU_POWER_MASK 0xffff0000
+#define GPU_POWER__DGPU_POWER__SHIFT 0x10
+#define NTE_POWER__NTE0_POWER_MASK 0xffff
+#define NTE_POWER__NTE0_POWER__SHIFT 0x0
+#define NTE_POWER__NTE1_POWER_MASK 0xffff0000
+#define NTE_POWER__NTE1_POWER__SH

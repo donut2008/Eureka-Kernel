@@ -1,27 +1,9 @@
-
-config BCACHE
-	tristate "Block device as cache"
-	depends on !PREEMPT_RT_FULL
-	---help---
-	Allows a block device to be used as cache for other devices; uses
-	a btree for indexing and the layout is optimized for SSDs.
-
-	See Documentation/bcache.txt for details.
-
-config BCACHE_DEBUG
-	bool "Bcache debugging"
-	depends on BCACHE
-	---help---
-	Don't select this option unless you're a developer
-
-	Enables extra debugging tools, allows expensive runtime checks to be
-	turned on.
-
-config BCACHE_CLOSURES_DEBUG
-	bool "Debug closures"
-	depends on BCACHE
-	select DEBUG_FS
-	---help---
-	Keeps all active closures in a linked list and provides a debugfs
-	interface to list them, which makes it possible to see asynchronous
-	operations that get stuck.
+                                 0x3f114
+#define ixDPM_TABLE_71                                                          0x3f118
+#define ixDPM_TABLE_72                                                          0x3f11c
+#define ixDPM_TABLE_73                                                          0x3f120
+#define ixDPM_TABLE_74                                                          0x3f124
+#define ixDPM_TABLE_75                                                          0x3f128
+#define ixDPM_TABLE_76                                                          0x3f12c
+#define ixDPM_TABLE_77                                                          0x3f130
+#define ixDPM_TABLE_78                                                          0

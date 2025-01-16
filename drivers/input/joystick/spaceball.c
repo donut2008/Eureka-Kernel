@@ -1,305 +1,323 @@
-/*
- *  Copyright (c) 1999-2001 Vojtech Pavlik
- *
- *  Based on the work of:
- *	David Thompson
- *	Joseph Krahn
- */
+errupt
+		 * during a chip reset.
+		 */
+		return IRQ_HANDLED;
 
-/*
- * SpaceTec SpaceBall 2003/3003/4000 FLX driver for Linux
- */
+	this_cpu_inc(*dd->int_counter);
 
-/*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- *
- *  Should you need to contact me, the author, you can do so either by
- * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
- * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
- */
+	/* Clear the interrupt bit we expect to be set. */
+	qib_write_kreg(dd, kr_intclear, ((1ULL << QIB_I_RCVAVAIL_LSB) |
+		       (1ULL << QIB_I_RCVURG_LSB)) << rcd->ctxt);
 
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/serio.h>
-#include <asm/unaligned.h>
+	qib_kreceive(rcd, NULL, &npkts);
 
-#define DRIVER_DESC	"SpaceTec SpaceBall 2003/3003/4000 FLX driver"
-
-MODULE_AUTHOR("Vojtech Pavlik <vojtech@ucw.cz>");
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-
-/*
- * Constants.
- */
-
-#define SPACEBALL_MAX_LENGTH	128
-#define SPACEBALL_MAX_ID	9
-
-#define SPACEBALL_1003      1
-#define SPACEBALL_2003B     3
-#define SPACEBALL_2003C     4
-#define SPACEBALL_3003C     7
-#define SPACEBALL_4000FLX   8
-#define SPACEBALL_4000FLX_L 9
-
-static int spaceball_axes[] = { ABS_X, ABS_Z, ABS_Y, ABS_RX, ABS_RZ, ABS_RY };
-static char *spaceball_names[] = {
-	"?", "SpaceTec SpaceBall 1003", "SpaceTec SpaceBall 2003", "SpaceTec SpaceBall 2003B",
-	"SpaceTec SpaceBall 2003C", "SpaceTec SpaceBall 3003", "SpaceTec SpaceBall SpaceController",
-	"SpaceTec SpaceBall 3003C", "SpaceTec SpaceBall 4000FLX", "SpaceTec SpaceBall 4000FLX Lefty" };
-
-/*
- * Per-Ball data.
- */
-
-struct spaceball {
-	struct input_dev *dev;
-	int idx;
-	int escape;
-	unsigned char data[SPACEBALL_MAX_LENGTH];
-	char phys[32];
-};
-
-/*
- * spaceball_process_packet() decodes packets the driver receives from the
- * SpaceBall.
- */
-
-static void spaceball_process_packet(struct spaceball* spaceball)
-{
-	struct input_dev *dev = spaceball->dev;
-	unsigned char *data = spaceball->data;
-	int i;
-
-	if (spaceball->idx < 2) return;
-
-	switch (spaceball->data[0]) {
-
-		case 'D':					/* Ball data */
-			if (spaceball->idx != 15) return;
-			/*
-			 * Skip first three bytes; read six axes worth of data.
-			 * Axis values are signed 16-bit big-endian.
-			 */
-			data += 3;
-			for (i = 0; i < ARRAY_SIZE(spaceball_axes); i++) {
-				input_report_abs(dev, spaceball_axes[i],
-					(__s16)get_unaligned_be16(&data[i * 2]));
-			}
-			break;
-
-		case 'K':					/* Button data */
-			if (spaceball->idx != 3) return;
-			input_report_key(dev, BTN_1, (data[2] & 0x01) || (data[2] & 0x20));
-			input_report_key(dev, BTN_2, data[2] & 0x02);
-			input_report_key(dev, BTN_3, data[2] & 0x04);
-			input_report_key(dev, BTN_4, data[2] & 0x08);
-			input_report_key(dev, BTN_5, data[1] & 0x01);
-			input_report_key(dev, BTN_6, data[1] & 0x02);
-			input_report_key(dev, BTN_7, data[1] & 0x04);
-			input_report_key(dev, BTN_8, data[1] & 0x10);
-			break;
-
-		case '.':					/* Advanced button data */
-			if (spaceball->idx != 3) return;
-			input_report_key(dev, BTN_1, data[2] & 0x01);
-			input_report_key(dev, BTN_2, data[2] & 0x02);
-			input_report_key(dev, BTN_3, data[2] & 0x04);
-			input_report_key(dev, BTN_4, data[2] & 0x08);
-			input_report_key(dev, BTN_5, data[2] & 0x10);
-			input_report_key(dev, BTN_6, data[2] & 0x20);
-			input_report_key(dev, BTN_7, data[2] & 0x80);
-			input_report_key(dev, BTN_8, data[1] & 0x01);
-			input_report_key(dev, BTN_9, data[1] & 0x02);
-			input_report_key(dev, BTN_A, data[1] & 0x04);
-			input_report_key(dev, BTN_B, data[1] & 0x08);
-			input_report_key(dev, BTN_C, data[1] & 0x10);
-			input_report_key(dev, BTN_MODE, data[1] & 0x20);
-			break;
-
-		case 'E':					/* Device error */
-			spaceball->data[spaceball->idx - 1] = 0;
-			printk(KERN_ERR "spaceball: Device error. [%s]\n", spaceball->data + 1);
-			break;
-
-		case '?':					/* Bad command packet */
-			spaceball->data[spaceball->idx - 1] = 0;
-			printk(KERN_ERR "spaceball: Bad command. [%s]\n", spaceball->data + 1);
-			break;
-	}
-
-	input_sync(dev);
-}
-
-/*
- * Spaceball 4000 FLX packets all start with a one letter packet-type decriptor,
- * and end in 0x0d. It uses '^' as an escape for CR, XOFF and XON characters which
- * can occur in the axis values.
- */
-
-static irqreturn_t spaceball_interrupt(struct serio *serio,
-		unsigned char data, unsigned int flags)
-{
-	struct spaceball *spaceball = serio_get_drvdata(serio);
-
-	switch (data) {
-		case 0xd:
-			spaceball_process_packet(spaceball);
-			spaceball->idx = 0;
-			spaceball->escape = 0;
-			break;
-		case '^':
-			if (!spaceball->escape) {
-				spaceball->escape = 1;
-				break;
-			}
-			spaceball->escape = 0;
-		case 'M':
-		case 'Q':
-		case 'S':
-			if (spaceball->escape) {
-				spaceball->escape = 0;
-				data &= 0x1f;
-			}
-		default:
-			if (spaceball->escape)
-				spaceball->escape = 0;
-			if (spaceball->idx < SPACEBALL_MAX_LENGTH)
-				spaceball->data[spaceball->idx++] = data;
-			break;
-	}
 	return IRQ_HANDLED;
 }
 
 /*
- * spaceball_disconnect() is the opposite of spaceball_connect()
+ * Dedicated Send buffer available interrupt handler.
  */
-
-static void spaceball_disconnect(struct serio *serio)
+static irqreturn_t qib_7322bufavail(int irq, void *data)
 {
-	struct spaceball* spaceball = serio_get_drvdata(serio);
+	struct qib_devdata *dd = data;
 
-	serio_close(serio);
-	serio_set_drvdata(serio, NULL);
-	input_unregister_device(spaceball->dev);
-	kfree(spaceball);
+	if ((dd->flags & (QIB_PRESENT | QIB_BADINTR)) != QIB_PRESENT)
+		/*
+		 * This return value is not great, but we do not want the
+		 * interrupt core code to remove our interrupt handler
+		 * because we don't appear to be handling an interrupt
+		 * during a chip reset.
+		 */
+		return IRQ_HANDLED;
+
+	this_cpu_inc(*dd->int_counter);
+
+	/* Clear the interrupt bit we expect to be set. */
+	qib_write_kreg(dd, kr_intclear, QIB_I_SPIOBUFAVAIL);
+
+	/* qib_ib_piobufavail() will clear the want PIO interrupt if needed */
+	if (dd->flags & QIB_INITTED)
+		qib_ib_piobufavail(dd);
+	else
+		qib_wantpiobuf_7322_intr(dd, 0);
+
+	return IRQ_HANDLED;
 }
 
 /*
- * spaceball_connect() is the routine that is called when someone adds a
- * new serio device that supports Spaceball protocol and registers it as
- * an input device.
+ * Dedicated Send DMA interrupt handler.
  */
-
-static int spaceball_connect(struct serio *serio, struct serio_driver *drv)
+static irqreturn_t sdma_intr(int irq, void *data)
 {
-	struct spaceball *spaceball;
-	struct input_dev *input_dev;
-	int err = -ENOMEM;
-	int i, id;
+	struct qib_pportdata *ppd = data;
+	struct qib_devdata *dd = ppd->dd;
 
-	if ((id = serio->id.id) > SPACEBALL_MAX_ID)
-		return -ENODEV;
+	if ((dd->flags & (QIB_PRESENT | QIB_BADINTR)) != QIB_PRESENT)
+		/*
+		 * This return value is not great, but we do not want the
+		 * interrupt core code to remove our interrupt handler
+		 * because we don't appear to be handling an interrupt
+		 * during a chip reset.
+		 */
+		return IRQ_HANDLED;
 
-	spaceball = kmalloc(sizeof(struct spaceball), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!spaceball || !input_dev)
-		goto fail1;
+	this_cpu_inc(*dd->int_counter);
 
-	spaceball->dev = input_dev;
-	snprintf(spaceball->phys, sizeof(spaceball->phys), "%s/input0", serio->phys);
+	/* Clear the interrupt bit we expect to be set. */
+	qib_write_kreg(dd, kr_intclear, ppd->hw_pidx ?
+		       INT_MASK_P(SDma, 1) : INT_MASK_P(SDma, 0));
+	qib_sdma_intr(ppd);
 
-	input_dev->name = spaceball_names[id];
-	input_dev->phys = spaceball->phys;
-	input_dev->id.bustype = BUS_RS232;
-	input_dev->id.vendor = SERIO_SPACEBALL;
-	input_dev->id.product = id;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &serio->dev;
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
-
-	switch (id) {
-		case SPACEBALL_4000FLX:
-		case SPACEBALL_4000FLX_L:
-			input_dev->keybit[BIT_WORD(BTN_0)] |= BIT_MASK(BTN_9);
-			input_dev->keybit[BIT_WORD(BTN_A)] |= BIT_MASK(BTN_A) |
-				BIT_MASK(BTN_B) | BIT_MASK(BTN_C) |
-				BIT_MASK(BTN_MODE);
-		default:
-			input_dev->keybit[BIT_WORD(BTN_0)] |= BIT_MASK(BTN_2) |
-				BIT_MASK(BTN_3) | BIT_MASK(BTN_4) |
-				BIT_MASK(BTN_5) | BIT_MASK(BTN_6) |
-				BIT_MASK(BTN_7) | BIT_MASK(BTN_8);
-		case SPACEBALL_3003C:
-			input_dev->keybit[BIT_WORD(BTN_0)] |= BIT_MASK(BTN_1) |
-				BIT_MASK(BTN_8);
-	}
-
-	for (i = 0; i < 3; i++) {
-		input_set_abs_params(input_dev, ABS_X + i, -8000, 8000, 8, 40);
-		input_set_abs_params(input_dev, ABS_RX + i, -1600, 1600, 2, 8);
-	}
-
-	serio_set_drvdata(serio, spaceball);
-
-	err = serio_open(serio, drv);
-	if (err)
-		goto fail2;
-
-	err = input_register_device(spaceball->dev);
-	if (err)
-		goto fail3;
-
-	return 0;
-
- fail3:	serio_close(serio);
- fail2:	serio_set_drvdata(serio, NULL);
- fail1:	input_free_device(input_dev);
-	kfree(spaceball);
-	return err;
+	return IRQ_HANDLED;
 }
 
 /*
- * The serio driver structure.
+ * Dedicated Send DMA idle interrupt handler.
  */
+static irqreturn_t sdma_idle_intr(int irq, void *data)
+{
+	struct qib_pportdata *ppd = data;
+	struct qib_devdata *dd = ppd->dd;
 
-static struct serio_device_id spaceball_serio_ids[] = {
-	{
-		.type	= SERIO_RS232,
-		.proto	= SERIO_SPACEBALL,
-		.id	= SERIO_ANY,
-		.extra	= SERIO_ANY,
-	},
-	{ 0 }
-};
+	if ((dd->flags & (QIB_PRESENT | QIB_BADINTR)) != QIB_PRESENT)
+		/*
+		 * This return value is not great, but we do not want the
+		 * interrupt core code to remove our interrupt handler
+		 * because we don't appear to be handling an interrupt
+		 * during a chip reset.
+		 */
+		return IRQ_HANDLED;
 
-MODULE_DEVICE_TABLE(serio, spaceball_serio_ids);
+	this_cpu_inc(*dd->int_counter);
 
-static struct serio_driver spaceball_drv = {
-	.driver		= {
-		.name	= "spaceball",
-	},
-	.description	= DRIVER_DESC,
-	.id_table	= spaceball_serio_ids,
-	.interrupt	= spaceball_interrupt,
-	.connect	= spaceball_connect,
-	.disconnect	= spaceball_disconnect,
-};
+	/* Clear the interrupt bit we expect to be set. */
+	qib_write_kreg(dd, kr_intclear, ppd->hw_pidx ?
+		       INT_MASK_P(SDmaIdle, 1) : INT_MASK_P(SDmaIdle, 0));
+	qib_sdma_intr(ppd);
 
-module_serio_driver(spaceball_drv);
+	return IRQ_HANDLED;
+}
+
+/*
+ * Dedicated Send DMA progress interrupt handler.
+ */
+static irqreturn_t sdma_progress_intr(int irq, void *data)
+{
+	struct qib_pportdata *ppd = data;
+	struct qib_devdata *dd = ppd->dd;
+
+	if ((dd->flags & (QIB_PRESENT | QIB_BADINTR)) != QIB_PRESENT)
+		/*
+		 * This return value is not great, but we do not want the
+		 * interrupt core code to remove our interrupt handler
+		 * because we don't appear to be handling an interrupt
+		 * during a chip reset.
+		 */
+		return IRQ_HANDLED;
+
+	this_cpu_inc(*dd->int_counter);
+
+	/* Clear the interrupt bit we expect to be set. */
+	qib_write_kreg(dd, kr_intclear, ppd->hw_pidx ?
+		       INT_MASK_P(SDmaProgress, 1) :
+		       INT_MASK_P(SDmaProgress, 0));
+	qib_sdma_intr(ppd);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * Dedicated Send DMA cleanup interrupt handler.
+ */
+static irqreturn_t sdma_cleanup_intr(int irq, void *data)
+{
+	struct qib_pportdata *ppd = data;
+	struct qib_devdata *dd = ppd->dd;
+
+	if ((dd->flags & (QIB_PRESENT | QIB_BADINTR)) != QIB_PRESENT)
+		/*
+		 * This return value is not great, but we do not want the
+		 * interrupt core code to remove our interrupt handler
+		 * because we don't appear to be handling an interrupt
+		 * during a chip reset.
+		 */
+		return IRQ_HANDLED;
+
+	this_cpu_inc(*dd->int_counter);
+
+	/* Clear the interrupt bit we expect to be set. */
+	qib_write_kreg(dd, kr_intclear, ppd->hw_pidx ?
+		       INT_MASK_PM(SDmaCleanupDone, 1) :
+		       INT_MASK_PM(SDmaCleanupDone, 0));
+	qib_sdma_process_event(ppd, qib_sdma_event_e20_hw_started);
+
+	return IRQ_HANDLED;
+}
+
+#ifdef CONFIG_INFINIBAND_QIB_DCA
+
+static void reset_dca_notifier(struct qib_devdata *dd, struct qib_msix_entry *m)
+{
+	if (!m->dca)
+		return;
+	qib_devinfo(dd->pcidev,
+		"Disabling notifier on HCA %d irq %d\n",
+		dd->unit,
+		m->msix.vector);
+	irq_set_affinity_notifier(
+		m->msix.vector,
+		NULL);
+	m->notifier = NULL;
+}
+
+static void setup_dca_notifier(struct qib_devdata *dd, struct qib_msix_entry *m)
+{
+	struct qib_irq_notify *n;
+
+	if (!m->dca)
+		return;
+	n = kzalloc(sizeof(*n), GFP_KERNEL);
+	if (n) {
+		int ret;
+
+		m->notifier = n;
+		n->notify.irq = m->msix.vector;
+		n->notify.notify = qib_irq_notifier_notify;
+		n->notify.release = qib_irq_notifier_release;
+		n->arg = m->arg;
+		n->rcv = m->rcv;
+		qib_devinfo(dd->pcidev,
+			"set notifier irq %d rcv %d notify %p\n",
+			n->notify.irq, n->rcv, &n->notify);
+		ret = irq_set_affinity_notifier(
+				n->notify.irq,
+				&n->notify);
+		if (ret) {
+			m->notifier = NULL;
+			kfree(n);
+		}
+	}
+}
+
+#endif
+
+/*
+ * Set up our chip-specific interrupt handler.
+ * The interrupt type has already been setup, so
+ * we just need to do the registration and error checking.
+ * If we are using MSIx interrupts, we may fall back to
+ * INTx later, if the interrupt handler doesn't get called
+ * within 1/2 second (see verify_interrupt()).
+ */
+static void qib_setup_7322_interrupt(struct qib_devdata *dd, int clearpend)
+{
+	int ret, i, msixnum;
+	u64 redirect[6];
+	u64 mask;
+	const struct cpumask *local_mask;
+	int firstcpu, secondcpu = 0, currrcvcpu = 0;
+
+	if (!dd->num_pports)
+		return;
+
+	if (clearpend) {
+		/*
+		 * if not switching interrupt types, be sure interrupts are
+		 * disabled, and then clear anything pending at this point,
+		 * because we are starting clean.
+		 */
+		qib_7322_set_intr_state(dd, 0);
+
+		/* clear the reset error, init error/hwerror mask */
+		qib_7322_init_hwerrors(dd);
+
+		/* clear any interrupt bits that might be set */
+		qib_write_kreg(dd, kr_intclear, ~0ULL);
+
+		/* make sure no pending MSIx intr, and clear diag reg */
+		qib_write_kreg(dd, kr_intgranted, ~0ULL);
+		qib_write_kreg(dd, kr_vecclr_wo_int, ~0ULL);
+	}
+
+	if (!dd->cspec->num_msix_entries) {
+		/* Try to get INTx interrupt */
+try_intx:
+		if (!dd->pcidev->irq) {
+			qib_dev_err(dd,
+				"irq is 0, BIOS error?  Interrupts won't work\n");
+			goto bail;
+		}
+		ret = request_irq(dd->pcidev->irq, qib_7322intr,
+				  IRQF_SHARED, QIB_DRV_NAME, dd);
+		if (ret) {
+			qib_dev_err(dd,
+				"Couldn't setup INTx interrupt (irq=%d): %d\n",
+				dd->pcidev->irq, ret);
+			goto bail;
+		}
+		dd->cspec->irq = dd->pcidev->irq;
+		dd->cspec->main_int_mask = ~0ULL;
+		goto bail;
+	}
+
+	/* Try to get MSIx interrupts */
+	memset(redirect, 0, sizeof(redirect));
+	mask = ~0ULL;
+	msixnum = 0;
+	local_mask = cpumask_of_pcibus(dd->pcidev->bus);
+	firstcpu = cpumask_first(local_mask);
+	if (firstcpu >= nr_cpu_ids ||
+			cpumask_weight(local_mask) == num_online_cpus()) {
+		local_mask = topology_core_cpumask(0);
+		firstcpu = cpumask_first(local_mask);
+	}
+	if (firstcpu < nr_cpu_ids) {
+		secondcpu = cpumask_next(firstcpu, local_mask);
+		if (secondcpu >= nr_cpu_ids)
+			secondcpu = firstcpu;
+		currrcvcpu = secondcpu;
+	}
+	for (i = 0; msixnum < dd->cspec->num_msix_entries; i++) {
+		irq_handler_t handler;
+		void *arg;
+		u64 val;
+		int lsb, reg, sh;
+#ifdef CONFIG_INFINIBAND_QIB_DCA
+		int dca = 0;
+#endif
+
+		dd->cspec->msix_entries[msixnum].
+			name[sizeof(dd->cspec->msix_entries[msixnum].name) - 1]
+			= '\0';
+		if (i < ARRAY_SIZE(irq_table)) {
+			if (irq_table[i].port) {
+				/* skip if for a non-configured port */
+				if (irq_table[i].port > dd->num_pports)
+					continue;
+				arg = dd->pport + irq_table[i].port - 1;
+			} else
+				arg = dd;
+#ifdef CONFIG_INFINIBAND_QIB_DCA
+			dca = irq_table[i].dca;
+#endif
+			lsb = irq_table[i].lsb;
+			handler = irq_table[i].handler;
+			snprintf(dd->cspec->msix_entries[msixnum].name,
+				sizeof(dd->cspec->msix_entries[msixnum].name)
+				 - 1,
+				QIB_DRV_NAME "%d%s", dd->unit,
+				irq_table[i].name);
+		} else {
+			unsigned ctxt;
+
+			ctxt = i - ARRAY_SIZE(irq_table);
+			/* per krcvq context receive interrupt */
+			arg = dd->rcd[ctxt];
+			if (!arg)
+				continue;
+			if (qib_krcvq01_no_msi && ctxt < 2)
+				continue;
+#ifdef CONFIG_INFINIBAND_QIB_DCA
+			dca = 1;
+#endif
+			lsb = QIB_I_RCVAVAIL_LSB + ct

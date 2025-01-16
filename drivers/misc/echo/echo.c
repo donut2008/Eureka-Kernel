@@ -1,674 +1,325 @@
-/*
- * SpanDSP - a series of DSP components for telephony
- *
- * echo.c - A line echo canceller.  This code is being developed
- *          against and partially complies with G168.
- *
- * Written by Steve Underwood <steveu@coppice.org>
- *         and David Rowe <david_at_rowetel_dot_com>
- *
- * Copyright (C) 2001, 2003 Steve Underwood, 2007 David Rowe
- *
- * Based on a bit from here, a bit from there, eye of toad, ear of
- * bat, 15 years of failed attempts by David and a few fried brain
- * cells.
- *
- * All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2, as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-/*! \file */
-
-/* Implementation Notes
-   David Rowe
-   April 2007
-
-   This code started life as Steve's NLMS algorithm with a tap
-   rotation algorithm to handle divergence during double talk.  I
-   added a Geigel Double Talk Detector (DTD) [2] and performed some
-   G168 tests.  However I had trouble meeting the G168 requirements,
-   especially for double talk - there were always cases where my DTD
-   failed, for example where near end speech was under the 6dB
-   threshold required for declaring double talk.
-
-   So I tried a two path algorithm [1], which has so far given better
-   results.  The original tap rotation/Geigel algorithm is available
-   in SVN http://svn.rowetel.com/software/oslec/tags/before_16bit.
-   It's probably possible to make it work if some one wants to put some
-   serious work into it.
-
-   At present no special treatment is provided for tones, which
-   generally cause NLMS algorithms to diverge.  Initial runs of a
-   subset of the G168 tests for tones (e.g ./echo_test 6) show the
-   current algorithm is passing OK, which is kind of surprising.  The
-   full set of tests needs to be performed to confirm this result.
-
-   One other interesting change is that I have managed to get the NLMS
-   code to work with 16 bit coefficients, rather than the original 32
-   bit coefficents.  This reduces the MIPs and storage required.
-   I evaulated the 16 bit port using g168_tests.sh and listening tests
-   on 4 real-world samples.
-
-   I also attempted the implementation of a block based NLMS update
-   [2] but although this passes g168_tests.sh it didn't converge well
-   on the real-world samples.  I have no idea why, perhaps a scaling
-   problem.  The block based code is also available in SVN
-   http://svn.rowetel.com/software/oslec/tags/before_16bit.  If this
-   code can be debugged, it will lead to further reduction in MIPS, as
-   the block update code maps nicely onto DSP instruction sets (it's a
-   dot product) compared to the current sample-by-sample update.
-
-   Steve also has some nice notes on echo cancellers in echo.h
-
-   References:
-
-   [1] Ochiai, Areseki, and Ogihara, "Echo Canceller with Two Echo
-       Path Models", IEEE Transactions on communications, COM-25,
-       No. 6, June
-       1977.
-       http://www.rowetel.com/images/echo/dual_path_paper.pdf
-
-   [2] The classic, very useful paper that tells you how to
-       actually build a real world echo canceller:
-	 Messerschmitt, Hedberg, Cole, Haoui, Winship, "Digital Voice
-	 Echo Canceller with a TMS320020,
-	 http://www.rowetel.com/images/echo/spra129.pdf
-
-   [3] I have written a series of blog posts on this work, here is
-       Part 1: http://www.rowetel.com/blog/?p=18
-
-   [4] The source code http://svn.rowetel.com/software/oslec/
-
-   [5] A nice reference on LMS filters:
-	 http://en.wikipedia.org/wiki/Least_mean_squares_filter
-
-   Credits:
-
-   Thanks to Steve Underwood, Jean-Marc Valin, and Ramakrishnan
-   Muthukrishnan for their suggestions and email discussions.  Thanks
-   also to those people who collected echo samples for me such as
-   Mark, Pawel, and Pavel.
-*/
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-
-#include "echo.h"
-
-#define MIN_TX_POWER_FOR_ADAPTION	64
-#define MIN_RX_POWER_FOR_ADAPTION	64
-#define DTD_HANGOVER			600	/* 600 samples, or 75ms     */
-#define DC_LOG2BETA			3	/* log2() of DC filter Beta */
-
-/* adapting coeffs using the traditional stochastic descent (N)LMS algorithm */
-
-#ifdef __bfin__
-static inline void lms_adapt_bg(struct oslec_state *ec, int clean, int shift)
-{
-	int i;
-	int offset1;
-	int offset2;
-	int factor;
-	int exp;
-	int16_t *phist;
-	int n;
-
-	if (shift > 0)
-		factor = clean << shift;
-	else
-		factor = clean >> -shift;
-
-	/* Update the FIR taps */
-
-	offset2 = ec->curr_pos;
-	offset1 = ec->taps - offset2;
-	phist = &ec->fir_state_bg.history[offset2];
-
-	/* st: and en: help us locate the assembler in echo.s */
-
-	/* asm("st:"); */
-	n = ec->taps;
-	for (i = 0; i < n; i++) {
-		exp = *phist++ * factor;
-		ec->fir_taps16[1][i] += (int16_t) ((exp + (1 << 14)) >> 15);
-	}
-	/* asm("en:"); */
-
-	/* Note the asm for the inner loop above generated by Blackfin gcc
-	   4.1.1 is pretty good (note even parallel instructions used):
-
-	   R0 = W [P0++] (X);
-	   R0 *= R2;
-	   R0 = R0 + R3 (NS) ||
-	   R1 = W [P1] (X) ||
-	   nop;
-	   R0 >>>= 15;
-	   R0 = R0 + R1;
-	   W [P1++] = R0;
-
-	   A block based update algorithm would be much faster but the
-	   above can't be improved on much.  Every instruction saved in
-	   the loop above is 2 MIPs/ch!  The for loop above is where the
-	   Blackfin spends most of it's time - about 17 MIPs/ch measured
-	   with speedtest.c with 256 taps (32ms).  Write-back and
-	   Write-through cache gave about the same performance.
-	 */
-}
-
-/*
-   IDEAS for further optimisation of lms_adapt_bg():
-
-   1/ The rounding is quite costly.  Could we keep as 32 bit coeffs
-   then make filter pluck the MS 16-bits of the coeffs when filtering?
-   However this would lower potential optimisation of filter, as I
-   think the dual-MAC architecture requires packed 16 bit coeffs.
-
-   2/ Block based update would be more efficient, as per comments above,
-   could use dual MAC architecture.
-
-   3/ Look for same sample Blackfin LMS code, see if we can get dual-MAC
-   packing.
-
-   4/ Execute the whole e/c in a block of say 20ms rather than sample
-   by sample.  Processing a few samples every ms is inefficient.
-*/
-
-#else
-static inline void lms_adapt_bg(struct oslec_state *ec, int clean, int shift)
-{
-	int i;
-
-	int offset1;
-	int offset2;
-	int factor;
-	int exp;
-
-	if (shift > 0)
-		factor = clean << shift;
-	else
-		factor = clean >> -shift;
-
-	/* Update the FIR taps */
-
-	offset2 = ec->curr_pos;
-	offset1 = ec->taps - offset2;
-
-	for (i = ec->taps - 1; i >= offset1; i--) {
-		exp = (ec->fir_state_bg.history[i - offset1] * factor);
-		ec->fir_taps16[1][i] += (int16_t) ((exp + (1 << 14)) >> 15);
-	}
-	for (; i >= 0; i--) {
-		exp = (ec->fir_state_bg.history[i + offset2] * factor);
-		ec->fir_taps16[1][i] += (int16_t) ((exp + (1 << 14)) >> 15);
-	}
-}
-#endif
-
-static inline int top_bit(unsigned int bits)
-{
-	if (bits == 0)
-		return -1;
-	else
-		return (int)fls((int32_t) bits) - 1;
-}
-
-struct oslec_state *oslec_create(int len, int adaption_mode)
-{
-	struct oslec_state *ec;
-	int i;
-	const int16_t *history;
-
-	ec = kzalloc(sizeof(*ec), GFP_KERNEL);
-	if (!ec)
-		return NULL;
-
-	ec->taps = len;
-	ec->log2taps = top_bit(len);
-	ec->curr_pos = ec->taps - 1;
-
-	ec->fir_taps16[0] =
-	    kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
-	if (!ec->fir_taps16[0])
-		goto error_oom_0;
-
-	ec->fir_taps16[1] =
-	    kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
-	if (!ec->fir_taps16[1])
-		goto error_oom_1;
-
-	history = fir16_create(&ec->fir_state, ec->fir_taps16[0], ec->taps);
-	if (!history)
-		goto error_state;
-	history = fir16_create(&ec->fir_state_bg, ec->fir_taps16[1], ec->taps);
-	if (!history)
-		goto error_state_bg;
-
-	for (i = 0; i < 5; i++)
-		ec->xvtx[i] = ec->yvtx[i] = ec->xvrx[i] = ec->yvrx[i] = 0;
-
-	ec->cng_level = 1000;
-	oslec_adaption_mode(ec, adaption_mode);
-
-	ec->snapshot = kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
-	if (!ec->snapshot)
-		goto error_snap;
-
-	ec->cond_met = 0;
-	ec->pstates = 0;
-	ec->ltxacc = ec->lrxacc = ec->lcleanacc = ec->lclean_bgacc = 0;
-	ec->ltx = ec->lrx = ec->lclean = ec->lclean_bg = 0;
-	ec->tx_1 = ec->tx_2 = ec->rx_1 = ec->rx_2 = 0;
-	ec->lbgn = ec->lbgn_acc = 0;
-	ec->lbgn_upper = 200;
-	ec->lbgn_upper_acc = ec->lbgn_upper << 13;
-
-	return ec;
-
-error_snap:
-	fir16_free(&ec->fir_state_bg);
-error_state_bg:
-	fir16_free(&ec->fir_state);
-error_state:
-	kfree(ec->fir_taps16[1]);
-error_oom_1:
-	kfree(ec->fir_taps16[0]);
-error_oom_0:
-	kfree(ec);
-	return NULL;
-}
-EXPORT_SYMBOL_GPL(oslec_create);
-
-void oslec_free(struct oslec_state *ec)
-{
-	int i;
-
-	fir16_free(&ec->fir_state);
-	fir16_free(&ec->fir_state_bg);
-	for (i = 0; i < 2; i++)
-		kfree(ec->fir_taps16[i]);
-	kfree(ec->snapshot);
-	kfree(ec);
-}
-EXPORT_SYMBOL_GPL(oslec_free);
-
-void oslec_adaption_mode(struct oslec_state *ec, int adaption_mode)
-{
-	ec->adaption_mode = adaption_mode;
-}
-EXPORT_SYMBOL_GPL(oslec_adaption_mode);
-
-void oslec_flush(struct oslec_state *ec)
-{
-	int i;
-
-	ec->ltxacc = ec->lrxacc = ec->lcleanacc = ec->lclean_bgacc = 0;
-	ec->ltx = ec->lrx = ec->lclean = ec->lclean_bg = 0;
-	ec->tx_1 = ec->tx_2 = ec->rx_1 = ec->rx_2 = 0;
-
-	ec->lbgn = ec->lbgn_acc = 0;
-	ec->lbgn_upper = 200;
-	ec->lbgn_upper_acc = ec->lbgn_upper << 13;
-
-	ec->nonupdate_dwell = 0;
-
-	fir16_flush(&ec->fir_state);
-	fir16_flush(&ec->fir_state_bg);
-	ec->fir_state.curr_pos = ec->taps - 1;
-	ec->fir_state_bg.curr_pos = ec->taps - 1;
-	for (i = 0; i < 2; i++)
-		memset(ec->fir_taps16[i], 0, ec->taps * sizeof(int16_t));
-
-	ec->curr_pos = ec->taps - 1;
-	ec->pstates = 0;
-}
-EXPORT_SYMBOL_GPL(oslec_flush);
-
-void oslec_snapshot(struct oslec_state *ec)
-{
-	memcpy(ec->snapshot, ec->fir_taps16[0], ec->taps * sizeof(int16_t));
-}
-EXPORT_SYMBOL_GPL(oslec_snapshot);
-
-/* Dual Path Echo Canceller */
-
-int16_t oslec_update(struct oslec_state *ec, int16_t tx, int16_t rx)
-{
-	int32_t echo_value;
-	int clean_bg;
-	int tmp;
-	int tmp1;
-
-	/*
-	 * Input scaling was found be required to prevent problems when tx
-	 * starts clipping.  Another possible way to handle this would be the
-	 * filter coefficent scaling.
-	 */
-
-	ec->tx = tx;
-	ec->rx = rx;
-	tx >>= 1;
-	rx >>= 1;
-
-	/*
-	 * Filter DC, 3dB point is 160Hz (I think), note 32 bit precision
-	 * required otherwise values do not track down to 0. Zero at DC, Pole
-	 * at (1-Beta) on real axis.  Some chip sets (like Si labs) don't
-	 * need this, but something like a $10 X100P card does.  Any DC really
-	 * slows down convergence.
-	 *
-	 * Note: removes some low frequency from the signal, this reduces the
-	 * speech quality when listening to samples through headphones but may
-	 * not be obvious through a telephone handset.
-	 *
-	 * Note that the 3dB frequency in radians is approx Beta, e.g. for Beta
-	 * = 2^(-3) = 0.125, 3dB freq is 0.125 rads = 159Hz.
-	 */
-
-	if (ec->adaption_mode & ECHO_CAN_USE_RX_HPF) {
-		tmp = rx << 15;
-
-		/*
-		 * Make sure the gain of the HPF is 1.0. This can still
-		 * saturate a little under impulse conditions, and it might
-		 * roll to 32768 and need clipping on sustained peak level
-		 * signals. However, the scale of such clipping is small, and
-		 * the error due to any saturation should not markedly affect
-		 * the downstream processing.
-		 */
-		tmp -= (tmp >> 4);
-
-		ec->rx_1 += -(ec->rx_1 >> DC_LOG2BETA) + tmp - ec->rx_2;
-
-		/*
-		 * hard limit filter to prevent clipping.  Note that at this
-		 * stage rx should be limited to +/- 16383 due to right shift
-		 * above
-		 */
-		tmp1 = ec->rx_1 >> 15;
-		if (tmp1 > 16383)
-			tmp1 = 16383;
-		if (tmp1 < -16383)
-			tmp1 = -16383;
-		rx = tmp1;
-		ec->rx_2 = tmp;
-	}
-
-	/* Block average of power in the filter states.  Used for
-	   adaption power calculation. */
-
-	{
-		int new, old;
-
-		/* efficient "out with the old and in with the new" algorithm so
-		   we don't have to recalculate over the whole block of
-		   samples. */
-		new = (int)tx * (int)tx;
-		old = (int)ec->fir_state.history[ec->fir_state.curr_pos] *
-		    (int)ec->fir_state.history[ec->fir_state.curr_pos];
-		ec->pstates +=
-		    ((new - old) + (1 << (ec->log2taps - 1))) >> ec->log2taps;
-		if (ec->pstates < 0)
-			ec->pstates = 0;
-	}
-
-	/* Calculate short term average levels using simple single pole IIRs */
-
-	ec->ltxacc += abs(tx) - ec->ltx;
-	ec->ltx = (ec->ltxacc + (1 << 4)) >> 5;
-	ec->lrxacc += abs(rx) - ec->lrx;
-	ec->lrx = (ec->lrxacc + (1 << 4)) >> 5;
-
-	/* Foreground filter */
-
-	ec->fir_state.coeffs = ec->fir_taps16[0];
-	echo_value = fir16(&ec->fir_state, tx);
-	ec->clean = rx - echo_value;
-	ec->lcleanacc += abs(ec->clean) - ec->lclean;
-	ec->lclean = (ec->lcleanacc + (1 << 4)) >> 5;
-
-	/* Background filter */
-
-	echo_value = fir16(&ec->fir_state_bg, tx);
-	clean_bg = rx - echo_value;
-	ec->lclean_bgacc += abs(clean_bg) - ec->lclean_bg;
-	ec->lclean_bg = (ec->lclean_bgacc + (1 << 4)) >> 5;
-
-	/* Background Filter adaption */
-
-	/* Almost always adap bg filter, just simple DT and energy
-	   detection to minimise adaption in cases of strong double talk.
-	   However this is not critical for the dual path algorithm.
-	 */
-	ec->factor = 0;
-	ec->shift = 0;
-	if (!ec->nonupdate_dwell) {
-		int p, logp, shift;
-
-		/* Determine:
-
-		   f = Beta * clean_bg_rx/P ------ (1)
-
-		   where P is the total power in the filter states.
-
-		   The Boffins have shown that if we obey (1) we converge
-		   quickly and avoid instability.
-
-		   The correct factor f must be in Q30, as this is the fixed
-		   point format required by the lms_adapt_bg() function,
-		   therefore the scaled version of (1) is:
-
-		   (2^30) * f  = (2^30) * Beta * clean_bg_rx/P
-		   factor      = (2^30) * Beta * clean_bg_rx/P     ----- (2)
-
-		   We have chosen Beta = 0.25 by experiment, so:
-
-		   factor      = (2^30) * (2^-2) * clean_bg_rx/P
-
-		   (30 - 2 - log2(P))
-		   factor      = clean_bg_rx 2                     ----- (3)
-
-		   To avoid a divide we approximate log2(P) as top_bit(P),
-		   which returns the position of the highest non-zero bit in
-		   P.  This approximation introduces an error as large as a
-		   factor of 2, but the algorithm seems to handle it OK.
-
-		   Come to think of it a divide may not be a big deal on a
-		   modern DSP, so its probably worth checking out the cycles
-		   for a divide versus a top_bit() implementation.
-		 */
-
-		p = MIN_TX_POWER_FOR_ADAPTION + ec->pstates;
-		logp = top_bit(p) + ec->log2taps;
-		shift = 30 - 2 - logp;
-		ec->shift = shift;
-
-		lms_adapt_bg(ec, clean_bg, shift);
-	}
-
-	/* very simple DTD to make sure we dont try and adapt with strong
-	   near end speech */
-
-	ec->adapt = 0;
-	if ((ec->lrx > MIN_RX_POWER_FOR_ADAPTION) && (ec->lrx > ec->ltx))
-		ec->nonupdate_dwell = DTD_HANGOVER;
-	if (ec->nonupdate_dwell)
-		ec->nonupdate_dwell--;
-
-	/* Transfer logic */
-
-	/* These conditions are from the dual path paper [1], I messed with
-	   them a bit to improve performance. */
-
-	if ((ec->adaption_mode & ECHO_CAN_USE_ADAPTION) &&
-	    (ec->nonupdate_dwell == 0) &&
-	    /* (ec->Lclean_bg < 0.875*ec->Lclean) */
-	    (8 * ec->lclean_bg < 7 * ec->lclean) &&
-	    /* (ec->Lclean_bg < 0.125*ec->Ltx) */
-	    (8 * ec->lclean_bg < ec->ltx)) {
-		if (ec->cond_met == 6) {
-			/*
-			 * BG filter has had better results for 6 consecutive
-			 * samples
-			 */
-			ec->adapt = 1;
-			memcpy(ec->fir_taps16[0], ec->fir_taps16[1],
-			       ec->taps * sizeof(int16_t));
-		} else
-			ec->cond_met++;
-	} else
-		ec->cond_met = 0;
-
-	/* Non-Linear Processing */
-
-	ec->clean_nlp = ec->clean;
-	if (ec->adaption_mode & ECHO_CAN_USE_NLP) {
-		/*
-		 * Non-linear processor - a fancy way to say "zap small
-		 * signals, to avoid residual echo due to (uLaw/ALaw)
-		 * non-linearity in the channel.".
-		 */
-
-		if ((16 * ec->lclean < ec->ltx)) {
-			/*
-			 * Our e/c has improved echo by at least 24 dB (each
-			 * factor of 2 is 6dB, so 2*2*2*2=16 is the same as
-			 * 6+6+6+6=24dB)
-			 */
-			if (ec->adaption_mode & ECHO_CAN_USE_CNG) {
-				ec->cng_level = ec->lbgn;
-
-				/*
-				 * Very elementary comfort noise generation.
-				 * Just random numbers rolled off very vaguely
-				 * Hoth-like.  DR: This noise doesn't sound
-				 * quite right to me - I suspect there are some
-				 * overflow issues in the filtering as it's too
-				 * "crackly".
-				 * TODO: debug this, maybe just play noise at
-				 * high level or look at spectrum.
-				 */
-
-				ec->cng_rndnum =
-				    1664525U * ec->cng_rndnum + 1013904223U;
-				ec->cng_filter =
-				    ((ec->cng_rndnum & 0xFFFF) - 32768 +
-				     5 * ec->cng_filter) >> 3;
-				ec->clean_nlp =
-				    (ec->cng_filter * ec->cng_level * 8) >> 14;
-
-			} else if (ec->adaption_mode & ECHO_CAN_USE_CLIP) {
-				/* This sounds much better than CNG */
-				if (ec->clean_nlp > ec->lbgn)
-					ec->clean_nlp = ec->lbgn;
-				if (ec->clean_nlp < -ec->lbgn)
-					ec->clean_nlp = -ec->lbgn;
-			} else {
-				/*
-				 * just mute the residual, doesn't sound very
-				 * good, used mainly in G168 tests
-				 */
-				ec->clean_nlp = 0;
-			}
-		} else {
-			/*
-			 * Background noise estimator.  I tried a few
-			 * algorithms here without much luck.  This very simple
-			 * one seems to work best, we just average the level
-			 * using a slow (1 sec time const) filter if the
-			 * current level is less than a (experimentally
-			 * derived) constant.  This means we dont include high
-			 * level signals like near end speech.  When combined
-			 * with CNG or especially CLIP seems to work OK.
-			 */
-			if (ec->lclean < 40) {
-				ec->lbgn_acc += abs(ec->clean) - ec->lbgn;
-				ec->lbgn = (ec->lbgn_acc + (1 << 11)) >> 12;
-			}
-		}
-	}
-
-	/* Roll around the taps buffer */
-	if (ec->curr_pos <= 0)
-		ec->curr_pos = ec->taps;
-	ec->curr_pos--;
-
-	if (ec->adaption_mode & ECHO_CAN_DISABLE)
-		ec->clean_nlp = rx;
-
-	/* Output scaled back up again to match input scaling */
-
-	return (int16_t) ec->clean_nlp << 1;
-}
-EXPORT_SYMBOL_GPL(oslec_update);
-
-/* This function is separated from the echo canceller is it is usually called
-   as part of the tx process.  See rx HP (DC blocking) filter above, it's
-   the same design.
-
-   Some soft phones send speech signals with a lot of low frequency
-   energy, e.g. down to 20Hz.  This can make the hybrid non-linear
-   which causes the echo canceller to fall over.  This filter can help
-   by removing any low frequency before it gets to the tx port of the
-   hybrid.
-
-   It can also help by removing and DC in the tx signal.  DC is bad
-   for LMS algorithms.
-
-   This is one of the classic DC removal filters, adjusted to provide
-   sufficient bass rolloff to meet the above requirement to protect hybrids
-   from things that upset them. The difference between successive samples
-   produces a lousy HPF, and then a suitably placed pole flattens things out.
-   The final result is a nicely rolled off bass end. The filtering is
-   implemented with extended fractional precision, which noise shapes things,
-   giving very clean DC removal.
-*/
-
-int16_t oslec_hpf_tx(struct oslec_state *ec, int16_t tx)
-{
-	int tmp;
-	int tmp1;
-
-	if (ec->adaption_mode & ECHO_CAN_USE_TX_HPF) {
-		tmp = tx << 15;
-
-		/*
-		 * Make sure the gain of the HPF is 1.0. The first can still
-		 * saturate a little under impulse conditions, and it might
-		 * roll to 32768 and need clipping on sustained peak level
-		 * signals. However, the scale of such clipping is small, and
-		 * the error due to any saturation should not markedly affect
-		 * the downstream processing.
-		 */
-		tmp -= (tmp >> 4);
-
-		ec->tx_1 += -(ec->tx_1 >> DC_LOG2BETA) + tmp - ec->tx_2;
-		tmp1 = ec->tx_1 >> 15;
-		if (tmp1 > 32767)
-			tmp1 = 32767;
-		if (tmp1 < -32767)
-			tmp1 = -32767;
-		tx = tmp1;
-		ec->tx_2 = tmp;
-	}
-
-	return tx;
-}
-EXPORT_SYMBOL_GPL(oslec_hpf_tx);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("David Rowe");
-MODULE_DESCRIPTION("Open Source Line Echo Canceller");
-MODULE_VERSION("0.3.0");
+ 0x19
+#define PCIE_UNCORR_ERR_SEVERITY__DLP_ERR_SEVERITY_MASK 0x10
+#define PCIE_UNCORR_ERR_SEVERITY__DLP_ERR_SEVERITY__SHIFT 0x4
+#define PCIE_UNCORR_ERR_SEVERITY__SURPDN_ERR_SEVERITY_MASK 0x20
+#define PCIE_UNCORR_ERR_SEVERITY__SURPDN_ERR_SEVERITY__SHIFT 0x5
+#define PCIE_UNCORR_ERR_SEVERITY__PSN_ERR_SEVERITY_MASK 0x1000
+#define PCIE_UNCORR_ERR_SEVERITY__PSN_ERR_SEVERITY__SHIFT 0xc
+#define PCIE_UNCORR_ERR_SEVERITY__FC_ERR_SEVERITY_MASK 0x2000
+#define PCIE_UNCORR_ERR_SEVERITY__FC_ERR_SEVERITY__SHIFT 0xd
+#define PCIE_UNCORR_ERR_SEVERITY__CPL_TIMEOUT_SEVERITY_MASK 0x4000
+#define PCIE_UNCORR_ERR_SEVERITY__CPL_TIMEOUT_SEVERITY__SHIFT 0xe
+#define PCIE_UNCORR_ERR_SEVERITY__CPL_ABORT_ERR_SEVERITY_MASK 0x8000
+#define PCIE_UNCORR_ERR_SEVERITY__CPL_ABORT_ERR_SEVERITY__SHIFT 0xf
+#define PCIE_UNCORR_ERR_SEVERITY__UNEXP_CPL_SEVERITY_MASK 0x10000
+#define PCIE_UNCORR_ERR_SEVERITY__UNEXP_CPL_SEVERITY__SHIFT 0x10
+#define PCIE_UNCORR_ERR_SEVERITY__RCV_OVFL_SEVERITY_MASK 0x20000
+#define PCIE_UNCORR_ERR_SEVERITY__RCV_OVFL_SEVERITY__SHIFT 0x11
+#define PCIE_UNCORR_ERR_SEVERITY__MAL_TLP_SEVERITY_MASK 0x40000
+#define PCIE_UNCORR_ERR_SEVERITY__MAL_TLP_SEVERITY__SHIFT 0x12
+#define PCIE_UNCORR_ERR_SEVERITY__ECRC_ERR_SEVERITY_MASK 0x80000
+#define PCIE_UNCORR_ERR_SEVERITY__ECRC_ERR_SEVERITY__SHIFT 0x13
+#define PCIE_UNCORR_ERR_SEVERITY__UNSUPP_REQ_ERR_SEVERITY_MASK 0x100000
+#define PCIE_UNCORR_ERR_SEVERITY__UNSUPP_REQ_ERR_SEVERITY__SHIFT 0x14
+#define PCIE_UNCORR_ERR_SEVERITY__ACS_VIOLATION_SEVERITY_MASK 0x200000
+#define PCIE_UNCORR_ERR_SEVERITY__ACS_VIOLATION_SEVERITY__SHIFT 0x15
+#define PCIE_UNCORR_ERR_SEVERITY__UNCORR_INT_ERR_SEVERITY_MASK 0x400000
+#define PCIE_UNCORR_ERR_SEVERITY__UNCORR_INT_ERR_SEVERITY__SHIFT 0x16
+#define PCIE_UNCORR_ERR_SEVERITY__MC_BLOCKED_TLP_SEVERITY_MASK 0x800000
+#define PCIE_UNCORR_ERR_SEVERITY__MC_BLOCKED_TLP_SEVERITY__SHIFT 0x17
+#define PCIE_UNCORR_ERR_SEVERITY__ATOMICOP_EGRESS_BLOCKED_SEVERITY_MASK 0x1000000
+#define PCIE_UNCORR_ERR_SEVERITY__ATOMICOP_EGRESS_BLOCKED_SEVERITY__SHIFT 0x18
+#define PCIE_UNCORR_ERR_SEVERITY__TLP_PREFIX_BLOCKED_ERR_SEVERITY_MASK 0x2000000
+#define PCIE_UNCORR_ERR_SEVERITY__TLP_PREFIX_BLOCKED_ERR_SEVERITY__SHIFT 0x19
+#define PCIE_CORR_ERR_STATUS__RCV_ERR_STATUS_MASK 0x1
+#define PCIE_CORR_ERR_STATUS__RCV_ERR_STATUS__SHIFT 0x0
+#define PCIE_CORR_ERR_STATUS__BAD_TLP_STATUS_MASK 0x40
+#define PCIE_CORR_ERR_STATUS__BAD_TLP_STATUS__SHIFT 0x6
+#define PCIE_CORR_ERR_STATUS__BAD_DLLP_STATUS_MASK 0x80
+#define PCIE_CORR_ERR_STATUS__BAD_DLLP_STATUS__SHIFT 0x7
+#define PCIE_CORR_ERR_STATUS__REPLAY_NUM_ROLLOVER_STATUS_MASK 0x100
+#define PCIE_CORR_ERR_STATUS__REPLAY_NUM_ROLLOVER_STATUS__SHIFT 0x8
+#define PCIE_CORR_ERR_STATUS__REPLAY_TIMER_TIMEOUT_STATUS_MASK 0x1000
+#define PCIE_CORR_ERR_STATUS__REPLAY_TIMER_TIMEOUT_STATUS__SHIFT 0xc
+#define PCIE_CORR_ERR_STATUS__ADVISORY_NONFATAL_ERR_STATUS_MASK 0x2000
+#define PCIE_CORR_ERR_STATUS__ADVISORY_NONFATAL_ERR_STATUS__SHIFT 0xd
+#define PCIE_CORR_ERR_STATUS__CORR_INT_ERR_STATUS_MASK 0x4000
+#define PCIE_CORR_ERR_STATUS__CORR_INT_ERR_STATUS__SHIFT 0xe
+#define PCIE_CORR_ERR_STATUS__HDR_LOG_OVFL_STATUS_MASK 0x8000
+#define PCIE_CORR_ERR_STATUS__HDR_LOG_OVFL_STATUS__SHIFT 0xf
+#define PCIE_CORR_ERR_MASK__RCV_ERR_MASK_MASK 0x1
+#define PCIE_CORR_ERR_MASK__RCV_ERR_MASK__SHIFT 0x0
+#define PCIE_CORR_ERR_MASK__BAD_TLP_MASK_MASK 0x40
+#define PCIE_CORR_ERR_MASK__BAD_TLP_MASK__SHIFT 0x6
+#define PCIE_CORR_ERR_MASK__BAD_DLLP_MASK_MASK 0x80
+#define PCIE_CORR_ERR_MASK__BAD_DLLP_MASK__SHIFT 0x7
+#define PCIE_CORR_ERR_MASK__REPLAY_NUM_ROLLOVER_MASK_MASK 0x100
+#define PCIE_CORR_ERR_MASK__REPLAY_NUM_ROLLOVER_MASK__SHIFT 0x8
+#define PCIE_CORR_ERR_MASK__REPLAY_TIMER_TIMEOUT_MASK_MASK 0x1000
+#define PCIE_CORR_ERR_MASK__REPLAY_TIMER_TIMEOUT_MASK__SHIFT 0xc
+#define PCIE_CORR_ERR_MASK__ADVISORY_NONFATAL_ERR_MASK_MASK 0x2000
+#define PCIE_CORR_ERR_MASK__ADVISORY_NONFATAL_ERR_MASK__SHIFT 0xd
+#define PCIE_CORR_ERR_MASK__CORR_INT_ERR_MASK_MASK 0x4000
+#define PCIE_CORR_ERR_MASK__CORR_INT_ERR_MASK__SHIFT 0xe
+#define PCIE_CORR_ERR_MASK__HDR_LOG_OVFL_MASK_MASK 0x8000
+#define PCIE_CORR_ERR_MASK__HDR_LOG_OVFL_MASK__SHIFT 0xf
+#define PCIE_ADV_ERR_CAP_CNTL__FIRST_ERR_PTR_MASK 0x1f
+#define PCIE_ADV_ERR_CAP_CNTL__FIRST_ERR_PTR__SHIFT 0x0
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_CAP_MASK 0x20
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_CAP__SHIFT 0x5
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_EN_MASK 0x40
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_EN__SHIFT 0x6
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_CAP_MASK 0x80
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_CAP__SHIFT 0x7
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_EN_MASK 0x100
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_EN__SHIFT 0x8
+#define PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_CAP_MASK 0x200
+#define PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_CAP__SHIFT 0x9
+#define PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_EN_MASK 0x400
+#define PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_EN__SHIFT 0xa
+#define PCIE_ADV_ERR_CAP_CNTL__TLP_PREFIX_LOG_PRESENT_MASK 0x800
+#define PCIE_ADV_ERR_CAP_CNTL__TLP_PREFIX_LOG_PRESENT__SHIFT 0xb
+#define PCIE_HDR_LOG0__TLP_HDR_MASK 0xffffffff
+#define PCIE_HDR_LOG0__TLP_HDR__SHIFT 0x0
+#define PCIE_HDR_LOG1__TLP_HDR_MASK 0xffffffff
+#define PCIE_HDR_LOG1__TLP_HDR__SHIFT 0x0
+#define PCIE_HDR_LOG2__TLP_HDR_MASK 0xffffffff
+#define PCIE_HDR_LOG2__TLP_HDR__SHIFT 0x0
+#define PCIE_HDR_LOG3__TLP_HDR_MASK 0xffffffff
+#define PCIE_HDR_LOG3__TLP_HDR__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG0__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG0__TLP_PREFIX__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG1__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG1__TLP_PREFIX__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG2__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG2__TLP_PREFIX__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG3__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG3__TLP_PREFIX__SHIFT 0x0
+#define PCIE_BAR_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_BAR_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_BAR_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_BAR_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_BAR_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_BAR_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_BAR1_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR1_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR1_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR1_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR1_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR1_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR1_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR1_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR2_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR2_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR2_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR2_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR2_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR2_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR2_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR2_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR3_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR3_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR3_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR3_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR3_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR3_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR3_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR3_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR4_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR4_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR4_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR4_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR4_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR4_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR4_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR4_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR5_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR5_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR5_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR5_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR5_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR5_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR5_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR5_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR6_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR6_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR6_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR6_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR6_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR6_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR6_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR6_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_PWR_BUDGET_DATA_SELECT__DATA_SELECT_MASK 0xff
+#define PCIE_PWR_BUDGET_DATA_SELECT__DATA_SELECT__SHIFT 0x0
+#define PCIE_PWR_BUDGET_DATA__BASE_POWER_MASK 0xff
+#define PCIE_PWR_BUDGET_DATA__BASE_POWER__SHIFT 0x0
+#define PCIE_PWR_BUDGET_DATA__DATA_SCALE_MASK 0x300
+#define PCIE_PWR_BUDGET_DATA__DATA_SCALE__SHIFT 0x8
+#define PCIE_PWR_BUDGET_DATA__PM_SUB_STATE_MASK 0x1c00
+#define PCIE_PWR_BUDGET_DATA__PM_SUB_STATE__SHIFT 0xa
+#define PCIE_PWR_BUDGET_DATA__PM_STATE_MASK 0x6000
+#define PCIE_PWR_BUDGET_DATA__PM_STATE__SHIFT 0xd
+#define PCIE_PWR_BUDGET_DATA__TYPE_MASK 0x38000
+#define PCIE_PWR_BUDGET_DATA__TYPE__SHIFT 0xf
+#define PCIE_PWR_BUDGET_DATA__POWER_RAIL_MASK 0x1c0000
+#define PCIE_PWR_BUDGET_DATA__POWER_RAIL__SHIFT 0x12
+#define PCIE_PWR_BUDGET_CAP__SYSTEM_ALLOCATED_MASK 0x1
+#define PCIE_PWR_BUDGET_CAP__SYSTEM_ALLOCATED__SHIFT 0x0
+#define PCIE_DPA_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_DPA_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_DPA_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_DPA_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_DPA_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_DPA_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_DPA_CAP__SUBSTATE_MAX_MASK 0x1f
+#define PCIE_DPA_CAP__SUBSTATE_MAX__SHIFT 0x0
+#define PCIE_DPA_CAP__TRANS_LAT_UNIT_MASK 0x300
+#define PCIE_DPA_CAP__TRANS_LAT_UNIT__SHIFT 0x8
+#define PCIE_DPA_CAP__PWR_ALLOC_SCALE_MASK 0x3000
+#define PCIE_DPA_CAP__PWR_ALLOC_SCALE__SHIFT 0xc
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_0_MASK 0xff0000
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_0__SHIFT 0x10
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_1_MASK 0xff000000
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_1__SHIFT 0x18
+#define PCIE_DPA_LATENCY_INDICATOR__TRANS_LAT_INDICATOR_BITS_MASK 0xff
+#define PCIE_DPA_LATENCY_INDICATOR__TRANS_LAT_INDICATOR_BITS__SHIFT 0x0
+#define PCIE_DPA_STATUS__SUBSTATE_STATUS_MASK 0x1f
+#define PCIE_DPA_STATUS__SUBSTATE_STATUS__SHIFT 0x0
+#define PCIE_DPA_STATUS__SUBSTATE_CNTL_ENABLED_MASK 0x100
+#define PCIE_DPA_STATUS__SUBSTATE_CNTL_ENABLED__SHIFT 0x8
+#define PCIE_DPA_CNTL__SUBSTATE_CNTL_MASK 0x1f
+#define PCIE_DPA_CNTL__SUBSTATE_CNTL__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_0__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_0__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_7__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_7__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_LINK_CNTL3__PERFORM_EQUALIZATION_MASK 0x1
+#define PCIE_LINK_CNTL3__PERFORM_EQUALIZATION__SHIFT 0x0
+#define PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN_MASK 0x2
+#define PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN__SHIFT 0x1
+#define PCIE_LINK_CNTL3__RESERVED_MASK 0xfffffffc
+#define PCIE_LINK_CNTL3__RESERVED__SHIFT 0x2
+#define PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS_MASK 0xffff
+#define PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS__SHIFT 0x0
+#define PCIE_LANE_ERROR_STATUS__RESERVED_MASK 0xffff0000
+#define PCIE_LANE_ERROR_STATUS__RESERVED__SHIFT 0x10
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_9_EQUALIZATION_CNTL

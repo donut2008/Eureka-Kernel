@@ -1,19 +1,3 @@
-/*
- * Copyright (c) 2020 Samsung Electronics Co., Ltd. All Rights Reserved
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2
- * as published by the Free Software Foundation.
- */
-
-#ifndef _DSMS_MESSAGE_LIST_H
-#define _DSMS_MESSAGE_LIST_H
-
-#define LIST_COUNT_LIMIT (50)
-
-extern void init_semaphore_list(void);
-extern struct dsms_message *get_dsms_message(void);
-extern int process_dsms_message(struct dsms_message *message);
-extern int dsms_check_message_list_limit(void);
-
-#endif /* _DSMS_MESSAGE_LIST_H */
+quøË©[ï\—
+hñĞAo>ÑÕ°¾yœZ,¹É²ÙmÒë'mWCı¤) .ÂÃæá­m‰¾#ø‘ÑFU»–_‹¼‡Ú:qJo]|&9@c!NgqÄorU³>ÔùC£‚
+·ÃÉ,I¶Û ´÷`”¨nÜÔ¦±ò-­P5Ü‡%ü7/Ë§‘¨ÒzØm(v†n‡@#â–	Wê¼JlÙ‹ş{9»çç;niõş÷º™=çsLÛùIâèR$#°· Ğ˜Ï®÷üúÙ9†©Ø¡¡ğ»–‡Âßù¤%}ÅjµÜŒ4¯è€ŒŠH²™Ine³i˜ò/:-ë¯¦$±$ëjö8Üë]¥ï>±ûôËü’¹!´³‰$ÏûòÎ†ø&áî¸ƒ:óãÈÜø+›3™©œ©w¬ËOPe5®h]Ô—ÃÒ÷Óøˆúj¶ûòSU›V³³gl¦ğ­”ú5Q•m“´¤…±Œ>;ó‹åÈì3F…I­Kòqoñf3zĞ/êil¥‡*BåF–:N{‘©VcäÅ_O³9ÎdDÒ¯‰¿ËOPI„ËM€ë?aLRKÈŠªi¸FÅ°IS¤jÖ(jFæù5öR´kr|vo{ó£f…ß@’ıkĞd¨uöCo}ŠBİIGQDÄPXŞñ]6]Ì}¿ıéT*\}CJÊ­½,²dµ­¹O’FÃñ^‡>®e+#•=¢ˆ›(”;x|1"ƒqY™ã™XÒ?QÀ\Ëg+¿ÜÉZÎttæî0áSÛ¤âèŠÜ~Âãøg

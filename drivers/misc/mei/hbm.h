@@ -1,62 +1,73 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-
-#ifndef _MEI_HBM_H_
-#define _MEI_HBM_H_
-
-struct mei_device;
-struct mei_msg_hdr;
-struct mei_cl;
-
-/**
- * enum mei_hbm_state - host bus message protocol state
- *
- * @MEI_HBM_IDLE : protocol not started
- * @MEI_HBM_STARTING : start request message was sent
- * @MEI_HBM_ENUM_CLIENTS : enumeration request was sent
- * @MEI_HBM_CLIENT_PROPERTIES : acquiring clients properties
- * @MEI_HBM_STARTED : enumeration was completed
- * @MEI_HBM_STOPPED : stopping exchange
- */
-enum mei_hbm_state {
-	MEI_HBM_IDLE = 0,
-	MEI_HBM_STARTING,
-	MEI_HBM_ENUM_CLIENTS,
-	MEI_HBM_CLIENT_PROPERTIES,
-	MEI_HBM_STARTED,
-	MEI_HBM_STOPPED,
+ice_attribute a1;
+		struct sensor_device_attribute_2 a2;
+	} u;
+	char name[32];
 };
 
-const char *mei_hbm_state_str(enum mei_hbm_state state);
+#define __TEMPLATE_ATTR(_template, _mode, _show, _store) {	\
+	.attr = {.name = _template, .mode = _mode },		\
+	.show	= _show,					\
+	.store	= _store,					\
+}
 
-int mei_hbm_dispatch(struct mei_device *dev, struct mei_msg_hdr *hdr);
+#define SENSOR_DEVICE_TEMPLATE(_template, _mode, _show, _store, _index)	\
+	{ .dev_attr = __TEMPLATE_ATTR(_template, _mode, _show, _store),	\
+	  .u.index = _index,						\
+	  .s2 = false }
 
-void mei_hbm_idle(struct mei_device *dev);
-void mei_hbm_reset(struct mei_device *dev);
-int mei_hbm_start_req(struct mei_device *dev);
-int mei_hbm_start_wait(struct mei_device *dev);
-int mei_hbm_cl_flow_control_req(struct mei_device *dev, struct mei_cl *cl);
-int mei_hbm_cl_disconnect_req(struct mei_device *dev, struct mei_cl *cl);
-int mei_hbm_cl_disconnect_rsp(struct mei_device *dev, struct mei_cl *cl);
-int mei_hbm_cl_connect_req(struct mei_device *dev, struct mei_cl *cl);
-bool mei_hbm_version_is_supported(struct mei_device *dev);
-int mei_hbm_pg(struct mei_device *dev, u8 pg_cmd);
-void mei_hbm_pg_resume(struct mei_device *dev);
-int mei_hbm_cl_notify_req(struct mei_device *dev,
-			  struct mei_cl *cl, u8 request);
+#define SENSOR_DEVICE_TEMPLATE_2(_template, _mode, _show, _store,	\
+				 _nr, _index)				\
+	{ .dev_attr = __TEMPLATE_ATTR(_template, _mode, _show, _store),	\
+	  .u.s.index = _index,						\
+	  .u.s.nr = _nr,						\
+	  .s2 = true }
 
-#endif /* _MEI_HBM_H_ */
+#define SENSOR_TEMPLATE(_name, _template, _mode, _show, _store, _index)	\
+static struct sensor_device_template sensor_dev_template_##_name	\
+	= SENSOR_DEVICE_TEMPLATE(_template, _mode, _show, _store,	\
+				 _index)
 
+#define SENSOR_TEMPLATE_2(_name, _template, _mode, _show, _store,	\
+			  _nr, _index)					\
+static struct sensor_device_template sensor_dev_template_##_name	\
+	= SENSOR_DEVICE_TEMPLATE_2(_template, _mode, _show, _store,	\
+				 _nr, _index)
+
+struct sensor_template_group {
+	struct sensor_device_template **templates;
+	umode_t (*is_visible)(struct kobject *, struct attribute *, int);
+	int base;
+};
+
+static struct attribute_group *
+nct6775_create_attr_group(struct device *dev, struct sensor_template_group *tg,
+			  int repeat)
+{
+	struct attribute_group *group;
+	struct sensor_device_attr_u *su;
+	struct sensor_device_attribute *a;
+	struct sensor_device_attribute_2 *a2;
+	struct attribute **attrs;
+	struct sensor_device_template **t;
+	int i, count;
+
+	if (repeat <= 0)
+		return ERR_PTR(-EINVAL);
+
+	t = tg->templates;
+	for (count = 0; *t; t++, count++)
+		;
+
+	if (count == 0)
+		return ERR_PTR(-EINVAL);
+
+	group = devm_kzalloc(dev, sizeof(*group), GFP_KERNEL);
+	if (group == NULL)
+		return ERR_PTR(-ENOMEM);
+
+	attrs = devm_kzalloc(dev, sizeof(*attrs) * (repeat * count + 1),
+			     GFP_KERNEL);
+	if (attrs == NULL)
+		return ERR_PTR(-ENOMEM);
+
+	su = devm_kzalloc(dev, sizeof(*su) * repeat * co

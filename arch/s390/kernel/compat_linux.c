@@ -1,521 +1,539 @@
-/*
- *  S390 version
- *    Copyright IBM Corp. 2000
- *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com),
- *               Gerhard Tonn (ton@de.ibm.com)   
- *               Thomas Spatzier (tspat@de.ibm.com)
- *
- *  Conversion between 31bit and 64bit native syscalls.
- *
- * Heavily inspired by the 32-bit Sparc compat code which is 
- * Copyright (C) 1997,1998 Jakub Jelinek (jj@sunsite.mff.cuni.cz)
- * Copyright (C) 1997 David S. Miller (davem@caip.rutgers.edu)
- *
- */
-
-
-#include <linux/kernel.h>
-#include <linux/sched.h>
-#include <linux/fs.h> 
-#include <linux/mm.h> 
-#include <linux/file.h> 
-#include <linux/signal.h>
-#include <linux/resource.h>
-#include <linux/times.h>
-#include <linux/smp.h>
-#include <linux/sem.h>
-#include <linux/msg.h>
-#include <linux/shm.h>
-#include <linux/uio.h>
-#include <linux/quota.h>
-#include <linux/module.h>
-#include <linux/poll.h>
-#include <linux/personality.h>
-#include <linux/stat.h>
-#include <linux/filter.h>
-#include <linux/highmem.h>
-#include <linux/highuid.h>
-#include <linux/mman.h>
-#include <linux/ipv6.h>
-#include <linux/in.h>
-#include <linux/icmpv6.h>
-#include <linux/syscalls.h>
-#include <linux/sysctl.h>
-#include <linux/binfmts.h>
-#include <linux/capability.h>
-#include <linux/compat.h>
-#include <linux/vfs.h>
-#include <linux/ptrace.h>
-#include <linux/fadvise.h>
-#include <linux/ipc.h>
-#include <linux/slab.h>
-
-#include <asm/types.h>
-#include <asm/uaccess.h>
-
-#include <net/scm.h>
-#include <net/sock.h>
-
-#include "compat_linux.h"
-
-/* For this source file, we want overflow handling. */
-
-#undef high2lowuid
-#undef high2lowgid
-#undef low2highuid
-#undef low2highgid
-#undef SET_UID16
-#undef SET_GID16
-#undef NEW_TO_OLD_UID
-#undef NEW_TO_OLD_GID
-#undef SET_OLDSTAT_UID
-#undef SET_OLDSTAT_GID
-#undef SET_STAT_UID
-#undef SET_STAT_GID
-
-#define high2lowuid(uid) ((uid) > 65535) ? (u16)overflowuid : (u16)(uid)
-#define high2lowgid(gid) ((gid) > 65535) ? (u16)overflowgid : (u16)(gid)
-#define low2highuid(uid) ((uid) == (u16)-1) ? (uid_t)-1 : (uid_t)(uid)
-#define low2highgid(gid) ((gid) == (u16)-1) ? (gid_t)-1 : (gid_t)(gid)
-#define SET_UID16(var, uid)	var = high2lowuid(uid)
-#define SET_GID16(var, gid)	var = high2lowgid(gid)
-#define NEW_TO_OLD_UID(uid)	high2lowuid(uid)
-#define NEW_TO_OLD_GID(gid)	high2lowgid(gid)
-#define SET_OLDSTAT_UID(stat, uid)	(stat).st_uid = high2lowuid(uid)
-#define SET_OLDSTAT_GID(stat, gid)	(stat).st_gid = high2lowgid(gid)
-#define SET_STAT_UID(stat, uid)		(stat).st_uid = high2lowuid(uid)
-#define SET_STAT_GID(stat, gid)		(stat).st_gid = high2lowgid(gid)
-
-COMPAT_SYSCALL_DEFINE3(s390_chown16, const char __user *, filename,
-		       u16, user, u16, group)
 {
-	return sys_chown(filename, low2highuid(user), low2highgid(group));
-}
+			const char *unit;
+			unsigned long size;
+			char buf[64];
 
-COMPAT_SYSCALL_DEFINE3(s390_lchown16, const char __user *,
-		       filename, u16, user, u16, group)
-{
-	return sys_lchown(filename, low2highuid(user), low2highgid(group));
-}
+			md = p;
+			size = md->num_pages << EFI_PAGE_SHIFT;
 
-COMPAT_SYSCALL_DEFINE3(s390_fchown16, unsigned int, fd, u16, user, u16, group)
-{
-	return sys_fchown(fd, low2highuid(user), low2highgid(group));
-}
+			if ((size >> 40) > 0) {
+				size >>= 40;
+				unit = "TB";
+			} else if ((size >> 30) > 0) {
+				size >>= 30;
+				unit = "GB";
+			} else if ((size >> 20) > 0) {
+				size >>= 20;
+				unit = "MB";
+			} else {
+				size >>= 10;
+				unit = "KB";
+			}
 
-COMPAT_SYSCALL_DEFINE2(s390_setregid16, u16, rgid, u16, egid)
-{
-	return sys_setregid(low2highgid(rgid), low2highgid(egid));
-}
-
-COMPAT_SYSCALL_DEFINE1(s390_setgid16, u16, gid)
-{
-	return sys_setgid(low2highgid(gid));
-}
-
-COMPAT_SYSCALL_DEFINE2(s390_setreuid16, u16, ruid, u16, euid)
-{
-	return sys_setreuid(low2highuid(ruid), low2highuid(euid));
-}
-
-COMPAT_SYSCALL_DEFINE1(s390_setuid16, u16, uid)
-{
-	return sys_setuid(low2highuid(uid));
-}
-
-COMPAT_SYSCALL_DEFINE3(s390_setresuid16, u16, ruid, u16, euid, u16, suid)
-{
-	return sys_setresuid(low2highuid(ruid), low2highuid(euid),
-			     low2highuid(suid));
-}
-
-COMPAT_SYSCALL_DEFINE3(s390_getresuid16, u16 __user *, ruidp,
-		       u16 __user *, euidp, u16 __user *, suidp)
-{
-	const struct cred *cred = current_cred();
-	int retval;
-	u16 ruid, euid, suid;
-
-	ruid = high2lowuid(from_kuid_munged(cred->user_ns, cred->uid));
-	euid = high2lowuid(from_kuid_munged(cred->user_ns, cred->euid));
-	suid = high2lowuid(from_kuid_munged(cred->user_ns, cred->suid));
-
-	if (!(retval   = put_user(ruid, ruidp)) &&
-	    !(retval   = put_user(euid, euidp)))
-		retval = put_user(suid, suidp);
-
-	return retval;
-}
-
-COMPAT_SYSCALL_DEFINE3(s390_setresgid16, u16, rgid, u16, egid, u16, sgid)
-{
-	return sys_setresgid(low2highgid(rgid), low2highgid(egid),
-			     low2highgid(sgid));
-}
-
-COMPAT_SYSCALL_DEFINE3(s390_getresgid16, u16 __user *, rgidp,
-		       u16 __user *, egidp, u16 __user *, sgidp)
-{
-	const struct cred *cred = current_cred();
-	int retval;
-	u16 rgid, egid, sgid;
-
-	rgid = high2lowgid(from_kgid_munged(cred->user_ns, cred->gid));
-	egid = high2lowgid(from_kgid_munged(cred->user_ns, cred->egid));
-	sgid = high2lowgid(from_kgid_munged(cred->user_ns, cred->sgid));
-
-	if (!(retval   = put_user(rgid, rgidp)) &&
-	    !(retval   = put_user(egid, egidp)))
-		retval = put_user(sgid, sgidp);
-
-	return retval;
-}
-
-COMPAT_SYSCALL_DEFINE1(s390_setfsuid16, u16, uid)
-{
-	return sys_setfsuid(low2highuid(uid));
-}
-
-COMPAT_SYSCALL_DEFINE1(s390_setfsgid16, u16, gid)
-{
-	return sys_setfsgid(low2highgid(gid));
-}
-
-static int groups16_to_user(u16 __user *grouplist, struct group_info *group_info)
-{
-	struct user_namespace *user_ns = current_user_ns();
-	int i;
-	u16 group;
-	kgid_t kgid;
-
-	for (i = 0; i < group_info->ngroups; i++) {
-		kgid = GROUP_AT(group_info, i);
-		group = (u16)from_kgid_munged(user_ns, kgid);
-		if (put_user(group, grouplist+i))
-			return -EFAULT;
-	}
-
-	return 0;
-}
-
-static int groups16_from_user(struct group_info *group_info, u16 __user *grouplist)
-{
-	struct user_namespace *user_ns = current_user_ns();
-	int i;
-	u16 group;
-	kgid_t kgid;
-
-	for (i = 0; i < group_info->ngroups; i++) {
-		if (get_user(group, grouplist+i))
-			return  -EFAULT;
-
-		kgid = make_kgid(user_ns, (gid_t)group);
-		if (!gid_valid(kgid))
-			return -EINVAL;
-
-		GROUP_AT(group_info, i) = kgid;
-	}
-
-	return 0;
-}
-
-COMPAT_SYSCALL_DEFINE2(s390_getgroups16, int, gidsetsize, u16 __user *, grouplist)
-{
-	const struct cred *cred = current_cred();
-	int i;
-
-	if (gidsetsize < 0)
-		return -EINVAL;
-
-	get_group_info(cred->group_info);
-	i = cred->group_info->ngroups;
-	if (gidsetsize) {
-		if (i > gidsetsize) {
-			i = -EINVAL;
-			goto out;
-		}
-		if (groups16_to_user(grouplist, cred->group_info)) {
-			i = -EFAULT;
-			goto out;
+			printk("mem%02d: %s "
+			       "range=[0x%016lx-0x%016lx) (%4lu%s)\n",
+			       i, efi_md_typeattr_format(buf, sizeof(buf), md),
+			       md->phys_addr,
+			       md->phys_addr + efi_md_size(md), size, unit);
 		}
 	}
-out:
-	put_group_info(cred->group_info);
-	return i;
-}
-
-COMPAT_SYSCALL_DEFINE2(s390_setgroups16, int, gidsetsize, u16 __user *, grouplist)
-{
-	struct group_info *group_info;
-	int retval;
-
-	if (!may_setgroups())
-		return -EPERM;
-	if ((unsigned)gidsetsize > NGROUPS_MAX)
-		return -EINVAL;
-
-	group_info = groups_alloc(gidsetsize);
-	if (!group_info)
-		return -ENOMEM;
-	retval = groups16_from_user(group_info, grouplist);
-	if (retval) {
-		put_group_info(group_info);
-		return retval;
-	}
-
-	groups_sort(group_info);
-	retval = set_current_groups(group_info);
-	put_group_info(group_info);
-
-	return retval;
-}
-
-COMPAT_SYSCALL_DEFINE0(s390_getuid16)
-{
-	return high2lowuid(from_kuid_munged(current_user_ns(), current_uid()));
-}
-
-COMPAT_SYSCALL_DEFINE0(s390_geteuid16)
-{
-	return high2lowuid(from_kuid_munged(current_user_ns(), current_euid()));
-}
-
-COMPAT_SYSCALL_DEFINE0(s390_getgid16)
-{
-	return high2lowgid(from_kgid_munged(current_user_ns(), current_gid()));
-}
-
-COMPAT_SYSCALL_DEFINE0(s390_getegid16)
-{
-	return high2lowgid(from_kgid_munged(current_user_ns(), current_egid()));
-}
-
-#ifdef CONFIG_SYSVIPC
-COMPAT_SYSCALL_DEFINE5(s390_ipc, uint, call, int, first, compat_ulong_t, second,
-		compat_ulong_t, third, compat_uptr_t, ptr)
-{
-	if (call >> 16)		/* hack for backward compatibility */
-		return -EINVAL;
-	return compat_sys_ipc(call, first, second, third, ptr, third);
-}
 #endif
 
-COMPAT_SYSCALL_DEFINE3(s390_truncate64, const char __user *, path, u32, high, u32, low)
-{
-	return sys_truncate(path, (unsigned long)high << 32 | low);
+	efi_map_pal_code();
+	efi_enter_virtual_mode();
 }
 
-COMPAT_SYSCALL_DEFINE3(s390_ftruncate64, unsigned int, fd, u32, high, u32, low)
+void
+efi_enter_virtual_mode (void)
 {
-	return sys_ftruncate(fd, (unsigned long)high << 32 | low);
-}
+	void *efi_map_start, *efi_map_end, *p;
+	efi_memory_desc_t *md;
+	efi_status_t status;
+	u64 efi_desc_size;
 
-COMPAT_SYSCALL_DEFINE5(s390_pread64, unsigned int, fd, char __user *, ubuf,
-		       compat_size_t, count, u32, high, u32, low)
-{
-	if ((compat_ssize_t) count < 0)
-		return -EINVAL;
-	return sys_pread64(fd, ubuf, count, (unsigned long)high << 32 | low);
-}
+	efi_map_start = __va(ia64_boot_param->efi_memmap);
+	efi_map_end   = efi_map_start + ia64_boot_param->efi_memmap_size;
+	efi_desc_size = ia64_boot_param->efi_memdesc_size;
 
-COMPAT_SYSCALL_DEFINE5(s390_pwrite64, unsigned int, fd, const char __user *, ubuf,
-		       compat_size_t, count, u32, high, u32, low)
-{
-	if ((compat_ssize_t) count < 0)
-		return -EINVAL;
-	return sys_pwrite64(fd, ubuf, count, (unsigned long)high << 32 | low);
-}
+	for (p = efi_map_start; p < efi_map_end; p += efi_desc_size) {
+		md = p;
+		if (md->attribute & EFI_MEMORY_RUNTIME) {
+			/*
+			 * Some descriptors have multiple bits set, so the
+			 * order of the tests is relevant.
+			 */
+			if (md->attribute & EFI_MEMORY_WB) {
+				md->virt_addr = (u64) __va(md->phys_addr);
+			} else if (md->attribute & EFI_MEMORY_UC) {
+				md->virt_addr = (u64) ioremap(md->phys_addr, 0);
+			} else if (md->attribute & EFI_MEMORY_WC) {
+#if 0
+				md->virt_addr = ia64_remap(md->phys_addr,
+							   (_PAGE_A |
+							    _PAGE_P |
+							    _PAGE_D |
+							    _PAGE_MA_WC |
+							    _PAGE_PL_0 |
+							    _PAGE_AR_RW));
+#else
+				printk(KERN_INFO "EFI_MEMORY_WC mapping\n");
+				md->virt_addr = (u64) ioremap(md->phys_addr, 0);
+#endif
+			} else if (md->attribute & EFI_MEMORY_WT) {
+#if 0
+				md->virt_addr = ia64_remap(md->phys_addr,
+							   (_PAGE_A |
+							    _PAGE_P |
+							    _PAGE_D |
+							    _PAGE_MA_WT |
+							    _PAGE_PL_0 |
+							    _PAGE_AR_RW));
+#else
+				printk(KERN_INFO "EFI_MEMORY_WT mapping\n");
+				md->virt_addr = (u64) ioremap(md->phys_addr, 0);
+#endif
+			}
+		}
+	}
 
-COMPAT_SYSCALL_DEFINE4(s390_readahead, int, fd, u32, high, u32, low, s32, count)
-{
-	return sys_readahead(fd, (unsigned long)high << 32 | low, count);
-}
+	status = efi_call_phys(__va(runtime->set_virtual_address_map),
+			       ia64_boot_param->efi_memmap_size,
+			       efi_desc_size,
+			       ia64_boot_param->efi_memdesc_version,
+			       ia64_boot_param->efi_memmap);
+	if (status != EFI_SUCCESS) {
+		printk(KERN_WARNING "warning: unable to switch EFI into "
+		       "virtual mode (status=%lu)\n", status);
+		return;
+	}
 
-struct stat64_emu31 {
-	unsigned long long  st_dev;
-	unsigned int    __pad1;
-#define STAT64_HAS_BROKEN_ST_INO        1
-	u32             __st_ino;
-	unsigned int    st_mode;
-	unsigned int    st_nlink;
-	u32             st_uid;
-	u32             st_gid;
-	unsigned long long  st_rdev;
-	unsigned int    __pad3;
-	long            st_size;
-	u32             st_blksize;
-	unsigned char   __pad4[4];
-	u32             __pad5;     /* future possible st_blocks high bits */
-	u32             st_blocks;  /* Number 512-byte blocks allocated. */
-	u32             st_atime;
-	u32             __pad6;
-	u32             st_mtime;
-	u32             __pad7;
-	u32             st_ctime;
-	u32             __pad8;     /* will be high 32 bits of ctime someday */
-	unsigned long   st_ino;
-};	
+	set_bit(EFI_RUNTIME_SERVICES, &efi.flags);
 
-static int cp_stat64(struct stat64_emu31 __user *ubuf, struct kstat *stat)
-{
-	struct stat64_emu31 tmp;
-
-	memset(&tmp, 0, sizeof(tmp));
-
-	tmp.st_dev = huge_encode_dev(stat->dev);
-	tmp.st_ino = stat->ino;
-	tmp.__st_ino = (u32)stat->ino;
-	tmp.st_mode = stat->mode;
-	tmp.st_nlink = (unsigned int)stat->nlink;
-	tmp.st_uid = from_kuid_munged(current_user_ns(), stat->uid);
-	tmp.st_gid = from_kgid_munged(current_user_ns(), stat->gid);
-	tmp.st_rdev = huge_encode_dev(stat->rdev);
-	tmp.st_size = stat->size;
-	tmp.st_blksize = (u32)stat->blksize;
-	tmp.st_blocks = (u32)stat->blocks;
-	tmp.st_atime = (u32)stat->atime.tv_sec;
-	tmp.st_mtime = (u32)stat->mtime.tv_sec;
-	tmp.st_ctime = (u32)stat->ctime.tv_sec;
-
-	return copy_to_user(ubuf,&tmp,sizeof(tmp)) ? -EFAULT : 0; 
-}
-
-COMPAT_SYSCALL_DEFINE2(s390_stat64, const char __user *, filename, struct stat64_emu31 __user *, statbuf)
-{
-	struct kstat stat;
-	int ret = vfs_stat(filename, &stat);
-	if (!ret)
-		ret = cp_stat64(statbuf, &stat);
-	return ret;
-}
-
-COMPAT_SYSCALL_DEFINE2(s390_lstat64, const char __user *, filename, struct stat64_emu31 __user *, statbuf)
-{
-	struct kstat stat;
-	int ret = vfs_lstat(filename, &stat);
-	if (!ret)
-		ret = cp_stat64(statbuf, &stat);
-	return ret;
-}
-
-COMPAT_SYSCALL_DEFINE2(s390_fstat64, unsigned int, fd, struct stat64_emu31 __user *, statbuf)
-{
-	struct kstat stat;
-	int ret = vfs_fstat(fd, &stat);
-	if (!ret)
-		ret = cp_stat64(statbuf, &stat);
-	return ret;
-}
-
-COMPAT_SYSCALL_DEFINE4(s390_fstatat64, unsigned int, dfd, const char __user *, filename,
-		       struct stat64_emu31 __user *, statbuf, int, flag)
-{
-	struct kstat stat;
-	int error;
-
-	error = vfs_fstatat(dfd, filename, &stat, flag);
-	if (error)
-		return error;
-	return cp_stat64(statbuf, &stat);
+	/*
+	 * Now that EFI is in virtual mode, we call the EFI functions more
+	 * efficiently:
+	 */
+	efi.get_time = virt_get_time;
+	efi.set_time = virt_set_time;
+	efi.get_wakeup_time = virt_get_wakeup_time;
+	efi.set_wakeup_time = virt_set_wakeup_time;
+	efi.get_variable = virt_get_variable;
+	efi.get_next_variable = virt_get_next_variable;
+	efi.set_variable = virt_set_variable;
+	efi.get_next_high_mono_count = virt_get_next_high_mono_count;
+	efi.reset_system = virt_reset_system;
 }
 
 /*
- * Linux/i386 didn't use to be able to handle more than
- * 4 system call parameters, so these system calls used a memory
- * block for parameter passing..
+ * Walk the EFI memory map looking for the I/O port range.  There can only be
+ * one entry of this type, other I/O port ranges should be described via ACPI.
  */
-
-struct mmap_arg_struct_emu31 {
-	compat_ulong_t addr;
-	compat_ulong_t len;
-	compat_ulong_t prot;
-	compat_ulong_t flags;
-	compat_ulong_t fd;
-	compat_ulong_t offset;
-};
-
-COMPAT_SYSCALL_DEFINE1(s390_old_mmap, struct mmap_arg_struct_emu31 __user *, arg)
+u64
+efi_get_iobase (void)
 {
-	struct mmap_arg_struct_emu31 a;
+	void *efi_map_start, *efi_map_end, *p;
+	efi_memory_desc_t *md;
+	u64 efi_desc_size;
 
-	if (copy_from_user(&a, arg, sizeof(a)))
-		return -EFAULT;
-	if (a.offset & ~PAGE_MASK)
-		return -EINVAL;
-	return sys_mmap_pgoff(a.addr, a.len, a.prot, a.flags, a.fd,
-			      a.offset >> PAGE_SHIFT);
+	efi_map_start = __va(ia64_boot_param->efi_memmap);
+	efi_map_end   = efi_map_start + ia64_boot_param->efi_memmap_size;
+	efi_desc_size = ia64_boot_param->efi_memdesc_size;
+
+	for (p = efi_map_start; p < efi_map_end; p += efi_desc_size) {
+		md = p;
+		if (md->type == EFI_MEMORY_MAPPED_IO_PORT_SPACE) {
+			if (md->attribute & EFI_MEMORY_UC)
+				return md->phys_addr;
+		}
+	}
+	return 0;
 }
 
-COMPAT_SYSCALL_DEFINE1(s390_mmap2, struct mmap_arg_struct_emu31 __user *, arg)
+static struct kern_memdesc *
+kern_memory_descriptor (unsigned long phys_addr)
 {
-	struct mmap_arg_struct_emu31 a;
+	struct kern_memdesc *md;
 
-	if (copy_from_user(&a, arg, sizeof(a)))
-		return -EFAULT;
-	return sys_mmap_pgoff(a.addr, a.len, a.prot, a.flags, a.fd, a.offset);
+	for (md = kern_memmap; md->start != ~0UL; md++) {
+		if (phys_addr - md->start < (md->num_pages << EFI_PAGE_SHIFT))
+			 return md;
+	}
+	return NULL;
 }
 
-COMPAT_SYSCALL_DEFINE3(s390_read, unsigned int, fd, char __user *, buf, compat_size_t, count)
+static efi_memory_desc_t *
+efi_memory_descriptor (unsigned long phys_addr)
 {
-	if ((compat_ssize_t) count < 0)
-		return -EINVAL; 
+	void *efi_map_start, *efi_map_end, *p;
+	efi_memory_desc_t *md;
+	u64 efi_desc_size;
 
-	return sys_read(fd, buf, count);
+	efi_map_start = __va(ia64_boot_param->efi_memmap);
+	efi_map_end   = efi_map_start + ia64_boot_param->efi_memmap_size;
+	efi_desc_size = ia64_boot_param->efi_memdesc_size;
+
+	for (p = efi_map_start; p < efi_map_end; p += efi_desc_size) {
+		md = p;
+
+		if (phys_addr - md->phys_addr < efi_md_size(md))
+			 return md;
+	}
+	return NULL;
 }
 
-COMPAT_SYSCALL_DEFINE3(s390_write, unsigned int, fd, const char __user *, buf, compat_size_t, count)
+static int
+efi_memmap_intersects (unsigned long phys_addr, unsigned long size)
 {
-	if ((compat_ssize_t) count < 0)
-		return -EINVAL; 
+	void *efi_map_start, *efi_map_end, *p;
+	efi_memory_desc_t *md;
+	u64 efi_desc_size;
+	unsigned long end;
 
-	return sys_write(fd, buf, count);
+	efi_map_start = __va(ia64_boot_param->efi_memmap);
+	efi_map_end   = efi_map_start + ia64_boot_param->efi_memmap_size;
+	efi_desc_size = ia64_boot_param->efi_memdesc_size;
+
+	end = phys_addr + size;
+
+	for (p = efi_map_start; p < efi_map_end; p += efi_desc_size) {
+		md = p;
+		if (md->phys_addr < end && efi_md_end(md) > phys_addr)
+			return 1;
+	}
+	return 0;
+}
+
+u32
+efi_mem_type (unsigned long phys_addr)
+{
+	efi_memory_desc_t *md = efi_memory_descriptor(phys_addr);
+
+	if (md)
+		return md->type;
+	return 0;
+}
+
+u64
+efi_mem_attributes (unsigned long phys_addr)
+{
+	efi_memory_desc_t *md = efi_memory_descriptor(phys_addr);
+
+	if (md)
+		return md->attribute;
+	return 0;
+}
+EXPORT_SYMBOL(efi_mem_attributes);
+
+u64
+efi_mem_attribute (unsigned long phys_addr, unsigned long size)
+{
+	unsigned long end = phys_addr + size;
+	efi_memory_desc_t *md = efi_memory_descriptor(phys_addr);
+	u64 attr;
+
+	if (!md)
+		return 0;
+
+	/*
+	 * EFI_MEMORY_RUNTIME is not a memory attribute; it just tells
+	 * the kernel that firmware needs this region mapped.
+	 */
+	attr = md->attribute & ~EFI_MEMORY_RUNTIME;
+	do {
+		unsigned long md_end = efi_md_end(md);
+
+		if (end <= md_end)
+			return attr;
+
+		md = efi_memory_descriptor(md_end);
+		if (!md || (md->attribute & ~EFI_MEMORY_RUNTIME) != attr)
+			return 0;
+	} while (md);
+	return 0;	/* never reached */
+}
+
+u64
+kern_mem_attribute (unsigned long phys_addr, unsigned long size)
+{
+	unsigned long end = phys_addr + size;
+	struct kern_memdesc *md;
+	u64 attr;
+
+	/*
+	 * This is a hack for ioremap calls before we set up kern_memmap.
+	 * Maybe we should do efi_memmap_init() earlier instead.
+	 */
+	if (!kern_memmap) {
+		attr = efi_mem_attribute(phys_addr, size);
+		if (attr & EFI_MEMORY_WB)
+			return EFI_MEMORY_WB;
+		return 0;
+	}
+
+	md = kern_memory_descriptor(phys_addr);
+	if (!md)
+		return 0;
+
+	attr = md->attribute;
+	do {
+		unsigned long md_end = kmd_end(md);
+
+		if (end <= md_end)
+			return attr;
+
+		md = kern_memory_descriptor(md_end);
+		if (!md || md->attribute != attr)
+			return 0;
+	} while (md);
+	return 0;	/* never reached */
+}
+EXPORT_SYMBOL(kern_mem_attribute);
+
+int
+valid_phys_addr_range (phys_addr_t phys_addr, unsigned long size)
+{
+	u64 attr;
+
+	/*
+	 * /dev/mem reads and writes use copy_to_user(), which implicitly
+	 * uses a granule-sized kernel identity mapping.  It's really
+	 * only safe to do this for regions in kern_memmap.  For more
+	 * details, see Documentation/ia64/aliasing.txt.
+	 */
+	attr = kern_mem_attribute(phys_addr, size);
+	if (attr & EFI_MEMORY_WB || attr & EFI_MEMORY_UC)
+		return 1;
+	return 0;
+}
+
+int
+valid_mmap_phys_addr_range (unsigned long pfn, unsigned long size)
+{
+	unsigned long phys_addr = pfn << PAGE_SHIFT;
+	u64 attr;
+
+	attr = efi_mem_attribute(phys_addr, size);
+
+	/*
+	 * /dev/mem mmap uses normal user pages, so we don't need the entire
+	 * granule, but the entire region we're mapping must support the same
+	 * attribute.
+	 */
+	if (attr & EFI_MEMORY_WB || attr & EFI_MEMORY_UC)
+		return 1;
+
+	/*
+	 * Intel firmware doesn't tell us about all the MMIO regions, so
+	 * in general we have to allow mmap requests.  But if EFI *does*
+	 * tell us about anything inside this region, we should deny it.
+	 * The user can always map a smaller region to avoid the overlap.
+	 */
+	if (efi_memmap_intersects(phys_addr, size))
+		return 0;
+
+	return 1;
+}
+
+pgprot_t
+phys_mem_access_prot(struct file *file, unsigned long pfn, unsigned long size,
+		     pgprot_t vma_prot)
+{
+	unsigned long phys_addr = pfn << PAGE_SHIFT;
+	u64 attr;
+
+	/*
+	 * For /dev/mem mmap, we use user mappings, but if the region is
+	 * in kern_memmap (and hence may be covered by a kernel mapping),
+	 * we must use the same attribute as the kernel mapping.
+	 */
+	attr = kern_mem_attribute(phys_addr, size);
+	if (attr & EFI_MEMORY_WB)
+		return pgprot_cacheable(vma_prot);
+	else if (attr & EFI_MEMORY_UC)
+		return pgprot_noncached(vma_prot);
+
+	/*
+	 * Some chipsets don't support UC access to memory.  If
+	 * WB is supported, we prefer that.
+	 */
+	if (efi_mem_attribute(phys_addr, size) & EFI_MEMORY_WB)
+		return pgprot_cacheable(vma_prot);
+
+	return pgprot_noncached(vma_prot);
+}
+
+int __init
+efi_uart_console_only(void)
+{
+	efi_status_t status;
+	char *s, name[] = "ConOut";
+	efi_guid_t guid = EFI_GLOBAL_VARIABLE_GUID;
+	efi_char16_t *utf16, name_utf16[32];
+	unsigned char data[1024];
+	unsigned long size = sizeof(data);
+	struct efi_generic_dev_path *hdr, *end_addr;
+	int uart = 0;
+
+	/* Convert to UTF-16 */
+	utf16 = name_utf16;
+	s = name;
+	while (*s)
+		*utf16++ = *s++ & 0x7f;
+	*utf16 = 0;
+
+	status = efi.get_variable(name_utf16, &guid, NULL, &size, data);
+	if (status != EFI_SUCCESS) {
+		printk(KERN_ERR "No EFI %s variable?\n", name);
+		return 0;
+	}
+
+	hdr = (struct efi_generic_dev_path *) data;
+	end_addr = (struct efi_generic_dev_path *) ((u8 *) data + size);
+	while (hdr < end_addr) {
+		if (hdr->type == EFI_DEV_MSG &&
+		    hdr->sub_type == EFI_DEV_MSG_UART)
+			uart = 1;
+		else if (hdr->type == EFI_DEV_END_PATH ||
+			  hdr->type == EFI_DEV_END_PATH2) {
+			if (!uart)
+				return 0;
+			if (hdr->sub_type == EFI_DEV_END_ENTIRE)
+				return 1;
+			uart = 0;
+		}
+		hdr = (struct efi_generic_dev_path *)((u8 *) hdr + hdr->length);
+	}
+	printk(KERN_ERR "Malformed %s value\n", name);
+	return 0;
 }
 
 /*
- * 31 bit emulation wrapper functions for sys_fadvise64/fadvise64_64.
- * These need to rewrite the advise values for POSIX_FADV_{DONTNEED,NOREUSE}
- * because the 31 bit values differ from the 64 bit values.
+ * Look for the first granule aligned memory descriptor memory
+ * that is big enough to hold EFI memory map. Make sure this
+ * descriptor is atleast granule sized so it does not get trimmed
  */
-
-COMPAT_SYSCALL_DEFINE5(s390_fadvise64, int, fd, u32, high, u32, low, compat_size_t, len, int, advise)
+struct kern_memdesc *
+find_memmap_space (void)
 {
-	if (advise == 4)
-		advise = POSIX_FADV_DONTNEED;
-	else if (advise == 5)
-		advise = POSIX_FADV_NOREUSE;
-	return sys_fadvise64(fd, (unsigned long)high << 32 | low, len, advise);
+	u64	contig_low=0, contig_high=0;
+	u64	as = 0, ae;
+	void *efi_map_start, *efi_map_end, *p, *q;
+	efi_memory_desc_t *md, *pmd = NULL, *check_md;
+	u64	space_needed, efi_desc_size;
+	unsigned long total_mem = 0;
+
+	efi_map_start = __va(ia64_boot_param->efi_memmap);
+	efi_map_end   = efi_map_start + ia64_boot_param->efi_memmap_size;
+	efi_desc_size = ia64_boot_param->efi_memdesc_size;
+
+	/*
+	 * Worst case: we need 3 kernel descriptors for each efi descriptor
+	 * (if every entry has a WB part in the middle, and UC head and tail),
+	 * plus one for the end marker.
+	 */
+	space_needed = sizeof(kern_memdesc_t) *
+		(3 * (ia64_boot_param->efi_memmap_size/efi_desc_size) + 1);
+
+	for (p = efi_map_start; p < efi_map_end; pmd = md, p += efi_desc_size) {
+		md = p;
+		if (!efi_wb(md)) {
+			continue;
+		}
+		if (pmd == NULL || !efi_wb(pmd) ||
+		    efi_md_end(pmd) != md->phys_addr) {
+			contig_low = GRANULEROUNDUP(md->phys_addr);
+			contig_high = efi_md_end(md);
+			for (q = p + efi_desc_size; q < efi_map_end;
+			     q += efi_desc_size) {
+				check_md = q;
+				if (!efi_wb(check_md))
+					break;
+				if (contig_high != check_md->phys_addr)
+					break;
+				contig_high = efi_md_end(check_md);
+			}
+			contig_high = GRANULEROUNDDOWN(contig_high);
+		}
+		if (!is_memory_available(md) || md->type == EFI_LOADER_DATA)
+			continue;
+
+		/* Round ends inward to granule boundaries */
+		as = max(contig_low, md->phys_addr);
+		ae = min(contig_high, efi_md_end(md));
+
+		/* keep within max_addr= and min_addr= command line arg */
+		as = max(as, min_addr);
+		ae = min(ae, max_addr);
+		if (ae <= as)
+			continue;
+
+		/* avoid going over mem= command line arg */
+		if (total_mem + (ae - as) > mem_limit)
+			ae -= total_mem + (ae - as) - mem_limit;
+
+		if (ae <= as)
+			continue;
+
+		if (ae - as > space_needed)
+			break;
+	}
+	if (p >= efi_map_end)
+		panic("Can't allocate space for kernel memory descriptors");
+
+	return __va(as);
 }
 
-struct fadvise64_64_args {
-	int fd;
-	long long offset;
-	long long len;
-	int advice;
-};
-
-COMPAT_SYSCALL_DEFINE1(s390_fadvise64_64, struct fadvise64_64_args __user *, args)
+/*
+ * Walk the EFI memory map and gather all memory available for kernel
+ * to use.  We can allocate partial granules only if the unavailable
+ * parts exist, and are WB.
+ */
+unsigned long
+efi_memmap_init(u64 *s, u64 *e)
 {
-	struct fadvise64_64_args a;
+	struct kern_memdesc *k, *prev = NULL;
+	u64	contig_low=0, contig_high=0;
+	u64	as, ae, lim;
+	void *efi_map_start, *efi_map_end, *p, *q;
+	efi_memory_desc_t *md, *pmd = NULL, *check_md;
+	u64	efi_desc_size;
+	unsigned long total_mem = 0;
 
-	if ( copy_from_user(&a, args, sizeof(a)) )
-		return -EFAULT;
-	if (a.advice == 4)
-		a.advice = POSIX_FADV_DONTNEED;
-	else if (a.advice == 5)
-		a.advice = POSIX_FADV_NOREUSE;
-	return sys_fadvise64_64(a.fd, a.offset, a.len, a.advice);
-}
+	k = kern_memmap = find_memmap_space();
 
-COMPAT_SYSCALL_DEFINE6(s390_sync_file_range, int, fd, u32, offhigh, u32, offlow,
-		       u32, nhigh, u32, nlow, unsigned int, flags)
-{
-	return sys_sync_file_range(fd, ((loff_t)offhigh << 32) + offlow,
-				   ((u64)nhigh << 32) + nlow, flags);
-}
+	efi_map_start = __va(ia64_boot_param->efi_memmap);
+	efi_map_end   = efi_map_start + ia64_boot_param->efi_memmap_size;
+	efi_desc_size = ia64_boot_param->efi_memdesc_size;
 
-COMPAT_SYSCALL_DEFINE6(s390_fallocate, int, fd, int, mode, u32, offhigh, u32, offlow,
-		       u32, lenhigh, u32, lenlow)
-{
-	return sys_fallocate(fd, mode, ((loff_t)offhigh << 32) + offlow,
-			     ((u64)lenhigh << 32) + lenlow);
-}
+	for (p = efi_map_start; p < efi_map_end; pmd = md, p += efi_desc_size) {
+		md = p;
+		if (!efi_wb(md)) {
+			if (efi_uc(md) &&
+			    (md->type == EFI_CONVENTIONAL_MEMORY ||
+			     md->type == EFI_BOOT_SERVICES_DATA)) {
+				k->attribute = EFI_MEMORY_UC;
+				k->start = md->phys_addr;
+				k->num_pages = md->num_pages;
+				k++;
+			}
+			continue;
+		}
+		if (pmd == NULL || !efi_wb(pmd) ||
+		    efi_md_end(pmd) != md->phys_addr) {
+			contig_low = GRANULEROUNDUP(md->phys_addr);
+			contig_high = efi_md_end(md);
+			for (q = p + efi_desc_size; q < efi_map_end;
+			     q += efi_desc_size) {
+				check_md = q;
+				if (!efi_wb(check_md))
+					break;
+				if (contig_high != check_md->phys_addr)
+					break;
+				contig_high = efi_md_end(check_md);
+			}
+			contig_high = GRANULEROUNDDOWN(contig_high);
+		}
+		if (!is_memory_available(md))
+			continue;
+
+		/*
+		 * Round ends inward to granule boundaries
+		 * Give trimmings to uncached allocator
+		 */
+		if (md->phys_addr < contig_low) {
+			lim = min(efi_md_end(md), contig_low);
+			if (efi_uc(md)) {
+				if (k > kern_memmap &&
+				    (k-1)->attribute == EFI_MEMORY_UC &&
+				    kmd_end(k-1) == md->phys_addr) {
+					(k-1)->num

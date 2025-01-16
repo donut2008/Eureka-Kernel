@@ -1,4 +1,4 @@
-obj-$(CONFIG_VMWARE_VMCI) += vmw_vmci.o
-vmw_vmci-y += vmci_context.o vmci_datagram.o vmci_doorbell.o \
-	vmci_driver.o vmci_event.o vmci_guest.o vmci_handle_array.o \
-	vmci_host.o vmci_queue_pair.o vmci_resource.o vmci_route.o
+ION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_12_EQU

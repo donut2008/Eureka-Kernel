@@ -1,30 +1,13 @@
-/*
- * Driver for Virtual PS/2 Mouse on VMware and QEMU hypervisors.
- *
- * Copyright (C) 2014, VMware, Inc. All Rights Reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- */
-
-#ifndef _VMMOUSE_H
-#define _VMMOUSE_H
-
-#ifdef CONFIG_MOUSE_PS2_VMMOUSE
-#define VMMOUSE_PSNAME  "VirtualPS/2"
-
-int vmmouse_detect(struct psmouse *psmouse, bool set_properties);
-int vmmouse_init(struct psmouse *psmouse);
-#else
-static inline int vmmouse_detect(struct psmouse *psmouse, bool set_properties)
-{
-	return -ENOSYS;
-}
-static inline int vmmouse_init(struct psmouse *psmouse)
-{
-	return -ENOSYS;
-}
-#endif
-
-#endif
+_0__S1_Y__SHIFT 0xc
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0__S2_X_MASK 0xf0000
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0__S2_X__SHIFT 0x10
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0__S2_Y_MASK 0xf00000
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0__S2_Y__SHIFT 0x14
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0__S3_X_MASK 0xf000000
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0__S3_X__SHIFT 0x18
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0__S3_Y_MASK 0xf0000000
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_0__S3_Y__SHIFT 0x1c
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_1__S4_X_MASK 0xf
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_1__S4_X__SHIFT 0x0
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_1__S4_Y_MASK 0xf0
+#define PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y1_1__S4_Y__SHIFT 0

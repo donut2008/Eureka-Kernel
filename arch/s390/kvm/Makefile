@@ -1,17 +1,20 @@
-# Makefile for kernel virtual machines on s390
-#
-# Copyright IBM Corp. 2008
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License (version 2 only)
-# as published by the Free Software Foundation.
+/*
+ * PAL Firmware support
+ * IA-64 Processor Programmers Reference Vol 2
+ *
+ * Copyright (C) 1999 Don Dugger <don.dugger@intel.com>
+ * Copyright (C) 1999 Walt Drummond <drummond@valinux.com>
+ * Copyright (C) 1999-2001, 2003 Hewlett-Packard Co
+ *	David Mosberger <davidm@hpl.hp.com>
+ *	Stephane Eranian <eranian@hpl.hp.com>
+ *
+ * 05/22/2000 eranian Added support for stacked register calls
+ * 05/24/2000 eranian Added support for physical mode static calls
+ */
 
-KVM := ../../../virt/kvm
-common-objs = $(KVM)/kvm_main.o $(KVM)/eventfd.o  $(KVM)/async_pf.o $(KVM)/irqchip.o
+#include <asm/asmmacro.h>
+#include <asm/processor.h>
 
-ccflags-y := -Ivirt/kvm -Iarch/s390/kvm
-
-kvm-objs := $(common-objs) kvm-s390.o intercept.o interrupt.o priv.o sigp.o
-kvm-objs += diag.o gaccess.o guestdbg.o
-
-obj-$(CONFIG_KVM) += kvm.o
+	.data
+pal_entry_point:
+	data8 ia64_pal_default_ha

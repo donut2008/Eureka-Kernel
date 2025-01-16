@@ -1,1 +1,1 @@
-obj-$(CONFIG_ETRAX_ARCH_V10) += eth_v10.o
+,sTyใ๏sXคต•ฅ M|ุ(ฦ์0๒Dผ807ฎaXþ่อํฌสk

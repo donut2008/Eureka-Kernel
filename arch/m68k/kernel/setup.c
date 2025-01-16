@@ -1,5 +1,1 @@
-#ifdef CONFIG_MMU
-#include "setup_mm.c"
-#else
-#include "setup_no.c"
-#endif
+oVEoVEoVE´VEoVEÖaEbTEbTE)NE)NEbTEbTE)NE)NE)NE)NE)NEbTE)NE

@@ -1,169 +1,79 @@
-/*
- * USB Serial "Simple" driver
- *
- * Copyright (C) 2001-2006,2008,2013 Greg Kroah-Hartman <greg@kroah.com>
- * Copyright (C) 2005 Arthur Huillet (ahuillet@users.sf.net)
- * Copyright (C) 2005 Thomas Hergenhahn <thomas.hergenhahn@suse.de>
- * Copyright (C) 2009 Outpost Embedded, LLC
- * Copyright (C) 2010 Zilogic Systems <code@zilogic.com>
- * Copyright (C) 2013 Wei Shuai <cpuwolf@gmail.com>
- * Copyright (C) 2013 Linux Foundation
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License version
- *	2 as published by the Free Software Foundation.
- */
-
-#include <linux/kernel.h>
-#include <linux/tty.h>
-#include <linux/module.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-
-#define DEVICE_N(vendor, IDS, nport)				\
-static const struct usb_device_id vendor##_id_table[] = {	\
-	IDS(),							\
-	{ },							\
-};								\
-static struct usb_serial_driver vendor##_device = {		\
-	.driver = {						\
-		.owner =	THIS_MODULE,			\
-		.name =		#vendor,			\
-	},							\
-	.id_table =		vendor##_id_table,		\
-	.num_ports =		nport,				\
-};
-
-#define DEVICE(vendor, IDS)	DEVICE_N(vendor, IDS, 1)
-
-/* Medtronic CareLink USB driver */
-#define CARELINK_IDS()			\
-	{ USB_DEVICE(0x0a21, 0x8001) }	/* MMT-7305WW */
-DEVICE(carelink, CARELINK_IDS);
-
-/* ZIO Motherboard USB driver */
-#define ZIO_IDS()			\
-	{ USB_DEVICE(0x1CBE, 0x0103) }
-DEVICE(zio, ZIO_IDS);
-
-/* Funsoft Serial USB driver */
-#define FUNSOFT_IDS()			\
-	{ USB_DEVICE(0x1404, 0xcddc) }
-DEVICE(funsoft, FUNSOFT_IDS);
-
-/* Infineon Flashloader driver */
-#define FLASHLOADER_IDS()		\
-	{ USB_DEVICE_INTERFACE_CLASS(0x058b, 0x0041, USB_CLASS_CDC_DATA) }, \
-	{ USB_DEVICE(0x8087, 0x0716) }, \
-	{ USB_DEVICE(0x8087, 0x0801) }
-DEVICE(flashloader, FLASHLOADER_IDS);
-
-/* Google Serial USB SubClass */
-#define GOOGLE_IDS()						\
-	{ USB_VENDOR_AND_INTERFACE_INFO(0x18d1,			\
-					USB_CLASS_VENDOR_SPEC,	\
-					0x50,			\
-					0x01) }
-DEVICE(google, GOOGLE_IDS);
-
-/* KAUFMANN RKS+CAN VCP */
-#define KAUFMANN_IDS()			\
-	{ USB_DEVICE(0x16d0, 0x0870) }
-DEVICE(kaufmann, KAUFMANN_IDS);
-
-/* Libtransistor USB console */
-#define LIBTRANSISTOR_IDS()			\
-	{ USB_DEVICE(0x1209, 0x8b00) }
-DEVICE(libtransistor, LIBTRANSISTOR_IDS);
-
-/* ViVOpay USB Serial Driver */
-#define VIVOPAY_IDS()			\
-	{ USB_DEVICE(0x1d5f, 0x1004) }	/* ViVOpay 8800 */
-DEVICE(vivopay, VIVOPAY_IDS);
-
-/* Motorola USB Phone driver */
-#define MOTO_IDS()			\
-	{ USB_DEVICE(0x05c6, 0x3197) },	/* unknown Motorola phone */	\
-	{ USB_DEVICE(0x0c44, 0x0022) },	/* unknown Motorola phone */	\
-	{ USB_DEVICE(0x22b8, 0x2a64) },	/* Motorola KRZR K1m */		\
-	{ USB_DEVICE(0x22b8, 0x2c84) },	/* Motorola VE240 phone */	\
-	{ USB_DEVICE(0x22b8, 0x2c64) }	/* Motorola V950 phone */
-DEVICE(moto_modem, MOTO_IDS);
-
-/* Motorola Tetra driver */
-#define MOTOROLA_TETRA_IDS()			\
-	{ USB_DEVICE(0x0cad, 0x9011) },	/* Motorola Solutions TETRA PEI */ \
-	{ USB_DEVICE(0x0cad, 0x9012) },	/* MTP6550 */ \
-	{ USB_DEVICE(0x0cad, 0x9013) },	/* MTP3xxx */ \
-	{ USB_DEVICE(0x0cad, 0x9015) },	/* MTP85xx */ \
-	{ USB_DEVICE(0x0cad, 0x9016) }	/* TPG2200 */
-DEVICE(motorola_tetra, MOTOROLA_TETRA_IDS);
-
-/* Nokia mobile phone driver */
-#define NOKIA_IDS()			\
-	{ USB_DEVICE(0x0421, 0x069a) }	/* Nokia 130 (RM-1035) */
-DEVICE(nokia, NOKIA_IDS);
-
-/* Novatel Wireless GPS driver */
-#define NOVATEL_IDS()			\
-	{ USB_DEVICE(0x09d7, 0x0100) }	/* NovAtel FlexPack GPS */
-DEVICE_N(novatel_gps, NOVATEL_IDS, 3);
-
-/* HP4x (48/49) Generic Serial driver */
-#define HP4X_IDS()			\
-	{ USB_DEVICE(0x03f0, 0x0121) }
-DEVICE(hp4x, HP4X_IDS);
-
-/* Suunto ANT+ USB Driver */
-#define SUUNTO_IDS()			\
-	{ USB_DEVICE(0x0fcf, 0x1008) },	\
-	{ USB_DEVICE(0x0fcf, 0x1009) } /* Dynastream ANT USB-m Stick */
-DEVICE(suunto, SUUNTO_IDS);
-
-/* Siemens USB/MPI adapter */
-#define SIEMENS_IDS()			\
-	{ USB_DEVICE(0x908, 0x0004) }
-DEVICE(siemens_mpi, SIEMENS_IDS);
-
-/* All of the above structures mushed into two lists */
-static struct usb_serial_driver * const serial_drivers[] = {
-	&carelink_device,
-	&zio_device,
-	&funsoft_device,
-	&flashloader_device,
-	&google_device,
-	&kaufmann_device,
-	&libtransistor_device,
-	&vivopay_device,
-	&moto_modem_device,
-	&motorola_tetra_device,
-	&nokia_device,
-	&novatel_gps_device,
-	&hp4x_device,
-	&suunto_device,
-	&siemens_mpi_device,
-	NULL
-};
-
-static const struct usb_device_id id_table[] = {
-	CARELINK_IDS(),
-	ZIO_IDS(),
-	FUNSOFT_IDS(),
-	FLASHLOADER_IDS(),
-	GOOGLE_IDS(),
-	KAUFMANN_IDS(),
-	LIBTRANSISTOR_IDS(),
-	VIVOPAY_IDS(),
-	MOTO_IDS(),
-	MOTOROLA_TETRA_IDS(),
-	NOKIA_IDS(),
-	NOVATEL_IDS(),
-	HP4X_IDS(),
-	SUUNTO_IDS(),
-	SIEMENS_IDS(),
-	{ },
-};
-MODULE_DEVICE_TABLE(usb, id_table);
-
-module_usb_serial_driver(serial_drivers, id_table);
-MODULE_LICENSE("GPL");
+define D3F5_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END__SHIFT 0x13
+#define D3F5_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END_MASK 0x7e000000
+#define D3F5_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END__SHIFT 0x19
+#define D3F5_PCIE_LC_STATE0__LC_CURRENT_STATE_MASK 0x3f
+#define D3F5_PCIE_LC_STATE0__LC_CURRENT_STATE__SHIFT 0x0
+#define D3F5_PCIE_LC_STATE0__LC_PREV_STATE1_MASK 0x3f00
+#define D3F5_PCIE_LC_STATE0__LC_PREV_STATE1__SHIFT 0x8
+#define D3F5_PCIE_LC_STATE0__LC_PREV_STATE2_MASK 0x3f0000
+#define D3F5_PCIE_LC_STATE0__LC_PREV_STATE2__SHIFT 0x10
+#define D3F5_PCIE_LC_STATE0__LC_PREV_STATE3_MASK 0x3f000000
+#define D3F5_PCIE_LC_STATE0__LC_PREV_STATE3__SHIFT 0x18
+#define D3F5_PCIE_LC_STATE1__LC_PREV_STATE4_MASK 0x3f
+#define D3F5_PCIE_LC_STATE1__LC_PREV_STATE4__SHIFT 0x0
+#define D3F5_PCIE_LC_STATE1__LC_PREV_STATE5_MASK 0x3f00
+#define D3F5_PCIE_LC_STATE1__LC_PREV_STATE5__SHIFT 0x8
+#define D3F5_PCIE_LC_STATE1__LC_PREV_STATE6_MASK 0x3f0000
+#define D3F5_PCIE_LC_STATE1__LC_PREV_STATE6__SHIFT 0x10
+#define D3F5_PCIE_LC_STATE1__LC_PREV_STATE7_MASK 0x3f000000
+#define D3F5_PCIE_LC_STATE1__LC_PREV_STATE7__SHIFT 0x18
+#define D3F5_PCIE_LC_STATE2__LC_PREV_STATE8_MASK 0x3f
+#define D3F5_PCIE_LC_STATE2__LC_PREV_STATE8__SHIFT 0x0
+#define D3F5_PCIE_LC_STATE2__LC_PREV_STATE9_MASK 0x3f00
+#define D3F5_PCIE_LC_STATE2__LC_PREV_STATE9__SHIFT 0x8
+#define D3F5_PCIE_LC_STATE2__LC_PREV_STATE10_MASK 0x3f0000
+#define D3F5_PCIE_LC_STATE2__LC_PREV_STATE10__SHIFT 0x10
+#define D3F5_PCIE_LC_STATE2__LC_PREV_STATE11_MASK 0x3f000000
+#define D3F5_PCIE_LC_STATE2__LC_PREV_STATE11__SHIFT 0x18
+#define D3F5_PCIE_LC_STATE3__LC_PREV_STATE12_MASK 0x3f
+#define D3F5_PCIE_LC_STATE3__LC_PREV_STATE12__SHIFT 0x0
+#define D3F5_PCIE_LC_STATE3__LC_PREV_STATE13_MASK 0x3f00
+#define D3F5_PCIE_LC_STATE3__LC_PREV_STATE13__SHIFT 0x8
+#define D3F5_PCIE_LC_STATE3__LC_PREV_STATE14_MASK 0x3f0000
+#define D3F5_PCIE_LC_STATE3__LC_PREV_STATE14__SHIFT 0x10
+#define D3F5_PCIE_LC_STATE3__LC_PREV_STATE15_MASK 0x3f000000
+#define D3F5_PCIE_LC_STATE3__LC_PREV_STATE15__SHIFT 0x18
+#define D3F5_PCIE_LC_STATE4__LC_PREV_STATE16_MASK 0x3f
+#define D3F5_PCIE_LC_STATE4__LC_PREV_STATE16__SHIFT 0x0
+#define D3F5_PCIE_LC_STATE4__LC_PREV_STATE17_MASK 0x3f00
+#define D3F5_PCIE_LC_STATE4__LC_PREV_STATE17__SHIFT 0x8
+#define D3F5_PCIE_LC_STATE4__LC_PREV_STATE18_MASK 0x3f0000
+#define D3F5_PCIE_LC_STATE4__LC_PREV_STATE18__SHIFT 0x10
+#define D3F5_PCIE_LC_STATE4__LC_PREV_STATE19_MASK 0x3f000000
+#define D3F5_PCIE_LC_STATE4__LC_PREV_STATE19__SHIFT 0x18
+#define D3F5_PCIE_LC_STATE5__LC_PREV_STATE20_MASK 0x3f
+#define D3F5_PCIE_LC_STATE5__LC_PREV_STATE20__SHIFT 0x0
+#define D3F5_PCIE_LC_STATE5__LC_PREV_STATE21_MASK 0x3f00
+#define D3F5_PCIE_LC_STATE5__LC_PREV_STATE21__SHIFT 0x8
+#define D3F5_PCIE_LC_STATE5__LC_PREV_STATE22_MASK 0x3f0000
+#define D3F5_PCIE_LC_STATE5__LC_PREV_STATE22__SHIFT 0x10
+#define D3F5_PCIE_LC_STATE5__LC_PREV_STATE23_MASK 0x3f000000
+#define D3F5_PCIE_LC_STATE5__LC_PREV_STATE23__SHIFT 0x18
+#define D3F5_PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT_MASK 0x3
+#define D3F5_PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT__SHIFT 0x0
+#define D3F5_PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT_MASK 0xc
+#define D3F5_PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT__SHIFT 0x2
+#define D3F5_PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT_MASK 0x30
+#define D3F5_PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT__SHIFT 0x4
+#define D3F5_PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT_MASK 0xc0
+#define D3F5_PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT__SHIFT 0x6
+#define D3F5_PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL_MASK 0x700
+#define D3F5_PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL__SHIFT 0x8
+#define D3F5_PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET_MASK 0x800
+#define D3F5_PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET__SHIFT 0xb
+#define D3F5_PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS_MASK 0x1000
+#define D3F5_PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS__SHIFT 0xc
+#define D3F5_PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE_MASK 0x2000
+#define D3F5_PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE__SHIFT 0xd
+#define D3F5_PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES_MASK 0x4000
+#define D3F5_PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES__SHIFT 0xe
+#define D3F5_PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS_MASK 0x8000
+#define D3F5_PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS__SHIFT 0xf
+#define D3F5_PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION_MASK 0x70000
+#define D3F5_PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION__SHIFT 0x10
+#define D3F5_PCIEP_STRAP_MISC__STRAP_REVERSE_LANES_MASK 0x1
+#define D3F5_PCIEP_STRAP_MISC__STRAP_REVERSE_LANES__SHIFT 0x0
+#define D3F5_PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN_MASK 0x2
+#define D3F5_PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN__SHIFT 0x1
+#define D3F5_PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED_MASK 0x4
+#define D3F5_PCIEP_STRAP_MISC__STRAP_EX

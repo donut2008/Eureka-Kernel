@@ -1,627 +1,283 @@
-/*
- * EHCI-compliant USB host controller driver for NVIDIA Tegra SoCs
- *
- * Copyright (C) 2010 Google, Inc.
- * Copyright (C) 2009 - 2013 NVIDIA Corporation
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2 of the License, or (at your
- * option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-
-#include <linux/clk.h>
-#include <linux/dma-mapping.h>
-#include <linux/err.h>
-#include <linux/gpio.h>
-#include <linux/io.h>
-#include <linux/irq.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/of_gpio.h>
-#include <linux/platform_device.h>
-#include <linux/pm_runtime.h>
-#include <linux/reset.h>
-#include <linux/slab.h>
-#include <linux/usb/ehci_def.h>
-#include <linux/usb/tegra_usb_phy.h>
-#include <linux/usb.h>
-#include <linux/usb/hcd.h>
-#include <linux/usb/otg.h>
-
-#include "ehci.h"
-
-#define PORT_WAKE_BITS (PORT_WKOC_E|PORT_WKDISC_E|PORT_WKCONN_E)
-
-#define TEGRA_USB_DMA_ALIGN 32
-
-#define DRIVER_DESC "Tegra EHCI driver"
-#define DRV_NAME "tegra-ehci"
-
-static struct hc_driver __read_mostly tegra_ehci_hc_driver;
-static bool usb1_reset_attempted;
-
-struct tegra_ehci_soc_config {
-	bool has_hostpc;
-};
-
-struct tegra_ehci_hcd {
-	struct tegra_usb_phy *phy;
-	struct clk *clk;
-	struct reset_control *rst;
-	int port_resuming;
-	bool needs_double_reset;
-	enum tegra_usb_phy_port_speed port_speed;
-};
-
-/*
- * The 1st USB controller contains some UTMI pad registers that are global for
- * all the controllers on the chip. Those registers are also cleared when
- * reset is asserted to the 1st controller. This means that the 1st controller
- * can only be reset when no other controlled has finished probing. So we'll
- * reset the 1st controller before doing any other setup on any of the
- * controllers, and then never again.
- *
- * Since this is a PHY issue, the Tegra PHY driver should probably be doing
- * the resetting of the USB controllers. But to keep compatibility with old
- * device trees that don't have reset phandles in the PHYs, do it here.
- * Those old DTs will be vulnerable to total USB breakage if the 1st EHCI
- * device isn't the first one to finish probing, so warn them.
- */
-static int tegra_reset_usb_controller(struct platform_device *pdev)
-{
-	struct device_node *phy_np;
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-	struct tegra_ehci_hcd *tegra =
-		(struct tegra_ehci_hcd *)hcd_to_ehci(hcd)->priv;
-
-	phy_np = of_parse_phandle(pdev->dev.of_node, "nvidia,phy", 0);
-	if (!phy_np)
-		return -ENOENT;
-
-	if (!usb1_reset_attempted) {
-		struct reset_control *usb1_reset;
-
-		usb1_reset = of_reset_control_get(phy_np, "utmi-pads");
-		if (IS_ERR(usb1_reset)) {
-			dev_warn(&pdev->dev,
-				 "can't get utmi-pads reset from the PHY\n");
-			dev_warn(&pdev->dev,
-				 "continuing, but please update your DT\n");
-		} else {
-			reset_control_assert(usb1_reset);
-			udelay(1);
-			reset_control_deassert(usb1_reset);
-		}
-
-		reset_control_put(usb1_reset);
-		usb1_reset_attempted = true;
-	}
-
-	if (!of_property_read_bool(phy_np, "nvidia,has-utmi-pad-registers")) {
-		reset_control_assert(tegra->rst);
-		udelay(1);
-		reset_control_deassert(tegra->rst);
-	}
-
-	of_node_put(phy_np);
-
-	return 0;
-}
-
-static int tegra_ehci_internal_port_reset(
-	struct ehci_hcd	*ehci,
-	u32 __iomem	*portsc_reg
-)
-{
-	u32		temp;
-	unsigned long	flags;
-	int		retval = 0;
-	int		i, tries;
-	u32		saved_usbintr;
-
-	spin_lock_irqsave(&ehci->lock, flags);
-	saved_usbintr = ehci_readl(ehci, &ehci->regs->intr_enable);
-	/* disable USB interrupt */
-	ehci_writel(ehci, 0, &ehci->regs->intr_enable);
-	spin_unlock_irqrestore(&ehci->lock, flags);
-
-	/*
-	 * Here we have to do Port Reset at most twice for
-	 * Port Enable bit to be set.
-	 */
-	for (i = 0; i < 2; i++) {
-		temp = ehci_readl(ehci, portsc_reg);
-		temp |= PORT_RESET;
-		ehci_writel(ehci, temp, portsc_reg);
-		mdelay(10);
-		temp &= ~PORT_RESET;
-		ehci_writel(ehci, temp, portsc_reg);
-		mdelay(1);
-		tries = 100;
-		do {
-			mdelay(1);
-			/*
-			 * Up to this point, Port Enable bit is
-			 * expected to be set after 2 ms waiting.
-			 * USB1 usually takes extra 45 ms, for safety,
-			 * we take 100 ms as timeout.
-			 */
-			temp = ehci_readl(ehci, portsc_reg);
-		} while (!(temp & PORT_PE) && tries--);
-		if (temp & PORT_PE)
-			break;
-	}
-	if (i == 2)
-		retval = -ETIMEDOUT;
-
-	/*
-	 * Clear Connect Status Change bit if it's set.
-	 * We can't clear PORT_PEC. It will also cause PORT_PE to be cleared.
-	 */
-	if (temp & PORT_CSC)
-		ehci_writel(ehci, PORT_CSC, portsc_reg);
-
-	/*
-	 * Write to clear any interrupt status bits that might be set
-	 * during port reset.
-	 */
-	temp = ehci_readl(ehci, &ehci->regs->status);
-	ehci_writel(ehci, temp, &ehci->regs->status);
-
-	/* restore original interrupt enable bits */
-	ehci_writel(ehci, saved_usbintr, &ehci->regs->intr_enable);
-	return retval;
-}
-
-static int tegra_ehci_hub_control(
-	struct usb_hcd	*hcd,
-	u16		typeReq,
-	u16		wValue,
-	u16		wIndex,
-	char		*buf,
-	u16		wLength
-)
-{
-	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
-	struct tegra_ehci_hcd *tegra = (struct tegra_ehci_hcd *)ehci->priv;
-	u32 __iomem	*status_reg;
-	u32		temp;
-	unsigned long	flags;
-	int		retval = 0;
-
-	status_reg = &ehci->regs->port_status[(wIndex & 0xff) - 1];
-
-	spin_lock_irqsave(&ehci->lock, flags);
-
-	if (typeReq == GetPortStatus) {
-		temp = ehci_readl(ehci, status_reg);
-		if (tegra->port_resuming && !(temp & PORT_SUSPEND)) {
-			/* Resume completed, re-enable disconnect detection */
-			tegra->port_resuming = 0;
-			tegra_usb_phy_postresume(hcd->usb_phy);
-		}
-	}
-
-	else if (typeReq == SetPortFeature && wValue == USB_PORT_FEAT_SUSPEND) {
-		temp = ehci_readl(ehci, status_reg);
-		if ((temp & PORT_PE) == 0 || (temp & PORT_RESET) != 0) {
-			retval = -EPIPE;
-			goto done;
-		}
-
-		temp &= ~(PORT_RWC_BITS | PORT_WKCONN_E);
-		temp |= PORT_WKDISC_E | PORT_WKOC_E;
-		ehci_writel(ehci, temp | PORT_SUSPEND, status_reg);
-
-		/*
-		 * If a transaction is in progress, there may be a delay in
-		 * suspending the port. Poll until the port is suspended.
-		 */
-		if (ehci_handshake(ehci, status_reg, PORT_SUSPEND,
-						PORT_SUSPEND, 5000))
-			pr_err("%s: timeout waiting for SUSPEND\n", __func__);
-
-		set_bit((wIndex & 0xff) - 1, &ehci->suspended_ports);
-		goto done;
-	}
-
-	/* For USB1 port we need to issue Port Reset twice internally */
-	if (tegra->needs_double_reset &&
-	   (typeReq == SetPortFeature && wValue == USB_PORT_FEAT_RESET)) {
-		spin_unlock_irqrestore(&ehci->lock, flags);
-		return tegra_ehci_internal_port_reset(ehci, status_reg);
-	}
-
-	/*
-	 * Tegra host controller will time the resume operation to clear the bit
-	 * when the port control state switches to HS or FS Idle. This behavior
-	 * is different from EHCI where the host controller driver is required
-	 * to set this bit to a zero after the resume duration is timed in the
-	 * driver.
-	 */
-	else if (typeReq == ClearPortFeature &&
-					wValue == USB_PORT_FEAT_SUSPEND) {
-		temp = ehci_readl(ehci, status_reg);
-		if ((temp & PORT_RESET) || !(temp & PORT_PE)) {
-			retval = -EPIPE;
-			goto done;
-		}
-
-		if (!(temp & PORT_SUSPEND))
-			goto done;
-
-		/* Disable disconnect detection during port resume */
-		tegra_usb_phy_preresume(hcd->usb_phy);
-
-		ehci->reset_done[wIndex-1] = jiffies + msecs_to_jiffies(25);
-
-		temp &= ~(PORT_RWC_BITS | PORT_WAKE_BITS);
-		/* start resume signalling */
-		ehci_writel(ehci, temp | PORT_RESUME, status_reg);
-		set_bit(wIndex-1, &ehci->resuming_ports);
-
-		spin_unlock_irqrestore(&ehci->lock, flags);
-		msleep(20);
-		spin_lock_irqsave(&ehci->lock, flags);
-
-		/* Poll until the controller clears RESUME and SUSPEND */
-		if (ehci_handshake(ehci, status_reg, PORT_RESUME, 0, 2000))
-			pr_err("%s: timeout waiting for RESUME\n", __func__);
-		if (ehci_handshake(ehci, status_reg, PORT_SUSPEND, 0, 2000))
-			pr_err("%s: timeout waiting for SUSPEND\n", __func__);
-
-		ehci->reset_done[wIndex-1] = 0;
-		clear_bit(wIndex-1, &ehci->resuming_ports);
-
-		tegra->port_resuming = 1;
-		goto done;
-	}
-
-	spin_unlock_irqrestore(&ehci->lock, flags);
-
-	/* Handle the hub control events here */
-	return ehci_hub_control(hcd, typeReq, wValue, wIndex, buf, wLength);
-
-done:
-	spin_unlock_irqrestore(&ehci->lock, flags);
-	return retval;
-}
-
-struct dma_aligned_buffer {
-	void *kmalloc_ptr;
-	void *old_xfer_buffer;
-	u8 data[0];
-};
-
-static void free_dma_aligned_buffer(struct urb *urb)
-{
-	struct dma_aligned_buffer *temp;
-	size_t length;
-
-	if (!(urb->transfer_flags & URB_ALIGNED_TEMP_BUFFER))
-		return;
-
-	temp = container_of(urb->transfer_buffer,
-		struct dma_aligned_buffer, data);
-
-	if (usb_urb_dir_in(urb)) {
-		if (usb_pipeisoc(urb->pipe))
-			length = urb->transfer_buffer_length;
-		else
-			length = urb->actual_length;
-
-		memcpy(temp->old_xfer_buffer, temp->data, length);
-	}
-	urb->transfer_buffer = temp->old_xfer_buffer;
-	kfree(temp->kmalloc_ptr);
-
-	urb->transfer_flags &= ~URB_ALIGNED_TEMP_BUFFER;
-}
-
-static int alloc_dma_aligned_buffer(struct urb *urb, gfp_t mem_flags)
-{
-	struct dma_aligned_buffer *temp, *kmalloc_ptr;
-	size_t kmalloc_size;
-
-	if (urb->num_sgs || urb->sg ||
-	    urb->transfer_buffer_length == 0 ||
-	    !((uintptr_t)urb->transfer_buffer & (TEGRA_USB_DMA_ALIGN - 1)))
-		return 0;
-
-	/* Allocate a buffer with enough padding for alignment */
-	kmalloc_size = urb->transfer_buffer_length +
-		sizeof(struct dma_aligned_buffer) + TEGRA_USB_DMA_ALIGN - 1;
-
-	kmalloc_ptr = kmalloc(kmalloc_size, mem_flags);
-	if (!kmalloc_ptr)
-		return -ENOMEM;
-
-	/* Position our struct dma_aligned_buffer such that data is aligned */
-	temp = PTR_ALIGN(kmalloc_ptr + 1, TEGRA_USB_DMA_ALIGN) - 1;
-	temp->kmalloc_ptr = kmalloc_ptr;
-	temp->old_xfer_buffer = urb->transfer_buffer;
-	if (usb_urb_dir_out(urb))
-		memcpy(temp->data, urb->transfer_buffer,
-		       urb->transfer_buffer_length);
-	urb->transfer_buffer = temp->data;
-
-	urb->transfer_flags |= URB_ALIGNED_TEMP_BUFFER;
-
-	return 0;
-}
-
-static int tegra_ehci_map_urb_for_dma(struct usb_hcd *hcd, struct urb *urb,
-				      gfp_t mem_flags)
-{
-	int ret;
-
-	ret = alloc_dma_aligned_buffer(urb, mem_flags);
-	if (ret)
-		return ret;
-
-	ret = usb_hcd_map_urb_for_dma(hcd, urb, mem_flags);
-	if (ret)
-		free_dma_aligned_buffer(urb);
-
-	return ret;
-}
-
-static void tegra_ehci_unmap_urb_for_dma(struct usb_hcd *hcd, struct urb *urb)
-{
-	usb_hcd_unmap_urb_for_dma(hcd, urb);
-	free_dma_aligned_buffer(urb);
-}
-
-static const struct tegra_ehci_soc_config tegra30_soc_config = {
-	.has_hostpc = true,
-};
-
-static const struct tegra_ehci_soc_config tegra20_soc_config = {
-	.has_hostpc = false,
-};
-
-static const struct of_device_id tegra_ehci_of_match[] = {
-	{ .compatible = "nvidia,tegra30-ehci", .data = &tegra30_soc_config },
-	{ .compatible = "nvidia,tegra20-ehci", .data = &tegra20_soc_config },
-	{ },
-};
-
-static int tegra_ehci_probe(struct platform_device *pdev)
-{
-	const struct of_device_id *match;
-	const struct tegra_ehci_soc_config *soc_config;
-	struct resource *res;
-	struct usb_hcd *hcd;
-	struct ehci_hcd *ehci;
-	struct tegra_ehci_hcd *tegra;
-	int err = 0;
-	int irq;
-	struct usb_phy *u_phy;
-
-	match = of_match_device(tegra_ehci_of_match, &pdev->dev);
-	if (!match) {
-		dev_err(&pdev->dev, "Error: No device match found\n");
-		return -ENODEV;
-	}
-	soc_config = match->data;
-
-	/* Right now device-tree probed devices don't get dma_mask set.
-	 * Since shared usb code relies on it, set it here for now.
-	 * Once we have dma capability bindings this can go away.
-	 */
-	err = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (err)
-		return err;
-
-	hcd = usb_create_hcd(&tegra_ehci_hc_driver, &pdev->dev,
-					dev_name(&pdev->dev));
-	if (!hcd) {
-		dev_err(&pdev->dev, "Unable to create HCD\n");
-		return -ENOMEM;
-	}
-	platform_set_drvdata(pdev, hcd);
-	ehci = hcd_to_ehci(hcd);
-	tegra = (struct tegra_ehci_hcd *)ehci->priv;
-
-	hcd->has_tt = 1;
-
-	tegra->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(tegra->clk)) {
-		dev_err(&pdev->dev, "Can't get ehci clock\n");
-		err = PTR_ERR(tegra->clk);
-		goto cleanup_hcd_create;
-	}
-
-	tegra->rst = devm_reset_control_get(&pdev->dev, "usb");
-	if (IS_ERR(tegra->rst)) {
-		dev_err(&pdev->dev, "Can't get ehci reset\n");
-		err = PTR_ERR(tegra->rst);
-		goto cleanup_hcd_create;
-	}
-
-	err = clk_prepare_enable(tegra->clk);
-	if (err)
-		goto cleanup_hcd_create;
-
-	err = tegra_reset_usb_controller(pdev);
-	if (err)
-		goto cleanup_clk_en;
-
-	u_phy = devm_usb_get_phy_by_phandle(&pdev->dev, "nvidia,phy", 0);
-	if (IS_ERR(u_phy)) {
-		err = -EPROBE_DEFER;
-		goto cleanup_clk_en;
-	}
-	hcd->usb_phy = u_phy;
-
-	tegra->needs_double_reset = of_property_read_bool(pdev->dev.of_node,
-		"nvidia,needs-double-reset");
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(hcd->regs)) {
-		err = PTR_ERR(hcd->regs);
-		goto cleanup_clk_en;
-	}
-	hcd->rsrc_start = res->start;
-	hcd->rsrc_len = resource_size(res);
-
-	ehci->caps = hcd->regs + 0x100;
-	ehci->has_hostpc = soc_config->has_hostpc;
-
-	err = usb_phy_init(hcd->usb_phy);
-	if (err) {
-		dev_err(&pdev->dev, "Failed to initialize phy\n");
-		goto cleanup_clk_en;
-	}
-
-	u_phy->otg = devm_kzalloc(&pdev->dev, sizeof(struct usb_otg),
-			     GFP_KERNEL);
-	if (!u_phy->otg) {
-		err = -ENOMEM;
-		goto cleanup_phy;
-	}
-	u_phy->otg->host = hcd_to_bus(hcd);
-
-	err = usb_phy_set_suspend(hcd->usb_phy, 0);
-	if (err) {
-		dev_err(&pdev->dev, "Failed to power on the phy\n");
-		goto cleanup_phy;
-	}
-
-	irq = platform_get_irq(pdev, 0);
-	if (!irq) {
-		dev_err(&pdev->dev, "Failed to get IRQ\n");
-		err = -ENODEV;
-		goto cleanup_phy;
-	}
-
-	otg_set_host(u_phy->otg, &hcd->self);
-
-	err = usb_add_hcd(hcd, irq, IRQF_SHARED);
-	if (err) {
-		dev_err(&pdev->dev, "Failed to add USB HCD\n");
-		goto cleanup_otg_set_host;
-	}
-	device_wakeup_enable(hcd->self.controller);
-
-	return err;
-
-cleanup_otg_set_host:
-	otg_set_host(u_phy->otg, NULL);
-cleanup_phy:
-	usb_phy_shutdown(hcd->usb_phy);
-cleanup_clk_en:
-	clk_disable_unprepare(tegra->clk);
-cleanup_hcd_create:
-	usb_put_hcd(hcd);
-	return err;
-}
-
-static int tegra_ehci_remove(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-	struct tegra_ehci_hcd *tegra =
-		(struct tegra_ehci_hcd *)hcd_to_ehci(hcd)->priv;
-
-	otg_set_host(hcd->usb_phy->otg, NULL);
-
-	usb_phy_shutdown(hcd->usb_phy);
-	usb_remove_hcd(hcd);
-
-	clk_disable_unprepare(tegra->clk);
-
-	usb_put_hcd(hcd);
-
-	return 0;
-}
-
-static void tegra_ehci_hcd_shutdown(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-
-	if (hcd->driver->shutdown)
-		hcd->driver->shutdown(hcd);
-}
-
-static struct platform_driver tegra_ehci_driver = {
-	.probe		= tegra_ehci_probe,
-	.remove		= tegra_ehci_remove,
-	.shutdown	= tegra_ehci_hcd_shutdown,
-	.driver		= {
-		.name	= DRV_NAME,
-		.of_match_table = tegra_ehci_of_match,
-	}
-};
-
-static int tegra_ehci_reset(struct usb_hcd *hcd)
-{
-	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
-	int retval;
-	int txfifothresh;
-
-	retval = ehci_setup(hcd);
-	if (retval)
-		return retval;
-
-	/*
-	 * We should really pull this value out of tegra_ehci_soc_config, but
-	 * to avoid needing access to it, make use of the fact that Tegra20 is
-	 * the only one so far that needs a value of 10, and Tegra20 is the
-	 * only one which doesn't set has_hostpc.
-	 */
-	txfifothresh = ehci->has_hostpc ? 0x10 : 10;
-	ehci_writel(ehci, txfifothresh << 16, &ehci->regs->txfill_tuning);
-
-	return 0;
-}
-
-static const struct ehci_driver_overrides tegra_overrides __initconst = {
-	.extra_priv_size	= sizeof(struct tegra_ehci_hcd),
-	.reset			= tegra_ehci_reset,
-};
-
-static int __init ehci_tegra_init(void)
-{
-	if (usb_disabled())
-		return -ENODEV;
-
-	pr_info(DRV_NAME ": " DRIVER_DESC "\n");
-
-	ehci_init_driver(&tegra_ehci_hc_driver, &tegra_overrides);
-
-	/*
-	 * The Tegra HW has some unusual quirks, which require Tegra-specific
-	 * workarounds. We override certain hc_driver functions here to
-	 * achieve that. We explicitly do not enhance ehci_driver_overrides to
-	 * allow this more easily, since this is an unusual case, and we don't
-	 * want to encourage others to override these functions by making it
-	 * too easy.
-	 */
-
-	tegra_ehci_hc_driver.map_urb_for_dma = tegra_ehci_map_urb_for_dma;
-	tegra_ehci_hc_driver.unmap_urb_for_dma = tegra_ehci_unmap_urb_for_dma;
-	tegra_ehci_hc_driver.hub_control = tegra_ehci_hub_control;
-
-	return platform_driver_register(&tegra_ehci_driver);
-}
-module_init(ehci_tegra_init);
-
-static void __exit ehci_tegra_cleanup(void)
-{
-	platform_driver_unregister(&tegra_ehci_driver);
-}
-module_exit(ehci_tegra_cleanup);
-
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:" DRV_NAME);
-MODULE_DEVICE_TABLE(of, tegra_ehci_of_match);
+K_REGS_GATE_LATENCY_MASK 0x2000
+#define PSX81_BIF_CPM_CONTROL__REFCLK_REGS_GATE_LATENCY__SHIFT 0xd
+#define PSX81_BIF_CPM_CONTROL__LCLK_GATE_TXCLK_FREE_MASK 0x4000
+#define PSX81_BIF_CPM_CONTROL__LCLK_GATE_TXCLK_FREE__SHIFT 0xe
+#define PSX81_BIF_CPM_CONTROL__RCVR_DET_CLK_ENABLE_MASK 0x8000
+#define PSX81_BIF_CPM_CONTROL__RCVR_DET_CLK_ENABLE__SHIFT 0xf
+#define PSX81_BIF_CPM_CONTROL__TXCLK_PERM_GATE_PLL_PDN_MASK 0x10000
+#define PSX81_BIF_CPM_CONTROL__TXCLK_PERM_GATE_PLL_PDN__SHIFT 0x10
+#define PSX81_BIF_CPM_CONTROL__FAST_TXCLK_LATENCY_MASK 0xe0000
+#define PSX81_BIF_CPM_CONTROL__FAST_TXCLK_LATENCY__SHIFT 0x11
+#define PSX81_BIF_CPM_CONTROL__MASTER_PCIE_PLL_SELECT_MASK 0x100000
+#define PSX81_BIF_CPM_CONTROL__MASTER_PCIE_PLL_SELECT__SHIFT 0x14
+#define PSX81_BIF_CPM_CONTROL__MASTER_PCIE_PLL_AUTO_MASK 0x200000
+#define PSX81_BIF_CPM_CONTROL__MASTER_PCIE_PLL_AUTO__SHIFT 0x15
+#define PSX81_BIF_CPM_CONTROL__REFCLK_XSTCLK_ENABLE_MASK 0x400000
+#define PSX81_BIF_CPM_CONTROL__REFCLK_XSTCLK_ENABLE__SHIFT 0x16
+#define PSX81_BIF_CPM_CONTROL__REFCLK_XSTCLK_LATENCY_MASK 0x800000
+#define PSX81_BIF_CPM_CONTROL__REFCLK_XSTCLK_LATENCY__SHIFT 0x17
+#define PSX81_BIF_CPM_CONTROL__SPARE_REGS_MASK 0xff000000
+#define PSX81_BIF_CPM_CONTROL__SPARE_REGS__SHIFT 0x18
+#define PSX81_BIF_LM_CONTROL__LoopbackSelect_MASK 0x1e
+#define PSX81_BIF_LM_CONTROL__LoopbackSelect__SHIFT 0x1
+#define PSX81_BIF_LM_CONTROL__PRBSPCIeLbSelect_MASK 0x20
+#define PSX81_BIF_LM_CONTROL__PRBSPCIeLbSelect__SHIFT 0x5
+#define PSX81_BIF_LM_CONTROL__LoopbackHalfRate_MASK 0xc0
+#define PSX81_BIF_LM_CONTROL__LoopbackHalfRate__SHIFT 0x6
+#define PSX81_BIF_LM_CONTROL__LoopbackFifoPtr_MASK 0x700
+#define PSX81_BIF_LM_CONTROL__LoopbackFifoPtr__SHIFT 0x8
+#define PSX81_BIF_LM_PCIETXMUX0__TXLANE0_MASK 0xff
+#define PSX81_BIF_LM_PCIETXMUX0__TXLANE0__SHIFT 0x0
+#define PSX81_BIF_LM_PCIETXMUX0__TXLANE1_MASK 0xff00
+#define PSX81_BIF_LM_PCIETXMUX0__TXLANE1__SHIFT 0x8
+#define PSX81_BIF_LM_PCIETXMUX0__TXLANE2_MASK 0xff0000
+#define PSX81_BIF_LM_PCIETXMUX0__TXLANE2__SHIFT 0x10
+#define PSX81_BIF_LM_PCIETXMUX0__TXLANE3_MASK 0xff000000
+#define PSX81_BIF_LM_PCIETXMUX0__TXLANE3__SHIFT 0x18
+#define PSX81_BIF_LM_PCIETXMUX1__TXLANE4_MASK 0xff
+#define PSX81_BIF_LM_PCIETXMUX1__TXLANE4__SHIFT 0x0
+#define PSX81_BIF_LM_PCIETXMUX1__TXLANE5_MASK 0xff00
+#define PSX81_BIF_LM_PCIETXMUX1__TXLANE5__SHIFT 0x8
+#define PSX81_BIF_LM_PCIETXMUX1__TXLANE6_MASK 0xff0000
+#define PSX81_BIF_LM_PCIETXMUX1__TXLANE6__SHIFT 0x10
+#define PSX81_BIF_LM_PCIETXMUX1__TXLANE7_MASK 0xff000000
+#define PSX81_BIF_LM_PCIETXMUX1__TXLANE7__SHIFT 0x18
+#define PSX81_BIF_LM_PCIETXMUX2__TXLANE8_MASK 0xff
+#define PSX81_BIF_LM_PCIETXMUX2__TXLANE8__SHIFT 0x0
+#define PSX81_BIF_LM_PCIETXMUX2__TXLANE9_MASK 0xff00
+#define PSX81_BIF_LM_PCIETXMUX2__TXLANE9__SHIFT 0x8
+#define PSX81_BIF_LM_PCIETXMUX2__TXLANE10_MASK 0xff0000
+#define PSX81_BIF_LM_PCIETXMUX2__TXLANE10__SHIFT 0x10
+#define PSX81_BIF_LM_PCIETXMUX2__TXLANE11_MASK 0xff000000
+#define PSX81_BIF_LM_PCIETXMUX2__TXLANE11__SHIFT 0x18
+#define PSX81_BIF_LM_PCIETXMUX3__TXLANE12_MASK 0xff
+#define PSX81_BIF_LM_PCIETXMUX3__TXLANE12__SHIFT 0x0
+#define PSX81_BIF_LM_PCIETXMUX3__TXLANE13_MASK 0xff00
+#define PSX81_BIF_LM_PCIETXMUX3__TXLANE13__SHIFT 0x8
+#define PSX81_BIF_LM_PCIETXMUX3__TXLANE14_MASK 0xff0000
+#define PSX81_BIF_LM_PCIETXMUX3__TXLANE14__SHIFT 0x10
+#define PSX81_BIF_LM_PCIETXMUX3__TXLANE15_MASK 0xff000000
+#define PSX81_BIF_LM_PCIETXMUX3__TXLANE15__SHIFT 0x18
+#define PSX81_BIF_LM_PCIERXMUX0__RXLANE0_MASK 0xff
+#define PSX81_BIF_LM_PCIERXMUX0__RXLANE0__SHIFT 0x0
+#define PSX81_BIF_LM_PCIERXMUX0__RXLANE1_MASK 0xff00
+#define PSX81_BIF_LM_PCIERXMUX0__RXLANE1__SHIFT 0x8
+#define PSX81_BIF_LM_PCIERXMUX0__RXLANE2_MASK 0xff0000
+#define PSX81_BIF_LM_PCIERXMUX0__RXLANE2__SHIFT 0x10
+#define PSX81_BIF_LM_PCIERXMUX0__RXLANE3_MASK 0xff000000
+#define PSX81_BIF_LM_PCIERXMUX0__RXLANE3__SHIFT 0x18
+#define PSX81_BIF_LM_PCIERXMUX1__RXLANE4_MASK 0xff
+#define PSX81_BIF_LM_PCIERXMUX1__RXLANE4__SHIFT 0x0
+#define PSX81_BIF_LM_PCIERXMUX1__RXLANE5_MASK 0xff00
+#define PSX81_BIF_LM_PCIERXMUX1__RXLANE5__SHIFT 0x8
+#define PSX81_BIF_LM_PCIERXMUX1__RXLANE6_MASK 0xff0000
+#define PSX81_BIF_LM_PCIERXMUX1__RXLANE6__SHIFT 0x10
+#define PSX81_BIF_LM_PCIERXMUX1__RXLANE7_MASK 0xff000000
+#define PSX81_BIF_LM_PCIERXMUX1__RXLANE7__SHIFT 0x18
+#define PSX81_BIF_LM_PCIERXMUX2__RXLANE8_MASK 0xff
+#define PSX81_BIF_LM_PCIERXMUX2__RXLANE8__SHIFT 0x0
+#define PSX81_BIF_LM_PCIERXMUX2__RXLANE9_MASK 0xff00
+#define PSX81_BIF_LM_PCIERXMUX2__RXLANE9__SHIFT 0x8
+#define PSX81_BIF_LM_PCIERXMUX2__RXLANE10_MASK 0xff0000
+#define PSX81_BIF_LM_PCIERXMUX2__RXLANE10__SHIFT 0x10
+#define PSX81_BIF_LM_PCIERXMUX2__RXLANE11_MASK 0xff000000
+#define PSX81_BIF_LM_PCIERXMUX2__RXLANE11__SHIFT 0x18
+#define PSX81_BIF_LM_PCIERXMUX3__RXLANE12_MASK 0xff
+#define PSX81_BIF_LM_PCIERXMUX3__RXLANE12__SHIFT 0x0
+#define PSX81_BIF_LM_PCIERXMUX3__RXLANE13_MASK 0xff00
+#define PSX81_BIF_LM_PCIERXMUX3__RXLANE13__SHIFT 0x8
+#define PSX81_BIF_LM_PCIERXMUX3__RXLANE14_MASK 0xff0000
+#define PSX81_BIF_LM_PCIERXMUX3__RXLANE14__SHIFT 0x10
+#define PSX81_BIF_LM_PCIERXMUX3__RXLANE15_MASK 0xff000000
+#define PSX81_BIF_LM_PCIERXMUX3__RXLANE15__SHIFT 0x18
+#define PSX81_BIF_LM_LANEENABLE__LANE_enable_MASK 0xffff
+#define PSX81_BIF_LM_LANEENABLE__LANE_enable__SHIFT 0x0
+#define PSX81_BIF_LM_PRBSCONTROL__PRBSPCIeSelect_MASK 0xffff
+#define PSX81_BIF_LM_PRBSCONTROL__PRBSPCIeSelect__SHIFT 0x0
+#define PSX81_BIF_LM_PRBSCONTROL__LMLaneDegrade0_MASK 0x10000000
+#define PSX81_BIF_LM_PRBSCONTROL__LMLaneDegrade0__SHIFT 0x1c
+#define PSX81_BIF_LM_PRBSCONTROL__LMLaneDegrade1_MASK 0x20000000
+#define PSX81_BIF_LM_PRBSCONTROL__LMLaneDegrade1__SHIFT 0x1d
+#define PSX81_BIF_LM_PRBSCONTROL__LMLaneDegrade2_MASK 0x40000000
+#define PSX81_BIF_LM_PRBSCONTROL__LMLaneDegrade2__SHIFT 0x1e
+#define PSX81_BIF_LM_PRBSCONTROL__LMLaneDegrade3_MASK 0x80000000
+#define PSX81_BIF_LM_PRBSCONTROL__LMLaneDegrade3__SHIFT 0x1f
+#define PSX81_BIF_LM_POWERCONTROL__LMTxPhyCmd0_MASK 0x7
+#define PSX81_BIF_LM_POWERCONTROL__LMTxPhyCmd0__SHIFT 0x0
+#define PSX81_BIF_LM_POWERCONTROL__LMRxPhyCmd0_MASK 0x38
+#define PSX81_BIF_LM_POWERCONTROL__LMRxPhyCmd0__SHIFT 0x3
+#define PSX81_BIF_LM_POWERCONTROL__LMLinkSpeed0_MASK 0xc0
+#define PSX81_BIF_LM_POWERCONTROL__LMLinkSpeed0__SHIFT 0x6
+#define PSX81_BIF_LM_POWERCONTROL__LMTxPhyCmd1_MASK 0x700
+#define PSX81_BIF_LM_POWERCONTROL__LMTxPhyCmd1__SHIFT 0x8
+#define PSX81_BIF_LM_POWERCONTROL__LMRxPhyCmd1_MASK 0x3800
+#define PSX81_BIF_LM_POWERCONTROL__LMRxPhyCmd1__SHIFT 0xb
+#define PSX81_BIF_LM_POWERCONTROL__LMLinkSpeed1_MASK 0xc000
+#define PSX81_BIF_LM_POWERCONTROL__LMLinkSpeed1__SHIFT 0xe
+#define PSX81_BIF_LM_POWERCONTROL__LMTxPhyCmd2_MASK 0x70000
+#define PSX81_BIF_LM_POWERCONTROL__LMTxPhyCmd2__SHIFT 0x10
+#define PSX81_BIF_LM_POWERCONTROL__LMRxPhyCmd2_MASK 0x380000
+#define PSX81_BIF_LM_POWERCONTROL__LMRxPhyCmd2__SHIFT 0x13
+#define PSX81_BIF_LM_POWERCONTROL__LMLinkSpeed2_MASK 0xc00000
+#define PSX81_BIF_LM_POWERCONTROL__LMLinkSpeed2__SHIFT 0x16
+#define PSX81_BIF_LM_POWERCONTROL__LMTxPhyCmd3_MASK 0x7000000
+#define PSX81_BIF_LM_POWERCONTROL__LMTxPhyCmd3__SHIFT 0x18
+#define PSX81_BIF_LM_POWERCONTROL__LMRxPhyCmd3_MASK 0x38000000
+#define PSX81_BIF_LM_POWERCONTROL__LMRxPhyCmd3__SHIFT 0x1b
+#define PSX81_BIF_LM_POWERCONTROL__LMLinkSpeed3_MASK 0xc0000000
+#define PSX81_BIF_LM_POWERCONTROL__LMLinkSpeed3__SHIFT 0x1e
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxEn0_MASK 0x1
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxEn0__SHIFT 0x0
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxClkEn0_MASK 0x2
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxClkEn0__SHIFT 0x1
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMargin0_MASK 0x1c
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMargin0__SHIFT 0x2
+#define PSX81_BIF_LM_POWERCONTROL1__LMSkipBit0_MASK 0x20
+#define PSX81_BIF_LM_POWERCONTROL1__LMSkipBit0__SHIFT 0x5
+#define PSX81_BIF_LM_POWERCONTROL1__LMLaneUnused0_MASK 0x40
+#define PSX81_BIF_LM_POWERCONTROL1__LMLaneUnused0__SHIFT 0x6
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMarginEn0_MASK 0x80
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMarginEn0__SHIFT 0x7
+#define PSX81_BIF_LM_POWERCONTROL1__LMDeemph0_MASK 0x100
+#define PSX81_BIF_LM_POWERCONTROL1__LMDeemph0__SHIFT 0x8
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxEn1_MASK 0x200
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxEn1__SHIFT 0x9
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxClkEn1_MASK 0x400
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxClkEn1__SHIFT 0xa
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMargin1_MASK 0x3800
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMargin1__SHIFT 0xb
+#define PSX81_BIF_LM_POWERCONTROL1__LMSkipBit1_MASK 0x4000
+#define PSX81_BIF_LM_POWERCONTROL1__LMSkipBit1__SHIFT 0xe
+#define PSX81_BIF_LM_POWERCONTROL1__LMLaneUnused1_MASK 0x8000
+#define PSX81_BIF_LM_POWERCONTROL1__LMLaneUnused1__SHIFT 0xf
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMarginEn1_MASK 0x10000
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMarginEn1__SHIFT 0x10
+#define PSX81_BIF_LM_POWERCONTROL1__LMDeemph1_MASK 0x20000
+#define PSX81_BIF_LM_POWERCONTROL1__LMDeemph1__SHIFT 0x11
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxEn2_MASK 0x40000
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxEn2__SHIFT 0x12
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxClkEn2_MASK 0x80000
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxClkEn2__SHIFT 0x13
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMargin2_MASK 0x700000
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMargin2__SHIFT 0x14
+#define PSX81_BIF_LM_POWERCONTROL1__LMSkipBit2_MASK 0x800000
+#define PSX81_BIF_LM_POWERCONTROL1__LMSkipBit2__SHIFT 0x17
+#define PSX81_BIF_LM_POWERCONTROL1__LMLaneUnused2_MASK 0x1000000
+#define PSX81_BIF_LM_POWERCONTROL1__LMLaneUnused2__SHIFT 0x18
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMarginEn2_MASK 0x2000000
+#define PSX81_BIF_LM_POWERCONTROL1__LMTxMarginEn2__SHIFT 0x19
+#define PSX81_BIF_LM_POWERCONTROL1__LMDeemph2_MASK 0x4000000
+#define PSX81_BIF_LM_POWERCONTROL1__LMDeemph2__SHIFT 0x1a
+#define PSX81_BIF_LM_POWERCONTROL1__TxCoeffID0_MASK 0x18000000
+#define PSX81_BIF_LM_POWERCONTROL1__TxCoeffID0__SHIFT 0x1b
+#define PSX81_BIF_LM_POWERCONTROL1__TxCoeffID1_MASK 0x60000000
+#define PSX81_BIF_LM_POWERCONTROL1__TxCoeffID1__SHIFT 0x1d
+#define PSX81_BIF_LM_POWERCONTROL2__LMTxEn3_MASK 0x1
+#define PSX81_BIF_LM_POWERCONTROL2__LMTxEn3__SHIFT 0x0
+#define PSX81_BIF_LM_POWERCONTROL2__LMTxClkEn3_MASK 0x2
+#define PSX81_BIF_LM_POWERCONTROL2__LMTxClkEn3__SHIFT 0x1
+#define PSX81_BIF_LM_POWERCONTROL2__LMTxMargin3_MASK 0x1c
+#define PSX81_BIF_LM_POWERCONTROL2__LMTxMargin3__SHIFT 0x2
+#define PSX81_BIF_LM_POWERCONTROL2__LMSkipBit3_MASK 0x20
+#define PSX81_BIF_LM_POWERCONTROL2__LMSkipBit3__SHIFT 0x5
+#define PSX81_BIF_LM_POWERCONTROL2__LMLaneUnused3_MASK 0x40
+#define PSX81_BIF_LM_POWERCONTROL2__LMLaneUnused3__SHIFT 0x6
+#define PSX81_BIF_LM_POWERCONTROL2__LMTxMarginEn3_MASK 0x80
+#define PSX81_BIF_LM_POWERCONTROL2__LMTxMarginEn3__SHIFT 0x7
+#define PSX81_BIF_LM_POWERCONTROL2__LMDeemph3_MASK 0x100
+#define PSX81_BIF_LM_POWERCONTROL2__LMDeemph3__SHIFT 0x8
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeffID2_MASK 0x600
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeffID2__SHIFT 0x9
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeffID3_MASK 0x1800
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeffID3__SHIFT 0xb
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeff0_MASK 0x7e000
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeff0__SHIFT 0xd
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeff1_MASK 0x1f80000
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeff1__SHIFT 0x13
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeff2_MASK 0x7e000000
+#define PSX81_BIF_LM_POWERCONTROL2__TxCoeff2__SHIFT 0x19
+#define PSX81_BIF_LM_POWERCONTROL3__TxCoeff3_MASK 0x3f
+#define PSX81_BIF_LM_POWERCONTROL3__TxCoeff3__SHIFT 0x0
+#define PSX81_BIF_LM_POWERCONTROL3__RxEqCtl0_MASK 0xfc0
+#define PSX81_BIF_LM_POWERCONTROL3__RxEqCtl0__SHIFT 0x6
+#define PSX81_BIF_LM_POWERCONTROL3__RxEqCtl1_MASK 0x3f000
+#define PSX81_BIF_LM_POWERCONTROL3__RxEqCtl1__SHIFT 0xc
+#define PSX81_BIF_LM_POWERCONTROL3__RxEqCtl2_MASK 0xfc0000
+#define PSX81_BIF_LM_POWERCONTROL3__RxEqCtl2__SHIFT 0x12
+#define PSX81_BIF_LM_POWERCONTROL3__RxEqCtl3_MASK 0x3f000000
+#define PSX81_BIF_LM_POWERCONTROL3__RxEqCtl3__SHIFT 0x18
+#define PSX81_BIF_LM_POWERCONTROL4__LinkNum0_MASK 0x7
+#define PSX81_BIF_LM_POWERCONTROL4__LinkNum0__SHIFT 0x0
+#define PSX81_BIF_LM_POWERCONTROL4__LinkNum1_MASK 0x38
+#define PSX81_BIF_LM_POWERCONTROL4__LinkNum1__SHIFT 0x3
+#define PSX81_BIF_LM_POWERCONTROL4__LinkNum2_MASK 0x1c0
+#define PSX81_BIF_LM_POWERCONTROL4__LinkNum2__SHIFT 0x6
+#define PSX81_BIF_LM_POWERCONTROL4__LinkNum3_MASK 0xe00
+#define PSX81_BIF_LM_POWERCONTROL4__LinkNum3__SHIFT 0x9
+#define PSX81_BIF_LM_POWERCONTROL4__LaneNum0_MASK 0xf000
+#define PSX81_BIF_LM_POWERCONTROL4__LaneNum0__SHIFT 0xc
+#define PSX81_BIF_LM_POWERCONTROL4__LaneNum1_MASK 0xf0000
+#define PSX81_BIF_LM_POWERCONTROL4__LaneNum1__SHIFT 0x10
+#define PSX81_BIF_LM_POWERCONTROL4__LaneNum2_MASK 0xf00000
+#define PSX81_BIF_LM_POWERCONTROL4__LaneNum2__SHIFT 0x14
+#define PSX81_BIF_LM_POWERCONTROL4__LaneNum3_MASK 0xf000000
+#define PSX81_BIF_LM_POWERCONTROL4__LaneNum3__SHIFT 0x18
+#define PSX81_BIF_LM_POWERCONTROL4__SpcMode0_MASK 0x10000000
+#define PSX81_BIF_LM_POWERCONTROL4__SpcMode0__SHIFT 0x1c
+#define PSX81_BIF_LM_POWERCONTROL4__SpcMode1_MASK 0x20000000
+#define PSX81_BIF_LM_POWERCONTROL4__SpcMode1__SHIFT 0x1d
+#define PSX81_BIF_LM_POWERCONTROL4__SpcMode2_MASK 0x40000000
+#define PSX81_BIF_LM_POWERCONTROL4__SpcMode2__SHIFT 0x1e
+#define PSX81_BIF_LM_POWERCONTROL4__SpcMode3_MASK 0x80000000
+#define PSX81_BIF_LM_POWERCONTROL4__SpcMode3__SHIFT 0x1f
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_valid_MASK 0x1
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_valid__SHIFT 0x0
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_ei_det_thresh_sel_MASK 0x6
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_ei_det_thresh_sel__SHIFT 0x1
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_dll_flock_disable_MASK 0x8
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_dll_flock_disable__SHIFT 0x3
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_cdr_ph_gain_gen12_MASK 0xf0
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_cdr_ph_gain_gen12__SHIFT 0x4
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_cdr_pi_stpsz_gen12_MASK 0x100
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_cdr_pi_stpsz_gen12__SHIFT 0x8
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_ron_ctl_MASK 0x600
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_ron_ctl__SHIFT 0x9
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_rtt_ctl_MASK 0x1800
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_rtt_ctl__SHIFT 0xb
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_rxdetect_samp_time_MASK 0xc0000
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_rxdetect_samp_time__SHIFT 0x12
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_spare_MASK 0xfff00000
+#define PSX80_PHY0_COM_COMMON_FUSE1__fuse1_spare__SHIFT 0x14
+#define PSX80_PHY0_COM_COMMON_FUSE2__fuse2_valid_MASK 0x1
+#define PSX80_PHY0_COM_COMMON_FUSE2__fuse2_valid__SHIFT 0x0
+#define PSX80_PHY0_COM_COMMON_FUSE2__fuse2_spare_MASK 0xfffffffe
+#define PSX80_PHY0_COM_COMMON_FUSE2__fuse2_spare__SHIFT 0x1
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_valid_MASK 0x1
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_valid__SHIFT 0x0
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_dll_cpi_sel_MASK 0xe
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_dll_cpi_sel__SHIFT 0x1
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_ron_override_val_MASK 0x3f0
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_ron_override_val__SHIFT 0x4
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_rtt_override_val_MASK 0xfc00
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_rtt_override_val__SHIFT 0xa
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_lcpll_bw_adj_MASK 0xf0000
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_lcpll_bw_adj__SHIFT 0x10
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_lcpll_ref_adj_MASK 0xf00000
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_lcpll_ref_adj__SHIFT 0x14
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_ropll_ref_adj_MASK 0xf000000
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_ropll_ref_adj__SHIFT 0x18
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_refresh_cal_en_MASK 0x10000000
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_refresh_cal_en__SHIFT 0x1c
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_spare_MASK 0xe0000000
+#define PSX80_PHY0_COM_COMMON_FUSE3__fuse3_spare__SHIFT 0x1d
+#define PSX80_PHY0_COM_COMMON_ELECIDLE__ei_det_dis_ps0_MASK 0x1
+#define PSX80_PHY0_COM_COMMON_ELECIDLE__ei_det_dis_ps0__SHIFT 0x0
+#define PSX80_PHY0_COM_COMMON_ELECIDLE__ei_det_initiate_ofc_cal_MASK 0x2
+#define PSX80_PHY0_COM_COMMON_ELECIDLE__ei_det_initiate_ofc_cal__SHIFT 0x1
+#define PSX80_PHY0_COM_COMMON_ELECIDLE__ei_det_dac_test_ofc_sel_MASK 0x4
+#define PSX80_PHY0_COM_COMMON_ELECIDLE__ei_det_dac_test_ofc_sel__SHIFT 0x2
+#define PSX80_PHY0_COM_COMMON_ELECIDLE__ei_det_dac_test_code_MASK 0x3f0
+#define PSX80_PHY0_COM_COMMON_ELECIDLE__ei_det_dac_test_code__SHIFT 0x4
+#define PSX80_PHY0_COM_COMMON_DFX__nelb_en_MASK 0x1
+#define PSX80_PHY0_COM_COMMON_DFX__nelb_en__SHIFT 0x0
+#define PSX80_PHY0_COM_C

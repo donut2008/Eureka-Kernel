@@ -1,175 +1,65 @@
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/fs.h>
-#include <linux/errno.h>
-#include <linux/types.h>
-#include <linux/io.h>
-#include <linux/irq.h>
-#include <linux/uaccess.h>
-#include <linux/firmware.h>
-#include <linux/time.h>
-#include <linux/miscdevice.h>
-#include <linux/clk.h>
-#include <linux/delay.h>
-#include <linux/dma-mapping.h>
-#include <linux/workqueue.h>
-#include <linux/platform_device.h>
-
-#include "score-debug-print.h"
-#include "score-fw-queue.h"
-//#include "score-device.h"
-//#include "score-system.h"
-
-#define MAX_PRINT_BUF_SIZE	(1024)
-#define SCORE_LOG_BUF_SIZE	SZ_1M
-
-extern struct score_fw_dev *score_fw_device;
-
-struct score_printf_buf_t {
-	int front;
-	int rear;
-	volatile unsigned char* buf_pa;
-	volatile unsigned char* buf_va;
-};
-
-dma_addr_t score_printf_addr;
-
-volatile struct score_printf_buf_t *score_printf_buf = NULL;
-static int score_printf_buf_size = 0;
-
-static struct workqueue_struct *score_printf_wq = NULL;
-static struct work_struct score_printf_work;
-
-static inline int score_printf_buf_is_full(void)
-{
-	return ((score_printf_buf->rear + 1) % score_printf_buf_size)
-		== score_printf_buf->front;
-}
-
-static inline int score_printf_buf_is_empty(void)
-{
-	return (score_printf_buf->rear == score_printf_buf->front);
-}
-
-static char* score_strcpy(char *dest, const volatile unsigned char* src)
-{
-	char* tmp = dest;
-
-	while ((*dest++ = *src++) != '\0') {;}
-
-	return tmp;
-}
-
-static int score_printf_dequeue(char* buf)
-{
-	int front;
-	volatile unsigned char *printf_buf;
-
-	if (score_printf_buf == NULL) {
-		return -1;
-	}
-
-	if (score_printf_buf_is_empty()) {
-		return -1;
-	}
-	front = (score_printf_buf->front + 1) % score_printf_buf_size;
-	printf_buf = (score_printf_buf->buf_va) + (MAX_PRINT_BUF_SIZE * front);
-
-	score_strcpy(buf, (const unsigned char*)printf_buf);
-	score_printf_buf->front = front;
-
-	return 0;
-}
-
-static void score_printf_work_func(struct work_struct *work)
-{
-	char buf[MAX_PRINT_BUF_SIZE];
-
-	while(1) {
-		memset(buf, '\0', MAX_PRINT_BUF_SIZE);
-		if (score_printf_dequeue(buf) < 0) {
-			msleep(500);
-		} else {
-			printk("%s",buf);
-			/* score_info("[S-FW] %s", buf); */
-		}
-	}
-}
-
-void score_printf_work_flush(void)
-{
-	char buf[MAX_PRINT_BUF_SIZE];
-
-	memset(buf, '\0', MAX_PRINT_BUF_SIZE);
-	if (score_printf_dequeue(buf) >= 0)
-		printk("[S-FW] %s",buf);
-}
-
-static void score_printf_work_init(void)
-{
-	score_printf_wq = create_singlethread_workqueue("score_printf_work");
-	if (!score_printf_wq) {
-		printk("Failed to create workqueue for score printf\n");
-		return;
-	}
-	INIT_WORK(&score_printf_work, score_printf_work_func);
-	queue_work(score_printf_wq, &score_printf_work);
-}
-
-static void score_printf_init(unsigned char* start, int size)
-{
-	score_printf_buf = (struct score_printf_buf_t*)start;
-	score_printf_buf->front = -1;
-	score_printf_buf->rear = -1;
-	score_printf_buf->buf_va = start + MAX_PRINT_BUF_SIZE;
-	score_printf_buf_size =
-		(size - sizeof(struct score_printf_buf_t)) / MAX_PRINT_BUF_SIZE;
-
-	score_printf_work_init();
-}
-
-int score_printf_buf_init(struct score_fw_dev *dev, void *msg_kva, unsigned long msg_dva)
-{
-	unsigned char *score_printf_va;
-	unsigned int score_printf_pa;
-
-//	score_printf_va = dma_zalloc_coherent(&dev->pdev->dev, SCORE_LOG_BUF_SIZE,
-//						&score_printf_addr, GFP_KERNEL);
-//	if (score_printf_va == NULL) {
-//		dev_err(&dev->pdev->dev, "Failed to allocate SCore_printf_buf memory\n");
-//		return -ENOMEM;
-//	}
-//
-//	score_printf_pa = virt_to_phys(score_printf_va);
-//	memset(score_printf_va, 0x0, SCORE_LOG_BUF_SIZE);
-
-	score_fw_device = dev;
-	pr_info("%p, 0x%lx, %p %p \n", msg_kva, msg_dva, dev, score_fw_device);
-
-	score_printf_va = (unsigned char*) msg_kva;
-	score_printf_pa = (unsigned int) msg_dva;
-	memset(score_printf_va, 0x0, SCORE_LOG_BUF_SIZE);
-
-	score_write_reg(score_printf_pa, SCORE_PRINTF_BUF_START);
-	score_write_reg(SCORE_LOG_BUF_SIZE, SCORE_PRINTF_BUF_SIZE);
-
-	score_printf_init(score_printf_va, SCORE_LOG_BUF_SIZE);
-
-	return 0;
-}
-
-int score_printf_buf_release(struct score_fw_dev *dev)
-{
-	if (score_printf_buf == NULL) {
-		printk("SCore_printf_buf is invalid memory\n");
-		return -EINVAL;
-	}
-
-//	dma_free_coherent(&dev->pdev->dev, SCORE_LOG_BUF_SIZE,
-//			(unsigned char*)score_printf_buf, score_printf_addr);
-
-	score_printf_buf = NULL;
-
-	return 0;
-}
+CIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define D3F5_PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define D3F5_PCIE_VC1_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define D3F5_PCIE_VC1_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define D3F5_PCIE_VC1_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define D3F5_PCIE_VC1_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define D3F5_PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x10000
+#define D3F5_PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x10
+#define D3F5_PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x20000
+#define D3F5_PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x11
+#define D3F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F5_PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO_MASK 0xffffffff
+#define D3F5_PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO__SHIFT 0x0
+#define D3F5_PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI_MASK 0xffffffff
+#define D3F5_PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI__SHIFT 0x0
+#define D3F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F5_PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS_MASK 0x10
+#define D3F5_PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS__SHIFT 0x4
+#define D3F5_PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS_MASK 0x20
+#define D3F5_PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS__SHIFT 0x5
+#define D3F5_PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS_MASK 0x1000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS__SHIFT 0xc
+#define D3F5_PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS_MASK 0x2000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS__SHIFT 0xd
+#define D3F5_PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS_MASK 0x4000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS__SHIFT 0xe
+#define D3F5_PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS_MASK 0x8000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS__SHIFT 0xf
+#define D3F5_PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS_MASK 0x10000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS__SHIFT 0x10
+#define D3F5_PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS_MASK 0x20000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS__SHIFT 0x11
+#define D3F5_PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS_MASK 0x40000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS__SHIFT 0x12
+#define D3F5_PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS_MASK 0x80000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS__SHIFT 0x13
+#define D3F5_PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS_MASK 0x100000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS__SHIFT 0x14
+#define D3F5_PCIE_UNCORR_ERR_STATUS__ACS_VIOLATION_STATUS_MASK 0x200000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__ACS_VIOLATION_STATUS__SHIFT 0x15
+#define D3F5_PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS_MASK 0x400000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS__SHIFT 0x16
+#define D3F5_PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS_MASK 0x800000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS__SHIFT 0x17
+#define D3F5_PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS_MASK 0x1000000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS__SHIFT 0x18
+#define D3F5_PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS_MASK 0x2000000
+#define D3F5_PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS__SHIFT 0x19
+#define D3F5_PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK_MASK 0x10
+#define D3F5_PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK__SHIFT 0x4
+#define D3F5_PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK_MASK 0x20
+#define D3F5_PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK__SHIFT 0x5
+#define D3F5_PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK_MASK 0x1000
+#define D3F5_PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK__SHIFT 0xc
+#define D3F5_PCI

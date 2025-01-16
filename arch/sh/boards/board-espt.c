@@ -1,109 +1,70 @@
-/*
- * Data Technology Inc. ESPT-GIGA board support
+oc_pd(struct ib_device *device);
+
+void ib_dealloc_pd(struct ib_pd *pd);
+
+/**
+ * ib_create_ah - Creates an address handle for the given address vector.
+ * @pd: The protection domain associated with the address handle.
+ * @ah_attr: The attributes of the address vector.
  *
- * Copyright (C) 2008, 2009 Renesas Solutions Corp.
- * Copyright (C) 2008, 2009 Nobuhiro Iwamatsu <iwamatsu.nobuhiro@renesas.com>
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ * The address handle is used to reference a local or global destination
+ * in all UD QP post sends.
  */
-#include <linux/init.h>
-#include <linux/platform_device.h>
-#include <linux/interrupt.h>
-#include <linux/mtd/physmap.h>
-#include <linux/io.h>
-#include <linux/sh_eth.h>
-#include <linux/sh_intc.h>
-#include <asm/machvec.h>
-#include <asm/sizes.h>
+struct ib_ah *ib_create_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr);
 
-/* NOR Flash */
-static struct mtd_partition espt_nor_flash_partitions[] = {
-	{
-		.name = "U-Boot",
-		.offset = 0,
-		.size = (2 * SZ_128K),
-		.mask_flags = MTD_WRITEABLE,	/* Read-only */
-	}, {
-		.name = "Linux-Kernel",
-		.offset = MTDPART_OFS_APPEND,
-		.size = (20 * SZ_128K),
-	}, {
-		.name = "Root Filesystem",
-		.offset = MTDPART_OFS_APPEND,
-		.size = MTDPART_SIZ_FULL,
-	},
-};
+/**
+ * ib_init_ah_from_wc - Initializes address handle attributes from a
+ *   work completion.
+ * @device: Device on which the received message arrived.
+ * @port_num: Port on which the received message arrived.
+ * @wc: Work completion associated with the received message.
+ * @grh: References the received global route header.  This parameter is
+ *   ignored unless the work completion indicates that the GRH is valid.
+ * @ah_attr: Returned attributes that can be used when creating an address
+ *   handle for replying to the message.
+ */
+int ib_init_ah_from_wc(struct ib_device *device, u8 port_num,
+		       const struct ib_wc *wc, const struct ib_grh *grh,
+		       struct ib_ah_attr *ah_attr);
 
-static struct physmap_flash_data espt_nor_flash_data = {
-	.width = 2,
-	.parts = espt_nor_flash_partitions,
-	.nr_parts = ARRAY_SIZE(espt_nor_flash_partitions),
-};
+/**
+ * ib_create_ah_from_wc - Creates an address handle associated with the
+ *   sender of the specified work completion.
+ * @pd: The protection domain associated with the address handle.
+ * @wc: Work completion information associated with a received message.
+ * @grh: References the received global route header.  This parameter is
+ *   ignored unless the work completion indicates that the GRH is valid.
+ * @port_num: The outbound port number to associate with the address.
+ *
+ * The address handle is used to reference a local or global destination
+ * in all UD QP post sends.
+ */
+struct ib_ah *ib_create_ah_from_wc(struct ib_pd *pd, const struct ib_wc *wc,
+				   const struct ib_grh *grh, u8 port_num);
 
-static struct resource espt_nor_flash_resources[] = {
-	[0] = {
-		.name = "NOR Flash",
-		.start = 0,
-		.end = SZ_8M - 1,
-		.flags = IORESOURCE_MEM,
-	},
-};
+/**
+ * ib_modify_ah - Modifies the address vector associated with an address
+ *   handle.
+ * @ah: The address handle to modify.
+ * @ah_attr: The new address vector attributes to associate with the
+ *   address handle.
+ */
+int ib_modify_ah(struct ib_ah *ah, struct ib_ah_attr *ah_attr);
 
-static struct platform_device espt_nor_flash_device = {
-	.name = "physmap-flash",
-	.resource = espt_nor_flash_resources,
-	.num_resources = ARRAY_SIZE(espt_nor_flash_resources),
-	.dev = {
-		.platform_data = &espt_nor_flash_data,
-	},
-};
+/**
+ * ib_query_ah - Queries the address vector associated with an address
+ *   handle.
+ * @ah: The address handle to query.
+ * @ah_attr: The address vector attributes associated with the address
+ *   handle.
+ */
+int ib_query_ah(struct ib_ah *ah, struct ib_ah_attr *ah_attr);
 
-/* SH-Ether */
-static struct resource sh_eth_resources[] = {
-	{
-		.start  = 0xFEE00800,   /* use eth1 */
-		.end    = 0xFEE00F7C - 1,
-		.flags  = IORESOURCE_MEM,
-	}, {
-		.start  = 0xFEE01800,   /* TSU */
-		.end    = 0xFEE01FFF,
-		.flags  = IORESOURCE_MEM,
-	}, {
+/**
+ * ib_destroy_ah - Destroys an address handle.
+ * @ah: The address handle to destroy.
+ */
+int ib_destroy_ah(struct ib_ah *ah);
 
-		.start  = evt2irq(0x920),   /* irq number */
-		.flags  = IORESOURCE_IRQ,
-	},
-};
-
-static struct sh_eth_plat_data sh7763_eth_pdata = {
-	.phy = 0,
-	.edmac_endian = EDMAC_LITTLE_ENDIAN,
-	.phy_interface = PHY_INTERFACE_MODE_MII,
-};
-
-static struct platform_device espt_eth_device = {
-	.name       = "sh7763-gether",
-	.resource   = sh_eth_resources,
-	.num_resources  = ARRAY_SIZE(sh_eth_resources),
-	.dev        = {
-		.platform_data = &sh7763_eth_pdata,
-	},
-};
-
-static struct platform_device *espt_devices[] __initdata = {
-	&espt_nor_flash_device,
-	&espt_eth_device,
-};
-
-static int __init espt_devices_setup(void)
-{
-	return platform_add_devices(espt_devices,
-				    ARRAY_SIZE(espt_devices));
-}
-device_initcall(espt_devices_setup);
-
-static struct sh_machine_vector mv_espt __initmv = {
-	.mv_name = "ESPT-GIGA",
-};
+/**
+ * ib_create_srq - Creates a SRQ associated with the 

@@ -1,9 +1,6 @@
-# Makefile of gnss_if
-
-# obj-$(CONFIG_GNSS_SHMEM_IF) += gnss_main.o gnss_io_device.o gnss_link_device_shmem.o \
-#						gnss_keplerctl_device.o gnss_utils.o
-
-obj-$(CONFIG_GNSS_SHMEM_IF) += gnss_main.o gnss_io_device.o \
-						gnss_keplerctl_device.o \
-						gnss_link_device_shmem.o \
-						gnss_link_device_memory.o pmu-gnss.o
+BLOCK_ID_TCC7                                = 0x97,
+	DBG_BLOCK_ID_SPS00                               = 0x98,
+	DBG_BLOCK_ID_SPS01                               = 0x99,
+	DBG_BLOCK_ID_SPS02                               = 0x9a,
+	DBG_BLOCK_ID_SPS10                               = 0x9b,
+	DBG_BLOCK_ID_SPS11                       

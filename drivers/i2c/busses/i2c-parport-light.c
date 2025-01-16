@@ -1,276 +1,250 @@
-/* ------------------------------------------------------------------------ *
- * i2c-parport-light.c I2C bus over parallel port                           *
- * ------------------------------------------------------------------------ *
-   Copyright (C) 2003-2010 Jean Delvare <jdelvare@suse.de>
-
-   Based on older i2c-velleman.c driver
-   Copyright (C) 1995-2000 Simon G. Vogl
-   With some changes from:
-   Frodo Looijaard <frodol@dds.nl>
-   Kyösti Mälkki <kmalkki@cc.hut.fi>
-
-   This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 2 of the License, or
-   (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
- * ------------------------------------------------------------------------ */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/delay.h>
-#include <linux/platform_device.h>
-#include <linux/ioport.h>
-#include <linux/i2c.h>
-#include <linux/i2c-algo-bit.h>
-#include <linux/i2c-smbus.h>
-#include <linux/io.h>
-#include "i2c-parport.h"
-
-#define DEFAULT_BASE 0x378
-#define DRVNAME "i2c-parport-light"
-
-static struct platform_device *pdev;
-
-static u16 base;
-module_param(base, ushort, 0);
-MODULE_PARM_DESC(base, "Base I/O address");
-
-static int irq;
-module_param(irq, int, 0);
-MODULE_PARM_DESC(irq, "IRQ (optional)");
-
-/* ----- Low-level parallel port access ----------------------------------- */
-
-static inline void port_write(unsigned char p, unsigned char d)
-{
-	outb(d, base+p);
-}
-
-static inline unsigned char port_read(unsigned char p)
-{
-	return inb(base+p);
-}
-
-/* ----- Unified line operation functions --------------------------------- */
-
-static inline void line_set(int state, const struct lineop *op)
-{
-	u8 oldval = port_read(op->port);
-
-	/* Touch only the bit(s) needed */
-	if ((op->inverted && !state) || (!op->inverted && state))
-		port_write(op->port, oldval | op->val);
-	else
-		port_write(op->port, oldval & ~op->val);
-}
-
-static inline int line_get(const struct lineop *op)
-{
-	u8 oldval = port_read(op->port);
-
-	return ((op->inverted && (oldval & op->val) != op->val)
-	    || (!op->inverted && (oldval & op->val) == op->val));
-}
-
-/* ----- I2C algorithm call-back functions and structures ----------------- */
-
-static void parport_setscl(void *data, int state)
-{
-	line_set(state, &adapter_parm[type].setscl);
-}
-
-static void parport_setsda(void *data, int state)
-{
-	line_set(state, &adapter_parm[type].setsda);
-}
-
-static int parport_getscl(void *data)
-{
-	return line_get(&adapter_parm[type].getscl);
-}
-
-static int parport_getsda(void *data)
-{
-	return line_get(&adapter_parm[type].getsda);
-}
-
-/* Encapsulate the functions above in the correct structure
-   Note that getscl will be set to NULL by the attaching code for adapters
-   that cannot read SCL back */
-static struct i2c_algo_bit_data parport_algo_data = {
-	.setsda		= parport_setsda,
-	.setscl		= parport_setscl,
-	.getsda		= parport_getsda,
-	.getscl		= parport_getscl,
-	.udelay		= 50,
-	.timeout	= HZ,
-};
-
-/* ----- Driver registration ---------------------------------------------- */
-
-static struct i2c_adapter parport_adapter = {
-	.owner		= THIS_MODULE,
-	.class		= I2C_CLASS_HWMON,
-	.algo_data	= &parport_algo_data,
-	.name		= "Parallel port adapter (light)",
-};
-
-/* SMBus alert support */
-static struct i2c_smbus_alert_setup alert_data = {
-	.alert_edge_triggered	= 1,
-};
-static struct i2c_client *ara;
-static struct lineop parport_ctrl_irq = {
-	.val		= (1 << 4),
-	.port		= PORT_CTRL,
-};
-
-static int i2c_parport_probe(struct platform_device *pdev)
-{
-	int err;
-
-	/* Reset hardware to a sane state (SCL and SDA high) */
-	parport_setsda(NULL, 1);
-	parport_setscl(NULL, 1);
-	/* Other init if needed (power on...) */
-	if (adapter_parm[type].init.val) {
-		line_set(1, &adapter_parm[type].init);
-		/* Give powered devices some time to settle */
-		msleep(100);
+nly happen if relaxed ordering is
+		 * used and requests are sent after an RDMA read or atomic
+		 * is sent but before the response is received.
+		 */
+		if ((wqe->wr.opcode == IB_WR_RDMA_READ &&
+		     (opcode != OP(RDMA_READ_RESPONSE_LAST) || diff != 0)) ||
+		    ((wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
+		      wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) &&
+		     (opcode != OP(ATOMIC_ACKNOWLEDGE) || diff != 0))) {
+			/* Retry this request. */
+			if (!(qp->r_flags & QIB_R_RDMAR_SEQ)) {
+				qp->r_flags |= QIB_R_RDMAR_SEQ;
+				qib_restart_rc(qp, qp->s_last_psn + 1, 0);
+				if (list_empty(&qp->rspwait)) {
+					qp->r_flags |= QIB_R_RSP_SEND;
+					atomic_inc(&qp->refcount);
+					list_add_tail(&qp->rspwait,
+						      &rcd->qp_wait_list);
+				}
+			}
+			/*
+			 * No need to process the ACK/NAK since we are
+			 * restarting an earlier request.
+			 */
+			goto bail;
+		}
+		if (wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
+		    wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) {
+			u64 *vaddr = wqe->sg_list[0].vaddr;
+			*vaddr = val;
+		}
+		if (qp->s_num_rd_atomic &&
+		    (wqe->wr.opcode == IB_WR_RDMA_READ ||
+		     wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
+		     wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD)) {
+			qp->s_num_rd_atomic--;
+			/* Restart sending task if fence is complete */
+			if ((qp->s_flags & QIB_S_WAIT_FENCE) &&
+			    !qp->s_num_rd_atomic) {
+				qp->s_flags &= ~(QIB_S_WAIT_FENCE |
+						 QIB_S_WAIT_ACK);
+				qib_schedule_send(qp);
+			} else if (qp->s_flags & QIB_S_WAIT_RDMAR) {
+				qp->s_flags &= ~(QIB_S_WAIT_RDMAR |
+						 QIB_S_WAIT_ACK);
+				qib_schedule_send(qp);
+			}
+		}
+		wqe = do_rc_completion(qp, wqe, ibp);
+		if (qp->s_acked == qp->s_tail)
+			break;
 	}
 
-	parport_adapter.dev.parent = &pdev->dev;
-	err = i2c_bit_add_bus(&parport_adapter);
-	if (err) {
-		dev_err(&pdev->dev, "Unable to register with I2C\n");
-		return err;
+	switch (aeth >> 29) {
+	case 0:         /* ACK */
+		ibp->n_rc_acks++;
+		if (qp->s_acked != qp->s_tail) {
+			/*
+			 * We are expecting more ACKs so
+			 * reset the retransmit timer.
+			 */
+			start_timer(qp);
+			/*
+			 * We can stop resending the earlier packets and
+			 * continue with the next packet the receiver wants.
+			 */
+			if (qib_cmp24(qp->s_psn, psn) <= 0)
+				reset_psn(qp, psn + 1);
+		} else if (qib_cmp24(qp->s_psn, psn) <= 0) {
+			qp->s_state = OP(SEND_LAST);
+			qp->s_psn = psn + 1;
+		}
+		if (qp->s_flags & QIB_S_WAIT_ACK) {
+			qp->s_flags &= ~QIB_S_WAIT_ACK;
+			qib_schedule_send(qp);
+		}
+		qib_get_credit(qp, aeth);
+		qp->s_rnr_retry = qp->s_rnr_retry_cnt;
+		qp->s_retry = qp->s_retry_cnt;
+		update_last_psn(qp, psn);
+		ret = 1;
+		goto bail;
+
+	case 1:         /* RNR NAK */
+		ibp->n_rnr_naks++;
+		if (qp->s_acked == qp->s_tail)
+			goto bail;
+		if (qp->s_flags & QIB_S_WAIT_RNR)
+			goto bail;
+		if (qp->s_rnr_retry == 0) {
+			status = IB_WC_RNR_RETRY_EXC_ERR;
+			goto class_b;
+		}
+		if (qp->s_rnr_retry_cnt < 7)
+			qp->s_rnr_retry--;
+
+		/* The last valid PSN is the previous PSN. */
+		update_last_psn(qp, psn - 1);
+
+		ibp->n_rc_resends += (qp->s_psn - psn) & QIB_PSN_MASK;
+
+		reset_psn(qp, psn);
+
+		qp->s_flags &= ~(QIB_S_WAIT_SSN_CREDIT | QIB_S_WAIT_ACK);
+		qp->s_flags |= QIB_S_WAIT_RNR;
+		qp->s_timer.function = qib_rc_rnr_retry;
+		qp->s_timer.expires = jiffies + usecs_to_jiffies(
+			ib_qib_rnr_table[(aeth >> QIB_AETH_CREDIT_SHIFT) &
+					   QIB_AETH_CREDIT_MASK]);
+		add_timer(&qp->s_timer);
+		goto bail;
+
+	case 3:         /* NAK */
+		if (qp->s_acked == qp->s_tail)
+			goto bail;
+		/* The last valid PSN is the previous PSN. */
+		update_last_psn(qp, psn - 1);
+		switch ((aeth >> QIB_AETH_CREDIT_SHIFT) &
+			QIB_AETH_CREDIT_MASK) {
+		case 0: /* PSN sequence error */
+			ibp->n_seq_naks++;
+			/*
+			 * Back up to the responder's expected PSN.
+			 * Note that we might get a NAK in the middle of an
+			 * RDMA READ response which terminates the RDMA
+			 * READ.
+			 */
+			qib_restart_rc(qp, psn, 0);
+			qib_schedule_send(qp);
+			break;
+
+		case 1: /* Invalid Request */
+			status = IB_WC_REM_INV_REQ_ERR;
+			ibp->n_other_naks++;
+			goto class_b;
+
+		case 2: /* Remote Access Error */
+			status = IB_WC_REM_ACCESS_ERR;
+			ibp->n_other_naks++;
+			goto class_b;
+
+		case 3: /* Remote Operation Error */
+			status = IB_WC_REM_OP_ERR;
+			ibp->n_other_naks++;
+class_b:
+			if (qp->s_last == qp->s_acked) {
+				qib_send_complete(qp, wqe, status);
+				qib_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+			}
+			break;
+
+		default:
+			/* Ignore other reserved NAK error codes */
+			goto reserved;
+		}
+		qp->s_retry = qp->s_retry_cnt;
+		qp->s_rnr_retry = qp->s_rnr_retry_cnt;
+		goto bail;
+
+	default:                /* 2: reserved */
+reserved:
+		/* Ignore reserved NAK codes. */
+		goto bail;
 	}
 
-	/* Setup SMBus alert if supported */
-	if (adapter_parm[type].smbus_alert && irq) {
-		alert_data.irq = irq;
-		ara = i2c_setup_smbus_alert(&parport_adapter, &alert_data);
-		if (ara)
-			line_set(1, &parport_ctrl_irq);
-		else
-			dev_warn(&pdev->dev, "Failed to register ARA client\n");
-	}
-
-	return 0;
+bail:
+	return ret;
 }
 
-static int i2c_parport_remove(struct platform_device *pdev)
+/*
+ * We have seen an out of sequence RDMA read middle or last packet.
+ * This ACKs SENDs and RDMA writes up to the first RDMA read or atomic SWQE.
+ */
+static void rdma_seq_err(struct qib_qp *qp, struct qib_ibport *ibp, u32 psn,
+			 struct qib_ctxtdata *rcd)
 {
-	if (ara) {
-		line_set(0, &parport_ctrl_irq);
-		i2c_unregister_device(ara);
-		ara = NULL;
+	struct qib_swqe *wqe;
+
+	/* Remove QP from retry timer */
+	if (qp->s_flags & (QIB_S_TIMER | QIB_S_WAIT_RNR)) {
+		qp->s_flags &= ~(QIB_S_TIMER | QIB_S_WAIT_RNR);
+		del_timer(&qp->s_timer);
 	}
-	i2c_del_adapter(&parport_adapter);
 
-	/* Un-init if needed (power off...) */
-	if (adapter_parm[type].init.val)
-		line_set(0, &adapter_parm[type].init);
+	wqe = get_swqe_ptr(qp, qp->s_acked);
 
-	return 0;
+	while (qib_cmp24(psn, wqe->lpsn) > 0) {
+		if (wqe->wr.opcode == IB_WR_RDMA_READ ||
+		    wqe->wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP ||
+		    wqe->wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD)
+			break;
+		wqe = do_rc_completion(qp, wqe, ibp);
+	}
+
+	ibp->n_rdma_seq++;
+	qp->r_flags |= QIB_R_RDMAR_SEQ;
+	qib_restart_rc(qp, qp->s_last_psn + 1, 0);
+	if (list_empty(&qp->rspwait)) {
+		qp->r_flags |= QIB_R_RSP_SEND;
+		atomic_inc(&qp->refcount);
+		list_add_tail(&qp->rspwait, &rcd->qp_wait_list);
+	}
 }
 
-static struct platform_driver i2c_parport_driver = {
-	.driver = {
-		.name	= DRVNAME,
-	},
-	.probe		= i2c_parport_probe,
-	.remove		= i2c_parport_remove,
-};
-
-static int __init i2c_parport_device_add(u16 address)
+/**
+ * qib_rc_rcv_resp - process an incoming RC response packet
+ * @ibp: the port this packet came in on
+ * @ohdr: the other headers for this packet
+ * @data: the packet data
+ * @tlen: the packet length
+ * @qp: the QP for this packet
+ * @opcode: the opcode for this packet
+ * @psn: the packet sequence number for this packet
+ * @hdrsize: the header length
+ * @pmtu: the path MTU
+ *
+ * This is called from qib_rc_rcv() to process an incoming RC response
+ * packet for the given QP.
+ * Called at interrupt level.
+ */
+static void qib_rc_rcv_resp(struct qib_ibport *ibp,
+			    struct qib_other_headers *ohdr,
+			    void *data, u32 tlen,
+			    struct qib_qp *qp,
+			    u32 opcode,
+			    u32 psn, u32 hdrsize, u32 pmtu,
+			    struct qib_ctxtdata *rcd)
 {
-	int err;
+	struct qib_swqe *wqe;
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	enum ib_wc_status status;
+	unsigned long flags;
+	int diff;
+	u32 pad;
+	u32 aeth;
+	u64 val;
 
-	pdev = platform_device_alloc(DRVNAME, -1);
-	if (!pdev) {
-		err = -ENOMEM;
-		printk(KERN_ERR DRVNAME ": Device allocation failed\n");
-		goto exit;
-	}
+	if (opcode != OP(RDMA_READ_RESPONSE_MIDDLE)) {
+		/*
+		 * If ACK'd PSN on SDMA busy list try to make progress to
+		 * reclaim SDMA credits.
+		 */
+		if ((qib_cmp24(psn, qp->s_sending_psn) >= 0) &&
+		    (qib_cmp24(qp->s_sending_psn, qp->s_sending_hpsn) <= 0)) {
 
-	err = platform_device_add(pdev);
-	if (err) {
-		printk(KERN_ERR DRVNAME ": Device addition failed (%d)\n",
-		       err);
-		goto exit_device_put;
-	}
-
-	return 0;
-
-exit_device_put:
-	platform_device_put(pdev);
-exit:
-	return err;
-}
-
-static int __init i2c_parport_init(void)
-{
-	int err;
-
-	if (type < 0) {
-		printk(KERN_ERR DRVNAME ": adapter type unspecified\n");
-		return -ENODEV;
-	}
-
-	if (type >= ARRAY_SIZE(adapter_parm)) {
-		printk(KERN_ERR DRVNAME ": invalid type (%d)\n", type);
-		return -ENODEV;
-	}
-
-	if (base == 0) {
-		pr_info(DRVNAME ": using default base 0x%x\n", DEFAULT_BASE);
-		base = DEFAULT_BASE;
-	}
-
-	if (!request_region(base, 3, DRVNAME))
-		return -EBUSY;
-
-	if (irq != 0)
-		pr_info(DRVNAME ": using irq %d\n", irq);
-
-	if (!adapter_parm[type].getscl.val)
-		parport_algo_data.getscl = NULL;
-
-	/* Sets global pdev as a side effect */
-	err = i2c_parport_device_add(base);
-	if (err)
-		goto exit_release;
-
-	err = platform_driver_register(&i2c_parport_driver);
-	if (err)
-		goto exit_device;
-
-	return 0;
-
-exit_device:
-	platform_device_unregister(pdev);
-exit_release:
-	release_region(base, 3);
-	return err;
-}
-
-static void __exit i2c_parport_exit(void)
-{
-	platform_driver_unregister(&i2c_parport_driver);
-	platform_device_unregister(pdev);
-	release_region(base, 3);
-}
-
-MODULE_AUTHOR("Jean Delvare <jdelvare@suse.de>");
-MODULE_DESCRIPTION("I2C bus over parallel port (light)");
-MODULE_LICENSE("GPL");
-
-module_init(i2c_parport_init);
-module_exit(i2c_parport_exit);
+			/*
+			 * If send tasklet not running attempt to progress
+			 * SDMA queue.
+			 */
+			i

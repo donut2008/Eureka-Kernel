@@ -1,218 +1,205 @@
-/*
- * Definitions for TUSB6010 USB 2.0 OTG Dual Role controller
- *
- * Copyright (C) 2006 Nokia Corporation
- * Tony Lindgren <tony@atomide.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
+ATOM_DTD_MODE_SUPPORT_TBL_SIZE)
 
-#ifndef __TUSB6010_H__
-#define __TUSB6010_H__
+#define ATOM_DFP4_EDID_ADDR             (ATOM_DFP3_STD_MODE_TBL_ADDR + ATOM_STD_MODE_SUPPORT_TBL_SIZE)
+#define ATOM_DFP4_DTD_MODE_TBL_ADDR     (ATOM_DFP4_EDID_ADDR + ATOM_EDID_RAW_DATASIZE)
+#define ATOM_DFP4_STD_MODE_TBL_ADDR     (ATOM_DFP4_DTD_MODE_TBL_ADDR + ATOM_DTD_MODE_SUPPORT_TBL_SIZE)
 
-/* VLYNQ control register. 32-bit at offset 0x000 */
-#define TUSB_VLYNQ_CTRL			0x004
+#define ATOM_DFP5_EDID_ADDR             (ATOM_DFP4_STD_MODE_TBL_ADDR + ATOM_STD_MODE_SUPPORT_TBL_SIZE)
+#define ATOM_DFP5_DTD_MODE_TBL_ADDR     (ATOM_DFP5_EDID_ADDR + ATOM_EDID_RAW_DATASIZE)
+#define ATOM_DFP5_STD_MODE_TBL_ADDR     (ATOM_DFP5_DTD_MODE_TBL_ADDR + ATOM_DTD_MODE_SUPPORT_TBL_SIZE)
 
-/* Mentor Graphics OTG core registers. 8,- 16- and 32-bit at offset 0x400 */
-#define TUSB_BASE_OFFSET		0x400
+#define ATOM_DP_TRAINING_TBL_ADDR       (ATOM_DFP5_STD_MODE_TBL_ADDR + ATOM_STD_MODE_SUPPORT_TBL_SIZE)
 
-/* FIFO registers 32-bit at offset 0x600 */
-#define TUSB_FIFO_BASE			0x600
+#define ATOM_STACK_STORAGE_START        (ATOM_DP_TRAINING_TBL_ADDR + 1024)
+#define ATOM_STACK_STORAGE_END          ATOM_STACK_STORAGE_START + 512
 
-/* Device System & Control registers. 32-bit at offset 0x800 */
-#define TUSB_SYS_REG_BASE		0x800
+//The size below is in Kb!
+#define ATOM_VRAM_RESERVE_SIZE         ((((ATOM_STACK_STORAGE_END - ATOM_HWICON1_SURFACE_ADDR)>>10)+4)&0xFFFC)
 
-#define TUSB_DEV_CONF			(TUSB_SYS_REG_BASE + 0x000)
-#define		TUSB_DEV_CONF_USB_HOST_MODE		(1 << 16)
-#define		TUSB_DEV_CONF_PROD_TEST_MODE		(1 << 15)
-#define		TUSB_DEV_CONF_SOFT_ID			(1 << 1)
-#define		TUSB_DEV_CONF_ID_SEL			(1 << 0)
+#define ATOM_VRAM_RESERVE_V2_SIZE      32
 
-#define TUSB_PHY_OTG_CTRL_ENABLE	(TUSB_SYS_REG_BASE + 0x004)
-#define TUSB_PHY_OTG_CTRL		(TUSB_SYS_REG_BASE + 0x008)
-#define		TUSB_PHY_OTG_CTRL_WRPROTECT		(0xa5 << 24)
-#define		TUSB_PHY_OTG_CTRL_OTG_ID_PULLUP		(1 << 23)
-#define		TUSB_PHY_OTG_CTRL_OTG_VBUS_DET_EN	(1 << 19)
-#define		TUSB_PHY_OTG_CTRL_OTG_SESS_END_EN	(1 << 18)
-#define		TUSB_PHY_OTG_CTRL_TESTM2		(1 << 17)
-#define		TUSB_PHY_OTG_CTRL_TESTM1		(1 << 16)
-#define		TUSB_PHY_OTG_CTRL_TESTM0		(1 << 15)
-#define		TUSB_PHY_OTG_CTRL_TX_DATA2		(1 << 14)
-#define		TUSB_PHY_OTG_CTRL_TX_GZ2		(1 << 13)
-#define		TUSB_PHY_OTG_CTRL_TX_ENABLE2		(1 << 12)
-#define		TUSB_PHY_OTG_CTRL_DM_PULLDOWN		(1 << 11)
-#define		TUSB_PHY_OTG_CTRL_DP_PULLDOWN		(1 << 10)
-#define		TUSB_PHY_OTG_CTRL_OSC_EN		(1 << 9)
-#define		TUSB_PHY_OTG_CTRL_PHYREF_CLKSEL(v)	(((v) & 3) << 7)
-#define		TUSB_PHY_OTG_CTRL_PD			(1 << 6)
-#define		TUSB_PHY_OTG_CTRL_PLL_ON		(1 << 5)
-#define		TUSB_PHY_OTG_CTRL_EXT_RPU		(1 << 4)
-#define		TUSB_PHY_OTG_CTRL_PWR_GOOD		(1 << 3)
-#define		TUSB_PHY_OTG_CTRL_RESET			(1 << 2)
-#define		TUSB_PHY_OTG_CTRL_SUSPENDM		(1 << 1)
-#define		TUSB_PHY_OTG_CTRL_CLK_MODE		(1 << 0)
+#define   ATOM_VRAM_OPERATION_FLAGS_MASK         0xC0000000L
+#define ATOM_VRAM_OPERATION_FLAGS_SHIFT        30
+#define   ATOM_VRAM_BLOCK_NEEDS_NO_RESERVATION   0x1
+#define   ATOM_VRAM_BLOCK_NEEDS_RESERVATION      0x0
 
-/*OTG status register */
-#define TUSB_DEV_OTG_STAT		(TUSB_SYS_REG_BASE + 0x00c)
-#define		TUSB_DEV_OTG_STAT_PWR_CLK_GOOD		(1 << 8)
-#define		TUSB_DEV_OTG_STAT_SESS_END		(1 << 7)
-#define		TUSB_DEV_OTG_STAT_SESS_VALID		(1 << 6)
-#define		TUSB_DEV_OTG_STAT_VBUS_VALID		(1 << 5)
-#define		TUSB_DEV_OTG_STAT_VBUS_SENSE		(1 << 4)
-#define		TUSB_DEV_OTG_STAT_ID_STATUS		(1 << 3)
-#define		TUSB_DEV_OTG_STAT_HOST_DISCON		(1 << 2)
-#define		TUSB_DEV_OTG_STAT_LINE_STATE		(3 << 0)
-#define		TUSB_DEV_OTG_STAT_DP_ENABLE		(1 << 1)
-#define		TUSB_DEV_OTG_STAT_DM_ENABLE		(1 << 0)
+/***********************************************************************************/
+// Structure used in VRAM_UsageByFirmwareTable
+// Note1: This table is filled by SetBiosReservationStartInFB in CoreCommSubs.asm
+//        at running time.
+// note2: From RV770, the memory is more than 32bit addressable, so we will change
+//        ucTableFormatRevision=1,ucTableContentRevision=4, the strcuture remains
+//        exactly same as 1.1 and 1.2 (1.3 is never in use), but ulStartAddrUsedByFirmware
+//        (in offset to start of memory address) is KB aligned instead of byte aligend.
+// Note3:
+/* If we change usReserved to "usFBUsedbyDrvInKB", then to VBIOS this usFBUsedbyDrvInKB is a predefined, unchanged
+constant across VGA or non VGA adapter,
+for CAIL, The size of FB access area is known, only thing missing is the Offset of FB Access area, so we can  have:
 
-#define TUSB_DEV_OTG_TIMER		(TUSB_SYS_REG_BASE + 0x010)
-#	define TUSB_DEV_OTG_TIMER_ENABLE		(1 << 31)
-#	define TUSB_DEV_OTG_TIMER_VAL(v)		((v) & 0x07ffffff)
-#define TUSB_PRCM_REV			(TUSB_SYS_REG_BASE + 0x014)
+If (ulStartAddrUsedByFirmware!=0)
+FBAccessAreaOffset= ulStartAddrUsedByFirmware - usFBUsedbyDrvInKB;
+Reserved area has been claimed by VBIOS including this FB access area; CAIL doesn't need to reserve any extra area for this purpose
+else   //Non VGA case
+ if (FB_Size<=2Gb)
+    FBAccessAreaOffset= FB_Size - usFBUsedbyDrvInKB;
+ else
+     FBAccessAreaOffset= Aper_Size - usFBUsedbyDrvInKB
 
-/* PRCM configuration register */
-#define TUSB_PRCM_CONF			(TUSB_SYS_REG_BASE + 0x018)
-#define		TUSB_PRCM_CONF_SFW_CPEN		(1 << 24)
-#define		TUSB_PRCM_CONF_SYS_CLKSEL(v)	(((v) & 3) << 16)
+CAIL needs to claim an reserved area defined by FBAccessAreaOffset and usFBUsedbyDrvInKB in non VGA case.*/
 
-/* PRCM management register */
-#define TUSB_PRCM_MNGMT			(TUSB_SYS_REG_BASE + 0x01c)
-#define		TUSB_PRCM_MNGMT_SRP_FIX_TIMER(v)	(((v) & 0xf) << 25)
-#define		TUSB_PRCM_MNGMT_SRP_FIX_EN		(1 << 24)
-#define		TUSB_PRCM_MNGMT_VBUS_VALID_TIMER(v)	(((v) & 0xf) << 20)
-#define		TUSB_PRCM_MNGMT_VBUS_VALID_FLT_EN	(1 << 19)
-#define		TUSB_PRCM_MNGMT_DFT_CLK_DIS		(1 << 18)
-#define		TUSB_PRCM_MNGMT_VLYNQ_CLK_DIS		(1 << 17)
-#define		TUSB_PRCM_MNGMT_OTG_SESS_END_EN		(1 << 10)
-#define		TUSB_PRCM_MNGMT_OTG_VBUS_DET_EN		(1 << 9)
-#define		TUSB_PRCM_MNGMT_OTG_ID_PULLUP		(1 << 8)
-#define		TUSB_PRCM_MNGMT_15_SW_EN		(1 << 4)
-#define		TUSB_PRCM_MNGMT_33_SW_EN		(1 << 3)
-#define		TUSB_PRCM_MNGMT_5V_CPEN			(1 << 2)
-#define		TUSB_PRCM_MNGMT_PM_IDLE			(1 << 1)
-#define		TUSB_PRCM_MNGMT_DEV_IDLE		(1 << 0)
+/***********************************************************************************/
+#define ATOM_MAX_FIRMWARE_VRAM_USAGE_INFO         1
 
-/* Wake-up source clear and mask registers */
-#define TUSB_PRCM_WAKEUP_SOURCE		(TUSB_SYS_REG_BASE + 0x020)
-#define TUSB_PRCM_WAKEUP_CLEAR		(TUSB_SYS_REG_BASE + 0x028)
-#define TUSB_PRCM_WAKEUP_MASK		(TUSB_SYS_REG_BASE + 0x02c)
-#define		TUSB_PRCM_WAKEUP_RESERVED_BITS	(0xffffe << 13)
-#define		TUSB_PRCM_WGPIO_7	(1 << 12)
-#define		TUSB_PRCM_WGPIO_6	(1 << 11)
-#define		TUSB_PRCM_WGPIO_5	(1 << 10)
-#define		TUSB_PRCM_WGPIO_4	(1 << 9)
-#define		TUSB_PRCM_WGPIO_3	(1 << 8)
-#define		TUSB_PRCM_WGPIO_2	(1 << 7)
-#define		TUSB_PRCM_WGPIO_1	(1 << 6)
-#define		TUSB_PRCM_WGPIO_0	(1 << 5)
-#define		TUSB_PRCM_WHOSTDISCON	(1 << 4)	/* Host disconnect */
-#define		TUSB_PRCM_WBUS		(1 << 3)	/* USB bus resume */
-#define		TUSB_PRCM_WNORCS	(1 << 2)	/* NOR chip select */
-#define		TUSB_PRCM_WVBUS		(1 << 1)	/* OTG PHY VBUS */
-#define		TUSB_PRCM_WID		(1 << 0)	/* OTG PHY ID detect */
+typedef struct _ATOM_FIRMWARE_VRAM_RESERVE_INFO
+{
+  ULONG   ulStartAddrUsedByFirmware;
+  USHORT  usFirmwareUseInKb;
+  USHORT  usReserved;
+}ATOM_FIRMWARE_VRAM_RESERVE_INFO;
 
-#define TUSB_PULLUP_1_CTRL		(TUSB_SYS_REG_BASE + 0x030)
-#define TUSB_PULLUP_2_CTRL		(TUSB_SYS_REG_BASE + 0x034)
-#define TUSB_INT_CTRL_REV		(TUSB_SYS_REG_BASE + 0x038)
-#define TUSB_INT_CTRL_CONF		(TUSB_SYS_REG_BASE + 0x03c)
-#define TUSB_USBIP_INT_SRC		(TUSB_SYS_REG_BASE + 0x040)
-#define TUSB_USBIP_INT_SET		(TUSB_SYS_REG_BASE + 0x044)
-#define TUSB_USBIP_INT_CLEAR		(TUSB_SYS_REG_BASE + 0x048)
-#define TUSB_USBIP_INT_MASK		(TUSB_SYS_REG_BASE + 0x04c)
-#define TUSB_DMA_INT_SRC		(TUSB_SYS_REG_BASE + 0x050)
-#define TUSB_DMA_INT_SET		(TUSB_SYS_REG_BASE + 0x054)
-#define TUSB_DMA_INT_CLEAR		(TUSB_SYS_REG_BASE + 0x058)
-#define TUSB_DMA_INT_MASK		(TUSB_SYS_REG_BASE + 0x05c)
-#define TUSB_GPIO_INT_SRC		(TUSB_SYS_REG_BASE + 0x060)
-#define TUSB_GPIO_INT_SET		(TUSB_SYS_REG_BASE + 0x064)
-#define TUSB_GPIO_INT_CLEAR		(TUSB_SYS_REG_BASE + 0x068)
-#define TUSB_GPIO_INT_MASK		(TUSB_SYS_REG_BASE + 0x06c)
+typedef struct _ATOM_VRAM_USAGE_BY_FIRMWARE
+{
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  ATOM_FIRMWARE_VRAM_RESERVE_INFO   asFirmwareVramReserveInfo[ATOM_MAX_FIRMWARE_VRAM_USAGE_INFO];
+}ATOM_VRAM_USAGE_BY_FIRMWARE;
 
-/* NOR flash interrupt source registers */
-#define TUSB_INT_SRC			(TUSB_SYS_REG_BASE + 0x070)
-#define TUSB_INT_SRC_SET		(TUSB_SYS_REG_BASE + 0x074)
-#define TUSB_INT_SRC_CLEAR		(TUSB_SYS_REG_BASE + 0x078)
-#define TUSB_INT_MASK			(TUSB_SYS_REG_BASE + 0x07c)
-#define		TUSB_INT_SRC_TXRX_DMA_DONE		(1 << 24)
-#define		TUSB_INT_SRC_USB_IP_CORE		(1 << 17)
-#define		TUSB_INT_SRC_OTG_TIMEOUT		(1 << 16)
-#define		TUSB_INT_SRC_VBUS_SENSE_CHNG		(1 << 15)
-#define		TUSB_INT_SRC_ID_STATUS_CHNG		(1 << 14)
-#define		TUSB_INT_SRC_DEV_WAKEUP			(1 << 13)
-#define		TUSB_INT_SRC_DEV_READY			(1 << 12)
-#define		TUSB_INT_SRC_USB_IP_TX			(1 << 9)
-#define		TUSB_INT_SRC_USB_IP_RX			(1 << 8)
-#define		TUSB_INT_SRC_USB_IP_VBUS_ERR		(1 << 7)
-#define		TUSB_INT_SRC_USB_IP_VBUS_REQ		(1 << 6)
-#define		TUSB_INT_SRC_USB_IP_DISCON		(1 << 5)
-#define		TUSB_INT_SRC_USB_IP_CONN		(1 << 4)
-#define		TUSB_INT_SRC_USB_IP_SOF			(1 << 3)
-#define		TUSB_INT_SRC_USB_IP_RST_BABBLE		(1 << 2)
-#define		TUSB_INT_SRC_USB_IP_RESUME		(1 << 1)
-#define		TUSB_INT_SRC_USB_IP_SUSPEND		(1 << 0)
+// change verion to 1.5, when allow driver to allocate the vram area for command table access.
+typedef struct _ATOM_FIRMWARE_VRAM_RESERVE_INFO_V1_5
+{
+  ULONG   ulStartAddrUsedByFirmware;
+  USHORT  usFirmwareUseInKb;
+  USHORT  usFBUsedByDrvInKb;
+}ATOM_FIRMWARE_VRAM_RESERVE_INFO_V1_5;
 
-/* NOR flash interrupt registers reserved bits. Must be written as 0 */
-#define		TUSB_INT_MASK_RESERVED_17		(0x3fff << 17)
-#define		TUSB_INT_MASK_RESERVED_13		(1 << 13)
-#define		TUSB_INT_MASK_RESERVED_8		(0xf << 8)
-#define		TUSB_INT_SRC_RESERVED_26		(0x1f << 26)
-#define		TUSB_INT_SRC_RESERVED_18		(0x3f << 18)
-#define		TUSB_INT_SRC_RESERVED_10		(0x03 << 10)
+typedef struct _ATOM_VRAM_USAGE_BY_FIRMWARE_V1_5
+{
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  ATOM_FIRMWARE_VRAM_RESERVE_INFO_V1_5   asFirmwareVramReserveInfo[ATOM_MAX_FIRMWARE_VRAM_USAGE_INFO];
+}ATOM_VRAM_USAGE_BY_FIRMWARE_V1_5;
 
-/* Reserved bits for NOR flash interrupt mask and clear register */
-#define		TUSB_INT_MASK_RESERVED_BITS	(TUSB_INT_MASK_RESERVED_17 | \
-						TUSB_INT_MASK_RESERVED_13 | \
-						TUSB_INT_MASK_RESERVED_8)
+/****************************************************************************/
+// Structure used in GPIO_Pin_LUTTable
+/****************************************************************************/
+typedef struct _ATOM_GPIO_PIN_ASSIGNMENT
+{
+  USHORT                   usGpioPin_AIndex;
+  UCHAR                    ucGpioPinBitShift;
+  UCHAR                    ucGPIO_ID;
+}ATOM_GPIO_PIN_ASSIGNMENT;
 
-/* Reserved bits for NOR flash interrupt status register */
-#define		TUSB_INT_SRC_RESERVED_BITS	(TUSB_INT_SRC_RESERVED_26 | \
-						TUSB_INT_SRC_RESERVED_18 | \
-						TUSB_INT_SRC_RESERVED_10)
+//ucGPIO_ID pre-define id for multiple usage
+// GPIO use to control PCIE_VDDC in certain SLT board
+#define PCIE_VDDC_CONTROL_GPIO_PINID        56
 
-#define TUSB_GPIO_REV			(TUSB_SYS_REG_BASE + 0x080)
-#define TUSB_GPIO_CONF			(TUSB_SYS_REG_BASE + 0x084)
-#define TUSB_DMA_CTRL_REV		(TUSB_SYS_REG_BASE + 0x100)
-#define TUSB_DMA_REQ_CONF		(TUSB_SYS_REG_BASE + 0x104)
-#define TUSB_EP0_CONF			(TUSB_SYS_REG_BASE + 0x108)
-#define TUSB_DMA_EP_MAP			(TUSB_SYS_REG_BASE + 0x148)
+//from SMU7.x, if ucGPIO_ID=PP_AC_DC_SWITCH_GPIO_PINID in GPIO_LUTTable, AC/DC swithing feature is enable
+#define PP_AC_DC_SWITCH_GPIO_PINID          60
+//from SMU7.x, if ucGPIO_ID=VDDC_REGULATOR_VRHOT_GPIO_PINID in GPIO_LUTable, VRHot feature is enable
+#define VDDC_VRHOT_GPIO_PINID               61
+//if ucGPIO_ID=VDDC_PCC_GPIO_PINID in GPIO_LUTable, Peak Current Control feature is enabled
+#define VDDC_PCC_GPIO_PINID                 62
+// Only used on certain SLT/PA board to allow utility to cut Efuse.
+#define EFUSE_CUT_ENABLE_GPIO_PINID         63
+// ucGPIO=DRAM_SELF_REFRESH_GPIO_PIND uses  for memory self refresh (ucGPIO=0, DRAM self-refresh; ucGPIO=
+#define DRAM_SELF_REFRESH_GPIO_PINID        64
+// Thermal interrupt output->system thermal chip GPIO pin
+#define THERMAL_INT_OUTPUT_GPIO_PINID       65
 
-/* Offsets from each ep base register */
-#define TUSB_EP_TX_OFFSET		0x10c	/* EP_IN in docs */
-#define TUSB_EP_RX_OFFSET		0x14c	/* EP_OUT in docs */
-#define TUSB_EP_MAX_PACKET_SIZE_OFFSET	0x188
 
-#define TUSB_WAIT_COUNT			(TUSB_SYS_REG_BASE + 0x1c8)
-#define TUSB_SCRATCH_PAD		(TUSB_SYS_REG_BASE + 0x1c4)
-#define TUSB_PROD_TEST_RESET		(TUSB_SYS_REG_BASE + 0x1d8)
+typedef struct _ATOM_GPIO_PIN_LUT
+{
+  ATOM_COMMON_TABLE_HEADER  sHeader;
+  ATOM_GPIO_PIN_ASSIGNMENT   asGPIO_Pin[1];
+}ATOM_GPIO_PIN_LUT;
 
-/* Device System & Control register bitfields */
-#define TUSB_INT_CTRL_CONF_INT_RELCYC(v)	(((v) & 0x7) << 18)
-#define TUSB_INT_CTRL_CONF_INT_POLARITY		(1 << 17)
-#define TUSB_INT_CTRL_CONF_INT_MODE		(1 << 16)
-#define TUSB_GPIO_CONF_DMAREQ(v)		(((v) & 0x3f) << 24)
-#define TUSB_DMA_REQ_CONF_BURST_SIZE(v)		(((v) & 3) << 26)
-#define TUSB_DMA_REQ_CONF_DMA_REQ_EN(v)		(((v) & 0x3f) << 20)
-#define TUSB_DMA_REQ_CONF_DMA_REQ_ASSER(v)	(((v) & 0xf) << 16)
-#define TUSB_EP0_CONFIG_SW_EN			(1 << 8)
-#define TUSB_EP0_CONFIG_DIR_TX			(1 << 7)
-#define TUSB_EP0_CONFIG_XFR_SIZE(v)		((v) & 0x7f)
-#define TUSB_EP_CONFIG_SW_EN			(1 << 31)
-#define TUSB_EP_CONFIG_XFR_SIZE(v)		((v) & 0x7fffffff)
-#define TUSB_PROD_TEST_RESET_VAL		0xa596
-#define TUSB_EP_FIFO(ep)			(TUSB_FIFO_BASE + (ep) * 0x20)
+/****************************************************************************/
+// Structure used in ComponentVideoInfoTable
+/****************************************************************************/
+#define GPIO_PIN_ACTIVE_HIGH          0x1
+#define MAX_SUPPORTED_CV_STANDARDS    5
 
-#define TUSB_DIDR1_LO				(TUSB_SYS_REG_BASE + 0x1f8)
-#define TUSB_DIDR1_HI				(TUSB_SYS_REG_BASE + 0x1fc)
-#define		TUSB_DIDR1_HI_CHIP_REV(v)		(((v) >> 17) & 0xf)
-#define			TUSB_DIDR1_HI_REV_20		0
-#define			TUSB_DIDR1_HI_REV_30		1
-#define			TUSB_DIDR1_HI_REV_31		2
+// definitions for ATOM_D_INFO.ucSettings
+#define ATOM_GPIO_SETTINGS_BITSHIFT_MASK  0x1F    // [4:0]
+#define ATOM_GPIO_SETTINGS_RESERVED_MASK  0x60    // [6:5] = must be zeroed out
+#define ATOM_GPIO_SETTINGS_ACTIVE_MASK    0x80    // [7]
 
-#define TUSB_REV_10	0x10
-#define TUSB_REV_20	0x20
-#define TUSB_REV_30	0x30
-#define TUSB_REV_31	0x31
+typedef struct _ATOM_GPIO_INFO
+{
+  USHORT  usAOffset;
+  UCHAR   ucSettings;
+  UCHAR   ucReserved;
+}ATOM_GPIO_INFO;
 
-#endif /* __TUSB6010_H__ */
+// definitions for ATOM_COMPONENT_VIDEO_INFO.ucMiscInfo (bit vector)
+#define ATOM_CV_RESTRICT_FORMAT_SELECTION           0x2
+
+// definitions for ATOM_COMPONENT_VIDEO_INFO.uc480i/uc480p/uc720p/uc1080i
+#define ATOM_GPIO_DEFAULT_MODE_EN                   0x80 //[7];
+#define ATOM_GPIO_SETTING_PERMODE_MASK              0x7F //[6:0]
+
+// definitions for ATOM_COMPONENT_VIDEO_INFO.ucLetterBoxMode
+//Line 3 out put 5V.
+#define ATOM_CV_LINE3_ASPECTRATIO_16_9_GPIO_A       0x01     //represent gpio 3 state for 16:9
+#define ATOM_CV_LINE3_ASPECTRATIO_16_9_GPIO_B       0x02     //represent gpio 4 state for 16:9
+#define ATOM_CV_LINE3_ASPECTRATIO_16_9_GPIO_SHIFT   0x0
+
+//Line 3 out put 2.2V
+#define ATOM_CV_LINE3_ASPECTRATIO_4_3_LETBOX_GPIO_A 0x04     //represent gpio 3 state for 4:3 Letter box
+#define ATOM_CV_LINE3_ASPECTRATIO_4_3_LETBOX_GPIO_B 0x08     //represent gpio 4 state for 4:3 Letter box
+#define ATOM_CV_LINE3_ASPECTRATIO_4_3_LETBOX_GPIO_SHIFT 0x2
+
+//Line 3 out put 0V
+#define ATOM_CV_LINE3_ASPECTRATIO_4_3_GPIO_A        0x10     //represent gpio 3 state for 4:3
+#define ATOM_CV_LINE3_ASPECTRATIO_4_3_GPIO_B        0x20     //represent gpio 4 state for 4:3
+#define ATOM_CV_LINE3_ASPECTRATIO_4_3_GPIO_SHIFT    0x4
+
+#define ATOM_CV_LINE3_ASPECTRATIO_MASK              0x3F     // bit [5:0]
+
+#define ATOM_CV_LINE3_ASPECTRATIO_EXIST             0x80     //bit 7
+
+//GPIO bit index in gpio setting per mode value, also represend the block no. in gpio blocks.
+#define ATOM_GPIO_INDEX_LINE3_ASPECRATIO_GPIO_A   3   //bit 3 in uc480i/uc480p/uc720p/uc1080i, which represend the default gpio bit setting for the mode.
+#define ATOM_GPIO_INDEX_LINE3_ASPECRATIO_GPIO_B   4   //bit 4 in uc480i/uc480p/uc720p/uc1080i, which represend the default gpio bit setting for the mode.
+
+
+typedef struct _ATOM_COMPONENT_VIDEO_INFO
+{
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  USHORT             usMask_PinRegisterIndex;
+  USHORT             usEN_PinRegisterIndex;
+  USHORT             usY_PinRegisterIndex;
+  USHORT             usA_PinRegisterIndex;
+  UCHAR              ucBitShift;
+  UCHAR              ucPinActiveState;  //ucPinActiveState: Bit0=1 active high, =0 active low
+  ATOM_DTD_FORMAT    sReserved;         // must be zeroed out
+  UCHAR              ucMiscInfo;
+  UCHAR              uc480i;
+  UCHAR              uc480p;
+  UCHAR              uc720p;
+  UCHAR              uc1080i;
+  UCHAR              ucLetterBoxMode;
+  UCHAR              ucReserved[3];
+  UCHAR              ucNumOfWbGpioBlocks; //For Component video D-Connector support. If zere, NTSC type connector
+  ATOM_GPIO_INFO     aWbGpioStateBlock[MAX_SUPPORTED_CV_STANDARDS];
+  ATOM_DTD_FORMAT    aModeTimings[MAX_SUPPORTED_CV_STANDARDS];
+}ATOM_COMPONENT_VIDEO_INFO;
+
+//ucTableFormatRevision=2
+//ucTableContentRevision=1
+typedef struct _ATOM_COMPONENT_VIDEO_INFO_V21
+{
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  UCHAR              ucMiscInfo;
+  UCHAR              uc480i;
+  UCHAR              uc480p;
+  UCHAR              uc720p;
+  UCHAR              uc1080i;
+  UCHAR              ucReserved;
+  UCHAR              ucLetterBoxMode;
+  UCHAR              ucNumOfWbGpioBlocks; //For Component video D-Connector support. If zere, NTSC type connector
+  ATOM_GPIO_INFO     aWbGpioStateBlock[MAX_SUPPORTED_CV_STANDARDS];
+  ATOM_DTD_FORMAT    aModeTimings[MAX_SUPPORTED_CV_STANDARDS];
+}ATOM_COMPONENT_VIDEO_INFO_V21;
+
+#define ATOM_COMPONENT_VIDEO_INFO_LAST  ATOM_COMPONENT_VIDEO_INFO_V21
+
+/***********************

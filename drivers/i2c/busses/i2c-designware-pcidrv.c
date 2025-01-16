@@ -1,322 +1,295 @@
-/*
- * Synopsys DesignWare I2C adapter driver (master only).
+IMM;
+		wc.ex.imm_data = swqe->wr.ex.imm_data;
+	}
+
+	spin_lock_irqsave(&qp->r_lock, flags);
+
+	/*
+	 * Get the next work request entry to find where to put the data.
+	 */
+	if (qp->r_flags & QIB_R_REUSE_SGE)
+		qp->r_flags &= ~QIB_R_REUSE_SGE;
+	else {
+		int ret;
+
+		ret = qib_get_rwqe(qp, 0);
+		if (ret < 0) {
+			qib_rc_error(qp, IB_WC_LOC_QP_OP_ERR);
+			goto bail_unlock;
+		}
+		if (!ret) {
+			if (qp->ibqp.qp_num == 0)
+				ibp->n_vl15_dropped++;
+			goto bail_unlock;
+		}
+	}
+	/* Silently drop packets which are too big. */
+	if (unlikely(wc.byte_len > qp->r_len)) {
+		qp->r_flags |= QIB_R_REUSE_SGE;
+		ibp->n_pkt_drops++;
+		goto bail_unlock;
+	}
+
+	if (ah_attr->ah_flags & IB_AH_GRH) {
+		qib_copy_sge(&qp->r_sge, &ah_attr->grh,
+			     sizeof(struct ib_grh), 1);
+		wc.wc_flags |= IB_WC_GRH;
+	} else
+		qib_skip_sge(&qp->r_sge, sizeof(struct ib_grh), 1);
+	ssge.sg_list = swqe->sg_list + 1;
+	ssge.sge = *swqe->sg_list;
+	ssge.num_sge = swqe->wr.num_sge;
+	sge = &ssge.sge;
+	while (length) {
+		u32 len = sge->length;
+
+		if (len > length)
+			len = length;
+		if (len > sge->sge_length)
+			len = sge->sge_length;
+		BUG_ON(len == 0);
+		qib_copy_sge(&qp->r_sge, sge->vaddr, len, 1);
+		sge->vaddr += len;
+		sge->length -= len;
+		sge->sge_length -= len;
+		if (sge->sge_length == 0) {
+			if (--ssge.num_sge)
+				*sge = *ssge.sg_list++;
+		} else if (sge->length == 0 && sge->mr->lkey) {
+			if (++sge->n >= QIB_SEGSZ) {
+				if (++sge->m >= sge->mr->mapsz)
+					break;
+				sge->n = 0;
+			}
+			sge->vaddr =
+				sge->mr->map[sge->m]->segs[sge->n].vaddr;
+			sge->length =
+				sge->mr->map[sge->m]->segs[sge->n].length;
+		}
+		length -= len;
+	}
+	qib_put_ss(&qp->r_sge);
+	if (!test_and_clear_bit(QIB_R_WRID_VALID, &qp->r_aflags))
+		goto bail_unlock;
+	wc.wr_id = qp->r_wr_id;
+	wc.status = IB_WC_SUCCESS;
+	wc.opcode = IB_WC_RECV;
+	wc.qp = &qp->ibqp;
+	wc.src_qp = sqp->ibqp.qp_num;
+	wc.pkey_index = qp->ibqp.qp_type == IB_QPT_GSI ?
+		swqe->ud_wr.pkey_index : 0;
+	wc.slid = ppd->lid | (ah_attr->src_path_bits & ((1 << ppd->lmc) - 1));
+	wc.sl = ah_attr->sl;
+	wc.dlid_path_bits = ah_attr->dlid & ((1 << ppd->lmc) - 1);
+	wc.port_num = qp->port_num;
+	/* Signal completion event if the solicited bit is set. */
+	qib_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,
+		     swqe->wr.send_flags & IB_SEND_SOLICITED);
+	ibp->n_loop_pkts++;
+bail_unlock:
+	spin_unlock_irqrestore(&qp->r_lock, flags);
+drop:
+	if (atomic_dec_and_test(&qp->refcount))
+		wake_up(&qp->wait);
+}
+
+/**
+ * qib_make_ud_req - construct a UD request packet
+ * @qp: the QP
  *
- * Based on the TI DAVINCI I2C adapter driver.
- *
- * Copyright (C) 2006 Texas Instruments.
- * Copyright (C) 2007 MontaVista Software Inc.
- * Copyright (C) 2009 Provigent Ltd.
- * Copyright (C) 2011, 2015 Intel Corporation.
- *
- * ----------------------------------------------------------------------------
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- * ----------------------------------------------------------------------------
- *
+ * Return 1 if constructed; otherwise, return 0.
  */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/delay.h>
-#include <linux/i2c.h>
-#include <linux/errno.h>
-#include <linux/sched.h>
-#include <linux/err.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/slab.h>
-#include <linux/pci.h>
-#include <linux/pm_runtime.h>
-#include <linux/acpi.h>
-#include "i2c-designware-core.h"
-
-#define DRIVER_NAME "i2c-designware-pci"
-
-enum dw_pci_ctl_id_t {
-	medfield_0,
-	medfield_1,
-	medfield_2,
-	medfield_3,
-	medfield_4,
-	medfield_5,
-
-	baytrail,
-	haswell,
-};
-
-struct dw_scl_sda_cfg {
-	u16 ss_hcnt;
-	u16 fs_hcnt;
-	u16 ss_lcnt;
-	u16 fs_lcnt;
-	u32 sda_hold;
-};
-
-struct dw_pci_controller {
-	u32 bus_num;
-	u32 bus_cfg;
-	u32 tx_fifo_depth;
-	u32 rx_fifo_depth;
-	u32 clk_khz;
-	u32 functionality;
-	struct dw_scl_sda_cfg *scl_sda_cfg;
-};
-
-#define INTEL_MID_STD_CFG  (DW_IC_CON_MASTER |			\
-				DW_IC_CON_SLAVE_DISABLE |	\
-				DW_IC_CON_RESTART_EN)
-
-#define DW_DEFAULT_FUNCTIONALITY (I2C_FUNC_I2C |			\
-					I2C_FUNC_SMBUS_BYTE |		\
-					I2C_FUNC_SMBUS_BYTE_DATA |	\
-					I2C_FUNC_SMBUS_WORD_DATA |	\
-					I2C_FUNC_SMBUS_I2C_BLOCK)
-
-/* BayTrail HCNT/LCNT/SDA hold time */
-static struct dw_scl_sda_cfg byt_config = {
-	.ss_hcnt = 0x200,
-	.fs_hcnt = 0x55,
-	.ss_lcnt = 0x200,
-	.fs_lcnt = 0x99,
-	.sda_hold = 0x6,
-};
-
-/* Haswell HCNT/LCNT/SDA hold time */
-static struct dw_scl_sda_cfg hsw_config = {
-	.ss_hcnt = 0x01b0,
-	.fs_hcnt = 0x48,
-	.ss_lcnt = 0x01fb,
-	.fs_lcnt = 0xa0,
-	.sda_hold = 0x9,
-};
-
-static struct dw_pci_controller dw_pci_controllers[] = {
-	[medfield_0] = {
-		.bus_num     = 0,
-		.bus_cfg   = INTEL_MID_STD_CFG | DW_IC_CON_SPEED_FAST,
-		.tx_fifo_depth = 32,
-		.rx_fifo_depth = 32,
-		.clk_khz      = 25000,
-	},
-	[medfield_1] = {
-		.bus_num     = 1,
-		.bus_cfg   = INTEL_MID_STD_CFG | DW_IC_CON_SPEED_FAST,
-		.tx_fifo_depth = 32,
-		.rx_fifo_depth = 32,
-		.clk_khz      = 25000,
-	},
-	[medfield_2] = {
-		.bus_num     = 2,
-		.bus_cfg   = INTEL_MID_STD_CFG | DW_IC_CON_SPEED_FAST,
-		.tx_fifo_depth = 32,
-		.rx_fifo_depth = 32,
-		.clk_khz      = 25000,
-	},
-	[medfield_3] = {
-		.bus_num     = 3,
-		.bus_cfg   = INTEL_MID_STD_CFG | DW_IC_CON_SPEED_STD,
-		.tx_fifo_depth = 32,
-		.rx_fifo_depth = 32,
-		.clk_khz      = 25000,
-	},
-	[medfield_4] = {
-		.bus_num     = 4,
-		.bus_cfg   = INTEL_MID_STD_CFG | DW_IC_CON_SPEED_FAST,
-		.tx_fifo_depth = 32,
-		.rx_fifo_depth = 32,
-		.clk_khz      = 25000,
-	},
-	[medfield_5] = {
-		.bus_num     = 5,
-		.bus_cfg   = INTEL_MID_STD_CFG | DW_IC_CON_SPEED_FAST,
-		.tx_fifo_depth = 32,
-		.rx_fifo_depth = 32,
-		.clk_khz      = 25000,
-	},
-	[baytrail] = {
-		.bus_num = -1,
-		.bus_cfg = INTEL_MID_STD_CFG | DW_IC_CON_SPEED_FAST,
-		.tx_fifo_depth = 32,
-		.rx_fifo_depth = 32,
-		.functionality = I2C_FUNC_10BIT_ADDR,
-		.scl_sda_cfg = &byt_config,
-	},
-	[haswell] = {
-		.bus_num = -1,
-		.bus_cfg = INTEL_MID_STD_CFG | DW_IC_CON_SPEED_FAST,
-		.tx_fifo_depth = 32,
-		.rx_fifo_depth = 32,
-		.functionality = I2C_FUNC_10BIT_ADDR,
-		.scl_sda_cfg = &hsw_config,
-	},
-};
-
-#ifdef CONFIG_PM
-static int i2c_dw_pci_suspend(struct device *dev)
+int qib_make_ud_req(struct qib_qp *qp)
 {
-	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
+	struct qib_other_headers *ohdr;
+	struct ib_ah_attr *ah_attr;
+	struct qib_pportdata *ppd;
+	struct qib_ibport *ibp;
+	struct qib_swqe *wqe;
+	unsigned long flags;
+	u32 nwords;
+	u32 extra_bytes;
+	u32 bth0;
+	u16 lrh0;
+	u16 lid;
+	int ret = 0;
+	int next_cur;
 
-	i2c_dw_disable(pci_get_drvdata(pdev));
+	spin_lock_irqsave(&qp->s_lock, flags);
+
+	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_NEXT_SEND_OK)) {
+		if (!(ib_qib_state_ops[qp->state] & QIB_FLUSH_SEND))
+			goto bail;
+		/* We are in the error state, flush the work request. */
+		if (qp->s_last == qp->s_head)
+			goto bail;
+		/* If DMAs are in progress, we can't flush immediately. */
+		if (atomic_read(&qp->s_dma_busy)) {
+			qp->s_flags |= QIB_S_WAIT_DMA;
+			goto bail;
+		}
+		wqe = get_swqe_ptr(qp, qp->s_last);
+		qib_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
+		goto done;
+	}
+
+	if (qp->s_cur == qp->s_head)
+		goto bail;
+
+	wqe = get_swqe_ptr(qp, qp->s_cur);
+	next_cur = qp->s_cur + 1;
+	if (next_cur >= qp->s_size)
+		next_cur = 0;
+
+	/* Construct the header. */
+	ibp = to_iport(qp->ibqp.device, qp->port_num);
+	ppd = ppd_from_ibp(ibp);
+	ah_attr = &to_iah(wqe->ud_wr.ah)->attr;
+	if (ah_attr->dlid >= QIB_MULTICAST_LID_BASE) {
+		if (ah_attr->dlid != QIB_PERMISSIVE_LID)
+			this_cpu_inc(ibp->pmastats->n_multicast_xmit);
+		else
+			this_cpu_inc(ibp->pmastats->n_unicast_xmit);
+	} else {
+		this_cpu_inc(ibp->pmastats->n_unicast_xmit);
+		lid = ah_attr->dlid & ~((1 << ppd->lmc) - 1);
+		if (unlikely(lid == ppd->lid)) {
+			/*
+			 * If DMAs are in progress, we can't generate
+			 * a completion for the loopback packet since
+			 * it would be out of order.
+			 * XXX Instead of waiting, we could queue a
+			 * zero length descriptor so we get a callback.
+			 */
+			if (atomic_read(&qp->s_dma_busy)) {
+				qp->s_flags |= QIB_S_WAIT_DMA;
+				goto bail;
+			}
+			qp->s_cur = next_cur;
+			spin_unlock_irqrestore(&qp->s_lock, flags);
+			qib_ud_loopback(qp, wqe);
+			spin_lock_irqsave(&qp->s_lock, flags);
+			qib_send_complete(qp, wqe, IB_WC_SUCCESS);
+			goto done;
+		}
+	}
+
+	qp->s_cur = next_cur;
+	extra_bytes = -wqe->length & 3;
+	nwords = (wqe->length + extra_bytes) >> 2;
+
+	/* header size in 32-bit words LRH+BTH+DETH = (8+12+8)/4. */
+	qp->s_hdrwords = 7;
+	qp->s_cur_size = wqe->length;
+	qp->s_cur_sge = &qp->s_sge;
+	qp->s_srate = ah_attr->static_rate;
+	qp->s_wqe = wqe;
+	qp->s_sge.sge = wqe->sg_list[0];
+	qp->s_sge.sg_list = wqe->sg_list + 1;
+	qp->s_sge.num_sge = wqe->wr.num_sge;
+	qp->s_sge.total_len = wqe->length;
+
+	if (ah_attr->ah_flags & IB_AH_GRH) {
+		/* Header size in 32-bit words. */
+		qp->s_hdrwords += qib_make_grh(ibp, &qp->s_hdr->u.l.grh,
+					       &ah_attr->grh,
+					       qp->s_hdrwords, nwords);
+		lrh0 = QIB_LRH_GRH;
+		ohdr = &qp->s_hdr->u.l.oth;
+		/*
+		 * Don't worry about sending to locally attached multicast
+		 * QPs.  It is unspecified by the spec. what happens.
+		 */
+	} else {
+		/* Header size in 32-bit words. */
+		lrh0 = QIB_LRH_BTH;
+		ohdr = &qp->s_hdr->u.oth;
+	}
+	if (wqe->wr.opcode == IB_WR_SEND_WITH_IMM) {
+		qp->s_hdrwords++;
+		ohdr->u.ud.imm_data = wqe->wr.ex.imm_data;
+		bth0 = IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE << 24;
+	} else
+		bth0 = IB_OPCODE_UD_SEND_ONLY << 24;
+	lrh0 |= ah_attr->sl << 4;
+	if (qp->ibqp.qp_type == IB_QPT_SMI)
+		lrh0 |= 0xF000; /* Set VL (see ch. 13.5.3.1) */
+	else
+		lrh0 |= ibp->sl_to_vl[ah_attr->sl] << 12;
+	qp->s_hdr->lrh[0] = cpu_to_be16(lrh0);
+	qp->s_hdr->lrh[1] = cpu_to_be16(ah_attr->dlid);  /* DEST LID */
+	qp->s_hdr->lrh[2] = cpu_to_be16(qp->s_hdrwords + nwords + SIZE_OF_CRC);
+	lid = ppd->lid;
+	if (lid) {
+		lid |= ah_attr->src_path_bits & ((1 << ppd->lmc) - 1);
+		qp->s_hdr->lrh[3] = cpu_to_be16(lid);
+	} else
+		qp->s_hdr->lrh[3] = IB_LID_PERMISSIVE;
+	if (wqe->wr.send_flags & IB_SEND_SOLICITED)
+		bth0 |= IB_BTH_SOLICITED;
+	bth0 |= extra_bytes << 20;
+	bth0 |= qp->ibqp.qp_type == IB_QPT_SMI ? QIB_DEFAULT_P_KEY :
+		qib_get_pkey(ibp, qp->ibqp.qp_type == IB_QPT_GSI ?
+			     wqe->ud_wr.pkey_index : qp->s_pkey_index);
+	ohdr->bth[0] = cpu_to_be32(bth0);
+	/*
+	 * Use the multicast QP if the destination LID is a multicast LID.
+	 */
+	ohdr->bth[1] = ah_attr->dlid >= QIB_MULTICAST_LID_BASE &&
+		ah_attr->dlid != QIB_PERMISSIVE_LID ?
+		cpu_to_be32(QIB_MULTICAST_QPN) :
+		cpu_to_be32(wqe->ud_wr.remote_qpn);
+	ohdr->bth[2] = cpu_to_be32(qp->s_next_psn++ & QIB_PSN_MASK);
+	/*
+	 * Qkeys with the high order bit set mean use the
+	 * qkey from the QP context instead of the WR (see 10.2.5).
+	 */
+	ohdr->u.ud.deth[0] = cpu_to_be32((int)wqe->ud_wr.remote_qkey < 0 ?
+					 qp->qkey : wqe->ud_wr.remote_qkey);
+	ohdr->u.ud.deth[1] = cpu_to_be32(qp->ibqp.qp_num);
+
+done:
+	ret = 1;
+	goto unlock;
+
+bail:
+	qp->s_flags &= ~QIB_S_BUSY;
+unlock:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+	return ret;
+}
+
+static unsigned qib_lookup_pkey(struct qib_ibport *ibp, u16 pkey)
+{
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	struct qib_devdata *dd = ppd->dd;
+	unsigned ctxt = ppd->hw_pidx;
+	unsigned i;
+
+	pkey &= 0x7fff;	/* remove limited/full membership bit */
+
+	for (i = 0; i < ARRAY_SIZE(dd->rcd[ctxt]->pkeys); ++i)
+		if ((dd->rcd[ctxt]->pkeys[i] & 0x7fff) == pkey)
+			return i;
+
+	/*
+	 * Should not get here, this means hardware failed to validate pkeys.
+	 * Punt and return index 0.
+	 */
 	return 0;
 }
 
-static int i2c_dw_pci_resume(struct device *dev)
-{
-	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
-
-	return i2c_dw_init(pci_get_drvdata(pdev));
-}
-#endif
-
-static UNIVERSAL_DEV_PM_OPS(i2c_dw_pm_ops, i2c_dw_pci_suspend,
-			    i2c_dw_pci_resume, NULL);
-
-static u32 i2c_dw_get_clk_rate_khz(struct dw_i2c_dev *dev)
-{
-	return dev->controller->clk_khz;
-}
-
-static int i2c_dw_pci_probe(struct pci_dev *pdev,
-			    const struct pci_device_id *id)
-{
-	struct dw_i2c_dev *dev;
-	struct i2c_adapter *adap;
-	int r;
-	struct  dw_pci_controller *controller;
-	struct dw_scl_sda_cfg *cfg;
-
-	if (id->driver_data >= ARRAY_SIZE(dw_pci_controllers)) {
-		dev_err(&pdev->dev, "%s: invalid driver data %ld\n", __func__,
-			id->driver_data);
-		return -EINVAL;
-	}
-
-	controller = &dw_pci_controllers[id->driver_data];
-
-	r = pcim_enable_device(pdev);
-	if (r) {
-		dev_err(&pdev->dev, "Failed to enable I2C PCI device (%d)\n",
-			r);
-		return r;
-	}
-
-	r = pcim_iomap_regions(pdev, 1 << 0, pci_name(pdev));
-	if (r) {
-		dev_err(&pdev->dev, "I/O memory remapping failed\n");
-		return r;
-	}
-
-	dev = devm_kzalloc(&pdev->dev, sizeof(struct dw_i2c_dev), GFP_KERNEL);
-	if (!dev)
-		return -ENOMEM;
-
-	dev->clk = NULL;
-	dev->controller = controller;
-	dev->get_clk_rate_khz = i2c_dw_get_clk_rate_khz;
-	dev->base = pcim_iomap_table(pdev)[0];
-	dev->dev = &pdev->dev;
-	dev->irq = pdev->irq;
-	dev->functionality = controller->functionality |
-				DW_DEFAULT_FUNCTIONALITY;
-
-	dev->master_cfg = controller->bus_cfg;
-	if (controller->scl_sda_cfg) {
-		cfg = controller->scl_sda_cfg;
-		dev->ss_hcnt = cfg->ss_hcnt;
-		dev->fs_hcnt = cfg->fs_hcnt;
-		dev->ss_lcnt = cfg->ss_lcnt;
-		dev->fs_lcnt = cfg->fs_lcnt;
-		dev->sda_hold_time = cfg->sda_hold;
-	}
-
-	pci_set_drvdata(pdev, dev);
-
-	dev->tx_fifo_depth = controller->tx_fifo_depth;
-	dev->rx_fifo_depth = controller->rx_fifo_depth;
-
-	adap = &dev->adapter;
-	adap->owner = THIS_MODULE;
-	adap->class = 0;
-	ACPI_COMPANION_SET(&adap->dev, ACPI_COMPANION(&pdev->dev));
-	adap->nr = controller->bus_num;
-
-	r = i2c_dw_probe(dev);
-	if (r)
-		return r;
-
-	pm_runtime_set_autosuspend_delay(&pdev->dev, 1000);
-	pm_runtime_use_autosuspend(&pdev->dev);
-	pm_runtime_put_autosuspend(&pdev->dev);
-	pm_runtime_allow(&pdev->dev);
-
-	return 0;
-}
-
-static void i2c_dw_pci_remove(struct pci_dev *pdev)
-{
-	struct dw_i2c_dev *dev = pci_get_drvdata(pdev);
-
-	i2c_dw_disable(dev);
-	pm_runtime_forbid(&pdev->dev);
-	pm_runtime_get_noresume(&pdev->dev);
-
-	i2c_del_adapter(&dev->adapter);
-}
-
-/* work with hotplug and coldplug */
-MODULE_ALIAS("i2c_designware-pci");
-
-static const struct pci_device_id i2_designware_pci_ids[] = {
-	/* Medfield */
-	{ PCI_VDEVICE(INTEL, 0x0817), medfield_3 },
-	{ PCI_VDEVICE(INTEL, 0x0818), medfield_4 },
-	{ PCI_VDEVICE(INTEL, 0x0819), medfield_5 },
-	{ PCI_VDEVICE(INTEL, 0x082C), medfield_0 },
-	{ PCI_VDEVICE(INTEL, 0x082D), medfield_1 },
-	{ PCI_VDEVICE(INTEL, 0x082E), medfield_2 },
-	/* Baytrail */
-	{ PCI_VDEVICE(INTEL, 0x0F41), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x0F42), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x0F43), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x0F44), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x0F45), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x0F46), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x0F47), baytrail },
-	/* Haswell */
-	{ PCI_VDEVICE(INTEL, 0x9c61), haswell },
-	{ PCI_VDEVICE(INTEL, 0x9c62), haswell },
-	/* Braswell / Cherrytrail */
-	{ PCI_VDEVICE(INTEL, 0x22C1), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x22C2), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x22C3), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x22C4), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x22C5), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x22C6), baytrail },
-	{ PCI_VDEVICE(INTEL, 0x22C7), baytrail },
-	{ 0,}
-};
-MODULE_DEVICE_TABLE(pci, i2_designware_pci_ids);
-
-static struct pci_driver dw_i2c_driver = {
-	.name		= DRIVER_NAME,
-	.id_table	= i2_designware_pci_ids,
-	.probe		= i2c_dw_pci_probe,
-	.remove		= i2c_dw_pci_remove,
-	.driver         = {
-		.pm     = &i2c_dw_pm_ops,
-	},
-};
-
-module_pci_driver(dw_i2c_driver);
-
-MODULE_AUTHOR("Baruch Siach <baruch@tkos.co.il>");
-MODULE_DESCRIPTION("Synopsys DesignWare PCI I2C bus adapter");
-MODULE_LICENSE("GPL");
+/**
+ * qib_ud_rcv - receive an incoming UD packet
+ * @ibp: the port the packet came in on
+ * @hdr: the packet header
+ * @has_grh: true if the packet has a GRH
+ * @data: the packet data
+ * @tlen: the packet length
+ * @qp: the QP the packet came on
+ *
+ * This is called from qib_qp_rcv() to process an incoming UD packet
+ * for the given QP.
+ * Called at interrupt level.
+ */
+void qib_ud_rcv(struct qib_ibport *ibp, struct qib_ib_header *hdr

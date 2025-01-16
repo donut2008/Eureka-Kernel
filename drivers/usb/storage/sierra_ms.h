@@ -1,4 +1,2 @@
-#ifndef _SIERRA_MS_H_
-#define _SIERRA_MS_H_
-extern int sierra_ms_init(struct us_data *us);
-#endif
+CIE_LANE_8_EQUALIZATION_CNTL                                    0x40000a3
+#define ixD2F3_PCIE_LANE

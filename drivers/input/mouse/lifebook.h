@@ -1,32 +1,12 @@
-/*
- * Fujitsu B-series Lifebook PS/2 TouchScreen driver
- *
- * Copyright (c) 2005 Vojtech Pavlik
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- */
-
-#ifndef _LIFEBOOK_H
-#define _LIFEBOOK_H
-
-#ifdef CONFIG_MOUSE_PS2_LIFEBOOK
-void lifebook_module_init(void);
-int lifebook_detect(struct psmouse *psmouse, bool set_properties);
-int lifebook_init(struct psmouse *psmouse);
-#else
-static inline void lifebook_module_init(void)
-{
-}
-static inline int lifebook_detect(struct psmouse *psmouse, bool set_properties)
-{
-	return -ENOSYS;
-}
-static inline int lifebook_init(struct psmouse *psmouse)
-{
-	return -ENOSYS;
-}
-#endif
-
-#endif
+f000000
+#define CLIPPER_DEBUG_REG13__outsm_clr_fifo_contents__SHIFT 0x18
+#define CLIPPER_DEBUG_REG13__outsm_clr_fifo_full_MASK 0x20000000
+#define CLIPPER_DEBUG_REG13__outsm_clr_fifo_full__SHIFT 0x1d
+#define CLIPPER_DEBUG_REG13__outsm_clr_fifo_advanceread_MASK 0x40000000
+#define CLIPPER_DEBUG_REG13__outsm_clr_fifo_advanceread__SHIFT 0x1e
+#define CLIPPER_DEBUG_REG13__outsm_clr_fifo_write_MASK 0x80000000
+#define CLIPPER_DEBUG_REG13__outsm_clr_fifo_write__SHIFT 0x1f
+#define CLIPPER_DEBUG_REG14__clprim_in_back_vertex_store_indx_2_MASK 0x3f
+#define CLIPPER_DEBUG_REG14__clprim_in_back_vertex_store_indx_2__SHIFT 0x0
+#define CLIPPER_DEBUG_REG14__clprim_in_back_vertex_store_indx_1_MASK 0xfc0
+#define CLIPPER_DEBUG_REG14__clprim_in_back_vertex_store_indx_1__SHI

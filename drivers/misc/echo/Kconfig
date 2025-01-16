@@ -1,9 +1,5 @@
-config ECHO
-	tristate "Line Echo Canceller support"
-	default n
-	---help---
-	  This driver provides line echo cancelling support for mISDN and
-	  Zaptel drivers.
-
-	  To compile this driver as a module, choose M here. The module
-	  will be called echo.
+ANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_ACS_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_A

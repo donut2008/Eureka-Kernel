@@ -1,59 +1,27 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#ifndef _VMCI_RESOURCE_H_
-#define _VMCI_RESOURCE_H_
-
-#include <linux/vmw_vmci_defs.h>
-#include <linux/types.h>
-
-#include "vmci_context.h"
-
-
-enum vmci_resource_type {
-	VMCI_RESOURCE_TYPE_ANY,
-	VMCI_RESOURCE_TYPE_API,
-	VMCI_RESOURCE_TYPE_GROUP,
-	VMCI_RESOURCE_TYPE_DATAGRAM,
-	VMCI_RESOURCE_TYPE_DOORBELL,
-	VMCI_RESOURCE_TYPE_QPAIR_GUEST,
-	VMCI_RESOURCE_TYPE_QPAIR_HOST
-};
-
-struct vmci_resource {
-	struct vmci_handle handle;
-	enum vmci_resource_type type;
-	struct hlist_node node;
-	struct kref kref;
-	struct completion done;
-};
-
-
-int vmci_resource_add(struct vmci_resource *resource,
-		      enum vmci_resource_type resource_type,
-		      struct vmci_handle handle);
-
-void vmci_resource_remove(struct vmci_resource *resource);
-
-struct vmci_resource *
-vmci_resource_by_handle(struct vmci_handle resource_handle,
-			enum vmci_resource_type resource_type);
-
-struct vmci_resource *vmci_resource_get(struct vmci_resource *resource);
-int vmci_resource_put(struct vmci_resource *resource);
-
-struct vmci_handle vmci_resource_handle(struct vmci_resource *resource);
-
-#endif /* _VMCI_RESOURCE_H_ */
+ne PB0_GLB_SCI_STAT_OVRD_REG3__IGNR_FREQDIV_CBI_UPDT_L8T11__SHIFT 0x1
+#define PB0_GLB_SCI_STAT_OVRD_REG3__IGNR_DLL_LOCK_CBI_UPDT_L8T11_MASK 0x4
+#define PB0_GLB_SCI_STAT_OVRD_REG3__IGNR_DLL_LOCK_CBI_UPDT_L8T11__SHIFT 0x2
+#define PB0_GLB_SCI_STAT_OVRD_REG3__DLL_LOCK_8_MASK 0x1000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__DLL_LOCK_8__SHIFT 0xc
+#define PB0_GLB_SCI_STAT_OVRD_REG3__DLL_LOCK_9_MASK 0x2000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__DLL_LOCK_9__SHIFT 0xd
+#define PB0_GLB_SCI_STAT_OVRD_REG3__DLL_LOCK_10_MASK 0x4000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__DLL_LOCK_10__SHIFT 0xe
+#define PB0_GLB_SCI_STAT_OVRD_REG3__DLL_LOCK_11_MASK 0x8000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__DLL_LOCK_11__SHIFT 0xf
+#define PB0_GLB_SCI_STAT_OVRD_REG3__LINKSPEED_8_MASK 0x30000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__LINKSPEED_8__SHIFT 0x10
+#define PB0_GLB_SCI_STAT_OVRD_REG3__FREQDIV_8_MASK 0xc0000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__FREQDIV_8__SHIFT 0x12
+#define PB0_GLB_SCI_STAT_OVRD_REG3__LINKSPEED_9_MASK 0x300000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__LINKSPEED_9__SHIFT 0x14
+#define PB0_GLB_SCI_STAT_OVRD_REG3__FREQDIV_9_MASK 0xc00000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__FREQDIV_9__SHIFT 0x16
+#define PB0_GLB_SCI_STAT_OVRD_REG3__LINKSPEED_10_MASK 0x3000000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__LINKSPEED_10__SHIFT 0x18
+#define PB0_GLB_SCI_STAT_OVRD_REG3__FREQDIV_10_MASK 0xc000000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__FREQDIV_10__SHIFT 0x1a
+#define PB0_GLB_SCI_STAT_OVRD_REG3__LINKSPEED_11_MASK 0x30000000
+#define PB0_GLB_SCI_STAT_OVRD_REG3__LINKSPEED_11__SHIFT 0x1c
+#define PB0_GLB_SCI_STAT_OVRD_REG3__FREQDIV_11_MASK 0xc0000000
+#define PB0_GLB_SCI_STAT_OVRD_

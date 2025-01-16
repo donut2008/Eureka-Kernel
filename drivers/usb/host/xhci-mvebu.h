@@ -1,21 +1,9 @@
-/*
- * Copyright (C) 2014 Marvell
- *
- * Gregory Clement <gregory.clement@free-electrons.com>
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2.  This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
- */
-
-#ifndef __LINUX_XHCI_MVEBU_H
-#define __LINUX_XHCI_MVEBU_H
-#if IS_ENABLED(CONFIG_USB_XHCI_MVEBU)
-int xhci_mvebu_mbus_init_quirk(struct platform_device *pdev);
-#else
-static inline int xhci_mvebu_mbus_init_quirk(struct platform_device *pdev)
-{
-	return 0;
-}
-#endif
-#endif /* __LINUX_XHCI_MVEBU_H */
+a
+#define DMCU_INTERRUPT_STATUS__UC_REG_RD_TIMEOUT_INT_OCCURRED_MASK 0x800
+#define DMCU_INTERRUPT_STATUS__UC_REG_RD_TIMEOUT_INT_OCCURRED__SHIFT 0xb
+#define DMCU_INTERRUPT_STATUS__UC_REG_RD_TIMEOUT_INT_CLEAR_MASK 0x800
+#define DMCU_INTERRUPT_STATUS__UC_REG_RD_TIMEOUT_INT_CLEAR__SHIFT 0xb
+#define DMCU_INTERRUPT_STATUS__DCPG_IHC_DCFE0_POWER_UP_INT_OCCURRED_MASK 0x1000
+#define DMCU_INTERRUPT_STATUS__DCPG_IHC_DCFE0_POWER_UP_INT_OCCURRED__SHIFT 0xc
+#define DMCU_INTERRUPT_STATUS__DCPG_IHC_DCFE0_POWER_UP_INT_CLEAR_MASK 0x1000
+#define DMCU_INTERRUPT_STATUS__DCPG_IHC_DCFE0_POWER_UP_INT_

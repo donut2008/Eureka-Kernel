@@ -1,26 +1,16 @@
-/*
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if defined(CONFIG_USB_STORAGE_ENE_UB6250) || \
-		defined(CONFIG_USB_STORAGE_ENE_UB6250_MODULE)
-
-UNUSUAL_DEV(0x0cf2, 0x6250, 0x0000, 0x9999,
-		"ENE",
-		"ENE UB6250 reader",
-		USB_SC_DEVICE, USB_PR_DEVICE, NULL, 0),
-
-#endif /* defined(CONFIG_USB_STORAGE_ENE_UB6250) || ... */
+efine PCIE_PERF_CNTL_SLV_R_CLK__COUNTER0_UPPER__SHIFT 0x10
+#define PCIE_PERF_CNTL_SLV_R_CLK__COUNTER1_UPPER_MASK 0xff000000
+#define PCIE_PERF_CNTL_SLV_R_CLK__COUNTER1_UPPER__SHIFT 0x18
+#define PCIE_PERF_COUNT0_SLV_R_CLK__COUNTER0_MASK 0xffffffff
+#define PCIE_PERF_COUNT0_SLV_R_CLK__COUNTER0__SHIFT 0x0
+#define PCIE_PERF_COUNT1_SLV_R_CLK__COUNTER1_MASK 0xffffffff
+#define PCIE_PERF_COUNT1_SLV_R_CLK__COUNTER1__SHIFT 0x0
+#define PCIE_PERF_CNTL_SLV_S_C_CLK__EVENT0_SEL_MASK 0xff
+#define PCIE_PERF_CNTL_SLV_S_C_CLK__EVENT0_SEL__SHIFT 0x0
+#define PCIE_PERF_CNTL_SLV_S_C_CLK__EVENT1_SEL_MASK 0xff00
+#define PCIE_PERF_CNTL_SLV_S_C_CLK__EVENT1_SEL__SHIFT 0x8
+#define PCIE_PERF_CNTL_SLV_S_C_CLK__COUNTER0_UPPER_MASK 0xff0000
+#define PCIE_PERF_CNTL_SLV_S_C_CLK__COUNTER0_UPPER__SHIFT 0x10
+#define PCIE_PERF_CNTL_SLV_S_C_CLK__COUNTER1_UPPER_MASK 0xff000000
+#define PCIE_PERF_CNTL_SLV_S_C_CLK__COUNTER1_UPPER__SHIFT 0x18
+#define PCIE_PERF_COUNT0_SLV_S_C_CLK__COUNTER0_MASK 0xfffff

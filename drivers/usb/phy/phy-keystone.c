@@ -1,131 +1,49 @@
-/*
- * phy-keystone - USB PHY, talking to dwc3 controller in Keystone.
- *
- * Copyright (C) 2013 Texas Instruments Incorporated - http://www.ti.com
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * Author: WingMan Kwok <w-kwok2@ti.com>
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/usb/usb_phy_generic.h>
-#include <linux/io.h>
-#include <linux/of.h>
-
-#include "phy-generic.h"
-
-/* USB PHY control register offsets */
-#define USB_PHY_CTL_UTMI		0x0000
-#define USB_PHY_CTL_PIPE		0x0004
-#define USB_PHY_CTL_PARAM_1		0x0008
-#define USB_PHY_CTL_PARAM_2		0x000c
-#define USB_PHY_CTL_CLOCK		0x0010
-#define USB_PHY_CTL_PLL			0x0014
-
-#define PHY_REF_SSP_EN			BIT(29)
-
-struct keystone_usbphy {
-	struct usb_phy_generic	usb_phy_gen;
-	void __iomem			*phy_ctrl;
-};
-
-static inline u32 keystone_usbphy_readl(void __iomem *base, u32 offset)
-{
-	return readl(base + offset);
-}
-
-static inline void keystone_usbphy_writel(void __iomem *base,
-					  u32 offset, u32 value)
-{
-	writel(value, base + offset);
-}
-
-static int keystone_usbphy_init(struct usb_phy *phy)
-{
-	struct keystone_usbphy *k_phy = dev_get_drvdata(phy->dev);
-	u32 val;
-
-	val  = keystone_usbphy_readl(k_phy->phy_ctrl, USB_PHY_CTL_CLOCK);
-	keystone_usbphy_writel(k_phy->phy_ctrl, USB_PHY_CTL_CLOCK,
-				val | PHY_REF_SSP_EN);
-	return 0;
-}
-
-static void keystone_usbphy_shutdown(struct usb_phy *phy)
-{
-	struct keystone_usbphy *k_phy = dev_get_drvdata(phy->dev);
-	u32 val;
-
-	val  = keystone_usbphy_readl(k_phy->phy_ctrl, USB_PHY_CTL_CLOCK);
-	keystone_usbphy_writel(k_phy->phy_ctrl, USB_PHY_CTL_CLOCK,
-				val &= ~PHY_REF_SSP_EN);
-}
-
-static int keystone_usbphy_probe(struct platform_device *pdev)
-{
-	struct device		*dev = &pdev->dev;
-	struct keystone_usbphy	*k_phy;
-	struct resource		*res;
-	int ret;
-
-	k_phy = devm_kzalloc(dev, sizeof(*k_phy), GFP_KERNEL);
-	if (!k_phy)
-		return -ENOMEM;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	k_phy->phy_ctrl = devm_ioremap_resource(dev, res);
-	if (IS_ERR(k_phy->phy_ctrl))
-		return PTR_ERR(k_phy->phy_ctrl);
-
-	ret = usb_phy_gen_create_phy(dev, &k_phy->usb_phy_gen, NULL);
-	if (ret)
-		return ret;
-
-	k_phy->usb_phy_gen.phy.init = keystone_usbphy_init;
-	k_phy->usb_phy_gen.phy.shutdown = keystone_usbphy_shutdown;
-
-	platform_set_drvdata(pdev, k_phy);
-
-	return usb_add_phy_dev(&k_phy->usb_phy_gen.phy);
-}
-
-static int keystone_usbphy_remove(struct platform_device *pdev)
-{
-	struct keystone_usbphy *k_phy = platform_get_drvdata(pdev);
-
-	usb_remove_phy(&k_phy->usb_phy_gen.phy);
-
-	return 0;
-}
-
-static const struct of_device_id keystone_usbphy_ids[] = {
-	{ .compatible = "ti,keystone-usbphy" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, keystone_usbphy_ids);
-
-static struct platform_driver keystone_usbphy_driver = {
-	.probe          = keystone_usbphy_probe,
-	.remove         = keystone_usbphy_remove,
-	.driver         = {
-		.name   = "keystone-usbphy",
-		.of_match_table = keystone_usbphy_ids,
-	},
-};
-
-module_platform_driver(keystone_usbphy_driver);
-
-MODULE_ALIAS("platform:keystone-usbphy");
-MODULE_AUTHOR("Texas Instruments Inc.");
-MODULE_DESCRIPTION("Keystone USB phy driver");
-MODULE_LICENSE("GPL v2");
+PONSE_INTERRUPT_COUNT_MASK 0xff
+#define RESPONSE_INTERRUPT_COUNT__N_RESPONSE_INTERRUPT_COUNT__SHIFT 0x0
+#define RIRB_CONTROL__RESPONSE_INTERRUPT_CONTROL_MASK 0x1
+#define RIRB_CONTROL__RESPONSE_INTERRUPT_CONTROL__SHIFT 0x0
+#define RIRB_CONTROL__RIRB_DMA_ENABLE_MASK 0x2
+#define RIRB_CONTROL__RIRB_DMA_ENABLE__SHIFT 0x1
+#define RIRB_CONTROL__RESPONSE_OVERRUN_INTERRUPT_CONTROL_MASK 0x4
+#define RIRB_CONTROL__RESPONSE_OVERRUN_INTERRUPT_CONTROL__SHIFT 0x2
+#define RIRB_STATUS__RESPONSE_INTERRUPT_MASK 0x1
+#define RIRB_STATUS__RESPONSE_INTERRUPT__SHIFT 0x0
+#define RIRB_STATUS__RESPONSE_OVERRUN_INTERRUPT_STATUS_MASK 0x4
+#define RIRB_STATUS__RESPONSE_OVERRUN_INTERRUPT_STATUS__SHIFT 0x2
+#define RIRB_SIZE__RIRB_SIZE_MASK 0x3
+#define RIRB_SIZE__RIRB_SIZE__SHIFT 0x0
+#define RIRB_SIZE__RIRB_SIZE_CAPABILITY_MASK 0xf0
+#define RIRB_SIZE__RIRB_SIZE_CAPABILITY__SHIFT 0x4
+#define IMMEDIATE_COMMAND_OUTPUT_INTERFACE__IMMEDIATE_COMMAND_WRITE_VERB_AND_PAYLOAD_MASK 0xfffffff
+#define IMMEDIATE_COMMAND_OUTPUT_INTERFACE__IMMEDIATE_COMMAND_WRITE_VERB_AND_PAYLOAD__SHIFT 0x0
+#define IMMEDIATE_COMMAND_OUTPUT_INTERFACE__IMMEDIATE_COMMAND_WRITE_CODEC_ADDRESS_MASK 0xf0000000
+#define IMMEDIATE_COMMAND_OUTPUT_INTERFACE__IMMEDIATE_COMMAND_WRITE_CODEC_ADDRESS__SHIFT 0x1c
+#define IMMEDIATE_COMMAND_OUTPUT_INTERFACE_INDEX__IMMEDIATE_COMMAND_WRITE_MASK 0xffff
+#define IMMEDIATE_COMMAND_OUTPUT_INTERFACE_INDEX__IMMEDIATE_COMMAND_WRITE__SHIFT 0x0
+#define IMMEDIATE_COMMAND_OUTPUT_INTERFACE_DATA__IMMEDIATE_COMMAND_WRITE_MASK 0xffffffff
+#define IMMEDIATE_COMMAND_OUTPUT_INTERFACE_DATA__IMMEDIATE_COMMAND_WRITE__SHIFT 0x0
+#define IMMEDIATE_RESPONSE_INPUT_INTERFACE__IMMEDIATE_RESPONSE_READ_MASK 0xffffffff
+#define IMMEDIATE_RESPONSE_INPUT_INTERFACE__IMMEDIATE_RESPONSE_READ__SHIFT 0x0
+#define IMMEDIATE_COMMAND_STATUS__IMMEDIATE_COMMAND_BUSY_MASK 0x1
+#define IMMEDIATE_COMMAND_STATUS__IMMEDIATE_COMMAND_BUSY__SHIFT 0x0
+#define IMMEDIATE_COMMAND_STATUS__IMMEDIATE_RESULT_VALID_MASK 0x2
+#define IMMEDIATE_COMMAND_STATUS__IMMEDIATE_RESULT_VALID__SHIFT 0x1
+#define DMA_POSITION_LOWER_BASE_ADDRESS__DMA_POSITION_BUFFER_ENABLE_MASK 0x1
+#define DMA_POSITION_LOWER_BASE_ADDRESS__DMA_POSITION_BUFFER_ENABLE__SHIFT 0x0
+#define DMA_POSITION_LOWER_BASE_ADDRESS__DMA_POSITION_LOWER_BASE_UNIMPLEMENTED_BITS_MASK 0x7e
+#define DMA_POSITION_LOWER_BASE_ADDRESS__DMA_POSITION_LOWER_BASE_UNIMPLEMENTED_BITS__SHIFT 0x1
+#define DMA_POSITION_LOWER_BASE_ADDRESS__DMA_POSITION_LOWER_BASE_ADDRESS_MASK 0xffffff80
+#define DMA_POSITION_LOWER_BASE_ADDRESS__DMA_POSITION_LOWER_BASE_ADDRESS__SHIFT 0x7
+#define DMA_POSITION_UPPER_BASE_ADDRESS__DMA_POSITION_UPPER_BASE_ADDRESS_MASK 0xffffffff
+#define DMA_POSITION_UPPER_BASE_ADDRESS__DMA_POSITION_UPPER_BASE_ADDRESS__SHIFT 0x0
+#define WALL_CLOCK_COUNTER_ALIAS__WALL_CLOCK_COUNTER_ALIAS_MASK 0xffffffff
+#define WALL_CLOCK_COUNTER_ALIAS__WALL_CLOCK_COUNTER_ALIAS__SHIFT 0x0
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL_AND_STATUS__STREAM_RESET_MASK 0x1
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL_AND_STATUS__STREAM_RESET__SHIFT 0x0
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL_AND_STATUS__STREAM_RUN_MASK 0x2
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL_AND_STATUS__STREAM_RUN__SHIFT 0x1
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL_AND_STATUS__INTERRUPT_ON_COMPLETION_ENABLE_MASK 0x4
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL_AND_STATUS__INTERRUPT_ON_COMPLETION_ENABLE__SHIFT 0x2
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL_AND_STATUS__FIFO_ERROR_INTERRUPT_ENABLE_MASK 0x8
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL_AND_STATUS__FIFO_ERROR_INTERRUPT_ENABLE__SHIFT 0x3
+#define OUTPUT_STREAM_DESCRIPTOR_CONTROL

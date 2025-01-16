@@ -1,493 +1,462 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/kernel.h>
-#include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/errno.h>
-#include <linux/types.h>
-#include <linux/fcntl.h>
-#include <linux/pci.h>
-#include <linux/poll.h>
-#include <linux/ioctl.h>
-#include <linux/cdev.h>
-#include <linux/sched.h>
-#include <linux/uuid.h>
-#include <linux/compat.h>
-#include <linux/jiffies.h>
-#include <linux/interrupt.h>
+			   header);
 
-#include <linux/pm_runtime.h>
-
-#include <linux/mei.h>
-
-#include "mei_dev.h"
-#include "client.h"
-#include "hw-me-regs.h"
-#include "hw-me.h"
-
-/* mei_pci_tbl - PCI Device ID Table */
-static const struct pci_device_id mei_me_pci_tbl[] = {
-	{MEI_PCI_DEVICE(MEI_DEV_ID_82946GZ, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_82G35, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_82Q965, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_82G965, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_82GM965, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_82GME965, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_82Q35, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_82G33, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_82Q33, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_82X38, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_3200, mei_me_legacy_cfg)},
-
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_6, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_7, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_8, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_9, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9_10, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9M_1, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9M_2, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9M_3, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH9M_4, mei_me_legacy_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH10_1, mei_me_ich_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH10_2, mei_me_ich_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH10_3, mei_me_ich_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_ICH10_4, mei_me_ich_cfg)},
-
-	{MEI_PCI_DEVICE(MEI_DEV_ID_IBXPK_1, mei_me_pch_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_IBXPK_2, mei_me_pch_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_CPT_1, mei_me_pch_cpt_pbg_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_PBG_1, mei_me_pch_cpt_pbg_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_PPT_1, mei_me_pch_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_PPT_2, mei_me_pch_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_PPT_3, mei_me_pch_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_LPT_H, mei_me_pch8_sps_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_LPT_W, mei_me_pch8_sps_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_LPT_LP, mei_me_pch8_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_LPT_HR, mei_me_pch8_sps_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_WPT_LP, mei_me_pch8_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_WPT_LP_2, mei_me_pch8_cfg)},
-
-	{MEI_PCI_DEVICE(MEI_DEV_ID_SPT, mei_me_pch8_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_SPT_2, mei_me_pch8_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_SPT_H, mei_me_pch8_sps_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_SPT_H_2, mei_me_pch8_sps_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_LBG, mei_me_pch8_cfg)},
-
-	{MEI_PCI_DEVICE(MEI_DEV_ID_KBP, mei_me_pch8_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_KBP_2, mei_me_pch8_cfg)},
-
-	{MEI_PCI_DEVICE(MEI_DEV_ID_BXT_M, mei_me_pch8_cfg)},
-	{MEI_PCI_DEVICE(MEI_DEV_ID_APL_I, mei_me_pch8_cfg)},
-
-	/* required last entry */
-	{0, }
-};
-
-MODULE_DEVICE_TABLE(pci, mei_me_pci_tbl);
-
-#ifdef CONFIG_PM
-static inline void mei_me_set_pm_domain(struct mei_device *dev);
-static inline void mei_me_unset_pm_domain(struct mei_device *dev);
-#else
-static inline void mei_me_set_pm_domain(struct mei_device *dev) {}
-static inline void mei_me_unset_pm_domain(struct mei_device *dev) {}
-#endif /* CONFIG_PM */
-
-/**
- * mei_me_quirk_probe - probe for devices that doesn't valid ME interface
- *
- * @pdev: PCI device structure
- * @cfg: per generation config
- *
- * Return: true if ME Interface is valid, false otherwise
- */
-static bool mei_me_quirk_probe(struct pci_dev *pdev,
-				const struct mei_cfg *cfg)
-{
-	if (cfg->quirk_probe && cfg->quirk_probe(pdev)) {
-		dev_info(&pdev->dev, "Device doesn't have valid ME Interface\n");
-		return false;
-	}
-
-	return true;
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+				 user_context_converter, &cmd->q.cid,
+				 NULL);
 }
 
 /**
- * mei_me_probe - Device Initialization Routine
+ * vmw_cmd_begin_query - validate a  SVGA_3D_CMD_BEGIN_QUERY command.
  *
- * @pdev: PCI device structure
- * @ent: entry in kcs_pci_tbl
- *
- * Return: 0 on success, <0 on failure.
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context used for this command submission.
+ * @header: Pointer to the command header in the command stream.
  */
-static int mei_me_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+static int vmw_cmd_begin_query(struct vmw_private *dev_priv,
+			       struct vmw_sw_context *sw_context,
+			       SVGA3dCmdHeader *header)
 {
-	const struct mei_cfg *cfg = (struct mei_cfg *)(ent->driver_data);
-	struct mei_device *dev;
-	struct mei_me_hw *hw;
-	unsigned int irqflags;
-	int err;
+	struct vmw_begin_query_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdBeginQuery q;
+	} *cmd;
 
+	cmd = container_of(header, struct vmw_begin_query_cmd,
+			   header);
 
-	if (!mei_me_quirk_probe(pdev, cfg))
-		return -ENODEV;
+	if (unlikely(dev_priv->has_mob)) {
+		struct {
+			SVGA3dCmdHeader header;
+			SVGA3dCmdBeginGBQuery q;
+		} gb_cmd;
 
-	/* enable pci dev */
-	err = pci_enable_device(pdev);
-	if (err) {
-		dev_err(&pdev->dev, "failed to enable pci device.\n");
-		goto end;
-	}
-	/* set PCI host mastering  */
-	pci_set_master(pdev);
-	/* pci request regions for mei driver */
-	err = pci_request_regions(pdev, KBUILD_MODNAME);
-	if (err) {
-		dev_err(&pdev->dev, "failed to get pci regions.\n");
-		goto disable_device;
-	}
+		BUG_ON(sizeof(gb_cmd) != sizeof(*cmd));
 
-	if (dma_set_mask(&pdev->dev, DMA_BIT_MASK(64)) ||
-	    dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64))) {
+		gb_cmd.header.id = SVGA_3D_CMD_BEGIN_GB_QUERY;
+		gb_cmd.header.size = cmd->header.size;
+		gb_cmd.q.cid = cmd->q.cid;
+		gb_cmd.q.type = cmd->q.type;
 
-		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
-		if (err)
-			err = dma_set_coherent_mask(&pdev->dev,
-						    DMA_BIT_MASK(32));
-	}
-	if (err) {
-		dev_err(&pdev->dev, "No usable DMA configuration, aborting\n");
-		goto release_regions;
+		memcpy(cmd, &gb_cmd, sizeof(*cmd));
+		return vmw_cmd_begin_gb_query(dev_priv, sw_context, header);
 	}
 
-
-	/* allocates and initializes the mei dev structure */
-	dev = mei_me_dev_init(pdev, cfg);
-	if (!dev) {
-		err = -ENOMEM;
-		goto release_regions;
-	}
-	hw = to_me_hw(dev);
-	/* mapping  IO device memory */
-	hw->mem_addr = pci_iomap(pdev, 0, 0);
-	if (!hw->mem_addr) {
-		dev_err(&pdev->dev, "mapping I/O device memory failure.\n");
-		err = -ENOMEM;
-		goto free_device;
-	}
-	pci_enable_msi(pdev);
-
-	 /* request and enable interrupt */
-	irqflags = pci_dev_msi_enabled(pdev) ? IRQF_ONESHOT : IRQF_SHARED;
-
-	err = request_threaded_irq(pdev->irq,
-			mei_me_irq_quick_handler,
-			mei_me_irq_thread_handler,
-			irqflags, KBUILD_MODNAME, dev);
-	if (err) {
-		dev_err(&pdev->dev, "request_threaded_irq failure. irq = %d\n",
-		       pdev->irq);
-		goto disable_msi;
-	}
-
-	if (mei_start(dev)) {
-		dev_err(&pdev->dev, "init hw failure.\n");
-		err = -ENODEV;
-		goto release_irq;
-	}
-
-	pm_runtime_set_autosuspend_delay(&pdev->dev, MEI_ME_RPM_TIMEOUT);
-	pm_runtime_use_autosuspend(&pdev->dev);
-
-	err = mei_register(dev, &pdev->dev);
-	if (err)
-		goto release_irq;
-
-	pci_set_drvdata(pdev, dev);
-
-	schedule_delayed_work(&dev->timer_work, HZ);
-
-	/*
-	* For not wake-able HW runtime pm framework
-	* can't be used on pci device level.
-	* Use domain runtime pm callbacks instead.
-	*/
-	if (!pci_dev_run_wake(pdev))
-		mei_me_set_pm_domain(dev);
-
-	if (mei_pg_is_enabled(dev)) {
-		pm_runtime_put_noidle(&pdev->dev);
-		if (hw->d0i3_supported)
-			pm_runtime_allow(&pdev->dev);
-	}
-
-	dev_dbg(&pdev->dev, "initialization successful.\n");
-
-	return 0;
-
-release_irq:
-	mei_cancel_work(dev);
-	mei_disable_interrupts(dev);
-	free_irq(pdev->irq, dev);
-disable_msi:
-	pci_disable_msi(pdev);
-	pci_iounmap(pdev, hw->mem_addr);
-free_device:
-	kfree(dev);
-release_regions:
-	pci_release_regions(pdev);
-disable_device:
-	pci_disable_device(pdev);
-end:
-	dev_err(&pdev->dev, "initialization failed.\n");
-	return err;
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+				 user_context_converter, &cmd->q.cid,
+				 NULL);
 }
 
 /**
- * mei_me_remove - Device Removal Routine
+ * vmw_cmd_end_gb_query - validate a  SVGA_3D_CMD_END_GB_QUERY command.
  *
- * @pdev: PCI device structure
- *
- * mei_remove is called by the PCI subsystem to alert the driver
- * that it should release a PCI device.
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context used for this command submission.
+ * @header: Pointer to the command header in the command stream.
  */
-static void mei_me_remove(struct pci_dev *pdev)
+static int vmw_cmd_end_gb_query(struct vmw_private *dev_priv,
+				struct vmw_sw_context *sw_context,
+				SVGA3dCmdHeader *header)
 {
-	struct mei_device *dev;
-	struct mei_me_hw *hw;
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return;
-
-	if (mei_pg_is_enabled(dev))
-		pm_runtime_get_noresume(&pdev->dev);
-
-	hw = to_me_hw(dev);
-
-
-	dev_dbg(&pdev->dev, "stop\n");
-	mei_stop(dev);
-
-	if (!pci_dev_run_wake(pdev))
-		mei_me_unset_pm_domain(dev);
-
-	/* disable interrupts */
-	mei_disable_interrupts(dev);
-
-	free_irq(pdev->irq, dev);
-	pci_disable_msi(pdev);
-
-	if (hw->mem_addr)
-		pci_iounmap(pdev, hw->mem_addr);
-
-	mei_deregister(dev);
-
-	kfree(dev);
-
-	pci_release_regions(pdev);
-	pci_disable_device(pdev);
-
-
-}
-#ifdef CONFIG_PM_SLEEP
-static int mei_me_pci_suspend(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev = pci_get_drvdata(pdev);
-
-	if (!dev)
-		return -ENODEV;
-
-	dev_dbg(&pdev->dev, "suspend\n");
-
-	mei_stop(dev);
-
-	mei_disable_interrupts(dev);
-
-	free_irq(pdev->irq, dev);
-	pci_disable_msi(pdev);
-
-	return 0;
-}
-
-static int mei_me_pci_resume(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
-	unsigned int irqflags;
-	int err;
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
-
-	pci_enable_msi(pdev);
-
-	irqflags = pci_dev_msi_enabled(pdev) ? IRQF_ONESHOT : IRQF_SHARED;
-
-	/* request and enable interrupt */
-	err = request_threaded_irq(pdev->irq,
-			mei_me_irq_quick_handler,
-			mei_me_irq_thread_handler,
-			irqflags, KBUILD_MODNAME, dev);
-
-	if (err) {
-		dev_err(&pdev->dev, "request_threaded_irq failed: irq = %d.\n",
-				pdev->irq);
-		return err;
-	}
-
-	err = mei_restart(dev);
-	if (err)
-		return err;
-
-	/* Start timer if stopped in suspend */
-	schedule_delayed_work(&dev->timer_work, HZ);
-
-	return 0;
-}
-#endif /* CONFIG_PM_SLEEP */
-
-#ifdef CONFIG_PM
-static int mei_me_pm_runtime_idle(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
-
-	dev_dbg(&pdev->dev, "rpm: me: runtime_idle\n");
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
-	if (mei_write_is_idle(dev))
-		pm_runtime_autosuspend(device);
-
-	return -EBUSY;
-}
-
-static int mei_me_pm_runtime_suspend(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
+	struct vmw_dma_buffer *vmw_bo;
+	struct vmw_query_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdEndGBQuery q;
+	} *cmd;
 	int ret;
 
-	dev_dbg(&pdev->dev, "rpm: me: runtime suspend\n");
+	cmd = container_of(header, struct vmw_query_cmd, header);
+	ret = vmw_cmd_cid_check(dev_priv, sw_context, header);
+	if (unlikely(ret != 0))
+		return ret;
 
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
+	ret = vmw_translate_mob_ptr(dev_priv, sw_context,
+				    &cmd->q.mobid,
+				    &vmw_bo);
+	if (unlikely(ret != 0))
+		return ret;
 
-	mutex_lock(&dev->device_lock);
+	ret = vmw_query_bo_switch_prepare(dev_priv, vmw_bo, sw_context);
 
-	if (mei_write_is_idle(dev))
-		ret = mei_me_pg_enter_sync(dev);
-	else
-		ret = -EAGAIN;
-
-	mutex_unlock(&dev->device_lock);
-
-	dev_dbg(&pdev->dev, "rpm: me: runtime suspend ret=%d\n", ret);
-
-	return ret;
-}
-
-static int mei_me_pm_runtime_resume(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
-	int ret;
-
-	dev_dbg(&pdev->dev, "rpm: me: runtime resume\n");
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
-
-	mutex_lock(&dev->device_lock);
-
-	ret = mei_me_pg_exit_sync(dev);
-
-	mutex_unlock(&dev->device_lock);
-
-	dev_dbg(&pdev->dev, "rpm: me: runtime resume ret = %d\n", ret);
-
+	vmw_dmabuf_unreference(&vmw_bo);
 	return ret;
 }
 
 /**
- * mei_me_set_pm_domain - fill and set pm domain structure for device
+ * vmw_cmd_end_query - validate a  SVGA_3D_CMD_END_QUERY command.
  *
- * @dev: mei_device
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context used for this command submission.
+ * @header: Pointer to the command header in the command stream.
  */
-static inline void mei_me_set_pm_domain(struct mei_device *dev)
+static int vmw_cmd_end_query(struct vmw_private *dev_priv,
+			     struct vmw_sw_context *sw_context,
+			     SVGA3dCmdHeader *header)
 {
-	struct pci_dev *pdev  = to_pci_dev(dev->dev);
+	struct vmw_dma_buffer *vmw_bo;
+	struct vmw_query_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdEndQuery q;
+	} *cmd;
+	int ret;
 
-	if (pdev->dev.bus && pdev->dev.bus->pm) {
-		dev->pg_domain.ops = *pdev->dev.bus->pm;
+	cmd = container_of(header, struct vmw_query_cmd, header);
+	if (dev_priv->has_mob) {
+		struct {
+			SVGA3dCmdHeader header;
+			SVGA3dCmdEndGBQuery q;
+		} gb_cmd;
 
-		dev->pg_domain.ops.runtime_suspend = mei_me_pm_runtime_suspend;
-		dev->pg_domain.ops.runtime_resume = mei_me_pm_runtime_resume;
-		dev->pg_domain.ops.runtime_idle = mei_me_pm_runtime_idle;
+		BUG_ON(sizeof(gb_cmd) != sizeof(*cmd));
 
-		pdev->dev.pm_domain = &dev->pg_domain;
+		gb_cmd.header.id = SVGA_3D_CMD_END_GB_QUERY;
+		gb_cmd.header.size = cmd->header.size;
+		gb_cmd.q.cid = cmd->q.cid;
+		gb_cmd.q.type = cmd->q.type;
+		gb_cmd.q.mobid = cmd->q.guestResult.gmrId;
+		gb_cmd.q.offset = cmd->q.guestResult.offset;
+
+		memcpy(cmd, &gb_cmd, sizeof(*cmd));
+		return vmw_cmd_end_gb_query(dev_priv, sw_context, header);
 	}
+
+	ret = vmw_cmd_cid_check(dev_priv, sw_context, header);
+	if (unlikely(ret != 0))
+		return ret;
+
+	ret = vmw_translate_guest_ptr(dev_priv, sw_context,
+				      &cmd->q.guestResult,
+				      &vmw_bo);
+	if (unlikely(ret != 0))
+		return ret;
+
+	ret = vmw_query_bo_switch_prepare(dev_priv, vmw_bo, sw_context);
+
+	vmw_dmabuf_unreference(&vmw_bo);
+	return ret;
 }
 
 /**
- * mei_me_unset_pm_domain - clean pm domain structure for device
+ * vmw_cmd_wait_gb_query - validate a  SVGA_3D_CMD_WAIT_GB_QUERY command.
  *
- * @dev: mei_device
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context used for this command submission.
+ * @header: Pointer to the command header in the command stream.
  */
-static inline void mei_me_unset_pm_domain(struct mei_device *dev)
+static int vmw_cmd_wait_gb_query(struct vmw_private *dev_priv,
+				 struct vmw_sw_context *sw_context,
+				 SVGA3dCmdHeader *header)
 {
-	/* stop using pm callbacks if any */
-	dev->dev->pm_domain = NULL;
+	struct vmw_dma_buffer *vmw_bo;
+	struct vmw_query_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdWaitForGBQuery q;
+	} *cmd;
+	int ret;
+
+	cmd = container_of(header, struct vmw_query_cmd, header);
+	ret = vmw_cmd_cid_check(dev_priv, sw_context, header);
+	if (unlikely(ret != 0))
+		return ret;
+
+	ret = vmw_translate_mob_ptr(dev_priv, sw_context,
+				    &cmd->q.mobid,
+				    &vmw_bo);
+	if (unlikely(ret != 0))
+		return ret;
+
+	vmw_dmabuf_unreference(&vmw_bo);
+	return 0;
 }
 
-static const struct dev_pm_ops mei_me_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(mei_me_pci_suspend,
-				mei_me_pci_resume)
-	SET_RUNTIME_PM_OPS(
-		mei_me_pm_runtime_suspend,
-		mei_me_pm_runtime_resume,
-		mei_me_pm_runtime_idle)
-};
-
-#define MEI_ME_PM_OPS	(&mei_me_pm_ops)
-#else
-#define MEI_ME_PM_OPS	NULL
-#endif /* CONFIG_PM */
-/*
- *  PCI driver structure
+/**
+ * vmw_cmd_wait_query - validate a  SVGA_3D_CMD_WAIT_QUERY command.
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context used for this command submission.
+ * @header: Pointer to the command header in the command stream.
  */
-static struct pci_driver mei_me_driver = {
-	.name = KBUILD_MODNAME,
-	.id_table = mei_me_pci_tbl,
-	.probe = mei_me_probe,
-	.remove = mei_me_remove,
-	.shutdown = mei_me_remove,
-	.driver.pm = MEI_ME_PM_OPS,
-};
+static int vmw_cmd_wait_query(struct vmw_private *dev_priv,
+			      struct vmw_sw_context *sw_context,
+			      SVGA3dCmdHeader *header)
+{
+	struct vmw_dma_buffer *vmw_bo;
+	struct vmw_query_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdWaitForQuery q;
+	} *cmd;
+	int ret;
 
-module_pci_driver(mei_me_driver);
+	cmd = container_of(header, struct vmw_query_cmd, header);
+	if (dev_priv->has_mob) {
+		struct {
+			SVGA3dCmdHeader header;
+			SVGA3dCmdWaitForGBQuery q;
+		} gb_cmd;
 
-MODULE_AUTHOR("Intel Corporation");
-MODULE_DESCRIPTION("Intel(R) Management Engine Interface");
-MODULE_LICENSE("GPL v2");
+		BUG_ON(sizeof(gb_cmd) != sizeof(*cmd));
+
+		gb_cmd.header.id = SVGA_3D_CMD_WAIT_FOR_GB_QUERY;
+		gb_cmd.header.size = cmd->header.size;
+		gb_cmd.q.cid = cmd->q.cid;
+		gb_cmd.q.type = cmd->q.type;
+		gb_cmd.q.mobid = cmd->q.guestResult.gmrId;
+		gb_cmd.q.offset = cmd->q.guestResult.offset;
+
+		memcpy(cmd, &gb_cmd, sizeof(*cmd));
+		return vmw_cmd_wait_gb_query(dev_priv, sw_context, header);
+	}
+
+	ret = vmw_cmd_cid_check(dev_priv, sw_context, header);
+	if (unlikely(ret != 0))
+		return ret;
+
+	ret = vmw_translate_guest_ptr(dev_priv, sw_context,
+				      &cmd->q.guestResult,
+				      &vmw_bo);
+	if (unlikely(ret != 0))
+		return ret;
+
+	vmw_dmabuf_unreference(&vmw_bo);
+	return 0;
+}
+
+static int vmw_cmd_dma(struct vmw_private *dev_priv,
+		       struct vmw_sw_context *sw_context,
+		       SVGA3dCmdHeader *header)
+{
+	struct vmw_dma_buffer *vmw_bo = NULL;
+	struct vmw_surface *srf = NULL;
+	struct vmw_dma_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdSurfaceDMA dma;
+	} *cmd;
+	int ret;
+	SVGA3dCmdSurfaceDMASuffix *suffix;
+	uint32_t bo_size;
+
+	cmd = container_of(header, struct vmw_dma_cmd, header);
+	suffix = (SVGA3dCmdSurfaceDMASuffix *)((unsigned long) &cmd->dma +
+					       header->size - sizeof(*suffix));
+
+	/* Make sure device and verifier stays in sync. */
+	if (unlikely(suffix->suffixSize != sizeof(*suffix))) {
+		DRM_ERROR("Invalid DMA suffix size.\n");
+		return -EINVAL;
+	}
+
+	ret = vmw_translate_guest_ptr(dev_priv, sw_context,
+				      &cmd->dma.guest.ptr,
+				      &vmw_bo);
+	if (unlikely(ret != 0))
+		return ret;
+
+	/* Make sure DMA doesn't cross BO boundaries. */
+	bo_size = vmw_bo->base.num_pages * PAGE_SIZE;
+	if (unlikely(cmd->dma.guest.ptr.offset > bo_size)) {
+		DRM_ERROR("Invalid DMA offset.\n");
+		return -EINVAL;
+	}
+
+	bo_size -= cmd->dma.guest.ptr.offset;
+	if (unlikely(suffix->maximumOffset > bo_size))
+		suffix->maximumOffset = bo_size;
+
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				user_surface_converter, &cmd->dma.host.sid,
+				NULL);
+	if (unlikely(ret != 0)) {
+		if (unlikely(ret != -ERESTARTSYS))
+			DRM_ERROR("could not find surface for DMA.\n");
+		goto out_no_surface;
+	}
+
+	srf = vmw_res_to_srf(sw_context->res_cache[vmw_res_surface].res);
+
+	vmw_kms_cursor_snoop(srf, sw_context->fp->tfile, &vmw_bo->base,
+			     header);
+
+out_no_surface:
+	vmw_dmabuf_unreference(&vmw_bo);
+	return ret;
+}
+
+static int vmw_cmd_draw(struct vmw_private *dev_priv,
+			struct vmw_sw_context *sw_context,
+			SVGA3dCmdHeader *header)
+{
+	struct vmw_draw_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDrawPrimitives body;
+	} *cmd;
+	SVGA3dVertexDecl *decl = (SVGA3dVertexDecl *)(
+		(unsigned long)header + sizeof(*cmd));
+	SVGA3dPrimitiveRange *range;
+	uint32_t i;
+	uint32_t maxnum;
+	int ret;
+
+	ret = vmw_cmd_cid_check(dev_priv, sw_context, header);
+	if (unlikely(ret != 0))
+		return ret;
+
+	cmd = container_of(header, struct vmw_draw_cmd, header);
+	maxnum = (header->size - sizeof(cmd->body)) / sizeof(*decl);
+
+	if (unlikely(cmd->body.numVertexDecls > maxnum)) {
+		DRM_ERROR("Illegal number of vertex declarations.\n");
+		return -EINVAL;
+	}
+
+	for (i = 0; i < cmd->body.numVertexDecls; ++i, ++decl) {
+		ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+					user_surface_converter,
+					&decl->array.surfaceId, NULL);
+		if (unlikely(ret != 0))
+			return ret;
+	}
+
+	maxnum = (header->size - sizeof(cmd->body) -
+		  cmd->body.numVertexDecls * sizeof(*decl)) / sizeof(*range);
+	if (unlikely(cmd->body.numRanges > maxnum)) {
+		DRM_ERROR("Illegal number of index ranges.\n");
+		return -EINVAL;
+	}
+
+	range = (SVGA3dPrimitiveRange *) decl;
+	for (i = 0; i < cmd->body.numRanges; ++i, ++range) {
+		ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+					user_surface_converter,
+					&range->indexArray.surfaceId, NULL);
+		if (unlikely(ret != 0))
+			return ret;
+	}
+	return 0;
+}
+
+
+static int vmw_cmd_tex_state(struct vmw_private *dev_priv,
+			     struct vmw_sw_context *sw_context,
+			     SVGA3dCmdHeader *header)
+{
+	struct vmw_tex_state_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdSetTextureState state;
+	} *cmd;
+
+	SVGA3dTextureState *last_state = (SVGA3dTextureState *)
+	  ((unsigned long) header + header->size + sizeof(*header));
+	SVGA3dTextureState *cur_state = (SVGA3dTextureState *)
+		((unsigned long) header + sizeof(struct vmw_tex_state_cmd));
+	struct vmw_resource_val_node *ctx_node;
+	struct vmw_resource_val_node *res_node;
+	int ret;
+
+	cmd = container_of(header, struct vmw_tex_state_cmd,
+			   header);
+
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+				user_context_converter, &cmd->state.cid,
+				&ctx_node);
+	if (unlikely(ret != 0))
+		return ret;
+
+	for (; cur_state < last_state; ++cur_state) {
+		if (likely(cur_state->name != SVGA3D_TS_BIND_TEXTURE))
+			continue;
+
+		if (cur_state->stage >= SVGA3D_NUM_TEXTURE_UNITS) {
+			DRM_ERROR("Illegal texture/sampler unit %u.\n",
+				  (unsigned) cur_state->stage);
+			return -EINVAL;
+		}
+
+		ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+					user_surface_converter,
+					&cur_state->value, &res_node);
+		if (unlikely(ret != 0))
+			return ret;
+
+		if (dev_priv->has_mob) {
+			struct vmw_ctx_bindinfo_tex binding;
+
+			binding.bi.ctx = ctx_node->res;
+			binding.bi.res = res_node ? res_node->res : NULL;
+			binding.bi.bt = vmw_ctx_binding_tex;
+			binding.texture_stage = cur_state->stage;
+			vmw_binding_add(ctx_node->staged_bindings, &binding.bi,
+					0, binding.texture_stage);
+		}
+	}
+
+	return 0;
+}
+
+static int vmw_cmd_check_define_gmrfb(struct vmw_private *dev_priv,
+				      struct vmw_sw_context *sw_context,
+				      void *buf)
+{
+	struct vmw_dma_buffer *vmw_bo;
+	int ret;
+
+	struct {
+		uint32_t header;
+		SVGAFifoCmdDefineGMRFB body;
+	} *cmd = buf;
+
+	ret = vmw_translate_guest_ptr(dev_priv, sw_context,
+				      &cmd->body.ptr,
+				      &vmw_bo);
+	if (unlikely(ret != 0))
+		return ret;
+
+	vmw_dmabuf_unreference(&vmw_bo);
+
+	return ret;
+}
+
+
+/**
+ * vmw_cmd_res_switch_backup - Utility function to handle backup buffer
+ * switching
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @val_node: The validation node representing the resource.
+ * @buf_id: Pointer to the user-space backup buffer handle in the command
+ * stream.
+ * @backup_offset: Offset of backup into MOB.
+ *
+ * This function prepares for registering a switch of backup buffers
+ * in the resource metadata just prior to unreserving. It's basically a wrapper
+ * around vmw_cmd_res_switch_backup with a different interface.
+ */
+static int vmw_cmd_res_switch_backup(struct vmw_private *dev_priv,
+				     struct vmw_sw_context *sw_context,
+				     struct vmw_resource_val_node *val_node,
+				     uint32_t *buf_id,
+				     unsigned long backup_offset)
+{
+	struct vmw_dma_buffer *dma_buf;
+	int ret;
+
+	ret = vmw_translate_mob_ptr(dev_priv, sw_context, buf_id, &dma_buf);
+	if (ret)
+		return ret;
+
+	val_node->switching_backup = true;
+	if (val_node->first_usage)
+		val_node->no_buffer_needed = true;
+
+	vmw_dmabuf_unreference(&val_node->new_backup);
+	val_node->new_backup = dma_buf;
+	val_node->new_backup_offset = backup_offset;
+
+	return 0;
+}
+
+
+/**
+ * vmw_cmd_switch_backup - Utility function to handle backup buffer switching
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The sof

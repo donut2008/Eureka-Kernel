@@ -1,75 +1,75 @@
+ {
+	__u64 val;
+	struct {
+		__u64 rv3  :  2; /* 0-1 */
+		__u64 ps   :  6; /* 2-7 */
+		__u64 key  : 24; /* 8-31 */
+		__u64 rv4  : 32; /* 32-63 */
+	};
+};
+
+union  ia64_rr {
+	__u64 val;
+	struct {
+		__u64  ve	:  1;  /* enable hw walker */
+		__u64  reserved0:  1;  /* reserved */
+		__u64  ps	:  6;  /* log page size */
+		__u64  rid	: 24;  /* region id */
+		__u64  reserved1: 32;  /* reserved */
+	};
+};
+
 /*
- * arch/sh/mm/numa.c - Multiple node support for SH machines
- *
- *  Copyright (C) 2007  Paul Mundt
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ * CPU type, hardware bug flags, and per-CPU state.  Frequently used
+ * state comes earlier:
  */
-#include <linux/module.h>
-#include <linux/bootmem.h>
-#include <linux/memblock.h>
-#include <linux/mm.h>
-#include <linux/numa.h>
-#include <linux/pfn.h>
-#include <asm/sections.h>
+struct cpuinfo_ia64 {
+	unsigned int softirq_pending;
+	unsigned long itm_delta;	/* # of clock cycles between clock ticks */
+	unsigned long itm_next;		/* interval timer mask value to use for next clock tick */
+	unsigned long nsec_per_cyc;	/* (1000000000<<IA64_NSEC_PER_CYC_SHIFT)/itc_freq */
+	unsigned long unimpl_va_mask;	/* mask of unimplemented virtual address bits (from PAL) */
+	unsigned long unimpl_pa_mask;	/* mask of unimplemented physical address bits (from PAL) */
+	unsigned long itc_freq;		/* frequency of ITC counter */
+	unsigned long proc_freq;	/* frequency of processor */
+	unsigned long cyc_per_usec;	/* itc_freq/1000000 */
+	unsigned long ptce_base;
+	unsigned int ptce_count[2];
+	unsigned int ptce_stride[2];
+	struct task_struct *ksoftirqd;	/* kernel softirq daemon for this CPU */
 
-struct pglist_data *node_data[MAX_NUMNODES] __read_mostly;
-EXPORT_SYMBOL_GPL(node_data);
+#ifdef CONFIG_SMP
+	unsigned long loops_per_jiffy;
+	int cpu;
+	unsigned int socket_id;	/* physical processor socket id */
+	unsigned short core_id;	/* core id */
+	unsigned short thread_id; /* thread id */
+	unsigned short num_log;	/* Total number of logical processors on
+				 * this socket that were successfully booted */
+	unsigned char cores_per_socket;	/* Cores per processor socket */
+	unsigned char threads_per_core;	/* Threads per core */
+#endif
+
+	/* CPUID-derived information: */
+	unsigned long ppn;
+	unsigned long features;
+	unsigned char number;
+	unsigned char revision;
+	unsigned char model;
+	unsigned char family;
+	unsigned char archrev;
+	char vendor[16];
+	char *model_name;
+
+#ifdef CONFIG_NUMA
+	struct ia64_node_data *node_data;
+#endif
+};
+
+DECLARE_PER_CPU(struct cpuinfo_ia64, ia64_cpu_info);
 
 /*
- * On SH machines the conventional approach is to stash system RAM
- * in node 0, and other memory blocks in to node 1 and up, ordered by
- * latency. Each node's pgdat is node-local at the beginning of the node,
- * immediately followed by the node mem map.
- */
-void __init setup_bootmem_node(int nid, unsigned long start, unsigned long end)
-{
-	unsigned long bootmap_pages;
-	unsigned long start_pfn, end_pfn;
-	unsigned long bootmem_paddr;
-
-	/* Don't allow bogus node assignment */
-	BUG_ON(nid >= MAX_NUMNODES || nid <= 0);
-
-	start_pfn = PFN_DOWN(start);
-	end_pfn = PFN_DOWN(end);
-
-	pmb_bolt_mapping((unsigned long)__va(start), start, end - start,
-			 PAGE_KERNEL);
-
-	memblock_add(start, end - start);
-
-	__add_active_range(nid, start_pfn, end_pfn);
-
-	/* Node-local pgdat */
-	NODE_DATA(nid) = __va(memblock_alloc_base(sizeof(struct pglist_data),
-					     SMP_CACHE_BYTES, end));
-	memset(NODE_DATA(nid), 0, sizeof(struct pglist_data));
-
-	NODE_DATA(nid)->bdata = &bootmem_node_data[nid];
-	NODE_DATA(nid)->node_start_pfn = start_pfn;
-	NODE_DATA(nid)->node_spanned_pages = end_pfn - start_pfn;
-
-	/* Node-local bootmap */
-	bootmap_pages = bootmem_bootmap_pages(end_pfn - start_pfn);
-	bootmem_paddr = memblock_alloc_base(bootmap_pages << PAGE_SHIFT,
-				       PAGE_SIZE, end);
-	init_bootmem_node(NODE_DATA(nid), bootmem_paddr >> PAGE_SHIFT,
-			  start_pfn, end_pfn);
-
-	free_bootmem_with_active_regions(nid, end_pfn);
-
-	/* Reserve the pgdat and bootmap space with the bootmem allocator */
-	reserve_bootmem_node(NODE_DATA(nid), start_pfn << PAGE_SHIFT,
-			     sizeof(struct pglist_data), BOOTMEM_DEFAULT);
-	reserve_bootmem_node(NODE_DATA(nid), bootmem_paddr,
-			     bootmap_pages << PAGE_SHIFT, BOOTMEM_DEFAULT);
-
-	/* It's up */
-	node_set_online(nid);
-
-	/* Kick sparsemem */
-	sparse_memory_present_with_active_regions(nid);
-}
+ * The "local" data variable.  It refers to the per-CPU data of the currently executing
+ * CPU, much like "current" points to the per-task data of the currently executing task.
+ * Do not use the address of local_cpu_data, since it will be different from
+ * cpu_data(smp_pr

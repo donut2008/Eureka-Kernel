@@ -1,339 +1,375 @@
-     cdc_mbim - Driver for CDC MBIM Mobile Broadband modems
-    ========================================================
+/*
+ * Intel 82860 Memory Controller kernel module
+ * (C) 2005 Red Hat (http://www.redhat.com)
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
+ *
+ * Written by Ben Woodard <woodard@redhat.com>
+ * shamelessly copied from and based upon the edac_i82875 driver
+ * by Thayne Harbaugh of Linux Networx. (http://lnxi.com)
+ */
 
-The cdc_mbim driver supports USB devices conforming to the "Universal
-Serial Bus Communications Class Subclass Specification for Mobile
-Broadband Interface Model" [1], which is a further development of
-"Universal Serial Bus Communications Class Subclass Specifications for
-Network Control Model Devices" [2] optimized for Mobile Broadband
-devices, aka "3G/LTE modems".
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/pci.h>
+#include <linux/pci_ids.h>
+#include <linux/edac.h>
+#include "edac_core.h"
 
+#define  I82860_REVISION " Ver: 2.0.2"
+#define EDAC_MOD_STR	"i82860_edac"
 
-Command Line Parameters
-=======================
+#define i82860_printk(level, fmt, arg...) \
+	edac_printk(level, "i82860", fmt, ##arg)
 
-The cdc_mbim driver has no parameters of its own.  But the probing
-behaviour for NCM 1.0 backwards compatible MBIM functions (an
-"NCM/MBIM function" as defined in section 3.2 of [1]) is affected
-by a cdc_ncm driver parameter:
+#define i82860_mc_printk(mci, level, fmt, arg...) \
+	edac_mc_chipset_printk(mci, level, "i82860", fmt, ##arg)
 
-prefer_mbim
------------
-Type:          Boolean
-Valid Range:   N/Y (0-1)
-Default Value: Y (MBIM is preferred)
+#ifndef PCI_DEVICE_ID_INTEL_82860_0
+#define PCI_DEVICE_ID_INTEL_82860_0	0x2531
+#endif				/* PCI_DEVICE_ID_INTEL_82860_0 */
 
-This parameter sets the system policy for NCM/MBIM functions.  Such
-functions will be handled by either the cdc_ncm driver or the cdc_mbim
-driver depending on the prefer_mbim setting.  Setting prefer_mbim=N
-makes the cdc_mbim driver ignore these functions and lets the cdc_ncm
-driver handle them instead.
+#define I82860_MCHCFG 0x50
+#define I82860_GBA 0x60
+#define I82860_GBA_MASK 0x7FF
+#define I82860_GBA_SHIFT 24
+#define I82860_ERRSTS 0xC8
+#define I82860_EAP 0xE4
+#define I82860_DERRCTL_STS 0xE2
 
-The parameter is writable, and can be changed at any time. A manual
-unbind/bind is required to make the change effective for NCM/MBIM
-functions bound to the "wrong" driver
+enum i82860_chips {
+	I82860 = 0,
+};
 
+struct i82860_dev_info {
+	const char *ctl_name;
+};
 
-Basic usage
-===========
+struct i82860_error_info {
+	u16 errsts;
+	u32 eap;
+	u16 derrsyn;
+	u16 errsts2;
+};
 
-MBIM functions are inactive when unmanaged. The cdc_mbim driver only
-provides an userspace interface to the MBIM control channel, and will
-not participate in the management of the function. This implies that a
-userspace MBIM management application always is required to enable a
-MBIM function.
+static const struct i82860_dev_info i82860_devs[] = {
+	[I82860] = {
+		.ctl_name = "i82860"},
+};
 
-Such userspace applications includes, but are not limited to:
- - mbimcli (included with the libmbim [3] library), and
- - ModemManager [4]
+static struct pci_dev *mci_pdev;	/* init dev: in case that AGP code
+					 * has already registered driver
+					 */
+static struct edac_pci_ctl_info *i82860_pci;
 
-Establishing a MBIM IP session reequires at least these actions by the
-management application:
- - open the control channel
- - configure network connection settings
- - connect to network
- - configure IP interface
+static void i82860_get_error_info(struct mem_ctl_info *mci,
+				struct i82860_error_info *info)
+{
+	struct pci_dev *pdev;
 
-Management application development
-----------------------------------
-The driver <-> userspace interfaces are described below.  The MBIM
-control channel protocol is described in [1].
+	pdev = to_pci_dev(mci->pdev);
 
+	/*
+	 * This is a mess because there is no atomic way to read all the
+	 * registers at once and the registers can transition from CE being
+	 * overwritten by UE.
+	 */
+	pci_read_config_word(pdev, I82860_ERRSTS, &info->errsts);
+	pci_read_config_dword(pdev, I82860_EAP, &info->eap);
+	pci_read_config_word(pdev, I82860_DERRCTL_STS, &info->derrsyn);
+	pci_read_config_word(pdev, I82860_ERRSTS, &info->errsts2);
 
-MBIM control channel userspace ABI
-==================================
+	pci_write_bits16(pdev, I82860_ERRSTS, 0x0003, 0x0003);
 
-/dev/cdc-wdmX character device
-------------------------------
-The driver creates a two-way pipe to the MBIM function control channel
-using the cdc-wdm driver as a subdriver.  The userspace end of the
-control channel pipe is a /dev/cdc-wdmX character device.
+	/*
+	 * If the error is the same for both reads then the first set of reads
+	 * is valid.  If there is a change then there is a CE no info and the
+	 * second set of reads is valid and should be UE info.
+	 */
+	if (!(info->errsts2 & 0x0003))
+		return;
 
-The cdc_mbim driver does not process or police messages on the control
-channel.  The channel is fully delegated to the userspace management
-application.  It is therefore up to this application to ensure that it
-complies with all the control channel requirements in [1].
+	if ((info->errsts ^ info->errsts2) & 0x0003) {
+		pci_read_config_dword(pdev, I82860_EAP, &info->eap);
+		pci_read_config_word(pdev, I82860_DERRCTL_STS, &info->derrsyn);
+	}
+}
 
-The cdc-wdmX device is created as a child of the MBIM control
-interface USB device.  The character device associated with a specific
-MBIM function can be looked up using sysfs.  For example:
+static int i82860_process_error_info(struct mem_ctl_info *mci,
+				struct i82860_error_info *info,
+				int handle_errors)
+{
+	struct dimm_info *dimm;
+	int row;
 
- bjorn@nemi:~$ ls /sys/bus/usb/drivers/cdc_mbim/2-4:2.12/usbmisc
- cdc-wdm0
+	if (!(info->errsts2 & 0x0003))
+		return 0;
 
- bjorn@nemi:~$ grep . /sys/bus/usb/drivers/cdc_mbim/2-4:2.12/usbmisc/cdc-wdm0/dev
- 180:0
+	if (!handle_errors)
+		return 1;
 
-
-USB configuration descriptors
------------------------------
-The wMaxControlMessage field of the CDC MBIM functional descriptor
-limits the maximum control message size. The managament application is
-responsible for negotiating a control message size complying with the
-requirements in section 9.3.1 of [1], taking this descriptor field
-into consideration.
-
-The userspace application can access the CDC MBIM functional
-descriptor of a MBIM function using either of the two USB
-configuration descriptor kernel interfaces described in [6] or [7].
-
-See also the ioctl documentation below.
-
-
-Fragmentation
--------------
-The userspace application is responsible for all control message
-fragmentation and defragmentaion, as described in section 9.5 of [1].
-
-
-/dev/cdc-wdmX write()
----------------------
-The MBIM control messages from the management application *must not*
-exceed the negotiated control message size.
-
-
-/dev/cdc-wdmX read()
---------------------
-The management application *must* accept control messages of up the
-negotiated control message size.
-
-
-/dev/cdc-wdmX ioctl()
---------------------
-IOCTL_WDM_MAX_COMMAND: Get Maximum Command Size
-This ioctl returns the wMaxControlMessage field of the CDC MBIM
-functional descriptor for MBIM devices.  This is intended as a
-convenience, eliminating the need to parse the USB descriptors from
-userspace.
-
-	#include <stdio.h>
-	#include <fcntl.h>
-	#include <sys/ioctl.h>
-	#include <linux/types.h>
-	#include <linux/usb/cdc-wdm.h>
-	int main()
-	{
-		__u16 max;
-		int fd = open("/dev/cdc-wdm0", O_RDWR);
-		if (!ioctl(fd, IOCTL_WDM_MAX_COMMAND, &max))
-			printf("wMaxControlMessage is %d\n", max);
+	if ((info->errsts ^ info->errsts2) & 0x0003) {
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1, 0, 0, 0,
+				     -1, -1, -1, "UE overwrote CE", "");
+		info->errsts = info->errsts2;
 	}
 
+	info->eap >>= PAGE_SHIFT;
+	row = edac_mc_find_csrow_by_page(mci, info->eap);
+	dimm = mci->csrows[row]->channels[0]->dimm;
 
-Custom device services
-----------------------
-The MBIM specification allows vendors to freely define additional
-services.  This is fully supported by the cdc_mbim driver.
+	if (info->errsts & 0x0002)
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1,
+				     info->eap, 0, 0,
+				     dimm->location[0], dimm->location[1], -1,
+				     "i82860 UE", "");
+	else
+		edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1,
+				     info->eap, 0, info->derrsyn,
+				     dimm->location[0], dimm->location[1], -1,
+				     "i82860 CE", "");
 
-Support for new MBIM services, including vendor specified services, is
-implemented entirely in userspace, like the rest of the MBIM control
-protocol
+	return 1;
+}
 
-New services should be registered in the MBIM Registry [5].
+static void i82860_check(struct mem_ctl_info *mci)
+{
+	struct i82860_error_info info;
 
+	edac_dbg(1, "MC%d\n", mci->mc_idx);
+	i82860_get_error_info(mci, &info);
+	i82860_process_error_info(mci, &info, 1);
+}
 
+static void i82860_init_csrows(struct mem_ctl_info *mci, struct pci_dev *pdev)
+{
+	unsigned long last_cumul_size;
+	u16 mchcfg_ddim;	/* DRAM Data Integrity Mode 0=none, 2=edac */
+	u16 value;
+	u32 cumul_size;
+	struct csrow_info *csrow;
+	struct dimm_info *dimm;
+	int index;
 
-MBIM data channel userspace ABI
-===============================
+	pci_read_config_word(pdev, I82860_MCHCFG, &mchcfg_ddim);
+	mchcfg_ddim = mchcfg_ddim & 0x180;
+	last_cumul_size = 0;
 
-wwanY network device
---------------------
-The cdc_mbim driver represents the MBIM data channel as a single
-network device of the "wwan" type. This network device is initially
-mapped to MBIM IP session 0.
+	/* The group row boundary (GRA) reg values are boundary address
+	 * for each DRAM row with a granularity of 16MB.  GRA regs are
+	 * cumulative; therefore GRA15 will contain the total memory contained
+	 * in all eight rows.
+	 */
+	for (index = 0; index < mci->nr_csrows; index++) {
+		csrow = mci->csrows[index];
+		dimm = csrow->channels[0]->dimm;
 
+		pci_read_config_word(pdev, I82860_GBA + index * 2, &value);
+		cumul_size = (value & I82860_GBA_MASK) <<
+			(I82860_GBA_SHIFT - PAGE_SHIFT);
+		edac_dbg(3, "(%d) cumul_size 0x%x\n", index, cumul_size);
 
-Multiplexed IP sessions (IPS)
------------------------------
-MBIM allows multiplexing up to 256 IP sessions over a single USB data
-channel.  The cdc_mbim driver models such IP sessions as 802.1q VLAN
-subdevices of the master wwanY device, mapping MBIM IP session Z to
-VLAN ID Z for all values of Z greater than 0.
+		if (cumul_size == last_cumul_size)
+			continue;	/* not populated */
 
-The device maximum Z is given in the MBIM_DEVICE_CAPS_INFO structure
-described in section 10.5.1 of [1].
+		csrow->first_page = last_cumul_size;
+		csrow->last_page = cumul_size - 1;
+		dimm->nr_pages = cumul_size - last_cumul_size;
+		last_cumul_size = cumul_size;
+		dimm->grain = 1 << 12;	/* I82860_EAP has 4KiB reolution */
+		dimm->mtype = MEM_RMBS;
+		dimm->dtype = DEV_UNKNOWN;
+		dimm->edac_mode = mchcfg_ddim ? EDAC_SECDED : EDAC_NONE;
+	}
+}
 
-The userspace management application is responsible for adding new
-VLAN links prior to establishing MBIM IP sessions where the SessionId
-is greater than 0. These links can be added by using the normal VLAN
-kernel interfaces, either ioctl or netlink.
+static int i82860_probe1(struct pci_dev *pdev, int dev_idx)
+{
+	struct mem_ctl_info *mci;
+	struct edac_mc_layer layers[2];
+	struct i82860_error_info discard;
 
-For example, adding a link for a MBIM IP session with SessionId 3:
+	/*
+	 * RDRAM has channels but these don't map onto the csrow abstraction.
+	 * According with the datasheet, there are 2 Rambus channels, supporting
+	 * up to 16 direct RDRAM devices.
+	 * The device groups from the GRA registers seem to map reasonably
+	 * well onto the notion of a chip select row.
+	 * There are 16 GRA registers and since the name is associated with
+	 * the channel and the GRA registers map to physical devices so we are
+	 * going to make 1 channel for group.
+	 */
+	layers[0].type = EDAC_MC_LAYER_CHANNEL;
+	layers[0].size = 2;
+	layers[0].is_virt_csrow = true;
+	layers[1].type = EDAC_MC_LAYER_SLOT;
+	layers[1].size = 8;
+	layers[1].is_virt_csrow = true;
+	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers, 0);
+	if (!mci)
+		return -ENOMEM;
 
-  ip link add link wwan0 name wwan0.3 type vlan id 3
+	edac_dbg(3, "init mci\n");
+	mci->pdev = &pdev->dev;
+	mci->mtype_cap = MEM_FLAG_DDR;
+	mci->edac_ctl_cap = EDAC_FLAG_NONE | EDAC_FLAG_SECDED;
+	/* I"m not sure about this but I think that all RDRAM is SECDED */
+	mci->edac_cap = EDAC_FLAG_SECDED;
+	mci->mod_name = EDAC_MOD_STR;
+	mci->mod_ver = I82860_REVISION;
+	mci->ctl_name = i82860_devs[dev_idx].ctl_name;
+	mci->dev_name = pci_name(pdev);
+	mci->edac_check = i82860_check;
+	mci->ctl_page_to_phys = NULL;
+	i82860_init_csrows(mci, pdev);
+	i82860_get_error_info(mci, &discard);	/* clear counters */
 
-The driver will automatically map the "wwan0.3" network device to MBIM
-IP session 3.
+	/* Here we assume that we will never see multiple instances of this
+	 * type of memory controller.  The ID is therefore hardcoded to 0.
+	 */
+	if (edac_mc_add_mc(mci)) {
+		edac_dbg(3, "failed edac_mc_add_mc()\n");
+		goto fail;
+	}
 
+	/* allocating generic PCI control info */
+	i82860_pci = edac_pci_create_generic_ctl(&pdev->dev, EDAC_MOD_STR);
+	if (!i82860_pci) {
+		printk(KERN_WARNING
+			"%s(): Unable to create PCI control\n",
+			__func__);
+		printk(KERN_WARNING
+			"%s(): PCI error report via EDAC not setup\n",
+			__func__);
+	}
 
-Device Service Streams (DSS)
-----------------------------
-MBIM also allows up to 256 non-IP data streams to be multiplexed over
-the same shared USB data channel.  The cdc_mbim driver models these
-sessions as another set of 802.1q VLAN subdevices of the master wwanY
-device, mapping MBIM DSS session A to VLAN ID (256 + A) for all values
-of A.
+	/* get this far and it's successful */
+	edac_dbg(3, "success\n");
 
-The device maximum A is given in the MBIM_DEVICE_SERVICES_INFO
-structure described in section 10.5.29 of [1].
+	return 0;
 
-The DSS VLAN subdevices are used as a practical interface between the
-shared MBIM data channel and a MBIM DSS aware userspace application.
-It is not intended to be presented as-is to an end user. The
-assumption is that an userspace application initiating a DSS session
-also takes care of the necessary framing of the DSS data, presenting
-the stream to the end user in an appropriate way for the stream type.
+fail:
+	edac_mc_free(mci);
+	return -ENODEV;
+}
 
-The network device ABI requires a dummy ethernet header for every DSS
-data frame being transported.  The contents of this header is
-arbitrary, with the following exceptions:
- - TX frames using an IP protocol (0x0800 or 0x86dd) will be dropped
- - RX frames will have the protocol field set to ETH_P_802_3 (but will
-   not be properly formatted 802.3 frames)
- - RX frames will have the destination address set to the hardware
-   address of the master device
+/* returns count (>= 0), or negative on error */
+static int i82860_init_one(struct pci_dev *pdev,
+			   const struct pci_device_id *ent)
+{
+	int rc;
 
-The DSS supporting userspace management application is responsible for
-adding the dummy ethernet header on TX and stripping it on RX.
+	edac_dbg(0, "\n");
+	i82860_printk(KERN_INFO, "i82860 init one\n");
 
-This is a simple example using tools commonly available, exporting
-DssSessionId 5 as a pty character device pointed to by a /dev/nmea
-symlink:
+	if (pci_enable_device(pdev) < 0)
+		return -EIO;
 
-  ip link add link wwan0 name wwan0.dss5 type vlan id 261
-  ip link set dev wwan0.dss5 up
-  socat INTERFACE:wwan0.dss5,type=2 PTY:,echo=0,link=/dev/nmea
+	rc = i82860_probe1(pdev, ent->driver_data);
 
-This is only an example, most suitable for testing out a DSS
-service. Userspace applications supporting specific MBIM DSS services
-are expected to use the tools and programming interfaces required by
-that service.
+	if (rc == 0)
+		mci_pdev = pci_dev_get(pdev);
 
-Note that adding VLAN links for DSS sessions is entirely optional.  A
-management application may instead choose to bind a packet socket
-directly to the master network device, using the received VLAN tags to
-map frames to the correct DSS session and adding 18 byte VLAN ethernet
-headers with the appropriate tag on TX.  In this case using a socket
-filter is recommended, matching only the DSS VLAN subset. This avoid
-unnecessary copying of unrelated IP session data to userspace.  For
-example:
+	return rc;
+}
 
-  static struct sock_filter dssfilter[] = {
-	/* use special negative offsets to get VLAN tag */
-	BPF_STMT(BPF_LD|BPF_B|BPF_ABS, SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT),
-	BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 1, 0, 6), /* true */
+static void i82860_remove_one(struct pci_dev *pdev)
+{
+	struct mem_ctl_info *mci;
 
-	/* verify DSS VLAN range */
-	BPF_STMT(BPF_LD|BPF_H|BPF_ABS, SKF_AD_OFF + SKF_AD_VLAN_TAG),
-	BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 256, 0, 4),	/* 256 is first DSS VLAN */
-	BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 512, 3, 0),	/* 511 is last DSS VLAN */
+	edac_dbg(0, "\n");
 
-	/* verify ethertype */
-        BPF_STMT(BPF_LD|BPF_H|BPF_ABS, 2 * ETH_ALEN),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, ETH_P_802_3, 0, 1),
+	if (i82860_pci)
+		edac_pci_release_generic_ctl(i82860_pci);
 
-        BPF_STMT(BPF_RET|BPF_K, (u_int)-1),	/* accept */
-        BPF_STMT(BPF_RET|BPF_K, 0),		/* ignore */
-  };
+	if ((mci = edac_mc_del_mc(&pdev->dev)) == NULL)
+		return;
 
+	edac_mc_free(mci);
+}
 
+static const struct pci_device_id i82860_pci_tbl[] = {
+	{
+	 PCI_VEND_DEV(INTEL, 82860_0), PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+	 I82860},
+	{
+	 0,
+	 }			/* 0 terminated list. */
+};
 
-Tagged IP session 0 VLAN
-------------------------
-As described above, MBIM IP session 0 is treated as special by the
-driver.  It is initially mapped to untagged frames on the wwanY
-network device.
+MODULE_DEVICE_TABLE(pci, i82860_pci_tbl);
 
-This mapping implies a few restrictions on multiplexed IPS and DSS
-sessions, which may not always be practical:
- - no IPS or DSS session can use a frame size greater than the MTU on
-   IP session 0
- - no IPS or DSS session can be in the up state unless the network
-   device representing IP session 0 also is up
+static struct pci_driver i82860_driver = {
+	.name = EDAC_MOD_STR,
+	.probe = i82860_init_one,
+	.remove = i82860_remove_one,
+	.id_table = i82860_pci_tbl,
+};
 
-These problems can be avoided by optionally making the driver map IP
-session 0 to a VLAN subdevice, similar to all other IP sessions.  This
-behaviour is triggered by adding a VLAN link for the magic VLAN ID
-4094.  The driver will then immediately start mapping MBIM IP session
-0 to this VLAN, and will drop untagged frames on the master wwanY
-device.
+static int __init i82860_init(void)
+{
+	int pci_rc;
 
-Tip: It might be less confusing to the end user to name this VLAN
-subdevice after the MBIM SessionID instead of the VLAN ID.  For
-example:
+	edac_dbg(3, "\n");
 
-  ip link add link wwan0 name wwan0.0 type vlan id 4094
+       /* Ensure that the OPSTATE is set correctly for POLL or NMI */
+       opstate_init();
 
+	if ((pci_rc = pci_register_driver(&i82860_driver)) < 0)
+		goto fail0;
 
-VLAN mapping
-------------
+	if (!mci_pdev) {
+		mci_pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+					PCI_DEVICE_ID_INTEL_82860_0, NULL);
 
-Summarizing the cdc_mbim driver mapping described above, we have this
-relationship between VLAN tags on the wwanY network device and MBIM
-sessions on the shared USB data channel:
+		if (mci_pdev == NULL) {
+			edac_dbg(0, "860 pci_get_device fail\n");
+			pci_rc = -ENODEV;
+			goto fail1;
+		}
 
-  VLAN ID       MBIM type   MBIM SessionID           Notes
-  ---------------------------------------------------------
-  untagged      IPS         0                        a)
-  1 - 255       IPS         1 - 255 <VLANID>
-  256 - 511     DSS         0 - 255 <VLANID - 256>
-  512 - 4093                                         b)
-  4094          IPS         0                        c)
+		pci_rc = i82860_init_one(mci_pdev, i82860_pci_tbl);
 
-    a) if no VLAN ID 4094 link exists, else dropped
-    b) unsupported VLAN range, unconditionally dropped
-    c) if a VLAN ID 4094 link exists, else dropped
+		if (pci_rc < 0) {
+			edac_dbg(0, "860 init fail\n");
+			pci_rc = -ENODEV;
+			goto fail1;
+		}
+	}
 
+	return 0;
 
+fail1:
+	pci_unregister_driver(&i82860_driver);
 
+fail0:
+	pci_dev_put(mci_pdev);
+	return pci_rc;
+}
 
-References
-==========
+static void __exit i82860_exit(void)
+{
+	edac_dbg(3, "\n");
+	pci_unregister_driver(&i82860_driver);
+	pci_dev_put(mci_pdev);
+}
 
-[1] USB Implementers Forum, Inc. - "Universal Serial Bus
-      Communications Class Subclass Specification for Mobile Broadband
-      Interface Model", Revision 1.0 (Errata 1), May 1, 2013
-      - http://www.usb.org/developers/docs/devclass_docs/
+module_init(i82860_init);
+module_exit(i82860_exit);
 
-[2] USB Implementers Forum, Inc. - "Universal Serial Bus
-      Communications Class Subclass Specifications for Network Control
-      Model Devices", Revision 1.0 (Errata 1), November 24, 2010
-      - http://www.usb.org/developers/docs/devclass_docs/
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Red Hat Inc. (http://www.redhat.com) "
+		"Ben Woodard <woodard@redhat.com>");
+MODULE_DESCRIPTION("ECC support for Intel 82860 memory hub controllers");
 
-[3] libmbim - "a glib-based library for talking to WWAN modems and
-      devices which speak the Mobile Interface Broadband Model (MBIM)
-      protocol"
-      - http://www.freedesktop.org/wiki/Software/libmbim/
-
-[4] ModemManager - "a DBus-activated daemon which controls mobile
-      broadband (2G/3G/4G) devices and connections"
-      - http://www.freedesktop.org/wiki/Software/ModemManager/
-
-[5] "MBIM (Mobile Broadband Interface Model) Registry"
-       - http://compliance.usb.org/mbim/
-
-[6] "/proc/bus/usb filesystem output"
-       - Documentation/usb/proc_usb_info.txt
-
-[7] "/sys/bus/usb/devices/.../descriptors"
-       - Documentation/ABI/stable/sysfs-bus-usb
+module_param(edac_op_state, int, 0444);
+MODULE_PARM_DESC(edac_op_state, "EDAC Error Reporting state: 0=Poll,1=NMI");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Intel D82875P Memory Controller kernel module
+ * (C) 2003 Linux Networx (http://lnxi.com)
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
+ *
+ * Written by Thayne Harbaugh
+ * Contributors:
+ *	Wang Zhenyu 

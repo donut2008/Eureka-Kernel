@@ -1,39 +1,25 @@
-/* Unusual Devices File for devices based on the Cypress USB/ATA bridge
- *	with support for ATACB
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if defined(CONFIG_USB_STORAGE_CYPRESS_ATACB) || \
-		defined(CONFIG_USB_STORAGE_CYPRESS_ATACB_MODULE)
-
-/* CY7C68300 : support atacb */
-UNUSUAL_DEV(  0x04b4, 0x6830, 0x0000, 0x9999,
-		"Cypress",
-		"Cypress AT2LP",
-		USB_SC_CYP_ATACB, USB_PR_DEVICE, NULL, 0),
-
-/* CY7C68310 : support atacb and atacb2 */
-UNUSUAL_DEV(  0x04b4, 0x6831, 0x0000, 0x9999,
-		"Cypress",
-		"Cypress ISD-300LP",
-		USB_SC_CYP_ATACB, USB_PR_DEVICE, NULL, 0),
-
-UNUSUAL_DEV( 0x14cd, 0x6116, 0x0150, 0x0160,
-		"Super Top",
-		"USB 2.0  SATA BRIDGE",
-		USB_SC_CYP_ATACB, USB_PR_DEVICE, NULL, 0),
-
-#endif /* defined(CONFIG_USB_STORAGE_CYPRESS_ATACB) || ... */
+_SHIFT 0x1d
+#define D2F1_SECONDARY_STATUS__RECEIVED_SYSTEM_ERROR_MASK 0x40000000
+#define D2F1_SECONDARY_STATUS__RECEIVED_SYSTEM_ERROR__SHIFT 0x1e
+#define D2F1_SECONDARY_STATUS__PARITY_ERROR_DETECTED_MASK 0x80000000
+#define D2F1_SECONDARY_STATUS__PARITY_ERROR_DETECTED__SHIFT 0x1f
+#define D2F1_MEM_BASE_LIMIT__MEM_BASE_TYPE_MASK 0xf
+#define D2F1_MEM_BASE_LIMIT__MEM_BASE_TYPE__SHIFT 0x0
+#define D2F1_MEM_BASE_LIMIT__MEM_BASE_31_20_MASK 0xfff0
+#define D2F1_MEM_BASE_LIMIT__MEM_BASE_31_20__SHIFT 0x4
+#define D2F1_MEM_BASE_LIMIT__MEM_LIMIT_TYPE_MASK 0xf0000
+#define D2F1_MEM_BASE_LIMIT__MEM_LIMIT_TYPE__SHIFT 0x10
+#define D2F1_MEM_BASE_LIMIT__MEM_LIMIT_31_20_MASK 0xfff00000
+#define D2F1_MEM_BASE_LIMIT__MEM_LIMIT_31_20__SHIFT 0x14
+#define D2F1_PREF_BASE_LIMIT__PREF_MEM_BASE_TYPE_MASK 0xf
+#define D2F1_PREF_BASE_LIMIT__PREF_MEM_BASE_TYPE__SHIFT 0x0
+#define D2F1_PREF_BASE_LIMIT__PREF_MEM_BASE_31_20_MASK 0xfff0
+#define D2F1_PREF_BASE_LIMIT__PREF_MEM_BASE_31_20__SHIFT 0x4
+#define D2F1_PREF_BASE_LIMIT__PREF_MEM_LIMIT_TYPE_MASK 0xf0000
+#define D2F1_PREF_BASE_LIMIT__PREF_MEM_LIMIT_TYPE__SHIFT 0x10
+#define D2F1_PREF_BASE_LIMIT__PREF_MEM_LIMIT_31_20_MASK 0xfff00000
+#define D2F1_PREF_BASE_LIMIT__PREF_MEM_LIMIT_31_20__SHIFT 0x14
+#define D2F1_PREF_BASE_UPPER__PREF_BASE_UPPER_MASK 0xffffffff
+#define D2F1_PREF_BASE_UPPER__PREF_BASE_UPPER__SHIFT 0x0
+#define D2F1_PREF_LIMIT_UPPER__PREF_LIMIT_UPPER_MASK 0xffffffff
+#defi

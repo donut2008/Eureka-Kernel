@@ -1,36 +1,17 @@
-/* Unusual Devices File for the Maxtor OneTouch USB hard drive's button
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if defined(CONFIG_USB_STORAGE_ONETOUCH) || \
-		defined(CONFIG_USB_STORAGE_ONETOUCH_MODULE)
-
-/* Submitted by: Nick Sillik <n.sillik@temple.edu>
- * Needed for OneTouch extension to usb-storage
- */
-UNUSUAL_DEV(  0x0d49, 0x7000, 0x0000, 0x9999,
-		"Maxtor",
-		"OneTouch External Harddrive",
-		USB_SC_DEVICE, USB_PR_DEVICE, onetouch_connect_input,
-		0),
-
-UNUSUAL_DEV(  0x0d49, 0x7010, 0x0000, 0x9999,
-		"Maxtor",
-		"OneTouch External Harddrive",
-		USB_SC_DEVICE, USB_PR_DEVICE, onetouch_connect_input,
-		0),
-
-#endif /* defined(CONFIG_USB_STORAGE_ONETOUCH) || ... */
+                       0x25
+#define ixD2F5_PCIE_TX_ACK_LATENCY_LIMIT                                        0x26
+#define ixD2F5_PCIE_TX_CREDITS_ADVT_P                                           0x30
+#define ixD2F5_PCIE_TX_CREDITS_ADVT_NP                                          0x31
+#define ixD2F5_PCIE_TX_CREDITS_ADVT_CPL                                         0x32
+#define ixD2F5_PCIE_TX_CREDITS_INIT_P                                           0x33
+#define ixD2F5_PCIE_TX_CREDITS_INIT_NP                                          0x34
+#define ixD2F5_PCIE_TX_CREDITS_INIT_CPL                                         0x35
+#define ixD2F5_PCIE_TX_CREDITS_STATUS                                           0x36
+#define ixD2F5_PCIE_TX_CREDITS_FCU_THRESHOLD                                    0x37
+#define ixD2F5_PCIE_P_PORT_LANE_STATUS                                          0x50
+#define ixD2F5_PCIE_FC_P                                                        0x60
+#define ixD2F5_PCIE_FC_NP                                                       0x61
+#define ixD2F5_PCIE_FC_CPL                                                      0x62
+#define ixD2F5_PCIE_ERR_CNTL                                                    0x6a
+#define ixD2F5_PCIE_RX_CNTL                                                     0x70
+#define ixD2F5_PCIE_

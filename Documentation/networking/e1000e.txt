@@ -1,312 +1,422 @@
-Linux* Driver for Intel(R) Ethernet Network Connection
-======================================================
-
-Intel Gigabit Linux driver.
-Copyright(c) 1999 - 2013 Intel Corporation.
-
-Contents
-========
-
-- Identifying Your Adapter
-- Command Line Parameters
-- Additional Configurations
-- Support
-
-Identifying Your Adapter
-========================
-
-The e1000e driver supports all PCI Express Intel(R) Gigabit Network
-Connections, except those that are 82575, 82576 and 82580-based*.
-
-* NOTE: The Intel(R) PRO/1000 P Dual Port Server Adapter is supported by
-  the e1000 driver, not the e1000e driver due to the 82546 part being used
-  behind a PCI Express bridge.
-
-For more information on how to identify your adapter, go to the Adapter &
-Driver ID Guide at:
-
-    http://support.intel.com/support/go/network/adapter/idguide.htm
-
-For the latest Intel network drivers for Linux, refer to the following
-website.  In the search field, enter your adapter name or type, or use the
-networking link on the left to search for your adapter:
-
-    http://support.intel.com/support/go/network/adapter/home.htm
-
-Command Line Parameters
-=======================
-
-The default value for each parameter is generally the recommended setting,
-unless otherwise noted.
-
-NOTES:  For more information about the InterruptThrottleRate,
-        RxIntDelay, TxIntDelay, RxAbsIntDelay, and TxAbsIntDelay
-        parameters, see the application note at:
-        http://www.intel.com/design/network/applnots/ap450.htm
-
-InterruptThrottleRate
----------------------
-Valid Range:   0,1,3,4,100-100000 (0=off, 1=dynamic, 3=dynamic conservative,
-                                   4=simplified balancing)
-Default Value: 3
-
-The driver can limit the amount of interrupts per second that the adapter
-will generate for incoming packets. It does this by writing a value to the
-adapter that is based on the maximum amount of interrupts that the adapter
-will generate per second.
-
-Setting InterruptThrottleRate to a value greater or equal to 100
-will program the adapter to send out a maximum of that many interrupts
-per second, even if more packets have come in. This reduces interrupt
-load on the system and can lower CPU utilization under heavy load,
-but will increase latency as packets are not processed as quickly.
-
-The default behaviour of the driver previously assumed a static
-InterruptThrottleRate value of 8000, providing a good fallback value for
-all traffic types, but lacking in small packet performance and latency.
-The hardware can handle many more small packets per second however, and
-for this reason an adaptive interrupt moderation algorithm was implemented.
-
-The driver has two adaptive modes (setting 1 or 3) in which
-it dynamically adjusts the InterruptThrottleRate value based on the traffic
-that it receives. After determining the type of incoming traffic in the last
-timeframe, it will adjust the InterruptThrottleRate to an appropriate value
-for that traffic.
-
-The algorithm classifies the incoming traffic every interval into
-classes.  Once the class is determined, the InterruptThrottleRate value is
-adjusted to suit that traffic type the best. There are three classes defined:
-"Bulk traffic", for large amounts of packets of normal size; "Low latency",
-for small amounts of traffic and/or a significant percentage of small
-packets; and "Lowest latency", for almost completely small packets or
-minimal traffic.
-
-In dynamic conservative mode, the InterruptThrottleRate value is set to 4000
-for traffic that falls in class "Bulk traffic". If traffic falls in the "Low
-latency" or "Lowest latency" class, the InterruptThrottleRate is increased
-stepwise to 20000. This default mode is suitable for most applications.
-
-For situations where low latency is vital such as cluster or
-grid computing, the algorithm can reduce latency even more when
-InterruptThrottleRate is set to mode 1. In this mode, which operates
-the same as mode 3, the InterruptThrottleRate will be increased stepwise to
-70000 for traffic in class "Lowest latency".
-
-In simplified mode the interrupt rate is based on the ratio of TX and
-RX traffic.  If the bytes per second rate is approximately equal, the
-interrupt rate will drop as low as 2000 interrupts per second.  If the
-traffic is mostly transmit or mostly receive, the interrupt rate could
-be as high as 8000.
-
-Setting InterruptThrottleRate to 0 turns off any interrupt moderation
-and may improve small packet latency, but is generally not suitable
-for bulk throughput traffic.
-
-NOTE:  InterruptThrottleRate takes precedence over the TxAbsIntDelay and
-       RxAbsIntDelay parameters.  In other words, minimizing the receive
-       and/or transmit absolute delays does not force the controller to
-       generate more interrupts than what the Interrupt Throttle Rate
-       allows.
-
-NOTE:  When e1000e is loaded with default settings and multiple adapters
-       are in use simultaneously, the CPU utilization may increase non-
-       linearly.  In order to limit the CPU utilization without impacting
-       the overall throughput, we recommend that you load the driver as
-       follows:
-
-           modprobe e1000e InterruptThrottleRate=3000,3000,3000
-
-       This sets the InterruptThrottleRate to 3000 interrupts/sec for
-       the first, second, and third instances of the driver.  The range
-       of 2000 to 3000 interrupts per second works on a majority of
-       systems and is a good starting point, but the optimal value will
-       be platform-specific.  If CPU utilization is not a concern, use
-       RX_POLLING (NAPI) and default driver settings.
-
-RxIntDelay
-----------
-Valid Range:   0-65535 (0=off)
-Default Value: 0
-
-This value delays the generation of receive interrupts in units of 1.024
-microseconds.  Receive interrupt reduction can improve CPU efficiency if
-properly tuned for specific network traffic.  Increasing this value adds
-extra latency to frame reception and can end up decreasing the throughput
-of TCP traffic.  If the system is reporting dropped receives, this value
-may be set too high, causing the driver to run out of available receive
-descriptors.
-
-CAUTION:  When setting RxIntDelay to a value other than 0, adapters may
-          hang (stop transmitting) under certain network conditions.  If
-          this occurs a NETDEV WATCHDOG message is logged in the system
-          event log.  In addition, the controller is automatically reset,
-          restoring the network connection.  To eliminate the potential
-          for the hang ensure that RxIntDelay is set to 0.
-
-RxAbsIntDelay
--------------
-Valid Range:   0-65535 (0=off)
-Default Value: 8
-
-This value, in units of 1.024 microseconds, limits the delay in which a
-receive interrupt is generated.  Useful only if RxIntDelay is non-zero,
-this value ensures that an interrupt is generated after the initial
-packet is received within the set amount of time.  Proper tuning,
-along with RxIntDelay, may improve traffic throughput in specific network
-conditions.
-
-TxIntDelay
-----------
-Valid Range:   0-65535 (0=off)
-Default Value: 8
-
-This value delays the generation of transmit interrupts in units of
-1.024 microseconds.  Transmit interrupt reduction can improve CPU
-efficiency if properly tuned for specific network traffic.  If the
-system is reporting dropped transmits, this value may be set too high
-causing the driver to run out of available transmit descriptors.
-
-TxAbsIntDelay
--------------
-Valid Range:   0-65535 (0=off)
-Default Value: 32
-
-This value, in units of 1.024 microseconds, limits the delay in which a
-transmit interrupt is generated.  Useful only if TxIntDelay is non-zero,
-this value ensures that an interrupt is generated after the initial
-packet is sent on the wire within the set amount of time.  Proper tuning,
-along with TxIntDelay, may improve traffic throughput in specific
-network conditions.
-
-Copybreak
----------
-Valid Range:   0-xxxxxxx (0=off)
-Default Value: 256
-
-Driver copies all packets below or equaling this size to a fresh RX
-buffer before handing it up the stack.
-
-This parameter is different than other parameters, in that it is a
-single (not 1,1,1 etc.) parameter applied to all driver instances and
-it is also available during runtime at
-/sys/module/e1000e/parameters/copybreak
-
-SmartPowerDownEnable
---------------------
-Valid Range: 0-1
-Default Value:  0 (disabled)
-
-Allows PHY to turn off in lower power states. The user can set this parameter
-in supported chipsets.
-
-KumeranLockLoss
----------------
-Valid Range: 0-1
-Default Value: 1 (enabled)
-
-This workaround skips resetting the PHY at shutdown for the initial
-silicon releases of ICH8 systems.
-
-IntMode
--------
-Valid Range: 0-2 (0=legacy, 1=MSI, 2=MSI-X)
-Default Value: 2
-
-Allows changing the interrupt mode at module load time, without requiring a
-recompile. If the driver load fails to enable a specific interrupt mode, the
-driver will try other interrupt modes, from least to most compatible.  The
-interrupt order is MSI-X, MSI, Legacy.  If specifying MSI (IntMode=1)
-interrupts, only MSI and Legacy will be attempted.
-
-CrcStripping
-------------
-Valid Range: 0-1
-Default Value: 1 (enabled)
-
-Strip the CRC from received packets before sending up the network stack.  If
-you have a machine with a BMC enabled but cannot receive IPMI traffic after
-loading or enabling the driver, try disabling this feature.
-
-WriteProtectNVM
----------------
-Valid Range: 0,1
-Default Value: 1
-
-If set to 1, configure the hardware to ignore all write/erase cycles to the
-GbE region in the ICHx NVM (in order to prevent accidental corruption of the
-NVM). This feature can be disabled by setting the parameter to 0 during initial
-driver load.
-NOTE: The machine must be power cycled (full off/on) when enabling NVM writes
-via setting the parameter to zero. Once the NVM has been locked (via the
-parameter at 1 when the driver loads) it cannot be unlocked except via power
-cycle.
-
-Additional Configurations
-=========================
-
-  Jumbo Frames
-  ------------
-  Jumbo Frames support is enabled by changing the MTU to a value larger than
-  the default of 1500.  Use the ifconfig command to increase the MTU size.
-  For example:
-
-       ifconfig eth<x> mtu 9000 up
-
-  This setting is not saved across reboots.
-
-  Notes:
-
-  - The maximum MTU setting for Jumbo Frames is 9216.  This value coincides
-    with the maximum Jumbo Frames size of 9234 bytes.
-
-  - Using Jumbo frames at 10 or 100 Mbps is not supported and may result in
-    poor performance or loss of link.
-
-  - Some adapters limit Jumbo Frames sized packets to a maximum of
-    4096 bytes and some adapters do not support Jumbo Frames.
-
-  - Jumbo Frames cannot be configured on an 82579-based Network device, if
-    MACSec is enabled on the system.
-
-  ethtool
-  -------
-  The driver utilizes the ethtool interface for driver configuration and
-  diagnostics, as well as displaying statistical information.  We
-  strongly recommend downloading the latest version of ethtool at:
-
-  http://ftp.kernel.org/pub/software/network/ethtool/
-
-  NOTE: When validating enable/disable tests on some parts (82578, for example)
-  you need to add a few seconds between tests when working with ethtool.
-
-  Speed and Duplex
-  ----------------
-  Speed and Duplex are configured through the ethtool* utility. For
-  instructions,  refer to the ethtool man page.
-
-  Enabling Wake on LAN* (WoL)
-  ---------------------------
-  WoL is configured through the ethtool* utility. For instructions on
-  enabling WoL with ethtool, refer to the ethtool man page.
-
-  WoL will be enabled on the system during the next shut down or reboot.
-  For this driver version, in order to enable WoL, the e1000e driver must be
-  loaded when shutting down or rebooting the system.
-
-  In most cases Wake On LAN is only supported on port A for multiple port
-  adapters. To verify if a port supports Wake on Lan run ethtool eth<X>.
-
-Support
-=======
-
-For general information, go to the Intel support website at:
-
-    www.intel.com/support/
-
-or the Intel Wired Networking project hosted by Sourceforge at:
-
-    http://sourceforge.net/projects/e1000
-
-If an issue is identified with the released source code on the supported
-kernel with a supported adapter, email the specific information related
-to the issue to e1000-devel@lists.sf.net
+.
+ */
+static int
+ppc4xx_edac_generate_lane_message(const struct mem_ctl_info *mci,
+				  const struct ppc4xx_ecc_status *status,
+				  char *buffer,
+				  size_t size)
+{
+	int n, total = 0;
+	unsigned int lane, lanes;
+	const unsigned int first_lane = 0;
+	const unsigned int lane_count = 16;
+
+	n = snprintf(buffer, size, "; Byte Lane Errors: ");
+
+	if (n < 0 || n >= size)
+		goto fail;
+
+	buffer += n;
+	size -= n;
+	total += n;
+
+	for (lanes = 0, lane = first_lane; lane < lane_count; lane++) {
+		if ((status->ecces & SDRAM_ECCES_BNCE_ENCODE(lane)) != 0) {
+			n = snprintf(buffer, size,
+				     "%s%u",
+				     (lanes++ ? ", " : ""), lane);
+
+			if (n < 0 || n >= size)
+				goto fail;
+
+			buffer += n;
+			size -= n;
+			total += n;
+		}
+	}
+
+	n = snprintf(buffer, size, "%s; ", lanes ? "" : "None");
+
+	if (n < 0 || n >= size)
+		goto fail;
+
+	buffer += n;
+	size -= n;
+	total += n;
+
+ fail:
+	return total;
+}
+
+/**
+ * ppc4xx_edac_generate_ecc_message - generate interpretted ECC status message
+ * @mci: A pointer to the EDAC memory controller instance associated
+ *       with the ECCES message being generated.
+ * @status: A pointer to the ECC status structure to generate the
+ *          message from.
+ * @buffer: A pointer to the buffer in which to generate the
+ *          message.
+ * @size: The size, in bytes, of space available in buffer.
+ *
+ * This routine generates to the provided buffer the portion of the
+ * driver-unique report message associated with the ECCESS register of
+ * the specified ECC status.
+ *
+ * Returns the number of characters generated on success; otherwise, <
+ * 0 on error.
+ */
+static int
+ppc4xx_edac_generate_ecc_message(const struct mem_ctl_info *mci,
+				 const struct ppc4xx_ecc_status *status,
+				 char *buffer,
+				 size_t size)
+{
+	int n, total = 0;
+
+	n = ppc4xx_edac_generate_bank_message(mci, status, buffer, size);
+
+	if (n < 0 || n >= size)
+		goto fail;
+
+	buffer += n;
+	size -= n;
+	total += n;
+
+	n = ppc4xx_edac_generate_checkbit_message(mci, status, buffer, size);
+
+	if (n < 0 || n >= size)
+		goto fail;
+
+	buffer += n;
+	size -= n;
+	total += n;
+
+	n = ppc4xx_edac_generate_lane_message(mci, status, buffer, size);
+
+	if (n < 0 || n >= size)
+		goto fail;
+
+	buffer += n;
+	size -= n;
+	total += n;
+
+ fail:
+	return total;
+}
+
+/**
+ * ppc4xx_edac_generate_plb_message - generate interpretted PLB status message
+ * @mci: A pointer to the EDAC memory controller instance associated
+ *       with the PLB message being generated.
+ * @status: A pointer to the ECC status structure to generate the
+ *          message from.
+ * @buffer: A pointer to the buffer in which to generate the
+ *          message.
+ * @size: The size, in bytes, of space available in buffer.
+ *
+ * This routine generates to the provided buffer the portion of the
+ * driver-unique report message associated with the PLB-related BESR
+ * and/or WMIRQ registers of the specified ECC status.
+ *
+ * Returns the number of characters generated on success; otherwise, <
+ * 0 on error.
+ */
+static int
+ppc4xx_edac_generate_plb_message(const struct mem_ctl_info *mci,
+				 const struct ppc4xx_ecc_status *status,
+				 char *buffer,
+				 size_t size)
+{
+	unsigned int master;
+	bool read;
+
+	if ((status->besr & SDRAM_BESR_MASK) == 0)
+		return 0;
+
+	if ((status->besr & SDRAM_BESR_M0ET_MASK) == SDRAM_BESR_M0ET_NONE)
+		return 0;
+
+	read = ((status->besr & SDRAM_BESR_M0RW_MASK) == SDRAM_BESR_M0RW_READ);
+
+	master = SDRAM_BESR_M0ID_DECODE(status->besr);
+
+	return snprintf(buffer, size,
+			"%s error w/ PLB master %u \"%s\"; ",
+			(read ? "Read" : "Write"),
+			master,
+			(((master >= SDRAM_PLB_M0ID_FIRST) &&
+			  (master <= SDRAM_PLB_M0ID_LAST)) ?
+			 ppc4xx_plb_masters[master] : "UNKNOWN"));
+}
+
+/**
+ * ppc4xx_edac_generate_message - generate interpretted status message
+ * @mci: A pointer to the EDAC memory controller instance associated
+ *       with the driver-unique message being generated.
+ * @status: A pointer to the ECC status structure to generate the
+ *          message from.
+ * @buffer: A pointer to the buffer in which to generate the
+ *          message.
+ * @size: The size, in bytes, of space available in buffer.
+ *
+ * This routine generates to the provided buffer the driver-unique
+ * EDAC report message from the specified ECC status.
+ */
+static void
+ppc4xx_edac_generate_message(const struct mem_ctl_info *mci,
+			     const struct ppc4xx_ecc_status *status,
+			     char *buffer,
+			     size_t size)
+{
+	int n;
+
+	if (buffer == NULL || size == 0)
+		return;
+
+	n = ppc4xx_edac_generate_ecc_message(mci, status, buffer, size);
+
+	if (n < 0 || n >= size)
+		return;
+
+	buffer += n;
+	size -= n;
+
+	ppc4xx_edac_generate_plb_message(mci, status, buffer, size);
+}
+
+#ifdef DEBUG
+/**
+ * ppc4xx_ecc_dump_status - dump controller ECC status registers
+ * @mci: A pointer to the EDAC memory controller instance
+ *       associated with the status being dumped.
+ * @status: A pointer to the ECC status structure to generate the
+ *          dump from.
+ *
+ * This routine dumps to the kernel log buffer the raw and
+ * interpretted specified ECC status.
+ */
+static void
+ppc4xx_ecc_dump_status(const struct mem_ctl_info *mci,
+		       const struct ppc4xx_ecc_status *status)
+{
+	char message[PPC4XX_EDAC_MESSAGE_SIZE];
+
+	ppc4xx_edac_generate_message(mci, status, message, sizeof(message));
+
+	ppc4xx_edac_mc_printk(KERN_INFO, mci,
+			      "\n"
+			      "\tECCES: 0x%08x\n"
+			      "\tWMIRQ: 0x%08x\n"
+			      "\tBESR:  0x%08x\n"
+			      "\tBEAR:  0x%08x%08x\n"
+			      "\t%s\n",
+			      status->ecces,
+			      status->wmirq,
+			      status->besr,
+			      status->bearh,
+			      status->bearl,
+			      message);
+}
+#endif /* DEBUG */
+
+/**
+ * ppc4xx_ecc_get_status - get controller ECC status
+ * @mci: A pointer to the EDAC memory controller instance
+ *       associated with the status being retrieved.
+ * @status: A pointer to the ECC status structure to populate the
+ *          ECC status with.
+ *
+ * This routine reads and masks, as appropriate, all the relevant
+ * status registers that deal with ibm,sdram-4xx-ddr2 ECC errors.
+ * While we read all of them, for correctable errors, we only expect
+ * to deal with ECCES. For uncorrectable errors, we expect to deal
+ * with all of them.
+ */
+static void
+ppc4xx_ecc_get_status(const struct mem_ctl_info *mci,
+		      struct ppc4xx_ecc_status *status)
+{
+	const struct ppc4xx_edac_pdata *pdata = mci->pvt_info;
+	const dcr_host_t *dcr_host = &pdata->dcr_host;
+
+	status->ecces = mfsdram(dcr_host, SDRAM_ECCES) & SDRAM_ECCES_MASK;
+	status->wmirq = mfsdram(dcr_host, SDRAM_WMIRQ) & SDRAM_WMIRQ_MASK;
+	status->besr  = mfsdram(dcr_host, SDRAM_BESR)  & SDRAM_BESR_MASK;
+	status->bearl = mfsdram(dcr_host, SDRAM_BEARL);
+	status->bearh = mfsdram(dcr_host, SDRAM_BEARH);
+}
+
+/**
+ * ppc4xx_ecc_clear_status - clear controller ECC status
+ * @mci: A pointer to the EDAC memory controller instance
+ *       associated with the status being cleared.
+ * @status: A pointer to the ECC status structure containing the
+ *          values to write to clear the ECC status.
+ *
+ * This routine clears--by writing the masked (as appropriate) status
+ * values back to--the status registers that deal with
+ * ibm,sdram-4xx-ddr2 ECC errors.
+ */
+static void
+ppc4xx_ecc_clear_status(const struct mem_ctl_info *mci,
+			const struct ppc4xx_ecc_status *status)
+{
+	const struct ppc4xx_edac_pdata *pdata = mci->pvt_info;
+	const dcr_host_t *dcr_host = &pdata->dcr_host;
+
+	mtsdram(dcr_host, SDRAM_ECCES,	status->ecces & SDRAM_ECCES_MASK);
+	mtsdram(dcr_host, SDRAM_WMIRQ,	status->wmirq & SDRAM_WMIRQ_MASK);
+	mtsdram(dcr_host, SDRAM_BESR,	status->besr & SDRAM_BESR_MASK);
+	mtsdram(dcr_host, SDRAM_BEARL,	0);
+	mtsdram(dcr_host, SDRAM_BEARH,	0);
+}
+
+/**
+ * ppc4xx_edac_handle_ce - handle controller correctable ECC error (CE)
+ * @mci: A pointer to the EDAC memory controller instance
+ *       associated with the correctable error being handled and reported.
+ * @status: A pointer to the ECC status structure associated with
+ *          the correctable error being handled and reported.
+ *
+ * This routine handles an ibm,sdram-4xx-ddr2 controller ECC
+ * correctable error. Per the aforementioned discussion, there's not
+ * enough status available to use the full EDAC correctable error
+ * interface, so we just pass driver-unique message to the "no info"
+ * interface.
+ */
+static void
+ppc4xx_edac_handle_ce(struct mem_ctl_info *mci,
+		      const struct ppc4xx_ecc_status *status)
+{
+	int row;
+	char message[PPC4XX_EDAC_MESSAGE_SIZE];
+
+	ppc4xx_edac_generate_message(mci, status, message, sizeof(message));
+
+	for (row = 0; row < mci->nr_csrows; row++)
+		if (ppc4xx_edac_check_bank_error(status, row))
+			edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1,
+					     0, 0, 0,
+					     row, 0, -1,
+					     message, "");
+}
+
+/**
+ * ppc4xx_edac_handle_ue - handle controller uncorrectable ECC error (UE)
+ * @mci: A pointer to the EDAC memory controller instance
+ *       associated with the uncorrectable error being handled and
+ *       reported.
+ * @status: A pointer to the ECC status structure associated with
+ *          the uncorrectable error being handled and reported.
+ *
+ * This routine handles an ibm,sdram-4xx-ddr2 controller ECC
+ * uncorrectable error.
+ */
+static void
+ppc4xx_edac_handle_ue(struct mem_ctl_info *mci,
+		      const struct ppc4xx_ecc_status *status)
+{
+	const u64 bear = ((u64)status->bearh << 32 | status->bearl);
+	const unsigned long page = bear >> PAGE_SHIFT;
+	const unsigned long offset = bear & ~PAGE_MASK;
+	int row;
+	char message[PPC4XX_EDAC_MESSAGE_SIZE];
+
+	ppc4xx_edac_generate_message(mci, status, message, sizeof(message));
+
+	for (row = 0; row < mci->nr_csrows; row++)
+		if (ppc4xx_edac_check_bank_error(status, row))
+			edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1,
+					     page, offset, 0,
+					     row, 0, -1,
+					     message, "");
+}
+
+/**
+ * ppc4xx_edac_check - check controller for ECC errors
+ * @mci: A pointer to the EDAC memory controller instance
+ *       associated with the ibm,sdram-4xx-ddr2 controller being
+ *       checked.
+ *
+ * This routine is used to check and post ECC errors and is called by
+ * both the EDAC polling thread and this driver's CE and UE interrupt
+ * handler.
+ */
+static void
+ppc4xx_edac_check(struct mem_ctl_info *mci)
+{
+#ifdef DEBUG
+	static unsigned int count;
+#endif
+	struct ppc4xx_ecc_status status;
+
+	ppc4xx_ecc_get_status(mci, &status);
+
+#ifdef DEBUG
+	if (count++ % 30 == 0)
+		ppc4xx_ecc_dump_status(mci, &status);
+#endif
+
+	if (status.ecces & SDRAM_ECCES_UE)
+		ppc4xx_edac_handle_ue(mci, &status);
+
+	if (status.ecces & SDRAM_ECCES_CE)
+		ppc4xx_edac_handle_ce(mci, &status);
+
+	ppc4xx_ecc_clear_status(mci, &status);
+}
+
+/**
+ * ppc4xx_edac_isr - SEC (CE) and DED (UE) interrupt service routine
+ * @irq:    The virtual interrupt number being serviced.
+ * @dev_id: A pointer to the EDAC memory controller instance
+ *          associated with the interrupt being handled.
+ *
+ * This routine implements the interrupt handler for both correctable
+ * (CE) and uncorrectable (UE) ECC errors for the ibm,sdram-4xx-ddr2
+ * controller. It simply calls through to the same routine used during
+ * polling to check, report and clear the ECC status.
+ *
+ * Unconditionally returns IRQ_HANDLED.
+ */
+static irqreturn_t
+ppc4xx_edac_isr(int irq, void *dev_id)
+{
+	struct mem_ctl_info *mci = dev_id;
+
+	ppc4xx_edac_check(mci);
+
+	return IRQ_HANDLED;
+}
+
+/**
+ * ppc4xx_edac_get_dtype - return the controller memory width
+ * @mcopt1: The 32-bit Memory Controller Option 1 register value
+ *          currently set for the controller, from which the width
+ *          is derived.
+ *
+ * This routine returns the EDAC device type width appropriate for the
+ * current controller configuration.
+ *
+ * TODO: This needs to be conditioned dynamically through feature
+ * flags or some such when other controller variants are supported as
+ * the 405EX[r] is 16-/32-bit and the others are 32-/64-bit with the
+ * 16- and 64-bit field definition/value/enumeration (b1) overloaded
+ * among them.
+ *
+ * Returns a device type width enumeration.
+ */
+static enum dev_type ppc4xx_edac_get_dtype(u32 mcopt1)
+{
+	switch (mcopt1 & SDRAM_MCOPT1_WDTH_MASK) {
+	case SDRAM_MCOPT1_WDTH_16:
+		return DEV_X2;
+	case SDRAM_MCOPT1_WDTH_32:
+		return DEV_X4;
+	default:
+		return DEV_UNKNOWN;
+	}
+}
+
+/**
+ * ppc

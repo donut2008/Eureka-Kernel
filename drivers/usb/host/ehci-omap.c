@@ -1,328 +1,101 @@
-/*
- * ehci-omap.c - driver for USBHOST on OMAP3/4 processors
- *
- * Bus Glue for the EHCI controllers in OMAP3/4
- * Tested on several OMAP3 boards, and OMAP4 Pandaboard
- *
- * Copyright (C) 2007-2013 Texas Instruments, Inc.
- *	Author: Vikram Pandita <vikram.pandita@ti.com>
- *	Author: Anand Gadiyar <gadiyar@ti.com>
- *	Author: Keshava Munegowda <keshava_mgowda@ti.com>
- *	Author: Roger Quadros <rogerq@ti.com>
- *
- * Copyright (C) 2009 Nokia Corporation
- *	Contact: Felipe Balbi <felipe.balbi@nokia.com>
- *
- * Based on "ehci-fsl.c" and "ehci-au1xxx.c" ehci glue layers
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/io.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-#include <linux/usb/ulpi.h>
-#include <linux/pm_runtime.h>
-#include <linux/gpio.h>
-#include <linux/clk.h>
-#include <linux/usb.h>
-#include <linux/usb/hcd.h>
-#include <linux/of.h>
-#include <linux/dma-mapping.h>
-
-#include "ehci.h"
-
-#include <linux/platform_data/usb-omap.h>
-
-/* EHCI Register Set */
-#define EHCI_INSNREG04					(0xA0)
-#define EHCI_INSNREG04_DISABLE_UNSUSPEND		(1 << 5)
-#define	EHCI_INSNREG05_ULPI				(0xA4)
-#define	EHCI_INSNREG05_ULPI_CONTROL_SHIFT		31
-#define	EHCI_INSNREG05_ULPI_PORTSEL_SHIFT		24
-#define	EHCI_INSNREG05_ULPI_OPSEL_SHIFT			22
-#define	EHCI_INSNREG05_ULPI_REGADD_SHIFT		16
-#define	EHCI_INSNREG05_ULPI_EXTREGADD_SHIFT		8
-#define	EHCI_INSNREG05_ULPI_WRDATA_SHIFT		0
-
-#define DRIVER_DESC "OMAP-EHCI Host Controller driver"
-
-static const char hcd_name[] = "ehci-omap";
-
-/*-------------------------------------------------------------------------*/
-
-struct omap_hcd {
-	struct usb_phy *phy[OMAP3_HS_USB_PORTS]; /* one PHY for each port */
-	int nports;
-};
-
-static inline void ehci_write(void __iomem *base, u32 reg, u32 val)
-{
-	__raw_writel(val, base + reg);
-}
-
-static inline u32 ehci_read(void __iomem *base, u32 reg)
-{
-	return __raw_readl(base + reg);
-}
-
-/* configure so an HC device and id are always provided */
-/* always called with process context; sleeping is OK */
-
-static struct hc_driver __read_mostly ehci_omap_hc_driver;
-
-static const struct ehci_driver_overrides ehci_omap_overrides __initdata = {
-	.extra_priv_size = sizeof(struct omap_hcd),
-};
-
-/**
- * ehci_hcd_omap_probe - initialize TI-based HCDs
- *
- * Allocates basic resources for this USB host controller, and
- * then invokes the start() method for the HCD associated with it
- * through the hotplug entry's driver_data.
- */
-static int ehci_hcd_omap_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct usbhs_omap_platform_data *pdata = dev_get_platdata(dev);
-	struct resource	*res;
-	struct usb_hcd	*hcd;
-	void __iomem *regs;
-	int ret;
-	int irq;
-	int i;
-	struct omap_hcd	*omap;
-
-	if (usb_disabled())
-		return -ENODEV;
-
-	if (!dev->parent) {
-		dev_err(dev, "Missing parent device\n");
-		return -ENODEV;
-	}
-
-	/* For DT boot, get platform data from parent. i.e. usbhshost */
-	if (dev->of_node) {
-		pdata = dev_get_platdata(dev->parent);
-		dev->platform_data = pdata;
-	}
-
-	if (!pdata) {
-		dev_err(dev, "Missing platform data\n");
-		return -ENODEV;
-	}
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(dev, "EHCI irq failed: %d\n", irq);
-		return irq;
-	}
-
-	res =  platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	regs = devm_ioremap_resource(dev, res);
-	if (IS_ERR(regs))
-		return PTR_ERR(regs);
-
-	/*
-	 * Right now device-tree probed devices don't get dma_mask set.
-	 * Since shared usb code relies on it, set it here for now.
-	 * Once we have dma capability bindings this can go away.
-	 */
-	ret = dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32));
-	if (ret)
-		return ret;
-
-	ret = -ENODEV;
-	hcd = usb_create_hcd(&ehci_omap_hc_driver, dev,
-			dev_name(dev));
-	if (!hcd) {
-		dev_err(dev, "Failed to create HCD\n");
-		return -ENOMEM;
-	}
-
-	hcd->rsrc_start = res->start;
-	hcd->rsrc_len = resource_size(res);
-	hcd->regs = regs;
-	hcd_to_ehci(hcd)->caps = regs;
-
-	omap = (struct omap_hcd *)hcd_to_ehci(hcd)->priv;
-	omap->nports = pdata->nports;
-
-	platform_set_drvdata(pdev, hcd);
-
-	/* get the PHY devices if needed */
-	for (i = 0 ; i < omap->nports ; i++) {
-		struct usb_phy *phy;
-
-		/* get the PHY device */
-		if (dev->of_node)
-			phy = devm_usb_get_phy_by_phandle(dev, "phys", i);
-		else
-			phy = devm_usb_get_phy_dev(dev, i);
-		if (IS_ERR(phy)) {
-			/* Don't bail out if PHY is not absolutely necessary */
-			if (pdata->port_mode[i] != OMAP_EHCI_PORT_MODE_PHY)
-				continue;
-
-			ret = PTR_ERR(phy);
-			dev_err(dev, "Can't get PHY device for port %d: %d\n",
-					i, ret);
-			goto err_phy;
-		}
-
-		omap->phy[i] = phy;
-
-		if (pdata->port_mode[i] == OMAP_EHCI_PORT_MODE_PHY) {
-			usb_phy_init(omap->phy[i]);
-			/* bring PHY out of suspend */
-			usb_phy_set_suspend(omap->phy[i], 0);
-		}
-	}
-
-	pm_runtime_enable(dev);
-	pm_runtime_get_sync(dev);
-
-	/*
-	 * An undocumented "feature" in the OMAP3 EHCI controller,
-	 * causes suspended ports to be taken out of suspend when
-	 * the USBCMD.Run/Stop bit is cleared (for example when
-	 * we do ehci_bus_suspend).
-	 * This breaks suspend-resume if the root-hub is allowed
-	 * to suspend. Writing 1 to this undocumented register bit
-	 * disables this feature and restores normal behavior.
-	 */
-	ehci_write(regs, EHCI_INSNREG04,
-				EHCI_INSNREG04_DISABLE_UNSUSPEND);
-
-	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
-	if (ret) {
-		dev_err(dev, "failed to add hcd with err %d\n", ret);
-		goto err_pm_runtime;
-	}
-	device_wakeup_enable(hcd->self.controller);
-
-	/*
-	 * Bring PHYs out of reset for non PHY modes.
-	 * Even though HSIC mode is a PHY-less mode, the reset
-	 * line exists between the chips and can be modelled
-	 * as a PHY device for reset control.
-	 */
-	for (i = 0; i < omap->nports; i++) {
-		if (!omap->phy[i] ||
-		     pdata->port_mode[i] == OMAP_EHCI_PORT_MODE_PHY)
-			continue;
-
-		usb_phy_init(omap->phy[i]);
-		/* bring PHY out of suspend */
-		usb_phy_set_suspend(omap->phy[i], 0);
-	}
-
-	return 0;
-
-err_pm_runtime:
-	pm_runtime_put_sync(dev);
-	pm_runtime_disable(dev);
-
-err_phy:
-	for (i = 0; i < omap->nports; i++) {
-		if (omap->phy[i])
-			usb_phy_shutdown(omap->phy[i]);
-	}
-
-	usb_put_hcd(hcd);
-
-	return ret;
-}
-
-
-/**
- * ehci_hcd_omap_remove - shutdown processing for EHCI HCDs
- * @pdev: USB Host Controller being removed
- *
- * Reverses the effect of usb_ehci_hcd_omap_probe(), first invoking
- * the HCD's stop() method.  It is always called from a thread
- * context, normally "rmmod", "apmd", or something similar.
- */
-static int ehci_hcd_omap_remove(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-	struct omap_hcd *omap = (struct omap_hcd *)hcd_to_ehci(hcd)->priv;
-	int i;
-
-	usb_remove_hcd(hcd);
-
-	for (i = 0; i < omap->nports; i++) {
-		if (omap->phy[i])
-			usb_phy_shutdown(omap->phy[i]);
-	}
-
-	usb_put_hcd(hcd);
-	pm_runtime_put_sync(dev);
-	pm_runtime_disable(dev);
-
-	return 0;
-}
-
-static const struct of_device_id omap_ehci_dt_ids[] = {
-	{ .compatible = "ti,ehci-omap" },
-	{ }
-};
-
-MODULE_DEVICE_TABLE(of, omap_ehci_dt_ids);
-
-static struct platform_driver ehci_hcd_omap_driver = {
-	.probe			= ehci_hcd_omap_probe,
-	.remove			= ehci_hcd_omap_remove,
-	.shutdown		= usb_hcd_platform_shutdown,
-	/*.suspend		= ehci_hcd_omap_suspend, */
-	/*.resume		= ehci_hcd_omap_resume, */
-	.driver = {
-		.name		= hcd_name,
-		.of_match_table = omap_ehci_dt_ids,
-	}
-};
-
-/*-------------------------------------------------------------------------*/
-
-static int __init ehci_omap_init(void)
-{
-	if (usb_disabled())
-		return -ENODEV;
-
-	pr_info("%s: " DRIVER_DESC "\n", hcd_name);
-
-	ehci_init_driver(&ehci_omap_hc_driver, &ehci_omap_overrides);
-	return platform_driver_register(&ehci_hcd_omap_driver);
-}
-module_init(ehci_omap_init);
-
-static void __exit ehci_omap_cleanup(void)
-{
-	platform_driver_unregister(&ehci_hcd_omap_driver);
-}
-module_exit(ehci_omap_cleanup);
-
-MODULE_ALIAS("platform:ehci-omap");
-MODULE_AUTHOR("Texas Instruments, Inc.");
-MODULE_AUTHOR("Felipe Balbi <felipe.balbi@nokia.com>");
-MODULE_AUTHOR("Roger Quadros <rogerq@ti.com>");
-
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+mDMIF_PG6_DPG_PIPE_NB_PSTATE_CHANGE_CONTROL                            0x4736
+#define mmDPG_PIPE_STUTTER_CONTROL_NONLPTCH                                     0x1b37
+#define mmDMIF_PG0_DPG_PIPE_STUTTER_CONTROL_NONLPTCH                            0x1b37
+#define mmDMIF_PG1_DPG_PIPE_STUTTER_CONTROL_NONLPTCH                            0x1d37
+#define mmDMIF_PG2_DPG_PIPE_STUTTER_CONTROL_NONLPTCH                            0x1f37
+#define mmDMIF_PG3_DPG_PIPE_STUTTER_CONTROL_NONLPTCH                            0x4137
+#define mmDMIF_PG4_DPG_PIPE_STUTTER_CONTROL_NONLPTCH                            0x4337
+#define mmDMIF_PG5_DPG_PIPE_STUTTER_CONTROL_NONLPTCH                            0x4537
+#define mmDMIF_PG6_DPG_PIPE_STUTTER_CONTROL_NONLPTCH                            0x4737
+#define mmDPG_REPEATER_PROGRAM                                                  0x1b3a
+#define mmDMIF_PG0_DPG_REPEATER_PROGRAM                                         0x1b3a
+#define mmDMIF_PG1_DPG_REPEATER_PROGRAM                                         0x1d3a
+#define mmDMIF_PG2_DPG_REPEATER_PROGRAM                                         0x1f3a
+#define mmDMIF_PG3_DPG_REPEATER_PROGRAM                                         0x413a
+#define mmDMIF_PG4_DPG_REPEATER_PROGRAM                                         0x433a
+#define mmDMIF_PG5_DPG_REPEATER_PROGRAM                                         0x453a
+#define mmDMIF_PG6_DPG_REPEATER_PROGRAM                                         0x473a
+#define mmDPG_HW_DEBUG_A                                                        0x1b3b
+#define mmDMIF_PG0_DPG_HW_DEBUG_A                                               0x1b3b
+#define mmDMIF_PG1_DPG_HW_DEBUG_A                                               0x1d3b
+#define mmDMIF_PG2_DPG_HW_DEBUG_A                                               0x1f3b
+#define mmDMIF_PG3_DPG_HW_DEBUG_A                                               0x413b
+#define mmDMIF_PG4_DPG_HW_DEBUG_A                                               0x433b
+#define mmDMIF_PG5_DPG_HW_DEBUG_A                                               0x453b
+#define mmDMIF_PG6_DPG_HW_DEBUG_A                                               0x473b
+#define mmDPG_HW_DEBUG_B                                                        0x1b3c
+#define mmDMIF_PG0_DPG_HW_DEBUG_B                                               0x1b3c
+#define mmDMIF_PG1_DPG_HW_DEBUG_B                                               0x1d3c
+#define mmDMIF_PG2_DPG_HW_DEBUG_B                                               0x1f3c
+#define mmDMIF_PG3_DPG_HW_DEBUG_B                                               0x413c
+#define mmDMIF_PG4_DPG_HW_DEBUG_B                                               0x433c
+#define mmDMIF_PG5_DPG_HW_DEBUG_B                                               0x453c
+#define mmDMIF_PG6_DPG_HW_DEBUG_B                                               0x473c
+#define mmDPG_HW_DEBUG_11                                                       0x1b3d
+#define mmDMIF_PG0_DPG_HW_DEBUG_11                                              0x1b3d
+#define mmDMIF_PG1_DPG_HW_DEBUG_11                                              0x1d3d
+#define mmDMIF_PG2_DPG_HW_DEBUG_11                                              0x1f3d
+#define mmDMIF_PG3_DPG_HW_DEBUG_11                                              0x413d
+#define mmDMIF_PG4_DPG_HW_DEBUG_11                                              0x433d
+#define mmDMIF_PG5_DPG_HW_DEBUG_11                                              0x453d
+#define mmDMIF_PG6_DPG_HW_DEBUG_11                                              0x473d
+#define mmDPG_TEST_DEBUG_INDEX                                                  0x1b38
+#define mmDMIF_PG0_DPG_TEST_DEBUG_INDEX                                         0x1b38
+#define mmDMIF_PG1_DPG_TEST_DEBUG_INDEX                                         0x1d38
+#define mmDMIF_PG2_DPG_TEST_DEBUG_INDEX                                         0x1f38
+#define mmDMIF_PG3_DPG_TEST_DEBUG_INDEX                                         0x4138
+#define mmDMIF_PG4_DPG_TEST_DEBUG_INDEX                                         0x4338
+#define mmDMIF_PG5_DPG_TEST_DEBUG_INDEX                                         0x4538
+#define mmDMIF_PG6_DPG_TEST_DEBUG_INDEX                                         0x4738
+#define mmDPG_TEST_DEBUG_DATA                                                   0x1b39
+#define mmDMIF_PG0_DPG_TEST_DEBUG_DATA                                          0x1b39
+#define mmDMIF_PG1_DPG_TEST_DEBUG_DATA                                          0x1d39
+#define mmDMIF_PG2_DPG_TEST_DEBUG_DATA                                          0x1f39
+#define mmDMIF_PG3_DPG_TEST_DEBUG_DATA                                          0x4139
+#define mmDMIF_PG4_DPG_TEST_DEBUG_DATA                                          0x4339
+#define mmDMIF_PG5_DPG_TEST_DEBUG_DATA                                          0x4539
+#define mmDMIF_PG6_DPG_TEST_DEBUG_DATA                                          0x4739
+#define mmAZROOT_IMMEDIATE_COMMAND_OUTPUT_INTERFACE_INDEX                       0x18
+#define mmAZROOT_IMMEDIATE_COMMAND_OUTPUT_INTERFACE_DATA                        0x18
+#define ixAZALIA_F2_CODEC_ROOT_PARAMETER_VENDOR_AND_DEVICE_ID                   0xf00
+#define ixAZALIA_F2_CODEC_ROOT_PARAMETER_REVISION_ID                            0xf02
+#define ixAZALIA_F2_CODEC_ROOT_PARAMETER_SUBORDINATE_NODE_COUNT                 0xf04
+#define ixAZALIA_F2_CODEC_FUNCTION_PARAMETER_SUBORDINATE_NODE_COUNT             0x1f04
+#define ixAZALIA_F2_CODEC_FUNCTION_PARAMETER_GROUP_TYPE                         0x1f05
+#define ixAZALIA_F2_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES               0x1f0a
+#define ixAZALIA_F2_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS                     0x1f0b
+#define ixAZALIA_F2_CODEC_FUNCTION_PARAMETER_POWER_STATES                       0x1f0f
+#define ixAZALIA_F2_CODEC_FUNCTION_CONTROL_POWER_STATE                          0x1705
+#define ixAZALIA_F2_CODEC_FUNCTION_CONTROL_RESET                                0x17ff
+#define ixAZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID                0x1720
+#define ixAZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_2              0x1721
+#define ixAZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_3              0x1722
+#define ixAZALIA_F2_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID_4              0x1723
+#define ixAZALIA_F2_CODEC_FUNCTION_CONTROL_CONVERTER_SYNCHRONIZATION            0x1770
+#define mmAZALIA_F0_CODEC_ROOT_PARAMETER_VENDOR_AND_DEVICE_ID                   0x1828
+#define mmAZALIA_F0_CODEC_ROOT_PARAMETER_REVISION_ID                            0x1829
+#define mmAZALIA_F0_CODEC_CHANNEL_COUNT_CONTROL                                 0x182a
+#define mmAZALIA_F0_CODEC_RESYNC_FIFO_CONTROL                                   0x182b
+#define mmAZALIA_F0_CODEC_FUNCTION_PARAMETER_GROUP_TYPE                         0x182c
+#define mmAZALIA_F0_CODEC_FUNCTION_PARAMETER_SUPPORTED_SIZE_RATES               0x182d
+#define mmAZALIA_F0_CODEC_FUNCTION_PARAMETER_STREAM_FORMATS                     0x182e
+#define mmAZALIA_F0_CODEC_FUNCTION_PARAMETER_POWER_STATES                       0x182f
+#define mmAZALIA_F0_CODEC_FUNCTION_CONTROL_POWER_STATE                          0x1830
+#define mmAZALIA_F0_CODEC_FUNCTION_CONTROL_RESET                                0x1831
+#define mmAZALIA_F0_CODEC_FUNCTION_CONTROL_RESPONSE_SUBSYSTEM_ID                0x1832
+#define mmAZALIA_F0_CODEC_FUNCTION_CONTROL_CONVERTER_SYNCHRONIZATION            0x1833
+#define mmCC_RCU_DC_AUDIO_PORT_CONNECTIVITY                                     0x1834
+#define mmCC_RCU_DC_AUDIO_INPUT_PORT_CONNECTIVITY                               0x1835
+#define mmAZALIA_F0_CODEC_DEBUG                                                 0x1836
+#define mmAZALIA_F0_GTC_GROUP_OFFSET0                                           0x1837
+#define mmAZALIA_F0_GTC_GROUP_OFFSET1                                           0x1838
+#define mmAZALIA_F0_GTC_GROUP_OFFSET2                                           0x1839
+#define mmAZALIA_F0_GTC_GROUP_OFFSET3                                           0x183a
+#define mmAZALIA_F0_GTC_GROUP_OFFSET4                                           0x183b
+#define mmAZALIA_F0_GTC_GROUP_OFFSET5                                           0x183c
+#define mmAZALIA_F0_GTC_GROUP_OFFSET6                                           0x183d
+#define mmGLOBAL_CAPABILITIES                                                   0x0
+#define mmMINOR_VERSION                                                         0x0
+#define mmMAJOR_VERSION                                                         0x0
+#define mmOUTPUT_PAYLOAD_CAPABILITY                                             0x1
+#define mmINPUT_PAYLOAD_CAPABILITY              

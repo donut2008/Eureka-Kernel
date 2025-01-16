@@ -1,265 +1,194 @@
-/*
- * twl4030-vibra.c - TWL4030 Vibrator driver
+ = (device_tree_infor + device_count);
+			const u32 *plevels = NULL;
+
+			// Geting label.
+			dt_infor->label = of_get_property(cnp, "input_booster,label", NULL);
+			printk("[Input Booster] %s   dt_infor->label : %s\n", __FUNCTION__, dt_infor->label);
+
+			if (of_property_read_u32(cnp, "input_booster,type", &dt_infor->type)) {
+				printk("Failed to get type property\n");
+				break;
+			}
+
+			// Geting the count of levels.
+			plevels = of_get_property(cnp, "input_booster,levels", &nlevels);
+
+			if (plevels && nlevels) {
+				dt_infor->nlevels = nlevels / sizeof(u32);
+				printk("[Input Booster] %s   dt_infor->nlevels : %d\n", __FUNCTION__, dt_infor->nlevels);
+			} else {
+				printk("Failed to calculate number of frequency.\n");
+				break;
+			}
+
+			// Allocation the param table.
+			dt_infor->param_tables = kcalloc(ABS_CNT, sizeof(struct t_input_booster_device_tree_param) * dt_infor->nlevels, GFP_KERNEL);
+			if (!dt_infor->param_tables) {
+				printk("Failed to allocate memory of freq_table\n");
+				break;
+			}
+
+			// fill the param table
+			pr_debug("[Input Booster] device_type:%d, label :%s, type: 0x%02x, num_level[%d]\n",
+				dt_infor->type, dt_infor->label, dt_infor->type, dt_infor->nlevels);
+
+			for (i = 0; i < dt_infor->nlevels; i++) {
+				u32 temp;
+				int err = 0;
+
+				err = of_property_read_u32_index(cnp, "input_booster,levels", i, &temp);  dt_infor->param_tables[i].ilevels = (u8)temp;
+				err |= of_property_read_u32_index(cnp, "input_booster,cpu_freqs", i, &dt_infor->param_tables[i].cpu_freq);
+				err |= of_property_read_u32_index(cnp, "input_booster,kfc_freqs", i, &dt_infor->param_tables[i].kfc_freq);
+				err |= of_property_read_u32_index(cnp, "input_booster,mif_freqs", i, &dt_infor->param_tables[i].mif_freq);
+				err |= of_property_read_u32_index(cnp, "input_booster,int_freqs", i, &dt_infor->param_tables[i].int_freq);
+				err |= of_property_read_u32_index(cnp, "input_booster,hmp_boost", i, &temp); dt_infor->param_tables[i].hmp_boost = (u8)temp;
+				err |= of_property_read_u32_index(cnp, "input_booster,head_times", i, &temp); dt_infor->param_tables[i].head_time = (u16)temp;
+				err |= of_property_read_u32_index(cnp, "input_booster,tail_times", i, &temp); dt_infor->param_tables[i].tail_time = (u16)temp;
+				err |= of_property_read_u32_index(cnp, "input_booster,phase_times", i, &temp); dt_infor->param_tables[i].phase_time = (u16)temp;
+				if (err) {
+					printk("Failed to get [%d] param table property\n", i);
+				}
+
+				printk("[Input Booster] Level %d : frequency[%d,%d,%d,%d] hmp_boost[%d] times[%d,%d,%d]\n", i,
+					dt_infor->param_tables[i].cpu_freq,
+					dt_infor->param_tables[i].kfc_freq,
+					dt_infor->param_tables[i].mif_freq,
+					dt_infor->param_tables[i].int_freq,
+					dt_infor->param_tables[i].hmp_boost,
+					dt_infor->param_tables[i].head_time,
+					dt_infor->param_tables[i].tail_time,
+					dt_infor->param_tables[i].phase_time);
+			}
+
+			device_count++;
+		}
+	}
+
+	// ********** Initialize Buffer for Touch **********
+	for(i=0;i<MAX_MULTI_TOUCH_EVENTS;i++) {
+		TouchIDs[i] = -1;
+	}
+
+	// ********** Initialize Booster **********
+	INIT_BOOSTER(touch)
+	INIT_BOOSTER(multitouch)
+	INIT_BOOSTER(key)
+	INIT_BOOSTER(touchkey)
+	INIT_BOOSTER(keyboard)
+	INIT_BOOSTER(mouse)
+	INIT_BOOSTER(mouse_wheel)
+	INIT_BOOSTER(pen)
+	INIT_BOOSTER(hover)
+	INIT_BOOSTER(key_two)
+	multitouch_booster.change_on_release = 1;
+
+	// ********** Initialize Sysfs **********
+	{
+		struct class *sysfs_class;
+
+		sysfs_class = class_create(THIS_MODULE, "input_booster");
+		if (IS_ERR(sysfs_class)) {
+			printk("[Input Booster] Failed to create class\n");
+			return;
+		}
+
+		INIT_SYSFS_CLASS(debug_level)
+		INIT_SYSFS_CLASS(head)
+		INIT_SYSFS_CLASS(tail)
+		INIT_SYSFS_CLASS(level)
+
+		INIT_SYSFS_DEVICE(touch)
+		INIT_SYSFS_DEVICE(multitouch)
+		INIT_SYSFS_DEVICE(key)
+		INIT_SYSFS_DEVICE(touchkey)
+		INIT_SYSFS_DEVICE(keyboard)
+		INIT_SYSFS_DEVICE(mouse)
+		INIT_SYSFS_DEVICE(mouse_wheel)
+		INIT_SYSFS_DEVICE(pen)
+		INIT_SYSFS_DEVICE(hover)
+		INIT_SYSFS_DEVICE(key_two)
+	}
+}
+#endif  // Input Booster -
+
+/**
+ * input_event() - report new input event
+ * @dev: device that generated the event
+ * @type: type of the event
+ * @code: event code
+ * @value: value of the event
  *
- * Copyright (C) 2008-2010 Nokia Corporation
+ * This function should be used by drivers implementing various input
+ * devices to report input events. See also input_inject_event().
  *
- * Written by Henrik Saari <henrik.saari@nokia.com>
- * Updates by Felipe Balbi <felipe.balbi@nokia.com>
- * Input by Jari Vanhala <ext-jari.vanhala@nokia.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
+ * NOTE: input_event() may be safely used right after input device was
+ * allocated with input_allocate_device(), even before it is registered
+ * with input_register_device(), but the event will not reach any of the
+ * input handlers. Such early invocation of input_event() may be used
+ * to 'seed' initial state of a switch or initial position of absolute
+ * axis, etc.
  */
-
-#include <linux/module.h>
-#include <linux/jiffies.h>
-#include <linux/platform_device.h>
-#include <linux/of.h>
-#include <linux/workqueue.h>
-#include <linux/i2c/twl.h>
-#include <linux/mfd/twl4030-audio.h>
-#include <linux/input.h>
-#include <linux/slab.h>
-
-/* MODULE ID2 */
-#define LEDEN		0x00
-
-/* ForceFeedback */
-#define EFFECT_DIR_180_DEG	0x8000 /* range is 0 - 0xFFFF */
-
-struct vibra_info {
-	struct device		*dev;
-	struct input_dev	*input_dev;
-
-	struct work_struct	play_work;
-
-	bool			enabled;
-	int			speed;
-	int			direction;
-
-	bool			coexist;
-};
-
-static void vibra_disable_leds(void)
+void input_event(struct input_dev *dev,
+		 unsigned int type, unsigned int code, int value)
 {
-	u8 reg;
+	unsigned long flags;
+	int idx;
 
-	/* Disable LEDA & LEDB, cannot be used with vibra (PWM) */
-	twl_i2c_read_u8(TWL4030_MODULE_LED, &reg, LEDEN);
-	reg &= ~0x03;
-	twl_i2c_write_u8(TWL4030_MODULE_LED, LEDEN, reg);
-}
+	if (is_event_supported(type, dev->evbit, EV_MAX)) {
 
-/* Powers H-Bridge and enables audio clk */
-static void vibra_enable(struct vibra_info *info)
-{
-	u8 reg;
+		spin_lock_irqsave(&dev->event_lock, flags);
+		input_handle_event(dev, type, code, value);
+		spin_unlock_irqrestore(&dev->event_lock, flags);
 
-	twl4030_audio_enable_resource(TWL4030_AUDIO_RES_POWER);
-
-	/* turn H-Bridge on */
-	twl_i2c_read_u8(TWL4030_MODULE_AUDIO_VOICE,
-			&reg, TWL4030_REG_VIBRA_CTL);
-	twl_i2c_write_u8(TWL4030_MODULE_AUDIO_VOICE,
-			 (reg | TWL4030_VIBRA_EN), TWL4030_REG_VIBRA_CTL);
-
-	twl4030_audio_enable_resource(TWL4030_AUDIO_RES_APLL);
-
-	info->enabled = true;
-}
-
-static void vibra_disable(struct vibra_info *info)
-{
-	u8 reg;
-
-	/* Power down H-Bridge */
-	twl_i2c_read_u8(TWL4030_MODULE_AUDIO_VOICE,
-			&reg, TWL4030_REG_VIBRA_CTL);
-	twl_i2c_write_u8(TWL4030_MODULE_AUDIO_VOICE,
-			 (reg & ~TWL4030_VIBRA_EN), TWL4030_REG_VIBRA_CTL);
-
-	twl4030_audio_disable_resource(TWL4030_AUDIO_RES_APLL);
-	twl4030_audio_disable_resource(TWL4030_AUDIO_RES_POWER);
-
-	info->enabled = false;
-}
-
-static void vibra_play_work(struct work_struct *work)
-{
-	struct vibra_info *info = container_of(work,
-			struct vibra_info, play_work);
-	int dir;
-	int pwm;
-	u8 reg;
-
-	dir = info->direction;
-	pwm = info->speed;
-
-	twl_i2c_read_u8(TWL4030_MODULE_AUDIO_VOICE,
-			&reg, TWL4030_REG_VIBRA_CTL);
-	if (pwm && (!info->coexist || !(reg & TWL4030_VIBRA_SEL))) {
-
-		if (!info->enabled)
-			vibra_enable(info);
-
-		/* set vibra rotation direction */
-		twl_i2c_read_u8(TWL4030_MODULE_AUDIO_VOICE,
-				&reg, TWL4030_REG_VIBRA_CTL);
-		reg = (dir) ? (reg | TWL4030_VIBRA_DIR) :
-			(reg & ~TWL4030_VIBRA_DIR);
-		twl_i2c_write_u8(TWL4030_MODULE_AUDIO_VOICE,
-				 reg, TWL4030_REG_VIBRA_CTL);
-
-		/* set PWM, 1 = max, 255 = min */
-		twl_i2c_write_u8(TWL4030_MODULE_AUDIO_VOICE,
-				 256 - pwm, TWL4030_REG_VIBRA_SET);
-	} else {
-		if (info->enabled)
-			vibra_disable(info);
+#if !defined(CONFIG_INPUT_BOOSTER) // Input Booster +
+		if(device_tree_infor != NULL) {
+			if (type == EV_SYN && input_count > 0) {
+				pr_debug("[Input Booster1] ==============================================\n");
+				input_booster(dev);
+				input_count=0;
+			} else if (input_count < MAX_EVENTS) {
+				pr_debug("[Input Booster1] type = %x, code = %x, value =%x\n", type, code, value);
+				idx = input_count;
+				input_events[idx].type = type;
+				input_events[idx].code = code;
+				input_events[idx].value = value;
+				if (idx < MAX_EVENTS) {
+					input_count = idx + 1 ;
+				}
+			} else {
+				pr_debug("[Input Booster1] type = %x, code = %x, value =%x   Booster Event Exceeded\n", type, code, value);
+			}
+		}
+#endif  // Input Booster -
 	}
 }
+EXPORT_SYMBOL(input_event);
 
-/*** Input/ForceFeedback ***/
-
-static int vibra_play(struct input_dev *input, void *data,
-		      struct ff_effect *effect)
+/**
+ * input_inject_event() - send input event from input handler
+ * @handle: input handle to send event through
+ * @type: type of the event
+ * @code: event code
+ * @value: value of the event
+ *
+ * Similar to input_event() but will ignore event if device is
+ * "grabbed" and handle injecting event is not the one that owns
+ * the device.
+ */
+void input_inject_event(struct input_handle *handle,
+			unsigned int type, unsigned int code, int value)
 {
-	struct vibra_info *info = input_get_drvdata(input);
+	struct input_dev *dev = handle->dev;
+	struct input_handle *grab;
+	unsigned long flags;
 
-	info->speed = effect->u.rumble.strong_magnitude >> 8;
-	if (!info->speed)
-		info->speed = effect->u.rumble.weak_magnitude >> 9;
-	info->direction = effect->direction < EFFECT_DIR_180_DEG ? 0 : 1;
-	schedule_work(&info->play_work);
-	return 0;
-}
+	if (is_event_supported(type, dev->evbit, EV_MAX)) {
+		spin_lock_irqsave(&dev->event_lock, flags);
 
-static void twl4030_vibra_close(struct input_dev *input)
-{
-	struct vibra_info *info = input_get_drvdata(input);
+		rcu_read_lock();
+		grab = rcu_dereference(dev->grab);
+		if (!grab || grab == handle)
+			input_handle_event(dev, type, code, value);
+		rcu_read_unlock();
 
-	cancel_work_sync(&info->play_work);
-
-	if (info->enabled)
-		vibra_disable(info);
-}
-
-/*** Module ***/
-static int __maybe_unused twl4030_vibra_suspend(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct vibra_info *info = platform_get_drvdata(pdev);
-
-	if (info->enabled)
-		vibra_disable(info);
-
-	return 0;
-}
-
-static int __maybe_unused twl4030_vibra_resume(struct device *dev)
-{
-	vibra_disable_leds();
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(twl4030_vibra_pm_ops,
-			 twl4030_vibra_suspend, twl4030_vibra_resume);
-
-static bool twl4030_vibra_check_coexist(struct twl4030_vibra_data *pdata,
-			      struct device_node *parent)
-{
-	struct device_node *node;
-
-	if (pdata && pdata->coexist)
-		return true;
-
-	node = of_get_child_by_name(parent, "codec");
-	if (node) {
-		of_node_put(node);
-		return true;
-	}
-
-	return false;
-}
-
-static int twl4030_vibra_probe(struct platform_device *pdev)
-{
-	struct twl4030_vibra_data *pdata = dev_get_platdata(&pdev->dev);
-	struct device_node *twl4030_core_node = pdev->dev.parent->of_node;
-	struct vibra_info *info;
-	int ret;
-
-	if (!pdata && !twl4030_core_node) {
-		dev_dbg(&pdev->dev, "platform_data not available\n");
-		return -EINVAL;
-	}
-
-	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
-	if (!info)
-		return -ENOMEM;
-
-	info->dev = &pdev->dev;
-	info->coexist = twl4030_vibra_check_coexist(pdata, twl4030_core_node);
-	INIT_WORK(&info->play_work, vibra_play_work);
-
-	info->input_dev = devm_input_allocate_device(&pdev->dev);
-	if (info->input_dev == NULL) {
-		dev_err(&pdev->dev, "couldn't allocate input device\n");
-		return -ENOMEM;
-	}
-
-	input_set_drvdata(info->input_dev, info);
-
-	info->input_dev->name = "twl4030:vibrator";
-	info->input_dev->id.version = 1;
-	info->input_dev->dev.parent = pdev->dev.parent;
-	info->input_dev->close = twl4030_vibra_close;
-	__set_bit(FF_RUMBLE, info->input_dev->ffbit);
-
-	ret = input_ff_create_memless(info->input_dev, NULL, vibra_play);
-	if (ret < 0) {
-		dev_dbg(&pdev->dev, "couldn't register vibrator to FF\n");
-		return ret;
-	}
-
-	ret = input_register_device(info->input_dev);
-	if (ret < 0) {
-		dev_dbg(&pdev->dev, "couldn't register input device\n");
-		goto err_iff;
-	}
-
-	vibra_disable_leds();
-
-	platform_set_drvdata(pdev, info);
-	return 0;
-
-err_iff:
-	input_ff_destroy(info->input_dev);
-	return ret;
-}
-
-static struct platform_driver twl4030_vibra_driver = {
-	.probe		= twl4030_vibra_probe,
-	.driver		= {
-		.name	= "twl4030-vibra",
-		.pm	= &twl4030_vibra_pm_ops,
-	},
-};
-module_platform_driver(twl4030_vibra_driver);
-
-MODULE_ALIAS("platform:twl4030-vibra");
-MODULE_DESCRIPTION("TWL4030 Vibra driver");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Nokia Corporation");
+		spin_unlock_irqre

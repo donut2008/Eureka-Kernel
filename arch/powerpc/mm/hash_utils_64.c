@@ -1,1559 +1,56 @@
-/*
- * PowerPC64 port by Mike Corrigan and Dave Engebretsen
- *   {mikejc|engebret}@us.ibm.com
- *
- *    Copyright (c) 2000 Mike Corrigan <mikejc@us.ibm.com>
- *
- * SMP scalability work:
- *    Copyright (C) 2001 Anton Blanchard <anton@au.ibm.com>, IBM
- * 
- *    Module name: htab.c
- *
- *    Description:
- *      PowerPC Hashed Page Table functions
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
- */
-
-#undef DEBUG
-#undef DEBUG_LOW
-
-#include <linux/spinlock.h>
-#include <linux/errno.h>
-#include <linux/sched.h>
-#include <linux/proc_fs.h>
-#include <linux/stat.h>
-#include <linux/sysctl.h>
-#include <linux/export.h>
-#include <linux/ctype.h>
-#include <linux/cache.h>
-#include <linux/init.h>
-#include <linux/signal.h>
-#include <linux/memblock.h>
-#include <linux/context_tracking.h>
-
-#include <asm/processor.h>
-#include <asm/pgtable.h>
-#include <asm/mmu.h>
-#include <asm/mmu_context.h>
-#include <asm/page.h>
-#include <asm/types.h>
-#include <asm/uaccess.h>
-#include <asm/machdep.h>
-#include <asm/prom.h>
-#include <asm/tlbflush.h>
-#include <asm/io.h>
-#include <asm/eeh.h>
-#include <asm/tlb.h>
-#include <asm/cacheflush.h>
-#include <asm/cputable.h>
-#include <asm/sections.h>
-#include <asm/copro.h>
-#include <asm/udbg.h>
-#include <asm/code-patching.h>
-#include <asm/fadump.h>
-#include <asm/firmware.h>
-#include <asm/tm.h>
-#include <asm/trace.h>
-
-#ifdef DEBUG
-#define DBG(fmt...) udbg_printf(fmt)
-#else
-#define DBG(fmt...)
-#endif
-
-#ifdef DEBUG_LOW
-#define DBG_LOW(fmt...) udbg_printf(fmt)
-#else
-#define DBG_LOW(fmt...)
-#endif
-
-#define KB (1024)
-#define MB (1024*KB)
-#define GB (1024L*MB)
-
-/*
- * Note:  pte   --> Linux PTE
- *        HPTE  --> PowerPC Hashed Page Table Entry
- *
- * Execution context:
- *   htab_initialize is called with the MMU off (of course), but
- *   the kernel has been copied down to zero so it can directly
- *   reference global data.  At this point it is very difficult
- *   to print debug info.
- *
- */
-
-#ifdef CONFIG_U3_DART
-extern unsigned long dart_tablebase;
-#endif /* CONFIG_U3_DART */
-
-static unsigned long _SDR1;
-struct mmu_psize_def mmu_psize_defs[MMU_PAGE_COUNT];
-EXPORT_SYMBOL_GPL(mmu_psize_defs);
-
-struct hash_pte *htab_address;
-unsigned long htab_size_bytes;
-unsigned long htab_hash_mask;
-EXPORT_SYMBOL_GPL(htab_hash_mask);
-int mmu_linear_psize = MMU_PAGE_4K;
-EXPORT_SYMBOL_GPL(mmu_linear_psize);
-int mmu_virtual_psize = MMU_PAGE_4K;
-int mmu_vmalloc_psize = MMU_PAGE_4K;
-#ifdef CONFIG_SPARSEMEM_VMEMMAP
-int mmu_vmemmap_psize = MMU_PAGE_4K;
-#endif
-int mmu_io_psize = MMU_PAGE_4K;
-int mmu_kernel_ssize = MMU_SEGSIZE_256M;
-EXPORT_SYMBOL_GPL(mmu_kernel_ssize);
-int mmu_highuser_ssize = MMU_SEGSIZE_256M;
-u16 mmu_slb_size = 64;
-EXPORT_SYMBOL_GPL(mmu_slb_size);
-#ifdef CONFIG_PPC_64K_PAGES
-int mmu_ci_restrictions;
-#endif
-#ifdef CONFIG_DEBUG_PAGEALLOC
-static u8 *linear_map_hash_slots;
-static unsigned long linear_map_hash_count;
-static DEFINE_SPINLOCK(linear_map_hash_lock);
-#endif /* CONFIG_DEBUG_PAGEALLOC */
-
-/* There are definitions of page sizes arrays to be used when none
- * is provided by the firmware.
- */
-
-/* Pre-POWER4 CPUs (4k pages only)
- */
-static struct mmu_psize_def mmu_psize_defaults_old[] = {
-	[MMU_PAGE_4K] = {
-		.shift	= 12,
-		.sllp	= 0,
-		.penc   = {[MMU_PAGE_4K] = 0, [1 ... MMU_PAGE_COUNT - 1] = -1},
-		.avpnm	= 0,
-		.tlbiel = 0,
-	},
-};
-
-/* POWER4, GPUL, POWER5
- *
- * Support for 16Mb large pages
- */
-static struct mmu_psize_def mmu_psize_defaults_gp[] = {
-	[MMU_PAGE_4K] = {
-		.shift	= 12,
-		.sllp	= 0,
-		.penc   = {[MMU_PAGE_4K] = 0, [1 ... MMU_PAGE_COUNT - 1] = -1},
-		.avpnm	= 0,
-		.tlbiel = 1,
-	},
-	[MMU_PAGE_16M] = {
-		.shift	= 24,
-		.sllp	= SLB_VSID_L,
-		.penc   = {[0 ... MMU_PAGE_16M - 1] = -1, [MMU_PAGE_16M] = 0,
-			    [MMU_PAGE_16M + 1 ... MMU_PAGE_COUNT - 1] = -1 },
-		.avpnm	= 0x1UL,
-		.tlbiel = 0,
-	},
-};
-
-static unsigned long htab_convert_pte_flags(unsigned long pteflags)
-{
-	unsigned long rflags = pteflags & 0x1fa;
-
-	/* _PAGE_EXEC -> NOEXEC */
-	if ((pteflags & _PAGE_EXEC) == 0)
-		rflags |= HPTE_R_N;
-
-	/* PP bits. PAGE_USER is already PP bit 0x2, so we only
-	 * need to add in 0x1 if it's a read-only user page
-	 */
-	if ((pteflags & _PAGE_USER) && !((pteflags & _PAGE_RW) &&
-					 (pteflags & _PAGE_DIRTY)))
-		rflags |= 1;
-	/*
-	 * Always add "C" bit for perf. Memory coherence is always enabled
-	 */
-	return rflags | HPTE_R_C | HPTE_R_M;
-}
-
-int htab_bolt_mapping(unsigned long vstart, unsigned long vend,
-		      unsigned long pstart, unsigned long prot,
-		      int psize, int ssize)
-{
-	unsigned long vaddr, paddr;
-	unsigned int step, shift;
-	int ret = 0;
-
-	shift = mmu_psize_defs[psize].shift;
-	step = 1 << shift;
-
-	prot = htab_convert_pte_flags(prot);
-
-	DBG("htab_bolt_mapping(%lx..%lx -> %lx (%lx,%d,%d)\n",
-	    vstart, vend, pstart, prot, psize, ssize);
-
-	for (vaddr = vstart, paddr = pstart; vaddr < vend;
-	     vaddr += step, paddr += step) {
-		unsigned long hash, hpteg;
-		unsigned long vsid = get_kernel_vsid(vaddr, ssize);
-		unsigned long vpn  = hpt_vpn(vaddr, vsid, ssize);
-		unsigned long tprot = prot;
-
-		/*
-		 * If we hit a bad address return error.
-		 */
-		if (!vsid)
-			return -1;
-		/* Make kernel text executable */
-		if (overlaps_kernel_text(vaddr, vaddr + step))
-			tprot &= ~HPTE_R_N;
-
-		/* Make kvm guest trampolines executable */
-		if (overlaps_kvm_tmp(vaddr, vaddr + step))
-			tprot &= ~HPTE_R_N;
-
-		/*
-		 * If relocatable, check if it overlaps interrupt vectors that
-		 * are copied down to real 0. For relocatable kernel
-		 * (e.g. kdump case) we copy interrupt vectors down to real
-		 * address 0. Mark that region as executable. This is
-		 * because on p8 system with relocation on exception feature
-		 * enabled, exceptions are raised with MMU (IR=DR=1) ON. Hence
-		 * in order to execute the interrupt handlers in virtual
-		 * mode the vector region need to be marked as executable.
-		 */
-		if ((PHYSICAL_START > MEMORY_START) &&
-			overlaps_interrupt_vector_text(vaddr, vaddr + step))
-				tprot &= ~HPTE_R_N;
-
-		hash = hpt_hash(vpn, shift, ssize);
-		hpteg = ((hash & htab_hash_mask) * HPTES_PER_GROUP);
-
-		BUG_ON(!ppc_md.hpte_insert);
-		ret = ppc_md.hpte_insert(hpteg, vpn, paddr, tprot,
-					 HPTE_V_BOLTED, psize, psize, ssize);
-
-		if (ret < 0)
-			break;
-#ifdef CONFIG_DEBUG_PAGEALLOC
-		if ((paddr >> PAGE_SHIFT) < linear_map_hash_count)
-			linear_map_hash_slots[paddr >> PAGE_SHIFT] = ret | 0x80;
-#endif /* CONFIG_DEBUG_PAGEALLOC */
-	}
-	return ret < 0 ? ret : 0;
-}
-
-#ifdef CONFIG_MEMORY_HOTPLUG
-int htab_remove_mapping(unsigned long vstart, unsigned long vend,
-		      int psize, int ssize)
-{
-	unsigned long vaddr;
-	unsigned int step, shift;
-
-	shift = mmu_psize_defs[psize].shift;
-	step = 1 << shift;
-
-	if (!ppc_md.hpte_removebolted) {
-		printk(KERN_WARNING "Platform doesn't implement "
-				"hpte_removebolted\n");
-		return -EINVAL;
-	}
-
-	for (vaddr = vstart; vaddr < vend; vaddr += step)
-		ppc_md.hpte_removebolted(vaddr, psize, ssize);
-
-	return 0;
-}
-#endif /* CONFIG_MEMORY_HOTPLUG */
-
-static int __init htab_dt_scan_seg_sizes(unsigned long node,
-					 const char *uname, int depth,
-					 void *data)
-{
-	const char *type = of_get_flat_dt_prop(node, "device_type", NULL);
-	const __be32 *prop;
-	int size = 0;
-
-	/* We are scanning "cpu" nodes only */
-	if (type == NULL || strcmp(type, "cpu") != 0)
-		return 0;
-
-	prop = of_get_flat_dt_prop(node, "ibm,processor-segment-sizes", &size);
-	if (prop == NULL)
-		return 0;
-	for (; size >= 4; size -= 4, ++prop) {
-		if (be32_to_cpu(prop[0]) == 40) {
-			DBG("1T segment support detected\n");
-			cur_cpu_spec->mmu_features |= MMU_FTR_1T_SEGMENT;
-			return 1;
-		}
-	}
-	cur_cpu_spec->mmu_features &= ~MMU_FTR_NO_SLBIE_B;
-	return 0;
-}
-
-static void __init htab_init_seg_sizes(void)
-{
-	of_scan_flat_dt(htab_dt_scan_seg_sizes, NULL);
-}
-
-static int __init get_idx_from_shift(unsigned int shift)
-{
-	int idx = -1;
-
-	switch (shift) {
-	case 0xc:
-		idx = MMU_PAGE_4K;
-		break;
-	case 0x10:
-		idx = MMU_PAGE_64K;
-		break;
-	case 0x14:
-		idx = MMU_PAGE_1M;
-		break;
-	case 0x18:
-		idx = MMU_PAGE_16M;
-		break;
-	case 0x22:
-		idx = MMU_PAGE_16G;
-		break;
-	}
-	return idx;
-}
-
-static int __init htab_dt_scan_page_sizes(unsigned long node,
-					  const char *uname, int depth,
-					  void *data)
-{
-	const char *type = of_get_flat_dt_prop(node, "device_type", NULL);
-	const __be32 *prop;
-	int size = 0;
-
-	/* We are scanning "cpu" nodes only */
-	if (type == NULL || strcmp(type, "cpu") != 0)
-		return 0;
-
-	prop = of_get_flat_dt_prop(node, "ibm,segment-page-sizes", &size);
-	if (!prop)
-		return 0;
-
-	pr_info("Page sizes from device-tree:\n");
-	size /= 4;
-	cur_cpu_spec->mmu_features &= ~(MMU_FTR_16M_PAGE);
-	while(size > 0) {
-		unsigned int base_shift = be32_to_cpu(prop[0]);
-		unsigned int slbenc = be32_to_cpu(prop[1]);
-		unsigned int lpnum = be32_to_cpu(prop[2]);
-		struct mmu_psize_def *def;
-		int idx, base_idx;
-
-		size -= 3; prop += 3;
-		base_idx = get_idx_from_shift(base_shift);
-		if (base_idx < 0) {
-			/* skip the pte encoding also */
-			prop += lpnum * 2; size -= lpnum * 2;
-			continue;
-		}
-		def = &mmu_psize_defs[base_idx];
-		if (base_idx == MMU_PAGE_16M)
-			cur_cpu_spec->mmu_features |= MMU_FTR_16M_PAGE;
-
-		def->shift = base_shift;
-		if (base_shift <= 23)
-			def->avpnm = 0;
-		else
-			def->avpnm = (1 << (base_shift - 23)) - 1;
-		def->sllp = slbenc;
-		/*
-		 * We don't know for sure what's up with tlbiel, so
-		 * for now we only set it for 4K and 64K pages
-		 */
-		if (base_idx == MMU_PAGE_4K || base_idx == MMU_PAGE_64K)
-			def->tlbiel = 1;
-		else
-			def->tlbiel = 0;
-
-		while (size > 0 && lpnum) {
-			unsigned int shift = be32_to_cpu(prop[0]);
-			int penc  = be32_to_cpu(prop[1]);
-
-			prop += 2; size -= 2;
-			lpnum--;
-
-			idx = get_idx_from_shift(shift);
-			if (idx < 0)
-				continue;
-
-			if (penc == -1)
-				pr_err("Invalid penc for base_shift=%d "
-				       "shift=%d\n", base_shift, shift);
-
-			def->penc[idx] = penc;
-			pr_info("base_shift=%d: shift=%d, sllp=0x%04lx,"
-				" avpnm=0x%08lx, tlbiel=%d, penc=%d\n",
-				base_shift, shift, def->sllp,
-				def->avpnm, def->tlbiel, def->penc[idx]);
-		}
-	}
-
-	return 1;
-}
-
-#ifdef CONFIG_HUGETLB_PAGE
-/* Scan for 16G memory blocks that have been set aside for huge pages
- * and reserve those blocks for 16G huge pages.
- */
-static int __init htab_dt_scan_hugepage_blocks(unsigned long node,
-					const char *uname, int depth,
-					void *data) {
-	const char *type = of_get_flat_dt_prop(node, "device_type", NULL);
-	const __be64 *addr_prop;
-	const __be32 *page_count_prop;
-	unsigned int expected_pages;
-	long unsigned int phys_addr;
-	long unsigned int block_size;
-
-	/* We are scanning "memory" nodes only */
-	if (type == NULL || strcmp(type, "memory") != 0)
-		return 0;
-
-	/* This property is the log base 2 of the number of virtual pages that
-	 * will represent this memory block. */
-	page_count_prop = of_get_flat_dt_prop(node, "ibm,expected#pages", NULL);
-	if (page_count_prop == NULL)
-		return 0;
-	expected_pages = (1 << be32_to_cpu(page_count_prop[0]));
-	addr_prop = of_get_flat_dt_prop(node, "reg", NULL);
-	if (addr_prop == NULL)
-		return 0;
-	phys_addr = be64_to_cpu(addr_prop[0]);
-	block_size = be64_to_cpu(addr_prop[1]);
-	if (block_size != (16 * GB))
-		return 0;
-	printk(KERN_INFO "Huge page(16GB) memory: "
-			"addr = 0x%lX size = 0x%lX pages = %d\n",
-			phys_addr, block_size, expected_pages);
-	if (phys_addr + (16 * GB) <= memblock_end_of_DRAM()) {
-		memblock_reserve(phys_addr, block_size * expected_pages);
-		add_gpage(phys_addr, block_size, expected_pages);
-	}
-	return 0;
-}
-#endif /* CONFIG_HUGETLB_PAGE */
-
-static void mmu_psize_set_default_penc(void)
-{
-	int bpsize, apsize;
-	for (bpsize = 0; bpsize < MMU_PAGE_COUNT; bpsize++)
-		for (apsize = 0; apsize < MMU_PAGE_COUNT; apsize++)
-			mmu_psize_defs[bpsize].penc[apsize] = -1;
-}
-
-#ifdef CONFIG_PPC_64K_PAGES
-
-static bool might_have_hea(void)
-{
-	/*
-	 * The HEA ethernet adapter requires awareness of the
-	 * GX bus. Without that awareness we can easily assume
-	 * we will never see an HEA ethernet device.
-	 */
-#ifdef CONFIG_IBMEBUS
-	return !cpu_has_feature(CPU_FTR_ARCH_207S);
-#else
-	return false;
-#endif
-}
-
-#endif /* #ifdef CONFIG_PPC_64K_PAGES */
-
-static void __init htab_init_page_sizes(void)
-{
-	int rc;
-
-	/* se the invalid penc to -1 */
-	mmu_psize_set_default_penc();
-
-	/* Default to 4K pages only */
-	memcpy(mmu_psize_defs, mmu_psize_defaults_old,
-	       sizeof(mmu_psize_defaults_old));
-
-	/*
-	 * Try to find the available page sizes in the device-tree
-	 */
-	rc = of_scan_flat_dt(htab_dt_scan_page_sizes, NULL);
-	if (rc != 0)  /* Found */
-		goto found;
-
-	/*
-	 * Not in the device-tree, let's fallback on known size
-	 * list for 16M capable GP & GR
-	 */
-	if (mmu_has_feature(MMU_FTR_16M_PAGE))
-		memcpy(mmu_psize_defs, mmu_psize_defaults_gp,
-		       sizeof(mmu_psize_defaults_gp));
- found:
-#ifndef CONFIG_DEBUG_PAGEALLOC
-	/*
-	 * Pick a size for the linear mapping. Currently, we only support
-	 * 16M, 1M and 4K which is the default
-	 */
-	if (mmu_psize_defs[MMU_PAGE_16M].shift)
-		mmu_linear_psize = MMU_PAGE_16M;
-	else if (mmu_psize_defs[MMU_PAGE_1M].shift)
-		mmu_linear_psize = MMU_PAGE_1M;
-#endif /* CONFIG_DEBUG_PAGEALLOC */
-
-#ifdef CONFIG_PPC_64K_PAGES
-	/*
-	 * Pick a size for the ordinary pages. Default is 4K, we support
-	 * 64K for user mappings and vmalloc if supported by the processor.
-	 * We only use 64k for ioremap if the processor
-	 * (and firmware) support cache-inhibited large pages.
-	 * If not, we use 4k and set mmu_ci_restrictions so that
-	 * hash_page knows to switch processes that use cache-inhibited
-	 * mappings to 4k pages.
-	 */
-	if (mmu_psize_defs[MMU_PAGE_64K].shift) {
-		mmu_virtual_psize = MMU_PAGE_64K;
-		mmu_vmalloc_psize = MMU_PAGE_64K;
-		if (mmu_linear_psize == MMU_PAGE_4K)
-			mmu_linear_psize = MMU_PAGE_64K;
-		if (mmu_has_feature(MMU_FTR_CI_LARGE_PAGE)) {
-			/*
-			 * When running on pSeries using 64k pages for ioremap
-			 * would stop us accessing the HEA ethernet. So if we
-			 * have the chance of ever seeing one, stay at 4k.
-			 */
-			if (!might_have_hea() || !machine_is(pseries))
-				mmu_io_psize = MMU_PAGE_64K;
-		} else
-			mmu_ci_restrictions = 1;
-	}
-#endif /* CONFIG_PPC_64K_PAGES */
-
-#ifdef CONFIG_SPARSEMEM_VMEMMAP
-	/* We try to use 16M pages for vmemmap if that is supported
-	 * and we have at least 1G of RAM at boot
-	 */
-	if (mmu_psize_defs[MMU_PAGE_16M].shift &&
-	    memblock_phys_mem_size() >= 0x40000000)
-		mmu_vmemmap_psize = MMU_PAGE_16M;
-	else if (mmu_psize_defs[MMU_PAGE_64K].shift)
-		mmu_vmemmap_psize = MMU_PAGE_64K;
-	else
-		mmu_vmemmap_psize = MMU_PAGE_4K;
-#endif /* CONFIG_SPARSEMEM_VMEMMAP */
-
-	printk(KERN_DEBUG "Page orders: linear mapping = %d, "
-	       "virtual = %d, io = %d"
-#ifdef CONFIG_SPARSEMEM_VMEMMAP
-	       ", vmemmap = %d"
-#endif
-	       "\n",
-	       mmu_psize_defs[mmu_linear_psize].shift,
-	       mmu_psize_defs[mmu_virtual_psize].shift,
-	       mmu_psize_defs[mmu_io_psize].shift
-#ifdef CONFIG_SPARSEMEM_VMEMMAP
-	       ,mmu_psize_defs[mmu_vmemmap_psize].shift
-#endif
-	       );
-
-#ifdef CONFIG_HUGETLB_PAGE
-	/* Reserve 16G huge page memory sections for huge pages */
-	of_scan_flat_dt(htab_dt_scan_hugepage_blocks, NULL);
-#endif /* CONFIG_HUGETLB_PAGE */
-}
-
-static int __init htab_dt_scan_pftsize(unsigned long node,
-				       const char *uname, int depth,
-				       void *data)
-{
-	const char *type = of_get_flat_dt_prop(node, "device_type", NULL);
-	const __be32 *prop;
-
-	/* We are scanning "cpu" nodes only */
-	if (type == NULL || strcmp(type, "cpu") != 0)
-		return 0;
-
-	prop = of_get_flat_dt_prop(node, "ibm,pft-size", NULL);
-	if (prop != NULL) {
-		/* pft_size[0] is the NUMA CEC cookie */
-		ppc64_pft_size = be32_to_cpu(prop[1]);
-		return 1;
-	}
-	return 0;
-}
-
-static unsigned long __init htab_get_table_size(void)
-{
-	unsigned long mem_size, rnd_mem_size, pteg_count, psize;
-
-	/* If hash size isn't already provided by the platform, we try to
-	 * retrieve it from the device-tree. If it's not there neither, we
-	 * calculate it now based on the total RAM size
-	 */
-	if (ppc64_pft_size == 0)
-		of_scan_flat_dt(htab_dt_scan_pftsize, NULL);
-	if (ppc64_pft_size)
-		return 1UL << ppc64_pft_size;
-
-	/* round mem_size up to next power of 2 */
-	mem_size = memblock_phys_mem_size();
-	rnd_mem_size = 1UL << __ilog2(mem_size);
-	if (rnd_mem_size < mem_size)
-		rnd_mem_size <<= 1;
-
-	/* # pages / 2 */
-	psize = mmu_psize_defs[mmu_virtual_psize].shift;
-	pteg_count = max(rnd_mem_size >> (psize + 1), 1UL << 11);
-
-	return pteg_count << 7;
-}
-
-#ifdef CONFIG_MEMORY_HOTPLUG
-int create_section_mapping(unsigned long start, unsigned long end)
-{
-	return htab_bolt_mapping(start, end, __pa(start),
-				 pgprot_val(PAGE_KERNEL), mmu_linear_psize,
-				 mmu_kernel_ssize);
-}
-
-int remove_section_mapping(unsigned long start, unsigned long end)
-{
-	return htab_remove_mapping(start, end, mmu_linear_psize,
-			mmu_kernel_ssize);
-}
-#endif /* CONFIG_MEMORY_HOTPLUG */
-
-extern u32 htab_call_hpte_insert1[];
-extern u32 htab_call_hpte_insert2[];
-extern u32 htab_call_hpte_remove[];
-extern u32 htab_call_hpte_updatepp[];
-extern u32 ht64_call_hpte_insert1[];
-extern u32 ht64_call_hpte_insert2[];
-extern u32 ht64_call_hpte_remove[];
-extern u32 ht64_call_hpte_updatepp[];
-
-static void __init htab_finish_init(void)
-{
-#ifdef CONFIG_PPC_64K_PAGES
-	patch_branch(ht64_call_hpte_insert1,
-		ppc_function_entry(ppc_md.hpte_insert),
-		BRANCH_SET_LINK);
-	patch_branch(ht64_call_hpte_insert2,
-		ppc_function_entry(ppc_md.hpte_insert),
-		BRANCH_SET_LINK);
-	patch_branch(ht64_call_hpte_remove,
-		ppc_function_entry(ppc_md.hpte_remove),
-		BRANCH_SET_LINK);
-	patch_branch(ht64_call_hpte_updatepp,
-		ppc_function_entry(ppc_md.hpte_updatepp),
-		BRANCH_SET_LINK);
-#endif /* CONFIG_PPC_64K_PAGES */
-
-	patch_branch(htab_call_hpte_insert1,
-		ppc_function_entry(ppc_md.hpte_insert),
-		BRANCH_SET_LINK);
-	patch_branch(htab_call_hpte_insert2,
-		ppc_function_entry(ppc_md.hpte_insert),
-		BRANCH_SET_LINK);
-	patch_branch(htab_call_hpte_remove,
-		ppc_function_entry(ppc_md.hpte_remove),
-		BRANCH_SET_LINK);
-	patch_branch(htab_call_hpte_updatepp,
-		ppc_function_entry(ppc_md.hpte_updatepp),
-		BRANCH_SET_LINK);
-}
-
-static void __init htab_initialize(void)
-{
-	unsigned long table;
-	unsigned long pteg_count;
-	unsigned long prot;
-	unsigned long base = 0, size = 0, limit;
-	struct memblock_region *reg;
-
-	DBG(" -> htab_initialize()\n");
-
-	/* Initialize segment sizes */
-	htab_init_seg_sizes();
-
-	/* Initialize page sizes */
-	htab_init_page_sizes();
-
-	if (mmu_has_feature(MMU_FTR_1T_SEGMENT)) {
-		mmu_kernel_ssize = MMU_SEGSIZE_1T;
-		mmu_highuser_ssize = MMU_SEGSIZE_1T;
-		printk(KERN_INFO "Using 1TB segments\n");
-	}
-
-	/*
-	 * Calculate the required size of the htab.  We want the number of
-	 * PTEGs to equal one half the number of real pages.
-	 */ 
-	htab_size_bytes = htab_get_table_size();
-	pteg_count = htab_size_bytes >> 7;
-
-	htab_hash_mask = pteg_count - 1;
-
-	if (firmware_has_feature(FW_FEATURE_LPAR)) {
-		/* Using a hypervisor which owns the htab */
-		htab_address = NULL;
-		_SDR1 = 0; 
-#ifdef CONFIG_FA_DUMP
-		/*
-		 * If firmware assisted dump is active firmware preserves
-		 * the contents of htab along with entire partition memory.
-		 * Clear the htab if firmware assisted dump is active so
-		 * that we dont end up using old mappings.
-		 */
-		if (is_fadump_active() && ppc_md.hpte_clear_all)
-			ppc_md.hpte_clear_all();
-#endif
-	} else {
-		/* Find storage for the HPT.  Must be contiguous in
-		 * the absolute address space. On cell we want it to be
-		 * in the first 2 Gig so we can use it for IOMMU hacks.
-		 */
-		if (machine_is(cell))
-			limit = 0x80000000;
-		else
-			limit = MEMBLOCK_ALLOC_ANYWHERE;
-
-		table = memblock_alloc_base(htab_size_bytes, htab_size_bytes, limit);
-
-		DBG("Hash table allocated at %lx, size: %lx\n", table,
-		    htab_size_bytes);
-
-		htab_address = __va(table);
-
-		/* htab absolute addr + encoded htabsize */
-		_SDR1 = table + __ilog2(pteg_count) - 11;
-
-		/* Initialize the HPT with no entries */
-		memset((void *)table, 0, htab_size_bytes);
-
-		/* Set SDR1 */
-		mtspr(SPRN_SDR1, _SDR1);
-	}
-
-	prot = pgprot_val(PAGE_KERNEL);
-
-#ifdef CONFIG_DEBUG_PAGEALLOC
-	linear_map_hash_count = memblock_end_of_DRAM() >> PAGE_SHIFT;
-	linear_map_hash_slots = __va(memblock_alloc_base(linear_map_hash_count,
-						    1, ppc64_rma_size));
-	memset(linear_map_hash_slots, 0, linear_map_hash_count);
-#endif /* CONFIG_DEBUG_PAGEALLOC */
-
-	/* On U3 based machines, we need to reserve the DART area and
-	 * _NOT_ map it to avoid cache paradoxes as it's remapped non
-	 * cacheable later on
-	 */
-
-	/* create bolted the linear mapping in the hash table */
-	for_each_memblock(memory, reg) {
-		base = (unsigned long)__va(reg->base);
-		size = reg->size;
-
-		DBG("creating mapping for region: %lx..%lx (prot: %lx)\n",
-		    base, size, prot);
-
-#ifdef CONFIG_U3_DART
-		/* Do not map the DART space. Fortunately, it will be aligned
-		 * in such a way that it will not cross two memblock regions and
-		 * will fit within a single 16Mb page.
-		 * The DART space is assumed to be a full 16Mb region even if
-		 * we only use 2Mb of that space. We will use more of it later
-		 * for AGP GART. We have to use a full 16Mb large page.
-		 */
-		DBG("DART base: %lx\n", dart_tablebase);
-
-		if (dart_tablebase != 0 && dart_tablebase >= base
-		    && dart_tablebase < (base + size)) {
-			unsigned long dart_table_end = dart_tablebase + 16 * MB;
-			if (base != dart_tablebase)
-				BUG_ON(htab_bolt_mapping(base, dart_tablebase,
-							__pa(base), prot,
-							mmu_linear_psize,
-							mmu_kernel_ssize));
-			if ((base + size) > dart_table_end)
-				BUG_ON(htab_bolt_mapping(dart_tablebase+16*MB,
-							base + size,
-							__pa(dart_table_end),
-							 prot,
-							 mmu_linear_psize,
-							 mmu_kernel_ssize));
-			continue;
-		}
-#endif /* CONFIG_U3_DART */
-		BUG_ON(htab_bolt_mapping(base, base + size, __pa(base),
-				prot, mmu_linear_psize, mmu_kernel_ssize));
-	}
-	memblock_set_current_limit(MEMBLOCK_ALLOC_ANYWHERE);
-
-	/*
-	 * If we have a memory_limit and we've allocated TCEs then we need to
-	 * explicitly map the TCE area at the top of RAM. We also cope with the
-	 * case that the TCEs start below memory_limit.
-	 * tce_alloc_start/end are 16MB aligned so the mapping should work
-	 * for either 4K or 16MB pages.
-	 */
-	if (tce_alloc_start) {
-		tce_alloc_start = (unsigned long)__va(tce_alloc_start);
-		tce_alloc_end = (unsigned long)__va(tce_alloc_end);
-
-		if (base + size >= tce_alloc_start)
-			tce_alloc_start = base + size + 1;
-
-		BUG_ON(htab_bolt_mapping(tce_alloc_start, tce_alloc_end,
-					 __pa(tce_alloc_start), prot,
-					 mmu_linear_psize, mmu_kernel_ssize));
-	}
-
-	htab_finish_init();
-
-	DBG(" <- htab_initialize()\n");
-}
-#undef KB
-#undef MB
-
-void __init early_init_mmu(void)
-{
-	/* Initialize the MMU Hash table and create the linear mapping
-	 * of memory. Has to be done before SLB initialization as this is
-	 * currently where the page size encoding is obtained.
-	 */
-	htab_initialize();
-
-	/* Initialize SLB management */
-	slb_initialize();
-}
-
-#ifdef CONFIG_SMP
-void early_init_mmu_secondary(void)
-{
-	/* Initialize hash table for that CPU */
-	if (!firmware_has_feature(FW_FEATURE_LPAR))
-		mtspr(SPRN_SDR1, _SDR1);
-
-	/* Initialize SLB */
-	slb_initialize();
-}
-#endif /* CONFIG_SMP */
-
-/*
- * Called by asm hashtable.S for doing lazy icache flush
- */
-unsigned int hash_page_do_lazy_icache(unsigned int pp, pte_t pte, int trap)
-{
-	struct page *page;
-
-	if (!pfn_valid(pte_pfn(pte)))
-		return pp;
-
-	page = pte_page(pte);
-
-	/* page is dirty */
-	if (!test_bit(PG_arch_1, &page->flags) && !PageReserved(page)) {
-		if (trap == 0x400) {
-			flush_dcache_icache_page(page);
-			set_bit(PG_arch_1, &page->flags);
-		} else
-			pp |= HPTE_R_N;
-	}
-	return pp;
-}
-
-#ifdef CONFIG_PPC_MM_SLICES
-static unsigned int get_paca_psize(unsigned long addr)
-{
-	u64 lpsizes;
-	unsigned char *hpsizes;
-	unsigned long index, mask_index;
-
-	if (addr < SLICE_LOW_TOP) {
-		lpsizes = get_paca()->context.low_slices_psize;
-		index = GET_LOW_SLICE_INDEX(addr);
-		return (lpsizes >> (index * 4)) & 0xF;
-	}
-	hpsizes = get_paca()->context.high_slices_psize;
-	index = GET_HIGH_SLICE_INDEX(addr);
-	mask_index = index & 0x1;
-	return (hpsizes[index >> 1] >> (mask_index * 4)) & 0xF;
-}
-
-#else
-unsigned int get_paca_psize(unsigned long addr)
-{
-	return get_paca()->context.user_psize;
-}
-#endif
-
-/*
- * Demote a segment to using 4k pages.
- * For now this makes the whole process use 4k pages.
- */
-#ifdef CONFIG_PPC_64K_PAGES
-void demote_segment_4k(struct mm_struct *mm, unsigned long addr)
-{
-	if (get_slice_psize(mm, addr) == MMU_PAGE_4K)
-		return;
-	slice_set_range_psize(mm, addr, 1, MMU_PAGE_4K);
-	copro_flush_all_slbs(mm);
-	if ((get_paca_psize(addr) != MMU_PAGE_4K) && (current->mm == mm)) {
-		get_paca()->context = mm->context;
-		slb_flush_and_rebolt();
-	}
-}
-#endif /* CONFIG_PPC_64K_PAGES */
-
-#ifdef CONFIG_PPC_SUBPAGE_PROT
-/*
- * This looks up a 2-bit protection code for a 4k subpage of a 64k page.
- * Userspace sets the subpage permissions using the subpage_prot system call.
- *
- * Result is 0: full permissions, _PAGE_RW: read-only,
- * _PAGE_USER or _PAGE_USER|_PAGE_RW: no access.
- */
-static int subpage_protection(struct mm_struct *mm, unsigned long ea)
-{
-	struct subpage_prot_table *spt = &mm->context.spt;
-	u32 spp = 0;
-	u32 **sbpm, *sbpp;
-
-	if (ea >= spt->maxaddr)
-		return 0;
-	if (ea < 0x100000000UL) {
-		/* addresses below 4GB use spt->low_prot */
-		sbpm = spt->low_prot;
-	} else {
-		sbpm = spt->protptrs[ea >> SBP_L3_SHIFT];
-		if (!sbpm)
-			return 0;
-	}
-	sbpp = sbpm[(ea >> SBP_L2_SHIFT) & (SBP_L2_COUNT - 1)];
-	if (!sbpp)
-		return 0;
-	spp = sbpp[(ea >> PAGE_SHIFT) & (SBP_L1_COUNT - 1)];
-
-	/* extract 2-bit bitfield for this 4k subpage */
-	spp >>= 30 - 2 * ((ea >> 12) & 0xf);
-
-	/* turn 0,1,2,3 into combination of _PAGE_USER and _PAGE_RW */
-	spp = ((spp & 2) ? _PAGE_USER : 0) | ((spp & 1) ? _PAGE_RW : 0);
-	return spp;
-}
-
-#else /* CONFIG_PPC_SUBPAGE_PROT */
-static inline int subpage_protection(struct mm_struct *mm, unsigned long ea)
-{
-	return 0;
-}
-#endif
-
-void hash_failure_debug(unsigned long ea, unsigned long access,
-			unsigned long vsid, unsigned long trap,
-			int ssize, int psize, int lpsize, unsigned long pte)
-{
-	if (!printk_ratelimit())
-		return;
-	pr_info("mm: Hashing failure ! EA=0x%lx access=0x%lx current=%s\n",
-		ea, access, current->comm);
-	pr_info("    trap=0x%lx vsid=0x%lx ssize=%d base psize=%d psize %d pte=0x%lx\n",
-		trap, vsid, ssize, psize, lpsize, pte);
-}
-
-static void check_paca_psize(unsigned long ea, struct mm_struct *mm,
-			     int psize, bool user_region)
-{
-	if (user_region) {
-		if (psize != get_paca_psize(ea)) {
-			get_paca()->context = mm->context;
-			slb_flush_and_rebolt();
-		}
-	} else if (get_paca()->vmalloc_sllp !=
-		   mmu_psize_defs[mmu_vmalloc_psize].sllp) {
-		get_paca()->vmalloc_sllp =
-			mmu_psize_defs[mmu_vmalloc_psize].sllp;
-		slb_vmalloc_update();
-	}
-}
-
-/* Result code is:
- *  0 - handled
- *  1 - normal page fault
- * -1 - critical hash insertion error
- * -2 - access not permitted by subpage protection mechanism
- */
-int hash_page_mm(struct mm_struct *mm, unsigned long ea,
-		 unsigned long access, unsigned long trap,
-		 unsigned long flags)
-{
-	bool is_thp;
-	enum ctx_state prev_state = exception_enter();
-	pgd_t *pgdir;
-	unsigned long vsid;
-	pte_t *ptep;
-	unsigned hugeshift;
-	const struct cpumask *tmp;
-	int rc, user_region = 0;
-	int psize, ssize;
-
-	DBG_LOW("hash_page(ea=%016lx, access=%lx, trap=%lx\n",
-		ea, access, trap);
-	trace_hash_fault(ea, access, trap);
-
-	/* Get region & vsid */
- 	switch (REGION_ID(ea)) {
-	case USER_REGION_ID:
-		user_region = 1;
-		if (! mm) {
-			DBG_LOW(" user region with no mm !\n");
-			rc = 1;
-			goto bail;
-		}
-		psize = get_slice_psize(mm, ea);
-		ssize = user_segment_size(ea);
-		vsid = get_vsid(mm->context.id, ea, ssize);
-		break;
-	case VMALLOC_REGION_ID:
-		vsid = get_kernel_vsid(ea, mmu_kernel_ssize);
-		if (ea < VMALLOC_END)
-			psize = mmu_vmalloc_psize;
-		else
-			psize = mmu_io_psize;
-		ssize = mmu_kernel_ssize;
-		break;
-	default:
-		/* Not a valid range
-		 * Send the problem up to do_page_fault 
-		 */
-		rc = 1;
-		goto bail;
-	}
-	DBG_LOW(" mm=%p, mm->pgdir=%p, vsid=%016lx\n", mm, mm->pgd, vsid);
-
-	/* Bad address. */
-	if (!vsid) {
-		DBG_LOW("Bad address!\n");
-		rc = 1;
-		goto bail;
-	}
-	/* Get pgdir */
-	pgdir = mm->pgd;
-	if (pgdir == NULL) {
-		rc = 1;
-		goto bail;
-	}
-
-	/* Check CPU locality */
-	tmp = cpumask_of(smp_processor_id());
-	if (user_region && cpumask_equal(mm_cpumask(mm), tmp))
-		flags |= HPTE_LOCAL_UPDATE;
-
-#ifndef CONFIG_PPC_64K_PAGES
-	/* If we use 4K pages and our psize is not 4K, then we might
-	 * be hitting a special driver mapping, and need to align the
-	 * address before we fetch the PTE.
-	 *
-	 * It could also be a hugepage mapping, in which case this is
-	 * not necessary, but it's not harmful, either.
-	 */
-	if (psize != MMU_PAGE_4K)
-		ea &= ~((1ul << mmu_psize_defs[psize].shift) - 1);
-#endif /* CONFIG_PPC_64K_PAGES */
-
-	/* Get PTE and page size from page tables */
-	ptep = __find_linux_pte_or_hugepte(pgdir, ea, &is_thp, &hugeshift);
-	if (ptep == NULL || !pte_present(*ptep)) {
-		DBG_LOW(" no PTE !\n");
-		rc = 1;
-		goto bail;
-	}
-
-	/* Add _PAGE_PRESENT to the required access perm */
-	access |= _PAGE_PRESENT;
-
-	/* Pre-check access permissions (will be re-checked atomically
-	 * in __hash_page_XX but this pre-check is a fast path
-	 */
-	if (access & ~pte_val(*ptep)) {
-		DBG_LOW(" no access !\n");
-		rc = 1;
-		goto bail;
-	}
-
-	if (hugeshift) {
-		if (is_thp)
-			rc = __hash_page_thp(ea, access, vsid, (pmd_t *)ptep,
-					     trap, flags, ssize, psize);
-#ifdef CONFIG_HUGETLB_PAGE
-		else
-			rc = __hash_page_huge(ea, access, vsid, ptep, trap,
-					      flags, ssize, hugeshift, psize);
-#else
-		else {
-			/*
-			 * if we have hugeshift, and is not transhuge with
-			 * hugetlb disabled, something is really wrong.
-			 */
-			rc = 1;
-			WARN_ON(1);
-		}
-#endif
-		if (current->mm == mm)
-			check_paca_psize(ea, mm, psize, user_region);
-
-		goto bail;
-	}
-
-#ifndef CONFIG_PPC_64K_PAGES
-	DBG_LOW(" i-pte: %016lx\n", pte_val(*ptep));
-#else
-	DBG_LOW(" i-pte: %016lx %016lx\n", pte_val(*ptep),
-		pte_val(*(ptep + PTRS_PER_PTE)));
-#endif
-	/* Do actual hashing */
-#ifdef CONFIG_PPC_64K_PAGES
-	/* If _PAGE_4K_PFN is set, make sure this is a 4k segment */
-	if ((pte_val(*ptep) & _PAGE_4K_PFN) && psize == MMU_PAGE_64K) {
-		demote_segment_4k(mm, ea);
-		psize = MMU_PAGE_4K;
-	}
-
-	/* If this PTE is non-cacheable and we have restrictions on
-	 * using non cacheable large pages, then we switch to 4k
-	 */
-	if (mmu_ci_restrictions && psize == MMU_PAGE_64K &&
-	    (pte_val(*ptep) & _PAGE_NO_CACHE)) {
-		if (user_region) {
-			demote_segment_4k(mm, ea);
-			psize = MMU_PAGE_4K;
-		} else if (ea < VMALLOC_END) {
-			/*
-			 * some driver did a non-cacheable mapping
-			 * in vmalloc space, so switch vmalloc
-			 * to 4k pages
-			 */
-			printk(KERN_ALERT "Reducing vmalloc segment "
-			       "to 4kB pages because of "
-			       "non-cacheable mapping\n");
-			psize = mmu_vmalloc_psize = MMU_PAGE_4K;
-			copro_flush_all_slbs(mm);
-		}
-	}
-
-	if (current->mm == mm)
-		check_paca_psize(ea, mm, psize, user_region);
-#endif /* CONFIG_PPC_64K_PAGES */
-
-#ifdef CONFIG_PPC_64K_PAGES
-	if (psize == MMU_PAGE_64K)
-		rc = __hash_page_64K(ea, access, vsid, ptep, trap,
-				     flags, ssize);
-	else
-#endif /* CONFIG_PPC_64K_PAGES */
-	{
-		int spp = subpage_protection(mm, ea);
-		if (access & spp)
-			rc = -2;
-		else
-			rc = __hash_page_4K(ea, access, vsid, ptep, trap,
-					    flags, ssize, spp);
-	}
-
-	/* Dump some info in case of hash insertion failure, they should
-	 * never happen so it is really useful to know if/when they do
-	 */
-	if (rc == -1)
-		hash_failure_debug(ea, access, vsid, trap, ssize, psize,
-				   psize, pte_val(*ptep));
-#ifndef CONFIG_PPC_64K_PAGES
-	DBG_LOW(" o-pte: %016lx\n", pte_val(*ptep));
-#else
-	DBG_LOW(" o-pte: %016lx %016lx\n", pte_val(*ptep),
-		pte_val(*(ptep + PTRS_PER_PTE)));
-#endif
-	DBG_LOW(" -> rc=%d\n", rc);
-
-bail:
-	exception_exit(prev_state);
-	return rc;
-}
-EXPORT_SYMBOL_GPL(hash_page_mm);
-
-int hash_page(unsigned long ea, unsigned long access, unsigned long trap,
-	      unsigned long dsisr)
-{
-	unsigned long flags = 0;
-	struct mm_struct *mm = current->mm;
-
-	if (REGION_ID(ea) == VMALLOC_REGION_ID)
-		mm = &init_mm;
-
-	if (dsisr & DSISR_NOHPTE)
-		flags |= HPTE_NOHPTE_UPDATE;
-
-	return hash_page_mm(mm, ea, access, trap, flags);
-}
-EXPORT_SYMBOL_GPL(hash_page);
-
-void hash_preload(struct mm_struct *mm, unsigned long ea,
-		  unsigned long access, unsigned long trap)
-{
-	int hugepage_shift;
-	unsigned long vsid;
-	pgd_t *pgdir;
-	pte_t *ptep;
-	unsigned long flags;
-	int rc, ssize, update_flags = 0;
-
-	BUG_ON(REGION_ID(ea) != USER_REGION_ID);
-
-#ifdef CONFIG_PPC_MM_SLICES
-	/* We only prefault standard pages for now */
-	if (unlikely(get_slice_psize(mm, ea) != mm->context.user_psize))
-		return;
-#endif
-
-	DBG_LOW("hash_preload(mm=%p, mm->pgdir=%p, ea=%016lx, access=%lx,"
-		" trap=%lx\n", mm, mm->pgd, ea, access, trap);
-
-	/* Get Linux PTE if available */
-	pgdir = mm->pgd;
-	if (pgdir == NULL)
-		return;
-
-	/* Get VSID */
-	ssize = user_segment_size(ea);
-	vsid = get_vsid(mm->context.id, ea, ssize);
-	if (!vsid)
-		return;
-	/*
-	 * Hash doesn't like irqs. Walking linux page table with irq disabled
-	 * saves us from holding multiple locks.
-	 */
-	local_irq_save(flags);
-
-	/*
-	 * THP pages use update_mmu_cache_pmd. We don't do
-	 * hash preload there. Hence can ignore THP here
-	 */
-	ptep = find_linux_pte_or_hugepte(pgdir, ea, NULL, &hugepage_shift);
-	if (!ptep)
-		goto out_exit;
-
-	WARN_ON(hugepage_shift);
-#ifdef CONFIG_PPC_64K_PAGES
-	/* If either _PAGE_4K_PFN or _PAGE_NO_CACHE is set (and we are on
-	 * a 64K kernel), then we don't preload, hash_page() will take
-	 * care of it once we actually try to access the page.
-	 * That way we don't have to duplicate all of the logic for segment
-	 * page size demotion here
-	 */
-	if (pte_val(*ptep) & (_PAGE_4K_PFN | _PAGE_NO_CACHE))
-		goto out_exit;
-#endif /* CONFIG_PPC_64K_PAGES */
-
-	/* Is that local to this CPU ? */
-	if (cpumask_equal(mm_cpumask(mm), cpumask_of(smp_processor_id())))
-		update_flags |= HPTE_LOCAL_UPDATE;
-
-	/* Hash it in */
-#ifdef CONFIG_PPC_64K_PAGES
-	if (mm->context.user_psize == MMU_PAGE_64K)
-		rc = __hash_page_64K(ea, access, vsid, ptep, trap,
-				     update_flags, ssize);
-	else
-#endif /* CONFIG_PPC_64K_PAGES */
-		rc = __hash_page_4K(ea, access, vsid, ptep, trap, update_flags,
-				    ssize, subpage_protection(mm, ea));
-
-	/* Dump some info in case of hash insertion failure, they should
-	 * never happen so it is really useful to know if/when they do
-	 */
-	if (rc == -1)
-		hash_failure_debug(ea, access, vsid, trap, ssize,
-				   mm->context.user_psize,
-				   mm->context.user_psize,
-				   pte_val(*ptep));
-out_exit:
-	local_irq_restore(flags);
-}
-
-/* WARNING: This is called from hash_low_64.S, if you change this prototype,
- *          do not forget to update the assembly call site !
- */
-void flush_hash_page(unsigned long vpn, real_pte_t pte, int psize, int ssize,
-		     unsigned long flags)
-{
-	unsigned long hash, index, shift, hidx, slot;
-	int local = flags & HPTE_LOCAL_UPDATE;
-
-	DBG_LOW("flush_hash_page(vpn=%016lx)\n", vpn);
-	pte_iterate_hashed_subpages(pte, psize, vpn, index, shift) {
-		hash = hpt_hash(vpn, shift, ssize);
-		hidx = __rpte_to_hidx(pte, index);
-		if (hidx & _PTEIDX_SECONDARY)
-			hash = ~hash;
-		slot = (hash & htab_hash_mask) * HPTES_PER_GROUP;
-		slot += hidx & _PTEIDX_GROUP_IX;
-		DBG_LOW(" sub %ld: hash=%lx, hidx=%lx\n", index, slot, hidx);
-		/*
-		 * We use same base page size and actual psize, because we don't
-		 * use these functions for hugepage
-		 */
-		ppc_md.hpte_invalidate(slot, vpn, psize, psize, ssize, local);
-	} pte_iterate_hashed_end();
-
-#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
-	/* Transactions are not aborted by tlbiel, only tlbie.
-	 * Without, syncing a page back to a block device w/ PIO could pick up
-	 * transactional data (bad!) so we force an abort here.  Before the
-	 * sync the page will be made read-only, which will flush_hash_page.
-	 * BIG ISSUE here: if the kernel uses a page from userspace without
-	 * unmapping it first, it may see the speculated version.
-	 */
-	if (local && cpu_has_feature(CPU_FTR_TM) &&
-	    current->thread.regs &&
-	    MSR_TM_ACTIVE(current->thread.regs->msr)) {
-		tm_enable();
-		tm_abort(TM_CAUSE_TLBI);
-	}
-#endif
-}
-
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-void flush_hash_hugepage(unsigned long vsid, unsigned long addr,
-			 pmd_t *pmdp, unsigned int psize, int ssize,
-			 unsigned long flags)
-{
-	int i, max_hpte_count, valid;
-	unsigned long s_addr;
-	unsigned char *hpte_slot_array;
-	unsigned long hidx, shift, vpn, hash, slot;
-	int local = flags & HPTE_LOCAL_UPDATE;
-
-	s_addr = addr & HPAGE_PMD_MASK;
-	hpte_slot_array = get_hpte_slot_array(pmdp);
-	/*
-	 * IF we try to do a HUGE PTE update after a withdraw is done.
-	 * we will find the below NULL. This happens when we do
-	 * split_huge_page_pmd
-	 */
-	if (!hpte_slot_array)
-		return;
-
-	if (ppc_md.hugepage_invalidate) {
-		ppc_md.hugepage_invalidate(vsid, s_addr, hpte_slot_array,
-					   psize, ssize, local);
-		goto tm_abort;
-	}
-	/*
-	 * No bluk hpte removal support, invalidate each entry
-	 */
-	shift = mmu_psize_defs[psize].shift;
-	max_hpte_count = HPAGE_PMD_SIZE >> shift;
-	for (i = 0; i < max_hpte_count; i++) {
-		/*
-		 * 8 bits per each hpte entries
-		 * 000| [ secondary group (one bit) | hidx (3 bits) | valid bit]
-		 */
-		valid = hpte_valid(hpte_slot_array, i);
-		if (!valid)
-			continue;
-		hidx =  hpte_hash_index(hpte_slot_array, i);
-
-		/* get the vpn */
-		addr = s_addr + (i * (1ul << shift));
-		vpn = hpt_vpn(addr, vsid, ssize);
-		hash = hpt_hash(vpn, shift, ssize);
-		if (hidx & _PTEIDX_SECONDARY)
-			hash = ~hash;
-
-		slot = (hash & htab_hash_mask) * HPTES_PER_GROUP;
-		slot += hidx & _PTEIDX_GROUP_IX;
-		ppc_md.hpte_invalidate(slot, vpn, psize,
-				       MMU_PAGE_16M, ssize, local);
-	}
-tm_abort:
-#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
-	/* Transactions are not aborted by tlbiel, only tlbie.
-	 * Without, syncing a page back to a block device w/ PIO could pick up
-	 * transactional data (bad!) so we force an abort here.  Before the
-	 * sync the page will be made read-only, which will flush_hash_page.
-	 * BIG ISSUE here: if the kernel uses a page from userspace without
-	 * unmapping it first, it may see the speculated version.
-	 */
-	if (local && cpu_has_feature(CPU_FTR_TM) &&
-	    current->thread.regs &&
-	    MSR_TM_ACTIVE(current->thread.regs->msr)) {
-		tm_enable();
-		tm_abort(TM_CAUSE_TLBI);
-	}
-#endif
-	return;
-}
-#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
-
-void flush_hash_range(unsigned long number, int local)
-{
-	if (ppc_md.flush_hash_range)
-		ppc_md.flush_hash_range(number, local);
-	else {
-		int i;
-		struct ppc64_tlb_batch *batch =
-			this_cpu_ptr(&ppc64_tlb_batch);
-
-		for (i = 0; i < number; i++)
-			flush_hash_page(batch->vpn[i], batch->pte[i],
-					batch->psize, batch->ssize, local);
-	}
-}
-
-/*
- * low_hash_fault is called when we the low level hash code failed
- * to instert a PTE due to an hypervisor error
- */
-void low_hash_fault(struct pt_regs *regs, unsigned long address, int rc)
-{
-	enum ctx_state prev_state = exception_enter();
-
-	if (user_mode(regs)) {
-#ifdef CONFIG_PPC_SUBPAGE_PROT
-		if (rc == -2)
-			_exception(SIGSEGV, regs, SEGV_ACCERR, address);
-		else
-#endif
-			_exception(SIGBUS, regs, BUS_ADRERR, address);
-	} else
-		bad_page_fault(regs, address, SIGBUS);
-
-	exception_exit(prev_state);
-}
-
-long hpte_insert_repeating(unsigned long hash, unsigned long vpn,
-			   unsigned long pa, unsigned long rflags,
-			   unsigned long vflags, int psize, int ssize)
-{
-	unsigned long hpte_group;
-	long slot;
-
-repeat:
-	hpte_group = ((hash & htab_hash_mask) *
-		       HPTES_PER_GROUP) & ~0x7UL;
-
-	/* Insert into the hash table, primary slot */
-	slot = ppc_md.hpte_insert(hpte_group, vpn, pa, rflags, vflags,
-				  psize, psize, ssize);
-
-	/* Primary is full, try the secondary */
-	if (unlikely(slot == -1)) {
-		hpte_group = ((~hash & htab_hash_mask) *
-			      HPTES_PER_GROUP) & ~0x7UL;
-		slot = ppc_md.hpte_insert(hpte_group, vpn, pa, rflags,
-					  vflags | HPTE_V_SECONDARY,
-					  psize, psize, ssize);
-		if (slot == -1) {
-			if (mftb() & 0x1)
-				hpte_group = ((hash & htab_hash_mask) *
-					      HPTES_PER_GROUP)&~0x7UL;
-
-			ppc_md.hpte_remove(hpte_group);
-			goto repeat;
-		}
-	}
-
-	return slot;
-}
-
-#ifdef CONFIG_DEBUG_PAGEALLOC
-static void kernel_map_linear_page(unsigned long vaddr, unsigned long lmi)
-{
-	unsigned long hash;
-	unsigned long vsid = get_kernel_vsid(vaddr, mmu_kernel_ssize);
-	unsigned long vpn = hpt_vpn(vaddr, vsid, mmu_kernel_ssize);
-	unsigned long mode = htab_convert_pte_flags(pgprot_val(PAGE_KERNEL));
-	long ret;
-
-	hash = hpt_hash(vpn, PAGE_SHIFT, mmu_kernel_ssize);
-
-	/* Don't create HPTE entries for bad address */
-	if (!vsid)
-		return;
-
-	ret = hpte_insert_repeating(hash, vpn, __pa(vaddr), mode,
-				    HPTE_V_BOLTED,
-				    mmu_linear_psize, mmu_kernel_ssize);
-
-	BUG_ON (ret < 0);
-	spin_lock(&linear_map_hash_lock);
-	BUG_ON(linear_map_hash_slots[lmi] & 0x80);
-	linear_map_hash_slots[lmi] = ret | 0x80;
-	spin_unlock(&linear_map_hash_lock);
-}
-
-static void kernel_unmap_linear_page(unsigned long vaddr, unsigned long lmi)
-{
-	unsigned long hash, hidx, slot;
-	unsigned long vsid = get_kernel_vsid(vaddr, mmu_kernel_ssize);
-	unsigned long vpn = hpt_vpn(vaddr, vsid, mmu_kernel_ssize);
-
-	hash = hpt_hash(vpn, PAGE_SHIFT, mmu_kernel_ssize);
-	spin_lock(&linear_map_hash_lock);
-	BUG_ON(!(linear_map_hash_slots[lmi] & 0x80));
-	hidx = linear_map_hash_slots[lmi] & 0x7f;
-	linear_map_hash_slots[lmi] = 0;
-	spin_unlock(&linear_map_hash_lock);
-	if (hidx & _PTEIDX_SECONDARY)
-		hash = ~hash;
-	slot = (hash & htab_hash_mask) * HPTES_PER_GROUP;
-	slot += hidx & _PTEIDX_GROUP_IX;
-	ppc_md.hpte_invalidate(slot, vpn, mmu_linear_psize, mmu_linear_psize,
-			       mmu_kernel_ssize, 0);
-}
-
-void __kernel_map_pages(struct page *page, int numpages, int enable)
-{
-	unsigned long flags, vaddr, lmi;
-	int i;
-
-	local_irq_save(flags);
-	for (i = 0; i < numpages; i++, page++) {
-		vaddr = (unsigned long)page_address(page);
-		lmi = __pa(vaddr) >> PAGE_SHIFT;
-		if (lmi >= linear_map_hash_count)
-			continue;
-		if (enable)
-			kernel_map_linear_page(vaddr, lmi);
-		else
-			kernel_unmap_linear_page(vaddr, lmi);
-	}
-	local_irq_restore(flags);
-}
-#endif /* CONFIG_DEBUG_PAGEALLOC */
-
-void setup_initial_memory_limit(phys_addr_t first_memblock_base,
-				phys_addr_t first_memblock_size)
-{
-	/* We don't currently support the first MEMBLOCK not mapping 0
-	 * physical on those processors
-	 */
-	BUG_ON(first_memblock_base != 0);
-
-	/* On LPAR systems, the first entry is our RMA region,
-	 * non-LPAR 64-bit hash MMU systems don't have a limitation
-	 * on real mode access, but using the first entry works well
-	 * enough. We also clamp it to 1G to avoid some funky things
-	 * such as RTAS bugs etc...
-	 */
-	ppc64_rma_size = min_t(u64, first_memblock_size, 0x40000000);
-
-	/* Finally limit subsequent allocations */
-	memblock_set_current_limit(ppc64_rma_size);
-}
+‘i‘j‘k‘l‘m‘n‘o‘k8l8m8p‘n8q‘r‘s‘t‘o8u‘v‘w‘x‘y‘z‘‘‚‘ƒ‘„‘…‘†‘‡‘ˆ‘‰‘Š‘‹‘Œ‘‘‘‘‘‘‘’‘“‘”‘•‘p8q8–‘r8s8—‘˜‘™‘t8š‘u8›‘œ‘‘‘Ÿ‘v8w8 ‘x8¡‘y8¢‘£‘¤‘¥‘¦‘§‘z8¨‘©‘ª‘{8«‘¬‘­‘®‘¯‘°‘±‘²‘³‘´‘µ‘¶‘·‘¸‘¹‘|8}8º‘»‘¼‘½‘¾‘¿‘À‘Á‘Â‘Ã‘Ä‘Å‘Æ‘Ç‘È‘É‘Ê‘Ë‘Ì‘Í‘Î‘Ï‘Ğ‘Ñ‘Ò‘Ó‘Ô‘Õ‘Ö‘×‘Ø‘Ù‘Ú‘Û‘~8Ü‘İ‘Ş‘!9ß‘à‘á‘"9â‘ã‘ä‘å‘æ‘ç‘è‘é‘#9ê‘$9ë‘%9ì‘í‘î‘ï‘ğ‘ñ‘&9ò‘ó‘ô‘'9õ‘ö‘÷‘(9ø‘ù‘ú‘û‘ü‘ı‘ş‘A’)9B’*9C’D’E’F’G’H’I’J’+9,9-9K’.9L’M’/9091929N’O’P’Q’R’3949S’59T’69U’V’W’79X’8999Y’Z’a’:9b’c’d’;9e’f’g’h’i’j’k’l’<9m’=9n’o’p’q’r’s’t’u’>9v’w’x’y’z’’‚’ƒ’„’…’†’‡’ˆ’‰’Š’‹’Œ’’’’’‘’’’“’”’•’–’?9—’˜’™’@9š’›’œ’A9’’Ÿ’ ’¡’¢’£’¤’¥’¦’§’¨’©’ª’«’¬’­’®’¯’B9°’±’²’C9³’´’µ’D9¶’·’¸’¹’º’»’¼’E9½’¾’F9¿’À’Á’Â’Ã’Ä’Å’Æ’G9Ç’È’É’H9Ê’Ë’Ì’I9Í’Î’Ï’Ğ’Ñ’Ò’Ó’J9Ô’Õ’K9Ö’×’Ø’Ù’Ú’Û’Ü’İ’Ş’ß’à’á’â’ã’ä’å’æ’ç’è’é’ê’ë’ì’í’î’ï’ğ’ñ’ò’ó’ô’õ’ö’÷’ø’ù’L9M9ú’û’N9ü’ı’O9P9ş’Q9A“B“C“D“E“R9S9F“T9U9V9G“W9H“X9I“J“Y9Z9[9\9]9K“L“^9_9`9a9b9M“N“O“P“c9d9Q“e9R“f9S“T“U“g9V“W“h9i9X“Y“j9Z“a“b“k9c“d“e“f“g“h“i“l9m9j“n9o9p9k“l“m“q9n“o“r9s9p“q“t9r“s“t“u“v“w“x“y“z““‚“ƒ“u9„“…“†“‡“ˆ“‰“Š“‹“Œ“““““‘“’“““”“•“–“—“˜“™“š“›“œ“““Ÿ“ “¡“¢“£“¤“¥“¦“§“¨“©“v9w9ª“«“x9¬“­“y9z9®“{9¯“°“±“²“³“|9}9´“~9µ“!:":¶“·“¸“¹“º“#:$:»“¼“%:½“¾“&:':¿“À“Á“Â“Ã“Ä“Å“(:):Æ“*:+:,:Ç“È“É“Ê“Ë“Ì“-:.:Í“Î“/:Ï“Ğ“Ñ“0:Ò“Ó“Ô“Õ“Ö“×“Ø“Ù“1:Ú“2:3:4:Û“Ü“İ“5:Ş“ß“6:à“á“â“7:ã“ä“å“æ“ç“è“é“ê“ë“ì“í“î“ï“ğ“ñ“ò“ó“ô“õ“ö“÷“ø“ù“8:9:::ú“;:û“ü“ı“<:ş“A”B”C”D”E”F”=:>:G”?:H”@:I”J”K”L”M”N”A:O”P”Q”B:R”S”T”U”V”W”X”Y”Z”a”b”c”d”e”f”C:g”h”i”j”k”l”m”D:n”o”p”q”r”s”t”u”v”w”x”y”z””‚”ƒ”„”…”†”E:‡”ˆ”‰”Š”‹”Œ””F:G:””H:”‘”’”I:“”””•”–”—”˜”™”J:K:š”›”œ”””Ÿ” ”¡”¢”£”L:¤”¥”¦”M:§”¨”©”ª”«”¬”­”®”¯”°”±”²”³”´”µ”¶”·”¸”¹”º”»”¼”½”N:O:¾”¿”P:À”Á”Q:R:S:T:Â”Ã”Ä”Å”Æ”U:V:Ç”W:È”X:É”Ê”Ë”Y:Z:Ì”[:Í”Î”Ï”Ğ”Ñ”Ò”Ó”\:Ô”Õ”Ö”×”Ø”Ù”Ú”Û”Ü”İ”Ş”]:ß”à”á”â”ã”ä”å”^:æ”ç”è”é”ê”ë”ì”í”î”ï”ğ”ñ”ò”ó”ô”õ”ö”÷”ø”ù”ú”û”ü”ı”ş”A•B•_:`:C•D•a:E•F•G•b:H•I•J•K•L•M•N•O•P•Q•R•S•c:T•U•V•W•X•Y•d:Z•a•b•e:c•d•e•f:f•g•h•i•j•k•l•g:m•n•h:o•i:p•q•r•s•t•u•j:k:v•w•l:x•y•z•m:•‚•ƒ•„•…•†•‡•n:o:ˆ•p:‰•Š•‹•Œ•••••‘•’•“•”•••–•—•˜•™•š•›•œ•••Ÿ• •¡•¢•£•¤•¥•¦•§•¨•©•ª•«•¬•q:r:­•®•s:¯•°•±•t:²•u:³•´•µ•¶•·•v:w:¸•x:¹•y:z:{:º•»•¼•½•|:}:¾•¿•~:À•Á•Â•!;Ã•";Ä•Å•Æ•Ç•È•#;$;É•%;&;';Ê•Ë•Ì•Í•Î•(;);*;Ï•Ğ•+;Ñ•Ò•Ó•,;Ô•Õ•Ö•×•Ø•Ù•Ú•-;.;Û•/;0;1;Ü•İ•Ş•ß•à•á•2;3;â•ã•ä•å•æ•ç•è•é•ê•ë•ì•í•î•ï•4;ğ•ñ•ò•ó•ô•õ•ö•÷•ø•ù•ú•û•ü•ı•ş•A–B–C–D–E–F–G–H–I–J–K–L–M–N–O–P–Q–R–S–T–U–V–W–X–5;6;Y–Z–7;a–b–8;9;c–d–e–f–g–h–i–:;j–k–;;<;=;l–m–n–o–p–q–>;r–s–t–u–v–w–x–y–z––‚–ƒ–„–…–†–‡–ˆ–‰–Š–‹–?;Œ–––––‘–@;A;’–“–”–•–––—–˜–™–š–›–œ–––Ÿ–B;C; –D;E;F;¡–¢–£–¤–¥–¦–§–¨–©–ª–«–¬–­–®–¯–°–±–²–³–´–µ–¶–·–¸–¹–º–»–¼–½–¾–¿–À–Á–Â–G;H;Ã–Ä–I;Å–Æ–Ç–J;È–É–Ê–Ë–Ì–Í–Î–K;L;Ï–Ğ–Ñ–M;Ò–Ó–Ô–Õ–Ö–×–Ø–Ù–Ú–Û–Ü–İ–Ş–ß–à–á–â–ã–ä–å–æ–ç–è–é–ê–ë–ì–í–î–ï–ğ–ñ–ò–ó–ô–õ–ö–÷–ø–ù–ú–û–ü–ı–ş–A—B—C—D—E—F—G—H—I—J—K—L—M—N—O—P—Q—N;R—S—T—U—V—W—X—Y—Z—a—b—c—d—e—f—g—h—i—j—k—l—m—n—o—p—q—r—O;s—t—u—v—w—x—y—z——‚—ƒ—„—…—†—‡—ˆ—‰—Š—‹—Œ—P;————‘—’—Q;R;“—”—S;•—–———T;˜—™—š—›—œ———U;Ÿ— —V;¡—W;¢—£—¤—¥—¦—§—¨—©—ª—«—¬—­—®—¯—°—±—²—³—´—µ—¶—·—¸—¹—º—»—¼—½—¾—¿—À—Á—Â—Ã—Ä—Å—Æ—Ç—È—É—Ê—Ë—Ì—Í—Î—Ï—Ğ—Ñ—Ò—Ó—Ô—Õ—Ö—×—Ø—Ù—Ú—Û—Ü—İ—Ş—ß—à—á—â—ã—ä—å—æ—ç—è—é—ê—ë—ì—í—î—ï—ğ—ñ—ò—ó—ô—õ—ö—÷—ø—ù—ú—û—X;ü—ı—ş—A˜B˜C˜D˜E˜F˜G˜H˜I˜J˜K˜L˜M˜N˜O˜P˜Q˜Y;R˜S˜T˜U˜V˜W˜Z;X˜Y˜Z˜[;a˜b˜c˜\;d˜e˜f˜g˜h˜i˜j˜];^;k˜l˜m˜n˜o˜p˜q˜r˜s˜t˜u˜v˜w˜x˜y˜z˜˜‚˜ƒ˜„˜…˜†˜‡˜ˆ˜‰˜Š˜‹˜Œ˜˜˜˜˜‘˜’˜“˜”˜•˜–˜_;`;—˜˜˜a;™˜š˜›˜b;œ˜˜˜Ÿ˜ ˜¡˜¢˜c;d;£˜e;¤˜f;¥˜¦˜§˜¨˜©˜ª˜g;h;«˜i;j;¬˜­˜k;l;m;n;®˜¯˜°˜±˜²˜o;p;³˜q;r;s;´˜µ˜¶˜t;·˜¸˜u;v;¹˜º˜w;»˜¼˜½˜x;¾˜¿˜À˜Á˜Â˜Ã˜Ä˜y;z;Å˜{;|;};Æ˜Ç˜È˜É˜Ê˜Ë˜~;!<Ì˜Í˜"<Î˜Ï˜Ğ˜#<Ñ˜Ò˜Ó˜Ô˜Õ˜Ö˜×˜$<%<Ø˜&<Ù˜'<Ú˜Û˜Ü˜İ˜Ş˜ß˜(<à˜á˜â˜)<ã˜ä˜å˜*<æ˜ç˜è˜é˜ê˜ë˜ì˜+<í˜î˜ï˜ğ˜,<ñ˜ò˜ó˜ô˜õ˜ö˜-<.</<0<1<÷˜ø˜2<3<ù˜4<5<ú˜û˜ü˜ı˜6<7<ş˜8<9<:<A™B™C™D™;<E™<<=<F™G™><H™I™J™?<K™L™M™N™O™P™Q™@<A<R™B<C<D<S™T™U™V™W™X™E<F<Y™Z™G<a™b™c™H<d™e™f™g™h™i™j™I<J<k™K<L<M<l™m™n™o™p™q™N<r™s™t™O<u™v™w™P<x™y™z™™‚™ƒ™„™…™†™‡™ˆ™‰™Q<Š™‹™Œ™™™™R<S<T<™U<‘™’™“™V<”™W<•™–™—™˜™™™X<Y<š™Z<›™[<œ™™™\<Ÿ™ ™]<^<¡™¢™_<£™¤™¥™`<¦™§™¨™©™ª™«™¬™­™®™¯™°™±™a<²™³™´™µ™¶™·™b<¸™¹™º™c<»™¼™½™d<¾™¿™À™Á™Â™Ã™Ä™e<Å™Æ™f<g<Ç™È™É™Ê™Ë™Ì™Í™h<Î™Ï™Ğ™i<Ñ™Ò™Ó™j<Ô™Õ™Ö™×™Ø™Ù™Ú™k<l<Û™m<Ü™İ™Ş™ß™à™á™â™ã™n<o<ä™å™p<æ™ç™è™q<é™ê™ë™ì™í™î™ï™r<s<ğ™t<ñ™u<ò™ó™ô™õ™ö™÷™v<w<ø™ù™x<ú™û™y<z<ü™ı™ş™AšBšCšDš{<|<Eš}<Fš~<Gš!=Hš"=#=Iš$=JšKšLšMšNšOšPšQšRšSšTšUšVšWšXšYšZšašbš%=cšdšešfšgšhšiš&='=jškš(=lšmšnš)=ošpšqšršsštšuš*=všwšxšyš+=zšš‚šƒš„š…š,=-=†š‡š.=ˆš‰šŠš/=‹šŒššššš‘š0=1=’š2=“š3=”š•š–š—š˜š™š4=5=šš›šœšššŸš6= š¡š¢š£š¤š¥š¦š7=§š¨š8=©š9=ªš«š¬š­š®š¯š:=;=°š±š<=²š³š´š==>=µš¶š·š¸š¹šºš?=@=»šA=¼šB=½š¾š¿šÀšÁšÂšÃšÄšÅšÆšÇšÈšÉšÊšËšÌšÍšÎšÏšĞšÑšÒšÓšÔšÕšÖš×šØšÙšÚšÛšÜšİšŞšC=D=ßšàšE=ášâšF=G=ãšäšåšæšçšèšH=I=J=éšK=êšL=ëšìšíšîšM=ïšN=O=ğšP=Q=ñšòšóšR=ôšõšöš÷šøšùšúšS=T=ûšüšU=V=ıšşšA›B›C›W=X=Y=D›E›Z=F›G›H›[=I›J›K›L›M›N›O›\=]=P›Q›^=_=R›S›T›U›V›W›X›Y›Z›a›b›c›d›e›f›g›h›i›j›k›l›m›n›o›p›q›r›`=s›t›u›v›w›x›y›z››‚›ƒ›„›…›†›‡›ˆ›‰›Š›‹›Œ›››››‘›’›“›”›•›–›—›˜›™›š›a=b=››œ›c=››Ÿ›d= ›e=¡›¢›£›¤›¥›f=g=¦›§›h=i=¨›©›ª›«›¬›­›j=®›¯›°›k=±›²›³›l=´›µ›¶›·›¸›¹›º›»›¼›½›¾›¿›À›Á›Â›Ã›Ä›Å›Æ›Ç›È›É›Ê›Ë›Ì›Í›Î›Ï›Ğ›Ñ›Ò›Ó›Ô›Õ›Ö›×›Ø›Ù›Ú›Û›Ü›İ›Ş›ß›à›á›â›ã›ä›å›æ›m=ç›è›é›ê›ë›ì›í›î›ï›ğ›ñ›ò›ó›ô›õ›ö›÷›ø›ù›ú›û›ü›ı›n=o=ş›Aœp=BœCœq=r=Dœs=EœFœGœHœIœt=u=JœKœLœv=MœNœOœPœQœRœw=x=SœTœy=UœVœWœXœYœZœaœbœcœdœeœfœgœhœiœz=jœkœlœmœnœoœpœ{=qœrœsœtœuœvœwœxœyœzœœ‚œƒœ„œ…œ†œ‡œˆœ‰œ|=Šœ‹œŒœœœœœ}=‘œ’œ“œ~=”œ•œ–œ!>—œ˜œ™œšœ›œœœœ">#>œŸœ œ¡œ¢œ£œ¤œ¥œ¦œ§œ$>¨œ©œªœ«œ¬œ­œ®œ¯œ°œ±œ²œ³œ´œµœ¶œ·œ¸œ¹œºœ»œ¼œ½œ¾œ¿œÀœÁœÂœ%>&>ÃœÄœ'>ÅœÆœÇœ(>ÈœÉœÊœËœÌœÍœÎœ)>*>ÏœĞœÑœ+>ÒœÓœÔœÕœÖœ×œ,>ØœÙœÚœÛœÜœİœŞœßœàœáœâœãœäœåœæœçœèœéœêœ->ëœìœíœîœïœğœñœ.>òœóœôœõœöœ÷œøœùœúœûœüœıœşœABCDEFGHIJKLMN/>OPQ0>RSTUVWXYZabcdefghijklmnopqrstuvwxyz‚ƒ„…†‡ˆ‰1>Š‹Œ2>3>‘4>’“”5>•6>–—˜™7>8>9>š›œŸ ¡¢£:>¤¥¦;>§¨©<>ª«¬­®¯°=>±²³´µ¶·¸¹º»>>?>¼½@>¾¿ÀA>ÁÂÃÄÅÆÇB>C>ÈD>ÉE>ÊËÌÍÎÏF>G>ĞÑH>I>J>ÒK>L>M>ÓÔÕÖN>O>P>×Q>R>S>ØÙÚT>U>ÛV>W>ÜİX>ŞßàY>áâãäåæçZ>[>è\>]>^>éêëìíî_>`>ïğa>ñòób>ôõc>ö÷øùd>e>úf>ûg>üışh>Ai>j>BCDk>EFGl>HIJKLMNOm>PQRSTUVWXYn>o>Zap>q>br>s>t>u>cdefgv>w>x>y>z>{>|>h}>i~>j!?"?kl#?mno$?pqrstuv%?&?w'?x(?yz‚ƒ„)?*?+?…,?†‡ˆ-?‰.?/?Š‹Œ0?1?2?3?4?5?6?7?8?9?‘’“:?”•–;?—˜™š›œ<?=?>???Ÿ ¡¢£¤¥@?A?¦§B?¨©ªC?D?E?«F?¬­G?H?I?®J?¯K?°L?±²³´M?N?µ¶O?·¸¹P?º»¼½¾¿ÀQ?R?ÁS?T?U?ÂÃÄÅÆÇV?W?ÈÉX?ÊËÌÍÎÏĞÑÒÓÔY?ÕÖZ?×[?ØÙÚÛÜİ\?]?Şß^?àáâ_?ãäåæçèé`?a?êb?ëc?ìíîïğñd?e?òóf?ôõög?÷øùúûüıh?i?şj?AŸk?BŸCŸDŸEŸFŸGŸl?m?HŸIŸn?JŸKŸLŸo?p?q?MŸNŸOŸPŸQŸr?s?RŸt?SŸu?TŸUŸVŸWŸXŸYŸv?w?ZŸaŸx?bŸcŸdŸy?eŸfŸgŸhŸiŸjŸkŸz?{?lŸmŸ|?}?nŸoŸpŸqŸrŸsŸ~?!@tŸuŸ"@vŸwŸxŸ#@yŸzŸŸ‚ŸƒŸ„Ÿ…Ÿ$@%@†Ÿ‡ŸˆŸ&@‰ŸŠŸ‹ŸŒŸŸŸ'@(@ŸŸ)@‘Ÿ’Ÿ“Ÿ*@”Ÿ•Ÿ–Ÿ—Ÿ˜Ÿ™ŸšŸ+@,@›Ÿ-@œŸ.@ŸŸŸŸ Ÿ¡Ÿ¢Ÿ/@0@£Ÿ¤Ÿ1@¥Ÿ¦Ÿ§Ÿ2@¨Ÿ©ŸªŸ«Ÿ¬Ÿ­Ÿ®Ÿ3@4@¯Ÿ5@°Ÿ6@±Ÿ7@²Ÿ³Ÿ´ŸµŸ8@9@¶Ÿ·Ÿ:@¸Ÿ¹ŸºŸ;@»Ÿ¼Ÿ½Ÿ¾Ÿ¿Ÿ<@ÀŸ=@>@ÁŸ?@ÂŸ@@A@B@C@D@E@F@G@ÃŸÄŸÅŸH@ÆŸÇŸÈŸI@ÉŸÊŸËŸÌŸÍŸÎŸÏŸJ@ĞŸÑŸK@ÒŸÓŸÔŸÕŸÖŸ×ŸØŸÙŸL@M@ÚŸÛŸN@ÜŸİŸŞŸO@P@Q@ßŸàŸáŸâŸR@S@T@ãŸU@V@W@X@äŸåŸæŸY@çŸZ@[@èŸéŸ\@êŸ]@^@_@ëŸ`@ìŸíŸîŸïŸğŸa@b@ñŸc@d@e@f@òŸóŸôŸõŸöŸg@h@÷ŸøŸi@ùŸúŸûŸj@üŸıŸşŸA B C D k@l@E m@n@o@F G H I J K p@q@L M r@N s@O t@P Q R S T U V u@W X Y Z v@a b c d e f w@g h i x@j k l y@m n o p q r s t u v w x y z  ‚ ƒ „ … z@{@† ‡ |@ˆ ‰ Š }@‹ ~@Œ     !A"A‘ #A’ $A%A“ ” • – — &A'A˜ ™ (Aš › œ )A  Ÿ   ¡ ¢ £ *A+A¤ ,A¥ -A¦ § ¨ © ª « .A¬ ­ ® /A¯ ° ± 0A² ³ ´ µ ¶ · ¸ 1A2A¹ º 3A4A» ¼ ½ ¾ ¿ À 5AÁ Â Ã Ä Å Æ Ç È É Ê Ë Ì Í Î Ï Ğ Ñ Ò Ó Ô Õ Ö × Ø Ù Ú Û 6A7AÜ İ 8AŞ ß à 9Aá :Aâ ã ä å æ ;A<Aç =Aè >A?A@Aé ê ë AABACAì í î ï ğ ñ DAò ó ô õ ö ÷ ø ù EAú FAû GAü ı ş A¡B¡C¡HAD¡E¡F¡G¡H¡I¡J¡K¡L¡M¡N¡O¡P¡Q¡R¡S¡T¡U¡V¡IAJAW¡X¡Y¡Z¡a¡b¡KAc¡d¡e¡LAf¡g¡h¡MAi¡j¡k¡l¡m¡n¡o¡NAOAp¡PAq¡QAr¡s¡t¡u¡v¡w¡RASAx¡y¡TAz¡¡‚¡ƒ¡„¡…¡†¡‡¡ˆ¡‰¡Š¡‹¡Œ¡¡¡¡UA¡‘¡’¡“¡”¡•¡VAWA–¡—¡XA˜¡™¡š¡YAZA[A›¡œ¡¡¡Ÿ¡\A]A ¡^AA¢_AB¢C¢D¢E¢F¢G¢`AH¢I¢J¢K¢L¢M¢N¢O¢P¢Q¢R¢S¢T¢U¢V¢W¢X¢Y¢Z¢aAa¢b¢c¢d¢e¢f¢g¢bAh¢i¢j¢k¢l¢m¢n¢o¢p¢q¢r¢s¢t¢u¢v¢w¢x¢y¢z¢¢‚¢ƒ¢„¢…¢†¢‡¢ˆ¢cAdA‰¢Š¢eA‹¢Œ¢¢fA¢¢¢‘¢’¢“¢”¢gAhA•¢iA–¢—¢˜¢™¢š¢›¢œ¢¢jA¢Ÿ¢ ¢kAA£B£C£lAD£E£F£G£H£I£J£mAK£L£M£N£O£P£Q£R£S£T£U£nAoAV£W£pAX£Y£Z£qAa£b£c£d£e£f£g£rAsAh£tAi£uAj£k£l£m£n£o£p£q£r£s£t£u£v£w£x£y£z££‚£ƒ£„£…£†£‡£ˆ£‰£Š£‹£Œ£££££‘£vAwA’£“£xA”£•£yAzA–£{A—£˜£™£š£›£|A}Aœ£~A£!B"B£Ÿ£#B$B £%B&BA¤B¤'BC¤(BD¤)BE¤F¤*BG¤H¤I¤J¤+B,BK¤-B.B/BL¤M¤N¤O¤P¤Q¤0B1BR¤S¤2BT¤U¤V¤3BW¤X¤Y¤Z¤a¤b¤c¤4B5Bd¤6B7B8Be¤f¤g¤h¤i¤j¤9Bk¤l¤m¤:Bn¤o¤p¤q¤r¤s¤t¤u¤v¤w¤x¤y¤z¤¤‚¤ƒ¤;B„¤…¤†¤‡¤ˆ¤‰¤Š¤‹¤Œ¤¤¤¤¤‘¤’¤“¤”¤•¤–¤—¤˜¤™¤š¤›¤œ¤¤¤Ÿ¤ ¤A¥B¥C¥D¥E¥<B=BF¥G¥>BH¥I¥J¥?BK¥L¥M¥N¥O¥P¥Q¥@BABR¥BBCBDBS¥T¥U¥V¥W¥X¥EBY¥Z¥a¥b¥c¥d¥e¥f¥g¥h¥i¥j¥k¥l¥m¥n¥o¥p¥q¥r¥FBs¥t¥u¥v¥w¥x¥GBy¥z¥¥‚¥ƒ¥„¥…¥†¥‡¥ˆ¥‰¥Š¥‹¥Œ¥¥¥¥¥‘¥HB’¥“¥”¥•¥–¥—¥˜¥™¥š¥›¥œ¥¥¥Ÿ¥ ¥A¦B¦C¦D¦E¦F¦G¦H¦I¦J¦K¦L¦M¦N¦O¦P¦Q¦R¦S¦T¦IBJBU¦V¦KBW¦X¦Y¦LBZ¦a¦b¦c¦d¦e¦f¦MBNBg¦OBh¦PBi¦QBj¦k¦l¦m¦RBSBn¦o¦p¦q¦r¦s¦TBt¦u¦v¦w¦x¦y¦z¦¦‚¦ƒ¦„¦UB…¦†¦‡¦ˆ¦‰¦Š¦‹¦VBŒ¦¦¦¦¦‘¦’¦“¦”¦•¦–¦—¦˜¦™¦š¦›¦œ¦¦¦WBŸ¦ ¦A§B§C§D§E§XBF§G§H§YBI§J§K§ZBL§M§N§O§P§Q§R§[B\BS§T§U§V§W§X§Y§Z§a§b§c§d§e§f§g§h§i§j§k§l§m§n§o§p§q§r§s§t§u§v§w§]Bx§y§z§§‚§ƒ§^B_B„§…§`B†§‡§ˆ§aB‰§Š§‹§Œ§§§§bBcB§‘§’§dB“§”§•§–§—§˜§eB™§š§›§œ§§§Ÿ§ §A¨B¨C¨D¨E¨F¨G¨H¨I¨J¨K¨fBgBL¨M¨N¨O¨P¨Q¨R¨S¨T¨U¨V¨W¨X¨Y¨Z¨a¨b¨c¨d¨e¨f¨g¨h¨i¨j¨k¨l¨m¨n¨o¨p¨q¨r¨s¨hBt¨u¨v¨w¨x¨y¨z¨¨‚¨ƒ¨„¨…¨†¨‡¨ˆ¨‰¨Š¨‹¨Œ¨¨¨¨¨‘¨’¨“¨”¨iB•¨–¨—¨˜¨™¨š¨›¨œ¨¨¨Ÿ¨ ¨A©B©C©D©E©F©G©H©I©J©K©L©M©N©O©jBP©Q©R©S©T©U©V©W©X©Y©Z©a©b©c©d©kBe©f©lBg©mBh©i©j©k©l©m©n©o©p©q©r©s©t©u©v©w©x©y©z©©‚©ƒ©„©…©†©‡©ˆ©‰©Š©‹©Œ©©©©nBoB©‘©pB’©“©”©qB•©–©—©˜©™©š©›©rBsBœ©©©tBuBŸ© ©AªBªvBwBxBCªDªyBEªzBFª{BGªHªIªJªKªLªMª|B}BNª~B!C"C#COªPªQªRªSª$C%CTªUª&CVªWªXª'CYªZªaªbªcªdªeª(C)Cfª*C+C,Cgªhªiªjªkªlª-Cmªnªoª.Cpª/Cqª0Crªsªtªuªvªwªxª1Cyªzªª‚ª2Cƒª„ª…ª†ª‡ªˆª‰ªŠª‹ªŒªªªªª‘ª’ª“ª”ª•ª–ª—ª˜ª™ªšª›ªœªªªŸª ªA«B«C«D«3C4CE«F«5CG«H«I«6CJ«K«L«M«N«O«P«7C8CQ«9C:C;CR«S«T«U«V«W«<C=CX«Y«>CZ«a«b«?Cc«d«e«f«g«h«i«@CACj«BCk«CCl«m«n«o«p«q«DCr«s«t«ECu«v«w«x«y«z««‚«ƒ«„«…«†«‡«ˆ«‰«FCŠ«‹«Œ«««««GC‘«’«“«HC”«•«–«—«˜«™«š«›«œ«««Ÿ« «A¬B¬C¬ICD¬E¬F¬G¬H¬I¬JCKCJ¬K¬LCL¬M¬N¬MCO¬P¬Q¬R¬S¬T¬U¬NCOCV¬PCW¬QCX¬Y¬Z¬a¬b¬c¬RCd¬e¬f¬SCg¬h¬i¬TCj¬k¬l¬m¬n¬o¬p¬q¬r¬s¬t¬u¬UCv¬w¬x¬y¬z¬¬‚¬ƒ¬„¬…¬†¬‡¬ˆ¬‰¬Š¬‹¬Œ¬¬¬¬¬‘¬’¬“¬”¬•¬–¬—¬˜¬™¬š¬›¬œ¬¬VC¬Ÿ¬ ¬WCA­B­C­XCD­E­F­G­H­I­J­YCZCK­[CL­\CM­N­O­P­Q­R­]CS­T­U­V­W­X­Y­Z­a­b­c­d­e­f­g­^Ch­i­j­k­l­m­n­o­p­q­r­_C`Cs­t­aCu­v­w­bCx­y­z­­‚­ƒ­„­cCdC…­eC†­fC‡­ˆ­‰­Š­‹­Œ­gC­­­­‘­’­“­”­•­–­—­˜­™­š­›­œ­­­Ÿ­hC ­A®B®C®D®E®F®iCG®H®I®jCJ®K®L®M®N®O®P®Q®R®S®T®U®V®W®X®Y®Z®a®b®c®d®e®f®kCg®h®i®lCj®k®l®mCm®n®o®p®q®r®s®nCoCt®pCu®qCv®w®x®y®z®®rC‚®ƒ®„®sC…®†®‡®tCˆ®‰®Š®‹®Œ®®®uC®®‘®’®vC“®”®•®–®—®˜®wCxC™®š®yC›®œ®®zC®Ÿ® ®A¯B¯C¯D¯{C|CE¯}CF¯~CG¯H¯I¯J¯K¯L¯M¯N¯O¯P¯Q¯R¯S¯T¯U¯V¯W¯X¯Y¯Z¯a¯b¯c¯d¯e¯f¯g¯h¯i¯j¯k¯l¯m¯n¯!D"Do¯p¯#Dq¯r¯$D%D&Ds¯t¯u¯v¯w¯x¯'D(Dy¯)Dz¯*D¯‚¯ƒ¯„¯…¯†¯+D,D‡¯ˆ¯-D‰¯Š¯‹¯.DŒ¯¯¯¯¯‘¯’¯/D0D“¯1D”¯2D•¯–¯—¯˜¯™¯š¯3D4D›¯œ¯5D¯¯Ÿ¯6D ¯A°B°C°D°E°F°7D8DG°9D:D;DH°I°J°K°L°M°<D=DN°O°P°Q°R°S°T°U°V°W°X°Y°Z°a°b°c°d°e°f°>Dg°h°i°j°k°l°m°n°o°p°q°r°s°t°u°v°w°x°y°z°°‚°ƒ°„°…°†°‡°ˆ°‰°Š°‹°Œ°°°?D@D°°AD‘°’°BDCD“°”°•°–°—°˜°™°DDEDš°FDGDHD›°œ°°°Ÿ° °IDJDA±B±KDC±D±E±LDF±G±H±I±J±K±L±MDNDM±ODN±PDO±P±Q±R±S±T±QDU±V±W±RDX±Y±Z±SDa±b±c±d±e±f±g±TDUDh±VDWDXDi±j±k±l±m±n±YDo±p±q±r±s±t±u±v±w±x±y±z±±‚±ƒ±„±…±†±‡±ˆ±‰±Š±‹±Œ±±±±ZD[D±‘±\D’±“±”±]D•±–±—±˜±™±š±›±^D_Dœ±`D±aD±Ÿ± ±A²B²C²bDcDD²E²dDF²G²H²eDI²J²K²L²M²N²O²fDP²Q²R²S²gDT²U²V²W²X²Y²hDZ²a²b²c²d²e²f²g²h²i²j²k²l²m²n²o²p²q²r²s²iDt²u²v²w²x²y²jDz²²‚²ƒ²„²…²†²kD‡²ˆ²‰²Š²‹²Œ²²²²²‘²’²“²”²•²–²—²˜²™²lDš²›²œ²²²Ÿ² ²A³B³C³D³E³F³G³H³I³J³K³L³M³N³O³P³Q³R³S³T³mDnDU³V³oDW³X³Y³pDZ³a³b³c³d³e³f³qDrDg³sDh³tDi³j³k³l³m³n³uDo³p³q³vDr³s³t³wDu³v³w³x³y³z³³‚³ƒ³„³…³†³xD‡³ˆ³‰³Š³‹³Œ³yD³³³³‘³’³“³”³•³–³—³˜³™³š³›³œ³³³Ÿ³ ³zDA´B´C´D´E´F´{D|DG´H´}DI´J´K´~DL´M´N´O´P´Q´R´!E"ES´#ET´$EU´V´W´X´Y´Z´%Ea´b´c´&Ed´e´f´'Eg´h´i´j´k´l´m´(En´o´p´q´r´s´t´u´v´w´x´)E*Ey´z´+E´‚´ƒ´,E„´…´†´‡´ˆ´‰´Š´-E.E‹´Œ´´/E´´´‘´’´“´”´•´–´—´˜´™´š´›´œ´´´Ÿ´ ´AµBµCµDµEµFµGµHµIµJµKµLµMµNµOµ0E1EPµQµ2ERµSµTµ3EUµVµWµXµYµZµaµ4E5Ebµ6Ecµ7Edµeµfµgµhµiµ8E9Ejµkµ:Elµmµnµ;E<Eoµpµqµrµsµtµ=E>Euµ?E@EAEvµwµxµyµzµµBECE‚µƒµDE„µ…µ†µEE‡µˆµ‰µŠµ‹µŒµµFEGEµHEIEJEµµ‘µ’µ“µ”µKE•µ–µ—µ˜µ™µšµ›µœµµµŸµ µA¶B¶C¶D¶E¶F¶G¶H¶LEI¶J¶K¶L¶M¶N¶O¶P¶Q¶R¶S¶T¶U¶V¶W¶X¶Y¶Z¶a¶b¶c¶d¶e¶f¶g¶h¶i¶j¶k¶l¶m¶n¶o¶p¶MENEq¶r¶OEs¶t¶u¶PEv¶QEw¶x¶y¶z¶¶RESE‚¶TEUEVEƒ¶„¶…¶†¶‡¶ˆ¶WEXE‰¶Š¶YE‹¶Œ¶¶ZE¶¶¶‘¶’¶“¶”¶[E\E•¶]E–¶^E—¶˜¶™¶š¶›¶œ¶_E¶¶Ÿ¶`E ¶A·B·C·D·E·F·G·H·I·J·K·L·M·N·aEO·P·Q·R·S·T·U·bEV·W·X·cEY·Z·a·b·c·d·e·f·g·h·i·j·k·l·m·n·o·p·q·r·s·t·u·dEeEv·w·fEx·y·z·gE·‚·ƒ·„·…·†·‡·hEiEˆ·jE‰·kEŠ·‹·Œ··lE·mE··‘·nE’·“·”·•·–·—·˜·™·š·›·œ···Ÿ· ·A¸B¸C¸D¸E¸F¸G¸H¸oEI¸J¸K¸L¸M¸N¸O¸P¸Q¸R¸S¸T¸U¸V¸W¸X¸Y¸Z¸a¸b¸c¸d¸e¸f¸g¸h¸i¸pEj¸k¸l¸qEm¸n¸o¸p¸q¸r¸s¸t¸u¸v¸w¸x¸y¸z¸rE¸sE‚¸ƒ¸„¸…¸†¸‡¸tEˆ¸‰¸Š¸‹¸Œ¸¸¸¸¸‘¸’¸“¸”¸•¸–¸—¸˜¸™¸š¸›¸œ¸¸¸Ÿ¸ ¸A¹B¹uEvEC¹D¹wEE¹F¹G¹xEH¹I¹J¹K¹L¹M¹N¹yEzEO¹{EP¹|EQ¹R¹S¹T¹U¹V¹}EW¹X¹Y¹Z¹a¹b¹c¹d¹e¹f¹g¹h¹i¹j¹k¹l¹m¹n¹o¹~Ep¹q¹r¹s¹t¹u¹v¹!Fw¹x¹y¹z¹¹‚¹ƒ¹„¹…¹†¹‡¹ˆ¹‰¹Š¹‹¹Œ¹¹¹¹¹‘¹’¹“¹”¹•¹–¹—¹"F#F˜¹™¹$Fš¹›¹œ¹%F¹¹Ÿ¹ ¹AºBºCº&F'FDºEºFº(FGºHºIºJºKºLº)FMºNºOº*FPºQºRº+FSºTºUºVºWºXºYº,FZºaºbºcº-Fdºeºfºgºhºiº.F/Fjºkº0Flºmº1F2Fnº3Foºpºqºrºsº4F5Ftº6Fuºvºwºxºyºzºº‚º7Fƒº„º…º8F†º‡ºˆº9F‰ºŠº‹ºŒºººº:F;Fº‘º’º“º”º•º–º—º˜º™º<F=Fšº›º>Fœººº?FŸº ºA»B»C»D»E»@FAFF»BFG»CFH»I»J»K»L»M»DFEFFFN»GFO»P»Q»HFR»IFS»T»U»V»W»JFKFX»LFMFNFY»Z»a»OFb»c»PFQFd»e»RFf»g»h»SFi»j»k»l»m»n»o»TFUFp»VFWFXFq»r»s»t»u»v»YFZFw»x»y»z»»‚»ƒ»„»…»†»‡»ˆ»‰»Š»‹»Œ»»»»»‘»’»“»”»•»–»—»˜»™»š»›»œ»»»Ÿ» »A¼B¼C¼D¼E¼F¼G¼H¼I¼J¼K¼L¼M¼N¼O¼P¼Q¼R¼[F\FS¼T¼]FU¼V¼W¼^FX¼Y¼Z¼a¼b¼c¼d¼_F`Fe¼aFbFcFf¼g¼h¼i¼j¼k¼dFeFl¼m¼fFn¼o¼p¼gFq¼r¼s¼t¼u¼v¼w¼hFiFx¼jFy¼kFz¼¼‚¼ƒ¼„¼…¼lF†¼‡¼ˆ¼mF‰¼Š¼‹¼nFŒ¼¼¼¼¼‘¼’¼oFpF“¼”¼qFrF•¼–¼—¼˜¼™¼š¼sF›¼œ¼¼¼Ÿ¼ ¼A½tFB½C½D½E½F½G½H½I½uFJ½vFK½L½M½N½O½P½Q½R½wFxFS½T½yFU½V½W½zFX½Y½Z½a½b½c½d½{F|Fe½}Ff½~Fg½h½i½j½k½l½!Gm½n½o½p½q½r½s½t½u½v½w½x½y½z½½‚½ƒ½„½…½†½"G‡½ˆ½‰½Š½‹½Œ½½½½½‘½’½“½”½•½–½—½˜½™½š½›½œ½½½Ÿ½ ½A¾B¾C¾D¾E¾F¾G¾H¾#GI¾J¾K¾$GL¾M¾N¾O¾P¾Q¾R¾S¾T¾U¾V¾W¾X¾Y¾Z¾a¾b¾c¾d¾e¾f¾g¾h¾%Gi¾j¾k¾&Gl¾m¾n¾'Go¾p¾q¾r¾s¾t¾u¾v¾(Gw¾)Gx¾y¾z¾¾‚¾ƒ¾„¾…¾*G+G†¾‡¾,Gˆ¾‰¾-G.GŠ¾/G‹¾Œ¾¾¾¾0G1G¾2G‘¾3G’¾“¾”¾•¾–¾—¾4G˜¾™¾š¾›¾œ¾¾¾Ÿ¾ ¾A¿B¿C¿D¿E¿F¿G¿H¿I¿J¿K¿5GL¿M¿N¿O¿P¿Q¿R¿S¿T¿U¿V¿W¿X¿Y¿Z¿a¿b¿c¿d¿e¿f¿g¿h¿i¿j¿k¿l¿m¿n¿o¿p¿q¿r¿s¿6Gt¿u¿v¿7Gw¿x¿y¿8Gz¿¿‚¿ƒ¿„¿…¿†¿9G‡¿ˆ¿:G‰¿Š¿‹¿Œ¿¿¿¿¿;G‘¿’¿“¿<G”¿•¿–¿=G—¿˜¿™¿š¿›¿œ¿¿>G¿Ÿ¿?G ¿@GAÀBÀCÀDÀEÀFÀAGGÀHÀIÀBGJÀKÀLÀCGMÀNÀOÀPÀQÀRÀSÀDGEGTÀFGUÀVÀWÀXÀYÀZÀaÀbÀcÀdÀeÀfÀgÀhÀiÀjÀkÀlÀmÀnÀoÀpÀqÀrÀsÀtÀuÀvÀwÀxÀyÀzÀÀ‚ÀƒÀ„ÀGGHG…À†ÀIG‡ÀˆÀ‰ÀJGŠÀ‹ÀŒÀÀÀÀÀKGLG‘ÀMG’ÀNG“À”À•À–À—À˜ÀOGPG™ÀšÀQG›ÀœÀÀRGÀŸÀ ÀAÁSGBÁCÁTGUGDÁVGEÁWGFÁGÁHÁIÁJÁKÁXGYGLÁMÁZGNÁOÁPÁ[GQÁRÁSÁTÁUÁVÁWÁ\G]GXÁ^G_G`GYÁZÁaÁbÁcÁdÁaGeÁfÁgÁhÁiÁjÁkÁlÁmÁnÁoÁpÁqÁrÁsÁtÁuÁvÁwÁxÁbGyÁzÁÁ‚ÁƒÁ„Á…Á†Á‡ÁˆÁ‰ÁŠÁ‹ÁŒÁÁÁÁÁ‘Á’Á“Á”Á•Á–Á—Á˜Á™ÁšÁ›ÁœÁÁÁŸÁ ÁcGdGAÂBÂeGCÂDÂEÂfGFÂgGGÂHÂIÂJÂKÂhGiGLÂjGMÂkGNÂOÂPÂQÂRÂSÂlGmGTÂUÂnGVÂWÂXÂoGYÂZÂaÂbÂcÂdÂeÂpGqGfÂrGgÂsGhÂiÂjÂkÂlÂmÂtGuGnÂoÂvGpÂqÂrÂwGsÂtÂuÂvÂwÂxÂyÂxGyGzÂzG{G|GÂ‚ÂƒÂ„Â…Â†Â}G‡ÂˆÂ‰Â~GŠÂ‹ÂŒÂ!HÂÂÂÂ‘Â’Â“Â”Â"H•Â–Â—Â˜Â™ÂšÂ›ÂœÂÂÂ#H$HŸÂ Â%HAÃBÃCÃ&HDÃEÃFÃGÃ'HHÃIÃ(H)HJÃ*HKÃ+HLÃMÃNÃ,HOÃPÃ-H.HQÃRÃ/HSÃTÃUÃ0HVÃWÃXÃYÃZÃaÃbÃcÃdÃeÃ1HfÃ2HgÃhÃiÃjÃkÃlÃ3H4HmÃnÃ5HoÃpÃqÃrÃsÃtÃuÃvÃwÃxÃyÃzÃÃ‚Ã6HƒÃ7H„Ã…Ã†Ã‡ÃˆÃ‰Ã8H9HŠÃ‹Ã:HŒÃÃÃ;HÃÃ‘Ã’Ã“Ã”Ã•Ã–Ã<H—Ã=H˜Ã>H™ÃšÃ›ÃœÃÃÃ?HŸÃ ÃAÄ@HBÄCÄDÄAHEÄFÄGÄHÄIÄJÄKÄLÄBHMÄCHNÄOÄPÄQÄRÄSÄTÄUÄDHEHVÄWÄFHXÄYÄZÄGHaÄbÄcÄdÄHHeÄfÄIHgÄhÄJHiÄKHjÄkÄlÄmÄnÄoÄLHpÄqÄrÄMHsÄtÄuÄNHvÄwÄxÄyÄzÄÄ‚ÄOHƒÄ„Ä…Ä†ÄPH‡ÄˆÄ‰ÄŠÄ‹ÄŒÄQHRHÄÄSHÄÄ‘ÄTH’Ä“Ä”Ä•Ä–Ä—Ä˜Ä™ÄšÄ›ÄœÄÄUHÄŸÄ ÄAÅBÅCÅVHWHDÅEÅXHFÅGÅHÅYHIÅJÅKÅLÅMÅNÅOÅZH[HPÅ\HQÅ]HRÅSÅTÅUÅVÅWÅ^H_HXÅYÅ`HZÅaÅbÅaHcÅdÅeÅfÅgÅhÅiÅbHjÅkÅcHlÅdHmÅnÅoÅpÅqÅrÅeHfHsÅtÅgHuÅhHiHjHkHvÅwÅxÅyÅzÅÅlHmH‚ÅnHƒÅoH„Å…Å†ÅpH‡ÅˆÅqH‰ÅŠÅ‹ÅrHŒÅÅÅsHÅÅ‘Å’Å“Å”Å•ÅtHuH–Å—Å˜ÅvH™ÅšÅ›ÅœÅÅÅwHxHŸÅ ÅyHAÆBÆCÆzHDÆEÆFÆGÆHÆIÆJÆ{H|HKÆ}HLÆ~HMÆNÆOÆPÆQÆRÆPKVKgKOMhM-N{O"P8PPP]PTQUQXQ[Q\Q]Q^Q_Q`QbQcQdQeQfQhQiQjQkQmQoQpQrQvQzQ|Q}Q~Q"R#R'R(R)R*R+R-R2R>RBRCRDRFRGRHRIRJRKRMRNRORPRQRRRSRTRURVRWRYRZR^R_RaRbRdReRfRgRhRiRjRkRpRqRrRsRtRuRwRxRfT|T%U+U.U8VMVKWdWE[d[%\%]U]t]|^~^3_a_h_q`-amauc!d)d.e1e2e9e;e<eDeNePeReVeze{e|e~e!f$f'f-f/f0f1f3f7f8f<fDfFfGfJfRfVfYf\f_fafdfefffhfjfkflfofqfrfufvfwfyf!g&g)g*g,g-g0g?gAgFgGgKgMgOgPgSg_gdgfgwgghhhphqhwhyh{h~h'i,iLiwiAjejtjwj|j~j$k'k)k*k:k;k=kAkBkFkGkLkOkPkQkRkXk&l'l*l/l0l1l2l5l8l:l@lAlElFlIlJlUl]l^laldlglhlwlxlzl!m"m#mnm[n=rzr1s'tnttvvv8wHwSw[xpx!z"zfz)|!#"###$#%#&#'#(#)#*#+#,#-#.#/#0#1#2#3#4#5#6#7#8#9#:#;#<#=#>#?#@#A#B#C#D#E#F#G#H#I#J#K#L#M#N#O#P#Q#R#S#T#U#V#W#X#Y#Z#[#,!]#^#_#`#a#b#c#d#e#f#g#h#i#j#k#l#m#n#o#p#q#r#s#t#u#v#w#x#y#z#{#|#}#&"ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿK!L!~!~#ÿÿM!\#       	
+  	
+   000· % & ¨ 0­  %"<ÿ<"    000	0
+00000000± × ÷ `"d"e""4"° 2 3 !+!àÿáÿåÿB&@& "¥"#""a"R"§ ; &&Ë%Ï%Î%Ç%Æ%¡% %³%²%½%¼%’!!‘!“!”!0j"k""=""5"+","""†"‡"‚"ƒ"*")"'"("âÿÒ!Ô! ""´ ^ÿÇØİÚÙ¸ Û¡ ¿ Ğ."""¤ 	!0 Á%À%·%¶%d&`&a&e&g&c&™"È%£%Ğ%Ñ%’%¤%¥%¨%§%¦%©%h&&&&&¶   ! •!—!™!–!˜!m&i&j&l&22!Ç3"!Â3Ø3!!¬ ® ÿÿÿÿÿÿÿÿ	ÿ
+ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ ÿ!ÿ"ÿ#ÿ$ÿ%ÿ&ÿ'ÿ(ÿ)ÿ*ÿ+ÿ,ÿ-ÿ.ÿ/ÿ0ÿ1ÿ2ÿ3ÿ4ÿ5ÿ6ÿ7ÿ8ÿ9ÿ:ÿ;ÿæÿ=ÿ>ÿ?ÿ@ÿAÿBÿCÿDÿEÿFÿGÿHÿIÿJÿKÿLÿMÿNÿOÿPÿQÿRÿSÿTÿUÿVÿWÿXÿYÿZÿ[ÿ\ÿ]ÿãÿ112131415161718191:1;1<1=1>1?1@1A1B1C1D1E1F1G1H1I1J1K1L1M1N1O1P1Q1R1S1T1U1V1W1X1Y1Z1[1\1]1^1_1`1a1b1c1d1e1f1g1h1i1j1k1l1m1n1o1p1q1r1s1t1u1v1w1x1y1z1{1|1}1~11€11‚1ƒ1„1…1†1‡1ˆ1‰1Š1‹1Œ111p!q!r!s!t!u!v!w!x!y!şÿşÿşÿşÿşÿ`!a!b!c!d!e!f!g!h!i!şÿşÿşÿşÿşÿşÿşÿ‘’“”•–—˜™š›œŸ ¡£¤¥¦§¨©şÿşÿşÿşÿşÿşÿşÿşÿ±²³´µ¶·¸¹º»¼½¾¿ÀÁÃÄÅÆÇÈÉ %%%%%%%,%$%4%<%%%%%%%#%3%+%;%K% %/%(%7%?%%0%%%8%B%%%%%%%%%%%!%"%&%'%)%*%-%.%1%2%5%6%9%:%=%>%@%A%C%D%E%F%G%H%I%J%•3–3—3!˜3Ä3£3¤3¥3¦3™3š3›3œ333Ÿ3 3¡3¢3Ê3333Ï3ˆ3‰3È3§3¨3°3±3²3³3´3µ3¶3·3¸3¹3€33‚3ƒ3„3º3»3¼3½3¾3¿33‘3’3“3”3&!À3Á3Š3‹3Œ3Ö3Å3­3®3¯3Û3©3ª3«3¬3İ3Ğ3Ó3Ã3É3Ü3Æ3Æ Ğ ª &şÿ2şÿ?AØ Rº Ş fJşÿ`2a2b2c2d2e2f2g2h2i2j2k2l2m2n2o2p2q2r2s2t2u2v2w2x2y2z2{2Ğ$Ñ$Ò$Ó$Ô$Õ$Ö$×$Ø$Ù$Ú$Û$Ü$İ$Ş$ß$à$á$â$ã$ä$å$æ$ç$è$é$`$a$b$c$d$e$f$g$h$i$j$k$l$m$n$½ S!T!¼ ¾ [!\!]!^!æ ğ '138@Bø Sß ş gKI 222222222	2
+222222222222222222œ$$$Ÿ$ $¡$¢$£$¤$¥$¦$§$¨$©$ª$«$¬$­$®$¯$°$±$²$³$´$µ$t$u$v$w$x$y$z${$|$}$~$$€$$‚$¹ ² ³ t   ‚ ƒ „ A0B0C0D0E0F0G0H0I0J0K0L0M0N0O0P0Q0R0S0T0U0V0W0X0Y0Z0[0\0]0^0_0`0a0b0c0d0e0f0g0h0i0j0k0l0m0n0o0p0q0r0s0t0u0v0w0x0y0z0{0|0}0~00€00‚0ƒ0„0…0†0‡0ˆ0‰0Š0‹0Œ00000‘0’0“0¡0¢0£0¤0¥0¦0§0¨0©0ª0«0¬0­0®0¯0°0±0²0³0´0µ0¶0·0¸0¹0º0»0¼0½0¾0¿0À0Á0Â0Ã0Ä0Å0Æ0Ç0È0É0Ê0Ë0Ì0Í0Î0Ï0Ğ0Ñ0Ò0Ó0Ô0Õ0Ö0×0Ø0Ù0Ú0Û0Ü0İ0Ş0ß0à0á0â0ã0ä0å0æ0ç0è0é0ê0ë0ì0í0î0ï0ğ0ñ0ò0ó0ô0õ0ö0 !"#$%&'()*+,-./şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ012345Q6789:;<=>?@ABCDEFGHIJKLMNO ¬¬¬¬¬	¬
+¬¬¬¬¬¬¬¬¬¬¬¬¬¬ ¬$¬,¬-¬/¬0¬1¬8¬9¬<¬@¬K¬M¬T¬X¬\¬p¬q¬t¬w¬x¬z¬€¬¬ƒ¬„¬…¬†¬‰¬Š¬‹¬Œ¬¬”¬œ¬¬Ÿ¬ ¬¡¬¨¬©¬ª¬¬¬¯¬°¬¸¬¹¬»¬¼¬½¬Á¬Ä¬È¬Ì¬Õ¬×¬à¬á¬ä¬ç¬è¬ê¬ì¬ï¬ğ¬ñ¬ó¬õ¬ö¬ü¬ı¬ ­­­­­­­­­ ­)­,­-­4­5­8­<­D­E­G­I­P­T­X­a­c­l­m­p­s­t­u­v­{­|­}­­­‚­ˆ­‰­Œ­­œ­­¤­·­À­Á­Ä­È­Ğ­Ñ­Ó­Ü­à­ä­ø­ù­ü­ÿ­ ®®®	®®®®0®1®4®7®8®:®@®A®C®E®F®J®L®M®N®P®T®V®\®]®_®`®a®e®h®i®l®p®x®y®{®|®}®„®…®Œ®¼®½®¾®À®Ä®Ì®Í®Ï®Ğ®Ñ®Ø®Ù®Ü®è®ë®í®ô®ø®ü®¯¯¯¯,¯-¯0¯2¯4¯<¯=¯?¯A¯B¯C¯H¯I¯P¯\¯]¯d¯e¯y¯€¯„¯ˆ¯¯‘¯•¯œ¯¸¯¹¯¼¯À¯Ç¯È¯É¯Ë¯Í¯Î¯Ô¯Ü¯è¯é¯ğ¯ñ¯ô¯ø¯ °°°°°°°°(°D°E°H°J°L°N°S°T°U°W°Y°]°|°}°€°„°Œ°°°‘°˜°™°š°œ°Ÿ° °¡°¢°¨°©°«°¬°­°®°¯°±°³°´°µ°¸°¼°Ä°Å°Ç°È°É°Ğ°Ñ°Ô°Ø°à°å°±	±±±±±±±±±±±#±$±%±(±,±4±5±7±8±9±@±A±D±H±P±Q±T±U±X±\±`±x±y±|±€±‚±ˆ±‰±‹±±’±“±”±˜±œ±¨±Ì±Ğ±Ô±Ü±İ±ß±è±é±ì±ğ±ù±û±ı±²²²²²²²²² ²4²<²X²\²`²h²i²t²u²|²„²…²‰²²‘²”²˜²™²š² ²¡²£²¥²¦²ª²¬²°²´²È²É²Ì²Ğ²Ò²Ø²Ù²Û²İ²â²ä²å²æ²è²ë²ì²í²î²ï²ó²ô²õ²÷²ø²ù²ú²û²ÿ² ³³³³³³³³³³T³U³V³X³[³\³^³_³d³e³g³i³k³n³p³q³t³x³€³³ƒ³„³…³Œ³³”³ ³¡³¨³¬³Ä³Å³È³Ë³Ì³Î³Ğ³Ô³Õ³×³Ù³Û³İ³à³ä³è³ü³´´´ ´(´)´+´4´P´Q´T´X´`´a´c´e´l´€´ˆ´´¤´¨´¬´µ´·´¹´À´Ä´È´Ğ´Õ´Ü´İ´à´ã´ä´æ´ì´í´ï´ñ´ø´µµµµµ$µ%µ'µ(µ)µ*µ0µ1µ4µ8µ@µAµCµDµEµKµLµMµPµTµ\µ]µ_µ`µaµ µ¡µ¤µ¨µªµ«µ°µ±µ³µ´µµµ»µ¼µ½µÀµÄµÌµÍµÏµĞµÑµØµìµ¶¶¶¶%¶,¶4¶H¶d¶h¶œ¶¶ ¶¤¶«¶¬¶±¶Ô¶ğ¶ô¶ø¶ ···(·)·,·/·0·8·9·;·D·H·L·T·U·`·d·h·p·q·s·u·|·}·€·„·Œ····‘·’·–·—·˜·™·œ· ·¨·©·«·¬·­·´·µ·¸·Ç·É·ì·í·ğ·ô·ü·ı·ÿ· ¸¸¸¸	¸¸¸¸¸¸¸$¸%¸(¸,¸4¸5¸7¸8¸9¸@¸D¸Q¸S¸\¸]¸`¸d¸l¸m¸o¸q¸x¸|¸¸¨¸°¸´¸¸¸À¸Á¸Ã¸Å¸Ì¸Ğ¸Ô¸İ¸ß¸á¸è¸é¸ì¸ğ¸ø¸ù¸û¸ı¸¹¹ ¹<¹=¹@¹D¹L¹O¹Q¹X¹Y¹\¹`¹h¹i¹k¹m¹t¹u¹x¹|¹„¹…¹‡¹‰¹Š¹¹¹¬¹­¹°¹´¹¼¹½¹¿¹Á¹È¹É¹Ì¹Î¹Ï¹Ğ¹Ñ¹Ò¹Ø¹Ù¹Û¹İ¹Ş¹á¹ã¹ä¹å¹è¹ì¹ô¹õ¹÷¹ø¹ù¹ú¹ ºººº8º9º<º@ºBºHºIºKºMºNºSºTºUºXº\ºdºeºgºhºiºpºqºtºxºƒº„º…º‡ºŒº¨º©º«º¬º°º²º¸º¹º»º½ºÄºÈºØºÙºüº »»»»»»» »)»+»4»5»6»8»;»<»=»>»D»E»G»I»M»O»P»T»X»a»c»l»ˆ»Œ»»¤»¨»¬»´»·»À»Ä»È»Ğ»Ó»ø»ù»ü»ÿ» ¼¼¼	¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼¼$¼%¼'¼)¼-¼0¼1¼4¼8¼@¼A¼C¼D¼E¼I¼L¼M¼P¼]¼„¼…¼ˆ¼‹¼Œ¼¼”¼•¼—¼™¼š¼ ¼¡¼¤¼§¼¨¼°¼±¼³¼´¼µ¼¼¼½¼À¼Ä¼Í¼Ï¼Ğ¼Ñ¼Õ¼Ø¼Ü¼ô¼õ¼ö¼ø¼ü¼½½½	½½½$½,½@½H½I½L½P½X½Y½d½h½€½½„½‡½ˆ½‰½Š½½‘½“½•½™½š½œ½¤½°½¸½Ô½Õ½Ø½Ü½é½ğ½ô½ø½ ¾¾¾¾¾¾¾¾¾¾D¾E¾H¾L¾N¾T¾U¾W¾Y¾Z¾[¾`¾a¾d¾h¾j¾p¾q¾s¾t¾u¾{¾|¾}¾€¾„¾Œ¾¾¾¾‘¾˜¾™¾¨¾Ğ¾Ñ¾Ô¾×¾Ø¾à¾ã¾ä¾å¾ì¾¿¿	¿¿¿¿¿¿@¿A¿D¿H¿P¿Q¿U¿”¿°¿Å¿Ì¿Í¿Ğ¿Ô¿Ü¿ß¿á¿<ÀQÀXÀ\À`ÀhÀiÀÀ‘À”À˜À À¡À£À¥À¬À­À¯À°À³À´ÀµÀ¶À¼À½À¿ÀÀÀÁÀÅÀÈÀÉÀÌÀĞÀØÀÙÀÛÀÜÀİÀäÀåÀèÀìÀôÀõÀ÷ÀùÀ ÁÁÁÁÁÁÁÁÁ Á#Á$Á&Á'Á,Á-Á/Á0Á1Á6Á8Á9Á<Á@ÁHÁIÁKÁLÁMÁTÁUÁXÁ\ÁdÁeÁgÁhÁiÁpÁtÁxÁ…ÁŒÁÁÁÁ”Á–ÁœÁÁŸÁ¡Á¥Á¨Á©Á¬Á°Á½ÁÄÁÈÁÌÁÔÁ×ÁØÁàÁäÁèÁğÁñÁóÁüÁıÁ ÂÂÂÂÂÂÂÂÂÂ Â(Â)Â+Â-Â/Â1Â2Â4ÂHÂPÂQÂTÂXÂ`ÂeÂlÂmÂpÂtÂ|Â}ÂÂÂˆÂ‰ÂÂ˜Â›ÂÂ¤Â¥Â¨Â¬Â­Â´ÂµÂ·Â¹ÂÜÂİÂàÂãÂäÂëÂìÂíÂïÂñÂöÂøÂùÂûÂüÂ ÃÃ	ÃÃÃÃÃÃÃÃ$Ã%Ã(Ã)ÃEÃhÃiÃlÃpÃrÃxÃyÃ|Ã}Ã„ÃˆÃŒÃÀÃØÃÙÃÜÃßÃàÃâÃèÃéÃíÃôÃõÃøÃÄÄ$Ä,Ä0Ä4Ä<Ä=ÄHÄdÄeÄhÄlÄtÄuÄyÄ€Ä”ÄœÄ¸Ä¼ÄéÄğÄñÄôÄøÄúÄÿÄ ÅÅÅÅÅÅ(Å)Å,Å0Å8Å9Å;Å=ÅDÅEÅHÅIÅJÅLÅMÅNÅSÅTÅUÅWÅXÅYÅ]Å^Å`ÅaÅdÅhÅpÅqÅsÅtÅuÅ|Å}Å€Å„Å‡ÅŒÅÅÅ‘Å•Å—Å˜ÅœÅ Å©Å´ÅµÅ¸Å¹Å»Å¼Å½Å¾ÅÄÅÅÅÆÅÇÅÈÅÉÅÊÅÌÅÎÅĞÅÑÅÔÅØÅàÅáÅãÅåÅìÅíÅîÅğÅôÅöÅ÷ÅüÅıÅşÅÿÅ ÆÆÆÆÆÆÆÆÆÆÆÆ$Æ%Æ(Æ,Æ-Æ.Æ0Æ3Æ4Æ5Æ7Æ9Æ;Æ@ÆAÆDÆHÆPÆQÆSÆTÆUÆ\Æ]Æ`ÆlÆoÆqÆxÆyÆ|Æ€ÆˆÆ‰Æ‹ÆÆ”Æ•Æ˜ÆœÆ¤Æ¥Æ§Æ©Æ°Æ±Æ´Æ¸Æ¹ÆºÆÀÆÁÆÃÆÅÆÌÆÍÆĞÆÔÆÜÆİÆàÆáÆèÆéÆìÆğÆøÆùÆıÆÇÇÇÇÇÇÇÇ Ç!Ç$Ç(Ç0Ç1Ç3Ç5Ç7Ç<Ç=Ç@ÇDÇJÇLÇMÇOÇQÇRÇSÇTÇUÇVÇWÇXÇ\Ç`ÇhÇkÇtÇuÇxÇ|Ç}Ç~ÇƒÇ„Ç…Ç‡ÇˆÇ‰ÇŠÇÇÇ‘Ç”Ç–Ç—Ç˜ÇšÇ Ç¡Ç£Ç¤Ç¥Ç¦Ç¬Ç­Ç°Ç´Ç¼Ç½Ç¿ÇÀÇÁÇÈÇÉÇÌÇÎÇĞÇØÇİÇäÇèÇìÇ ÈÈÈÈ
+ÈÈÈÈÈÈÈÈ È$È,È-È/È1È8È<È@ÈHÈIÈLÈMÈTÈpÈqÈtÈxÈzÈ€ÈÈƒÈ…È†È‡È‹ÈŒÈÈ”ÈÈŸÈ¡È¨È¼È½ÈÄÈÈÈÌÈÔÈÕÈ×ÈÙÈàÈáÈäÈõÈüÈıÈ ÉÉÉÉÉÉÉÉÉ,É4ÉPÉQÉTÉXÉ`ÉaÉcÉlÉpÉtÉ|ÉˆÉ‰ÉŒÉÉ˜É™É›ÉÉÀÉÁÉÄÉÇÉÈÉÊÉĞÉÑÉÓÉÕÉÖÉÙÉÚÉÜÉİÉàÉâÉäÉçÉìÉíÉïÉğÉñÉøÉùÉüÉ ÊÊ	ÊÊÊÊÊÊ)ÊLÊMÊPÊTÊ\Ê]Ê_Ê`ÊaÊhÊ}Ê„Ê˜Ê¼Ê½ÊÀÊÄÊÌÊÍÊÏÊÑÊÓÊØÊÙÊàÊìÊôÊËËËË Ë!ËAËHËIËLËPËXËYË]ËdËxËyËœË¸ËÔËäËçËéËÌÌÌÌÌÌ!Ì"Ì'Ì(Ì)Ì,Ì.Ì0Ì8Ì9Ì;Ì<Ì=Ì>ÌDÌEÌHÌLÌTÌUÌWÌXÌYÌ`ÌdÌfÌhÌpÌuÌ˜Ì™ÌœÌ Ì¨Ì©Ì«Ì¬Ì­Ì´ÌµÌ¸Ì¼ÌÄÌÅÌÇÌÉÌĞÌÔÌäÌìÌğÌÍÍ	ÍÍÍÍÍÍÍ$Í(Í,Í9Í\Í`ÍdÍlÍmÍoÍqÍxÍˆÍ”Í•Í˜ÍœÍ¤Í¥Í§Í©Í°ÍÄÍÌÍĞÍèÍìÍğÍøÍùÍûÍıÍÎÎÎÎÎ Î!Î$Î(Î0Î1Î3Î5ÎXÎYÎ\Î_Î`ÎaÎhÎiÎkÎmÎtÎuÎxÎ|Î„Î…Î‡Î‰ÎÎ‘Î”Î˜Î Î¡Î£Î¤Î¥Î¬Î­ÎÁÎäÎåÎèÎëÎìÎôÎõÎ÷ÎøÎùÎ ÏÏÏÏÏÏÏÏÏ Ï$Ï,Ï-Ï/Ï0Ï1Ï8ÏTÏUÏXÏ\ÏdÏeÏgÏiÏpÏqÏtÏxÏ€Ï…ÏŒÏ¡Ï¨Ï°ÏÄÏàÏáÏäÏèÏğÏñÏóÏõÏüÏ ĞĞĞĞ-Ğ4Ğ5Ğ8Ğ<ĞDĞEĞGĞIĞPĞTĞXĞ`ĞlĞmĞpĞtĞ|Ğ}ĞĞ¤Ğ¥Ğ¨Ğ¬Ğ´ĞµĞ·Ğ¹ĞÀĞÁĞÄĞÈĞÉĞĞĞÑĞÓĞÔĞÕĞÜĞİĞàĞäĞìĞíĞïĞğĞñĞøĞÑ0Ñ1Ñ4Ñ8Ñ:Ñ@ÑAÑCÑDÑEÑLÑMÑPÑTÑ\Ñ]Ñ_ÑaÑhÑlÑ|Ñ„ÑˆÑ Ñ¡Ñ¤Ñ¨Ñ°Ñ±Ñ³ÑµÑºÑ¼ÑÀÑØÑôÑøÑÒ	ÒÒ,Ò-Ò0Ò4Ò<Ò=Ò?ÒAÒHÒ\ÒdÒ€ÒÒ„ÒˆÒÒ‘Ò•ÒœÒ Ò¤Ò¬Ò±Ò¸Ò¹Ò¼Ò¿ÒÀÒÂÒÈÒÉÒËÒÔÒØÒÜÒäÒåÒğÒñÒôÒøÒ ÓÓÓÓÓÓÓÓÓÓÓÓÓ Ó!Ó%Ó(Ó)Ó,Ó0Ó8Ó9Ó;Ó<Ó=ÓDÓEÓ|Ó}Ó€Ó„ÓŒÓÓÓÓ‘Ó˜Ó™ÓœÓ Ó¨Ó©Ó«Ó­Ó´Ó¸Ó¼ÓÄÓÅÓÈÓÉÓĞÓØÓáÓãÓìÓíÓğÓôÓüÓıÓÿÓÔÔÔ@ÔDÔ\Ô`ÔdÔmÔoÔxÔyÔ|ÔÔ€Ô‚ÔˆÔ‰Ô‹ÔÔ”Ô©ÔÌÔĞÔÔÔÜÔßÔèÔìÔğÔøÔûÔıÔÕÕÕÕÕÕ<Õ=Õ@ÕDÕLÕMÕOÕQÕXÕYÕ\Õ`ÕeÕhÕiÕkÕmÕtÕuÕxÕ|Õ„Õ…Õ‡ÕˆÕ‰ÕÕ¥ÕÈÕÉÕÌÕĞÕÒÕØÕÙÕÛÕİÕäÕåÕèÕìÕôÕõÕ÷ÕùÕ ÖÖÖÖÖÖÖÖÖÖ Ö$Ö-Ö8Ö9Ö<Ö@ÖEÖHÖIÖKÖMÖQÖTÖUÖXÖ\ÖgÖiÖpÖqÖtÖƒÖ…ÖŒÖÖÖ”ÖÖŸÖ¡Ö¨Ö¬Ö°Ö¹Ö»ÖÄÖÅÖÈÖÌÖÑÖÔÖ×ÖÙÖàÖäÖèÖğÖõÖüÖıÖ ×××××× ×(×)×+×-×4×5×8×<×D×G×I×P×Q×T×V×W×X×Y×`×a×c×e×i×l×p×t×|×}××ˆ×‰×Œ××˜×™×›××=OsOGPùP RïSuTåT	VÁZ¶[‡f¶g·gïgLkÂsÂu<zÛ‚ƒWˆˆˆ6ŠÈŒÏûæÕ™;RtSTj`da¼kÏsº‰Ò‰£•ƒO
+R¾XxYæYr^y^ÇaÀcFgìgh—oNvwõxzÿz!|€n‚q‚ëŠ“•kNU÷f4n£xíz[„‰N‡¨—ØRNW*XL]a¾a!bbeÑgDjnu³uãv°w:}¯Q”R”•Ÿ#S¬\2uÛ€@’˜•[RXÜY¡\]·^:_J_wa_lzu†uà|s}±}ŒT!‚‘…A‰‹ü’M–GœËN÷NPñQOX7a>aha9eêio¥u†vÖv‡{¥‚Ë„ ù§“‹•€U¢[QWù³|¹µ‘(P»SE\è]ÒbncÚdçd n¬p[yİù}E’ø’~NöNePş]ú^aWiqT†Gu“+š^N‘Ppg@h	QR’R¢j¼w’Ô«R/`òHP©aícÊd<h„jÀoˆ¡‰”–X}r¬ruy}m~©€‹‰t‹cQ‰bzlToP}:#Š|QJa{‹W’Œ“¬NÓOP¾PQÁRÍRSpWƒXš^‘_va¬aÎdleof»fôf—h‡m…pñpŸt¥tÊtÙulxìxßzözE}“}€?€–ƒf‹á“˜8˜Zšè›ÂOSU:XQYc[F\¸`bBh°hèhªnLuxvÎx=zû|k~|~Š¡Š?Œ–ÄäSéSJTqTúVÑYd[;\«^÷b7eEere f¯gÁi½lüuv~w?z”€¡€æ‚ı‚ğƒÁ…1ˆ´ˆ¥Šùœ.“Ç–g˜ØšŸíT›eòfh@z7Œ`ğVdW]f±hÍhşn(tˆä›hlù¨š›OlQqQŸRT[å]P`m`ñb§c;eÙszz£†¢Œ—2Ná[bœgÜtÑyÓƒ‡Š²ŠèNK“F˜Ó^èiÿ…íù Q˜[ì[caúh>kLp/tØt¡{PÅƒÀ‰«ŒÜ•(™.R]`ìbŠOIQ!SÙXã^àf8mšpÂrÖsP{ñ€[”fS›ckVN€PJXŞX*`'aĞbĞiA›[}±€_¤NÑP¬T¬U[ ]ç]*eNe!hKjárvïw^}ù N…ß†NÊ™Uš«›NEN]NÇNñOwQşR@SãSåSTVuW¢WÇ[‡]Ğ^üaØbQe¸gégËiPkÆkìkBlnxp×r–st¿wéwvz}	€ü‚
+‚ß‚bˆ3‹üŒÀ±d’¶’Ò™Ešéœ×œŸW@\Êƒ —«—´T˜z¤ÙˆÍá XH\˜cŸz®[_yz®z‚¬&P8RøRwSWóbrc
+kÃm7w¥SWsh…vÕ•:gÃjpomŠÌK™ùwfxk´Œ<›ùëS-WNYÆcûiêsExºzÅzş|u„‰s5¨•ûRGWGu`{Ìƒ’ùXjKQKR‡RbØhui™–ÅP¤RäRÃa¤e9hÿi~tK{¹‚ëƒ²‰9‹ÑI™	ùÊN—YÒdfj4ty½y©‚~ˆˆ_‰
+ù&“OÊS%`qbrl}f}˜NbQÜw¯€OOvQ€QÜUhV;WúWüWYGY“YÄ[\]ñ]~^Ì_€b×eãegg^gËhÄh_j:k#l}l‚lÇm˜s&t*t‚t£txuuxïxAyGyHyzy•{ }º}ˆ€-€Œ€ŠO‹HŒw!“$“â˜Q™ššeš’Ê}vO	TîbThÑ‘«U:QùùZæaùÏbÿbùùùùùù£ùùùùùşŠùùùù–fùVqùùã– ùOczcWS!ùg`isn"ù7u#ù$ù%ù}&ù'ùrˆÊVZ(ù)ù*ù+ù,ùCN-ùgQHYğg€.ùsYt^šdÊyõ_l`Èb{cç[×[ªR/ùtY)_`0ù1ù2ùYt3ù4ù5ù6ù7ù8ùÑ™9ù:ù;ù<ù=ù>ù?ù@ùAùBùCùÃoDùEù¿²ñ`FùGùfHùIù?\JùKùLùMùNùOùPùQùéZ%Š{g}RùSùTùUùVùWùı€XùYù<\ål?SºnY6ƒ9N¶NFO®UWÇXV_·eæe€jµkMníwïz|Ş}Ë†’ˆ2‘[“»d¾ozs¸uTVUMWºaÔdÇfám[nmo¹oğuC€½A…ƒ‰ÇŠZ‹““lSuT{]UXXXb^bdàhvuÖ|³‡èãNˆWnW'Y\±\6^…_4bád³sú‹ˆ¸ŒŠ–Û…[·_³`P R0RW5XWX\`\ö\‹]¦^’_¼`c‰cdChùhÂjØm!nÔnäoşqÜvyw±y;z„©‰íŒóHSıM“v–Ü—ÒkpXr¢rhscw¿yä{›~€‹©XÇ`feıe¾fŒlqÉqZŒ˜mNzİN¬QÍQÕRT§aqgPhßhm|o¼u³wåzô€c„…’\Q—e\g“gØuÇzsƒZùFŒ-˜o\Àš‚Ao’—_]YjÈq{vI{ä…‹'‘0š‡Uöa[ùiv…?†º‡øˆ\ùmÙpŞsa}=„]ùj‘ñ™^ù‚NuSkk>pr-†LR£P]åd,ekëoC|œ~Í…d‰½‰ÉbØˆÊ^gjmürtot‚‡Ş†O] _
+„·Q ceu®NPiQÉQhj®|±|ç|o‚ÒŠÏ‘¶O7QõRBTì^na>bÅeÚjşo*yÜ…#ˆ­•bšjš—Î›RÆfwkp+ybB—a b#e#oIq‰tô}o€î„&#J“½QR£RmÈpÂˆÉ^‚e®kÂo>|usäN6OùV_ùº\º]`²s-{šÎF€4’ö–H—˜aŸ‹O§o®y´‘·–ŞR`ùˆdÄdÓj^oprçv€†\†ï2—o›úuŒxy }Éƒ““ÖŠßX_'g'pÏt`|~€!Q(pbrÊxÂŒÚŒôŒ÷–†NÚPî[Ö^™eÎqBv­wJ€ü„|'›ŸØXAZb\jÚmo;v/}7~…8‰ä“K–‰RÒeóg´iAmœnp	t`tYu$vkx,‹^˜mQ.bx––O+P]êm¸}*‹_Dahaù†–ÒR‹€ÜQÌQ^iz¾}ñƒu–ÚO)R˜STUe\§`Ng¨hlmrørtƒtbùâul|y¸‰ƒÏˆáˆÌ‘Ğ‘â–É›T~oĞq˜tú…ª£–WœŸ—gËm3tè—,xËz {’|idjtòu¼xèx¬™T›»Ş[U^ oœ«ƒˆNMS)ZÒ]N_ba=cifüfÿn+ocpw,„…;ˆE™;œU¹b+g«l	ƒj‰z—¡N„YØ_Ù_g²}T’‚+ƒ½ƒ™ËW¹Y’ZĞ['fšg…hÏkdqu·ŒãŒE›ŠŒL–@š¥_[lsòvßv„ªQ“‰MQ•QÉRÉh”lw w¿}ì}b—µÅn…¥QT}Tff'iŸn¿v‘wƒÂ„Ÿ‡i‘˜’ôœ‚ˆ®O’QßRÆY=^Uaxdyd®fĞg!jÍkÛk_rarAt8wÛw€¼‚ƒ ‹(‹ŒŒ(glgrîvfwFz©k’l"Y&g™„oS“X™Yß^Ïc4fsg:n+s×z×‚(“ÙRë]®aËa
+bÇb«dàeYifkËk!q÷s]uF~‚ƒj…£Š¿Œ'—a¨XØPR;TOU‡evl
+}}^€Š†€•ï–ÿR•lirsTšZ>\K]L_®_*g¶hci<nDn	ws|‡…‹÷a—ô·\¶`a«aOeûeüelïlŸsÉsá}”•Æ[‡‹]RZSÍbd²d4g8jÊlÀst”{•|~Š6‚„…ëù–Á™4OJSÍSÛSÌb,d e‘eÃiîlXoísTu"vävüvĞxûx,yF},‚à‡Ô˜ï˜ÃRÔb¥d$nQo|vË±‘b’îšC›#PPJW¨Y(\G^w_?b>e¹eÁe	f‹gœiÂnÅx!}ª€€+‚³‚¡„Œ†*Š‹¦2–ŸPóOcùùW˜_Üb’cogCnqÃvÌ€Ú€ôˆõˆ‰àŒ)M‘j–/OpO^Ïg"h}v~vD›a^
+jiqÔqjudùA~C…é…Ü˜OO{p¥•áQ^µh>lNlÛl¯rÄ{ƒÕl:tûPˆRÁXØd—j§tVv§x†â•9—eù^S_Š‹¨¯Š%R¥wIœŸNPuQ[\w^f:fÄgÅh³puÅuÉyİz' ™šİO!X1Xö[nfekmzn}oäs+uéƒÜˆ‰\‹OÕPS\S“[©_gyy/ƒ…‰†‰9;¥™œ,gvNøOIY\ï\ğ\gcÒhıp¢q+t+~ì„‡"Ò’óœNØNïO…PVRoR&TTàW+YfZZ[u[Ì[œ^fùvbwe§enm¥n6r&{?|6PQš@‚™‚©ƒŠ ŒæŒûŒtºèÜ‘–D–Ù™çœSR)TtV³XTYnYÿ_¤anbf~lqÆv‰|Ş|}¬‚ÁŒğ–gù[O__Âb)]gÚh|xC~lN™PS*SQSƒYbZ‡^²`ŠaIbybe‡g§iÔkÖk×kØk¸lhù5túux‘xÕyØyƒ|Ë}á¥€>Âòƒ‡èˆ¹Šl‹»Œ‘^—Û˜;Ÿ¬V*[l_Œe³j¯k\mñop]r­s§ŒÓŒ;˜‘a7lX€šMN‹N›NÕN:O<OOßOÿPòSøSUãUÛVëXbYZë[ú[\ó]+^™_`hcœe¯eögûg­h{k™l×l#n	pEsx>y@y`yÁyé{}r}†€‚ƒÑ„Ç†ßˆPŠ^Š‹ÜŒf­ªü˜ß™JRiùgjù˜P*Rq\ceUlÊs#uu—{œ„x‘0—wN’dºk^q©…	NkùIgîhnŸ‚…kˆ÷co’¯˜
+N·PÏPQFUªUV@[\à\8^Š^ ^Â^ó`QhajXn=r@rÀrøvey±{Ôóˆô‰sŠaŒŞŒ—^X½tıŒÇUlùaz"}r‚rru%umù{…XûX¼]^¶^_U`’bcMe‘fÙføfhòh€r^tn{n}Ö}rå€‚¯…‰“Šä’Í ŸYmY-^Ü`fsfgPlÅm_oów©xÆ„Ë‘+“ÙNÊPHQ„U[£[Gb~eËe2n}qtDt‡t¿tlvªyÚ}U~¨z³9‚†ì‡uŠãx‘’%”M™®›hSQ\TiÄl)m+n‚›…;‰-ŠªŠê–gŸaR¹f²k–~ş‡ƒ•]–e‰mîqnùÎWÓY¬['`ú`bf_f)sùsÛvwl{V€r€e Š’‘NâRrkmz9{0}où°ŒìS/VQXµ[\\â]@bƒcd-f³h¼lˆm¯np¤pÒq&uuuv{à{+| }9},…m…†4Šaµ·’ö—7š×Ol\_g‘mŸ|Œ~‹k[ı]dÀ„\á˜‡s‹[š`~gŞmŠ¦Š˜7RpùQpx–“pˆ×‘îO×SıUÚV‚WıXÂZˆ[«\À\%^abKbˆcd6exe9jŠk4lm1oçqérxst²t&vawÀyWzêz¹|}¬}a~)1ƒ„Ú„ê…–ˆ°Š‹8Bƒl‘–’¹’‹–§–¨–Ö– —˜–™Óš›ÔS~XYp[¿[ÑmZoŸq!t¹t…€ıƒá]‡_ª_B`ìehoiSj‰k5mómãsşv¬wM{}#‚@ƒô„c…bŠÄŠ‡‘“˜´™bSˆğe’]']i]_th‡ÕoşbÒ6‰r‰NXNçPİRGSbfi~ˆ^–OS6VËY¤Z8\N\M\^_C`½e/fBf¾gôgsâw:yÅ”„Í„–‰fŠiŠáŠUŒzŒôWÔ[_o`íbi–k\n„qÒ{U‡X‹şß˜ş˜8OOáO{T Z¸[<a°ehfüq3u^y3}Nã˜ƒª…Î…‡
+Š«›qùÅ1Y¤[æ[‰`é[\Ã_lrùñmpu¯‚öŠÀNASsùÙ–lNÄORQ^U%Zè\bYr½‚ªƒş†YˆŠ?–Å–™	]
+X³\½]D^á`aácj%n‘T“N˜œwŸ‰[¸\	cOfHh<wÁ–—T˜Ÿ›¡e‹Ë¼•5U©\Ö]µ^—fLvôƒÇ•ÓX¼bÎr(ğN.Y`;fƒkçy&“SÀTÃW]aÖf¯mx~‚˜–D—„S|b–c²m
+~KM˜ûjL¯_N;P¶QYù`öc0i:r6€tùÎ‘1_uùvù}å‚o„»„å…wùoOxùyùäXC[Y`Úceme˜fzùJi#jmplqÒuv³ypz{ùŠ|ùD‰}ù“‹À‘}–~ù
+™W¡_¼eo v¦yŠ­™Z›lŸQ¶a‘bjÆCP0Xf_	q ŠúŠ|[†úO<Q´VDY©cùmª]mi†QˆNYOù€ùù‚Y‚ùƒù_k]l„ùµty…ù‚E‚9ƒ?]†ù™‡ùˆù‰ù¦NŠùßWy_f‹ùŒù«uy~o‹ù[š¥V'XøYZ´[ùö^ùùPc;c‘ù=i‡l¿lm“mõmo’ùßp6qYq“ùÃqÕq”ùOxox•ùu{ã}–ù/~—ùMˆß˜ù™ùšù[’›ùöœœùùù…`…mŸù±q ù¡ù±•­S¢ù£ù¤ùÓg¥ùp0q0tv‚Ò‚¦ù»•åš}Äf§ùÁqI„¨ù©ùKXªù«ù¸]q_¬ù ffyi®i8lól6nAoÚop/pPqßqps­ù[t®ùÔtÈvNz“~¯ù°ùñ‚`ŠÎ±ùH“²ù—³ù´ùBN*PµùRáSófmlÊo
+swbz®‚İ…†¶ùÔˆcŠ}‹kŒ·ù³’¸ù—˜”NOÉO²PHS>T3TÚUbXºXgYZä[Ÿ`¹ùÊaVeÿedf§hZl³oÏp¬qRs}{‡¤Š2œŸK\ƒlDs‰s:’«netviz~
+†@QÅXÁdîtupvÁ•Í–T™&næt©zªzåÙ†x‡ŠIZŒ[›[¡h icm©st,t—xé}ëUƒLŒ.–˜ğf€_úe‰gjl‹s-PZjkîwYl]Í]%sOuºù»ùåPùQ/X-Y–YÚYå[¼ù½ù¢]×bd“dşd¾ùÜf¿ùHjÀùÿqdtÁùˆz¯zG~^~ €pÂùï‡‰ ‹YÃù€R™~a2ktm~%‰±ÑO­P—QÇRÇW‰X¹[¸^Ba•iŒmgn¶n”qbt(u,us€8ƒÉ„
+”“Ş“ÄùNQOvP*QÈSËSóS‡[Ó[$\a‚aôe[r—s@tÂvPy‘y¹y}½‹‚Õ…^†ÂGõê‘…–è–é–ÖRg_íe1f/h\q6zÁ
+˜‘NÅùRjko‰q€¸‚S…K•–ò–û—…1›NŠqÄ–CQŸSáTWW£W›ZÄZÃ[(`?aôc…l9mrnn0r?sWtÑ‚ˆE`Æùb–X˜gŠ^’MOIPŞPqSWÔYZ	\paf-n2rKtï}Ã€„f„?…_‡[ˆ‰‹UË—O›sN‘OQjQÇù/U©Uz[¥[|^}^¾^ `ß`a	aÄc8e	gÈùÔgÚgÉùaibi¹l'mÊù8nËùáo6s7sÌù\t1uÍùRvÎùÏù­}ş8„Õˆ˜ŠÛŠíŠ0BJ>zI‘É‘n“ĞùÑù	XÒùÓk‰€²€ÓùÔùAQkY9\ÕùÖùdo§sä€×ù’•ØùÙùÚùÛù€bph}‡Üù Wi`Ga·k¾Š€’±–YNTëm-…p–ó—î˜Öcãl‘İQÉaºùOP Qœ[aÿaìdiÅk‘uãw©d‚…û‡cˆ¼Šp‹«‘ŒNåN
+OİùŞù7YèYßùò]_[_!`àùáùâùãù>råsäùpuÍuåùûyæù€3€„€á‚Qƒçùèù½Œ³Œ‡éùêùô˜™ëùìù7pÊvÊÌü‹ºNÁNRpSíù½TàVûYÅ[_Í_nnîùïùj}5ƒğù“†Šñùm—w—òùóù NZO~OùXåe¢n8°“¹™ûNìXŠYÙYA`ôùõùzöùOƒÃŒeQDS÷ùøùùùÍNiRU[¿‚ÔN:R¨TÉYÿYP[W[\[c`HaËn™pnq†s÷tµuÁx+}€ê(ƒ…É…îŠÇŒÌ–\OúR¼V«e(f|p¸p5r½}‚L‘À–rq[çh˜kzoŞv‘\«f[o´{*|6ˆÜ–N×N S4X»XïXlY\3^„^5_Œc²fVgj£jk?oFrúùPs‹tàz§|xßçŠƒl„#…”…Ï…İˆ¬‘w•œ–QÉT(W°[MbPg=h“h=nÓn}p!~Áˆ¡Œ	KŸNŸ-r{ÍŠ“GONO2Q€TĞY•^µbugnij®lnÙr*s½u¸{5}ç‚ùƒW„÷…[Š¯Œ‡¸Î–_ŸãR
+TáZÂ[XdueônÄrûù„vMz{M|>~ß{ƒ+‹ÊŒdá_êùiÑ“COzO³PhQxQMRjRaX|X`Y\U\Û^›`0bh¿kl±oNq t0u8uQurvL{‹{­{Æ{~nŠ>I?’“’"“+”û–Z˜k˜™R*b˜bYmdvÊzÀ{v}`S¾\—^8o¹p˜|—›Ş¥czdv‡N•N­N\PuPHTÃYš[@^­^÷^_Å`:c?eteÌevfxfşghi‰jck@lÀmèmn^np¡psıs:u[w‡xyz}z¾|}G‚ŠêŠŒ-‘J‘Ø‘f’Ì’ “—V—\—˜Ÿ6R‘R|U$X^_Œ`Ğc¯hßomy,{Íº…ıˆøŠD‘d–›–=—L˜JŸÎOFQËQ©R2V_k_ªcÍdéeAfúfùfgh×hıionogqåq*rªt:wVyZyßy z•z—|ß|D}p~‡€û…¤†TŠ¿Š™ mã‘;–Õ–åœÏe|³Ã“X[
+\RSÙbs'P—[_°`kaÕhÙm.t.zB}œ}1~k*5~“”POPWæ]§^+cj;NOOOZPİYÄ€jThTşUOY™[Ş]Ú^]f1gñg*hèl2mJno·pàs‡uL|},}¢}‚Û†;Š…ŠpŠ31N‘R‘D”Ğ™ùz¥|ÊOQÆQÈWï[û\Yf=jZm–nìoqouãz"ˆ!uË–ÿ™ƒ-NòNFˆÍ‘}SÛjkiAlz„XaşfïbİpuÇuR~¸„I‹KNêS«T0W@W×_ccod/eèezfg³gbk`lšl,oåw%xIyWy}¢€ó‚·‚‡ŒŠüù¾rôvz7zT~w€UÔUuX/c"dIfKfmh›i„k%m±nÍsht¡t[u¹uávw‹wæy	~~û/…—ˆ:ŠÑŒë°2­“c–s–—„OñSêYÉZ^NhÆt¾uéy’z£í†êŒÌíŸegıù÷WWoİ}/ö“Æ–µ_òa„oN˜OPÉSßUo]î]!kdkËxš{şùIÊnIc>d@w„z/“”jŸ°d¯oæq¨tÚtÄz|‚~²|˜~š‹
+}”™L™9Rß[æd-g.}íPÃSyXXaYaúa¬eÙz’‹–‹	P!PuR1U<Zà^p_4a^ef6f¢fÍiÄn2os!v“z9Y‚Öƒ¼„µPğWÀ[è[i_¡c&xµ}Üƒ!…Ç‘õ‘ŠQõgV{¬ŒÄQ»Y½`U†PÿùTR:\}abÓbòd¥eÌn v
+`_–»–ßNCS˜U)Yİ]ÅdÉlúm”sz‚¦…äŒwç‘á•!–Æ—øQòT†U¹_¤dˆo´}M5”ÉP\¾lûmu»w=|d|yŠÂŠX¾Y^wcRrŠukwÜŠ¼Œó^tføm}€ÁƒËŠQ—Ö› úCRÿf•mïnà}æŠ.^ÔšRRèT”a„bÛb¢hiZi5j’p&q]xyyÒyz–€x‚Õ‚IƒI…‚Œ…b‘‹‘®‘ÃOÑVíq×w ‡ø‰ø[Ö_Qg¨âSZXõ[¤`a`d=~p€%…ƒ’®d¬P] gœX½b¨cixijknºvËy»‚)„ÏŠ¨ı‘K‘œ‘““š“Û–6šœN\u]yúzQ{É{.~Ä„Ytø%f?iCtúQ.gÜEQà_–lò‡]ˆwˆ´`µ„ÖS9T4V6Z1\ŠpàZ€í£‰‘_šòtPÄN Sû`,nd\ˆO$PäUÙ\_^e`”h»lÄm¾qÔuôuavzIzÇ}û}nô©†É–³™RŸGRÅRí˜ª‰NÒgoµOâ[•gˆlxmt'xİ‘|“Ä‡äy1zë_ÖN¤T>U®X¥Yğ`SbÖb6gUi5‚@–±™İ™,PSSDU|WúXbúâdkfİgÁoïo"t8tŠ8”QTVfWH_šaNkXp­p»}•ŠjY+¢cw=€ªŒTX-d»i•[^onúi…LQğS*Y `Ka†kplğl{Î€Ô‚Æ°±˜úÇd¤o‘deNQTWŠ_avhúÛuR{q}XÌi*‰ 9˜xPWY¬Y•b*›]ayrÖ•aWFZô]Šb­dúdwgâl>m,r6t4xw­‚Û˜$RBWgHrãt©Œ¦’*–kQíSLciOU–`We›lmLrırz‡‰Œm_oùp¨a¿OOPAbGrÇ{è}éM­—š¶ŒjWs^°g„UŠ T[c^â^
+_ƒeº€=…‰•[–HOSSS†TúTW^`›b±bUcúálfm±u2xŞ€/Ş‚a„²„ˆ‰ê’ı˜‘›E^´fİfprúõO}Rj_SaSgjoâthyhˆyŒÇ˜Ä˜CšÁTzSi÷ŠJŒ¨˜®™|_«b²u®v«ˆB–9S<_Å_ÌlÌsbu‹uF{ş‚™ON<NUO¦SYÈ^0f³lUtwƒf‡ÀŒP—œÑXx[P†‹´Ò[h``ñeWl"o£opUğ‘•’•P–Ó—rRDıQ+T¸TcUŠU»jµmØ}f‚œ’w–yTÈTÒvä†¤•Ô•\–¢N	OîYæZ÷]R`—bmgAh†l/n8›€*‚ú	ú˜¥NUP³T“WZYi[³[Èawiwm#pù‡ã‰rŠçŠ‚í™¸š¾R8hPx^OgGƒLˆ«NT®Væs‘ÿ—	™W™™™SVŸX[†1Š²aöj{sÒGkª–WšUY rki—ÔOô\&_øa[fël«p„s¹sşs)wMwC}b}#~7‚Rˆ
+úâŒI’o˜Q[tz@ˆ˜ÌZàOTS>Yı\>cymùr¢ƒÏ’0˜¨NDQR‹Wb_ÂlÎnpPp¯p’qésitJƒ¢‡aˆ¢£“¨™nQW_à`ga³fY…J¯‘‹—NN’N|TÕXúX}Yµ\'_6bHb
+fgfëkimÏmVnøn”oàoéo]pĞr%tZtàt“v\yÊ|~á€¦‚k„¿„N†_†t‡w‹jŒ¬“ ˜e˜Ñ`bw‘ZZf÷m>n?tB›ı_Ú`{ÄT_^lÓl*mØp}y†Š;SŒT[:jkpuuy¾y±‚ïƒqŠA‹¨Œt—úôd+eºx»xkz8NšUPY¦[{^£`ÛcakefShneq°t}„iš%œ;mÑn>sAŒÊ•ğQL^¨_M`ö`0aLaCfDf¥iÁl_nÉnboLqœt‡vÁ{'|RƒW‡Q–Ã/SŞVû^Š_b`”`÷affgœjîm®oppjsj~¾4ƒÔ†¨ŠÄŒƒRrs–[kj”îT†V][He…eÉfŸhmÆm;r´€u‘Mš¯OPšST<T‰UÅU?^Œ_=gfqİsÛRóRdXÎXqqûq°…Šˆf¨…§U„fJq1„IS™UÁkY_½_îc‰fGqñŠ¾O:dËpfug†d`N‹øGQöQS6mø€Ñf#k˜pÕuTy\}Š k=kFk8Tp`=mÕ‚ÖPŞQœUkVÍVìY	[^™a˜a1b^fæf™q¹qºq§r§y z²pŠ¬¬¬¬¬¬¬¬¬¬¬¬!¬"¬#¬%¬&¬'¬(¬)¬*¬+¬.¬2¬3¬4¬şÿşÿşÿşÿşÿşÿ5¬6¬7¬:¬;¬=¬>¬?¬A¬B¬C¬D¬E¬F¬G¬H¬I¬J¬L¬N¬O¬P¬Q¬R¬S¬U¬şÿşÿşÿşÿşÿşÿV¬W¬Y¬Z¬[¬]¬^¬_¬`¬a¬b¬c¬d¬e¬f¬g¬h¬i¬j¬k¬l¬m¬n¬o¬r¬s¬u¬v¬y¬{¬|¬}¬~¬¬‚¬‡¬ˆ¬¬¬¬‘¬’¬“¬•¬–¬—¬˜¬™¬š¬›¬¬¢¬£¬¤¬¥¬¦¬§¬«¬­¬®¬±¬²¬³¬´¬µ¬¶¬·¬º¬¾¬¿¬À¬Â¬Ã¬Å¬Æ¬Ç¬É¬Ê¬Ë¬Í¬Î¬Ï¬Ğ¬Ñ¬Ò¬Ó¬Ô¬Ö¬Ø¬Ù¬Ú¬Û¬Ü¬İ¬Ş¬ß¬â¬ã¬å¬æ¬é¬ë¬í¬î¬ò¬ô¬÷¬ø¬ù¬ú¬û¬ş¬ÿ¬­­­­­­	­
+­­­­­­­­­­­­­­­­!­"­#­$­%­&­'­(­*­+­.­/­0­1­2­3­şÿşÿşÿşÿşÿşÿ6­7­9­:­;­=­>­?­@­A­B­C­F­H­J­K­L­M­N­O­Q­R­S­U­V­W­şÿşÿşÿşÿşÿşÿY­Z­[­\­]­^­_­`­b­d­e­f­g­h­i­j­k­n­o­q­r­w­x­y­z­~­€­ƒ­„­…­†­‡­Š­‹­­­­‘­’­“­”­•­–­—­˜­™­š­›­­Ÿ­ ­¡­¢­£­¥­¦­§­¨­©­ª­«­¬­­­®­¯­°­±­²­³­´­µ­¶­¸­¹­º­»­¼­½­¾­¿­Â­Ã­Å­Æ­Ç­É­Ê­Ë­Ì­Í­Î­Ï­Ò­Ô­Õ­Ö­×­Ø­Ù­Ú­Û­İ­Ş­ß­á­â­ã­å­æ­ç­è­é­ê­ë­ì­í­î­ï­ğ­ñ­ò­ó­ô­õ­ö­÷­ú­û­ı­ş­®®®®®®
+®®®®®®®®®®®®®®®®şÿşÿşÿşÿşÿşÿ®®® ®!®"®#®$®%®&®'®(®)®*®+®,®-®.®/®2®3®5®6®9®;®<®şÿşÿşÿşÿşÿşÿ=®>®?®B®D®G®H®I®K®O®Q®R®S®U®W®X®Y®Z®[®^®b®c®d®f®g®j®k®m®n®o®q®r®s®t®u®v®w®z®~®®€®®‚®ƒ®†®‡®ˆ®‰®Š®‹®®®®®‘®’®“®”®•®–®—®˜®™®š®›®œ®®®Ÿ® ®¡®¢®£®¤®¥®¦®§®¨®©®ª®«®¬®­®®®¯®°®±®²®³®´®µ®¶®·®¸®¹®º®»®¿®Á®Â®Ã®Å®Æ®Ç®È®É®Ê®Ë®Î®Ò®Ó®Ô®Õ®Ö®×®Ú®Û®İ®Ş®ß®à®á®â®ã®ä®å®æ®ç®é®ê®ì®î®ï®ğ®ñ®ò®ó®õ®ö®÷®ù®ú®û®ı®ş®ÿ® ¯¯¯¯¯¯şÿşÿşÿşÿşÿşÿ¯	¯
+¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯ ¯!¯"¯#¯şÿşÿşÿşÿşÿşÿ$¯%¯&¯'¯(¯)¯*¯+¯.¯/¯1¯3¯5¯6¯7¯8¯9¯:¯;¯>¯@¯D¯E¯F¯G¯J¯K¯L¯M¯N¯O¯Q¯R¯S¯T¯U¯V¯W¯X¯Y¯Z¯[¯^¯_¯`¯a¯b¯c¯f¯g¯h¯i¯j¯k¯l¯m¯n¯o¯p¯q¯r¯s¯t¯u¯v¯w¯x¯z¯{¯|¯}¯~¯¯¯‚¯ƒ¯…¯†¯‡¯‰¯Š¯‹¯Œ¯¯¯¯’¯“¯”¯–¯—¯˜¯™¯š¯›¯¯¯Ÿ¯ ¯¡¯¢¯£¯¤¯¥¯¦¯§¯¨¯©¯ª¯«¯¬¯­¯®¯¯¯°¯±¯²¯³¯´¯µ¯¶¯·¯º¯»¯½¯¾¯¿¯Á¯Â¯Ã¯Ä¯Å¯Æ¯Ê¯Ì¯Ï¯Ğ¯Ñ¯Ò¯Ó¯Õ¯Ö¯×¯Ø¯Ù¯Ú¯Û¯İ¯Ş¯ß¯à¯á¯şÿşÿşÿşÿşÿşÿâ¯ã¯ä¯å¯æ¯ç¯ê¯ë¯ì¯í¯î¯ï¯ò¯ó¯õ¯ö¯÷¯ù¯ú¯û¯ü¯ı¯ş¯ÿ¯°°şÿşÿşÿşÿşÿşÿ°°°°	°
+°°°°°°°°°°°°°°°°° °!°"°#°$°%°&°'°)°*°+°,°-°.°/°0°1°2°3°4°5°6°7°8°9°:°;°<°=°>°?°@°A°B°C°F°G°I°K°M°O°P°Q°R°V°X°Z°[°\°^°_°`°a°b°c°d°e°f°g°h°i°j°k°l°m°n°o°p°q°r°s°t°u°v°w°x°y°z°{°~°°°‚°ƒ°…°†°‡°ˆ°‰°Š°‹°°°’°“°”°•°–°—°›°°°£°¤°¥°¦°§°ª°°°²°¶°·°¹°º°»°½°¾°¿°À°Á°Â°Ã°Æ°Ê°Ë°Ì°Í°Î°Ï°Ò°şÿşÿşÿşÿşÿşÿÓ°Õ°Ö°×°Ù°Ú°Û°Ü°İ°Ş°ß°á°â°ã°ä°æ°ç°è°é°ê°ë°ì°í°î°ï°ğ°şÿşÿşÿşÿşÿşÿñ°ò°ó°ô°õ°ö°÷°ø°ù°ú°û°ü°ı°ş°ÿ° ±±±±±±±±
+±±±±±±±±±±±± ±!±"±&±'±)±*±+±-±.±/±0±1±2±3±6±:±;±<±=±>±?±B±C±E±F±G±I±J±K±L±M±N±O±R±S±V±W±Y±Z±[±]±^±_±a±b±c±d±e±f±g±h±i±j±k±l±m±n±o±p±q±r±s±t±u±v±w±z±{±}±~±±±ƒ±„±…±†±‡±Š±Œ±±±±‘±•±–±—±™±š±›±±±Ÿ± ±¡±¢±£±¤±¥±¦±§±©±ª±«±¬±­±®±¯±°±±±²±³±´±µ±¶±·±¸±şÿşÿşÿşÿşÿşÿ¹±º±»±¼±½±¾±¿±À±Á±Â±Ã±Ä±Å±Æ±Ç±È±É±Ê±Ë±Í±Î±Ï±Ñ±Ò±Ó±Õ±şÿşÿşÿşÿşÿşÿÖ±×±Ø±Ù±Ú±Û±Ş±à±á±â±ã±ä±å±æ±ç±ê±ë±í±î±ï±ñ±ò±ó±ô±õ±ö±÷±ø±ú±ü±ş±ÿ± ²²²²²²	²
+²²²²²²²²²²²²²²²²!²"²#²$²%²&²'²(²)²*²+²,²-².²/²0²1²2²3²5²6²7²8²9²:²;²=²>²?²@²A²B²C²D²E²F²G²H²I²J²K²L²M²N²O²P²Q²R²S²T²U²V²W²Y²Z²[²]²^²_²a²b²c²d²e²f²g²j²k²l²m²n²o²p²q²r²s²v²w²x²y²z²{²}²~²²€²²‚²ƒ²†²‡²ˆ²Š²‹²Œ²²²şÿşÿşÿşÿşÿşÿ²’²“²•²–²—²›²œ²²²Ÿ²¢²¤²§²¨²©²«²­²®²¯²±²²²³²µ²¶²·²şÿşÿşÿşÿşÿşÿ¸²¹²º²»²¼²½²¾²¿²À²Á²Â²Ã²Ä²Å²Æ²Ç²Ê²Ë²Í²Î²Ï²Ñ²Ó²Ô²Õ²Ö²×²Ú²Ü²Ş²ß²à²á²ã²ç²é²ê²ğ²ñ²ò²ö²ü²ı²ş²³³³³³	³
+³³³³³³³³³³³³³³³³ ³!³"³#³$³%³&³'³(³)³*³+³,³-³.³/³0³1³2³3³4³5³6³7³8³9³:³;³<³=³>³?³@³A³B³C³D³E³F³G³H³I³J³K³L³M³N³O³P³Q³R³S³W³Y³Z³]³`³a³b³c³f³h³j³l³m³o³r³s³u³v³w³y³z³{³|³}³~³³‚³†³‡³ˆ³‰³Š³‹³³şÿşÿşÿşÿşÿşÿ³³‘³’³“³•³–³—³˜³™³š³›³œ³³³Ÿ³¢³£³¤³¥³¦³§³©³ª³«³­³şÿşÿşÿşÿşÿşÿ®³¯³°³±³²³³³´³µ³¶³·³¸³¹³º³»³¼³½³¾³¿³À³Á³Â³Ã³Æ³Ç³É³Ê³Í³Ï³Ñ³Ò³Ó³Ö³Ø³Ú³Ü³Ş³ß³á³â³ã³å³æ³ç³é³ê³ë³ì³í³î³ï³ğ³ñ³ò³ó³ô³õ³ö³÷³ø³ù³ú³û³ı³ş³ÿ³ ´´´´´´´´´	´
+´´´´´´´´´´´´´´´´´´´!´"´#´$´%´&´'´*´,´-´.´/´0´1´2´3´5´6´7´8´9´:´;´<´=´>´?´@´A´B´C´D´E´F´G´H´I´J´K´L´M´N´O´R´S´U´V´W´Y´Z´[´\´]´^´_´b´d´f´şÿşÿşÿşÿşÿşÿg´h´i´j´k´m´n´o´p´q´r´s´t´u´v´w´x´y´z´{´|´}´~´´´‚´şÿşÿşÿşÿşÿşÿƒ´„´…´†´‡´‰´Š´‹´Œ´´´´´‘´’´“´”´•´–´—´˜´™´š´›´œ´´Ÿ´ ´¡´¢´£´¥´¦´§´©´ª´«´­´®´¯´°´±´²´³´´´¶´¸´º´»´¼´½´¾´¿´Á´Â´Ã´Å´Æ´Ç´É´Ê´Ë´Ì´Í´Î´Ï´Ñ´Ò´Ó´Ô´Ö´×´Ø´Ù´Ú´Û´Ş´ß´á´â´å´ç´è´é´ê´ë´î´ğ´ò´ó´ô´õ´ö´÷´ù´ú´û´ü´ı´ş´ÿ´ µµµµµµµµµ	µ
+µµµµµµµµµµµµµµµµµ µ!µ"µ#µ&µ+µ,µ-µ.µ/µ2µ3µ5µ6µ7µ9µ:µ;µ<µ=µ>µ?µBµFµşÿşÿşÿşÿşÿşÿGµHµIµJµNµOµQµRµSµUµVµWµXµYµZµ[µ^µbµcµdµeµfµgµhµiµjµşÿşÿşÿşÿşÿşÿkµlµmµnµoµpµqµrµsµtµuµvµwµxµyµzµ{µ|µ}µ~µµ€µµ‚µƒµ„µ…µ†µ‡µˆµ‰µŠµ‹µŒµµµµµ‘µ’µ“µ”µ•µ–µ—µ˜µ™µšµ›µœµµµŸµ¢µ£µ¥µ¦µ§µ©µ¬µ­µ®µ¯µ²µ¶µ·µ¸µ¹µºµ¾µ¿µÁµÂµÃµÅµÆµÇµÈµÉµÊµËµÎµÒµÓµÔµÕµÖµ×µÙµÚµÛµÜµİµŞµßµàµáµâµãµäµåµæµçµèµéµêµëµíµîµïµğµñµòµóµôµõµöµ÷µøµùµúµûµüµıµşµÿµ ¶¶¶¶¶¶¶¶¶	¶
+¶¶¶¶¶¶¶¶¶¶¶¶¶¶¶¶şÿşÿşÿşÿşÿşÿ¶¶ ¶!¶"¶#¶$¶&¶'¶(¶)¶*¶+¶-¶.¶/¶0¶1¶2¶3¶5¶6¶7¶8¶9¶:¶şÿşÿşÿşÿşÿşÿ;¶<¶=¶>¶?¶@¶A¶B¶C¶D¶E¶F¶G¶I¶J¶K¶L¶M¶N¶O¶P¶Q¶R¶S¶T¶U¶V¶W¶X¶Y¶Z¶[¶\¶]¶^¶_¶`¶a¶b¶c¶e¶f¶g¶i¶j¶k¶l¶m¶n¶o¶p¶q¶r¶s¶t¶u¶v¶w¶x¶y¶z¶{¶|¶}¶~¶¶€¶¶‚¶ƒ¶„¶…¶†¶‡¶ˆ¶‰¶Š¶‹¶Œ¶¶¶¶¶‘¶’¶“¶”¶•¶–¶—¶˜¶™¶š¶›¶¶Ÿ¶¡¶¢¶£¶¥¶¦¶§¶¨¶©¶ª¶­¶®¶¯¶°¶²¶³¶´¶µ¶¶¶·¶¸¶¹¶º¶»¶¼¶½¶¾¶¿¶À¶Á¶Â¶Ã¶Ä¶Å¶Æ¶Ç¶È¶É¶Ê¶Ë¶Ì¶Í¶Î¶Ï¶Ğ¶Ñ¶Ò¶Ó¶Õ¶Ö¶×¶Ø¶Ù¶Ú¶Û¶Ü¶İ¶şÿşÿşÿşÿşÿşÿŞ¶ß¶à¶á¶â¶ã¶ä¶å¶æ¶ç¶è¶é¶ê¶ë¶ì¶í¶î¶ï¶ñ¶ò¶ó¶õ¶ö¶÷¶ù¶ú¶şÿşÿşÿşÿşÿşÿû¶ü¶ı¶ş¶ÿ¶······	·
+······················ ·!·"·#·$·%·&·'·*·+·-·.·1·2·3·4·5·6·7·:·<·=·>·?·@·A·B·C·E·F·G·I·J·K·M·N·O·P·Q·R·S·V·W·X·Y·Z·[·\·]·^·_·a·b·c·e·f·g·i·j·k·l·m·n·o·r·t·v·w·x·y·z·{·~···‚·ƒ·…·†·‡·ˆ·‰·Š·‹··“·”·•·š·›···Ÿ·¡·¢·£·¤·¥·¦·§·ª·®·¯·°·±·²·³·¶···¹·º·»·¼·½·¾·¿·À·Á·şÿşÿşÿşÿşÿşÿÂ·Ã·Ä·Å·Æ·È·Ê·Ë·Ì·Í·Î·Ï·Ğ·Ñ·Ò·Ó·Ô·Õ·Ö·×·Ø·Ù·Ú·Û·Ü·İ·şÿşÿşÿşÿşÿşÿŞ·ß·à·á·â·ã·ä·å·æ·ç·è·é·ê·ë·î·ï·ñ·ò·ó·õ·ö·÷·ø·ù·ú·û·ş·¸¸¸¸¸
+¸¸¸¸¸¸¸¸¸¸¸¸¸¸¸¸ ¸!¸"¸#¸&¸'¸)¸*¸+¸-¸.¸/¸0¸1¸2¸3¸6¸:¸;¸<¸=¸>¸?¸A¸B¸C¸E¸F¸G¸H¸I¸J¸K¸L¸M¸N¸O¸P¸R¸T¸U¸V¸W¸X¸Y¸Z¸[¸^¸_¸a¸b¸c¸e¸f¸g¸h¸i¸j¸k¸n¸p¸r¸s¸t¸u¸v¸w¸y¸z¸{¸}¸~¸¸€¸¸‚¸ƒ¸„¸…¸†¸‡¸ˆ¸‰¸Š¸‹¸Œ¸¸¸¸‘¸’¸“¸”¸•¸–¸—¸˜¸™¸š¸›¸œ¸¸¸Ÿ¸şÿşÿşÿşÿşÿşÿ ¸¡¸¢¸£¸¤¸¥¸¦¸§¸©¸ª¸«¸¬¸­¸®¸¯¸±¸²¸³¸µ¸¶¸·¸¹¸º¸»¸¼¸½¸şÿşÿşÿşÿşÿşÿ¾¸¿¸Â¸Ä¸Æ¸Ç¸È¸É¸Ê¸Ë¸Í¸Î¸Ï¸Ñ¸Ò¸Ó¸Õ¸Ö¸×¸Ø¸Ù¸Ú¸Û¸Ü¸Ş¸à¸â¸ã¸ä¸å¸æ¸ç¸ê¸ë¸í¸î¸ï¸ñ¸ò¸ó¸ô¸õ¸ö¸÷¸ú¸ü¸ş¸ÿ¸ ¹¹¹¹¹¹¹¹	¹
+¹¹¹¹¹¹¹¹¹¹¹¹¹¹¹¹¹¹¹¹¹!¹"¹#¹$¹%¹&¹'¹(¹)¹*¹+¹,¹-¹.¹/¹0¹1¹2¹3¹4¹5¹6¹7¹8¹9¹:¹;¹>¹?¹A¹B¹C¹E¹F¹G¹H¹I¹J¹K¹M¹N¹P¹R¹S¹T¹U¹V¹W¹Z¹[¹]¹^¹_¹a¹b¹c¹d¹e¹f¹g¹j¹l¹n¹o¹p¹q¹r¹s¹v¹w¹y¹z¹{¹}¹şÿşÿşÿşÿşÿşÿ~¹¹€¹¹‚¹ƒ¹†¹ˆ¹‹¹Œ¹¹¹‘¹’¹“¹”¹•¹–¹—¹˜¹™¹š¹›¹œ¹¹¹şÿşÿşÿşÿşÿşÿŸ¹ ¹¡¹¢¹£¹¤¹¥¹¦¹§¹¨¹©¹ª¹«¹®¹¯¹±¹²¹³¹µ¹¶¹·¹¸¹¹¹º¹»¹¾¹À¹Â¹Ã¹Ä¹Å¹Æ¹Ç¹Ê¹Ë¹Í¹Ó¹Ô¹Õ¹Ö¹×¹Ú¹Ü¹ß¹à¹â¹æ¹ç¹é¹ê¹ë¹í¹î¹ï¹ğ¹ñ¹ò¹ó¹ö¹û¹ü¹ı¹ş¹ÿ¹ºººººº	º
+ººººººººººººººººººººº º!º"º#º$º%º&º'º(º)º*º+º,º-º.º/º0º1º2º3º4º5º6º7º:º;º=º>º?ºAºCºDºEºFºGºJºLºOºPºQºRºVºWºYºZº[º]º^º_º`ºaºbºcºfºjºkºlºmºnºoºşÿşÿşÿşÿşÿşÿrºsºuºvºwºyºzº{º|º}º~ºº€ºº‚º†ºˆº‰ºŠº‹ººººº‘º’ºşÿşÿşÿşÿşÿşÿ“º”º•º–º—º˜º™ºšº›ºœºººŸº º¡º¢º£º¤º¥º¦º§ºªº­º®º¯º±º³º´ºµº¶º·ººº¼º¾º¿ºÀºÁºÂºÃºÅºÆºÇºÉºÊºËºÌºÍºÎºÏºĞºÑºÒºÓºÔºÕºÖº×ºÚºÛºÜºİºŞºßºàºáºâºãºäºåºæºçºèºéºêºëºìºíºîºïºğºñºòºóºôºõºöº÷ºøºùºúºûºıºşºÿº»»»»»»»	»
+»»»»»»»»»»»»»»»»»!»"»#»$»%»&»'»(»*»,»-».»/»0»1»2»3»7»9»:»?»@»A»B»C»F»H»J»K»L»N»Q»R»şÿşÿşÿşÿşÿşÿS»U»V»W»Y»Z»[»\»]»^»_»`»b»d»e»f»g»h»i»j»k»m»n»o»p»q»şÿşÿşÿşÿşÿşÿr»s»t»u»v»w»x»y»z»{»|»}»~»»€»»‚»ƒ»„»…»†»‡»‰»Š»‹»»»»‘»’»“»”»•»–»—»˜»™»š»›»œ»»»Ÿ» »¡»¢»£»¥»¦»§»©»ª»«»­»®»¯»°»±»²»³»µ»¶»¸»¹»º»»»¼»½»¾»¿»Á»Â»Ã»Å»Æ»Ç»É»Ê»Ë»Ì»Í»Î»Ï»Ñ»Ò»Ô»Õ»Ö»×»Ø»Ù»Ú»Û»Ü»İ»Ş»ß»à»á»â»ã»ä»å»æ»ç»è»é»ê»ë»ì»í»î»ï»ğ»ñ»ò»ó»ô»õ»ö»÷»ú»û»ı»ş»¼¼¼¼¼¼
+¼¼¼¼¼¼¼ ¼!¼"¼#¼&¼(¼*¼+¼,¼.¼/¼2¼3¼5¼şÿşÿşÿşÿşÿşÿ6¼7¼9¼:¼;¼<¼=¼>¼?¼B¼F¼G¼H¼J¼K¼N¼O¼Q¼R¼S¼T¼U¼V¼W¼X¼Y¼şÿşÿşÿşÿşÿşÿZ¼[¼\¼^¼_¼`¼a¼b¼c¼d¼e¼f¼g¼h¼i¼j¼k¼l¼m¼n¼o¼p¼q¼r¼s¼t¼u¼v¼w¼x¼y¼z¼{¼|¼}¼~¼¼€¼¼‚¼ƒ¼†¼‡¼‰¼Š¼¼¼¼‘¼’¼“¼–¼˜¼›¼œ¼¼¼Ÿ¼¢¼£¼¥¼¦¼©¼ª¼«¼¬¼­¼®¼¯¼²¼¶¼·¼¸¼¹¼º¼»¼¾¼¿¼Á¼Â¼Ã¼Å¼Æ¼Ç¼È¼É¼Ê¼Ë¼Ì¼Î¼Ò¼Ó¼Ô¼Ö¼×¼Ù¼Ú¼Û¼İ¼Ş¼ß¼à¼á¼â¼ã¼ä¼å¼æ¼ç¼è¼é¼ê¼ë¼ì¼í¼î¼ï¼ğ¼ñ¼ò¼ó¼÷¼ù¼ú¼û¼ı¼ş¼ÿ¼ ½½½½½½
+½½½½½½½½½½½½½½½½½½şÿşÿşÿşÿşÿşÿ½½ ½!½"½#½%½&½'½(½)½*½+½-½.½/½0½1½2½3½4½5½6½7½8½9½şÿşÿşÿşÿşÿşÿ:½;½<½=½>½?½A½B½C½D½E½F½G½J½K½M½N½O½Q½R½S½T½U½V½W½Z½[½\½]½^½_½`½a½b½c½e½f½g½i½j½k½l½m½n½o½p½q½r½s½t½u½v½w½x½y½z½{½|½}½~½½‚½ƒ½…½†½‹½Œ½½½½’½”½–½—½˜½›½½½Ÿ½ ½¡½¢½£½¥½¦½§½¨½©½ª½«½¬½­½®½¯½±½²½³½´½µ½¶½·½¹½º½»½¼½½½¾½¿½À½Á½Â½Ã½Ä½Å½Æ½Ç½È½É½Ê½Ë½Ì½Í½Î½Ï½Ğ½Ñ½Ò½Ó½Ö½×½Ù½Ú½Û½İ½Ş½ß½à½á½â½ã½ä½å½æ½ç½è½ê½ë½ì½í½î½ï½ñ½şÿşÿşÿşÿşÿşÿò½ó½õ½ö½÷½ù½ú½û½ü½ı½ş½ÿ½¾¾¾¾¾¾	¾
+¾¾¾¾¾¾¾şÿşÿşÿşÿşÿşÿ¾¾¾¾¾¾¾¾ ¾!¾"¾#¾$¾%¾&¾'¾(¾)¾*¾+¾,¾-¾.¾/¾0¾1¾2¾3¾4¾5¾6¾7¾8¾9¾:¾;¾<¾=¾>¾?¾@¾A¾B¾C¾F¾G¾I¾J¾K¾M¾O¾P¾Q¾R¾S¾V¾X¾\¾]¾^¾_¾b¾c¾e¾f¾g¾i¾k¾l¾m¾n¾o¾r¾v¾w¾x¾y¾z¾~¾¾¾‚¾ƒ¾…¾†¾‡¾ˆ¾‰¾Š¾‹¾¾’¾“¾”¾•¾–¾—¾š¾›¾œ¾¾¾Ÿ¾ ¾¡¾¢¾£¾¤¾¥¾¦¾§¾©¾ª¾«¾¬¾­¾®¾¯¾°¾±¾²¾³¾´¾µ¾¶¾·¾¸¾¹¾º¾»¾¼¾½¾¾¾¿¾À¾Á¾Â¾Ã¾Ä¾Å¾Æ¾Ç¾È¾É¾Ê¾Ë¾Ì¾Í¾Î¾Ï¾Ò¾Ó¾şÿşÿşÿşÿşÿşÿÕ¾Ö¾Ù¾Ú¾Û¾Ü¾İ¾Ş¾ß¾á¾â¾æ¾ç¾è¾é¾ê¾ë¾í¾î¾ï¾ğ¾ñ¾ò¾ó¾ô¾õ¾şÿşÿşÿşÿşÿşÿö¾÷¾ø¾ù¾ú¾û¾ü¾ı¾ş¾ÿ¾ ¿¿¿¿¿¿¿
+¿¿¿¿¿¿¿¿¿¿¿¿¿¿¿¿¿ ¿!¿"¿#¿$¿%¿&¿'¿(¿)¿*¿+¿,¿-¿.¿/¿0¿1¿2¿3¿4¿5¿6¿7¿8¿9¿:¿;¿<¿=¿>¿?¿B¿C¿E¿F¿G¿I¿J¿K¿L¿M¿N¿O¿R¿S¿T¿V¿W¿X¿Y¿Z¿[¿\¿]¿^¿_¿`¿a¿b¿c¿d¿e¿f¿g¿h¿i¿j¿k¿l¿m¿n¿o¿p¿q¿r¿s¿t¿u¿v¿w¿x¿y¿z¿{¿|¿}¿~¿¿€¿¿‚¿ƒ¿„¿…¿†¿‡¿ˆ¿‰¿Š¿‹¿Œ¿¿¿¿¿‘¿’¿“¿•¿–¿—¿˜¿™¿š¿›¿œ¿¿şÿşÿşÿşÿşÿşÿ¿Ÿ¿ ¿¡¿¢¿£¿¤¿¥¿¦¿§¿¨¿©¿ª¿«¿¬¿­¿®¿¯¿±¿²¿³¿´¿µ¿¶¿·¿¸¿şÿşÿşÿşÿşÿşÿ¹¿º¿»¿¼¿½¿¾¿¿¿À¿Á¿Â¿Ã¿Ä¿Æ¿Ç¿È¿É¿Ê¿Ë¿Î¿Ï¿Ñ¿Ò¿Ó¿Õ¿Ö¿×¿Ø¿Ù¿Ú¿Û¿İ¿Ş¿à¿â¿ã¿ä¿å¿æ¿ç¿è¿é¿ê¿ë¿ì¿í¿î¿ï¿ğ¿ñ¿ò¿ó¿ô¿õ¿ö¿÷¿ø¿ù¿ú¿û¿ü¿ı¿ş¿ÿ¿ ÀÀÀÀÀÀÀÀÀ	À
+ÀÀÀÀÀÀÀÀÀÀÀÀÀÀÀÀÀÀÀÀÀÀ À!À"À#À$À%À&À'À(À)À*À+À,À-À.À/À0À1À2À3À4À5À6À7À8À9À:À;À=À>À?À@ÀAÀBÀCÀDÀEÀFÀGÀHÀIÀJÀKÀLÀMÀNÀOÀPÀRÀSÀTÀUÀVÀWÀYÀZÀ[Àşÿşÿşÿşÿşÿşÿ]À^À_ÀaÀbÀcÀdÀeÀfÀgÀjÀkÀlÀmÀnÀoÀpÀqÀrÀsÀtÀuÀvÀwÀxÀyÀşÿşÿşÿşÿşÿşÿzÀ{À|À}À~ÀÀ€ÀÀ‚ÀƒÀ„À…À†À‡ÀˆÀ‰ÀŠÀ‹ÀŒÀÀÀÀ’À“À•À–À—À™ÀšÀ›ÀœÀÀÀŸÀ¢À¤À¦À§À¨À©ÀªÀ«À®À±À²À·À¸À¹ÀºÀ»À¾ÀÂÀÃÀÄÀÆÀÇÀÊÀËÀÍÀÎÀÏÀÑÀÒÀÓÀÔÀÕÀÖÀ×ÀÚÀŞÀßÀàÀáÀâÀãÀæÀçÀéÀêÀëÀíÀîÀïÀğÀñÀòÀóÀöÀøÀúÀûÀüÀıÀşÀÿÀÁÁÁÁÁÁ	Á
+ÁÁÁÁÁÁÁÁÁÁÁÁÁÁÁÁ!Á"Á%Á(Á)Á*Á+Á.Á2Á3Á4Á5Á7Á:Á;Á=Á>Á?ÁAÁBÁCÁDÁEÁFÁGÁJÁNÁOÁPÁQÁRÁSÁVÁWÁşÿşÿşÿşÿşÿşÿYÁZÁ[Á]Á^Á_Á`ÁaÁbÁcÁfÁjÁkÁlÁmÁnÁoÁqÁrÁsÁuÁvÁwÁyÁzÁ{Áşÿşÿşÿşÿşÿşÿ|Á}Á~ÁÁ€ÁÁ‚ÁƒÁ„Á†Á‡ÁˆÁ‰ÁŠÁ‹ÁÁ‘Á’Á“Á•Á—Á˜Á™ÁšÁ›ÁÁ Á¢Á£Á¤Á¦Á§ÁªÁ«Á­Á®Á¯Á±Á²Á³Á´ÁµÁ¶Á·Á¸Á¹ÁºÁ»Á¼Á¾Á¿ÁÀÁÁÁÂÁÃÁÅÁÆÁÇÁÉÁÊÁËÁÍÁÎÁÏÁĞÁÑÁÒÁÓÁÕÁÖÁÙÁÚÁÛÁÜÁİÁŞÁßÁáÁâÁãÁåÁæÁçÁéÁêÁëÁìÁíÁîÁïÁòÁôÁõÁöÁ÷ÁøÁùÁúÁûÁşÁÿÁÂÂÂÂÂÂÂ	Â
+ÂÂÂÂÂÂÂÂÂÂÂÂÂÂ!Â"Â#Â$Â%Â&Â'Â*Â,Â.Â0Â3Â5Â6Â7Â8Â9Â:Â;Â<Â=Â>Â?Â@ÂAÂBÂCÂDÂEÂşÿşÿşÿşÿşÿşÿFÂGÂIÂJÂKÂLÂMÂNÂOÂRÂSÂUÂVÂWÂYÂZÂ[Â\Â]Â^Â_ÂaÂbÂcÂdÂfÂşÿşÿşÿşÿşÿşÿgÂhÂiÂjÂkÂnÂoÂqÂrÂsÂuÂvÂwÂxÂyÂzÂ{Â~Â€Â‚ÂƒÂ„Â…Â†Â‡ÂŠÂ‹ÂŒÂÂÂÂ‘Â’Â“Â”Â•Â–Â—Â™ÂšÂœÂÂŸÂ Â¡Â¢Â£Â¦Â§Â©ÂªÂ«Â®Â¯Â°Â±Â²Â³Â¶Â¸ÂºÂ»Â¼Â½Â¾Â¿ÂÀÂÁÂÂÂÃÂÄÂÅÂÆÂÇÂÈÂÉÂÊÂËÂÌÂÍÂÎÂÏÂĞÂÑÂÒÂÓÂÔÂÕÂÖÂ×ÂØÂÙÂÚÂÛÂŞÂßÂáÂâÂåÂæÂçÂèÂéÂêÂîÂğÂòÂóÂôÂõÂ÷ÂúÂıÂşÂÿÂÃÃÃÃÃÃÃ
+ÃÃÃÃÃÃÃÃÃÃÃÃÃÃÃ Ã!Ã"Ã#Ã&Ã'Ã*Ã+Ã,Ã-Ã.Ã/Ã0Ã1Ã2Ãşÿşÿşÿşÿşÿşÿ3Ã4Ã5Ã6Ã7Ã8Ã9Ã:Ã;Ã<Ã=Ã>Ã?Ã@ÃAÃBÃCÃDÃFÃGÃHÃIÃJÃKÃLÃMÃşÿşÿşÿşÿşÿşÿNÃOÃPÃQÃRÃSÃTÃUÃVÃWÃXÃYÃZÃ[Ã\Ã]Ã^Ã_Ã`ÃaÃbÃcÃdÃeÃfÃgÃjÃkÃmÃnÃoÃqÃsÃtÃuÃvÃwÃzÃ{Ã~ÃÃ€ÃÃ‚ÃƒÃ…Ã†Ã‡Ã‰ÃŠÃ‹ÃÃÃÃÃ‘Ã’Ã“Ã”Ã•Ã–Ã—Ã˜Ã™ÃšÃ›ÃœÃÃÃŸÃ Ã¡Ã¢Ã£Ã¤Ã¥Ã¦Ã§Ã¨Ã©ÃªÃ«Ã¬Ã­Ã®Ã¯Ã°Ã±Ã²Ã³Ã´ÃµÃ¶Ã·Ã¸Ã¹ÃºÃ»Ã¼Ã½

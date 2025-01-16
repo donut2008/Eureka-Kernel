@@ -1,400 +1,153 @@
-/*
- * Apple Cinema Display driver
- *
- * Copyright (C) 2006  Michael Hanselmann (linux-kernel@hansmi.ch)
- *
- * Thanks to Caskey L. Dickson for his work with acdctl.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/usb.h>
-#include <linux/backlight.h>
-#include <linux/timer.h>
-#include <linux/workqueue.h>
-#include <linux/atomic.h>
-
-#define APPLE_VENDOR_ID		0x05AC
-
-#define USB_REQ_GET_REPORT	0x01
-#define USB_REQ_SET_REPORT	0x09
-
-#define ACD_USB_TIMEOUT		250
-
-#define ACD_USB_EDID		0x0302
-#define ACD_USB_BRIGHTNESS	0x0310
-
-#define ACD_BTN_NONE		0
-#define ACD_BTN_BRIGHT_UP	3
-#define ACD_BTN_BRIGHT_DOWN	4
-
-#define ACD_URB_BUFFER_LEN	2
-#define ACD_MSG_BUFFER_LEN	2
-
-#define APPLEDISPLAY_DEVICE(prod)				\
-	.match_flags = USB_DEVICE_ID_MATCH_DEVICE |		\
-		       USB_DEVICE_ID_MATCH_INT_CLASS |		\
-		       USB_DEVICE_ID_MATCH_INT_PROTOCOL,	\
-	.idVendor = APPLE_VENDOR_ID,				\
-	.idProduct = (prod),					\
-	.bInterfaceClass = USB_CLASS_HID,			\
-	.bInterfaceProtocol = 0x00
-
-/* table of devices that work with this driver */
-static const struct usb_device_id appledisplay_table[] = {
-	{ APPLEDISPLAY_DEVICE(0x9218) },
-	{ APPLEDISPLAY_DEVICE(0x9219) },
-	{ APPLEDISPLAY_DEVICE(0x921c) },
-	{ APPLEDISPLAY_DEVICE(0x921d) },
-	{ APPLEDISPLAY_DEVICE(0x9222) },
-	{ APPLEDISPLAY_DEVICE(0x9226) },
-	{ APPLEDISPLAY_DEVICE(0x9236) },
-
-	/* Terminating entry */
-	{ }
-};
-MODULE_DEVICE_TABLE(usb, appledisplay_table);
-
-/* Structure to hold all of our device specific stuff */
-struct appledisplay {
-	struct usb_device *udev;	/* usb device */
-	struct urb *urb;		/* usb request block */
-	struct backlight_device *bd;	/* backlight device */
-	u8 *urbdata;			/* interrupt URB data buffer */
-	u8 *msgdata;			/* control message data buffer */
-
-	struct delayed_work work;
-	int button_pressed;
-	spinlock_t lock;
-	struct mutex sysfslock;		/* concurrent read and write */
-};
-
-static atomic_t count_displays = ATOMIC_INIT(0);
-static struct workqueue_struct *wq;
-
-static void appledisplay_complete(struct urb *urb)
-{
-	struct appledisplay *pdata = urb->context;
-	struct device *dev = &pdata->udev->dev;
-	unsigned long flags;
-	int status = urb->status;
-	int retval;
-
-	switch (status) {
-	case 0:
-		/* success */
-		break;
-	case -EOVERFLOW:
-		dev_err(dev,
-			"OVERFLOW with data length %d, actual length is %d\n",
-			ACD_URB_BUFFER_LEN, pdata->urb->actual_length);
-	case -ECONNRESET:
-	case -ENOENT:
-	case -ESHUTDOWN:
-		/* This urb is terminated, clean up */
-		dev_dbg(dev, "%s - urb shuttingdown with status: %d\n",
-			__func__, status);
-		return;
-	default:
-		dev_dbg(dev, "%s - nonzero urb status received: %d\n",
-			__func__, status);
-		goto exit;
-	}
-
-	spin_lock_irqsave(&pdata->lock, flags);
-
-	switch(pdata->urbdata[1]) {
-	case ACD_BTN_BRIGHT_UP:
-	case ACD_BTN_BRIGHT_DOWN:
-		pdata->button_pressed = 1;
-		queue_delayed_work(wq, &pdata->work, 0);
-		break;
-	case ACD_BTN_NONE:
-	default:
-		pdata->button_pressed = 0;
-		break;
-	}
-
-	spin_unlock_irqrestore(&pdata->lock, flags);
-
-exit:
-	retval = usb_submit_urb(pdata->urb, GFP_ATOMIC);
-	if (retval) {
-		dev_err(dev, "%s - usb_submit_urb failed with result %d\n",
-			__func__, retval);
-	}
-}
-
-static int appledisplay_bl_update_status(struct backlight_device *bd)
-{
-	struct appledisplay *pdata = bl_get_data(bd);
-	int retval;
-
-	mutex_lock(&pdata->sysfslock);
-	pdata->msgdata[0] = 0x10;
-	pdata->msgdata[1] = bd->props.brightness;
-
-	retval = usb_control_msg(
-		pdata->udev,
-		usb_sndctrlpipe(pdata->udev, 0),
-		USB_REQ_SET_REPORT,
-		USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-		ACD_USB_BRIGHTNESS,
-		0,
-		pdata->msgdata, 2,
-		ACD_USB_TIMEOUT);
-	mutex_unlock(&pdata->sysfslock);
-
-	if (retval < 0)
-		return retval;
-	else
-		return 0;
-}
-
-static int appledisplay_bl_get_brightness(struct backlight_device *bd)
-{
-	struct appledisplay *pdata = bl_get_data(bd);
-	int retval, brightness;
-
-	mutex_lock(&pdata->sysfslock);
-	retval = usb_control_msg(
-		pdata->udev,
-		usb_rcvctrlpipe(pdata->udev, 0),
-		USB_REQ_GET_REPORT,
-		USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-		ACD_USB_BRIGHTNESS,
-		0,
-		pdata->msgdata, 2,
-		ACD_USB_TIMEOUT);
-	if (retval < 2) {
-		if (retval >= 0)
-			retval = -EMSGSIZE;
-	} else {
-		brightness = pdata->msgdata[1];
-	}
-	mutex_unlock(&pdata->sysfslock);
-
-	if (retval < 0)
-		return retval;
-	else
-		return brightness;
-}
-
-static const struct backlight_ops appledisplay_bl_data = {
-	.get_brightness	= appledisplay_bl_get_brightness,
-	.update_status	= appledisplay_bl_update_status,
-};
-
-static void appledisplay_work(struct work_struct *work)
-{
-	struct appledisplay *pdata =
-		container_of(work, struct appledisplay, work.work);
-	int retval;
-
-	retval = appledisplay_bl_get_brightness(pdata->bd);
-	if (retval >= 0)
-		pdata->bd->props.brightness = retval;
-
-	/* Poll again in about 125ms if there's still a button pressed */
-	if (pdata->button_pressed)
-		schedule_delayed_work(&pdata->work, HZ / 8);
-}
-
-static int appledisplay_probe(struct usb_interface *iface,
-	const struct usb_device_id *id)
-{
-	struct backlight_properties props;
-	struct appledisplay *pdata;
-	struct usb_device *udev = interface_to_usbdev(iface);
-	struct usb_host_interface *iface_desc;
-	struct usb_endpoint_descriptor *endpoint;
-	int int_in_endpointAddr = 0;
-	int i, retval = -ENOMEM, brightness;
-	char bl_name[20];
-
-	/* set up the endpoint information */
-	/* use only the first interrupt-in endpoint */
-	iface_desc = iface->cur_altsetting;
-	for (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
-		endpoint = &iface_desc->endpoint[i].desc;
-		if (!int_in_endpointAddr && usb_endpoint_is_int_in(endpoint)) {
-			/* we found an interrupt in endpoint */
-			int_in_endpointAddr = endpoint->bEndpointAddress;
-			break;
-		}
-	}
-	if (!int_in_endpointAddr) {
-		dev_err(&iface->dev, "Could not find int-in endpoint\n");
-		return -EIO;
-	}
-
-	/* allocate memory for our device state and initialize it */
-	pdata = kzalloc(sizeof(struct appledisplay), GFP_KERNEL);
-	if (!pdata) {
-		retval = -ENOMEM;
-		dev_err(&iface->dev, "Out of memory\n");
-		goto error;
-	}
-
-	pdata->udev = udev;
-
-	spin_lock_init(&pdata->lock);
-	INIT_DELAYED_WORK(&pdata->work, appledisplay_work);
-	mutex_init(&pdata->sysfslock);
-
-	/* Allocate buffer for control messages */
-	pdata->msgdata = kmalloc(ACD_MSG_BUFFER_LEN, GFP_KERNEL);
-	if (!pdata->msgdata) {
-		retval = -ENOMEM;
-		dev_err(&iface->dev,
-			"Allocating buffer for control messages failed\n");
-		goto error;
-	}
-
-	/* Allocate interrupt URB */
-	pdata->urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!pdata->urb) {
-		retval = -ENOMEM;
-		dev_err(&iface->dev, "Allocating URB failed\n");
-		goto error;
-	}
-
-	/* Allocate buffer for interrupt data */
-	pdata->urbdata = usb_alloc_coherent(pdata->udev, ACD_URB_BUFFER_LEN,
-		GFP_KERNEL, &pdata->urb->transfer_dma);
-	if (!pdata->urbdata) {
-		retval = -ENOMEM;
-		dev_err(&iface->dev, "Allocating URB buffer failed\n");
-		goto error;
-	}
-
-	/* Configure interrupt URB */
-	usb_fill_int_urb(pdata->urb, udev,
-		usb_rcvintpipe(udev, int_in_endpointAddr),
-		pdata->urbdata, ACD_URB_BUFFER_LEN, appledisplay_complete,
-		pdata, 1);
-	if (usb_submit_urb(pdata->urb, GFP_KERNEL)) {
-		retval = -EIO;
-		dev_err(&iface->dev, "Submitting URB failed\n");
-		goto error;
-	}
-
-	/* Register backlight device */
-	snprintf(bl_name, sizeof(bl_name), "appledisplay%d",
-		atomic_inc_return(&count_displays) - 1);
-	memset(&props, 0, sizeof(struct backlight_properties));
-	props.type = BACKLIGHT_RAW;
-	props.max_brightness = 0xff;
-	pdata->bd = backlight_device_register(bl_name, NULL, pdata,
-					      &appledisplay_bl_data, &props);
-	if (IS_ERR(pdata->bd)) {
-		dev_err(&iface->dev, "Backlight registration failed\n");
-		retval = PTR_ERR(pdata->bd);
-		goto error;
-	}
-
-	/* Try to get brightness */
-	brightness = appledisplay_bl_get_brightness(pdata->bd);
-
-	if (brightness < 0) {
-		retval = brightness;
-		dev_err(&iface->dev,
-			"Error while getting initial brightness: %d\n", retval);
-		goto error;
-	}
-
-	/* Set brightness in backlight device */
-	pdata->bd->props.brightness = brightness;
-
-	/* save our data pointer in the interface device */
-	usb_set_intfdata(iface, pdata);
-
-	printk(KERN_INFO "appledisplay: Apple Cinema Display connected\n");
-
-	return 0;
-
-error:
-	if (pdata) {
-		if (pdata->urb) {
-			usb_kill_urb(pdata->urb);
-			cancel_delayed_work_sync(&pdata->work);
-			if (pdata->urbdata)
-				usb_free_coherent(pdata->udev, ACD_URB_BUFFER_LEN,
-					pdata->urbdata, pdata->urb->transfer_dma);
-			usb_free_urb(pdata->urb);
-		}
-		if (!IS_ERR(pdata->bd))
-			backlight_device_unregister(pdata->bd);
-		kfree(pdata->msgdata);
-	}
-	usb_set_intfdata(iface, NULL);
-	kfree(pdata);
-	return retval;
-}
-
-static void appledisplay_disconnect(struct usb_interface *iface)
-{
-	struct appledisplay *pdata = usb_get_intfdata(iface);
-
-	if (pdata) {
-		usb_kill_urb(pdata->urb);
-		cancel_delayed_work(&pdata->work);
-		backlight_device_unregister(pdata->bd);
-		usb_free_coherent(pdata->udev, ACD_URB_BUFFER_LEN,
-			pdata->urbdata, pdata->urb->transfer_dma);
-		usb_free_urb(pdata->urb);
-		kfree(pdata->msgdata);
-		kfree(pdata);
-	}
-
-	printk(KERN_INFO "appledisplay: Apple Cinema Display disconnected\n");
-}
-
-static struct usb_driver appledisplay_driver = {
-	.name		= "appledisplay",
-	.probe		= appledisplay_probe,
-	.disconnect	= appledisplay_disconnect,
-	.id_table	= appledisplay_table,
-};
-
-static int __init appledisplay_init(void)
-{
-	wq = create_singlethread_workqueue("appledisplay");
-	if (!wq) {
-		printk(KERN_ERR "appledisplay: Could not create work queue\n");
-		return -ENOMEM;
-	}
-
-	return usb_register(&appledisplay_driver);
-}
-
-static void __exit appledisplay_exit(void)
-{
-	flush_workqueue(wq);
-	destroy_workqueue(wq);
-	usb_deregister(&appledisplay_driver);
-}
-
-MODULE_AUTHOR("Michael Hanselmann");
-MODULE_DESCRIPTION("Apple Cinema Display driver");
-MODULE_LICENSE("GPL");
-
-module_init(appledisplay_init);
-module_exit(appledisplay_exit);
+_DATA_MASK 0xffffffff
+#define XDMA_AON_TEST_DEBUG_DATA__XDMA_AON_TEST_DEBUG_DATA__SHIFT 0x0
+#define XDMA_MSTR_CNTL__XDMA_MSTR_ALPHA_POSITION_MASK 0x3000
+#define XDMA_MSTR_CNTL__XDMA_MSTR_ALPHA_POSITION__SHIFT 0xc
+#define XDMA_MSTR_CNTL__XDMA_MSTR_MEM_READY_MASK 0x4000
+#define XDMA_MSTR_CNTL__XDMA_MSTR_MEM_READY__SHIFT 0xe
+#define XDMA_MSTR_CNTL__XDMA_MSTR_ENABLE_MASK 0x10000
+#define XDMA_MSTR_CNTL__XDMA_MSTR_ENABLE__SHIFT 0x10
+#define XDMA_MSTR_CNTL__XDMA_MSTR_DEBUG_MODE_MASK 0x40000
+#define XDMA_MSTR_CNTL__XDMA_MSTR_DEBUG_MODE__SHIFT 0x12
+#define XDMA_MSTR_CNTL__XDMA_MSTR_SOFT_RESET_MASK 0x100000
+#define XDMA_MSTR_CNTL__XDMA_MSTR_SOFT_RESET__SHIFT 0x14
+#define XDMA_MSTR_CNTL__XDMA_MSTR_BIF_STALL_EN_MASK 0x200000
+#define XDMA_MSTR_CNTL__XDMA_MSTR_BIF_STALL_EN__SHIFT 0x15
+#define XDMA_MSTR_STATUS__XDMA_MSTR_VCOUNT_CURRENT_MASK 0x3fff
+#define XDMA_MSTR_STATUS__XDMA_MSTR_VCOUNT_CURRENT__SHIFT 0x0
+#define XDMA_MSTR_STATUS__XDMA_MSTR_WRITE_LINE_CURRENT_MASK 0xfff0000
+#define XDMA_MSTR_STATUS__XDMA_MSTR_WRITE_LINE_CURRENT__SHIFT 0x10
+#define XDMA_MSTR_STATUS__XDMA_MSTR_STATUS_SELECT_MASK 0x70000000
+#define XDMA_MSTR_STATUS__XDMA_MSTR_STATUS_SELECT__SHIFT 0x1c
+#define XDMA_MSTR_MEM_CLIENT_CONFIG__XDMA_MSTR_MEM_CLIENT_SWAP_MASK 0x300
+#define XDMA_MSTR_MEM_CLIENT_CONFIG__XDMA_MSTR_MEM_CLIENT_SWAP__SHIFT 0x8
+#define XDMA_MSTR_MEM_CLIENT_CONFIG__XDMA_MSTR_MEM_CLIENT_VMID_MASK 0xf000
+#define XDMA_MSTR_MEM_CLIENT_CONFIG__XDMA_MSTR_MEM_CLIENT_VMID__SHIFT 0xc
+#define XDMA_MSTR_MEM_CLIENT_CONFIG__XDMA_MSTR_MEM_CLIENT_PRIV_MASK 0x10000
+#define XDMA_MSTR_MEM_CLIENT_CONFIG__XDMA_MSTR_MEM_CLIENT_PRIV__SHIFT 0x10
+#define XDMA_MSTR_LOCAL_SURFACE_BASE_ADDR__XDMA_MSTR_LOCAL_SURFACE_BASE_ADDR_MASK 0xffffffff
+#define XDMA_MSTR_LOCAL_SURFACE_BASE_ADDR__XDMA_MSTR_LOCAL_SURFACE_BASE_ADDR__SHIFT 0x0
+#define XDMA_MSTR_LOCAL_SURFACE_BASE_ADDR_HIGH__XDMA_MSTR_LOCAL_SURFACE_BASE_ADDR_HIGH_MASK 0xff
+#define XDMA_MSTR_LOCAL_SURFACE_BASE_ADDR_HIGH__XDMA_MSTR_LOCAL_SURFACE_BASE_ADDR_HIGH__SHIFT 0x0
+#define XDMA_MSTR_LOCAL_SURFACE_PITCH__XDMA_MSTR_LOCAL_SURFACE_PITCH_MASK 0x3fff
+#define XDMA_MSTR_LOCAL_SURFACE_PITCH__XDMA_MSTR_LOCAL_SURFACE_PITCH__SHIFT 0x0
+#define XDMA_MSTR_CMD_URGENT_CNTL__XDMA_MSTR_CMD_CLIENT_STALL_MASK 0x1
+#define XDMA_MSTR_CMD_URGENT_CNTL__XDMA_MSTR_CMD_CLIENT_STALL__SHIFT 0x0
+#define XDMA_MSTR_CMD_URGENT_CNTL__XDMA_MSTR_CMD_URGENT_LEVEL_MASK 0xf00
+#define XDMA_MSTR_CMD_URGENT_CNTL__XDMA_MSTR_CMD_URGENT_LEVEL__SHIFT 0x8
+#define XDMA_MSTR_CMD_URGENT_CNTL__XDMA_MSTR_CMD_STALL_DELAY_MASK 0xf000
+#define XDMA_MSTR_CMD_URGENT_CNTL__XDMA_MSTR_CMD_STALL_DELAY__SHIFT 0xc
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_CLIENT_STALL_MASK 0x1
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_CLIENT_STALL__SHIFT 0x0
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_URGENT_LIMIT_MASK 0xf0
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_URGENT_LIMIT__SHIFT 0x4
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_URGENT_LEVEL_MASK 0xf00
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_URGENT_LEVEL__SHIFT 0x8
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_STALL_DELAY_MASK 0xf000
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_STALL_DELAY__SHIFT 0xc
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_URGENT_TIMER_MASK 0xffff0000
+#define XDMA_MSTR_MEM_URGENT_CNTL__XDMA_MSTR_MEM_URGENT_TIMER__SHIFT 0x10
+#define XDMA_MSTR_PCIE_NACK_STATUS__XDMA_MSTR_PCIE_NACK_TAG_MASK 0x3ff
+#define XDMA_MSTR_PCIE_NACK_STATUS__XDMA_MSTR_PCIE_NACK_TAG__SHIFT 0x0
+#define XDMA_MSTR_PCIE_NACK_STATUS__XDMA_MSTR_PCIE_NACK_MASK 0x3000
+#define XDMA_MSTR_PCIE_NACK_STATUS__XDMA_MSTR_PCIE_NACK__SHIFT 0xc
+#define XDMA_MSTR_PCIE_NACK_STATUS__XDMA_MSTR_PCIE_NACK_CLR_MASK 0x10000
+#define XDMA_MSTR_PCIE_NACK_STATUS__XDMA_MSTR_PCIE_NACK_CLR__SHIFT 0x10
+#define XDMA_MSTR_MEM_NACK_STATUS__XDMA_MSTR_MEM_NACK_TAG_MASK 0x3ff
+#define XDMA_MSTR_MEM_NACK_STATUS__XDMA_MSTR_MEM_NACK_TAG__SHIFT 0x0
+#define XDMA_MSTR_MEM_NACK_STATUS__XDMA_MSTR_MEM_NACK_MASK 0x3000
+#define XDMA_MSTR_MEM_NACK_STATUS__XDMA_MSTR_MEM_NACK__SHIFT 0xc
+#define XDMA_MSTR_MEM_NACK_STATUS__XDMA_MSTR_MEM_NACK_CLR_MASK 0x10000
+#define XDMA_MSTR_MEM_NACK_STATUS__XDMA_MSTR_MEM_NACK_CLR__SHIFT 0x10
+#define XDMA_MSTR_VSYNC_GSL_CHECK__XDMA_MSTR_VSYNC_GSL_CHECK_SEL_MASK 0x7
+#define XDMA_MSTR_VSYNC_GSL_CHECK__XDMA_MSTR_VSYNC_GSL_CHECK_SEL__SHIFT 0x0
+#define XDMA_MSTR_VSYNC_GSL_CHECK__XDMA_MSTR_VSYNC_GSL_CHECK_V_COUNT_MASK 0x3fff00
+#define XDMA_MSTR_VSYNC_GSL_CHECK__XDMA_MSTR_VSYNC_GSL_CHECK_V_COUNT__SHIFT 0x8
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_CACHE_LINES_MASK 0xff
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_CACHE_LINES__SHIFT 0x0
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_READ_REQUEST_MASK 0x100
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_READ_REQUEST__SHIFT 0x8
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_FRAME_MODE_MASK 0x200
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_FRAME_MODE__SHIFT 0x9
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_SOFT_RESET_MASK 0x400
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_SOFT_RESET__SHIFT 0xa
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_CACHE_INVALIDATE_MASK 0x800
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_CACHE_INVALIDATE__SHIFT 0xb
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_REQUEST_CHANNEL_ID_MASK 0x7000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_REQUEST_CHANNEL_ID__SHIFT 0xc
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_FLIP_MODE_MASK 0x8000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_FLIP_MODE__SHIFT 0xf
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_REQUEST_MIN_MASK 0xff0000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_REQUEST_MIN__SHIFT 0x10
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_ACTIVE_MASK 0x1000000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_ACTIVE__SHIFT 0x18
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_FLUSHING_MASK 0x2000000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_FLUSHING__SHIFT 0x19
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_FLIP_PENDING_MASK 0x4000000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_PIPE_FLIP_PENDING__SHIFT 0x1a
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_VSYNC_GSL_ENABLE_MASK 0x8000000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_VSYNC_GSL_ENABLE__SHIFT 0x1b
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_SUPERAA_ENABLE_MASK 0x10000000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_SUPERAA_ENABLE__SHIFT 0x1c
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_HSYNC_GSL_GROUP_MASK 0x60000000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_HSYNC_GSL_GROUP__SHIFT 0x1d
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_GSL_GROUP_MASTER_MASK 0x80000000
+#define XDMA_MSTR_PIPE_CNTL__XDMA_MSTR_GSL_GROUP_MASTER__SHIFT 0x1f
+#define XDMA_MSTR_READ_COMMAND__XDMA_MSTR_REQUEST_SIZE_MASK 0x3fff
+#define XDMA_MSTR_READ_COMMAND__XDMA_MSTR_REQUEST_SIZE__SHIFT 0x0
+#define XDMA_MSTR_READ_COMMAND__XDMA_MSTR_REQUEST_PREFETCH_MASK 0x3fff0000
+#define XDMA_MSTR_READ_COMMAND__XDMA_MSTR_REQUEST_PREFETCH__SHIFT 0x10
+#define XDMA_MSTR_CHANNEL_DIM__XDMA_MSTR_CHANNEL_WIDTH_MASK 0x3fff
+#define XDMA_MSTR_CHANNEL_DIM__XDMA_MSTR_CHANNEL_WIDTH__SHIFT 0x0
+#define XDMA_MSTR_CHANNEL_DIM__XDMA_MSTR_CHANNEL_HEIGHT_MASK 0x3fff0000
+#define XDMA_MSTR_CHANNEL_DIM__XDMA_MSTR_CHANNEL_HEIGHT__SHIFT 0x10
+#define XDMA_MSTR_HEIGHT__XDMA_MSTR_ACTIVE_HEIGHT_MASK 0x3fff
+#define XDMA_MSTR_HEIGHT__XDMA_MSTR_ACTIVE_HEIGHT__SHIFT 0x0
+#define XDMA_MSTR_HEIGHT__XDMA_MSTR_FRAME_HEIGHT_MASK 0x3fff0000
+#define XDMA_MSTR_HEIGHT__XDMA_MSTR_FRAME_HEIGHT__SHIFT 0x10
+#define XDMA_MSTR_REMOTE_SURFACE_BASE__XDMA_MSTR_REMOTE_SURFACE_BASE_MASK 0xffffffff
+#define XDMA_MSTR_REMOTE_SURFACE_BASE__XDMA_MSTR_REMOTE_SURFACE_BASE__SHIFT 0x0
+#define XDMA_MSTR_REMOTE_SURFACE_BASE_HIGH__XDMA_MSTR_REMOTE_SURFACE_BASE_HIGH_MASK 0xff
+#define XDMA_MSTR_REMOTE_SURFACE_BASE_HIGH__XDMA_MSTR_REMOTE_SURFACE_BASE_HIGH__SHIFT 0x0
+#define XDMA_MSTR_REMOTE_GPU_ADDRESS__XDMA_MSTR_REMOTE_GPU_ADDRESS_MASK 0xffffffff
+#define XDMA_MSTR_REMOTE_GPU_ADDRESS__XDMA_MSTR_REMOTE_GPU_ADDRESS__SHIFT 0x0
+#define XDMA_MSTR_REMOTE_GPU_ADDRESS_HIGH__XDMA_MSTR_REMOTE_GPU_ADDRESS_HIGH_MASK 0xff
+#define XDMA_MSTR_REMOTE_GPU_ADDRESS_HIGH__XDMA_MSTR_REMOTE_GPU_ADDRESS_HIGH__SHIFT 0x0
+#define XDMA_MSTR_CACHE_BASE_ADDR__XDMA_MSTR_CACHE_BASE_ADDR_MASK 0xffffffff
+#define XDMA_MSTR_CACHE_BASE_ADDR__XDMA_MSTR_CACHE_BASE_ADDR__SHIFT 0x0
+#define XDMA_MSTR_CACHE_BASE_ADDR_HIGH__XDMA_MSTR_CACHE_BASE_ADDR_HIGH_MASK 0xff
+#define XDMA_MSTR_CACHE_BASE_ADDR_HIGH__XDMA_MSTR_CACHE_BASE_ADDR_HIGH__SHIFT 0x0
+#define XDMA_MSTR_CACHE__XDMA_MSTR_CACHE_PITCH_MASK 0x3fff
+#define XDMA_MSTR_CACHE__XDMA_MSTR_CACHE_PITCH__SHIFT 0x0
+#define XDMA_MSTR_CACHE__XDMA_MSTR_CACHE_TLB_PG_STATE_MASK 0x60000000
+#define XDMA_MSTR_CACHE__XDMA_MSTR_CACHE_TLB_PG_STATE__SHIFT 0x1d
+#define XDMA_MSTR_CACHE__XDMA_MSTR_CACHE_TLB_PG_TRANS_MASK 0x80000000
+#define XDMA_MSTR_CACHE__XDMA_MSTR_CACHE_TLB_PG_TRANS__SHIFT 0x1f
+#define XDMA_MSTR_CHANNEL_START__XDMA_MSTR_CHANNEL_START_X_MASK 0x3fff
+#define XDMA_MSTR_CHANNEL_START__XDMA_MSTR_CHANNEL_START_X__SHIFT 0x0
+#define XDMA_MSTR_CHANNEL_START__XDMA_MSTR_CHANNEL_START_Y_MASK 0x3fff0000
+#define XDMA_MSTR_CHANNEL_START__XDMA_MSTR_CHANNEL_START_Y__SHIFT 0x10
+#define XDMA_MSTR_PERFMEAS_STATUS__XDMA_MSTR_PERFMEAS_DATA_MASK 0xffffff
+#define XDMA_MSTR_PERFMEAS_STATUS__XDMA_MSTR_PERFMEAS_DATA__SHIFT 0x0
+#define XDMA_MSTR_PERFMEAS_STATUS__XDMA_MSTR_PERFMEAS_INDEX_MASK 0x7000000
+#define XDMA_MSTR_PERFMEAS_STATUS__XDMA_MSTR_PERFMEAS_INDEX__SHIFT 0x18
+#define XDMA_MSTR_PERFMEAS_STATUS__XDMA_MSTR_PERFMEAS_INDEX_MODE_MASK 0xc0000000
+#define XDMA_MSTR_PERFMEAS_STATUS__XDMA_MSTR_PERFMEAS_INDEX_MODE__SHIFT 0x1e
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_CACHE_BW_MEAS_ITER_MASK 0xfff
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_CACHE_BW_MEAS_ITER__SHIFT 0x0
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_CACHE_BW_SEGID_SEL_MASK 0x1f000
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_CACHE_BW_SEGID_SEL__SHIFT 0xc
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_CACHE_BW_COUNTER_RST_MASK 0x20000
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_CACHE_BW_COUNTER_RST__SHIFT 0x11
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_LT_MEAS_ITER_MASK 0x7ff80000
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_LT_MEAS_ITER__SHIFT 0x13
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_LT_COUNTER_RST_MASK 0x80000000
+#define XDMA_MSTR_PERFMEAS_CNTL__XDMA_MSTR_LT_COUNTER_RST__SHIFT 0x1f
+#define XDMA_SLV_CNTL__XDMA_SLV_READ_LINES_MASK 0x1
+#define XDMA_SLV_CNTL__XDMA_SLV_READ_LINES__SHIFT 0x0
+#define XDMA_SLV_CNTL__XDMA_SLV_MEM_READY_MASK 0x200
+#define XDMA_SLV_CNTL__XDMA_SLV_MEM_READY__SHIFT 0x9
+#define XDMA_SLV_CNTL__XDMA_SLV_ACTIVE_MASK 0x400
+#define XDMA_SLV_CNTL__XDMA_SLV_ACTIVE__SHIFT 0xa
+#define XDMA_SLV_CNTL__XDMA_SLV_ALPHA_POSITION_MASK 0x3000
+#define XDMA_SLV_CNTL__XDMA_SLV_ALPHA_POSITION__SHIFT 0xc
+#define XDMA_S

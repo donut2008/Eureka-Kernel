@@ -1,100 +1,113 @@
-Firmware is required for this device: http://accessrunner.sourceforge.net/
+ror; otherwise,
+ * false.
+ */
+static bool
+ppc4xx_edac_check_bank_error(const struct ppc4xx_ecc_status *status,
+			     unsigned int bank)
+{
+	switch (bank) {
+	case 0:
+		return status->ecces & SDRAM_ECCES_BK0ER;
+	case 1:
+		return status->ecces & SDRAM_ECCES_BK1ER;
+	default:
+		return false;
+	}
+}
 
-While it is capable of managing/maintaining the ADSL connection without the
-module loaded, the device will sometimes stop responding after unloading the
-driver and it is necessary to unplug/remove power to the device to fix this.
+/**
+ * ppc4xx_edac_generate_bank_message - generate interpretted bank status message
+ * @mci: A pointer to the EDAC memory controller instance associated
+ *       with the bank message being generated.
+ * @status: A pointer to the ECC status structure to generate the
+ *          message from.
+ * @buffer: A pointer to the buffer in which to generate the
+ *          message.
+ * @size: The size, in bytes, of space available in buffer.
+ *
+ * This routine generates to the provided buffer the portion of the
+ * driver-unique report message associated with the ECCESS[BKNER]
+ * field of the specified ECC status.
+ *
+ * Returns the number of characters generated on success; otherwise, <
+ * 0 on error.
+ */
+static int
+ppc4xx_edac_generate_bank_message(const struct mem_ctl_info *mci,
+				  const struct ppc4xx_ecc_status *status,
+				  char *buffer,
+				  size_t size)
+{
+	int n, total = 0;
+	unsigned int row, rows;
 
-Note: support for cxacru-cf.bin has been removed. It was not loaded correctly
-so it had no effect on the device configuration. Fixing it could have stopped
-existing devices working when an invalid configuration is supplied.
+	n = snprintf(buffer, size, "%s: Banks: ", mci->dev_name);
 
-There is a script cxacru-cf.py to convert an existing file to the sysfs form.
+	if (n < 0 || n >= size)
+		goto fail;
 
-Detected devices will appear as ATM devices named "cxacru". In /sys/class/atm/
-these are directories named cxacruN where N is the device number. A symlink
-named device points to the USB interface device's directory which contains
-several sysfs attribute files for retrieving device statistics:
+	buffer += n;
+	size -= n;
+	total += n;
 
-* adsl_controller_version
+	for (rows = 0, row = 0; row < mci->nr_csrows; row++) {
+		if (ppc4xx_edac_check_bank_error(status, row)) {
+			n = snprintf(buffer, size, "%s%u",
+					(rows++ ? ", " : ""), row);
 
-* adsl_headend
-* adsl_headend_environment
-	Information about the remote headend.
+			if (n < 0 || n >= size)
+				goto fail;
 
-* adsl_config
-	Configuration writing interface.
-	Write parameters in hexadecimal format <index>=<value>,
-	separated by whitespace, e.g.:
-		"1=0 a=5"
-	Up to 7 parameters at a time will be sent and the modem will restart
-	the ADSL connection when any value is set. These are logged for future
-	reference.
+			buffer += n;
+			size -= n;
+			total += n;
+		}
+	}
 
-* downstream_attenuation (dB)
-* downstream_bits_per_frame
-* downstream_rate (kbps)
-* downstream_snr_margin (dB)
-	Downstream stats.
+	n = snprintf(buffer, size, "%s; ", rows ? "" : "None");
 
-* upstream_attenuation (dB)
-* upstream_bits_per_frame
-* upstream_rate (kbps)
-* upstream_snr_margin (dB)
-* transmitter_power (dBm/Hz)
-	Upstream stats.
+	if (n < 0 || n >= size)
+		goto fail;
 
-* downstream_crc_errors
-* downstream_fec_errors
-* downstream_hec_errors
-* upstream_crc_errors
-* upstream_fec_errors
-* upstream_hec_errors
-	Error counts.
+	buffer += n;
+	size -= n;
+	total += n;
 
-* line_startable
-	Indicates that ADSL support on the device
-	is/can be enabled, see adsl_start.
+ fail:
+	return total;
+}
 
-* line_status
-	"initialising"
-	"down"
-	"attempting to activate"
-	"training"
-	"channel analysis"
-	"exchange"
-	"waiting"
-	"up"
+/**
+ * ppc4xx_edac_generate_checkbit_message - generate interpretted checkbit message
+ * @mci: A pointer to the EDAC memory controller instance associated
+ *       with the checkbit message being generated.
+ * @status: A pointer to the ECC status structure to generate the
+ *          message from.
+ * @buffer: A pointer to the buffer in which to generate the
+ *          message.
+ * @size: The size, in bytes, of space available in buffer.
+ *
+ * This routine generates to the provided buffer the portion of the
+ * driver-unique report message associated with the ECCESS[CKBER]
+ * field of the specified ECC status.
+ *
+ * Returns the number of characters generated on success; otherwise, <
+ * 0 on error.
+ */
+static int
+ppc4xx_edac_generate_checkbit_message(const struct mem_ctl_info *mci,
+				      const struct ppc4xx_ecc_status *status,
+				      char *buffer,
+				      size_t size)
+{
+	const struct ppc4xx_edac_pdata *pdata = mci->pvt_info;
+	const char *ckber = NULL;
 
-	Changes between "down" and "attempting to activate"
-	if there is no signal.
-
-* link_status
-	"not connected"
-	"connected"
-	"lost"
-
-* mac_address
-
-* modulation
-	"" (when not connected)
-	"ANSI T1.413"
-	"ITU-T G.992.1 (G.DMT)"
-	"ITU-T G.992.2 (G.LITE)"
-
-* startup_attempts
-	Count of total attempts to initialise ADSL.
-
-To enable/disable ADSL, the following can be written to the adsl_state file:
-	"start"
-	"stop
-	"restart" (stops, waits 1.5s, then starts)
-	"poll" (used to resume status polling if it was disabled due to failure)
-
-Changes in adsl/line state are reported via kernel log messages:
-	[4942145.150704] ATM dev 0: ADSL state: running
-	[4942243.663766] ATM dev 0: ADSL line: down
-	[4942249.665075] ATM dev 0: ADSL line: attempting to activate
-	[4942253.654954] ATM dev 0: ADSL line: training
-	[4942255.666387] ATM dev 0: ADSL line: channel analysis
-	[4942259.656262] ATM dev 0: ADSL line: exchange
-	[2635357.696901] ATM dev 0: ADSL line: up (8128 kb/s down | 832 kb/s up)
+	switch (status->ecces & SDRAM_ECCES_CKBER_MASK) {
+	case SDRAM_ECCES_CKBER_NONE:
+		ckber = "None";
+		break;
+	case SDRAM_ECCES_CKBER_32_ECC_0_3:
+		ckber = "ECC0:3";
+		break;
+	case SDRAM_ECCES_CKBER_32_E

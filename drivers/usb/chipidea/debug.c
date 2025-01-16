@@ -1,455 +1,127 @@
-#include <linux/kernel.h>
-#include <linux/device.h>
-#include <linux/types.h>
-#include <linux/spinlock.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
-#include <linux/uaccess.h>
-#include <linux/usb/ch9.h>
-#include <linux/usb/gadget.h>
-#include <linux/usb/phy.h>
-#include <linux/usb/otg.h>
-#include <linux/usb/otg-fsm.h>
-#include <linux/usb/chipidea.h>
-
-#include "ci.h"
-#include "udc.h"
-#include "bits.h"
-#include "debug.h"
-#include "otg.h"
-
-/**
- * ci_device_show: prints information about device capabilities and status
- */
-static int ci_device_show(struct seq_file *s, void *data)
-{
-	struct ci_hdrc *ci = s->private;
-	struct usb_gadget *gadget = &ci->gadget;
-
-	seq_printf(s, "speed             = %d\n", gadget->speed);
-	seq_printf(s, "max_speed         = %d\n", gadget->max_speed);
-	seq_printf(s, "is_otg            = %d\n", gadget->is_otg);
-	seq_printf(s, "is_a_peripheral   = %d\n", gadget->is_a_peripheral);
-	seq_printf(s, "b_hnp_enable      = %d\n", gadget->b_hnp_enable);
-	seq_printf(s, "a_hnp_support     = %d\n", gadget->a_hnp_support);
-	seq_printf(s, "a_alt_hnp_support = %d\n", gadget->a_alt_hnp_support);
-	seq_printf(s, "name              = %s\n",
-		   (gadget->name ? gadget->name : ""));
-
-	if (!ci->driver)
-		return 0;
-
-	seq_printf(s, "gadget function   = %s\n",
-		       (ci->driver->function ? ci->driver->function : ""));
-	seq_printf(s, "gadget max speed  = %d\n", ci->driver->max_speed);
-
-	return 0;
-}
-
-static int ci_device_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ci_device_show, inode->i_private);
-}
-
-static const struct file_operations ci_device_fops = {
-	.open		= ci_device_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-/**
- * ci_port_test_show: reads port test mode
- */
-static int ci_port_test_show(struct seq_file *s, void *data)
-{
-	struct ci_hdrc *ci = s->private;
-	unsigned long flags;
-	unsigned mode;
-
-	pm_runtime_get_sync(ci->dev);
-	spin_lock_irqsave(&ci->lock, flags);
-	mode = hw_port_test_get(ci);
-	spin_unlock_irqrestore(&ci->lock, flags);
-	pm_runtime_put_sync(ci->dev);
-
-	seq_printf(s, "mode = %u\n", mode);
-
-	return 0;
-}
-
-/**
- * ci_port_test_write: writes port test mode
- */
-static ssize_t ci_port_test_write(struct file *file, const char __user *ubuf,
-				  size_t count, loff_t *ppos)
-{
-	struct seq_file *s = file->private_data;
-	struct ci_hdrc *ci = s->private;
-	unsigned long flags;
-	unsigned mode;
-	char buf[32];
-	int ret;
-
-	count = min_t(size_t, sizeof(buf) - 1, count);
-	if (copy_from_user(buf, ubuf, count))
-		return -EFAULT;
-
-	/* sscanf requires a zero terminated string */
-	buf[count] = '\0';
-
-	if (sscanf(buf, "%u", &mode) != 1)
-		return -EINVAL;
-
-	pm_runtime_get_sync(ci->dev);
-	spin_lock_irqsave(&ci->lock, flags);
-	ret = hw_port_test_set(ci, mode);
-	spin_unlock_irqrestore(&ci->lock, flags);
-	pm_runtime_put_sync(ci->dev);
-
-	return ret ? ret : count;
-}
-
-static int ci_port_test_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ci_port_test_show, inode->i_private);
-}
-
-static const struct file_operations ci_port_test_fops = {
-	.open		= ci_port_test_open,
-	.write		= ci_port_test_write,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-/**
- * ci_qheads_show: DMA contents of all queue heads
- */
-static int ci_qheads_show(struct seq_file *s, void *data)
-{
-	struct ci_hdrc *ci = s->private;
-	unsigned long flags;
-	unsigned i, j;
-
-	if (ci->role != CI_ROLE_GADGET) {
-		seq_printf(s, "not in gadget mode\n");
-		return 0;
-	}
-
-	spin_lock_irqsave(&ci->lock, flags);
-	for (i = 0; i < ci->hw_ep_max/2; i++) {
-		struct ci_hw_ep *hweprx = &ci->ci_hw_ep[i];
-		struct ci_hw_ep *hweptx =
-			&ci->ci_hw_ep[i + ci->hw_ep_max/2];
-		seq_printf(s, "EP=%02i: RX=%08X TX=%08X\n",
-			   i, (u32)hweprx->qh.dma, (u32)hweptx->qh.dma);
-		for (j = 0; j < (sizeof(struct ci_hw_qh)/sizeof(u32)); j++)
-			seq_printf(s, " %04X:    %08X    %08X\n", j,
-				   *((u32 *)hweprx->qh.ptr + j),
-				   *((u32 *)hweptx->qh.ptr + j));
-	}
-	spin_unlock_irqrestore(&ci->lock, flags);
-
-	return 0;
-}
-
-static int ci_qheads_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ci_qheads_show, inode->i_private);
-}
-
-static const struct file_operations ci_qheads_fops = {
-	.open		= ci_qheads_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-/**
- * ci_requests_show: DMA contents of all requests currently queued (all endpts)
- */
-static int ci_requests_show(struct seq_file *s, void *data)
-{
-	struct ci_hdrc *ci = s->private;
-	unsigned long flags;
-	struct list_head   *ptr = NULL;
-	struct ci_hw_req *req = NULL;
-	struct td_node *node, *tmpnode;
-	unsigned i, j, qsize = sizeof(struct ci_hw_td)/sizeof(u32);
-
-	if (ci->role != CI_ROLE_GADGET) {
-		seq_printf(s, "not in gadget mode\n");
-		return 0;
-	}
-
-	spin_lock_irqsave(&ci->lock, flags);
-	for (i = 0; i < ci->hw_ep_max; i++)
-		list_for_each(ptr, &ci->ci_hw_ep[i].qh.queue) {
-			req = list_entry(ptr, struct ci_hw_req, queue);
-
-			list_for_each_entry_safe(node, tmpnode, &req->tds, td) {
-				seq_printf(s, "EP=%02i: TD=%08X %s\n",
-					   i % (ci->hw_ep_max / 2),
-					   (u32)node->dma,
-					   ((i < ci->hw_ep_max/2) ?
-					   "RX" : "TX"));
-
-				for (j = 0; j < qsize; j++)
-					seq_printf(s, " %04X:    %08X\n", j,
-						   *((u32 *)node->ptr + j));
-			}
-		}
-	spin_unlock_irqrestore(&ci->lock, flags);
-
-	return 0;
-}
-
-static int ci_requests_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ci_requests_show, inode->i_private);
-}
-
-static const struct file_operations ci_requests_fops = {
-	.open		= ci_requests_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int ci_otg_show(struct seq_file *s, void *unused)
-{
-	struct ci_hdrc *ci = s->private;
-	struct otg_fsm *fsm;
-
-	if (!ci || !ci_otg_is_fsm_mode(ci))
-		return 0;
-
-	fsm = &ci->fsm;
-
-	/* ------ State ----- */
-	seq_printf(s, "OTG state: %s\n\n",
-			usb_otg_state_string(ci->otg.state));
-
-	/* ------ State Machine Variables ----- */
-	seq_printf(s, "a_bus_drop: %d\n", fsm->a_bus_drop);
-
-	seq_printf(s, "a_bus_req: %d\n", fsm->a_bus_req);
-
-	seq_printf(s, "a_srp_det: %d\n", fsm->a_srp_det);
-
-	seq_printf(s, "a_vbus_vld: %d\n", fsm->a_vbus_vld);
-
-	seq_printf(s, "b_conn: %d\n", fsm->b_conn);
-
-	seq_printf(s, "adp_change: %d\n", fsm->adp_change);
-
-	seq_printf(s, "power_up: %d\n", fsm->power_up);
-
-	seq_printf(s, "a_bus_resume: %d\n", fsm->a_bus_resume);
-
-	seq_printf(s, "a_bus_suspend: %d\n", fsm->a_bus_suspend);
-
-	seq_printf(s, "a_conn: %d\n", fsm->a_conn);
-
-	seq_printf(s, "b_bus_req: %d\n", fsm->b_bus_req);
-
-	seq_printf(s, "b_bus_suspend: %d\n", fsm->b_bus_suspend);
-
-	seq_printf(s, "b_se0_srp: %d\n", fsm->b_se0_srp);
-
-	seq_printf(s, "b_ssend_srp: %d\n", fsm->b_ssend_srp);
-
-	seq_printf(s, "b_sess_vld: %d\n", fsm->b_sess_vld);
-
-	seq_printf(s, "b_srp_done: %d\n", fsm->b_srp_done);
-
-	seq_printf(s, "drv_vbus: %d\n", fsm->drv_vbus);
-
-	seq_printf(s, "loc_conn: %d\n", fsm->loc_conn);
-
-	seq_printf(s, "loc_sof: %d\n", fsm->loc_sof);
-
-	seq_printf(s, "adp_prb: %d\n", fsm->adp_prb);
-
-	seq_printf(s, "id: %d\n", fsm->id);
-
-	seq_printf(s, "protocol: %d\n", fsm->protocol);
-
-	return 0;
-}
-
-static int ci_otg_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ci_otg_show, inode->i_private);
-}
-
-static const struct file_operations ci_otg_fops = {
-	.open			= ci_otg_open,
-	.read			= seq_read,
-	.llseek			= seq_lseek,
-	.release		= single_release,
-};
-
-static int ci_role_show(struct seq_file *s, void *data)
-{
-	struct ci_hdrc *ci = s->private;
-
-	if (ci->role != CI_ROLE_END)
-		seq_printf(s, "%s\n", ci_role(ci)->name);
-
-	return 0;
-}
-
-static ssize_t ci_role_write(struct file *file, const char __user *ubuf,
-			     size_t count, loff_t *ppos)
-{
-	struct seq_file *s = file->private_data;
-	struct ci_hdrc *ci = s->private;
-	enum ci_role role;
-	char buf[8];
-	int ret;
-
-	if (copy_from_user(buf, ubuf, min_t(size_t, sizeof(buf) - 1, count)))
-		return -EFAULT;
-
-	for (role = CI_ROLE_HOST; role < CI_ROLE_END; role++)
-		if (ci->roles[role] &&
-		    !strncmp(buf, ci->roles[role]->name,
-			     strlen(ci->roles[role]->name)))
-			break;
-
-	if (role == CI_ROLE_END || role == ci->role)
-		return -EINVAL;
-
-	pm_runtime_get_sync(ci->dev);
-	disable_irq(ci->irq);
-	ci_role_stop(ci);
-	ret = ci_role_start(ci, role);
-	enable_irq(ci->irq);
-	pm_runtime_put_sync(ci->dev);
-
-	return ret ? ret : count;
-}
-
-static int ci_role_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ci_role_show, inode->i_private);
-}
-
-static const struct file_operations ci_role_fops = {
-	.open		= ci_role_open,
-	.write		= ci_role_write,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int ci_registers_show(struct seq_file *s, void *unused)
-{
-	struct ci_hdrc *ci = s->private;
-	u32 tmp_reg;
-
-	if (!ci || ci->in_lpm)
-		return -EPERM;
-
-	/* ------ Registers ----- */
-	tmp_reg = hw_read_intr_enable(ci);
-	seq_printf(s, "USBINTR reg: %08x\n", tmp_reg);
-
-	tmp_reg = hw_read_intr_status(ci);
-	seq_printf(s, "USBSTS reg: %08x\n", tmp_reg);
-
-	tmp_reg = hw_read(ci, OP_USBMODE, ~0);
-	seq_printf(s, "USBMODE reg: %08x\n", tmp_reg);
-
-	tmp_reg = hw_read(ci, OP_USBCMD, ~0);
-	seq_printf(s, "USBCMD reg: %08x\n", tmp_reg);
-
-	tmp_reg = hw_read(ci, OP_PORTSC, ~0);
-	seq_printf(s, "PORTSC reg: %08x\n", tmp_reg);
-
-	if (ci->is_otg) {
-		tmp_reg = hw_read_otgsc(ci, ~0);
-		seq_printf(s, "OTGSC reg: %08x\n", tmp_reg);
-	}
-
-	return 0;
-}
-
-static int ci_registers_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, ci_registers_show, inode->i_private);
-}
-
-static const struct file_operations ci_registers_fops = {
-	.open			= ci_registers_open,
-	.read			= seq_read,
-	.llseek			= seq_lseek,
-	.release		= single_release,
-};
-
-/**
- * dbg_create_files: initializes the attribute interface
- * @ci: device
- *
- * This function returns an error code
- */
-int dbg_create_files(struct ci_hdrc *ci)
-{
-	struct dentry *dent;
-
-	ci->debugfs = debugfs_create_dir(dev_name(ci->dev), NULL);
-	if (!ci->debugfs)
-		return -ENOMEM;
-
-	dent = debugfs_create_file("device", S_IRUGO, ci->debugfs, ci,
-				   &ci_device_fops);
-	if (!dent)
-		goto err;
-
-	dent = debugfs_create_file("port_test", S_IRUGO | S_IWUSR, ci->debugfs,
-				   ci, &ci_port_test_fops);
-	if (!dent)
-		goto err;
-
-	dent = debugfs_create_file("qheads", S_IRUGO, ci->debugfs, ci,
-				   &ci_qheads_fops);
-	if (!dent)
-		goto err;
-
-	dent = debugfs_create_file("requests", S_IRUGO, ci->debugfs, ci,
-				   &ci_requests_fops);
-	if (!dent)
-		goto err;
-
-	if (ci_otg_is_fsm_mode(ci)) {
-		dent = debugfs_create_file("otg", S_IRUGO, ci->debugfs, ci,
-					&ci_otg_fops);
-		if (!dent)
-			goto err;
-	}
-
-	dent = debugfs_create_file("role", S_IRUGO | S_IWUSR, ci->debugfs, ci,
-				   &ci_role_fops);
-	if (!dent)
-		goto err;
-
-	dent = debugfs_create_file("registers", S_IRUGO, ci->debugfs, ci,
-				&ci_registers_fops);
-
-	if (dent)
-		return 0;
-err:
-	debugfs_remove_recursive(ci->debugfs);
-	return -ENOMEM;
-}
-
-/**
- * dbg_remove_files: destroys the attribute interface
- * @ci: device
- */
-void dbg_remove_files(struct ci_hdrc *ci)
-{
-	debugfs_remove_recursive(ci->debugfs);
-}
+                                     0x3f694
+#define ixDPM_TABLE_321                                                         0x3f698
+#define ixDPM_TABLE_322                                                         0x3f69c
+#define ixDPM_TABLE_323                                                         0x3f6a0
+#define ixDPM_TABLE_324                                                         0x3f6a4
+#define ixDPM_TABLE_325                                                         0x3f6a8
+#define ixDPM_TABLE_326                                                         0x3f6ac
+#define ixDPM_TABLE_327                                                         0x3f6b0
+#define ixDPM_TABLE_328                                                         0x3f6b4
+#define ixDPM_TABLE_329                                                         0x3f6b8
+#define ixDPM_TABLE_330                                                         0x3f6bc
+#define ixDPM_TABLE_331                                                         0x3f6c0
+#define ixDPM_TABLE_332                                                         0x3f6c4
+#define ixDPM_TABLE_333                                                         0x3f6c8
+#define ixDPM_TABLE_334                                                         0x3f6cc
+#define ixDPM_TABLE_335                                                         0x3f6d0
+#define ixDPM_TABLE_336                                                         0x3f6d4
+#define ixDPM_TABLE_337                                                         0x3f6d8
+#define ixDPM_TABLE_338                                                         0x3f6dc
+#define ixDPM_TABLE_339                                                         0x3f6e0
+#define ixDPM_TABLE_340                                                         0x3f6e4
+#define ixDPM_TABLE_341                                                         0x3f6e8
+#define ixDPM_TABLE_342                                                         0x3f6ec
+#define ixDPM_TABLE_343                                                         0x3f6f0
+#define ixDPM_TABLE_344                                                         0x3f6f4
+#define ixDPM_TABLE_345                                                         0x3f6f8
+#define ixDPM_TABLE_346                                                         0x3f6fc
+#define ixDPM_TABLE_347                                                         0x3f700
+#define ixDPM_TABLE_348                                                         0x3f704
+#define ixDPM_TABLE_349                                                         0x3f708
+#define ixDPM_TABLE_350                                                         0x3f70c
+#define ixDPM_TABLE_351                                                         0x3f710
+#define ixDPM_TABLE_352                                                         0x3f714
+#define ixDPM_TABLE_353                                                         0x3f718
+#define ixDPM_TABLE_354                                                         0x3f71c
+#define ixDPM_TABLE_355                                                         0x3f720
+#define ixDPM_TABLE_356                                                         0x3f724
+#define ixDPM_TABLE_357                                                         0x3f728
+#define ixDPM_TABLE_358                                                         0x3f72c
+#define ixDPM_TABLE_359                                                         0x3f730
+#define ixDPM_TABLE_360                                                         0x3f734
+#define ixDPM_TABLE_361                                                         0x3f738
+#define ixDPM_TABLE_362                                                         0x3f73c
+#define ixDPM_TABLE_363                                                         0x3f740
+#define ixDPM_TABLE_364                                                         0x3f744
+#define ixDPM_TABLE_365                                                         0x3f748
+#define ixDPM_TABLE_366                                                         0x3f74c
+#define ixDPM_TABLE_367                                                         0x3f750
+#define ixDPM_TABLE_368                                                         0x3f754
+#define ixDPM_TABLE_369                                                         0x3f758
+#define ixDPM_TABLE_370                                                         0x3f75c
+#define ixDPM_TABLE_371                                                         0x3f760
+#define ixDPM_TABLE_372                                                         0x3f764
+#define ixDPM_TABLE_373                                                         0x3f768
+#define ixDPM_TABLE_374                                                         0x3f76c
+#define ixDPM_TABLE_375                                                         0x3f770
+#define ixDPM_TABLE_376                                                         0x3f774
+#define ixDPM_TABLE_377                                                         0x3f778
+#define ixDPM_TABLE_378                                                         0x3f77c
+#define ixDPM_TABLE_379                                                         0x3f780
+#define ixDPM_TABLE_380                                                         0x3f784
+#define ixDPM_TABLE_381                                                         0x3f788
+#define ixDPM_TABLE_382                                                         0x3f78c
+#define ixDPM_TABLE_383                                                         0x3f790
+#define ixDPM_TABLE_384                                                         0x3f794
+#define ixDPM_TABLE_385                                                         0x3f798
+#define ixDPM_TABLE_386                                                         0x3f79c
+#define ixDPM_TABLE_387                                                         0x3f7a0
+#define ixDPM_TABLE_388                                                         0x3f7a4
+#define ixDPM_TABLE_389                                                         0x3f7a8
+#define ixDPM_TABLE_390                                                         0x3f7ac
+#define ixDPM_TABLE_391                                                         0x3f7b0
+#define ixDPM_TABLE_392                                                         0x3f7b4
+#define ixDPM_TABLE_393                                                         0x3f7b8
+#define ixDPM_TABLE_394                                                         0x3f7bc
+#define ixDPM_TABLE_395                                                         0x3f7c0
+#define ixDPM_TABLE_396                                                         0x3f7c4
+#define ixDPM_TABLE_397                                                         0x3f7c8
+#define ixDPM_TABLE_398                                                         0x3f7cc
+#define ixDPM_TABLE_399                                                         0x3f7d0
+#define ixDPM_TABLE_400                                                         0x3f7d4
+#define ixDPM_TABLE_401                                                         0x3f7d8
+#define ixDPM_TABLE_402                                                         0x3f7dc
+#define ixDPM_TABLE_403                                                         0x3f7e0
+#define ixDPM_TABLE_404                                                         0x3f7e4
+#define ixDPM_TABLE_405                                                         0x3f7e8
+#define ixDPM_TABLE_406                                                         0x3f7ec
+#define ixDPM_TABLE_407                                                         0x3f7f0
+#define ixDPM_TABLE_408                                                         0x3f7f4
+#define ixDPM_TABLE_409                                                         0x3f7f8
+#define ixDPM_TABLE_410                                                         0x3f7fc
+#define ixDPM_TABLE_411                                                         0x3f800
+#define ixDPM_TABLE_412                                                         0x3f804
+#define ixDPM_TABLE_413                                                         0x3f808
+#define ixDPM_TABLE_414                                                         0x3f80c
+#define ixDPM_TABLE_415                                                         0x3f810
+#define ixDPM_TABLE_416                                                         0x3f814
+#define ixDPM_TABLE_417                                                         0x3f818
+#define ixDPM_TABLE_418                                                         0x3f81c
+#define ixDPM_TABLE_419                                                         0x3f820
+#define ixDPM_TABLE_420                                                         0x3f824
+#define ixDPM_TABLE_421                                                         0x3f828
+#define ixDPM_TABLE_422                                                         0x3f82c
+#define ixDPM_TABLE_423                                                         0x3f830
+#define ixDPM_TABLE_424                                                         0x3f834
+#define ixDPM_TABLE_425                                                         0x3f838
+#define ixDPM_TABLE_426                                                         0x3f83c
+#define ixDPM_TABLE_427                                                         0x3f840
+#define ixDPM_TABLE_428                                                         0x3f844
+#define ixDPM_TABLE_429                                                         0x3f848
+#define ixDPM_TABLE_430                                                         0x3f84c
+#define ixDPM_TABLE_431                                                         0x3f850
+#define ixDPM_TABLE_432                                                         0x3f854
+#define ixDPM_TABLE_433                                                         0x3f858
+#define ixDPM_TABLE_434                                                         0x3f85c
+#define ixDPM_TABLE_435                                                         0x3f860
+#define ixDPM_TABLE_436                                                         0x3f864
+#define ixDPM_TABLE_437                                                         0x3f868
+#define ixDPM_TABLE_438                                                         0x3f86c
+#define ixDPM_TABLE_439                                                         0x3f870
+#define ixDPM_TABLE_440                                                         0x3f874
+#define ixSOFT_REGISTERS_TABLE_1                                                0x3f89c
+#define ixSOFT_REGISTERS_TABLE_2                                                0x3f8a0
+#define ixSOFT_REGISTERS_TABLE_3                                                0x3f8a4
+#define ixSOFT_REGISTERS_TABLE_4                                                0x3f8a8
+#define ixSOFT_REGISTERS_TABLE_5                                                0x3f8ac
+#defi

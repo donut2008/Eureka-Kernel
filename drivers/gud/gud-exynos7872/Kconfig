@@ -1,39 +1,18 @@
-#
-# Trustonic drivers configuration
-#
-config TRUSTONIC_TEE
-    tristate "Trustonic TEE Driver"
-    depends on ARM || ARM64
-    default y
-    ---help---
-      Enable Trustonic TEE support
-
-config TRUSTONIC_TEE_LPAE
-    bool "Trustonic TEE uses LPAE"
-    depends on TRUSTONIC_TEE
-    default y if ARM64
-    default n if ARM
-    ---help---
-      Enable Trustonic TEE 64-bit physical addresses support
-
-config TRUSTONIC_TEE_DEBUG
-    bool "Trustonic TEE driver debug mode"
-    depends on TRUSTONIC_TEE
-    default n
-    ---help---
-      Enable the debug mode in the Trustonic TEE Driver.
-
-config TRUSTONIC_TRUSTED_UI
-    tristate "Trustonic Trusted UI"
-    depends on TRUSTONIC_TEE
-    ---help---
-      Enable Trustonic Trusted User Interface
-
-config TRUSTONIC_TRUSTED_UI_FB_BLANK
-    bool "Trustonic Trusted UI with fb_blank"
-    depends on TRUSTONIC_TRUSTED_UI
-    ---help---
-    Blank the framebuffer before starting a TUI session
-
-source "drivers/gud/gud-exynos7872/sec-os-ctrl/Kconfig"
-source "drivers/gud/gud-exynos7872/sec-os-booster/Kconfig"
+L_D0__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_DQB2L_RX_VREF_CAL_D0__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_DQB2L_RX_VREF_CAL_D0__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_DQB2L_RX_VREF_CAL_D0__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_DQB2L_RX_VREF_CAL_D0__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_DQB2L_RX_VREF_CAL_D0__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_DQB2L_RX_VREF_CAL_D0__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_DQB2L_RX_VREF_CAL_D0__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_DQB2L_RX_VREF_CAL_D0__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_DQB2H_RX_VREF_CAL_D0__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_DQB2H_RX_VREF_CAL_D0__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_DQB2H_RX_VREF_CAL_D0__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_DQB2H_RX_VREF_CAL_D0__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_DQB2H_RX_VREF_CAL_D0__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_DQB2H_RX_VREF_CAL_D0__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_DQB2H_RX_VREF_CAL_D0__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_DQB2H_RX_VREF_CAL_D0__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_DQB3L_RX_VREF_CAL_D0_

@@ -1,2482 +1,1966 @@
-/******************************************************************************
+ intermediate state (the cpuidle_device's safe state), and wait for
+ * all the other cpus to call this function.  Once all coupled cpus are idle,
+ * the second stage will start.  Each coupled cpu will spin until all cpus have
+ * guaranteed that they will call the target_state.
  *
- * Copyright(c) 2009-2012  Realtek Corporation.
+ * This function must be called with interrupts disabled.  It may enable
+ * interrupts while preparing for idle, and it will always return with
+ * interrupts enabled.
+ */
+int cpuidle_enter_state_coupled(struct cpuidle_device *dev,
+		struct cpuidle_driver *drv, int next_state)
+{
+	int entered_state = -1;
+	struct cpuidle_coupled *coupled = dev->coupled;
+	int w;
+
+	if (!coupled)
+		return -EINVAL;
+
+	while (coupled->prevent) {
+		cpuidle_coupled_clear_pokes(dev->cpu);
+		if (need_resched()) {
+			local_irq_enable();
+			return entered_state;
+		}
+		entered_state = cpuidle_enter_state(dev, drv,
+			drv->safe_state_index);
+		local_irq_disable();
+	}
+
+	/* Read barrier ensures online_count is read after prevent is cleared */
+	smp_rmb();
+
+reset:
+	cpumask_clear_cpu(dev->cpu, &cpuidle_coupled_poked);
+
+	w = cpuidle_coupled_set_waiting(dev->cpu, coupled, next_state);
+	/*
+	 * If this is the last cpu to enter the waiting state, poke
+	 * all the other cpus out of their waiting state so they can
+	 * enter a deeper state.  This can race with one of the cpus
+	 * exiting the waiting state due to an interrupt and
+	 * decrementing waiting_count, see comment below.
+	 */
+	if (w == coupled->online_count) {
+		cpumask_set_cpu(dev->cpu, &cpuidle_coupled_poked);
+		cpuidle_coupled_poke_others(dev->cpu, coupled);
+	}
+
+retry:
+	/*
+	 * Wait for all coupled cpus to be idle, using the deepest state
+	 * allowed for a single cpu.  If this was not the poking cpu, wait
+	 * for at least one poke before leaving to avoid a race where
+	 * two cpus could arrive at the waiting loop at the same time,
+	 * but the first of the two to arrive could skip the loop without
+	 * processing the pokes from the last to arrive.
+	 */
+	while (!cpuidle_coupled_cpus_waiting(coupled) ||
+			!cpumask_test_cpu(dev->cpu, &cpuidle_coupled_poked)) {
+		if (cpuidle_coupled_clear_pokes(dev->cpu))
+			continue;
+
+		if (need_resched()) {
+			cpuidle_coupled_set_not_waiting(dev->cpu, coupled);
+			goto out;
+		}
+
+		if (coupled->prevent) {
+			cpuidle_coupled_set_not_waiting(dev->cpu, coupled);
+			goto out;
+		}
+
+		entered_state = cpuidle_enter_state(dev, drv,
+			drv->safe_state_index);
+		local_irq_disable();
+	}
+
+	cpuidle_coupled_clear_pokes(dev->cpu);
+	if (need_resched()) {
+		cpuidle_coupled_set_not_waiting(dev->cpu, coupled);
+		goto out;
+	}
+
+	/*
+	 * Make sure final poke status for this cpu is visible before setting
+	 * cpu as ready.
+	 */
+	smp_wmb();
+
+	/*
+	 * All coupled cpus are probably idle.  There is a small chance that
+	 * one of the other cpus just became active.  Increment the ready count,
+	 * and spin until all coupled cpus have incremented the counter. Once a
+	 * cpu has incremented the ready counter, it cannot abort idle and must
+	 * spin until either all cpus have incremented the ready counter, or
+	 * another cpu leaves idle and decrements the waiting counter.
+	 */
+
+	cpuidle_coupled_set_ready(coupled);
+	while (!cpuidle_coupled_cpus_ready(coupled)) {
+		/* Check if any other cpus bailed out of idle. */
+		if (!cpuidle_coupled_cpus_waiting(coupled))
+			if (!cpuidle_coupled_set_not_ready(coupled))
+				goto retry;
+
+		cpu_relax();
+	}
+
+	/*
+	 * Make sure read of all cpus ready is done before reading pending pokes
+	 */
+	smp_rmb();
+
+	/*
+	 * There is a small chance that a cpu left and reentered idle after this
+	 * cpu saw that all cpus were waiting.  The cpu that reentered idle will
+	 * have sent this cpu a poke, which will still be pending after the
+	 * ready loop.  The pending interrupt may be lost by the interrupt
+	 * controller when entering the deep idle state.  It's not possible to
+	 * clear a pending interrupt without turning interrupts on and handling
+	 * it, and it's too late to turn on interrupts here, so reset the
+	 * coupled idle state of all cpus and retry.
+	 */
+	if (cpuidle_coupled_any_pokes_pending(coupled)) {
+		cpuidle_coupled_set_done(dev->cpu, coupled);
+		/* Wait for all cpus to see the pending pokes */
+		cpuidle_coupled_parallel_barrier(dev, &coupled->abort_barrier);
+		goto reset;
+	}
+
+	/* all cpus have acked the coupled state */
+	next_state = cpuidle_coupled_get_state(dev, coupled);
+
+	entered_state = cpuidle_enter_state(dev, drv, next_state);
+
+	cpuidle_coupled_set_done(dev->cpu, coupled);
+
+out:
+	/*
+	 * Normal cpuidle states are expected to return with irqs enabled.
+	 * That leads to an inefficiency where a cpu receiving an interrupt
+	 * that brings it out of idle will process that interrupt before
+	 * exiting the idle enter function and decrementing ready_count.  All
+	 * other cpus will need to spin waiting for the cpu that is processing
+	 * the interrupt.  If the driver returns with interrupts disabled,
+	 * all other cpus will loop back into the safe idle state instead of
+	 * spinning, saving power.
+	 *
+	 * Calling local_irq_enable here allows coupled states to return with
+	 * interrupts disabled, but won't cause problems for drivers that
+	 * exit with interrupts enabled.
+	 */
+	local_irq_enable();
+
+	/*
+	 * Wait until all coupled cpus have exited idle.  There is no risk that
+	 * a cpu exits and re-enters the ready state because this cpu has
+	 * already decremented its waiting_count.
+	 */
+	while (!cpuidle_coupled_no_cpus_ready(coupled))
+		cpu_relax();
+
+	return entered_state;
+}
+
+static void cpuidle_coupled_update_online_cpus(struct cpuidle_coupled *coupled)
+{
+	cpumask_t cpus;
+	cpumask_and(&cpus, cpu_online_mask, &coupled->coupled_cpus);
+	coupled->online_count = cpumask_weight(&cpus);
+}
+
+/**
+ * cpuidle_coupled_register_device - register a coupled cpuidle device
+ * @dev: struct cpuidle_device for the current cpu
  *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of version 2 of the GNU General Public License as
+ * Called from cpuidle_register_device to handle coupled idle init.  Finds the
+ * cpuidle_coupled struct for this set of coupled cpus, or creates one if none
+ * exists yet.
+ */
+int cpuidle_coupled_register_device(struct cpuidle_device *dev)
+{
+	int cpu;
+	struct cpuidle_device *other_dev;
+	struct call_single_data *csd;
+	struct cpuidle_coupled *coupled;
+
+	if (cpumask_empty(&dev->coupled_cpus))
+		return 0;
+
+	for_each_cpu(cpu, &dev->coupled_cpus) {
+		other_dev = per_cpu(cpuidle_devices, cpu);
+		if (other_dev && other_dev->coupled) {
+			coupled = other_dev->coupled;
+			goto have_coupled;
+		}
+	}
+
+	/* No existing coupled info found, create a new one */
+	coupled = kzalloc(sizeof(struct cpuidle_coupled), GFP_KERNEL);
+	if (!coupled)
+		return -ENOMEM;
+
+	coupled->coupled_cpus = dev->coupled_cpus;
+
+have_coupled:
+	dev->coupled = coupled;
+	if (WARN_ON(!cpumask_equal(&dev->coupled_cpus, &coupled->coupled_cpus)))
+		coupled->prevent++;
+
+	cpuidle_coupled_update_online_cpus(coupled);
+
+	coupled->refcnt++;
+
+	csd = &per_cpu(cpuidle_coupled_poke_cb, dev->cpu);
+	csd->func = cpuidle_coupled_handle_poke;
+	csd->info = (void *)(unsigned long)dev->cpu;
+
+	return 0;
+}
+
+/**
+ * cpuidle_coupled_unregister_device - unregister a coupled cpuidle device
+ * @dev: struct cpuidle_device for the current cpu
+ *
+ * Called from cpuidle_unregister_device to tear down coupled idle.  Removes the
+ * cpu from the coupled idle set, and frees the cpuidle_coupled_info struct if
+ * this was the last cpu in the set.
+ */
+void cpuidle_coupled_unregister_device(struct cpuidle_device *dev)
+{
+	struct cpuidle_coupled *coupled = dev->coupled;
+
+	if (cpumask_empty(&dev->coupled_cpus))
+		return;
+
+	if (--coupled->refcnt)
+		kfree(coupled);
+	dev->coupled = NULL;
+}
+
+/**
+ * cpuidle_coupled_prevent_idle - prevent cpus from entering a coupled state
+ * @coupled: the struct coupled that contains the cpu that is changing state
+ *
+ * Disables coupled cpuidle on a coupled set of cpus.  Used to ensure that
+ * cpu_online_mask doesn't change while cpus are coordinating coupled idle.
+ */
+static void cpuidle_coupled_prevent_idle(struct cpuidle_coupled *coupled)
+{
+	int cpu = get_cpu();
+
+	/* Force all cpus out of the waiting loop. */
+	coupled->prevent++;
+	cpuidle_coupled_poke_others(cpu, coupled);
+	put_cpu();
+	while (!cpuidle_coupled_no_cpus_waiting(coupled))
+		cpu_relax();
+}
+
+/**
+ * cpuidle_coupled_allow_idle - allows cpus to enter a coupled state
+ * @coupled: the struct coupled that contains the cpu that is changing state
+ *
+ * Enables coupled cpuidle on a coupled set of cpus.  Used to ensure that
+ * cpu_online_mask doesn't change while cpus are coordinating coupled idle.
+ */
+static void cpuidle_coupled_allow_idle(struct cpuidle_coupled *coupled)
+{
+	int cpu = get_cpu();
+
+	/*
+	 * Write barrier ensures readers see the new online_count when they
+	 * see prevent == 0.
+	 */
+	smp_wmb();
+	coupled->prevent--;
+	/* Force cpus out of the prevent loop. */
+	cpuidle_coupled_poke_others(cpu, coupled);
+	put_cpu();
+}
+
+/**
+ * cpuidle_coupled_cpu_notify - notifier called during hotplug transitions
+ * @nb: notifier block
+ * @action: hotplug transition
+ * @hcpu: target cpu number
+ *
+ * Called when a cpu is brought on or offline using hotplug.  Updates the
+ * coupled cpu set appropriately
+ */
+static int cpuidle_coupled_cpu_notify(struct notifier_block *nb,
+		unsigned long action, void *hcpu)
+{
+	int cpu = (unsigned long)hcpu;
+	struct cpuidle_device *dev;
+
+	switch (action & ~CPU_TASKS_FROZEN) {
+	case CPU_UP_PREPARE:
+	case CPU_DOWN_PREPARE:
+	case CPU_ONLINE:
+	case CPU_DEAD:
+	case CPU_UP_CANCELED:
+	case CPU_DOWN_FAILED:
+		break;
+	default:
+		return NOTIFY_OK;
+	}
+
+	mutex_lock(&cpuidle_lock);
+
+	dev = per_cpu(cpuidle_devices, cpu);
+	if (!dev || !dev->coupled)
+		goto out;
+
+	switch (action & ~CPU_TASKS_FROZEN) {
+	case CPU_UP_PREPARE:
+	case CPU_DOWN_PREPARE:
+		cpuidle_coupled_prevent_idle(dev->coupled);
+		break;
+	case CPU_ONLINE:
+	case CPU_DEAD:
+		cpuidle_coupled_update_online_cpus(dev->coupled);
+		/* Fall through */
+	case CPU_UP_CANCELED:
+	case CPU_DOWN_FAILED:
+		cpuidle_coupled_allow_idle(dev->coupled);
+		break;
+	}
+
+out:
+	mutex_unlock(&cpuidle_lock);
+	return NOTIFY_OK;
+}
+
+static struct notifier_block cpuidle_coupled_cpu_notifier = {
+	.notifier_call = cpuidle_coupled_cpu_notify,
+};
+
+static int __init cpuidle_coupled_init(void)
+{
+	return register_cpu_notifier(&cpuidle_coupled_cpu_notifier);
+}
+core_initcall(cpuidle_coupled_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ * ARM/ARM64 generic CPU idle driver.
+ *
+ * Copyright (C) 2014 ARM Ltd.
+ * Author: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ */
+
+#define pr_fmt(fmt) "CPUidle arm: " fmt
+
+#include <linux/cpuidle.h>
+#include <linux/cpumask.h>
+#include <linux/cpu_pm.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/slab.h>
+
+#include <asm/cpuidle.h>
+
+#include "dt_idle_states.h"
+
+/*
+ * arm_enter_idle_state - Programs CPU to enter the specified state
+ *
+ * dev: cpuidle device
+ * drv: cpuidle driver
+ * idx: state index
+ *
+ * Called from the CPUidle framework to program the device to the
+ * specified target state selected by the governor.
+ */
+static int arm_enter_idle_state(struct cpuidle_device *dev,
+				struct cpuidle_driver *drv, int idx)
+{
+	int ret;
+
+	if (!idx) {
+		cpu_do_idle();
+		return idx;
+	}
+
+	ret = cpu_pm_enter();
+	if (!ret) {
+		/*
+		 * Pass idle state index to cpu_suspend which in turn will
+		 * call the CPU ops suspend protocol with idle index as a
+		 * parameter.
+		 */
+		ret = arm_cpuidle_suspend(idx);
+
+		cpu_pm_exit();
+	}
+
+	return ret ? -1 : idx;
+}
+
+static struct cpuidle_driver arm_idle_driver = {
+	.name = "arm_idle",
+	.owner = THIS_MODULE,
+	/*
+	 * State at index 0 is standby wfi and considered standard
+	 * on all ARM platforms. If in some platforms simple wfi
+	 * can't be used as "state 0", DT bindings must be implemented
+	 * to work around this issue and allow installing a special
+	 * handler for idle state index 0.
+	 */
+	.states[0] = {
+		.enter                  = arm_enter_idle_state,
+		.exit_latency           = 1,
+		.target_residency       = 1,
+		.power_usage		= UINT_MAX,
+		.name                   = "WFI",
+		.desc                   = "ARM WFI",
+	}
+};
+
+static const struct of_device_id arm_idle_state_match[] __initconst = {
+	{ .compatible = "arm,idle-state",
+	  .data = arm_enter_idle_state },
+	{ },
+};
+
+/*
+ * arm_idle_init
+ *
+ * Registers the arm specific cpuidle driver with the cpuidle
+ * framework. It relies on core code to parse the idle states
+ * and initialize them using driver data structures accordingly.
+ */
+static int __init arm_idle_init(void)
+{
+	int cpu, ret;
+	struct cpuidle_driver *drv = &arm_idle_driver;
+	struct cpuidle_device *dev;
+
+	/*
+	 * Initialize idle states data, starting at index 1.
+	 * This driver is DT only, if no DT idle states are detected (ret == 0)
+	 * let the driver initialization fail accordingly since there is no
+	 * reason to initialize the idle driver if only wfi is supported.
+	 */
+	ret = dt_init_idle_driver(drv, arm_idle_state_match, 1);
+	if (ret <= 0)
+		return ret ? : -ENODEV;
+
+	ret = cpuidle_register_driver(drv);
+	if (ret) {
+		pr_err("Failed to register cpuidle driver\n");
+		return ret;
+	}
+
+	/*
+	 * Call arch CPU operations in order to initialize
+	 * idle states suspend back-end specific data
+	 */
+	for_each_possible_cpu(cpu) {
+		ret = arm_cpuidle_init(cpu);
+
+		/*
+		 * Skip the cpuidle device initialization if the reported
+		 * failure is a HW misconfiguration/breakage (-ENXIO).
+		 */
+		if (ret == -ENXIO)
+			continue;
+
+		if (ret) {
+			pr_err("CPU %d failed to init idle CPU ops\n", cpu);
+			goto out_fail;
+		}
+
+		dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+		if (!dev) {
+			pr_err("Failed to allocate cpuidle device\n");
+			ret = -ENOMEM;
+			goto out_fail;
+		}
+		dev->cpu = cpu;
+
+		ret = cpuidle_register_device(dev);
+		if (ret) {
+			pr_err("Failed to register cpuidle device for CPU %d\n",
+			       cpu);
+			kfree(dev);
+			goto out_fail;
+		}
+	}
+
+	return 0;
+out_fail:
+	while (--cpu >= 0) {
+		dev = per_cpu(cpuidle_devices, cpu);
+		cpuidle_unregister_device(dev);
+		kfree(dev);
+	}
+
+	cpuidle_unregister_driver(drv);
+
+	return ret;
+}
+device_initcall(arm_idle_init);
+                                                                                                                                                                                                                           /*
+ * based on arch/arm/mach-kirkwood/cpuidle.c
+ *
+ * CPU idle support for AT91 SoC
+ *
+ * This file is licensed under the terms of the GNU General Public
+ * License version 2.  This program is licensed "as is" without any
+ * warranty of any kind, whether express or implied.
+ *
+ * The cpu idle uses wait-for-interrupt and RAM self refresh in order
+ * to implement two idle states -
+ * #1 wait-for-interrupt
+ * #2 wait-for-interrupt and RAM self refresh
+ */
+
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/platform_device.h>
+#include <linux/cpuidle.h>
+#include <linux/io.h>
+#include <linux/export.h>
+#include <asm/cpuidle.h>
+
+#define AT91_MAX_STATES	2
+
+static void (*at91_standby)(void);
+
+/* Actual code that puts the SoC in different idle states */
+static int at91_enter_idle(struct cpuidle_device *dev,
+			struct cpuidle_driver *drv,
+			       int index)
+{
+	at91_standby();
+	return index;
+}
+
+static struct cpuidle_driver at91_idle_driver = {
+	.name			= "at91_idle",
+	.owner			= THIS_MODULE,
+	.states[0]		= ARM_CPUIDLE_WFI_STATE,
+	.states[1]		= {
+		.enter			= at91_enter_idle,
+		.exit_latency		= 10,
+		.target_residency	= 10000,
+		.name			= "RAM_SR",
+		.desc			= "WFI and DDR Self Refresh",
+	},
+	.state_count = AT91_MAX_STATES,
+};
+
+/* Initialize CPU idle by registering the idle states */
+static int at91_cpuidle_probe(struct platform_device *dev)
+{
+	at91_standby = (void *)(dev->dev.platform_data);
+	
+	return cpuidle_register(&at91_idle_driver, NULL);
+}
+
+static struct platform_driver at91_cpuidle_driver = {
+	.driver = {
+		.name = "cpuidle-at91",
+	},
+	.probe = at91_cpuidle_probe,
+};
+builtin_platform_driver(at91_cpuidle_driver);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+ * Copyright (c) 2013 ARM/Linaro
+ *
+ * Authors: Daniel Lezcano <daniel.lezcano@linaro.org>
+ *          Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+ *          Nicolas Pitre <nicolas.pitre@linaro.org>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  *
- * This program is distributed in the hope that it will be useful, but WITHOUT
+ * Maintainer: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+ * Maintainer: Daniel Lezcano <daniel.lezcano@linaro.org>
+ */
+#include <linux/cpuidle.h>
+#include <linux/cpu_pm.h>
+#include <linux/slab.h>
+#include <linux/of.h>
+
+#include <asm/cpu.h>
+#include <asm/cputype.h>
+#include <asm/cpuidle.h>
+#include <asm/mcpm.h>
+#include <asm/smp_plat.h>
+#include <asm/suspend.h>
+
+#include "dt_idle_states.h"
+
+static int bl_enter_powerdown(struct cpuidle_device *dev,
+			      struct cpuidle_driver *drv, int idx);
+
+/*
+ * NB: Owing to current menu governor behaviour big and LITTLE
+ * index 1 states have to define exit_latency and target_residency for
+ * cluster state since, when all CPUs in a cluster hit it, the cluster
+ * can be shutdown. This means that when a single CPU enters this state
+ * the exit_latency and target_residency values are somewhat overkill.
+ * There is no notion of cluster states in the menu governor, so CPUs
+ * have to define CPU states where possibly the cluster will be shutdown
+ * depending on the state of other CPUs. idle states entry and exit happen
+ * at random times; however the cluster state provides target_residency
+ * values as if all CPUs in a cluster enter the state at once; this is
+ * somewhat optimistic and behaviour should be fixed either in the governor
+ * or in the MCPM back-ends.
+ * To make this driver 100% generic the number of states and the exit_latency
+ * target_residency values must be obtained from device tree bindings.
+ *
+ * exit_latency: refers to the TC2 vexpress test chip and depends on the
+ * current cluster operating point. It is the time it takes to get the CPU
+ * up and running when the CPU is powered up on cluster wake-up from shutdown.
+ * Current values for big and LITTLE clusters are provided for clusters
+ * running at default operating points.
+ *
+ * target_residency: it is the minimum amount of time the cluster has
+ * to be down to break even in terms of power consumption. cluster
+ * shutdown has inherent dynamic power costs (L2 writebacks to DRAM
+ * being the main factor) that depend on the current operating points.
+ * The current values for both clusters are provided for a CPU whose half
+ * of L2 lines are dirty and require cleaning to DRAM, and takes into
+ * account leakage static power values related to the vexpress TC2 testchip.
+ */
+static struct cpuidle_driver bl_idle_little_driver = {
+	.name = "little_idle",
+	.owner = THIS_MODULE,
+	.states[0] = ARM_CPUIDLE_WFI_STATE,
+	.states[1] = {
+		.enter			= bl_enter_powerdown,
+		.exit_latency		= 700,
+		.target_residency	= 2500,
+		.flags			= CPUIDLE_FLAG_TIMER_STOP,
+		.name			= "C1",
+		.desc			= "ARM little-cluster power down",
+	},
+	.state_count = 2,
+};
+
+static const struct of_device_id bl_idle_state_match[] __initconst = {
+	{ .compatible = "arm,idle-state",
+	  .data = bl_enter_powerdown },
+	{ },
+};
+
+static struct cpuidle_driver bl_idle_big_driver = {
+	.name = "big_idle",
+	.owner = THIS_MODULE,
+	.states[0] = ARM_CPUIDLE_WFI_STATE,
+	.states[1] = {
+		.enter			= bl_enter_powerdown,
+		.exit_latency		= 500,
+		.target_residency	= 2000,
+		.flags			= CPUIDLE_FLAG_TIMER_STOP,
+		.name			= "C1",
+		.desc			= "ARM big-cluster power down",
+	},
+	.state_count = 2,
+};
+
+/*
+ * notrace prevents trace shims from getting inserted where they
+ * should not. Global jumps and ldrex/strex must not be inserted
+ * in power down sequences where caches and MMU may be turned off.
+ */
+static int notrace bl_powerdown_finisher(unsigned long arg)
+{
+	/* MCPM works with HW CPU identifiers */
+	unsigned int mpidr = read_cpuid_mpidr();
+	unsigned int cluster = MPIDR_AFFINITY_LEVEL(mpidr, 1);
+	unsigned int cpu = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+
+	mcpm_set_entry_vector(cpu, cluster, cpu_resume);
+	mcpm_cpu_suspend();
+
+	/* return value != 0 means failure */
+	return 1;
+}
+
+/**
+ * bl_enter_powerdown - Programs CPU to enter the specified state
+ * @dev: cpuidle device
+ * @drv: The target state to be programmed
+ * @idx: state index
+ *
+ * Called from the CPUidle framework to program the device to the
+ * specified target state selected by the governor.
+ */
+static int bl_enter_powerdown(struct cpuidle_device *dev,
+				struct cpuidle_driver *drv, int idx)
+{
+	cpu_pm_enter();
+
+	cpu_suspend(0, bl_powerdown_finisher);
+
+	/* signals the MCPM core that CPU is out of low power state */
+	mcpm_cpu_powered_up();
+
+	cpu_pm_exit();
+
+	return idx;
+}
+
+static int __init bl_idle_driver_init(struct cpuidle_driver *drv, int part_id)
+{
+	struct cpumask *cpumask;
+	int cpu;
+
+	cpumask = kzalloc(cpumask_size(), GFP_KERNEL);
+	if (!cpumask)
+		return -ENOMEM;
+
+	for_each_possible_cpu(cpu)
+		if (smp_cpuid_part(cpu) == part_id)
+			cpumask_set_cpu(cpu, cpumask);
+
+	drv->cpumask = cpumask;
+
+	return 0;
+}
+
+static const struct of_device_id compatible_machine_match[] = {
+	{ .compatible = "arm,vexpress,v2p-ca15_a7" },
+	{ .compatible = "samsung,exynos5420" },
+	{ .compatible = "samsung,exynos5800" },
+	{},
+};
+
+static int __init bl_idle_init(void)
+{
+	int ret;
+	struct device_node *root = of_find_node_by_path("/");
+	const struct of_device_id *match_id;
+
+	if (!root)
+		return -ENODEV;
+
+	/*
+	 * Initialize the driver just for a compliant set of machines
+	 */
+	match_id = of_match_node(compatible_machine_match, root);
+
+	of_node_put(root);
+
+	if (!match_id)
+		return -ENODEV;
+
+	if (!mcpm_is_available())
+		return -EUNATCH;
+
+	/*
+	 * For now the differentiation between little and big cores
+	 * is based on the part number. A7 cores are considered little
+	 * cores, A15 are considered big cores. This distinction may
+	 * evolve in the future with a more generic matching approach.
+	 */
+	ret = bl_idle_driver_init(&bl_idle_little_driver,
+				  ARM_CPU_PART_CORTEX_A7);
+	if (ret)
+		return ret;
+
+	ret = bl_idle_driver_init(&bl_idle_big_driver, ARM_CPU_PART_CORTEX_A15);
+	if (ret)
+		goto out_uninit_little;
+
+	/* Start at index 1, index 0 standard WFI */
+	ret = dt_init_idle_driver(&bl_idle_big_driver, bl_idle_state_match, 1);
+	if (ret < 0)
+		goto out_uninit_big;
+
+	/* Start at index 1, index 0 standard WFI */
+	ret = dt_init_idle_driver(&bl_idle_little_driver,
+				  bl_idle_state_match, 1);
+	if (ret < 0)
+		goto out_uninit_big;
+
+	ret = cpuidle_register(&bl_idle_little_driver, NULL);
+	if (ret)
+		goto out_uninit_big;
+
+	ret = cpuidle_register(&bl_idle_big_driver, NULL);
+	if (ret)
+		goto out_unregister_little;
+
+	return 0;
+
+out_unregister_little:
+	cpuidle_unregister(&bl_idle_little_driver);
+out_uninit_big:
+	kfree(bl_idle_big_driver.cpumask);
+out_uninit_little:
+	kfree(bl_idle_little_driver.cpumask);
+
+	return ret;
+}
+device_initcall(bl_idle_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * Copyright 2012 Calxeda, Inc.
+ *
+ * Based on arch/arm/plat-mxc/cpuidle.c: #v3.7
+ * Copyright 2012 Freescale Semiconductor, Inc.
+ * Copyright 2012 Linaro Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
  * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
  * more details.
  *
- * The full GNU General Public License is included in this distribution in the
- * file called LICENSE.
+ * You should have received a copy of the GNU General Public License along with
+ * this program.  If not, see <http://www.gnu.org/licenses/>.
  *
- * Contact Information:
- * wlanfae <wlanfae@realtek.com>
- * Realtek Corporation, No. 2, Innovation Road II, Hsinchu Science Park,
- * Hsinchu 300, Taiwan.
+ * Maintainer: Rob Herring <rob.herring@calxeda.com>
+ */
+
+#include <linux/cpuidle.h>
+#include <linux/cpu_pm.h>
+#include <linux/init.h>
+#include <linux/mm.h>
+#include <linux/platform_device.h>
+#include <linux/psci.h>
+
+#include <asm/cpuidle.h>
+#include <asm/suspend.h>
+
+#include <uapi/linux/psci.h>
+
+#define CALXEDA_IDLE_PARAM \
+	((0 << PSCI_0_2_POWER_STATE_ID_SHIFT) | \
+	 (0 << PSCI_0_2_POWER_STATE_AFFL_SHIFT) | \
+	 (PSCI_POWER_STATE_TYPE_POWER_DOWN << PSCI_0_2_POWER_STATE_TYPE_SHIFT))
+
+static int calxeda_idle_finish(unsigned long val)
+{
+	return psci_ops.cpu_suspend(CALXEDA_IDLE_PARAM, __pa(cpu_resume));
+}
+
+static int calxeda_pwrdown_idle(struct cpuidle_device *dev,
+				struct cpuidle_driver *drv,
+				int index)
+{
+	cpu_pm_enter();
+	cpu_suspend(0, calxeda_idle_finish);
+	cpu_pm_exit();
+
+	return index;
+}
+
+static struct cpuidle_driver calxeda_idle_driver = {
+	.name = "calxeda_idle",
+	.states = {
+		ARM_CPUIDLE_WFI_STATE,
+		{
+			.name = "PG",
+			.desc = "Power Gate",
+			.exit_latency = 30,
+			.power_usage = 50,
+			.target_residency = 200,
+			.enter = calxeda_pwrdown_idle,
+		},
+	},
+	.state_count = 2,
+};
+
+static int calxeda_cpuidle_probe(struct platform_device *pdev)
+{
+	return cpuidle_register(&calxeda_idle_driver, NULL);
+}
+
+static struct platform_driver calxeda_cpuidle_plat_driver = {
+        .driver = {
+                .name = "cpuidle-calxeda",
+        },
+        .probe = calxeda_cpuidle_probe,
+};
+builtin_platform_driver(calxeda_cpuidle_plat_driver);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+ *  CLPS711X CPU idle driver
  *
- * Larry Finger <Larry.Finger@lwfinger.net>
+ *  Copyright (C) 2014 Alexander Shiyan <shc_work@mail.ru>
  *
- *****************************************************************************/
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ */
 
-#include "../wifi.h"
-#include "../efuse.h"
-#include "../base.h"
-#include "../regd.h"
-#include "../cam.h"
-#include "../ps.h"
-#include "../pci.h"
-#include "reg.h"
-#include "def.h"
-#include "phy.h"
-#include "../rtl8723com/phy_common.h"
-#include "dm.h"
-#include "../rtl8723com/dm_common.h"
-#include "fw.h"
-#include "../rtl8723com/fw_common.h"
-#include "led.h"
-#include "hw.h"
-#include "../pwrseqcmd.h"
-#include "pwrseq.h"
-#include "btc.h"
+#include <linux/cpuidle.h>
+#include <linux/err.h>
+#include <linux/io.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
 
-#define LLT_CONFIG	5
+#define CLPS711X_CPUIDLE_NAME	"clps711x-cpuidle"
 
-static void _rtl8723e_set_bcn_ctrl_reg(struct ieee80211_hw *hw,
-				       u8 set_bits, u8 clear_bits)
+static void __iomem *clps711x_halt;
+
+static int clps711x_cpuidle_halt(struct cpuidle_device *dev,
+				 struct cpuidle_driver *drv, int index)
 {
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
+	writel(0xaa, clps711x_halt);
 
-	rtlpci->reg_bcn_ctrl_val |= set_bits;
-	rtlpci->reg_bcn_ctrl_val &= ~clear_bits;
-
-	rtl_write_byte(rtlpriv, REG_BCN_CTRL, (u8) rtlpci->reg_bcn_ctrl_val);
+	return index;
 }
 
-static void _rtl8723e_stop_tx_beacon(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	u8 tmp1byte;
+static struct cpuidle_driver clps711x_idle_driver = {
+	.name		= CLPS711X_CPUIDLE_NAME,
+	.owner		= THIS_MODULE,
+	.states[0]	= {
+		.name		= "HALT",
+		.desc		= "CLPS711X HALT",
+		.enter		= clps711x_cpuidle_halt,
+		.exit_latency	= 1,
+	},
+	.state_count	= 1,
+};
 
-	tmp1byte = rtl_read_byte(rtlpriv, REG_FWHW_TXQ_CTRL + 2);
-	rtl_write_byte(rtlpriv, REG_FWHW_TXQ_CTRL + 2, tmp1byte & (~BIT(6)));
-	rtl_write_byte(rtlpriv, REG_TBTT_PROHIBIT + 1, 0x64);
-	tmp1byte = rtl_read_byte(rtlpriv, REG_TBTT_PROHIBIT + 2);
-	tmp1byte &= ~(BIT(0));
-	rtl_write_byte(rtlpriv, REG_TBTT_PROHIBIT + 2, tmp1byte);
+static int __init clps711x_cpuidle_probe(struct platform_device *pdev)
+{
+	struct resource *res;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	clps711x_halt = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(clps711x_halt))
+		return PTR_ERR(clps711x_halt);
+
+	return cpuidle_register(&clps711x_idle_driver, NULL);
 }
 
-static void _rtl8723e_resume_tx_beacon(struct ieee80211_hw *hw)
+static struct platform_driver clps711x_cpuidle_driver = {
+	.driver	= {
+		.name	= CLPS711X_CPUIDLE_NAME,
+	},
+};
+module_platform_driver_probe(clps711x_cpuidle_driver, clps711x_cpuidle_probe);
+
+MODULE_AUTHOR("Alexander Shiyan <shc_work@mail.ru>");
+MODULE_DESCRIPTION("CLPS711X CPU idle driver");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * Copyright (C) 2014 Imagination Technologies
+ * Author: Paul Burton <paul.burton@imgtec.com>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation;  either version 2 of the  License, or (at your
+ * option) any later version.
+ */
+
+#include <linux/cpu_pm.h>
+#include <linux/cpuidle.h>
+#include <linux/init.h>
+
+#include <asm/idle.h>
+#include <asm/pm-cps.h>
+
+/* Enumeration of the various idle states this driver may enter */
+enum cps_idle_state {
+	STATE_WAIT = 0,		/* MIPS wait instruction, coherent */
+	STATE_NC_WAIT,		/* MIPS wait instruction, non-coherent */
+	STATE_CLOCK_GATED,	/* Core clock gated */
+	STATE_POWER_GATED,	/* Core power gated */
+	STATE_COUNT
+};
+
+static int cps_nc_enter(struct cpuidle_device *dev,
+			struct cpuidle_driver *drv, int index)
 {
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	u8 tmp1byte;
-
-	tmp1byte = rtl_read_byte(rtlpriv, REG_FWHW_TXQ_CTRL + 2);
-	rtl_write_byte(rtlpriv, REG_FWHW_TXQ_CTRL + 2, tmp1byte | BIT(6));
-	rtl_write_byte(rtlpriv, REG_TBTT_PROHIBIT + 1, 0xff);
-	tmp1byte = rtl_read_byte(rtlpriv, REG_TBTT_PROHIBIT + 2);
-	tmp1byte |= BIT(1);
-	rtl_write_byte(rtlpriv, REG_TBTT_PROHIBIT + 2, tmp1byte);
-}
-
-static void _rtl8723e_enable_bcn_sub_func(struct ieee80211_hw *hw)
-{
-	_rtl8723e_set_bcn_ctrl_reg(hw, 0, BIT(1));
-}
-
-static void _rtl8723e_disable_bcn_sub_func(struct ieee80211_hw *hw)
-{
-	_rtl8723e_set_bcn_ctrl_reg(hw, BIT(1), 0);
-}
-
-void rtl8723e_get_hw_reg(struct ieee80211_hw *hw, u8 variable, u8 *val)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-
-	switch (variable) {
-	case HW_VAR_RCR:
-		*((u32 *)(val)) = rtlpci->receive_config;
-		break;
-	case HW_VAR_RF_STATE:
-		*((enum rf_pwrstate *)(val)) = ppsc->rfpwr_state;
-		break;
-	case HW_VAR_FWLPS_RF_ON:{
-			enum rf_pwrstate rfstate;
-			u32 val_rcr;
-
-			rtlpriv->cfg->ops->get_hw_reg(hw,
-						      HW_VAR_RF_STATE,
-						      (u8 *)(&rfstate));
-			if (rfstate == ERFOFF) {
-				*((bool *)(val)) = true;
-			} else {
-				val_rcr = rtl_read_dword(rtlpriv, REG_RCR);
-				val_rcr &= 0x00070000;
-				if (val_rcr)
-					*((bool *)(val)) = false;
-				else
-					*((bool *)(val)) = true;
-			}
-			break;
-		}
-	case HW_VAR_FW_PSMODE_STATUS:
-		*((bool *)(val)) = ppsc->fw_current_inpsmode;
-		break;
-	case HW_VAR_CORRECT_TSF:{
-			u64 tsf;
-			u32 *ptsf_low = (u32 *)&tsf;
-			u32 *ptsf_high = ((u32 *)&tsf) + 1;
-
-			*ptsf_high = rtl_read_dword(rtlpriv, (REG_TSFTR + 4));
-			*ptsf_low = rtl_read_dword(rtlpriv, REG_TSFTR);
-
-			*((u64 *)(val)) = tsf;
-
-			break;
-		}
-	default:
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_LOUD,
-			 "switch case not process\n");
-		break;
-	}
-}
-
-void rtl8723e_set_hw_reg(struct ieee80211_hw *hw, u8 variable, u8 *val)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	struct rtl_efuse *rtlefuse = rtl_efuse(rtl_priv(hw));
-	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
-	u8 idx;
-
-	switch (variable) {
-	case HW_VAR_ETHER_ADDR:{
-			for (idx = 0; idx < ETH_ALEN; idx++) {
-				rtl_write_byte(rtlpriv, (REG_MACID + idx),
-					       val[idx]);
-			}
-			break;
-		}
-	case HW_VAR_BASIC_RATE:{
-			u16 b_rate_cfg = ((u16 *)val)[0];
-			u8 rate_index = 0;
-
-			b_rate_cfg = b_rate_cfg & 0x15f;
-			b_rate_cfg |= 0x01;
-			rtl_write_byte(rtlpriv, REG_RRSR, b_rate_cfg & 0xff);
-			rtl_write_byte(rtlpriv, REG_RRSR + 1,
-				       (b_rate_cfg >> 8) & 0xff);
-			while (b_rate_cfg > 0x1) {
-				b_rate_cfg = (b_rate_cfg >> 1);
-				rate_index++;
-			}
-			rtl_write_byte(rtlpriv, REG_INIRTS_RATE_SEL,
-				       rate_index);
-			break;
-		}
-	case HW_VAR_BSSID:{
-			for (idx = 0; idx < ETH_ALEN; idx++) {
-				rtl_write_byte(rtlpriv, (REG_BSSID + idx),
-					       val[idx]);
-			}
-			break;
-		}
-	case HW_VAR_SIFS:{
-			rtl_write_byte(rtlpriv, REG_SIFS_CTX + 1, val[0]);
-			rtl_write_byte(rtlpriv, REG_SIFS_TRX + 1, val[1]);
-
-			rtl_write_byte(rtlpriv, REG_SPEC_SIFS + 1, val[0]);
-			rtl_write_byte(rtlpriv, REG_MAC_SPEC_SIFS + 1, val[0]);
-
-			if (!mac->ht_enable)
-				rtl_write_word(rtlpriv, REG_RESP_SIFS_OFDM,
-					       0x0e0e);
-			else
-				rtl_write_word(rtlpriv, REG_RESP_SIFS_OFDM,
-					       *((u16 *)val));
-			break;
-		}
-	case HW_VAR_SLOT_TIME:{
-			u8 e_aci;
-
-			RT_TRACE(rtlpriv, COMP_MLME, DBG_LOUD,
-				 "HW_VAR_SLOT_TIME %x\n", val[0]);
-
-			rtl_write_byte(rtlpriv, REG_SLOT, val[0]);
-
-			for (e_aci = 0; e_aci < AC_MAX; e_aci++) {
-				rtlpriv->cfg->ops->set_hw_reg(hw,
-							      HW_VAR_AC_PARAM,
-							      (u8 *)(&e_aci));
-			}
-			break;
-		}
-	case HW_VAR_ACK_PREAMBLE:{
-			u8 reg_tmp;
-			u8 short_preamble = (bool)(*(u8 *)val);
-
-			reg_tmp = (mac->cur_40_prime_sc) << 5;
-			if (short_preamble)
-				reg_tmp |= 0x80;
-
-			rtl_write_byte(rtlpriv, REG_RRSR + 2, reg_tmp);
-			break;
-		}
-	case HW_VAR_AMPDU_MIN_SPACE:{
-			u8 min_spacing_to_set;
-			u8 sec_min_space;
-
-			min_spacing_to_set = *((u8 *)val);
-			if (min_spacing_to_set <= 7) {
-				sec_min_space = 0;
-
-				if (min_spacing_to_set < sec_min_space)
-					min_spacing_to_set = sec_min_space;
-
-				mac->min_space_cfg = ((mac->min_space_cfg &
-						       0xf8) |
-						      min_spacing_to_set);
-
-				*val = min_spacing_to_set;
-
-				RT_TRACE(rtlpriv, COMP_MLME, DBG_LOUD,
-					 "Set HW_VAR_AMPDU_MIN_SPACE: %#x\n",
-					  mac->min_space_cfg);
-
-				rtl_write_byte(rtlpriv, REG_AMPDU_MIN_SPACE,
-					       mac->min_space_cfg);
-			}
-			break;
-		}
-	case HW_VAR_SHORTGI_DENSITY:{
-			u8 density_to_set;
-
-			density_to_set = *((u8 *)val);
-			mac->min_space_cfg |= (density_to_set << 3);
-
-			RT_TRACE(rtlpriv, COMP_MLME, DBG_LOUD,
-				 "Set HW_VAR_SHORTGI_DENSITY: %#x\n",
-				  mac->min_space_cfg);
-
-			rtl_write_byte(rtlpriv, REG_AMPDU_MIN_SPACE,
-				       mac->min_space_cfg);
-
-			break;
-		}
-	case HW_VAR_AMPDU_FACTOR:{
-			u8 regtoset_normal[4] = { 0x41, 0xa8, 0x72, 0xb9 };
-			u8 regtoset_bt[4] = {0x31, 0x74, 0x42, 0x97};
-			u8 factor_toset;
-			u8 *p_regtoset = NULL;
-			u8 index = 0;
-
-			if ((rtlpriv->btcoexist.bt_coexistence) &&
-			    (rtlpriv->btcoexist.bt_coexist_type ==
-				BT_CSR_BC4))
-				p_regtoset = regtoset_bt;
-			else
-				p_regtoset = regtoset_normal;
-
-			factor_toset = *((u8 *)val);
-			if (factor_toset <= 3) {
-				factor_toset = (1 << (factor_toset + 2));
-				if (factor_toset > 0xf)
-					factor_toset = 0xf;
-
-				for (index = 0; index < 4; index++) {
-					if ((p_regtoset[index] & 0xf0) >
-					    (factor_toset << 4))
-						p_regtoset[index] =
-						    (p_regtoset[index] & 0x0f) |
-						    (factor_toset << 4);
-
-					if ((p_regtoset[index] & 0x0f) >
-					    factor_toset)
-						p_regtoset[index] =
-						    (p_regtoset[index] & 0xf0) |
-						    (factor_toset);
-
-					rtl_write_byte(rtlpriv,
-						       (REG_AGGLEN_LMT + index),
-						       p_regtoset[index]);
-				}
-
-				RT_TRACE(rtlpriv, COMP_MLME, DBG_LOUD,
-					 "Set HW_VAR_AMPDU_FACTOR: %#x\n",
-					  factor_toset);
-			}
-			break;
-		}
-	case HW_VAR_AC_PARAM:{
-			u8 e_aci = *((u8 *)val);
-
-			rtl8723_dm_init_edca_turbo(hw);
-
-			if (rtlpci->acm_method != EACMWAY2_SW)
-				rtlpriv->cfg->ops->set_hw_reg(hw,
-							      HW_VAR_ACM_CTRL,
-							      (u8 *)(&e_aci));
-			break;
-		}
-	case HW_VAR_ACM_CTRL:{
-			u8 e_aci = *((u8 *)val);
-			union aci_aifsn *p_aci_aifsn =
-			    (union aci_aifsn *)(&mac->ac[0].aifs);
-			u8 acm = p_aci_aifsn->f.acm;
-			u8 acm_ctrl = rtl_read_byte(rtlpriv, REG_ACMHWCTRL);
-
-			acm_ctrl =
-			    acm_ctrl | ((rtlpci->acm_method == 2) ? 0x0 : 0x1);
-
-			if (acm) {
-				switch (e_aci) {
-				case AC0_BE:
-					acm_ctrl |= ACMHW_BEQEN;
-					break;
-				case AC2_VI:
-					acm_ctrl |= ACMHW_VIQEN;
-					break;
-				case AC3_VO:
-					acm_ctrl |= ACMHW_VOQEN;
-					break;
-				default:
-					RT_TRACE(rtlpriv, COMP_ERR, DBG_WARNING,
-						 "HW_VAR_ACM_CTRL acm set failed: eACI is %d\n",
-						 acm);
-					break;
-				}
-			} else {
-				switch (e_aci) {
-				case AC0_BE:
-					acm_ctrl &= (~ACMHW_BEQEN);
-					break;
-				case AC2_VI:
-					acm_ctrl &= (~ACMHW_VIQEN);
-					break;
-				case AC3_VO:
-					acm_ctrl &= (~ACMHW_VOQEN);
-					break;
-				default:
-					RT_TRACE(rtlpriv, COMP_ERR, DBG_LOUD,
-						 "switch case not process\n");
-					break;
-				}
-			}
-
-			RT_TRACE(rtlpriv, COMP_QOS, DBG_TRACE,
-				 "SetHwReg8190pci(): [HW_VAR_ACM_CTRL] Write 0x%X\n",
-				 acm_ctrl);
-			rtl_write_byte(rtlpriv, REG_ACMHWCTRL, acm_ctrl);
-			break;
-		}
-	case HW_VAR_RCR:{
-			rtl_write_dword(rtlpriv, REG_RCR, ((u32 *)(val))[0]);
-			rtlpci->receive_config = ((u32 *)(val))[0];
-			break;
-		}
-	case HW_VAR_RETRY_LIMIT:{
-			u8 retry_limit = ((u8 *)(val))[0];
-
-			rtl_write_word(rtlpriv, REG_RL,
-				       retry_limit << RETRY_LIMIT_SHORT_SHIFT |
-				       retry_limit << RETRY_LIMIT_LONG_SHIFT);
-			break;
-		}
-	case HW_VAR_DUAL_TSF_RST:
-		rtl_write_byte(rtlpriv, REG_DUAL_TSF_RST, (BIT(0) | BIT(1)));
-		break;
-	case HW_VAR_EFUSE_BYTES:
-		rtlefuse->efuse_usedbytes = *((u16 *)val);
-		break;
-	case HW_VAR_EFUSE_USAGE:
-		rtlefuse->efuse_usedpercentage = *((u8 *)val);
-		break;
-	case HW_VAR_IO_CMD:
-		rtl8723e_phy_set_io_cmd(hw, (*(enum io_type *)val));
-		break;
-	case HW_VAR_WPA_CONFIG:
-		rtl_write_byte(rtlpriv, REG_SECCFG, *((u8 *)val));
-		break;
-	case HW_VAR_SET_RPWM:{
-			u8 rpwm_val;
-
-			rpwm_val = rtl_read_byte(rtlpriv, REG_PCIE_HRPWM);
-			udelay(1);
-
-			if (rpwm_val & BIT(7)) {
-				rtl_write_byte(rtlpriv, REG_PCIE_HRPWM,
-					       (*(u8 *)val));
-			} else {
-				rtl_write_byte(rtlpriv, REG_PCIE_HRPWM,
-					       ((*(u8 *)val) | BIT(7)));
-			}
-
-			break;
-		}
-	case HW_VAR_H2C_FW_PWRMODE:{
-			u8 psmode = (*(u8 *)val);
-
-			if (psmode != FW_PS_ACTIVE_MODE)
-				rtl8723e_dm_rf_saving(hw, true);
-
-			rtl8723e_set_fw_pwrmode_cmd(hw, (*(u8 *)val));
-			break;
-		}
-	case HW_VAR_FW_PSMODE_STATUS:
-		ppsc->fw_current_inpsmode = *((bool *)val);
-		break;
-	case HW_VAR_H2C_FW_JOINBSSRPT:{
-			u8 mstatus = (*(u8 *)val);
-			u8 tmp_regcr, tmp_reg422;
-			bool b_recover = false;
-
-			if (mstatus == RT_MEDIA_CONNECT) {
-				rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_AID,
-							      NULL);
-
-				tmp_regcr = rtl_read_byte(rtlpriv, REG_CR + 1);
-				rtl_write_byte(rtlpriv, REG_CR + 1,
-					       (tmp_regcr | BIT(0)));
-
-				_rtl8723e_set_bcn_ctrl_reg(hw, 0, BIT(3));
-				_rtl8723e_set_bcn_ctrl_reg(hw, BIT(4), 0);
-
-				tmp_reg422 =
-				    rtl_read_byte(rtlpriv,
-						  REG_FWHW_TXQ_CTRL + 2);
-				if (tmp_reg422 & BIT(6))
-					b_recover = true;
-				rtl_write_byte(rtlpriv, REG_FWHW_TXQ_CTRL + 2,
-					       tmp_reg422 & (~BIT(6)));
-
-				rtl8723e_set_fw_rsvdpagepkt(hw, 0);
-
-				_rtl8723e_set_bcn_ctrl_reg(hw, BIT(3), 0);
-				_rtl8723e_set_bcn_ctrl_reg(hw, 0, BIT(4));
-
-				if (b_recover) {
-					rtl_write_byte(rtlpriv,
-						       REG_FWHW_TXQ_CTRL + 2,
-						       tmp_reg422);
-				}
-
-				rtl_write_byte(rtlpriv, REG_CR + 1,
-					       (tmp_regcr & ~(BIT(0))));
-			}
-			rtl8723e_set_fw_joinbss_report_cmd(hw, (*(u8 *)val));
-
-			break;
-		}
-	case HW_VAR_H2C_FW_P2P_PS_OFFLOAD:{
-		rtl8723e_set_p2p_ps_offload_cmd(hw, (*(u8 *)val));
-		break;
-	}
-	case HW_VAR_AID:{
-			u16 u2btmp;
-
-			u2btmp = rtl_read_word(rtlpriv, REG_BCN_PSR_RPT);
-			u2btmp &= 0xC000;
-			rtl_write_word(rtlpriv, REG_BCN_PSR_RPT,
-				       (u2btmp | mac->assoc_id));
-
-			break;
-		}
-	case HW_VAR_CORRECT_TSF:{
-			u8 btype_ibss = ((u8 *)(val))[0];
-
-			if (btype_ibss)
-				_rtl8723e_stop_tx_beacon(hw);
-
-			_rtl8723e_set_bcn_ctrl_reg(hw, 0, BIT(3));
-
-			rtl_write_dword(rtlpriv, REG_TSFTR,
-					(u32)(mac->tsf & 0xffffffff));
-			rtl_write_dword(rtlpriv, REG_TSFTR + 4,
-					(u32)((mac->tsf >> 32) & 0xffffffff));
-
-			_rtl8723e_set_bcn_ctrl_reg(hw, BIT(3), 0);
-
-			if (btype_ibss)
-				_rtl8723e_resume_tx_beacon(hw);
-
-			break;
-		}
-	case HW_VAR_FW_LPS_ACTION:{
-			bool b_enter_fwlps = *((bool *)val);
-			u8 rpwm_val, fw_pwrmode;
-			bool fw_current_inps;
-
-			if (b_enter_fwlps) {
-				rpwm_val = 0x02;	/* RF off */
-				fw_current_inps = true;
-				rtlpriv->cfg->ops->set_hw_reg(hw,
-						HW_VAR_FW_PSMODE_STATUS,
-						(u8 *)(&fw_current_inps));
-				rtlpriv->cfg->ops->set_hw_reg(hw,
-						HW_VAR_H2C_FW_PWRMODE,
-						(u8 *)(&ppsc->fwctrl_psmode));
-
-				rtlpriv->cfg->ops->set_hw_reg(hw,
-						HW_VAR_SET_RPWM,
-						(u8 *)(&rpwm_val));
-			} else {
-				rpwm_val = 0x0C;	/* RF on */
-				fw_pwrmode = FW_PS_ACTIVE_MODE;
-				fw_current_inps = false;
-				rtlpriv->cfg->ops->set_hw_reg(hw,
-							      HW_VAR_SET_RPWM,
-							      (u8 *)(&rpwm_val));
-				rtlpriv->cfg->ops->set_hw_reg(hw,
-						HW_VAR_H2C_FW_PWRMODE,
-						(u8 *)(&fw_pwrmode));
-
-				rtlpriv->cfg->ops->set_hw_reg(hw,
-						HW_VAR_FW_PSMODE_STATUS,
-						(u8 *)(&fw_current_inps));
-			}
-			 break;
-		}
-	default:
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_LOUD,
-			 "switch case not process\n");
-		break;
-	}
-}
-
-static bool _rtl8723e_llt_write(struct ieee80211_hw *hw, u32 address, u32 data)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	bool status = true;
-	long count = 0;
-	u32 value = _LLT_INIT_ADDR(address) |
-	    _LLT_INIT_DATA(data) | _LLT_OP(_LLT_WRITE_ACCESS);
-
-	rtl_write_dword(rtlpriv, REG_LLT_INIT, value);
-
-	do {
-		value = rtl_read_dword(rtlpriv, REG_LLT_INIT);
-		if (_LLT_NO_ACTIVE == _LLT_OP_VALUE(value))
-			break;
-
-		if (count > POLLING_LLT_THRESHOLD) {
-			RT_TRACE(rtlpriv, COMP_ERR, DBG_EMERG,
-				 "Failed to polling write LLT done at address %d!\n",
-				 address);
-			status = false;
-			break;
-		}
-	} while (++count);
-
-	return status;
-}
-
-static bool _rtl8723e_llt_table_init(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	unsigned short i;
-	u8 txpktbuf_bndy;
-	u8 maxpage;
-	bool status;
-	u8 ubyte;
-
-#if LLT_CONFIG == 1
-	maxpage = 255;
-	txpktbuf_bndy = 252;
-#elif LLT_CONFIG == 2
-	maxpage = 127;
-	txpktbuf_bndy = 124;
-#elif LLT_CONFIG == 3
-	maxpage = 255;
-	txpktbuf_bndy = 174;
-#elif LLT_CONFIG == 4
-	maxpage = 255;
-	txpktbuf_bndy = 246;
-#elif LLT_CONFIG == 5
-	maxpage = 255;
-	txpktbuf_bndy = 246;
-#endif
-
-	rtl_write_byte(rtlpriv, REG_CR, 0x8B);
-
-#if LLT_CONFIG == 1
-	rtl_write_byte(rtlpriv, REG_RQPN_NPQ, 0x1c);
-	rtl_write_dword(rtlpriv, REG_RQPN, 0x80a71c1c);
-#elif LLT_CONFIG == 2
-	rtl_write_dword(rtlpriv, REG_RQPN, 0x845B1010);
-#elif LLT_CONFIG == 3
-	rtl_write_dword(rtlpriv, REG_RQPN, 0x84838484);
-#elif LLT_CONFIG == 4
-	rtl_write_dword(rtlpriv, REG_RQPN, 0x80bd1c1c);
-#elif LLT_CONFIG == 5
-	rtl_write_word(rtlpriv, REG_RQPN_NPQ, 0x0000);
-
-	rtl_write_dword(rtlpriv, REG_RQPN, 0x80ac1c29);
-	rtl_write_byte(rtlpriv, REG_RQPN_NPQ, 0x03);
-#endif
-
-	rtl_write_dword(rtlpriv, REG_TRXFF_BNDY, (0x27FF0000 | txpktbuf_bndy));
-	rtl_write_byte(rtlpriv, REG_TDECTRL + 1, txpktbuf_bndy);
-
-	rtl_write_byte(rtlpriv, REG_TXPKTBUF_BCNQ_BDNY, txpktbuf_bndy);
-	rtl_write_byte(rtlpriv, REG_TXPKTBUF_MGQ_BDNY, txpktbuf_bndy);
-
-	rtl_write_byte(rtlpriv, 0x45D, txpktbuf_bndy);
-	rtl_write_byte(rtlpriv, REG_PBP, 0x11);
-	rtl_write_byte(rtlpriv, REG_RX_DRVINFO_SZ, 0x4);
-
-	for (i = 0; i < (txpktbuf_bndy - 1); i++) {
-		status = _rtl8723e_llt_write(hw, i, i + 1);
-		if (true != status)
-			return status;
-	}
-
-	status = _rtl8723e_llt_write(hw, (txpktbuf_bndy - 1), 0xFF);
-	if (true != status)
-		return status;
-
-	for (i = txpktbuf_bndy; i < maxpage; i++) {
-		status = _rtl8723e_llt_write(hw, i, (i + 1));
-		if (true != status)
-			return status;
-	}
-
-	status = _rtl8723e_llt_write(hw, maxpage, txpktbuf_bndy);
-	if (true != status)
-		return status;
-
-	rtl_write_byte(rtlpriv, REG_CR, 0xff);
-	ubyte = rtl_read_byte(rtlpriv, REG_RQPN + 3);
-	rtl_write_byte(rtlpriv, REG_RQPN + 3, ubyte | BIT(7));
-
-	return true;
-}
-
-static void _rtl8723e_gen_refresh_led_state(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci_priv *pcipriv = rtl_pcipriv(hw);
-	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
-	struct rtl_led *pled0 = &pcipriv->ledctl.sw_led0;
-
-	if (rtlpriv->rtlhal.up_first_time)
-		return;
-
-	if (ppsc->rfoff_reason == RF_CHANGE_BY_IPS)
-		rtl8723e_sw_led_on(hw, pled0);
-	else if (ppsc->rfoff_reason == RF_CHANGE_BY_INIT)
-		rtl8723e_sw_led_on(hw, pled0);
-	else
-		rtl8723e_sw_led_off(hw, pled0);
-}
-
-static bool _rtl8712e_init_mac(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-
-	unsigned char bytetmp;
-	unsigned short wordtmp;
-	u16 retry = 0;
-	u16 tmpu2b;
-	bool mac_func_enable;
-
-	rtl_write_byte(rtlpriv, REG_RSV_CTRL, 0x00);
-	bytetmp = rtl_read_byte(rtlpriv, REG_CR);
-	if (bytetmp == 0xFF)
-		mac_func_enable = true;
-	else
-		mac_func_enable = false;
-
-	/* HW Power on sequence */
-	if (!rtl_hal_pwrseqcmdparsing(rtlpriv, PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK,
-		PWR_INTF_PCI_MSK, Rtl8723_NIC_ENABLE_FLOW))
-		return false;
-
-	bytetmp = rtl_read_byte(rtlpriv, REG_PCIE_CTRL_REG+2);
-	rtl_write_byte(rtlpriv, REG_PCIE_CTRL_REG+2, bytetmp | BIT(4));
-
-	/* eMAC time out function enable, 0x369[7]=1 */
-	bytetmp = rtl_read_byte(rtlpriv, 0x369);
-	rtl_write_byte(rtlpriv, 0x369, bytetmp | BIT(7));
-
-	/* ePHY reg 0x1e bit[4]=1 using MDIO interface,
-	 * we should do this before Enabling ASPM backdoor.
-	 */
-	do {
-		rtl_write_word(rtlpriv, 0x358, 0x5e);
-		udelay(100);
-		rtl_write_word(rtlpriv, 0x356, 0xc280);
-		rtl_write_word(rtlpriv, 0x354, 0xc290);
-		rtl_write_word(rtlpriv, 0x358, 0x3e);
-		udelay(100);
-		rtl_write_word(rtlpriv, 0x358, 0x5e);
-		udelay(100);
-		tmpu2b = rtl_read_word(rtlpriv, 0x356);
-		retry++;
-	} while (tmpu2b != 0xc290 && retry < 100);
-
-	if (retry >= 100) {
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD,
-			 "InitMAC(): ePHY configure fail!!!\n");
-		return false;
-	}
-
-	rtl_write_word(rtlpriv, REG_CR, 0x2ff);
-	rtl_write_word(rtlpriv, REG_CR + 1, 0x06);
-
-	if (!mac_func_enable) {
-		if (!_rtl8723e_llt_table_init(hw))
-			return false;
-	}
-
-	rtl_write_dword(rtlpriv, REG_HISR, 0xffffffff);
-	rtl_write_byte(rtlpriv, REG_HISRE, 0xff);
-
-	rtl_write_word(rtlpriv, REG_TRXFF_BNDY + 2, 0x27ff);
-
-	wordtmp = rtl_read_word(rtlpriv, REG_TRXDMA_CTRL);
-	wordtmp &= 0xf;
-	wordtmp |= 0xF771;
-	rtl_write_word(rtlpriv, REG_TRXDMA_CTRL, wordtmp);
-
-	rtl_write_byte(rtlpriv, REG_FWHW_TXQ_CTRL + 1, 0x1F);
-	rtl_write_dword(rtlpriv, REG_RCR, rtlpci->receive_config);
-	rtl_write_word(rtlpriv, REG_RXFLTMAP2, 0xFFFF);
-	rtl_write_dword(rtlpriv, REG_TCR, rtlpci->transmit_config);
-
-	rtl_write_byte(rtlpriv, 0x4d0, 0x0);
-
-	rtl_write_dword(rtlpriv, REG_BCNQ_DESA,
-			((u64) rtlpci->tx_ring[BEACON_QUEUE].dma) &
-			DMA_BIT_MASK(32));
-	rtl_write_dword(rtlpriv, REG_MGQ_DESA,
-			(u64) rtlpci->tx_ring[MGNT_QUEUE].dma &
-			DMA_BIT_MASK(32));
-	rtl_write_dword(rtlpriv, REG_VOQ_DESA,
-			(u64) rtlpci->tx_ring[VO_QUEUE].dma & DMA_BIT_MASK(32));
-	rtl_write_dword(rtlpriv, REG_VIQ_DESA,
-			(u64) rtlpci->tx_ring[VI_QUEUE].dma & DMA_BIT_MASK(32));
-	rtl_write_dword(rtlpriv, REG_BEQ_DESA,
-			(u64) rtlpci->tx_ring[BE_QUEUE].dma & DMA_BIT_MASK(32));
-	rtl_write_dword(rtlpriv, REG_BKQ_DESA,
-			(u64) rtlpci->tx_ring[BK_QUEUE].dma & DMA_BIT_MASK(32));
-	rtl_write_dword(rtlpriv, REG_HQ_DESA,
-			(u64) rtlpci->tx_ring[HIGH_QUEUE].dma &
-			DMA_BIT_MASK(32));
-	rtl_write_dword(rtlpriv, REG_RX_DESA,
-			(u64) rtlpci->rx_ring[RX_MPDU_QUEUE].dma &
-			DMA_BIT_MASK(32));
-
-	rtl_write_byte(rtlpriv, REG_PCIE_CTRL_REG + 3, 0x74);
-
-	rtl_write_dword(rtlpriv, REG_INT_MIG, 0);
-
-	bytetmp = rtl_read_byte(rtlpriv, REG_APSD_CTRL);
-	rtl_write_byte(rtlpriv, REG_APSD_CTRL, bytetmp & ~BIT(6));
-	do {
-		retry++;
-		bytetmp = rtl_read_byte(rtlpriv, REG_APSD_CTRL);
-	} while ((retry < 200) && (bytetmp & BIT(7)));
-
-	_rtl8723e_gen_refresh_led_state(hw);
-
-	rtl_write_dword(rtlpriv, REG_MCUTST_1, 0x0);
-
-	return true;
-}
-
-static void _rtl8723e_hw_configure(struct ieee80211_hw *hw)
-{
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	u8 reg_bw_opmode;
-	u32 reg_ratr, reg_prsr;
-
-	reg_bw_opmode = BW_OPMODE_20MHZ;
-	reg_ratr = RATE_ALL_CCK | RATE_ALL_OFDM_AG |
-	    RATE_ALL_OFDM_1SS | RATE_ALL_OFDM_2SS;
-	reg_prsr = RATE_ALL_CCK | RATE_ALL_OFDM_AG;
-
-	rtl_write_byte(rtlpriv, REG_INIRTS_RATE_SEL, 0x8);
-
-	rtl_write_byte(rtlpriv, REG_BWOPMODE, reg_bw_opmode);
-
-	rtl_write_dword(rtlpriv, REG_RRSR, reg_prsr);
-
-	rtl_write_byte(rtlpriv, REG_SLOT, 0x09);
-
-	rtl_write_byte(rtlpriv, REG_AMPDU_MIN_SPACE, 0x0);
-
-	rtl_write_word(rtlpriv, REG_FWHW_TXQ_CTRL, 0x1F80);
-
-	rtl_write_word(rtlpriv, REG_RL, 0x0707);
-
-	rtl_write_dword(rtlpriv, REG_BAR_MODE_CTRL, 0x02012802);
-
-	rtl_write_byte(rtlpriv, REG_HWSEQ_CTRL, 0xFF);
-
-	rtl_write_dword(rtlpriv, REG_DARFRC, 0x01000000);
-	rtl_write_dword(rtlpriv, REG_DARFRC + 4, 0x07060504);
-	rtl_write_dword(rtlpriv, REG_RARFRC, 0x01000000);
-	rtl_write_dword(rtlpriv, REG_RARFRC + 4, 0x07060504);
-
-	if ((rtlpriv->btcoexist.bt_coexistence) &&
-	    (rtlpriv->btcoexist.bt_coexist_type == BT_CSR_BC4))
-		rtl_write_dword(rtlpriv, REG_AGGLEN_LMT, 0x97427431);
-	else
-		rtl_write_dword(rtlpriv, REG_AGGLEN_LMT, 0xb972a841);
-
-	rtl_write_byte(rtlpriv, REG_ATIMWND, 0x2);
-
-	rtl_write_byte(rtlpriv, REG_BCN_MAX_ERR, 0xff);
-
-	rtlpci->reg_bcn_ctrl_val = 0x1f;
-	rtl_write_byte(rtlpriv, REG_BCN_CTRL, rtlpci->reg_bcn_ctrl_val);
-
-	rtl_write_byte(rtlpriv, REG_TBTT_PROHIBIT + 1, 0xff);
-
-	rtl_write_byte(rtlpriv, REG_TBTT_PROHIBIT + 1, 0xff);
-
-	rtl_write_byte(rtlpriv, REG_PIFS, 0x1C);
-	rtl_write_byte(rtlpriv, REG_AGGR_BREAK_TIME, 0x16);
-
-	if ((rtlpriv->btcoexist.bt_coexistence) &&
-	    (rtlpriv->btcoexist.bt_coexist_type == BT_CSR_BC4)) {
-		rtl_write_word(rtlpriv, REG_NAV_PROT_LEN, 0x0020);
-		rtl_write_word(rtlpriv, REG_PROT_MODE_CTRL, 0x0402);
-	} else {
-		rtl_write_word(rtlpriv, REG_NAV_PROT_LEN, 0x0020);
-		rtl_write_word(rtlpriv, REG_NAV_PROT_LEN, 0x0020);
-	}
-
-	if ((rtlpriv->btcoexist.bt_coexistence) &&
-	    (rtlpriv->btcoexist.bt_coexist_type == BT_CSR_BC4))
-		rtl_write_dword(rtlpriv, REG_FAST_EDCA_CTRL, 0x03086666);
-	else
-		rtl_write_dword(rtlpriv, REG_FAST_EDCA_CTRL, 0x086666);
-
-	rtl_write_byte(rtlpriv, REG_ACKTO, 0x40);
-
-	rtl_write_word(rtlpriv, REG_SPEC_SIFS, 0x1010);
-	rtl_write_word(rtlpriv, REG_MAC_SPEC_SIFS, 0x1010);
-
-	rtl_write_word(rtlpriv, REG_SIFS_CTX, 0x1010);
-
-	rtl_write_word(rtlpriv, REG_SIFS_TRX, 0x1010);
-
-	rtl_write_dword(rtlpriv, REG_MAR, 0xffffffff);
-	rtl_write_dword(rtlpriv, REG_MAR + 4, 0xffffffff);
-
-	rtl_write_dword(rtlpriv, 0x394, 0x1);
-}
-
-static void _rtl8723e_enable_aspm_back_door(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
-
-	rtl_write_byte(rtlpriv, 0x34b, 0x93);
-	rtl_write_word(rtlpriv, 0x350, 0x870c);
-	rtl_write_byte(rtlpriv, 0x352, 0x1);
-
-	if (ppsc->support_backdoor)
-		rtl_write_byte(rtlpriv, 0x349, 0x1b);
-	else
-		rtl_write_byte(rtlpriv, 0x349, 0x03);
-
-	rtl_write_word(rtlpriv, 0x350, 0x2718);
-	rtl_write_byte(rtlpriv, 0x352, 0x1);
-}
-
-void rtl8723e_enable_hw_security_config(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	u8 sec_reg_value;
-
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_DMESG,
-		 "PairwiseEncAlgorithm = %d GroupEncAlgorithm = %d\n",
-		  rtlpriv->sec.pairwise_enc_algorithm,
-		  rtlpriv->sec.group_enc_algorithm);
-
-	if (rtlpriv->cfg->mod_params->sw_crypto || rtlpriv->sec.use_sw_sec) {
-		RT_TRACE(rtlpriv, COMP_SEC, DBG_DMESG,
-			 "not open hw encryption\n");
-		return;
-	}
-
-	sec_reg_value = SCR_TXENCENABLE | SCR_RXDECENABLE;
-
-	if (rtlpriv->sec.use_defaultkey) {
-		sec_reg_value |= SCR_TXUSEDK;
-		sec_reg_value |= SCR_RXUSEDK;
-	}
-
-	sec_reg_value |= (SCR_RXBCUSEDK | SCR_TXBCUSEDK);
-
-	rtl_write_byte(rtlpriv, REG_CR + 1, 0x02);
-
-	RT_TRACE(rtlpriv, COMP_SEC, DBG_DMESG,
-		 "The SECR-value %x\n", sec_reg_value);
-
-	rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_WPA_CONFIG, &sec_reg_value);
-
-}
-
-int rtl8723e_hw_init(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	struct rtl_phy *rtlphy = &(rtlpriv->phy);
-	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-	bool rtstatus = true;
+	enum cps_pm_state pm_state;
 	int err;
-	u8 tmp_u1b;
-	unsigned long flags;
 
-	rtlpriv->rtlhal.being_init_adapter = true;
-	/* As this function can take a very long time (up to 350 ms)
-	 * and can be called with irqs disabled, reenable the irqs
-	 * to let the other devices continue being serviced.
+	/*
+	 * At least one core must remain powered up & clocked in order for the
+	 * system to have any hope of functioning.
 	 *
-	 * It is safe doing so since our own interrupts will only be enabled
-	 * in a subsequent step.
+	 * TODO: don't treat core 0 specially, just prevent the final core
+	 * TODO: remap interrupt affinity temporarily
 	 */
-	local_save_flags(flags);
-	local_irq_enable();
-	rtlhal->fw_ready = false;
+	if (!cpu_data[dev->cpu].core && (index > STATE_NC_WAIT))
+		index = STATE_NC_WAIT;
 
-	rtlpriv->intf_ops->disable_aspm(hw);
-	rtstatus = _rtl8712e_init_mac(hw);
-	if (rtstatus != true) {
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_EMERG, "Init MAC failed\n");
-		err = 1;
-		goto exit;
+	/* Select the appropriate cps_pm_state */
+	switch (index) {
+	case STATE_NC_WAIT:
+		pm_state = CPS_PM_NC_WAIT;
+		break;
+	case STATE_CLOCK_GATED:
+		pm_state = CPS_PM_CLOCK_GATED;
+		break;
+	case STATE_POWER_GATED:
+		pm_state = CPS_PM_POWER_GATED;
+		break;
+	default:
+		BUG();
+		return -EINVAL;
 	}
 
-	err = rtl8723_download_fw(hw, false, FW_8723A_POLLING_TIMEOUT_COUNT);
-	if (err) {
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_WARNING,
-			 "Failed to download FW. Init HW without FW now..\n");
-		err = 1;
-		goto exit;
+	/* Notify listeners the CPU is about to power down */
+	if ((pm_state == CPS_PM_POWER_GATED) && cpu_pm_enter())
+		return -EINTR;
+
+	/* Enter that state */
+	err = cps_pm_enter_state(pm_state);
+
+	/* Notify listeners the CPU is back up */
+	if (pm_state == CPS_PM_POWER_GATED)
+		cpu_pm_exit();
+
+	return err ?: index;
+}
+
+static struct cpuidle_driver cps_driver = {
+	.name			= "cpc_cpuidle",
+	.owner			= THIS_MODULE,
+	.states = {
+		[STATE_WAIT] = MIPS_CPUIDLE_WAIT_STATE,
+		[STATE_NC_WAIT] = {
+			.enter	= cps_nc_enter,
+			.exit_latency		= 200,
+			.target_residency	= 450,
+			.name	= "nc-wait",
+			.desc	= "non-coherent MIPS wait",
+		},
+		[STATE_CLOCK_GATED] = {
+			.enter	= cps_nc_enter,
+			.exit_latency		= 300,
+			.target_residency	= 700,
+			.flags	= CPUIDLE_FLAG_TIMER_STOP,
+			.name	= "clock-gated",
+			.desc	= "core clock gated",
+		},
+		[STATE_POWER_GATED] = {
+			.enter	= cps_nc_enter,
+			.exit_latency		= 600,
+			.target_residency	= 1000,
+			.flags	= CPUIDLE_FLAG_TIMER_STOP,
+			.name	= "power-gated",
+			.desc	= "core power gated",
+		},
+	},
+	.state_count		= STATE_COUNT,
+	.safe_state_index	= 0,
+};
+
+static void __init cps_cpuidle_unregister(void)
+{
+	int cpu;
+	struct cpuidle_device *device;
+
+	for_each_possible_cpu(cpu) {
+		device = &per_cpu(cpuidle_dev, cpu);
+		cpuidle_unregister_device(device);
 	}
-	rtlhal->fw_ready = true;
 
-	rtlhal->last_hmeboxnum = 0;
-	rtl8723e_phy_mac_config(hw);
-	/* because last function modify RCR, so we update
-	 * rcr var here, or TP will unstable for receive_config
-	 * is wrong, RX RCR_ACRC32 will cause TP unstable & Rx
-	 * RCR_APP_ICV will cause mac80211 unassoc for cisco 1252
-	 */
-	rtlpci->receive_config = rtl_read_dword(rtlpriv, REG_RCR);
-	rtlpci->receive_config &= ~(RCR_ACRC32 | RCR_AICV);
-	rtl_write_dword(rtlpriv, REG_RCR, rtlpci->receive_config);
+	cpuidle_unregister_driver(&cps_driver);
+}
 
-	rtl8723e_phy_bb_config(hw);
-	rtlphy->rf_mode = RF_OP_BY_SW_3WIRE;
-	rtl8723e_phy_rf_config(hw);
-	if (IS_VENDOR_UMC_A_CUT(rtlhal->version)) {
-		rtl_set_rfreg(hw, RF90_PATH_A, RF_RX_G1, MASKDWORD, 0x30255);
-		rtl_set_rfreg(hw, RF90_PATH_A, RF_RX_G2, MASKDWORD, 0x50a00);
-	} else if (IS_81xxC_VENDOR_UMC_B_CUT(rtlhal->version)) {
-		rtl_set_rfreg(hw, RF90_PATH_A, 0x0C, MASKDWORD, 0x894AE);
-		rtl_set_rfreg(hw, RF90_PATH_A, 0x0A, MASKDWORD, 0x1AF31);
-		rtl_set_rfreg(hw, RF90_PATH_A, RF_IPA, MASKDWORD, 0x8F425);
-		rtl_set_rfreg(hw, RF90_PATH_A, RF_SYN_G2, MASKDWORD, 0x4F200);
-		rtl_set_rfreg(hw, RF90_PATH_A, RF_RCK1, MASKDWORD, 0x44053);
-		rtl_set_rfreg(hw, RF90_PATH_A, RF_RCK2, MASKDWORD, 0x80201);
-	}
-	rtlphy->rfreg_chnlval[0] = rtl_get_rfreg(hw, (enum radio_path)0,
-						 RF_CHNLBW, RFREG_OFFSET_MASK);
-	rtlphy->rfreg_chnlval[1] = rtl_get_rfreg(hw, (enum radio_path)1,
-						 RF_CHNLBW, RFREG_OFFSET_MASK);
-	rtl_set_bbreg(hw, RFPGA0_RFMOD, BCCKEN, 0x1);
-	rtl_set_bbreg(hw, RFPGA0_RFMOD, BOFDMEN, 0x1);
-	rtl_set_bbreg(hw, RFPGA0_ANALOGPARAMETER2, BIT(10), 1);
-	_rtl8723e_hw_configure(hw);
-	rtl_cam_reset_all_entry(hw);
-	rtl8723e_enable_hw_security_config(hw);
+static int __init cps_cpuidle_init(void)
+{
+	int err, cpu, core, i;
+	struct cpuidle_device *device;
 
-	ppsc->rfpwr_state = ERFON;
+	/* Detect supported states */
+	if (!cps_pm_support_state(CPS_PM_POWER_GATED))
+		cps_driver.state_count = STATE_CLOCK_GATED + 1;
+	if (!cps_pm_support_state(CPS_PM_CLOCK_GATED))
+		cps_driver.state_count = STATE_NC_WAIT + 1;
+	if (!cps_pm_support_state(CPS_PM_NC_WAIT))
+		cps_driver.state_count = STATE_WAIT + 1;
 
-	rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_ETHER_ADDR, mac->mac_addr);
-	_rtl8723e_enable_aspm_back_door(hw);
-	rtlpriv->intf_ops->enable_aspm(hw);
-
-	rtl8723e_bt_hw_init(hw);
-
-	if (ppsc->rfpwr_state == ERFON) {
-		rtl8723e_phy_set_rfpath_switch(hw, 1);
-		if (rtlphy->iqk_initialized) {
-			rtl8723e_phy_iq_calibrate(hw, true);
-		} else {
-			rtl8723e_phy_iq_calibrate(hw, false);
-			rtlphy->iqk_initialized = true;
+	/* Inform the user if some states are unavailable */
+	if (cps_driver.state_count < STATE_COUNT) {
+		pr_info("cpuidle-cps: limited to ");
+		switch (cps_driver.state_count - 1) {
+		case STATE_WAIT:
+			pr_cont("coherent wait\n");
+			break;
+		case STATE_NC_WAIT:
+			pr_cont("non-coherent wait\n");
+			break;
+		case STATE_CLOCK_GATED:
+			pr_cont("clock gating\n");
+			break;
 		}
-
-		rtl8723e_dm_check_txpower_tracking(hw);
-		rtl8723e_phy_lc_calibrate(hw);
 	}
 
-	tmp_u1b = efuse_read_1byte(hw, 0x1FA);
-	if (!(tmp_u1b & BIT(0))) {
-		rtl_set_rfreg(hw, RF90_PATH_A, 0x15, 0x0F, 0x05);
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE, "PA BIAS path A\n");
+	/*
+	 * Set the coupled flag on the appropriate states if this system
+	 * requires it.
+	 */
+	if (coupled_coherence)
+		for (i = STATE_NC_WAIT; i < cps_driver.state_count; i++)
+			cps_driver.states[i].flags |= CPUIDLE_FLAG_COUPLED;
+
+	err = cpuidle_register_driver(&cps_driver);
+	if (err) {
+		pr_err("Failed to register CPS cpuidle driver\n");
+		return err;
 	}
 
-	if (!(tmp_u1b & BIT(4))) {
-		tmp_u1b = rtl_read_byte(rtlpriv, 0x16);
-		tmp_u1b &= 0x0F;
-		rtl_write_byte(rtlpriv, 0x16, tmp_u1b | 0x80);
-		udelay(10);
-		rtl_write_byte(rtlpriv, 0x16, tmp_u1b | 0x90);
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE, "under 1.5V\n");
+	for_each_possible_cpu(cpu) {
+		core = cpu_data[cpu].core;
+		device = &per_cpu(cpuidle_dev, cpu);
+		device->cpu = cpu;
+#ifdef CONFIG_MIPS_MT
+		cpumask_copy(&device->coupled_cpus, &cpu_sibling_map[cpu]);
+#endif
+
+		err = cpuidle_register_device(device);
+		if (err) {
+			pr_err("Failed to register CPU%d cpuidle device\n",
+			       cpu);
+			goto err_out;
+		}
 	}
-	rtl8723e_dm_init(hw);
-exit:
-	local_irq_restore(flags);
-	rtlpriv->rtlhal.being_init_adapter = false;
+
+	return 0;
+err_out:
+	cps_cpuidle_unregister();
 	return err;
 }
+device_initcall(cps_cpuidle_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Copyright (c) 2011-2014 Samsung Electronics Co., Ltd.
+ *		http://www.samsung.com
+ *
+ * Coupled cpuidle support based on the work of:
+ *	Colin Cross <ccross@android.com>
+ *	Daniel Lezcano <daniel.lezcano@linaro.org>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+*/
 
-static enum version_8723e _rtl8723e_read_chip_version(struct ieee80211_hw *hw)
+#include <linux/cpuidle.h>
+#include <linux/cpu_pm.h>
+#include <linux/export.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/of.h>
+#include <linux/platform_data/cpuidle-exynos.h>
+
+#include <asm/suspend.h>
+#include <asm/cpuidle.h>
+
+static atomic_t exynos_idle_barrier;
+
+static struct cpuidle_exynos_data *exynos_cpuidle_pdata;
+static void (*exynos_enter_aftr)(void);
+
+static int exynos_enter_coupled_lowpower(struct cpuidle_device *dev,
+					 struct cpuidle_driver *drv,
+					 int index)
 {
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_phy *rtlphy = &(rtlpriv->phy);
-	enum version_8723e version = 0x0000;
-	u32 value32;
+	int ret;
 
-	value32 = rtl_read_dword(rtlpriv, REG_SYS_CFG);
-	if (value32 & TRP_VAUX_EN) {
-		version = (enum version_8723e)(version |
-			((value32 & VENDOR_ID) ? CHIP_VENDOR_UMC : 0));
-		/* RTL8723 with BT function. */
-		version = (enum version_8723e)(version |
-			((value32 & BT_FUNC) ? CHIP_8723 : 0));
+	exynos_cpuidle_pdata->pre_enter_aftr();
 
-	} else {
-		/* Normal mass production chip. */
-		version = (enum version_8723e) NORMAL_CHIP;
-		version = (enum version_8723e)(version |
-			((value32 & VENDOR_ID) ? CHIP_VENDOR_UMC : 0));
-		/* RTL8723 with BT function. */
-		version = (enum version_8723e)(version |
-			((value32 & BT_FUNC) ? CHIP_8723 : 0));
-		if (IS_CHIP_VENDOR_UMC(version))
-			version = (enum version_8723e)(version |
-			((value32 & CHIP_VER_RTL_MASK)));/* IC version (CUT) */
-		if (IS_8723_SERIES(version)) {
-			value32 = rtl_read_dword(rtlpriv, REG_GPIO_OUTSTS);
-			/* ROM code version. */
-			version = (enum version_8723e)(version |
-				((value32 & RF_RL_ID)>>20));
-		}
-	}
-
-	if (IS_8723_SERIES(version)) {
-		value32 = rtl_read_dword(rtlpriv, REG_MULTI_FUNC_CTRL);
-		rtlphy->polarity_ctl = ((value32 & WL_HWPDN_SL) ?
-					RT_POLARITY_HIGH_ACT :
-					RT_POLARITY_LOW_ACT);
-	}
-	switch (version) {
-	case VERSION_TEST_UMC_CHIP_8723:
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE,
-			 "Chip Version ID: VERSION_TEST_UMC_CHIP_8723.\n");
-			break;
-	case VERSION_NORMAL_UMC_CHIP_8723_1T1R_A_CUT:
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE,
-			 "Chip Version ID: VERSION_NORMAL_UMC_CHIP_8723_1T1R_A_CUT.\n");
-		break;
-	case VERSION_NORMAL_UMC_CHIP_8723_1T1R_B_CUT:
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE,
-			 "Chip Version ID: VERSION_NORMAL_UMC_CHIP_8723_1T1R_B_CUT.\n");
-		break;
-	default:
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_EMERG,
-			 "Chip Version ID: Unknown. Bug?\n");
-		break;
-	}
-
-	if (IS_8723_SERIES(version))
-		rtlphy->rf_type = RF_1T1R;
-
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD, "Chip RF Type: %s\n",
-		(rtlphy->rf_type == RF_2T2R) ? "RF_2T2R" : "RF_1T1R");
-
-	return version;
-}
-
-static int _rtl8723e_set_media_status(struct ieee80211_hw *hw,
-				      enum nl80211_iftype type)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	u8 bt_msr = rtl_read_byte(rtlpriv, MSR) & 0xfc;
-	enum led_ctl_mode ledaction = LED_CTL_NO_LINK;
-	u8 mode = MSR_NOLINK;
-
-	rtl_write_dword(rtlpriv, REG_BCN_CTRL, 0);
-	RT_TRACE(rtlpriv, COMP_BEACON, DBG_LOUD,
-		"clear 0x550 when set HW_VAR_MEDIA_STATUS\n");
-
-	switch (type) {
-	case NL80211_IFTYPE_UNSPECIFIED:
-		mode = MSR_NOLINK;
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE,
-			"Set Network type to NO LINK!\n");
-		break;
-	case NL80211_IFTYPE_ADHOC:
-		mode = MSR_ADHOC;
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE,
-			"Set Network type to Ad Hoc!\n");
-		break;
-	case NL80211_IFTYPE_STATION:
-		mode = MSR_INFRA;
-		ledaction = LED_CTL_LINK;
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE,
-			"Set Network type to STA!\n");
-		break;
-	case NL80211_IFTYPE_AP:
-		mode = MSR_AP;
-		ledaction = LED_CTL_LINK;
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_TRACE,
-			"Set Network type to AP!\n");
-		break;
-	default:
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_EMERG,
-			"Network type %d not support!\n", type);
-		return 1;
-		break;
-	}
-
-	/* MSR_INFRA == Link in infrastructure network;
-	 * MSR_ADHOC == Link in ad hoc network;
-	 * Therefore, check link state is necessary.
-	 *
-	 * MSR_AP == AP mode; link state is not cared here.
+	/*
+	 * Waiting all cpus to reach this point at the same moment
 	 */
-	if (mode != MSR_AP &&
-	    rtlpriv->mac80211.link_state < MAC80211_LINKED) {
-		mode = MSR_NOLINK;
-		ledaction = LED_CTL_NO_LINK;
-	}
-	if (mode == MSR_NOLINK || mode == MSR_INFRA) {
-		_rtl8723e_stop_tx_beacon(hw);
-		_rtl8723e_enable_bcn_sub_func(hw);
-	} else if (mode == MSR_ADHOC || mode == MSR_AP) {
-		_rtl8723e_resume_tx_beacon(hw);
-		_rtl8723e_disable_bcn_sub_func(hw);
+	cpuidle_coupled_parallel_barrier(dev, &exynos_idle_barrier);
+
+	/*
+	 * Both cpus will reach this point at the same time
+	 */
+	ret = dev->cpu ? exynos_cpuidle_pdata->cpu1_powerdown()
+		       : exynos_cpuidle_pdata->cpu0_enter_aftr();
+	if (ret)
+		index = ret;
+
+	/*
+	 * Waiting all cpus to finish the power sequence before going further
+	 */
+	cpuidle_coupled_parallel_barrier(dev, &exynos_idle_barrier);
+
+	exynos_cpuidle_pdata->post_enter_aftr();
+
+	return index;
+}
+
+static int exynos_enter_lowpower(struct cpuidle_device *dev,
+				struct cpuidle_driver *drv,
+				int index)
+{
+	int new_index = index;
+
+	/* AFTR can only be entered when cores other than CPU0 are offline */
+	if (num_online_cpus() > 1 || dev->cpu != 0)
+		new_index = drv->safe_state_index;
+
+	if (new_index == 0)
+		return arm_cpuidle_simple_enter(dev, drv, new_index);
+
+	exynos_enter_aftr();
+
+	return new_index;
+}
+
+static struct cpuidle_driver exynos_idle_driver = {
+	.name			= "exynos_idle",
+	.owner			= THIS_MODULE,
+	.states = {
+		[0] = ARM_CPUIDLE_WFI_STATE,
+		[1] = {
+			.enter			= exynos_enter_lowpower,
+			.exit_latency		= 300,
+			.target_residency	= 100000,
+			.name			= "C1",
+			.desc			= "ARM power down",
+		},
+	},
+	.state_count = 2,
+	.safe_state_index = 0,
+};
+
+static struct cpuidle_driver exynos_coupled_idle_driver = {
+	.name			= "exynos_coupled_idle",
+	.owner			= THIS_MODULE,
+	.states = {
+		[0] = ARM_CPUIDLE_WFI_STATE,
+		[1] = {
+			.enter			= exynos_enter_coupled_lowpower,
+			.exit_latency		= 5000,
+			.target_residency	= 10000,
+			.flags			= CPUIDLE_FLAG_COUPLED |
+						  CPUIDLE_FLAG_TIMER_STOP,
+			.name			= "C1",
+			.desc			= "ARM power down",
+		},
+	},
+	.state_count = 2,
+	.safe_state_index = 0,
+};
+
+static int exynos_cpuidle_probe(struct platform_device *pdev)
+{
+	int ret;
+
+	if (IS_ENABLED(CONFIG_SMP) &&
+	    of_machine_is_compatible("samsung,exynos4210")) {
+		exynos_cpuidle_pdata = pdev->dev.platform_data;
+
+		ret = cpuidle_register(&exynos_coupled_idle_driver,
+				       cpu_possible_mask);
 	} else {
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_WARNING,
-			 "Set HW_VAR_MEDIA_STATUS: No such media status(%x).\n",
-			 mode);
+		exynos_enter_aftr = (void *)(pdev->dev.platform_data);
+
+		ret = cpuidle_register(&exynos_idle_driver, NULL);
 	}
 
-	rtl_write_byte(rtlpriv, MSR, bt_msr | mode);
-	rtlpriv->cfg->ops->led_control(hw, ledaction);
-	if (mode == MSR_AP)
-		rtl_write_byte(rtlpriv, REG_BCNTCFG + 1, 0x00);
-	else
-		rtl_write_byte(rtlpriv, REG_BCNTCFG + 1, 0x66);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to register cpuidle driver\n");
+		return ret;
+	}
+
 	return 0;
 }
 
-void rtl8723e_set_check_bssid(struct ieee80211_hw *hw, bool check_bssid)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-	u32 reg_rcr = rtlpci->receive_config;
+static struct platform_driver exynos_cpuidle_driver = {
+	.probe	= exynos_cpuidle_probe,
+	.driver = {
+		.name = "exynos_cpuidle",
+	},
+};
 
-	if (rtlpriv->psc.rfpwr_state != ERFON)
-		return;
+module_platform_driver(exynos_cpuidle_driver);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * Copyright (c) 2014 Samsung Electronics Co., Ltd.
+ *		http://www.samsung.com
+ *
+ * CPUIDLE driver for exynos 64bit
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+*/
 
-	if (check_bssid) {
-		reg_rcr |= (RCR_CBSSID_DATA | RCR_CBSSID_BCN);
-		rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_RCR,
-					      (u8 *)(&reg_rcr));
-		_rtl8723e_set_bcn_ctrl_reg(hw, 0, BIT(4));
-	} else if (!check_bssid) {
-		reg_rcr &= (~(RCR_CBSSID_DATA | RCR_CBSSID_BCN));
-		_rtl8723e_set_bcn_ctrl_reg(hw, BIT(4), 0);
-		rtlpriv->cfg->ops->set_hw_reg(hw,
-			HW_VAR_RCR, (u8 *)(&reg_rcr));
-	}
-}
+#include <linux/cpuidle.h>
+#include <linux/cpu_pm.h>
+#include <linux/slab.h>
+#include <linux/io.h>
+#include <linux/suspend.h>
+#include <linux/cpu.h>
+#include <linux/reboot.h>
+#include <linux/of.h>
+#include <linux/psci.h>
+#include <linux/cpuidle_profiler.h>
 
-int rtl8723e_set_network_type(struct ieee80211_hw *hw,
-			      enum nl80211_iftype type)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
+#include <asm/tlbflush.h>
+#include <asm/cpuidle.h>
+#include <asm/topology.h>
 
-	if (_rtl8723e_set_media_status(hw, type))
-		return -EOPNOTSUPP;
+#include <soc/samsung/exynos-powermode.h>
 
-	if (rtlpriv->mac80211.link_state == MAC80211_LINKED) {
-		if (type != NL80211_IFTYPE_AP)
-			rtl8723e_set_check_bssid(hw, true);
-	} else {
-		rtl8723e_set_check_bssid(hw, false);
-	}
+#include "dt_idle_states.h"
 
-	return 0;
-}
-
-/* don't set REG_EDCA_BE_PARAM here
- * because mac80211 will send pkt when scan
+/*
+ * Exynos cpuidle driver supports the below idle states
+ *
+ * IDLE_C1 : WFI(Wait For Interrupt) low-power state
+ * IDLE_C2 : Local CPU power gating
  */
-void rtl8723e_set_qos(struct ieee80211_hw *hw, int aci)
+enum idle_states {
+	IDLE_C1 = 0,
+	IDLE_C2,
+	IDLE_STATE_MAX,
+};
+
+/***************************************************************************
+ *                           Cpuidle state handler                         *
+ ***************************************************************************/
+static unsigned int prepare_idle(unsigned int cpu, int index)
 {
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
+	unsigned int entry_state = 0;
 
-	rtl8723_dm_init_edca_turbo(hw);
-	switch (aci) {
-	case AC1_BK:
-		rtl_write_dword(rtlpriv, REG_EDCA_BK_PARAM, 0xa44f);
-		break;
-	case AC0_BE:
-		break;
-	case AC2_VI:
-		rtl_write_dword(rtlpriv, REG_EDCA_VI_PARAM, 0x5e4322);
-		break;
-	case AC3_VO:
-		rtl_write_dword(rtlpriv, REG_EDCA_VO_PARAM, 0x2f3222);
-		break;
-	default:
-		RT_ASSERT(false, "invalid aci: %d !\n", aci);
-		break;
-	}
-}
-
-void rtl8723e_enable_interrupt(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-
-	rtl_write_dword(rtlpriv, 0x3a8, rtlpci->irq_mask[0] & 0xFFFFFFFF);
-	rtl_write_dword(rtlpriv, 0x3ac, rtlpci->irq_mask[1] & 0xFFFFFFFF);
-	rtlpci->irq_enabled = true;
-}
-
-void rtl8723e_disable_interrupt(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-	rtl_write_dword(rtlpriv, 0x3a8, IMR8190_DISABLED);
-	rtl_write_dword(rtlpriv, 0x3ac, IMR8190_DISABLED);
-	rtlpci->irq_enabled = false;
-	/*synchronize_irq(rtlpci->pdev->irq);*/
-}
-
-static void _rtl8723e_poweroff_adapter(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
-	u8 u1b_tmp;
-
-	/* Combo (PCIe + USB) Card and PCIe-MF Card */
-	/* 1. Run LPS WL RFOFF flow */
-	rtl_hal_pwrseqcmdparsing(rtlpriv, PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK,
-				 PWR_INTF_PCI_MSK, Rtl8723_NIC_LPS_ENTER_FLOW);
-
-	/* 2. 0x1F[7:0] = 0 */
-	/* turn off RF */
-	rtl_write_byte(rtlpriv, REG_RF_CTRL, 0x00);
-	if ((rtl_read_byte(rtlpriv, REG_MCUFWDL) & BIT(7)) &&
-	    rtlhal->fw_ready) {
-		rtl8723ae_firmware_selfreset(hw);
+	if (index > 0) {
+		cpu_pm_enter();
+		entry_state = exynos_cpu_pm_enter(cpu, index);
 	}
 
-	/* Reset MCU. Suggested by Filen. */
-	u1b_tmp = rtl_read_byte(rtlpriv, REG_SYS_FUNC_EN+1);
-	rtl_write_byte(rtlpriv, REG_SYS_FUNC_EN+1, (u1b_tmp & (~BIT(2))));
+	cpuidle_profile_start(cpu, index, entry_state);
 
-	/* g.	MCUFWDL 0x80[1:0]=0	 */
-	/* reset MCU ready status */
-	rtl_write_byte(rtlpriv, REG_MCUFWDL, 0x00);
-
-	/* HW card disable configuration. */
-	rtl_hal_pwrseqcmdparsing(rtlpriv, PWR_CUT_ALL_MSK, PWR_FAB_ALL_MSK,
-		PWR_INTF_PCI_MSK, Rtl8723_NIC_DISABLE_FLOW);
-
-	/* Reset MCU IO Wrapper */
-	u1b_tmp = rtl_read_byte(rtlpriv, REG_RSV_CTRL + 1);
-	rtl_write_byte(rtlpriv, REG_RSV_CTRL + 1, (u1b_tmp & (~BIT(0))));
-	u1b_tmp = rtl_read_byte(rtlpriv, REG_RSV_CTRL + 1);
-	rtl_write_byte(rtlpriv, REG_RSV_CTRL + 1, u1b_tmp | BIT(0));
-
-	/* 7. RSV_CTRL 0x1C[7:0] = 0x0E */
-	/* lock ISO/CLK/Power control register */
-	rtl_write_byte(rtlpriv, REG_RSV_CTRL, 0x0e);
+	return entry_state;
 }
 
-void rtl8723e_card_disable(struct ieee80211_hw *hw)
+static void post_idle(unsigned int cpu, int index, int fail)
 {
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	enum nl80211_iftype opmode;
+	cpuidle_profile_finish(cpu, fail);
 
-	mac->link_state = MAC80211_NOLINK;
-	opmode = NL80211_IFTYPE_UNSPECIFIED;
-	_rtl8723e_set_media_status(hw, opmode);
-	if (rtlpriv->rtlhal.driver_is_goingto_unload ||
-	    ppsc->rfoff_reason > RF_CHANGE_BY_PS)
-		rtlpriv->cfg->ops->led_control(hw, LED_CTL_POWER_OFF);
-	RT_SET_PS_LEVEL(ppsc, RT_RF_OFF_LEVL_HALT_NIC);
-	_rtl8723e_poweroff_adapter(hw);
-
-	/* after power off we should do iqk again */
-	rtlpriv->phy.iqk_initialized = false;
-}
-
-void rtl8723e_interrupt_recognized(struct ieee80211_hw *hw,
-				   u32 *p_inta, u32 *p_intb)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-
-	*p_inta = rtl_read_dword(rtlpriv, 0x3a0) & rtlpci->irq_mask[0];
-	rtl_write_dword(rtlpriv, 0x3a0, *p_inta);
-}
-
-void rtl8723e_set_beacon_related_registers(struct ieee80211_hw *hw)
-{
-
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	u16 bcn_interval, atim_window;
-
-	bcn_interval = mac->beacon_interval;
-	atim_window = 2;	/*FIX MERGE */
-	rtl8723e_disable_interrupt(hw);
-	rtl_write_word(rtlpriv, REG_ATIMWND, atim_window);
-	rtl_write_word(rtlpriv, REG_BCN_INTERVAL, bcn_interval);
-	rtl_write_word(rtlpriv, REG_BCNTCFG, 0x660f);
-	rtl_write_byte(rtlpriv, REG_RXTSF_OFFSET_CCK, 0x18);
-	rtl_write_byte(rtlpriv, REG_RXTSF_OFFSET_OFDM, 0x18);
-	rtl_write_byte(rtlpriv, 0x606, 0x30);
-	rtl8723e_enable_interrupt(hw);
-}
-
-void rtl8723e_set_beacon_interval(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	u16 bcn_interval = mac->beacon_interval;
-
-	RT_TRACE(rtlpriv, COMP_BEACON, DBG_DMESG,
-		 "beacon_interval:%d\n", bcn_interval);
-	rtl8723e_disable_interrupt(hw);
-	rtl_write_word(rtlpriv, REG_BCN_INTERVAL, bcn_interval);
-	rtl8723e_enable_interrupt(hw);
-}
-
-void rtl8723e_update_interrupt_mask(struct ieee80211_hw *hw,
-				    u32 add_msr, u32 rm_msr)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
-
-	RT_TRACE(rtlpriv, COMP_INTR, DBG_LOUD,
-		 "add_msr:%x, rm_msr:%x\n", add_msr, rm_msr);
-
-	if (add_msr)
-		rtlpci->irq_mask[0] |= add_msr;
-	if (rm_msr)
-		rtlpci->irq_mask[0] &= (~rm_msr);
-	rtl8723e_disable_interrupt(hw);
-	rtl8723e_enable_interrupt(hw);
-}
-
-static u8 _rtl8723e_get_chnl_group(u8 chnl)
-{
-	u8 group;
-
-	if (chnl < 3)
-		group = 0;
-	else if (chnl < 9)
-		group = 1;
-	else
-		group = 2;
-	return group;
-}
-
-static void _rtl8723e_read_txpower_info_from_hwpg(struct ieee80211_hw *hw,
-						  bool autoload_fail,
-						  u8 *hwinfo)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_efuse *rtlefuse = rtl_efuse(rtl_priv(hw));
-	u8 rf_path, index, tempval;
-	u16 i;
-
-	for (rf_path = 0; rf_path < 1; rf_path++) {
-		for (i = 0; i < 3; i++) {
-			if (!autoload_fail) {
-				rtlefuse->eeprom_chnlarea_txpwr_cck[rf_path][i] =
-				    hwinfo[EEPROM_TXPOWERCCK + rf_path * 3 + i];
-				rtlefuse->eeprom_chnlarea_txpwr_ht40_1s[rf_path][i] =
-				    hwinfo[EEPROM_TXPOWERHT40_1S + rf_path * 3 + i];
-			} else {
-				rtlefuse->eeprom_chnlarea_txpwr_cck[rf_path][i] =
-				    EEPROM_DEFAULT_TXPOWERLEVEL;
-				rtlefuse->eeprom_chnlarea_txpwr_ht40_1s[rf_path][i] =
-				    EEPROM_DEFAULT_TXPOWERLEVEL;
-			}
-		}
-	}
-
-	for (i = 0; i < 3; i++) {
-		if (!autoload_fail)
-			tempval = hwinfo[EEPROM_TXPOWERHT40_2SDIFF + i];
-		else
-			tempval = EEPROM_DEFAULT_HT40_2SDIFF;
-		rtlefuse->eprom_chnl_txpwr_ht40_2sdf[RF90_PATH_A][i] =
-		    (tempval & 0xf);
-		rtlefuse->eprom_chnl_txpwr_ht40_2sdf[RF90_PATH_B][i] =
-		    ((tempval & 0xf0) >> 4);
-	}
-
-	for (rf_path = 0; rf_path < 2; rf_path++)
-		for (i = 0; i < 3; i++)
-			RTPRINT(rtlpriv, FINIT, INIT_EEPROM,
-				"RF(%d) EEPROM CCK Area(%d) = 0x%x\n", rf_path,
-				 i, rtlefuse->eeprom_chnlarea_txpwr_cck
-					[rf_path][i]);
-	for (rf_path = 0; rf_path < 2; rf_path++)
-		for (i = 0; i < 3; i++)
-			RTPRINT(rtlpriv, FINIT, INIT_EEPROM,
-				"RF(%d) EEPROM HT40 1S Area(%d) = 0x%x\n",
-				rf_path, i,
-				rtlefuse->eeprom_chnlarea_txpwr_ht40_1s
-					[rf_path][i]);
-	for (rf_path = 0; rf_path < 2; rf_path++)
-		for (i = 0; i < 3; i++)
-			RTPRINT(rtlpriv, FINIT, INIT_EEPROM,
-				"RF(%d) EEPROM HT40 2S Diff Area(%d) = 0x%x\n",
-				 rf_path, i,
-				 rtlefuse->eprom_chnl_txpwr_ht40_2sdf
-					[rf_path][i]);
-
-	for (rf_path = 0; rf_path < 2; rf_path++) {
-		for (i = 0; i < 14; i++) {
-			index = _rtl8723e_get_chnl_group((u8)i);
-
-			rtlefuse->txpwrlevel_cck[rf_path][i] =
-				rtlefuse->eeprom_chnlarea_txpwr_cck
-					[rf_path][index];
-			rtlefuse->txpwrlevel_ht40_1s[rf_path][i] =
-				rtlefuse->eeprom_chnlarea_txpwr_ht40_1s
-					[rf_path][index];
-
-			if ((rtlefuse->eeprom_chnlarea_txpwr_ht40_1s
-					[rf_path][index] -
-			     rtlefuse->eprom_chnl_txpwr_ht40_2sdf
-					[rf_path][index]) > 0) {
-				rtlefuse->txpwrlevel_ht40_2s[rf_path][i] =
-				  rtlefuse->eeprom_chnlarea_txpwr_ht40_1s
-				  [rf_path][index] -
-				  rtlefuse->eprom_chnl_txpwr_ht40_2sdf
-				  [rf_path][index];
-			} else {
-				rtlefuse->txpwrlevel_ht40_2s[rf_path][i] = 0;
-			}
-		}
-
-		for (i = 0; i < 14; i++) {
-			RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-				"RF(%d)-Ch(%d) [CCK / HT40_1S / HT40_2S] = [0x%x / 0x%x / 0x%x]\n",
-				rf_path, i,
-				rtlefuse->txpwrlevel_cck[rf_path][i],
-				rtlefuse->txpwrlevel_ht40_1s[rf_path][i],
-				rtlefuse->txpwrlevel_ht40_2s[rf_path][i]);
-		}
-	}
-
-	for (i = 0; i < 3; i++) {
-		if (!autoload_fail) {
-			rtlefuse->eeprom_pwrlimit_ht40[i] =
-			    hwinfo[EEPROM_TXPWR_GROUP + i];
-			rtlefuse->eeprom_pwrlimit_ht20[i] =
-			    hwinfo[EEPROM_TXPWR_GROUP + 3 + i];
-		} else {
-			rtlefuse->eeprom_pwrlimit_ht40[i] = 0;
-			rtlefuse->eeprom_pwrlimit_ht20[i] = 0;
-		}
-	}
-
-	for (rf_path = 0; rf_path < 2; rf_path++) {
-		for (i = 0; i < 14; i++) {
-			index = _rtl8723e_get_chnl_group((u8)i);
-
-			if (rf_path == RF90_PATH_A) {
-				rtlefuse->pwrgroup_ht20[rf_path][i] =
-				  (rtlefuse->eeprom_pwrlimit_ht20[index] & 0xf);
-				rtlefuse->pwrgroup_ht40[rf_path][i] =
-				  (rtlefuse->eeprom_pwrlimit_ht40[index] & 0xf);
-			} else if (rf_path == RF90_PATH_B) {
-				rtlefuse->pwrgroup_ht20[rf_path][i] =
-				  ((rtlefuse->eeprom_pwrlimit_ht20[index] &
-				   0xf0) >> 4);
-				rtlefuse->pwrgroup_ht40[rf_path][i] =
-				  ((rtlefuse->eeprom_pwrlimit_ht40[index] &
-				   0xf0) >> 4);
-			}
-
-			RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-				"RF-%d pwrgroup_ht20[%d] = 0x%x\n", rf_path, i,
-				rtlefuse->pwrgroup_ht20[rf_path][i]);
-			RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-				"RF-%d pwrgroup_ht40[%d] = 0x%x\n", rf_path, i,
-				rtlefuse->pwrgroup_ht40[rf_path][i]);
-		}
-	}
-
-	for (i = 0; i < 14; i++) {
-		index = _rtl8723e_get_chnl_group((u8)i);
-
-		if (!autoload_fail)
-			tempval = hwinfo[EEPROM_TXPOWERHT20DIFF + index];
-		else
-			tempval = EEPROM_DEFAULT_HT20_DIFF;
-
-		rtlefuse->txpwr_ht20diff[RF90_PATH_A][i] = (tempval & 0xF);
-		rtlefuse->txpwr_ht20diff[RF90_PATH_B][i] =
-		    ((tempval >> 4) & 0xF);
-
-		if (rtlefuse->txpwr_ht20diff[RF90_PATH_A][i] & BIT(3))
-			rtlefuse->txpwr_ht20diff[RF90_PATH_A][i] |= 0xF0;
-
-		if (rtlefuse->txpwr_ht20diff[RF90_PATH_B][i] & BIT(3))
-			rtlefuse->txpwr_ht20diff[RF90_PATH_B][i] |= 0xF0;
-
-		index = _rtl8723e_get_chnl_group((u8)i);
-
-		if (!autoload_fail)
-			tempval = hwinfo[EEPROM_TXPOWER_OFDMDIFF + index];
-		else
-			tempval = EEPROM_DEFAULT_LEGACYHTTXPOWERDIFF;
-
-		rtlefuse->txpwr_legacyhtdiff[RF90_PATH_A][i] = (tempval & 0xF);
-		rtlefuse->txpwr_legacyhtdiff[RF90_PATH_B][i] =
-		    ((tempval >> 4) & 0xF);
-	}
-
-	rtlefuse->legacy_ht_txpowerdiff =
-	    rtlefuse->txpwr_legacyhtdiff[RF90_PATH_A][7];
-
-	for (i = 0; i < 14; i++)
-		RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-			"RF-A Ht20 to HT40 Diff[%d] = 0x%x\n", i,
-			 rtlefuse->txpwr_ht20diff[RF90_PATH_A][i]);
-	for (i = 0; i < 14; i++)
-		RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-			"RF-A Legacy to Ht40 Diff[%d] = 0x%x\n", i,
-			 rtlefuse->txpwr_legacyhtdiff[RF90_PATH_A][i]);
-	for (i = 0; i < 14; i++)
-		RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-			"RF-B Ht20 to HT40 Diff[%d] = 0x%x\n", i,
-			 rtlefuse->txpwr_ht20diff[RF90_PATH_B][i]);
-	for (i = 0; i < 14; i++)
-		RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-			"RF-B Legacy to HT40 Diff[%d] = 0x%x\n", i,
-			 rtlefuse->txpwr_legacyhtdiff[RF90_PATH_B][i]);
-
-	if (!autoload_fail)
-		rtlefuse->eeprom_regulatory = (hwinfo[RF_OPTION1] & 0x7);
-	else
-		rtlefuse->eeprom_regulatory = 0;
-	RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-		"eeprom_regulatory = 0x%x\n", rtlefuse->eeprom_regulatory);
-
-	if (!autoload_fail)
-		rtlefuse->eeprom_tssi[RF90_PATH_A] = hwinfo[EEPROM_TSSI_A];
-	else
-		rtlefuse->eeprom_tssi[RF90_PATH_A] = EEPROM_DEFAULT_TSSI;
-
-	RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-		"TSSI_A = 0x%x, TSSI_B = 0x%x\n",
-		 rtlefuse->eeprom_tssi[RF90_PATH_A],
-		 rtlefuse->eeprom_tssi[RF90_PATH_B]);
-
-	if (!autoload_fail)
-		tempval = hwinfo[EEPROM_THERMAL_METER];
-	else
-		tempval = EEPROM_DEFAULT_THERMALMETER;
-	rtlefuse->eeprom_thermalmeter = (tempval & 0x1f);
-
-	if (rtlefuse->eeprom_thermalmeter == 0x1f || autoload_fail)
-		rtlefuse->apk_thermalmeterignore = true;
-
-	rtlefuse->thermalmeter[0] = rtlefuse->eeprom_thermalmeter;
-	RTPRINT(rtlpriv, FINIT, INIT_TXPOWER,
-		"thermalmeter = 0x%x\n", rtlefuse->eeprom_thermalmeter);
-}
-
-static void _rtl8723e_read_adapter_info(struct ieee80211_hw *hw,
-					bool b_pseudo_test)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_efuse *rtlefuse = rtl_efuse(rtl_priv(hw));
-	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
-	u16 i, usvalue;
-	u8 hwinfo[HWSET_MAX_SIZE];
-	u16 eeprom_id;
-
-	if (b_pseudo_test) {
-		/* need add */
-		return;
-	}
-	if (rtlefuse->epromtype == EEPROM_BOOT_EFUSE) {
-		rtl_efuse_shadow_map_update(hw);
-
-		memcpy(hwinfo, &rtlefuse->efuse_map[EFUSE_INIT_MAP][0],
-		       HWSET_MAX_SIZE);
-	} else if (rtlefuse->epromtype == EEPROM_93C46) {
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_EMERG,
-			 "RTL819X Not boot from eeprom, check it !!");
-	}
-
-	RT_PRINT_DATA(rtlpriv, COMP_INIT, DBG_DMESG, "MAP\n",
-		      hwinfo, HWSET_MAX_SIZE);
-
-	eeprom_id = *((u16 *)&hwinfo[0]);
-	if (eeprom_id != RTL8190_EEPROM_ID) {
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_WARNING,
-			 "EEPROM ID(%#x) is invalid!!\n", eeprom_id);
-		rtlefuse->autoload_failflag = true;
-	} else {
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD, "Autoload OK\n");
-		rtlefuse->autoload_failflag = false;
-	}
-
-	if (rtlefuse->autoload_failflag)
+	if (!index)
 		return;
 
-	rtlefuse->eeprom_vid = *(u16 *)&hwinfo[EEPROM_VID];
-	rtlefuse->eeprom_did = *(u16 *)&hwinfo[EEPROM_DID];
-	rtlefuse->eeprom_svid = *(u16 *)&hwinfo[EEPROM_SVID];
-	rtlefuse->eeprom_smid = *(u16 *)&hwinfo[EEPROM_SMID];
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD,
-		 "EEPROMId = 0x%4x\n", eeprom_id);
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD,
-		 "EEPROM VID = 0x%4x\n", rtlefuse->eeprom_vid);
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD,
-		 "EEPROM DID = 0x%4x\n", rtlefuse->eeprom_did);
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD,
-		 "EEPROM SVID = 0x%4x\n", rtlefuse->eeprom_svid);
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD,
-		 "EEPROM SMID = 0x%4x\n", rtlefuse->eeprom_smid);
+	exynos_cpu_pm_exit(cpu, fail);
+	cpu_pm_exit();
+}
 
-	for (i = 0; i < 6; i += 2) {
-		usvalue = *(u16 *)&hwinfo[EEPROM_MAC_ADDR + i];
-		*((u16 *)(&rtlefuse->dev_addr[i])) = usvalue;
+static int enter_idle(unsigned int index)
+{
+	/*
+	 * idle state index 0 corresponds to wfi, should never be called
+	 * from the cpu_suspend operations
+	 */
+	if (!index) {
+		cpu_do_idle();
+		return 0;
 	}
 
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_DMESG,
-		 "dev_addr: %pM\n", rtlefuse->dev_addr);
+	return arm_cpuidle_suspend(index);
+}
 
-	_rtl8723e_read_txpower_info_from_hwpg(hw, rtlefuse->autoload_failflag,
-					      hwinfo);
+static int exynos_enter_idle(struct cpuidle_device *dev,
+				struct cpuidle_driver *drv, int index)
+{
+	int entry_state, ret = 0;
 
-	rtl8723e_read_bt_coexist_info_from_hwpg(hw,
-			rtlefuse->autoload_failflag, hwinfo);
+	entry_state = prepare_idle(dev->cpu, index);
 
-	rtlefuse->eeprom_channelplan = hwinfo[EEPROM_CHANNELPLAN];
-	rtlefuse->eeprom_version = *(u16 *)&hwinfo[EEPROM_VERSION];
-	rtlefuse->txpwr_fromeprom = true;
-	rtlefuse->eeprom_oemid = hwinfo[EEPROM_CUSTOMER_ID];
+	ret = enter_idle(entry_state);
 
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD,
-		 "EEPROM Customer ID: 0x%2x\n", rtlefuse->eeprom_oemid);
+	post_idle(dev->cpu, index, ret);
 
-	/* set channel paln to world wide 13 */
-	rtlefuse->channel_plan = COUNTRY_CODE_WORLD_WIDE_13;
+	/*
+	 * If cpu fail to enter idle, it should not update state usage
+	 * count. Driver have to return an error value to
+	 * cpuidle_enter_state().
+	 */
+	if (ret < 0)
+		return ret;
+	else
+		return index;
+}
 
-	if (rtlhal->oem_id == RT_CID_DEFAULT) {
-		switch (rtlefuse->eeprom_oemid) {
-		case EEPROM_CID_DEFAULT:
-			if (rtlefuse->eeprom_did == 0x8176) {
-				if (CHK_SVID_SMID(0x10EC, 0x6151) ||
-				    CHK_SVID_SMID(0x10EC, 0x6152) ||
-				    CHK_SVID_SMID(0x10EC, 0x6154) ||
-				    CHK_SVID_SMID(0x10EC, 0x6155) ||
-				    CHK_SVID_SMID(0x10EC, 0x6177) ||
-				    CHK_SVID_SMID(0x10EC, 0x6178) ||
-				    CHK_SVID_SMID(0x10EC, 0x6179) ||
-				    CHK_SVID_SMID(0x10EC, 0x6180) ||
-				    CHK_SVID_SMID(0x10EC, 0x7151) ||
-				    CHK_SVID_SMID(0x10EC, 0x7152) ||
-				    CHK_SVID_SMID(0x10EC, 0x7154) ||
-				    CHK_SVID_SMID(0x10EC, 0x7155) ||
-				    CHK_SVID_SMID(0x10EC, 0x7177) ||
-				    CHK_SVID_SMID(0x10EC, 0x7178) ||
-				    CHK_SVID_SMID(0x10EC, 0x7179) ||
-				    CHK_SVID_SMID(0x10EC, 0x7180) ||
-				    CHK_SVID_SMID(0x10EC, 0x8151) ||
-				    CHK_SVID_SMID(0x10EC, 0x8152) ||
-				    CHK_SVID_SMID(0x10EC, 0x8154) ||
-				    CHK_SVID_SMID(0x10EC, 0x8155) ||
-				    CHK_SVID_SMID(0x10EC, 0x8181) ||
-				    CHK_SVID_SMID(0x10EC, 0x8182) ||
-				    CHK_SVID_SMID(0x10EC, 0x8184) ||
-				    CHK_SVID_SMID(0x10EC, 0x8185) ||
-				    CHK_SVID_SMID(0x10EC, 0x9151) ||
-				    CHK_SVID_SMID(0x10EC, 0x9152) ||
-				    CHK_SVID_SMID(0x10EC, 0x9154) ||
-				    CHK_SVID_SMID(0x10EC, 0x9155) ||
-				    CHK_SVID_SMID(0x10EC, 0x9181) ||
-				    CHK_SVID_SMID(0x10EC, 0x9182) ||
-				    CHK_SVID_SMID(0x10EC, 0x9184) ||
-				    CHK_SVID_SMID(0x10EC, 0x9185))
-					rtlhal->oem_id = RT_CID_TOSHIBA;
-				else if (rtlefuse->eeprom_svid == 0x1025)
-					rtlhal->oem_id = RT_CID_819X_ACER;
-				else if (CHK_SVID_SMID(0x10EC, 0x6191) ||
-					 CHK_SVID_SMID(0x10EC, 0x6192) ||
-					 CHK_SVID_SMID(0x10EC, 0x6193) ||
-					 CHK_SVID_SMID(0x10EC, 0x7191) ||
-					 CHK_SVID_SMID(0x10EC, 0x7192) ||
-					 CHK_SVID_SMID(0x10EC, 0x7193) ||
-					 CHK_SVID_SMID(0x10EC, 0x8191) ||
-					 CHK_SVID_SMID(0x10EC, 0x8192) ||
-					 CHK_SVID_SMID(0x10EC, 0x8193) ||
-					 CHK_SVID_SMID(0x10EC, 0x9191) ||
-					 CHK_SVID_SMID(0x10EC, 0x9192) ||
-					 CHK_SVID_SMID(0x10EC, 0x9193))
-					rtlhal->oem_id = RT_CID_819X_SAMSUNG;
-				else if (CHK_SVID_SMID(0x10EC, 0x8195) ||
-					 CHK_SVID_SMID(0x10EC, 0x9195) ||
-					 CHK_SVID_SMID(0x10EC, 0x7194) ||
-					 CHK_SVID_SMID(0x10EC, 0x8200) ||
-					 CHK_SVID_SMID(0x10EC, 0x8201) ||
-					 CHK_SVID_SMID(0x10EC, 0x8202) ||
-					 CHK_SVID_SMID(0x10EC, 0x9200))
-					rtlhal->oem_id = RT_CID_819X_LENOVO;
-				else if (CHK_SVID_SMID(0x10EC, 0x8197) ||
-					 CHK_SVID_SMID(0x10EC, 0x9196))
-					rtlhal->oem_id = RT_CID_819X_CLEVO;
-				else if (CHK_SVID_SMID(0x1028, 0x8194) ||
-					 CHK_SVID_SMID(0x1028, 0x8198) ||
-					 CHK_SVID_SMID(0x1028, 0x9197) ||
-					 CHK_SVID_SMID(0x1028, 0x9198))
-					rtlhal->oem_id = RT_CID_819X_DELL;
-				else if (CHK_SVID_SMID(0x103C, 0x1629))
-					rtlhal->oem_id = RT_CID_819X_HP;
-				else if (CHK_SVID_SMID(0x1A32, 0x2315))
-					rtlhal->oem_id = RT_CID_819X_QMI;
-				else if (CHK_SVID_SMID(0x10EC, 0x8203))
-					rtlhal->oem_id = RT_CID_819X_PRONETS;
-				else if (CHK_SVID_SMID(0x1043, 0x84B5))
-					rtlhal->oem_id =
-						 RT_CID_819X_EDIMAX_ASUS;
-				else
-					rtlhal->oem_id = RT_CID_DEFAULT;
-			} else if (rtlefuse->eeprom_did == 0x8178) {
-				if (CHK_SVID_SMID(0x10EC, 0x6181) ||
-				    CHK_SVID_SMID(0x10EC, 0x6182) ||
-				    CHK_SVID_SMID(0x10EC, 0x6184) ||
-				    CHK_SVID_SMID(0x10EC, 0x6185) ||
-				    CHK_SVID_SMID(0x10EC, 0x7181) ||
-				    CHK_SVID_SMID(0x10EC, 0x7182) ||
-				    CHK_SVID_SMID(0x10EC, 0x7184) ||
-				    CHK_SVID_SMID(0x10EC, 0x7185) ||
-				    CHK_SVID_SMID(0x10EC, 0x8181) ||
-				    CHK_SVID_SMID(0x10EC, 0x8182) ||
-				    CHK_SVID_SMID(0x10EC, 0x8184) ||
-				    CHK_SVID_SMID(0x10EC, 0x8185) ||
-				    CHK_SVID_SMID(0x10EC, 0x9181) ||
-				    CHK_SVID_SMID(0x10EC, 0x9182) ||
-				    CHK_SVID_SMID(0x10EC, 0x9184) ||
-				    CHK_SVID_SMID(0x10EC, 0x9185))
-					rtlhal->oem_id = RT_CID_TOSHIBA;
-				else if (rtlefuse->eeprom_svid == 0x1025)
-					rtlhal->oem_id = RT_CID_819X_ACER;
-				else if (CHK_SVID_SMID(0x10EC, 0x8186))
-					rtlhal->oem_id = RT_CID_819X_PRONETS;
-				else if (CHK_SVID_SMID(0x1043, 0x8486))
-					rtlhal->oem_id =
-						     RT_CID_819X_EDIMAX_ASUS;
-				else
-					rtlhal->oem_id = RT_CID_DEFAULT;
-			} else {
-				rtlhal->oem_id = RT_CID_DEFAULT;
-			}
+/***************************************************************************
+ *                            Define notifier call                         *
+ ***************************************************************************/
+static int exynos_cpuidle_reboot_notifier(struct notifier_block *this,
+				unsigned long event, void *_cmd)
+{
+	switch (event) {
+	case SYSTEM_POWER_OFF:
+	case SYS_RESTART:
+		cpuidle_pause();
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block exynos_cpuidle_reboot_nb = {
+	.notifier_call = exynos_cpuidle_reboot_notifier,
+};
+
+/***************************************************************************
+ *                         Initialize cpuidle driver                       *
+ ***************************************************************************/
+#define exynos_idle_wfi_state(state)					\
+	do {								\
+		state.enter = exynos_enter_idle;			\
+		state.exit_latency = 1;					\
+		state.target_residency = 1;				\
+		state.power_usage = UINT_MAX;				\
+		strncpy(state.name, "WFI", CPUIDLE_NAME_LEN - 1);	\
+		strncpy(state.desc, "c1", CPUIDLE_DESC_LEN - 1);	\
+	} while (0)
+
+static struct cpuidle_driver exynos_idle_driver[NR_CPUS];
+
+static const struct of_device_id exynos_idle_state_match[] __initconst = {
+	{ .compatible = "exynos,idle-state",
+	  .data = exynos_enter_idle },
+	{ },
+};
+
+static int __init exynos_idle_driver_init(struct cpuidle_driver *drv,
+					   struct cpumask* cpumask)
+{
+	int cpu = cpumask_first(cpumask);
+
+	drv->name = kzalloc(sizeof("exynos_idleX"), GFP_KERNEL);
+	if (!drv->name)
+		return -ENOMEM;
+
+	scnprintf((char *)drv->name, 12, "exynos_idle%d", cpu);
+	drv->owner = THIS_MODULE;
+	drv->cpumask = cpumask;
+	exynos_idle_wfi_state(drv->states[0]);
+
+	return 0;
+}
+
+static int __init exynos_idle_init(void)
+{
+	int ret, cpu, i;
+
+	for_each_possible_cpu(cpu) {
+		ret = exynos_idle_driver_init(&exynos_idle_driver[cpu],
+					      topology_sibling_cpumask(cpu));
+
+		if (ret) {
+			pr_err("failed to initialize cpuidle driver for cpu%d",
+					cpu);
+			goto out_unregister;
+		}
+
+		/*
+		 * Initialize idle states data, starting at index 1.
+		 * This driver is DT only, if no DT idle states are detected
+		 * (ret == 0) let the driver initialization fail accordingly
+		 * since there is no reason to initialize the idle driver
+		 * if only wfi is supported.
+		 */
+		ret = dt_init_idle_driver(&exynos_idle_driver[cpu],
+					exynos_idle_state_match, 1);
+		if (ret < 0) {
+			pr_err("failed to initialize idle state for cpu%d\n", cpu);
+			goto out_unregister;
+		}
+
+		/*
+		 * Call arch CPU operations in order to initialize
+		 * idle states suspend back-end specific data
+		 */
+		ret = arm_cpuidle_init(cpu);
+		if (ret) {
+			pr_err("failed to initialize idle operation for cpu%d\n", cpu);
+			goto out_unregister;
+		}
+
+		ret = cpuidle_register(&exynos_idle_driver[cpu], NULL);
+		if (ret) {
+			pr_err("failed to register cpuidle for cpu%d\n", cpu);
+			goto out_unregister;
+		}
+	}
+
+	register_reboot_notifier(&exynos_cpuidle_reboot_nb);
+
+	cpuidle_profile_register(&exynos_idle_driver[0]);
+
+	pr_info("Exynos cpuidle driver Initialized\n");
+
+	return 0;
+
+out_unregister:
+	for (i = 0; i <= cpu; i++) {
+		if (exynos_idle_driver[i].name)
+			kfree(exynos_idle_driver[i].name);
+
+		/*
+		 * Cpuidle driver of variable "cpu" is always not registered.
+		 * "cpu" should not call cpuidle_unregister().
+		 */
+		if (i < cpu)
+			cpuidle_unregister(&exynos_idle_driver[i]);
+	}
+
+	return ret;
+}
+device_initcall(exynos_idle_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * CPU idle Marvell Kirkwood SoCs
+ *
+ * This file is licensed under the terms of the GNU General Public
+ * License version 2.  This program is licensed "as is" without any
+ * warranty of any kind, whether express or implied.
+ *
+ * The cpu idle uses wait-for-interrupt and DDR self refresh in order
+ * to implement two idle states -
+ * #1 wait-for-interrupt
+ * #2 wait-for-interrupt and DDR self refresh
+ *
+ * Maintainer: Jason Cooper <jason@lakedaemon.net>
+ * Maintainer: Andrew Lunn <andrew@lunn.ch>
+ */
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/platform_device.h>
+#include <linux/cpuidle.h>
+#include <linux/io.h>
+#include <linux/export.h>
+#include <asm/cpuidle.h>
+
+#define KIRKWOOD_MAX_STATES	2
+
+static void __iomem *ddr_operation_base;
+
+/* Actual code that puts the SoC in different idle states */
+static int kirkwood_enter_idle(struct cpuidle_device *dev,
+			       struct cpuidle_driver *drv,
+			       int index)
+{
+	writel(0x7, ddr_operation_base);
+	cpu_do_idle();
+
+	return index;
+}
+
+static struct cpuidle_driver kirkwood_idle_driver = {
+	.name			= "kirkwood_idle",
+	.owner			= THIS_MODULE,
+	.states[0]		= ARM_CPUIDLE_WFI_STATE,
+	.states[1]		= {
+		.enter			= kirkwood_enter_idle,
+		.exit_latency		= 10,
+		.target_residency	= 100000,
+		.name			= "DDR SR",
+		.desc			= "WFI and DDR Self Refresh",
+	},
+	.state_count = KIRKWOOD_MAX_STATES,
+};
+
+/* Initialize CPU idle by registering the idle states */
+static int kirkwood_cpuidle_probe(struct platform_device *pdev)
+{
+	struct resource *res;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	ddr_operation_base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(ddr_operation_base))
+		return PTR_ERR(ddr_operation_base);
+
+	return cpuidle_register(&kirkwood_idle_driver, NULL);
+}
+
+static int kirkwood_cpuidle_remove(struct platform_device *pdev)
+{
+	cpuidle_unregister(&kirkwood_idle_driver);
+	return 0;
+}
+
+static struct platform_driver kirkwood_cpuidle_driver = {
+	.probe = kirkwood_cpuidle_probe,
+	.remove = kirkwood_cpuidle_remove,
+	.driver = {
+		   .name = "kirkwood_cpuidle",
+		   },
+};
+
+module_platform_driver(kirkwood_cpuidle_driver);
+
+MODULE_AUTHOR("Andrew Lunn <andrew@lunn.ch>");
+MODULE_DESCRIPTION("Kirkwood cpu idle driver");
+MODULE_LICENSE("GPL v2");
+MODULE_ALIAS("platform:kirkwood-cpuidle");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+ * Marvell Armada 370, 38x and XP SoC cpuidle driver
+ *
+ * Copyright (C) 2014 Marvell
+ *
+ * Nadav Haklai <nadavh@marvell.com>
+ * Gregory CLEMENT <gregory.clement@free-electrons.com>
+ *
+ * This file is licensed under the terms of the GNU General Public
+ * License version 2.  This program is licensed "as is" without any
+ * warranty of any kind, whether express or implied.
+ *
+ * Maintainer: Gregory CLEMENT <gregory.clement@free-electrons.com>
+ */
+
+#include <linux/cpu_pm.h>
+#include <linux/cpuidle.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/suspend.h>
+#include <linux/platform_device.h>
+#include <asm/cpuidle.h>
+
+#define MVEBU_V7_FLAG_DEEP_IDLE	0x10000
+
+static int (*mvebu_v7_cpu_suspend)(int);
+
+static int mvebu_v7_enter_idle(struct cpuidle_device *dev,
+				struct cpuidle_driver *drv,
+				int index)
+{
+	int ret;
+	bool deepidle = false;
+	cpu_pm_enter();
+
+	if (drv->states[index].flags & MVEBU_V7_FLAG_DEEP_IDLE)
+		deepidle = true;
+
+	ret = mvebu_v7_cpu_suspend(deepidle);
+	cpu_pm_exit();
+
+	if (ret)
+		return ret;
+
+	return index;
+}
+
+static struct cpuidle_driver armadaxp_idle_driver = {
+	.name			= "armada_xp_idle",
+	.states[0]		= ARM_CPUIDLE_WFI_STATE,
+	.states[1]		= {
+		.enter			= mvebu_v7_enter_idle,
+		.exit_latency		= 100,
+		.power_usage		= 50,
+		.target_residency	= 1000,
+		.name			= "MV CPU IDLE",
+		.desc			= "CPU power down",
+	},
+	.states[2]		= {
+		.enter			= mvebu_v7_enter_idle,
+		.exit_latency		= 1000,
+		.power_usage		= 5,
+		.target_residency	= 10000,
+		.flags			= MVEBU_V7_FLAG_DEEP_IDLE,
+		.name			= "MV CPU DEEP IDLE",
+		.desc			= "CPU and L2 Fabric power down",
+	},
+	.state_count = 3,
+};
+
+static struct cpuidle_driver armada370_idle_driver = {
+	.name			= "armada_370_idle",
+	.states[0]		= ARM_CPUIDLE_WFI_STATE,
+	.states[1]		= {
+		.enter			= mvebu_v7_enter_idle,
+		.exit_latency		= 100,
+		.power_usage		= 5,
+		.target_residency	= 1000,
+		.flags			= MVEBU_V7_FLAG_DEEP_IDLE,
+		.name			= "Deep Idle",
+		.desc			= "CPU and L2 Fabric power down",
+	},
+	.state_count = 2,
+};
+
+static struct cpuidle_driver armada38x_idle_driver = {
+	.name			= "armada_38x_idle",
+	.states[0]		= ARM_CPUIDLE_WFI_STATE,
+	.states[1]		= {
+		.enter			= mvebu_v7_enter_idle,
+		.exit_latency		= 10,
+		.power_usage		= 5,
+		.target_residency	= 100,
+		.name			= "Idle",
+		.desc			= "CPU and SCU power down",
+	},
+	.state_count = 2,
+};
+
+static int mvebu_v7_cpuidle_probe(struct platform_device *pdev)
+{
+	const struct platform_device_id *id = pdev->id_entry;
+
+	if (!id)
+		return -EINVAL;
+
+	mvebu_v7_cpu_suspend = pdev->dev.platform_data;
+
+	return cpuidle_register((struct cpuidle_driver *)id->driver_data, NULL);
+}
+
+static const struct platform_device_id mvebu_cpuidle_ids[] = {
+	{
+		.name = "cpuidle-armada-xp",
+		.driver_data = (unsigned long)&armadaxp_idle_driver,
+	}, {
+		.name = "cpuidle-armada-370",
+		.driver_data = (unsigned long)&armada370_idle_driver,
+	}, {
+		.name = "cpuidle-armada-38x",
+		.driver_data = (unsigned long)&armada38x_idle_driver,
+	},
+	{}
+};
+
+static struct platform_driver mvebu_cpuidle_driver = {
+	.probe = mvebu_v7_cpuidle_probe,
+	.driver = {
+		.name = "cpuidle-mbevu",
+		.suppress_bind_attrs = true,
+	},
+	.id_table = mvebu_cpuidle_ids,
+};
+
+builtin_platform_driver(mvebu_cpuidle_driver);
+
+MODULE_AUTHOR("Gregory CLEMENT <gregory.clement@free-electrons.com>");
+MODULE_DESCRIPTION("Marvell EBU v7 cpuidle driver");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ *  cpuidle-powernv - idle state cpuidle driver.
+ *  Adapted from drivers/cpuidle/cpuidle-pseries
+ *
+ */
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/moduleparam.h>
+#include <linux/cpuidle.h>
+#include <linux/cpu.h>
+#include <linux/notifier.h>
+#include <linux/clockchips.h>
+#include <linux/of.h>
+#include <linux/slab.h>
+
+#include <asm/machdep.h>
+#include <asm/firmware.h>
+#include <asm/opal.h>
+#include <asm/runlatch.h>
+
+#define MAX_POWERNV_IDLE_STATES	8
+
+struct cpuidle_driver powernv_idle_driver = {
+	.name             = "powernv_idle",
+	.owner            = THIS_MODULE,
+};
+
+static int max_idle_state;
+static struct cpuidle_state *cpuidle_state_table;
+static u64 default_snooze_timeout;
+static bool snooze_timeout_en;
+
+static u64 get_snooze_timeout(struct cpuidle_device *dev,
+			      struct cpuidle_driver *drv,
+			      int index)
+{
+	int i;
+
+	if (unlikely(!snooze_timeout_en))
+		return default_snooze_timeout;
+
+	for (i = index + 1; i < drv->state_count; i++) {
+		struct cpuidle_state *s = &drv->states[i];
+		struct cpuidle_state_usage *su = &dev->states_usage[i];
+
+		if (s->disabled || su->disable)
+			continue;
+
+		return s->target_residency * tb_ticks_per_usec;
+	}
+
+	return default_snooze_timeout;
+}
+
+static int snooze_loop(struct cpuidle_device *dev,
+			struct cpuidle_driver *drv,
+			int index)
+{
+	u64 snooze_exit_time;
+
+	local_irq_enable();
+	set_thread_flag(TIF_POLLING_NRFLAG);
+
+	snooze_exit_time = get_tb() + get_snooze_timeout(dev, drv, index);
+	ppc64_runlatch_off();
+	while (!need_resched()) {
+		HMT_low();
+		HMT_very_low();
+		if (snooze_timeout_en && get_tb() > snooze_exit_time)
 			break;
-		case EEPROM_CID_TOSHIBA:
-			rtlhal->oem_id = RT_CID_TOSHIBA;
+	}
+
+	HMT_medium();
+	ppc64_runlatch_on();
+	clear_thread_flag(TIF_POLLING_NRFLAG);
+	smp_mb();
+	return index;
+}
+
+static int nap_loop(struct cpuidle_device *dev,
+			struct cpuidle_driver *drv,
+			int index)
+{
+	ppc64_runlatch_off();
+	power7_idle();
+	ppc64_runlatch_on();
+	return index;
+}
+
+/* Register for fastsleep only in oneshot mode of broadcast */
+#ifdef CONFIG_TICK_ONESHOT
+static int fastsleep_loop(struct cpuidle_device *dev,
+				struct cpuidle_driver *drv,
+				int index)
+{
+	unsigned long old_lpcr = mfspr(SPRN_LPCR);
+	unsigned long new_lpcr;
+
+	if (unlikely(system_state < SYSTEM_RUNNING))
+		return index;
+
+	new_lpcr = old_lpcr;
+	/* Do not exit powersave upon decrementer as we've setup the timer
+	 * offload.
+	 */
+	new_lpcr &= ~LPCR_PECE1;
+
+	mtspr(SPRN_LPCR, new_lpcr);
+	power7_sleep();
+
+	mtspr(SPRN_LPCR, old_lpcr);
+
+	return index;
+}
+#endif
+/*
+ * States for dedicated partition case.
+ */
+static struct cpuidle_state powernv_states[MAX_POWERNV_IDLE_STATES] = {
+	{ /* Snooze */
+		.name = "snooze",
+		.desc = "snooze",
+		.exit_latency = 0,
+		.target_residency = 0,
+		.enter = &snooze_loop },
+};
+
+static int powernv_cpuidle_add_cpu_notifier(struct notifier_block *n,
+			unsigned long action, void *hcpu)
+{
+	int hotcpu = (unsigned long)hcpu;
+	struct cpuidle_device *dev =
+				per_cpu(cpuidle_devices, hotcpu);
+
+	if (dev && cpuidle_get_driver()) {
+		switch (action) {
+		case CPU_ONLINE:
+		case CPU_ONLINE_FROZEN:
+			cpuidle_pause_and_lock();
+			cpuidle_enable_device(dev);
+			cpuidle_resume_and_unlock();
 			break;
-		case EEPROM_CID_CCX:
-			rtlhal->oem_id = RT_CID_CCX;
+
+		case CPU_DEAD:
+		case CPU_DEAD_FROZEN:
+			cpuidle_pause_and_lock();
+			cpuidle_disable_device(dev);
+			cpuidle_resume_and_unlock();
 			break;
-		case EEPROM_CID_QMI:
-			rtlhal->oem_id = RT_CID_819X_QMI;
-			break;
-		case EEPROM_CID_WHQL:
-				break;
+
 		default:
-			rtlhal->oem_id = RT_CID_DEFAULT;
-			break;
-
+			return NOTIFY_DONE;
 		}
 	}
+	return NOTIFY_OK;
 }
 
-static void _rtl8723e_hal_customized_behavior(struct ieee80211_hw *hw)
+static struct notifier_block setup_hotplug_notifier = {
+	.notifier_call = powernv_cpuidle_add_cpu_notifier,
+};
+
+/*
+ * powernv_cpuidle_driver_init()
+ */
+static int powernv_cpuidle_driver_init(void)
 {
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_pci_priv *pcipriv = rtl_pcipriv(hw);
-	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
+	int idle_state;
+	struct cpuidle_driver *drv = &powernv_idle_driver;
 
-	pcipriv->ledctl.led_opendrain = true;
-	switch (rtlhal->oem_id) {
-	case RT_CID_819X_HP:
-		pcipriv->ledctl.led_opendrain = true;
-		break;
-	case RT_CID_819X_LENOVO:
-	case RT_CID_DEFAULT:
-	case RT_CID_TOSHIBA:
-	case RT_CID_CCX:
-	case RT_CID_819X_ACER:
-	case RT_CID_WHQL:
-	default:
-		break;
-	}
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_DMESG,
-		 "RT Customized ID: 0x%02X\n", rtlhal->oem_id);
-}
+	drv->state_count = 0;
 
-void rtl8723e_read_eeprom_info(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_efuse *rtlefuse = rtl_efuse(rtl_priv(hw));
-	struct rtl_phy *rtlphy = &(rtlpriv->phy);
-	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
-	u8 tmp_u1b;
-	u32 value32;
+	for (idle_state = 0; idle_state < max_idle_state; ++idle_state) {
+		/* Is the state not enabled? */
+		if (cpuidle_state_table[idle_state].enter == NULL)
+			continue;
 
-	value32 = rtl_read_dword(rtlpriv, rtlpriv->cfg->maps[EFUSE_TEST]);
-	value32 = (value32 & ~EFUSE_SEL_MASK) | EFUSE_SEL(EFUSE_WIFI_SEL_0);
-	rtl_write_dword(rtlpriv, rtlpriv->cfg->maps[EFUSE_TEST], value32);
+		drv->states[drv->state_count] =	/* structure copy */
+			cpuidle_state_table[idle_state];
 
-	rtlhal->version = _rtl8723e_read_chip_version(hw);
-
-	if (get_rf_type(rtlphy) == RF_1T1R)
-		rtlpriv->dm.rfpath_rxenable[0] = true;
-	else
-		rtlpriv->dm.rfpath_rxenable[0] =
-		    rtlpriv->dm.rfpath_rxenable[1] = true;
-	RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD, "VersionID = 0x%4x\n",
-						rtlhal->version);
-
-	tmp_u1b = rtl_read_byte(rtlpriv, REG_9346CR);
-	if (tmp_u1b & BIT(4)) {
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_DMESG, "Boot from EEPROM\n");
-		rtlefuse->epromtype = EEPROM_93C46;
-	} else {
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_DMESG, "Boot from EFUSE\n");
-		rtlefuse->epromtype = EEPROM_BOOT_EFUSE;
-	}
-	if (tmp_u1b & BIT(5)) {
-		RT_TRACE(rtlpriv, COMP_INIT, DBG_LOUD, "Autoload OK\n");
-		rtlefuse->autoload_failflag = false;
-		_rtl8723e_read_adapter_info(hw, false);
-	} else {
-		rtlefuse->autoload_failflag = true;
-		_rtl8723e_read_adapter_info(hw, false);
-		RT_TRACE(rtlpriv, COMP_ERR, DBG_EMERG, "Autoload ERR!!\n");
-	}
-	_rtl8723e_hal_customized_behavior(hw);
-}
-
-static void rtl8723e_update_hal_rate_table(struct ieee80211_hw *hw,
-					   struct ieee80211_sta *sta)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_phy *rtlphy = &(rtlpriv->phy);
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
-	u32 ratr_value;
-	u8 ratr_index = 0;
-	u8 b_nmode = mac->ht_enable;
-	u16 shortgi_rate;
-	u32 tmp_ratr_value;
-	u8 curtxbw_40mhz = mac->bw_40;
-	u8 curshortgi_40mhz = (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_40) ?
-				1 : 0;
-	u8 curshortgi_20mhz = (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_20) ?
-				1 : 0;
-	enum wireless_mode wirelessmode = mac->mode;
-	u32 ratr_mask;
-
-	if (rtlhal->current_bandtype == BAND_ON_5G)
-		ratr_value = sta->supp_rates[1] << 4;
-	else
-		ratr_value = sta->supp_rates[0];
-	if (mac->opmode == NL80211_IFTYPE_ADHOC)
-		ratr_value = 0xfff;
-	ratr_value |= (sta->ht_cap.mcs.rx_mask[1] << 20 |
-			sta->ht_cap.mcs.rx_mask[0] << 12);
-	switch (wirelessmode) {
-	case WIRELESS_MODE_B:
-		if (ratr_value & 0x0000000c)
-			ratr_value &= 0x0000000d;
-		else
-			ratr_value &= 0x0000000f;
-		break;
-	case WIRELESS_MODE_G:
-		ratr_value &= 0x00000FF5;
-		break;
-	case WIRELESS_MODE_N_24G:
-	case WIRELESS_MODE_N_5G:
-		b_nmode = 1;
-		if (get_rf_type(rtlphy) == RF_1T2R ||
-		    get_rf_type(rtlphy) == RF_1T1R)
-			ratr_mask = 0x000ff005;
-		else
-			ratr_mask = 0x0f0ff005;
-
-		ratr_value &= ratr_mask;
-		break;
-	default:
-		if (rtlphy->rf_type == RF_1T2R)
-			ratr_value &= 0x000ff0ff;
-		else
-			ratr_value &= 0x0f0ff0ff;
-
-		break;
+		drv->state_count += 1;
 	}
 
-	if ((rtlpriv->btcoexist.bt_coexistence) &&
-	    (rtlpriv->btcoexist.bt_coexist_type == BT_CSR_BC4) &&
-	    (rtlpriv->btcoexist.bt_cur_state) &&
-	    (rtlpriv->btcoexist.bt_ant_isolation) &&
-	    ((rtlpriv->btcoexist.bt_service == BT_SCO) ||
-	    (rtlpriv->btcoexist.bt_service == BT_BUSY)))
-		ratr_value &= 0x0fffcfc0;
-	else
-		ratr_value &= 0x0FFFFFFF;
+	/*
+	 * On the PowerNV platform cpu_present may be less than cpu_possible in
+	 * cases when firmware detects the CPU, but it is not available to the
+	 * OS.  If CONFIG_HOTPLUG_CPU=n, then such CPUs are not hotplugable at
+	 * run time and hence cpu_devices are not created for those CPUs by the
+	 * generic topology_init().
+	 *
+	 * drv->cpumask defaults to cpu_possible_mask in
+	 * __cpuidle_driver_init().  This breaks cpuidle on PowerNV where
+	 * cpu_devices are not created for CPUs in cpu_possible_mask that
+	 * cannot be hot-added later at run time.
+	 *
+	 * Trying cpuidle_register_device() on a CPU without a cpu_device is
+	 * incorrect, so pass a correct CPU mask to the generic cpuidle driver.
+	 */
 
-	if (b_nmode &&
-	    ((curtxbw_40mhz && curshortgi_40mhz) ||
-	     (!curtxbw_40mhz && curshortgi_20mhz))) {
-		ratr_value |= 0x10000000;
-		tmp_ratr_value = (ratr_value >> 12);
+	drv->cpumask = (struct cpumask *)cpu_present_mask;
 
-		for (shortgi_rate = 15; shortgi_rate > 0; shortgi_rate--) {
-			if ((1 << shortgi_rate) & tmp_ratr_value)
-				break;
-		}
+	return 0;
+}
 
-		shortgi_rate = (shortgi_rate << 12) | (shortgi_rate << 8) |
-		    (shortgi_rate << 4) | (shortgi_rate);
+static int powernv_add_idle_states(void)
+{
+	struct device_node *power_mgt;
+	int nr_idle_states = 1; /* Snooze */
+	int dt_idle_states;
+	u32 *latency_ns, *residency_ns, *flags;
+	int i, rc;
+
+	/* Currently we have snooze statically defined */
+
+	power_mgt = of_find_node_by_path("/ibm,opal/power-mgt");
+	if (!power_mgt) {
+		pr_warn("opal: PowerMgmt Node not found\n");
+		goto out;
 	}
 
-	rtl_write_dword(rtlpriv, REG_ARFR0 + ratr_index * 4, ratr_value);
-
-	RT_TRACE(rtlpriv, COMP_RATR, DBG_DMESG,
-		 "%x\n", rtl_read_dword(rtlpriv, REG_ARFR0));
-}
-
-static void rtl8723e_update_hal_rate_mask(struct ieee80211_hw *hw,
-					  struct ieee80211_sta *sta,
-					  u8 rssi_level)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_phy *rtlphy = &(rtlpriv->phy);
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
-	struct rtl_sta_info *sta_entry = NULL;
-	u32 ratr_bitmap;
-	u8 ratr_index;
-	u8 curtxbw_40mhz = (sta->ht_cap.cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40)
-				? 1 : 0;
-	u8 curshortgi_40mhz = (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_40) ?
-				1 : 0;
-	u8 curshortgi_20mhz = (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_20) ?
-				1 : 0;
-	enum wireless_mode wirelessmode = 0;
-	bool shortgi = false;
-	u8 rate_mask[5];
-	u8 macid = 0;
-	/*u8 mimo_ps = IEEE80211_SMPS_OFF;*/
-
-	sta_entry = (struct rtl_sta_info *)sta->drv_priv;
-	wirelessmode = sta_entry->wireless_mode;
-	if (mac->opmode == NL80211_IFTYPE_STATION)
-		curtxbw_40mhz = mac->bw_40;
-	else if (mac->opmode == NL80211_IFTYPE_AP ||
-		mac->opmode == NL80211_IFTYPE_ADHOC)
-		macid = sta->aid + 1;
-
-	if (rtlhal->current_bandtype == BAND_ON_5G)
-		ratr_bitmap = sta->supp_rates[1] << 4;
-	else
-		ratr_bitmap = sta->supp_rates[0];
-	if (mac->opmode == NL80211_IFTYPE_ADHOC)
-		ratr_bitmap = 0xfff;
-	ratr_bitmap |= (sta->ht_cap.mcs.rx_mask[1] << 20 |
-			sta->ht_cap.mcs.rx_mask[0] << 12);
-	switch (wirelessmode) {
-	case WIRELESS_MODE_B:
-		ratr_index = RATR_INX_WIRELESS_B;
-		if (ratr_bitmap & 0x0000000c)
-			ratr_bitmap &= 0x0000000d;
-		else
-			ratr_bitmap &= 0x0000000f;
-		break;
-	case WIRELESS_MODE_G:
-		ratr_index = RATR_INX_WIRELESS_GB;
-
-		if (rssi_level == 1)
-			ratr_bitmap &= 0x00000f00;
-		else if (rssi_level == 2)
-			ratr_bitmap &= 0x00000ff0;
-		else
-			ratr_bitmap &= 0x00000ff5;
-		break;
-	case WIRELESS_MODE_A:
-		ratr_index = RATR_INX_WIRELESS_G;
-		ratr_bitmap &= 0x00000ff0;
-		break;
-	case WIRELESS_MODE_N_24G:
-	case WIRELESS_MODE_N_5G:
-		ratr_index = RATR_INX_WIRELESS_NGB;
-		if (rtlphy->rf_type == RF_1T2R ||
-		    rtlphy->rf_type == RF_1T1R) {
-			if (curtxbw_40mhz) {
-				if (rssi_level == 1)
-					ratr_bitmap &= 0x000f0000;
-				else if (rssi_level == 2)
-					ratr_bitmap &= 0x000ff000;
-				else
-					ratr_bitmap &= 0x000ff015;
-			} else {
-				if (rssi_level == 1)
-					ratr_bitmap &= 0x000f0000;
-				else if (rssi_level == 2)
-					ratr_bitmap &= 0x000ff000;
-				else
-					ratr_bitmap &= 0x000ff005;
-			}
-		} else {
-			if (curtxbw_40mhz) {
-				if (rssi_level == 1)
-					ratr_bitmap &= 0x0f0f0000;
-				else if (rssi_level == 2)
-					ratr_bitmap &= 0x0f0ff000;
-				else
-					ratr_bitmap &= 0x0f0ff015;
-			} else {
-				if (rssi_level == 1)
-					ratr_bitmap &= 0x0f0f0000;
-				else if (rssi_level == 2)
-					ratr_bitmap &= 0x0f0ff000;
-				else
-					ratr_bitmap &= 0x0f0ff005;
-			}
-		}
-
-		if ((curtxbw_40mhz && curshortgi_40mhz) ||
-		    (!curtxbw_40mhz && curshortgi_20mhz)) {
-			if (macid == 0)
-				shortgi = true;
-			else if (macid == 1)
-				shortgi = false;
-		}
-		break;
-	default:
-		ratr_index = RATR_INX_WIRELESS_NGB;
-
-		if (rtlphy->rf_type == RF_1T2R)
-			ratr_bitmap &= 0x000ff0ff;
-		else
-			ratr_bitmap &= 0x0f0ff0ff;
-		break;
-	}
-	sta_entry->ratr_index = ratr_index;
-
-	RT_TRACE(rtlpriv, COMP_RATR, DBG_DMESG,
-		 "ratr_bitmap :%x\n", ratr_bitmap);
-	*(u32 *)&rate_mask = (ratr_bitmap & 0x0fffffff) |
-			     (ratr_index << 28);
-	rate_mask[4] = macid | (shortgi ? 0x20 : 0x00) | 0x80;
-	RT_TRACE(rtlpriv, COMP_RATR, DBG_DMESG,
-		 "Rate_index:%x, ratr_val:%x, %x:%x:%x:%x:%x\n",
-		  ratr_index, ratr_bitmap,
-		  rate_mask[0], rate_mask[1],
-		  rate_mask[2], rate_mask[3],
-		  rate_mask[4]);
-	rtl8723e_fill_h2c_cmd(hw, H2C_RA_MASK, 5, rate_mask);
-}
-
-void rtl8723e_update_hal_rate_tbl(struct ieee80211_hw *hw,
-				  struct ieee80211_sta *sta, u8 rssi_level)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-
-	if (rtlpriv->dm.useramask)
-		rtl8723e_update_hal_rate_mask(hw, sta, rssi_level);
-	else
-		rtl8723e_update_hal_rate_table(hw, sta);
-}
-
-void rtl8723e_update_channel_access_setting(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	u16 sifs_timer;
-
-	rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_SLOT_TIME, &mac->slot_time);
-	if (!mac->ht_enable)
-		sifs_timer = 0x0a0a;
-	else
-		sifs_timer = 0x1010;
-	rtlpriv->cfg->ops->set_hw_reg(hw, HW_VAR_SIFS, (u8 *)&sifs_timer);
-}
-
-bool rtl8723e_gpio_radio_on_off_checking(struct ieee80211_hw *hw, u8 *valid)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_ps_ctl *ppsc = rtl_psc(rtl_priv(hw));
-	struct rtl_phy *rtlphy = &(rtlpriv->phy);
-	enum rf_pwrstate e_rfpowerstate_toset, cur_rfstate;
-	u8 u1tmp;
-	bool b_actuallyset = false;
-
-	if (rtlpriv->rtlhal.being_init_adapter)
-		return false;
-
-	if (ppsc->swrf_processing)
-		return false;
-
-	spin_lock(&rtlpriv->locks.rf_ps_lock);
-	if (ppsc->rfchange_inprogress) {
-		spin_unlock(&rtlpriv->locks.rf_ps_lock);
-		return false;
-	} else {
-		ppsc->rfchange_inprogress = true;
-		spin_unlock(&rtlpriv->locks.rf_ps_lock);
-	}
-
-	cur_rfstate = ppsc->rfpwr_state;
-
-	rtl_write_byte(rtlpriv, REG_GPIO_IO_SEL_2,
-		       rtl_read_byte(rtlpriv, REG_GPIO_IO_SEL_2)&~(BIT(1)));
-
-	u1tmp = rtl_read_byte(rtlpriv, REG_GPIO_PIN_CTRL_2);
-
-	if (rtlphy->polarity_ctl)
-		e_rfpowerstate_toset = (u1tmp & BIT(1)) ? ERFOFF : ERFON;
-	else
-		e_rfpowerstate_toset = (u1tmp & BIT(1)) ? ERFON : ERFOFF;
-
-	if (ppsc->hwradiooff && (e_rfpowerstate_toset == ERFON)) {
-		RT_TRACE(rtlpriv, COMP_RF, DBG_DMESG,
-			 "GPIOChangeRF  - HW Radio ON, RF ON\n");
-
-		e_rfpowerstate_toset = ERFON;
-		ppsc->hwradiooff = false;
-		b_actuallyset = true;
-	} else if (!ppsc->hwradiooff && (e_rfpowerstate_toset == ERFOFF)) {
-		RT_TRACE(rtlpriv, COMP_RF, DBG_DMESG,
-			 "GPIOChangeRF  - HW Radio OFF, RF OFF\n");
-
-		e_rfpowerstate_toset = ERFOFF;
-		ppsc->hwradiooff = true;
-		b_actuallyset = true;
-	}
-
-	if (b_actuallyset) {
-		spin_lock(&rtlpriv->locks.rf_ps_lock);
-		ppsc->rfchange_inprogress = false;
-		spin_unlock(&rtlpriv->locks.rf_ps_lock);
-	} else {
-		if (ppsc->reg_rfps_level & RT_RF_OFF_LEVL_HALT_NIC)
-			RT_SET_PS_LEVEL(ppsc, RT_RF_OFF_LEVL_HALT_NIC);
-
-		spin_lock(&rtlpriv->locks.rf_ps_lock);
-		ppsc->rfchange_inprogress = false;
-		spin_unlock(&rtlpriv->locks.rf_ps_lock);
-	}
-
-	*valid = 1;
-	return !ppsc->hwradiooff;
-
-}
-
-void rtl8723e_set_key(struct ieee80211_hw *hw, u32 key_index,
-		      u8 *p_macaddr, bool is_group, u8 enc_algo,
-		      bool is_wepkey, bool clear_all)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
-	struct rtl_efuse *rtlefuse = rtl_efuse(rtl_priv(hw));
-	u8 *macaddr = p_macaddr;
-	u32 entry_id = 0;
-	bool is_pairwise = false;
-
-	static u8 cam_const_addr[4][6] = {
-		{0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-		{0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
-		{0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
-		{0x00, 0x00, 0x00, 0x00, 0x00, 0x03}
-	};
-	static u8 cam_const_broad[] = {
-		0xff, 0xff, 0xff, 0xff, 0xff, 0xff
-	};
-
-	if (clear_all) {
-		u8 idx = 0;
-		u8 cam_offset = 0;
-		u8 clear_number = 5;
-
-		RT_TRACE(rtlpriv, COMP_SEC, DBG_DMESG, "clear_all\n");
-
-		for (idx = 0; idx < clear_number; idx++) {
-			rtl_cam_mark_invalid(hw, cam_offset + idx);
-			rtl_cam_empty_entry(hw, cam_offset + idx);
-
-			if (idx < 5) {
-				memset(rtlpriv->sec.key_buf[idx], 0,
-				       MAX_KEY_LEN);
-				rtlpriv->sec.key_len[idx] = 0;
-			}
-		}
-
-	} else {
-		switch (enc_algo) {
-		case WEP40_ENCRYPTION:
-			enc_algo = CAM_WEP40;
-			break;
-		case WEP104_ENCRYPTION:
-			enc_algo = CAM_WEP104;
-			break;
-		case TKIP_ENCRYPTION:
-			enc_algo = CAM_TKIP;
-			break;
-		case AESCCMP_ENCRYPTION:
-			enc_algo = CAM_AES;
-			break;
-		default:
-			RT_TRACE(rtlpriv, COMP_ERR, DBG_LOUD,
-				 "switch case not process\n");
-			enc_algo = CAM_TKIP;
-			break;
-		}
-
-		if (is_wepkey || rtlpriv->sec.use_defaultkey) {
-			macaddr = cam_const_addr[key_index];
-			entry_id = key_index;
-		} else {
-			if (is_group) {
-				macaddr = cam_const_broad;
-				entry_id = key_index;
-			} else {
-				if (mac->opmode == NL80211_IFTYPE_AP) {
-					entry_id =
-					  rtl_cam_get_free_entry(hw, p_macaddr);
-					if (entry_id >=  TOTAL_CAM_ENTRY) {
-						RT_TRACE(rtlpriv, COMP_SEC,
-							 DBG_EMERG,
-							 "Can not find free hw security cam entry\n");
-						return;
-					}
-				} else {
-					entry_id = CAM_PAIRWISE_KEY_POSITION;
-				}
-
-				key_index = PAIRWISE_KEYIDX;
-				is_pairwise = true;
-			}
-		}
-
-		if (rtlpriv->sec.key_len[key_index] == 0) {
-			RT_TRACE(rtlpriv, COMP_SEC, DBG_DMESG,
-				 "delete one entry, entry_id is %d\n",
-				 entry_id);
-			if (mac->opmode == NL80211_IFTYPE_AP)
-				rtl_cam_del_entry(hw, p_macaddr);
-			rtl_cam_delete_one_entry(hw, p_macaddr, entry_id);
-		} else {
-			RT_TRACE(rtlpriv, COMP_SEC, DBG_DMESG,
-				 "add one entry\n");
-			if (is_pairwise) {
-				RT_TRACE(rtlpriv, COMP_SEC, DBG_DMESG,
-					 "set Pairwiase key\n");
-
-				rtl_cam_add_one_entry(hw, macaddr, key_index,
-						      entry_id, enc_algo,
-						      CAM_CONFIG_NO_USEDK,
-						      rtlpriv->sec.key_buf[key_index]);
-			} else {
-				RT_TRACE(rtlpriv, COMP_SEC, DBG_DMESG,
-					 "set group key\n");
-
-				if (mac->opmode == NL80211_IFTYPE_ADHOC) {
-					rtl_cam_add_one_entry(hw,
-							rtlefuse->dev_addr,
-							PAIRWISE_KEYIDX,
-							CAM_PAIRWISE_KEY_POSITION,
-							enc_algo,
-							CAM_CONFIG_NO_USEDK,
-							rtlpriv->sec.key_buf
-							[entry_id]);
-				}
-
-				rtl_cam_add_one_entry(hw, macaddr, key_index,
-						entry_id, enc_algo,
-						CAM_CONFIG_NO_USEDK,
-						rtlpriv->sec.key_buf[entry_id]);
-			}
-
-		}
-	}
-}
-
-static void rtl8723e_bt_var_init(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-
-	rtlpriv->btcoexist.bt_coexistence =
-		rtlpriv->btcoexist.eeprom_bt_coexist;
-	rtlpriv->btcoexist.bt_ant_num =
-		rtlpriv->btcoexist.eeprom_bt_ant_num;
-	rtlpriv->btcoexist.bt_coexist_type =
-		rtlpriv->btcoexist.eeprom_bt_type;
-
-	rtlpriv->btcoexist.bt_ant_isolation =
-		rtlpriv->btcoexist.eeprom_bt_ant_isol;
-
-	rtlpriv->btcoexist.bt_radio_shared_type =
-		rtlpriv->btcoexist.eeprom_bt_radio_shared;
-
-	RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-		 "BT Coexistance = 0x%x\n",
-		 rtlpriv->btcoexist.bt_coexistence);
-
-	if (rtlpriv->btcoexist.bt_coexistence) {
-		rtlpriv->btcoexist.bt_busy_traffic = false;
-		rtlpriv->btcoexist.bt_traffic_mode_set = false;
-		rtlpriv->btcoexist.bt_non_traffic_mode_set = false;
-
-		rtlpriv->btcoexist.cstate = 0;
-		rtlpriv->btcoexist.previous_state = 0;
-
-		if (rtlpriv->btcoexist.bt_ant_num == ANT_X2) {
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_Ant_Num = Antx2\n");
-		} else if (rtlpriv->btcoexist.bt_ant_num == ANT_X1) {
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_Ant_Num = Antx1\n");
-		}
-		switch (rtlpriv->btcoexist.bt_coexist_type) {
-		case BT_2WIRE:
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_CoexistType = BT_2Wire\n");
-			break;
-		case BT_ISSC_3WIRE:
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_CoexistType = BT_ISSC_3Wire\n");
-			break;
-		case BT_ACCEL:
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_CoexistType = BT_ACCEL\n");
-			break;
-		case BT_CSR_BC4:
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_CoexistType = BT_CSR_BC4\n");
-			break;
-		case BT_CSR_BC8:
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_CoexistType = BT_CSR_BC8\n");
-			break;
-		case BT_RTL8756:
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_CoexistType = BT_RTL8756\n");
-			break;
-		default:
-			RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-				 "BlueTooth BT_CoexistType = Unknown\n");
-			break;
-		}
-		RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-			 "BlueTooth BT_Ant_isolation = %d\n",
-			 rtlpriv->btcoexist.bt_ant_isolation);
-		RT_TRACE(rtlpriv, COMP_BT_COEXIST, DBG_TRACE,
-			 "BT_RadioSharedType = 0x%x\n",
-			 rtlpriv->btcoexist.bt_radio_shared_type);
-		rtlpriv->btcoexist.bt_active_zero_cnt = 0;
-		rtlpriv->btcoexist.cur_bt_disabled = false;
-		rtlpriv->btcoexist.pre_bt_disabled = false;
-	}
-}
-
-void rtl8723e_read_bt_coexist_info_from_hwpg(struct ieee80211_hw *hw,
-					     bool auto_load_fail, u8 *hwinfo)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-	u8 value;
-	u32 tmpu_32;
-
-	if (!auto_load_fail) {
-		tmpu_32 = rtl_read_dword(rtlpriv, REG_MULTI_FUNC_CTRL);
-		if (tmpu_32 & BIT(18))
-			rtlpriv->btcoexist.eeprom_bt_coexist = 1;
-		else
-			rtlpriv->btcoexist.eeprom_bt_coexist = 0;
-		value = hwinfo[RF_OPTION4];
-		rtlpriv->btcoexist.eeprom_bt_type = BT_RTL8723A;
-		rtlpriv->btcoexist.eeprom_bt_ant_num = (value & 0x1);
-		rtlpriv->btcoexist.eeprom_bt_ant_isol = ((value & 0x10) >> 4);
-		rtlpriv->btcoexist.eeprom_bt_radio_shared =
-		  ((value & 0x20) >> 5);
-	} else {
-		rtlpriv->btcoexist.eeprom_bt_coexist = 0;
-		rtlpriv->btcoexist.eeprom_bt_type = BT_RTL8723A;
-		rtlpriv->btcoexist.eeprom_bt_ant_num = ANT_X2;
-		rtlpriv->btcoexist.eeprom_bt_ant_isol = 0;
-		rtlpriv->btcoexist.eeprom_bt_radio_shared = BT_RADIO_SHARED;
-	}
-
-	rtl8723e_bt_var_init(hw);
-}
-
-void rtl8723e_bt_reg_init(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-
-	/* 0:Low, 1:High, 2:From Efuse. */
-	rtlpriv->btcoexist.reg_bt_iso = 2;
-	/* 0:Idle, 1:None-SCO, 2:SCO, 3:From Counter. */
-	rtlpriv->btcoexist.reg_bt_sco = 3;
-	/* 0:Disable BT control A-MPDU, 1:Enable BT control A-MPDU. */
-	rtlpriv->btcoexist.reg_bt_sco = 0;
-}
-
-void rtl8723e_bt_hw_init(struct ieee80211_hw *hw)
-{
-	struct rtl_priv *rtlpriv = rtl_priv(hw);
-
-	if (rtlpriv->cfg->ops->get_btc_status())
-		rtlpriv->btcoexist.btc_ops->btc_init_hw_config(rtlpriv);
-}
-
-void rtl8723e_suspend(struct ieee80211_hw *hw)
-{
-}
-
-void rtl8723e_resume(struct ieee80211_hw *hw)
-{
-}
+	/* Read values of any property to determine the num of idle states */
+	dt_idle_states = of_property_count_u32_elems(power_mgt, "ibm,cpu-idle-state-flags");
+	if (dt_idle_states < 0) {
+		pr_warn("cpuidle-powernv

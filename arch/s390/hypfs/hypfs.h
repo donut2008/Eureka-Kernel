@@ -1,76 +1,63 @@
-/*
- *    Hypervisor filesystem for Linux on s390.
+/* a.out coredump register dumper
  *
- *    Copyright IBM Corp. 2006
- *    Author(s): Michael Holzheu <holzheu@de.ibm.com>
+ * Copyright (C) 2007 Red Hat, Inc. All Rights Reserved.
+ * Written by David Howells (dhowells@redhat.com)
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public Licence
+ * as published by the Free Software Foundation; either version
+ * 2 of the Licence, or (at your option) any later version.
  */
 
-#ifndef _HYPFS_H_
-#define _HYPFS_H_
+#ifndef _ASM_A_OUT_CORE_H
+#define _ASM_A_OUT_CORE_H
 
-#include <linux/fs.h>
-#include <linux/types.h>
-#include <linux/debugfs.h>
-#include <linux/workqueue.h>
-#include <linux/kref.h>
-#include <asm/hypfs.h>
+#ifdef __KERNEL__
 
-#define REG_FILE_MODE    0440
-#define UPDATE_FILE_MODE 0220
-#define DIR_MODE         0550
+#include <linux/user.h>
+#include <linux/elfcore.h>
 
-extern struct dentry *hypfs_mkdir(struct dentry *parent, const char *name);
+/*
+ * fill in the user structure for an a.out core dump
+ */
+static inline void aout_dump_thread(struct pt_regs *regs, struct user *dump)
+{
+	struct switch_stack *sw;
 
-extern struct dentry *hypfs_create_u64(struct dentry *dir, const char *name,
-				       __u64 value);
+/* changed the size calculations - should hopefully work better. lbt */
+	dump->magic = CMAGIC;
+	dump->start_code = 0;
+	dump->start_stack = rdusp() & ~(PAGE_SIZE - 1);
+	dump->u_tsize = ((unsigned long) current->mm->end_code) >> PAGE_SHIFT;
+	dump->u_dsize = ((unsigned long) (current->mm->brk +
+					  (PAGE_SIZE-1))) >> PAGE_SHIFT;
+	dump->u_dsize -= dump->u_tsize;
+	dump->u_ssize = 0;
 
-extern struct dentry *hypfs_create_str(struct dentry *dir, const char *name,
-				       char *string);
+	if (dump->start_stack < TASK_SIZE)
+		dump->u_ssize = ((unsigned long) (TASK_SIZE - dump->start_stack)) >> PAGE_SHIFT;
 
-/* LPAR Hypervisor */
-extern int hypfs_diag_init(void);
-extern void hypfs_diag_exit(void);
-extern int hypfs_diag_create_files(struct dentry *root);
-
-/* VM Hypervisor */
-extern int hypfs_vm_init(void);
-extern void hypfs_vm_exit(void);
-extern int hypfs_vm_create_files(struct dentry *root);
-
-/* VM diagnose 0c */
-int hypfs_diag0c_init(void);
-void hypfs_diag0c_exit(void);
-
-/* Set Partition-Resource Parameter */
-int hypfs_sprp_init(void);
-void hypfs_sprp_exit(void);
-
-/* debugfs interface */
-struct hypfs_dbfs_file;
-
-struct hypfs_dbfs_data {
-	void			*buf;
-	void			*buf_free_ptr;
-	size_t			size;
-	struct hypfs_dbfs_file	*dbfs_file;
-};
-
-struct hypfs_dbfs_file {
-	const char	*name;
-	int		(*data_create)(void **data, void **data_free_ptr,
-				       size_t *size);
-	void		(*data_free)(const void *buf_free_ptr);
-	long		(*unlocked_ioctl) (struct file *, unsigned int,
-					   unsigned long);
-
-	/* Private data for hypfs_dbfs.c */
-	struct mutex		lock;
-	struct dentry		*dentry;
-};
-
-extern int hypfs_dbfs_init(void);
-extern void hypfs_dbfs_exit(void);
-extern int hypfs_dbfs_create_file(struct hypfs_dbfs_file *df);
-extern void hypfs_dbfs_remove_file(struct hypfs_dbfs_file *df);
-
-#endif /* _HYPFS_H_ */
+	dump->u_ar0 = offsetof(struct user, regs);
+	sw = ((struct switch_stack *)regs) - 1;
+	dump->regs.d1 = regs->d1;
+	dump->regs.d2 = regs->d2;
+	dump->regs.d3 = regs->d3;
+	dump->regs.d4 = regs->d4;
+	dump->regs.d5 = regs->d5;
+	dump->regs.d6 = sw->d6;
+	dump->regs.d7 = sw->d7;
+	dump->regs.a0 = regs->a0;
+	dump->regs.a1 = regs->a1;
+	dump->regs.a2 = regs->a2;
+	dump->regs.a3 = sw->a3;
+	dump->regs.a4 = sw->a4;
+	dump->regs.a5 = sw->a5;
+	dump->regs.a6 = sw->a6;
+	dump->regs.d0 = regs->d0;
+	dump->regs.orig_d0 = regs->orig_d0;
+	dump->regs.stkadj = regs->stkadj;
+	dump->regs.sr = regs->sr;
+	dump->regs.pc = regs->pc;
+	dump->regs.fmtvec = (regs->format << 12) | regs->vector;
+	/* dump floating point stuff */
+	dump

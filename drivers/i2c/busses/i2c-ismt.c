@@ -1,960 +1,1025 @@
-/*
- * This file is provided under a dual BSD/GPLv2 license.  When using or
- * redistributing this file, you may do so under either license.
- *
- * Copyright(c) 2012 Intel Corporation. All rights reserved.
- *
- * GPL LICENSE SUMMARY
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of version 2 of the GNU General Public License as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- * The full GNU General Public License is included in this distribution
- * in the file called LICENSE.GPL.
- *
- * BSD LICENSE
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- *   * Redistributions of source code must retain the above copyright
- *     notice, this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in
- *     the documentation and/or other materials provided with the
- *     distribution.
- *   * Neither the name of Intel Corporation nor the names of its
- *     contributors may be used to endorse or promote products derived
- *     from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+, flags);
+		epb_access(dd, IB_7220_SERDES, 1);
+		rst_val |= 1ULL;
+		/* Squelch possible parity error from _asserting_ reset */
+		qib_write_kreg(dd, kr_hwerrmask,
+			       dd->cspec->hwerrmask &
+			       ~QLOGIC_IB_HWE_IB_UC_MEMORYPARITYERR);
+		qib_write_kreg(dd, kr_ibserdesctrl, rst_val);
+		/* flush write, delay to ensure it took effect */
+		qib_read_kreg32(dd, kr_scratch);
+		udelay(2);
+		/* once it's reset, can remove interrupt */
+		epb_access(dd, IB_7220_SERDES, -1);
+		spin_unlock_irqrestore(&dd->cspec->sdepb_lock, flags);
+	} else {
+		/*
+		 * Before we de-assert reset, we need to deal with
+		 * possible glitch on the Parity-error line.
+		 * Suppress it around the reset, both in chip-level
+		 * hwerrmask and in IB uC control reg. uC will allow
+		 * it again during startup.
+		 */
+		u64 val;
 
-/*
- *  Supports the SMBus Message Transport (SMT) in the Intel Atom Processor
- *  S12xx Product Family.
- *
- *  Features supported by this driver:
- *  Hardware PEC                     yes
- *  Block buffer                     yes
- *  Block process call transaction   no
- *  Slave mode                       no
- */
+		rst_val &= ~(1ULL);
+		qib_write_kreg(dd, kr_hwerrmask,
+			       dd->cspec->hwerrmask &
+			       ~QLOGIC_IB_HWE_IB_UC_MEMORYPARITYERR);
 
-#include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/kernel.h>
-#include <linux/stddef.h>
-#include <linux/completion.h>
-#include <linux/dma-mapping.h>
-#include <linux/i2c.h>
-#include <linux/acpi.h>
-#include <linux/interrupt.h>
+		ret = qib_resync_ibepb(dd);
+		if (ret < 0)
+			qib_dev_err(dd, "unable to re-sync IB EPB\n");
 
-#include <linux/io-64-nonatomic-lo-hi.h>
-
-/* PCI Address Constants */
-#define SMBBAR		0
-
-/* PCI DIDs for the Intel SMBus Message Transport (SMT) Devices */
-#define PCI_DEVICE_ID_INTEL_S1200_SMT0	0x0c59
-#define PCI_DEVICE_ID_INTEL_S1200_SMT1	0x0c5a
-#define PCI_DEVICE_ID_INTEL_AVOTON_SMT	0x1f15
-
-#define ISMT_DESC_ENTRIES	2	/* number of descriptor entries */
-#define ISMT_MAX_RETRIES	3	/* number of SMBus retries to attempt */
-
-/* Hardware Descriptor Constants - Control Field */
-#define ISMT_DESC_CWRL	0x01	/* Command/Write Length */
-#define ISMT_DESC_BLK	0X04	/* Perform Block Transaction */
-#define ISMT_DESC_FAIR	0x08	/* Set fairness flag upon successful arbit. */
-#define ISMT_DESC_PEC	0x10	/* Packet Error Code */
-#define ISMT_DESC_I2C	0x20	/* I2C Enable */
-#define ISMT_DESC_INT	0x40	/* Interrupt */
-#define ISMT_DESC_SOE	0x80	/* Stop On Error */
-
-/* Hardware Descriptor Constants - Status Field */
-#define ISMT_DESC_SCS	0x01	/* Success */
-#define ISMT_DESC_DLTO	0x04	/* Data Low Time Out */
-#define ISMT_DESC_NAK	0x08	/* NAK Received */
-#define ISMT_DESC_CRC	0x10	/* CRC Error */
-#define ISMT_DESC_CLTO	0x20	/* Clock Low Time Out */
-#define ISMT_DESC_COL	0x40	/* Collisions */
-#define ISMT_DESC_LPR	0x80	/* Large Packet Received */
-
-/* Macros */
-#define ISMT_DESC_ADDR_RW(addr, rw) (((addr) << 1) | (rw))
-
-/* iSMT General Register address offsets (SMBBAR + <addr>) */
-#define ISMT_GR_GCTRL		0x000	/* General Control */
-#define ISMT_GR_SMTICL		0x008	/* SMT Interrupt Cause Location */
-#define ISMT_GR_ERRINTMSK	0x010	/* Error Interrupt Mask */
-#define ISMT_GR_ERRAERMSK	0x014	/* Error AER Mask */
-#define ISMT_GR_ERRSTS		0x018	/* Error Status */
-#define ISMT_GR_ERRINFO		0x01c	/* Error Information */
-
-/* iSMT Master Registers */
-#define ISMT_MSTR_MDBA		0x100	/* Master Descriptor Base Address */
-#define ISMT_MSTR_MCTRL		0x108	/* Master Control */
-#define ISMT_MSTR_MSTS		0x10c	/* Master Status */
-#define ISMT_MSTR_MDS		0x110	/* Master Descriptor Size */
-#define ISMT_MSTR_RPOLICY	0x114	/* Retry Policy */
-
-/* iSMT Miscellaneous Registers */
-#define ISMT_SPGT	0x300	/* SMBus PHY Global Timing */
-
-/* General Control Register (GCTRL) bit definitions */
-#define ISMT_GCTRL_TRST	0x04	/* Target Reset */
-#define ISMT_GCTRL_KILL	0x08	/* Kill */
-#define ISMT_GCTRL_SRST	0x40	/* Soft Reset */
-
-/* Master Control Register (MCTRL) bit definitions */
-#define ISMT_MCTRL_SS	0x01		/* Start/Stop */
-#define ISMT_MCTRL_MEIE	0x10		/* Master Error Interrupt Enable */
-#define ISMT_MCTRL_FMHP	0x00ff0000	/* Firmware Master Head Ptr (FMHP) */
-
-/* Master Status Register (MSTS) bit definitions */
-#define ISMT_MSTS_HMTP	0xff0000	/* HW Master Tail Pointer (HMTP) */
-#define ISMT_MSTS_MIS	0x20		/* Master Interrupt Status (MIS) */
-#define ISMT_MSTS_MEIS	0x10		/* Master Error Int Status (MEIS) */
-#define ISMT_MSTS_IP	0x01		/* In Progress */
-
-/* Master Descriptor Size (MDS) bit definitions */
-#define ISMT_MDS_MASK	0xff	/* Master Descriptor Size mask (MDS) */
-
-/* SMBus PHY Global Timing Register (SPGT) bit definitions */
-#define ISMT_SPGT_SPD_MASK	0xc0000000	/* SMBus Speed mask */
-#define ISMT_SPGT_SPD_80K	0x00		/* 80 kHz */
-#define ISMT_SPGT_SPD_100K	(0x1 << 30)	/* 100 kHz */
-#define ISMT_SPGT_SPD_400K	(0x2 << 30)	/* 400 kHz */
-#define ISMT_SPGT_SPD_1M	(0x3 << 30)	/* 1 MHz */
-
-
-/* MSI Control Register (MSICTL) bit definitions */
-#define ISMT_MSICTL_MSIE	0x01	/* MSI Enable */
-
-/* iSMT Hardware Descriptor */
-struct ismt_desc {
-	u8 tgtaddr_rw;	/* target address & r/w bit */
-	u8 wr_len_cmd;	/* write length in bytes or a command */
-	u8 rd_len;	/* read length */
-	u8 control;	/* control bits */
-	u8 status;	/* status bits */
-	u8 retry;	/* collision retry and retry count */
-	u8 rxbytes;	/* received bytes */
-	u8 txbytes;	/* transmitted bytes */
-	u32 dptr_low;	/* lower 32 bit of the data pointer */
-	u32 dptr_high;	/* upper 32 bit of the data pointer */
-} __packed;
-
-struct ismt_priv {
-	struct i2c_adapter adapter;
-	void __iomem *smba;			/* PCI BAR */
-	struct pci_dev *pci_dev;
-	struct ismt_desc *hw;			/* descriptor virt base addr */
-	dma_addr_t io_rng_dma;			/* descriptor HW base addr */
-	u8 head;				/* ring buffer head pointer */
-	struct completion cmp;			/* interrupt completion */
-	u8 dma_buffer[I2C_SMBUS_BLOCK_MAX + 1];	/* temp R/W data buffer */
-};
-
-/**
- * ismt_ids - PCI device IDs supported by this driver
- */
-static const struct pci_device_id ismt_ids[] = {
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_S1200_SMT0) },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_S1200_SMT1) },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_AVOTON_SMT) },
-	{ 0, }
-};
-
-MODULE_DEVICE_TABLE(pci, ismt_ids);
-
-/* Bus speed control bits for slow debuggers - refer to the docs for usage */
-static unsigned int bus_speed;
-module_param(bus_speed, uint, S_IRUGO);
-MODULE_PARM_DESC(bus_speed, "Bus Speed in kHz (0 = BIOS default)");
-
-/**
- * __ismt_desc_dump() - dump the contents of a specific descriptor
- */
-static void __ismt_desc_dump(struct device *dev, const struct ismt_desc *desc)
-{
-
-	dev_dbg(dev, "Descriptor struct:  %p\n", desc);
-	dev_dbg(dev, "\ttgtaddr_rw=0x%02X\n", desc->tgtaddr_rw);
-	dev_dbg(dev, "\twr_len_cmd=0x%02X\n", desc->wr_len_cmd);
-	dev_dbg(dev, "\trd_len=    0x%02X\n", desc->rd_len);
-	dev_dbg(dev, "\tcontrol=   0x%02X\n", desc->control);
-	dev_dbg(dev, "\tstatus=    0x%02X\n", desc->status);
-	dev_dbg(dev, "\tretry=     0x%02X\n", desc->retry);
-	dev_dbg(dev, "\trxbytes=   0x%02X\n", desc->rxbytes);
-	dev_dbg(dev, "\ttxbytes=   0x%02X\n", desc->txbytes);
-	dev_dbg(dev, "\tdptr_low=  0x%08X\n", desc->dptr_low);
-	dev_dbg(dev, "\tdptr_high= 0x%08X\n", desc->dptr_high);
-}
-/**
- * ismt_desc_dump() - dump the contents of a descriptor for debug purposes
- * @priv: iSMT private data
- */
-static void ismt_desc_dump(struct ismt_priv *priv)
-{
-	struct device *dev = &priv->pci_dev->dev;
-	struct ismt_desc *desc = &priv->hw[priv->head];
-
-	dev_dbg(dev, "Dump of the descriptor struct:  0x%X\n", priv->head);
-	__ismt_desc_dump(dev, desc);
-}
-
-/**
- * ismt_gen_reg_dump() - dump the iSMT General Registers
- * @priv: iSMT private data
- */
-static void ismt_gen_reg_dump(struct ismt_priv *priv)
-{
-	struct device *dev = &priv->pci_dev->dev;
-
-	dev_dbg(dev, "Dump of the iSMT General Registers\n");
-	dev_dbg(dev, "  GCTRL.... : (0x%p)=0x%X\n",
-		priv->smba + ISMT_GR_GCTRL,
-		readl(priv->smba + ISMT_GR_GCTRL));
-	dev_dbg(dev, "  SMTICL... : (0x%p)=0x%016llX\n",
-		priv->smba + ISMT_GR_SMTICL,
-		(long long unsigned int)readq(priv->smba + ISMT_GR_SMTICL));
-	dev_dbg(dev, "  ERRINTMSK : (0x%p)=0x%X\n",
-		priv->smba + ISMT_GR_ERRINTMSK,
-		readl(priv->smba + ISMT_GR_ERRINTMSK));
-	dev_dbg(dev, "  ERRAERMSK : (0x%p)=0x%X\n",
-		priv->smba + ISMT_GR_ERRAERMSK,
-		readl(priv->smba + ISMT_GR_ERRAERMSK));
-	dev_dbg(dev, "  ERRSTS... : (0x%p)=0x%X\n",
-		priv->smba + ISMT_GR_ERRSTS,
-		readl(priv->smba + ISMT_GR_ERRSTS));
-	dev_dbg(dev, "  ERRINFO.. : (0x%p)=0x%X\n",
-		priv->smba + ISMT_GR_ERRINFO,
-		readl(priv->smba + ISMT_GR_ERRINFO));
-}
-
-/**
- * ismt_mstr_reg_dump() - dump the iSMT Master Registers
- * @priv: iSMT private data
- */
-static void ismt_mstr_reg_dump(struct ismt_priv *priv)
-{
-	struct device *dev = &priv->pci_dev->dev;
-
-	dev_dbg(dev, "Dump of the iSMT Master Registers\n");
-	dev_dbg(dev, "  MDBA..... : (0x%p)=0x%016llX\n",
-		priv->smba + ISMT_MSTR_MDBA,
-		(long long unsigned int)readq(priv->smba + ISMT_MSTR_MDBA));
-	dev_dbg(dev, "  MCTRL.... : (0x%p)=0x%X\n",
-		priv->smba + ISMT_MSTR_MCTRL,
-		readl(priv->smba + ISMT_MSTR_MCTRL));
-	dev_dbg(dev, "  MSTS..... : (0x%p)=0x%X\n",
-		priv->smba + ISMT_MSTR_MSTS,
-		readl(priv->smba + ISMT_MSTR_MSTS));
-	dev_dbg(dev, "  MDS...... : (0x%p)=0x%X\n",
-		priv->smba + ISMT_MSTR_MDS,
-		readl(priv->smba + ISMT_MSTR_MDS));
-	dev_dbg(dev, "  RPOLICY.. : (0x%p)=0x%X\n",
-		priv->smba + ISMT_MSTR_RPOLICY,
-		readl(priv->smba + ISMT_MSTR_RPOLICY));
-	dev_dbg(dev, "  SPGT..... : (0x%p)=0x%X\n",
-		priv->smba + ISMT_SPGT,
-		readl(priv->smba + ISMT_SPGT));
-}
-
-/**
- * ismt_submit_desc() - add a descriptor to the ring
- * @priv: iSMT private data
- */
-static void ismt_submit_desc(struct ismt_priv *priv)
-{
-	uint fmhp;
-	uint val;
-
-	ismt_desc_dump(priv);
-	ismt_gen_reg_dump(priv);
-	ismt_mstr_reg_dump(priv);
-
-	/* Set the FMHP (Firmware Master Head Pointer)*/
-	fmhp = ((priv->head + 1) % ISMT_DESC_ENTRIES) << 16;
-	val = readl(priv->smba + ISMT_MSTR_MCTRL);
-	writel((val & ~ISMT_MCTRL_FMHP) | fmhp,
-	       priv->smba + ISMT_MSTR_MCTRL);
-
-	/* Set the start bit */
-	val = readl(priv->smba + ISMT_MSTR_MCTRL);
-	writel(val | ISMT_MCTRL_SS,
-	       priv->smba + ISMT_MSTR_MCTRL);
-}
-
-/**
- * ismt_process_desc() - handle the completion of the descriptor
- * @desc: the iSMT hardware descriptor
- * @data: data buffer from the upper layer
- * @priv: ismt_priv struct holding our dma buffer
- * @size: SMBus transaction type
- * @read_write: flag to indicate if this is a read or write
- */
-static int ismt_process_desc(const struct ismt_desc *desc,
-			     union i2c_smbus_data *data,
-			     struct ismt_priv *priv, int size,
-			     char read_write)
-{
-	u8 *dma_buffer = priv->dma_buffer;
-
-	dev_dbg(&priv->pci_dev->dev, "Processing completed descriptor\n");
-	__ismt_desc_dump(&priv->pci_dev->dev, desc);
-
-	if (desc->status & ISMT_DESC_SCS) {
-		if (read_write == I2C_SMBUS_WRITE &&
-		    size != I2C_SMBUS_PROC_CALL)
-			return 0;
-
-		switch (size) {
-		case I2C_SMBUS_BYTE:
-		case I2C_SMBUS_BYTE_DATA:
-			data->byte = dma_buffer[0];
-			break;
-		case I2C_SMBUS_WORD_DATA:
-		case I2C_SMBUS_PROC_CALL:
-			data->word = dma_buffer[0] | (dma_buffer[1] << 8);
-			break;
-		case I2C_SMBUS_BLOCK_DATA:
-			if (desc->rxbytes != dma_buffer[0] + 1)
-				return -EMSGSIZE;
-
-			memcpy(data->block, dma_buffer, desc->rxbytes);
-			break;
-		case I2C_SMBUS_I2C_BLOCK_DATA:
-			memcpy(&data->block[1], dma_buffer, desc->rxbytes);
-			data->block[0] = desc->rxbytes;
-			break;
+		/* set uC control regs to suppress parity errs */
+		ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES, IB_MPREG5, 1, 1);
+		if (ret < 0)
+			goto bail;
+		/* IB uC code past Version 1.32.17 allow suppression of wdog */
+		ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES, IB_MPREG6, 0x80,
+			0x80);
+		if (ret < 0) {
+			qib_dev_err(dd, "Failed to set WDOG disable\n");
+			goto bail;
 		}
-		return 0;
+		qib_write_kreg(dd, kr_ibserdesctrl, rst_val);
+		/* flush write, delay for startup */
+		qib_read_kreg32(dd, kr_scratch);
+		udelay(1);
+		/* clear, then re-enable parity errs */
+		qib_sd7220_clr_ibpar(dd);
+		val = qib_read_kreg64(dd, kr_hwerrstatus);
+		if (val & QLOGIC_IB_HWE_IB_UC_MEMORYPARITYERR) {
+			qib_dev_err(dd, "IBUC Parity still set after RST\n");
+			dd->cspec->hwerrmask &=
+				~QLOGIC_IB_HWE_IB_UC_MEMORYPARITYERR;
+		}
+		qib_write_kreg(dd, kr_hwerrmask,
+			dd->cspec->hwerrmask);
 	}
 
-	if (likely(desc->status & ISMT_DESC_NAK))
-		return -ENXIO;
-
-	if (desc->status & ISMT_DESC_CRC)
-		return -EBADMSG;
-
-	if (desc->status & ISMT_DESC_COL)
-		return -EAGAIN;
-
-	if (desc->status & ISMT_DESC_LPR)
-		return -EPROTO;
-
-	if (desc->status & (ISMT_DESC_DLTO | ISMT_DESC_CLTO))
-		return -ETIMEDOUT;
-
-	return -EIO;
-}
-
-/**
- * ismt_access() - process an SMBus command
- * @adap: the i2c host adapter
- * @addr: address of the i2c/SMBus target
- * @flags: command options
- * @read_write: read from or write to device
- * @command: the i2c/SMBus command to issue
- * @size: SMBus transaction type
- * @data: read/write data buffer
- */
-static int ismt_access(struct i2c_adapter *adap, u16 addr,
-		       unsigned short flags, char read_write, u8 command,
-		       int size, union i2c_smbus_data *data)
-{
-	int ret;
-	unsigned long time_left;
-	dma_addr_t dma_addr = 0; /* address of the data buffer */
-	u8 dma_size = 0;
-	enum dma_data_direction dma_direction = 0;
-	struct ismt_desc *desc;
-	struct ismt_priv *priv = i2c_get_adapdata(adap);
-	struct device *dev = &priv->pci_dev->dev;
-
-	desc = &priv->hw[priv->head];
-
-	/* Initialize the DMA buffer */
-	memset(priv->dma_buffer, 0, sizeof(priv->dma_buffer));
-
-	/* Initialize the descriptor */
-	memset(desc, 0, sizeof(struct ismt_desc));
-	desc->tgtaddr_rw = ISMT_DESC_ADDR_RW(addr, read_write);
-
-	/* Initialize common control bits */
-	if (likely(pci_dev_msi_enabled(priv->pci_dev)))
-		desc->control = ISMT_DESC_INT | ISMT_DESC_FAIR;
-	else
-		desc->control = ISMT_DESC_FAIR;
-
-	if ((flags & I2C_CLIENT_PEC) && (size != I2C_SMBUS_QUICK)
-	    && (size != I2C_SMBUS_I2C_BLOCK_DATA))
-		desc->control |= ISMT_DESC_PEC;
-
-	switch (size) {
-	case I2C_SMBUS_QUICK:
-		dev_dbg(dev, "I2C_SMBUS_QUICK\n");
-		break;
-
-	case I2C_SMBUS_BYTE:
-		if (read_write == I2C_SMBUS_WRITE) {
-			/*
-			 * Send Byte
-			 * The command field contains the write data
-			 */
-			dev_dbg(dev, "I2C_SMBUS_BYTE:  WRITE\n");
-			desc->control |= ISMT_DESC_CWRL;
-			desc->wr_len_cmd = command;
-		} else {
-			/* Receive Byte */
-			dev_dbg(dev, "I2C_SMBUS_BYTE:  READ\n");
-			dma_size = 1;
-			dma_direction = DMA_FROM_DEVICE;
-			desc->rd_len = 1;
-		}
-		break;
-
-	case I2C_SMBUS_BYTE_DATA:
-		if (read_write == I2C_SMBUS_WRITE) {
-			/*
-			 * Write Byte
-			 * Command plus 1 data byte
-			 */
-			dev_dbg(dev, "I2C_SMBUS_BYTE_DATA:  WRITE\n");
-			desc->wr_len_cmd = 2;
-			dma_size = 2;
-			dma_direction = DMA_TO_DEVICE;
-			priv->dma_buffer[0] = command;
-			priv->dma_buffer[1] = data->byte;
-		} else {
-			/* Read Byte */
-			dev_dbg(dev, "I2C_SMBUS_BYTE_DATA:  READ\n");
-			desc->control |= ISMT_DESC_CWRL;
-			desc->wr_len_cmd = command;
-			desc->rd_len = 1;
-			dma_size = 1;
-			dma_direction = DMA_FROM_DEVICE;
-		}
-		break;
-
-	case I2C_SMBUS_WORD_DATA:
-		if (read_write == I2C_SMBUS_WRITE) {
-			/* Write Word */
-			dev_dbg(dev, "I2C_SMBUS_WORD_DATA:  WRITE\n");
-			desc->wr_len_cmd = 3;
-			dma_size = 3;
-			dma_direction = DMA_TO_DEVICE;
-			priv->dma_buffer[0] = command;
-			priv->dma_buffer[1] = data->word & 0xff;
-			priv->dma_buffer[2] = data->word >> 8;
-		} else {
-			/* Read Word */
-			dev_dbg(dev, "I2C_SMBUS_WORD_DATA:  READ\n");
-			desc->wr_len_cmd = command;
-			desc->control |= ISMT_DESC_CWRL;
-			desc->rd_len = 2;
-			dma_size = 2;
-			dma_direction = DMA_FROM_DEVICE;
-		}
-		break;
-
-	case I2C_SMBUS_PROC_CALL:
-		dev_dbg(dev, "I2C_SMBUS_PROC_CALL\n");
-		desc->wr_len_cmd = 3;
-		desc->rd_len = 2;
-		dma_size = 3;
-		dma_direction = DMA_BIDIRECTIONAL;
-		priv->dma_buffer[0] = command;
-		priv->dma_buffer[1] = data->word & 0xff;
-		priv->dma_buffer[2] = data->word >> 8;
-		break;
-
-	case I2C_SMBUS_BLOCK_DATA:
-		if (read_write == I2C_SMBUS_WRITE) {
-			/* Block Write */
-			dev_dbg(dev, "I2C_SMBUS_BLOCK_DATA:  WRITE\n");
-			if (data->block[0] < 1 || data->block[0] > I2C_SMBUS_BLOCK_MAX)
-				return -EINVAL;
-
-			dma_size = data->block[0] + 1;
-			dma_direction = DMA_TO_DEVICE;
-			desc->wr_len_cmd = dma_size;
-			desc->control |= ISMT_DESC_BLK;
-			priv->dma_buffer[0] = command;
-			memcpy(&priv->dma_buffer[1], &data->block[1], dma_size - 1);
-		} else {
-			/* Block Read */
-			dev_dbg(dev, "I2C_SMBUS_BLOCK_DATA:  READ\n");
-			dma_size = I2C_SMBUS_BLOCK_MAX;
-			dma_direction = DMA_FROM_DEVICE;
-			desc->rd_len = dma_size;
-			desc->wr_len_cmd = command;
-			desc->control |= (ISMT_DESC_BLK | ISMT_DESC_CWRL);
-		}
-		break;
-
-	case I2C_SMBUS_I2C_BLOCK_DATA:
-		/* Make sure the length is valid */
-		if (data->block[0] < 1)
-			data->block[0] = 1;
-
-		if (data->block[0] > I2C_SMBUS_BLOCK_MAX)
-			data->block[0] = I2C_SMBUS_BLOCK_MAX;
-
-		if (read_write == I2C_SMBUS_WRITE) {
-			/* i2c Block Write */
-			dev_dbg(dev, "I2C_SMBUS_I2C_BLOCK_DATA:  WRITE\n");
-			dma_size = data->block[0] + 1;
-			dma_direction = DMA_TO_DEVICE;
-			desc->wr_len_cmd = dma_size;
-			desc->control |= ISMT_DESC_I2C;
-			priv->dma_buffer[0] = command;
-			memcpy(&priv->dma_buffer[1], &data->block[1], dma_size - 1);
-		} else {
-			/* i2c Block Read */
-			dev_dbg(dev, "I2C_SMBUS_I2C_BLOCK_DATA:  READ\n");
-			dma_size = data->block[0];
-			dma_direction = DMA_FROM_DEVICE;
-			desc->rd_len = dma_size;
-			desc->wr_len_cmd = command;
-			desc->control |= (ISMT_DESC_I2C | ISMT_DESC_CWRL);
-			/*
-			 * Per the "Table 15-15. I2C Commands",
-			 * in the External Design Specification (EDS),
-			 * (Document Number: 508084, Revision: 2.0),
-			 * the _rw bit must be 0
-			 */
-			desc->tgtaddr_rw = ISMT_DESC_ADDR_RW(addr, 0);
-		}
-		break;
-
-	default:
-		dev_err(dev, "Unsupported transaction %d\n",
-			size);
-		return -EOPNOTSUPP;
-	}
-
-	/* map the data buffer */
-	if (dma_size != 0) {
-		dev_dbg(dev, " dev=%p\n", dev);
-		dev_dbg(dev, " data=%p\n", data);
-		dev_dbg(dev, " dma_buffer=%p\n", priv->dma_buffer);
-		dev_dbg(dev, " dma_size=%d\n", dma_size);
-		dev_dbg(dev, " dma_direction=%d\n", dma_direction);
-
-		dma_addr = dma_map_single(dev,
-				      priv->dma_buffer,
-				      dma_size,
-				      dma_direction);
-
-		if (dma_mapping_error(dev, dma_addr)) {
-			dev_err(dev, "Error in mapping dma buffer %p\n",
-				priv->dma_buffer);
-			return -EIO;
-		}
-
-		dev_dbg(dev, " dma_addr = 0x%016llX\n",
-			(unsigned long long)dma_addr);
-
-		desc->dptr_low = lower_32_bits(dma_addr);
-		desc->dptr_high = upper_32_bits(dma_addr);
-	}
-
-	reinit_completion(&priv->cmp);
-
-	/* Add the descriptor */
-	ismt_submit_desc(priv);
-
-	/* Now we wait for interrupt completion, 1s */
-	time_left = wait_for_completion_timeout(&priv->cmp, HZ*1);
-
-	/* unmap the data buffer */
-	if (dma_size != 0)
-		dma_unmap_single(dev, dma_addr, dma_size, dma_direction);
-
-	if (unlikely(!time_left)) {
-		dev_err(dev, "completion wait timed out\n");
-		ret = -ETIMEDOUT;
-		goto out;
-	}
-
-	/* do any post processing of the descriptor here */
-	ret = ismt_process_desc(desc, data, priv, size, read_write);
-
-out:
-	/* Update the ring pointer */
-	priv->head++;
-	priv->head %= ISMT_DESC_ENTRIES;
-
+bail:
 	return ret;
 }
 
-/**
- * ismt_func() - report which i2c commands are supported by this adapter
- * @adap: the i2c host adapter
- */
-static u32 ismt_func(struct i2c_adapter *adap)
+static void qib_sd_trimdone_monitor(struct qib_devdata *dd,
+	const char *where)
 {
-	return I2C_FUNC_SMBUS_QUICK		|
-	       I2C_FUNC_SMBUS_BYTE		|
-	       I2C_FUNC_SMBUS_BYTE_DATA		|
-	       I2C_FUNC_SMBUS_WORD_DATA		|
-	       I2C_FUNC_SMBUS_PROC_CALL		|
-	       I2C_FUNC_SMBUS_BLOCK_DATA	|
-	       I2C_FUNC_SMBUS_I2C_BLOCK		|
-	       I2C_FUNC_SMBUS_PEC;
-}
+	int ret, chn, baduns;
+	u64 val;
 
-/**
- * smbus_algorithm - the adapter algorithm and supported functionality
- * @smbus_xfer: the adapter algorithm
- * @functionality: functionality supported by the adapter
- */
-static const struct i2c_algorithm smbus_algorithm = {
-	.smbus_xfer	= ismt_access,
-	.functionality	= ismt_func,
-};
+	if (!where)
+		where = "?";
 
-/**
- * ismt_handle_isr() - interrupt handler bottom half
- * @priv: iSMT private data
- */
-static irqreturn_t ismt_handle_isr(struct ismt_priv *priv)
-{
-	complete(&priv->cmp);
+	/* give time for reset to settle out in EPB */
+	udelay(2);
 
-	return IRQ_HANDLED;
-}
+	ret = qib_resync_ibepb(dd);
+	if (ret < 0)
+		qib_dev_err(dd, "not able to re-sync IB EPB (%s)\n", where);
 
+	/* Do "sacrificial read" to get EPB in sane state after reset */
+	ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES, IB_CTRL2(0), 0, 0);
+	if (ret < 0)
+		qib_dev_err(dd, "Failed TRIMDONE 1st read, (%s)\n", where);
 
-/**
- * ismt_do_interrupt() - IRQ interrupt handler
- * @vec: interrupt vector
- * @data: iSMT private data
- */
-static irqreturn_t ismt_do_interrupt(int vec, void *data)
-{
-	u32 val;
-	struct ismt_priv *priv = data;
-
+	/* Check/show "summary" Trim-done bit in IBCStatus */
+	val = qib_read_kreg64(dd, kr_ibcstatus);
+	if (!(val & (1ULL << 11)))
+		qib_dev_err(dd, "IBCS TRIMDONE clear (%s)\n", where);
 	/*
-	 * check to see it's our interrupt, return IRQ_NONE if not ours
-	 * since we are sharing interrupt
+	 * Do "dummy read/mod/wr" to get EPB in sane state after reset
+	 * The default value for MPREG6 is 0.
 	 */
-	val = readl(priv->smba + ISMT_MSTR_MSTS);
+	udelay(2);
 
-	if (!(val & (ISMT_MSTS_MIS | ISMT_MSTS_MEIS)))
-		return IRQ_NONE;
-	else
-		writel(val | ISMT_MSTS_MIS | ISMT_MSTS_MEIS,
-		       priv->smba + ISMT_MSTR_MSTS);
+	ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES, IB_MPREG6, 0x80, 0x80);
+	if (ret < 0)
+		qib_dev_err(dd, "Failed Dummy RMW, (%s)\n", where);
+	udelay(10);
 
-	return ismt_handle_isr(priv);
+	baduns = 0;
+
+	for (chn = 3; chn >= 0; --chn) {
+		/* Read CTRL reg for each channel to check TRIMDONE */
+		ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES,
+			IB_CTRL2(chn), 0, 0);
+		if (ret < 0)
+			qib_dev_err(dd,
+				"Failed checking TRIMDONE, chn %d (%s)\n",
+				chn, where);
+
+		if (!(ret & 0x10)) {
+			int probe;
+
+			baduns |= (1 << chn);
+			qib_dev_err(dd,
+				"TRIMDONE cleared on chn %d (%02X). (%s)\n",
+				chn, ret, where);
+			probe = qib_sd7220_reg_mod(dd, IB_7220_SERDES,
+				IB_PGUDP(0), 0, 0);
+			qib_dev_err(dd, "probe is %d (%02X)\n",
+				probe, probe);
+			probe = qib_sd7220_reg_mod(dd, IB_7220_SERDES,
+				IB_CTRL2(chn), 0, 0);
+			qib_dev_err(dd, "re-read: %d (%02X)\n",
+				probe, probe);
+			ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES,
+				IB_CTRL2(chn), 0x10, 0x10);
+			if (ret < 0)
+				qib_dev_err(dd,
+					"Err on TRIMDONE rewrite1\n");
+		}
+	}
+	for (chn = 3; chn >= 0; --chn) {
+		/* Read CTRL reg for each channel to check TRIMDONE */
+		if (baduns & (1 << chn)) {
+			qib_dev_err(dd,
+				"Resetting TRIMDONE on chn %d (%s)\n",
+				chn, where);
+			ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES,
+				IB_CTRL2(chn), 0x10, 0x10);
+			if (ret < 0)
+				qib_dev_err(dd,
+					"Failed re-setting TRIMDONE, chn %d (%s)\n",
+					chn, where);
+		}
+	}
 }
 
-/**
- * ismt_do_msi_interrupt() - MSI interrupt handler
- * @vec: interrupt vector
- * @data: iSMT private data
+/*
+ * Below is portion of IBA7220-specific bringup_serdes() that actually
+ * deals with registers and memory within the SerDes itself.
+ * Post IB uC code version 1.32.17, was_reset being 1 is not really
+ * informative, so we double-check.
  */
-static irqreturn_t ismt_do_msi_interrupt(int vec, void *data)
+int qib_sd7220_init(struct qib_devdata *dd)
 {
-	return ismt_handle_isr(data);
-}
+	const struct firmware *fw;
+	int ret = 1; /* default to failure */
+	int first_reset, was_reset;
 
-/**
- * ismt_hw_init() - initialize the iSMT hardware
- * @priv: iSMT private data
- */
-static void ismt_hw_init(struct ismt_priv *priv)
-{
-	u32 val;
-	struct device *dev = &priv->pci_dev->dev;
+	/* SERDES MPU reset recorded in D0 */
+	was_reset = (qib_read_kreg64(dd, kr_ibserdesctrl) & 1);
+	if (!was_reset) {
+		/* entered with reset not asserted, we need to do it */
+		qib_ibsd_reset(dd, 1);
+		qib_sd_trimdone_monitor(dd, "Driver-reload");
+	}
 
-	/* initialize the Master Descriptor Base Address (MDBA) */
-	writeq(priv->io_rng_dma, priv->smba + ISMT_MSTR_MDBA);
+	ret = request_firmware(&fw, SD7220_FW_NAME, &dd->pcidev->dev);
+	if (ret) {
+		qib_dev_err(dd, "Failed to load IB SERDES image\n");
+		goto done;
+	}
 
-	/* initialize the Master Control Register (MCTRL) */
-	writel(ISMT_MCTRL_MEIE, priv->smba + ISMT_MSTR_MCTRL);
+	/* Substitute our deduced value for was_reset */
+	ret = qib_ibsd_ucode_loaded(dd->pport, fw);
+	if (ret < 0)
+		goto bail;
 
-	/* initialize the Master Status Register (MSTS) */
-	writel(0, priv->smba + ISMT_MSTR_MSTS);
-
-	/* initialize the Master Descriptor Size (MDS) */
-	val = readl(priv->smba + ISMT_MSTR_MDS);
-	writel((val & ~ISMT_MDS_MASK) | (ISMT_DESC_ENTRIES - 1),
-		priv->smba + ISMT_MSTR_MDS);
-
+	first_reset = !ret; /* First reset if IBSD uCode not yet loaded */
 	/*
-	 * Set the SMBus speed (could use this for slow HW debuggers)
+	 * Alter some regs per vendor latest doc, reset-defaults
+	 * are not right for IB.
 	 */
+	ret = qib_sd_early(dd);
+	if (ret < 0) {
+		qib_dev_err(dd, "Failed to set IB SERDES early defaults\n");
+		goto bail;
+	}
+	/*
+	 * Set DAC manual trim IB.
+	 * We only do this once after chip has been reset (usually
+	 * same as once per system boot).
+	 */
+	if (first_reset) {
+		ret = qib_sd_dactrim(dd);
+		if (ret < 0) {
+			qib_dev_err(dd, "Failed IB SERDES DAC trim\n");
+			goto bail;
+		}
+	}
+	/*
+	 * Set various registers (DDS and RXEQ) that will be
+	 * controlled by IBC (in 1.2 mode) to reasonable preset values
+	 * Calling the "internal" version avoids the "check for needed"
+	 * and "trimdone monitor" that might be counter-productive.
+	 */
+	ret = qib_internal_presets(dd);
+	if (ret < 0) {
+		qib_dev_err(dd, "Failed to set IB SERDES presets\n");
+		goto bail;
+	}
+	ret = qib_sd_trimself(dd, 0x80);
+	if (ret < 0) {
+		qib_dev_err(dd, "Failed to set IB SERDES TRIMSELF\n");
+		goto bail;
+	}
 
-	val = readl(priv->smba + ISMT_SPGT);
+	/* Load image, then try to verify */
+	ret = 0;        /* Assume success */
+	if (first_reset) {
+		int vfy;
+		int trim_done;
 
-	switch (bus_speed) {
-	case 0:
+		ret = qib_sd7220_ib_load(dd, fw);
+		if (ret < 0) {
+			qib_dev_err(dd, "Failed to load IB SERDES image\n");
+			goto bail;
+		} else {
+			/* Loaded image, try to verify */
+			vfy = qib_sd7220_ib_vfy(dd, fw);
+			if (vfy != ret) {
+				qib_dev_err(dd, "SERDES PRAM VFY failed\n");
+				goto bail;
+			} /* end if verified */
+		} /* end if loaded */
+
+		/*
+		 * Loaded and verified. Almost good...
+		 * hold "success" in ret
+		 */
+		ret = 0;
+		/*
+		 * Prev steps all worked, continue bringup
+		 * De-assert RESET to uC, only in first reset, to allow
+		 * trimming.
+		 *
+		 * Since our default setup sets START_EQ1 to
+		 * PRESET, we need to clear that for this very first run.
+		 */
+		ret = ibsd_mod_allchnls(dd, START_EQ1(0), 0, 0x38);
+		if (ret < 0) {
+			qib_dev_err(dd, "Failed clearing START_EQ1\n");
+			goto bail;
+		}
+
+		qib_ibsd_reset(dd, 0);
+		/*
+		 * If this is not the first reset, trimdone should be set
+		 * already. We may need to check about this.
+		 */
+		trim_done = qib_sd_trimdone_poll(dd);
+		/*
+		 * Whether or not trimdone succeeded, we need to put the
+		 * uC back into reset to avoid a possible fight with the
+		 * IBC state-machine.
+		 */
+		qib_ibsd_reset(dd, 1);
+
+		if (!trim_done) {
+			qib_dev_err(dd, "No TRIMDONE seen\n");
+			goto bail;
+		}
+		/*
+		 * DEBUG: check each time we reset if trimdone bits have
+		 * gotten cleared, and re-set them.
+		 */
+		qib_sd_trimdone_monitor(dd, "First-reset");
+		/* Remember so we do not re-do the load, dactrim, etc. */
+		dd->cspec->serdes_first_init_done = 1;
+	}
+	/*
+	 * setup for channel training and load values for
+	 * RxEq and DDS in tables used by IBC in IB1.2 mode
+	 */
+	ret = 0;
+	if (qib_sd_setvals(dd) >= 0)
+		goto done;
+bail:
+	ret = 1;
+done:
+	/* start relock timer regardless, but start at 1 second */
+	set_7220_relock_poll(dd, -1);
+
+	release_firmware(fw);
+	return ret;
+}
+
+#define EPB_ACC_REQ 1
+#define EPB_ACC_GNT 0x100
+#define EPB_DATA_MASK 0xFF
+#define EPB_RD (1ULL << 24)
+#define EPB_TRANS_RDY (1ULL << 31)
+#define EPB_TRANS_ERR (1ULL << 30)
+#define EPB_TRANS_TRIES 5
+
+/*
+ * query, claim, release ownership of the EPB (External Parallel Bus)
+ * for a specified SERDES.
+ * the "claim" parameter is >0 to claim, <0 to release, 0 to query.
+ * Returns <0 for errors, >0 if we had ownership, else 0.
+ */
+static int epb_access(struct qib_devdata *dd, int sdnum, int claim)
+{
+	u16 acc;
+	u64 accval;
+	int owned = 0;
+	u64 oct_sel = 0;
+
+	switch (sdnum) {
+	case IB_7220_SERDES:
+		/*
+		 * The IB SERDES "ownership" is fairly simple. A single each
+		 * request/grant.
+		 */
+		acc = kr_ibsd_epb_access_ctrl;
 		break;
 
-	case 80:
-		dev_dbg(dev, "Setting SMBus clock to 80 kHz\n");
-		writel(((val & ~ISMT_SPGT_SPD_MASK) | ISMT_SPGT_SPD_80K),
-			priv->smba + ISMT_SPGT);
-		break;
-
-	case 100:
-		dev_dbg(dev, "Setting SMBus clock to 100 kHz\n");
-		writel(((val & ~ISMT_SPGT_SPD_MASK) | ISMT_SPGT_SPD_100K),
-			priv->smba + ISMT_SPGT);
-		break;
-
-	case 400:
-		dev_dbg(dev, "Setting SMBus clock to 400 kHz\n");
-		writel(((val & ~ISMT_SPGT_SPD_MASK) | ISMT_SPGT_SPD_400K),
-			priv->smba + ISMT_SPGT);
-		break;
-
-	case 1000:
-		dev_dbg(dev, "Setting SMBus clock to 1000 kHz\n");
-		writel(((val & ~ISMT_SPGT_SPD_MASK) | ISMT_SPGT_SPD_1M),
-			priv->smba + ISMT_SPGT);
+	case PCIE_SERDES0:
+	case PCIE_SERDES1:
+		/* PCIe SERDES has two "octants", need to select which */
+		acc = kr_pciesd_epb_access_ctrl;
+		oct_sel = (2 << (sdnum - PCIE_SERDES0));
 		break;
 
 	default:
-		dev_warn(dev, "Invalid SMBus clock speed, only 0, 80, 100, 400, and 1000 are valid\n");
-		break;
+		return 0;
 	}
 
-	val = readl(priv->smba + ISMT_SPGT);
+	/* Make sure any outstanding transaction was seen */
+	qib_read_kreg32(dd, kr_scratch);
+	udelay(15);
 
-	switch (val & ISMT_SPGT_SPD_MASK) {
-	case ISMT_SPGT_SPD_80K:
-		bus_speed = 80;
-		break;
-	case ISMT_SPGT_SPD_100K:
-		bus_speed = 100;
-		break;
-	case ISMT_SPGT_SPD_400K:
-		bus_speed = 400;
-		break;
-	case ISMT_SPGT_SPD_1M:
-		bus_speed = 1000;
-		break;
+	accval = qib_read_kreg32(dd, acc);
+
+	owned = !!(accval & EPB_ACC_GNT);
+	if (claim < 0) {
+		/* Need to release */
+		u64 pollval;
+		/*
+		 * The only writeable bits are the request and CS.
+		 * Both should be clear
+		 */
+		u64 newval = 0;
+
+		qib_write_kreg(dd, acc, newval);
+		/* First read after write is not trustworthy */
+		pollval = qib_read_kreg32(dd, acc);
+		udelay(5);
+		pollval = qib_read_kreg32(dd, acc);
+		if (pollval & EPB_ACC_GNT)
+			owned = -1;
+	} else if (claim > 0) {
+		/* Need to claim */
+		u64 pollval;
+		u64 newval = EPB_ACC_REQ | oct_sel;
+
+		qib_write_kreg(dd, acc, newval);
+		/* First read after write is not trustworthy */
+		pollval = qib_read_kreg32(dd, acc);
+		udelay(5);
+		pollval = qib_read_kreg32(dd, acc);
+		if (!(pollval & EPB_ACC_GNT))
+			owned = -1;
 	}
-	dev_dbg(dev, "SMBus clock is running at %d kHz\n", bus_speed);
+	return owned;
+}
+
+/*
+ * Lemma to deal with race condition of write..read to epb regs
+ */
+static int epb_trans(struct qib_devdata *dd, u16 reg, u64 i_val, u64 *o_vp)
+{
+	int tries;
+	u64 transval;
+
+	qib_write_kreg(dd, reg, i_val);
+	/* Throw away first read, as RDY bit may be stale */
+	transval = qib_read_kreg64(dd, reg);
+
+	for (tries = EPB_TRANS_TRIES; tries; --tries) {
+		transval = qib_read_kreg32(dd, reg);
+		if (transval & EPB_TRANS_RDY)
+			break;
+		udelay(5);
+	}
+	if (transval & EPB_TRANS_ERR)
+		return -1;
+	if (tries > 0 && o_vp)
+		*o_vp = transval;
+	return tries;
 }
 
 /**
- * ismt_dev_init() - initialize the iSMT data structures
- * @priv: iSMT private data
+ * qib_sd7220_reg_mod - modify SERDES register
+ * @dd: the qlogic_ib device
+ * @sdnum: which SERDES to access
+ * @loc: location - channel, element, register, as packed by EPB_LOC() macro.
+ * @wd: Write Data - value to set in register
+ * @mask: ones where data should be spliced into reg.
+ *
+ * Basic register read/modify/write, with un-needed acesses elided. That is,
+ * a mask of zero will prevent write, while a mask of 0xFF will prevent read.
+ * returns current (presumed, if a write was done) contents of selected
+ * register, or <0 if errors.
  */
-static int ismt_dev_init(struct ismt_priv *priv)
+static int qib_sd7220_reg_mod(struct qib_devdata *dd, int sdnum, u32 loc,
+			      u32 wd, u32 mask)
 {
-	/* allocate memory for the descriptor */
-	priv->hw = dmam_alloc_coherent(&priv->pci_dev->dev,
-				       (ISMT_DESC_ENTRIES
-					       * sizeof(struct ismt_desc)),
-				       &priv->io_rng_dma,
-				       GFP_KERNEL);
-	if (!priv->hw)
-		return -ENOMEM;
+	u16 trans;
+	u64 transval;
+	int owned;
+	int tries, ret;
+	unsigned long flags;
 
-	memset(priv->hw, 0, (ISMT_DESC_ENTRIES * sizeof(struct ismt_desc)));
+	switch (sdnum) {
+	case IB_7220_SERDES:
+		trans = kr_ibsd_epb_transaction_reg;
+		break;
 
-	priv->head = 0;
-	init_completion(&priv->cmp);
+	case PCIE_SERDES0:
+	case PCIE_SERDES1:
+		trans = kr_pciesd_epb_transaction_reg;
+		break;
 
-	return 0;
-}
-
-/**
- * ismt_int_init() - initialize interrupts
- * @priv: iSMT private data
- */
-static int ismt_int_init(struct ismt_priv *priv)
-{
-	int err;
-
-	/* Try using MSI interrupts */
-	err = pci_enable_msi(priv->pci_dev);
-	if (err)
-		goto intx;
-
-	err = devm_request_irq(&priv->pci_dev->dev,
-			       priv->pci_dev->irq,
-			       ismt_do_msi_interrupt,
-			       0,
-			       "ismt-msi",
-			       priv);
-	if (err) {
-		pci_disable_msi(priv->pci_dev);
-		goto intx;
+	default:
+		return -1;
 	}
 
-	return 0;
+	/*
+	 * All access is locked in software (vs other host threads) and
+	 * hardware (vs uC access).
+	 */
+	spin_lock_irqsave(&dd->cspec->sdepb_lock, flags);
 
-	/* Try using legacy interrupts */
-intx:
-	dev_warn(&priv->pci_dev->dev,
-		 "Unable to use MSI interrupts, falling back to legacy\n");
-
-	err = devm_request_irq(&priv->pci_dev->dev,
-			       priv->pci_dev->irq,
-			       ismt_do_interrupt,
-			       IRQF_SHARED,
-			       "ismt-intx",
-			       priv);
-	if (err) {
-		dev_err(&priv->pci_dev->dev, "no usable interrupts\n");
-		return err;
+	owned = epb_access(dd, sdnum, 1);
+	if (owned < 0) {
+		spin_unlock_irqrestore(&dd->cspec->sdepb_lock, flags);
+		return -1;
+	}
+	ret = 0;
+	for (tries = EPB_TRANS_TRIES; tries; --tries) {
+		transval = qib_read_kreg32(dd, trans);
+		if (transval & EPB_TRANS_RDY)
+			break;
+		udelay(5);
 	}
 
-	return 0;
-}
-
-static struct pci_driver ismt_driver;
-
-/**
- * ismt_probe() - probe for iSMT devices
- * @pdev: PCI-Express device
- * @id: PCI-Express device ID
- */
-static int
-ismt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
-{
-	int err;
-	struct ismt_priv *priv;
-	unsigned long start, len;
-
-	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	pci_set_drvdata(pdev, priv);
-
-	i2c_set_adapdata(&priv->adapter, priv);
-	priv->adapter.owner = THIS_MODULE;
-	priv->adapter.class = I2C_CLASS_HWMON;
-	priv->adapter.algo = &smbus_algorithm;
-	priv->adapter.dev.parent = &pdev->dev;
-	ACPI_COMPANION_SET(&priv->adapter.dev, ACPI_COMPANION(&pdev->dev));
-	priv->adapter.retries = ISMT_MAX_RETRIES;
-
-	priv->pci_dev = pdev;
-
-	err = pcim_enable_device(pdev);
-	if (err) {
-		dev_err(&pdev->dev, "Failed to enable SMBus PCI device (%d)\n",
-			err);
-		return err;
-	}
-
-	/* enable bus mastering */
-	pci_set_master(pdev);
-
-	/* Determine the address of the SMBus area */
-	start = pci_resource_start(pdev, SMBBAR);
-	len = pci_resource_len(pdev, SMBBAR);
-	if (!start || !len) {
-		dev_err(&pdev->dev,
-			"SMBus base address uninitialized, upgrade BIOS\n");
-		return -ENODEV;
-	}
-
-	snprintf(priv->adapter.name, sizeof(priv->adapter.name),
-		 "SMBus iSMT adapter at %lx", start);
-
-	dev_dbg(&priv->pci_dev->dev, " start=0x%lX\n", start);
-	dev_dbg(&priv->pci_dev->dev, " len=0x%lX\n", len);
-
-	err = acpi_check_resource_conflict(&pdev->resource[SMBBAR]);
-	if (err) {
-		dev_err(&pdev->dev, "ACPI resource conflict!\n");
-		return err;
-	}
-
-	err = pci_request_region(pdev, SMBBAR, ismt_driver.name);
-	if (err) {
-		dev_err(&pdev->dev,
-			"Failed to request SMBus region 0x%lx-0x%lx\n",
-			start, start + len);
-		return err;
-	}
-
-	priv->smba = pcim_iomap(pdev, SMBBAR, len);
-	if (!priv->smba) {
-		dev_err(&pdev->dev, "Unable to ioremap SMBus BAR\n");
-		return -ENODEV;
-	}
-
-	if ((pci_set_dma_mask(pdev, DMA_BIT_MASK(64)) != 0) ||
-	    (pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64)) != 0)) {
-		if ((pci_set_dma_mask(pdev, DMA_BIT_MASK(32)) != 0) ||
-		    (pci_set_consistent_dma_mask(pdev,
-						 DMA_BIT_MASK(32)) != 0)) {
-			dev_err(&pdev->dev, "pci_set_dma_mask fail %p\n",
-				pdev);
-			return -ENODEV;
+	if (tries > 0) {
+		tries = 1;      /* to make read-skip work */
+		if (mask != 0xFF) {
+			/*
+			 * Not a pure write, so need to read.
+			 * loc encodes chip-select as well as address
+			 */
+			transval = loc | EPB_RD;
+			tries = epb_trans(dd, trans, transval, &transval);
+		}
+		if (tries > 0 && mask != 0) {
+			/*
+			 * Not a pure read, so need to write.
+			 */
+			wd = (wd & mask) | (transval & ~mask);
+			transval = loc | (wd & EPB_DATA_MASK);
+			tries = epb_trans(dd, trans, transval, &transval);
 		}
 	}
+	/* else, failed to see ready, what error-handling? */
 
-	err = ismt_dev_init(priv);
-	if (err)
-		return err;
+	/*
+	 * Release bus. Failure is an error.
+	 */
+	if (epb_access(dd, sdnum, -1) < 0)
+		ret = -1;
+	else
+		ret = transval & EPB_DATA_MASK;
 
-	ismt_hw_init(priv);
+	spin_unlock_irqrestore(&dd->cspec->sdepb_lock, flags);
+	if (tries <= 0)
+		ret = -1;
+	return ret;
+}
 
-	err = ismt_int_init(priv);
-	if (err)
-		return err;
+#define EPB_ROM_R (2)
+#define EPB_ROM_W (1)
+/*
+ * Below, all uC-related, use appropriate UC_CS, depending
+ * on which SerDes is used.
+ */
+#define EPB_UC_CTL EPB_LOC(6, 0, 0)
+#define EPB_MADDRL EPB_LOC(6, 0, 2)
+#define EPB_MADDRH EPB_LOC(6, 0, 3)
+#define EPB_ROMDATA EPB_LOC(6, 0, 4)
+#define EPB_RAMDATA EPB_LOC(6, 0, 5)
 
-	err = i2c_add_adapter(&priv->adapter);
-	if (err) {
-		dev_err(&pdev->dev, "Failed to add SMBus iSMT adapter\n");
-		return -ENODEV;
+/* Transfer date to/from uC Program RAM of IB or PCIe SerDes */
+static int qib_sd7220_ram_xfer(struct qib_devdata *dd, int sdnum, u32 loc,
+			       u8 *buf, int cnt, int rd_notwr)
+{
+	u16 trans;
+	u64 transval;
+	u64 csbit;
+	int owned;
+	int tries;
+	int sofar;
+	int addr;
+	int ret;
+	unsigned long flags;
+	const char *op;
+
+	/* Pick appropriate transaction reg and "Chip select" for this serdes */
+	switch (sdnum) {
+	case IB_7220_SERDES:
+		csbit = 1ULL << EPB_IB_UC_CS_SHF;
+		trans = kr_ibsd_epb_transaction_reg;
+		break;
+
+	case PCIE_SERDES0:
+	case PCIE_SERDES1:
+		/* PCIe SERDES has uC "chip select" in different bit, too */
+		csbit = 1ULL << EPB_PCIE_UC_CS_SHF;
+		trans = kr_pciesd_epb_transaction_reg;
+		break;
+
+	default:
+		return -1;
 	}
+
+	op = rd_notwr ? "Rd" : "Wr";
+	spin_lock_irqsave(&dd->cspec->sdepb_lock, flags);
+
+	owned = epb_access(dd, sdnum, 1);
+	if (owned < 0) {
+		spin_unlock_irqrestore(&dd->cspec->sdepb_lock, flags);
+		return -1;
+	}
+
+	/*
+	 * In future code, we may need to distinguish several address ranges,
+	 * and select various memories based on this. For now, just trim
+	 * "loc" (location including address and memory select) to
+	 * "addr" (address within memory). we will only support PRAM
+	 * The memory is 8KB.
+	 */
+	addr = loc & 0x1FFF;
+	for (tries = EPB_TRANS_TRIES; tries; --tries) {
+		transval = qib_read_kreg32(dd, trans);
+		if (transval & EPB_TRANS_RDY)
+			break;
+		udelay(5);
+	}
+
+	sofar = 0;
+	if (tries > 0) {
+		/*
+		 * Every "memory" access is doubly-indirect.
+		 * We set two bytes of address, then read/write
+		 * one or mores bytes of data.
+		 */
+
+		/* First, we set control to "Read" or "Write" */
+		transval = csbit | EPB_UC_CTL |
+			(rd_notwr ? EPB_ROM_R : EPB_ROM_W);
+		tries = epb_trans(dd, trans, transval, &transval);
+		while (tries > 0 && sofar < cnt) {
+			if (!sofar) {
+				/* Only set address at start of chunk */
+				int addrbyte = (addr + sofar) >> 8;
+
+				transval = csbit | EPB_MADDRH | addrbyte;
+				tries = epb_trans(dd, trans, transval,
+						  &transval);
+				if (tries <= 0)
+					break;
+				addrbyte = (addr + sofar) & 0xFF;
+				transval = csbit | EPB_MADDRL | addrbyte;
+				tries = epb_trans(dd, trans, transval,
+						 &transval);
+				if (tries <= 0)
+					break;
+			}
+
+			if (rd_notwr)
+				transval = csbit | EPB_ROMDATA | EPB_RD;
+			else
+				transval = csbit | EPB_ROMDATA | buf[sofar];
+			tries = epb_trans(dd, trans, transval, &transval);
+			if (tries <= 0)
+				break;
+			if (rd_notwr)
+				buf[sofar] = transval & EPB_DATA_MASK;
+			++sofar;
+		}
+		/* Finally, clear control-bit for Read or Write */
+		transval = csbit | EPB_UC_CTL;
+		tries = epb_trans(dd, trans, transval, &transval);
+	}
+
+	ret = sofar;
+	/* Release bus. Failure is an error */
+	if (epb_access(dd, sdnum, -1) < 0)
+		ret = -1;
+
+	spin_unlock_irqrestore(&dd->cspec->sdepb_lock, flags);
+	if (tries <= 0)
+		ret = -1;
+	return ret;
+}
+
+#define PROG_CHUNK 64
+
+static int qib_sd7220_prog_ld(struct qib_devdata *dd, int sdnum,
+			      const u8 *img, int len, int offset)
+{
+	int cnt, sofar, req;
+
+	sofar = 0;
+	while (sofar < len) {
+		req = len - sofar;
+		if (req > PROG_CHUNK)
+			req = PROG_CHUNK;
+		cnt = qib_sd7220_ram_xfer(dd, sdnum, offset + sofar,
+					  (u8 *)img + sofar, req, 0);
+		if (cnt < req) {
+			sofar = -1;
+			break;
+		}
+		sofar += req;
+	}
+	return sofar;
+}
+
+#define VFY_CHUNK 64
+#define SD_PRAM_ERROR_LIMIT 42
+
+static int qib_sd7220_prog_vfy(struct qib_devdata *dd, int sdnum,
+			       const u8 *img, int len, int offset)
+{
+	int cnt, sofar, req, idx, errors;
+	unsigned char readback[VFY_CHUNK];
+
+	errors = 0;
+	sofar = 0;
+	while (sofar < len) {
+		req = len - sofar;
+		if (req > VFY_CHUNK)
+			req = VFY_CHUNK;
+		cnt = qib_sd7220_ram_xfer(dd, sdnum, sofar + offset,
+					  readback, req, 1);
+		if (cnt < req) {
+			/* failed in read itself */
+			sofar = -1;
+			break;
+		}
+		for (idx = 0; idx < cnt; ++idx) {
+			if (readback[idx] != img[idx+sofar])
+				++errors;
+		}
+		sofar += cnt;
+	}
+	return errors ? -errors : sofar;
+}
+
+static int
+qib_sd7220_ib_load(struct qib_devdata *dd, const struct firmware *fw)
+{
+	return qib_sd7220_prog_ld(dd, IB_7220_SERDES, fw->data, fw->size, 0);
+}
+
+static int
+qib_sd7220_ib_vfy(struct qib_devdata *dd, const struct firmware *fw)
+{
+	return qib_sd7220_prog_vfy(dd, IB_7220_SERDES, fw->data, fw->size, 0);
+}
+
+/*
+ * IRQ not set up at this point in init, so we poll.
+ */
+#define IB_SERDES_TRIM_DONE (1ULL << 11)
+#define TRIM_TMO (15)
+
+static int qib_sd_trimdone_poll(struct qib_devdata *dd)
+{
+	int trim_tmo, ret;
+	uint64_t val;
+
+	/*
+	 * Default to failure, so IBC will not start
+	 * without IB_SERDES_TRIM_DONE.
+	 */
+	ret = 0;
+	for (trim_tmo = 0; trim_tmo < TRIM_TMO; ++trim_tmo) {
+		val = qib_read_kreg64(dd, kr_ibcstatus);
+		if (val & IB_SERDES_TRIM_DONE) {
+			ret = 1;
+			break;
+		}
+		msleep(20);
+	}
+	if (trim_tmo >= TRIM_TMO) {
+		qib_dev_err(dd, "No TRIMDONE in %d tries\n", trim_tmo);
+		ret = 0;
+	}
+	return ret;
+}
+
+#define TX_FAST_ELT (9)
+
+/*
+ * Set the "negotiation" values for SERDES. These are used by the IB1.2
+ * link negotiation. Macros below are attempt to keep the values a
+ * little more human-editable.
+ * First, values related to Drive De-emphasis Settings.
+ */
+
+#define NUM_DDS_REGS 6
+#define DDS_REG_MAP 0x76A910 /* LSB-first list of regs (in elt 9) to mod */
+
+#define DDS_VAL(amp_d, main_d, ipst_d, ipre_d, amp_s, main_s, ipst_s, ipre_s) \
+	{ { ((amp_d & 0x1F) << 1) | 1, ((amp_s & 0x1F) << 1) | 1, \
+	  (main_d << 3) | 4 | (ipre_d >> 2), \
+	  (main_s << 3) | 4 | (ipre_s >> 2), \
+	  ((ipst_d & 0xF) << 1) | ((ipre_d & 3) << 6) | 0x21, \
+	  ((ipst_s & 0xF) << 1) | ((ipre_s & 3) << 6) | 0x21 } }
+
+static struct dds_init {
+	uint8_t reg_vals[NUM_DDS_REGS];
+} dds_init_vals[] = {
+	/*       DDR(FDR)       SDR(HDR)   */
+	/* Vendor recommends below for 3m cable */
+#define DDS_3M 0
+	DDS_VAL(31, 19, 12, 0, 29, 22,  9, 0),
+	DDS_VAL(31, 12, 15, 4, 31, 15, 15, 1),
+	DDS_VAL(31, 13, 15, 3, 31, 16, 15, 0),
+	DDS_VAL(31, 14, 15, 2, 31, 17, 14, 0),
+	DDS_VAL(31, 15, 15, 1, 31, 18, 13, 0),
+	DDS_VAL(31, 16, 15, 0, 31, 19, 12, 0),
+	DDS_VAL(31, 17, 14, 0, 31, 20, 11, 0),
+	DDS_VAL(31, 18, 13, 0, 30, 21, 10, 0),
+	DDS_VAL(31, 20, 11, 0, 28, 23,  8, 0),
+	DDS_VAL(31, 21, 10, 0, 27, 24,  7, 0),
+	DDS_VAL(31, 22,  9, 0, 26, 25,  6, 0),
+	DDS_VAL(30, 23,  8, 0, 25, 26,  5, 0),
+	DDS_VAL(29, 24,  7, 0, 23, 27,  4, 0),
+	/* Vendor recommends below for 1m cable */
+#define DDS_1M 13
+	DDS_VAL(28, 25,  6, 0, 21, 28,  3, 0),
+	DDS_VAL(27, 26,  5, 0, 19, 29,  2, 0),
+	DDS_VAL(25, 27,  4, 0, 17, 30,  1, 0)
+};
+
+/*
+ * Now the RXEQ section of the table.
+ */
+/* Hardware packs an element number and register address thus: */
+#define RXEQ_INIT_RDESC(elt, addr) (((elt) & 0xF) | ((addr) << 4))
+#define RXEQ_VAL(elt, adr, val0, val1, val2, val3) \
+	{RXEQ_INIT_RDESC((elt), (adr)), {(val0), (val1), (val2), (val3)} }
+
+#define RXEQ_VAL_ALL(elt, adr, val)  \
+	{RXEQ_INIT_RDESC((elt), (adr)), {(val), (val), (val), (val)} }
+
+#define RXEQ_SDR_DFELTH 0
+#define RXEQ_SDR_TLTH 0
+#define RXEQ_SDR_G1CNT_Z1CNT 0x11
+#define RXEQ_SDR_ZCNT 23
+
+static struct rxeq_init {
+	u16 rdesc;      /* in form used in SerDesDDSRXEQ */
+	u8  rdata[4];
+} rxeq_init_vals[] = {
+	/* Set Rcv Eq. to Preset node */
+	RXEQ_VAL_ALL(7, 0x27, 0x10),
+	/* Set DFELTHFDR/HDR thresholds */
+	RXEQ_VAL(7, 8,    0, 0, 0, 0), /* FDR, was 0, 1, 2, 3 */
+	RXEQ_VAL(7, 0x21, 0, 0, 0, 0), /* HDR */
+	/* Set TLTHFDR/HDR theshold */
+	RXEQ_VAL(7, 9,    2, 2, 2, 2), /* FDR, was 0, 2, 4, 6 */
+	RXEQ_VAL(7, 0x23, 2, 2, 2, 2), /* HDR, was  0, 1, 2, 3 */
+	/* Set Preamp setting 2 (ZFR/ZCNT) */
+	RXEQ_VAL(7, 0x1B, 12, 12, 12, 12), /* FDR, was 12, 16, 20, 24 */
+	RXEQ_VAL(7, 0x1C, 12, 12, 12, 12), /* HDR, was 12, 16, 20, 24 */
+	/* Set Preamp DC gain and Setting 1 (GFR/GHR) */
+	RXEQ_VAL(7, 0x1E, 16, 16, 16, 16), /* FDR, was 16, 17, 18, 20 */
+	RXEQ_VAL(7, 0x1F, 16, 16, 16, 16), /* HDR, was 16, 17, 18, 20 */
+	/* Toggle RELOCK (in VCDL_CTRL0) to lock to data */
+	RXEQ_VAL_ALL(6, 6, 0x20), /* Set D5 High */
+	RXEQ_VAL_ALL(6, 6, 0), /* Set D5 Low */
+};
+
+/* There are 17 values from vendor, but IBC only accesses the first 16 */
+#define DDS_ROWS (16)
+#define RXEQ_ROWS ARRAY_SIZE(rxeq_init_vals)
+
+static int qib_sd_setvals(struct qib_devdata *dd)
+{
+	int idx, midx;
+	int min_idx;     /* Minimum index for this portion of table */
+	uint32_t dds_reg_map;
+	u64 __iomem *taddr, *iaddr;
+	uint64_t data;
+	uint64_t sdctl;
+
+	taddr = dd->kregbase + kr_serdes_maptable;
+	iaddr = dd->kregbase + kr_serdes_ddsrxeq0;
+
+	/*
+	 * Init the DDS section of the table.
+	 * Each "row" of the table provokes NUM_DDS_REG writes, to the
+	 * registers indicated in DDS_REG_MAP.
+	 */
+	sdctl = qib_read_kreg64(dd, kr_ibserdesctrl);
+	sdctl = (sdctl & ~(0x1f << 8)) | (NUM_DDS_REGS << 8);
+	sdctl = (sdctl & ~(0x1f << 13)) | (RXEQ_ROWS << 13);
+	qib_write_kreg(dd, kr_ibserdesctrl, sdctl);
+
+	/*
+	 * Iterate down table within loop for each register to store.
+	 */
+	dds_reg_map = DDS_REG_MAP;
+	for (idx = 0; idx < NUM_DDS_REGS; ++idx) {
+		data = ((dds_reg_map & 0xF) << 4) | TX_FAST_ELT;
+		writeq(data, iaddr + idx);
+		mmiowb();
+		qib_read_kreg32(dd, kr_scratch);
+		dds_reg_map >>= 4;
+		for (midx = 0; midx < DDS_ROWS; ++midx) {
+			u64 __iomem *daddr = taddr + ((midx << 4) + idx);
+
+			data = dds_init_vals[midx].reg_vals[idx];
+			writeq(data, daddr);
+			mmiowb();
+			qib_read_kreg32(dd, kr_scratch);
+		} /* End inner for (vals for this reg, each row) */
+	} /* end outer for (regs to be stored) */
+
+	/*
+	 * Init the RXEQ section of the table.
+	 * This runs in a different order, as the pattern of
+	 * register references is more complex, but there are only
+	 * four "data" values per register.
+	 */
+	min_idx = idx; /* RXEQ indices pick up where DDS left off */
+	taddr += 0x100; /* RXEQ data is in second half of table */
+	/* Iterate through RXEQ register addresses */
+	for (idx = 0; idx < RXEQ_ROWS; ++idx) {
+		int didx; /* "destination" */
+		int vidx;
+
+		/* didx is offset by min_idx to address RXEQ range of regs */
+		didx = idx + min_idx;
+		/* Store the next RXEQ register address */
+		writeq(rxeq_init_vals[idx].rdesc, iaddr + didx);
+		mmiowb();
+		qib_read_kreg32(dd, kr_scratch);
+		/* Iterate through RXEQ values */
+		for (vidx = 0; vidx < 4; vidx++) {
+			data = rxeq_init_vals[idx].rdata[vidx];
+			writeq(data, taddr + (vidx << 6) + idx);
+			mmiowb();
+			qib_read_kreg32(dd, kr_scratch);
+		}
+	} /* end outer for (Reg-writes for RXEQ) */
 	return 0;
 }
 
-/**
- * ismt_remove() - release driver resources
- * @pdev: PCI-Express device
- */
-static void ismt_remove(struct pci_dev *pdev)
-{
-	struct ismt_priv *priv = pci_get_drvdata(pdev);
+#define CMUCTRL5 EPB_LOC(7, 0, 0x15)
+#define RXHSCTRL0(chan) EPB_LOC(chan, 6, 0)
+#define VCDL_DAC2(chan) EPB_LOC(chan, 6, 5)
+#define VCDL_CTRL0(chan) EPB_LOC(chan, 6, 6)
+#define VCDL_CTRL2(chan) EPB_LOC(chan, 6, 8)
+#define START_EQ2(chan) EPB_LOC(chan, 7, 0x28)
 
-	i2c_del_adapter(&priv->adapter);
+/*
+ * Repeat a "store" across all channels of the IB SerDes.
+ * Although nominally it inherits the "read value" of the last
+ * channel it modified, the only really useful return is <0 for
+ * failure, >= 0 for success. The parameter 'loc' is assumed to
+ * be the location in some channel of the register to be modified
+ * The caller can specify use of the "gang write" option of EPB,
+ * in which case we use the specified channel data for any fields
+ * not explicitely written.
+ */
+static int ibsd_mod_allchnls(struct qib_devdata *dd, int loc, int val,
+			     int mask)
+{
+	int ret = -1;
+	int chnl;
+
+	if (loc & EPB_GLOBAL_WR) {
+		/*
+		 * Our caller has assured us that we can set all four
+		 * channels at once. Trust that. If mask is not 0xFF,
+		 * we will read the _specified_ channel for our starting
+		 * value.
+		 */
+		loc |= (1U << EPB_IB_QUAD0_CS_SHF);
+		chnl = (loc >> (4 + EPB_ADDR_SHF)) & 7;
+		if (mask != 0xFF) {
+			ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES,
+						 loc & ~EPB_GLOBAL_WR, 0, 0);
+			if (ret < 0) {
+				int sloc = loc >> EPB_ADDR_SHF;
+
+				qib_dev_err(dd,
+					"pre-read failed: elt %d, addr 0x%X, chnl %d\n",
+					(sloc & 0xF),
+					(sloc >> 9) & 0x3f, chnl);
+				return ret;
+			}
+			val = (ret & ~mask) | (val & mask);
+		}
+		loc &=  ~(7 << (4+EPB_ADDR_SHF));
+		ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES, loc, val, 0xFF);
+		if (ret < 0) {
+			int sloc = loc >> EPB_ADDR_SHF;
+
+			qib_dev_err(dd,
+				"Global WR failed: elt %d, addr 0x%X, val %02X\n",
+				(sloc & 0xF), (sloc >> 9) & 0x3f, val);
+		}
+		return ret;
+	}
+	/* Clear "channel" and set CS so we can simply iterate */
+	loc &=  ~(7 << (4+EPB_ADDR_SHF));
+	loc |= (1U << EPB_IB_QUAD0_CS_SHF);
+	for (chnl = 0; chnl < 4; ++chnl) {
+		int cloc = loc | (chnl << (4+EPB_ADDR_SHF));
+
+		ret = qib_sd7220_reg_mod(dd, IB_7220_SERDES, cloc, val, mask);
+		if (ret < 0) {
+			int sloc = loc >> EPB_ADDR_SHF;
+
+			qib_dev_err(dd,
+				"Write failed: elt %d, addr 0x%X, chnl %d, val 0x%02X, mask 0x%02X\n",
+				(sloc & 0xF), (sloc >> 9) & 0x3f, chnl,
+				val & 0xFF, mask & 0xFF);
+			break;
+		}
+	}
+	return ret;
 }
 
-static struct pci_driver ismt_driver = {
-	.name = "ismt_smbus",
-	.id_table = ismt_ids,
-	.probe = ismt_probe,
-	.remove = ismt_remove,
-};
+/*
+ * Set the Tx values normally modified by IBC in IB1.2 mode to default
+ * values, as gotten from first row of init table.
+ */
+static int set_dds_vals(struct qib_devdata *dd, struct dds_init *ddi)
+{
+	int ret;
+	int idx, reg, data;
+	uint32_t regmap;
 
-module_pci_driver(ismt_driver);
+	regmap = DDS_REG_MAP;
+	for (idx = 0; idx < NUM_DDS_REGS; ++idx) {
+		reg = (regmap & 0xF);
+		regmap >>= 4;
+		data = ddi->reg_vals[idx];
+		/* Vendor says RMW not needed for these regs, use 0xFF mask */
+		ret = ibsd_mod_allchnls(dd, EPB_LOC(0, 9, reg), data, 0xFF);
+		if (ret < 0)
+			break;
+	}
+	return ret;
+}
 
-MODULE_LICENSE("Dual BSD/GPL");
-MODULE_AUTHOR("Bill E. Brown <bill.e.brown@intel.com>");
-MODULE_DESCRIPTION("Intel SMBus Message Transport (iSMT) driver");
+/*
+ * Set the Rx values normally modified by IBC in IB1.2 mode to default
+ * values, as gotten from selected column of init table.
+ */
+static int set_rxeq_vals(struct qib_devdata *dd, int vsel)
+{
+	int ret;
+	int ridx;
+	int cnt = ARRAY_SIZE(rxeq_init_vals);
+
+	for (ridx = 0; ridx < cnt; ++ridx) {
+		int elt, reg, val, loc;
+
+		elt = rxeq_init_vals[ridx].rdesc & 0xF;
+		reg = rxeq_init_vals[ridx].rdesc >> 4;
+		loc = EPB_LOC(0, elt, reg);
+		val = rxeq_init_vals[ridx].rdata[vsel];
+		/* mask of 0xFF, because hardware does full-byte store. */
+		ret = ibsd_mod_allchnls(dd, loc, val, 0xFF);
+		if (ret < 0)
+			break;
+	}
+	return ret;
+}
+
+/*
+ * Set the default values (row 0) for DDR Driver Demphasis.
+ * we do this initially and whenever we turn off IB-1.2
+ *
+ * The "default" values for Rx equalization are also stored to
+ * SerDes registers. Formerly (and still default), we used set 2.
+ * For experimenting with cables and link-partners, we allow changing
+ * that via a module parameter.
+ */
+static unsigned qib_rxeq_set = 2;
+module_param_named(rxeq_default_set, qib_rxeq_set, uint,
+		   S_IWUSR | S_IRUGO);
+MODULE_PARM_DESC(rxeq_default_set,
+		 "Which set [0..3] of Rx Equalization values is default");
+
+static int qib_internal_presets(struct qib_devdata *dd)
+{
+	int ret = 0;
+
+	ret = set_dds_vals(dd, dds_init_vals + DDS_3M);
+
+	if (ret < 0)
+		qib_dev_err(dd, "Failed to set default DDS valu

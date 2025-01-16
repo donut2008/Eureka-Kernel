@@ -1,154 +1,86 @@
-/*
- * muic_ccic.c
- *
- * Copyright (C) 2014 Samsung Electronics
- * Thomas Ryu <smilesr.ryu@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
- */
-
-#include <linux/gpio.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/slab.h>
-#include <linux/platform_device.h>
-#include <linux/module.h>
-#include <linux/delay.h>
-#include <linux/host_notify.h>
-#include <linux/string.h>
-#if defined (CONFIG_OF)
-#include <linux/of_device.h>
-#include <linux/of_gpio.h>
-#endif
-
-#include <linux/muic/muic.h>
-#if defined(CONFIG_MUIC_NOTIFIER)
-#include <linux/muic/muic_notifier.h>
-#endif
-
-#if defined(CONFIG_USB_EXTERNAL_NOTIFY)
-#include <linux/usb_notify.h>
-#endif
-
-#include "muic-internal.h"
-#include "muic_coagent.h"
-
-#if defined(CONFIG_USB_EXTERNAL_NOTIFY)
-extern void muic_send_dock_intent(int type);
-
-/*
- * status: normal if 1, abnormal if 0
- * return 0 on success, -1 on fail
- */
-static int muic_noti_gamepad_status(int status, const char *sender)
-{
-	uint val;
-
-	if (!sender) {
-		pr_info("%s:%s: Illegal argument!\n", MUIC_DEV_NAME, __func__);
-		return -1;
-	}
-
-	pr_info("%s:%s gamepas_status=[%s] from %s\n", MUIC_DEV_NAME, __func__,
-		status ? "normal" : "abnormal", sender);
-
-	val = status ? COA_STATUS_OK: COA_STATUS_NOK;
-	val <<= COAGENT_PARAM_BITS;
-	val |= COA_GAMEPAD_STATUS;
-	coagent_in(&val);
-
-	return 0;
-}
-
-static int muic_handle_usb_notification(struct notifier_block *nb,
-				unsigned long action, void *data)
-{
-	muic_data_t *pmuic =
-		container_of(nb, muic_data_t, usb_nb);
-
-	switch (action) {
-	/* Abnormal device */
-	case EXTERNAL_NOTIFY_3S_NODEVICE:
-		pr_info("%s: 3S_NODEVICE(USB HOST Connection timeout)\n", __func__);
-		if (pmuic->attached_dev == ATTACHED_DEV_HMT_MUIC)
-			muic_set_hmt_status(1);
-		else if ((pmuic->attached_dev == ATTACHED_DEV_GAMEPAD_MUIC) ||
-			(pmuic->attached_dev == ATTACHED_DEV_OTG_MUIC))
-			pr_info("%s: Abnormal Gamepad -> do nothing.\n", __func__);
-		
-		break;
-
-	/* Gamepad device connected */
-	case EXTERNAL_NOTIFY_DEVICE_CONNECT:
-		pr_info("%s: DEVICE_CONNECT(Gamepad)\n", __func__);
-
-
-		if ((pmuic->attached_dev != ATTACHED_DEV_GAMEPAD_MUIC) &&
-			(pmuic->attached_dev != ATTACHED_DEV_OTG_MUIC)) {
-			pr_info("%s: Unexpected scenario.n", __func__);
-			break;
-		}			
-
-		pmuic->is_gamepad = true;
-		if (pmuic->attached_dev == ATTACHED_DEV_OTG_MUIC)
-			muic_send_dock_intent(MUIC_DOCK_GAMEPAD_WITH_EARJACK);
-
-		muic_noti_gamepad_status(1, "USB");
-		break;
-
-	default:
-		break;
-	}
-
-	return NOTIFY_DONE;
-}
-
-
-void muic_register_usb_notifier(muic_data_t *pmuic)
-{
-	int ret = 0;
-
-	pr_info("%s: Registering EXTERNAL_NOTIFY_DEV_MUIC.\n", __func__);
-
-
-	ret = usb_external_notify_register(&pmuic->usb_nb,
-		muic_handle_usb_notification, EXTERNAL_NOTIFY_DEV_MUIC);
-	if (ret < 0) {
-		pr_info("%s: USB Noti. is not ready.\n", __func__);
-		return;
-	}
-
-	pr_info("%s: done.\n", __func__);
-}
-
-void muic_unregister_usb_notifier(muic_data_t *pmuic)
-{
-	int ret = 0;
-
-	pr_info("%s\n", __func__);
-
-	ret = usb_external_notify_unregister(&pmuic->usb_nb);
-	if (ret < 0) {
-		pr_info("%s: USB Noti. unregister error.\n", __func__);
-		return;
-	}
-
-	pr_info("%s: done.\n", __func__);
-}
-#else
-void muic_register_usb_notifier(muic_data_t *pmuic){}
-void muic_unregister_usb_notifier(muic_data_t *pmuic){}
-#endif
+00
+#define MC_ARB_WTM_GRPWT_WR__GRP4__SHIFT 0x8
+#define MC_ARB_WTM_GRPWT_WR__GRP5_MASK 0xc00
+#define MC_ARB_WTM_GRPWT_WR__GRP5__SHIFT 0xa
+#define MC_ARB_WTM_GRPWT_WR__GRP6_MASK 0x3000
+#define MC_ARB_WTM_GRPWT_WR__GRP6__SHIFT 0xc
+#define MC_ARB_WTM_GRPWT_WR__GRP7_MASK 0xc000
+#define MC_ARB_WTM_GRPWT_WR__GRP7__SHIFT 0xe
+#define MC_ARB_WTM_GRPWT_WR__GRP_EXT_MASK 0xff0000
+#define MC_ARB_WTM_GRPWT_WR__GRP_EXT__SHIFT 0x10
+#define MC_ARB_TM_CNTL_RD__GROUPBY_RANK_MASK 0x1
+#define MC_ARB_TM_CNTL_RD__GROUPBY_RANK__SHIFT 0x0
+#define MC_ARB_TM_CNTL_RD__BANK_SELECT_MASK 0x6
+#define MC_ARB_TM_CNTL_RD__BANK_SELECT__SHIFT 0x1
+#define MC_ARB_TM_CNTL_RD__MATCH_RANK_MASK 0x8
+#define MC_ARB_TM_CNTL_RD__MATCH_RANK__SHIFT 0x3
+#define MC_ARB_TM_CNTL_RD__MATCH_BANK_MASK 0x10
+#define MC_ARB_TM_CNTL_RD__MATCH_BANK__SHIFT 0x4
+#define MC_ARB_TM_CNTL_WR__GROUPBY_RANK_MASK 0x1
+#define MC_ARB_TM_CNTL_WR__GROUPBY_RANK__SHIFT 0x0
+#define MC_ARB_TM_CNTL_WR__BANK_SELECT_MASK 0x6
+#define MC_ARB_TM_CNTL_WR__BANK_SELECT__SHIFT 0x1
+#define MC_ARB_TM_CNTL_WR__MATCH_RANK_MASK 0x8
+#define MC_ARB_TM_CNTL_WR__MATCH_RANK__SHIFT 0x3
+#define MC_ARB_TM_CNTL_WR__MATCH_BANK_MASK 0x10
+#define MC_ARB_TM_CNTL_WR__MATCH_BANK__SHIFT 0x4
+#define MC_ARB_LAZY0_RD__GROUP0_MASK 0xff
+#define MC_ARB_LAZY0_RD__GROUP0__SHIFT 0x0
+#define MC_ARB_LAZY0_RD__GROUP1_MASK 0xff00
+#define MC_ARB_LAZY0_RD__GROUP1__SHIFT 0x8
+#define MC_ARB_LAZY0_RD__GROUP2_MASK 0xff0000
+#define MC_ARB_LAZY0_RD__GROUP2__SHIFT 0x10
+#define MC_ARB_LAZY0_RD__GROUP3_MASK 0xff000000
+#define MC_ARB_LAZY0_RD__GROUP3__SHIFT 0x18
+#define MC_ARB_LAZY0_WR__GROUP0_MASK 0xff
+#define MC_ARB_LAZY0_WR__GROUP0__SHIFT 0x0
+#define MC_ARB_LAZY0_WR__GROUP1_MASK 0xff00
+#define MC_ARB_LAZY0_WR__GROUP1__SHIFT 0x8
+#define MC_ARB_LAZY0_WR__GROUP2_MASK 0xff0000
+#define MC_ARB_LAZY0_WR__GROUP2__SHIFT 0x10
+#define MC_ARB_LAZY0_WR__GROUP3_MASK 0xff000000
+#define MC_ARB_LAZY0_WR__GROUP3__SHIFT 0x18
+#define MC_ARB_LAZY1_RD__GROUP4_MASK 0xff
+#define MC_ARB_LAZY1_RD__GROUP4__SHIFT 0x0
+#define MC_ARB_LAZY1_RD__GROUP5_MASK 0xff00
+#define MC_ARB_LAZY1_RD__GROUP5__SHIFT 0x8
+#define MC_ARB_LAZY1_RD__GROUP6_MASK 0xff0000
+#define MC_ARB_LAZY1_RD__GROUP6__SHIFT 0x10
+#define MC_ARB_LAZY1_RD__GROUP7_MASK 0xff000000
+#define MC_ARB_LAZY1_RD__GROUP7__SHIFT 0x18
+#define MC_ARB_LAZY1_WR__GROUP4_MASK 0xff
+#define MC_ARB_LAZY1_WR__GROUP4__SHIFT 0x0
+#define MC_ARB_LAZY1_WR__GROUP5_MASK 0xff00
+#define MC_ARB_LAZY1_WR__GROUP5__SHIFT 0x8
+#define MC_ARB_LAZY1_WR__GROUP6_MASK 0xff0000
+#define MC_ARB_LAZY1_WR__GROUP6__SHIFT 0x10
+#define MC_ARB_LAZY1_WR__GROUP7_MASK 0xff000000
+#define MC_ARB_LAZY1_WR__GROUP7__SHIFT 0x18
+#define MC_ARB_AGE_RD__RATE_GROUP0_MASK 0x3
+#define MC_ARB_AGE_RD__RATE_GROUP0__SHIFT 0x0
+#define MC_ARB_AGE_RD__RATE_GROUP1_MASK 0xc
+#define MC_ARB_AGE_RD__RATE_GROUP1__SHIFT 0x2
+#define MC_ARB_AGE_RD__RATE_GROUP2_MASK 0x30
+#define MC_ARB_AGE_RD__RATE_GROUP2__SHIFT 0x4
+#define MC_ARB_AGE_RD__RATE_GROUP3_MASK 0xc0
+#define MC_ARB_AGE_RD__RATE_GROUP3__SHIFT 0x6
+#define MC_ARB_AGE_RD__RATE_GROUP4_MASK 0x300
+#define MC_ARB_AGE_RD__RATE_GROUP4__SHIFT 0x8
+#define MC_ARB_AGE_RD__RATE_GROUP5_MASK 0xc00
+#define MC_ARB_AGE_RD__RATE_GROUP5__SHIFT 0xa
+#define MC_ARB_AGE_RD__RATE_GROUP6_MASK 0x3000
+#define MC_ARB_AGE_RD__RATE_GROUP6__SHIFT 0xc
+#define MC_ARB_AGE_RD__RATE_GROUP7_MASK 0xc000
+#define MC_ARB_AGE_RD__RATE_GROUP7__SHIFT 0xe
+#define MC_ARB_AGE_RD__ENABLE_GROUP0_MASK 0x10000
+#define MC_ARB_AGE_RD__ENABLE_GROUP0__SHIFT 0x10
+#define MC_ARB_AGE_RD__ENABLE_GROUP1_MASK 0x20000
+#define MC_ARB_AGE_RD__ENABLE_GROUP1__SHIFT 0x11
+#define MC_ARB_AGE_RD__ENABLE_GROUP2_MASK 0x40000
+#define MC_ARB_AGE_RD__ENABLE_GROUP2__SHIFT 0x12
+#define MC_ARB_AGE_RD__ENABLE_GROUP3_MASK 0x80000
+#define MC_ARB_AGE_RD__ENABLE_GROUP3__SHIFT 0x13
+#define MC_ARB_AGE_RD__ENABLE_GROUP4_MASK 0x100000
+#define MC_ARB_AGE_RD__ENABLE_GROUP4__SHIFT 0x14
+#define MC_ARB_AGE_RD__ENABLE_GROUP5_MASK 0x200000
+#define MC

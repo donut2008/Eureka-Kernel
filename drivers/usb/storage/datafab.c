@@ -1,764 +1,346 @@
-/* Driver for Datafab USB Compact Flash reader
- *
- * datafab driver v0.1:
- *
- * First release
- *
- * Current development and maintenance by:
- *   (c) 2000 Jimmie Mayfield (mayfield+datafab@sackheads.org)
- *
- *   Many thanks to Robert Baruch for the SanDisk SmartMedia reader driver
- *   which I used as a template for this driver.
- *
- *   Some bugfixes and scatter-gather code by Gregory P. Smith 
- *   (greg-usb@electricrain.com)
- *
- *   Fix for media change by Joerg Schneider (js@joergschneider.com)
- *
- * Other contributors:
- *   (c) 2002 Alan Stern <stern@rowland.org>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-/*
- * This driver attempts to support USB CompactFlash reader/writer devices
- * based on Datafab USB-to-ATA chips.  It was specifically developed for the 
- * Datafab MDCFE-B USB CompactFlash reader but has since been found to work 
- * with a variety of Datafab-based devices from a number of manufacturers.
- * I've received a report of this driver working with a Datafab-based
- * SmartMedia device though please be aware that I'm personally unable to
- * test SmartMedia support.
- *
- * This driver supports reading and writing.  If you're truly paranoid,
- * however, you can force the driver into a write-protected state by setting
- * the WP enable bits in datafab_handle_mode_sense().  See the comments
- * in that routine.
- */
-
-#include <linux/errno.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-
-#include "usb.h"
-#include "transport.h"
-#include "protocol.h"
-#include "debug.h"
-#include "scsiglue.h"
-
-#define DRV_NAME "ums-datafab"
-
-MODULE_DESCRIPTION("Driver for Datafab USB Compact Flash reader");
-MODULE_AUTHOR("Jimmie Mayfield <mayfield+datafab@sackheads.org>");
-MODULE_LICENSE("GPL");
-
-struct datafab_info {
-	unsigned long   sectors;	/* total sector count */
-	unsigned long   ssize;		/* sector size in bytes */
-	signed char	lun;		/* used for dual-slot readers */
-
-	/* the following aren't used yet */
-	unsigned char   sense_key;
-	unsigned long   sense_asc;	/* additional sense code */
-	unsigned long   sense_ascq;	/* additional sense code qualifier */
-};
-
-static int datafab_determine_lun(struct us_data *us,
-				 struct datafab_info *info);
-
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-static struct usb_device_id datafab_usb_ids[] = {
-#	include "unusual_datafab.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, datafab_usb_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev datafab_unusual_dev_list[] = {
-#	include "unusual_datafab.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-
-static inline int
-datafab_bulk_read(struct us_data *us, unsigned char *data, unsigned int len) {
-	if (len == 0)
-		return USB_STOR_XFER_GOOD;
-
-	usb_stor_dbg(us, "len = %d\n", len);
-	return usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
-			data, len, NULL);
-}
-
-
-static inline int
-datafab_bulk_write(struct us_data *us, unsigned char *data, unsigned int len) {
-	if (len == 0)
-		return USB_STOR_XFER_GOOD;
-
-	usb_stor_dbg(us, "len = %d\n", len);
-	return usb_stor_bulk_transfer_buf(us, us->send_bulk_pipe,
-			data, len, NULL);
-}
-
-
-static int datafab_read_data(struct us_data *us,
-			     struct datafab_info *info,
-			     u32 sector,
-			     u32 sectors)
-{
-	unsigned char *command = us->iobuf;
-	unsigned char *buffer;
-	unsigned char  thistime;
-	unsigned int totallen, alloclen;
-	int len, result;
-	unsigned int sg_offset = 0;
-	struct scatterlist *sg = NULL;
-
-	// we're working in LBA mode.  according to the ATA spec, 
-	// we can support up to 28-bit addressing.  I don't know if Datafab
-	// supports beyond 24-bit addressing.  It's kind of hard to test 
-	// since it requires > 8GB CF card.
-	//
-	if (sectors > 0x0FFFFFFF)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	if (info->lun == -1) {
-		result = datafab_determine_lun(us, info);
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			return result;
-	}
-
-	totallen = sectors * info->ssize;
-
-	// Since we don't read more than 64 KB at a time, we have to create
-	// a bounce buffer and move the data a piece at a time between the
-	// bounce buffer and the actual transfer buffer.
-
-	alloclen = min(totallen, 65536u);
-	buffer = kmalloc(alloclen, GFP_NOIO);
-	if (buffer == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	do {
-		// loop, never allocate or transfer more than 64k at once
-		// (min(128k, 255*info->ssize) is the real limit)
-
-		len = min(totallen, alloclen);
-		thistime = (len / info->ssize) & 0xff;
-
-		command[0] = 0;
-		command[1] = thistime;
-		command[2] = sector & 0xFF;
-		command[3] = (sector >> 8) & 0xFF;
-		command[4] = (sector >> 16) & 0xFF;
-
-		command[5] = 0xE0 + (info->lun << 4);
-		command[5] |= (sector >> 24) & 0x0F;
-		command[6] = 0x20;
-		command[7] = 0x01;
-
-		// send the read command
-		result = datafab_bulk_write(us, command, 8);
-		if (result != USB_STOR_XFER_GOOD)
-			goto leave;
-
-		// read the result
-		result = datafab_bulk_read(us, buffer, len);
-		if (result != USB_STOR_XFER_GOOD)
-			goto leave;
-
-		// Store the data in the transfer buffer
-		usb_stor_access_xfer_buf(buffer, len, us->srb,
-				 &sg, &sg_offset, TO_XFER_BUF);
-
-		sector += thistime;
-		totallen -= len;
-	} while (totallen > 0);
-
-	kfree(buffer);
-	return USB_STOR_TRANSPORT_GOOD;
-
- leave:
-	kfree(buffer);
-	return USB_STOR_TRANSPORT_ERROR;
-}
-
-
-static int datafab_write_data(struct us_data *us,
-			      struct datafab_info *info,
-			      u32 sector,
-			      u32 sectors)
-{
-	unsigned char *command = us->iobuf;
-	unsigned char *reply = us->iobuf;
-	unsigned char *buffer;
-	unsigned char thistime;
-	unsigned int totallen, alloclen;
-	int len, result;
-	unsigned int sg_offset = 0;
-	struct scatterlist *sg = NULL;
-
-	// we're working in LBA mode.  according to the ATA spec, 
-	// we can support up to 28-bit addressing.  I don't know if Datafab
-	// supports beyond 24-bit addressing.  It's kind of hard to test 
-	// since it requires > 8GB CF card.
-	//
-	if (sectors > 0x0FFFFFFF)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	if (info->lun == -1) {
-		result = datafab_determine_lun(us, info);
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			return result;
-	}
-
-	totallen = sectors * info->ssize;
-
-	// Since we don't write more than 64 KB at a time, we have to create
-	// a bounce buffer and move the data a piece at a time between the
-	// bounce buffer and the actual transfer buffer.
-
-	alloclen = min(totallen, 65536u);
-	buffer = kmalloc(alloclen, GFP_NOIO);
-	if (buffer == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	do {
-		// loop, never allocate or transfer more than 64k at once
-		// (min(128k, 255*info->ssize) is the real limit)
-
-		len = min(totallen, alloclen);
-		thistime = (len / info->ssize) & 0xff;
-
-		// Get the data from the transfer buffer
-		usb_stor_access_xfer_buf(buffer, len, us->srb,
-				&sg, &sg_offset, FROM_XFER_BUF);
-
-		command[0] = 0;
-		command[1] = thistime;
-		command[2] = sector & 0xFF;
-		command[3] = (sector >> 8) & 0xFF;
-		command[4] = (sector >> 16) & 0xFF;
-
-		command[5] = 0xE0 + (info->lun << 4);
-		command[5] |= (sector >> 24) & 0x0F;
-		command[6] = 0x30;
-		command[7] = 0x02;
-
-		// send the command
-		result = datafab_bulk_write(us, command, 8);
-		if (result != USB_STOR_XFER_GOOD)
-			goto leave;
-
-		// send the data
-		result = datafab_bulk_write(us, buffer, len);
-		if (result != USB_STOR_XFER_GOOD)
-			goto leave;
-
-		// read the result
-		result = datafab_bulk_read(us, reply, 2);
-		if (result != USB_STOR_XFER_GOOD)
-			goto leave;
-
-		if (reply[0] != 0x50 && reply[1] != 0) {
-			usb_stor_dbg(us, "Gah! write return code: %02x %02x\n",
-				     reply[0], reply[1]);
-			result = USB_STOR_TRANSPORT_ERROR;
-			goto leave;
-		}
-
-		sector += thistime;
-		totallen -= len;
-	} while (totallen > 0);
-
-	kfree(buffer);
-	return USB_STOR_TRANSPORT_GOOD;
-
- leave:
-	kfree(buffer);
-	return USB_STOR_TRANSPORT_ERROR;
-}
-
-
-static int datafab_determine_lun(struct us_data *us,
-				 struct datafab_info *info)
-{
-	// Dual-slot readers can be thought of as dual-LUN devices.
-	// We need to determine which card slot is being used.
-	// We'll send an IDENTIFY DEVICE command and see which LUN responds...
-	//
-	// There might be a better way of doing this?
-
-	static unsigned char scommand[8] = { 0, 1, 0, 0, 0, 0xa0, 0xec, 1 };
-	unsigned char *command = us->iobuf;
-	unsigned char *buf;
-	int count = 0, rc;
-
-	if (!info)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	memcpy(command, scommand, 8);
-	buf = kmalloc(512, GFP_NOIO);
-	if (!buf)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "locating...\n");
-
-	// we'll try 3 times before giving up...
-	//
-	while (count++ < 3) {
-		command[5] = 0xa0;
-
-		rc = datafab_bulk_write(us, command, 8);
-		if (rc != USB_STOR_XFER_GOOD) {
-			rc = USB_STOR_TRANSPORT_ERROR;
-			goto leave;
-		}
-
-		rc = datafab_bulk_read(us, buf, 512);
-		if (rc == USB_STOR_XFER_GOOD) {
-			info->lun = 0;
-			rc = USB_STOR_TRANSPORT_GOOD;
-			goto leave;
-		}
-
-		command[5] = 0xb0;
-
-		rc = datafab_bulk_write(us, command, 8);
-		if (rc != USB_STOR_XFER_GOOD) {
-			rc = USB_STOR_TRANSPORT_ERROR;
-			goto leave;
-		}
-
-		rc = datafab_bulk_read(us, buf, 512);
-		if (rc == USB_STOR_XFER_GOOD) {
-			info->lun = 1;
-			rc = USB_STOR_TRANSPORT_GOOD;
-			goto leave;
-		}
-
-		msleep(20);
-	}
-
-	rc = USB_STOR_TRANSPORT_ERROR;
-
- leave:
-	kfree(buf);
-	return rc;
-}
-
-static int datafab_id_device(struct us_data *us,
-			     struct datafab_info *info)
-{
-	// this is a variation of the ATA "IDENTIFY DEVICE" command...according
-	// to the ATA spec, 'Sector Count' isn't used but the Windows driver
-	// sets this bit so we do too...
-	//
-	static unsigned char scommand[8] = { 0, 1, 0, 0, 0, 0xa0, 0xec, 1 };
-	unsigned char *command = us->iobuf;
-	unsigned char *reply;
-	int rc;
-
-	if (!info)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	if (info->lun == -1) {
-		rc = datafab_determine_lun(us, info);
-		if (rc != USB_STOR_TRANSPORT_GOOD)
-			return rc;
-	}
-
-	memcpy(command, scommand, 8);
-	reply = kmalloc(512, GFP_NOIO);
-	if (!reply)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	command[5] += (info->lun << 4);
-
-	rc = datafab_bulk_write(us, command, 8);
-	if (rc != USB_STOR_XFER_GOOD) {
-		rc = USB_STOR_TRANSPORT_ERROR;
-		goto leave;
-	}
-
-	// we'll go ahead and extract the media capacity while we're here...
-	//
-	rc = datafab_bulk_read(us, reply, 512);
-	if (rc == USB_STOR_XFER_GOOD) {
-		// capacity is at word offset 57-58
-		//
-		info->sectors = ((u32)(reply[117]) << 24) | 
-				((u32)(reply[116]) << 16) |
-				((u32)(reply[115]) <<  8) | 
-				((u32)(reply[114])      );
-		rc = USB_STOR_TRANSPORT_GOOD;
-		goto leave;
-	}
-
-	rc = USB_STOR_TRANSPORT_ERROR;
-
- leave:
-	kfree(reply);
-	return rc;
-}
-
-
-static int datafab_handle_mode_sense(struct us_data *us,
-				     struct scsi_cmnd * srb, 
-				     int sense_6)
-{
-	static unsigned char rw_err_page[12] = {
-		0x1, 0xA, 0x21, 1, 0, 0, 0, 0, 1, 0, 0, 0
-	};
-	static unsigned char cache_page[12] = {
-		0x8, 0xA, 0x1, 0, 0, 0, 0, 0, 0, 0, 0, 0
-	};
-	static unsigned char rbac_page[12] = {
-		0x1B, 0xA, 0, 0x81, 0, 0, 0, 0, 0, 0, 0, 0
-	};
-	static unsigned char timer_page[8] = {
-		0x1C, 0x6, 0, 0, 0, 0
-	};
-	unsigned char pc, page_code;
-	unsigned int i = 0;
-	struct datafab_info *info = (struct datafab_info *) (us->extra);
-	unsigned char *ptr = us->iobuf;
-
-	// most of this stuff is just a hack to get things working.  the
-	// datafab reader doesn't present a SCSI interface so we
-	// fudge the SCSI commands...
-	//
-
-	pc = srb->cmnd[2] >> 6;
-	page_code = srb->cmnd[2] & 0x3F;
-
-	switch (pc) {
-	   case 0x0:
-		   usb_stor_dbg(us, "Current values\n");
-		break;
-	   case 0x1:
-		   usb_stor_dbg(us, "Changeable values\n");
-		break;
-	   case 0x2:
-		   usb_stor_dbg(us, "Default values\n");
-		break;
-	   case 0x3:
-		   usb_stor_dbg(us, "Saves values\n");
-		break;
-	}
-
-	memset(ptr, 0, 8);
-	if (sense_6) {
-		ptr[2] = 0x00;		// WP enable: 0x80
-		i = 4;
-	} else {
-		ptr[3] = 0x00;		// WP enable: 0x80
-		i = 8;
-	}
-
-	switch (page_code) {
-	   default:
-		// vendor-specific mode
-		info->sense_key = 0x05;
-		info->sense_asc = 0x24;
-		info->sense_ascq = 0x00;
-		return USB_STOR_TRANSPORT_FAILED;
-
-	   case 0x1:
-		memcpy(ptr + i, rw_err_page, sizeof(rw_err_page));
-		i += sizeof(rw_err_page);
-		break;
-
-	   case 0x8:
-		memcpy(ptr + i, cache_page, sizeof(cache_page));
-		i += sizeof(cache_page);
-		break;
-
-	   case 0x1B:
-		memcpy(ptr + i, rbac_page, sizeof(rbac_page));
-		i += sizeof(rbac_page);
-		break;
-
-	   case 0x1C:
-		memcpy(ptr + i, timer_page, sizeof(timer_page));
-		i += sizeof(timer_page);
-		break;
-
-	   case 0x3F:		// retrieve all pages
-		memcpy(ptr + i, timer_page, sizeof(timer_page));
-		i += sizeof(timer_page);
-		memcpy(ptr + i, rbac_page, sizeof(rbac_page));
-		i += sizeof(rbac_page);
-		memcpy(ptr + i, cache_page, sizeof(cache_page));
-		i += sizeof(cache_page);
-		memcpy(ptr + i, rw_err_page, sizeof(rw_err_page));
-		i += sizeof(rw_err_page);
-		break;
-	}
-
-	if (sense_6)
-		ptr[0] = i - 1;
-	else
-		((__be16 *) ptr)[0] = cpu_to_be16(i - 2);
-	usb_stor_set_xfer_buf(ptr, i, srb);
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-static void datafab_info_destructor(void *extra)
-{
-	// this routine is a placeholder...
-	// currently, we don't allocate any extra memory so we're okay
-}
-
-
-// Transport for the Datafab MDCFE-B
-//
-static int datafab_transport(struct scsi_cmnd *srb, struct us_data *us)
-{
-	struct datafab_info *info;
-	int rc;
-	unsigned long block, blocks;
-	unsigned char *ptr = us->iobuf;
-	static unsigned char inquiry_reply[8] = {
-		0x00, 0x80, 0x00, 0x01, 0x1F, 0x00, 0x00, 0x00
-	};
-
-	if (!us->extra) {
-		us->extra = kzalloc(sizeof(struct datafab_info), GFP_NOIO);
-		if (!us->extra)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		us->extra_destructor = datafab_info_destructor;
-  		((struct datafab_info *)us->extra)->lun = -1;
-	}
-
-	info = (struct datafab_info *) (us->extra);
-
-	if (srb->cmnd[0] == INQUIRY) {
-		usb_stor_dbg(us, "INQUIRY - Returning bogus response\n");
-		memcpy(ptr, inquiry_reply, sizeof(inquiry_reply));
-		fill_inquiry_response(us, ptr, 36);
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == READ_CAPACITY) {
-		info->ssize = 0x200;  // hard coded 512 byte sectors as per ATA spec
-		rc = datafab_id_device(us, info);
-		if (rc != USB_STOR_TRANSPORT_GOOD)
-			return rc;
-
-		usb_stor_dbg(us, "READ_CAPACITY:  %ld sectors, %ld bytes per sector\n",
-			     info->sectors, info->ssize);
-
-		// build the reply
-		// we need the last sector, not the number of sectors
-		((__be32 *) ptr)[0] = cpu_to_be32(info->sectors - 1);
-		((__be32 *) ptr)[1] = cpu_to_be32(info->ssize);
-		usb_stor_set_xfer_buf(ptr, 8, srb);
-
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == MODE_SELECT_10) {
-		usb_stor_dbg(us, "Gah! MODE_SELECT_10\n");
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	// don't bother implementing READ_6 or WRITE_6.
-	//
-	if (srb->cmnd[0] == READ_10) {
-		block = ((u32)(srb->cmnd[2]) << 24) | ((u32)(srb->cmnd[3]) << 16) |
-			((u32)(srb->cmnd[4]) <<  8) | ((u32)(srb->cmnd[5]));
-
-		blocks = ((u32)(srb->cmnd[7]) << 8) | ((u32)(srb->cmnd[8]));
-
-		usb_stor_dbg(us, "READ_10: read block 0x%04lx  count %ld\n",
-			     block, blocks);
-		return datafab_read_data(us, info, block, blocks);
-	}
-
-	if (srb->cmnd[0] == READ_12) {
-		// we'll probably never see a READ_12 but we'll do it anyway...
-		//
-		block = ((u32)(srb->cmnd[2]) << 24) | ((u32)(srb->cmnd[3]) << 16) |
-			((u32)(srb->cmnd[4]) <<  8) | ((u32)(srb->cmnd[5]));
-
-		blocks = ((u32)(srb->cmnd[6]) << 24) | ((u32)(srb->cmnd[7]) << 16) |
-			 ((u32)(srb->cmnd[8]) <<  8) | ((u32)(srb->cmnd[9]));
-
-		usb_stor_dbg(us, "READ_12: read block 0x%04lx  count %ld\n",
-			     block, blocks);
-		return datafab_read_data(us, info, block, blocks);
-	}
-
-	if (srb->cmnd[0] == WRITE_10) {
-		block = ((u32)(srb->cmnd[2]) << 24) | ((u32)(srb->cmnd[3]) << 16) |
-			((u32)(srb->cmnd[4]) <<  8) | ((u32)(srb->cmnd[5]));
-
-		blocks = ((u32)(srb->cmnd[7]) << 8) | ((u32)(srb->cmnd[8]));
-
-		usb_stor_dbg(us, "WRITE_10: write block 0x%04lx count %ld\n",
-			     block, blocks);
-		return datafab_write_data(us, info, block, blocks);
-	}
-
-	if (srb->cmnd[0] == WRITE_12) {
-		// we'll probably never see a WRITE_12 but we'll do it anyway...
-		//
-		block = ((u32)(srb->cmnd[2]) << 24) | ((u32)(srb->cmnd[3]) << 16) |
-			((u32)(srb->cmnd[4]) <<  8) | ((u32)(srb->cmnd[5]));
-
-		blocks = ((u32)(srb->cmnd[6]) << 24) | ((u32)(srb->cmnd[7]) << 16) |
-			 ((u32)(srb->cmnd[8]) <<  8) | ((u32)(srb->cmnd[9]));
-
-		usb_stor_dbg(us, "WRITE_12: write block 0x%04lx count %ld\n",
-			     block, blocks);
-		return datafab_write_data(us, info, block, blocks);
-	}
-
-	if (srb->cmnd[0] == TEST_UNIT_READY) {
-		usb_stor_dbg(us, "TEST_UNIT_READY\n");
-		return datafab_id_device(us, info);
-	}
-
-	if (srb->cmnd[0] == REQUEST_SENSE) {
-		usb_stor_dbg(us, "REQUEST_SENSE - Returning faked response\n");
-
-		// this response is pretty bogus right now.  eventually if necessary
-		// we can set the correct sense data.  so far though it hasn't been
-		// necessary
-		//
-		memset(ptr, 0, 18);
-		ptr[0] = 0xF0;
-		ptr[2] = info->sense_key;
-		ptr[7] = 11;
-		ptr[12] = info->sense_asc;
-		ptr[13] = info->sense_ascq;
-		usb_stor_set_xfer_buf(ptr, 18, srb);
-
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == MODE_SENSE) {
-		usb_stor_dbg(us, "MODE_SENSE_6 detected\n");
-		return datafab_handle_mode_sense(us, srb, 1);
-	}
-
-	if (srb->cmnd[0] == MODE_SENSE_10) {
-		usb_stor_dbg(us, "MODE_SENSE_10 detected\n");
-		return datafab_handle_mode_sense(us, srb, 0);
-	}
-
-	if (srb->cmnd[0] == ALLOW_MEDIUM_REMOVAL) {
-		// sure.  whatever.  not like we can stop the user from
-		// popping the media out of the device (no locking doors, etc)
-		//
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == START_STOP) {
-		/* this is used by sd.c'check_scsidisk_media_change to detect
-		   media change */
-		usb_stor_dbg(us, "START_STOP\n");
-		/* the first datafab_id_device after a media change returns
-		   an error (determined experimentally) */
-		rc = datafab_id_device(us, info);
-		if (rc == USB_STOR_TRANSPORT_GOOD) {
-			info->sense_key = NO_SENSE;
-			srb->result = SUCCESS;
-		} else {
-			info->sense_key = UNIT_ATTENTION;
-			srb->result = SAM_STAT_CHECK_CONDITION;
-		}
-		return rc;
-	}
-
-	usb_stor_dbg(us, "Gah! Unknown command: %d (0x%x)\n",
-		     srb->cmnd[0], srb->cmnd[0]);
-	info->sense_key = 0x05;
-	info->sense_asc = 0x20;
-	info->sense_ascq = 0x00;
-	return USB_STOR_TRANSPORT_FAILED;
-}
-
-static struct scsi_host_template datafab_host_template;
-
-static int datafab_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-
-	result = usb_stor_probe1(&us, intf, id,
-			(id - datafab_usb_ids) + datafab_unusual_dev_list,
-			&datafab_host_template);
-	if (result)
-		return result;
-
-	us->transport_name  = "Datafab Bulk-Only";
-	us->transport = datafab_transport;
-	us->transport_reset = usb_stor_Bulk_reset;
-	us->max_lun = 1;
-
-	result = usb_stor_probe2(us);
-	return result;
-}
-
-static struct usb_driver datafab_driver = {
-	.name =		DRV_NAME,
-	.probe =	datafab_probe,
-	.disconnect =	usb_stor_disconnect,
-	.suspend =	usb_stor_suspend,
-	.resume =	usb_stor_resume,
-	.reset_resume =	usb_stor_reset_resume,
-	.pre_reset =	usb_stor_pre_reset,
-	.post_reset =	usb_stor_post_reset,
-	.id_table =	datafab_usb_ids,
-	.soft_unbind =	1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(datafab_driver, datafab_host_template, DRV_NAME);
+N_MASK 0x1
+#define PCIEP_PORT_CNTL__SLV_PORT_REQ_EN__SHIFT 0x0
+#define PCIEP_PORT_CNTL__CI_SNOOP_OVERRIDE_MASK 0x2
+#define PCIEP_PORT_CNTL__CI_SNOOP_OVERRIDE__SHIFT 0x1
+#define PCIEP_PORT_CNTL__HOTPLUG_MSG_EN_MASK 0x4
+#define PCIEP_PORT_CNTL__HOTPLUG_MSG_EN__SHIFT 0x2
+#define PCIEP_PORT_CNTL__NATIVE_PME_EN_MASK 0x8
+#define PCIEP_PORT_CNTL__NATIVE_PME_EN__SHIFT 0x3
+#define PCIEP_PORT_CNTL__PWR_FAULT_EN_MASK 0x10
+#define PCIEP_PORT_CNTL__PWR_FAULT_EN__SHIFT 0x4
+#define PCIEP_PORT_CNTL__PMI_BM_DIS_MASK 0x20
+#define PCIEP_PORT_CNTL__PMI_BM_DIS__SHIFT 0x5
+#define PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE_MASK 0x40
+#define PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE__SHIFT 0x6
+#define PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S_MASK 0x7f00
+#define PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S__SHIFT 0x8
+#define PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE_MASK 0x30000
+#define PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE_MASK 0x1c0000
+#define PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE__SHIFT 0x12
+#define PCIE_TX_CNTL__TX_SNR_OVERRIDE_MASK 0xc00
+#define PCIE_TX_CNTL__TX_SNR_OVERRIDE__SHIFT 0xa
+#define PCIE_TX_CNTL__TX_RO_OVERRIDE_MASK 0x3000
+#define PCIE_TX_CNTL__TX_RO_OVERRIDE__SHIFT 0xc
+#define PCIE_TX_CNTL__TX_PACK_PACKET_DIS_MASK 0x4000
+#define PCIE_TX_CNTL__TX_PACK_PACKET_DIS__SHIFT 0xe
+#define PCIE_TX_CNTL__TX_FLUSH_TLP_DIS_MASK 0x8000
+#define PCIE_TX_CNTL__TX_FLUSH_TLP_DIS__SHIFT 0xf
+#define PCIE_TX_CNTL__TX_CPL_PASS_P_MASK 0x100000
+#define PCIE_TX_CNTL__TX_CPL_PASS_P__SHIFT 0x14
+#define PCIE_TX_CNTL__TX_NP_PASS_P_MASK 0x200000
+#define PCIE_TX_CNTL__TX_NP_PASS_P__SHIFT 0x15
+#define PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS_MASK 0x400000
+#define PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS__SHIFT 0x16
+#define PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS_MASK 0x800000
+#define PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS__SHIFT 0x17
+#define PCIE_TX_CNTL__TX_F0_TPH_DIS_MASK 0x1000000
+#define PCIE_TX_CNTL__TX_F0_TPH_DIS__SHIFT 0x18
+#define PCIE_TX_CNTL__TX_F1_TPH_DIS_MASK 0x2000000
+#define PCIE_TX_CNTL__TX_F1_TPH_DIS__SHIFT 0x19
+#define PCIE_TX_CNTL__TX_F2_TPH_DIS_MASK 0x4000000
+#define PCIE_TX_CNTL__TX_F2_TPH_DIS__SHIFT 0x1a
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION_MASK 0x7
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION__SHIFT 0x0
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE_MASK 0xf8
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE__SHIFT 0x3
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS_MASK 0xff00
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS__SHIFT 0x8
+#define PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA_MASK 0xffffff
+#define PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA__SHIFT 0x0
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_MASK 0x3f000000
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP__SHIFT 0x18
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN_MASK 0x40000000
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN__SHIFT 0x1e
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN_MASK 0x80000000
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN__SHIFT 0x1f
+#define PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ_MASK 0xfff
+#define PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ__SHIFT 0x0
+#define PCIE_TX_SEQ__TX_ACKD_SEQ_MASK 0xfff0000
+#define PCIE_TX_SEQ__TX_ACKD_SEQ__SHIFT 0x10
+#define PCIE_TX_REPLAY__TX_REPLAY_NUM_MASK 0x7
+#define PCIE_TX_REPLAY__TX_REPLAY_NUM__SHIFT 0x0
+#define PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE_MASK 0x8000
+#define PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE__SHIFT 0xf
+#define PCIE_TX_REPLAY__TX_REPLAY_TIMER_MASK 0xffff0000
+#define PCIE_TX_REPLAY__TX_REPLAY_TIMER__SHIFT 0x10
+#define PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_MASK 0xfff
+#define PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT__SHIFT 0x0
+#define PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE_MASK 0x1000
+#define PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE__SHIFT 0xc
+#define PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD_MASK 0xfff
+#define PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD__SHIFT 0x0
+#define PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH_MASK 0xff0000
+#define PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH__SHIFT 0x10
+#define PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD_MASK 0xfff
+#define PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD__SHIFT 0x0
+#define PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPH_MASK 0xff0000
+#define PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPH__SHIFT 0x10
+#define PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLD_MASK 0xfff
+#define PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLD__SHIFT 0x0
+#define PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLH_MASK 0xff0000
+#define PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLH__SHIFT 0x10
+#define PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PD_MASK 0xfff
+#define PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PD__SHIFT 0x0
+#define PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PH_MASK 0xff0000
+#define PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PH__SHIFT 0x10
+#define PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPD_MASK 0xfff
+#define PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPD__SHIFT 0x0
+#define PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPH_MASK 0xff0000
+#define PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPH__SHIFT 0x10
+#define PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLD_MASK 0xfff
+#define PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLD__SHIFT 0x0
+#define PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLH_MASK 0xff0000
+#define PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLH__SHIFT 0x10
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD_MASK 0x1
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD__SHIFT 0x0
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH_MASK 0x2
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH__SHIFT 0x1
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD_MASK 0x4
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD__SHIFT 0x2
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH_MASK 0x8
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH__SHIFT 0x3
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD_MASK 0x10
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD__SHIFT 0x4
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH_MASK 0x20
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH__SHIFT 0x5
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD_MASK 0x10000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD__SHIFT 0x10
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH_MASK 0x20000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH__SHIFT 0x11
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD_MASK 0x40000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD__SHIFT 0x12
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH_MASK 0x80000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH__SHIFT 0x13
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD_MASK 0x100000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD__SHIFT 0x14
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH_MASK 0x200000
+#define PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH__SHIFT 0x15
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0_MASK 0x7
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0__SHIFT 0x0
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0_MASK 0x70
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0__SHIFT 0x4
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0_MASK 0x700
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0__SHIFT 0x8
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1_MASK 0x70000
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1__SHIFT 0x10
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1_MASK 0x700000
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1__SHIFT 0x14
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1_MASK 0x7000000
+#define PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1__SHIFT 0x18
+#define PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL_MASK 0x1
+#define PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL__SHIFT 0x0
+#define PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH_MASK 0x7e
+#define PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH__SHIFT 0x1
+#define PCIE_FC_P__PD_CREDITS_MASK 0xff
+#define PCIE_FC_P__PD_CREDITS__SHIFT 0x0
+#define PCIE_FC_P__PH_CREDITS_MASK 0xff00
+#define PCIE_FC_P__PH_CREDITS__SHIFT 0x8
+#define PCIE_FC_NP__NPD_CREDITS_MASK 0xff
+#define PCIE_FC_NP__NPD_CREDITS__SHIFT 0x0
+#define PCIE_FC_NP__NPH_CREDITS_MASK 0xff00
+#define PCIE_FC_NP__NPH_CREDITS__SHIFT 0x8
+#define PCIE_FC_CPL__CPLD_CREDITS_MASK 0xff
+#define PCIE_FC_CPL__CPLD_CREDITS__SHIFT 0x0
+#define PCIE_FC_CPL__CPLH_CREDITS_MASK 0xff00
+#define PCIE_FC_CPL__CPLH_CREDITS__SHIFT 0x8
+#define PCIE_ERR_CNTL__ERR_REPORTING_DIS_MASK 0x1
+#define PCIE_ERR_CNTL__ERR_REPORTING_DIS__SHIFT 0x0
+#define PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG_MASK 0x2
+#define PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG__SHIFT 0x1
+#define PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES_MASK 0x4
+#define PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES__SHIFT 0x2
+#define PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR_MASK 0x10
+#define PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR__SHIFT 0x4
+#define PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR_MASK 0x20
+#define PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR__SHIFT 0x5
+#define PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR_MASK 0x40
+#define PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR__SHIFT 0x6
+#define PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR_MASK 0x80
+#define PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR__SHIFT 0x7
+#define PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT_MASK 0x700
+#define PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT__SHIFT 0x8
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED_MASK 0x800
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED__SHIFT 0xb
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F1_TIMER_EXPIRED_MASK 0x1000
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F1_TIMER_EXPIRED__SHIFT 0xc
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F2_TIMER_EXPIRED_MASK 0x2000
+#define PCIE_ERR_CNTL__AER_HDR_LOG_F2_TIMER_EXPIRED__SHIFT 0xd
+#define PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS_MASK 0x4000
+#define PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS__SHIFT 0xe
+#define PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS_MASK 0x8000
+#define PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS__SHIFT 0xf
+#define PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET_MASK 0x10000
+#define PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET__SHIFT 0x10
+#define PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY_MASK 0x20000
+#define PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY__SHIFT 0x11
+#define PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL_MASK 0x40000
+#define PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL__SHIFT 0x12
+#define PCIE_RX_CNTL__RX_IGNORE_IO_ERR_MASK 0x1
+#define PCIE_RX_CNTL__RX_IGNORE_IO_ERR__SHIFT 0x0
+#define PCIE_RX_CNTL__RX_IGNORE_BE_ERR_MASK 0x2
+#define PCIE_RX_CNTL__RX_IGNORE_BE_ERR__SHIFT 0x1
+#define PCIE_RX_CNTL__RX_IGNORE_MSG_ERR_MASK 0x4
+#define PCIE_RX_CNTL__RX_IGNORE_MSG_ERR__SHIFT 0x2
+#define PCIE_RX_CNTL__RX_IGNORE_CRC_ERR_MASK 0x8
+#define PCIE_RX_CNTL__RX_IGNORE_CRC_ERR__SHIFT 0x3
+#define PCIE_RX_CNTL__RX_IGNORE_CFG_ERR_MASK 0x10
+#define PCIE_RX_CNTL__RX_IGNORE_CFG_ERR__SHIFT 0x4
+#define PCIE_RX_CNTL__RX_IGNORE_CPL_ERR_MASK 0x20
+#define PCIE_RX_CNTL__RX_IGNORE_CPL_ERR__SHIFT 0x5
+#define PCIE_RX_CNTL__RX_IGNORE_EP_ERR_MASK 0x40
+#define PCIE_RX_CNTL__RX_IGNORE_EP_ERR__SHIFT 0x6
+#define PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR_MASK 0x80
+#define PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR__SHIFT 0x7
+#define PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR_MASK 0x100
+#define PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR__SHIFT 0x8
+#define PCIE_RX_CNTL__RX_IGNORE_TC_ERR_MASK 0x200
+#define PCIE_RX_CNTL__RX_IGNORE_TC_ERR__SHIFT 0x9
+#define PCIE_RX_CNTL__RX_IGNORE_CFG_UR_MASK 0x400
+#define PCIE_RX_CNTL__RX_IGNORE_CFG_UR__SHIFT 0xa
+#define PCIE_RX_CNTL__RX_IGNORE_IO_UR_MASK 0x800
+#define PCIE_RX_CNTL__RX_IGNORE_IO_UR__SHIFT 0xb
+#define PCIE_RX_CNTL__RX_IGNORE_AT_ERR_MASK 0x1000
+#define PCIE_RX_CNTL__RX_IGNORE_AT_ERR__SHIFT 0xc
+#define PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL_MASK 0x2000
+#define PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL__SHIFT 0xd
+#define PCIE_RX_CNTL__RX_GEN_ONE_NAK_MASK 0x4000
+#define PCIE_RX_CNTL__RX_GEN_ONE_NAK__SHIFT 0xe
+#define PCIE_RX_CNTL__RX_FC_INIT_FROM_REG_MASK 0x8000
+#define PCIE_RX_CNTL__RX_FC_INIT_FROM_REG__SHIFT 0xf
+#define PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MASK 0x70000
+#define PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT__SHIFT 0x10
+#define PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE_MASK 0x80000
+#define PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE__SHIFT 0x13
+#define PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS_MASK 0x100000
+#define PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS__SHIFT 0x14
+#define PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR_MASK 0x200000
+#define PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR__SHIFT 0x15
+#define PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR_MASK 0x400000
+#define PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR__SHIFT 0x16
+#define PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR_MASK 0x800000
+#define PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR__SHIFT 0x17
+#define PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR_MASK 0x1000000
+#define PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR__SHIFT 0x18
+#define PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR_MASK 0x2000000
+#define PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR__SHIFT 0x19
+#define PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM_MASK 0xfff
+#define PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM__SHIFT 0x0
+#define PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA_MASK 0xffffff
+#define PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA__SHIFT 0x0
+#define PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS_MASK 0x1000000
+#define PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS__SHIFT 0x18
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR_MASK 0x1
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR__SHIFT 0x0
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR_MASK 0x2
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR__SHIFT 0x1
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR_MASK 0x4
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR__SHIFT 0x2
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR_MASK 0x8
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR__SHIFT 0x3
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR_MASK 0x10
+#define PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR__SHIFT 0x4
+#define PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD_MASK 0xfff
+#define PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD__SHIFT 0x0
+#define PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH_MASK 0xff0000
+#define PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH__SHIFT 0x10
+#define PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD_MASK 0xfff
+#define PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD__SHIFT 0x0
+#define PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH_MASK 0xff0000
+#define PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH__SHIFT 0x10
+#define PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD_MASK 0xfff
+#define PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD__SHIFT 0x0
+#define PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH_MASK 0xff0000
+#define PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH__SHIFT 0x10
+#define PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0_MASK 0x2
+#define PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0__SHIFT 0x1
+#define PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN_MASK 0x4
+#define PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN__SHIFT 0x2
+#define PCIE_LC_CNTL__LC_RESET_LINK_MASK 0x8
+#define PCIE_LC_CNTL__LC_RESET_LINK__SHIFT 0x3
+#define PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE_MASK 0xf0
+#define PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE__SHIFT 0x4
+#define PCIE_LC_CNTL__LC_L0S_INACTIVITY_MASK 0xf00
+#define PCIE_LC_CNTL__LC_L0S_INACTIVITY__SHIFT 0x8
+#define PCIE_LC_CNTL__LC_L1_INACTIVITY_MASK 0xf000
+#define PCIE_LC_CNTL__LC_L1_INACTIVITY__SHIFT 0xc
+#define PCIE_LC_CNTL__LC_PMI_TO_L1_DIS_MASK 0x10000
+#define PCIE_LC_CNTL__LC_PMI_TO_L1_DIS__SHIFT 0x10
+#define PCIE_LC_CNTL__LC_INC_N_FTS_EN_MASK 0x20000
+#define PCIE_LC_CNTL__LC_INC_N_FTS_EN__SHIFT 0x11
+#define PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23_MASK 0xc0000
+#define PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23__SHIFT 0x12
+#define PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC_MASK 0x100000
+#define PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC__SHIFT 0x14
+#define PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS_MASK 0x200000
+#define PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS__SHIFT 0x15
+#define PCIE_LC_CNTL__LC_WAKE_FROM_L23_MASK 0x400000
+#define PCIE_LC_CNTL__LC_WAKE_FROM_L23__SHIFT 0x16
+#define PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK_MASK 0x800000
+#define PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK__SHIFT 0x17
+#define PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS_MASK 0x1000000
+#define PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS__SHIFT 0x18
+#define PCIE_LC_CNTL__LC_DELAY_COUNT_MASK 0x6000000
+#define PCIE_LC_CNTL__LC_DELAY_COUNT__SHIFT 0x19
+#define PCIE_LC_CNTL__LC_DELAY_L0S_EXIT_MASK 0x8000000
+#define PCIE_LC_CNTL__LC_DELAY_L0S_EXIT__SHIFT 0x1b
+#define PCIE_LC_CNTL__LC_DELAY_L1_EXIT_MASK 0x10000000
+#define PCIE_LC_CNTL__LC_DELAY_L1_EXIT__SHIFT 0x1c
+#define PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE_MASK 0x20000000
+#define PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE__SHIFT 0x1d
+#define PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN_MASK 0x40000000
+#define PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN__SHIFT 0x1e
+#define PCIE_LC_CNTL__LC_GATE_RCVR_IDLE_MASK 0x80000000
+#define PCIE_LC_CNTL__LC_GATE_RCVR_IDLE__SHIFT 0x1f
+#define PCIE_LC_CNTL2__LC_TIMED_OUT_STATE_MASK 0x3f
+#define PCIE_LC_CNTL2__LC_TIMED_OUT_STATE__SHIFT 0x0
+#define PCIE_LC_CNTL2__LC_STATE_TIMED_OUT_MASK 0x40
+#define PCIE_LC_CNTL2__LC_STATE_TIMED_OUT__SHIFT 0x6
+#define PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION_MASK 0x80
+#define PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION__SHIFT 0x7
+#define PCIE_LC_CNTL2__LC_MORE_TS2_EN_MASK 0x100
+#define PCIE_LC_CNTL2__LC_MORE_TS2_EN__SHIFT 0x8
+#define PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS_MASK 0x200
+#define PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS__SHIFT 0x9
+#define PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN_MASK 0x400
+#define PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN__SHIFT 0xa
+#define PCIE_LC_CNTL2__LC_ILLEGAL_STATE_MASK 0x800
+#define PCIE_LC_CNTL2__LC_ILLEGAL_STATE__SHIFT 0xb
+#define PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN_MASK 0x1000
+#define PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN__SHIFT 0xc
+#define PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE_MASK 0x2000
+#define PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE__SHIFT 0xd
+#define PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE_MASK 0xc000
+#define PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE__SHIFT 0xe
+#define PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET_MASK 0x10000
+#define PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET__SHIFT 0x10
+#define PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1_MASK 0x20000
+#define PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1__SHIFT 0x11
+#define PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L23_MASK 0x40000
+#define PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L23__SHIFT 0x12
+#define PCIE_LC_CNTL2__LC_DEASSERT_RX_EN_IN_L0S_MASK 0x80000
+#define PCIE_LC_CNTL2__LC_DEASSERT_RX_EN_IN_L0S__SHIFT 0x13
+#define PCIE_LC_CNTL2__LC_BLOCK_EL_IDLE_IN_L0_MASK 0x100000
+#define PCIE_LC_CNTL2__LC_BLOCK_EL_IDLE_IN_L0__SHIFT 0x14
+#define PCIE_LC_CNTL2__LC_RCV_L0_TO_RCV_L0S_DIS_MASK 0x200000
+#define PCIE_LC_CNTL2__LC_RCV_L0_TO_RCV_L0S_DIS__SHIFT 0x15
+#define PCIE_LC_CNTL2__LC_ASSERT_INACTIVE_DURING_HOLD_MASK 0x400000
+#define PCIE_LC_CNTL2__LC_ASSERT_INACTIVE_DURING_HOLD__SHIFT 0x16
+#define PCIE_LC_CNTL2__LC_WAIT_FOR_LANES_IN_LW_NEG_MASK 0x1800000
+#define PCIE_LC_CNTL2__LC_WAIT_FOR_LANES_IN_LW_NEG__SHIFT 0x17
+#define PCIE_LC_CNTL2__LC_PWR_DOWN_NEG_OFF_LANES_MASK 0x2000000
+#define PCIE_LC_CNTL2__LC_PWR_DOWN_NEG_OFF_LANES__SHIFT 0x19
+#define PCIE_LC_CNTL2__LC_DISABLE_LOST_SYM_LOCK_ARCS_MASK 0x4000000
+#define PCIE_LC_CNTL2__LC_DISABLE_LOST_SYM_LOCK_ARCS__SHIFT 0x1a
+#define PCIE_LC_CNTL2__LC_LINK_BW_NOTIFICATION_DIS_MASK 0x8000000
+#define PCIE_LC_CNTL2__LC_LINK_BW_NOTIFICATION_DIS__SHIFT 0x1b
+#define PCIE_LC_CNTL2__LC_PMI_L1_WAIT_FOR_SLV_IDLE_MASK 0x10000000
+#define PCIE_LC_CNTL2__LC_PMI_L1_WAIT_FOR_SLV_IDLE__SHIFT 0x1c
+#define PCIE_LC_CNTL2__LC_TEST_TIMER_SEL_MASK 0x60000000
+#define PCIE_LC_CNTL2__LC_TEST_TIMER_SEL__SHIFT 0x1d
+#define PCIE_LC_CNTL2__LC_ENABLE_INFERRED_ELEC_IDLE_FOR_PI_MASK 0x80000000
+#define PCIE_LC_CNTL2__LC_ENABLE_INFERRED_ELEC_IDLE_FOR_PI__SHIFT 0x1f
+#define PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_MASK 0x1
+#define PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS__SHIFT 0x0
+#define PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_CNTL_MASK 0x6
+#define

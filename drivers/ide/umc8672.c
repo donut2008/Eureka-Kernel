@@ -1,183 +1,155 @@
-/*
- *  Copyright (C) 1995-1996  Linus Torvalds & author (see below)
- */
-
-/*
- *  Principal Author/Maintainer:  PODIEN@hml2.atlas.de (Wolfram Podien)
- *
- *  This file provides support for the advanced features
- *  of the UMC 8672 IDE interface.
- *
- *  Version 0.01	Initial version, hacked out of ide.c,
- *			and #include'd rather than compiled separately.
- *			This will get cleaned up in a subsequent release.
- *
- *  Version 0.02	now configs/compiles separate from ide.c  -ml
- *  Version 0.03	enhanced auto-tune, fix display bug
- *  Version 0.05	replace sti() with restore_flags()  -ml
- *			add detection of possible race condition  -ml
- */
-
-/*
- * VLB Controller Support from
- * Wolfram Podien
- * Rohoefe 3
- * D28832 Achim
- * Germany
- *
- * To enable UMC8672 support there must a lilo line like
- * append="ide0=umc8672"...
- * To set the speed according to the abilities of the hardware there must be a
- * line like
- * #define UMC_DRIVE0 11
- * in the beginning of the driver, which sets the speed of drive 0 to 11 (there
- * are some lines present). 0 - 11 are allowed speed values. These values are
- * the results from the DOS speed test program supplied from UMC. 11 is the
- * highest speed (about PIO mode 3)
- */
-#define REALLY_SLOW_IO		/* some systems can safely undef this */
-
-#include <linux/module.h>
-#include <linux/types.h>
-#include <linux/kernel.h>
-#include <linux/delay.h>
-#include <linux/timer.h>
-#include <linux/mm.h>
-#include <linux/ioport.h>
-#include <linux/blkdev.h>
-#include <linux/ide.h>
-#include <linux/init.h>
-
-#include <asm/io.h>
-
-#define DRV_NAME "umc8672"
-
-/*
- * Default speeds.  These can be changed with "auto-tune" and/or hdparm.
- */
-#define UMC_DRIVE0      1              /* DOS measured drive speeds */
-#define UMC_DRIVE1      1              /* 0 to 11 allowed */
-#define UMC_DRIVE2      1              /* 11 = Fastest Speed */
-#define UMC_DRIVE3      1              /* In case of crash reduce speed */
-
-static u8 current_speeds[4] = {UMC_DRIVE0, UMC_DRIVE1, UMC_DRIVE2, UMC_DRIVE3};
-static const u8 pio_to_umc [5] = {0, 3, 7, 10, 11};	/* rough guesses */
-
-/*       0    1    2    3    4    5    6    7    8    9    10   11      */
-static const u8 speedtab [3][12] = {
-	{0x0f, 0x0b, 0x02, 0x02, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x1},
-	{0x03, 0x02, 0x02, 0x02, 0x02, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x1},
-	{0xff, 0xcb, 0xc0, 0x58, 0x36, 0x33, 0x23, 0x22, 0x21, 0x11, 0x10, 0x0}
-};
-
-static void out_umc(char port, char wert)
+a_chan *ioat_chan)
 {
-	outb_p(port, 0x108);
-	outb_p(wert, 0x109);
+	u8 ver = ioat_chan->ioat_dma->version;
+
+	writeb(IOAT_CHANCMD_SUSPEND,
+	       ioat_chan->reg_base + IOAT_CHANCMD_OFFSET(ver));
 }
 
-static inline u8 in_umc(char port)
+static inline void ioat_reset(struct ioatdma_chan *ioat_chan)
 {
-	outb_p(port, 0x108);
-	return inb_p(0x109);
+	u8 ver = ioat_chan->ioat_dma->version;
+
+	writeb(IOAT_CHANCMD_RESET,
+	       ioat_chan->reg_base + IOAT_CHANCMD_OFFSET(ver));
 }
 
-static void umc_set_speeds(u8 speeds[])
+static inline bool ioat_reset_pending(struct ioatdma_chan *ioat_chan)
 {
-	int i, tmp;
+	u8 ver = ioat_chan->ioat_dma->version;
+	u8 cmd;
 
-	outb_p(0x5A, 0x108); /* enable umc */
-
-	out_umc(0xd7, (speedtab[0][speeds[2]] | (speedtab[0][speeds[3]]<<4)));
-	out_umc(0xd6, (speedtab[0][speeds[0]] | (speedtab[0][speeds[1]]<<4)));
-	tmp = 0;
-	for (i = 3; i >= 0; i--)
-		tmp = (tmp << 2) | speedtab[1][speeds[i]];
-	out_umc(0xdc, tmp);
-	for (i = 0; i < 4; i++) {
-		out_umc(0xd0 + i, speedtab[2][speeds[i]]);
-		out_umc(0xd8 + i, speedtab[2][speeds[i]]);
-	}
-	outb_p(0xa5, 0x108); /* disable umc */
-
-	printk("umc8672: drive speeds [0 to 11]: %d %d %d %d\n",
-		speeds[0], speeds[1], speeds[2], speeds[3]);
+	cmd = readb(ioat_chan->reg_base + IOAT_CHANCMD_OFFSET(ver));
+	return (cmd & IOAT_CHANCMD_RESET) == IOAT_CHANCMD_RESET;
 }
 
-static void umc_set_pio_mode(ide_hwif_t *hwif, ide_drive_t *drive)
+static inline bool is_ioat_active(unsigned long status)
 {
-	ide_hwif_t *mate = hwif->mate;
-	unsigned long uninitialized_var(flags);
-	const u8 pio = drive->pio_mode - XFER_PIO_0;
-
-	printk("%s: setting umc8672 to PIO mode%d (speed %d)\n",
-		drive->name, pio, pio_to_umc[pio]);
-	if (mate)
-		spin_lock_irqsave(&mate->lock, flags);
-	if (mate && mate->handler) {
-		printk(KERN_ERR "umc8672: other interface is busy: exiting tune_umc()\n");
-	} else {
-		current_speeds[drive->name[2] - 'a'] = pio_to_umc[pio];
-		umc_set_speeds(current_speeds);
-	}
-	if (mate)
-		spin_unlock_irqrestore(&mate->lock, flags);
+	return ((status & IOAT_CHANSTS_STATUS) == IOAT_CHANSTS_ACTIVE);
 }
 
-static const struct ide_port_ops umc8672_port_ops = {
-	.set_pio_mode		= umc_set_pio_mode,
-};
-
-static const struct ide_port_info umc8672_port_info __initconst = {
-	.name			= DRV_NAME,
-	.chipset		= ide_umc8672,
-	.port_ops		= &umc8672_port_ops,
-	.host_flags		= IDE_HFLAG_NO_DMA,
-	.pio_mask		= ATA_PIO4,
-};
-
-static int __init umc8672_probe(void)
+static inline bool is_ioat_idle(unsigned long status)
 {
-	unsigned long flags;
-
-	if (!request_region(0x108, 2, "umc8672")) {
-		printk(KERN_ERR "umc8672: ports 0x108-0x109 already in use.\n");
-		return 1;
-	}
-	local_irq_save(flags);
-	outb_p(0x5A, 0x108); /* enable umc */
-	if (in_umc (0xd5) != 0xa0) {
-		local_irq_restore(flags);
-		printk(KERN_ERR "umc8672: not found\n");
-		release_region(0x108, 2);
-		return 1;
-	}
-	outb_p(0xa5, 0x108); /* disable umc */
-
-	umc_set_speeds(current_speeds);
-	local_irq_restore(flags);
-
-	return ide_legacy_device_add(&umc8672_port_info, 0);
+	return ((status & IOAT_CHANSTS_STATUS) == IOAT_CHANSTS_DONE);
 }
 
-static bool probe_umc8672;
-
-module_param_named(probe, probe_umc8672, bool, 0);
-MODULE_PARM_DESC(probe, "probe for UMC8672 chipset");
-
-static int __init umc8672_init(void)
+static inline bool is_ioat_halted(unsigned long status)
 {
-	if (probe_umc8672 == 0)
-		goto out;
-
-	if (umc8672_probe() == 0)
-		return 0;
-out:
-	return -ENODEV;
+	return ((status & IOAT_CHANSTS_STATUS) == IOAT_CHANSTS_HALTED);
 }
 
-module_init(umc8672_init);
+static inline bool is_ioat_suspended(unsigned long status)
+{
+	return ((status & IOAT_CHANSTS_STATUS) == IOAT_CHANSTS_SUSPENDED);
+}
 
-MODULE_AUTHOR("Wolfram Podien");
-MODULE_DESCRIPTION("Support for UMC 8672 IDE chipset");
-MODULE_LICENSE("GPL");
+/* channel was fatally programmed */
+static inline bool is_ioat_bug(unsigned long err)
+{
+	return !!err;
+}
+
+#define IOAT_MAX_ORDER 16
+#define ioat_get_alloc_order() \
+	(min(ioat_ring_alloc_order, IOAT_MAX_ORDER))
+#define ioat_get_max_alloc_order() \
+	(min(ioat_ring_max_alloc_order, IOAT_MAX_ORDER))
+
+static inline u32 ioat_ring_size(struct ioatdma_chan *ioat_chan)
+{
+	return 1 << ioat_chan->alloc_order;
+}
+
+/* count of descriptors in flight with the engine */
+static inline u16 ioat_ring_active(struct ioatdma_chan *ioat_chan)
+{
+	return CIRC_CNT(ioat_chan->head, ioat_chan->tail,
+			ioat_ring_size(ioat_chan));
+}
+
+/* count of descriptors pending submission to hardware */
+static inline u16 ioat_ring_pending(struct ioatdma_chan *ioat_chan)
+{
+	return CIRC_CNT(ioat_chan->head, ioat_chan->issued,
+			ioat_ring_size(ioat_chan));
+}
+
+static inline u32 ioat_ring_space(struct ioatdma_chan *ioat_chan)
+{
+	return ioat_ring_size(ioat_chan) - ioat_ring_active(ioat_chan);
+}
+
+static inline u16
+ioat_xferlen_to_descs(struct ioatdma_chan *ioat_chan, size_t len)
+{
+	u16 num_descs = len >> ioat_chan->xfercap_log;
+
+	num_descs += !!(len & ((1 << ioat_chan->xfercap_log) - 1));
+	return num_descs;
+}
+
+static inline struct ioat_ring_ent *
+ioat_get_ring_ent(struct ioatdma_chan *ioat_chan, u16 idx)
+{
+	return ioat_chan->ring[idx & (ioat_ring_size(ioat_chan) - 1)];
+}
+
+static inline void
+ioat_set_chainaddr(struct ioatdma_chan *ioat_chan, u64 addr)
+{
+	writel(addr & 0x00000000FFFFFFFF,
+	       ioat_chan->reg_base + IOAT2_CHAINADDR_OFFSET_LOW);
+	writel(addr >> 32,
+	       ioat_chan->reg_base + IOAT2_CHAINADDR_OFFSET_HIGH);
+}
+
+/* IOAT Prep functions */
+struct dma_async_tx_descriptor *
+ioat_dma_prep_memcpy_lock(struct dma_chan *c, dma_addr_t dma_dest,
+			   dma_addr_t dma_src, size_t len, unsigned long flags);
+struct dma_async_tx_descriptor *
+ioat_prep_interrupt_lock(struct dma_chan *c, unsigned long flags);
+struct dma_async_tx_descriptor *
+ioat_prep_xor(struct dma_chan *chan, dma_addr_t dest, dma_addr_t *src,
+	       unsigned int src_cnt, size_t len, unsigned long flags);
+struct dma_async_tx_descriptor *
+ioat_prep_xor_val(struct dma_chan *chan, dma_addr_t *src,
+		    unsigned int src_cnt, size_t len,
+		    enum sum_check_flags *result, unsigned long flags);
+struct dma_async_tx_descriptor *
+ioat_prep_pq(struct dma_chan *chan, dma_addr_t *dst, dma_addr_t *src,
+	      unsigned int src_cnt, const unsigned char *scf, size_t len,
+	      unsigned long flags);
+struct dma_async_tx_descriptor *
+ioat_prep_pq_val(struct dma_chan *chan, dma_addr_t *pq, dma_addr_t *src,
+		  unsigned int src_cnt, const unsigned char *scf, size_t len,
+		  enum sum_check_flags *pqres, unsigned long flags);
+struct dma_async_tx_descriptor *
+ioat_prep_pqxor(struct dma_chan *chan, dma_addr_t dst, dma_addr_t *src,
+		 unsigned int src_cnt, size_t len, unsigned long flags);
+struct dma_async_tx_descriptor *
+ioat_prep_pqxor_val(struct dma_chan *chan, dma_addr_t *src,
+		     unsigned int src_cnt, size_t len,
+		     enum sum_check_flags *result, unsigned long flags);
+
+/* IOAT Operation functions */
+irqreturn_t ioat_dma_do_interrupt(int irq, void *data);
+irqreturn_t ioat_dma_do_interrupt_msix(int irq, void *data);
+struct ioat_ring_ent **
+ioat_alloc_ring(struct dma_chan *c, int order, gfp_t flags);
+void ioat_start_null_desc(struct ioatdma_chan *ioat_chan);
+void ioat_free_ring_ent(struct ioat_ring_ent *desc, struct dma_chan *chan);
+int ioat_reset_hw(struct ioatdma_chan *ioat_chan);
+enum dma_status
+ioat_tx_status(struct dma_chan *c, dma_cookie_t cookie,
+		struct dma_tx_state *txstate);
+void ioat_cleanup_event(unsigned long data);
+void ioat_timer_event(unsigned long data);
+int ioat_check_space_lock(struct ioatdma_chan *ioat_chan, int num_descs);
+void ioat_issue_pending(struct dma_chan *chan);
+void ioat_timer_event(unsigned long data);
+
+/* IOAT Init functions */
+bool is_bwd_ioat(struct pci_dev *pdev);
+struct dca_provider *ioat_dca_init(struct pci_dev *pdev, void __iomem *iobase);
+void ioat_kobject_add(struct ioatdma

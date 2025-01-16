@@ -1,566 +1,271 @@
-/* Driver for Freecom USB/IDE adaptor
- *
- * Freecom v0.1:
- *
- * First release
- *
- * Current development and maintenance by:
- *   (C) 2000 David Brown <usb-storage@davidb.org>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- *
- * This driver was developed with information provided in FREECOM's USB
- * Programmers Reference Guide.  For further information contact Freecom
- * (http://www.freecom.de/)
- */
-
-#include <linux/module.h>
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-
-#include "usb.h"
-#include "transport.h"
-#include "protocol.h"
-#include "debug.h"
-#include "scsiglue.h"
-
-#define DRV_NAME "ums-freecom"
-
-MODULE_DESCRIPTION("Driver for Freecom USB/IDE adaptor");
-MODULE_AUTHOR("David Brown <usb-storage@davidb.org>");
-MODULE_LICENSE("GPL");
-
-#ifdef CONFIG_USB_STORAGE_DEBUG
-static void pdump(struct us_data *us, void *ibuffer, int length);
-#endif
-
-/* Bits of HD_STATUS */
-#define ERR_STAT		0x01
-#define DRQ_STAT		0x08
-
-/* All of the outgoing packets are 64 bytes long. */
-struct freecom_cb_wrap {
-	u8    Type;		/* Command type. */
-	u8    Timeout;		/* Timeout in seconds. */
-	u8    Atapi[12];	/* An ATAPI packet. */
-	u8    Filler[50];	/* Padding Data. */
-};
-
-struct freecom_xfer_wrap {
-	u8    Type;		/* Command type. */
-	u8    Timeout;		/* Timeout in seconds. */
-	__le32   Count;		/* Number of bytes to transfer. */
-	u8    Pad[58];
-} __attribute__ ((packed));
-
-struct freecom_ide_out {
-	u8    Type;		/* Type + IDE register. */
-	u8    Pad;
-	__le16   Value;		/* Value to write. */
-	u8    Pad2[60];
-};
-
-struct freecom_ide_in {
-	u8    Type;		/* Type | IDE register. */
-	u8    Pad[63];
-};
-
-struct freecom_status {
-	u8    Status;
-	u8    Reason;
-	__le16   Count;
-	u8    Pad[60];
-};
-
-/* Freecom stuffs the interrupt status in the INDEX_STAT bit of the ide
- * register. */
-#define FCM_INT_STATUS		0x02 /* INDEX_STAT */
-#define FCM_STATUS_BUSY		0x80
-
-/* These are the packet types.  The low bit indicates that this command
- * should wait for an interrupt. */
-#define FCM_PACKET_ATAPI	0x21
-#define FCM_PACKET_STATUS	0x20
-
-/* Receive data from the IDE interface.  The ATAPI packet has already
- * waited, so the data should be immediately available. */
-#define FCM_PACKET_INPUT	0x81
-
-/* Send data to the IDE interface. */
-#define FCM_PACKET_OUTPUT	0x01
-
-/* Write a value to an ide register.  Or the ide register to write after
- * munging the address a bit. */
-#define FCM_PACKET_IDE_WRITE	0x40
-#define FCM_PACKET_IDE_READ	0xC0
-
-/* All packets (except for status) are 64 bytes long. */
-#define FCM_PACKET_LENGTH		64
-#define FCM_STATUS_PACKET_LENGTH	4
-
-static int init_freecom(struct us_data *us);
-
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-static struct usb_device_id freecom_usb_ids[] = {
-#	include "unusual_freecom.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, freecom_usb_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev freecom_unusual_dev_list[] = {
-#	include "unusual_freecom.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-static int
-freecom_readdata (struct scsi_cmnd *srb, struct us_data *us,
-		unsigned int ipipe, unsigned int opipe, int count)
-{
-	struct freecom_xfer_wrap *fxfr =
-		(struct freecom_xfer_wrap *) us->iobuf;
-	int result;
-
-	fxfr->Type = FCM_PACKET_INPUT | 0x00;
-	fxfr->Timeout = 0;    /* Short timeout for debugging. */
-	fxfr->Count = cpu_to_le32 (count);
-	memset (fxfr->Pad, 0, sizeof (fxfr->Pad));
-
-	usb_stor_dbg(us, "Read data Freecom! (c=%d)\n", count);
-
-	/* Issue the transfer command. */
-	result = usb_stor_bulk_transfer_buf (us, opipe, fxfr,
-			FCM_PACKET_LENGTH, NULL);
-	if (result != USB_STOR_XFER_GOOD) {
-		usb_stor_dbg(us, "Freecom readdata transport error\n");
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	/* Now transfer all of our blocks. */
-	usb_stor_dbg(us, "Start of read\n");
-	result = usb_stor_bulk_srb(us, ipipe, srb);
-	usb_stor_dbg(us, "freecom_readdata done!\n");
-
-	if (result > USB_STOR_XFER_SHORT)
-		return USB_STOR_TRANSPORT_ERROR;
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-static int
-freecom_writedata (struct scsi_cmnd *srb, struct us_data *us,
-		int unsigned ipipe, unsigned int opipe, int count)
-{
-	struct freecom_xfer_wrap *fxfr =
-		(struct freecom_xfer_wrap *) us->iobuf;
-	int result;
-
-	fxfr->Type = FCM_PACKET_OUTPUT | 0x00;
-	fxfr->Timeout = 0;    /* Short timeout for debugging. */
-	fxfr->Count = cpu_to_le32 (count);
-	memset (fxfr->Pad, 0, sizeof (fxfr->Pad));
-
-	usb_stor_dbg(us, "Write data Freecom! (c=%d)\n", count);
-
-	/* Issue the transfer command. */
-	result = usb_stor_bulk_transfer_buf (us, opipe, fxfr,
-			FCM_PACKET_LENGTH, NULL);
-	if (result != USB_STOR_XFER_GOOD) {
-		usb_stor_dbg(us, "Freecom writedata transport error\n");
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	/* Now transfer all of our blocks. */
-	usb_stor_dbg(us, "Start of write\n");
-	result = usb_stor_bulk_srb(us, opipe, srb);
-
-	usb_stor_dbg(us, "freecom_writedata done!\n");
-	if (result > USB_STOR_XFER_SHORT)
-		return USB_STOR_TRANSPORT_ERROR;
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Transport for the Freecom USB/IDE adaptor.
- *
- */
-static int freecom_transport(struct scsi_cmnd *srb, struct us_data *us)
-{
-	struct freecom_cb_wrap *fcb;
-	struct freecom_status  *fst;
-	unsigned int ipipe, opipe;		/* We need both pipes. */
-	int result;
-	unsigned int partial;
-	int length;
-
-	fcb = (struct freecom_cb_wrap *) us->iobuf;
-	fst = (struct freecom_status *) us->iobuf;
-
-	usb_stor_dbg(us, "Freecom TRANSPORT STARTED\n");
-
-	/* Get handles for both transports. */
-	opipe = us->send_bulk_pipe;
-	ipipe = us->recv_bulk_pipe;
-
-	/* The ATAPI Command always goes out first. */
-	fcb->Type = FCM_PACKET_ATAPI | 0x00;
-	fcb->Timeout = 0;
-	memcpy (fcb->Atapi, srb->cmnd, 12);
-	memset (fcb->Filler, 0, sizeof (fcb->Filler));
-
-	US_DEBUG(pdump(us, srb->cmnd, 12));
-
-	/* Send it out. */
-	result = usb_stor_bulk_transfer_buf (us, opipe, fcb,
-			FCM_PACKET_LENGTH, NULL);
-
-	/* The Freecom device will only fail if there is something wrong in
-	 * USB land.  It returns the status in its own registers, which
-	 * come back in the bulk pipe. */
-	if (result != USB_STOR_XFER_GOOD) {
-		usb_stor_dbg(us, "freecom transport error\n");
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	/* There are times we can optimize out this status read, but it
-	 * doesn't hurt us to always do it now. */
-	result = usb_stor_bulk_transfer_buf (us, ipipe, fst,
-			FCM_STATUS_PACKET_LENGTH, &partial);
-	usb_stor_dbg(us, "foo Status result %d %u\n", result, partial);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	US_DEBUG(pdump(us, (void *)fst, partial));
-
-	/* The firmware will time-out commands after 20 seconds. Some commands
-	 * can legitimately take longer than this, so we use a different
-	 * command that only waits for the interrupt and then sends status,
-	 * without having to send a new ATAPI command to the device.
-	 *
-	 * NOTE: There is some indication that a data transfer after a timeout
-	 * may not work, but that is a condition that should never happen.
-	 */
-	while (fst->Status & FCM_STATUS_BUSY) {
-		usb_stor_dbg(us, "20 second USB/ATAPI bridge TIMEOUT occurred!\n");
-		usb_stor_dbg(us, "fst->Status is %x\n", fst->Status);
-
-		/* Get the status again */
-		fcb->Type = FCM_PACKET_STATUS;
-		fcb->Timeout = 0;
-		memset (fcb->Atapi, 0, sizeof(fcb->Atapi));
-		memset (fcb->Filler, 0, sizeof (fcb->Filler));
-
-		/* Send it out. */
-		result = usb_stor_bulk_transfer_buf (us, opipe, fcb,
-				FCM_PACKET_LENGTH, NULL);
-
-		/* The Freecom device will only fail if there is something
-		 * wrong in USB land.  It returns the status in its own
-		 * registers, which come back in the bulk pipe.
-		 */
-		if (result != USB_STOR_XFER_GOOD) {
-			usb_stor_dbg(us, "freecom transport error\n");
-			return USB_STOR_TRANSPORT_ERROR;
-		}
-
-		/* get the data */
-		result = usb_stor_bulk_transfer_buf (us, ipipe, fst,
-				FCM_STATUS_PACKET_LENGTH, &partial);
-
-		usb_stor_dbg(us, "bar Status result %d %u\n", result, partial);
-		if (result != USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		US_DEBUG(pdump(us, (void *)fst, partial));
-	}
-
-	if (partial != 4)
-		return USB_STOR_TRANSPORT_ERROR;
-	if ((fst->Status & 1) != 0) {
-		usb_stor_dbg(us, "operation failed\n");
-		return USB_STOR_TRANSPORT_FAILED;
-	}
-
-	/* The device might not have as much data available as we
-	 * requested.  If you ask for more than the device has, this reads
-	 * and such will hang. */
-	usb_stor_dbg(us, "Device indicates that it has %d bytes available\n",
-		     le16_to_cpu(fst->Count));
-	usb_stor_dbg(us, "SCSI requested %d\n", scsi_bufflen(srb));
-
-	/* Find the length we desire to read. */
-	switch (srb->cmnd[0]) {
-	case INQUIRY:
-	case REQUEST_SENSE:	/* 16 or 18 bytes? spec says 18, lots of devices only have 16 */
-	case MODE_SENSE:
-	case MODE_SENSE_10:
-		length = le16_to_cpu(fst->Count);
-		break;
-	default:
-		length = scsi_bufflen(srb);
-	}
-
-	/* verify that this amount is legal */
-	if (length > scsi_bufflen(srb)) {
-		length = scsi_bufflen(srb);
-		usb_stor_dbg(us, "Truncating request to match buffer length: %d\n",
-			     length);
-	}
-
-	/* What we do now depends on what direction the data is supposed to
-	 * move in. */
-
-	switch (us->srb->sc_data_direction) {
-	case DMA_FROM_DEVICE:
-		/* catch bogus "read 0 length" case */
-		if (!length)
-			break;
-		/* Make sure that the status indicates that the device
-		 * wants data as well. */
-		if ((fst->Status & DRQ_STAT) == 0 || (fst->Reason & 3) != 2) {
-			usb_stor_dbg(us, "SCSI wants data, drive doesn't have any\n");
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-		result = freecom_readdata (srb, us, ipipe, opipe, length);
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			return result;
-
-		usb_stor_dbg(us, "Waiting for status\n");
-		result = usb_stor_bulk_transfer_buf (us, ipipe, fst,
-				FCM_PACKET_LENGTH, &partial);
-		US_DEBUG(pdump(us, (void *)fst, partial));
-
-		if (partial != 4 || result > USB_STOR_XFER_SHORT)
-			return USB_STOR_TRANSPORT_ERROR;
-		if ((fst->Status & ERR_STAT) != 0) {
-			usb_stor_dbg(us, "operation failed\n");
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-		if ((fst->Reason & 3) != 3) {
-			usb_stor_dbg(us, "Drive seems still hungry\n");
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-		usb_stor_dbg(us, "Transfer happy\n");
-		break;
-
-	case DMA_TO_DEVICE:
-		/* catch bogus "write 0 length" case */
-		if (!length)
-			break;
-		/* Make sure the status indicates that the device wants to
-		 * send us data. */
-		/* !!IMPLEMENT!! */
-		result = freecom_writedata (srb, us, ipipe, opipe, length);
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			return result;
-
-		usb_stor_dbg(us, "Waiting for status\n");
-		result = usb_stor_bulk_transfer_buf (us, ipipe, fst,
-				FCM_PACKET_LENGTH, &partial);
-
-		if (partial != 4 || result > USB_STOR_XFER_SHORT)
-			return USB_STOR_TRANSPORT_ERROR;
-		if ((fst->Status & ERR_STAT) != 0) {
-			usb_stor_dbg(us, "operation failed\n");
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-		if ((fst->Reason & 3) != 3) {
-			usb_stor_dbg(us, "Drive seems still hungry\n");
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-
-		usb_stor_dbg(us, "Transfer happy\n");
-		break;
-
-
-	case DMA_NONE:
-		/* Easy, do nothing. */
-		break;
-
-	default:
-		/* should never hit here -- filtered in usb.c */
-		usb_stor_dbg(us, "freecom unimplemented direction: %d\n",
-			     us->srb->sc_data_direction);
-		/* Return fail, SCSI seems to handle this better. */
-		return USB_STOR_TRANSPORT_FAILED;
-		break;
-	}
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-static int init_freecom(struct us_data *us)
-{
-	int result;
-	char *buffer = us->iobuf;
-
-	/* The DMA-mapped I/O buffer is 64 bytes long, just right for
-	 * all our packets.  No need to allocate any extra buffer space.
-	 */
-
-	result = usb_stor_control_msg(us, us->recv_ctrl_pipe,
-			0x4c, 0xc0, 0x4346, 0x0, buffer, 0x20, 3*HZ);
-	buffer[32] = '\0';
-	usb_stor_dbg(us, "String returned from FC init is: %s\n", buffer);
-
-	/* Special thanks to the people at Freecom for providing me with
-	 * this "magic sequence", which they use in their Windows and MacOS
-	 * drivers to make sure that all the attached perhiperals are
-	 * properly reset.
-	 */
-
-	/* send reset */
-	result = usb_stor_control_msg(us, us->send_ctrl_pipe,
-			0x4d, 0x40, 0x24d8, 0x0, NULL, 0x0, 3*HZ);
-	usb_stor_dbg(us, "result from activate reset is %d\n", result);
-
-	/* wait 250ms */
-	mdelay(250);
-
-	/* clear reset */
-	result = usb_stor_control_msg(us, us->send_ctrl_pipe,
-			0x4d, 0x40, 0x24f8, 0x0, NULL, 0x0, 3*HZ);
-	usb_stor_dbg(us, "result from clear reset is %d\n", result);
-
-	/* wait 3 seconds */
-	mdelay(3 * 1000);
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-static int usb_stor_freecom_reset(struct us_data *us)
-{
-	printk (KERN_CRIT "freecom reset called\n");
-
-	/* We don't really have this feature. */
-	return FAILED;
-}
-
-#ifdef CONFIG_USB_STORAGE_DEBUG
-static void pdump(struct us_data *us, void *ibuffer, int length)
-{
-	static char line[80];
-	int offset = 0;
-	unsigned char *buffer = (unsigned char *) ibuffer;
-	int i, j;
-	int from, base;
-
-	offset = 0;
-	for (i = 0; i < length; i++) {
-		if ((i & 15) == 0) {
-			if (i > 0) {
-				offset += sprintf (line+offset, " - ");
-				for (j = i - 16; j < i; j++) {
-					if (buffer[j] >= 32 && buffer[j] <= 126)
-						line[offset++] = buffer[j];
-					else
-						line[offset++] = '.';
-				}
-				line[offset] = 0;
-				usb_stor_dbg(us, "%s\n", line);
-				offset = 0;
-			}
-			offset += sprintf (line+offset, "%08x:", i);
-		} else if ((i & 7) == 0) {
-			offset += sprintf (line+offset, " -");
-		}
-		offset += sprintf (line+offset, " %02x", buffer[i] & 0xff);
-	}
-
-	/* Add the last "chunk" of data. */
-	from = (length - 1) % 16;
-	base = ((length - 1) / 16) * 16;
-
-	for (i = from + 1; i < 16; i++)
-		offset += sprintf (line+offset, "   ");
-	if (from < 8)
-		offset += sprintf (line+offset, "  ");
-	offset += sprintf (line+offset, " - ");
-
-	for (i = 0; i <= from; i++) {
-		if (buffer[base+i] >= 32 && buffer[base+i] <= 126)
-			line[offset++] = buffer[base+i];
-		else
-			line[offset++] = '.';
-	}
-	line[offset] = 0;
-	usb_stor_dbg(us, "%s\n", line);
-	offset = 0;
-}
-#endif
-
-static struct scsi_host_template freecom_host_template;
-
-static int freecom_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-
-	result = usb_stor_probe1(&us, intf, id,
-			(id - freecom_usb_ids) + freecom_unusual_dev_list,
-			&freecom_host_template);
-	if (result)
-		return result;
-
-	us->transport_name = "Freecom";
-	us->transport = freecom_transport;
-	us->transport_reset = usb_stor_freecom_reset;
-	us->max_lun = 0;
-
-	result = usb_stor_probe2(us);
-	return result;
-}
-
-static struct usb_driver freecom_driver = {
-	.name =		DRV_NAME,
-	.probe =	freecom_probe,
-	.disconnect =	usb_stor_disconnect,
-	.suspend =	usb_stor_suspend,
-	.resume =	usb_stor_resume,
-	.reset_resume =	usb_stor_reset_resume,
-	.pre_reset =	usb_stor_pre_reset,
-	.post_reset =	usb_stor_post_reset,
-	.id_table =	freecom_usb_ids,
-	.soft_unbind =	1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(freecom_driver, freecom_host_template, DRV_NAME);
+e D2F1_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS_MASK 0x800000
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS__SHIFT 0x17
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED_MASK 0x3000000
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED__SHIFT 0x18
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE_MASK 0x4000000
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE__SHIFT 0x1a
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN_MASK 0x8000000
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN__SHIFT 0x1b
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN_MASK 0x10000000
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN__SHIFT 0x1c
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN_MASK 0x20000000
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN__SHIFT 0x1d
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG_MASK 0x40000000
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG__SHIFT 0x1e
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS_MASK 0x80000000
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS__SHIFT 0x1f
+#define D2F1_PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF_MASK 0xfff
+#define D2F1_PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF__SHIFT 0x0
+#define D2F1_PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS_MASK 0xfff000
+#define D2F1_PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS__SHIFT 0xc
+#define D2F1_PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE_MASK 0x3000000
+#define D2F1_PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE__SHIFT 0x18
+#define D2F1_PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES_MASK 0xffff
+#define D2F1_PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES__SHIFT 0x0
+#define D2F1_PCIE_LC_LANE_CNTL__LC_LANE_DIS_MASK 0xffff0000
+#define D2F1_PCIE_LC_LANE_CNTL__LC_LANE_DIS__SHIFT 0x10
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_FORCE_COEFF_MASK 0x1
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_FORCE_COEFF__SHIFT 0x0
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_FORCE_PRE_CURSOR_MASK 0x7e
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_FORCE_PRE_CURSOR__SHIFT 0x1
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_FORCE_CURSOR_MASK 0x1f80
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_FORCE_CURSOR__SHIFT 0x7
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_FORCE_POST_CURSOR_MASK 0x7e000
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_FORCE_POST_CURSOR__SHIFT 0xd
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_3X3_COEFF_SEARCH_EN_MASK 0x80000
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_3X3_COEFF_SEARCH_EN__SHIFT 0x13
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_PRESET_10_EN_MASK 0x100000
+#define D2F1_PCIE_LC_FORCE_COEFF__LC_PRESET_10_EN__SHIFT 0x14
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRESET_MASK 0xf
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRESET__SHIFT 0x0
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRECURSOR_MASK 0x3f0
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRECURSOR__SHIFT 0x4
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_CURSOR_MASK 0xfc00
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_CURSOR__SHIFT 0xa
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_POSTCURSOR_MASK 0x3f0000
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_POSTCURSOR__SHIFT 0x10
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_FOM_MASK 0x3fc00000
+#define D2F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_FOM__SHIFT 0x16
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_COEFF_IN_EQ_REQ_PHASE_MASK 0x1
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_COEFF_IN_EQ_REQ_PHASE__SHIFT 0x0
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_PRE_CURSOR_REQ_MASK 0x7e
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_PRE_CURSOR_REQ__SHIFT 0x1
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_CURSOR_REQ_MASK 0x1f80
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_CURSOR_REQ__SHIFT 0x7
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_POST_CURSOR_REQ_MASK 0x7e000
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_POST_CURSOR_REQ__SHIFT 0xd
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END_MASK 0x1f80000
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END__SHIFT 0x13
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END_MASK 0x7e000000
+#define D2F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END__SHIFT 0x19
+#define D2F1_PCIE_LC_STATE0__LC_CURRENT_STATE_MASK 0x3f
+#define D2F1_PCIE_LC_STATE0__LC_CURRENT_STATE__SHIFT 0x0
+#define D2F1_PCIE_LC_STATE0__LC_PREV_STATE1_MASK 0x3f00
+#define D2F1_PCIE_LC_STATE0__LC_PREV_STATE1__SHIFT 0x8
+#define D2F1_PCIE_LC_STATE0__LC_PREV_STATE2_MASK 0x3f0000
+#define D2F1_PCIE_LC_STATE0__LC_PREV_STATE2__SHIFT 0x10
+#define D2F1_PCIE_LC_STATE0__LC_PREV_STATE3_MASK 0x3f000000
+#define D2F1_PCIE_LC_STATE0__LC_PREV_STATE3__SHIFT 0x18
+#define D2F1_PCIE_LC_STATE1__LC_PREV_STATE4_MASK 0x3f
+#define D2F1_PCIE_LC_STATE1__LC_PREV_STATE4__SHIFT 0x0
+#define D2F1_PCIE_LC_STATE1__LC_PREV_STATE5_MASK 0x3f00
+#define D2F1_PCIE_LC_STATE1__LC_PREV_STATE5__SHIFT 0x8
+#define D2F1_PCIE_LC_STATE1__LC_PREV_STATE6_MASK 0x3f0000
+#define D2F1_PCIE_LC_STATE1__LC_PREV_STATE6__SHIFT 0x10
+#define D2F1_PCIE_LC_STATE1__LC_PREV_STATE7_MASK 0x3f000000
+#define D2F1_PCIE_LC_STATE1__LC_PREV_STATE7__SHIFT 0x18
+#define D2F1_PCIE_LC_STATE2__LC_PREV_STATE8_MASK 0x3f
+#define D2F1_PCIE_LC_STATE2__LC_PREV_STATE8__SHIFT 0x0
+#define D2F1_PCIE_LC_STATE2__LC_PREV_STATE9_MASK 0x3f00
+#define D2F1_PCIE_LC_STATE2__LC_PREV_STATE9__SHIFT 0x8
+#define D2F1_PCIE_LC_STATE2__LC_PREV_STATE10_MASK 0x3f0000
+#define D2F1_PCIE_LC_STATE2__LC_PREV_STATE10__SHIFT 0x10
+#define D2F1_PCIE_LC_STATE2__LC_PREV_STATE11_MASK 0x3f000000
+#define D2F1_PCIE_LC_STATE2__LC_PREV_STATE11__SHIFT 0x18
+#define D2F1_PCIE_LC_STATE3__LC_PREV_STATE12_MASK 0x3f
+#define D2F1_PCIE_LC_STATE3__LC_PREV_STATE12__SHIFT 0x0
+#define D2F1_PCIE_LC_STATE3__LC_PREV_STATE13_MASK 0x3f00
+#define D2F1_PCIE_LC_STATE3__LC_PREV_STATE13__SHIFT 0x8
+#define D2F1_PCIE_LC_STATE3__LC_PREV_STATE14_MASK 0x3f0000
+#define D2F1_PCIE_LC_STATE3__LC_PREV_STATE14__SHIFT 0x10
+#define D2F1_PCIE_LC_STATE3__LC_PREV_STATE15_MASK 0x3f000000
+#define D2F1_PCIE_LC_STATE3__LC_PREV_STATE15__SHIFT 0x18
+#define D2F1_PCIE_LC_STATE4__LC_PREV_STATE16_MASK 0x3f
+#define D2F1_PCIE_LC_STATE4__LC_PREV_STATE16__SHIFT 0x0
+#define D2F1_PCIE_LC_STATE4__LC_PREV_STATE17_MASK 0x3f00
+#define D2F1_PCIE_LC_STATE4__LC_PREV_STATE17__SHIFT 0x8
+#define D2F1_PCIE_LC_STATE4__LC_PREV_STATE18_MASK 0x3f0000
+#define D2F1_PCIE_LC_STATE4__LC_PREV_STATE18__SHIFT 0x10
+#define D2F1_PCIE_LC_STATE4__LC_PREV_STATE19_MASK 0x3f000000
+#define D2F1_PCIE_LC_STATE4__LC_PREV_STATE19__SHIFT 0x18
+#define D2F1_PCIE_LC_STATE5__LC_PREV_STATE20_MASK 0x3f
+#define D2F1_PCIE_LC_STATE5__LC_PREV_STATE20__SHIFT 0x0
+#define D2F1_PCIE_LC_STATE5__LC_PREV_STATE21_MASK 0x3f00
+#define D2F1_PCIE_LC_STATE5__LC_PREV_STATE21__SHIFT 0x8
+#define D2F1_PCIE_LC_STATE5__LC_PREV_STATE22_MASK 0x3f0000
+#define D2F1_PCIE_LC_STATE5__LC_PREV_STATE22__SHIFT 0x10
+#define D2F1_PCIE_LC_STATE5__LC_PREV_STATE23_MASK 0x3f000000
+#define D2F1_PCIE_LC_STATE5__LC_PREV_STATE23__SHIFT 0x18
+#define D2F1_PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT_MASK 0x3
+#define D2F1_PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT__SHIFT 0x0
+#define D2F1_PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT_MASK 0xc
+#define D2F1_PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT__SHIFT 0x2
+#define D2F1_PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT_MASK 0x30
+#define D2F1_PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT__SHIFT 0x4
+#define D2F1_PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT_MASK 0xc0
+#define D2F1_PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT__SHIFT 0x6
+#define D2F1_PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL_MASK 0x700
+#define D2F1_PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL__SHIFT 0x8
+#define D2F1_PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET_MASK 0x800
+#define D2F1_PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET__SHIFT 0xb
+#define D2F1_PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS_MASK 0x1000
+#define D2F1_PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS__SHIFT 0xc
+#define D2F1_PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE_MASK 0x2000
+#define D2F1_PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE__SHIFT 0xd
+#define D2F1_PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES_MASK 0x4000
+#define D2F1_PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES__SHIFT 0xe
+#define D2F1_PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS_MASK 0x8000
+#define D2F1_PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS__SHIFT 0xf
+#define D2F1_PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION_MASK 0x70000
+#define D2F1_PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION__SHIFT 0x10
+#define D2F1_PCIEP_STRAP_MISC__STRAP_REVERSE_LANES_MASK 0x1
+#define D2F1_PCIEP_STRAP_MISC__STRAP_REVERSE_LANES__SHIFT 0x0
+#define D2F1_PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN_MASK 0x2
+#define D2F1_PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN__SHIFT 0x1
+#define D2F1_PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED_MASK 0x4
+#define D2F1_PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED__SHIFT 0x2
+#define D2F1_PCIEP_STRAP_MISC__STRAP_OBFF_SUPPORTED_MASK 0x18
+#define D2F1_PCIEP_STRAP_MISC__STRAP_OBFF_SUPPORTED__SHIFT 0x3
+#define D2F1_PCIEP_STRAP_MISC__STRAP_LTR_SUPPORTED_MASK 0x20
+#define D2F1_PCIEP_STRAP_MISC__STRAP_LTR_SUPPORTED__SHIFT 0x5
+#define D2F1_PCIEP_BCH_ECC_CNTL__STRAP_BCH_ECC_EN_MASK 0x1
+#define D2F1_PCIEP_BCH_ECC_CNTL__STRAP_BCH_ECC_EN__SHIFT 0x0
+#define D2F1_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD_MASK 0xff00
+#define D2F1_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD__SHIFT 0x8
+#define D2F1_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS_MASK 0xffff0000
+#define D2F1_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS__SHIFT 0x10
+#define D2F1_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE_MASK 0x8
+#define D2F1_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE__SHIFT 0x3
+#define D2F1_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE_MASK 0x40
+#define D2F1_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE__SHIFT 0x6
+#define D2F1_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN_MASK 0x1
+#define D2F1_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN__SHIFT 0x0
+#define D2F1_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN_MASK 0x2
+#define D2F1_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN__SHIFT 0x1
+#define D2F1_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN_MASK 0x4
+#define D2F1_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN__SHIFT 0x2
+#define D2F1_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN_MASK 0x8
+#define D2F1_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN__SHIFT 0x3
+#define D2F1_PCIEP_HPGI__REG_HPGI_HOOK_MASK 0x80
+#define D2F1_PCIEP_HPGI__REG_HPGI_HOOK__SHIFT 0x7
+#define D2F1_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS_MASK 0x100
+#define D2F1_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS__SHIFT 0x8
+#define D2F1_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS_MASK 0x200
+#define D2F1_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS__SHIFT 0x9
+#define D2F1_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS_MASK 0x400
+#define D2F1_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS__SHIFT 0xa
+#define D2F1_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS_MASK 0x800
+#define D2F1_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS__SHIFT 0xb
+#define D2F1_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS_MASK 0x8000
+#define D2F1_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS__SHIFT 0xf
+#define D2F1_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN_MASK 0x10000
+#define D2F1_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN__SHIFT 0x10
+#define D2F1_VENDOR_ID__VENDOR_ID_MASK 0xffff
+#define D2F1_VENDOR_ID__VENDOR_ID__SHIFT 0x0
+#define D2F1_DEVICE_ID__DEVICE_ID_MASK 0xffff0000
+#define D2F1_DEVICE_ID__DEVICE_ID__SHIFT 0x10
+#define D2F1_COMMAND__IO_ACCESS_EN_MASK 0x1
+#define D2F1_COMMAND__IO_ACCESS_EN__SHIFT 0x0
+#define D2F1_COMMAND__MEM_ACCESS_EN_MASK 0x2
+#define D2F1_COMMAND__MEM_ACCESS_EN__SHIFT 0x1
+#define D2F1_COMMAND__BUS_MASTER_EN_MASK 0x4
+#define D2F1_COMMAND__BUS_MASTER_EN__SHIFT 0x2
+#define D2F1_COMMAND__SPECIAL_CYCLE_EN_MASK 0x8
+#define D2F1_COMMAND__SPECIAL_CYCLE_EN__SHIFT 0x3
+#define D2F1_COMMAND__MEM_WRITE_INVALIDATE_EN_MASK 0x10
+#define D2F1_COMMAND__MEM_WRITE_INVALIDATE_EN__SHIFT 0x4
+#define D2F1_COMMAND__PAL_SNOOP_EN_MASK 0x20
+#define D2F1_COMMAND__PAL_SNOOP_EN__SHIFT 0x5
+#define D2F1_COMMAND__PARITY_ERROR_RESPONSE_MASK 0x40
+#define D2F1_COMMAND__PARITY_ERROR_RESPONSE__SHIFT 0x6
+#define D2F1_COMMAND__AD_STEPPING_MASK 0x80
+#define D2F1_COMMAND__AD_STEPPING__SHIFT 0x7
+#define D2F1_COMMAND__SERR_EN_MASK 0x100
+#define D2F1_COMMAND__SERR_EN__SHIFT 0x8
+#define D2F1_COMMAND__FAST_B2B_EN_MASK 0x200
+#define D2F1_COMMAND__FAST_B2B_EN__SHIFT 0x9
+#define D2F1_COMMAND__INT_DIS_MASK 0x400
+#define D2F1_COMMAND__INT_DIS__SHIFT 0xa
+#define D2F1_STATUS__INT_STATUS_MASK 0x80000
+#define D2F1_STATUS__INT_STATUS__SHIFT 0x13
+#define D2F1_STATUS__CAP_LIST_MASK 0x100000
+#define D2F1_STATUS__CAP_LIST__SHIFT 0x14
+#define D2F1_STATUS__PCI_66_EN_MASK 0x200000
+#define D2F1_STATUS__PCI_66_EN__SHIFT 0x15
+#define D2F1_STATUS__FAST_BACK_CAPABLE_MASK 0x800000
+#define D2F1_STATUS__FAST_BACK_CAPABLE__SHIFT 0x17
+#define D2F1_STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x1000000
+#define D2F1_STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x18
+#define D2F1_STATUS__DEVSEL_TIMING_MASK 0x6000000
+#define D2F1_STATUS__DEVSEL_TIMING__SHIFT 0x19
+#define D2F1_STATUS__SIGNAL_TARGET_ABORT_MASK 0x8000000
+#define D2F1_STATUS__SIGNAL_TARGET_ABORT__SHIFT 0x1b
+#define D2F1_STATUS__RECEIVED_TARGET_ABORT_MASK 0x10000000
+#define D2F1_STATUS__RECEIVED_TARGET_ABORT__SHIFT 0x1c
+#define D2F1_STATUS__RECEIVED_MASTER_ABORT_MASK 0x20000000
+#define D2F1_STATUS__RECEIVED_MASTER_ABORT__SHIFT 0x1d
+#define D2F1_STATUS__SIGNALED_SYSTEM_ERROR_MASK 0x40000000
+#define D2F1_STATUS__SIGNALED_SYSTEM_ERROR__SHIFT 0x1e
+#define D2F1_STATUS__PARITY_ERROR_DETECTED_MASK 0x80000000
+#define D2F1_STATUS__PARITY_ERROR_DETECTED__SHIFT 0x1f
+#define D2F1_REVISION_ID__MINOR_REV_ID_MASK 0xf
+#define D2F1_REVISION_ID__MINOR_REV_ID__SHIFT 0x0
+#define D2F1_REVISION_ID__MAJOR_REV_ID_MASK 0xf0
+#define D2F1_REVISION_ID__MAJOR_REV_ID__SHIFT 0x4
+#define D2F1_PROG_INTERFACE__PROG_INTERFACE_MASK 0xff00
+#define D2F1_PROG_INTERFACE__PROG_INTERFACE__SHIFT 0x8
+#define D2F1_SUB_CLASS__SUB_CLASS_MASK 0xff0000
+#define D2F1_SUB_CLASS__SUB_CLASS__SHIFT 0x10
+#define D2F1_BASE_CLASS__BASE_CLASS_MASK 0xff000000
+#define D2F1_BASE_CLASS__BASE_CLASS__SHIFT 0x18
+#define D2F1_CACHE_LINE__CACHE_LINE_SIZE_MASK 0xff
+#define D2F1_CACHE_LINE__CACHE_LINE_SIZE__SHIFT 0x0
+#define D2F1_LATENCY__LATENCY_TIMER_MASK 0xff00
+#define D2F1_LATENCY__LATENCY_TIMER__SHIFT 0x8
+#define D2F1_HEADER__HEADER_TYPE_MASK 0x7f0000
+#define D2F1_HEADER__HEADER_TYPE__SHIFT 0x10
+#define D2F1_HEADER__DEVICE_TYPE_MASK 0x800000
+#define D2F1_HEADER__DEVICE_TYPE__SHIFT 0x17
+#define D2F1_BIST__BIST_COMP_MASK 0xf000000
+#define D2F1_BIST__BIST_COMP__SHIFT 0x18
+#define D2F1_BIST__BIST_STRT_MASK 0x40000000
+#define D2F1_BIST__BIST_STRT__SHIFT 0x1e
+#define D2F1_BIST__BIST_CAP_MASK 0x80000000
+#define D2F1_BIST__BIST_CAP__SHIFT 0x1f
+#define D2F1_SUB_BUS_NUMBER_LATENCY__PRIMARY_BUS_MASK 0xff
+#define D2F1_SUB_BUS_NUMBER_LATENCY__PRIMARY_BUS__SHIFT 0x0
+#define D2F1_SUB_BUS_NUMBER_LATENCY__SECONDARY_BUS_MASK 0xff00
+#define D2F1_SUB_BUS_NUMBER_LATENCY__SECONDARY_BUS__SHIFT 0x8
+#define D2F1_SUB_BUS_NUMBER_LATENCY__SUB_BUS_NUM_MASK 0xff0000
+#define D2F1_SUB_BUS_NUMBER_LATENCY__SUB_BUS_NUM__SHIFT 0x10
+#define D2F1_SUB_BUS_NUMBER_LATENCY__SECONDARY_LATENCY_TIMER_MASK 0xff000000
+#define D2F1_SUB_BUS_NUMBER_LATENCY__SECONDARY_LATENCY_TIMER__SHIFT 0x18
+#define D2F1_IO_BASE_LIMIT__IO_BASE_TYPE_MASK 0xf
+#define D2F1_IO_BASE_LIMIT__IO_BASE_TYPE__SHIFT 0x0
+#define D2F1_IO_BASE_LIMIT__IO_BASE_MASK 0xf0
+#define D2F1_IO_BASE_LIMIT__IO_BASE__SHIFT 0x4
+#define D2F1_IO_BASE_LIMIT__IO_LIMIT_TYPE_MASK 0xf00
+#define D2F1_IO_BASE_LIMIT__IO_LIMIT_TYPE__SHIFT 0x8
+#define D2F1_IO_BASE_LIMIT__IO_LIMIT_MASK 0xf000
+#define D2F1_IO_BASE_LIMIT__IO_LIMIT__SHIFT 0xc
+#define D2F1_SECONDARY_STATUS__CAP_LIST_MASK 0x100000
+#define D2F1_SECONDARY_STATUS__CAP_LIST__SHIFT 0x14
+#define D2F1_SECONDARY_STATUS__PCI_66_EN_MASK 0x200000
+#define D2F1_SECONDARY_STATUS__PCI_66_EN__SHIFT 0x15
+#define D2F1_SECONDARY_STATUS__FAST_BACK_CAPABLE_MASK 0x800000
+#define D2F1_SECONDARY_STATUS__FAST_BACK_CAPABLE__SHIFT 0x17
+#define D2F1_SECONDARY_STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x1000000
+#define D2F1_SECONDARY_STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x18
+#define D2F1_SECONDARY_STATUS__DEVSEL_TIMING_MASK 0x6000000
+#define D2F1_SECONDARY_STATUS__DEVSEL_TIMING__SHIFT 0x19
+#define D2F1_SECONDARY_STATUS__SIGNAL_TARGET_AB

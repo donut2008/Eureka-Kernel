@@ -1,34 +1,10 @@
-#ifndef _BCACHE_DEBUG_H
-#define _BCACHE_DEBUG_H
-
-struct bio;
-struct cached_dev;
-struct cache_set;
-
-#ifdef CONFIG_BCACHE_DEBUG
-
-void bch_btree_verify(struct btree *);
-void bch_data_verify(struct cached_dev *, struct bio *);
-
-#define expensive_debug_checks(c)	((c)->expensive_debug_checks)
-#define key_merging_disabled(c)		((c)->key_merging_disabled)
-#define bypass_torture_test(d)		((d)->bypass_torture_test)
-
-#else /* DEBUG */
-
-static inline void bch_btree_verify(struct btree *b) {}
-static inline void bch_data_verify(struct cached_dev *dc, struct bio *bio) {}
-
-#define expensive_debug_checks(c)	0
-#define key_merging_disabled(c)		0
-#define bypass_torture_test(d)		0
-
-#endif
-
-#ifdef CONFIG_DEBUG_FS
-void bch_debug_init_cache_set(struct cache_set *);
-#else
-static inline void bch_debug_init_cache_set(struct cache_set *c) {}
-#endif
-
-#endif
+GISTERS_TABLE_66                                                 0x3fc44
+#define ixMC_REGISTERS_TABLE_67                                                 0x3fc48
+#define ixMC_REGISTERS_TABLE_68                                                 0x3fc4c
+#define ixMC_REGISTERS_TABLE_69                                                 0x3fc50
+#define ixMC_REGISTERS_TABLE_70                                                 0x3fc54
+#define ixMC_REGISTERS_TABLE_71                                                 0x3fc58
+#define ixMC_REGISTERS_TABLE_72                                                 0x3fc5c
+#define ixMC_REGISTERS_TABLE_73                                                 0x3fc60
+#define ixMC_REGISTERS_TABLE_74                                                 0x3fc64
+#define ixMC_REGISTERS_TABLE_75                                

@@ -1,278 +1,256 @@
 /*
- * I2C multiplexer using pinctrl API
+ * Copyright (c) 2013 Intel Corporation. All rights reserved.
+ * Copyright (c) 2006, 2007, 2008, 2009 QLogic Corporation. All rights reserved.
+ * Copyright (c) 2003, 2004, 2005, 2006 PathScale, Inc. All rights reserved.
  *
- * Copyright (c) 2012, NVIDIA CORPORATION.  All rights reserved.
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
  *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
  *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
-#include <linux/i2c.h>
-#include <linux/i2c-mux.h>
+#include <linux/spinlock.h>
+#include <linux/pci.h>
+#include <linux/io.h>
+#include <linux/delay.h>
+#include <linux/netdevice.h>
+#include <linux/vmalloc.h>
 #include <linux/module.h>
-#include <linux/pinctrl/consumer.h>
-#include <linux/i2c-mux-pinctrl.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-#include <linux/of.h>
+#include <linux/prefetch.h>
 
-struct i2c_mux_pinctrl {
-	struct device *dev;
-	struct i2c_mux_pinctrl_platform_data *pdata;
-	struct pinctrl *pinctrl;
-	struct pinctrl_state **states;
-	struct pinctrl_state *state_idle;
-	struct i2c_adapter *parent;
-	struct i2c_adapter **busses;
-};
+#include "qib.h"
 
-static int i2c_mux_pinctrl_select(struct i2c_adapter *adap, void *data,
-				  u32 chan)
+/*
+ * The size has to be longer than this string, so we can append
+ * board/chip information to it in the init code.
+ */
+const char ib_qib_version[] = QIB_DRIVER_VERSION "\n";
+
+DEFINE_SPINLOCK(qib_devs_lock);
+LIST_HEAD(qib_dev_list);
+DEFINE_MUTEX(qib_mutex);	/* general driver use */
+
+unsigned qib_ibmtu;
+module_param_named(ibmtu, qib_ibmtu, uint, S_IRUGO);
+MODULE_PARM_DESC(ibmtu, "Set max IB MTU (0=2KB, 1=256, 2=512, ... 5=4096");
+
+unsigned qib_compat_ddr_negotiate = 1;
+module_param_named(compat_ddr_negotiate, qib_compat_ddr_negotiate, uint,
+		   S_IWUSR | S_IRUGO);
+MODULE_PARM_DESC(compat_ddr_negotiate,
+		 "Attempt pre-IBTA 1.2 DDR speed negotiation");
+
+MODULE_LICENSE("Dual BSD/GPL");
+MODULE_AUTHOR("Intel <ibsupport@intel.com>");
+MODULE_DESCRIPTION("Intel IB driver");
+MODULE_VERSION(QIB_DRIVER_VERSION);
+
+/*
+ * QIB_PIO_MAXIBHDR is the max IB header size allowed for in our
+ * PIO send buffers.  This is well beyond anything currently
+ * defined in the InfiniBand spec.
+ */
+#define QIB_PIO_MAXIBHDR 128
+
+/*
+ * QIB_MAX_PKT_RCV is the max # if packets processed per receive interrupt.
+ */
+#define QIB_MAX_PKT_RECV 64
+
+struct qlogic_ib_stats qib_stats;
+
+const char *qib_get_unit_name(int unit)
 {
-	struct i2c_mux_pinctrl *mux = data;
+	static char iname[16];
 
-	return pinctrl_select_state(mux->pinctrl, mux->states[chan]);
+	snprintf(iname, sizeof(iname), "infinipath%u", unit);
+	return iname;
 }
 
-static int i2c_mux_pinctrl_deselect(struct i2c_adapter *adap, void *data,
-				    u32 chan)
+/*
+ * Return count of units with at least one port ACTIVE.
+ */
+int qib_count_active_units(void)
 {
-	struct i2c_mux_pinctrl *mux = data;
+	struct qib_devdata *dd;
+	struct qib_pportdata *ppd;
+	unsigned long flags;
+	int pidx, nunits_active = 0;
 
-	return pinctrl_select_state(mux->pinctrl, mux->state_idle);
-}
-
-#ifdef CONFIG_OF
-static int i2c_mux_pinctrl_parse_dt(struct i2c_mux_pinctrl *mux,
-				struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	int num_names, i, ret;
-	struct device_node *adapter_np;
-	struct i2c_adapter *adapter;
-
-	if (!np)
-		return 0;
-
-	mux->pdata = devm_kzalloc(&pdev->dev, sizeof(*mux->pdata), GFP_KERNEL);
-	if (!mux->pdata) {
-		dev_err(mux->dev,
-			"Cannot allocate i2c_mux_pinctrl_platform_data\n");
-		return -ENOMEM;
-	}
-
-	num_names = of_property_count_strings(np, "pinctrl-names");
-	if (num_names < 0) {
-		dev_err(mux->dev, "Cannot parse pinctrl-names: %d\n",
-			num_names);
-		return num_names;
-	}
-
-	mux->pdata->pinctrl_states = devm_kzalloc(&pdev->dev,
-		sizeof(*mux->pdata->pinctrl_states) * num_names,
-		GFP_KERNEL);
-	if (!mux->pdata->pinctrl_states) {
-		dev_err(mux->dev, "Cannot allocate pinctrl_states\n");
-		return -ENOMEM;
-	}
-
-	for (i = 0; i < num_names; i++) {
-		ret = of_property_read_string_index(np, "pinctrl-names", i,
-			&mux->pdata->pinctrl_states[mux->pdata->bus_count]);
-		if (ret < 0) {
-			dev_err(mux->dev, "Cannot parse pinctrl-names: %d\n",
-				ret);
-			return ret;
-		}
-		if (!strcmp(mux->pdata->pinctrl_states[mux->pdata->bus_count],
-			    "idle")) {
-			if (i != num_names - 1) {
-				dev_err(mux->dev, "idle state must be last\n");
-				return -EINVAL;
+	spin_lock_irqsave(&qib_devs_lock, flags);
+	list_for_each_entry(dd, &qib_dev_list, list) {
+		if (!(dd->flags & QIB_PRESENT) || !dd->kregbase)
+			continue;
+		for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+			ppd = dd->pport + pidx;
+			if (ppd->lid && (ppd->lflags & (QIBL_LINKINIT |
+					 QIBL_LINKARMED | QIBL_LINKACTIVE))) {
+				nunits_active++;
+				break;
 			}
-			mux->pdata->pinctrl_state_idle = "idle";
-		} else {
-			mux->pdata->bus_count++;
 		}
 	}
-
-	adapter_np = of_parse_phandle(np, "i2c-parent", 0);
-	if (!adapter_np) {
-		dev_err(mux->dev, "Cannot parse i2c-parent\n");
-		return -ENODEV;
-	}
-	adapter = of_find_i2c_adapter_by_node(adapter_np);
-	of_node_put(adapter_np);
-	if (!adapter) {
-		dev_err(mux->dev, "Cannot find parent bus\n");
-		return -EPROBE_DEFER;
-	}
-	mux->pdata->parent_bus_num = i2c_adapter_id(adapter);
-	put_device(&adapter->dev);
-
-	return 0;
+	spin_unlock_irqrestore(&qib_devs_lock, flags);
+	return nunits_active;
 }
-#else
-static inline int i2c_mux_pinctrl_parse_dt(struct i2c_mux_pinctrl *mux,
-					   struct platform_device *pdev)
+
+/*
+ * Return count of all units, optionally return in arguments
+ * the number of usable (present) units, and the number of
+ * ports that are up.
+ */
+int qib_count_units(int *npresentp, int *nupp)
 {
-	return 0;
+	int nunits = 0, npresent = 0, nup = 0;
+	struct qib_devdata *dd;
+	unsigned long flags;
+	int pidx;
+	struct qib_pportdata *ppd;
+
+	spin_lock_irqsave(&qib_devs_lock, flags);
+
+	list_for_each_entry(dd, &qib_dev_list, list) {
+		nunits++;
+		if ((dd->flags & QIB_PRESENT) && dd->kregbase)
+			npresent++;
+		for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+			ppd = dd->pport + pidx;
+			if (ppd->lid && (ppd->lflags & (QIBL_LINKINIT |
+					 QIBL_LINKARMED | QIBL_LINKACTIVE)))
+				nup++;
+		}
+	}
+
+	spin_unlock_irqrestore(&qib_devs_lock, flags);
+
+	if (npresentp)
+		*npresentp = npresent;
+	if (nupp)
+		*nupp = nup;
+
+	return nunits;
 }
-#endif
 
-static int i2c_mux_pinctrl_probe(struct platform_device *pdev)
+/**
+ * qib_wait_linkstate - wait for an IB link state change to occur
+ * @dd: the qlogic_ib device
+ * @state: the state to wait for
+ * @msecs: the number of milliseconds to wait
+ *
+ * wait up to msecs milliseconds for IB link state change to occur for
+ * now, take the easy polling route.  Currently used only by
+ * qib_set_linkstate.  Returns 0 if state reached, otherwise
+ * -ETIMEDOUT state can have multiple states set, for any of several
+ * transitions.
+ */
+int qib_wait_linkstate(struct qib_pportdata *ppd, u32 state, int msecs)
 {
-	struct i2c_mux_pinctrl *mux;
-	int (*deselect)(struct i2c_adapter *, void *, u32);
-	int i, ret;
+	int ret;
+	unsigned long flags;
 
-	mux = devm_kzalloc(&pdev->dev, sizeof(*mux), GFP_KERNEL);
-	if (!mux) {
-		dev_err(&pdev->dev, "Cannot allocate i2c_mux_pinctrl\n");
-		ret = -ENOMEM;
-		goto err;
+	spin_lock_irqsave(&ppd->lflags_lock, flags);
+	if (ppd->state_wanted) {
+		spin_unlock_irqrestore(&ppd->lflags_lock, flags);
+		ret = -EBUSY;
+		goto bail;
 	}
-	platform_set_drvdata(pdev, mux);
+	ppd->state_wanted = state;
+	spin_unlock_irqrestore(&ppd->lflags_lock, flags);
+	wait_event_interruptible_timeout(ppd->state_wait,
+					 (ppd->lflags & state),
+					 msecs_to_jiffies(msecs));
+	spin_lock_irqsave(&ppd->lflags_lock, flags);
+	ppd->state_wanted = 0;
+	spin_unlock_irqrestore(&ppd->lflags_lock, flags);
 
-	mux->dev = &pdev->dev;
-
-	mux->pdata = dev_get_platdata(&pdev->dev);
-	if (!mux->pdata) {
-		ret = i2c_mux_pinctrl_parse_dt(mux, pdev);
-		if (ret < 0)
-			goto err;
-	}
-	if (!mux->pdata) {
-		dev_err(&pdev->dev, "Missing platform data\n");
-		ret = -ENODEV;
-		goto err;
-	}
-
-	mux->states = devm_kzalloc(&pdev->dev,
-				   sizeof(*mux->states) * mux->pdata->bus_count,
-				   GFP_KERNEL);
-	if (!mux->states) {
-		dev_err(&pdev->dev, "Cannot allocate states\n");
-		ret = -ENOMEM;
-		goto err;
-	}
-
-	mux->busses = devm_kzalloc(&pdev->dev,
-				   sizeof(*mux->busses) * mux->pdata->bus_count,
-				   GFP_KERNEL);
-	if (!mux->busses) {
-		dev_err(&pdev->dev, "Cannot allocate busses\n");
-		ret = -ENOMEM;
-		goto err;
-	}
-
-	mux->pinctrl = devm_pinctrl_get(&pdev->dev);
-	if (IS_ERR(mux->pinctrl)) {
-		ret = PTR_ERR(mux->pinctrl);
-		dev_err(&pdev->dev, "Cannot get pinctrl: %d\n", ret);
-		goto err;
-	}
-	for (i = 0; i < mux->pdata->bus_count; i++) {
-		mux->states[i] = pinctrl_lookup_state(mux->pinctrl,
-						mux->pdata->pinctrl_states[i]);
-			if (IS_ERR(mux->states[i])) {
-				ret = PTR_ERR(mux->states[i]);
-				dev_err(&pdev->dev,
-					"Cannot look up pinctrl state %s: %d\n",
-					mux->pdata->pinctrl_states[i], ret);
-				goto err;
-			}
-	}
-	if (mux->pdata->pinctrl_state_idle) {
-		mux->state_idle = pinctrl_lookup_state(mux->pinctrl,
-						mux->pdata->pinctrl_state_idle);
-		if (IS_ERR(mux->state_idle)) {
-			ret = PTR_ERR(mux->state_idle);
-			dev_err(&pdev->dev,
-				"Cannot look up pinctrl state %s: %d\n",
-				mux->pdata->pinctrl_state_idle, ret);
-			goto err;
-		}
-
-		deselect = i2c_mux_pinctrl_deselect;
-	} else {
-		deselect = NULL;
-	}
-
-	mux->parent = i2c_get_adapter(mux->pdata->parent_bus_num);
-	if (!mux->parent) {
-		dev_err(&pdev->dev, "Parent adapter (%d) not found\n",
-			mux->pdata->parent_bus_num);
-		ret = -EPROBE_DEFER;
-		goto err;
-	}
-
-	for (i = 0; i < mux->pdata->bus_count; i++) {
-		u32 bus = mux->pdata->base_bus_num ?
-				(mux->pdata->base_bus_num + i) : 0;
-
-		mux->busses[i] = i2c_add_mux_adapter(mux->parent, &pdev->dev,
-						     mux, bus, i, 0,
-						     i2c_mux_pinctrl_select,
-						     deselect);
-		if (!mux->busses[i]) {
-			ret = -ENODEV;
-			dev_err(&pdev->dev, "Failed to add adapter %d\n", i);
-			goto err_del_adapter;
-		}
-	}
-
-	return 0;
-
-err_del_adapter:
-	for (; i > 0; i--)
-		i2c_del_mux_adapter(mux->busses[i - 1]);
-	i2c_put_adapter(mux->parent);
-err:
+	if (!(ppd->lflags & state))
+		ret = -ETIMEDOUT;
+	else
+		ret = 0;
+bail:
 	return ret;
 }
 
-static int i2c_mux_pinctrl_remove(struct platform_device *pdev)
+int qib_set_linkstate(struct qib_pportdata *ppd, u8 newstate)
 {
-	struct i2c_mux_pinctrl *mux = platform_get_drvdata(pdev);
-	int i;
+	u32 lstate;
+	int ret;
+	struct qib_devdata *dd = ppd->dd;
+	unsigned long flags;
 
-	for (i = 0; i < mux->pdata->bus_count; i++)
-		i2c_del_mux_adapter(mux->busses[i]);
+	switch (newstate) {
+	case QIB_IB_LINKDOWN_ONLY:
+		dd->f_set_ib_cfg(ppd, QIB_IB_CFG_LSTATE,
+				 IB_LINKCMD_DOWN | IB_LINKINITCMD_NOP);
+		/* don't wait */
+		ret = 0;
+		goto bail;
 
-	i2c_put_adapter(mux->parent);
+	case QIB_IB_LINKDOWN:
+		dd->f_set_ib_cfg(ppd, QIB_IB_CFG_LSTATE,
+				 IB_LINKCMD_DOWN | IB_LINKINITCMD_POLL);
+		/* don't wait */
+		ret = 0;
+		goto bail;
 
-	return 0;
-}
+	case QIB_IB_LINKDOWN_SLEEP:
+		dd->f_set_ib_cfg(ppd, QIB_IB_CFG_LSTATE,
+				 IB_LINKCMD_DOWN | IB_LINKINITCMD_SLEEP);
+		/* don't wait */
+		ret = 0;
+		goto bail;
 
-#ifdef CONFIG_OF
-static const struct of_device_id i2c_mux_pinctrl_of_match[] = {
-	{ .compatible = "i2c-mux-pinctrl", },
-	{},
-};
-MODULE_DEVICE_TABLE(of, i2c_mux_pinctrl_of_match);
-#endif
+	case QIB_IB_LINKDOWN_DISABLE:
+		dd->f_set_ib_cfg(ppd, QIB_IB_CFG_LSTATE,
+				 IB_LINKCMD_DOWN | IB_LINKINITCMD_DISABLE);
+		/* don't wait */
+		ret = 0;
+		goto bail;
 
-static struct platform_driver i2c_mux_pinctrl_driver = {
-	.driver	= {
-		.name	= "i2c-mux-pinctrl",
-		.of_match_table = of_match_ptr(i2c_mux_pinctrl_of_match),
-	},
-	.probe	= i2c_mux_pinctrl_probe,
-	.remove	= i2c_mux_pinctrl_remove,
-};
-module_platform_driver(i2c_mux_pinctrl_driver);
+	case QIB_IB_LINKARM:
+		if (ppd->lflags & QIBL_LINKARMED) {
+			ret = 0;
+			goto bail;
+		}
+		if (!(ppd->lflags & (QIBL_LINKINIT | QIBL_LINKACTIVE))) {
+			ret = -EINVAL;
+			goto bail;
+		}
+		/*
+		 * Since the port can be ACTIVE when we ask for ARMED,
+		 * clear QIBL_LINKV so we can wait for a transition.
+		 * If the link isn't ARMED, then something else happened
+		 * and there is no point waiting for ARMED.
+		 */
+		spin_lock_irqsave(&ppd->lflags_lock, flags);
+		ppd->lflags &= ~QIBL_LINKV;
+		spin_unlock_irqrestore(&ppd->lflags_lock, flags);
+		dd->f_set_ib_cfg(ppd, QIB_IB_CFG_LSTATE,
+				 IB_LINKCMD_ARMED | IB_LINKINITCMD_NOP);
+		lstate = QIBL_LINKV;
+		break;
 
-MODULE_DESCRIPTION("pinctrl-based I2C multiplexer driver");
-MODULE_AUTHOR("Stephen Warren <swarren@nvidia.com>");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:i2c-mux-pinctrl");
+	case QIB_IB_LINKACTI

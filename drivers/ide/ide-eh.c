@@ -1,442 +1,406 @@
+ to_idmac_chan(chan);
+	struct idmac *idmac = to_idmac(chan->device);
+	struct ipu *ipu = to_ipu(idmac);
+	struct list_head *list, *tmp;
+	unsigned long flags;
 
-#include <linux/kernel.h>
-#include <linux/export.h>
-#include <linux/ide.h>
-#include <linux/delay.h>
+	mutex_lock(&ichan->chan_mutex);
 
-static ide_startstop_t ide_ata_error(ide_drive_t *drive, struct request *rq,
-				     u8 stat, u8 err)
-{
-	ide_hwif_t *hwif = drive->hwif;
+	spin_lock_irqsave(&ipu->lock, flags);
+	ipu_ic_disable_task(ipu, chan->chan_id);
 
-	if ((stat & ATA_BUSY) ||
-	    ((stat & ATA_DF) && (drive->dev_flags & IDE_DFLAG_NOWERR) == 0)) {
-		/* other bits are useless when BUSY */
-		rq->errors |= ERROR_RESET;
-	} else if (stat & ATA_ERR) {
-		/* err has different meaning on cdrom and tape */
-		if (err == ATA_ABORTED) {
-			if ((drive->dev_flags & IDE_DFLAG_LBA) &&
-			    /* some newer drives don't support ATA_CMD_INIT_DEV_PARAMS */
-			    hwif->tp_ops->read_status(hwif) == ATA_CMD_INIT_DEV_PARAMS)
-				return ide_stopped;
-		} else if ((err & BAD_CRC) == BAD_CRC) {
-			/* UDMA crc error, just retry the operation */
-			drive->crc_count++;
-		} else if (err & (ATA_BBK | ATA_UNC)) {
-			/* retries won't help these */
-			rq->errors = ERROR_MAX;
-		} else if (err & ATA_TRK0NF) {
-			/* help it find track zero */
-			rq->errors |= ERROR_RECAL;
-		}
-	}
+	/* Return all descriptors into "prepared" state */
+	list_for_each_safe(list, tmp, &ichan->queue)
+		list_del_init(list);
 
-	if ((stat & ATA_DRQ) && rq_data_dir(rq) == READ &&
-	    (hwif->host_flags & IDE_HFLAG_ERROR_STOPS_FIFO) == 0) {
-		int nsect = drive->mult_count ? drive->mult_count : 1;
+	ichan->sg[0] = NULL;
+	ichan->sg[1] = NULL;
 
-		ide_pad_transfer(drive, READ, nsect * SECTOR_SIZE);
-	}
+	spin_unlock_irqrestore(&ipu->lock, flags);
 
-	if (rq->errors >= ERROR_MAX || blk_noretry_request(rq)) {
-		ide_kill_rq(drive, rq);
-		return ide_stopped;
-	}
+	ichan->status = IPU_CHANNEL_INITIALIZED;
 
-	if (hwif->tp_ops->read_status(hwif) & (ATA_BUSY | ATA_DRQ))
-		rq->errors |= ERROR_RESET;
+	mutex_unlock(&ichan->chan_mutex);
 
-	if ((rq->errors & ERROR_RESET) == ERROR_RESET) {
-		++rq->errors;
-		return ide_do_reset(drive);
-	}
-
-	if ((rq->errors & ERROR_RECAL) == ERROR_RECAL)
-		drive->special_flags |= IDE_SFLAG_RECALIBRATE;
-
-	++rq->errors;
-
-	return ide_stopped;
+	return 0;
 }
 
-static ide_startstop_t ide_atapi_error(ide_drive_t *drive, struct request *rq,
-				       u8 stat, u8 err)
+static int __idmac_terminate_all(struct dma_chan *chan)
 {
-	ide_hwif_t *hwif = drive->hwif;
-
-	if ((stat & ATA_BUSY) ||
-	    ((stat & ATA_DF) && (drive->dev_flags & IDE_DFLAG_NOWERR) == 0)) {
-		/* other bits are useless when BUSY */
-		rq->errors |= ERROR_RESET;
-	} else {
-		/* add decoding error stuff */
-	}
-
-	if (hwif->tp_ops->read_status(hwif) & (ATA_BUSY | ATA_DRQ))
-		/* force an abort */
-		hwif->tp_ops->exec_command(hwif, ATA_CMD_IDLEIMMEDIATE);
-
-	if (rq->errors >= ERROR_MAX) {
-		ide_kill_rq(drive, rq);
-	} else {
-		if ((rq->errors & ERROR_RESET) == ERROR_RESET) {
-			++rq->errors;
-			return ide_do_reset(drive);
-		}
-		++rq->errors;
-	}
-
-	return ide_stopped;
-}
-
-static ide_startstop_t __ide_error(ide_drive_t *drive, struct request *rq,
-				   u8 stat, u8 err)
-{
-	if (drive->media == ide_disk)
-		return ide_ata_error(drive, rq, stat, err);
-	return ide_atapi_error(drive, rq, stat, err);
-}
-
-/**
- *	ide_error	-	handle an error on the IDE
- *	@drive: drive the error occurred on
- *	@msg: message to report
- *	@stat: status bits
- *
- *	ide_error() takes action based on the error returned by the drive.
- *	For normal I/O that may well include retries. We deal with
- *	both new-style (taskfile) and old style command handling here.
- *	In the case of taskfile command handling there is work left to
- *	do
- */
-
-ide_startstop_t ide_error(ide_drive_t *drive, const char *msg, u8 stat)
-{
-	struct request *rq;
-	u8 err;
-
-	err = ide_dump_status(drive, msg, stat);
-
-	rq = drive->hwif->rq;
-	if (rq == NULL)
-		return ide_stopped;
-
-	/* retry only "normal" I/O: */
-	if (rq->cmd_type != REQ_TYPE_FS) {
-		if (rq->cmd_type == REQ_TYPE_ATA_TASKFILE) {
-			struct ide_cmd *cmd = rq->special;
-
-			if (cmd)
-				ide_complete_cmd(drive, cmd, stat, err);
-		} else if (ata_pm_request(rq)) {
-			rq->errors = 1;
-			ide_complete_pm_rq(drive, rq);
-			return ide_stopped;
-		}
-		rq->errors = err;
-		ide_complete_rq(drive, err ? -EIO : 0, blk_rq_bytes(rq));
-		return ide_stopped;
-	}
-
-	return __ide_error(drive, rq, stat, err);
-}
-EXPORT_SYMBOL_GPL(ide_error);
-
-static inline void ide_complete_drive_reset(ide_drive_t *drive, int err)
-{
-	struct request *rq = drive->hwif->rq;
-
-	if (rq && rq->cmd_type == REQ_TYPE_DRV_PRIV &&
-	    rq->cmd[0] == REQ_DRIVE_RESET) {
-		if (err <= 0 && rq->errors == 0)
-			rq->errors = -EIO;
-		ide_complete_rq(drive, err ? err : 0, blk_rq_bytes(rq));
-	}
-}
-
-/* needed below */
-static ide_startstop_t do_reset1(ide_drive_t *, int);
-
-/*
- * atapi_reset_pollfunc() gets invoked to poll the interface for completion
- * every 50ms during an atapi drive reset operation.  If the drive has not yet
- * responded, and we have not yet hit our maximum waiting time, then the timer
- * is restarted for another 50ms.
- */
-static ide_startstop_t atapi_reset_pollfunc(ide_drive_t *drive)
-{
-	ide_hwif_t *hwif = drive->hwif;
-	const struct ide_tp_ops *tp_ops = hwif->tp_ops;
-	u8 stat;
-
-	tp_ops->dev_select(drive);
-	udelay(10);
-	stat = tp_ops->read_status(hwif);
-
-	if (OK_STAT(stat, 0, ATA_BUSY))
-		printk(KERN_INFO "%s: ATAPI reset complete\n", drive->name);
-	else {
-		if (time_before(jiffies, hwif->poll_timeout)) {
-			ide_set_handler(drive, &atapi_reset_pollfunc, HZ/20);
-			/* continue polling */
-			return ide_started;
-		}
-		/* end of polling */
-		hwif->polling = 0;
-		printk(KERN_ERR "%s: ATAPI reset timed-out, status=0x%02x\n",
-			drive->name, stat);
-		/* do it the old fashioned way */
-		return do_reset1(drive, 1);
-	}
-	/* done polling */
-	hwif->polling = 0;
-	ide_complete_drive_reset(drive, 0);
-	return ide_stopped;
-}
-
-static void ide_reset_report_error(ide_hwif_t *hwif, u8 err)
-{
-	static const char *err_master_vals[] =
-		{ NULL, "passed", "formatter device error",
-		  "sector buffer error", "ECC circuitry error",
-		  "controlling MPU error" };
-
-	u8 err_master = err & 0x7f;
-
-	printk(KERN_ERR "%s: reset: master: ", hwif->name);
-	if (err_master && err_master < 6)
-		printk(KERN_CONT "%s", err_master_vals[err_master]);
-	else
-		printk(KERN_CONT "error (0x%02x?)", err);
-	if (err & 0x80)
-		printk(KERN_CONT "; slave: failed");
-	printk(KERN_CONT "\n");
-}
-
-/*
- * reset_pollfunc() gets invoked to poll the interface for completion every 50ms
- * during an ide reset operation. If the drives have not yet responded,
- * and we have not yet hit our maximum waiting time, then the timer is restarted
- * for another 50ms.
- */
-static ide_startstop_t reset_pollfunc(ide_drive_t *drive)
-{
-	ide_hwif_t *hwif = drive->hwif;
-	const struct ide_port_ops *port_ops = hwif->port_ops;
-	u8 tmp;
-	int err = 0;
-
-	if (port_ops && port_ops->reset_poll) {
-		err = port_ops->reset_poll(drive);
-		if (err) {
-			printk(KERN_ERR "%s: host reset_poll failure for %s.\n",
-				hwif->name, drive->name);
-			goto out;
-		}
-	}
-
-	tmp = hwif->tp_ops->read_status(hwif);
-
-	if (!OK_STAT(tmp, 0, ATA_BUSY)) {
-		if (time_before(jiffies, hwif->poll_timeout)) {
-			ide_set_handler(drive, &reset_pollfunc, HZ/20);
-			/* continue polling */
-			return ide_started;
-		}
-		printk(KERN_ERR "%s: reset timed-out, status=0x%02x\n",
-			hwif->name, tmp);
-		drive->failures++;
-		err = -EIO;
-	} else  {
-		tmp = ide_read_error(drive);
-
-		if (tmp == 1) {
-			printk(KERN_INFO "%s: reset: success\n", hwif->name);
-			drive->failures = 0;
-		} else {
-			ide_reset_report_error(hwif, tmp);
-			drive->failures++;
-			err = -EIO;
-		}
-	}
-out:
-	hwif->polling = 0;	/* done polling */
-	ide_complete_drive_reset(drive, err);
-	return ide_stopped;
-}
-
-static void ide_disk_pre_reset(ide_drive_t *drive)
-{
-	int legacy = (drive->id[ATA_ID_CFS_ENABLE_2] & 0x0400) ? 0 : 1;
-
-	drive->special_flags =
-		legacy ? (IDE_SFLAG_SET_GEOMETRY | IDE_SFLAG_RECALIBRATE) : 0;
-
-	drive->mult_count = 0;
-	drive->dev_flags &= ~IDE_DFLAG_PARKED;
-
-	if ((drive->dev_flags & IDE_DFLAG_KEEP_SETTINGS) == 0 &&
-	    (drive->dev_flags & IDE_DFLAG_USING_DMA) == 0)
-		drive->mult_req = 0;
-
-	if (drive->mult_req != drive->mult_count)
-		drive->special_flags |= IDE_SFLAG_SET_MULTMODE;
-}
-
-static void pre_reset(ide_drive_t *drive)
-{
-	const struct ide_port_ops *port_ops = drive->hwif->port_ops;
-
-	if (drive->media == ide_disk)
-		ide_disk_pre_reset(drive);
-	else
-		drive->dev_flags |= IDE_DFLAG_POST_RESET;
-
-	if (drive->dev_flags & IDE_DFLAG_USING_DMA) {
-		if (drive->crc_count)
-			ide_check_dma_crc(drive);
-		else
-			ide_dma_off(drive);
-	}
-
-	if ((drive->dev_flags & IDE_DFLAG_KEEP_SETTINGS) == 0) {
-		if ((drive->dev_flags & IDE_DFLAG_USING_DMA) == 0) {
-			drive->dev_flags &= ~IDE_DFLAG_UNMASK;
-			drive->io_32bit = 0;
-		}
-		return;
-	}
-
-	if (port_ops && port_ops->pre_reset)
-		port_ops->pre_reset(drive);
-
-	if (drive->current_speed != 0xff)
-		drive->desired_speed = drive->current_speed;
-	drive->current_speed = 0xff;
-}
-
-/*
- * do_reset1() attempts to recover a confused drive by resetting it.
- * Unfortunately, resetting a disk drive actually resets all devices on
- * the same interface, so it can really be thought of as resetting the
- * interface rather than resetting the drive.
- *
- * ATAPI devices have their own reset mechanism which allows them to be
- * individually reset without clobbering other devices on the same interface.
- *
- * Unfortunately, the IDE interface does not generate an interrupt to let
- * us know when the reset operation has finished, so we must poll for this.
- * Equally poor, though, is the fact that this may a very long time to complete,
- * (up to 30 seconds worstcase).  So, instead of busy-waiting here for it,
- * we set a timer to poll at 50ms intervals.
- */
-static ide_startstop_t do_reset1(ide_drive_t *drive, int do_not_try_atapi)
-{
-	ide_hwif_t *hwif = drive->hwif;
-	struct ide_io_ports *io_ports = &hwif->io_ports;
-	const struct ide_tp_ops *tp_ops = hwif->tp_ops;
-	const struct ide_port_ops *port_ops;
-	ide_drive_t *tdrive;
-	unsigned long flags, timeout;
+	struct idmac_channel *ichan = to_idmac_chan(chan);
+	struct idmac *idmac = to_idmac(chan->device);
+	struct ipu *ipu = to_ipu(idmac);
+	unsigned long flags;
 	int i;
-	DEFINE_WAIT(wait);
 
-	spin_lock_irqsave(&hwif->lock, flags);
+	ipu_disable_channel(idmac, ichan,
+			    ichan->status >= IPU_CHANNEL_ENABLED);
 
-	/* We must not reset with running handlers */
-	BUG_ON(hwif->handler != NULL);
+	tasklet_disable(&ipu->tasklet);
 
-	/* For an ATAPI device, first try an ATAPI SRST. */
-	if (drive->media != ide_disk && !do_not_try_atapi) {
-		pre_reset(drive);
-		tp_ops->dev_select(drive);
-		udelay(20);
-		tp_ops->exec_command(hwif, ATA_CMD_DEV_RESET);
-		ndelay(400);
-		hwif->poll_timeout = jiffies + WAIT_WORSTCASE;
-		hwif->polling = 1;
-		__ide_set_handler(drive, &atapi_reset_pollfunc, HZ/20);
-		spin_unlock_irqrestore(&hwif->lock, flags);
-		return ide_started;
-	}
+	/* ichan->queue is modified in ISR, have to spinlock */
+	spin_lock_irqsave(&ichan->lock, flags);
+	list_splice_init(&ichan->queue, &ichan->free_list);
 
-	/* We must not disturb devices in the IDE_DFLAG_PARKED state. */
-	do {
-		unsigned long now;
+	if (ichan->desc)
+		for (i = 0; i < ichan->n_tx_desc; i++) {
+			struct idmac_tx_desc *desc = ichan->desc + i;
+			if (list_empty(&desc->list))
+				/* Descriptor was prepared, but not submitted */
+				list_add(&desc->list, &ichan->free_list);
 
-		prepare_to_wait(&ide_park_wq, &wait, TASK_UNINTERRUPTIBLE);
-		timeout = jiffies;
-		ide_port_for_each_present_dev(i, tdrive, hwif) {
-			if ((tdrive->dev_flags & IDE_DFLAG_PARKED) &&
-			    time_after(tdrive->sleep, timeout))
-				timeout = tdrive->sleep;
+			async_tx_clear_ack(&desc->txd);
 		}
 
-		now = jiffies;
-		if (time_before_eq(timeout, now))
-			break;
+	ichan->sg[0] = NULL;
+	ichan->sg[1] = NULL;
+	spin_unlock_irqrestore(&ichan->lock, flags);
 
-		spin_unlock_irqrestore(&hwif->lock, flags);
-		timeout = schedule_timeout_uninterruptible(timeout - now);
-		spin_lock_irqsave(&hwif->lock, flags);
-	} while (timeout);
-	finish_wait(&ide_park_wq, &wait);
+	tasklet_enable(&ipu->tasklet);
+
+	ichan->status = IPU_CHANNEL_INITIALIZED;
+
+	return 0;
+}
+
+static int idmac_terminate_all(struct dma_chan *chan)
+{
+	struct idmac_channel *ichan = to_idmac_chan(chan);
+	int ret;
+
+	mutex_lock(&ichan->chan_mutex);
+
+	ret = __idmac_terminate_all(chan);
+
+	mutex_unlock(&ichan->chan_mutex);
+
+	return ret;
+}
+
+#ifdef DEBUG
+static irqreturn_t ic_sof_irq(int irq, void *dev_id)
+{
+	struct idmac_channel *ichan = dev_id;
+	printk(KERN_DEBUG "Got SOF IRQ %d on Channel %d\n",
+	       irq, ichan->dma_chan.chan_id);
+	disable_irq_nosync(irq);
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t ic_eof_irq(int irq, void *dev_id)
+{
+	struct idmac_channel *ichan = dev_id;
+	printk(KERN_DEBUG "Got EOF IRQ %d on Channel %d\n",
+	       irq, ichan->dma_chan.chan_id);
+	disable_irq_nosync(irq);
+	return IRQ_HANDLED;
+}
+
+static int ic_sof = -EINVAL, ic_eof = -EINVAL;
+#endif
+
+static int idmac_alloc_chan_resources(struct dma_chan *chan)
+{
+	struct idmac_channel *ichan = to_idmac_chan(chan);
+	struct idmac *idmac = to_idmac(chan->device);
+	int ret;
+
+	/* dmaengine.c now guarantees to only offer free channels */
+	BUG_ON(chan->client_count > 1);
+	WARN_ON(ichan->status != IPU_CHANNEL_FREE);
+
+	dma_cookie_init(chan);
+
+	ret = ipu_irq_map(chan->chan_id);
+	if (ret < 0)
+		goto eimap;
+
+	ichan->eof_irq = ret;
 
 	/*
-	 * First, reset any device state data we were maintaining
-	 * for any of the drives on this interface.
+	 * Important to first disable the channel, because maybe someone
+	 * used it before us, e.g., the bootloader
 	 */
-	ide_port_for_each_dev(i, tdrive, hwif)
-		pre_reset(tdrive);
+	ipu_disable_channel(idmac, ichan, true);
 
-	if (io_ports->ctl_addr == 0) {
-		spin_unlock_irqrestore(&hwif->lock, flags);
-		ide_complete_drive_reset(drive, -ENXIO);
-		return ide_stopped;
+	ret = ipu_init_channel(idmac, ichan);
+	if (ret < 0)
+		goto eichan;
+
+	ret = request_irq(ichan->eof_irq, idmac_interrupt, 0,
+			  ichan->eof_name, ichan);
+	if (ret < 0)
+		goto erirq;
+
+#ifdef DEBUG
+	if (chan->chan_id == IDMAC_IC_7) {
+		ic_sof = ipu_irq_map(69);
+		if (ic_sof > 0) {
+			ret = request_irq(ic_sof, ic_sof_irq, 0, "IC SOF", ichan);
+			if (ret)
+				dev_err(&chan->dev->device, "request irq failed for IC SOF");
+		}
+		ic_eof = ipu_irq_map(70);
+		if (ic_eof > 0) {
+			ret = request_irq(ic_eof, ic_eof_irq, 0, "IC EOF", ichan);
+			if (ret)
+				dev_err(&chan->dev->device, "request irq failed for IC EOF");
+		}
+	}
+#endif
+
+	ichan->status = IPU_CHANNEL_INITIALIZED;
+
+	dev_dbg(&chan->dev->device, "Found channel 0x%x, irq %d\n",
+		chan->chan_id, ichan->eof_irq);
+
+	return ret;
+
+erirq:
+	ipu_uninit_channel(idmac, ichan);
+eichan:
+	ipu_irq_unmap(chan->chan_id);
+eimap:
+	return ret;
+}
+
+static void idmac_free_chan_resources(struct dma_chan *chan)
+{
+	struct idmac_channel *ichan = to_idmac_chan(chan);
+	struct idmac *idmac = to_idmac(chan->device);
+
+	mutex_lock(&ichan->chan_mutex);
+
+	__idmac_terminate_all(chan);
+
+	if (ichan->status > IPU_CHANNEL_FREE) {
+#ifdef DEBUG
+		if (chan->chan_id == IDMAC_IC_7) {
+			if (ic_sof > 0) {
+				free_irq(ic_sof, ichan);
+				ipu_irq_unmap(69);
+				ic_sof = -EINVAL;
+			}
+			if (ic_eof > 0) {
+				free_irq(ic_eof, ichan);
+				ipu_irq_unmap(70);
+				ic_eof = -EINVAL;
+			}
+		}
+#endif
+		free_irq(ichan->eof_irq, ichan);
+		ipu_irq_unmap(chan->chan_id);
 	}
 
-	/*
-	 * Note that we also set nIEN while resetting the device,
-	 * to mask unwanted interrupts from the interface during the reset.
-	 * However, due to the design of PC hardware, this will cause an
-	 * immediate interrupt due to the edge transition it produces.
-	 * This single interrupt gives us a "fast poll" for drives that
-	 * recover from reset very quickly, saving us the first 50ms wait time.
-	 */
-	/* set SRST and nIEN */
-	tp_ops->write_devctl(hwif, ATA_SRST | ATA_NIEN | ATA_DEVCTL_OBS);
-	/* more than enough time */
-	udelay(10);
-	/* clear SRST, leave nIEN (unless device is on the quirk list) */
-	tp_ops->write_devctl(hwif,
-		((drive->dev_flags & IDE_DFLAG_NIEN_QUIRK) ? 0 : ATA_NIEN) |
-		 ATA_DEVCTL_OBS);
-	/* more than enough time */
-	udelay(10);
-	hwif->poll_timeout = jiffies + WAIT_WORSTCASE;
-	hwif->polling = 1;
-	__ide_set_handler(drive, &reset_pollfunc, HZ/20);
+	ichan->status = IPU_CHANNEL_FREE;
 
-	/*
-	 * Some weird controller like resetting themselves to a strange
-	 * state when the disks are reset this way. At least, the Winbond
-	 * 553 documentation says that
-	 */
-	port_ops = hwif->port_ops;
-	if (port_ops && port_ops->resetproc)
-		port_ops->resetproc(drive);
+	ipu_uninit_channel(idmac, ichan);
 
-	spin_unlock_irqrestore(&hwif->lock, flags);
-	return ide_started;
+	mutex_unlock(&ichan->chan_mutex);
+
+	tasklet_schedule(&to_ipu(idmac)->tasklet);
+}
+
+static enum dma_status idmac_tx_status(struct dma_chan *chan,
+		       dma_cookie_t cookie, struct dma_tx_state *txstate)
+{
+	return dma_cookie_status(chan, cookie, txstate);
+}
+
+static int __init ipu_idmac_init(struct ipu *ipu)
+{
+	struct idmac *idmac = &ipu->idmac;
+	struct dma_device *dma = &idmac->dma;
+	int i;
+
+	dma_cap_set(DMA_SLAVE, dma->cap_mask);
+	dma_cap_set(DMA_PRIVATE, dma->cap_mask);
+
+	/* Compulsory common fields */
+	dma->dev				= ipu->dev;
+	dma->device_alloc_chan_resources	= idmac_alloc_chan_resources;
+	dma->device_free_chan_resources		= idmac_free_chan_resources;
+	dma->device_tx_status			= idmac_tx_status;
+	dma->device_issue_pending		= idmac_issue_pending;
+
+	/* Compulsory for DMA_SLAVE fields */
+	dma->device_prep_slave_sg		= idmac_prep_slave_sg;
+	dma->device_pause			= idmac_pause;
+	dma->device_terminate_all		= idmac_terminate_all;
+
+	INIT_LIST_HEAD(&dma->channels);
+	for (i = 0; i < IPU_CHANNELS_NUM; i++) {
+		struct idmac_channel *ichan = ipu->channel + i;
+		struct dma_chan *dma_chan = &ichan->dma_chan;
+
+		spin_lock_init(&ichan->lock);
+		mutex_init(&ichan->chan_mutex);
+
+		ichan->status		= IPU_CHANNEL_FREE;
+		ichan->sec_chan_en	= false;
+		snprintf(ichan->eof_name, sizeof(ichan->eof_name), "IDMAC EOF %d", i);
+
+		dma_chan->device	= &idmac->dma;
+		dma_cookie_init(dma_chan);
+		dma_chan->chan_id	= i;
+		list_add_tail(&dma_chan->device_node, &dma->channels);
+	}
+
+	idmac_write_icreg(ipu, 0x00000070, IDMAC_CONF);
+
+	return dma_async_device_register(&idmac->dma);
+}
+
+static void ipu_idmac_exit(struct ipu *ipu)
+{
+	int i;
+	struct idmac *idmac = &ipu->idmac;
+
+	for (i = 0; i < IPU_CHANNELS_NUM; i++) {
+		struct idmac_channel *ichan = ipu->channel + i;
+
+		idmac_terminate_all(&ichan->dma_chan);
+	}
+
+	dma_async_device_unregister(&idmac->dma);
+}
+
+/*****************************************************************************
+ * IPU common probe / remove
+ */
+
+static int __init ipu_probe(struct platform_device *pdev)
+{
+	struct resource *mem_ipu, *mem_ic;
+	int ret;
+
+	spin_lock_init(&ipu_data.lock);
+
+	mem_ipu	= platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	mem_ic	= platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!mem_ipu || !mem_ic)
+		return -EINVAL;
+
+	ipu_data.dev = &pdev->dev;
+
+	platform_set_drvdata(pdev, &ipu_data);
+
+	ret = platform_get_irq(pdev, 0);
+	if (ret < 0)
+		goto err_noirq;
+
+	ipu_data.irq_fn = ret;
+	ret = platform_get_irq(pdev, 1);
+	if (ret < 0)
+		goto err_noirq;
+
+	ipu_data.irq_err = ret;
+
+	dev_dbg(&pdev->dev, "fn irq %u, err irq %u\n",
+		ipu_data.irq_fn, ipu_data.irq_err);
+
+	/* Remap IPU common registers */
+	ipu_data.reg_ipu = ioremap(mem_ipu->start, resource_size(mem_ipu));
+	if (!ipu_data.reg_ipu) {
+		ret = -ENOMEM;
+		goto err_ioremap_ipu;
+	}
+
+	/* Remap Image Converter and Image DMA Controller registers */
+	ipu_data.reg_ic = ioremap(mem_ic->start, resource_size(mem_ic));
+	if (!ipu_data.reg_ic) {
+		ret = -ENOMEM;
+		goto err_ioremap_ic;
+	}
+
+	/* Get IPU clock */
+	ipu_data.ipu_clk = clk_get(&pdev->dev, NULL);
+	if (IS_ERR(ipu_data.ipu_clk)) {
+		ret = PTR_ERR(ipu_data.ipu_clk);
+		goto err_clk_get;
+	}
+
+	/* Make sure IPU HSP clock is running */
+	clk_prepare_enable(ipu_data.ipu_clk);
+
+	/* Disable all interrupts */
+	idmac_write_ipureg(&ipu_data, 0, IPU_INT_CTRL_1);
+	idmac_write_ipureg(&ipu_data, 0, IPU_INT_CTRL_2);
+	idmac_write_ipureg(&ipu_data, 0, IPU_INT_CTRL_3);
+	idmac_write_ipureg(&ipu_data, 0, IPU_INT_CTRL_4);
+	idmac_write_ipureg(&ipu_data, 0, IPU_INT_CTRL_5);
+
+	dev_dbg(&pdev->dev, "%s @ 0x%08lx, fn irq %u, err irq %u\n", pdev->name,
+		(unsigned long)mem_ipu->start, ipu_data.irq_fn, ipu_data.irq_err);
+
+	ret = ipu_irq_attach_irq(&ipu_data, pdev);
+	if (ret < 0)
+		goto err_attach_irq;
+
+	/* Initialize DMA engine */
+	ret = ipu_idmac_init(&ipu_data);
+	if (ret < 0)
+		goto err_idmac_init;
+
+	tasklet_init(&ipu_data.tasklet, ipu_gc_tasklet, (unsigned long)&ipu_data);
+
+	ipu_data.dev = &pdev->dev;
+
+	dev_dbg(ipu_data.dev, "IPU initialized\n");
+
+	return 0;
+
+err_idmac_init:
+err_attach_irq:
+	ipu_irq_detach_irq(&ipu_data, pdev);
+	clk_disable_unprepare(ipu_data.ipu_clk);
+	clk_put(ipu_data.ipu_clk);
+err_clk_get:
+	iounmap(ipu_data.reg_ic);
+err_ioremap_ic:
+	iounmap(ipu_data.reg_ipu);
+err_ioremap_ipu:
+err_noirq:
+	dev_err(&pdev->dev, "Failed to probe IPU: %d\n", ret);
+	return ret;
+}
+
+static int ipu_remove(struct platform_device *pdev)
+{
+	struct ipu *ipu = platform_get_drvdata(pdev);
+
+	ipu_idmac_exit(ipu);
+	ipu_irq_detach_irq(ipu, pdev);
+	clk_disable_unprepare(ipu->ipu_clk);
+	clk_put(ipu->ipu_clk);
+	iounmap(ipu->reg_ic);
+	iounmap(ipu->reg_ipu);
+	tasklet_kill(&ipu->tasklet);
+
+	return 0;
 }
 
 /*
- * ide_do_reset() is the entry point to the drive/interface reset code.
+ * We need two MEM resources - with IPU-common and Image Converter registers,
+ * including PF_CONF and IDMAC_* registers, and two IRQs - function and error
  */
+static struct platform_driver ipu_platform_driver = {
+	.driver = {
+		.name	= "ipu-core",
+	},
+	.remove		= ipu_remove,
+};
 
-ide_startstop_t ide_do_reset(ide_drive_t *drive)
+static int __init ipu_init(void)
 {
-	return do_reset1(drive, 0);
+	return platform_driver_probe(&ipu_platform_driver, ipu_probe);
 }
-EXPORT_SYMBOL(ide_do_reset);
+subsys_initcall(ipu_init);
+
+MODULE_DESCRIPTION("IPU core driver");
+MODULE_LICENSE("GPL v2");
+MODULE_AUTHOR("Guennadi Liakhovetski <lg@denx.de>");
+MODULE_ALIAS("platform:ipu-core");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Copyright (C) 2008
+ * Guennadi Liakhovetski, DENX Software Engineering, <lg@d

@@ -1,72 +1,29 @@
-/*
- * Copyright (C) 2014 Marvell
- * Author: Gregory CLEMENT <gregory.clement@free-electrons.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- */
-
-#include <linux/io.h>
-#include <linux/mbus.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-
-#include "xhci-mvebu.h"
-
-#define USB3_MAX_WINDOWS	4
-#define USB3_WIN_CTRL(w)	(0x0 + ((w) * 8))
-#define USB3_WIN_BASE(w)	(0x4 + ((w) * 8))
-
-static void xhci_mvebu_mbus_config(void __iomem *base,
-			const struct mbus_dram_target_info *dram)
-{
-	int win;
-
-	/* Clear all existing windows */
-	for (win = 0; win < USB3_MAX_WINDOWS; win++) {
-		writel(0, base + USB3_WIN_CTRL(win));
-		writel(0, base + USB3_WIN_BASE(win));
-	}
-
-	/* Program each DRAM CS in a seperate window */
-	for (win = 0; win < dram->num_cs; win++) {
-		const struct mbus_dram_window *cs = &dram->cs[win];
-
-		writel(((cs->size - 1) & 0xffff0000) | (cs->mbus_attr << 8) |
-		       (dram->mbus_dram_target_id << 4) | 1,
-		       base + USB3_WIN_CTRL(win));
-
-		writel((cs->base & 0xffff0000), base + USB3_WIN_BASE(win));
-	}
-}
-
-int xhci_mvebu_mbus_init_quirk(struct platform_device *pdev)
-{
-	struct resource	*res;
-	void __iomem *base;
-	const struct mbus_dram_target_info *dram;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	if (!res)
-		return -ENODEV;
-
-	/*
-	 * We don't use devm_ioremap() because this mapping should
-	 * only exists for the duration of this probe function.
-	 */
-	base = ioremap(res->start, resource_size(res));
-	if (!base)
-		return -ENODEV;
-
-	dram = mv_mbus_dram_info();
-	xhci_mvebu_mbus_config(base, dram);
-
-	/*
-	 * This memory area was only needed to configure the MBus
-	 * windows, and is therefore no longer useful.
-	 */
-	iounmap(base);
-
-	return 0;
-}
+DGE_PIXEL_CNTL__OVLSCL_BLACK_COLOR_BCB__SHIFT 0x0
+#define OVLSCL_EDGE_PIXEL_CNTL__OVLSCL_BLACK_COLOR_GY_MASK 0xffc00
+#define OVLSCL_EDGE_PIXEL_CNTL__OVLSCL_BLACK_COLOR_GY__SHIFT 0xa
+#define OVLSCL_EDGE_PIXEL_CNTL__OVLSCL_BLACK_COLOR_RCR_MASK 0x3ff00000
+#define OVLSCL_EDGE_PIXEL_CNTL__OVLSCL_BLACK_COLOR_RCR__SHIFT 0x14
+#define OVLSCL_EDGE_PIXEL_CNTL__OVLSCL_EDGE_PIXEL_SEL_MASK 0x80000000
+#define OVLSCL_EDGE_PIXEL_CNTL__OVLSCL_EDGE_PIXEL_SEL__SHIFT 0x1f
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_SELECT_MASK 0x1
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_SELECT__SHIFT 0x0
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_R_SIGN_MASK 0x2
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_R_SIGN__SHIFT 0x1
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_G_SIGN_MASK 0x4
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_G_SIGN__SHIFT 0x2
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_B_SIGN_MASK 0x8
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_B_SIGN__SHIFT 0x3
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_BYPASS_MASK 0x10
+#define PRESCALE_GRPH_CONTROL__GRPH_PRESCALE_BYPASS__SHIFT 0x4
+#define PRESCALE_VALUES_GRPH_R__GRPH_PRESCALE_BIAS_R_MASK 0xffff
+#define PRESCALE_VALUES_GRPH_R__GRPH_PRESCALE_BIAS_R__SHIFT 0x0
+#define PRESCALE_VALUES_GRPH_R__GRPH_PRESCALE_SCALE_R_MASK 0xffff0000
+#define PRESCALE_VALUES_GRPH_R__GRPH_PRESCALE_SCALE_R__SHIFT 0x10
+#define PRESCALE_VALUES_GRPH_G__GRPH_PRESCALE_BIAS_G_MASK 0xffff
+#define PRESCALE_VALUES_GRPH_G__GRPH_PRESCALE_BIAS_G__SHIFT 0x0
+#define PRESCALE_VALUES_GRPH_G__GRPH_PRESCALE_SCALE_G_MASK 0xffff0000
+#define PRESCALE_VALUES_GRPH_G__GRPH_PRESCALE_SCALE_G__SHIFT 0x10
+#define PRESCALE_VALUES_GRPH_B__GRPH_PRESCALE_BIAS_B_MASK 0xffff
+#define PRESCALE_VALUES_GRPH_B__GRPH_PRESCALE_BIAS_B__SHIFT 0x0
+#define PRESCALE_VALUES_GRPH_B__GRPH_PRESCALE_SCALE_B_MASK 0xffff0000
+#define PRESCALE_VALUES_GRPH

@@ -1,19 +1,13 @@
-config NTB_PINGPONG
-	tristate "NTB Ping Pong Test Client"
-	help
-	 This is a simple ping pong driver that exercises the scratchpads and
-	 doorbells of the ntb hardware.  This driver may be used to test that
-	 your ntb hardware and drivers are functioning at a basic level.
-
-	 If unsure, say N.
-
-config NTB_TOOL
-	tristate "NTB Debugging Tool Test Client"
-	help
-	 This is a simple debugging driver that enables the doorbell and
-	 scratchpad registers to be read and written from the debugfs.  This
-	 enables more complicated debugging to be scripted from user space.
-	 This driver may be used to test that your ntb hardware and drivers are
-	 functioning at a basic level.
-
-	 If unsure, say N.
+EBUG_DQB0L_TXPHASE_D0__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_DQB0L_TXPHASE_D0__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_DQB0L_TXPHASE_D0__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_DQB0L_TXPHASE_D0__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_DQB0L_TXPHASE_D0__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_DQB0L_TXPHASE_D0__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_DQB0L_TXPHASE_D0__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_DQB0L_TXPHASE_D0__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_DQB0H_TXPHASE_D0__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_DQB0H_TXPHASE_D0__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_DQB0H_TXPHASE_D0__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_DQB0H_TXPHASE_D0__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_DQB

@@ -1,1538 +1,718 @@
-/*
- * USB transceiver driver for AB8500 family chips
- *
- * Copyright (C) 2010-2013 ST-Ericsson AB
- * Mian Yousaf Kaukab <mian.yousaf.kaukab@stericsson.com>
- * Avinash Kumar <avinash.kumar@stericsson.com>
- * Thirupathi Chippakurthy <thirupathi.chippakurthy@stericsson.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- *
- */
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/usb/otg.h>
-#include <linux/slab.h>
-#include <linux/notifier.h>
-#include <linux/interrupt.h>
-#include <linux/delay.h>
-#include <linux/clk.h>
-#include <linux/err.h>
-#include <linux/mfd/abx500.h>
-#include <linux/mfd/abx500/ab8500.h>
-#include <linux/usb/musb-ux500.h>
-#include <linux/regulator/consumer.h>
-#include <linux/pinctrl/consumer.h>
-
-/* Bank AB8500_SYS_CTRL2_BLOCK */
-#define AB8500_MAIN_WD_CTRL_REG 0x01
-
-/* Bank AB8500_USB */
-#define AB8500_USB_LINE_STAT_REG 0x80
-#define AB8505_USB_LINE_STAT_REG 0x94
-#define AB8540_USB_LINK_STAT_REG 0x94
-#define AB9540_USB_LINK_STAT_REG 0x94
-#define AB8540_USB_OTG_CTL_REG 0x87
-#define AB8500_USB_PHY_CTRL_REG 0x8A
-#define AB8540_VBUS_CTRL_REG 0x82
-
-/* Bank AB8500_DEVELOPMENT */
-#define AB8500_BANK12_ACCESS 0x00
-
-/* Bank AB8500_DEBUG */
-#define AB8540_DEBUG 0x32
-#define AB8500_USB_PHY_TUNE1 0x05
-#define AB8500_USB_PHY_TUNE2 0x06
-#define AB8500_USB_PHY_TUNE3 0x07
-
-/* Bank AB8500_INTERRUPT */
-#define AB8500_IT_SOURCE2_REG 0x01
-
-#define AB8500_BIT_OTG_STAT_ID (1 << 0)
-#define AB8500_BIT_PHY_CTRL_HOST_EN (1 << 0)
-#define AB8500_BIT_PHY_CTRL_DEVICE_EN (1 << 1)
-#define AB8500_BIT_WD_CTRL_ENABLE (1 << 0)
-#define AB8500_BIT_WD_CTRL_KICK (1 << 1)
-#define AB8500_BIT_SOURCE2_VBUSDET (1 << 7)
-#define AB8540_BIT_OTG_CTL_VBUS_VALID_ENA (1 << 0)
-#define AB8540_BIT_OTG_CTL_ID_HOST_ENA (1 << 1)
-#define AB8540_BIT_OTG_CTL_ID_DEV_ENA (1 << 5)
-#define AB8540_BIT_VBUS_CTRL_CHARG_DET_ENA (1 << 0)
-
-#define AB8500_WD_KICK_DELAY_US 100 /* usec */
-#define AB8500_WD_V11_DISABLE_DELAY_US 100 /* usec */
-#define AB8500_V20_31952_DISABLE_DELAY_US 100 /* usec */
-
-/* Usb line status register */
-enum ab8500_usb_link_status {
-	USB_LINK_NOT_CONFIGURED_8500 = 0,
-	USB_LINK_STD_HOST_NC_8500,
-	USB_LINK_STD_HOST_C_NS_8500,
-	USB_LINK_STD_HOST_C_S_8500,
-	USB_LINK_HOST_CHG_NM_8500,
-	USB_LINK_HOST_CHG_HS_8500,
-	USB_LINK_HOST_CHG_HS_CHIRP_8500,
-	USB_LINK_DEDICATED_CHG_8500,
-	USB_LINK_ACA_RID_A_8500,
-	USB_LINK_ACA_RID_B_8500,
-	USB_LINK_ACA_RID_C_NM_8500,
-	USB_LINK_ACA_RID_C_HS_8500,
-	USB_LINK_ACA_RID_C_HS_CHIRP_8500,
-	USB_LINK_HM_IDGND_8500,
-	USB_LINK_RESERVED_8500,
-	USB_LINK_NOT_VALID_LINK_8500,
-};
-
-enum ab8505_usb_link_status {
-	USB_LINK_NOT_CONFIGURED_8505 = 0,
-	USB_LINK_STD_HOST_NC_8505,
-	USB_LINK_STD_HOST_C_NS_8505,
-	USB_LINK_STD_HOST_C_S_8505,
-	USB_LINK_CDP_8505,
-	USB_LINK_RESERVED0_8505,
-	USB_LINK_RESERVED1_8505,
-	USB_LINK_DEDICATED_CHG_8505,
-	USB_LINK_ACA_RID_A_8505,
-	USB_LINK_ACA_RID_B_8505,
-	USB_LINK_ACA_RID_C_NM_8505,
-	USB_LINK_RESERVED2_8505,
-	USB_LINK_RESERVED3_8505,
-	USB_LINK_HM_IDGND_8505,
-	USB_LINK_CHARGERPORT_NOT_OK_8505,
-	USB_LINK_CHARGER_DM_HIGH_8505,
-	USB_LINK_PHYEN_NO_VBUS_NO_IDGND_8505,
-	USB_LINK_STD_UPSTREAM_NO_IDGNG_NO_VBUS_8505,
-	USB_LINK_STD_UPSTREAM_8505,
-	USB_LINK_CHARGER_SE1_8505,
-	USB_LINK_CARKIT_CHGR_1_8505,
-	USB_LINK_CARKIT_CHGR_2_8505,
-	USB_LINK_ACA_DOCK_CHGR_8505,
-	USB_LINK_SAMSUNG_BOOT_CBL_PHY_EN_8505,
-	USB_LINK_SAMSUNG_BOOT_CBL_PHY_DISB_8505,
-	USB_LINK_SAMSUNG_UART_CBL_PHY_EN_8505,
-	USB_LINK_SAMSUNG_UART_CBL_PHY_DISB_8505,
-	USB_LINK_MOTOROLA_FACTORY_CBL_PHY_EN_8505,
-};
-
-enum ab8540_usb_link_status {
-	USB_LINK_NOT_CONFIGURED_8540 = 0,
-	USB_LINK_STD_HOST_NC_8540,
-	USB_LINK_STD_HOST_C_NS_8540,
-	USB_LINK_STD_HOST_C_S_8540,
-	USB_LINK_CDP_8540,
-	USB_LINK_RESERVED0_8540,
-	USB_LINK_RESERVED1_8540,
-	USB_LINK_DEDICATED_CHG_8540,
-	USB_LINK_ACA_RID_A_8540,
-	USB_LINK_ACA_RID_B_8540,
-	USB_LINK_ACA_RID_C_NM_8540,
-	USB_LINK_RESERVED2_8540,
-	USB_LINK_RESERVED3_8540,
-	USB_LINK_HM_IDGND_8540,
-	USB_LINK_CHARGERPORT_NOT_OK_8540,
-	USB_LINK_CHARGER_DM_HIGH_8540,
-	USB_LINK_PHYEN_NO_VBUS_NO_IDGND_8540,
-	USB_LINK_STD_UPSTREAM_NO_IDGNG_VBUS_8540,
-	USB_LINK_STD_UPSTREAM_8540,
-	USB_LINK_CHARGER_SE1_8540,
-	USB_LINK_CARKIT_CHGR_1_8540,
-	USB_LINK_CARKIT_CHGR_2_8540,
-	USB_LINK_ACA_DOCK_CHGR_8540,
-	USB_LINK_SAMSUNG_BOOT_CBL_PHY_EN_8540,
-	USB_LINK_SAMSUNG_BOOT_CBL_PHY_DISB_8540,
-	USB_LINK_SAMSUNG_UART_CBL_PHY_EN_8540,
-	USB_LINK_SAMSUNG_UART_CBL_PHY_DISB_8540,
-	USB_LINK_MOTOROLA_FACTORY_CBL_PHY_EN_8540
-};
-
-enum ab9540_usb_link_status {
-	USB_LINK_NOT_CONFIGURED_9540 = 0,
-	USB_LINK_STD_HOST_NC_9540,
-	USB_LINK_STD_HOST_C_NS_9540,
-	USB_LINK_STD_HOST_C_S_9540,
-	USB_LINK_CDP_9540,
-	USB_LINK_RESERVED0_9540,
-	USB_LINK_RESERVED1_9540,
-	USB_LINK_DEDICATED_CHG_9540,
-	USB_LINK_ACA_RID_A_9540,
-	USB_LINK_ACA_RID_B_9540,
-	USB_LINK_ACA_RID_C_NM_9540,
-	USB_LINK_RESERVED2_9540,
-	USB_LINK_RESERVED3_9540,
-	USB_LINK_HM_IDGND_9540,
-	USB_LINK_CHARGERPORT_NOT_OK_9540,
-	USB_LINK_CHARGER_DM_HIGH_9540,
-	USB_LINK_PHYEN_NO_VBUS_NO_IDGND_9540,
-	USB_LINK_STD_UPSTREAM_NO_IDGNG_VBUS_9540,
-	USB_LINK_STD_UPSTREAM_9540,
-	USB_LINK_CHARGER_SE1_9540,
-	USB_LINK_CARKIT_CHGR_1_9540,
-	USB_LINK_CARKIT_CHGR_2_9540,
-	USB_LINK_ACA_DOCK_CHGR_9540,
-	USB_LINK_SAMSUNG_BOOT_CBL_PHY_EN_9540,
-	USB_LINK_SAMSUNG_BOOT_CBL_PHY_DISB_9540,
-	USB_LINK_SAMSUNG_UART_CBL_PHY_EN_9540,
-	USB_LINK_SAMSUNG_UART_CBL_PHY_DISB_9540,
-	USB_LINK_MOTOROLA_FACTORY_CBL_PHY_EN_9540
-};
-
-enum ab8500_usb_mode {
-	USB_IDLE = 0,
-	USB_PERIPHERAL,
-	USB_HOST,
-	USB_DEDICATED_CHG
-};
-
-/* Register USB_LINK_STATUS interrupt */
-#define AB8500_USB_FLAG_USE_LINK_STATUS_IRQ	(1 << 0)
-/* Register ID_WAKEUP_F interrupt */
-#define AB8500_USB_FLAG_USE_ID_WAKEUP_IRQ	(1 << 1)
-/* Register VBUS_DET_F interrupt */
-#define AB8500_USB_FLAG_USE_VBUS_DET_IRQ	(1 << 2)
-/* Driver is using the ab-iddet driver*/
-#define AB8500_USB_FLAG_USE_AB_IDDET		(1 << 3)
-/* Enable setting regulators voltage */
-#define AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE	(1 << 4)
-/* Enable the check_vbus_status workaround */
-#define AB8500_USB_FLAG_USE_CHECK_VBUS_STATUS	(1 << 5)
-/* Enable the vbus host workaround */
-#define AB8500_USB_FLAG_USE_VBUS_HOST_QUIRK	(1 << 6)
-
-struct ab8500_usb {
-	struct usb_phy phy;
-	struct device *dev;
-	struct ab8500 *ab8500;
-	unsigned vbus_draw;
-	struct work_struct phy_dis_work;
-	struct work_struct vbus_event_work;
-	enum ab8500_usb_mode mode;
-	struct clk *sysclk;
-	struct regulator *v_ape;
-	struct regulator *v_musb;
-	struct regulator *v_ulpi;
-	int saved_v_ulpi;
-	int previous_link_status_state;
-	struct pinctrl *pinctrl;
-	struct pinctrl_state *pins_sleep;
-	bool enabled_charging_detection;
-	unsigned int flags;
-};
-
-static inline struct ab8500_usb *phy_to_ab(struct usb_phy *x)
-{
-	return container_of(x, struct ab8500_usb, phy);
-}
-
-static void ab8500_usb_wd_workaround(struct ab8500_usb *ab)
-{
-	abx500_set_register_interruptible(ab->dev,
-		AB8500_SYS_CTRL2_BLOCK,
-		AB8500_MAIN_WD_CTRL_REG,
-		AB8500_BIT_WD_CTRL_ENABLE);
-
-	udelay(AB8500_WD_KICK_DELAY_US);
-
-	abx500_set_register_interruptible(ab->dev,
-		AB8500_SYS_CTRL2_BLOCK,
-		AB8500_MAIN_WD_CTRL_REG,
-		(AB8500_BIT_WD_CTRL_ENABLE
-		| AB8500_BIT_WD_CTRL_KICK));
-
-	udelay(AB8500_WD_V11_DISABLE_DELAY_US);
-
-	abx500_set_register_interruptible(ab->dev,
-		AB8500_SYS_CTRL2_BLOCK,
-		AB8500_MAIN_WD_CTRL_REG,
-		0);
-}
-
-static void ab8500_usb_regulator_enable(struct ab8500_usb *ab)
-{
-	int ret, volt;
-
-	ret = regulator_enable(ab->v_ape);
-	if (ret)
-		dev_err(ab->dev, "Failed to enable v-ape\n");
-
-	if (ab->flags & AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE) {
-		ab->saved_v_ulpi = regulator_get_voltage(ab->v_ulpi);
-		if (ab->saved_v_ulpi < 0)
-			dev_err(ab->dev, "Failed to get v_ulpi voltage\n");
-
-		ret = regulator_set_voltage(ab->v_ulpi, 1300000, 1350000);
-		if (ret < 0)
-			dev_err(ab->dev, "Failed to set the Vintcore to 1.3V, ret=%d\n",
-					ret);
-
-		ret = regulator_set_load(ab->v_ulpi, 28000);
-		if (ret < 0)
-			dev_err(ab->dev, "Failed to set optimum mode (ret=%d)\n",
-					ret);
-	}
-
-	ret = regulator_enable(ab->v_ulpi);
-	if (ret)
-		dev_err(ab->dev, "Failed to enable vddulpivio18\n");
-
-	if (ab->flags & AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE) {
-		volt = regulator_get_voltage(ab->v_ulpi);
-		if ((volt != 1300000) && (volt != 1350000))
-			dev_err(ab->dev, "Vintcore is not set to 1.3V volt=%d\n",
-					volt);
-	}
-
-	ret = regulator_enable(ab->v_musb);
-	if (ret)
-		dev_err(ab->dev, "Failed to enable musb_1v8\n");
-}
-
-static void ab8500_usb_regulator_disable(struct ab8500_usb *ab)
-{
-	int ret;
-
-	regulator_disable(ab->v_musb);
-
-	regulator_disable(ab->v_ulpi);
-
-	/* USB is not the only consumer of Vintcore, restore old settings */
-	if (ab->flags & AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE) {
-		if (ab->saved_v_ulpi > 0) {
-			ret = regulator_set_voltage(ab->v_ulpi,
-					ab->saved_v_ulpi, ab->saved_v_ulpi);
-			if (ret < 0)
-				dev_err(ab->dev, "Failed to set the Vintcore to %duV, ret=%d\n",
-						ab->saved_v_ulpi, ret);
-		}
-
-		ret = regulator_set_load(ab->v_ulpi, 0);
-		if (ret < 0)
-			dev_err(ab->dev, "Failed to set optimum mode (ret=%d)\n",
-					ret);
-	}
-
-	regulator_disable(ab->v_ape);
-}
-
-static void ab8500_usb_wd_linkstatus(struct ab8500_usb *ab, u8 bit)
-{
-	/* Workaround for v2.0 bug # 31952 */
-	if (is_ab8500_2p0(ab->ab8500)) {
-		abx500_mask_and_set_register_interruptible(ab->dev,
-				AB8500_USB, AB8500_USB_PHY_CTRL_REG,
-				bit, bit);
-		udelay(AB8500_V20_31952_DISABLE_DELAY_US);
-	}
-}
-
-static void ab8500_usb_phy_enable(struct ab8500_usb *ab, bool sel_host)
-{
-	u8 bit;
-	bit = sel_host ? AB8500_BIT_PHY_CTRL_HOST_EN :
-		AB8500_BIT_PHY_CTRL_DEVICE_EN;
-
-	/* mux and configure USB pins to DEFAULT state */
-	ab->pinctrl = pinctrl_get_select(ab->dev, PINCTRL_STATE_DEFAULT);
-	if (IS_ERR(ab->pinctrl))
-		dev_err(ab->dev, "could not get/set default pinstate\n");
-
-	if (clk_prepare_enable(ab->sysclk))
-		dev_err(ab->dev, "can't prepare/enable clock\n");
-
-	ab8500_usb_regulator_enable(ab);
-
-	abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_USB, AB8500_USB_PHY_CTRL_REG,
-			bit, bit);
-
-	if (ab->flags & AB8500_USB_FLAG_USE_VBUS_HOST_QUIRK) {
-		if (sel_host)
-			abx500_set_register_interruptible(ab->dev,
-					AB8500_USB, AB8540_USB_OTG_CTL_REG,
-					AB8540_BIT_OTG_CTL_VBUS_VALID_ENA |
-					AB8540_BIT_OTG_CTL_ID_HOST_ENA |
-					AB8540_BIT_OTG_CTL_ID_DEV_ENA);
-	}
-}
-
-static void ab8500_usb_phy_disable(struct ab8500_usb *ab, bool sel_host)
-{
-	u8 bit;
-	bit = sel_host ? AB8500_BIT_PHY_CTRL_HOST_EN :
-		AB8500_BIT_PHY_CTRL_DEVICE_EN;
-
-	ab8500_usb_wd_linkstatus(ab, bit);
-
-	abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_USB, AB8500_USB_PHY_CTRL_REG,
-			bit, 0);
-
-	/* Needed to disable the phy.*/
-	ab8500_usb_wd_workaround(ab);
-
-	clk_disable_unprepare(ab->sysclk);
-
-	ab8500_usb_regulator_disable(ab);
-
-	if (!IS_ERR(ab->pinctrl)) {
-		/* configure USB pins to SLEEP state */
-		ab->pins_sleep = pinctrl_lookup_state(ab->pinctrl,
-				PINCTRL_STATE_SLEEP);
-
-		if (IS_ERR(ab->pins_sleep))
-			dev_dbg(ab->dev, "could not get sleep pinstate\n");
-		else if (pinctrl_select_state(ab->pinctrl, ab->pins_sleep))
-			dev_err(ab->dev, "could not set pins to sleep state\n");
-
-		/*
-		 * as USB pins are shared with iddet, release them to allow
-		 * iddet to request them
-		 */
-		pinctrl_put(ab->pinctrl);
-	}
-}
-
-#define ab8500_usb_host_phy_en(ab)	ab8500_usb_phy_enable(ab, true)
-#define ab8500_usb_host_phy_dis(ab)	ab8500_usb_phy_disable(ab, true)
-#define ab8500_usb_peri_phy_en(ab)	ab8500_usb_phy_enable(ab, false)
-#define ab8500_usb_peri_phy_dis(ab)	ab8500_usb_phy_disable(ab, false)
-
-static int ab9540_usb_link_status_update(struct ab8500_usb *ab,
-		enum ab9540_usb_link_status lsts)
-{
-	enum ux500_musb_vbus_id_status event = 0;
-
-	dev_dbg(ab->dev, "ab9540_usb_link_status_update %d\n", lsts);
-
-	if (ab->previous_link_status_state == USB_LINK_HM_IDGND_9540 &&
-			(lsts == USB_LINK_STD_HOST_C_NS_9540 ||
-			 lsts == USB_LINK_STD_HOST_NC_9540))
-		return 0;
-
-	if (ab->previous_link_status_state == USB_LINK_ACA_RID_A_9540 &&
-			(lsts == USB_LINK_STD_HOST_NC_9540))
-		return 0;
-
-	ab->previous_link_status_state = lsts;
-
-	switch (lsts) {
-	case USB_LINK_ACA_RID_B_9540:
-		event = UX500_MUSB_RIDB;
-	case USB_LINK_NOT_CONFIGURED_9540:
-	case USB_LINK_RESERVED0_9540:
-	case USB_LINK_RESERVED1_9540:
-	case USB_LINK_RESERVED2_9540:
-	case USB_LINK_RESERVED3_9540:
-		if (ab->mode == USB_PERIPHERAL)
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_CLEAN, &ab->vbus_draw);
-		ab->mode = USB_IDLE;
-		ab->phy.otg->default_a = false;
-		ab->vbus_draw = 0;
-		if (event != UX500_MUSB_RIDB)
-			event = UX500_MUSB_NONE;
-		/* Fallback to default B_IDLE as nothing is connected. */
-		ab->phy.otg->state = OTG_STATE_B_IDLE;
-		usb_phy_set_event(&ab->phy, USB_EVENT_NONE);
-		break;
-
-	case USB_LINK_ACA_RID_C_NM_9540:
-		event = UX500_MUSB_RIDC;
-	case USB_LINK_STD_HOST_NC_9540:
-	case USB_LINK_STD_HOST_C_NS_9540:
-	case USB_LINK_STD_HOST_C_S_9540:
-	case USB_LINK_CDP_9540:
-		if (ab->mode == USB_HOST) {
-			ab->mode = USB_PERIPHERAL;
-			ab8500_usb_host_phy_dis(ab);
-			ab8500_usb_peri_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-			usb_phy_set_event(&ab->phy, USB_EVENT_ENUMERATED);
-		}
-		if (ab->mode == USB_IDLE) {
-			ab->mode = USB_PERIPHERAL;
-			ab8500_usb_peri_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-			usb_phy_set_event(&ab->phy, USB_EVENT_ENUMERATED);
-		}
-		if (event != UX500_MUSB_RIDC)
-			event = UX500_MUSB_VBUS;
-		break;
-
-	case USB_LINK_ACA_RID_A_9540:
-		event = UX500_MUSB_RIDA;
-	case USB_LINK_HM_IDGND_9540:
-	case USB_LINK_STD_UPSTREAM_9540:
-		if (ab->mode == USB_PERIPHERAL) {
-			ab->mode = USB_HOST;
-			ab8500_usb_peri_phy_dis(ab);
-			ab8500_usb_host_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-		}
-		if (ab->mode == USB_IDLE) {
-			ab->mode = USB_HOST;
-			ab8500_usb_host_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-		}
-		ab->phy.otg->default_a = true;
-		if (event != UX500_MUSB_RIDA)
-			event = UX500_MUSB_ID;
-
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		break;
-
-	case USB_LINK_DEDICATED_CHG_9540:
-		ab->mode = USB_DEDICATED_CHG;
-		event = UX500_MUSB_CHARGER;
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		usb_phy_set_event(&ab->phy, USB_EVENT_CHARGER);
-		break;
-
-	case USB_LINK_PHYEN_NO_VBUS_NO_IDGND_9540:
-	case USB_LINK_STD_UPSTREAM_NO_IDGNG_VBUS_9540:
-		if (!(is_ab9540_2p0_or_earlier(ab->ab8500))) {
-			event = UX500_MUSB_NONE;
-			if (ab->mode == USB_HOST) {
-				ab->phy.otg->default_a = false;
-				ab->vbus_draw = 0;
-				atomic_notifier_call_chain(&ab->phy.notifier,
-						event, &ab->vbus_draw);
-				ab8500_usb_host_phy_dis(ab);
-				ab->mode = USB_IDLE;
-			}
-			if (ab->mode == USB_PERIPHERAL) {
-				atomic_notifier_call_chain(&ab->phy.notifier,
-						event, &ab->vbus_draw);
-				ab8500_usb_peri_phy_dis(ab);
-				atomic_notifier_call_chain(&ab->phy.notifier,
-						UX500_MUSB_CLEAN,
-						&ab->vbus_draw);
-				ab->mode = USB_IDLE;
-				ab->phy.otg->default_a = false;
-				ab->vbus_draw = 0;
-				usb_phy_set_event(&ab->phy, USB_EVENT_NONE);
-			}
-		}
-		break;
-
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-static int ab8540_usb_link_status_update(struct ab8500_usb *ab,
-		enum ab8540_usb_link_status lsts)
-{
-	enum ux500_musb_vbus_id_status event = 0;
-
-	dev_dbg(ab->dev, "ab8540_usb_link_status_update %d\n", lsts);
-
-	if (ab->enabled_charging_detection) {
-		/* Disable USB Charger detection */
-		abx500_mask_and_set_register_interruptible(ab->dev,
-				AB8500_USB, AB8540_VBUS_CTRL_REG,
-				AB8540_BIT_VBUS_CTRL_CHARG_DET_ENA, 0x00);
-		ab->enabled_charging_detection = false;
-	}
-
-	/*
-	 * Spurious link_status interrupts are seen in case of a
-	 * disconnection of a device in IDGND and RIDA stage
-	 */
-	if (ab->previous_link_status_state == USB_LINK_HM_IDGND_8540 &&
-			(lsts == USB_LINK_STD_HOST_C_NS_8540 ||
-			 lsts == USB_LINK_STD_HOST_NC_8540))
-		return 0;
-
-	if (ab->previous_link_status_state == USB_LINK_ACA_RID_A_8540 &&
-			(lsts == USB_LINK_STD_HOST_NC_8540))
-		return 0;
-
-	ab->previous_link_status_state = lsts;
-
-	switch (lsts) {
-	case USB_LINK_ACA_RID_B_8540:
-		event = UX500_MUSB_RIDB;
-	case USB_LINK_NOT_CONFIGURED_8540:
-	case USB_LINK_RESERVED0_8540:
-	case USB_LINK_RESERVED1_8540:
-	case USB_LINK_RESERVED2_8540:
-	case USB_LINK_RESERVED3_8540:
-		ab->mode = USB_IDLE;
-		ab->phy.otg->default_a = false;
-		ab->vbus_draw = 0;
-		if (event != UX500_MUSB_RIDB)
-			event = UX500_MUSB_NONE;
-		/*
-		 * Fallback to default B_IDLE as nothing
-		 * is connected
-		 */
-		ab->phy.otg->state = OTG_STATE_B_IDLE;
-		usb_phy_set_event(&ab->phy, USB_EVENT_NONE);
-		break;
-
-	case USB_LINK_ACA_RID_C_NM_8540:
-		event = UX500_MUSB_RIDC;
-	case USB_LINK_STD_HOST_NC_8540:
-	case USB_LINK_STD_HOST_C_NS_8540:
-	case USB_LINK_STD_HOST_C_S_8540:
-	case USB_LINK_CDP_8540:
-		if (ab->mode == USB_IDLE) {
-			ab->mode = USB_PERIPHERAL;
-			ab8500_usb_peri_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-			usb_phy_set_event(&ab->phy, USB_EVENT_ENUMERATED);
-		}
-		if (event != UX500_MUSB_RIDC)
-			event = UX500_MUSB_VBUS;
-		break;
-
-	case USB_LINK_ACA_RID_A_8540:
-	case USB_LINK_ACA_DOCK_CHGR_8540:
-		event = UX500_MUSB_RIDA;
-	case USB_LINK_HM_IDGND_8540:
-	case USB_LINK_STD_UPSTREAM_8540:
-		if (ab->mode == USB_IDLE) {
-			ab->mode = USB_HOST;
-			ab8500_usb_host_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-		}
-		ab->phy.otg->default_a = true;
-		if (event != UX500_MUSB_RIDA)
-			event = UX500_MUSB_ID;
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		break;
-
-	case USB_LINK_DEDICATED_CHG_8540:
-		ab->mode = USB_DEDICATED_CHG;
-		event = UX500_MUSB_CHARGER;
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		usb_phy_set_event(&ab->phy, USB_EVENT_CHARGER);
-		break;
-
-	case USB_LINK_PHYEN_NO_VBUS_NO_IDGND_8540:
-	case USB_LINK_STD_UPSTREAM_NO_IDGNG_VBUS_8540:
-		event = UX500_MUSB_NONE;
-		if (ab->mode == USB_HOST) {
-			ab->phy.otg->default_a = false;
-			ab->vbus_draw = 0;
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					event, &ab->vbus_draw);
-			ab8500_usb_host_phy_dis(ab);
-			ab->mode = USB_IDLE;
-		}
-		if (ab->mode == USB_PERIPHERAL) {
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					event, &ab->vbus_draw);
-			ab8500_usb_peri_phy_dis(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_CLEAN, &ab->vbus_draw);
-			ab->mode = USB_IDLE;
-			ab->phy.otg->default_a = false;
-			ab->vbus_draw = 0;
-		usb_phy_set_event(&ab->phy, USB_EVENT_NONE);
-		}
-		break;
-
-	default:
-		event = UX500_MUSB_NONE;
-		break;
-	}
-
-	return 0;
-}
-
-static int ab8505_usb_link_status_update(struct ab8500_usb *ab,
-		enum ab8505_usb_link_status lsts)
-{
-	enum ux500_musb_vbus_id_status event = 0;
-
-	dev_dbg(ab->dev, "ab8505_usb_link_status_update %d\n", lsts);
-
-	/*
-	 * Spurious link_status interrupts are seen at the time of
-	 * disconnection of a device in RIDA state
-	 */
-	if (ab->previous_link_status_state == USB_LINK_ACA_RID_A_8505 &&
-			(lsts == USB_LINK_STD_HOST_NC_8505))
-		return 0;
-
-	ab->previous_link_status_state = lsts;
-
-	switch (lsts) {
-	case USB_LINK_ACA_RID_B_8505:
-		event = UX500_MUSB_RIDB;
-	case USB_LINK_NOT_CONFIGURED_8505:
-	case USB_LINK_RESERVED0_8505:
-	case USB_LINK_RESERVED1_8505:
-	case USB_LINK_RESERVED2_8505:
-	case USB_LINK_RESERVED3_8505:
-		ab->mode = USB_IDLE;
-		ab->phy.otg->default_a = false;
-		ab->vbus_draw = 0;
-		if (event != UX500_MUSB_RIDB)
-			event = UX500_MUSB_NONE;
-		/*
-		 * Fallback to default B_IDLE as nothing
-		 * is connected
-		 */
-		ab->phy.otg->state = OTG_STATE_B_IDLE;
-		usb_phy_set_event(&ab->phy, USB_EVENT_NONE);
-		break;
-
-	case USB_LINK_ACA_RID_C_NM_8505:
-		event = UX500_MUSB_RIDC;
-	case USB_LINK_STD_HOST_NC_8505:
-	case USB_LINK_STD_HOST_C_NS_8505:
-	case USB_LINK_STD_HOST_C_S_8505:
-	case USB_LINK_CDP_8505:
-		if (ab->mode == USB_IDLE) {
-			ab->mode = USB_PERIPHERAL;
-			ab8500_usb_peri_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-			usb_phy_set_event(&ab->phy, USB_EVENT_ENUMERATED);
-		}
-		if (event != UX500_MUSB_RIDC)
-			event = UX500_MUSB_VBUS;
-		break;
-
-	case USB_LINK_ACA_RID_A_8505:
-	case USB_LINK_ACA_DOCK_CHGR_8505:
-		event = UX500_MUSB_RIDA;
-	case USB_LINK_HM_IDGND_8505:
-		if (ab->mode == USB_IDLE) {
-			ab->mode = USB_HOST;
-			ab8500_usb_host_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-		}
-		ab->phy.otg->default_a = true;
-		if (event != UX500_MUSB_RIDA)
-			event = UX500_MUSB_ID;
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		break;
-
-	case USB_LINK_DEDICATED_CHG_8505:
-		ab->mode = USB_DEDICATED_CHG;
-		event = UX500_MUSB_CHARGER;
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		usb_phy_set_event(&ab->phy, USB_EVENT_CHARGER);
-		break;
-
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-static int ab8500_usb_link_status_update(struct ab8500_usb *ab,
-		enum ab8500_usb_link_status lsts)
-{
-	enum ux500_musb_vbus_id_status event = 0;
-
-	dev_dbg(ab->dev, "ab8500_usb_link_status_update %d\n", lsts);
-
-	/*
-	 * Spurious link_status interrupts are seen in case of a
-	 * disconnection of a device in IDGND and RIDA stage
-	 */
-	if (ab->previous_link_status_state == USB_LINK_HM_IDGND_8500 &&
-			(lsts == USB_LINK_STD_HOST_C_NS_8500 ||
-			 lsts == USB_LINK_STD_HOST_NC_8500))
-		return 0;
-
-	if (ab->previous_link_status_state == USB_LINK_ACA_RID_A_8500 &&
-			lsts == USB_LINK_STD_HOST_NC_8500)
-		return 0;
-
-	ab->previous_link_status_state = lsts;
-
-	switch (lsts) {
-	case USB_LINK_ACA_RID_B_8500:
-		event = UX500_MUSB_RIDB;
-	case USB_LINK_NOT_CONFIGURED_8500:
-	case USB_LINK_NOT_VALID_LINK_8500:
-		ab->mode = USB_IDLE;
-		ab->phy.otg->default_a = false;
-		ab->vbus_draw = 0;
-		if (event != UX500_MUSB_RIDB)
-			event = UX500_MUSB_NONE;
-		/* Fallback to default B_IDLE as nothing is connected */
-		ab->phy.otg->state = OTG_STATE_B_IDLE;
-		usb_phy_set_event(&ab->phy, USB_EVENT_NONE);
-		break;
-
-	case USB_LINK_ACA_RID_C_NM_8500:
-	case USB_LINK_ACA_RID_C_HS_8500:
-	case USB_LINK_ACA_RID_C_HS_CHIRP_8500:
-		event = UX500_MUSB_RIDC;
-	case USB_LINK_STD_HOST_NC_8500:
-	case USB_LINK_STD_HOST_C_NS_8500:
-	case USB_LINK_STD_HOST_C_S_8500:
-	case USB_LINK_HOST_CHG_NM_8500:
-	case USB_LINK_HOST_CHG_HS_8500:
-	case USB_LINK_HOST_CHG_HS_CHIRP_8500:
-		if (ab->mode == USB_IDLE) {
-			ab->mode = USB_PERIPHERAL;
-			ab8500_usb_peri_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-			usb_phy_set_event(&ab->phy, USB_EVENT_ENUMERATED);
-		}
-		if (event != UX500_MUSB_RIDC)
-			event = UX500_MUSB_VBUS;
-		break;
-
-	case USB_LINK_ACA_RID_A_8500:
-		event = UX500_MUSB_RIDA;
-	case USB_LINK_HM_IDGND_8500:
-		if (ab->mode == USB_IDLE) {
-			ab->mode = USB_HOST;
-			ab8500_usb_host_phy_en(ab);
-			atomic_notifier_call_chain(&ab->phy.notifier,
-					UX500_MUSB_PREPARE, &ab->vbus_draw);
-		}
-		ab->phy.otg->default_a = true;
-		if (event != UX500_MUSB_RIDA)
-			event = UX500_MUSB_ID;
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		break;
-
-	case USB_LINK_DEDICATED_CHG_8500:
-		ab->mode = USB_DEDICATED_CHG;
-		event = UX500_MUSB_CHARGER;
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		usb_phy_set_event(&ab->phy, USB_EVENT_CHARGER);
-		break;
-
-	case USB_LINK_RESERVED_8500:
-		break;
-	}
-
-	return 0;
-}
-
-/*
- * Connection Sequence:
- *   1. Link Status Interrupt
- *   2. Enable AB clock
- *   3. Enable AB regulators
- *   4. Enable USB phy
- *   5. Reset the musb controller
- *   6. Switch the ULPI GPIO pins to fucntion mode
- *   7. Enable the musb Peripheral5 clock
- *   8. Restore MUSB context
- */
-static int abx500_usb_link_status_update(struct ab8500_usb *ab)
-{
-	u8 reg;
-	int ret = 0;
-
-	if (is_ab8500(ab->ab8500)) {
-		enum ab8500_usb_link_status lsts;
-
-		abx500_get_register_interruptible(ab->dev,
-				AB8500_USB, AB8500_USB_LINE_STAT_REG, &reg);
-		lsts = (reg >> 3) & 0x0F;
-		ret = ab8500_usb_link_status_update(ab, lsts);
-	} else if (is_ab8505(ab->ab8500)) {
-		enum ab8505_usb_link_status lsts;
-
-		abx500_get_register_interruptible(ab->dev,
-				AB8500_USB, AB8505_USB_LINE_STAT_REG, &reg);
-		lsts = (reg >> 3) & 0x1F;
-		ret = ab8505_usb_link_status_update(ab, lsts);
-	} else if (is_ab8540(ab->ab8500)) {
-		enum ab8540_usb_link_status lsts;
-
-		abx500_get_register_interruptible(ab->dev,
-				AB8500_USB, AB8540_USB_LINK_STAT_REG, &reg);
-		lsts = (reg >> 3) & 0xFF;
-		ret = ab8540_usb_link_status_update(ab, lsts);
-	} else if (is_ab9540(ab->ab8500)) {
-		enum ab9540_usb_link_status lsts;
-
-		abx500_get_register_interruptible(ab->dev,
-				AB8500_USB, AB9540_USB_LINK_STAT_REG, &reg);
-		lsts = (reg >> 3) & 0xFF;
-		ret = ab9540_usb_link_status_update(ab, lsts);
-	}
-
-	return ret;
-}
-
-/*
- * Disconnection Sequence:
- *   1. Disconnect Interrupt
- *   2. Disable regulators
- *   3. Disable AB clock
- *   4. Disable the Phy
- *   5. Link Status Interrupt
- *   6. Disable Musb Clock
- */
-static irqreturn_t ab8500_usb_disconnect_irq(int irq, void *data)
-{
-	struct ab8500_usb *ab = (struct ab8500_usb *) data;
-	enum usb_phy_events event = UX500_MUSB_NONE;
-
-	/* Link status will not be updated till phy is disabled. */
-	if (ab->mode == USB_HOST) {
-		ab->phy.otg->default_a = false;
-		ab->vbus_draw = 0;
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		ab8500_usb_host_phy_dis(ab);
-		ab->mode = USB_IDLE;
-	}
-
-	if (ab->mode == USB_PERIPHERAL) {
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				event, &ab->vbus_draw);
-		ab8500_usb_peri_phy_dis(ab);
-		atomic_notifier_call_chain(&ab->phy.notifier,
-				UX500_MUSB_CLEAN, &ab->vbus_draw);
-		ab->mode = USB_IDLE;
-		ab->phy.otg->default_a = false;
-		ab->vbus_draw = 0;
-	}
-
-	if (is_ab8500_2p0(ab->ab8500)) {
-		if (ab->mode == USB_DEDICATED_CHG) {
-			ab8500_usb_wd_linkstatus(ab,
-					AB8500_BIT_PHY_CTRL_DEVICE_EN);
-			abx500_mask_and_set_register_interruptible(ab->dev,
-					AB8500_USB, AB8500_USB_PHY_CTRL_REG,
-					AB8500_BIT_PHY_CTRL_DEVICE_EN, 0);
-		}
-	}
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t ab8500_usb_link_status_irq(int irq, void *data)
-{
-	struct ab8500_usb *ab = (struct ab8500_usb *)data;
-
-	abx500_usb_link_status_update(ab);
-
-	return IRQ_HANDLED;
-}
-
-static void ab8500_usb_phy_disable_work(struct work_struct *work)
-{
-	struct ab8500_usb *ab = container_of(work, struct ab8500_usb,
-						phy_dis_work);
-
-	if (!ab->phy.otg->host)
-		ab8500_usb_host_phy_dis(ab);
-
-	if (!ab->phy.otg->gadget)
-		ab8500_usb_peri_phy_dis(ab);
-}
-
-/* Check if VBUS is set and linkstatus has not detected a cable. */
-static bool ab8500_usb_check_vbus_status(struct ab8500_usb *ab)
-{
-	u8 isource2;
-	u8 reg;
-	enum ab8540_usb_link_status lsts;
-
-	abx500_get_register_interruptible(ab->dev,
-			AB8500_INTERRUPT, AB8500_IT_SOURCE2_REG,
-			&isource2);
-
-	/* If Vbus is below 3.6V abort */
-	if (!(isource2 & AB8500_BIT_SOURCE2_VBUSDET))
-		return false;
-
-	abx500_get_register_interruptible(ab->dev,
-			AB8500_USB, AB8540_USB_LINK_STAT_REG,
-			&reg);
-
-	lsts = (reg >> 3) & 0xFF;
-
-	/* Check if linkstatus has detected a cable */
-	if (lsts)
-		return false;
-
-	return true;
-}
-
-/* re-trigger charger detection again with watchdog re-kick. */
-static void ab8500_usb_vbus_turn_on_event_work(struct work_struct *work)
-{
-	struct ab8500_usb *ab = container_of(work, struct ab8500_usb,
-			vbus_event_work);
-
-	if (ab->mode != USB_IDLE)
-		return;
-
-	abx500_set_register_interruptible(ab->dev,
-			AB8500_SYS_CTRL2_BLOCK, AB8500_MAIN_WD_CTRL_REG,
-			AB8500_BIT_WD_CTRL_ENABLE);
-
-	udelay(100);
-
-	abx500_set_register_interruptible(ab->dev,
-			AB8500_SYS_CTRL2_BLOCK, AB8500_MAIN_WD_CTRL_REG,
-			AB8500_BIT_WD_CTRL_ENABLE | AB8500_BIT_WD_CTRL_KICK);
-
-	udelay(100);
-
-	/* Disable Main watchdog */
-	abx500_set_register_interruptible(ab->dev,
-			AB8500_SYS_CTRL2_BLOCK, AB8500_MAIN_WD_CTRL_REG,
-			0x0);
-
-	/* Enable USB Charger detection */
-	abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_USB, AB8540_VBUS_CTRL_REG,
-			AB8540_BIT_VBUS_CTRL_CHARG_DET_ENA,
-			AB8540_BIT_VBUS_CTRL_CHARG_DET_ENA);
-
-	ab->enabled_charging_detection = true;
-}
-
-static unsigned ab8500_eyediagram_workaroud(struct ab8500_usb *ab, unsigned mA)
-{
-	/*
-	 * AB8500 V2 has eye diagram issues when drawing more than 100mA from
-	 * VBUS.  Set charging current to 100mA in case of standard host
-	 */
-	if (is_ab8500_2p0_or_earlier(ab->ab8500))
-		if (mA > 100)
-			mA = 100;
-
-	return mA;
-}
-
-static int ab8500_usb_set_power(struct usb_phy *phy, unsigned mA)
-{
-	struct ab8500_usb *ab;
-
-	if (!phy)
-		return -ENODEV;
-
-	ab = phy_to_ab(phy);
-
-	mA = ab8500_eyediagram_workaroud(ab, mA);
-
-	ab->vbus_draw = mA;
-
-	atomic_notifier_call_chain(&ab->phy.notifier,
-			UX500_MUSB_VBUS, &ab->vbus_draw);
-
-	return 0;
-}
-
-static int ab8500_usb_set_suspend(struct usb_phy *x, int suspend)
-{
-	/* TODO */
-	return 0;
-}
-
-static int ab8500_usb_set_peripheral(struct usb_otg *otg,
-					struct usb_gadget *gadget)
-{
-	struct ab8500_usb *ab;
-
-	if (!otg)
-		return -ENODEV;
-
-	ab = phy_to_ab(otg->usb_phy);
-
-	ab->phy.otg->gadget = gadget;
-
-	/* Some drivers call this function in atomic context.
-	 * Do not update ab8500 registers directly till this
-	 * is fixed.
-	 */
-
-	if ((ab->mode != USB_IDLE) && !gadget) {
-		ab->mode = USB_IDLE;
-		schedule_work(&ab->phy_dis_work);
-	}
-
-	return 0;
-}
-
-static int ab8500_usb_set_host(struct usb_otg *otg, struct usb_bus *host)
-{
-	struct ab8500_usb *ab;
-
-	if (!otg)
-		return -ENODEV;
-
-	ab = phy_to_ab(otg->usb_phy);
-
-	ab->phy.otg->host = host;
-
-	/* Some drivers call this function in atomic context.
-	 * Do not update ab8500 registers directly till this
-	 * is fixed.
-	 */
-
-	if ((ab->mode != USB_IDLE) && !host) {
-		ab->mode = USB_IDLE;
-		schedule_work(&ab->phy_dis_work);
-	}
-
-	return 0;
-}
-
-static void ab8500_usb_restart_phy(struct ab8500_usb *ab)
-{
-	abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_USB, AB8500_USB_PHY_CTRL_REG,
-			AB8500_BIT_PHY_CTRL_DEVICE_EN,
-			AB8500_BIT_PHY_CTRL_DEVICE_EN);
-
-	udelay(100);
-
-	abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_USB, AB8500_USB_PHY_CTRL_REG,
-			AB8500_BIT_PHY_CTRL_DEVICE_EN,
-			0);
-
-	abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_USB, AB8500_USB_PHY_CTRL_REG,
-			AB8500_BIT_PHY_CTRL_HOST_EN,
-			AB8500_BIT_PHY_CTRL_HOST_EN);
-
-	udelay(100);
-
-	abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_USB, AB8500_USB_PHY_CTRL_REG,
-			AB8500_BIT_PHY_CTRL_HOST_EN,
-			0);
-}
-
-static int ab8500_usb_regulator_get(struct ab8500_usb *ab)
-{
-	int err;
-
-	ab->v_ape = devm_regulator_get(ab->dev, "v-ape");
-	if (IS_ERR(ab->v_ape)) {
-		dev_err(ab->dev, "Could not get v-ape supply\n");
-		err = PTR_ERR(ab->v_ape);
-		return err;
-	}
-
-	ab->v_ulpi = devm_regulator_get(ab->dev, "vddulpivio18");
-	if (IS_ERR(ab->v_ulpi)) {
-		dev_err(ab->dev, "Could not get vddulpivio18 supply\n");
-		err = PTR_ERR(ab->v_ulpi);
-		return err;
-	}
-
-	ab->v_musb = devm_regulator_get(ab->dev, "musb_1v8");
-	if (IS_ERR(ab->v_musb)) {
-		dev_err(ab->dev, "Could not get musb_1v8 supply\n");
-		err = PTR_ERR(ab->v_musb);
-		return err;
-	}
-
-	return 0;
-}
-
-static int ab8500_usb_irq_setup(struct platform_device *pdev,
-		struct ab8500_usb *ab)
-{
-	int err;
-	int irq;
-
-	if (ab->flags & AB8500_USB_FLAG_USE_LINK_STATUS_IRQ) {
-		irq = platform_get_irq_byname(pdev, "USB_LINK_STATUS");
-		if (irq < 0) {
-			dev_err(&pdev->dev, "Link status irq not found\n");
-			return irq;
-		}
-		err = devm_request_threaded_irq(&pdev->dev, irq, NULL,
-				ab8500_usb_link_status_irq,
-				IRQF_NO_SUSPEND | IRQF_SHARED | IRQF_ONESHOT,
-				"usb-link-status", ab);
-		if (err < 0) {
-			dev_err(ab->dev, "request_irq failed for link status irq\n");
-			return err;
-		}
-	}
-
-	if (ab->flags & AB8500_USB_FLAG_USE_ID_WAKEUP_IRQ) {
-		irq = platform_get_irq_byname(pdev, "ID_WAKEUP_F");
-		if (irq < 0) {
-			dev_err(&pdev->dev, "ID fall irq not found\n");
-			return irq;
-		}
-		err = devm_request_threaded_irq(&pdev->dev, irq, NULL,
-				ab8500_usb_disconnect_irq,
-				IRQF_NO_SUSPEND | IRQF_SHARED | IRQF_ONESHOT,
-				"usb-id-fall", ab);
-		if (err < 0) {
-			dev_err(ab->dev, "request_irq failed for ID fall irq\n");
-			return err;
-		}
-	}
-
-	if (ab->flags & AB8500_USB_FLAG_USE_VBUS_DET_IRQ) {
-		irq = platform_get_irq_byname(pdev, "VBUS_DET_F");
-		if (irq < 0) {
-			dev_err(&pdev->dev, "VBUS fall irq not found\n");
-			return irq;
-		}
-		err = devm_request_threaded_irq(&pdev->dev, irq, NULL,
-				ab8500_usb_disconnect_irq,
-				IRQF_NO_SUSPEND | IRQF_SHARED | IRQF_ONESHOT,
-				"usb-vbus-fall", ab);
-		if (err < 0) {
-			dev_err(ab->dev, "request_irq failed for Vbus fall irq\n");
-			return err;
-		}
-	}
-
-	return 0;
-}
-
-static void ab8500_usb_set_ab8500_tuning_values(struct ab8500_usb *ab)
-{
-	int err;
-
-	/* Enable the PBT/Bank 0x12 access */
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEVELOPMENT, AB8500_BANK12_ACCESS, 0x01);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to enable bank12 access err=%d\n",
-				err);
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE1, 0xC8);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE1 register err=%d\n",
-				err);
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE2, 0x00);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE2 register err=%d\n",
-				err);
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE3, 0x78);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE3 regester err=%d\n",
-				err);
-
-	/* Switch to normal mode/disable Bank 0x12 access */
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEVELOPMENT, AB8500_BANK12_ACCESS, 0x00);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to switch bank12 access err=%d\n",
-				err);
-}
-
-static void ab8500_usb_set_ab8505_tuning_values(struct ab8500_usb *ab)
-{
-	int err;
-
-	/* Enable the PBT/Bank 0x12 access */
-	err = abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_DEVELOPMENT, AB8500_BANK12_ACCESS,
-			0x01, 0x01);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to enable bank12 access err=%d\n",
-				err);
-
-	err = abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE1,
-			0xC8, 0xC8);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE1 register err=%d\n",
-				err);
-
-	err = abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE2,
-			0x60, 0x60);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE2 register err=%d\n",
-				err);
-
-	err = abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE3,
-			0xFC, 0x80);
-
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE3 regester err=%d\n",
-				err);
-
-	/* Switch to normal mode/disable Bank 0x12 access */
-	err = abx500_mask_and_set_register_interruptible(ab->dev,
-			AB8500_DEVELOPMENT, AB8500_BANK12_ACCESS,
-			0x00, 0x00);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to switch bank12 access err=%d\n",
-				err);
-}
-
-static void ab8500_usb_set_ab8540_tuning_values(struct ab8500_usb *ab)
-{
-	int err;
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8540_DEBUG, AB8500_USB_PHY_TUNE1, 0xCC);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE1 register ret=%d\n",
-				err);
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8540_DEBUG, AB8500_USB_PHY_TUNE2, 0x60);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE2 register ret=%d\n",
-				err);
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8540_DEBUG, AB8500_USB_PHY_TUNE3, 0x90);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE3 regester ret=%d\n",
-				err);
-}
-
-static void ab8500_usb_set_ab9540_tuning_values(struct ab8500_usb *ab)
-{
-	int err;
-
-	/* Enable the PBT/Bank 0x12 access */
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEVELOPMENT, AB8500_BANK12_ACCESS, 0x01);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to enable bank12 access err=%d\n",
-				err);
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE1, 0xC8);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE1 register err=%d\n",
-				err);
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE2, 0x60);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE2 register err=%d\n",
-				err);
-
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEBUG, AB8500_USB_PHY_TUNE3, 0x80);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to set PHY_TUNE3 regester err=%d\n",
-				err);
-
-	/* Switch to normal mode/disable Bank 0x12 access */
-	err = abx500_set_register_interruptible(ab->dev,
-			AB8500_DEVELOPMENT, AB8500_BANK12_ACCESS, 0x00);
-	if (err < 0)
-		dev_err(ab->dev, "Failed to switch bank12 access err=%d\n",
-				err);
-}
-
-static int ab8500_usb_probe(struct platform_device *pdev)
-{
-	struct ab8500_usb	*ab;
-	struct ab8500		*ab8500;
-	struct usb_otg		*otg;
-	int err;
-	int rev;
-
-	ab8500 = dev_get_drvdata(pdev->dev.parent);
-	rev = abx500_get_chip_id(&pdev->dev);
-
-	if (is_ab8500_1p1_or_earlier(ab8500)) {
-		dev_err(&pdev->dev, "Unsupported AB8500 chip rev=%d\n", rev);
-		return -ENODEV;
-	}
-
-	ab = devm_kzalloc(&pdev->dev, sizeof(*ab), GFP_KERNEL);
-	if (!ab)
-		return -ENOMEM;
-
-	otg = devm_kzalloc(&pdev->dev, sizeof(*otg), GFP_KERNEL);
-	if (!otg)
-		return -ENOMEM;
-
-	ab->dev			= &pdev->dev;
-	ab->ab8500		= ab8500;
-	ab->phy.dev		= ab->dev;
-	ab->phy.otg		= otg;
-	ab->phy.label		= "ab8500";
-	ab->phy.set_suspend	= ab8500_usb_set_suspend;
-	ab->phy.set_power	= ab8500_usb_set_power;
-	ab->phy.otg->state	= OTG_STATE_UNDEFINED;
-
-	otg->usb_phy		= &ab->phy;
-	otg->set_host		= ab8500_usb_set_host;
-	otg->set_peripheral	= ab8500_usb_set_peripheral;
-
-	if (is_ab8500(ab->ab8500)) {
-		ab->flags |= AB8500_USB_FLAG_USE_LINK_STATUS_IRQ |
-			AB8500_USB_FLAG_USE_ID_WAKEUP_IRQ |
-			AB8500_USB_FLAG_USE_VBUS_DET_IRQ |
-			AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE;
-	} else if (is_ab8505(ab->ab8500)) {
-		ab->flags |= AB8500_USB_FLAG_USE_LINK_STATUS_IRQ |
-			AB8500_USB_FLAG_USE_ID_WAKEUP_IRQ |
-			AB8500_USB_FLAG_USE_VBUS_DET_IRQ |
-			AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE;
-	} else if (is_ab8540(ab->ab8500)) {
-		ab->flags |= AB8500_USB_FLAG_USE_LINK_STATUS_IRQ |
-			AB8500_USB_FLAG_USE_CHECK_VBUS_STATUS |
-			AB8500_USB_FLAG_USE_VBUS_HOST_QUIRK |
-			AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE;
-	} else if (is_ab9540(ab->ab8500)) {
-		ab->flags |= AB8500_USB_FLAG_USE_LINK_STATUS_IRQ |
-			AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE;
-		if (is_ab9540_2p0_or_earlier(ab->ab8500))
-			ab->flags |= AB8500_USB_FLAG_USE_ID_WAKEUP_IRQ |
-				AB8500_USB_FLAG_USE_VBUS_DET_IRQ;
-	}
-
-	/* Disable regulator voltage setting for AB8500 <= v2.0 */
-	if (is_ab8500_2p0_or_earlier(ab->ab8500))
-		ab->flags &= ~AB8500_USB_FLAG_REGULATOR_SET_VOLTAGE;
-
-	platform_set_drvdata(pdev, ab);
-
-	/* all: Disable phy when called from set_host and set_peripheral */
-	INIT_WORK(&ab->phy_dis_work, ab8500_usb_phy_disable_work);
-
-	INIT_WORK(&ab->vbus_event_work, ab8500_usb_vbus_turn_on_event_work);
-
-	err = ab8500_usb_regulator_get(ab);
-	if (err)
-		return err;
-
-	ab->sysclk = devm_clk_get(ab->dev, "sysclk");
-	if (IS_ERR(ab->sysclk)) {
-		dev_err(ab->dev, "Could not get sysclk.\n");
-		return PTR_ERR(ab->sysclk);
-	}
-
-	err = ab8500_usb_irq_setup(pdev, ab);
-	if (err < 0)
-		return err;
-
-	err = usb_add_phy(&ab->phy, USB_PHY_TYPE_USB2);
-	if (err) {
-		dev_err(&pdev->dev, "Can't register transceiver\n");
-		return err;
-	}
-
-	if (is_ab8500(ab->ab8500) && !is_ab8500_2p0_or_earlier(ab->ab8500))
-		/* Phy tuning values for AB8500 > v2.0 */
-		ab8500_usb_set_ab8500_tuning_values(ab);
-	else if (is_ab8505(ab->ab8500))
-		/* Phy tuning values for AB8505 */
-		ab8500_usb_set_ab8505_tuning_values(ab);
-	else if (is_ab8540(ab->ab8500))
-		/* Phy tuning values for AB8540 */
-		ab8500_usb_set_ab8540_tuning_values(ab);
-	else if (is_ab9540(ab->ab8500))
-		/* Phy tuning values for AB9540 */
-		ab8500_usb_set_ab9540_tuning_values(ab);
-
-	/* Needed to enable ID detection. */
-	ab8500_usb_wd_workaround(ab);
-
-	/*
-	 * This is required for usb-link-status to work properly when a
-	 * cable is connected at boot time.
-	 */
-	ab8500_usb_restart_phy(ab);
-
-	if (ab->flags & AB8500_USB_FLAG_USE_CHECK_VBUS_STATUS) {
-		if (ab8500_usb_check_vbus_status(ab))
-			schedule_work(&ab->vbus_event_work);
-	}
-
-	abx500_usb_link_status_update(ab);
-
-	dev_info(&pdev->dev, "revision 0x%2x driver initialized\n", rev);
-
-	return 0;
-}
-
-static int ab8500_usb_remove(struct platform_device *pdev)
-{
-	struct ab8500_usb *ab = platform_get_drvdata(pdev);
-
-	cancel_work_sync(&ab->phy_dis_work);
-	cancel_work_sync(&ab->vbus_event_work);
-
-	usb_remove_phy(&ab->phy);
-
-	if (ab->mode == USB_HOST)
-		ab8500_usb_host_phy_dis(ab);
-	else if (ab->mode == USB_PERIPHERAL)
-		ab8500_usb_peri_phy_dis(ab);
-
-	return 0;
-}
-
-static const struct platform_device_id ab8500_usb_devtype[] = {
-	{ .name = "ab8500-usb", },
-	{ .name = "ab8540-usb", },
-	{ .name = "ab9540-usb", },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(platform, ab8500_usb_devtype);
-
-static struct platform_driver ab8500_usb_driver = {
-	.probe		= ab8500_usb_probe,
-	.remove		= ab8500_usb_remove,
-	.id_table	= ab8500_usb_devtype,
-	.driver		= {
-		.name	= "abx5x0-usb",
-	},
-};
-
-static int __init ab8500_usb_init(void)
-{
-	return platform_driver_register(&ab8500_usb_driver);
-}
-subsys_initcall(ab8500_usb_init);
-
-static void __exit ab8500_usb_exit(void)
-{
-	platform_driver_unregister(&ab8500_usb_driver);
-}
-module_exit(ab8500_usb_exit);
-
-MODULE_AUTHOR("ST-Ericsson AB");
-MODULE_DESCRIPTION("AB8500 family usb transceiver driver");
-MODULE_LICENSE("GPL");
+efine DVO_CONTROL__DVO_CTL3__SHIFT 0x1f
+#define DVO_CRC_EN__DVO_CRC2_EN_MASK 0x10000
+#define DVO_CRC_EN__DVO_CRC2_EN__SHIFT 0x10
+#define DVO_CRC2_SIG_MASK__DVO_CRC2_SIG_MASK_MASK 0x7ffffff
+#define DVO_CRC2_SIG_MASK__DVO_CRC2_SIG_MASK__SHIFT 0x0
+#define DVO_CRC2_SIG_RESULT__DVO_CRC2_SIG_RESULT_MASK 0x7ffffff
+#define DVO_CRC2_SIG_RESULT__DVO_CRC2_SIG_RESULT__SHIFT 0x0
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_LEVEL_ERROR_MASK 0x1
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_LEVEL_ERROR__SHIFT 0x0
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_USE_OVERWRITE_LEVEL_MASK 0x2
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_USE_OVERWRITE_LEVEL__SHIFT 0x1
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_OVERWRITE_LEVEL_MASK 0xfc
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_OVERWRITE_LEVEL__SHIFT 0x2
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_ERROR_ACK_MASK 0x100
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_ERROR_ACK__SHIFT 0x8
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_CAL_AVERAGE_LEVEL_MASK 0xfc00
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_CAL_AVERAGE_LEVEL__SHIFT 0xa
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_MAXIMUM_LEVEL_MASK 0xf0000
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_MAXIMUM_LEVEL__SHIFT 0x10
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_MINIMUM_LEVEL_MASK 0x3c00000
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_MINIMUM_LEVEL__SHIFT 0x16
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_CALIBRATED_MASK 0x20000000
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_CALIBRATED__SHIFT 0x1d
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_FORCE_RECAL_AVERAGE_MASK 0x40000000
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_FORCE_RECAL_AVERAGE__SHIFT 0x1e
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_FORCE_RECOMP_MINMAX_MASK 0x80000000
+#define DVO_FIFO_ERROR_STATUS__DVO_FIFO_FORCE_RECOMP_MINMAX__SHIFT 0x1f
+#define DVO_TEST_DEBUG_INDEX__DVO_TEST_DEBUG_INDEX_MASK 0xff
+#define DVO_TEST_DEBUG_INDEX__DVO_TEST_DEBUG_INDEX__SHIFT 0x0
+#define DVO_TEST_DEBUG_INDEX__DVO_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define DVO_TEST_DEBUG_INDEX__DVO_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define DVO_TEST_DEBUG_DATA__DVO_TEST_DEBUG_DATA_MASK 0xffffffff
+#define DVO_TEST_DEBUG_DATA__DVO_TEST_DEBUG_DATA__SHIFT 0x0
+#define FBC_CNTL__FBC_GRPH_COMP_EN_MASK 0x1
+#define FBC_CNTL__FBC_GRPH_COMP_EN__SHIFT 0x0
+#define FBC_CNTL__FBC_SRC_SEL_MASK 0xe
+#define FBC_CNTL__FBC_SRC_SEL__SHIFT 0x1
+#define FBC_CNTL__FBC_COHERENCY_MODE_MASK 0x30000
+#define FBC_CNTL__FBC_COHERENCY_MODE__SHIFT 0x10
+#define FBC_CNTL__FBC_SOFT_COMPRESS_EN_MASK 0x2000000
+#define FBC_CNTL__FBC_SOFT_COMPRESS_EN__SHIFT 0x19
+#define FBC_CNTL__FBC_EN_MASK 0x80000000
+#define FBC_CNTL__FBC_EN__SHIFT 0x1f
+#define FBC_IDLE_MASK__FBC_IDLE_MASK_MASK 0xffffffff
+#define FBC_IDLE_MASK__FBC_IDLE_MASK__SHIFT 0x0
+#define FBC_IDLE_FORCE_CLEAR_MASK__FBC_IDLE_FORCE_CLEAR_MASK_MASK 0xffffffff
+#define FBC_IDLE_FORCE_CLEAR_MASK__FBC_IDLE_FORCE_CLEAR_MASK__SHIFT 0x0
+#define FBC_START_STOP_DELAY__FBC_DECOMP_START_DELAY_MASK 0x1f
+#define FBC_START_STOP_DELAY__FBC_DECOMP_START_DELAY__SHIFT 0x0
+#define FBC_START_STOP_DELAY__FBC_DECOMP_STOP_DELAY_MASK 0x80
+#define FBC_START_STOP_DELAY__FBC_DECOMP_STOP_DELAY__SHIFT 0x7
+#define FBC_START_STOP_DELAY__FBC_COMP_START_DELAY_MASK 0x1f00
+#define FBC_START_STOP_DELAY__FBC_COMP_START_DELAY__SHIFT 0x8
+#define FBC_COMP_CNTL__FBC_MIN_COMPRESSION_MASK 0xf
+#define FBC_COMP_CNTL__FBC_MIN_COMPRESSION__SHIFT 0x0
+#define FBC_COMP_CNTL__FBC_DEPTH_MONO08_EN_MASK 0x10000
+#define FBC_COMP_CNTL__FBC_DEPTH_MONO08_EN__SHIFT 0x10
+#define FBC_COMP_CNTL__FBC_DEPTH_MONO16_EN_MASK 0x20000
+#define FBC_COMP_CNTL__FBC_DEPTH_MONO16_EN__SHIFT 0x11
+#define FBC_COMP_CNTL__FBC_DEPTH_RGB04_EN_MASK 0x40000
+#define FBC_COMP_CNTL__FBC_DEPTH_RGB04_EN__SHIFT 0x12
+#define FBC_COMP_CNTL__FBC_DEPTH_RGB08_EN_MASK 0x80000
+#define FBC_COMP_CNTL__FBC_DEPTH_RGB08_EN__SHIFT 0x13
+#define FBC_COMP_CNTL__FBC_DEPTH_RGB16_EN_MASK 0x100000
+#define FBC_COMP_CNTL__FBC_DEPTH_RGB16_EN__SHIFT 0x14
+#define FBC_COMP_MODE__FBC_RLE_EN_MASK 0x1
+#define FBC_COMP_MODE__FBC_RLE_EN__SHIFT 0x0
+#define FBC_COMP_MODE__FBC_DPCM4_RGB_EN_MASK 0x100
+#define FBC_COMP_MODE__FBC_DPCM4_RGB_EN__SHIFT 0x8
+#define FBC_COMP_MODE__FBC_DPCM8_RGB_EN_MASK 0x200
+#define FBC_COMP_MODE__FBC_DPCM8_RGB_EN__SHIFT 0x9
+#define FBC_COMP_MODE__FBC_DPCM4_YUV_EN_MASK 0x400
+#define FBC_COMP_MODE__FBC_DPCM4_YUV_EN__SHIFT 0xa
+#define FBC_COMP_MODE__FBC_DPCM8_YUV_EN_MASK 0x800
+#define FBC_COMP_MODE__FBC_DPCM8_YUV_EN__SHIFT 0xb
+#define FBC_COMP_MODE__FBC_IND_EN_MASK 0x10000
+#define FBC_COMP_MODE__FBC_IND_EN__SHIFT 0x10
+#define FBC_DEBUG0__FBC_PERF_MUX0_MASK 0xff
+#define FBC_DEBUG0__FBC_PERF_MUX0__SHIFT 0x0
+#define FBC_DEBUG0__FBC_PERF_MUX1_MASK 0xff00
+#define FBC_DEBUG0__FBC_PERF_MUX1__SHIFT 0x8
+#define FBC_DEBUG0__FBC_COMP_WAKE_DIS_MASK 0x10000
+#define FBC_DEBUG0__FBC_COMP_WAKE_DIS__SHIFT 0x10
+#define FBC_DEBUG0__FBC_DEBUG0_MASK 0xfe0000
+#define FBC_DEBUG0__FBC_DEBUG0__SHIFT 0x11
+#define FBC_DEBUG0__FBC_DEBUG_MUX_MASK 0xff000000
+#define FBC_DEBUG0__FBC_DEBUG_MUX__SHIFT 0x18
+#define FBC_DEBUG1__FBC_DEBUG1_MASK 0xffffffff
+#define FBC_DEBUG1__FBC_DEBUG1__SHIFT 0x0
+#define FBC_DEBUG2__FBC_DEBUG2_MASK 0xffffffff
+#define FBC_DEBUG2__FBC_DEBUG2__SHIFT 0x0
+#define FBC_IND_LUT0__FBC_IND_LUT0_MASK 0xffffff
+#define FBC_IND_LUT0__FBC_IND_LUT0__SHIFT 0x0
+#define FBC_IND_LUT1__FBC_IND_LUT1_MASK 0xffffff
+#define FBC_IND_LUT1__FBC_IND_LUT1__SHIFT 0x0
+#define FBC_IND_LUT2__FBC_IND_LUT2_MASK 0xffffff
+#define FBC_IND_LUT2__FBC_IND_LUT2__SHIFT 0x0
+#define FBC_IND_LUT3__FBC_IND_LUT3_MASK 0xffffff
+#define FBC_IND_LUT3__FBC_IND_LUT3__SHIFT 0x0
+#define FBC_IND_LUT4__FBC_IND_LUT4_MASK 0xffffff
+#define FBC_IND_LUT4__FBC_IND_LUT4__SHIFT 0x0
+#define FBC_IND_LUT5__FBC_IND_LUT5_MASK 0xffffff
+#define FBC_IND_LUT5__FBC_IND_LUT5__SHIFT 0x0
+#define FBC_IND_LUT6__FBC_IND_LUT6_MASK 0xffffff
+#define FBC_IND_LUT6__FBC_IND_LUT6__SHIFT 0x0
+#define FBC_IND_LUT7__FBC_IND_LUT7_MASK 0xffffff
+#define FBC_IND_LUT7__FBC_IND_LUT7__SHIFT 0x0
+#define FBC_IND_LUT8__FBC_IND_LUT8_MASK 0xffffff
+#define FBC_IND_LUT8__FBC_IND_LUT8__SHIFT 0x0
+#define FBC_IND_LUT9__FBC_IND_LUT9_MASK 0xffffff
+#define FBC_IND_LUT9__FBC_IND_LUT9__SHIFT 0x0
+#define FBC_IND_LUT10__FBC_IND_LUT10_MASK 0xffffff
+#define FBC_IND_LUT10__FBC_IND_LUT10__SHIFT 0x0
+#define FBC_IND_LUT11__FBC_IND_LUT11_MASK 0xffffff
+#define FBC_IND_LUT11__FBC_IND_LUT11__SHIFT 0x0
+#define FBC_IND_LUT12__FBC_IND_LUT12_MASK 0xffffff
+#define FBC_IND_LUT12__FBC_IND_LUT12__SHIFT 0x0
+#define FBC_IND_LUT13__FBC_IND_LUT13_MASK 0xffffff
+#define FBC_IND_LUT13__FBC_IND_LUT13__SHIFT 0x0
+#define FBC_IND_LUT14__FBC_IND_LUT14_MASK 0xffffff
+#define FBC_IND_LUT14__FBC_IND_LUT14__SHIFT 0x0
+#define FBC_IND_LUT15__FBC_IND_LUT15_MASK 0xffffff
+#define FBC_IND_LUT15__FBC_IND_LUT15__SHIFT 0x0
+#define FBC_CSM_REGION_OFFSET_01__FBC_CSM_REGION_OFFSET_0_MASK 0x3ff
+#define FBC_CSM_REGION_OFFSET_01__FBC_CSM_REGION_OFFSET_0__SHIFT 0x0
+#define FBC_CSM_REGION_OFFSET_01__FBC_CSM_REGION_OFFSET_1_MASK 0x3ff0000
+#define FBC_CSM_REGION_OFFSET_01__FBC_CSM_REGION_OFFSET_1__SHIFT 0x10
+#define FBC_CSM_REGION_OFFSET_23__FBC_CSM_REGION_OFFSET_2_MASK 0x3ff
+#define FBC_CSM_REGION_OFFSET_23__FBC_CSM_REGION_OFFSET_2__SHIFT 0x0
+#define FBC_CSM_REGION_OFFSET_23__FBC_CSM_REGION_OFFSET_3_MASK 0x3ff0000
+#define FBC_CSM_REGION_OFFSET_23__FBC_CSM_REGION_OFFSET_3__SHIFT 0x10
+#define FBC_CLIENT_REGION_MASK__FBC_MEMORY_REGION_MASK_MASK 0xf0000
+#define FBC_CLIENT_REGION_MASK__FBC_MEMORY_REGION_MASK__SHIFT 0x10
+#define FBC_DEBUG_COMP__FBC_COMP_SWAP_MASK 0x3
+#define FBC_DEBUG_COMP__FBC_COMP_SWAP__SHIFT 0x0
+#define FBC_DEBUG_COMP__FBC_COMP_RSIZE_MASK 0x8
+#define FBC_DEBUG_COMP__FBC_COMP_RSIZE__SHIFT 0x3
+#define FBC_DEBUG_COMP__FBC_COMP_BUSY_HYSTERESIS_MASK 0xf0
+#define FBC_DEBUG_COMP__FBC_COMP_BUSY_HYSTERESIS__SHIFT 0x4
+#define FBC_DEBUG_COMP__FBC_COMP_CLK_CNTL_MASK 0x300
+#define FBC_DEBUG_COMP__FBC_COMP_CLK_CNTL__SHIFT 0x8
+#define FBC_DEBUG_COMP__FBC_COMP_PRIVILEGED_ACCESS_ENABLE_MASK 0x400
+#define FBC_DEBUG_COMP__FBC_COMP_PRIVILEGED_ACCESS_ENABLE__SHIFT 0xa
+#define FBC_DEBUG_COMP__FBC_COMP_ADDRESS_TRANSLATION_ENABLE_MASK 0x800
+#define FBC_DEBUG_COMP__FBC_COMP_ADDRESS_TRANSLATION_ENABLE__SHIFT 0xb
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_ADDR_MASK 0x3ff
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_ADDR__SHIFT 0x0
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_WR_DATA_MASK 0x10000
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_WR_DATA__SHIFT 0x10
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_RD_DATA_MASK 0x20000
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_RD_DATA__SHIFT 0x11
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_EN_MASK 0x80000000
+#define FBC_DEBUG_CSR__FBC_DEBUG_CSR_EN__SHIFT 0x1f
+#define FBC_DEBUG_CSR_RDATA__FBC_DEBUG_CSR_RDATA_MASK 0xffffffff
+#define FBC_DEBUG_CSR_RDATA__FBC_DEBUG_CSR_RDATA__SHIFT 0x0
+#define FBC_DEBUG_CSR_WDATA__FBC_DEBUG_CSR_WDATA_MASK 0xffffffff
+#define FBC_DEBUG_CSR_WDATA__FBC_DEBUG_CSR_WDATA__SHIFT 0x0
+#define FBC_DEBUG_CSR_RDATA_HI__FBC_DEBUG_CSR_RDATA_HI_MASK 0xff
+#define FBC_DEBUG_CSR_RDATA_HI__FBC_DEBUG_CSR_RDATA_HI__SHIFT 0x0
+#define FBC_DEBUG_CSR_WDATA_HI__FBC_DEBUG_CSR_WDATA_HI_MASK 0xff
+#define FBC_DEBUG_CSR_WDATA_HI__FBC_DEBUG_CSR_WDATA_HI__SHIFT 0x0
+#define FBC_MISC__FBC_DECOMPRESS_ERROR_MASK 0x3
+#define FBC_MISC__FBC_DECOMPRESS_ERROR__SHIFT 0x0
+#define FBC_MISC__FBC_STOP_ON_ERROR_MASK 0x4
+#define FBC_MISC__FBC_STOP_ON_ERROR__SHIFT 0x2
+#define FBC_MISC__FBC_INVALIDATE_ON_ERROR_MASK 0x8
+#define FBC_MISC__FBC_INVALIDATE_ON_ERROR__SHIFT 0x3
+#define FBC_MISC__FBC_ERROR_PIXEL_MASK 0xf0
+#define FBC_MISC__FBC_ERROR_PIXEL__SHIFT 0x4
+#define FBC_MISC__FBC_DIVIDE_X_MASK 0x300
+#define FBC_MISC__FBC_DIVIDE_X__SHIFT 0x8
+#define FBC_MISC__FBC_DIVIDE_Y_MASK 0x400
+#define FBC_MISC__FBC_DIVIDE_Y__SHIFT 0xa
+#define FBC_MISC__FBC_RSM_WRITE_VALUE_MASK 0x800
+#define FBC_MISC__FBC_RSM_WRITE_VALUE__SHIFT 0xb
+#define FBC_MISC__FBC_RSM_UNCOMP_DATA_IMMEDIATELY_MASK 0x1000
+#define FBC_MISC__FBC_RSM_UNCOMP_DATA_IMMEDIATELY__SHIFT 0xc
+#define FBC_MISC__FBC_DECOMPRESS_ERROR_CLEAR_MASK 0x10000
+#define FBC_MISC__FBC_DECOMPRESS_ERROR_CLEAR__SHIFT 0x10
+#define FBC_MISC__FBC_RESET_AT_ENABLE_MASK 0x100000
+#define FBC_MISC__FBC_RESET_AT_ENABLE__SHIFT 0x14
+#define FBC_MISC__FBC_RESET_AT_DISABLE_MASK 0x200000
+#define FBC_MISC__FBC_RESET_AT_DISABLE__SHIFT 0x15
+#define FBC_MISC__FBC_SLOW_REQ_INTERVAL_MASK 0x1f000000
+#define FBC_MISC__FBC_SLOW_REQ_INTERVAL__SHIFT 0x18
+#define FBC_STATUS__FBC_ENABLE_STATUS_MASK 0x1
+#define FBC_STATUS__FBC_ENABLE_STATUS__SHIFT 0x0
+#define FBC_TEST_DEBUG_INDEX__FBC_TEST_DEBUG_INDEX_MASK 0xff
+#define FBC_TEST_DEBUG_INDEX__FBC_TEST_DEBUG_INDEX__SHIFT 0x0
+#define FBC_TEST_DEBUG_INDEX__FBC_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define FBC_TEST_DEBUG_INDEX__FBC_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define FBC_TEST_DEBUG_DATA__FBC_TEST_DEBUG_DATA_MASK 0xffffffff
+#define FBC_TEST_DEBUG_DATA__FBC_TEST_DEBUG_DATA__SHIFT 0x0
+#define FMT_CLAMP_COMPONENT_R__FMT_CLAMP_LOWER_R_MASK 0xffff
+#define FMT_CLAMP_COMPONENT_R__FMT_CLAMP_LOWER_R__SHIFT 0x0
+#define FMT_CLAMP_COMPONENT_R__FMT_CLAMP_UPPER_R_MASK 0xffff0000
+#define FMT_CLAMP_COMPONENT_R__FMT_CLAMP_UPPER_R__SHIFT 0x10
+#define FMT_CLAMP_COMPONENT_G__FMT_CLAMP_LOWER_G_MASK 0xffff
+#define FMT_CLAMP_COMPONENT_G__FMT_CLAMP_LOWER_G__SHIFT 0x0
+#define FMT_CLAMP_COMPONENT_G__FMT_CLAMP_UPPER_G_MASK 0xffff0000
+#define FMT_CLAMP_COMPONENT_G__FMT_CLAMP_UPPER_G__SHIFT 0x10
+#define FMT_CLAMP_COMPONENT_B__FMT_CLAMP_LOWER_B_MASK 0xffff
+#define FMT_CLAMP_COMPONENT_B__FMT_CLAMP_LOWER_B__SHIFT 0x0
+#define FMT_CLAMP_COMPONENT_B__FMT_CLAMP_UPPER_B_MASK 0xffff0000
+#define FMT_CLAMP_COMPONENT_B__FMT_CLAMP_UPPER_B__SHIFT 0x10
+#define FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_EN_MASK 0x1
+#define FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_EN__SHIFT 0x0
+#define FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_MODE_MASK 0x10
+#define FMT_DYNAMIC_EXP_CNTL__FMT_DYNAMIC_EXP_MODE__SHIFT 0x4
+#define FMT_CONTROL__FMT_STEREOSYNC_OVERRIDE_MASK 0x1
+#define FMT_CONTROL__FMT_STEREOSYNC_OVERRIDE__SHIFT 0x0
+#define FMT_CONTROL__FMT_STEREOSYNC_OVR_POL_MASK 0x10
+#define FMT_CONTROL__FMT_STEREOSYNC_OVR_POL__SHIFT 0x4
+#define FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_MAX_MASK 0xf00
+#define FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_MAX__SHIFT 0x8
+#define FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_BIT_SWAP_MASK 0x3000
+#define FMT_CONTROL__FMT_SPATIAL_DITHER_FRAME_COUNTER_BIT_SWAP__SHIFT 0xc
+#define FMT_CONTROL__FMT_PIXEL_ENCODING_MASK 0x10000
+#define FMT_CONTROL__FMT_PIXEL_ENCODING__SHIFT 0x10
+#define FMT_CONTROL__FMT_SUBSAMPLING_MODE_MASK 0x20000
+#define FMT_CONTROL__FMT_SUBSAMPLING_MODE__SHIFT 0x11
+#define FMT_CONTROL__FMT_SUBSAMPLING_ORDER_MASK 0x40000
+#define FMT_CONTROL__FMT_SUBSAMPLING_ORDER__SHIFT 0x12
+#define FMT_CONTROL__FMT_SRC_SELECT_MASK 0x7000000
+#define FMT_CONTROL__FMT_SRC_SELECT__SHIFT 0x18
+#define FMT_FORCE_OUTPUT_CNTL__FMT_FORCE_DATA_EN_MASK 0x1
+#define FMT_FORCE_OUTPUT_CNTL__FMT_FORCE_DATA_EN__SHIFT 0x0
+#define FMT_FORCE_OUTPUT_CNTL__FMT_FORCE_DATA_SEL_COLOR_MASK 0x700
+#define FMT_FORCE_OUTPUT_CNTL__FMT_FORCE_DATA_SEL_COLOR__SHIFT 0x8
+#define FMT_FORCE_OUTPUT_CNTL__FMT_FORCE_DATA_SEL_SLOT_MASK 0xf000
+#define FMT_FORCE_OUTPUT_CNTL__FMT_FORCE_DATA_SEL_SLOT__SHIFT 0xc
+#define FMT_FORCE_OUTPUT_CNTL__FMT_FORCE_DATA_ON_BLANKB_ONLY_MASK 0x10000
+#define FMT_FORCE_OUTPUT_CNTL__FMT_FORCE_DATA_ON_BLANKB_ONLY__SHIFT 0x10
+#define FMT_FORCE_DATA_0_1__FMT_FORCE_DATA0_MASK 0xffff
+#define FMT_FORCE_DATA_0_1__FMT_FORCE_DATA0__SHIFT 0x0
+#define FMT_FORCE_DATA_0_1__FMT_FORCE_DATA1_MASK 0xffff0000
+#define FMT_FORCE_DATA_0_1__FMT_FORCE_DATA1__SHIFT 0x10
+#define FMT_FORCE_DATA_2_3__FMT_FORCE_DATA2_MASK 0xffff
+#define FMT_FORCE_DATA_2_3__FMT_FORCE_DATA2__SHIFT 0x0
+#define FMT_FORCE_DATA_2_3__FMT_FORCE_DATA3_MASK 0xffff0000
+#define FMT_FORCE_DATA_2_3__FMT_FORCE_DATA3__SHIFT 0x10
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_EN_MASK 0x1
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_EN__SHIFT 0x0
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_MODE_MASK 0x2
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_MODE__SHIFT 0x1
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_DEPTH_MASK 0x30
+#define FMT_BIT_DEPTH_CONTROL__FMT_TRUNCATE_DEPTH__SHIFT 0x4
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_EN_MASK 0x100
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_EN__SHIFT 0x8
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_MODE_MASK 0x600
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_MODE__SHIFT 0x9
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_DEPTH_MASK 0x1800
+#define FMT_BIT_DEPTH_CONTROL__FMT_SPATIAL_DITHER_DEPTH__SHIFT 0xb
+#define FMT_BIT_DEPTH_CONTROL__FMT_FRAME_RANDOM_ENABLE_MASK 0x2000
+#define FMT_BIT_DEPTH_CONTROL__FMT_FRAME_RANDOM_ENABLE__SHIFT 0xd
+#define FMT_BIT_DEPTH_CONTROL__FMT_RGB_RANDOM_ENABLE_MASK 0x4000
+#define FMT_BIT_DEPTH_CONTROL__FMT_RGB_RANDOM_ENABLE__SHIFT 0xe
+#define FMT_BIT_DEPTH_CONTROL__FMT_HIGHPASS_RANDOM_ENABLE_MASK 0x8000
+#define FMT_BIT_DEPTH_CONTROL__FMT_HIGHPASS_RANDOM_ENABLE__SHIFT 0xf
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_EN_MASK 0x10000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_EN__SHIFT 0x10
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_DEPTH_MASK 0x60000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_DEPTH__SHIFT 0x11
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_OFFSET_MASK 0x600000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_OFFSET__SHIFT 0x15
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_LEVEL_MASK 0x1000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_LEVEL__SHIFT 0x18
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_RESET_MASK 0x2000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_TEMPORAL_DITHER_RESET__SHIFT 0x19
+#define FMT_BIT_DEPTH_CONTROL__FMT_25FRC_SEL_MASK 0xc000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_25FRC_SEL__SHIFT 0x1a
+#define FMT_BIT_DEPTH_CONTROL__FMT_50FRC_SEL_MASK 0x30000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_50FRC_SEL__SHIFT 0x1c
+#define FMT_BIT_DEPTH_CONTROL__FMT_75FRC_SEL_MASK 0xc0000000
+#define FMT_BIT_DEPTH_CONTROL__FMT_75FRC_SEL__SHIFT 0x1e
+#define FMT_DITHER_RAND_R_SEED__FMT_RAND_R_SEED_MASK 0xff
+#define FMT_DITHER_RAND_R_SEED__FMT_RAND_R_SEED__SHIFT 0x0
+#define FMT_DITHER_RAND_R_SEED__FMT_OFFSET_R_CR_MASK 0xffff0000
+#define FMT_DITHER_RAND_R_SEED__FMT_OFFSET_R_CR__SHIFT 0x10
+#define FMT_DITHER_RAND_G_SEED__FMT_RAND_G_SEED_MASK 0xff
+#define FMT_DITHER_RAND_G_SEED__FMT_RAND_G_SEED__SHIFT 0x0
+#define FMT_DITHER_RAND_G_SEED__FMT_OFFSET_G_Y_MASK 0xffff0000
+#define FMT_DITHER_RAND_G_SEED__FMT_OFFSET_G_Y__SHIFT 0x10
+#define FMT_DITHER_RAND_B_SEED__FMT_RAND_B_SEED_MASK 0xff
+#define FMT_DITHER_RAND_B_SEED__FMT_RAND_B_SEED__SHIFT 0x0
+#define FMT_DITHER_RAND_B_SEED__FMT_OFFSET_B_CB_MASK 0xffff0000
+#define FMT_DITHER_RAND_B_SEED__FMT_OFFSET_B_CB__SHIFT 0x10
+#define FMT_TEMPORAL_DITHER_PATTERN_CONTROL__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_SELECT_MASK 0x1
+#define FMT_TEMPORAL_DITHER_PATTERN_CONTROL__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_SELECT__SHIFT 0x0
+#define FMT_TEMPORAL_DITHER_PATTERN_CONTROL__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_RGB1_BGR0_MASK 0x10
+#define FMT_TEMPORAL_DITHER_PATTERN_CONTROL__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_RGB1_BGR0__SHIFT 0x4
+#define FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX_MASK 0xffffffff
+#define FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX__SHIFT 0x0
+#define FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX_MASK 0xffffffff
+#define FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX__FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX__SHIFT 0x0
+#define FMT_CLAMP_CNTL__FMT_CLAMP_DATA_EN_MASK 0x1
+#define FMT_CLAMP_CNTL__FMT_CLAMP_DATA_EN__SHIFT 0x0
+#define FMT_CLAMP_CNTL__FMT_CLAMP_COLOR_FORMAT_MASK 0x70000
+#define FMT_CLAMP_CNTL__FMT_CLAMP_COLOR_FORMAT__SHIFT 0x10
+#define FMT_CRC_CNTL__FMT_CRC_EN_MASK 0x1
+#define FMT_CRC_CNTL__FMT_CRC_EN__SHIFT 0x0
+#define FMT_CRC_CNTL__FMT_DTMTEST_CRC_EN_MASK 0x2
+#define FMT_CRC_CNTL__FMT_DTMTEST_CRC_EN__SHIFT 0x1
+#define FMT_CRC_CNTL__FMT_CRC_CONT_EN_MASK 0x10
+#define FMT_CRC_CNTL__FMT_CRC_CONT_EN__SHIFT 0x4
+#define FMT_CRC_CNTL__FMT_CRC_ONLY_BLANKB_MASK 0x100
+#define FMT_CRC_CNTL__FMT_CRC_ONLY_BLANKB__SHIFT 0x8
+#define FMT_CRC_CNTL__FMT_CRC_INTERLACE_MODE_MASK 0x3000
+#define FMT_CRC_CNTL__FMT_CRC_INTERLACE_MODE__SHIFT 0xc
+#define FMT_CRC_CNTL__FMT_CRC_USE_NEW_AND_REPEATED_PIXELS_MASK 0x10000
+#define FMT_CRC_CNTL__FMT_CRC_USE_NEW_AND_REPEATED_PIXELS__SHIFT 0x10
+#define FMT_CRC_CNTL__FMT_CRC_EVEN_ODD_PIX_ENABLE_MASK 0x100000
+#define FMT_CRC_CNTL__FMT_CRC_EVEN_ODD_PIX_ENABLE__SHIFT 0x14
+#define FMT_CRC_CNTL__FMT_CRC_EVEN_ODD_PIX_SELECT_MASK 0x1000000
+#define FMT_CRC_CNTL__FMT_CRC_EVEN_ODD_PIX_SELECT__SHIFT 0x18
+#define FMT_CRC_SIG_RED_GREEN_MASK__FMT_CRC_SIG_RED_MASK_MASK 0xffff
+#define FMT_CRC_SIG_RED_GREEN_MASK__FMT_CRC_SIG_RED_MASK__SHIFT 0x0
+#define FMT_CRC_SIG_RED_GREEN_MASK__FMT_CRC_SIG_GREEN_MASK_MASK 0xffff0000
+#define FMT_CRC_SIG_RED_GREEN_MASK__FMT_CRC_SIG_GREEN_MASK__SHIFT 0x10
+#define FMT_CRC_SIG_BLUE_CONTROL_MASK__FMT_CRC_SIG_BLUE_MASK_MASK 0xffff
+#define FMT_CRC_SIG_BLUE_CONTROL_MASK__FMT_CRC_SIG_BLUE_MASK__SHIFT 0x0
+#define FMT_CRC_SIG_BLUE_CONTROL_MASK__FMT_CRC_SIG_CONTROL_MASK_MASK 0xffff0000
+#define FMT_CRC_SIG_BLUE_CONTROL_MASK__FMT_CRC_SIG_CONTROL_MASK__SHIFT 0x10
+#define FMT_CRC_SIG_RED_GREEN__FMT_CRC_SIG_RED_MASK 0xffff
+#define FMT_CRC_SIG_RED_GREEN__FMT_CRC_SIG_RED__SHIFT 0x0
+#define FMT_CRC_SIG_RED_GREEN__FMT_CRC_SIG_GREEN_MASK 0xffff0000
+#define FMT_CRC_SIG_RED_GREEN__FMT_CRC_SIG_GREEN__SHIFT 0x10
+#define FMT_CRC_SIG_BLUE_CONTROL__FMT_CRC_SIG_BLUE_MASK 0xffff
+#define FMT_CRC_SIG_BLUE_CONTROL__FMT_CRC_SIG_BLUE__SHIFT 0x0
+#define FMT_CRC_SIG_BLUE_CONTROL__FMT_CRC_SIG_CONTROL_MASK 0xffff0000
+#define FMT_CRC_SIG_BLUE_CONTROL__FMT_CRC_SIG_CONTROL__SHIFT 0x10
+#define FMT_DEBUG_CNTL__FMT_DEBUG_COLOR_SELECT_MASK 0x3
+#define FMT_DEBUG_CNTL__FMT_DEBUG_COLOR_SELECT__SHIFT 0x0
+#define FMT_TEST_DEBUG_INDEX__FMT_TEST_DEBUG_INDEX_MASK 0xff
+#define FMT_TEST_DEBUG_INDEX__FMT_TEST_DEBUG_INDEX__SHIFT 0x0
+#define FMT_TEST_DEBUG_INDEX__FMT_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define FMT_TEST_DEBUG_INDEX__FMT_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define FMT_TEST_DEBUG_DATA__FMT_TEST_DEBUG_DATA_MASK 0xffffffff
+#define FMT_TEST_DEBUG_DATA__FMT_TEST_DEBUG_DATA__SHIFT 0x0
+#define FMT_DEBUG0__FMT_DEBUG0_MASK 0xffffffff
+#define FMT_DEBUG0__FMT_DEBUG0__SHIFT 0x0
+#define FMT_DEBUG1__FMT_DEBUG1_MASK 0xffffffff
+#define FMT_DEBUG1__FMT_DEBUG1__SHIFT 0x0
+#define FMT_DEBUG2__FMT_DEBUG2_MASK 0xffffffff
+#define FMT_DEBUG2__FMT_DEBUG2__SHIFT 0x0
+#define FMT_DEBUG_ID__FMT_DEBUG_ID_MASK 0xffffffff
+#define FMT_DEBUG_ID__FMT_DEBUG_ID__SHIFT 0x0
+#define LB_DATA_FORMAT__PIXEL_DEPTH_MASK 0x3
+#define LB_DATA_FORMAT__PIXEL_DEPTH__SHIFT 0x0
+#define LB_DATA_FORMAT__PIXEL_EXPAN_MODE_MASK 0x4
+#define LB_DATA_FORMAT__PIXEL_EXPAN_MODE__SHIFT 0x2
+#define LB_DATA_FORMAT__INTERLEAVE_EN_MASK 0x8
+#define LB_DATA_FORMAT__INTERLEAVE_EN__SHIFT 0x3
+#define LB_DATA_FORMAT__PIXEL_REDUCE_MODE_MASK 0x10
+#define LB_DATA_FORMAT__PIXEL_REDUCE_MODE__SHIFT 0x4
+#define LB_DATA_FORMAT__DYNAMIC_PIXEL_DEPTH_MASK 0x20
+#define LB_DATA_FORMAT__DYNAMIC_PIXEL_DEPTH__SHIFT 0x5
+#define LB_DATA_FORMAT__PREFETCH_MASK 0x1000
+#define LB_DATA_FORMAT__PREFETCH__SHIFT 0xc
+#define LB_DATA_FORMAT__REQUEST_MODE_MASK 0x1000000
+#define LB_DATA_FORMAT__REQUEST_MODE__SHIFT 0x18
+#define LB_DATA_FORMAT__ALPHA_EN_MASK 0x80000000
+#define LB_DATA_FORMAT__ALPHA_EN__SHIFT 0x1f
+#define LB_MEMORY_CTRL__LB_MEMORY_SIZE_MASK 0xfff
+#define LB_MEMORY_CTRL__LB_MEMORY_SIZE__SHIFT 0x0
+#define LB_MEMORY_CTRL__LB_NUM_PARTITIONS_MASK 0xf0000
+#define LB_MEMORY_CTRL__LB_NUM_PARTITIONS__SHIFT 0x10
+#define LB_MEMORY_CTRL__LB_MEMORY_CONFIG_MASK 0x300000
+#define LB_MEMORY_CTRL__LB_MEMORY_CONFIG__SHIFT 0x14
+#define LB_MEMORY_SIZE_STATUS__LB_MEMORY_SIZE_STATUS_MASK 0xfff
+#define LB_MEMORY_SIZE_STATUS__LB_MEMORY_SIZE_STATUS__SHIFT 0x0
+#define LB_DESKTOP_HEIGHT__DESKTOP_HEIGHT_MASK 0x7fff
+#define LB_DESKTOP_HEIGHT__DESKTOP_HEIGHT__SHIFT 0x0
+#define LB_VLINE_START_END__VLINE_START_MASK 0x3fff
+#define LB_VLINE_START_END__VLINE_START__SHIFT 0x0
+#define LB_VLINE_START_END__VLINE_END_MASK 0x7fff0000
+#define LB_VLINE_START_END__VLINE_END__SHIFT 0x10
+#define LB_VLINE_START_END__VLINE_INV_MASK 0x80000000
+#define LB_VLINE_START_END__VLINE_INV__SHIFT 0x1f
+#define LB_VLINE2_START_END__VLINE2_START_MASK 0x3fff
+#define LB_VLINE2_START_END__VLINE2_START__SHIFT 0x0
+#define LB_VLINE2_START_END__VLINE2_END_MASK 0x7fff0000
+#define LB_VLINE2_START_END__VLINE2_END__SHIFT 0x10
+#define LB_VLINE2_START_END__VLINE2_INV_MASK 0x80000000
+#define LB_VLINE2_START_END__VLINE2_INV__SHIFT 0x1f
+#define LB_V_COUNTER__V_COUNTER_MASK 0x7fff
+#define LB_V_COUNTER__V_COUNTER__SHIFT 0x0
+#define LB_SNAPSHOT_V_COUNTER__SNAPSHOT_V_COUNTER_MASK 0x7fff
+#define LB_SNAPSHOT_V_COUNTER__SNAPSHOT_V_COUNTER__SHIFT 0x0
+#define LB_INTERRUPT_MASK__VBLANK_INTERRUPT_MASK_MASK 0x1
+#define LB_INTERRUPT_MASK__VBLANK_INTERRUPT_MASK__SHIFT 0x0
+#define LB_INTERRUPT_MASK__VLINE_INTERRUPT_MASK_MASK 0x10
+#define LB_INTERRUPT_MASK__VLINE_INTERRUPT_MASK__SHIFT 0x4
+#define LB_INTERRUPT_MASK__VLINE2_INTERRUPT_MASK_MASK 0x100
+#define LB_INTERRUPT_MASK__VLINE2_INTERRUPT_MASK__SHIFT 0x8
+#define LB_VLINE_STATUS__VLINE_OCCURRED_MASK 0x1
+#define LB_VLINE_STATUS__VLINE_OCCURRED__SHIFT 0x0
+#define LB_VLINE_STATUS__VLINE_ACK_MASK 0x10
+#define LB_VLINE_STATUS__VLINE_ACK__SHIFT 0x4
+#define LB_VLINE_STATUS__VLINE_STAT_MASK 0x1000
+#define LB_VLINE_STATUS__VLINE_STAT__SHIFT 0xc
+#define LB_VLINE_STATUS__VLINE_INTERRUPT_MASK 0x10000
+#define LB_VLINE_STATUS__VLINE_INTERRUPT__SHIFT 0x10
+#define LB_VLINE_STATUS__VLINE_INTERRUPT_TYPE_MASK 0x20000
+#define LB_VLINE_STATUS__VLINE_INTERRUPT_TYPE__SHIFT 0x11
+#define LB_VLINE2_STATUS__VLINE2_OCCURRED_MASK 0x1
+#define LB_VLINE2_STATUS__VLINE2_OCCURRED__SHIFT 0x0
+#define LB_VLINE2_STATUS__VLINE2_ACK_MASK 0x10
+#define LB_VLINE2_STATUS__VLINE2_ACK__SHIFT 0x4
+#define LB_VLINE2_STATUS__VLINE2_STAT_MASK 0x1000
+#define LB_VLINE2_STATUS__VLINE2_STAT__SHIFT 0xc
+#define LB_VLINE2_STATUS__VLINE2_INTERRUPT_MASK 0x10000
+#define LB_VLINE2_STATUS__VLINE2_INTERRUPT__SHIFT 0x10
+#define LB_VLINE2_STATUS__VLINE2_INTERRUPT_TYPE_MASK 0x20000
+#define LB_VLINE2_STATUS__VLINE2_INTERRUPT_TYPE__SHIFT 0x11
+#define LB_VBLANK_STATUS__VBLANK_OCCURRED_MASK 0x1
+#define LB_VBLANK_STATUS__VBLANK_OCCURRED__SHIFT 0x0
+#define LB_VBLANK_STATUS__VBLANK_ACK_MASK 0x10
+#define LB_VBLANK_STATUS__VBLANK_ACK__SHIFT 0x4
+#define LB_VBLANK_STATUS__VBLANK_STAT_MASK 0x1000
+#define LB_VBLANK_STATUS__VBLANK_STAT__SHIFT 0xc
+#define LB_VBLANK_STATUS__VBLANK_INTERRUPT_MASK 0x10000
+#define LB_VBLANK_STATUS__VBLANK_INTERRUPT__SHIFT 0x10
+#define LB_VBLANK_STATUS__VBLANK_INTERRUPT_TYPE_MASK 0x20000
+#define LB_VBLANK_STATUS__VBLANK_INTERRUPT_TYPE__SHIFT 0x11
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_SEL_MASK 0x3
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_SEL__SHIFT 0x0
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_SEL2_MASK 0x10
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_SEL2__SHIFT 0x4
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_DELAY_MASK 0xff00
+#define LB_SYNC_RESET_SEL__LB_SYNC_RESET_DELAY__SHIFT 0x8
+#define LB_SYNC_RESET_SEL__LB_SYNC_DURATION_MASK 0xc00000
+#define LB_SYNC_RESET_SEL__LB_SYNC_DURATION__SHIFT 0x16
+#define LB_BLACK_KEYER_R_CR__LB_BLACK_KEYER_R_CR_MASK 0xfff0
+#define LB_BLACK_KEYER_R_CR__LB_BLACK_KEYER_R_CR__SHIFT 0x4
+#define LB_BLACK_KEYER_G_Y__LB_BLACK_KEYER_G_Y_MASK 0xfff0
+#define LB_BLACK_KEYER_G_Y__LB_BLACK_KEYER_G_Y__SHIFT 0x4
+#define LB_BLACK_KEYER_B_CB__LB_BLACK_KEYER_B_CB_MASK 0xfff0
+#define LB_BLACK_KEYER_B_CB__LB_BLACK_KEYER_B_CB__SHIFT 0x4
+#define LB_KEYER_COLOR_CTRL__LB_KEYER_COLOR_EN_MASK 0x1
+#define LB_KEYER_COLOR_CTRL__LB_KEYER_COLOR_EN__SHIFT 0x0
+#define LB_KEYER_COLOR_CTRL__LB_KEYER_COLOR_REP_EN_MASK 0x100
+#define LB_KEYER_COLOR_CTRL__LB_KEYER_COLOR_REP_EN__SHIFT 0x8
+#define LB_KEYER_COLOR_R_CR__LB_KEYER_COLOR_R_CR_MASK 0xfff0
+#define LB_KEYER_COLOR_R_CR__LB_KEYER_COLOR_R_CR__SHIFT 0x4
+#define LB_KEYER_COLOR_G_Y__LB_KEYER_COLOR_G_Y_MASK 0xfff0
+#define LB_KEYER_COLOR_G_Y__LB_KEYER_COLOR_G_Y__SHIFT 0x4
+#define LB_KEYER_COLOR_B_CB__LB_KEYER_COLOR_B_CB_MASK 0xfff0
+#define LB_KEYER_COLOR_B_CB__LB_KEYER_COLOR_B_CB__SHIFT 0x4
+#define LB_KEYER_COLOR_REP_R_CR__LB_KEYER_COLOR_REP_R_CR_MASK 0xfff0
+#define LB_KEYER_COLOR_REP_R_CR__LB_KEYER_COLOR_REP_R_CR__SHIFT 0x4
+#define LB_KEYER_COLOR_REP_G_Y__LB_KEYER_COLOR_REP_G_Y_MASK 0xfff0
+#define LB_KEYER_COLOR_REP_G_Y__LB_KEYER_COLOR_REP_G_Y__SHIFT 0x4
+#define LB_KEYER_COLOR_REP_B_CB__LB_KEYER_COLOR_REP_B_CB_MASK 0xfff0
+#define LB_KEYER_COLOR_REP_B_CB__LB_KEYER_COLOR_REP_B_CB__SHIFT 0x4
+#define LB_BUFFER_LEVEL_STATUS__REQ_FIFO_LEVEL_MASK 0x3f
+#define LB_BUFFER_LEVEL_STATUS__REQ_FIFO_LEVEL__SHIFT 0x0
+#define LB_BUFFER_LEVEL_STATUS__REQ_FIFO_FULL_CNTL_MASK 0xfc00
+#define LB_BUFFER_LEVEL_STATUS__REQ_FIFO_FULL_CNTL__SHIFT 0xa
+#define LB_BUFFER_LEVEL_STATUS__DATA_BUFFER_LEVEL_MASK 0xfff0000
+#define LB_BUFFER_LEVEL_STATUS__DATA_BUFFER_LEVEL__SHIFT 0x10
+#define LB_BUFFER_LEVEL_STATUS__DATA_FIFO_FULL_CNTL_MASK 0xf0000000
+#define LB_BUFFER_LEVEL_STATUS__DATA_FIFO_FULL_CNTL__SHIFT 0x1c
+#define LB_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_ON_MASK 0xfff
+#define LB_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_ON__SHIFT 0x0
+#define LB_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_OFF_MASK 0xfff0000
+#define LB_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_OFF__SHIFT 0x10
+#define LB_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_LEVEL_MASK 0xfff
+#define LB_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_LEVEL__SHIFT 0x0
+#define LB_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_STAT_MASK 0x10000
+#define LB_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_STAT__SHIFT 0x10
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_MARGIN_MASK 0xf
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_MARGIN__SHIFT 0x0
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_STAT_MASK 0x10
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_STAT__SHIFT 0x4
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_OCCURRED_MASK 0x100
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_OCCURRED__SHIFT 0x8
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_ACK_MASK 0x1000
+#define LB_BUFFER_STATUS__LB_BUFFER_EMPTY_ACK__SHIFT 0xc
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_STAT_MASK 0x10000
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_STAT__SHIFT 0x10
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_OCCURRED_MASK 0x100000
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_OCCURRED__SHIFT 0x14
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_ACK_MASK 0x1000000
+#define LB_BUFFER_STATUS__LB_BUFFER_FULL_ACK__SHIFT 0x18
+#define LB_NO_OUTSTANDING_REQ_STATUS__LB_NO_OUTSTANDING_REQ_STAT_MASK 0x1
+#define LB_NO_OUTSTANDING_REQ_STATUS__LB_NO_OUTSTANDING_REQ_STAT__SHIFT 0x0
+#define MVP_AFR_FLIP_MODE__MVP_AFR_FLIP_MODE_MASK 0x3
+#define MVP_AFR_FLIP_MODE__MVP_AFR_FLIP_MODE__SHIFT 0x0
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_NUM_ENTRIES_MASK 0xf
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_NUM_ENTRIES__SHIFT 0x0
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_MASK 0x10
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET__SHIFT 0x4
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_FLAG_MASK 0x100
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_FLAG__SHIFT 0x8
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_ACK_MASK 0x1000
+#define MVP_AFR_FLIP_FIFO_CNTL__MVP_AFR_FLIP_FIFO_RESET_ACK__SHIFT 0xc
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_INSERT_MODE_MASK 0x3
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_INSERT_MODE__SHIFT 0x0
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_INSERT_MASK 0x7fff00
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_INSERT__SHIFT 0x8
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_OFFSET_MASK 0x3f000000
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_LINE_NUM_OFFSET__SHIFT 0x18
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_AUTO_ENABLE_MASK 0x40000000
+#define MVP_FLIP_LINE_NUM_INSERT__MVP_FLIP_AUTO_ENABLE__SHIFT 0x1e
+#define DC_MVP_LB_CONTROL__MVP_SWAP_LOCK_IN_MODE_MASK 0x3
+#define DC_MVP_LB_CONTROL__MVP_SWAP_LOCK_IN_MODE__SHIFT 0x0
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_SEL_MASK 0x100
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_SEL__SHIFT 0x8
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_FORCE_ONE_MASK 0x1000
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_FORCE_ONE__SHIFT 0xc
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_FORCE_ZERO_MASK 0x10000
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_OUT_FORCE_ZERO__SHIFT 0x10
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_STATUS_MASK 0x100000
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_STATUS__SHIFT 0x14
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_IN_CAP_MASK 0x10000000
+#define DC_MVP_LB_CONTROL__DC_MVP_SWAP_LOCK_IN_CAP__SHIFT 0x1c
+#define DC_MVP_LB_CONTROL__DC_MVP_SPARE_FLOPS_MASK 0x80000000
+#define DC_MVP_LB_CONTROL__DC_MVP_SPARE_FLOPS__SHIFT 0x1f
+#define LB_DEBUG__LB_DEBUG_MASK 0xffffffff
+#define LB_DEBUG__LB_DEBUG__SHIFT 0x0
+#define LB_DEBUG2__LB_DEBUG2_MASK 0xffffffff
+#define LB_DEBUG2__LB_DEBUG2__SHIFT 0x0
+#define LB_DEBUG3__LB_DEBUG3_MASK 0xffffffff
+#define LB_DEBUG3__LB_DEBUG3__SHIFT 0x0
+#define LB_TEST_DEBUG_INDEX__LB_TEST_DEBUG_INDEX_MASK 0xff
+#define LB_TEST_DEBUG_INDEX__LB_TEST_DEBUG_INDEX__SHIFT 0x0
+#define LB_TEST_DEBUG_INDEX__LB_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define LB_TEST_DEBUG_INDEX__LB_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define LB_TEST_DEBUG_DATA__LB_TEST_DEBUG_DATA_MASK 0xffffffff
+#define LB_TEST_DEBUG_DATA__LB_TEST_DEBUG_DATA__SHIFT 0x0
+#define LBV_DATA_FORMAT__PIXEL_DEPTH_MASK 0x3
+#define LBV_DATA_FORMAT__PIXEL_DEPTH__SHIFT 0x0
+#define LBV_DATA_FORMAT__PIXEL_EXPAN_MODE_MASK 0x4
+#define LBV_DATA_FORMAT__PIXEL_EXPAN_MODE__SHIFT 0x2
+#define LBV_DATA_FORMAT__INTERLEAVE_EN_MASK 0x8
+#define LBV_DATA_FORMAT__INTERLEAVE_EN__SHIFT 0x3
+#define LBV_DATA_FORMAT__PIXEL_REDUCE_MODE_MASK 0x10
+#define LBV_DATA_FORMAT__PIXEL_REDUCE_MODE__SHIFT 0x4
+#define LBV_DATA_FORMAT__DYNAMIC_PIXEL_DEPTH_MASK 0x20
+#define LBV_DATA_FORMAT__DYNAMIC_PIXEL_DEPTH__SHIFT 0x5
+#define LBV_DATA_FORMAT__DITHER_EN_MASK 0x40
+#define LBV_DATA_FORMAT__DITHER_EN__SHIFT 0x6
+#define LBV_DATA_FORMAT__DOWNSCALE_PREFETCH_EN_MASK 0x80
+#define LBV_DATA_FORMAT__DOWNSCALE_PREFETCH_EN__SHIFT 0x7
+#define LBV_DATA_FORMAT__PREFETCH_MASK 0x1000
+#define LBV_DATA_FORMAT__PREFETCH__SHIFT 0xc
+#define LBV_DATA_FORMAT__REQUEST_MODE_MASK 0x1000000
+#define LBV_DATA_FORMAT__REQUEST_MODE__SHIFT 0x18
+#define LBV_DATA_FORMAT__ALPHA_EN_MASK 0x80000000
+#define LBV_DATA_FORMAT__ALPHA_EN__SHIFT 0x1f
+#define LBV_MEMORY_CTRL__LB_MEMORY_SIZE_MASK 0xfff
+#define LBV_MEMORY_CTRL__LB_MEMORY_SIZE__SHIFT 0x0
+#define LBV_MEMORY_CTRL__LB_NUM_PARTITIONS_MASK 0xf0000
+#define LBV_MEMORY_CTRL__LB_NUM_PARTITIONS__SHIFT 0x10
+#define LBV_MEMORY_CTRL__LB_MEMORY_CONFIG_MASK 0x300000
+#define LBV_MEMORY_CTRL__LB_MEMORY_CONFIG__SHIFT 0x14
+#define LBV_MEMORY_SIZE_STATUS__LB_MEMORY_SIZE_STATUS_MASK 0xfff
+#define LBV_MEMORY_SIZE_STATUS__LB_MEMORY_SIZE_STATUS__SHIFT 0x0
+#define LBV_DESKTOP_HEIGHT__DESKTOP_HEIGHT_MASK 0x7fff
+#define LBV_DESKTOP_HEIGHT__DESKTOP_HEIGHT__SHIFT 0x0
+#define LBV_VLINE_START_END__VLINE_START_MASK 0x3fff
+#define LBV_VLINE_START_END__VLINE_START__SHIFT 0x0
+#define LBV_VLINE_START_END__VLINE_END_MASK 0x7fff0000
+#define LBV_VLINE_START_END__VLINE_END__SHIFT 0x10
+#define LBV_VLINE_START_END__VLINE_INV_MASK 0x80000000
+#define LBV_VLINE_START_END__VLINE_INV__SHIFT 0x1f
+#define LBV_VLINE2_START_END__VLINE2_START_MASK 0x3fff
+#define LBV_VLINE2_START_END__VLINE2_START__SHIFT 0x0
+#define LBV_VLINE2_START_END__VLINE2_END_MASK 0x7fff0000
+#define LBV_VLINE2_START_END__VLINE2_END__SHIFT 0x10
+#define LBV_VLINE2_START_END__VLINE2_INV_MASK 0x80000000
+#define LBV_VLINE2_START_END__VLINE2_INV__SHIFT 0x1f
+#define LBV_V_COUNTER__V_COUNTER_MASK 0x7fff
+#define LBV_V_COUNTER__V_COUNTER__SHIFT 0x0
+#define LBV_SNAPSHOT_V_COUNTER__SNAPSHOT_V_COUNTER_MASK 0x7fff
+#define LBV_SNAPSHOT_V_COUNTER__SNAPSHOT_V_COUNTER__SHIFT 0x0
+#define LBV_V_COUNTER_CHROMA__V_COUNTER_CHROMA_MASK 0x7fff
+#define LBV_V_COUNTER_CHROMA__V_COUNTER_CHROMA__SHIFT 0x0
+#define LBV_SNAPSHOT_V_COUNTER_CHROMA__SNAPSHOT_V_COUNTER_CHROMA_MASK 0x7fff
+#define LBV_SNAPSHOT_V_COUNTER_CHROMA__SNAPSHOT_V_COUNTER_CHROMA__SHIFT 0x0
+#define LBV_INTERRUPT_MASK__VBLANK_INTERRUPT_MASK_MASK 0x1
+#define LBV_INTERRUPT_MASK__VBLANK_INTERRUPT_MASK__SHIFT 0x0
+#define LBV_INTERRUPT_MASK__VLINE_INTERRUPT_MASK_MASK 0x10
+#define LBV_INTERRUPT_MASK__VLINE_INTERRUPT_MASK__SHIFT 0x4
+#define LBV_INTERRUPT_MASK__VLINE2_INTERRUPT_MASK_MASK 0x100
+#define LBV_INTERRUPT_MASK__VLINE2_INTERRUPT_MASK__SHIFT 0x8
+#define LBV_VLINE_STATUS__VLINE_OCCURRED_MASK 0x1
+#define LBV_VLINE_STATUS__VLINE_OCCURRED__SHIFT 0x0
+#define LBV_VLINE_STATUS__VLINE_ACK_MASK 0x10
+#define LBV_VLINE_STATUS__VLINE_ACK__SHIFT 0x4
+#define LBV_VLINE_STATUS__VLINE_STAT_MASK 0x1000
+#define LBV_VLINE_STATUS__VLINE_STAT__SHIFT 0xc
+#define LBV_VLINE_STATUS__VLINE_INTERRUPT_MASK 0x10000
+#define LBV_VLINE_STATUS__VLINE_INTERRUPT__SHIFT 0x10
+#define LBV_VLINE_STATUS__VLINE_INTERRUPT_TYPE_MASK 0x20000
+#define LBV_VLINE_STATUS__VLINE_INTERRUPT_TYPE__SHIFT 0x11
+#define LBV_VLINE2_STATUS__VLINE2_OCCURRED_MASK 0x1
+#define LBV_VLINE2_STATUS__VLINE2_OCCURRED__SHIFT 0x0
+#define LBV_VLINE2_STATUS__VLINE2_ACK_MASK 0x10
+#define LBV_VLINE2_STATUS__VLINE2_ACK__SHIFT 0x4
+#define LBV_VLINE2_STATUS__VLINE2_STAT_MASK 0x1000
+#define LBV_VLINE2_STATUS__VLINE2_STAT__SHIFT 0xc
+#define LBV_VLINE2_STATUS__VLINE2_INTERRUPT_MASK 0x10000
+#define LBV_VLINE2_STATUS__VLINE2_INTERRUPT__SHIFT 0x10
+#define LBV_VLINE2_STATUS__VLINE2_INTERRUPT_TYPE_MASK 0x20000
+#define LBV_VLINE2_STATUS__VLINE2_INTERRUPT_TYPE__SHIFT 0x11
+#define LBV_VBLANK_STATUS__VBLANK_OCCURRED_MASK 0x1
+#define LBV_VBLANK_STATUS__VBLANK_OCCURRED__SHIFT 0x0
+#define LBV_VBLANK_STATUS__VBLANK_ACK_MASK 0x10
+#define LBV_VBLANK_STATUS__VBLANK_ACK__SHIFT 0x4
+#define LBV_VBLANK_STATUS__VBLANK_STAT_MASK 0x1000
+#define LBV_VBLANK_STATUS__VBLANK_STAT__SHIFT 0xc
+#define LBV_VBLANK_STATUS__VBLANK_INTERRUPT_MASK 0x10000
+#define LBV_VBLANK_STATUS__VBLANK_INTERRUPT__SHIFT 0x10
+#define LBV_VBLANK_STATUS__VBLANK_INTERRUPT_TYPE_MASK 0x20000
+#define LBV_VBLANK_STATUS__VBLANK_INTERRUPT_TYPE__SHIFT 0x11
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_SEL_MASK 0x3
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_SEL__SHIFT 0x0
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_SEL2_MASK 0x10
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_SEL2__SHIFT 0x4
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_DELAY_MASK 0xff00
+#define LBV_SYNC_RESET_SEL__LB_SYNC_RESET_DELAY__SHIFT 0x8
+#define LBV_SYNC_RESET_SEL__LB_SYNC_DURATION_MASK 0xc00000
+#define LBV_SYNC_RESET_SEL__LB_SYNC_DURATION__SHIFT 0x16
+#define LBV_BLACK_KEYER_R_CR__LB_BLACK_KEYER_R_CR_MASK 0xfff0
+#define LBV_BLACK_KEYER_R_CR__LB_BLACK_KEYER_R_CR__SHIFT 0x4
+#define LBV_BLACK_KEYER_G_Y__LB_BLACK_KEYER_G_Y_MASK 0xfff0
+#define LBV_BLACK_KEYER_G_Y__LB_BLACK_KEYER_G_Y__SHIFT 0x4
+#define LBV_BLACK_KEYER_B_CB__LB_BLACK_KEYER_B_CB_MASK 0xfff0
+#define LBV_BLACK_KEYER_B_CB__LB_BLACK_KEYER_B_CB__SHIFT 0x4
+#define LBV_KEYER_COLOR_CTRL__LB_KEYER_COLOR_EN_MASK 0x1
+#define LBV_KEYER_COLOR_CTRL__LB_KEYER_COLOR_EN__SHIFT 0x0
+#define LBV_KEYER_COLOR_CTRL__LB_KEYER_COLOR_REP_EN_MASK 0x100
+#define LBV_KEYER_COLOR_CTRL__LB_KEYER_COLOR_REP_EN__SHIFT 0x8
+#define LBV_KEYER_COLOR_R_CR__LB_KEYER_COLOR_R_CR_MASK 0xfff0
+#define LBV_KEYER_COLOR_R_CR__LB_KEYER_COLOR_R_CR__SHIFT 0x4
+#define LBV_KEYER_COLOR_G_Y__LB_KEYER_COLOR_G_Y_MASK 0xfff0
+#define LBV_KEYER_COLOR_G_Y__LB_KEYER_COLOR_G_Y__SHIFT 0x4
+#define LBV_KEYER_COLOR_B_CB__LB_KEYER_COLOR_B_CB_MASK 0xfff0
+#define LBV_KEYER_COLOR_B_CB__LB_KEYER_COLOR_B_CB__SHIFT 0x4
+#define LBV_KEYER_COLOR_REP_R_CR__LB_KEYER_COLOR_REP_R_CR_MASK 0xfff0
+#define LBV_KEYER_COLOR_REP_R_CR__LB_KEYER_COLOR_REP_R_CR__SHIFT 0x4
+#define LBV_KEYER_COLOR_REP_G_Y__LB_KEYER_COLOR_REP_G_Y_MASK 0xfff0
+#define LBV_KEYER_COLOR_REP_G_Y__LB_KEYER_COLOR_REP_G_Y__SHIFT 0x4
+#define LBV_KEYER_COLOR_REP_B_CB__LB_KEYER_COLOR_REP_B_CB_MASK 0xfff0
+#define LBV_KEYER_COLOR_REP_B_CB__LB_KEYER_COLOR_REP_B_CB__SHIFT 0x4
+#define LBV_BUFFER_LEVEL_STATUS__REQ_FIFO_LEVEL_MASK 0x3f
+#define LBV_BUFFER_LEVEL_STATUS__REQ_FIFO_LEVEL__SHIFT 0x0
+#define LBV_BUFFER_LEVEL_STATUS__REQ_FIFO_FULL_CNTL_MASK 0xfc00
+#define LBV_BUFFER_LEVEL_STATUS__REQ_FIFO_FULL_CNTL__SHIFT 0xa
+#define LBV_BUFFER_LEVEL_STATUS__DATA_BUFFER_LEVEL_MASK 0xfff0000
+#define LBV_BUFFER_LEVEL_STATUS__DATA_BUFFER_LEVEL__SHIFT 0x10
+#define LBV_BUFFER_LEVEL_STATUS__DATA_FIFO_FULL_CNTL_MASK 0xf0000000
+#define LBV_BUFFER_LEVEL_STATUS__DATA_FIFO_FULL_CNTL__SHIFT 0x1c
+#define LBV_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_ON_MASK 0xfff
+#define LBV_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_ON__SHIFT 0x0
+#define LBV_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_OFF_MASK 0xfff0000
+#define LBV_BUFFER_URGENCY_CTRL__LB_BUFFER_URGENCY_MARK_OFF__SHIFT 0x10
+#define LBV_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_LEVEL_MASK 0xfff
+#define LBV_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_LEVEL__SHIFT 0x0
+#define LBV_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_STAT_MASK 0x10000
+#define LBV_BUFFER_URGENCY_STATUS__LB_BUFFER_URGENCY_STAT__SHIFT 0x10
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_MARGIN_MASK 0xf
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_MARGIN__SHIFT 0x0
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_STAT_MASK 0x10
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_STAT__SHIFT 0x4
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_OCCURRED_MASK 0x100
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_OCCURRED__SHIFT 0x8
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_ACK_MASK 0x1000
+#define LBV_BUFFER_STATUS__LB_BUFFER_EMPTY_ACK__SHIFT 0xc
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_STAT_MASK 0x10000
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_STAT__SHIFT 0x10
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_OCCURRED_MASK 0x100000
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_OCCURRED__SHIFT 0x14
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_ACK_MASK 0x1000000
+#define LBV_BUFFER_STATUS__LB_BUFFER_FULL_ACK__SHIFT 0x18
+#define LBV_NO_OUTSTANDING_REQ_STATUS__LB_NO_OUTSTANDING_REQ_STAT_MASK 0x1
+#define LBV_NO_OUTSTANDING_REQ_STATUS__LB_NO_OUTSTANDING_REQ_STAT__SHIFT 0x0
+#define LBV_DEBUG__LB_DEBUG_MASK 0xffffffff
+#define LBV_DEBUG__LB_DEBUG__SHIFT 0x0
+#define LBV_DEBUG2__LB_DEBUG2_MASK 0xffffffff
+#define LBV_DEBUG2__LB_DEBUG2__SHIFT 0x0
+#define LBV_DEBUG3__LB_DEBUG3_MASK 0xffffffff
+#define LBV_DEBUG3__LB_DEBUG3__SHIFT 0x0
+#define LBV_TEST_DEBUG_INDEX__LB_TEST_DEBUG_INDEX_MASK 0xff
+#define LBV_TEST_DEBUG_INDEX__LB_TEST_DEBUG_INDEX__SHIFT 0x0
+#define LBV_TEST_DEBUG_INDEX__LB_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define LBV_TEST_DEBUG_INDEX__LB_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define LBV_TEST_DEBUG_DATA__LB_TEST_DEBUG_DATA_MASK 0xffffffff
+#define LBV_TEST_DEBUG_DATA__LB_TEST_DEBUG_DATA__SHIFT 0x0
+#define MVP_CONTROL1__MVP_EN_MASK 0x1
+#define MVP_CONTROL1__MVP_EN__SHIFT 0x0
+#define MVP_CONTROL1__MVP_MIXER_MODE_MASK 0x70
+#define MVP_CONTROL1__MVP_MIXER_MODE__SHIFT 0x4
+#define MVP_CONTROL1__MVP_MIXER_SLAVE_SEL_MASK 0x100
+#define MVP_CONTROL1__MVP_MIXER_SLAVE_SEL__SHIFT 0x8
+#define MVP_CONTROL1__MVP_MIXER_SLAVE_SEL_DELAY_UNTIL_END_OF_BLANK_MASK 0x200
+#define MVP_CONTROL1__MVP_MIXER_SLAVE_SEL_DELAY_UNTIL_END_OF_BLANK__SHIFT 0x9
+#define MVP_CONTROL1__MVP_ARBITRATION_MODE_FOR_AFR_MANUAL_SWITCH_MODE_MASK 0x400
+#define MVP_CONTROL1__MVP_ARBITRATION_MODE_FOR_AFR_MANUAL_SWITCH_MODE__SHIFT 0xa
+#define MVP_CONTROL1__MVP_RATE_CONTROL_MASK 0x1000
+#define MVP_CONTROL1__MVP_RATE_CONTROL__SHIFT 0xc
+#define MVP_CONTROL1__MVP_CHANNEL_CONTROL_MASK 0x10000
+#define MVP_CONTROL1__MVP_CHANNEL_CONTROL__SHIFT 0x10
+#define MVP_CONTROL1__MVP_GPU_CHAIN_LOCATION_MASK 0x300000
+#define MVP_CONTROL1__MVP_GPU_CHAIN_LOCATION__SHIFT 0x14
+#define MVP_CONTROL1__MVP_DISABLE_MSB_EXPAND_MASK 0x1000000
+#define MVP_CONTROL1__MVP_DISABLE_MSB_EXPAND__SHIFT 0x18
+#define MVP_CONTROL1__MVP_30BPP_EN_MASK 0x10000000
+#define MVP_CONTROL1__MVP_30BPP_EN__SHIFT 0x1c
+#define MVP_CONTROL1__MVP_TERMINATION_CNTL_A_MASK 0x40000000
+#define MVP_CONTROL1__MVP_TERMINATION_CNTL_A__SHIFT 0x1e
+#define MVP_CONTROL1__MVP_TERMINATION_CNTL_B_MASK 0x80000000
+#define MVP_CONTROL1__MVP_TERMINATION_CNTL_B__SHIFT 0x1f
+#define MVP_CONTROL2__MVP_MUX_DE_DVOCNTL0_SEL_MASK 0x1
+#define MVP_CONTROL2__MVP_MUX_DE_DVOCNTL0_SEL__SHIFT 0x0
+#define MVP_CONTROL2__MVP_MU

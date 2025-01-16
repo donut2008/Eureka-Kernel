@@ -1,601 +1,305 @@
-/*
- * Copyright (C) 2014 Samsung Electronics Co.Ltd
- * http://www.samsung.com
- *
- * MCU IPC driver
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
-*/
-
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/miscdevice.h>
-#include <linux/platform_device.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/dma-mapping.h>
-#include <linux/delay.h>
-#include <soc/samsung/exynos-pmu.h>
-
-#include "regs-mcu_ipc.h"
-#include "mcu_ipc.h"
-
-#ifdef CONFIG_SOC_EXYNOS7885
-#define CP_STAT				0x38
-#define EXT_REGULATOR_SHARED_STATUS	0x3644
-#define EXT_REGULATOR_SHARED_OPTION	0x3648
-static spinlock_t shared_reg_lock;
-static bool shared_reg_ready = false;
-static signed int shared_reg_usage_cnt = 0;
-int exynos_pmu_shared_reg_enable(void);
-void exynos_pmu_shared_reg_disable(void);
-#endif
-
-void mcu_ipc_reg_dump(enum mcu_ipc_region id)
-{
-	unsigned long flags;
-	u32 i, value;
-
-	if (id >= MCU_MAX)
-		return;
-
-	spin_lock_irqsave(&mcu_dat[id].reg_lock, flags);
-
-	for (i = 0; i < 4; i++) {
-		value = mcu_ipc_readl(id, EXYNOS_MCU_IPC_ISSR0 + (4 * i));
-		dev_err(mcu_dat[id].mcu_ipc_dev, "mbox dump: 0x%02x: 0x%04x\n",
-			i, value);
-	}
-
-	spin_unlock_irqrestore(&mcu_dat[id].reg_lock, flags);
-}
-EXPORT_SYMBOL(mcu_ipc_reg_dump);
-
-static irqreturn_t mcu_ipc_handler(int irq, void *data)
-{
-	u32 irq_stat, i;
-	u32 id;
-
-	id = ((struct mcu_ipc_drv_data *)data)->id;
-
-	spin_lock(&mcu_dat[id].reg_lock);
-
-	/* Check raised interrupts */
-	irq_stat = mcu_ipc_readl(id, EXYNOS_MCU_IPC_INTSR0) & 0xFFFF0000;
-
-
-	/* Only clear and handle unmasked interrupts */
-	irq_stat &= mcu_dat[id].unmasked_irq << 16;
-
-
-	/* Interrupt Clear */
-	mcu_ipc_writel(id, irq_stat, EXYNOS_MCU_IPC_INTCR0);
-	spin_unlock(&mcu_dat[id].reg_lock);
-
-	for (i = 0; i < 16; i++) {
-		if (irq_stat & (1 << (i + 16))) {
-			if ((1 << (i + 16)) & mcu_dat[id].registered_irq)
-				mcu_dat[id].hd[i].handler(mcu_dat[id].hd[i].data);
-			else
-				dev_err(mcu_dat[id].mcu_ipc_dev,
-					"Unregistered INT received.\n");
-
-			irq_stat &= ~(1 << (i + 16));
-		}
-
-		if (!irq_stat)
-			break;
-	}
-
-	return IRQ_HANDLED;
-}
-
-int mbox_request_irq(enum mcu_ipc_region id, u32 int_num,
-					void (*handler)(void *), void *data)
-{
-	unsigned long flags;
-
-	if ((!handler) || (int_num > 15))
-		return -EINVAL;
-
-	spin_lock_irqsave(&mcu_dat[id].reg_lock, flags);
-
-	mcu_dat[id].hd[int_num].data = data;
-	mcu_dat[id].hd[int_num].handler = handler;
-	mcu_dat[id].registered_irq |= 1 << (int_num + 16);
-	set_bit(int_num, &mcu_dat[id].unmasked_irq);
-
-	spin_unlock_irqrestore(&mcu_dat[id].reg_lock, flags);
-
-	return 0;
-}
-EXPORT_SYMBOL(mbox_request_irq);
-
-/*
- * mbox_enable_irq
- *
- * This function unmasks a single mailbox interrupt.
- */
-int mbox_enable_irq(enum mcu_ipc_region id, u32 int_num)
-{
-	unsigned long flags;
-	unsigned long tmp;
-
-	/* The irq should have been registered. */
-	if (!(mcu_dat[id].registered_irq & BIT(int_num + 16)))
-		return -EINVAL;
-
-	spin_lock_irqsave(&mcu_dat[id].reg_lock, flags);
-
-	tmp = mcu_ipc_readl(id, EXYNOS_MCU_IPC_INTMR0);
-
-	/* Clear the mask if it was set. */
-	if (test_and_clear_bit(int_num + 16, &tmp))
-		mcu_ipc_writel(id, tmp, EXYNOS_MCU_IPC_INTMR0);
-
-	/* Mark the irq as unmasked */
-	set_bit(int_num, &mcu_dat[id].unmasked_irq);
-
-	spin_unlock_irqrestore(&mcu_dat[id].reg_lock, flags);
-
-	return 0;
-}
-EXPORT_SYMBOL(mbox_enable_irq);
-
-/*
- * mbox_check_irq
- *
- * This function is used to check the state of the mailbox interrupt
- * when the interrupt after the interrupt has been masked. This can be
- * used to check if a new interrupt has been set after being masked. A
- * masked interrupt will have its status set but will not generate a hard
- * interrupt. This function will check and clear the status.
- */
-int mbox_check_irq(enum mcu_ipc_region id, u32 int_num)
-{
-	unsigned long flags;
-	u32 irq_stat;
-
-	/* Interrupt must have been registered. */
-	if (!(mcu_dat[id].registered_irq & BIT(int_num + 16)))
-		return -EINVAL;
-
-	spin_lock_irqsave(&mcu_dat[id].reg_lock, flags);
-
-	/* Interrupt must have been masked. */
-	if (test_bit(int_num, &mcu_dat[id].unmasked_irq)) {
-		spin_unlock_irqrestore(&mcu_dat[id].reg_lock, flags);
-		return -EINVAL;
-	}
-
-	/* Check and clear the interrupt status bit. */
-	irq_stat = mcu_ipc_readl(id, EXYNOS_MCU_IPC_INTSR0) & BIT(int_num + 16);
-	if (irq_stat)
-		mcu_ipc_writel(id, irq_stat, EXYNOS_MCU_IPC_INTCR0);
-
-	spin_unlock_irqrestore(&mcu_dat[id].reg_lock, flags);
-
-	return irq_stat != 0;
-}
-EXPORT_SYMBOL(mbox_check_irq);
-
-/*
- * mbox_disable_irq
- *
- * This function masks and single mailbox interrupt.
- */
-int mbox_disable_irq(enum mcu_ipc_region id, u32 int_num)
-{
-	unsigned long flags;
-	unsigned long irq_mask;
-
-	/* The interrupt must have been registered. */
-	if (!(mcu_dat[id].registered_irq & BIT(int_num + 16)))
-		return -EINVAL;
-
-	/* Set the mask */
-	spin_lock_irqsave(&mcu_dat[id].reg_lock, flags);
-
-	irq_mask = mcu_ipc_readl(id, EXYNOS_MCU_IPC_INTMR0);
-
-	/* Set the mask if it was not already set */
-	if (!test_and_set_bit(int_num + 16, &irq_mask)) {
-		mcu_ipc_writel(id, irq_mask, EXYNOS_MCU_IPC_INTMR0);
-
-		udelay(5);
-
-		/* Reset the status bit to signal interrupt needs handling */
-		mcu_ipc_writel(id, BIT(int_num + 16), EXYNOS_MCU_IPC_INTGR0);
-
-		udelay(5);
-	}
-
-	/* Remove the irq from the umasked irqs */
-	clear_bit(int_num, &mcu_dat[id].unmasked_irq);
-
-	spin_unlock_irqrestore(&mcu_dat[id].reg_lock, flags);
-
-	return 0;
-}
-EXPORT_SYMBOL(mbox_disable_irq);
-
-int mcu_ipc_unregister_handler(enum mcu_ipc_region id, u32 int_num,
-								void (*handler)(void *))
-{
-	unsigned long flags;
-
-	if (!handler || (mcu_dat[id].hd[int_num].handler != handler))
-		return -EINVAL;
-
-	spin_lock_irqsave(&mcu_dat[id].reg_lock, flags);
-
-	mcu_dat[id].hd[int_num].data = NULL;
-	mcu_dat[id].hd[int_num].handler = NULL;
-	mcu_dat[id].registered_irq &= ~(1 << (int_num + 16));
-	clear_bit(int_num, &mcu_dat[id].unmasked_irq);
-
-	spin_unlock_irqrestore(&mcu_dat[id].reg_lock, flags);
-
-	return 0;
-}
-EXPORT_SYMBOL(mcu_ipc_unregister_handler);
-
-void mbox_set_interrupt(enum mcu_ipc_region id, u32 int_num)
-{
-	int need_delay = 0;
-	/* generate interrupt */
-	if (int_num < 16) {
-		if (id == MCU_CP)
-			need_delay = exynos_pmu_shared_reg_enable();
-		mcu_ipc_writel(id, 0x1 << int_num, EXYNOS_MCU_IPC_INTGR1);
-		if (id == MCU_CP) {
-			if (need_delay)
-				udelay(3000);
-			exynos_pmu_shared_reg_disable();
-		}
-	}
-}
-EXPORT_SYMBOL(mbox_set_interrupt);
-
-void mcu_ipc_send_command(enum mcu_ipc_region id, u32 int_num, u16 cmd)
-{
-	/* write command */
-	if (int_num < 16)
-		mcu_ipc_writel(id, cmd, EXYNOS_MCU_IPC_ISSR0 + (8 * int_num));
-
-	/* generate interrupt */
-	mbox_set_interrupt(id, int_num);
-}
-EXPORT_SYMBOL(mcu_ipc_send_command);
-
-u32 mbox_get_value(enum mcu_ipc_region id, u32 mbx_num)
-{
-	if (mbx_num < 64)
-		return mcu_ipc_readl(id, EXYNOS_MCU_IPC_ISSR0 + (4 * mbx_num));
-	else
-		return 0;
-}
-EXPORT_SYMBOL(mbox_get_value);
-
-void mbox_set_value(enum mcu_ipc_region id, u32 mbx_num, u32 msg)
-{
-	if (mbx_num < 64)
-		mcu_ipc_writel(id, msg, EXYNOS_MCU_IPC_ISSR0 + (4 * mbx_num));
-}
-EXPORT_SYMBOL(mbox_set_value);
-
-u32 mbox_extract_value(enum mcu_ipc_region id, u32 mbx_num, u32 mask, u32 pos)
-{
-	if (mbx_num < 64)
-		return (mbox_get_value(id, mbx_num) >> pos) & mask;
-	else
-		return 0;
-}
-EXPORT_SYMBOL(mbox_extract_value);
-
-void mbox_update_value(enum mcu_ipc_region id, u32 mbx_num,
-				u32 msg, u32 mask, u32 pos)
-{
-	u32 val;
-	unsigned long flags;
-
-	spin_lock_irqsave(&mcu_dat[id].lock, flags);
-
-	if (mbx_num < 64) {
-		val = mbox_get_value(id, mbx_num);
-		val &= ~(mask << pos);
-		val |= (msg & mask) << pos;
-		mbox_set_value(id, mbx_num, val);
-	}
-
-	spin_unlock_irqrestore(&mcu_dat[id].lock, flags);
-}
-EXPORT_SYMBOL(mbox_update_value);
-
-void mbox_sw_reset(enum mcu_ipc_region id)
-{
-	u32 reg_val;
-
-	printk("Reset Mailbox registers\n");
-
-	reg_val = mcu_ipc_readl(id, EXYNOS_MCU_IPC_MCUCTLR);
-	reg_val |= (0x1 << MCU_IPC_MCUCTLR_MSWRST);
-
-	mcu_ipc_writel(id, reg_val, EXYNOS_MCU_IPC_MCUCTLR) ;
-
-	udelay(5);
-}
-EXPORT_SYMBOL(mbox_sw_reset);
-
-void mcu_ipc_clear_all_interrupt(enum mcu_ipc_region id)
-{
-	mcu_ipc_writel(id, 0xFFFF, EXYNOS_MCU_IPC_INTCR1);
-}
-
-#ifdef CONFIG_ARGOS
-static int mcu_ipc_set_affinity(enum mcu_ipc_region id, struct device *dev, int irq)
-{
-	struct device_node *np = dev->of_node;
-	u32 irq_affinity_mask = 0;
-
-	if (!np)	{
-		dev_err(dev, "non-DT project, can't set irq affinity\n");
-		return -ENODEV;
-	}
-
-	if (of_property_read_u32(np, "mcu,irq_affinity_mask",
-			&irq_affinity_mask))	{
-		dev_err(dev, "Failed to get affinity mask\n");
-		return -ENODEV;
-	}
-
-	dev_info(dev, "irq_affinity_mask = 0x%x\n", irq_affinity_mask);
-
-	if (!zalloc_cpumask_var(&mcu_dat[id].dmask, GFP_KERNEL))
-		return -ENOMEM;
-	if (!zalloc_cpumask_var(&mcu_dat[id].imask, GFP_KERNEL))
-		return -ENOMEM;
-
-	cpumask_or(mcu_dat[id].imask, mcu_dat[id].imask, cpumask_of(irq_affinity_mask));
-	cpumask_copy(mcu_dat[id].dmask, get_default_cpu_mask());
-
-	return argos_irq_affinity_setup_label(irq, "IPC", mcu_dat[id].imask,
-			mcu_dat[id].dmask);
-}
-#else
-static int mcu_ipc_set_affinity(enum mcu_ipc_region id, struct device *dev, int irq)
-{
-	return 0;
-}
-#endif
-
-#ifdef CONFIG_MCU_IPC_TEST
-static void test_without_dev(enum mcu_ipc_region id)
-{
-	int i;
-	char *region;
-
-	switch(id) {
-	case MCU_CP:
-		region = "CP";
-		break;
-	case MCU_GNSS:
-		region = "GNSS";
-		break;
-	default:
-		region = NULL;
-	}
-
-	for (i = 0; i < 64; i++) {
-		mbox_set_value(id, i, 64 - i);
-		mdelay(50);
-		dev_err(mcu_dat[id].mcu_ipc_dev,
-				"Test without %s(%d): Read mbox value[%d]: %d\n",
-				region, id, i, mbox_get_value(i));
-	}
-}
-#endif
-
-#ifdef CONFIG_SOC_EXYNOS7885
-static int get_cp_stat(void)
-{
-	u32 val;
-	exynos_pmu_read(CP_STAT, &val);
-	return val;
-}
-
-static int get_ext_regulator_shared_status(void)
-{
-	u32 val;
-	exynos_pmu_read(EXT_REGULATOR_SHARED_STATUS, &val);
-	return val;
-}
-
-int exynos_pmu_shared_reg_enable(void)
-{
-	int need_delay = 0;
-	unsigned long flags;
-
-	spin_lock_irqsave(&shared_reg_lock, flags);
-
-	if (shared_reg_usage_cnt == 0) {
-		mbox_update_value(MCU_CP, 2, 1, 0x1, 0x0);
-		exynos_pmu_update(EXT_REGULATOR_SHARED_OPTION, 0x4, 0x4);
-		if (mbox_extract_value(MCU_CP, 3, 0xf, 0x1) == 0) {
-			need_delay = 1;
-		}
-	}
-
-	shared_reg_usage_cnt++;
-
-	if (get_ext_regulator_shared_status() != 0x20001 || get_cp_stat() != 0x10)
-		pr_info("%s) need_delay = %d, usage_cnt = %d, CP_WAKEUP = %d, CP_STAT = 0x%02x, EXT_REGULATOR_SHARED_STATUS: 0x%08x, CALLER = %pf\n", __func__,
-			need_delay, shared_reg_usage_cnt, mbox_extract_value(MCU_CP, 2, 0x1, 0x0),
-			get_cp_stat(), get_ext_regulator_shared_status(), __builtin_return_address(0));
-
-	spin_unlock_irqrestore(&shared_reg_lock, flags);
-	return need_delay;
-}
-
-void exynos_pmu_shared_reg_disable(void)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&shared_reg_lock, flags);
-
-	if (shared_reg_usage_cnt == 1) {
-		exynos_pmu_update(EXT_REGULATOR_SHARED_OPTION, 0x4, 0x0);
-		mbox_update_value(MCU_CP, 2, 0, 0x1, 0x0);
-	}
-
-	shared_reg_usage_cnt--;
-
-	//pr_info("%s) usage_cnt = %d, ret = %d(%pf)\n", __func__, shared_reg_usage_cnt, ret, __builtin_return_address(0));
-
-	WARN(shared_reg_usage_cnt < 0, "%s) usage_cnt = %d(%pf), CP_STAT = 0x%02x, EXT_REGULATOR_SHARED_STATUS: 0x%08x, CALLER = %pf\n", __func__,
-			shared_reg_usage_cnt, __builtin_return_address(0), get_cp_stat(), get_ext_regulator_shared_status(),
-			__builtin_return_address(0));
-
-	spin_unlock_irqrestore(&shared_reg_lock, flags);
-}
-
-EXPORT_SYMBOL(exynos_pmu_shared_reg_enable);
-EXPORT_SYMBOL(exynos_pmu_shared_reg_disable);
-#endif
-
-static int mcu_ipc_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct resource *res = NULL;
-	int mcu_ipc_irq;
-	int err = 0;
-	u32 id = 0;
-
-	dev_err(&pdev->dev, "%s: mcu_ipc probe start.\n", __func__);
-
-	err = of_property_read_u32(dev->of_node, "mcu,id", &id);
-	if (err) {
-		dev_err(&pdev->dev, "MCU IPC parse error! [id]\n");
-		return err;
-	}
-
-	if (id >= MCU_MAX) {
-		dev_err(&pdev->dev, "MCU IPC Invalid ID [%d]\n", id);
-		return -EINVAL;
-	}
-
-	mcu_dat[id].id = id;
-	mcu_dat[id].mcu_ipc_dev = &pdev->dev;
-
-	if (!pdev->dev.dma_mask)
-		pdev->dev.dma_mask = &pdev->dev.coherent_dma_mask;
-	if (!pdev->dev.coherent_dma_mask)
-		pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
-
-	if (dev->of_node) {
-		mcu_dt_read_string(dev->of_node, "mcu,name", mcu_dat[id].name);
-		if (IS_ERR(&mcu_dat[id])) {
-			dev_err(&pdev->dev, "MCU IPC parse error!\n");
-			return PTR_ERR(&mcu_dat[id]);
-		}
-	}
-
-	/* resource for mcu_ipc SFR region */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	mcu_dat[id].ioaddr = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(mcu_dat[id].ioaddr)) {
-		dev_err(&pdev->dev, "failded to request memory resource\n");
-		return PTR_ERR(mcu_dat[id].ioaddr);
-	}
-
-	/* Request IRQ */
-	mcu_ipc_irq = platform_get_irq(pdev, 0);
-	err = devm_request_irq(&pdev->dev, mcu_ipc_irq, mcu_ipc_handler, 0,
-			pdev->name, &mcu_dat[id]);
-	if (err) {
-		dev_err(&pdev->dev, "Can't request MCU_IPC IRQ\n");
-		return err;
-	}
-
-	mcu_ipc_clear_all_interrupt(id);
-
-	/* set argos irq affinity */
-	err = mcu_ipc_set_affinity(id, dev, mcu_ipc_irq);
-	if (err)
-		dev_err(dev, "Can't set IRQ affinity with(%d)\n", err);
-
-#ifdef CONFIG_MCU_IPC_TEST
-	test_without_dev(id);
-#endif
-
-	spin_lock_init(&mcu_dat[id].lock);
-	spin_lock_init(&mcu_dat[id].reg_lock);
-
-#ifdef CONFIG_SOC_EXYNOS7885
-	spin_lock_init(&shared_reg_lock);
-	shared_reg_ready = true;
-#endif
-
-	dev_err(&pdev->dev, "%s: mcu_ipc probe done.\n", __func__);
-
-	return 0;
-}
-
-static int __exit mcu_ipc_remove(struct platform_device *pdev)
-{
-	/* TODO */
-	return 0;
-}
-
-#ifdef CONFIG_PM
-static int mcu_ipc_suspend(struct device *dev)
-{
-	/* TODO */
-	return 0;
-}
-
-static int mcu_ipc_resume(struct device *dev)
-{
-	/* TODO */
-	return 0;
-}
-#else
-#define mcu_ipc_suspend NULL
-#define mcu_ipc_resume NULL
-#endif
-
-static const struct dev_pm_ops mcu_ipc_pm_ops = {
-	.suspend = mcu_ipc_suspend,
-	.resume = mcu_ipc_resume,
-};
-
-static const struct of_device_id exynos_mcu_ipc_dt_match[] = {
-		{ .compatible = "samsung,exynos7580-mailbox", },
-		{ .compatible = "samsung,exynos7890-mailbox", },
-		{ .compatible = "samsung,exynos8890-mailbox", },
-		{ .compatible = "samsung,exynos7870-mailbox", },
-		{ .compatible = "samsung,exynos-shd-ipc-mailbox", },
-		{},
-};
-MODULE_DEVICE_TABLE(of, exynos_mcu_ipc_dt_match);
-
-static struct platform_driver mcu_ipc_driver = {
-	.probe		= mcu_ipc_probe,
-	.remove		= mcu_ipc_remove,
-	.driver		= {
-		.name = "mcu_ipc",
-		.owner = THIS_MODULE,
-		.of_match_table = of_match_ptr(exynos_mcu_ipc_dt_match),
-		.pm = &mcu_ipc_pm_ops,
-		.suppress_bind_attrs = true,
-	},
-};
-module_platform_driver(mcu_ipc_driver);
-
-MODULE_DESCRIPTION("MCU IPC driver");
-MODULE_AUTHOR("<hy50.seo@samsung.com>");
-MODULE_LICENSE("GPL");
+ GARLIC_FLUSH_CNTL__SAM_SAB_RBO_WPTR_MASK 0x200
+#define GARLIC_FLUSH_CNTL__SAM_SAB_RBO_WPTR__SHIFT 0x9
+#define GARLIC_FLUSH_CNTL__VCE_OUT_RB_WPTR_MASK 0x400
+#define GARLIC_FLUSH_CNTL__VCE_OUT_RB_WPTR__SHIFT 0xa
+#define GARLIC_FLUSH_CNTL__VCE_RB_WPTR2_MASK 0x800
+#define GARLIC_FLUSH_CNTL__VCE_RB_WPTR2__SHIFT 0xb
+#define GARLIC_FLUSH_CNTL__VCE_RB_WPTR_MASK 0x1000
+#define GARLIC_FLUSH_CNTL__VCE_RB_WPTR__SHIFT 0xc
+#define GARLIC_FLUSH_CNTL__HOST_DOORBELL_MASK 0x2000
+#define GARLIC_FLUSH_CNTL__HOST_DOORBELL__SHIFT 0xd
+#define GARLIC_FLUSH_CNTL__SELFRING_DOORBELL_MASK 0x4000
+#define GARLIC_FLUSH_CNTL__SELFRING_DOORBELL__SHIFT 0xe
+#define GARLIC_FLUSH_CNTL__DISPLAY_MASK 0x10000
+#define GARLIC_FLUSH_CNTL__DISPLAY__SHIFT 0x10
+#define GARLIC_FLUSH_CNTL__IGNORE_MC_DISABLE_MASK 0x40000000
+#define GARLIC_FLUSH_CNTL__IGNORE_MC_DISABLE__SHIFT 0x1e
+#define GARLIC_FLUSH_CNTL__DISABLE_ALL_MASK 0x80000000
+#define GARLIC_FLUSH_CNTL__DISABLE_ALL__SHIFT 0x1f
+#define GARLIC_FLUSH_ADDR_START_0__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_0__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_0__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_0__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_0__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_0__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_1__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_1__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_1__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_1__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_1__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_1__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_2__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_2__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_2__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_2__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_2__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_2__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_3__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_3__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_3__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_3__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_3__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_3__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_4__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_4__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_4__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_4__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_4__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_4__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_5__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_5__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_5__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_5__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_5__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_5__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_6__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_6__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_6__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_6__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_6__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_6__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_7__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_7__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_7__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_7__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_7__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_7__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_0__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_0__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_1__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_1__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_2__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_2__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_3__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_3__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_4__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_4__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_5__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_5__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_6__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_6__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_7__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_7__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_REQ__FLUSH_REQ_MASK 0x1
+#define GARLIC_FLUSH_REQ__FLUSH_REQ__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_REQ__CP0_MASK 0x1
+#define GPU_GARLIC_FLUSH_REQ__CP0__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_REQ__CP1_MASK 0x2
+#define GPU_GARLIC_FLUSH_REQ__CP1__SHIFT 0x1
+#define GPU_GARLIC_FLUSH_REQ__CP2_MASK 0x4
+#define GPU_GARLIC_FLUSH_REQ__CP2__SHIFT 0x2
+#define GPU_GARLIC_FLUSH_REQ__CP3_MASK 0x8
+#define GPU_GARLIC_FLUSH_REQ__CP3__SHIFT 0x3
+#define GPU_GARLIC_FLUSH_REQ__CP4_MASK 0x10
+#define GPU_GARLIC_FLUSH_REQ__CP4__SHIFT 0x4
+#define GPU_GARLIC_FLUSH_REQ__CP5_MASK 0x20
+#define GPU_GARLIC_FLUSH_REQ__CP5__SHIFT 0x5
+#define GPU_GARLIC_FLUSH_REQ__CP6_MASK 0x40
+#define GPU_GARLIC_FLUSH_REQ__CP6__SHIFT 0x6
+#define GPU_GARLIC_FLUSH_REQ__CP7_MASK 0x80
+#define GPU_GARLIC_FLUSH_REQ__CP7__SHIFT 0x7
+#define GPU_GARLIC_FLUSH_REQ__CP8_MASK 0x100
+#define GPU_GARLIC_FLUSH_REQ__CP8__SHIFT 0x8
+#define GPU_GARLIC_FLUSH_REQ__CP9_MASK 0x200
+#define GPU_GARLIC_FLUSH_REQ__CP9__SHIFT 0x9
+#define GPU_GARLIC_FLUSH_REQ__SDMA0_MASK 0x400
+#define GPU_GARLIC_FLUSH_REQ__SDMA0__SHIFT 0xa
+#define GPU_GARLIC_FLUSH_REQ__SDMA1_MASK 0x800
+#define GPU_GARLIC_FLUSH_REQ__SDMA1__SHIFT 0xb
+#define GPU_GARLIC_FLUSH_DONE__CP0_MASK 0x1
+#define GPU_GARLIC_FLUSH_DONE__CP0__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_DONE__CP1_MASK 0x2
+#define GPU_GARLIC_FLUSH_DONE__CP1__SHIFT 0x1
+#define GPU_GARLIC_FLUSH_DONE__CP2_MASK 0x4
+#define GPU_GARLIC_FLUSH_DONE__CP2__SHIFT 0x2
+#define GPU_GARLIC_FLUSH_DONE__CP3_MASK 0x8
+#define GPU_GARLIC_FLUSH_DONE__CP3__SHIFT 0x3
+#define GPU_GARLIC_FLUSH_DONE__CP4_MASK 0x10
+#define GPU_GARLIC_FLUSH_DONE__CP4__SHIFT 0x4
+#define GPU_GARLIC_FLUSH_DONE__CP5_MASK 0x20
+#define GPU_GARLIC_FLUSH_DONE__CP5__SHIFT 0x5
+#define GPU_GARLIC_FLUSH_DONE__CP6_MASK 0x40
+#define GPU_GARLIC_FLUSH_DONE__CP6__SHIFT 0x6
+#define GPU_GARLIC_FLUSH_DONE__CP7_MASK 0x80
+#define GPU_GARLIC_FLUSH_DONE__CP7__SHIFT 0x7
+#define GPU_GARLIC_FLUSH_DONE__CP8_MASK 0x100
+#define GPU_GARLIC_FLUSH_DONE__CP8__SHIFT 0x8
+#define GPU_GARLIC_FLUSH_DONE__CP9_MASK 0x200
+#define GPU_GARLIC_FLUSH_DONE__CP9__SHIFT 0x9
+#define GPU_GARLIC_FLUSH_DONE__SDMA0_MASK 0x400
+#define GPU_GARLIC_FLUSH_DONE__SDMA0__SHIFT 0xa
+#define GPU_GARLIC_FLUSH_DONE__SDMA1_MASK 0x800
+#define GPU_GARLIC_FLUSH_DONE__SDMA1__SHIFT 0xb
+#define GARLIC_COHE_CP_RB0_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB0_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_RB1_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB1_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_RB2_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB2_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_UVD_RBC_RB_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_UVD_RBC_RB_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA0_GFX_RB_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA0_GFX_RB_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA1_GFX_RB_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA1_GFX_RB_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_DMA_ME_COMMAND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_DMA_ME_COMMAND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_DMA_PFP_COMMAND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_DMA_PFP_COMMAND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SAM_SAB_RBI_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SAM_SAB_RBI_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SAM_SAB_RBO_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SAM_SAB_RBO_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_OUT_RB_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_OUT_RB_WPTR__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_RB_WPTR2__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_RB_WPTR2__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_RB_WPTR__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_RB_WPTR__ADDRESS__SHIFT 0x2
+#define BIOS_SCRATCH_0__BIOS_SCRATCH_0_MASK 0xffffffff
+#define BIOS_SCRATCH_0__BIOS_SCRATCH_0__SHIFT 0x0
+#define BIOS_SCRATCH_1__BIOS_SCRATCH_1_MASK 0xffffffff
+#define BIOS_SCRATCH_1__BIOS_SCRATCH_1__SHIFT 0x0
+#define BIOS_SCRATCH_2__BIOS_SCRATCH_2_MASK 0xffffffff
+#define BIOS_SCRATCH_2__BIOS_SCRATCH_2__SHIFT 0x0
+#define BIOS_SCRATCH_3__BIOS_SCRATCH_3_MASK 0xffffffff
+#define BIOS_SCRATCH_3__BIOS_SCRATCH_3__SHIFT 0x0
+#define BIOS_SCRATCH_4__BIOS_SCRATCH_4_MASK 0xffffffff
+#define BIOS_SCRATCH_4__BIOS_SCRATCH_4__SHIFT 0x0
+#define BIOS_SCRATCH_5__BIOS_SCRATCH_5_MASK 0xffffffff
+#define BIOS_SCRATCH_5__BIOS_SCRATCH_5__SHIFT 0x0
+#define BIOS_SCRATCH_6__BIOS_SCRATCH_6_MASK 0xffffffff
+#define BIOS_SCRATCH_6__BIOS_SCRATCH_6__SHIFT 0x0
+#define BIOS_SCRATCH_7__BIOS_SCRATCH_7_MASK 0xffffffff
+#define BIOS_SCRATCH_7__BIOS_SCRATCH_7__SHIFT 0x0
+#define BIOS_SCRATCH_8__BIOS_SCRATCH_8_MASK 0xffffffff
+#define BIOS_SCRATCH_8__BIOS_SCRATCH_8__SHIFT 0x0
+#define BIOS_SCRATCH_9__BIOS_SCRATCH_9_MASK 0xffffffff
+#define BIOS_SCRATCH_9__BIOS_SCRATCH_9__SHIFT 0x0
+#define BIOS_SCRATCH_10__BIOS_SCRATCH_10_MASK 0xffffffff
+#define BIOS_SCRATCH_10__BIOS_SCRATCH_10__SHIFT 0x0
+#define BIOS_SCRATCH_11__BIOS_SCRATCH_11_MASK 0xffffffff
+#define BIOS_SCRATCH_11__BIOS_SCRATCH_11__SHIFT 0x0
+#define BIOS_SCRATCH_12__BIOS_SCRATCH_12_MASK 0xffffffff
+#define BIOS_SCRATCH_12__BIOS_SCRATCH_12__SHIFT 0x0
+#define BIOS_SCRATCH_13__BIOS_SCRATCH_13_MASK 0xffffffff
+#define BIOS_SCRATCH_13__BIOS_SCRATCH_13__SHIFT 0x0
+#define BIOS_SCRATCH_14__BIOS_SCRATCH_14_MASK 0xffffffff
+#define BIOS_SCRATCH_14__BIOS_SCRATCH_14__SHIFT 0x0
+#define BIOS_SCRATCH_15__BIOS_SCRATCH_15_MASK 0xffffffff
+#define BIOS_SCRATCH_15__BIOS_SCRATCH_15__SHIFT 0x0
+#define VENDOR_ID__VENDOR_ID_MASK 0xffff
+#define VENDOR_ID__VENDOR_ID__SHIFT 0x0
+#define DEVICE_ID__DEVICE_ID_MASK 0xffff
+#define DEVICE_ID__DEVICE_ID__SHIFT 0x0
+#define COMMAND__IO_ACCESS_EN_MASK 0x1
+#define COMMAND__IO_ACCESS_EN__SHIFT 0x0
+#define COMMAND__MEM_ACCESS_EN_MASK 0x2
+#define COMMAND__MEM_ACCESS_EN__SHIFT 0x1
+#define COMMAND__BUS_MASTER_EN_MASK 0x4
+#define COMMAND__BUS_MASTER_EN__SHIFT 0x2
+#define COMMAND__SPECIAL_CYCLE_EN_MASK 0x8
+#define COMMAND__SPECIAL_CYCLE_EN__SHIFT 0x3
+#define COMMAND__MEM_WRITE_INVALIDATE_EN_MASK 0x10
+#define COMMAND__MEM_WRITE_INVALIDATE_EN__SHIFT 0x4
+#define COMMAND__PAL_SNOOP_EN_MASK 0x20
+#define COMMAND__PAL_SNOOP_EN__SHIFT 0x5
+#define COMMAND__PARITY_ERROR_RESPONSE_MASK 0x40
+#define COMMAND__PARITY_ERROR_RESPONSE__SHIFT 0x6
+#define COMMAND__AD_STEPPING_MASK 0x80
+#define COMMAND__AD_STEPPING__SHIFT 0x7
+#define COMMAND__SERR_EN_MASK 0x100
+#define COMMAND__SERR_EN__SHIFT 0x8
+#define COMMAND__FAST_B2B_EN_MASK 0x200
+#define COMMAND__FAST_B2B_EN__SHIFT 0x9
+#define COMMAND__INT_DIS_MASK 0x400
+#define COMMAND__INT_DIS__SHIFT 0xa
+#define STATUS__INT_STATUS_MASK 0x8
+#define STATUS__INT_STATUS__SHIFT 0x3
+#define STATUS__CAP_LIST_MASK 0x10
+#define STATUS__CAP_LIST__SHIFT 0x4
+#define STATUS__PCI_66_EN_MASK 0x20
+#define STATUS__PCI_66_EN__SHIFT 0x5
+#define STATUS__FAST_BACK_CAPABLE_MASK 0x80
+#define STATUS__FAST_BACK_CAPABLE__SHIFT 0x7
+#define STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x100
+#define STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x8
+#define STATUS__DEVSEL_TIMING_MASK 0x600
+#define STATUS__DEVSEL_TIMING__SHIFT 0x9
+#define STATUS__SIGNAL_TARGET_ABORT_MASK 0x800
+#define STATUS__SIGNAL_TARGET_ABORT__SHIFT 0xb
+#define STATUS__RECEIVED_TARGET_ABORT_MASK 0x1000
+#define STATUS__RECEIVED_TARGET_ABORT__SHIFT 0xc
+#define STATUS__RECEIVED_MASTER_ABORT_MASK 0x2000
+#define STATUS__RECEIVED_MASTER_ABORT__SHIFT 0xd
+#define STATUS__SIGNALED_SYSTEM_ERROR_MASK 0x4000
+#define STATUS__SIGNALED_SYSTEM_ERROR__SHIFT 0xe
+#define STATUS__PARITY_ERROR_DETECTED_MASK 0x8000
+#define STATUS__PARITY_ERROR_DETECTED__SHIFT 0xf
+#define REVISION_ID__MINOR_REV_ID_MASK 0xf
+#define REVISION_ID__MINOR_REV_ID__SHIFT 0x0
+#define REVISION_ID__MAJOR_REV_ID_MASK 0xf0
+#define REVISION_ID__MAJOR_REV_ID__SHIFT 0x4
+#define PROG_INTERFACE__PROG_INTERFACE_MASK 0xff
+#define PROG_INTERFACE__PROG_INTERFACE__SHIFT 0x0
+#define SUB_CLASS__SUB_CLASS_MASK 0xff
+#define SUB_CLASS__SUB_CLASS__SHIFT 0x0
+#define BASE_CLASS__BASE_CLASS_MASK 0xff
+#define BASE_CLASS__BASE_CLASS__SHIFT 0x0
+#define CACHE_LINE__CACHE_LINE_SIZE_MASK 0xff
+#define CACHE_LINE__CACHE_LINE_SIZE__SHIFT 0x0
+#define LATENCY__LATENCY_TIMER_MASK 0xff
+#define LATENCY__LATENCY_TIMER__SHIFT 0x0
+#define HEADER__HEADER_TYPE_MASK 0x7f
+#define HEADER__HEADER_TYPE__SHIFT 0x0
+#define HEADER__DEVICE_TYPE_MASK 0x80
+#define HEADER__DEVICE_TYPE__SHIFT 0x7
+#define BIST__BIST_COMP_MASK 0xf
+#define BIST__BIST_COMP__SHIFT 0x0
+#define BIST__BIST_STRT_MASK 0x40
+#define BIST__BIST_STRT__SHIFT 0x6
+#define BIST__BIST_CAP_MASK 0x80
+#define BIST__BIST_CAP__SHIFT 0x7
+#define BASE_ADDR_1__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_1__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_2__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_2__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_3__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_3__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_4__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_4__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_5__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_5__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_6__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_6__BASE_ADDR__SHIFT 0x0
+#define ROM_BASE_ADDR__BASE_ADDR_MASK 0xffffffff
+#define ROM_BASE_ADDR__BASE_ADDR__SHIFT 0x0
+#define CAP_PTR__CAP_PTR_MASK 0xff
+#define CAP_PTR__CAP_PTR__SHIFT 0x0
+#define INTERRUPT_LINE__INTERRUPT_LINE_MASK 0xff
+#define INTERRUPT_LINE__INTERRUPT_LINE__SHIFT 0x0
+#define INTERRUPT_PIN__INTERRUPT_PIN_MASK 0xff
+#define INTERRUPT_PIN__INTERRUPT_PIN__SHIFT 0x0
+#define ADAPTER_ID__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define ADAPTER_ID__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define ADAPTER_ID__SUBSYSTEM_ID_MASK 0xffff0000
+#define ADAPTER_ID__SUBSYSTEM_ID__SHIFT 0x10
+#define MIN_GRANT__MIN_GNT_MASK 0xff
+#define MIN_GRANT__MIN_GNT__SHIFT 0x0
+#define MAX_LATENCY__MAX_LAT_MASK 0xff
+#define MAX_LATENCY__MAX_LAT__SHIFT 0x0
+#define VENDOR_CAP_LIST__CAP_ID_MASK 0xff
+#define VENDOR_CAP_LIST__CAP_ID__SHIFT 0x0
+#define VENDOR_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define VENDOR_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define VENDOR_CAP_LIST__LENGTH_MASK 0xff0000
+#define VENDOR_CAP_LIST__LENGTH__SHIFT 0x10
+#define ADAPTER_ID_W__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define ADAPTER_ID_W__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define ADAPTER_ID_W__SUBSYSTEM_ID_MASK 0xffff0000
+#define ADAPTER_ID_W__SUBSYSTEM_ID__SHIFT 0x10
+#define PMI_CAP_LIST__CAP_ID_MASK 0xff
+#define PMI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PMI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define PMI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define PMI_CAP__VERSION_M

@@ -1,1011 +1,507 @@
-/* Driver for SanDisk SDDR-55 SmartMedia reader
- *
- * SDDR55 driver v0.1:
- *
- * First release
- *
- * Current development and maintenance by:
- *   (c) 2002 Simon Munton
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/jiffies.h>
-#include <linux/errno.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-
-#include "usb.h"
-#include "transport.h"
-#include "protocol.h"
-#include "debug.h"
-#include "scsiglue.h"
-
-#define DRV_NAME "ums-sddr55"
-
-MODULE_DESCRIPTION("Driver for SanDisk SDDR-55 SmartMedia reader");
-MODULE_AUTHOR("Simon Munton");
-MODULE_LICENSE("GPL");
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-static struct usb_device_id sddr55_usb_ids[] = {
-#	include "unusual_sddr55.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, sddr55_usb_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev sddr55_unusual_dev_list[] = {
-#	include "unusual_sddr55.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-
-#define short_pack(lsb,msb) ( ((u16)(lsb)) | ( ((u16)(msb))<<8 ) )
-#define LSB_of(s) ((s)&0xFF)
-#define MSB_of(s) ((s)>>8)
-#define PAGESIZE  512
-
-#define set_sense_info(sk, asc, ascq)	\
-    do {				\
-	info->sense_data[2] = sk;	\
-	info->sense_data[12] = asc;	\
-	info->sense_data[13] = ascq;	\
-	} while (0)
-
-
-struct sddr55_card_info {
-	unsigned long	capacity;	/* Size of card in bytes */
-	int		max_log_blks;	/* maximum number of logical blocks */
-	int		pageshift;	/* log2 of pagesize */
-	int		smallpageshift;	/* 1 if pagesize == 256 */
-	int		blocksize;	/* Size of block in pages */
-	int		blockshift;	/* log2 of blocksize */
-	int		blockmask;	/* 2^blockshift - 1 */
-	int		read_only;	/* non zero if card is write protected */
-	int		force_read_only;	/* non zero if we find a map error*/
-	int		*lba_to_pba;	/* logical to physical map */
-	int		*pba_to_lba;	/* physical to logical map */
-	int		fatal_error;	/* set if we detect something nasty */
-	unsigned long 	last_access;	/* number of jiffies since we last talked to device */
-	unsigned char   sense_data[18];
-};
-
-
-#define NOT_ALLOCATED		0xffffffff
-#define BAD_BLOCK		0xffff
-#define CIS_BLOCK		0x400
-#define UNUSED_BLOCK		0x3ff
-
-static int
-sddr55_bulk_transport(struct us_data *us, int direction,
-		      unsigned char *data, unsigned int len) {
-	struct sddr55_card_info *info = (struct sddr55_card_info *)us->extra;
-	unsigned int pipe = (direction == DMA_FROM_DEVICE) ?
-			us->recv_bulk_pipe : us->send_bulk_pipe;
-
-	if (!len)
-		return USB_STOR_XFER_GOOD;
-	info->last_access = jiffies;
-	return usb_stor_bulk_transfer_buf(us, pipe, data, len, NULL);
-}
-
-/* check if card inserted, if there is, update read_only status
- * return non zero if no card
- */
-
-static int sddr55_status(struct us_data *us)
-{
-	int result;
-	unsigned char *command = us->iobuf;
-	unsigned char *status = us->iobuf;
-	struct sddr55_card_info *info = (struct sddr55_card_info *)us->extra;
-
-	/* send command */
-	memset(command, 0, 8);
-	command[5] = 0xB0;
-	command[7] = 0x80;
-	result = sddr55_bulk_transport(us,
-		DMA_TO_DEVICE, command, 8);
-
-	usb_stor_dbg(us, "Result for send_command in status %d\n", result);
-
-	if (result != USB_STOR_XFER_GOOD) {
-		set_sense_info (4, 0, 0);	/* hardware error */
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	result = sddr55_bulk_transport(us,
-		DMA_FROM_DEVICE, status,	4);
-
-	/* expect to get short transfer if no card fitted */
-	if (result == USB_STOR_XFER_SHORT || result == USB_STOR_XFER_STALLED) {
-		/* had a short transfer, no card inserted, free map memory */
-		kfree(info->lba_to_pba);
-		kfree(info->pba_to_lba);
-		info->lba_to_pba = NULL;
-		info->pba_to_lba = NULL;
-
-		info->fatal_error = 0;
-		info->force_read_only = 0;
-
-		set_sense_info (2, 0x3a, 0);	/* not ready, medium not present */
-		return USB_STOR_TRANSPORT_FAILED;
-	}
-
-	if (result != USB_STOR_XFER_GOOD) {
-		set_sense_info (4, 0, 0);	/* hardware error */
-		return USB_STOR_TRANSPORT_FAILED;
-	}
-	
-	/* check write protect status */
-	info->read_only = (status[0] & 0x20);
-
-	/* now read status */
-	result = sddr55_bulk_transport(us,
-		DMA_FROM_DEVICE, status,	2);
-
-	if (result != USB_STOR_XFER_GOOD) {
-		set_sense_info (4, 0, 0);	/* hardware error */
-	}
-
-	return (result == USB_STOR_XFER_GOOD ?
-			USB_STOR_TRANSPORT_GOOD : USB_STOR_TRANSPORT_FAILED);
-}
-
-
-static int sddr55_read_data(struct us_data *us,
-		unsigned int lba,
-		unsigned int page,
-		unsigned short sectors) {
-
-	int result = USB_STOR_TRANSPORT_GOOD;
-	unsigned char *command = us->iobuf;
-	unsigned char *status = us->iobuf;
-	struct sddr55_card_info *info = (struct sddr55_card_info *)us->extra;
-	unsigned char *buffer;
-
-	unsigned int pba;
-	unsigned long address;
-
-	unsigned short pages;
-	unsigned int len, offset;
-	struct scatterlist *sg;
-
-	// Since we only read in one block at a time, we have to create
-	// a bounce buffer and move the data a piece at a time between the
-	// bounce buffer and the actual transfer buffer.
-
-	len = min((unsigned int) sectors, (unsigned int) info->blocksize >>
-			info->smallpageshift) * PAGESIZE;
-	buffer = kmalloc(len, GFP_NOIO);
-	if (buffer == NULL)
-		return USB_STOR_TRANSPORT_ERROR; /* out of memory */
-	offset = 0;
-	sg = NULL;
-
-	while (sectors>0) {
-
-		/* have we got to end? */
-		if (lba >= info->max_log_blks)
-			break;
-
-		pba = info->lba_to_pba[lba];
-
-		// Read as many sectors as possible in this block
-
-		pages = min((unsigned int) sectors << info->smallpageshift,
-				info->blocksize - page);
-		len = pages << info->pageshift;
-
-		usb_stor_dbg(us, "Read %02X pages, from PBA %04X (LBA %04X) page %02X\n",
-			     pages, pba, lba, page);
-
-		if (pba == NOT_ALLOCATED) {
-			/* no pba for this lba, fill with zeroes */
-			memset (buffer, 0, len);
-		} else {
-
-			address = (pba << info->blockshift) + page;
-
-			command[0] = 0;
-			command[1] = LSB_of(address>>16);
-			command[2] = LSB_of(address>>8);
-			command[3] = LSB_of(address);
-
-			command[4] = 0;
-			command[5] = 0xB0;
-			command[6] = LSB_of(pages << (1 - info->smallpageshift));
-			command[7] = 0x85;
-
-			/* send command */
-			result = sddr55_bulk_transport(us,
-				DMA_TO_DEVICE, command, 8);
-
-			usb_stor_dbg(us, "Result for send_command in read_data %d\n",
-				     result);
-
-			if (result != USB_STOR_XFER_GOOD) {
-				result = USB_STOR_TRANSPORT_ERROR;
-				goto leave;
-			}
-
-			/* read data */
-			result = sddr55_bulk_transport(us,
-				DMA_FROM_DEVICE, buffer, len);
-
-			if (result != USB_STOR_XFER_GOOD) {
-				result = USB_STOR_TRANSPORT_ERROR;
-				goto leave;
-			}
-
-			/* now read status */
-			result = sddr55_bulk_transport(us,
-				DMA_FROM_DEVICE, status, 2);
-
-			if (result != USB_STOR_XFER_GOOD) {
-				result = USB_STOR_TRANSPORT_ERROR;
-				goto leave;
-			}
-
-			/* check status for error */
-			if (status[0] == 0xff && status[1] == 0x4) {
-				set_sense_info (3, 0x11, 0);
-				result = USB_STOR_TRANSPORT_FAILED;
-				goto leave;
-			}
-		}
-
-		// Store the data in the transfer buffer
-		usb_stor_access_xfer_buf(buffer, len, us->srb,
-				&sg, &offset, TO_XFER_BUF);
-
-		page = 0;
-		lba++;
-		sectors -= pages >> info->smallpageshift;
-	}
-
-	result = USB_STOR_TRANSPORT_GOOD;
-
-leave:
-	kfree(buffer);
-
-	return result;
-}
-
-static int sddr55_write_data(struct us_data *us,
-		unsigned int lba,
-		unsigned int page,
-		unsigned short sectors) {
-
-	int result = USB_STOR_TRANSPORT_GOOD;
-	unsigned char *command = us->iobuf;
-	unsigned char *status = us->iobuf;
-	struct sddr55_card_info *info = (struct sddr55_card_info *)us->extra;
-	unsigned char *buffer;
-
-	unsigned int pba;
-	unsigned int new_pba;
-	unsigned long address;
-
-	unsigned short pages;
-	int i;
-	unsigned int len, offset;
-	struct scatterlist *sg;
-
-	/* check if we are allowed to write */
-	if (info->read_only || info->force_read_only) {
-		set_sense_info (7, 0x27, 0);	/* read only */
-		return USB_STOR_TRANSPORT_FAILED;
-	}
-
-	// Since we only write one block at a time, we have to create
-	// a bounce buffer and move the data a piece at a time between the
-	// bounce buffer and the actual transfer buffer.
-
-	len = min((unsigned int) sectors, (unsigned int) info->blocksize >>
-			info->smallpageshift) * PAGESIZE;
-	buffer = kmalloc(len, GFP_NOIO);
-	if (buffer == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-	offset = 0;
-	sg = NULL;
-
-	while (sectors > 0) {
-
-		/* have we got to end? */
-		if (lba >= info->max_log_blks)
-			break;
-
-		pba = info->lba_to_pba[lba];
-
-		// Write as many sectors as possible in this block
-
-		pages = min((unsigned int) sectors << info->smallpageshift,
-				info->blocksize - page);
-		len = pages << info->pageshift;
-
-		// Get the data from the transfer buffer
-		usb_stor_access_xfer_buf(buffer, len, us->srb,
-				&sg, &offset, FROM_XFER_BUF);
-
-		usb_stor_dbg(us, "Write %02X pages, to PBA %04X (LBA %04X) page %02X\n",
-			     pages, pba, lba, page);
-			
-		command[4] = 0;
-
-		if (pba == NOT_ALLOCATED) {
-			/* no pba allocated for this lba, find a free pba to use */
-
-			int max_pba = (info->max_log_blks / 250 ) * 256;
-			int found_count = 0;
-			int found_pba = -1;
-
-			/* set pba to first block in zone lba is in */
-			pba = (lba / 1000) * 1024;
-
-			usb_stor_dbg(us, "No PBA for LBA %04X\n", lba);
-
-			if (max_pba > 1024)
-				max_pba = 1024;
-
-			/*
-			 * Scan through the map looking for an unused block
-			 * leave 16 unused blocks at start (or as many as
-			 * possible) since the sddr55 seems to reuse a used
-			 * block when it shouldn't if we don't leave space.
-			 */
-			for (i = 0; i < max_pba; i++, pba++) {
-				if (info->pba_to_lba[pba] == UNUSED_BLOCK) {
-					found_pba = pba;
-					if (found_count++ > 16)
-						break;
-				}
-			}
-
-			pba = found_pba;
-
-			if (pba == -1) {
-				/* oh dear */
-				usb_stor_dbg(us, "Couldn't find unallocated block\n");
-
-				set_sense_info (3, 0x31, 0);	/* medium error */
-				result = USB_STOR_TRANSPORT_FAILED;
-				goto leave;
-			}
-
-			usb_stor_dbg(us, "Allocating PBA %04X for LBA %04X\n",
-				     pba, lba);
-
-			/* set writing to unallocated block flag */
-			command[4] = 0x40;
-		}
-
-		address = (pba << info->blockshift) + page;
-
-		command[1] = LSB_of(address>>16);
-		command[2] = LSB_of(address>>8); 
-		command[3] = LSB_of(address);
-
-		/* set the lba into the command, modulo 1000 */
-		command[0] = LSB_of(lba % 1000);
-		command[6] = MSB_of(lba % 1000);
-
-		command[4] |= LSB_of(pages >> info->smallpageshift);
-		command[5] = 0xB0;
-		command[7] = 0x86;
-
-		/* send command */
-		result = sddr55_bulk_transport(us,
-			DMA_TO_DEVICE, command, 8);
-
-		if (result != USB_STOR_XFER_GOOD) {
-			usb_stor_dbg(us, "Result for send_command in write_data %d\n",
-				     result);
-
-			/* set_sense_info is superfluous here? */
-			set_sense_info (3, 0x3, 0);/* peripheral write error */
-			result = USB_STOR_TRANSPORT_FAILED;
-			goto leave;
-		}
-
-		/* send the data */
-		result = sddr55_bulk_transport(us,
-			DMA_TO_DEVICE, buffer, len);
-
-		if (result != USB_STOR_XFER_GOOD) {
-			usb_stor_dbg(us, "Result for send_data in write_data %d\n",
-				     result);
-
-			/* set_sense_info is superfluous here? */
-			set_sense_info (3, 0x3, 0);/* peripheral write error */
-			result = USB_STOR_TRANSPORT_FAILED;
-			goto leave;
-		}
-
-		/* now read status */
-		result = sddr55_bulk_transport(us, DMA_FROM_DEVICE, status, 6);
-
-		if (result != USB_STOR_XFER_GOOD) {
-			usb_stor_dbg(us, "Result for get_status in write_data %d\n",
-				     result);
-
-			/* set_sense_info is superfluous here? */
-			set_sense_info (3, 0x3, 0);/* peripheral write error */
-			result = USB_STOR_TRANSPORT_FAILED;
-			goto leave;
-		}
-
-		new_pba = (status[3] + (status[4] << 8) + (status[5] << 16))
-						  >> info->blockshift;
-
-		/* check status for error */
-		if (status[0] == 0xff && status[1] == 0x4) {
-			info->pba_to_lba[new_pba] = BAD_BLOCK;
-
-			set_sense_info (3, 0x0c, 0);
-			result = USB_STOR_TRANSPORT_FAILED;
-			goto leave;
-		}
-
-		usb_stor_dbg(us, "Updating maps for LBA %04X: old PBA %04X, new PBA %04X\n",
-			     lba, pba, new_pba);
-
-		/* update the lba<->pba maps, note new_pba might be the same as pba */
-		info->lba_to_pba[lba] = new_pba;
-		info->pba_to_lba[pba] = UNUSED_BLOCK;
-
-		/* check that new_pba wasn't already being used */
-		if (info->pba_to_lba[new_pba] != UNUSED_BLOCK) {
-			printk(KERN_ERR "sddr55 error: new PBA %04X already in use for LBA %04X\n",
-				new_pba, info->pba_to_lba[new_pba]);
-			info->fatal_error = 1;
-			set_sense_info (3, 0x31, 0);
-			result = USB_STOR_TRANSPORT_FAILED;
-			goto leave;
-		}
-
-		/* update the pba<->lba maps for new_pba */
-		info->pba_to_lba[new_pba] = lba % 1000;
-
-		page = 0;
-		lba++;
-		sectors -= pages >> info->smallpageshift;
-	}
-	result = USB_STOR_TRANSPORT_GOOD;
-
- leave:
-	kfree(buffer);
-	return result;
-}
-
-static int sddr55_read_deviceID(struct us_data *us,
-		unsigned char *manufacturerID,
-		unsigned char *deviceID) {
-
-	int result;
-	unsigned char *command = us->iobuf;
-	unsigned char *content = us->iobuf;
-
-	memset(command, 0, 8);
-	command[5] = 0xB0;
-	command[7] = 0x84;
-	result = sddr55_bulk_transport(us, DMA_TO_DEVICE, command, 8);
-
-	usb_stor_dbg(us, "Result of send_control for device ID is %d\n",
-		     result);
-
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	result = sddr55_bulk_transport(us,
-		DMA_FROM_DEVICE, content, 4);
-
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	*manufacturerID = content[0];
-	*deviceID = content[1];
-
-	if (content[0] != 0xff)	{
-    		result = sddr55_bulk_transport(us,
-			DMA_FROM_DEVICE, content, 2);
-	}
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-
-static int sddr55_reset(struct us_data *us)
-{
-	return 0;
-}
-
-
-static unsigned long sddr55_get_capacity(struct us_data *us) {
-
-	unsigned char uninitialized_var(manufacturerID);
-	unsigned char uninitialized_var(deviceID);
-	int result;
-	struct sddr55_card_info *info = (struct sddr55_card_info *)us->extra;
-
-	usb_stor_dbg(us, "Reading capacity...\n");
-
-	result = sddr55_read_deviceID(us,
-		&manufacturerID,
-		&deviceID);
-
-	usb_stor_dbg(us, "Result of read_deviceID is %d\n", result);
-
-	if (result != USB_STOR_XFER_GOOD)
-		return 0;
-
-	usb_stor_dbg(us, "Device ID = %02X\n", deviceID);
-	usb_stor_dbg(us, "Manuf  ID = %02X\n", manufacturerID);
-
-	info->pageshift = 9;
-	info->smallpageshift = 0;
-	info->blocksize = 16;
-	info->blockshift = 4;
-	info->blockmask = 15;
-
-	switch (deviceID) {
-
-	case 0x6e: // 1MB
-	case 0xe8:
-	case 0xec:
-		info->pageshift = 8;
-		info->smallpageshift = 1;
-		return 0x00100000;
-
-	case 0xea: // 2MB
-	case 0x64:
-		info->pageshift = 8;
-		info->smallpageshift = 1;
-	case 0x5d: // 5d is a ROM card with pagesize 512.
-		return 0x00200000;
-
-	case 0xe3: // 4MB
-	case 0xe5:
-	case 0x6b:
-	case 0xd5:
-		return 0x00400000;
-
-	case 0xe6: // 8MB
-	case 0xd6:
-		return 0x00800000;
-
-	case 0x73: // 16MB
-		info->blocksize = 32;
-		info->blockshift = 5;
-		info->blockmask = 31;
-		return 0x01000000;
-
-	case 0x75: // 32MB
-		info->blocksize = 32;
-		info->blockshift = 5;
-		info->blockmask = 31;
-		return 0x02000000;
-
-	case 0x76: // 64MB
-		info->blocksize = 32;
-		info->blockshift = 5;
-		info->blockmask = 31;
-		return 0x04000000;
-
-	case 0x79: // 128MB
-		info->blocksize = 32;
-		info->blockshift = 5;
-		info->blockmask = 31;
-		return 0x08000000;
-
-	default: // unknown
-		return 0;
-
-	}
-}
-
-static int sddr55_read_map(struct us_data *us) {
-
-	struct sddr55_card_info *info = (struct sddr55_card_info *)(us->extra);
-	int numblocks;
-	unsigned char *buffer;
-	unsigned char *command = us->iobuf;
-	int i;
-	unsigned short lba;
-	unsigned short max_lba;
-	int result;
-
-	if (!info->capacity)
-		return -1;
-
-	numblocks = info->capacity >> (info->blockshift + info->pageshift);
-	
-	buffer = kmalloc( numblocks * 2, GFP_NOIO );
-	
-	if (!buffer)
-		return -1;
-
-	memset(command, 0, 8);
-	command[5] = 0xB0;
-	command[6] = numblocks * 2 / 256;
-	command[7] = 0x8A;
-
-	result = sddr55_bulk_transport(us, DMA_TO_DEVICE, command, 8);
-
-	if ( result != USB_STOR_XFER_GOOD) {
-		kfree (buffer);
-		return -1;
-	}
-
-	result = sddr55_bulk_transport(us, DMA_FROM_DEVICE, buffer, numblocks * 2);
-
-	if ( result != USB_STOR_XFER_GOOD) {
-		kfree (buffer);
-		return -1;
-	}
-
-	result = sddr55_bulk_transport(us, DMA_FROM_DEVICE, command, 2);
-
-	if ( result != USB_STOR_XFER_GOOD) {
-		kfree (buffer);
-		return -1;
-	}
-
-	kfree(info->lba_to_pba);
-	kfree(info->pba_to_lba);
-	info->lba_to_pba = kmalloc(numblocks*sizeof(int), GFP_NOIO);
-	info->pba_to_lba = kmalloc(numblocks*sizeof(int), GFP_NOIO);
-
-	if (info->lba_to_pba == NULL || info->pba_to_lba == NULL) {
-		kfree(info->lba_to_pba);
-		kfree(info->pba_to_lba);
-		info->lba_to_pba = NULL;
-		info->pba_to_lba = NULL;
-		kfree(buffer);
-		return -1;
-	}
-
-	memset(info->lba_to_pba, 0xff, numblocks*sizeof(int));
-	memset(info->pba_to_lba, 0xff, numblocks*sizeof(int));
-
-	/* set maximum lba */
-	max_lba = info->max_log_blks;
-	if (max_lba > 1000)
-		max_lba = 1000;
-
-	// Each block is 64 bytes of control data, so block i is located in
-	// scatterlist block i*64/128k = i*(2^6)*(2^-17) = i*(2^-11)
-
-	for (i=0; i<numblocks; i++) {
-		int zone = i / 1024;
-
-		lba = short_pack(buffer[i * 2], buffer[i * 2 + 1]);
-
-			/* Every 1024 physical blocks ("zone"), the LBA numbers
-			 * go back to zero, but are within a higher
-			 * block of LBA's. Also, there is a maximum of
-			 * 1000 LBA's per zone. In other words, in PBA
-			 * 1024-2047 you will find LBA 0-999 which are
-			 * really LBA 1000-1999. Yes, this wastes 24
-			 * physical blocks per zone. Go figure. 
-			 * These devices can have blocks go bad, so there
-			 * are 24 spare blocks to use when blocks do go bad.
-			 */
-
-			/* SDDR55 returns 0xffff for a bad block, and 0x400 for the 
-			 * CIS block. (Is this true for cards 8MB or less??)
-			 * Record these in the physical to logical map
-			 */ 
-
-		info->pba_to_lba[i] = lba;
-
-		if (lba >= max_lba) {
-			continue;
-		}
-		
-		if (info->lba_to_pba[lba + zone * 1000] != NOT_ALLOCATED &&
-		    !info->force_read_only) {
-			printk(KERN_WARNING
-			       "sddr55: map inconsistency at LBA %04X\n",
-			       lba + zone * 1000);
-			info->force_read_only = 1;
-		}
-
-		if (lba<0x10 || (lba>=0x3E0 && lba<0x3EF))
-			usb_stor_dbg(us, "LBA %04X <-> PBA %04X\n", lba, i);
-
-		info->lba_to_pba[lba + zone * 1000] = i;
-	}
-
-	kfree(buffer);
-	return 0;
-}
-
-
-static void sddr55_card_info_destructor(void *extra) {
-	struct sddr55_card_info *info = (struct sddr55_card_info *)extra;
-
-	if (!extra)
-		return;
-
-	kfree(info->lba_to_pba);
-	kfree(info->pba_to_lba);
-}
-
-
-/*
- * Transport for the Sandisk SDDR-55
- */
-static int sddr55_transport(struct scsi_cmnd *srb, struct us_data *us)
-{
-	int result;
-	static unsigned char inquiry_response[8] = {
-		0x00, 0x80, 0x00, 0x02, 0x1F, 0x00, 0x00, 0x00
-	};
- 	// write-protected for now, no block descriptor support
-	static unsigned char mode_page_01[20] = {
-		0x0, 0x12, 0x00, 0x80, 0x0, 0x0, 0x0, 0x0,
-		0x01, 0x0A,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-	};
-	unsigned char *ptr = us->iobuf;
-	unsigned long capacity;
-	unsigned int lba;
-	unsigned int pba;
-	unsigned int page;
-	unsigned short pages;
-	struct sddr55_card_info *info;
-
-	if (!us->extra) {
-		us->extra = kzalloc(
-			sizeof(struct sddr55_card_info), GFP_NOIO);
-		if (!us->extra)
-			return USB_STOR_TRANSPORT_ERROR;
-		us->extra_destructor = sddr55_card_info_destructor;
-	}
-
-	info = (struct sddr55_card_info *)(us->extra);
-
-	if (srb->cmnd[0] == REQUEST_SENSE) {
-		usb_stor_dbg(us, "request sense %02x/%02x/%02x\n",
-			     info->sense_data[2],
-			     info->sense_data[12],
-			     info->sense_data[13]);
-
-		memcpy (ptr, info->sense_data, sizeof info->sense_data);
-		ptr[0] = 0x70;
-		ptr[7] = 11;
-		usb_stor_set_xfer_buf (ptr, sizeof info->sense_data, srb);
-		memset (info->sense_data, 0, sizeof info->sense_data);
-
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	memset (info->sense_data, 0, sizeof info->sense_data);
-
-	/* Dummy up a response for INQUIRY since SDDR55 doesn't
-	   respond to INQUIRY commands */
-
-	if (srb->cmnd[0] == INQUIRY) {
-		memcpy(ptr, inquiry_response, 8);
-		fill_inquiry_response(us, ptr, 36);
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	/* only check card status if the map isn't allocated, ie no card seen yet
-	 * or if it's been over half a second since we last accessed it
-	 */
-	if (info->lba_to_pba == NULL || time_after(jiffies, info->last_access + HZ/2)) {
-
-		/* check to see if a card is fitted */
-		result = sddr55_status (us);
-		if (result) {
-			result = sddr55_status (us);
-			if (!result) {
-			set_sense_info (6, 0x28, 0);	/* new media, set unit attention, not ready to ready */
-			}
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-	}
-
-	/* if we detected a problem with the map when writing,
-	   don't allow any more access */
-	if (info->fatal_error) {
-
-		set_sense_info (3, 0x31, 0);
-		return USB_STOR_TRANSPORT_FAILED;
-	}
-
-	if (srb->cmnd[0] == READ_CAPACITY) {
-
-		capacity = sddr55_get_capacity(us);
-
-		if (!capacity) {
-			set_sense_info (3, 0x30, 0); /* incompatible medium */
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-
-		info->capacity = capacity;
-
-		/* figure out the maximum logical block number, allowing for
-		 * the fact that only 250 out of every 256 are used */
-		info->max_log_blks = ((info->capacity >> (info->pageshift + info->blockshift)) / 256) * 250;
-
-		/* Last page in the card, adjust as we only use 250 out of
-		 * every 256 pages */
-		capacity = (capacity / 256) * 250;
-
-		capacity /= PAGESIZE;
-		capacity--;
-
-		((__be32 *) ptr)[0] = cpu_to_be32(capacity);
-		((__be32 *) ptr)[1] = cpu_to_be32(PAGESIZE);
-		usb_stor_set_xfer_buf(ptr, 8, srb);
-
-		sddr55_read_map(us);
-
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == MODE_SENSE_10) {
-
-		memcpy(ptr, mode_page_01, sizeof mode_page_01);
-		ptr[3] = (info->read_only || info->force_read_only) ? 0x80 : 0;
-		usb_stor_set_xfer_buf(ptr, sizeof(mode_page_01), srb);
-
-		if ( (srb->cmnd[2] & 0x3F) == 0x01 ) {
-			usb_stor_dbg(us, "Dummy up request for mode page 1\n");
-			return USB_STOR_TRANSPORT_GOOD;
-
-		} else if ( (srb->cmnd[2] & 0x3F) == 0x3F ) {
-			usb_stor_dbg(us, "Dummy up request for all mode pages\n");
-			return USB_STOR_TRANSPORT_GOOD;
-		}
-
-		set_sense_info (5, 0x24, 0);	/* invalid field in command */
-		return USB_STOR_TRANSPORT_FAILED;
-	}
-
-	if (srb->cmnd[0] == ALLOW_MEDIUM_REMOVAL) {
-
-		usb_stor_dbg(us, "%s medium removal. Not that I can do anything about it...\n",
-			     (srb->cmnd[4]&0x03) ? "Prevent" : "Allow");
-
-		return USB_STOR_TRANSPORT_GOOD;
-
-	}
-
-	if (srb->cmnd[0] == READ_10 || srb->cmnd[0] == WRITE_10) {
-
-		page = short_pack(srb->cmnd[3], srb->cmnd[2]);
-		page <<= 16;
-		page |= short_pack(srb->cmnd[5], srb->cmnd[4]);
-		pages = short_pack(srb->cmnd[8], srb->cmnd[7]);
-
-		page <<= info->smallpageshift;
-
-		// convert page to block and page-within-block
-
-		lba = page >> info->blockshift;
-		page = page & info->blockmask;
-
-		// locate physical block corresponding to logical block
-
-		if (lba >= info->max_log_blks) {
-
-			usb_stor_dbg(us, "Error: Requested LBA %04X exceeds maximum block %04X\n",
-				     lba, info->max_log_blks - 1);
-
-			set_sense_info (5, 0x24, 0);	/* invalid field in command */
-
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-
-		pba = info->lba_to_pba[lba];
-
-		if (srb->cmnd[0] == WRITE_10) {
-			usb_stor_dbg(us, "WRITE_10: write block %04X (LBA %04X) page %01X pages %d\n",
-				     pba, lba, page, pages);
-
-			return sddr55_write_data(us, lba, page, pages);
-		} else {
-			usb_stor_dbg(us, "READ_10: read block %04X (LBA %04X) page %01X pages %d\n",
-				     pba, lba, page, pages);
-
-			return sddr55_read_data(us, lba, page, pages);
-		}
-	}
-
-
-	if (srb->cmnd[0] == TEST_UNIT_READY) {
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == START_STOP) {
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	set_sense_info (5, 0x20, 0);	/* illegal command */
-
-	return USB_STOR_TRANSPORT_FAILED; // FIXME: sense buffer?
-}
-
-static struct scsi_host_template sddr55_host_template;
-
-static int sddr55_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-
-	result = usb_stor_probe1(&us, intf, id,
-			(id - sddr55_usb_ids) + sddr55_unusual_dev_list,
-			&sddr55_host_template);
-	if (result)
-		return result;
-
-	us->transport_name = "SDDR55";
-	us->transport = sddr55_transport;
-	us->transport_reset = sddr55_reset;
-	us->max_lun = 0;
-
-	result = usb_stor_probe2(us);
-	return result;
-}
-
-static struct usb_driver sddr55_driver = {
-	.name =		DRV_NAME,
-	.probe =	sddr55_probe,
-	.disconnect =	usb_stor_disconnect,
-	.suspend =	usb_stor_suspend,
-	.resume =	usb_stor_resume,
-	.reset_resume =	usb_stor_reset_resume,
-	.pre_reset =	usb_stor_pre_reset,
-	.post_reset =	usb_stor_post_reset,
-	.id_table =	sddr55_usb_ids,
-	.soft_unbind =	1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(sddr55_driver, sddr55_host_template, DRV_NAME);
+xfffffffc
+#define BIF_RB_WPTR_ADDR_LO__ADDR__SHIFT 0x2
+#define VENDOR_ID__VENDOR_ID_MASK 0xffff
+#define VENDOR_ID__VENDOR_ID__SHIFT 0x0
+#define DEVICE_ID__DEVICE_ID_MASK 0xffff
+#define DEVICE_ID__DEVICE_ID__SHIFT 0x0
+#define COMMAND__IO_ACCESS_EN_MASK 0x1
+#define COMMAND__IO_ACCESS_EN__SHIFT 0x0
+#define COMMAND__MEM_ACCESS_EN_MASK 0x2
+#define COMMAND__MEM_ACCESS_EN__SHIFT 0x1
+#define COMMAND__BUS_MASTER_EN_MASK 0x4
+#define COMMAND__BUS_MASTER_EN__SHIFT 0x2
+#define COMMAND__SPECIAL_CYCLE_EN_MASK 0x8
+#define COMMAND__SPECIAL_CYCLE_EN__SHIFT 0x3
+#define COMMAND__MEM_WRITE_INVALIDATE_EN_MASK 0x10
+#define COMMAND__MEM_WRITE_INVALIDATE_EN__SHIFT 0x4
+#define COMMAND__PAL_SNOOP_EN_MASK 0x20
+#define COMMAND__PAL_SNOOP_EN__SHIFT 0x5
+#define COMMAND__PARITY_ERROR_RESPONSE_MASK 0x40
+#define COMMAND__PARITY_ERROR_RESPONSE__SHIFT 0x6
+#define COMMAND__AD_STEPPING_MASK 0x80
+#define COMMAND__AD_STEPPING__SHIFT 0x7
+#define COMMAND__SERR_EN_MASK 0x100
+#define COMMAND__SERR_EN__SHIFT 0x8
+#define COMMAND__FAST_B2B_EN_MASK 0x200
+#define COMMAND__FAST_B2B_EN__SHIFT 0x9
+#define COMMAND__INT_DIS_MASK 0x400
+#define COMMAND__INT_DIS__SHIFT 0xa
+#define STATUS__INT_STATUS_MASK 0x8
+#define STATUS__INT_STATUS__SHIFT 0x3
+#define STATUS__CAP_LIST_MASK 0x10
+#define STATUS__CAP_LIST__SHIFT 0x4
+#define STATUS__PCI_66_EN_MASK 0x20
+#define STATUS__PCI_66_EN__SHIFT 0x5
+#define STATUS__FAST_BACK_CAPABLE_MASK 0x80
+#define STATUS__FAST_BACK_CAPABLE__SHIFT 0x7
+#define STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x100
+#define STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x8
+#define STATUS__DEVSEL_TIMING_MASK 0x600
+#define STATUS__DEVSEL_TIMING__SHIFT 0x9
+#define STATUS__SIGNAL_TARGET_ABORT_MASK 0x800
+#define STATUS__SIGNAL_TARGET_ABORT__SHIFT 0xb
+#define STATUS__RECEIVED_TARGET_ABORT_MASK 0x1000
+#define STATUS__RECEIVED_TARGET_ABORT__SHIFT 0xc
+#define STATUS__RECEIVED_MASTER_ABORT_MASK 0x2000
+#define STATUS__RECEIVED_MASTER_ABORT__SHIFT 0xd
+#define STATUS__SIGNALED_SYSTEM_ERROR_MASK 0x4000
+#define STATUS__SIGNALED_SYSTEM_ERROR__SHIFT 0xe
+#define STATUS__PARITY_ERROR_DETECTED_MASK 0x8000
+#define STATUS__PARITY_ERROR_DETECTED__SHIFT 0xf
+#define REVISION_ID__MINOR_REV_ID_MASK 0xf
+#define REVISION_ID__MINOR_REV_ID__SHIFT 0x0
+#define REVISION_ID__MAJOR_REV_ID_MASK 0xf0
+#define REVISION_ID__MAJOR_REV_ID__SHIFT 0x4
+#define PROG_INTERFACE__PROG_INTERFACE_MASK 0xff
+#define PROG_INTERFACE__PROG_INTERFACE__SHIFT 0x0
+#define SUB_CLASS__SUB_CLASS_MASK 0xff
+#define SUB_CLASS__SUB_CLASS__SHIFT 0x0
+#define BASE_CLASS__BASE_CLASS_MASK 0xff
+#define BASE_CLASS__BASE_CLASS__SHIFT 0x0
+#define CACHE_LINE__CACHE_LINE_SIZE_MASK 0xff
+#define CACHE_LINE__CACHE_LINE_SIZE__SHIFT 0x0
+#define LATENCY__LATENCY_TIMER_MASK 0xff
+#define LATENCY__LATENCY_TIMER__SHIFT 0x0
+#define HEADER__HEADER_TYPE_MASK 0x7f
+#define HEADER__HEADER_TYPE__SHIFT 0x0
+#define HEADER__DEVICE_TYPE_MASK 0x80
+#define HEADER__DEVICE_TYPE__SHIFT 0x7
+#define BIST__BIST_COMP_MASK 0xf
+#define BIST__BIST_COMP__SHIFT 0x0
+#define BIST__BIST_STRT_MASK 0x40
+#define BIST__BIST_STRT__SHIFT 0x6
+#define BIST__BIST_CAP_MASK 0x80
+#define BIST__BIST_CAP__SHIFT 0x7
+#define BASE_ADDR_1__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_1__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_2__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_2__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_3__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_3__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_4__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_4__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_5__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_5__BASE_ADDR__SHIFT 0x0
+#define BASE_ADDR_6__BASE_ADDR_MASK 0xffffffff
+#define BASE_ADDR_6__BASE_ADDR__SHIFT 0x0
+#define ROM_BASE_ADDR__BASE_ADDR_MASK 0xffffffff
+#define ROM_BASE_ADDR__BASE_ADDR__SHIFT 0x0
+#define CAP_PTR__CAP_PTR_MASK 0xff
+#define CAP_PTR__CAP_PTR__SHIFT 0x0
+#define INTERRUPT_LINE__INTERRUPT_LINE_MASK 0xff
+#define INTERRUPT_LINE__INTERRUPT_LINE__SHIFT 0x0
+#define INTERRUPT_PIN__INTERRUPT_PIN_MASK 0xff
+#define INTERRUPT_PIN__INTERRUPT_PIN__SHIFT 0x0
+#define ADAPTER_ID__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define ADAPTER_ID__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define ADAPTER_ID__SUBSYSTEM_ID_MASK 0xffff0000
+#define ADAPTER_ID__SUBSYSTEM_ID__SHIFT 0x10
+#define MIN_GRANT__MIN_GNT_MASK 0xff
+#define MIN_GRANT__MIN_GNT__SHIFT 0x0
+#define MAX_LATENCY__MAX_LAT_MASK 0xff
+#define MAX_LATENCY__MAX_LAT__SHIFT 0x0
+#define VENDOR_CAP_LIST__CAP_ID_MASK 0xff
+#define VENDOR_CAP_LIST__CAP_ID__SHIFT 0x0
+#define VENDOR_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define VENDOR_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define VENDOR_CAP_LIST__LENGTH_MASK 0xff0000
+#define VENDOR_CAP_LIST__LENGTH__SHIFT 0x10
+#define ADAPTER_ID_W__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define ADAPTER_ID_W__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define ADAPTER_ID_W__SUBSYSTEM_ID_MASK 0xffff0000
+#define ADAPTER_ID_W__SUBSYSTEM_ID__SHIFT 0x10
+#define PMI_CAP_LIST__CAP_ID_MASK 0xff
+#define PMI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PMI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define PMI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define PMI_CAP__VERSION_MASK 0x7
+#define PMI_CAP__VERSION__SHIFT 0x0
+#define PMI_CAP__PME_CLOCK_MASK 0x8
+#define PMI_CAP__PME_CLOCK__SHIFT 0x3
+#define PMI_CAP__DEV_SPECIFIC_INIT_MASK 0x20
+#define PMI_CAP__DEV_SPECIFIC_INIT__SHIFT 0x5
+#define PMI_CAP__AUX_CURRENT_MASK 0x1c0
+#define PMI_CAP__AUX_CURRENT__SHIFT 0x6
+#define PMI_CAP__D1_SUPPORT_MASK 0x200
+#define PMI_CAP__D1_SUPPORT__SHIFT 0x9
+#define PMI_CAP__D2_SUPPORT_MASK 0x400
+#define PMI_CAP__D2_SUPPORT__SHIFT 0xa
+#define PMI_CAP__PME_SUPPORT_MASK 0xf800
+#define PMI_CAP__PME_SUPPORT__SHIFT 0xb
+#define PMI_STATUS_CNTL__POWER_STATE_MASK 0x3
+#define PMI_STATUS_CNTL__POWER_STATE__SHIFT 0x0
+#define PMI_STATUS_CNTL__NO_SOFT_RESET_MASK 0x8
+#define PMI_STATUS_CNTL__NO_SOFT_RESET__SHIFT 0x3
+#define PMI_STATUS_CNTL__PME_EN_MASK 0x100
+#define PMI_STATUS_CNTL__PME_EN__SHIFT 0x8
+#define PMI_STATUS_CNTL__DATA_SELECT_MASK 0x1e00
+#define PMI_STATUS_CNTL__DATA_SELECT__SHIFT 0x9
+#define PMI_STATUS_CNTL__DATA_SCALE_MASK 0x6000
+#define PMI_STATUS_CNTL__DATA_SCALE__SHIFT 0xd
+#define PMI_STATUS_CNTL__PME_STATUS_MASK 0x8000
+#define PMI_STATUS_CNTL__PME_STATUS__SHIFT 0xf
+#define PMI_STATUS_CNTL__B2_B3_SUPPORT_MASK 0x400000
+#define PMI_STATUS_CNTL__B2_B3_SUPPORT__SHIFT 0x16
+#define PMI_STATUS_CNTL__BUS_PWR_EN_MASK 0x800000
+#define PMI_STATUS_CNTL__BUS_PWR_EN__SHIFT 0x17
+#define PMI_STATUS_CNTL__PMI_DATA_MASK 0xff000000
+#define PMI_STATUS_CNTL__PMI_DATA__SHIFT 0x18
+#define PCIE_CAP_LIST__CAP_ID_MASK 0xff
+#define PCIE_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define PCIE_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define PCIE_CAP__VERSION_MASK 0xf
+#define PCIE_CAP__VERSION__SHIFT 0x0
+#define PCIE_CAP__DEVICE_TYPE_MASK 0xf0
+#define PCIE_CAP__DEVICE_TYPE__SHIFT 0x4
+#define PCIE_CAP__SLOT_IMPLEMENTED_MASK 0x100
+#define PCIE_CAP__SLOT_IMPLEMENTED__SHIFT 0x8
+#define PCIE_CAP__INT_MESSAGE_NUM_MASK 0x3e00
+#define PCIE_CAP__INT_MESSAGE_NUM__SHIFT 0x9
+#define DEVICE_CAP__MAX_PAYLOAD_SUPPORT_MASK 0x7
+#define DEVICE_CAP__MAX_PAYLOAD_SUPPORT__SHIFT 0x0
+#define DEVICE_CAP__PHANTOM_FUNC_MASK 0x18
+#define DEVICE_CAP__PHANTOM_FUNC__SHIFT 0x3
+#define DEVICE_CAP__EXTENDED_TAG_MASK 0x20
+#define DEVICE_CAP__EXTENDED_TAG__SHIFT 0x5
+#define DEVICE_CAP__L0S_ACCEPTABLE_LATENCY_MASK 0x1c0
+#define DEVICE_CAP__L0S_ACCEPTABLE_LATENCY__SHIFT 0x6
+#define DEVICE_CAP__L1_ACCEPTABLE_LATENCY_MASK 0xe00
+#define DEVICE_CAP__L1_ACCEPTABLE_LATENCY__SHIFT 0x9
+#define DEVICE_CAP__ROLE_BASED_ERR_REPORTING_MASK 0x8000
+#define DEVICE_CAP__ROLE_BASED_ERR_REPORTING__SHIFT 0xf
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT_MASK 0x3fc0000
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT__SHIFT 0x12
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE_MASK 0xc000000
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE__SHIFT 0x1a
+#define DEVICE_CAP__FLR_CAPABLE_MASK 0x10000000
+#define DEVICE_CAP__FLR_CAPABLE__SHIFT 0x1c
+#define DEVICE_CNTL__CORR_ERR_EN_MASK 0x1
+#define DEVICE_CNTL__CORR_ERR_EN__SHIFT 0x0
+#define DEVICE_CNTL__NON_FATAL_ERR_EN_MASK 0x2
+#define DEVICE_CNTL__NON_FATAL_ERR_EN__SHIFT 0x1
+#define DEVICE_CNTL__FATAL_ERR_EN_MASK 0x4
+#define DEVICE_CNTL__FATAL_ERR_EN__SHIFT 0x2
+#define DEVICE_CNTL__USR_REPORT_EN_MASK 0x8
+#define DEVICE_CNTL__USR_REPORT_EN__SHIFT 0x3
+#define DEVICE_CNTL__RELAXED_ORD_EN_MASK 0x10
+#define DEVICE_CNTL__RELAXED_ORD_EN__SHIFT 0x4
+#define DEVICE_CNTL__MAX_PAYLOAD_SIZE_MASK 0xe0
+#define DEVICE_CNTL__MAX_PAYLOAD_SIZE__SHIFT 0x5
+#define DEVICE_CNTL__EXTENDED_TAG_EN_MASK 0x100
+#define DEVICE_CNTL__EXTENDED_TAG_EN__SHIFT 0x8
+#define DEVICE_CNTL__PHANTOM_FUNC_EN_MASK 0x200
+#define DEVICE_CNTL__PHANTOM_FUNC_EN__SHIFT 0x9
+#define DEVICE_CNTL__AUX_POWER_PM_EN_MASK 0x400
+#define DEVICE_CNTL__AUX_POWER_PM_EN__SHIFT 0xa
+#define DEVICE_CNTL__NO_SNOOP_EN_MASK 0x800
+#define DEVICE_CNTL__NO_SNOOP_EN__SHIFT 0xb
+#define DEVICE_CNTL__MAX_READ_REQUEST_SIZE_MASK 0x7000
+#define DEVICE_CNTL__MAX_READ_REQUEST_SIZE__SHIFT 0xc
+#define DEVICE_CNTL__INITIATE_FLR_MASK 0x8000
+#define DEVICE_CNTL__INITIATE_FLR__SHIFT 0xf
+#define DEVICE_STATUS__CORR_ERR_MASK 0x1
+#define DEVICE_STATUS__CORR_ERR__SHIFT 0x0
+#define DEVICE_STATUS__NON_FATAL_ERR_MASK 0x2
+#define DEVICE_STATUS__NON_FATAL_ERR__SHIFT 0x1
+#define DEVICE_STATUS__FATAL_ERR_MASK 0x4
+#define DEVICE_STATUS__FATAL_ERR__SHIFT 0x2
+#define DEVICE_STATUS__USR_DETECTED_MASK 0x8
+#define DEVICE_STATUS__USR_DETECTED__SHIFT 0x3
+#define DEVICE_STATUS__AUX_PWR_MASK 0x10
+#define DEVICE_STATUS__AUX_PWR__SHIFT 0x4
+#define DEVICE_STATUS__TRANSACTIONS_PEND_MASK 0x20
+#define DEVICE_STATUS__TRANSACTIONS_PEND__SHIFT 0x5
+#define LINK_CAP__LINK_SPEED_MASK 0xf
+#define LINK_CAP__LINK_SPEED__SHIFT 0x0
+#define LINK_CAP__LINK_WIDTH_MASK 0x3f0
+#define LINK_CAP__LINK_WIDTH__SHIFT 0x4
+#define LINK_CAP__PM_SUPPORT_MASK 0xc00
+#define LINK_CAP__PM_SUPPORT__SHIFT 0xa
+#define LINK_CAP__L0S_EXIT_LATENCY_MASK 0x7000
+#define LINK_CAP__L0S_EXIT_LATENCY__SHIFT 0xc
+#define LINK_CAP__L1_EXIT_LATENCY_MASK 0x38000
+#define LINK_CAP__L1_EXIT_LATENCY__SHIFT 0xf
+#define LINK_CAP__CLOCK_POWER_MANAGEMENT_MASK 0x40000
+#define LINK_CAP__CLOCK_POWER_MANAGEMENT__SHIFT 0x12
+#define LINK_CAP__SURPRISE_DOWN_ERR_REPORTING_MASK 0x80000
+#define LINK_CAP__SURPRISE_DOWN_ERR_REPORTING__SHIFT 0x13
+#define LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE_MASK 0x100000
+#define LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE__SHIFT 0x14
+#define LINK_CAP__LINK_BW_NOTIFICATION_CAP_MASK 0x200000
+#define LINK_CAP__LINK_BW_NOTIFICATION_CAP__SHIFT 0x15
+#define LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE_MASK 0x400000
+#define LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE__SHIFT 0x16
+#define LINK_CAP__PORT_NUMBER_MASK 0xff000000
+#define LINK_CAP__PORT_NUMBER__SHIFT 0x18
+#define LINK_CNTL__PM_CONTROL_MASK 0x3
+#define LINK_CNTL__PM_CONTROL__SHIFT 0x0
+#define LINK_CNTL__READ_CPL_BOUNDARY_MASK 0x8
+#define LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define LINK_CNTL__LINK_DIS_MASK 0x10
+#define LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0x9
+#define LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN_MASK 0x400
+#define LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN__SHIFT 0xa
+#define LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN_MASK 0x800
+#define LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN__SHIFT 0xb
+#define LINK_STATUS__CURRENT_LINK_SPEED_MASK 0xf
+#define LINK_STATUS__CURRENT_LINK_SPEED__SHIFT 0x0
+#define LINK_STATUS__NEGOTIATED_LINK_WIDTH_MASK 0x3f0
+#define LINK_STATUS__NEGOTIATED_LINK_WIDTH__SHIFT 0x4
+#define LINK_STATUS__LINK_TRAINING_MASK 0x800
+#define LINK_STATUS__LINK_TRAINING__SHIFT 0xb
+#define LINK_STATUS__SLOT_CLOCK_CFG_MASK 0x1000
+#define LINK_STATUS__SLOT_CLOCK_CFG__SHIFT 0xc
+#define LINK_STATUS__DL_ACTIVE_MASK 0x2000
+#define LINK_STATUS__DL_ACTIVE__SHIFT 0xd
+#define LINK_STATUS__LINK_BW_MANAGEMENT_STATUS_MASK 0x4000
+#define LINK_STATUS__LINK_BW_MANAGEMENT_STATUS__SHIFT 0xe
+#define LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS_MASK 0x8000
+#define LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS__SHIFT 0xf
+#define DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED_MASK 0xf
+#define DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED__SHIFT 0x0
+#define DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED_MASK 0x10
+#define DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED__SHIFT 0x4
+#define DEVICE_CAP2__ARI_FORWARDING_SUPPORTED_MASK 0x20
+#define DEVICE_CAP2__ARI_FORWARDING_SUPPORTED__SHIFT 0x5
+#define DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING_MASK 0x400
+#define DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING__SHIFT 0xa
+#define DEVICE_CAP2__LTR_SUPPORTED_MASK 0x800
+#define DEVICE_CAP2__LTR_SUPPORTED__SHIFT 0xb
+#define DEVICE_CAP2__TPH_CPLR_SUPPORTED_MASK 0x3000
+#define DEVICE_CAP2__TPH_CPLR_SUPPORTED__SHIFT 0xc
+#define DEVICE_CAP2__OBFF_SUPPORTED_MASK 0xc0000
+#define DEVICE_CAP2__OBFF_SUPPORTED__SHIFT 0x12
+#define DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED_MASK 0x100000
+#define DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED__SHIFT 0x14
+#define DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED_MASK 0x200000
+#define DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED__SHIFT 0x15
+#define DEVICE_CAP2__MAX_END_END_TLP_PREFIXES_MASK 0xc00000
+#define DEVICE_CAP2__MAX_END_END_TLP_PREFIXES__SHIFT 0x16
+#define DEVICE_CNTL2__CPL_TIMEOUT_VALUE_MASK 0xf
+#define DEVICE_CNTL2__CPL_TIMEOUT_VALUE__SHIFT 0x0
+#define DEVICE_CNTL2__CPL_TIMEOUT_DIS_MASK 0x10
+#define DEVICE_CNTL2__CPL_TIMEOUT_DIS__SHIFT 0x4
+#define DEVICE_CNTL2__ARI_FORWARDING_EN_MASK 0x20
+#define DEVICE_CNTL2__ARI_FORWARDING_EN__SHIFT 0x5
+#define DEVICE_CNTL2__IDO_REQUEST_ENABLE_MASK 0x100
+#define DEVICE_CNTL2__IDO_REQUEST_ENABLE__SHIFT 0x8
+#define DEVICE_CNTL2__IDO_COMPLETION_ENABLE_MASK 0x200
+#define DEVICE_CNTL2__IDO_COMPLETION_ENABLE__SHIFT 0x9
+#define DEVICE_CNTL2__LTR_EN_MASK 0x400
+#define DEVICE_CNTL2__LTR_EN__SHIFT 0xa
+#define DEVICE_CNTL2__OBFF_EN_MASK 0x6000
+#define DEVICE_CNTL2__OBFF_EN__SHIFT 0xd
+#define DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING_MASK 0x8000
+#define DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING__SHIFT 0xf
+#define DEVICE_STATUS2__RESERVED_MASK 0xffff
+#define DEVICE_STATUS2__RESERVED__SHIFT 0x0
+#define LINK_CAP2__SUPPORTED_LINK_SPEED_MASK 0xfe
+#define LINK_CAP2__SUPPORTED_LINK_SPEED__SHIFT 0x1
+#define LINK_CAP2__CROSSLINK_SUPPORTED_MASK 0x100
+#define LINK_CAP2__CROSSLINK_SUPPORTED__SHIFT 0x8
+#define LINK_CAP2__RESERVED_MASK 0xfffffe00
+#define LINK_CAP2__RESERVED__SHIFT 0x9
+#define LINK_CNTL2__TARGET_LINK_SPEED_MASK 0xf
+#define LINK_CNTL2__TARGET_LINK_SPEED__SHIFT 0x0
+#define LINK_CNTL2__ENTER_COMPLIANCE_MASK 0x10
+#define LINK_CNTL2__ENTER_COMPLIANCE__SHIFT 0x4
+#define LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE_MASK 0x20
+#define LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define LINK_CNTL2__ENTER_MOD_COMPLIANCE_MASK 0x400
+#define LINK_CNTL2__ENTER_MOD_COMPLIANCE__SHIFT 0xa
+#define LINK_CNTL2__COMPLIANCE_SOS_MASK 0x800
+#define LINK_CNTL2__COMPLIANCE_SOS__SHIFT 0xb
+#define LINK_CNTL2__COMPLIANCE_DEEMPHASIS_MASK 0xf000
+#define LINK_CNTL2__COMPLIANCE_DEEMPHASIS__SHIFT 0xc
+#define LINK_STATUS2__CUR_DEEMPHASIS_LEVEL_MASK 0x1
+#define LINK_STATUS2__CUR_DEEMPHASIS_LEVEL__SHIFT 0x0
+#define LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x2
+#define LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x1
+#define LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x4
+#define LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x2
+#define LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS_MASK 0x8
+#define LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS__SHIFT 0x3
+#define LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS_MASK 0x10
+#define LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS__SHIFT 0x4
+#define LINK_STATUS2__LINK_EQUALIZATION_REQUEST_MASK 0x20
+#define LINK_STATUS2__LINK_EQUALIZATION_REQUEST__SHIFT 0x5
+#define MSI_CAP_LIST__CAP_ID_MASK 0xff
+#define MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define MSI_MSG_CNTL__MSI_EN_MASK 0x1
+#define MSI_MSG_CNTL__MSI_EN__SHIFT 0x0
+#define MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe
+#define MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x1
+#define MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x70
+#define MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x4
+#define MSI_MSG_CNTL__MSI_64BIT_MASK 0x80
+#define MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x7
+#define MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID_MASK 0xffff
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV_MASK 0xf0000
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV__SHIFT 0x10
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH_MASK 0xfff00000
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH__SHIFT 0x14
+#define PCIE_VENDOR_SPECIFIC1__SCRATCH_MASK 0xffffffff
+#define PCIE_VENDOR_SPECIFIC1__SCRATCH__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT_MASK 0x70
+#define PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT__SHIFT 0x4
+#define PCIE_PORT_VC_CAP_REG1__REF_CLK_MASK 0x300
+#define PCIE_PORT_VC_CAP_REG1__REF_CLK__SHIFT 0x8
+#define PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE_MASK 0xc00
+#define PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE__SHIFT 0xa
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP_MASK 0xff
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP__SHIFT 0x0
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE_MASK 0x1
+#define PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE__SHIFT 0x0
+#define PCIE_PORT_VC_CNTL__VC_ARB_SELECT_MASK 0xe
+#define PCIE_PORT_VC_CNTL__VC_ARB_SELECT__SHIFT 0x1
+#define PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define PCIE_VC0_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define PCIE_VC0_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define PCIE_VC0_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define PCIE_VC0_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x2
+#define PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x1
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define PCIE_VC1_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define PCIE_VC1_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define PCIE_VC1_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define PCIE_VC1_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x2
+#define PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x1
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO_MASK 0xffffffff
+#define PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO__SHIFT 0x0
+#define PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI_MASK 0xffffffff
+#define PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI__SHIFT 0x0
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS_MASK 0x10
+#define PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS__SHIFT 0x4
+#define PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS_MASK 0x20
+#define PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS__SHIFT 0x5
+#define PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS_MASK 0x1000
+#define PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS__SHIFT 0xc
+#define PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS_MASK 0x2000
+#define PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS__SHIFT 0xd
+#define PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS_MASK 0x4000
+#define PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS__SHIFT 0xe
+#define PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS_MASK 0x8000
+#define PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS__SHIFT 0xf
+#define PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS_MASK 0x10000
+#define PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS__SHIFT 0x10
+#define PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS_MASK 0x20000
+#define PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS__SHIFT 0x11
+#define PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS_MASK 0x40000
+#define PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS__SHIFT 0x12
+#define PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS_MASK 0x80000
+#define PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS__SHIFT 0x13
+#define PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS_MASK 0x100000
+#define PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS__SHIFT 0x14
+#define PCIE_UNCORR_ERR_STATUS__ACS_VIOLATION_STATUS_MASK 0x200000
+#define PCIE_UNCORR_ERR_STATUS__ACS_VIOLATION_STATUS__SHIFT 0x15
+#define PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS_MASK 0x400000
+#define PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS__SHIFT 0x16
+#define PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS_MASK 0x800000
+#define PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS__SHIFT 0x17
+#define PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS_MASK 0x1000000
+#define PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS__SHIFT 0x18
+#define PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS_MASK 0x2000000
+#define PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS__SHIFT 0x19
+#define PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK_MASK 0x10
+#define PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK__SHIFT 0x4
+#define PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK_MASK 0x20
+#define PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK__SHIFT 0x5
+#define PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK_MASK 0x1000
+#define PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK__SHIFT 0xc
+#define PCIE_UNCORR_ERR_MASK__FC_ERR_MASK_MASK 0x2000
+#define PCIE_UNCORR_ERR_MASK__FC_ERR_MASK__SHIFT 0xd
+#define PCIE_UNCORR_ERR_MASK__

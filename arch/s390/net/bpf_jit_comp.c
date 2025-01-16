@@ -1,1393 +1,1166 @@
+ UART Baud Control Register
+ */
+#define UBAUD_ADDR	0xfffff902
+#define UBAUD		WORD_REF(UBAUD_ADDR)
+
+#define UBAUD_PRESCALER_MASK	0x003f	/* Actual divisor is 65 - PRESCALER */
+#define UBAUD_PRESCALER_SHIFT	0
+#define UBAUD_DIVIDE_MASK	0x0700	/* Baud Rate freq. divizor */
+#define UBAUD_DIVIDE_SHIFT	8
+#define UBAUD_BAUD_SRC		0x0800	/* Baud Rate Source */
+#define UBAUD_GPIOSRC		0x1000	/* GPIO source */
+#define UBAUD_GPIODIR		0x2000	/* GPIO Direction */
+#define UBAUD_GPIO		0x4000	/* Current GPIO pin status */
+#define UBAUD_GPIODELTA		0x8000	/* GPIO pin value changed */
+
 /*
- * BPF Jit compiler for s390.
+ * UART Receiver Register 
+ */
+#define URX_ADDR	0xfffff904
+#define URX		WORD_REF(URX_ADDR)
+
+#define URX_RXDATA_ADDR	0xfffff905
+#define URX_RXDATA	BYTE_REF(URX_RXDATA_ADDR)
+
+#define URX_RXDATA_MASK	 0x00ff	/* Received data */
+#define URX_RXDATA_SHIFT 0
+#define URX_PARITY_ERROR 0x0100	/* Parity Error */
+#define URX_BREAK	 0x0200	/* Break Detected */
+#define URX_FRAME_ERROR	 0x0400	/* Framing Error */
+#define URX_OVRUN	 0x0800	/* Serial Overrun */
+#define URX_DATA_READY	 0x2000	/* Data Ready (FIFO not empty) */
+#define URX_FIFO_HALF	 0x4000 /* FIFO is Half-Full */
+#define URX_FIFO_FULL	 0x8000	/* FIFO is Full */
+
+/*
+ * UART Transmitter Register 
+ */
+#define UTX_ADDR	0xfffff906
+#define UTX		WORD_REF(UTX_ADDR)
+
+#define UTX_TXDATA_ADDR	0xfffff907
+#define UTX_TXDATA	BYTE_REF(UTX_TXDATA_ADDR)
+
+#define UTX_TXDATA_MASK	 0x00ff	/* Data to be transmitted */
+#define UTX_TXDATA_SHIFT 0
+#define UTX_CTS_DELTA	 0x0100	/* CTS changed */
+#define UTX_CTS_STATUS	 0x0200	/* CTS State */
+#define	UTX_IGNORE_CTS	 0x0800	/* Ignore CTS */
+#define UTX_SEND_BREAK	 0x1000	/* Send a BREAK */
+#define UTX_TX_AVAIL	 0x2000	/* Transmit FIFO has a slot available */
+#define UTX_FIFO_HALF	 0x4000	/* Transmit FIFO is half empty */
+#define UTX_FIFO_EMPTY	 0x8000	/* Transmit FIFO is empty */
+
+/* 'EZ328-compatible definitions */
+#define UTX_CTS_STAT	UTX_CTS_STATUS
+#define UTX_NOCTS	UTX_IGNORE_CTS
+
+/*
+ * UART Miscellaneous Register 
+ */
+#define UMISC_ADDR	0xfffff908
+#define UMISC		WORD_REF(UMISC_ADDR)
+
+#define UMISC_TX_POL	 0x0004	/* Transmit Polarity */
+#define UMISC_RX_POL	 0x0008	/* Receive Polarity */
+#define UMISC_IRDA_LOOP	 0x0010	/* IrDA Loopback Enable */
+#define UMISC_IRDA_EN	 0x0020	/* Infra-Red Enable */
+#define UMISC_RTS	 0x0040	/* Set RTS status */
+#define UMISC_RTSCONT	 0x0080	/* Choose RTS control */
+#define UMISC_LOOP	 0x1000	/* Serial Loopback Enable */
+#define UMISC_FORCE_PERR 0x2000	/* Force Parity Error */
+#define UMISC_CLKSRC	 0x4000	/* Clock Source */
+
+
+/* generalization of uart control registers to support multiple ports: */
+typedef volatile struct {
+  volatile unsigned short int ustcnt;
+  volatile unsigned short int ubaud;
+  union {
+    volatile unsigned short int w;
+    struct {
+      volatile unsigned char status;
+      volatile unsigned char rxdata;
+    } b;
+  } urx;
+  union {
+    volatile unsigned short int w;
+    struct {
+      volatile unsigned char status;
+      volatile unsigned char txdata;
+    } b;
+  } utx;
+  volatile unsigned short int umisc;
+  volatile unsigned short int pad1;
+  volatile unsigned short int pad2;
+  volatile unsigned short int pad3;
+} __attribute__((packed)) m68328_uart;
+
+
+/**********
  *
- * Minimum build requirements:
+ * 0xFFFFFAxx -- LCD Controller
  *
- *  - HAVE_MARCH_Z196_FEATURES: laal, laalg
- *  - HAVE_MARCH_Z10_FEATURES: msfi, cgrj, clgrj
- *  - HAVE_MARCH_Z9_109_FEATURES: alfi, llilf, clfi, oilf, nilf
- *  - PACK_STACK
- *  - 64BIT
+ **********/
+
+/*
+ * LCD Screen Starting Address Register 
+ */
+#define LSSA_ADDR	0xfffffa00
+#define LSSA		LONG_REF(LSSA_ADDR)
+
+#define LSSA_SSA_MASK	0xfffffffe	/* Bit 0 is reserved */
+
+/*
+ * LCD Virtual Page Width Register 
+ */
+#define LVPW_ADDR	0xfffffa05
+#define LVPW		BYTE_REF(LVPW_ADDR)
+
+/*
+ * LCD Screen Width Register (not compatible with 'EZ328 !!!)
+ */
+#define LXMAX_ADDR	0xfffffa08
+#define LXMAX		WORD_REF(LXMAX_ADDR)
+
+#define LXMAX_XM_MASK	0x02ff		/* Bits 0-3 are reserved */
+
+/*
+ * LCD Screen Height Register
+ */
+#define LYMAX_ADDR	0xfffffa0a
+#define LYMAX		WORD_REF(LYMAX_ADDR)
+
+#define LYMAX_YM_MASK	0x02ff		/* Bits 10-15 are reserved */
+
+/*
+ * LCD Cursor X Position Register
+ */
+#define LCXP_ADDR	0xfffffa18
+#define LCXP		WORD_REF(LCXP_ADDR)
+
+#define LCXP_CC_MASK	0xc000		/* Cursor Control */
+#define   LCXP_CC_TRAMSPARENT	0x0000
+#define   LCXP_CC_BLACK		0x4000
+#define   LCXP_CC_REVERSED	0x8000
+#define   LCXP_CC_WHITE		0xc000
+#define LCXP_CXP_MASK	0x02ff		/* Cursor X position */
+
+/*
+ * LCD Cursor Y Position Register
+ */
+#define LCYP_ADDR	0xfffffa1a
+#define LCYP		WORD_REF(LCYP_ADDR)
+
+#define LCYP_CYP_MASK	0x01ff		/* Cursor Y Position */
+
+/*
+ * LCD Cursor Width and Heigth Register
+ */
+#define LCWCH_ADDR	0xfffffa1c
+#define LCWCH		WORD_REF(LCWCH_ADDR)
+
+#define LCWCH_CH_MASK	0x001f		/* Cursor Height */
+#define LCWCH_CH_SHIFT	0
+#define LCWCH_CW_MASK	0x1f00		/* Cursor Width */
+#define LCWCH_CW_SHIFT	8
+
+/*
+ * LCD Blink Control Register
+ */
+#define LBLKC_ADDR	0xfffffa1f
+#define LBLKC		BYTE_REF(LBLKC_ADDR)
+
+#define LBLKC_BD_MASK	0x7f	/* Blink Divisor */
+#define LBLKC_BD_SHIFT	0
+#define LBLKC_BKEN	0x80	/* Blink Enabled */
+
+/*
+ * LCD Panel Interface Configuration Register 
+ */
+#define LPICF_ADDR	0xfffffa20
+#define LPICF		BYTE_REF(LPICF_ADDR)
+
+#define LPICF_GS_MASK	 0x01	 /* Gray-Scale Mode */
+#define	  LPICF_GS_BW	   0x00
+#define   LPICF_GS_GRAY_4  0x01
+#define LPICF_PBSIZ_MASK 0x06	/* Panel Bus Width */
+#define   LPICF_PBSIZ_1	   0x00
+#define   LPICF_PBSIZ_2    0x02
+#define   LPICF_PBSIZ_4    0x04
+
+/*
+ * LCD Polarity Configuration Register 
+ */
+#define LPOLCF_ADDR	0xfffffa21
+#define LPOLCF		BYTE_REF(LPOLCF_ADDR)
+
+#define LPOLCF_PIXPOL	0x01	/* Pixel Polarity */
+#define LPOLCF_LPPOL	0x02	/* Line Pulse Polarity */
+#define LPOLCF_FLMPOL	0x04	/* Frame Marker Polarity */
+#define LPOLCF_LCKPOL	0x08	/* LCD Shift Lock Polarity */
+
+/*
+ * LACD (LCD Alternate Crystal Direction) Rate Control Register
+ */
+#define LACDRC_ADDR	0xfffffa23
+#define LACDRC		BYTE_REF(LACDRC_ADDR)
+
+#define LACDRC_ACD_MASK	 0x0f	/* Alternate Crystal Direction Control */
+#define LACDRC_ACD_SHIFT 0
+
+/*
+ * LCD Pixel Clock Divider Register
+ */
+#define LPXCD_ADDR	0xfffffa25
+#define LPXCD		BYTE_REF(LPXCD_ADDR)
+
+#define	LPXCD_PCD_MASK	0x3f 	/* Pixel Clock Divider */
+#define LPXCD_PCD_SHIFT	0
+
+/*
+ * LCD Clocking Control Register
+ */
+#define LCKCON_ADDR	0xfffffa27
+#define LCKCON		BYTE_REF(LCKCON_ADDR)
+
+#define LCKCON_PCDS	 0x01	/* Pixel Clock Divider Source Select */
+#define LCKCON_DWIDTH	 0x02	/* Display Memory Width  */
+#define LCKCON_DWS_MASK	 0x3c	/* Display Wait-State */
+#define LCKCON_DWS_SHIFT 2
+#define LCKCON_DMA16	 0x40	/* DMA burst length */
+#define LCKCON_LCDON	 0x80	/* Enable LCD Controller */
+
+/* 'EZ328-compatible definitions */
+#define LCKCON_DW_MASK	LCKCON_DWS_MASK
+#define LCKCON_DW_SHIFT	LCKCON_DWS_SHIFT
+
+/*
+ * LCD Last Buffer Address Register
+ */
+#define LLBAR_ADDR	0xfffffa29
+#define LLBAR		BYTE_REF(LLBAR_ADDR)
+
+#define LLBAR_LBAR_MASK	 0x7f	/* Number of memory words to fill 1 line */
+#define LLBAR_LBAR_SHIFT 0
+
+/*
+ * LCD Octet Terminal Count Register 
+ */
+#define LOTCR_ADDR	0xfffffa2b
+#define LOTCR		BYTE_REF(LOTCR_ADDR)
+
+/*
+ * LCD Panning Offset Register
+ */
+#define LPOSR_ADDR	0xfffffa2d
+#define LPOSR		BYTE_REF(LPOSR_ADDR)
+
+#define LPOSR_BOS	0x08	/* Byte offset (for B/W mode only */
+#define LPOSR_POS_MASK	0x07	/* Pixel Offset Code */
+#define LPOSR_POS_SHIFT	0
+
+/*
+ * LCD Frame Rate Control Modulation Register
+ */
+#define LFRCM_ADDR	0xfffffa31
+#define LFRCM		BYTE_REF(LFRCM_ADDR)
+
+#define LFRCM_YMOD_MASK	 0x0f	/* Vertical Modulation */
+#define LFRCM_YMOD_SHIFT 0
+#define LFRCM_XMOD_MASK	 0xf0	/* Horizontal Modulation */
+#define LFRCM_XMOD_SHIFT 4
+
+/*
+ * LCD Gray Palette Mapping Register
+ */
+#define LGPMR_ADDR	0xfffffa32
+#define LGPMR		WORD_REF(LGPMR_ADDR)
+
+#define LGPMR_GLEVEL3_MASK	0x000f
+#define LGPMR_GLEVEL3_SHIFT	0 
+#define LGPMR_GLEVEL2_MASK	0x00f0
+#define LGPMR_GLEVEL2_SHIFT	4 
+#define LGPMR_GLEVEL0_MASK	0x0f00
+#define LGPMR_GLEVEL0_SHIFT	8 
+#define LGPMR_GLEVEL1_MASK	0xf000
+#define LGPMR_GLEVEL1_SHIFT	12
+
+/**********
  *
- * Copyright IBM Corp. 2012,2015
+ * 0xFFFFFBxx -- Real-Time Clock (RTC)
  *
- * Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>
- *	      Michael Holzheu <holzheu@linux.vnet.ibm.com>
- */
-
-#define KMSG_COMPONENT "bpf_jit"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
-
-#include <linux/netdevice.h>
-#include <linux/filter.h>
-#include <linux/init.h>
-#include <linux/bpf.h>
-#include <asm/cacheflush.h>
-#include <asm/dis.h>
-#include <asm/facility.h>
-#include <asm/nospec-branch.h>
-#include "bpf_jit.h"
-
-struct bpf_jit {
-	u32 seen;		/* Flags to remember seen eBPF instructions */
-	u32 seen_reg[16];	/* Array to remember which registers are used */
-	u32 *addrs;		/* Array with relative instruction addresses */
-	u8 *prg_buf;		/* Start of program */
-	int size;		/* Size of program and literal pool */
-	int size_prg;		/* Size of program */
-	int prg;		/* Current position in program */
-	int lit_start;		/* Start of literal pool */
-	int lit;		/* Current position in literal pool */
-	int base_ip;		/* Base address for literal pool */
-	int ret0_ip;		/* Address of return 0 */
-	int exit_ip;		/* Address of exit */
-	int r1_thunk_ip;	/* Address of expoline thunk for 'br %r1' */
-	int r14_thunk_ip;	/* Address of expoline thunk for 'br %r14' */
-	int tail_call_start;	/* Tail call start offset */
-	int labels[1];		/* Labels for local jumps */
-};
-
-#define BPF_SIZE_MAX	0xffff	/* Max size for program (16 bit branches) */
-
-#define SEEN_SKB	1	/* skb access */
-#define SEEN_MEM	2	/* use mem[] for temporary storage */
-#define SEEN_RET0	4	/* ret0_ip points to a valid return 0 */
-#define SEEN_LITERAL	8	/* code uses literals */
-#define SEEN_FUNC	16	/* calls C functions */
-#define SEEN_TAIL_CALL	32	/* code uses tail calls */
-#define SEEN_SKB_CHANGE	64	/* code changes skb data */
-#define SEEN_STACK	(SEEN_FUNC | SEEN_MEM | SEEN_SKB)
+ **********/
 
 /*
- * s390 registers
+ * RTC Hours Minutes and Seconds Register
  */
-#define REG_W0		(__MAX_BPF_REG+0)	/* Work register 1 (even) */
-#define REG_W1		(__MAX_BPF_REG+1)	/* Work register 2 (odd) */
-#define REG_SKB_DATA	(__MAX_BPF_REG+2)	/* SKB data register */
-#define REG_L		(__MAX_BPF_REG+3)	/* Literal pool register */
-#define REG_15		(__MAX_BPF_REG+4)	/* Register 15 */
-#define REG_0		REG_W0			/* Register 0 */
-#define REG_1		REG_W1			/* Register 1 */
-#define REG_2		BPF_REG_1		/* Register 2 */
-#define REG_14		BPF_REG_0		/* Register 14 */
+#define RTCTIME_ADDR	0xfffffb00
+#define RTCTIME		LONG_REF(RTCTIME_ADDR)
+
+#define RTCTIME_SECONDS_MASK	0x0000003f	/* Seconds */
+#define RTCTIME_SECONDS_SHIFT	0
+#define RTCTIME_MINUTES_MASK	0x003f0000	/* Minutes */
+#define RTCTIME_MINUTES_SHIFT	16
+#define RTCTIME_HOURS_MASK	0x1f000000	/* Hours */
+#define RTCTIME_HOURS_SHIFT	24
 
 /*
- * Mapping of BPF registers to s390 registers
+ *  RTC Alarm Register 
  */
-static const int reg2hex[] = {
-	/* Return code */
-	[BPF_REG_0]	= 14,
-	/* Function parameters */
-	[BPF_REG_1]	= 2,
-	[BPF_REG_2]	= 3,
-	[BPF_REG_3]	= 4,
-	[BPF_REG_4]	= 5,
-	[BPF_REG_5]	= 6,
-	/* Call saved registers */
-	[BPF_REG_6]	= 7,
-	[BPF_REG_7]	= 8,
-	[BPF_REG_8]	= 9,
-	[BPF_REG_9]	= 10,
-	/* BPF stack pointer */
-	[BPF_REG_FP]	= 13,
-	/* SKB data pointer */
-	[REG_SKB_DATA]	= 12,
-	/* Work registers for s390x backend */
-	[REG_W0]	= 0,
-	[REG_W1]	= 1,
-	[REG_L]		= 11,
-	[REG_15]	= 15,
-};
+#define RTCALRM_ADDR    0xfffffb04
+#define RTCALRM         LONG_REF(RTCALRM_ADDR)
 
-static inline u32 reg(u32 dst_reg, u32 src_reg)
-{
-	return reg2hex[dst_reg] << 4 | reg2hex[src_reg];
-}
-
-static inline u32 reg_high(u32 reg)
-{
-	return reg2hex[reg] << 4;
-}
-
-static inline void reg_set_seen(struct bpf_jit *jit, u32 b1)
-{
-	u32 r1 = reg2hex[b1];
-
-	if (r1 >= 6 && r1 <= 15 && !jit->seen_reg[r1])
-		jit->seen_reg[r1] = 1;
-}
-
-#define REG_SET_SEEN(b1)					\
-({								\
-	reg_set_seen(jit, b1);					\
-})
-
-#define REG_SEEN(b1) jit->seen_reg[reg2hex[(b1)]]
+#define RTCALRM_SECONDS_MASK    0x0000003f      /* Seconds */
+#define RTCALRM_SECONDS_SHIFT   0
+#define RTCALRM_MINUTES_MASK    0x003f0000      /* Minutes */
+#define RTCALRM_MINUTES_SHIFT   16
+#define RTCALRM_HOURS_MASK      0x1f000000      /* Hours */
+#define RTCALRM_HOURS_SHIFT     24
 
 /*
- * EMIT macros for code generation
+ * RTC Control Register
  */
+#define RTCCTL_ADDR	0xfffffb0c
+#define RTCCTL		WORD_REF(RTCCTL_ADDR)
 
-#define _EMIT2(op)						\
-({								\
-	if (jit->prg_buf)					\
-		*(u16 *) (jit->prg_buf + jit->prg) = op;	\
-	jit->prg += 2;						\
-})
+#define RTCCTL_384	0x0020	/* Crystal Selection */
+#define RTCCTL_ENABLE	0x0080	/* RTC Enable */
 
-#define EMIT2(op, b1, b2)					\
-({								\
-	_EMIT2(op | reg(b1, b2));				\
-	REG_SET_SEEN(b1);					\
-	REG_SET_SEEN(b2);					\
-})
-
-#define _EMIT4(op)						\
-({								\
-	if (jit->prg_buf)					\
-		*(u32 *) (jit->prg_buf + jit->prg) = op;	\
-	jit->prg += 4;						\
-})
-
-#define EMIT4(op, b1, b2)					\
-({								\
-	_EMIT4(op | reg(b1, b2));				\
-	REG_SET_SEEN(b1);					\
-	REG_SET_SEEN(b2);					\
-})
-
-#define EMIT4_RRF(op, b1, b2, b3)				\
-({								\
-	_EMIT4(op | reg_high(b3) << 8 | reg(b1, b2));		\
-	REG_SET_SEEN(b1);					\
-	REG_SET_SEEN(b2);					\
-	REG_SET_SEEN(b3);					\
-})
-
-#define _EMIT4_DISP(op, disp)					\
-({								\
-	unsigned int __disp = (disp) & 0xfff;			\
-	_EMIT4(op | __disp);					\
-})
-
-#define EMIT4_DISP(op, b1, b2, disp)				\
-({								\
-	_EMIT4_DISP(op | reg_high(b1) << 16 |			\
-		    reg_high(b2) << 8, disp);			\
-	REG_SET_SEEN(b1);					\
-	REG_SET_SEEN(b2);					\
-})
-
-#define EMIT4_IMM(op, b1, imm)					\
-({								\
-	unsigned int __imm = (imm) & 0xffff;			\
-	_EMIT4(op | reg_high(b1) << 16 | __imm);		\
-	REG_SET_SEEN(b1);					\
-})
-
-#define EMIT4_PCREL(op, pcrel)					\
-({								\
-	long __pcrel = ((pcrel) >> 1) & 0xffff;			\
-	_EMIT4(op | __pcrel);					\
-})
-
-#define _EMIT6(op1, op2)					\
-({								\
-	if (jit->prg_buf) {					\
-		*(u32 *) (jit->prg_buf + jit->prg) = op1;	\
-		*(u16 *) (jit->prg_buf + jit->prg + 4) = op2;	\
-	}							\
-	jit->prg += 6;						\
-})
-
-#define _EMIT6_DISP(op1, op2, disp)				\
-({								\
-	unsigned int __disp = (disp) & 0xfff;			\
-	_EMIT6(op1 | __disp, op2);				\
-})
-
-#define _EMIT6_DISP_LH(op1, op2, disp)				\
-({								\
-	u32 _disp = (u32) disp;					\
-	unsigned int __disp_h = _disp & 0xff000;		\
-	unsigned int __disp_l = _disp & 0x00fff;		\
-	_EMIT6(op1 | __disp_l, op2 | __disp_h >> 4);		\
-})
-
-#define EMIT6_DISP_LH(op1, op2, b1, b2, b3, disp)		\
-({								\
-	_EMIT6_DISP_LH(op1 | reg(b1, b2) << 16 |		\
-		       reg_high(b3) << 8, op2, disp);		\
-	REG_SET_SEEN(b1);					\
-	REG_SET_SEEN(b2);					\
-	REG_SET_SEEN(b3);					\
-})
-
-#define EMIT6_PCREL_LABEL(op1, op2, b1, b2, label, mask)	\
-({								\
-	int rel = (jit->labels[label] - jit->prg) >> 1;		\
-	_EMIT6(op1 | reg(b1, b2) << 16 | (rel & 0xffff),	\
-	       op2 | mask << 12);				\
-	REG_SET_SEEN(b1);					\
-	REG_SET_SEEN(b2);					\
-})
-
-#define EMIT6_PCREL_IMM_LABEL(op1, op2, b1, imm, label, mask)	\
-({								\
-	int rel = (jit->labels[label] - jit->prg) >> 1;		\
-	_EMIT6(op1 | (reg_high(b1) | mask) << 16 |		\
-		(rel & 0xffff), op2 | (imm & 0xff) << 8);	\
-	REG_SET_SEEN(b1);					\
-	BUILD_BUG_ON(((unsigned long) imm) > 0xff);		\
-})
-
-#define EMIT6_PCREL(op1, op2, b1, b2, i, off, mask)		\
-({								\
-	/* Branch instruction needs 6 bytes */			\
-	int rel = (addrs[i + off + 1] - (addrs[i + 1] - 6)) / 2;\
-	_EMIT6(op1 | reg(b1, b2) << 16 | (rel & 0xffff), op2 | mask);	\
-	REG_SET_SEEN(b1);					\
-	REG_SET_SEEN(b2);					\
-})
-
-#define EMIT6_PCREL_RILB(op, b, target)				\
-({								\
-	int rel = (target - jit->prg) / 2;			\
-	_EMIT6(op | reg_high(b) << 16 | rel >> 16, rel & 0xffff);	\
-	REG_SET_SEEN(b);					\
-})
-
-#define EMIT6_PCREL_RIL(op, target)				\
-({								\
-	int rel = (target - jit->prg) / 2;			\
-	_EMIT6(op | rel >> 16, rel & 0xffff);			\
-})
-
-#define _EMIT6_IMM(op, imm)					\
-({								\
-	unsigned int __imm = (imm);				\
-	_EMIT6(op | (__imm >> 16), __imm & 0xffff);		\
-})
-
-#define EMIT6_IMM(op, b1, imm)					\
-({								\
-	_EMIT6_IMM(op | reg_high(b1) << 16, imm);		\
-	REG_SET_SEEN(b1);					\
-})
-
-#define EMIT_CONST_U32(val)					\
-({								\
-	unsigned int ret;					\
-	ret = jit->lit - jit->base_ip;				\
-	jit->seen |= SEEN_LITERAL;				\
-	if (jit->prg_buf)					\
-		*(u32 *) (jit->prg_buf + jit->lit) = (u32) val;	\
-	jit->lit += 4;						\
-	ret;							\
-})
-
-#define EMIT_CONST_U64(val)					\
-({								\
-	unsigned int ret;					\
-	ret = jit->lit - jit->base_ip;				\
-	jit->seen |= SEEN_LITERAL;				\
-	if (jit->prg_buf)					\
-		*(u64 *) (jit->prg_buf + jit->lit) = (u64) val;	\
-	jit->lit += 8;						\
-	ret;							\
-})
-
-#define EMIT_ZERO(b1)						\
-({								\
-	/* llgfr %dst,%dst (zero extend to 64 bit) */		\
-	EMIT4(0xb9160000, b1, b1);				\
-	REG_SET_SEEN(b1);					\
-})
+/* 'EZ328-compatible definitions */
+#define RTCCTL_XTL	RTCCTL_384
+#define RTCCTL_EN	RTCCTL_ENABLE
 
 /*
- * Fill whole space with illegal instructions
+ * RTC Interrupt Status Register 
  */
-static void jit_fill_hole(void *area, unsigned int size)
-{
-	memset(area, 0, size);
-}
+#define RTCISR_ADDR	0xfffffb0e
+#define RTCISR		WORD_REF(RTCISR_ADDR)
+
+#define RTCISR_SW	0x0001	/* Stopwatch timed out */
+#define RTCISR_MIN	0x0002	/* 1-minute interrupt has occurred */
+#define RTCISR_ALM	0x0004	/* Alarm interrupt has occurred */
+#define RTCISR_DAY	0x0008	/* 24-hour rollover interrupt has occurred */
+#define RTCISR_1HZ	0x0010	/* 1Hz interrupt has occurred */
 
 /*
- * Save registers from "rs" (register start) to "re" (register end) on stack
+ * RTC Interrupt Enable Register
  */
-static void save_regs(struct bpf_jit *jit, u32 rs, u32 re)
-{
-	u32 off = STK_OFF_R6 + (rs - 6) * 8;
+#define RTCIENR_ADDR	0xfffffb10
+#define RTCIENR		WORD_REF(RTCIENR_ADDR)
 
-	if (rs == re)
-		/* stg %rs,off(%r15) */
-		_EMIT6(0xe300f000 | rs << 20 | off, 0x0024);
-	else
-		/* stmg %rs,%re,off(%r15) */
-		_EMIT6_DISP(0xeb00f000 | rs << 20 | re << 16, 0x0024, off);
-}
+#define RTCIENR_SW	0x0001	/* Stopwatch interrupt enable */
+#define RTCIENR_MIN	0x0002	/* 1-minute interrupt enable */
+#define RTCIENR_ALM	0x0004	/* Alarm interrupt enable */
+#define RTCIENR_DAY	0x0008	/* 24-hour rollover interrupt enable */
+#define RTCIENR_1HZ	0x0010	/* 1Hz interrupt enable */
 
-/*
- * Restore registers from "rs" (register start) to "re" (register end) on stack
+/* 
+ * Stopwatch Minutes Register
  */
-static void restore_regs(struct bpf_jit *jit, u32 rs, u32 re)
-{
-	u32 off = STK_OFF_R6 + (rs - 6) * 8;
+#define STPWCH_ADDR	0xfffffb12
+#define STPWCH		WORD_REF(STPWCH)
 
-	if (jit->seen & SEEN_STACK)
-		off += STK_OFF;
+#define STPWCH_CNT_MASK	 0x00ff	/* Stopwatch countdown value */
+#define SPTWCH_CNT_SHIFT 0
 
-	if (rs == re)
-		/* lg %rs,off(%r15) */
-		_EMIT6(0xe300f000 | rs << 20 | off, 0x0004);
-	else
-		/* lmg %rs,%re,off(%r15) */
-		_EMIT6_DISP(0xeb00f000 | rs << 20 | re << 16, 0x0004, off);
-}
-
-/*
- * Return first seen register (from start)
- */
-static int get_start(struct bpf_jit *jit, int start)
-{
-	int i;
-
-	for (i = start; i <= 15; i++) {
-		if (jit->seen_reg[i])
-			return i;
-	}
-	return 0;
-}
-
-/*
- * Return last seen register (from start) (gap >= 2)
- */
-static int get_end(struct bpf_jit *jit, int start)
-{
-	int i;
-
-	for (i = start; i < 15; i++) {
-		if (!jit->seen_reg[i] && !jit->seen_reg[i + 1])
-			return i - 1;
-	}
-	return jit->seen_reg[15] ? 15 : 14;
-}
-
-#define REGS_SAVE	1
-#define REGS_RESTORE	0
-/*
- * Save and restore clobbered registers (6-15) on stack.
- * We save/restore registers in chunks with gap >= 2 registers.
- */
-static void save_restore_regs(struct bpf_jit *jit, int op)
-{
-
-	int re = 6, rs;
-
-	do {
-		rs = get_start(jit, re);
-		if (!rs)
-			break;
-		re = get_end(jit, rs + 1);
-		if (op == REGS_SAVE)
-			save_regs(jit, rs, re);
-		else
-			restore_regs(jit, rs, re);
-		re++;
-	} while (re <= 15);
-}
-
-/*
- * For SKB access %b1 contains the SKB pointer. For "bpf_jit.S"
- * we store the SKB header length on the stack and the SKB data
- * pointer in REG_SKB_DATA.
- */
-static void emit_load_skb_data_hlen(struct bpf_jit *jit)
-{
-	/* Header length: llgf %w1,<len>(%b1) */
-	EMIT6_DISP_LH(0xe3000000, 0x0016, REG_W1, REG_0, BPF_REG_1,
-		      offsetof(struct sk_buff, len));
-	/* s %w1,<data_len>(%b1) */
-	EMIT4_DISP(0x5b000000, REG_W1, BPF_REG_1,
-		   offsetof(struct sk_buff, data_len));
-	/* stg %w1,ST_OFF_HLEN(%r0,%r15) */
-	EMIT6_DISP_LH(0xe3000000, 0x0024, REG_W1, REG_0, REG_15, STK_OFF_HLEN);
-	/* lg %skb_data,data_off(%b1) */
-	EMIT6_DISP_LH(0xe3000000, 0x0004, REG_SKB_DATA, REG_0,
-		      BPF_REG_1, offsetof(struct sk_buff, data));
-}
-
-/*
- * Emit function prologue
+#endif /* _MC68328_H_ */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
+/* include/asm-m68knommu/MC68EZ328.h: 'EZ328 control registers
  *
- * Save registers and create stack frame if necessary.
- * See stack frame layout desription in "bpf_jit.h"!
- */
-static void bpf_jit_prologue(struct bpf_jit *jit)
-{
-	if (jit->seen & SEEN_TAIL_CALL) {
-		/* xc STK_OFF_TCCNT(4,%r15),STK_OFF_TCCNT(%r15) */
-		_EMIT6(0xd703f000 | STK_OFF_TCCNT, 0xf000 | STK_OFF_TCCNT);
-	} else {
-		/* j tail_call_start: NOP if no tail calls are used */
-		EMIT4_PCREL(0xa7f40000, 6);
-		_EMIT2(0);
-	}
-	/* Tail calls have to skip above initialization */
-	jit->tail_call_start = jit->prg;
-	/* Save registers */
-	save_restore_regs(jit, REGS_SAVE);
-	/* Setup literal pool */
-	if (jit->seen & SEEN_LITERAL) {
-		/* basr %r13,0 */
-		EMIT2(0x0d00, REG_L, REG_0);
-		jit->base_ip = jit->prg;
-	}
-	/* Setup stack and backchain */
-	if (jit->seen & SEEN_STACK) {
-		if (jit->seen & SEEN_FUNC)
-			/* lgr %w1,%r15 (backchain) */
-			EMIT4(0xb9040000, REG_W1, REG_15);
-		/* la %bfp,STK_160_UNUSED(%r15) (BPF frame pointer) */
-		EMIT4_DISP(0x41000000, BPF_REG_FP, REG_15, STK_160_UNUSED);
-		/* aghi %r15,-STK_OFF */
-		EMIT4_IMM(0xa70b0000, REG_15, -STK_OFF);
-		if (jit->seen & SEEN_FUNC)
-			/* stg %w1,152(%r15) (backchain) */
-			EMIT6_DISP_LH(0xe3000000, 0x0024, REG_W1, REG_0,
-				      REG_15, 152);
-	}
-	if (jit->seen & SEEN_SKB)
-		emit_load_skb_data_hlen(jit);
-	if (jit->seen & SEEN_SKB_CHANGE)
-		/* stg %b1,ST_OFF_SKBP(%r0,%r15) */
-		EMIT6_DISP_LH(0xe3000000, 0x0024, BPF_REG_1, REG_0, REG_15,
-			      STK_OFF_SKBP);
-}
-
-/*
- * Function epilogue
- */
-static void bpf_jit_epilogue(struct bpf_jit *jit)
-{
-	/* Return 0 */
-	if (jit->seen & SEEN_RET0) {
-		jit->ret0_ip = jit->prg;
-		/* lghi %b0,0 */
-		EMIT4_IMM(0xa7090000, BPF_REG_0, 0);
-	}
-	jit->exit_ip = jit->prg;
-	/* Load exit code: lgr %r2,%b0 */
-	EMIT4(0xb9040000, REG_2, BPF_REG_0);
-	/* Restore registers */
-	save_restore_regs(jit, REGS_RESTORE);
-	if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable) {
-		jit->r14_thunk_ip = jit->prg;
-		/* Generate __s390_indirect_jump_r14 thunk */
-		if (test_facility(35)) {
-			/* exrl %r0,.+10 */
-			EMIT6_PCREL_RIL(0xc6000000, jit->prg + 10);
-		} else {
-			/* larl %r1,.+14 */
-			EMIT6_PCREL_RILB(0xc0000000, REG_1, jit->prg + 14);
-			/* ex 0,0(%r1) */
-			EMIT4_DISP(0x44000000, REG_0, REG_1, 0);
-		}
-		/* j . */
-		EMIT4_PCREL(0xa7f40000, 0);
-	}
-	/* br %r14 */
-	_EMIT2(0x07fe);
-
-	if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable &&
-	    (jit->seen & SEEN_FUNC)) {
-		jit->r1_thunk_ip = jit->prg;
-		/* Generate __s390_indirect_jump_r1 thunk */
-		if (test_facility(35)) {
-			/* exrl %r0,.+10 */
-			EMIT6_PCREL_RIL(0xc6000000, jit->prg + 10);
-			/* j . */
-			EMIT4_PCREL(0xa7f40000, 0);
-			/* br %r1 */
-			_EMIT2(0x07f1);
-		} else {
-			/* ex 0,S390_lowcore.br_r1_tampoline */
-			EMIT4_DISP(0x44000000, REG_0, REG_0,
-				   offsetof(struct _lowcore, br_r1_trampoline));
-			/* j . */
-			EMIT4_PCREL(0xa7f40000, 0);
-		}
-	}
-}
-
-/*
- * Compile one eBPF instruction into s390x code
+ * Copyright (C) 1999  Vladimir Gurevich <vgurevic@cisco.com>
+ *                     Bear & Hare Software, Inc.
  *
- * NOTE: Use noinline because for gcov (-fprofile-arcs) gcc allocates a lot of
- * stack space for the large switch statement.
+ * Based on include/asm-m68knommu/MC68332.h
+ * Copyright (C) 1998  Kenneth Albanowski <kjahds@kjahds.com>,
+ *                     The Silver Hammer Group, Ltd.
+ *
  */
-static noinline int bpf_jit_insn(struct bpf_jit *jit, struct bpf_prog *fp, int i)
-{
-	struct bpf_insn *insn = &fp->insnsi[i];
-	int jmp_off, last, insn_count = 1;
-	unsigned int func_addr, mask;
-	u32 dst_reg = insn->dst_reg;
-	u32 src_reg = insn->src_reg;
-	u32 *addrs = jit->addrs;
-	s32 imm = insn->imm;
-	s16 off = insn->off;
 
-	switch (insn->code) {
-	/*
-	 * BPF_MOV
-	 */
-	case BPF_ALU | BPF_MOV | BPF_X: /* dst = (u32) src */
-		/* llgfr %dst,%src */
-		EMIT4(0xb9160000, dst_reg, src_reg);
-		break;
-	case BPF_ALU64 | BPF_MOV | BPF_X: /* dst = src */
-		/* lgr %dst,%src */
-		EMIT4(0xb9040000, dst_reg, src_reg);
-		break;
-	case BPF_ALU | BPF_MOV | BPF_K: /* dst = (u32) imm */
-		/* llilf %dst,imm */
-		EMIT6_IMM(0xc00f0000, dst_reg, imm);
-		break;
-	case BPF_ALU64 | BPF_MOV | BPF_K: /* dst = imm */
-		/* lgfi %dst,imm */
-		EMIT6_IMM(0xc0010000, dst_reg, imm);
-		break;
-	/*
-	 * BPF_LD 64
-	 */
-	case BPF_LD | BPF_IMM | BPF_DW: /* dst = (u64) imm */
-	{
-		/* 16 byte instruction that uses two 'struct bpf_insn' */
-		u64 imm64;
+#ifndef _MC68EZ328_H_
+#define _MC68EZ328_H_
 
-		imm64 = (u64)(u32) insn[0].imm | ((u64)(u32) insn[1].imm) << 32;
-		/* lg %dst,<d(imm)>(%l) */
-		EMIT6_DISP_LH(0xe3000000, 0x0004, dst_reg, REG_0, REG_L,
-			      EMIT_CONST_U64(imm64));
-		insn_count = 2;
-		break;
-	}
-	/*
-	 * BPF_ADD
-	 */
-	case BPF_ALU | BPF_ADD | BPF_X: /* dst = (u32) dst + (u32) src */
-		/* ar %dst,%src */
-		EMIT2(0x1a00, dst_reg, src_reg);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_ADD | BPF_X: /* dst = dst + src */
-		/* agr %dst,%src */
-		EMIT4(0xb9080000, dst_reg, src_reg);
-		break;
-	case BPF_ALU | BPF_ADD | BPF_K: /* dst = (u32) dst + (u32) imm */
-		if (imm != 0) {
-			/* alfi %dst,imm */
-			EMIT6_IMM(0xc20b0000, dst_reg, imm);
-		}
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_ADD | BPF_K: /* dst = dst + imm */
-		if (!imm)
-			break;
-		/* agfi %dst,imm */
-		EMIT6_IMM(0xc2080000, dst_reg, imm);
-		break;
-	/*
-	 * BPF_SUB
-	 */
-	case BPF_ALU | BPF_SUB | BPF_X: /* dst = (u32) dst - (u32) src */
-		/* sr %dst,%src */
-		EMIT2(0x1b00, dst_reg, src_reg);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_SUB | BPF_X: /* dst = dst - src */
-		/* sgr %dst,%src */
-		EMIT4(0xb9090000, dst_reg, src_reg);
-		break;
-	case BPF_ALU | BPF_SUB | BPF_K: /* dst = (u32) dst - (u32) imm */
-		if (imm != 0) {
-			/* alfi %dst,-imm */
-			EMIT6_IMM(0xc20b0000, dst_reg, -imm);
-		}
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_SUB | BPF_K: /* dst = dst - imm */
-		if (!imm)
-			break;
-		if (imm == -0x80000000) {
-			/* algfi %dst,0x80000000 */
-			EMIT6_IMM(0xc20a0000, dst_reg, 0x80000000);
-		} else {
-			/* agfi %dst,-imm */
-			EMIT6_IMM(0xc2080000, dst_reg, -imm);
-		}
-		break;
-	/*
-	 * BPF_MUL
-	 */
-	case BPF_ALU | BPF_MUL | BPF_X: /* dst = (u32) dst * (u32) src */
-		/* msr %dst,%src */
-		EMIT4(0xb2520000, dst_reg, src_reg);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_MUL | BPF_X: /* dst = dst * src */
-		/* msgr %dst,%src */
-		EMIT4(0xb90c0000, dst_reg, src_reg);
-		break;
-	case BPF_ALU | BPF_MUL | BPF_K: /* dst = (u32) dst * (u32) imm */
-		if (imm != 1) {
-			/* msfi %r5,imm */
-			EMIT6_IMM(0xc2010000, dst_reg, imm);
-		}
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_MUL | BPF_K: /* dst = dst * imm */
-		if (imm == 1)
-			break;
-		/* msgfi %dst,imm */
-		EMIT6_IMM(0xc2000000, dst_reg, imm);
-		break;
-	/*
-	 * BPF_DIV / BPF_MOD
-	 */
-	case BPF_ALU | BPF_DIV | BPF_X: /* dst = (u32) dst / (u32) src */
-	case BPF_ALU | BPF_MOD | BPF_X: /* dst = (u32) dst % (u32) src */
-	{
-		int rc_reg = BPF_OP(insn->code) == BPF_DIV ? REG_W1 : REG_W0;
+#define BYTE_REF(addr) (*((volatile unsigned char*)addr))
+#define WORD_REF(addr) (*((volatile unsigned short*)addr))
+#define LONG_REF(addr) (*((volatile unsigned long*)addr))
 
-		jit->seen |= SEEN_RET0;
-		/* ltr %src,%src (if src == 0 goto fail) */
-		EMIT2(0x1200, src_reg, src_reg);
-		/* jz <ret0> */
-		EMIT4_PCREL(0xa7840000, jit->ret0_ip - jit->prg);
-		/* lhi %w0,0 */
-		EMIT4_IMM(0xa7080000, REG_W0, 0);
-		/* lr %w1,%dst */
-		EMIT2(0x1800, REG_W1, dst_reg);
-		/* dlr %w0,%src */
-		EMIT4(0xb9970000, REG_W0, src_reg);
-		/* llgfr %dst,%rc */
-		EMIT4(0xb9160000, dst_reg, rc_reg);
-		break;
-	}
-	case BPF_ALU64 | BPF_DIV | BPF_X: /* dst = dst / src */
-	case BPF_ALU64 | BPF_MOD | BPF_X: /* dst = dst % src */
-	{
-		int rc_reg = BPF_OP(insn->code) == BPF_DIV ? REG_W1 : REG_W0;
+#define PUT_FIELD(field, val) (((val) << field##_SHIFT) & field##_MASK)
+#define GET_FIELD(reg, field) (((reg) & field##_MASK) >> field##_SHIFT)
 
-		jit->seen |= SEEN_RET0;
-		/* ltgr %src,%src (if src == 0 goto fail) */
-		EMIT4(0xb9020000, src_reg, src_reg);
-		/* jz <ret0> */
-		EMIT4_PCREL(0xa7840000, jit->ret0_ip - jit->prg);
-		/* lghi %w0,0 */
-		EMIT4_IMM(0xa7090000, REG_W0, 0);
-		/* lgr %w1,%dst */
-		EMIT4(0xb9040000, REG_W1, dst_reg);
-		/* dlgr %w0,%dst */
-		EMIT4(0xb9870000, REG_W0, src_reg);
-		/* lgr %dst,%rc */
-		EMIT4(0xb9040000, dst_reg, rc_reg);
-		break;
-	}
-	case BPF_ALU | BPF_DIV | BPF_K: /* dst = (u32) dst / (u32) imm */
-	case BPF_ALU | BPF_MOD | BPF_K: /* dst = (u32) dst % (u32) imm */
-	{
-		int rc_reg = BPF_OP(insn->code) == BPF_DIV ? REG_W1 : REG_W0;
+/********** 
+ *
+ * 0xFFFFF0xx -- System Control
+ *
+ **********/
+ 
+/*
+ * System Control Register (SCR)
+ */
+#define SCR_ADDR	0xfffff000
+#define SCR		BYTE_REF(SCR_ADDR)
 
-		if (imm == 1) {
-			if (BPF_OP(insn->code) == BPF_MOD)
-				/* lhgi %dst,0 */
-				EMIT4_IMM(0xa7090000, dst_reg, 0);
-			else
-				EMIT_ZERO(dst_reg);
-			break;
-		}
-		/* lhi %w0,0 */
-		EMIT4_IMM(0xa7080000, REG_W0, 0);
-		/* lr %w1,%dst */
-		EMIT2(0x1800, REG_W1, dst_reg);
-		/* dl %w0,<d(imm)>(%l) */
-		EMIT6_DISP_LH(0xe3000000, 0x0097, REG_W0, REG_0, REG_L,
-			      EMIT_CONST_U32(imm));
-		/* llgfr %dst,%rc */
-		EMIT4(0xb9160000, dst_reg, rc_reg);
-		break;
-	}
-	case BPF_ALU64 | BPF_DIV | BPF_K: /* dst = dst / imm */
-	case BPF_ALU64 | BPF_MOD | BPF_K: /* dst = dst % imm */
-	{
-		int rc_reg = BPF_OP(insn->code) == BPF_DIV ? REG_W1 : REG_W0;
-
-		if (imm == 1) {
-			if (BPF_OP(insn->code) == BPF_MOD)
-				/* lhgi %dst,0 */
-				EMIT4_IMM(0xa7090000, dst_reg, 0);
-			break;
-		}
-		/* lghi %w0,0 */
-		EMIT4_IMM(0xa7090000, REG_W0, 0);
-		/* lgr %w1,%dst */
-		EMIT4(0xb9040000, REG_W1, dst_reg);
-		/* dlg %w0,<d(imm)>(%l) */
-		EMIT6_DISP_LH(0xe3000000, 0x0087, REG_W0, REG_0, REG_L,
-			      EMIT_CONST_U64(imm));
-		/* lgr %dst,%rc */
-		EMIT4(0xb9040000, dst_reg, rc_reg);
-		break;
-	}
-	/*
-	 * BPF_AND
-	 */
-	case BPF_ALU | BPF_AND | BPF_X: /* dst = (u32) dst & (u32) src */
-		/* nr %dst,%src */
-		EMIT2(0x1400, dst_reg, src_reg);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_AND | BPF_X: /* dst = dst & src */
-		/* ngr %dst,%src */
-		EMIT4(0xb9800000, dst_reg, src_reg);
-		break;
-	case BPF_ALU | BPF_AND | BPF_K: /* dst = (u32) dst & (u32) imm */
-		/* nilf %dst,imm */
-		EMIT6_IMM(0xc00b0000, dst_reg, imm);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_AND | BPF_K: /* dst = dst & imm */
-		/* ng %dst,<d(imm)>(%l) */
-		EMIT6_DISP_LH(0xe3000000, 0x0080, dst_reg, REG_0, REG_L,
-			      EMIT_CONST_U64(imm));
-		break;
-	/*
-	 * BPF_OR
-	 */
-	case BPF_ALU | BPF_OR | BPF_X: /* dst = (u32) dst | (u32) src */
-		/* or %dst,%src */
-		EMIT2(0x1600, dst_reg, src_reg);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_OR | BPF_X: /* dst = dst | src */
-		/* ogr %dst,%src */
-		EMIT4(0xb9810000, dst_reg, src_reg);
-		break;
-	case BPF_ALU | BPF_OR | BPF_K: /* dst = (u32) dst | (u32) imm */
-		/* oilf %dst,imm */
-		EMIT6_IMM(0xc00d0000, dst_reg, imm);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_OR | BPF_K: /* dst = dst | imm */
-		/* og %dst,<d(imm)>(%l) */
-		EMIT6_DISP_LH(0xe3000000, 0x0081, dst_reg, REG_0, REG_L,
-			      EMIT_CONST_U64(imm));
-		break;
-	/*
-	 * BPF_XOR
-	 */
-	case BPF_ALU | BPF_XOR | BPF_X: /* dst = (u32) dst ^ (u32) src */
-		/* xr %dst,%src */
-		EMIT2(0x1700, dst_reg, src_reg);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_XOR | BPF_X: /* dst = dst ^ src */
-		/* xgr %dst,%src */
-		EMIT4(0xb9820000, dst_reg, src_reg);
-		break;
-	case BPF_ALU | BPF_XOR | BPF_K: /* dst = (u32) dst ^ (u32) imm */
-		if (imm != 0) {
-			/* xilf %dst,imm */
-			EMIT6_IMM(0xc0070000, dst_reg, imm);
-		}
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_XOR | BPF_K: /* dst = dst ^ imm */
-		/* xg %dst,<d(imm)>(%l) */
-		EMIT6_DISP_LH(0xe3000000, 0x0082, dst_reg, REG_0, REG_L,
-			      EMIT_CONST_U64(imm));
-		break;
-	/*
-	 * BPF_LSH
-	 */
-	case BPF_ALU | BPF_LSH | BPF_X: /* dst = (u32) dst << (u32) src */
-		/* sll %dst,0(%src) */
-		EMIT4_DISP(0x89000000, dst_reg, src_reg, 0);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_LSH | BPF_X: /* dst = dst << src */
-		/* sllg %dst,%dst,0(%src) */
-		EMIT6_DISP_LH(0xeb000000, 0x000d, dst_reg, dst_reg, src_reg, 0);
-		break;
-	case BPF_ALU | BPF_LSH | BPF_K: /* dst = (u32) dst << (u32) imm */
-		if (imm != 0) {
-			/* sll %dst,imm(%r0) */
-			EMIT4_DISP(0x89000000, dst_reg, REG_0, imm);
-		}
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_LSH | BPF_K: /* dst = dst << imm */
-		if (imm == 0)
-			break;
-		/* sllg %dst,%dst,imm(%r0) */
-		EMIT6_DISP_LH(0xeb000000, 0x000d, dst_reg, dst_reg, REG_0, imm);
-		break;
-	/*
-	 * BPF_RSH
-	 */
-	case BPF_ALU | BPF_RSH | BPF_X: /* dst = (u32) dst >> (u32) src */
-		/* srl %dst,0(%src) */
-		EMIT4_DISP(0x88000000, dst_reg, src_reg, 0);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_RSH | BPF_X: /* dst = dst >> src */
-		/* srlg %dst,%dst,0(%src) */
-		EMIT6_DISP_LH(0xeb000000, 0x000c, dst_reg, dst_reg, src_reg, 0);
-		break;
-	case BPF_ALU | BPF_RSH | BPF_K: /* dst = (u32) dst >> (u32) imm */
-		if (imm != 0) {
-			/* srl %dst,imm(%r0) */
-			EMIT4_DISP(0x88000000, dst_reg, REG_0, imm);
-		}
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_RSH | BPF_K: /* dst = dst >> imm */
-		if (imm == 0)
-			break;
-		/* srlg %dst,%dst,imm(%r0) */
-		EMIT6_DISP_LH(0xeb000000, 0x000c, dst_reg, dst_reg, REG_0, imm);
-		break;
-	/*
-	 * BPF_ARSH
-	 */
-	case BPF_ALU64 | BPF_ARSH | BPF_X: /* ((s64) dst) >>= src */
-		/* srag %dst,%dst,0(%src) */
-		EMIT6_DISP_LH(0xeb000000, 0x000a, dst_reg, dst_reg, src_reg, 0);
-		break;
-	case BPF_ALU64 | BPF_ARSH | BPF_K: /* ((s64) dst) >>= imm */
-		if (imm == 0)
-			break;
-		/* srag %dst,%dst,imm(%r0) */
-		EMIT6_DISP_LH(0xeb000000, 0x000a, dst_reg, dst_reg, REG_0, imm);
-		break;
-	/*
-	 * BPF_NEG
-	 */
-	case BPF_ALU | BPF_NEG: /* dst = (u32) -dst */
-		/* lcr %dst,%dst */
-		EMIT2(0x1300, dst_reg, dst_reg);
-		EMIT_ZERO(dst_reg);
-		break;
-	case BPF_ALU64 | BPF_NEG: /* dst = -dst */
-		/* lcgr %dst,%dst */
-		EMIT4(0xb9030000, dst_reg, dst_reg);
-		break;
-	/*
-	 * BPF_FROM_BE/LE
-	 */
-	case BPF_ALU | BPF_END | BPF_FROM_BE:
-		/* s390 is big endian, therefore only clear high order bytes */
-		switch (imm) {
-		case 16: /* dst = (u16) cpu_to_be16(dst) */
-			/* llghr %dst,%dst */
-			EMIT4(0xb9850000, dst_reg, dst_reg);
-			break;
-		case 32: /* dst = (u32) cpu_to_be32(dst) */
-			/* llgfr %dst,%dst */
-			EMIT4(0xb9160000, dst_reg, dst_reg);
-			break;
-		case 64: /* dst = (u64) cpu_to_be64(dst) */
-			break;
-		}
-		break;
-	case BPF_ALU | BPF_END | BPF_FROM_LE:
-		switch (imm) {
-		case 16: /* dst = (u16) cpu_to_le16(dst) */
-			/* lrvr %dst,%dst */
-			EMIT4(0xb91f0000, dst_reg, dst_reg);
-			/* srl %dst,16(%r0) */
-			EMIT4_DISP(0x88000000, dst_reg, REG_0, 16);
-			/* llghr %dst,%dst */
-			EMIT4(0xb9850000, dst_reg, dst_reg);
-			break;
-		case 32: /* dst = (u32) cpu_to_le32(dst) */
-			/* lrvr %dst,%dst */
-			EMIT4(0xb91f0000, dst_reg, dst_reg);
-			/* llgfr %dst,%dst */
-			EMIT4(0xb9160000, dst_reg, dst_reg);
-			break;
-		case 64: /* dst = (u64) cpu_to_le64(dst) */
-			/* lrvgr %dst,%dst */
-			EMIT4(0xb90f0000, dst_reg, dst_reg);
-			break;
-		}
-		break;
-	/*
-	 * BPF_ST(X)
-	 */
-	case BPF_STX | BPF_MEM | BPF_B: /* *(u8 *)(dst + off) = src_reg */
-		/* stcy %src,off(%dst) */
-		EMIT6_DISP_LH(0xe3000000, 0x0072, src_reg, dst_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_STX | BPF_MEM | BPF_H: /* (u16 *)(dst + off) = src */
-		/* sthy %src,off(%dst) */
-		EMIT6_DISP_LH(0xe3000000, 0x0070, src_reg, dst_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_STX | BPF_MEM | BPF_W: /* *(u32 *)(dst + off) = src */
-		/* sty %src,off(%dst) */
-		EMIT6_DISP_LH(0xe3000000, 0x0050, src_reg, dst_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_STX | BPF_MEM | BPF_DW: /* (u64 *)(dst + off) = src */
-		/* stg %src,off(%dst) */
-		EMIT6_DISP_LH(0xe3000000, 0x0024, src_reg, dst_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_ST | BPF_MEM | BPF_B: /* *(u8 *)(dst + off) = imm */
-		/* lhi %w0,imm */
-		EMIT4_IMM(0xa7080000, REG_W0, (u8) imm);
-		/* stcy %w0,off(dst) */
-		EMIT6_DISP_LH(0xe3000000, 0x0072, REG_W0, dst_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_ST | BPF_MEM | BPF_H: /* (u16 *)(dst + off) = imm */
-		/* lhi %w0,imm */
-		EMIT4_IMM(0xa7080000, REG_W0, (u16) imm);
-		/* sthy %w0,off(dst) */
-		EMIT6_DISP_LH(0xe3000000, 0x0070, REG_W0, dst_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_ST | BPF_MEM | BPF_W: /* *(u32 *)(dst + off) = imm */
-		/* llilf %w0,imm  */
-		EMIT6_IMM(0xc00f0000, REG_W0, (u32) imm);
-		/* sty %w0,off(%dst) */
-		EMIT6_DISP_LH(0xe3000000, 0x0050, REG_W0, dst_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_ST | BPF_MEM | BPF_DW: /* *(u64 *)(dst + off) = imm */
-		/* lgfi %w0,imm */
-		EMIT6_IMM(0xc0010000, REG_W0, imm);
-		/* stg %w0,off(%dst) */
-		EMIT6_DISP_LH(0xe3000000, 0x0024, REG_W0, dst_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	/*
-	 * BPF_STX XADD (atomic_add)
-	 */
-	case BPF_STX | BPF_XADD | BPF_W: /* *(u32 *)(dst + off) += src */
-		/* laal %w0,%src,off(%dst) */
-		EMIT6_DISP_LH(0xeb000000, 0x00fa, REG_W0, src_reg,
-			      dst_reg, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_STX | BPF_XADD | BPF_DW: /* *(u64 *)(dst + off) += src */
-		/* laalg %w0,%src,off(%dst) */
-		EMIT6_DISP_LH(0xeb000000, 0x00ea, REG_W0, src_reg,
-			      dst_reg, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	/*
-	 * BPF_LDX
-	 */
-	case BPF_LDX | BPF_MEM | BPF_B: /* dst = *(u8 *)(ul) (src + off) */
-		/* llgc %dst,0(off,%src) */
-		EMIT6_DISP_LH(0xe3000000, 0x0090, dst_reg, src_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_LDX | BPF_MEM | BPF_H: /* dst = *(u16 *)(ul) (src + off) */
-		/* llgh %dst,0(off,%src) */
-		EMIT6_DISP_LH(0xe3000000, 0x0091, dst_reg, src_reg, REG_0, off);
-		jit->seen |= SEEN_MEM;
-		break;
-	case BPF_LDX | BPF_MEM | BPF_W: /* dst = *(u32 *)(ul) (src + off) */
-		/* llgf %dst,off(%src) */
-		jit->seen |= SEEN_MEM;
-		EMIT6_DISP_LH(0xe3000000, 0x0016, dst_reg, src_reg, REG_0, off);
-		break;
-	case BPF_LDX | BPF_MEM | BPF_DW: /* dst = *(u64 *)(ul) (src + off) */
-		/* lg %dst,0(off,%src) */
-		jit->seen |= SEEN_MEM;
-		EMIT6_DISP_LH(0xe3000000, 0x0004, dst_reg, src_reg, REG_0, off);
-		break;
-	/*
-	 * BPF_JMP / CALL
-	 */
-	case BPF_JMP | BPF_CALL:
-	{
-		/*
-		 * b0 = (__bpf_call_base + imm)(b1, b2, b3, b4, b5)
-		 */
-		const u64 func = (u64)__bpf_call_base + imm;
-
-		REG_SET_SEEN(BPF_REG_5);
-		jit->seen |= SEEN_FUNC;
-		/* lg %w1,<d(imm)>(%l) */
-		EMIT6_DISP_LH(0xe3000000, 0x0004, REG_W1, REG_0, REG_L,
-			      EMIT_CONST_U64(func));
-		if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable) {
-			/* brasl %r14,__s390_indirect_jump_r1 */
-			EMIT6_PCREL_RILB(0xc0050000, REG_14, jit->r1_thunk_ip);
-		} else {
-			/* basr %r14,%w1 */
-			EMIT2(0x0d00, REG_14, REG_W1);
-		}
-		/* lgr %b0,%r2: load return value into %b0 */
-		EMIT4(0xb9040000, BPF_REG_0, REG_2);
-		if (bpf_helper_changes_skb_data((void *)func)) {
-			jit->seen |= SEEN_SKB_CHANGE;
-			/* lg %b1,ST_OFF_SKBP(%r15) */
-			EMIT6_DISP_LH(0xe3000000, 0x0004, BPF_REG_1, REG_0,
-				      REG_15, STK_OFF_SKBP);
-			emit_load_skb_data_hlen(jit);
-		}
-		break;
-	}
-	case BPF_JMP | BPF_CALL | BPF_X:
-		/*
-		 * Implicit input:
-		 *  B1: pointer to ctx
-		 *  B2: pointer to bpf_array
-		 *  B3: index in bpf_array
-		 */
-		jit->seen |= SEEN_TAIL_CALL;
-
-		/*
-		 * if (index >= array->map.max_entries)
-		 *         goto out;
-		 */
-
-		/* llgf %w1,map.max_entries(%b2) */
-		EMIT6_DISP_LH(0xe3000000, 0x0016, REG_W1, REG_0, BPF_REG_2,
-			      offsetof(struct bpf_array, map.max_entries));
-		/* clrj %b3,%w1,0xa,label0: if (u32)%b3 >= (u32)%w1 goto out */
-		EMIT6_PCREL_LABEL(0xec000000, 0x0077, BPF_REG_3,
-				  REG_W1, 0, 0xa);
-
-		/*
-		 * if (tail_call_cnt++ > MAX_TAIL_CALL_CNT)
-		 *         goto out;
-		 */
-
-		if (jit->seen & SEEN_STACK)
-			off = STK_OFF_TCCNT + STK_OFF;
-		else
-			off = STK_OFF_TCCNT;
-		/* lhi %w0,1 */
-		EMIT4_IMM(0xa7080000, REG_W0, 1);
-		/* laal %w1,%w0,off(%r15) */
-		EMIT6_DISP_LH(0xeb000000, 0x00fa, REG_W1, REG_W0, REG_15, off);
-		/* clij %w1,MAX_TAIL_CALL_CNT,0x2,label0 */
-		EMIT6_PCREL_IMM_LABEL(0xec000000, 0x007f, REG_W1,
-				      MAX_TAIL_CALL_CNT, 0, 0x2);
-
-		/*
-		 * prog = array->ptrs[index];
-		 * if (prog == NULL)
-		 *         goto out;
-		 */
-
-		/* llgfr %r1,%b3: %r1 = (u32) index */
-		EMIT4(0xb9160000, REG_1, BPF_REG_3);
-		/* sllg %r1,%r1,3: %r1 *= 8 */
-		EMIT6_DISP_LH(0xeb000000, 0x000d, REG_1, REG_1, REG_0, 3);
-		/* lg %r1,prog(%b2,%r1) */
-		EMIT6_DISP_LH(0xe3000000, 0x0004, REG_1, BPF_REG_2,
-			      REG_1, offsetof(struct bpf_array, ptrs));
-		/* clgij %r1,0,0x8,label0 */
-		EMIT6_PCREL_IMM_LABEL(0xec000000, 0x007d, REG_1, 0, 0, 0x8);
-
-		/*
-		 * Restore registers before calling function
-		 */
-		save_restore_regs(jit, REGS_RESTORE);
-
-		/*
-		 * goto *(prog->bpf_func + tail_call_start);
-		 */
-
-		/* lg %r1,bpf_func(%r1) */
-		EMIT6_DISP_LH(0xe3000000, 0x0004, REG_1, REG_1, REG_0,
-			      offsetof(struct bpf_prog, bpf_func));
-		/* bc 0xf,tail_call_start(%r1) */
-		_EMIT4(0x47f01000 + jit->tail_call_start);
-		/* out: */
-		jit->labels[0] = jit->prg;
-		break;
-	case BPF_JMP | BPF_EXIT: /* return b0 */
-		last = (i == fp->len - 1) ? 1 : 0;
-		if (last && !(jit->seen & SEEN_RET0))
-			break;
-		/* j <exit> */
-		EMIT4_PCREL(0xa7f40000, jit->exit_ip - jit->prg);
-		break;
-	/*
-	 * Branch relative (number of skipped instructions) to offset on
-	 * condition.
-	 *
-	 * Condition code to mask mapping:
-	 *
-	 * CC | Description	   | Mask
-	 * ------------------------------
-	 * 0  | Operands equal	   |	8
-	 * 1  | First operand low  |	4
-	 * 2  | First operand high |	2
-	 * 3  | Unused		   |	1
-	 *
-	 * For s390x relative branches: ip = ip + off_bytes
-	 * For BPF relative branches:	insn = insn + off_insns + 1
-	 *
-	 * For example for s390x with offset 0 we jump to the branch
-	 * instruction itself (loop) and for BPF with offset 0 we
-	 * branch to the instruction behind the branch.
-	 */
-	case BPF_JMP | BPF_JA: /* if (true) */
-		mask = 0xf000; /* j */
-		goto branch_oc;
-	case BPF_JMP | BPF_JSGT | BPF_K: /* ((s64) dst > (s64) imm) */
-		mask = 0x2000; /* jh */
-		goto branch_ks;
-	case BPF_JMP | BPF_JSGE | BPF_K: /* ((s64) dst >= (s64) imm) */
-		mask = 0xa000; /* jhe */
-		goto branch_ks;
-	case BPF_JMP | BPF_JGT | BPF_K: /* (dst_reg > imm) */
-		mask = 0x2000; /* jh */
-		goto branch_ku;
-	case BPF_JMP | BPF_JGE | BPF_K: /* (dst_reg >= imm) */
-		mask = 0xa000; /* jhe */
-		goto branch_ku;
-	case BPF_JMP | BPF_JNE | BPF_K: /* (dst_reg != imm) */
-		mask = 0x7000; /* jne */
-		goto branch_ku;
-	case BPF_JMP | BPF_JEQ | BPF_K: /* (dst_reg == imm) */
-		mask = 0x8000; /* je */
-		goto branch_ku;
-	case BPF_JMP | BPF_JSET | BPF_K: /* (dst_reg & imm) */
-		mask = 0x7000; /* jnz */
-		/* lgfi %w1,imm (load sign extend imm) */
-		EMIT6_IMM(0xc0010000, REG_W1, imm);
-		/* ngr %w1,%dst */
-		EMIT4(0xb9800000, REG_W1, dst_reg);
-		goto branch_oc;
-
-	case BPF_JMP | BPF_JSGT | BPF_X: /* ((s64) dst > (s64) src) */
-		mask = 0x2000; /* jh */
-		goto branch_xs;
-	case BPF_JMP | BPF_JSGE | BPF_X: /* ((s64) dst >= (s64) src) */
-		mask = 0xa000; /* jhe */
-		goto branch_xs;
-	case BPF_JMP | BPF_JGT | BPF_X: /* (dst > src) */
-		mask = 0x2000; /* jh */
-		goto branch_xu;
-	case BPF_JMP | BPF_JGE | BPF_X: /* (dst >= src) */
-		mask = 0xa000; /* jhe */
-		goto branch_xu;
-	case BPF_JMP | BPF_JNE | BPF_X: /* (dst != src) */
-		mask = 0x7000; /* jne */
-		goto branch_xu;
-	case BPF_JMP | BPF_JEQ | BPF_X: /* (dst == src) */
-		mask = 0x8000; /* je */
-		goto branch_xu;
-	case BPF_JMP | BPF_JSET | BPF_X: /* (dst & src) */
-		mask = 0x7000; /* jnz */
-		/* ngrk %w1,%dst,%src */
-		EMIT4_RRF(0xb9e40000, REG_W1, dst_reg, src_reg);
-		goto branch_oc;
-branch_ks:
-		/* lgfi %w1,imm (load sign extend imm) */
-		EMIT6_IMM(0xc0010000, REG_W1, imm);
-		/* cgrj %dst,%w1,mask,off */
-		EMIT6_PCREL(0xec000000, 0x0064, dst_reg, REG_W1, i, off, mask);
-		break;
-branch_ku:
-		/* lgfi %w1,imm (load sign extend imm) */
-		EMIT6_IMM(0xc0010000, REG_W1, imm);
-		/* clgrj %dst,%w1,mask,off */
-		EMIT6_PCREL(0xec000000, 0x0065, dst_reg, REG_W1, i, off, mask);
-		break;
-branch_xs:
-		/* cgrj %dst,%src,mask,off */
-		EMIT6_PCREL(0xec000000, 0x0064, dst_reg, src_reg, i, off, mask);
-		break;
-branch_xu:
-		/* clgrj %dst,%src,mask,off */
-		EMIT6_PCREL(0xec000000, 0x0065, dst_reg, src_reg, i, off, mask);
-		break;
-branch_oc:
-		/* brc mask,jmp_off (branch instruction needs 4 bytes) */
-		jmp_off = addrs[i + off + 1] - (addrs[i + 1] - 4);
-		EMIT4_PCREL(0xa7040000 | mask << 8, jmp_off);
-		break;
-	/*
-	 * BPF_LD
-	 */
-	case BPF_LD | BPF_ABS | BPF_B: /* b0 = *(u8 *) (skb->data+imm) */
-	case BPF_LD | BPF_IND | BPF_B: /* b0 = *(u8 *) (skb->data+imm+src) */
-		if ((BPF_MODE(insn->code) == BPF_ABS) && (imm >= 0))
-			func_addr = __pa(sk_load_byte_pos);
-		else
-			func_addr = __pa(sk_load_byte);
-		goto call_fn;
-	case BPF_LD | BPF_ABS | BPF_H: /* b0 = *(u16 *) (skb->data+imm) */
-	case BPF_LD | BPF_IND | BPF_H: /* b0 = *(u16 *) (skb->data+imm+src) */
-		if ((BPF_MODE(insn->code) == BPF_ABS) && (imm >= 0))
-			func_addr = __pa(sk_load_half_pos);
-		else
-			func_addr = __pa(sk_load_half);
-		goto call_fn;
-	case BPF_LD | BPF_ABS | BPF_W: /* b0 = *(u32 *) (skb->data+imm) */
-	case BPF_LD | BPF_IND | BPF_W: /* b0 = *(u32 *) (skb->data+imm+src) */
-		if ((BPF_MODE(insn->code) == BPF_ABS) && (imm >= 0))
-			func_addr = __pa(sk_load_word_pos);
-		else
-			func_addr = __pa(sk_load_word);
-		goto call_fn;
-call_fn:
-		jit->seen |= SEEN_SKB | SEEN_RET0 | SEEN_FUNC;
-		REG_SET_SEEN(REG_14); /* Return address of possible func call */
-
-		/*
-		 * Implicit input:
-		 *  BPF_REG_6	 (R7) : skb pointer
-		 *  REG_SKB_DATA (R12): skb data pointer
-		 *
-		 * Calculated input:
-		 *  BPF_REG_2	 (R3) : offset of byte(s) to fetch in skb
-		 *  BPF_REG_5	 (R6) : return address
-		 *
-		 * Output:
-		 *  BPF_REG_0	 (R14): data read from skb
-		 *
-		 * Scratch registers (BPF_REG_1-5)
-		 */
-
-		/* Call function: llilf %w1,func_addr  */
-		EMIT6_IMM(0xc00f0000, REG_W1, func_addr);
-
-		/* Offset: lgfi %b2,imm */
-		EMIT6_IMM(0xc0010000, BPF_REG_2, imm);
-		if (BPF_MODE(insn->code) == BPF_IND)
-			/* agfr %b2,%src (%src is s32 here) */
-			EMIT4(0xb9180000, BPF_REG_2, src_reg);
-
-		/* basr %b5,%w1 (%b5 is call saved) */
-		EMIT2(0x0d00, BPF_REG_5, REG_W1);
-
-		/*
-		 * Note: For fast access we jump directly after the
-		 * jnz instruction from bpf_jit.S
-		 */
-		/* jnz <ret0> */
-		EMIT4_PCREL(0xa7740000, jit->ret0_ip - jit->prg);
-		break;
-	default: /* too complex, give up */
-		pr_err("Unknown opcode %02x\n", insn->code);
-		return -1;
-	}
-	return insn_count;
-}
+#define SCR_WDTH8	0x01	/* 8-Bit Width Select */
+#define SCR_DMAP	0x04	/* Double Map */
+#define SCR_SO		0x08	/* Supervisor Only */
+#define SCR_BETEN	0x10	/* Bus-Error Time-Out Enable */
+#define SCR_PRV		0x20	/* Privilege Violation */
+#define SCR_WPV		0x40	/* Write Protect Violation */
+#define SCR_BETO	0x80	/* Bus-Error TimeOut */
 
 /*
- * Compile eBPF program into s390x code
+ * Silicon ID Register (Mask Revision Register (MRR) for '328 Compatibility)
  */
-static int bpf_jit_prog(struct bpf_jit *jit, struct bpf_prog *fp)
-{
-	int i, insn_count;
+#define MRR_ADDR 0xfffff004
+#define MRR	 LONG_REF(MRR_ADDR)
 
-	jit->lit = jit->lit_start;
-	jit->prg = 0;
+/********** 
+ *
+ * 0xFFFFF1xx -- Chip-Select logic
+ *
+ **********/
+ 
+/*
+ * Chip Select Group Base Registers 
+ */
+#define CSGBA_ADDR	0xfffff100
+#define CSGBB_ADDR	0xfffff102
 
-	bpf_jit_prologue(jit);
-	for (i = 0; i < fp->len; i += insn_count) {
-		insn_count = bpf_jit_insn(jit, fp, i);
-		if (insn_count < 0)
-			return -1;
-		/* Next instruction address */
-		jit->addrs[i + insn_count] = jit->prg;
-	}
-	bpf_jit_epilogue(jit);
+#define CSGBC_ADDR	0xfffff104
+#define CSGBD_ADDR	0xfffff106
 
-	jit->lit_start = jit->prg;
-	jit->size = jit->lit;
-	jit->size_prg = jit->prg;
-	return 0;
-}
+#define CSGBA		WORD_REF(CSGBA_ADDR)
+#define CSGBB		WORD_REF(CSGBB_ADDR)
+#define CSGBC		WORD_REF(CSGBC_ADDR)
+#define CSGBD		WORD_REF(CSGBD_ADDR)
 
 /*
- * Classic BPF function stub. BPF programs will be converted into
- * eBPF and then bpf_int_jit_compile() will be called.
+ * Chip Select Registers 
  */
-void bpf_jit_compile(struct bpf_prog *fp)
-{
-}
+#define CSA_ADDR	0xfffff110
+#define CSB_ADDR	0xfffff112
+#define CSC_ADDR	0xfffff114
+#define CSD_ADDR	0xfffff116
+
+#define CSA		WORD_REF(CSA_ADDR)
+#define CSB		WORD_REF(CSB_ADDR)
+#define CSC		WORD_REF(CSC_ADDR)
+#define CSD		WORD_REF(CSD_ADDR)
+
+#define CSA_EN		0x0001		/* Chip-Select Enable */
+#define CSA_SIZ_MASK	0x000e		/* Chip-Select Size */
+#define CSA_SIZ_SHIFT   1
+#define CSA_WS_MASK	0x0070		/* Wait State */
+#define CSA_WS_SHIFT    4
+#define CSA_BSW		0x0080		/* Data Bus Width */
+#define CSA_FLASH	0x0100		/* FLASH Memory Support */
+#define CSA_RO		0x8000		/* Read-Only */
+
+#define CSB_EN		0x0001		/* Chip-Select Enable */
+#define CSB_SIZ_MASK	0x000e		/* Chip-Select Size */
+#define CSB_SIZ_SHIFT   1
+#define CSB_WS_MASK	0x0070		/* Wait State */
+#define CSB_WS_SHIFT    4
+#define CSB_BSW		0x0080		/* Data Bus Width */
+#define CSB_FLASH	0x0100		/* FLASH Memory Support */
+#define CSB_UPSIZ_MASK	0x1800		/* Unprotected memory block size */
+#define CSB_UPSIZ_SHIFT 11
+#define CSB_ROP		0x2000		/* Readonly if protected */
+#define CSB_SOP		0x4000		/* Supervisor only if protected */
+#define CSB_RO		0x8000		/* Read-Only */
+
+#define CSC_EN		0x0001		/* Chip-Select Enable */
+#define CSC_SIZ_MASK	0x000e		/* Chip-Select Size */
+#define CSC_SIZ_SHIFT   1
+#define CSC_WS_MASK	0x0070		/* Wait State */
+#define CSC_WS_SHIFT    4
+#define CSC_BSW		0x0080		/* Data Bus Width */
+#define CSC_FLASH	0x0100		/* FLASH Memory Support */
+#define CSC_UPSIZ_MASK	0x1800		/* Unprotected memory block size */
+#define CSC_UPSIZ_SHIFT 11
+#define CSC_ROP		0x2000		/* Readonly if protected */
+#define CSC_SOP		0x4000		/* Supervisor only if protected */
+#define CSC_RO		0x8000		/* Read-Only */
+
+#define CSD_EN		0x0001		/* Chip-Select Enable */
+#define CSD_SIZ_MASK	0x000e		/* Chip-Select Size */
+#define CSD_SIZ_SHIFT   1
+#define CSD_WS_MASK	0x0070		/* Wait State */
+#define CSD_WS_SHIFT    4
+#define CSD_BSW		0x0080		/* Data Bus Width */
+#define CSD_FLASH	0x0100		/* FLASH Memory Support */
+#define CSD_DRAM	0x0200		/* Dram Selection */
+#define	CSD_COMB	0x0400		/* Combining */
+#define CSD_UPSIZ_MASK	0x1800		/* Unprotected memory block size */
+#define CSD_UPSIZ_SHIFT 11
+#define CSD_ROP		0x2000		/* Readonly if protected */
+#define CSD_SOP		0x4000		/* Supervisor only if protected */
+#define CSD_RO		0x8000		/* Read-Only */
 
 /*
- * Compile eBPF program "fp"
+ * Emulation Chip-Select Register 
  */
-struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *fp)
-{
-	struct bpf_binary_header *header;
-	struct bpf_jit jit;
-	int pass;
+#define EMUCS_ADDR	0xfffff118
+#define EMUCS		WORD_REF(EMUCS_ADDR)
 
-	if (!bpf_jit_enable)
-		return fp;
+#define EMUCS_WS_MASK	0x0070
+#define EMUCS_WS_SHIFT	4
 
-	memset(&jit, 0, sizeof(jit));
-	jit.addrs = kcalloc(fp->len + 1, sizeof(*jit.addrs), GFP_KERNEL);
-	if (jit.addrs == NULL)
-		return fp;
-	/*
-	 * Three initial passes:
-	 *   - 1/2: Determine clobbered registers
-	 *   - 3:   Calculate program size and addrs arrray
-	 */
-	for (pass = 1; pass <= 3; pass++) {
-		if (bpf_jit_prog(&jit, fp))
-			goto free_addrs;
-	}
-	/*
-	 * Final pass: Allocate and generate program
-	 */
-	if (jit.size >= BPF_SIZE_MAX)
-		goto free_addrs;
-	header = bpf_jit_binary_alloc(jit.size, &jit.prg_buf, 2, jit_fill_hole);
-	if (!header)
-		goto free_addrs;
-	if (bpf_jit_prog(&jit, fp))
-		goto free_addrs;
-	if (bpf_jit_enable > 1) {
-		bpf_jit_dump(fp->len, jit.size, pass, jit.prg_buf);
-		if (jit.prg_buf)
-			print_fn_code(jit.prg_buf, jit.size_prg);
-	}
-	if (jit.prg_buf) {
-		set_memory_ro((unsigned long)header, header->pages);
-		fp->bpf_func = (void *) jit.prg_buf;
-		fp->jited = 1;
-	}
-free_addrs:
-	kfree(jit.addrs);
-	return fp;
-}
+/********** 
+ *
+ * 0xFFFFF2xx -- Phase Locked Loop (PLL) & Power Control
+ *
+ **********/
 
 /*
- * Free eBPF program
+ * PLL Control Register 
  */
-void bpf_jit_free(struct bpf_prog *fp)
-{
-	unsigned long addr = (unsigned long)fp->bpf_func & PAGE_MASK;
-	struct bpf_binary_header *header = (void *)addr;
+#define PLLCR_ADDR	0xfffff200
+#define PLLCR		WORD_REF(PLLCR_ADDR)
 
-	if (!fp->jited)
-		goto free_filter;
+#define PLLCR_DISPLL	       0x0008	/* Disable PLL */
+#define PLLCR_CLKEN	       0x0010	/* Clock (CLKO pin) enable */
+#define PLLCR_PRESC	       0x0020	/* VCO prescaler */
+#define PLLCR_SYSCLK_SEL_MASK  0x0700	/* System Clock Selection */
+#define PLLCR_SYSCLK_SEL_SHIFT 8
+#define PLLCR_LCDCLK_SEL_MASK  0x3800	/* LCD Clock Selection */
+#define PLLCR_LCDCLK_SEL_SHIFT 11
 
-	set_memory_rw(addr, header->pages);
-	bpf_jit_binary_free(header);
+/* '328-compatible definitions */
+#define PLLCR_PIXCLK_SEL_MASK	PLLCR_LCDCLK_SEL_MASK
+#define PLLCR_PIXCLK_SEL_SHIFT	PLLCR_LCDCLK_SEL_SHIFT
 
-free_filter:
-	bpf_prog_unlock_free(fp);
-}
+/*
+ * PLL Frequency Select Register
+ */
+#define PLLFSR_ADDR	0xfffff202
+#define PLLFSR		WORD_REF(PLLFSR_ADDR)
+
+#define PLLFSR_PC_MASK	0x00ff		/* P Count */
+#define PLLFSR_PC_SHIFT 0
+#define PLLFSR_QC_MASK	0x0f00		/* Q Count */
+#define PLLFSR_QC_SHIFT 8
+#define PLLFSR_PROT	0x4000		/* Protect P & Q */
+#define PLLFSR_CLK32	0x8000		/* Clock 32 (kHz) */
+
+/*
+ * Power Control Register
+ */
+#define PCTRL_ADDR	0xfffff207
+#define PCTRL		BYTE_REF(PCTRL_ADDR)
+
+#define PCTRL_WIDTH_MASK	0x1f	/* CPU Clock bursts width */
+#define PCTRL_WIDTH_SHIFT	0
+#define PCTRL_PCEN		0x80	/* Power Control Enable */
+
+/**********
+ *
+ * 0xFFFFF3xx -- Interrupt Controller
+ *
+ **********/
+
+/* 
+ * Interrupt Vector Register
+ */
+#define IVR_ADDR	0xfffff300
+#define IVR		BYTE_REF(IVR_ADDR)
+
+#define IVR_VECTOR_MASK 0xF8
+
+/*
+ * Interrupt control Register
+ */
+#define ICR_ADDR	0xfffff302
+#define ICR		WORD_REF(ICR_ADDR)
+
+#define ICR_POL5	0x0080	/* Polarity Control for IRQ5 */
+#define ICR_ET6		0x0100	/* Edge Trigger Select for IRQ6 */
+#define ICR_ET3		0x0200	/* Edge Trigger Select for IRQ3 */
+#define ICR_ET2		0x0400	/* Edge Trigger Select for IRQ2 */
+#define ICR_ET1		0x0800	/* Edge Trigger Select for IRQ1 */
+#define ICR_POL6	0x1000	/* Polarity Control for IRQ6 */
+#define ICR_POL3	0x2000	/* Polarity Control for IRQ3 */
+#define ICR_POL2	0x4000	/* Polarity Control for IRQ2 */
+#define ICR_POL1	0x8000	/* Polarity Control for IRQ1 */
+
+/*
+ * Interrupt Mask Register
+ */
+#define IMR_ADDR	0xfffff304
+#define IMR		LONG_REF(IMR_ADDR)
+
+/*
+ * Define the names for bit positions first. This is useful for 
+ * request_irq
+ */
+#define SPI_IRQ_NUM	0	/* SPI interrupt */
+#define TMR_IRQ_NUM	1	/* Timer interrupt */
+#define UART_IRQ_NUM	2	/* UART interrupt */	
+#define	WDT_IRQ_NUM	3	/* Watchdog Timer interrupt */
+#define RTC_IRQ_NUM	4	/* RTC interrupt */
+#define	KB_IRQ_NUM	6	/* Keyboard Interrupt */
+#define PWM_IRQ_NUM	7	/* Pulse-Width Modulator int. */
+#define	INT0_IRQ_NUM	8	/* External INT0 */
+#define	INT1_IRQ_NUM	9	/* External INT1 */
+#define	INT2_IRQ_NUM	10	/* External INT2 */
+#define	INT3_IRQ_NUM	11	/* External INT3 */
+#define IRQ1_IRQ_NUM	16	/* IRQ1 */
+#define IRQ2_IRQ_NUM	17	/* IRQ2 */
+#define IRQ3_IRQ_NUM	18	/* IRQ3 */
+#define IRQ6_IRQ_NUM	19	/* IRQ6 */
+#define IRQ5_IRQ_NUM	20	/* IRQ5 */
+#define SAM_IRQ_NUM	22	/* Sampling Timer for RTC */
+#define EMIQ_IRQ_NUM	23	/* Emulator Interrupt */
+
+/* '328-compatible definitions */
+#define SPIM_IRQ_NUM	SPI_IRQ_NUM
+#define TMR1_IRQ_NUM	TMR_IRQ_NUM
+
+/* 
+ * Here go the bitmasks themselves
+ */
+#define IMR_MSPI 	(1 << SPI_IRQ_NUM)	/* Mask SPI interrupt */
+#define	IMR_MTMR	(1 << TMR_IRQ_NUM)	/* Mask Timer interrupt */
+#define IMR_MUART	(1 << UART_IRQ_NUM)	/* Mask UART interrupt */	
+#define	IMR_MWDT	(1 << WDT_IRQ_NUM)	/* Mask Watchdog Timer interrupt */
+#define IMR_MRTC	(1 << RTC_IRQ_NUM)	/* Mask RTC interrupt */
+#define	IMR_MKB		(1 << KB_IRQ_NUM)	/* Mask Keyboard Interrupt */
+#define IMR_MPWM	(1 << PWM_IRQ_NUM)	/* Mask Pulse-Width Modulator int. */
+#define	IMR_MINT0	(1 << INT0_IRQ_NUM)	/* Mask External INT0 */
+#define	IMR_MINT1	(1 << INT1_IRQ_NUM)	/* Mask External INT1 */
+#define	IMR_MINT2	(1 << INT2_IRQ_NUM)	/* Mask External INT2 */
+#define	IMR_MINT3	(1 << INT3_IRQ_NUM)	/* Mask External INT3 */
+#define IMR_MIRQ1	(1 << IRQ1_IRQ_NUM)	/* Mask IRQ1 */
+#define IMR_MIRQ2	(1 << IRQ2_IRQ_NUM)	/* Mask IRQ2 */
+#define IMR_MIRQ3	(1 << IRQ3_IRQ_NUM)	/* Mask IRQ3 */
+#define IMR_MIRQ6	(1 << IRQ6_IRQ_NUM)	/* Mask IRQ6 */
+#define IMR_MIRQ5	(1 << IRQ5_IRQ_NUM)	/* Mask IRQ5 */
+#define IMR_MSAM	(1 << SAM_IRQ_NUM)	/* Mask Sampling Timer for RTC */
+#define IMR_MEMIQ	(1 << EMIQ_IRQ_NUM)	/* Mask Emulator Interrupt */
+
+/* '328-compatible definitions */
+#define IMR_MSPIM	IMR_MSPI
+#define IMR_MTMR1	IMR_MTMR
+
+/* 
+ * Interrupt Status Register 
+ */
+#define ISR_ADDR	0xfffff30c
+#define ISR		LONG_REF(ISR_ADDR)
+
+#define ISR_SPI 	(1 << SPI_IRQ_NUM)	/* SPI interrupt */
+#define	ISR_TMR		(1 << TMR_IRQ_NUM)	/* Timer interrupt */
+#define ISR_UART	(1 << UART_IRQ_NUM)	/* UART interrupt */	
+#define	ISR_WDT		(1 << WDT_IRQ_NUM)	/* Watchdog Timer interrupt */
+#define ISR_RTC		(1 << RTC_IRQ_NUM)	/* RTC interrupt */
+#define	ISR_KB		(1 << KB_IRQ_NUM)	/* Keyboard Interrupt */
+#define ISR_PWM		(1 << PWM_IRQ_NUM)	/* Pulse-Width Modulator interrupt */
+#define	ISR_INT0	(1 << INT0_IRQ_NUM)	/* External INT0 */
+#define	ISR_INT1	(1 << INT1_IRQ_NUM)	/* External INT1 */
+#define	ISR_INT2	(1 << INT2_IRQ_NUM)	/* External INT2 */
+#define	ISR_INT3	(1 << INT3_IRQ_NUM)	/* External INT3 */
+#define ISR_IRQ1	(1 << IRQ1_IRQ_NUM)	/* IRQ1 */
+#define ISR_IRQ2	(1 << IRQ2_IRQ_NUM)	/* IRQ2 */
+#define ISR_IRQ3	(1 << IRQ3_IRQ_NUM)	/* IRQ3 */
+#define ISR_IRQ6	(1 << IRQ6_IRQ_NUM)	/* IRQ6 */
+#define ISR_IRQ5	(1 << IRQ5_IRQ_NUM)	/* IRQ5 */
+#define ISR_SAM		(1 << SAM_IRQ_NUM)	/* Sampling Timer for RTC */
+#define ISR_EMIQ	(1 << EMIQ_IRQ_NUM)	/* Emulator Interrupt */
+
+/* '328-compatible definitions */
+#define ISR_SPIM	ISR_SPI
+#define ISR_TMR1	ISR_TMR
+
+/* 
+ * Interrupt Pending Register 
+ */
+#define IPR_ADDR	0xfffff30c
+#define IPR		LONG_REF(IPR_ADDR)
+
+#define IPR_SPI 	(1 << SPI_IRQ_NUM)	/* SPI interrupt */
+#define	IPR_TMR		(1 << TMR_IRQ_NUM)	/* Timer interrupt */
+#define IPR_UART	(1 << UART_IRQ_NUM)	/* UART interrupt */	
+#define	IPR_WDT		(1 << WDT_IRQ_NUM)	/* Watchdog Timer interrupt */
+#define IPR_RTC		(1 << RTC_IRQ_NUM)	/* RTC interrupt */
+#define	IPR_KB		(1 << KB_IRQ_NUM)	/* Keyboard Interrupt */
+#define IPR_PWM		(1 << PWM_IRQ_NUM)	/* Pulse-Width Modulator interrupt */
+#define	IPR_INT0	(1 << INT0_IRQ_NUM)	/* External INT0 */
+#define	IPR_INT1	(1 << INT1_IRQ_NUM)	/* External INT1 */
+#define	IPR_INT2	(1 << INT2_IRQ_NUM)	/* External INT2 */
+#define	IPR_INT3	(1 << INT3_IRQ_NUM)	/* External INT3 */
+#define IPR_IRQ1	(1 << IRQ1_IRQ_NUM)	/* IRQ1 */
+#define IPR_IRQ2	(1 << IRQ2_IRQ_NUM)	/* IRQ2 */
+#define IPR_IRQ3	(1 << IRQ3_IRQ_NUM)	/* IRQ3 */
+#define IPR_IRQ6	(1 << IRQ6_IRQ_NUM)	/* IRQ6 */
+#define IPR_IRQ5	(1 << IRQ5_IRQ_NUM)	/* IRQ5 */
+#define IPR_SAM		(1 << SAM_IRQ_NUM)	/* Sampling Timer for RTC */
+#define IPR_EMIQ	(1 << EMIQ_IRQ_NUM)	/* Emulator Interrupt */
+
+/* '328-compatible definitions */
+#define IPR_SPIM	IPR_SPI
+#define IPR_TMR1	IPR_TMR
+
+/**********
+ *
+ * 0xFFFFF4xx -- Parallel Ports
+ *
+ **********/
+
+/*
+ * Port A
+ */
+#define PADIR_ADDR	0xfffff400		/* Port A direction reg */
+#define PADATA_ADDR	0xfffff401		/* Port A data register */
+#define PAPUEN_ADDR	0xfffff402		/* Port A Pull-Up enable reg */
+
+#define PADIR		BYTE_REF(PADIR_ADDR)
+#define PADATA		BYTE_REF(PADATA_ADDR)
+#define PAPUEN		BYTE_REF(PAPUEN_ADDR)
+
+#define PA(x)		(1 << (x))
+
+/* 
+ * Port B
+ */
+#define PBDIR_ADDR	0xfffff408		/* Port B direction reg */
+#define PBDATA_ADDR	0xfffff409		/* Port B data register */
+#define PBPUEN_ADDR	0xfffff40a		/* Port B Pull-Up enable reg */
+#define PBSEL_ADDR	0xfffff40b		/* Port B Select Register */
+
+#define PBDIR		BYTE_REF(PBDIR_ADDR)
+#define PBDATA		BYTE_REF(PBDATA_ADDR)
+#define PBPUEN		BYTE_REF(PBPUEN_ADDR)
+#define PBSEL		BYTE_REF(PBSEL_ADDR)
+
+#define PB(x)		(1 << (x))
+
+#define PB_CSB0		0x01	/* Use CSB0      as PB[0] */
+#define PB_CSB1		0x02	/* Use CSB1      as PB[1] */
+#define PB_CSC0_RAS0	0x04    /* Use CSC0/RAS0 as PB[2] */	
+#define PB_CSC1_RAS1	0x08    /* Use CSC1/RAS1 as PB[3] */	
+#define PB_CSD0_CAS0	0x10    /* Use CSD0/CAS0 as PB[4] */	
+#define PB_CSD1_CAS1	0x20    /* Use CSD1/CAS1 as PB[5] */
+#define PB_TIN_TOUT	0x40	/* Use TIN/TOUT  as PB[6] */
+#define PB_PWMO		0x80	/* Use PWMO      as PB[7] */
+
+/* 
+ * Port C
+ */
+#define PCDIR_ADDR	0xfffff410		/* Port C direction reg */
+#define PCDATA_ADDR	0xfffff411		/* Port C data register */
+#define PCPDEN_ADDR	0xfffff412		/* Port C Pull-Down enb. reg */
+#define PCSEL_ADDR	0xfffff413		/* Port C Select Register */
+
+#define PCDIR		BYTE_REF(PCDIR_ADDR)
+#define PCDATA		BYTE_REF(PCDATA_ADDR)
+#define PCPDEN		BYTE_REF(PCPDEN_ADDR)
+#define PCSEL		BYTE_REF(PCSEL_ADDR)
+
+#define PC(x)		(1 << (x))
+
+#define PC_LD0		0x01	/* Use LD0  as PC[0] */
+#define PC_LD1		0x02	/* Use LD1  as PC[1] */
+#define PC_LD2		0x04	/* Use LD2  as PC[2] */
+#define PC_LD3		0x08	/* Use LD3  as PC[3] */
+#define PC_LFLM		0x10	/* Use LFLM as PC[4] */
+#define PC_LLP 		0x20	/* Use LLP  as PC[5] */
+#define PC_LCLK		0x40	/* Use LCLK as PC[6] */
+#define PC_LACD		0x80	/* Use LACD as PC[7] */
+
+/* 
+ * Port D
+ */
+#define PDDIR_ADDR	0xfffff418		/* Port D direction reg */
+#define PDDATA_ADDR	0xfffff419		/* Port D data register */
+#define PDPUEN_ADDR	0xfffff41a		/* Port D Pull-Up enable reg */
+#define PDSEL_ADDR	0xfffff41b		/* Port D Select Register */
+#define PDPOL_ADDR	0xfffff41c		/* Port D Polarity Register */
+#define PDIRQEN_ADDR	0xfffff41d		/* Port D IRQ enable register */
+#define PDKBEN_ADDR	0xfffff41e		/* Port D Keyboard Enable reg */
+#define	PDIQEG_ADDR	0xfffff41f		/* Port D IRQ Edge Register */
+
+#define PDDIR		BYTE_REF(PDDIR_ADDR)
+#define PDDATA		BYTE_REF(PDDATA_ADDR)
+#define PDPUEN		BYTE_REF(PDPUEN_ADDR)
+#define PDSEL		BYTE_REF(PDSEL_ADDR)
+#define	PDPOL		BYTE_REF(PDPOL_ADDR)
+#define PDIRQEN		BYTE_REF(PDIRQEN_ADDR)
+#define PDKBEN		BYTE_REF(PDKBEN_ADDR)
+#define PDIQEG		BYTE_REF(PDIQEG_ADDR)
+
+#define PD(x)		(1 << (x))
+
+#define PD_INT0		0x01	/* Use INT0 as PD[0] */
+#define PD_INT1		0x02	/* Use INT1 as PD[1] */
+#define PD_INT2		0x04	/* Use INT2 as PD[2] */
+#define PD_INT3		0x08	/* Use INT3 as PD[3] */
+#define PD_IRQ1		0x10	/* Use IRQ1 as PD[4] */
+#define PD_IRQ2		0x20	/* Use IRQ2 as PD[5] */
+#define PD_IRQ3		0x40	/* Use IRQ3 as PD[6] */
+#define PD_IRQ6		0x80	/* Use IRQ6 as PD[7] */
+
+/* 
+ * Port E
+ */
+#define PEDIR_ADDR	0xfffff420		/* Port E direction reg */
+#define PEDATA_ADDR	0xfffff421		/* Port E data register */
+#define PEPUEN_ADDR	0xfffff422		/* Port E Pull-Up enable reg */
+#define PESEL_ADDR	0xfffff423		/* Port E Select Register */
+
+#define PEDIR		BYTE_REF(PEDIR_ADDR)
+#define PEDATA		BYTE_REF(PEDATA_ADDR)
+#define PEPUEN		BYTE_REF(PEPUEN_ADDR)
+#define PESEL		BYTE_REF(PESEL_ADDR)
+
+#define PE(x)		(1 << (x))
+
+#define PE_SPMTXD	0x01	/* Use SPMTXD as PE[0] */
+#define PE_SPMRXD	0x02	/* Use SPMRXD as PE[1] */
+#define PE_SPMCLK	0x04	/* Use SPMCLK as PE[2] */
+#define PE_DWE		0x08	/* Use DWE    as PE[3] */
+#define PE_RXD		0x10	/* Use RXD    as PE[4] */
+#define PE_TXD		0x20	/* Use TXD    as PE[5] */
+#define PE_RTS		0x40	/* Use RTS    as PE[6] */
+#define PE_CTS		0x80	/* Use CTS    as PE[7] */
+
+/* 
+ * Port F
+ */
+#define PFDIR_ADDR	0xfffff428		/* Port F direction reg */
+#define PFDATA_ADDR	0xfffff429		/* Port F data register */
+#define PFPUEN_ADDR	0xfffff42a		/* Port F Pull-Up enable reg */
+#define PFSEL_ADDR	0xfffff42b		/* Port F Select Register */
+
+#define PFDIR		BYTE_REF(PFDIR_ADDR)
+#define PFDATA		BYTE_REF(PFDATA_ADDR)
+#define PFPUEN		BYTE_REF(PFPUEN_ADDR)
+#define PFSEL		BYTE_REF(PFSEL_ADDR)
+
+#define PF(x)		(1 << (x))
+
+#define PF_LCONTRAST	0x01	/* Use LCONTRAST as PF[0] */
+#define PF_IRQ5         0x02    /* Use IRQ5      as PF[1] */
+#define PF_CLKO         0x04    /* Use CLKO      as PF[2] */
+#define PF_A20          0x08    /* Use A20       as PF[3] */
+#define PF_A21          0x10    /* Use A21       as PF[4] */
+#define PF_A22          0x20    /* Use A22       as PF[5] */
+#define PF_A23          0x40    /* Use A23       as PF[6] */
+#define PF_CSA1		0x80    /* Use CSA1      as PF[7] */
+
+/* 
+ * Port G
+ */
+#define PGDIR_ADDR	0xfffff430		/* Port G direction reg */
+#define PGDATA_ADDR	0xfffff431		/* Port G data register */
+#define PGPUEN_ADDR	0xfffff432		/* Port G Pull-Up enable reg */
+#define PGSEL_ADDR	0xfffff433		/* Port G Select Register */
+
+#define PGDIR		BYTE_REF(PGDIR_ADDR)
+#define PGDATA		BYTE_REF(PGDATA_ADDR)
+#define PGPUEN		BYTE_REF(PGPUEN_ADDR)
+#define PGSEL		BYTE_REF(PGSEL_ADDR)
+
+#define PG(x)		(1 << (x))
+
+#define PG_BUSW_DTACK	0x01	/* Use BUSW/DTACK as PG[0] */
+#define PG_A0		0x02	/* Use A0         as PG[1] */
+#define PG_EMUIRQ	0x04	/* Use EMUIRQ     as PG[2] */
+#define PG_HIZ_P_D	0x08	/* Use HIZ/P/D    as PG[3] */
+#define PG_EMUCS        0x10	/* Use EMUCS      as PG[4] */
+#define PG_EMUBRK	0x20	/* Use EMUBRK     as PG[5] */
+
+/**********
+ *
+ * 0xFFFFF5xx -- Pulse-Width Modulator (PWM)
+ *
+ **********/
+
+/*
+ * PWM Control Register 
+ */
+#define PWMC_ADDR	0xfffff500
+#define PWMC		WORD_REF(PWMC_ADDR)
+
+#define PWMC_CLKSEL_MASK	0x0003	/* Clock Selection */
+#define PWMC_CLKSEL_SHIFT	0
+#define PWMC_REPEAT_MASK	0x000c	/* Sample Repeats */
+#define PWMC_REPEAT_SHIFT	2
+#define PWMC_EN			0x0010	/* Enable PWM */
+#define PMNC_FIFOAV		0x0020	/* FIFO Available */
+#define PWMC_IRQEN		0x0040	/* Interrupt Request Enable */
+#define PWMC_IRQ		0x0080	/* Interrupt Request (FIFO empty) */
+#define PWMC_PRESCALER_MASK	0x7f00	/* Incoming Clock prescaler */
+#define PWMC_PRESCALER_SHIFT	8
+#define PWMC_CLKSRC		0x8000	/* Clock Source Select */
+
+/* '328-compatible definitions */
+#define PWMC_PWMEN	PWMC_EN
+
+/*
+ * PWM Sample Register 
+ */
+#define PWMS_ADDR	0xfffff502
+#define PWMS		WORD_REF(PWMS_ADDR)
+
+/*
+ * PWM Period Register
+ */
+#define PWMP_ADDR	0xfffff504
+#define PWMP		BYTE_REF(PWMP_ADDR)
+
+/*
+ * PWM Counter Register
+ */
+#define PWMCNT_ADDR	0xfffff505
+#define PWMCNT		BYTE_REF(PWMCNT_ADDR)
+
+/**********
+ *
+ * 0xFFFFF6xx -- General-Purpose Timer
+ *
+ **********/
+
+/* 
+ * Timer Control register
+ */
+#define TCTL_ADDR	0xfffff600
+#define TCTL		WORD_REF(TCTL_ADDR)
+
+#define	TCTL_TEN		0x0001	/* Timer Enable  */
+#define TCTL_CLKSOURCE_MASK 	0x000e	/* Clock Source: */
+#define   TCTL_CLKSOURCE_STOP	   0x0000	/* Stop count (disabled)    */
+#define   TCTL_CLKSOURCE_SYSCLK	   0x0002	/* SYSCLK to prescaler      */
+#define   TCTL_CLKSOURCE_SYSCLK_16 0x0004	/* SYSCLK/16 to prescaler   */
+#define   TCTL_CLKSOURCE_TIN	   0x0006	/* TIN to prescaler         */
+#define   TCTL_CLKSOURCE_32KHZ	   0x0008	/* 32kHz clock to prescaler */
+#define TCTL_IRQEN		0x0010	/* IRQ Enable    */
+#define TCTL_OM			0x0020	/* Output Mode   */
+#define TCTL_CAP_MASK		0x00c0	/* Capture Edge: */
+#define	  TCTL_CAP_RE		0x0040		/* Capture on rizing edge   */
+#define   TCTL_CAP_FE		0x0080		/* Capture on falling edge  */
+#define TCTL_FRR		0x0010	/* Free-Run Mode */
+
+/* '328-compatible definitions */
+#define TCTL1_ADDR	TCTL_ADDR
+#define TCTL1		TCTL
+
+/*
+ * Timer Prescaler Register
+ */
+#define TPRER_ADDR	0xfffff602
+#define TPRER		WORD_REF(TPRER_ADDR)
+
+/* '328-compatible definitions */
+#define TPRER1_ADDR	TPRER_ADDR
+#define TPRER1		TPRER
+
+/*
+ * Timer Compare Register
+ */
+#define TCMP_ADDR	0xfffff604
+#define TCMP		WORD_REF(TCMP_ADDR)
+
+/* '328-compatible definitions */
+#define TCMP1_ADDR	TCMP_ADDR
+#define TCMP1		TCMP
+
+/*
+ * Timer Capture register
+ */
+#define TCR_ADDR	0xfffff606
+#define TCR		WORD_REF(TCR_ADDR)
+
+/* '328-compatible definitions */
+#define TCR1_ADDR	TCR_ADDR
+#define TCR1		TCR
+
+/*
+ * Timer Counter Register
+ */
+#define TCN_ADDR	0xfffff608
+#define TCN		WORD_REF(TCN_ADDR)
+
+/* '328-compatible definitions */
+#define TCN1_ADDR	TCN_ADDR
+#define TCN1		TCN
+
+/*
+ * Timer Status Register
+ */
+#define TSTAT_ADDR	0xfffff60a
+#define TSTAT		WORD_REF(TSTAT_ADDR)
+
+#define TSTAT_COMP	0x0001		/* Compare Event occurred */
+#define TSTAT_CAPT	0x0001		/* Capture Event occurred */
+
+/* '328-compatible definitions */
+#define TSTAT1_ADDR	TSTAT_ADDR
+#define TSTAT1		TSTAT
+
+/**********
+ *
+ * 0xFFFFF8xx -- Serial Periferial Interface Master (SPIM)
+ *
+ **********/
+
+/*
+ * SPIM Data Register
+ */
+#define SPIMDATA_ADDR	0xfffff800
+#define SPIMDATA	WORD_REF(SPIMDATA_ADDR)
+
+/*
+ * SPIM Control/Status Register
+ */
+#define SPIMCONT_ADDR	0xfffff802
+#define SPIMCONT	WORD_REF(SPIMCONT_ADDR)
+
+#define SPIMCONT_BIT_COUNT_MASK	 0x000f	/* Transfer Length in Bytes */
+#define SPIMCONT_BIT_COUNT_SHIFT 0
+#define SPIMCONT_POL		 0x0010	/* SPMCLK Signel Polarity */
+#define	SPIMCONT_PHA		 0x0020	/* Clock/Data phase relationship */
+#define SPIMCONT_IRQEN		 0x0040 /* IRQ Enable */
+#define SPIMCONT_IRQ		 0x0080	/* Interrupt Request */
+#define SPIMCONT_XCH		 0x0100	/* Exchange */
+#define SPIMCONT_ENABLE		 0x0200	/* Enable SPIM */
+#define SPIMCONT_DATA_RATE_MASK	 0xe000	/* SPIM Data Rate */
+#define SPIMCONT_DATA_RATE_SHIFT 13
+
+/* '328-compatible definitions */
+#define SPIMCONT_SPIMIRQ	SPIMCONT_IRQ
+#define SPIMCONT_SPIMEN		SPIMCONT_ENABLE
+
+/**********
+ *
+ * 0xFFFFF9xx -- UART
+ *
+ **********/
+
+/*
+ * UART Status/Control Register
+ */
+#define USTCNT_ADDR	0xfffff900
+#define USTCNT		WORD_REF(USTCNT_ADDR)
+
+#define USTCNT_TXAE	0x0001	/* Transmitter Available Interrupt Enable */
+#define USTCNT_TXHE	0x0002	/* Transmitter Half Empty Enable */
+#define USTCNT_TXEE	0x0004	/* Transmitter Empty Interrupt Enable */
+#define USTCNT_RXRE	0x0008	/* Receiver Ready Interrupt Enable */
+#define USTCNT_RXHE	0x0010	/* Receiver Half-Full Interrupt Enable */
+#define USTCNT_RXFE	0x0020	/* Receiver Full Interrupt Enable */
+#define USTCNT_CTSD	0x0040	/* CTS Delta Interrupt Enable */
+#define USTCNT_ODEN	0x0080	/* Old Data Interrupt Enable */
+#define USTCNT_8_7	0x0100	/* Eight or seven-bit transmission */
+#define USTCNT_STOP	0x0200	/* Stop bit transmission */
+#define USTCNT_ODD	0x0400	/* Odd Parity */
+#define	USTCNT_PEN	0x0800	/* Parity Enable */
+#define USTCNT_CLKM	0x1000	/* Clock Mode Select */
+#define	USTCNT_TXEN	0x2000	/* Transmitter Enable */
+#define USTCNT_RXEN	0x4000	/* Receiver Enable */
+#define USTCNT_UEN	0x8000	/* UART Enable */
+
+/* '328-compatible definitions */
+#define USTCNT_TXAVAILEN	USTCNT_TXAE
+#define USTCNT_TXHALFEN		USTCNT_TXHE
+#define USTCNT_TXEMPTYEN	USTCNT_TXEE
+#define USTCNT_RXREADYEN	USTCNT_RXRE
+#define USTCNT_RXHALFEN		USTCNT_RXHE
+#define USTCNT_RXFULLEN		USTCNT_RXFE
+#define USTCNT_CTSDELTAEN	USTCNT_CTSD
+#define USTCNT_ODD_EVEN		USTCNT_ODD
+#define USTCNT_PARITYEN		USTCNT_PEN
+#define USTCNT_CLKMODE		USTCNT_CLKM
+#define USTCNT_UARTEN		USTCNT_UEN
+
+/*
+ * UART Baud Control Register
+ */
+#define UBAUD_ADDR	0xfffff902
+#define UBAUD		WORD_REF(UBAUD_ADDR)
+
+#define UBAUD_PRESCALER_MASK	0x003f	/* Actual divisor is 65 - PRESCALER */
+#define UBAUD_PRESCALER_SHIFT	0
+#define UBAUD_DIVIDE_MASK	0x0700	/* Baud Rate freq. divizor */
+#define UBAUD_DIVIDE_SHIFT	8
+#define UBAUD_BAUD_SRC		0x0800	/* Baud Rate Source */
+#define UBAUD_UCLKDIR		0x2000	/* UCLK Direction */
+
+/*
+ * UART Receiver Register 
+ */
+#define URX_ADDR	0xfffff904
+#define URX		WORD_REF(URX_ADDR)
+
+#define URX_RXDATA_ADDR	0xfffff905
+#define URX_RXDATA	BYTE_REF(URX_RXDATA_ADDR)
+
+#define URX_RXDATA_MASK	 0x00ff	/* Received data */
+#define URX_RXDATA_SHIFT 0
+#define URX_PARITY_ERROR 0x0100	/* Parity Error */
+#define URX_BREAK	 0x0200	/* Break Detected */
+#define URX_FRAME_ERROR	 0x0400	/* Framing Error */
+#define URX_OVRUN	 0x0800	/* Serial Overrun */
+#define URX_OLD_DATA	 0x1000	/* Old data in FIFO */
+#define URX_DATA_READY	 0x2000	/* Data Ready (FIFO not empty) */
+#define URX_FIFO_HALF	 0x4000 /* FIFO is Half-Full */
+#define URX_FIFO_FULL	 0x8000	/* FIFO is Full */
+
+/*
+ * UART Transmitter Register 
+ */
+#define UTX_ADDR	0xfffff906
+#define UTX		WORD_REF(UTX_ADDR)
+
+#define UTX_TXDATA_ADDR	0xfffff907
+#define UTX_TXDATA	BYTE_REF(UTX_TXDATA_ADDR)
+
+#define UTX_TXDATA_MASK	 0x00ff	/* Data to be transmitted */
+#define UTX_TXDATA_SHIFT 0
+#define UTX_CTS_DELTA	 0x0100	/* CTS changed */
+#define UTX_CTS_STAT	 0x0200	/* CTS State */
+#define	UTX_BUSY	 0x0400	/* FIFO is busy, sending a character */
+#define	UTX_NOCTS	 0x0800	/* Ignore CTS */
+#define UTX_SEND_BREAK	 0x1000	/* Send a BREAK */
+#define UTX_TX_AVAIL	 0x2000	/* Transmit FIFO has a slot available */
+#define UTX_FIFO_HALF	 0x4000	/* Transmit FIFO is half empty */
+#define UTX_FIFO_EMPTY	 0x8000	/* Transmit FIFO is empty */
+
+/* '328-compatible definitions */
+#define UTX_CTS_STATUS	UTX_CTS_STAT
+#define UTX_IGNORE_CTS	UTX_NOCTS
+
+/*
+ * UART Miscellaneous Register 
+ */
+#define UMISC_ADDR	0xfffff908
+#define UMISC		WORD_REF(UMISC_ADDR)
+
+#define UMISC_TX_POL	 0x0004	/* Transmit Polarity */
+#define UMISC_RX_POL	 0x0008	/* Receive Polarity */
+#define UMISC_IRDA_LOOP	 0x0010	/* IrDA Loopback Enable */
+#define UMISC_IRDA_EN	 0x0020	/* Infra-Red Enable */
+#define UMISC_RTS	 0x0040	/* Set RTS status */
+#define UMISC_RTSCONT	 0x0080	/* Choose RTS control */
+#define UMISC_IR_TEST	 0x0400	/* IRDA Test Enable */
+#define UMISC_BAUD_RESET 0x0800	/* Reset Baud Rate Generation Counters */
+#define UMISC_LOOP	 0x1000	/* Serial Loopback Enable */
+#define UMISC_FORCE_PERR 0x2000	/* Force Parity Error */
+#define UMISC_CLKSRC	 0x4000	/* Clock Source */
+#define UMISC_BAUD_TEST	 0x8000	/* Enable Baud Test Mode */
+
+/* 
+ * UART Non-integer Prescaler Register
+ */
+#define NIPR_ADDR	0xfffff90a
+#define NIPR		WORD_REF(NIPR_ADDR)
+
+#define NIPR_STEP_VALUE_MASK	0x00ff	/* NI prescaler step value */
+#define NIPR_STEP_VALUE_SHIFT	0
+#define NIPR_SELECT_MASK	0x0700	/* Tap Selection */
+#define NIPR_SELECT_SHIFT	8
+#define NIPR_PRE_SEL		0x8000	/* Non-integer prescaler select */
+
+
+/* generalization of uart control registers to support multiple ports: */
+typedef volatile struct {
+  volatile unsigned short int ustcnt;
+  volatile unsigned short int ub

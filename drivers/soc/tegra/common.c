@@ -1,36 +1,11 @@
-/*
- * Copyright (C) 2014 NVIDIA CORPORATION.  All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/of.h>
-
-#include <soc/tegra/common.h>
-
-static const struct of_device_id tegra_machine_match[] = {
-	{ .compatible = "nvidia,tegra20", },
-	{ .compatible = "nvidia,tegra30", },
-	{ .compatible = "nvidia,tegra114", },
-	{ .compatible = "nvidia,tegra124", },
-	{ .compatible = "nvidia,tegra132", },
-	{ .compatible = "nvidia,tegra210", },
-	{ }
-};
-
-bool soc_is_tegra(void)
-{
-	const struct of_device_id *match;
-	struct device_node *root;
-
-	root = of_find_node_by_path("/");
-	if (!root)
-		return false;
-
-	match = of_match_node(tegra_machine_match, root);
-	of_node_put(root);
-
-	return match != NULL;
-}
+                        0x1a7
+#define mmSMU_IND_INDEX_1                                                       0x1a8
+#define mmSMU_IND_DATA_1                                                        0x1a9
+#define mmSMU_IND_INDEX_2                                                       0x1aa
+#define mmSMU_IND_DATA_2                                                        0x1ab
+#define mmSMU_IND_INDEX_3                                                       0x1ac
+#define mmSMU_IND_DATA_3                                                        0x1ad
+#define mmSMU_IND_INDEX_4                                                       0x1ae
+#define mmSMU_IND_DATA_4                                                        0x1af
+#define mmSMU_IND_INDEX_5                                                       0x1b0
+#define mmSMU_IND_DATA_5                                      

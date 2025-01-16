@@ -1,168 +1,81 @@
-/*
- * OMAP OTG controller driver
- *
- * Based on code from tahvo-usb.c and isp1301_omap.c drivers.
- *
- * Copyright (C) 2005-2006 Nokia Corporation
- * Copyright (C) 2004 Texas Instruments
- * Copyright (C) 2004 David Brownell
- *
- * This file is subject to the terms and conditions of the GNU General
- * Public License. See the file "COPYING" in the main directory of this
- * archive for more details.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
-
-#include <linux/io.h>
-#include <linux/err.h>
-#include <linux/extcon.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/interrupt.h>
-#include <linux/platform_device.h>
-#include <linux/platform_data/usb-omap1.h>
-
-struct otg_device {
-	void __iomem			*base;
-	bool				id;
-	bool				vbus;
-	struct extcon_dev		*extcon;
-	struct notifier_block		vbus_nb;
-	struct notifier_block		id_nb;
-};
-
-#define OMAP_OTG_CTRL		0x0c
-#define OMAP_OTG_ASESSVLD	(1 << 20)
-#define OMAP_OTG_BSESSEND	(1 << 19)
-#define OMAP_OTG_BSESSVLD	(1 << 18)
-#define OMAP_OTG_VBUSVLD	(1 << 17)
-#define OMAP_OTG_ID		(1 << 16)
-#define OMAP_OTG_XCEIV_OUTPUTS \
-	(OMAP_OTG_ASESSVLD | OMAP_OTG_BSESSEND | OMAP_OTG_BSESSVLD | \
-	 OMAP_OTG_VBUSVLD  | OMAP_OTG_ID)
-
-static void omap_otg_ctrl(struct otg_device *otg_dev, u32 outputs)
-{
-	u32 l;
-
-	l = readl(otg_dev->base + OMAP_OTG_CTRL);
-	l &= ~OMAP_OTG_XCEIV_OUTPUTS;
-	l |= outputs;
-	writel(l, otg_dev->base + OMAP_OTG_CTRL);
-}
-
-static void omap_otg_set_mode(struct otg_device *otg_dev)
-{
-	if (!otg_dev->id && otg_dev->vbus)
-		/* Set B-session valid. */
-		omap_otg_ctrl(otg_dev, OMAP_OTG_ID | OMAP_OTG_BSESSVLD);
-	else if (otg_dev->vbus)
-		/* Set A-session valid. */
-		omap_otg_ctrl(otg_dev, OMAP_OTG_ASESSVLD);
-	else if (!otg_dev->id)
-		/* Set B-session end to indicate no VBUS. */
-		omap_otg_ctrl(otg_dev, OMAP_OTG_ID | OMAP_OTG_BSESSEND);
-}
-
-static int omap_otg_id_notifier(struct notifier_block *nb,
-				unsigned long event, void *ptr)
-{
-	struct otg_device *otg_dev = container_of(nb, struct otg_device, id_nb);
-
-	otg_dev->id = event;
-	omap_otg_set_mode(otg_dev);
-
-	return NOTIFY_DONE;
-}
-
-static int omap_otg_vbus_notifier(struct notifier_block *nb,
-				  unsigned long event, void *ptr)
-{
-	struct otg_device *otg_dev = container_of(nb, struct otg_device,
-						  vbus_nb);
-
-	otg_dev->vbus = event;
-	omap_otg_set_mode(otg_dev);
-
-	return NOTIFY_DONE;
-}
-
-static int omap_otg_probe(struct platform_device *pdev)
-{
-	const struct omap_usb_config *config = pdev->dev.platform_data;
-	struct otg_device *otg_dev;
-	struct extcon_dev *extcon;
-	int ret;
-	u32 rev;
-
-	if (!config || !config->extcon)
-		return -ENODEV;
-
-	extcon = extcon_get_extcon_dev(config->extcon);
-	if (!extcon)
-		return -EPROBE_DEFER;
-
-	otg_dev = devm_kzalloc(&pdev->dev, sizeof(*otg_dev), GFP_KERNEL);
-	if (!otg_dev)
-		return -ENOMEM;
-
-	otg_dev->base = devm_ioremap_resource(&pdev->dev, &pdev->resource[0]);
-	if (IS_ERR(otg_dev->base))
-		return PTR_ERR(otg_dev->base);
-
-	otg_dev->extcon = extcon;
-	otg_dev->id_nb.notifier_call = omap_otg_id_notifier;
-	otg_dev->vbus_nb.notifier_call = omap_otg_vbus_notifier;
-
-	ret = extcon_register_notifier(extcon, EXTCON_USB_HOST, &otg_dev->id_nb);
-	if (ret)
-		return ret;
-
-	ret = extcon_register_notifier(extcon, EXTCON_USB, &otg_dev->vbus_nb);
-	if (ret) {
-		extcon_unregister_notifier(extcon, EXTCON_USB_HOST,
-					&otg_dev->id_nb);
-		return ret;
-	}
-
-	otg_dev->id = extcon_get_cable_state_(extcon, EXTCON_USB_HOST);
-	otg_dev->vbus = extcon_get_cable_state_(extcon, EXTCON_USB);
-	omap_otg_set_mode(otg_dev);
-
-	rev = readl(otg_dev->base);
-
-	dev_info(&pdev->dev,
-		 "OMAP USB OTG controller rev %d.%d (%s, id=%d, vbus=%d)\n",
-		 (rev >> 4) & 0xf, rev & 0xf, config->extcon, otg_dev->id,
-		 otg_dev->vbus);
-
-	return 0;
-}
-
-static int omap_otg_remove(struct platform_device *pdev)
-{
-	struct otg_device *otg_dev = platform_get_drvdata(pdev);
-	struct extcon_dev *edev = otg_dev->extcon;
-
-	extcon_unregister_notifier(edev, EXTCON_USB_HOST,&otg_dev->id_nb);
-	extcon_unregister_notifier(edev, EXTCON_USB, &otg_dev->vbus_nb);
-
-	return 0;
-}
-
-static struct platform_driver omap_otg_driver = {
-	.probe		= omap_otg_probe,
-	.remove		= omap_otg_remove,
-	.driver		= {
-		.name	= "omap_otg",
-	},
-};
-module_platform_driver(omap_otg_driver);
-
-MODULE_DESCRIPTION("OMAP USB OTG controller driver");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Aaro Koskinen <aaro.koskinen@iki.fi>");
+DP_REG0__ITXA_OVERRIDE_PG_MASK 0x7fc
+#define UNIPHY_TMDP_REG0__ITXA_OVERRIDE_PG__SHIFT 0x2
+#define UNIPHY_TMDP_REG0__ITXA_OVERRIDE_NG_MASK 0xff800
+#define UNIPHY_TMDP_REG0__ITXA_OVERRIDE_NG__SHIFT 0xb
+#define UNIPHY_TMDP_REG0__ITXA_TPC_SEL_MASK 0x100000
+#define UNIPHY_TMDP_REG0__ITXA_TPC_SEL__SHIFT 0x14
+#define UNIPHY_TMDP_REG0__ITXA_PCALEN_MASK 0x200000
+#define UNIPHY_TMDP_REG0__ITXA_PCALEN__SHIFT 0x15
+#define UNIPHY_TMDP_REG0__ITXA_DPPC_PWN_MASK 0x400000
+#define UNIPHY_TMDP_REG0__ITXA_DPPC_PWN__SHIFT 0x16
+#define UNIPHY_TMDP_REG0__ITXA_OVERRIDE_EN_MASK 0x800000
+#define UNIPHY_TMDP_REG0__ITXA_OVERRIDE_EN__SHIFT 0x17
+#define UNIPHY_TMDP_REG0__ITXA_TPC_CNTL_MASK 0x3000000
+#define UNIPHY_TMDP_REG0__ITXA_TPC_CNTL__SHIFT 0x18
+#define UNIPHY_TMDP_REG0__ITXA_VSCALEN_MASK 0x4000000
+#define UNIPHY_TMDP_REG0__ITXA_VSCALEN__SHIFT 0x1a
+#define UNIPHY_TMDP_REG0__ITXA_IOCNTL_TSTSEL_MASK 0x78000000
+#define UNIPHY_TMDP_REG0__ITXA_IOCNTL_TSTSEL__SHIFT 0x1b
+#define UNIPHY_TMDP_REG0__ITXA_IMPVSCALEN_MASK 0x80000000
+#define UNIPHY_TMDP_REG0__ITXA_IMPVSCALEN__SHIFT 0x1f
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_ICC_TST_MASK 0x1f
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_ICC_TST__SHIFT 0x0
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_IPLL100_ADJ_MASK 0x1e0
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_IPLL100_ADJ__SHIFT 0x5
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_IPLL50_ADJ_MASK 0x1e00
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_IPLL50_ADJ__SHIFT 0x9
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_ICC_ADJ_MASK 0x1e000
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_ICC_ADJ__SHIFT 0xd
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_ICC_PDN_MASK 0x20000
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_ICC_PDN__SHIFT 0x11
+#define UNIPHY_TMDP_REG1__ITXA_IOCNTL_MASK 0xffc0000
+#define UNIPHY_TMDP_REG1__ITXA_IOCNTL__SHIFT 0x12
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_PLLREFSEL_MASK 0x10000000
+#define UNIPHY_TMDP_REG1__ITXA_BIAS_PLLREFSEL__SHIFT 0x1c
+#define UNIPHY_TMDP_REG1__ITX_EDPSEL_MASK 0xe0000000
+#define UNIPHY_TMDP_REG1__ITX_EDPSEL__SHIFT 0x1d
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_PDN_MASK 0x1
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_PDN__SHIFT 0x0
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_OFFSET_EN_MASK 0x2
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_OFFSET_EN__SHIFT 0x1
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_OFFSET_MASK 0x3c
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_OFFSET__SHIFT 0x2
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_OVERRIDE_EN_MASK 0x40
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_OVERRIDE_EN__SHIFT 0x6
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_OVERRIDE_MASK 0x3f80
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_OVERRIDE__SHIFT 0x7
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_SET_MASK 0x4000
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALN_SET__SHIFT 0xe
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_PDN_MASK 0x10000
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_PDN__SHIFT 0x10
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_OFFSET_EN_MASK 0x20000
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_OFFSET_EN__SHIFT 0x11
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_OFFSET_MASK 0x3c0000
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_OFFSET__SHIFT 0x12
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_OVERRIDE_EN_MASK 0x400000
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_OVERRIDE_EN__SHIFT 0x16
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_OVERRIDE_MASK 0x3f800000
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_OVERRIDE__SHIFT 0x17
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_SET_MASK 0x40000000
+#define UNIPHY_TMDP_REG2__ITXA_IMPCALP_SET__SHIFT 0x1e
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_PDN_MASK 0x1
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_PDN__SHIFT 0x0
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_OFFSET_EN_MASK 0x2
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_OFFSET_EN__SHIFT 0x1
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_OFFSET_MASK 0x3c
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_OFFSET__SHIFT 0x2
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_OVERRIDE_EN_MASK 0x40
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_OVERRIDE_EN__SHIFT 0x6
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_OVERRIDE_MASK 0x3f80
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_OVERRIDE__SHIFT 0x7
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_SET_MASK 0x4000
+#define UNIPHY_TMDP_REG3__ITXA_IMPCALVS_SET__SHIFT 0xe
+#define UNIPHY_TMDP_REG3__ITXA_PREM_ADJ_MASK 0xf8000
+#define UNIPHY_TMDP_REG3__ITXA_PREM_ADJ__SHIFT 0xf
+#define UNIPHY_TMDP_REG3__OTXA_RES_NCAL_MASK 0x1f00000
+#define UNIPHY_TMDP_REG3__OTXA_RES_NCAL__SHIFT 0x14
+#define UNIPHY_TMDP_REG3__OTXA_RES_PCAL_MASK 0x3e000000
+#define UNIPHY_TMDP_REG3__OTXA_RES_PCAL__SHIFT 0x19
+#define UNIPHY_TMDP_REG4__RESERVED_MASK 0x3fffff
+#define UNIPHY_TMDP_REG4__RESERVED__SHIFT 0x0
+#define UNIPHY_TMDP_REG4__OTXA_IOCNTL_NF_

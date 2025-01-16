@@ -1,24 +1,14 @@
-/* tui/stui_hal.h
+/*
+ * BIF_5_0 Register documentation
  *
- * Samsung TUI HW Handler driver.
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
  *
- * Copyright (c) 2015 Samsung Electronics
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
-*/
-
-#ifndef __STUI_HAL_H_
-#define __STUI_HAL_H_
-
-#include "stui_ioctl.h"
-
-int stui_i2c_protect(bool is_protect);
-int stui_prepare_tui(void);
-void stui_finish_tui(void);
-void stui_free_video_space(void);
-int stui_alloc_video_space(struct tui_hw_buffer *buffer);
-int stui_get_resolution(struct tui_hw_buffer *buffer);
-
-#endif /* __STUI_HAL_H_ */
+ * The above copyright notice and this permission notice shall be included
+ * in all 

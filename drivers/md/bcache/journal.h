@@ -1,179 +1,74 @@
-#ifndef _BCACHE_JOURNAL_H
-#define _BCACHE_JOURNAL_H
-
-/*
- * THE JOURNAL:
- *
- * The journal is treated as a circular buffer of buckets - a journal entry
- * never spans two buckets. This means (not implemented yet) we can resize the
- * journal at runtime, and will be needed for bcache on raw flash support.
- *
- * Journal entries contain a list of keys, ordered by the time they were
- * inserted; thus journal replay just has to reinsert the keys.
- *
- * We also keep some things in the journal header that are logically part of the
- * superblock - all the things that are frequently updated. This is for future
- * bcache on raw flash support; the superblock (which will become another
- * journal) can't be moved or wear leveled, so it contains just enough
- * information to find the main journal, and the superblock only has to be
- * rewritten when we want to move/wear level the main journal.
- *
- * Currently, we don't journal BTREE_REPLACE operations - this will hopefully be
- * fixed eventually. This isn't a bug - BTREE_REPLACE is used for insertions
- * from cache misses, which don't have to be journaled, and for writeback and
- * moving gc we work around it by flushing the btree to disk before updating the
- * gc information. But it is a potential issue with incremental garbage
- * collection, and it's fragile.
- *
- * OPEN JOURNAL ENTRIES:
- *
- * Each journal entry contains, in the header, the sequence number of the last
- * journal entry still open - i.e. that has keys that haven't been flushed to
- * disk in the btree.
- *
- * We track this by maintaining a refcount for every open journal entry, in a
- * fifo; each entry in the fifo corresponds to a particular journal
- * entry/sequence number. When the refcount at the tail of the fifo goes to
- * zero, we pop it off - thus, the size of the fifo tells us the number of open
- * journal entries
- *
- * We take a refcount on a journal entry when we add some keys to a journal
- * entry that we're going to insert (held by struct btree_op), and then when we
- * insert those keys into the btree the btree write we're setting up takes a
- * copy of that refcount (held by struct btree_write). That refcount is dropped
- * when the btree write completes.
- *
- * A struct btree_write can only hold a refcount on a single journal entry, but
- * might contain keys for many journal entries - we handle this by making sure
- * it always has a refcount on the _oldest_ journal entry of all the journal
- * entries it has keys for.
- *
- * JOURNAL RECLAIM:
- *
- * As mentioned previously, our fifo of refcounts tells us the number of open
- * journal entries; from that and the current journal sequence number we compute
- * last_seq - the oldest journal entry we still need. We write last_seq in each
- * journal entry, and we also have to keep track of where it exists on disk so
- * we don't overwrite it when we loop around the journal.
- *
- * To do that we track, for each journal bucket, the sequence number of the
- * newest journal entry it contains - if we don't need that journal entry we
- * don't need anything in that bucket anymore. From that we track the last
- * journal bucket we still need; all this is tracked in struct journal_device
- * and updated by journal_reclaim().
- *
- * JOURNAL FILLING UP:
- *
- * There are two ways the journal could fill up; either we could run out of
- * space to write to, or we could have too many open journal entries and run out
- * of room in the fifo of refcounts. Since those refcounts are decremented
- * without any locking we can't safely resize that fifo, so we handle it the
- * same way.
- *
- * If the journal fills up, we start flushing dirty btree nodes until we can
- * allocate space for a journal write again - preferentially flushing btree
- * nodes that are pinning the oldest journal entries first.
- */
-
-/*
- * Only used for holding the journal entries we read in btree_journal_read()
- * during cache_registration
- */
-struct journal_replay {
-	struct list_head	list;
-	atomic_t		*pin;
-	struct jset		j;
-};
-
-/*
- * We put two of these in struct journal; we used them for writes to the
- * journal that are being staged or in flight.
- */
-struct journal_write {
-	struct jset		*data;
-#define JSET_BITS		3
-
-	struct cache_set	*c;
-	struct closure_waitlist	wait;
-	bool			dirty;
-	bool			need_write;
-};
-
-/* Embedded in struct cache_set */
-struct journal {
-	spinlock_t		lock;
-	/* used when waiting because the journal was full */
-	struct closure_waitlist	wait;
-	struct closure		io;
-	int			io_in_flight;
-	struct delayed_work	work;
-
-	/* Number of blocks free in the bucket(s) we're currently writing to */
-	unsigned		blocks_free;
-	uint64_t		seq;
-	DECLARE_FIFO(atomic_t, pin);
-
-	BKEY_PADDED(key);
-
-	struct journal_write	w[2], *cur;
-};
-
-/*
- * Embedded in struct cache. First three fields refer to the array of journal
- * buckets, in cache_sb.
- */
-struct journal_device {
-	/*
-	 * For each journal bucket, contains the max sequence number of the
-	 * journal writes it contains - so we know when a bucket can be reused.
-	 */
-	uint64_t		seq[SB_JOURNAL_BUCKETS];
-
-	/* Journal bucket we're currently writing to */
-	unsigned		cur_idx;
-
-	/* Last journal bucket that still contains an open journal entry */
-	unsigned		last_idx;
-
-	/* Next journal bucket to be discarded */
-	unsigned		discard_idx;
-
-#define DISCARD_READY		0
-#define DISCARD_IN_FLIGHT	1
-#define DISCARD_DONE		2
-	/* 1 - discard in flight, -1 - discard completed */
-	atomic_t		discard_in_flight;
-
-	struct work_struct	discard_work;
-	struct bio		discard_bio;
-	struct bio_vec		discard_bv;
-
-	/* Bio for journal reads/writes to this device */
-	struct bio		bio;
-	struct bio_vec		bv[8];
-};
-
-#define journal_pin_cmp(c, l, r)				\
-	(fifo_idx(&(c)->journal.pin, (l)) > fifo_idx(&(c)->journal.pin, (r)))
-
-#define JOURNAL_PIN	20000
-
-#define journal_full(j)						\
-	(!(j)->blocks_free || fifo_free(&(j)->pin) <= 1)
-
-struct closure;
-struct cache_set;
-struct btree_op;
-struct keylist;
-
-atomic_t *bch_journal(struct cache_set *, struct keylist *, struct closure *);
-void bch_journal_next(struct journal *);
-void bch_journal_mark(struct cache_set *, struct list_head *);
-void bch_journal_meta(struct cache_set *, struct closure *);
-int bch_journal_read(struct cache_set *, struct list_head *);
-int bch_journal_replay(struct cache_set *, struct list_head *);
-
-void bch_journal_free(struct cache_set *);
-int bch_journal_alloc(struct cache_set *);
-
-#endif /* _BCACHE_JOURNAL_H */
+                 0x3fcfc
+#define ixMC_REGISTERS_TABLE_113                                                0x3fd00
+#define ixFAN_TABLE_1                                                           0x3fd04
+#define ixFAN_TABLE_2                                                           0x3fd08
+#define ixFAN_TABLE_3                                                           0x3fd0c
+#define ixFAN_TABLE_4                                                           0x3fd10
+#define ixFAN_TABLE_5                                                           0x3fd14
+#define ixFAN_TABLE_6                                                           0x3fd18
+#define ixFAN_TABLE_7                                                           0x3fd1c
+#define ixFAN_TABLE_8                                                           0x3fd20
+#define ixFAN_TABLE_9                                                           0x3fd24
+#define ixSOFT_REGISTERS_TABLE_1                                                0x3fd28
+#define ixSOFT_REGISTERS_TABLE_2                                                0x3fd2c
+#define ixSOFT_REGISTERS_TABLE_3                                                0x3fd30
+#define ixSOFT_REGISTERS_TABLE_4                                                0x3fd34
+#define ixSOFT_REGISTERS_TABLE_5                                                0x3fd38
+#define ixSOFT_REGISTERS_TABLE_6                                                0x3fd3c
+#define ixSOFT_REGISTERS_TABLE_7                                                0x3fd40
+#define ixSOFT_REGISTERS_TABLE_8                                                0x3fd44
+#define ixSOFT_REGISTERS_TABLE_9                                                0x3fd48
+#define ixSOFT_REGISTERS_TABLE_10                                               0x3fd4c
+#define ixSOFT_REGISTERS_TABLE_11                                               0x3fd50
+#define ixSOFT_REGISTERS_TABLE_12                                               0x3fd54
+#define ixSOFT_REGISTERS_TABLE_13                                               0x3fd58
+#define ixSOFT_REGISTERS_TABLE_14                                               0x3fd5c
+#define ixSOFT_REGISTERS_TABLE_15                                               0x3fd60
+#define ixSOFT_REGISTERS_TABLE_16                                               0x3fd64
+#define ixSOFT_REGISTERS_TABLE_17                                               0x3fd68
+#define ixSOFT_REGISTERS_TABLE_18                                               0x3fd6c
+#define ixSOFT_REGISTERS_TABLE_19                                               0x3fd70
+#define ixSOFT_REGISTERS_TABLE_20                                               0x3fd74
+#define ixSOFT_REGISTERS_TABLE_21                                               0x3fd78
+#define ixSOFT_REGISTERS_TABLE_22                                               0x3fd7c
+#define ixSOFT_REGISTERS_TABLE_23                                               0x3fd80
+#define ixSOFT_REGISTERS_TABLE_24                                               0x3fd84
+#define ixSOFT_REGISTERS_TABLE_25                                               0x3fd88
+#define ixSOFT_REGISTERS_TABLE_26                                               0x3fd8c
+#define ixSOFT_REGISTERS_TABLE_27                                               0x3fd90
+#define ixSOFT_REGISTERS_TABLE_28                                               0x3fd94
+#define ixSOFT_REGISTERS_TABLE_29                                               0x3fd98
+#define ixSOFT_REGISTERS_TABLE_30                                               0x3fd9c
+#define ixPM_FUSES_1                                                            0x3fda0
+#define ixPM_FUSES_2                                                            0x3fda4
+#define ixPM_FUSES_3                                                            0x3fda8
+#define ixPM_FUSES_4                                                            0x3fdac
+#define ixPM_FUSES_5                                                            0x3fdb0
+#define ixPM_FUSES_6                                                            0x3fdb4
+#define ixPM_FUSES_7                                                            0x3fdb8
+#define ixPM_FUSES_8                                                            0x3fdbc
+#define ixPM_FUSES_9                                                            0x3fdc0
+#define ixPM_FUSES_10                                                           0x3fdc4
+#define ixPM_FUSES_11                                                           0x3fdc8
+#define ixPM_FUSES_12                                                           0x3fdcc
+#define ixPM_FUSES_13                                                           0x3fdd0
+#define ixPM_FUSES_14                                                           0x3fdd4
+#define ixPM_FUSES_15                                                           0x3fdd8
+#define ixPM_FUSES_16                                                           0x3fddc
+#define ixPM_FUSES_17                                                           0x3fde0
+#define ixPM_FUSES_18                                                           0x3fde4
+#define ixPM_FUSES_19                                                           0x3fde8
+#define ixSMU_PM_STATUS_0                                                       0x3fe00
+#define ixSMU_PM_STATUS_1                                                       0x3fe04
+#define ixSMU_PM_STATUS_2                                                       0x3fe08
+#define ixSMU_PM_STATUS_3                                                       0x3fe0c
+#define ixSMU_PM_STATUS_4                                                       0x3fe10
+#define ixSMU_PM_STATUS_5                                                       0x3fe14
+#define ixSMU_PM_STATUS_6                                                       0x3fe18
+#define ixSMU_PM_STATUS_7                                                       0x3fe1c
+#define ixSMU_PM_STATUS_8                                                       0x3fe20
+#define ixSMU_PM_STATUS_9                                                       0x3fe24
+#define ixSMU_PM_STATUS_10                                                      0x3fe28
+#define ixSMU_PM_STATUS_11                                                      0x3fe2c
+#define ixSMU_PM_STATUS_12                                                      0x3fe30
+#define ixSMU_

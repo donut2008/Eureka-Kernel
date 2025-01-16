@@ -1,199 +1,84 @@
-/******************************************************************************
- *  usbatm.h - Generic USB xDSL driver core
- *
- *  Copyright (C) 2001, Alcatel
- *  Copyright (C) 2003, Duncan Sands, SolNegro, Josep Comas
- *  Copyright (C) 2004, David Woodhouse
- *
- *  This program is free software; you can redistribute it and/or modify it
- *  under the terms of the GNU General Public License as published by the Free
- *  Software Foundation; either version 2 of the License, or (at your option)
- *  any later version.
- *
- *  This program is distributed in the hope that it will be useful, but WITHOUT
- *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- *  more details.
- *
- *  You should have received a copy of the GNU General Public License along with
- *  this program; if not, write to the Free Software Foundation, Inc., 59
- *  Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- *
- ******************************************************************************/
-
-#ifndef	_USBATM_H_
-#define	_USBATM_H_
-
-#include <linux/atm.h>
-#include <linux/atmdev.h>
-#include <linux/completion.h>
-#include <linux/device.h>
-#include <linux/kernel.h>
-#include <linux/kref.h>
-#include <linux/list.h>
-#include <linux/stringify.h>
-#include <linux/usb.h>
-#include <linux/mutex.h>
-#include <linux/ratelimit.h>
-
-/*
-#define VERBOSE_DEBUG
-*/
-
-#define usb_err(instance, format, arg...)	\
-	dev_err(&(instance)->usb_intf->dev , format , ## arg)
-#define usb_info(instance, format, arg...)	\
-	dev_info(&(instance)->usb_intf->dev , format , ## arg)
-#define usb_warn(instance, format, arg...)	\
-	dev_warn(&(instance)->usb_intf->dev , format , ## arg)
-#define usb_dbg(instance, format, arg...)	\
-	dev_dbg(&(instance)->usb_intf->dev , format , ## arg)
-
-/* FIXME: move to dev_* once ATM is driver model aware */
-#define atm_printk(level, instance, format, arg...)	\
-	printk(level "ATM dev %d: " format ,		\
-	(instance)->atm_dev->number , ## arg)
-
-#define atm_err(instance, format, arg...)	\
-	atm_printk(KERN_ERR, instance , format , ## arg)
-#define atm_info(instance, format, arg...)	\
-	atm_printk(KERN_INFO, instance , format , ## arg)
-#define atm_warn(instance, format, arg...)	\
-	atm_printk(KERN_WARNING, instance , format , ## arg)
-#define atm_dbg(instance, format, ...)					\
-	pr_debug("ATM dev %d: " format,					\
-		 (instance)->atm_dev->number, ##__VA_ARGS__)
-#define atm_rldbg(instance, format, ...)				\
-	pr_debug_ratelimited("ATM dev %d: " format,			\
-			     (instance)->atm_dev->number, ##__VA_ARGS__)
-
-/* flags, set by mini-driver in bind() */
-
-#define UDSL_SKIP_HEAVY_INIT	(1<<0)
-#define UDSL_USE_ISOC		(1<<1)
-#define UDSL_IGNORE_EILSEQ	(1<<2)
-
-
-/* mini driver */
-
-struct usbatm_data;
-
-/*
-*  Assuming all methods exist and succeed, they are called in this order:
-*
-*	bind, heavy_init, atm_start, ..., atm_stop, unbind
-*/
-
-struct usbatm_driver {
-	const char *driver_name;
-
-	/* init device ... can sleep, or cause probe() failure */
-	int (*bind) (struct usbatm_data *, struct usb_interface *,
-		     const struct usb_device_id *id);
-
-	/* additional device initialization that is too slow to be done in probe() */
-	int (*heavy_init) (struct usbatm_data *, struct usb_interface *);
-
-	/* cleanup device ... can sleep, but can't fail */
-	void (*unbind) (struct usbatm_data *, struct usb_interface *);
-
-	/* init ATM device ... can sleep, or cause ATM initialization failure */
-	int (*atm_start) (struct usbatm_data *, struct atm_dev *);
-
-	/* cleanup ATM device ... can sleep, but can't fail */
-	void (*atm_stop) (struct usbatm_data *, struct atm_dev *);
-
-	int bulk_in;	/* bulk rx endpoint */
-	int isoc_in;	/* isochronous rx endpoint */
-	int bulk_out;	/* bulk tx endpoint */
-
-	unsigned rx_padding;
-	unsigned tx_padding;
-};
-
-extern int usbatm_usb_probe(struct usb_interface *intf, const struct usb_device_id *id,
-		struct usbatm_driver *driver);
-extern void usbatm_usb_disconnect(struct usb_interface *intf);
-
-
-struct usbatm_channel {
-	int endpoint;			/* usb pipe */
-	unsigned int stride;		/* ATM cell size + padding */
-	unsigned int buf_size;		/* urb buffer size */
-	unsigned int packet_size;	/* endpoint maxpacket */
-	spinlock_t lock;
-	struct list_head list;
-	struct tasklet_struct tasklet;
-	struct timer_list delay;
-	struct usbatm_data *usbatm;
-};
-
-/* main driver data */
-
-struct usbatm_data {
-	/******************
-	*  public fields  *
-	******************/
-
-	/* mini driver */
-	struct usbatm_driver *driver;
-	void *driver_data;
-	char driver_name[16];
-	unsigned int flags; /* set by mini-driver in bind() */
-
-	/* USB device */
-	struct usb_device *usb_dev;
-	struct usb_interface *usb_intf;
-	char description[64];
-
-	/* ATM device */
-	struct atm_dev *atm_dev;
-
-	/********************************
-	*  private fields - do not use  *
-	********************************/
-
-	struct kref refcount;
-	struct mutex serialize;
-	int disconnected;
-
-	/* heavy init */
-	struct task_struct *thread;
-	struct completion thread_started;
-	struct completion thread_exited;
-
-	/* ATM device */
-	struct list_head vcc_list;
-
-	struct usbatm_channel rx_channel;
-	struct usbatm_channel tx_channel;
-
-	struct sk_buff_head sndqueue;
-	struct sk_buff *current_skb;	/* being emptied */
-
-	struct usbatm_vcc_data *cached_vcc;
-	int cached_vci;
-	short cached_vpi;
-
-	unsigned char *cell_buf;	/* holds partial rx cell */
-	unsigned int buf_usage;
-
-	struct urb *urbs[0];
-};
-
-static inline void *to_usbatm_driver_data(struct usb_interface *intf)
-{
-	struct usbatm_data *usbatm_instance;
-
-	if (intf == NULL)
-		return NULL;
-
-	usbatm_instance = usb_get_intfdata(intf);
-
-	if (usbatm_instance == NULL) /* set NULL before unbind() */
-		return NULL;
-
-	return usbatm_instance->driver_data; /* set NULL after unbind() */
-}
-
-#endif	/* _USBATM_H_ */
+NT_ERR_STATUS_MASK 0x400000
+#define D2F3_PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS__SHIFT 0x16
+#define D2F3_PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS_MASK 0x800000
+#define D2F3_PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS__SHIFT 0x17
+#define D2F3_PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS_MASK 0x1000000
+#define D2F3_PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS__SHIFT 0x18
+#define D2F3_PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS_MASK 0x2000000
+#define D2F3_PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS__SHIFT 0x19
+#define D2F3_PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK_MASK 0x10
+#define D2F3_PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK__SHIFT 0x4
+#define D2F3_PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK_MASK 0x20
+#define D2F3_PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK__SHIFT 0x5
+#define D2F3_PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK_MASK 0x1000
+#define D2F3_PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK__SHIFT 0xc
+#define D2F3_PCIE_UNCORR_ERR_MASK__FC_ERR_MASK_MASK 0x2000
+#define D2F3_PCIE_UNCORR_ERR_MASK__FC_ERR_MASK__SHIFT 0xd
+#define D2F3_PCIE_UNCORR_ERR_MASK__CPL_TIMEOUT_MASK_MASK 0x4000
+#define D2F3_PCIE_UNCORR_ERR_MASK__CPL_TIMEOUT_MASK__SHIFT 0xe
+#define D2F3_PCIE_UNCORR_ERR_MASK__CPL_ABORT_ERR_MASK_MASK 0x8000
+#define D2F3_PCIE_UNCORR_ERR_MASK__CPL_ABORT_ERR_MASK__SHIFT 0xf
+#define D2F3_PCIE_UNCORR_ERR_MASK__UNEXP_CPL_MASK_MASK 0x10000
+#define D2F3_PCIE_UNCORR_ERR_MASK__UNEXP_CPL_MASK__SHIFT 0x10
+#define D2F3_PCIE_UNCORR_ERR_MASK__RCV_OVFL_MASK_MASK 0x20000
+#define D2F3_PCIE_UNCORR_ERR_MASK__RCV_OVFL_MASK__SHIFT 0x11
+#define D2F3_PCIE_UNCORR_ERR_MASK__MAL_TLP_MASK_MASK 0x40000
+#define D2F3_PCIE_UNCORR_ERR_MASK__MAL_TLP_MASK__SHIFT 0x12
+#define D2F3_PCIE_UNCORR_ERR_MASK__ECRC_ERR_MASK_MASK 0x80000
+#define D2F3_PCIE_UNCORR_ERR_MASK__ECRC_ERR_MASK__SHIFT 0x13
+#define D2F3_PCIE_UNCORR_ERR_MASK__UNSUPP_REQ_ERR_MASK_MASK 0x100000
+#define D2F3_PCIE_UNCORR_ERR_MASK__UNSUPP_REQ_ERR_MASK__SHIFT 0x14
+#define D2F3_PCIE_UNCORR_ERR_MASK__ACS_VIOLATION_MASK_MASK 0x200000
+#define D2F3_PCIE_UNCORR_ERR_MASK__ACS_VIOLATION_MASK__SHIFT 0x15
+#define D2F3_PCIE_UNCORR_ERR_MASK__UNCORR_INT_ERR_MASK_MASK 0x400000
+#define D2F3_PCIE_UNCORR_ERR_MASK__UNCORR_INT_ERR_MASK__SHIFT 0x16
+#define D2F3_PCIE_UNCORR_ERR_MASK__MC_BLOCKED_TLP_MASK_MASK 0x800000
+#define D2F3_PCIE_UNCORR_ERR_MASK__MC_BLOCKED_TLP_MASK__SHIFT 0x17
+#define D2F3_PCIE_UNCORR_ERR_MASK__ATOMICOP_EGRESS_BLOCKED_MASK_MASK 0x1000000
+#define D2F3_PCIE_UNCORR_ERR_MASK__ATOMICOP_EGRESS_BLOCKED_MASK__SHIFT 0x18
+#define D2F3_PCIE_UNCORR_ERR_MASK__TLP_PREFIX_BLOCKED_ERR_MASK_MASK 0x2000000
+#define D2F3_PCIE_UNCORR_ERR_MASK__TLP_PREFIX_BLOCKED_ERR_MASK__SHIFT 0x19
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__DLP_ERR_SEVERITY_MASK 0x10
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__DLP_ERR_SEVERITY__SHIFT 0x4
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__SURPDN_ERR_SEVERITY_MASK 0x20
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__SURPDN_ERR_SEVERITY__SHIFT 0x5
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__PSN_ERR_SEVERITY_MASK 0x1000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__PSN_ERR_SEVERITY__SHIFT 0xc
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__FC_ERR_SEVERITY_MASK 0x2000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__FC_ERR_SEVERITY__SHIFT 0xd
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__CPL_TIMEOUT_SEVERITY_MASK 0x4000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__CPL_TIMEOUT_SEVERITY__SHIFT 0xe
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__CPL_ABORT_ERR_SEVERITY_MASK 0x8000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__CPL_ABORT_ERR_SEVERITY__SHIFT 0xf
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__UNEXP_CPL_SEVERITY_MASK 0x10000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__UNEXP_CPL_SEVERITY__SHIFT 0x10
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__RCV_OVFL_SEVERITY_MASK 0x20000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__RCV_OVFL_SEVERITY__SHIFT 0x11
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__MAL_TLP_SEVERITY_MASK 0x40000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__MAL_TLP_SEVERITY__SHIFT 0x12
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__ECRC_ERR_SEVERITY_MASK 0x80000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__ECRC_ERR_SEVERITY__SHIFT 0x13
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__UNSUPP_REQ_ERR_SEVERITY_MASK 0x100000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__UNSUPP_REQ_ERR_SEVERITY__SHIFT 0x14
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__ACS_VIOLATION_SEVERITY_MASK 0x200000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__ACS_VIOLATION_SEVERITY__SHIFT 0x15
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__UNCORR_INT_ERR_SEVERITY_MASK 0x400000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__UNCORR_INT_ERR_SEVERITY__SHIFT 0x16
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__MC_BLOCKED_TLP_SEVERITY_MASK 0x800000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__MC_BLOCKED_TLP_SEVERITY__SHIFT 0x17
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__ATOMICOP_EGRESS_BLOCKED_SEVERITY_MASK 0x1000000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__ATOMICOP_EGRESS_BLOCKED_SEVERITY__SHIFT 0x18
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__TLP_PREFIX_BLOCKED_ERR_SEVERITY_MASK 0x2000000
+#define D2F3_PCIE_UNCORR_ERR_SEVERITY__TLP_PREFIX_BLOCKED_ERR_SEVERITY__SHIFT 0x19
+#define D2F3_PCIE_CORR_ERR_STATUS__RCV_ERR_STATUS_MASK 0x1
+#define D2F3_PCIE_CORR_ERR_STATUS__RCV_ERR_STATUS__SHIFT 0x0
+#define D2F3_PCIE_CORR_ERR_STATUS__BAD_TLP_STATUS_MASK 0x40
+#define D2F3_PCIE_CORR_ERR_STATUS__BAD_TLP_STATUS__SHIFT 0x6
+#define D2F3_PCIE_CORR_ERR_STATUS__BAD_DLLP_STATUS_MASK 0x80
+#define D2F3_PCIE_CORR_ERR_STATUS__BAD_DLLP_STATUS__SHIFT 0x7
+#define D2F3_PCIE_CORR_ERR_STATUS__REPLAY_NUM_ROLLOVER_STATUS_MASK 0x100
+#define D2F3_PCIE_CORR_ERR_STATUS__REPLAY_NUM_ROLLOVER_STATUS__SHIFT 0x8
+#define D2F3_PCIE_CORR_ERR_STATUS__REPLAY_TIMER_TIMEOUT_STATUS_MASK 0x1000
+#define D2F3_PCIE_CORR_ERR_STATUS__REPLAY_TIMER_TIMEOUT_STATUS__SHIFT 0xc
+#define D2F3_PCIE_CORR_ERR_STATUS__ADVISORY_NONFATAL_ERR_STATUS_MASK 0x2000
+#define D2F3_PCIE_CORR_ERR_STATUS__ADVISORY_NONFATAL_ERR_STATU

@@ -1,616 +1,587 @@
-/*
- * Wacom Penabled Driver for I2C
- *
- * Copyright (c) 2011-2014 Tatsunosuke Tobita, Wacom.
- * <tobita.tatsunosuke@wacom.co.jp>
- *
- * This program is free software; you can redistribute it
- * and/or modify it under the terms of the GNU General
- * Public License as published by the Free Software
- * Foundation; either version of 2 of the License,
- * or (at your option) any later version.
- */
-
-#include <linux/kernel.h>
-#include <linux/i2c.h>
-#include <linux/input.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
-
-#include "wacom.h"
-#include "w9018_flash.h"
-
-bool wacom_i2c_set_feature(struct wacom_i2c *wac_i2c, u8 report_id,
-			   unsigned int buf_size, u8 *data, u16 cmdreg,
-			   u16 datareg)
-{
-	int i, ret = -1;
-	int total = SFEATURE_SIZE + buf_size;
-	u8 *sFeature = NULL;
-	bool bRet = false;
-
-	sFeature = kzalloc(sizeof(u8) * total, GFP_KERNEL);
-	if (!sFeature) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s cannot preserve memory\n", __func__);
-		goto out;
-	}
-	memset(sFeature, 0, sizeof(u8) * total);
-
-	sFeature[0] = (u8) (cmdreg & 0x00ff);
-	sFeature[1] = (u8) ((cmdreg & 0xff00) >> 8);
-	sFeature[2] = (RTYPE_FEATURE << 4) | report_id;
-	sFeature[3] = CMD_SET_FEATURE;
-	sFeature[4] = (u8) (datareg & 0x00ff);
-	sFeature[5] = (u8) ((datareg & 0xff00) >> 8);
-
-	if ((buf_size + 2) > 255) {
-		sFeature[6] = (u8) ((buf_size + 2) & 0x00ff);
-		sFeature[7] = (u8) (((buf_size + 2) & 0xff00) >> 8);
-	} else {
-		sFeature[6] = (u8) (buf_size + 2);
-		sFeature[7] = (u8) (0x00);
-	}
-
-	for (i = 0; i < buf_size; i++)
-		sFeature[i + SFEATURE_SIZE] = *(data + i);
-
-	ret = wacom_i2c_send(wac_i2c, sFeature, total, WACOM_I2C_MODE_BOOT);
-	if (ret != total) {
-		input_err(true, &wac_i2c->client->dev,
-			  "Sending Set_Feature failed sent bytes: %d\n", ret);
-		goto err;
-	}
-
-	usleep_range(60, 61);
-	bRet = true;
-err:
-	kfree(sFeature);
-	sFeature = NULL;
-
-out:
-	return bRet;
-}
-
-bool wacom_i2c_get_feature(struct wacom_i2c *wac_i2c, u8 report_id,
-			   unsigned int buf_size, u8 *data, u16 cmdreg,
-			   u16 datareg, int delay)
-{
-	int ret = -1;
-	u8 *recv = NULL;
-	bool bRet = false;
-	u8 gFeature[] = {
-		(u8) (cmdreg & 0x00ff),
-		(u8) ((cmdreg & 0xff00) >> 8),
-		(RTYPE_FEATURE << 4) | report_id,
-		CMD_GET_FEATURE,
-		(u8) (datareg & 0x00ff),
-		(u8) ((datareg & 0xff00) >> 8)
-	};
-
-	/*"+ 2", adding 2 more spaces for organizeing again later in the passed data, "data" */
-	recv = kzalloc(sizeof(u8) * (buf_size + 0), GFP_KERNEL);
-	if (!recv) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s cannot preserve memory\n", __func__);
-		goto err_alloc_memory;
-	}
-
-	/*Append 2 bytes for length low and high of the byte */
-	memset(recv, 0, sizeof(u8) * (buf_size + 0));
-
-	ret =
-	    wacom_i2c_send(wac_i2c, gFeature, GFEATURE_SIZE,
-			   WACOM_I2C_MODE_BOOT);
-	if (ret != GFEATURE_SIZE) {
-		input_info(true, &wac_i2c->client->dev,
-			   "%s Sending Get_Feature failed; sent bytes: %d\n",
-			   __func__, ret);
-
-		udelay(delay);
-
-		goto err_fail_i2c;
-	}
-
-	udelay(delay);
-
-	ret = wacom_i2c_recv(wac_i2c, recv, buf_size, WACOM_I2C_MODE_BOOT);
-	if (ret != buf_size) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s Receiving data failed; recieved bytes: %d\n",
-			  __func__, ret);
-		goto err_fail_i2c;
-	}
-
-	/*Coppy data pointer, subtracting the first two bytes of the length */
-	memcpy(data, (recv + 0), buf_size);
-
-	bRet = true;
-err_fail_i2c:
-	kfree(recv);
-	recv = NULL;
-
-err_alloc_memory:
-	return bRet;
-}
-
-static int wacom_flash_cmd(struct wacom_i2c *wac_i2c)
-{
-	u8 command[10];
-	int len = 0;
-	int ret = -1;
-
-	command[len++] = 0x0d;
-	command[len++] = FLASH_START0;
-	command[len++] = FLASH_START1;
-	command[len++] = FLASH_START2;
-	command[len++] = FLASH_START3;
-	command[len++] = FLASH_START4;
-	command[len++] = FLASH_START5;
-	command[len++] = 0x0d;
-
-	ret = wacom_i2c_send(wac_i2c, command, len, WACOM_I2C_MODE_BOOT);
-	if (ret < 0) {
-		input_err(true, &wac_i2c->client->dev,
-			  "Sending flash command failed\n");
-		return -EXIT_FAIL;
-	}
-
-	msleep(300);
-
-	return 0;
-}
-
-int flash_query_w9018(struct wacom_i2c *wac_i2c)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	u8 response[RSP_SIZE];
-	int ECH, len = 0;
-
-	command[len++] = BOOT_CMD_REPORT_ID;	/* Report:ReportID */
-	command[len++] = BOOT_QUERY;		/* Report:Boot Query command */
-	command[len++] = ECH = 7;		/* Report:echo */
-
-	bRet =
-	    wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG,
-				  DATA_REG);
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s failed to set feature\n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	bRet =
-	    wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, RSP_SIZE, response,
-				  COMM_REG, DATA_REG, (10 * 1000));
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s failed to get feature\n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	if ((response[3] != QUERY_CMD) || (response[4] != ECH)) {
-		input_err(true, &wac_i2c->client->dev, "%s res3:%x res4:%x\n",
-			  __func__, response[3], response[4]);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	if (response[5] != QUERY_RSP) {
-		input_err(true, &wac_i2c->client->dev, "%s res5:%x\n",
-			  __func__, response[5]);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	input_info(true, &wac_i2c->client->dev, "QUERY SUCCEEDED\n");
-	return 0;
-}
-
-static bool flash_blver_w9018(struct wacom_i2c *wac_i2c, int *blver)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	u8 response[RSP_SIZE];
-	int ECH, len = 0;
-
-	command[len++] = BOOT_CMD_REPORT_ID;	/* Report:ReportID */
-	command[len++] = BOOT_BLVER;		/* Report:Boot Version command */
-	command[len++] = ECH = 7;		/* Report:echo */
-
-	bRet =
-	    wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG,
-				  DATA_REG);
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s failed to set feature1\n", __func__);
-		return false;
-	}
-
-	bRet =
-	    wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, RSP_SIZE, response,
-				  COMM_REG, DATA_REG, (10 * 1000));
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s 2 failed to set feature\n", __func__);
-		return false;
-	}
-
-	if ((response[3] != BOOT_CMD) || (response[4] != ECH)) {
-		input_err(true, &wac_i2c->client->dev, "%s res3:%x res4:%x\n",
-			  __func__, response[3], response[4]);
-		return false;
-	}
-
-	*blver = (int)response[5];
-
-	return true;
-}
-
-static bool flash_mputype_w9018(struct wacom_i2c *wac_i2c, int *pMpuType)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	u8 response[RSP_SIZE];
-	int ECH, len = 0;
-
-	command[len++] = BOOT_CMD_REPORT_ID;	/* Report:ReportID */
-	command[len++] = BOOT_MPU;	/* Report:Boot Query command */
-	command[len++] = ECH = 7;	/* Report:echo */
-
-	bRet =
-	    wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG,
-				  DATA_REG);
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s failed to set feature\n", __func__);
-		return false;
-	}
-
-	bRet =
-	    wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, RSP_SIZE, response,
-				  COMM_REG, DATA_REG, (10 * 1000));
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s failed to get feature\n", __func__);
-		return false;
-	}
-
-	if ((response[3] != MPU_CMD) || (response[4] != ECH)) {
-		input_err(true, &wac_i2c->client->dev, "%s res3:%x res4:%x\n",
-			  __func__, response[3], response[4]);
-		return false;
-	}
-
-	*pMpuType = (int)response[5];
-	return true;
-}
-
-static bool flash_end_w9018(struct wacom_i2c *wac_i2c)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	int len = 0;
-
-	command[len++] = BOOT_CMD_REPORT_ID;
-	command[len++] = BOOT_EXIT;
-	command[len++] = 0;
-
-	bRet =
-	    wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG,
-				  DATA_REG);
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s failed to set feature 1\n", __func__);
-		return false;
-	}
-
-	return true;
-}
-
-static int check_progress(u8 *data, size_t size, u8 cmd, u8 ech)
-{
-	if (data[0] != cmd || data[1] != ech) {
-		pr_err("%s sec_epen: %s failed to erase\n", SECLOG, __func__);
-		return -EXIT_FAIL;
-	}
-
-	switch (data[2]) {
-	case PROCESS_CHKSUM1_ERR:
-	case PROCESS_CHKSUM2_ERR:
-	case PROCESS_TIMEOUT_ERR:
-		pr_err("%s sec_epen: %s error: %x\n", SECLOG, __func__,
-		       data[2]);
-		return -EXIT_FAIL;
-	}
-
-	return data[2];
-}
-
-static bool flash_erase_all(struct wacom_i2c *wac_i2c)
-{
-	bool bRet = false;
-	u8 command[BOOT_CMD_SIZE];
-	u8 response[BOOT_RSP_SIZE];
-	int i, len = 0;
-	int ECH, sum = 0;
-	int ret = -1;
-
-	command[len++] = 7;
-	command[len++] = ERS_ALL_CMD;
-	command[len++] = ECH = 2;
-	command[len++] = ERS_ECH2;
-
-	/* Preliminarily stored data that cannnot appear here, but in wacom_set_feature() */
-	sum += 0x05;
-	sum += 0x07;
-	for (i = 0; i < len; i++)
-		sum += command[i];
-
-	command[len++] = ~sum + 1;
-
-	bRet =
-	    wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG,
-				  DATA_REG);
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s failed to set feature\n", __func__);
-		return false;
-	}
-
-	do {
-		bRet =
-		    wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, BOOT_RSP_SIZE,
-					  response, COMM_REG, DATA_REG, 0);
-		if (!bRet) {
-			input_err(true, &wac_i2c->client->dev,
-				  "%s failed to set feature\n", __func__);
-			return false;
-		}
-
-		ret = check_progress(&response[3], (BOOT_RSP_SIZE - 3), ERS_ALL_CMD, ECH);
-		if (ret < 0)
-			return false;
-
-	} while (ret == PROCESS_INPROGRESS);
-
-	return true;
-}
-
-static bool flash_write_block_w9018(struct wacom_i2c *wac_i2c, char *flash_data,
-				    unsigned long ulAddress, u8 *pcommand_id,
-				    int *ECH)
-{
-	const int MAX_COM_SIZE = (8 + FLASH_BLOCK_SIZE + 2);	/* 8: num of command[0] to command[7] */
-	/* FLASH_BLOCK_SIZE: unit to erase the block */
-	/* Num of Last 2 checksums */
-	bool bRet = false;
-	u8 command[300];
-	unsigned char sum = 0;
-	int i;
-
-	command[0] = BOOT_CMD_REPORT_ID;		/* Report:ReportID */
-	command[1] = BOOT_WRITE_FLASH;			/* Report:program  command */
-	command[2] = *ECH = ++(*pcommand_id);		/* Report:echo */
-	command[3] = ulAddress & 0x000000ff;
-	command[4] = (ulAddress & 0x0000ff00) >> 8;
-	command[5] = (ulAddress & 0x00ff0000) >> 16;
-	command[6] = (ulAddress & 0xff000000) >> 24;	/* Report:address(4bytes) */
-	command[7] = 0x20;
-
-	/*Preliminarily stored data that cannnot appear here, but in wacom_set_feature() */
-	sum = (0x05 + 0x0c + 0x01);
-
-	for (i = 0; i < 8; i++)
-		sum += command[i];
-
-	command[MAX_COM_SIZE - 2] = ~sum + 1;	/* Report:command checksum */
-
-	sum = 0;
-
-	for (i = 8; i < (FLASH_BLOCK_SIZE + 8); i++) {
-		command[i] = flash_data[ulAddress + (i - 8)];
-		sum += flash_data[ulAddress + (i - 8)];
-	}
-
-	command[MAX_COM_SIZE - 1] = ~sum + 1;	/* Report:data checksum */
-
-	/*Subtract 8 for the first 8 bytes */
-	bRet =
-	    wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, (BOOT_CMD_SIZE + 4 - 8),
-				  command, COMM_REG, DATA_REG);
-	if (!bRet) {
-		input_err(true, &wac_i2c->client->dev,
-			  "%s failed to set feature\n", __func__);
-		return false;
-	}
-
-	udelay(50);
-
-	return true;
-}
-
-static bool flash_write_w9018(struct wacom_i2c *wac_i2c,
-			      unsigned char *flash_data,
-			      unsigned long start_address,
-			      unsigned long *max_address)
-{
-	bool bRet = false;
-	u8 command_id = 0;
-	u8 response[BOOT_RSP_SIZE];
-	int i, j, ECH = 0, ECH_len = 0;
-	int ECH_ARRAY[3];
-	int ret = -1;
-	unsigned long ulAddress;
-
-	j = 0;
-	for (ulAddress = start_address; ulAddress < *max_address;
-	     ulAddress += FLASH_BLOCK_SIZE) {
-		for (i = 0; i < FLASH_BLOCK_SIZE; i++) {
-			if (flash_data[ulAddress + i] != 0xFF)
-				break;
-		}
-		if (i == (FLASH_BLOCK_SIZE))
-			continue;
-
-		bRet =
-		    flash_write_block_w9018(wac_i2c, flash_data, ulAddress,
-					    &command_id, &ECH);
-		if (!bRet)
-			return false;
-		if (ECH_len == 3)
-			ECH_len = 0;
-
-		ECH_ARRAY[ECH_len++] = ECH;
-		if (ECH_len == 3) {
-			for (j = 0; j < 3; j++) {
-				do {
-
-					bRet =
-					    wacom_i2c_get_feature(wac_i2c,
-								  REPORT_ID_2,
-								  BOOT_RSP_SIZE,
-								  response,
-								  COMM_REG,
-								  DATA_REG, 50);
-					if (!bRet) {
-						input_err(true,
-							  &wac_i2c->client->dev,
-							  "%s failed to set feature\n",
-							  __func__);
-						return false;
-					}
-
-					ret = check_progress(&response[3], (BOOT_RSP_SIZE - 3), 0x01, ECH_ARRAY[j]);
-					if (ret < 0) {
-						input_err(true,
-							  &wac_i2c->client->dev,
-							  "%s mismatched echo array\n",
-							  __func__);
-						return false;
-					}
-				} while (ret == PROCESS_INPROGRESS);
-			}
-		}
-	}
-
-	return true;
-}
-
-int wacom_i2c_flash_w9018(struct wacom_i2c *wac_i2c, unsigned char *fw_data)
-{
-	struct i2c_client *client = wac_i2c->client;
-	bool bRet = false;
-	int iBLVer = 0, iMpuType = 0;
-	unsigned long max_address = W9018_END_ADDR;	/* Max.address of Load data */
-	unsigned long start_address = W9018_START_ADDR;	/* Start.address of Load data */
-
-	/*Obtain boot loader version */
-	if (!flash_blver_w9018(wac_i2c, &iBLVer)) {
-		input_err(true, &client->dev,
-			  "%s failed to get Boot Loader version\n", __func__);
-		return -EXIT_FAIL_GET_BOOT_LOADER_VERSION;
-	}
-	input_info(true, &client->dev, "BL version: %x\n", iBLVer);
-
-	/*Obtain MPUtype: this can be manually done in user space */
-	if (!flash_mputype_w9018(wac_i2c, &iMpuType)) {
-		input_err(true, &client->dev,
-			  "%s failed to get MPU type\n", __func__);
-		return -EXIT_FAIL_GET_MPU_TYPE;
-	}
-	if (iMpuType != MPU_W9018) {
-		input_err(true, &client->dev,
-			  "MPU is not for W9018 : %x\n", iMpuType);
-		return -EXIT_FAIL_GET_MPU_TYPE;
-	}
-	input_info(true, &client->dev, "MPU type: %x\n", iMpuType);
-
-	/*-----------------------------------*/
-	/*Flashing operation starts from here */
-
-	/*Erase the current loaded program */
-	input_info(true, &client->dev,
-		   "%s erasing the current firmware\n", __func__);
-	bRet = flash_erase_all(wac_i2c);
-	if (!bRet) {
-		input_err(true, &client->dev,
-			  "%s failed to erase the user program\n", __func__);
-		return -EXIT_FAIL_ERASE;
-	}
-
-	/*Write the new program */
-	input_info(true, &client->dev, "%s writing new firmware\n",
-		   __func__);
-	bRet =
-	    flash_write_w9018(wac_i2c, wac_i2c->fw_data, start_address,
-			      &max_address);
-	if (!bRet) {
-		input_err(true, &client->dev,
-			  "%s failed to write firmware\n", __func__);
-		return -EXIT_FAIL_WRITE_FIRMWARE;
-	}
-
-	/*Return to the user mode */
-	input_info(true, &client->dev, "%s closing the boot mode\n",
-		   __func__);
-	bRet = flash_end_w9018(wac_i2c);
-	if (!bRet) {
-		input_err(true, &client->dev,
-			  "%s closing boot mode failed\n", __func__);
-		return -EXIT_FAIL_WRITING_MARK_NOT_SET;
-	}
-
-	input_info(true, &client->dev,
-		   "%s write and verify completed\n", __func__);
-
-	return EXIT_OK;
-}
-
-int wacom_i2c_flash(struct wacom_i2c *wac_i2c)
-{
-	int ret;
-
-	if (wac_i2c->fw_data == NULL) {
-		input_err(true, &wac_i2c->client->dev,
-			  "epen:Data is NULL. Exit.\n");
-		return -EINVAL;
-	}
-
-	wacom_compulsory_flash_mode(wac_i2c, true);
-	wacom_reset_hw(wac_i2c);
-
-	ret = wacom_flash_cmd(wac_i2c);
-	if (ret < 0) {
-		input_err(true, &wac_i2c->client->dev,
-			  "epen:%s cannot send flash command\n", __func__);
-		ret = -EXIT_FAIL;
-		goto out;
-	}
-
-	ret = flash_query_w9018(wac_i2c);
-	if (ret < 0) {
-		input_err(true, &wac_i2c->client->dev,
-			  "epen:%s Error: cannot send query\n", __func__);
-		ret = -EXIT_FAIL;
-		goto out;
-	}
-
-	ret = wacom_i2c_flash_w9018(wac_i2c, wac_i2c->fw_data);
-	if (ret < 0) {
-		input_err(true, &wac_i2c->client->dev,
-			  "epen:%s Error: flash failed\n", __func__);
-		ret = -EXIT_FAIL;
-		goto out;
-	}
-
-	msleep(200);
-
-out:
-	wac_i2c->function_result &= ~EPEN_EVENT_SURVEY;
-	wac_i2c->survey_mode = EPEN_SURVEY_MODE_NONE;
-
-	wacom_compulsory_flash_mode(wac_i2c, false);
-	wacom_reset_hw(wac_i2c);
-
-	return ret;
-}
+Q_CQID_SHIFT		= 16,
+	OCRDMA_CREATE_QP_REQ_WQ_CQID_MASK		= 0xFFFF <<
+				OCRDMA_CREATE_QP_REQ_WQ_CQID_SHIFT,
+
+	OCRDMA_CREATE_QP_REQ_DPP_CQPID_SHIFT		= 0,
+	OCRDMA_CREATE_QP_REQ_DPP_CQPID_MASK		= 0xFFFF,
+	OCRDMA_CREATE_QP_REQ_DPP_CREDIT_SHIFT		= 16,
+	OCRDMA_CREATE_QP_REQ_DPP_CREDIT_MASK		= 0xFFFF <<
+				OCRDMA_CREATE_QP_REQ_DPP_CREDIT_SHIFT
+};
+
+enum {
+	OCRDMA_CREATE_QP_REQ_DPP_CREDIT_LIMIT	= 16,
+	OCRDMA_CREATE_QP_RSP_DPP_PAGE_SHIFT	= 1
+};
+
+#define MAX_OCRDMA_IRD_PAGES 4
+
+enum ocrdma_qp_flags {
+	OCRDMA_QP_MW_BIND	= 1,
+	OCRDMA_QP_LKEY0		= (1 << 1),
+	OCRDMA_QP_FAST_REG	= (1 << 2),
+	OCRDMA_QP_INB_RD	= (1 << 6),
+	OCRDMA_QP_INB_WR	= (1 << 7),
+};
+
+enum ocrdma_qp_state {
+	OCRDMA_QPS_RST		= 0,
+	OCRDMA_QPS_INIT		= 1,
+	OCRDMA_QPS_RTR		= 2,
+	OCRDMA_QPS_RTS		= 3,
+	OCRDMA_QPS_SQE		= 4,
+	OCRDMA_QPS_SQ_DRAINING	= 5,
+	OCRDMA_QPS_ERR		= 6,
+	OCRDMA_QPS_SQD		= 7
+};
+
+struct ocrdma_create_qp_req {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+
+	u32 type_pgsz_pdn;
+	u32 max_wqe_rqe;
+	u32 max_sge_send_write;
+	u32 max_sge_recv_flags;
+	u32 max_ord_ird;
+	u32 num_wq_rq_pages;
+	u32 wqe_rqe_size;
+	u32 wq_rq_cqid;
+	struct ocrdma_pa wq_addr[MAX_OCRDMA_QP_PAGES];
+	struct ocrdma_pa rq_addr[MAX_OCRDMA_QP_PAGES];
+	u32 dpp_credits_cqid;
+	u32 rpir_lkey;
+	struct ocrdma_pa ird_addr[MAX_OCRDMA_IRD_PAGES];
+};
+
+enum {
+	OCRDMA_CREATE_QP_RSP_QP_ID_SHIFT		= 0,
+	OCRDMA_CREATE_QP_RSP_QP_ID_MASK			= 0xFFFF,
+
+	OCRDMA_CREATE_QP_RSP_MAX_RQE_SHIFT		= 0,
+	OCRDMA_CREATE_QP_RSP_MAX_RQE_MASK		= 0xFFFF,
+	OCRDMA_CREATE_QP_RSP_MAX_WQE_SHIFT		= 16,
+	OCRDMA_CREATE_QP_RSP_MAX_WQE_MASK		= 0xFFFF <<
+				OCRDMA_CREATE_QP_RSP_MAX_WQE_SHIFT,
+
+	OCRDMA_CREATE_QP_RSP_MAX_SGE_WRITE_SHIFT	= 0,
+	OCRDMA_CREATE_QP_RSP_MAX_SGE_WRITE_MASK		= 0xFFFF,
+	OCRDMA_CREATE_QP_RSP_MAX_SGE_SEND_SHIFT		= 16,
+	OCRDMA_CREATE_QP_RSP_MAX_SGE_SEND_MASK		= 0xFFFF <<
+				OCRDMA_CREATE_QP_RSP_MAX_SGE_SEND_SHIFT,
+
+	OCRDMA_CREATE_QP_RSP_MAX_SGE_RECV_SHIFT		= 16,
+	OCRDMA_CREATE_QP_RSP_MAX_SGE_RECV_MASK		= 0xFFFF <<
+				OCRDMA_CREATE_QP_RSP_MAX_SGE_RECV_SHIFT,
+
+	OCRDMA_CREATE_QP_RSP_MAX_IRD_SHIFT		= 0,
+	OCRDMA_CREATE_QP_RSP_MAX_IRD_MASK		= 0xFFFF,
+	OCRDMA_CREATE_QP_RSP_MAX_ORD_SHIFT		= 16,
+	OCRDMA_CREATE_QP_RSP_MAX_ORD_MASK		= 0xFFFF <<
+				OCRDMA_CREATE_QP_RSP_MAX_ORD_SHIFT,
+
+	OCRDMA_CREATE_QP_RSP_RQ_ID_SHIFT		= 0,
+	OCRDMA_CREATE_QP_RSP_RQ_ID_MASK			= 0xFFFF,
+	OCRDMA_CREATE_QP_RSP_SQ_ID_SHIFT		= 16,
+	OCRDMA_CREATE_QP_RSP_SQ_ID_MASK			= 0xFFFF <<
+				OCRDMA_CREATE_QP_RSP_SQ_ID_SHIFT,
+
+	OCRDMA_CREATE_QP_RSP_DPP_ENABLED_MASK		= BIT(0),
+	OCRDMA_CREATE_QP_RSP_DPP_PAGE_OFFSET_SHIFT	= 1,
+	OCRDMA_CREATE_QP_RSP_DPP_PAGE_OFFSET_MASK	= 0x7FFF <<
+				OCRDMA_CREATE_QP_RSP_DPP_PAGE_OFFSET_SHIFT,
+	OCRDMA_CREATE_QP_RSP_DPP_CREDITS_SHIFT		= 16,
+	OCRDMA_CREATE_QP_RSP_DPP_CREDITS_MASK		= 0xFFFF <<
+				OCRDMA_CREATE_QP_RSP_DPP_CREDITS_SHIFT,
+};
+
+struct ocrdma_create_qp_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+
+	u32 qp_id;
+	u32 max_wqe_rqe;
+	u32 max_sge_send_write;
+	u32 max_sge_recv;
+	u32 max_ord_ird;
+	u32 sq_rq_id;
+	u32 dpp_response;
+};
+
+struct ocrdma_destroy_qp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+	u32 qp_id;
+};
+
+struct ocrdma_destroy_qp_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+};
+
+enum {
+	OCRDMA_MODIFY_QP_ID_SHIFT	= 0,
+	OCRDMA_MODIFY_QP_ID_MASK	= 0xFFFF,
+
+	OCRDMA_QP_PARA_QPS_VALID	= BIT(0),
+	OCRDMA_QP_PARA_SQD_ASYNC_VALID	= BIT(1),
+	OCRDMA_QP_PARA_PKEY_VALID	= BIT(2),
+	OCRDMA_QP_PARA_QKEY_VALID	= BIT(3),
+	OCRDMA_QP_PARA_PMTU_VALID	= BIT(4),
+	OCRDMA_QP_PARA_ACK_TO_VALID	= BIT(5),
+	OCRDMA_QP_PARA_RETRY_CNT_VALID	= BIT(6),
+	OCRDMA_QP_PARA_RRC_VALID	= BIT(7),
+	OCRDMA_QP_PARA_RQPSN_VALID	= BIT(8),
+	OCRDMA_QP_PARA_MAX_IRD_VALID	= BIT(9),
+	OCRDMA_QP_PARA_MAX_ORD_VALID	= BIT(10),
+	OCRDMA_QP_PARA_RNT_VALID	= BIT(11),
+	OCRDMA_QP_PARA_SQPSN_VALID	= BIT(12),
+	OCRDMA_QP_PARA_DST_QPN_VALID	= BIT(13),
+	OCRDMA_QP_PARA_MAX_WQE_VALID	= BIT(14),
+	OCRDMA_QP_PARA_MAX_RQE_VALID	= BIT(15),
+	OCRDMA_QP_PARA_SGE_SEND_VALID	= BIT(16),
+	OCRDMA_QP_PARA_SGE_RECV_VALID	= BIT(17),
+	OCRDMA_QP_PARA_SGE_WR_VALID	= BIT(18),
+	OCRDMA_QP_PARA_INB_RDEN_VALID	= BIT(19),
+	OCRDMA_QP_PARA_INB_WREN_VALID	= BIT(20),
+	OCRDMA_QP_PARA_FLOW_LBL_VALID	= BIT(21),
+	OCRDMA_QP_PARA_BIND_EN_VALID	= BIT(22),
+	OCRDMA_QP_PARA_ZLKEY_EN_VALID	= BIT(23),
+	OCRDMA_QP_PARA_FMR_EN_VALID	= BIT(24),
+	OCRDMA_QP_PARA_INBAT_EN_VALID	= BIT(25),
+	OCRDMA_QP_PARA_VLAN_EN_VALID	= BIT(26),
+
+	OCRDMA_MODIFY_QP_FLAGS_RD	= BIT(0),
+	OCRDMA_MODIFY_QP_FLAGS_WR	= BIT(1),
+	OCRDMA_MODIFY_QP_FLAGS_SEND	= BIT(2),
+	OCRDMA_MODIFY_QP_FLAGS_ATOMIC	= BIT(3)
+};
+
+enum {
+	OCRDMA_QP_PARAMS_SRQ_ID_SHIFT		= 0,
+	OCRDMA_QP_PARAMS_SRQ_ID_MASK		= 0xFFFF,
+
+	OCRDMA_QP_PARAMS_MAX_RQE_SHIFT		= 0,
+	OCRDMA_QP_PARAMS_MAX_RQE_MASK		= 0xFFFF,
+	OCRDMA_QP_PARAMS_MAX_WQE_SHIFT		= 16,
+	OCRDMA_QP_PARAMS_MAX_WQE_MASK		= 0xFFFF <<
+	    OCRDMA_QP_PARAMS_MAX_WQE_SHIFT,
+
+	OCRDMA_QP_PARAMS_MAX_SGE_WRITE_SHIFT	= 0,
+	OCRDMA_QP_PARAMS_MAX_SGE_WRITE_MASK	= 0xFFFF,
+	OCRDMA_QP_PARAMS_MAX_SGE_SEND_SHIFT	= 16,
+	OCRDMA_QP_PARAMS_MAX_SGE_SEND_MASK	= 0xFFFF <<
+					OCRDMA_QP_PARAMS_MAX_SGE_SEND_SHIFT,
+
+	OCRDMA_QP_PARAMS_FLAGS_FMR_EN		= BIT(0),
+	OCRDMA_QP_PARAMS_FLAGS_LKEY_0_EN	= BIT(1),
+	OCRDMA_QP_PARAMS_FLAGS_BIND_MW_EN	= BIT(2),
+	OCRDMA_QP_PARAMS_FLAGS_INBWR_EN		= BIT(3),
+	OCRDMA_QP_PARAMS_FLAGS_INBRD_EN		= BIT(4),
+	OCRDMA_QP_PARAMS_STATE_SHIFT		= 5,
+	OCRDMA_QP_PARAMS_STATE_MASK		= BIT(5) | BIT(6) | BIT(7),
+	OCRDMA_QP_PARAMS_FLAGS_SQD_ASYNC	= BIT(8),
+	OCRDMA_QP_PARAMS_FLAGS_INB_ATEN		= BIT(9),
+	OCRDMA_QP_PARAMS_MAX_SGE_RECV_SHIFT	= 16,
+	OCRDMA_QP_PARAMS_MAX_SGE_RECV_MASK	= 0xFFFF <<
+					OCRDMA_QP_PARAMS_MAX_SGE_RECV_SHIFT,
+
+	OCRDMA_QP_PARAMS_MAX_IRD_SHIFT		= 0,
+	OCRDMA_QP_PARAMS_MAX_IRD_MASK		= 0xFFFF,
+	OCRDMA_QP_PARAMS_MAX_ORD_SHIFT		= 16,
+	OCRDMA_QP_PARAMS_MAX_ORD_MASK		= 0xFFFF <<
+					OCRDMA_QP_PARAMS_MAX_ORD_SHIFT,
+
+	OCRDMA_QP_PARAMS_RQ_CQID_SHIFT		= 0,
+	OCRDMA_QP_PARAMS_RQ_CQID_MASK		= 0xFFFF,
+	OCRDMA_QP_PARAMS_WQ_CQID_SHIFT		= 16,
+	OCRDMA_QP_PARAMS_WQ_CQID_MASK		= 0xFFFF <<
+					OCRDMA_QP_PARAMS_WQ_CQID_SHIFT,
+
+	OCRDMA_QP_PARAMS_RQ_PSN_SHIFT		= 0,
+	OCRDMA_QP_PARAMS_RQ_PSN_MASK		= 0xFFFFFF,
+	OCRDMA_QP_PARAMS_HOP_LMT_SHIFT		= 24,
+	OCRDMA_QP_PARAMS_HOP_LMT_MASK		= 0xFF <<
+					OCRDMA_QP_PARAMS_HOP_LMT_SHIFT,
+
+	OCRDMA_QP_PARAMS_SQ_PSN_SHIFT		= 0,
+	OCRDMA_QP_PARAMS_SQ_PSN_MASK		= 0xFFFFFF,
+	OCRDMA_QP_PARAMS_TCLASS_SHIFT		= 24,
+	OCRDMA_QP_PARAMS_TCLASS_MASK		= 0xFF <<
+					OCRDMA_QP_PARAMS_TCLASS_SHIFT,
+
+	OCRDMA_QP_PARAMS_DEST_QPN_SHIFT		= 0,
+	OCRDMA_QP_PARAMS_DEST_QPN_MASK		= 0xFFFFFF,
+	OCRDMA_QP_PARAMS_RNR_RETRY_CNT_SHIFT	= 24,
+	OCRDMA_QP_PARAMS_RNR_RETRY_CNT_MASK	= 0x7 <<
+					OCRDMA_QP_PARAMS_RNR_RETRY_CNT_SHIFT,
+	OCRDMA_QP_PARAMS_ACK_TIMEOUT_SHIFT	= 27,
+	OCRDMA_QP_PARAMS_ACK_TIMEOUT_MASK	= 0x1F <<
+					OCRDMA_QP_PARAMS_ACK_TIMEOUT_SHIFT,
+
+	OCRDMA_QP_PARAMS_PKEY_IDNEX_SHIFT	= 0,
+	OCRDMA_QP_PARAMS_PKEY_INDEX_MASK	= 0xFFFF,
+	OCRDMA_QP_PARAMS_PATH_MTU_SHIFT		= 18,
+	OCRDMA_QP_PARAMS_PATH_MTU_MASK		= 0x3FFF <<
+					OCRDMA_QP_PARAMS_PATH_MTU_SHIFT,
+
+	OCRDMA_QP_PARAMS_FLOW_LABEL_SHIFT	= 0,
+	OCRDMA_QP_PARAMS_FLOW_LABEL_MASK	= 0xFFFFF,
+	OCRDMA_QP_PARAMS_SL_SHIFT		= 20,
+	OCRDMA_QP_PARAMS_SL_MASK		= 0xF <<
+					OCRDMA_QP_PARAMS_SL_SHIFT,
+	OCRDMA_QP_PARAMS_RETRY_CNT_SHIFT	= 24,
+	OCRDMA_QP_PARAMS_RETRY_CNT_MASK		= 0x7 <<
+					OCRDMA_QP_PARAMS_RETRY_CNT_SHIFT,
+	OCRDMA_QP_PARAMS_RNR_NAK_TIMER_SHIFT	= 27,
+	OCRDMA_QP_PARAMS_RNR_NAK_TIMER_MASK	= 0x1F <<
+					OCRDMA_QP_PARAMS_RNR_NAK_TIMER_SHIFT,
+
+	OCRDMA_QP_PARAMS_DMAC_B4_TO_B5_SHIFT	= 0,
+	OCRDMA_QP_PARAMS_DMAC_B4_TO_B5_MASK	= 0xFFFF,
+	OCRDMA_QP_PARAMS_VLAN_SHIFT		= 16,
+	OCRDMA_QP_PARAMS_VLAN_MASK		= 0xFFFF <<
+					OCRDMA_QP_PARAMS_VLAN_SHIFT
+};
+
+struct ocrdma_qp_params {
+	u32 id;
+	u32 max_wqe_rqe;
+	u32 max_sge_send_write;
+	u32 max_sge_recv_flags;
+	u32 max_ord_ird;
+	u32 wq_rq_cqid;
+	u32 hop_lmt_rq_psn;
+	u32 tclass_sq_psn;
+	u32 ack_to_rnr_rtc_dest_qpn;
+	u32 path_mtu_pkey_indx;
+	u32 rnt_rc_sl_fl;
+	u8 sgid[16];
+	u8 dgid[16];
+	u32 dmac_b0_to_b3;
+	u32 vlan_dmac_b4_to_b5;
+	u32 qkey;
+};
+
+
+struct ocrdma_modify_qp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+
+	struct ocrdma_qp_params params;
+	u32 flags;
+	u32 rdma_flags;
+	u32 num_outstanding_atomic_rd;
+};
+
+enum {
+	OCRDMA_MODIFY_QP_RSP_MAX_RQE_SHIFT	= 0,
+	OCRDMA_MODIFY_QP_RSP_MAX_RQE_MASK	= 0xFFFF,
+	OCRDMA_MODIFY_QP_RSP_MAX_WQE_SHIFT	= 16,
+	OCRDMA_MODIFY_QP_RSP_MAX_WQE_MASK	= 0xFFFF <<
+					OCRDMA_MODIFY_QP_RSP_MAX_WQE_SHIFT,
+
+	OCRDMA_MODIFY_QP_RSP_MAX_IRD_SHIFT	= 0,
+	OCRDMA_MODIFY_QP_RSP_MAX_IRD_MASK	= 0xFFFF,
+	OCRDMA_MODIFY_QP_RSP_MAX_ORD_SHIFT	= 16,
+	OCRDMA_MODIFY_QP_RSP_MAX_ORD_MASK	= 0xFFFF <<
+					OCRDMA_MODIFY_QP_RSP_MAX_ORD_SHIFT
+};
+
+struct ocrdma_modify_qp_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+
+	u32 max_wqe_rqe;
+	u32 max_ord_ird;
+};
+
+struct ocrdma_query_qp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+
+#define OCRDMA_QUERY_UP_QP_ID_SHIFT	0
+#define OCRDMA_QUERY_UP_QP_ID_MASK	0xFFFFFF
+	u32 qp_id;
+};
+
+struct ocrdma_query_qp_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+	struct ocrdma_qp_params params;
+	u32 dpp_credits_cqid;
+	u32 rbq_id;
+};
+
+enum {
+	OCRDMA_CREATE_SRQ_PD_ID_SHIFT		= 0,
+	OCRDMA_CREATE_SRQ_PD_ID_MASK		= 0xFFFF,
+	OCRDMA_CREATE_SRQ_PG_SZ_SHIFT		= 16,
+	OCRDMA_CREATE_SRQ_PG_SZ_MASK		= 0x3 <<
+					OCRDMA_CREATE_SRQ_PG_SZ_SHIFT,
+
+	OCRDMA_CREATE_SRQ_MAX_RQE_SHIFT		= 0,
+	OCRDMA_CREATE_SRQ_MAX_SGE_RECV_SHIFT	= 16,
+	OCRDMA_CREATE_SRQ_MAX_SGE_RECV_MASK	= 0xFFFF <<
+					OCRDMA_CREATE_SRQ_MAX_SGE_RECV_SHIFT,
+
+	OCRDMA_CREATE_SRQ_RQE_SIZE_SHIFT	= 0,
+	OCRDMA_CREATE_SRQ_RQE_SIZE_MASK		= 0xFFFF,
+	OCRDMA_CREATE_SRQ_NUM_RQ_PAGES_SHIFT	= 16,
+	OCRDMA_CREATE_SRQ_NUM_RQ_PAGES_MASK	= 0xFFFF <<
+					OCRDMA_CREATE_SRQ_NUM_RQ_PAGES_SHIFT
+};
+
+struct ocrdma_create_srq {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+
+	u32 pgsz_pdid;
+	u32 max_sge_rqe;
+	u32 pages_rqe_sz;
+	struct ocrdma_pa rq_addr[MAX_OCRDMA_SRQ_PAGES];
+};
+
+enum {
+	OCRDMA_CREATE_SRQ_RSP_SRQ_ID_SHIFT			= 0,
+	OCRDMA_CREATE_SRQ_RSP_SRQ_ID_MASK			= 0xFFFFFF,
+
+	OCRDMA_CREATE_SRQ_RSP_MAX_RQE_ALLOCATED_SHIFT		= 0,
+	OCRDMA_CREATE_SRQ_RSP_MAX_RQE_ALLOCATED_MASK		= 0xFFFF,
+	OCRDMA_CREATE_SRQ_RSP_MAX_SGE_RECV_ALLOCATED_SHIFT	= 16,
+	OCRDMA_CREATE_SRQ_RSP_MAX_SGE_RECV_ALLOCATED_MASK	= 0xFFFF <<
+			OCRDMA_CREATE_SRQ_RSP_MAX_SGE_RECV_ALLOCATED_SHIFT
+};
+
+struct ocrdma_create_srq_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+
+	u32 id;
+	u32 max_sge_rqe_allocated;
+};
+
+enum {
+	OCRDMA_MODIFY_SRQ_ID_SHIFT	= 0,
+	OCRDMA_MODIFY_SRQ_ID_MASK	= 0xFFFFFF,
+
+	OCRDMA_MODIFY_SRQ_MAX_RQE_SHIFT	= 0,
+	OCRDMA_MODIFY_SRQ_MAX_RQE_MASK	= 0xFFFF,
+	OCRDMA_MODIFY_SRQ_LIMIT_SHIFT	= 16,
+	OCRDMA_MODIFY_SRQ__LIMIT_MASK	= 0xFFFF <<
+					OCRDMA_MODIFY_SRQ_LIMIT_SHIFT
+};
+
+struct ocrdma_modify_srq {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rep;
+
+	u32 id;
+	u32 limit_max_rqe;
+};
+
+enum {
+	OCRDMA_QUERY_SRQ_ID_SHIFT	= 0,
+	OCRDMA_QUERY_SRQ_ID_MASK	= 0xFFFFFF
+};
+
+struct ocrdma_query_srq {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp req;
+
+	u32 id;
+};
+
+enum {
+	OCRDMA_QUERY_SRQ_RSP_PD_ID_SHIFT	= 0,
+	OCRDMA_QUERY_SRQ_RSP_PD_ID_MASK		= 0xFFFF,
+	OCRDMA_QUERY_SRQ_RSP_MAX_RQE_SHIFT	= 16,
+	OCRDMA_QUERY_SRQ_RSP_MAX_RQE_MASK	= 0xFFFF <<
+					OCRDMA_QUERY_SRQ_RSP_MAX_RQE_SHIFT,
+
+	OCRDMA_QUERY_SRQ_RSP_MAX_SGE_RECV_SHIFT	= 0,
+	OCRDMA_QUERY_SRQ_RSP_MAX_SGE_RECV_MASK	= 0xFFFF,
+	OCRDMA_QUERY_SRQ_RSP_SRQ_LIMIT_SHIFT	= 16,
+	OCRDMA_QUERY_SRQ_RSP_SRQ_LIMIT_MASK	= 0xFFFF <<
+					OCRDMA_QUERY_SRQ_RSP_SRQ_LIMIT_SHIFT
+};
+
+struct ocrdma_query_srq_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp req;
+
+	u32 max_rqe_pdid;
+	u32 srq_lmt_max_sge;
+};
+
+enum {
+	OCRDMA_DESTROY_SRQ_ID_SHIFT	= 0,
+	OCRDMA_DESTROY_SRQ_ID_MASK	= 0xFFFFFF
+};
+
+struct ocrdma_destroy_srq {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp req;
+
+	u32 id;
+};
+
+enum {
+	OCRDMA_ALLOC_PD_ENABLE_DPP	= BIT(16),
+	OCRDMA_DPP_PAGE_SIZE		= 4096
+};
+
+struct ocrdma_alloc_pd {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+	u32 enable_dpp_rsvd;
+};
+
+enum {
+	OCRDMA_ALLOC_PD_RSP_DPP			= BIT(16),
+	OCRDMA_ALLOC_PD_RSP_DPP_PAGE_SHIFT	= 20,
+	OCRDMA_ALLOC_PD_RSP_PDID_MASK		= 0xFFFF,
+};
+
+struct ocrdma_alloc_pd_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+	u32 dpp_page_pdid;
+};
+
+struct ocrdma_dealloc_pd {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+	u32 id;
+};
+
+struct ocrdma_dealloc_pd_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+};
+
+struct ocrdma_alloc_pd_range {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+	u32 enable_dpp_rsvd;
+	u32 pd_count;
+};
+
+struct ocrdma_alloc_pd_range_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+	u32 dpp_page_pdid;
+	u32 pd_count;
+};
+
+enum {
+	OCRDMA_ALLOC_PD_RNG_RSP_START_PDID_MASK = 0xFFFF,
+};
+
+struct ocrdma_dealloc_pd_range {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+	u32 start_pd_id;
+	u32 pd_count;
+};
+
+struct ocrdma_dealloc_pd_range_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+	u32 rsvd;
+};
+
+enum {
+	OCRDMA_ADDR_CHECK_ENABLE	= 1,
+	OCRDMA_ADDR_CHECK_DISABLE	= 0
+};
+
+enum {
+	OCRDMA_ALLOC_LKEY_PD_ID_SHIFT		= 0,
+	OCRDMA_ALLOC_LKEY_PD_ID_MASK		= 0xFFFF,
+
+	OCRDMA_ALLOC_LKEY_ADDR_CHECK_SHIFT	= 0,
+	OCRDMA_ALLOC_LKEY_ADDR_CHECK_MASK	= BIT(0),
+	OCRDMA_ALLOC_LKEY_FMR_SHIFT		= 1,
+	OCRDMA_ALLOC_LKEY_FMR_MASK		= BIT(1),
+	OCRDMA_ALLOC_LKEY_REMOTE_INV_SHIFT	= 2,
+	OCRDMA_ALLOC_LKEY_REMOTE_INV_MASK	= BIT(2),
+	OCRDMA_ALLOC_LKEY_REMOTE_WR_SHIFT	= 3,
+	OCRDMA_ALLOC_LKEY_REMOTE_WR_MASK	= BIT(3),
+	OCRDMA_ALLOC_LKEY_REMOTE_RD_SHIFT	= 4,
+	OCRDMA_ALLOC_LKEY_REMOTE_RD_MASK	= BIT(4),
+	OCRDMA_ALLOC_LKEY_LOCAL_WR_SHIFT	= 5,
+	OCRDMA_ALLOC_LKEY_LOCAL_WR_MASK		= BIT(5),
+	OCRDMA_ALLOC_LKEY_REMOTE_ATOMIC_MASK	= BIT(6),
+	OCRDMA_ALLOC_LKEY_REMOTE_ATOMIC_SHIFT	= 6,
+	OCRDMA_ALLOC_LKEY_PBL_SIZE_SHIFT	= 16,
+	OCRDMA_ALLOC_LKEY_PBL_SIZE_MASK		= 0xFFFF <<
+						OCRDMA_ALLOC_LKEY_PBL_SIZE_SHIFT
+};
+
+struct ocrdma_alloc_lkey {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+
+	u32 pdid;
+	u32 pbl_sz_flags;
+};
+
+struct ocrdma_alloc_lkey_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+
+	u32 lrkey;
+	u32 num_pbl_rsvd;
+};
+
+struct ocrdma_dealloc_lkey {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_hdr req;
+
+	u32 lkey;
+	u32 rsvd_frmr;
+};
+
+struct ocrdma_dealloc_lkey_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+};
+
+#define MAX_OCRDMA_NSMR_PBL    (u32)22
+#define MAX_OCRDMA_PBL_SIZE     65536
+#define MAX_OCRDMA_PBL_PER_LKEY	32767
+
+enum {
+	OCRDMA_REG_NSMR_LRKEY_INDEX_SHIFT	= 0,
+	OCRDMA_REG_NSMR_LRKEY_INDEX_MASK	= 0xFFFFFF,
+	OCRDMA_REG_NSMR_LRKEY_SHIFT		= 24,
+	OCRDMA_REG_NSMR_LRKEY_MASK		= 0xFF <<
+					OCRDMA_REG_NSMR_LRKEY_SHIFT,
+
+	OCRDMA_REG_NSMR_PD_ID_SHIFT		= 0,
+	OCRDMA_REG_NSMR_PD_ID_MASK		= 0xFFFF,
+	OCRDMA_REG_NSMR_NUM_PBL_SHIFT		= 16,
+	OCRDMA_REG_NSMR_NUM_PBL_MASK		= 0xFFFF <<
+					OCRDMA_REG_NSMR_NUM_PBL_SHIFT,
+
+	OCRDMA_REG_NSMR_PBE_SIZE_SHIFT		= 0,
+	OCRDMA_REG_NSMR_PBE_SIZE_MASK		= 0xFFFF,
+	OCRDMA_REG_NSMR_HPAGE_SIZE_SHIFT	= 16,
+	OCRDMA_REG_NSMR_HPAGE_SIZE_MASK		= 0xFF <<
+					OCRDMA_REG_NSMR_HPAGE_SIZE_SHIFT,
+	OCRDMA_REG_NSMR_BIND_MEMWIN_SHIFT	= 24,
+	OCRDMA_REG_NSMR_BIND_MEMWIN_MASK	= BIT(24),
+	OCRDMA_REG_NSMR_ZB_SHIFT		= 25,
+	OCRDMA_REG_NSMR_ZB_SHIFT_MASK		= BIT(25),
+	OCRDMA_REG_NSMR_REMOTE_INV_SHIFT	= 26,
+	OCRDMA_REG_NSMR_REMOTE_INV_MASK		= BIT(26),
+	OCRDMA_REG_NSMR_REMOTE_WR_SHIFT		= 27,
+	OCRDMA_REG_NSMR_REMOTE_WR_MASK		= BIT(27),
+	OCRDMA_REG_NSMR_REMOTE_RD_SHIFT		= 28,
+	OCRDMA_REG_NSMR_REMOTE_RD_MASK		= BIT(28),
+	OCRDMA_REG_NSMR_LOCAL_WR_SHIFT		= 29,
+	OCRDMA_REG_NSMR_LOCAL_WR_MASK		= BIT(29),
+	OCRDMA_REG_NSMR_REMOTE_ATOMIC_SHIFT	= 30,
+	OCRDMA_REG_NSMR_REMOTE_ATOMIC_MASK	= BIT(30),
+	OCRDMA_REG_NSMR_LAST_SHIFT		= 3

@@ -1,294 +1,323 @@
+river_ops[] = {
+	{ .read = driver_stats_read, .llseek = generic_file_llseek, },
+	{ .read = driver_names_read, .llseek = generic_file_llseek, },
+};
+
+/* read the per-device counters */
+static ssize_t dev_counters_read(struct file *file, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	u64 *counters;
+	size_t avail;
+	struct qib_devdata *dd = private2dd(file);
+
+	avail = dd->f_read_cntrs(dd, *ppos, NULL, &counters);
+	return simple_read_from_buffer(buf, count, ppos, counters, avail);
+}
+
+/* read the per-device counters */
+static ssize_t dev_names_read(struct file *file, char __user *buf,
+			      size_t count, loff_t *ppos)
+{
+	char *names;
+	size_t avail;
+	struct qib_devdata *dd = private2dd(file);
+
+	avail = dd->f_read_cntrs(dd, *ppos, &names, NULL);
+	return simple_read_from_buffer(buf, count, ppos, names, avail);
+}
+
+static const struct file_operations cntr_ops[] = {
+	{ .read = dev_counters_read, .llseek = generic_file_llseek, },
+	{ .read = dev_names_read, .llseek = generic_file_llseek, },
+};
+
 /*
- * IBM OPAL I2C driver
- * Copyright (C) 2014 IBM
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.
+ * Could use file_inode(file)->i_ino to figure out which file,
+ * instead of separate routine for each, but for now, this works...
  */
 
-#include <linux/device.h>
-#include <linux/i2c.h>
-#include <linux/kernel.h>
-#include <linux/mm.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-
-#include <asm/firmware.h>
-#include <asm/opal.h>
-
-static int i2c_opal_translate_error(int rc)
+/* read the per-port names (same for each port) */
+static ssize_t portnames_read(struct file *file, char __user *buf,
+			      size_t count, loff_t *ppos)
 {
-	switch (rc) {
-	case OPAL_NO_MEM:
+	char *names;
+	size_t avail;
+	struct qib_devdata *dd = private2dd(file);
+
+	avail = dd->f_read_portcntrs(dd, *ppos, 0, &names, NULL);
+	return simple_read_from_buffer(buf, count, ppos, names, avail);
+}
+
+/* read the per-port counters for port 1 (pidx 0) */
+static ssize_t portcntrs_1_read(struct file *file, char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	u64 *counters;
+	size_t avail;
+	struct qib_devdata *dd = private2dd(file);
+
+	avail = dd->f_read_portcntrs(dd, *ppos, 0, NULL, &counters);
+	return simple_read_from_buffer(buf, count, ppos, counters, avail);
+}
+
+/* read the per-port counters for port 2 (pidx 1) */
+static ssize_t portcntrs_2_read(struct file *file, char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	u64 *counters;
+	size_t avail;
+	struct qib_devdata *dd = private2dd(file);
+
+	avail = dd->f_read_portcntrs(dd, *ppos, 1, NULL, &counters);
+	return simple_read_from_buffer(buf, count, ppos, counters, avail);
+}
+
+static const struct file_operations portcntr_ops[] = {
+	{ .read = portnames_read, .llseek = generic_file_llseek, },
+	{ .read = portcntrs_1_read, .llseek = generic_file_llseek, },
+	{ .read = portcntrs_2_read, .llseek = generic_file_llseek, },
+};
+
+/*
+ * read the per-port QSFP data for port 1 (pidx 0)
+ */
+static ssize_t qsfp_1_read(struct file *file, char __user *buf,
+			   size_t count, loff_t *ppos)
+{
+	struct qib_devdata *dd = private2dd(file);
+	char *tmp;
+	int ret;
+
+	tmp = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!tmp)
 		return -ENOMEM;
-	case OPAL_PARAMETER:
-		return -EINVAL;
-	case OPAL_I2C_ARBT_LOST:
-		return -EAGAIN;
-	case OPAL_I2C_TIMEOUT:
-		return -ETIMEDOUT;
-	case OPAL_I2C_NACK_RCVD:
-		return -ENXIO;
-	case OPAL_I2C_STOP_ERR:
-		return -EBUSY;
-	default:
-		return -EIO;
-	}
+
+	ret = qib_qsfp_dump(dd->pport, tmp, PAGE_SIZE);
+	if (ret > 0)
+		ret = simple_read_from_buffer(buf, count, ppos, tmp, ret);
+	kfree(tmp);
+	return ret;
 }
 
-static int i2c_opal_send_request(u32 bus_id, struct opal_i2c_request *req)
+/*
+ * read the per-port QSFP data for port 2 (pidx 1)
+ */
+static ssize_t qsfp_2_read(struct file *file, char __user *buf,
+			   size_t count, loff_t *ppos)
 {
-	struct opal_msg msg;
-	int token, rc;
+	struct qib_devdata *dd = private2dd(file);
+	char *tmp;
+	int ret;
 
-	token = opal_async_get_token_interruptible();
-	if (token < 0) {
-		if (token != -ERESTARTSYS)
-			pr_err("Failed to get the async token\n");
+	if (dd->num_pports < 2)
+		return -ENODEV;
 
-		return token;
-	}
+	tmp = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
 
-	rc = opal_i2c_request(token, bus_id, req);
-	if (rc != OPAL_ASYNC_COMPLETION) {
-		rc = i2c_opal_translate_error(rc);
-		goto exit;
-	}
-
-	rc = opal_async_wait_response(token, &msg);
-	if (rc)
-		goto exit;
-
-	rc = be64_to_cpu(msg.params[1]);
-	if (rc != OPAL_SUCCESS) {
-		rc = i2c_opal_translate_error(rc);
-		goto exit;
-	}
-
-exit:
-	opal_async_release_token(token);
-	return rc;
+	ret = qib_qsfp_dump(dd->pport + 1, tmp, PAGE_SIZE);
+	if (ret > 0)
+		ret = simple_read_from_buffer(buf, count, ppos, tmp, ret);
+	kfree(tmp);
+	return ret;
 }
 
-static int i2c_opal_master_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
-				int num)
-{
-	unsigned long opal_id = (unsigned long)adap->algo_data;
-	struct opal_i2c_request req;
-	int rc, i;
+static const struct file_operations qsfp_ops[] = {
+	{ .read = qsfp_1_read, .llseek = generic_file_llseek, },
+	{ .read = qsfp_2_read, .llseek = generic_file_llseek, },
+};
 
-	/* We only support fairly simple combinations here of one
-	 * or two messages
-	 */
-	memset(&req, 0, sizeof(req));
-	switch(num) {
-	case 0:
-		return 0;
-	case 1:
-		req.type = (msgs[0].flags & I2C_M_RD) ?
-			OPAL_I2C_RAW_READ : OPAL_I2C_RAW_WRITE;
-		req.addr = cpu_to_be16(msgs[0].addr);
-		req.size = cpu_to_be32(msgs[0].len);
-		req.buffer_ra = cpu_to_be64(__pa(msgs[0].buf));
-		break;
-	case 2:
-		req.type = (msgs[1].flags & I2C_M_RD) ?
-			OPAL_I2C_SM_READ : OPAL_I2C_SM_WRITE;
-		req.addr = cpu_to_be16(msgs[0].addr);
-		req.subaddr_sz = msgs[0].len;
-		for (i = 0; i < msgs[0].len; i++)
-			req.subaddr = (req.subaddr << 8) | msgs[0].buf[i];
-		req.subaddr = cpu_to_be32(req.subaddr);
-		req.size = cpu_to_be32(msgs[1].len);
-		req.buffer_ra = cpu_to_be64(__pa(msgs[1].buf));
-		break;
-	default:
-		return -EOPNOTSUPP;
+static ssize_t flash_read(struct file *file, char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	struct qib_devdata *dd;
+	ssize_t ret;
+	loff_t pos;
+	char *tmp;
+
+	pos = *ppos;
+
+	if (pos < 0) {
+		ret = -EINVAL;
+		goto bail;
 	}
 
-	rc = i2c_opal_send_request(opal_id, &req);
-	if (rc)
-		return rc;
+	if (pos >= sizeof(struct qib_flash)) {
+		ret = 0;
+		goto bail;
+	}
 
-	return num;
+	if (count > sizeof(struct qib_flash) - pos)
+		count = sizeof(struct qib_flash) - pos;
+
+	tmp = kmalloc(count, GFP_KERNEL);
+	if (!tmp) {
+		ret = -ENOMEM;
+		goto bail;
+	}
+
+	dd = private2dd(file);
+	if (qib_eeprom_read(dd, pos, tmp, count)) {
+		qib_dev_err(dd, "failed to read from flash\n");
+		ret = -ENXIO;
+		goto bail_tmp;
+	}
+
+	if (copy_to_user(buf, tmp, count)) {
+		ret = -EFAULT;
+		goto bail_tmp;
+	}
+
+	*ppos = pos + count;
+	ret = count;
+
+bail_tmp:
+	kfree(tmp);
+
+bail:
+	return ret;
 }
 
-static int i2c_opal_smbus_xfer(struct i2c_adapter *adap, u16 addr,
-			       unsigned short flags, char read_write,
-			       u8 command, int size, union i2c_smbus_data *data)
+static ssize_t flash_write(struct file *file, const char __user *buf,
+			   size_t count, loff_t *ppos)
 {
-	unsigned long opal_id = (unsigned long)adap->algo_data;
-	struct opal_i2c_request req;
-	u8 local[2];
-	int rc;
+	struct qib_devdata *dd;
+	ssize_t ret;
+	loff_t pos;
+	char *tmp;
 
-	memset(&req, 0, sizeof(req));
+	pos = *ppos;
 
-	req.addr = cpu_to_be16(addr);
-	switch (size) {
-	case I2C_SMBUS_BYTE:
-		req.buffer_ra = cpu_to_be64(__pa(&data->byte));
-		req.size = cpu_to_be32(1);
-		/* Fall through */
-	case I2C_SMBUS_QUICK:
-		req.type = (read_write == I2C_SMBUS_READ) ?
-			OPAL_I2C_RAW_READ : OPAL_I2C_RAW_WRITE;
-		break;
-	case I2C_SMBUS_BYTE_DATA:
-		req.buffer_ra = cpu_to_be64(__pa(&data->byte));
-		req.size = cpu_to_be32(1);
-		req.subaddr = cpu_to_be32(command);
-		req.subaddr_sz = 1;
-		req.type = (read_write == I2C_SMBUS_READ) ?
-			OPAL_I2C_SM_READ : OPAL_I2C_SM_WRITE;
-		break;
-	case I2C_SMBUS_WORD_DATA:
-		if (!read_write) {
-			local[0] = data->word & 0xff;
-			local[1] = (data->word >> 8) & 0xff;
+	if (pos != 0) {
+		ret = -EINVAL;
+		goto bail;
+	}
+
+	if (count != sizeof(struct qib_flash)) {
+		ret = -EINVAL;
+		goto bail;
+	}
+
+	tmp = kmalloc(count, GFP_KERNEL);
+	if (!tmp) {
+		ret = -ENOMEM;
+		goto bail;
+	}
+
+	if (copy_from_user(tmp, buf, count)) {
+		ret = -EFAULT;
+		goto bail_tmp;
+	}
+
+	dd = private2dd(file);
+	if (qib_eeprom_write(dd, pos, tmp, count)) {
+		ret = -ENXIO;
+		qib_dev_err(dd, "failed to write to flash\n");
+		goto bail_tmp;
+	}
+
+	*ppos = pos + count;
+	ret = count;
+
+bail_tmp:
+	kfree(tmp);
+
+bail:
+	return ret;
+}
+
+static const struct file_operations flash_ops = {
+	.read = flash_read,
+	.write = flash_write,
+	.llseek = default_llseek,
+};
+
+static int add_cntr_files(struct super_block *sb, struct qib_devdata *dd)
+{
+	struct dentry *dir, *tmp;
+	char unit[10];
+	int ret, i;
+
+	/* create the per-unit directory */
+	snprintf(unit, sizeof(unit), "%u", dd->unit);
+	ret = create_file(unit, S_IFDIR|S_IRUGO|S_IXUGO, sb->s_root, &dir,
+			  &simple_dir_operations, dd);
+	if (ret) {
+		pr_err("create_file(%s) failed: %d\n", unit, ret);
+		goto bail;
+	}
+
+	/* create the files in the new directory */
+	ret = create_file("counters", S_IFREG|S_IRUGO, dir, &tmp,
+			  &cntr_ops[0], dd);
+	if (ret) {
+		pr_err("create_file(%s/counters) failed: %d\n",
+		       unit, ret);
+		goto bail;
+	}
+	ret = create_file("counter_names", S_IFREG|S_IRUGO, dir, &tmp,
+			  &cntr_ops[1], dd);
+	if (ret) {
+		pr_err("create_file(%s/counter_names) failed: %d\n",
+		       unit, ret);
+		goto bail;
+	}
+	ret = create_file("portcounter_names", S_IFREG|S_IRUGO, dir, &tmp,
+			  &portcntr_ops[0], dd);
+	if (ret) {
+		pr_err("create_file(%s/%s) failed: %d\n",
+		       unit, "portcounter_names", ret);
+		goto bail;
+	}
+	for (i = 1; i <= dd->num_pports; i++) {
+		char fname[24];
+
+		sprintf(fname, "port%dcounters", i);
+		/* create the files in the new directory */
+		ret = create_file(fname, S_IFREG|S_IRUGO, dir, &tmp,
+				  &portcntr_ops[i], dd);
+		if (ret) {
+			pr_err("create_file(%s/%s) failed: %d\n",
+				unit, fname, ret);
+			goto bail;
 		}
-		req.buffer_ra = cpu_to_be64(__pa(local));
-		req.size = cpu_to_be32(2);
-		req.subaddr = cpu_to_be32(command);
-		req.subaddr_sz = 1;
-		req.type = (read_write == I2C_SMBUS_READ) ?
-			OPAL_I2C_SM_READ : OPAL_I2C_SM_WRITE;
-		break;
-	case I2C_SMBUS_I2C_BLOCK_DATA:
-		req.buffer_ra = cpu_to_be64(__pa(&data->block[1]));
-		req.size = cpu_to_be32(data->block[0]);
-		req.subaddr = cpu_to_be32(command);
-		req.subaddr_sz = 1;
-		req.type = (read_write == I2C_SMBUS_READ) ?
-			OPAL_I2C_SM_READ : OPAL_I2C_SM_WRITE;
-		break;
-	default:
-		return -EINVAL;
+		if (!(dd->flags & QIB_HAS_QSFP))
+			continue;
+		sprintf(fname, "qsfp%d", i);
+		ret = create_file(fname, S_IFREG|S_IRUGO, dir, &tmp,
+				  &qsfp_ops[i - 1], dd);
+		if (ret) {
+			pr_err("create_file(%s/%s) failed: %d\n",
+				unit, fname, ret);
+			goto bail;
+		}
 	}
 
-	rc = i2c_opal_send_request(opal_id, &req);
-	if (!rc && read_write && size == I2C_SMBUS_WORD_DATA) {
-		data->word = ((u16)local[1]) << 8;
-		data->word |= local[0];
+	ret = create_file("flash", S_IFREG|S_IWUSR|S_IRUGO, dir, &tmp,
+			  &flash_ops, dd);
+	if (ret)
+		pr_err("create_file(%s/flash) failed: %d\n",
+			unit, ret);
+bail:
+	return ret;
+}
+
+static int remove_file(struct dentry *parent, char *name)
+{
+	struct dentry *tmp;
+	int ret;
+
+	tmp = lookup_one_len(name, parent, strlen(name));
+
+	if (IS_ERR(tmp)) {
+		ret = PTR_ERR(tmp);
+		goto bail;
 	}
 
-	return rc;
-}
-
-static u32 i2c_opal_func(struct i2c_adapter *adapter)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
-	       I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA |
-	       I2C_FUNC_SMBUS_I2C_BLOCK;
-}
-
-static const struct i2c_algorithm i2c_opal_algo = {
-	.master_xfer	= i2c_opal_master_xfer,
-	.smbus_xfer	= i2c_opal_smbus_xfer,
-	.functionality	= i2c_opal_func,
-};
-
-/*
- * For two messages, we basically support simple smbus transactions of a
- * write-then-anything.
- */
-static struct i2c_adapter_quirks i2c_opal_quirks = {
-	.flags = I2C_AQ_COMB | I2C_AQ_COMB_WRITE_FIRST | I2C_AQ_COMB_SAME_ADDR,
-	.max_comb_1st_msg_len = 4,
-};
-
-static int i2c_opal_probe(struct platform_device *pdev)
-{
-	struct i2c_adapter	*adapter;
-	const char		*pname;
-	u32			opal_id;
-	int			rc;
-
-	if (!pdev->dev.of_node)
-		return -ENODEV;
-
-	rc = of_property_read_u32(pdev->dev.of_node, "ibm,opal-id", &opal_id);
-	if (rc) {
-		dev_err(&pdev->dev, "Missing ibm,opal-id property !\n");
-		return -EIO;
-	}
-
-	adapter = devm_kzalloc(&pdev->dev, sizeof(*adapter), GFP_KERNEL);
-	if (!adapter)
-		return -ENOMEM;
-
-	adapter->algo = &i2c_opal_algo;
-	adapter->algo_data = (void *)(unsigned long)opal_id;
-	adapter->quirks = &i2c_opal_quirks;
-	adapter->dev.parent = &pdev->dev;
-	adapter->dev.of_node = of_node_get(pdev->dev.of_node);
-	pname = of_get_property(pdev->dev.of_node, "ibm,port-name", NULL);
-	if (pname)
-		strlcpy(adapter->name, pname, sizeof(adapter->name));
-	else
-		strlcpy(adapter->name, "opal", sizeof(adapter->name));
-
-	platform_set_drvdata(pdev, adapter);
-	rc = i2c_add_adapter(adapter);
-	if (rc)
-		dev_err(&pdev->dev, "Failed to register the i2c adapter\n");
-
-	return rc;
-}
-
-static int i2c_opal_remove(struct platform_device *pdev)
-{
-	struct i2c_adapter *adapter = platform_get_drvdata(pdev);
-
-	i2c_del_adapter(adapter);
-
-	return 0;
-}
-
-static const struct of_device_id i2c_opal_of_match[] = {
-	{
-		.compatible = "ibm,opal-i2c",
-	},
-	{ }
-};
-MODULE_DEVICE_TABLE(of, i2c_opal_of_match);
-
-static struct platform_driver i2c_opal_driver = {
-	.probe	= i2c_opal_probe,
-	.remove	= i2c_opal_remove,
-	.driver	= {
-		.name		= "i2c-opal",
-		.of_match_table	= i2c_opal_of_match,
-	},
-};
-
-static int __init i2c_opal_init(void)
-{
-	if (!firmware_has_feature(FW_FEATURE_OPAL))
-		return -ENODEV;
-
-	return platform_driver_register(&i2c_opal_driver);
-}
-module_init(i2c_opal_init);
-
-static void __exit i2c_opal_exit(void)
-{
-	return platform_driver_unregister(&i2c_opal_driver);
-}
-module_exit(i2c_opal_exit);
-
-MODULE_AUTHOR("Neelesh Gupta <neelegup@linux.vnet.ibm.com>");
-MODULE_DESCRIPTION("IBM OPAL I2C driver");
-MODULE_LICENSE("GPL");
+	spin_lock(&tmp->d_lock);
+	if (simple_positive(tmp)) {
+		__d_drop(tmp);
+		spin_unlock(&tmp->d_lock);
+		simple_

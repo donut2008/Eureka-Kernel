@@ -1,37 +1,19 @@
-/*
- * Cryptographic API.
- *
- * s390 generic implementation of the SHA Secure Hash Algorithms.
- *
- * Copyright IBM Corp. 2007
- * Author(s): Jan Glauber (jang@de.ibm.com)
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option)
- * any later version.
- *
- */
-#ifndef _CRYPTO_ARCH_S390_SHA_H
-#define _CRYPTO_ARCH_S390_SHA_H
+                             */
+#define SH_EVENT_OCCURRED_RTC3_INT_SHFT			26
+#define SH_EVENT_OCCURRED_RTC3_INT_MASK	__IA64_UL_CONST(0x0000000004000000)
 
-#include <linux/crypto.h>
-#include <crypto/sha.h>
+/* ==================================================================== */
+/*                       Register "SH_IPI_ACCESS"                       */
+/*                 CPU interrupt Access Permission Bits                 */
+/* ==================================================================== */
 
-/* must be big enough for the largest SHA variant */
-#define SHA_MAX_STATE_SIZE	(SHA512_DIGEST_SIZE / 4)
-#define SHA_MAX_BLOCK_SIZE      SHA512_BLOCK_SIZE
+#define SH1_IPI_ACCESS			__IA64_UL_CONST(0x0000000110060480)
+#define SH2_IPI_ACCESS0			__IA64_UL_CONST(0x0000000010060c00)
+#define SH2_IPI_ACCESS1			__IA64_UL_CONST(0x0000000010060c80)
+#define SH2_IPI_ACCESS2			__IA64_UL_CONST(0x0000000010060d00)
+#define SH2_IPI_ACCESS3			__IA64_UL_CONST(0x0000000010060d80)
 
-struct s390_sha_ctx {
-	u64 count;              /* message length in bytes */
-	u32 state[SHA_MAX_STATE_SIZE];
-	u8 buf[2 * SHA_MAX_BLOCK_SIZE];
-	int func;		/* KIMD function to use */
-};
-
-struct shash_desc;
-
-int s390_sha_update(struct shash_desc *desc, const u8 *data, unsigned int len);
-int s390_sha_final(struct shash_desc *desc, u8 *out);
-
-#endif
+/* ==================================================================== */
+/*                        Register "SH_INT_CMPB"                        */
+/*                  RTC Compare Value for Processor B                   */
+/* =========================================================

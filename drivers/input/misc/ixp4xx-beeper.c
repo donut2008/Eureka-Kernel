@@ -1,177 +1,158 @@
-/*
- * Generic IXP4xx beeper driver
+ bitmasks not mentioned in dev->evbit are clean. */
+	input_cleanse_bitmasks(dev);
+
+	packet_size = input_estimate_events_per_packet(dev);
+	if (dev->hint_events_per_packet < packet_size)
+		dev->hint_events_per_packet = packet_size;
+
+	dev->max_vals = dev->hint_events_per_packet + 2;
+	dev->vals = kcalloc(dev->max_vals, sizeof(*dev->vals), GFP_KERNEL);
+	if (!dev->vals) {
+		error = -ENOMEM;
+		goto err_devres_free;
+	}
+
+	/*
+	 * If delay and period are pre-set by the driver, then autorepeating
+	 * is handled by the driver itself and we don't do it in input.c.
+	 */
+	if (!dev->rep[REP_DELAY] && !dev->rep[REP_PERIOD])
+		input_enable_softrepeat(dev, 250, 33);
+
+	if (!dev->getkeycode)
+		dev->getkeycode = input_default_getkeycode;
+
+	if (!dev->setkeycode)
+		dev->setkeycode = input_default_setkeycode;
+
+	error = device_add(&dev->dev);
+	if (error)
+		goto err_free_vals;
+
+	path = kobject_get_path(&dev->dev.kobj, GFP_KERNEL);
+	pr_info("%s as %s\n",
+		dev->name ? dev->name : "Unspecified device",
+		path ? path : "N/A");
+	kfree(path);
+
+	error = mutex_lock_interruptible(&input_mutex);
+	if (error)
+		goto err_device_del;
+
+	list_add_tail(&dev->node, &input_dev_list);
+
+	list_for_each_entry(handler, &input_handler_list, node)
+		input_attach_handler(dev, handler);
+
+	input_wakeup_procfs_readers();
+
+	mutex_unlock(&input_mutex);
+
+	if (dev->devres_managed) {
+		dev_dbg(dev->dev.parent, "%s: registering %s with devres.\n",
+			__func__, dev_name(&dev->dev));
+		devres_add(dev->dev.parent, devres);
+	}
+	return 0;
+
+err_device_del:
+	device_del(&dev->dev);
+err_free_vals:
+	kfree(dev->vals);
+	dev->vals = NULL;
+err_devres_free:
+	devres_free(devres);
+	return error;
+}
+EXPORT_SYMBOL(input_register_device);
+
+/**
+ * input_unregister_device - unregister previously registered device
+ * @dev: device to be unregistered
  *
- * Copyright (C) 2005 Tower Technologies
- *
- * based on nslu2-io.c
- *  Copyright (C) 2004 Karen Spearel
- *
- * Author: Alessandro Zummo <a.zummo@towertech.it>
- * Maintainers: http://www.nslu2-linux.org/
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
+ * This function unregisters an input device. Once device is unregistered
+ * the caller should not try to access it as it may get freed at any moment.
  */
-
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/delay.h>
-#include <linux/platform_device.h>
-#include <linux/interrupt.h>
-#include <linux/gpio.h>
-#include <mach/hardware.h>
-
-MODULE_AUTHOR("Alessandro Zummo <a.zummo@towertech.it>");
-MODULE_DESCRIPTION("ixp4xx beeper driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:ixp4xx-beeper");
-
-static DEFINE_SPINLOCK(beep_lock);
-
-static void ixp4xx_spkr_control(unsigned int pin, unsigned int count)
+void input_unregister_device(struct input_dev *dev)
 {
-	unsigned long flags;
-
-	spin_lock_irqsave(&beep_lock, flags);
-
-	if (count) {
-		gpio_direction_output(pin, 0);
-		*IXP4XX_OSRT2 = (count & ~IXP4XX_OST_RELOAD_MASK) | IXP4XX_OST_ENABLE;
+	if (dev->devres_managed) {
+		WARN_ON(devres_destroy(dev->dev.parent,
+					devm_input_device_unregister,
+					devm_input_device_match,
+					dev));
+		__input_unregister_device(dev);
+		/*
+		 * We do not do input_put_device() here because it will be done
+		 * when 2nd devres fires up.
+		 */
 	} else {
-		gpio_direction_output(pin, 1);
-		gpio_direction_input(pin);
-		*IXP4XX_OSRT2 = 0;
+		__input_unregister_device(dev);
+		input_put_device(dev);
 	}
-
-	spin_unlock_irqrestore(&beep_lock, flags);
 }
+EXPORT_SYMBOL(input_unregister_device);
 
-static int ixp4xx_spkr_event(struct input_dev *dev, unsigned int type, unsigned int code, int value)
+/**
+ * input_register_handler - register a new input handler
+ * @handler: handler to be registered
+ *
+ * This function registers a new input handler (interface) for input
+ * devices in the system and attaches it to all input devices that
+ * are compatible with the handler.
+ */
+int input_register_handler(struct input_handler *handler)
 {
-	unsigned int pin = (unsigned int) input_get_drvdata(dev);
-	unsigned int count = 0;
+	struct input_dev *dev;
+	int error;
 
-	if (type != EV_SND)
-		return -1;
+	error = mutex_lock_interruptible(&input_mutex);
+	if (error)
+		return error;
 
-	switch (code) {
-		case SND_BELL:
-			if (value)
-				value = 1000;
-		case SND_TONE:
-			break;
-		default:
-			return -1;
-	}
+	INIT_LIST_HEAD(&handler->h_list);
 
-	if (value > 20 && value < 32767)
-		count = (ixp4xx_timer_freq / (value * 4)) - 1;
+	list_add_tail(&handler->node, &input_handler_list);
 
-	ixp4xx_spkr_control(pin, count);
+	list_for_each_entry(dev, &input_dev_list, node)
+		input_attach_handler(dev, handler);
 
+	input_wakeup_procfs_readers();
+
+	mutex_unlock(&input_mutex);
 	return 0;
 }
+EXPORT_SYMBOL(input_register_handler);
 
-static irqreturn_t ixp4xx_spkr_interrupt(int irq, void *dev_id)
+/**
+ * input_unregister_handler - unregisters an input handler
+ * @handler: handler to be unregistered
+ *
+ * This function disconnects a handler from its input devices and
+ * removes it from lists of known handlers.
+ */
+void input_unregister_handler(struct input_handler *handler)
 {
-	unsigned int pin = (unsigned int) dev_id;
+	struct input_handle *handle, *next;
 
-	/* clear interrupt */
-	*IXP4XX_OSST = IXP4XX_OSST_TIMER_2_PEND;
+	mutex_lock(&input_mutex);
 
-	/* flip the beeper output */
-	gpio_set_value(pin, !gpio_get_value(pin));
+	list_for_each_entry_safe(handle, next, &handler->h_list, h_node)
+		handler->disconnect(handle);
+	WARN_ON(!list_empty(&handler->h_list));
 
-	return IRQ_HANDLED;
+	list_del_init(&handler->node);
+
+	input_wakeup_procfs_readers();
+
+	mutex_unlock(&input_mutex);
 }
+EXPORT_SYMBOL(input_unregister_handler);
 
-static int ixp4xx_spkr_probe(struct platform_device *dev)
-{
-	struct input_dev *input_dev;
-	int err;
-
-	input_dev = input_allocate_device();
-	if (!input_dev)
-		return -ENOMEM;
-
-	input_set_drvdata(input_dev, (void *) dev->id);
-
-	input_dev->name = "ixp4xx beeper",
-	input_dev->phys = "ixp4xx/gpio";
-	input_dev->id.bustype = BUS_HOST;
-	input_dev->id.vendor  = 0x001f;
-	input_dev->id.product = 0x0001;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &dev->dev;
-
-	input_dev->evbit[0] = BIT_MASK(EV_SND);
-	input_dev->sndbit[0] = BIT_MASK(SND_BELL) | BIT_MASK(SND_TONE);
-	input_dev->event = ixp4xx_spkr_event;
-
-	err = gpio_request(dev->id, "ixp4-beeper");
-	if (err)
-		goto err_free_device;
-
-	err = request_irq(IRQ_IXP4XX_TIMER2, &ixp4xx_spkr_interrupt,
-			  IRQF_NO_SUSPEND, "ixp4xx-beeper",
-			  (void *) dev->id);
-	if (err)
-		goto err_free_gpio;
-
-	err = input_register_device(input_dev);
-	if (err)
-		goto err_free_irq;
-
-	platform_set_drvdata(dev, input_dev);
-
-	return 0;
-
- err_free_irq:
-	free_irq(IRQ_IXP4XX_TIMER2, (void *)dev->id);
- err_free_gpio:
-	gpio_free(dev->id);
- err_free_device:
-	input_free_device(input_dev);
-
-	return err;
-}
-
-static int ixp4xx_spkr_remove(struct platform_device *dev)
-{
-	struct input_dev *input_dev = platform_get_drvdata(dev);
-	unsigned int pin = (unsigned int) input_get_drvdata(input_dev);
-
-	input_unregister_device(input_dev);
-
-	/* turn the speaker off */
-	disable_irq(IRQ_IXP4XX_TIMER2);
-	ixp4xx_spkr_control(pin, 0);
-
-	free_irq(IRQ_IXP4XX_TIMER2, (void *)dev->id);
-	gpio_free(dev->id);
-
-	return 0;
-}
-
-static void ixp4xx_spkr_shutdown(struct platform_device *dev)
-{
-	struct input_dev *input_dev = platform_get_drvdata(dev);
-	unsigned int pin = (unsigned int) input_get_drvdata(input_dev);
-
-	/* turn off the speaker */
-	disable_irq(IRQ_IXP4XX_TIMER2);
-	ixp4xx_spkr_control(pin, 0);
-}
-
-static struct platform_driver ixp4xx_spkr_platform_driver = {
-	.driver		= {
-		.name	= "ixp4xx-beeper",
-	},
-	.probe		= ixp4xx_spkr_probe,
-	.remove		= ixp4xx_spkr_remove,
-	.shutdown	= ixp4xx_spkr_shutdown,
-};
-module_platform_driver(ixp4xx_spkr_platform_driver);
-
+/**
+ * input_handler_for_each_handle - handle iterator
+ * @handler: input handler to iterate
+ * @data: data for the callback
+ * @fn: function to be called for each handle
+ *
+ * Iterate over @bus's list of devices, and call @fn for each, passing
+ * it @data and stop when @fn returns

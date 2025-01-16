@@ -1,627 +1,628 @@
+
 /*
- * Regulator driver for Rockchip RK808
+ * edac_device.c
+ * (C) 2007 www.douglaskthompson.com
  *
- * Copyright (c) 2014, Fuzhou Rockchip Electronics Co., Ltd
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
  *
- * Author: Chris Zhong <zyw@rock-chips.com>
- * Author: Zhang Qing <zhangqing@rock-chips.com>
+ * Written by Doug Thompson <norsk5@xmission.com>
  *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
+ * edac_device API implementation
+ * 19 Jan 2007
  */
 
-#include <linux/delay.h>
-#include <linux/gpio.h>
-#include <linux/i2c.h>
 #include <linux/module.h>
-#include <linux/of_device.h>
-#include <linux/of_gpio.h>
-#include <linux/mfd/rk808.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/gpio/consumer.h>
+#include <linux/types.h>
+#include <linux/smp.h>
+#include <linux/init.h>
+#include <linux/sysctl.h>
+#include <linux/highmem.h>
+#include <linux/timer.h>
+#include <linux/slab.h>
+#include <linux/jiffies.h>
+#include <linux/spinlock.h>
+#include <linux/list.h>
+#include <linux/ctype.h>
+#include <linux/workqueue.h>
+#include <asm/uaccess.h>
+#include <asm/page.h>
 
-/* Field Definitions */
-#define RK808_BUCK_VSEL_MASK	0x3f
-#define RK808_BUCK4_VSEL_MASK	0xf
-#define RK808_LDO_VSEL_MASK	0x1f
+#include "edac_core.h"
+#include "edac_module.h"
 
-/* Ramp rate definitions for buck1 / buck2 only */
-#define RK808_RAMP_RATE_OFFSET		3
-#define RK808_RAMP_RATE_MASK		(3 << RK808_RAMP_RATE_OFFSET)
-#define RK808_RAMP_RATE_2MV_PER_US	(0 << RK808_RAMP_RATE_OFFSET)
-#define RK808_RAMP_RATE_4MV_PER_US	(1 << RK808_RAMP_RATE_OFFSET)
-#define RK808_RAMP_RATE_6MV_PER_US	(2 << RK808_RAMP_RATE_OFFSET)
-#define RK808_RAMP_RATE_10MV_PER_US	(3 << RK808_RAMP_RATE_OFFSET)
+/* lock for the list: 'edac_device_list', manipulation of this list
+ * is protected by the 'device_ctls_mutex' lock
+ */
+static DEFINE_MUTEX(device_ctls_mutex);
+static LIST_HEAD(edac_device_list);
 
-#define RK808_DVS2_POL		BIT(2)
-#define RK808_DVS1_POL		BIT(1)
+/* Default workqueue processing interval on this instance, in msecs */
+#define DEFAULT_POLL_INTERVAL 1000
 
-/* Offset from XXX_ON_VSEL to XXX_SLP_VSEL */
-#define RK808_SLP_REG_OFFSET 1
-
-/* Offset from XXX_ON_VSEL to XXX_DVS_VSEL */
-#define RK808_DVS_REG_OFFSET 2
-
-/* Offset from XXX_EN_REG to SLEEP_SET_OFF_XXX */
-#define RK808_SLP_SET_OFF_REG_OFFSET 2
-
-/* max steps for increase voltage of Buck1/2, equal 100mv*/
-#define MAX_STEPS_ONE_TIME 8
-
-struct rk808_regulator_data {
-	struct gpio_desc *dvs_gpio[2];
-};
-
-static const int rk808_buck_config_regs[] = {
-	RK808_BUCK1_CONFIG_REG,
-	RK808_BUCK2_CONFIG_REG,
-	RK808_BUCK3_CONFIG_REG,
-	RK808_BUCK4_CONFIG_REG,
-};
-
-static const struct regulator_linear_range rk808_buck_voltage_ranges[] = {
-	REGULATOR_LINEAR_RANGE(712500, 0, 63, 12500),
-};
-
-static const struct regulator_linear_range rk808_buck4_voltage_ranges[] = {
-	REGULATOR_LINEAR_RANGE(1800000, 0, 15, 100000),
-};
-
-static const struct regulator_linear_range rk808_ldo_voltage_ranges[] = {
-	REGULATOR_LINEAR_RANGE(1800000, 0, 16, 100000),
-};
-
-static const struct regulator_linear_range rk808_ldo3_voltage_ranges[] = {
-	REGULATOR_LINEAR_RANGE(800000, 0, 13, 100000),
-	REGULATOR_LINEAR_RANGE(2500000, 15, 15, 0),
-};
-
-static const struct regulator_linear_range rk808_ldo6_voltage_ranges[] = {
-	REGULATOR_LINEAR_RANGE(800000, 0, 17, 100000),
-};
-
-static int rk808_buck1_2_get_voltage_sel_regmap(struct regulator_dev *rdev)
+#ifdef CONFIG_EDAC_DEBUG
+static void edac_device_dump_device(struct edac_device_ctl_info *edac_dev)
 {
-	struct rk808_regulator_data *pdata = rdev_get_drvdata(rdev);
-	int id = rdev->desc->id - RK808_ID_DCDC1;
-	struct gpio_desc *gpio = pdata->dvs_gpio[id];
-	unsigned int val;
-	int ret;
-
-	if (!gpio || gpiod_get_value(gpio) == 0)
-		return regulator_get_voltage_sel_regmap(rdev);
-
-	ret = regmap_read(rdev->regmap,
-			  rdev->desc->vsel_reg + RK808_DVS_REG_OFFSET,
-			  &val);
-	if (ret != 0)
-		return ret;
-
-	val &= rdev->desc->vsel_mask;
-	val >>= ffs(rdev->desc->vsel_mask) - 1;
-
-	return val;
+	edac_dbg(3, "\tedac_dev = %p dev_idx=%d\n",
+		 edac_dev, edac_dev->dev_idx);
+	edac_dbg(4, "\tedac_dev->edac_check = %p\n", edac_dev->edac_check);
+	edac_dbg(3, "\tdev = %p\n", edac_dev->dev);
+	edac_dbg(3, "\tmod_name:ctl_name = %s:%s\n",
+		 edac_dev->mod_name, edac_dev->ctl_name);
+	edac_dbg(3, "\tpvt_info = %p\n\n", edac_dev->pvt_info);
 }
+#endif				/* CONFIG_EDAC_DEBUG */
 
-static int rk808_buck1_2_i2c_set_voltage_sel(struct regulator_dev *rdev,
-					     unsigned sel)
+
+/*
+ * edac_device_alloc_ctl_info()
+ *	Allocate a new edac device control info structure
+ *
+ *	The control structure is allocated in complete chunk
+ *	from the OS. It is in turn sub allocated to the
+ *	various objects that compose the structure
+ *
+ *	The structure has a 'nr_instance' array within itself.
+ *	Each instance represents a major component
+ *		Example:  L1 cache and L2 cache are 2 instance components
+ *
+ *	Within each instance is an array of 'nr_blocks' blockoffsets
+ */
+struct edac_device_ctl_info *edac_device_alloc_ctl_info(
+	unsigned sz_private,
+	char *edac_device_name, unsigned nr_instances,
+	char *edac_block_name, unsigned nr_blocks,
+	unsigned offset_value,		/* zero, 1, or other based offset */
+	struct edac_dev_sysfs_block_attribute *attrib_spec, unsigned nr_attrib,
+	int device_index)
 {
-	int ret, delta_sel;
-	unsigned int old_sel, tmp, val, mask = rdev->desc->vsel_mask;
+	struct edac_device_ctl_info *dev_ctl;
+	struct edac_device_instance *dev_inst, *inst;
+	struct edac_device_block *dev_blk, *blk_p, *blk;
+	struct edac_dev_sysfs_block_attribute *dev_attrib, *attrib_p, *attrib;
+	unsigned total_size;
+	unsigned count;
+	unsigned instance, block, attr;
+	void *pvt, *p;
+	int err;
 
-	ret = regmap_read(rdev->regmap, rdev->desc->vsel_reg, &val);
-	if (ret != 0)
-		return ret;
+	edac_dbg(4, "instances=%d blocks=%d\n", nr_instances, nr_blocks);
 
-	tmp = val & ~mask;
-	old_sel = val & mask;
-	old_sel >>= ffs(mask) - 1;
-	delta_sel = sel - old_sel;
+	/* Calculate the size of memory we need to allocate AND
+	 * determine the offsets of the various item arrays
+	 * (instance,block,attrib) from the start of an  allocated structure.
+	 * We want the alignment of each item  (instance,block,attrib)
+	 * to be at least as stringent as what the compiler would
+	 * provide if we could simply hardcode everything into a single struct.
+	 */
+	p = NULL;
+	dev_ctl = edac_align_ptr(&p, sizeof(*dev_ctl), 1);
+
+	/* Calc the 'end' offset past end of ONE ctl_info structure
+	 * which will become the start of the 'instance' array
+	 */
+	dev_inst = edac_align_ptr(&p, sizeof(*dev_inst), nr_instances);
+
+	/* Calc the 'end' offset past the instance array within the ctl_info
+	 * which will become the start of the block array
+	 */
+	count = nr_instances * nr_blocks;
+	dev_blk = edac_align_ptr(&p, sizeof(*dev_blk), count);
+
+	/* Calc the 'end' offset past the dev_blk array
+	 * which will become the start of the attrib array, if any.
+	 */
+	/* calc how many nr_attrib we need */
+	if (nr_attrib > 0)
+		count *= nr_attrib;
+	dev_attrib = edac_align_ptr(&p, sizeof(*dev_attrib), count);
+
+	/* Calc the 'end' offset past the attributes array */
+	pvt = edac_align_ptr(&p, sz_private, 1);
+
+	/* 'pvt' now points to where the private data area is.
+	 * At this point 'pvt' (like dev_inst,dev_blk and dev_attrib)
+	 * is baselined at ZERO
+	 */
+	total_size = ((unsigned long)pvt) + sz_private;
+
+	/* Allocate the amount of memory for the set of control structures */
+	dev_ctl = kzalloc(total_size, GFP_KERNEL);
+	if (dev_ctl == NULL)
+		return NULL;
+
+	/* Adjust pointers so they point within the actual memory we
+	 * just allocated rather than an imaginary chunk of memory
+	 * located at address 0.
+	 * 'dev_ctl' points to REAL memory, while the others are
+	 * ZERO based and thus need to be adjusted to point within
+	 * the allocated memory.
+	 */
+	dev_inst = (struct edac_device_instance *)
+		(((char *)dev_ctl) + ((unsigned long)dev_inst));
+	dev_blk = (struct edac_device_block *)
+		(((char *)dev_ctl) + ((unsigned long)dev_blk));
+	dev_attrib = (struct edac_dev_sysfs_block_attribute *)
+		(((char *)dev_ctl) + ((unsigned long)dev_attrib));
+	pvt = sz_private ? (((char *)dev_ctl) + ((unsigned long)pvt)) : NULL;
+
+	/* Begin storing the information into the control info structure */
+	dev_ctl->dev_idx = device_index;
+	dev_ctl->nr_instances = nr_instances;
+	dev_ctl->instances = dev_inst;
+	dev_ctl->pvt_info = pvt;
+
+	/* Default logging of CEs and UEs */
+	dev_ctl->log_ce = 1;
+	dev_ctl->log_ue = 1;
+
+	/* Name of this edac device */
+	snprintf(dev_ctl->name,sizeof(dev_ctl->name),"%s",edac_device_name);
+
+	edac_dbg(4, "edac_dev=%p next after end=%p\n",
+		 dev_ctl, pvt + sz_private);
+
+	/* Initialize every Instance */
+	for (instance = 0; instance < nr_instances; instance++) {
+		inst = &dev_inst[instance];
+		inst->ctl = dev_ctl;
+		inst->nr_blocks = nr_blocks;
+		blk_p = &dev_blk[instance * nr_blocks];
+		inst->blocks = blk_p;
+
+		/* name of this instance */
+		snprintf(inst->name, sizeof(inst->name),
+			 "%s%u", edac_device_name, instance);
+
+		/* Initialize every block in each instance */
+		for (block = 0; block < nr_blocks; block++) {
+			blk = &blk_p[block];
+			blk->instance = inst;
+			snprintf(blk->name, sizeof(blk->name),
+				 "%s%d", edac_block_name, block+offset_value);
+
+			edac_dbg(4, "instance=%d inst_p=%p block=#%d block_p=%p name='%s'\n",
+				 instance, inst, block, blk, blk->name);
+
+			/* if there are NO attributes OR no attribute pointer
+			 * then continue on to next block iteration
+			 */
+			if ((nr_attrib == 0) || (attrib_spec == NULL))
+				continue;
+
+			/* setup the attribute array for this block */
+			blk->nr_attribs = nr_attrib;
+			attrib_p = &dev_attrib[block*nr_instances*nr_attrib];
+			blk->block_attributes = attrib_p;
+
+			edac_dbg(4, "THIS BLOCK_ATTRIB=%p\n",
+				 blk->block_attributes);
+
+			/* Initialize every user specified attribute in this
+			 * block with the data the caller passed in
+			 * Each block gets its own copy of pointers,
+			 * and its unique 'value'
+			 */
+			for (attr = 0; attr < nr_attrib; attr++) {
+				attrib = &attrib_p[attr];
+
+				/* populate the unique per attrib
+				 * with the code pointers and info
+				 */
+				attrib->attr = attrib_spec[attr].attr;
+				attrib->show = attrib_spec[attr].show;
+				attrib->store = attrib_spec[attr].store;
+
+				attrib->block = blk;	/* up link */
+
+				edac_dbg(4, "alloc-attrib=%p attrib_name='%s' attrib-spec=%p spec-name=%s\n",
+					 attrib, attrib->attr.name,
+					 &attrib_spec[attr],
+					 attrib_spec[attr].attr.name
+					);
+			}
+		}
+	}
+
+	/* Mark this instance as merely ALLOCATED */
+	dev_ctl->op_state = OP_ALLOC;
 
 	/*
-	 * If directly modify the register to change the voltage, we will face
-	 * the risk of overshoot. Put it into a multi-step, can effectively
-	 * avoid this problem, a step is 100mv here.
+	 * Initialize the 'root' kobj for the edac_device controller
 	 */
-	while (delta_sel > MAX_STEPS_ONE_TIME) {
-		old_sel += MAX_STEPS_ONE_TIME;
-		val = old_sel << (ffs(mask) - 1);
-		val |= tmp;
-
-		/*
-		 * i2c is 400kHz (2.5us per bit) and we must transmit _at least_
-		 * 3 bytes (24 bits) plus start and stop so 26 bits.  So we've
-		 * got more than 65 us between each voltage change and thus
-		 * won't ramp faster than ~1500 uV / us.
-		 */
-		ret = regmap_write(rdev->regmap, rdev->desc->vsel_reg, val);
-		delta_sel = sel - old_sel;
+	err = edac_device_register_sysfs_main_kobj(dev_ctl);
+	if (err) {
+		kfree(dev_ctl);
+		return NULL;
 	}
 
-	sel <<= ffs(mask) - 1;
-	val = tmp | sel;
-	ret = regmap_write(rdev->regmap, rdev->desc->vsel_reg, val);
-
-	/*
-	 * When we change the voltage register directly, the ramp rate is about
-	 * 100000uv/us, wait 1us to make sure the target voltage to be stable,
-	 * so we needn't wait extra time after that.
+	/* at this point, the root kobj is valid, and in order to
+	 * 'free' the object, then the function:
+	 *	edac_device_unregister_sysfs_main_kobj() must be called
+	 * which will perform kobj unregistration and the actual free
+	 * will occur during the kobject callback operation
 	 */
-	udelay(1);
 
-	return ret;
+	return dev_ctl;
 }
+EXPORT_SYMBOL_GPL(edac_device_alloc_ctl_info);
 
-static int rk808_buck1_2_set_voltage_sel(struct regulator_dev *rdev,
-					 unsigned sel)
+/*
+ * edac_device_free_ctl_info()
+ *	frees the memory allocated by the edac_device_alloc_ctl_info()
+ *	function
+ */
+void edac_device_free_ctl_info(struct edac_device_ctl_info *ctl_info)
 {
-	struct rk808_regulator_data *pdata = rdev_get_drvdata(rdev);
-	int id = rdev->desc->id - RK808_ID_DCDC1;
-	struct gpio_desc *gpio = pdata->dvs_gpio[id];
-	unsigned int reg = rdev->desc->vsel_reg;
-	unsigned old_sel;
-	int ret, gpio_level;
+	edac_device_unregister_sysfs_main_kobj(ctl_info);
+}
+EXPORT_SYMBOL_GPL(edac_device_free_ctl_info);
 
-	if (!gpio)
-		return rk808_buck1_2_i2c_set_voltage_sel(rdev, sel);
+/*
+ * find_edac_device_by_dev
+ *	scans the edac_device list for a specific 'struct device *'
+ *
+ *	lock to be held prior to call:	device_ctls_mutex
+ *
+ *	Return:
+ *		pointer to control structure managing 'dev'
+ *		NULL if not found on list
+ */
+static struct edac_device_ctl_info *find_edac_device_by_dev(struct device *dev)
+{
+	struct edac_device_ctl_info *edac_dev;
+	struct list_head *item;
 
-	gpio_level = gpiod_get_value(gpio);
-	if (gpio_level == 0) {
-		reg += RK808_DVS_REG_OFFSET;
-		ret = regmap_read(rdev->regmap, rdev->desc->vsel_reg, &old_sel);
-	} else {
-		ret = regmap_read(rdev->regmap,
-				  reg + RK808_DVS_REG_OFFSET,
-				  &old_sel);
+	edac_dbg(0, "\n");
+
+	list_for_each(item, &edac_device_list) {
+		edac_dev = list_entry(item, struct edac_device_ctl_info, link);
+
+		if (edac_dev->dev == dev)
+			return edac_dev;
 	}
 
-	if (ret != 0)
-		return ret;
-
-	sel <<= ffs(rdev->desc->vsel_mask) - 1;
-	sel |= old_sel & ~rdev->desc->vsel_mask;
-
-	ret = regmap_write(rdev->regmap, reg, sel);
-	if (ret)
-		return ret;
-
-	gpiod_set_value(gpio, !gpio_level);
-
-	return ret;
+	return NULL;
 }
 
-static int rk808_buck1_2_set_voltage_time_sel(struct regulator_dev *rdev,
-				       unsigned int old_selector,
-				       unsigned int new_selector)
+/*
+ * add_edac_dev_to_global_list
+ *	Before calling this function, caller must
+ *	assign a unique value to edac_dev->dev_idx.
+ *
+ *	lock to be held prior to call:	device_ctls_mutex
+ *
+ *	Return:
+ *		0 on success
+ *		1 on failure.
+ */
+static int add_edac_dev_to_global_list(struct edac_device_ctl_info *edac_dev)
 {
-	struct rk808_regulator_data *pdata = rdev_get_drvdata(rdev);
-	int id = rdev->desc->id - RK808_ID_DCDC1;
-	struct gpio_desc *gpio = pdata->dvs_gpio[id];
+	struct list_head *item, *insert_before;
+	struct edac_device_ctl_info *rover;
 
-	/* if there is no dvs1/2 pin, we don't need wait extra time here. */
-	if (!gpio)
-		return 0;
+	insert_before = &edac_device_list;
 
-	return regulator_set_voltage_time_sel(rdev, old_selector, new_selector);
-}
+	/* Determine if already on the list */
+	rover = find_edac_device_by_dev(edac_dev->dev);
+	if (unlikely(rover != NULL))
+		goto fail0;
 
-static int rk808_set_ramp_delay(struct regulator_dev *rdev, int ramp_delay)
-{
-	unsigned int ramp_value = RK808_RAMP_RATE_10MV_PER_US;
-	unsigned int reg = rk808_buck_config_regs[rdev->desc->id -
-						  RK808_ID_DCDC1];
+	/* Insert in ascending order by 'dev_idx', so find position */
+	list_for_each(item, &edac_device_list) {
+		rover = list_entry(item, struct edac_device_ctl_info, link);
 
-	switch (ramp_delay) {
-	case 1 ... 2000:
-		ramp_value = RK808_RAMP_RATE_2MV_PER_US;
-		break;
-	case 2001 ... 4000:
-		ramp_value = RK808_RAMP_RATE_4MV_PER_US;
-		break;
-	case 4001 ... 6000:
-		ramp_value = RK808_RAMP_RATE_6MV_PER_US;
-		break;
-	case 6001 ... 10000:
-		break;
-	default:
-		pr_warn("%s ramp_delay: %d not supported, setting 10000\n",
-			rdev->desc->name, ramp_delay);
-	}
+		if (rover->dev_idx >= edac_dev->dev_idx) {
+			if (unlikely(rover->dev_idx == edac_dev->dev_idx))
+				goto fail1;
 
-	return regmap_update_bits(rdev->regmap, reg,
-				  RK808_RAMP_RATE_MASK, ramp_value);
-}
-
-static int rk808_set_suspend_voltage(struct regulator_dev *rdev, int uv)
-{
-	unsigned int reg;
-	int sel = regulator_map_voltage_linear_range(rdev, uv, uv);
-
-	if (sel < 0)
-		return -EINVAL;
-
-	reg = rdev->desc->vsel_reg + RK808_SLP_REG_OFFSET;
-
-	return regmap_update_bits(rdev->regmap, reg,
-				  rdev->desc->vsel_mask,
-				  sel);
-}
-
-static int rk808_set_suspend_enable(struct regulator_dev *rdev)
-{
-	unsigned int reg;
-
-	reg = rdev->desc->enable_reg + RK808_SLP_SET_OFF_REG_OFFSET;
-
-	return regmap_update_bits(rdev->regmap, reg,
-				  rdev->desc->enable_mask,
-				  0);
-}
-
-static int rk808_set_suspend_disable(struct regulator_dev *rdev)
-{
-	unsigned int reg;
-
-	reg = rdev->desc->enable_reg + RK808_SLP_SET_OFF_REG_OFFSET;
-
-	return regmap_update_bits(rdev->regmap, reg,
-				  rdev->desc->enable_mask,
-				  rdev->desc->enable_mask);
-}
-
-static struct regulator_ops rk808_buck1_2_ops = {
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.map_voltage		= regulator_map_voltage_linear_range,
-	.get_voltage_sel	= rk808_buck1_2_get_voltage_sel_regmap,
-	.set_voltage_sel	= rk808_buck1_2_set_voltage_sel,
-	.set_voltage_time_sel	= rk808_buck1_2_set_voltage_time_sel,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-	.set_ramp_delay		= rk808_set_ramp_delay,
-	.set_suspend_voltage	= rk808_set_suspend_voltage,
-	.set_suspend_enable	= rk808_set_suspend_enable,
-	.set_suspend_disable	= rk808_set_suspend_disable,
-};
-
-static struct regulator_ops rk808_reg_ops = {
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.map_voltage		= regulator_map_voltage_linear_range,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-	.set_suspend_voltage	= rk808_set_suspend_voltage,
-	.set_suspend_enable	= rk808_set_suspend_enable,
-	.set_suspend_disable	= rk808_set_suspend_disable,
-};
-
-static struct regulator_ops rk808_switch_ops = {
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-	.set_suspend_enable	= rk808_set_suspend_enable,
-	.set_suspend_disable	= rk808_set_suspend_disable,
-};
-
-static const struct regulator_desc rk808_reg[] = {
-	{
-		.name = "DCDC_REG1",
-		.supply_name = "vcc1",
-		.id = RK808_ID_DCDC1,
-		.ops = &rk808_buck1_2_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 64,
-		.linear_ranges = rk808_buck_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_buck_voltage_ranges),
-		.vsel_reg = RK808_BUCK1_ON_VSEL_REG,
-		.vsel_mask = RK808_BUCK_VSEL_MASK,
-		.enable_reg = RK808_DCDC_EN_REG,
-		.enable_mask = BIT(0),
-		.owner = THIS_MODULE,
-	}, {
-		.name = "DCDC_REG2",
-		.supply_name = "vcc2",
-		.id = RK808_ID_DCDC2,
-		.ops = &rk808_buck1_2_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 64,
-		.linear_ranges = rk808_buck_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_buck_voltage_ranges),
-		.vsel_reg = RK808_BUCK2_ON_VSEL_REG,
-		.vsel_mask = RK808_BUCK_VSEL_MASK,
-		.enable_reg = RK808_DCDC_EN_REG,
-		.enable_mask = BIT(1),
-		.owner = THIS_MODULE,
-	}, {
-		.name = "DCDC_REG3",
-		.supply_name = "vcc3",
-		.id = RK808_ID_DCDC3,
-		.ops = &rk808_switch_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 1,
-		.enable_reg = RK808_DCDC_EN_REG,
-		.enable_mask = BIT(2),
-		.owner = THIS_MODULE,
-	}, {
-		.name = "DCDC_REG4",
-		.supply_name = "vcc4",
-		.id = RK808_ID_DCDC4,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 16,
-		.linear_ranges = rk808_buck4_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_buck4_voltage_ranges),
-		.vsel_reg = RK808_BUCK4_ON_VSEL_REG,
-		.vsel_mask = RK808_BUCK4_VSEL_MASK,
-		.enable_reg = RK808_DCDC_EN_REG,
-		.enable_mask = BIT(3),
-		.owner = THIS_MODULE,
-	}, {
-		.name = "LDO_REG1",
-		.supply_name = "vcc6",
-		.id = RK808_ID_LDO1,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 17,
-		.linear_ranges = rk808_ldo_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_ldo_voltage_ranges),
-		.vsel_reg = RK808_LDO1_ON_VSEL_REG,
-		.vsel_mask = RK808_LDO_VSEL_MASK,
-		.enable_reg = RK808_LDO_EN_REG,
-		.enable_mask = BIT(0),
-		.enable_time = 400,
-		.owner = THIS_MODULE,
-	}, {
-		.name = "LDO_REG2",
-		.supply_name = "vcc6",
-		.id = RK808_ID_LDO2,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 17,
-		.linear_ranges = rk808_ldo_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_ldo_voltage_ranges),
-		.vsel_reg = RK808_LDO2_ON_VSEL_REG,
-		.vsel_mask = RK808_LDO_VSEL_MASK,
-		.enable_reg = RK808_LDO_EN_REG,
-		.enable_mask = BIT(1),
-		.enable_time = 400,
-		.owner = THIS_MODULE,
-	}, {
-		.name = "LDO_REG3",
-		.supply_name = "vcc7",
-		.id = RK808_ID_LDO3,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 16,
-		.linear_ranges = rk808_ldo3_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_ldo3_voltage_ranges),
-		.vsel_reg = RK808_LDO3_ON_VSEL_REG,
-		.vsel_mask = RK808_BUCK4_VSEL_MASK,
-		.enable_reg = RK808_LDO_EN_REG,
-		.enable_mask = BIT(2),
-		.enable_time = 400,
-		.owner = THIS_MODULE,
-	}, {
-		.name = "LDO_REG4",
-		.supply_name = "vcc9",
-		.id = RK808_ID_LDO4,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 17,
-		.linear_ranges = rk808_ldo_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_ldo_voltage_ranges),
-		.vsel_reg = RK808_LDO4_ON_VSEL_REG,
-		.vsel_mask = RK808_LDO_VSEL_MASK,
-		.enable_reg = RK808_LDO_EN_REG,
-		.enable_mask = BIT(3),
-		.enable_time = 400,
-		.owner = THIS_MODULE,
-	}, {
-		.name = "LDO_REG5",
-		.supply_name = "vcc9",
-		.id = RK808_ID_LDO5,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 17,
-		.linear_ranges = rk808_ldo_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_ldo_voltage_ranges),
-		.vsel_reg = RK808_LDO5_ON_VSEL_REG,
-		.vsel_mask = RK808_LDO_VSEL_MASK,
-		.enable_reg = RK808_LDO_EN_REG,
-		.enable_mask = BIT(4),
-		.enable_time = 400,
-		.owner = THIS_MODULE,
-	}, {
-		.name = "LDO_REG6",
-		.supply_name = "vcc10",
-		.id = RK808_ID_LDO6,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 18,
-		.linear_ranges = rk808_ldo6_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_ldo6_voltage_ranges),
-		.vsel_reg = RK808_LDO6_ON_VSEL_REG,
-		.vsel_mask = RK808_LDO_VSEL_MASK,
-		.enable_reg = RK808_LDO_EN_REG,
-		.enable_mask = BIT(5),
-		.enable_time = 400,
-		.owner = THIS_MODULE,
-	}, {
-		.name = "LDO_REG7",
-		.supply_name = "vcc7",
-		.id = RK808_ID_LDO7,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 18,
-		.linear_ranges = rk808_ldo6_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_ldo6_voltage_ranges),
-		.vsel_reg = RK808_LDO7_ON_VSEL_REG,
-		.vsel_mask = RK808_LDO_VSEL_MASK,
-		.enable_reg = RK808_LDO_EN_REG,
-		.enable_mask = BIT(6),
-		.enable_time = 400,
-		.owner = THIS_MODULE,
-	}, {
-		.name = "LDO_REG8",
-		.supply_name = "vcc11",
-		.id = RK808_ID_LDO8,
-		.ops = &rk808_reg_ops,
-		.type = REGULATOR_VOLTAGE,
-		.n_voltages = 17,
-		.linear_ranges = rk808_ldo_voltage_ranges,
-		.n_linear_ranges = ARRAY_SIZE(rk808_ldo_voltage_ranges),
-		.vsel_reg = RK808_LDO8_ON_VSEL_REG,
-		.vsel_mask = RK808_LDO_VSEL_MASK,
-		.enable_reg = RK808_LDO_EN_REG,
-		.enable_mask = BIT(7),
-		.enable_time = 400,
-		.owner = THIS_MODULE,
-	}, {
-		.name = "SWITCH_REG1",
-		.supply_name = "vcc8",
-		.id = RK808_ID_SWITCH1,
-		.ops = &rk808_switch_ops,
-		.type = REGULATOR_VOLTAGE,
-		.enable_reg = RK808_DCDC_EN_REG,
-		.enable_mask = BIT(5),
-		.owner = THIS_MODULE,
-	}, {
-		.name = "SWITCH_REG2",
-		.supply_name = "vcc12",
-		.id = RK808_ID_SWITCH2,
-		.ops = &rk808_switch_ops,
-		.type = REGULATOR_VOLTAGE,
-		.enable_reg = RK808_DCDC_EN_REG,
-		.enable_mask = BIT(6),
-		.owner = THIS_MODULE,
-	},
-};
-
-static struct of_regulator_match rk808_reg_matches[] = {
-	[RK808_ID_DCDC1]	= { .name = "DCDC_REG1" },
-	[RK808_ID_DCDC2]	= { .name = "DCDC_REG2" },
-	[RK808_ID_DCDC3]	= { .name = "DCDC_REG3" },
-	[RK808_ID_DCDC4]	= { .name = "DCDC_REG4" },
-	[RK808_ID_LDO1]		= { .name = "LDO_REG1" },
-	[RK808_ID_LDO2]		= { .name = "LDO_REG2" },
-	[RK808_ID_LDO3]		= { .name = "LDO_REG3" },
-	[RK808_ID_LDO4]		= { .name = "LDO_REG4" },
-	[RK808_ID_LDO5]		= { .name = "LDO_REG5" },
-	[RK808_ID_LDO6]		= { .name = "LDO_REG6" },
-	[RK808_ID_LDO7]		= { .name = "LDO_REG7" },
-	[RK808_ID_LDO8]		= { .name = "LDO_REG8" },
-	[RK808_ID_SWITCH1]	= { .name = "SWITCH_REG1" },
-	[RK808_ID_SWITCH2]	= { .name = "SWITCH_REG2" },
-};
-
-static int rk808_regulator_dt_parse_pdata(struct device *dev,
-				   struct device *client_dev,
-				   struct regmap *map,
-				   struct rk808_regulator_data *pdata)
-{
-	struct device_node *np;
-	int tmp, ret, i;
-
-	np = of_get_child_by_name(client_dev->of_node, "regulators");
-	if (!np)
-		return -ENXIO;
-
-	ret = of_regulator_match(dev, np, rk808_reg_matches,
-				 RK808_NUM_REGULATORS);
-	if (ret < 0)
-		goto dt_parse_end;
-
-	for (i = 0; i < ARRAY_SIZE(pdata->dvs_gpio); i++) {
-		pdata->dvs_gpio[i] =
-			devm_gpiod_get_index_optional(client_dev, "dvs", i,
-						      GPIOD_OUT_LOW);
-		if (IS_ERR(pdata->dvs_gpio[i])) {
-			ret = PTR_ERR(pdata->dvs_gpio[i]);
-			dev_err(dev, "failed to get dvs%d gpio (%d)\n", i, ret);
-			goto dt_parse_end;
-		}
-
-		if (!pdata->dvs_gpio[i]) {
-			dev_info(dev, "there is no dvs%d gpio\n", i);
-			continue;
-		}
-
-		tmp = i ? RK808_DVS2_POL : RK808_DVS1_POL;
-		ret = regmap_update_bits(map, RK808_IO_POL_REG, tmp,
-				gpiod_is_active_low(pdata->dvs_gpio[i]) ?
-				0 : tmp);
-	}
-
-dt_parse_end:
-	of_node_put(np);
-	return ret;
-}
-
-static int rk808_regulator_probe(struct platform_device *pdev)
-{
-	struct rk808 *rk808 = dev_get_drvdata(pdev->dev.parent);
-	struct i2c_client *client = rk808->i2c;
-	struct regulator_config config = {};
-	struct regulator_dev *rk808_rdev;
-	struct rk808_regulator_data *pdata;
-	int ret, i;
-
-	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata)
-		return -ENOMEM;
-
-	ret = rk808_regulator_dt_parse_pdata(&pdev->dev, &client->dev,
-					     rk808->regmap, pdata);
-	if (ret < 0)
-		return ret;
-
-	platform_set_drvdata(pdev, pdata);
-
-	/* Instantiate the regulators */
-	for (i = 0; i < RK808_NUM_REGULATORS; i++) {
-		if (!rk808_reg_matches[i].init_data ||
-		    !rk808_reg_matches[i].of_node)
-			continue;
-
-		config.dev = &client->dev;
-		config.driver_data = pdata;
-		config.regmap = rk808->regmap;
-		config.of_node = rk808_reg_matches[i].of_node;
-		config.init_data = rk808_reg_matches[i].init_data;
-
-		rk808_rdev = devm_regulator_register(&pdev->dev,
-						     &rk808_reg[i], &config);
-		if (IS_ERR(rk808_rdev)) {
-			dev_err(&client->dev,
-				"failed to register %d regulator\n", i);
-			return PTR_ERR(rk808_rdev);
+			insert_before = item;
+			break;
 		}
 	}
 
+	list_add_tail_rcu(&edac_dev->link, insert_before);
 	return 0;
+
+fail0:
+	edac_printk(KERN_WARNING, EDAC_MC,
+			"%s (%s) %s %s already assigned %d\n",
+			dev_name(rover->dev), edac_dev_name(rover),
+			rover->mod_name, rover->ctl_name, rover->dev_idx);
+	return 1;
+
+fail1:
+	edac_printk(KERN_WARNING, EDAC_MC,
+			"bug in low-level driver: attempt to assign\n"
+			"    duplicate dev_idx %d in %s()\n", rover->dev_idx,
+			__func__);
+	return 1;
 }
 
-static struct platform_driver rk808_regulator_driver = {
-	.probe = rk808_regulator_probe,
-	.driver = {
-		.name = "rk808-regulator",
-		.owner = THIS_MODULE,
-	},
-};
+/*
+ * del_edac_device_from_global_list
+ */
+static void del_edac_device_from_global_list(struct edac_device_ctl_info
+						*edac_device)
+{
+	list_del_rcu(&edac_device->link);
 
-module_platform_driver(rk808_regulator_driver);
+	/* these are for safe removal of devices from global list while
+	 * NMI handlers may be traversing list
+	 */
+	synchronize_rcu();
+	INIT_LIST_HEAD(&edac_device->link);
+}
 
-MODULE_DESCRIPTION("regulator driver for the rk808 series PMICs");
-MODULE_AUTHOR("Chris Zhong<zyw@rock-chips.com>");
-MODULE_AUTHOR("Zhang Qing<zhangqing@rock-chips.com>");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:rk808-regulator");
+/*
+ * edac_device_workq_function
+ *	performs the operation scheduled by a workq request
+ *
+ *	this workq is embedded within an edac_device_ctl_info
+ *	structure, that needs to be polled for possible error events.
+ *
+ *	This operation is to acquire the list mutex lock
+ *	(thus preventing insertation or deletion)
+ *	and then call the device's poll function IFF this device is
+ *	running polled and there is a poll function defined.
+ */
+static void edac_device_workq_function(struct work_struct *work_req)
+{
+	struct delayed_work *d_work = to_delayed_work(work_req);
+	struct edac_device_ctl_info *edac_dev = to_edac_device_ctl_work(d_work);
+
+	mutex_lock(&device_ctls_mutex);
+
+	/* If we are being removed, bail out immediately */
+	if (edac_dev->op_state == OP_OFFLINE) {
+		mutex_unlock(&device_ctls_mutex);
+		return;
+	}
+
+	/* Only poll controllers that are running polled and have a check */
+	if ((edac_dev->op_state == OP_RUNNING_POLL) &&
+		(edac_dev->edac_check != NULL)) {
+			edac_dev->edac_check(edac_dev);
+	}
+
+	mutex_unlock(&device_ctls_mutex);
+
+	/* Reschedule the workq for the next time period to start again
+	 * if the number of msec is for 1 sec, then adjust to the next
+	 * whole one second to save timers firing all over the period
+	 * between integral seconds
+	 */
+	if (edac_dev->poll_msec == DEFAULT_POLL_INTERVAL)
+		queue_delayed_work(edac_workqueue, &edac_dev->work,
+				round_jiffies_relative(edac_dev->delay));
+	else
+		queue_delayed_work(edac_workqueue, &edac_dev->work,
+				edac_dev->delay);
+}
+
+/*
+ * edac_device_workq_setup
+ *	initialize a workq item for this edac_device instance
+ *	passing in the new delay period in msec
+ */
+void edac_device_workq_setup(struct edac_device_ctl_info *edac_dev,
+				unsigned msec)
+{
+	edac_dbg(0, "\n");
+
+	/* take the arg 'msec' and set it into the control structure
+	 * to used in the time period calculation
+	 * then calc the number of jiffies that represents
+	 */
+	edac_dev->poll_msec = msec;
+	edac_dev->delay = msecs_to_jiffies(msec);
+
+	INIT_DELAYED_WORK(&edac_dev->work, edac_device_workq_function);
+
+	/* optimize here for the 1 second case, which will be normal value, to
+	 * fire ON the 1 second time event. This helps reduce all sorts of
+	 * timers firing on sub-second basis, while they are happy
+	 * to fire together on the 1 second exactly
+	 */
+	if (edac_dev->poll_msec == DEFAULT_POLL_INTERVAL)
+		queue_delayed_work(edac_workqueue, &edac_dev->work,
+				round_jiffies_relative(edac_dev->delay));
+	else
+		queue_delayed_work(edac_workqueue, &edac_dev->work,
+				edac_dev->delay);
+}
+
+/*
+ * edac_device_workq_teardown
+ *	stop the workq processing on this edac_dev
+ */
+void edac_device_workq_teardown(struct edac_device_ctl_info *edac_dev)
+{
+	if (!edac_dev->edac_check)
+		return;
+
+	edac_dev->op_state = OP_OFFLINE;
+
+	cancel_delayed_work_sync(&edac_dev->work);
+	flush_workqueue(edac_workqueue);
+}
+
+/*
+ * edac_device_reset_delay_period
+ *
+ *	need to stop any outstanding workq queued up at this time
+ *	because we will be resetting the sleep time.
+ *	Then restart the workq on the new delay
+ */
+void edac_device_reset_delay_period(struct edac_device_ctl_info *edac_dev,
+					unsigned long value)
+{
+	/* cancel the current workq request, without the mutex lock */
+	edac_device_workq_teardown(edac_dev);
+
+	/* acquire the mutex before doing the workq setup */
+	mutex_lock(&device_ctls_mutex);
+
+	/* restart the workq request, with new delay value */
+	edac_device_workq_setup(edac_dev, value);
+
+	mutex_unlock(&device_ctls_mutex);
+}
+
+/*
+ * edac_device_alloc_index: Allocate a unique device index number
+ *
+ * Return:
+ *	allocated index number
+ */
+int edac_device_alloc_index(void)
+{
+	static atomic_t device_indexes = ATOMIC_INIT(0);
+
+	return atomic_inc_return(&device_indexes) - 1;
+}
+EXPORT_SYMBOL_GPL(edac_device_alloc_index);
+
+/**
+ * edac_device_add_device: Insert the 'edac_dev' structure into the
+ * edac_device global list and create sysfs entries associated with
+ * edac_device structure.
+ * @edac_device: pointer to the edac_device structure to be added to the list
+ * 'edac_device' structure.
+ *
+ * Return:
+ *	0	Success
+ *	!0	Failure
+ */
+int edac_device_add_device(struct edac_device_ctl_info *edac_dev)
+{
+	edac_dbg(0, "\n");
+
+#ifdef CONFIG_EDAC_DEBUG
+	if (edac_debug_level >= 3)
+		edac_device_dump_device(edac_dev);
+#endif
+	mutex_lock(&device_ctls_mutex);
+
+	if (add_edac_dev_to_global_list(edac_dev))
+		goto fail0;
+
+	/* set load time so that error rate can be tracked */
+	edac_dev->start_time = jiffies;
+
+	/* create this instance's sysfs entries */
+	if (edac_device_create_sysfs(edac_dev)) {
+		edac_device_printk(edac_dev, KERN_WARNING,
+					"failed to create sysfs device\n");
+		goto fail1;
+	}
+
+	/* If there IS a check routine, then we are running POLLED */
+	if (edac_dev->edac_check != NULL) {
+		/* This instance is NOW RUNNING */
+		edac_dev->op_state = OP_RUNNING_POLL;
+
+		edac_device_workq_setup(edac_dev, edac_dev->poll_msec ?: DEFAULT_POLL_INTERVAL);
+	} else {
+		edac_dev->op_state = OP_RUNNING_INTERRUPT;
+	}
+
+	/* Report action taken */
+	edac_device_printk(edac_dev, KERN_INFO,
+		"Giving out device to module %s controller %s: DEV %s (%s)\n",
+		edac_dev->mod_name, edac_dev->ctl_name, edac_dev->dev_name,
+		edac_op_state_to_string(edac_dev->op_state));
+
+	mutex_unlock(&device_ctls_mutex);
+	return 0;
+
+fail1:
+	/* Some error, so remove the entry from the lsit */
+	del_edac_device_from_global_list(edac_dev);
+
+fail0:
+	mutex_unlock(&device_ctls_mutex);
+	return 1;
+}
+EXPORT_SYMBOL_GPL(edac_device_add_device);
+
+/**
+ * edac_device_del_device:
+ *	Remove sysfs entries for specified edac_device structure and
+ *	then remove edac_device structure from global list
+ *
+ * @dev:
+ *	Pointer to 'struct device' representing edac_device
+ *	structure to remove.
+ *
+ * Return:
+ *	Pointer to removed edac_device structure,
+ *	OR NULL if device not found.
+ */
+struct edac_device_ctl_info *edac_device_del_device(struct device *dev)
+{
+	struct edac_device_ctl_info *edac_dev;
+
+	edac_dbg(0, "\n");
+
+	mutex_lock(&device_ctls_mutex);
+
+	/* Find the structure on the list, if not there, then leave */
+	edac_dev = find_edac_device_by_dev(dev);
+	if (edac_dev == NULL) {
+		mutex_unlock(&device_ctls_mutex);
+		return NULL;
+	}
+
+	/* mark this instance as OFFLINE */
+	edac_dev->op_state = OP_OFFLINE;
+
+	/* deregister from global list */
+	del_edac_device_from_global_list(edac_dev);
+
+	mutex_unlock(&device_ctls_mutex);
+
+	/* clear workq processing on this instance */
+	edac_device_workq_teardown(edac_dev);
+
+	/* Tear down the sysfs entries for this instance */
+	edac_device_remove_sysfs(edac_dev);
+
+	edac_printk(KERN_INFO, EDAC_MC,
+		"Removed device %d for %s %s: DEV %s\n",
+		edac_dev->dev_idx,
+		edac_dev->mod_name, edac_dev->ctl_name, edac_dev_name(edac_dev));
+
+	return edac_dev;
+}
+EXPORT_SYMBOL_GPL(edac_device_del_device);
+
+static inline int edac_device_get_log_ce(struct edac_device_ctl_info *edac_dev)
+{
+	return edac_dev->log_ce;
+}
+
+static inline int edac_device_get_log_ue(struct edac_device_ctl_info *edac_dev)
+{
+	return edac_dev->log_ue;
+}
+
+static inline int edac_device_get_panic_on_ue(struct edac_device_ctl_info
+					*edac_dev)
+{
+	return edac_dev->panic_on_ue;
+}
+
+/*
+ * edac_device_handle_ce
+ *	perform a common output and handling of an 'edac_dev' CE event
+ */
+void edac_device_handle_ce(struct edac_device_ctl_info *edac_dev,
+			int inst_nr, int block_nr, const char *msg)
+{
+	struct edac_device_instance *instance;
+	struct edac_device_block *block = NULL;
+
+	if ((inst_nr >= edac_dev->nr_instances) || (inst_nr < 0)) {
+		edac_device_printk(edac_dev, KERN_ERR,
+				"INTERNAL ERROR: 'instance' out

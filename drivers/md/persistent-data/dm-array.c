@@ -1,821 +1,371 @@
-/*
- * Copyright (C) 2012 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-
-#include "dm-array.h"
-#include "dm-space-map.h"
-#include "dm-transaction-manager.h"
-
-#include <linux/export.h>
-#include <linux/device-mapper.h>
-
-#define DM_MSG_PREFIX "array"
-
-/*----------------------------------------------------------------*/
-
-/*
- * The array is implemented as a fully populated btree, which points to
- * blocks that contain the packed values.  This is more space efficient
- * than just using a btree since we don't store 1 key per value.
- */
-struct array_block {
-	__le32 csum;
-	__le32 max_entries;
-	__le32 nr_entries;
-	__le32 value_size;
-	__le64 blocknr; /* Block this node is supposed to live in. */
-} __packed;
-
-/*----------------------------------------------------------------*/
-
-/*
- * Validator methods.  As usual we calculate a checksum, and also write the
- * block location into the header (paranoia about ssds remapping areas by
- * mistake).
- */
-#define CSUM_XOR 595846735
-
-static void array_block_prepare_for_write(struct dm_block_validator *v,
-					  struct dm_block *b,
-					  size_t size_of_block)
-{
-	struct array_block *bh_le = dm_block_data(b);
-
-	bh_le->blocknr = cpu_to_le64(dm_block_location(b));
-	bh_le->csum = cpu_to_le32(dm_bm_checksum(&bh_le->max_entries,
-						 size_of_block - sizeof(__le32),
-						 CSUM_XOR));
-}
-
-static int array_block_check(struct dm_block_validator *v,
-			     struct dm_block *b,
-			     size_t size_of_block)
-{
-	struct array_block *bh_le = dm_block_data(b);
-	__le32 csum_disk;
-
-	if (dm_block_location(b) != le64_to_cpu(bh_le->blocknr)) {
-		DMERR_LIMIT("array_block_check failed: blocknr %llu != wanted %llu",
-			    (unsigned long long) le64_to_cpu(bh_le->blocknr),
-			    (unsigned long long) dm_block_location(b));
-		return -ENOTBLK;
-	}
-
-	csum_disk = cpu_to_le32(dm_bm_checksum(&bh_le->max_entries,
-					       size_of_block - sizeof(__le32),
-					       CSUM_XOR));
-	if (csum_disk != bh_le->csum) {
-		DMERR_LIMIT("array_block_check failed: csum %u != wanted %u",
-			    (unsigned) le32_to_cpu(csum_disk),
-			    (unsigned) le32_to_cpu(bh_le->csum));
-		return -EILSEQ;
-	}
-
-	return 0;
-}
-
-static struct dm_block_validator array_validator = {
-	.name = "array",
-	.prepare_for_write = array_block_prepare_for_write,
-	.check = array_block_check
-};
-
-/*----------------------------------------------------------------*/
-
-/*
- * Functions for manipulating the array blocks.
- */
-
-/*
- * Returns a pointer to a value within an array block.
- *
- * index - The index into _this_ specific block.
- */
-static void *element_at(struct dm_array_info *info, struct array_block *ab,
-			unsigned index)
-{
-	unsigned char *entry = (unsigned char *) (ab + 1);
-
-	entry += index * info->value_type.size;
-
-	return entry;
-}
-
-/*
- * Utility function that calls one of the value_type methods on every value
- * in an array block.
- */
-static void on_entries(struct dm_array_info *info, struct array_block *ab,
-		       void (*fn)(void *, const void *))
-{
-	unsigned i, nr_entries = le32_to_cpu(ab->nr_entries);
-
-	for (i = 0; i < nr_entries; i++)
-		fn(info->value_type.context, element_at(info, ab, i));
-}
-
-/*
- * Increment every value in an array block.
- */
-static void inc_ablock_entries(struct dm_array_info *info, struct array_block *ab)
-{
-	struct dm_btree_value_type *vt = &info->value_type;
-
-	if (vt->inc)
-		on_entries(info, ab, vt->inc);
-}
-
-/*
- * Decrement every value in an array block.
- */
-static void dec_ablock_entries(struct dm_array_info *info, struct array_block *ab)
-{
-	struct dm_btree_value_type *vt = &info->value_type;
-
-	if (vt->dec)
-		on_entries(info, ab, vt->dec);
-}
-
-/*
- * Each array block can hold this many values.
- */
-static uint32_t calc_max_entries(size_t value_size, size_t size_of_block)
-{
-	return (size_of_block - sizeof(struct array_block)) / value_size;
-}
-
-/*
- * Allocate a new array block.  The caller will need to unlock block.
- */
-static int alloc_ablock(struct dm_array_info *info, size_t size_of_block,
-			uint32_t max_entries,
-			struct dm_block **block, struct array_block **ab)
-{
-	int r;
-
-	r = dm_tm_new_block(info->btree_info.tm, &array_validator, block);
-	if (r)
-		return r;
-
-	(*ab) = dm_block_data(*block);
-	(*ab)->max_entries = cpu_to_le32(max_entries);
-	(*ab)->nr_entries = cpu_to_le32(0);
-	(*ab)->value_size = cpu_to_le32(info->value_type.size);
-
-	return 0;
-}
-
-/*
- * Pad an array block out with a particular value.  Every instance will
- * cause an increment of the value_type.  new_nr must always be more than
- * the current number of entries.
- */
-static void fill_ablock(struct dm_array_info *info, struct array_block *ab,
-			const void *value, unsigned new_nr)
-{
-	unsigned i;
-	uint32_t nr_entries;
-	struct dm_btree_value_type *vt = &info->value_type;
-
-	BUG_ON(new_nr > le32_to_cpu(ab->max_entries));
-	BUG_ON(new_nr < le32_to_cpu(ab->nr_entries));
-
-	nr_entries = le32_to_cpu(ab->nr_entries);
-	for (i = nr_entries; i < new_nr; i++) {
-		if (vt->inc)
-			vt->inc(vt->context, value);
-		memcpy(element_at(info, ab, i), value, vt->size);
-	}
-	ab->nr_entries = cpu_to_le32(new_nr);
-}
-
-/*
- * Remove some entries from the back of an array block.  Every value
- * removed will be decremented.  new_nr must be <= the current number of
- * entries.
- */
-static void trim_ablock(struct dm_array_info *info, struct array_block *ab,
-			unsigned new_nr)
-{
-	unsigned i;
-	uint32_t nr_entries;
-	struct dm_btree_value_type *vt = &info->value_type;
-
-	BUG_ON(new_nr > le32_to_cpu(ab->max_entries));
-	BUG_ON(new_nr > le32_to_cpu(ab->nr_entries));
-
-	nr_entries = le32_to_cpu(ab->nr_entries);
-	for (i = nr_entries; i > new_nr; i--)
-		if (vt->dec)
-			vt->dec(vt->context, element_at(info, ab, i - 1));
-	ab->nr_entries = cpu_to_le32(new_nr);
-}
-
-/*
- * Read locks a block, and coerces it to an array block.  The caller must
- * unlock 'block' when finished.
- */
-static int get_ablock(struct dm_array_info *info, dm_block_t b,
-		      struct dm_block **block, struct array_block **ab)
-{
-	int r;
-
-	r = dm_tm_read_lock(info->btree_info.tm, b, &array_validator, block);
-	if (r)
-		return r;
-
-	*ab = dm_block_data(*block);
-	return 0;
-}
-
-/*
- * Unlocks an array block.
- */
-static void unlock_ablock(struct dm_array_info *info, struct dm_block *block)
-{
-	dm_tm_unlock(info->btree_info.tm, block);
-}
-
-/*----------------------------------------------------------------*/
-
-/*
- * Btree manipulation.
- */
-
-/*
- * Looks up an array block in the btree, and then read locks it.
- *
- * index is the index of the index of the array_block, (ie. the array index
- * / max_entries).
- */
-static int lookup_ablock(struct dm_array_info *info, dm_block_t root,
-			 unsigned index, struct dm_block **block,
-			 struct array_block **ab)
-{
-	int r;
-	uint64_t key = index;
-	__le64 block_le;
-
-	r = dm_btree_lookup(&info->btree_info, root, &key, &block_le);
-	if (r)
-		return r;
-
-	return get_ablock(info, le64_to_cpu(block_le), block, ab);
-}
-
-/*
- * Insert an array block into the btree.  The block is _not_ unlocked.
- */
-static int insert_ablock(struct dm_array_info *info, uint64_t index,
-			 struct dm_block *block, dm_block_t *root)
-{
-	__le64 block_le = cpu_to_le64(dm_block_location(block));
-
-	__dm_bless_for_disk(block_le);
-	return dm_btree_insert(&info->btree_info, *root, &index, &block_le, root);
-}
-
-/*
- * Looks up an array block in the btree.  Then shadows it, and updates the
- * btree to point to this new shadow.  'root' is an input/output parameter
- * for both the current root block, and the new one.
- */
-static int shadow_ablock(struct dm_array_info *info, dm_block_t *root,
-			 unsigned index, struct dm_block **block,
-			 struct array_block **ab)
-{
-	int r, inc;
-	uint64_t key = index;
-	dm_block_t b;
-	__le64 block_le;
-
-	/*
-	 * lookup
-	 */
-	r = dm_btree_lookup(&info->btree_info, *root, &key, &block_le);
-	if (r)
-		return r;
-	b = le64_to_cpu(block_le);
-
-	/*
-	 * shadow
-	 */
-	r = dm_tm_shadow_block(info->btree_info.tm, b,
-			       &array_validator, block, &inc);
-	if (r)
-		return r;
-
-	*ab = dm_block_data(*block);
-	if (inc)
-		inc_ablock_entries(info, *ab);
-
-	/*
-	 * Reinsert.
-	 *
-	 * The shadow op will often be a noop.  Only insert if it really
-	 * copied data.
-	 */
-	if (dm_block_location(*block) != b) {
-		/*
-		 * dm_tm_shadow_block will have already decremented the old
-		 * block, but it is still referenced by the btree.  We
-		 * increment to stop the insert decrementing it below zero
-		 * when overwriting the old value.
-		 */
-		dm_tm_inc(info->btree_info.tm, b);
-		r = insert_ablock(info, index, *block, root);
-	}
-
-	return r;
-}
-
-/*
- * Allocate an new array block, and fill it with some values.
- */
-static int insert_new_ablock(struct dm_array_info *info, size_t size_of_block,
-			     uint32_t max_entries,
-			     unsigned block_index, uint32_t nr,
-			     const void *value, dm_block_t *root)
-{
-	int r;
-	struct dm_block *block;
-	struct array_block *ab;
-
-	r = alloc_ablock(info, size_of_block, max_entries, &block, &ab);
-	if (r)
-		return r;
-
-	fill_ablock(info, ab, value, nr);
-	r = insert_ablock(info, block_index, block, root);
-	unlock_ablock(info, block);
-
-	return r;
-}
-
-static int insert_full_ablocks(struct dm_array_info *info, size_t size_of_block,
-			       unsigned begin_block, unsigned end_block,
-			       unsigned max_entries, const void *value,
-			       dm_block_t *root)
-{
-	int r = 0;
-
-	for (; !r && begin_block != end_block; begin_block++)
-		r = insert_new_ablock(info, size_of_block, max_entries, begin_block, max_entries, value, root);
-
-	return r;
-}
-
-/*
- * There are a bunch of functions involved with resizing an array.  This
- * structure holds information that commonly needed by them.  Purely here
- * to reduce parameter count.
- */
-struct resize {
-	/*
-	 * Describes the array.
-	 */
-	struct dm_array_info *info;
-
-	/*
-	 * The current root of the array.  This gets updated.
-	 */
-	dm_block_t root;
-
-	/*
-	 * Metadata block size.  Used to calculate the nr entries in an
-	 * array block.
-	 */
-	size_t size_of_block;
-
-	/*
-	 * Maximum nr entries in an array block.
-	 */
-	unsigned max_entries;
-
-	/*
-	 * nr of completely full blocks in the array.
-	 *
-	 * 'old' refers to before the resize, 'new' after.
-	 */
-	unsigned old_nr_full_blocks, new_nr_full_blocks;
-
-	/*
-	 * Number of entries in the final block.  0 iff only full blocks in
-	 * the array.
-	 */
-	unsigned old_nr_entries_in_last_block, new_nr_entries_in_last_block;
-
-	/*
-	 * The default value used when growing the array.
-	 */
-	const void *value;
-};
-
-/*
- * Removes a consecutive set of array blocks from the btree.  The values
- * in block are decremented as a side effect of the btree remove.
- *
- * begin_index - the index of the first array block to remove.
- * end_index - the one-past-the-end value.  ie. this block is not removed.
- */
-static int drop_blocks(struct resize *resize, unsigned begin_index,
-		       unsigned end_index)
-{
-	int r;
-
-	while (begin_index != end_index) {
-		uint64_t key = begin_index++;
-		r = dm_btree_remove(&resize->info->btree_info, resize->root,
-				    &key, &resize->root);
-		if (r)
-			return r;
-	}
-
-	return 0;
-}
-
-/*
- * Calculates how many blocks are needed for the array.
- */
-static unsigned total_nr_blocks_needed(unsigned nr_full_blocks,
-				       unsigned nr_entries_in_last_block)
-{
-	return nr_full_blocks + (nr_entries_in_last_block ? 1 : 0);
-}
-
-/*
- * Shrink an array.
- */
-static int shrink(struct resize *resize)
-{
-	int r;
-	unsigned begin, end;
-	struct dm_block *block;
-	struct array_block *ab;
-
-	/*
-	 * Lose some blocks from the back?
-	 */
-	if (resize->new_nr_full_blocks < resize->old_nr_full_blocks) {
-		begin = total_nr_blocks_needed(resize->new_nr_full_blocks,
-					       resize->new_nr_entries_in_last_block);
-		end = total_nr_blocks_needed(resize->old_nr_full_blocks,
-					     resize->old_nr_entries_in_last_block);
-
-		r = drop_blocks(resize, begin, end);
-		if (r)
-			return r;
-	}
-
-	/*
-	 * Trim the new tail block
-	 */
-	if (resize->new_nr_entries_in_last_block) {
-		r = shadow_ablock(resize->info, &resize->root,
-				  resize->new_nr_full_blocks, &block, &ab);
-		if (r)
-			return r;
-
-		trim_ablock(resize->info, ab, resize->new_nr_entries_in_last_block);
-		unlock_ablock(resize->info, block);
-	}
-
-	return 0;
-}
-
-/*
- * Grow an array.
- */
-static int grow_extend_tail_block(struct resize *resize, uint32_t new_nr_entries)
-{
-	int r;
-	struct dm_block *block;
-	struct array_block *ab;
-
-	r = shadow_ablock(resize->info, &resize->root,
-			  resize->old_nr_full_blocks, &block, &ab);
-	if (r)
-		return r;
-
-	fill_ablock(resize->info, ab, resize->value, new_nr_entries);
-	unlock_ablock(resize->info, block);
-
-	return r;
-}
-
-static int grow_add_tail_block(struct resize *resize)
-{
-	return insert_new_ablock(resize->info, resize->size_of_block,
-				 resize->max_entries,
-				 resize->new_nr_full_blocks,
-				 resize->new_nr_entries_in_last_block,
-				 resize->value, &resize->root);
-}
-
-static int grow_needs_more_blocks(struct resize *resize)
-{
-	int r;
-	unsigned old_nr_blocks = resize->old_nr_full_blocks;
-
-	if (resize->old_nr_entries_in_last_block > 0) {
-		old_nr_blocks++;
-
-		r = grow_extend_tail_block(resize, resize->max_entries);
-		if (r)
-			return r;
-	}
-
-	r = insert_full_ablocks(resize->info, resize->size_of_block,
-				old_nr_blocks,
-				resize->new_nr_full_blocks,
-				resize->max_entries, resize->value,
-				&resize->root);
-	if (r)
-		return r;
-
-	if (resize->new_nr_entries_in_last_block)
-		r = grow_add_tail_block(resize);
-
-	return r;
-}
-
-static int grow(struct resize *resize)
-{
-	if (resize->new_nr_full_blocks > resize->old_nr_full_blocks)
-		return grow_needs_more_blocks(resize);
-
-	else if (resize->old_nr_entries_in_last_block)
-		return grow_extend_tail_block(resize, resize->new_nr_entries_in_last_block);
-
-	else
-		return grow_add_tail_block(resize);
-}
-
-/*----------------------------------------------------------------*/
-
-/*
- * These are the value_type functions for the btree elements, which point
- * to array blocks.
- */
-static void block_inc(void *context, const void *value)
-{
-	__le64 block_le;
-	struct dm_array_info *info = context;
-
-	memcpy(&block_le, value, sizeof(block_le));
-	dm_tm_inc(info->btree_info.tm, le64_to_cpu(block_le));
-}
-
-static void block_dec(void *context, const void *value)
-{
-	int r;
-	uint64_t b;
-	__le64 block_le;
-	uint32_t ref_count;
-	struct dm_block *block;
-	struct array_block *ab;
-	struct dm_array_info *info = context;
-
-	memcpy(&block_le, value, sizeof(block_le));
-	b = le64_to_cpu(block_le);
-
-	r = dm_tm_ref(info->btree_info.tm, b, &ref_count);
-	if (r) {
-		DMERR_LIMIT("couldn't get reference count for block %llu",
-			    (unsigned long long) b);
-		return;
-	}
-
-	if (ref_count == 1) {
-		/*
-		 * We're about to drop the last reference to this ablock.
-		 * So we need to decrement the ref count of the contents.
-		 */
-		r = get_ablock(info, b, &block, &ab);
-		if (r) {
-			DMERR_LIMIT("couldn't get array block %llu",
-				    (unsigned long long) b);
-			return;
-		}
-
-		dec_ablock_entries(info, ab);
-		unlock_ablock(info, block);
-	}
-
-	dm_tm_dec(info->btree_info.tm, b);
-}
-
-static int block_equal(void *context, const void *value1, const void *value2)
-{
-	return !memcmp(value1, value2, sizeof(__le64));
-}
-
-/*----------------------------------------------------------------*/
-
-void dm_array_info_init(struct dm_array_info *info,
-			struct dm_transaction_manager *tm,
-			struct dm_btree_value_type *vt)
-{
-	struct dm_btree_value_type *bvt = &info->btree_info.value_type;
-
-	memcpy(&info->value_type, vt, sizeof(info->value_type));
-	info->btree_info.tm = tm;
-	info->btree_info.levels = 1;
-
-	bvt->context = info;
-	bvt->size = sizeof(__le64);
-	bvt->inc = block_inc;
-	bvt->dec = block_dec;
-	bvt->equal = block_equal;
-}
-EXPORT_SYMBOL_GPL(dm_array_info_init);
-
-int dm_array_empty(struct dm_array_info *info, dm_block_t *root)
-{
-	return dm_btree_empty(&info->btree_info, root);
-}
-EXPORT_SYMBOL_GPL(dm_array_empty);
-
-static int array_resize(struct dm_array_info *info, dm_block_t root,
-			uint32_t old_size, uint32_t new_size,
-			const void *value, dm_block_t *new_root)
-{
-	int r;
-	struct resize resize;
-
-	if (old_size == new_size) {
-		*new_root = root;
-		return 0;
-	}
-
-	resize.info = info;
-	resize.root = root;
-	resize.size_of_block = dm_bm_block_size(dm_tm_get_bm(info->btree_info.tm));
-	resize.max_entries = calc_max_entries(info->value_type.size,
-					      resize.size_of_block);
-
-	resize.old_nr_full_blocks = old_size / resize.max_entries;
-	resize.old_nr_entries_in_last_block = old_size % resize.max_entries;
-	resize.new_nr_full_blocks = new_size / resize.max_entries;
-	resize.new_nr_entries_in_last_block = new_size % resize.max_entries;
-	resize.value = value;
-
-	r = ((new_size > old_size) ? grow : shrink)(&resize);
-	if (r)
-		return r;
-
-	*new_root = resize.root;
-	return 0;
-}
-
-int dm_array_resize(struct dm_array_info *info, dm_block_t root,
-		    uint32_t old_size, uint32_t new_size,
-		    const void *value, dm_block_t *new_root)
-		    __dm_written_to_disk(value)
-{
-	int r = array_resize(info, root, old_size, new_size, value, new_root);
-	__dm_unbless_for_disk(value);
-	return r;
-}
-EXPORT_SYMBOL_GPL(dm_array_resize);
-
-int dm_array_del(struct dm_array_info *info, dm_block_t root)
-{
-	return dm_btree_del(&info->btree_info, root);
-}
-EXPORT_SYMBOL_GPL(dm_array_del);
-
-int dm_array_get_value(struct dm_array_info *info, dm_block_t root,
-		       uint32_t index, void *value_le)
-{
-	int r;
-	struct dm_block *block;
-	struct array_block *ab;
-	size_t size_of_block;
-	unsigned entry, max_entries;
-
-	size_of_block = dm_bm_block_size(dm_tm_get_bm(info->btree_info.tm));
-	max_entries = calc_max_entries(info->value_type.size, size_of_block);
-
-	r = lookup_ablock(info, root, index / max_entries, &block, &ab);
-	if (r)
-		return r;
-
-	entry = index % max_entries;
-	if (entry >= le32_to_cpu(ab->nr_entries))
-		r = -ENODATA;
-	else
-		memcpy(value_le, element_at(info, ab, entry),
-		       info->value_type.size);
-
-	unlock_ablock(info, block);
-	return r;
-}
-EXPORT_SYMBOL_GPL(dm_array_get_value);
-
-static int array_set_value(struct dm_array_info *info, dm_block_t root,
-			   uint32_t index, const void *value, dm_block_t *new_root)
-{
-	int r;
-	struct dm_block *block;
-	struct array_block *ab;
-	size_t size_of_block;
-	unsigned max_entries;
-	unsigned entry;
-	void *old_value;
-	struct dm_btree_value_type *vt = &info->value_type;
-
-	size_of_block = dm_bm_block_size(dm_tm_get_bm(info->btree_info.tm));
-	max_entries = calc_max_entries(info->value_type.size, size_of_block);
-
-	r = shadow_ablock(info, &root, index / max_entries, &block, &ab);
-	if (r)
-		return r;
-	*new_root = root;
-
-	entry = index % max_entries;
-	if (entry >= le32_to_cpu(ab->nr_entries)) {
-		r = -ENODATA;
-		goto out;
-	}
-
-	old_value = element_at(info, ab, entry);
-	if (vt->dec &&
-	    (!vt->equal || !vt->equal(vt->context, old_value, value))) {
-		vt->dec(vt->context, old_value);
-		if (vt->inc)
-			vt->inc(vt->context, value);
-	}
-
-	memcpy(old_value, value, info->value_type.size);
-
-out:
-	unlock_ablock(info, block);
-	return r;
-}
-
-int dm_array_set_value(struct dm_array_info *info, dm_block_t root,
-		 uint32_t index, const void *value, dm_block_t *new_root)
-		 __dm_written_to_disk(value)
-{
-	int r;
-
-	r = array_set_value(info, root, index, value, new_root);
-	__dm_unbless_for_disk(value);
-	return r;
-}
-EXPORT_SYMBOL_GPL(dm_array_set_value);
-
-struct walk_info {
-	struct dm_array_info *info;
-	int (*fn)(void *context, uint64_t key, void *leaf);
-	void *context;
-};
-
-static int walk_ablock(void *context, uint64_t *keys, void *leaf)
-{
-	struct walk_info *wi = context;
-
-	int r;
-	unsigned i;
-	__le64 block_le;
-	unsigned nr_entries, max_entries;
-	struct dm_block *block;
-	struct array_block *ab;
-
-	memcpy(&block_le, leaf, sizeof(block_le));
-	r = get_ablock(wi->info, le64_to_cpu(block_le), &block, &ab);
-	if (r)
-		return r;
-
-	max_entries = le32_to_cpu(ab->max_entries);
-	nr_entries = le32_to_cpu(ab->nr_entries);
-	for (i = 0; i < nr_entries; i++) {
-		r = wi->fn(wi->context, keys[0] * max_entries + i,
-			   element_at(wi->info, ab, i));
-
-		if (r)
-			break;
-	}
-
-	unlock_ablock(wi->info, block);
-	return r;
-}
-
-int dm_array_walk(struct dm_array_info *info, dm_block_t root,
-		  int (*fn)(void *, uint64_t key, void *leaf),
-		  void *context)
-{
-	struct walk_info wi;
-
-	wi.info = info;
-	wi.fn = fn;
-	wi.context = context;
-
-	return dm_btree_walk(&info->btree_info, root, walk_ablock, &wi);
-}
-EXPORT_SYMBOL_GPL(dm_array_walk);
-
-/*----------------------------------------------------------------*/
+e SDMA1_RLC1_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE_MASK 0x4
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE__SHIFT 0x2
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__FREQUENCY_MASK 0xfff0
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__FREQUENCY__SHIFT 0x4
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT_MASK 0xffff0000
+#define SDMA1_RLC1_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT__SHIFT 0x10
+#define SDMA1_RLC1_RB_WPTR_POLL_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC1_RB_WPTR_POLL_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC1_RB_WPTR_POLL_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA1_RLC1_RB_WPTR_POLL_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA1_RLC1_RB_RPTR_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC1_RB_RPTR_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC1_RB_RPTR_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA1_RLC1_RB_RPTR_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA1_RLC1_IB_CNTL__IB_ENABLE_MASK 0x1
+#define SDMA1_RLC1_IB_CNTL__IB_ENABLE__SHIFT 0x0
+#define SDMA1_RLC1_IB_CNTL__IB_SWAP_ENABLE_MASK 0x10
+#define SDMA1_RLC1_IB_CNTL__IB_SWAP_ENABLE__SHIFT 0x4
+#define SDMA1_RLC1_IB_CNTL__SWITCH_INSIDE_IB_MASK 0x100
+#define SDMA1_RLC1_IB_CNTL__SWITCH_INSIDE_IB__SHIFT 0x8
+#define SDMA1_RLC1_IB_CNTL__CMD_VMID_MASK 0xf0000
+#define SDMA1_RLC1_IB_CNTL__CMD_VMID__SHIFT 0x10
+#define SDMA1_RLC1_IB_RPTR__OFFSET_MASK 0x3ffffc
+#define SDMA1_RLC1_IB_RPTR__OFFSET__SHIFT 0x2
+#define SDMA1_RLC1_IB_OFFSET__OFFSET_MASK 0x3ffffc
+#define SDMA1_RLC1_IB_OFFSET__OFFSET__SHIFT 0x2
+#define SDMA1_RLC1_IB_BASE_LO__ADDR_MASK 0xffffffe0
+#define SDMA1_RLC1_IB_BASE_LO__ADDR__SHIFT 0x5
+#define SDMA1_RLC1_IB_BASE_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC1_IB_BASE_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC1_IB_SIZE__SIZE_MASK 0xfffff
+#define SDMA1_RLC1_IB_SIZE__SIZE__SHIFT 0x0
+#define SDMA1_RLC1_SKIP_CNTL__SKIP_COUNT_MASK 0x3fff
+#define SDMA1_RLC1_SKIP_CNTL__SKIP_COUNT__SHIFT 0x0
+#define SDMA1_RLC1_CONTEXT_STATUS__SELECTED_MASK 0x1
+#define SDMA1_RLC1_CONTEXT_STATUS__SELECTED__SHIFT 0x0
+#define SDMA1_RLC1_CONTEXT_STATUS__IDLE_MASK 0x4
+#define SDMA1_RLC1_CONTEXT_STATUS__IDLE__SHIFT 0x2
+#define SDMA1_RLC1_CONTEXT_STATUS__EXPIRED_MASK 0x8
+#define SDMA1_RLC1_CONTEXT_STATUS__EXPIRED__SHIFT 0x3
+#define SDMA1_RLC1_CONTEXT_STATUS__EXCEPTION_MASK 0x70
+#define SDMA1_RLC1_CONTEXT_STATUS__EXCEPTION__SHIFT 0x4
+#define SDMA1_RLC1_CONTEXT_STATUS__CTXSW_ABLE_MASK 0x80
+#define SDMA1_RLC1_CONTEXT_STATUS__CTXSW_ABLE__SHIFT 0x7
+#define SDMA1_RLC1_CONTEXT_STATUS__CTXSW_READY_MASK 0x100
+#define SDMA1_RLC1_CONTEXT_STATUS__CTXSW_READY__SHIFT 0x8
+#define SDMA1_RLC1_CONTEXT_STATUS__PREEMPTED_MASK 0x200
+#define SDMA1_RLC1_CONTEXT_STATUS__PREEMPTED__SHIFT 0x9
+#define SDMA1_RLC1_CONTEXT_STATUS__PREEMPT_DISABLE_MASK 0x400
+#define SDMA1_RLC1_CONTEXT_STATUS__PREEMPT_DISABLE__SHIFT 0xa
+#define SDMA1_RLC1_DOORBELL__OFFSET_MASK 0x1fffff
+#define SDMA1_RLC1_DOORBELL__OFFSET__SHIFT 0x0
+#define SDMA1_RLC1_DOORBELL__ENABLE_MASK 0x10000000
+#define SDMA1_RLC1_DOORBELL__ENABLE__SHIFT 0x1c
+#define SDMA1_RLC1_DOORBELL__CAPTURED_MASK 0x40000000
+#define SDMA1_RLC1_DOORBELL__CAPTURED__SHIFT 0x1e
+#define SDMA1_RLC1_VIRTUAL_ADDR__ATC_MASK 0x1
+#define SDMA1_RLC1_VIRTUAL_ADDR__ATC__SHIFT 0x0
+#define SDMA1_RLC1_VIRTUAL_ADDR__INVAL_MASK 0x2
+#define SDMA1_RLC1_VIRTUAL_ADDR__INVAL__SHIFT 0x1
+#define SDMA1_RLC1_VIRTUAL_ADDR__PTR32_MASK 0x10
+#define SDMA1_RLC1_VIRTUAL_ADDR__PTR32__SHIFT 0x4
+#define SDMA1_RLC1_VIRTUAL_ADDR__SHARED_BASE_MASK 0x700
+#define SDMA1_RLC1_VIRTUAL_ADDR__SHARED_BASE__SHIFT 0x8
+#define SDMA1_RLC1_VIRTUAL_ADDR__VM_HOLE_MASK 0x40000000
+#define SDMA1_RLC1_VIRTUAL_ADDR__VM_HOLE__SHIFT 0x1e
+#define SDMA1_RLC1_APE1_CNTL__BASE_MASK 0xffff
+#define SDMA1_RLC1_APE1_CNTL__BASE__SHIFT 0x0
+#define SDMA1_RLC1_APE1_CNTL__LIMIT_MASK 0xffff0000
+#define SDMA1_RLC1_APE1_CNTL__LIMIT__SHIFT 0x10
+#define SDMA1_RLC1_DOORBELL_LOG__BE_ERROR_MASK 0x1
+#define SDMA1_RLC1_DOORBELL_LOG__BE_ERROR__SHIFT 0x0
+#define SDMA1_RLC1_DOORBELL_LOG__DATA_MASK 0xfffffffc
+#define SDMA1_RLC1_DOORBELL_LOG__DATA__SHIFT 0x2
+#define SDMA1_RLC1_WATERMARK__RD_OUTSTANDING_MASK 0xfff
+#define SDMA1_RLC1_WATERMARK__RD_OUTSTANDING__SHIFT 0x0
+#define SDMA1_RLC1_WATERMARK__WR_OUTSTANDING_MASK 0x1ff0000
+#define SDMA1_RLC1_WATERMARK__WR_OUTSTANDING__SHIFT 0x10
+#define SDMA1_RLC1_CSA_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA1_RLC1_CSA_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA1_RLC1_CSA_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC1_CSA_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC1_IB_SUB_REMAIN__SIZE_MASK 0x3fff
+#define SDMA1_RLC1_IB_SUB_REMAIN__SIZE__SHIFT 0x0
+#define SDMA1_RLC1_PREEMPT__IB_PREEMPT_MASK 0x1
+#define SDMA1_RLC1_PREEMPT__IB_PREEMPT__SHIFT 0x0
+#define SDMA1_RLC1_DUMMY_REG__DUMMY_MASK 0xffffffff
+#define SDMA1_RLC1_DUMMY_REG__DUMMY__SHIFT 0x0
+#define SDMA1_RLC1_MIDCMD_DATA0__DATA0_MASK 0xffffffff
+#define SDMA1_RLC1_MIDCMD_DATA0__DATA0__SHIFT 0x0
+#define SDMA1_RLC1_MIDCMD_DATA1__DATA1_MASK 0xffffffff
+#define SDMA1_RLC1_MIDCMD_DATA1__DATA1__SHIFT 0x0
+#define SDMA1_RLC1_MIDCMD_DATA2__DATA2_MASK 0xffffffff
+#define SDMA1_RLC1_MIDCMD_DATA2__DATA2__SHIFT 0x0
+#define SDMA1_RLC1_MIDCMD_DATA3__DATA3_MASK 0xffffffff
+#define SDMA1_RLC1_MIDCMD_DATA3__DATA3__SHIFT 0x0
+#define SDMA1_RLC1_MIDCMD_DATA4__DATA4_MASK 0xffffffff
+#define SDMA1_RLC1_MIDCMD_DATA4__DATA4__SHIFT 0x0
+#define SDMA1_RLC1_MIDCMD_DATA5__DATA5_MASK 0xffffffff
+#define SDMA1_RLC1_MIDCMD_DATA5__DATA5__SHIFT 0x0
+#define SDMA1_RLC1_MIDCMD_CNTL__DATA_VALID_MASK 0x1
+#define SDMA1_RLC1_MIDCMD_CNTL__DATA_VALID__SHIFT 0x0
+#define SDMA1_RLC1_MIDCMD_CNTL__COPY_MODE_MASK 0x2
+#define SDMA1_RLC1_MIDCMD_CNTL__COPY_MODE__SHIFT 0x1
+#define SDMA1_RLC1_MIDCMD_CNTL__SPLIT_STATE_MASK 0xf0
+#define SDMA1_RLC1_MIDCMD_CNTL__SPLIT_STATE__SHIFT 0x4
+#define SDMA1_RLC1_MIDCMD_CNTL__ALLOW_PREEMPT_MASK 0x100
+#define SDMA1_RLC1_MIDCMD_CNTL__ALLOW_PREEMPT__SHIFT 0x8
+#define HDP_HOST_PATH_CNTL__BIF_RDRET_CREDIT_MASK 0x7
+#define HDP_HOST_PATH_CNTL__BIF_RDRET_CREDIT__SHIFT 0x0
+#define HDP_HOST_PATH_CNTL__MC_WRREQ_CREDIT_MASK 0x1f8
+#define HDP_HOST_PATH_CNTL__MC_WRREQ_CREDIT__SHIFT 0x3
+#define HDP_HOST_PATH_CNTL__WR_STALL_TIMER_MASK 0x600
+#define HDP_HOST_PATH_CNTL__WR_STALL_TIMER__SHIFT 0x9
+#define HDP_HOST_PATH_CNTL__RD_STALL_TIMER_MASK 0x1800
+#define HDP_HOST_PATH_CNTL__RD_STALL_TIMER__SHIFT 0xb
+#define HDP_HOST_PATH_CNTL__WRITE_COMBINE_TIMER_MASK 0x180000
+#define HDP_HOST_PATH_CNTL__WRITE_COMBINE_TIMER__SHIFT 0x13
+#define HDP_HOST_PATH_CNTL__WRITE_COMBINE_EN_MASK 0x200000
+#define HDP_HOST_PATH_CNTL__WRITE_COMBINE_EN__SHIFT 0x15
+#define HDP_HOST_PATH_CNTL__CACHE_INVALIDATE_MASK 0x400000
+#define HDP_HOST_PATH_CNTL__CACHE_INVALIDATE__SHIFT 0x16
+#define HDP_HOST_PATH_CNTL__CLOCK_GATING_DIS_MASK 0x800000
+#define HDP_HOST_PATH_CNTL__CLOCK_GATING_DIS__SHIFT 0x17
+#define HDP_HOST_PATH_CNTL__REG_CLK_ENABLE_COUNT_MASK 0xf000000
+#define HDP_HOST_PATH_CNTL__REG_CLK_ENABLE_COUNT__SHIFT 0x18
+#define HDP_HOST_PATH_CNTL__ALL_SURFACES_DIS_MASK 0x20000000
+#define HDP_HOST_PATH_CNTL__ALL_SURFACES_DIS__SHIFT 0x1d
+#define HDP_HOST_PATH_CNTL__WRITE_THROUGH_CACHE_DIS_MASK 0x40000000
+#define HDP_HOST_PATH_CNTL__WRITE_THROUGH_CACHE_DIS__SHIFT 0x1e
+#define HDP_HOST_PATH_CNTL__LIN_RD_CACHE_DIS_MASK 0x80000000
+#define HDP_HOST_PATH_CNTL__LIN_RD_CACHE_DIS__SHIFT 0x1f
+#define HDP_NONSURFACE_BASE__NONSURF_BASE_MASK 0xffffffff
+#define HDP_NONSURFACE_BASE__NONSURF_BASE__SHIFT 0x0
+#define HDP_NONSURFACE_INFO__NONSURF_ADDR_TYPE_MASK 0x1
+#define HDP_NONSURFACE_INFO__NONSURF_ADDR_TYPE__SHIFT 0x0
+#define HDP_NONSURFACE_INFO__NONSURF_ARRAY_MODE_MASK 0x1e
+#define HDP_NONSURFACE_INFO__NONSURF_ARRAY_MODE__SHIFT 0x1
+#define HDP_NONSURFACE_INFO__NONSURF_ENDIAN_MASK 0x60
+#define HDP_NONSURFACE_INFO__NONSURF_ENDIAN__SHIFT 0x5
+#define HDP_NONSURFACE_INFO__NONSURF_PIXEL_SIZE_MASK 0x380
+#define HDP_NONSURFACE_INFO__NONSURF_PIXEL_SIZE__SHIFT 0x7
+#define HDP_NONSURFACE_INFO__NONSURF_SAMPLE_NUM_MASK 0x1c00
+#define HDP_NONSURFACE_INFO__NONSURF_SAMPLE_NUM__SHIFT 0xa
+#define HDP_NONSURFACE_INFO__NONSURF_SAMPLE_SIZE_MASK 0x6000
+#define HDP_NONSURFACE_INFO__NONSURF_SAMPLE_SIZE__SHIFT 0xd
+#define HDP_NONSURFACE_INFO__NONSURF_PRIV_MASK 0x8000
+#define HDP_NONSURFACE_INFO__NONSURF_PRIV__SHIFT 0xf
+#define HDP_NONSURFACE_INFO__NONSURF_TILE_COMPACT_MASK 0x10000
+#define HDP_NONSURFACE_INFO__NONSURF_TILE_COMPACT__SHIFT 0x10
+#define HDP_NONSURFACE_INFO__NONSURF_TILE_SPLIT_MASK 0xe0000
+#define HDP_NONSURFACE_INFO__NONSURF_TILE_SPLIT__SHIFT 0x11
+#define HDP_NONSURFACE_INFO__NONSURF_NUM_BANKS_MASK 0x300000
+#define HDP_NONSURFACE_INFO__NONSURF_NUM_BANKS__SHIFT 0x14
+#define HDP_NONSURFACE_INFO__NONSURF_BANK_WIDTH_MASK 0xc00000
+#define HDP_NONSURFACE_INFO__NONSURF_BANK_WIDTH__SHIFT 0x16
+#define HDP_NONSURFACE_INFO__NONSURF_BANK_HEIGHT_MASK 0x3000000
+#define HDP_NONSURFACE_INFO__NONSURF_BANK_HEIGHT__SHIFT 0x18
+#define HDP_NONSURFACE_INFO__NONSURF_MACRO_TILE_ASPECT_MASK 0xc000000
+#define HDP_NONSURFACE_INFO__NONSURF_MACRO_TILE_ASPECT__SHIFT 0x1a
+#define HDP_NONSURFACE_INFO__NONSURF_MICRO_TILE_MODE_MASK 0x70000000
+#define HDP_NONSURFACE_INFO__NONSURF_MICRO_TILE_MODE__SHIFT 0x1c
+#define HDP_NONSURFACE_INFO__NONSURF_SLICE_TILE_MAX_MSB_MASK 0x80000000
+#define HDP_NONSURFACE_INFO__NONSURF_SLICE_TILE_MAX_MSB__SHIFT 0x1f
+#define HDP_NONSURFACE_SIZE__NONSURF_PITCH_TILE_MAX_MASK 0x7ff
+#define HDP_NONSURFACE_SIZE__NONSURF_PITCH_TILE_MAX__SHIFT 0x0
+#define HDP_NONSURFACE_SIZE__NONSURF_SLICE_TILE_MAX_MASK 0xfffff800
+#define HDP_NONSURFACE_SIZE__NONSURF_SLICE_TILE_MAX__SHIFT 0xb
+#define HDP_NONSURF_FLAGS__NONSURF_WRITE_FLAG_MASK 0x1
+#define HDP_NONSURF_FLAGS__NONSURF_WRITE_FLAG__SHIFT 0x0
+#define HDP_NONSURF_FLAGS__NONSURF_READ_FLAG_MASK 0x2
+#define HDP_NONSURF_FLAGS__NONSURF_READ_FLAG__SHIFT 0x1
+#define HDP_NONSURF_FLAGS_CLR__NONSURF_WRITE_FLAG_CLR_MASK 0x1
+#define HDP_NONSURF_FLAGS_CLR__NONSURF_WRITE_FLAG_CLR__SHIFT 0x0
+#define HDP_NONSURF_FLAGS_CLR__NONSURF_READ_FLAG_CLR_MASK 0x2
+#define HDP_NONSURF_FLAGS_CLR__NONSURF_READ_FLAG_CLR__SHIFT 0x1
+#define HDP_SW_SEMAPHORE__SW_SEMAPHORE_MASK 0xffffffff
+#define HDP_SW_SEMAPHORE__SW_SEMAPHORE__SHIFT 0x0
+#define HDP_DEBUG0__HDP_DEBUG__SHIFT 0x0
+#define HDP_DEBUG1__HDP_DEBUG__SHIFT 0x0
+#define HDP_LAST_SURFACE_HIT__LAST_SURFACE_HIT_MASK 0x3f
+#define HDP_LAST_SURFACE_HIT__LAST_SURFACE_HIT__SHIFT 0x0
+#define HDP_TILING_CONFIG__PIPE_TILING_MASK 0xe
+#define HDP_TILING_CONFIG__PIPE_TILING__SHIFT 0x1
+#define HDP_TILING_CONFIG__BANK_TILING_MASK 0x30
+#define HDP_TILING_CONFIG__BANK_TILING__SHIFT 0x4
+#define HDP_TILING_CONFIG__GROUP_SIZE_MASK 0xc0
+#define HDP_TILING_CONFIG__GROUP_SIZE__SHIFT 0x6
+#define HDP_TILING_CONFIG__ROW_TILING_MASK 0x700
+#define HDP_TILING_CONFIG__ROW_TILING__SHIFT 0x8
+#define HDP_TILING_CONFIG__BANK_SWAPS_MASK 0x3800
+#define HDP_TILING_CONFIG__BANK_SWAPS__SHIFT 0xb
+#define HDP_TILING_CONFIG__SAMPLE_SPLIT_MASK 0xc000
+#define HDP_TILING_CONFIG__SAMPLE_SPLIT__SHIFT 0xe
+#define HDP_SC_MULTI_CHIP_CNTL__LOG2_NUM_CHIPS_MASK 0x7
+#define HDP_SC_MULTI_CHIP_CNTL__LOG2_NUM_CHIPS__SHIFT 0x0
+#define HDP_SC_MULTI_CHIP_CNTL__MULTI_CHIP_TILE_SIZE_MASK 0x18
+#define HDP_SC_MULTI_CHIP_CNTL__MULTI_CHIP_TILE_SIZE__SHIFT 0x3
+#define HDP_OUTSTANDING_REQ__WRITE_REQ_MASK 0xff
+#define HDP_OUTSTANDING_REQ__WRITE_REQ__SHIFT 0x0
+#define HDP_OUTSTANDING_REQ__READ_REQ_MASK 0xff00
+#define HDP_OUTSTANDING_REQ__READ_REQ__SHIFT 0x8
+#define HDP_ADDR_CONFIG__NUM_PIPES_MASK 0x7
+#define HDP_ADDR_CONFIG__NUM_PIPES__SHIFT 0x0
+#define HDP_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE_MASK 0x70
+#define HDP_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE__SHIFT 0x4
+#define HDP_ADDR_CONFIG__BANK_INTERLEAVE_SIZE_MASK 0x700
+#define HDP_ADDR_CONFIG__BANK_INTERLEAVE_SIZE__SHIFT 0x8
+#define HDP_ADDR_CONFIG__NUM_SHADER_ENGINES_MASK 0x3000
+#define HDP_ADDR_CONFIG__NUM_SHADER_ENGINES__SHIFT 0xc
+#define HDP_ADDR_CONFIG__SHADER_ENGINE_TILE_SIZE_MASK 0x70000
+#define HDP_ADDR_CONFIG__SHADER_ENGINE_TILE_SIZE__SHIFT 0x10
+#define HDP_ADDR_CONFIG__NUM_GPUS_MASK 0x700000
+#define HDP_ADDR_CONFIG__NUM_GPUS__SHIFT 0x14
+#define HDP_ADDR_CONFIG__MULTI_GPU_TILE_SIZE_MASK 0x3000000
+#define HDP_ADDR_CONFIG__MULTI_GPU_TILE_SIZE__SHIFT 0x18
+#define HDP_ADDR_CONFIG__ROW_SIZE_MASK 0x30000000
+#define HDP_ADDR_CONFIG__ROW_SIZE__SHIFT 0x1c
+#define HDP_ADDR_CONFIG__NUM_LOWER_PIPES_MASK 0x40000000
+#define HDP_ADDR_CONFIG__NUM_LOWER_PIPES__SHIFT 0x1e
+#define HDP_MISC_CNTL__FLUSH_INVALIDATE_CACHE_MASK 0x1
+#define HDP_MISC_CNTL__FLUSH_INVALIDATE_CACHE__SHIFT 0x0
+#define HDP_MISC_CNTL__VM_ID_MASK 0x1e
+#define HDP_MISC_CNTL__VM_ID__SHIFT 0x1
+#define HDP_MISC_CNTL__OUTSTANDING_WRITE_COUNT_1024_MASK 0x20
+#define HDP_MISC_CNTL__OUTSTANDING_WRITE_COUNT_1024__SHIFT 0x5
+#define HDP_MISC_CNTL__MULTIPLE_READS_MASK 0x40
+#define HDP_MISC_CNTL__MULTIPLE_READS__SHIFT 0x6
+#define HDP_MISC_CNTL__HDP_BIF_RDRET_CREDIT_MASK 0x780
+#define HDP_MISC_CNTL__HDP_BIF_RDRET_CREDIT__SHIFT 0x7
+#define HDP_MISC_CNTL__SIMULTANEOUS_READS_WRITES_MASK 0x800
+#define HDP_MISC_CNTL__SIMULTANEOUS_READS_WRITES__SHIFT 0xb
+#define HDP_MISC_CNTL__NO_SPLIT_ARRAY_LINEAR_MASK 0x1000
+#define HDP_MISC_CNTL__NO_SPLIT_ARRAY_LINEAR__SHIFT 0xc
+#define HDP_MISC_CNTL__MC_RDREQ_CREDIT_MASK 0x7e000
+#define HDP_MISC_CNTL__MC_RDREQ_CREDIT__SHIFT 0xd
+#define HDP_MISC_CNTL__READ_CACHE_INVALIDATE_MASK 0x80000
+#define HDP_MISC_CNTL__READ_CACHE_INVALIDATE__SHIFT 0x13
+#define HDP_MISC_CNTL__ADDRLIB_LINEAR_BYPASS_MASK 0x100000
+#define HDP_MISC_CNTL__ADDRLIB_LINEAR_BYPASS__SHIFT 0x14
+#define HDP_MISC_CNTL__FED_ENABLE_MASK 0x200000
+#define HDP_MISC_CNTL__FED_ENABLE__SHIFT 0x15
+#define HDP_MISC_CNTL__LEGACY_TILING_ENABLE_MASK 0x400000
+#define HDP_MISC_CNTL__LEGACY_TILING_ENABLE__SHIFT 0x16
+#define HDP_MISC_CNTL__LEGACY_SURFACES_ENABLE_MASK 0x800000
+#define HDP_MISC_CNTL__LEGACY_SURFACES_ENABLE__SHIFT 0x17
+#define HDP_MEM_POWER_LS__LS_ENABLE_MASK 0x1
+#define HDP_MEM_POWER_LS__LS_ENABLE__SHIFT 0x0
+#define HDP_MEM_POWER_LS__LS_SETUP_MASK 0x7e
+#define HDP_MEM_POWER_LS__LS_SETUP__SHIFT 0x1
+#define HDP_MEM_POWER_LS__LS_HOLD_MASK 0x1f80
+#define HDP_MEM_POWER_LS__LS_HOLD__SHIFT 0x7
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PREFETCH_PRI_MASK 0x7
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PREFETCH_PRI__SHIFT 0x0
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PREFETCH_DIR_MASK 0x38
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PREFETCH_DIR__SHIFT 0x3
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PREFETCH_NUM_MASK 0x1c0
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PREFETCH_NUM__SHIFT 0x6
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PREFETCH_MAX_Z_MASK 0xffe00
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PREFETCH_MAX_Z__SHIFT 0x9
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PIPE_CONFIG_MASK 0xf8000000
+#define HDP_NONSURFACE_PREFETCH__NONSURF_PIPE_CONFIG__SHIFT 0x1b
+#define HDP_MEMIO_CNTL__MEMIO_SEND_MASK 0x1
+#define HDP_MEMIO_CNTL__MEMIO_SEND__SHIFT 0x0
+#define HDP_MEMIO_CNTL__MEMIO_OP_MASK 0x2
+#define HDP_MEMIO_CNTL__MEMIO_OP__SHIFT 0x1
+#define HDP_MEMIO_CNTL__MEMIO_BE_MASK 0x3c
+#define HDP_MEMIO_CNTL__MEMIO_BE__SHIFT 0x2
+#define HDP_MEMIO_CNTL__MEMIO_WR_STROBE_MASK 0x40
+#define HDP_MEMIO_CNTL__MEMIO_WR_STROBE__SHIFT 0x6
+#define HDP_MEMIO_CNTL__MEMIO_RD_STROBE_MASK 0x80
+#define HDP_MEMIO_CNTL__MEMIO_RD_STROBE__SHIFT 0x7
+#define HDP_MEMIO_CNTL__MEMIO_ADDR_UPPER_MASK 0x3f00
+#define HDP_MEMIO_CNTL__MEMIO_ADDR_UPPER__SHIFT 0x8
+#define HDP_MEMIO_CNTL__MEMIO_CLR_WR_ERROR_MASK 0x4000
+#define HDP_MEMIO_CNTL__MEMIO_CLR_WR_ERROR__SHIFT 0xe
+#define HDP_MEMIO_CNTL__MEMIO_CLR_RD_ERROR_MASK 0x8000
+#define HDP_MEMIO_CNTL__MEMIO_CLR_RD_ERROR__SHIFT 0xf
+#define HDP_MEMIO_CNTL__MEMIO_VF_MASK 0x10000
+#define HDP_MEMIO_CNTL__MEMIO_VF__SHIFT 0x10
+#define HDP_MEMIO_CNTL__MEMIO_VFID_MASK 0x1e0000
+#define HDP_MEMIO_CNTL__MEMIO_VFID__SHIFT 0x11
+#define HDP_MEMIO_ADDR__MEMIO_ADDR_LOWER_MASK 0xffffffff
+#define HDP_MEMIO_ADDR__MEMIO_ADDR_LOWER__SHIFT 0x0
+#define HDP_MEMIO_STATUS__MEMIO_WR_STATUS_MASK 0x1
+#define HDP_MEMIO_STATUS__MEMIO_WR_STATUS__SHIFT 0x0
+#define HDP_MEMIO_STATUS__MEMIO_RD_STATUS_MASK 0x2
+#define HDP_MEMIO_STATUS__MEMIO_RD_STATUS__SHIFT 0x1
+#define HDP_MEMIO_STATUS__MEMIO_WR_ERROR_MASK 0x4
+#define HDP_MEMIO_STATUS__MEMIO_WR_ERROR__SHIFT 0x2
+#define HDP_MEMIO_STATUS__MEMIO_RD_ERROR_MASK 0x8
+#define HDP_MEMIO_STATUS__MEMIO_RD_ERROR__SHIFT 0x3
+#define HDP_MEMIO_WR_DATA__MEMIO_WR_DATA_MASK 0xffffffff
+#define HDP_MEMIO_WR_DATA__MEMIO_WR_DATA__SHIFT 0x0
+#define HDP_MEMIO_RD_DATA__MEMIO_RD_DATA_MASK 0xffffffff
+#define HDP_MEMIO_RD_DATA__MEMIO_RD_DATA__SHIFT 0x0
+#define HDP_VF_ENABLE__VF_EN_MASK 0x1
+#define HDP_VF_ENABLE__VF_EN__SHIFT 0x0
+#define HDP_VF_ENABLE__VF_NUM_MASK 0xffff0000
+#define HDP_VF_ENABLE__VF_NUM__SHIFT 0x10
+#define HDP_XDP_DIRECT2HDP_FIRST__RESERVED_MASK 0xffffffff
+#define HDP_XDP_DIRECT2HDP_FIRST__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_FLUSH_NUM_MASK 0xf
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_FLUSH_NUM__SHIFT 0x0
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_MBX_ENC_DATA_MASK 0xf0
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_MBX_ENC_DATA__SHIFT 0x4
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_MBX_ADDR_SEL_MASK 0x700
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_MBX_ADDR_SEL__SHIFT 0x8
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_XPB_CLG_MASK 0xf800
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_XPB_CLG__SHIFT 0xb
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_SEND_HOST_MASK 0x10000
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_SEND_HOST__SHIFT 0x10
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_SEND_SIDE_MASK 0x20000
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_SEND_SIDE__SHIFT 0x11
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_ALTER_FLUSH_NUM_MASK 0x40000
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_ALTER_FLUSH_NUM__SHIFT 0x12
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_RSVD_0_MASK 0x80000
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_RSVD_0__SHIFT 0x13
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_RSVD_1_MASK 0x100000
+#define HDP_XDP_D2H_FLUSH__D2H_FLUSH_RSVD_1__SHIFT 0x14
+#define HDP_XDP_D2H_BAR_UPDATE__D2H_BAR_UPDATE_ADDR_MASK 0xffff
+#define HDP_XDP_D2H_BAR_UPDATE__D2H_BAR_UPDATE_ADDR__SHIFT 0x0
+#define HDP_XDP_D2H_BAR_UPDATE__D2H_BAR_UPDATE_FLUSH_NUM_MASK 0xf0000
+#define HDP_XDP_D2H_BAR_UPDATE__D2H_BAR_UPDATE_FLUSH_NUM__SHIFT 0x10
+#define HDP_XDP_D2H_BAR_UPDATE__D2H_BAR_UPDATE_BAR_NUM_MASK 0x700000
+#define HDP_XDP_D2H_BAR_UPDATE__D2H_BAR_UPDATE_BAR_NUM__SHIFT 0x14
+#define HDP_XDP_D2H_RSVD_3__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_3__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_4__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_4__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_5__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_5__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_6__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_6__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_7__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_7__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_8__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_8__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_9__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_9__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_10__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_10__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_11__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_11__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_12__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_12__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_13__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_13__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_14__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_14__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_15__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_15__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_16__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_16__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_17__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_17__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_18__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_18__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_19__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_19__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_20__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_20__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_21__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_21__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_22__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_22__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_23__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_23__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H_RSVD_24__RESERVED_MASK 0xffffffff
+#define HDP_XDP_D2H_RSVD_24__RESERVED__SHIFT 0x0
+#define HDP_XDP_D2H

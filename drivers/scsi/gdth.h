@@ -1,1010 +1,1784 @@
-#ifndef _GDTH_H
-#define _GDTH_H
-
-/*
- * Header file for the GDT Disk Array/Storage RAID controllers driver for Linux
- * 
- * gdth.h Copyright (C) 1995-06 ICP vortex, Achim Leubner
- * See gdth.c for further informations and 
- * below for supported controller types
- *
- * <achim_leubner@adaptec.com>
- *
- * $Id: gdth.h,v 1.58 2006/01/11 16:14:09 achim Exp $
- */
-
-#include <linux/types.h>
-
-#ifndef TRUE
-#define TRUE 1
-#endif
-#ifndef FALSE
-#define FALSE 0
-#endif
-
-/* defines, macros */
-
-/* driver version */
-#define GDTH_VERSION_STR        "3.05"
-#define GDTH_VERSION            3
-#define GDTH_SUBVERSION         5
-
-/* protocol version */
-#define PROTOCOL_VERSION        1
-
-/* OEM IDs */
-#define OEM_ID_ICP      0x941c
-#define OEM_ID_INTEL    0x8000
-
-/* controller classes */
-#define GDT_ISA         0x01                    /* ISA controller */
-#define GDT_EISA        0x02                    /* EISA controller */
-#define GDT_PCI         0x03                    /* PCI controller */
-#define GDT_PCINEW      0x04                    /* new PCI controller */
-#define GDT_PCIMPR      0x05                    /* PCI MPR controller */
-/* GDT_EISA, controller subtypes EISA */
-#define GDT3_ID         0x0130941c              /* GDT3000/3020 */
-#define GDT3A_ID        0x0230941c              /* GDT3000A/3020A/3050A */
-#define GDT3B_ID        0x0330941c              /* GDT3000B/3010A */
-/* GDT_ISA */
-#define GDT2_ID         0x0120941c              /* GDT2000/2020 */
-
-#ifndef PCI_DEVICE_ID_VORTEX_GDT60x0
-/* GDT_PCI */
-#define PCI_DEVICE_ID_VORTEX_GDT60x0    0       /* GDT6000/6020/6050 */
-#define PCI_DEVICE_ID_VORTEX_GDT6000B   1       /* GDT6000B/6010 */
-/* GDT_PCINEW */
-#define PCI_DEVICE_ID_VORTEX_GDT6x10    2       /* GDT6110/6510 */
-#define PCI_DEVICE_ID_VORTEX_GDT6x20    3       /* GDT6120/6520 */
-#define PCI_DEVICE_ID_VORTEX_GDT6530    4       /* GDT6530 */
-#define PCI_DEVICE_ID_VORTEX_GDT6550    5       /* GDT6550 */
-/* GDT_PCINEW, wide/ultra SCSI controllers */
-#define PCI_DEVICE_ID_VORTEX_GDT6x17    6       /* GDT6117/6517 */
-#define PCI_DEVICE_ID_VORTEX_GDT6x27    7       /* GDT6127/6527 */
-#define PCI_DEVICE_ID_VORTEX_GDT6537    8       /* GDT6537 */
-#define PCI_DEVICE_ID_VORTEX_GDT6557    9       /* GDT6557/6557-ECC */
-/* GDT_PCINEW, wide SCSI controllers */
-#define PCI_DEVICE_ID_VORTEX_GDT6x15    10      /* GDT6115/6515 */
-#define PCI_DEVICE_ID_VORTEX_GDT6x25    11      /* GDT6125/6525 */
-#define PCI_DEVICE_ID_VORTEX_GDT6535    12      /* GDT6535 */
-#define PCI_DEVICE_ID_VORTEX_GDT6555    13      /* GDT6555/6555-ECC */
-#endif
-
-#ifndef PCI_DEVICE_ID_VORTEX_GDT6x17RP
-/* GDT_MPR, RP series, wide/ultra SCSI */
-#define PCI_DEVICE_ID_VORTEX_GDT6x17RP  0x100   /* GDT6117RP/GDT6517RP */
-#define PCI_DEVICE_ID_VORTEX_GDT6x27RP  0x101   /* GDT6127RP/GDT6527RP */
-#define PCI_DEVICE_ID_VORTEX_GDT6537RP  0x102   /* GDT6537RP */
-#define PCI_DEVICE_ID_VORTEX_GDT6557RP  0x103   /* GDT6557RP */
-/* GDT_MPR, RP series, narrow/ultra SCSI */
-#define PCI_DEVICE_ID_VORTEX_GDT6x11RP  0x104   /* GDT6111RP/GDT6511RP */
-#define PCI_DEVICE_ID_VORTEX_GDT6x21RP  0x105   /* GDT6121RP/GDT6521RP */
-#endif
-#ifndef PCI_DEVICE_ID_VORTEX_GDT6x17RD
-/* GDT_MPR, RD series, wide/ultra SCSI */
-#define PCI_DEVICE_ID_VORTEX_GDT6x17RD  0x110   /* GDT6117RD/GDT6517RD */
-#define PCI_DEVICE_ID_VORTEX_GDT6x27RD  0x111   /* GDT6127RD/GDT6527RD */
-#define PCI_DEVICE_ID_VORTEX_GDT6537RD  0x112   /* GDT6537RD */
-#define PCI_DEVICE_ID_VORTEX_GDT6557RD  0x113   /* GDT6557RD */
-/* GDT_MPR, RD series, narrow/ultra SCSI */
-#define PCI_DEVICE_ID_VORTEX_GDT6x11RD  0x114   /* GDT6111RD/GDT6511RD */
-#define PCI_DEVICE_ID_VORTEX_GDT6x21RD  0x115   /* GDT6121RD/GDT6521RD */
-/* GDT_MPR, RD series, wide/ultra2 SCSI */
-#define PCI_DEVICE_ID_VORTEX_GDT6x18RD  0x118   /* GDT6118RD/GDT6518RD/
-                                                   GDT6618RD */
-#define PCI_DEVICE_ID_VORTEX_GDT6x28RD  0x119   /* GDT6128RD/GDT6528RD/
-                                                   GDT6628RD */
-#define PCI_DEVICE_ID_VORTEX_GDT6x38RD  0x11A   /* GDT6538RD/GDT6638RD */
-#define PCI_DEVICE_ID_VORTEX_GDT6x58RD  0x11B   /* GDT6558RD/GDT6658RD */
-/* GDT_MPR, RN series (64-bit PCI), wide/ultra2 SCSI */
-#define PCI_DEVICE_ID_VORTEX_GDT7x18RN  0x168   /* GDT7118RN/GDT7518RN/
-                                                   GDT7618RN */
-#define PCI_DEVICE_ID_VORTEX_GDT7x28RN  0x169   /* GDT7128RN/GDT7528RN/
-                                                   GDT7628RN */
-#define PCI_DEVICE_ID_VORTEX_GDT7x38RN  0x16A   /* GDT7538RN/GDT7638RN */
-#define PCI_DEVICE_ID_VORTEX_GDT7x58RN  0x16B   /* GDT7558RN/GDT7658RN */
-#endif
-
-#ifndef PCI_DEVICE_ID_VORTEX_GDT6x19RD
-/* GDT_MPR, RD series, Fibre Channel */
-#define PCI_DEVICE_ID_VORTEX_GDT6x19RD  0x210   /* GDT6519RD/GDT6619RD */
-#define PCI_DEVICE_ID_VORTEX_GDT6x29RD  0x211   /* GDT6529RD/GDT6629RD */
-/* GDT_MPR, RN series (64-bit PCI), Fibre Channel */
-#define PCI_DEVICE_ID_VORTEX_GDT7x19RN  0x260   /* GDT7519RN/GDT7619RN */
-#define PCI_DEVICE_ID_VORTEX_GDT7x29RN  0x261   /* GDT7529RN/GDT7629RN */
-#endif
-
-#ifndef PCI_DEVICE_ID_VORTEX_GDTMAXRP
-/* GDT_MPR, last device ID */
-#define PCI_DEVICE_ID_VORTEX_GDTMAXRP   0x2ff   
-#endif
-
-#ifndef PCI_DEVICE_ID_VORTEX_GDTNEWRX
-/* new GDT Rx Controller */
-#define PCI_DEVICE_ID_VORTEX_GDTNEWRX   0x300
-#endif
-
-#ifndef PCI_DEVICE_ID_VORTEX_GDTNEWRX2
-/* new(2) GDT Rx Controller */
-#define PCI_DEVICE_ID_VORTEX_GDTNEWRX2  0x301
-#endif        
-
-#ifndef PCI_DEVICE_ID_INTEL_SRC
-/* Intel Storage RAID Controller */
-#define PCI_DEVICE_ID_INTEL_SRC         0x600
-#endif
-
-#ifndef PCI_DEVICE_ID_INTEL_SRC_XSCALE
-/* Intel Storage RAID Controller */
-#define PCI_DEVICE_ID_INTEL_SRC_XSCALE  0x601
-#endif
-
-/* limits */
-#define GDTH_SCRATCH    PAGE_SIZE               /* 4KB scratch buffer */
-#define GDTH_MAXCMDS    120
-#define GDTH_MAXC_P_L   16                      /* max. cmds per lun */
-#define GDTH_MAX_RAW    2                       /* max. cmds per raw device */
-#define MAXOFFSETS      128
-#define MAXHA           16
-#define MAXID           127
-#define MAXLUN          8
-#define MAXBUS          6
-#define MAX_EVENTS      100                     /* event buffer count */
-#define MAX_RES_ARGS    40                      /* device reservation, 
-                                                   must be a multiple of 4 */
-#define MAXCYLS         1024
-#define HEADS           64
-#define SECS            32                      /* mapping 64*32 */
-#define MEDHEADS        127
-#define MEDSECS         63                      /* mapping 127*63 */
-#define BIGHEADS        255
-#define BIGSECS         63                      /* mapping 255*63 */
-
-/* special command ptr. */
-#define UNUSED_CMND     ((Scsi_Cmnd *)-1)
-#define INTERNAL_CMND   ((Scsi_Cmnd *)-2)
-#define SCREEN_CMND     ((Scsi_Cmnd *)-3)
-#define SPECIAL_SCP(p)  (p==UNUSED_CMND || p==INTERNAL_CMND || p==SCREEN_CMND)
-
-/* controller services */
-#define SCSIRAWSERVICE  3
-#define CACHESERVICE    9
-#define SCREENSERVICE   11
-
-/* screenservice defines */
-#define MSG_INV_HANDLE  -1                      /* special message handle */
-#define MSGLEN          16                      /* size of message text */
-#define MSG_SIZE        34                      /* size of message structure */
-#define MSG_REQUEST     0                       /* async. event: message */
-
-/* DPMEM constants */
-#define DPMEM_MAGIC     0xC0FFEE11
-#define IC_HEADER_BYTES 48
-#define IC_QUEUE_BYTES  4
-#define DPMEM_COMMAND_OFFSET    IC_HEADER_BYTES+IC_QUEUE_BYTES*MAXOFFSETS
-
-/* cluster_type constants */
-#define CLUSTER_DRIVE         1
-#define CLUSTER_MOUNTED       2
-#define CLUSTER_RESERVED      4
-#define CLUSTER_RESERVE_STATE (CLUSTER_DRIVE|CLUSTER_MOUNTED|CLUSTER_RESERVED)
-
-/* commands for all services, cache service */
-#define GDT_INIT        0                       /* service initialization */
-#define GDT_READ        1                       /* read command */
-#define GDT_WRITE       2                       /* write command */
-#define GDT_INFO        3                       /* information about devices */
-#define GDT_FLUSH       4                       /* flush dirty cache buffers */
-#define GDT_IOCTL       5                       /* ioctl command */
-#define GDT_DEVTYPE     9                       /* additional information */
-#define GDT_MOUNT       10                      /* mount cache device */
-#define GDT_UNMOUNT     11                      /* unmount cache device */
-#define GDT_SET_FEAT    12                      /* set feat. (scatter/gather) */
-#define GDT_GET_FEAT    13                      /* get features */
-#define GDT_WRITE_THR   16                      /* write through */
-#define GDT_READ_THR    17                      /* read through */
-#define GDT_EXT_INFO    18                      /* extended info */
-#define GDT_RESET       19                      /* controller reset */
-#define GDT_RESERVE_DRV 20                      /* reserve host drive */
-#define GDT_RELEASE_DRV 21                      /* release host drive */
-#define GDT_CLUST_INFO  22                      /* cluster info */
-#define GDT_RW_ATTRIBS  23                      /* R/W attribs (write thru,..)*/
-#define GDT_CLUST_RESET 24                      /* releases the cluster drives*/
-#define GDT_FREEZE_IO   25                      /* freezes all IOs */
-#define GDT_UNFREEZE_IO 26                      /* unfreezes all IOs */
-#define GDT_X_INIT_HOST 29                      /* ext. init: 64 bit support */
-#define GDT_X_INFO      30                      /* ext. info for drives>2TB */
-
-/* raw service commands */
-#define GDT_RESERVE     14                      /* reserve dev. to raw serv. */
-#define GDT_RELEASE     15                      /* release device */
-#define GDT_RESERVE_ALL 16                      /* reserve all devices */
-#define GDT_RELEASE_ALL 17                      /* release all devices */
-#define GDT_RESET_BUS   18                      /* reset bus */
-#define GDT_SCAN_START  19                      /* start device scan */
-#define GDT_SCAN_END    20                      /* stop device scan */  
-#define GDT_X_INIT_RAW  21                      /* ext. init: 64 bit support */
-
-/* screen service commands */
-#define GDT_REALTIME    3                       /* realtime clock to screens. */
-#define GDT_X_INIT_SCR  4                       /* ext. init: 64 bit support */
-
-/* IOCTL command defines */
-#define SCSI_DR_INFO    0x00                    /* SCSI drive info */                   
-#define SCSI_CHAN_CNT   0x05                    /* SCSI channel count */   
-#define SCSI_DR_LIST    0x06                    /* SCSI drive list */
-#define SCSI_DEF_CNT    0x15                    /* grown/primary defects */
-#define DSK_STATISTICS  0x4b                    /* SCSI disk statistics */
-#define IOCHAN_DESC     0x5d                    /* description of IO channel */
-#define IOCHAN_RAW_DESC 0x5e                    /* description of raw IO chn. */
-#define L_CTRL_PATTERN  0x20000000L             /* SCSI IOCTL mask */
-#define ARRAY_INFO      0x12                    /* array drive info */
-#define ARRAY_DRV_LIST  0x0f                    /* array drive list */
-#define ARRAY_DRV_LIST2 0x34                    /* array drive list (new) */
-#define LA_CTRL_PATTERN 0x10000000L             /* array IOCTL mask */
-#define CACHE_DRV_CNT   0x01                    /* cache drive count */
-#define CACHE_DRV_LIST  0x02                    /* cache drive list */
-#define CACHE_INFO      0x04                    /* cache info */
-#define CACHE_CONFIG    0x05                    /* cache configuration */
-#define CACHE_DRV_INFO  0x07                    /* cache drive info */
-#define BOARD_FEATURES  0x15                    /* controller features */
-#define BOARD_INFO      0x28                    /* controller info */
-#define SET_PERF_MODES  0x82                    /* set mode (coalescing,..) */
-#define GET_PERF_MODES  0x83                    /* get mode */
-#define CACHE_READ_OEM_STRING_RECORD 0x84       /* read OEM string record */ 
-#define HOST_GET        0x10001L                /* get host drive list */
-#define IO_CHANNEL      0x00020000L             /* default IO channel */
-#define INVALID_CHANNEL 0x0000ffffL             /* invalid channel */
-
-/* service errors */
-#define S_OK            1                       /* no error */
-#define S_GENERR        6                       /* general error */
-#define S_BSY           7                       /* controller busy */
-#define S_CACHE_UNKNOWN 12                      /* cache serv.: drive unknown */
-#define S_RAW_SCSI      12                      /* raw serv.: target error */
-#define S_RAW_ILL       0xff                    /* raw serv.: illegal */
-#define S_NOFUNC        -2                      /* unknown function */
-#define S_CACHE_RESERV  -24                     /* cache: reserv. conflict */   
-
-/* timeout values */
-#define INIT_RETRIES    100000                  /* 100000 * 1ms = 100s */
-#define INIT_TIMEOUT    100000                  /* 100000 * 1ms = 100s */
-#define POLL_TIMEOUT    10000                   /* 10000 * 1ms = 10s */
-
-/* priorities */
-#define DEFAULT_PRI     0x20
-#define IOCTL_PRI       0x10
-#define HIGH_PRI        0x08
-
-/* data directions */
-#define GDTH_DATA_IN    0x01000000L             /* data from target */
-#define GDTH_DATA_OUT   0x00000000L             /* data to target */
-
-/* BMIC registers (EISA controllers) */
-#define ID0REG          0x0c80                  /* board ID */
-#define EINTENABREG     0x0c89                  /* interrupt enable */
-#define SEMA0REG        0x0c8a                  /* command semaphore */
-#define SEMA1REG        0x0c8b                  /* status semaphore */
-#define LDOORREG        0x0c8d                  /* local doorbell */
-#define EDENABREG       0x0c8e                  /* EISA system doorbell enab. */
-#define EDOORREG        0x0c8f                  /* EISA system doorbell */
-#define MAILBOXREG      0x0c90                  /* mailbox reg. (16 bytes) */
-#define EISAREG         0x0cc0                  /* EISA configuration */
-
-/* other defines */
-#define LINUX_OS        8                       /* used for cache optim. */
-#define SECS32          0x1f                    /* round capacity */
-#define BIOS_ID_OFFS    0x10                    /* offset contr-ID in ISABIOS */
-#define LOCALBOARD      0                       /* board node always 0 */
-#define ASYNCINDEX      0                       /* cmd index async. event */
-#define SPEZINDEX       1                       /* cmd index unknown service */
-#define COALINDEX       (GDTH_MAXCMDS + 2)
-
-/* features */
-#define SCATTER_GATHER  1                       /* s/g feature */
-#define GDT_WR_THROUGH  0x100                   /* WRITE_THROUGH supported */
-#define GDT_64BIT       0x200                   /* 64bit / drv>2TB support */
-
-#include "gdth_ioctl.h"
-
-/* screenservice message */
-typedef struct {                               
-    u32     msg_handle;                     /* message handle */
-    u32     msg_len;                        /* size of message */
-    u32     msg_alen;                       /* answer length */
-    u8      msg_answer;                     /* answer flag */
-    u8      msg_ext;                        /* more messages */
-    u8      msg_reserved[2];
-    char        msg_text[MSGLEN+2];             /* the message text */
-} __attribute__((packed)) gdth_msg_str;
-
-
-/* IOCTL data structures */
-
-/* Status coalescing buffer for returning multiple requests per interrupt */
-typedef struct {
-    u32     status;
-    u32     ext_status;
-    u32     info0;
-    u32     info1;
-} __attribute__((packed)) gdth_coal_status;
-
-/* performance mode data structure */
-typedef struct {
-    u32     version;            /* The version of this IOCTL structure. */
-    u32     st_mode;            /* 0=dis., 1=st_buf_addr1 valid, 2=both  */
-    u32     st_buff_addr1;      /* physical address of status buffer 1 */
-    u32     st_buff_u_addr1;    /* reserved for 64 bit addressing */
-    u32     st_buff_indx1;      /* reserved command idx. for this buffer */
-    u32     st_buff_addr2;      /* physical address of status buffer 1 */
-    u32     st_buff_u_addr2;    /* reserved for 64 bit addressing */
-    u32     st_buff_indx2;      /* reserved command idx. for this buffer */
-    u32     st_buff_size;       /* size of each buffer in bytes */
-    u32     cmd_mode;           /* 0 = mode disabled, 1 = cmd_buff_addr1 */ 
-    u32     cmd_buff_addr1;     /* physical address of cmd buffer 1 */   
-    u32     cmd_buff_u_addr1;   /* reserved for 64 bit addressing */
-    u32     cmd_buff_indx1;     /* cmd buf addr1 unique identifier */
-    u32     cmd_buff_addr2;     /* physical address of cmd buffer 1 */   
-    u32     cmd_buff_u_addr2;   /* reserved for 64 bit addressing */
-    u32     cmd_buff_indx2;     /* cmd buf addr1 unique identifier */
-    u32     cmd_buff_size;      /* size of each cmd buffer in bytes */
-    u32     reserved1;
-    u32     reserved2;
-} __attribute__((packed)) gdth_perf_modes;
-
-/* SCSI drive info */
-typedef struct {
-    u8      vendor[8];                      /* vendor string */
-    u8      product[16];                    /* product string */
-    u8      revision[4];                    /* revision */
-    u32     sy_rate;                        /* current rate for sync. tr. */
-    u32     sy_max_rate;                    /* max. rate for sync. tr. */
-    u32     no_ldrive;                      /* belongs to this log. drv.*/
-    u32     blkcnt;                         /* number of blocks */
-    u16      blksize;                        /* size of block in bytes */
-    u8      available;                      /* flag: access is available */
-    u8      init;                           /* medium is initialized */
-    u8      devtype;                        /* SCSI devicetype */
-    u8      rm_medium;                      /* medium is removable */
-    u8      wp_medium;                      /* medium is write protected */
-    u8      ansi;                           /* SCSI I/II or III? */
-    u8      protocol;                       /* same as ansi */
-    u8      sync;                           /* flag: sync. transfer enab. */
-    u8      disc;                           /* flag: disconnect enabled */
-    u8      queueing;                       /* flag: command queing enab. */
-    u8      cached;                         /* flag: caching enabled */
-    u8      target_id;                      /* target ID of device */
-    u8      lun;                            /* LUN id of device */
-    u8      orphan;                         /* flag: drive fragment */
-    u32     last_error;                     /* sense key or drive state */
-    u32     last_result;                    /* result of last command */
-    u32     check_errors;                   /* err. in last surface check */
-    u8      percent;                        /* progress for surface check */
-    u8      last_check;                     /* IOCTRL operation */
-    u8      res[2];
-    u32     flags;                          /* from 1.19/2.19: raw reserv.*/
-    u8      multi_bus;                      /* multi bus dev? (fibre ch.) */
-    u8      mb_status;                      /* status: available? */
-    u8      res2[2];
-    u8      mb_alt_status;                  /* status on second bus */
-    u8      mb_alt_bid;                     /* number of second bus */
-    u8      mb_alt_tid;                     /* target id on second bus */
-    u8      res3;
-    u8      fc_flag;                        /* from 1.22/2.22: info valid?*/
-    u8      res4;
-    u16      fc_frame_size;                  /* frame size (bytes) */
-    char        wwn[8];                         /* world wide name */
-} __attribute__((packed)) gdth_diskinfo_str;
-
-/* get SCSI channel count  */
-typedef struct {
-    u32     channel_no;                     /* number of channel */
-    u32     drive_cnt;                      /* drive count */
-    u8      siop_id;                        /* SCSI processor ID */
-    u8      siop_state;                     /* SCSI processor state */ 
-} __attribute__((packed)) gdth_getch_str;
-
-/* get SCSI drive numbers */
-typedef struct {
-    u32     sc_no;                          /* SCSI channel */
-    u32     sc_cnt;                         /* sc_list[] elements */
-    u32     sc_list[MAXID];                 /* minor device numbers */
-} __attribute__((packed)) gdth_drlist_str;
-
-/* get grown/primary defect count */
-typedef struct {
-    u8      sddc_type;                      /* 0x08: grown, 0x10: prim. */
-    u8      sddc_format;                    /* list entry format */
-    u8      sddc_len;                       /* list entry length */
-    u8      sddc_res;
-    u32     sddc_cnt;                       /* entry count */
-} __attribute__((packed)) gdth_defcnt_str;
-
-/* disk statistics */
-typedef struct {
-    u32     bid;                            /* SCSI channel */
-    u32     first;                          /* first SCSI disk */
-    u32     entries;                        /* number of elements */
-    u32     count;                          /* (R) number of init. el. */
-    u32     mon_time;                       /* time stamp */
-    struct {
-        u8  tid;                            /* target ID */
-        u8  lun;                            /* LUN */
-        u8  res[2];
-        u32 blk_size;                       /* block size in bytes */
-        u32 rd_count;                       /* bytes read */
-        u32 wr_count;                       /* bytes written */
-        u32 rd_blk_count;                   /* blocks read */
-        u32 wr_blk_count;                   /* blocks written */
-        u32 retries;                        /* retries */
-        u32 reassigns;                      /* reassigns */
-    } __attribute__((packed)) list[1];
-} __attribute__((packed)) gdth_dskstat_str;
-
-/* IO channel header */
-typedef struct {
-    u32     version;                        /* version (-1UL: newest) */
-    u8      list_entries;                   /* list entry count */
-    u8      first_chan;                     /* first channel number */
-    u8      last_chan;                      /* last channel number */
-    u8      chan_count;                     /* (R) channel count */
-    u32     list_offset;                    /* offset of list[0] */
-} __attribute__((packed)) gdth_iochan_header;
-
-/* get IO channel description */
-typedef struct {
-    gdth_iochan_header  hdr;
-    struct {
-        u32         address;                /* channel address */
-        u8          type;                   /* type (SCSI, FCAL) */
-        u8          local_no;               /* local number */
-        u16          features;               /* channel features */
-    } __attribute__((packed)) list[MAXBUS];
-} __attribute__((packed)) gdth_iochan_str;
-
-/* get raw IO channel description */
-typedef struct {
-    gdth_iochan_header  hdr;
-    struct {
-        u8      proc_id;                    /* processor id */
-        u8      proc_defect;                /* defect ? */
-        u8      reserved[2];
-    } __attribute__((packed)) list[MAXBUS];
-} __attribute__((packed)) gdth_raw_iochan_str;
-
-/* array drive component */
-typedef struct {
-    u32     al_controller;                  /* controller ID */
-    u8      al_cache_drive;                 /* cache drive number */
-    u8      al_status;                      /* cache drive state */
-    u8      al_res[2];     
-} __attribute__((packed)) gdth_arraycomp_str;
-
-/* array drive information */
-typedef struct {
-    u8      ai_type;                        /* array type (RAID0,4,5) */
-    u8      ai_cache_drive_cnt;             /* active cachedrives */
-    u8      ai_state;                       /* array drive state */
-    u8      ai_master_cd;                   /* master cachedrive */
-    u32     ai_master_controller;           /* ID of master controller */
-    u32     ai_size;                        /* user capacity [sectors] */
-    u32     ai_striping_size;               /* striping size [sectors] */
-    u32     ai_secsize;                     /* sector size [bytes] */
-    u32     ai_err_info;                    /* failed cache drive */
-    u8      ai_name[8];                     /* name of the array drive */
-    u8      ai_controller_cnt;              /* number of controllers */
-    u8      ai_removable;                   /* flag: removable */
-    u8      ai_write_protected;             /* flag: write protected */
-    u8      ai_devtype;                     /* type: always direct access */
-    gdth_arraycomp_str  ai_drives[35];          /* drive components: */
-    u8      ai_drive_entries;               /* number of drive components */
-    u8      ai_protected;                   /* protection flag */
-    u8      ai_verify_state;                /* state of a parity verify */
-    u8      ai_ext_state;                   /* extended array drive state */
-    u8      ai_expand_state;                /* array expand state (>=2.18)*/
-    u8      ai_reserved[3];
-} __attribute__((packed)) gdth_arrayinf_str;
-
-/* get array drive list */
-typedef struct {
-    u32     controller_no;                  /* controller no. */
-    u8      cd_handle;                      /* master cachedrive */
-    u8      is_arrayd;                      /* Flag: is array drive? */
-    u8      is_master;                      /* Flag: is array master? */
-    u8      is_parity;                      /* Flag: is parity drive? */
-    u8      is_hotfix;                      /* Flag: is hotfix drive? */
-    u8      res[3];
-} __attribute__((packed)) gdth_alist_str;
-
-typedef struct {
-    u32     entries_avail;                  /* allocated entries */
-    u32     entries_init;                   /* returned entries */
-    u32     first_entry;                    /* first entry number */
-    u32     list_offset;                    /* offset of following list */
-    gdth_alist_str list[1];                     /* list */
-} __attribute__((packed)) gdth_arcdl_str;
-
-/* cache info/config IOCTL */
-typedef struct {
-    u32     version;                        /* firmware version */
-    u16      state;                          /* cache state (on/off) */
-    u16      strategy;                       /* cache strategy */
-    u16      write_back;                     /* write back state (on/off) */
-    u16      block_size;                     /* cache block size */
-} __attribute__((packed)) gdth_cpar_str;
-
-typedef struct {
-    u32     csize;                          /* cache size */
-    u32     read_cnt;                       /* read/write counter */
-    u32     write_cnt;
-    u32     tr_hits;                        /* hits */
-    u32     sec_hits;
-    u32     sec_miss;                       /* misses */
-} __attribute__((packed)) gdth_cstat_str;
-
-typedef struct {
-    gdth_cpar_str   cpar;
-    gdth_cstat_str  cstat;
-} __attribute__((packed)) gdth_cinfo_str;
-
-/* cache drive info */
-typedef struct {
-    u8      cd_name[8];                     /* cache drive name */
-    u32     cd_devtype;                     /* SCSI devicetype */
-    u32     cd_ldcnt;                       /* number of log. drives */
-    u32     cd_last_error;                  /* last error */
-    u8      cd_initialized;                 /* drive is initialized */
-    u8      cd_removable;                   /* media is removable */
-    u8      cd_write_protected;             /* write protected */
-    u8      cd_flags;                       /* Pool Hot Fix? */
-    u32     ld_blkcnt;                      /* number of blocks */
-    u32     ld_blksize;                     /* blocksize */
-    u32     ld_dcnt;                        /* number of disks */
-    u32     ld_slave;                       /* log. drive index */
-    u32     ld_dtype;                       /* type of logical drive */
-    u32     ld_last_error;                  /* last error */
-    u8      ld_name[8];                     /* log. drive name */
-    u8      ld_error;                       /* error */
-} __attribute__((packed)) gdth_cdrinfo_str;
-
-/* OEM string */
-typedef struct {
-    u32     ctl_version;
-    u32     file_major_version;
-    u32     file_minor_version;
-    u32     buffer_size;
-    u32     cpy_count;
-    u32     ext_error;
-    u32     oem_id;
-    u32     board_id;
-} __attribute__((packed)) gdth_oem_str_params;
-
-typedef struct {
-    u8      product_0_1_name[16];
-    u8      product_4_5_name[16];
-    u8      product_cluster_name[16];
-    u8      product_reserved[16];
-    u8      scsi_cluster_target_vendor_id[16];
-    u8      cluster_raid_fw_name[16];
-    u8      oem_brand_name[16];
-    u8      oem_raid_type[16];
-    u8      bios_type[13];
-    u8      bios_title[50];
-    u8      oem_company_name[37];
-    u32     pci_id_1;
-    u32     pci_id_2;
-    u8      validation_status[80];
-    u8      reserved_1[4];
-    u8      scsi_host_drive_inquiry_vendor_id[16];
-    u8      library_file_template[16];
-    u8      reserved_2[16];
-    u8      tool_name_1[32];
-    u8      tool_name_2[32];
-    u8      tool_name_3[32];
-    u8      oem_contact_1[84];
-    u8      oem_contact_2[84];
-    u8      oem_contact_3[84];
-} __attribute__((packed)) gdth_oem_str;
-
-typedef struct {
-    gdth_oem_str_params params;
-    gdth_oem_str        text;
-} __attribute__((packed)) gdth_oem_str_ioctl;
-
-/* board features */
-typedef struct {
-    u8      chaining;                       /* Chaining supported */
-    u8      striping;                       /* Striping (RAID-0) supp. */
-    u8      mirroring;                      /* Mirroring (RAID-1) supp. */
-    u8      raid;                           /* RAID-4/5/10 supported */
-} __attribute__((packed)) gdth_bfeat_str;
-
-/* board info IOCTL */
-typedef struct {
-    u32     ser_no;                         /* serial no. */
-    u8      oem_id[2];                      /* OEM ID */
-    u16      ep_flags;                       /* eprom flags */
-    u32     proc_id;                        /* processor ID */
-    u32     memsize;                        /* memory size (bytes) */
-    u8      mem_banks;                      /* memory banks */
-    u8      chan_type;                      /* channel type */
-    u8      chan_count;                     /* channel count */
-    u8      rdongle_pres;                   /* dongle present? */
-    u32     epr_fw_ver;                     /* (eprom) firmware version */
-    u32     upd_fw_ver;                     /* (update) firmware version */
-    u32     upd_revision;                   /* update revision */
-    char        type_string[16];                /* controller name */
-    char        raid_string[16];                /* RAID firmware name */
-    u8      update_pres;                    /* update present? */
-    u8      xor_pres;                       /* XOR engine present? */
-    u8      prom_type;                      /* ROM type (eprom/flash) */
-    u8      prom_count;                     /* number of ROM devices */
-    u32     dup_pres;                       /* duplexing module present? */
-    u32     chan_pres;                      /* number of expansion chn. */
-    u32     mem_pres;                       /* memory expansion inst. ? */
-    u8      ft_bus_system;                  /* fault bus supported? */
-    u8      subtype_valid;                  /* board_subtype valid? */
-    u8      board_subtype;                  /* subtype/hardware level */
-    u8      ramparity_pres;                 /* RAM parity check hardware? */
-} __attribute__((packed)) gdth_binfo_str; 
-
-/* get host drive info */
-typedef struct {
-    char        name[8];                        /* host drive name */
-    u32     size;                           /* size (sectors) */
-    u8      host_drive;                     /* host drive number */
-    u8      log_drive;                      /* log. drive (master) */
-    u8      reserved;
-    u8      rw_attribs;                     /* r/w attribs */
-    u32     start_sec;                      /* start sector */
-} __attribute__((packed)) gdth_hentry_str;
-
-typedef struct {
-    u32     entries;                        /* entry count */
-    u32     offset;                         /* offset of entries */
-    u8      secs_p_head;                    /* sectors/head */
-    u8      heads_p_cyl;                    /* heads/cylinder */
-    u8      reserved;
-    u8      clust_drvtype;                  /* cluster drive type */
-    u32     location;                       /* controller number */
-    gdth_hentry_str entry[MAX_HDRIVES];         /* entries */
-} __attribute__((packed)) gdth_hget_str;    
-
-
-/* DPRAM structures */
-
-/* interface area ISA/PCI */
-typedef struct {
-    u8              S_Cmd_Indx;             /* special command */
-    u8 volatile     S_Status;               /* status special command */
-    u16              reserved1;
-    u32             S_Info[4];              /* add. info special command */
-    u8 volatile     Sema0;                  /* command semaphore */
-    u8              reserved2[3];
-    u8              Cmd_Index;              /* command number */
-    u8              reserved3[3];
-    u16 volatile     Status;                 /* command status */
-    u16              Service;                /* service(for async.events) */
-    u32             Info[2];                /* additional info */
-    struct {
-        u16          offset;                 /* command offs. in the DPRAM*/
-        u16          serv_id;                /* service */
-    } __attribute__((packed)) comm_queue[MAXOFFSETS];            /* command queue */
-    u32             bios_reserved[2];
-    u8              gdt_dpr_cmd[1];         /* commands */
-} __attribute__((packed)) gdt_dpr_if;
-
-/* SRAM structure PCI controllers */
-typedef struct {
-    u32     magic;                          /* controller ID from BIOS */
-    u16      need_deinit;                    /* switch betw. BIOS/driver */
-    u8      switch_support;                 /* see need_deinit */
-    u8      padding[9];
-    u8      os_used[16];                    /* OS code per service */
-    u8      unused[28];
-    u8      fw_magic;                       /* contr. ID from firmware */
-} __attribute__((packed)) gdt_pci_sram;
-
-/* SRAM structure EISA controllers (but NOT GDT3000/3020) */
-typedef struct {
-    u8      os_used[16];                    /* OS code per service */
-    u16      need_deinit;                    /* switch betw. BIOS/driver */
-    u8      switch_support;                 /* see need_deinit */
-    u8      padding;
-} __attribute__((packed)) gdt_eisa_sram;
-
-
-/* DPRAM ISA controllers */
-typedef struct {
-    union {
-        struct {
-            u8      bios_used[0x3c00-32];   /* 15KB - 32Bytes BIOS */
-            u32     magic;                  /* controller (EISA) ID */
-            u16      need_deinit;            /* switch betw. BIOS/driver */
-            u8      switch_support;         /* see need_deinit */
-            u8      padding[9];
-            u8      os_used[16];            /* OS code per service */
-        } __attribute__((packed)) dp_sram;
-        u8          bios_area[0x4000];      /* 16KB reserved for BIOS */
-    } bu;
-    union {
-        gdt_dpr_if      ic;                     /* interface area */
-        u8          if_area[0x3000];        /* 12KB for interface */
-    } u;
-    struct {
-        u8          memlock;                /* write protection DPRAM */
-        u8          event;                  /* release event */
-        u8          irqen;                  /* board interrupts enable */
-        u8          irqdel;                 /* acknowledge board int. */
-        u8 volatile Sema1;                  /* status semaphore */
-        u8          rq;                     /* IRQ/DRQ configuration */
-    } __attribute__((packed)) io;
-} __attribute__((packed)) gdt2_dpram_str;
-
-/* DPRAM PCI controllers */
-typedef struct {
-    union {
-        gdt_dpr_if      ic;                     /* interface area */
-        u8          if_area[0xff0-sizeof(gdt_pci_sram)];
-    } u;
-    gdt_pci_sram        gdt6sr;                 /* SRAM structure */
-    struct {
-        u8          unused0[1];
-        u8 volatile Sema1;                  /* command semaphore */
-        u8          unused1[3];
-        u8          irqen;                  /* board interrupts enable */
-        u8          unused2[2];
-        u8          event;                  /* release event */
-        u8          unused3[3];
-        u8          irqdel;                 /* acknowledge board int. */
-        u8          unused4[3];
-    } __attribute__((packed)) io;
-} __attribute__((packed)) gdt6_dpram_str;
-
-/* PLX register structure (new PCI controllers) */
-typedef struct {
-    u8              cfg_reg;        /* DPRAM cfg.(2:below 1MB,0:anywhere)*/
-    u8              unused1[0x3f];
-    u8 volatile     sema0_reg;              /* command semaphore */
-    u8 volatile     sema1_reg;              /* status semaphore */
-    u8              unused2[2];
-    u16 volatile     status;                 /* command status */
-    u16              service;                /* service */
-    u32             info[2];                /* additional info */
-    u8              unused3[0x10];
-    u8              ldoor_reg;              /* PCI to local doorbell */
-    u8              unused4[3];
-    u8 volatile     edoor_reg;              /* local to PCI doorbell */
-    u8              unused5[3];
-    u8              control0;               /* control0 register(unused) */
-    u8              control1;               /* board interrupts enable */
-    u8              unused6[0x16];
-} __attribute__((packed)) gdt6c_plx_regs;
-
-/* DPRAM new PCI controllers */
-typedef struct {
-    union {
-        gdt_dpr_if      ic;                     /* interface area */
-        u8          if_area[0x4000-sizeof(gdt_pci_sram)];
-    } u;
-    gdt_pci_sram        gdt6sr;                 /* SRAM structure */
-} __attribute__((packed)) gdt6c_dpram_str;
-
-/* i960 register structure (PCI MPR controllers) */
-typedef struct {
-    u8              unused1[16];
-    u8 volatile     sema0_reg;              /* command semaphore */
-    u8              unused2;
-    u8 volatile     sema1_reg;              /* status semaphore */
-    u8              unused3;
-    u16 volatile     status;                 /* command status */
-    u16              service;                /* service */
-    u32             info[2];                /* additional info */
-    u8              ldoor_reg;              /* PCI to local doorbell */
-    u8              unused4[11];
-    u8 volatile     edoor_reg;              /* local to PCI doorbell */
-    u8              unused5[7];
-    u8              edoor_en_reg;           /* board interrupts enable */
-    u8              unused6[27];
-    u32             unused7[939];         
-    u32             severity;       
-    char                evt_str[256];           /* event string */
-} __attribute__((packed)) gdt6m_i960_regs;
-
-/* DPRAM PCI MPR controllers */
-typedef struct {
-    gdt6m_i960_regs     i960r;                  /* 4KB i960 registers */
-    union {
-        gdt_dpr_if      ic;                     /* interface area */
-        u8          if_area[0x3000-sizeof(gdt_pci_sram)];
-    } u;
-    gdt_pci_sram        gdt6sr;                 /* SRAM structure */
-} __attribute__((packed)) gdt6m_dpram_str;
-
-
-/* PCI resources */
-typedef struct {
-    struct pci_dev      *pdev;
-    unsigned long               dpmem;                  /* DPRAM address */
-    unsigned long               io;                     /* IO address */
-} gdth_pci_str;
-
-
-/* controller information structure */
-typedef struct {
-    struct Scsi_Host    *shost;
-    struct list_head    list;
-    u16      	hanum;
-    u16              oem_id;                 /* OEM */
-    u16              type;                   /* controller class */
-    u32             stype;                  /* subtype (PCI: device ID) */
-    u16              fw_vers;                /* firmware version */
-    u16              cache_feat;             /* feat. cache serv. (s/g,..)*/
-    u16              raw_feat;               /* feat. raw service (s/g,..)*/
-    u16              screen_feat;            /* feat. raw service (s/g,..)*/
-    u16              bmic;                   /* BMIC address (EISA) */
-    void __iomem        *brd;                   /* DPRAM address */
-    u32             brd_phys;               /* slot number/BIOS address */
-    gdt6c_plx_regs      *plx;                   /* PLX regs (new PCI contr.) */
-    gdth_cmd_str        cmdext;
-    gdth_cmd_str        *pccb;                  /* address command structure */
-    u32             ccb_phys;               /* phys. address */
-#ifdef INT_COAL
-    gdth_coal_status    *coal_stat;             /* buffer for coalescing int.*/
-    u64             coal_stat_phys;         /* phys. address */
-#endif
-    char                *pscratch;              /* scratch (DMA) buffer */
-    u64             scratch_phys;           /* phys. address */
-    u8              scratch_busy;           /* in use? */
-    u8              dma64_support;          /* 64-bit DMA supported? */
-    gdth_msg_str        *pmsg;                  /* message buffer */
-    u64             msg_phys;               /* phys. address */
-    u8              scan_mode;              /* current scan mode */
-    u8              irq;                    /* IRQ */
-    u8              drq;                    /* DRQ (ISA controllers) */
-    u16              status;                 /* command status */
-    u16              service;                /* service/firmware ver./.. */
-    u32             info;
-    u32             info2;                  /* additional info */
-    Scsi_Cmnd           *req_first;             /* top of request queue */
-    struct {
-        u8          present;                /* Flag: host drive present? */
-        u8          is_logdrv;              /* Flag: log. drive (master)? */
-        u8          is_arraydrv;            /* Flag: array drive? */
-        u8          is_master;              /* Flag: array drive master? */
-        u8          is_parity;              /* Flag: parity drive? */
-        u8          is_hotfix;              /* Flag: hotfix drive? */
-        u8          master_no;              /* number of master drive */
-        u8          lock;                   /* drive locked? (hot plug) */
-        u8          heads;                  /* mapping */
-        u8          secs;
-        u16          devtype;                /* further information */
-        u64         size;                   /* capacity */
-        u8          ldr_no;                 /* log. drive no. */
-        u8          rw_attribs;             /* r/w attributes */
-        u8          cluster_type;           /* cluster properties */
-        u8          media_changed;          /* Flag:MOUNT/UNMOUNT occurred */
-        u32         start_sec;              /* start sector */
-    } hdr[MAX_LDRIVES];                         /* host drives */
-    struct {
-        u8          lock;                   /* channel locked? (hot plug) */
-        u8          pdev_cnt;               /* physical device count */
-        u8          local_no;               /* local channel number */
-        u8          io_cnt[MAXID];          /* current IO count */
-        u32         address;                /* channel address */
-        u32         id_list[MAXID];         /* IDs of the phys. devices */
-    } raw[MAXBUS];                              /* SCSI channels */
-    struct {
-        Scsi_Cmnd       *cmnd;                  /* pending request */
-        u16          service;                /* service */
-    } cmd_tab[GDTH_MAXCMDS];                    /* table of pend. requests */
-    struct gdth_cmndinfo {                      /* per-command private info */
-        int index;
-        int internal_command;                   /* don't call scsi_done */
-        gdth_cmd_str *internal_cmd_str;         /* crier for internal messages*/
-        dma_addr_t sense_paddr;                 /* sense dma-addr */
-        u8 priority;
-	int timeout_count;			/* # of timeout calls */
-        volatile int wait_for_completion;
-        u16 status;
-        u32 info;
-        enum dma_data_direction dma_dir;
-        int phase;                              /* ???? */
-        int OpCode;
-    } cmndinfo[GDTH_MAXCMDS];                   /* index==0 is free */
-    u8              bus_cnt;                /* SCSI bus count */
-    u8              tid_cnt;                /* Target ID count */
-    u8              bus_id[MAXBUS];         /* IOP IDs */
-    u8              virt_bus;               /* number of virtual bus */
-    u8              more_proc;              /* more /proc info supported */
-    u16              cmd_cnt;                /* command count in DPRAM */
-    u16              cmd_len;                /* length of actual command */
-    u16              cmd_offs_dpmem;         /* actual offset in DPRAM */
-    u16              ic_all_size;            /* sizeof DPRAM interf. area */
-    gdth_cpar_str       cpar;                   /* controller cache par. */
-    gdth_bfeat_str      bfeat;                  /* controller features */
-    gdth_binfo_str      binfo;                  /* controller info */
-    gdth_evt_data       dvr;                    /* event structure */
-    spinlock_t          smp_lock;
-    struct pci_dev      *pdev;
-    char                oem_name[8];
-#ifdef GDTH_DMA_STATISTICS
-    unsigned long               dma32_cnt, dma64_cnt;   /* statistics: DMA buffer */
-#endif
-    struct scsi_device         *sdev;
-} gdth_ha_str;
-
-static inline struct gdth_cmndinfo *gdth_cmnd_priv(struct scsi_cmnd* cmd)
+     struct dma_slave_config *config)
 {
-	return (struct gdth_cmndinfo *)cmd->host_scribble;
+	struct nbpf_channel *chan = nbpf_to_chan(dchan);
+
+	dev_dbg(dchan->device->dev, "Entry %s\n", __func__);
+
+	/*
+	 * We could check config->slave_id to match chan->terminal here,
+	 * but with DT they would be coming from the same source, so
+	 * such a check would be superflous
+	 */
+
+	chan->slave_dst_addr = config->dst_addr;
+	chan->slave_dst_width = nbpf_xfer_size(chan->nbpf,
+					       config->dst_addr_width, 1);
+	chan->slave_dst_burst = nbpf_xfer_size(chan->nbpf,
+					       config->dst_addr_width,
+					       config->dst_maxburst);
+	chan->slave_src_addr = config->src_addr;
+	chan->slave_src_width = nbpf_xfer_size(chan->nbpf,
+					       config->src_addr_width, 1);
+	chan->slave_src_burst = nbpf_xfer_size(chan->nbpf,
+					       config->src_addr_width,
+					       config->src_maxburst);
+
+	return 0;
 }
 
-/* INQUIRY data format */
-typedef struct {
-    u8      type_qual;
-    u8      modif_rmb;
-    u8      version;
-    u8      resp_aenc;
-    u8      add_length;
-    u8      reserved1;
-    u8      reserved2;
-    u8      misc;
-    u8      vendor[8];
-    u8      product[16];
-    u8      revision[4];
-} __attribute__((packed)) gdth_inq_data;
+static struct dma_async_tx_descriptor *nbpf_prep_sg(struct nbpf_channel *chan,
+		struct scatterlist *src_sg, struct scatterlist *dst_sg,
+		size_t len, enum dma_transfer_direction direction,
+		unsigned long flags)
+{
+	struct nbpf_link_desc *ldesc;
+	struct scatterlist *mem_sg;
+	struct nbpf_desc *desc;
+	bool inc_src, inc_dst;
+	size_t data_len = 0;
+	int i = 0;
 
-/* READ_CAPACITY data format */
-typedef struct {
-    u32     last_block_no;
-    u32     block_length;
-} __attribute__((packed)) gdth_rdcap_data;
+	switch (direction) {
+	case DMA_DEV_TO_MEM:
+		mem_sg = dst_sg;
+		inc_src = false;
+		inc_dst = true;
+		break;
 
-/* READ_CAPACITY (16) data format */
-typedef struct {
-    u64     last_block_no;
-    u32     block_length;
-} __attribute__((packed)) gdth_rdcap16_data;
+	case DMA_MEM_TO_DEV:
+		mem_sg = src_sg;
+		inc_src = true;
+		inc_dst = false;
+		break;
 
-/* REQUEST_SENSE data format */
-typedef struct {
-    u8      errorcode;
-    u8      segno;
-    u8      key;
-    u32     info;
-    u8      add_length;
-    u32     cmd_info;
-    u8      adsc;
-    u8      adsq;
-    u8      fruc;
-    u8      key_spec[3];
-} __attribute__((packed)) gdth_sense_data;
+	default:
+	case DMA_MEM_TO_MEM:
+		mem_sg = src_sg;
+		inc_src = true;
+		inc_dst = true;
+	}
 
-/* MODE_SENSE data format */
-typedef struct {
-    struct {
-        u8  data_length;
-        u8  med_type;
-        u8  dev_par;
-        u8  bd_length;
-    } __attribute__((packed)) hd;
-    struct {
-        u8  dens_code;
-        u8  block_count[3];
-        u8  reserved;
-        u8  block_length[3];
-    } __attribute__((packed)) bd;
-} __attribute__((packed)) gdth_modep_data;
+	desc = nbpf_desc_get(chan, len);
+	if (!desc)
+		return NULL;
 
-/* stack frame */
-typedef struct {
-    unsigned long       b[10];                          /* 32/64 bit compiler ! */
-} __attribute__((packed)) gdth_stackframe;
+	desc->async_tx.flags = flags;
+	desc->async_tx.cookie = -EBUSY;
+	desc->user_wait = false;
 
+	/*
+	 * This is a private descriptor list, and we own the descriptor. No need
+	 * to lock.
+	 */
+	list_for_each_entry(ldesc, &desc->sg, node) {
+		int ret = nbpf_prep_one(ldesc, direction,
+					sg_dma_address(src_sg),
+					sg_dma_address(dst_sg),
+					sg_dma_len(mem_sg),
+					i == len - 1);
+		if (ret < 0) {
+			nbpf_desc_put(desc);
+			return NULL;
+		}
+		data_len += sg_dma_len(mem_sg);
+		if (inc_src)
+			src_sg = sg_next(src_sg);
+		if (inc_dst)
+			dst_sg = sg_next(dst_sg);
+		mem_sg = direction == DMA_DEV_TO_MEM ? dst_sg : src_sg;
+		i++;
+	}
 
-/* function prototyping */
+	desc->length = data_len;
 
-int gdth_show_info(struct seq_file *, struct Scsi_Host *);
-int gdth_set_info(struct Scsi_Host *, char *, int);
+	/* The user has to return the descriptor to us ASAP via .tx_submit() */
+	return &desc->async_tx;
+}
 
+static struct dma_async_tx_descriptor *nbpf_prep_memcpy(
+	struct dma_chan *dchan, dma_addr_t dst, dma_addr_t src,
+	size_t len, unsigned long flags)
+{
+	struct nbpf_channel *chan = nbpf_to_chan(dchan);
+	struct scatterlist dst_sg;
+	struct scatterlist src_sg;
+
+	sg_init_table(&dst_sg, 1);
+	sg_init_table(&src_sg, 1);
+
+	sg_dma_address(&dst_sg) = dst;
+	sg_dma_address(&src_sg) = src;
+
+	sg_dma_len(&dst_sg) = len;
+	sg_dma_len(&src_sg) = len;
+
+	dev_dbg(dchan->device->dev, "%s(): %zu @ %pad -> %pad\n",
+		__func__, len, &src, &dst);
+
+	return nbpf_prep_sg(chan, &src_sg, &dst_sg, 1,
+			    DMA_MEM_TO_MEM, flags);
+}
+
+static struct dma_async_tx_descriptor *nbpf_prep_memcpy_sg(
+	struct dma_chan *dchan,
+	struct scatterlist *dst_sg, unsigned int dst_nents,
+	struct scatterlist *src_sg, unsigned int src_nents,
+	unsigned long flags)
+{
+	struct nbpf_channel *chan = nbpf_to_chan(dchan);
+
+	if (dst_nents != src_nents)
+		return NULL;
+
+	return nbpf_prep_sg(chan, src_sg, dst_sg, src_nents,
+			    DMA_MEM_TO_MEM, flags);
+}
+
+static struct dma_async_tx_descriptor *nbpf_prep_slave_sg(
+	struct dma_chan *dchan, struct scatterlist *sgl, unsigned int sg_len,
+	enum dma_transfer_direction direction, unsigned long flags, void *context)
+{
+	struct nbpf_channel *chan = nbpf_to_chan(dchan);
+	struct scatterlist slave_sg;
+
+	dev_dbg(dchan->device->dev, "Entry %s()\n", __func__);
+
+	sg_init_table(&slave_sg, 1);
+
+	switch (direction) {
+	case DMA_MEM_TO_DEV:
+		sg_dma_address(&slave_sg) = chan->slave_dst_addr;
+		return nbpf_prep_sg(chan, sgl, &slave_sg, sg_len,
+				    direction, flags);
+
+	case DMA_DEV_TO_MEM:
+		sg_dma_address(&slave_sg) = chan->slave_src_addr;
+		return nbpf_prep_sg(chan, &slave_sg, sgl, sg_len,
+				    direction, flags);
+
+	default:
+		return NULL;
+	}
+}
+
+static int nbpf_alloc_chan_resources(struct dma_chan *dchan)
+{
+	struct nbpf_channel *chan = nbpf_to_chan(dchan);
+	int ret;
+
+	INIT_LIST_HEAD(&chan->free);
+	INIT_LIST_HEAD(&chan->free_links);
+	INIT_LIST_HEAD(&chan->queued);
+	INIT_LIST_HEAD(&chan->active);
+	INIT_LIST_HEAD(&chan->done);
+
+	ret = nbpf_desc_page_alloc(chan);
+	if (ret < 0)
+		return ret;
+
+	dev_dbg(dchan->device->dev, "Entry %s(): terminal %u\n", __func__,
+		chan->terminal);
+
+	nbpf_chan_configure(chan);
+
+	return ret;
+}
+
+static void nbpf_free_chan_resources(struct dma_chan *dchan)
+{
+	struct nbpf_channel *chan = nbpf_to_chan(dchan);
+	struct nbpf_desc_page *dpage, *tmp;
+
+	dev_dbg(dchan->device->dev, "Entry %s()\n", __func__);
+
+	nbpf_chan_halt(chan);
+	nbpf_chan_idle(chan);
+	/* Clean up for if a channel is re-used for MEMCPY after slave DMA */
+	nbpf_chan_prepare_default(chan);
+
+	list_for_each_entry_safe(dpage, tmp, &chan->desc_page, node) {
+		struct nbpf_link_desc *ldesc;
+		int i;
+		list_del(&dpage->node);
+		for (i = 0, ldesc = dpage->ldesc;
+		     i < ARRAY_SIZE(dpage->ldesc);
+		     i++, ldesc++)
+			dma_unmap_single(dchan->device->dev, ldesc->hwdesc_dma_addr,
+					 sizeof(*ldesc->hwdesc), DMA_TO_DEVICE);
+		free_page((unsigned long)dpage);
+	}
+}
+
+static struct dma_chan *nbpf_of_xlate(struct of_phandle_args *dma_spec,
+				      struct of_dma *ofdma)
+{
+	struct nbpf_device *nbpf = ofdma->of_dma_data;
+	struct dma_chan *dchan;
+	struct nbpf_channel *chan;
+
+	if (dma_spec->args_count != 2)
+		return NULL;
+
+	dchan = dma_get_any_slave_channel(&nbpf->dma_dev);
+	if (!dchan)
+		return NULL;
+
+	dev_dbg(dchan->device->dev, "Entry %s(%s)\n", __func__,
+		dma_spec->np->name);
+
+	chan = nbpf_to_chan(dchan);
+
+	chan->terminal = dma_spec->args[0];
+	chan->flags = dma_spec->args[1];
+
+	nbpf_chan_prepare(chan);
+	nbpf_chan_configure(chan);
+
+	return dchan;
+}
+
+static void nbpf_chan_tasklet(unsigned long data)
+{
+	struct nbpf_channel *chan = (struct nbpf_channel *)data;
+	struct nbpf_desc *desc, *tmp;
+	dma_async_tx_callback callback;
+	void *param;
+
+	while (!list_empty(&chan->done)) {
+		bool found = false, must_put, recycling = false;
+
+		spin_lock_irq(&chan->lock);
+
+		list_for_each_entry_safe(desc, tmp, &chan->done, node) {
+			if (!desc->user_wait) {
+				/* Newly completed descriptor, have to process */
+				found = true;
+				break;
+			} else if (async_tx_test_ack(&desc->async_tx)) {
+				/*
+				 * This descriptor was waiting for a user ACK,
+				 * it can be recycled now.
+				 */
+				list_del(&desc->node);
+				spin_unlock_irq(&chan->lock);
+				nbpf_desc_put(desc);
+				recycling = true;
+				break;
+			}
+		}
+
+		if (recycling)
+			continue;
+
+		if (!found) {
+			/* This can happen if TERMINATE_ALL has been called */
+			spin_unlock_irq(&chan->lock);
+			break;
+		}
+
+		dma_cookie_complete(&desc->async_tx);
+
+		/*
+		 * With released lock we cannot dereference desc, maybe it's
+		 * still on the "done" list
+		 */
+		if (async_tx_test_ack(&desc->async_tx)) {
+			list_del(&desc->node);
+			must_put = true;
+		} else {
+			desc->user_wait = true;
+			must_put = false;
+		}
+
+		callback = desc->async_tx.callback;
+		param = desc->async_tx.callback_param;
+
+		/* ack and callback completed descriptor */
+		spin_unlock_irq(&chan->lock);
+
+		if (callback)
+			callback(param);
+
+		if (must_put)
+			nbpf_desc_put(desc);
+	}
+}
+
+static irqreturn_t nbpf_chan_irq(int irq, void *dev)
+{
+	struct nbpf_channel *chan = dev;
+	bool done = nbpf_status_get(chan);
+	struct nbpf_desc *desc;
+	irqreturn_t ret;
+	bool bh = false;
+
+	if (!done)
+		return IRQ_NONE;
+
+	nbpf_status_ack(chan);
+
+	dev_dbg(&chan->dma_chan.dev->device, "%s()\n", __func__);
+
+	spin_lock(&chan->lock);
+	desc = chan->running;
+	if (WARN_ON(!desc)) {
+		ret = IRQ_NONE;
+		goto unlock;
+	} else {
+		ret = IRQ_HANDLED;
+		bh = true;
+	}
+
+	list_move_tail(&desc->node, &chan->done);
+	chan->running = NULL;
+
+	if (!list_empty(&chan->active)) {
+		desc = list_first_entry(&chan->active,
+					struct nbpf_desc, node);
+		if (!nbpf_start(desc))
+			chan->running = desc;
+	}
+
+unlock:
+	spin_unlock(&chan->lock);
+
+	if (bh)
+		tasklet_schedule(&chan->tasklet);
+
+	return ret;
+}
+
+static irqreturn_t nbpf_err_irq(int irq, void *dev)
+{
+	struct nbpf_device *nbpf = dev;
+	u32 error = nbpf_error_get(nbpf);
+
+	dev_warn(nbpf->dma_dev.dev, "DMA error IRQ %u\n", irq);
+
+	if (!error)
+		return IRQ_NONE;
+
+	do {
+		struct nbpf_channel *chan = nbpf_error_get_channel(nbpf, error);
+		/* On error: abort all queued transfers, no callback */
+		nbpf_error_clear(chan);
+		nbpf_chan_idle(chan);
+		error = nbpf_error_get(nbpf);
+	} while (error);
+
+	return IRQ_HANDLED;
+}
+
+static int nbpf_chan_probe(struct nbpf_device *nbpf, int n)
+{
+	struct dma_device *dma_dev = &nbpf->dma_dev;
+	struct nbpf_channel *chan = nbpf->chan + n;
+	int ret;
+
+	chan->nbpf = nbpf;
+	chan->base = nbpf->base + NBPF_REG_CHAN_OFFSET + NBPF_REG_CHAN_SIZE * n;
+	INIT_LIST_HEAD(&chan->desc_page);
+	spin_lock_init(&chan->lock);
+	chan->dma_chan.device = dma_dev;
+	dma_cookie_init(&chan->dma_chan);
+	nbpf_chan_prepare_default(chan);
+
+	dev_dbg(dma_dev->dev, "%s(): channel %d: -> %p\n", __func__, n, chan->base);
+
+	snprintf(chan->name, sizeof(chan->name), "nbpf %d", n);
+
+	tasklet_init(&chan->tasklet, nbpf_chan_tasklet, (unsigned long)chan);
+	ret = devm_request_irq(dma_dev->dev, chan->irq,
+			nbpf_chan_irq, IRQF_SHARED,
+			chan->name, chan);
+	if (ret < 0)
+		return ret;
+
+	/* Add the channel to DMA device channel list */
+	list_add_tail(&chan->dma_chan.device_node,
+		      &dma_dev->channels);
+
+	return 0;
+}
+
+static const struct of_device_id nbpf_match[] = {
+	{.compatible = "renesas,nbpfaxi64dmac1b4",	.data = &nbpf_cfg[NBPF1B4]},
+	{.compatible = "renesas,nbpfaxi64dmac1b8",	.data = &nbpf_cfg[NBPF1B8]},
+	{.compatible = "renesas,nbpfaxi64dmac1b16",	.data = &nbpf_cfg[NBPF1B16]},
+	{.compatible = "renesas,nbpfaxi64dmac4b4",	.data = &nbpf_cfg[NBPF4B4]},
+	{.compatible = "renesas,nbpfaxi64dmac4b8",	.data = &nbpf_cfg[NBPF4B8]},
+	{.compatible = "renesas,nbpfaxi64dmac4b16",	.data = &nbpf_cfg[NBPF4B16]},
+	{.compatible = "renesas,nbpfaxi64dmac8b4",	.data = &nbpf_cfg[NBPF8B4]},
+	{.compatible = "renesas,nbpfaxi64dmac8b8",	.data = &nbpf_cfg[NBPF8B8]},
+	{.compatible = "renesas,nbpfaxi64dmac8b16",	.data = &nbpf_cfg[NBPF8B16]},
+	{}
+};
+MODULE_DEVICE_TABLE(of, nbpf_match);
+
+static int nbpf_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	const struct of_device_id *of_id = of_match_device(nbpf_match, dev);
+	struct device_node *np = dev->of_node;
+	struct nbpf_device *nbpf;
+	struct dma_device *dma_dev;
+	struct resource *iomem, *irq_res;
+	const struct nbpf_config *cfg;
+	int num_channels;
+	int ret, irq, eirq, i;
+	int irqbuf[9] /* maximum 8 channels + error IRQ */;
+	unsigned int irqs = 0;
+
+	BUILD_BUG_ON(sizeof(struct nbpf_desc_page) > PAGE_SIZE);
+
+	/* DT only */
+	if (!np || !of_id || !of_id->data)
+		return -ENODEV;
+
+	cfg = of_id->data;
+	num_channels = cfg->num_channels;
+
+	nbpf = devm_kzalloc(dev, sizeof(*nbpf) + num_channels *
+			    sizeof(nbpf->chan[0]), GFP_KERNEL);
+	if (!nbpf) {
+		dev_err(dev, "Memory allocation failed\n");
+		return -ENOMEM;
+	}
+	dma_dev = &nbpf->dma_dev;
+	dma_dev->dev = dev;
+
+	iomem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	nbpf->base = devm_ioremap_resource(dev, iomem);
+	if (IS_ERR(nbpf->base))
+		return PTR_ERR(nbpf->base);
+
+	nbpf->clk = devm_clk_get(dev, NULL);
+	if (IS_ERR(nbpf->clk))
+		return PTR_ERR(nbpf->clk);
+
+	nbpf->config = cfg;
+
+	for (i = 0; irqs < ARRAY_SIZE(irqbuf); i++) {
+		irq_res = platform_get_resource(pdev, IORESOURCE_IRQ, i);
+		if (!irq_res)
+			break;
+
+		for (irq = irq_res->start; irq <= irq_res->end;
+		     irq++, irqs++)
+			irqbuf[irqs] = irq;
+	}
+
+	/*
+	 * 3 IRQ resource schemes are supported:
+	 * 1. 1 shared IRQ for error and all channels
+	 * 2. 2 IRQs: one for error and one shared for all channels
+	 * 3. 1 IRQ for error and an own IRQ for each channel
+	 */
+	if (irqs != 1 && irqs != 2 && irqs != num_channels + 1)
+		return -ENXIO;
+
+	if (irqs == 1) {
+		eirq = irqbuf[0];
+
+		for (i = 0; i <= num_channels; i++)
+			nbpf->chan[i].irq = irqbuf[0];
+	} else {
+		eirq = platform_get_irq_byname(pdev, "error");
+		if (eirq < 0)
+			return eirq;
+
+		if (irqs == num_channels + 1) {
+			struct nbpf_channel *chan;
+
+			for (i = 0, chan = nbpf->chan; i <= num_channels;
+			     i++, chan++) {
+				/* Skip the error IRQ */
+				if (irqbuf[i] == eirq)
+					i++;
+				chan->irq = irqbuf[i];
+			}
+
+			if (chan != nbpf->chan + num_channels)
+				return -EINVAL;
+		} else {
+			/* 2 IRQs and more than one channel */
+			if (irqbuf[0] == eirq)
+				irq = irqbuf[1];
+			else
+				irq = irqbuf[0];
+
+			for (i = 0; i <= num_channels; i++)
+				nbpf->chan[i].irq = irq;
+		}
+	}
+
+	ret = devm_request_irq(dev, eirq, nbpf_err_irq,
+			       IRQF_SHARED, "dma error", nbpf);
+	if (ret < 0)
+		return ret;
+
+	INIT_LIST_HEAD(&dma_dev->channels);
+
+	/* Create DMA Channel */
+	for (i = 0; i < num_channels; i++) {
+		ret = nbpf_chan_probe(nbpf, i);
+		if (ret < 0)
+			return ret;
+	}
+
+	dma_cap_set(DMA_MEMCPY, dma_dev->cap_mask);
+	dma_cap_set(DMA_SLAVE, dma_dev->cap_mask);
+	dma_cap_set(DMA_PRIVATE, dma_dev->cap_mask);
+	dma_cap_set(DMA_SG, dma_dev->cap_mask);
+
+	/* Common and MEMCPY operations */
+	dma_dev->device_alloc_chan_resources
+		= nbpf_alloc_chan_resources;
+	dma_dev->device_free_chan_resources = nbpf_free_chan_resources;
+	dma_dev->device_prep_dma_sg = nbpf_prep_memcpy_sg;
+	dma_dev->device_prep_dma_memcpy = nbpf_prep_memcpy;
+	dma_dev->device_tx_status = nbpf_tx_status;
+	dma_dev->device_issue_pending = nbpf_issue_pending;
+
+	/*
+	 * If we drop support for unaligned MEMCPY buffer addresses and / or
+	 * lengths by setting
+	 * dma_dev->copy_align = 4;
+	 * then we can set transfer length to 4 bytes in nbpf_prep_one() for
+	 * DMA_MEM_TO_MEM
+	 */
+
+	/* Compulsory for DMA_SLAVE fields */
+	dma_dev->device_prep_slave_sg = nbpf_prep_slave_sg;
+	dma_dev->device_config = nbpf_config;
+	dma_dev->device_pause = nbpf_pause;
+	dma_dev->device_terminate_all = nbpf_terminate_all;
+
+	dma_dev->src_addr_widths = NBPF_DMA_BUSWIDTHS;
+	dma_dev->dst_addr_widths = NBPF_DMA_BUSWIDTHS;
+	dma_dev->directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
+
+	platform_set_drvdata(pdev, nbpf);
+
+	ret = clk_prepare_enable(nbpf->clk);
+	if (ret < 0)
+		return ret;
+
+	nbpf_configure(nbpf);
+
+	ret = dma_async_device_register(dma_dev);
+	if (ret < 0)
+		goto e_clk_off;
+
+	ret = of_dma_controller_register(np, nbpf_of_xlate, nbpf);
+	if (ret < 0)
+		goto e_dma_dev_unreg;
+
+	return 0;
+
+e_dma_dev_unreg:
+	dma_async_device_unregister(dma_dev);
+e_clk_off:
+	clk_disable_unprepare(nbpf->clk);
+
+	return ret;
+}
+
+static int nbpf_remove(struct platform_device *pdev)
+{
+	struct nbpf_device *nbpf = platform_get_drvdata(pdev);
+
+	of_dma_controller_free(pdev->dev.of_node);
+	dma_async_device_unregister(&nbpf->dma_dev);
+	clk_disable_unprepare(nbpf->clk);
+
+	return 0;
+}
+
+static const struct platform_device_id nbpf_ids[] = {
+	{"nbpfaxi64dmac1b4",	(kernel_ulong_t)&nbpf_cfg[NBPF1B4]},
+	{"nbpfaxi64dmac1b8",	(kernel_ulong_t)&nbpf_cfg[NBPF1B8]},
+	{"nbpfaxi64dmac1b16",	(kernel_ulong_t)&nbpf_cfg[NBPF1B16]},
+	{"nbpfaxi64dmac4b4",	(kernel_ulong_t)&nbpf_cfg[NBPF4B4]},
+	{"nbpfaxi64dmac4b8",	(kernel_ulong_t)&nbpf_cfg[NBPF4B8]},
+	{"nbpfaxi64dmac4b16",	(kernel_ulong_t)&nbpf_cfg[NBPF4B16]},
+	{"nbpfaxi64dmac8b4",	(kernel_ulong_t)&nbpf_cfg[NBPF8B4]},
+	{"nbpfaxi64dmac8b8",	(kernel_ulong_t)&nbpf_cfg[NBPF8B8]},
+	{"nbpfaxi64dmac8b16",	(kernel_ulong_t)&nbpf_cfg[NBPF8B16]},
+	{},
+};
+MODULE_DEVICE_TABLE(platform, nbpf_ids);
+
+#ifdef CONFIG_PM
+static int nbpf_runtime_suspend(struct device *dev)
+{
+	struct nbpf_device *nbpf = platform_get_drvdata(to_platform_device(dev));
+	clk_disable_unprepare(nbpf->clk);
+	return 0;
+}
+
+static int nbpf_runtime_resume(struct device *dev)
+{
+	struct nbpf_device *nbpf = platform_get_drvdata(to_platform_device(dev));
+	return clk_prepare_enable(nbpf->clk);
+}
 #endif
+
+static const struct dev_pm_ops nbpf_pm_ops = {
+	SET_RUNTIME_PM_OPS(nbpf_runtime_suspend, nbpf_runtime_resume, NULL)
+};
+
+static struct platform_driver nbpf_driver = {
+	.driver = {
+		.name = "dma-nbpf",
+		.of_match_table = nbpf_match,
+		.pm = &nbpf_pm_ops,
+	},
+	.id_table = nbpf_ids,
+	.probe = nbpf_probe,
+	.remove = nbpf_remove,
+};
+
+module_platform_driver(nbpf_driver);
+
+MODULE_AUTHOR("Guennadi Liakhovetski <g.liakhovetski@gmx.de>");
+MODULE_DESCRIPTION("dmaengine driver for NBPFAXI64* DMACs");
+MODULE_LICENSE("GPL v2");
+                                                                                                                /*
+ * Device tree helpers for DMA request / controller
+ *
+ * Based on of_gpio.c
+ *
+ * Copyright (C) 2012 Texas Instruments Incorporated - http://www.ti.com/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ */
+
+#include <linux/device.h>
+#include <linux/err.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/of.h>
+#include <linux/of_dma.h>
+
+static LIST_HEAD(of_dma_list);
+static DEFINE_MUTEX(of_dma_lock);
+
+/**
+ * of_dma_find_controller - Get a DMA controller in DT DMA helpers list
+ * @dma_spec:	pointer to DMA specifier as found in the device tree
+ *
+ * Finds a DMA controller with matching device node and number for dma cells
+ * in a list of registered DMA controllers. If a match is found a valid pointer
+ * to the DMA data stored is retuned. A NULL pointer is returned if no match is
+ * found.
+ */
+static struct of_dma *of_dma_find_controller(struct of_phandle_args *dma_spec)
+{
+	struct of_dma *ofdma;
+
+	list_for_each_entry(ofdma, &of_dma_list, of_dma_controllers)
+		if (ofdma->of_node == dma_spec->np)
+			return ofdma;
+
+	pr_debug("%s: can't find DMA controller %s\n", __func__,
+		 dma_spec->np->full_name);
+
+	return NULL;
+}
+
+/**
+ * of_dma_router_xlate - translation function for router devices
+ * @dma_spec:	pointer to DMA specifier as found in the device tree
+ * @of_dma:	pointer to DMA controller data (router information)
+ *
+ * The function creates new dma_spec to be passed to the router driver's
+ * of_dma_route_allocate() function to prepare a dma_spec which will be used
+ * to request channel from the real DMA controller.
+ */
+static struct dma_chan *of_dma_router_xlate(struct of_phandle_args *dma_spec,
+					    struct of_dma *ofdma)
+{
+	struct dma_chan		*chan;
+	struct of_dma		*ofdma_target;
+	struct of_phandle_args	dma_spec_target;
+	void			*route_data;
+
+	/* translate the request for the real DMA controller */
+	memcpy(&dma_spec_target, dma_spec, sizeof(dma_spec_target));
+	route_data = ofdma->of_dma_route_allocate(&dma_spec_target, ofdma);
+	if (IS_ERR(route_data))
+		return NULL;
+
+	ofdma_target = of_dma_find_controller(&dma_spec_target);
+	if (!ofdma_target) {
+		ofdma->dma_router->route_free(ofdma->dma_router->dev,
+					      route_data);
+		chan = ERR_PTR(-EPROBE_DEFER);
+		goto err;
+	}
+
+	chan = ofdma_target->of_dma_xlate(&dma_spec_target, ofdma_target);
+	if (IS_ERR_OR_NULL(chan)) {
+		ofdma->dma_router->route_free(ofdma->dma_router->dev,
+					      route_data);
+	} else {
+		chan->router = ofdma->dma_router;
+		chan->route_data = route_data;
+	}
+
+err:
+	/*
+	 * Need to put the node back since the ofdma->of_dma_route_allocate
+	 * has taken it for generating the new, translated dma_spec
+	 */
+	of_node_put(dma_spec_target.np);
+	return chan;
+}
+
+/**
+ * of_dma_controller_register - Register a DMA controller to DT DMA helpers
+ * @np:			device node of DMA controller
+ * @of_dma_xlate:	translation function which converts a phandle
+ *			arguments list into a dma_chan structure
+ * @data		pointer to controller specific data to be used by
+ *			translation function
+ *
+ * Returns 0 on success or appropriate errno value on error.
+ *
+ * Allocated memory should be freed with appropriate of_dma_controller_free()
+ * call.
+ */
+int of_dma_controller_register(struct device_node *np,
+				struct dma_chan *(*of_dma_xlate)
+				(struct of_phandle_args *, struct of_dma *),
+				void *data)
+{
+	struct of_dma	*ofdma;
+
+	if (!np || !of_dma_xlate) {
+		pr_err("%s: not enough information provided\n", __func__);
+		return -EINVAL;
+	}
+
+	ofdma = kzalloc(sizeof(*ofdma), GFP_KERNEL);
+	if (!ofdma)
+		return -ENOMEM;
+
+	ofdma->of_node = np;
+	ofdma->of_dma_xlate = of_dma_xlate;
+	ofdma->of_dma_data = data;
+
+	/* Now queue of_dma controller structure in list */
+	mutex_lock(&of_dma_lock);
+	list_add_tail(&ofdma->of_dma_controllers, &of_dma_list);
+	mutex_unlock(&of_dma_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(of_dma_controller_register);
+
+/**
+ * of_dma_controller_free - Remove a DMA controller from DT DMA helpers list
+ * @np:		device node of DMA controller
+ *
+ * Memory allocated by of_dma_controller_register() is freed here.
+ */
+void of_dma_controller_free(struct device_node *np)
+{
+	struct of_dma *ofdma;
+
+	mutex_lock(&of_dma_lock);
+
+	list_for_each_entry(ofdma, &of_dma_list, of_dma_controllers)
+		if (ofdma->of_node == np) {
+			list_del(&ofdma->of_dma_controllers);
+			kfree(ofdma);
+			break;
+		}
+
+	mutex_unlock(&of_dma_lock);
+}
+EXPORT_SYMBOL_GPL(of_dma_controller_free);
+
+/**
+ * of_dma_router_register - Register a DMA router to DT DMA helpers as a
+ *			    controller
+ * @np:				device node of DMA router
+ * @of_dma_route_allocate:	setup function for the router which need to
+ *				modify the dma_spec for the DMA controller to
+ *				use and to set up the requested route.
+ * @dma_router:			pointer to dma_router structure to be used when
+ *				the route need to be free up.
+ *
+ * Returns 0 on success or appropriate errno value on error.
+ *
+ * Allocated memory should be freed with appropriate of_dma_controller_free()
+ * call.
+ */
+int of_dma_router_register(struct device_node *np,
+			   void *(*of_dma_route_allocate)
+			   (struct of_phandle_args *, struct of_dma *),
+			   struct dma_router *dma_router)
+{
+	struct of_dma	*ofdma;
+
+	if (!np || !of_dma_route_allocate || !dma_router) {
+		pr_err("%s: not enough information provided\n", __func__);
+		return -EINVAL;
+	}
+
+	ofdma = kzalloc(sizeof(*ofdma), GFP_KERNEL);
+	if (!ofdma)
+		return -ENOMEM;
+
+	ofdma->of_node = np;
+	ofdma->of_dma_xlate = of_dma_router_xlate;
+	ofdma->of_dma_route_allocate = of_dma_route_allocate;
+	ofdma->dma_router = dma_router;
+
+	/* Now queue of_dma controller structure in list */
+	mutex_lock(&of_dma_lock);
+	list_add_tail(&ofdma->of_dma_controllers, &of_dma_list);
+	mutex_unlock(&of_dma_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(of_dma_router_register);
+
+/**
+ * of_dma_match_channel - Check if a DMA specifier matches name
+ * @np:		device node to look for DMA channels
+ * @name:	channel name to be matched
+ * @index:	index of DMA specifier in list of DMA specifiers
+ * @dma_spec:	pointer to DMA specifier as found in the device tree
+ *
+ * Check if the DMA specifier pointed to by the index in a list of DMA
+ * specifiers, matches the name provided. Returns 0 if the name matches and
+ * a valid pointer to the DMA specifier is found. Otherwise returns -ENODEV.
+ */
+static int of_dma_match_channel(struct device_node *np, const char *name,
+				int index, struct of_phandle_args *dma_spec)
+{
+	const char *s;
+
+	if (of_property_read_string_index(np, "dma-names", index, &s))
+		return -ENODEV;
+
+	if (strcmp(name, s))
+		return -ENODEV;
+
+	if (of_parse_phandle_with_args(np, "dmas", "#dma-cells", index,
+				       dma_spec))
+		return -ENODEV;
+
+	return 0;
+}
+
+/**
+ * of_dma_get_mcode_addr - Get the DMA micro code buffer address.
+ * @np:		device node of DMA controller
+ *
+ * Return the physical address.
+ */
+unsigned int of_dma_get_mcode_addr(struct device_node *np)
+{
+	unsigned int addr = 0;
+	const __be32	*prop;
+
+	prop = of_get_property(np, "#dma-mcode-addr", NULL);
+	if (prop)
+		addr = be32_to_cpup(prop);
+
+	return addr;
+}
+EXPORT_SYMBOL_GPL(of_dma_get_mcode_addr);
+
+/**
+ * of_dma_secure_dma_ch- Get the DMA micro code buffer address.
+ * @np:		device node of DMA controller
+ *
+ * Return the physical address.
+ */
+bool of_dma_secure_mode(struct device_node *np)
+{
+	bool ret = 0;
+	const __be32	*prop;
+
+	prop = of_get_property(np, "#dma-secure-mode", NULL);
+	if (prop)
+		ret = be32_to_cpup(prop);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(of_dma_secure_mode);
+
+#ifdef CONFIG_SOC_EXYNOS8895
+void __iomem *of_dma_get_sel_chan_address(struct device_node *np)
+{
+	const __be32 *reg_list;
+	int ret = 0;
+
+	reg_list = of_get_property(np, "dma-selchan", NULL);
+
+	if (!reg_list)
+		return NULL;
+
+	ret = be32_to_cpup(reg_list);
+	if (!ret)
+		return NULL;
+
+	return ioremap(ret, SZ_32);
+}
+EXPORT_SYMBOL_GPL(of_dma_get_sel_chan_address);
+#endif
+
+/**
+ * of_dma_get_arwrapper_address - Get the DMA WAPPER AR address
+ * @np:		device node of DMA controller
+ * @num:	DMA channel thread number
+ *
+ * Return the virtual address.
+ */
+void __iomem *of_dma_get_arwrapper_address(struct device_node *np, unsigned int num)
+{
+	const __be32 *reg_list;
+	unsigned int length, count;
+
+	reg_list = of_get_property(np, "dma-arwrapper", &length);
+	count = (unsigned int)(length / sizeof(unsigned int));
+
+	if (!reg_list || num >= count)
+		return NULL;
+
+	return ioremap(be32_to_cpup(reg_list + num), SZ_32);
+}
+EXPORT_SYMBOL_GPL(of_dma_get_arwrapper_address);
+
+/**
+ * of_dma_get_arwrapper_address - Get the DMA WAPPER AW address
+ * @np:		device node of DMA controller
+ * @num:	DMA channel thread number
+ *
+ * Return the virtual address.
+ */
+void __iomem *of_dma_get_awwrapper_address(struct device_node *np, unsigned int num)
+{
+	const __be32 *reg_list;
+	unsigned int length, count;
+
+	reg_list = of_get_property(np, "dma-awwrapper", &length);
+	count = (unsigned int)(length / sizeof(unsigned int));
+
+	if (!reg_list || num >= count)
+		return NULL;
+
+	return ioremap(be32_to_cpup(reg_list + num), SZ_32);
+}
+EXPORT_SYMBOL_GPL(of_dma_get_awwrapper_address);
+
+/**
+ * of_dma_get_arwrapper_address - Get the DMA WAPPER AR address of DMA instruction
+ * @np:		device node of DMA controller
+ *
+ * Return the virtual address.
+ */
+void __iomem *of_dma_get_instwrapper_address(struct device_node *np)
+{
+	const __be32 *reg_list;
+	int ret = 0;
+
+	reg_list = of_get_property(np, "dma-instwrapper", NULL);
+
+	if (!reg_list)
+		return NULL;
+
+	ret = be32_to_cpup(reg_list);
+	if (!ret)
+		return NULL;
+
+	return ioremap(ret, SZ_32);
+}
+EXPORT_SYMBOL_GPL(of_dma_get_instwrapper_address);
+
+/**
+ * of_dma_get_arwrapper_address - Get the DMA WAPPER availableilable
+ * @np:		device node of DMA controller
+ *
+ */
+bool of_dma_get_wrapper_available(struct device_node *np)
+{
+	const __be32 *reg_list;
+	int ret = 0;
+
+	reg_list = of_get_property(np, "dma-instwrapper", NULL);
+
+	if (!reg_list)
+		return false;
+
+	ret = be32_to_cpup(reg_list);
+	if (ret)
+		return true;
+	else
+		return false;
+}
+EXPORT_SYMBOL_GPL(of_dma_get_wrapper_available);
+
+/**
+ * of_dma_get_arwrapper_address - Get the DMA WAPPER availableilable
+ * @np:		device node of DMA controller
+ *
+ */
+u64 of_dma_get_mask(struct device_node *np, char *name)
+{
+	int bit_cnt = 0;
+
+	of_property_read_u32(np, name, &bit_cnt);
+
+	if (bit_cnt)
+		return ((u64)1 << bit_cnt) - 1;
+	else
+		return -1;
+}
+EXPORT_SYMBOL_GPL(of_dma_get_mask);
+
+/**
+ * of_dma_request_slave_channel - Get the DMA slave channel
+ * @np:		device node to get DMA request from
+ * @name:	name of desired channel
+ *
+ * Returns pointer to appropriate DMA channel on success or an error pointer.
+ */
+struct dma_chan *of_dma_request_slave_channel(struct device_node *np,
+					      const char *name)
+{
+	struct of_phandle_args	dma_spec;
+	struct of_dma		*ofdma;
+	struct dma_chan		*chan;
+	int			count, i;
+	int			ret_no_channel = -ENODEV;
+
+	if (!np || !name) {
+		pr_err("%s: not enough information provided\n", __func__);
+		return ERR_PTR(-ENODEV);
+	}
+
+	/* Silently fail if there is not even the "dmas" property */
+	if (!of_find_property(np, "dmas", NULL))
+		return ERR_PTR(-ENODEV);
+
+	count = of_property_count_strings(np, "dma-names");
+	if (count < 0) {
+		pr_err("%s: dma-names property of node '%s' missing or empty\n",
+			__func__, np->full_name);
+		return ERR_PTR(-ENODEV);
+	}
+
+	for (i = 0; i < count; i++) {
+		if (of_dma_match_channel(np, name, i, &dma_spec))
+			continue;
+
+		mutex_lock(&of_dma_lock);
+		ofdma = of_dma_find_controller(&dma_spec);
+
+		if (ofdma) {
+			chan = ofdma->of_dma_xlate(&dma_spec, ofdma);
+		} else {
+			ret_no_channel = -EPROBE_DEFER;
+			chan = NULL;
+		}
+
+		mutex_unlock(&of_dma_lock);
+
+		of_node_put(dma_spec.np);
+
+		if (chan)
+			return chan;
+	}
+
+	return ERR_PTR(ret_no_channel);
+}
+EXPORT_SYMBOL_GPL(of_dma_request_slave_channel);
+
+/**
+ * of_dma_simple_xlate - Simple DMA engine translation function
+ * @dma_spec:	pointer to DMA specifier as found in the device tree
+ * @of_dma:	pointer to DMA controller data
+ *
+ * A simple translation function for devices that use a 32-bit value for the
+ * filter_param when calling the DMA engine dma_request_channel() function.
+ * Note that this translation function requires that #dma-cells is equal to 1
+ * and the argument of the dma specifier is the 32-bit filter_param. Returns
+ * pointer to appropriate dma channel on success or NULL on error.
+ */
+struct dma_chan *of_dma_simple_xlate(struct of_phandle_args *dma_spec,
+						struct of_dma *ofdma)
+{
+	int count = dma_spec->args_count;
+	struct of_dma_filter_info *info = ofdma->of_dma_data;
+
+	if (!info || !info->filter_fn)
+		return NULL;
+
+	if (count != 1)
+		return NULL;
+
+	return dma_request_channel(info->dma_cap, info->filter_fn,
+			&dma_spec->args[0]);
+}
+EXPORT_SYMBOL_GPL(of_dma_simple_xlate);
+
+/**
+ * of_dma_xlate_by_chan_id - Translate dt property to DMA channel by channel id
+ * @dma_spec:	pointer to DMA specifier as found in the device tree
+ * @of_dma:	pointer to DMA controller data
+ *
+ * This function can be used as the of xlate callback for DMA driver which wants
+ * to match the channel based on the channel id. When using this xlate function
+ * the #dma-cells propety of the DMA controller dt node needs to be set to 1.
+ * The data parameter of of_dma_controller_register must be a pointer to the
+ * dma_device struct the function should match upon.
+ *
+ * Returns pointer to appropriate dma channel on success or NULL on error.
+ */
+struct dma_chan *of_dma_xlate_by_chan_id(struct of_phandle_args *dma_spec,
+					 struct of_dma *ofdma)
+{
+	struct dma_device *dev = ofdma->of_dma_data;
+	struct dma_chan *chan, *candidate = NULL;
+
+	if (!dev || dma_spec->args_count != 1)
+		return NULL;
+
+	list_for_each_entry(chan, &dev->channels, device_node)
+		if (chan->chan_id == dma_spec->args[0]) {
+			candidate = chan;
+			break;
+		}
+
+	if (!candidate)
+		return NULL;
+
+	return dma_get_slave_channel(candidate);
+}
+EXPORT_SYMBOL_GPL(of_dma_xlate_by_chan_id);
+
+bool of_dma_multi_irq(struct device_node *np)
+{
+	bool ret = 0;
+	const __be32	*prop;
+
+	prop = of_get_property(np, "#dma-multi-irq", NULL);
+	if (prop)
+		ret = be32_to_cpup(prop);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(of_dma_multi_irq);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * OMAP DMAengine support
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ */
+#include <linux/delay.h>
+#include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
+#include <linux/err.h>
+#include <linux/init.h>
+#include <linux/interrupt.h>
+#include <linux/list.h>
+#include <linux/module.h>
+#include <linux/omap-dma.h>
+#include <linux/platform_device.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/of_dma.h>
+#include <linux/of_device.h>
+
+#include "virt-dma.h"
+
+#define OMAP_SDMA_REQUESTS	127
+#define OMAP_SDMA_CHANNELS	32
+
+struct omap_dmadev {
+	struct dma_device ddev;
+	spinlock_t lock;
+	struct tasklet_struct task;
+	struct list_head pending;
+	void __iomem *base;
+	const struct omap_dma_reg *reg_map;
+	struct omap_system_dma_plat_info *plat;
+	bool legacy;
+	unsigned dma_requests;
+	spinlock_t irq_lock;
+	uint32_t irq_enable_mask;
+	struct omap_chan *lch_map[OMAP_SDMA_CHANNELS];
+};
+
+struct omap_chan {
+	struct virt_dma_chan vc;
+	struct list_head node;
+	void __iomem *channel_base;
+	const struct omap_dma_reg *reg_map;
+	uint32_t ccr;
+
+	struct dma_slave_config	cfg;
+	unsigned dma_sig;
+	bool cyclic;
+	bool paused;
+
+	int dma_ch;
+	struct omap_desc *desc;
+	unsigned sgidx;
+};
+
+struct omap_sg {
+	dma_addr_t addr;
+	uint32_t en;		/* number of elements (24-bit) */
+	uint32_t fn;		/* number of frames (16-bit) */
+};
+
+struct omap_desc {
+	struct virt_dma_desc vd;
+	enum dma_transfer_direction dir;
+	dma_addr_t dev_addr;
+
+	int16_t fi;		/* for OMAP_DMA_SYNC_PACKET */
+	uint8_t es;		/* CSDP_DATA_TYPE_xxx */
+	uint32_t ccr;		/* CCR value */
+	uint16_t clnk_ctrl;	/* CLNK_CTRL value */
+	uint16_t cicr;		/* CICR value */
+	uint32_t csdp;		/* CSDP value */
+
+	unsigned sglen;
+	struct omap_sg sg[0];
+};
+
+enum {
+	CCR_FS			= BIT(5),
+	CCR_READ_PRIORITY	= BIT(6),
+	CCR_ENABLE		= BIT(7),
+	CCR_AUTO_INIT		= BIT(8),	/* OMAP1 only */
+	CCR_REPEAT		= BIT(9),	/* OMAP1 only */
+	CCR_OMAP31_DISABLE	= BIT(10),	/* OMAP1 only */
+	CCR_SUSPEND_SENSITIVE	= BIT(8),	/* OMAP2+ only */
+	CCR_RD_ACTIVE		= BIT(9),	/* OMAP2+ only */
+	CCR_WR_ACTIVE		= BIT(10),	/* OMAP2+ only */
+	CCR_SRC_AMODE_CONSTANT	= 0 << 12,
+	CCR_SRC_AMODE_POSTINC	= 1 << 12,
+	CCR_SRC_AMODE_SGLIDX	= 2 << 12,
+	CCR_SRC_AMODE_DBLIDX	= 3 << 12,
+	CCR_DST_AMODE_CONSTANT	= 0 << 14,
+	CCR_DST_AMODE_POSTINC	= 1 << 14,
+	CCR_DST_AMODE_SGLIDX	= 2 << 14,
+	CCR_DST_AMODE_DBLIDX	= 3 << 14,
+	CCR_CONSTANT_FILL	= BIT(16),
+	CCR_TRANSPARENT_COPY	= BIT(17),
+	CCR_BS			= BIT(18),
+	CCR_SUPERVISOR		= BIT(22),
+	CCR_PREFETCH		= BIT(23),
+	CCR_TRIGGER_SRC		= BIT(24),
+	CCR_BUFFERING_DISABLE	= BIT(25),
+	CCR_WRITE_PRIORITY	= BIT(26),
+	CCR_SYNC_ELEMENT	= 0,
+	CCR_SYNC_FRAME		= CCR_FS,
+	CCR_SYNC_BLOCK		= CCR_BS,
+	CCR_SYNC_PACKET		= CCR_BS | CCR_FS,
+
+	CSDP_DATA_TYPE_8	= 0,
+	CSDP_DATA_TYPE_16	= 1,
+	CSDP_DATA_TYPE_32	= 2,
+	CSDP_SRC_PORT_EMIFF	= 0 << 2, /* OMAP1 only */
+	CSDP_SRC_PORT_EMIFS	= 1 << 2, /* OMAP1 only */
+	CSDP_SRC_PORT_OCP_T1	= 2 << 2, /* OMAP1 only */
+	CSDP_SRC_PORT_TIPB	= 3 << 2, /* OMAP1 only */
+	CSDP_SRC_PORT_OCP_T2	= 4 << 2, /* OMAP1 only */
+	CSDP_SRC_PORT_MPUI	= 5 << 2, /* OMAP1 only */
+	CSDP_SRC_PACKED		= BIT(6),
+	CSDP_SRC_BURST_1	= 0 << 7,
+	CSDP_SRC_BURST_16	= 1 << 7,
+	CSDP_SRC_BURST_32	= 2 << 7,
+	CSDP_SRC_BURST_64	= 3 << 7,
+	CSDP_DST_PORT_EMIFF	= 0 << 9, /* OMAP1 only */
+	CSDP_DST_PORT_EMIFS	= 1 << 9, /* OMAP1 only */
+	CSDP_DST_PORT_OCP_T1	= 2 << 9, /* OMAP1 only */
+	CSDP_DST_PORT_TIPB	= 3 << 9, /* OMAP1 only */
+	CSDP_DST_PORT_OCP_T2	= 4 << 9, /* OMAP1 only */
+	CSDP_DST_PORT_MPUI	= 5 << 9, /* OMAP1 only */
+	CSDP_DST_PACKED		= BIT(13),
+	CSDP_DST_BURST_1	= 0 << 14,
+	CSDP_DST_BURST_16	= 1 << 14,
+	CSDP_DST_BURST_32	= 2 << 14,
+	CSDP_DST_BURST_64	= 3 << 14,
+
+	CICR_TOUT_IE		= BIT(0),	/* OMAP1 only */
+	CICR_DROP_IE		= BIT(1),
+	CICR_HALF_IE		= BIT(2),
+	CICR_FRAME_IE		= BIT(3),
+	CICR_LAST_IE		= BIT(4),
+	CICR_BLOCK_IE		= BIT(5),
+	CICR_PKT_IE		= BIT(7),	/* OMAP2+ only */
+	CICR_TRANS_ERR_IE	= BIT(8),	/* OMAP2+ only */
+	CICR_SUPERVISOR_ERR_IE	= BIT(10),	/* OMAP2+ only */
+	CICR_MISALIGNED_ERR_IE	= BIT(11),	/* OMAP2+ only */
+	CICR_DRAIN_IE		= BIT(12),	/* OMAP2+ only */
+	CICR_SUPER_BLOCK_IE	= BIT(14),	/* OMAP2+ only */
+
+	CLNK_CTRL_ENABLE_LNK	= BIT(15),
+};
+
+static const unsigned es_bytes[] = {
+	[CSDP_DATA_TYPE_8] = 1,
+	[CSDP_DATA_TYPE_16] = 2,
+	[CSDP_DATA_TYPE_32] = 4,
+};
+
+static struct of_dma_filter_info omap_dma_info = {
+	.filter_fn = omap_dma_filter_fn,
+};
+
+static inline struct omap_dmadev *to_omap_dma_dev(struct dma_device *d)
+{
+	return container_of(d, struct omap_dmadev, ddev);
+}
+
+static inline struct omap_chan *to_omap_dma_chan(struct dma_chan *c)
+{
+	return container_of(c, struct omap_chan, vc.chan);
+}
+
+static inline struct omap_desc *to_omap_dma_desc(struct dma_async_tx_descriptor *t)
+{
+	return container_of(t, struct omap_desc, vd.tx);
+}
+
+static void omap_dma_desc_free(struct virt_dma_desc *vd)
+{
+	kfree(container_of(vd, struct omap_desc, vd));
+}
+
+static void omap_dma_write(uint32_t val, unsigned type, void __iomem *addr)
+{
+	switch (type) {
+	case OMAP_DMA_REG_16BIT:
+		writew_relaxed(val, addr);
+		break;
+	case OMAP_DMA_REG_2X16BIT:
+		writew_relaxed(val, addr);
+		writew_relaxed(val >> 16, addr + 2);
+		break;
+	case OMAP_DMA_REG_32BIT:
+		writel_relaxed(val, addr);
+		break;
+	default:
+		WARN_ON(1);
+	}
+}
+
+static unsigned omap_dma_read(unsigned type, void __iomem *addr)
+{
+	unsigned val;
+
+	switch (type) {
+	case OMAP_DMA_REG_16BIT:
+		val = readw_relaxed(addr);
+		break;
+	case OMAP_DMA_REG_2X16BIT:
+		val = readw_relaxed(addr);
+		val |= readw_relaxed(addr + 2) << 16;
+		break;
+	case OMAP_DMA_REG_32BIT:
+		val = readl_relaxed(addr);
+		break;
+	default:
+		WARN_ON(1);
+		val = 0;
+	}
+
+	return val;
+}
+
+static void omap_dma_glbl_write(struct omap_dmadev *od, unsigned reg, unsigned val)
+{
+	const struct omap_dma_reg *r = od->reg_map + reg;
+
+	WARN_ON(r->stride);
+
+	omap_dma_write(val, r->type, od->base + r->offset);
+}
+
+static unsigned omap_dma_glbl_read(struct omap_dmadev *od, unsigned reg)
+{
+	const struct omap_dma_reg *r = od->reg_map + reg;
+
+	WARN_ON(r->stride);
+
+	return omap_dma_read(r->type, od->base + r->offset);
+}
+
+static void omap_dma_chan_write(struct omap_chan *c, unsigned reg, unsigned val)
+{
+	const struct omap_dma_reg *r = c->reg_map + reg;
+
+	omap_dma_write(val, r->type, c->channel_base + r->offset);
+}
+
+static unsigned omap_dma_chan_read(struct omap_chan *c, unsigned reg)
+{
+	const struct omap_dma_reg *r = c->reg_map + reg;
+
+	return omap_dma_read(r->type, c->channel_base + r->offset);
+}
+
+static void omap_dma_clear_csr(struct omap_chan *c)
+{
+	if (dma_omap1())
+		omap_dma_chan_read(c, CSR);
+	else
+		omap_dma_chan_write(c, CSR, ~0);
+}
+
+static unsigned omap_dma_get_csr(struct omap_chan *c)
+{
+	unsigned val = omap_dma_chan_read(c, CSR);
+
+	if (!dma_omap1())
+		omap_dma_chan_write(c, CSR, val);
+
+	return val;
+}
+
+static void omap_dma_assign(struct omap_dmadev *od, struct omap_chan *c,
+	unsigned lch)
+{
+	c->channel_base = od->base + od->plat->channel_stride * lch;
+
+	od->lch_map[lch] = c;
+}
+
+static void omap_dma_start(struct omap_chan *c, struct omap_desc *d)
+{
+	struct omap_dmadev *od = to_omap_dma_dev(c->vc.chan.device);
+
+	if (__dma_omap15xx(od->plat->dma_attr))
+		omap_dma_chan_write(c, CPC, 0);
+	else
+		omap_dma_chan_write(c, CDAC, 0);
+
+	omap_dma_clear_csr(c);
+
+	/* Enable interrupts */
+	omap_dma_chan_write(c, CICR, d->cicr);
+
+	/* Enable channel */
+	omap_dma_chan_write(c, CCR, d->ccr | CCR_ENABLE);
+}
+
+static void omap_dma_stop(struct omap_chan *c)
+{
+	struct omap_dmadev *od = to_omap_dma_dev(c->vc.chan.device);
+	uint32_t val;
+
+	/* disable irq */
+	omap_dma_chan_write(c, CICR, 0);
+
+	omap_dma_clear_csr(c);
+
+	val = omap_dma_chan_read(c, CCR);
+	if (od->plat->errata & DMA_ERRATA_i541 && val & CCR_TRIGGER_SRC) {
+		uint32_t sysconfig;
+		unsigned i;
+
+		sysconfig = omap_dma_glbl_read(od, OCP_SYSCONFIG);
+		val = sysconfig & ~DMA_SYSCONFIG_MIDLEMODE_MASK;
+		val |= DMA_SYSCONFIG_MIDLEMODE(DMA_IDLEMODE_NO_IDLE);
+		omap_dma_glbl_write(od, OCP_SYSCONFIG, val);
+
+		val = omap_dma_chan_read(c, CCR);
+		val &= ~CCR_ENABLE;
+		omap_dma_chan_write(c, CCR, val);
+
+		/* Wait for sDMA FIFO to drain */
+		for (i = 0; ; i++) {
+			val = omap_dma_chan_read(c, CCR);
+			if (!(val & (CCR_RD_ACTIVE | CCR_WR_ACTIVE)))
+				break;
+
+			if (i > 100)
+				break;
+
+			udelay(5);
+		}
+
+		if (val & (CCR_RD_ACTIVE | CCR_WR_ACTIVE))
+			dev_err(c->vc.chan.device->dev,
+				"DMA drain did not complete on lch %d\n",
+			        c->dma_ch);
+
+		omap_dma_glbl_write(od, OCP_SYSCONFIG, sysconfig);
+	} else {
+		val &= ~CCR_ENABLE;
+		omap_dma_chan_write(c, CCR, val);
+	}
+
+	mb();
+
+	if (!__dma_omap15xx(od->plat->dma_attr) && c->cyclic) {
+		val = omap_dma_chan_read(c, CLNK_CTRL);
+
+		if (dma_omap1())
+			val |= 1 << 14; /* set the STOP_LNK bit */
+		else
+			val &= ~CLNK_CTRL_ENABLE_LNK;
+
+		omap_dma_chan_write(c, CLNK_CTRL, val);
+	}
+}
+
+static void omap_dma_start_sg(struct omap_chan *c, struct omap_desc *d,
+	unsigned idx)
+{
+	struct omap_sg *sg = d->sg + idx;
+	unsigned cxsa, cxei, cxfi;
+
+	if (d->dir == DMA_DEV_TO_MEM || d->dir == DMA_MEM_TO_MEM) {
+		cxsa = CDSA;
+		cxei = CDEI;
+		cxfi = CDFI;
+	} else {
+		cxsa = CSSA;
+		cxei = CSEI;
+		cxfi = CSFI;
+	}
+
+	omap_dma_chan_write(c, cxsa, sg->addr);
+	omap_dma_chan_write(c, cxei, 0);
+	omap_dma_chan_write(c, cxfi, 0);
+	omap_dma_chan_write(c, CEN, sg->en);
+	omap_dma_chan_write(c, CFN, sg->fn);
+
+	omap_dma_start(c, d);
+}
+
+static void omap_dma_start_desc(struct omap_chan *c)
+{
+	struct virt_dma_desc *vd = vchan_next_desc(&c->vc);
+	struct omap_desc *d;
+	unsigned cxsa, cxei, cxfi;
+
+	if (!vd) {
+		c->desc = NULL;
+		return;
+	}
+
+	list_del(&vd->node);
+
+	c->desc = d = to_omap_dma_desc(&vd->tx);
+	c->sgidx = 0;
+
+	/*
+	 * This provides the necessary barrier to ensure data held in
+	 * DMA coherent memory is visible to the DMA engine prior to
+	 * the transfer starting.
+	 */
+	mb();
+
+	omap_dma_chan_write(c, CCR, d->ccr);
+	if (dma_omap1())
+		omap_dma_chan_write(c, CCR2, d->ccr >> 16);
+
+	if (d->dir == DMA_DEV_TO_MEM || d->dir == DMA_MEM_TO_MEM) {
+		cxsa = CSSA;
+		cxei = CSEI;
+		cxfi = CSFI;
+	} else {
+		cxsa = CDSA;
+		cxei = CDEI;
+		cxfi = CDFI;
+	}
+
+	omap_dma_chan_write(c, cxsa, d->dev_addr);
+	omap_dma_chan_write(c, cxei, 0);
+	omap_dma_chan_write(c, cxfi, d->fi);
+	omap_dma_chan_write(c, CSDP, d->csdp);
+	omap_dma_chan_write(c, CLNK_CTRL, d->clnk_ctrl);
+
+	omap_dma_start_sg(c, d, 0);
+}
+
+static void omap_dma_callback(int ch, u16 status, void *data)
+{
+	struct omap_chan *c = data;
+	struct omap_desc *d;
+	unsigned long flags;
+
+	spin_lock_irqsave(&c->vc.lock, flags);
+	d = c->desc;
+	if (d) {
+		if (!c->cyclic) {
+			if (++c->sgidx < d->sglen) {
+				omap_dma_start_sg(c, d, c->sgidx);
+			} else {
+				omap_dma_start_desc(c);
+				vchan_cookie_complete(&d->vd);
+			}
+		} else {
+			vchan_cyclic_callback(&d->vd);
+		}
+	}
+	spin_unlock_irqrestore(&c->vc.lock, flags);
+}
+
+/*
+ * This callback schedules all pending channels.  We could be more
+ * clever here by postponing allocation of the real DMA channels to
+ * this point, and freeing them when our virtual channel becomes idle.
+ *
+ * We would then need to deal with 'all channels in-use'
+ */
+static void omap_dma_sched(unsigned long data)
+{
+	struct omap_dmadev *d = (struct omap_dmadev *)data;
+	LIST_HEAD(head);
+
+	spin_lock_irq(&d->lock);
+	list_splice_tail_init(&d->pending, &head);
+	spin_unlock_irq(&d->lock);
+
+	while (!list_empty(&head)) {
+		struct omap_chan *c = list_first_entry(&head,
+			struct omap_chan, node);
+
+		spin_lock_irq(&c->vc.lock);
+		list_del_init(&c->node);
+		omap_dma_start_desc(c);
+		spin_unlock_irq(&c->vc.lock);
+	}
+}
+
+static irqreturn_t omap_dma_irq(int irq, void *devid)
+{
+	struct omap_dmadev *od = devid;
+	unsigned status, channel;
+
+	spin_lock(&od->irq_lock);
+
+	status = omap_dma_glbl_read(od, IRQSTATUS_L1);
+	status &= od->irq_enable_mask;
+	if (status == 0) {
+		spin_unlock(&od->irq_lock);
+		return IRQ_NONE;
+	}
+
+	while ((channel = ffs(status)) != 0) {
+		unsigned mask, csr;
+		struct omap_chan *c;
+
+		channel -= 1;
+		mask = BIT(channel);
+		status &= ~mask;
+
+		c = od->lch_map[channel];
+		if (c == NULL) {
+			/* This should never happen */
+			dev_err(od->ddev.dev, "invalid channel %u\n", channel);
+			continue;
+		}
+
+		csr = omap_dma_get_csr(c);
+		omap_dma_glbl_write(od, IRQSTATUS_L1, mask);
+
+		omap_dma_callback(channel, csr, c);
+	}
+
+	spin_unlock(&od->irq_lock);
+
+	return IRQ_HANDLED;
+}
+
+static int omap_dma_alloc_chan_resources(struct dma_chan *chan)
+{
+	struct omap_dmadev *od = to_omap_dma_dev(chan->device);
+	struct omap_chan *c = to_omap_dma_chan(chan);
+	int ret;
+
+	if (od->legacy) {
+		ret = omap_request_dma(c->dma_sig, "DMA engine",
+				       omap_dma_callback, c, &c->dma_ch);
+	} else {
+		ret = omap_request_dma(c->dma_sig, "DMA engine", NULL, NULL,
+				       &c->dma_ch);
+	}
+
+	dev_dbg(od->ddev.dev, "allocating channel %u for %u\n",
+		c->dma_ch, c->dma_sig);
+
+	if (ret >= 0) {
+		omap_dma_assign(od, c, c->dma_ch);
+
+		if (!od->legacy) {
+			unsigned val;
+
+			spin_lock_irq(&od->irq_lock);
+			val = BIT(c->dma_ch);
+			omap_dma_glbl_write(od, IRQSTATUS_L1, val);
+			od->irq_enable_mask |= val;
+			omap_dma_glbl_write(od, IRQENABLE_L1, od->irq_enable_mask);
+
+			val = omap_dma_glbl_read(od, IRQENABLE_L0);
+			val &= ~BIT(c->dma_ch);
+			omap_dma_glbl_write(od, IRQENABLE_L0, val);
+			spin_unlock_irq(&od->irq_lock);
+		}
+	}
+
+	if (dma_omap1()) {
+		if (__dma_omap16xx(od->plat->dma_attr)) {
+			c->ccr = CCR_OMAP31_DISABLE;
+			/* Duplicate what plat-omap/dma.c does */
+			c->ccr |= c->dma_ch + 1;
+		} else {
+			c->ccr = c->dma_sig & 0x1f;
+		}
+	} else {
+		c->ccr = c->dma_sig & 0x1f;
+		c->ccr |= (c->dma_sig & ~0x1f) << 14;
+	}
+	if (od->plat->errata & DMA_ERRATA_IFRAME_BUFFERING)
+		c->ccr |= CCR_BUFFERING_DISABLE;
+
+	return ret;
+}
+
+static void omap_dma_free_chan_resources(struct dma_chan *chan)
+{
+	struct omap_dmadev *od = to_omap_dma_dev(chan->device);
+	struct omap_chan *c = to_omap_dma_chan(chan);
+
+	if (!od->legacy) {
+		spin_lock_irq(&od->irq_lock);
+		od->irq_enable_mask &= ~BIT(c->dma_ch);
+		omap_dma_glbl_write(od, IRQENABLE_L1, od->irq_enable_mask);
+		spin_unlock_irq(&od->irq_lock);
+	}
+
+	c->channel_base = NULL;
+	od->lch_map[c->dma_ch] = NULL;
+	vchan_free_chan_resources(&c->vc);
+	omap_free_dma(c->dma_ch);
+
+	dev_dbg(od->ddev.dev, "freeing channel for %u\n", c->dma_sig);
+	c->dma_sig = 0;
+}
+
+static size_t omap_dma_sg_size(struct omap_sg *sg)
+{
+	return sg->en * sg->fn;
+}
+
+static 

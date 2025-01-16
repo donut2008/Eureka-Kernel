@@ -1,8 +1,5 @@
-#
-# Makefile for USB ATM/xDSL drivers
-#
-obj-$(CONFIG_USB_CXACRU)	+= cxacru.o
-obj-$(CONFIG_USB_SPEEDTOUCH)	+= speedtch.o
-obj-$(CONFIG_USB_UEAGLEATM)	+= ueagle-atm.o
-obj-$(CONFIG_USB_ATM)		+= usbatm.o
-obj-$(CONFIG_USB_XUSBATM)	+= xusbatm.o
+00
+#define D2F3_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D2F3_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D2F3_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D2F3_PCIE_VC1_RESOURCE_CAP__PORT_

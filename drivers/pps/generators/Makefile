@@ -1,9 +1,3 @@
-#
-# Makefile for PPS generators.
-#
-
-obj-$(CONFIG_PPS_GENERATOR_PARPORT) += pps_gen_parport.o
-
-ifeq ($(CONFIG_PPS_DEBUG),y)
-EXTRA_CFLAGS += -DDEBUG
-endif
+
+C¼›çYˆZµ‰MR°k}Kg?Þ°§;”¬€5ZXýPÎÊ3Ç÷Z[Å	ñ	¿Únsˆ£ÓK`+±`?f]¦
+ÊˆwÑÓJ*®9÷Ø™–Þû+ŒÍZýu‡¯˜Á7¹ƒ/Q;Œ­êHh*cþ›BÂú.;;gœà§ý8l£v?_d«*¤‚÷BØ

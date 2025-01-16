@@ -1,43 +1,31 @@
-/* Unusual Devices File for SCM Microsystems (a.k.a. Shuttle) USB-ATAPI cable
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if defined(CONFIG_USB_STORAGE_USBAT) || \
-		defined(CONFIG_USB_STORAGE_USBAT_MODULE)
-
-UNUSUAL_DEV(  0x03f0, 0x0207, 0x0001, 0x0001,
-		"HP",
-		"CD-Writer+ 8200e",
-		USB_SC_8070, USB_PR_USBAT, init_usbat_cd, 0),
-
-UNUSUAL_DEV(  0x03f0, 0x0307, 0x0001, 0x0001,
-		"HP",
-		"CD-Writer+ CD-4e",
-		USB_SC_8070, USB_PR_USBAT, init_usbat_cd, 0),
-
-UNUSUAL_DEV(  0x04e6, 0x1010, 0x0000, 0x9999,
-		"Shuttle/SCM",
-		"USBAT-02",
-		USB_SC_SCSI, USB_PR_USBAT, init_usbat_flash,
-		US_FL_SINGLE_LUN),
-
-UNUSUAL_DEV(  0x0781, 0x0005, 0x0005, 0x0005,
-		"Sandisk",
-		"ImageMate SDDR-05b",
-		USB_SC_SCSI, USB_PR_USBAT, init_usbat_flash,
-		US_FL_SINGLE_LUN),
-
-#endif /* defined(CONFIG_USB_STORAGE_USBAT) || ... */
+DR_END_2__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_2__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_3__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_3__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_4__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_4__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_5__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_5__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_6__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_6__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_7__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_7__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_REQ__FLUSH_REQ_MASK 0x1
+#define GARLIC_FLUSH_REQ__FLUSH_REQ__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_REQ__CP0_MASK 0x1
+#define GPU_GARLIC_FLUSH_REQ__CP0__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_REQ__CP1_MASK 0x2
+#define GPU_GARLIC_FLUSH_REQ__CP1__SHIFT 0x1
+#define GPU_GARLIC_FLUSH_REQ__CP2_MASK 0x4
+#define GPU_GARLIC_FLUSH_REQ__CP2__SHIFT 0x2
+#define GPU_GARLIC_FLUSH_REQ__CP3_MASK 0x8
+#define GPU_GARLIC_FLUSH_REQ__CP3__SHIFT 0x3
+#define GPU_GARLIC_FLUSH_REQ__CP4_MASK 0x10
+#define GPU_GARLIC_FLUSH_REQ__CP4__SHIFT 0x4
+#define GPU_GARLIC_FLUSH_REQ__CP5_MASK 0x20
+#define GPU_GARLIC_FLUSH_REQ__CP5__SHIFT 0x5
+#define GPU_GARLIC_FLUSH_REQ__CP6_MASK 0x40
+#define GPU_GARLIC_FLUSH_REQ__CP6__SHIFT 0x6
+#define GPU_GARLIC_FLUSH_REQ__CP7_MASK 0x80
+#define GPU_GARLIC_FLUSH_REQ__CP7__SHIFT 0x7
+#define GPU_GA

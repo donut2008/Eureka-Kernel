@@ -1,29 +1,8 @@
-#ifndef __DRIVERS_USB_CHIPIDEA_HOST_H
-#define __DRIVERS_USB_CHIPIDEA_HOST_H
-
-#ifdef CONFIG_USB_CHIPIDEA_HOST
-
-int ci_hdrc_host_init(struct ci_hdrc *ci);
-void ci_hdrc_host_destroy(struct ci_hdrc *ci);
-void ci_hdrc_host_driver_init(void);
-
-#else
-
-static inline int ci_hdrc_host_init(struct ci_hdrc *ci)
-{
-	return -ENXIO;
-}
-
-static inline void ci_hdrc_host_destroy(struct ci_hdrc *ci)
-{
-
-}
-
-static void ci_hdrc_host_driver_init(void)
-{
-
-}
-
-#endif
-
-#endif /* __DRIVERS_USB_CHIPIDEA_HOST_H */
+f000000
+#define DPM_TABLE_152__GraphicsLevel_5_pcieDpmLevel__SHIFT 0x18
+#define DPM_TABLE_153__GraphicsLevel_5_CgSpllFuncCntl3_MASK 0xffffffff
+#define DPM_TABLE_153__GraphicsLevel_5_CgSpllFuncCntl3__SHIFT 0x0
+#define DPM_TABLE_154__GraphicsLevel_5_CgSpllFuncCntl4_MASK 0xffffffff
+#define DPM_TABLE_154__GraphicsLevel_5_CgSpllFuncCntl4__SHIFT 0x0
+#define DPM_TABLE_155__GraphicsLevel_5_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_155__GraphicsLevel_5_SpllSpreadSpectrum__SHIFT 0x0

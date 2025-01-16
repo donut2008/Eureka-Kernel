@@ -1,15 +1,15 @@
-#ifndef __ARCH_S390_KERNEL_AUDIT_H
-#define __ARCH_S390_KERNEL_AUDIT_H
+#ifndef _ASM_IA64_INTEL_INTRIN_H
+#define _ASM_IA64_INTEL_INTRIN_H
+/*
+ * Intel Compiler Intrinsics
+ *
+ * Copyright (C) 2002,2003 Jun Nakajima <jun.nakajima@intel.com>
+ * Copyright (C) 2002,2003 Suresh Siddha <suresh.b.siddha@intel.com>
+ * Copyright (C) 2005,2006 Hongjiu Lu <hongjiu.lu@intel.com>
+ *
+ */
+#include <ia64intrin.h>
 
-#include <linux/types.h>
+#define ia64_barrier()		__memory_barrier()
 
-#ifdef CONFIG_COMPAT
-extern int s390_classify_syscall(unsigned);
-extern __u32 s390_dir_class[];
-extern __u32 s390_write_class[];
-extern __u32 s390_read_class[];
-extern __u32 s390_chattr_class[];
-extern __u32 s390_signal_class[];
-#endif /* CONFIG_COMPAT */
-
-#endif /* __ARCH_S390_KERNEL_AUDIT_H */
+#define ia64_stop()	/*

@@ -1,2910 +1,2685 @@
-/*
- * Copyright (c) Samsung Electronics Co., Ltd.
+t)
+{
+	struct sun4i_dma_promise *promise;
+
+	promise = list_first_entry_or_null(&contract->demands,
+					   struct sun4i_dma_promise, list);
+	if (!promise) {
+		list_splice_init(&contract->completed_demands,
+				 &contract->demands);
+		promise = list_first_entry(&contract->demands,
+					   struct sun4i_dma_promise, list);
+	}
+
+	return promise;
+}
+
+/**
+ * Free a contract and all its associated promises
+ */
+static void sun4i_dma_free_contract(struct virt_dma_desc *vd)
+{
+	struct sun4i_dma_contract *contract = to_sun4i_dma_contract(vd);
+	struct sun4i_dma_promise *promise, *tmp;
+
+	/* Free all the demands and completed demands */
+	list_for_each_entry_safe(promise, tmp, &contract->demands, list)
+		kfree(promise);
+
+	list_for_each_entry_safe(promise, tmp, &contract->completed_demands, list)
+		kfree(promise);
+
+	kfree(contract);
+}
+
+static struct dma_async_tx_descriptor *
+sun4i_dma_prep_dma_memcpy(struct dma_chan *chan, dma_addr_t dest,
+			  dma_addr_t src, size_t len, unsigned long flags)
+{
+	struct sun4i_dma_vchan *vchan = to_sun4i_dma_vchan(chan);
+	struct dma_slave_config *sconfig = &vchan->cfg;
+	struct sun4i_dma_promise *promise;
+	struct sun4i_dma_contract *contract;
+
+	contract = generate_dma_contract();
+	if (!contract)
+		return NULL;
+
+	/*
+	 * We can only do the copy to bus aligned addresses, so
+	 * choose the best one so we get decent performance. We also
+	 * maximize the burst size for this same reason.
+	 */
+	sconfig->src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	sconfig->dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	sconfig->src_maxburst = 8;
+	sconfig->dst_maxburst = 8;
+
+	if (vchan->is_dedicated)
+		promise = generate_ddma_promise(chan, src, dest, len, sconfig);
+	else
+		promise = generate_ndma_promise(chan, src, dest, len, sconfig,
+						DMA_MEM_TO_MEM);
+
+	if (!promise) {
+		kfree(contract);
+		return NULL;
+	}
+
+	/* Configure memcpy mode */
+	if (vchan->is_dedicated) {
+		promise->cfg |= SUN4I_DMA_CFG_SRC_DRQ_TYPE(SUN4I_DDMA_DRQ_TYPE_SDRAM) |
+				SUN4I_DMA_CFG_DST_DRQ_TYPE(SUN4I_DDMA_DRQ_TYPE_SDRAM);
+	} else {
+		promise->cfg |= SUN4I_DMA_CFG_SRC_DRQ_TYPE(SUN4I_NDMA_DRQ_TYPE_SDRAM) |
+				SUN4I_DMA_CFG_DST_DRQ_TYPE(SUN4I_NDMA_DRQ_TYPE_SDRAM);
+	}
+
+	/* Fill the contract with our only promise */
+	list_add_tail(&promise->list, &contract->demands);
+
+	/* And add it to the vchan */
+	return vchan_tx_prep(&vchan->vc, &contract->vd, flags);
+}
+
+static struct dma_async_tx_descriptor *
+sun4i_dma_prep_dma_cyclic(struct dma_chan *chan, dma_addr_t buf, size_t len,
+			  size_t period_len, enum dma_transfer_direction dir,
+			  unsigned long flags)
+{
+	struct sun4i_dma_vchan *vchan = to_sun4i_dma_vchan(chan);
+	struct dma_slave_config *sconfig = &vchan->cfg;
+	struct sun4i_dma_promise *promise;
+	struct sun4i_dma_contract *contract;
+	dma_addr_t src, dest;
+	u32 endpoints;
+	int nr_periods, offset, plength, i;
+
+	if (!is_slave_direction(dir)) {
+		dev_err(chan2dev(chan), "Invalid DMA direction\n");
+		return NULL;
+	}
+
+	if (vchan->is_dedicated) {
+		/*
+		 * As we are using this just for audio data, we need to use
+		 * normal DMA. There is nothing stopping us from supporting
+		 * dedicated DMA here as well, so if a client comes up and
+		 * requires it, it will be simple to implement it.
+		 */
+		dev_err(chan2dev(chan),
+			"Cyclic transfers are only supported on Normal DMA\n");
+		return NULL;
+	}
+
+	contract = generate_dma_contract();
+	if (!contract)
+		return NULL;
+
+	contract->is_cyclic = 1;
+
+	/* Figure out the endpoints and the address we need */
+	if (dir == DMA_MEM_TO_DEV) {
+		src = buf;
+		dest = sconfig->dst_addr;
+		endpoints = SUN4I_DMA_CFG_SRC_DRQ_TYPE(SUN4I_NDMA_DRQ_TYPE_SDRAM) |
+			    SUN4I_DMA_CFG_DST_DRQ_TYPE(vchan->endpoint) |
+			    SUN4I_DMA_CFG_DST_ADDR_MODE(SUN4I_NDMA_ADDR_MODE_IO);
+	} else {
+		src = sconfig->src_addr;
+		dest = buf;
+		endpoints = SUN4I_DMA_CFG_SRC_DRQ_TYPE(vchan->endpoint) |
+			    SUN4I_DMA_CFG_SRC_ADDR_MODE(SUN4I_NDMA_ADDR_MODE_IO) |
+			    SUN4I_DMA_CFG_DST_DRQ_TYPE(SUN4I_NDMA_DRQ_TYPE_SDRAM);
+	}
+
+	/*
+	 * We will be using half done interrupts to make two periods
+	 * out of a promise, so we need to program the DMA engine less
+	 * often
+	 */
+
+	/*
+	 * The engine can interrupt on half-transfer, so we can use
+	 * this feature to program the engine half as often as if we
+	 * didn't use it (keep in mind the hardware doesn't support
+	 * linked lists).
+	 *
+	 * Say you have a set of periods (| marks the start/end, I for
+	 * interrupt, P for programming the engine to do a new
+	 * transfer), the easy but slow way would be to do
+	 *
+	 *  |---|---|---|---| (periods / promises)
+	 *  P  I,P I,P I,P  I
+	 *
+	 * Using half transfer interrupts you can do
+	 *
+	 *  |-------|-------| (promises as configured on hw)
+	 *  |---|---|---|---| (periods)
+	 *  P   I  I,P  I   I
+	 *
+	 * Which requires half the engine programming for the same
+	 * functionality.
+	 */
+	nr_periods = DIV_ROUND_UP(len / period_len, 2);
+	for (i = 0; i < nr_periods; i++) {
+		/* Calculate the offset in the buffer and the length needed */
+		offset = i * period_len * 2;
+		plength = min((len - offset), (period_len * 2));
+		if (dir == DMA_MEM_TO_DEV)
+			src = buf + offset;
+		else
+			dest = buf + offset;
+
+		/* Make the promise */
+		promise = generate_ndma_promise(chan, src, dest,
+						plength, sconfig, dir);
+		if (!promise) {
+			/* TODO: should we free everything? */
+			return NULL;
+		}
+		promise->cfg |= endpoints;
+
+		/* Then add it to the contract */
+		list_add_tail(&promise->list, &contract->demands);
+	}
+
+	/* And add it to the vchan */
+	return vchan_tx_prep(&vchan->vc, &contract->vd, flags);
+}
+
+static struct dma_async_tx_descriptor *
+sun4i_dma_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
+			unsigned int sg_len, enum dma_transfer_direction dir,
+			unsigned long flags, void *context)
+{
+	struct sun4i_dma_vchan *vchan = to_sun4i_dma_vchan(chan);
+	struct dma_slave_config *sconfig = &vchan->cfg;
+	struct sun4i_dma_promise *promise;
+	struct sun4i_dma_contract *contract;
+	u8 ram_type, io_mode, linear_mode;
+	struct scatterlist *sg;
+	dma_addr_t srcaddr, dstaddr;
+	u32 endpoints, para;
+	int i;
+
+	if (!sgl)
+		return NULL;
+
+	if (!is_slave_direction(dir)) {
+		dev_err(chan2dev(chan), "Invalid DMA direction\n");
+		return NULL;
+	}
+
+	contract = generate_dma_contract();
+	if (!contract)
+		return NULL;
+
+	if (vchan->is_dedicated) {
+		io_mode = SUN4I_DDMA_ADDR_MODE_IO;
+		linear_mode = SUN4I_DDMA_ADDR_MODE_LINEAR;
+		ram_type = SUN4I_DDMA_DRQ_TYPE_SDRAM;
+	} else {
+		io_mode = SUN4I_NDMA_ADDR_MODE_IO;
+		linear_mode = SUN4I_NDMA_ADDR_MODE_LINEAR;
+		ram_type = SUN4I_NDMA_DRQ_TYPE_SDRAM;
+	}
+
+	if (dir == DMA_MEM_TO_DEV)
+		endpoints = SUN4I_DMA_CFG_DST_DRQ_TYPE(vchan->endpoint) |
+			    SUN4I_DMA_CFG_DST_ADDR_MODE(io_mode) |
+			    SUN4I_DMA_CFG_SRC_DRQ_TYPE(ram_type) |
+			    SUN4I_DMA_CFG_SRC_ADDR_MODE(linear_mode);
+	else
+		endpoints = SUN4I_DMA_CFG_DST_DRQ_TYPE(ram_type) |
+			    SUN4I_DMA_CFG_DST_ADDR_MODE(linear_mode) |
+			    SUN4I_DMA_CFG_SRC_DRQ_TYPE(vchan->endpoint) |
+			    SUN4I_DMA_CFG_SRC_ADDR_MODE(io_mode);
+
+	for_each_sg(sgl, sg, sg_len, i) {
+		/* Figure out addresses */
+		if (dir == DMA_MEM_TO_DEV) {
+			srcaddr = sg_dma_address(sg);
+			dstaddr = sconfig->dst_addr;
+		} else {
+			srcaddr = sconfig->src_addr;
+			dstaddr = sg_dma_address(sg);
+		}
+
+		/*
+		 * These are the magic DMA engine timings that keep SPI going.
+		 * I haven't seen any interface on DMAEngine to configure
+		 * timings, and so far they seem to work for everything we
+		 * support, so I've kept them here. I don't know if other
+		 * devices need different timings because, as usual, we only
+		 * have the "para" bitfield meanings, but no comment on what
+		 * the values should be when doing a certain operation :|
+		 */
+		para = SUN4I_DDMA_MAGIC_SPI_PARAMETERS;
+
+		/* And make a suitable promise */
+		if (vchan->is_dedicated)
+			promise = generate_ddma_promise(chan, srcaddr, dstaddr,
+							sg_dma_len(sg),
+							sconfig);
+		else
+			promise = generate_ndma_promise(chan, srcaddr, dstaddr,
+							sg_dma_len(sg),
+							sconfig, dir);
+
+		if (!promise)
+			return NULL; /* TODO: should we free everything? */
+
+		promise->cfg |= endpoints;
+		promise->para = para;
+
+		/* Then add it to the contract */
+		list_add_tail(&promise->list, &contract->demands);
+	}
+
+	/*
+	 * Once we've got all the promises ready, add the contract
+	 * to the pending list on the vchan
+	 */
+	return vchan_tx_prep(&vchan->vc, &contract->vd, flags);
+}
+
+static int sun4i_dma_terminate_all(struct dma_chan *chan)
+{
+	struct sun4i_dma_dev *priv = to_sun4i_dma_dev(chan->device);
+	struct sun4i_dma_vchan *vchan = to_sun4i_dma_vchan(chan);
+	struct sun4i_dma_pchan *pchan = vchan->pchan;
+	LIST_HEAD(head);
+	unsigned long flags;
+
+	spin_lock_irqsave(&vchan->vc.lock, flags);
+	vchan_get_all_descriptors(&vchan->vc, &head);
+	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+
+	/*
+	 * Clearing the configuration register will halt the pchan. Interrupts
+	 * may still trigger, so don't forget to disable them.
+	 */
+	if (pchan) {
+		if (pchan->is_dedicated)
+			writel(0, pchan->base + SUN4I_DDMA_CFG_REG);
+		else
+			writel(0, pchan->base + SUN4I_NDMA_CFG_REG);
+		set_pchan_interrupt(priv, pchan, 0, 0);
+		release_pchan(priv, pchan);
+	}
+
+	spin_lock_irqsave(&vchan->vc.lock, flags);
+	vchan_dma_desc_free_list(&vchan->vc, &head);
+	/* Clear these so the vchan is usable again */
+	vchan->processing = NULL;
+	vchan->pchan = NULL;
+	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+
+	return 0;
+}
+
+static int sun4i_dma_config(struct dma_chan *chan,
+			    struct dma_slave_config *config)
+{
+	struct sun4i_dma_vchan *vchan = to_sun4i_dma_vchan(chan);
+
+	memcpy(&vchan->cfg, config, sizeof(*config));
+
+	return 0;
+}
+
+static struct dma_chan *sun4i_dma_of_xlate(struct of_phandle_args *dma_spec,
+					   struct of_dma *ofdma)
+{
+	struct sun4i_dma_dev *priv = ofdma->of_dma_data;
+	struct sun4i_dma_vchan *vchan;
+	struct dma_chan *chan;
+	u8 is_dedicated = dma_spec->args[0];
+	u8 endpoint = dma_spec->args[1];
+
+	/* Check if type is Normal or Dedicated */
+	if (is_dedicated != 0 && is_dedicated != 1)
+		return NULL;
+
+	/* Make sure the endpoint looks sane */
+	if ((is_dedicated && endpoint >= SUN4I_DDMA_DRQ_TYPE_LIMIT) ||
+	    (!is_dedicated && endpoint >= SUN4I_NDMA_DRQ_TYPE_LIMIT))
+		return NULL;
+
+	chan = dma_get_any_slave_channel(&priv->slave);
+	if (!chan)
+		return NULL;
+
+	/* Assign the endpoint to the vchan */
+	vchan = to_sun4i_dma_vchan(chan);
+	vchan->is_dedicated = is_dedicated;
+	vchan->endpoint = endpoint;
+
+	return chan;
+}
+
+static enum dma_status sun4i_dma_tx_status(struct dma_chan *chan,
+					   dma_cookie_t cookie,
+					   struct dma_tx_state *state)
+{
+	struct sun4i_dma_vchan *vchan = to_sun4i_dma_vchan(chan);
+	struct sun4i_dma_pchan *pchan = vchan->pchan;
+	struct sun4i_dma_contract *contract;
+	struct sun4i_dma_promise *promise;
+	struct virt_dma_desc *vd;
+	unsigned long flags;
+	enum dma_status ret;
+	size_t bytes = 0;
+
+	ret = dma_cookie_status(chan, cookie, state);
+	if (!state || (ret == DMA_COMPLETE))
+		return ret;
+
+	spin_lock_irqsave(&vchan->vc.lock, flags);
+	vd = vchan_find_desc(&vchan->vc, cookie);
+	if (!vd)
+		goto exit;
+	contract = to_sun4i_dma_contract(vd);
+
+	list_for_each_entry(promise, &contract->demands, list)
+		bytes += promise->len;
+
+	/*
+	 * The hardware is configured to return the remaining byte
+	 * quantity. If possible, replace the first listed element's
+	 * full size with the actual remaining amount
+	 */
+	promise = list_first_entry_or_null(&contract->demands,
+					   struct sun4i_dma_promise, list);
+	if (promise && pchan) {
+		bytes -= promise->len;
+		if (pchan->is_dedicated)
+			bytes += readl(pchan->base + SUN4I_DDMA_BYTE_COUNT_REG);
+		else
+			bytes += readl(pchan->base + SUN4I_NDMA_BYTE_COUNT_REG);
+	}
+
+exit:
+
+	dma_set_residue(state, bytes);
+	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+
+	return ret;
+}
+
+static void sun4i_dma_issue_pending(struct dma_chan *chan)
+{
+	struct sun4i_dma_dev *priv = to_sun4i_dma_dev(chan->device);
+	struct sun4i_dma_vchan *vchan = to_sun4i_dma_vchan(chan);
+	unsigned long flags;
+
+	spin_lock_irqsave(&vchan->vc.lock, flags);
+
+	/*
+	 * If there are pending transactions for this vchan, push one of
+	 * them into the engine to get the ball rolling.
+	 */
+	if (vchan_issue_pending(&vchan->vc))
+		__execute_vchan_pending(priv, vchan);
+
+	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+}
+
+static irqreturn_t sun4i_dma_interrupt(int irq, void *dev_id)
+{
+	struct sun4i_dma_dev *priv = dev_id;
+	struct sun4i_dma_pchan *pchans = priv->pchans, *pchan;
+	struct sun4i_dma_vchan *vchan;
+	struct sun4i_dma_contract *contract;
+	struct sun4i_dma_promise *promise;
+	unsigned long pendirq, irqs, disableirqs;
+	int bit, i, free_room, allow_mitigation = 1;
+
+	pendirq = readl_relaxed(priv->base + SUN4I_DMA_IRQ_PENDING_STATUS_REG);
+
+handle_pending:
+
+	disableirqs = 0;
+	free_room = 0;
+
+	for_each_set_bit(bit, &pendirq, 32) {
+		pchan = &pchans[bit >> 1];
+		vchan = pchan->vchan;
+		if (!vchan) /* a terminated channel may still interrupt */
+			continue;
+		contract = vchan->contract;
+
+		/*
+		 * Disable the IRQ and free the pchan if it's an end
+		 * interrupt (odd bit)
+		 */
+		if (bit & 1) {
+			spin_lock(&vchan->vc.lock);
+
+			/*
+			 * Move the promise into the completed list now that
+			 * we're done with it
+			 */
+			list_del(&vchan->processing->list);
+			list_add_tail(&vchan->processing->list,
+				      &contract->completed_demands);
+
+			/*
+			 * Cyclic DMA transfers are special:
+			 * - There's always something we can dispatch
+			 * - We need to run the callback
+			 * - Latency is very important, as this is used by audio
+			 * We therefore just cycle through the list and dispatch
+			 * whatever we have here, reusing the pchan. There's
+			 * no need to run the thread after this.
+			 *
+			 * For non-cyclic transfers we need to look around,
+			 * so we can program some more work, or notify the
+			 * client that their transfers have been completed.
+			 */
+			if (contract->is_cyclic) {
+				promise = get_next_cyclic_promise(contract);
+				vchan->processing = promise;
+				configure_pchan(pchan, promise);
+				vchan_cyclic_callback(&contract->vd);
+			} else {
+				vchan->processing = NULL;
+				vchan->pchan = NULL;
+
+				free_room = 1;
+				disableirqs |= BIT(bit);
+				release_pchan(priv, pchan);
+			}
+
+			spin_unlock(&vchan->vc.lock);
+		} else {
+			/* Half done interrupt */
+			if (contract->is_cyclic)
+				vchan_cyclic_callback(&contract->vd);
+			else
+				disableirqs |= BIT(bit);
+		}
+	}
+
+	/* Disable the IRQs for events we handled */
+	spin_lock(&priv->lock);
+	irqs = readl_relaxed(priv->base + SUN4I_DMA_IRQ_ENABLE_REG);
+	writel_relaxed(irqs & ~disableirqs,
+		       priv->base + SUN4I_DMA_IRQ_ENABLE_REG);
+	spin_unlock(&priv->lock);
+
+	/* Writing 1 to the pending field will clear the pending interrupt */
+	writel_relaxed(pendirq, priv->base + SUN4I_DMA_IRQ_PENDING_STATUS_REG);
+
+	/*
+	 * If a pchan was freed, we may be able to schedule something else,
+	 * so have a look around
+	 */
+	if (free_room) {
+		for (i = 0; i < SUN4I_DMA_NR_MAX_VCHANS; i++) {
+			vchan = &priv->vchans[i];
+			spin_lock(&vchan->vc.lock);
+			__execute_vchan_pending(priv, vchan);
+			spin_unlock(&vchan->vc.lock);
+		}
+	}
+
+	/*
+	 * Handle newer interrupts if some showed up, but only do it once
+	 * to avoid a too long a loop
+	 */
+	if (allow_mitigation) {
+		pendirq = readl_relaxed(priv->base +
+					SUN4I_DMA_IRQ_PENDING_STATUS_REG);
+		if (pendirq) {
+			allow_mitigation = 0;
+			goto handle_pending;
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+static int sun4i_dma_probe(struct platform_device *pdev)
+{
+	struct sun4i_dma_dev *priv;
+	struct resource *res;
+	int i, j, ret;
+
+	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	priv->base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(priv->base))
+		return PTR_ERR(priv->base);
+
+	priv->irq = platform_get_irq(pdev, 0);
+	if (priv->irq < 0) {
+		dev_err(&pdev->dev, "Cannot claim IRQ\n");
+		return priv->irq;
+	}
+
+	priv->clk = devm_clk_get(&pdev->dev, NULL);
+	if (IS_ERR(priv->clk)) {
+		dev_err(&pdev->dev, "No clock specified\n");
+		return PTR_ERR(priv->clk);
+	}
+
+	platform_set_drvdata(pdev, priv);
+	spin_lock_init(&priv->lock);
+
+	dma_cap_zero(priv->slave.cap_mask);
+	dma_cap_set(DMA_PRIVATE, priv->slave.cap_mask);
+	dma_cap_set(DMA_MEMCPY, priv->slave.cap_mask);
+	dma_cap_set(DMA_CYCLIC, priv->slave.cap_mask);
+	dma_cap_set(DMA_SLAVE, priv->slave.cap_mask);
+
+	INIT_LIST_HEAD(&priv->slave.channels);
+	priv->slave.device_free_chan_resources	= sun4i_dma_free_chan_resources;
+	priv->slave.device_tx_status		= sun4i_dma_tx_status;
+	priv->slave.device_issue_pending	= sun4i_dma_issue_pending;
+	priv->slave.device_prep_slave_sg	= sun4i_dma_prep_slave_sg;
+	priv->slave.device_prep_dma_memcpy	= sun4i_dma_prep_dma_memcpy;
+	priv->slave.device_prep_dma_cyclic	= sun4i_dma_prep_dma_cyclic;
+	priv->slave.device_config		= sun4i_dma_config;
+	priv->slave.device_terminate_all	= sun4i_dma_terminate_all;
+	priv->slave.copy_align			= 2;
+	priv->slave.src_addr_widths		= BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+						  BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+						  BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+	priv->slave.dst_addr_widths		= BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+						  BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+						  BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+	priv->slave.directions			= BIT(DMA_DEV_TO_MEM) |
+						  BIT(DMA_MEM_TO_DEV);
+	priv->slave.residue_granularity		= DMA_RESIDUE_GRANULARITY_BURST;
+
+	priv->slave.dev = &pdev->dev;
+
+	priv->pchans = devm_kcalloc(&pdev->dev, SUN4I_DMA_NR_MAX_CHANNELS,
+				    sizeof(struct sun4i_dma_pchan), GFP_KERNEL);
+	priv->vchans = devm_kcalloc(&pdev->dev, SUN4I_DMA_NR_MAX_VCHANS,
+				    sizeof(struct sun4i_dma_vchan), GFP_KERNEL);
+	if (!priv->vchans || !priv->pchans)
+		return -ENOMEM;
+
+	/*
+	 * [0..SUN4I_NDMA_NR_MAX_CHANNELS) are normal pchans, and
+	 * [SUN4I_NDMA_NR_MAX_CHANNELS..SUN4I_DMA_NR_MAX_CHANNELS) are
+	 * dedicated ones
+	 */
+	for (i = 0; i < SUN4I_NDMA_NR_MAX_CHANNELS; i++)
+		priv->pchans[i].base = priv->base +
+			SUN4I_NDMA_CHANNEL_REG_BASE(i);
+
+	for (j = 0; i < SUN4I_DMA_NR_MAX_CHANNELS; i++, j++) {
+		priv->pchans[i].base = priv->base +
+			SUN4I_DDMA_CHANNEL_REG_BASE(j);
+		priv->pchans[i].is_dedicated = 1;
+	}
+
+	for (i = 0; i < SUN4I_DMA_NR_MAX_VCHANS; i++) {
+		struct sun4i_dma_vchan *vchan = &priv->vchans[i];
+
+		spin_lock_init(&vchan->vc.lock);
+		vchan->vc.desc_free = sun4i_dma_free_contract;
+		vchan_init(&vchan->vc, &priv->slave);
+	}
+
+	ret = clk_prepare_enable(priv->clk);
+	if (ret) {
+		dev_err(&pdev->dev, "Couldn't enable the clock\n");
+		return ret;
+	}
+
+	/*
+	 * Make sure the IRQs are all disabled and accounted for. The bootloader
+	 * likes to leave these dirty
+	 */
+	writel(0, priv->base + SUN4I_DMA_IRQ_ENABLE_REG);
+	writel(0xFFFFFFFF, priv->base + SUN4I_DMA_IRQ_PENDING_STATUS_REG);
+
+	ret = devm_request_irq(&pdev->dev, priv->irq, sun4i_dma_interrupt,
+			       0, dev_name(&pdev->dev), priv);
+	if (ret) {
+		dev_err(&pdev->dev, "Cannot request IRQ\n");
+		goto err_clk_disable;
+	}
+
+	ret = dma_async_device_register(&priv->slave);
+	if (ret) {
+		dev_warn(&pdev->dev, "Failed to register DMA engine device\n");
+		goto err_clk_disable;
+	}
+
+	ret = of_dma_controller_register(pdev->dev.of_node, sun4i_dma_of_xlate,
+					 priv);
+	if (ret) {
+		dev_err(&pdev->dev, "of_dma_controller_register failed\n");
+		goto err_dma_unregister;
+	}
+
+	dev_dbg(&pdev->dev, "Successfully probed SUN4I_DMA\n");
+
+	return 0;
+
+err_dma_unregister:
+	dma_async_device_unregister(&priv->slave);
+err_clk_disable:
+	clk_disable_unprepare(priv->clk);
+	return ret;
+}
+
+static int sun4i_dma_remove(struct platform_device *pdev)
+{
+	struct sun4i_dma_dev *priv = platform_get_drvdata(pdev);
+
+	/* Disable IRQ so no more work is scheduled */
+	disable_irq(priv->irq);
+
+	of_dma_controller_free(pdev->dev.of_node);
+	dma_async_device_unregister(&priv->slave);
+
+	clk_disable_unprepare(priv->clk);
+
+	return 0;
+}
+
+static const struct of_device_id sun4i_dma_match[] = {
+	{ .compatible = "allwinner,sun4i-a10-dma" },
+	{ /* sentinel */ },
+};
+
+static struct platform_driver sun4i_dma_driver = {
+	.probe	= sun4i_dma_probe,
+	.remove	= sun4i_dma_remove,
+	.driver	= {
+		.name		= "sun4i-dma",
+		.of_match_table	= sun4i_dma_match,
+	},
+};
+
+module_platform_driver(sun4i_dma_driver);
+
+MODULE_DESCRIPTION("Allwinner A10 Dedicated DMA Controller Driver");
+MODULE_AUTHOR("Emilio López <emilio@elopez.com.ar>");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                     /*
+ * Copyright (C) 2013-2014 Allwinner Tech Co., Ltd
+ * Author: Sugar <shuge@allwinnertech.com>
+ *
+ * Copyright (C) 2014 Maxime Ripard
+ * Maxime Ripard <maxime.ripard@free-electrons.com>
  *
  * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  */
 
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/dmaengine.h>
+#include <linux/dmapool.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
-#include <linux/lcd.h>
-#include <linux/backlight.h>
+#include <linux/of_dma.h>
 #include <linux/of_device.h>
-#include <linux/ctype.h>
-#include <video/mipi_display.h>
+#include <linux/platform_device.h>
+#include <linux/reset.h>
+#include <linux/slab.h>
+#include <linux/types.h>
 
-#include "../decon.h"
-#include "../decon_notify.h"
-#include "../dsim.h"
-#include "dsim_panel.h"
+#include "virt-dma.h"
 
-#include "s6e3fa7_a7y18_param.h"
+/*
+ * Common registers
+ */
+#define DMA_IRQ_EN(x)		((x) * 0x04)
+#define DMA_IRQ_HALF			BIT(0)
+#define DMA_IRQ_PKG			BIT(1)
+#define DMA_IRQ_QUEUE			BIT(2)
 
-#if defined(CONFIG_EXYNOS_DECON_MDNIE)
-#include "mdnie.h"
-#include "s6e3fa7_jackpot2_mdnie.h"
-#endif
+#define DMA_IRQ_CHAN_NR			8
+#define DMA_IRQ_CHAN_WIDTH		4
 
-#ifdef CONFIG_SUPPORT_POC_FLASH
-#include "poc.h"
-#endif
 
-#if defined(CONFIG_DISPLAY_USE_INFO)
-#include "dpui.h"
+#define DMA_IRQ_STAT(x)		((x) * 0x04 + 0x10)
 
-#define	DPUI_VENDOR_NAME	"SDC"
-#define DPUI_MODEL_NAME		"AMS604NL07"
-#endif
+#define DMA_STAT		0x30
 
-#define PANEL_STATE_SUSPENED	0
-#define PANEL_STATE_RESUMED	1
+/*
+ * sun8i specific registers
+ */
+#define SUN8I_DMA_GATE		0x20
+#define SUN8I_DMA_GATE_ENABLE	0x4
 
-#define DSI_WRITE(cmd, size)		do {				\
-	if (size >= DSIM_FIFO_SIZE)	\
-		ret = mipi_write_side_ram(lcd, cmd, size);	\
-	else	\
-		ret = dsim_write_hl_data(lcd, cmd, size);			\
-	if (ret < 0)							\
-		dev_info(&lcd->ld->dev, "%s: failed to write %s\n", __func__, #cmd);	\
-} while (0)
+/*
+ * Channels specific registers
+ */
+#define DMA_CHAN_ENABLE		0x00
+#define DMA_CHAN_ENABLE_START		BIT(0)
+#define DMA_CHAN_ENABLE_STOP		0
 
-#ifdef SMART_DIMMING_DEBUG
-#define smtd_dbg(format, arg...)	printk(format, ##arg)
-#else
-#define smtd_dbg(format, arg...)
-#endif
+#define DMA_CHAN_PAUSE		0x04
+#define DMA_CHAN_PAUSE_PAUSE		BIT(1)
+#define DMA_CHAN_PAUSE_RESUME		0
 
-#define get_bit(value, shift, width)	((value >> shift) & (GENMASK(width - 1, 0)))
+#define DMA_CHAN_LLI_ADDR	0x08
 
-union aor_info {
-	u32 value;
-	struct {
-		u8 aor_1;
-		u8 aor_2;
-		u16 reserved;
-	};
+#define DMA_CHAN_CUR_CFG	0x0c
+#define DMA_CHAN_CFG_SRC_DRQ(x)		((x) & 0x1f)
+#define DMA_CHAN_CFG_SRC_IO_MODE	BIT(5)
+#define DMA_CHAN_CFG_SRC_LINEAR_MODE	(0 << 5)
+#define DMA_CHAN_CFG_SRC_BURST(x)	(((x) & 0x3) << 7)
+#define DMA_CHAN_CFG_SRC_WIDTH(x)	(((x) & 0x3) << 9)
+
+#define DMA_CHAN_CFG_DST_DRQ(x)		(DMA_CHAN_CFG_SRC_DRQ(x) << 16)
+#define DMA_CHAN_CFG_DST_IO_MODE	(DMA_CHAN_CFG_SRC_IO_MODE << 16)
+#define DMA_CHAN_CFG_DST_LINEAR_MODE	(DMA_CHAN_CFG_SRC_LINEAR_MODE << 16)
+#define DMA_CHAN_CFG_DST_BURST(x)	(DMA_CHAN_CFG_SRC_BURST(x) << 16)
+#define DMA_CHAN_CFG_DST_WIDTH(x)	(DMA_CHAN_CFG_SRC_WIDTH(x) << 16)
+
+#define DMA_CHAN_CUR_SRC	0x10
+
+#define DMA_CHAN_CUR_DST	0x14
+
+#define DMA_CHAN_CUR_CNT	0x18
+
+#define DMA_CHAN_CUR_PARA	0x1c
+
+
+/*
+ * Various hardware related defines
+ */
+#define LLI_LAST_ITEM	0xfffff800
+#define NORMAL_WAIT	8
+#define DRQ_SDRAM	1
+
+/*
+ * Hardware channels / ports representation
+ *
+ * The hardware is used in several SoCs, with differing numbers
+ * of channels and endpoints. This structure ties those numbers
+ * to a certain compatible string.
+ */
+struct sun6i_dma_config {
+	u32 nr_max_channels;
+	u32 nr_max_requests;
+	u32 nr_max_vchans;
 };
 
-union elvss_info {
-	u32 value;
-	struct {
-		u8 tset;
-		u8 mpscon;
-		u8 dim_offset;
-		u8 cal_offset;
-	};
+/*
+ * Hardware representation of the LLI
+ *
+ * The hardware will be fed the physical address of this structure,
+ * and read its content in order to start the transfer.
+ */
+struct sun6i_dma_lli {
+	u32			cfg;
+	u32			src;
+	u32			dst;
+	u32			len;
+	u32			para;
+	u32			p_lli_next;
+
+	/*
+	 * This field is not used by the DMA controller, but will be
+	 * used by the CPU to go through the list (mostly for dumping
+	 * or freeing it).
+	 */
+	struct sun6i_dma_lli	*v_lli_next;
 };
 
-union acl_info {
-	u32 value;
-	struct {
-		u8 enable;
-		u8 frame_avg_hbm;
-		u8 percent;
-		u8 frame_avg;
-	};
+
+struct sun6i_desc {
+	struct virt_dma_desc	vd;
+	dma_addr_t		p_lli;
+	struct sun6i_dma_lli	*v_lli;
 };
 
-struct hbm_interpolation_t {
-	int		*hbm;
-	const int	*gamma_default;
-
-	const int	*ibr_tbl;
-	int		idx_ref;
-	int		idx_hbm;
+struct sun6i_pchan {
+	u32			idx;
+	void __iomem		*base;
+	struct sun6i_vchan	*vchan;
+	struct sun6i_desc	*desc;
+	struct sun6i_desc	*done;
 };
 
-union lpm_info {
-	u32 value;
-	struct {
-		u8 state;
-		u8 mode;	/* comes from sysfs. 0(off), 1(alpm 2nit), 2(hlpm 2nit), 3(alpm 60nit), 4(hlpm 60nit) or 1(alpm), 2(hlpm) */
-		u8 ver;		/* comes from sysfs. 0(old), 1(new) */
-		u16 reserved;
-	};
+struct sun6i_vchan {
+	struct virt_dma_chan	vc;
+	struct list_head	node;
+	struct dma_slave_config	cfg;
+	struct sun6i_pchan	*phy;
+	u8			port;
 };
 
-struct lcd_info {
-	unsigned int			connected;
-	unsigned int			bl;
-	unsigned int			brightness;
-	unsigned int			current_bl;
-	union elvss_info		current_elvss;
-	union aor_info			current_aor;
-	union acl_info			current_acl;
-	unsigned int			current_vint;
-	unsigned int			state;
-
-	struct lcd_device		*ld;
-	struct backlight_device		*bd;
-	struct device			svc_dev;
-	struct dynamic_aid_param_t	daid;
-
-	unsigned char			elvss_table[IBRIGHTNESS_HBM_MAX][TEMP_MAX][ELVSS_CMD_CNT];
-	unsigned char			gamma_table[IBRIGHTNESS_HBM_MAX][GAMMA_CMD_CNT];
-#ifdef CONFIG_SUPPORT_POC_FLASH
-	unsigned char			poc_compen_table[IBRIGHTNESS_HBM_MAX][POC_COMPEN_CMD_CNT];
-#endif
-
-	unsigned char			(*aor_table)[AID_CMD_CNT];
-	unsigned char			(*irc_table)[IRC_CMD_CNT];
-	unsigned char			**acl_table;
-	unsigned char			**opr_table;
-	unsigned char			(*vint_table)[VINT_CMD_CNT];
-
-	int				temperature;
-	unsigned int			temperature_index;
-
-	union {
-		struct {
-			u8		reserved;
-			u8		id[LDI_LEN_ID];
-		};
-		u32			value;
-	} id_info;
-	unsigned char			mtp[LDI_LEN_MTP];
-	unsigned char			hbm[LDI_LEN_HBM];
-	unsigned char			code[LDI_LEN_CHIP_ID];
-	unsigned char			date[LDI_LEN_DATE];
-	unsigned int			coordinate[2];
-	unsigned char			coordinates[20];
-	unsigned char			manufacture_info[LDI_LEN_MANUFACTURE_INFO];
-	unsigned char			rddpm;
-	unsigned char			rddsm;
-
-	unsigned int			adaptive_control;
-	int				lux;
-	struct class			*mdnie_class;
-
-	struct dsim_device		*dsim;
-	struct mutex			lock;
-
-	struct hbm_interpolation_t	hitp;
-
-	struct notifier_block		fb_notifier;
-
-#if defined(CONFIG_DISPLAY_USE_INFO)
-	struct notifier_block		dpui_notif;
-#endif
-
-#if defined(CONFIG_EXYNOS_DOZE)
-	union lpm_info			alpm;
-	union lpm_info			current_alpm;
-
-#if defined(CONFIG_SEC_FACTORY)
-	unsigned int			prev_brightness;
-	union lpm_info			prev_alpm;
-#endif
-#endif
-
-#if defined(CONFIG_LCD_HMT)
-	struct dynamic_aid_param_t	hmt_daid;
-	unsigned int			hmt_on;
-	unsigned int			hmt_brightness;
-	unsigned int			hmt_bl;
-	unsigned int			hmt_current_bl;
-	unsigned char			hmt_gamma_table[IBRIGHTNESS_HMT_MAX][GAMMA_CMD_CNT];
-#endif
-	unsigned char			poc_eb[LDI_LEN_POC_EB];
-	unsigned char			poc_ec[LDI_LEN_POC_EC];
-
-#ifdef CONFIG_SUPPORT_POC_FLASH
-	struct panel_poc_device		poc_dev;
-#endif
+struct sun6i_dma_dev {
+	struct dma_device	slave;
+	void __iomem		*base;
+	struct clk		*clk;
+	int			irq;
+	spinlock_t		lock;
+	struct reset_control	*rstc;
+	struct tasklet_struct	task;
+	atomic_t		tasklet_shutdown;
+	struct list_head	pending;
+	struct dma_pool		*pool;
+	struct sun6i_pchan	*pchans;
+	struct sun6i_vchan	*vchans;
+	const struct sun6i_dma_config *cfg;
 };
 
-#if defined(CONFIG_LCD_HMT)
-static int s6e3fa7_hmt_update(struct lcd_info *lcd, u8 forced);
-static int hmt_init(struct lcd_info *lcd);
-static void show_hmt_aid_log(struct lcd_info *lcd);
-#endif
-
-static int dsim_write_hl_data(struct lcd_info *lcd, const u8 *cmd, u32 cmdsize)
+static struct device *chan2dev(struct dma_chan *chan)
 {
-	int ret = 0;
-	int retry = 2;
-
-	if (!lcd->connected)
-		return ret;
-
-try_write:
-	if (cmdsize == 1)
-		ret = dsim_write_data(lcd->dsim, MIPI_DSI_DCS_SHORT_WRITE, cmd[0], 0);
-	else if (cmdsize == 2)
-		ret = dsim_write_data(lcd->dsim, MIPI_DSI_DCS_SHORT_WRITE_PARAM, cmd[0], cmd[1]);
-	else
-		ret = dsim_write_data(lcd->dsim, MIPI_DSI_DCS_LONG_WRITE, (unsigned long)cmd, cmdsize);
-
-	if (ret < 0) {
-		if (--retry)
-			goto try_write;
-		else
-			dev_info(&lcd->ld->dev, "%s: fail. %02x, ret: %d\n", __func__, cmd[0], ret);
-	}
-
-	return ret;
+	return &chan->dev->device;
 }
 
-static int mipi_write_side_ram(struct lcd_info *lcd, const u8 *cmd, int size)
+static inline struct sun6i_dma_dev *to_sun6i_dma_dev(struct dma_device *d)
 {
-	int ret;
-	u8 cmd_buf[DSIM_FIFO_SIZE];
-	u32 t_tx_size, tx_size, remind_size;
-	u32 fifo_size, tmp;
-
-	dev_info(&lcd->ld->dev, "%s: %d\n", __func__, size);
-
-	fifo_size = DSIM_FIFO_SIZE;
-
-	/* for SIDE_RAM_ALIGN_CNT byte align */
-	tmp = (fifo_size - 1) / SIDE_RAM_ALIGN_CNT;
-	fifo_size = (tmp * SIDE_RAM_ALIGN_CNT) + 1;
-
-	dev_info(&lcd->ld->dev, "%s: fifo_size: %d\n", __func__, fifo_size);
-
-	t_tx_size = 0;
-	remind_size = size;
-
-	while (remind_size) {
-		if (remind_size == size)
-			cmd_buf[0] = MIPI_DSI_OEM1_WR_SIDE_RAM;
-		else
-			cmd_buf[0] = MIPI_DSI_OEM1_WR_SIDE_RAM2;
-
-		tx_size = min(remind_size, fifo_size - 1);
-
-		memcpy((u8 *)cmd_buf + 1, (u8 *)cmd + t_tx_size, tx_size);
-
-		ret = dsim_write_hl_data(lcd, cmd_buf, tx_size + 1);
-		if (ret < 0) {
-			dev_info(&lcd->ld->dev, "%s: failed to write command: %d\n", __func__, ret);
-			goto err_write_side_ram;
-		}
-
-		t_tx_size += tx_size;
-		remind_size -= tx_size;
-	}
-
-err_write_side_ram:
-	return ret;
+	return container_of(d, struct sun6i_dma_dev, slave);
 }
 
-static int dsim_read_hl_data(struct lcd_info *lcd, u8 addr, u32 size, u8 *buf)
+static inline struct sun6i_vchan *to_sun6i_vchan(struct dma_chan *chan)
 {
-	int ret = 0, rx_size = 0;
-	int retry = 2;
-
-	if (!lcd->connected)
-		return ret;
-
-try_read:
-	rx_size = dsim_read_data(lcd->dsim, MIPI_DSI_DCS_READ, (u32)addr, size, buf);
-	dev_info(&lcd->ld->dev, "%s: %2d(%2d), %02x, %*ph%s\n", __func__, size, rx_size, addr,
-		min_t(u32, min_t(u32, size, rx_size), 5), buf, (rx_size > 5) ? "..." : "");
-	if (rx_size != size) {
-		if (--retry)
-			goto try_read;
-		else {
-			dev_info(&lcd->ld->dev, "%s: fail. %02x, %d(%d)\n", __func__, addr, size, rx_size);
-			ret = -EPERM;
-		}
-	}
-
-	return ret;
+	return container_of(chan, struct sun6i_vchan, vc.chan);
 }
 
-static int dsim_read_info(struct lcd_info *lcd, u8 reg, u32 len, u8 *buf)
+static inline struct sun6i_desc *
+to_sun6i_desc(struct dma_async_tx_descriptor *tx)
 {
-	int ret = 0, i;
-
-	ret = dsim_read_hl_data(lcd, reg, len, buf);
-	if (ret < 0) {
-		dev_info(&lcd->ld->dev, "%s: fail. %02x, ret: %d\n", __func__, reg, ret);
-		goto exit;
-	}
-
-	smtd_dbg("%s: %02xh\n", __func__, reg);
-	for (i = 0; i < len; i++)
-		smtd_dbg("%02dth value is %02x, %3d\n", i + 1, buf[i], buf[i]);
-
-exit:
-	return ret;
+	return container_of(tx, struct sun6i_desc, vd.tx);
 }
 
-#if defined(CONFIG_EXYNOS_DECON_MDNIE) || defined(CONFIG_EXYNOS_DOZE)
-static int dsim_write_set(struct lcd_info *lcd, struct lcd_seq_info *seq, u32 num)
+static inline void sun6i_dma_dump_com_regs(struct sun6i_dma_dev *sdev)
 {
-	int ret = 0, i;
-
-	for (i = 0; i < num; i++) {
-		if (seq[i].cmd) {
-			ret = dsim_write_hl_data(lcd, seq[i].cmd, seq[i].len);
-			if (ret < 0) {
-				dev_info(&lcd->ld->dev, "%s: %dth fail\n", __func__, i);
-				return ret;
-			}
-		}
-		if (seq[i].sleep)
-			usleep_range(seq[i].sleep * 1000, seq[i].sleep * 1100);
-	}
-	return ret;
-}
-#endif
-
-static int dsim_panel_gamma_ctrl(struct lcd_info *lcd, u8 force)
-{
-	int ret = 0;
-
-	if (force)
-		goto update;
-	else if (lcd->current_bl != lcd->bl)
-		goto update;
-	else
-		goto exit;
-
-update:
-	DSI_WRITE(lcd->gamma_table[lcd->bl], GAMMA_CMD_CNT);
-
-exit:
-	return ret;
+	dev_dbg(sdev->slave.dev, "Common register:\n"
+		"\tmask0(%04x): 0x%08x\n"
+		"\tmask1(%04x): 0x%08x\n"
+		"\tpend0(%04x): 0x%08x\n"
+		"\tpend1(%04x): 0x%08x\n"
+		"\tstats(%04x): 0x%08x\n",
+		DMA_IRQ_EN(0), readl(sdev->base + DMA_IRQ_EN(0)),
+		DMA_IRQ_EN(1), readl(sdev->base + DMA_IRQ_EN(1)),
+		DMA_IRQ_STAT(0), readl(sdev->base + DMA_IRQ_STAT(0)),
+		DMA_IRQ_STAT(1), readl(sdev->base + DMA_IRQ_STAT(1)),
+		DMA_STAT, readl(sdev->base + DMA_STAT));
 }
 
-static int dsim_panel_aid_ctrl(struct lcd_info *lcd, u8 force)
+static inline void sun6i_dma_dump_chan_regs(struct sun6i_dma_dev *sdev,
+					    struct sun6i_pchan *pchan)
 {
-	int ret = 0;
+	phys_addr_t reg = virt_to_phys(pchan->base);
 
-	DSI_WRITE(lcd->aor_table[lcd->brightness], AID_CMD_CNT);
-
-	return ret;
+	dev_dbg(sdev->slave.dev, "Chan %d reg: %pa\n"
+		"\t___en(%04x): \t0x%08x\n"
+		"\tpause(%04x): \t0x%08x\n"
+		"\tstart(%04x): \t0x%08x\n"
+		"\t__cfg(%04x): \t0x%08x\n"
+		"\t__src(%04x): \t0x%08x\n"
+		"\t__dst(%04x): \t0x%08x\n"
+		"\tcount(%04x): \t0x%08x\n"
+		"\t_para(%04x): \t0x%08x\n\n",
+		pchan->idx, &reg,
+		DMA_CHAN_ENABLE,
+		readl(pchan->base + DMA_CHAN_ENABLE),
+		DMA_CHAN_PAUSE,
+		readl(pchan->base + DMA_CHAN_PAUSE),
+		DMA_CHAN_LLI_ADDR,
+		readl(pchan->base + DMA_CHAN_LLI_ADDR),
+		DMA_CHAN_CUR_CFG,
+		readl(pchan->base + DMA_CHAN_CUR_CFG),
+		DMA_CHAN_CUR_SRC,
+		readl(pchan->base + DMA_CHAN_CUR_SRC),
+		DMA_CHAN_CUR_DST,
+		readl(pchan->base + DMA_CHAN_CUR_DST),
+		DMA_CHAN_CUR_CNT,
+		readl(pchan->base + DMA_CHAN_CUR_CNT),
+		DMA_CHAN_CUR_PARA,
+		readl(pchan->base + DMA_CHAN_CUR_PARA));
 }
 
-static int dsim_panel_set_elvss(struct lcd_info *lcd, u8 force)
+static inline s8 convert_burst(u32 maxburst)
 {
-	u8 *elvss = NULL;
-	int ret = 0;
-	union elvss_info elvss_value;
-	unsigned char tset;
-
-	elvss = lcd->elvss_table[lcd->bl][lcd->temperature_index];
-
-	tset = ((lcd->temperature < 0) ? BIT(7) : 0) | abs(lcd->temperature);
-	elvss_value.tset = elvss[LDI_OFFSET_ELVSS_1] = tset;
-	elvss_value.mpscon = elvss[LDI_OFFSET_ELVSS_2];
-	elvss_value.dim_offset = elvss[LDI_OFFSET_ELVSS_3];
-	elvss_value.cal_offset = elvss[LDI_OFFSET_ELVSS_4];
-
-	if (force)
-		goto update;
-	else if (lcd->current_elvss.value != elvss_value.value)
-		goto update;
-	else
-		goto exit;
-
-update:
-	DSI_WRITE(elvss, ELVSS_CMD_CNT);
-	lcd->current_elvss.value = elvss_value.value;
-	dev_info(&lcd->ld->dev, "elvss: %x\n", lcd->current_elvss.value);
-
-exit:
-	return ret;
-}
-
-static int dsim_panel_set_acl(struct lcd_info *lcd, int force)
-{
-	int ret = 0, opr_status = OPR_STATUS_15P, acl_status = ACL_STATUS_ON;
-	union acl_info acl_value;
-
-	opr_status = brightness_opr_table[!!lcd->adaptive_control][lcd->brightness];
-	acl_status = !!opr_status;
-
-	acl_value.enable = lcd->acl_table[acl_status][LDI_OFFSET_ACL];
-	acl_value.frame_avg_hbm = lcd->opr_table[opr_status][LDI_OFFSET_OPR_1];
-	acl_value.percent = lcd->opr_table[opr_status][LDI_OFFSET_OPR_2];
-	acl_value.frame_avg = lcd->opr_table[opr_status][LDI_OFFSET_OPR_3];
-
-	if (force)
-		goto update;
-	else if (lcd->current_acl.value != acl_value.value)
-		goto update;
-	else
-		goto exit;
-
-update:
-	DSI_WRITE(lcd->opr_table[opr_status], OPR_CMD_CNT);
-	DSI_WRITE(lcd->acl_table[acl_status], ACL_CMD_CNT);
-	lcd->current_acl.value = acl_value.value;
-	dev_info(&lcd->ld->dev, "acl: %x, brightness: %d, adaptive_control: %d\n", lcd->current_acl.value, lcd->brightness, lcd->adaptive_control);
-
-exit:
-	return ret;
-}
-
-static int dsim_panel_irc_ctrl(struct lcd_info *lcd, u8 force)
-{
-	int ret = 0;
-
-	DSI_WRITE(lcd->irc_table[lcd->brightness], IRC_CMD_CNT);
-
-	return ret;
-}
-
-static int dsim_panel_vint_ctrl(struct lcd_info *lcd, u8 force)
-{
-	int ret = 0;
-	unsigned char vint = lcd->vint_table[lcd->bl][LDI_OFFSET_VINT];
-
-	if (force)
-		goto update;
-	else if (lcd->current_vint != vint)
-		goto update;
-	else
-		goto exit;
-
-update:
-	DSI_WRITE(lcd->vint_table[lcd->bl], VINT_CMD_CNT);
-	lcd->current_vint = vint;
-	dev_info(&lcd->ld->dev, "vint: %x\n", lcd->current_vint);
-
-exit:
-	return ret;
-}
-
-#ifdef CONFIG_SUPPORT_POC_FLASH
-static int dsim_panel_poc_compen_ctrl(struct lcd_info *lcd, u8 force)
-{
-	int ret = 0;
-
-	if (force)
-		goto update;
-	else if (lcd->current_bl != lcd->bl)
-		goto update;
-	else
-		goto exit;
-
-update:
-	DSI_WRITE(lcd->poc_compen_table[lcd->bl], POC_COMPEN_CMD_CNT);
-
-exit:
-	return ret;
-}
-#endif
-
-static int low_level_set_brightness(struct lcd_info *lcd, int force)
-{
-	int ret = 0;
-
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-
-	dsim_panel_gamma_ctrl(lcd, force);
-
-	dsim_panel_aid_ctrl(lcd, force);
-
-	dsim_panel_set_elvss(lcd, force);
-
-	dsim_panel_set_acl(lcd, force);
-
-	dsim_panel_irc_ctrl(lcd, force);
-
-	dsim_panel_vint_ctrl(lcd, force);
-
-#ifdef CONFIG_SUPPORT_POC_FLASH
-	dsim_panel_poc_compen_ctrl(lcd, force);
-#endif
-
-	DSI_WRITE(SEQ_GAMMA_UPDATE, ARRAY_SIZE(SEQ_GAMMA_UPDATE));
-
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-
-	return 0;
-}
-
-static int get_backlight_level_from_brightness(int brightness)
-{
-	return brightness_table[brightness];
-}
-
-static int dsim_panel_set_brightness(struct lcd_info *lcd, int force)
-{
-	int ret = 0;
-
-	mutex_lock(&lcd->lock);
-
-#if defined(CONFIG_EXYNOS_DOZE)
-	if (lcd->current_alpm.state) {
-		dev_info(&lcd->ld->dev, "%s: brightness: %3d, lpm: %06x(%06x)\n", __func__,
-			lcd->bd->props.brightness, lcd->current_alpm.value, lcd->alpm.value);
-		goto exit;
-	}
-#endif
-
-#if defined(CONFIG_LCD_HMT)
-	if (lcd->hmt_on) {
-		dev_info(&lcd->ld->dev, "%s: brightness: %d, hmt_state: %d\n", __func__, lcd->bd->props.brightness, lcd->hmt_on);
-		goto exit;
-	}
-#endif
-	lcd->brightness = lcd->bd->props.brightness;
-
-	lcd->bl = get_backlight_level_from_brightness(lcd->brightness);
-
-	if (!force && lcd->state != PANEL_STATE_RESUMED) {
-		dev_info(&lcd->ld->dev, "%s: brightness: %d, panel_state: %d\n", __func__, lcd->brightness, lcd->state);
-		goto exit;
-	}
-
-	ret = low_level_set_brightness(lcd, force);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: failed to set brightness : %d\n", __func__, index_brightness_table[lcd->bl]);
-
-	lcd->current_bl = lcd->bl;
-
-	dev_info(&lcd->ld->dev, "brightness: %d, bl: %d, nit: %d, lx: %d\n", lcd->brightness, lcd->bl, index_brightness_table[lcd->bl], lcd->lux);
-exit:
-	mutex_unlock(&lcd->lock);
-
-	return ret;
-}
-
-static int panel_get_brightness(struct backlight_device *bd)
-{
-	struct lcd_info *lcd = bl_get_data(bd);
-
-	return index_brightness_table[lcd->bl];
-}
-
-static int panel_set_brightness(struct backlight_device *bd)
-{
-	int ret = 0;
-	struct lcd_info *lcd = bl_get_data(bd);
-
-	if (lcd->state == PANEL_STATE_RESUMED) {
-		ret = dsim_panel_set_brightness(lcd, 0);
-		if (ret < 0)
-			dev_info(&lcd->ld->dev, "%s: failed to set brightness\n", __func__);
-	}
-
-	return ret;
-}
-
-static const struct backlight_ops panel_backlight_ops = {
-	.get_brightness = panel_get_brightness,
-	.update_status = panel_set_brightness,
-};
-
-static void init_dynamic_aid(struct lcd_info *lcd)
-{
-	lcd->daid.vreg = VREG_OUT_X1000;
-	lcd->daid.iv_tbl = index_voltage_table;
-	lcd->daid.iv_max = IV_MAX;
-	lcd->daid.mtp = lcd->daid.mtp ? lcd->daid.mtp : kzalloc(IV_MAX * CI_MAX * sizeof(int), GFP_KERNEL);
-	lcd->daid.gamma_default = gamma_default;
-	lcd->daid.formular = gamma_formula;
-	lcd->daid.vt_voltage_value = vt_voltage_value;
-
-	lcd->daid.ibr_tbl = index_brightness_table;
-	lcd->daid.ibr_max = IBRIGHTNESS_MAX;
-
-	lcd->daid.offset_color = (const struct rgb_t(*)[])offset_color;
-	lcd->daid.iv_ref = index_voltage_reference;
-	lcd->daid.m_gray = m_gray;
-}
-
-/* V255(msb is separated) ~ VT -> VT ~ V255(msb is not separated) and signed bit */
-static void reorder_reg2mtp(u8 *reg, int *mtp)
-{
-	int j, c, v;
-
-	for (c = 0, j = 0; c < CI_MAX; c++, j++) {
-		if (reg[j++] & 0x01)
-			mtp[(IV_MAX-1)*CI_MAX+c] = reg[j] * (-1);
-		else
-			mtp[(IV_MAX-1)*CI_MAX+c] = reg[j];
-	}
-
-	for (v = IV_MAX - 2; v >= 0; v--) {
-		for (c = 0; c < CI_MAX; c++, j++) {
-			if (reg[j] & 0x80)
-				mtp[CI_MAX*v+c] = (reg[j] & 0x7F) * (-1);
-			else
-				mtp[CI_MAX*v+c] = reg[j];
-		}
-	}
-}
-
-/* V255(msb is separated) ~ VT -> VT ~ V255(msb is not separated) */
-static void reorder_reg2gamma(u8 *reg, int *gamma)
-{
-	int j, c, v;
-
-	for (c = 0, j = 0; c < CI_MAX; c++, j++) {
-		if (reg[j++] & 0x01)
-			gamma[(IV_MAX-1)*CI_MAX+c] = reg[j] | BIT(8);
-		else
-			gamma[(IV_MAX-1)*CI_MAX+c] = reg[j];
-	}
-
-	for (v = IV_MAX - 2; v >= 0; v--) {
-		for (c = 0; c < CI_MAX; c++, j++) {
-			if (reg[j] & 0x80)
-				gamma[CI_MAX*v+c] = (reg[j] & 0x7F) | BIT(7);
-			else
-				gamma[CI_MAX*v+c] = reg[j];
-		}
-	}
-}
-
-/* VT ~ V255(msb is not separated) -> V255(msb is separated) ~ VT */
-/* array idx zero (reg[0]) is reserved for gamma command address (0xCA) */
-static void reorder_gamma2reg(int *gamma, u8 *reg)
-{
-	int j, c, v;
-	int *pgamma;
-
-	/* V255_R_1: 1st para D[2] */
-	/* V255_R_2: 3th para */
-	/* V255_G_1: 1st para D[1] */
-	/* V255_G_2: 4rd para */
-	/* V255_B_1: 1st para D[0] */
-	/* V255_B_2: 6th para */
-	v = IV_MAX - 1;
-	pgamma = &gamma[v * CI_MAX];
-	reg[1] = get_bit(pgamma[CI_RED], 8, 1) << 2 | get_bit(pgamma[CI_GREEN], 8, 1) << 1 | get_bit(pgamma[CI_BLUE], 8, 1) << 0;
-	reg[3] = pgamma[CI_RED] & 0xff;
-	reg[4] = pgamma[CI_GREEN] & 0xff;
-	reg[5] = 0;
-	reg[6] = pgamma[CI_BLUE] & 0xff;
-
-	for (v = IV_MAX - 2, j = 7; v > IV_VT; v--) {
-		pgamma = &gamma[v * CI_MAX];
-		for (c = 0; c < CI_MAX; c++, pgamma++)
-			reg[j++] = *pgamma;
-	}
-
-	/* VT_R: 1st para D[7:4] */
-	/* VT_G: 2nd para D[7:4] */
-	/* VT_B: 2nd para D[3:0] */
-	v = IV_VT;
-	pgamma = &gamma[v * CI_MAX];
-	reg[1] = (pgamma[CI_RED] & 0xf) << 4 | (reg[1] & 0x7);
-	reg[2] = (pgamma[CI_GREEN] & 0xf) << 4 | (pgamma[CI_BLUE] & 0xf);
-}
-
-static void init_mtp_data(struct lcd_info *lcd, u8 *data)
-{
-	int i, c;
-	int *mtp = lcd->daid.mtp;
-	u8 tmp[IV_MAX * CI_MAX + CI_MAX] = {0, };
-	u8 v255[CI_MAX][2] = {{0,}, };
-
-	memcpy(&tmp[6], &data[5], (IV_203 - IV_1 + 1) * CI_MAX);	/* V203 ~ V1 */
-
-	/* V255_R_1: C8h 1st para D[2] */
-	/* V255_R_2: C8h 3th para */
-	/* V255_G_1: C8h 1st para D[1] */
-	/* V255_G_2: C8h 4rd para */
-	/* V255_B_1: C8h 1st para D[0] */
-	/* V255_B_2: C8h 5th para */
-	v255[CI_RED][0] = get_bit(data[0], 2, 1);
-	v255[CI_RED][1] = data[2];
-
-	v255[CI_GREEN][0] = get_bit(data[0], 1, 1);
-	v255[CI_GREEN][1] = data[3];
-
-	v255[CI_BLUE][0] = get_bit(data[0], 0, 1);
-	v255[CI_BLUE][1] = data[4];
-
-	tmp[0] = v255[CI_RED][0];
-	tmp[1] = v255[CI_RED][1];
-	tmp[2] = v255[CI_GREEN][0];
-	tmp[3] = v255[CI_GREEN][1];
-	tmp[4] = v255[CI_BLUE][0];
-	tmp[5] = v255[CI_BLUE][1];
-
-	/* VT_R: C8h 1st para D[7:4] */
-	/* VT_G: C8h 2nd para D[7:4] */
-	/* VT_B: C8h 2nd para D[3:0] */
-	tmp[33] = get_bit(data[0], 4, 4);
-	tmp[34] = get_bit(data[1], 4, 4);
-	tmp[35] = get_bit(data[1], 0, 4);
-
-	reorder_reg2mtp(tmp, mtp);
-
-	smtd_dbg("MTP_Offset_Value\n");
-	for (i = 0; i < IV_MAX; i++) {
-		for (c = 0; c < CI_MAX; c++)
-			smtd_dbg("%4d ", mtp[i*CI_MAX+c]);
-		smtd_dbg("\n");
-	}
-}
-
-static int init_gamma(struct lcd_info *lcd)
-{
-	int i, j;
-	int ret = 0;
-	int **gamma;
-
-	/* allocate memory for local gamma table */
-	gamma = kcalloc(IBRIGHTNESS_MAX, sizeof(int *), GFP_KERNEL);
-	if (!gamma) {
-		pr_err("failed to allocate gamma table\n");
-		ret = -ENOMEM;
-		goto err_alloc_gamma_table;
-	}
-
-	for (i = 0; i < IBRIGHTNESS_MAX; i++) {
-		gamma[i] = kcalloc(IV_MAX*CI_MAX, sizeof(int), GFP_KERNEL);
-		if (!gamma[i]) {
-			pr_err("failed to allocate gamma\n");
-			ret = -ENOMEM;
-			goto err_alloc_gamma;
-		}
-	}
-
-	/* pre-allocate memory for gamma table */
-	for (i = 0; i < IBRIGHTNESS_MAX; i++)
-		memcpy(&lcd->gamma_table[i], SEQ_GAMMA_CONDITION_SET, GAMMA_CMD_CNT);
-
-	/* calculate gamma table */
-	init_mtp_data(lcd, lcd->mtp);
-	dynamic_aid(lcd->daid, gamma);
-
-	/* relocate gamma order */
-	for (i = 0; i < IBRIGHTNESS_MAX; i++)
-		reorder_gamma2reg(gamma[i], lcd->gamma_table[i]);
-
-	for (i = 0; i < IBRIGHTNESS_MAX; i++) {
-		smtd_dbg("Gamma [%3d] = ", lcd->daid.ibr_tbl[i]);
-		for (j = 0; j < GAMMA_CMD_CNT; j++)
-			smtd_dbg("%4d ", lcd->gamma_table[i][j]);
-		smtd_dbg("\n");
-	}
-
-	/* free local gamma table */
-	for (i = 0; i < IBRIGHTNESS_MAX; i++)
-		kfree(gamma[i]);
-	kfree(gamma);
-
-	return 0;
-
-err_alloc_gamma:
-	while (i > 0) {
-		kfree(gamma[i-1]);
-		i--;
-	}
-	kfree(gamma);
-err_alloc_gamma_table:
-	return ret;
-}
-
-static int s6e3fa7_read_id(struct lcd_info *lcd)
-{
-	struct panel_private *priv = &lcd->dsim->priv;
-	int ret = 0;
-	struct decon_device *decon = get_decon_drvdata(0);
-	static char *LDI_BIT_DESC_ID[BITS_PER_BYTE * LDI_LEN_ID] = {
-		[0 ... 23] = "ID Read Fail",
-	};
-
-	lcd->id_info.value = 0;
-	priv->lcdconnected = lcd->connected = lcdtype ? 1 : 0;
-
-	ret = dsim_read_info(lcd, LDI_REG_ID, LDI_LEN_ID, lcd->id_info.id);
-	if (ret < 0 || !lcd->id_info.value) {
-		priv->lcdconnected = lcd->connected = 0;
-		dev_info(&lcd->ld->dev, "%s: connected lcd is invalid\n", __func__);
-
-		if (lcdtype && decon)
-			decon_abd_save_bit(&decon->abd, BITS_PER_BYTE * LDI_LEN_ID, cpu_to_be32(lcd->id_info.value), LDI_BIT_DESC_ID);
-	}
-
-	dev_info(&lcd->ld->dev, "%s: %x\n", __func__, cpu_to_be32(lcd->id_info.value));
-
-	return ret;
-}
-
-static int s6e3fa7_read_mtp(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char buf[LDI_GPARA_DATE + LDI_LEN_DATE] = {0, };
-
-	ret = dsim_read_info(lcd, LDI_REG_MTP, ARRAY_SIZE(buf), buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	memcpy(lcd->mtp, buf, LDI_LEN_MTP);
-	memcpy(lcd->date, &buf[LDI_GPARA_DATE], LDI_LEN_DATE);
-
-	return ret;
-}
-
-static int s6e3fa7_read_coordinate(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char buf[LDI_LEN_COORDINATE] = {0, };
-
-	ret = dsim_read_info(lcd, LDI_REG_COORDINATE, LDI_LEN_COORDINATE, buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	lcd->coordinate[0] = buf[0] << 8 | buf[1];	/* X */
-	lcd->coordinate[1] = buf[2] << 8 | buf[3];	/* Y */
-
-	scnprintf(lcd->coordinates, sizeof(lcd->coordinates), "%d %d\n", lcd->coordinate[0], lcd->coordinate[1]);
-
-	return ret;
-}
-
-static int s6e3fa7_read_manufacture_info(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char buf[LDI_GPARA_MANUFACTURE_INFO + LDI_LEN_MANUFACTURE_INFO] = {0, };
-
-	ret = dsim_read_info(lcd, LDI_REG_MANUFACTURE_INFO, ARRAY_SIZE(buf), buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	memcpy(lcd->manufacture_info, &buf[LDI_GPARA_MANUFACTURE_INFO], LDI_LEN_MANUFACTURE_INFO);
-
-	return ret;
-}
-
-static int s6e3fa7_read_chip_id(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char buf[LDI_LEN_CHIP_ID] = {0, };
-
-	ret = dsim_read_info(lcd, LDI_REG_CHIP_ID, LDI_LEN_CHIP_ID, buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	memcpy(lcd->code, buf, LDI_LEN_CHIP_ID);
-
-	return ret;
-}
-
-static int s6e3fa7_read_elvss(struct lcd_info *lcd, unsigned char *buf)
-{
-	int ret = 0;
-
-	ret = dsim_read_info(lcd, LDI_REG_ELVSS, LDI_LEN_ELVSS, buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	return ret;
-}
-
-static int s6e3fa7_read_irc(struct lcd_info *lcd, unsigned char *buf)
-{
-	int ret = 0;
-
-	ret = dsim_read_info(lcd, LDI_REG_IRC, LDI_LEN_IRC, buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	return ret;
-}
-
-static int s6e3fa7_read_hbm(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char buf[LDI_LEN_HBM] = {0, };
-
-	ret = dsim_read_info(lcd, LDI_REG_HBM, LDI_LEN_HBM, buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	memcpy(lcd->hbm, buf, LDI_LEN_HBM);
-
-	return ret;
-}
-
-static int s6e3fa7_read_poc_info(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char eb_buf[LDI_LEN_POC_EB] = {0, };
-	unsigned char ec_buf[LDI_LEN_POC_EC] = {0, };
-
-	ret = dsim_read_info(lcd, LDI_REG_POC_EB, LDI_LEN_POC_EB, eb_buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	memcpy(lcd->poc_eb, eb_buf, LDI_LEN_POC_EB);
-
-	ret = dsim_read_info(lcd, LDI_REG_POC_EC, LDI_LEN_POC_EC, ec_buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	memcpy(lcd->poc_ec, ec_buf, LDI_LEN_POC_EC);
-
-	return ret;
-}
-
-static int panel_read_bit_info(struct lcd_info *lcd, u32 index, u8 *rxbuf)
-{
-	int ret = 0;
-	u8 buf[5] = {0, };
-	struct bit_info *bit_info_list = ldi_bit_info_list;
-	unsigned int reg, len, mask, expect, offset, invert, print_tag, bit;
-	char **print_org = NULL;
-	char *print_new[sizeof(u8) * BITS_PER_BYTE] = {0, };
-	struct decon_device *decon = get_decon_drvdata(0);
-
-	if (!lcd->connected)
-		return ret;
-
-	if (index >= LDI_BIT_ENUM_MAX) {
-		dev_info(&lcd->ld->dev, "%s: invalid index(%d)\n", __func__, index);
-		ret = -EINVAL;
-		return ret;
-	}
-
-	reg = bit_info_list[index].reg;
-	len = bit_info_list[index].len;
-	print_org = bit_info_list[index].print;
-	expect = bit_info_list[index].expect;
-	offset = bit_info_list[index].offset;
-	invert = bit_info_list[index].invert;
-	mask = bit_info_list[index].mask;
-	if (!mask) {
-		for (bit = 0; bit < sizeof(u8) * BITS_PER_BYTE; bit++) {
-			if (print_org[bit])
-				mask |= BIT(bit);
-		}
-		bit_info_list[index].mask = mask;
-	}
-
-	if (offset + len > ARRAY_SIZE(buf)) {
-		dev_info(&lcd->ld->dev, "%s: invalid length(%d)\n", __func__, len);
-		ret = -EINVAL;
-		return ret;
-	}
-
-	ret = dsim_read_info(lcd, reg, offset + len, buf);
-	if (ret < 0) {
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-		return ret;
-	}
-
-	print_tag = buf[offset] & mask;
-	print_tag = print_tag ^ invert;
-
-	memcpy(&bit_info_list[index].result, &buf[offset], len);
-
-	if (rxbuf)
-		memcpy(rxbuf, &buf[offset], len);
-
-	if (print_tag) {
-		for_each_set_bit(bit, (unsigned long *)&print_tag, sizeof(u8) * BITS_PER_BYTE) {
-			if (print_org[bit])
-				print_new[bit] = print_org[bit];
-		}
-
-		if (likely(decon)) {
-			dev_info(&lcd->ld->dev, "==================================================\n");
-			decon_abd_save_bit(&decon->abd, len * BITS_PER_BYTE, buf[offset], print_new);
-		}
-		dev_info(&lcd->ld->dev, "==================================================\n");
-		dev_info(&lcd->ld->dev, "%s: 0x%02X is invalid. 0x%02X(expect %02X)\n", __func__, reg, buf[offset], expect);
-		for (bit = 0; bit < sizeof(u8) * BITS_PER_BYTE; bit++) {
-			if (print_new[bit]) {
-				if (!bit || !print_new[bit - 1] || strcmp(print_new[bit - 1], print_new[bit]))
-					dev_info(&lcd->ld->dev, "* %s (NG)\n", print_new[bit]);
-			}
-		}
-		dev_info(&lcd->ld->dev, "==================================================\n");
-
-	}
-
-	return ret;
-}
-
-#if defined(CONFIG_DISPLAY_USE_INFO)
-static int panel_inc_dpui_u32_field(struct lcd_info *lcd, enum dpui_key key, u32 value)
-{
-	if (lcd->connected) {
-		inc_dpui_u32_field(key, value);
-		if (value)
-			dev_info(&lcd->ld->dev, "%s: key(%d) invalid\n", __func__, key);
-	}
-
-	return 0;
-}
-
-static int s6e3fa7_read_rdnumpe(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char buf[LDI_LEN_RDNUMPE] = {0, };
-
-	ret = panel_read_bit_info(lcd, LDI_BIT_ENUM_RDNUMPE, buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-	else
-		panel_inc_dpui_u32_field(lcd, DPUI_KEY_PNDSIE, (buf[0] & LDI_PNDSIE_MASK));
-
-	return ret;
-}
-
-static int s6e3fa7_read_esderr(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char buf[LDI_LEN_ESDERR] = {0, };
-
-	ret = panel_read_bit_info(lcd, LDI_BIT_ENUM_ESDERR, buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-	else {
-		panel_inc_dpui_u32_field(lcd, DPUI_KEY_PNELVDE, !!(buf[0] & LDI_PNELVDE_MASK));
-		panel_inc_dpui_u32_field(lcd, DPUI_KEY_PNVLI1E, !!(buf[0] & LDI_PNVLI1E_MASK));
-		panel_inc_dpui_u32_field(lcd, DPUI_KEY_PNVLO3E, !!(buf[0] & LDI_PNVLO3E_MASK));
-		panel_inc_dpui_u32_field(lcd, DPUI_KEY_PNESDE, !!(buf[0] & LDI_PNESDE_MASK));
-	}
-
-	return ret;
-}
-
-static int s6e3fa7_read_rddsdr(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char buf[LDI_LEN_RDDSDR] = {0, };
-
-	ret = panel_read_bit_info(lcd, LDI_BIT_ENUM_RDDSDR, buf);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-	else
-		panel_inc_dpui_u32_field(lcd, DPUI_KEY_PNSDRE, !(buf[0] & LDI_PNSDRE_MASK));
-
-	return ret;
-}
-#endif
-
-static int s6e3fa7_read_rddpm(struct lcd_info *lcd)
-{
-	int ret = 0;
-
-	ret = panel_read_bit_info(lcd, LDI_BIT_ENUM_RDDPM, &lcd->rddpm);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	return ret;
-}
-
-static int s6e3fa7_read_rddsm(struct lcd_info *lcd)
-{
-	int ret = 0;
-
-	ret = panel_read_bit_info(lcd, LDI_BIT_ENUM_RDDSM, &lcd->rddsm);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: fail\n", __func__);
-
-	return ret;
-}
-
-static int s6e3fa7_init_elvss(struct lcd_info *lcd, u8 *data)
-{
-	int i, temp, ret = 0;
-
-	for (i = 0; i < IBRIGHTNESS_MAX; i++) {
-		for (temp = 0; temp < TEMP_MAX; temp++) {
-			/* Duplicate with reading value from DDI */
-			memcpy(&lcd->elvss_table[i][temp][1], data, LDI_LEN_ELVSS);
-
-			lcd->elvss_table[i][temp][0] = LDI_REG_ELVSS;
-			lcd->elvss_table[i][temp][LDI_OFFSET_ELVSS_1] = NORMAL_TEMPERATURE;		/* B5h 1st Para: TSET */
-			lcd->elvss_table[i][temp][LDI_OFFSET_ELVSS_2] = elvss_mpscon_data[i];		/* B5h 2nd Para: MPS_CON */
-			lcd->elvss_table[i][temp][LDI_OFFSET_ELVSS_3] = elvss_offset_data[i][temp];	/* B5h 3rd Para: ELVSS_Dim_offset */
-		}
-	}
-
-	return ret;
-}
-
-#ifdef CONFIG_SUPPORT_POC_FLASH
-static int s6e3fa7_init_poc_compen(struct lcd_info *lcd)
-{
-	int i, ret = 0;
-
-	for (i = 0; i < IBRIGHTNESS_MAX; i++) {
-		lcd->poc_compen_table[i][0] = LDI_REG_POC_EB;
-		memcpy(&lcd->poc_compen_table[i][1], lcd->poc_eb, LDI_LEN_POC_EB);
-		memcpy(&lcd->poc_compen_table[i][11], &SEQ_POC_COMPEN_SETTING[11], 8);
-		lcd->poc_compen_table[i][6] = POC_COMPEN_RATIO[i];
-	}
-
-	return ret;
-}
-#endif
-
-static int s6e3fa7_init_hbm_elvss(struct lcd_info *lcd, u8 *data)
-{
-	int i, temp, ret = 0;
-
-	for (i = IBRIGHTNESS_MAX; i < IBRIGHTNESS_HBM_MAX; i++) {
-		for (temp = 0; temp < TEMP_MAX; temp++) {
-			/* Duplicate with reading value from DDI */
-			memcpy(&lcd->elvss_table[i][temp][1], data, LDI_LEN_ELVSS);
-
-			lcd->elvss_table[i][temp][0] = LDI_REG_ELVSS;
-			lcd->elvss_table[i][temp][LDI_OFFSET_ELVSS_1] = NORMAL_TEMPERATURE;		/* B5h 1st Para: TSET */
-			lcd->elvss_table[i][temp][LDI_OFFSET_ELVSS_2] = elvss_mpscon_data[i];		/* B5h 2nd Para: MPS_CON */
-			lcd->elvss_table[i][temp][LDI_OFFSET_ELVSS_3] = elvss_offset_data[i][temp];	/* B5h 3rd Para: ELVSS_Dim_offset */
-			lcd->elvss_table[i][temp][LDI_OFFSET_ELVSS_4] = data[LDI_GPARA_HBM_ELVSS];	/* B5h 23th Para: ELVSS_offset */
-		}
-	}
-
-	return ret;
-}
-
-static int s6e3fa7_init_irc(struct lcd_info *lcd, u8 *data)
-{
-	int i, j, ret = 0;
-
-	for (i = 0; i <= EXTEND_BRIGHTNESS; i++) {
-		/* Duplicate with reading value from DDI */
-		for (j = 1; j < IRC_CMD_CNT; j++)
-			lcd->irc_table[i][j] = irc_otp_flag[j] ? data[j - 1] : lcd->irc_table[i][j];
-	}
-
-#if defined(CONFIG_LCD_HMT)
-	/* Duplicate with reading value from DDI */
-	for (j = 1; j < IRC_OFF_CNT; j++)
-		SEQ_IRC_OFF[j] = irc_otp_flag[j] ? data[j - 1] : SEQ_IRC_OFF[j];
-#endif
-
-	return ret;
-}
-
-static void init_hbm_interpolation(struct lcd_info *lcd)
-{
-	lcd->hitp.hbm = kzalloc(IV_MAX * CI_MAX * sizeof(int), GFP_KERNEL);
-	lcd->hitp.gamma_default = gamma_default;
-
-	lcd->hitp.ibr_tbl = index_brightness_table;
-	lcd->hitp.idx_ref = IBRIGHTNESS_MAX - 1;
-	lcd->hitp.idx_hbm = IBRIGHTNESS_HBM_MAX - 1;
-}
-
-static void init_hbm_data(struct lcd_info *lcd, u8 *data)
-{
-	int i, c;
-	int *hbm = lcd->hitp.hbm;
-	u8 tmp[IV_MAX * CI_MAX + CI_MAX] = {0, };
-	u8 v255[CI_MAX][2] = {{0,}, };
-
-	memcpy(&tmp[6], &data[7], (IV_203 - IV_1 + 1) * CI_MAX);	/* V203 ~ V1 */
-
-	/* V255_R_1: B3h 3rd para D[2] */
-	/* V255_R_2: B3h 5th para */
-	/* V255_G_1: B3h 3rd para D[1] */
-	/* V255_G_2: B3h 6rd para */
-	/* V255_B_1: B3h 3rd para D[0] */
-	/* V255_B_2: B3h 7th para */
-	v255[CI_RED][0] = get_bit(data[2], 2, 1);
-	v255[CI_RED][1] = data[4];
-
-	v255[CI_GREEN][0] = get_bit(data[2], 1, 1);
-	v255[CI_GREEN][1] = data[5];
-
-	v255[CI_BLUE][0] = get_bit(data[2], 0, 1);
-	v255[CI_BLUE][1] = data[6];
-
-	tmp[0] = v255[CI_RED][0];
-	tmp[1] = v255[CI_RED][1];
-	tmp[2] = v255[CI_GREEN][0];
-	tmp[3] = v255[CI_GREEN][1];
-	tmp[4] = v255[CI_BLUE][0];
-	tmp[5] = v255[CI_BLUE][1];
-
-	/* VT_R: B3h 3rd para D[7:4] */
-	/* VT_G: B3h 4th para D[7:4] */
-	/* VT_B: B3h 4th para D[3:0] */
-	tmp[33] = get_bit(data[2], 4, 4);
-	tmp[34] = get_bit(data[3], 4, 4);
-	tmp[35] = get_bit(data[3], 0, 4);
-
-	reorder_reg2gamma(tmp, hbm);
-
-	smtd_dbg("HBM_Gamma_Value\n");
-	for (i = 0; i < IV_MAX; i++) {
-		for (c = 0; c < CI_MAX; c++)
-			smtd_dbg("%4d ", hbm[i*CI_MAX+c]);
-		smtd_dbg("\n");
-	}
-}
-
-static int init_hbm_gamma(struct lcd_info *lcd)
-{
-	int i, v, c, ret = 0;
-	int *pgamma_def, *pgamma_hbm, *pgamma;
-	s64 t1, t2, ratio;
-	int gamma[IV_MAX * CI_MAX] = {0, };
-	struct hbm_interpolation_t *hitp = &lcd->hitp;
-
-	init_hbm_data(lcd, lcd->hbm);
-
-	for (i = IBRIGHTNESS_MAX; i < IBRIGHTNESS_HBM_MAX; i++)
-		memcpy(&lcd->gamma_table[i], SEQ_GAMMA_CONDITION_SET, GAMMA_CMD_CNT);
-
-	for (i = IBRIGHTNESS_MAX; i < IBRIGHTNESS_HBM_MAX; i++) {
-		t1 = hitp->ibr_tbl[i] - hitp->ibr_tbl[hitp->idx_ref];
-		t2 = hitp->ibr_tbl[hitp->idx_hbm] - hitp->ibr_tbl[hitp->idx_ref];
-
-		ratio = (t1 << 10) / t2;
-
-		for (v = 0; v < IV_MAX; v++) {
-			pgamma_def = (int *)&hitp->gamma_default[v*CI_MAX];
-			pgamma_hbm = &hitp->hbm[v*CI_MAX];
-			pgamma = &gamma[v*CI_MAX];
-
-			for (c = 0; c < CI_MAX; c++) {
-				t1 = pgamma_def[c];
-				t1 = t1 << 10;
-				t2 = pgamma_hbm[c] - pgamma_def[c];
-				pgamma[c] = (t1 + (t2 * ratio)) >> 10;
-			}
-		}
-
-		reorder_gamma2reg(gamma, lcd->gamma_table[i]);
-	}
-
-	for (i = IBRIGHTNESS_MAX; i < IBRIGHTNESS_HBM_MAX; i++) {
-		smtd_dbg("Gamma [%3d] = ", lcd->hitp.ibr_tbl[i]);
-		for (v = 0; v < GAMMA_CMD_CNT; v++)
-			smtd_dbg("%4d ", lcd->gamma_table[i][v]);
-		smtd_dbg("\n");
-	}
-
-	return ret;
-}
-
-static int s6e3fa7_read_init_info(struct lcd_info *lcd)
-{
-	int ret = 0;
-	unsigned char elvss_data[LDI_LEN_ELVSS] = {0, };
-	unsigned char irc_data[LDI_LEN_IRC] = {0, };
-
-	s6e3fa7_read_id(lcd);
-
-	init_dynamic_aid(lcd);
-	init_hbm_interpolation(lcd);
-
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-
-	s6e3fa7_read_mtp(lcd);
-	s6e3fa7_read_coordinate(lcd);
-	s6e3fa7_read_chip_id(lcd);
-	s6e3fa7_read_elvss(lcd, elvss_data);
-	s6e3fa7_read_manufacture_info(lcd);
-	s6e3fa7_read_hbm(lcd);
-	s6e3fa7_read_irc(lcd, irc_data);
-	s6e3fa7_read_poc_info(lcd);
-	s6e3fa7_init_elvss(lcd, elvss_data);
-	s6e3fa7_init_hbm_elvss(lcd, elvss_data);
-	s6e3fa7_init_irc(lcd, irc_data);
-#ifdef CONFIG_SUPPORT_POC_FLASH
-	s6e3fa7_init_poc_compen(lcd);
-#endif
-
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-
-	init_gamma(lcd);
-	init_hbm_gamma(lcd);
-
-	return ret;
-}
-
-static int s6e3fa7_exit(struct lcd_info *lcd)
-{
-	int ret = 0;
-
-	dev_info(&lcd->ld->dev, "%s\n", __func__);
-
-	s6e3fa7_read_rddpm(lcd);
-	s6e3fa7_read_rddsm(lcd);
-
-#if defined(CONFIG_DISPLAY_USE_INFO)
-	s6e3fa7_read_rdnumpe(lcd);
-
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-	s6e3fa7_read_esderr(lcd);
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-#endif
-
-	/* 2. Display Off (28h) */
-	DSI_WRITE(SEQ_DISPLAY_OFF, ARRAY_SIZE(SEQ_DISPLAY_OFF));
-
-	DSI_WRITE(SEQ_SELF_MASK_OFF, ARRAY_SIZE(SEQ_SELF_MASK_OFF));
-
-	/* 3. Sleep In (10h) */
-	DSI_WRITE(SEQ_SLEEP_IN, ARRAY_SIZE(SEQ_SLEEP_IN));
-
-	/* 4. Wait 120ms */
-	msleep(120);
-
-#if defined(CONFIG_EXYNOS_DOZE)
-	mutex_lock(&lcd->lock);
-	lcd->current_alpm.value = 0;
-	mutex_unlock(&lcd->lock);
-#endif
-
-	return ret;
-}
-
-static int s6e3fa7_displayon(struct lcd_info *lcd)
-{
-	int ret = 0;
-
-	dev_info(&lcd->ld->dev, "%s\n", __func__);
-
-	/* 14. Display On(29h) */
-	DSI_WRITE(SEQ_DISPLAY_ON, ARRAY_SIZE(SEQ_DISPLAY_ON));
-
-	return ret;
-}
-
-static int s6e3fa7_init(struct lcd_info *lcd)
-{
-	int ret = 0;
-
-	dev_info(&lcd->ld->dev, "%s\n", __func__);
-
-	/* 7. Sleep Out(11h) */
-	DSI_WRITE(SEQ_SLEEP_OUT, ARRAY_SIZE(SEQ_SLEEP_OUT));
-
-	/* 8. Wait 20ms */
-	msleep(20);
-
-#if defined(CONFIG_SEC_FACTORY)
-	s6e3fa7_read_init_info(lcd);
-#if defined(CONFIG_EXYNOS_DECON_MDNIE)
-	attr_store_for_each(lcd->mdnie_class, "color_coordinate", lcd->coordinates, strlen(lcd->coordinates));
-#endif
-#else
-	s6e3fa7_read_id(lcd);
-#endif
-
-	/* Test Key Enable */
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-
-#if defined(CONFIG_DISPLAY_USE_INFO)
-	s6e3fa7_read_rddsdr(lcd);
-#endif
-
-	/* Parial update setting */
-	DSI_WRITE(SEQ_PARTIAL_SETTING, ARRAY_SIZE(SEQ_PARTIAL_SETTING));
-
-	/* 10. Common Setting */
-	/* 4.1.2 PCD Setting */
-	DSI_WRITE(SEQ_PCD_SET_DET_LOW, ARRAY_SIZE(SEQ_PCD_SET_DET_LOW));
-	/* 4.1.3 ERR_FG Setting */
-	DSI_WRITE(SEQ_ERR_FG_SETTING, ARRAY_SIZE(SEQ_ERR_FG_SETTING));
-	/* 4.1.4 TSP SYNC Setting */
-	DSI_WRITE(SEQ_TSP_SYNC_SETTING, ARRAY_SIZE(SEQ_TSP_SYNC_SETTING));
-	/* 4.1.5 FFC Setting */
-	DSI_WRITE(SEQ_FFC_SETTING, ARRAY_SIZE(SEQ_FFC_SETTING));
-	/* 4.1.6 AVC 2.0 Setting */
-	DSI_WRITE(SEQ_AVC_2_SETTING, ARRAY_SIZE(SEQ_AVC_2_SETTING));
-
-	DSI_WRITE(SEQ_SELF_MASK_SEL, ARRAY_SIZE(SEQ_SELF_MASK_SEL));
-	DSI_WRITE(SEQ_SELF_MASK_IMAGE, ARRAY_SIZE(SEQ_SELF_MASK_IMAGE));
-	DSI_WRITE(SEQ_SELF_MASK_ON, ARRAY_SIZE(SEQ_SELF_MASK_ON));
-
-	/* Test Key Disable */
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-
-	/* 11. Brightness control */
-	dsim_panel_set_brightness(lcd, 1);
-
-	/* 4.1.1 TE(Vsync) ON/OFF */
-	DSI_WRITE(SEQ_TE_ON, ARRAY_SIZE(SEQ_TE_ON));
-
-	msleep(20);
-
-#if defined(CONFIG_LCD_HMT)
-	if (lcd->hmt_on == 1)
-		s6e3fa7_hmt_update(lcd, 1);
-#endif
-
-	return ret;
-}
-
-#if defined(CONFIG_DISPLAY_USE_INFO)
-static int panel_dpui_notifier_callback(struct notifier_block *self,
-				unsigned long event, void *data)
-{
-	struct lcd_info *lcd = NULL;
-	struct dpui_info *dpui = data;
-	char tbuf[MAX_DPUI_VAL_LEN];
-	int size;
-	unsigned int site, rework, poc, i, invalid = 0;
-	unsigned char *m_info;
-
-	struct seq_file m = {
-		.buf = tbuf,
-		.size = sizeof(tbuf) - 1,
-	};
-
-	if (dpui == NULL) {
-		pr_err("%s: dpui is null\n", __func__);
-		return NOTIFY_DONE;
-	}
-
-	lcd = container_of(self, struct lcd_info, dpui_notif);
-
-	size = snprintf(tbuf, MAX_DPUI_VAL_LEN, "%04d%02d%02d %02d%02d%02d",
-			((lcd->date[0] & 0xF0) >> 4) + 2011, lcd->date[0] & 0xF, lcd->date[1] & 0x1F,
-			lcd->date[2] & 0x1F, lcd->date[3] & 0x3F, lcd->date[4] & 0x3F);
-	set_dpui_field(DPUI_KEY_MAID_DATE, tbuf, size);
-
-	size = snprintf(tbuf, MAX_DPUI_VAL_LEN, "%d", lcd->id_info.id[0]);
-	set_dpui_field(DPUI_KEY_LCDID1, tbuf, size);
-	size = snprintf(tbuf, MAX_DPUI_VAL_LEN, "%d", lcd->id_info.id[1]);
-	set_dpui_field(DPUI_KEY_LCDID2, tbuf, size);
-	size = snprintf(tbuf, MAX_DPUI_VAL_LEN, "%d", lcd->id_info.id[2]);
-	set_dpui_field(DPUI_KEY_LCDID3, tbuf, size);
-	size = snprintf(tbuf, MAX_DPUI_VAL_LEN, "%s_%s", DPUI_VENDOR_NAME, DPUI_MODEL_NAME);
-	set_dpui_field(DPUI_KEY_DISP_MODEL, tbuf, size);
-
-	size = snprintf(tbuf, MAX_DPUI_VAL_LEN, "0x%02X%02X%02X%02X%02X",
-		lcd->code[0], lcd->code[1], lcd->code[2], lcd->code[3], lcd->code[4]);
-	set_dpui_field(DPUI_KEY_CHIPID, tbuf, size);
-
-	size = snprintf(tbuf, MAX_DPUI_VAL_LEN, "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
-		lcd->date[0], lcd->date[1], lcd->date[2], lcd->date[3], lcd->date[4],
-		lcd->date[5], lcd->date[6], (lcd->coordinate[0] & 0xFF00) >> 8, lcd->coordinate[0] & 0x00FF,
-		(lcd->coordinate[1] & 0xFF00) >> 8, lcd->coordinate[1] & 0x00FF);
-	set_dpui_field(DPUI_KEY_CELLID, tbuf, size);
-
-	m_info = lcd->manufacture_info;
-	site = get_bit(m_info[0], 4, 4);
-	rework = get_bit(m_info[0], 0, 4);
-	poc = get_bit(m_info[1], 0, 4);
-	seq_printf(&m, "%d%d%d%02x%02x", site, rework, poc, m_info[2], m_info[3]);
-
-	for (i = 4; i < LDI_LEN_MANUFACTURE_INFO; i++) {
-		if (!isdigit(m_info[i]) && !isupper(m_info[i])) {
-			invalid = 1;
-			break;
-		}
-	}
-	for (i = 4; !invalid && i < LDI_LEN_MANUFACTURE_INFO; i++)
-		seq_printf(&m, "%c", m_info[i]);
-
-	set_dpui_field(DPUI_KEY_OCTAID, tbuf, m.count);
-
-	return NOTIFY_DONE;
-}
-#endif /* CONFIG_DISPLAY_USE_INFO */
-
-static int fb_notifier_callback(struct notifier_block *self,
-			unsigned long event, void *data)
-{
-	struct fb_event *evdata = data;
-	struct lcd_info *lcd = NULL;
-	int fb_blank;
-
-	switch (event) {
-	case FB_EVENT_BLANK:
-	case DECON_EVENT_DOZE:
-		break;
-	default:
-		return NOTIFY_DONE;
-	}
-
-	lcd = container_of(self, struct lcd_info, fb_notifier);
-
-	fb_blank = *(int *)evdata->data;
-
-	dev_info(&lcd->ld->dev, "%s: %02lx, %d\n", __func__, event, fb_blank);
-
-	if (evdata->info->node)
-		return NOTIFY_DONE;
-
-	if (fb_blank == FB_BLANK_UNBLANK) {
-		mutex_lock(&lcd->lock);
-		s6e3fa7_displayon(lcd);
-		mutex_unlock(&lcd->lock);
-	}
-
-	return NOTIFY_DONE;
-}
-
-static int s6e3fa7_register_notifier(struct lcd_info *lcd)
-{
-	lcd->fb_notifier.notifier_call = fb_notifier_callback;
-	decon_register_notifier(&lcd->fb_notifier);
-
-#if defined(CONFIG_DISPLAY_USE_INFO)
-	lcd->dpui_notif.notifier_call = panel_dpui_notifier_callback;
-	if (lcd->connected)
-		dpui_logging_register(&lcd->dpui_notif, DPUI_TYPE_PANEL);
-#endif
-
-	dev_info(&lcd->ld->dev, "%s\n", __func__);
-
-	return 0;
-}
-
-static int s6e3fa7_probe(struct lcd_info *lcd)
-{
-	int ret = 0;
-
-	dev_info(&lcd->ld->dev, "+ %s\n", __func__);
-
-	lcd->bd->props.max_brightness = EXTEND_BRIGHTNESS;
-	lcd->bd->props.brightness = UI_DEFAULT_BRIGHTNESS;
-
-	lcd->state = PANEL_STATE_RESUMED;
-
-	lcd->temperature = NORMAL_TEMPERATURE;
-	lcd->adaptive_control = ACL_STATUS_ON;
-	lcd->lux = -1;
-
-	lcd->acl_table = ACL_TABLE;
-	lcd->opr_table = OPR_TABLE;
-	lcd->aor_table = AOR_TABLE;
-	lcd->irc_table = IRC_TABLE;
-	lcd->vint_table = VINT_TABLE;
-
-	ret = s6e3fa7_read_init_info(lcd);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: failed to init information\n", __func__);
-
-#if defined(CONFIG_LCD_HMT)
-	hmt_init(lcd);
-#endif
-
-#ifdef CONFIG_SUPPORT_POC_FLASH
-	lcd->poc_dev.dsim = lcd->dsim;
-	lcd->poc_dev.lock = &lcd->lock;
-	ret = panel_poc_probe(&lcd->poc_dev);
-	if (ret)
-		dev_info(&lcd->ld->dev, "%s : failed to probe poc_device", __func__);
-#endif
-
-	dsim_panel_set_brightness(lcd, 1);
-
-	dev_info(&lcd->ld->dev, "- %s\n", __func__);
-
-	return 0;
-}
-
-#if defined(CONFIG_EXYNOS_DOZE)
-static int s6e3fa7_setalpm(struct lcd_info *lcd, int mode)
-{
-	int ret = 0;
-
-	dev_info(&lcd->ld->dev, "%s: brightness: %3d, lpm: %06x(%06x)\n", __func__,
-		lcd->bd->props.brightness, lcd->current_alpm.value, lcd->alpm.value);
-
-	switch (mode) {
-	case HLPM_ON_LOW:
-	case ALPM_ON_LOW:
-		DSI_WRITE(SEQ_HLPM_CONTROL_02, ARRAY_SIZE(SEQ_HLPM_CONTROL_02));
-		DSI_WRITE(SEQ_HLPM_ON_02, ARRAY_SIZE(SEQ_HLPM_ON_02));
-		DSI_WRITE(SEQ_GAMMA_UPDATE, ARRAY_SIZE(SEQ_GAMMA_UPDATE));
-		dev_info(&lcd->ld->dev, "%s: HLPM_ON_02, %d\n", __func__, mode);
-		break;
-	case HLPM_ON_HIGH:
-	case ALPM_ON_HIGH:
-		DSI_WRITE(SEQ_HLPM_CONTROL_60, ARRAY_SIZE(SEQ_HLPM_CONTROL_60));
-		DSI_WRITE(SEQ_HLPM_ON_60, ARRAY_SIZE(SEQ_HLPM_ON_60));
-		DSI_WRITE(SEQ_GAMMA_UPDATE, ARRAY_SIZE(SEQ_GAMMA_UPDATE));
-		dev_info(&lcd->ld->dev, "%s: HLPM_ON_60, %d\n", __func__, mode);
-		break;
-	default:
-		dev_info(&lcd->ld->dev, "%s: input is out of range: %d\n", __func__, mode);
-		break;
-	}
-
-	return ret;
-}
-
-static int s6e3fa7_enteralpm(struct lcd_info *lcd)
-{
-	int ret = 0;
-	union lpm_info lpm = {0, };
-
-	dev_info(&lcd->ld->dev, "%s: brightness: %3d, lpm: %06x(%06x)\n", __func__,
-		lcd->bd->props.brightness, lcd->current_alpm.value, lcd->alpm.value);
-
-	mutex_lock(&lcd->lock);
-
-	if (lcd->state == PANEL_STATE_SUSPENED) {
-		dev_info(&lcd->ld->dev, "%s: panel state is %d\n", __func__, lcd->state);
-		goto exit;
-	}
-
-	lpm.value = lcd->alpm.value;
-	lpm.state = (lpm.ver && lpm.mode) ? lpm_brightness_table[lcd->bd->props.brightness] : lpm_old_table[lpm.mode];
-
-	if (lcd->current_alpm.value == lpm.value)
-		goto exit;
-
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-
-	DSI_WRITE(SEQ_SELF_MASK_OFF, ARRAY_SIZE(SEQ_SELF_MASK_OFF));
-
-	/* 2. AOR Setting for HLPM On */
-	/* 5.2.1 AOR Setting for HLPM On */
-	DSI_WRITE(SEQ_AOR_CONTROL_HLPM_ON, ARRAY_SIZE(SEQ_AOR_CONTROL_HLPM_ON));
-	DSI_WRITE(SEQ_GAMMA_UPDATE, ARRAY_SIZE(SEQ_GAMMA_UPDATE));
-
-	/* 3. Image Write for HLPM Mode */
-	/* 4. Wait 16.7ms */
-	msleep(20);
-
-	ret = s6e3fa7_setalpm(lcd, lpm.state);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: failed to set alpm\n", __func__);
-
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-
-	lcd->current_alpm.value = lpm.value;
-exit:
-	mutex_unlock(&lcd->lock);
-	return ret;
-}
-
-static int s6e3fa7_exitalpm(struct lcd_info *lcd)
-{
-	int ret = 0;
-
-	dev_info(&lcd->ld->dev, "%s: brightness: %3d, lpm: %06x(%06x)\n", __func__,
-		lcd->bd->props.brightness, lcd->current_alpm.value, lcd->alpm.value);
-
-	mutex_lock(&lcd->lock);
-
-	if (lcd->state == PANEL_STATE_SUSPENED) {
-		dev_info(&lcd->ld->dev, "%s: panel state is %d\n", __func__, lcd->state);
-		goto exit;
-	}
-
-	/* 5.1.2 HLPM Off Sequence (HLPM -> Normal) */
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-
-	/* 2. AOR Setting for HLPM Off */
-	/* 5.2.2 AOR Setting for HLPM Off */
-	DSI_WRITE(SEQ_HLPM_CONTROL_OFF, ARRAY_SIZE(SEQ_HLPM_CONTROL_OFF));
-
-	/* 3. Wait 33.4ms */
-	msleep(34);
-
-	/* 3 Image Write for Normal Mode */
-	/* 4. HLPM Off setting */
-	/* 5.2.4 HLPM Off Setting */
-	DSI_WRITE(SEQ_HLPM_OFF, ARRAY_SIZE(SEQ_HLPM_OFF));
-
-	dev_info(&lcd->ld->dev, "%s: HLPM_OFF\n", __func__);
-
-	DSI_WRITE(SEQ_SELF_MASK_ON, ARRAY_SIZE(SEQ_SELF_MASK_ON));
-
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-
-	lcd->current_alpm.value = 0;
-exit:
-	mutex_unlock(&lcd->lock);
-	return ret;
-}
-#endif
-
-static ssize_t lcd_type_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	sprintf(buf, "SDC_%02X%02X%02X\n", lcd->id_info.id[0], lcd->id_info.id[1], lcd->id_info.id[2]);
-
-	return strlen(buf);
-}
-
-static ssize_t window_type_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	sprintf(buf, "%02x %02x %02x\n", lcd->id_info.id[0], lcd->id_info.id[1], lcd->id_info.id[2]);
-
-	return strlen(buf);
-}
-
-static ssize_t brightness_table_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	int i, bl;
-	char *pos = buf;
-
-	for (i = 0; i <= EXTEND_BRIGHTNESS; i++) {
-		bl = get_backlight_level_from_brightness(i);
-		pos += sprintf(pos, "%3d %3d\n", i, index_brightness_table[bl]);
-	}
-
-	return pos - buf;
-}
-
-static ssize_t temperature_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	char temp[] = "-15, -14, 0, 1\n";
-
-	strcat(buf, temp);
-	return strlen(buf);
-}
-
-static ssize_t temperature_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	int value, rc, temperature_index = 0;
-
-	rc = kstrtoint(buf, 0, &value);
-	if (rc < 0)
-		return rc;
-
-	switch (value) {
+	switch (maxburst) {
 	case 1:
-		temperature_index = TEMP_ABOVE_MINUS_00_DEGREE;
-		break;
-	case 0:
-	case -14:
-		temperature_index = TEMP_ABOVE_MINUS_15_DEGREE;
-		break;
-	case -15:
-		temperature_index = TEMP_BELOW_MINUS_15_DEGREE;
-		break;
+		return 0;
+	case 8:
+		return 2;
 	default:
-		dev_info(&lcd->ld->dev, "%s: %d is invalid\n", __func__, value);
 		return -EINVAL;
 	}
-
-	mutex_lock(&lcd->lock);
-	lcd->temperature = value;
-	lcd->temperature_index = temperature_index;
-	mutex_unlock(&lcd->lock);
-
-	if (lcd->state == PANEL_STATE_RESUMED)
-		dsim_panel_set_brightness(lcd, 1);
-
-	dev_info(&lcd->ld->dev, "%s: %d, %d, %d\n", __func__, value, lcd->temperature, lcd->temperature_index);
-
-	return size;
 }
 
-static ssize_t color_coordinate_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
+static inline s8 convert_buswidth(enum dma_slave_buswidth addr_width)
 {
-	struct lcd_info *lcd = dev_get_drvdata(dev);
+	if ((addr_width < DMA_SLAVE_BUSWIDTH_1_BYTE) ||
+	    (addr_width > DMA_SLAVE_BUSWIDTH_4_BYTES))
+		return -EINVAL;
 
-	sprintf(buf, "%u, %u\n", lcd->coordinate[0], lcd->coordinate[1]);
-
-	return strlen(buf);
+	return addr_width >> 1;
 }
 
-static ssize_t manufacture_date_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
+static void *sun6i_dma_lli_add(struct sun6i_dma_lli *prev,
+			       struct sun6i_dma_lli *next,
+			       dma_addr_t next_phy,
+			       struct sun6i_desc *txd)
 {
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	u16 year;
-	u8 month, day, hour, min, sec;
-	u16 ms;
-
-	year = ((lcd->date[0] & 0xF0) >> 4) + 2011;
-	month = lcd->date[0] & 0xF;
-	day = lcd->date[1] & 0x1F;
-	hour = lcd->date[2] & 0x1F;
-	min = lcd->date[3] & 0x3F;
-	sec = lcd->date[4];
-	ms = (lcd->date[5] << 8) | lcd->date[6];
-
-	sprintf(buf, "%04d, %02d, %02d, %02d:%02d:%02d.%04d\n", year, month, day, hour, min, sec, ms);
-
-	return strlen(buf);
-}
-
-static ssize_t manufacture_code_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	sprintf(buf, "%02X%02X%02X%02X%02X\n",
-		lcd->code[0], lcd->code[1], lcd->code[2], lcd->code[3], lcd->code[4]);
-
-	return strlen(buf);
-}
-
-static ssize_t cell_id_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	sprintf(buf, "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
-		lcd->date[0], lcd->date[1], lcd->date[2], lcd->date[3], lcd->date[4],
-		lcd->date[5], lcd->date[6], (lcd->coordinate[0] & 0xFF00) >> 8, lcd->coordinate[0] & 0x00FF,
-		(lcd->coordinate[1] & 0xFF00) >> 8, lcd->coordinate[1] & 0x00FF);
-
-	return strlen(buf);
-}
-
-static void show_aid_log(struct lcd_info *lcd)
-{
-	u8 temp[256];
-	int i, j, k;
-	int *mtp;
-
-	mtp = lcd->daid.mtp;
-	for (i = 0, j = 0; i < IV_MAX; i++, j += CI_MAX) {
-		if (i == 0)
-			dev_info(&lcd->ld->dev, "MTP Offset VT   : %4d %4d %4d\n",
-				mtp[j + CI_RED], mtp[j + CI_GREEN], mtp[j + CI_BLUE]);
-		else
-			dev_info(&lcd->ld->dev, "MTP Offset V%3d : %4d %4d %4d\n",
-				lcd->daid.iv_tbl[i], mtp[j + CI_RED], mtp[j + CI_GREEN], mtp[j + CI_BLUE]);
-	}
-
-	for (i = 0; i < IBRIGHTNESS_MAX; i++) {
-		memset(temp, 0, sizeof(temp));
-		for (j = 1; j < GAMMA_CMD_CNT; j++) {
-			if (j == 3) {
-				k = get_bit(lcd->gamma_table[i][1], 2, 1) * 256;
-				j++;
-			} else if (j == 4) {
-				k = get_bit(lcd->gamma_table[i][1], 1, 1) * 256;
-				j++;
-			} else if (j == 5) {
-				j++;
-				continue;
-			} else if (j == 6) {
-				k = get_bit(lcd->gamma_table[i][1], 0, 1) * 256;
-				j++;
-			} else
-				k = 0;
-			snprintf(temp + strnlen(temp, 256), 256, " %3d", lcd->gamma_table[i][j] + k);
-		}
-
-		dev_info(&lcd->ld->dev, "nit : %3d  %s\n", lcd->daid.ibr_tbl[i], temp);
-	}
-
-	mtp = lcd->hitp.hbm;
-	for (i = 0, j = 0; i < IV_MAX; i++, j += CI_MAX) {
-		if (i == 0)
-			dev_info(&lcd->ld->dev, "HBM Gamma VT   : %4d %4d %4d\n",
-				mtp[j + CI_RED], mtp[j + CI_GREEN], mtp[j + CI_BLUE]);
-		else
-			dev_info(&lcd->ld->dev, "HBM Gamma V%3d : %4d %4d %4d\n",
-				lcd->daid.iv_tbl[i], mtp[j + CI_RED], mtp[j + CI_GREEN], mtp[j + CI_BLUE]);
-	}
-
-	for (i = IBRIGHTNESS_MAX; i < IBRIGHTNESS_HBM_MAX; i++) {
-		memset(temp, 0, sizeof(temp));
-		for (j = 1; j < GAMMA_CMD_CNT; j++) {
-			if (j == 3) {
-				k = get_bit(lcd->gamma_table[i][1], 2, 1) * 256;
-				j++;
-			} else if (j == 4) {
-				k = get_bit(lcd->gamma_table[i][1], 1, 1) * 256;
-				j++;
-			} else if (j == 5) {
-				j++;
-				continue;
-			} else if (j == 6) {
-				k = get_bit(lcd->gamma_table[i][1], 0, 1) * 256;
-				j++;
-			} else
-				k = 0;
-			snprintf(temp + strnlen(temp, 256), 256, " %3d", lcd->gamma_table[i][j] + k);
-		}
-
-		dev_info(&lcd->ld->dev, "nit : %3d  %s\n", lcd->daid.ibr_tbl[i], temp);
-	}
-
-	dev_info(&lcd->ld->dev, "%s\n", __func__);
-}
-
-static ssize_t aid_log_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	show_aid_log(lcd);
-#if defined(CONFIG_LCD_HMT)
-	show_hmt_aid_log(lcd);
-#endif
-	return strlen(buf);
-}
-
-static ssize_t adaptive_control_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	sprintf(buf, "%d\n", lcd->adaptive_control);
-
-	return strlen(buf);
-}
-
-static ssize_t adaptive_control_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	int rc;
-	unsigned int value;
-
-	rc = kstrtouint(buf, 0, &value);
-	if (rc < 0)
-		return rc;
-
-	if (lcd->adaptive_control != value) {
-		dev_info(&lcd->ld->dev, "%s: %d, %d\n", __func__, lcd->adaptive_control, value);
-		mutex_lock(&lcd->lock);
-		lcd->adaptive_control = value;
-		mutex_unlock(&lcd->lock);
-		if (lcd->state == PANEL_STATE_RESUMED)
-			dsim_panel_set_brightness(lcd, 1);
-	}
-
-	return size;
-}
-
-static ssize_t lux_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	sprintf(buf, "%d\n", lcd->lux);
-
-	return strlen(buf);
-}
-
-static ssize_t lux_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	int value;
-	int rc;
-
-	rc = kstrtoint(buf, 0, &value);
-	if (rc < 0)
-		return rc;
-
-	if (lcd->lux != value) {
-		mutex_lock(&lcd->lock);
-		lcd->lux = value;
-		mutex_unlock(&lcd->lock);
-
-#if defined(CONFIG_EXYNOS_DECON_MDNIE)
-		attr_store_for_each(lcd->mdnie_class, attr->attr.name, buf, size);
-#endif
-	}
-
-	return size;
-}
-
-static ssize_t octa_id_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	unsigned int site, rework, poc, i, invalid = 0;
-	unsigned char *m_info;
-
-	struct seq_file m = {
-		.buf = buf,
-		.size = PAGE_SIZE - 1,
-	};
-
-	m_info = lcd->manufacture_info;
-	site = get_bit(m_info[0], 4, 4);
-	rework = get_bit(m_info[0], 0, 4);
-	poc = get_bit(m_info[1], 0, 4);
-	seq_printf(&m, "%d%d%d%02x%02x", site, rework, poc, m_info[2], m_info[3]);
-
-	for (i = 4; i < LDI_LEN_MANUFACTURE_INFO; i++) {
-		if (!isdigit(m_info[i]) && !isupper(m_info[i])) {
-			invalid = 1;
-			break;
-		}
-	}
-	for (i = 4; !invalid && i < LDI_LEN_MANUFACTURE_INFO; i++)
-		seq_printf(&m, "%c", m_info[i]);
-
-	seq_puts(&m, "\n");
-
-	return strlen(buf);
-}
-
-#if defined(CONFIG_SEC_FACTORY)
-static ssize_t poc_enabled_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	int ret = 0;
-
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-	s6e3fa7_read_poc_info(lcd);
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-
-	dev_info(&lcd->ld->dev, "%s EC[5]: %x EC[6]: %x EC[8]: %x EB[7]: %x\n",
-				__func__, lcd->poc_ec[4], lcd->poc_ec[5], lcd->poc_ec[7], lcd->poc_eb[6]);
-
-	sprintf(buf, "%02x %02x %02x %02x\n", lcd->poc_ec[4], lcd->poc_ec[5], lcd->poc_ec[7], lcd->poc_eb[6]);
-
-	return strlen(buf);
-}
-#endif
-
-#if defined(CONFIG_LCD_HMT)
-static void init_dynamic_aid_for_hmt(struct lcd_info *lcd)
-{
-	lcd->hmt_daid = lcd->daid;
-	lcd->hmt_daid.ibr_tbl = index_brightness_table_hmt;
-	lcd->hmt_daid.ibr_max = IBRIGHTNESS_HMT_MAX;
-
-	lcd->hmt_daid.offset_color = (const struct rgb_t(*)[])offset_color_hmt;
-	lcd->hmt_daid.m_gray = m_gray_hmt;
-}
-
-static int init_hmt_gamma(struct lcd_info *lcd)
-{
-	int i, j;
-	int ret = 0;
-	int **gamma;
-
-	/* allocate memory for local gamma table */
-	gamma = kcalloc(IBRIGHTNESS_HMT_MAX, sizeof(int *), GFP_KERNEL);
-	if (!gamma) {
-		pr_err("failed to allocate gamma table\n");
-		ret = -ENOMEM;
-		goto err_alloc_gamma_table;
-	}
-
-	for (i = 0; i < IBRIGHTNESS_HMT_MAX; i++) {
-		gamma[i] = kcalloc(IV_MAX*CI_MAX, sizeof(int), GFP_KERNEL);
-		if (!gamma[i]) {
-			pr_err("failed to allocate gamma\n");
-			ret = -ENOMEM;
-			goto err_alloc_gamma;
-		}
-	}
-
-	/* pre-allocate memory for gamma table */
-	for (i = 0; i < IBRIGHTNESS_HMT_MAX; i++)
-		memcpy(&lcd->hmt_gamma_table[i], SEQ_GAMMA_CONDITION_SET, GAMMA_CMD_CNT);
-
-	/* calculate gamma table */
-	dynamic_aid(lcd->hmt_daid, gamma);
-
-	/* relocate gamma order */
-	for (i = 0; i < IBRIGHTNESS_HMT_MAX; i++)
-		reorder_gamma2reg(gamma[i], lcd->hmt_gamma_table[i]);
-
-	for (i = 0; i < IBRIGHTNESS_HMT_MAX; i++) {
-		smtd_dbg("Gamma [%3d] = ", lcd->hmt_daid.ibr_tbl[i]);
-		for (j = 0; j < GAMMA_CMD_CNT; j++)
-			smtd_dbg("%4d ", lcd->hmt_gamma_table[i][j]);
-		smtd_dbg("\n");
-	}
-
-	/* free local gamma table */
-	for (i = 0; i < IBRIGHTNESS_HMT_MAX; i++)
-		kfree(gamma[i]);
-	kfree(gamma);
-
-	return 0;
-
-err_alloc_gamma:
-	while (i > 0) {
-		kfree(gamma[i-1]);
-		i--;
-	}
-	kfree(gamma);
-err_alloc_gamma_table:
-	return ret;
-}
-
-static void show_hmt_aid_log(struct lcd_info *lcd)
-{
-	u8 temp[256];
-	int i, j, k;
-
-	for (i = 0; i < IBRIGHTNESS_HMT_MAX; i++) {
-		memset(temp, 0, sizeof(temp));
-		for (j = 1; j < GAMMA_CMD_CNT; j++) {
-			if (j == 3) {
-				k = get_bit(lcd->hmt_gamma_table[i][1], 2, 1) * 256;
-				j++;
-			} else if (j == 4) {
-				k = get_bit(lcd->hmt_gamma_table[i][1], 1, 1) * 256;
-				j++;
-			} else if (j == 5) {
-				j++;
-				continue;
-			} else if (j == 6) {
-				k = get_bit(lcd->hmt_gamma_table[i][1], 0, 1) * 256;
-				j++;
-			} else
-				k = 0;
-			snprintf(temp + strnlen(temp, 256), 256, " %3d", lcd->hmt_gamma_table[i][j] + k);
-		}
-
-		dev_info(&lcd->ld->dev, "nit : %3d  %s\n", lcd->hmt_daid.ibr_tbl[i], temp);
-	}
-	dev_info(&lcd->ld->dev, "%s\n", __func__);
-}
-
-static int hmt_init(struct lcd_info *lcd)
-{
-	init_dynamic_aid_for_hmt(lcd);
-	init_hmt_gamma(lcd);
-
-	mutex_lock(&lcd->lock);
-	lcd->hmt_on = lcd->dsim->hmt_on = 0;
-	lcd->hmt_bl = lcd->hmt_current_bl = 0;
-	lcd->hmt_brightness = DEFAULT_HMT_BRIGHTNESS;
-	mutex_unlock(&lcd->lock);
-
-	return 0;
-}
-
-static int get_backlight_level_from_hmt_brightness(int brightness)
-{
-	return hmt_brightness_table[brightness];
-}
-
-static int low_level_set_brightness_for_hmt(struct lcd_info *lcd, int force)
-{
-	int ret = 0;
-	unsigned char hmt_elvss[] = {0xB5, NORMAL_TEMPERATURE, 0xCC, 0x04};
-
-	dev_info(&lcd->ld->dev, "%s++\n", __func__);
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-	DSI_WRITE(lcd->hmt_gamma_table[lcd->hmt_bl], GAMMA_CMD_CNT);			/* gamma */
-
-	if (lcd->hmt_bl >= IBRIGHTNESS_HMT_077NIT)					/* aor */
-		DSI_WRITE(SEQ_AID_FOR_HMT[AID_HMT_UPPER], AID_CMD_CNT);
-	else
-		DSI_WRITE(SEQ_AID_FOR_HMT[AID_HMT_LOWER], AID_CMD_CNT);
-
-	DSI_WRITE(hmt_elvss, ARRAY_SIZE(hmt_elvss));					/* elvss */
-	DSI_WRITE(SEQ_ACL_OFF, ACL_CMD_CNT);						/* acl off */
-	DSI_WRITE(SEQ_IRC_OFF, IRC_OFF_CNT);						/* irc off */
-
-	DSI_WRITE(SEQ_GAMMA_UPDATE, ARRAY_SIZE(SEQ_GAMMA_UPDATE));
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-
-	dev_info(&lcd->ld->dev, "%s--\n", __func__);
-	return ret;
-}
-
-
-static int hmt_set_mode(struct lcd_info *lcd, u8 forced)
-{
-	int ret = 0;
-
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-	if (lcd->hmt_on) {
-		DSI_WRITE(SEQ_HMT_ON, ARRAY_SIZE(SEQ_HMT_ON));
-		DSI_WRITE(SEQ_AID_REVERSE, ARRAY_SIZE(SEQ_AID_REVERSE));
-		dev_info(&lcd->ld->dev, "%s: hmt on %d %d\n", __func__, lcd->hmt_on, lcd->dsim->hmt_on);
+	if ((!prev && !txd) || !next)
+		return NULL;
+
+	if (!prev) {
+		txd->p_lli = next_phy;
+		txd->v_lli = next;
 	} else {
-		DSI_WRITE(SEQ_HMT_OFF, ARRAY_SIZE(SEQ_HMT_OFF));
-		DSI_WRITE(SEQ_AID_FORWARD, ARRAY_SIZE(SEQ_AID_FORWARD));
-		dev_info(&lcd->ld->dev, "%s: hmt off %d %d\n", __func__, lcd->hmt_on, lcd->dsim->hmt_on);
+		prev->p_lli_next = next_phy;
+		prev->v_lli_next = next;
 	}
-	DSI_WRITE(SEQ_GAMMA_UPDATE, ARRAY_SIZE(SEQ_GAMMA_UPDATE));
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
 
+	next->p_lli_next = LLI_LAST_ITEM;
+	next->v_lli_next = NULL;
+
+	return next;
+}
+
+static inline int sun6i_dma_cfg_lli(struct sun6i_dma_lli *lli,
+				    dma_addr_t src,
+				    dma_addr_t dst, u32 len,
+				    struct dma_slave_config *config)
+{
+	u8 src_width, dst_width, src_burst, dst_burst;
+
+	if (!config)
+		return -EINVAL;
+
+	src_burst = convert_burst(config->src_maxburst);
+	if (src_burst)
+		return src_burst;
+
+	dst_burst = convert_burst(config->dst_maxburst);
+	if (dst_burst)
+		return dst_burst;
+
+	src_width = convert_buswidth(config->src_addr_width);
+	if (src_width)
+		return src_width;
+
+	dst_width = convert_buswidth(config->dst_addr_width);
+	if (dst_width)
+		return dst_width;
+
+	lli->cfg = DMA_CHAN_CFG_SRC_BURST(src_burst) |
+		DMA_CHAN_CFG_SRC_WIDTH(src_width) |
+		DMA_CHAN_CFG_DST_BURST(dst_burst) |
+		DMA_CHAN_CFG_DST_WIDTH(dst_width);
+
+	lli->src = src;
+	lli->dst = dst;
+	lli->len = len;
+	lli->para = NORMAL_WAIT;
+
+	return 0;
+}
+
+static inline void sun6i_dma_dump_lli(struct sun6i_vchan *vchan,
+				      struct sun6i_dma_lli *lli)
+{
+	phys_addr_t p_lli = virt_to_phys(lli);
+
+	dev_dbg(chan2dev(&vchan->vc.chan),
+		"\n\tdesc:   p - %pa v - 0x%p\n"
+		"\t\tc - 0x%08x s - 0x%08x d - 0x%08x\n"
+		"\t\tl - 0x%08x p - 0x%08x n - 0x%08x\n",
+		&p_lli, lli,
+		lli->cfg, lli->src, lli->dst,
+		lli->len, lli->para, lli->p_lli_next);
+}
+
+static void sun6i_dma_free_desc(struct virt_dma_desc *vd)
+{
+	struct sun6i_desc *txd = to_sun6i_desc(&vd->tx);
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(vd->tx.chan->device);
+	struct sun6i_dma_lli *v_lli, *v_next;
+	dma_addr_t p_lli, p_next;
+
+	if (unlikely(!txd))
+		return;
+
+	p_lli = txd->p_lli;
+	v_lli = txd->v_lli;
+
+	while (v_lli) {
+		v_next = v_lli->v_lli_next;
+		p_next = v_lli->p_lli_next;
+
+		dma_pool_free(sdev->pool, v_lli, p_lli);
+
+		v_lli = v_next;
+		p_lli = p_next;
+	}
+
+	kfree(txd);
+}
+
+static int sun6i_dma_start_desc(struct sun6i_vchan *vchan)
+{
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(vchan->vc.chan.device);
+	struct virt_dma_desc *desc = vchan_next_desc(&vchan->vc);
+	struct sun6i_pchan *pchan = vchan->phy;
+	u32 irq_val, irq_reg, irq_offset;
+
+	if (!pchan)
+		return -EAGAIN;
+
+	if (!desc) {
+		pchan->desc = NULL;
+		pchan->done = NULL;
+		return -EAGAIN;
+	}
+
+	list_del(&desc->node);
+
+	pchan->desc = to_sun6i_desc(&desc->tx);
+	pchan->done = NULL;
+
+	sun6i_dma_dump_lli(vchan, pchan->desc->v_lli);
+
+	irq_reg = pchan->idx / DMA_IRQ_CHAN_NR;
+	irq_offset = pchan->idx % DMA_IRQ_CHAN_NR;
+
+	irq_val = readl(sdev->base + DMA_IRQ_EN(irq_offset));
+	irq_val |= DMA_IRQ_QUEUE << (irq_offset * DMA_IRQ_CHAN_WIDTH);
+	writel(irq_val, sdev->base + DMA_IRQ_EN(irq_offset));
+
+	writel(pchan->desc->p_lli, pchan->base + DMA_CHAN_LLI_ADDR);
+	writel(DMA_CHAN_ENABLE_START, pchan->base + DMA_CHAN_ENABLE);
+
+	sun6i_dma_dump_com_regs(sdev);
+	sun6i_dma_dump_chan_regs(sdev, pchan);
+
+	return 0;
+}
+
+static void sun6i_dma_tasklet(unsigned long data)
+{
+	struct sun6i_dma_dev *sdev = (struct sun6i_dma_dev *)data;
+	const struct sun6i_dma_config *cfg = sdev->cfg;
+	struct sun6i_vchan *vchan;
+	struct sun6i_pchan *pchan;
+	unsigned int pchan_alloc = 0;
+	unsigned int pchan_idx;
+
+	list_for_each_entry(vchan, &sdev->slave.channels, vc.chan.device_node) {
+		spin_lock_irq(&vchan->vc.lock);
+
+		pchan = vchan->phy;
+
+		if (pchan && pchan->done) {
+			if (sun6i_dma_start_desc(vchan)) {
+				/*
+				 * No current txd associated with this channel
+				 */
+				dev_dbg(sdev->slave.dev, "pchan %u: free\n",
+					pchan->idx);
+
+				/* Mark this channel free */
+				vchan->phy = NULL;
+				pchan->vchan = NULL;
+			}
+		}
+		spin_unlock_irq(&vchan->vc.lock);
+	}
+
+	spin_lock_irq(&sdev->lock);
+	for (pchan_idx = 0; pchan_idx < cfg->nr_max_channels; pchan_idx++) {
+		pchan = &sdev->pchans[pchan_idx];
+
+		if (pchan->vchan || list_empty(&sdev->pending))
+			continue;
+
+		vchan = list_first_entry(&sdev->pending,
+					 struct sun6i_vchan, node);
+
+		/* Remove from pending channels */
+		list_del_init(&vchan->node);
+		pchan_alloc |= BIT(pchan_idx);
+
+		/* Mark this channel allocated */
+		pchan->vchan = vchan;
+		vchan->phy = pchan;
+		dev_dbg(sdev->slave.dev, "pchan %u: alloc vchan %p\n",
+			pchan->idx, &vchan->vc);
+	}
+	spin_unlock_irq(&sdev->lock);
+
+	for (pchan_idx = 0; pchan_idx < cfg->nr_max_channels; pchan_idx++) {
+		if (!(pchan_alloc & BIT(pchan_idx)))
+			continue;
+
+		pchan = sdev->pchans + pchan_idx;
+		vchan = pchan->vchan;
+		if (vchan) {
+			spin_lock_irq(&vchan->vc.lock);
+			sun6i_dma_start_desc(vchan);
+			spin_unlock_irq(&vchan->vc.lock);
+		}
+	}
+}
+
+static irqreturn_t sun6i_dma_interrupt(int irq, void *dev_id)
+{
+	struct sun6i_dma_dev *sdev = dev_id;
+	struct sun6i_vchan *vchan;
+	struct sun6i_pchan *pchan;
+	int i, j, ret = IRQ_NONE;
+	u32 status;
+
+	for (i = 0; i < sdev->cfg->nr_max_channels / DMA_IRQ_CHAN_NR; i++) {
+		status = readl(sdev->base + DMA_IRQ_STAT(i));
+		if (!status)
+			continue;
+
+		dev_dbg(sdev->slave.dev, "DMA irq status %s: 0x%x\n",
+			i ? "high" : "low", status);
+
+		writel(status, sdev->base + DMA_IRQ_STAT(i));
+
+		for (j = 0; (j < DMA_IRQ_CHAN_NR) && status; j++) {
+			if (status & DMA_IRQ_QUEUE) {
+				pchan = sdev->pchans + j;
+				vchan = pchan->vchan;
+
+				if (vchan) {
+					spin_lock(&vchan->vc.lock);
+					vchan_cookie_complete(&pchan->desc->vd);
+					pchan->done = pchan->desc;
+					spin_unlock(&vchan->vc.lock);
+				}
+			}
+
+			status = status >> DMA_IRQ_CHAN_WIDTH;
+		}
+
+		if (!atomic_read(&sdev->tasklet_shutdown))
+			tasklet_schedule(&sdev->task);
+		ret = IRQ_HANDLED;
+	}
 
 	return ret;
 }
 
-static int dsim_panel_set_hmt_brightness(struct lcd_info *lcd, int force)
+static struct dma_async_tx_descriptor *sun6i_dma_prep_dma_memcpy(
+		struct dma_chan *chan, dma_addr_t dest, dma_addr_t src,
+		size_t len, unsigned long flags)
 {
-	int ret = 0;
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	struct sun6i_dma_lli *v_lli;
+	struct sun6i_desc *txd;
+	dma_addr_t p_lli;
+	s8 burst, width;
 
-	mutex_lock(&lcd->lock);
-	lcd->hmt_bl = get_backlight_level_from_hmt_brightness(lcd->hmt_brightness);
+	dev_dbg(chan2dev(chan),
+		"%s; chan: %d, dest: %pad, src: %pad, len: %zu. flags: 0x%08lx\n",
+		__func__, vchan->vc.chan.chan_id, &dest, &src, len, flags);
 
-	if (!force && lcd->state != PANEL_STATE_RESUMED) {
-		lcd->hmt_current_bl = lcd->hmt_bl;
-		dev_info(&lcd->ld->dev, "%s: hmt brightness: %d, panel_state: %d\n", __func__, lcd->hmt_brightness, lcd->state);
-		goto exit;
+	if (!len)
+		return NULL;
+
+	txd = kzalloc(sizeof(*txd), GFP_NOWAIT);
+	if (!txd)
+		return NULL;
+
+	v_lli = dma_pool_alloc(sdev->pool, GFP_NOWAIT, &p_lli);
+	if (!v_lli) {
+		dev_err(sdev->slave.dev, "Failed to alloc lli memory\n");
+		goto err_txd_free;
 	}
 
-	ret = low_level_set_brightness_for_hmt(lcd, force);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: failed to set hmt brightness : %d\n", __func__, index_brightness_table_hmt[lcd->hmt_bl]);
+	v_lli->src = src;
+	v_lli->dst = dest;
+	v_lli->len = len;
+	v_lli->para = NORMAL_WAIT;
 
-	lcd->hmt_current_bl = lcd->hmt_bl;
+	burst = convert_burst(8);
+	width = convert_buswidth(DMA_SLAVE_BUSWIDTH_4_BYTES);
+	v_lli->cfg |= DMA_CHAN_CFG_SRC_DRQ(DRQ_SDRAM) |
+		DMA_CHAN_CFG_DST_DRQ(DRQ_SDRAM) |
+		DMA_CHAN_CFG_DST_LINEAR_MODE |
+		DMA_CHAN_CFG_SRC_LINEAR_MODE |
+		DMA_CHAN_CFG_SRC_BURST(burst) |
+		DMA_CHAN_CFG_SRC_WIDTH(width) |
+		DMA_CHAN_CFG_DST_BURST(burst) |
+		DMA_CHAN_CFG_DST_WIDTH(width);
 
-	dev_info(&lcd->ld->dev, "hmt brightness: %d, hmt bl: %d, hmt nit: %d\n",
-	lcd->hmt_brightness, lcd->hmt_bl, index_brightness_table_hmt[lcd->hmt_bl]);
+	sun6i_dma_lli_add(NULL, v_lli, p_lli, txd);
 
-exit:
-	mutex_unlock(&lcd->lock);
+	sun6i_dma_dump_lli(vchan, v_lli);
+
+	return vchan_tx_prep(&vchan->vc, &txd->vd, flags);
+
+err_txd_free:
+	kfree(txd);
+	return NULL;
+}
+
+static struct dma_async_tx_descriptor *sun6i_dma_prep_slave_sg(
+		struct dma_chan *chan, struct scatterlist *sgl,
+		unsigned int sg_len, enum dma_transfer_direction dir,
+		unsigned long flags, void *context)
+{
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	struct dma_slave_config *sconfig = &vchan->cfg;
+	struct sun6i_dma_lli *v_lli, *prev = NULL;
+	struct sun6i_desc *txd;
+	struct scatterlist *sg;
+	dma_addr_t p_lli;
+	int i, ret;
+
+	if (!sgl)
+		return NULL;
+
+	if (!is_slave_direction(dir)) {
+		dev_err(chan2dev(chan), "Invalid DMA direction\n");
+		return NULL;
+	}
+
+	txd = kzalloc(sizeof(*txd), GFP_NOWAIT);
+	if (!txd)
+		return NULL;
+
+	for_each_sg(sgl, sg, sg_len, i) {
+		v_lli = dma_pool_alloc(sdev->pool, GFP_NOWAIT, &p_lli);
+		if (!v_lli)
+			goto err_lli_free;
+
+		if (dir == DMA_MEM_TO_DEV) {
+			ret = sun6i_dma_cfg_lli(v_lli, sg_dma_address(sg),
+						sconfig->dst_addr, sg_dma_len(sg),
+						sconfig);
+			if (ret)
+				goto err_cur_lli_free;
+
+			v_lli->cfg |= DMA_CHAN_CFG_DST_IO_MODE |
+				DMA_CHAN_CFG_SRC_LINEAR_MODE |
+				DMA_CHAN_CFG_SRC_DRQ(DRQ_SDRAM) |
+				DMA_CHAN_CFG_DST_DRQ(vchan->port);
+
+			dev_dbg(chan2dev(chan),
+				"%s; chan: %d, dest: %pad, src: %pad, len: %u. flags: 0x%08lx\n",
+				__func__, vchan->vc.chan.chan_id,
+				&sconfig->dst_addr, &sg_dma_address(sg),
+				sg_dma_len(sg), flags);
+
+		} else {
+			ret = sun6i_dma_cfg_lli(v_lli, sconfig->src_addr,
+						sg_dma_address(sg), sg_dma_len(sg),
+						sconfig);
+			if (ret)
+				goto err_cur_lli_free;
+
+			v_lli->cfg |= DMA_CHAN_CFG_DST_LINEAR_MODE |
+				DMA_CHAN_CFG_SRC_IO_MODE |
+				DMA_CHAN_CFG_DST_DRQ(DRQ_SDRAM) |
+				DMA_CHAN_CFG_SRC_DRQ(vchan->port);
+
+			dev_dbg(chan2dev(chan),
+				"%s; chan: %d, dest: %pad, src: %pad, len: %u. flags: 0x%08lx\n",
+				__func__, vchan->vc.chan.chan_id,
+				&sg_dma_address(sg), &sconfig->src_addr,
+				sg_dma_len(sg), flags);
+		}
+
+		prev = sun6i_dma_lli_add(prev, v_lli, p_lli, txd);
+	}
+
+	dev_dbg(chan2dev(chan), "First: %pad\n", &txd->p_lli);
+	for (prev = txd->v_lli; prev; prev = prev->v_lli_next)
+		sun6i_dma_dump_lli(vchan, prev);
+
+	return vchan_tx_prep(&vchan->vc, &txd->vd, flags);
+
+err_cur_lli_free:
+	dma_pool_free(sdev->pool, v_lli, p_lli);
+err_lli_free:
+	for (prev = txd->v_lli; prev; prev = prev->v_lli_next)
+		dma_pool_free(sdev->pool, prev, virt_to_phys(prev));
+	kfree(txd);
+	return NULL;
+}
+
+static int sun6i_dma_config(struct dma_chan *chan,
+			    struct dma_slave_config *config)
+{
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+
+	memcpy(&vchan->cfg, config, sizeof(*config));
+
+	return 0;
+}
+
+static int sun6i_dma_pause(struct dma_chan *chan)
+{
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	struct sun6i_pchan *pchan = vchan->phy;
+
+	dev_dbg(chan2dev(chan), "vchan %p: pause\n", &vchan->vc);
+
+	if (pchan) {
+		writel(DMA_CHAN_PAUSE_PAUSE,
+		       pchan->base + DMA_CHAN_PAUSE);
+	} else {
+		spin_lock(&sdev->lock);
+		list_del_init(&vchan->node);
+		spin_unlock(&sdev->lock);
+	}
+
+	return 0;
+}
+
+static int sun6i_dma_resume(struct dma_chan *chan)
+{
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	struct sun6i_pchan *pchan = vchan->phy;
+	unsigned long flags;
+
+	dev_dbg(chan2dev(chan), "vchan %p: resume\n", &vchan->vc);
+
+	spin_lock_irqsave(&vchan->vc.lock, flags);
+
+	if (pchan) {
+		writel(DMA_CHAN_PAUSE_RESUME,
+		       pchan->base + DMA_CHAN_PAUSE);
+	} else if (!list_empty(&vchan->vc.desc_issued)) {
+		spin_lock(&sdev->lock);
+		list_add_tail(&vchan->node, &sdev->pending);
+		spin_unlock(&sdev->lock);
+	}
+
+	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+
+	return 0;
+}
+
+static int sun6i_dma_terminate_all(struct dma_chan *chan)
+{
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	struct sun6i_pchan *pchan = vchan->phy;
+	unsigned long flags;
+	LIST_HEAD(head);
+
+	spin_lock(&sdev->lock);
+	list_del_init(&vchan->node);
+	spin_unlock(&sdev->lock);
+
+	spin_lock_irqsave(&vchan->vc.lock, flags);
+
+	vchan_get_all_descriptors(&vchan->vc, &head);
+
+	if (pchan) {
+		writel(DMA_CHAN_ENABLE_STOP, pchan->base + DMA_CHAN_ENABLE);
+		writel(DMA_CHAN_PAUSE_RESUME, pchan->base + DMA_CHAN_PAUSE);
+
+		vchan->phy = NULL;
+		pchan->vchan = NULL;
+		pchan->desc = NULL;
+		pchan->done = NULL;
+	}
+
+	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+
+	vchan_dma_desc_free_list(&vchan->vc, &head);
+
+	return 0;
+}
+
+static enum dma_status sun6i_dma_tx_status(struct dma_chan *chan,
+					   dma_cookie_t cookie,
+					   struct dma_tx_state *state)
+{
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	struct sun6i_pchan *pchan = vchan->phy;
+	struct sun6i_dma_lli *lli;
+	struct virt_dma_desc *vd;
+	struct sun6i_desc *txd;
+	enum dma_status ret;
+	unsigned long flags;
+	size_t bytes = 0;
+
+	ret = dma_cookie_status(chan, cookie, state);
+	if (ret == DMA_COMPLETE)
+		return ret;
+
+	spin_lock_irqsave(&vchan->vc.lock, flags);
+
+	vd = vchan_find_desc(&vchan->vc, cookie);
+	txd = to_sun6i_desc(&vd->tx);
+
+	if (vd) {
+		for (lli = txd->v_lli; lli != NULL; lli = lli->v_lli_next)
+			bytes += lli->len;
+	} else if (!pchan || !pchan->desc) {
+		bytes = 0;
+	} else {
+		bytes = readl(pchan->base + DMA_CHAN_CUR_CNT);
+	}
+
+	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+
+	dma_set_residue(state, bytes);
 
 	return ret;
 }
 
-
-static int s6e3fa7_hmt_update(struct lcd_info *lcd, u8 forced)
+static void sun6i_dma_issue_pending(struct dma_chan *chan)
 {
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	unsigned long flags;
+
+	spin_lock_irqsave(&vchan->vc.lock, flags);
+
+	if (vchan_issue_pending(&vchan->vc)) {
+		spin_lock(&sdev->lock);
+
+		if (!vchan->phy && list_empty(&vchan->node)) {
+			list_add_tail(&vchan->node, &sdev->pending);
+			tasklet_schedule(&sdev->task);
+			dev_dbg(chan2dev(chan), "vchan %p: issued\n",
+				&vchan->vc);
+		}
+
+		spin_unlock(&sdev->lock);
+	} else {
+		dev_dbg(chan2dev(chan), "vchan %p: nothing to issue\n",
+			&vchan->vc);
+	}
+
+	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+}
+
+static void sun6i_dma_free_chan_resources(struct dma_chan *chan)
+{
+	struct sun6i_dma_dev *sdev = to_sun6i_dma_dev(chan->device);
+	struct sun6i_vchan *vchan = to_sun6i_vchan(chan);
+	unsigned long flags;
+
+	spin_lock_irqsave(&sdev->lock, flags);
+	list_del_init(&vchan->node);
+	spin_unlock_irqrestore(&sdev->lock, flags);
+
+	vchan_free_chan_resources(&vchan->vc);
+}
+
+static struct dma_chan *sun6i_dma_of_xlate(struct of_phandle_args *dma_spec,
+					   struct of_dma *ofdma)
+{
+	struct sun6i_dma_dev *sdev = ofdma->of_dma_data;
+	struct sun6i_vchan *vchan;
+	struct dma_chan *chan;
+	u8 port = dma_spec->args[0];
+
+	if (port > sdev->cfg->nr_max_requests)
+		return NULL;
+
+	chan = dma_get_any_slave_channel(&sdev->slave);
+	if (!chan)
+		return NULL;
+
+	vchan = to_sun6i_vchan(chan);
+	vchan->port = port;
+
+	return chan;
+}
+
+static inline void sun6i_kill_tasklet(struct sun6i_dma_dev *sdev)
+{
+	/* Disable all interrupts from DMA */
+	writel(0, sdev->base + DMA_IRQ_EN(0));
+	writel(0, sdev->base + DMA_IRQ_EN(1));
+
+	/* Prevent spurious interrupts from scheduling the tasklet */
+	atomic_inc(&sdev->tasklet_shutdown);
+
+	/* Make sure we won't have any further interrupts */
+	devm_free_irq(sdev->slave.dev, sdev->irq, sdev);
+
+	/* Actually prevent the tasklet from being scheduled */
+	tasklet_kill(&sdev->task);
+}
+
+static inline void sun6i_dma_free(struct sun6i_dma_dev *sdev)
+{
+	int i;
+
+	for (i = 0; i < sdev->cfg->nr_max_vchans; i++) {
+		struct sun6i_vchan *vchan = &sdev->vchans[i];
+
+		list_del(&vchan->vc.chan.device_node);
+		tasklet_kill(&vchan->vc.task);
+	}
+}
+
 /*
- *	1. set hmt comaand
- *	2. set hmt brightness
+ * For A31:
+ *
+ * There's 16 physical channels that can work in parallel.
+ *
+ * However we have 30 different endpoints for our requests.
+ *
+ * Since the channels are able to handle only an unidirectional
+ * transfer, we need to allocate more virtual channels so that
+ * everyone can grab one channel.
+ *
+ * Some devices can't work in both direction (mostly because it
+ * wouldn't make sense), so we have a bit fewer virtual channels than
+ * 2 channels per endpoints.
  */
 
-	hmt_set_mode(lcd, forced);
-	if (lcd->hmt_on)
-		dsim_panel_set_hmt_brightness(lcd, forced);
+static struct sun6i_dma_config sun6i_a31_dma_cfg = {
+	.nr_max_channels = 16,
+	.nr_max_requests = 30,
+	.nr_max_vchans   = 53,
+};
+
+/*
+ * The A23 only has 8 physical channels, a maximum DRQ port id of 24,
+ * and a total of 37 usable source and destination endpoints.
+ */
+
+static struct sun6i_dma_config sun8i_a23_dma_cfg = {
+	.nr_max_channels = 8,
+	.nr_max_requests = 24,
+	.nr_max_vchans   = 37,
+};
+
+/*
+ * The H3 has 12 physical channels, a maximum DRQ port id of 27,
+ * and a total of 34 usable source and destination endpoints.
+ */
+
+static struct sun6i_dma_config sun8i_h3_dma_cfg = {
+	.nr_max_channels = 12,
+	.nr_max_requests = 27,
+	.nr_max_vchans   = 34,
+};
+
+static const struct of_device_id sun6i_dma_match[] = {
+	{ .compatible = "allwinner,sun6i-a31-dma", .data = &sun6i_a31_dma_cfg },
+	{ .compatible = "allwinner,sun8i-a23-dma", .data = &sun8i_a23_dma_cfg },
+	{ .compatible = "allwinner,sun8i-h3-dma", .data = &sun8i_h3_dma_cfg },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, sun6i_dma_match);
+
+static int sun6i_dma_probe(struct platform_device *pdev)
+{
+	const struct of_device_id *device;
+	struct sun6i_dma_dev *sdc;
+	struct resource *res;
+	int ret, i;
+
+	sdc = devm_kzalloc(&pdev->dev, sizeof(*sdc), GFP_KERNEL);
+	if (!sdc)
+		return -ENOMEM;
+
+	device = of_match_device(sun6i_dma_match, &pdev->dev);
+	if (!device)
+		return -ENODEV;
+	sdc->cfg = device->data;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	sdc->base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(sdc->base))
+		return PTR_ERR(sdc->base);
+
+	sdc->irq = platform_get_irq(pdev, 0);
+	if (sdc->irq < 0) {
+		dev_err(&pdev->dev, "Cannot claim IRQ\n");
+		return sdc->irq;
+	}
+
+	sdc->clk = devm_clk_get(&pdev->dev, NULL);
+	if (IS_ERR(sdc->clk)) {
+		dev_err(&pdev->dev, "No clock specified\n");
+		return PTR_ERR(sdc->clk);
+	}
+
+	sdc->rstc = devm_reset_control_get(&pdev->dev, NULL);
+	if (IS_ERR(sdc->rstc)) {
+		dev_err(&pdev->dev, "No reset controller specified\n");
+		return PTR_ERR(sdc->rstc);
+	}
+
+	sdc->pool = dmam_pool_create(dev_name(&pdev->dev), &pdev->dev,
+				     sizeof(struct sun6i_dma_lli), 4, 0);
+	if (!sdc->pool) {
+		dev_err(&pdev->dev, "No memory for descriptors dma pool\n");
+		return -ENOMEM;
+	}
+
+	platform_set_drvdata(pdev, sdc);
+	INIT_LIST_HEAD(&sdc->pending);
+	spin_lock_init(&sdc->lock);
+
+	dma_cap_set(DMA_PRIVATE, sdc->slave.cap_mask);
+	dma_cap_set(DMA_MEMCPY, sdc->slave.cap_mask);
+	dma_cap_set(DMA_SLAVE, sdc->slave.cap_mask);
+
+	INIT_LIST_HEAD(&sdc->slave.channels);
+	sdc->slave.device_free_chan_resources	= sun6i_dma_free_chan_resources;
+	sdc->slave.device_tx_status		= sun6i_dma_tx_status;
+	sdc->slave.device_issue_pending		= sun6i_dma_issue_pending;
+	sdc->slave.device_prep_slave_sg		= sun6i_dma_prep_slave_sg;
+	sdc->slave.device_prep_dma_memcpy	= sun6i_dma_prep_dma_memcpy;
+	sdc->slave.copy_align			= DMAENGINE_ALIGN_4_BYTES;
+	sdc->slave.device_config		= sun6i_dma_config;
+	sdc->slave.device_pause			= sun6i_dma_pause;
+	sdc->slave.device_resume		= sun6i_dma_resume;
+	sdc->slave.device_terminate_all		= sun6i_dma_terminate_all;
+	sdc->slave.src_addr_widths		= BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+						  BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+						  BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+	sdc->slave.dst_addr_widths		= BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+						  BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+						  BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+	sdc->slave.directions			= BIT(DMA_DEV_TO_MEM) |
+						  BIT(DMA_MEM_TO_DEV);
+	sdc->slave.residue_granularity		= DMA_RESIDUE_GRANULARITY_BURST;
+	sdc->slave.dev = &pdev->dev;
+
+	sdc->pchans = devm_kcalloc(&pdev->dev, sdc->cfg->nr_max_channels,
+				   sizeof(struct sun6i_pchan), GFP_KERNEL);
+	if (!sdc->pchans)
+		return -ENOMEM;
+
+	sdc->vchans = devm_kcalloc(&pdev->dev, sdc->cfg->nr_max_vchans,
+				   sizeof(struct sun6i_vchan), GFP_KERNEL);
+	if (!sdc->vchans)
+		return -ENOMEM;
+
+	tasklet_init(&sdc->task, sun6i_dma_tasklet, (unsigned long)sdc);
+
+	for (i = 0; i < sdc->cfg->nr_max_channels; i++) {
+		struct sun6i_pchan *pchan = &sdc->pchans[i];
+
+		pchan->idx = i;
+		pchan->base = sdc->base + 0x100 + i * 0x40;
+	}
+
+	for (i = 0; i < sdc->cfg->nr_max_vchans; i++) {
+		struct sun6i_vchan *vchan = &sdc->vchans[i];
+
+		INIT_LIST_HEAD(&vchan->node);
+		vchan->vc.desc_free = sun6i_dma_free_desc;
+		vchan_init(&vchan->vc, &sdc->slave);
+	}
+
+	ret = reset_control_deassert(sdc->rstc);
+	if (ret) {
+		dev_err(&pdev->dev, "Couldn't deassert the device from reset\n");
+		goto err_chan_free;
+	}
+
+	ret = clk_prepare_enable(sdc->clk);
+	if (ret) {
+		dev_err(&pdev->dev, "Couldn't enable the clock\n");
+		goto err_reset_assert;
+	}
+
+	ret = devm_request_irq(&pdev->dev, sdc->irq, sun6i_dma_interrupt, 0,
+			       dev_name(&pdev->dev), sdc);
+	if (ret) {
+		dev_err(&pdev->dev, "Cannot request IRQ\n");
+		goto err_clk_disable;
+	}
+
+	ret = dma_async_device_register(&sdc->slave);
+	if (ret) {
+		dev_warn(&pdev->dev, "Failed to register DMA engine device\n");
+		goto err_irq_disable;
+	}
+
+	ret = of_dma_controller_register(pdev->dev.of_node, sun6i_dma_of_xlate,
+					 sdc);
+	if (ret) {
+		dev_err(&pdev->dev, "of_dma_controller_register failed\n");
+		goto err_dma_unregister;
+	}
+
+	/*
+	 * sun8i variant requires us to toggle a dma gating register,
+	 * as seen in Allwinner's SDK. This register is not documented
+	 * in the A23 user manual.
+	 */
+	if (of_device_is_compatible(pdev->dev.of_node,
+				    "allwinner,sun8i-a23-dma"))
+		writel(SUN8I_DMA_GATE_ENABLE, sdc->base + SUN8I_DMA_GATE);
+
+	return 0;
+
+err_dma_unregister:
+	dma_async_device_unregister(&sdc->slave);
+err_irq_disable:
+	sun6i_kill_tasklet(sdc);
+err_clk_disable:
+	clk_disable_unprepare(sdc->clk);
+err_reset_assert:
+	reset_control_assert(sdc->rstc);
+err_chan_free:
+	sun6i_dma_free(sdc);
+	return ret;
+}
+
+static int sun6i_dma_remove(struct platform_device *pdev)
+{
+	struct sun6i_dma_dev *sdc = platform_get_drvdata(pdev);
+
+	of_dma_controller_free(pdev->dev.of_node);
+	dma_async_device_unregister(&sdc->slave);
+
+	sun6i_kill_tasklet(sdc);
+
+	clk_disable_unprepare(sdc->clk);
+	reset_control_assert(sdc->rstc);
+
+	sun6i_dma_free(sdc);
+
+	return 0;
+}
+
+static struct platform_driver sun6i_dma_driver = {
+	.probe		= sun6i_dma_probe,
+	.remove		= sun6i_dma_remove,
+	.driver = {
+		.name		= "sun6i-dma",
+		.of_match_table	= sun6i_dma_match,
+	},
+};
+module_platform_driver(sun6i_dma_driver);
+
+MODULE_DESCRIPTION("Allwinner A31 DMA Controller Driver");
+MODULE_AUTHOR("Sugar <shuge@allwinnertech.com>");
+MODULE_AUTHOR("Maxime Ripard <maxime.ripard@free-electrons.com>");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * DMA driver for Nvidia's Tegra20 APB DMA controller.
+ *
+ * Copyright (c) 2012-2013, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <linux/bitops.h>
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
+#include <linux/err.h>
+#include <linux/init.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/of_dma.h>
+#include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/pm_runtime.h>
+#include <linux/reset.h>
+#include <linux/slab.h>
+
+#include "dmaengine.h"
+
+#define TEGRA_APBDMA_GENERAL			0x0
+#define TEGRA_APBDMA_GENERAL_ENABLE		BIT(31)
+
+#define TEGRA_APBDMA_CONTROL			0x010
+#define TEGRA_APBDMA_IRQ_MASK			0x01c
+#define TEGRA_APBDMA_IRQ_MASK_SET		0x020
+
+/* CSR register */
+#define TEGRA_APBDMA_CHAN_CSR			0x00
+#define TEGRA_APBDMA_CSR_ENB			BIT(31)
+#define TEGRA_APBDMA_CSR_IE_EOC			BIT(30)
+#define TEGRA_APBDMA_CSR_HOLD			BIT(29)
+#define TEGRA_APBDMA_CSR_DIR			BIT(28)
+#define TEGRA_APBDMA_CSR_ONCE			BIT(27)
+#define TEGRA_APBDMA_CSR_FLOW			BIT(21)
+#define TEGRA_APBDMA_CSR_REQ_SEL_SHIFT		16
+#define TEGRA_APBDMA_CSR_WCOUNT_MASK		0xFFFC
+
+/* STATUS register */
+#define TEGRA_APBDMA_CHAN_STATUS		0x004
+#define TEGRA_APBDMA_STATUS_BUSY		BIT(31)
+#define TEGRA_APBDMA_STATUS_ISE_EOC		BIT(30)
+#define TEGRA_APBDMA_STATUS_HALT		BIT(29)
+#define TEGRA_APBDMA_STATUS_PING_PONG		BIT(28)
+#define TEGRA_APBDMA_STATUS_COUNT_SHIFT		2
+#define TEGRA_APBDMA_STATUS_COUNT_MASK		0xFFFC
+
+#define TEGRA_APBDMA_CHAN_CSRE			0x00C
+#define TEGRA_APBDMA_CHAN_CSRE_PAUSE		(1 << 31)
+
+/* AHB memory address */
+#define TEGRA_APBDMA_CHAN_AHBPTR		0x010
+
+/* AHB sequence register */
+#define TEGRA_APBDMA_CHAN_AHBSEQ		0x14
+#define TEGRA_APBDMA_AHBSEQ_INTR_ENB		BIT(31)
+#define TEGRA_APBDMA_AHBSEQ_BUS_WIDTH_8		(0 << 28)
+#define TEGRA_APBDMA_AHBSEQ_BUS_WIDTH_16	(1 << 28)
+#define TEGRA_APBDMA_AHBSEQ_BUS_WIDTH_32	(2 << 28)
+#define TEGRA_APBDMA_AHBSEQ_BUS_WIDTH_64	(3 << 28)
+#define TEGRA_APBDMA_AHBSEQ_BUS_WIDTH_128	(4 << 28)
+#define TEGRA_APBDMA_AHBSEQ_DATA_SWAP		BIT(27)
+#define TEGRA_APBDMA_AHBSEQ_BURST_1		(4 << 24)
+#define TEGRA_APBDMA_AHBSEQ_BURST_4		(5 << 24)
+#define TEGRA_APBDMA_AHBSEQ_BURST_8		(6 << 24)
+#define TEGRA_APBDMA_AHBSEQ_DBL_BUF		BIT(19)
+#define TEGRA_APBDMA_AHBSEQ_WRAP_SHIFT		16
+#define TEGRA_APBDMA_AHBSEQ_WRAP_NONE		0
+
+/* APB address */
+#define TEGRA_APBDMA_CHAN_APBPTR		0x018
+
+/* APB sequence register */
+#define TEGRA_APBDMA_CHAN_APBSEQ		0x01c
+#define TEGRA_APBDMA_APBSEQ_BUS_WIDTH_8		(0 << 28)
+#define TEGRA_APBDMA_APBSEQ_BUS_WIDTH_16	(1 << 28)
+#define TEGRA_APBDMA_APBSEQ_BUS_WIDTH_32	(2 << 28)
+#define TEGRA_APBDMA_APBSEQ_BUS_WIDTH_64	(3 << 28)
+#define TEGRA_APBDMA_APBSEQ_BUS_WIDTH_128	(4 << 28)
+#define TEGRA_APBDMA_APBSEQ_DATA_SWAP		BIT(27)
+#define TEGRA_APBDMA_APBSEQ_WRAP_WORD_1		(1 << 16)
+
+/* Tegra148 specific registers */
+#define TEGRA_APBDMA_CHAN_WCOUNT		0x20
+
+#define TEGRA_APBDMA_CHAN_WORD_TRANSFER		0x24
+
+/*
+ * If any burst is in flight and DMA paused then this is the time to complete
+ * on-flight burst and update DMA status register.
+ */
+#define TEGRA_APBDMA_BURST_COMPLETE_TIME	20
+
+/* Channel base address offset from APBDMA base address */
+#define TEGRA_APBDMA_CHANNEL_BASE_ADD_OFFSET	0x1000
+
+struct tegra_dma;
+
+/*
+ * tegra_dma_chip_data Tegra chip specific DMA data
+ * @nr_channels: Number of channels available in the controller.
+ * @channel_reg_size: Channel register size/stride.
+ * @max_dma_count: Maximum DMA transfer count supported by DMA controller.
+ * @support_channel_pause: Support channel wise pause of dma.
+ * @support_separate_wcount_reg: Support separate word count register.
+ */
+struct tegra_dma_chip_data {
+	int nr_channels;
+	int channel_reg_size;
+	int max_dma_count;
+	bool support_channel_pause;
+	bool support_separate_wcount_reg;
+};
+
+/* DMA channel registers */
+struct tegra_dma_channel_regs {
+	unsigned long	csr;
+	unsigned long	ahb_ptr;
+	unsigned long	apb_ptr;
+	unsigned long	ahb_seq;
+	unsigned long	apb_seq;
+	unsigned long	wcount;
+};
+
+/*
+ * tegra_dma_sg_req: Dma request details to configure hardware. This
+ * contains the details for one transfer to configure DMA hw.
+ * The client's request for data transfer can be broken into multiple
+ * sub-transfer as per requester details and hw support.
+ * This sub transfer get added in the list of transfer and point to Tegra
+ * DMA descriptor which manages the transfer details.
+ */
+struct tegra_dma_sg_req {
+	struct tegra_dma_channel_regs	ch_regs;
+	int				req_len;
+	bool				configured;
+	bool				last_sg;
+	struct list_head		node;
+	struct tegra_dma_desc		*dma_desc;
+};
+
+/*
+ * tegra_dma_desc: Tegra DMA descriptors which manages the client requests.
+ * This descriptor keep track of transfer status, callbacks and request
+ * counts etc.
+ */
+struct tegra_dma_desc {
+	struct dma_async_tx_descriptor	txd;
+	int				bytes_requested;
+	int				bytes_transferred;
+	enum dma_status			dma_status;
+	struct list_head		node;
+	struct list_head		tx_list;
+	struct list_head		cb_node;
+	int				cb_count;
+};
+
+struct tegra_dma_channel;
+
+typedef void (*dma_isr_handler)(struct tegra_dma_channel *tdc,
+				bool to_terminate);
+
+/* tegra_dma_channel: Channel specific information */
+struct tegra_dma_channel {
+	struct dma_chan		dma_chan;
+	char			name[30];
+	bool			config_init;
+	int			id;
+	int			irq;
+	void __iomem		*chan_addr;
+	spinlock_t		lock;
+	bool			busy;
+	struct tegra_dma	*tdma;
+	bool			cyclic;
+
+	/* Different lists for managing the requests */
+	struct list_head	free_sg_req;
+	struct list_head	pending_sg_req;
+	struct list_head	free_dma_desc;
+	struct list_head	cb_desc;
+
+	/* ISR handler and tasklet for bottom half of isr handling */
+	dma_isr_handler		isr_handler;
+	struct tasklet_struct	tasklet;
+
+	/* Channel-slave specific configuration */
+	unsigned int slave_id;
+	struct dma_slave_config dma_sconfig;
+	struct tegra_dma_channel_regs	channel_reg;
+};
+
+/* tegra_dma: Tegra DMA specific information */
+struct tegra_dma {
+	struct dma_device		dma_dev;
+	struct device			*dev;
+	struct clk			*dma_clk;
+	struct reset_control		*rst;
+	spinlock_t			global_lock;
+	void __iomem			*base_addr;
+	const struct tegra_dma_chip_data *chip_data;
+
+	/*
+	 * Counter for managing global pausing of the DMA controller.
+	 * Only applicable for devices that don't support individual
+	 * channel pausing.
+	 */
+	u32				global_pause_count;
+
+	/* Some register need to be cache before suspend */
+	u32				reg_gen;
+
+	/* Last member of the structure */
+	struct tegra_dma_channel channels[0];
+};
+
+static inline void tdma_write(struct tegra_dma *tdma, u32 reg, u32 val)
+{
+	writel(val, tdma->base_addr + reg);
+}
+
+static inline u32 tdma_read(struct tegra_dma *tdma, u32 reg)
+{
+	return readl(tdma->base_addr + reg);
+}
+
+static inline void tdc_write(struct tegra_dma_channel *tdc,
+		u32 reg, u32 val)
+{
+	writel(val, tdc->chan_addr + reg);
+}
+
+static inline u32 tdc_read(struct tegra_dma_channel *tdc, u32 reg)
+{
+	return readl(tdc->chan_addr + reg);
+}
+
+static inline struct tegra_dma_channel *to_tegra_dma_chan(struct dma_chan *dc)
+{
+	return container_of(dc, struct tegra_dma_channel, dma_chan);
+}
+
+static inline struct tegra_dma_desc *txd_to_tegra_dma_desc(
+		struct dma_async_tx_descriptor *td)
+{
+	return container_of(td, struct tegra_dma_desc, txd);
+}
+
+static inline struct device *tdc2dev(struct tegra_dma_channel *tdc)
+{
+	return &tdc->dma_chan.dev->device;
+}
+
+static dma_cookie_t tegra_dma_tx_submit(struct dma_async_tx_descriptor *tx);
+static int tegra_dma_runtime_suspend(struct device *dev);
+static int tegra_dma_runtime_resume(struct device *dev);
+
+/* Get DMA desc from free list, if not there then allocate it.  */
+static struct tegra_dma_desc *tegra_dma_desc_get(
+		struct tegra_dma_channel *tdc)
+{
+	struct tegra_dma_desc *dma_desc;
+	unsigned long flags;
+
+	spin_lock_irqsave(&tdc->lock, flags);
+
+	/* Do not allocate if desc are waiting for ack */
+	list_for_each_entry(dma_desc, &tdc->free_dma_desc, node) {
+		if (async_tx_test_ack(&dma_desc->txd) && !dma_desc->cb_count) {
+			list_del(&dma_desc->node);
+			spin_unlock_irqrestore(&tdc->lock, flags);
+			dma_desc->txd.flags = 0;
+			return dma_desc;
+		}
+	}
+
+	spin_unlock_irqrestore(&tdc->lock, flags);
+
+	/* Allocate DMA desc */
+	dma_desc = kzalloc(sizeof(*dma_desc), GFP_ATOMIC);
+	if (!dma_desc) {
+		dev_err(tdc2dev(tdc), "dma_desc alloc failed\n");
+		return NULL;
+	}
+
+	dma_async_tx_descriptor_init(&dma_desc->txd, &tdc->dma_chan);
+	dma_desc->txd.tx_submit = tegra_dma_tx_submit;
+	dma_desc->txd.flags = 0;
+	return dma_desc;
+}
+
+static void tegra_dma_desc_put(struct tegra_dma_channel *tdc,
+		struct tegra_dma_desc *dma_desc)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tdc->lock, flags);
+	if (!list_empty(&dma_desc->tx_list))
+		list_splice_init(&dma_desc->tx_list, &tdc->free_sg_req);
+	list_add_tail(&dma_desc->node, &tdc->free_dma_desc);
+	spin_unlock_irqrestore(&tdc->lock, flags);
+}
+
+static struct tegra_dma_sg_req *tegra_dma_sg_req_get(
+		struct tegra_dma_channel *tdc)
+{
+	struct tegra_dma_sg_req *sg_req = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&tdc->lock, flags);
+	if (!list_empty(&tdc->free_sg_req)) {
+		sg_req = list_first_entry(&tdc->free_sg_req,
+					typeof(*sg_req), node);
+		list_del(&sg_req->node);
+		spin_unlock_irqrestore(&tdc->lock, flags);
+		return sg_req;
+	}
+	spin_unlock_irqrestore(&tdc->lock, flags);
+
+	sg_req = kzalloc(sizeof(struct tegra_dma_sg_req), GFP_ATOMIC);
+	if (!sg_req)
+		dev_err(tdc2dev(tdc), "sg_req alloc failed\n");
+	return sg_req;
+}
+
+static int tegra_dma_slave_config(struct dma_chan *dc,
+		struct dma_slave_config *sconfig)
+{
+	struct tegra_dma_channel *tdc = to_tegra_dma_chan(dc);
+
+	if (!list_empty(&tdc->pending_sg_req)) {
+		dev_err(tdc2dev(tdc), "Configuration not allowed\n");
+		return -EBUSY;
+	}
+
+	memcpy(&tdc->dma_sconfig, sconfig, sizeof(*sconfig));
+	if (!tdc->slave_id)
+		tdc->slave_id = sconfig->slave_id;
+	tdc->config_init = true;
+	return 0;
+}
+
+static void tegra_dma_global_pause(struct tegra_dma_channel *tdc,
+	bool wait_for_burst_complete)
+{
+	struct tegra_dma *tdma = tdc->tdma;
+
+	spin_lock(&tdma->global_lock);
+
+	if (tdc->tdma->global_pause_count == 0) {
+		tdma_write(tdma, TEGRA_APBDMA_GENERAL, 0);
+		if (wait_for_burst_complete)
+			udelay(TEGRA_APBDMA_BURST_COMPLETE_TIME);
+	}
+
+	tdc->tdma->global_pause_count++;
+
+	spin_unlock(&tdma->global_lock);
+}
+
+static void tegra_dma_global_resume(struct tegra_dma_channel *tdc)
+{
+	struct tegra_dma *tdma = tdc->tdma;
+
+	spin_lock(&tdma->global_lock);
+
+	if (WARN_ON(tdc->tdma->global_pause_count == 0))
+		goto out;
+
+	if (--tdc->tdma->global_pause_count == 0)
+		tdma_write(tdma, TEGRA_APBDMA_GENERAL,
+			   TEGRA_APBDMA_GENERAL_ENABLE);
+
+out:
+	spin_unlock(&tdma->global_lock);
+}
+
+static void tegra_dma_pause(struct tegra_dma_channel *tdc,
+	bool wait_for_burst_complete)
+{
+	struct tegra_dma *tdma = tdc->tdma;
+
+	if (tdma->chip_data->support_channel_pause) {
+		tdc_write(tdc, TEGRA_APBDMA_CHAN_CSRE,
+				TEGRA_APBDMA_CHAN_CSRE_PAUSE);
+		if (wait_for_burst_complete)
+			udelay(TEGRA_APBDMA_BURST_COMPLETE_TIME);
+	} else {
+		tegra_dma_global_pause(tdc, wait_for_burst_complete);
+	}
+}
+
+static void tegra_dma_resume(struct tegra_dma_channel *tdc)
+{
+	struct tegra_dma *tdma = tdc->tdma;
+
+	if (tdma->chip_data->support_channel_pause) {
+		tdc_write(tdc, TEGRA_APBDMA_CHAN_CSRE, 0);
+	} else {
+		tegra_dma_global_resume(tdc);
+	}
+}
+
+static void tegra_dma_stop(struct tegra_dma_channel *tdc)
+{
+	u32 csr;
+	u32 status;
+
+	/* Disable interrupts */
+	csr = tdc_read(tdc, TEGRA_APBDMA_CHAN_CSR);
+	csr &= ~TEGRA_APBDMA_CSR_IE_EOC;
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_CSR, csr);
+
+	/* Disable DMA */
+	csr &= ~TEGRA_APBDMA_CSR_ENB;
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_CSR, csr);
+
+	/* Clear interrupt status if it is there */
+	status = tdc_read(tdc, TEGRA_APBDMA_CHAN_STATUS);
+	if (status & TEGRA_APBDMA_STATUS_ISE_EOC) {
+		dev_dbg(tdc2dev(tdc), "%s():clearing interrupt\n", __func__);
+		tdc_write(tdc, TEGRA_APBDMA_CHAN_STATUS, status);
+	}
+	tdc->busy = false;
+}
+
+static void tegra_dma_start(struct tegra_dma_channel *tdc,
+		struct tegra_dma_sg_req *sg_req)
+{
+	struct tegra_dma_channel_regs *ch_regs = &sg_req->ch_regs;
+
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_CSR, ch_regs->csr);
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_APBSEQ, ch_regs->apb_seq);
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_APBPTR, ch_regs->apb_ptr);
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_AHBSEQ, ch_regs->ahb_seq);
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_AHBPTR, ch_regs->ahb_ptr);
+	if (tdc->tdma->chip_data->support_separate_wcount_reg)
+		tdc_write(tdc, TEGRA_APBDMA_CHAN_WCOUNT, ch_regs->wcount);
+
+	/* Start DMA */
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_CSR,
+				ch_regs->csr | TEGRA_APBDMA_CSR_ENB);
+}
+
+static void tegra_dma_configure_for_next(struct tegra_dma_channel *tdc,
+		struct tegra_dma_sg_req *nsg_req)
+{
+	unsigned long status;
+
+	/*
+	 * The DMA controller reloads the new configuration for next transfer
+	 * after last burst of current transfer completes.
+	 * If there is no IEC status then this makes sure that last burst
+	 * has not be completed. There may be case that last burst is on
+	 * flight and so it can complete but because DMA is paused, it
+	 * will not generates interrupt as well as not reload the new
+	 * configuration.
+	 * If there is already IEC status then interrupt handler need to
+	 * load new configuration.
+	 */
+	tegra_dma_pause(tdc, false);
+	status  = tdc_read(tdc, TEGRA_APBDMA_CHAN_STATUS);
+
+	/*
+	 * If interrupt is pending then do nothing as the ISR will handle
+	 * the programing for new request.
+	 */
+	if (status & TEGRA_APBDMA_STATUS_ISE_EOC) {
+		dev_err(tdc2dev(tdc),
+			"Skipping new configuration as interrupt is pending\n");
+		tegra_dma_resume(tdc);
+		return;
+	}
+
+	/* Safe to program new configuration */
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_APBPTR, nsg_req->ch_regs.apb_ptr);
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_AHBPTR, nsg_req->ch_regs.ahb_ptr);
+	if (tdc->tdma->chip_data->support_separate_wcount_reg)
+		tdc_write(tdc, TEGRA_APBDMA_CHAN_WCOUNT,
+						nsg_req->ch_regs.wcount);
+	tdc_write(tdc, TEGRA_APBDMA_CHAN_CSR,
+				nsg_req->ch_regs.csr | TEGRA_APBDMA_CSR_ENB);
+	nsg_req->configured = true;
+
+	tegra_dma_resume(tdc);
+}
+
+static void tdc_start_head_req(struct tegra_dma_channel *tdc)
+{
+	struct tegra_dma_sg_req *sg_req;
+
+	if (list_empty(&tdc->pending_sg_req))
+		return;
+
+	sg_req = list_first_entry(&tdc->pending_sg_req,
+					typeof(*sg_req), node);
+	tegra_dma_start(tdc, sg_req);
+	sg_req->configured = true;
+	tdc->busy = true;
+}
+
+static void tdc_configure_next_head_desc(struct tegra_dma_channel *tdc)
+{
+	struct tegra_dma_sg_req *hsgreq;
+	struct tegra_dma_sg_req *hnsgreq;
+
+	if (list_empty(&tdc->pending_sg_req))
+		return;
+
+	hsgreq = list_first_entry(&tdc->pending_sg_req, typeof(*hsgreq), node);
+	if (!list_is_last(&hsgreq->node, &tdc->pending_sg_req)) {
+		hnsgreq = list_first_entry(&hsgreq->node,
+					typeof(*hnsgreq), node);
+		tegra_dma_configure_for_next(tdc, hnsgreq);
+	}
+}
+
+static inline int get_current_xferred_count(struct tegra_dma_channel *tdc,
+	struct tegra_dma_sg_req *sg_req, unsigned long status)
+{
+	return sg_req->req_len - (status & TEGRA_APBDMA_STATUS_COUNT_MASK) - 4;
+}
+
+static void tegra_dma_abort_all(struct tegra_dma_channel *tdc)
+{
+	struct tegra_dma_sg_req *sgreq;
+	struct tegra_dma_desc *dma_desc;
+
+	while (!list_empty(&tdc->pending_sg_req)) {
+		sgreq = list_first_entry(&tdc->pending_sg_req,
+						typeof(*sgreq), node);
+		list_move_tail(&sgreq->node, &tdc->free_sg_req);
+		if (sgreq->last_sg) {
+			dma_desc = sgreq->dma_desc;
+			dma_desc->dma_status = DMA_ERROR;
+			list_add_tail(&dma_desc->node, &tdc->free_dma_desc);
+
+			/* Add in cb list if it is not there. */
+			if (!dma_desc->cb_count)
+				list_add_tail(&dma_desc->cb_node,
+							&tdc->cb_desc);
+			dma_desc->cb_count++;
+		}
+	}
+	tdc->isr_handler = NULL;
+}
+
+static bool handle_continuous_head_request(struct tegra_dma_channel *tdc,
+		struct tegra_dma_sg_req *last_sg_req, bool to_terminate)
+{
+	struct tegra_dma_sg_req *hsgreq = NULL;
+
+	if (list_empty(&tdc->pending_sg_req)) {
+		dev_err(tdc2dev(tdc), "Dma is running without req\n");
+		tegra_dma_stop(tdc);
+		return false;
+	}
+
+	/*
+	 * Check that head req on list should be in flight.
+	 * If it is not in flight then abort transfer as
+	 * looping of transfer can not continue.
+	 */
+	hsgreq = list_first_entry(&tdc->pending_sg_req, typeof(*hsgreq), node);
+	if (!hsgreq->configured) {
+		tegra_dma_stop(tdc);
+		dev_err(tdc2dev(tdc), "Error in dma transfer, aborting dma\n");
+		tegra_dma_abort_all(tdc);
+		return false;
+	}
+
+	/* Configure next request */
+	if (!to_terminate)
+		tdc_configure_next_head_desc(tdc);
+	return true;
+}
+
+static void handle_once_dma_done(struct tegra_dma_channel *tdc,
+	bool to_terminate)
+{
+	struct tegra_dma_sg_req *sgreq;
+	struct tegra_dma_desc *dma_desc;
+
+	tdc->busy = false;
+	sgreq = list_first_entry(&tdc->pending_sg_req, typeof(*sgreq), node);
+	dma_desc = sgreq->dma_desc;
+	dma_desc->bytes_transferred += sgreq->req_len;
+
+	list_del(&sgreq->node);
+	if (sgreq->last_sg) {
+		dma_desc->dma_status = DMA_COMPLETE;
+		dma_cookie_complete(&dma_desc->txd);
+		if (!dma_desc->cb_count)
+			list_add_tail(&dma_desc->cb_node, &tdc->cb_desc);
+		dma_desc->cb_count++;
+		list_add_tail(&dma_desc->node, &tdc->free_dma_desc);
+	}
+	list_add_tail(&sgreq->node, &tdc->free_sg_req);
+
+	/* Do not start DMA if it is going to be terminate */
+	if (to_terminate || list_empty(&tdc->pending_sg_req))
+		return;
+
+	tdc_start_head_req(tdc);
+}
+
+static void handle_cont_sngl_cycle_dma_done(struct tegra_dma_channel *tdc,
+		bool to_terminate)
+{
+	struct tegra_dma_sg_req *sgreq;
+	struct tegra_dma_desc *dma_desc;
+	bool st;
+
+	sgreq = list_first_entry(&tdc->pending_sg_req, typeof(*sgreq), node);
+	dma_desc = sgreq->dma_desc;
+	/* if we dma for long enough the transfer count will wrap */
+	dma_desc->bytes_transferred =
+		(dma_desc->bytes_transferred + sgreq->req_len) %
+		dma_desc->bytes_requested;
+
+	/* Callback need to be call */
+	if (!dma_desc->cb_count)
+		list_add_tail(&dma_desc->cb_node, &tdc->cb_desc);
+	dma_desc->cb_count++;
+
+	/* If not last req then put at end of pending list */
+	if (!list_is_last(&sgreq->node, &tdc->pending_sg_req)) {
+		list_move_tail(&sgreq->node, &tdc->pending_sg_req);
+		sgreq->configured = false;
+		st = handle_continuous_head_request(tdc, sgreq, to_terminate);
+		if (!st)
+			dma_desc->dma_status = DMA_ERROR;
+	}
+}
+
+static void tegra_dma_tasklet(unsigned long data)
+{
+	struct tegra_dma_channel *tdc = (struct tegra_dma_channel *)data;
+	dma_async_tx_callback callback = NULL;
+	void *callback_param = NULL;
+	struct tegra_dma_desc *dma_desc;
+	unsigned long flags;
+	int cb_count;
+
+	spin_lock_irqsave(&tdc->lock, flags);
+	while (!list_empty(&tdc->cb_desc)) {
+		dma_desc  = list_first_entry(&tdc->cb_desc,
+					typeof(*dma_desc), cb_node);
+		list_del(&dma_desc->cb_node);
+		callback = dma_desc->txd.callback;
+		callback_param = dma_desc->txd.callback_param;
+		cb_count = dma_desc->cb_count;
+		dma_desc->cb_count = 0;
+		spin_unlock_irqrestore(&tdc->lock, flags);
+		while (cb_count-- && callback)
+			callback(callback_param);
+		spin_lock_irqsave(&tdc->lock, flags);
+	}
+	spin_unlock_irqrestore(&tdc->lock, flags);
+}
+
+static irqreturn_t tegra_dma_isr(int irq, void *dev_id)
+{
+	struct tegra_dma_channel *tdc = dev_id;
+	unsigned long status;
+	unsigned long flags;
+
+	spin_lock_irqsave(&tdc->lock, flags);
+
+	status = tdc_read(tdc, TEGRA_APBDMA_CHAN_STATUS);
+	if (status & TEGRA_APBDMA_STATUS_ISE_EOC) {
+		tdc_write(tdc, TEGRA_APBDMA_CHAN_STATUS, status);
+		tdc->isr_handler(tdc, false);
+		tasklet_schedule(&tdc->tasklet);
+		spin_unlock_irqrestore(&tdc->lock, flags);
+		return IRQ_HANDLED;
+	}
+
+	spin_unlock_irqrestore(&tdc->lock, flags);
+	dev_info(tdc2dev(tdc),
+		"Interrupt already served status 0x%08lx\n", status);
+	return IRQ_NONE;
+}
+
+static dma_cookie_t tegra_dma_tx_submit(struct dma_async_tx_descriptor *txd)
+{
+	struct tegra_dma_desc *dma_desc = txd_to_tegra_dma_desc(txd);
+	struct tegra_dma_channel *tdc = to_tegra_dma_chan(txd->chan);
+	unsigned long flags;
+	dma_cookie_t cookie;
+
+	spin_lock_irqsave(&tdc->lock, flags);
+	dma_desc->dma_status = DMA_IN_PROGRESS;
+	cookie = dma_cookie_assign(&dma_desc->txd);
+	list_splice_tail_init(&dma_desc->tx_list, &tdc->pending_sg_req);
+	spin_unlock_irqrestore(&tdc->lock, flags);
+	return cookie;
+}
+
+static void tegra_dma_issue_pending(struct dma_chan *dc)
+{
+	struct tegra_dma_channel *tdc = to_tegra_dma_chan(dc);
+	unsigned long flags;
+
+	spin_lock_irqsave(&tdc->lock, flags);
+	if (list_empty(&tdc->pending_sg_req)) {
+		dev_err(tdc2dev(tdc), "No DMA request\n");
+		goto end;
+	}
+	if (!tdc->busy) {
+		tdc_start_head_req(tdc);
+
+		/* Continuous single mode: Configure next req */
+		if (tdc->cyclic) {
+			/*
+			 * Wait for 1 burst time for configure DMA for
+			 * next transfer.
+			 */
+			udelay(TEGRA_APBDMA_BURST_COMPLETE_TIME);
+			tdc_configure_next_head_desc(tdc);
+		}
+	}
+end:
+	spin_unlock_irqrestore(&tdc->lock, flags);
+}
+
+static int tegra_dma_terminate_all(struct dma_chan *dc)
+{
+	struct tegra_dma_channel *tdc = to_tegra_dma_chan(dc);
+	struct tegra_dma_sg_req *sgreq;
+	struct tegra_dma_desc *dma_desc;
+	unsigned long flags;
+	unsigned long status;
+	unsigned long wcount;
+	bool was_busy;
+
+	spin_lock_irqsave(&tdc->lock, flags);
+
+	if (!tdc->busy)
+		goto skip_dma_stop;
+
+	/* Pause DMA before checking the queue status */
+	tegra_dma_pause(tdc, true);
+
+	status = tdc_read(tdc, TEGRA_APBDMA_CHAN_STATUS);
+	if (status & TEGRA_APBDMA_STATUS_ISE_EOC) {
+		dev_dbg(tdc2dev(tdc), "%s():handling isr\n", __func__);
+		tdc->isr_handler(tdc, true);
+		status = tdc_read(tdc, TEGRA_APBDMA_CHAN_STATUS);
+	}
+	if (tdc->tdma->chip_data->support_separate_wcount_reg)
+		wcount = tdc_read(tdc, TEGRA_APBDMA_CHAN_WORD_TRANSFER);
 	else
-		dsim_panel_set_brightness(lcd, forced);
+		wcount = status;
 
+	was_busy = tdc->busy;
+	tegra_dma_stop(tdc);
+
+	if (!list_empty(&tdc->pending_sg_req) && was_busy) {
+		sgreq = list_first_entry(&tdc->pending_sg_req,
+					typeof(*sgreq), node);
+		sgreq->dma_desc->bytes_transferred +=
+				get_current_xferred_count(tdc, sgreq, wcount);
+	}
+	tegra_dma_resume(tdc);
+
+skip_dma_stop:
+	tegra_dma_abort_all(tdc);
+
+	while (!list_empty(&tdc->cb_desc)) {
+		dma_desc  = list_first_entry(&tdc->cb_desc,
+					typeof(*dma_desc), cb_node);
+		list_del(&dma_desc->cb_node);
+		dma_desc->cb_count = 0;
+	}
+	spin_unlock_irqrestore(&tdc->lock, flags);
 	return 0;
 }
 
-static ssize_t hmt_brightness_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
+static enum dma_status tegra_dma_tx_status(struct dma_chan *dc,
+	dma_cookie_t cookie, struct dma_tx_state *txstate)
 {
-	struct lcd_info *lcd = dev_get_drvdata(dev);
+	struct tegra_dma_channel *tdc = to_tegra_dma_chan(dc);
+	struct tegra_dma_desc *dma_desc;
+	struct tegra_dma_sg_req *sg_req;
+	enum dma_status ret;
+	unsigned long flags;
+	unsigned int residual;
 
-	sprintf(buf, "index : %d, brightness : %d\n", lcd->hmt_current_bl, lcd->hmt_brightness);
-
-	return strlen(buf);
-}
-
-static ssize_t hmt_brightness_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	unsigned int value;
-	int rc;
-
-	rc = kstrtouint(buf, 0, &value);
-	if (rc < 0)
-		return rc;
-
-	dev_info(&lcd->ld->dev, "++ %s: %d\n", __func__, value);
-	if (!lcd->hmt_on) {
-		dev_info(&lcd->ld->dev, "%s: hmt is not on\n", __func__);
-		return -EINVAL;
-	}
-
-	if (lcd->hmt_brightness != value) {
-		mutex_lock(&lcd->lock);
-		lcd->hmt_brightness = value;
-		mutex_unlock(&lcd->lock);
-		dsim_panel_set_hmt_brightness(lcd, 0);
-	}
-	dev_info(&lcd->ld->dev, "-- %s: %d\n", __func__, value);
-
-	return size;
-}
-
-static ssize_t hmt_on_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	sprintf(buf, "%u\n", lcd->hmt_on);
-
-	return strlen(buf);
-}
-
-static ssize_t hmt_on_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	unsigned int value;
-	int rc;
-
-	rc = kstrtouint(buf, 0, &value);
-	if (rc < 0)
-		return rc;
-
-	if (lcd->hmt_on != value) {
-		dev_info(&lcd->ld->dev, "%s: %d\n", __func__, lcd->hmt_on);
-		mutex_lock(&lcd->lock);
-		lcd->hmt_on = lcd->dsim->hmt_on = value;
-		mutex_unlock(&lcd->lock);
-		s6e3fa7_hmt_update(lcd, 1);
-		dev_info(&lcd->ld->dev, "%s: finish %d\n", __func__, lcd->hmt_on);
-	} else
-		dev_info(&lcd->ld->dev, "%s: hmt already %s\n", __func__, value ? "on" : "off");
-
-	return size;
-}
-
-static DEVICE_ATTR(hmt_bright, 0664, hmt_brightness_show, hmt_brightness_store);
-static DEVICE_ATTR(hmt_on, 0664, hmt_on_show, hmt_on_store);
-#endif
-
-#if defined(CONFIG_DISPLAY_USE_INFO)
-/*
- * HW PARAM LOGGING SYSFS NODE
- */
-static ssize_t dpui_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	int ret;
-
-	update_dpui_log(DPUI_LOG_LEVEL_INFO, DPUI_TYPE_PANEL);
-	ret = get_dpui_log(buf, DPUI_LOG_LEVEL_INFO, DPUI_TYPE_PANEL);
-	if (ret < 0) {
-		pr_err("%s failed to get log %d\n", __func__, ret);
-		return ret;
-	}
-
-	pr_info("%s\n", buf);
-	return ret;
-}
-
-static ssize_t dpui_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	if (buf[0] == 'C' || buf[0] == 'c')
-		clear_dpui_log(DPUI_LOG_LEVEL_INFO, DPUI_TYPE_PANEL);
-
-	return size;
-}
-
-/*
- * [DEV ONLY]
- * HW PARAM LOGGING SYSFS NODE
- */
-static ssize_t dpui_dbg_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	int ret;
-
-	update_dpui_log(DPUI_LOG_LEVEL_DEBUG, DPUI_TYPE_PANEL);
-	ret = get_dpui_log(buf, DPUI_LOG_LEVEL_DEBUG, DPUI_TYPE_PANEL);
-	if (ret < 0) {
-		pr_err("%s failed to get log %d\n", __func__, ret);
-		return ret;
-	}
-
-	pr_info("%s\n", buf);
-	return ret;
-}
-
-static ssize_t dpui_dbg_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	if (buf[0] == 'C' || buf[0] == 'c')
-		clear_dpui_log(DPUI_LOG_LEVEL_DEBUG, DPUI_TYPE_PANEL);
-
-	return size;
-}
-
-static DEVICE_ATTR(dpui, 0660, dpui_show, dpui_store);
-static DEVICE_ATTR(dpui_dbg, 0660, dpui_dbg_show, dpui_dbg_store);
-#endif
-
-#if defined(CONFIG_EXYNOS_DOZE)
-#if defined(CONFIG_SEC_FACTORY)
-static ssize_t alpm_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	struct dsim_device *dsim = lcd->dsim;
-	struct decon_device *decon = get_decon_drvdata(0);
-	struct fb_info *fbinfo = decon->win[decon->dt.dft_win]->fbinfo;
-	union lpm_info lpm = {0, };
-	unsigned int value = 0;
-	int ret;
-
-	ret = kstrtouint(buf, 0, &value);
-	if (ret < 0)
+	ret = dma_cookie_status(dc, cookie, txstate);
+	if (ret == DMA_COMPLETE)
 		return ret;
 
-	dev_info(&lcd->ld->dev, "%s: %06x, lpm: %06x(%06x)\n", __func__,
-		value, lcd->current_alpm.value, lcd->alpm.value);
+	spin_lock_irqsave(&tdc->lock, flags);
 
-	if (lcd->state != PANEL_STATE_RESUMED) {
-		dev_info(&lcd->ld->dev, "%s: panel state is %d\n", __func__, lcd->state);
-		return -EINVAL;
-	}
-
-	if (!lock_fb_info(fbinfo)) {
-		dev_info(&lcd->ld->dev, "%s: fblock is failed\n", __func__);
-		return -EINVAL;
-	}
-
-	lpm.ver = get_bit(value, 16, 8);
-	lpm.mode = get_bit(value, 0, 8);
-
-	if (!lpm.ver && lpm.mode >= ALPM_MODE_MAX) {
-		dev_info(&lcd->ld->dev, "%s: undefined lpm value: %x\n", __func__, value);
-		unlock_fb_info(fbinfo);
-		return -EINVAL;
-	}
-
-	if (lpm.ver && lpm.mode >= AOD_MODE_MAX) {
-		dev_info(&lcd->ld->dev, "%s: undefined lpm value: %x\n", __func__, value);
-		unlock_fb_info(fbinfo);
-		return -EINVAL;
-	}
-
-	lpm.state = (lpm.ver && lpm.mode) ? lpm_brightness_table[lcd->bd->props.brightness] : lpm_old_table[lpm.mode];
-
-	mutex_lock(&lcd->lock);
-	lcd->prev_alpm = lcd->alpm;
-	lcd->alpm = lpm;
-	mutex_unlock(&lcd->lock);
-
-	switch (lpm.mode) {
-	case ALPM_OFF:
-		if (lcd->prev_brightness) {
-			mutex_lock(&lcd->lock);
-			lcd->bd->props.brightness = lcd->prev_brightness;
-			lcd->prev_brightness = 0;
-			mutex_unlock(&lcd->lock);
+	/* Check on wait_ack desc status */
+	list_for_each_entry(dma_desc, &tdc->free_dma_desc, node) {
+		if (dma_desc->txd.cookie == cookie) {
+			residual =  dma_desc->bytes_requested -
+					(dma_desc->bytes_transferred %
+						dma_desc->bytes_requested);
+			dma_set_residue(txstate, residual);
+			ret = dma_desc->dma_status;
+			spin_unlock_irqrestore(&tdc->lock, flags);
+			return ret;
 		}
-		mutex_lock(&decon->lock);
-		call_panel_ops(dsim, displayon, dsim);	/* for exitalpm */
-		mutex_unlock(&decon->lock);
-		usleep_range(17000, 18000);
-		mutex_lock(&lcd->lock);
-		s6e3fa7_displayon(lcd);
-		mutex_unlock(&lcd->lock);
-		break;
-	case ALPM_ON_LOW:
-	case HLPM_ON_LOW:
-	case ALPM_ON_HIGH:
-	case HLPM_ON_HIGH:
-		if (lcd->prev_alpm.mode == ALPM_OFF) {
-			mutex_lock(&lcd->lock);
-			lcd->prev_brightness = lcd->bd->props.brightness;
-			mutex_unlock(&lcd->lock);
+	}
+
+	/* Check in pending list */
+	list_for_each_entry(sg_req, &tdc->pending_sg_req, node) {
+		dma_desc = sg_req->dma_desc;
+		if (dma_desc->txd.cookie == cookie) {
+			residual =  dma_desc->bytes_requested -
+					(dma_desc->bytes_transferred %
+						dma_desc->bytes_requested);
+			dma_set_residue(txstate, residual);
+			ret = dma_desc->dma_status;
+			spin_unlock_irqrestore(&tdc->lock, flags);
+			return ret;
 		}
-		mutex_lock(&decon->lock);
-		lcd->bd->props.brightness = (value <= HLPM_ON_LOW) ? 0 : UI_MAX_BRIGHTNESS;
-		call_panel_ops(dsim, doze, dsim);
-		mutex_unlock(&decon->lock);
-		usleep_range(17000, 18000);
-		mutex_lock(&lcd->lock);
-		s6e3fa7_displayon(lcd);
-		mutex_unlock(&lcd->lock);
-		break;
 	}
 
-	unlock_fb_info(fbinfo);
-
-	return size;
-}
-#else
-static ssize_t alpm_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	struct dsim_device *dsim = lcd->dsim;
-	struct decon_device *decon = get_decon_drvdata(0);
-	union lpm_info lpm = {0, };
-	unsigned int value = 0;
-	int ret;
-
-	ret = kstrtouint(buf, 0, &value);
-	if (ret < 0)
-		return ret;
-
-	dev_info(&lcd->ld->dev, "%s: %06x, lpm: %06x(%06x)\n", __func__,
-		value, lcd->current_alpm.value, lcd->alpm.value);
-
-	lpm.ver = get_bit(value, 16, 8);
-	lpm.mode = get_bit(value, 0, 8);
-
-	if (!lpm.ver && lpm.mode >= ALPM_MODE_MAX) {
-		dev_info(&lcd->ld->dev, "%s: undefined lpm value: %x\n", __func__, value);
-		return -EINVAL;
-	}
-
-	if (lpm.ver && lpm.mode >= AOD_MODE_MAX) {
-		dev_info(&lcd->ld->dev, "%s: undefined lpm value: %x\n", __func__, value);
-		return -EINVAL;
-	}
-
-	lpm.state = (lpm.ver && lpm.mode) ? lpm_brightness_table[lcd->bd->props.brightness] : lpm_old_table[lpm.mode];
-
-	if (lcd->alpm.value == lpm.value && lcd->current_alpm.value == lpm.value) {
-		dev_info(&lcd->ld->dev, "%s: unchanged lpm value: %x\n", __func__, lpm.value);
-		return size;
-	}
-
-	mutex_lock(&decon->lock);
-	mutex_lock(&lcd->lock);
-	lcd->alpm = lpm;
-	mutex_unlock(&lcd->lock);
-
-	if (dsim->doze_state == DOZE_STATE_DOZE) {
-		call_panel_ops(dsim, doze, dsim);
-	}
-	mutex_unlock(&decon->lock);
-
-	return size;
-}
-#endif
-
-static ssize_t alpm_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-
-	sprintf(buf, "%06x\n", lcd->current_alpm.value);
-
-	return strlen(buf);
-}
-
-static DEVICE_ATTR(alpm, 0664, alpm_show, alpm_store);
-#endif
-
-#ifdef CONFIG_SUPPORT_POC_FLASH
-static ssize_t poc_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-
-	return strlen(buf);
-}
-
-static ssize_t poc_store(struct device *dev,
-	struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	struct panel_poc_device *poc_dev;
-	struct panel_poc_info *poc_info;
-	int ret;
-	int cmd, addr, len;
-
-	if (lcd->state != PANEL_STATE_RESUMED) {
-		dev_info(&lcd->ld->dev, "%s: panel state is %d\n", __func__, lcd->state);
-		return -EINVAL;
-	}
-
-	poc_dev = &lcd->poc_dev;
-	poc_info = &poc_dev->poc_info;
-
-	ret = sscanf(buf, "%d %d %d\n", &cmd, &addr, &len);
-	if ((ret != 3) || (cmd != POC_OP_SECTOR_ERASE)) {
-		dev_info(&lcd->ld->dev, "%s: err! cmd: [%d] ret: [%d]\n", __func__, cmd, ret);
-		return ret;
-	}
-
-	if (cmd == POC_OP_SECTOR_ERASE)
-		poc_erase(poc_dev, addr, len);
-
-	dev_info(&lcd->ld->dev, "%s: poc_op %d\n", __func__, cmd);
-
-	return size;
-}
-
-static ssize_t poc_mca_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct lcd_info *lcd = dev_get_drvdata(dev);
-	int ret = 0;
-	unsigned int i = 0;
-	struct seq_file m = {
-		.buf = buf,
-		.size = PAGE_SIZE - 1,
-		.count = 0,
-	};
-
-	if (lcd->state != PANEL_STATE_RESUMED) {
-		dev_info(&lcd->ld->dev, "%s: state is %d\n", __func__, lcd->state);
-		return -EINVAL;
-	}
-
-	DSI_WRITE(SEQ_TEST_KEY_ON_F0, ARRAY_SIZE(SEQ_TEST_KEY_ON_F0));
-	s6e3fa7_read_poc_info(lcd);
-	DSI_WRITE(SEQ_TEST_KEY_OFF_F0, ARRAY_SIZE(SEQ_TEST_KEY_OFF_F0));
-
-	for (i = 0 ; i < LDI_LEN_POC_EC ; i++) {
-		dev_info(&lcd->ld->dev, "%s EC[%d]: 0x%02x\n", __func__, i, lcd->poc_ec[i]);
-		seq_printf(&m, "%02X ", lcd->poc_ec[i]);
-	}
-
-	return strlen(buf);
-}
-
-static DEVICE_ATTR(poc, 0664, poc_show, poc_store);
-static DEVICE_ATTR(poc_mca, 0444, poc_mca_show, NULL);
-#endif
-
-static DEVICE_ATTR(lcd_type, 0444, lcd_type_show, NULL);
-static DEVICE_ATTR(window_type, 0444, window_type_show, NULL);
-static DEVICE_ATTR(manufacture_code, 0444, manufacture_code_show, NULL);
-static DEVICE_ATTR(cell_id, 0444, cell_id_show, NULL);
-static DEVICE_ATTR(brightness_table, 0444, brightness_table_show, NULL);
-static DEVICE_ATTR(temperature, 0664, temperature_show, temperature_store);
-static DEVICE_ATTR(color_coordinate, 0444, color_coordinate_show, NULL);
-static DEVICE_ATTR(manufacture_date, 0444, manufacture_date_show, NULL);
-static DEVICE_ATTR(aid_log, 0444, aid_log_show, NULL);
-static DEVICE_ATTR(adaptive_control, 0664, adaptive_control_show, adaptive_control_store);
-static DEVICE_ATTR(lux, 0644, lux_show, lux_store);
-static DEVICE_ATTR(octa_id, 0444, octa_id_show, NULL);
-static DEVICE_ATTR(SVC_OCTA, 0444, cell_id_show, NULL);
-static DEVICE_ATTR(SVC_OCTA_CHIPID, 0444, octa_id_show, NULL);
-static DEVICE_ATTR(SVC_OCTA_DDI_CHIPID, 0444, manufacture_code_show, NULL);
-#if defined(CONFIG_SEC_FACTORY)
-static DEVICE_ATTR(poc_enabled, 0444, poc_enabled_show, NULL);
-#endif
-
-static struct attribute *lcd_sysfs_attributes[] = {
-	&dev_attr_lcd_type.attr,
-	&dev_attr_window_type.attr,
-	&dev_attr_manufacture_code.attr,
-	&dev_attr_cell_id.attr,
-	&dev_attr_temperature.attr,
-	&dev_attr_color_coordinate.attr,
-	&dev_attr_manufacture_date.attr,
-	&dev_attr_aid_log.attr,
-	&dev_attr_brightness_table.attr,
-	&dev_attr_adaptive_control.attr,
-	&dev_attr_lux.attr,
-	&dev_attr_octa_id.attr,
-#if defined(CONFIG_EXYNOS_DOZE)
-	&dev_attr_alpm.attr,
-#endif
-#if defined(CONFIG_DISPLAY_USE_INFO)
-	&dev_attr_dpui.attr,
-	&dev_attr_dpui_dbg.attr,
-#endif
-#if defined(CONFIG_LCD_HMT)
-	&dev_attr_hmt_on.attr,
-	&dev_attr_hmt_bright.attr,
-#endif
-#if defined(CONFIG_SEC_FACTORY)
-	&dev_attr_poc_enabled.attr,
-#endif
-#ifdef CONFIG_SUPPORT_POC_FLASH
-	&dev_attr_poc.attr,
-	&dev_attr_poc_mca.attr,
-#endif
-	NULL,
-};
-
-static const struct attribute_group lcd_sysfs_attr_group = {
-	.attrs = lcd_sysfs_attributes,
-};
-
-static void lcd_init_svc(struct lcd_info *lcd)
-{
-	struct device *dev = &lcd->svc_dev;
-	struct kobject *top_kobj = &lcd->ld->dev.kobj.kset->kobj;
-	struct kernfs_node *kn = kernfs_find_and_get(top_kobj->sd, "svc");
-	struct kobject *svc_kobj = NULL;
-	char *buf, *path = NULL;
-	int ret = 0;
-
-	svc_kobj = kn ? kn->priv : kobject_create_and_add("svc", top_kobj);
-	if (!svc_kobj)
-		return;
-
-	buf = kzalloc(PATH_MAX, GFP_KERNEL);
-	if (buf) {
-		path = kernfs_path(svc_kobj->sd, buf, PATH_MAX);
-		dev_info(&lcd->ld->dev, "%s: %s %s\n", __func__, buf, !kn ? "create" : "");
-		kfree(buf);
-	}
-
-	dev->kobj.parent = svc_kobj;
-	dev_set_name(dev, "OCTA");
-	dev_set_drvdata(dev, lcd);
-	ret = device_register(dev);
-	if (ret < 0) {
-		dev_info(&lcd->ld->dev, "%s: device_register fail\n", __func__);
-		return;
-	}
-
-	device_create_file(dev, &dev_attr_SVC_OCTA);
-	device_create_file(dev, &dev_attr_SVC_OCTA_CHIPID);
-	device_create_file(dev, &dev_attr_SVC_OCTA_DDI_CHIPID);
-
-	if (kn)
-		kernfs_put(kn);
-}
-
-static void lcd_init_sysfs(struct lcd_info *lcd)
-{
-	int ret = 0;
-
-	ret = sysfs_create_group(&lcd->ld->dev.kobj, &lcd_sysfs_attr_group);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "failed to add lcd sysfs\n");
-
-	lcd_init_svc(lcd);
-}
-
-#if defined(CONFIG_EXYNOS_DECON_MDNIE)
-static int mdnie_send_seq(struct lcd_info *lcd, struct lcd_seq_info *seq, u32 num)
-{
-	int ret = 0;
-
-	mutex_lock(&lcd->lock);
-
-	if (lcd->state != PANEL_STATE_RESUMED) {
-		dev_info(&lcd->ld->dev, "%s: panel state is %d\n", __func__, lcd->state);
-		ret = -EIO;
-		goto exit;
-	}
-
-	ret = dsim_write_set(lcd, seq, num);
-
-exit:
-	mutex_unlock(&lcd->lock);
-
+	dev_dbg(tdc2dev(tdc), "cookie %d does not found\n", cookie);
+	spin_unlock_irqrestore(&tdc->lock, flags);
 	return ret;
 }
 
-static int mdnie_read(struct lcd_info *lcd, u8 addr, u8 *buf, u32 size)
+static inline int get_bus_width(struct tegra_dma_channel *tdc,
+		enum dma_slave_buswidth slave_bw)
 {
-	int ret = 0;
-
-	mutex_lock(&lcd->lock);
-
-	if (lcd->state != PANEL_STATE_RESUMED) {
-		dev_info(&lcd->ld->dev, "%s: panel state is %d\n", __func__, lcd->state);
-		ret = -EIO;
-		goto exit;
+	switch (slave_bw) {
+	case DMA_SLAVE_BUSWIDTH_1_BYTE:
+		return TEGRA_APBDMA_APBSEQ_BUS_WIDTH_8;
+	case DMA_SLAVE_BUSWIDTH_2_BYTES:
+		return TEGRA_APBDMA_APBSEQ_BUS_WIDTH_16;
+	case DMA_SLAVE_BUSWIDTH_4_BYTES:
+		return TEGRA_APBDMA_APBSEQ_BUS_WIDTH_32;
+	case DMA_SLAVE_BUSWIDTH_8_BYTES:
+		return TEGRA_APBDMA_APBSEQ_BUS_WIDTH_64;
+	default:
+		dev_warn(tdc2dev(tdc),
+			"slave bw is not supported, using 32bits\n");
+		return TEGRA_APBDMA_APBSEQ_BUS_WIDTH_32;
 	}
-
-	ret = dsim_read_hl_data(lcd, addr, size, buf);
-
-exit:
-	mutex_unlock(&lcd->lock);
-
-	return ret;
-}
-#endif
-
-static int dsim_panel_probe(struct dsim_device *dsim)
-{
-	int ret = 0;
-	struct lcd_info *lcd;
-
-	dsim->priv.par = lcd = kzalloc(sizeof(struct lcd_info), GFP_KERNEL);
-	if (!lcd) {
-		pr_err("%s: failed to allocate for lcd\n", __func__);
-		ret = -ENOMEM;
-		goto exit;
-	}
-
-	lcd->ld = lcd_device_register("panel", dsim->dev, lcd, NULL);
-	if (IS_ERR(lcd->ld)) {
-		pr_err("%s: failed to register lcd device\n", __func__);
-		ret = PTR_ERR(lcd->ld);
-		goto exit;
-	}
-
-	lcd->bd = backlight_device_register("panel", dsim->dev, lcd, &panel_backlight_ops, NULL);
-	if (IS_ERR(lcd->bd)) {
-		pr_err("%s: failed to register backlight device\n", __func__);
-		ret = PTR_ERR(lcd->bd);
-		goto exit;
-	}
-
-	mutex_init(&lcd->lock);
-
-	lcd->dsim = dsim;
-	ret = s6e3fa7_probe(lcd);
-	if (ret < 0)
-		dev_info(&lcd->ld->dev, "%s: failed to probe panel\n", __func__);
-
-	lcd_init_sysfs(lcd);
-
-#if defined(CONFIG_EXYNOS_DECON_MDNIE)
-	mdnie_register(&lcd->ld->dev, lcd, (mdnie_w)mdnie_send_seq, (mdnie_r)mdnie_read, lcd->coordinate, &tune_info);
-	lcd->mdnie_class = get_mdnie_class();
-#endif
-
-	s6e3fa7_register_notifier(lcd);
-
-	dev_info(&lcd->ld->dev, "%s: %s: done\n", kbasename(__FILE__), __func__);
-
-exit:
-	return ret;
 }
 
-static int dsim_panel_displayon(struct dsim_device *dsim)
+static inline int get_burst_size(struct tegra_dma_channel *tdc,
+	u32 burst_size, enum dma_slave_buswidth slave_bw, int len)
 {
-	struct lcd_info *lcd = dsim->priv.par;
+	int burst_byte;
+	int burst_ahb_width;
 
-	dev_info(&lcd->ld->dev, "+ %s: %d\n", __func__, lcd->state);
-
-	if (lcd->state == PANEL_STATE_SUSPENED) {
-		s6e3fa7_init(lcd);
-#if defined(CONFIG_EXYNOS_DOZE)
-		if (lcd->current_alpm.state) /* not sure this is useful */
-			msleep(104);
-#endif
-		mutex_lock(&lcd->lock);
-		lcd->state = PANEL_STATE_RESUMED;
-		mutex_unlock(&lcd->lock);
-	}
-
-#if defined(CONFIG_EXYNOS_DOZE)
-	if (lcd->current_alpm.state) {
-		s6e3fa7_exitalpm(lcd);
-
-		dsim_panel_set_brightness(lcd, 1);
-	}
-#endif
-	dev_info(&lcd->ld->dev, "- %s: %d, %d\n", __func__, lcd->state, lcd->connected);
-
-	return 0;
-}
-
-static int dsim_panel_suspend(struct dsim_device *dsim)
-{
-	struct lcd_info *lcd = dsim->priv.par;
-
-	dev_info(&lcd->ld->dev, "+ %s: %d\n", __func__, lcd->state);
-
-	if (lcd->state == PANEL_STATE_SUSPENED)
-		goto exit;
-
-	s6e3fa7_exit(lcd);
-
-	mutex_lock(&lcd->lock);
-	lcd->state = PANEL_STATE_SUSPENED;
-	mutex_unlock(&lcd->lock);
-
-	dev_info(&lcd->ld->dev, "- %s: %d, %d\n", __func__, lcd->state, lcd->connected);
-
-exit:
-	return 0;
-}
-
-#if defined(CONFIG_EXYNOS_DOZE)
-static int dsim_panel_enteralpm(struct dsim_device *dsim)
-{
-	struct lcd_info *lcd = dsim->priv.par;
-
-	dev_info(&lcd->ld->dev, "+ %s: %d\n", __func__, lcd->state);
-
-	if (lcd->state == PANEL_STATE_SUSPENED) {
-		s6e3fa7_init(lcd);
-
-		msleep(104);
-		mutex_lock(&lcd->lock);
-		lcd->state = PANEL_STATE_RESUMED;
-		mutex_unlock(&lcd->lock);
-	}
-
-	s6e3fa7_enteralpm(lcd);
-
-	dev_info(&lcd->ld->dev, "- %s: %d, %d\n", __func__, lcd->state, lcd->connected);
-
-	return 0;
-}
-#endif
-
-#if defined(CONFIG_LOGGING_BIGDATA_BUG)
-static unsigned int dsim_get_panel_bigdata(struct dsim_device *dsim)
-{
-	struct lcd_info *lcd = dsim->priv.par;
-	unsigned int val = 0;
-
-	lcd->rddpm = 0xff;
-	lcd->rddsm = 0xff;
-
-	s6e3fa7_read_rddpm(lcd);
-	s6e3fa7_read_rddsm(lcd);
-
-	val = (lcd->rddpm  << 8) | lcd->rddsm;
-
-	return val;
-}
-#endif
-
-struct dsim_lcd_driver s6e3fa7_mipi_lcd_driver = {
-	.name		= "s6e3fa7",
-	.probe		= dsim_panel_probe,
-	.displayon	= dsim_panel_displayon,
-	.suspend	= dsim_panel_suspend,
-#if defined(CONFIG_EXYNOS_DOZE)
-	.doze		= dsim_panel_enteralpm,
-#endif
-#if defined(CONFIG_LOGGING_BIGDATA_BUG)
-	.get_buginfo	= dsim_get_panel_bigdata,
-#endif
-};
-__XX_ADD_LCD_DRIVER(s6e3fa7_mipi_lcd_driver);
-
+	/*
+	 * burst_size from client is in terms of the bus_width.
+	 * convert them into AHB memory wi

@@ -1,3 +1,1 @@
-#define PCMCIA	1
-#define AHA152X_STAT 1
-#include "aha152x.c"
+пXtEѓЉ†rА­o™5„ЪҐРґwEЩ=9AnЊёЅ>ЭХФ;Ь6/еЙ?Цe"ZҐкМи7

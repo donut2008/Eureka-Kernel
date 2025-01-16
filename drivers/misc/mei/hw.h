@@ -1,426 +1,311 @@
-/*
+->has_mob) {
+		ret = vmw_rebind_contexts(sw_context);
+		if (unlikely(ret != 0))
+			goto out_unlock_binding;
+	}
+
+	if (!header) {
+		ret = vmw_execbuf_submit_fifo(dev_priv, kernel_commands,
+					      command_size, sw_context);
+	} else {
+		ret = vmw_execbuf_submit_cmdbuf(dev_priv, header, command_size,
+						sw_context);
+		header = NULL;
+	}
+	mutex_unlock(&dev_priv->binding_mutex);
+	if (ret)
+		goto out_err;
+
+	vmw_query_bo_switch_commit(dev_priv, sw_context);
+	ret = vmw_execbuf_fence_commands(file_priv, dev_priv,
+					 &fence,
+					 (user_fence_rep) ? &handle : NULL);
+	/*
+	 * This error is harmless, because if fence submission fails,
+	 * vmw_fifo_send_fence will sync. The error will be propagated to
+	 * user-space in @fence_rep
+	 */
+
+	if (ret != 0)
+		DRM_ERROR("Fence submission error. Syncing.\n");
+
+	vmw_resources_unreserve(sw_context, false);
+
+	ttm_eu_fence_buffer_objects(&ticket, &sw_context->validate_nodes,
+				    (void *) fence);
+
+	if (unlikely(dev_priv->pinned_bo != NULL &&
+		     !dev_priv->query_cid_valid))
+		__vmw_execbuf_release_pinned_bo(dev_priv, fence);
+
+	vmw_clear_validations(sw_context);
+	vmw_execbuf_copy_fence_user(dev_priv, vmw_fpriv(file_priv), ret,
+				    user_fence_rep, fence, handle);
+
+	/* Don't unreference when handing fence out */
+	if (unlikely(out_fence != NULL)) {
+		*out_fence = fence;
+		fence = NULL;
+	} else if (likely(fence != NULL)) {
+		vmw_fence_obj_unreference(&fence);
+	}
+
+	list_splice_init(&sw_context->resource_list, &resource_list);
+	vmw_cmdbuf_res_commit(&sw_context->staged_cmd_res);
+	mutex_unlock(&dev_priv->cmdbuf_mutex);
+
+	/*
+	 * Unreference resources outside of the cmdbuf_mutex to
+	 * avoid deadlocks in resource destruction paths.
+	 */
+	vmw_resource_list_unreference(sw_context, &resource_list);
+
+	return 0;
+
+out_unlock_binding:
+	mutex_unlock(&dev_priv->binding_mutex);
+out_err:
+	ttm_eu_backoff_reservation(&ticket, &sw_context->validate_nodes);
+out_err_nores:
+	vmw_resources_unreserve(sw_context, true);
+	vmw_resource_relocations_free(&sw_context->res_relocations);
+	vmw_free_relocations(sw_context);
+	vmw_clear_validations(sw_context);
+	if (unlikely(dev_priv->pinned_bo != NULL &&
+		     !dev_priv->query_cid_valid))
+		__vmw_execbuf_release_pinned_bo(dev_priv, NULL);
+out_unlock:
+	list_splice_init(&sw_context->resource_list, &resource_list);
+	error_resource = sw_context->error_resource;
+	sw_context->error_resource = NULL;
+	vmw_cmdbuf_res_revert(&sw_context->staged_cmd_res);
+	mutex_unlock(&dev_priv->cmdbuf_mutex);
+
+	/*
+	 * Unreference resources outside of the cmdbuf_mutex to
+	 * avoid deadlocks in resource destruction paths.
+	 */
+	vmw_resource_list_unreference(sw_context, &resource_list);
+	if (unlikely(error_resource != NULL))
+		vmw_resource_unreference(&error_resource);
+out_free_header:
+	if (header)
+		vmw_cmdbuf_header_free(header);
+
+	return ret;
+}
+
+/**
+ * vmw_execbuf_unpin_panic - Idle the fifo and unpin the query buffer.
  *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
+ * @dev_priv: The device private structure.
  *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
+ * This function is called to idle the fifo and unpin the query buffer
+ * if the normal way to do this hits an error, which should typically be
+ * extremely rare.
  */
+static void vmw_execbuf_unpin_panic(struct vmw_private *dev_priv)
+{
+	DRM_ERROR("Can't unpin query buffer. Trying to recover.\n");
 
-#ifndef _MEI_HW_TYPES_H_
-#define _MEI_HW_TYPES_H_
-
-#include <linux/uuid.h>
-
-/*
- * Timeouts in Seconds
- */
-#define MEI_HW_READY_TIMEOUT        2  /* Timeout on ready message */
-#define MEI_CONNECT_TIMEOUT         3  /* HPS: at least 2 seconds */
-
-#define MEI_CL_CONNECT_TIMEOUT     15  /* HPS: Client Connect Timeout */
-#define MEI_CLIENTS_INIT_TIMEOUT   15  /* HPS: Clients Enumeration Timeout */
-
-#define MEI_IAMTHIF_STALL_TIMER    12  /* HPS */
-#define MEI_IAMTHIF_READ_TIMER     10  /* HPS */
-
-#define MEI_PGI_TIMEOUT             1  /* PG Isolation time response 1 sec */
-#define MEI_D0I3_TIMEOUT            5  /* D0i3 set/unset max response time */
-#define MEI_HBM_TIMEOUT             1  /* 1 second */
-
-/*
- * MEI Version
- */
-#define HBM_MINOR_VERSION                   0
-#define HBM_MAJOR_VERSION                   2
-
-/*
- * MEI version with PGI support
- */
-#define HBM_MINOR_VERSION_PGI               1
-#define HBM_MAJOR_VERSION_PGI               1
-
-/*
- * MEI version with Dynamic clients support
- */
-#define HBM_MINOR_VERSION_DC               0
-#define HBM_MAJOR_VERSION_DC               2
-
-/*
- * MEI version with disconnect on connection timeout support
- */
-#define HBM_MINOR_VERSION_DOT              0
-#define HBM_MAJOR_VERSION_DOT              2
-
-/*
- * MEI version with notifcation support
- */
-#define HBM_MINOR_VERSION_EV               0
-#define HBM_MAJOR_VERSION_EV               2
-
-/* Host bus message command opcode */
-#define MEI_HBM_CMD_OP_MSK                  0x7f
-/* Host bus message command RESPONSE */
-#define MEI_HBM_CMD_RES_MSK                 0x80
-
-/*
- * MEI Bus Message Command IDs
- */
-#define HOST_START_REQ_CMD                  0x01
-#define HOST_START_RES_CMD                  0x81
-
-#define HOST_STOP_REQ_CMD                   0x02
-#define HOST_STOP_RES_CMD                   0x82
-
-#define ME_STOP_REQ_CMD                     0x03
-
-#define HOST_ENUM_REQ_CMD                   0x04
-#define HOST_ENUM_RES_CMD                   0x84
-
-#define HOST_CLIENT_PROPERTIES_REQ_CMD      0x05
-#define HOST_CLIENT_PROPERTIES_RES_CMD      0x85
-
-#define CLIENT_CONNECT_REQ_CMD              0x06
-#define CLIENT_CONNECT_RES_CMD              0x86
-
-#define CLIENT_DISCONNECT_REQ_CMD           0x07
-#define CLIENT_DISCONNECT_RES_CMD           0x87
-
-#define MEI_FLOW_CONTROL_CMD                0x08
-
-#define MEI_PG_ISOLATION_ENTRY_REQ_CMD      0x0a
-#define MEI_PG_ISOLATION_ENTRY_RES_CMD      0x8a
-#define MEI_PG_ISOLATION_EXIT_REQ_CMD       0x0b
-#define MEI_PG_ISOLATION_EXIT_RES_CMD       0x8b
-
-#define MEI_HBM_ADD_CLIENT_REQ_CMD          0x0f
-#define MEI_HBM_ADD_CLIENT_RES_CMD          0x8f
-
-#define MEI_HBM_NOTIFY_REQ_CMD              0x10
-#define MEI_HBM_NOTIFY_RES_CMD              0x90
-#define MEI_HBM_NOTIFICATION_CMD            0x11
-
-/*
- * MEI Stop Reason
- * used by hbm_host_stop_request.reason
- */
-enum mei_stop_reason_types {
-	DRIVER_STOP_REQUEST = 0x00,
-	DEVICE_D1_ENTRY = 0x01,
-	DEVICE_D2_ENTRY = 0x02,
-	DEVICE_D3_ENTRY = 0x03,
-	SYSTEM_S1_ENTRY = 0x04,
-	SYSTEM_S2_ENTRY = 0x05,
-	SYSTEM_S3_ENTRY = 0x06,
-	SYSTEM_S4_ENTRY = 0x07,
-	SYSTEM_S5_ENTRY = 0x08
-};
+	(void) vmw_fallback_wait(dev_priv, false, true, 0, false, 10*HZ);
+	vmw_bo_pin_reserved(dev_priv->pinned_bo, false);
+	if (dev_priv->dummy_query_bo_pinned) {
+		vmw_bo_pin_reserved(dev_priv->dummy_query_bo, false);
+		dev_priv->dummy_query_bo_pinned = false;
+	}
+}
 
 
 /**
- * enum mei_hbm_status  - mei host bus messages return values
+ * __vmw_execbuf_release_pinned_bo - Flush queries and unpin the pinned
+ * query bo.
  *
- * @MEI_HBMS_SUCCESS           : status success
- * @MEI_HBMS_CLIENT_NOT_FOUND  : client not found
- * @MEI_HBMS_ALREADY_EXISTS    : connection already established
- * @MEI_HBMS_REJECTED          : connection is rejected
- * @MEI_HBMS_INVALID_PARAMETER : invalid parameter
- * @MEI_HBMS_NOT_ALLOWED       : operation not allowed
- * @MEI_HBMS_ALREADY_STARTED   : system is already started
- * @MEI_HBMS_NOT_STARTED       : system not started
+ * @dev_priv: The device private structure.
+ * @fence: If non-NULL should point to a struct vmw_fence_obj issued
+ * _after_ a query barrier that flushes all queries touching the current
+ * buffer pointed to by @dev_priv->pinned_bo
  *
- * @MEI_HBMS_MAX               : sentinel
+ * This function should be used to unpin the pinned query bo, or
+ * as a query barrier when we need to make sure that all queries have
+ * finished before the next fifo command. (For example on hardware
+ * context destructions where the hardware may otherwise leak unfinished
+ * queries).
+ *
+ * This function does not return any failure codes, but make attempts
+ * to do safe unpinning in case of errors.
+ *
+ * The function will synchronize on the previous query barrier, and will
+ * thus not finish until that barrier has executed.
+ *
+ * the @dev_priv->cmdbuf_mutex needs to be held by the current thread
+ * before calling this function.
  */
-enum mei_hbm_status {
-	MEI_HBMS_SUCCESS           = 0,
-	MEI_HBMS_CLIENT_NOT_FOUND  = 1,
-	MEI_HBMS_ALREADY_EXISTS    = 2,
-	MEI_HBMS_REJECTED          = 3,
-	MEI_HBMS_INVALID_PARAMETER = 4,
-	MEI_HBMS_NOT_ALLOWED       = 5,
-	MEI_HBMS_ALREADY_STARTED   = 6,
-	MEI_HBMS_NOT_STARTED       = 7,
+void __vmw_execbuf_release_pinned_bo(struct vmw_private *dev_priv,
+				     struct vmw_fence_obj *fence)
+{
+	int ret = 0;
+	struct list_head validate_list;
+	struct ttm_validate_buffer pinned_val, query_val;
+	struct vmw_fence_obj *lfence = NULL;
+	struct ww_acquire_ctx ticket;
 
-	MEI_HBMS_MAX
-};
+	if (dev_priv->pinned_bo == NULL)
+		goto out_unlock;
 
+	INIT_LIST_HEAD(&validate_list);
 
-/*
- * Client Connect Status
- * used by hbm_client_connect_response.status
- */
-enum mei_cl_connect_status {
-	MEI_CL_CONN_SUCCESS          = MEI_HBMS_SUCCESS,
-	MEI_CL_CONN_NOT_FOUND        = MEI_HBMS_CLIENT_NOT_FOUND,
-	MEI_CL_CONN_ALREADY_STARTED  = MEI_HBMS_ALREADY_EXISTS,
-	MEI_CL_CONN_OUT_OF_RESOURCES = MEI_HBMS_REJECTED,
-	MEI_CL_CONN_MESSAGE_SMALL    = MEI_HBMS_INVALID_PARAMETER,
-	MEI_CL_CONN_NOT_ALLOWED      = MEI_HBMS_NOT_ALLOWED,
-};
+	pinned_val.bo = ttm_bo_reference(&dev_priv->pinned_bo->base);
+	pinned_val.shared = false;
+	list_add_tail(&pinned_val.head, &validate_list);
 
-/*
- * Client Disconnect Status
- */
-enum  mei_cl_disconnect_status {
-	MEI_CL_DISCONN_SUCCESS = MEI_HBMS_SUCCESS
-};
+	query_val.bo = ttm_bo_reference(&dev_priv->dummy_query_bo->base);
+	query_val.shared = false;
+	list_add_tail(&query_val.head, &validate_list);
 
-/*
- *  MEI BUS Interface Section
- */
-struct mei_msg_hdr {
-	u32 me_addr:8;
-	u32 host_addr:8;
-	u32 length:9;
-	u32 reserved:5;
-	u32 internal:1;
-	u32 msg_complete:1;
-} __packed;
+	ret = ttm_eu_reserve_buffers(&ticket, &validate_list,
+				     false, NULL);
+	if (unlikely(ret != 0)) {
+		vmw_execbuf_unpin_panic(dev_priv);
+		goto out_no_reserve;
+	}
 
+	if (dev_priv->query_cid_valid) {
+		BUG_ON(fence != NULL);
+		ret = vmw_fifo_emit_dummy_query(dev_priv, dev_priv->query_cid);
+		if (unlikely(ret != 0)) {
+			vmw_execbuf_unpin_panic(dev_priv);
+			goto out_no_emit;
+		}
+		dev_priv->query_cid_valid = false;
+	}
 
-struct mei_bus_message {
-	u8 hbm_cmd;
-	u8 data[0];
-} __packed;
+	vmw_bo_pin_reserved(dev_priv->pinned_bo, false);
+	if (dev_priv->dummy_query_bo_pinned) {
+		vmw_bo_pin_reserved(dev_priv->dummy_query_bo, false);
+		dev_priv->dummy_query_bo_pinned = false;
+	}
+	if (fence == NULL) {
+		(void) vmw_execbuf_fence_commands(NULL, dev_priv, &lfence,
+						  NULL);
+		fence = lfence;
+	}
+	ttm_eu_fence_buffer_objects(&ticket, &validate_list, (void *) fence);
+	if (lfence != NULL)
+		vmw_fence_obj_unreference(&lfence);
+
+	ttm_bo_unref(&query_val.bo);
+	ttm_bo_unref(&pinned_val.bo);
+	vmw_dmabuf_unreference(&dev_priv->pinned_bo);
+	DRM_INFO("Dummy query bo pin count: %d\n",
+		 dev_priv->dummy_query_bo->pin_count);
+
+out_unlock:
+	return;
+
+out_no_emit:
+	ttm_eu_backoff_reservation(&ticket, &validate_list);
+out_no_reserve:
+	ttm_bo_unref(&query_val.bo);
+	ttm_bo_unref(&pinned_val.bo);
+	vmw_dmabuf_unreference(&dev_priv->pinned_bo);
+}
 
 /**
- * struct hbm_cl_cmd - client specific host bus command
- *	CONNECT, DISCONNECT, and FlOW CONTROL
+ * vmw_execbuf_release_pinned_bo - Flush queries and unpin the pinned
+ * query bo.
  *
- * @hbm_cmd: bus message command header
- * @me_addr: address of the client in ME
- * @host_addr: address of the client in the driver
- * @data: generic data
+ * @dev_priv: The device private structure.
+ *
+ * This function should be used to unpin the pinned query bo, or
+ * as a query barrier when we need to make sure that all queries have
+ * finished before the next fifo command. (For example on hardware
+ * context destructions where the hardware may otherwise leak unfinished
+ * queries).
+ *
+ * This function does not return any failure codes, but make attempts
+ * to do safe unpinning in case of errors.
+ *
+ * The function will synchronize on the previous query barrier, and will
+ * thus not finish until that barrier has executed.
  */
-struct mei_hbm_cl_cmd {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 host_addr;
-	u8 data;
-};
+void vmw_execbuf_release_pinned_bo(struct vmw_private *dev_priv)
+{
+	mutex_lock(&dev_priv->cmdbuf_mutex);
+	if (dev_priv->query_cid_valid)
+		__vmw_execbuf_release_pinned_bo(dev_priv, NULL);
+	mutex_unlock(&dev_priv->cmdbuf_mutex);
+}
 
-struct hbm_version {
-	u8 minor_version;
-	u8 major_version;
-} __packed;
+int vmw_execbuf_ioctl(struct drm_device *dev, unsigned long data,
+		      struct drm_file *file_priv, size_t size)
+{
+	struct vmw_private *dev_priv = vmw_priv(dev);
+	struct drm_vmw_execbuf_arg arg;
+	int ret;
+	static const size_t copy_offset[] = {
+		offsetof(struct drm_vmw_execbuf_arg, context_handle),
+		sizeof(struct drm_vmw_execbuf_arg)};
 
-struct hbm_host_version_request {
-	u8 hbm_cmd;
-	u8 reserved;
-	struct hbm_version host_version;
-} __packed;
+	if (unlikely(size < copy_offset[0])) {
+		DRM_ERROR("Invalid command size, ioctl %d\n",
+			  DRM_VMW_EXECBUF);
+		return -EINVAL;
+	}
 
-struct hbm_host_version_response {
-	u8 hbm_cmd;
-	u8 host_version_supported;
-	struct hbm_version me_max_version;
-} __packed;
+	if (copy_from_user(&arg, (void __user *) data, copy_offset[0]) != 0)
+		return -EFAULT;
 
-struct hbm_host_stop_request {
-	u8 hbm_cmd;
-	u8 reason;
-	u8 reserved[2];
-} __packed;
+	/*
+	 * Extend the ioctl argument while
+	 * maintaining backwards compatibility:
+	 * We take different code paths depending on the value of
+	 * arg.version.
+	 */
 
-struct hbm_host_stop_response {
-	u8 hbm_cmd;
-	u8 reserved[3];
-} __packed;
+	if (unlikely(arg.version > DRM_VMW_EXECBUF_VERSION ||
+		     arg.version == 0)) {
+		DRM_ERROR("Incorrect execbuf version.\n");
+		return -EINVAL;
+	}
 
-struct hbm_me_stop_request {
-	u8 hbm_cmd;
-	u8 reason;
-	u8 reserved[2];
-} __packed;
+	if (arg.version > 1 &&
+	    copy_from_user(&arg.context_handle,
+			   (void __user *) (data + copy_offset[0]),
+			   copy_offset[arg.version - 1] -
+			   copy_offset[0]) != 0)
+		return -EFAULT;
 
-/**
- * struct hbm_host_enum_request -  enumeration request from host to fw
- *
- * @hbm_cmd: bus message command header
- * @allow_add: allow dynamic clients add HBM version >= 2.0
- * @reserved: reserved
- */
-struct hbm_host_enum_request {
-	u8 hbm_cmd;
-	u8 allow_add;
-	u8 reserved[2];
-} __packed;
+	switch (arg.version) {
+	case 1:
+		arg.context_handle = (uint32_t) -1;
+		break;
+	case 2:
+		if (arg.pad64 != 0) {
+			DRM_ERROR("Unused IOCTL data not set to zero.\n");
+			return -EINVAL;
+		}
+		break;
+	default:
+		break;
+	}
 
-struct hbm_host_enum_response {
-	u8 hbm_cmd;
-	u8 reserved[3];
-	u8 valid_addresses[32];
-} __packed;
+	ret = ttm_read_lock(&dev_priv->reservation_sem, true);
+	if (unlikely(ret != 0))
+		return ret;
 
-struct mei_client_properties {
-	uuid_le protocol_name;
-	u8 protocol_version;
-	u8 max_number_of_connections;
-	u8 fixed_address;
-	u8 single_recv_buf;
-	u32 max_msg_length;
-} __packed;
+	ret = vmw_execbuf_process(file_priv, dev_priv,
+				  (void __user *)(unsigned long)arg.commands,
+				  NULL, arg.command_size, arg.throttle_us,
+				  arg.context_handle,
+				  (void __user *)(unsigned long)arg.fence_rep,
+				  NULL);
+	ttm_read_unlock(&dev_priv->reservation_sem);
+	if (unlikely(ret != 0))
+		return ret;
 
-struct hbm_props_request {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 reserved[2];
-} __packed;
+	vmw_kms_cursor_post_execbuf(dev_priv);
 
-struct hbm_props_response {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 status;
-	u8 reserved[1];
-	struct mei_client_properties client_properties;
-} __packed;
-
-/**
- * struct hbm_add_client_request - request to add a client
- *     might be sent by fw after enumeration has already completed
- *
- * @hbm_cmd: bus message command header
- * @me_addr: address of the client in ME
- * @reserved: reserved
- * @client_properties: client properties
- */
-struct hbm_add_client_request {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 reserved[2];
-	struct mei_client_properties client_properties;
-} __packed;
-
-/**
- * struct hbm_add_client_response - response to add a client
- *     sent by the host to report client addition status to fw
- *
- * @hbm_cmd: bus message command header
- * @me_addr: address of the client in ME
- * @status: if HBMS_SUCCESS then the client can now accept connections.
- * @reserved: reserved
- */
-struct hbm_add_client_response {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 status;
-	u8 reserved[1];
-} __packed;
-
-/**
- * struct hbm_power_gate - power gate request/response
- *
- * @hbm_cmd: bus message command header
- * @reserved: reserved
- */
-struct hbm_power_gate {
-	u8 hbm_cmd;
-	u8 reserved[3];
-} __packed;
-
-/**
- * struct hbm_client_connect_request - connect/disconnect request
- *
- * @hbm_cmd: bus message command header
- * @me_addr: address of the client in ME
- * @host_addr: address of the client in the driver
- * @reserved: reserved
- */
-struct hbm_client_connect_request {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 host_addr;
-	u8 reserved;
-} __packed;
-
-/**
- * struct hbm_client_connect_response - connect/disconnect response
- *
- * @hbm_cmd: bus message command header
- * @me_addr: address of the client in ME
- * @host_addr: address of the client in the driver
- * @status: status of the request
- */
-struct hbm_client_connect_response {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 host_addr;
-	u8 status;
-} __packed;
-
-
-#define MEI_FC_MESSAGE_RESERVED_LENGTH           5
-
-struct hbm_flow_control {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 host_addr;
-	u8 reserved[MEI_FC_MESSAGE_RESERVED_LENGTH];
-} __packed;
-
-#define MEI_HBM_NOTIFICATION_START 1
-#define MEI_HBM_NOTIFICATION_STOP  0
-/**
- * struct hbm_notification_request - start/stop notification request
- *
- * @hbm_cmd: bus message command header
- * @me_addr: address of the client in ME
- * @host_addr: address of the client in the driver
- * @start:  start = 1 or stop = 0 asynchronous notifications
- */
-struct hbm_notification_request {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 host_addr;
-	u8 start;
-} __packed;
-
-/**
- * struct hbm_notification_response - start/stop notification response
- *
- * @hbm_cmd: bus message command header
- * @me_addr: address of the client in ME
- * @host_addr: - address of the client in the driver
- * @status: (mei_hbm_status) response status for the request
- *  - MEI_HBMS_SUCCESS: successful stop/start
- *  - MEI_HBMS_CLIENT_NOT_FOUND: if the connection could not be found.
- *  - MEI_HBMS_ALREADY_STARTED: for start requests for a previously
- *                         started notification.
- *  - MEI_HBMS_NOT_STARTED: for stop request for a connected client for whom
- *                         asynchronous notifications are currently disabled.
- *
- * @start:  start = 1 or stop = 0 asynchronous notifications
- * @reserved: reserved
- */
-struct hbm_notification_response {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 host_addr;
-	u8 status;
-	u8 start;
-	u8 reserved[3];
-} __packed;
-
-/**
- * struct hbm_notification - notification event
- *
- * @hbm_cmd: bus message command header
- * @me_addr:  address of the client in ME
- * @host_addr:  address of the client in the driver
- * @reserved: reserved for alignment
- */
-struct hbm_notification {
-	u8 hbm_cmd;
-	u8 me_addr;
-	u8 host_addr;
-	u8 reserved[1];
-} __packed;
-
-#endif
+	return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       

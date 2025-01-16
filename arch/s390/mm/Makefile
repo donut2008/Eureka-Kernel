@@ -1,10 +1,22 @@
-#
-# Makefile for the linux s390-specific parts of the memory manager.
-#
 
-obj-y		:= init.o fault.o extmem.o mmap.o vmem.o pgtable.o maccess.o
-obj-y		+= page-states.o gup.o extable.o pageattr.o mem_detect.o
+	u_char  pad2[0x1a];
+	u_short hht;
+	u_short hbb;
+	u_short hbe;
+	u_short hdb;
+	u_short hde;
+	u_short hss;
+	u_char  pad3[0x14];
+	u_short vft;
+	u_short vbb;
+	u_short vbe;
+	u_short vdb;
+	u_short vde;
+	u_short vss;
+	u_char  pad4[0x12];
+	u_short control;
+	u_short mode;
+};
+#define	videl	((*(volatile struct VIDEL *)VIDEL_BAS))
 
-obj-$(CONFIG_CMM)		+= cmm.o
-obj-$(CONFIG_HUGETLB_PAGE)	+= hugetlbpage.o
-obj-$(CONFIG_S390_PTDUMP)	+= dump_pagetables.o
+/*

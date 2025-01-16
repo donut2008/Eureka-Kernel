@@ -1,153 +1,46 @@
-/*
- * Generic UHCI HCD (Host Controller Driver) for Platform Devices
- *
- * Copyright (c) 2011 Tony Prisk <linux@prisktech.co.nz>
- *
- * This file is based on uhci-grlib.c
- * (C) Copyright 2004-2007 Alan Stern, stern@rowland.harvard.edu
- */
-
-#include <linux/of.h>
-#include <linux/device.h>
-#include <linux/platform_device.h>
-
-static int uhci_platform_init(struct usb_hcd *hcd)
-{
-	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
-
-	uhci->rh_numports = uhci_count_ports(hcd);
-
-	/* Set up pointers to to generic functions */
-	uhci->reset_hc = uhci_generic_reset_hc;
-	uhci->check_and_reset_hc = uhci_generic_check_and_reset_hc;
-
-	/* No special actions need to be taken for the functions below */
-	uhci->configure_hc = NULL;
-	uhci->resume_detect_interrupts_are_broken = NULL;
-	uhci->global_suspend_mode_is_broken = NULL;
-
-	/* Reset if the controller isn't already safely quiescent. */
-	check_and_reset_hc(uhci);
-	return 0;
-}
-
-static const struct hc_driver uhci_platform_hc_driver = {
-	.description =		hcd_name,
-	.product_desc =		"Generic UHCI Host Controller",
-	.hcd_priv_size =	sizeof(struct uhci_hcd),
-
-	/* Generic hardware linkage */
-	.irq =			uhci_irq,
-	.flags =		HCD_MEMORY | HCD_USB11,
-
-	/* Basic lifecycle operations */
-	.reset =		uhci_platform_init,
-	.start =		uhci_start,
-#ifdef CONFIG_PM
-	.pci_suspend =		NULL,
-	.pci_resume =		NULL,
-	.bus_suspend =		uhci_rh_suspend,
-	.bus_resume =		uhci_rh_resume,
-#endif
-	.stop =			uhci_stop,
-
-	.urb_enqueue =		uhci_urb_enqueue,
-	.urb_dequeue =		uhci_urb_dequeue,
-
-	.endpoint_disable =	uhci_hcd_endpoint_disable,
-	.get_frame_number =	uhci_hcd_get_frame_number,
-
-	.hub_status_data =	uhci_hub_status_data,
-	.hub_control =		uhci_hub_control,
-};
-
-static int uhci_hcd_platform_probe(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd;
-	struct uhci_hcd	*uhci;
-	struct resource *res;
-	int ret;
-
-	if (usb_disabled())
-		return -ENODEV;
-
-	/*
-	 * Right now device-tree probed devices don't get dma_mask set.
-	 * Since shared usb code relies on it, set it here for now.
-	 * Once we have dma capability bindings this can go away.
-	 */
-	ret = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (ret)
-		return ret;
-
-	hcd = usb_create_hcd(&uhci_platform_hc_driver, &pdev->dev,
-			pdev->name);
-	if (!hcd)
-		return -ENOMEM;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(hcd->regs)) {
-		ret = PTR_ERR(hcd->regs);
-		goto err_rmr;
-	}
-	hcd->rsrc_start = res->start;
-	hcd->rsrc_len = resource_size(res);
-
-	uhci = hcd_to_uhci(hcd);
-
-	uhci->regs = hcd->regs;
-
-	ret = usb_add_hcd(hcd, pdev->resource[1].start, IRQF_SHARED);
-	if (ret)
-		goto err_rmr;
-
-	device_wakeup_enable(hcd->self.controller);
-	return 0;
-
-err_rmr:
-	usb_put_hcd(hcd);
-
-	return ret;
-}
-
-static int uhci_hcd_platform_remove(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-
-	usb_remove_hcd(hcd);
-	usb_put_hcd(hcd);
-
-	return 0;
-}
-
-/* Make sure the controller is quiescent and that we're not using it
- * any more.  This is mainly for the benefit of programs which, like kexec,
- * expect the hardware to be idle: not doing DMA or generating IRQs.
- *
- * This routine may be called in a damaged or failing kernel.  Hence we
- * do not acquire the spinlock before shutting down the controller.
- */
-static void uhci_hcd_platform_shutdown(struct platform_device *op)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(op);
-
-	uhci_hc_died(hcd_to_uhci(hcd));
-}
-
-static const struct of_device_id platform_uhci_ids[] = {
-	{ .compatible = "generic-uhci", },
-	{ .compatible = "platform-uhci", },
-	{}
-};
-MODULE_DEVICE_TABLE(of, platform_uhci_ids);
-
-static struct platform_driver uhci_platform_driver = {
-	.probe		= uhci_hcd_platform_probe,
-	.remove		= uhci_hcd_platform_remove,
-	.shutdown	= uhci_hcd_platform_shutdown,
-	.driver = {
-		.name = "platform-uhci",
-		.of_match_table = platform_uhci_ids,
-	},
-};
+        0x418a
+#define mmCRTC4_CRTC_V_TOTAL_CONTROL                                            0x438a
+#define mmCRTC5_CRTC_V_TOTAL_CONTROL                                            0x458a
+#define mmCRTC6_CRTC_V_TOTAL_CONTROL                                            0x478a
+#define mmCRTC_V_TOTAL_INT_STATUS                                               0x1b8b
+#define mmCRTC0_CRTC_V_TOTAL_INT_STATUS                                         0x1b8b
+#define mmCRTC1_CRTC_V_TOTAL_INT_STATUS                                         0x1d8b
+#define mmCRTC2_CRTC_V_TOTAL_INT_STATUS                                         0x1f8b
+#define mmCRTC3_CRTC_V_TOTAL_INT_STATUS                                         0x418b
+#define mmCRTC4_CRTC_V_TOTAL_INT_STATUS                                         0x438b
+#define mmCRTC5_CRTC_V_TOTAL_INT_STATUS                                         0x458b
+#define mmCRTC6_CRTC_V_TOTAL_INT_STATUS                                         0x478b
+#define mmCRTC_VSYNC_NOM_INT_STATUS                                             0x1b8c
+#define mmCRTC0_CRTC_VSYNC_NOM_INT_STATUS                                       0x1b8c
+#define mmCRTC1_CRTC_VSYNC_NOM_INT_STATUS                                       0x1d8c
+#define mmCRTC2_CRTC_VSYNC_NOM_INT_STATUS                                       0x1f8c
+#define mmCRTC3_CRTC_VSYNC_NOM_INT_STATUS                                       0x418c
+#define mmCRTC4_CRTC_VSYNC_NOM_INT_STATUS                                       0x438c
+#define mmCRTC5_CRTC_VSYNC_NOM_INT_STATUS                                       0x458c
+#define mmCRTC6_CRTC_VSYNC_NOM_INT_STATUS                                       0x478c
+#define mmCRTC_V_BLANK_START_END                                                0x1b8d
+#define mmCRTC0_CRTC_V_BLANK_START_END                                          0x1b8d
+#define mmCRTC1_CRTC_V_BLANK_START_END                                          0x1d8d
+#define mmCRTC2_CRTC_V_BLANK_START_END                                          0x1f8d
+#define mmCRTC3_CRTC_V_BLANK_START_END                                          0x418d
+#define mmCRTC4_CRTC_V_BLANK_START_END                                          0x438d
+#define mmCRTC5_CRTC_V_BLANK_START_END                                          0x458d
+#define mmCRTC6_CRTC_V_BLANK_START_END                                          0x478d
+#define mmCRTC_V_SYNC_A                                                         0x1b8e
+#define mmCRTC0_CRTC_V_SYNC_A                                                   0x1b8e
+#define mmCRTC1_CRTC_V_SYNC_A                                                   0x1d8e
+#define mmCRTC2_CRTC_V_SYNC_A                                                   0x1f8e
+#define mmCRTC3_CRTC_V_SYNC_A                                                   0x418e
+#define mmCRTC4_CRTC_V_SYNC_A                                                   0x438e
+#define mmCRTC5_CRTC_V_SYNC_A                                                   0x458e
+#define mmCRTC6_CRTC_V_SYNC_A                                                   0x478e
+#define mmCRTC_V_SYNC_A_CNTL                                                    0x1b8f
+#define mmCRTC0_CRTC_V_SYNC_A_CNTL                                              0x1b8f
+#define mmCRTC1_CRTC_V_SYNC_A_CNTL                                              0x1d8f
+#define mmCRTC2_CRTC_V_SYNC_A_CNTL                                              0x1f8f
+#define mmCRTC3_CRTC_V_SYNC_A_CNTL                                              0x418f
+#define mmCRTC4_CRTC_V_SYNC_A_CNTL                                              0x438f
+#define mmCRTC5_CRTC_V_SYNC_A_CNTL                                              0x458f
+#define mmCRTC6_CRTC_V_SYNC_A_CNTL                                              0x478f
+#define mmCRTC_V_SYNC_B                                                         0x1b90
+#define mmCRTC0_CRTC_V_SYNC_B      

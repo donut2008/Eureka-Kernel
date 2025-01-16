@@ -1,104 +1,95 @@
-/*
- * Hypervisor filesystem for Linux on s390 - debugfs interface
+#define NIPR_STEP_VALUE_SHIFT	0
+#define NIPR_SELECT_MASK	0x0700	/* Tap Selection */
+#define NIPR_SELECT_SHIFT	8
+#define NIPR_PRE_SEL		0x8000	/* Non-integer prescaler select */
+
+
+/* generalization of uart control registers to support multiple ports: */
+typedef struct {
+  volatile unsigned short int ustcnt;
+  volatile unsigned short int ubaud;
+  union {
+    volatile unsigned short int w;
+    struct {
+      volatile unsigned char status;
+      volatile unsigned char rxdata;
+    } b;
+  } urx;
+  union {
+    volatile unsigned short int w;
+    struct {
+      volatile unsigned char status;
+      volatile unsigned char txdata;
+    } b;
+  } utx;
+  volatile unsigned short int umisc;
+  volatile unsigned short int nipr;
+  volatile unsigned short int hmark;
+  volatile unsigned short int unused;
+} __attribute__((packed)) m68328_uart;
+
+
+
+
+/**********
  *
- * Copyright IBM Corp. 2010
- * Author(s): Michael Holzheu <holzheu@linux.vnet.ibm.com>
+ * 0xFFFFFAxx -- LCD Controller
+ *
+ **********/
+
+/*
+ * LCD Screen Starting Address Register 
  */
+#define LSSA_ADDR	0xfffffa00
+#define LSSA		LONG_REF(LSSA_ADDR)
 
-#include <linux/slab.h>
-#include "hypfs.h"
+#define LSSA_SSA_MASK	0x1ffffffe	/* Bits 0 and 29-31 are reserved */
 
-static struct dentry *dbfs_dir;
+/*
+ * LCD Virtual Page Width Register 
+ */
+#define LVPW_ADDR	0xfffffa05
+#define LVPW		BYTE_REF(LVPW_ADDR)
 
-static struct hypfs_dbfs_data *hypfs_dbfs_data_alloc(struct hypfs_dbfs_file *f)
-{
-	struct hypfs_dbfs_data *data;
+/*
+ * LCD Screen Width Register (not compatible with '328 !!!) 
+ */
+#define LXMAX_ADDR	0xfffffa08
+#define LXMAX		WORD_REF(LXMAX_ADDR)
 
-	data = kmalloc(sizeof(*data), GFP_KERNEL);
-	if (!data)
-		return NULL;
-	data->dbfs_file = f;
-	return data;
-}
+#define LXMAX_XM_MASK	0x02f0		/* Bits 0-3 and 10-15 are reserved */
 
-static void hypfs_dbfs_data_free(struct hypfs_dbfs_data *data)
-{
-	data->dbfs_file->data_free(data->buf_free_ptr);
-	kfree(data);
-}
+/*
+ * LCD Screen Height Register
+ */
+#define LYMAX_ADDR	0xfffffa0a
+#define LYMAX		WORD_REF(LYMAX_ADDR)
 
-static ssize_t dbfs_read(struct file *file, char __user *buf,
-			 size_t size, loff_t *ppos)
-{
-	struct hypfs_dbfs_data *data;
-	struct hypfs_dbfs_file *df;
-	ssize_t rc;
+#define LYMAX_YM_MASK	0x01ff		/* Bits 9-15 are reserved */
 
-	if (*ppos != 0)
-		return 0;
+/*
+ * LCD Cursor X Position Register
+ */
+#define LCXP_ADDR	0xfffffa18
+#define LCXP		WORD_REF(LCXP_ADDR)
 
-	df = file_inode(file)->i_private;
-	mutex_lock(&df->lock);
-	data = hypfs_dbfs_data_alloc(df);
-	if (!data) {
-		mutex_unlock(&df->lock);
-		return -ENOMEM;
-	}
-	rc = df->data_create(&data->buf, &data->buf_free_ptr, &data->size);
-	if (rc) {
-		mutex_unlock(&df->lock);
-		kfree(data);
-		return rc;
-	}
-	mutex_unlock(&df->lock);
+#define LCXP_CC_MASK	0xc000		/* Cursor Control */
+#define   LCXP_CC_TRAMSPARENT	0x0000
+#define   LCXP_CC_BLACK		0x4000
+#define   LCXP_CC_REVERSED	0x8000
+#define   LCXP_CC_WHITE		0xc000
+#define LCXP_CXP_MASK	0x02ff		/* Cursor X position */
 
-	rc = simple_read_from_buffer(buf, size, ppos, data->buf, data->size);
-	hypfs_dbfs_data_free(data);
-	return rc;
-}
+/*
+ * LCD Cursor Y Position Register
+ */
+#define LCYP_ADDR	0xfffffa1a
+#define LCYP		WORD_REF(LCYP_ADDR)
 
-static long dbfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	struct hypfs_dbfs_file *df = file_inode(file)->i_private;
-	long rc;
+#define LCYP_CYP_MASK	0x01ff		/* Cursor Y Position */
 
-	mutex_lock(&df->lock);
-	if (df->unlocked_ioctl)
-		rc = df->unlocked_ioctl(file, cmd, arg);
-	else
-		rc = -ENOTTY;
-	mutex_unlock(&df->lock);
-	return rc;
-}
-
-static const struct file_operations dbfs_ops = {
-	.read		= dbfs_read,
-	.llseek		= no_llseek,
-	.unlocked_ioctl = dbfs_ioctl,
-};
-
-int hypfs_dbfs_create_file(struct hypfs_dbfs_file *df)
-{
-	df->dentry = debugfs_create_file(df->name, 0400, dbfs_dir, df,
-					 &dbfs_ops);
-	if (IS_ERR(df->dentry))
-		return PTR_ERR(df->dentry);
-	mutex_init(&df->lock);
-	return 0;
-}
-
-void hypfs_dbfs_remove_file(struct hypfs_dbfs_file *df)
-{
-	debugfs_remove(df->dentry);
-}
-
-int hypfs_dbfs_init(void)
-{
-	dbfs_dir = debugfs_create_dir("s390_hypfs", NULL);
-	return PTR_ERR_OR_ZERO(dbfs_dir);
-}
-
-void hypfs_dbfs_exit(void)
-{
-	debugfs_remove(dbfs_dir);
-}
+/*
+ * LCD Cursor Width and Heigth Register
+ */
+#define LCWCH_ADDR	0xfffffa1c
+#define LCWCH		WORD_RE

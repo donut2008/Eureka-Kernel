@@ -1,966 +1,507 @@
-/******************************************************************************
- *  speedtch.c  -  Alcatel SpeedTouch USB xDSL modem driver
- *
- *  Copyright (C) 2001, Alcatel
- *  Copyright (C) 2003, Duncan Sands
- *  Copyright (C) 2004, David Woodhouse
- *
- *  Based on "modem_run.c", copyright (C) 2001, Benoit Papillault
- *
- *  This program is free software; you can redistribute it and/or modify it
- *  under the terms of the GNU General Public License as published by the Free
- *  Software Foundation; either version 2 of the License, or (at your option)
- *  any later version.
- *
- *  This program is distributed in the hope that it will be useful, but WITHOUT
- *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- *  more details.
- *
- *  You should have received a copy of the GNU General Public License along with
- *  this program; if not, write to the Free Software Foundation, Inc., 59
- *  Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- *
- ******************************************************************************/
-
-#include <asm/page.h>
-#include <linux/device.h>
-#include <linux/errno.h>
-#include <linux/firmware.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/slab.h>
-#include <linux/stat.h>
-#include <linux/timer.h>
-#include <linux/types.h>
-#include <linux/usb/ch9.h>
-#include <linux/workqueue.h>
-
-#include "usbatm.h"
-
-#define DRIVER_AUTHOR	"Johan Verrept, Duncan Sands <duncan.sands@free.fr>"
-#define DRIVER_VERSION	"1.10"
-#define DRIVER_DESC	"Alcatel SpeedTouch USB driver version " DRIVER_VERSION
-
-static const char speedtch_driver_name[] = "speedtch";
-
-#define CTRL_TIMEOUT 2000	/* milliseconds */
-#define DATA_TIMEOUT 2000	/* milliseconds */
-
-#define OFFSET_7	0		/* size 1 */
-#define OFFSET_b	1		/* size 8 */
-#define OFFSET_d	9		/* size 4 */
-#define OFFSET_e	13		/* size 1 */
-#define OFFSET_f	14		/* size 1 */
-
-#define SIZE_7		1
-#define SIZE_b		8
-#define SIZE_d		4
-#define SIZE_e		1
-#define SIZE_f		1
-
-#define MIN_POLL_DELAY		5000	/* milliseconds */
-#define MAX_POLL_DELAY		60000	/* milliseconds */
-
-#define RESUBMIT_DELAY		1000	/* milliseconds */
-
-#define DEFAULT_BULK_ALTSETTING	1
-#define DEFAULT_ISOC_ALTSETTING	3
-#define DEFAULT_DL_512_FIRST	0
-#define DEFAULT_ENABLE_ISOC	0
-#define DEFAULT_SW_BUFFERING	0
-
-static unsigned int altsetting = 0; /* zero means: use the default */
-static bool dl_512_first = DEFAULT_DL_512_FIRST;
-static bool enable_isoc = DEFAULT_ENABLE_ISOC;
-static bool sw_buffering = DEFAULT_SW_BUFFERING;
-
-#define DEFAULT_B_MAX_DSL	8128
-#define DEFAULT_MODEM_MODE	11
-#define MODEM_OPTION_LENGTH	16
-static const unsigned char DEFAULT_MODEM_OPTION[MODEM_OPTION_LENGTH] = {
-	0x10, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-
-static unsigned int BMaxDSL = DEFAULT_B_MAX_DSL;
-static unsigned char ModemMode = DEFAULT_MODEM_MODE;
-static unsigned char ModemOption[MODEM_OPTION_LENGTH];
-static unsigned int num_ModemOption;
-
-module_param(altsetting, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(altsetting,
-		"Alternative setting for data interface (bulk_default: "
-		__MODULE_STRING(DEFAULT_BULK_ALTSETTING) "; isoc_default: "
-		__MODULE_STRING(DEFAULT_ISOC_ALTSETTING) ")");
-
-module_param(dl_512_first, bool, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(dl_512_first,
-		 "Read 512 bytes before sending firmware (default: "
-		 __MODULE_STRING(DEFAULT_DL_512_FIRST) ")");
-
-module_param(enable_isoc, bool, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(enable_isoc,
-		"Use isochronous transfers if available (default: "
-		__MODULE_STRING(DEFAULT_ENABLE_ISOC) ")");
-
-module_param(sw_buffering, bool, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(sw_buffering,
-		 "Enable software buffering (default: "
-		 __MODULE_STRING(DEFAULT_SW_BUFFERING) ")");
-
-module_param(BMaxDSL, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(BMaxDSL,
-		"default: " __MODULE_STRING(DEFAULT_B_MAX_DSL));
-
-module_param(ModemMode, byte, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(ModemMode,
-		"default: " __MODULE_STRING(DEFAULT_MODEM_MODE));
-
-module_param_array(ModemOption, byte, &num_ModemOption, S_IRUGO);
-MODULE_PARM_DESC(ModemOption, "default: 0x10,0x00,0x00,0x00,0x20");
-
-#define INTERFACE_DATA		1
-#define ENDPOINT_INT		0x81
-#define ENDPOINT_BULK_DATA	0x07
-#define ENDPOINT_ISOC_DATA	0x07
-#define ENDPOINT_FIRMWARE	0x05
-
-struct speedtch_params {
-	unsigned int altsetting;
-	unsigned int BMaxDSL;
-	unsigned char ModemMode;
-	unsigned char ModemOption[MODEM_OPTION_LENGTH];
-};
-
-struct speedtch_instance_data {
-	struct usbatm_data *usbatm;
-
-	struct speedtch_params params; /* set in probe, constant afterwards */
-
-	struct timer_list status_check_timer;
-	struct work_struct status_check_work;
-
-	unsigned char last_status;
-
-	int poll_delay; /* milliseconds */
-
-	struct timer_list resubmit_timer;
-	struct urb *int_urb;
-	unsigned char int_data[16];
-
-	unsigned char scratch_buffer[16];
-};
-
-/***************
-**  firmware  **
-***************/
-
-static void speedtch_set_swbuff(struct speedtch_instance_data *instance, int state)
-{
-	struct usbatm_data *usbatm = instance->usbatm;
-	struct usb_device *usb_dev = usbatm->usb_dev;
-	int ret;
-
-	ret = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			      0x32, 0x40, state ? 0x01 : 0x00, 0x00, NULL, 0, CTRL_TIMEOUT);
-	if (ret < 0)
-		usb_warn(usbatm,
-			 "%sabling SW buffering: usb_control_msg returned %d\n",
-			 state ? "En" : "Dis", ret);
-	else
-		usb_dbg(usbatm, "speedtch_set_swbuff: %sbled SW buffering\n", state ? "En" : "Dis");
-}
-
-static void speedtch_test_sequence(struct speedtch_instance_data *instance)
-{
-	struct usbatm_data *usbatm = instance->usbatm;
-	struct usb_device *usb_dev = usbatm->usb_dev;
-	unsigned char *buf = instance->scratch_buffer;
-	int ret;
-
-	/* URB 147 */
-	buf[0] = 0x1c;
-	buf[1] = 0x50;
-	ret = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			      0x01, 0x40, 0x0b, 0x00, buf, 2, CTRL_TIMEOUT);
-	if (ret < 0)
-		usb_warn(usbatm, "%s failed on URB147: %d\n", __func__, ret);
-
-	/* URB 148 */
-	buf[0] = 0x32;
-	buf[1] = 0x00;
-	ret = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			      0x01, 0x40, 0x02, 0x00, buf, 2, CTRL_TIMEOUT);
-	if (ret < 0)
-		usb_warn(usbatm, "%s failed on URB148: %d\n", __func__, ret);
-
-	/* URB 149 */
-	buf[0] = 0x01;
-	buf[1] = 0x00;
-	buf[2] = 0x01;
-	ret = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			      0x01, 0x40, 0x03, 0x00, buf, 3, CTRL_TIMEOUT);
-	if (ret < 0)
-		usb_warn(usbatm, "%s failed on URB149: %d\n", __func__, ret);
-
-	/* URB 150 */
-	buf[0] = 0x01;
-	buf[1] = 0x00;
-	buf[2] = 0x01;
-	ret = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			      0x01, 0x40, 0x04, 0x00, buf, 3, CTRL_TIMEOUT);
-	if (ret < 0)
-		usb_warn(usbatm, "%s failed on URB150: %d\n", __func__, ret);
-
-	/* Extra initialisation in recent drivers - gives higher speeds */
-
-	/* URBext1 */
-	buf[0] = instance->params.ModemMode;
-	ret = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			      0x01, 0x40, 0x11, 0x00, buf, 1, CTRL_TIMEOUT);
-	if (ret < 0)
-		usb_warn(usbatm, "%s failed on URBext1: %d\n", __func__, ret);
-
-	/* URBext2 */
-	/* This seems to be the one which actually triggers the higher sync
-	   rate -- it does require the new firmware too, although it works OK
-	   with older firmware */
-	ret = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			      0x01, 0x40, 0x14, 0x00,
-			      instance->params.ModemOption,
-			      MODEM_OPTION_LENGTH, CTRL_TIMEOUT);
-	if (ret < 0)
-		usb_warn(usbatm, "%s failed on URBext2: %d\n", __func__, ret);
-
-	/* URBext3 */
-	buf[0] = instance->params.BMaxDSL & 0xff;
-	buf[1] = instance->params.BMaxDSL >> 8;
-	ret = usb_control_msg(usb_dev, usb_sndctrlpipe(usb_dev, 0),
-			      0x01, 0x40, 0x12, 0x00, buf, 2, CTRL_TIMEOUT);
-	if (ret < 0)
-		usb_warn(usbatm, "%s failed on URBext3: %d\n", __func__, ret);
-}
-
-static int speedtch_upload_firmware(struct speedtch_instance_data *instance,
-				     const struct firmware *fw1,
-				     const struct firmware *fw2)
-{
-	unsigned char *buffer;
-	struct usbatm_data *usbatm = instance->usbatm;
-	struct usb_device *usb_dev = usbatm->usb_dev;
-	int actual_length;
-	int ret = 0;
-	int offset;
-
-	usb_dbg(usbatm, "%s entered\n", __func__);
-
-	buffer = (unsigned char *)__get_free_page(GFP_KERNEL);
-	if (!buffer) {
-		ret = -ENOMEM;
-		usb_dbg(usbatm, "%s: no memory for buffer!\n", __func__);
-		goto out;
-	}
-
-	if (!usb_ifnum_to_if(usb_dev, 2)) {
-		ret = -ENODEV;
-		usb_dbg(usbatm, "%s: interface not found!\n", __func__);
-		goto out_free;
-	}
-
-	/* URB 7 */
-	if (dl_512_first) {	/* some modems need a read before writing the firmware */
-		ret = usb_bulk_msg(usb_dev, usb_rcvbulkpipe(usb_dev, ENDPOINT_FIRMWARE),
-				   buffer, 0x200, &actual_length, 2000);
-
-		if (ret < 0 && ret != -ETIMEDOUT)
-			usb_warn(usbatm, "%s: read BLOCK0 from modem failed (%d)!\n", __func__, ret);
-		else
-			usb_dbg(usbatm, "%s: BLOCK0 downloaded (%d bytes)\n", __func__, ret);
-	}
-
-	/* URB 8 : both leds are static green */
-	for (offset = 0; offset < fw1->size; offset += PAGE_SIZE) {
-		int thislen = min_t(int, PAGE_SIZE, fw1->size - offset);
-		memcpy(buffer, fw1->data + offset, thislen);
-
-		ret = usb_bulk_msg(usb_dev, usb_sndbulkpipe(usb_dev, ENDPOINT_FIRMWARE),
-				   buffer, thislen, &actual_length, DATA_TIMEOUT);
-
-		if (ret < 0) {
-			usb_err(usbatm, "%s: write BLOCK1 to modem failed (%d)!\n", __func__, ret);
-			goto out_free;
-		}
-		usb_dbg(usbatm, "%s: BLOCK1 uploaded (%zu bytes)\n", __func__, fw1->size);
-	}
-
-	/* USB led blinking green, ADSL led off */
-
-	/* URB 11 */
-	ret = usb_bulk_msg(usb_dev, usb_rcvbulkpipe(usb_dev, ENDPOINT_FIRMWARE),
-			   buffer, 0x200, &actual_length, DATA_TIMEOUT);
-
-	if (ret < 0) {
-		usb_err(usbatm, "%s: read BLOCK2 from modem failed (%d)!\n", __func__, ret);
-		goto out_free;
-	}
-	usb_dbg(usbatm, "%s: BLOCK2 downloaded (%d bytes)\n", __func__, actual_length);
-
-	/* URBs 12 to 139 - USB led blinking green, ADSL led off */
-	for (offset = 0; offset < fw2->size; offset += PAGE_SIZE) {
-		int thislen = min_t(int, PAGE_SIZE, fw2->size - offset);
-		memcpy(buffer, fw2->data + offset, thislen);
-
-		ret = usb_bulk_msg(usb_dev, usb_sndbulkpipe(usb_dev, ENDPOINT_FIRMWARE),
-				   buffer, thislen, &actual_length, DATA_TIMEOUT);
-
-		if (ret < 0) {
-			usb_err(usbatm, "%s: write BLOCK3 to modem failed (%d)!\n", __func__, ret);
-			goto out_free;
-		}
-	}
-	usb_dbg(usbatm, "%s: BLOCK3 uploaded (%zu bytes)\n", __func__, fw2->size);
-
-	/* USB led static green, ADSL led static red */
-
-	/* URB 142 */
-	ret = usb_bulk_msg(usb_dev, usb_rcvbulkpipe(usb_dev, ENDPOINT_FIRMWARE),
-			   buffer, 0x200, &actual_length, DATA_TIMEOUT);
-
-	if (ret < 0) {
-		usb_err(usbatm, "%s: read BLOCK4 from modem failed (%d)!\n", __func__, ret);
-		goto out_free;
-	}
-
-	/* success */
-	usb_dbg(usbatm, "%s: BLOCK4 downloaded (%d bytes)\n", __func__, actual_length);
-
-	/* Delay to allow firmware to start up. We can do this here
-	   because we're in our own kernel thread anyway. */
-	msleep_interruptible(1000);
-
-	if ((ret = usb_set_interface(usb_dev, INTERFACE_DATA, instance->params.altsetting)) < 0) {
-		usb_err(usbatm, "%s: setting interface to %d failed (%d)!\n", __func__, instance->params.altsetting, ret);
-		goto out_free;
-	}
-
-	/* Enable software buffering, if requested */
-	if (sw_buffering)
-		speedtch_set_swbuff(instance, 1);
-
-	/* Magic spell; don't ask us what this does */
-	speedtch_test_sequence(instance);
-
-	ret = 0;
-
-out_free:
-	free_page((unsigned long)buffer);
-out:
-	return ret;
-}
-
-static int speedtch_find_firmware(struct usbatm_data *usbatm, struct usb_interface *intf,
-				  int phase, const struct firmware **fw_p)
-{
-	struct device *dev = &intf->dev;
-	const u16 bcdDevice = le16_to_cpu(interface_to_usbdev(intf)->descriptor.bcdDevice);
-	const u8 major_revision = bcdDevice >> 8;
-	const u8 minor_revision = bcdDevice & 0xff;
-	char buf[24];
-
-	sprintf(buf, "speedtch-%d.bin.%x.%02x", phase, major_revision, minor_revision);
-	usb_dbg(usbatm, "%s: looking for %s\n", __func__, buf);
-
-	if (request_firmware(fw_p, buf, dev)) {
-		sprintf(buf, "speedtch-%d.bin.%x", phase, major_revision);
-		usb_dbg(usbatm, "%s: looking for %s\n", __func__, buf);
-
-		if (request_firmware(fw_p, buf, dev)) {
-			sprintf(buf, "speedtch-%d.bin", phase);
-			usb_dbg(usbatm, "%s: looking for %s\n", __func__, buf);
-
-			if (request_firmware(fw_p, buf, dev)) {
-				usb_err(usbatm, "%s: no stage %d firmware found!\n", __func__, phase);
-				return -ENOENT;
-			}
-		}
-	}
-
-	usb_info(usbatm, "found stage %d firmware %s\n", phase, buf);
-
-	return 0;
-}
-
-static int speedtch_heavy_init(struct usbatm_data *usbatm, struct usb_interface *intf)
-{
-	const struct firmware *fw1, *fw2;
-	struct speedtch_instance_data *instance = usbatm->driver_data;
-	int ret;
-
-	if ((ret = speedtch_find_firmware(usbatm, intf, 1, &fw1)) < 0)
-		return ret;
-
-	if ((ret = speedtch_find_firmware(usbatm, intf, 2, &fw2)) < 0) {
-		release_firmware(fw1);
-		return ret;
-	}
-
-	if ((ret = speedtch_upload_firmware(instance, fw1, fw2)) < 0)
-		usb_err(usbatm, "%s: firmware upload failed (%d)!\n", __func__, ret);
-
-	release_firmware(fw2);
-	release_firmware(fw1);
-
-	return ret;
-}
-
-
-/**********
-**  ATM  **
-**********/
-
-static int speedtch_read_status(struct speedtch_instance_data *instance)
-{
-	struct usbatm_data *usbatm = instance->usbatm;
-	struct usb_device *usb_dev = usbatm->usb_dev;
-	unsigned char *buf = instance->scratch_buffer;
-	int ret;
-
-	memset(buf, 0, 16);
-
-	ret = usb_control_msg(usb_dev, usb_rcvctrlpipe(usb_dev, 0),
-			      0x12, 0xc0, 0x07, 0x00, buf + OFFSET_7, SIZE_7,
-			      CTRL_TIMEOUT);
-	if (ret < 0) {
-		atm_dbg(usbatm, "%s: MSG 7 failed\n", __func__);
-		return ret;
-	}
-
-	ret = usb_control_msg(usb_dev, usb_rcvctrlpipe(usb_dev, 0),
-			      0x12, 0xc0, 0x0b, 0x00, buf + OFFSET_b, SIZE_b,
-			      CTRL_TIMEOUT);
-	if (ret < 0) {
-		atm_dbg(usbatm, "%s: MSG B failed\n", __func__);
-		return ret;
-	}
-
-	ret = usb_control_msg(usb_dev, usb_rcvctrlpipe(usb_dev, 0),
-			      0x12, 0xc0, 0x0d, 0x00, buf + OFFSET_d, SIZE_d,
-			      CTRL_TIMEOUT);
-	if (ret < 0) {
-		atm_dbg(usbatm, "%s: MSG D failed\n", __func__);
-		return ret;
-	}
-
-	ret = usb_control_msg(usb_dev, usb_rcvctrlpipe(usb_dev, 0),
-			      0x01, 0xc0, 0x0e, 0x00, buf + OFFSET_e, SIZE_e,
-			      CTRL_TIMEOUT);
-	if (ret < 0) {
-		atm_dbg(usbatm, "%s: MSG E failed\n", __func__);
-		return ret;
-	}
-
-	ret = usb_control_msg(usb_dev, usb_rcvctrlpipe(usb_dev, 0),
-			      0x01, 0xc0, 0x0f, 0x00, buf + OFFSET_f, SIZE_f,
-			      CTRL_TIMEOUT);
-	if (ret < 0) {
-		atm_dbg(usbatm, "%s: MSG F failed\n", __func__);
-		return ret;
-	}
-
-	return 0;
-}
-
-static int speedtch_start_synchro(struct speedtch_instance_data *instance)
-{
-	struct usbatm_data *usbatm = instance->usbatm;
-	struct usb_device *usb_dev = usbatm->usb_dev;
-	unsigned char *buf = instance->scratch_buffer;
-	int ret;
-
-	atm_dbg(usbatm, "%s entered\n", __func__);
-
-	memset(buf, 0, 2);
-
-	ret = usb_control_msg(usb_dev, usb_rcvctrlpipe(usb_dev, 0),
-			      0x12, 0xc0, 0x04, 0x00,
-			      buf, 2, CTRL_TIMEOUT);
-
-	if (ret < 0)
-		atm_warn(usbatm, "failed to start ADSL synchronisation: %d\n", ret);
-	else
-		atm_dbg(usbatm, "%s: modem prodded. %d bytes returned: %02x %02x\n",
-			__func__, ret, buf[0], buf[1]);
-
-	return ret;
-}
-
-static void speedtch_check_status(struct work_struct *work)
-{
-	struct speedtch_instance_data *instance =
-		container_of(work, struct speedtch_instance_data,
-			     status_check_work);
-	struct usbatm_data *usbatm = instance->usbatm;
-	struct atm_dev *atm_dev = usbatm->atm_dev;
-	unsigned char *buf = instance->scratch_buffer;
-	int down_speed, up_speed, ret;
-	unsigned char status;
-
-#ifdef VERBOSE_DEBUG
-	atm_dbg(usbatm, "%s entered\n", __func__);
-#endif
-
-	ret = speedtch_read_status(instance);
-	if (ret < 0) {
-		atm_warn(usbatm, "error %d fetching device status\n", ret);
-		instance->poll_delay = min(2 * instance->poll_delay, MAX_POLL_DELAY);
-		return;
-	}
-
-	instance->poll_delay = max(instance->poll_delay / 2, MIN_POLL_DELAY);
-
-	status = buf[OFFSET_7];
-
-	if ((status != instance->last_status) || !status) {
-		atm_dbg(usbatm, "%s: line state 0x%02x\n", __func__, status);
-
-		switch (status) {
-		case 0:
-			atm_dev_signal_change(atm_dev, ATM_PHY_SIG_LOST);
-			if (instance->last_status)
-				atm_info(usbatm, "ADSL line is down\n");
-			/* It may never resync again unless we ask it to... */
-			ret = speedtch_start_synchro(instance);
-			break;
-
-		case 0x08:
-			atm_dev_signal_change(atm_dev, ATM_PHY_SIG_UNKNOWN);
-			atm_info(usbatm, "ADSL line is blocked?\n");
-			break;
-
-		case 0x10:
-			atm_dev_signal_change(atm_dev, ATM_PHY_SIG_LOST);
-			atm_info(usbatm, "ADSL line is synchronising\n");
-			break;
-
-		case 0x20:
-			down_speed = buf[OFFSET_b] | (buf[OFFSET_b + 1] << 8)
-				| (buf[OFFSET_b + 2] << 16) | (buf[OFFSET_b + 3] << 24);
-			up_speed = buf[OFFSET_b + 4] | (buf[OFFSET_b + 5] << 8)
-				| (buf[OFFSET_b + 6] << 16) | (buf[OFFSET_b + 7] << 24);
-
-			if (!(down_speed & 0x0000ffff) && !(up_speed & 0x0000ffff)) {
-				down_speed >>= 16;
-				up_speed >>= 16;
-			}
-
-			atm_dev->link_rate = down_speed * 1000 / 424;
-			atm_dev_signal_change(atm_dev, ATM_PHY_SIG_FOUND);
-
-			atm_info(usbatm,
-				 "ADSL line is up (%d kb/s down | %d kb/s up)\n",
-				 down_speed, up_speed);
-			break;
-
-		default:
-			atm_dev_signal_change(atm_dev, ATM_PHY_SIG_UNKNOWN);
-			atm_info(usbatm, "unknown line state %02x\n", status);
-			break;
-		}
-
-		instance->last_status = status;
-	}
-}
-
-static void speedtch_status_poll(unsigned long data)
-{
-	struct speedtch_instance_data *instance = (void *)data;
-
-	schedule_work(&instance->status_check_work);
-
-	/* The following check is racy, but the race is harmless */
-	if (instance->poll_delay < MAX_POLL_DELAY)
-		mod_timer(&instance->status_check_timer, jiffies + msecs_to_jiffies(instance->poll_delay));
-	else
-		atm_warn(instance->usbatm, "Too many failures - disabling line status polling\n");
-}
-
-static void speedtch_resubmit_int(unsigned long data)
-{
-	struct speedtch_instance_data *instance = (void *)data;
-	struct urb *int_urb = instance->int_urb;
-	int ret;
-
-	atm_dbg(instance->usbatm, "%s entered\n", __func__);
-
-	if (int_urb) {
-		ret = usb_submit_urb(int_urb, GFP_ATOMIC);
-		if (!ret)
-			schedule_work(&instance->status_check_work);
-		else {
-			atm_dbg(instance->usbatm, "%s: usb_submit_urb failed with result %d\n", __func__, ret);
-			mod_timer(&instance->resubmit_timer, jiffies + msecs_to_jiffies(RESUBMIT_DELAY));
-		}
-	}
-}
-
-static void speedtch_handle_int(struct urb *int_urb)
-{
-	struct speedtch_instance_data *instance = int_urb->context;
-	struct usbatm_data *usbatm = instance->usbatm;
-	unsigned int count = int_urb->actual_length;
-	int status = int_urb->status;
-	int ret;
-
-	/* The magic interrupt for "up state" */
-	static const unsigned char up_int[6]   = { 0xa1, 0x00, 0x01, 0x00, 0x00, 0x00 };
-	/* The magic interrupt for "down state" */
-	static const unsigned char down_int[6] = { 0xa1, 0x00, 0x00, 0x00, 0x00, 0x00 };
-
-	atm_dbg(usbatm, "%s entered\n", __func__);
-
-	if (status < 0) {
-		atm_dbg(usbatm, "%s: nonzero urb status %d!\n", __func__, status);
-		goto fail;
-	}
-
-	if ((count == 6) && !memcmp(up_int, instance->int_data, 6)) {
-		del_timer(&instance->status_check_timer);
-		atm_info(usbatm, "DSL line goes up\n");
-	} else if ((count == 6) && !memcmp(down_int, instance->int_data, 6)) {
-		atm_info(usbatm, "DSL line goes down\n");
-	} else {
-		int i;
-
-		atm_dbg(usbatm, "%s: unknown interrupt packet of length %d:", __func__, count);
-		for (i = 0; i < count; i++)
-			printk(" %02x", instance->int_data[i]);
-		printk("\n");
-		goto fail;
-	}
-
-	int_urb = instance->int_urb;
-	if (int_urb) {
-		ret = usb_submit_urb(int_urb, GFP_ATOMIC);
-		schedule_work(&instance->status_check_work);
-		if (ret < 0) {
-			atm_dbg(usbatm, "%s: usb_submit_urb failed with result %d\n", __func__, ret);
-			goto fail;
-		}
-	}
-
-	return;
-
-fail:
-	int_urb = instance->int_urb;
-	if (int_urb)
-		mod_timer(&instance->resubmit_timer, jiffies + msecs_to_jiffies(RESUBMIT_DELAY));
-}
-
-static int speedtch_atm_start(struct usbatm_data *usbatm, struct atm_dev *atm_dev)
-{
-	struct usb_device *usb_dev = usbatm->usb_dev;
-	struct speedtch_instance_data *instance = usbatm->driver_data;
-	int i, ret;
-	unsigned char mac_str[13];
-
-	atm_dbg(usbatm, "%s entered\n", __func__);
-
-	/* Set MAC address, it is stored in the serial number */
-	memset(atm_dev->esi, 0, sizeof(atm_dev->esi));
-	if (usb_string(usb_dev, usb_dev->descriptor.iSerialNumber, mac_str, sizeof(mac_str)) == 12) {
-		for (i = 0; i < 6; i++)
-			atm_dev->esi[i] = (hex_to_bin(mac_str[i * 2]) << 4) +
-				hex_to_bin(mac_str[i * 2 + 1]);
-	}
-
-	/* Start modem synchronisation */
-	ret = speedtch_start_synchro(instance);
-
-	/* Set up interrupt endpoint */
-	if (instance->int_urb) {
-		ret = usb_submit_urb(instance->int_urb, GFP_KERNEL);
-		if (ret < 0) {
-			/* Doesn't matter; we'll poll anyway */
-			atm_dbg(usbatm, "%s: submission of interrupt URB failed (%d)!\n", __func__, ret);
-			usb_free_urb(instance->int_urb);
-			instance->int_urb = NULL;
-		}
-	}
-
-	/* Start status polling */
-	mod_timer(&instance->status_check_timer, jiffies + msecs_to_jiffies(1000));
-
-	return 0;
-}
-
-static void speedtch_atm_stop(struct usbatm_data *usbatm, struct atm_dev *atm_dev)
-{
-	struct speedtch_instance_data *instance = usbatm->driver_data;
-	struct urb *int_urb = instance->int_urb;
-
-	atm_dbg(usbatm, "%s entered\n", __func__);
-
-	del_timer_sync(&instance->status_check_timer);
-
-	/*
-	 * Since resubmit_timer and int_urb can schedule themselves and
-	 * each other, shutting them down correctly takes some care
-	 */
-	instance->int_urb = NULL; /* signal shutdown */
-	mb();
-	usb_kill_urb(int_urb);
-	del_timer_sync(&instance->resubmit_timer);
-	/*
-	 * At this point, speedtch_handle_int and speedtch_resubmit_int
-	 * can run or be running, but instance->int_urb == NULL means that
-	 * they will not reschedule
-	 */
-	usb_kill_urb(int_urb);
-	del_timer_sync(&instance->resubmit_timer);
-	usb_free_urb(int_urb);
-
-	flush_work(&instance->status_check_work);
-}
-
-static int speedtch_pre_reset(struct usb_interface *intf)
-{
-	return 0;
-}
-
-static int speedtch_post_reset(struct usb_interface *intf)
-{
-	return 0;
-}
-
-
-/**********
-**  USB  **
-**********/
-
-static struct usb_device_id speedtch_usb_ids[] = {
-	{USB_DEVICE(0x06b9, 0x4061)},
-	{}
-};
-
-MODULE_DEVICE_TABLE(usb, speedtch_usb_ids);
-
-static int speedtch_usb_probe(struct usb_interface *, const struct usb_device_id *);
-
-static struct usb_driver speedtch_usb_driver = {
-	.name		= speedtch_driver_name,
-	.probe		= speedtch_usb_probe,
-	.disconnect	= usbatm_usb_disconnect,
-	.pre_reset	= speedtch_pre_reset,
-	.post_reset	= speedtch_post_reset,
-	.id_table	= speedtch_usb_ids
-};
-
-static void speedtch_release_interfaces(struct usb_device *usb_dev,
-					int num_interfaces)
-{
-	struct usb_interface *cur_intf;
-	int i;
-
-	for (i = 0; i < num_interfaces; i++) {
-		cur_intf = usb_ifnum_to_if(usb_dev, i);
-		if (cur_intf) {
-			usb_set_intfdata(cur_intf, NULL);
-			usb_driver_release_interface(&speedtch_usb_driver, cur_intf);
-		}
-	}
-}
-
-static int speedtch_bind(struct usbatm_data *usbatm,
-			 struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct usb_device *usb_dev = interface_to_usbdev(intf);
-	struct usb_interface *cur_intf, *data_intf;
-	struct speedtch_instance_data *instance;
-	int ifnum = intf->altsetting->desc.bInterfaceNumber;
-	int num_interfaces = usb_dev->actconfig->desc.bNumInterfaces;
-	int i, ret;
-	int use_isoc;
-
-	usb_dbg(usbatm, "%s entered\n", __func__);
-
-	/* sanity checks */
-
-	if (usb_dev->descriptor.bDeviceClass != USB_CLASS_VENDOR_SPEC) {
-		usb_err(usbatm, "%s: wrong device class %d\n", __func__, usb_dev->descriptor.bDeviceClass);
-		return -ENODEV;
-	}
-
-	data_intf = usb_ifnum_to_if(usb_dev, INTERFACE_DATA);
-	if (!data_intf) {
-		usb_err(usbatm, "%s: data interface not found!\n", __func__);
-		return -ENODEV;
-	}
-
-	/* claim all interfaces */
-
-	for (i = 0; i < num_interfaces; i++) {
-		cur_intf = usb_ifnum_to_if(usb_dev, i);
-
-		if ((i != ifnum) && cur_intf) {
-			ret = usb_driver_claim_interface(&speedtch_usb_driver, cur_intf, usbatm);
-
-			if (ret < 0) {
-				usb_err(usbatm, "%s: failed to claim interface %2d (%d)!\n", __func__, i, ret);
-				speedtch_release_interfaces(usb_dev, i);
-				return ret;
-			}
-		}
-	}
-
-	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
-
-	if (!instance) {
-		usb_err(usbatm, "%s: no memory for instance data!\n", __func__);
-		ret = -ENOMEM;
-		goto fail_release;
-	}
-
-	instance->usbatm = usbatm;
-
-	/* module parameters may change at any moment, so take a snapshot */
-	instance->params.altsetting = altsetting;
-	instance->params.BMaxDSL = BMaxDSL;
-	instance->params.ModemMode = ModemMode;
-	memcpy(instance->params.ModemOption, DEFAULT_MODEM_OPTION, MODEM_OPTION_LENGTH);
-	memcpy(instance->params.ModemOption, ModemOption, num_ModemOption);
-	use_isoc = enable_isoc;
-
-	if (instance->params.altsetting)
-		if ((ret = usb_set_interface(usb_dev, INTERFACE_DATA, instance->params.altsetting)) < 0) {
-			usb_err(usbatm, "%s: setting interface to %2d failed (%d)!\n", __func__, instance->params.altsetting, ret);
-			instance->params.altsetting = 0; /* fall back to default */
-		}
-
-	if (!instance->params.altsetting && use_isoc)
-		if ((ret = usb_set_interface(usb_dev, INTERFACE_DATA, DEFAULT_ISOC_ALTSETTING)) < 0) {
-			usb_dbg(usbatm, "%s: setting interface to %2d failed (%d)!\n", __func__, DEFAULT_ISOC_ALTSETTING, ret);
-			use_isoc = 0; /* fall back to bulk */
-		}
-
-	if (use_isoc) {
-		const struct usb_host_interface *desc = data_intf->cur_altsetting;
-		const __u8 target_address = USB_DIR_IN | usbatm->driver->isoc_in;
-
-		use_isoc = 0; /* fall back to bulk if endpoint not found */
-
-		for (i = 0; i < desc->desc.bNumEndpoints; i++) {
-			const struct usb_endpoint_descriptor *endpoint_desc = &desc->endpoint[i].desc;
-
-			if ((endpoint_desc->bEndpointAddress == target_address)) {
-				use_isoc =
-					usb_endpoint_xfer_isoc(endpoint_desc);
-				break;
-			}
-		}
-
-		if (!use_isoc)
-			usb_info(usbatm, "isochronous transfer not supported - using bulk\n");
-	}
-
-	if (!use_isoc && !instance->params.altsetting)
-		if ((ret = usb_set_interface(usb_dev, INTERFACE_DATA, DEFAULT_BULK_ALTSETTING)) < 0) {
-			usb_err(usbatm, "%s: setting interface to %2d failed (%d)!\n", __func__, DEFAULT_BULK_ALTSETTING, ret);
-			goto fail_free;
-		}
-
-	if (!instance->params.altsetting)
-		instance->params.altsetting = use_isoc ? DEFAULT_ISOC_ALTSETTING : DEFAULT_BULK_ALTSETTING;
-
-	usbatm->flags |= (use_isoc ? UDSL_USE_ISOC : 0);
-
-	INIT_WORK(&instance->status_check_work, speedtch_check_status);
-	init_timer(&instance->status_check_timer);
-
-	instance->status_check_timer.function = speedtch_status_poll;
-	instance->status_check_timer.data = (unsigned long)instance;
-	instance->last_status = 0xff;
-	instance->poll_delay = MIN_POLL_DELAY;
-
-	init_timer(&instance->resubmit_timer);
-	instance->resubmit_timer.function = speedtch_resubmit_int;
-	instance->resubmit_timer.data = (unsigned long)instance;
-
-	instance->int_urb = usb_alloc_urb(0, GFP_KERNEL);
-
-	if (instance->int_urb)
-		usb_fill_int_urb(instance->int_urb, usb_dev,
-				 usb_rcvintpipe(usb_dev, ENDPOINT_INT),
-				 instance->int_data, sizeof(instance->int_data),
-				 speedtch_handle_int, instance, 16);
-	else
-		usb_dbg(usbatm, "%s: no memory for interrupt urb!\n", __func__);
-
-	/* check whether the modem already seems to be alive */
-	ret = usb_control_msg(usb_dev, usb_rcvctrlpipe(usb_dev, 0),
-			      0x12, 0xc0, 0x07, 0x00,
-			      instance->scratch_buffer + OFFSET_7, SIZE_7, 500);
-
-	usbatm->flags |= (ret == SIZE_7 ? UDSL_SKIP_HEAVY_INIT : 0);
-
-	usb_dbg(usbatm, "%s: firmware %s loaded\n", __func__, usbatm->flags & UDSL_SKIP_HEAVY_INIT ? "already" : "not");
-
-	if (!(usbatm->flags & UDSL_SKIP_HEAVY_INIT))
-		if ((ret = usb_reset_device(usb_dev)) < 0) {
-			usb_err(usbatm, "%s: device reset failed (%d)!\n", __func__, ret);
-			goto fail_free;
-		}
-
-        usbatm->driver_data = instance;
-
-	return 0;
-
-fail_free:
-	usb_free_urb(instance->int_urb);
-	kfree(instance);
-fail_release:
-	speedtch_release_interfaces(usb_dev, num_interfaces);
-	return ret;
-}
-
-static void speedtch_unbind(struct usbatm_data *usbatm, struct usb_interface *intf)
-{
-	struct usb_device *usb_dev = interface_to_usbdev(intf);
-	struct speedtch_instance_data *instance = usbatm->driver_data;
-
-	usb_dbg(usbatm, "%s entered\n", __func__);
-
-	speedtch_release_interfaces(usb_dev, usb_dev->actconfig->desc.bNumInterfaces);
-	usb_free_urb(instance->int_urb);
-	kfree(instance);
-}
-
-
-/***********
-**  init  **
-***********/
-
-static struct usbatm_driver speedtch_usbatm_driver = {
-	.driver_name	= speedtch_driver_name,
-	.bind		= speedtch_bind,
-	.heavy_init	= speedtch_heavy_init,
-	.unbind		= speedtch_unbind,
-	.atm_start	= speedtch_atm_start,
-	.atm_stop	= speedtch_atm_stop,
-	.bulk_in	= ENDPOINT_BULK_DATA,
-	.bulk_out	= ENDPOINT_BULK_DATA,
-	.isoc_in	= ENDPOINT_ISOC_DATA
-};
-
-static int speedtch_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
-{
-	return usbatm_usb_probe(intf, id, &speedtch_usbatm_driver);
-}
-
-module_usb_driver(speedtch_usb_driver);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-MODULE_VERSION(DRIVER_VERSION);
+x0
+#define D2F4_INTERRUPT_LINE__INTERRUPT_LINE_MASK 0xff
+#define D2F4_INTERRUPT_LINE__INTERRUPT_LINE__SHIFT 0x0
+#define D2F4_INTERRUPT_PIN__INTERRUPT_PIN_MASK 0xff00
+#define D2F4_INTERRUPT_PIN__INTERRUPT_PIN__SHIFT 0x8
+#define D2F4_EXT_BRIDGE_CNTL__IO_PORT_80_EN_MASK 0x1
+#define D2F4_EXT_BRIDGE_CNTL__IO_PORT_80_EN__SHIFT 0x0
+#define D2F4_PMI_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F4_PMI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_PMI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F4_PMI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F4_PMI_CAP__VERSION_MASK 0x70000
+#define D2F4_PMI_CAP__VERSION__SHIFT 0x10
+#define D2F4_PMI_CAP__PME_CLOCK_MASK 0x80000
+#define D2F4_PMI_CAP__PME_CLOCK__SHIFT 0x13
+#define D2F4_PMI_CAP__DEV_SPECIFIC_INIT_MASK 0x200000
+#define D2F4_PMI_CAP__DEV_SPECIFIC_INIT__SHIFT 0x15
+#define D2F4_PMI_CAP__AUX_CURRENT_MASK 0x1c00000
+#define D2F4_PMI_CAP__AUX_CURRENT__SHIFT 0x16
+#define D2F4_PMI_CAP__D1_SUPPORT_MASK 0x2000000
+#define D2F4_PMI_CAP__D1_SUPPORT__SHIFT 0x19
+#define D2F4_PMI_CAP__D2_SUPPORT_MASK 0x4000000
+#define D2F4_PMI_CAP__D2_SUPPORT__SHIFT 0x1a
+#define D2F4_PMI_CAP__PME_SUPPORT_MASK 0xf8000000
+#define D2F4_PMI_CAP__PME_SUPPORT__SHIFT 0x1b
+#define D2F4_PMI_STATUS_CNTL__POWER_STATE_MASK 0x3
+#define D2F4_PMI_STATUS_CNTL__POWER_STATE__SHIFT 0x0
+#define D2F4_PMI_STATUS_CNTL__NO_SOFT_RESET_MASK 0x8
+#define D2F4_PMI_STATUS_CNTL__NO_SOFT_RESET__SHIFT 0x3
+#define D2F4_PMI_STATUS_CNTL__PME_EN_MASK 0x100
+#define D2F4_PMI_STATUS_CNTL__PME_EN__SHIFT 0x8
+#define D2F4_PMI_STATUS_CNTL__DATA_SELECT_MASK 0x1e00
+#define D2F4_PMI_STATUS_CNTL__DATA_SELECT__SHIFT 0x9
+#define D2F4_PMI_STATUS_CNTL__DATA_SCALE_MASK 0x6000
+#define D2F4_PMI_STATUS_CNTL__DATA_SCALE__SHIFT 0xd
+#define D2F4_PMI_STATUS_CNTL__PME_STATUS_MASK 0x8000
+#define D2F4_PMI_STATUS_CNTL__PME_STATUS__SHIFT 0xf
+#define D2F4_PMI_STATUS_CNTL__B2_B3_SUPPORT_MASK 0x400000
+#define D2F4_PMI_STATUS_CNTL__B2_B3_SUPPORT__SHIFT 0x16
+#define D2F4_PMI_STATUS_CNTL__BUS_PWR_EN_MASK 0x800000
+#define D2F4_PMI_STATUS_CNTL__BUS_PWR_EN__SHIFT 0x17
+#define D2F4_PMI_STATUS_CNTL__PMI_DATA_MASK 0xff000000
+#define D2F4_PMI_STATUS_CNTL__PMI_DATA__SHIFT 0x18
+#define D2F4_PCIE_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F4_PCIE_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_PCIE_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F4_PCIE_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F4_PCIE_CAP__VERSION_MASK 0xf0000
+#define D2F4_PCIE_CAP__VERSION__SHIFT 0x10
+#define D2F4_PCIE_CAP__DEVICE_TYPE_MASK 0xf00000
+#define D2F4_PCIE_CAP__DEVICE_TYPE__SHIFT 0x14
+#define D2F4_PCIE_CAP__SLOT_IMPLEMENTED_MASK 0x1000000
+#define D2F4_PCIE_CAP__SLOT_IMPLEMENTED__SHIFT 0x18
+#define D2F4_PCIE_CAP__INT_MESSAGE_NUM_MASK 0x3e000000
+#define D2F4_PCIE_CAP__INT_MESSAGE_NUM__SHIFT 0x19
+#define D2F4_DEVICE_CAP__MAX_PAYLOAD_SUPPORT_MASK 0x7
+#define D2F4_DEVICE_CAP__MAX_PAYLOAD_SUPPORT__SHIFT 0x0
+#define D2F4_DEVICE_CAP__PHANTOM_FUNC_MASK 0x18
+#define D2F4_DEVICE_CAP__PHANTOM_FUNC__SHIFT 0x3
+#define D2F4_DEVICE_CAP__EXTENDED_TAG_MASK 0x20
+#define D2F4_DEVICE_CAP__EXTENDED_TAG__SHIFT 0x5
+#define D2F4_DEVICE_CAP__L0S_ACCEPTABLE_LATENCY_MASK 0x1c0
+#define D2F4_DEVICE_CAP__L0S_ACCEPTABLE_LATENCY__SHIFT 0x6
+#define D2F4_DEVICE_CAP__L1_ACCEPTABLE_LATENCY_MASK 0xe00
+#define D2F4_DEVICE_CAP__L1_ACCEPTABLE_LATENCY__SHIFT 0x9
+#define D2F4_DEVICE_CAP__ROLE_BASED_ERR_REPORTING_MASK 0x8000
+#define D2F4_DEVICE_CAP__ROLE_BASED_ERR_REPORTING__SHIFT 0xf
+#define D2F4_DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT_MASK 0x3fc0000
+#define D2F4_DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT__SHIFT 0x12
+#define D2F4_DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE_MASK 0xc000000
+#define D2F4_DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE__SHIFT 0x1a
+#define D2F4_DEVICE_CAP__FLR_CAPABLE_MASK 0x10000000
+#define D2F4_DEVICE_CAP__FLR_CAPABLE__SHIFT 0x1c
+#define D2F4_DEVICE_CNTL__CORR_ERR_EN_MASK 0x1
+#define D2F4_DEVICE_CNTL__CORR_ERR_EN__SHIFT 0x0
+#define D2F4_DEVICE_CNTL__NON_FATAL_ERR_EN_MASK 0x2
+#define D2F4_DEVICE_CNTL__NON_FATAL_ERR_EN__SHIFT 0x1
+#define D2F4_DEVICE_CNTL__FATAL_ERR_EN_MASK 0x4
+#define D2F4_DEVICE_CNTL__FATAL_ERR_EN__SHIFT 0x2
+#define D2F4_DEVICE_CNTL__USR_REPORT_EN_MASK 0x8
+#define D2F4_DEVICE_CNTL__USR_REPORT_EN__SHIFT 0x3
+#define D2F4_DEVICE_CNTL__RELAXED_ORD_EN_MASK 0x10
+#define D2F4_DEVICE_CNTL__RELAXED_ORD_EN__SHIFT 0x4
+#define D2F4_DEVICE_CNTL__MAX_PAYLOAD_SIZE_MASK 0xe0
+#define D2F4_DEVICE_CNTL__MAX_PAYLOAD_SIZE__SHIFT 0x5
+#define D2F4_DEVICE_CNTL__EXTENDED_TAG_EN_MASK 0x100
+#define D2F4_DEVICE_CNTL__EXTENDED_TAG_EN__SHIFT 0x8
+#define D2F4_DEVICE_CNTL__PHANTOM_FUNC_EN_MASK 0x200
+#define D2F4_DEVICE_CNTL__PHANTOM_FUNC_EN__SHIFT 0x9
+#define D2F4_DEVICE_CNTL__AUX_POWER_PM_EN_MASK 0x400
+#define D2F4_DEVICE_CNTL__AUX_POWER_PM_EN__SHIFT 0xa
+#define D2F4_DEVICE_CNTL__NO_SNOOP_EN_MASK 0x800
+#define D2F4_DEVICE_CNTL__NO_SNOOP_EN__SHIFT 0xb
+#define D2F4_DEVICE_CNTL__MAX_READ_REQUEST_SIZE_MASK 0x7000
+#define D2F4_DEVICE_CNTL__MAX_READ_REQUEST_SIZE__SHIFT 0xc
+#define D2F4_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN_MASK 0x8000
+#define D2F4_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN__SHIFT 0xf
+#define D2F4_DEVICE_STATUS__CORR_ERR_MASK 0x10000
+#define D2F4_DEVICE_STATUS__CORR_ERR__SHIFT 0x10
+#define D2F4_DEVICE_STATUS__NON_FATAL_ERR_MASK 0x20000
+#define D2F4_DEVICE_STATUS__NON_FATAL_ERR__SHIFT 0x11
+#define D2F4_DEVICE_STATUS__FATAL_ERR_MASK 0x40000
+#define D2F4_DEVICE_STATUS__FATAL_ERR__SHIFT 0x12
+#define D2F4_DEVICE_STATUS__USR_DETECTED_MASK 0x80000
+#define D2F4_DEVICE_STATUS__USR_DETECTED__SHIFT 0x13
+#define D2F4_DEVICE_STATUS__AUX_PWR_MASK 0x100000
+#define D2F4_DEVICE_STATUS__AUX_PWR__SHIFT 0x14
+#define D2F4_DEVICE_STATUS__TRANSACTIONS_PEND_MASK 0x200000
+#define D2F4_DEVICE_STATUS__TRANSACTIONS_PEND__SHIFT 0x15
+#define D2F4_LINK_CAP__LINK_SPEED_MASK 0xf
+#define D2F4_LINK_CAP__LINK_SPEED__SHIFT 0x0
+#define D2F4_LINK_CAP__LINK_WIDTH_MASK 0x3f0
+#define D2F4_LINK_CAP__LINK_WIDTH__SHIFT 0x4
+#define D2F4_LINK_CAP__PM_SUPPORT_MASK 0xc00
+#define D2F4_LINK_CAP__PM_SUPPORT__SHIFT 0xa
+#define D2F4_LINK_CAP__L0S_EXIT_LATENCY_MASK 0x7000
+#define D2F4_LINK_CAP__L0S_EXIT_LATENCY__SHIFT 0xc
+#define D2F4_LINK_CAP__L1_EXIT_LATENCY_MASK 0x38000
+#define D2F4_LINK_CAP__L1_EXIT_LATENCY__SHIFT 0xf
+#define D2F4_LINK_CAP__CLOCK_POWER_MANAGEMENT_MASK 0x40000
+#define D2F4_LINK_CAP__CLOCK_POWER_MANAGEMENT__SHIFT 0x12
+#define D2F4_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING_MASK 0x80000
+#define D2F4_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING__SHIFT 0x13
+#define D2F4_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE_MASK 0x100000
+#define D2F4_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE__SHIFT 0x14
+#define D2F4_LINK_CAP__LINK_BW_NOTIFICATION_CAP_MASK 0x200000
+#define D2F4_LINK_CAP__LINK_BW_NOTIFICATION_CAP__SHIFT 0x15
+#define D2F4_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE_MASK 0x400000
+#define D2F4_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE__SHIFT 0x16
+#define D2F4_LINK_CAP__PORT_NUMBER_MASK 0xff000000
+#define D2F4_LINK_CAP__PORT_NUMBER__SHIFT 0x18
+#define D2F4_LINK_CNTL__PM_CONTROL_MASK 0x3
+#define D2F4_LINK_CNTL__PM_CONTROL__SHIFT 0x0
+#define D2F4_LINK_CNTL__READ_CPL_BOUNDARY_MASK 0x8
+#define D2F4_LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define D2F4_LINK_CNTL__LINK_DIS_MASK 0x10
+#define D2F4_LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define D2F4_LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define D2F4_LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define D2F4_LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define D2F4_LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define D2F4_LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define D2F4_LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define D2F4_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define D2F4_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define D2F4_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define D2F4_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0x9
+#define D2F4_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN_MASK 0x400
+#define D2F4_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN__SHIFT 0xa
+#define D2F4_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN_MASK 0x800
+#define D2F4_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN__SHIFT 0xb
+#define D2F4_LINK_STATUS__CURRENT_LINK_SPEED_MASK 0xf0000
+#define D2F4_LINK_STATUS__CURRENT_LINK_SPEED__SHIFT 0x10
+#define D2F4_LINK_STATUS__NEGOTIATED_LINK_WIDTH_MASK 0x3f00000
+#define D2F4_LINK_STATUS__NEGOTIATED_LINK_WIDTH__SHIFT 0x14
+#define D2F4_LINK_STATUS__LINK_TRAINING_MASK 0x8000000
+#define D2F4_LINK_STATUS__LINK_TRAINING__SHIFT 0x1b
+#define D2F4_LINK_STATUS__SLOT_CLOCK_CFG_MASK 0x10000000
+#define D2F4_LINK_STATUS__SLOT_CLOCK_CFG__SHIFT 0x1c
+#define D2F4_LINK_STATUS__DL_ACTIVE_MASK 0x20000000
+#define D2F4_LINK_STATUS__DL_ACTIVE__SHIFT 0x1d
+#define D2F4_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS_MASK 0x40000000
+#define D2F4_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS__SHIFT 0x1e
+#define D2F4_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS_MASK 0x80000000
+#define D2F4_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS__SHIFT 0x1f
+#define D2F4_SLOT_CAP__ATTN_BUTTON_PRESENT_MASK 0x1
+#define D2F4_SLOT_CAP__ATTN_BUTTON_PRESENT__SHIFT 0x0
+#define D2F4_SLOT_CAP__PWR_CONTROLLER_PRESENT_MASK 0x2
+#define D2F4_SLOT_CAP__PWR_CONTROLLER_PRESENT__SHIFT 0x1
+#define D2F4_SLOT_CAP__MRL_SENSOR_PRESENT_MASK 0x4
+#define D2F4_SLOT_CAP__MRL_SENSOR_PRESENT__SHIFT 0x2
+#define D2F4_SLOT_CAP__ATTN_INDICATOR_PRESENT_MASK 0x8
+#define D2F4_SLOT_CAP__ATTN_INDICATOR_PRESENT__SHIFT 0x3
+#define D2F4_SLOT_CAP__PWR_INDICATOR_PRESENT_MASK 0x10
+#define D2F4_SLOT_CAP__PWR_INDICATOR_PRESENT__SHIFT 0x4
+#define D2F4_SLOT_CAP__HOTPLUG_SURPRISE_MASK 0x20
+#define D2F4_SLOT_CAP__HOTPLUG_SURPRISE__SHIFT 0x5
+#define D2F4_SLOT_CAP__HOTPLUG_CAPABLE_MASK 0x40
+#define D2F4_SLOT_CAP__HOTPLUG_CAPABLE__SHIFT 0x6
+#define D2F4_SLOT_CAP__SLOT_PWR_LIMIT_VALUE_MASK 0x7f80
+#define D2F4_SLOT_CAP__SLOT_PWR_LIMIT_VALUE__SHIFT 0x7
+#define D2F4_SLOT_CAP__SLOT_PWR_LIMIT_SCALE_MASK 0x18000
+#define D2F4_SLOT_CAP__SLOT_PWR_LIMIT_SCALE__SHIFT 0xf
+#define D2F4_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT_MASK 0x20000
+#define D2F4_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT__SHIFT 0x11
+#define D2F4_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED_MASK 0x40000
+#define D2F4_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED__SHIFT 0x12
+#define D2F4_SLOT_CAP__PHYSICAL_SLOT_NUM_MASK 0xfff80000
+#define D2F4_SLOT_CAP__PHYSICAL_SLOT_NUM__SHIFT 0x13
+#define D2F4_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN_MASK 0x1
+#define D2F4_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN__SHIFT 0x0
+#define D2F4_SLOT_CNTL__PWR_FAULT_DETECTED_EN_MASK 0x2
+#define D2F4_SLOT_CNTL__PWR_FAULT_DETECTED_EN__SHIFT 0x1
+#define D2F4_SLOT_CNTL__MRL_SENSOR_CHANGED_EN_MASK 0x4
+#define D2F4_SLOT_CNTL__MRL_SENSOR_CHANGED_EN__SHIFT 0x2
+#define D2F4_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN_MASK 0x8
+#define D2F4_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN__SHIFT 0x3
+#define D2F4_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN_MASK 0x10
+#define D2F4_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN__SHIFT 0x4
+#define D2F4_SLOT_CNTL__HOTPLUG_INTR_EN_MASK 0x20
+#define D2F4_SLOT_CNTL__HOTPLUG_INTR_EN__SHIFT 0x5
+#define D2F4_SLOT_CNTL__ATTN_INDICATOR_CNTL_MASK 0xc0
+#define D2F4_SLOT_CNTL__ATTN_INDICATOR_CNTL__SHIFT 0x6
+#define D2F4_SLOT_CNTL__PWR_INDICATOR_CNTL_MASK 0x300
+#define D2F4_SLOT_CNTL__PWR_INDICATOR_CNTL__SHIFT 0x8
+#define D2F4_SLOT_CNTL__PWR_CONTROLLER_CNTL_MASK 0x400
+#define D2F4_SLOT_CNTL__PWR_CONTROLLER_CNTL__SHIFT 0xa
+#define D2F4_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL_MASK 0x800
+#define D2F4_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL__SHIFT 0xb
+#define D2F4_SLOT_CNTL__DL_STATE_CHANGED_EN_MASK 0x1000
+#define D2F4_SLOT_CNTL__DL_STATE_CHANGED_EN__SHIFT 0xc
+#define D2F4_SLOT_STATUS__ATTN_BUTTON_PRESSED_MASK 0x10000
+#define D2F4_SLOT_STATUS__ATTN_BUTTON_PRESSED__SHIFT 0x10
+#define D2F4_SLOT_STATUS__PWR_FAULT_DETECTED_MASK 0x20000
+#define D2F4_SLOT_STATUS__PWR_FAULT_DETECTED__SHIFT 0x11
+#define D2F4_SLOT_STATUS__MRL_SENSOR_CHANGED_MASK 0x40000
+#define D2F4_SLOT_STATUS__MRL_SENSOR_CHANGED__SHIFT 0x12
+#define D2F4_SLOT_STATUS__PRESENCE_DETECT_CHANGED_MASK 0x80000
+#define D2F4_SLOT_STATUS__PRESENCE_DETECT_CHANGED__SHIFT 0x13
+#define D2F4_SLOT_STATUS__COMMAND_COMPLETED_MASK 0x100000
+#define D2F4_SLOT_STATUS__COMMAND_COMPLETED__SHIFT 0x14
+#define D2F4_SLOT_STATUS__MRL_SENSOR_STATE_MASK 0x200000
+#define D2F4_SLOT_STATUS__MRL_SENSOR_STATE__SHIFT 0x15
+#define D2F4_SLOT_STATUS__PRESENCE_DETECT_STATE_MASK 0x400000
+#define D2F4_SLOT_STATUS__PRESENCE_DETECT_STATE__SHIFT 0x16
+#define D2F4_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS_MASK 0x800000
+#define D2F4_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS__SHIFT 0x17
+#define D2F4_SLOT_STATUS__DL_STATE_CHANGED_MASK 0x1000000
+#define D2F4_SLOT_STATUS__DL_STATE_CHANGED__SHIFT 0x18
+#define D2F4_ROOT_CNTL__SERR_ON_CORR_ERR_EN_MASK 0x1
+#define D2F4_ROOT_CNTL__SERR_ON_CORR_ERR_EN__SHIFT 0x0
+#define D2F4_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN_MASK 0x2
+#define D2F4_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN__SHIFT 0x1
+#define D2F4_ROOT_CNTL__SERR_ON_FATAL_ERR_EN_MASK 0x4
+#define D2F4_ROOT_CNTL__SERR_ON_FATAL_ERR_EN__SHIFT 0x2
+#define D2F4_ROOT_CNTL__PM_INTERRUPT_EN_MASK 0x8
+#define D2F4_ROOT_CNTL__PM_INTERRUPT_EN__SHIFT 0x3
+#define D2F4_ROOT_CNTL__CRS_SOFTWARE_VISIBILITY_EN_MASK 0x10
+#define D2F4_ROOT_CNTL__CRS_SOFTWARE_VISIBILITY_EN__SHIFT 0x4
+#define D2F4_ROOT_CAP__CRS_SOFTWARE_VISIBILITY_MASK 0x10000
+#define D2F4_ROOT_CAP__CRS_SOFTWARE_VISIBILITY__SHIFT 0x10
+#define D2F4_ROOT_STATUS__PME_REQUESTOR_ID_MASK 0xffff
+#define D2F4_ROOT_STATUS__PME_REQUESTOR_ID__SHIFT 0x0
+#define D2F4_ROOT_STATUS__PME_STATUS_MASK 0x10000
+#define D2F4_ROOT_STATUS__PME_STATUS__SHIFT 0x10
+#define D2F4_ROOT_STATUS__PME_PENDING_MASK 0x20000
+#define D2F4_ROOT_STATUS__PME_PENDING__SHIFT 0x11
+#define D2F4_DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED_MASK 0xf
+#define D2F4_DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED__SHIFT 0x0
+#define D2F4_DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED_MASK 0x10
+#define D2F4_DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED__SHIFT 0x4
+#define D2F4_DEVICE_CAP2__ARI_FORWARDING_SUPPORTED_MASK 0x20
+#define D2F4_DEVICE_CAP2__ARI_FORWARDING_SUPPORTED__SHIFT 0x5
+#define D2F4_DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED_MASK 0x40
+#define D2F4_DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED__SHIFT 0x6
+#define D2F4_DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED_MASK 0x80
+#define D2F4_DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED__SHIFT 0x7
+#define D2F4_DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED_MASK 0x100
+#define D2F4_DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED__SHIFT 0x8
+#define D2F4_DEVICE_CAP2__CAS128_CMPLT_SUPPORTED_MASK 0x200
+#define D2F4_DEVICE_CAP2__CAS128_CMPLT_SUPPORTED__SHIFT 0x9
+#define D2F4_DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING_MASK 0x400
+#define D2F4_DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING__SHIFT 0xa
+#define D2F4_DEVICE_CAP2__LTR_SUPPORTED_MASK 0x800
+#define D2F4_DEVICE_CAP2__LTR_SUPPORTED__SHIFT 0xb
+#define D2F4_DEVICE_CAP2__TPH_CPLR_SUPPORTED_MASK 0x3000
+#define D2F4_DEVICE_CAP2__TPH_CPLR_SUPPORTED__SHIFT 0xc
+#define D2F4_DEVICE_CAP2__OBFF_SUPPORTED_MASK 0xc0000
+#define D2F4_DEVICE_CAP2__OBFF_SUPPORTED__SHIFT 0x12
+#define D2F4_DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED_MASK 0x100000
+#define D2F4_DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED__SHIFT 0x14
+#define D2F4_DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED_MASK 0x200000
+#define D2F4_DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED__SHIFT 0x15
+#define D2F4_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES_MASK 0xc00000
+#define D2F4_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES__SHIFT 0x16
+#define D2F4_DEVICE_CNTL2__CPL_TIMEOUT_VALUE_MASK 0xf
+#define D2F4_DEVICE_CNTL2__CPL_TIMEOUT_VALUE__SHIFT 0x0
+#define D2F4_DEVICE_CNTL2__CPL_TIMEOUT_DIS_MASK 0x10
+#define D2F4_DEVICE_CNTL2__CPL_TIMEOUT_DIS__SHIFT 0x4
+#define D2F4_DEVICE_CNTL2__ARI_FORWARDING_EN_MASK 0x20
+#define D2F4_DEVICE_CNTL2__ARI_FORWARDING_EN__SHIFT 0x5
+#define D2F4_DEVICE_CNTL2__ATOMICOP_REQUEST_EN_MASK 0x40
+#define D2F4_DEVICE_CNTL2__ATOMICOP_REQUEST_EN__SHIFT 0x6
+#define D2F4_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING_MASK 0x80
+#define D2F4_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING__SHIFT 0x7
+#define D2F4_DEVICE_CNTL2__IDO_REQUEST_ENABLE_MASK 0x100
+#define D2F4_DEVICE_CNTL2__IDO_REQUEST_ENABLE__SHIFT 0x8
+#define D2F4_DEVICE_CNTL2__IDO_COMPLETION_ENABLE_MASK 0x200
+#define D2F4_DEVICE_CNTL2__IDO_COMPLETION_ENABLE__SHIFT 0x9
+#define D2F4_DEVICE_CNTL2__LTR_EN_MASK 0x400
+#define D2F4_DEVICE_CNTL2__LTR_EN__SHIFT 0xa
+#define D2F4_DEVICE_CNTL2__OBFF_EN_MASK 0x6000
+#define D2F4_DEVICE_CNTL2__OBFF_EN__SHIFT 0xd
+#define D2F4_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING_MASK 0x8000
+#define D2F4_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING__SHIFT 0xf
+#define D2F4_DEVICE_STATUS2__RESERVED_MASK 0xffff0000
+#define D2F4_DEVICE_STATUS2__RESERVED__SHIFT 0x10
+#define D2F4_LINK_CAP2__SUPPORTED_LINK_SPEED_MASK 0xfe
+#define D2F4_LINK_CAP2__SUPPORTED_LINK_SPEED__SHIFT 0x1
+#define D2F4_LINK_CAP2__CROSSLINK_SUPPORTED_MASK 0x100
+#define D2F4_LINK_CAP2__CROSSLINK_SUPPORTED__SHIFT 0x8
+#define D2F4_LINK_CAP2__RESERVED_MASK 0xfffffe00
+#define D2F4_LINK_CAP2__RESERVED__SHIFT 0x9
+#define D2F4_LINK_CNTL2__TARGET_LINK_SPEED_MASK 0xf
+#define D2F4_LINK_CNTL2__TARGET_LINK_SPEED__SHIFT 0x0
+#define D2F4_LINK_CNTL2__ENTER_COMPLIANCE_MASK 0x10
+#define D2F4_LINK_CNTL2__ENTER_COMPLIANCE__SHIFT 0x4
+#define D2F4_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE_MASK 0x20
+#define D2F4_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define D2F4_LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define D2F4_LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define D2F4_LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define D2F4_LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define D2F4_LINK_CNTL2__ENTER_MOD_COMPLIANCE_MASK 0x400
+#define D2F4_LINK_CNTL2__ENTER_MOD_COMPLIANCE__SHIFT 0xa
+#define D2F4_LINK_CNTL2__COMPLIANCE_SOS_MASK 0x800
+#define D2F4_LINK_CNTL2__COMPLIANCE_SOS__SHIFT 0xb
+#define D2F4_LINK_CNTL2__COMPLIANCE_DEEMPHASIS_MASK 0xf000
+#define D2F4_LINK_CNTL2__COMPLIANCE_DEEMPHASIS__SHIFT 0xc
+#define D2F4_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL_MASK 0x10000
+#define D2F4_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL__SHIFT 0x10
+#define D2F4_LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x20000
+#define D2F4_LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x11
+#define D2F4_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x40000
+#define D2F4_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x12
+#define D2F4_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS_MASK 0x80000
+#define D2F4_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS__SHIFT 0x13
+#define D2F4_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS_MASK 0x100000
+#define D2F4_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS__SHIFT 0x14
+#define D2F4_LINK_STATUS2__LINK_EQUALIZATION_REQUEST_MASK 0x200000
+#define D2F4_LINK_STATUS2__LINK_EQUALIZATION_REQUEST__SHIFT 0x15
+#define D2F4_SLOT_CAP2__RESERVED_MASK 0xffffffff
+#define D2F4_SLOT_CAP2__RESERVED__SHIFT 0x0
+#define D2F4_SLOT_CNTL2__RESERVED_MASK 0xffff
+#define D2F4_SLOT_CNTL2__RESERVED__SHIFT 0x0
+#define D2F4_SLOT_STATUS2__RESERVED_MASK 0xffff0000
+#define D2F4_SLOT_STATUS2__RESERVED__SHIFT 0x10
+#define D2F4_MSI_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F4_MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F4_MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F4_MSI_MSG_CNTL__MSI_EN_MASK 0x10000
+#define D2F4_MSI_MSG_CNTL__MSI_EN__SHIFT 0x10
+#define D2F4_MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe0000
+#define D2F4_MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x11
+#define D2F4_MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x700000
+#define D2F4_MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x14
+#define D2F4_MSI_MSG_CNTL__MSI_64BIT_MASK 0x800000
+#define D2F4_MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x17
+#define D2F4_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP_MASK 0x1000000
+#define D2F4_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP__SHIFT 0x18
+#define D2F4_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define D2F4_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define D2F4_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define D2F4_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define D2F4_MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define D2F4_MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define D2F4_MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define D2F4_MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define D2F4_SSID_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F4_SSID_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_SSID_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F4_SSID_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F4_SSID_CAP__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define D2F4_SSID_CAP__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define D2F4_SSID_CAP__SUBSYSTEM_ID_MASK 0xffff0000
+#define D2F4_SSID_CAP__SUBSYSTEM_ID__SHIFT 0x10
+#define D2F4_MSI_MAP_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F4_MSI_MAP_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_MSI_MAP_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F4_MSI_MAP_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F4_MSI_MAP_CAP__EN_MASK 0x10000
+#define D2F4_MSI_MAP_CAP__EN__SHIFT 0x10
+#define D2F4_MSI_MAP_CAP__FIXD_MASK 0x20000
+#define D2F4_MSI_MAP_CAP__FIXD__SHIFT 0x11
+#define D2F4_MSI_MAP_CAP__CAP_TYPE_MASK 0xf8000000
+#define D2F4_MSI_MAP_CAP__CAP_TYPE__SHIFT 0x1b
+#define D2F4_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO_MASK 0xfff00000
+#define D2F4_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO__SHIFT 0x14
+#define D2F4_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI_MASK 0xffffffff
+#define D2F4_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI__SHIFT 0x0
+#define D2F4_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F4_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F4_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F4_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F4_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F4_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID_MASK 0xffff
+#define D2F4_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID__SHIFT 0x0
+#define D2F4_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV_MASK 0xf0000
+#define D2F4_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV__SHIFT 0x10
+#define D2F4_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH_MASK 0xfff00000
+#define D2F4_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH__SHIFT 0x14
+#define D2F4_PCIE_VENDOR_SPECIFIC1__SCRATCH_MASK 0xffffffff
+#define D2F4_PCIE_VENDOR_SPECIFIC1__SCRATCH__SHIFT 0x0
+#define D2F4_PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define D2F4_PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define D2F4_PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F4_PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F4_PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F4_PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F4_PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F4_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define D2F4_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define D2F4_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT_MASK 0x70
+#define D2F4_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT__SHIFT 0x4
+#define D2F4_PCIE_PORT_VC_CAP_REG1__REF_CLK_MASK 0x300
+#define D2F4_PCIE_PORT_VC_CAP_REG1__REF_CLK__SHIFT 0x8
+#define D2F4_PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE_MASK 0xc00
+#define D2F4_PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE__SHIFT 0xa
+#define D2F4_PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP_MASK 0xff
+#define D2F4_PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP__SHIFT 0x0
+#define D2F4_PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D2F4_PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D2F4_PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE_MASK 0x1
+#define D2F4_PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE__SHIFT 0x0
+#define D2F4_PCIE_PORT_VC_CNTL__VC_ARB_SELECT_MASK 0xe
+#define D2F4_PCIE_PORT_VC_CNTL__VC_ARB_SELECT__SHIFT 0x1
+#define D2F4_PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS_MASK 0x10000
+#define D2F4_PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS__SHIFT 0x10
+#define D2F4_PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define D2F4_PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define D2F4_PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define D2F4_PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D2F4_PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D2F4_PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D2F4_PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D2F4_PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define D2F4_PCIE_VC0_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define D2F4_PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x10000
+#define D2F4_PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x10
+#define D2F4_PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x20000
+#define D2F4_PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x11
+#define D2F4_PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define D2F4_PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define D2F4_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define D2F4_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D2F4_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D2F4_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D2F4_PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D2F4_PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define D2F4_PCIE_VC1_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define D2F4_PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x10000
+#define D2F4_PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x10
+#define D2F4_PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x20000
+#define D2F4_PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x11
+#define D2F4_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F4_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F4_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F4_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F4_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F4_PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO_MASK 0xffffffff
+#define D2F4_PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO__SHIFT 0x0
+#define D2F4_PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI_MASK 0xffffffff
+#define D2F4_PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI__SHIFT 0x0
+#define D2F4_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F4_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F4_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F4_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F4_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F4_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F4_PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS_MASK 0x10
+#define D2F4_PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS__SHIFT 0x4
+#define D2F4_PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS_MASK 0x20
+#define D2F4_PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS__SHIFT 0x5
+#define D2F4_PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS_MASK 0x1000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS__SHIFT 0xc
+#define D2F4_PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS_MASK 0x2000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS__SHIFT 0xd
+#define D2F4_PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS_MASK 0x4000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS__SHIFT 0xe
+#define D2F4_PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS_MASK 0x8000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS__SHIFT 0xf
+#define D2F4_PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS_MASK 0x10000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS__SHIFT 0x10
+#define D2F4_PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS_MASK 0x20000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS__SHIFT 0x11
+#define D2F4_PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS_MASK 0x40000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS__SHIFT 0x12
+#define D2F4_PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS_MASK 0x80000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS__SHIFT 0x13
+#define D2F4_PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS_MASK 0x100000
+#define D2F4_PCIE_UNCORR_ERR_STATUS__UNSUPP_RE

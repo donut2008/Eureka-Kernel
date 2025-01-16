@@ -1,81 +1,74 @@
-/**
- * i2c-exynos5.h - Samsung Exynos5 I2C Controller Driver Header file
- *
- * Copyright (C) 2015 Samsung Electronics Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
-*/
+ sizeof(ohdr->u.rc.reth) / sizeof(u32);
+			ss = NULL;
+			len = 0;
+			bth2 |= IB_BTH_REQ_ACK;
+			if (++qp->s_cur == qp->s_size)
+				qp->s_cur = 0;
+			break;
 
-#ifndef __I2C_EXYNOS5_H
-#define __I2C_EXYNOS5_H
+		case IB_WR_ATOMIC_CMP_AND_SWP:
+		case IB_WR_ATOMIC_FETCH_AND_ADD:
+			/*
+			 * Don't allow more operations to be started
+			 * than the QP limits allow.
+			 */
+			if (newreq) {
+				if (qp->s_num_rd_atomic >=
+				    qp->s_max_rd_atomic) {
+					qp->s_flags |= QIB_S_WAIT_RDMAR;
+					goto bail;
+				}
+				qp->s_num_rd_atomic++;
+				if (!(qp->s_flags & QIB_S_UNLIMITED_CREDIT))
+					qp->s_lsn++;
+				wqe->lpsn = wqe->psn;
+			}
+			if (wqe->atomic_wr.wr.opcode == IB_WR_ATOMIC_CMP_AND_SWP) {
+				qp->s_state = OP(COMPARE_SWAP);
+				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+					wqe->atomic_wr.swap);
+				ohdr->u.atomic_eth.compare_data = cpu_to_be64(
+					wqe->atomic_wr.compare_add);
+			} else {
+				qp->s_state = OP(FETCH_ADD);
+				ohdr->u.atomic_eth.swap_data = cpu_to_be64(
+					wqe->atomic_wr.compare_add);
+				ohdr->u.atomic_eth.compare_data = 0;
+			}
+			ohdr->u.atomic_eth.vaddr[0] = cpu_to_be32(
+				wqe->atomic_wr.remote_addr >> 32);
+			ohdr->u.atomic_eth.vaddr[1] = cpu_to_be32(
+				wqe->atomic_wr.remote_addr);
+			ohdr->u.atomic_eth.rkey = cpu_to_be32(
+				wqe->atomic_wr.rkey);
+			hwords += sizeof(struct ib_atomic_eth) / sizeof(u32);
+			ss = NULL;
+			len = 0;
+			bth2 |= IB_BTH_REQ_ACK;
+			if (++qp->s_cur == qp->s_size)
+				qp->s_cur = 0;
+			break;
 
-struct exynos5_i2c {
-	struct list_head	node;
-	struct i2c_adapter	adap;
-	unsigned int		need_hw_init;
-	unsigned int		suspended:1;
+		default:
+			goto bail;
+		}
+		qp->s_sge.sge = wqe->sg_list[0];
+		qp->s_sge.sg_list = wqe->sg_list + 1;
+		qp->s_sge.num_sge = wqe->wr.num_sge;
+		qp->s_sge.total_len = wqe->length;
+		qp->s_len = wqe->length;
+		if (newreq) {
+			qp->s_tail++;
+			if (qp->s_tail >= qp->s_size)
+				qp->s_tail = 0;
+		}
+		if (wqe->wr.opcode == IB_WR_RDMA_READ)
+			qp->s_psn = wqe->lpsn + 1;
+		else {
+			qp->s_psn++;
+			if (qib_cmp24(qp->s_psn, qp->s_next_psn) > 0)
+				qp->s_next_psn = qp->s_psn;
+		}
+		break;
 
-	struct i2c_msg		*msg;
-	struct completion	msg_complete;
-	unsigned int		msg_ptr;
-	unsigned int		msg_len;
-
-	unsigned int		irq;
-
-	void __iomem		*regs;
-	void __iomem		*regs_mailbox;
-	struct clk		*clk;
-	struct clk		*rate_clk;
-	struct device		*dev;
-	int			state;
-
-	/*
-	 * Since the TRANS_DONE bit is cleared on read, and we may read it
-	 * either during an IRQ or after a transaction, keep track of its
-	 * state here.
-	 */
-	int			trans_done;
-
-	/* Controller operating frequency */
-	unsigned int		fs_clock;
-	unsigned int		hs_clock;
-
-	/* to set the source clock */
-	unsigned int		default_clk;
-
-	/*
-	 * HSI2C Controller can operate in
-	 * 1. High speed upto 3.4Mbps
-	 * 2. Fast speed upto 1Mbps
-	 */
-	int			speed_mode;
-	int			operation_mode;
-	int			bus_id;
-	int			scl_clk_stretch;
-	int			stop_after_trans;
-	int			use_old_timing_values;
-	unsigned int		imode_addr;
-	void __iomem		*imode_base;
-	unsigned int		transfer_delay;
-	unsigned int		sda_trigger_timing;
-	int			scl_extended_low;
-#ifdef CONFIG_EXYNOS_APM
-	int			use_apm_mode;
-#endif
-	/* HSI2C Batcher can automatically handle HSI2C operation */
-	int			support_hsi2c_batcher;
-
-	unsigned int		cmd_buffer;
-	unsigned int		cmd_index;
-	unsigned int		cmd_pointer;
-	unsigned int		desc_pointer;
-	unsigned int		batcher_read_addr;
-	int			need_cs_enb;
-	int			idle_ip_index;
-	int			reset_before_trans;
-	unsigned int		runtime_resumed;
-	unsigned int		qactive_off;
-};
-#endif /*__I2C_EXYNOS5_H */
+	case OP(RDMA_RE

@@ -1,26 +1,20 @@
-#ifndef __LINUX_USB_PCI_QUIRKS_H
-#define __LINUX_USB_PCI_QUIRKS_H
-
-#ifdef CONFIG_PCI
-void uhci_reset_hc(struct pci_dev *pdev, unsigned long base);
-int uhci_check_and_reset_hc(struct pci_dev *pdev, unsigned long base);
-int usb_amd_find_chipset_info(void);
-int usb_hcd_amd_remote_wakeup_quirk(struct pci_dev *pdev);
-bool usb_amd_hang_symptom_quirk(void);
-bool usb_amd_prefetch_quirk(void);
-void usb_amd_dev_put(void);
-void usb_amd_quirk_pll_disable(void);
-void usb_amd_quirk_pll_enable(void);
-void usb_enable_intel_xhci_ports(struct pci_dev *xhci_pdev);
-void usb_disable_xhci_ports(struct pci_dev *xhci_pdev);
-void sb800_prefetch(struct device *dev, int on);
-#else
-struct pci_dev;
-static inline void usb_amd_quirk_pll_disable(void) {}
-static inline void usb_amd_quirk_pll_enable(void) {}
-static inline void usb_amd_dev_put(void) {}
-static inline void usb_disable_xhci_ports(struct pci_dev *xhci_pdev) {}
-static inline void sb800_prefetch(struct device *dev, int on) {}
-#endif  /* CONFIG_PCI */
-
-#endif  /*  __LINUX_USB_PCI_QUIRKS_H  */
+/*
+ * DCE_10_0 Register documentation
+ *
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, T

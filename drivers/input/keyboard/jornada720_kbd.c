@@ -1,174 +1,84 @@
-/*
- * drivers/input/keyboard/jornada720_kbd.c
- *
- * HP Jornada 720 keyboard platform driver
- *
- * Copyright (C) 2006/2007 Kristoffer Ericson <Kristoffer.Ericson@Gmail.com>
- *
- *    Copyright (C) 2006 jornada 720 kbd driver by
-		Filip Zyzniewsk <Filip.Zyzniewski@tefnet.plX
- *     based on (C) 2004 jornada 720 kbd driver by
-		Alex Lange <chicken@handhelds.org>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- */
-#include <linux/device.h>
-#include <linux/errno.h>
-#include <linux/interrupt.h>
-#include <linux/input.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-
-#include <mach/jornada720.h>
-#include <mach/hardware.h>
-#include <mach/irqs.h>
-
-MODULE_AUTHOR("Kristoffer Ericson <Kristoffer.Ericson@gmail.com>");
-MODULE_DESCRIPTION("HP Jornada 710/720/728 keyboard driver");
-MODULE_LICENSE("GPL v2");
-
-static unsigned short jornada_std_keymap[128] = {					/* ROW */
-	0, KEY_ESC, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,		/* #1  */
-	KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_MUTE,	/*  -> */
-	0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,		/* #2  */
-	KEY_0, KEY_MINUS, KEY_EQUAL,0, 0, 0,						/*  -> */
-	0, KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_U, KEY_I, KEY_O,		/* #3  */
-	KEY_P, KEY_BACKSLASH, KEY_BACKSPACE, 0, 0, 0,					/*  -> */
-	0, KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,		/* #4  */
-	KEY_SEMICOLON, KEY_LEFTBRACE, KEY_RIGHTBRACE, 0, 0, 0,				/*  -> */
-	0, KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M, KEY_COMMA,			/* #5  */
-	KEY_DOT, KEY_KPMINUS, KEY_APOSTROPHE, KEY_ENTER, 0, 0,0,			/*  -> */
-	0, KEY_TAB, 0, KEY_LEFTSHIFT, 0, KEY_APOSTROPHE, 0, 0, 0, 0,			/* #6  */
-	KEY_UP, 0, KEY_RIGHTSHIFT, 0, 0, 0,0, 0, 0, 0, 0, KEY_LEFTALT, KEY_GRAVE,	/*  -> */
-	0, 0, KEY_LEFT, KEY_DOWN, KEY_RIGHT, 0, 0, 0, 0,0, KEY_KPASTERISK,		/*  -> */
-	KEY_LEFTCTRL, 0, KEY_SPACE, 0, 0, 0, KEY_SLASH, KEY_DELETE, 0, 0,		/*  -> */
-	0, 0, 0, KEY_POWER,								/*  -> */
-};
-
-struct jornadakbd {
-	unsigned short keymap[ARRAY_SIZE(jornada_std_keymap)];
-	struct input_dev *input;
-};
-
-static irqreturn_t jornada720_kbd_interrupt(int irq, void *dev_id)
-{
-	struct platform_device *pdev = dev_id;
-	struct jornadakbd *jornadakbd = platform_get_drvdata(pdev);
-	struct input_dev *input = jornadakbd->input;
-	u8 count, kbd_data, scan_code;
-
-	/* startup ssp with spinlock */
-	jornada_ssp_start();
-
-	if (jornada_ssp_inout(GETSCANKEYCODE) != TXDUMMY) {
-		printk(KERN_DEBUG
-			"jornada720_kbd: "
-			"GetKeycode command failed with ETIMEDOUT, "
-			"flushed bus\n");
-	} else {
-		/* How many keycodes are waiting for us? */
-		count = jornada_ssp_byte(TXDUMMY);
-
-		/* Lets drag them out one at a time */
-		while (count--) {
-			/* Exchange TxDummy for location (keymap[kbddata]) */
-			kbd_data = jornada_ssp_byte(TXDUMMY);
-			scan_code = kbd_data & 0x7f;
-
-			input_event(input, EV_MSC, MSC_SCAN, scan_code);
-			input_report_key(input, jornadakbd->keymap[scan_code],
-					 !(kbd_data & 0x80));
-			input_sync(input);
-		}
-	}
-
-	/* release spinlock and turn off ssp */
-	jornada_ssp_end();
-
-	return IRQ_HANDLED;
-};
-
-static int jornada720_kbd_probe(struct platform_device *pdev)
-{
-	struct jornadakbd *jornadakbd;
-	struct input_dev *input_dev;
-	int i, err;
-
-	jornadakbd = kzalloc(sizeof(struct jornadakbd), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!jornadakbd || !input_dev) {
-		err = -ENOMEM;
-		goto fail1;
-	}
-
-	platform_set_drvdata(pdev, jornadakbd);
-
-	memcpy(jornadakbd->keymap, jornada_std_keymap,
-		sizeof(jornada_std_keymap));
-	jornadakbd->input = input_dev;
-
-	input_dev->evbit[0] = BIT(EV_KEY) | BIT(EV_REP);
-	input_dev->name = "HP Jornada 720 keyboard";
-	input_dev->phys = "jornadakbd/input0";
-	input_dev->keycode = jornadakbd->keymap;
-	input_dev->keycodesize = sizeof(unsigned short);
-	input_dev->keycodemax = ARRAY_SIZE(jornada_std_keymap);
-	input_dev->id.bustype = BUS_HOST;
-	input_dev->dev.parent = &pdev->dev;
-
-	for (i = 0; i < ARRAY_SIZE(jornadakbd->keymap); i++)
-		__set_bit(jornadakbd->keymap[i], input_dev->keybit);
-	__clear_bit(KEY_RESERVED, input_dev->keybit);
-
-	input_set_capability(input_dev, EV_MSC, MSC_SCAN);
-
-	err = request_irq(IRQ_GPIO0,
-			  jornada720_kbd_interrupt,
-			  IRQF_TRIGGER_FALLING,
-			  "jornadakbd", pdev);
-	if (err) {
-		printk(KERN_INFO "jornadakbd720_kbd: Unable to grab IRQ\n");
-		goto fail1;
-	}
-
-	err = input_register_device(jornadakbd->input);
-	if (err)
-		goto fail2;
-
-	return 0;
-
- fail2:	/* IRQ, DEVICE, MEMORY */
-	free_irq(IRQ_GPIO0, pdev);
- fail1:	/* DEVICE, MEMORY */
-	input_free_device(input_dev);
-	kfree(jornadakbd);
-	return err;
-};
-
-static int jornada720_kbd_remove(struct platform_device *pdev)
-{
-	struct jornadakbd *jornadakbd = platform_get_drvdata(pdev);
-
-	free_irq(IRQ_GPIO0, pdev);
-	input_unregister_device(jornadakbd->input);
-	kfree(jornadakbd);
-
-	return 0;
-}
-
-/* work with hotplug and coldplug */
-MODULE_ALIAS("platform:jornada720_kbd");
-
-static struct platform_driver jornada720_kbd_driver = {
-	.driver  = {
-		.name    = "jornada720_kbd",
-	 },
-	.probe   = jornada720_kbd_probe,
-	.remove  = jornada720_kbd_remove,
-};
-module_platform_driver(jornada720_kbd_driver);
+IDATED_10__SHIFT 0xa
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_11_MASK 0x800
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_11__SHIFT 0xb
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_12_MASK 0x1000
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_12__SHIFT 0xc
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_13_MASK 0x2000
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_13__SHIFT 0xd
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_14_MASK 0x4000
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_14__SHIFT 0xe
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_15_MASK 0x8000
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_15__SHIFT 0xf
+#define VM_PRT_APERTURE0_LOW_ADDR__LOGICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_PRT_APERTURE0_LOW_ADDR__LOGICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_PRT_APERTURE1_LOW_ADDR__LOGICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_PRT_APERTURE1_LOW_ADDR__LOGICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_PRT_APERTURE2_LOW_ADDR__LOGICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_PRT_APERTURE2_LOW_ADDR__LOGICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_PRT_APERTURE3_LOW_ADDR__LOGICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_PRT_APERTURE3_LOW_ADDR__LOGICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_PRT_APERTURE0_HIGH_ADDR__LOGICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_PRT_APERTURE0_HIGH_ADDR__LOGICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_PRT_APERTURE1_HIGH_ADDR__LOGICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_PRT_APERTURE1_HIGH_ADDR__LOGICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_PRT_APERTURE2_HIGH_ADDR__LOGICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_PRT_APERTURE2_HIGH_ADDR__LOGICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_PRT_APERTURE3_HIGH_ADDR__LOGICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_PRT_APERTURE3_HIGH_ADDR__LOGICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_PRT_CNTL__CB_DISABLE_READ_FAULT_ON_UNMAPPED_ACCESS_MASK 0x1
+#define VM_PRT_CNTL__CB_DISABLE_READ_FAULT_ON_UNMAPPED_ACCESS__SHIFT 0x0
+#define VM_PRT_CNTL__TC_DISABLE_READ_FAULT_ON_UNMAPPED_ACCESS_MASK 0x2
+#define VM_PRT_CNTL__TC_DISABLE_READ_FAULT_ON_UNMAPPED_ACCESS__SHIFT 0x1
+#define VM_PRT_CNTL__L2_CACHE_STORE_INVALID_ENTRIES_MASK 0x4
+#define VM_PRT_CNTL__L2_CACHE_STORE_INVALID_ENTRIES__SHIFT 0x2
+#define VM_PRT_CNTL__L1_TLB_STORE_INVALID_ENTRIES_MASK 0x8
+#define VM_PRT_CNTL__L1_TLB_STORE_INVALID_ENTRIES__SHIFT 0x3
+#define VM_PRT_CNTL__CB_DISABLE_WRITE_FAULT_ON_UNMAPPED_ACCESS_MASK 0x10
+#define VM_PRT_CNTL__CB_DISABLE_WRITE_FAULT_ON_UNMAPPED_ACCESS__SHIFT 0x4
+#define VM_PRT_CNTL__TC_DISABLE_WRITE_FAULT_ON_UNMAPPED_ACCESS_MASK 0x20
+#define VM_PRT_CNTL__TC_DISABLE_WRITE_FAULT_ON_UNMAPPED_ACCESS__SHIFT 0x5
+#define VM_PRT_CNTL__MASK_PDE0_FAULT_MASK 0x40
+#define VM_PRT_CNTL__MASK_PDE0_FAULT__SHIFT 0x6
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_0_MASK 0x1
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_0__SHIFT 0x0
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_1_MASK 0x2
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_1__SHIFT 0x1
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_2_MASK 0x4
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_2__SHIFT 0x2
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_3_MASK 0x8
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_3__SHIFT 0x3
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_4_MASK 0x10
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_4__SHIFT 0x4
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_5_MASK 0x20
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_5__SHIFT 0x5
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_6_MASK 0x40
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_6__SHIFT 0x6
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_7_MASK 0x80
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_7__SHIFT 0x7
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_8_MASK 0x100
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_8__SHIFT 0x8
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_9_MASK 0x200
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_9__SHIFT 0x9
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_10_MASK 0x400
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_10__SHIFT 0xa
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_11_MASK 0x800
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_11__SHIFT 0xb
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_12_MASK 0x1000
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_12__SHIFT 0xc
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_13_MASK 0x2000
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_13__SHIFT 0xd
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_14_MASK 0x4000
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_14__SHIFT 0xe
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_15_MASK 0x8000
+#define VM_CONTEXTS_DISABLE__DISABLE_CONTEXT_15__SHIFT 0xf
+#define VM_CONTEXT0_PROTECTION_FAULT_STATUS__PROTECTIONS_MASK 0xff
+#define VM_CONTEXT0_PROTECTION_FAULT_STATUS__PROTECTIONS__SHIFT 0x0
+#define VM_CONTEXT0_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_ID_MASK 0xff000
+#define VM_CONTEXT0_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_ID__SHIFT 0xc
+#define VM_CONTEXT0_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_RW_MASK 0x1000000
+#define VM_CONTEXT0_PROTECTION_FAULT_STATUS__MEMORY_CLIENT_RW__SHIFT 0x18
+#define VM_CONTEXT0_PROTECTION_FAULT_STATUS__VMID_MASK 0x1e000000
+#define VM_CONTEXT0_PROTECTION_FAULT_STATUS__VMID__SHIFT 0x19
+#define VM_CONTEXT1_PROTECTION_FAULT_STATUS__PROTECTIONS_MASK 0xff
+#define VM_CONTEXT1_PROTECTION_FAULT_STATUS__PROTECTIONS__SHIFT 0x0
+#define VM_CONTEXT1_PROTECTION_FAULT_STATUS__MEMOR

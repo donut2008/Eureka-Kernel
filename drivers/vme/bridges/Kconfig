@@ -1,15 +1,6 @@
-comment "VME Bridge Drivers"
-
-config VME_CA91CX42
-	tristate "Universe II"
-	depends on VIRT_TO_BUS
-	help
-	 If you say Y here you get support for the Tundra CA91C142
-	 (Universe II) VME bridge chip.
-
-config VME_TSI148
-	tristate "Tempe"
-	depends on HAS_DMA
-	help
-	 If you say Y here you get support for the Tundra TSI148 VME bridge
-	 chip.
+IFT 0x2
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT3_STATUS_MASK 0x8
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT3_STATUS__SHIFT 0x3
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT4_STATUS_MASK 0x10
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT4_STATUS__SHIFT 0x4
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT5_STATUS_MAS

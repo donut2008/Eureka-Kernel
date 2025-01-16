@@ -1,544 +1,572 @@
-/*
- * Copyright (C) 2010 Samsung Electronics.
+te, i) {
+		const struct drm_plane_helper_funcs *funcs;
+
+		funcs = plane->helper_private;
+
+		if (funcs->cleanup_fb)
+			funcs->cleanup_fb(plane, plane_state);
+	}
+}
+EXPORT_SYMBOL(drm_atomic_helper_cleanup_planes);
+
+/**
+ * drm_atomic_helper_swap_state - store atomic state into current sw state
+ * @dev: DRM device
+ * @state: atomic state
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
+ * This function stores the atomic state into the current state pointers in all
+ * driver objects. It should be called after all failing steps have been done
+ * and succeeded, but before the actual hardware state is committed.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * For cleanup and error recovery the current state for all changed objects will
+ * be swaped into @state.
  *
+ * With that sequence it fits perfectly into the plane prepare/cleanup sequence:
+ *
+ * 1. Call drm_atomic_helper_prepare_planes() with the staged atomic state.
+ *
+ * 2. Do any other steps that might fail.
+ *
+ * 3. Put the staged state into the current state pointers with this function.
+ *
+ * 4. Actually commit the hardware state.
+ *
+ * 5. Call drm_atomic_helper_cleanup_planes() with @state, which since step 3
+ * contains the old state. Also do any other cleanup required with that state.
  */
-
-#include <linux/init.h>
-#include <linux/irq.h>
-#include <linux/interrupt.h>
-#include <linux/gpio.h>
-#include <linux/delay.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/consumer.h>
-#include <linux/clk.h>
-#include <linux/mcu_ipc.h>
-#include <linux/pinctrl/consumer.h>
-
-#include <asm/cacheflush.h>
-
-#include "gnss_prj.h"
-#include "gnss_link_device_shmem.h"
-#include "pmu-gnss.h"
-
-#define BCMD_WAKELOCK_TIMEOUT		(HZ / 10) /* 100 msec */
-#define REQ_BCMD_TIMEOUT	200		/* 10 ms */
-
-static void gnss_state_changed(struct gnss_ctl *gc, enum gnss_state state)
+void drm_atomic_helper_swap_state(struct drm_device *dev,
+				  struct drm_atomic_state *state)
 {
-	struct io_device *iod = gc->iod;
-	int old_state = gc->gnss_state;
+	int i;
 
-	if (old_state != state) {
-		gc->gnss_state = state;
-		gif_err("%s state changed (%s -> %s)\n", gc->name,
-			get_gnss_state_str(old_state), get_gnss_state_str(state));
+	for (i = 0; i < dev->mode_config.num_connector; i++) {
+		struct drm_connector *connector = state->connectors[i];
+
+		if (!connector)
+			continue;
+
+		connector->state->state = state;
+		swap(state->connector_states[i], connector->state);
+		connector->state->state = NULL;
 	}
 
-	if (state == STATE_OFFLINE || state == STATE_FAULT)
-		wake_up(&iod->wq);
-}
+	for (i = 0; i < dev->mode_config.num_crtc; i++) {
+		struct drm_crtc *crtc = state->crtcs[i];
 
-static irqreturn_t kepler_active_isr(int irq, void *arg)
-{
-	struct gnss_ctl *gc = (struct gnss_ctl *)arg;
-	struct io_device *iod = gc->iod;
+		if (!crtc)
+			continue;
 
-	gif_err("ACTIVE Interrupt occurred!\n");
-
-	if (!wake_lock_active(&gc->gc_fault_wake_lock))
-		wake_lock_timeout(&gc->gc_fault_wake_lock, HZ);
-
-	gnss_state_changed(gc, STATE_FAULT);
-	wake_up(&iod->wq);
-
-	gc->pmu_ops->clear_int(GNSS_INT_ACTIVE_CLEAR);
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t kepler_wdt_isr(int irq, void *arg)
-{
-	struct gnss_ctl *gc = (struct gnss_ctl *)arg;
-	struct io_device *iod = gc->iod;
-
-	gif_err("WDT Interrupt occurred!\n");
-
-	if (!wake_lock_active(&gc->gc_fault_wake_lock))
-		wake_lock_timeout(&gc->gc_fault_wake_lock, HZ);
-
-	gnss_state_changed(gc, STATE_FAULT);
-	wake_up(&iod->wq);
-
-	gc->pmu_ops->clear_int(GNSS_INT_WDT_RESET_CLEAR);
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t kepler_wakelock_isr(int irq, void *arg)
-{
-	struct gnss_ctl *gc = (struct gnss_ctl *)arg;
-	struct gnss_mbox *mbx = gc->gnss_data->mbx;
-	struct link_device *ld = gc->iod->ld;
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-	/*
-	u32 rx_tail, rx_head, tx_tail, tx_head, gnss_ipc_msg, ap_ipc_msg;
-	*/
-
-#ifdef USE_SIMPLE_WAKE_LOCK
-	gif_err("Unexpected interrupt occurred(%s)!!!!\n", __func__);
-	return IRQ_HANDLED;
-#endif
-
-	/* This is for debugging
-	tx_head = get_txq_head(shmd);
-	tx_tail = get_txq_tail(shmd);
-	rx_head = get_rxq_head(shmd);
-	rx_tail = get_rxq_tail(shmd);
-	gnss_ipc_msg =  mbox_get_value(MCU_GNSS, shmd->irq_gnss2ap_ipc_msg);
-	ap_ipc_msg = read_int2gnss(shmd);
-
-	gif_err("RX_H[0x%x], RX_T[0x%x], TX_H[0x%x], TX_T[0x%x],\
-			AP_IPC[0x%x], GNSS_IPC[0x%x]\n",
-			rx_head, rx_tail, tx_head, tx_tail, ap_ipc_msg, gnss_ipc_msg);
-	*/
-
-	/* Clear wake_lock */
-	if (wake_lock_active(&shmd->wlock))
-		wake_unlock(&shmd->wlock);
-
-	gif_debug("Wake Lock ISR!!!!\n");
-	gif_err(">>>>DBUS_SW_WAKE_INT\n");
-
-	/* 1. Set wake-lock-timeout(). */
-	if (!wake_lock_active(&gc->gc_wake_lock))
-		wake_lock_timeout(&gc->gc_wake_lock, HZ); /* 1 sec */
-
-	/* 2. Disable DBUS_SW_WAKE_INT interrupts. */
-	disable_irq_nosync(gc->wake_lock_irq);
-
-	/* 3. Write 0x1 to MBOX_reg[6]. */
-	/* MBOX_req[6] is WAKE_LOCK */
-	if (gnss_read_reg(shmd, GNSS_REG_WAKE_LOCK) == 0X1) {
-		gif_err("@@ reg_wake_lock is already 0x1!!!!!!\n");
-		return IRQ_HANDLED;
-	} else {
-		gnss_write_reg(shmd, GNSS_REG_WAKE_LOCK, 0x1);
+		crtc->state->state = state;
+		swap(state->crtc_states[i], crtc->state);
+		crtc->state->state = NULL;
 	}
 
-	/* 4. Send interrupt MBOX1[3]. */
-	/* Interrupt MBOX1[3] is RSP_WAKE_LOCK_SET */
-	mbox_set_interrupt(mbx->id, mbx->int_ap2gnss_ack_wake_set);
+	for (i = 0; i < dev->mode_config.num_total_plane; i++) {
+		struct drm_plane *plane = state->planes[i];
 
-	return IRQ_HANDLED;
-}
+		if (!plane)
+			continue;
 
-static void kepler_irq_bcmd_handler(void *data)
-{
-	struct gnss_ctl *gc = (struct gnss_ctl *)data;
-
-	/* Signal kepler_req_bcmd */
-	complete(&gc->bcmd_cmpl);
-}
-
-#ifdef USE_SIMPLE_WAKE_LOCK
-static void mbox_kepler_simple_lock(void *arg)
-{
-	struct gnss_ctl *gc = (struct gnss_ctl *)arg;
-	struct gnss_mbox *mbx = gc->gnss_data->mbx;
-
-	gif_debug("[GNSS] WAKE interrupt(Mbox15) occurred\n");
-	mbox_set_interrupt(mbx->id, mbx->int_ap2gnss_ack_wake_set);
-	gc->pmu_ops->clear_int(GNSS_INT_WAKEUP_CLEAR);
-}
-#endif
-
-static void mbox_kepler_wake_clr(void *arg)
-{
-	struct gnss_ctl *gc = (struct gnss_ctl *)arg;
-	struct gnss_mbox *mbx = gc->gnss_data->mbx;
-	struct link_device *ld = gc->iod->ld;
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-
-	/*
-	struct link_device *ld = gc->iod->ld;
-	struct shmem_link_device *shmd = to_shmem_link_device(ld);
-	u32 rx_tail, rx_head, tx_tail, tx_head, gnss_ipc_msg, ap_ipc_msg;
-	*/
-#ifdef USE_SIMPLE_WAKE_LOCK
-	gif_err("Unexpected interrupt occurred(%s)!!!!\n", __func__);
-	return ;
-#endif
-	/*
-	tx_head = get_txq_head(shmd);
-	tx_tail = get_txq_tail(shmd);
-	rx_head = get_rxq_head(shmd);
-	rx_tail = get_rxq_tail(shmd);
-	gnss_ipc_msg = mbox_get_value(MCU_GNSS, shmd->irq_gnss2ap_ipc_msg);
-	ap_ipc_msg = read_int2gnss(shmd);
-
-	gif_eff("RX_H[0x%x], RX_T[0x%x], TX_H[0x%x], TX_T[0x%x], AP_IPC[0x%x], GNSS_IPC[0x%x]\n",
-			rx_head, rx_tail, tx_head, tx_tail, ap_ipc_msg, gnss_ipc_msg);
-	*/
-	gc->pmu_ops->clear_int(GNSS_INT_WAKEUP_CLEAR);
-
-	gif_debug("Wake Lock Clear!!!!\n");
-	gif_err(">>>>DBUS_SW_WAKE_INT CLEAR\n");
-
-	wake_unlock(&gc->gc_wake_lock);
-	enable_irq(gc->wake_lock_irq);
-	if (gnss_read_reg(shmd, GNSS_REG_WAKE_LOCK) == 0X0) {
-		gif_err("@@ reg_wake_lock is already 0x0!!!!!!\n");
-		return ;
+		plane->state->state = state;
+		swap(state->plane_states[i], plane->state);
+		plane->state->state = NULL;
 	}
-	gnss_write_reg(shmd, GNSS_REG_WAKE_LOCK, 0x0);
-	mbox_set_interrupt(mbx->id, mbx->int_ap2gnss_ack_wake_clr);
-
 }
+EXPORT_SYMBOL(drm_atomic_helper_swap_state);
 
-static void mbox_kepler_rsp_fault_info(void *arg)
+/**
+ * drm_atomic_helper_update_plane - Helper for primary plane update using atomic
+ * @plane: plane object to update
+ * @crtc: owning CRTC of owning plane
+ * @fb: framebuffer to flip onto plane
+ * @crtc_x: x offset of primary plane on crtc
+ * @crtc_y: y offset of primary plane on crtc
+ * @crtc_w: width of primary plane rectangle on crtc
+ * @crtc_h: height of primary plane rectangle on crtc
+ * @src_x: x offset of @fb for panning
+ * @src_y: y offset of @fb for panning
+ * @src_w: width of source rectangle in @fb
+ * @src_h: height of source rectangle in @fb
+ *
+ * Provides a default plane update handler using the atomic driver interface.
+ *
+ * RETURNS:
+ * Zero on success, error code on failure
+ */
+int drm_atomic_helper_update_plane(struct drm_plane *plane,
+				   struct drm_crtc *crtc,
+				   struct drm_framebuffer *fb,
+				   int crtc_x, int crtc_y,
+				   unsigned int crtc_w, unsigned int crtc_h,
+				   uint32_t src_x, uint32_t src_y,
+				   uint32_t src_w, uint32_t src_h)
 {
-	struct gnss_ctl *gc = (struct gnss_ctl *)arg;
+	struct drm_atomic_state *state;
+	struct drm_plane_state *plane_state;
+	int ret = 0;
 
-	complete(&gc->fault_cmpl);
-}
+	state = drm_atomic_state_alloc(plane->dev);
+	if (!state)
+		return -ENOMEM;
 
-static int kepler_hold_reset(struct gnss_ctl *gc)
-{
-	gif_err("%s\n", __func__);
-
-	if (gc->gnss_state == STATE_OFFLINE) {
-		gif_err("Current Kerpler status is OFFLINE, so it will be ignored\n");
-		return 0;
+	state->acquire_ctx = drm_modeset_legacy_acquire_ctx(crtc);
+retry:
+	plane_state = drm_atomic_get_plane_state(state, plane);
+	if (IS_ERR(plane_state)) {
+		ret = PTR_ERR(plane_state);
+		goto fail;
 	}
 
-	gnss_state_changed(gc, STATE_HOLD_RESET);
+	ret = drm_atomic_set_crtc_for_plane(plane_state, crtc);
+	if (ret != 0)
+		goto fail;
+	drm_atomic_set_fb_for_plane(plane_state, fb);
+	plane_state->crtc_x = crtc_x;
+	plane_state->crtc_y = crtc_y;
+	plane_state->crtc_h = crtc_h;
+	plane_state->crtc_w = crtc_w;
+	plane_state->src_x = src_x;
+	plane_state->src_y = src_y;
+	plane_state->src_h = src_h;
+	plane_state->src_w = src_w;
 
-	if (gc->ccore_qch_lh_gnss) {
-		clk_disable_unprepare(gc->ccore_qch_lh_gnss);
-		gif_err("Disabled GNSS Qch\n");
-	}
+	if (plane == crtc->cursor)
+		state->legacy_cursor_update = true;
 
-	gc->pmu_ops->hold_reset();
-	mbox_sw_reset(gc->gnss_data->mbx->id);
+	ret = drm_atomic_commit(state);
+	if (ret != 0)
+		goto fail;
 
+	/* Driver takes ownership of state on successful commit. */
 	return 0;
-}
+fail:
+	if (ret == -EDEADLK)
+		goto backoff;
 
-static int kepler_release_reset(struct gnss_ctl *gc)
-{
-	int ret;
-	gif_err("%s\n", __func__);
-
-	gnss_state_changed(gc, STATE_ONLINE);
-	gif_debug("[GNSS] CLEAR all interrupts(EXYNOS_MCU_IPC_INTCR1(0xffff))\n");
-	mcu_ipc_clear_all_interrupt(MCU_GNSS);
-	gc->pmu_ops->release_reset();
-
-	if (gc->ccore_qch_lh_gnss) {
-		ret = clk_prepare_enable(gc->ccore_qch_lh_gnss);
-		if (!ret)
-			gif_err("GNSS Qch enabled\n");
-		else
-			gif_err("Could not enable Qch (%d)\n", ret);
-	}
-
-	return 0;
-}
-
-static int kepler_power_on(struct gnss_ctl *gc)
-{
-	int ret;
-	gif_err("%s\n", __func__);
-
-	gnss_state_changed(gc, STATE_ONLINE);
-	gc->pmu_ops->power_on(GNSS_POWER_ON);
-
-	if (gc->ccore_qch_lh_gnss) {
-		ret = clk_prepare_enable(gc->ccore_qch_lh_gnss);
-		if (!ret)
-			gif_err("GNSS Qch enabled\n");
-		else
-			gif_err("Could not enable Qch (%d)\n", ret);
-	}
-
-	return 0;
-}
-
-static int kepler_req_fault_info(struct gnss_ctl *gc)
-{
-	int ret;
-	struct gnss_data *pdata;
-	struct gnss_mbox *mbx;
-	unsigned long timeout = msecs_to_jiffies(1000);
-	u32 size = 0;
-
-	if (!gc) {
-		gif_err("No gnss_ctl info!\n");
-		ret = -ENODEV;
-		goto req_fault_exit;
-	}
-	pdata = gc->gnss_data;
-	mbx = pdata->mbx;
-
-	mbox_set_interrupt(mbx->id, mbx->int_ap2gnss_req_fault_info);
-
-	ret = wait_for_completion_timeout(&gc->fault_cmpl, timeout);
-	if (ret == 0) {
-		gif_err("Req Fault Info TIMEOUT!\n");
-		ret = -EIO;
-		goto req_fault_exit;
-	}
-
-	switch (pdata->fault_info.device) {
-	case GNSS_IPC_MBOX:
-		size = pdata->fault_info.size * sizeof(u32);
-		ret = size;
-		break;
-	case GNSS_IPC_SHMEM:
-		size = mbox_get_value(mbx->id, mbx->reg_bcmd_ctrl[CTRL3]);
-		ret = size;
-		break;
-	default:
-		gif_err("No device for fault dump!\n");
-		ret = -ENODEV;
-	}
-
-req_fault_exit:
-	wake_unlock(&gc->gc_fault_wake_lock);
+	drm_atomic_state_free(state);
 
 	return ret;
-}
+backoff:
+	drm_atomic_state_clear(state);
+	drm_atomic_legacy_backoff(state);
 
-
-static int kepler_suspend(struct gnss_ctl *gc)
-{
-	return 0;
-}
-
-static int kepler_resume(struct gnss_ctl *gc)
-{
-#ifdef USE_SIMPLE_WAKE_LOCK
-	gc->pmu_ops->clear_int(GNSS_INT_WAKEUP_CLEAR);
-#endif
-
-	return 0;
-}
-
-static int kepler_change_gpio(struct gnss_ctl *gc)
-{
-	int status = 0;
-
-	gif_err("Change GPIO for sensor\n");
-	if (!IS_ERR(gc->gnss_sensor_gpio)) {
-		status = pinctrl_select_state(gc->gnss_gpio, gc->gnss_sensor_gpio);
-		if (status) {
-			gif_err("Can't change sensor GPIO(%d)\n", status);
-		}
-	} else {
-		gif_err("gnss_sensor_gpio is not valid(0x%p)\n", gc->gnss_sensor_gpio);
-		status = -EIO;
-	}
-
-	return status;
-}
-
-static int kepler_set_sensor_power(struct gnss_ctl *gc, enum sensor_power reg_en)
-{
-	int ret;
-
-	if (reg_en == SENSOR_OFF) {
-		ret = regulator_disable(gc->vdd_sensor_reg);
-		if (ret != 0)
-			gif_err("Failed : Disable sensor power.\n");
-		else
-			gif_err("Success : Disable sensor power.\n");
-	} else {
-		ret = regulator_enable(gc->vdd_sensor_reg);
-		if (ret != 0)
-			gif_err("Failed : Enable sensor power.\n");
-		else
-			gif_err("Success : Enable sensor power.\n");
-	}
-	return ret;
-}
-
-static int kepler_req_bcmd(struct gnss_ctl *gc, u16 cmd_id, u16 flags,
-		u32 param1, u32 param2)
-{
-	u32 ctrl[BCMD_CTRL_COUNT], ret_val;
-	unsigned long timeout = msecs_to_jiffies(REQ_BCMD_TIMEOUT);
-	int ret;
-	struct gnss_mbox *mbx = gc->gnss_data->mbx;
-	struct link_device *ld = gc->iod->ld;
-
-#ifndef USE_SIMPLE_WAKE_LOCK
-	wake_lock_timeout(&gc->gc_bcmd_wake_lock, BCMD_WAKELOCK_TIMEOUT);
-#endif
-	/* Parse arguments */
-	/* Flags: Command flags */
-	/* Param1/2 : Paramter 1/2 */
-
-	ctrl[CTRL0] = (flags << 16) + cmd_id;
-	ctrl[CTRL1] = param1;
-	ctrl[CTRL2] = param2;
-	gif_debug("%s : set param  0 : 0x%x, 1 : 0x%x, 2 : 0x%x\n",
-			__func__, ctrl[CTRL0], ctrl[CTRL1], ctrl[CTRL2]);
-	mbox_set_value(mbx->id, mbx->reg_bcmd_ctrl[CTRL0], ctrl[CTRL0]);
-	mbox_set_value(mbx->id, mbx->reg_bcmd_ctrl[CTRL1], ctrl[CTRL1]);
-	mbox_set_value(mbx->id, mbx->reg_bcmd_ctrl[CTRL2], ctrl[CTRL2]);
 	/*
-	 * 0xff is MAGIC number to avoid confuging that
-	 * register is set from Kepler.
+	 * Someone might have exchanged the framebuffer while we dropped locks
+	 * in the backoff code. We need to fix up the fb refcount tracking the
+	 * core does for us.
 	 */
-	mbox_set_value(mbx->id, mbx->reg_bcmd_ctrl[CTRL3], 0xff);
+	plane->old_fb = plane->fb;
 
-	mbox_set_interrupt(mbx->id, mbx->int_ap2gnss_bcmd);
+	goto retry;
+}
+EXPORT_SYMBOL(drm_atomic_helper_update_plane);
 
-	if (gc->gnss_state == STATE_OFFLINE) {
-		gif_debug("Set POWER ON!!!!\n");
-		kepler_power_on(gc);
-	} else if (gc->gnss_state == STATE_HOLD_RESET) {
-		ld->reset_buffers(ld);
-		gif_debug("Set RELEASE RESET!!!!\n");
-		kepler_release_reset(gc);
-	}
+/**
+ * drm_atomic_helper_disable_plane - Helper for primary plane disable using * atomic
+ * @plane: plane to disable
+ *
+ * Provides a default plane disable handler using the atomic driver interface.
+ *
+ * RETURNS:
+ * Zero on success, error code on failure
+ */
+int drm_atomic_helper_disable_plane(struct drm_plane *plane)
+{
+	struct drm_atomic_state *state;
+	struct drm_plane_state *plane_state;
+	int ret = 0;
 
-	if (cmd_id == 0x4) /* BLC_Branch does not have return value */
+	/*
+	 * FIXME: Without plane->crtc set we can't get at the implicit legacy
+	 * acquire context. The real fix will be to wire the acquire ctx through
+	 * everywhere we need it, but meanwhile prevent chaos by just skipping
+	 * this noop. The critical case is the cursor ioctls which a) only grab
+	 * crtc/cursor-plane locks (so we need the crtc to get at the right
+	 * acquire context) and b) can try to disable the plane multiple times.
+	 */
+	if (!plane->crtc)
 		return 0;
 
-	ret = wait_for_completion_interruptible_timeout(&gc->bcmd_cmpl,
-						timeout);
-	if (ret == 0) {
-#ifndef USE_SIMPLE_WAKE_LOCK
-		wake_unlock(&gc->gc_bcmd_wake_lock);
-#endif
-		gif_err("%s: bcmd TIMEOUT!\n", gc->name);
-		return -EIO;
+	state = drm_atomic_state_alloc(plane->dev);
+	if (!state)
+		return -ENOMEM;
+
+	state->acquire_ctx = drm_modeset_legacy_acquire_ctx(plane->crtc);
+retry:
+	plane_state = drm_atomic_get_plane_state(state, plane);
+	if (IS_ERR(plane_state)) {
+		ret = PTR_ERR(plane_state);
+		goto fail;
 	}
 
-	ret_val = mbox_get_value(mbx->id, mbx->reg_bcmd_ctrl[CTRL3]);
-	gif_debug("BCMD cmd_id 0x%x returned 0x%x\n", cmd_id, ret_val);
+	if (plane_state->crtc && (plane == plane->crtc->cursor))
+		plane_state->state->legacy_cursor_update = true;
 
-	return ret_val;
-}
+	ret = __drm_atomic_helper_disable_plane(plane, plane_state);
+	if (ret != 0)
+		goto fail;
 
-static void gnss_get_ops(struct gnss_ctl *gc)
-{
-	gc->ops.gnss_hold_reset = kepler_hold_reset;
-	gc->ops.gnss_release_reset = kepler_release_reset;
-	gc->ops.gnss_power_on = kepler_power_on;
-	gc->ops.gnss_req_fault_info = kepler_req_fault_info;
-	gc->ops.suspend_gnss_ctrl = kepler_suspend;
-	gc->ops.resume_gnss_ctrl = kepler_resume;
-	gc->ops.change_sensor_gpio = kepler_change_gpio;
-	gc->ops.set_sensor_power = kepler_set_sensor_power;
-	gc->ops.req_bcmd = kepler_req_bcmd;
-}
+	ret = drm_atomic_commit(state);
+	if (ret != 0)
+		goto fail;
 
-int init_gnssctl_device(struct gnss_ctl *gc, struct gnss_data *pdata)
-{
-	int ret = 0, irq = 0;
-	struct platform_device *pdev = NULL;
-	struct gnss_mbox *mbox = gc->gnss_data->mbx;
-	gif_err("[GNSS IF] Initializing GNSS Control\n");
+	/* Driver takes ownership of state on successful commit. */
+	return 0;
+fail:
+	if (ret == -EDEADLK)
+		goto backoff;
 
-	gnss_get_ops(gc);
-	gnss_get_pmu_ops(gc);
-
-	dev_set_drvdata(gc->dev, gc);
-
-	wake_lock_init(&gc->gc_fault_wake_lock,
-				WAKE_LOCK_SUSPEND, "gnss_fault_wake_lock");
-	wake_lock_init(&gc->gc_wake_lock,
-				WAKE_LOCK_SUSPEND, "gnss_wake_lock");
-
-	init_completion(&gc->fault_cmpl);
-	init_completion(&gc->bcmd_cmpl);
-
-	pdev = to_platform_device(gc->dev);
-
-	/* GNSS_ACTIVE */
-	irq = platform_get_irq_byname(pdev, "ACTIVE");
-	if (irq < 0)
-		irq = platform_get_irq(pdev, 0);
-	ret = devm_request_irq(&pdev->dev, irq, kepler_active_isr, 0,
-			  "kepler_active_handler", gc);
-	if (ret) {
-		gif_err("Request irq fail - kepler_active_isr(%d)\n", ret);
-		return ret;
-	}
-	enable_irq_wake(irq);
-
-	/* GNSS_WATCHDOG */
-	irq = platform_get_irq_byname(pdev, "WATCHDOG");
-	if (irq < 0)
-		irq = platform_get_irq(pdev, 1);
-	ret = devm_request_irq(&pdev->dev, irq, kepler_wdt_isr, 0,
-			  "kepler_wdt_handler", gc);
-	if (ret) {
-		gif_err("Request irq fail - kepler_wdt_isr(%d)\n", ret);
-		return ret;
-	}
-	enable_irq_wake(irq);
-
-	/* GNSS_WAKEUP */
-	irq = platform_get_irq_byname(pdev, "WAKEUP");
-	if (irq < 0)
-		irq = platform_get_irq(pdev, 2);
-	gc->wake_lock_irq = irq;
-	ret = devm_request_irq(&pdev->dev, gc->wake_lock_irq, kepler_wakelock_isr,
-			0, "kepler_wakelock_handler", gc);
-
-	if (ret) {
-		gif_err("Request irq fail - kepler_wakelock_isr(%d)\n", ret);
-		return ret;
-	}
-	enable_irq_wake(irq);
-#ifdef USE_SIMPLE_WAKE_LOCK
-	disable_irq(gc->wake_lock_irq);
-
-	gif_err("Using simple lock sequence!!!\n");
-	mbox_request_irq(gc->gnss_data->mbx->id, 15, mbox_kepler_simple_lock, (void *)gc);
-
-#endif
-
-	/* Initializing Shared Memory for GNSS */
-	gif_err("Initializing shared memory for GNSS.\n");
-	gc->pmu_ops->init_conf(gc);
-	gc->gnss_state = STATE_OFFLINE;
-
-	gif_info("[GNSS IF] Register mailbox for GNSS2AP fault handling\n");
-	mbox_request_irq(mbox->id, mbox->irq_gnss2ap_req_wake_clr,
-			 mbox_kepler_wake_clr, (void *)gc);
-
-	mbox_request_irq(mbox->id, mbox->irq_gnss2ap_rsp_fault_info,
-			 mbox_kepler_rsp_fault_info, (void *)gc);
-
-	mbox_request_irq(mbox->id, mbox->irq_gnss2ap_bcmd,
-			kepler_irq_bcmd_handler, (void *)gc);
-
-	gc->gnss_gpio = devm_pinctrl_get(&pdev->dev);
-	if (IS_ERR(gc->gnss_gpio)) {
-		gif_err("Can't get gpio for GNSS sensor.\n");
-	} else {
-		gc->gnss_sensor_gpio = pinctrl_lookup_state(gc->gnss_gpio,
-				"gnss_sensor");
-	}
-
-	gc->vdd_sensor_reg = devm_regulator_get(gc->dev, "vdd_sensor_2p85");
-	if (IS_ERR(gc->vdd_sensor_reg)) {
-		gif_err("Cannot get the regulator \"vdd_sensor_2p85\"\n");
-	}
-
-	gif_err("---\n");
+	drm_atomic_state_free(state);
 
 	return ret;
+backoff:
+	drm_atomic_state_clear(state);
+	drm_atomic_legacy_backoff(state);
+
+	/*
+	 * Someone might have exchanged the framebuffer while we dropped locks
+	 * in the backoff code. We need to fix up the fb refcount tracking the
+	 * core does for us.
+	 */
+	plane->old_fb = plane->fb;
+
+	goto retry;
 }
+EXPORT_SYMBOL(drm_atomic_helper_disable_plane);
+
+/* just used from fb-helper and atomic-helper: */
+int __drm_atomic_helper_disable_plane(struct drm_plane *plane,
+		struct drm_plane_state *plane_state)
+{
+	int ret;
+
+	ret = drm_atomic_set_crtc_for_plane(plane_state, NULL);
+	if (ret != 0)
+		return ret;
+
+	drm_atomic_set_fb_for_plane(plane_state, NULL);
+	plane_state->crtc_x = 0;
+	plane_state->crtc_y = 0;
+	plane_state->crtc_h = 0;
+	plane_state->crtc_w = 0;
+	plane_state->src_x = 0;
+	plane_state->src_y = 0;
+	plane_state->src_h = 0;
+	plane_state->src_w = 0;
+
+	return 0;
+}
+
+static int update_output_state(struct drm_atomic_state *state,
+			       struct drm_mode_set *set)
+{
+	struct drm_device *dev = set->crtc->dev;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *crtc_state;
+	struct drm_connector *connector;
+	struct drm_connector_state *conn_state;
+	int ret, i, j;
+
+	ret = drm_modeset_lock(&dev->mode_config.connection_mutex,
+			       state->acquire_ctx);
+	if (ret)
+		return ret;
+
+	/* First grab all affected connector/crtc states. */
+	for (i = 0; i < set->num_connectors; i++) {
+		conn_state = drm_atomic_get_connector_state(state,
+							    set->connectors[i]);
+		if (IS_ERR(conn_state))
+			return PTR_ERR(conn_state);
+	}
+
+	for_each_crtc_in_state(state, crtc, crtc_state, i) {
+		ret = drm_atomic_add_affected_connectors(state, crtc);
+		if (ret)
+			return ret;
+	}
+
+	/* Then recompute connector->crtc links and crtc enabling state. */
+	for_each_connector_in_state(state, connector, conn_state, i) {
+		if (conn_state->crtc == set->crtc) {
+			ret = drm_atomic_set_crtc_for_connector(conn_state,
+								NULL);
+			if (ret)
+				return ret;
+		}
+
+		for (j = 0; j < set->num_connectors; j++) {
+			if (set->connectors[j] == connector) {
+				ret = drm_atomic_set_crtc_for_connector(conn_state,
+									set->crtc);
+				if (ret)
+					return ret;
+				break;
+			}
+		}
+	}
+
+	for_each_crtc_in_state(state, crtc, crtc_state, i) {
+		/* Don't update ->enable for the CRTC in the set_config request,
+		 * since a mismatch would indicate a bug in the upper layers.
+		 * The actual modeset code later on will catch any
+		 * inconsistencies here. */
+		if (crtc == set->crtc)
+			continue;
+
+		if (!drm_atomic_connectors_for_crtc(state, crtc)) {
+			ret = drm_atomic_set_mode_prop_for_crtc(crtc_state,
+								NULL);
+			if (ret < 0)
+				return ret;
+
+			crtc_state->active = false;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * drm_atomic_helper_set_config - set a new config from userspace
+ * @set: mode set configuration
+ *
+ * Provides a default crtc set_config handler using the atomic driver interface.
+ *
+ * Returns:
+ * Returns 0 on success, negative errno numbers on failure.
+ */
+int drm_atomic_helper_set_config(struct drm_mode_set *set)
+{
+	struct drm_atomic_state *state;
+	struct drm_crtc *crtc = set->crtc;
+	int ret = 0;
+
+	state = drm_atomic_state_alloc(crtc->dev);
+	if (!state)
+		return -ENOMEM;
+
+	state->acquire_ctx = drm_modeset_legacy_acquire_ctx(crtc);
+retry:
+	ret = __drm_atomic_helper_set_config(set, state);
+	if (ret != 0)
+		goto fail;
+
+	ret = drm_atomic_commit(state);
+	if (ret != 0)
+		goto fail;
+
+	/* Driver takes ownership of state on successful commit. */
+	return 0;
+fail:
+	if (ret == -EDEADLK)
+		goto backoff;
+
+	drm_atomic_state_free(state);
+
+	return ret;
+backoff:
+	drm_atomic_state_clear(state);
+	drm_atomic_legacy_backoff(state);
+
+	/*
+	 * Someone might have exchanged the framebuffer while we dropped locks
+	 * in the backoff code. We need to fix up the fb refcount tracking the
+	 * core does for us.
+	 */
+	crtc->primary->old_fb = crtc->primary->fb;
+
+	goto retry;
+}
+EXPORT_SYMBOL(drm_atomic_helper_set_config);
+
+/* just used from fb-helper and atomic-helper: */
+int __drm_atomic_helper_set_config(struct drm_mode_set *set,
+		struct drm_atomic_state *state)
+{
+	struct drm_crtc_state *crtc_state;
+	struct drm_plane_state *primary_state;
+	struct drm_crtc *crtc = set->crtc;
+	int hdisplay, vdisplay;
+	int ret;
+
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state))
+		return PTR_ERR(crtc_state);
+
+	primary_state = drm_atomic_get_plane_state(state, crtc->primary);
+	if (IS_ERR(primary_state))
+		return PTR_ERR(primary_state);
+
+	if (!set->mode) {
+		WARN_ON(set->fb);
+		WARN_ON(set->num_connectors);
+
+		ret = drm_atomic_set_mode_for_crtc(crtc_state, NULL);
+		if (ret != 0)
+			return ret;
+
+		crtc_state->active = false;
+
+		ret = drm_atomic_set_crtc_for_plane(primary_state, NULL);
+		if (ret != 0)
+			return ret;
+
+		drm_atomic_set_fb_for_plane(primary_state, NULL);
+
+		goto commit;
+	}
+
+	WARN_ON(!set->fb);
+	WARN_ON(!set->num_connectors);
+
+	ret = drm_atomic_set_mode_for_crtc(crtc_state, set->mode);
+	if (ret != 0)
+		return ret;
+
+	crtc_state->active = true;
+
+	ret = drm_atomic_set_crtc_for_plane(primary_state, crtc);
+	if (ret != 0)
+		return ret;
+
+	drm_crtc_get_hv_timing(set->mode, &hdisplay, &vdisplay);
+
+	drm_atomic_set_fb_for_plane(primary_state, set->fb);
+	primary_state->crtc_x = 0;
+	primary_state->crtc_y = 0;
+	primary_state->crtc_h = vdisplay;
+	primary_state->crtc_w = hdisplay;
+	primary_state->src_x = set->x << 16;
+	primary_state->src_y = set->y << 16;
+	if (primary_state->rotation & (BIT(DRM_ROTATE_90) | BIT(DRM_ROTATE_270))) {
+		primary_state->src_h = hdisplay << 16;
+		primary_state->src_w = vdisplay << 16;
+	} else {
+		primary_state->src_h = vdisplay << 16;
+		primary_state->src_w = hdisplay << 16;
+	}
+
+commit:
+	ret = update_output_state(state, set);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+/**
+ * drm_atomic_helper_crtc_set_property - helper for crtc properties
+ * @crtc: DRM crtc
+ * @property: DRM property
+ * @val: value of property
+ *
+ * Provides a default crtc set_property handler using the atomic driver
+ * interface.
+ *
+ * RETURNS:
+ * Zero on success, error code on failure
+ */
+int
+drm_atomic_helper_crtc_set_property(struct drm_crtc *crtc,
+				    struct drm_property *property,
+				    uint64_t val)
+{
+	struct drm_atomic_state *state;
+	struct drm_crtc_state *crtc_state;
+	int ret = 0;
+
+	state = drm_atomic_state_alloc(crtc->dev);
+	if (!state)
+		return -ENOMEM;
+
+	/* ->set_property is always called with all locks held. */
+	state->acquire_ctx = crtc->dev->mode_config.acquire_ctx;
+retry:
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto fail;
+	}
+
+	ret = drm_atomic_crtc_set_property(crtc, crtc_state,
+			property, val);
+	if (ret)
+		goto fail;
+
+	ret = drm_atomic_commit(state);
+	if (ret != 0)
+		goto fail;
+
+	/* Driver takes ownership of state on successful commit. */
+	return 0;
+fail:
+	if (ret == -EDEADLK)
+		goto backoff;
+
+	drm_atomic_state_free(state);
+
+	return ret;
+backoff:
+	drm_atomic_state_clear(state);
+	drm_atomic_legacy_backoff(state);
+
+	goto retry;
+}
+EXPORT_SYMBOL(drm_atomic_helper_crtc_set_property);
+
+/**
+ * drm_atomic_helper_plane_set_property - helper for plane properties
+ * @plane: DRM plane
+ * @property: DRM property
+ * @val: value of property
+ *
+ * Provides a default plane set_property handler using the atomic driver
+ * interface.
+ *
+ * RETURNS:
+ * Zero on success, error code on failure
+ */
+int
+drm_atomic_helper_plane_set_property(struct drm_plane *plane,
+				    struct drm_property *property,
+				    uint64_t val)
+{
+	struct drm_atomic_state *state;
+	struct drm_plane_state *plane_state;
+	int ret = 0;
+
+	state = drm_atomic_state_alloc(plane->dev);
+	if (!state)
+		return -ENOMEM;
+
+	/* ->set_property is always called with all locks held. */
+	state->acquire_ctx = plane->dev->mode_config.acquire_ctx;
+retry:
+	plane_state = drm_atomic_get_plane_state(state, plane);
+	if (IS_ERR(plane_state)) {
+		ret = PTR_ERR(plane_state);
+		goto fail;
+	}
+
+	ret = drm_atomic_plane_set_property(plane, plane_state,
+			property, val);
+	if (ret)
+		goto fail;
+
+	ret = drm_atomic_commit(state);
+	if (ret != 0)
+		goto fail;
+
+	/* Driver takes ownership of state on successful commit. */
+	return 0;
+fail:
+	if (ret == -EDEADLK)
+		goto backoff;
+
+	drm_atomic_state_free(state);
+
+	return ret;
+backoff:
+	drm_atomic_state_clear(state);
+	drm_atom

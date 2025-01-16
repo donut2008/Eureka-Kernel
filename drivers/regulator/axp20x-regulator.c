@@ -1,453 +1,527 @@
-/*
- * AXP20x regulators driver.
- *
- * Copyright (C) 2013 Carlo Caione <carlo@caione.org>
- *
- * This file is subject to the terms and conditions of the GNU General
- * Public License. See the file "COPYING" in the main directory of this
- * archive for more details.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
+DIMM_COLS(mtr) == 1 ? "2,048 - 11 columns" :
+		 MTR_DIMM_COLS(mtr) == 2 ? "4,096 - 12 columns" :
+		 "reserved");
+	edac_dbg(2, "\t\tSIZE: %d MB\n", dinfo->megabytes);
 
-#include <linux/err.h>
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
-#include <linux/mfd/axp20x.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/of_regulator.h>
+	/*
+	 * The type of error detection actually depends of the
+	 * mode of operation. When it is just one single memory chip, at
+	 * socket 0, channel 0, it uses 8-byte-over-32-byte SECDED+ code.
+	 * In normal or mirrored mode, it uses Lockstep mode,
+	 * with the possibility of using an extended algorithm for x8 memories
+	 * See datasheet Sections 7.3.6 to 7.3.8
+	 */
 
-#define AXP20X_IO_ENABLED		0x03
-#define AXP20X_IO_DISABLED		0x07
-
-#define AXP22X_IO_ENABLED		0x03
-#define AXP22X_IO_DISABLED		0x04
-
-#define AXP20X_WORKMODE_DCDC2_MASK	BIT(2)
-#define AXP20X_WORKMODE_DCDC3_MASK	BIT(1)
-#define AXP22X_WORKMODE_DCDCX_MASK(x)	BIT(x)
-
-#define AXP20X_FREQ_DCDC_MASK		0x0f
-
-#define AXP_DESC_IO(_family, _id, _match, _supply, _min, _max, _step, _vreg,	\
-		    _vmask, _ereg, _emask, _enable_val, _disable_val)		\
-	[_family##_##_id] = {							\
-		.name		= #_id,						\
-		.supply_name	= (_supply),					\
-		.of_match	= of_match_ptr(_match),				\
-		.regulators_node = of_match_ptr("regulators"),			\
-		.type		= REGULATOR_VOLTAGE,				\
-		.id		= _family##_##_id,				\
-		.n_voltages	= (((_max) - (_min)) / (_step) + 1),		\
-		.owner		= THIS_MODULE,					\
-		.min_uV		= (_min) * 1000,				\
-		.uV_step	= (_step) * 1000,				\
-		.vsel_reg	= (_vreg),					\
-		.vsel_mask	= (_vmask),					\
-		.enable_reg	= (_ereg),					\
-		.enable_mask	= (_emask),					\
-		.enable_val	= (_enable_val),				\
-		.disable_val	= (_disable_val),				\
-		.ops		= &axp20x_ops,					\
-	}
-
-#define AXP_DESC(_family, _id, _match, _supply, _min, _max, _step, _vreg,	\
-		 _vmask, _ereg, _emask) 					\
-	[_family##_##_id] = {							\
-		.name		= #_id,						\
-		.supply_name	= (_supply),					\
-		.of_match	= of_match_ptr(_match),				\
-		.regulators_node = of_match_ptr("regulators"),			\
-		.type		= REGULATOR_VOLTAGE,				\
-		.id		= _family##_##_id,				\
-		.n_voltages	= (((_max) - (_min)) / (_step) + 1),		\
-		.owner		= THIS_MODULE,					\
-		.min_uV		= (_min) * 1000,				\
-		.uV_step	= (_step) * 1000,				\
-		.vsel_reg	= (_vreg),					\
-		.vsel_mask	= (_vmask),					\
-		.enable_reg	= (_ereg),					\
-		.enable_mask	= (_emask),					\
-		.ops		= &axp20x_ops,					\
-	}
-
-#define AXP_DESC_SW(_family, _id, _match, _supply, _min, _max, _step, _vreg,	\
-		    _vmask, _ereg, _emask) 					\
-	[_family##_##_id] = {							\
-		.name		= #_id,						\
-		.supply_name	= (_supply),					\
-		.of_match	= of_match_ptr(_match),				\
-		.regulators_node = of_match_ptr("regulators"),			\
-		.type		= REGULATOR_VOLTAGE,				\
-		.id		= _family##_##_id,				\
-		.n_voltages	= (((_max) - (_min)) / (_step) + 1),		\
-		.owner		= THIS_MODULE,					\
-		.min_uV		= (_min) * 1000,				\
-		.uV_step	= (_step) * 1000,				\
-		.vsel_reg	= (_vreg),					\
-		.vsel_mask	= (_vmask),					\
-		.enable_reg	= (_ereg),					\
-		.enable_mask	= (_emask),					\
-		.ops		= &axp20x_ops_sw,				\
-	}
-
-#define AXP_DESC_FIXED(_family, _id, _match, _supply, _volt)			\
-	[_family##_##_id] = {							\
-		.name		= #_id,						\
-		.supply_name	= (_supply),					\
-		.of_match	= of_match_ptr(_match),				\
-		.regulators_node = of_match_ptr("regulators"),			\
-		.type		= REGULATOR_VOLTAGE,				\
-		.id		= _family##_##_id,				\
-		.n_voltages	= 1,						\
-		.owner		= THIS_MODULE,					\
-		.min_uV		= (_volt) * 1000,				\
-		.ops		= &axp20x_ops_fixed				\
-	}
-
-#define AXP_DESC_TABLE(_family, _id, _match, _supply, _table, _vreg, _vmask,	\
-		       _ereg, _emask)						\
-	[_family##_##_id] = {							\
-		.name		= #_id,						\
-		.supply_name	= (_supply),					\
-		.of_match	= of_match_ptr(_match),				\
-		.regulators_node = of_match_ptr("regulators"),			\
-		.type		= REGULATOR_VOLTAGE,				\
-		.id		= _family##_##_id,				\
-		.n_voltages	= ARRAY_SIZE(_table),				\
-		.owner		= THIS_MODULE,					\
-		.vsel_reg	= (_vreg),					\
-		.vsel_mask	= (_vmask),					\
-		.enable_reg	= (_ereg),					\
-		.enable_mask	= (_emask),					\
-		.volt_table	= (_table),					\
-		.ops		= &axp20x_ops_table,				\
-	}
-
-static const int axp20x_ldo4_data[] = { 1250000, 1300000, 1400000, 1500000, 1600000,
-					1700000, 1800000, 1900000, 2000000, 2500000,
-					2700000, 2800000, 3000000, 3100000, 3200000,
-					3300000 };
-
-static struct regulator_ops axp20x_ops_fixed = {
-	.list_voltage		= regulator_list_voltage_linear,
-};
-
-static struct regulator_ops axp20x_ops_table = {
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_table,
-	.map_voltage		= regulator_map_voltage_ascend,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-};
-
-static struct regulator_ops axp20x_ops = {
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-};
-
-static struct regulator_ops axp20x_ops_sw = {
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.is_enabled		= regulator_is_enabled_regmap,
-};
-
-static const struct regulator_desc axp20x_regulators[] = {
-	AXP_DESC(AXP20X, DCDC2, "dcdc2", "vin2", 700, 2275, 25,
-		 AXP20X_DCDC2_V_OUT, 0x3f, AXP20X_PWR_OUT_CTRL, 0x10),
-	AXP_DESC(AXP20X, DCDC3, "dcdc3", "vin3", 700, 3500, 25,
-		 AXP20X_DCDC3_V_OUT, 0x7f, AXP20X_PWR_OUT_CTRL, 0x02),
-	AXP_DESC_FIXED(AXP20X, LDO1, "ldo1", "acin", 1300),
-	AXP_DESC(AXP20X, LDO2, "ldo2", "ldo24in", 1800, 3300, 100,
-		 AXP20X_LDO24_V_OUT, 0xf0, AXP20X_PWR_OUT_CTRL, 0x04),
-	AXP_DESC(AXP20X, LDO3, "ldo3", "ldo3in", 700, 3500, 25,
-		 AXP20X_LDO3_V_OUT, 0x7f, AXP20X_PWR_OUT_CTRL, 0x40),
-	AXP_DESC_TABLE(AXP20X, LDO4, "ldo4", "ldo24in", axp20x_ldo4_data,
-		       AXP20X_LDO24_V_OUT, 0x0f, AXP20X_PWR_OUT_CTRL, 0x08),
-	AXP_DESC_IO(AXP20X, LDO5, "ldo5", "ldo5in", 1800, 3300, 100,
-		    AXP20X_LDO5_V_OUT, 0xf0, AXP20X_GPIO0_CTRL, 0x07,
-		    AXP20X_IO_ENABLED, AXP20X_IO_DISABLED),
-};
-
-static const struct regulator_desc axp22x_regulators[] = {
-	AXP_DESC(AXP22X, DCDC1, "dcdc1", "vin1", 1600, 3400, 100,
-		 AXP22X_DCDC1_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL1, BIT(1)),
-	AXP_DESC(AXP22X, DCDC2, "dcdc2", "vin2", 600, 1540, 20,
-		 AXP22X_DCDC2_V_OUT, 0x3f, AXP22X_PWR_OUT_CTRL1, BIT(2)),
-	AXP_DESC(AXP22X, DCDC3, "dcdc3", "vin3", 600, 1860, 20,
-		 AXP22X_DCDC3_V_OUT, 0x3f, AXP22X_PWR_OUT_CTRL1, BIT(3)),
-	AXP_DESC(AXP22X, DCDC4, "dcdc4", "vin4", 600, 1540, 20,
-		 AXP22X_DCDC4_V_OUT, 0x3f, AXP22X_PWR_OUT_CTRL1, BIT(4)),
-	AXP_DESC(AXP22X, DCDC5, "dcdc5", "vin5", 1000, 2550, 50,
-		 AXP22X_DCDC5_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL1, BIT(5)),
-	/* secondary switchable output of DCDC1 */
-	AXP_DESC_SW(AXP22X, DC1SW, "dc1sw", NULL, 1600, 3400, 100,
-		    AXP22X_DCDC1_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL2, BIT(7)),
-	/* LDO regulator internally chained to DCDC5 */
-	AXP_DESC(AXP22X, DC5LDO, "dc5ldo", NULL, 700, 1400, 100,
-		 AXP22X_DC5LDO_V_OUT, 0x7, AXP22X_PWR_OUT_CTRL1, BIT(0)),
-	AXP_DESC(AXP22X, ALDO1, "aldo1", "aldoin", 700, 3300, 100,
-		 AXP22X_ALDO1_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL1, BIT(6)),
-	AXP_DESC(AXP22X, ALDO2, "aldo2", "aldoin", 700, 3300, 100,
-		 AXP22X_ALDO2_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL1, BIT(7)),
-	AXP_DESC(AXP22X, ALDO3, "aldo3", "aldoin", 700, 3300, 100,
-		 AXP22X_ALDO3_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL3, BIT(7)),
-	AXP_DESC(AXP22X, DLDO1, "dldo1", "dldoin", 700, 3300, 100,
-		 AXP22X_DLDO1_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL2, BIT(3)),
-	AXP_DESC(AXP22X, DLDO2, "dldo2", "dldoin", 700, 3300, 100,
-		 AXP22X_DLDO2_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL2, BIT(4)),
-	AXP_DESC(AXP22X, DLDO3, "dldo3", "dldoin", 700, 3300, 100,
-		 AXP22X_DLDO3_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL2, BIT(5)),
-	AXP_DESC(AXP22X, DLDO4, "dldo4", "dldoin", 700, 3300, 100,
-		 AXP22X_DLDO4_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL2, BIT(6)),
-	AXP_DESC(AXP22X, ELDO1, "eldo1", "eldoin", 700, 3300, 100,
-		 AXP22X_ELDO1_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL2, BIT(0)),
-	AXP_DESC(AXP22X, ELDO2, "eldo2", "eldoin", 700, 3300, 100,
-		 AXP22X_ELDO2_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL2, BIT(1)),
-	AXP_DESC(AXP22X, ELDO3, "eldo3", "eldoin", 700, 3300, 100,
-		 AXP22X_ELDO3_V_OUT, 0x1f, AXP22X_PWR_OUT_CTRL2, BIT(2)),
-	AXP_DESC_IO(AXP22X, LDO_IO0, "ldo_io0", "ips", 700, 3300, 100,
-		    AXP22X_LDO_IO0_V_OUT, 0x1f, AXP20X_GPIO0_CTRL, 0x07,
-		    AXP22X_IO_ENABLED, AXP22X_IO_DISABLED),
-	AXP_DESC_IO(AXP22X, LDO_IO1, "ldo_io1", "ips", 700, 3300, 100,
-		    AXP22X_LDO_IO1_V_OUT, 0x1f, AXP20X_GPIO1_CTRL, 0x07,
-		    AXP22X_IO_ENABLED, AXP22X_IO_DISABLED),
-	AXP_DESC_FIXED(AXP22X, RTC_LDO, "rtc_ldo", "ips", 3000),
-};
-
-static int axp20x_set_dcdc_freq(struct platform_device *pdev, u32 dcdcfreq)
-{
-	struct axp20x_dev *axp20x = dev_get_drvdata(pdev->dev.parent);
-	u32 min, max, def, step;
-
-	switch (axp20x->variant) {
-	case AXP202_ID:
-	case AXP209_ID:
-		min = 750;
-		max = 1875;
-		def = 1500;
-		step = 75;
-		break;
-	case AXP221_ID:
-		min = 1800;
-		max = 4050;
-		def = 3000;
-		step = 150;
-		break;
-	default:
-		dev_err(&pdev->dev,
-			"Setting DCDC frequency for unsupported AXP variant\n");
-		return -EINVAL;
-	}
-
-	if (dcdcfreq == 0)
-		dcdcfreq = def;
-
-	if (dcdcfreq < min) {
-		dcdcfreq = min;
-		dev_warn(&pdev->dev, "DCDC frequency too low. Set to %ukHz\n",
-			 min);
-	}
-
-	if (dcdcfreq > max) {
-		dcdcfreq = max;
-		dev_warn(&pdev->dev, "DCDC frequency too high. Set to %ukHz\n",
-			 max);
-	}
-
-	dcdcfreq = (dcdcfreq - min) / step;
-
-	return regmap_update_bits(axp20x->regmap, AXP20X_DCDC_FREQ,
-				  AXP20X_FREQ_DCDC_MASK, dcdcfreq);
-}
-
-static int axp20x_regulator_parse_dt(struct platform_device *pdev)
-{
-	struct device_node *np, *regulators;
-	int ret = 0;
-	u32 dcdcfreq = 0;
-
-	np = of_node_get(pdev->dev.parent->of_node);
-	if (!np)
-		return 0;
-
-	regulators = of_get_child_by_name(np, "regulators");
-	if (!regulators) {
-		dev_warn(&pdev->dev, "regulators node not found\n");
+	dimm->nr_pages = MiB_TO_PAGES(dinfo->megabytes);
+	dimm->grain = 8;
+	dimm->mtype = MEM_FB_DDR2;
+	if (IS_SINGLE_MODE(pvt->mc_settings_a)) {
+		dimm->edac_mode = EDAC_SECDED;
+		edac_dbg(2, "\t\tECC code is 8-byte-over-32-byte SECDED+ code\n");
 	} else {
-		of_property_read_u32(regulators, "x-powers,dcdc-freq", &dcdcfreq);
-		ret = axp20x_set_dcdc_freq(pdev, dcdcfreq);
-		if (ret < 0) {
-			dev_err(&pdev->dev, "Error setting dcdc frequency: %d\n", ret);
+		edac_dbg(2, "\t\tECC code is on Lockstep mode\n");
+		if (MTR_DRAM_WIDTH(mtr) == 8)
+			dimm->edac_mode = EDAC_S8ECD8ED;
+		else
+			dimm->edac_mode = EDAC_S4ECD4ED;
+	}
+
+	/* ask what device type on this row */
+	if (MTR_DRAM_WIDTH(mtr) == 8) {
+		edac_dbg(2, "\t\tScrub algorithm for x8 is on %s mode\n",
+			 IS_SCRBALGO_ENHANCED(pvt->mc_settings) ?
+			 "enhanced" : "normal");
+
+		dimm->dtype = DEV_X8;
+	} else
+		dimm->dtype = DEV_X4;
+
+	return mtr;
+}
+
+/**
+ * print_dimm_size() - Prints dump of the memory organization
+ * @pvt: pointer to the private data struct used by i7300 driver
+ *
+ * Useful for debug. If debug is disabled, this routine do nothing
+ */
+static void print_dimm_size(struct i7300_pvt *pvt)
+{
+#ifdef CONFIG_EDAC_DEBUG
+	struct i7300_dimm_info *dinfo;
+	char *p;
+	int space, n;
+	int channel, slot;
+
+	space = PAGE_SIZE;
+	p = pvt->tmp_prt_buffer;
+
+	n = snprintf(p, space, "              ");
+	p += n;
+	space -= n;
+	for (channel = 0; channel < MAX_CHANNELS; channel++) {
+		n = snprintf(p, space, "channel %d | ", channel);
+		p += n;
+		space -= n;
+	}
+	edac_dbg(2, "%s\n", pvt->tmp_prt_buffer);
+	p = pvt->tmp_prt_buffer;
+	space = PAGE_SIZE;
+	n = snprintf(p, space, "-------------------------------"
+			       "------------------------------");
+	p += n;
+	space -= n;
+	edac_dbg(2, "%s\n", pvt->tmp_prt_buffer);
+	p = pvt->tmp_prt_buffer;
+	space = PAGE_SIZE;
+
+	for (slot = 0; slot < MAX_SLOTS; slot++) {
+		n = snprintf(p, space, "csrow/SLOT %d  ", slot);
+		p += n;
+		space -= n;
+
+		for (channel = 0; channel < MAX_CHANNELS; channel++) {
+			dinfo = &pvt->dimm_info[slot][channel];
+			n = snprintf(p, space, "%4d MB   | ", dinfo->megabytes);
+			p += n;
+			space -= n;
 		}
-		of_node_put(regulators);
+
+		edac_dbg(2, "%s\n", pvt->tmp_prt_buffer);
+		p = pvt->tmp_prt_buffer;
+		space = PAGE_SIZE;
 	}
 
-	of_node_put(np);
-	return ret;
+	n = snprintf(p, space, "-------------------------------"
+			       "------------------------------");
+	p += n;
+	space -= n;
+	edac_dbg(2, "%s\n", pvt->tmp_prt_buffer);
+	p = pvt->tmp_prt_buffer;
+	space = PAGE_SIZE;
+#endif
 }
 
-static int axp20x_set_dcdc_workmode(struct regulator_dev *rdev, int id, u32 workmode)
+/**
+ * i7300_init_csrows() - Initialize the 'csrows' table within
+ *			 the mci control structure with the
+ *			 addressing of memory.
+ * @mci: struct mem_ctl_info pointer
+ */
+static int i7300_init_csrows(struct mem_ctl_info *mci)
 {
-	struct axp20x_dev *axp20x = rdev_get_drvdata(rdev);
-	unsigned int mask;
+	struct i7300_pvt *pvt;
+	struct i7300_dimm_info *dinfo;
+	int rc = -ENODEV;
+	int mtr;
+	int ch, branch, slot, channel, max_channel, max_branch;
+	struct dimm_info *dimm;
 
-	switch (axp20x->variant) {
-	case AXP202_ID:
-	case AXP209_ID:
-		if ((id != AXP20X_DCDC2) && (id != AXP20X_DCDC3))
-			return -EINVAL;
+	pvt = mci->pvt_info;
 
-		mask = AXP20X_WORKMODE_DCDC2_MASK;
-		if (id == AXP20X_DCDC3)
-			mask = AXP20X_WORKMODE_DCDC3_MASK;
+	edac_dbg(2, "Memory Technology Registers:\n");
 
-		workmode <<= ffs(mask) - 1;
-		break;
-
-	case AXP221_ID:
-		if (id < AXP22X_DCDC1 || id > AXP22X_DCDC5)
-			return -EINVAL;
-
-		mask = AXP22X_WORKMODE_DCDCX_MASK(id - AXP22X_DCDC1);
-		workmode <<= id - AXP22X_DCDC1;
-		break;
-
-	default:
-		/* should not happen */
-		WARN_ON(1);
-		return -EINVAL;
+	if (IS_SINGLE_MODE(pvt->mc_settings_a)) {
+		max_branch = 1;
+		max_channel = 1;
+	} else {
+		max_branch = MAX_BRANCHES;
+		max_channel = MAX_CH_PER_BRANCH;
 	}
 
-	return regmap_update_bits(rdev->regmap, AXP20X_DCDC_MODE, mask, workmode);
-}
+	/* Get the AMB present registers for the four channels */
+	for (branch = 0; branch < max_branch; branch++) {
+		/* Read and dump branch 0's MTRs */
+		channel = to_channel(0, branch);
+		pci_read_config_word(pvt->pci_dev_2x_0_fbd_branch[branch],
+				     AMBPRESENT_0,
+				&pvt->ambpresent[channel]);
+		edac_dbg(2, "\t\tAMB-present CH%d = 0x%x:\n",
+			 channel, pvt->ambpresent[channel]);
 
-static int axp20x_regulator_probe(struct platform_device *pdev)
-{
-	struct regulator_dev *rdev;
-	struct axp20x_dev *axp20x = dev_get_drvdata(pdev->dev.parent);
-	const struct regulator_desc *regulators;
-	struct regulator_config config = {
-		.dev = pdev->dev.parent,
-		.regmap = axp20x->regmap,
-		.driver_data = axp20x,
-	};
-	int ret, i, nregulators;
-	u32 workmode;
-	const char *axp22x_dc1_name = axp22x_regulators[AXP22X_DCDC1].name;
-	const char *axp22x_dc5_name = axp22x_regulators[AXP22X_DCDC5].name;
+		if (max_channel == 1)
+			continue;
 
-	switch (axp20x->variant) {
-	case AXP202_ID:
-	case AXP209_ID:
-		regulators = axp20x_regulators;
-		nregulators = AXP20X_REG_ID_MAX;
-		break;
-	case AXP221_ID:
-		regulators = axp22x_regulators;
-		nregulators = AXP22X_REG_ID_MAX;
-		break;
-	default:
-		dev_err(&pdev->dev, "Unsupported AXP variant: %ld\n",
-			axp20x->variant);
-		return -EINVAL;
+		channel = to_channel(1, branch);
+		pci_read_config_word(pvt->pci_dev_2x_0_fbd_branch[branch],
+				     AMBPRESENT_1,
+				&pvt->ambpresent[channel]);
+		edac_dbg(2, "\t\tAMB-present CH%d = 0x%x:\n",
+			 channel, pvt->ambpresent[channel]);
 	}
 
-	/* This only sets the dcdc freq. Ignore any errors */
-	axp20x_regulator_parse_dt(pdev);
+	/* Get the set of MTR[0-7] regs by each branch */
+	for (slot = 0; slot < MAX_SLOTS; slot++) {
+		int where = mtr_regs[slot];
+		for (branch = 0; branch < max_branch; branch++) {
+			pci_read_config_word(pvt->pci_dev_2x_0_fbd_branch[branch],
+					where,
+					&pvt->mtr[slot][branch]);
+			for (ch = 0; ch < max_channel; ch++) {
+				int channel = to_channel(ch, branch);
 
-	for (i = 0; i < nregulators; i++) {
-		const struct regulator_desc *desc = &regulators[i];
-		struct regulator_desc *new_desc;
+				dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms,
+					       mci->n_layers, branch, ch, slot);
 
-		/*
-		 * Regulators DC1SW and DC5LDO are connected internally,
-		 * so we have to handle their supply names separately.
-		 *
-		 * We always register the regulators in proper sequence,
-		 * so the supply names are correctly read. See the last
-		 * part of this loop to see where we save the DT defined
-		 * name.
-		 */
-		if (regulators == axp22x_regulators) {
-			if (i == AXP22X_DC1SW) {
-				new_desc = devm_kzalloc(&pdev->dev,
-							sizeof(*desc),
-							GFP_KERNEL);
-				*new_desc = regulators[i];
-				new_desc->supply_name = axp22x_dc1_name;
-				desc = new_desc;
-			} else if (i == AXP22X_DC5LDO) {
-				new_desc = devm_kzalloc(&pdev->dev,
-							sizeof(*desc),
-							GFP_KERNEL);
-				*new_desc = regulators[i];
-				new_desc->supply_name = axp22x_dc5_name;
-				desc = new_desc;
+				dinfo = &pvt->dimm_info[slot][channel];
+
+				mtr = decode_mtr(pvt, slot, ch, branch,
+						 dinfo, dimm);
+
+				/* if no DIMMS on this row, continue */
+				if (!MTR_DIMMS_PRESENT(mtr))
+					continue;
+
+				rc = 0;
+
 			}
 		}
-
-		rdev = devm_regulator_register(&pdev->dev, desc, &config);
-		if (IS_ERR(rdev)) {
-			dev_err(&pdev->dev, "Failed to register %s\n",
-				regulators[i].name);
-
-			return PTR_ERR(rdev);
-		}
-
-		ret = of_property_read_u32(rdev->dev.of_node,
-					   "x-powers,dcdc-workmode",
-					   &workmode);
-		if (!ret) {
-			if (axp20x_set_dcdc_workmode(rdev, i, workmode))
-				dev_err(&pdev->dev, "Failed to set workmode on %s\n",
-					rdev->desc->name);
-		}
-
-		/*
-		 * Save AXP22X DCDC1 / DCDC5 regulator names for later.
-		 */
-		if (regulators == axp22x_regulators) {
-			/* Can we use rdev->constraints->name instead? */
-			if (i == AXP22X_DCDC1)
-				of_property_read_string(rdev->dev.of_node,
-							"regulator-name",
-							&axp22x_dc1_name);
-			else if (i == AXP22X_DCDC5)
-				of_property_read_string(rdev->dev.of_node,
-							"regulator-name",
-							&axp22x_dc5_name);
-		}
 	}
+
+	return rc;
+}
+
+/**
+ * decode_mir() - Decodes Memory Interleave Register (MIR) info
+ * @int mir_no: number of the MIR register to decode
+ * @mir: array with the MIR data cached on the driver
+ */
+static void decode_mir(int mir_no, u16 mir[MAX_MIR])
+{
+	if (mir[mir_no] & 3)
+		edac_dbg(2, "MIR%d: limit= 0x%x Branch(es) that participate: %s %s\n",
+			 mir_no,
+			 (mir[mir_no] >> 4) & 0xfff,
+			 (mir[mir_no] & 1) ? "B0" : "",
+			 (mir[mir_no] & 2) ? "B1" : "");
+}
+
+/**
+ * i7300_get_mc_regs() - Get the contents of the MC enumeration registers
+ * @mci: struct mem_ctl_info pointer
+ *
+ * Data read is cached internally for its usage when needed
+ */
+static int i7300_get_mc_regs(struct mem_ctl_info *mci)
+{
+	struct i7300_pvt *pvt;
+	u32 actual_tolm;
+	int i, rc;
+
+	pvt = mci->pvt_info;
+
+	pci_read_config_dword(pvt->pci_dev_16_0_fsb_ctlr, AMBASE,
+			(u32 *) &pvt->ambase);
+
+	edac_dbg(2, "AMBASE= 0x%lx\n", (long unsigned int)pvt->ambase);
+
+	/* Get the Branch Map regs */
+	pci_read_config_word(pvt->pci_dev_16_1_fsb_addr_map, TOLM, &pvt->tolm);
+	pvt->tolm >>= 12;
+	edac_dbg(2, "TOLM (number of 256M regions) =%u (0x%x)\n",
+		 pvt->tolm, pvt->tolm);
+
+	actual_tolm = (u32) ((1000l * pvt->tolm) >> (30 - 28));
+	edac_dbg(2, "Actual TOLM byte addr=%u.%03u GB (0x%x)\n",
+		 actual_tolm/1000, actual_tolm % 1000, pvt->tolm << 28);
+
+	/* Get memory controller settings */
+	pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map, MC_SETTINGS,
+			     &pvt->mc_settings);
+	pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map, MC_SETTINGS_A,
+			     &pvt->mc_settings_a);
+
+	if (IS_SINGLE_MODE(pvt->mc_settings_a))
+		edac_dbg(0, "Memory controller operating on single mode\n");
+	else
+		edac_dbg(0, "Memory controller operating on %smirrored mode\n",
+			 IS_MIRRORED(pvt->mc_settings) ? "" : "non-");
+
+	edac_dbg(0, "Error detection is %s\n",
+		 IS_ECC_ENABLED(pvt->mc_settings) ? "enabled" : "disabled");
+	edac_dbg(0, "Retry is %s\n",
+		 IS_RETRY_ENABLED(pvt->mc_settings) ? "enabled" : "disabled");
+
+	/* Get Memory Interleave Range registers */
+	pci_read_config_word(pvt->pci_dev_16_1_fsb_addr_map, MIR0,
+			     &pvt->mir[0]);
+	pci_read_config_word(pvt->pci_dev_16_1_fsb_addr_map, MIR1,
+			     &pvt->mir[1]);
+	pci_read_config_word(pvt->pci_dev_16_1_fsb_addr_map, MIR2,
+			     &pvt->mir[2]);
+
+	/* Decode the MIR regs */
+	for (i = 0; i < MAX_MIR; i++)
+		decode_mir(i, pvt->mir);
+
+	rc = i7300_init_csrows(mci);
+	if (rc < 0)
+		return rc;
+
+	/* Go and determine the size of each DIMM and place in an
+	 * orderly matrix */
+	print_dimm_size(pvt);
 
 	return 0;
 }
 
-static struct platform_driver axp20x_regulator_driver = {
-	.probe	= axp20x_regulator_probe,
-	.driver	= {
-		.name		= "axp20x-regulator",
-	},
-};
+/*************************************************
+ * i7300 Functions related to device probe/release
+ *************************************************/
 
-module_platform_driver(axp20x_regulator_driver);
+/**
+ * i7300_put_devices() - Release the PCI devices
+ * @mci: struct mem_ctl_info pointer
+ */
+static void i7300_put_devices(struct mem_ctl_info *mci)
+{
+	struct i7300_pvt *pvt;
+	int branch;
 
-MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Carlo Caione <carlo@caione.org>");
-MODULE_DESCRIPTION("Regulator Driver for AXP20X PMIC");
-MODULE_ALIAS("platform:axp20x-regulator");
+	pvt = mci->pvt_info;
+
+	/* Decrement usage count for devices */
+	for (branch = 0; branch < MAX_CH_PER_BRANCH; branch++)
+		pci_dev_put(pvt->pci_dev_2x_0_fbd_branch[branch]);
+	pci_dev_put(pvt->pci_dev_16_2_fsb_err_regs);
+	pci_dev_put(pvt->pci_dev_16_1_fsb_addr_map);
+}
+
+/**
+ * i7300_get_devices() - Find and perform 'get' operation on the MCH's
+ *			 device/functions we want to reference for this driver
+ * @mci: struct mem_ctl_info pointer
+ *
+ * Access and prepare the several devices for usage:
+ * I7300 devices used by this driver:
+ *    Device 16, functions 0,1 and 2:	PCI_DEVICE_ID_INTEL_I7300_MCH_ERR
+ *    Device 21 function 0:		PCI_DEVICE_ID_INTEL_I7300_MCH_FB0
+ *    Device 22 function 0:		PCI_DEVICE_ID_INTEL_I7300_MCH_FB1
+ */
+static int i7300_get_devices(struct mem_ctl_info *mci)
+{
+	struct i7300_pvt *pvt;
+	struct pci_dev *pdev;
+
+	pvt = mci->pvt_info;
+
+	/* Attempt to 'get' the MCH register we want */
+	pdev = NULL;
+	while ((pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				      PCI_DEVICE_ID_INTEL_I7300_MCH_ERR,
+				      pdev))) {
+		/* Store device 16 funcs 1 and 2 */
+		switch (PCI_FUNC(pdev->devfn)) {
+		case 1:
+			if (!pvt->pci_dev_16_1_fsb_addr_map)
+				pvt->pci_dev_16_1_fsb_addr_map =
+							pci_dev_get(pdev);
+			break;
+		case 2:
+			if (!pvt->pci_dev_16_2_fsb_err_regs)
+				pvt->pci_dev_16_2_fsb_err_regs =
+							pci_dev_get(pdev);
+			break;
+		}
+	}
+
+	if (!pvt->pci_dev_16_1_fsb_addr_map ||
+	    !pvt->pci_dev_16_2_fsb_err_regs) {
+		/* At least one device was not found */
+		i7300_printk(KERN_ERR,
+			"'system address,Process Bus' device not found:"
+			"vendor 0x%x device 0x%x ERR funcs (broken BIOS?)\n",
+			PCI_VENDOR_ID_INTEL,
+			PCI_DEVICE_ID_INTEL_I7300_MCH_ERR);
+		goto error;
+	}
+
+	edac_dbg(1, "System Address, processor bus- PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->pci_dev_16_0_fsb_ctlr),
+		 pvt->pci_dev_16_0_fsb_ctlr->vendor,
+		 pvt->pci_dev_16_0_fsb_ctlr->device);
+	edac_dbg(1, "Branchmap, control and errors - PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->pci_dev_16_1_fsb_addr_map),
+		 pvt->pci_dev_16_1_fsb_addr_map->vendor,
+		 pvt->pci_dev_16_1_fsb_addr_map->device);
+	edac_dbg(1, "FSB Error Regs - PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->pci_dev_16_2_fsb_err_regs),
+		 pvt->pci_dev_16_2_fsb_err_regs->vendor,
+		 pvt->pci_dev_16_2_fsb_err_regs->device);
+
+	pvt->pci_dev_2x_0_fbd_branch[0] = pci_get_device(PCI_VENDOR_ID_INTEL,
+					    PCI_DEVICE_ID_INTEL_I7300_MCH_FB0,
+					    NULL);
+	if (!pvt->pci_dev_2x_0_fbd_branch[0]) {
+		i7300_printk(KERN_ERR,
+			"MC: 'BRANCH 0' device not found:"
+			"vendor 0x%x device 0x%x Func 0 (broken BIOS?)\n",
+			PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_I7300_MCH_FB0);
+		goto error;
+	}
+
+	pvt->pci_dev_2x_0_fbd_branch[1] = pci_get_device(PCI_VENDOR_ID_INTEL,
+					    PCI_DEVICE_ID_INTEL_I7300_MCH_FB1,
+					    NULL);
+	if (!pvt->pci_dev_2x_0_fbd_branch[1]) {
+		i7300_printk(KERN_ERR,
+			"MC: 'BRANCH 1' device not found:"
+			"vendor 0x%x device 0x%x Func 0 "
+			"(broken BIOS?)\n",
+			PCI_VENDOR_ID_INTEL,
+			PCI_DEVICE_ID_INTEL_I7300_MCH_FB1);
+		goto error;
+	}
+
+	return 0;
+
+error:
+	i7300_put_devices(mci);
+	return -ENODEV;
+}
+
+/**
+ * i7300_init_one() - Probe for one instance of the device
+ * @pdev: struct pci_dev pointer
+ * @id: struct pci_device_id pointer - currently unused
+ */
+static int i7300_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	struct mem_ctl_info *mci;
+	struct edac_mc_layer layers[3];
+	struct i7300_pvt *pvt;
+	int rc;
+
+	/* wake up device */
+	rc = pci_enable_device(pdev);
+	if (rc == -EIO)
+		return rc;
+
+	edac_dbg(0, "MC: pdev bus %u dev=0x%x fn=0x%x\n",
+		 pdev->bus->number,
+		 PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
+
+	/* We only are looking for func 0 of the set */
+	if (PCI_FUNC(pdev->devfn) != 0)
+		return -ENODEV;
+
+	/* allocate a new MC control structure */
+	layers[0].type = EDAC_MC_LAYER_BRANCH;
+	layers[0].size = MAX_BRANCHES;
+	layers[0].is_virt_csrow = false;
+	layers[1].type = EDAC_MC_LAYER_CHANNEL;
+	layers[1].size = MAX_CH_PER_BRANCH;
+	layers[1].is_virt_csrow = true;
+	layers[2].type = EDAC_MC_LAYER_SLOT;
+	layers[2].size = MAX_SLOTS;
+	layers[2].is_virt_csrow = true;
+	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers, sizeof(*pvt));
+	if (mci == NULL)
+		return -ENOMEM;
+
+	edac_dbg(0, "MC: mci = %p\n", mci);
+
+	mci->pdev = &pdev->dev;	/* record ptr  to the generic device */
+
+	pvt = mci->pvt_info;
+	pvt->pci_dev_16_0_fsb_ctlr = pdev;	/* Record this device in our private */
+
+	pvt->tmp_prt_buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!pvt->tmp_prt_buffer) {
+		edac_mc_free(mci);
+		return -ENOMEM;
+	}
+
+	/* 'get' the pci devices we want to reserve for our use */
+	if (i7300_get_devices(mci))
+		goto fail0;
+
+	mci->mc_idx = 0;
+	mci->mtype_cap = MEM_FLAG_FB_DDR2;
+	mci->edac_ctl_cap = EDAC_FLAG_NONE;
+	mci->edac_cap = EDAC_FLAG_NONE;
+	mci->mod_name = "i7300_edac.c";
+	mci->mod_ver = I7300_REVISION;
+	mci->ctl_name = i7300_devs[0].ctl_name;
+	mci->dev_name = pci_name(pdev);
+	mci->ctl_page_to_phys = NULL;
+
+	/* Set the function pointer to an actual operation function */
+	mci->edac_check = i7300_check_error;
+
+	/* initialize the MC control structure 'csrows' table
+	 * with the mapping and control information */
+	if (i7300_get_mc_regs(mci)) {
+		edac_dbg(0, "MC: Setting mci->edac_cap to EDAC_FLAG_NONE because i7300_init_csrows() returned nonzero value\n");
+		mci->edac_cap = EDAC_FLAG_NONE;	/* no csrows found */
+	} else {
+		edac_dbg(1, "MC: Enable error reporting now\n");
+		i7300_enable_error_reporting(mci);
+	}
+
+	/* add this new MC control structure to EDAC's list of MCs */
+	if (edac_mc_add_mc(mci)) {
+		edac_dbg(0, "MC: failed edac_mc_add_mc()\n");
+		/* FIXME: perhaps some code should go here that disables error
+		 * reporting if we just enabled it
+		 */
+		goto fail1;
+	}
+
+	i7300_clear_error(mci);
+
+	/* allocating generic PCI control info */
+	i7300_pci = edac_pci_create_generic_ctl(&pdev->dev, EDAC_MOD_STR);
+	if (!i7300_pci) {
+		printk(KERN_WARNING
+			"%s(): Unable to create PCI control\n",
+			__func__);
+		printk(KERN_WARNING
+			"%s(): PCI error report via EDAC not setup\n",
+			__func__);
+	}
+
+	return 0;
+
+	/* Error exit unwinding stack */
+fail1:
+
+	i7300_put_devices(mci);
+
+fail0:
+	kfree(pvt->tmp_prt_buffer);
+	edac_mc_free(mci);
+	return -ENODEV;
+}
+
+/**
+ * i7300_remove_one() - Remove the driver
+ * @pdev: struct pci_dev pointer
+ */
+static void i7300_remove_one(struct pci_dev *pdev)
+{
+	struct mem_ctl_info *mci;
+	char *tmp;
+
+	edac_dbg(0, "\n");
+
+	if (i7300_pci)
+		edac_pci_release_generic_ctl(i7300_pci);
+
+	mci = edac_mc_del_mc(&pdev->dev);
+	if (!mci)
+		return;
+
+	tmp = ((struct i7300_pvt *)mci->pvt_info)->tmp_prt_buffer;
+
+	/* retrieve references to resources, and free those resources */
+	i7300_put_devices(mci);
+
+	kfree(tmp);
+	edac_mc_free(mci);
+}
+
+/*
+ * pci_device_id: table for which devices we are looking for
+ *
+ * Has only 8086:3

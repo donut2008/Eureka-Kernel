@@ -1,10 +1,6 @@
-ccflags-y := -Werror $(call cc-disable-warning, unused-const-variable)
-
-cxl-y				+= main.o file.o irq.o fault.o native.o
-cxl-y				+= context.o sysfs.o debugfs.o pci.o trace.o
-cxl-y				+= vphb.o api.o
-obj-$(CONFIG_CXL)		+= cxl.o
-obj-$(CONFIG_CXL_BASE)		+= base.o
-
-# For tracepoints to include our trace.h from tracepoint infrastructure:
-CFLAGS_trace.o := -I$(src)
+D_REG0__TX_DRV_PWRON_OVRD_EN_4__SHIFT 0x5
+#define PB1_TX_LANE4_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_4_MASK 0x40
+#define PB1_TX_LANE4_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_4__SHIFT 0x6
+#define PB1_TX_LANE4_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_4_MASK 0x80
+#define PB1_TX_LANE4_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_4__SHIFT 0x7
+#define PB1_TX_LANE4_SCI_STAT_OVRD_RE

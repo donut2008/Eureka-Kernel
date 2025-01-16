@@ -1,133 +1,138 @@
-/*
- * ADLX345/346 Three-Axis Digital Accelerometers (SPI Interface)
- *
- * Enter bugs at http://blackfin.uclinux.org/
- *
- * Copyright (C) 2009 Michael Hennerich, Analog Devices Inc.
- * Licensed under the GPL-2 or later.
+mapped_sg_count = 0;
+	}
+}
+
+/**
+ * srpt_map_sg_to_ib_sge() - Map an SG list to an IB SGE list.
  */
-
-#include <linux/input.h>	/* BUS_SPI */
-#include <linux/module.h>
-#include <linux/spi/spi.h>
-#include <linux/pm.h>
-#include <linux/types.h>
-#include "adxl34x.h"
-
-#define MAX_SPI_FREQ_HZ		5000000
-#define MAX_FREQ_NO_FIFODELAY	1500000
-#define ADXL34X_CMD_MULTB	(1 << 6)
-#define ADXL34X_CMD_READ	(1 << 7)
-#define ADXL34X_WRITECMD(reg)	(reg & 0x3F)
-#define ADXL34X_READCMD(reg)	(ADXL34X_CMD_READ | (reg & 0x3F))
-#define ADXL34X_READMB_CMD(reg) (ADXL34X_CMD_READ | ADXL34X_CMD_MULTB \
-					| (reg & 0x3F))
-
-static int adxl34x_spi_read(struct device *dev, unsigned char reg)
+static int srpt_map_sg_to_ib_sge(struct srpt_rdma_ch *ch,
+				 struct srpt_send_ioctx *ioctx)
 {
-	struct spi_device *spi = to_spi_device(dev);
-	unsigned char cmd;
+	struct ib_device *dev = ch->sport->sdev->device;
+	struct se_cmd *cmd;
+	struct scatterlist *sg, *sg_orig;
+	int sg_cnt;
+	enum dma_data_direction dir;
+	struct rdma_iu *riu;
+	struct srp_direct_buf *db;
+	dma_addr_t dma_addr;
+	struct ib_sge *sge;
+	u64 raddr;
+	u32 rsize;
+	u32 tsize;
+	u32 dma_len;
+	int count, nrdma;
+	int i, j, k;
 
-	cmd = ADXL34X_READCMD(reg);
+	BUG_ON(!ch);
+	BUG_ON(!ioctx);
+	cmd = &ioctx->cmd;
+	dir = cmd->data_direction;
+	BUG_ON(dir == DMA_NONE);
 
-	return spi_w8r8(spi, cmd);
-}
+	ioctx->sg = sg = sg_orig = cmd->t_data_sg;
+	ioctx->sg_cnt = sg_cnt = cmd->t_data_nents;
 
-static int adxl34x_spi_write(struct device *dev,
-			     unsigned char reg, unsigned char val)
-{
-	struct spi_device *spi = to_spi_device(dev);
-	unsigned char buf[2];
+	count = ib_dma_map_sg(ch->sport->sdev->device, sg, sg_cnt,
+			      opposite_dma_dir(dir));
+	if (unlikely(!count))
+		return -EAGAIN;
 
-	buf[0] = ADXL34X_WRITECMD(reg);
-	buf[1] = val;
+	ioctx->mapped_sg_count = count;
 
-	return spi_write(spi, buf, sizeof(buf));
-}
+	if (ioctx->rdma_ius && ioctx->n_rdma_ius)
+		nrdma = ioctx->n_rdma_ius;
+	else {
+		nrdma = (count + SRPT_DEF_SG_PER_WQE - 1) / SRPT_DEF_SG_PER_WQE
+			+ ioctx->n_rbuf;
 
-static int adxl34x_spi_read_block(struct device *dev,
-				  unsigned char reg, int count,
-				  void *buf)
-{
-	struct spi_device *spi = to_spi_device(dev);
-	ssize_t status;
+		ioctx->rdma_ius = kzalloc(nrdma * sizeof *riu, GFP_KERNEL);
+		if (!ioctx->rdma_ius)
+			goto free_mem;
 
-	reg = ADXL34X_READMB_CMD(reg);
-	status = spi_write_then_read(spi, &reg, 1, buf, count);
-
-	return (status < 0) ? status : 0;
-}
-
-static const struct adxl34x_bus_ops adxl34x_spi_bops = {
-	.bustype	= BUS_SPI,
-	.write		= adxl34x_spi_write,
-	.read		= adxl34x_spi_read,
-	.read_block	= adxl34x_spi_read_block,
-};
-
-static int adxl34x_spi_probe(struct spi_device *spi)
-{
-	struct adxl34x *ac;
-
-	/* don't exceed max specified SPI CLK frequency */
-	if (spi->max_speed_hz > MAX_SPI_FREQ_HZ) {
-		dev_err(&spi->dev, "SPI CLK %d Hz too fast\n", spi->max_speed_hz);
-		return -EINVAL;
+		ioctx->n_rdma_ius = nrdma;
 	}
 
-	ac = adxl34x_probe(&spi->dev, spi->irq,
-			   spi->max_speed_hz > MAX_FREQ_NO_FIFODELAY,
-			   &adxl34x_spi_bops);
+	db = ioctx->rbufs;
+	tsize = cmd->data_length;
+	dma_len = ib_sg_dma_len(dev, &sg[0]);
+	riu = ioctx->rdma_ius;
 
-	if (IS_ERR(ac))
-		return PTR_ERR(ac);
+	/*
+	 * For each remote desc - calculate the #ib_sge.
+	 * If #ib_sge < SRPT_DEF_SG_PER_WQE per rdma operation then
+	 *      each remote desc rdma_iu is required a rdma wr;
+	 * else
+	 *      we need to allocate extra rdma_iu to carry extra #ib_sge in
+	 *      another rdma wr
+	 */
+	for (i = 0, j = 0;
+	     j < count && i < ioctx->n_rbuf && tsize > 0; ++i, ++riu, ++db) {
+		rsize = be32_to_cpu(db->len);
+		raddr = be64_to_cpu(db->va);
+		riu->raddr = raddr;
+		riu->rkey = be32_to_cpu(db->key);
+		riu->sge_cnt = 0;
 
-	spi_set_drvdata(spi, ac);
+		/* calculate how many sge required for this remote_buf */
+		while (rsize > 0 && tsize > 0) {
 
-	return 0;
-}
+			if (rsize >= dma_len) {
+				tsize -= dma_len;
+				rsize -= dma_len;
+				raddr += dma_len;
 
-static int adxl34x_spi_remove(struct spi_device *spi)
-{
-	struct adxl34x *ac = spi_get_drvdata(spi);
+				if (tsize > 0) {
+					++j;
+					if (j < count) {
+						sg = sg_next(sg);
+						dma_len = ib_sg_dma_len(
+								dev, sg);
+					}
+				}
+			} else {
+				tsize -= rsize;
+				dma_len -= rsize;
+				rsize = 0;
+			}
 
-	return adxl34x_remove(ac);
-}
+			++riu->sge_cnt;
 
-static int __maybe_unused adxl34x_spi_suspend(struct device *dev)
-{
-	struct spi_device *spi = to_spi_device(dev);
-	struct adxl34x *ac = spi_get_drvdata(spi);
+			if (rsize > 0 && riu->sge_cnt == SRPT_DEF_SG_PER_WQE) {
+				++ioctx->n_rdma;
+				riu->sge =
+				    kmalloc(riu->sge_cnt * sizeof *riu->sge,
+					    GFP_KERNEL);
+				if (!riu->sge)
+					goto free_mem;
 
-	adxl34x_suspend(ac);
+				++riu;
+				riu->sge_cnt = 0;
+				riu->raddr = raddr;
+				riu->rkey = be32_to_cpu(db->key);
+			}
+		}
 
-	return 0;
-}
+		++ioctx->n_rdma;
+		riu->sge = kmalloc(riu->sge_cnt * sizeof *riu->sge,
+				   GFP_KERNEL);
+		if (!riu->sge)
+			goto free_mem;
+	}
 
-static int __maybe_unused adxl34x_spi_resume(struct device *dev)
-{
-	struct spi_device *spi = to_spi_device(dev);
-	struct adxl34x *ac = spi_get_drvdata(spi);
+	db = ioctx->rbufs;
+	tsize = cmd->data_length;
+	riu = ioctx->rdma_ius;
+	sg = sg_orig;
+	dma_len = ib_sg_dma_len(dev, &sg[0]);
+	dma_addr = ib_sg_dma_address(dev, &sg[0]);
 
-	adxl34x_resume(ac);
+	/* this second loop is really mapped sg_addres to rdma_iu->ib_sge */
+	for (i = 0, j = 0;
+	     j < count && i < ioctx->n_rbuf && tsize > 0; ++i, ++riu, ++db) {
+		rsize = be32_to_cpu(db->len);
+		sge = riu->sge;
+		k = 0;
 
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(adxl34x_spi_pm, adxl34x_spi_suspend,
-			 adxl34x_spi_resume);
-
-static struct spi_driver adxl34x_driver = {
-	.driver = {
-		.name = "adxl34x",
-		.pm = &adxl34x_spi_pm,
-	},
-	.probe   = adxl34x_spi_probe,
-	.remove  = adxl34x_spi_remove,
-};
-
-module_spi_driver(adxl34x_driver);
-
-MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
-MODULE_DESCRIPTION("ADXL345/346 Three-Axis Digital Accelerometer SPI Bus Driver");
-MODULE_LICENSE("GPL");
+		while (rsize > 0 && tsize > 0) {
+			sge->addr =

@@ -1,49 +1,65 @@
-#
-# Wacom configuration
-#
+NODELAY
+};
 
-config INPUT_WACOM
-	tristate "Wacom penabled i2c touchscreen"
-	depends on I2C
-	help
-	  Say Y here if you have an Wacom penabled i2c touchscreen
-	  connected to your system.
+struct ocrdma_create_cq_cmd {
+	struct ocrdma_mbx_hdr req;
+	u32 pgsz_pgcnt;
+	u32 ev_cnt_flags;
+	u32 eqn;
+	u32 pdid_cqecnt;
+	u32 rsvd6;
+	struct ocrdma_pa pa[OCRDMA_CREATE_CQ_MAX_PAGES];
+};
 
-	  If unsure, say N.
+struct ocrdma_create_cq {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_create_cq_cmd cmd;
+};
 
-	  To compile this driver as a module, choose M here: the
-	  module will be called wacom_GXXX.
+enum {
+	OCRDMA_CREATE_CQ_CMD_PDID_SHIFT	= 0x10
+};
 
-config EPEN_WACOM_W9018
-	tristate "Wacom W9018 penabled i2c touchscreen"
-	depends on I2C
-	help
-	  Say Y here if you have an Wacom G10PM penabled i2c touchscreen
-	  connected to your system.
+enum {
+	OCRDMA_CREATE_CQ_RSP_CQ_ID_MASK	= 0xFFFF
+};
 
-	  If unsure, say N.
+struct ocrdma_create_cq_cmd_rsp {
+	struct ocrdma_mbx_rsp rsp;
+	u32 cq_id;
+};
 
-	  To compile this driver as a module, choose M here: the
-	  module will be called wacom_W9018.
+struct ocrdma_create_cq_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_create_cq_cmd_rsp rsp;
+};
 
-config EPEN_WACOM_W9019
-	tristate "Wacom W9019 penabled i2c touchscreen"
-	depends on I2C
-	help
-	  Say Y here if you have an Wacom G10PM penabled i2c touchscreen
-	  connected to your system.
+enum {
+	OCRDMA_CREATE_MQ_V0_CQ_ID_SHIFT		= 22,
+	OCRDMA_CREATE_MQ_CQ_ID_SHIFT		= 16,
+	OCRDMA_CREATE_MQ_RING_SIZE_SHIFT	= 16,
+	OCRDMA_CREATE_MQ_VALID			= BIT(31),
+	OCRDMA_CREATE_MQ_ASYNC_CQ_VALID		= BIT(0)
+};
 
-	  If unsure, say N.
+struct ocrdma_create_mq_req {
+	struct ocrdma_mbx_hdr req;
+	u32 cqid_pages;
+	u32 async_event_bitmap;
+	u32 async_cqid_ringsize;
+	u32 valid;
+	u32 async_cqid_valid;
+	u32 rsvd;
+	struct ocrdma_pa pa[8];
+};
 
-	  To compile this driver as a module, choose M here: the
-	  module will be called wacom_W9018.
+struct ocrdma_create_mq_rsp {
+	struct ocrdma_mbx_rsp rsp;
+	u32 id;
+};
 
-config WACOM_LCD_FREQ_COMPENSATE
-	bool "Wacom LCD vsync/hsync frequency compensate rotuine"
-	help
-	  Say Y here if you have an Wacom lcd freq compensate config
-
-	  If unsure, say N.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called wacom.
+enum {
+	OCRDMA_DESTROY_CQ_QID_SHIFT			= 0,
+	OCRDMA_DESTROY_CQ_QID_MASK			= 0xFFFF,
+	OCRDMA_DESTROY_CQ_QID_BYPASS_FLUSH_SHIFT	= 16,
+	OCRDMA_DESTROY_CQ_QID_BYPA

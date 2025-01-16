@@ -1,27 +1,13 @@
-/*
- * Copyright (C) 2016 Samsung Electronics.
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
-
-#ifndef __MODEM_DUMP_H__
-#define __MODEM_DUMP_H__
-
-#include <linux/workqueue.h>
-#include "modem_prj.h"
-
-int save_shmem_dump(struct link_device *mld, struct io_device *iod,
-		unsigned long arg);
-int save_acpm_dump(struct link_device *mld, struct io_device *iod,
-		unsigned long arg);
-int save_vss_dump(struct link_device *mld, struct io_device *iod,
-		unsigned long arg);
-#endif
+EN_OVRD_EN_0__SHIFT 0x9
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_FBDIV_OVRD_VAL_0_MASK 0x3fc00
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_FBDIV_OVRD_VAL_0__SHIFT 0xa
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_FBDIV_OVRD_EN_0_MASK 0x40000
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_FBDIV_OVRD_EN_0__SHIFT 0x12
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_LF_CNTRL_OVRD_VAL_0_MASK 0xff80000
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_LF_CNTRL_OVRD_VAL_0__SHIFT 0x13
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_LF_CNTRL_OVRD_EN_0_MASK 0x10000000
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_LF_CNTRL_OVRD_EN_0__SHIFT 0x1c
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_REFDIV_OVRD_VAL_0_MASK 0x60000000
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_REFDIV_OVRD_VAL_0__SHIFT 0x1d
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_REFDIV_OVRD_EN_0_MASK 0x80000000
+#define PB1_PLL_LC0_OVRD_REG0__PLL_CFG_LC_REFDIV_OVRD_EN_0_

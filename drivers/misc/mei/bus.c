@@ -1,1015 +1,719 @@
+28 */
+	AGC_EN_RSSI,               /* 29 */
+	RFA_ENCLKRFAGC,            /* 30 */
+	RFA_RSSI_REFH,             /* 31 */
+	RFA_RSSI_REF,              /* 32 */
+	RFA_RSSI_REFL,             /* 33 */
+	RFA_FLR,                   /* 34 */
+	RFA_CEIL,                  /* 35 */
+	SEQ_EXTIQFSMPULSE,         /* 36 */
+	OVERRIDE_1,                /* 37 */
+	BB_INITSTATE_DLPF_TUNE,    /* 38 */
+	TG_R_DIV,                  /* 39 */
+	EN_CHP_LIN_B,              /* 40 */
+
+	/* Channel Change Control Names */
+	DN_POLY = 51,              /* 51 */
+	DN_RFGAIN,                 /* 52 */
+	DN_CAP_RFLPF,              /* 53 */
+	DN_EN_VHFUHFBAR,           /* 54 */
+	DN_GAIN_ADJUST,            /* 55 */
+	DN_IQTNBUF_AMP,            /* 56 */
+	DN_IQTNGNBFBIAS_BST,       /* 57 */
+	RFSYN_EN_OUTMUX,           /* 58 */
+	RFSYN_SEL_VCO_OUT,         /* 59 */
+	RFSYN_SEL_VCO_HI,          /* 60 */
+	RFSYN_SEL_DIVM,            /* 61 */
+	RFSYN_RF_DIV_BIAS,         /* 62 */
+	DN_SEL_FREQ,               /* 63 */
+	RFSYN_VCO_BIAS,            /* 64 */
+	CHCAL_INT_MOD_RF,          /* 65 */
+	CHCAL_FRAC_MOD_RF,         /* 66 */
+	RFSYN_LPF_R,               /* 67 */
+	CHCAL_EN_INT_RF,           /* 68 */
+	TG_LO_DIVVAL,              /* 69 */
+	TG_LO_SELVAL,              /* 70 */
+	TG_DIV_VAL,                /* 71 */
+	TG_VCO_BIAS,               /* 72 */
+	SEQ_EXTPOWERUP,            /* 73 */
+	OVERRIDE_2,                /* 74 */
+	OVERRIDE_3,                /* 75 */
+	OVERRIDE_4,                /* 76 */
+	SEQ_FSM_PULSE,             /* 77 */
+	GPIO_4B,                   /* 78 */
+	GPIO_3B,                   /* 79 */
+	GPIO_4,                    /* 80 */
+	GPIO_3,                    /* 81 */
+	GPIO_1B,                   /* 82 */
+	DAC_A_ENABLE,              /* 83 */
+	DAC_B_ENABLE,              /* 84 */
+	DAC_DIN_A,                 /* 85 */
+	DAC_DIN_B,                 /* 86 */
+#ifdef _MXL_PRODUCTION
+	RFSYN_EN_DIV,              /* 87 */
+	RFSYN_DIVM,                /* 88 */
+	DN_BYPASS_AGC_I2C          /* 89 */
+#endif
+};
+
 /*
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2012-2013, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
+ * The following context is source code provided by MaxLinear.
+ * MaxLinear source code - Common_MXL.h (?)
  */
 
-#include <linux/module.h>
-#include <linux/device.h>
-#include <linux/kernel.h>
-#include <linux/sched.h>
-#include <linux/init.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/mutex.h>
-#include <linux/interrupt.h>
-#include <linux/mei_cl_bus.h>
-
-#include "mei_dev.h"
-#include "client.h"
-
-#define to_mei_cl_driver(d) container_of(d, struct mei_cl_driver, driver)
-#define to_mei_cl_device(d) container_of(d, struct mei_cl_device, dev)
-
-/**
- * __mei_cl_send - internal client send (write)
- *
- * @cl: host client
- * @buf: buffer to send
- * @length: buffer length
- * @blocking: wait for write completion
- *
- * Return: written size bytes or < 0 on error
- */
-ssize_t __mei_cl_send(struct mei_cl *cl, u8 *buf, size_t length,
-			bool blocking)
-{
-	struct mei_device *bus;
-	struct mei_cl_cb *cb = NULL;
-	ssize_t rets;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	bus = cl->dev;
-
-	mutex_lock(&bus->device_lock);
-	if (bus->dev_state != MEI_DEV_ENABLED) {
-		rets = -ENODEV;
-		goto out;
-	}
-
-	if (!mei_cl_is_connected(cl)) {
-		rets = -ENODEV;
-		goto out;
-	}
-
-	/* Check if we have an ME client device */
-	if (!mei_me_cl_is_active(cl->me_cl)) {
-		rets = -ENOTTY;
-		goto out;
-	}
-
-	if (length > mei_cl_mtu(cl)) {
-		rets = -EFBIG;
-		goto out;
-	}
-
-	cb = mei_cl_alloc_cb(cl, length, MEI_FOP_WRITE, NULL);
-	if (!cb) {
-		rets = -ENOMEM;
-		goto out;
-	}
-
-	memcpy(cb->buf.data, buf, length);
-
-	rets = mei_cl_write(cl, cb, blocking);
-
-out:
-	mutex_unlock(&bus->device_lock);
-	if (rets < 0)
-		mei_io_cb_free(cb);
-
-	return rets;
-}
-
-/**
- * __mei_cl_recv - internal client receive (read)
- *
- * @cl: host client
- * @buf: buffer to receive
- * @length: buffer length
- *
- * Return: read size in bytes of < 0 on error
- */
-ssize_t __mei_cl_recv(struct mei_cl *cl, u8 *buf, size_t length)
-{
-	struct mei_device *bus;
-	struct mei_cl_cb *cb;
-	size_t r_length;
-	ssize_t rets;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	bus = cl->dev;
-
-	mutex_lock(&bus->device_lock);
-	if (bus->dev_state != MEI_DEV_ENABLED) {
-		rets = -ENODEV;
-		goto out;
-	}
-
-	cb = mei_cl_read_cb(cl, NULL);
-	if (cb)
-		goto copy;
-
-	rets = mei_cl_read_start(cl, length, NULL);
-	if (rets && rets != -EBUSY)
-		goto out;
-
-	/* wait on event only if there is no other waiter */
-	if (list_empty(&cl->rd_completed) && !waitqueue_active(&cl->rx_wait)) {
-
-		mutex_unlock(&bus->device_lock);
-
-		if (wait_event_interruptible(cl->rx_wait,
-				(!list_empty(&cl->rd_completed)) ||
-				(!mei_cl_is_connected(cl)))) {
-
-			if (signal_pending(current))
-				return -EINTR;
-			return -ERESTARTSYS;
-		}
-
-		mutex_lock(&bus->device_lock);
-
-		if (!mei_cl_is_connected(cl)) {
-			rets = -ENODEV;
-			goto out;
-		}
-	}
-
-	cb = mei_cl_read_cb(cl, NULL);
-	if (!cb) {
-		rets = 0;
-		goto out;
-	}
-
-copy:
-	if (cb->status) {
-		rets = cb->status;
-		goto free;
-	}
-
-	r_length = min_t(size_t, length, cb->buf_idx);
-	memcpy(buf, cb->buf.data, r_length);
-	rets = r_length;
-
-free:
-	mei_io_cb_free(cb);
-out:
-	mutex_unlock(&bus->device_lock);
-
-	return rets;
-}
-
-/**
- * mei_cldev_send - me device send  (write)
- *
- * @cldev: me client device
- * @buf: buffer to send
- * @length: buffer length
- *
- * Return: written size in bytes or < 0 on error
- */
-ssize_t mei_cldev_send(struct mei_cl_device *cldev, u8 *buf, size_t length)
-{
-	struct mei_cl *cl = cldev->cl;
-
-	if (cl == NULL)
-		return -ENODEV;
-
-	return __mei_cl_send(cl, buf, length, 1);
-}
-EXPORT_SYMBOL_GPL(mei_cldev_send);
-
-/**
- * mei_cldev_recv - client receive (read)
- *
- * @cldev: me client device
- * @buf: buffer to receive
- * @length: buffer length
- *
- * Return: read size in bytes of < 0 on error
- */
-ssize_t mei_cldev_recv(struct mei_cl_device *cldev, u8 *buf, size_t length)
-{
-	struct mei_cl *cl = cldev->cl;
-
-	if (cl == NULL)
-		return -ENODEV;
-
-	return __mei_cl_recv(cl, buf, length);
-}
-EXPORT_SYMBOL_GPL(mei_cldev_recv);
-
-/**
- * mei_cl_bus_event_work  - dispatch rx event for a bus device
- *    and schedule new work
- *
- * @work: work
- */
-static void mei_cl_bus_event_work(struct work_struct *work)
-{
-	struct mei_cl_device *cldev;
-	struct mei_device *bus;
-
-	cldev = container_of(work, struct mei_cl_device, event_work);
-
-	bus = cldev->bus;
-
-	if (cldev->event_cb)
-		cldev->event_cb(cldev, cldev->events, cldev->event_context);
-
-	cldev->events = 0;
-
-	/* Prepare for the next read */
-	if (cldev->events_mask & BIT(MEI_CL_EVENT_RX)) {
-		mutex_lock(&bus->device_lock);
-		mei_cl_read_start(cldev->cl, 0, NULL);
-		mutex_unlock(&bus->device_lock);
-	}
-}
-
-/**
- * mei_cl_bus_notify_event - schedule notify cb on bus client
- *
- * @cl: host client
- */
-void mei_cl_bus_notify_event(struct mei_cl *cl)
-{
-	struct mei_cl_device *cldev = cl->cldev;
-
-	if (!cldev || !cldev->event_cb)
-		return;
-
-	if (!(cldev->events_mask & BIT(MEI_CL_EVENT_NOTIF)))
-		return;
-
-	if (!cl->notify_ev)
-		return;
-
-	set_bit(MEI_CL_EVENT_NOTIF, &cldev->events);
-
-	schedule_work(&cldev->event_work);
-
-	cl->notify_ev = false;
-}
-
-/**
- * mei_cl_bus_rx_event  - schedule rx evenet
- *
- * @cl: host client
- */
-void mei_cl_bus_rx_event(struct mei_cl *cl)
-{
-	struct mei_cl_device *cldev = cl->cldev;
-
-	if (!cldev || !cldev->event_cb)
-		return;
-
-	if (!(cldev->events_mask & BIT(MEI_CL_EVENT_RX)))
-		return;
-
-	set_bit(MEI_CL_EVENT_RX, &cldev->events);
-
-	schedule_work(&cldev->event_work);
-}
-
-/**
- * mei_cldev_register_event_cb - register event callback
- *
- * @cldev: me client devices
- * @event_cb: callback function
- * @events_mask: requested events bitmask
- * @context: driver context data
- *
- * Return: 0 on success
- *         -EALREADY if an callback is already registered
- *         <0 on other errors
- */
-int mei_cldev_register_event_cb(struct mei_cl_device *cldev,
-				unsigned long events_mask,
-				mei_cldev_event_cb_t event_cb, void *context)
-{
-	struct mei_device *bus = cldev->bus;
-	int ret;
-
-	if (cldev->event_cb)
-		return -EALREADY;
-
-	cldev->events = 0;
-	cldev->events_mask = events_mask;
-	cldev->event_cb = event_cb;
-	cldev->event_context = context;
-	INIT_WORK(&cldev->event_work, mei_cl_bus_event_work);
-
-	if (cldev->events_mask & BIT(MEI_CL_EVENT_RX)) {
-		mutex_lock(&bus->device_lock);
-		ret = mei_cl_read_start(cldev->cl, 0, NULL);
-		mutex_unlock(&bus->device_lock);
-		if (ret && ret != -EBUSY)
-			return ret;
-	}
-
-	if (cldev->events_mask & BIT(MEI_CL_EVENT_NOTIF)) {
-		mutex_lock(&bus->device_lock);
-		ret = mei_cl_notify_request(cldev->cl, NULL, event_cb ? 1 : 0);
-		mutex_unlock(&bus->device_lock);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(mei_cldev_register_event_cb);
-
-/**
- * mei_cldev_get_drvdata - driver data getter
- *
- * @cldev: mei client device
- *
- * Return: driver private data
- */
-void *mei_cldev_get_drvdata(const struct mei_cl_device *cldev)
-{
-	return dev_get_drvdata(&cldev->dev);
-}
-EXPORT_SYMBOL_GPL(mei_cldev_get_drvdata);
-
-/**
- * mei_cldev_set_drvdata - driver data setter
- *
- * @cldev: mei client device
- * @data: data to store
- */
-void mei_cldev_set_drvdata(struct mei_cl_device *cldev, void *data)
-{
-	dev_set_drvdata(&cldev->dev, data);
-}
-EXPORT_SYMBOL_GPL(mei_cldev_set_drvdata);
-
-/**
- * mei_cldev_uuid - return uuid of the underlying me client
- *
- * @cldev: mei client device
- *
- * Return: me client uuid
- */
-const uuid_le *mei_cldev_uuid(const struct mei_cl_device *cldev)
-{
-	return mei_me_cl_uuid(cldev->me_cl);
-}
-EXPORT_SYMBOL_GPL(mei_cldev_uuid);
-
-/**
- * mei_cldev_ver - return protocol version of the underlying me client
- *
- * @cldev: mei client device
- *
- * Return: me client protocol version
- */
-u8 mei_cldev_ver(const struct mei_cl_device *cldev)
-{
-	return mei_me_cl_ver(cldev->me_cl);
-}
-EXPORT_SYMBOL_GPL(mei_cldev_ver);
-
-/**
- * mei_cldev_enabled - check whether the device is enabled
- *
- * @cldev: mei client device
- *
- * Return: true if me client is initialized and connected
- */
-bool mei_cldev_enabled(struct mei_cl_device *cldev)
-{
-	return cldev->cl && mei_cl_is_connected(cldev->cl);
-}
-EXPORT_SYMBOL_GPL(mei_cldev_enabled);
-
-/**
- * mei_cldev_enable - enable me client device
- *     create connection with me client
- *
- * @cldev: me client device
- *
- * Return: 0 on success and < 0 on error
- */
-int mei_cldev_enable(struct mei_cl_device *cldev)
-{
-	struct mei_device *bus = cldev->bus;
-	struct mei_cl *cl;
-	int ret;
-
-	cl = cldev->cl;
-
-	if (!cl) {
-		mutex_lock(&bus->device_lock);
-		cl = mei_cl_alloc_linked(bus, MEI_HOST_CLIENT_ID_ANY);
-		mutex_unlock(&bus->device_lock);
-		if (IS_ERR(cl))
-			return PTR_ERR(cl);
-		/* update pointers */
-		cldev->cl = cl;
-		cl->cldev = cldev;
-	}
-
-	mutex_lock(&bus->device_lock);
-	if (mei_cl_is_connected(cl)) {
-		ret = 0;
-		goto out;
-	}
-
-	if (!mei_me_cl_is_active(cldev->me_cl)) {
-		dev_err(&cldev->dev, "me client is not active\n");
-		ret = -ENOTTY;
-		goto out;
-	}
-
-	ret = mei_cl_connect(cl, cldev->me_cl, NULL);
-	if (ret < 0)
-		dev_err(&cldev->dev, "cannot connect\n");
-
-out:
-	mutex_unlock(&bus->device_lock);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(mei_cldev_enable);
-
-/**
- * mei_cldev_disable - disable me client device
- *     disconnect form the me client
- *
- * @cldev: me client device
- *
- * Return: 0 on success and < 0 on error
- */
-int mei_cldev_disable(struct mei_cl_device *cldev)
-{
-	struct mei_device *bus;
-	struct mei_cl *cl;
-	int err;
-
-	if (!cldev || !cldev->cl)
-		return -ENODEV;
-
-	cl = cldev->cl;
-
-	bus = cldev->bus;
-
-	cldev->event_cb = NULL;
-
-	mutex_lock(&bus->device_lock);
-
-	if (!mei_cl_is_connected(cl)) {
-		dev_err(bus->dev, "Already disconnected");
-		err = 0;
-		goto out;
-	}
-
-	err = mei_cl_disconnect(cl);
-	if (err < 0)
-		dev_err(bus->dev, "Could not disconnect from the ME client");
-
-out:
-	/* Flush queues and remove any pending read */
-	mei_cl_flush_queues(cl, NULL);
-	mei_cl_unlink(cl);
-
-	kfree(cl);
-	cldev->cl = NULL;
-
-	mutex_unlock(&bus->device_lock);
-	return err;
-}
-EXPORT_SYMBOL_GPL(mei_cldev_disable);
-
-/**
- * mei_cl_device_find - find matching entry in the driver id table
- *
- * @cldev: me client device
- * @cldrv: me client driver
- *
- * Return: id on success; NULL if no id is matching
- */
-static const
-struct mei_cl_device_id *mei_cl_device_find(struct mei_cl_device *cldev,
-					    struct mei_cl_driver *cldrv)
-{
-	const struct mei_cl_device_id *id;
-	const uuid_le *uuid;
-	u8 version;
-	bool match;
-
-	uuid = mei_me_cl_uuid(cldev->me_cl);
-	version = mei_me_cl_ver(cldev->me_cl);
-
-	id = cldrv->id_table;
-	while (uuid_le_cmp(NULL_UUID_LE, id->uuid)) {
-		if (!uuid_le_cmp(*uuid, id->uuid)) {
-			match = true;
-
-			if (cldev->name[0])
-				if (strncmp(cldev->name, id->name,
-					    sizeof(id->name)))
-					match = false;
-
-			if (id->version != MEI_CL_VERSION_ANY)
-				if (id->version != version)
-					match = false;
-			if (match)
-				return id;
-		}
-
-		id++;
-	}
-
-	return NULL;
-}
-
-/**
- * mei_cl_device_match  - device match function
- *
- * @dev: device
- * @drv: driver
- *
- * Return:  1 if matching device was found 0 otherwise
- */
-static int mei_cl_device_match(struct device *dev, struct device_driver *drv)
-{
-	struct mei_cl_device *cldev = to_mei_cl_device(dev);
-	struct mei_cl_driver *cldrv = to_mei_cl_driver(drv);
-	const struct mei_cl_device_id *found_id;
-
-	if (!cldev)
-		return 0;
-
-	if (!cldev->do_match)
-		return 0;
-
-	if (!cldrv || !cldrv->id_table)
-		return 0;
-
-	found_id = mei_cl_device_find(cldev, cldrv);
-	if (found_id)
-		return 1;
-
-	return 0;
-}
-
-/**
- * mei_cl_device_probe - bus probe function
- *
- * @dev: device
- *
- * Return:  0 on success; < 0 otherwise
- */
-static int mei_cl_device_probe(struct device *dev)
-{
-	struct mei_cl_device *cldev;
-	struct mei_cl_driver *cldrv;
-	const struct mei_cl_device_id *id;
-
-	cldev = to_mei_cl_device(dev);
-	cldrv = to_mei_cl_driver(dev->driver);
-
-	if (!cldev)
-		return 0;
-
-	if (!cldrv || !cldrv->probe)
-		return -ENODEV;
-
-	id = mei_cl_device_find(cldev, cldrv);
-	if (!id)
-		return -ENODEV;
-
-	__module_get(THIS_MODULE);
-
-	return cldrv->probe(cldev, id);
-}
-
-/**
- * mei_cl_device_remove - remove device from the bus
- *
- * @dev: device
- *
- * Return:  0 on success; < 0 otherwise
- */
-static int mei_cl_device_remove(struct device *dev)
-{
-	struct mei_cl_device *cldev = to_mei_cl_device(dev);
-	struct mei_cl_driver *cldrv;
-	int ret = 0;
-
-	if (!cldev || !dev->driver)
-		return 0;
-
-	if (cldev->event_cb) {
-		cldev->event_cb = NULL;
-		cancel_work_sync(&cldev->event_work);
-	}
-
-	cldrv = to_mei_cl_driver(dev->driver);
-	if (cldrv->remove)
-		ret = cldrv->remove(cldev);
-
-	module_put(THIS_MODULE);
-
-	return ret;
-}
-
-static ssize_t name_show(struct device *dev, struct device_attribute *a,
-			     char *buf)
-{
-	struct mei_cl_device *cldev = to_mei_cl_device(dev);
-	size_t len;
-
-	len = snprintf(buf, PAGE_SIZE, "%s", cldev->name);
-
-	return (len >= PAGE_SIZE) ? (PAGE_SIZE - 1) : len;
-}
-static DEVICE_ATTR_RO(name);
-
-static ssize_t uuid_show(struct device *dev, struct device_attribute *a,
-			     char *buf)
-{
-	struct mei_cl_device *cldev = to_mei_cl_device(dev);
-	const uuid_le *uuid = mei_me_cl_uuid(cldev->me_cl);
-	size_t len;
-
-	len = snprintf(buf, PAGE_SIZE, "%pUl", uuid);
-
-	return (len >= PAGE_SIZE) ? (PAGE_SIZE - 1) : len;
-}
-static DEVICE_ATTR_RO(uuid);
-
-static ssize_t version_show(struct device *dev, struct device_attribute *a,
-			     char *buf)
-{
-	struct mei_cl_device *cldev = to_mei_cl_device(dev);
-	u8 version = mei_me_cl_ver(cldev->me_cl);
-	size_t len;
-
-	len = snprintf(buf, PAGE_SIZE, "%02X", version);
-
-	return (len >= PAGE_SIZE) ? (PAGE_SIZE - 1) : len;
-}
-static DEVICE_ATTR_RO(version);
-
-static ssize_t modalias_show(struct device *dev, struct device_attribute *a,
-			     char *buf)
-{
-	struct mei_cl_device *cldev = to_mei_cl_device(dev);
-	const uuid_le *uuid = mei_me_cl_uuid(cldev->me_cl);
-	size_t len;
-
-	len = snprintf(buf, PAGE_SIZE, "mei:%s:%pUl:", cldev->name, uuid);
-	return (len >= PAGE_SIZE) ? (PAGE_SIZE - 1) : len;
-}
-static DEVICE_ATTR_RO(modalias);
-
-static struct attribute *mei_cldev_attrs[] = {
-	&dev_attr_name.attr,
-	&dev_attr_uuid.attr,
-	&dev_attr_version.attr,
-	&dev_attr_modalias.attr,
-	NULL,
+/* Constants */
+#define MXL5005S_REG_WRITING_TABLE_LEN_MAX	104
+#define MXL5005S_LATCH_BYTE			0xfe
+
+/* Register address, MSB, and LSB */
+#define MXL5005S_BB_IQSWAP_ADDR			59
+#define MXL5005S_BB_IQSWAP_MSB			0
+#define MXL5005S_BB_IQSWAP_LSB			0
+
+#define MXL5005S_BB_DLPF_BANDSEL_ADDR		53
+#define MXL5005S_BB_DLPF_BANDSEL_MSB		4
+#define MXL5005S_BB_DLPF_BANDSEL_LSB		3
+
+/* Standard modes */
+enum {
+	MXL5005S_STANDARD_DVBT,
+	MXL5005S_STANDARD_ATSC,
 };
-ATTRIBUTE_GROUPS(mei_cldev);
+#define MXL5005S_STANDARD_MODE_NUM		2
 
-/**
- * mei_cl_device_uevent - me client bus uevent handler
- *
- * @dev: device
- * @env: uevent kobject
- *
- * Return: 0 on success -ENOMEM on when add_uevent_var fails
- */
-static int mei_cl_device_uevent(struct device *dev, struct kobj_uevent_env *env)
-{
-	struct mei_cl_device *cldev = to_mei_cl_device(dev);
-	const uuid_le *uuid = mei_me_cl_uuid(cldev->me_cl);
-	u8 version = mei_me_cl_ver(cldev->me_cl);
+/* Bandwidth modes */
+enum {
+	MXL5005S_BANDWIDTH_6MHZ = 6000000,
+	MXL5005S_BANDWIDTH_7MHZ = 7000000,
+	MXL5005S_BANDWIDTH_8MHZ = 8000000,
+};
+#define MXL5005S_BANDWIDTH_MODE_NUM		3
 
-	if (add_uevent_var(env, "MEI_CL_VERSION=%d", version))
-		return -ENOMEM;
-
-	if (add_uevent_var(env, "MEI_CL_UUID=%pUl", uuid))
-		return -ENOMEM;
-
-	if (add_uevent_var(env, "MEI_CL_NAME=%s", cldev->name))
-		return -ENOMEM;
-
-	if (add_uevent_var(env, "MODALIAS=mei:%s:%pUl:%02X:",
-			   cldev->name, uuid, version))
-		return -ENOMEM;
-
-	return 0;
-}
-
-static struct bus_type mei_cl_bus_type = {
-	.name		= "mei",
-	.dev_groups	= mei_cldev_groups,
-	.match		= mei_cl_device_match,
-	.probe		= mei_cl_device_probe,
-	.remove		= mei_cl_device_remove,
-	.uevent		= mei_cl_device_uevent,
+/* MXL5005 Tuner Control Struct */
+struct TunerControl {
+	u16 Ctrl_Num;	/* Control Number */
+	u16 size;	/* Number of bits to represent Value */
+	u16 addr[25];	/* Array of Tuner Register Address for each bit pos */
+	u16 bit[25];	/* Array of bit pos in Reg Addr for each bit pos */
+	u16 val[25];	/* Binary representation of Value */
 };
 
-static struct mei_device *mei_dev_bus_get(struct mei_device *bus)
-{
-	if (bus)
-		get_device(bus->dev);
+/* MXL5005 Tuner Struct */
+struct mxl5005s_state {
+	u8	Mode;		/* 0: Analog Mode ; 1: Digital Mode */
+	u8	IF_Mode;	/* for Analog Mode, 0: zero IF; 1: low IF */
+	u32	Chan_Bandwidth;	/* filter  channel bandwidth (6, 7, 8) */
+	u32	IF_OUT;		/* Desired IF Out Frequency */
+	u16	IF_OUT_LOAD;	/* IF Out Load Resistor (200/300 Ohms) */
+	u32	RF_IN;		/* RF Input Frequency */
+	u32	Fxtal;		/* XTAL Frequency */
+	u8	AGC_Mode;	/* AGC Mode 0: Dual AGC; 1: Single AGC */
+	u16	TOP;		/* Value: take over point */
+	u8	CLOCK_OUT;	/* 0: turn off clk out; 1: turn on clock out */
+	u8	DIV_OUT;	/* 4MHz or 16MHz */
+	u8	CAPSELECT;	/* 0: disable On-Chip pulling cap; 1: enable */
+	u8	EN_RSSI;	/* 0: disable RSSI; 1: enable RSSI */
 
-	return bus;
-}
+	/* Modulation Type; */
+	/* 0 - Default;	1 - DVB-T; 2 - ATSC; 3 - QAM; 4 - Analog Cable */
+	u8	Mod_Type;
 
-static void mei_dev_bus_put(struct mei_device *bus)
-{
-	if (bus)
-		put_device(bus->dev);
-}
+	/* Tracking Filter Type */
+	/* 0 - Default; 1 - Off; 2 - Type C; 3 - Type C-H */
+	u8	TF_Type;
 
-static void mei_cl_bus_dev_release(struct device *dev)
-{
-	struct mei_cl_device *cldev = to_mei_cl_device(dev);
+	/* Calculated Settings */
+	u32	RF_LO;		/* Synth RF LO Frequency */
+	u32	IF_LO;		/* Synth IF LO Frequency */
+	u32	TG_LO;		/* Synth TG_LO Frequency */
 
-	if (!cldev)
-		return;
+	/* Pointers to ControlName Arrays */
+	u16	Init_Ctrl_Num;		/* Number of INIT Control Names */
+	struct TunerControl
+		Init_Ctrl[INITCTRL_NUM]; /* INIT Control Names Array Pointer */
 
-	mei_me_cl_put(cldev->me_cl);
-	mei_dev_bus_put(cldev->bus);
-	kfree(cldev);
-}
+	u16	CH_Ctrl_Num;		/* Number of CH Control Names */
+	struct TunerControl
+		CH_Ctrl[CHCTRL_NUM];	/* CH Control Name Array Pointer */
 
-static struct device_type mei_cl_device_type = {
-	.release	= mei_cl_bus_dev_release,
+	u16	MXL_Ctrl_Num;		/* Number of MXL Control Names */
+	struct TunerControl
+		MXL_Ctrl[MXLCTRL_NUM];	/* MXL Control Name Array Pointer */
+
+	/* Pointer to Tuner Register Array */
+	u16	TunerRegs_Num;		/* Number of Tuner Registers */
+	struct TunerReg
+		TunerRegs[TUNER_REGS_NUM]; /* Tuner Register Array Pointer */
+
+	/* Linux driver framework specific */
+	struct mxl5005s_config *config;
+	struct dvb_frontend *frontend;
+	struct i2c_adapter *i2c;
+
+	/* Cache values */
+	u32 current_mode;
+
 };
 
-/**
- * mei_cl_bus_set_name - set device name for me client device
- *  <controller>-<client device>
- *  Example: 0000:00:16.0-55213584-9a29-4916-badf-0fb7ed682aeb
+static u16 MXL_GetMasterControl(u8 *MasterReg, int state);
+static u16 MXL_ControlWrite(struct dvb_frontend *fe, u16 ControlNum, u32 value);
+static u16 MXL_ControlRead(struct dvb_frontend *fe, u16 controlNum, u32 *value);
+static void MXL_RegWriteBit(struct dvb_frontend *fe, u8 address, u8 bit,
+	u8 bitVal);
+static u16 MXL_GetCHRegister(struct dvb_frontend *fe, u8 *RegNum,
+	u8 *RegVal, int *count);
+static u32 MXL_Ceiling(u32 value, u32 resolution);
+static u16 MXL_RegRead(struct dvb_frontend *fe, u8 RegNum, u8 *RegVal);
+static u16 MXL_ControlWrite_Group(struct dvb_frontend *fe, u16 controlNum,
+	u32 value, u16 controlGroup);
+static u16 MXL_SetGPIO(struct dvb_frontend *fe, u8 GPIO_Num, u8 GPIO_Val);
+static u16 MXL_GetInitRegister(struct dvb_frontend *fe, u8 *RegNum,
+	u8 *RegVal, int *count);
+static u16 MXL_TuneRF(struct dvb_frontend *fe, u32 RF_Freq);
+static void MXL_SynthIFLO_Calc(struct dvb_frontend *fe);
+static void MXL_SynthRFTGLO_Calc(struct dvb_frontend *fe);
+static u16 MXL_GetCHRegister_ZeroIF(struct dvb_frontend *fe, u8 *RegNum,
+	u8 *RegVal, int *count);
+static int mxl5005s_writeregs(struct dvb_frontend *fe, u8 *addrtable,
+	u8 *datatable, u8 len);
+static u16 MXL_IFSynthInit(struct dvb_frontend *fe);
+static int mxl5005s_AssignTunerMode(struct dvb_frontend *fe, u32 mod_type,
+	u32 bandwidth);
+static int mxl5005s_reconfigure(struct dvb_frontend *fe, u32 mod_type,
+	u32 bandwidth);
+
+/* ----------------------------------------------------------------
+ * Begin: Custom code salvaged from the Realtek driver.
+ * Copyright (C) 2008 Realtek
+ * Copyright (C) 2008 Jan Hoogenraad
+ * This code is placed under the terms of the GNU General Public License
  *
- * @cldev: me client device
+ * Released by Realtek under GPLv2.
+ * Thanks to Realtek for a lot of support we received !
+ *
+ *  Revision: 080314 - original version
  */
-static inline void mei_cl_bus_set_name(struct mei_cl_device *cldev)
+
+static int mxl5005s_SetRfFreqHz(struct dvb_frontend *fe, unsigned long RfFreqHz)
 {
-	dev_set_name(&cldev->dev, "%s-%pUl",
-		     dev_name(cldev->bus->dev),
-		     mei_me_cl_uuid(cldev->me_cl));
-}
+	struct mxl5005s_state *state = fe->tuner_priv;
+	unsigned char AddrTable[MXL5005S_REG_WRITING_TABLE_LEN_MAX];
+	unsigned char ByteTable[MXL5005S_REG_WRITING_TABLE_LEN_MAX];
+	int TableLen;
 
-/**
- * mei_cl_bus_dev_alloc - initialize and allocate mei client device
- *
- * @bus: mei device
- * @me_cl: me client
- *
- * Return: allocated device structur or NULL on allocation failure
- */
-static struct mei_cl_device *mei_cl_bus_dev_alloc(struct mei_device *bus,
-						  struct mei_me_client *me_cl)
-{
-	struct mei_cl_device *cldev;
+	u32 IfDivval = 0;
+	unsigned char MasterControlByte;
 
-	cldev = kzalloc(sizeof(struct mei_cl_device), GFP_KERNEL);
-	if (!cldev)
-		return NULL;
+	dprintk(1, "%s() freq=%ld\n", __func__, RfFreqHz);
 
-	device_initialize(&cldev->dev);
-	cldev->dev.parent = bus->dev;
-	cldev->dev.bus    = &mei_cl_bus_type;
-	cldev->dev.type   = &mei_cl_device_type;
-	cldev->bus        = mei_dev_bus_get(bus);
-	cldev->me_cl      = mei_me_cl_get(me_cl);
-	mei_cl_bus_set_name(cldev);
-	cldev->is_added   = 0;
-	INIT_LIST_HEAD(&cldev->bus_list);
+	/* Set MxL5005S tuner RF frequency according to example code. */
 
-	return cldev;
-}
+	/* Tuner RF frequency setting stage 0 */
+	MXL_GetMasterControl(ByteTable, MC_SYNTH_RESET);
+	AddrTable[0] = MASTER_CONTROL_ADDR;
+	ByteTable[0] |= state->config->AgcMasterByte;
 
-/**
- * mei_cl_dev_setup - setup me client device
- *    run fix up routines and set the device name
- *
- * @bus: mei device
- * @cldev: me client device
- *
- * Return: true if the device is eligible for enumeration
- */
-static bool mei_cl_bus_dev_setup(struct mei_device *bus,
-				 struct mei_cl_device *cldev)
-{
-	cldev->do_match = 1;
-	mei_cl_bus_dev_fixup(cldev);
+	mxl5005s_writeregs(fe, AddrTable, ByteTable, 1);
 
-	/* the device name can change during fix up */
-	if (cldev->do_match)
-		mei_cl_bus_set_name(cldev);
+	/* Tuner RF frequency setting stage 1 */
+	MXL_TuneRF(fe, RfFreqHz);
 
-	return cldev->do_match == 1;
-}
+	MXL_ControlRead(fe, IF_DIVVAL, &IfDivval);
 
-/**
- * mei_cl_bus_dev_add - add me client devices
- *
- * @cldev: me client device
- *
- * Return: 0 on success; < 0 on failre
- */
-static int mei_cl_bus_dev_add(struct mei_cl_device *cldev)
-{
-	int ret;
+	MXL_ControlWrite(fe, SEQ_FSM_PULSE, 0);
+	MXL_ControlWrite(fe, SEQ_EXTPOWERUP, 1);
+	MXL_ControlWrite(fe, IF_DIVVAL, 8);
+	MXL_GetCHRegister(fe, AddrTable, ByteTable, &TableLen);
 
-	dev_dbg(cldev->bus->dev, "adding %pUL:%02X\n",
-		mei_me_cl_uuid(cldev->me_cl),
-		mei_me_cl_ver(cldev->me_cl));
-	ret = device_add(&cldev->dev);
-	if (!ret)
-		cldev->is_added = 1;
+	MXL_GetMasterControl(&MasterControlByte, MC_LOAD_START);
+	AddrTable[TableLen] = MASTER_CONTROL_ADDR ;
+	ByteTable[TableLen] = MasterControlByte |
+		state->config->AgcMasterByte;
+	TableLen += 1;
 
-	return ret;
-}
+	mxl5005s_writeregs(fe, AddrTable, ByteTable, TableLen);
 
-/**
- * mei_cl_bus_dev_stop - stop the driver
- *
- * @cldev: me client device
- */
-static void mei_cl_bus_dev_stop(struct mei_cl_device *cldev)
-{
-	if (cldev->is_added)
-		device_release_driver(&cldev->dev);
-}
+	/* Wait 30 ms. */
+	msleep(150);
 
-/**
- * mei_cl_bus_dev_destroy - destroy me client devices object
- *
- * @cldev: me client device
- *
- * Locking: called under "dev->cl_bus_lock" lock
- */
-static void mei_cl_bus_dev_destroy(struct mei_cl_device *cldev)
-{
+	/* Tuner RF frequency setting stage 2 */
+	MXL_ControlWrite(fe, SEQ_FSM_PULSE, 1);
+	MXL_ControlWrite(fe, IF_DIVVAL, IfDivval);
+	MXL_GetCHRegister_ZeroIF(fe, AddrTable, ByteTable, &TableLen);
 
-	WARN_ON(!mutex_is_locked(&cldev->bus->cl_bus_lock));
+	MXL_GetMasterControl(&MasterControlByte, MC_LOAD_START);
+	AddrTable[TableLen] = MASTER_CONTROL_ADDR ;
+	ByteTable[TableLen] = MasterControlByte |
+		state->config->AgcMasterByte ;
+	TableLen += 1;
 
-	if (!cldev->is_added)
-		return;
+	mxl5005s_writeregs(fe, AddrTable, ByteTable, TableLen);
 
-	device_del(&cldev->dev);
-
-	list_del_init(&cldev->bus_list);
-
-	cldev->is_added = 0;
-	put_device(&cldev->dev);
-}
-
-/**
- * mei_cl_bus_remove_device - remove a devices form the bus
- *
- * @cldev: me client device
- */
-static void mei_cl_bus_remove_device(struct mei_cl_device *cldev)
-{
-	mei_cl_bus_dev_stop(cldev);
-	mei_cl_bus_dev_destroy(cldev);
-}
-
-/**
- * mei_cl_bus_remove_devices - remove all devices form the bus
- *
- * @bus: mei device
- */
-void mei_cl_bus_remove_devices(struct mei_device *bus)
-{
-	struct mei_cl_device *cldev, *next;
-
-	mutex_lock(&bus->cl_bus_lock);
-	list_for_each_entry_safe(cldev, next, &bus->device_list, bus_list)
-		mei_cl_bus_remove_device(cldev);
-	mutex_unlock(&bus->cl_bus_lock);
-}
-
-
-/**
- * mei_cl_bus_dev_init - allocate and initializes an mei client devices
- *     based on me client
- *
- * @bus: mei device
- * @me_cl: me client
- *
- * Locking: called under "dev->cl_bus_lock" lock
- */
-static void mei_cl_bus_dev_init(struct mei_device *bus,
-				struct mei_me_client *me_cl)
-{
-	struct mei_cl_device *cldev;
-
-	WARN_ON(!mutex_is_locked(&bus->cl_bus_lock));
-
-	dev_dbg(bus->dev, "initializing %pUl", mei_me_cl_uuid(me_cl));
-
-	if (me_cl->bus_added)
-		return;
-
-	cldev = mei_cl_bus_dev_alloc(bus, me_cl);
-	if (!cldev)
-		return;
-
-	me_cl->bus_added = true;
-	list_add_tail(&cldev->bus_list, &bus->device_list);
-
-}
-
-/**
- * mei_cl_bus_rescan - scan me clients list and add create
- *    devices for eligible clients
- *
- * @bus: mei device
- */
-void mei_cl_bus_rescan(struct mei_device *bus)
-{
-	struct mei_cl_device *cldev, *n;
-	struct mei_me_client *me_cl;
-
-	mutex_lock(&bus->cl_bus_lock);
-
-	down_read(&bus->me_clients_rwsem);
-	list_for_each_entry(me_cl, &bus->me_clients, list)
-		mei_cl_bus_dev_init(bus, me_cl);
-	up_read(&bus->me_clients_rwsem);
-
-	list_for_each_entry_safe(cldev, n, &bus->device_list, bus_list) {
-
-		if (!mei_me_cl_is_active(cldev->me_cl)) {
-			mei_cl_bus_remove_device(cldev);
-			continue;
-		}
-
-		if (cldev->is_added)
-			continue;
-
-		if (mei_cl_bus_dev_setup(bus, cldev))
-			mei_cl_bus_dev_add(cldev);
-		else {
-			list_del_init(&cldev->bus_list);
-			put_device(&cldev->dev);
-		}
-	}
-	mutex_unlock(&bus->cl_bus_lock);
-
-	dev_dbg(bus->dev, "rescan end");
-}
-
-int __mei_cldev_driver_register(struct mei_cl_driver *cldrv,
-				struct module *owner)
-{
-	int err;
-
-	cldrv->driver.name = cldrv->name;
-	cldrv->driver.owner = owner;
-	cldrv->driver.bus = &mei_cl_bus_type;
-
-	err = driver_register(&cldrv->driver);
-	if (err)
-		return err;
-
-	pr_debug("mei: driver [%s] registered\n", cldrv->driver.name);
+	msleep(100);
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(__mei_cldev_driver_register);
+/* End: Custom code taken from the Realtek driver */
 
-void mei_cldev_driver_unregister(struct mei_cl_driver *cldrv)
+/* ----------------------------------------------------------------
+ * Begin: Reference driver code found in the Realtek driver.
+ * Copyright (C) 2008 MaxLinear
+ */
+static u16 MXL5005_RegisterInit(struct dvb_frontend *fe)
 {
-	driver_unregister(&cldrv->driver);
+	struct mxl5005s_state *state = fe->tuner_priv;
+	state->TunerRegs_Num = TUNER_REGS_NUM ;
 
-	pr_debug("mei: driver [%s] unregistered\n", cldrv->driver.name);
+	state->TunerRegs[0].Reg_Num = 9 ;
+	state->TunerRegs[0].Reg_Val = 0x40 ;
+
+	state->TunerRegs[1].Reg_Num = 11 ;
+	state->TunerRegs[1].Reg_Val = 0x19 ;
+
+	state->TunerRegs[2].Reg_Num = 12 ;
+	state->TunerRegs[2].Reg_Val = 0x60 ;
+
+	state->TunerRegs[3].Reg_Num = 13 ;
+	state->TunerRegs[3].Reg_Val = 0x00 ;
+
+	state->TunerRegs[4].Reg_Num = 14 ;
+	state->TunerRegs[4].Reg_Val = 0x00 ;
+
+	state->TunerRegs[5].Reg_Num = 15 ;
+	state->TunerRegs[5].Reg_Val = 0xC0 ;
+
+	state->TunerRegs[6].Reg_Num = 16 ;
+	state->TunerRegs[6].Reg_Val = 0x00 ;
+
+	state->TunerRegs[7].Reg_Num = 17 ;
+	state->TunerRegs[7].Reg_Val = 0x00 ;
+
+	state->TunerRegs[8].Reg_Num = 18 ;
+	state->TunerRegs[8].Reg_Val = 0x00 ;
+
+	state->TunerRegs[9].Reg_Num = 19 ;
+	state->TunerRegs[9].Reg_Val = 0x34 ;
+
+	state->TunerRegs[10].Reg_Num = 21 ;
+	state->TunerRegs[10].Reg_Val = 0x00 ;
+
+	state->TunerRegs[11].Reg_Num = 22 ;
+	state->TunerRegs[11].Reg_Val = 0x6B ;
+
+	state->TunerRegs[12].Reg_Num = 23 ;
+	state->TunerRegs[12].Reg_Val = 0x35 ;
+
+	state->TunerRegs[13].Reg_Num = 24 ;
+	state->TunerRegs[13].Reg_Val = 0x70 ;
+
+	state->TunerRegs[14].Reg_Num = 25 ;
+	state->TunerRegs[14].Reg_Val = 0x3E ;
+
+	state->TunerRegs[15].Reg_Num = 26 ;
+	state->TunerRegs[15].Reg_Val = 0x82 ;
+
+	state->TunerRegs[16].Reg_Num = 31 ;
+	state->TunerRegs[16].Reg_Val = 0x00 ;
+
+	state->TunerRegs[17].Reg_Num = 32 ;
+	state->TunerRegs[17].Reg_Val = 0x40 ;
+
+	state->TunerRegs[18].Reg_Num = 33 ;
+	state->TunerRegs[18].Reg_Val = 0x53 ;
+
+	state->TunerRegs[19].Reg_Num = 34 ;
+	state->TunerRegs[19].Reg_Val = 0x81 ;
+
+	state->TunerRegs[20].Reg_Num = 35 ;
+	state->TunerRegs[20].Reg_Val = 0xC9 ;
+
+	state->TunerRegs[21].Reg_Num = 36 ;
+	state->TunerRegs[21].Reg_Val = 0x01 ;
+
+	state->TunerRegs[22].Reg_Num = 37 ;
+	state->TunerRegs[22].Reg_Val = 0x00 ;
+
+	state->TunerRegs[23].Reg_Num = 41 ;
+	state->TunerRegs[23].Reg_Val = 0x00 ;
+
+	state->TunerRegs[24].Reg_Num = 42 ;
+	state->TunerRegs[24].Reg_Val = 0xF8 ;
+
+	state->TunerRegs[25].Reg_Num = 43 ;
+	state->TunerRegs[25].Reg_Val = 0x43 ;
+
+	state->TunerRegs[26].Reg_Num = 44 ;
+	state->TunerRegs[26].Reg_Val = 0x20 ;
+
+	state->TunerRegs[27].Reg_Num = 45 ;
+	state->TunerRegs[27].Reg_Val = 0x80 ;
+
+	state->TunerRegs[28].Reg_Num = 46 ;
+	state->TunerRegs[28].Reg_Val = 0x88 ;
+
+	state->TunerRegs[29].Reg_Num = 47 ;
+	state->TunerRegs[29].Reg_Val = 0x86 ;
+
+	state->TunerRegs[30].Reg_Num = 48 ;
+	state->TunerRegs[30].Reg_Val = 0x00 ;
+
+	state->TunerRegs[31].Reg_Num = 49 ;
+	state->TunerRegs[31].Reg_Val = 0x00 ;
+
+	state->TunerRegs[32].Reg_Num = 53 ;
+	state->TunerRegs[32].Reg_Val = 0x94 ;
+
+	state->TunerRegs[33].Reg_Num = 54 ;
+	state->TunerRegs[33].Reg_Val = 0xFA ;
+
+	state->TunerRegs[34].Reg_Num = 55 ;
+	state->TunerRegs[34].Reg_Val = 0x92 ;
+
+	state->TunerRegs[35].Reg_Num = 56 ;
+	state->TunerRegs[35].Reg_Val = 0x80 ;
+
+	state->TunerRegs[36].Reg_Num = 57 ;
+	state->TunerRegs[36].Reg_Val = 0x41 ;
+
+	state->TunerRegs[37].Reg_Num = 58 ;
+	state->TunerRegs[37].Reg_Val = 0xDB ;
+
+	state->TunerRegs[38].Reg_Num = 59 ;
+	state->TunerRegs[38].Reg_Val = 0x00 ;
+
+	state->TunerRegs[39].Reg_Num = 60 ;
+	state->TunerRegs[39].Reg_Val = 0x00 ;
+
+	state->TunerRegs[40].Reg_Num = 61 ;
+	state->TunerRegs[40].Reg_Val = 0x00 ;
+
+	state->TunerRegs[41].Reg_Num = 62 ;
+	state->TunerRegs[41].Reg_Val = 0x00 ;
+
+	state->TunerRegs[42].Reg_Num = 65 ;
+	state->TunerRegs[42].Reg_Val = 0xF8 ;
+
+	state->TunerRegs[43].Reg_Num = 66 ;
+	state->TunerRegs[43].Reg_Val = 0xE4 ;
+
+	state->TunerRegs[44].Reg_Num = 67 ;
+	state->TunerRegs[44].Reg_Val = 0x90 ;
+
+	state->TunerRegs[45].Reg_Num = 68 ;
+	state->TunerRegs[45].Reg_Val = 0xC0 ;
+
+	state->TunerRegs[46].Reg_Num = 69 ;
+	state->TunerRegs[46].Reg_Val = 0x01 ;
+
+	state->TunerRegs[47].Reg_Num = 70 ;
+	state->TunerRegs[47].Reg_Val = 0x50 ;
+
+	state->TunerRegs[48].Reg_Num = 71 ;
+	state->TunerRegs[48].Reg_Val = 0x06 ;
+
+	state->TunerRegs[49].Reg_Num = 72 ;
+	state->TunerRegs[49].Reg_Val = 0x00 ;
+
+	state->TunerRegs[50].Reg_Num = 73 ;
+	state->TunerRegs[50].Reg_Val = 0x20 ;
+
+	state->TunerRegs[51].Reg_Num = 76 ;
+	state->TunerRegs[51].Reg_Val = 0xBB ;
+
+	state->TunerRegs[52].Reg_Num = 77 ;
+	state->TunerRegs[52].Reg_Val = 0x13 ;
+
+	state->TunerRegs[53].Reg_Num = 81 ;
+	state->TunerRegs[53].Reg_Val = 0x04 ;
+
+	state->TunerRegs[54].Reg_Num = 82 ;
+	state->TunerRegs[54].Reg_Val = 0x75 ;
+
+	state->TunerRegs[55].Reg_Num = 83 ;
+	state->TunerRegs[55].Reg_Val = 0x00 ;
+
+	state->TunerRegs[56].Reg_Num = 84 ;
+	state->TunerRegs[56].Reg_Val = 0x00 ;
+
+	state->TunerRegs[57].Reg_Num = 85 ;
+	state->TunerRegs[57].Reg_Val = 0x00 ;
+
+	state->TunerRegs[58].Reg_Num = 91 ;
+	state->TunerRegs[58].Reg_Val = 0x70 ;
+
+	state->TunerRegs[59].Reg_Num = 92 ;
+	state->TunerRegs[59].Reg_Val = 0x00 ;
+
+	state->TunerRegs[60].Reg_Num = 93 ;
+	state->TunerRegs[60].Reg_Val = 0x00 ;
+
+	state->TunerRegs[61].Reg_Num = 94 ;
+	state->TunerRegs[61].Reg_Val = 0x00 ;
+
+	state->TunerRegs[62].Reg_Num = 95 ;
+	state->TunerRegs[62].Reg_Val = 0x0C ;
+
+	state->TunerRegs[63].Reg_Num = 96 ;
+	state->TunerRegs[63].Reg_Val = 0x00 ;
+
+	state->TunerRegs[64].Reg_Num = 97 ;
+	state->TunerRegs[64].Reg_Val = 0x00 ;
+
+	state->TunerRegs[65].Reg_Num = 98 ;
+	state->TunerRegs[65].Reg_Val = 0xE2 ;
+
+	state->TunerRegs[66].Reg_Num = 99 ;
+	state->TunerRegs[66].Reg_Val = 0x00 ;
+
+	state->TunerRegs[67].Reg_Num = 100 ;
+	state->TunerRegs[67].Reg_Val = 0x00 ;
+
+	state->TunerRegs[68].Reg_Num = 101 ;
+	state->TunerRegs[68].Reg_Val = 0x12 ;
+
+	state->TunerRegs[69].Reg_Num = 102 ;
+	state->TunerRegs[69].Reg_Val = 0x80 ;
+
+	state->TunerRegs[70].Reg_Num = 103 ;
+	state->TunerRegs[70].Reg_Val = 0x32 ;
+
+	state->TunerRegs[71].Reg_Num = 104 ;
+	state->TunerRegs[71].Reg_Val = 0xB4 ;
+
+	state->TunerRegs[72].Reg_Num = 105 ;
+	state->TunerRegs[72].Reg_Val = 0x60 ;
+
+	state->TunerRegs[73].Reg_Num = 106 ;
+	state->TunerRegs[73].Reg_Val = 0x83 ;
+
+	state->TunerRegs[74].Reg_Num = 107 ;
+	state->TunerRegs[74].Reg_Val = 0x84 ;
+
+	state->TunerRegs[75].Reg_Num = 108 ;
+	state->TunerRegs[75].Reg_Val = 0x9C ;
+
+	state->TunerRegs[76].Reg_Num = 109 ;
+	state->TunerRegs[76].Reg_Val = 0x02 ;
+
+	state->TunerRegs[77].Reg_Num = 110 ;
+	state->TunerRegs[77].Reg_Val = 0x81 ;
+
+	state->TunerRegs[78].Reg_Num = 111 ;
+	state->TunerRegs[78].Reg_Val = 0xC0 ;
+
+	state->TunerRegs[79].Reg_Num = 112 ;
+	state->TunerRegs[79].Reg_Val = 0x10 ;
+
+	state->TunerRegs[80].Reg_Num = 131 ;
+	state->TunerRegs[80].Reg_Val = 0x8A ;
+
+	state->TunerRegs[81].Reg_Num = 132 ;
+	state->TunerRegs[81].Reg_Val = 0x10 ;
+
+	state->TunerRegs[82].Reg_Num = 133 ;
+	state->TunerRegs[82].Reg_Val = 0x24 ;
+
+	state->TunerRegs[83].Reg_Num = 134 ;
+	state->TunerRegs[83].Reg_Val = 0x00 ;
+
+	state->TunerRegs[84].Reg_Num = 135 ;
+	state->TunerRegs[84].Reg_Val = 0x00 ;
+
+	state->TunerRegs[85].Reg_Num = 136 ;
+	state->TunerRegs[85].Reg_Val = 0x7E ;
+
+	state->TunerRegs[86].Reg_Num = 137 ;
+	state->TunerRegs[86].Reg_Val = 0x40 ;
+
+	state->TunerRegs[87].Reg_Num = 138 ;
+	state->TunerRegs[87].Reg_Val = 0x38 ;
+
+	state->TunerRegs[88].Reg_Num = 146 ;
+	state->TunerRegs[88].Reg_Val = 0xF6 ;
+
+	state->TunerRegs[89].Reg_Num = 147 ;
+	state->TunerRegs[89].Reg_Val = 0x1A ;
+
+	state->TunerRegs[90].Reg_Num = 148 ;
+	state->TunerRegs[90].Reg_Val = 0x62 ;
+
+	state->TunerRegs[91].Reg_Num = 149 ;
+	state->TunerRegs[91].Reg_Val = 0x33 ;
+
+	state->TunerRegs[92].Reg_Num = 150 ;
+	state->TunerRegs[92].Reg_Val = 0x80 ;
+
+	state->TunerRegs[93].Reg_Num = 156 ;
+	state->TunerRegs[93].Reg_Val = 0x56 ;
+
+	state->TunerRegs[94].Reg_Num = 157 ;
+	state->TunerRegs[94].Reg_Val = 0x17 ;
+
+	state->TunerRegs[95].Reg_Num = 158 ;
+	state->TunerRegs[95].Reg_Val = 0xA9 ;
+
+	state->TunerRegs[96].Reg_Num = 159 ;
+	state->TunerRegs[96].Reg_Val = 0x00 ;
+
+	state->TunerRegs[97].Reg_Num = 160 ;
+	state->TunerRegs[97].Reg_Val = 0x00 ;
+
+	state->TunerRegs[98].Reg_Num = 161 ;
+	state->TunerRegs[98].Reg_Val = 0x00 ;
+
+	state->TunerRegs[99].Reg_Num = 162 ;
+	state->TunerRegs[99].Reg_Val = 0x40 ;
+
+	state->TunerRegs[100].Reg_Num = 166 ;
+	state->TunerRegs[100].Reg_Val = 0xAE ;
+
+	state->TunerRegs[101].Reg_Num = 167 ;
+	state->TunerRegs[101].Reg_Val = 0x1B ;
+
+	state->TunerRegs[102].Reg_Num = 168 ;
+	state->TunerRegs[102].Reg_Val = 0xF2 ;
+
+	state->TunerRegs[103].Reg_Num = 195 ;
+	state->TunerRegs[103].Reg_Val = 0x00 ;
+
+	return 0 ;
 }
-EXPORT_SYMBOL_GPL(mei_cldev_driver_unregister);
 
-
-int __init mei_cl_bus_init(void)
+static u16 MXL5005_ControlInit(struct dvb_frontend *fe)
 {
-	return bus_register(&mei_cl_bus_type);
-}
+	struct mxl5005s_state *state = fe->tuner_priv;
+	state->Init_Ctrl_Num = INITCTRL_NUM;
 
-void __exit mei_cl_bus_exit(void)
-{
-	bus_unregister(&mei_cl_bus_type);
-}
+	state->Init_Ctrl[0].Ctrl_Num = DN_IQTN_AMP_CUT ;
+	state->Init_Ctrl[0].size = 1 ;
+	state->Init_Ctrl[0].addr[0] = 73;
+	state->Init_Ctrl[0].bit[0] = 7;
+	state->Init_Ctrl[0].val[0] = 0;
+
+	state->Init_Ctrl[1].Ctrl_Num = BB_MODE ;
+	state->Init_Ctrl[1].size = 1 ;
+	state->Init_Ctrl[1].addr[0] = 53;
+	state->Init_Ctrl[1].bit[0] = 2;
+	state->Init_Ctrl[1].val[0] = 1;
+
+	state->Init_Ctrl[2].Ctrl_Num = BB_BUF ;
+	state->Init_Ctrl[2].size = 2 ;
+	state->Init_Ctrl[2].addr[0] = 53;
+	state->Init_Ctrl[2].bit[0] = 1;
+	state->Init_Ctrl[2].val[0] = 0;
+	state->Init_Ctrl[2].addr[1] = 57;
+	state->Init_Ctrl[2].bit[1] = 0;
+	state->Init_Ctrl[2].val[1] = 1;
+
+	state->Init_Ctrl[3].Ctrl_Num = BB_BUF_OA ;
+	state->Init_Ctrl[3].size = 1 ;
+	state->Init_Ctrl[3].addr[0] = 53;
+	state->Init_Ctrl[3].bit[0] = 0;
+	state->Init_Ctrl[3].val[0] = 0;
+
+	state->Init_Ctrl[4].Ctrl_Num = BB_ALPF_BANDSELECT ;
+	state->Init_Ctrl[4].size = 3 ;
+	state->Init_Ctrl[4].addr[0] = 53;
+	state->Init_Ctrl[4].bit[0] = 5;
+	state->Init_Ctrl[4].val[0] = 0;
+	state->Init_Ctrl[4].addr[1] = 53;
+	state->Init_Ctrl[4].bit[1] = 6;
+	state->Init_Ctrl[4].val[1] = 0;
+	state->Init_Ctrl[4].addr[2] = 53;
+	state->Init_Ctrl[4].bit[2] = 7;
+	state->Init_Ctrl[4].val[2] = 1;
+
+	state->Init_Ctrl[5].Ctrl_Num = BB_IQSWAP ;
+	state->Init_Ctrl[5].size = 1 ;
+	state->Init_Ctrl[5].addr[0] = 59;
+	state->Init_Ctrl[5].bit[0] = 0;
+	state->Init_Ctrl[5].val[0] = 0;
+
+	state->Init_Ctrl[6].Ctrl_Num = BB_DLPF_BANDSEL ;
+	state->Init_Ctrl[6].size = 2 ;
+	state->Init_Ctrl[6].addr[0] = 53;
+	state->Init_Ctrl[6].bit[0] = 3;
+	state->Init_Ctrl[6].val[0] = 0;
+	state->Init_Ctrl[6].addr[1] = 53;
+	state->Init_Ctrl[6].bit[1] = 4;
+	state->Init_Ctrl[6].val[1] = 1;
+
+	state->Init_Ctrl[7].Ctrl_Num = RFSYN_CHP_GAIN ;
+	state->Init_Ctrl[7].size = 4 ;
+	state->Init_Ctrl[7].addr[0] = 22;
+	state->Init_Ctrl[7].bit[0] = 4;
+	state->Init_Ctrl[7].val[0] = 0;
+	state->Init_Ctrl[7].addr[1] = 22;
+	state->Init_Ctrl[7].bit[1] = 5;
+	state->Init_Ctrl[7].val[1] = 1;
+	state->Init_Ctrl[7].addr[2] = 22;
+	state->Init_Ctrl[7].bit[2] = 6;
+	state->Init_Ctrl[7].val[2] = 1;
+	state->Init_Ctrl[7].addr[3] = 22;
+	state->Init_Ctrl[7].bit[3] = 7;
+	state->Init_Ctrl[7].val[3] = 0;
+
+	state->Init_Ctrl[8].Ctrl_Num = RFSYN_EN_CHP_HIGAIN ;
+	state->Init_Ctrl[8].size = 1 ;
+	state->Init_Ctrl[8].addr[0] = 22;
+	state->Init_Ctrl[8].bit[0] = 2;
+	state->Init_Ctrl[8].val[0] = 0;
+
+	state->Init_Ctrl[9].Ctrl_Num = AGC_IF ;
+	state->Init_Ctrl[9].size = 4 ;
+	state->Init_Ctrl[9].addr[0] = 76;
+	state->Init_Ctrl[9].bit[0] = 0;
+	state->Init_Ctrl[9].val[0] = 1;
+	state->Init_Ctrl[9].addr[1] = 76;
+	state->Init_Ctrl[9].bit[1] = 1;
+	state->Init_Ctrl[9].val[1] = 1;
+	state->Init_Ctrl[9].addr[2] = 76;
+	state->Init_Ctrl[9].bit[2] = 2;
+	state->Init_Ctrl[9].val[2] = 0;
+	state->Init_Ctrl[9].addr[3] = 76;
+	state->Init_Ctrl[9].bit[3] = 3;
+	state->Init_Ctrl[9].val[3] = 1;
+
+	state->Init_Ctrl[10].Ctrl_Num = AGC_RF ;
+	state->Init_Ctrl[10].size = 4 ;
+	state->Init_Ctrl[10].addr[0] = 76;
+	state->Init_Ctrl[10].bit[0] = 4;
+	state->Init_Ctrl[10].val[0] = 1;
+	state->Init_Ctrl[10].addr[1] = 76;
+	state->Init_Ctrl[10].bit[1] = 5;
+	state->Init_Ctrl[10].val[1] = 1;
+	state->Init_Ctrl[10].addr[2] = 76;
+	state->Init_Ctrl[10].bit[2] = 6;
+	state->Init_Ctrl[10].val[2] = 0;
+	state->Init_Ctrl[10].addr[3] = 76;
+	state->Init_Ctrl[10].bit[3] = 7;
+	state->Init_Ctrl[10].val[3] = 1;
+
+	state->Init_Ctrl[11].Ctrl_Num = IF_DIVVAL ;
+	state->Init_Ctrl[11].size = 5 ;
+	state->Init_Ctrl[11].addr[0] = 43;
+	state->Init_Ctrl[11].bit[0] = 3;
+	state->Init_Ctrl[11].val[0] = 0;
+	state->Init_Ctrl[11].addr[1] = 43;
+	state->Init_Ctrl[11].bit[1] = 4;
+	state->Init_Ctrl[11].val[1] = 0;
+	state->Init_Ctrl[11].addr[2] = 43;
+	state->Init_Ctrl[11].bit[2] = 5;
+	state->Init_Ctrl[11].val[2] = 0;
+	state->Init_Ctrl[11].addr[3] = 43;
+	state->Init_Ctrl[11].bit[3] = 6;
+	state->Init_Ctrl[11].val[3] = 1;
+	state->Init_Ctrl[11].addr[4] = 43;
+	state->Init_Ctrl[11].bit[4] = 7;
+	state->Init_Ctrl[11].val[4] = 0;
+
+	state->Init_Ctrl[12].Ctrl_Num = IF_VCO_BIAS ;
+	state->Init_Ctrl[12].size = 6 ;
+	state->Init_Ctrl[12].addr[0] = 44;
+	state->Init_Ctrl[12].bit[0] = 2;
+	state->Init_Ctrl[12].val[0] = 0;
+	state->Init_Ctrl[12].addr[1] = 44;
+	state->Init_Ctrl[12].bit[1] = 3;
+	state->Init_Ctrl[12].val[1] = 0;
+	state->Init_Ctrl[12].addr[2] = 44;
+	state->Init_Ctrl[12

@@ -1,371 +1,174 @@
-/*
- * Copyright (C) 2010 Samsung Electronics.
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
-
-#ifndef __GNSS_PRJ_H__
-#define __GNSS_PRJ_H__
-
-#include <linux/wait.h>
-#include <linux/miscdevice.h>
-#include <linux/skbuff.h>
-#include <linux/interrupt.h>
-#include <linux/completion.h>
-#include <linux/wakelock.h>
-#include <linux/rbtree.h>
-#include <linux/spinlock.h>
-#include <linux/cdev.h>
-#include <linux/types.h>
-#include "include/gnss.h"
-#include "include/exynos_ipc.h"
-#include "pmu-gnss.h"
-
-#define CALLER	(__builtin_return_address(0))
-
-#define MAX_IOD_RXQ_LEN	2048
-
-#define GNSS_IOC_MAGIC	('K')
-
-#define GNSS_IOCTL_RESET			_IO(GNSS_IOC_MAGIC, 0x00)
-#define GNSS_IOCTL_LOAD_FIRMWARE	_IO(GNSS_IOC_MAGIC, 0x01)
-#define GNSS_IOCTL_REQ_FAULT_INFO	_IO(GNSS_IOC_MAGIC, 0x02)
-#define GNSS_IOCTL_REQ_BCMD			_IO(GNSS_IOC_MAGIC, 0x03)
-#define GNSS_IOCTL_READ_FIRMWARE	_IO(GNSS_IOC_MAGIC, 0x04)
-#define GNSS_IOCTL_CHANGE_SENSOR_GPIO	_IO(GNSS_IOC_MAGIC, 0x05)
-#define GNSS_IOCTL_CHANGE_TCXO_MODE		_IO(GNSS_IOC_MAGIC, 0x06)
-#define GNSS_IOCTL_SET_SENSOR_POWER		_IO(GNSS_IOC_MAGIC, 0x07)
-#define GNSS_IOCTL_RELEASE_RESET		_IO(GNSS_IOC_MAGIC, 0x08)
-
-#define GNSS_AUTO_RUN 0x40001
-#define AUTO_RUN_CMD_SIZE 0x10
-
-enum sensor_power {
-	SENSOR_OFF,
-	SENSOR_ON,
-};
-
-#define USE_SIMPLE_WAKE_LOCK
-
-struct kepler_bcmd_args {
-	u16 flags;
-	u16 cmd_id;
-	u32 param1;
-	u32 param2;
-	u32 ret_val;
-};
-
-struct kepler_firmware_args {
-	u32 firmware_size;
-	u32 offset;
-	char *firmware_bin;
-};
-
-struct kepler_fault_args {
-	u32 dump_size;
-	char *dumped_data;
-};
-
-#ifdef CONFIG_COMPAT
-struct kepler_firmware_args32 {
-	u32 firmware_size;
-	u32 offset;
-	compat_uptr_t firmware_bin;
-};
-
-struct kepler_fault_args32 {
-	u32 dump_size;
-	compat_uptr_t dumped_data;
-};
-#endif
-
-/* gnss status */
-#define HDLC_HEADER_MAX_SIZE	6 /* fmt 3, raw 6, rfs 6 */
-
-#define GNSS_MAX_NAME_LEN	64
-
-#define MAX_HEX_LEN			16
-#define MAX_NAME_LEN		64
-#define MAX_PREFIX_LEN		128
-#define MAX_STR_LEN			256
-
-/* Does gnss ctl structure will use state ? or status defined below ?*/
-enum gnss_state {
-	STATE_OFFLINE,
-	STATE_FIRMWARE_DL, /* no firmware */
-	STATE_ONLINE,
-	STATE_HOLD_RESET,
-	STATE_FAULT, /* ACTIVE/WDT */
-};
-
-static const char const *gnss_state_str[] = {
-	[STATE_OFFLINE]			= "OFFLINE",
-	[STATE_FIRMWARE_DL]		= "FIRMWARE_DL",
-	[STATE_ONLINE]			= "ONLINE",
-	[STATE_HOLD_RESET]		= "HOLD_RESET",
-	[STATE_FAULT]			= "FAULT",
-};
-
-enum direction {
-	TX = 0,
-	AP2GNSS = 0,
-	RX = 1,
-	GNSS2AP = 1,
-	MAX_DIR = 2
-};
-
-/**
-  @brief      return the gnss_state string
-  @param state    the state of a GNSS
- */
-static const inline char *get_gnss_state_str(int state)
-{
-	return gnss_state_str[state];
-}
-
-struct header_data {
-	char hdr[HDLC_HEADER_MAX_SIZE];
-	u32 len;
-	u32 frag_len;
-	char start; /*hdlc start header 0x7F*/
-};
-
-struct fmt_hdr {
-	u16 len;
-	u8 control;
-} __packed;
-
-/* for fragmented data from link devices */
-struct fragmented_data {
-	struct sk_buff *skb_recv;
-	struct header_data h_data;
-	struct exynos_frame_data f_data;
-	/* page alloc fail retry*/
-	unsigned realloc_offset;
-};
-#define fragdata(iod, ld) (&(iod)->fragments)
-
-/** struct skbuff_priv - private data of struct sk_buff
- * this is matched to char cb[48] of struct sk_buff
- */
-struct skbuff_private {
-	struct io_device *iod;
-	struct link_device *ld;
-	struct io_device *real_iod; /* for rx multipdp */
-
-	/* for time-stamping */
-	struct timespec ts;
-
-	u32 lnk_hdr:1,
-		reserved:15,
-		exynos_ch:8,
-		frm_ctrl:8;
-
-	/* for indicating that thers is only one IPC frame in an skb */
-	bool single_frame;
-} __packed;
-
-static inline struct skbuff_private *skbpriv(struct sk_buff *skb)
-{
-	BUILD_BUG_ON(sizeof(struct skbuff_private) > sizeof(skb->cb));
-	return (struct skbuff_private *)&skb->cb;
-}
-
-struct io_device {
-	/* Name of the IO device */
-	char *name;
-
-	/* Link to link device */
-	struct link_device *ld;
-
-	/* Reference count */
-	atomic_t opened;
-
-	/* Wait queue for the IO device */
-	wait_queue_head_t wq;
-
-	/* Misc and net device structures for the IO device */
-	struct miscdevice  miscdev;
-
-	/* The name of the application that will use this IO device */
-	char *app;
-
-	bool link_header;
-
-	/* Rx queue of sk_buff */
-	struct sk_buff_head sk_rx_q;
-
-	/*
-	** work for each io device, when delayed work needed
-	** use this for private io device rx action
-	*/
-	struct delayed_work rx_work;
-
-	struct fragmented_data fragments;
-
-	/* called from linkdevice when a packet arrives for this iodevice */
-	int (*recv_skb)(struct io_device *iod, struct link_device *ld,
-					struct sk_buff *skb);
-	int (*recv_skb_single)(struct io_device *iod, struct link_device *ld,
-					struct sk_buff *skb);
-
-	struct gnss_ctl *gc;
-
-	struct wake_lock wakelock;
-	long waketime;
-
-	struct exynos_seq_num seq_num;
-
-	/* DO NOT use __current_link directly
-	 * you MUST use skbpriv(skb)->ld in mc, link, etc..
-	 */
-	struct link_device *__current_link;
-};
-#define to_io_device(misc) container_of(misc, struct io_device, miscdev)
-
-/* get_current_link, set_current_link don't need to use locks.
- * In ARM, set_current_link and get_current_link are compiled to
- * each one instruction (str, ldr) as atomic_set, atomic_read.
- * And, the order of set_current_link and get_current_link is not important.
- */
-#define get_current_link(iod) ((iod)->__current_link)
-#define set_current_link(iod, ld) ((iod)->__current_link = (ld))
-
-struct link_device {
-	struct list_head  list;
-	char *name;
-
-	/* GNSS data */
-	struct gnss_data *gnss_data;
-
-	/* GNSS control */
-	struct gnss_ctl *gc;
-
-	/* link to io device */
-	struct io_device *iod;
-
-	/* TX queue of socket buffers */
-	struct sk_buff_head sk_fmt_tx_q;
-	struct sk_buff_head *skb_txq;
-
-	/* RX queue of socket buffers */
-	struct sk_buff_head sk_fmt_rx_q;
-	struct sk_buff_head *skb_rxq;
-
-	int timeout_cnt;
-
-	struct workqueue_struct *tx_wq;
-	struct work_struct tx_work;
-	struct delayed_work tx_delayed_work;
-
-	struct delayed_work *tx_dwork;
-	struct delayed_work fmt_tx_dwork;
-
-	struct workqueue_struct *rx_wq;
-	struct work_struct rx_work;
-	struct delayed_work rx_delayed_work;
-
-	/* called by an io_device when it has a packet to send over link
-	 * - the io device is passed so the link device can look at id and
-	 *   format fields to determine how to route/format the packet
-	 */
-	int (*send)(struct link_device *ld, struct io_device *iod,
-			struct sk_buff *skb);
-
-	/* Method to clear RX/TX buffers before reset */
-	void (*reset_buffers)(struct link_device *ld);
-
-	/* Methods for copying to/from reserved memory */
-	int (*copy_reserved_from_user)(struct link_device *ld, u32 offset, \
-					void __user *user_src, u32 size);
-	int (*copy_reserved_to_user)(struct link_device *ld, u32 offset, \
-					void __user *user_dst, u32 size);
-
-	/* Method to dump fault info to user */
-	int (*dump_fault_to_user)(struct link_device *ld, \
-					void __user *user_dst, u32 size);
-
-	void (*set_autorun_cmd)(struct link_device *ld, u32 size);
-};
-
-/** rx_alloc_skb - allocate an skbuff and set skb's iod, ld
- * @length:	length to allocate
- * @iod:	struct io_device *
- * @ld:		struct link_device *
- *
- * %NULL is returned if there is no free memory.
- */
-static inline struct sk_buff *rx_alloc_skb(unsigned int length,
-		struct io_device *iod, struct link_device *ld)
-{
-	struct sk_buff *skb;
-
-	skb = alloc_skb(length, GFP_ATOMIC);
-
-	if (likely(skb)) {
-		skbpriv(skb)->iod = iod;
-		skbpriv(skb)->ld = ld;
-	}
-	return skb;
-}
-
-enum gnss_mode;
-enum gnss_int_clear;
-enum gnss_tcxo_mode;
-
-struct gnssctl_ops {
-	int (*gnss_hold_reset)(struct gnss_ctl *);
-	int (*gnss_release_reset)(struct gnss_ctl *);
-	int (*gnss_power_on)(struct gnss_ctl *);
-	int (*gnss_req_fault_info)(struct gnss_ctl *);
-	int (*suspend_gnss_ctrl)(struct gnss_ctl *);
-	int (*resume_gnss_ctrl)(struct gnss_ctl *);
-	int (*change_sensor_gpio)(struct gnss_ctl *);
-	int (*set_sensor_power)(struct gnss_ctl *, enum sensor_power);
-	int (*req_bcmd)(struct gnss_ctl *, u16, u16, u32, u32);
-};
-
-struct gnss_ctl {
-	struct device *dev;
-	char *name;
-	struct gnss_data *gnss_data;
-	enum gnss_state gnss_state;
-
-	struct clk *ccore_qch_lh_gnss;
-
-	struct delayed_work dwork;
-	struct work_struct work;
-
-	struct gnssctl_ops ops;
-	struct gnssctl_pmu_ops *pmu_ops;
-	struct io_device *iod;
-
-	/* Wakelock for gnss_ctl */
-	struct wake_lock gc_fault_wake_lock;
-	struct wake_lock gc_wake_lock;
-	struct wake_lock gc_bcmd_wake_lock;
-
-	int wake_lock_irq;
-	struct completion fault_cmpl;
-	struct completion bcmd_cmpl;
-
-	struct pinctrl *gnss_gpio;
-	struct pinctrl_state *gnss_sensor_gpio;
-
-	struct regulator *vdd_sensor_reg;
-};
-
-extern int exynos_init_gnss_io_device(struct io_device *iod);
-
-int init_gnssctl_device(struct gnss_ctl *mc, struct gnss_data *pdata);
-struct link_device *create_link_device_shmem(struct platform_device *pdev);
-
-#endif
+         = 0x19,
+	DBG_BLOCK_ID_TD10_BY8                            = 0x1a,
+	DBG_BLOCK_ID_TD18_BY8                            = 0x1b,
+	DBG_BLOCK_ID_MCD0_BY8                            = 0x1c,
+} DebugBlockId_BY8;
+typedef enum DebugBlockId_BY16 {
+	DBG_BLOCK_ID_RESERVED_BY16                       = 0x0,
+	DBG_BLOCK_ID_DMA0_BY16                           = 0x1,
+	DBG_BLOCK_ID_VGT0_BY16                           = 0x2,
+	DBG_BLOCK_ID_SX0_BY16                            = 0x3,
+	DBG_BLOCK_ID_SCB0_BY16                           = 0x4,
+	DBG_BLOCK_ID_CB00_BY16                           = 0x5,
+	DBG_BLOCK_ID_TCP0_BY16                           = 0x6,
+	DBG_BLOCK_ID_TCP16_BY16                          = 0x7,
+	DBG_BLOCK_ID_DB00_BY16                           = 0x8,
+	DBG_BLOCK_ID_TCC0_BY16                           = 0x9,
+	DBG_BLOCK_ID_TA00_BY16                           = 0xa,
+	DBG_BLOCK_ID_TA10_BY16                           = 0xb,
+	DBG_BLOCK_ID_TD00_BY16                           = 0xc,
+	DBG_BLOCK_ID_TD10_BY16                           = 0xd,
+	DBG_BLOCK_ID_MCD0_BY16                           = 0xe,
+} DebugBlockId_BY16;
+typedef enum ColorTransform {
+	DCC_CT_AUTO                                      = 0x0,
+	DCC_CT_NONE                                      = 0x1,
+	ABGR_TO_A_BG_G_RB                                = 0x2,
+	BGRA_TO_BG_G_RB_A                                = 0x3,
+} ColorTransform;
+typedef enum CompareRef {
+	REF_NEVER                                        = 0x0,
+	REF_LESS                                         = 0x1,
+	REF_EQUAL                                        = 0x2,
+	REF_LEQUAL                                       = 0x3,
+	REF_GREATER                                      = 0x4,
+	REF_NOTEQUAL                                     = 0x5,
+	REF_GEQUAL                                       = 0x6,
+	REF_ALWAYS                                       = 0x7,
+} CompareRef;
+typedef enum ReadSize {
+	READ_256_BITS                                    = 0x0,
+	READ_512_BITS                                    = 0x1,
+} ReadSize;
+typedef enum DepthFormat {
+	DEPTH_INVALID                                    = 0x0,
+	DEPTH_16                                         = 0x1,
+	DEPTH_X8_24                                      = 0x2,
+	DEPTH_8_24                                       = 0x3,
+	DEPTH_X8_24_FLOAT                                = 0x4,
+	DEPTH_8_24_FLOAT                                 = 0x5,
+	DEPTH_32_FLOAT                                   = 0x6,
+	DEPTH_X24_8_32_FLOAT                             = 0x7,
+} DepthFormat;
+typedef enum ZFormat {
+	Z_INVALID                                        = 0x0,
+	Z_16                                             = 0x1,
+	Z_24                                             = 0x2,
+	Z_32_FLOAT                                       = 0x3,
+} ZFormat;
+typedef enum StencilFormat {
+	STENCIL_INVALID                                  = 0x0,
+	STENCIL_8                                        = 0x1,
+} StencilFormat;
+typedef enum CmaskMode {
+	CMASK_CLEAR_NONE                                 = 0x0,
+	CMASK_CLEAR_ONE                                  = 0x1,
+	CMASK_CLEAR_ALL                                  = 0x2,
+	CMASK_ANY_EXPANDED                               = 0x3,
+	CMASK_ALPHA0_FRAG1                               = 0x4,
+	CMASK_ALPHA0_FRAG2                               = 0x5,
+	CMASK_ALPHA0_FRAG4                               = 0x6,
+	CMASK_ALPHA0_FRAGS                               = 0x7,
+	CMASK_ALPHA1_FRAG1                               = 0x8,
+	CMASK_ALPHA1_FRAG2                               = 0x9,
+	CMASK_ALPHA1_FRAG4                               = 0xa,
+	CMASK_ALPHA1_FRAGS                               = 0xb,
+	CMASK_ALPHAX_FRAG1                               = 0xc,
+	CMASK_ALPHAX_FRAG2                               = 0xd,
+	CMASK_ALPHAX_FRAG4                               = 0xe,
+	CMASK_ALPHAX_FRAGS                               = 0xf,
+} CmaskMode;
+typedef enum QuadExportFormat {
+	EXPORT_UNUSED                                    = 0x0,
+	EXPORT_32_R                                      = 0x1,
+	EXPORT_32_GR                                     = 0x2,
+	EXPORT_32_AR                                     = 0x3,
+	EXPORT_FP16_ABGR                                 = 0x4,
+	EXPORT_UNSIGNED16_ABGR                           = 0x5,
+	EXPORT_SIGNED16_ABGR                             = 0x6,
+	EXPORT_32_ABGR                                   = 0x7,
+} QuadExportFormat;
+typedef enum QuadExportFormatOld {
+	EXPORT_4P_32BPC_ABGR                             = 0x0,
+	EXPORT_4P_16BPC_ABGR                             = 0x1,
+	EXPORT_4P_32BPC_GR                               = 0x2,
+	EXPORT_4P_32BPC_AR                               = 0x3,
+	EXPORT_2P_32BPC_ABGR                             = 0x4,
+	EXPORT_8P_32BPC_R                                = 0x5,
+} QuadExportFormatOld;
+typedef enum ColorFormat {
+	COLOR_INVALID                                    = 0x0,
+	COLOR_8                                          = 0x1,
+	COLOR_16                                         = 0x2,
+	COLOR_8_8                                        = 0x3,
+	COLOR_32                                         = 0x4,
+	COLOR_16_16                                      = 0x5,
+	COLOR_10_11_11                                   = 0x6,
+	COLOR_11_11_10                                   = 0x7,
+	COLOR_10_10_10_2                                 = 0x8,
+	COLOR_2_10_10_10                                 = 0x9,
+	COLOR_8_8_8_8                                    = 0xa,
+	COLOR_32_32                                      = 0xb,
+	COLOR_16_16_16_16                                = 0xc,
+	COLOR_RESERVED_13                                = 0xd,
+	COLOR_32_32_32_32                                = 0xe,
+	COLOR_RESERVED_15                                = 0xf,
+	COLOR_5_6_5                                      = 0x10,
+	COLOR_1_5_5_5                                    = 0x11,
+	COLOR_5_5_5_1                                    = 0x12,
+	COLOR_4_4_4_4                                    = 0x13,
+	COLOR_8_24                                       = 0x14,
+	COLOR_24_8                                       = 0x15,
+	COLOR_X24_8_32_FLOAT                             = 0x16,
+	COLOR_RESERVED_23                                = 0x17,
+} ColorFormat;
+typedef enum SurfaceFormat {
+	FMT_INVALID                                      = 0x0,
+	FMT_8                                            = 0x1,
+	FMT_16                                           = 0x2,
+	FMT_8_8                                          = 0x3,
+	FMT_32                                           = 0x4,
+	FMT_16_16                                        = 0x5,
+	FMT_10_11_11                                     = 0x6,
+	FMT_11_11_10                                     = 0x7,
+	FMT_10_10_10_2                                   = 0x8,
+	FMT_2_10_10_10                                   = 0x9,
+	FMT_8_8_8_8                                      = 0xa,
+	FMT_32_32                                        = 0xb,
+	FMT_16_16_16_16                                  = 0xc,
+	FMT_32_32_32                                     = 0xd,
+	FMT_32_32_32_32                                  = 0xe,
+	FMT_RESERVED_4                                   = 0xf,
+	FMT_5_6_5                                        = 0x10,
+	FMT_1_5_5_5                                      = 0x11,
+	FMT_5_5_5_1                                      = 0x12,
+	FMT_4_4_4_4                                      = 0x13,
+	FMT_8_24                                         = 0x14,
+	FMT_24_8                                         = 0x15,
+	FMT_X24_8_32_FLOAT                               = 0x16,
+	FMT_RESERVED_33                                  = 0x17,
+	FMT_11_11_10_FLOAT                               = 0x18,
+	FMT_16_FLOAT                                     = 0x19,
+	FMT_32_FLOAT                                     = 0x1a,
+	FMT_16_16_FLOAT                                  = 0x1b,
+	FMT_8_24_FLOAT                                   = 0x1c,
+	FMT_24_8_FLOAT                                   = 0x1d,
+	FMT_32_32_FLOAT                                  = 0x1e,
+	FMT_10_11_11_FLOAT                               = 0x1f,
+	FMT_16_16_16_16_FLOAT                            = 0x20,
+	FMT_3_3_2                                        = 0x21,
+	FMT_6_5_5                                        = 0x22,
+	FMT_32_32_32_32_FLOAT                            = 0x23,
+	FMT_RESERVED_36                                  = 0x24,
+	FMT_1                                            = 0x25,
+	FMT_1_REVERSED                                   = 0x26,
+	FMT_GB_GR                                        = 0x27,
+	FMT_BG_RG                                        = 0x28,
+	FMT_32_AS_8                                      = 0x29,
+	FMT_32_AS_8_8                                    = 0x2a,
+	FMT_5_9_9_9_SHAREDEXP                            = 0x2b,
+	FMT_8_8_8                                        = 0x2c,
+	FMT_16_16_16                                     = 0x2d,
+	FMT_16_16_16_FLOAT                               = 0x2e,
+	FMT_4_4                                          = 0x2f,
+	FMT_32_32_32_FLOAT                     

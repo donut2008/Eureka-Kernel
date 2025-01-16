@@ -1,162 +1,163 @@
-/*
- *  Cobalt button interface driver.
+P_FLAG_DOUNDER))
+			scsi_set_resid(scmnd, be32_to_cpu(rsp->data_out_res_cnt));
+		else if (unlikely(rsp->flags & SRP_RSP_FLAG_DOOVER))
+			scsi_set_resid(scmnd, -be32_to_cpu(rsp->data_out_res_cnt));
+
+		srp_free_req(ch, req, scmnd,
+			     be32_to_cpu(rsp->req_lim_delta));
+
+		scmnd->host_scribble = NULL;
+		scmnd->scsi_done(scmnd);
+	}
+}
+
+static int srp_response_common(struct srp_rdma_ch *ch, s32 req_delta,
+			       void *rsp, int len)
+{
+	struct srp_target_port *target = ch->target;
+	struct ib_device *dev = target->srp_host->srp_dev->dev;
+	unsigned long flags;
+	struct srp_iu *iu;
+	int err;
+
+	spin_lock_irqsave(&ch->lock, flags);
+	ch->req_lim += req_delta;
+	iu = __srp_get_tx_iu(ch, SRP_IU_RSP);
+	spin_unlock_irqrestore(&ch->lock, flags);
+
+	if (!iu) {
+		shost_printk(KERN_ERR, target->scsi_host, PFX
+			     "no IU available to send response\n");
+		return 1;
+	}
+
+	ib_dma_sync_single_for_cpu(dev, iu->dma, len, DMA_TO_DEVICE);
+	memcpy(iu->buf, rsp, len);
+	ib_dma_sync_single_for_device(dev, iu->dma, len, DMA_TO_DEVICE);
+
+	err = srp_post_send(ch, iu, len);
+	if (err) {
+		shost_printk(KERN_ERR, target->scsi_host, PFX
+			     "unable to post response: %d\n", err);
+		srp_put_tx_iu(ch, iu, SRP_IU_RSP);
+	}
+
+	return err;
+}
+
+static void srp_process_cred_req(struct srp_rdma_ch *ch,
+				 struct srp_cred_req *req)
+{
+	struct srp_cred_rsp rsp = {
+		.opcode = SRP_CRED_RSP,
+		.tag = req->tag,
+	};
+	s32 delta = be32_to_cpu(req->req_lim_delta);
+
+	if (srp_response_common(ch, delta, &rsp, sizeof(rsp)))
+		shost_printk(KERN_ERR, ch->target->scsi_host, PFX
+			     "problems processing SRP_CRED_REQ\n");
+}
+
+static void srp_process_aer_req(struct srp_rdma_ch *ch,
+				struct srp_aer_req *req)
+{
+	struct srp_target_port *target = ch->target;
+	struct srp_aer_rsp rsp = {
+		.opcode = SRP_AER_RSP,
+		.tag = req->tag,
+	};
+	s32 delta = be32_to_cpu(req->req_lim_delta);
+
+	shost_printk(KERN_ERR, target->scsi_host, PFX
+		     "ignoring AER for LUN %llu\n", scsilun_to_int(&req->lun));
+
+	if (srp_response_common(ch, delta, &rsp, sizeof(rsp)))
+		shost_printk(KERN_ERR, target->scsi_host, PFX
+			     "problems processing SRP_AER_REQ\n");
+}
+
+static void srp_handle_recv(struct srp_rdma_ch *ch, struct ib_wc *wc)
+{
+	struct srp_target_port *target = ch->target;
+	struct ib_device *dev = target->srp_host->srp_dev->dev;
+	struct srp_iu *iu = (struct srp_iu *) (uintptr_t) wc->wr_id;
+	int res;
+	u8 opcode;
+
+	ib_dma_sync_single_for_cpu(dev, iu->dma, ch->max_ti_iu_len,
+				   DMA_FROM_DEVICE);
+
+	opcode = *(u8 *) iu->buf;
+
+	if (0) {
+		shost_printk(KERN_ERR, target->scsi_host,
+			     PFX "recv completion, opcode 0x%02x\n", opcode);
+		print_hex_dump(KERN_ERR, "", DUMP_PREFIX_OFFSET, 8, 1,
+			       iu->buf, wc->byte_len, true);
+	}
+
+	switch (opcode) {
+	case SRP_RSP:
+		srp_process_rsp(ch, iu->buf);
+		break;
+
+	case SRP_CRED_REQ:
+		srp_process_cred_req(ch, iu->buf);
+		break;
+
+	case SRP_AER_REQ:
+		srp_process_aer_req(ch, iu->buf);
+		break;
+
+	case SRP_T_LOGOUT:
+		/* XXX Handle target logout */
+		shost_printk(KERN_WARNING, target->scsi_host,
+			     PFX "Got target logout request\n");
+		break;
+
+	default:
+		shost_printk(KERN_WARNING, target->scsi_host,
+			     PFX "Unhandled SRP opcode 0x%02x\n", opcode);
+		break;
+	}
+
+	ib_dma_sync_single_for_device(dev, iu->dma, ch->max_ti_iu_len,
+				      DMA_FROM_DEVICE);
+
+	res = srp_post_recv(ch, iu);
+	if (res != 0)
+		shost_printk(KERN_ERR, target->scsi_host,
+			     PFX "Recv failed with error code %d\n", res);
+}
+
+/**
+ * srp_tl_err_work() - handle a transport layer error
+ * @work: Work structure embedded in an SRP target port.
  *
- *  Copyright (C) 2007-2008  Yoichi Yuasa <yuasa@linux-mips.org>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * Note: This function may get invoked before the rport has been created,
+ * hence the target->rport test.
  */
-#include <linux/input-polldev.h>
-#include <linux/ioport.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-
-#define BUTTONS_POLL_INTERVAL	30	/* msec */
-#define BUTTONS_COUNT_THRESHOLD	3
-#define BUTTONS_STATUS_MASK	0xfe000000
-
-static const unsigned short cobalt_map[] = {
-	KEY_RESERVED,
-	KEY_RESTART,
-	KEY_LEFT,
-	KEY_UP,
-	KEY_DOWN,
-	KEY_RIGHT,
-	KEY_ENTER,
-	KEY_SELECT
-};
-
-struct buttons_dev {
-	struct input_polled_dev *poll_dev;
-	unsigned short keymap[ARRAY_SIZE(cobalt_map)];
-	int count[ARRAY_SIZE(cobalt_map)];
-	void __iomem *reg;
-};
-
-static void handle_buttons(struct input_polled_dev *dev)
+static void srp_tl_err_work(struct work_struct *work)
 {
-	struct buttons_dev *bdev = dev->private;
-	struct input_dev *input = dev->input;
-	uint32_t status;
-	int i;
+	struct srp_target_port *target;
 
-	status = ~readl(bdev->reg) >> 24;
-
-	for (i = 0; i < ARRAY_SIZE(bdev->keymap); i++) {
-		if (status & (1U << i)) {
-			if (++bdev->count[i] == BUTTONS_COUNT_THRESHOLD) {
-				input_event(input, EV_MSC, MSC_SCAN, i);
-				input_report_key(input, bdev->keymap[i], 1);
-				input_sync(input);
-			}
-		} else {
-			if (bdev->count[i] >= BUTTONS_COUNT_THRESHOLD) {
-				input_event(input, EV_MSC, MSC_SCAN, i);
-				input_report_key(input, bdev->keymap[i], 0);
-				input_sync(input);
-			}
-			bdev->count[i] = 0;
-		}
-	}
+	target = container_of(work, struct srp_target_port, tl_err_work);
+	if (target->rport)
+		srp_start_tl_fail_timers(target->rport);
 }
 
-static int cobalt_buttons_probe(struct platform_device *pdev)
+static void srp_handle_qp_err(u64 wr_id, enum ib_wc_status wc_status,
+			      bool send_err, struct srp_rdma_ch *ch)
 {
-	struct buttons_dev *bdev;
-	struct input_polled_dev *poll_dev;
-	struct input_dev *input;
-	struct resource *res;
-	int error, i;
+	struct srp_target_port *target = ch->target;
 
-	bdev = kzalloc(sizeof(struct buttons_dev), GFP_KERNEL);
-	poll_dev = input_allocate_polled_device();
-	if (!bdev || !poll_dev) {
-		error = -ENOMEM;
-		goto err_free_mem;
+	if (wr_id == SRP_LAST_WR_ID) {
+		complete(&ch->done);
+		return;
 	}
 
-	memcpy(bdev->keymap, cobalt_map, sizeof(bdev->keymap));
-
-	poll_dev->private = bdev;
-	poll_dev->poll = handle_buttons;
-	poll_dev->poll_interval = BUTTONS_POLL_INTERVAL;
-
-	input = poll_dev->input;
-	input->name = "Cobalt buttons";
-	input->phys = "cobalt/input0";
-	input->id.bustype = BUS_HOST;
-	input->dev.parent = &pdev->dev;
-
-	input->keycode = bdev->keymap;
-	input->keycodemax = ARRAY_SIZE(bdev->keymap);
-	input->keycodesize = sizeof(unsigned short);
-
-	input_set_capability(input, EV_MSC, MSC_SCAN);
-	__set_bit(EV_KEY, input->evbit);
-	for (i = 0; i < ARRAY_SIZE(cobalt_map); i++)
-		__set_bit(bdev->keymap[i], input->keybit);
-	__clear_bit(KEY_RESERVED, input->keybit);
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res) {
-		error = -EBUSY;
-		goto err_free_mem;
-	}
-
-	bdev->poll_dev = poll_dev;
-	bdev->reg = ioremap(res->start, resource_size(res));
-	dev_set_drvdata(&pdev->dev, bdev);
-
-	error = input_register_polled_device(poll_dev);
-	if (error)
-		goto err_iounmap;
-
-	return 0;
-
- err_iounmap:
-	iounmap(bdev->reg);
- err_free_mem:
-	input_free_polled_device(poll_dev);
-	kfree(bdev);
-	return error;
-}
-
-static int cobalt_buttons_remove(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct buttons_dev *bdev = dev_get_drvdata(dev);
-
-	input_unregister_polled_device(bdev->poll_dev);
-	input_free_polled_device(bdev->poll_dev);
-	iounmap(bdev->reg);
-	kfree(bdev);
-
-	return 0;
-}
-
-MODULE_AUTHOR("Yoichi Yuasa <yuasa@linux-mips.org>");
-MODULE_DESCRIPTION("Cobalt button interface driver");
-MODULE_LICENSE("GPL");
-/* work with hotplug and coldplug */
-MODULE_ALIAS("platform:Cobalt buttons");
-
-static struct platform_driver cobalt_buttons_driver = {
-	.probe	= cobalt_buttons_probe,
-	.remove	= cobalt_buttons_remove,
-	.driver	= {
-		.name	= "Cobalt buttons",
-	},
-};
-module_platform_driver(cobalt_buttons_driver);
+	if (ch->connected && !target->qp_in_error) {
+		if (wr_id & LOCAL_INV_WR_ID_MASK) {
+			shost_printk(KERN_ERR, target->scsi_host, PFX
+				     "LOCAL_INV failed with

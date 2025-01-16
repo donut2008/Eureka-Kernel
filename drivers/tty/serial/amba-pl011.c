@@ -1,2548 +1,1464 @@
-/*
- *  Driver for AMBA serial ports
- *
- *  Based on drivers/char/serial.c, by Linus Torvalds, Theodore Ts'o.
- *
- *  Copyright 1999 ARM Limited
- *  Copyright (C) 2000 Deep Blue Solutions Ltd.
- *  Copyright (C) 2010 ST-Ericsson SA
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- *
- * This is a generic driver for ARM AMBA-type serial ports.  They
- * have a lot of 16550-like features, but are not register compatible.
- * Note that although they do have CTS, DCD and DSR inputs, they do
- * not have an RI input, nor do they have DTR or RTS outputs.  If
- * required, these have to be supplied via some other means (eg, GPIO)
- * and hooked into this driver.
- */
-
-
-#if defined(CONFIG_SERIAL_AMBA_PL011_CONSOLE) && defined(CONFIG_MAGIC_SYSRQ)
-#define SUPPORT_SYSRQ
-#endif
-
-#include <linux/module.h>
-#include <linux/ioport.h>
-#include <linux/init.h>
-#include <linux/console.h>
-#include <linux/sysrq.h>
-#include <linux/device.h>
-#include <linux/tty.h>
-#include <linux/tty_flip.h>
-#include <linux/serial_core.h>
-#include <linux/serial.h>
-#include <linux/amba/bus.h>
-#include <linux/amba/serial.h>
-#include <linux/clk.h>
-#include <linux/slab.h>
-#include <linux/dmaengine.h>
-#include <linux/dma-mapping.h>
-#include <linux/scatterlist.h>
-#include <linux/delay.h>
-#include <linux/types.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/pinctrl/consumer.h>
-#include <linux/sizes.h>
-#include <linux/io.h>
-#include <linux/acpi.h>
-
-#define UART_NR			14
-
-#define SERIAL_AMBA_MAJOR	204
-#define SERIAL_AMBA_MINOR	64
-#define SERIAL_AMBA_NR		UART_NR
-
-#define AMBA_ISR_PASS_LIMIT	256
-
-#define UART_DR_ERROR		(UART011_DR_OE|UART011_DR_BE|UART011_DR_PE|UART011_DR_FE)
-#define UART_DUMMY_DR_RX	(1 << 16)
-
-/* There is by now at least one vendor with differing details, so handle it */
-struct vendor_data {
-	unsigned int		ifls;
-	unsigned int		lcrh_tx;
-	unsigned int		lcrh_rx;
-	bool			oversampling;
-	bool			dma_threshold;
-	bool			cts_event_workaround;
-	bool			always_enabled;
-	bool			fixed_options;
-
-	unsigned int (*get_fifosize)(struct amba_device *dev);
-};
-
-static unsigned int get_fifosize_arm(struct amba_device *dev)
-{
-	return amba_rev(dev) < 3 ? 16 : 32;
-}
-
-static struct vendor_data vendor_arm = {
-	.ifls			= UART011_IFLS_RX4_8|UART011_IFLS_TX4_8,
-	.lcrh_tx		= UART011_LCRH,
-	.lcrh_rx		= UART011_LCRH,
-	.oversampling		= false,
-	.dma_threshold		= false,
-	.cts_event_workaround	= false,
-	.always_enabled		= false,
-	.fixed_options		= false,
-	.get_fifosize		= get_fifosize_arm,
-};
-
-static struct vendor_data vendor_sbsa = {
-	.oversampling		= false,
-	.dma_threshold		= false,
-	.cts_event_workaround	= false,
-	.always_enabled		= true,
-	.fixed_options		= true,
-};
-
-static unsigned int get_fifosize_st(struct amba_device *dev)
-{
-	return 64;
-}
-
-static struct vendor_data vendor_st = {
-	.ifls			= UART011_IFLS_RX_HALF|UART011_IFLS_TX_HALF,
-	.lcrh_tx		= ST_UART011_LCRH_TX,
-	.lcrh_rx		= ST_UART011_LCRH_RX,
-	.oversampling		= true,
-	.dma_threshold		= true,
-	.cts_event_workaround	= true,
-	.always_enabled		= false,
-	.fixed_options		= false,
-	.get_fifosize		= get_fifosize_st,
-};
-
-/* Deals with DMA transactions */
-
-struct pl011_sgbuf {
-	struct scatterlist sg;
-	char *buf;
-};
-
-struct pl011_dmarx_data {
-	struct dma_chan		*chan;
-	struct completion	complete;
-	bool			use_buf_b;
-	struct pl011_sgbuf	sgbuf_a;
-	struct pl011_sgbuf	sgbuf_b;
-	dma_cookie_t		cookie;
-	bool			running;
-	struct timer_list	timer;
-	unsigned int last_residue;
-	unsigned long last_jiffies;
-	bool auto_poll_rate;
-	unsigned int poll_rate;
-	unsigned int poll_timeout;
-};
-
-struct pl011_dmatx_data {
-	struct dma_chan		*chan;
-	struct scatterlist	sg;
-	char			*buf;
-	bool			queued;
-};
-
-/*
- * We wrap our port structure around the generic uart_port.
- */
-struct uart_amba_port {
-	struct uart_port	port;
-	struct clk		*clk;
-	const struct vendor_data *vendor;
-	unsigned int		dmacr;		/* dma control reg */
-	unsigned int		im;		/* interrupt mask */
-	unsigned int		old_status;
-	unsigned int		fifosize;	/* vendor-specific */
-	unsigned int		lcrh_tx;	/* vendor-specific */
-	unsigned int		lcrh_rx;	/* vendor-specific */
-	unsigned int		old_cr;		/* state during shutdown */
-	bool			autorts;
-	unsigned int		fixed_baud;	/* vendor-set fixed baud rate */
-	char			type[12];
-#ifdef CONFIG_DMA_ENGINE
-	/* DMA stuff */
-	bool			using_tx_dma;
-	bool			using_rx_dma;
-	struct pl011_dmarx_data dmarx;
-	struct pl011_dmatx_data	dmatx;
-	bool			dma_probed;
-#endif
-};
-
-/*
- * Reads up to 256 characters from the FIFO or until it's empty and
- * inserts them into the TTY layer. Returns the number of characters
- * read from the FIFO.
- */
-static int pl011_fifo_to_tty(struct uart_amba_port *uap)
-{
-	u16 status;
-	unsigned int ch, flag, max_count = 256;
-	int fifotaken = 0;
-
-	while (max_count--) {
-		status = readw(uap->port.membase + UART01x_FR);
-		if (status & UART01x_FR_RXFE)
-			break;
-
-		/* Take chars from the FIFO and update status */
-		ch = readw(uap->port.membase + UART01x_DR) |
-			UART_DUMMY_DR_RX;
-		flag = TTY_NORMAL;
-		uap->port.icount.rx++;
-		fifotaken++;
-
-		if (unlikely(ch & UART_DR_ERROR)) {
-			if (ch & UART011_DR_BE) {
-				ch &= ~(UART011_DR_FE | UART011_DR_PE);
-				uap->port.icount.brk++;
-				if (uart_handle_break(&uap->port))
-					continue;
-			} else if (ch & UART011_DR_PE)
-				uap->port.icount.parity++;
-			else if (ch & UART011_DR_FE)
-				uap->port.icount.frame++;
-			if (ch & UART011_DR_OE)
-				uap->port.icount.overrun++;
-
-			ch &= uap->port.read_status_mask;
-
-			if (ch & UART011_DR_BE)
-				flag = TTY_BREAK;
-			else if (ch & UART011_DR_PE)
-				flag = TTY_PARITY;
-			else if (ch & UART011_DR_FE)
-				flag = TTY_FRAME;
-		}
-
-		if (uart_handle_sysrq_char(&uap->port, ch & 255))
-			continue;
-
-		uart_insert_char(&uap->port, ch, UART011_DR_OE, ch, flag);
-	}
-
-	return fifotaken;
-}
-
-
-/*
- * All the DMA operation mode stuff goes inside this ifdef.
- * This assumes that you have a generic DMA device interface,
- * no custom DMA interfaces are supported.
- */
-#ifdef CONFIG_DMA_ENGINE
-
-#define PL011_DMA_BUFFER_SIZE PAGE_SIZE
-
-static int pl011_sgbuf_init(struct dma_chan *chan, struct pl011_sgbuf *sg,
-	enum dma_data_direction dir)
-{
-	dma_addr_t dma_addr;
-
-	sg->buf = dma_alloc_coherent(chan->device->dev,
-		PL011_DMA_BUFFER_SIZE, &dma_addr, GFP_KERNEL);
-	if (!sg->buf)
-		return -ENOMEM;
-
-	sg_init_table(&sg->sg, 1);
-	sg_set_page(&sg->sg, phys_to_page(dma_addr),
-		PL011_DMA_BUFFER_SIZE, offset_in_page(dma_addr));
-	sg_dma_address(&sg->sg) = dma_addr;
-	sg_dma_len(&sg->sg) = PL011_DMA_BUFFER_SIZE;
-
-	return 0;
-}
-
-static void pl011_sgbuf_free(struct dma_chan *chan, struct pl011_sgbuf *sg,
-	enum dma_data_direction dir)
-{
-	if (sg->buf) {
-		dma_free_coherent(chan->device->dev,
-			PL011_DMA_BUFFER_SIZE, sg->buf,
-			sg_dma_address(&sg->sg));
-	}
-}
-
-static void pl011_dma_probe(struct uart_amba_port *uap)
-{
-	/* DMA is the sole user of the platform data right now */
-	struct amba_pl011_data *plat = dev_get_platdata(uap->port.dev);
-	struct device *dev = uap->port.dev;
-	struct dma_slave_config tx_conf = {
-		.dst_addr = uap->port.mapbase + UART01x_DR,
-		.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
-		.direction = DMA_MEM_TO_DEV,
-		.dst_maxburst = uap->fifosize >> 1,
-		.device_fc = false,
-	};
-	struct dma_chan *chan;
-	dma_cap_mask_t mask;
-
-	uap->dma_probed = true;
-	chan = dma_request_slave_channel_reason(dev, "tx");
-	if (IS_ERR(chan)) {
-		if (PTR_ERR(chan) == -EPROBE_DEFER) {
-			uap->dma_probed = false;
-			return;
-		}
-
-		/* We need platform data */
-		if (!plat || !plat->dma_filter) {
-			dev_info(uap->port.dev, "no DMA platform data\n");
-			return;
-		}
-
-		/* Try to acquire a generic DMA engine slave TX channel */
-		dma_cap_zero(mask);
-		dma_cap_set(DMA_SLAVE, mask);
-
-		chan = dma_request_channel(mask, plat->dma_filter,
-						plat->dma_tx_param);
-		if (!chan) {
-			dev_err(uap->port.dev, "no TX DMA channel!\n");
-			return;
-		}
-	}
-
-	dmaengine_slave_config(chan, &tx_conf);
-	uap->dmatx.chan = chan;
-
-	dev_info(uap->port.dev, "DMA channel TX %s\n",
-		 dma_chan_name(uap->dmatx.chan));
-
-	/* Optionally make use of an RX channel as well */
-	chan = dma_request_slave_channel(dev, "rx");
-
-	if (!chan && plat->dma_rx_param) {
-		chan = dma_request_channel(mask, plat->dma_filter, plat->dma_rx_param);
-
-		if (!chan) {
-			dev_err(uap->port.dev, "no RX DMA channel!\n");
-			return;
-		}
-	}
-
-	if (chan) {
-		struct dma_slave_config rx_conf = {
-			.src_addr = uap->port.mapbase + UART01x_DR,
-			.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
-			.direction = DMA_DEV_TO_MEM,
-			.src_maxburst = uap->fifosize >> 2,
-			.device_fc = false,
-		};
-		struct dma_slave_caps caps;
-
-		/*
-		 * Some DMA controllers provide information on their capabilities.
-		 * If the controller does, check for suitable residue processing
-		 * otherwise assime all is well.
-		 */
-		if (0 == dma_get_slave_caps(chan, &caps)) {
-			if (caps.residue_granularity ==
-					DMA_RESIDUE_GRANULARITY_DESCRIPTOR) {
-				dma_release_channel(chan);
-				dev_info(uap->port.dev,
-					"RX DMA disabled - no residue processing\n");
-				return;
-			}
-		}
-		dmaengine_slave_config(chan, &rx_conf);
-		uap->dmarx.chan = chan;
-
-		uap->dmarx.auto_poll_rate = false;
-		if (plat && plat->dma_rx_poll_enable) {
-			/* Set poll rate if specified. */
-			if (plat->dma_rx_poll_rate) {
-				uap->dmarx.auto_poll_rate = false;
-				uap->dmarx.poll_rate = plat->dma_rx_poll_rate;
-			} else {
-				/*
-				 * 100 ms defaults to poll rate if not
-				 * specified. This will be adjusted with
-				 * the baud rate at set_termios.
-				 */
-				uap->dmarx.auto_poll_rate = true;
-				uap->dmarx.poll_rate =  100;
-			}
-			/* 3 secs defaults poll_timeout if not specified. */
-			if (plat->dma_rx_poll_timeout)
-				uap->dmarx.poll_timeout =
-					plat->dma_rx_poll_timeout;
-			else
-				uap->dmarx.poll_timeout = 3000;
-		} else if (!plat && dev->of_node) {
-			uap->dmarx.auto_poll_rate = of_property_read_bool(
-						dev->of_node, "auto-poll");
-			if (uap->dmarx.auto_poll_rate) {
-				u32 x;
-
-				if (0 == of_property_read_u32(dev->of_node,
-						"poll-rate-ms", &x))
-					uap->dmarx.poll_rate = x;
-				else
-					uap->dmarx.poll_rate = 100;
-				if (0 == of_property_read_u32(dev->of_node,
-						"poll-timeout-ms", &x))
-					uap->dmarx.poll_timeout = x;
-				else
-					uap->dmarx.poll_timeout = 3000;
-			}
-		}
-		dev_info(uap->port.dev, "DMA channel RX %s\n",
-			 dma_chan_name(uap->dmarx.chan));
-	}
-}
-
-static void pl011_dma_remove(struct uart_amba_port *uap)
-{
-	if (uap->dmatx.chan)
-		dma_release_channel(uap->dmatx.chan);
-	if (uap->dmarx.chan)
-		dma_release_channel(uap->dmarx.chan);
-}
-
-/* Forward declare these for the refill routine */
-static int pl011_dma_tx_refill(struct uart_amba_port *uap);
-static void pl011_start_tx_pio(struct uart_amba_port *uap);
-
-/*
- * The current DMA TX buffer has been sent.
- * Try to queue up another DMA buffer.
- */
-static void pl011_dma_tx_callback(void *data)
-{
-	struct uart_amba_port *uap = data;
-	struct pl011_dmatx_data *dmatx = &uap->dmatx;
-	unsigned long flags;
-	u16 dmacr;
-
-	spin_lock_irqsave(&uap->port.lock, flags);
-	if (uap->dmatx.queued)
-		dma_unmap_sg(dmatx->chan->device->dev, &dmatx->sg, 1,
-			     DMA_TO_DEVICE);
-
-	dmacr = uap->dmacr;
-	uap->dmacr = dmacr & ~UART011_TXDMAE;
-	writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-
-	/*
-	 * If TX DMA was disabled, it means that we've stopped the DMA for
-	 * some reason (eg, XOFF received, or we want to send an X-char.)
-	 *
-	 * Note: we need to be careful here of a potential race between DMA
-	 * and the rest of the driver - if the driver disables TX DMA while
-	 * a TX buffer completing, we must update the tx queued status to
-	 * get further refills (hence we check dmacr).
-	 */
-	if (!(dmacr & UART011_TXDMAE) || uart_tx_stopped(&uap->port) ||
-	    uart_circ_empty(&uap->port.state->xmit)) {
-		uap->dmatx.queued = false;
-		spin_unlock_irqrestore(&uap->port.lock, flags);
-		return;
-	}
-
-	if (pl011_dma_tx_refill(uap) <= 0)
-		/*
-		 * We didn't queue a DMA buffer for some reason, but we
-		 * have data pending to be sent.  Re-enable the TX IRQ.
-		 */
-		pl011_start_tx_pio(uap);
-
-	spin_unlock_irqrestore(&uap->port.lock, flags);
-}
-
-/*
- * Try to refill the TX DMA buffer.
- * Locking: called with port lock held and IRQs disabled.
- * Returns:
- *   1 if we queued up a TX DMA buffer.
- *   0 if we didn't want to handle this by DMA
- *  <0 on error
- */
-static int pl011_dma_tx_refill(struct uart_amba_port *uap)
-{
-	struct pl011_dmatx_data *dmatx = &uap->dmatx;
-	struct dma_chan *chan = dmatx->chan;
-	struct dma_device *dma_dev = chan->device;
-	struct dma_async_tx_descriptor *desc;
-	struct circ_buf *xmit = &uap->port.state->xmit;
-	unsigned int count;
-
-	/*
-	 * Try to avoid the overhead involved in using DMA if the
-	 * transaction fits in the first half of the FIFO, by using
-	 * the standard interrupt handling.  This ensures that we
-	 * issue a uart_write_wakeup() at the appropriate time.
-	 */
-	count = uart_circ_chars_pending(xmit);
-	if (count < (uap->fifosize >> 1)) {
-		uap->dmatx.queued = false;
-		return 0;
-	}
-
-	/*
-	 * Bodge: don't send the last character by DMA, as this
-	 * will prevent XON from notifying us to restart DMA.
-	 */
-	count -= 1;
-
-	/* Else proceed to copy the TX chars to the DMA buffer and fire DMA */
-	if (count > PL011_DMA_BUFFER_SIZE)
-		count = PL011_DMA_BUFFER_SIZE;
-
-	if (xmit->tail < xmit->head)
-		memcpy(&dmatx->buf[0], &xmit->buf[xmit->tail], count);
-	else {
-		size_t first = UART_XMIT_SIZE - xmit->tail;
-		size_t second;
-
-		if (first > count)
-			first = count;
-		second = count - first;
-
-		memcpy(&dmatx->buf[0], &xmit->buf[xmit->tail], first);
-		if (second)
-			memcpy(&dmatx->buf[first], &xmit->buf[0], second);
-	}
-
-	dmatx->sg.length = count;
-
-	if (dma_map_sg(dma_dev->dev, &dmatx->sg, 1, DMA_TO_DEVICE) != 1) {
-		uap->dmatx.queued = false;
-		dev_dbg(uap->port.dev, "unable to map TX DMA\n");
-		return -EBUSY;
-	}
-
-	desc = dmaengine_prep_slave_sg(chan, &dmatx->sg, 1, DMA_MEM_TO_DEV,
-					     DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
-	if (!desc) {
-		dma_unmap_sg(dma_dev->dev, &dmatx->sg, 1, DMA_TO_DEVICE);
-		uap->dmatx.queued = false;
-		/*
-		 * If DMA cannot be used right now, we complete this
-		 * transaction via IRQ and let the TTY layer retry.
-		 */
-		dev_dbg(uap->port.dev, "TX DMA busy\n");
-		return -EBUSY;
-	}
-
-	/* Some data to go along to the callback */
-	desc->callback = pl011_dma_tx_callback;
-	desc->callback_param = uap;
-
-	/* All errors should happen at prepare time */
-	dmaengine_submit(desc);
-
-	/* Fire the DMA transaction */
-	dma_dev->device_issue_pending(chan);
-
-	uap->dmacr |= UART011_TXDMAE;
-	writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-	uap->dmatx.queued = true;
-
-	/*
-	 * Now we know that DMA will fire, so advance the ring buffer
-	 * with the stuff we just dispatched.
-	 */
-	xmit->tail = (xmit->tail + count) & (UART_XMIT_SIZE - 1);
-	uap->port.icount.tx += count;
-
-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
-		uart_write_wakeup(&uap->port);
-
-	return 1;
-}
-
-/*
- * We received a transmit interrupt without a pending X-char but with
- * pending characters.
- * Locking: called with port lock held and IRQs disabled.
- * Returns:
- *   false if we want to use PIO to transmit
- *   true if we queued a DMA buffer
- */
-static bool pl011_dma_tx_irq(struct uart_amba_port *uap)
-{
-	if (!uap->using_tx_dma)
-		return false;
-
-	/*
-	 * If we already have a TX buffer queued, but received a
-	 * TX interrupt, it will be because we've just sent an X-char.
-	 * Ensure the TX DMA is enabled and the TX IRQ is disabled.
-	 */
-	if (uap->dmatx.queued) {
-		uap->dmacr |= UART011_TXDMAE;
-		writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-		uap->im &= ~UART011_TXIM;
-		writew(uap->im, uap->port.membase + UART011_IMSC);
-		return true;
-	}
-
-	/*
-	 * We don't have a TX buffer queued, so try to queue one.
-	 * If we successfully queued a buffer, mask the TX IRQ.
-	 */
-	if (pl011_dma_tx_refill(uap) > 0) {
-		uap->im &= ~UART011_TXIM;
-		writew(uap->im, uap->port.membase + UART011_IMSC);
-		return true;
-	}
-	return false;
-}
-
-/*
- * Stop the DMA transmit (eg, due to received XOFF).
- * Locking: called with port lock held and IRQs disabled.
- */
-static inline void pl011_dma_tx_stop(struct uart_amba_port *uap)
-{
-	if (uap->dmatx.queued) {
-		uap->dmacr &= ~UART011_TXDMAE;
-		writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-	}
-}
-
-/*
- * Try to start a DMA transmit, or in the case of an XON/OFF
- * character queued for send, try to get that character out ASAP.
- * Locking: called with port lock held and IRQs disabled.
- * Returns:
- *   false if we want the TX IRQ to be enabled
- *   true if we have a buffer queued
- */
-static inline bool pl011_dma_tx_start(struct uart_amba_port *uap)
-{
-	u16 dmacr;
-
-	if (!uap->using_tx_dma)
-		return false;
-
-	if (!uap->port.x_char) {
-		/* no X-char, try to push chars out in DMA mode */
-		bool ret = true;
-
-		if (!uap->dmatx.queued) {
-			if (pl011_dma_tx_refill(uap) > 0) {
-				uap->im &= ~UART011_TXIM;
-				writew(uap->im, uap->port.membase +
-				       UART011_IMSC);
-			} else
-				ret = false;
-		} else if (!(uap->dmacr & UART011_TXDMAE)) {
-			uap->dmacr |= UART011_TXDMAE;
-			writew(uap->dmacr,
-				       uap->port.membase + UART011_DMACR);
-		}
-		return ret;
-	}
-
-	/*
-	 * We have an X-char to send.  Disable DMA to prevent it loading
-	 * the TX fifo, and then see if we can stuff it into the FIFO.
-	 */
-	dmacr = uap->dmacr;
-	uap->dmacr &= ~UART011_TXDMAE;
-	writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-
-	if (readw(uap->port.membase + UART01x_FR) & UART01x_FR_TXFF) {
-		/*
-		 * No space in the FIFO, so enable the transmit interrupt
-		 * so we know when there is space.  Note that once we've
-		 * loaded the character, we should just re-enable DMA.
-		 */
-		return false;
-	}
-
-	writew(uap->port.x_char, uap->port.membase + UART01x_DR);
-	uap->port.icount.tx++;
-	uap->port.x_char = 0;
-
-	/* Success - restore the DMA state */
-	uap->dmacr = dmacr;
-	writew(dmacr, uap->port.membase + UART011_DMACR);
-
-	return true;
-}
-
-/*
- * Flush the transmit buffer.
- * Locking: called with port lock held and IRQs disabled.
- */
-static void pl011_dma_flush_buffer(struct uart_port *port)
-__releases(&uap->port.lock)
-__acquires(&uap->port.lock)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-
-	if (!uap->using_tx_dma)
-		return;
-
-	/* Avoid deadlock with the DMA engine callback */
-	spin_unlock(&uap->port.lock);
-	dmaengine_terminate_all(uap->dmatx.chan);
-	spin_lock(&uap->port.lock);
-	if (uap->dmatx.queued) {
-		dma_unmap_sg(uap->dmatx.chan->device->dev, &uap->dmatx.sg, 1,
-			     DMA_TO_DEVICE);
-		uap->dmatx.queued = false;
-		uap->dmacr &= ~UART011_TXDMAE;
-		writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-	}
-}
-
-static void pl011_dma_rx_callback(void *data);
-
-static int pl011_dma_rx_trigger_dma(struct uart_amba_port *uap)
-{
-	struct dma_chan *rxchan = uap->dmarx.chan;
-	struct pl011_dmarx_data *dmarx = &uap->dmarx;
-	struct dma_async_tx_descriptor *desc;
-	struct pl011_sgbuf *sgbuf;
-
-	if (!rxchan)
-		return -EIO;
-
-	/* Start the RX DMA job */
-	sgbuf = uap->dmarx.use_buf_b ?
-		&uap->dmarx.sgbuf_b : &uap->dmarx.sgbuf_a;
-	desc = dmaengine_prep_slave_sg(rxchan, &sgbuf->sg, 1,
-					DMA_DEV_TO_MEM,
-					DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
-	/*
-	 * If the DMA engine is busy and cannot prepare a
-	 * channel, no big deal, the driver will fall back
-	 * to interrupt mode as a result of this error code.
-	 */
-	if (!desc) {
-		uap->dmarx.running = false;
-		dmaengine_terminate_all(rxchan);
-		return -EBUSY;
-	}
-
-	/* Some data to go along to the callback */
-	desc->callback = pl011_dma_rx_callback;
-	desc->callback_param = uap;
-	dmarx->cookie = dmaengine_submit(desc);
-	dma_async_issue_pending(rxchan);
-
-	uap->dmacr |= UART011_RXDMAE;
-	writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-	uap->dmarx.running = true;
-
-	uap->im &= ~UART011_RXIM;
-	writew(uap->im, uap->port.membase + UART011_IMSC);
-
-	return 0;
-}
-
-/*
- * This is called when either the DMA job is complete, or
- * the FIFO timeout interrupt occurred. This must be called
- * with the port spinlock uap->port.lock held.
- */
-static void pl011_dma_rx_chars(struct uart_amba_port *uap,
-			       u32 pending, bool use_buf_b,
-			       bool readfifo)
-{
-	struct tty_port *port = &uap->port.state->port;
-	struct pl011_sgbuf *sgbuf = use_buf_b ?
-		&uap->dmarx.sgbuf_b : &uap->dmarx.sgbuf_a;
-	int dma_count = 0;
-	u32 fifotaken = 0; /* only used for vdbg() */
-
-	struct pl011_dmarx_data *dmarx = &uap->dmarx;
-	int dmataken = 0;
-
-	if (uap->dmarx.poll_rate) {
-		/* The data can be taken by polling */
-		dmataken = sgbuf->sg.length - dmarx->last_residue;
-		/* Recalculate the pending size */
-		if (pending >= dmataken)
-			pending -= dmataken;
-	}
-
-	/* Pick the remain data from the DMA */
-	if (pending) {
-
-		/*
-		 * First take all chars in the DMA pipe, then look in the FIFO.
-		 * Note that tty_insert_flip_buf() tries to take as many chars
-		 * as it can.
-		 */
-		dma_count = tty_insert_flip_string(port, sgbuf->buf + dmataken,
-				pending);
-
-		uap->port.icount.rx += dma_count;
-		if (dma_count < pending)
-			dev_warn(uap->port.dev,
-				 "couldn't insert all characters (TTY is full?)\n");
-	}
-
-	/* Reset the last_residue for Rx DMA poll */
-	if (uap->dmarx.poll_rate)
-		dmarx->last_residue = sgbuf->sg.length;
-
-	/*
-	 * Only continue with trying to read the FIFO if all DMA chars have
-	 * been taken first.
-	 */
-	if (dma_count == pending && readfifo) {
-		/* Clear any error flags */
-		writew(UART011_OEIS | UART011_BEIS | UART011_PEIS | UART011_FEIS,
-		       uap->port.membase + UART011_ICR);
-
-		/*
-		 * If we read all the DMA'd characters, and we had an
-		 * incomplete buffer, that could be due to an rx error, or
-		 * maybe we just timed out. Read any pending chars and check
-		 * the error status.
-		 *
-		 * Error conditions will only occur in the FIFO, these will
-		 * trigger an immediate interrupt and stop the DMA job, so we
-		 * will always find the error in the FIFO, never in the DMA
-		 * buffer.
-		 */
-		fifotaken = pl011_fifo_to_tty(uap);
-	}
-
-	spin_unlock(&uap->port.lock);
-	dev_vdbg(uap->port.dev,
-		 "Took %d chars from DMA buffer and %d chars from the FIFO\n",
-		 dma_count, fifotaken);
-	tty_flip_buffer_push(port);
-	spin_lock(&uap->port.lock);
-}
-
-static void pl011_dma_rx_irq(struct uart_amba_port *uap)
-{
-	struct pl011_dmarx_data *dmarx = &uap->dmarx;
-	struct dma_chan *rxchan = dmarx->chan;
-	struct pl011_sgbuf *sgbuf = dmarx->use_buf_b ?
-		&dmarx->sgbuf_b : &dmarx->sgbuf_a;
-	size_t pending;
-	struct dma_tx_state state;
-	enum dma_status dmastat;
-
-	/*
-	 * Pause the transfer so we can trust the current counter,
-	 * do this before we pause the PL011 block, else we may
-	 * overflow the FIFO.
-	 */
-	if (dmaengine_pause(rxchan))
-		dev_err(uap->port.dev, "unable to pause DMA transfer\n");
-	dmastat = rxchan->device->device_tx_status(rxchan,
-						   dmarx->cookie, &state);
-	if (dmastat != DMA_PAUSED)
-		dev_err(uap->port.dev, "unable to pause DMA transfer\n");
-
-	/* Disable RX DMA - incoming data will wait in the FIFO */
-	uap->dmacr &= ~UART011_RXDMAE;
-	writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-	uap->dmarx.running = false;
-
-	pending = sgbuf->sg.length - state.residue;
-	BUG_ON(pending > PL011_DMA_BUFFER_SIZE);
-	/* Then we terminate the transfer - we now know our residue */
-	dmaengine_terminate_all(rxchan);
-
-	/*
-	 * This will take the chars we have so far and insert
-	 * into the framework.
-	 */
-	pl011_dma_rx_chars(uap, pending, dmarx->use_buf_b, true);
-
-	/* Switch buffer & re-trigger DMA job */
-	dmarx->use_buf_b = !dmarx->use_buf_b;
-	if (pl011_dma_rx_trigger_dma(uap)) {
-		dev_dbg(uap->port.dev, "could not retrigger RX DMA job "
-			"fall back to interrupt mode\n");
-		uap->im |= UART011_RXIM;
-		writew(uap->im, uap->port.membase + UART011_IMSC);
-	}
-}
-
-static void pl011_dma_rx_callback(void *data)
-{
-	struct uart_amba_port *uap = data;
-	struct pl011_dmarx_data *dmarx = &uap->dmarx;
-	struct dma_chan *rxchan = dmarx->chan;
-	bool lastbuf = dmarx->use_buf_b;
-	struct pl011_sgbuf *sgbuf = dmarx->use_buf_b ?
-		&dmarx->sgbuf_b : &dmarx->sgbuf_a;
-	size_t pending;
-	struct dma_tx_state state;
-	int ret;
-
-	/*
-	 * This completion interrupt occurs typically when the
-	 * RX buffer is totally stuffed but no timeout has yet
-	 * occurred. When that happens, we just want the RX
-	 * routine to flush out the secondary DMA buffer while
-	 * we immediately trigger the next DMA job.
-	 */
-	spin_lock_irq(&uap->port.lock);
-	/*
-	 * Rx data can be taken by the UART interrupts during
-	 * the DMA irq handler. So we check the residue here.
-	 */
-	rxchan->device->device_tx_status(rxchan, dmarx->cookie, &state);
-	pending = sgbuf->sg.length - state.residue;
-	BUG_ON(pending > PL011_DMA_BUFFER_SIZE);
-	/* Then we terminate the transfer - we now know our residue */
-	dmaengine_terminate_all(rxchan);
-
-	uap->dmarx.running = false;
-	dmarx->use_buf_b = !lastbuf;
-	ret = pl011_dma_rx_trigger_dma(uap);
-
-	pl011_dma_rx_chars(uap, pending, lastbuf, false);
-	spin_unlock_irq(&uap->port.lock);
-	/*
-	 * Do this check after we picked the DMA chars so we don't
-	 * get some IRQ immediately from RX.
-	 */
-	if (ret) {
-		dev_dbg(uap->port.dev, "could not retrigger RX DMA job "
-			"fall back to interrupt mode\n");
-		uap->im |= UART011_RXIM;
-		writew(uap->im, uap->port.membase + UART011_IMSC);
-	}
-}
-
-/*
- * Stop accepting received characters, when we're shutting down or
- * suspending this port.
- * Locking: called with port lock held and IRQs disabled.
- */
-static inline void pl011_dma_rx_stop(struct uart_amba_port *uap)
-{
-	if (!uap->using_rx_dma)
-		return;
-
-	/* FIXME.  Just disable the DMA enable */
-	uap->dmacr &= ~UART011_RXDMAE;
-	writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-}
-
-/*
- * Timer handler for Rx DMA polling.
- * Every polling, It checks the residue in the dma buffer and transfer
- * data to the tty. Also, last_residue is updated for the next polling.
- */
-static void pl011_dma_rx_poll(unsigned long args)
-{
-	struct uart_amba_port *uap = (struct uart_amba_port *)args;
-	struct tty_port *port = &uap->port.state->port;
-	struct pl011_dmarx_data *dmarx = &uap->dmarx;
-	struct dma_chan *rxchan = uap->dmarx.chan;
-	unsigned long flags = 0;
-	unsigned int dmataken = 0;
-	unsigned int size = 0;
-	struct pl011_sgbuf *sgbuf;
-	int dma_count;
-	struct dma_tx_state state;
-
-	sgbuf = dmarx->use_buf_b ? &uap->dmarx.sgbuf_b : &uap->dmarx.sgbuf_a;
-	rxchan->device->device_tx_status(rxchan, dmarx->cookie, &state);
-	if (likely(state.residue < dmarx->last_residue)) {
-		dmataken = sgbuf->sg.length - dmarx->last_residue;
-		size = dmarx->last_residue - state.residue;
-		dma_count = tty_insert_flip_string(port, sgbuf->buf + dmataken,
-				size);
-		if (dma_count == size)
-			dmarx->last_residue =  state.residue;
-		dmarx->last_jiffies = jiffies;
-	}
-	tty_flip_buffer_push(port);
-
-	/*
-	 * If no data is received in poll_timeout, the driver will fall back
-	 * to interrupt mode. We will retrigger DMA at the first interrupt.
-	 */
-	if (jiffies_to_msecs(jiffies - dmarx->last_jiffies)
-			> uap->dmarx.poll_timeout) {
-
-		spin_lock_irqsave(&uap->port.lock, flags);
-		pl011_dma_rx_stop(uap);
-		uap->im |= UART011_RXIM;
-		writew(uap->im, uap->port.membase + UART011_IMSC);
-		spin_unlock_irqrestore(&uap->port.lock, flags);
-
-		uap->dmarx.running = false;
-		dmaengine_terminate_all(rxchan);
-		del_timer(&uap->dmarx.timer);
-	} else {
-		mod_timer(&uap->dmarx.timer,
-			jiffies + msecs_to_jiffies(uap->dmarx.poll_rate));
-	}
-}
-
-static void pl011_dma_startup(struct uart_amba_port *uap)
-{
-	int ret;
-
-	if (!uap->dma_probed)
-		pl011_dma_probe(uap);
-
-	if (!uap->dmatx.chan)
-		return;
-
-	uap->dmatx.buf = kmalloc(PL011_DMA_BUFFER_SIZE, GFP_KERNEL | __GFP_DMA);
-	if (!uap->dmatx.buf) {
-		dev_err(uap->port.dev, "no memory for DMA TX buffer\n");
-		uap->port.fifosize = uap->fifosize;
-		return;
-	}
-
-	sg_init_one(&uap->dmatx.sg, uap->dmatx.buf, PL011_DMA_BUFFER_SIZE);
-
-	/* The DMA buffer is now the FIFO the TTY subsystem can use */
-	uap->port.fifosize = PL011_DMA_BUFFER_SIZE;
-	uap->using_tx_dma = true;
-
-	if (!uap->dmarx.chan)
-		goto skip_rx;
-
-	/* Allocate and map DMA RX buffers */
-	ret = pl011_sgbuf_init(uap->dmarx.chan, &uap->dmarx.sgbuf_a,
-			       DMA_FROM_DEVICE);
-	if (ret) {
-		dev_err(uap->port.dev, "failed to init DMA %s: %d\n",
-			"RX buffer A", ret);
-		goto skip_rx;
-	}
-
-	ret = pl011_sgbuf_init(uap->dmarx.chan, &uap->dmarx.sgbuf_b,
-			       DMA_FROM_DEVICE);
-	if (ret) {
-		dev_err(uap->port.dev, "failed to init DMA %s: %d\n",
-			"RX buffer B", ret);
-		pl011_sgbuf_free(uap->dmarx.chan, &uap->dmarx.sgbuf_a,
-				 DMA_FROM_DEVICE);
-		goto skip_rx;
-	}
-
-	uap->using_rx_dma = true;
-
-skip_rx:
-	/* Turn on DMA error (RX/TX will be enabled on demand) */
-	uap->dmacr |= UART011_DMAONERR;
-	writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-
-	/*
-	 * ST Micro variants has some specific dma burst threshold
-	 * compensation. Set this to 16 bytes, so burst will only
-	 * be issued above/below 16 bytes.
-	 */
-	if (uap->vendor->dma_threshold)
-		writew(ST_UART011_DMAWM_RX_16 | ST_UART011_DMAWM_TX_16,
-			       uap->port.membase + ST_UART011_DMAWM);
-
-	if (uap->using_rx_dma) {
-		if (pl011_dma_rx_trigger_dma(uap))
-			dev_dbg(uap->port.dev, "could not trigger initial "
-				"RX DMA job, fall back to interrupt mode\n");
-		if (uap->dmarx.poll_rate) {
-			init_timer(&(uap->dmarx.timer));
-			uap->dmarx.timer.function = pl011_dma_rx_poll;
-			uap->dmarx.timer.data = (unsigned long)uap;
-			mod_timer(&uap->dmarx.timer,
-				jiffies +
-				msecs_to_jiffies(uap->dmarx.poll_rate));
-			uap->dmarx.last_residue = PL011_DMA_BUFFER_SIZE;
-			uap->dmarx.last_jiffies = jiffies;
-		}
-	}
-}
-
-static void pl011_dma_shutdown(struct uart_amba_port *uap)
-{
-	if (!(uap->using_tx_dma || uap->using_rx_dma))
-		return;
-
-	/* Disable RX and TX DMA */
-	while (readw(uap->port.membase + UART01x_FR) & UART01x_FR_BUSY)
-		barrier();
-
-	spin_lock_irq(&uap->port.lock);
-	uap->dmacr &= ~(UART011_DMAONERR | UART011_RXDMAE | UART011_TXDMAE);
-	writew(uap->dmacr, uap->port.membase + UART011_DMACR);
-	spin_unlock_irq(&uap->port.lock);
-
-	if (uap->using_tx_dma) {
-		/* In theory, this should already be done by pl011_dma_flush_buffer */
-		dmaengine_terminate_all(uap->dmatx.chan);
-		if (uap->dmatx.queued) {
-			dma_unmap_sg(uap->dmatx.chan->device->dev, &uap->dmatx.sg, 1,
-				     DMA_TO_DEVICE);
-			uap->dmatx.queued = false;
-		}
-
-		kfree(uap->dmatx.buf);
-		uap->using_tx_dma = false;
-	}
-
-	if (uap->using_rx_dma) {
-		dmaengine_terminate_all(uap->dmarx.chan);
-		/* Clean up the RX DMA */
-		pl011_sgbuf_free(uap->dmarx.chan, &uap->dmarx.sgbuf_a, DMA_FROM_DEVICE);
-		pl011_sgbuf_free(uap->dmarx.chan, &uap->dmarx.sgbuf_b, DMA_FROM_DEVICE);
-		if (uap->dmarx.poll_rate)
-			del_timer_sync(&uap->dmarx.timer);
-		uap->using_rx_dma = false;
-	}
-}
-
-static inline bool pl011_dma_rx_available(struct uart_amba_port *uap)
-{
-	return uap->using_rx_dma;
-}
-
-static inline bool pl011_dma_rx_running(struct uart_amba_port *uap)
-{
-	return uap->using_rx_dma && uap->dmarx.running;
-}
-
-#else
-/* Blank functions if the DMA engine is not available */
-static inline void pl011_dma_probe(struct uart_amba_port *uap)
-{
-}
-
-static inline void pl011_dma_remove(struct uart_amba_port *uap)
-{
-}
-
-static inline void pl011_dma_startup(struct uart_amba_port *uap)
-{
-}
-
-static inline void pl011_dma_shutdown(struct uart_amba_port *uap)
-{
-}
-
-static inline bool pl011_dma_tx_irq(struct uart_amba_port *uap)
-{
-	return false;
-}
-
-static inline void pl011_dma_tx_stop(struct uart_amba_port *uap)
-{
-}
-
-static inline bool pl011_dma_tx_start(struct uart_amba_port *uap)
-{
-	return false;
-}
-
-static inline void pl011_dma_rx_irq(struct uart_amba_port *uap)
-{
-}
-
-static inline void pl011_dma_rx_stop(struct uart_amba_port *uap)
-{
-}
-
-static inline int pl011_dma_rx_trigger_dma(struct uart_amba_port *uap)
-{
-	return -EIO;
-}
-
-static inline bool pl011_dma_rx_available(struct uart_amba_port *uap)
-{
-	return false;
-}
-
-static inline bool pl011_dma_rx_running(struct uart_amba_port *uap)
-{
-	return false;
-}
-
-#define pl011_dma_flush_buffer	NULL
-#endif
-
-static void pl011_stop_tx(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-
-	uap->im &= ~UART011_TXIM;
-	writew(uap->im, uap->port.membase + UART011_IMSC);
-	pl011_dma_tx_stop(uap);
-}
-
-static void pl011_tx_chars(struct uart_amba_port *uap, bool from_irq);
-
-/* Start TX with programmed I/O only (no DMA) */
-static void pl011_start_tx_pio(struct uart_amba_port *uap)
-{
-	uap->im |= UART011_TXIM;
-	writew(uap->im, uap->port.membase + UART011_IMSC);
-	pl011_tx_chars(uap, false);
-}
-
-static void pl011_start_tx(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-
-	if (!pl011_dma_tx_start(uap))
-		pl011_start_tx_pio(uap);
-}
-
-static void pl011_stop_rx(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-
-	uap->im &= ~(UART011_RXIM|UART011_RTIM|UART011_FEIM|
-		     UART011_PEIM|UART011_BEIM|UART011_OEIM);
-	writew(uap->im, uap->port.membase + UART011_IMSC);
-
-	pl011_dma_rx_stop(uap);
-}
-
-static void pl011_enable_ms(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-
-	uap->im |= UART011_RIMIM|UART011_CTSMIM|UART011_DCDMIM|UART011_DSRMIM;
-	writew(uap->im, uap->port.membase + UART011_IMSC);
-}
-
-static void pl011_rx_chars(struct uart_amba_port *uap)
-__releases(&uap->port.lock)
-__acquires(&uap->port.lock)
-{
-	pl011_fifo_to_tty(uap);
-
-	spin_unlock(&uap->port.lock);
-	tty_flip_buffer_push(&uap->port.state->port);
-	/*
-	 * If we were temporarily out of DMA mode for a while,
-	 * attempt to switch back to DMA mode again.
-	 */
-	if (pl011_dma_rx_available(uap)) {
-		if (pl011_dma_rx_trigger_dma(uap)) {
-			dev_dbg(uap->port.dev, "could not trigger RX DMA job "
-				"fall back to interrupt mode again\n");
-			uap->im |= UART011_RXIM;
-			writew(uap->im, uap->port.membase + UART011_IMSC);
-		} else {
-#ifdef CONFIG_DMA_ENGINE
-			/* Start Rx DMA poll */
-			if (uap->dmarx.poll_rate) {
-				uap->dmarx.last_jiffies = jiffies;
-				uap->dmarx.last_residue	= PL011_DMA_BUFFER_SIZE;
-				mod_timer(&uap->dmarx.timer,
-					jiffies +
-					msecs_to_jiffies(uap->dmarx.poll_rate));
-			}
-#endif
-		}
-	}
-	spin_lock(&uap->port.lock);
-}
-
-static bool pl011_tx_char(struct uart_amba_port *uap, unsigned char c,
-			  bool from_irq)
-{
-	if (unlikely(!from_irq) &&
-	    readw(uap->port.membase + UART01x_FR) & UART01x_FR_TXFF)
-		return false; /* unable to transmit character */
-
-	writew(c, uap->port.membase + UART01x_DR);
-	uap->port.icount.tx++;
-
-	return true;
-}
-
-static void pl011_tx_chars(struct uart_amba_port *uap, bool from_irq)
-{
-	struct circ_buf *xmit = &uap->port.state->xmit;
-	int count = uap->fifosize >> 1;
-
-	if (uap->port.x_char) {
-		if (!pl011_tx_char(uap, uap->port.x_char, from_irq))
-			return;
-		uap->port.x_char = 0;
-		--count;
-	}
-	if (uart_circ_empty(xmit) || uart_tx_stopped(&uap->port)) {
-		pl011_stop_tx(&uap->port);
-		return;
-	}
-
-	/* If we are using DMA mode, try to send some characters. */
-	if (pl011_dma_tx_irq(uap))
-		return;
-
-	do {
-		if (likely(from_irq) && count-- == 0)
-			break;
-
-		if (!pl011_tx_char(uap, xmit->buf[xmit->tail], from_irq))
-			break;
-
-		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-	} while (!uart_circ_empty(xmit));
-
-	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
-		uart_write_wakeup(&uap->port);
-
-	if (uart_circ_empty(xmit))
-		pl011_stop_tx(&uap->port);
-}
-
-static void pl011_modem_status(struct uart_amba_port *uap)
-{
-	unsigned int status, delta;
-
-	status = readw(uap->port.membase + UART01x_FR) & UART01x_FR_MODEM_ANY;
-
-	delta = status ^ uap->old_status;
-	uap->old_status = status;
-
-	if (!delta)
-		return;
-
-	if (delta & UART01x_FR_DCD)
-		uart_handle_dcd_change(&uap->port, status & UART01x_FR_DCD);
-
-	if (delta & UART01x_FR_DSR)
-		uap->port.icount.dsr++;
-
-	if (delta & UART01x_FR_CTS)
-		uart_handle_cts_change(&uap->port, status & UART01x_FR_CTS);
-
-	wake_up_interruptible(&uap->port.state->port.delta_msr_wait);
-}
-
-static void check_apply_cts_event_workaround(struct uart_amba_port *uap)
-{
-	unsigned int dummy_read;
-
-	if (!uap->vendor->cts_event_workaround)
-		return;
-
-	/* workaround to make sure that all bits are unlocked.. */
-	writew(0x00, uap->port.membase + UART011_ICR);
-
-	/*
-	 * WA: introduce 26ns(1 uart clk) delay before W1C;
-	 * single apb access will incur 2 pclk(133.12Mhz) delay,
-	 * so add 2 dummy reads
-	 */
-	dummy_read = readw(uap->port.membase + UART011_ICR);
-	dummy_read = readw(uap->port.membase + UART011_ICR);
-}
-
-static irqreturn_t pl011_int(int irq, void *dev_id)
-{
-	struct uart_amba_port *uap = dev_id;
-	unsigned long flags;
-	unsigned int status, pass_counter = AMBA_ISR_PASS_LIMIT;
-	u16 imsc;
-	int handled = 0;
-
-	spin_lock_irqsave(&uap->port.lock, flags);
-	imsc = readw(uap->port.membase + UART011_IMSC);
-	status = readw(uap->port.membase + UART011_RIS) & imsc;
-	if (status) {
-		do {
-			check_apply_cts_event_workaround(uap);
-
-			writew(status & ~(UART011_TXIS|UART011_RTIS|
-					  UART011_RXIS),
-			       uap->port.membase + UART011_ICR);
-
-			if (status & (UART011_RTIS|UART011_RXIS)) {
-				if (pl011_dma_rx_running(uap))
-					pl011_dma_rx_irq(uap);
-				else
-					pl011_rx_chars(uap);
-			}
-			if (status & (UART011_DSRMIS|UART011_DCDMIS|
-				      UART011_CTSMIS|UART011_RIMIS))
-				pl011_modem_status(uap);
-			if (status & UART011_TXIS)
-				pl011_tx_chars(uap, true);
-
-			if (pass_counter-- == 0)
-				break;
-
-			status = readw(uap->port.membase + UART011_RIS) & imsc;
-		} while (status != 0);
-		handled = 1;
-	}
-
-	spin_unlock_irqrestore(&uap->port.lock, flags);
-
-	return IRQ_RETVAL(handled);
-}
-
-static unsigned int pl011_tx_empty(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned int status = readw(uap->port.membase + UART01x_FR);
-	return status & (UART01x_FR_BUSY|UART01x_FR_TXFF) ? 0 : TIOCSER_TEMT;
-}
-
-static unsigned int pl011_get_mctrl(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned int result = 0;
-	unsigned int status = readw(uap->port.membase + UART01x_FR);
-
-#define TIOCMBIT(uartbit, tiocmbit)	\
-	if (status & uartbit)		\
-		result |= tiocmbit
-
-	TIOCMBIT(UART01x_FR_DCD, TIOCM_CAR);
-	TIOCMBIT(UART01x_FR_DSR, TIOCM_DSR);
-	TIOCMBIT(UART01x_FR_CTS, TIOCM_CTS);
-	TIOCMBIT(UART011_FR_RI, TIOCM_RNG);
-#undef TIOCMBIT
-	return result;
-}
-
-static void pl011_set_mctrl(struct uart_port *port, unsigned int mctrl)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned int cr;
-
-	cr = readw(uap->port.membase + UART011_CR);
-
-#define	TIOCMBIT(tiocmbit, uartbit)		\
-	if (mctrl & tiocmbit)		\
-		cr |= uartbit;		\
-	else				\
-		cr &= ~uartbit
-
-	TIOCMBIT(TIOCM_RTS, UART011_CR_RTS);
-	TIOCMBIT(TIOCM_DTR, UART011_CR_DTR);
-	TIOCMBIT(TIOCM_OUT1, UART011_CR_OUT1);
-	TIOCMBIT(TIOCM_OUT2, UART011_CR_OUT2);
-	TIOCMBIT(TIOCM_LOOP, UART011_CR_LBE);
-
-	if (uap->autorts) {
-		/* We need to disable auto-RTS if we want to turn RTS off */
-		TIOCMBIT(TIOCM_RTS, UART011_CR_RTSEN);
-	}
-#undef TIOCMBIT
-
-	writew(cr, uap->port.membase + UART011_CR);
-}
-
-static void pl011_break_ctl(struct uart_port *port, int break_state)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned long flags;
-	unsigned int lcr_h;
-
-	spin_lock_irqsave(&uap->port.lock, flags);
-	lcr_h = readw(uap->port.membase + uap->lcrh_tx);
-	if (break_state == -1)
-		lcr_h |= UART01x_LCRH_BRK;
-	else
-		lcr_h &= ~UART01x_LCRH_BRK;
-	writew(lcr_h, uap->port.membase + uap->lcrh_tx);
-	spin_unlock_irqrestore(&uap->port.lock, flags);
-}
-
-#ifdef CONFIG_CONSOLE_POLL
-
-static void pl011_quiesce_irqs(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned char __iomem *regs = uap->port.membase;
-
-	writew(readw(regs + UART011_MIS), regs + UART011_ICR);
-	/*
-	 * There is no way to clear TXIM as this is "ready to transmit IRQ", so
-	 * we simply mask it. start_tx() will unmask it.
-	 *
-	 * Note we can race with start_tx(), and if the race happens, the
-	 * polling user might get another interrupt just after we clear it.
-	 * But it should be OK and can happen even w/o the race, e.g.
-	 * controller immediately got some new data and raised the IRQ.
-	 *
-	 * And whoever uses polling routines assumes that it manages the device
-	 * (including tx queue), so we're also fine with start_tx()'s caller
-	 * side.
-	 */
-	writew(readw(regs + UART011_IMSC) & ~UART011_TXIM, regs + UART011_IMSC);
-}
-
-static int pl011_get_poll_char(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned int status;
-
-	/*
-	 * The caller might need IRQs lowered, e.g. if used with KDB NMI
-	 * debugger.
-	 */
-	pl011_quiesce_irqs(port);
-
-	status = readw(uap->port.membase + UART01x_FR);
-	if (status & UART01x_FR_RXFE)
-		return NO_POLL_CHAR;
-
-	return readw(uap->port.membase + UART01x_DR);
-}
-
-static void pl011_put_poll_char(struct uart_port *port,
-			 unsigned char ch)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-
-	while (readw(uap->port.membase + UART01x_FR) & UART01x_FR_TXFF)
-		barrier();
-
-	writew(ch, uap->port.membase + UART01x_DR);
-}
-
-#endif /* CONFIG_CONSOLE_POLL */
-
-static int pl011_hwinit(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	int retval;
-
-	/* Optionaly enable pins to be muxed in and configured */
-	pinctrl_pm_select_default_state(port->dev);
-
-	/*
-	 * Try to enable the clock producer.
-	 */
-	retval = clk_prepare_enable(uap->clk);
-	if (retval)
-		return retval;
-
-	uap->port.uartclk = clk_get_rate(uap->clk);
-
-	/* Clear pending error and receive interrupts */
-	writew(UART011_OEIS | UART011_BEIS | UART011_PEIS | UART011_FEIS |
-	       UART011_RTIS | UART011_RXIS, uap->port.membase + UART011_ICR);
-
-	/*
-	 * Save interrupts enable mask, and enable RX interrupts in case if
-	 * the interrupt is used for NMI entry.
-	 */
-	uap->im = readw(uap->port.membase + UART011_IMSC);
-	writew(UART011_RTIM | UART011_RXIM, uap->port.membase + UART011_IMSC);
-
-	if (dev_get_platdata(uap->port.dev)) {
-		struct amba_pl011_data *plat;
-
-		plat = dev_get_platdata(uap->port.dev);
-		if (plat->init)
-			plat->init();
-	}
-	return 0;
-}
-
-static void pl011_write_lcr_h(struct uart_amba_port *uap, unsigned int lcr_h)
-{
-	writew(lcr_h, uap->port.membase + uap->lcrh_rx);
-	if (uap->lcrh_rx != uap->lcrh_tx) {
-		int i;
-		/*
-		 * Wait 10 PCLKs before writing LCRH_TX register,
-		 * to get this delay write read only register 10 times
-		 */
-		for (i = 0; i < 10; ++i)
-			writew(0xff, uap->port.membase + UART011_MIS);
-		writew(lcr_h, uap->port.membase + uap->lcrh_tx);
-	}
-}
-
-static int pl011_allocate_irq(struct uart_amba_port *uap)
-{
-	writew(uap->im, uap->port.membase + UART011_IMSC);
-
-	return request_irq(uap->port.irq, pl011_int, 0, "uart-pl011", uap);
-}
-
-/*
- * Enable interrupts, only timeouts when using DMA
- * if initial RX DMA job failed, start in interrupt mode
- * as well.
- */
-static void pl011_enable_interrupts(struct uart_amba_port *uap)
-{
-	spin_lock_irq(&uap->port.lock);
-
-	/* Clear out any spuriously appearing RX interrupts */
-	writew(UART011_RTIS | UART011_RXIS,
-	       uap->port.membase + UART011_ICR);
-	uap->im = UART011_RTIM;
-	if (!pl011_dma_rx_running(uap))
-		uap->im |= UART011_RXIM;
-	writew(uap->im, uap->port.membase + UART011_IMSC);
-	spin_unlock_irq(&uap->port.lock);
-}
-
-static int pl011_startup(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned int cr;
-	int retval;
-
-	retval = pl011_hwinit(port);
-	if (retval)
-		goto clk_dis;
-
-	retval = pl011_allocate_irq(uap);
-	if (retval)
-		goto clk_dis;
-
-	writew(uap->vendor->ifls, uap->port.membase + UART011_IFLS);
-
-	spin_lock_irq(&uap->port.lock);
-
-	/* restore RTS and DTR */
-	cr = uap->old_cr & (UART011_CR_RTS | UART011_CR_DTR);
-	cr |= UART01x_CR_UARTEN | UART011_CR_RXE | UART011_CR_TXE;
-	writew(cr, uap->port.membase + UART011_CR);
-
-	spin_unlock_irq(&uap->port.lock);
-
-	/*
-	 * initialise the old status of the modem signals
-	 */
-	uap->old_status = readw(uap->port.membase + UART01x_FR) & UART01x_FR_MODEM_ANY;
-
-	/* Startup DMA */
-	pl011_dma_startup(uap);
-
-	pl011_enable_interrupts(uap);
-
-	return 0;
-
- clk_dis:
-	clk_disable_unprepare(uap->clk);
-	return retval;
-}
-
-static int sbsa_uart_startup(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-		container_of(port, struct uart_amba_port, port);
-	int retval;
-
-	retval = pl011_hwinit(port);
-	if (retval)
-		return retval;
-
-	retval = pl011_allocate_irq(uap);
-	if (retval)
-		return retval;
-
-	/* The SBSA UART does not support any modem status lines. */
-	uap->old_status = 0;
-
-	pl011_enable_interrupts(uap);
-
-	return 0;
-}
-
-static void pl011_shutdown_channel(struct uart_amba_port *uap,
-					unsigned int lcrh)
-{
-      unsigned long val;
-
-      val = readw(uap->port.membase + lcrh);
-      val &= ~(UART01x_LCRH_BRK | UART01x_LCRH_FEN);
-      writew(val, uap->port.membase + lcrh);
-}
-
-/*
- * disable the port. It should not disable RTS and DTR.
- * Also RTS and DTR state should be preserved to restore
- * it during startup().
- */
-static void pl011_disable_uart(struct uart_amba_port *uap)
-{
-	unsigned int cr;
-
-	uap->autorts = false;
-	spin_lock_irq(&uap->port.lock);
-	cr = readw(uap->port.membase + UART011_CR);
-	uap->old_cr = cr;
-	cr &= UART011_CR_RTS | UART011_CR_DTR;
-	cr |= UART01x_CR_UARTEN | UART011_CR_TXE;
-	writew(cr, uap->port.membase + UART011_CR);
-	spin_unlock_irq(&uap->port.lock);
-
-	/*
-	 * disable break condition and fifos
-	 */
-	pl011_shutdown_channel(uap, uap->lcrh_rx);
-	if (uap->lcrh_rx != uap->lcrh_tx)
-		pl011_shutdown_channel(uap, uap->lcrh_tx);
-}
-
-static void pl011_disable_interrupts(struct uart_amba_port *uap)
-{
-	spin_lock_irq(&uap->port.lock);
-
-	/* mask all interrupts and clear all pending ones */
-	uap->im = 0;
-	writew(uap->im, uap->port.membase + UART011_IMSC);
-	writew(0xffff, uap->port.membase + UART011_ICR);
-
-	spin_unlock_irq(&uap->port.lock);
-}
-
-static void pl011_shutdown(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-		container_of(port, struct uart_amba_port, port);
-
-	pl011_disable_interrupts(uap);
-
-	pl011_dma_shutdown(uap);
-
-	free_irq(uap->port.irq, uap);
-
-	pl011_disable_uart(uap);
-
-	/*
-	 * Shut down the clock producer
-	 */
-	clk_disable_unprepare(uap->clk);
-	/* Optionally let pins go into sleep states */
-	pinctrl_pm_select_sleep_state(port->dev);
-
-	if (dev_get_platdata(uap->port.dev)) {
-		struct amba_pl011_data *plat;
-
-		plat = dev_get_platdata(uap->port.dev);
-		if (plat->exit)
-			plat->exit();
-	}
-
-	if (uap->port.ops->flush_buffer)
-		uap->port.ops->flush_buffer(port);
-}
-
-static void sbsa_uart_shutdown(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-		container_of(port, struct uart_amba_port, port);
-
-	pl011_disable_interrupts(uap);
-
-	free_irq(uap->port.irq, uap);
-
-	if (uap->port.ops->flush_buffer)
-		uap->port.ops->flush_buffer(port);
-}
-
-static void
-pl011_setup_status_masks(struct uart_port *port, struct ktermios *termios)
-{
-	port->read_status_mask = UART011_DR_OE | 255;
-	if (termios->c_iflag & INPCK)
-		port->read_status_mask |= UART011_DR_FE | UART011_DR_PE;
-	if (termios->c_iflag & (IGNBRK | BRKINT | PARMRK))
-		port->read_status_mask |= UART011_DR_BE;
-
-	/*
-	 * Characters to ignore
-	 */
-	port->ignore_status_mask = 0;
-	if (termios->c_iflag & IGNPAR)
-		port->ignore_status_mask |= UART011_DR_FE | UART011_DR_PE;
-	if (termios->c_iflag & IGNBRK) {
-		port->ignore_status_mask |= UART011_DR_BE;
-		/*
-		 * If we're ignoring parity and break indicators,
-		 * ignore overruns too (for real raw support).
-		 */
-		if (termios->c_iflag & IGNPAR)
-			port->ignore_status_mask |= UART011_DR_OE;
-	}
-
-	/*
-	 * Ignore all characters if CREAD is not set.
-	 */
-	if ((termios->c_cflag & CREAD) == 0)
-		port->ignore_status_mask |= UART_DUMMY_DR_RX;
-}
-
-static void
-pl011_set_termios(struct uart_port *port, struct ktermios *termios,
-		     struct ktermios *old)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned int lcr_h, old_cr;
-	unsigned long flags;
-	unsigned int baud, quot, clkdiv;
-
-	if (uap->vendor->oversampling)
-		clkdiv = 8;
-	else
-		clkdiv = 16;
-
-	/*
-	 * Ask the core to calculate the divisor for us.
-	 */
-	baud = uart_get_baud_rate(port, termios, old, 0,
-				  port->uartclk / clkdiv);
-#ifdef CONFIG_DMA_ENGINE
-	/*
-	 * Adjust RX DMA polling rate with baud rate if not specified.
-	 */
-	if (uap->dmarx.auto_poll_rate)
-		uap->dmarx.poll_rate = DIV_ROUND_UP(10000000, baud);
-#endif
-
-	if (baud > port->uartclk/16)
-		quot = DIV_ROUND_CLOSEST(port->uartclk * 8, baud);
-	else
-		quot = DIV_ROUND_CLOSEST(port->uartclk * 4, baud);
-
-	switch (termios->c_cflag & CSIZE) {
-	case CS5:
-		lcr_h = UART01x_LCRH_WLEN_5;
-		break;
-	case CS6:
-		lcr_h = UART01x_LCRH_WLEN_6;
-		break;
-	case CS7:
-		lcr_h = UART01x_LCRH_WLEN_7;
-		break;
-	default: // CS8
-		lcr_h = UART01x_LCRH_WLEN_8;
-		break;
-	}
-	if (termios->c_cflag & CSTOPB)
-		lcr_h |= UART01x_LCRH_STP2;
-	if (termios->c_cflag & PARENB) {
-		lcr_h |= UART01x_LCRH_PEN;
-		if (!(termios->c_cflag & PARODD))
-			lcr_h |= UART01x_LCRH_EPS;
-	}
-	if (uap->fifosize > 1)
-		lcr_h |= UART01x_LCRH_FEN;
-
-	spin_lock_irqsave(&port->lock, flags);
-
-	/*
-	 * Update the per-port timeout.
-	 */
-	uart_update_timeout(port, termios->c_cflag, baud);
-
-	pl011_setup_status_masks(port, termios);
-
-	if (UART_ENABLE_MS(port, termios->c_cflag))
-		pl011_enable_ms(port);
-
-	/* first, disable everything */
-	old_cr = readw(port->membase + UART011_CR);
-	writew(0, port->membase + UART011_CR);
-
-	if (termios->c_cflag & CRTSCTS) {
-		if (old_cr & UART011_CR_RTS)
-			old_cr |= UART011_CR_RTSEN;
-
-		old_cr |= UART011_CR_CTSEN;
-		uap->autorts = true;
-	} else {
-		old_cr &= ~(UART011_CR_CTSEN | UART011_CR_RTSEN);
-		uap->autorts = false;
-	}
-
-	if (uap->vendor->oversampling) {
-		if (baud > port->uartclk / 16)
-			old_cr |= ST_UART011_CR_OVSFACT;
-		else
-			old_cr &= ~ST_UART011_CR_OVSFACT;
-	}
-
-	/*
-	 * Workaround for the ST Micro oversampling variants to
-	 * increase the bitrate slightly, by lowering the divisor,
-	 * to avoid delayed sampling of start bit at high speeds,
-	 * else we see data corruption.
-	 */
-	if (uap->vendor->oversampling) {
-		if ((baud >= 3000000) && (baud < 3250000) && (quot > 1))
-			quot -= 1;
-		else if ((baud > 3250000) && (quot > 2))
-			quot -= 2;
-	}
-	/* Set baud rate */
-	writew(quot & 0x3f, port->membase + UART011_FBRD);
-	writew(quot >> 6, port->membase + UART011_IBRD);
-
-	/*
-	 * ----------v----------v----------v----------v-----
-	 * NOTE: lcrh_tx and lcrh_rx MUST BE WRITTEN AFTER
-	 * UART011_FBRD & UART011_IBRD.
-	 * ----------^----------^----------^----------^-----
-	 */
-	pl011_write_lcr_h(uap, lcr_h);
-	writew(old_cr, port->membase + UART011_CR);
-
-	spin_unlock_irqrestore(&port->lock, flags);
-}
-
-static void
-sbsa_uart_set_termios(struct uart_port *port, struct ktermios *termios,
-		      struct ktermios *old)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	unsigned long flags;
-
-	tty_termios_encode_baud_rate(termios, uap->fixed_baud, uap->fixed_baud);
-
-	/* The SBSA UART only supports 8n1 without hardware flow control. */
-	termios->c_cflag &= ~(CSIZE | CSTOPB | PARENB | PARODD);
-	termios->c_cflag &= ~(CMSPAR | CRTSCTS);
-	termios->c_cflag |= CS8 | CLOCAL;
-
-	spin_lock_irqsave(&port->lock, flags);
-	uart_update_timeout(port, CS8, uap->fixed_baud);
-	pl011_setup_status_masks(port, termios);
-	spin_unlock_irqrestore(&port->lock, flags);
-}
-
-static const char *pl011_type(struct uart_port *port)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-	return uap->port.type == PORT_AMBA ? uap->type : NULL;
-}
-
-/*
- * Configure/autoconfigure the port.
- */
-static void pl011_config_port(struct uart_port *port, int flags)
-{
-	if (flags & UART_CONFIG_TYPE)
-		port->type = PORT_AMBA;
-}
-
-/*
- * verify the new serial_struct (for TIOCSSERIAL).
- */
-static int pl011_verify_port(struct uart_port *port, struct serial_struct *ser)
-{
-	int ret = 0;
-	if (ser->type != PORT_UNKNOWN && ser->type != PORT_AMBA)
-		ret = -EINVAL;
-	if (ser->irq < 0 || ser->irq >= nr_irqs)
-		ret = -EINVAL;
-	if (ser->baud_base < 9600)
-		ret = -EINVAL;
-	if (port->mapbase != (unsigned long) ser->iomem_base)
-		ret = -EINVAL;
-	return ret;
-}
-
-static struct uart_ops amba_pl011_pops = {
-	.tx_empty	= pl011_tx_empty,
-	.set_mctrl	= pl011_set_mctrl,
-	.get_mctrl	= pl011_get_mctrl,
-	.stop_tx	= pl011_stop_tx,
-	.start_tx	= pl011_start_tx,
-	.stop_rx	= pl011_stop_rx,
-	.enable_ms	= pl011_enable_ms,
-	.break_ctl	= pl011_break_ctl,
-	.startup	= pl011_startup,
-	.shutdown	= pl011_shutdown,
-	.flush_buffer	= pl011_dma_flush_buffer,
-	.set_termios	= pl011_set_termios,
-	.type		= pl011_type,
-	.config_port	= pl011_config_port,
-	.verify_port	= pl011_verify_port,
-#ifdef CONFIG_CONSOLE_POLL
-	.poll_init     = pl011_hwinit,
-	.poll_get_char = pl011_get_poll_char,
-	.poll_put_char = pl011_put_poll_char,
-#endif
-};
-
-static void sbsa_uart_set_mctrl(struct uart_port *port, unsigned int mctrl)
-{
-}
-
-static unsigned int sbsa_uart_get_mctrl(struct uart_port *port)
-{
-	return 0;
-}
-
-static const struct uart_ops sbsa_uart_pops = {
-	.tx_empty	= pl011_tx_empty,
-	.set_mctrl	= sbsa_uart_set_mctrl,
-	.get_mctrl	= sbsa_uart_get_mctrl,
-	.stop_tx	= pl011_stop_tx,
-	.start_tx	= pl011_start_tx,
-	.stop_rx	= pl011_stop_rx,
-	.startup	= sbsa_uart_startup,
-	.shutdown	= sbsa_uart_shutdown,
-	.set_termios	= sbsa_uart_set_termios,
-	.type		= pl011_type,
-	.config_port	= pl011_config_port,
-	.verify_port	= pl011_verify_port,
-#ifdef CONFIG_CONSOLE_POLL
-	.poll_init     = pl011_hwinit,
-	.poll_get_char = pl011_get_poll_char,
-	.poll_put_char = pl011_put_poll_char,
-#endif
-};
-
-static struct uart_amba_port *amba_ports[UART_NR];
-
-#ifdef CONFIG_SERIAL_AMBA_PL011_CONSOLE
-
-static void pl011_console_putchar(struct uart_port *port, int ch)
-{
-	struct uart_amba_port *uap =
-	    container_of(port, struct uart_amba_port, port);
-
-	while (readw(uap->port.membase + UART01x_FR) & UART01x_FR_TXFF)
-		barrier();
-	writew(ch, uap->port.membase + UART01x_DR);
-}
-
-static void
-pl011_console_write(struct console *co, const char *s, unsigned int count)
-{
-	struct uart_amba_port *uap = amba_ports[co->index];
-	unsigned int status, old_cr = 0, new_cr;
-	unsigned long flags;
-	int locked = 1;
-
-	clk_enable(uap->clk);
-
-	/*
-	 * local_irq_save(flags);
-	 *
-	 * This local_irq_save() is nonsense. If we come in via sysrq
-	 * handling then interrupts are already disabled. Aside of
-	 * that the port.sysrq check is racy on SMP regardless.
-	*/
-	if (uap->port.sysrq)
-		locked = 0;
-	else if (oops_in_progress)
-		locked = spin_trylock_irqsave(&uap->port.lock, flags);
-	else
-		spin_lock_irqsave(&uap->port.lock, flags);
-
-	/*
-	 *	First save the CR then disable the interrupts
-	 */
-	if (!uap->vendor->always_enabled) {
-		old_cr = readw(uap->port.membase + UART011_CR);
-		new_cr = old_cr & ~UART011_CR_CTSEN;
-		new_cr |= UART01x_CR_UARTEN | UART011_CR_TXE;
-		writew(new_cr, uap->port.membase + UART011_CR);
-	}
-
-	uart_console_write(&uap->port, s, count, pl011_console_putchar);
-
-	/*
-	 *	Finally, wait for transmitter to become empty
-	 *	and restore the TCR
-	 */
-	do {
-		status = readw(uap->port.membase + UART01x_FR);
-	} while (status & UART01x_FR_BUSY);
-	if (!uap->vendor->always_enabled)
-		writew(old_cr, uap->port.membase + UART011_CR);
-
-	if (locked)
-		spin_unlock_irqrestore(&uap->port.lock, flags);
-
-	clk_disable(uap->clk);
-}
-
-static void __init
-pl011_console_get_options(struct uart_amba_port *uap, int *baud,
-			     int *parity, int *bits)
-{
-	if (readw(uap->port.membase + UART011_CR) & UART01x_CR_UARTEN) {
-		unsigned int lcr_h, ibrd, fbrd;
-
-		lcr_h = readw(uap->port.membase + uap->lcrh_tx);
-
-		*parity = 'n';
-		if (lcr_h & UART01x_LCRH_PEN) {
-			if (lcr_h & UART01x_LCRH_EPS)
-				*parity = 'e';
-			else
-				*parity = 'o';
-		}
-
-		if ((lcr_h & 0x60) == UART01x_LCRH_WLEN_7)
-			*bits = 7;
-		else
-			*bits = 8;
-
-		ibrd = readw(uap->port.membase + UART011_IBRD);
-		fbrd = readw(uap->port.membase + UART011_FBRD);
-
-		*baud = uap->port.uartclk * 4 / (64 * ibrd + fbrd);
-
-		if (uap->vendor->oversampling) {
-			if (readw(uap->port.membase + UART011_CR)
-				  & ST_UART011_CR_OVSFACT)
-				*baud *= 2;
-		}
-	}
-}
-
-static int __init pl011_console_setup(struct console *co, char *options)
-{
-	struct uart_amba_port *uap;
-	int baud = 38400;
-	int bits = 8;
-	int parity = 'n';
-	int flow = 'n';
-	int ret;
-
-	/*
-	 * Check whether an invalid uart number has been specified, and
-	 * if so, search for the first available port that does have
-	 * console support.
-	 */
-	if (co->index >= UART_NR)
-		co->index = 0;
-	uap = amba_ports[co->index];
-	if (!uap)
-		return -ENODEV;
-
-	/* Allow pins to be muxed in and configured */
-	pinctrl_pm_select_default_state(uap->port.dev);
-
-	ret = clk_prepare(uap->clk);
-	if (ret)
-		return ret;
-
-	if (dev_get_platdata(uap->port.dev)) {
-		struct amba_pl011_data *plat;
-
-		plat = dev_get_platdata(uap->port.dev);
-		if (plat->init)
-			plat->init();
-	}
-
-	uap->port.uartclk = clk_get_rate(uap->clk);
-
-	if (uap->vendor->fixed_options) {
-		baud = uap->fixed_baud;
-	} else {
-		if (options)
-			uart_parse_options(options,
-					   &baud, &parity, &bits, &flow);
-		else
-			pl011_console_get_options(uap, &baud, &parity, &bits);
-	}
-
-	return uart_set_options(&uap->port, co, baud, parity, bits, flow);
-}
-
-static struct uart_driver amba_reg;
-static struct console amba_console = {
-	.name		= "ttyAMA",
-	.write		= pl011_console_write,
-	.device		= uart_console_device,
-	.setup		= pl011_console_setup,
-	.flags		= CON_PRINTBUFFER,
-	.index		= -1,
-	.data		= &amba_reg,
-};
-
-#define AMBA_CONSOLE	(&amba_console)
-
-static void pl011_putc(struct uart_port *port, int c)
-{
-	while (readl(port->membase + UART01x_FR) & UART01x_FR_TXFF)
-		;
-	writeb(c, port->membase + UART01x_DR);
-	while (readl(port->membase + UART01x_FR) & UART01x_FR_BUSY)
-		;
-}
-
-static void pl011_early_write(struct console *con, const char *s, unsigned n)
-{
-	struct earlycon_device *dev = con->data;
-
-	uart_console_write(&dev->port, s, n, pl011_putc);
-}
-
-static int __init pl011_early_console_setup(struct earlycon_device *device,
-					    const char *opt)
-{
-	if (!device->port.membase)
-		return -ENODEV;
-
-	device->con->write = pl011_early_write;
-	return 0;
-}
-EARLYCON_DECLARE(pl011, pl011_early_console_setup);
-OF_EARLYCON_DECLARE(pl011, "arm,pl011", pl011_early_console_setup);
-
-#else
-#define AMBA_CONSOLE	NULL
-#endif
-
-static struct uart_driver amba_reg = {
-	.owner			= THIS_MODULE,
-	.driver_name		= "ttyAMA",
-	.dev_name		= "ttyAMA",
-	.major			= SERIAL_AMBA_MAJOR,
-	.minor			= SERIAL_AMBA_MINOR,
-	.nr			= UART_NR,
-	.cons			= AMBA_CONSOLE,
-};
-
-static int pl011_probe_dt_alias(int index, struct device *dev)
-{
-	struct device_node *np;
-	static bool seen_dev_with_alias = false;
-	static bool seen_dev_without_alias = false;
-	int ret = index;
-
-	if (!IS_ENABLED(CONFIG_OF))
-		return ret;
-
-	np = dev->of_node;
-	if (!np)
-		return ret;
-
-	ret = of_alias_get_id(np, "serial");
-	if (IS_ERR_VALUE(ret)) {
-		seen_dev_without_alias = true;
-		ret = index;
-	} else {
-		seen_dev_with_alias = true;
-		if (ret >= ARRAY_SIZE(amba_ports) || amba_ports[ret] != NULL) {
-			dev_warn(dev, "requested serial port %d  not available.\n", ret);
-			ret = index;
-		}
-	}
-
-	if (seen_dev_with_alias && seen_dev_without_alias)
-		dev_warn(dev, "aliased and non-aliased serial devices found in device tree. Serial port enumeration may be unpredictable.\n");
-
-	return ret;
-}
-
-/* unregisters the driver also if no more ports are left */
-static void pl011_unregister_port(struct uart_amba_port *uap)
-{
-	int i;
-	bool busy = false;
-
-	for (i = 0; i < ARRAY_SIZE(amba_ports); i++) {
-		if (amba_ports[i] == uap)
-			amba_ports[i] = NULL;
-		else if (amba_ports[i])
-			busy = true;
-	}
-	pl011_dma_remove(uap);
-	if (!busy)
-		uart_unregister_driver(&amba_reg);
-}
-
-static int pl011_find_free_port(void)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(amba_ports); i++)
-		if (amba_ports[i] == NULL)
-			return i;
-
-	return -EBUSY;
-}
-
-static int pl011_setup_port(struct device *dev, struct uart_amba_port *uap,
-			    struct resource *mmiobase, int index)
-{
-	void __iomem *base;
-
-	base = devm_ioremap_resource(dev, mmiobase);
-	if (IS_ERR(base))
-		return PTR_ERR(base);
-
-	index = pl011_probe_dt_alias(index, dev);
-
-	uap->old_cr = 0;
-	uap->port.dev = dev;
-	uap->port.mapbase = mmiobase->start;
-	uap->port.membase = base;
-	uap->port.iotype = UPIO_MEM;
-	uap->port.fifosize = uap->fifosize;
-	uap->port.flags = UPF_BOOT_AUTOCONF;
-	uap->port.line = index;
-	spin_lock_init(&uap->port.lock);
-
-	amba_ports[index] = uap;
-
-	return 0;
-}
-
-static int pl011_register_port(struct uart_amba_port *uap)
-{
-	int ret, i;
-
-	/* Ensure interrupts from this UART are masked and cleared */
-	writew(0, uap->port.membase + UART011_IMSC);
-	writew(0xffff, uap->port.membase + UART011_ICR);
-
-	if (!amba_reg.state) {
-		ret = uart_register_driver(&amba_reg);
-		if (ret < 0) {
-			dev_err(uap->port.dev,
-				"Failed to register AMBA-PL011 driver\n");
-			for (i = 0; i < ARRAY_SIZE(amba_ports); i++)
-				if (amba_ports[i] == uap)
-					amba_ports[i] = NULL;
-			return ret;
-		}
-	}
-
-	ret = uart_add_one_port(&amba_reg, &uap->port);
-	if (ret)
-		pl011_unregister_port(uap);
-
-	return ret;
-}
-
-static int pl011_probe(struct amba_device *dev, const struct amba_id *id)
-{
-	struct uart_amba_port *uap;
-	struct vendor_data *vendor = id->data;
-	int portnr, ret;
-
-	portnr = pl011_find_free_port();
-	if (portnr < 0)
-		return portnr;
-
-	uap = devm_kzalloc(&dev->dev, sizeof(struct uart_amba_port),
-			   GFP_KERNEL);
-	if (!uap)
-		return -ENOMEM;
-
-	uap->clk = devm_clk_get(&dev->dev, NULL);
-	if (IS_ERR(uap->clk))
-		return PTR_ERR(uap->clk);
-
-	uap->vendor = vendor;
-	uap->lcrh_rx = vendor->lcrh_rx;
-	uap->lcrh_tx = vendor->lcrh_tx;
-	uap->fifosize = vendor->get_fifosize(dev);
-	uap->port.irq = dev->irq[0];
-	uap->port.ops = &amba_pl011_pops;
-
-	snprintf(uap->type, sizeof(uap->type), "PL011 rev%u", amba_rev(dev));
-
-	ret = pl011_setup_port(&dev->dev, uap, &dev->res, portnr);
-	if (ret)
-		return ret;
-
-	amba_set_drvdata(dev, uap);
-
-	return pl011_register_port(uap);
-}
-
-static int pl011_remove(struct amba_device *dev)
-{
-	struct uart_amba_port *uap = amba_get_drvdata(dev);
-
-	uart_remove_one_port(&amba_reg, &uap->port);
-	pl011_unregister_port(uap);
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int pl011_suspend(struct device *dev)
-{
-	struct uart_amba_port *uap = dev_get_drvdata(dev);
-
-	if (!uap)
-		return -EINVAL;
-
-	return uart_suspend_port(&amba_reg, &uap->port);
-}
-
-static int pl011_resume(struct device *dev)
-{
-	struct uart_amba_port *uap = dev_get_drvdata(dev);
-
-	if (!uap)
-		return -EINVAL;
-
-	return uart_resume_port(&amba_reg, &uap->port);
-}
-#endif
-
-static SIMPLE_DEV_PM_OPS(pl011_dev_pm_ops, pl011_suspend, pl011_resume);
-
-static int sbsa_uart_probe(struct platform_device *pdev)
-{
-	struct uart_amba_port *uap;
-	struct resource *r;
-	int portnr, ret;
-	int baudrate;
-
-	/*
-	 * Check the mandatory baud rate parameter in the DT node early
-	 * so that we can easily exit with the error.
-	 */
-	if (pdev->dev.of_node) {
-		struct device_node *np = pdev->dev.of_node;
-
-		ret = of_property_read_u32(np, "current-speed", &baudrate);
-		if (ret)
-			return ret;
-	} else {
-		baudrate = 115200;
-	}
-
-	portnr = pl011_find_free_port();
-	if (portnr < 0)
-		return portnr;
-
-	uap = devm_kzalloc(&pdev->dev, sizeof(struct uart_amba_port),
-			   GFP_KERNEL);
-	if (!uap)
-		return -ENOMEM;
-
-	uap->vendor	= &vendor_sbsa;
-	uap->fifosize	= 32;
-	uap->port.irq	= platform_get_irq(pdev, 0);
-	uap->port.ops	= &sbsa_uart_pops;
-	uap->fixed_baud = baudrate;
-
-	snprintf(uap->type, sizeof(uap->type), "SBSA");
-
-	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-
-	ret = pl011_setup_port(&pdev->dev, uap, r, portnr);
-	if (ret)
-		return ret;
-
-	platform_set_drvdata(pdev, uap);
-
-	return pl011_register_port(uap);
-}
-
-static int sbsa_uart_remove(struct platform_device *pdev)
-{
-	struct uart_amba_port *uap = platform_get_drvdata(pdev);
-
-	uart_remove_one_port(&amba_reg, &uap->port);
-	pl011_unregister_port(uap);
-	return 0;
-}
-
-static const struct of_device_id sbsa_uart_of_match[] = {
-	{ .compatible = "arm,sbsa-uart", },
-	{},
-};
-MODULE_DEVICE_TABLE(of, sbsa_uart_of_match);
-
-static const struct acpi_device_id sbsa_uart_acpi_match[] = {
-	{ "ARMH0011", 0 },
-	{ "ARMHB000", 0 },
-	{},
-};
-MODULE_DEVICE_TABLE(acpi, sbsa_uart_acpi_match);
-
-static struct platform_driver arm_sbsa_uart_platform_driver = {
-	.probe		= sbsa_uart_probe,
-	.remove		= sbsa_uart_remove,
-	.driver	= {
-		.name	= "sbsa-uart",
-		.of_match_table = of_match_ptr(sbsa_uart_of_match),
-		.acpi_match_table = ACPI_PTR(sbsa_uart_acpi_match),
-	},
-};
-
-static struct amba_id pl011_ids[] = {
-	{
-		.id	= 0x00041011,
-		.mask	= 0x000fffff,
-		.data	= &vendor_arm,
-	},
-	{
-		.id	= 0x00380802,
-		.mask	= 0x00ffffff,
-		.data	= &vendor_st,
-	},
-	{ 0, 0 },
-};
-
-MODULE_DEVICE_TABLE(amba, pl011_ids);
-
-static struct amba_driver pl011_driver = {
-	.drv = {
-		.name	= "uart-pl011",
-		.pm	= &pl011_dev_pm_ops,
-	},
-	.id_table	= pl011_ids,
-	.probe		= pl011_probe,
-	.remove		= pl011_remove,
-};
-
-static int __init pl011_init(void)
-{
-	printk(KERN_INFO "Serial: AMBA PL011 UART driver\n");
-
-	if (platform_driver_register(&arm_sbsa_uart_platform_driver))
-		pr_warn("could not register SBSA UART platform driver\n");
-	return amba_driver_register(&pl011_driver);
-}
-
-static void __exit pl011_exit(void)
-{
-	platform_driver_unregister(&arm_sbsa_uart_platform_driver);
-	amba_driver_unregister(&pl011_driver);
-}
-
-/*
- * While this can be a module, if builtin it's most likely the console
- * So let's leave module_exit but move module_init to an earlier place
- */
-arch_initcall(pl011_init);
-module_exit(pl011_exit);
-
-MODULE_AUTHOR("ARM Ltd/Deep Blue Solutions Ltd");
-MODULE_DESCRIPTION("ARM AMBA serial port driver");
-MODULE_LICENSE("GPL");
+04430413341333139340D0A3A84
+:100560003130353732303030333034353336333163
+:100570003330333033303333333033333330333459
+:10058000333133333334333334380D0A3A31303581
+:100590003733303030333033333331333433313336
+:1005A0003333393333333033343335333333323316
+:1005B000333334333333390D0A3A3130353734304D
+:1005C0003030333133333331333433313333333900
+:1005D00033393333304430413341333133303435C0
+:1005E000333635410D0A3A31303537353030303316
+:1005F00032333033303330333333373334333533CE
+:1006000033333233343331333333313333333132C1
+:10061000320D0A3A313035373630303033333330FB
+:100620003334333333333337333333303333333299
+:1006300033333336333333313333333130430D0ACD
+:100640003A31303537373030303333333233333378
+:10065000363338343430443041334133313330343D
+:1006600035333633333330333031460D0A3A313097
+:100670003537383030303330333333373334333544
+:100680003333333233343331333034343330343141
+:1006900033333431333343300D0A3A31303537395F
+:1006A0003030303331333333303334333133343328
+:1006B000333334333533333330333333303333330D
+:1006C00030333345340D0A3A31303537413030302C
+:1006D00033373431333930443041334133313330BF
+:1006E00034353336333433303330333033333330DF
+:1006F00046340D0A3A3130353742303030333333F7
+:1007000037333333373333333733333338333333A8
+:100710003833343335333333323333333441300DBC
+:100720000A3A3130353743303030333333313333B5
+:100730003331333333373333333833333333333481
+:100740003335333433363334343238440D0A3A31A6
+:100750003035374430303030443041334133313339
+:10076000303435333633353330333033303334335C
+:100770003333333331333344390D0A3A313035377B
+:10078000453030303330333433323333333933332D
+:100790003337333333313333333033333334333329
+:1007A0003330333338390D0A3A313035374630304B
+:1007B000303330333333303334333333333336330E
+:1007C00033333033343335333533313044304133E0
+:1007D0004143330D0A3A313035383030303033311F
+:1007E00033303435333633363330333033303333DC
+:1007F00033363330343433303431333334313334CB
+:100800000D0A3A313035383130303033333331330B
+:1008100033333033343331333433333334333633A7
+:10082000333330333333303333333036320D0A3AE7
+:10083000313035383230303033343334333433358B
+:10084000333333313333333033373435304430415D
+:10085000334133313330343536440D0A3A31303593
+:10086000383330303033363337333033303330335E
+:100870003333323333333633333336333433353340
+:10088000333337333332450D0A3A3130353834306B
+:100890003030333033333336333333363333333727
+:1008A000333333383333333433343335333433350C
+:1008B000333331350D0A3A31303538353030303355
+:1008C00032333333313333333033323334304430F3
+:1008D00041334133313330343533363338333035C7
+:1008E000340D0A3A31303538363030303330333029
+:1008F00033333332333333383334333433343335BF
+:1009000033343335333333303333333130370D0A07
+:100910003A313035383730303033333330333433A5
+:100920003233333339333333363333333133333391
+:1009300033333333343330343445350D0A3A3130C0
+:100940003538383030303330343133363331304469
+:10095000304133413331333034353336333933304A
+:1009600033303330333331370D0A3A31303538399B
+:100970003030303431333333313333333033343355
+:10098000313334333433333330333333303333333D
+:1009900030333344370D0A3A313035384130303056
+:1009A000333033333330333333383333333033331B
+:1009B0003330333333303334333333333337333209
+:1009C00043450D0A3A313035384230303033383013
+:1009D00044304133413331333034353336343133BD
+:1009E0003033303330333333303333333045430DEA
+:1009F0000A3A3130353843303030333333323333E1
+:100A000033313333333133333332333333363333B8
+:100A10003337333433353333333741300D0A3A31DA
+:100A20003035384430303033333330333333373389
+:100A30003333373333333733333338333333353377
+:100A40003133393044304144330D0A3A313035388E
+:100A5000453030303341333133303435333634324E
+:100A6000333033303330333433353333333233335D
+:100A70003330333336430D0A3A313035384630306F
+:100A80003033313333333133333337333333383334
+:100A9000333336333433353333333333333334331F
+:100AA0003036460D0A3A3130353930303030343452
+:100AB0003330343133333431333333313333333010
+:100AC00033343435304430413341333133303743BC
+:100AD0000D0A3A313035393130303034353336342F
+:100AE00033333033303330333433313334333433DE
+:100AF000333331333333303333333034320D0A3A16
+:100B000031303539323030303333333033333330C2
+:100B100033333336333333313333333133333332A7
+:100B2000333333383334333634360D0A3A313035D3
+:100B30003933303030333433353333333033333388
+:100B4000343435333330443041334133313330344E
+:100B5000353336343434420D0A3A31303539343095
+:100B60003030333033303330333333313333333168
+:100B7000333433323333333933333337333333313D
+:100B8000333332430D0A3A31303539353030303372
+:100B9000303334333333333330333333303333332D
+:100BA000303333333633333339333333383333310C
+:100BB000340D0A3A3130353936303030333533334D
+:100BC00033373434343630443041334133313330C9
+:100BD00034353336343533303330333030430D0A27
+:100BE0003A313035393730303033333339333333CA
+:100BF00031333333303333333833343333333333C4
+:100C000030333333353334333445460D0A3A3130DB
+:100C100035393830303033303434333034313333A5
+:100C2000343133333331333333303334333133349A
+:100C300033343333333243350D0A3A3130353939B1
+:100C4000303030333033333044304133413331335B
+:100C50003034353336343633303330333033333366
+:100C600030333330420D0A3A31303539413030308B
+:100C70003330333333303333333033333330333350
+:100C80003333333333303334333233333331333339
+:100C900044380D0A3A313035394230303033393347
+:100CA0003333313333333033333334333333323319
+:100CB0003333303333333234363332304443450DFB
+:100CC0000A3A3130353943303030304133413331F5
+:100CD00033303435333733303330333033303334EB
+:100CE0003333333433333333333043350D0A3A310E
+:100CF00030353944303030333333303333333033BD
+:100D000033333833333330333333333333333033B4
+:100D10003433313333333141310D0A3A31303539DF
+:100D2000453030303333333033333336333433328A
+:100D30003333333833333332343133343044304166
+:100D40003341333142450D0A3A313035394630307E
+:100D5000303330343533373331333033303330336D
+:100D60003333363334333133333332333433333351
+:100D70003436430D0A3A313035413030303033317A
+:100D8000333034343330343133333431333333313B
+:100D90003333333033343331333433343333343522
+:100DA0000D0A3A313035413130303033333333335B
+:100DB0003033333330333333303434333230443000
+:100DC000413341333133303435333738360D0A3A15
+:100DD00031303541323030303332333033303330EC
+:100DE00033333333333333383333333733333331CC
+:100DF000333333303333333434420D0A3A31303500
+:100E000041333030303333333033333330333433B2
+:100E1000333333333633343332333333373334339A
+:100E2000343333333233330D0A3A313035413430D1
+:100E3000303033333336333333383337343330446D
+:100E4000304133413331333034353337333333305A
+:100E5000333034370D0A3A313035413530303033A4
+:100E6000303333333233343336333333373334334D
+:100E7000333333333033343331333333303333314B
+:100E8000380D0A3A31303541363030303330333373
+:100E9000333333333330333333373333333733331D
+:100EA00033303334333333333339333330300D0A63
+:100EB0003A313035413730303033303336333930F2
+:100EC00044304133413331333034353337333433C5
+:100ED00030333033303334333232460D0A3A313026
+:100EE00035413830303033333337333034343330C6
+:100EF00034313333343133333331333333303334C8
+:100F000033313334333442460D0A3A3130354139C6
+:100F100030303033333334333333303333333033AF
+:100F2000333330333333303333333033333331349B
+:100F300033333444350D0A3A3130354141303030A5
+:100F40003044304133413331333034353337333546
+:100F5000333033303330333333303334333433336B
+:100F600030350D0A3A313035414230303033363386
+:100F70003333393333333733333338333333323333
+:100F80003333303333333433333331333441380D47
+:100F90000A3A31303541433030303333333333392B
+:100FA000333333303333333033333330333333311C
+:100FB0003336333330443041334146300D0A3A3111
+:100FC00030354144303030333133303435333733DA
+:100FD00036333033303330333333303333333633E7
+:100FE0003333363333333738340D0A3A3130354101
+:100FF00045303030333333393333333333333338AD
+:1010000033333339333333313333333033333338AA
+:101010003333333037380D0A3A31303541463030CA
+:101020003033333330333333393333333433303491
+:101030003433383336304430413341333133303454
+:101040003539370D0A3A31303542303030303337A8
+:10105000333733303330333033303431333334316A
+:101060003333333133333330333433313334353254
+:101070000D0A3A3130354231303030333433333386
+:101080003533333330333333303333333033333337
+:10109000343333333333333337333335360D0A3A5E
+:1010A0003130354232303030333733343333333309
+:1010B00033363335343330443041334133313330D8
+:1010C000343533373338333036300D0A3A31303532
+:1010D00042333030303330333033333337333333DC
+:1010E00039333333303333333233333332333333CF
+:1010F000393334333332460D0A3A313035423430E5
+:1011000030303333333633333333333333373333AE
+:101110003330333333363333333933333333333399
+:10112000333331380D0A3A313035423530303033CF
+:10113000333332333333323044304133413331335C
+:10114000303435333733393330333033303333356C
+:10115000310D0A3A313035423630303033303333A6
+:10116000333233333330333333363333333933334A
+:1011700033373334333333343333333346440D0A64
+:101180003A31303542373030303337333333303320
+:101190003333323334333333303434333034313324
+:1011A00033343133333331333543440D0A3A31303C
+:1011B00035423830303034343044304133413331CB
+:1011C00033303435333734313330333033303333F5
+:1011D00033303334333130410D0A3A31303542390E
+:1011E00030303033343334333333363333333033D6
+:1011F00033333033333330333333373333333733BD
+:1012000033333044340D0A3A3130354241303030D6
+:1012100033333330333333343333333333333333A0
+:101220003333333933333331333134333044304172
+:1012300030340D0A3A3130354242303030334133A8
+:101240003133303435333734323330333033303375
+:101250003333323333333033343335333439370D7A
+:101260000A3A31303542433030303333333333365A
+:101270003333333433333337333333303333333639
+:101280003333333933333334333339360D0A3A3168
+:101290003035424430303033333333333233333309
+:1012A000303333333233333330333033343044300C
+:1012B0004133413331333045430D0A3A3130354201
+:1012C00045303030343533373433333033303330E6
+:1012D00033333336333333393333333733333334D0
+:1012E0003333333335410D0A3A31303542463030ED
+:1012F00030333333343333333933343333333433B8
+:1013000033333034343330343133333431333333B3
+:101310003134370D0A3A31303543303030303333E1
+:101320003330333433313334333433313332304484
+:101330003041334133313330343533373434384648
+:101340000D0A3A31303543313030303330333033B9
+:101350003033333337333333303333333033333362
+:10136000303333333333333338333335440D0A3A80
+:101370003130354332303030333933343335333430
+:10138000333533333334333333313333333033332F
+:10139000333233333334333433420D0A3A31303558
+:1013A0004333303030333433333331343433343007
+:1013B00044304133413331333034353337343533CE
+:1013C000303330333035310D0A3A31303543343033
+:1013D00030303333333233333336333333373333DD
+:1013E00033393334333233333339333333373334BC
+:1013F000333530420D0A3A313035433530303033F1
+:1014000034333533333334333333313333333033AD
+:10141000333332333333333334333433343334319B
+:10142000320D0A3A313035433630303033393333C8
+:10143000304430413341333133303435333734364F
+:1014400033303330333033343336333332370D0ABD
+:101450003A3130354337303030333233333334334D
+:10146000333331333333313333333733303434334D
+:1014700030343133333431333343440D0A3A31306D
+:101480003543383030303331333333303334333124
+:10149000333433343333333833333330333333301B
+:1014A00033303335304431300D0A3A313035433939
+:1014B00030303030413341333133303435333833E9
+:1014C00030333033303330333333303333333333FB
+:1014D00033333845450D0A3A3130354341303030E9
+:1014E00033333339333433353334333533343333BF
+:1014F00033333331333333303334333333343333BF
+:1015000042410D0A3A3130354342303030333333C3
+:101510003733333330333433333333333833333394
+:101520003033363435304430413341333145350D75
+:101530000A3A313035434330303033303435333884
+:10154000333133303330333033333330333333327A
+:101550003333333633333339333339360D0A3A3193
+:101560003035434430303033373334333233333330
+:101570003933333339333433353334333533343328
+:101580003333333331333337460D0A3A3130354351
+:101590004530303033303333333333333338333310
+:1015A00033393336343130443041334133313330E1
+:1015B0003435333841310D0A3A3130354346303015
+:1015C00030333233303330333033343335333333F5
+:1015D00030333333373330343433303431333334DE
+:1015E0003135330D0A3A3130354430303030333311
+:1015F00033313333333033343331333433343333BF
+:10160000333933333330333333303333333036419C
+:101610000D0A3A31303544313030303334333633DB
+:101620003333343433333230443041334133313364
+:10163000303435333833333330333037420D0A3AB0
+:10164000313035443230303033303333333133336B
+:101650003330333333323333333433333339333357
+:10166000333133343332333334370D0A3A31303592
+:101670004433303030333933333339333433353323
+:10168000343336333333343333333133333330332A
+:10169000333330333332370D0A3A31303544343056
+:1016A00030303332333733313044304133413331EA
+:1016B00033303435333833343330333033303333FD
+:1016C000333336300D0A3A3130354435303030332B
+:1016D00033333433333333333333383333333733D0
+:1016E00034333533343336333333383333333146AD
+:1016F000460D0A3A313035443630303033333330EA
+:1017000033333332333333343333333733333331A7
+:1017100033333331333333363336333646440D0ABD
+:101720003A31303544373030303044304133413352
+:10173000313330343533383335333033303330337D
+:1017400030343433303431333331370D0A3A3130B9
+:101750003544383030303431333333313333333050
+:10176000333433313334333433343331333333304C
+:1017700033333330333345300D0A3A313035443961
+:10178000303030333033343332333333393333332F
+:1017900037333433353334333633373333304430FF
+:1017A00041334130390D0A3A31303544413030301F
+:1017B00033313330343533383336333033303330FC
+:1017C00033333338333333313333333033343336E5
+:1017D00042330D0A3A3130354442303030333333FE
+:1017E00032333333323334333533333333333333C8
+:1017F0003833333339333333313333333041430DBB
+:101800000A3A3130354443303030333433333333B4
+:10181000333033333330333433333333333530448D
+:101820003041334133313330343545300D0A3A31AC
+:10183000303544443030303338333733303330335D
+:10184000303333333633333337333333393333335E
+:101850003333333332333338370D0A3A313035448A
+:101860004530303033323334333133343333333340
+:10187000333633333335333333373334333233332F
+:101880003337333037410D0A3A3130354446303042
+:10189000303434333034313333343133363432301E
+:1018A00044304133413331333034353338333833D6
+:1018B0003036420D0A3A3130354530303030333031
+:1018C00033303333333133333330333433313334F0
+:1018D00033343334333233333330333333303732DA
+:1018E0000D0A3A313035453130303033333330330F
+:1018F00033333033333336333333393333333533B0
+:10190000333330333333323333333035340D0A3AF3
+:10191000313035453230303033333332333333388E
+:101920003044304133413331333034353338333957
+:10193000333033303330333337370D0A3A313035C3
+:101940004533303030333033333336333333393358
+:101950003333373333333433333333333333353350
+:10196000333339333331460D0A3A3130354534306B
+:10197000303033313334333333333339333333303B
+:10198000333333343333333533333330333333302A
+:10199000333232340D0A3A31303545353030303358
+:1019A00037304430413341333133303435333834D8
+:1019B00031333033303330333433333333333633FE
+:1019C000420D0A3A31303545363030303333333713
+:1019D00033333339333333323333333233333330D6
+:1019E00033343335333333353334333246380D0AF9
+:1019F0003A313035453730303033303434333034A9
+:101A000031333334313333333133333330333433AD
+:101A100031333334333044304131300D0A3A3130D0
+:101A20003545383030303341333133303435333865
+:101A3000343233303330333033343334333433337C
+:101A400033333330333343330D0A3A31303545398C
+:101A50003030303330333333303334333333333364
+:101A6000363333333633333337333333303333333F
+:101A700036333343440D0A3A313035454130303046
+:101A80003339333333363333333033333332333321
+:101A900033303436333430443041334133313330F2
+:101AA00046390D0A3A31303545423030303435331D
+:101AB00038343333303330333033333332333333FA
+:101AC0003033333336333333393333333738420DEE
+:101AD0000A3A3130354543303030333333343333E1
+:101AE00033333333333633333339333333333333BD
+:101AF0003338333333393334333538410D0A3A31DF
+:101B0000303545443030303333333033333338338A
+:101B1000333331343533383044304133413331336A
+:101B20003034353338343441300D0A3A31303545AC
+:101B30004530303033303330333033333331333377
+:101B40003332333333343334333633333331333363
+:101B50003336333338380D0A3A3130354546303074
+:101B60003033393330343433303431333334313348
+:101B70003333313333333033343331333433343339
+:101B80003434380D0A3A3130354630303030333461
+:101B900033333330333133303044304133413331F8
+:101BA00033303435333834353330333033303935FE
+:101BB0000D0A3A313035463130303033333330333B
+:101BC00033333033333332333333363333333733E2
+:101BD000333339333433323333333934350D0A3A0E
+:101BE00031303546323030303333333733343335B8
+:101BF00033333330333333383333333133333331B7
+:101C0000333333323333333333440D0A3A313035DF
+:101C10004633303030343334313044304133413363
+:101C20003133303435333834363330333033303386
+:101C3000343336333433410D0A3A3130354634309B
+:101C40003030333633343336333333323333333166
+:101C50003333333433333333333333383333333948
+:101C6000333431300D0A3A31303546353030303387
+:101C70003533333331333333303333333133333339
+:101C80003133333332333333363339343230443211
+:101C9000370D0A3A31303546363030303041334135
+:101CA000333133303435333933303330333033300C
+:101CB00033333339333333373334333131330D0A3C
+:101CC0003A313035463730303033333338333034CF
+:101CD00034333034313333343133333331333333DA
+:101CE00030333433313334333443390D0A3A3130FD
+:101CF00035463830303033343335333333303333A3
+:101D0000333033333330333433323434333030449C
+:101D100030413341333132330D0A3A3130354639AF
+:101D2000303030333034353339333133303330338E
+:101D30003033333339333333393334333533333367
+:101D400031333342410D0A3A31303546413030307B
+:101D5000333033333331333333313333333333335A
+:101D60003338333333393334333533333331333337
+:101D700042430D0A3A313035464230303033383341
+:101D80003333313333333133333332333933373021
+:101D90004430413341333133303435333944430DEA
+:101DA0000A3A313035464330303033323330333015
+:101DB00033303333333433333339333333313334F0
+:101DC0003332333333393333333939410D0A3A310E
+:101DD00030354644303030333433353333333133B8
+:101DE00033333833333331333333313333333133C4
+:101DF0003433333333333938410D0A3A31303546D1
+:101E00004530303033333330333333303337333896
+:101E10003044304133413331333034353339333367
+:101E20003330333042390D0A3A313035464630309E
+:101E3000303330333433323330343433303431337D
+:101E40003334313333333133333330333433313369
+:101E50003435320D0A3A31303630303030303334A8
+:101E60003334333633333330333333303333333047
+:101E7000333433333333333833333330333336312E
+:101E80000D0A3A313036303130303033303431347D
+:101E900034304430413341333133303435333933E6
+:101EA000343330333033303334333337300D0A3A50
+:101EB00031303630323030303333333633333337FA
+:101EC00033333339333333333333333233333330E0
+:101ED000333333363333333333340D0A3A31303618
+:101EE00030333030303333333833333337333433C4
+:101EF00035333333313334333333333331333333B3
+:101F0000313335333632340D0A3A313036303430ED
+:101F1000303030443041334133313330343533396C
+:101F20003335333033303330333333323333333488
+:101F3000333335430D0A3A313036303530303033B3
+:101F40003733333331333433323333333933333359
+:101F5000373334333533333331333433333333304E
+:101F6000320D0A3A31303630363030303331333397
+:101F70003331333333333333333833303434333032
+:101F800034313339343130443041334131410D0A39
+:101F90003A31303630373030303331333034353316
+:101FA0003933363330333033303333343133333302
+:101FB00031333333303334333144420D0A3A313024
+:101FC00036303830303033343335333333303333E5
+:101FD00033303333333033333330333333323333DB
+:101FE00033343334333245390D0A3A3130363039EF
+:101FF00030303033333331333333323333333433BC
+:102000003433313334333630443041334133313378
+:1020100030343530410D0A3A3130363041303030CD
+:10202000333933373330333033303333333433347D
+:102030003336333333323333333933333336333365
+:1020400042320D0A3A31303630423030303332339A
+:10205000343333333333323333333033333337334F
+:102060003333383333333033333330333442300D5A
+:102070000A3A31303630433030303333333433334F
+:1020800033333332333134353044304133413331FB
+:102090003330343533393338333043330D0A3A3142
+:1020A0003036304430303033303330333333303304
+:1020B00033333933333330333333303333333633ED
+:1020C0003333393333333239310D0A3A3130363024
+:1020D00045303030333333383334333533343332BF
+:1020E00033333337333034343330343133333431C2
+:1020F0003333333134460D0A3A31303630463030DE
+:102100003033333330333733353044304133413378
+:10211000313330343533393339333033303330338E
+:102120003441340D0A3A31303631303030303331C9
+:102130003334333533333331333333303333333074
+:102140003333333033343331333333393333363459
+:102150000D0A3A31303631313030303333333433A5
+:10216000353334333633343333333333313333333A
+:10217000303334333133333339343433360D0A3A70
+:102180003130363132303030343130443041334107
+:102190003331333034353339343133303330333015
+:1021A000333333343334333535440D0A3A31303632
+:1021B00031333030303334333533333332333333F8
+:1021C00031333333303334333133333339333433DE
+:1021D000343334333532380D0A3A31303631343015
+:1021E00030303334333533333330333333313333C7
+:1021F000333033343331333333393433333330449E
+:10220000304135450D0A3A313036313530303033D2
+:102210004133313330343533393432333033303382
+:10222000303333333533343335333333323333456B
+:10223000420D0A3A313036313630303033303333B4
+:102240003331333333313334333133333337333062
+:1022500034343330343133333431333344430D0A7F
+:102260003A31303631373030303331333333303345
+:10227000343331333433353333333233333337302C
+:1022800044304133413331333033430D0A3A313036
+:10229000363138303030343533393433333033300D
+:1022A0003330333333303333333033333330333409
+:1022B00033313333333943340D0A3A31303631391F
+:1022C00030303033333336333433353333333033E4
+:1022D00033333633333331333333313334333133D0
+:1022E00033333943380D0A3A3130363141303030EA
+:1022F00033343336333433353333333034333335A7
+:102300003044304133413331333034353339343470
+:1023100043440D0A3A3130363142303030333033B5
+:102320003033303333333433333331333333313386
+:102330003333303333333633333332333442420D75
+:102340000A3A31303631433030303335333333307D
+:10235000333433333333333233333330333433364C
+:102360003333333433333331333439460D0A3A316E
+:102370003036314430303033313333333634333424
+:1023800034304430413341333133303435333934F0
+:102390003533303330333039390D0A3A3130363154
+:1023A00045303030333433323333333333343336F0
+:1023B00033333332333333303330343433303431F6
+:1023C0003333343135380D0A3A3130363146303016
+:1023D00030333333313333333033343331333433D5
+:1023E00035333333333333333033333330333333C1
+:1023F0003037420D0A3A31303632303030303330F7
+:10240000343630443041334133313330343533396D
+:102410003436333033303330333333303333374380
+:102420000D0A3A31303632313030303335333333D0
+:102430003033333330333333303333333633333372
+:10244000323334333533333330333435320D0A3AA3
+:10245000313036323230303033333333333233335A
+:10246000333033343336333333343333333133343B
+:10247000333134323334304435360D0A3A31303664
+:10248000323330303030413341333133303435340E
+:10249000313330333033303330333433313334331A
+:1024A000323333333534300D0A3A3130363234304A
+:1024B00030303334333133333330333333353333F4
+:1024C00033303333333033333335333333383334DA
+:1024D000333331450D0A3A3130363235303030330E
+:1024E00033333133333332333333303333333033C5
+:1024F0003333303431333530443041334133313587
+:10250000340D0A3A313036323630303033303435EB
+:102510003431333133303330333033333335333494
+:1025200033333330343433303431333344300D0AC1
+:102530003A3130363237303030343133333331336F
+:10254000333330333433313334333533333334335B
+:1025500033333033333330333345380D0A3A313087
+:102560003632383030303330333333353333333839
+:1025700033333338343434343044304133413331FD
+:1025800033303435343145300D0A3A313036323952
+:102590003030303332333033303330333333313320
+:1025A0003333313333333033333330333333303306
+:1025B00033333245360D0A3A31303632413030301D
+:1025C00033343333333333313333333033333333DF
+:1025D00033333330333333303333333033343335D1
+:1025E00043380D0A3A3130363242303030333333EB
+:1025F0003133343336333934363044304133413378
+:102600003133303435343133333330333043360DB6
+:102610000A3A3130363243303030333033333330AE
+:102620003333333033333330333333303333333086
+:102630003333333033343333333342320D0A3A31A8
+:102640003036324430303033323333333033343356
+:102650003333333338333333313334333133343347
+:102660003333343335333038450D0A3A313036326E
+:1026700045303030343433383436304430413341EF
+:102680003331333034353431333433303330333025
+:102690003330343137460D0A3A3130363246303035
+:1026A0003033333431333333313333333033343302
+:1026B00031333433353333333533333330333333EA
+:1026C0003036370D0A3A313036333030303033332C
+:1026D00033303334333533333331333433363333C8
+:1026E00033303333333033333330333834313531BF
+:1026F0000D0A3A31303633313030303044304133E6
+:102700004133313330343534313335333033303392
+:10271000303333333033333330333338370D0A3AD1
+:102720003130363332303030333133333338333382
+:102730003337333333303333333333343335333365
+:10274000333233333330333333410D0A3A31303699
+:102750003333303030333033343333333333323355
+:102760003333303334333133333338333534353036
+:10277000443041334136330D0A3A31303633343048
+:102780003030333133303435343133363330333025
+:10279000333033333336333333313334333333330A
+:1027A000333430350D0A3A3130363335303030334A
+:1027B00033333733333330333333383333333233E4
+:1027C00033333033333333333333343334333430DC
+:1027D000380D0A3A31303633363030303330343415
+:1027E00033303431333334313333333133393431BB
+:1027F00030443041334133313330343546460D0AAD
+:102800003A31303633373030303431333733303398
+:10281000303330333333303334333133343335338F
+:1028200033333633333330333345350D0A3A3130B1
+:102830003633383030303330333333303333333072
+:102840003334333333333332333333303334333459
+:1028500033333338333345320D0A3A313036333976
+:102860003030303334333333303334333533323341
+:102870003030443041334133313330343534313307
+:1028800038333046420D0A3A313036334130303039
+:10289000333033303333333133343336333333300F
+:1028A0003333333033333330333333303333333004
+:1028B00044300D0A3A31303633423030303333331E
+:1028C00033333433333333333133333330333333DC
+:1028D0003233333330333333303333333042420DDA
+:1028E0000A3A3130363343303030333433343334D2
+:1028F0003332304430413341333133303435343185
+:102900003339333033303330333343420D0A3A31C5
+:102910003036334430303033393334333333333378
+:102920003133333331333333303333333033333381
+:102930003033343332333339330D0A3A31303633AE
+:10294000453030303337333034343330343133334F
+:10295000343133333331333333303334333133344D
+:102960003335333535330D0A3A313036334630306E
+:102970003033373044304133413331333034353400
+:10298000313431333033303330333333373333331F
+:102990003039300D0A3A313036343030303033335C
+:1029A00033303333333033333330333333343334FE
+:1029B00033343333333033343334333333313635E4
+:1029C0000D0A3A3130363431303030333333383326
+:1029D00033333133333330333333363334333333C8
+:1029E000333334333034333044304138390D0A3ADC
+:1029F00031303634323030303341333133303435A6
+:102A000034313432333033303330333333303333A3
+:102A1000333633343332333331340D0A3A313036CE
+:102A2000343330303033323333333033333336337F
+:102A3000333339333333333334333333343332335F
+:102A4000343332333432350D0A3A3130363434309F
+:102A50003030333233333330333333303333333056
+:102A60003333333034353331304430413341333113
+:102A7000333036360D0A3A31303634353030303472
+:102A80003534313433333033303330333333303320
+:102A900033333633343335333433343333333145EE
+:102AA000320D0A3A31303634363030303333333841
+:102AB00033303434333034313333343133333331EE
+:102AC00033333330333433313334333544330D0A15
+:102AD0003A313036343730303033333338333333C0
+:102AE0003033333330333134353044304133413394
+:102AF00031333034353431343446390D0A3A3130DB
+:102B000036343830303033303330333033333330A1
+:102B1000333333313333333833333337333433327E
+:102B200033333331333345330D0A3A3130363439A8
+:102B30003030303332333333303333333033343374
+:102B4000333333333633333337333433353334334A
+:102B500033333343370D0A3A313036344130303075
+:102B6000333233333331343333363044304133410D
+:102B7000333133303435343134353330333033302E
+:102B800044300D0A3A31303634423030303333334A
+:102B90003533333332333433363334333133343300
+:102BA0003533333330333433323333333041420D02
+:102BB0000A3A313036344330303033333330333304
+:102BC00033313333333833333334333433313333D2
+:102BD0003331333333333333333041310D0A3A3108
+:102BE0003036344430303034313436304430413390
+:102BF000413331333034353431343633303330339C
+:102C00003033333330333439300D0A3A31303634DF
+:102C1000453030303331333333353330343433307F
+:102C2000343133333431333333313333333033347A
+:102C30003331333435410D0A3A3130363446303091
+:102C40003033353333333933333330333333303355
+:102C50003333303333333033333336333033393047
+:102C60004439300D0A3A3130363530303030304169
+:102C70003341333133303435343233303330333021
+:102C80003330333333323334333533333332364303
+:102C90000D0A3A3130363531303030333333363354
+:102CA00033333433343334333333303333333633F1
+:102CB000333333333433343333333134350D0A3A29
+:102CC00031303635323030303333333333333334DD
+:102CD00033333334333333303334333333393332C0
+:102CE000304430413341333138300D0A3A313036D7
+:102CF00035333030303330343534323331333033B0
+:102D0000303330333333353333333033333333339A
+:102D1000343333333331380D0A3A313036353430C9
+:102D2000303033303333333033333330333333367F
+:102D30003333333633343332333333303334333263
+:102D4000333432300D0A3A313036353530303033A5
+:102D5000313334333633343331333433353335343C
+:102D6000343044304133413331333034353432320E
+:102D7000300D0A3A31303635363030303332333078
+:102D8000333033303330343433303431333334311F
+:102D900033333331333333303334333145340D0A45
+:102DA0003A313036353730303033343335333433ED
+:102DB00031333333303333333033333330333333EE
+:102DC00030333333303333333046420D0A3A313007
+:102DD00036353830303033333330333333313435C4
+:102DE000343230443041334133313330343534328E
+:102DF00033333330333046310D0A3A3130363539DA
+:102E00003030303330333333383333333733343394
+:102E10003133333331333333333333333033333389
+:102E200030333343450D0A3A313036354130303096
+:102E30003332333333343334333533333331333361
+:102E4000333233333336333433343333333733334A
+:102E500042320D0A3A313036354230303033313378
+:102E6000373331304430413341333133303435340A
+:102E70003233343330333033303333333344460D2D
+:102E80000A3A31303635433030303334333433342A
+:102E900033343333333133333333333433353334FF
+:102EA0003335333433363333333239300D0A3A3134
+:102EB00030363544303030333433353333333933CF
+:102EC00033333233343336333034343330343133D4
+:102ED0003334313335343434350D0A3A3130363504
+:102EE0004530303030443041334133313330343584
+:102EF00034323335333033303330333333313333AB
+:102F00003330333442320D0A3A31303635463030C0
+:102F10003033313334333533343332333333303386
+:102F20003333303333333033333339333333313373
+:102F30003336460D0A3A31303636303030303330A1
+:102F4000333433333333333033333334333333374E
+:102F5000333333303335333430443041334141320D
+:102F60000D0A3A3130363631303030333133303487
+:102F70003534323336333033303330333333313327
+:102F8000333333333333363333333732460D0A3A40
+:102F90003130363632303030333433333333333606
+:102FA00033333336333333393334333233333332E9
+:102FB000333333303334333532450D0A3A3130361A
+:102FC00036333030303333333333333330333333DA
+:102FD0003533343332333233393044304133413393
+:102FE000313330343536310D0A3A313036363430FB
+:102FF00030303432333733303330333033333332AD
+:103000003334333633333336333333373333333088
+:10301000333330390D0A3A313036363530303033CB
+:10302000373333333033333330333433363333336E
+:103030003033303434333034313333343133334557
+:10304000340D0A3A3130363636303030333133339E
+:10305000333033343331333833303044304133411B
+:1030600033313330343534323338333032380D0A7B
+:103070003A31303636373030303330333033343322
+:103080003533343333333333303333333033333313
+:1030900030333333323333333646330D0A3A31303B
+:1030A00036363830303033333336333333353333E9
+:1030B00033373333333033333336333333363334D8
+:1030C00033333334333343430D0A3A3130363639F0
+:1030D00030303033333336333034323044304133B0
+:1030E00041333133303435343233393330333033A4
+:1030F00030333345410D0A3A3130363641303030C5
+:103100003330333333323333333733333330333392
+:103110003330333333303333333233333330333389
+:1031200043370D0A3A31303636423030303334339B
+:103130003333313333333033333336333433333360
+:103140003333323333333433333336333441360D60
+:103150000A3A313036364330303033303044304143
+:10316000334133313330343534323431333033302A
+:103170003330333333313333333943300D0A3A315B
+:103180003036364430303033333331333333363303
+:1031900034333333343333333433313330343433FF
+:1031A0003034313333343136310D0A3A313036363A
+:1031B00045303030333333313333333033343331DC
+:1031C00033343335333433343333333033323331D0
+:1031D0003044304144300D0A3A31303636463030D2
+:1031E00030334133313330343534323432333033A9
+:1031F00030333033333330333333303333333233AC
+:103200003334380D0A3A31303637303030303334D9
+:103210003333333733333331333433363333333279
+:10322000333433363333333133333331333335336C
+:103230000D0A3A31303637313030303330333333B2
+:103240003233343333333333353333333834363343
+:10325000353044304133413331333037440D0A3A4D
+:103260003130363732303030343534323433333035
+:103270003330333033343333333333313333333127
+:10328000333333303333333031410D0A3A31303652
+:103290003733303030333333303333333533333304
+:1032A00030333333383333333133333331333333F0
+:1032B000363333333232410D0A3A31303637343017
+:1032C00030303333333233343336333333373436C9
+:1032D000343130443041334133313330343534329A
+:1032E000343430430D0A3A313036373530303033EC
+:1032F00030333033303333333233343336333333A4
+:103300003633333336333034343330343133334679
+:10331000300D0A3A313036373630303034313333CD
+:10332000333133333330333433313334333533346F
+:1033300033353333333033333330333346310D0A9F
+:103340003A3130363737303030333033333332334D
+:10335000313332304430413341333133303435341A
+:1033600032343533303330333031330D0A3A313083
+:10337000363738303030333433333333333133331B
+:103380003330333333323333333033333330333317
+:1033900033303334333545340D0A3A31303637392A
+:1033A00030303033333331333433363333333033F7
+:1033B00033333033333330333333303333333033E9
+:1033C00033333044390D0A3A3130363741303030FA
+:1033D0003435333330443041334133313330343595
+:1033E00034323436333033303330333433333333B1
+:1033F00043380D0A3A3130363742303030333633C5
+:103400003333303333333533333330333333313392
+:103410003433333333333333333338333341360D8B
+:103420000A3A31303637433030303337333333367E
+:103430003333333033333338333333303333333060
+:103440003334333134323332304441460D0A3A3169
+:10345000303637443030303041334133313330341B
+:103460003534333330333033303330333333373331
+:103470003034343330343137440D0A3A3130363752
+:103480004530303033333431333333313333333009
+:1034900033343331333433353334333633333330F9
+:1034A0003333333037300D0A3A3130363746303027
+:1034B00030333333303333333733333338333333D9
+:1034C000343333333734353335304430413341339B
+:1034D0003139340D0A3A313036383030303033300B
+:1034E00034353433333133303330333033333330B6
+:1034F0003334333533333330333333303333344190
+:103500000D0A3A31303638313030303337333333D7
+:103510003833333335333333373333333033343372
+:10352000333333333033333330333434300D0A3ABA
+:103530003130363832303030333333343333333361
+:10354000333433333330333833373044304133411D
+:10355000333133303435343335420D0A3A31303675
+:103560003833303030333233303330333033333339
+:10357000323333333733333330333333303333331E
+:10358000303333333433370D0A3A31303638343050
+:103590003030333333373333333233333331333300
+:1035A00033323333333033333337333433353333E8
+:1035B000333830460D0A3A31303638353030303312
+:1035C00030343433303431343633303044304133B6
+:1035D00041333133303435343333333330333031B6
+:1035E000300D0A3A313036383630303033303333FC
+:1035F00034313333333133333330333433313334A1
+:1036000033363333333033333330333346350D0AC7
+:103610003A3130363837303030333033333330337B
+:103620003433333334333333333335333333303369
+:1036300033333233333337333345410D0A3A313084
+:10364000363838303030333033363435304430412A
+:103650003341333133303435343333343330333032
+:1036600033303333333046430D0A3A31303638394C
+:103670003030303333333033333334333333373321
+:103680003333313333333133333332333333303312
+:1036900033333243460D0A3A313036384130303018
+:1036A00033333330333333343333333733333330EB
+:1036B00033333331333333333333333733393434D0
+:1036C00041300D0A3A3130363842303030304430F3
+:1036D00041334133313330343534333335333033A0
+:1036E0003033303333333733333333333344360DBE
+:1036F0000A3A3130363843303030333833333336AA
+:10370000333333363333333433333330333333308B
+:103710003333333033333339333338460D0A3A31A8
+:103720003036384430303033393330343433303459
+:103730003133333431333333313333333034323460
+:103740003530443041334138370D0A3A313036385C
+:103750004530303033313330343534333336333031
+:10376000333033303334333133343336333333312E
+:103770003333333036330D0A3A3130363846303051
+:10378000303333333033333330333333373333330E
+:1037900038333333353333333633333330333333F2
+:1037A0003436320D0A3A3130363930303030333336
+:1037B00033303333333033343333333433333333DD
+:1037C000333830443041334133313330343539319B
+:1037D0000D0A3A3130363931303030343333373303
+:1037E00030333033303333333533333330333333B3
+:1037F000323333333733333330333333440D0A3AD0
+:103800003130363932303030333033333330333394
+:103810003332333333303333333233333330333380
+:10382000333433333337333334300D0A3A313036AF
+:103830003933303030333433333337333333383351
+:10384000363334304430413341333133303435341E
+:10385000333338333034320D0A3A3130363934307C
+:10386000303033303330333333353333333633332F
+:10387000333033333336333333303333333033341D
+:10388000333331440D0A3A31303639353030303344
+:1038900034333333303434333034313333343133FD
+:1038A00033333133333330333433313334333645D8
+:1038B000310D0A3A31303639363030303333333225
+:1038C00033363332304430413341333133303435A1
+:1038D00034333339333033303330333332340D0A09
+:1038E0003A313036393730303033303333333033A8
+:1038F0003333303334333333343333333333353397
+:1039000033333033333332333346300D0A3A3130C8
+:103910003639383030303337333333303333333074
+:10392000333333303333333233333330333333326F
+:1039300033333330333345340D0A3A313036393985
+:10394000303030343330443041334133313330342C
+:10395000353433343133303330333033333334333D
+:1039600033333744380D0A3A31303639413030304C
+:103970003333333833333337333333383333333606
+:103980003333333633333330333333383333333005
+:1039900041340D0A3A313036394230303033333326
+:1039A00030333433333334333333333336333333E5
+:1039B0003033333332333033303044304146450DC9
+:1039C0000A3A3130363943303030334133313330D5
+:1039D00034353433343233303330333033333337B8
+:1039E0003333333033333330333336460D0A3A31E1
+:1039F000303639443030303332333333353330348A
+:103A0000343330343133333431333333313333338C
+:103A10003033343331333436340D0A3A31303639B9
+:103A2000453030303336333333333333333033335D
+:103A30003330333333303335343130443041334134
+:103A40003331333042410D0A3A3130363946303065
+:103A5000303435343334333330333033303333333D
+:103A6000303333333233333330333333333333332D
+:103A70003034380D0A3A313036413030303033345A
+:103A80003333333333373333333033333331333307
+:103A90003330333333303333333033333330363200
+:103AA0000D0A3A313036413130303033333334332C
+:103AB00033333233333333333134323044304133C0
+:103AC000413331333034353433343435330D0A3AFD
+:103AD00031303641323030303330333033303334BC
+:103AE000333433333336333333323333333733339F
+:103AF000333833333332333333330D0A3A313036DC
+:103B0000413330303033303333333533333335337F
+:103B10003433333333333733333330333333313375
+:103B2000343333333332340D0A3A313036413430A2
+:103B30003030333033333330343334363044304143
+:103B4000334133313330343534333435333033303B
+:103B5000333031420D0A3A3130364135303030336E
+:103B60003433353334333433303434333034313325
+:103B7000333431333333313333333033343331450A
+:103B8000300D0A3A31303641363030303334333646
+:103B900033333334333333303333333033333330FD
+:103BA00033333331333333363333333246410D0A13
+:103BB0003A313036413730303033303335304430BD
+:103BC00041334133313330343534333436333033A9
+:103BD00030333033333337333430330D0A3A313006
+:103BE0003641383030303336333333373333333292
+:103BF000333433363334333533333331333433368C
+:103C000033333330333343410D0A3A31303641399F
+:103C10003030303330333333303333333033333386
+:103C20003033333333333433333333333133393362
+:103C300035304446310D0A3A31303641413030306A
+:103C40003041334133313330343534343330333031
+:103C5000333033303333333033333331333433333E
+:103C600043410D0A3A31303641423030303333333C
+:103C7000303333333033333330333333343333331C
+:103C80003733333330333333303333333641440D0A
+:103C90000A3A313036414330303033333333333303
+:103CA00033323334333233333339333034343435DD
+:103CB0003331304430413341333142440D0A3A31DB
+:103CC00030364144303030333034353434333133AE
+:103CD00030333033303330343133333431333333C2
+:103CE0003133333330333435430D0A3A31303641D2
+:103CF0004530303033313334333633333335333387
+:103D0000333033333330333333303333333033338F
+:103D10003334333337440D0A3A313036414630308C
+:103D2000303334333333383333333033333336345F
+:103D3000333433304430413341333133303435342C
+:103D40003436410D0A3A3130364230303030333279
+:103D5000333033303330333333323333333133343E
+:103D6000333433333339333433333333333135420C
+:103D70000D0A3A313036423130303033333330335C
+:103D80003433333333333033333330333433323308
+:103D9000333339333433323333333134390D0A3A30
+:103DA00031303642323030303333333033333338DE
+:103DB00033363336304430413341333133303435A8
+:103DC000343433333330333035440D0A3A313036FE
+:103DD00042333030303330333333303333333033B6
+:103DE00034333233333331333333373333333133A3
+:103DF000343332333332450D0A3A313036423430BF
+:103E00003030333933333337333333313333333182
+:103E10003334333133303434333034313333343179
+:103E2000333345390D0A3A3130364235303030338C
+:103E30003134333331304430413341333133303432
+:103E4000353434333433303330333033333330324A
+:103E5000450D0A3A31303642363030303334333162
+:103E60003334333633333336333333303333333021
+:103E700033333330333333303333333446410D0A45
+:103E80003A313036423730303033333330333333F6
+:103E900030333333303333333833343334333333F1
+:103EA00030333333333337333345360D0A3A313019
+:103EB00036423830303030443041334133313330A2
+:103EC00034353434333533303330333033333330C7
+:103ED00033333331333330420D0A3A3130364239DD
+:103EE00030303033393333333633343332333333A2
+:103EF0003433343334333333303333333233333393
+:103F000030333343300D0A3A3130364241303030AD
+:103F10003330333333303333333833343333333371
+:103F20003330333333373335333530443041334135
+:103F300046380D0A3A313036424230303033313370
+:103F40003034353434333633303330333033333345
+:103F50003033333334333333313333333039340D57
+:103F60000A3A313036424330303033333338333429
+:103F70003335333333303334333133333331333018
+:103F80003434333034313333343136430D0A3A313B
+:103F900030364244303030333333313333333033DF
+:103FA00034333133343336333833363044304133BD
+:103FB0004133313330343542410D0A3A31303642E3
+:103FC00045303030343433373330333033303333BB
+:103FD00033373333333033333330333333303333B6
+:103FE0003330333337310D0A3A31303642463030D0
+:103FF000303330333333333333333033333330339D
+:104000003433333334333233333330333333313384
+:104010003437310D0A3A31303643303030303333B3
+:104020003333333033333331333434363044304147
+:10403000334133313330343534343338333036442C
+:104040000D0A3A313036433130303033303330338B
+:104050003333323334333333343334333333303331
+:10406000343334333433353333333334360D0A3A5F
+:104070003130364332303030333333303333333210
+:104080003334333333343333333333303333333004
+:10409000333333303334333333450D0A3A3130362A
+:1040A00043333030303334333634343434304430C6
+:1040B00041334133313330343534343339333033B1
+:1040C000303330333332420D0A3A313036433430F4
+:1040D00030303332333333363334333233343335B1
+:1040E00033333331333433363330343433303431A3
+:1040F000333346340D0A3A313036433530303034BC
+:104100003133333331333333303334333133343386
+:10411000363333333833333330333333303333465A
+:10412000390D0A3A3130364336303030343330448A
+:10413000304133413331333034353434343133303A
+:1041400033303330333333303333333430420D0A8A
+:104150003A3130364337303030333433323334331E
+:104160003633333333333333303333333133333321
+:1041700030333333303333333345420D0A3A313041
+:1041800036433830303033333338333333373334E6
+:1041900033353333333033333334333333303330F5
+:1041A00033383044304131410D0A3A3130364339E9
+:1041B00030303033413331333034353434343233CA
+:1041C00030333033303333333133343333333333C9
+:1041D00036333339370D0A3A3130364341303030D7
+:1041E0003337333433343333333833333332333395
+:1041F000333133333335333333343334333233348D
+:1042000041380D0A3A31303643423030303336339C
+:104210003333333333333033333331333333303475
+:104220003434353044304133413331333044330D4D
+:104230000A3A313036434330303034353434343355
+:10424000333033303330333333303334333133344A
+:104250003335333034343330343135320D0A3A317A
+:104260003036434430303033333431333333313309
+:104270003333303334333133343336333333393308
+:104280003333303333333037380D0A3A3130364335
+:1042900045303030333333303333333033333336E8
+:1042A00033323335304430413341333133303435B8
+:1042B0003434343438460D0A3A31303643463030DF
+:1042C00030333033303330333333323334333233CB
+:1042D00033333033333336333333333333333133B0
+:1042E0003337300D0A3A31303644303030303330E5
+:1042F000333333343333333433333332333433328D
+:104300003333333933343333333433353333344263
+:104310000D0A3A31303644313030303330333333B4
+:104320003434333334304430413341333133303437
+:10433000353434343533303330333035350D0A3A93
+:10434000313036443230303033333330333333313D
+:10435000333333323334333233333334333433352A
+:10436000333333303333333233390D0A3A31303665
+:10437000443330303033333330333333303334330A
+:1043800031333433323334333633333334333333FA
+:10439000353334333432310D0A3A31303644343027
+:1043A00030303339343430443041334133313330B9
+:1043B00034353434343633303330333033303434CE
+:1043C000333031310D0A3A31303644353030303403
+:1043D00031333334313333333133333330333433B4
+:1043E000313334333633343331333333303333458D
+:1043F000440D0A3A313036443630303033303333BE
+:104400003330333333303333333133333330333387
+:1044100033303334333333303335304432410D0AA3
+:104420003A31303644373030303041334133313334
+:104430003034353435333033303330333033333355
+:1044400034333333323333333046350D0A3A313077
+:104450003644383030303333333833333332333318
+:104460003330333333343333333033343332333420
+:1044700033363333333543450D0A3A313036443918
+:10448000303030333333303333333133333330330D
+:1044900033333033343336343134313044304133D4
+:1044A00041333146380D0A3A3130364441303030EC
+:1044B00033303435343533313330333033303333D4
+:1044C00033323334333533343332333333323334BA
+:1044D00039420D0A3A3130364442303030333233CB
+:1044E000343336333333343333333033333331339C
+:1044F0003333303333333033333333333341410D9C
+:104500000A3A313036444330303033383330343483
+:104510003330343133333431343334353044304153
+:104520003341333133303435343536450D0A3A3181
+:10453000303644443030303332333033303330333C
+:10454000333331333333303334333133343336333D
+:104550003433323333333039320D0A3A3130364462
+:10456000453030303333333033333330333333301B
+:104570003334333233333338333333363333333006
+:104580003333333137390D0A3A313036444630301F
+:1045900030333333303333333033383337304430E0
+:1045A00041334133313330343534353333333033C1
+:1045B0003038460D0A3A31303645303030303330FD
+:1045C00033333335333333383334333333333331B5
+:1045D00033333330333433333333333033333534AD
+:1045E0000D0A3A31303645313030303330333333E1
+:1045F0003333333338333433323333333133333388
+:10460000303333333833333330333334330D0A3AC2
+:104610003130364532303030333033373338304450
+:104620003041334133313330343534353334333042
+:10463000333033303333333036300D0A3A3130369D
+:104640004533303030333333343333333233333331
+:10465000303333333233343333333333313333332F
+:10466000303333333832350D0A3A31303645343051
+:10467000303033333339333034343330343133330F
+:104680003431333333313333333033343331343300
+:10469000333244430D0A3A3130364535303030300C
+:1046A00044304133413331333034353435333533AD
+:1046B00030333033303334333633343333333332CF
+:1046C000440D0A3A313036453630303033303333EA
+:1046D00033303333333033333331333433333333B1
+:1046E00033303333333033343335333346460D0AC6
+:1046F0003A31303645373030303331333433363376
+:10470000333330333333333333333433333331337D
+:1047100034333130443041334132440D0A3A313080
+:104720003645383030303331333034353435333644
+:104730003330333033303333333433333330333453
+:1047400033333333333742360D0A3A313036453955
+:104750003030303333333033333331333333383332
+:10476000333330333433313334333233333331331F
+:1047700034333643340D0A3A313036454130303027
+:1047800033333331333333393333333933333330F2
+:1047900033323435304430413341333133303435C2
+:1047A00044350D0A3A3130364542303030343533F5
+:1047B00037333033303330333333373334333233CA
+:1047C0003333343333333133333330333439340DDB
+:1047D0000A3A3130364543303030333133333338B1
+:1047E00033303434333034313333343133333331A1
+:1047F0003333333033343331333436440D0A3A31C2
+:104800003036454430303033363334333433333359
+:104810003033353435304430413341333133303443
+:104820003534353338333039330D0A3A3130364583
+:10483000453030303330333033333330333333304B
+:10484000333333393333333933333330333333372B
+:104850003334333237310D0A3A3130364546303051
+:10486000303333333533333331333333303334331D
+:10487000313334333233333330333433343333330B
+:104880003036410D0A3A313036463030303033332D
+:1048900033333331333730443041334133313330C4
+:1048A00034353435333933303330333033333742C2
+:1048B0000D0A3A313036463130303033303333330D
+:1048C00030333433333334333233343331333333BB
+:1048D000303333333033333333333334440D0A3AE4
+:1048E0003130364632303030333033333330333397
+:1048F000333033343333333333323333333033338E
+:10490000333533333334333133430D0A3A313036B0
+:104910004633303030343230443041334133313338
+:10492000303435343534313330333033303333335E
+:10493000313334333133390D0A3A3130364634307D
+:10494000303033333334333333393330343433303A
+:10495000343133333431333333313333333033342D
+:10496000333145390D0A3A3130364635303030333F
+:104970003433363334333533333330333333303306
+:1049800033333033333330333433353044304135DF
+:10499000320D0A3A31303646363030303341333119
+:1049A00033303435343534323330333033303334DC
+:1049B00033333333333333333330333343370D0A05
+:1049C0003A3130364637303030333733333334339F
+:1049D00033333033333330333333383334333233A8
+:1049E00033333533333330333344450D0A3A3130C2
+:1049F000364638303030333033333332333333307C
+:104A00003333333033333330333133303044304168
+:104A100033413331333033300D0A3A313036463991
+:104A20003030303435343534333330333033303361
+:104A30003433333333333233333330333433353346
+:104A400033333039390D0A3A31303646413030305F
+:104A50003333333133333339333333303334333324
+:104A60003333333333333330333333373333333414
+:104A700041440D0A3A313036464230303033333318
+:104A800030333333303334333634343337304430E7
+:104A90004133413331333034353435343441360DDC
+:104AA0000A3A3130364643303030333033303330E9
+:104AB00033343336333034343330343133333431C8
+:104AC0003333333133333330333437330D0A3A3100
+:104AD0003036464430303033313334333633343388
+:104AE000363333333033333330333333303333339C
+:104AF0003833343332333337460D0A3A31303646A1
+:104B00004530303033353333333034363435304458
+:104B1000304133413331333034353435343533304B
+:104B20003330333036440D0A3A3130364646303071
+:104B3000303333333033333332333333303333334F
+:104B40003033333333333333303334333633333337
+:104B50003136430D0A3A313037303030303033336C
+:104B60003332333333343333333133333334333415
+:104B700033353333333133343336333333303446F0
+:104B80000D0A3A313037303130303034333436304A
+:104B900044304133413331333034353435343633B6
+:104BA000303330333033333330333333460D0A3A16
+:104BB00031303730323030303330333333303333D9
+:104BC00033303333333933333339333333323333AD
+:104BD000333033343333333432460D0A3A313037DD
+:104BE00030333030303335333333313334333133A2
+:104BF0003433313333333933303434333034313484
+:104C0000363333304431360D0A3A313037303430B0
+:104C10003030304133413331333034353436333052
+:104C20003330333033303333343133333331333360
+:104C3000333031350D0A3A3130373035303030339A
+:104C4000343332333333303333333033333330333D
+:104C5000333330333333303334333533333331302C
+:104C6000450D0A3A31303730363030303334333650
+:104C70003333333033333330333333303333333010
+:104C800034323338304430413341333132450D0A08
+:104C90003A313037303730303033303435343633E2
+:104CA00031333033303330333333303333333333E2
+:104CB00034333333333331333343440D0A3A3130F1
+:104CC00037303830303033303333333233333338B6
+:104CD00033333330333333303333333033333336AA
+:104CE00033333332333344360D0A3A3130373039C7
+:104CF0003030303331333333303333333433333391
+:104D00003334333330304430413341333133303452
+:104D100035343644460D0A3A313037304130303080
+:104D20003332333033303330333333303333333063
+:104D30003334333333333334333333303333333245
+:104D400043320D0A3A31303730423030303333336A
+:104D5000303333333033333330333333333333332C
+:104D60003433303434333034313333343138310D3B
+:104D70000A3A313037304330303033333331333324
+:104D800033303436343630443041334133313330CC
+:104D90003435343633333330333039440D0A3A3115
+:104DA00030373044303030333033343332333333D0
+:104DB00030333333313333333033333330333333CE
+:104DC0003033343333333339300D0A3A31303730FE
+:104DD0004530303033393334333533333331333393
+:104DE000333233333330333333303333333033339D
+:104DF0003338333436440D0A3A31303730463030A8
+:104E00003033323337333030443041334133313350
+:104E10003034353436333433303330333033343365
+:104E20003538440D0A3A3130373130303030333391
+:104E30003337333333303333333633333330333341
+:104E40003330333333333333333833333337343826
+:104E50000D0A3A313037313130303033333330337B
+:104E60003333313334333333333330333433313317
+:104E7000333330333333383336333034350D0A3A45
+:104E800031303731323030303044304133413331DA
+:104E900033303435343633353330333033303334E4
+:104EA000333533333330333335450D0A3A31303708
+:104EB00031333030303330333333303333333833CE
+:104EC00033333033343332333333383330343433B1
+:104ED000303431333330350D0A3A313037313430F4
+:104EE000303034313333333133333330333433329E
+:104EF000333333303333333234313334304430416D
+:104F0000334134330D0A3A313037313530303033B4
+:104F10003133303435343633363330333033303365
+:104F20003333303333333033333330333433344546
+:104F3000430D0A3A31303731363030303334333381
+:104F4000333333373333333033333338333333302E
+:104F500033333330333333303333333246320D0A65
+:104F60003A31303731373030303334333333343310
+:104F700035333333303333333133343330304430FB
+:104F800041334133313330343531440D0A3A313015
+:104F900037313830303034363337333033303330E4
+:104FA00033343333333433343334333633333338C5
+:104FB00033333332333342360D0A3A3130373139F5
+:104FC00030303033313334333533333333333333B9
+:104FD000383333333233343335333333313333339C
+:104FE00034333342380D0A3A3130373141303030C2
+:104FF000333033333330333433363436333730446D
+:105000003041334133313330343534363338333053
+:1050100043300D0A3A31303731423030303330339B
+:105020003033333331333333323333333033333359
+:105030003233333332333034343330343139340D66
+:105040000A3A31303731433030303333343133334F
+:105050003331333333303334333233333330333328
+:105060003333333333303333333038460D0A3A3148
+:105070003037314430303033333330343133333000
+:1050800044304133413331333034353436333933BE
+:105090003033303330333339460D0A3A313037311B
+:1050A00045303030333033343333333333333333C9
+:1050B00033303333333133333335333333303333C6
+:1050C0003330333337410D0A3A31303731463030DF
+:1050D00030333233333336333333333333333233A2
+:1050E0003333303334333333333334333333303394
+:1050F0003336320D0A3A31303732303030303331D6
+:105100003044304133413331333034353436343147
+:105110003330333033303333333133343336373164
+:105120000D0A3A31303732313030303333333033A7
+:105130003333303333333033333336333333323343
+:10514000333331333333363334333234340D0A3A74
+:105150003130373232303030333333343334333428
+:105160003333333033333332333333303333333019
+:10517000333034363044304137340D0A3A31303729
+:1051800032333030303341333133303435343634E8
+:1051900032333033303330333333313334333233EB
+:1051A000303434333045380D0A3A31303732343008
+:1051B00030303431333334313333333133333330CC
+:1051C00033343332333333303333333433333330B4
+:1051D000333346430D0A3A313037323530303033CD
+:1051E0003033333330333333303333333833343392
+:1051F0003533343339304430413341333133303453
+:10520000350D0A3A313037323630303034353436B5
+:10521000343333303330333033333330333333306C
+:1052200033333330333333333333333043450D0A81
+:105230003A3130373237303030333333323334333E
+:10524000333334333533333330333333333333332E
+:1052500030333333303333333145360D0A3A31305E
+:10526000373238303030333333343334333233340D
+:1052700033363435333430443041334133313330D5
+:1052800034353436343443440D0A3A313037323908
+:1052900030303033303330333033333333333333F0
+:1052A00030333333313333333033333330333333D9
+:1052B00030333344350D0A3A3130373241303030F3
+:1052C00033363333333233343335333333303333AC
+:1052D00033363333333333333331333333303333A0
+:1052E00041450D0A3A3130373242303030333133B4
+:1052F0003034343332333830443041334133313356
+:105300003034353436343533303330333041440D76
+:105310000A3A31303732433030303330343133337E
+:105320003431333333313333333033343332333353
+:105330003330333333353333333037450D0A3A3175
+:10534000303732443030303333333033333330332B
+:105350003333303333333433333334333333383319
+:105360003333323334333238310D0A3A3130373255
+:1053700045303030333033313044304133413331D4
+:1053800033303435343634363330333033303333EE
+:105390003334333438460D0A3A3130373246303000
+:1053A00030333533333330333333323333333033D5
+:1053B00033333033343331333433323334333633BD
+:1053C0003336330D0A3A31303733303030303334FE
+:1053D00033333330333333313333333033333330A8
+:1053E000333433333333333434313331304436466A
+:1053F0000D0A3A31303733313030303041334133B8
+:10540000313330343633303330333033303330337C
+:10541000333332333333303333333835460D0A3A8E
+:10542000313037333230303033333332333333315A
+:10543000333333323333333033343332333433363C
+:10544000333333353333333133300D0A3A31303778
+:10545000333330303033333331333034343330342A
+:10546000313333343133333331333033303044300C
+:10547000413341333134410D0A3A3130373334301E
+:1054800030303330343633303331333033303330FF
+:1054900033333330333433323333333033333336DF
+:1054A000333330450D0A3A3130373335303030330D
+:1054B00030333333303333333033333330333333C8
+:1054C00031333333303333333033343336333330B3
+:1054D000440D0A3A313037333630303033323334DA
+:1054E0003336333333333334333333393333304474
+:1054F00030413341333133303436333032300D0ABA
+:105500003A31303733373030303332333033303371
+:10551000303334333233343336333333323333335B
+:1055200030333333313333333045430D0A3A31307E
+:10553000373338303030333333303333333333333E
+:105540003338333333323334333533333331333326
+:1055500033343333333043440D0A3A31303733393F
+:10556000303030333333303334333633373338300D
+:1055700044304133413331333034363330333333D5
+:1055800030333046360D0A3A31303733413030301F
+:1055900033303333333133333332333333303333E4
+:1055A00033303334333333333333333333303333D0
+:1055B00042420D0A3A3130373342303030333733DC
+:1055C00033333533303434333034313333343133AF
+:1055D0003333313333333033343332333337350DC0
+:1055E0000A3A3130373343303030333034343337A4
+:1055F0003044304133413331333034363330333457
+:105600003330333033303333333742430D0A3A319A
+:105610003037334430303033333330333333303357
+:105620003333303333333133333335333333303350
+:105630003333303333333238440D0A3A3130373371
+:10564000453030303333333633333333333333321F
+:105650003333333033343333333333323333333020
+:105660003339333136440D0A3A313037334630302E
+:1056700030304430413341333133303436333033DA
+:1056800035333033303330333333303333333033F7
+:105690003341370D0A3A313037343030303033341B
+:1056A00033333331333333303334333333333334CD
+:1056B00033333330333333313334333633333446A7
+:1056C0000D0A3A3130373431303030333033333300
+:1056D0003033333336333433323333333433343398
+:1056E000343334343430443041334137320D0A3AA4
+:1056F0003130373432303030333133303436333088
+:105700003336333033303330333333303333333273
+:10571000333333303333333033310D0A3A313037AA
+:105720003433303030333433343333333133303453
+:10573000343330343133333431333333313333333F
+:10574000303334333246410D0A3A31303734343055
+:105750003030333333303333333833333330333320
+:1057600033303431343430443041334133313330E9
+:10577000343632420D0A3A31303734353030303336
+:1057800030333733303330333033333330333333F4
+:1057900034333333383334333533333331333330D5
+:1057A000300D0A3A3130373436303030333233331B
+:1057B00033303333333033333330333333323334C2
+:1057C00033333333333133333330333346420D0ADB
+:1057D0003A31303734373030303332333333383393
+:1057E0003333303334343330443041334133313365
+:1057F00030343633303338333030350D0A3A3130C7
+:10580000373438303030333033303333333033346F
+:105810003335333333313334333633333330333357
+:1058200033303333333044390D0A3A313037343979
+:105830003030303333333033333330333333333347
+:105840003333343333333133333334333433323328
+:1058500033333143340D0A3A31303734413030304C
+:1058600033343336333134363044304133413331DD
+:1058700033303436333033393330333033303333FD
+:1058800044370D0A3A313037344230303033313317
+:1058900033333533333338333034343330343133D6
+:1058A0003334313333333133333330333437340DEE
+:1058B0000A3A3130373443303030333233333330D7
+:1058C00033333339333333303333333033333330AB
+:1058D0003333333033343333333739310D0A3A31DC
+:1058E0003037344430303033323044304133413358
+:1058F0003133303436333034313330333033303386
+:105900003333373333333042340D0A3A313037349E
+:10591000453030303333333133333338333333304E
+:105920003334333133333333333333383333333640
+:105930003333333736310D0A3A313037344630306D
+:10594000303333333033333334333333303333332F
+:105950003033343334333433333436343330443007
+:105960004138440D0A3A3130373530303030334128
+:105970003331333034363330343233303330333004
+:1059800033333336333333303333333833333245D1
+:105990000D0A3A313037353130303033303333332C
+:1059A00030333333303333333833333332333333C9
+:1059B000333333333633343331333333450D0A3AEB
+:1059C00031303735323030303338333333353333A9
+:1059D000333733343336333433333435333130447F
+:1059E000304133413331333035380D0A3A313037B5
+:1059F0003533303030343633303433333033303382
+:105A0000303330343433303431333334313333336F
+:105A1000313333333045320D0A3A31303735343093
+:105A20003030333433323333333033343331333350
+:105A3000333033333330333333303334333233343E
+:105A4000333531350D0A3A31303735353030303372
+:105A5000333331333333303333333833323432301A
+:105A600044304133413331333034363330343431E0
+:105A7000390D0A3A31303735363030303330333043
+:105A800033303333333233333330333333353333EB
+:105A900033333333333433333335333346330D0A0F
+:105AA0003A313037353730303033313334333133C6
+:105AB00033333933333335333333373334333233AA
+:105AC00034333533333331333344310D0A3A3130E3
+:105AD000373538303030333033343336343233388E
+:105AE0003044304133413331333034363330343560
+:105AF00033303330333045410D0A3A3130373539A0
+:105B0000303030333333323333333233343336336C
+:105B1000333332333333383333333633333337334A
+:105B200034333241450D0A3A313037354130303067
+:105B30003334333333333331333333303333333735
+:105B4000333433333330343433303431333334312A
+:105B500038330D0A3A31303735423030303435344D
+:105B600035304430413341333133303436333034DF
+:105B70003633303330333033333331333341430D05
+:105B80000A3A313037354330303033303334333202
+:105B900033333330333433323333333033333330DE
+:105BA0003333333033343333333439380D0A3A3105
+:105BB00030373544303030333333333336333333A7
+:105BC00030333333363333333833333330333333A3
+:105BD0003034323331304439320D0A3A31303735CE
+:105BE0004530303030413341333133303436333166
+:105BF000333033303330333033333331333333387E
+:105C00003333333638370D0A3A3130373546303092
+:105C10003033333337333433323334333133333354
+:105C20003133333330333433333333333233333349
+:105C30003135460D0A3A3130373630303030333472
+:105C40003332333433333333333433333336333320
+:105C500033303338333030443041334133313930ED
+:105C60000D0A3A3130373631303030333034363354
+:105C700031333133303330333033333339333333FB
+:105C8000323333333033333339333332460D0A3A18
+:105C900031303736323030303330333333343333DE
+:105CA00033353333333133343333333333323330C7
+:105CB000343433303431333331330D0A3A31303701
+:105CC00036333030303431333333313333333033B0
+:105CD0003433323435333830443041334133313367
+:105CE000303436333133360D0A3A313037363430CA
+:105CF0003030333233303330333033333330333486
+:105D0000333333333330333333303333333033336C
+:105D1000333931390D0A3A31303736353030303396
+:105D20003333393333333533333337333433323337
+:105D30003433313333333133333330333333304629
+:105D4000370D0A3A3130373636303030333333346A
+:105D500033333332333833343044304133413331E9
+:105D600033303436333133333330333032360D0A57
+:105D70003A313037363730303033303333333233F3
+:105D800033333033333334333333333333333733E1
+:105D900033333033333334333344450D0A3A3130FF
+:105DA00037363830303033343333333133333330C4
+:105DB00033333336333333353333333633343336A7
+:105DC00033333332333343330D0A3A3130373639D4
+:105DD0003030303331333834333044304133413371
+:105DE000313330343633313334333033303330338E
+:105DF00033333945350D0A3A31303736413030309A
+:105E00003333333233333338333333363333333757
+:105E10003333333233343331333034343330343159
+:105E200038380D0A3A313037364230303033333477
+:105E30003133333331333333303334333233333339
+:105E40003033343334333333303431333438360D44
+:105E50000A3A313037364330303030443041334104
+:105E6000333133303436333133353330333033300C
+:105E70003333333033333330333344330D0A3A3131
+:105E800030373644303030333933333336333333CD
+:105E900030333333343334333333343333333333D2
+:105EA0003633333330333437300D0A3A3130373606
+:105EB00045303030333333333338333333303333A7
+:105EC0003330333433333333333233343330304499
+:105ED0003041334142350D0A3A31303736463030A1
+:105EE000303331333034363331333633303330338B
+:105EF0003033333331333333393333333033343373
+:105F00003335320D0A3A31303737303030303333B1
+:105F10003336333333303333333333343333333350
+:105F2000333033333330333333303333333435304A
+:105F30000D0A3A3130373731303030333333323382
+:105F4000333332333433313333333933343334301E
+:105F5000443041334133313330343636450D0A3A1B
+:105F6000313037373230303033313337333033300C
+:105F700033303333333633333337333333323333EE
+:105F8000333933303434333031390D0A3A31303724
+:105F900037333030303431333334313333333133DA
+:105FA00033333033343332333333303334333533C4
+:105FB000333330333330350D0A3A313037373430FC
+:105FC00030303330333333303334333233373433A8
+:105FD0003044304133413331333034363331333868
+:105FE000333033350D0A3A313037373530303033CE
+:105FF0003033303334333533333331333333303379
+:106000003333393333333933333330333333374640
+:10601000340D0A3A3130373736303030333433329A
+:106020003334333133333331333333303333333049
+:1060300033333334333333333333333745440D0A57
+:106040003A3130373737303030333333303331341F
+:1060500035304430413341333133303436333133EA
+:1060600039333033303330333330420D0A3A313044
+:1060700037373830303033363333333433333332E9
+:1060800033333330333333363333333633333335DB
+:1060900033343336333342440D0A3A3130373739EB
+:1060A00030303033323333333033333339333433C6
+:1060B00033333333343333333633333330333333AF
+:1060C000313331423

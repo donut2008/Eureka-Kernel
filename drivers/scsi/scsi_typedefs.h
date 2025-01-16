@@ -1,2 +1,4 @@
+pe;
+};
 
-typedef struct scsi_cmnd Scsi_Cmnd;
+static struct mxs_dma_type mx

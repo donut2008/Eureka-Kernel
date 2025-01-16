@@ -1,117 +1,51 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#include <linux/vmw_vmci_defs.h>
-#include <linux/vmw_vmci_api.h>
-#include <linux/atomic.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-
-#include "vmci_driver.h"
-#include "vmci_event.h"
-
-static bool vmci_disable_host;
-module_param_named(disable_host, vmci_disable_host, bool, 0);
-MODULE_PARM_DESC(disable_host,
-		 "Disable driver host personality (default=enabled)");
-
-static bool vmci_disable_guest;
-module_param_named(disable_guest, vmci_disable_guest, bool, 0);
-MODULE_PARM_DESC(disable_guest,
-		 "Disable driver guest personality (default=enabled)");
-
-static bool vmci_guest_personality_initialized;
-static bool vmci_host_personality_initialized;
-
-/*
- * vmci_get_context_id() - Gets the current context ID.
- *
- * Returns the current context ID.  Note that since this is accessed only
- * from code running in the host, this always returns the host context ID.
- */
-u32 vmci_get_context_id(void)
-{
-	if (vmci_guest_code_active())
-		return vmci_get_vm_context_id();
-	else if (vmci_host_code_active())
-		return VMCI_HOST_CONTEXT_ID;
-
-	return VMCI_INVALID_ID;
-}
-EXPORT_SYMBOL_GPL(vmci_get_context_id);
-
-static int __init vmci_drv_init(void)
-{
-	int vmci_err;
-	int error;
-
-	vmci_err = vmci_event_init();
-	if (vmci_err < VMCI_SUCCESS) {
-		pr_err("Failed to initialize VMCIEvent (result=%d)\n",
-		       vmci_err);
-		return -EINVAL;
-	}
-
-	if (!vmci_disable_guest) {
-		error = vmci_guest_init();
-		if (error) {
-			pr_warn("Failed to initialize guest personality (err=%d)\n",
-				error);
-		} else {
-			vmci_guest_personality_initialized = true;
-			pr_info("Guest personality initialized and is %s\n",
-				vmci_guest_code_active() ?
-				"active" : "inactive");
-		}
-	}
-
-	if (!vmci_disable_host) {
-		error = vmci_host_init();
-		if (error) {
-			pr_warn("Unable to initialize host personality (err=%d)\n",
-				error);
-		} else {
-			vmci_host_personality_initialized = true;
-			pr_info("Initialized host personality\n");
-		}
-	}
-
-	if (!vmci_guest_personality_initialized &&
-	    !vmci_host_personality_initialized) {
-		vmci_event_exit();
-		return -ENODEV;
-	}
-
-	return 0;
-}
-module_init(vmci_drv_init);
-
-static void __exit vmci_drv_exit(void)
-{
-	if (vmci_guest_personality_initialized)
-		vmci_guest_exit();
-
-	if (vmci_host_personality_initialized)
-		vmci_host_exit();
-
-	vmci_event_exit();
-}
-module_exit(vmci_drv_exit);
-
-MODULE_AUTHOR("VMware, Inc.");
-MODULE_DESCRIPTION("VMware Virtual Machine Communication Interface.");
-MODULE_VERSION("1.1.3.0-k");
-MODULE_LICENSE("GPL v2");
+TATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_7__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_F0_DPA_SUBSTATE_PWR_ALLOC_7__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define SWRST_COMMAND_STATUS__RECONFIGURE_MASK 0x1
+#define SWRST_COMMAND_STATUS__RECONFIGURE__SHIFT 0x0
+#define SWRST_COMMAND_STATUS__ATOMIC_RESET_MASK 0x2
+#define SWRST_COMMAND_STATUS__ATOMIC_RESET__SHIFT 0x1
+#define SWRST_COMMAND_STATUS__RESET_COMPLETE_MASK 0x10000
+#define SWRST_COMMAND_STATUS__RESET_COMPLETE__SHIFT 0x10
+#define SWRST_COMMAND_STATUS__WAIT_STATE_MASK 0x20000
+#define SWRST_COMMAND_STATUS__WAIT_STATE__SHIFT 0x11
+#define SWRST_GENERAL_CONTROL__RECONFIGURE_EN_MASK 0x1
+#define SWRST_GENERAL_CONTROL__RECONFIGURE_EN__SHIFT 0x0
+#define SWRST_GENERAL_CONTROL__ATOMIC_RESET_EN_MASK 0x2
+#define SWRST_GENERAL_CONTROL__ATOMIC_RESET_EN__SHIFT 0x1
+#define SWRST_GENERAL_CONTROL__RESET_PERIOD_MASK 0x1c
+#define SWRST_GENERAL_CONTROL__RESET_PERIOD__SHIFT 0x2
+#define SWRST_GENERAL_CONTROL__WAIT_LINKUP_MASK 0x100
+#define SWRST_GENERAL_CONTROL__WAIT_LINKUP__SHIFT 0x8
+#define SWRST_GENERAL_CONTROL__FORCE_REGIDLE_MASK 0x200
+#define SWRST_GENERAL_CONTROL__FORCE_REGIDLE__SHIFT 0x9
+#define SWRST_GENERAL_CONTROL__BLOCK_ON_IDLE_MASK 0x400
+#define SWRST_GENERAL_CONTROL__BLOCK_ON_IDLE__SHIFT 0xa
+#define SWRST_GENERAL_CONTROL__CONFIG_XFER_MODE_MASK 0x1000
+#define SWRST_GENERAL_CONTROL__CONFIG_XFER_MODE__SHIFT 0xc
+#define SWRST_GENERAL_CONTROL__MUXSEL_XFER_MODE_MASK 0x2000
+#define SWRST_GENERAL_CONTROL__MUXSEL_XFER_MODE__SHIFT 0xd
+#define SWRST_GENERAL_CONTROL__HLDTRAIN_XFER_MODE_MASK 0x4000
+#define SWRST_GENERAL_CONTROL__HLDTRAIN_XFER_MODE__SHIFT 0xe
+#define SWRST_GENERAL_CONTROL__BYPASS_HOLD_MASK 0x10000
+#define SWRST_GENERAL_CONTROL__BYPASS_HOLD__SHIFT 0x10
+#define SWRST_GENERAL_CONTROL__BYPASS_PIF_HOLD_MASK 0x20000
+#define SWRST_GENERAL_CONTROL__BYPASS_PIF_HOLD__SHIFT 0x11
+#define SWRST_GENERAL_CONTROL__EP_COMPLT_CHK_EN_MASK 0x10000000
+#define SWRST_GENERAL_CONTROL__EP_COMPLT_CHK_EN__SHIFT 0x1c
+#define SWRST_GENERAL_CONTROL__EP_COMPLT_WAIT_TMR_MASK 0x60000000
+#define SWRST_GENERAL_CONTROL__EP_COMPLT_WAIT_TMR__SHIFT 0x1d
+#define SWRST_COMMAND_0__BIF_STRAPREG_RESET_MASK 0x8000
+#define SWRST

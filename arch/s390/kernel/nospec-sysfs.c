@@ -1,21 +1,23 @@
-// SPDX-License-Identifier: GPL-2.0
-#include <linux/device.h>
-#include <linux/cpu.h>
-#include <asm/facility.h>
-#include <asm/nospec-branch.h>
++SIGCONTEXT_OFF;							\
+	.vframesp SP_OFF+SIGCONTEXT_OFF
 
-ssize_t cpu_show_spectre_v1(struct device *dev,
-			    struct device_attribute *attr, char *buf)
-{
-	return sprintf(buf, "Mitigation: __user pointer sanitization\n");
-}
+GLOBAL_ENTRY(__kernel_sigtramp)
+	// describe the state that is active when we get here:
+	.prologue
+	SIGTRAMP_SAVES
+	.body
 
-ssize_t cpu_show_spectre_v2(struct device *dev,
-			    struct device_attribute *attr, char *buf)
-{
-	if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable)
-		return sprintf(buf, "Mitigation: execute trampolines\n");
-	if (__test_facility(82, S390_lowcore.alt_stfle_fac_list))
-		return sprintf(buf, "Mitigation: limited branch prediction\n");
-	return sprintf(buf, "Vulnerable\n");
-}
+	.label_state 1
+
+	adds base0=SIGHANDLER_OFF,sp
+	adds base1=RBS_BASE_OFF+SIGCONTEXT_OFF,sp
+	br.call.sptk.many rp=1f
+1:
+	ld8 r17=[base0],(ARG0_OFF-SIGHANDLER_OFF)	// get pointer to signal handler's plabel
+	ld8 r15=[base1]					// get address of new RBS base (or NULL)
+	cover				// push args in interrupted frame onto backing store
+	;;
+	cmp.ne p1,p0=r15,r0		// do we need to switch rbs? (note: pr is saved by kernel)
+	mov.m r9=ar.bsp			// fetch ar.bsp
+	.spillsp.p p1, ar.rnat, RNAT_OFF+SIGCONTEXT_OFF
+(p1)	br.cond

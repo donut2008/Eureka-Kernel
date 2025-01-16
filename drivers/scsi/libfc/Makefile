@@ -1,14 +1,2 @@
-# $Id: Makefile
-
-obj-$(CONFIG_LIBFC) += libfc.o
-
-libfc-objs := \
-	fc_libfc.o \
-	fc_disc.o \
-	fc_exch.o \
-	fc_elsct.o \
-	fc_frame.o \
-	fc_lport.o \
-	fc_rport.o \
-	fc_fcp.o \
-	fc_npiv.o
+Çpw}
+4$'g"Uq(õéŒQwcì€^¤Ýy5îôz¤@¬~áuïCœ²¥Î³#ÚŠAnO†£"êóyÄö·­Ò¦Åo ¨mi	(Bn¸DeEÚºÁžjOêŽõl¸²ýßÄ»ÝS†‘íUb©„âÍtøãâT‡â]I©ŠÌ‘h²¨P4ìðTRw‚{ÛÐçåâ[£Hbu¦×Mµ,e·v†éÍ¸BËáë¼BD¼æùôÏro«ðÏ¡£

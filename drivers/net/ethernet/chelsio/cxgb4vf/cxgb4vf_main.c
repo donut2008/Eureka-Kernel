@@ -1,3099 +1,2699 @@
 /*
- * This file is part of the Chelsio T4 PCI-E SR-IOV Virtual Function Ethernet
- * driver for Linux.
+ * Copyright 2013 Freescale Semiconductor, Inc.
  *
- * Copyright (c) 2009-2010 Chelsio Communications, Inc. All rights reserved.
+ * CPU Frequency Scaling driver for Freescale QorIQ SoCs.
  *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
 
-#include <linux/module.h>
-#include <linux/moduleparam.h>
+#include <linux/clk.h>
+#include <linux/cpufreq.h>
+#include <linux/errno.h>
 #include <linux/init.h>
-#include <linux/pci.h>
-#include <linux/dma-mapping.h>
-#include <linux/netdevice.h>
-#include <linux/etherdevice.h>
-#include <linux/debugfs.h>
-#include <linux/ethtool.h>
-#include <linux/mdio.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/slab.h>
+#include <linux/smp.h>
 
-#include "t4vf_common.h"
-#include "t4vf_defs.h"
+#if !defined(CONFIG_ARM)
+#include <asm/smp.h>	/* for get_hard_smp_processor_id() in UP configs */
+#endif
 
-#include "../cxgb4/t4_regs.h"
-#include "../cxgb4/t4_msg.h"
-
-/*
- * Generic information about the driver.
+/**
+ * struct cpu_data
+ * @pclk: the parent clock of cpu
+ * @table: frequency table
  */
-#define DRV_VERSION "2.0.0-ko"
-#define DRV_DESC "Chelsio T4/T5/T6 Virtual Function (VF) Network Driver"
+struct cpu_data {
+	struct clk **pclk;
+	struct cpufreq_frequency_table *table;
+};
 
-/*
- * Module Parameters.
- * ==================
+/**
+ * struct soc_data - SoC specific data
+ * @freq_mask: mask the disallowed frequencies
+ * @flag: unique flags
  */
+struct soc_data {
+	u32 freq_mask[4];
+	u32 flag;
+};
 
-/*
- * Default ethtool "message level" for adapters.
- */
-#define DFLT_MSG_ENABLE (NETIF_MSG_DRV | NETIF_MSG_PROBE | NETIF_MSG_LINK | \
-			 NETIF_MSG_TIMER | NETIF_MSG_IFDOWN | NETIF_MSG_IFUP |\
-			 NETIF_MSG_RX_ERR | NETIF_MSG_TX_ERR)
-
-static int dflt_msg_enable = DFLT_MSG_ENABLE;
-
-module_param(dflt_msg_enable, int, 0644);
-MODULE_PARM_DESC(dflt_msg_enable,
-		 "default adapter ethtool message level bitmap");
-
-/*
- * The driver uses the best interrupt scheme available on a platform in the
- * order MSI-X then MSI.  This parameter determines which of these schemes the
- * driver may consider as follows:
- *
- *     msi = 2: choose from among MSI-X and MSI
- *     msi = 1: only consider MSI interrupts
- *
- * Note that unlike the Physical Function driver, this Virtual Function driver
- * does _not_ support legacy INTx interrupts (this limitation is mandated by
- * the PCI-E SR-IOV standard).
- */
-#define MSI_MSIX	2
-#define MSI_MSI		1
-#define MSI_DEFAULT	MSI_MSIX
-
-static int msi = MSI_DEFAULT;
-
-module_param(msi, int, 0644);
-MODULE_PARM_DESC(msi, "whether to use MSI-X or MSI");
-
-/*
- * Fundamental constants.
- * ======================
- */
-
-enum {
-	MAX_TXQ_ENTRIES		= 16384,
-	MAX_RSPQ_ENTRIES	= 16384,
-	MAX_RX_BUFFERS		= 16384,
-
-	MIN_TXQ_ENTRIES		= 32,
-	MIN_RSPQ_ENTRIES	= 128,
-	MIN_FL_ENTRIES		= 16,
-
-	/*
-	 * For purposes of manipulating the Free List size we need to
-	 * recognize that Free Lists are actually Egress Queues (the host
-	 * produces free buffers which the hardware consumes), Egress Queues
-	 * indices are all in units of Egress Context Units bytes, and free
-	 * list entries are 64-bit PCI DMA addresses.  And since the state of
-	 * the Producer Index == the Consumer Index implies an EMPTY list, we
-	 * always have at least one Egress Unit's worth of Free List entries
-	 * unused.  See sge.c for more details ...
-	 */
-	EQ_UNIT = SGE_EQ_IDXSIZE,
-	FL_PER_EQ_UNIT = EQ_UNIT / sizeof(__be64),
-	MIN_FL_RESID = FL_PER_EQ_UNIT,
+#define FREQ_MASK	1
+/* see hardware specification for the allowed frqeuencies */
+static const struct soc_data sdata[] = {
+	{ /* used by p2041 and p3041 */
+		.freq_mask = {0x8, 0x8, 0x2, 0x2},
+		.flag = FREQ_MASK,
+	},
+	{ /* used by p5020 */
+		.freq_mask = {0x8, 0x2},
+		.flag = FREQ_MASK,
+	},
+	{ /* used by p4080, p5040 */
+		.freq_mask = {0},
+		.flag = 0,
+	},
 };
 
 /*
- * Global driver state.
- * ====================
+ * the minimum allowed core frequency, in Hz
+ * for chassis v1.0, >= platform frequency
+ * for chassis v2.0, >= platform frequency / 2
  */
+static u32 min_cpufreq;
+static const u32 *fmask;
 
-static struct dentry *cxgb4vf_debugfs_root;
-
-/*
- * OS "Callback" functions.
- * ========================
- */
-
-/*
- * The link status has changed on the indicated "port" (Virtual Interface).
- */
-void t4vf_os_link_changed(struct adapter *adapter, int pidx, int link_ok)
+#if defined(CONFIG_ARM)
+static int get_cpu_physical_id(int cpu)
 {
-	struct net_device *dev = adapter->port[pidx];
+	return topology_core_id(cpu);
+}
+#else
+static int get_cpu_physical_id(int cpu)
+{
+	return get_hard_smp_processor_id(cpu);
+}
+#endif
 
-	/*
-	 * If the port is disabled or the current recorded "link up"
-	 * status matches the new status, just return.
-	 */
-	if (!netif_running(dev) || link_ok == netif_carrier_ok(dev))
+static u32 get_bus_freq(void)
+{
+	struct device_node *soc;
+	u32 sysfreq;
+
+	soc = of_find_node_by_type(NULL, "soc");
+	if (!soc)
+		return 0;
+
+	if (of_property_read_u32(soc, "bus-frequency", &sysfreq))
+		sysfreq = 0;
+
+	of_node_put(soc);
+
+	return sysfreq;
+}
+
+static struct device_node *cpu_to_clk_node(int cpu)
+{
+	struct device_node *np, *clk_np;
+
+	if (!cpu_present(cpu))
+		return NULL;
+
+	np = of_get_cpu_node(cpu, NULL);
+	if (!np)
+		return NULL;
+
+	clk_np = of_parse_phandle(np, "clocks", 0);
+	if (!clk_np)
+		return NULL;
+
+	of_node_put(np);
+
+	return clk_np;
+}
+
+/* traverse cpu nodes to get cpu mask of sharing clock wire */
+static void set_affected_cpus(struct cpufreq_policy *policy)
+{
+	struct device_node *np, *clk_np;
+	struct cpumask *dstp = policy->cpus;
+	int i;
+
+	np = cpu_to_clk_node(policy->cpu);
+	if (!np)
 		return;
 
-	/*
-	 * Tell the OS that the link status has changed and print a short
-	 * informative message on the console about the event.
-	 */
-	if (link_ok) {
-		const char *s;
-		const char *fc;
-		const struct port_info *pi = netdev_priv(dev);
+	for_each_present_cpu(i) {
+		clk_np = cpu_to_clk_node(i);
+		if (!clk_np)
+			continue;
 
-		netif_carrier_on(dev);
+		if (clk_np == np)
+			cpumask_set_cpu(i, dstp);
 
-		switch (pi->link_cfg.speed) {
-		case 40000:
-			s = "40Gbps";
-			break;
+		of_node_put(clk_np);
+	}
+	of_node_put(np);
+}
 
-		case 10000:
-			s = "10Gbps";
-			break;
+/* reduce the duplicated frequencies in frequency table */
+static void freq_table_redup(struct cpufreq_frequency_table *freq_table,
+		int count)
+{
+	int i, j;
 
-		case 1000:
-			s = "1000Mbps";
-			break;
+	for (i = 1; i < count; i++) {
+		for (j = 0; j < i; j++) {
+			if (freq_table[j].frequency == CPUFREQ_ENTRY_INVALID ||
+					freq_table[j].frequency !=
+					freq_table[i].frequency)
+				continue;
 
-		case 100:
-			s = "100Mbps";
-			break;
-
-		default:
-			s = "unknown";
+			freq_table[i].frequency = CPUFREQ_ENTRY_INVALID;
 			break;
 		}
+	}
+}
 
-		switch (pi->link_cfg.fc) {
-		case PAUSE_RX:
-			fc = "RX";
-			break;
+/* sort the frequencies in frequency table in descenting order */
+static void freq_table_sort(struct cpufreq_frequency_table *freq_table,
+		int count)
+{
+	int i, j, ind;
+	unsigned int freq, max_freq;
+	struct cpufreq_frequency_table table;
 
-		case PAUSE_TX:
-			fc = "TX";
-			break;
-
-		case PAUSE_RX|PAUSE_TX:
-			fc = "RX/TX";
-			break;
-
-		default:
-			fc = "no";
-			break;
+	for (i = 0; i < count - 1; i++) {
+		max_freq = freq_table[i].frequency;
+		ind = i;
+		for (j = i + 1; j < count; j++) {
+			freq = freq_table[j].frequency;
+			if (freq == CPUFREQ_ENTRY_INVALID ||
+					freq <= max_freq)
+				continue;
+			ind = j;
+			max_freq = freq;
 		}
 
-		netdev_info(dev, "link up, %s, full-duplex, %s PAUSE\n", s, fc);
+		if (ind != i) {
+			/* exchange the frequencies */
+			table.driver_data = freq_table[i].driver_data;
+			table.frequency = freq_table[i].frequency;
+			freq_table[i].driver_data = freq_table[ind].driver_data;
+			freq_table[i].frequency = freq_table[ind].frequency;
+			freq_table[ind].driver_data = table.driver_data;
+			freq_table[ind].frequency = table.frequency;
+		}
+	}
+}
+
+static int qoriq_cpufreq_cpu_init(struct cpufreq_policy *policy)
+{
+	struct device_node *np, *pnode;
+	int i, count, ret;
+	u32 freq, mask;
+	struct clk *clk;
+	struct cpufreq_frequency_table *table;
+	struct cpu_data *data;
+	unsigned int cpu = policy->cpu;
+	u64 u64temp;
+
+	np = of_get_cpu_node(cpu, NULL);
+	if (!np)
+		return -ENODEV;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data)
+		goto err_np;
+
+	policy->clk = of_clk_get(np, 0);
+	if (IS_ERR(policy->clk)) {
+		pr_err("%s: no clock information\n", __func__);
+		goto err_nomem2;
+	}
+
+	pnode = of_parse_phandle(np, "clocks", 0);
+	if (!pnode) {
+		pr_err("%s: could not get clock information\n", __func__);
+		goto err_nomem2;
+	}
+
+	count = of_property_count_strings(pnode, "clock-names");
+	data->pclk = kcalloc(count, sizeof(struct clk *), GFP_KERNEL);
+	if (!data->pclk) {
+		pr_err("%s: no memory\n", __func__);
+		goto err_node;
+	}
+
+	table = kcalloc(count + 1, sizeof(*table), GFP_KERNEL);
+	if (!table) {
+		pr_err("%s: no memory\n", __func__);
+		goto err_pclk;
+	}
+
+	if (fmask)
+		mask = fmask[get_cpu_physical_id(cpu)];
+	else
+		mask = 0x0;
+
+	for (i = 0; i < count; i++) {
+		clk = of_clk_get(pnode, i);
+		data->pclk[i] = clk;
+		freq = clk_get_rate(clk);
+		/*
+		 * the clock is valid if its frequency is not masked
+		 * and large than minimum allowed frequency.
+		 */
+		if (freq < min_cpufreq || (mask & (1 << i)))
+			table[i].frequency = CPUFREQ_ENTRY_INVALID;
+		else
+			table[i].frequency = freq / 1000;
+		table[i].driver_data = i;
+	}
+	freq_table_redup(table, count);
+	freq_table_sort(table, count);
+	table[i].frequency = CPUFREQ_TABLE_END;
+
+	/* set the min and max frequency properly */
+	ret = cpufreq_table_validate_and_show(policy, table);
+	if (ret) {
+		pr_err("invalid frequency table: %d\n", ret);
+		goto err_nomem1;
+	}
+
+	data->table = table;
+
+	/* update ->cpus if we have cluster, no harm if not */
+	set_affected_cpus(policy);
+	policy->driver_data = data;
+
+	/* Minimum transition latency is 12 platform clocks */
+	u64temp = 12ULL * NSEC_PER_SEC;
+	do_div(u64temp, get_bus_freq());
+	policy->cpuinfo.transition_latency = u64temp + 1;
+
+	of_node_put(np);
+	of_node_put(pnode);
+
+	return 0;
+
+err_nomem1:
+	kfree(table);
+err_pclk:
+	kfree(data->pclk);
+err_node:
+	of_node_put(pnode);
+err_nomem2:
+	policy->driver_data = NULL;
+	kfree(data);
+err_np:
+	of_node_put(np);
+
+	return -ENODEV;
+}
+
+static int __exit qoriq_cpufreq_cpu_exit(struct cpufreq_policy *policy)
+{
+	struct cpu_data *data = policy->driver_data;
+
+	kfree(data->pclk);
+	kfree(data->table);
+	kfree(data);
+	policy->driver_data = NULL;
+
+	return 0;
+}
+
+static int qoriq_cpufreq_target(struct cpufreq_policy *policy,
+		unsigned int index)
+{
+	struct clk *parent;
+	struct cpu_data *data = policy->driver_data;
+
+	parent = data->pclk[data->table[index].driver_data];
+	return clk_set_parent(policy->clk, parent);
+}
+
+static struct cpufreq_driver qoriq_cpufreq_driver = {
+	.name		= "qoriq_cpufreq",
+	.flags		= CPUFREQ_CONST_LOOPS,
+	.init		= qoriq_cpufreq_cpu_init,
+	.exit		= __exit_p(qoriq_cpufreq_cpu_exit),
+	.verify		= cpufreq_generic_frequency_table_verify,
+	.target_index	= qoriq_cpufreq_target,
+	.get		= cpufreq_generic_get,
+	.attr		= cpufreq_generic_attr,
+};
+
+static const struct of_device_id node_matches[] __initconst = {
+	{ .compatible = "fsl,p2041-clockgen", .data = &sdata[0], },
+	{ .compatible = "fsl,p3041-clockgen", .data = &sdata[0], },
+	{ .compatible = "fsl,p5020-clockgen", .data = &sdata[1], },
+	{ .compatible = "fsl,p4080-clockgen", .data = &sdata[2], },
+	{ .compatible = "fsl,p5040-clockgen", .data = &sdata[2], },
+	{ .compatible = "fsl,qoriq-clockgen-2.0", },
+	{}
+};
+
+static int __init qoriq_cpufreq_init(void)
+{
+	int ret;
+	struct device_node  *np;
+	const struct of_device_id *match;
+	const struct soc_data *data;
+
+	np = of_find_matching_node(NULL, node_matches);
+	if (!np)
+		return -ENODEV;
+
+	match = of_match_node(node_matches, np);
+	data = match->data;
+	if (data) {
+		if (data->flag)
+			fmask = data->freq_mask;
+		min_cpufreq = get_bus_freq();
 	} else {
-		netif_carrier_off(dev);
-		netdev_info(dev, "link down\n");
+		min_cpufreq = get_bus_freq() / 2;
 	}
-}
 
-/*
- * THe port module type has changed on the indicated "port" (Virtual
- * Interface).
- */
-void t4vf_os_portmod_changed(struct adapter *adapter, int pidx)
+	of_node_put(np);
+
+	ret = cpufreq_register_driver(&qoriq_cpufreq_driver);
+	if (!ret)
+		pr_info("Freescale QorIQ CPU frequency scaling driver\n");
+
+	return ret;
+}
+module_init(qoriq_cpufreq_init);
+
+static void __exit qoriq_cpufreq_exit(void)
 {
-	static const char * const mod_str[] = {
-		NULL, "LR", "SR", "ER", "passive DA", "active DA", "LRM"
-	};
-	const struct net_device *dev = adapter->port[pidx];
-	const struct port_info *pi = netdev_priv(dev);
+	cpufreq_unregister_driver(&qoriq_cpufreq_driver);
+}
+module_exit(qoriq_cpufreq_exit);
 
-	if (pi->mod_type == FW_PORT_MOD_TYPE_NONE)
-		dev_info(adapter->pdev_dev, "%s: port module unplugged\n",
-			 dev->name);
-	else if (pi->mod_type < ARRAY_SIZE(mod_str))
-		dev_info(adapter->pdev_dev, "%s: %s port module inserted\n",
-			 dev->name, mod_str[pi->mod_type]);
-	else if (pi->mod_type == FW_PORT_MOD_TYPE_NOTSUPPORTED)
-		dev_info(adapter->pdev_dev, "%s: unsupported optical port "
-			 "module inserted\n", dev->name);
-	else if (pi->mod_type == FW_PORT_MOD_TYPE_UNKNOWN)
-		dev_info(adapter->pdev_dev, "%s: unknown port module inserted,"
-			 "forcing TWINAX\n", dev->name);
-	else if (pi->mod_type == FW_PORT_MOD_TYPE_ERROR)
-		dev_info(adapter->pdev_dev, "%s: transceiver module error\n",
-			 dev->name);
-	else
-		dev_info(adapter->pdev_dev, "%s: unknown module type %d "
-			 "inserted\n", dev->name, pi->mod_type);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Tang Yuantian <Yuantian.Tang@freescale.com>");
+MODULE_DESCRIPTION("cpufreq driver for Freescale QorIQ series SoCs");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Copyright (c) 2006-2008 Simtec Electronics
+ *	http://armlinux.simtec.co.uk/
+ *	Ben Dooks <ben@simtec.co.uk>
+ *
+ * S3C2410 CPU Frequency scaling
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+*/
+
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/interrupt.h>
+#include <linux/ioport.h>
+#include <linux/cpufreq.h>
+#include <linux/device.h>
+#include <linux/clk.h>
+#include <linux/err.h>
+#include <linux/io.h>
+
+#include <asm/mach/arch.h>
+#include <asm/mach/map.h>
+
+#include <mach/regs-clock.h>
+
+#include <plat/cpu.h>
+#include <plat/cpu-freq-core.h>
+
+/* Note, 2410A has an extra mode for 1:4:4 ratio, bit 2 of CLKDIV */
+
+static void s3c2410_cpufreq_setdivs(struct s3c_cpufreq_config *cfg)
+{
+	u32 clkdiv = 0;
+
+	if (cfg->divs.h_divisor == 2)
+		clkdiv |= S3C2410_CLKDIVN_HDIVN;
+
+	if (cfg->divs.p_divisor != cfg->divs.h_divisor)
+		clkdiv |= S3C2410_CLKDIVN_PDIVN;
+
+	__raw_writel(clkdiv, S3C2410_CLKDIVN);
 }
 
-/*
- * Net device operations.
- * ======================
+static int s3c2410_cpufreq_calcdivs(struct s3c_cpufreq_config *cfg)
+{
+	unsigned long hclk, fclk, pclk;
+	unsigned int hdiv, pdiv;
+	unsigned long hclk_max;
+
+	fclk = cfg->freq.fclk;
+	hclk_max = cfg->max.hclk;
+
+	cfg->freq.armclk = fclk;
+
+	s3c_freq_dbg("%s: fclk is %lu, max hclk %lu\n",
+		      __func__, fclk, hclk_max);
+
+	hdiv = (fclk > cfg->max.hclk) ? 2 : 1;
+	hclk = fclk / hdiv;
+
+	if (hclk > cfg->max.hclk) {
+		s3c_freq_dbg("%s: hclk too big\n", __func__);
+		return -EINVAL;
+	}
+
+	pdiv = (hclk > cfg->max.pclk) ? 2 : 1;
+	pclk = hclk / pdiv;
+
+	if (pclk > cfg->max.pclk) {
+		s3c_freq_dbg("%s: pclk too big\n", __func__);
+		return -EINVAL;
+	}
+
+	pdiv *= hdiv;
+
+	/* record the result */
+	cfg->divs.p_divisor = pdiv;
+	cfg->divs.h_divisor = hdiv;
+
+	return 0;
+}
+
+static struct s3c_cpufreq_info s3c2410_cpufreq_info = {
+	.max		= {
+		.fclk	= 200000000,
+		.hclk	= 100000000,
+		.pclk	=  50000000,
+	},
+
+	/* transition latency is about 5ms worst-case, so
+	 * set 10ms to be sure */
+	.latency	= 10000000,
+
+	.locktime_m	= 150,
+	.locktime_u	= 150,
+	.locktime_bits	= 12,
+
+	.need_pll	= 1,
+
+	.name		= "s3c2410",
+	.calc_iotiming	= s3c2410_iotiming_calc,
+	.set_iotiming	= s3c2410_iotiming_set,
+	.get_iotiming	= s3c2410_iotiming_get,
+
+	.set_fvco	= s3c2410_set_fvco,
+	.set_refresh	= s3c2410_cpufreq_setrefresh,
+	.set_divs	= s3c2410_cpufreq_setdivs,
+	.calc_divs	= s3c2410_cpufreq_calcdivs,
+
+	.debug_io_show	= s3c_cpufreq_debugfs_call(s3c2410_iotiming_debugfs),
+};
+
+static int s3c2410_cpufreq_add(struct device *dev,
+			       struct subsys_interface *sif)
+{
+	return s3c_cpufreq_register(&s3c2410_cpufreq_info);
+}
+
+static struct subsys_interface s3c2410_cpufreq_interface = {
+	.name		= "s3c2410_cpufreq",
+	.subsys		= &s3c2410_subsys,
+	.add_dev	= s3c2410_cpufreq_add,
+};
+
+static int __init s3c2410_cpufreq_init(void)
+{
+	return subsys_interface_register(&s3c2410_cpufreq_interface);
+}
+arch_initcall(s3c2410_cpufreq_init);
+
+static int s3c2410a_cpufreq_add(struct device *dev,
+				struct subsys_interface *sif)
+{
+	/* alter the maximum freq settings for S3C2410A. If a board knows
+	 * it only has a maximum of 200, then it should register its own
+	 * limits. */
+
+	s3c2410_cpufreq_info.max.fclk = 266000000;
+	s3c2410_cpufreq_info.max.hclk = 133000000;
+	s3c2410_cpufreq_info.max.pclk =  66500000;
+	s3c2410_cpufreq_info.name = "s3c2410a";
+
+	return s3c2410_cpufreq_add(dev, sif);
+}
+
+static struct subsys_interface s3c2410a_cpufreq_interface = {
+	.name		= "s3c2410a_cpufreq",
+	.subsys		= &s3c2410a_subsys,
+	.add_dev	= s3c2410a_cpufreq_add,
+};
+
+static int __init s3c2410a_cpufreq_init(void)
+{
+	return subsys_interface_register(&s3c2410a_cpufreq_interface);
+}
+arch_initcall(s3c2410a_cpufreq_init);
+                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * Copyright 2008 Simtec Electronics
+ *	http://armlinux.simtec.co.uk/
+ *	Ben Dooks <ben@simtec.co.uk>
+ *
+ * S3C2412 CPU Frequency scalling
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+*/
+
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/interrupt.h>
+#include <linux/ioport.h>
+#include <linux/cpufreq.h>
+#include <linux/device.h>
+#include <linux/delay.h>
+#include <linux/clk.h>
+#include <linux/err.h>
+#include <linux/io.h>
+
+#include <asm/mach/arch.h>
+#include <asm/mach/map.h>
+
+#include <mach/regs-clock.h>
+#include <mach/s3c2412.h>
+
+#include <plat/cpu.h>
+#include <plat/cpu-freq-core.h>
+
+/* our clock resources. */
+static struct clk *xtal;
+static struct clk *fclk;
+static struct clk *hclk;
+static struct clk *armclk;
+
+/* HDIV: 1, 2, 3, 4, 6, 8 */
+
+static int s3c2412_cpufreq_calcdivs(struct s3c_cpufreq_config *cfg)
+{
+	unsigned int hdiv, pdiv, armdiv, dvs;
+	unsigned long hclk, fclk, armclk, armdiv_clk;
+	unsigned long hclk_max;
+
+	fclk = cfg->freq.fclk;
+	armclk = cfg->freq.armclk;
+	hclk_max = cfg->max.hclk;
+
+	/* We can't run hclk above armclk as at the best we have to
+	 * have armclk and hclk in dvs mode. */
+
+	if (hclk_max > armclk)
+		hclk_max = armclk;
+
+	s3c_freq_dbg("%s: fclk=%lu, armclk=%lu, hclk_max=%lu\n",
+		     __func__, fclk, armclk, hclk_max);
+	s3c_freq_dbg("%s: want f=%lu, arm=%lu, h=%lu, p=%lu\n",
+		     __func__, cfg->freq.fclk, cfg->freq.armclk,
+		     cfg->freq.hclk, cfg->freq.pclk);
+
+	armdiv = fclk / armclk;
+
+	if (armdiv < 1)
+		armdiv = 1;
+	if (armdiv > 2)
+		armdiv = 2;
+
+	cfg->divs.arm_divisor = armdiv;
+	armdiv_clk = fclk / armdiv;
+
+	hdiv = armdiv_clk / hclk_max;
+	if (hdiv < 1)
+		hdiv = 1;
+
+	cfg->freq.hclk = hclk = armdiv_clk / hdiv;
+
+	/* set dvs depending on whether we reached armclk or not. */
+	cfg->divs.dvs = dvs = armclk < armdiv_clk;
+
+	/* update the actual armclk we achieved. */
+	cfg->freq.armclk = dvs ? hclk : armdiv_clk;
+
+	s3c_freq_dbg("%s: armclk %lu, hclk %lu, armdiv %d, hdiv %d, dvs %d\n",
+		     __func__, armclk, hclk, armdiv, hdiv, cfg->divs.dvs);
+
+	if (hdiv > 4)
+		goto invalid;
+
+	pdiv = (hclk > cfg->max.pclk) ? 2 : 1;
+
+	if ((hclk / pdiv) > cfg->max.pclk)
+		pdiv++;
+
+	cfg->freq.pclk = hclk / pdiv;
+
+	s3c_freq_dbg("%s: pdiv %d\n", __func__, pdiv);
+
+	if (pdiv > 2)
+		goto invalid;
+
+	pdiv *= hdiv;
+
+	/* store the result, and then return */
+
+	cfg->divs.h_divisor = hdiv * armdiv;
+	cfg->divs.p_divisor = pdiv * armdiv;
+
+	return 0;
+
+invalid:
+	return -EINVAL;
+}
+
+static void s3c2412_cpufreq_setdivs(struct s3c_cpufreq_config *cfg)
+{
+	unsigned long clkdiv;
+	unsigned long olddiv;
+
+	olddiv = clkdiv = __raw_readl(S3C2410_CLKDIVN);
+
+	/* clear off current clock info */
+
+	clkdiv &= ~S3C2412_CLKDIVN_ARMDIVN;
+	clkdiv &= ~S3C2412_CLKDIVN_HDIVN_MASK;
+	clkdiv &= ~S3C2412_CLKDIVN_PDIVN;
+
+	if (cfg->divs.arm_divisor == 2)
+		clkdiv |= S3C2412_CLKDIVN_ARMDIVN;
+
+	clkdiv |= ((cfg->divs.h_divisor / cfg->divs.arm_divisor) - 1);
+
+	if (cfg->divs.p_divisor != cfg->divs.h_divisor)
+		clkdiv |= S3C2412_CLKDIVN_PDIVN;
+
+	s3c_freq_dbg("%s: div %08lx => %08lx\n", __func__, olddiv, clkdiv);
+	__raw_writel(clkdiv, S3C2410_CLKDIVN);
+
+	clk_set_parent(armclk, cfg->divs.dvs ? hclk : fclk);
+}
+
+static void s3c2412_cpufreq_setrefresh(struct s3c_cpufreq_config *cfg)
+{
+	struct s3c_cpufreq_board *board = cfg->board;
+	unsigned long refresh;
+
+	s3c_freq_dbg("%s: refresh %u ns, hclk %lu\n", __func__,
+		     board->refresh, cfg->freq.hclk);
+
+	/* Reduce both the refresh time (in ns) and the frequency (in MHz)
+	 * by 10 each to ensure that we do not overflow 32 bit numbers. This
+	 * should work for HCLK up to 133MHz and refresh period up to 30usec.
+	 */
+
+	refresh = (board->refresh / 10);
+	refresh *= (cfg->freq.hclk / 100);
+	refresh /= (1 * 1000 * 1000);	/* 10^6 */
+
+	s3c_freq_dbg("%s: setting refresh 0x%08lx\n", __func__, refresh);
+	__raw_writel(refresh, S3C2412_REFRESH);
+}
+
+/* set the default cpu frequency information, based on an 200MHz part
+ * as we have no other way of detecting the speed rating in software.
  */
 
+static struct s3c_cpufreq_info s3c2412_cpufreq_info = {
+	.max		= {
+		.fclk	= 200000000,
+		.hclk	= 100000000,
+		.pclk	=  50000000,
+	},
 
+	.latency	= 5000000, /* 5ms */
 
+	.locktime_m	= 150,
+	.locktime_u	= 150,
+	.locktime_bits	= 16,
 
-/*
- * Perform the MAC and PHY actions needed to enable a "port" (Virtual
- * Interface).
+	.name		= "s3c2412",
+	.set_refresh	= s3c2412_cpufreq_setrefresh,
+	.set_divs	= s3c2412_cpufreq_setdivs,
+	.calc_divs	= s3c2412_cpufreq_calcdivs,
+
+	.calc_iotiming	= s3c2412_iotiming_calc,
+	.set_iotiming	= s3c2412_iotiming_set,
+	.get_iotiming	= s3c2412_iotiming_get,
+
+	.debug_io_show  = s3c_cpufreq_debugfs_call(s3c2412_iotiming_debugfs),
+};
+
+static int s3c2412_cpufreq_add(struct device *dev,
+			       struct subsys_interface *sif)
+{
+	unsigned long fclk_rate;
+
+	hclk = clk_get(NULL, "hclk");
+	if (IS_ERR(hclk)) {
+		printk(KERN_ERR "%s: cannot find hclk clock\n", __func__);
+		return -ENOENT;
+	}
+
+	fclk = clk_get(NULL, "fclk");
+	if (IS_ERR(fclk)) {
+		printk(KERN_ERR "%s: cannot find fclk clock\n", __func__);
+		goto err_fclk;
+	}
+
+	fclk_rate = clk_get_rate(fclk);
+	if (fclk_rate > 200000000) {
+		printk(KERN_INFO
+		       "%s: fclk %ld MHz, assuming 266MHz capable part\n",
+		       __func__, fclk_rate / 1000000);
+		s3c2412_cpufreq_info.max.fclk = 266000000;
+		s3c2412_cpufreq_info.max.hclk = 133000000;
+		s3c2412_cpufreq_info.max.pclk =  66000000;
+	}
+
+	armclk = clk_get(NULL, "armclk");
+	if (IS_ERR(armclk)) {
+		printk(KERN_ERR "%s: cannot find arm clock\n", __func__);
+		goto err_armclk;
+	}
+
+	xtal = clk_get(NULL, "xtal");
+	if (IS_ERR(xtal)) {
+		printk(KERN_ERR "%s: cannot find xtal clock\n", __func__);
+		goto err_xtal;
+	}
+
+	return s3c_cpufreq_register(&s3c2412_cpufreq_info);
+
+err_xtal:
+	clk_put(armclk);
+err_armclk:
+	clk_put(fclk);
+err_fclk:
+	clk_put(hclk);
+
+	return -ENOENT;
+}
+
+static struct subsys_interface s3c2412_cpufreq_interface = {
+	.name		= "s3c2412_cpufreq",
+	.subsys		= &s3c2412_subsys,
+	.add_dev	= s3c2412_cpufreq_add,
+};
+
+static int s3c2412_cpufreq_init(void)
+{
+	return subsys_interface_register(&s3c2412_cpufreq_interface);
+}
+arch_initcall(s3c2412_cpufreq_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * S3C2416/2450 CPUfreq Support
+ *
+ * Copyright 2011 Heiko Stuebner <heiko@sntech.de>
+ *
+ * based on s3c64xx_cpufreq.c
+ *
+ * Copyright 2009 Wolfson Microelectronics plc
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
-static int link_start(struct net_device *dev)
+
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/init.h>
+#include <linux/cpufreq.h>
+#include <linux/clk.h>
+#include <linux/err.h>
+#include <linux/regulator/consumer.h>
+#include <linux/reboot.h>
+#include <linux/module.h>
+
+static DEFINE_MUTEX(cpufreq_lock);
+
+struct s3c2416_data {
+	struct clk *armdiv;
+	struct clk *armclk;
+	struct clk *hclk;
+
+	unsigned long regulator_latency;
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+	struct regulator *vddarm;
+#endif
+
+	struct cpufreq_frequency_table *freq_table;
+
+	bool is_dvs;
+	bool disable_dvs;
+};
+
+static struct s3c2416_data s3c2416_cpufreq;
+
+struct s3c2416_dvfs {
+	unsigned int vddarm_min;
+	unsigned int vddarm_max;
+};
+
+/* pseudo-frequency for dvs mode */
+#define FREQ_DVS	132333
+
+/* frequency to sleep and reboot in
+ * it's essential to leave dvs, as some boards do not reconfigure the
+ * regulator on reboot
+ */
+#define FREQ_SLEEP	133333
+
+/* Sources for the ARMCLK */
+#define SOURCE_HCLK	0
+#define SOURCE_ARMDIV	1
+
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+/* S3C2416 only supports changing the voltage in the dvs-mode.
+ * Voltages down to 1.0V seem to work, so we take what the regulator
+ * can get us.
+ */
+static struct s3c2416_dvfs s3c2416_dvfs_table[] = {
+	[SOURCE_HCLK] = {  950000, 1250000 },
+	[SOURCE_ARMDIV] = { 1250000, 1350000 },
+};
+#endif
+
+static struct cpufreq_frequency_table s3c2416_freq_table[] = {
+	{ 0, SOURCE_HCLK, FREQ_DVS },
+	{ 0, SOURCE_ARMDIV, 133333 },
+	{ 0, SOURCE_ARMDIV, 266666 },
+	{ 0, SOURCE_ARMDIV, 400000 },
+	{ 0, 0, CPUFREQ_TABLE_END },
+};
+
+static struct cpufreq_frequency_table s3c2450_freq_table[] = {
+	{ 0, SOURCE_HCLK, FREQ_DVS },
+	{ 0, SOURCE_ARMDIV, 133500 },
+	{ 0, SOURCE_ARMDIV, 267000 },
+	{ 0, SOURCE_ARMDIV, 534000 },
+	{ 0, 0, CPUFREQ_TABLE_END },
+};
+
+static unsigned int s3c2416_cpufreq_get_speed(unsigned int cpu)
+{
+	struct s3c2416_data *s3c_freq = &s3c2416_cpufreq;
+
+	if (cpu != 0)
+		return 0;
+
+	/* return our pseudo-frequency when in dvs mode */
+	if (s3c_freq->is_dvs)
+		return FREQ_DVS;
+
+	return clk_get_rate(s3c_freq->armclk) / 1000;
+}
+
+static int s3c2416_cpufreq_set_armdiv(struct s3c2416_data *s3c_freq,
+				      unsigned int freq)
 {
 	int ret;
-	struct port_info *pi = netdev_priv(dev);
 
-	/*
-	 * We do not set address filters and promiscuity here, the stack does
-	 * that step explicitly. Enable vlan accel.
-	 */
-	ret = t4vf_set_rxmode(pi->adapter, pi->viid, dev->mtu, -1, -1, -1, 1,
-			      true);
-	if (ret == 0) {
-		ret = t4vf_change_mac(pi->adapter, pi->viid,
-				      pi->xact_addr_filt, dev->dev_addr, true);
-		if (ret >= 0) {
-			pi->xact_addr_filt = ret;
-			ret = 0;
+	if (clk_get_rate(s3c_freq->armdiv) / 1000 != freq) {
+		ret = clk_set_rate(s3c_freq->armdiv, freq * 1000);
+		if (ret < 0) {
+			pr_err("cpufreq: Failed to set armdiv rate %dkHz: %d\n",
+			       freq, ret);
+			return ret;
 		}
 	}
 
-	/*
-	 * We don't need to actually "start the link" itself since the
-	 * firmware will do that for us when the first Virtual Interface
-	 * is enabled on a port.
+	return 0;
+}
+
+static int s3c2416_cpufreq_enter_dvs(struct s3c2416_data *s3c_freq, int idx)
+{
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+	struct s3c2416_dvfs *dvfs;
+#endif
+	int ret;
+
+	if (s3c_freq->is_dvs) {
+		pr_debug("cpufreq: already in dvs mode, nothing to do\n");
+		return 0;
+	}
+
+	pr_debug("cpufreq: switching armclk to hclk (%lukHz)\n",
+		 clk_get_rate(s3c_freq->hclk) / 1000);
+	ret = clk_set_parent(s3c_freq->armclk, s3c_freq->hclk);
+	if (ret < 0) {
+		pr_err("cpufreq: Failed to switch armclk to hclk: %d\n", ret);
+		return ret;
+	}
+
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+	/* changing the core voltage is only allowed when in dvs mode */
+	if (s3c_freq->vddarm) {
+		dvfs = &s3c2416_dvfs_table[idx];
+
+		pr_debug("cpufreq: setting regulator to %d-%d\n",
+			 dvfs->vddarm_min, dvfs->vddarm_max);
+		ret = regulator_set_voltage(s3c_freq->vddarm,
+					    dvfs->vddarm_min,
+					    dvfs->vddarm_max);
+
+		/* when lowering the voltage failed, there is nothing to do */
+		if (ret != 0)
+			pr_err("cpufreq: Failed to set VDDARM: %d\n", ret);
+	}
+#endif
+
+	s3c_freq->is_dvs = 1;
+
+	return 0;
+}
+
+static int s3c2416_cpufreq_leave_dvs(struct s3c2416_data *s3c_freq, int idx)
+{
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+	struct s3c2416_dvfs *dvfs;
+#endif
+	int ret;
+
+	if (!s3c_freq->is_dvs) {
+		pr_debug("cpufreq: not in dvs mode, so can't leave\n");
+		return 0;
+	}
+
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+	if (s3c_freq->vddarm) {
+		dvfs = &s3c2416_dvfs_table[idx];
+
+		pr_debug("cpufreq: setting regulator to %d-%d\n",
+			 dvfs->vddarm_min, dvfs->vddarm_max);
+		ret = regulator_set_voltage(s3c_freq->vddarm,
+					    dvfs->vddarm_min,
+					    dvfs->vddarm_max);
+		if (ret != 0) {
+			pr_err("cpufreq: Failed to set VDDARM: %d\n", ret);
+			return ret;
+		}
+	}
+#endif
+
+	/* force armdiv to hclk frequency for transition from dvs*/
+	if (clk_get_rate(s3c_freq->armdiv) > clk_get_rate(s3c_freq->hclk)) {
+		pr_debug("cpufreq: force armdiv to hclk frequency (%lukHz)\n",
+			 clk_get_rate(s3c_freq->hclk) / 1000);
+		ret = s3c2416_cpufreq_set_armdiv(s3c_freq,
+					clk_get_rate(s3c_freq->hclk) / 1000);
+		if (ret < 0) {
+			pr_err("cpufreq: Failed to set the armdiv to %lukHz: %d\n",
+			       clk_get_rate(s3c_freq->hclk) / 1000, ret);
+			return ret;
+		}
+	}
+
+	pr_debug("cpufreq: switching armclk parent to armdiv (%lukHz)\n",
+			clk_get_rate(s3c_freq->armdiv) / 1000);
+
+	ret = clk_set_parent(s3c_freq->armclk, s3c_freq->armdiv);
+	if (ret < 0) {
+		pr_err("cpufreq: Failed to switch armclk clock parent to armdiv: %d\n",
+		       ret);
+		return ret;
+	}
+
+	s3c_freq->is_dvs = 0;
+
+	return 0;
+}
+
+static int s3c2416_cpufreq_set_target(struct cpufreq_policy *policy,
+				      unsigned int index)
+{
+	struct s3c2416_data *s3c_freq = &s3c2416_cpufreq;
+	unsigned int new_freq;
+	int idx, ret, to_dvs = 0;
+
+	mutex_lock(&cpufreq_lock);
+
+	idx = s3c_freq->freq_table[index].driver_data;
+
+	if (idx == SOURCE_HCLK)
+		to_dvs = 1;
+
+	/* switching to dvs when it's not allowed */
+	if (to_dvs && s3c_freq->disable_dvs) {
+		pr_debug("cpufreq: entering dvs mode not allowed\n");
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* When leavin dvs mode, always switch the armdiv to the hclk rate
+	 * The S3C2416 has stability issues when switching directly to
+	 * higher frequencies.
 	 */
-	if (ret == 0)
-		ret = t4vf_enable_vi(pi->adapter, pi->viid, true, true);
+	new_freq = (s3c_freq->is_dvs && !to_dvs)
+				? clk_get_rate(s3c_freq->hclk) / 1000
+				: s3c_freq->freq_table[index].frequency;
+
+	if (to_dvs) {
+		pr_debug("cpufreq: enter dvs\n");
+		ret = s3c2416_cpufreq_enter_dvs(s3c_freq, idx);
+	} else if (s3c_freq->is_dvs) {
+		pr_debug("cpufreq: leave dvs\n");
+		ret = s3c2416_cpufreq_leave_dvs(s3c_freq, idx);
+	} else {
+		pr_debug("cpufreq: change armdiv to %dkHz\n", new_freq);
+		ret = s3c2416_cpufreq_set_armdiv(s3c_freq, new_freq);
+	}
+
+out:
+	mutex_unlock(&cpufreq_lock);
+
 	return ret;
 }
 
-/*
- * Name the MSI-X interrupts.
- */
-static void name_msix_vecs(struct adapter *adapter)
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+static void s3c2416_cpufreq_cfg_regulator(struct s3c2416_data *s3c_freq)
 {
-	int namelen = sizeof(adapter->msix_info[0].desc) - 1;
-	int pidx;
+	int count, v, i, found;
+	struct cpufreq_frequency_table *pos;
+	struct s3c2416_dvfs *dvfs;
 
-	/*
-	 * Firmware events.
-	 */
-	snprintf(adapter->msix_info[MSIX_FW].desc, namelen,
-		 "%s-FWeventq", adapter->name);
-	adapter->msix_info[MSIX_FW].desc[namelen] = 0;
-
-	/*
-	 * Ethernet queues.
-	 */
-	for_each_port(adapter, pidx) {
-		struct net_device *dev = adapter->port[pidx];
-		const struct port_info *pi = netdev_priv(dev);
-		int qs, msi;
-
-		for (qs = 0, msi = MSIX_IQFLINT; qs < pi->nqsets; qs++, msi++) {
-			snprintf(adapter->msix_info[msi].desc, namelen,
-				 "%s-%d", dev->name, qs);
-			adapter->msix_info[msi].desc[namelen] = 0;
-		}
-	}
-}
-
-/*
- * Request all of our MSI-X resources.
- */
-static int request_msix_queue_irqs(struct adapter *adapter)
-{
-	struct sge *s = &adapter->sge;
-	int rxq, msi, err;
-
-	/*
-	 * Firmware events.
-	 */
-	err = request_irq(adapter->msix_info[MSIX_FW].vec, t4vf_sge_intr_msix,
-			  0, adapter->msix_info[MSIX_FW].desc, &s->fw_evtq);
-	if (err)
-		return err;
-
-	/*
-	 * Ethernet queues.
-	 */
-	msi = MSIX_IQFLINT;
-	for_each_ethrxq(s, rxq) {
-		err = request_irq(adapter->msix_info[msi].vec,
-				  t4vf_sge_intr_msix, 0,
-				  adapter->msix_info[msi].desc,
-				  &s->ethrxq[rxq].rspq);
-		if (err)
-			goto err_free_irqs;
-		msi++;
-	}
-	return 0;
-
-err_free_irqs:
-	while (--rxq >= 0)
-		free_irq(adapter->msix_info[--msi].vec, &s->ethrxq[rxq].rspq);
-	free_irq(adapter->msix_info[MSIX_FW].vec, &s->fw_evtq);
-	return err;
-}
-
-/*
- * Free our MSI-X resources.
- */
-static void free_msix_queue_irqs(struct adapter *adapter)
-{
-	struct sge *s = &adapter->sge;
-	int rxq, msi;
-
-	free_irq(adapter->msix_info[MSIX_FW].vec, &s->fw_evtq);
-	msi = MSIX_IQFLINT;
-	for_each_ethrxq(s, rxq)
-		free_irq(adapter->msix_info[msi++].vec,
-			 &s->ethrxq[rxq].rspq);
-}
-
-/*
- * Turn on NAPI and start up interrupts on a response queue.
- */
-static void qenable(struct sge_rspq *rspq)
-{
-	napi_enable(&rspq->napi);
-
-	/*
-	 * 0-increment the Going To Sleep register to start the timer and
-	 * enable interrupts.
-	 */
-	t4_write_reg(rspq->adapter, T4VF_SGE_BASE_ADDR + SGE_VF_GTS,
-		     CIDXINC_V(0) |
-		     SEINTARM_V(rspq->intr_params) |
-		     INGRESSQID_V(rspq->cntxt_id));
-}
-
-/*
- * Enable NAPI scheduling and interrupt generation for all Receive Queues.
- */
-static void enable_rx(struct adapter *adapter)
-{
-	int rxq;
-	struct sge *s = &adapter->sge;
-
-	for_each_ethrxq(s, rxq)
-		qenable(&s->ethrxq[rxq].rspq);
-	qenable(&s->fw_evtq);
-
-	/*
-	 * The interrupt queue doesn't use NAPI so we do the 0-increment of
-	 * its Going To Sleep register here to get it started.
-	 */
-	if (adapter->flags & USING_MSI)
-		t4_write_reg(adapter, T4VF_SGE_BASE_ADDR + SGE_VF_GTS,
-			     CIDXINC_V(0) |
-			     SEINTARM_V(s->intrq.intr_params) |
-			     INGRESSQID_V(s->intrq.cntxt_id));
-
-}
-
-/*
- * Wait until all NAPI handlers are descheduled.
- */
-static void quiesce_rx(struct adapter *adapter)
-{
-	struct sge *s = &adapter->sge;
-	int rxq;
-
-	for_each_ethrxq(s, rxq)
-		napi_disable(&s->ethrxq[rxq].rspq.napi);
-	napi_disable(&s->fw_evtq.napi);
-}
-
-/*
- * Response queue handler for the firmware event queue.
- */
-static int fwevtq_handler(struct sge_rspq *rspq, const __be64 *rsp,
-			  const struct pkt_gl *gl)
-{
-	/*
-	 * Extract response opcode and get pointer to CPL message body.
-	 */
-	struct adapter *adapter = rspq->adapter;
-	u8 opcode = ((const struct rss_header *)rsp)->opcode;
-	void *cpl = (void *)(rsp + 1);
-
-	switch (opcode) {
-	case CPL_FW6_MSG: {
-		/*
-		 * We've received an asynchronous message from the firmware.
-		 */
-		const struct cpl_fw6_msg *fw_msg = cpl;
-		if (fw_msg->type == FW6_TYPE_CMD_RPL)
-			t4vf_handle_fw_rpl(adapter, fw_msg->data);
-		break;
+	count = regulator_count_voltages(s3c_freq->vddarm);
+	if (count < 0) {
+		pr_err("cpufreq: Unable to check supported voltages\n");
+		return;
 	}
 
-	case CPL_FW4_MSG: {
-		/* FW can send EGR_UPDATEs encapsulated in a CPL_FW4_MSG.
-		 */
-		const struct cpl_sge_egr_update *p = (void *)(rsp + 3);
-		opcode = CPL_OPCODE_G(ntohl(p->opcode_qid));
-		if (opcode != CPL_SGE_EGR_UPDATE) {
-			dev_err(adapter->pdev_dev, "unexpected FW4/CPL %#x on FW event queue\n"
-				, opcode);
-			break;
-		}
-		cpl = (void *)p;
-		/*FALLTHROUGH*/
-	}
+	if (!count)
+		goto out;
 
-	case CPL_SGE_EGR_UPDATE: {
-		/*
-		 * We've received an Egress Queue Status Update message.  We
-		 * get these, if the SGE is configured to send these when the
-		 * firmware passes certain points in processing our TX
-		 * Ethernet Queue or if we make an explicit request for one.
-		 * We use these updates to determine when we may need to
-		 * restart a TX Ethernet Queue which was stopped for lack of
-		 * free TX Queue Descriptors ...
-		 */
-		const struct cpl_sge_egr_update *p = cpl;
-		unsigned int qid = EGR_QID_G(be32_to_cpu(p->opcode_qid));
-		struct sge *s = &adapter->sge;
-		struct sge_txq *tq;
-		struct sge_eth_txq *txq;
-		unsigned int eq_idx;
+	cpufreq_for_each_valid_entry(pos, s3c_freq->freq_table) {
+		dvfs = &s3c2416_dvfs_table[pos->driver_data];
+		found = 0;
 
-		/*
-		 * Perform sanity checking on the Queue ID to make sure it
-		 * really refers to one of our TX Ethernet Egress Queues which
-		 * is active and matches the queue's ID.  None of these error
-		 * conditions should ever happen so we may want to either make
-		 * them fatal and/or conditionalized under DEBUG.
-		 */
-		eq_idx = EQ_IDX(s, qid);
-		if (unlikely(eq_idx >= MAX_EGRQ)) {
-			dev_err(adapter->pdev_dev,
-				"Egress Update QID %d out of range\n", qid);
-			break;
-		}
-		tq = s->egr_map[eq_idx];
-		if (unlikely(tq == NULL)) {
-			dev_err(adapter->pdev_dev,
-				"Egress Update QID %d TXQ=NULL\n", qid);
-			break;
-		}
-		txq = container_of(tq, struct sge_eth_txq, q);
-		if (unlikely(tq->abs_id != qid)) {
-			dev_err(adapter->pdev_dev,
-				"Egress Update QID %d refers to TXQ %d\n",
-				qid, tq->abs_id);
-			break;
+		/* Check only the min-voltage, more is always ok on S3C2416 */
+		for (i = 0; i < count; i++) {
+			v = regulator_list_voltage(s3c_freq->vddarm, i);
+			if (v >= dvfs->vddarm_min)
+				found = 1;
 		}
 
-		/*
-		 * Restart a stopped TX Queue which has less than half of its
-		 * TX ring in use ...
-		 */
-		txq->q.restarts++;
-		netif_tx_wake_queue(txq->txq);
-		break;
-	}
-
-	default:
-		dev_err(adapter->pdev_dev,
-			"unexpected CPL %#x on FW event queue\n", opcode);
-	}
-
-	return 0;
-}
-
-/*
- * Allocate SGE TX/RX response queues.  Determine how many sets of SGE queues
- * to use and initializes them.  We support multiple "Queue Sets" per port if
- * we have MSI-X, otherwise just one queue set per port.
- */
-static int setup_sge_queues(struct adapter *adapter)
-{
-	struct sge *s = &adapter->sge;
-	int err, pidx, msix;
-
-	/*
-	 * Clear "Queue Set" Free List Starving and TX Queue Mapping Error
-	 * state.
-	 */
-	bitmap_zero(s->starving_fl, MAX_EGRQ);
-
-	/*
-	 * If we're using MSI interrupt mode we need to set up a "forwarded
-	 * interrupt" queue which we'll set up with our MSI vector.  The rest
-	 * of the ingress queues will be set up to forward their interrupts to
-	 * this queue ...  This must be first since t4vf_sge_alloc_rxq() uses
-	 * the intrq's queue ID as the interrupt forwarding queue for the
-	 * subsequent calls ...
-	 */
-	if (adapter->flags & USING_MSI) {
-		err = t4vf_sge_alloc_rxq(adapter, &s->intrq, false,
-					 adapter->port[0], 0, NULL, NULL);
-		if (err)
-			goto err_free_queues;
-	}
-
-	/*
-	 * Allocate our ingress queue for asynchronous firmware messages.
-	 */
-	err = t4vf_sge_alloc_rxq(adapter, &s->fw_evtq, true, adapter->port[0],
-				 MSIX_FW, NULL, fwevtq_handler);
-	if (err)
-		goto err_free_queues;
-
-	/*
-	 * Allocate each "port"'s initial Queue Sets.  These can be changed
-	 * later on ... up to the point where any interface on the adapter is
-	 * brought up at which point lots of things get nailed down
-	 * permanently ...
-	 */
-	msix = MSIX_IQFLINT;
-	for_each_port(adapter, pidx) {
-		struct net_device *dev = adapter->port[pidx];
-		struct port_info *pi = netdev_priv(dev);
-		struct sge_eth_rxq *rxq = &s->ethrxq[pi->first_qset];
-		struct sge_eth_txq *txq = &s->ethtxq[pi->first_qset];
-		int qs;
-
-		for (qs = 0; qs < pi->nqsets; qs++, rxq++, txq++) {
-			err = t4vf_sge_alloc_rxq(adapter, &rxq->rspq, false,
-						 dev, msix++,
-						 &rxq->fl, t4vf_ethrx_handler);
-			if (err)
-				goto err_free_queues;
-
-			err = t4vf_sge_alloc_eth_txq(adapter, txq, dev,
-					     netdev_get_tx_queue(dev, qs),
-					     s->fw_evtq.cntxt_id);
-			if (err)
-				goto err_free_queues;
-
-			rxq->rspq.idx = qs;
-			memset(&rxq->stats, 0, sizeof(rxq->stats));
+		if (!found) {
+			pr_debug("cpufreq: %dkHz unsupported by regulator\n",
+				 pos->frequency);
+			pos->frequency = CPUFREQ_ENTRY_INVALID;
 		}
 	}
 
-	/*
-	 * Create the reverse mappings for the queues.
+out:
+	/* Guessed */
+	s3c_freq->regulator_latency = 1 * 1000 * 1000;
+}
+#endif
+
+static int s3c2416_cpufreq_reboot_notifier_evt(struct notifier_block *this,
+					       unsigned long event, void *ptr)
+{
+	struct s3c2416_data *s3c_freq = &s3c2416_cpufreq;
+	int ret;
+
+	mutex_lock(&cpufreq_lock);
+
+	/* disable further changes */
+	s3c_freq->disable_dvs = 1;
+
+	mutex_unlock(&cpufreq_lock);
+
+	/* some boards don't reconfigure the regulator on reboot, which
+	 * could lead to undervolting the cpu when the clock is reset.
+	 * Therefore we always leave the DVS mode on reboot.
 	 */
-	s->egr_base = s->ethtxq[0].q.abs_id - s->ethtxq[0].q.cntxt_id;
-	s->ingr_base = s->ethrxq[0].rspq.abs_id - s->ethrxq[0].rspq.cntxt_id;
-	IQ_MAP(s, s->fw_evtq.abs_id) = &s->fw_evtq;
-	for_each_port(adapter, pidx) {
-		struct net_device *dev = adapter->port[pidx];
-		struct port_info *pi = netdev_priv(dev);
-		struct sge_eth_rxq *rxq = &s->ethrxq[pi->first_qset];
-		struct sge_eth_txq *txq = &s->ethtxq[pi->first_qset];
-		int qs;
-
-		for (qs = 0; qs < pi->nqsets; qs++, rxq++, txq++) {
-			IQ_MAP(s, rxq->rspq.abs_id) = &rxq->rspq;
-			EQ_MAP(s, txq->q.abs_id) = &txq->q;
-
-			/*
-			 * The FW_IQ_CMD doesn't return the Absolute Queue IDs
-			 * for Free Lists but since all of the Egress Queues
-			 * (including Free Lists) have Relative Queue IDs
-			 * which are computed as Absolute - Base Queue ID, we
-			 * can synthesize the Absolute Queue IDs for the Free
-			 * Lists.  This is useful for debugging purposes when
-			 * we want to dump Queue Contexts via the PF Driver.
-			 */
-			rxq->fl.abs_id = rxq->fl.cntxt_id + s->egr_base;
-			EQ_MAP(s, rxq->fl.abs_id) = &rxq->fl;
-		}
+	if (s3c_freq->is_dvs) {
+		pr_debug("cpufreq: leave dvs on reboot\n");
+		ret = cpufreq_driver_target(cpufreq_cpu_get(0), FREQ_SLEEP, 0);
+		if (ret < 0)
+			return NOTIFY_BAD;
 	}
-	return 0;
 
-err_free_queues:
-	t4vf_free_sge_resources(adapter);
-	return err;
+	return NOTIFY_DONE;
 }
 
-/*
- * Set up Receive Side Scaling (RSS) to distribute packets to multiple receive
- * queues.  We configure the RSS CPU lookup table to distribute to the number
- * of HW receive queues, and the response queue lookup table to narrow that
- * down to the response queues actually configured for each "port" (Virtual
- * Interface).  We always configure the RSS mapping for all ports since the
- * mapping table has plenty of entries.
- */
-static int setup_rss(struct adapter *adapter)
+static struct notifier_block s3c2416_cpufreq_reboot_notifier = {
+	.notifier_call = s3c2416_cpufreq_reboot_notifier_evt,
+};
+
+static int s3c2416_cpufreq_driver_init(struct cpufreq_policy *policy)
 {
-	int pidx;
+	struct s3c2416_data *s3c_freq = &s3c2416_cpufreq;
+	struct cpufreq_frequency_table *pos;
+	struct clk *msysclk;
+	unsigned long rate;
+	int ret;
 
-	for_each_port(adapter, pidx) {
-		struct port_info *pi = adap2pinfo(adapter, pidx);
-		struct sge_eth_rxq *rxq = &adapter->sge.ethrxq[pi->first_qset];
-		u16 rss[MAX_PORT_QSETS];
-		int qs, err;
+	if (policy->cpu != 0)
+		return -EINVAL;
 
-		for (qs = 0; qs < pi->nqsets; qs++)
-			rss[qs] = rxq[qs].rspq.abs_id;
+	msysclk = clk_get(NULL, "msysclk");
+	if (IS_ERR(msysclk)) {
+		ret = PTR_ERR(msysclk);
+		pr_err("cpufreq: Unable to obtain msysclk: %d\n", ret);
+		return ret;
+	}
 
-		err = t4vf_config_rss_range(adapter, pi->viid,
-					    0, pi->rss_size, rss, pi->nqsets);
-		if (err)
-			return err;
+	/*
+	 * S3C2416 and S3C2450 share the same processor-ID and also provide no
+	 * other means to distinguish them other than through the rate of
+	 * msysclk. On S3C2416 msysclk runs at 800MHz and on S3C2450 at 533MHz.
+	 */
+	rate = clk_get_rate(msysclk);
+	if (rate == 800 * 1000 * 1000) {
+		pr_info("cpufreq: msysclk running at %lukHz, using S3C2416 frequency table\n",
+			rate / 1000);
+		s3c_freq->freq_table = s3c2416_freq_table;
+		policy->cpuinfo.max_freq = 400000;
+	} else if (rate / 1000 == 534000) {
+		pr_info("cpufreq: msysclk running at %lukHz, using S3C2450 frequency table\n",
+			rate / 1000);
+		s3c_freq->freq_table = s3c2450_freq_table;
+		policy->cpuinfo.max_freq = 534000;
+	}
 
-		/*
-		 * Perform Global RSS Mode-specific initialization.
-		 */
-		switch (adapter->params.rss.mode) {
-		case FW_RSS_GLB_CONFIG_CMD_MODE_BASICVIRTUAL:
-			/*
-			 * If Tunnel All Lookup isn't specified in the global
-			 * RSS Configuration, then we need to specify a
-			 * default Ingress Queue for any ingress packets which
-			 * aren't hashed.  We'll use our first ingress queue
-			 * ...
-			 */
-			if (!adapter->params.rss.u.basicvirtual.tnlalllookup) {
-				union rss_vi_config config;
-				err = t4vf_read_rss_vi_config(adapter,
-							      pi->viid,
-							      &config);
-				if (err)
-					return err;
-				config.basicvirtual.defaultq =
-					rxq[0].rspq.abs_id;
-				err = t4vf_write_rss_vi_config(adapter,
-							       pi->viid,
-							       &config);
-				if (err)
-					return err;
+	/* not needed anymore */
+	clk_put(msysclk);
+
+	if (s3c_freq->freq_table == NULL) {
+		pr_err("cpufreq: No frequency information for this CPU, msysclk at %lukHz\n",
+		       rate / 1000);
+		return -ENODEV;
+	}
+
+	s3c_freq->is_dvs = 0;
+
+	s3c_freq->armdiv = clk_get(NULL, "armdiv");
+	if (IS_ERR(s3c_freq->armdiv)) {
+		ret = PTR_ERR(s3c_freq->armdiv);
+		pr_err("cpufreq: Unable to obtain ARMDIV: %d\n", ret);
+		return ret;
+	}
+
+	s3c_freq->hclk = clk_get(NULL, "hclk");
+	if (IS_ERR(s3c_freq->hclk)) {
+		ret = PTR_ERR(s3c_freq->hclk);
+		pr_err("cpufreq: Unable to obtain HCLK: %d\n", ret);
+		goto err_hclk;
+	}
+
+	/* chech hclk rate, we only support the common 133MHz for now
+	 * hclk could also run at 66MHz, but this not often used
+	 */
+	rate = clk_get_rate(s3c_freq->hclk);
+	if (rate < 133 * 1000 * 1000) {
+		pr_err("cpufreq: HCLK not at 133MHz\n");
+		ret = -EINVAL;
+		goto err_armclk;
+	}
+
+	s3c_freq->armclk = clk_get(NULL, "armclk");
+	if (IS_ERR(s3c_freq->armclk)) {
+		ret = PTR_ERR(s3c_freq->armclk);
+		pr_err("cpufreq: Unable to obtain ARMCLK: %d\n", ret);
+		goto err_armclk;
+	}
+
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+	s3c_freq->vddarm = regulator_get(NULL, "vddarm");
+	if (IS_ERR(s3c_freq->vddarm)) {
+		ret = PTR_ERR(s3c_freq->vddarm);
+		pr_err("cpufreq: Failed to obtain VDDARM: %d\n", ret);
+		goto err_vddarm;
+	}
+
+	s3c2416_cpufreq_cfg_regulator(s3c_freq);
+#else
+	s3c_freq->regulator_latency = 0;
+#endif
+
+	cpufreq_for_each_entry(pos, s3c_freq->freq_table) {
+		/* special handling for dvs mode */
+		if (pos->driver_data == 0) {
+			if (!s3c_freq->hclk) {
+				pr_debug("cpufreq: %dkHz unsupported as it would need unavailable dvs mode\n",
+					 pos->frequency);
+				pos->frequency = CPUFREQ_ENTRY_INVALID;
+			} else {
+				continue;
 			}
-			break;
+		}
+
+		/* Check for frequencies we can generate */
+		rate = clk_round_rate(s3c_freq->armdiv,
+				      pos->frequency * 1000);
+		rate /= 1000;
+		if (rate != pos->frequency) {
+			pr_debug("cpufreq: %dkHz unsupported by clock (clk_round_rate return %lu)\n",
+				pos->frequency, rate);
+			pos->frequency = CPUFREQ_ENTRY_INVALID;
 		}
 	}
 
-	return 0;
-}
-
-/*
- * Bring the adapter up.  Called whenever we go from no "ports" open to having
- * one open.  This function performs the actions necessary to make an adapter
- * operational, such as completing the initialization of HW modules, and
- * enabling interrupts.  Must be called with the rtnl lock held.  (Note that
- * this is called "cxgb_up" in the PF Driver.)
- */
-static int adapter_up(struct adapter *adapter)
-{
-	int err;
-
-	/*
-	 * If this is the first time we've been called, perform basic
-	 * adapter setup.  Once we've done this, many of our adapter
-	 * parameters can no longer be changed ...
+	/* Datasheet says PLL stabalisation time must be at least 300us,
+	 * so but add some fudge. (reference in LOCKCON0 register description)
 	 */
-	if ((adapter->flags & FULL_INIT_DONE) == 0) {
-		err = setup_sge_queues(adapter);
-		if (err)
-			return err;
-		err = setup_rss(adapter);
-		if (err) {
-			t4vf_free_sge_resources(adapter);
-			return err;
-		}
+	ret = cpufreq_generic_init(policy, s3c_freq->freq_table,
+			(500 * 1000) + s3c_freq->regulator_latency);
+	if (ret)
+		goto err_freq_table;
 
-		if (adapter->flags & USING_MSIX)
-			name_msix_vecs(adapter);
-		adapter->flags |= FULL_INIT_DONE;
-	}
+	register_reboot_notifier(&s3c2416_cpufreq_reboot_notifier);
 
-	/*
-	 * Acquire our interrupt resources.  We only support MSI-X and MSI.
-	 */
-	BUG_ON((adapter->flags & (USING_MSIX|USING_MSI)) == 0);
-	if (adapter->flags & USING_MSIX)
-		err = request_msix_queue_irqs(adapter);
-	else
-		err = request_irq(adapter->pdev->irq,
-				  t4vf_intr_handler(adapter), 0,
-				  adapter->name, adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "request_irq failed, err %d\n",
-			err);
-		return err;
-	}
-
-	/*
-	 * Enable NAPI ingress processing and return success.
-	 */
-	enable_rx(adapter);
-	t4vf_sge_start(adapter);
-	return 0;
-}
-
-/*
- * Bring the adapter down.  Called whenever the last "port" (Virtual
- * Interface) closed.  (Note that this routine is called "cxgb_down" in the PF
- * Driver.)
- */
-static void adapter_down(struct adapter *adapter)
-{
-	/*
-	 * Free interrupt resources.
-	 */
-	if (adapter->flags & USING_MSIX)
-		free_msix_queue_irqs(adapter);
-	else
-		free_irq(adapter->pdev->irq, adapter);
-
-	/*
-	 * Wait for NAPI handlers to finish.
-	 */
-	quiesce_rx(adapter);
-}
-
-/*
- * Start up a net device.
- */
-static int cxgb4vf_open(struct net_device *dev)
-{
-	int err;
-	struct port_info *pi = netdev_priv(dev);
-	struct adapter *adapter = pi->adapter;
-
-	/*
-	 * If this is the first interface that we're opening on the "adapter",
-	 * bring the "adapter" up now.
-	 */
-	if (adapter->open_device_map == 0) {
-		err = adapter_up(adapter);
-		if (err)
-			return err;
-	}
-
-	/*
-	 * Note that this interface is up and start everything up ...
-	 */
-	netif_set_real_num_tx_queues(dev, pi->nqsets);
-	err = netif_set_real_num_rx_queues(dev, pi->nqsets);
-	if (err)
-		goto err_unwind;
-	err = link_start(dev);
-	if (err)
-		goto err_unwind;
-
-	netif_tx_start_all_queues(dev);
-	set_bit(pi->port_id, &adapter->open_device_map);
 	return 0;
 
-err_unwind:
-	if (adapter->open_device_map == 0)
-		adapter_down(adapter);
-	return err;
-}
+err_freq_table:
+#ifdef CONFIG_ARM_S3C2416_CPUFREQ_VCORESCALE
+	regulator_put(s3c_freq->vddarm);
+err_vddarm:
+#endif
+	clk_put(s3c_freq->armclk);
+err_armclk:
+	clk_put(s3c_freq->hclk);
+err_hclk:
+	clk_put(s3c_freq->armdiv);
 
-/*
- * Shut down a net device.  This routine is called "cxgb_close" in the PF
- * Driver ...
- */
-static int cxgb4vf_stop(struct net_device *dev)
-{
-	struct port_info *pi = netdev_priv(dev);
-	struct adapter *adapter = pi->adapter;
-
-	netif_tx_stop_all_queues(dev);
-	netif_carrier_off(dev);
-	t4vf_enable_vi(adapter, pi->viid, false, false);
-	pi->link_cfg.link_ok = 0;
-
-	clear_bit(pi->port_id, &adapter->open_device_map);
-	if (adapter->open_device_map == 0)
-		adapter_down(adapter);
-	return 0;
-}
-
-/*
- * Translate our basic statistics into the standard "ifconfig" statistics.
- */
-static struct net_device_stats *cxgb4vf_get_stats(struct net_device *dev)
-{
-	struct t4vf_port_stats stats;
-	struct port_info *pi = netdev2pinfo(dev);
-	struct adapter *adapter = pi->adapter;
-	struct net_device_stats *ns = &dev->stats;
-	int err;
-
-	spin_lock(&adapter->stats_lock);
-	err = t4vf_get_port_stats(adapter, pi->pidx, &stats);
-	spin_unlock(&adapter->stats_lock);
-
-	memset(ns, 0, sizeof(*ns));
-	if (err)
-		return ns;
-
-	ns->tx_bytes = (stats.tx_bcast_bytes + stats.tx_mcast_bytes +
-			stats.tx_ucast_bytes + stats.tx_offload_bytes);
-	ns->tx_packets = (stats.tx_bcast_frames + stats.tx_mcast_frames +
-			  stats.tx_ucast_frames + stats.tx_offload_frames);
-	ns->rx_bytes = (stats.rx_bcast_bytes + stats.rx_mcast_bytes +
-			stats.rx_ucast_bytes);
-	ns->rx_packets = (stats.rx_bcast_frames + stats.rx_mcast_frames +
-			  stats.rx_ucast_frames);
-	ns->multicast = stats.rx_mcast_frames;
-	ns->tx_errors = stats.tx_drop_frames;
-	ns->rx_errors = stats.rx_err_frames;
-
-	return ns;
-}
-
-/*
- * Collect up to maxaddrs worth of a netdevice's unicast addresses, starting
- * at a specified offset within the list, into an array of addrss pointers and
- * return the number collected.
- */
-static inline unsigned int collect_netdev_uc_list_addrs(const struct net_device *dev,
-							const u8 **addr,
-							unsigned int offset,
-							unsigned int maxaddrs)
-{
-	unsigned int index = 0;
-	unsigned int naddr = 0;
-	const struct netdev_hw_addr *ha;
-
-	for_each_dev_addr(dev, ha)
-		if (index++ >= offset) {
-			addr[naddr++] = ha->addr;
-			if (naddr >= maxaddrs)
-				break;
-		}
-	return naddr;
-}
-
-/*
- * Collect up to maxaddrs worth of a netdevice's multicast addresses, starting
- * at a specified offset within the list, into an array of addrss pointers and
- * return the number collected.
- */
-static inline unsigned int collect_netdev_mc_list_addrs(const struct net_device *dev,
-							const u8 **addr,
-							unsigned int offset,
-							unsigned int maxaddrs)
-{
-	unsigned int index = 0;
-	unsigned int naddr = 0;
-	const struct netdev_hw_addr *ha;
-
-	netdev_for_each_mc_addr(ha, dev)
-		if (index++ >= offset) {
-			addr[naddr++] = ha->addr;
-			if (naddr >= maxaddrs)
-				break;
-		}
-	return naddr;
-}
-
-/*
- * Configure the exact and hash address filters to handle a port's multicast
- * and secondary unicast MAC addresses.
- */
-static int set_addr_filters(const struct net_device *dev, bool sleep)
-{
-	u64 mhash = 0;
-	u64 uhash = 0;
-	bool free = true;
-	unsigned int offset, naddr;
-	const u8 *addr[7];
-	int ret;
-	const struct port_info *pi = netdev_priv(dev);
-
-	/* first do the secondary unicast addresses */
-	for (offset = 0; ; offset += naddr) {
-		naddr = collect_netdev_uc_list_addrs(dev, addr, offset,
-						     ARRAY_SIZE(addr));
-		if (naddr == 0)
-			break;
-
-		ret = t4vf_alloc_mac_filt(pi->adapter, pi->viid, free,
-					  naddr, addr, NULL, &uhash, sleep);
-		if (ret < 0)
-			return ret;
-
-		free = false;
-	}
-
-	/* next set up the multicast addresses */
-	for (offset = 0; ; offset += naddr) {
-		naddr = collect_netdev_mc_list_addrs(dev, addr, offset,
-						     ARRAY_SIZE(addr));
-		if (naddr == 0)
-			break;
-
-		ret = t4vf_alloc_mac_filt(pi->adapter, pi->viid, free,
-					  naddr, addr, NULL, &mhash, sleep);
-		if (ret < 0)
-			return ret;
-		free = false;
-	}
-
-	return t4vf_set_addr_hash(pi->adapter, pi->viid, uhash != 0,
-				  uhash | mhash, sleep);
-}
-
-/*
- * Set RX properties of a port, such as promiscruity, address filters, and MTU.
- * If @mtu is -1 it is left unchanged.
- */
-static int set_rxmode(struct net_device *dev, int mtu, bool sleep_ok)
-{
-	int ret;
-	struct port_info *pi = netdev_priv(dev);
-
-	ret = set_addr_filters(dev, sleep_ok);
-	if (ret == 0)
-		ret = t4vf_set_rxmode(pi->adapter, pi->viid, -1,
-				      (dev->flags & IFF_PROMISC) != 0,
-				      (dev->flags & IFF_ALLMULTI) != 0,
-				      1, -1, sleep_ok);
 	return ret;
 }
 
-/*
- * Set the current receive modes on the device.
- */
-static void cxgb4vf_set_rxmode(struct net_device *dev)
+static struct cpufreq_driver s3c2416_cpufreq_driver = {
+	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK,
+	.verify		= cpufreq_generic_frequency_table_verify,
+	.target_index	= s3c2416_cpufreq_set_target,
+	.get		= s3c2416_cpufreq_get_speed,
+	.init		= s3c2416_cpufreq_driver_init,
+	.name		= "s3c2416",
+	.attr		= cpufreq_generic_attr,
+};
+
+static int __init s3c2416_cpufreq_init(void)
 {
-	/* unfortunately we can't return errors to the stack */
-	set_rxmode(dev, -1, false);
+	return cpufreq_register_driver(&s3c2416_cpufreq_driver);
 }
+module_init(s3c2416_cpufreq_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+ * Copyright (c) 2006-2009 Simtec Electronics
+ *	http://armlinux.simtec.co.uk/
+ *	Ben Dooks <ben@simtec.co.uk>
+ *	Vincent Sanders <vince@simtec.co.uk>
+ *
+ * S3C2440/S3C2442 CPU Frequency scaling
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+*/
 
-/*
- * Find the entry in the interrupt holdoff timer value array which comes
- * closest to the specified interrupt holdoff value.
- */
-static int closest_timer(const struct sge *s, int us)
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/interrupt.h>
+#include <linux/ioport.h>
+#include <linux/cpufreq.h>
+#include <linux/device.h>
+#include <linux/delay.h>
+#include <linux/clk.h>
+#include <linux/err.h>
+#include <linux/io.h>
+
+#include <asm/mach/arch.h>
+#include <asm/mach/map.h>
+
+#include <mach/regs-clock.h>
+
+#include <plat/cpu.h>
+#include <plat/cpu-freq-core.h>
+
+static struct clk *xtal;
+static struct clk *fclk;
+static struct clk *hclk;
+static struct clk *armclk;
+
+/* HDIV: 1, 2, 3, 4, 6, 8 */
+
+static inline int within_khz(unsigned long a, unsigned long b)
 {
-	int i, timer_idx = 0, min_delta = INT_MAX;
+	long diff = a - b;
 
-	for (i = 0; i < ARRAY_SIZE(s->timer_val); i++) {
-		int delta = us - s->timer_val[i];
-		if (delta < 0)
-			delta = -delta;
-		if (delta < min_delta) {
-			min_delta = delta;
-			timer_idx = i;
-		}
-	}
-	return timer_idx;
-}
-
-static int closest_thres(const struct sge *s, int thres)
-{
-	int i, delta, pktcnt_idx = 0, min_delta = INT_MAX;
-
-	for (i = 0; i < ARRAY_SIZE(s->counter_val); i++) {
-		delta = thres - s->counter_val[i];
-		if (delta < 0)
-			delta = -delta;
-		if (delta < min_delta) {
-			min_delta = delta;
-			pktcnt_idx = i;
-		}
-	}
-	return pktcnt_idx;
-}
-
-/*
- * Return a queue's interrupt hold-off time in us.  0 means no timer.
- */
-static unsigned int qtimer_val(const struct adapter *adapter,
-			       const struct sge_rspq *rspq)
-{
-	unsigned int timer_idx = QINTR_TIMER_IDX_G(rspq->intr_params);
-
-	return timer_idx < SGE_NTIMERS
-		? adapter->sge.timer_val[timer_idx]
-		: 0;
+	return (diff >= -1000 && diff <= 1000);
 }
 
 /**
- *	set_rxq_intr_params - set a queue's interrupt holdoff parameters
- *	@adapter: the adapter
- *	@rspq: the RX response queue
- *	@us: the hold-off time in us, or 0 to disable timer
- *	@cnt: the hold-off packet count, or 0 to disable counter
+ * s3c2440_cpufreq_calcdivs - calculate divider settings
+ * @cfg: The cpu frequency settings.
  *
- *	Sets an RX response queue's interrupt hold-off time and packet count.
- *	At least one of the two needs to be enabled for the queue to generate
- *	interrupts.
+ * Calcualte the divider values for the given frequency settings
+ * specified in @cfg. The values are stored in @cfg for later use
+ * by the relevant set routine if the request settings can be reached.
  */
-static int set_rxq_intr_params(struct adapter *adapter, struct sge_rspq *rspq,
-			       unsigned int us, unsigned int cnt)
+static int s3c2440_cpufreq_calcdivs(struct s3c_cpufreq_config *cfg)
 {
-	unsigned int timer_idx;
+	unsigned int hdiv, pdiv;
+	unsigned long hclk, fclk, armclk;
+	unsigned long hclk_max;
 
-	/*
-	 * If both the interrupt holdoff timer and count are specified as
-	 * zero, default to a holdoff count of 1 ...
-	 */
-	if ((us | cnt) == 0)
-		cnt = 1;
+	fclk = cfg->freq.fclk;
+	armclk = cfg->freq.armclk;
+	hclk_max = cfg->max.hclk;
 
-	/*
-	 * If an interrupt holdoff count has been specified, then find the
-	 * closest configured holdoff count and use that.  If the response
-	 * queue has already been created, then update its queue context
-	 * parameters ...
-	 */
-	if (cnt) {
-		int err;
-		u32 v, pktcnt_idx;
+	s3c_freq_dbg("%s: fclk is %lu, armclk %lu, max hclk %lu\n",
+		     __func__, fclk, armclk, hclk_max);
 
-		pktcnt_idx = closest_thres(&adapter->sge, cnt);
-		if (rspq->desc && rspq->pktcnt_idx != pktcnt_idx) {
-			v = FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_DMAQ) |
-			    FW_PARAMS_PARAM_X_V(
-					FW_PARAMS_PARAM_DMAQ_IQ_INTCNTTHRESH) |
-			    FW_PARAMS_PARAM_YZ_V(rspq->cntxt_id);
-			err = t4vf_set_params(adapter, 1, &v, &pktcnt_idx);
-			if (err)
-				return err;
-		}
-		rspq->pktcnt_idx = pktcnt_idx;
+	if (armclk > fclk) {
+		printk(KERN_WARNING "%s: armclk > fclk\n", __func__);
+		armclk = fclk;
 	}
 
-	/*
-	 * Compute the closest holdoff timer index from the supplied holdoff
-	 * timer value.
-	 */
-	timer_idx = (us == 0
-		     ? SGE_TIMER_RSTRT_CNTR
-		     : closest_timer(&adapter->sge, us));
+	/* if we are in DVS, we need HCLK to be <= ARMCLK */
+	if (armclk < fclk && armclk < hclk_max)
+		hclk_max = armclk;
 
-	/*
-	 * Update the response queue's interrupt coalescing parameters and
-	 * return success.
+	for (hdiv = 1; hdiv < 9; hdiv++) {
+		if (hdiv == 5 || hdiv == 7)
+			hdiv++;
+
+		hclk = (fclk / hdiv);
+		if (hclk <= hclk_max || within_khz(hclk, hclk_max))
+			break;
+	}
+
+	s3c_freq_dbg("%s: hclk %lu, div %d\n", __func__, hclk, hdiv);
+
+	if (hdiv > 8)
+		goto invalid;
+
+	pdiv = (hclk > cfg->max.pclk) ? 2 : 1;
+
+	if ((hclk / pdiv) > cfg->max.pclk)
+		pdiv++;
+
+	s3c_freq_dbg("%s: pdiv %d\n", __func__, pdiv);
+
+	if (pdiv > 2)
+		goto invalid;
+
+	pdiv *= hdiv;
+
+	/* calculate a valid armclk */
+
+	if (armclk < hclk)
+		armclk = hclk;
+
+	/* if we're running armclk lower than fclk, this really means
+	 * that the system should go into dvs mode, which means that
+	 * armclk is connected to hclk. */
+	if (armclk < fclk) {
+		cfg->divs.dvs = 1;
+		armclk = hclk;
+	} else
+		cfg->divs.dvs = 0;
+
+	cfg->freq.armclk = armclk;
+
+	/* store the result, and then return */
+
+	cfg->divs.h_divisor = hdiv;
+	cfg->divs.p_divisor = pdiv;
+
+	return 0;
+
+ invalid:
+	return -EINVAL;
+}
+
+#define CAMDIVN_HCLK_HALF (S3C2440_CAMDIVN_HCLK3_HALF | \
+			   S3C2440_CAMDIVN_HCLK4_HALF)
+
+/**
+ * s3c2440_cpufreq_setdivs - set the cpu frequency divider settings
+ * @cfg: The cpu frequency settings.
+ *
+ * Set the divisors from the settings in @cfg, which where generated
+ * during the calculation phase by s3c2440_cpufreq_calcdivs().
+ */
+static void s3c2440_cpufreq_setdivs(struct s3c_cpufreq_config *cfg)
+{
+	unsigned long clkdiv, camdiv;
+
+	s3c_freq_dbg("%s: divsiors: h=%d, p=%d\n", __func__,
+		     cfg->divs.h_divisor, cfg->divs.p_divisor);
+
+	clkdiv = __raw_readl(S3C2410_CLKDIVN);
+	camdiv = __raw_readl(S3C2440_CAMDIVN);
+
+	clkdiv &= ~(S3C2440_CLKDIVN_HDIVN_MASK | S3C2440_CLKDIVN_PDIVN);
+	camdiv &= ~CAMDIVN_HCLK_HALF;
+
+	switch (cfg->divs.h_divisor) {
+	case 1:
+		clkdiv |= S3C2440_CLKDIVN_HDIVN_1;
+		break;
+
+	case 2:
+		clkdiv |= S3C2440_CLKDIVN_HDIVN_2;
+		break;
+
+	case 6:
+		camdiv |= S3C2440_CAMDIVN_HCLK3_HALF;
+	case 3:
+		clkdiv |= S3C2440_CLKDIVN_HDIVN_3_6;
+		break;
+
+	case 8:
+		camdiv |= S3C2440_CAMDIVN_HCLK4_HALF;
+	case 4:
+		clkdiv |= S3C2440_CLKDIVN_HDIVN_4_8;
+		break;
+
+	default:
+		BUG();	/* we don't expect to get here. */
+	}
+
+	if (cfg->divs.p_divisor != cfg->divs.h_divisor)
+		clkdiv |= S3C2440_CLKDIVN_PDIVN;
+
+	/* todo - set pclk. */
+
+	/* Write the divisors first with hclk intentionally halved so that
+	 * when we write clkdiv we will under-frequency instead of over. We
+	 * then make a short delay and remove the hclk halving if necessary.
 	 */
-	rspq->intr_params = (QINTR_TIMER_IDX_V(timer_idx) |
-			     QINTR_CNT_EN_V(cnt > 0));
+
+	__raw_writel(camdiv | CAMDIVN_HCLK_HALF, S3C2440_CAMDIVN);
+	__raw_writel(clkdiv, S3C2410_CLKDIVN);
+
+	ndelay(20);
+	__raw_writel(camdiv, S3C2440_CAMDIVN);
+
+	clk_set_parent(armclk, cfg->divs.dvs ? hclk : fclk);
+}
+
+static int run_freq_for(unsigned long max_hclk, unsigned long fclk,
+			int *divs,
+			struct cpufreq_frequency_table *table,
+			size_t table_size)
+{
+	unsigned long freq;
+	int index = 0;
+	int div;
+
+	for (div = *divs; div > 0; div = *divs++) {
+		freq = fclk / div;
+
+		if (freq > max_hclk && div != 1)
+			continue;
+
+		freq /= 1000; /* table is in kHz */
+		index = s3c_cpufreq_addfreq(table, index, table_size, freq);
+		if (index < 0)
+			break;
+	}
+
+	return index;
+}
+
+static int hclk_divs[] = { 1, 2, 3, 4, 6, 8, -1 };
+
+static int s3c2440_cpufreq_calctable(struct s3c_cpufreq_config *cfg,
+				     struct cpufreq_frequency_table *table,
+				     size_t table_size)
+{
+	int ret;
+
+	WARN_ON(cfg->info == NULL);
+	WARN_ON(cfg->board == NULL);
+
+	ret = run_freq_for(cfg->info->max.hclk,
+			   cfg->info->max.fclk,
+			   hclk_divs,
+			   table, table_size);
+
+	s3c_freq_dbg("%s: returning %d\n", __func__, ret);
+
+	return ret;
+}
+
+static struct s3c_cpufreq_info s3c2440_cpufreq_info = {
+	.max		= {
+		.fclk	= 400000000,
+		.hclk	= 133333333,
+		.pclk	=  66666666,
+	},
+
+	.locktime_m	= 300,
+	.locktime_u	= 300,
+	.locktime_bits	= 16,
+
+	.name		= "s3c244x",
+	.calc_iotiming	= s3c2410_iotiming_calc,
+	.set_iotiming	= s3c2410_iotiming_set,
+	.get_iotiming	= s3c2410_iotiming_get,
+	.set_fvco	= s3c2410_set_fvco,
+
+	.set_refresh	= s3c2410_cpufreq_setrefresh,
+	.set_divs	= s3c2440_cpufreq_setdivs,
+	.calc_divs	= s3c2440_cpufreq_calcdivs,
+	.calc_freqtable	= s3c2440_cpufreq_calctable,
+
+	.debug_io_show  = s3c_cpufreq_debugfs_call(s3c2410_iotiming_debugfs),
+};
+
+static int s3c2440_cpufreq_add(struct device *dev,
+			       struct subsys_interface *sif)
+{
+	xtal = s3c_cpufreq_clk_get(NULL, "xtal");
+	hclk = s3c_cpufreq_clk_get(NULL, "hclk");
+	fclk = s3c_cpufreq_clk_get(NULL, "fclk");
+	armclk = s3c_cpufreq_clk_get(NULL, "armclk");
+
+	if (IS_ERR(xtal) || IS_ERR(hclk) || IS_ERR(fclk) || IS_ERR(armclk)) {
+		printk(KERN_ERR "%s: failed to get clocks\n", __func__);
+		return -ENOENT;
+	}
+
+	return s3c_cpufreq_register(&s3c2440_cpufreq_info);
+}
+
+static struct subsys_interface s3c2440_cpufreq_interface = {
+	.name		= "s3c2440_cpufreq",
+	.subsys		= &s3c2440_subsys,
+	.add_dev	= s3c2440_cpufreq_add,
+};
+
+static int s3c2440_cpufreq_init(void)
+{
+	return subsys_interface_register(&s3c2440_cpufreq_interface);
+}
+
+/* arch_initcall adds the clocks we need, so use subsys_initcall. */
+subsys_initcall(s3c2440_cpufreq_init);
+
+static struct subsys_interface s3c2442_cpufreq_interface = {
+	.name		= "s3c2442_cpufreq",
+	.subsys		= &s3c2442_subsys,
+	.add_dev	= s3c2440_cpufreq_add,
+};
+
+static int s3c2442_cpufreq_init(void)
+{
+	return subsys_interface_register(&s3c2442_cpufreq_interface);
+}
+subsys_initcall(s3c2442_cpufreq_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ * Copyright (c) 2009 Simtec Electronics
+ *	http://armlinux.simtec.co.uk/
+ *	Ben Dooks <ben@simtec.co.uk>
+ *
+ * S3C24XX CPU Frequency scaling - debugfs status support
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+*/
+
+#include <linux/init.h>
+#include <linux/export.h>
+#include <linux/interrupt.h>
+#include <linux/ioport.h>
+#include <linux/cpufreq.h>
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/err.h>
+
+#include <plat/cpu-freq-core.h>
+
+static struct dentry *dbgfs_root;
+static struct dentry *dbgfs_file_io;
+static struct dentry *dbgfs_file_info;
+static struct dentry *dbgfs_file_board;
+
+#define print_ns(x) ((x) / 10), ((x) % 10)
+
+static void show_max(struct seq_file *seq, struct s3c_freq *f)
+{
+	seq_printf(seq, "MAX: F=%lu, H=%lu, P=%lu, A=%lu\n",
+		   f->fclk, f->hclk, f->pclk, f->armclk);
+}
+
+static int board_show(struct seq_file *seq, void *p)
+{
+	struct s3c_cpufreq_config *cfg;
+	struct s3c_cpufreq_board *brd;
+
+	cfg = s3c_cpufreq_getconfig();
+	if (!cfg) {
+		seq_printf(seq, "no configuration registered\n");
+		return 0;
+	}
+
+	brd = cfg->board;
+	if (!brd) {
+		seq_printf(seq, "no board definition set?\n");
+		return 0;
+	}
+
+	seq_printf(seq, "SDRAM refresh %u ns\n", brd->refresh);
+	seq_printf(seq, "auto_io=%u\n", brd->auto_io);
+	seq_printf(seq, "need_io=%u\n", brd->need_io);
+
+	show_max(seq, &brd->max);
+
+
 	return 0;
 }
 
-/*
- * Return a version number to identify the type of adapter.  The scheme is:
- * - bits 0..9: chip version
- * - bits 10..15: chip revision
- */
-static inline unsigned int mk_adap_vers(const struct adapter *adapter)
+static int fops_board_open(struct inode *inode, struct file *file)
 {
-	/*
-	 * Chip version 4, revision 0x3f (cxgb4vf).
-	 */
-	return CHELSIO_CHIP_VERSION(adapter->params.chip) | (0x3f << 10);
+	return single_open(file, board_show, NULL);
 }
 
-/*
- * Execute the specified ioctl command.
+static const struct file_operations fops_board = {
+	.open		= fops_board_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.owner		= THIS_MODULE,
+};
+
+static int info_show(struct seq_file *seq, void *p)
+{
+	struct s3c_cpufreq_config *cfg;
+
+	cfg = s3c_cpufreq_getconfig();
+	if (!cfg) {
+		seq_printf(seq, "no configuration registered\n");
+		return 0;
+	}
+
+	seq_printf(seq, "  FCLK %ld Hz\n", cfg->freq.fclk);
+	seq_printf(seq, "  HCLK %ld Hz (%lu.%lu ns)\n",
+		   cfg->freq.hclk, print_ns(cfg->freq.hclk_tns));
+	seq_printf(seq, "  PCLK %ld Hz\n", cfg->freq.hclk);
+	seq_printf(seq, "ARMCLK %ld Hz\n", cfg->freq.armclk);
+	seq_printf(seq, "\n");
+
+	show_max(seq, &cfg->max);
+
+	seq_printf(seq, "Divisors: P=%d, H=%d, A=%d, dvs=%s\n",
+		   cfg->divs.h_divisor, cfg->divs.p_divisor,
+		   cfg->divs.arm_divisor, cfg->divs.dvs ? "on" : "off");
+	seq_printf(seq, "\n");
+
+	seq_printf(seq, "lock_pll=%u\n", cfg->lock_pll);
+
+	return 0;
+}
+
+static int fops_info_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, info_show, NULL);
+}
+
+static const struct file_operations fops_info = {
+	.open		= fops_info_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.owner		= THIS_MODULE,
+};
+
+static int io_show(struct seq_file *seq, void *p)
+{
+	void (*show_bank)(struct seq_file *, struct s3c_cpufreq_config *, union s3c_iobank *);
+	struct s3c_cpufreq_config *cfg;
+	struct s3c_iotimings *iot;
+	union s3c_iobank *iob;
+	int bank;
+
+	cfg = s3c_cpufreq_getconfig();
+	if (!cfg) {
+		seq_printf(seq, "no configuration registered\n");
+		return 0;
+	}
+
+	show_bank = cfg->info->debug_io_show;
+	if (!show_bank) {
+		seq_printf(seq, "no code to show bank timing\n");
+		return 0;
+	}
+
+	iot = s3c_cpufreq_getiotimings();
+	if (!iot) {
+		seq_printf(seq, "no io timings registered\n");
+		return 0;
+	}
+
+	seq_printf(seq, "hclk period is %lu.%lu ns\n", print_ns(cfg->freq.hclk_tns));
+
+	for (bank = 0; bank < MAX_BANKS; bank++) {
+		iob = &iot->bank[bank];
+
+		seq_printf(seq, "bank %d: ", bank);
+
+		if (!iob->io_2410) {
+			seq_printf(seq, "nothing set\n");
+			continue;
+		}
+
+		show_bank(seq, cfg, iob);
+	}
+
+	return 0;
+}
+
+static int fops_io_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, io_show, NULL);
+}
+
+static const struct file_operations fops_io = {
+	.open		= fops_io_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.owner		= THIS_MODULE,
+};
+
+
+static int __init s3c_freq_debugfs_init(void)
+{
+	dbgfs_root = debugfs_create_dir("s3c-cpufreq", NULL);
+	if (IS_ERR(dbgfs_root)) {
+		printk(KERN_ERR "%s: error creating debugfs root\n", __func__);
+		return PTR_ERR(dbgfs_root);
+	}
+
+	dbgfs_file_io = debugfs_create_file("io-timing", S_IRUGO, dbgfs_root,
+					    NULL, &fops_io);
+
+	dbgfs_file_info = debugfs_create_file("info", S_IRUGO, dbgfs_root,
+					      NULL, &fops_info);
+
+	dbgfs_file_board = debugfs_create_file("board", S_IRUGO, dbgfs_root,
+					       NULL, &fops_board);
+
+	return 0;
+}
+
+late_initcall(s3c_freq_debugfs_init);
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * Copyright (c) 2006-2008 Simtec Electronics
+ *	http://armlinux.simtec.co.uk/
+ *	Ben Dooks <ben@simtec.co.uk>
+ *
+ * S3C24XX CPU Frequency scaling
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+*/
+
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/interrupt.h>
+#include <linux/ioport.h>
+#include <linux/cpufreq.h>
+#include <linux/cpu.h>
+#include <linux/clk.h>
+#include <linux/err.h>
+#include <linux/io.h>
+#include <linux/device.h>
+#include <linux/sysfs.h>
+#include <linux/slab.h>
+
+#include <asm/mach/arch.h>
+#include <asm/mach/map.h>
+
+#include <plat/cpu.h>
+#include <plat/cpu-freq-core.h>
+
+#include <mach/regs-clock.h>
+
+/* note, cpufreq support deals in kHz, no Hz */
+
+static struct cpufreq_driver s3c24xx_driver;
+static struct s3c_cpufreq_config cpu_cur;
+static struct s3c_iotimings s3c24xx_iotiming;
+static struct cpufreq_frequency_table *pll_reg;
+static unsigned int last_target = ~0;
+static unsigned int ftab_size;
+static struct cpufreq_frequency_table *ftab;
+
+static struct clk *_clk_mpll;
+static struct clk *_clk_xtal;
+static struct clk *clk_fclk;
+static struct clk *clk_hclk;
+static struct clk *clk_pclk;
+static struct clk *clk_arm;
+
+#ifdef CONFIG_ARM_S3C24XX_CPUFREQ_DEBUGFS
+struct s3c_cpufreq_config *s3c_cpufreq_getconfig(void)
+{
+	return &cpu_cur;
+}
+
+struct s3c_iotimings *s3c_cpufreq_getiotimings(void)
+{
+	return &s3c24xx_iotiming;
+}
+#endif /* CONFIG_ARM_S3C24XX_CPUFREQ_DEBUGFS */
+
+static void s3c_cpufreq_getcur(struct s3c_cpufreq_config *cfg)
+{
+	unsigned long fclk, pclk, hclk, armclk;
+
+	cfg->freq.fclk = fclk = clk_get_rate(clk_fclk);
+	cfg->freq.hclk = hclk = clk_get_rate(clk_hclk);
+	cfg->freq.pclk = pclk = clk_get_rate(clk_pclk);
+	cfg->freq.armclk = armclk = clk_get_rate(clk_arm);
+
+	cfg->pll.driver_data = __raw_readl(S3C2410_MPLLCON);
+	cfg->pll.frequency = fclk;
+
+	cfg->freq.hclk_tns = 1000000000 / (cfg->freq.hclk / 10);
+
+	cfg->divs.h_divisor = fclk / hclk;
+	cfg->divs.p_divisor = fclk / pclk;
+}
+
+static inline void s3c_cpufreq_calc(struct s3c_cpufreq_config *cfg)
+{
+	unsigned long pll = cfg->pll.frequency;
+
+	cfg->freq.fclk = pll;
+	cfg->freq.hclk = pll / cfg->divs.h_divisor;
+	cfg->freq.pclk = pll / cfg->divs.p_divisor;
+
+	/* convert hclk into 10ths of nanoseconds for io calcs */
+	cfg->freq.hclk_tns = 1000000000 / (cfg->freq.hclk / 10);
+}
+
+static inline int closer(unsigned int target, unsigned int n, unsigned int c)
+{
+	int diff_cur = abs(target - c);
+	int diff_new = abs(target - n);
+
+	return (diff_new < diff_cur);
+}
+
+static void s3c_cpufreq_show(const char *pfx,
+				 struct s3c_cpufreq_config *cfg)
+{
+	s3c_freq_dbg("%s: Fvco=%u, F=%lu, A=%lu, H=%lu (%u), P=%lu (%u)\n",
+		     pfx, cfg->pll.frequency, cfg->freq.fclk, cfg->freq.armclk,
+		     cfg->freq.hclk, cfg->divs.h_divisor,
+		     cfg->freq.pclk, cfg->divs.p_divisor);
+}
+
+/* functions to wrapper the driver info calls to do the cpu specific work */
+
+static void s3c_cpufreq_setio(struct s3c_cpufreq_config *cfg)
+{
+	if (cfg->info->set_iotiming)
+		(cfg->info->set_iotiming)(cfg, &s3c24xx_iotiming);
+}
+
+static int s3c_cpufreq_calcio(struct s3c_cpufreq_config *cfg)
+{
+	if (cfg->info->calc_iotiming)
+		return (cfg->info->calc_iotiming)(cfg, &s3c24xx_iotiming);
+
+	return 0;
+}
+
+static void s3c_cpufreq_setrefresh(struct s3c_cpufreq_config *cfg)
+{
+	(cfg->info->set_refresh)(cfg);
+}
+
+static void s3c_cpufreq_setdivs(struct s3c_cpufreq_config *cfg)
+{
+	(cfg->info->set_divs)(cfg);
+}
+
+static int s3c_cpufreq_calcdivs(struct s3c_cpufreq_config *cfg)
+{
+	return (cfg->info->calc_divs)(cfg);
+}
+
+static void s3c_cpufreq_setfvco(struct s3c_cpufreq_config *cfg)
+{
+	cfg->mpll = _clk_mpll;
+	(cfg->info->set_fvco)(cfg);
+}
+
+static inline void s3c_cpufreq_updateclk(struct clk *clk,
+					 unsigned int freq)
+{
+	clk_set_rate(clk, freq);
+}
+
+static int s3c_cpufreq_settarget(struct cpufreq_policy *policy,
+				 unsigned int target_freq,
+				 struct cpufreq_frequency_table *pll)
+{
+	struct s3c_cpufreq_freqs freqs;
+	struct s3c_cpufreq_config cpu_new;
+	unsigned long flags;
+
+	cpu_new = cpu_cur;  /* copy new from current */
+
+	s3c_cpufreq_show("cur", &cpu_cur);
+
+	/* TODO - check for DMA currently outstanding */
+
+	cpu_new.pll = pll ? *pll : cpu_cur.pll;
+
+	if (pll)
+		freqs.pll_changing = 1;
+
+	/* update our frequencies */
+
+	cpu_new.freq.armclk = target_freq;
+	cpu_new.freq.fclk = cpu_new.pll.frequency;
+
+	if (s3c_cpufreq_calcdivs(&cpu_new) < 0) {
+		printk(KERN_ERR "no divisors for %d\n", target_freq);
+		goto err_notpossible;
+	}
+
+	s3c_freq_dbg("%s: got divs\n", __func__);
+
+	s3c_cpufreq_calc(&cpu_new);
+
+	s3c_freq_dbg("%s: calculated frequencies for new\n", __func__);
+
+	if (cpu_new.freq.hclk != cpu_cur.freq.hclk) {
+		if (s3c_cpufreq_calcio(&cpu_new) < 0) {
+			printk(KERN_ERR "%s: no IO timings\n", __func__);
+			goto err_notpossible;
+		}
+	}
+
+	s3c_cpufreq_show("new", &cpu_new);
+
+	/* setup our cpufreq parameters */
+
+	freqs.old = cpu_cur.freq;
+	freqs.new = cpu_new.freq;
+
+	freqs.freqs.old = cpu_cur.freq.armclk / 1000;
+	freqs.freqs.new = cpu_new.freq.armclk / 1000;
+
+	/* update f/h/p clock settings before we issue the change
+	 * notification, so that drivers do not need to do anything
+	 * special if they want to recalculate on CPUFREQ_PRECHANGE. */
+
+	s3c_cpufreq_updateclk(_clk_mpll, cpu_new.pll.frequency);
+	s3c_cpufreq_updateclk(clk_fclk, cpu_new.freq.fclk);
+	s3c_cpufreq_updateclk(clk_hclk, cpu_new.freq.hclk);
+	s3c_cpufreq_updateclk(clk_pclk, cpu_new.freq.pclk);
+
+	/* start the frequency change */
+	cpufreq_freq_transition_begin(policy, &freqs.freqs);
+
+	/* If hclk is staying the same, then we do not need to
+	 * re-write the IO or the refresh timings whilst we are changing
+	 * speed. */
+
+	local_irq_save(flags);
+
+	/* is our memory clock slowing down? */
+	if (cpu_new.freq.hclk < cpu_cur.freq.hclk) {
+		s3c_cpufreq_setrefresh(&cpu_new);
+		s3c_cpufreq_setio(&cpu_new);
+	}
+
+	if (cpu_new.freq.fclk == cpu_cur.freq.fclk) {
+		/* not changing PLL, just set the divisors */
+
+		s3c_cpufreq_setdivs(&cpu_new);
+	} else {
+		if (cpu_new.freq.fclk < cpu_cur.freq.fclk) {
+			/* slow the cpu down, then set divisors */
+
+			s3c_cpufreq_setfvco(&cpu_new);
+			s3c_cpufreq_setdivs(&cpu_new);
+		} else {
+			/* set the divisors, then speed up */
+
+			s3c_cpufreq_setdivs(&cpu_new);
+			s3c_cpufreq_setfvco(&cpu_new);
+		}
+	}
+
+	/* did our memory clock speed up */
+	if (cpu_new.freq.hclk > cpu_cur.freq.hclk) {
+		s3c_cpufreq_setrefresh(&cpu_new);
+		s3c_cpufreq_setio(&cpu_new);
+	}
+
+	/* update our current settings */
+	cpu_cur = cpu_new;
+
+	local_irq_restore(flags);
+
+	/* notify everyone we've done this */
+	cpufreq_freq_transition_end(policy, &freqs.freqs, 0);
+
+	s3c_freq_dbg("%s: finished\n", __func__);
+	return 0;
+
+ err_notpossible:
+	printk(KERN_ERR "no compatible settings for %d\n", target_freq);
+	return -EINVAL;
+}
+
+/* s3c_cpufreq_target
+ *
+ * called by the cpufreq core to adjust the frequency that the CPU
+ * is currently running at.
  */
-static int cxgb4vf_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+
+static int s3c_cpufreq_target(struct cpufreq_policy *policy,
+			      unsigned int target_freq,
+			      unsigned int relation)
+{
+	struct cpufreq_frequency_table *pll;
+	unsigned int index;
+
+	/* avoid repeated calls which cause a needless amout of duplicated
+	 * logging output (and CPU time as the calculation process is
+	 * done) */
+	if (target_freq == last_target)
+		return 0;
+
+	last_target = target_freq;
+
+	s3c_freq_dbg("%s: policy %p, target %u, relation %u\n",
+		     __func__, policy, target_freq, relation);
+
+	if (ftab) {
+		if (cpufreq_frequency_table_target(policy, ftab,
+						   target_freq, relation,
+						   &index)) {
+			s3c_freq_dbg("%s: table failed\n", __func__);
+			return -EINVAL;
+		}
+
+		s3c_freq_dbg("%s: adjust %d to entry %d (%u)\n", __func__,
+			     target_freq, index, ftab[index].frequency);
+		target_freq = ftab[index].frequency;
+	}
+
+	target_freq *= 1000;  /* convert target to Hz */
+
+	/* find the settings for our new frequency */
+
+	if (!pll_reg || cpu_cur.lock_pll) {
+		/* either we've not got any PLL values, or we've locked
+		 * to the current one. */
+		pll = NULL;
+	} else {
+		struct cpufreq_policy tmp_policy;
+		int ret;
+
+		/* we keep the cpu pll table in Hz, to ensure we get an
+		 * accurate value for the PLL output. */
+
+		tmp_policy.min = policy->min * 1000;
+		tmp_policy.max = policy->max * 1000;
+		tmp_policy.cpu = policy->cpu;
+
+		/* cpufreq_frequency_table_target uses a pointer to 'index'
+		 * which is the number of the table entry, not the value of
+		 * the table entry's index field. */
+
+		ret = cpufreq_frequency_table_target(&tmp_policy, pll_reg,
+						     target_freq, relation,
+						     &index);
+
+		if (ret < 0) {
+			printk(KERN_ERR "%s: no PLL available\n", __func__);
+			goto err_notpossible;
+		}
+
+		pll = pll_reg + index;
+
+		s3c_freq_dbg("%s: target %u => %u\n",
+			     __func__, target_freq, pll->frequency);
+
+		target_freq = pll->frequency;
+	}
+
+	return s3c_cpufreq_settarget(policy, target_freq, pll);
+
+ err_notpossible:
+	printk(KERN_ERR "no compatible settings for %d\n", target_freq);
+	return -EINVAL;
+}
+
+struct clk *s3c_cpufreq_clk_get(struct device *dev, const char *name)
+{
+	struct clk *clk;
+
+	clk = clk_get(dev, name);
+	if (IS_ERR(clk))
+		printk(KERN_ERR "cpufreq: failed to get clock '%s'\n", name);
+
+	return clk;
+}
+
+static int s3c_cpufreq_init(struct cpufreq_policy *policy)
+{
+	policy->clk = clk_arm;
+
+	policy->cpuinfo.transition_latency = cpu_cur.info->latency;
+
+	if (ftab)
+		return cpufreq_table_validate_and_show(policy, ftab);
+
+	return 0;
+}
+
+static int __init s3c_cpufreq_initclks(void)
+{
+	_clk_mpll = s3c_cpufreq_clk_get(NULL, "mpll");
+	_clk_xtal = s3c_cpufreq_clk_get(NULL, "xtal");
+	clk_fclk = s3c_cpufreq_clk_get(NULL, "fclk");
+	clk_hclk = s3c_cpufreq_clk_get(NULL, "hclk");
+	clk_pclk = s3c_cpufreq_clk_get(NULL, "pclk");
+	clk_arm = s3c_cpufreq_clk_get(NULL, "armclk");
+
+	if (IS_ERR(clk_fclk) || IS_ERR(clk_hclk) || IS_ERR(clk_pclk) ||
+	    IS_ERR(_clk_mpll) || IS_ERR(clk_arm) || IS_ERR(_clk_xtal)) {
+		printk(KERN_ERR "%s: could not get clock(s)\n", __func__);
+		return -ENOENT;
+	}
+
+	printk(KERN_INFO "%s: clocks f=%lu,h=%lu,p=%lu,a=%lu\n", __func__,
+	       clk_get_rate(clk_fclk) / 1000,
+	       clk_get_rate(clk_hclk) / 1000,
+	       clk_get_rate(clk_pclk) / 1000,
+	       clk_get_rate(clk_arm) / 1000);
+
+	return 0;
+}
+
+#ifdef CONFIG_PM
+static struct cpufreq_frequency_table suspend_pll;
+static unsigned int suspend_freq;
+
+static int s3c_cpufreq_suspend(struct cpufreq_policy *policy)
+{
+	suspend_pll.frequency = clk_get_rate(_clk_mpll);
+	suspend_pll.driver_data = __raw_readl(S3C2410_MPLLCON);
+	suspend_freq = clk_get_rate(clk_arm);
+
+	return 0;
+}
+
+static int s3c_cpufreq_resume(struct cpufreq_policy *policy)
+{
+	int ret;
+
+	s3c_freq_dbg("%s: resuming with policy %p\n", __func__, policy);
+
+	last_target = ~0;	/* invalidate last_target setting */
+
+	/* whilst we will be called later on, we try and re-set the
+	 * cpu frequencies as soon as possible so that we do not end
+	 * up resuming devices and then immediately having to re-set
+	 * a number of settings once these devices have restarted.
+	 *
+	 * as a note, it is expected devices are not used until they
+	 * have been un-suspended and at that time they should have
+	 * used the updated clock settings.
+	 */
+
+	ret = s3c_cpufreq_settarget(NULL, suspend_freq, &suspend_pll);
+	if (ret) {
+		printk(KERN_ERR "%s: failed to reset pll/freq\n", __func__);
+		return ret;
+	}
+
+	return 0;
+}
+#else
+#define s3c_cpufreq_resume NULL
+#define s3c_cpufreq_suspend NULL
+#endif
+
+static struct cpufreq_driver s3c24xx_driver = {
+	.flags		= CPUFREQ_STICKY | CPUFREQ_NEED_INITIAL_FREQ_CHECK,
+	.target		= s3c_cpufreq_target,
+	.get		= cpufreq_generic_get,
+	.init		= s3c_cpufreq_init,
+	.suspend	= s3c_cpufreq_suspend,
+	.resume		= s3c_cpufreq_resume,
+	.name		= "s3c24xx",
+};
+
+
+int s3c_cpufreq_register(struct s3c_cpufreq_info *info)
+{
+	if (!info || !info->name) {
+		printk(KERN_ERR "%s: failed to pass valid information\n",
+		       __func__);
+		return -EINVAL;
+	}
+
+	printk(KERN_INFO "S3C24XX CPU Frequency driver, %s cpu support\n",
+	       info->name);
+
+	/* check our driver info has valid data */
+
+	BUG_ON(info->set_refresh == NULL);
+	BUG_ON(info->set_divs == NULL);
+	BUG_ON(info->calc_divs == NULL);
+
+	/* info->set_fvco is optional, depending on whether there
+	 * is a need to set the clock code. */
+
+	cpu_cur.info = info;
+
+	/* Note, driver registering should probably update locktime */
+
+	return 0;
+}
+
+int __init s3c_cpufreq_setboard(struct s3c_cpufreq_board *board)
+{
+	struct s3c_cpufreq_board *ours;
+
+	if (!board) {
+		printk(KERN_INFO "%s: no board data\n", __func__);
+		return -EINVAL;
+	}
+
+	/* Copy the board information so that each board can make this
+	 * initdata. */
+
+	ours = kzalloc(sizeof(*ours), GFP_KERNEL);
+	if (ours == NULL) {
+		printk(KERN_ERR "%s: no memory\n", __func__);
+		return -ENOMEM;
+	}
+
+	*ours = *board;
+	cpu_cur.board = ours;
+
+	return 0;
+}
+
+static int __init s3c_cpufreq_auto_io(void)
+{
+	int ret;
+
+	if (!cpu_cur.info->get_iotiming) {
+		printk(KERN_ERR "%s: get_iotiming undefined\n", __func__);
+		return -ENOENT;
+	}
+
+	printk(KERN_INFO "%s: working out IO settings\n", __func__);
+
+	ret = (cpu_cur.info->get_iotiming)(&cpu_cur, &s3c24xx_iotiming);
+	if (ret)
+		printk(KERN_ERR "%s: failed to get timings\n", __func__);
+
+	return ret;
+}
+
+/* if one or is zero, then return the other, otherwise return the min */
+#define do_min(_a, _b) ((_a) == 0 ? (_b) : (_b) == 0 ? (_a) : min(_a, _b))
+
+/**
+ * s3c_cpufreq_freq_min - find the minimum settings for the given freq.
+ * @dst: The destination structure
+ * @a: One argument.
+ * @b: The other argument.
+ *
+ * Create a minimum of each frequency entry in the 'struct s3c_freq',
+ * unless the entry is zero when it is ignored and the non-zero argument
+ * used.
+ */
+static void s3c_cpufreq_freq_min(struct s3c_freq *dst,
+				 struct s3c_freq *a, struct s3c_freq *b)
+{
+	dst->fclk = do_min(a->fclk, b->fclk);
+	dst->hclk = do_min(a->hclk, b->hclk);
+	dst->pclk = do_min(a->pclk, b->pclk);
+	dst->armclk = do_min(a->armclk, b->armclk);
+}
+
+static inline u32 calc_locktime(u32 freq, u32 time_us)
+{
+	u32 result;
+
+	result = freq * time_us;
+	result = DIV_ROUND_UP(result, 1000 * 1000);
+
+	return result;
+}
+
+static void s3c_cpufreq_update_loctkime(void)
+{
+	unsigned int bits = cpu_cur.info->locktime_bits;
+	u32 rate = (u32)clk_get_rate(_clk_xtal);
+	u32 val;
+
+	if (bits == 0) {
+		WARN_ON(1);
+		return;
+	}
+
+	val = calc_locktime(rate, cpu_cur.info->locktime_u) << bits;
+	val |= calc_locktime(rate, cpu_cur.info->locktime_m);
+
+	printk(KERN_INFO "%s: new locktime is 0x%08x\n", __func__, val);
+	__raw_writel(val, S3C2410_LOCKTIME);
+}
+
+static int s3c_cpufreq_build_freq(void)
+{
+	int size, ret;
+
+	if (!cpu_cur.info->calc_freqtable)
+		return -EINVAL;
+
+	kfree(ftab);
+	ftab = NULL;
+
+	size = cpu_cur.info->calc_freqtable(&cpu_cur, NULL, 0);
+	size++;
+
+	ftab = kzalloc(sizeof(*ftab) * size, GFP_KERNEL);
+	if (!ftab) {
+		printk(KERN_ERR "%s: no memory for tables\n", __func__);
+		return -ENOMEM;
+	}
+
+	ftab_size = size;
+
+	ret = cpu_cur.info->calc_freqtable(&cpu_cur, ftab, size);
+	s3c_cpufreq_addfreq(ftab, ret, size, CPUFREQ_TABLE_END);
+
+	return 0;
+}
+
+static int __init s3c_cpufreq_initcall(void)
 {
 	int ret = 0;
 
-	switch (cmd) {
-	    /*
-	     * The VF Driver doesn't have access to any of the other
-	     * common Ethernet device ioctl()'s (like reading/writing
-	     * PHY registers, etc.
-	     */
-
-	default:
-		ret = -EOPNOTSUPP;
-		break;
-	}
-	return ret;
-}
-
-/*
- * Change the device's MTU.
- */
-static int cxgb4vf_change_mtu(struct net_device *dev, int new_mtu)
-{
-	int ret;
-	struct port_info *pi = netdev_priv(dev);
-
-	/* accommodate SACK */
-	if (new_mtu < 81)
-		return -EINVAL;
-
-	ret = t4vf_set_rxmode(pi->adapter, pi->viid, new_mtu,
-			      -1, -1, -1, -1, true);
-	if (!ret)
-		dev->mtu = new_mtu;
-	return ret;
-}
-
-static netdev_features_t cxgb4vf_fix_features(struct net_device *dev,
-	netdev_features_t features)
-{
-	/*
-	 * Since there is no support for separate rx/tx vlan accel
-	 * enable/disable make sure tx flag is always in same state as rx.
-	 */
-	if (features & NETIF_F_HW_VLAN_CTAG_RX)
-		features |= NETIF_F_HW_VLAN_CTAG_TX;
-	else
-		features &= ~NETIF_F_HW_VLAN_CTAG_TX;
-
-	return features;
-}
-
-static int cxgb4vf_set_features(struct net_device *dev,
-	netdev_features_t features)
-{
-	struct port_info *pi = netdev_priv(dev);
-	netdev_features_t changed = dev->features ^ features;
-
-	if (changed & NETIF_F_HW_VLAN_CTAG_RX)
-		t4vf_set_rxmode(pi->adapter, pi->viid, -1, -1, -1, -1,
-				features & NETIF_F_HW_VLAN_CTAG_TX, 0);
-
-	return 0;
-}
-
-/*
- * Change the devices MAC address.
- */
-static int cxgb4vf_set_mac_addr(struct net_device *dev, void *_addr)
-{
-	int ret;
-	struct sockaddr *addr = _addr;
-	struct port_info *pi = netdev_priv(dev);
-
-	if (!is_valid_ether_addr(addr->sa_data))
-		return -EADDRNOTAVAIL;
-
-	ret = t4vf_change_mac(pi->adapter, pi->viid, pi->xact_addr_filt,
-			      addr->sa_data, true);
-	if (ret < 0)
-		return ret;
-
-	memcpy(dev->dev_addr, addr->sa_data, dev->addr_len);
-	pi->xact_addr_filt = ret;
-	return 0;
-}
-
-#ifdef CONFIG_NET_POLL_CONTROLLER
-/*
- * Poll all of our receive queues.  This is called outside of normal interrupt
- * context.
- */
-static void cxgb4vf_poll_controller(struct net_device *dev)
-{
-	struct port_info *pi = netdev_priv(dev);
-	struct adapter *adapter = pi->adapter;
-
-	if (adapter->flags & USING_MSIX) {
-		struct sge_eth_rxq *rxq;
-		int nqsets;
-
-		rxq = &adapter->sge.ethrxq[pi->first_qset];
-		for (nqsets = pi->nqsets; nqsets; nqsets--) {
-			t4vf_sge_intr_msix(0, &rxq->rspq);
-			rxq++;
-		}
-	} else
-		t4vf_intr_handler(adapter)(0, adapter);
-}
-#endif
-
-/*
- * Ethtool operations.
- * ===================
- *
- * Note that we don't support any ethtool operations which change the physical
- * state of the port to which we're linked.
- */
-
-static unsigned int t4vf_from_fw_linkcaps(enum fw_port_type type,
-					  unsigned int caps)
-{
-	unsigned int v = 0;
-
-	if (type == FW_PORT_TYPE_BT_SGMII || type == FW_PORT_TYPE_BT_XFI ||
-	    type == FW_PORT_TYPE_BT_XAUI) {
-		v |= SUPPORTED_TP;
-		if (caps & FW_PORT_CAP_SPEED_100M)
-			v |= SUPPORTED_100baseT_Full;
-		if (caps & FW_PORT_CAP_SPEED_1G)
-			v |= SUPPORTED_1000baseT_Full;
-		if (caps & FW_PORT_CAP_SPEED_10G)
-			v |= SUPPORTED_10000baseT_Full;
-	} else if (type == FW_PORT_TYPE_KX4 || type == FW_PORT_TYPE_KX) {
-		v |= SUPPORTED_Backplane;
-		if (caps & FW_PORT_CAP_SPEED_1G)
-			v |= SUPPORTED_1000baseKX_Full;
-		if (caps & FW_PORT_CAP_SPEED_10G)
-			v |= SUPPORTED_10000baseKX4_Full;
-	} else if (type == FW_PORT_TYPE_KR)
-		v |= SUPPORTED_Backplane | SUPPORTED_10000baseKR_Full;
-	else if (type == FW_PORT_TYPE_BP_AP)
-		v |= SUPPORTED_Backplane | SUPPORTED_10000baseR_FEC |
-		     SUPPORTED_10000baseKR_Full | SUPPORTED_1000baseKX_Full;
-	else if (type == FW_PORT_TYPE_BP4_AP)
-		v |= SUPPORTED_Backplane | SUPPORTED_10000baseR_FEC |
-		     SUPPORTED_10000baseKR_Full | SUPPORTED_1000baseKX_Full |
-		     SUPPORTED_10000baseKX4_Full;
-	else if (type == FW_PORT_TYPE_FIBER_XFI ||
-		 type == FW_PORT_TYPE_FIBER_XAUI ||
-		 type == FW_PORT_TYPE_SFP ||
-		 type == FW_PORT_TYPE_QSFP_10G ||
-		 type == FW_PORT_TYPE_QSA) {
-		v |= SUPPORTED_FIBRE;
-		if (caps & FW_PORT_CAP_SPEED_1G)
-			v |= SUPPORTED_1000baseT_Full;
-		if (caps & FW_PORT_CAP_SPEED_10G)
-			v |= SUPPORTED_10000baseT_Full;
-	} else if (type == FW_PORT_TYPE_BP40_BA ||
-		   type == FW_PORT_TYPE_QSFP) {
-		v |= SUPPORTED_40000baseSR4_Full;
-		v |= SUPPORTED_FIBRE;
-	}
-
-	if (caps & FW_PORT_CAP_ANEG)
-		v |= SUPPORTED_Autoneg;
-	return v;
-}
-
-static int cxgb4vf_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
-{
-	const struct port_info *p = netdev_priv(dev);
-
-	if (p->port_type == FW_PORT_TYPE_BT_SGMII ||
-	    p->port_type == FW_PORT_TYPE_BT_XFI ||
-	    p->port_type == FW_PORT_TYPE_BT_XAUI)
-		cmd->port = PORT_TP;
-	else if (p->port_type == FW_PORT_TYPE_FIBER_XFI ||
-		 p->port_type == FW_PORT_TYPE_FIBER_XAUI)
-		cmd->port = PORT_FIBRE;
-	else if (p->port_type == FW_PORT_TYPE_SFP ||
-		 p->port_type == FW_PORT_TYPE_QSFP_10G ||
-		 p->port_type == FW_PORT_TYPE_QSA ||
-		 p->port_type == FW_PORT_TYPE_QSFP) {
-		if (p->mod_type == FW_PORT_MOD_TYPE_LR ||
-		    p->mod_type == FW_PORT_MOD_TYPE_SR ||
-		    p->mod_type == FW_PORT_MOD_TYPE_ER ||
-		    p->mod_type == FW_PORT_MOD_TYPE_LRM)
-			cmd->port = PORT_FIBRE;
-		else if (p->mod_type == FW_PORT_MOD_TYPE_TWINAX_PASSIVE ||
-			 p->mod_type == FW_PORT_MOD_TYPE_TWINAX_ACTIVE)
-			cmd->port = PORT_DA;
-		else
-			cmd->port = PORT_OTHER;
-	} else
-		cmd->port = PORT_OTHER;
-
-	if (p->mdio_addr >= 0) {
-		cmd->phy_address = p->mdio_addr;
-		cmd->transceiver = XCVR_EXTERNAL;
-		cmd->mdio_support = p->port_type == FW_PORT_TYPE_BT_SGMII ?
-			MDIO_SUPPORTS_C22 : MDIO_SUPPORTS_C45;
-	} else {
-		cmd->phy_address = 0;  /* not really, but no better option */
-		cmd->transceiver = XCVR_INTERNAL;
-		cmd->mdio_support = 0;
-	}
-
-	cmd->supported = t4vf_from_fw_linkcaps(p->port_type,
-					       p->link_cfg.supported);
-	cmd->advertising = t4vf_from_fw_linkcaps(p->port_type,
-					    p->link_cfg.advertising);
-	ethtool_cmd_speed_set(cmd,
-			      netif_carrier_ok(dev) ? p->link_cfg.speed : 0);
-	cmd->duplex = DUPLEX_FULL;
-	cmd->autoneg = p->link_cfg.autoneg;
-	cmd->maxtxpkt = 0;
-	cmd->maxrxpkt = 0;
-	return 0;
-}
-
-/*
- * Return our driver information.
- */
-static void cxgb4vf_get_drvinfo(struct net_device *dev,
-				struct ethtool_drvinfo *drvinfo)
-{
-	struct adapter *adapter = netdev2adap(dev);
-
-	strlcpy(drvinfo->driver, KBUILD_MODNAME, sizeof(drvinfo->driver));
-	strlcpy(drvinfo->version, DRV_VERSION, sizeof(drvinfo->version));
-	strlcpy(drvinfo->bus_info, pci_name(to_pci_dev(dev->dev.parent)),
-		sizeof(drvinfo->bus_info));
-	snprintf(drvinfo->fw_version, sizeof(drvinfo->fw_version),
-		 "%u.%u.%u.%u, TP %u.%u.%u.%u",
-		 FW_HDR_FW_VER_MAJOR_G(adapter->params.dev.fwrev),
-		 FW_HDR_FW_VER_MINOR_G(adapter->params.dev.fwrev),
-		 FW_HDR_FW_VER_MICRO_G(adapter->params.dev.fwrev),
-		 FW_HDR_FW_VER_BUILD_G(adapter->params.dev.fwrev),
-		 FW_HDR_FW_VER_MAJOR_G(adapter->params.dev.tprev),
-		 FW_HDR_FW_VER_MINOR_G(adapter->params.dev.tprev),
-		 FW_HDR_FW_VER_MICRO_G(adapter->params.dev.tprev),
-		 FW_HDR_FW_VER_BUILD_G(adapter->params.dev.tprev));
-}
-
-/*
- * Return current adapter message level.
- */
-static u32 cxgb4vf_get_msglevel(struct net_device *dev)
-{
-	return netdev2adap(dev)->msg_enable;
-}
-
-/*
- * Set current adapter message level.
- */
-static void cxgb4vf_set_msglevel(struct net_device *dev, u32 msglevel)
-{
-	netdev2adap(dev)->msg_enable = msglevel;
-}
-
-/*
- * Return the device's current Queue Set ring size parameters along with the
- * allowed maximum values.  Since ethtool doesn't understand the concept of
- * multi-queue devices, we just return the current values associated with the
- * first Queue Set.
- */
-static void cxgb4vf_get_ringparam(struct net_device *dev,
-				  struct ethtool_ringparam *rp)
-{
-	const struct port_info *pi = netdev_priv(dev);
-	const struct sge *s = &pi->adapter->sge;
-
-	rp->rx_max_pending = MAX_RX_BUFFERS;
-	rp->rx_mini_max_pending = MAX_RSPQ_ENTRIES;
-	rp->rx_jumbo_max_pending = 0;
-	rp->tx_max_pending = MAX_TXQ_ENTRIES;
-
-	rp->rx_pending = s->ethrxq[pi->first_qset].fl.size - MIN_FL_RESID;
-	rp->rx_mini_pending = s->ethrxq[pi->first_qset].rspq.size;
-	rp->rx_jumbo_pending = 0;
-	rp->tx_pending = s->ethtxq[pi->first_qset].q.size;
-}
-
-/*
- * Set the Queue Set ring size parameters for the device.  Again, since
- * ethtool doesn't allow for the concept of multiple queues per device, we'll
- * apply these new values across all of the Queue Sets associated with the
- * device -- after vetting them of course!
- */
-static int cxgb4vf_set_ringparam(struct net_device *dev,
-				 struct ethtool_ringparam *rp)
-{
-	const struct port_info *pi = netdev_priv(dev);
-	struct adapter *adapter = pi->adapter;
-	struct sge *s = &adapter->sge;
-	int qs;
-
-	if (rp->rx_pending > MAX_RX_BUFFERS ||
-	    rp->rx_jumbo_pending ||
-	    rp->tx_pending > MAX_TXQ_ENTRIES ||
-	    rp->rx_mini_pending > MAX_RSPQ_ENTRIES ||
-	    rp->rx_mini_pending < MIN_RSPQ_ENTRIES ||
-	    rp->rx_pending < MIN_FL_ENTRIES ||
-	    rp->tx_pending < MIN_TXQ_ENTRIES)
-		return -EINVAL;
-
-	if (adapter->flags & FULL_INIT_DONE)
-		return -EBUSY;
-
-	for (qs = pi->first_qset; qs < pi->first_qset + pi->nqsets; qs++) {
-		s->ethrxq[qs].fl.size = rp->rx_pending + MIN_FL_RESID;
-		s->ethrxq[qs].rspq.size = rp->rx_mini_pending;
-		s->ethtxq[qs].q.size = rp->tx_pending;
-	}
-	return 0;
-}
-
-/*
- * Return the interrupt holdoff timer and count for the first Queue Set on the
- * device.  Our extension ioctl() (the cxgbtool interface) allows the
- * interrupt holdoff timer to be read on all of the device's Queue Sets.
- */
-static int cxgb4vf_get_coalesce(struct net_device *dev,
-				struct ethtool_coalesce *coalesce)
-{
-	const struct port_info *pi = netdev_priv(dev);
-	const struct adapter *adapter = pi->adapter;
-	const struct sge_rspq *rspq = &adapter->sge.ethrxq[pi->first_qset].rspq;
-
-	coalesce->rx_coalesce_usecs = qtimer_val(adapter, rspq);
-	coalesce->rx_max_coalesced_frames =
-		((rspq->intr_params & QINTR_CNT_EN_F)
-		 ? adapter->sge.counter_val[rspq->pktcnt_idx]
-		 : 0);
-	return 0;
-}
-
-/*
- * Set the RX interrupt holdoff timer and count for the first Queue Set on the
- * interface.  Our extension ioctl() (the cxgbtool interface) allows us to set
- * the interrupt holdoff timer on any of the device's Queue Sets.
- */
-static int cxgb4vf_set_coalesce(struct net_device *dev,
-				struct ethtool_coalesce *coalesce)
-{
-	const struct port_info *pi = netdev_priv(dev);
-	struct adapter *adapter = pi->adapter;
-
-	return set_rxq_intr_params(adapter,
-				   &adapter->sge.ethrxq[pi->first_qset].rspq,
-				   coalesce->rx_coalesce_usecs,
-				   coalesce->rx_max_coalesced_frames);
-}
-
-/*
- * Report current port link pause parameter settings.
- */
-static void cxgb4vf_get_pauseparam(struct net_device *dev,
-				   struct ethtool_pauseparam *pauseparam)
-{
-	struct port_info *pi = netdev_priv(dev);
-
-	pauseparam->autoneg = (pi->link_cfg.requested_fc & PAUSE_AUTONEG) != 0;
-	pauseparam->rx_pause = (pi->link_cfg.fc & PAUSE_RX) != 0;
-	pauseparam->tx_pause = (pi->link_cfg.fc & PAUSE_TX) != 0;
-}
-
-/*
- * Identify the port by blinking the port's LED.
- */
-static int cxgb4vf_phys_id(struct net_device *dev,
-			   enum ethtool_phys_id_state state)
-{
-	unsigned int val;
-	struct port_info *pi = netdev_priv(dev);
-
-	if (state == ETHTOOL_ID_ACTIVE)
-		val = 0xffff;
-	else if (state == ETHTOOL_ID_INACTIVE)
-		val = 0;
-	else
-		return -EINVAL;
-
-	return t4vf_identify_port(pi->adapter, pi->viid, val);
-}
-
-/*
- * Port stats maintained per queue of the port.
- */
-struct queue_port_stats {
-	u64 tso;
-	u64 tx_csum;
-	u64 rx_csum;
-	u64 vlan_ex;
-	u64 vlan_ins;
-	u64 lro_pkts;
-	u64 lro_merged;
-};
-
-/*
- * Strings for the ETH_SS_STATS statistics set ("ethtool -S").  Note that
- * these need to match the order of statistics returned by
- * t4vf_get_port_stats().
- */
-static const char stats_strings[][ETH_GSTRING_LEN] = {
-	/*
-	 * These must match the layout of the t4vf_port_stats structure.
-	 */
-	"TxBroadcastBytes  ",
-	"TxBroadcastFrames ",
-	"TxMulticastBytes  ",
-	"TxMulticastFrames ",
-	"TxUnicastBytes    ",
-	"TxUnicastFrames   ",
-	"TxDroppedFrames   ",
-	"TxOffloadBytes    ",
-	"TxOffloadFrames   ",
-	"RxBroadcastBytes  ",
-	"RxBroadcastFrames ",
-	"RxMulticastBytes  ",
-	"RxMulticastFrames ",
-	"RxUnicastBytes    ",
-	"RxUnicastFrames   ",
-	"RxErrorFrames     ",
-
-	/*
-	 * These are accumulated per-queue statistics and must match the
-	 * order of the fields in the queue_port_stats structure.
-	 */
-	"TSO               ",
-	"TxCsumOffload     ",
-	"RxCsumGood        ",
-	"VLANextractions   ",
-	"VLANinsertions    ",
-	"GROPackets        ",
-	"GROMerged         ",
-};
-
-/*
- * Return the number of statistics in the specified statistics set.
- */
-static int cxgb4vf_get_sset_count(struct net_device *dev, int sset)
-{
-	switch (sset) {
-	case ETH_SS_STATS:
-		return ARRAY_SIZE(stats_strings);
-	default:
-		return -EOPNOTSUPP;
-	}
-	/*NOTREACHED*/
-}
-
-/*
- * Return the strings for the specified statistics set.
- */
-static void cxgb4vf_get_strings(struct net_device *dev,
-				u32 sset,
-				u8 *data)
-{
-	switch (sset) {
-	case ETH_SS_STATS:
-		memcpy(data, stats_strings, sizeof(stats_strings));
-		break;
-	}
-}
-
-/*
- * Small utility routine to accumulate queue statistics across the queues of
- * a "port".
- */
-static void collect_sge_port_stats(const struct adapter *adapter,
-				   const struct port_info *pi,
-				   struct queue_port_stats *stats)
-{
-	const struct sge_eth_txq *txq = &adapter->sge.ethtxq[pi->first_qset];
-	const struct sge_eth_rxq *rxq = &adapter->sge.ethrxq[pi->first_qset];
-	int qs;
-
-	memset(stats, 0, sizeof(*stats));
-	for (qs = 0; qs < pi->nqsets; qs++, rxq++, txq++) {
-		stats->tso += txq->tso;
-		stats->tx_csum += txq->tx_cso;
-		stats->rx_csum += rxq->stats.rx_cso;
-		stats->vlan_ex += rxq->stats.vlan_ex;
-		stats->vlan_ins += txq->vlan_ins;
-		stats->lro_pkts += rxq->stats.lro_pkts;
-		stats->lro_merged += rxq->stats.lro_merged;
-	}
-}
-
-/*
- * Return the ETH_SS_STATS statistics set.
- */
-static void cxgb4vf_get_ethtool_stats(struct net_device *dev,
-				      struct ethtool_stats *stats,
-				      u64 *data)
-{
-	struct port_info *pi = netdev2pinfo(dev);
-	struct adapter *adapter = pi->adapter;
-	int err = t4vf_get_port_stats(adapter, pi->pidx,
-				      (struct t4vf_port_stats *)data);
-	if (err)
-		memset(data, 0, sizeof(struct t4vf_port_stats));
-
-	data += sizeof(struct t4vf_port_stats) / sizeof(u64);
-	collect_sge_port_stats(adapter, pi, (struct queue_port_stats *)data);
-}
-
-/*
- * Return the size of our register map.
- */
-static int cxgb4vf_get_regs_len(struct net_device *dev)
-{
-	return T4VF_REGMAP_SIZE;
-}
-
-/*
- * Dump a block of registers, start to end inclusive, into a buffer.
- */
-static void reg_block_dump(struct adapter *adapter, void *regbuf,
-			   unsigned int start, unsigned int end)
-{
-	u32 *bp = regbuf + start - T4VF_REGMAP_START;
-
-	for ( ; start <= end; start += sizeof(u32)) {
-		/*
-		 * Avoid reading the Mailbox Control register since that
-		 * can trigger a Mailbox Ownership Arbitration cycle and
-		 * interfere with communication with the firmware.
-		 */
-		if (start == T4VF_CIM_BASE_ADDR + CIM_VF_EXT_MAILBOX_CTRL)
-			*bp++ = 0xffff;
-		else
-			*bp++ = t4_read_reg(adapter, start);
-	}
-}
-
-/*
- * Copy our entire register map into the provided buffer.
- */
-static void cxgb4vf_get_regs(struct net_device *dev,
-			     struct ethtool_regs *regs,
-			     void *regbuf)
-{
-	struct adapter *adapter = netdev2adap(dev);
-
-	regs->version = mk_adap_vers(adapter);
-
-	/*
-	 * Fill in register buffer with our register map.
-	 */
-	memset(regbuf, 0, T4VF_REGMAP_SIZE);
-
-	reg_block_dump(adapter, regbuf,
-		       T4VF_SGE_BASE_ADDR + T4VF_MOD_MAP_SGE_FIRST,
-		       T4VF_SGE_BASE_ADDR + T4VF_MOD_MAP_SGE_LAST);
-	reg_block_dump(adapter, regbuf,
-		       T4VF_MPS_BASE_ADDR + T4VF_MOD_MAP_MPS_FIRST,
-		       T4VF_MPS_BASE_ADDR + T4VF_MOD_MAP_MPS_LAST);
-
-	/* T5 adds new registers in the PL Register map.
-	 */
-	reg_block_dump(adapter, regbuf,
-		       T4VF_PL_BASE_ADDR + T4VF_MOD_MAP_PL_FIRST,
-		       T4VF_PL_BASE_ADDR + (is_t4(adapter->params.chip)
-		       ? PL_VF_WHOAMI_A : PL_VF_REVISION_A));
-	reg_block_dump(adapter, regbuf,
-		       T4VF_CIM_BASE_ADDR + T4VF_MOD_MAP_CIM_FIRST,
-		       T4VF_CIM_BASE_ADDR + T4VF_MOD_MAP_CIM_LAST);
-
-	reg_block_dump(adapter, regbuf,
-		       T4VF_MBDATA_BASE_ADDR + T4VF_MBDATA_FIRST,
-		       T4VF_MBDATA_BASE_ADDR + T4VF_MBDATA_LAST);
-}
-
-/*
- * Report current Wake On LAN settings.
- */
-static void cxgb4vf_get_wol(struct net_device *dev,
-			    struct ethtool_wolinfo *wol)
-{
-	wol->supported = 0;
-	wol->wolopts = 0;
-	memset(&wol->sopass, 0, sizeof(wol->sopass));
-}
-
-/*
- * TCP Segmentation Offload flags which we support.
- */
-#define TSO_FLAGS (NETIF_F_TSO | NETIF_F_TSO6 | NETIF_F_TSO_ECN)
-
-static const struct ethtool_ops cxgb4vf_ethtool_ops = {
-	.get_settings		= cxgb4vf_get_settings,
-	.get_drvinfo		= cxgb4vf_get_drvinfo,
-	.get_msglevel		= cxgb4vf_get_msglevel,
-	.set_msglevel		= cxgb4vf_set_msglevel,
-	.get_ringparam		= cxgb4vf_get_ringparam,
-	.set_ringparam		= cxgb4vf_set_ringparam,
-	.get_coalesce		= cxgb4vf_get_coalesce,
-	.set_coalesce		= cxgb4vf_set_coalesce,
-	.get_pauseparam		= cxgb4vf_get_pauseparam,
-	.get_link		= ethtool_op_get_link,
-	.get_strings		= cxgb4vf_get_strings,
-	.set_phys_id		= cxgb4vf_phys_id,
-	.get_sset_count		= cxgb4vf_get_sset_count,
-	.get_ethtool_stats	= cxgb4vf_get_ethtool_stats,
-	.get_regs_len		= cxgb4vf_get_regs_len,
-	.get_regs		= cxgb4vf_get_regs,
-	.get_wol		= cxgb4vf_get_wol,
-};
-
-/*
- * /sys/kernel/debug/cxgb4vf support code and data.
- * ================================================
- */
-
-/*
- * Show SGE Queue Set information.  We display QPL Queues Sets per line.
- */
-#define QPL	4
-
-static int sge_qinfo_show(struct seq_file *seq, void *v)
-{
-	struct adapter *adapter = seq->private;
-	int eth_entries = DIV_ROUND_UP(adapter->sge.ethqsets, QPL);
-	int qs, r = (uintptr_t)v - 1;
-
-	if (r)
-		seq_putc(seq, '\n');
-
-	#define S3(fmt_spec, s, v) \
-		do {\
-			seq_printf(seq, "%-12s", s); \
-			for (qs = 0; qs < n; ++qs) \
-				seq_printf(seq, " %16" fmt_spec, v); \
-			seq_putc(seq, '\n'); \
-		} while (0)
-	#define S(s, v)		S3("s", s, v)
-	#define T(s, v)		S3("u", s, txq[qs].v)
-	#define R(s, v)		S3("u", s, rxq[qs].v)
-
-	if (r < eth_entries) {
-		const struct sge_eth_rxq *rxq = &adapter->sge.ethrxq[r * QPL];
-		const struct sge_eth_txq *txq = &adapter->sge.ethtxq[r * QPL];
-		int n = min(QPL, adapter->sge.ethqsets - QPL * r);
-
-		S("QType:", "Ethernet");
-		S("Interface:",
-		  (rxq[qs].rspq.netdev
-		   ? rxq[qs].rspq.netdev->name
-		   : "N/A"));
-		S3("d", "Port:",
-		   (rxq[qs].rspq.netdev
-		    ? ((struct port_info *)
-		       netdev_priv(rxq[qs].rspq.netdev))->port_id
-		    : -1));
-		T("TxQ ID:", q.abs_id);
-		T("TxQ size:", q.size);
-		T("TxQ inuse:", q.in_use);
-		T("TxQ PIdx:", q.pidx);
-		T("TxQ CIdx:", q.cidx);
-		R("RspQ ID:", rspq.abs_id);
-		R("RspQ size:", rspq.size);
-		R("RspQE size:", rspq.iqe_len);
-		S3("u", "Intr delay:", qtimer_val(adapter, &rxq[qs].rspq));
-		S3("u", "Intr pktcnt:",
-		   adapter->sge.counter_val[rxq[qs].rspq.pktcnt_idx]);
-		R("RspQ CIdx:", rspq.cidx);
-		R("RspQ Gen:", rspq.gen);
-		R("FL ID:", fl.abs_id);
-		R("FL size:", fl.size - MIN_FL_RESID);
-		R("FL avail:", fl.avail);
-		R("FL PIdx:", fl.pidx);
-		R("FL CIdx:", fl.cidx);
-		return 0;
-	}
-
-	r -= eth_entries;
-	if (r == 0) {
-		const struct sge_rspq *evtq = &adapter->sge.fw_evtq;
-
-		seq_printf(seq, "%-12s %16s\n", "QType:", "FW event queue");
-		seq_printf(seq, "%-12s %16u\n", "RspQ ID:", evtq->abs_id);
-		seq_printf(seq, "%-12s %16u\n", "Intr delay:",
-			   qtimer_val(adapter, evtq));
-		seq_printf(seq, "%-12s %16u\n", "Intr pktcnt:",
-			   adapter->sge.counter_val[evtq->pktcnt_idx]);
-		seq_printf(seq, "%-12s %16u\n", "RspQ Cidx:", evtq->cidx);
-		seq_printf(seq, "%-12s %16u\n", "RspQ Gen:", evtq->gen);
-	} else if (r == 1) {
-		const struct sge_rspq *intrq = &adapter->sge.intrq;
-
-		seq_printf(seq, "%-12s %16s\n", "QType:", "Interrupt Queue");
-		seq_printf(seq, "%-12s %16u\n", "RspQ ID:", intrq->abs_id);
-		seq_printf(seq, "%-12s %16u\n", "Intr delay:",
-			   qtimer_val(adapter, intrq));
-		seq_printf(seq, "%-12s %16u\n", "Intr pktcnt:",
-			   adapter->sge.counter_val[intrq->pktcnt_idx]);
-		seq_printf(seq, "%-12s %16u\n", "RspQ Cidx:", intrq->cidx);
-		seq_printf(seq, "%-12s %16u\n", "RspQ Gen:", intrq->gen);
-	}
-
-	#undef R
-	#undef T
-	#undef S
-	#undef S3
-
-	return 0;
-}
-
-/*
- * Return the number of "entries" in our "file".  We group the multi-Queue
- * sections with QPL Queue Sets per "entry".  The sections of the output are:
- *
- *     Ethernet RX/TX Queue Sets
- *     Firmware Event Queue
- *     Forwarded Interrupt Queue (if in MSI mode)
- */
-static int sge_queue_entries(const struct adapter *adapter)
-{
-	return DIV_ROUND_UP(adapter->sge.ethqsets, QPL) + 1 +
-		((adapter->flags & USING_MSI) != 0);
-}
-
-static void *sge_queue_start(struct seq_file *seq, loff_t *pos)
-{
-	int entries = sge_queue_entries(seq->private);
-
-	return *pos < entries ? (void *)((uintptr_t)*pos + 1) : NULL;
-}
-
-static void sge_queue_stop(struct seq_file *seq, void *v)
-{
-}
-
-static void *sge_queue_next(struct seq_file *seq, void *v, loff_t *pos)
-{
-	int entries = sge_queue_entries(seq->private);
-
-	++*pos;
-	return *pos < entries ? (void *)((uintptr_t)*pos + 1) : NULL;
-}
-
-static const struct seq_operations sge_qinfo_seq_ops = {
-	.start = sge_queue_start,
-	.next  = sge_queue_next,
-	.stop  = sge_queue_stop,
-	.show  = sge_qinfo_show
-};
-
-static int sge_qinfo_open(struct inode *inode, struct file *file)
-{
-	int res = seq_open(file, &sge_qinfo_seq_ops);
-
-	if (!res) {
-		struct seq_file *seq = file->private_data;
-		seq->private = inode->i_private;
-	}
-	return res;
-}
-
-static const struct file_operations sge_qinfo_debugfs_fops = {
-	.owner   = THIS_MODULE,
-	.open    = sge_qinfo_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = seq_release,
-};
-
-/*
- * Show SGE Queue Set statistics.  We display QPL Queues Sets per line.
- */
-#define QPL	4
-
-static int sge_qstats_show(struct seq_file *seq, void *v)
-{
-	struct adapter *adapter = seq->private;
-	int eth_entries = DIV_ROUND_UP(adapter->sge.ethqsets, QPL);
-	int qs, r = (uintptr_t)v - 1;
-
-	if (r)
-		seq_putc(seq, '\n');
-
-	#define S3(fmt, s, v) \
-		do { \
-			seq_printf(seq, "%-16s", s); \
-			for (qs = 0; qs < n; ++qs) \
-				seq_printf(seq, " %8" fmt, v); \
-			seq_putc(seq, '\n'); \
-		} while (0)
-	#define S(s, v)		S3("s", s, v)
-
-	#define T3(fmt, s, v)	S3(fmt, s, txq[qs].v)
-	#define T(s, v)		T3("lu", s, v)
-
-	#define R3(fmt, s, v)	S3(fmt, s, rxq[qs].v)
-	#define R(s, v)		R3("lu", s, v)
-
-	if (r < eth_entries) {
-		const struct sge_eth_rxq *rxq = &adapter->sge.ethrxq[r * QPL];
-		const struct sge_eth_txq *txq = &adapter->sge.ethtxq[r * QPL];
-		int n = min(QPL, adapter->sge.ethqsets - QPL * r);
-
-		S("QType:", "Ethernet");
-		S("Interface:",
-		  (rxq[qs].rspq.netdev
-		   ? rxq[qs].rspq.netdev->name
-		   : "N/A"));
-		R3("u", "RspQNullInts:", rspq.unhandled_irqs);
-		R("RxPackets:", stats.pkts);
-		R("RxCSO:", stats.rx_cso);
-		R("VLANxtract:", stats.vlan_ex);
-		R("LROmerged:", stats.lro_merged);
-		R("LROpackets:", stats.lro_pkts);
-		R("RxDrops:", stats.rx_drops);
-		T("TSO:", tso);
-		T("TxCSO:", tx_cso);
-		T("VLANins:", vlan_ins);
-		T("TxQFull:", q.stops);
-		T("TxQRestarts:", q.restarts);
-		T("TxMapErr:", mapping_err);
-		R("FLAllocErr:", fl.alloc_failed);
-		R("FLLrgAlcErr:", fl.large_alloc_failed);
-		R("FLStarving:", fl.starving);
-		return 0;
-	}
-
-	r -= eth_entries;
-	if (r == 0) {
-		const struct sge_rspq *evtq = &adapter->sge.fw_evtq;
-
-		seq_printf(seq, "%-8s %16s\n", "QType:", "FW event queue");
-		seq_printf(seq, "%-16s %8u\n", "RspQNullInts:",
-			   evtq->unhandled_irqs);
-		seq_printf(seq, "%-16s %8u\n", "RspQ CIdx:", evtq->cidx);
-		seq_printf(seq, "%-16s %8u\n", "RspQ Gen:", evtq->gen);
-	} else if (r == 1) {
-		const struct sge_rspq *intrq = &adapter->sge.intrq;
-
-		seq_printf(seq, "%-8s %16s\n", "QType:", "Interrupt Queue");
-		seq_printf(seq, "%-16s %8u\n", "RspQNullInts:",
-			   intrq->unhandled_irqs);
-		seq_printf(seq, "%-16s %8u\n", "RspQ CIdx:", intrq->cidx);
-		seq_printf(seq, "%-16s %8u\n", "RspQ Gen:", intrq->gen);
-	}
-
-	#undef R
-	#undef T
-	#undef S
-	#undef R3
-	#undef T3
-	#undef S3
-
-	return 0;
-}
-
-/*
- * Return the number of "entries" in our "file".  We group the multi-Queue
- * sections with QPL Queue Sets per "entry".  The sections of the output are:
- *
- *     Ethernet RX/TX Queue Sets
- *     Firmware Event Queue
- *     Forwarded Interrupt Queue (if in MSI mode)
- */
-static int sge_qstats_entries(const struct adapter *adapter)
-{
-	return DIV_ROUND_UP(adapter->sge.ethqsets, QPL) + 1 +
-		((adapter->flags & USING_MSI) != 0);
-}
-
-static void *sge_qstats_start(struct seq_file *seq, loff_t *pos)
-{
-	int entries = sge_qstats_entries(seq->private);
-
-	return *pos < entries ? (void *)((uintptr_t)*pos + 1) : NULL;
-}
-
-static void sge_qstats_stop(struct seq_file *seq, void *v)
-{
-}
-
-static void *sge_qstats_next(struct seq_file *seq, void *v, loff_t *pos)
-{
-	int entries = sge_qstats_entries(seq->private);
-
-	(*pos)++;
-	return *pos < entries ? (void *)((uintptr_t)*pos + 1) : NULL;
-}
-
-static const struct seq_operations sge_qstats_seq_ops = {
-	.start = sge_qstats_start,
-	.next  = sge_qstats_next,
-	.stop  = sge_qstats_stop,
-	.show  = sge_qstats_show
-};
-
-static int sge_qstats_open(struct inode *inode, struct file *file)
-{
-	int res = seq_open(file, &sge_qstats_seq_ops);
-
-	if (res == 0) {
-		struct seq_file *seq = file->private_data;
-		seq->private = inode->i_private;
-	}
-	return res;
-}
-
-static const struct file_operations sge_qstats_proc_fops = {
-	.owner   = THIS_MODULE,
-	.open    = sge_qstats_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = seq_release,
-};
-
-/*
- * Show PCI-E SR-IOV Virtual Function Resource Limits.
- */
-static int resources_show(struct seq_file *seq, void *v)
-{
-	struct adapter *adapter = seq->private;
-	struct vf_resources *vfres = &adapter->params.vfres;
-
-	#define S(desc, fmt, var) \
-		seq_printf(seq, "%-60s " fmt "\n", \
-			   desc " (" #var "):", vfres->var)
-
-	S("Virtual Interfaces", "%d", nvi);
-	S("Egress Queues", "%d", neq);
-	S("Ethernet Control", "%d", nethctrl);
-	S("Ingress Queues/w Free Lists/Interrupts", "%d", niqflint);
-	S("Ingress Queues", "%d", niq);
-	S("Traffic Class", "%d", tc);
-	S("Port Access Rights Mask", "%#x", pmask);
-	S("MAC Address Filters", "%d", nexactf);
-	S("Firmware Command Read Capabilities", "%#x", r_caps);
-	S("Firmware Command Write/Execute Capabilities", "%#x", wx_caps);
-
-	#undef S
-
-	return 0;
-}
-
-static int resources_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, resources_show, inode->i_private);
-}
-
-static const struct file_operations resources_proc_fops = {
-	.owner   = THIS_MODULE,
-	.open    = resources_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = single_release,
-};
-
-/*
- * Show Virtual Interfaces.
- */
-static int interfaces_show(struct seq_file *seq, void *v)
-{
-	if (v == SEQ_START_TOKEN) {
-		seq_puts(seq, "Interface  Port   VIID\n");
-	} else {
-		struct adapter *adapter = seq->private;
-		int pidx = (uintptr_t)v - 2;
-		struct net_device *dev = adapter->port[pidx];
-		struct port_info *pi = netdev_priv(dev);
-
-		seq_printf(seq, "%9s  %4d  %#5x\n",
-			   dev->name, pi->port_id, pi->viid);
-	}
-	return 0;
-}
-
-static inline void *interfaces_get_idx(struct adapter *adapter, loff_t pos)
-{
-	return pos <= adapter->params.nports
-		? (void *)(uintptr_t)(pos + 1)
-		: NULL;
-}
-
-static void *interfaces_start(struct seq_file *seq, loff_t *pos)
-{
-	return *pos
-		? interfaces_get_idx(seq->private, *pos)
-		: SEQ_START_TOKEN;
-}
-
-static void *interfaces_next(struct seq_file *seq, void *v, loff_t *pos)
-{
-	(*pos)++;
-	return interfaces_get_idx(seq->private, *pos);
-}
-
-static void interfaces_stop(struct seq_file *seq, void *v)
-{
-}
-
-static const struct seq_operations interfaces_seq_ops = {
-	.start = interfaces_start,
-	.next  = interfaces_next,
-	.stop  = interfaces_stop,
-	.show  = interfaces_show
-};
-
-static int interfaces_open(struct inode *inode, struct file *file)
-{
-	int res = seq_open(file, &interfaces_seq_ops);
-
-	if (res == 0) {
-		struct seq_file *seq = file->private_data;
-		seq->private = inode->i_private;
-	}
-	return res;
-}
-
-static const struct file_operations interfaces_proc_fops = {
-	.owner   = THIS_MODULE,
-	.open    = interfaces_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = seq_release,
-};
-
-/*
- * /sys/kernel/debugfs/cxgb4vf/ files list.
- */
-struct cxgb4vf_debugfs_entry {
-	const char *name;		/* name of debugfs node */
-	umode_t mode;			/* file system mode */
-	const struct file_operations *fops;
-};
-
-static struct cxgb4vf_debugfs_entry debugfs_files[] = {
-	{ "sge_qinfo",  S_IRUGO, &sge_qinfo_debugfs_fops },
-	{ "sge_qstats", S_IRUGO, &sge_qstats_proc_fops },
-	{ "resources",  S_IRUGO, &resources_proc_fops },
-	{ "interfaces", S_IRUGO, &interfaces_proc_fops },
-};
-
-/*
- * Module and device initialization and cleanup code.
- * ==================================================
- */
-
-/*
- * Set up out /sys/kernel/debug/cxgb4vf sub-nodes.  We assume that the
- * directory (debugfs_root) has already been set up.
- */
-static int setup_debugfs(struct adapter *adapter)
-{
-	int i;
-
-	BUG_ON(IS_ERR_OR_NULL(adapter->debugfs_root));
-
-	/*
-	 * Debugfs support is best effort.
-	 */
-	for (i = 0; i < ARRAY_SIZE(debugfs_files); i++)
-		(void)debugfs_create_file(debugfs_files[i].name,
-				  debugfs_files[i].mode,
-				  adapter->debugfs_root,
-				  (void *)adapter,
-				  debugfs_files[i].fops);
-
-	return 0;
-}
-
-/*
- * Tear down the /sys/kernel/debug/cxgb4vf sub-nodes created above.  We leave
- * it to our caller to tear down the directory (debugfs_root).
- */
-static void cleanup_debugfs(struct adapter *adapter)
-{
-	BUG_ON(IS_ERR_OR_NULL(adapter->debugfs_root));
-
-	/*
-	 * Unlike our sister routine cleanup_proc(), we don't need to remove
-	 * individual entries because a call will be made to
-	 * debugfs_remove_recursive().  We just need to clean up any ancillary
-	 * persistent state.
-	 */
-	/* nothing to do */
-}
-
-/*
- * Perform early "adapter" initialization.  This is where we discover what
- * adapter parameters we're going to be using and initialize basic adapter
- * hardware support.
- */
-static int adap_init0(struct adapter *adapter)
-{
-	struct vf_resources *vfres = &adapter->params.vfres;
-	struct sge_params *sge_params = &adapter->params.sge;
-	struct sge *s = &adapter->sge;
-	unsigned int ethqsets;
-	int err;
-	u32 param, val = 0;
-
-	/*
-	 * Wait for the device to become ready before proceeding ...
-	 */
-	err = t4vf_wait_dev_ready(adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "device didn't become ready:"
-			" err=%d\n", err);
-		return err;
-	}
-
-	/*
-	 * Some environments do not properly handle PCIE FLRs -- e.g. in Linux
-	 * 2.6.31 and later we can't call pci_reset_function() in order to
-	 * issue an FLR because of a self- deadlock on the device semaphore.
-	 * Meanwhile, the OS infrastructure doesn't issue FLRs in all the
-	 * cases where they're needed -- for instance, some versions of KVM
-	 * fail to reset "Assigned Devices" when the VM reboots.  Therefore we
-	 * use the firmware based reset in order to reset any per function
-	 * state.
-	 */
-	err = t4vf_fw_reset(adapter);
-	if (err < 0) {
-		dev_err(adapter->pdev_dev, "FW reset failed: err=%d\n", err);
-		return err;
-	}
-
-	/*
-	 * Grab basic operational parameters.  These will predominantly have
-	 * been set up by the Physical Function Driver or will be hard coded
-	 * into the adapter.  We just have to live with them ...  Note that
-	 * we _must_ get our VPD parameters before our SGE parameters because
-	 * we need to know the adapter's core clock from the VPD in order to
-	 * properly decode the SGE Timer Values.
-	 */
-	err = t4vf_get_dev_params(adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "unable to retrieve adapter"
-			" device parameters: err=%d\n", err);
-		return err;
-	}
-	err = t4vf_get_vpd_params(adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "unable to retrieve adapter"
-			" VPD parameters: err=%d\n", err);
-		return err;
-	}
-	err = t4vf_get_sge_params(adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "unable to retrieve adapter"
-			" SGE parameters: err=%d\n", err);
-		return err;
-	}
-	err = t4vf_get_rss_glb_config(adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "unable to retrieve adapter"
-			" RSS parameters: err=%d\n", err);
-		return err;
-	}
-	if (adapter->params.rss.mode !=
-	    FW_RSS_GLB_CONFIG_CMD_MODE_BASICVIRTUAL) {
-		dev_err(adapter->pdev_dev, "unable to operate with global RSS"
-			" mode %d\n", adapter->params.rss.mode);
-		return -EINVAL;
-	}
-	err = t4vf_sge_init(adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "unable to use adapter parameters:"
-			" err=%d\n", err);
-		return err;
-	}
-
-	/* If we're running on newer firmware, let it know that we're
-	 * prepared to deal with encapsulated CPL messages.  Older
-	 * firmware won't understand this and we'll just get
-	 * unencapsulated messages ...
-	 */
-	param = FW_PARAMS_MNEM_V(FW_PARAMS_MNEM_PFVF) |
-		FW_PARAMS_PARAM_X_V(FW_PARAMS_PARAM_PFVF_CPLFW4MSG_ENCAP);
-	val = 1;
-	(void) t4vf_set_params(adapter, 1, &param, &val);
-
-	/*
-	 * Retrieve our RX interrupt holdoff timer values and counter
-	 * threshold values from the SGE parameters.
-	 */
-	s->timer_val[0] = core_ticks_to_us(adapter,
-		TIMERVALUE0_G(sge_params->sge_timer_value_0_and_1));
-	s->timer_val[1] = core_ticks_to_us(adapter,
-		TIMERVALUE1_G(sge_params->sge_timer_value_0_and_1));
-	s->timer_val[2] = core_ticks_to_us(adapter,
-		TIMERVALUE0_G(sge_params->sge_timer_value_2_and_3));
-	s->timer_val[3] = core_ticks_to_us(adapter,
-		TIMERVALUE1_G(sge_params->sge_timer_value_2_and_3));
-	s->timer_val[4] = core_ticks_to_us(adapter,
-		TIMERVALUE0_G(sge_params->sge_timer_value_4_and_5));
-	s->timer_val[5] = core_ticks_to_us(adapter,
-		TIMERVALUE1_G(sge_params->sge_timer_value_4_and_5));
-
-	s->counter_val[0] = THRESHOLD_0_G(sge_params->sge_ingress_rx_threshold);
-	s->counter_val[1] = THRESHOLD_1_G(sge_params->sge_ingress_rx_threshold);
-	s->counter_val[2] = THRESHOLD_2_G(sge_params->sge_ingress_rx_threshold);
-	s->counter_val[3] = THRESHOLD_3_G(sge_params->sge_ingress_rx_threshold);
-
-	/*
-	 * Grab our Virtual Interface resource allocation, extract the
-	 * features that we're interested in and do a bit of sanity testing on
-	 * what we discover.
-	 */
-	err = t4vf_get_vfres(adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "unable to get virtual interface"
-			" resources: err=%d\n", err);
-		return err;
-	}
-
-	/*
-	 * The number of "ports" which we support is equal to the number of
-	 * Virtual Interfaces with which we've been provisioned.
-	 */
-	adapter->params.nports = vfres->nvi;
-	if (adapter->params.nports > MAX_NPORTS) {
-		dev_warn(adapter->pdev_dev, "only using %d of %d allowed"
-			 " virtual interfaces\n", MAX_NPORTS,
-			 adapter->params.nports);
-		adapter->params.nports = MAX_NPORTS;
-	}
-
-	/*
-	 * We need to reserve a number of the ingress queues with Free List
-	 * and Interrupt capabilities for special interrupt purposes (like
-	 * asynchronous firmware messages, or forwarded interrupts if we're
-	 * using MSI).  The rest of the FL/Intr-capable ingress queues will be
-	 * matched up one-for-one with Ethernet/Control egress queues in order
-	 * to form "Queue Sets" which will be aportioned between the "ports".
-	 * For each Queue Set, we'll need the ability to allocate two Egress
-	 * Contexts -- one for the Ingress Queue Free List and one for the TX
-	 * Ethernet Queue.
-	 */
-	ethqsets = vfres->niqflint - INGQ_EXTRAS;
-	if (vfres->nethctrl != ethqsets) {
-		dev_warn(adapter->pdev_dev, "unequal number of [available]"
-			 " ingress/egress queues (%d/%d); using minimum for"
-			 " number of Queue Sets\n", ethqsets, vfres->nethctrl);
-		ethqsets = min(vfres->nethctrl, ethqsets);
-	}
-	if (vfres->neq < ethqsets*2) {
-		dev_warn(adapter->pdev_dev, "Not enough Egress Contexts (%d)"
-			 " to support Queue Sets (%d); reducing allowed Queue"
-			 " Sets\n", vfres->neq, ethqsets);
-		ethqsets = vfres->neq/2;
-	}
-	if (ethqsets > MAX_ETH_QSETS) {
-		dev_warn(adapter->pdev_dev, "only using %d of %d allowed Queue"
-			 " Sets\n", MAX_ETH_QSETS, adapter->sge.max_ethqsets);
-		ethqsets = MAX_ETH_QSETS;
-	}
-	if (vfres->niq != 0 || vfres->neq > ethqsets*2) {
-		dev_warn(adapter->pdev_dev, "unused resources niq/neq (%d/%d)"
-			 " ignored\n", vfres->niq, vfres->neq - ethqsets*2);
-	}
-	adapter->sge.max_ethqsets = ethqsets;
-
-	/*
-	 * Check for various parameter sanity issues.  Most checks simply
-	 * result in us using fewer resources than our provissioning but we
-	 * do need at least  one "port" with which to work ...
-	 */
-	if (adapter->sge.max_ethqsets < adapter->params.nports) {
-		dev_warn(adapter->pdev_dev, "only using %d of %d available"
-			 " virtual interfaces (too few Queue Sets)\n",
-			 adapter->sge.max_ethqsets, adapter->params.nports);
-		adapter->params.nports = adapter->sge.max_ethqsets;
-	}
-	if (adapter->params.nports == 0) {
-		dev_err(adapter->pdev_dev, "no virtual interfaces configured/"
-			"usable!\n");
-		return -EINVAL;
-	}
-	return 0;
-}
-
-static inline void init_rspq(struct sge_rspq *rspq, u8 timer_idx,
-			     u8 pkt_cnt_idx, unsigned int size,
-			     unsigned int iqe_size)
-{
-	rspq->intr_params = (QINTR_TIMER_IDX_V(timer_idx) |
-			     (pkt_cnt_idx < SGE_NCOUNTERS ?
-			      QINTR_CNT_EN_F : 0));
-	rspq->pktcnt_idx = (pkt_cnt_idx < SGE_NCOUNTERS
-			    ? pkt_cnt_idx
-			    : 0);
-	rspq->iqe_len = iqe_size;
-	rspq->size = size;
-}
-
-/*
- * Perform default configuration of DMA queues depending on the number and
- * type of ports we found and the number of available CPUs.  Most settings can
- * be modified by the admin via ethtool and cxgbtool prior to the adapter
- * being brought up for the first time.
- */
-static void cfg_queues(struct adapter *adapter)
-{
-	struct sge *s = &adapter->sge;
-	int q10g, n10g, qidx, pidx, qs;
-	size_t iqe_size;
-
-	/*
-	 * We should not be called till we know how many Queue Sets we can
-	 * support.  In particular, this means that we need to know what kind
-	 * of interrupts we'll be using ...
-	 */
-	BUG_ON((adapter->flags & (USING_MSIX|USING_MSI)) == 0);
-
-	/*
-	 * Count the number of 10GbE Virtual Interfaces that we have.
-	 */
-	n10g = 0;
-	for_each_port(adapter, pidx)
-		n10g += is_x_10g_port(&adap2pinfo(adapter, pidx)->link_cfg);
-
-	/*
-	 * We default to 1 queue per non-10G port and up to # of cores queues
-	 * per 10G port.
-	 */
-	if (n10g == 0)
-		q10g = 0;
-	else {
-		int n1g = (adapter->params.nports - n10g);
-		q10g = (adapter->sge.max_ethqsets - n1g) / n10g;
-		if (q10g > num_online_cpus())
-			q10g = num_online_cpus();
-	}
-
-	/*
-	 * Allocate the "Queue Sets" to the various Virtual Interfaces.
-	 * The layout will be established in setup_sge_queues() when the
-	 * adapter is brough up for the first time.
-	 */
-	qidx = 0;
-	for_each_port(adapter, pidx) {
-		struct port_info *pi = adap2pinfo(adapter, pidx);
-
-		pi->first_qset = qidx;
-		pi->nqsets = is_x_10g_port(&pi->link_cfg) ? q10g : 1;
-		qidx += pi->nqsets;
-	}
-	s->ethqsets = qidx;
-
-	/*
-	 * The Ingress Queue Entry Size for our various Response Queues needs
-	 * to be big enough to accommodate the largest message we can receive
-	 * from the chip/firmware; which is 64 bytes ...
-	 */
-	iqe_size = 64;
-
-	/*
-	 * Set up default Queue Set parameters ...  Start off with the
-	 * shortest interrupt holdoff timer.
-	 */
-	for (qs = 0; qs < s->max_ethqsets; qs++) {
-		struct sge_eth_rxq *rxq = &s->ethrxq[qs];
-		struct sge_eth_txq *txq = &s->ethtxq[qs];
-
-		init_rspq(&rxq->rspq, 0, 0, 1024, iqe_size);
-		rxq->fl.size = 72;
-		txq->q.size = 1024;
-	}
-
-	/*
-	 * The firmware event queue is used for link state changes and
-	 * notifications of TX DMA completions.
-	 */
-	init_rspq(&s->fw_evtq, SGE_TIMER_RSTRT_CNTR, 0, 512, iqe_size);
-
-	/*
-	 * The forwarded interrupt queue is used when we're in MSI interrupt
-	 * mode.  In this mode all interrupts associated with RX queues will
-	 * be forwarded to a single queue which we'll associate with our MSI
-	 * interrupt vector.  The messages dropped in the forwarded interrupt
-	 * queue will indicate which ingress queue needs servicing ...  This
-	 * queue needs to be large enough to accommodate all of the ingress
-	 * queues which are forwarding their interrupt (+1 to prevent the PIDX
-	 * from equalling the CIDX if every ingress queue has an outstanding
-	 * interrupt).  The queue doesn't need to be any larger because no
-	 * ingress queue will ever have more than one outstanding interrupt at
-	 * any time ...
-	 */
-	init_rspq(&s->intrq, SGE_TIMER_RSTRT_CNTR, 0, MSIX_ENTRIES + 1,
-		  iqe_size);
-}
-
-/*
- * Reduce the number of Ethernet queues across all ports to at most n.
- * n provides at least one queue per port.
- */
-static void reduce_ethqs(struct adapter *adapter, int n)
-{
-	int i;
-	struct port_info *pi;
-
-	/*
-	 * While we have too many active Ether Queue Sets, interate across the
-	 * "ports" and reduce their individual Queue Set allocations.
-	 */
-	BUG_ON(n < adapter->params.nports);
-	while (n < adapter->sge.ethqsets)
-		for_each_port(adapter, i) {
-			pi = adap2pinfo(adapter, i);
-			if (pi->nqsets > 1) {
-				pi->nqsets--;
-				adapter->sge.ethqsets--;
-				if (adapter->sge.ethqsets <= n)
-					break;
+	if (cpu_cur.info && cpu_cur.board) {
+		ret = s3c_cpufreq_initclks();
+		if (ret)
+			goto out;
+
+		/* get current settings */
+		s3c_cpufreq_getcur(&cpu_cur);
+		s3c_cpufreq_show("cur", &cpu_cur);
+
+		if (cpu_cur.board->auto_io) {
+			ret = s3c_cpufreq_auto_io();
+			if (ret) {
+				printk(KERN_ERR "%s: failed to get io timing\n",
+				       __func__);
+				goto out;
 			}
 		}
 
-	/*
-	 * Reassign the starting Queue Sets for each of the "ports" ...
-	 */
-	n = 0;
-	for_each_port(adapter, i) {
-		pi = adap2pinfo(adapter, i);
-		pi->first_qset = n;
-		n += pi->nqsets;
-	}
-}
-
-/*
- * We need to grab enough MSI-X vectors to cover our interrupt needs.  Ideally
- * we get a separate MSI-X vector for every "Queue Set" plus any extras we
- * need.  Minimally we need one for every Virtual Interface plus those needed
- * for our "extras".  Note that this process may lower the maximum number of
- * allowed Queue Sets ...
- */
-static int enable_msix(struct adapter *adapter)
-{
-	int i, want, need, nqsets;
-	struct msix_entry entries[MSIX_ENTRIES];
-	struct sge *s = &adapter->sge;
-
-	for (i = 0; i < MSIX_ENTRIES; ++i)
-		entries[i].entry = i;
-
-	/*
-	 * We _want_ enough MSI-X interrupts to cover all of our "Queue Sets"
-	 * plus those needed for our "extras" (for example, the firmware
-	 * message queue).  We _need_ at least one "Queue Set" per Virtual
-	 * Interface plus those needed for our "extras".  So now we get to see
-	 * if the song is right ...
-	 */
-	want = s->max_ethqsets + MSIX_EXTRAS;
-	need = adapter->params.nports + MSIX_EXTRAS;
-
-	want = pci_enable_msix_range(adapter->pdev, entries, need, want);
-	if (want < 0)
-		return want;
-
-	nqsets = want - MSIX_EXTRAS;
-	if (nqsets < s->max_ethqsets) {
-		dev_warn(adapter->pdev_dev, "only enough MSI-X vectors"
-			 " for %d Queue Sets\n", nqsets);
-		s->max_ethqsets = nqsets;
-		if (nqsets < s->ethqsets)
-			reduce_ethqs(adapter, nqsets);
-	}
-	for (i = 0; i < want; ++i)
-		adapter->msix_info[i].vec = entries[i].vector;
-
-	return 0;
-}
-
-static const struct net_device_ops cxgb4vf_netdev_ops	= {
-	.ndo_open		= cxgb4vf_open,
-	.ndo_stop		= cxgb4vf_stop,
-	.ndo_start_xmit		= t4vf_eth_xmit,
-	.ndo_get_stats		= cxgb4vf_get_stats,
-	.ndo_set_rx_mode	= cxgb4vf_set_rxmode,
-	.ndo_set_mac_address	= cxgb4vf_set_mac_addr,
-	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_do_ioctl		= cxgb4vf_do_ioctl,
-	.ndo_change_mtu		= cxgb4vf_change_mtu,
-	.ndo_fix_features	= cxgb4vf_fix_features,
-	.ndo_set_features	= cxgb4vf_set_features,
-#ifdef CONFIG_NET_POLL_CONTROLLER
-	.ndo_poll_controller	= cxgb4vf_poll_controller,
-#endif
-};
-
-/*
- * "Probe" a device: initialize a device and construct all kernel and driver
- * state needed to manage the device.  This routine is called "init_one" in
- * the PF Driver ...
- */
-static int cxgb4vf_pci_probe(struct pci_dev *pdev,
-			     const struct pci_device_id *ent)
-{
-	int pci_using_dac;
-	int err, pidx;
-	unsigned int pmask;
-	struct adapter *adapter;
-	struct port_info *pi;
-	struct net_device *netdev;
-
-	/*
-	 * Print our driver banner the first time we're called to initialize a
-	 * device.
-	 */
-	pr_info_once("%s - version %s\n", DRV_DESC, DRV_VERSION);
-
-	/*
-	 * Initialize generic PCI device state.
-	 */
-	err = pci_enable_device(pdev);
-	if (err) {
-		dev_err(&pdev->dev, "cannot enable PCI device\n");
-		return err;
-	}
-
-	/*
-	 * Reserve PCI resources for the device.  If we can't get them some
-	 * other driver may have already claimed the device ...
-	 */
-	err = pci_request_regions(pdev, KBUILD_MODNAME);
-	if (err) {
-		dev_err(&pdev->dev, "cannot obtain PCI resources\n");
-		goto err_disable_device;
-	}
-
-	/*
-	 * Set up our DMA mask: try for 64-bit address masking first and
-	 * fall back to 32-bit if we can't get 64 bits ...
-	 */
-	err = pci_set_dma_mask(pdev, DMA_BIT_MASK(64));
-	if (err == 0) {
-		err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
-		if (err) {
-			dev_err(&pdev->dev, "unable to obtain 64-bit DMA for"
-				" coherent allocations\n");
-			goto err_release_regions;
-		}
-		pci_using_dac = 1;
-	} else {
-		err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
-		if (err != 0) {
-			dev_err(&pdev->dev, "no usable DMA configuration\n");
-			goto err_release_regions;
-		}
-		pci_using_dac = 0;
-	}
-
-	/*
-	 * Enable bus mastering for the device ...
-	 */
-	pci_set_master(pdev);
-
-	/*
-	 * Allocate our adapter data structure and attach it to the device.
-	 */
-	adapter = kzalloc(sizeof(*adapter), GFP_KERNEL);
-	if (!adapter) {
-		err = -ENOMEM;
-		goto err_release_regions;
-	}
-	pci_set_drvdata(pdev, adapter);
-	adapter->pdev = pdev;
-	adapter->pdev_dev = &pdev->dev;
-
-	/*
-	 * Initialize SMP data synchronization resources.
-	 */
-	spin_lock_init(&adapter->stats_lock);
-
-	/*
-	 * Map our I/O registers in BAR0.
-	 */
-	adapter->regs = pci_ioremap_bar(pdev, 0);
-	if (!adapter->regs) {
-		dev_err(&pdev->dev, "cannot map device registers\n");
-		err = -ENOMEM;
-		goto err_free_adapter;
-	}
-
-	/* Wait for the device to become ready before proceeding ...
-	 */
-	err = t4vf_prep_adapter(adapter);
-	if (err) {
-		dev_err(adapter->pdev_dev, "device didn't become ready:"
-			" err=%d\n", err);
-		goto err_unmap_bar0;
-	}
-
-	/* For T5 and later we want to use the new BAR-based User Doorbells,
-	 * so we need to map BAR2 here ...
-	 */
-	if (!is_t4(adapter->params.chip)) {
-		adapter->bar2 = ioremap_wc(pci_resource_start(pdev, 2),
-					   pci_resource_len(pdev, 2));
-		if (!adapter->bar2) {
-			dev_err(adapter->pdev_dev, "cannot map BAR2 doorbells\n");
-			err = -ENOMEM;
-			goto err_unmap_bar0;
-		}
-	}
-	/*
-	 * Initialize adapter level features.
-	 */
-	adapter->name = pci_name(pdev);
-	adapter->msg_enable = dflt_msg_enable;
-	err = adap_init0(adapter);
-	if (err)
-		goto err_unmap_bar;
-
-	/*
-	 * Allocate our "adapter ports" and stitch everything together.
-	 */
-	pmask = adapter->params.vfres.pmask;
-	for_each_port(adapter, pidx) {
-		int port_id, viid;
-
-		/*
-		 * We simplistically allocate our virtual interfaces
-		 * sequentially across the port numbers to which we have
-		 * access rights.  This should be configurable in some manner
-		 * ...
-		 */
-		if (pmask == 0)
-			break;
-		port_id = ffs(pmask) - 1;
-		pmask &= ~(1 << port_id);
-		viid = t4vf_alloc_vi(adapter, port_id);
-		if (viid < 0) {
-			dev_err(&pdev->dev, "cannot allocate VI for port %d:"
-				" err=%d\n", port_id, viid);
-			err = viid;
-			goto err_free_dev;
+		if (cpu_cur.board->need_io && !cpu_cur.info->set_iotiming) {
+			printk(KERN_ERR "%s: no IO support registered\n",
+			       __func__);
+			ret = -EINVAL;
+			goto out;
 		}
 
-		/*
-		 * Allocate our network device and stitch things together.
-		 */
-		netdev = alloc_etherdev_mq(sizeof(struct port_info),
-					   MAX_PORT_QSETS);
-		if (netdev == NULL) {
-			t4vf_free_vi(adapter, viid);
-			err = -ENOMEM;
-			goto err_free_dev;
-		}
-		adapter->port[pidx] = netdev;
-		SET_NETDEV_DEV(netdev, &pdev->dev);
-		pi = netdev_priv(netdev);
-		pi->adapter = adapter;
-		pi->pidx = pidx;
-		pi->port_id = port_id;
-		pi->viid = viid;
+		if (!cpu_cur.info->need_pll)
+			cpu_cur.lock_pll = 1;
 
-		/*
-		 * Initialize the starting state of our "port" and register
-		 * it.
-		 */
-		pi->xact_addr_filt = -1;
-		netif_carrier_off(netdev);
-		netdev->irq = pdev->irq;
+		s3c_cpufreq_update_loctkime();
 
-		netdev->hw_features = NETIF_F_SG | TSO_FLAGS |
-			NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
-			NETIF_F_HW_VLAN_CTAG_RX | NETIF_F_RXCSUM;
-		netdev->vlan_features = NETIF_F_SG | TSO_FLAGS |
-			NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
-			NETIF_F_HIGHDMA;
-		netdev->features = netdev->hw_features |
-				   NETIF_F_HW_VLAN_CTAG_TX;
-		if (pci_using_dac)
-			netdev->features |= NETIF_F_HIGHDMA;
+		s3c_cpufreq_freq_min(&cpu_cur.max, &cpu_cur.board->max,
+				     &cpu_cur.info->max);
 
-		netdev->priv_flags |= IFF_UNICAST_FLT;
+		if (cpu_cur.info->calc_freqtable)
+			s3c_cpufreq_build_freq();
 
-		netdev->netdev_ops = &cxgb4vf_netdev_ops;
-		netdev->ethtool_ops = &cxgb4vf_ethtool_ops;
-
-		/*
-		 * Initialize the hardware/software state for the port.
-		 */
-		err = t4vf_port_init(adapter, pidx);
-		if (err) {
-			dev_err(&pdev->dev, "cannot initialize port %d\n",
-				pidx);
-			goto err_free_dev;
-		}
+		ret = cpufreq_register_driver(&s3c24xx_driver);
 	}
 
-	/*
-	 * The "card" is now ready to go.  If any errors occur during device
-	 * registration we do not fail the whole "card" but rather proceed
-	 * only with the ports we manage to register successfully.  However we
-	 * must register at least one net device.
-	 */
-	for_each_port(adapter, pidx) {
-		netdev = adapter->port[pidx];
-		if (netdev == NULL)
-			continue;
-
-		err = register_netdev(netdev);
-		if (err) {
-			dev_warn(&pdev->dev, "cannot register net device %s,"
-				 " skipping\n", netdev->name);
-			continue;
-		}
-
-		set_bit(pidx, &adapter->registered_device_map);
-	}
-	if (adapter->registered_device_map == 0) {
-		dev_err(&pdev->dev, "could not register any net devices\n");
-		goto err_free_dev;
-	}
-
-	/*
-	 * Set up our debugfs entries.
-	 */
-	if (!IS_ERR_OR_NULL(cxgb4vf_debugfs_root)) {
-		adapter->debugfs_root =
-			debugfs_create_dir(pci_name(pdev),
-					   cxgb4vf_debugfs_root);
-		if (IS_ERR_OR_NULL(adapter->debugfs_root))
-			dev_warn(&pdev->dev, "could not create debugfs"
-				 " directory");
-		else
-			setup_debugfs(adapter);
-	}
-
-	/*
-	 * See what interrupts we'll be using.  If we've been configured to
-	 * use MSI-X interrupts, try to enable them but fall back to using
-	 * MSI interrupts if we can't enable MSI-X interrupts.  If we can't
-	 * get MSI interrupts we bail with the error.
-	 */
-	if (msi == MSI_MSIX && enable_msix(adapter) == 0)
-		adapter->flags |= USING_MSIX;
-	else {
-		err = pci_enable_msi(pdev);
-		if (err) {
-			dev_err(&pdev->dev, "Unable to allocate %s interrupts;"
-				" err=%d\n",
-				msi == MSI_MSIX ? "MSI-X or MSI" : "MSI", err);
-			goto err_free_debugfs;
-		}
-		adapter->flags |= USING_MSI;
-	}
-
-	/*
-	 * Now that we know how many "ports" we have and what their types are,
-	 * and how many Queue Sets we can support, we can configure our queue
-	 * resources.
-	 */
-	cfg_queues(adapter);
-
-	/*
-	 * Print a short notice on the existence and configuration of the new
-	 * VF network device ...
-	 */
-	for_each_port(adapter, pidx) {
-		dev_info(adapter->pdev_dev, "%s: Chelsio VF NIC PCIe %s\n",
-			 adapter->port[pidx]->name,
-			 (adapter->flags & USING_MSIX) ? "MSI-X" :
-			 (adapter->flags & USING_MSI)  ? "MSI" : "");
-	}
-
-	/*
-	 * Return success!
-	 */
-	return 0;
-
-	/*
-	 * Error recovery and exit code.  Unwind state that's been created
-	 * so far and return the error.
-	 */
-
-err_free_debugfs:
-	if (!IS_ERR_OR_NULL(adapter->debugfs_root)) {
-		cleanup_debugfs(adapter);
-		debugfs_remove_recursive(adapter->debugfs_root);
-	}
-
-err_free_dev:
-	for_each_port(adapter, pidx) {
-		netdev = adapter->port[pidx];
-		if (netdev == NULL)
-			continue;
-		pi = netdev_priv(netdev);
-		t4vf_free_vi(adapter, pi->viid);
-		if (test_bit(pidx, &adapter->registered_device_map))
-			unregister_netdev(netdev);
-		free_netdev(netdev);
-	}
-
-err_unmap_bar:
-	if (!is_t4(adapter->params.chip))
-		iounmap(adapter->bar2);
-
-err_unmap_bar0:
-	iounmap(adapter->regs);
-
-err_free_adapter:
-	kfree(adapter);
-
-err_release_regions:
-	pci_release_regions(pdev);
-	pci_clear_master(pdev);
-
-err_disable_device:
-	pci_disable_device(pdev);
-
-	return err;
-}
-
-/*
- * "Remove" a device: tear down all kernel and driver state created in the
- * "probe" routine and quiesce the device (disable interrupts, etc.).  (Note
- * that this is called "remove_one" in the PF Driver.)
- */
-static void cxgb4vf_pci_remove(struct pci_dev *pdev)
-{
-	struct adapter *adapter = pci_get_drvdata(pdev);
-
-	/*
-	 * Tear down driver state associated with device.
-	 */
-	if (adapter) {
-		int pidx;
-
-		/*
-		 * Stop all of our activity.  Unregister network port,
-		 * disable interrupts, etc.
-		 */
-		for_each_port(adapter, pidx)
-			if (test_bit(pidx, &adapter->registered_device_map))
-				unregister_netdev(adapter->port[pidx]);
-		t4vf_sge_stop(adapter);
-		if (adapter->flags & USING_MSIX) {
-			pci_disable_msix(adapter->pdev);
-			adapter->flags &= ~USING_MSIX;
-		} else if (adapter->flags & USING_MSI) {
-			pci_disable_msi(adapter->pdev);
-			adapter->flags &= ~USING_MSI;
-		}
-
-		/*
-		 * Tear down our debugfs entries.
-		 */
-		if (!IS_ERR_OR_NULL(adapter->debugfs_root)) {
-			cleanup_debugfs(adapter);
-			debugfs_remove_recursive(adapter->debugfs_root);
-		}
-
-		/*
-		 * Free all of the various resources which we've acquired ...
-		 */
-		t4vf_free_sge_resources(adapter);
-		for_each_port(adapter, pidx) {
-			struct net_device *netdev = adapter->port[pidx];
-			struct port_info *pi;
-
-			if (netdev == NULL)
-				continue;
-
-			pi = netdev_priv(netdev);
-			t4vf_free_vi(adapter, pi->viid);
-			free_netdev(netdev);
-		}
-		iounmap(adapter->regs);
-		if (!is_t4(adapter->params.chip))
-			iounmap(adapter->bar2);
-		kfree(adapter);
-	}
-
-	/*
-	 * Disable the device and release its PCI resources.
-	 */
-	pci_disable_device(pdev);
-	pci_clear_master(pdev);
-	pci_release_regions(pdev);
-}
-
-/*
- * "Shutdown" quiesce the device, stopping Ingress Packet and Interrupt
- * delivery.
- */
-static void cxgb4vf_pci_shutdown(struct pci_dev *pdev)
-{
-	struct adapter *adapter;
-	int pidx;
-
-	adapter = pci_get_drvdata(pdev);
-	if (!adapter)
-		return;
-
-	/* Disable all Virtual Interfaces.  This will shut down the
-	 * delivery of all ingress packets into the chip for these
-	 * Virtual Interfaces.
-	 */
-	for_each_port(adapter, pidx)
-		if (test_bit(pidx, &adapter->registered_device_map))
-			unregister_netdev(adapter->port[pidx]);
-
-	/* Free up all Queues which will prevent further DMA and
-	 * Interrupts allowing various internal pathways to drain.
-	 */
-	t4vf_sge_stop(adapter);
-	if (adapter->flags & USING_MSIX) {
-		pci_disable_msix(adapter->pdev);
-		adapter->flags &= ~USING_MSIX;
-	} else if (adapter->flags & USING_MSI) {
-		pci_disable_msi(adapter->pdev);
-		adapter->flags &= ~USING_MSI;
-	}
-
-	/*
-	 * Free up all Queues which will prevent further DMA and
-	 * Interrupts allowing various internal pathways to drain.
-	 */
-	t4vf_free_sge_resources(adapter);
-	pci_set_drvdata(pdev, NULL);
-}
-
-/* Macros needed to support the PCI Device ID Table ...
- */
-#define CH_PCI_DEVICE_ID_TABLE_DEFINE_BEGIN \
-	static const struct pci_device_id cxgb4vf_pci_tbl[] = {
-#define CH_PCI_DEVICE_ID_FUNCTION	0x8
-
-#define CH_PCI_ID_TABLE_ENTRY(devid) \
-		{ PCI_VDEVICE(CHELSIO, (devid)), 0 }
-
-#define CH_PCI_DEVICE_ID_TABLE_DEFINE_END { 0, } }
-
-#include "../cxgb4/t4_pci_id_tbl.h"
-
-MODULE_DESCRIPTION(DRV_DESC);
-MODULE_AUTHOR("Chelsio Communications");
-MODULE_LICENSE("Dual BSD/GPL");
-MODULE_VERSION(DRV_VERSION);
-MODULE_DEVICE_TABLE(pci, cxgb4vf_pci_tbl);
-
-static struct pci_driver cxgb4vf_driver = {
-	.name		= KBUILD_MODNAME,
-	.id_table	= cxgb4vf_pci_tbl,
-	.probe		= cxgb4vf_pci_probe,
-	.remove		= cxgb4vf_pci_remove,
-	.shutdown	= cxgb4vf_pci_shutdown,
-};
-
-/*
- * Initialize global driver state.
- */
-static int __init cxgb4vf_module_init(void)
-{
-	int ret;
-
-	/*
-	 * Vet our module parameters.
-	 */
-	if (msi != MSI_MSIX && msi != MSI_MSI) {
-		pr_warn("bad module parameter msi=%d; must be %d (MSI-X or MSI) or %d (MSI)\n",
-			msi, MSI_MSIX, MSI_MSI);
-		return -EINVAL;
-	}
-
-	/* Debugfs support is optional, just warn if this fails */
-	cxgb4vf_debugfs_root = debugfs_create_dir(KBUILD_MODNAME, NULL);
-	if (IS_ERR_OR_NULL(cxgb4vf_debugfs_root))
-		pr_warn("could not create debugfs entry, continuing\n");
-
-	ret = pci_register_driver(&cxgb4vf_driver);
-	if (ret < 0 && !IS_ERR_OR_NULL(cxgb4vf_debugfs_root))
-		debugfs_remove(cxgb4vf_debugfs_root);
+ out:
 	return ret;
 }
 
-/*
- * Tear down global driver state.
+late_initcall(s3c_cpufreq_initcall);
+
+/**
+ * s3c_plltab_register - register CPU PLL table.
+ * @plls: The list of PLL entries.
+ * @plls_no: The size of the PLL entries @plls.
+ *
+ * Register the given set of PLLs with the system.
  */
-static void __exit cxgb4vf_module_exit(void)
+int s3c_plltab_register(struct cpufreq_frequency_table *plls,
+			       unsigned int plls_no)
 {
-	pci_unregister_driver(&cxgb4vf_driver);
-	debugfs_remove(cxgb4vf_debugfs_root);
+	struct cpufreq_frequency_table *vals;
+	unsigned int size;
+
+	size = sizeof(*vals) * (plls_no + 1);
+
+	vals = kzalloc(size, GFP_KERNEL);
+	if (vals) {
+		memcpy(vals, plls, size);
+		pll_reg = vals;
+
+		/* write a terminating entry, we don't store it in the
+		 * table that is stored in the kernel */
+		vals += plls_no;
+		vals->frequency = CPUFREQ_TABLE_END;
+
+		printk(KERN_INFO "cpufreq: %d PLL entries\n", plls_no);
+	} else
+		printk(KERN_ERR "cpufreq: no memory for PLL tables\n");
+
+	return vals ? 0 : -ENOMEM;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * Copyright 2009 Wolfson Microelectronics plc
+ *
+ * S3C64xx CPUfreq Support
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ */
+
+#define pr_fmt(fmt) "cpufreq: " fmt
+
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/init.h>
+#include <linux/cpufreq.h>
+#include <linux/clk.h>
+#include <linux/err.h>
+#include <linux/regulator/consumer.h>
+#include <linux/module.h>
+
+static struct regulator *vddarm;
+static unsigned long regulator_latency;
+
+#ifdef CONFIG_CPU_S3C6410
+struct s3c64xx_dvfs {
+	unsigned int vddarm_min;
+	unsigned int vddarm_max;
+};
+
+static struct s3c64xx_dvfs s3c64xx_dvfs_table[] = {
+	[0] = { 1000000, 1150000 },
+	[1] = { 1050000, 1150000 },
+	[2] = { 1100000, 1150000 },
+	[3] = { 1200000, 1350000 },
+	[4] = { 1300000, 1350000 },
+};
+
+static struct cpufreq_frequency_table s3c64xx_freq_table[] = {
+	{ 0, 0,  66000 },
+	{ 0, 0, 100000 },
+	{ 0, 0, 133000 },
+	{ 0, 1, 200000 },
+	{ 0, 1, 222000 },
+	{ 0, 1, 266000 },
+	{ 0, 2, 333000 },
+	{ 0, 2, 400000 },
+	{ 0, 2, 532000 },
+	{ 0, 2, 533000 },
+	{ 0, 3, 667000 },
+	{ 0, 4, 800000 },
+	{ 0, 0, CPUFREQ_TABLE_END },
+};
+#endif
+
+static int s3c64xx_cpufreq_set_target(struct cpufreq_policy *policy,
+				      unsigned int index)
+{
+	struct s3c64xx_dvfs *dvfs;
+	unsigned int old_freq, new_freq;
+	int ret;
+
+	old_freq = clk_get_rate(policy->clk) / 1000;
+	new_freq = s3c64xx_freq_table[index].frequency;
+	dvfs = &s3c64xx_dvfs_table[s3c64xx_freq_table[index].driver_data];
+
+#ifdef CONFIG_REGULATOR
+	if (vddarm && new_freq > old_freq) {
+		ret = regulator_set_voltage(vddarm,
+					    dvfs->vddarm_min,
+					    dvfs->vddarm_max);
+		if (ret != 0) {
+			pr_err("Failed to set VDDARM for %dkHz: %d\n",
+			       new_freq, ret);
+			return ret;
+		}
+	}
+#endif
+
+	ret = clk_set_rate(policy->clk, new_freq * 1000);
+	if (ret < 0) {
+		pr_err("Failed to set rate %dkHz: %d\n",
+		       new_freq, ret);
+		return ret;
+	}
+
+#ifdef CONFIG_REGULATOR
+	if (vddarm && new_freq < old_freq) {
+		ret = regulator_set_voltage(vddarm,
+					    dvfs->vddarm_min,
+					    dvfs->vddarm_max);
+		if (ret != 0) {
+			pr_err("Failed to set VDDARM for %dkHz: %d\n",
+			       new_freq, ret);
+			if (clk_set_rate(policy->clk, old_freq * 1000) < 0)
+				pr_err("Failed to restore original clock rate\n");
+
+			return ret;
+		}
+	}
+#endif
+
+	pr_debug("Set actual frequency %lukHz\n",
+		 clk_get_rate(policy->clk) / 1000);
+
+	return 0;
 }
 
-module_init(cxgb4vf_module_init);
-module_exit(cxgb4vf_module_exit);
+#ifdef CONFIG_REGULATOR
+static void __init s3c64xx_cpufreq_config_regulator(void)
+{
+	int count, v, i, found;
+	struct cpufreq_frequency_table *freq;
+	struct s3c64xx_dvfs *dvfs;
+
+	count = regulator_count_voltages(vddarm);
+	if (count < 0) {
+		pr_err("Unable to check supported voltages\n");
+	}
+
+	if (!count)
+		goto out;
+
+	cpufreq_for_each_valid_entry(freq, s3c64xx_freq_table) {
+		dvfs = &s3c64xx_dvfs_table[freq->driver_data];
+		found = 0;
+
+		for (i = 0; i < count; i++) {
+			v = regulator_list_voltage(vddarm, i);
+			if (v >= dvfs->vddarm_min && v <= dvfs->vddarm_max)
+				found = 1;
+		}
+
+		if (!found) {
+			pr_debug("%dkHz unsupported by regulator\n",
+				 freq->frequency);
+			freq->frequency = CPUFREQ_ENTRY_INVALID;
+		}
+	}
+
+out:
+	/* Guess based on having to do an I2C/SPI write; in future we
+	 * will be able to query the regulator performance here. */
+	regulator_latency = 1 * 1000 * 1000;
+}
+#endif
+
+static int s3c64xx_cpufreq_driver_init(struct cpufreq_policy *policy)
+{
+	int ret;
+	struct cpufreq_frequency_table *freq;
+
+	if (policy->cpu != 0)
+		return -EINVAL;
+
+	if (s3c64xx_freq_table == NULL) {
+		pr_err("No frequency information for this CPU\n");
+		return -ENODEV;
+	}
+
+	policy->clk = clk_get(NULL, "armclk");
+	if (IS_ERR(policy->clk)) {
+		pr_err("Unable to obtain ARMCLK: %ld\n",
+		       PTR_ERR(policy->clk));
+		return PTR_ERR(policy->clk);
+	}
+
+#ifdef CONFIG_REGULATOR
+	vddarm = regulator_get(NULL, "vddarm");
+	if (IS_ERR(vddarm)) {
+		ret = PTR_ERR(vddarm);
+		pr_err("Failed to obtain VDDARM: %d\n", ret);
+		pr_err("Only frequency scaling available\n");
+		vddarm = NULL;
+	} else {
+		s3c64xx_cpufreq_config_regulator();
+	}
+#endif
+
+	cpufreq_for_each_entry(freq, s3c64xx_freq_table) {
+		unsigned long r;
+
+		/* Check for frequencies we can generate */
+		r = clk_round_rate(policy->clk, freq->frequency * 1000);
+		r /= 1000;
+		if (r != freq->frequency) {
+			pr_debug("%dkHz unsupported by clock\n",
+				 freq->frequency);
+			freq->frequency = CPUFREQ_ENTRY_INVALID;
+		}
+
+		/* If we have no regulator then assume startup
+		 * frequency is the maximum we can support. */
+		if (!vddarm && freq->frequency > clk_get_rate(policy->clk) / 1000)
+			freq->frequency = CPUFREQ_ENTRY_INVALID;
+	}
+
+	/* Datasheet says PLL stabalisation time (if we were to use
+	 * the PLLs, which we don't currently) is ~300us worst case,
+	 * but add some fudge.
+	 */
+	ret = cpufreq_generic_init(policy, s3c64xx_freq_table,
+			(500 * 1000) + regulator_latency);
+	if (ret != 0) {
+		pr_err("Failed to configure frequency table: %d\n",
+		       ret);
+		regulator_put(vddarm);
+		clk_put(policy->clk);
+	}
+
+	return ret;
+}
+
+static struct cpufreq_driver s3c64xx_cpufreq_driver = {
+	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK,
+	.verify		= cpufreq_generic_frequency_table_verify,
+	.target_index	= s3c64xx_cpufreq_set_target,
+	.get		= cpufreq_generic_get,
+	.init		= s3c64xx_cpufreq_driver_init,
+	.name		= "s3c",
+};
+
+static int __init s3c64xx_cpufreq_init(void)
+{
+	return cpufreq_register_driver(&s3c64xx_cpufreq_driver);
+}
+module_init(s3c64xx_cpufreq_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             

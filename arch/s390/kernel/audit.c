@@ -1,78 +1,60 @@
-#include <linux/init.h>
+/*
+ * (c) Copyright 2003, 2006 Hewlett-Packard Development Company, L.P.
+ *	Alex Williamson <alex.williamson@hp.com>
+ *	Bjorn Helgaas <bjorn.helgaas@hp.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ */
+
+#include <linux/module.h>
 #include <linux/types.h>
-#include <linux/audit.h>
-#include <asm/unistd.h>
-#include "audit.h"
+#include <linux/slab.h>
+#include <linux/acpi.h>
 
-static unsigned dir_class[] = {
-#include <asm-generic/audit_dir_write.h>
-~0U
+#include <asm/acpi-ext.h>
+
+/*
+ * Device CSRs that do not appear in PCI config space should be described
+ * via ACPI.  This would normally be done with Address Space Descriptors
+ * marked as "consumer-only," but old versions of Windows and Linux ignore
+ * the producer/consumer flag, so HP invented a vendor-defined resource to
+ * describe the location and size of CSR space.
+ */
+
+struct acpi_vendor_uuid hp_ccsr_uuid = {
+	.subtype = 2,
+	.data = { 0xf9, 0xad, 0xe9, 0x69, 0x4f, 0x92, 0x5f, 0xab, 0xf6, 0x4a,
+	    0x24, 0xd2, 0x01, 0x37, 0x0e, 0xad },
 };
 
-static unsigned read_class[] = {
-#include <asm-generic/audit_read.h>
-~0U
-};
-
-static unsigned write_class[] = {
-#include <asm-generic/audit_write.h>
-~0U
-};
-
-static unsigned chattr_class[] = {
-#include <asm-generic/audit_change_attr.h>
-~0U
-};
-
-static unsigned signal_class[] = {
-#include <asm-generic/audit_signal.h>
-~0U
-};
-
-int audit_classify_arch(int arch)
+static acpi_status hp_ccsr_locate(acpi_handle obj, u64 *base, u64 *length)
 {
-#ifdef CONFIG_COMPAT
-	if (arch == AUDIT_ARCH_S390)
-		return 1;
-#endif
-	return 0;
-}
+	acpi_status status;
+	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+	struct acpi_resource *resource;
+	struct acpi_resource_vendor_typed *vendor;
 
-int audit_classify_syscall(int abi, unsigned syscall)
-{
-#ifdef CONFIG_COMPAT
-	if (abi == AUDIT_ARCH_S390)
-		return s390_classify_syscall(syscall);
-#endif
-	switch(syscall) {
-	case __NR_open:
-		return 2;
-	case __NR_openat:
-		return 3;
-	case __NR_socketcall:
-		return 4;
-	case __NR_execve:
-		return 5;
-	default:
-		return 0;
+	status = acpi_get_vendor_resource(obj, METHOD_NAME__CRS, &hp_ccsr_uuid,
+		&buffer);
+
+	resource = buffer.pointer;
+	vendor = &resource->data.vendor_typed;
+
+	if (ACPI_FAILURE(status) || vendor->byte_length < 16) {
+		status = AE_NOT_FOUND;
+		goto exit;
 	}
+
+	memcpy(base, vendor->byte_data, sizeof(*base));
+	memcpy(length, vendor->byte_data + 8, sizeof(*length));
+
+  exit:
+	kfree(buffer.pointer);
+	return status;
 }
 
-static int __init audit_classes_init(void)
-{
-#ifdef CONFIG_COMPAT
-	audit_register_class(AUDIT_CLASS_WRITE_32, s390_write_class);
-	audit_register_class(AUDIT_CLASS_READ_32, s390_read_class);
-	audit_register_class(AUDIT_CLASS_DIR_WRITE_32, s390_dir_class);
-	audit_register_class(AUDIT_CLASS_CHATTR_32, s390_chattr_class);
-	audit_register_class(AUDIT_CLASS_SIGNAL_32, s390_signal_class);
-#endif
-	audit_register_class(AUDIT_CLASS_WRITE, write_class);
-	audit_register_class(AUDIT_CLASS_READ, read_class);
-	audit_register_class(AUDIT_CLASS_DIR_WRITE, dir_class);
-	audit_register_class(AUDIT_CLASS_CHATTR, chattr_class);
-	audit_register_class(AUDIT_CLASS_SIGNAL, signal_class);
-	return 0;
-}
-
-__initcall(audit_classes_init);
+struct csr_space {
+	u64	base;
+	

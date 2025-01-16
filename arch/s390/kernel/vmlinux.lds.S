@@ -1,139 +1,120 @@
-/* ld script to make s390 Linux kernel
- * Written by Martin Schwidefsky (schwidefsky@de.ibm.com)
+#ifndef _ASM_IA64_CMPXCHG_H
+#define _ASM_IA64_CMPXCHG_H
+
+/*
+ * Compare/Exchange, forked from asm/intrinsics.h
+ * which was:
+ *
+ *	Copyright (C) 2002-2003 Hewlett-Packard Co
+ *	David Mosberger-Tang <davidm@hpl.hp.com>
  */
 
-#include <asm/thread_info.h>
-#include <asm/page.h>
-#include <asm-generic/vmlinux.lds.h>
+#ifndef __ASSEMBLY__
 
-OUTPUT_FORMAT("elf64-s390", "elf64-s390", "elf64-s390")
-OUTPUT_ARCH(s390:64-bit)
-ENTRY(startup)
-jiffies = jiffies_64;
-
-PHDRS {
-	text PT_LOAD FLAGS(5);	/* R_E */
-	data PT_LOAD FLAGS(7);	/* RWE */
-	note PT_NOTE FLAGS(0);	/* ___ */
-}
-
-SECTIONS
-{
-	. = 0x00000000;
-	.text : {
-		/* Text and read-only data */
-		HEAD_TEXT
-		/*
-		 * E.g. perf doesn't like symbols starting at address zero,
-		 * therefore skip the initial PSW and channel program located
-		 * at address zero and let _text start at 0x200.
-		 */
-	_text = 0x200;
-		TEXT_TEXT
-		SCHED_TEXT
-		CPUIDLE_TEXT
-		LOCK_TEXT
-		KPROBES_TEXT
-		IRQENTRY_TEXT
-		SOFTIRQENTRY_TEXT
-		*(.fixup)
-		*(.gnu.warning)
-	} :text = 0x0700
-
-	_etext = .;		/* End of text section */
-
-	NOTES :text :note
-
-	.dummy : { *(.dummy) } :data
-
-	RO_DATA_SECTION(PAGE_SIZE)
-
-#ifdef CONFIG_SHARED_KERNEL
-	. = ALIGN(0x100000);	/* VM shared segments are 1MB aligned */
+#include <linux/types.h>
+/* include compiler specific intrinsics */
+#include <asm/ia64regs.h>
+#ifdef __INTEL_COMPILER
+# include <asm/intel_intrin.h>
+#else
+# include <asm/gcc_intrin.h>
 #endif
 
-	. = ALIGN(PAGE_SIZE);
-	_eshared = .;		/* End of shareable data */
-	_sdata = .;		/* Start of data section */
+/*
+ * This function doesn't exist, so you'll get a linker error if
+ * something tries to do an invalid xchg().
+ */
+extern void ia64_xchg_called_with_bad_pointer(void);
 
-	EXCEPTION_TABLE(16) :data
+#define __xchg(x, ptr, size)						\
+({									\
+	unsigned long __xchg_result;					\
+									\
+	switch (size) {							\
+	case 1:								\
+		__xchg_result = ia64_xchg1((__u8 *)ptr, x);		\
+		break;							\
+									\
+	case 2:								\
+		__xchg_result = ia64_xchg2((__u16 *)ptr, x);		\
+		break;							\
+									\
+	case 4:								\
+		__xchg_result = ia64_xchg4((__u32 *)ptr, x);		\
+		break;							\
+									\
+	case 8:								\
+		__xchg_result = ia64_xchg8((__u64 *)ptr, x);		\
+		break;							\
+	default:							\
+		ia64_xchg_called_with_bad_pointer();			\
+	}								\
+	__xchg_result;							\
+})
 
-	RW_DATA_SECTION(0x100, PAGE_SIZE, THREAD_SIZE)
+#define xchg(ptr, x)							\
+((__typeof__(*(ptr))) __xchg((unsigned long) (x), (ptr), sizeof(*(ptr))))
 
-	_edata = .;		/* End of data section */
+/*
+ * Atomic compare and exchange.  Compare OLD with MEM, if identical,
+ * store NEW in MEM.  Return the initial value in MEM.  Success is
+ * indicated by comparing RETURN with OLD.
+ */
 
-	/* will be freed after init */
-	. = ALIGN(PAGE_SIZE);	/* Init code and data */
-	__init_begin = .;
+/*
+ * This function doesn't exist, so you'll get a linker error
+ * if something tries to do an invalid cmpxchg().
+ */
+extern long ia64_cmpxchg_called_with_bad_pointer(void);
 
-	INIT_TEXT_SECTION(PAGE_SIZE)
+#define ia64_cmpxchg(sem, ptr, old, new, size)				\
+({									\
+	__u64 _o_, _r_;							\
+									\
+	switch (size) {							\
+	case 1:								\
+		_o_ = (__u8) (long) (old);				\
+		break;							\
+	case 2:								\
+		_o_ = (__u16) (long) (old);				\
+		break;							\
+	case 4:								\
+		_o_ = (__u32) (long) (old);				\
+		break;							\
+	case 8:								\
+		_o_ = (__u64) (long) (old);				\
+		break;							\
+	default:							\
+		break;							\
+	}								\
+	switch (size) {							\
+	case 1:								\
+		_r_ = ia64_cmpxchg1_##sem((__u8 *) ptr, new, _o_);	\
+		break;							\
+									\
+	case 2:								\
+		_r_ = ia64_cmpxchg2_##sem((__u16 *) ptr, new, _o_);	\
+		break;							\
+									\
+	case 4:								\
+		_r_ = ia64_cmpxchg4_##sem((__u32 *) ptr, new, _o_);	\
+		break;							\
+									\
+	case 8:								\
+		_r_ = ia64_cmpxchg8_##sem((__u64 *) ptr, new, _o_);	\
+		break;							\
+									\
+	default:							\
+		_r_ = ia64_cmpxchg_called_with_bad_pointer();		\
+		break;							\
+	}								\
+	(__typeof__(old)) _r_;						\
+})
 
-	/*
-	 * .exit.text is discarded at runtime, not link time,
-	 * to deal with references from __bug_table
-	*/
-	.exit.text : {
-		EXIT_TEXT
-	}
+#define cmpxchg_acq(ptr, o, n)	\
+	ia64_cmpxchg(acq, (ptr), (o), (n), sizeof(*(ptr)))
+#define cmpxchg_rel(ptr, o, n)	\
+	ia64_cmpxchg(rel, (ptr), (o), (n), sizeof(*(ptr)))
 
-	.exit.data : {
-		EXIT_DATA
-	}
-
-	/*
-	 * struct alt_inst entries. From the header (alternative.h):
-	 * "Alternative instructions for different CPU types or capabilities"
-	 * Think locking instructions on spinlocks.
-	 * Note, that it is a part of __init region.
-	 */
-	. = ALIGN(8);
-	.altinstructions : {
-		__alt_instructions = .;
-		*(.altinstructions)
-		__alt_instructions_end = .;
-	}
-
-	/*
-	 * And here are the replacement instructions. The linker sticks
-	 * them as binary blobs. The .altinstructions has enough data to
-	 * get the address and the length of them to patch the kernel safely.
-	 * Note, that it is a part of __init region.
-	 */
-	.altinstr_replacement : {
-		*(.altinstr_replacement)
-	}
-
-	/*
-	 * Table with the patch locations to undo expolines
-	*/
-	. = ALIGN(4);
-	.nospec_call_table : {
-		__nospec_call_start = . ;
-		*(.s390_indirect*)
-		__nospec_call_end = . ;
-	}
-	.nospec_return_table : {
-		__nospec_return_start = . ;
-		*(.s390_return*)
-		__nospec_return_end = . ;
-	}
-
-	/* early.c uses stsi, which requires page aligned data. */
-	. = ALIGN(PAGE_SIZE);
-	INIT_DATA_SECTION(0x100)
-
-	PERCPU_SECTION(0x100)
-	. = ALIGN(PAGE_SIZE);
-	__init_end = .;		/* freed after init ends here */
-
-	BSS_SECTION(0, 2, 0)
-
-	_end = . ;
-
-	/* Debugging sections.	*/
-	STABS_DEBUG
-	DWARF_DEBUG
-
-	/* Sections to be discarded */
-	DISCARDS
-}
+/*
+ * Worse still - early processor implementations ac

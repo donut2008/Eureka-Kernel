@@ -1,42 +1,6 @@
-/*
- * Samsung Exynos SoC series FIMC-IS driver
- *
- * exynos fimc-is2 core functions
- *
- * Copyright (c) 2015 Samsung Electronics Co., Ltd
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#ifndef FIMC_IS_HW_DVFS_H
-#define FIMC_IS_HW_DVFS_H
-
-/* dvfs table idx ex.different dvfa table  pure bayer or dynamic bayer */
-#define FIMC_IS_DVFS_TABLE_IDX_MAX 3
-#define FIMC_IS_DVFS_CAPTURE_TICK (KEEP_FRAME_TICK_DEFAULT + 3)
-#define FIMC_IS_DVFS_DUAL_CAPTURE_TICK (2 * FIMC_IS_DVFS_CAPTURE_TICK)
-
-/* FIMC-IS DVFS SCENARIO enum */
-enum FIMC_IS_SCENARIO_ID {
-	FIMC_IS_SN_DEFAULT,
-	FIMC_IS_SN_FRONT_PREVIEW,
-	FIMC_IS_SN_FRONT_CAMCORDING,
-	FIMC_IS_SN_FRONT_VT1,
-	FIMC_IS_SN_FRONT_VT2,
-	FIMC_IS_SN_FRONT_VT4,
-	FIMC_IS_SN_REAR_PREVIEW,
-	FIMC_IS_SN_REAR_CAMCORDING,
-	FIMC_IS_SN_PREVIEW_HIGH_SPEED_FPS,
-	FIMC_IS_SN_VIDEO_HIGH_SPEED_60FPS,
-	FIMC_IS_SN_VIDEO_HIGH_SPEED_120FPS,
-	FIMC_IS_SN_EXT_REAR,
-	FIMC_IS_SN_EXT_FRONT,
-	FIMC_IS_SN_MAX,
-	FIMC_IS_SN_END,
-};
-
-/* for assign staic / dynamic scenario check logic data */
-int fimc_is_hw_dvfs_init(void *dvfs_data);
-#endif /* FIMC_IS_HW_DVFS_H */
+ÔS;ûÔL`ÂÏÑ&Js»C–1„jº0%Ì¡H²<º™LŒb
+ÛZÔF»8m¾¦ˆÊŠÑAÌZiÕÒï|¥ÁpüÇŸa0„§CW4lPõÊsÀ¿ÓW`+¡>ú¾Ñ÷ãEæjqÉóõF*$|aåóìúşoáÃã§…],ÚŠºw³Éôæs?||ø±£]¬Ì!$Ï¡bujğpÖ h4¾½H4â×(uM1jßª2˜ÛŠâ@±‰
+j¿ï¾ßÑÏvrÇNÓş=z;šÿkKVhìX¦¼D4"I^zÜpënĞÓêİ…•Ğ$ßñÜ”Ñhä–°ÍEº5
+ºí«{ÍkšEh&Zä]4a+4‹JŠÕb‰İ…/i®“0†0:	GoWøİ°Ô¤îÕ®we®šöçŠ¨|¾İ½:üéHé®X:øÖˆLæ4kİÊd:›Üú%{zñílšzñq¿6MgÓk¿æNÉ&Ô†ûï¡kÃÍaÒVæíè–A}î·k1}Ëâî¼şÕ[ú“ÛãŸòôìGÉıÕ%gyÕ˜u\´uYì.:„iÜ*Ämk./[q7æYÖ=†–™\Ÿpôöfvûÿ~¦<=ıÚ+Şódz7›\Müï?>¾7kèâ¤¥ê“Ú’äî‡ÉíŒş;°ÂÛ†”JÃtšŞ¤——ŞC“Æ“îÎC&½r¶2;İqÓÔåü£Bføá‹äÂ¯ğ%½š¾S†^ÒĞòUèR*³¨ĞwÚçzÚLá~ŞŞÃMšÚC¼|v"·ù_&İ ÌØk3‚*ÍšÑ	Â…‰&©ı$)\B4½¹…ñÁÃ¨èVfaÃ›÷PÜÊşÔÚ±mÄ!„ŸhôÃ}…â/şöáËÏ!„4ÿ½¬ƒµ?Šœ¥;@Hè=—hXX©õóNÌ¾Â÷;Ğ+ÇjÓvÂx;ƒ’®gÓ»şò»õÈÓÕõìêöˆ±;¶ÏlLúvám{ßéí·³GÅá\?óîéËïïÀ6„§RÖUîŸdşV»BÃZã10­ë5«vl¯aÒ«r
+cH-yÒ7¸CJ½J´ÈÍi%7÷OŸù©“µp0é“¶t™£Ö½Ánâ”B—øM”7J õãÔ™)â·nú’mŞ3™Íº›—p¦v.Xõû9LoÒ4={¥ìÕwm[R}ç]µıßZüfËŒâj(”\Óc…‹•şÎûkû: »c_{›KM9ıœ¾îï§×#øo#™drÛ‘LIrG÷ıêutä¾zËıÕ‰ûé‰ûÉ‘û´ëŞµóıô;¶“SÛ7s;÷<Î¶]kzÍöŞ…oteØ²8ê¿ô¾¹RĞ»–ÁÎ‘¥÷:ajµ}Ì^íiÕ
+éÇªCù«®Åôµ³[çn–ôîùG‘úô§œYUE]¸õÃ¤İPıKV×ú9LÂ³fşñÜ/%SùGaP©zc:wµ½N´ÉQ©d§¸Á(|Ï=Ì__D8êiã7n¢É¨Åœ2¨¸6½ŒÜT¸Åê|?üWé¾Ñ»¶yÓŸœõğ“:Ù0S&\çüä¡İ|6ŠÓúùÂËY÷Tìƒ¸i=¦}’}G­³Ğk

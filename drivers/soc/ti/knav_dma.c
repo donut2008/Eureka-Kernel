@@ -1,823 +1,204 @@
-/*
- * Copyright (C) 2014 Texas Instruments Incorporated
- * Authors:	Santosh Shilimkar <santosh.shilimkar@ti.com>
- *		Sandeep Nair <sandeep_n@ti.com>
- *		Cyril Chemparathy <cyril@ti.com>
+                                  0xc030014c
+#define ixTHM_TMON0_RDIR4_DATA                                                  0xc0300150
+#define ixTHM_TMON0_RDIR5_DATA                                                  0xc0300154
+#define ixTHM_TMON0_RDIR6_DATA                                                  0xc0300158
+#define ixTHM_TMON0_RDIR7_DATA                                                  0xc030015c
+#define ixTHM_TMON0_RDIR8_DATA                                                  0xc0300160
+#define ixTHM_TMON0_RDIR9_DATA                                                  0xc0300164
+#define ixTHM_TMON0_RDIR10_DATA                                                 0xc0300168
+#define ixTHM_TMON0_RDIR11_DATA                                                 0xc030016c
+#define ixTHM_TMON0_RDIR12_DATA                                                 0xc0300170
+#define ixTHM_TMON0_RDIR13_DATA                                                 0xc0300174
+#define ixTHM_TMON0_RDIR14_DATA                                                 0xc0300178
+#define ixTHM_TMON0_RDIR15_DATA                                                 0xc030017c
+#define ixTHM_TMON1_RDIL0_DATA                                                  0xc0300180
+#define ixTHM_TMON1_RDIL1_DATA                                                  0xc0300184
+#define ixTHM_TMON1_RDIL2_DATA                                                  0xc0300188
+#define ixTHM_TMON1_RDIL3_DATA                                                  0xc030018c
+#define ixTHM_TMON1_RDIL4_DATA                                                  0xc0300190
+#define ixTHM_TMON1_RDIL5_DATA                                                  0xc0300194
+#define ixTHM_TMON1_RDIL6_DATA                                                  0xc0300198
+#define ixTHM_TMON1_RDIL7_DATA                                                  0xc030019c
+#define ixTHM_TMON1_RDIL8_DATA                                                  0xc03001a0
+#define ixTHM_TMON1_RDIL9_DATA                                                  0xc03001a4
+#define ixTHM_TMON1_RDIL10_DATA                                                 0xc03001a8
+#define ixTHM_TMON1_RDIL11_DATA                                                 0xc03001ac
+#define ixTHM_TMON1_RDIL12_DATA                                                 0xc03001b0
+#define ixTHM_TMON1_RDIL13_DATA                                                 0xc03001b4
+#define ixTHM_TMON1_RDIL14_DATA                                                 0xc03001b8
+#define ixTHM_TMON1_RDIL15_DATA                                                 0xc03001bc
+#define ixTHM_TMON1_RDIR0_DATA                                                  0xc03001c0
+#define ixTHM_TMON1_RDIR1_DATA                                                  0xc03001c4
+#define ixTHM_TMON1_RDIR2_DATA                                                  0xc03001c8
+#define ixTHM_TMON1_RDIR3_DATA                                                  0xc03001cc
+#define ixTHM_TMON1_RDIR4_DATA                                                  0xc03001d0
+#define ixTHM_TMON1_RDIR5_DATA                                                  0xc03001d4
+#define ixTHM_TMON1_RDIR6_DATA                                                  0xc03001d8
+#define ixTHM_TMON1_RDIR7_DATA                                                  0xc03001dc
+#define ixTHM_TMON1_RDIR8_DATA                                                  0xc03001e0
+#define ixTHM_TMON1_RDIR9_DATA                                                  0xc03001e4
+#define ixTHM_TMON1_RDIR10_DATA                                                 0xc03001e8
+#define ixTHM_TMON1_RDIR11_DATA                                                 0xc03001ec
+#define ixTHM_TMON1_RDIR12_DATA                                                 0xc03001f0
+#define ixTHM_TMON1_RDIR13_DATA                                                 0xc03001f4
+#define ixTHM_TMON1_RDIR14_DATA                                                 0xc03001f8
+#define ixTHM_TMON1_RDIR15_DATA                                                 0xc03001fc
+#define ixTHM_TMON0_INT_DATA                                                    0xc0300300
+#define ixTHM_TMON1_INT_DATA                                                    0xc0300304
+#define ixTHM_TMON0_DEBUG                                                       0xc0300310
+#define ixTHM_TMON1_DEBUG                                                       0xc0300314
+#define ixTHM_TMON0_STATUS                                                      0xc0300320
+#define ixTHM_TMON1_STATUS                                                      0xc0300324
+#define ixGENERAL_PWRMGT                                                        0xc0200000
+#define ixCNB_PWRMGT_CNTL                                                       0xc0200004
+#define ixSCLK_PWRMGT_CNTL                                                      0xc0200008
+#define ixTARGET_AND_CURRENT_PROFILE_INDEX                                      0xc0200014
+#define ixPWR_PCC_CONTROL                                                       0xc0200018
+#define ixPWR_PCC_GPIO_SELECT                                                   0xc020001c
+#define ixCG_FREQ_TRAN_VOTING_0                                                 0xc02001a8
+#define ixCG_FREQ_TRAN_VOTING_1                                                 0xc02001ac
+#define ixCG_FREQ_TRAN_VOTING_2                                                 0xc02001b0
+#define ixCG_FREQ_TRAN_VOTING_3                                                 0xc02001b4
+#define ixCG_FREQ_TRAN_VOTING_4                                                 0xc02001b8
+#define ixCG_FREQ_TRAN_VOTING_5                                                 0xc02001bc
+#define ixCG_FREQ_TRAN_VOTING_6                                                 0xc02001c0
+#define ixCG_FREQ_TRAN_VOTING_7                                                 0xc02001c4
+#define ixPLL_TEST_CNTL                                                         0xc020003c
+#define ixCG_STATIC_SCREEN_PARAMETER                                            0xc0200044
+#define ixCG_DISPLAY_GAP_CNTL                                                   0xc0200060
+#define ixCG_DISPLAY_GAP_CNTL2                                                  0xc0200230
+#define ixCG_ACPI_CNTL                                                          0xc0200064
+#define ixSCLK_DEEP_SLEEP_CNTL                                                  0xc0200080
+#define ixSCLK_DEEP_SLEEP_CNTL2                                                 0xc0200084
+#define ixSCLK_DEEP_SLEEP_CNTL3                                                 0xc020009c
+#define ixSCLK_DEEP_SLEEP_MISC_CNTL                                             0xc0200088
+#define ixLCLK_DEEP_SLEEP_CNTL                                                  0xc020008c
+#define ixLCLK_DEEP_SLEEP_CNTL2                                                 0xc0200310
+#define ixTARGET_AND_CURRENT_PROFILE_INDEX_1                                    0xc02000f0
+#define ixCG_ULV_PARAMETER                                                      0xc020015c
+#define ixSCLK_MIN_DIV                                                          0xc02003ac
+#define ixPWR_CKS_ENABLE                                                        0xc020034c
+#define ixPWR_CKS_CNTL                                                          0xc0200350
+#define ixPWR_DISP_TIMER_CONTROL                                                0xc02003c0
+#define ixPWR_DISP_TIMER_DEBUG                                                  0xc02003c4
+#define ixPWR_DISP_TIMER2_CONTROL                                               0xc02003c8
+#define ixPWR_DISP_TIMER2_DEBUG                                                 0xc02003cc
+#define ixPWR_DISP_TIMER_CONTROL2                                               0xc0200378
+#define ixVDDGFX_IDLE_PARAMETER                                                 0xc020036c
+#define ixVDDGFX_IDLE_CONTROL                                                   0xc0200370
+#define ixVDDGFX_IDLE_EXIT                                                      0xc0200374
+#define ixLCAC_MC0_CNTL                                                         0xc0400130
+#define ixLCAC_MC0_OVR_SEL                                                      0xc0400134
+#define ixLCAC_MC0_OVR_VAL                                                      0xc0400138
+#define ixLCAC_MC1_CNTL                                                         0xc040013c
+#define ixLCAC_MC1_OVR_SEL                                                      0xc0400140
+#define ixLCAC_MC1_OVR_VAL                                                      0xc0400144
+#define ixLCAC_MC2_CNTL                                                         0xc0400148
+#define ixLCAC_MC2_OVR_SEL                                                      0xc040014c
+#define ixLCAC_MC2_OVR_VAL                                                      0xc0400150
+#define ixLCAC_MC3_CNTL                                                         0xc0400154
+#define ixLCAC_MC3_OVR_SEL                                                      0xc0400158
+#define ixLCAC_MC3_OVR_VAL                                                      0xc040015c
+#define ixLCAC_CPL_CNTL                                                         0xc0400160
+#define ixLCAC_CPL_OVR_SEL                                                      0xc0400164
+#define ixLCAC_CPL_OVR_VAL                                                      0xc0400168
+#define mmROM_SMC_IND_INDEX                                                     0x80
+#define mmROM0_ROM_SMC_IND_INDEX                                                0x80
+#define mmROM1_ROM_SMC_IND_INDEX                                                0x82
+#define mmROM2_ROM_SMC_IND_INDEX                                                0x84
+#define mmROM3_ROM_SMC_IND_INDEX                                                0x86
+#define mmROM_SMC_IND_DATA                                                      0x81
+#define mmROM0_ROM_SMC_IND_DATA                                                 0x81
+#define mmROM1_ROM_SMC_IND_DATA                                                 0x83
+#define mmROM2_ROM_SMC_IND_DATA                                                 0x85
+#define mmROM3_ROM_SMC_IND_DATA                                                 0x87
+#define ixROM_CNTL                                                              0xc0600000
+#define ixPAGE_MIRROR_CNTL                                                      0xc0600004
+#define ixROM_STATUS                                                            0xc0600008
+#define ixCGTT_ROM_CLK_CTRL0                                                    0xc060000c
+#define ixROM_INDEX                                                             0xc0600010
+#define ixROM_DATA                                                              0xc0600014
+#define ixROM_START                                                             0xc0600018
+#define ixROM_SW_CNTL                                                           0xc060001c
+#define ixROM_SW_STATUS                                                         0xc0600020
+#define ixROM_SW_COMMAND                                                        0xc0600024
+#define ixROM_SW_DATA_1                                                         0xc0600028
+#define ixROM_SW_DATA_2                                                         0xc060002c
+#define ixROM_SW_DATA_3                                                         0xc0600030
+#define ixROM_SW_DATA_4                                                         0xc0600034
+#define ixROM_SW_DATA_5                                                         0xc0600038
+#define ixROM_SW_DATA_6                                                         0xc060003c
+#define ixROM_SW_DATA_7                                                         0xc0600040
+#define ixROM_SW_DATA_8                                                         0xc0600044
+#define ixROM_SW_DATA_9                                                         0xc0600048
+#define ixROM_SW_DATA_10                                                        0xc060004c
+#define ixROM_SW_DATA_11                                                        0xc0600050
+#define ixROM_SW_DATA_12                                                        0xc0600054
+#define ixROM_SW_DATA_13                                                        0xc0600058
+#define ixROM_SW_DATA_14                                                        0xc060005c
+#define ixROM_SW_DATA_15                                                        0xc0600060
+#define ixROM_SW_DATA_16                                                        0xc0600064
+#define ixROM_SW_DATA_17                                                        0xc0600068
+#define ixROM_SW_DATA_18                                                        0xc060006c
+#define ixROM_SW_DATA_19                                                        0xc0600070
+#define ixROM_SW_DATA_20                                                        0xc0600074
+#define ixROM_SW_DATA_21                                                        0xc0600078
+#define ixROM_SW_DATA_22                                                        0xc060007c
+#define ixROM_SW_DATA_23                                                        0xc0600080
+#define ixROM_SW_DATA_24                                                        0xc0600084
+#define ixROM_SW_DATA_25                                                        0xc0600088
+#define ixROM_SW_DATA_26                                                        0xc060008c
+#define ixROM_SW_DATA_27                                                        0xc0600090
+#define ixROM_SW_DATA_28                                                        0xc0600094
+#define ixROM_SW_DATA_29                                                        0xc0600098
+#define ixROM_SW_DATA_30                                                        0xc060009c
+#define ixROM_SW_DATA_31                                                        0xc06000a0
+#define ixROM_SW_DATA_32                                                        0xc06000a4
+#define ixROM_SW_DATA_33                                                        0xc06000a8
+#define ixROM_SW_DATA_34                                                        0xc06000ac
+#define ixROM_SW_DATA_35                                                        0xc06000b0
+#define ixROM_SW_DATA_36                                                        0xc06000b4
+#define ixROM_SW_DATA_37                                                        0xc06000b8
+#define ixROM_SW_DATA_38                                                        0xc06000bc
+#define ixROM_SW_DATA_39                                                        0xc06000c0
+#define ixROM_SW_DATA_40                                                        0xc06000c4
+#define ixROM_SW_DATA_41                                                        0xc06000c8
+#define ixROM_SW_DATA_42                                                        0xc06000cc
+#define ixROM_SW_DATA_43                                                        0xc06000d0
+#define ixROM_SW_DATA_44                                                        0xc06000d4
+#define ixROM_SW_DATA_45                                                        0xc06000d8
+#define ixROM_SW_DATA_46                                                        0xc06000dc
+#define ixROM_SW_DATA_47                                                        0xc06000e0
+#define ixROM_SW_DATA_48                                                        0xc06000e4
+#define ixROM_SW_DATA_49                                                        0xc06000e8
+#define ixROM_SW_DATA_50                                                        0xc06000ec
+#define ixROM_SW_DATA_51                                                        0xc06000f0
+#define ixROM_SW_DATA_52                                                        0xc06000f4
+#define ixROM_SW_DATA_53                                                        0xc06000f8
+#define ixROM_SW_DATA_54                                                        0xc06000fc
+#define ixROM_SW_DATA_55                                                        0xc0600100
+#define ixROM_SW_DATA_56                                                        0xc0600104
+#define ixROM_SW_DATA_57                                                        0xc0600108
+#define ixROM_SW_DATA_58                                                        0xc060010c
+#define ixROM_SW_DATA_59                                                        0xc0600110
+#define ixROM_SW_DATA_60                                                        0xc0600114
+#define ixROM_SW_DATA_61                                                        0xc0600118
+#define ixROM_SW_DATA_62                                                        0xc060011c
+#define ixROM_SW_DATA_63                                                        0xc0600120
+#define ixROM_SW_DATA_64                                                        0xc0600124
+
+#endif /* SMU_7_1_2_D_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+ * SMU_7_1_2 Register documentation
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation version 2.
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
  *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/io.h>
-#include <linux/sched.h>
-#include <linux/module.h>
-#include <linux/dma-direction.h>
-#include <linux/interrupt.h>
-#include <linux/pm_runtime.h>
-#include <linux/of_dma.h>
-#include <linux/of_address.h>
-#include <linux/platform_device.h>
-#include <linux/soc/ti/knav_dma.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
-
-#define REG_MASK		0xffffffff
-
-#define DMA_LOOPBACK		BIT(31)
-#define DMA_ENABLE		BIT(31)
-#define DMA_TEARDOWN		BIT(30)
-
-#define DMA_TX_FILT_PSWORDS	BIT(29)
-#define DMA_TX_FILT_EINFO	BIT(30)
-#define DMA_TX_PRIO_SHIFT	0
-#define DMA_RX_PRIO_SHIFT	16
-#define DMA_PRIO_MASK		GENMASK(3, 0)
-#define DMA_PRIO_DEFAULT	0
-#define DMA_RX_TIMEOUT_DEFAULT	17500 /* cycles */
-#define DMA_RX_TIMEOUT_MASK	GENMASK(16, 0)
-#define DMA_RX_TIMEOUT_SHIFT	0
-
-#define CHAN_HAS_EPIB		BIT(30)
-#define CHAN_HAS_PSINFO		BIT(29)
-#define CHAN_ERR_RETRY		BIT(28)
-#define CHAN_PSINFO_AT_SOP	BIT(25)
-#define CHAN_SOP_OFF_SHIFT	16
-#define CHAN_SOP_OFF_MASK	GENMASK(9, 0)
-#define DESC_TYPE_SHIFT		26
-#define DESC_TYPE_MASK		GENMASK(2, 0)
-
-/*
- * QMGR & QNUM together make up 14 bits with QMGR as the 2 MSb's in the logical
- * navigator cloud mapping scheme.
- * using the 14bit physical queue numbers directly maps into this scheme.
- */
-#define CHAN_QNUM_MASK		GENMASK(14, 0)
-#define DMA_MAX_QMS		4
-#define DMA_TIMEOUT		1	/* msecs */
-#define DMA_INVALID_ID		0xffff
-
-struct reg_global {
-	u32	revision;
-	u32	perf_control;
-	u32	emulation_control;
-	u32	priority_control;
-	u32	qm_base_address[DMA_MAX_QMS];
-};
-
-struct reg_chan {
-	u32	control;
-	u32	mode;
-	u32	__rsvd[6];
-};
-
-struct reg_tx_sched {
-	u32	prio;
-};
-
-struct reg_rx_flow {
-	u32	control;
-	u32	tags;
-	u32	tag_sel;
-	u32	fdq_sel[2];
-	u32	thresh[3];
-};
-
-struct knav_dma_pool_device {
-	struct device			*dev;
-	struct list_head		list;
-};
-
-struct knav_dma_device {
-	bool				loopback, enable_all;
-	unsigned			tx_priority, rx_priority, rx_timeout;
-	unsigned			logical_queue_managers;
-	unsigned			qm_base_address[DMA_MAX_QMS];
-	struct reg_global __iomem	*reg_global;
-	struct reg_chan __iomem		*reg_tx_chan;
-	struct reg_rx_flow __iomem	*reg_rx_flow;
-	struct reg_chan __iomem		*reg_rx_chan;
-	struct reg_tx_sched __iomem	*reg_tx_sched;
-	unsigned			max_rx_chan, max_tx_chan;
-	unsigned			max_rx_flow;
-	char				name[32];
-	atomic_t			ref_count;
-	struct list_head		list;
-	struct list_head		chan_list;
-	spinlock_t			lock;
-};
-
-struct knav_dma_chan {
-	enum dma_transfer_direction	direction;
-	struct knav_dma_device		*dma;
-	atomic_t			ref_count;
-
-	/* registers */
-	struct reg_chan __iomem		*reg_chan;
-	struct reg_tx_sched __iomem	*reg_tx_sched;
-	struct reg_rx_flow __iomem	*reg_rx_flow;
-
-	/* configuration stuff */
-	unsigned			channel, flow;
-	struct knav_dma_cfg		cfg;
-	struct list_head		list;
-	spinlock_t			lock;
-};
-
-#define chan_number(ch)	((ch->direction == DMA_MEM_TO_DEV) ? \
-			ch->channel : ch->flow)
-
-static struct knav_dma_pool_device *kdev;
-
-static bool check_config(struct knav_dma_chan *chan, struct knav_dma_cfg *cfg)
-{
-	if (!memcmp(&chan->cfg, cfg, sizeof(*cfg)))
-		return true;
-	else
-		return false;
-}
-
-static int chan_start(struct knav_dma_chan *chan,
-			struct knav_dma_cfg *cfg)
-{
-	u32 v = 0;
-
-	spin_lock(&chan->lock);
-	if ((chan->direction == DMA_MEM_TO_DEV) && chan->reg_chan) {
-		if (cfg->u.tx.filt_pswords)
-			v |= DMA_TX_FILT_PSWORDS;
-		if (cfg->u.tx.filt_einfo)
-			v |= DMA_TX_FILT_EINFO;
-		writel_relaxed(v, &chan->reg_chan->mode);
-		writel_relaxed(DMA_ENABLE, &chan->reg_chan->control);
-	}
-
-	if (chan->reg_tx_sched)
-		writel_relaxed(cfg->u.tx.priority, &chan->reg_tx_sched->prio);
-
-	if (chan->reg_rx_flow) {
-		v = 0;
-
-		if (cfg->u.rx.einfo_present)
-			v |= CHAN_HAS_EPIB;
-		if (cfg->u.rx.psinfo_present)
-			v |= CHAN_HAS_PSINFO;
-		if (cfg->u.rx.err_mode == DMA_RETRY)
-			v |= CHAN_ERR_RETRY;
-		v |= (cfg->u.rx.desc_type & DESC_TYPE_MASK) << DESC_TYPE_SHIFT;
-		if (cfg->u.rx.psinfo_at_sop)
-			v |= CHAN_PSINFO_AT_SOP;
-		v |= (cfg->u.rx.sop_offset & CHAN_SOP_OFF_MASK)
-			<< CHAN_SOP_OFF_SHIFT;
-		v |= cfg->u.rx.dst_q & CHAN_QNUM_MASK;
-
-		writel_relaxed(v, &chan->reg_rx_flow->control);
-		writel_relaxed(0, &chan->reg_rx_flow->tags);
-		writel_relaxed(0, &chan->reg_rx_flow->tag_sel);
-
-		v =  cfg->u.rx.fdq[0] << 16;
-		v |=  cfg->u.rx.fdq[1] & CHAN_QNUM_MASK;
-		writel_relaxed(v, &chan->reg_rx_flow->fdq_sel[0]);
-
-		v =  cfg->u.rx.fdq[2] << 16;
-		v |=  cfg->u.rx.fdq[3] & CHAN_QNUM_MASK;
-		writel_relaxed(v, &chan->reg_rx_flow->fdq_sel[1]);
-
-		writel_relaxed(0, &chan->reg_rx_flow->thresh[0]);
-		writel_relaxed(0, &chan->reg_rx_flow->thresh[1]);
-		writel_relaxed(0, &chan->reg_rx_flow->thresh[2]);
-	}
-
-	/* Keep a copy of the cfg */
-	memcpy(&chan->cfg, cfg, sizeof(*cfg));
-	spin_unlock(&chan->lock);
-
-	return 0;
-}
-
-static int chan_teardown(struct knav_dma_chan *chan)
-{
-	unsigned long end, value;
-
-	if (!chan->reg_chan)
-		return 0;
-
-	/* indicate teardown */
-	writel_relaxed(DMA_TEARDOWN, &chan->reg_chan->control);
-
-	/* wait for the dma to shut itself down */
-	end = jiffies + msecs_to_jiffies(DMA_TIMEOUT);
-	do {
-		value = readl_relaxed(&chan->reg_chan->control);
-		if ((value & DMA_ENABLE) == 0)
-			break;
-	} while (time_after(end, jiffies));
-
-	if (readl_relaxed(&chan->reg_chan->control) & DMA_ENABLE) {
-		dev_err(kdev->dev, "timeout waiting for teardown\n");
-		return -ETIMEDOUT;
-	}
-
-	return 0;
-}
-
-static void chan_stop(struct knav_dma_chan *chan)
-{
-	spin_lock(&chan->lock);
-	if (chan->reg_rx_flow) {
-		/* first detach fdqs, starve out the flow */
-		writel_relaxed(0, &chan->reg_rx_flow->fdq_sel[0]);
-		writel_relaxed(0, &chan->reg_rx_flow->fdq_sel[1]);
-		writel_relaxed(0, &chan->reg_rx_flow->thresh[0]);
-		writel_relaxed(0, &chan->reg_rx_flow->thresh[1]);
-		writel_relaxed(0, &chan->reg_rx_flow->thresh[2]);
-	}
-
-	/* teardown the dma channel */
-	chan_teardown(chan);
-
-	/* then disconnect the completion side */
-	if (chan->reg_rx_flow) {
-		writel_relaxed(0, &chan->reg_rx_flow->control);
-		writel_relaxed(0, &chan->reg_rx_flow->tags);
-		writel_relaxed(0, &chan->reg_rx_flow->tag_sel);
-	}
-
-	memset(&chan->cfg, 0, sizeof(struct knav_dma_cfg));
-	spin_unlock(&chan->lock);
-
-	dev_dbg(kdev->dev, "channel stopped\n");
-}
-
-static void dma_hw_enable_all(struct knav_dma_device *dma)
-{
-	int i;
-
-	for (i = 0; i < dma->max_tx_chan; i++) {
-		writel_relaxed(0, &dma->reg_tx_chan[i].mode);
-		writel_relaxed(DMA_ENABLE, &dma->reg_tx_chan[i].control);
-	}
-}
-
-
-static void knav_dma_hw_init(struct knav_dma_device *dma)
-{
-	unsigned v;
-	int i;
-
-	spin_lock(&dma->lock);
-	v  = dma->loopback ? DMA_LOOPBACK : 0;
-	writel_relaxed(v, &dma->reg_global->emulation_control);
-
-	v = readl_relaxed(&dma->reg_global->perf_control);
-	v |= ((dma->rx_timeout & DMA_RX_TIMEOUT_MASK) << DMA_RX_TIMEOUT_SHIFT);
-	writel_relaxed(v, &dma->reg_global->perf_control);
-
-	v = ((dma->tx_priority << DMA_TX_PRIO_SHIFT) |
-	     (dma->rx_priority << DMA_RX_PRIO_SHIFT));
-
-	writel_relaxed(v, &dma->reg_global->priority_control);
-
-	/* Always enable all Rx channels. Rx paths are managed using flows */
-	for (i = 0; i < dma->max_rx_chan; i++)
-		writel_relaxed(DMA_ENABLE, &dma->reg_rx_chan[i].control);
-
-	for (i = 0; i < dma->logical_queue_managers; i++)
-		writel_relaxed(dma->qm_base_address[i],
-			       &dma->reg_global->qm_base_address[i]);
-	spin_unlock(&dma->lock);
-}
-
-static void knav_dma_hw_destroy(struct knav_dma_device *dma)
-{
-	int i;
-	unsigned v;
-
-	spin_lock(&dma->lock);
-	v = ~DMA_ENABLE & REG_MASK;
-
-	for (i = 0; i < dma->max_rx_chan; i++)
-		writel_relaxed(v, &dma->reg_rx_chan[i].control);
-
-	for (i = 0; i < dma->max_tx_chan; i++)
-		writel_relaxed(v, &dma->reg_tx_chan[i].control);
-	spin_unlock(&dma->lock);
-}
-
-static void dma_debug_show_channels(struct seq_file *s,
-					struct knav_dma_chan *chan)
-{
-	int i;
-
-	seq_printf(s, "\t%s %d:\t",
-		((chan->direction == DMA_MEM_TO_DEV) ? "tx chan" : "rx flow"),
-		chan_number(chan));
-
-	if (chan->direction == DMA_MEM_TO_DEV) {
-		seq_printf(s, "einfo - %d, pswords - %d, priority - %d\n",
-			chan->cfg.u.tx.filt_einfo,
-			chan->cfg.u.tx.filt_pswords,
-			chan->cfg.u.tx.priority);
-	} else {
-		seq_printf(s, "einfo - %d, psinfo - %d, desc_type - %d\n",
-			chan->cfg.u.rx.einfo_present,
-			chan->cfg.u.rx.psinfo_present,
-			chan->cfg.u.rx.desc_type);
-		seq_printf(s, "\t\t\tdst_q: [%d], thresh: %d fdq: ",
-			chan->cfg.u.rx.dst_q,
-			chan->cfg.u.rx.thresh);
-		for (i = 0; i < KNAV_DMA_FDQ_PER_CHAN; i++)
-			seq_printf(s, "[%d]", chan->cfg.u.rx.fdq[i]);
-		seq_printf(s, "\n");
-	}
-}
-
-static void dma_debug_show_devices(struct seq_file *s,
-					struct knav_dma_device *dma)
-{
-	struct knav_dma_chan *chan;
-
-	list_for_each_entry(chan, &dma->chan_list, list) {
-		if (atomic_read(&chan->ref_count))
-			dma_debug_show_channels(s, chan);
-	}
-}
-
-static int dma_debug_show(struct seq_file *s, void *v)
-{
-	struct knav_dma_device *dma;
-
-	list_for_each_entry(dma, &kdev->list, list) {
-		if (atomic_read(&dma->ref_count)) {
-			seq_printf(s, "%s : max_tx_chan: (%d), max_rx_flows: (%d)\n",
-			dma->name, dma->max_tx_chan, dma->max_rx_flow);
-			dma_debug_show_devices(s, dma);
-		}
-	}
-
-	return 0;
-}
-
-static int knav_dma_debug_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, dma_debug_show, NULL);
-}
-
-static const struct file_operations knav_dma_debug_ops = {
-	.open		= knav_dma_debug_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int of_channel_match_helper(struct device_node *np, const char *name,
-					const char **dma_instance)
-{
-	struct of_phandle_args args;
-	struct device_node *dma_node;
-	int index;
-
-	dma_node = of_parse_phandle(np, "ti,navigator-dmas", 0);
-	if (!dma_node)
-		return -ENODEV;
-
-	*dma_instance = dma_node->name;
-	index = of_property_match_string(np, "ti,navigator-dma-names", name);
-	if (index < 0) {
-		dev_err(kdev->dev, "No 'ti,navigator-dma-names' propery\n");
-		return -ENODEV;
-	}
-
-	if (of_parse_phandle_with_fixed_args(np, "ti,navigator-dmas",
-					1, index, &args)) {
-		dev_err(kdev->dev, "Missing the pahndle args name %s\n", name);
-		return -ENODEV;
-	}
-
-	if (args.args[0] < 0) {
-		dev_err(kdev->dev, "Missing args for %s\n", name);
-		return -ENODEV;
-	}
-
-	return args.args[0];
-}
-
-/**
- * knav_dma_open_channel() - try to setup an exclusive slave channel
- * @dev:	pointer to client device structure
- * @name:	slave channel name
- * @config:	dma configuration parameters
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * Returns pointer to appropriate DMA channel on success or NULL.
- */
-void *knav_dma_open_channel(struct device *dev, const char *name,
-					struct knav_dma_cfg *config)
-{
-	struct knav_dma_chan *chan;
-	struct knav_dma_device *dma;
-	bool found = false;
-	int chan_num = -1;
-	const char *instance;
-
-	if (!kdev) {
-		pr_err("keystone-navigator-dma driver not registered\n");
-		return (void *)-EINVAL;
-	}
-
-	chan_num = of_channel_match_helper(dev->of_node, name, &instance);
-	if (chan_num < 0) {
-		dev_err(kdev->dev, "No DMA instace with name %s\n", name);
-		return (void *)-EINVAL;
-	}
-
-	dev_dbg(kdev->dev, "initializing %s channel %d from DMA %s\n",
-		  config->direction == DMA_MEM_TO_DEV   ? "transmit" :
-		  config->direction == DMA_DEV_TO_MEM ? "receive"  :
-		  "unknown", chan_num, instance);
-
-	if (config->direction != DMA_MEM_TO_DEV &&
-	    config->direction != DMA_DEV_TO_MEM) {
-		dev_err(kdev->dev, "bad direction\n");
-		return (void *)-EINVAL;
-	}
-
-	/* Look for correct dma instance */
-	list_for_each_entry(dma, &kdev->list, list) {
-		if (!strcmp(dma->name, instance)) {
-			found = true;
-			break;
-		}
-	}
-	if (!found) {
-		dev_err(kdev->dev, "No DMA instace with name %s\n", instance);
-		return (void *)-EINVAL;
-	}
-
-	/* Look for correct dma channel from dma instance */
-	found = false;
-	list_for_each_entry(chan, &dma->chan_list, list) {
-		if (config->direction == DMA_MEM_TO_DEV) {
-			if (chan->channel == chan_num) {
-				found = true;
-				break;
-			}
-		} else {
-			if (chan->flow == chan_num) {
-				found = true;
-				break;
-			}
-		}
-	}
-	if (!found) {
-		dev_err(kdev->dev, "channel %d is not in DMA %s\n",
-				chan_num, instance);
-		return (void *)-EINVAL;
-	}
-
-	if (atomic_read(&chan->ref_count) >= 1) {
-		if (!check_config(chan, config)) {
-			dev_err(kdev->dev, "channel %d config miss-match\n",
-				chan_num);
-			return (void *)-EINVAL;
-		}
-	}
-
-	if (atomic_inc_return(&chan->dma->ref_count) <= 1)
-		knav_dma_hw_init(chan->dma);
-
-	if (atomic_inc_return(&chan->ref_count) <= 1)
-		chan_start(chan, config);
-
-	dev_dbg(kdev->dev, "channel %d opened from DMA %s\n",
-				chan_num, instance);
-
-	return chan;
-}
-EXPORT_SYMBOL_GPL(knav_dma_open_channel);
-
-/**
- * knav_dma_close_channel()	- Destroy a dma channel
- *
- * channel:	dma channel handle
- *
- */
-void knav_dma_close_channel(void *channel)
-{
-	struct knav_dma_chan *chan = channel;
-
-	if (!kdev) {
-		pr_err("keystone-navigator-dma driver not registered\n");
-		return;
-	}
-
-	if (atomic_dec_return(&chan->ref_count) <= 0)
-		chan_stop(chan);
-
-	if (atomic_dec_return(&chan->dma->ref_count) <= 0)
-		knav_dma_hw_destroy(chan->dma);
-
-	dev_dbg(kdev->dev, "channel %d or flow %d closed from DMA %s\n",
-			chan->channel, chan->flow, chan->dma->name);
-}
-EXPORT_SYMBOL_GPL(knav_dma_close_channel);
-
-static void __iomem *pktdma_get_regs(struct knav_dma_device *dma,
-				struct device_node *node,
-				unsigned index, resource_size_t *_size)
-{
-	struct device *dev = kdev->dev;
-	struct resource res;
-	void __iomem *regs;
-	int ret;
-
-	ret = of_address_to_resource(node, index, &res);
-	if (ret) {
-		dev_err(dev, "Can't translate of node(%s) address for index(%d)\n",
-			node->name, index);
-		return ERR_PTR(ret);
-	}
-
-	regs = devm_ioremap_resource(kdev->dev, &res);
-	if (IS_ERR(regs))
-		dev_err(dev, "Failed to map register base for index(%d) node(%s)\n",
-			index, node->name);
-	if (_size)
-		*_size = resource_size(&res);
-
-	return regs;
-}
-
-static int pktdma_init_rx_chan(struct knav_dma_chan *chan, u32 flow)
-{
-	struct knav_dma_device *dma = chan->dma;
-
-	chan->flow = flow;
-	chan->reg_rx_flow = dma->reg_rx_flow + flow;
-	chan->channel = DMA_INVALID_ID;
-	dev_dbg(kdev->dev, "rx flow(%d) (%p)\n", chan->flow, chan->reg_rx_flow);
-
-	return 0;
-}
-
-static int pktdma_init_tx_chan(struct knav_dma_chan *chan, u32 channel)
-{
-	struct knav_dma_device *dma = chan->dma;
-
-	chan->channel = channel;
-	chan->reg_chan = dma->reg_tx_chan + channel;
-	chan->reg_tx_sched = dma->reg_tx_sched + channel;
-	chan->flow = DMA_INVALID_ID;
-	dev_dbg(kdev->dev, "tx channel(%d) (%p)\n", chan->channel, chan->reg_chan);
-
-	return 0;
-}
-
-static int pktdma_init_chan(struct knav_dma_device *dma,
-				enum dma_transfer_direction dir,
-				unsigned chan_num)
-{
-	struct device *dev = kdev->dev;
-	struct knav_dma_chan *chan;
-	int ret = -EINVAL;
-
-	chan = devm_kzalloc(dev, sizeof(*chan), GFP_KERNEL);
-	if (!chan)
-		return -ENOMEM;
-
-	INIT_LIST_HEAD(&chan->list);
-	chan->dma	= dma;
-	chan->direction	= DMA_NONE;
-	atomic_set(&chan->ref_count, 0);
-	spin_lock_init(&chan->lock);
-
-	if (dir == DMA_MEM_TO_DEV) {
-		chan->direction = dir;
-		ret = pktdma_init_tx_chan(chan, chan_num);
-	} else if (dir == DMA_DEV_TO_MEM) {
-		chan->direction = dir;
-		ret = pktdma_init_rx_chan(chan, chan_num);
-	} else {
-		dev_err(dev, "channel(%d) direction unknown\n", chan_num);
-	}
-
-	list_add_tail(&chan->list, &dma->chan_list);
-
-	return ret;
-}
-
-static int dma_init(struct device_node *cloud, struct device_node *dma_node)
-{
-	unsigned max_tx_chan, max_rx_chan, max_rx_flow, max_tx_sched;
-	struct device_node *node = dma_node;
-	struct knav_dma_device *dma;
-	int ret, len, num_chan = 0;
-	resource_size_t size;
-	u32 timeout;
-	u32 i;
-
-	dma = devm_kzalloc(kdev->dev, sizeof(*dma), GFP_KERNEL);
-	if (!dma) {
-		dev_err(kdev->dev, "could not allocate driver mem\n");
-		return -ENOMEM;
-	}
-	INIT_LIST_HEAD(&dma->list);
-	INIT_LIST_HEAD(&dma->chan_list);
-
-	if (!of_find_property(cloud, "ti,navigator-cloud-address", &len)) {
-		dev_err(kdev->dev, "unspecified navigator cloud addresses\n");
-		return -ENODEV;
-	}
-
-	dma->logical_queue_managers = len / sizeof(u32);
-	if (dma->logical_queue_managers > DMA_MAX_QMS) {
-		dev_warn(kdev->dev, "too many queue mgrs(>%d) rest ignored\n",
-			 dma->logical_queue_managers);
-		dma->logical_queue_managers = DMA_MAX_QMS;
-	}
-
-	ret = of_property_read_u32_array(cloud, "ti,navigator-cloud-address",
-					dma->qm_base_address,
-					dma->logical_queue_managers);
-	if (ret) {
-		dev_err(kdev->dev, "invalid navigator cloud addresses\n");
-		return -ENODEV;
-	}
-
-	dma->reg_global	 = pktdma_get_regs(dma, node, 0, &size);
-	if (!dma->reg_global)
-		return -ENODEV;
-	if (size < sizeof(struct reg_global)) {
-		dev_err(kdev->dev, "bad size %pa for global regs\n", &size);
-		return -ENODEV;
-	}
-
-	dma->reg_tx_chan = pktdma_get_regs(dma, node, 1, &size);
-	if (!dma->reg_tx_chan)
-		return -ENODEV;
-
-	max_tx_chan = size / sizeof(struct reg_chan);
-	dma->reg_rx_chan = pktdma_get_regs(dma, node, 2, &size);
-	if (!dma->reg_rx_chan)
-		return -ENODEV;
-
-	max_rx_chan = size / sizeof(struct reg_chan);
-	dma->reg_tx_sched = pktdma_get_regs(dma, node, 3, &size);
-	if (!dma->reg_tx_sched)
-		return -ENODEV;
-
-	max_tx_sched = size / sizeof(struct reg_tx_sched);
-	dma->reg_rx_flow = pktdma_get_regs(dma, node, 4, &size);
-	if (!dma->reg_rx_flow)
-		return -ENODEV;
-
-	max_rx_flow = size / sizeof(struct reg_rx_flow);
-	dma->rx_priority = DMA_PRIO_DEFAULT;
-	dma->tx_priority = DMA_PRIO_DEFAULT;
-
-	dma->enable_all	= (of_get_property(node, "ti,enable-all", NULL) != NULL);
-	dma->loopback	= (of_get_property(node, "ti,loop-back",  NULL) != NULL);
-
-	ret = of_property_read_u32(node, "ti,rx-retry-timeout", &timeout);
-	if (ret < 0) {
-		dev_dbg(kdev->dev, "unspecified rx timeout using value %d\n",
-			DMA_RX_TIMEOUT_DEFAULT);
-		timeout = DMA_RX_TIMEOUT_DEFAULT;
-	}
-
-	dma->rx_timeout = timeout;
-	dma->max_rx_chan = max_rx_chan;
-	dma->max_rx_flow = max_rx_flow;
-	dma->max_tx_chan = min(max_tx_chan, max_tx_sched);
-	atomic_set(&dma->ref_count, 0);
-	strcpy(dma->name, node->name);
-	spin_lock_init(&dma->lock);
-
-	for (i = 0; i < dma->max_tx_chan; i++) {
-		if (pktdma_init_chan(dma, DMA_MEM_TO_DEV, i) >= 0)
-			num_chan++;
-	}
-
-	for (i = 0; i < dma->max_rx_flow; i++) {
-		if (pktdma_init_chan(dma, DMA_DEV_TO_MEM, i) >= 0)
-			num_chan++;
-	}
-
-	list_add_tail(&dma->list, &kdev->list);
-
-	/*
-	 * For DSP software usecases or userpace transport software, setup all
-	 * the DMA hardware resources.
-	 */
-	if (dma->enable_all) {
-		atomic_inc(&dma->ref_count);
-		knav_dma_hw_init(dma);
-		dma_hw_enable_all(dma);
-	}
-
-	dev_info(kdev->dev, "DMA %s registered %d logical channels, flows %d, tx chans: %d, rx chans: %d%s\n",
-		dma->name, num_chan, dma->max_rx_flow,
-		dma->max_tx_chan, dma->max_rx_chan,
-		dma->loopback ? ", loopback" : "");
-
-	return 0;
-}
-
-static int knav_dma_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct device_node *node = pdev->dev.of_node;
-	struct device_node *child;
-	int ret = 0;
-
-	if (!node) {
-		dev_err(&pdev->dev, "could not find device info\n");
-		return -EINVAL;
-	}
-
-	kdev = devm_kzalloc(dev,
-			sizeof(struct knav_dma_pool_device), GFP_KERNEL);
-	if (!kdev) {
-		dev_err(dev, "could not allocate driver mem\n");
-		return -ENOMEM;
-	}
-
-	kdev->dev = dev;
-	INIT_LIST_HEAD(&kdev->list);
-
-	pm_runtime_enable(kdev->dev);
-	ret = pm_runtime_get_sync(kdev->dev);
-	if (ret < 0) {
-		pm_runtime_put_noidle(kdev->dev);
-		dev_err(kdev->dev, "unable to enable pktdma, err %d\n", ret);
-		goto err_pm_disable;
-	}
-
-	/* Initialise all packet dmas */
-	for_each_child_of_node(node, child) {
-		ret = dma_init(node, child);
-		if (ret) {
-			dev_err(&pdev->dev, "init failed with %d\n", ret);
-			break;
-		}
-	}
-
-	if (list_empty(&kdev->list)) {
-		dev_err(dev, "no valid dma instance\n");
-		ret = -ENODEV;
-		goto err_put_sync;
-	}
-
-	debugfs_create_file("knav_dma", S_IFREG | S_IRUGO, NULL, NULL,
-			    &knav_dma_debug_ops);
-
-	return ret;
-
-err_put_sync:
-	pm_runtime_put_sync(kdev->dev);
-err_pm_disable:
-	pm_runtime_disable(kdev->dev);
-
-	return ret;
-}
-
-static int knav_dma_remove(struct platform_device *pdev)
-{
-	struct knav_dma_device *dma;
-
-	list_for_each_entry(dma, &kdev->list, list) {
-		if (atomic_dec_return(&dma->ref_count) == 0)
-			knav_dma_hw_destroy(dma);
-	}
-
-	pm_runtime_put_sync(&pdev->dev);
-	pm_runtime_disable(&pdev->dev);
-
-	return 0;
-}
-
-static struct of_device_id of_match[] = {
-	{ .compatible = "ti,keystone-navigator-dma", },
-	{},
-};
-
-MODULE_DEVICE_TABLE(of, of_match);
-
-static struct platform_driver knav_dma_driver = {
-	.probe	= knav_dma_probe,
-	.remove	= knav_dma_remove,
-	.driver = {
-		.name		= "keystone-navigator-dma",
-		.of_match_table	= of_match,
-	},
-};
-module_platform_driver(knav_dma_driver);
-
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("TI Keystone Navigator Packet DMA driver");
-MODULE_AUTHOR("Sandeep Nair <sandeep_n@ti.com>");
-MODULE_AUTHOR("Santosh Shilimkar <santosh.shilimkar@ti.com>");
+ * The above copyright notice and this permission notice shall be included
+ * in all copies

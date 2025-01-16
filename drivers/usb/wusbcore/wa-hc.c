@@ -1,102 +1,38 @@
-/*
- * Wire Adapter Host Controller Driver
- * Common items to HWA and DWA based HCDs
- *
- * Copyright (C) 2005-2006 Intel Corporation
- * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
- *
- * FIXME: docs
- */
-#include <linux/slab.h>
-#include <linux/module.h>
-#include "wusbhc.h"
-#include "wa-hc.h"
-
-/**
- * Assumes
- *
- * wa->usb_dev and wa->usb_iface initialized and refcounted,
- * wa->wa_descr initialized.
- */
-int wa_create(struct wahc *wa, struct usb_interface *iface,
-	kernel_ulong_t quirks)
-{
-	int result;
-	struct device *dev = &iface->dev;
-
-	if (iface->cur_altsetting->desc.bNumEndpoints < 3)
-		return -ENODEV;
-
-	result = wa_rpipes_create(wa);
-	if (result < 0)
-		goto error_rpipes_create;
-	wa->quirks = quirks;
-	/* Fill up Data Transfer EP pointers */
-	wa->dti_epd = &iface->cur_altsetting->endpoint[1].desc;
-	wa->dto_epd = &iface->cur_altsetting->endpoint[2].desc;
-	wa->dti_buf_size = usb_endpoint_maxp(wa->dti_epd);
-	wa->dti_buf = kmalloc(wa->dti_buf_size, GFP_KERNEL);
-	if (wa->dti_buf == NULL) {
-		result = -ENOMEM;
-		goto error_dti_buf_alloc;
-	}
-	result = wa_nep_create(wa, iface);
-	if (result < 0) {
-		dev_err(dev, "WA-CDS: can't initialize notif endpoint: %d\n",
-			result);
-		goto error_nep_create;
-	}
-	return 0;
-
-error_nep_create:
-	kfree(wa->dti_buf);
-error_dti_buf_alloc:
-	wa_rpipes_destroy(wa);
-error_rpipes_create:
-	return result;
-}
-EXPORT_SYMBOL_GPL(wa_create);
-
-
-void __wa_destroy(struct wahc *wa)
-{
-	if (wa->dti_urb) {
-		usb_kill_urb(wa->dti_urb);
-		usb_put_urb(wa->dti_urb);
-	}
-	kfree(wa->dti_buf);
-	wa_nep_destroy(wa);
-	wa_rpipes_destroy(wa);
-}
-EXPORT_SYMBOL_GPL(__wa_destroy);
-
-/**
- * wa_reset_all - reset the WA device
- * @wa: the WA to be reset
- *
- * For HWAs the radio controller and all other PALs are also reset.
- */
-void wa_reset_all(struct wahc *wa)
-{
-	/* FIXME: assuming HWA. */
-	wusbhc_reset_all(wa->wusb);
-}
-
-MODULE_AUTHOR("Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>");
-MODULE_DESCRIPTION("Wireless USB Wire Adapter core");
-MODULE_LICENSE("GPL");
+S_timeout_timer_MASK 0xff0000
+#define BIF_RFE_MST_SMBUS_CMDSTATUS__REG_SMBUS_timeout_timer__SHIFT 0x10
+#define BIF_RFE_MST_SMBUS_CMDSTATUS__SMBUS_RFE_mstTimeout_MASK 0x1000000
+#define BIF_RFE_MST_SMBUS_CMDSTATUS__SMBUS_RFE_mstTimeout__SHIFT 0x18
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_clkGate_timer_MASK 0xff
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_clkGate_timer__SHIFT 0x0
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_clkSetup_timer_MASK 0xf00
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_clkSetup_timer__SHIFT 0x8
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_timeout_timer_MASK 0xff0000
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_timeout_timer__SHIFT 0x10
+#define BIF_RFE_MST_BX_CMDSTATUS__BX_RFE_mstTimeout_MASK 0x1000000
+#define BIF_RFE_MST_BX_CMDSTATUS__BX_RFE_mstTimeout__SHIFT 0x18
+#define BIF_RFE_MST_TMOUT_STATUS__MstTmoutStatus_MASK 0x1
+#define BIF_RFE_MST_TMOUT_STATUS__MstTmoutStatus__SHIFT 0x0
+#define BIF_RFE_MMCFG_CNTL__CLIENT0_RFE_RFEWDBIF_MM_WR_TO_CFG_EN_MASK 0x1
+#define BIF_RFE_MMCFG_CNTL__CLIENT0_RFE_RFEWDBIF_MM_WR_TO_CFG_EN__SHIFT 0x0
+#define BIF_RFE_MMCFG_CNTL__CLIENT0_RFE_RFEWDBIF_MM_CFG_FUNC_SEL_MASK 0xe
+#define BIF_RFE_MMCFG_CNTL__CLIENT0_RFE_RFEWDBIF_MM_CFG_FUNC_SEL__SHIFT 0x1
+#define BIF_RFE_MMCFG_CNTL__CLIENT1_RFE_RFEWDBIF_MM_WR_TO_CFG_EN_MASK 0x10
+#define BIF_RFE_MMCFG_CNTL__CLIENT1_RFE_RFEWDBIF_MM_WR_TO_CFG_EN__SHIFT 0x4
+#define BIF_RFE_MMCFG_CNTL__CLIENT1_RFE_RFEWDBIF_MM_CFG_FUNC_SEL_MASK 0xe0
+#define BIF_RFE_MMCFG_CNTL__CLIENT1_RFE_RFEWDBIF_MM_CFG_FUNC_SEL__SHIFT 0x5
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_RX_IMPVAL_MASK 0x1e
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_RX_IMPVAL__SHIFT 0x1
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_RX_IMPVAL_EN_MASK 0x20
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_RX_IMPVAL_EN__SHIFT 0x5
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_PD_MASK 0x3c0
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_PD__SHIFT 0x6
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_EN_PD_MASK 0x400
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_EN_PD__SHIFT 0xa
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_PU_MASK 0x7800
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_PU__SHIFT 0xb
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_EN_PU_MASK 0x8000
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_EN_PU__SHIFT 0xf
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_IMP_DBG_ANALOG_EN_MASK 0x10000
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_IMP_DBG_ANALOG_EN__SHIFT 0x10
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_IMP_IGNORE_QUICKSIM_MASK 0x20000
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_IMP_IGNORE_QUICKS

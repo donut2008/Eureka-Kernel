@@ -1,116 +1,63 @@
-/*
- * Intel(R) Trace Hub Memory Storage Unit (MSU) data structures
- *
- * Copyright (C) 2014-2015 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- */
-
-#ifndef __INTEL_TH_MSU_H__
-#define __INTEL_TH_MSU_H__
-
-enum {
-	REG_MSU_MSUPARAMS	= 0x0000,
-	REG_MSU_MSUSTS		= 0x0008,
-	REG_MSU_MSC0CTL		= 0x0100, /* MSC0 control */
-	REG_MSU_MSC0STS		= 0x0104, /* MSC0 status */
-	REG_MSU_MSC0BAR		= 0x0108, /* MSC0 output base address */
-	REG_MSU_MSC0SIZE	= 0x010c, /* MSC0 output size */
-	REG_MSU_MSC0MWP		= 0x0110, /* MSC0 write pointer */
-	REG_MSU_MSC0NWSA	= 0x011c, /* MSC0 next window start address */
-
-	REG_MSU_MSC1CTL		= 0x0200, /* MSC1 control */
-	REG_MSU_MSC1STS		= 0x0204, /* MSC1 status */
-	REG_MSU_MSC1BAR		= 0x0208, /* MSC1 output base address */
-	REG_MSU_MSC1SIZE	= 0x020c, /* MSC1 output size */
-	REG_MSU_MSC1MWP		= 0x0210, /* MSC1 write pointer */
-	REG_MSU_MSC1NWSA	= 0x021c, /* MSC1 next window start address */
-};
-
-/* MSUSTS bits */
-#define MSUSTS_MSU_INT	BIT(0)
-
-/* MSCnCTL bits */
-#define MSC_EN		BIT(0)
-#define MSC_WRAPEN	BIT(1)
-#define MSC_RD_HDR_OVRD	BIT(2)
-#define MSC_MODE	(BIT(4) | BIT(5))
-#define MSC_LEN		(BIT(8) | BIT(9) | BIT(10))
-
-/* MSC operating modes (MSC_MODE) */
-enum {
-	MSC_MODE_SINGLE	= 0,
-	MSC_MODE_MULTI,
-	MSC_MODE_EXI,
-	MSC_MODE_DEBUG,
-};
-
-/* MSCnSTS bits */
-#define MSCSTS_WRAPSTAT	BIT(1)	/* Wrap occurred */
-#define MSCSTS_PLE	BIT(2)	/* Pipeline Empty */
-
-/*
- * Multiblock/multiwindow block descriptor
- */
-struct msc_block_desc {
-	u32	sw_tag;
-	u32	block_sz;
-	u32	next_blk;
-	u32	next_win;
-	u32	res0[4];
-	u32	hw_tag;
-	u32	valid_dw;
-	u32	ts_low;
-	u32	ts_high;
-	u32	res1[4];
-} __packed;
-
-#define MSC_BDESC	sizeof(struct msc_block_desc)
-#define DATA_IN_PAGE	(PAGE_SIZE - MSC_BDESC)
-
-/* MSC multiblock sw tag bits */
-#define MSC_SW_TAG_LASTBLK	BIT(0)
-#define MSC_SW_TAG_LASTWIN	BIT(1)
-
-/* MSC multiblock hw tag bits */
-#define MSC_HW_TAG_TRIGGER	BIT(0)
-#define MSC_HW_TAG_BLOCKWRAP	BIT(1)
-#define MSC_HW_TAG_WINWRAP	BIT(2)
-#define MSC_HW_TAG_ENDBIT	BIT(3)
-
-static inline unsigned long msc_data_sz(struct msc_block_desc *bdesc)
-{
-	if (!bdesc->valid_dw)
-		return 0;
-
-	return bdesc->valid_dw * 4 - MSC_BDESC;
-}
-
-static inline bool msc_block_wrapped(struct msc_block_desc *bdesc)
-{
-	if (bdesc->hw_tag & MSC_HW_TAG_BLOCKWRAP)
-		return true;
-
-	return false;
-}
-
-static inline bool msc_block_last_written(struct msc_block_desc *bdesc)
-{
-	if ((bdesc->hw_tag & MSC_HW_TAG_ENDBIT) ||
-	    (msc_data_sz(bdesc) != DATA_IN_PAGE))
-		return true;
-
-	return false;
-}
-
-/* waiting for Pipeline Empty bit(s) to assert for MSC */
-#define MSC_PLE_WAITLOOP_DEPTH	10000
-
-#endif /* __INTEL_TH_MSU_H__ */
+S__SHIFT 0x19
+#define MC_HUB_RDREQ_MCDU__ENABLE_MASK 0x1
+#define MC_HUB_RDREQ_MCDU__ENABLE__SHIFT 0x0
+#define MC_HUB_RDREQ_MCDU__BLACKOUT_EXEMPT_MASK 0x2
+#define MC_HUB_RDREQ_MCDU__BLACKOUT_EXEMPT__SHIFT 0x1
+#define MC_HUB_RDREQ_MCDU__BUS_MASK 0x4
+#define MC_HUB_RDREQ_MCDU__BUS__SHIFT 0x2
+#define MC_HUB_RDREQ_MCDU__MAXBURST_MASK 0x78
+#define MC_HUB_RDREQ_MCDU__MAXBURST__SHIFT 0x3
+#define MC_HUB_RDREQ_MCDU__LAZY_TIMER_MASK 0x780
+#define MC_HUB_RDREQ_MCDU__LAZY_TIMER__SHIFT 0x7
+#define MC_HUB_RDREQ_MCDU__ASK_CREDITS_MASK 0x3f800
+#define MC_HUB_RDREQ_MCDU__ASK_CREDITS__SHIFT 0xb
+#define MC_HUB_RDREQ_MCDU__DISPLAY_CREDITS_MASK 0x1fc0000
+#define MC_HUB_RDREQ_MCDU__DISPLAY_CREDITS__SHIFT 0x12
+#define MC_HUB_RDREQ_MCDU__MED_CREDITS_MASK 0xfe000000
+#define MC_HUB_RDREQ_MCDU__MED_CREDITS__SHIFT 0x19
+#define MC_HUB_RDREQ_MCDV__ENABLE_MASK 0x1
+#define MC_HUB_RDREQ_MCDV__ENABLE__SHIFT 0x0
+#define MC_HUB_RDREQ_MCDV__BLACKOUT_EXEMPT_MASK 0x2
+#define MC_HUB_RDREQ_MCDV__BLACKOUT_EXEMPT__SHIFT 0x1
+#define MC_HUB_RDREQ_MCDV__BUS_MASK 0x4
+#define MC_HUB_RDREQ_MCDV__BUS__SHIFT 0x2
+#define MC_HUB_RDREQ_MCDV__MAXBURST_MASK 0x78
+#define MC_HUB_RDREQ_MCDV__MAXBURST__SHIFT 0x3
+#define MC_HUB_RDREQ_MCDV__LAZY_TIMER_MASK 0x780
+#define MC_HUB_RDREQ_MCDV__LAZY_TIMER__SHIFT 0x7
+#define MC_HUB_RDREQ_MCDV__ASK_CREDITS_MASK 0x3f800
+#define MC_HUB_RDREQ_MCDV__ASK_CREDITS__SHIFT 0xb
+#define MC_HUB_RDREQ_MCDV__DISPLAY_CREDITS_MASK 0x1fc0000
+#define MC_HUB_RDREQ_MCDV__DISPLAY_CREDITS__SHIFT 0x12
+#define MC_HUB_RDREQ_MCDV__MED_CREDITS_MASK 0xfe000000
+#define MC_HUB_RDREQ_MCDV__MED_CREDITS__SHIFT 0x19
+#define MC_HUB_WDP_MCDS__ENABLE_MASK 0x1
+#define MC_HUB_WDP_MCDS__ENABLE__SHIFT 0x0
+#define MC_HUB_WDP_MCDS__BLACKOUT_EXEMPT_MASK 0x2
+#define MC_HUB_WDP_MCDS__BLACKOUT_EXEMPT__SHIFT 0x1
+#define MC_HUB_WDP_MCDS__STALL_MODE_MASK 0x4
+#define MC_HUB_WDP_MCDS__STALL_MODE__SHIFT 0x2
+#define MC_HUB_WDP_MCDS__MAXBURST_MASK 0x78
+#define MC_HUB_WDP_MCDS__MAXBURST__SHIFT 0x3
+#define MC_HUB_WDP_MCDS__ASK_CREDITS_MASK 0x1f80
+#define MC_HUB_WDP_MCDS__ASK_CREDITS__SHIFT 0x7
+#define MC_HUB_WDP_MCDS__LAZY_TIMER_MASK 0x1e000
+#define MC_HUB_WDP_MCDS__LAZY_TIMER__SHIFT 0xd
+#define MC_HUB_WDP_MCDS__STALL_THRESHOLD_MASK 0xfe0000
+#define MC_HUB_WDP_MCDS__STALL_THRESHOLD__SHIFT 0x11
+#define MC_HUB_WDP_MCDS__ASK_CREDITS_W_MASK 0x7f000000
+#define MC_HUB_WDP_MCDS__ASK_CREDITS_W__SHIFT 0x18
+#define MC_HUB_WDP_MCDT__ENABLE_MASK 0x1
+#define MC_HUB_WDP_MCDT__ENABLE__SHIFT 0x0
+#define MC_HUB_WDP_MCDT__BLACKOUT_EXEMPT_MASK 0x2
+#define MC_HUB_WDP_MCDT__BLACKOUT_EXEMPT__SHIFT 0x1
+#define MC_HUB_WDP_MCDT__STALL_MODE_MASK 0x4
+#define MC_HUB_WDP_MCDT__STALL_MODE__SHIFT 0x2
+#define MC_HUB_WDP_MCDT__MAXBURST_MASK 0x78
+#define MC_HUB_WDP_MCDT__MAXBURST__SHIFT 0x3
+#define MC_HUB_WDP_MCDT__ASK_CREDITS_MASK 0x1f80
+#define MC_HUB_WDP_MCDT__ASK_CREDITS__SHIFT 0x7
+#define MC_HUB_WDP_MCDT__LAZY_TIMER_MASK 0x1e000
+#define MC_HUB_WDP_MCDT__LAZY_TIMER__SHIFT 0xd
+#define MC_HUB_WDP_MCDT__STALL_THRESHOLD_MASK 0xfe0000
+#define MC_HUB_WDP_MCDT__STALL_THRESHOLD

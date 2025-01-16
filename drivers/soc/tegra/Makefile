@@ -1,4 +1,2 @@
-obj-y += fuse/
-
-obj-y += common.o
-obj-y += pmc.o
+OL__DISP_TIMER_INT_MASK_MASK 0x8000000
+#define PW

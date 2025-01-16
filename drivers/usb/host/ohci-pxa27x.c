@@ -1,639 +1,265 @@
-/*
- * OHCI HCD (Host Controller Driver) for USB.
- *
- * (C) Copyright 1999 Roman Weissgaerber <weissg@vienna.at>
- * (C) Copyright 2000-2002 David Brownell <dbrownell@users.sourceforge.net>
- * (C) Copyright 2002 Hewlett-Packard Company
- *
- * Bus Glue for pxa27x
- *
- * Written by Christopher Hoover <ch@hpl.hp.com>
- * Based on fragments of previous driver by Russell King et al.
- *
- * Modified for LH7A404 from ohci-sa1111.c
- *  by Durgesh Pattamatta <pattamattad@sharpsec.com>
- *
- * Modified for pxa27x from ohci-lh7a404.c
- *  by Nick Bane <nick@cecomputing.co.uk> 26-8-2004
- *
- * This file is licenced under the GPL.
- */
-
-#include <linux/clk.h>
-#include <linux/device.h>
-#include <linux/dma-mapping.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/of_platform.h>
-#include <linux/of_gpio.h>
-#include <linux/platform_data/usb-ohci-pxa27x.h>
-#include <linux/platform_data/usb-pxa3xx-ulpi.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/consumer.h>
-#include <linux/signal.h>
-#include <linux/usb.h>
-#include <linux/usb/hcd.h>
-#include <linux/usb/otg.h>
-
-#include <mach/hardware.h>
-
-#include "ohci.h"
-
-#define DRIVER_DESC "OHCI PXA27x/PXA3x driver"
-
-/*
- * UHC: USB Host Controller (OHCI-like) register definitions
- */
-#define UHCREV		(0x0000) /* UHC HCI Spec Revision */
-#define UHCHCON		(0x0004) /* UHC Host Control Register */
-#define UHCCOMS		(0x0008) /* UHC Command Status Register */
-#define UHCINTS		(0x000C) /* UHC Interrupt Status Register */
-#define UHCINTE		(0x0010) /* UHC Interrupt Enable */
-#define UHCINTD		(0x0014) /* UHC Interrupt Disable */
-#define UHCHCCA		(0x0018) /* UHC Host Controller Comm. Area */
-#define UHCPCED		(0x001C) /* UHC Period Current Endpt Descr */
-#define UHCCHED		(0x0020) /* UHC Control Head Endpt Descr */
-#define UHCCCED		(0x0024) /* UHC Control Current Endpt Descr */
-#define UHCBHED		(0x0028) /* UHC Bulk Head Endpt Descr */
-#define UHCBCED		(0x002C) /* UHC Bulk Current Endpt Descr */
-#define UHCDHEAD	(0x0030) /* UHC Done Head */
-#define UHCFMI		(0x0034) /* UHC Frame Interval */
-#define UHCFMR		(0x0038) /* UHC Frame Remaining */
-#define UHCFMN		(0x003C) /* UHC Frame Number */
-#define UHCPERS		(0x0040) /* UHC Periodic Start */
-#define UHCLS		(0x0044) /* UHC Low Speed Threshold */
-
-#define UHCRHDA		(0x0048) /* UHC Root Hub Descriptor A */
-#define UHCRHDA_NOCP	(1 << 12)	/* No over current protection */
-#define UHCRHDA_OCPM	(1 << 11)	/* Over Current Protection Mode */
-#define UHCRHDA_POTPGT(x) \
-			(((x) & 0xff) << 24) /* Power On To Power Good Time */
-
-#define UHCRHDB		(0x004C) /* UHC Root Hub Descriptor B */
-#define UHCRHS		(0x0050) /* UHC Root Hub Status */
-#define UHCRHPS1	(0x0054) /* UHC Root Hub Port 1 Status */
-#define UHCRHPS2	(0x0058) /* UHC Root Hub Port 2 Status */
-#define UHCRHPS3	(0x005C) /* UHC Root Hub Port 3 Status */
-
-#define UHCSTAT		(0x0060) /* UHC Status Register */
-#define UHCSTAT_UPS3	(1 << 16)	/* USB Power Sense Port3 */
-#define UHCSTAT_SBMAI	(1 << 15)	/* System Bus Master Abort Interrupt*/
-#define UHCSTAT_SBTAI	(1 << 14)	/* System Bus Target Abort Interrupt*/
-#define UHCSTAT_UPRI	(1 << 13)	/* USB Port Resume Interrupt */
-#define UHCSTAT_UPS2	(1 << 12)	/* USB Power Sense Port 2 */
-#define UHCSTAT_UPS1	(1 << 11)	/* USB Power Sense Port 1 */
-#define UHCSTAT_HTA	(1 << 10)	/* HCI Target Abort */
-#define UHCSTAT_HBA	(1 << 8)	/* HCI Buffer Active */
-#define UHCSTAT_RWUE	(1 << 7)	/* HCI Remote Wake Up Event */
-
-#define UHCHR           (0x0064) /* UHC Reset Register */
-#define UHCHR_SSEP3	(1 << 11)	/* Sleep Standby Enable for Port3 */
-#define UHCHR_SSEP2	(1 << 10)	/* Sleep Standby Enable for Port2 */
-#define UHCHR_SSEP1	(1 << 9)	/* Sleep Standby Enable for Port1 */
-#define UHCHR_PCPL	(1 << 7)	/* Power control polarity low */
-#define UHCHR_PSPL	(1 << 6)	/* Power sense polarity low */
-#define UHCHR_SSE	(1 << 5)	/* Sleep Standby Enable */
-#define UHCHR_UIT	(1 << 4)	/* USB Interrupt Test */
-#define UHCHR_SSDC	(1 << 3)	/* Simulation Scale Down Clock */
-#define UHCHR_CGR	(1 << 2)	/* Clock Generation Reset */
-#define UHCHR_FHR	(1 << 1)	/* Force Host Controller Reset */
-#define UHCHR_FSBIR	(1 << 0)	/* Force System Bus Iface Reset */
-
-#define UHCHIE          (0x0068) /* UHC Interrupt Enable Register*/
-#define UHCHIE_UPS3IE	(1 << 14)	/* Power Sense Port3 IntEn */
-#define UHCHIE_UPRIE	(1 << 13)	/* Port Resume IntEn */
-#define UHCHIE_UPS2IE	(1 << 12)	/* Power Sense Port2 IntEn */
-#define UHCHIE_UPS1IE	(1 << 11)	/* Power Sense Port1 IntEn */
-#define UHCHIE_TAIE	(1 << 10)	/* HCI Interface Transfer Abort
-					   Interrupt Enable*/
-#define UHCHIE_HBAIE	(1 << 8)	/* HCI Buffer Active IntEn */
-#define UHCHIE_RWIE	(1 << 7)	/* Remote Wake-up IntEn */
-
-#define UHCHIT          (0x006C) /* UHC Interrupt Test register */
-
-#define PXA_UHC_MAX_PORTNUM    3
-
-static const char hcd_name[] = "ohci-pxa27x";
-
-static struct hc_driver __read_mostly ohci_pxa27x_hc_driver;
-
-struct pxa27x_ohci {
-	struct clk	*clk;
-	void __iomem	*mmio_base;
-	struct regulator *vbus[3];
-	bool		vbus_enabled[3];
-};
-
-#define to_pxa27x_ohci(hcd)	(struct pxa27x_ohci *)(hcd_to_ohci(hcd)->priv)
-
-/*
-  PMM_NPS_MODE -- PMM Non-power switching mode
-      Ports are powered continuously.
-
-  PMM_GLOBAL_MODE -- PMM global switching mode
-      All ports are powered at the same time.
-
-  PMM_PERPORT_MODE -- PMM per port switching mode
-      Ports are powered individually.
- */
-static int pxa27x_ohci_select_pmm(struct pxa27x_ohci *pxa_ohci, int mode)
-{
-	uint32_t uhcrhda = __raw_readl(pxa_ohci->mmio_base + UHCRHDA);
-	uint32_t uhcrhdb = __raw_readl(pxa_ohci->mmio_base + UHCRHDB);
-
-	switch (mode) {
-	case PMM_NPS_MODE:
-		uhcrhda |= RH_A_NPS;
-		break;
-	case PMM_GLOBAL_MODE:
-		uhcrhda &= ~(RH_A_NPS | RH_A_PSM);
-		break;
-	case PMM_PERPORT_MODE:
-		uhcrhda &= ~(RH_A_NPS);
-		uhcrhda |= RH_A_PSM;
-
-		/* Set port power control mask bits, only 3 ports. */
-		uhcrhdb |= (0x7<<17);
-		break;
-	default:
-		printk( KERN_ERR
-			"Invalid mode %d, set to non-power switch mode.\n",
-			mode );
-
-		uhcrhda |= RH_A_NPS;
-	}
-
-	__raw_writel(uhcrhda, pxa_ohci->mmio_base + UHCRHDA);
-	__raw_writel(uhcrhdb, pxa_ohci->mmio_base + UHCRHDB);
-	return 0;
-}
-
-static int pxa27x_ohci_set_vbus_power(struct pxa27x_ohci *pxa_ohci,
-				      unsigned int port, bool enable)
-{
-	struct regulator *vbus = pxa_ohci->vbus[port];
-	int ret = 0;
-
-	if (IS_ERR_OR_NULL(vbus))
-		return 0;
-
-	if (enable && !pxa_ohci->vbus_enabled[port])
-		ret = regulator_enable(vbus);
-	else if (!enable && pxa_ohci->vbus_enabled[port])
-		ret = regulator_disable(vbus);
-
-	if (ret < 0)
-		return ret;
-
-	pxa_ohci->vbus_enabled[port] = enable;
-
-	return 0;
-}
-
-static int pxa27x_ohci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
-				   u16 wIndex, char *buf, u16 wLength)
-{
-	struct pxa27x_ohci *pxa_ohci = to_pxa27x_ohci(hcd);
-	int ret;
-
-	switch (typeReq) {
-	case SetPortFeature:
-	case ClearPortFeature:
-		if (!wIndex || wIndex > 3)
-			return -EPIPE;
-
-		if (wValue != USB_PORT_FEAT_POWER)
-			break;
-
-		ret = pxa27x_ohci_set_vbus_power(pxa_ohci, wIndex - 1,
-						 typeReq == SetPortFeature);
-		if (ret)
-			return ret;
-		break;
-	}
-
-	return ohci_hub_control(hcd, typeReq, wValue, wIndex, buf, wLength);
-}
-/*-------------------------------------------------------------------------*/
-
-static inline void pxa27x_setup_hc(struct pxa27x_ohci *pxa_ohci,
-				   struct pxaohci_platform_data *inf)
-{
-	uint32_t uhchr = __raw_readl(pxa_ohci->mmio_base + UHCHR);
-	uint32_t uhcrhda = __raw_readl(pxa_ohci->mmio_base + UHCRHDA);
-
-	if (inf->flags & ENABLE_PORT1)
-		uhchr &= ~UHCHR_SSEP1;
-
-	if (inf->flags & ENABLE_PORT2)
-		uhchr &= ~UHCHR_SSEP2;
-
-	if (inf->flags & ENABLE_PORT3)
-		uhchr &= ~UHCHR_SSEP3;
-
-	if (inf->flags & POWER_CONTROL_LOW)
-		uhchr |= UHCHR_PCPL;
-
-	if (inf->flags & POWER_SENSE_LOW)
-		uhchr |= UHCHR_PSPL;
-
-	if (inf->flags & NO_OC_PROTECTION)
-		uhcrhda |= UHCRHDA_NOCP;
-	else
-		uhcrhda &= ~UHCRHDA_NOCP;
-
-	if (inf->flags & OC_MODE_PERPORT)
-		uhcrhda |= UHCRHDA_OCPM;
-	else
-		uhcrhda &= ~UHCRHDA_OCPM;
-
-	if (inf->power_on_delay) {
-		uhcrhda &= ~UHCRHDA_POTPGT(0xff);
-		uhcrhda |= UHCRHDA_POTPGT(inf->power_on_delay / 2);
-	}
-
-	__raw_writel(uhchr, pxa_ohci->mmio_base + UHCHR);
-	__raw_writel(uhcrhda, pxa_ohci->mmio_base + UHCRHDA);
-}
-
-static inline void pxa27x_reset_hc(struct pxa27x_ohci *pxa_ohci)
-{
-	uint32_t uhchr = __raw_readl(pxa_ohci->mmio_base + UHCHR);
-
-	__raw_writel(uhchr | UHCHR_FHR, pxa_ohci->mmio_base + UHCHR);
-	udelay(11);
-	__raw_writel(uhchr & ~UHCHR_FHR, pxa_ohci->mmio_base + UHCHR);
-}
-
-#ifdef CONFIG_PXA27x
-extern void pxa27x_clear_otgph(void);
-#else
-#define pxa27x_clear_otgph()	do {} while (0)
-#endif
-
-static int pxa27x_start_hc(struct pxa27x_ohci *pxa_ohci, struct device *dev)
-{
-	int retval = 0;
-	struct pxaohci_platform_data *inf;
-	uint32_t uhchr;
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-
-	inf = dev_get_platdata(dev);
-
-	clk_prepare_enable(pxa_ohci->clk);
-
-	pxa27x_reset_hc(pxa_ohci);
-
-	uhchr = __raw_readl(pxa_ohci->mmio_base + UHCHR) | UHCHR_FSBIR;
-	__raw_writel(uhchr, pxa_ohci->mmio_base + UHCHR);
-
-	while (__raw_readl(pxa_ohci->mmio_base + UHCHR) & UHCHR_FSBIR)
-		cpu_relax();
-
-	pxa27x_setup_hc(pxa_ohci, inf);
-
-	if (inf->init)
-		retval = inf->init(dev);
-
-	if (retval < 0)
-		return retval;
-
-	if (cpu_is_pxa3xx())
-		pxa3xx_u2d_start_hc(&hcd->self);
-
-	uhchr = __raw_readl(pxa_ohci->mmio_base + UHCHR) & ~UHCHR_SSE;
-	__raw_writel(uhchr, pxa_ohci->mmio_base + UHCHR);
-	__raw_writel(UHCHIE_UPRIE | UHCHIE_RWIE, pxa_ohci->mmio_base + UHCHIE);
-
-	/* Clear any OTG Pin Hold */
-	pxa27x_clear_otgph();
-	return 0;
-}
-
-static void pxa27x_stop_hc(struct pxa27x_ohci *pxa_ohci, struct device *dev)
-{
-	struct pxaohci_platform_data *inf;
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-	uint32_t uhccoms;
-
-	inf = dev_get_platdata(dev);
-
-	if (cpu_is_pxa3xx())
-		pxa3xx_u2d_stop_hc(&hcd->self);
-
-	if (inf->exit)
-		inf->exit(dev);
-
-	pxa27x_reset_hc(pxa_ohci);
-
-	/* Host Controller Reset */
-	uhccoms = __raw_readl(pxa_ohci->mmio_base + UHCCOMS) | 0x01;
-	__raw_writel(uhccoms, pxa_ohci->mmio_base + UHCCOMS);
-	udelay(10);
-
-	clk_disable_unprepare(pxa_ohci->clk);
-}
-
-#ifdef CONFIG_OF
-static const struct of_device_id pxa_ohci_dt_ids[] = {
-	{ .compatible = "marvell,pxa-ohci" },
-	{ }
-};
-
-MODULE_DEVICE_TABLE(of, pxa_ohci_dt_ids);
-
-static int ohci_pxa_of_init(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct pxaohci_platform_data *pdata;
-	u32 tmp;
-	int ret;
-
-	if (!np)
-		return 0;
-
-	/* Right now device-tree probed devices don't get dma_mask set.
-	 * Since shared usb code relies on it, set it here for now.
-	 * Once we have dma capability bindings this can go away.
-	 */
-	ret = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (ret)
-		return ret;
-
-	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata)
-		return -ENOMEM;
-
-	if (of_get_property(np, "marvell,enable-port1", NULL))
-		pdata->flags |= ENABLE_PORT1;
-	if (of_get_property(np, "marvell,enable-port2", NULL))
-		pdata->flags |= ENABLE_PORT2;
-	if (of_get_property(np, "marvell,enable-port3", NULL))
-		pdata->flags |= ENABLE_PORT3;
-	if (of_get_property(np, "marvell,port-sense-low", NULL))
-		pdata->flags |= POWER_SENSE_LOW;
-	if (of_get_property(np, "marvell,power-control-low", NULL))
-		pdata->flags |= POWER_CONTROL_LOW;
-	if (of_get_property(np, "marvell,no-oc-protection", NULL))
-		pdata->flags |= NO_OC_PROTECTION;
-	if (of_get_property(np, "marvell,oc-mode-perport", NULL))
-		pdata->flags |= OC_MODE_PERPORT;
-	if (!of_property_read_u32(np, "marvell,power-on-delay", &tmp))
-		pdata->power_on_delay = tmp;
-	if (!of_property_read_u32(np, "marvell,port-mode", &tmp))
-		pdata->port_mode = tmp;
-	if (!of_property_read_u32(np, "marvell,power-budget", &tmp))
-		pdata->power_budget = tmp;
-
-	pdev->dev.platform_data = pdata;
-
-	return 0;
-}
-#else
-static int ohci_pxa_of_init(struct platform_device *pdev)
-{
-	return 0;
-}
-#endif
-
-/*-------------------------------------------------------------------------*/
-
-/* configure so an HC device and id are always provided */
-/* always called with process context; sleeping is OK */
-
-
-/**
- * usb_hcd_pxa27x_probe - initialize pxa27x-based HCDs
- * Context: !in_interrupt()
- *
- * Allocates basic resources for this USB host controller, and
- * then invokes the start() method for the HCD associated with it
- * through the hotplug entry's driver_data.
- *
- */
-int usb_hcd_pxa27x_probe (const struct hc_driver *driver, struct platform_device *pdev)
-{
-	int retval, irq;
-	struct usb_hcd *hcd;
-	struct pxaohci_platform_data *inf;
-	struct pxa27x_ohci *pxa_ohci;
-	struct ohci_hcd *ohci;
-	struct resource *r;
-	struct clk *usb_clk;
-	unsigned int i;
-
-	retval = ohci_pxa_of_init(pdev);
-	if (retval)
-		return retval;
-
-	inf = dev_get_platdata(&pdev->dev);
-
-	if (!inf)
-		return -ENODEV;
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		pr_err("no resource of IORESOURCE_IRQ");
-		return -ENXIO;
-	}
-
-	usb_clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(usb_clk))
-		return PTR_ERR(usb_clk);
-
-	hcd = usb_create_hcd (driver, &pdev->dev, "pxa27x");
-	if (!hcd)
-		return -ENOMEM;
-
-	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, r);
-	if (IS_ERR(hcd->regs)) {
-		retval = PTR_ERR(hcd->regs);
-		goto err;
-	}
-	hcd->rsrc_start = r->start;
-	hcd->rsrc_len = resource_size(r);
-
-	/* initialize "struct pxa27x_ohci" */
-	pxa_ohci = to_pxa27x_ohci(hcd);
-	pxa_ohci->clk = usb_clk;
-	pxa_ohci->mmio_base = (void __iomem *)hcd->regs;
-
-	for (i = 0; i < 3; ++i) {
-		char name[6];
-
-		if (!(inf->flags & (ENABLE_PORT1 << i)))
-			continue;
-
-		sprintf(name, "vbus%u", i + 1);
-		pxa_ohci->vbus[i] = devm_regulator_get(&pdev->dev, name);
-	}
-
-	retval = pxa27x_start_hc(pxa_ohci, &pdev->dev);
-	if (retval < 0) {
-		pr_debug("pxa27x_start_hc failed");
-		goto err;
-	}
-
-	/* Select Power Management Mode */
-	pxa27x_ohci_select_pmm(pxa_ohci, inf->port_mode);
-
-	if (inf->power_budget)
-		hcd->power_budget = inf->power_budget;
-
-	/* The value of NDP in roothub_a is incorrect on this hardware */
-	ohci = hcd_to_ohci(hcd);
-	ohci->num_ports = 3;
-
-	retval = usb_add_hcd(hcd, irq, 0);
-	if (retval == 0) {
-		device_wakeup_enable(hcd->self.controller);
-		return retval;
-	}
-
-	pxa27x_stop_hc(pxa_ohci, &pdev->dev);
- err:
-	usb_put_hcd(hcd);
-	return retval;
-}
-
-
-/* may be called without controller electrically present */
-/* may be called with controller, bus, and devices active */
-
-/**
- * usb_hcd_pxa27x_remove - shutdown processing for pxa27x-based HCDs
- * @dev: USB Host Controller being removed
- * Context: !in_interrupt()
- *
- * Reverses the effect of usb_hcd_pxa27x_probe(), first invoking
- * the HCD's stop() method.  It is always called from a thread
- * context, normally "rmmod", "apmd", or something similar.
- *
- */
-void usb_hcd_pxa27x_remove (struct usb_hcd *hcd, struct platform_device *pdev)
-{
-	struct pxa27x_ohci *pxa_ohci = to_pxa27x_ohci(hcd);
-	unsigned int i;
-
-	usb_remove_hcd(hcd);
-	pxa27x_stop_hc(pxa_ohci, &pdev->dev);
-
-	for (i = 0; i < 3; ++i)
-		pxa27x_ohci_set_vbus_power(pxa_ohci, i, false);
-
-	usb_put_hcd(hcd);
-}
-
-/*-------------------------------------------------------------------------*/
-
-static int ohci_hcd_pxa27x_drv_probe(struct platform_device *pdev)
-{
-	pr_debug ("In ohci_hcd_pxa27x_drv_probe");
-
-	if (usb_disabled())
-		return -ENODEV;
-
-	return usb_hcd_pxa27x_probe(&ohci_pxa27x_hc_driver, pdev);
-}
-
-static int ohci_hcd_pxa27x_drv_remove(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-
-	usb_hcd_pxa27x_remove(hcd, pdev);
-	return 0;
-}
-
-#ifdef CONFIG_PM
-static int ohci_hcd_pxa27x_drv_suspend(struct device *dev)
-{
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-	struct pxa27x_ohci *pxa_ohci = to_pxa27x_ohci(hcd);
-	struct ohci_hcd *ohci = hcd_to_ohci(hcd);
-	bool do_wakeup = device_may_wakeup(dev);
-	int ret;
-
-
-	if (time_before(jiffies, ohci->next_statechange))
-		msleep(5);
-	ohci->next_statechange = jiffies;
-
-	ret = ohci_suspend(hcd, do_wakeup);
-	if (ret)
-		return ret;
-
-	pxa27x_stop_hc(pxa_ohci, dev);
-	return ret;
-}
-
-static int ohci_hcd_pxa27x_drv_resume(struct device *dev)
-{
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-	struct pxa27x_ohci *pxa_ohci = to_pxa27x_ohci(hcd);
-	struct pxaohci_platform_data *inf = dev_get_platdata(dev);
-	struct ohci_hcd *ohci = hcd_to_ohci(hcd);
-	int status;
-
-	if (time_before(jiffies, ohci->next_statechange))
-		msleep(5);
-	ohci->next_statechange = jiffies;
-
-	status = pxa27x_start_hc(pxa_ohci, dev);
-	if (status < 0)
-		return status;
-
-	/* Select Power Management Mode */
-	pxa27x_ohci_select_pmm(pxa_ohci, inf->port_mode);
-
-	ohci_resume(hcd, false);
-	return 0;
-}
-
-static const struct dev_pm_ops ohci_hcd_pxa27x_pm_ops = {
-	.suspend	= ohci_hcd_pxa27x_drv_suspend,
-	.resume		= ohci_hcd_pxa27x_drv_resume,
-};
-#endif
-
-static struct platform_driver ohci_hcd_pxa27x_driver = {
-	.probe		= ohci_hcd_pxa27x_drv_probe,
-	.remove		= ohci_hcd_pxa27x_drv_remove,
-	.shutdown	= usb_hcd_platform_shutdown,
-	.driver		= {
-		.name	= "pxa27x-ohci",
-		.of_match_table = of_match_ptr(pxa_ohci_dt_ids),
-#ifdef CONFIG_PM
-		.pm	= &ohci_hcd_pxa27x_pm_ops,
-#endif
-	},
-};
-
-static const struct ohci_driver_overrides pxa27x_overrides __initconst = {
-	.extra_priv_size =      sizeof(struct pxa27x_ohci),
-};
-
-static int __init ohci_pxa27x_init(void)
-{
-	if (usb_disabled())
-		return -ENODEV;
-
-	pr_info("%s: " DRIVER_DESC "\n", hcd_name);
-
-	ohci_init_driver(&ohci_pxa27x_hc_driver, &pxa27x_overrides);
-	ohci_pxa27x_hc_driver.hub_control = pxa27x_ohci_hub_control;
-
-	return platform_driver_register(&ohci_hcd_pxa27x_driver);
-}
-module_init(ohci_pxa27x_init);
-
-static void __exit ohci_pxa27x_cleanup(void)
-{
-	platform_driver_unregister(&ohci_hcd_pxa27x_driver);
-}
-module_exit(ohci_pxa27x_cleanup);
-
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:pxa27x-ohci");
+CRTC_TRIGB_POLARITY_STATUS_MASK 0x400
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_POLARITY_STATUS__SHIFT 0xa
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_OCCURRED_MASK 0x800
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_OCCURRED__SHIFT 0xb
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_RISING_EDGE_DETECT_CNTL_MASK 0x3000
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_RISING_EDGE_DETECT_CNTL__SHIFT 0xc
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_FALLING_EDGE_DETECT_CNTL_MASK 0x30000
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_FALLING_EDGE_DETECT_CNTL__SHIFT 0x10
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_FREQUENCY_SELECT_MASK 0x300000
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_FREQUENCY_SELECT__SHIFT 0x14
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_DELAY_MASK 0x1f000000
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_DELAY__SHIFT 0x18
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_CLEAR_MASK 0x80000000
+#define CRTC_TRIGB_CNTL__CRTC_TRIGB_CLEAR__SHIFT 0x1f
+#define CRTC_TRIGB_MANUAL_TRIG__CRTC_TRIGB_MANUAL_TRIG_MASK 0x1
+#define CRTC_TRIGB_MANUAL_TRIG__CRTC_TRIGB_MANUAL_TRIG__SHIFT 0x0
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_MODE_MASK 0x3
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_MODE__SHIFT 0x0
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_CHECK_MASK 0x10
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_CHECK__SHIFT 0x4
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_TRIG_SEL_MASK 0x100
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_TRIG_SEL__SHIFT 0x8
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_OCCURRED_MASK 0x10000
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_OCCURRED__SHIFT 0x10
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_CLEAR_MASK 0x1000000
+#define CRTC_FORCE_COUNT_NOW_CNTL__CRTC_FORCE_COUNT_NOW_CLEAR__SHIFT 0x18
+#define CRTC_FLOW_CONTROL__CRTC_FLOW_CONTROL_SOURCE_SELECT_MASK 0x1f
+#define CRTC_FLOW_CONTROL__CRTC_FLOW_CONTROL_SOURCE_SELECT__SHIFT 0x0
+#define CRTC_FLOW_CONTROL__CRTC_FLOW_CONTROL_POLARITY_MASK 0x100
+#define CRTC_FLOW_CONTROL__CRTC_FLOW_CONTROL_POLARITY__SHIFT 0x8
+#define CRTC_FLOW_CONTROL__CRTC_FLOW_CONTROL_GRANULARITY_MASK 0x10000
+#define CRTC_FLOW_CONTROL__CRTC_FLOW_CONTROL_GRANULARITY__SHIFT 0x10
+#define CRTC_FLOW_CONTROL__CRTC_FLOW_CONTROL_INPUT_STATUS_MASK 0x1000000
+#define CRTC_FLOW_CONTROL__CRTC_FLOW_CONTROL_INPUT_STATUS__SHIFT 0x18
+#define CRTC_STEREO_FORCE_NEXT_EYE__CRTC_STEREO_FORCE_NEXT_EYE_MASK 0x3
+#define CRTC_STEREO_FORCE_NEXT_EYE__CRTC_STEREO_FORCE_NEXT_EYE__SHIFT 0x0
+#define CRTC_STEREO_FORCE_NEXT_EYE__CRTC_AVSYNC_FRAME_COUNTER_MASK 0xff00
+#define CRTC_STEREO_FORCE_NEXT_EYE__CRTC_AVSYNC_FRAME_COUNTER__SHIFT 0x8
+#define CRTC_STEREO_FORCE_NEXT_EYE__CRTC_AVSYNC_LINE_COUNTER_MASK 0x1fff0000
+#define CRTC_STEREO_FORCE_NEXT_EYE__CRTC_AVSYNC_LINE_COUNTER__SHIFT 0x10
+#define CRTC_AVSYNC_COUNTER__CRTC_AVSYNC_COUNTER_MASK 0xffffffff
+#define CRTC_AVSYNC_COUNTER__CRTC_AVSYNC_COUNTER__SHIFT 0x0
+#define CRTC_CONTROL__CRTC_MASTER_EN_MASK 0x1
+#define CRTC_CONTROL__CRTC_MASTER_EN__SHIFT 0x0
+#define CRTC_CONTROL__CRTC_SYNC_RESET_SEL_MASK 0x10
+#define CRTC_CONTROL__CRTC_SYNC_RESET_SEL__SHIFT 0x4
+#define CRTC_CONTROL__CRTC_DISABLE_POINT_CNTL_MASK 0x300
+#define CRTC_CONTROL__CRTC_DISABLE_POINT_CNTL__SHIFT 0x8
+#define CRTC_CONTROL__CRTC_START_POINT_CNTL_MASK 0x1000
+#define CRTC_CONTROL__CRTC_START_POINT_CNTL__SHIFT 0xc
+#define CRTC_CONTROL__CRTC_FIELD_NUMBER_CNTL_MASK 0x2000
+#define CRTC_CONTROL__CRTC_FIELD_NUMBER_CNTL__SHIFT 0xd
+#define CRTC_CONTROL__CRTC_FIELD_NUMBER_POLARITY_MASK 0x4000
+#define CRTC_CONTROL__CRTC_FIELD_NUMBER_POLARITY__SHIFT 0xe
+#define CRTC_CONTROL__CRTC_CURRENT_MASTER_EN_STATE_MASK 0x10000
+#define CRTC_CONTROL__CRTC_CURRENT_MASTER_EN_STATE__SHIFT 0x10
+#define CRTC_CONTROL__CRTC_HBLANK_EARLY_CONTROL_MASK 0x700000
+#define CRTC_CONTROL__CRTC_HBLANK_EARLY_CONTROL__SHIFT 0x14
+#define CRTC_CONTROL__CRTC_DISP_READ_REQUEST_DISABLE_MASK 0x1000000
+#define CRTC_CONTROL__CRTC_DISP_READ_REQUEST_DISABLE__SHIFT 0x18
+#define CRTC_CONTROL__CRTC_SOF_PULL_EN_MASK 0x20000000
+#define CRTC_CONTROL__CRTC_SOF_PULL_EN__SHIFT 0x1d
+#define CRTC_CONTROL__CRTC_AVSYNC_LOCK_SNAPSHOT_MASK 0x40000000
+#define CRTC_CONTROL__CRTC_AVSYNC_LOCK_SNAPSHOT__SHIFT 0x1e
+#define CRTC_CONTROL__CRTC_AVSYNC_VSYNC_N_HSYNC_MODE_MASK 0x80000000
+#define CRTC_CONTROL__CRTC_AVSYNC_VSYNC_N_HSYNC_MODE__SHIFT 0x1f
+#define CRTC_BLANK_CONTROL__CRTC_CURRENT_BLANK_STATE_MASK 0x1
+#define CRTC_BLANK_CONTROL__CRTC_CURRENT_BLANK_STATE__SHIFT 0x0
+#define CRTC_BLANK_CONTROL__CRTC_BLANK_DATA_EN_MASK 0x100
+#define CRTC_BLANK_CONTROL__CRTC_BLANK_DATA_EN__SHIFT 0x8
+#define CRTC_BLANK_CONTROL__CRTC_BLANK_DE_MODE_MASK 0x10000
+#define CRTC_BLANK_CONTROL__CRTC_BLANK_DE_MODE__SHIFT 0x10
+#define CRTC_INTERLACE_CONTROL__CRTC_INTERLACE_ENABLE_MASK 0x1
+#define CRTC_INTERLACE_CONTROL__CRTC_INTERLACE_ENABLE__SHIFT 0x0
+#define CRTC_INTERLACE_CONTROL__CRTC_INTERLACE_FORCE_NEXT_FIELD_MASK 0x30000
+#define CRTC_INTERLACE_CONTROL__CRTC_INTERLACE_FORCE_NEXT_FIELD__SHIFT 0x10
+#define CRTC_INTERLACE_STATUS__CRTC_INTERLACE_CURRENT_FIELD_MASK 0x1
+#define CRTC_INTERLACE_STATUS__CRTC_INTERLACE_CURRENT_FIELD__SHIFT 0x0
+#define CRTC_INTERLACE_STATUS__CRTC_INTERLACE_NEXT_FIELD_MASK 0x2
+#define CRTC_INTERLACE_STATUS__CRTC_INTERLACE_NEXT_FIELD__SHIFT 0x1
+#define CRTC_FIELD_INDICATION_CONTROL__CRTC_FIELD_INDICATION_OUTPUT_POLARITY_MASK 0x1
+#define CRTC_FIELD_INDICATION_CONTROL__CRTC_FIELD_INDICATION_OUTPUT_POLARITY__SHIFT 0x0
+#define CRTC_FIELD_INDICATION_CONTROL__CRTC_FIELD_ALIGNMENT_MASK 0x2
+#define CRTC_FIELD_INDICATION_CONTROL__CRTC_FIELD_ALIGNMENT__SHIFT 0x1
+#define CRTC_PIXEL_DATA_READBACK0__CRTC_PIXEL_DATA_BLUE_CB_MASK 0xfff
+#define CRTC_PIXEL_DATA_READBACK0__CRTC_PIXEL_DATA_BLUE_CB__SHIFT 0x0
+#define CRTC_PIXEL_DATA_READBACK0__CRTC_PIXEL_DATA_GREEN_Y_MASK 0xfff0000
+#define CRTC_PIXEL_DATA_READBACK0__CRTC_PIXEL_DATA_GREEN_Y__SHIFT 0x10
+#define CRTC_PIXEL_DATA_READBACK1__CRTC_PIXEL_DATA_RED_CR_MASK 0xfff
+#define CRTC_PIXEL_DATA_READBACK1__CRTC_PIXEL_DATA_RED_CR__SHIFT 0x0
+#define CRTC_STATUS__CRTC_V_BLANK_MASK 0x1
+#define CRTC_STATUS__CRTC_V_BLANK__SHIFT 0x0
+#define CRTC_STATUS__CRTC_V_ACTIVE_DISP_MASK 0x2
+#define CRTC_STATUS__CRTC_V_ACTIVE_DISP__SHIFT 0x1
+#define CRTC_STATUS__CRTC_V_SYNC_A_MASK 0x4
+#define CRTC_STATUS__CRTC_V_SYNC_A__SHIFT 0x2
+#define CRTC_STATUS__CRTC_V_UPDATE_MASK 0x8
+#define CRTC_STATUS__CRTC_V_UPDATE__SHIFT 0x3
+#define CRTC_STATUS__CRTC_V_START_LINE_MASK 0x10
+#define CRTC_STATUS__CRTC_V_START_LINE__SHIFT 0x4
+#define CRTC_STATUS__CRTC_V_BLANK_3D_STRUCTURE_MASK 0x20
+#define CRTC_STATUS__CRTC_V_BLANK_3D_STRUCTURE__SHIFT 0x5
+#define CRTC_STATUS__CRTC_H_BLANK_MASK 0x10000
+#define CRTC_STATUS__CRTC_H_BLANK__SHIFT 0x10
+#define CRTC_STATUS__CRTC_H_ACTIVE_DISP_MASK 0x20000
+#define CRTC_STATUS__CRTC_H_ACTIVE_DISP__SHIFT 0x11
+#define CRTC_STATUS__CRTC_H_SYNC_A_MASK 0x40000
+#define CRTC_STATUS__CRTC_H_SYNC_A__SHIFT 0x12
+#define CRTC_STATUS_POSITION__CRTC_VERT_COUNT_MASK 0x3fff
+#define CRTC_STATUS_POSITION__CRTC_VERT_COUNT__SHIFT 0x0
+#define CRTC_STATUS_POSITION__CRTC_HORZ_COUNT_MASK 0x3fff0000
+#define CRTC_STATUS_POSITION__CRTC_HORZ_COUNT__SHIFT 0x10
+#define CRTC_NOM_VERT_POSITION__CRTC_VERT_COUNT_NOM_MASK 0x3fff
+#define CRTC_NOM_VERT_POSITION__CRTC_VERT_COUNT_NOM__SHIFT 0x0
+#define CRTC_STATUS_FRAME_COUNT__CRTC_FRAME_COUNT_MASK 0xffffff
+#define CRTC_STATUS_FRAME_COUNT__CRTC_FRAME_COUNT__SHIFT 0x0
+#define CRTC_STATUS_VF_COUNT__CRTC_VF_COUNT_MASK 0x3fffffff
+#define CRTC_STATUS_VF_COUNT__CRTC_VF_COUNT__SHIFT 0x0
+#define CRTC_STATUS_HV_COUNT__CRTC_HV_COUNT_MASK 0x3fffffff
+#define CRTC_STATUS_HV_COUNT__CRTC_HV_COUNT__SHIFT 0x0
+#define CRTC_COUNT_CONTROL__CRTC_HORZ_COUNT_BY2_EN_MASK 0x1
+#define CRTC_COUNT_CONTROL__CRTC_HORZ_COUNT_BY2_EN__SHIFT 0x0
+#define CRTC_COUNT_CONTROL__CRTC_HORZ_REPETITION_COUNT_MASK 0x1e
+#define CRTC_COUNT_CONTROL__CRTC_HORZ_REPETITION_COUNT__SHIFT 0x1
+#define CRTC_COUNT_RESET__CRTC_RESET_FRAME_COUNT_MASK 0x1
+#define CRTC_COUNT_RESET__CRTC_RESET_FRAME_COUNT__SHIFT 0x0
+#define CRTC_MANUAL_FORCE_VSYNC_NEXT_LINE__CRTC_MANUAL_FORCE_VSYNC_NEXT_LINE_MASK 0x1
+#define CRTC_MANUAL_FORCE_VSYNC_NEXT_LINE__CRTC_MANUAL_FORCE_VSYNC_NEXT_LINE__SHIFT 0x0
+#define CRTC_VERT_SYNC_CONTROL__CRTC_FORCE_VSYNC_NEXT_LINE_OCCURRED_MASK 0x1
+#define CRTC_VERT_SYNC_CONTROL__CRTC_FORCE_VSYNC_NEXT_LINE_OCCURRED__SHIFT 0x0
+#define CRTC_VERT_SYNC_CONTROL__CRTC_FORCE_VSYNC_NEXT_LINE_CLEAR_MASK 0x100
+#define CRTC_VERT_SYNC_CONTROL__CRTC_FORCE_VSYNC_NEXT_LINE_CLEAR__SHIFT 0x8
+#define CRTC_VERT_SYNC_CONTROL__CRTC_AUTO_FORCE_VSYNC_MODE_MASK 0x30000
+#define CRTC_VERT_SYNC_CONTROL__CRTC_AUTO_FORCE_VSYNC_MODE__SHIFT 0x10
+#define CRTC_STEREO_STATUS__CRTC_STEREO_CURRENT_EYE_MASK 0x1
+#define CRTC_STEREO_STATUS__CRTC_STEREO_CURRENT_EYE__SHIFT 0x0
+#define CRTC_STEREO_STATUS__CRTC_STEREO_SYNC_OUTPUT_MASK 0x100
+#define CRTC_STEREO_STATUS__CRTC_STEREO_SYNC_OUTPUT__SHIFT 0x8
+#define CRTC_STEREO_STATUS__CRTC_STEREO_SYNC_SELECT_MASK 0x10000
+#define CRTC_STEREO_STATUS__CRTC_STEREO_SYNC_SELECT__SHIFT 0x10
+#define CRTC_STEREO_STATUS__CRTC_STEREO_EYE_FLAG_MASK 0x100000
+#define CRTC_STEREO_STATUS__CRTC_STEREO_EYE_FLAG__SHIFT 0x14
+#define CRTC_STEREO_STATUS__CRTC_STEREO_FORCE_NEXT_EYE_PENDING_MASK 0x3000000
+#define CRTC_STEREO_STATUS__CRTC_STEREO_FORCE_NEXT_EYE_PENDING__SHIFT 0x18
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_SYNC_OUTPUT_LINE_NUM_MASK 0x3fff
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_SYNC_OUTPUT_LINE_NUM__SHIFT 0x0
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_SYNC_OUTPUT_POLARITY_MASK 0x8000
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_SYNC_OUTPUT_POLARITY__SHIFT 0xf
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_SYNC_SELECT_POLARITY_MASK 0x10000
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_SYNC_SELECT_POLARITY__SHIFT 0x10
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_EYE_FLAG_POLARITY_MASK 0x20000
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_EYE_FLAG_POLARITY__SHIFT 0x11
+#define CRTC_STEREO_CONTROL__CRTC_DISABLE_STEREOSYNC_OUTPUT_FOR_DP_MASK 0x40000
+#define CRTC_STEREO_CONTROL__CRTC_DISABLE_STEREOSYNC_OUTPUT_FOR_DP__SHIFT 0x12
+#define CRTC_STEREO_CONTROL__CRTC_DISABLE_FIELD_NUM_MASK 0x80000
+#define CRTC_STEREO_CONTROL__CRTC_DISABLE_FIELD_NUM__SHIFT 0x13
+#define CRTC_STEREO_CONTROL__CRTC_DISABLE_V_BLANK_FOR_DP_FIX_MASK 0x100000
+#define CRTC_STEREO_CONTROL__CRTC_DISABLE_V_BLANK_FOR_DP_FIX__SHIFT 0x14
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_EN_MASK 0x1000000
+#define CRTC_STEREO_CONTROL__CRTC_STEREO_EN__SHIFT 0x18
+#define CRTC_SNAPSHOT_STATUS__CRTC_SNAPSHOT_OCCURRED_MASK 0x1
+#define CRTC_SNAPSHOT_STATUS__CRTC_SNAPSHOT_OCCURRED__SHIFT 0x0
+#define CRTC_SNAPSHOT_STATUS__CRTC_SNAPSHOT_CLEAR_MASK 0x2
+#define CRTC_SNAPSHOT_STATUS__CRTC_SNAPSHOT_CLEAR__SHIFT 0x1
+#define CRTC_SNAPSHOT_STATUS__CRTC_SNAPSHOT_MANUAL_TRIGGER_MASK 0x4
+#define CRTC_SNAPSHOT_STATUS__CRTC_SNAPSHOT_MANUAL_TRIGGER__SHIFT 0x2
+#define CRTC_SNAPSHOT_CONTROL__CRTC_AUTO_SNAPSHOT_TRIG_SEL_MASK 0x3
+#define CRTC_SNAPSHOT_CONTROL__CRTC_AUTO_SNAPSHOT_TRIG_SEL__SHIFT 0x0
+#define CRTC_SNAPSHOT_POSITION__CRTC_SNAPSHOT_VERT_COUNT_MASK 0x3fff
+#define CRTC_SNAPSHOT_POSITION__CRTC_SNAPSHOT_VERT_COUNT__SHIFT 0x0
+#define CRTC_SNAPSHOT_POSITION__CRTC_SNAPSHOT_HORZ_COUNT_MASK 0x3fff0000
+#define CRTC_SNAPSHOT_POSITION__CRTC_SNAPSHOT_HORZ_COUNT__SHIFT 0x10
+#define CRTC_SNAPSHOT_FRAME__CRTC_SNAPSHOT_FRAME_COUNT_MASK 0xffffff
+#define CRTC_SNAPSHOT_FRAME__CRTC_SNAPSHOT_FRAME_COUNT__SHIFT 0x0
+#define CRTC_START_LINE_CONTROL__CRTC_PROGRESSIVE_START_LINE_EARLY_MASK 0x1
+#define CRTC_START_LINE_CONTROL__CRTC_PROGRESSIVE_START_LINE_EARLY__SHIFT 0x0
+#define CRTC_START_LINE_CONTROL__CRTC_INTERLACE_START_LINE_EARLY_MASK 0x100
+#define CRTC_START_LINE_CONTROL__CRTC_INTERLACE_START_LINE_EARLY__SHIFT 0x8
+#define CRTC_START_LINE_CONTROL__CRTC_ADVANCED_START_LINE_POSITION_MASK 0xff000
+#define CRTC_START_LINE_CONTROL__CRTC_ADVANCED_START_LINE_POSITION__SHIFT 0xc
+#define CRTC_START_LINE_CONTROL__CRTC_LEGACY_REQUESTOR_EN_MASK 0x100000
+#define CRTC_START_LINE_CONTROL__CRTC_LEGACY_REQUESTOR_EN__SHIFT 0x14
+#define CRTC_START_LINE_CONTROL__CRTC_PREFETCH_EN_MASK 0x10000000
+#define CRTC_START_LINE_CONTROL__CRTC_PREFETCH_EN__SHIFT 0x1c
+#define CRTC_INTERRUPT_CONTROL__CRTC_SNAPSHOT_INT_MSK_MASK 0x1
+#define CRTC_INTERRUPT_CONTROL__CRTC_SNAPSHOT_INT_MSK__SHIFT 0x0
+#define CRTC_INTERRUPT_CONTROL__CRTC_SNAPSHOT_INT_TYPE_MASK 0x2
+#define CRTC_INTERRUPT_CONTROL__CRTC_SNAPSHOT_INT_TYPE__SHIFT 0x1
+#define CRTC_INTERRUPT_CONTROL__CRTC_V_UPDATE_INT_MSK_MASK 0x10
+#define CRTC_INTERRUPT_CONTROL__CRTC_V_UPDATE_INT_MSK__SHIFT 0x4
+#define CRTC_INTERRUPT_CONTROL__CRTC_V_UPDATE_INT_TYPE_MASK 0x20
+#define CRTC_INTERRUPT_CONTROL__CRTC_V_UPDATE_INT_TYPE__SHIFT 0x5
+#define CRTC_INTERRUPT_CONTROL__CRTC_FORCE_COUNT_NOW_INT_MSK_MASK 0x100
+#define CRTC_INTERRUPT_CONTROL__CRTC_FORCE_COUNT_NOW_INT_MSK__SHIFT 0x8
+#define CRTC_INTERRUPT_CONTROL__CRTC_FORCE_COUNT_NOW_INT_TYPE_MASK 0x200
+#define CRTC_INTERRUPT_CONTROL__CRTC_FORCE_COUNT_NOW_INT_TYPE__SHIFT 0x9
+#define CRTC_INTERRUPT_CONTROL__CRTC_FORCE_VSYNC_NEXT_LINE_INT_MSK_MASK 0x10000
+#define CRTC_INTERRUPT_CONTROL__CRTC_FORCE_VSYNC_NEXT_LINE_INT_MSK__SHIFT 0x10
+#define CRTC_INTERRUPT_CONTROL__CRTC_FORCE_VSYNC_NEXT_LINE_INT_TYPE_MASK 0x20000
+#define CRTC_INTERRUPT_CONTROL__CRTC_FORCE_VSYNC_NEXT_LINE_INT_TYPE__SHIFT 0x11
+#define CRTC_INTERRUPT_CONTROL__CRTC_TRIGA_INT_MSK_MASK 0x1000000
+#define CRTC_INTERRUPT_CONTROL__CRTC_TRIGA_INT_MSK__SHIFT 0x18
+#define CRTC_INTERRUPT_CONTROL__CRTC_TRIGB_INT_MSK_MASK 0x2000000
+#define CRTC_INTERRUPT_CONTROL__CRTC_TRIGB_INT_MSK__SHIFT 0x19
+#define CRTC_INTERRUPT_CONTROL__CRTC_TRIGA_INT_TYPE_MASK 0x4000000
+#define CRTC_INTERRUPT_CONTROL__CRTC_TRIGA_INT_TYPE__SHIFT 0x1a
+#define CRTC_INTERRUPT_CONTROL__CRTC_TRIGB_INT_TYPE_MASK 0x8000000
+#define CRTC_INTERRUPT_CONTROL__CRTC_TRIGB_INT_TYPE__SHIFT 0x1b
+#define CRTC_INTERRUPT_CONTROL__CRTC_VSYNC_NOM_INT_MSK_MASK 0x10000000
+#define CRTC_INTERRUPT_CONTROL__CRTC_VSYNC_NOM_INT_MSK__SHIFT 0x1c
+#define CRTC_INTERRUPT_CONTROL__CRTC_VSYNC_NOM_INT_TYPE_MASK 0x20000000
+#define CRTC_INTERRUPT_CONTROL__CRTC_VSYNC_NOM_INT_TYPE__SHIFT 0x1d
+#define CRTC_INTERRUPT_CONTROL__CRTC_GSL_VSYNC_GAP_INT_MSK_MASK 0x40000000
+#define CRTC_INTERRUPT_CONTROL__CRTC_GSL_VSYNC_GAP_INT_MSK__SHIFT 0x1e
+#define CRTC_INTERRUPT_CONTROL__CRTC_GSL_VSYNC_GAP_INT_TYPE_MASK 0x80000000
+#define CRTC_INTERRUPT_CONTROL__CRTC_GSL_VSYNC_GAP_INT_TYPE__SHIFT 0x1f
+#define CRTC_UPDATE_LOCK__CRTC_UPDATE_LOCK_MASK 0x1
+#define CRTC_UPDATE_LOCK__CRTC_UPDATE_LOCK__SHIFT 0x0
+#define CRTC_DOUBLE_BUFFER_CONTROL__CRTC_UPDATE_PENDING_MASK 0x1
+#define CRTC_DOUBLE_BUFFER_CONTROL__CRTC_UPDATE_PENDING__SHIFT 0x0
+#define CRTC_DOUBLE_BUFFER_CONTROL__CRTC_UPDATE_INSTANTLY_MASK 0x100
+#define CRTC_DOUBLE_BUFFER_CONTROL__CRTC_UPDATE_INSTANTLY__SHIFT 0x8
+#define CRTC_DOUBLE_BUFFER_CONTROL__CRTC_BLANK_DATA_DOUBLE_BUFFER_EN_MASK 0x10000
+#define CRTC_DOUBLE_BUFFER_CONTROL__CRTC_BLANK_DATA_DOUBLE_BUFFER_EN__SHIFT 0x10
+#define CRTC_VGA_PARAMETER_CAPTURE_MODE__CRTC_VGA_PARAMETER_CAPTURE_MODE_MASK 0x1
+#define CRTC_VGA_PARAMETER_CAPTURE_MODE__CRTC_VGA_PARAMETER_CAPTURE_MODE__SHIFT 0x0
+#define CRTC_TEST_PATTERN_CONTROL__CRTC_TEST_PATTERN_EN_MASK 0x1
+#define CRTC_TEST_PATTERN_CONTROL__CRTC_TEST_PATTERN_EN__SHIFT 0x0
+#define CRTC_TEST_PATTERN_CONTROL__CRTC_TEST_PATTERN_MODE_MASK 0x700
+#define CRTC_TEST_PATTERN_CONTROL__CRTC_TEST_PATTERN_MODE__SHIFT 0x8
+#define CRTC_TEST_PATTERN_CONTROL__CRTC_TEST_PATTERN_DYNAMIC_RANGE_MASK 0x10000
+#define CRTC_TEST_PATTERN_CONTROL__CRTC_TEST_PATTERN_DYNAMIC_RANGE__SHIFT 0x10
+#define CRTC_TEST_PATTERN_CONTROL__CRTC_TEST_PATTERN_COLOR_FORMAT_MASK 0xff000000
+#define CRTC_TEST_PATTERN_CONTROL__CRTC_TEST_PATTERN_COLOR_FORMAT__SHIFT 0x18
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_INC0_MASK 0xf
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_INC0__SHIFT 0x0
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_INC1_MASK 0xf0
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_INC1__SHIFT 0x4
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_VRES_MASK 0xf00
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_VRES__SHIFT 0x8
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_HRES_MASK 0xf000
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_HRES__SHIFT 0xc
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_RAMP0_OFFSET_MASK 0xffff0000
+#define CRTC_TEST_PATTERN_PARAMETERS__CRTC_TEST_PATTERN_RAMP0_OFFSET__SHIFT 0x10
+#define CRTC_TEST_PATTERN_COLOR__CRTC_TEST_PATTERN_DATA_MASK 0xffff
+#define CRTC_TEST_PATTERN_COLOR__CRTC_TEST_PATTERN_DATA__SHIFT 0x0
+#define CRTC_TEST_PATTERN_COLOR__CRTC_TEST_PATTERN_MASK_MASK 0x3f0000
+#define CRTC_TEST_PATTERN_COLOR__CRTC_TEST_PATTERN_MASK__SHIFT 0x10
+#define MASTER_UPDATE_LOCK__MASTER_UPDATE_LOCK_MASK 0x1
+#define MASTER_UPDATE_LOCK__MASTER_UPDATE_LOCK__SHIFT 0x0
+#define MASTER_UPDATE_LOCK__GSL_CONTROL_MASTER_UPDATE_LOCK_MASK 0x100
+#define MASTER_UPDATE_LOCK__GSL_CONTROL_MASTER_UPDATE_LOCK__SHIFT 0x8
+#define MASTER_UPDATE_MODE__MASTER_UPDATE_MODE_MASK 0x7
+#define MASTER_UPDATE_MODE__MASTER_UPDATE_MODE__SHIFT 0x0
+#define MASTER_UPDATE_MODE__MASTER_UPDATE_INTERLACED_MODE_MASK 0x30000
+#define MASTER_UPDATE_MODE__MASTER_UPDATE_INTERLACED_MODE__SHIFT 0x10
+#define CRTC_MVP_INBAND_CNTL_INSERT__CRTC_MVP_INBAND_OUT_MODE_MASK 0x3
+#define CRTC_MVP_INBAND_CNTL_INSERT__CRTC_MVP_INBAND_OUT_MODE__SHIFT 0x0
+#define CRTC_MVP_INBAND_CNTL_INSERT__CRTC_MVP_INBAND_CNTL_CHAR_INSERT_MASK 0xffffff00
+#define CRTC_MVP_INBAND_CNTL_INSERT__CRTC_MVP_INBAND_CNTL_CHAR_INSERT__SHIFT 0x8
+#define CRTC_MVP_INBAND_CNTL_INSERT_TIMER__CRTC_MVP_INBAND_CNTL_CHAR_INSERT_TIMER_MASK 0xff
+#define CRTC_MVP_INBAND_CNTL_INSERT_TIMER__CRTC_MVP_INBAND_CNTL_CHAR_INSERT_TIMER__SHIFT 0x0
+#define CRTC_MVP_STATUS__CRTC_FLIP_NOW_OCCURRED_MASK 0x1
+#define CRTC_MVP_STATUS__CRTC_FLIP_NOW_OCCURRED__SHIFT 0x0
+#define CRTC_MVP_STATUS__CRTC_AFR_HSYNC_SWIT

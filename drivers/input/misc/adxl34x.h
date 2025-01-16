@@ -1,30 +1,36 @@
-/*
- * ADXL345/346 Three-Axis Digital Accelerometers (I2C/SPI Interface)
- *
- * Enter bugs at http://blackfin.uclinux.org/
- *
- * Copyright (C) 2009 Michael Hennerich, Analog Devices Inc.
- * Licensed under the GPL-2 or later.
+srp_conn_unique() - check whether the connection to a target is unique
+ * @host:   SRP host.
+ * @target: SRP target port.
  */
+static bool srp_conn_unique(struct srp_host *host,
+			    struct srp_target_port *target)
+{
+	struct srp_target_port *t;
+	bool ret = false;
 
-#ifndef _ADXL34X_H_
-#define _ADXL34X_H_
+	if (target->state == SRP_TARGET_REMOVED)
+		goto out;
 
-struct device;
-struct adxl34x;
+	ret = true;
 
-struct adxl34x_bus_ops {
-	u16 bustype;
-	int (*read)(struct device *, unsigned char);
-	int (*read_block)(struct device *, unsigned char, int, void *);
-	int (*write)(struct device *, unsigned char, unsigned char);
-};
+	spin_lock(&host->target_lock);
+	list_for_each_entry(t, &host->target_list, list) {
+		if (t != target &&
+		    target->id_ext == t->id_ext &&
+		    target->ioc_guid == t->ioc_guid &&
+		    target->initiator_ext == t->initiator_ext) {
+			ret = false;
+			break;
+		}
+	}
+	spin_unlock(&host->target_lock);
 
-void adxl34x_suspend(struct adxl34x *ac);
-void adxl34x_resume(struct adxl34x *ac);
-struct adxl34x *adxl34x_probe(struct device *dev, int irq,
-			      bool fifo_delay_default,
-			      const struct adxl34x_bus_ops *bops);
-int adxl34x_remove(struct adxl34x *ac);
+out:
+	return ret;
+}
 
-#endif
+/*
+ * Target ports are added by writing
+ *
+ *     id_ext=<SRP ID ext>,ioc_guid=<SRP IOC GUID>,dgid=<dest GID>,
+ *     pkey=<P_Key

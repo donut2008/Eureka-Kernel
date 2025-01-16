@@ -1,25 +1,29 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2015, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
+be freed using either vmw_apply_relocations() or
+ * vmw_free_relocations(). The latter needs to be freed using
+ * vmw_clear_validations.
  */
-#include <linux/module.h>
+static int vmw_translate_guest_ptr(struct vmw_private *dev_priv,
+				   struct vmw_sw_context *sw_context,
+				   SVGAGuestPtr *ptr,
+				   struct vmw_dma_buffer **vmw_bo_p)
+{
+	struct vmw_dma_buffer *vmw_bo = NULL;
+	uint32_t handle = ptr->gmrId;
+	struct vmw_relocation *reloc;
+	int ret;
 
-/* sparse doesn't like tracepoint macros */
-#ifndef __CHECKER__
-#define CREATE_TRACE_POINTS
-#include "mei-trace.h"
+	ret = vmw_user_dmabuf_lookup(sw_context->fp->tfile, handle, &vmw_bo,
+				     NULL);
+	if (unlikely(ret != 0)) {
+		DRM_ERROR("Could not find or use GMR region.\n");
+		ret = -EINVAL;
+		goto out_no_reloc;
+	}
 
-EXPORT_TRACEPOINT_SYMBOL(mei_reg_read);
-EXPORT_TRACEPOINT_SYMBOL(mei_reg_write);
-#endif /* __CHECKER__ */
+	if (unlikely(sw_context->cur_reloc >= VMWGFX_MAX_RELOCATIONS)) {
+		DRM_ERROR("Max number relocations per submission"
+			  " exceeded\n");
+		ret = -EINVAL;
+		goto out_no_reloc;
+	}
+

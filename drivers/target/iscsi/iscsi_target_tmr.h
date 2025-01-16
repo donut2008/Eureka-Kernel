@@ -1,14 +1,8 @@
-#ifndef ISCSI_TARGET_TMR_H
-#define ISCSI_TARGET_TMR_H
-
-extern u8 iscsit_tmr_abort_task(struct iscsi_cmd *, unsigned char *);
-extern int iscsit_tmr_task_warm_reset(struct iscsi_conn *, struct iscsi_tmr_req *,
-			unsigned char *);
-extern int iscsit_tmr_task_cold_reset(struct iscsi_conn *, struct iscsi_tmr_req *,
-			unsigned char *);
-extern u8 iscsit_tmr_task_reassign(struct iscsi_cmd *, unsigned char *);
-extern int iscsit_tmr_post_handler(struct iscsi_cmd *, struct iscsi_conn *);
-extern int iscsit_check_task_reassign_expdatasn(struct iscsi_tmr_req *,
-			struct iscsi_conn *);
-
-#endif /* ISCSI_TARGET_TMR_H */
+mDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED10                             0x490a
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED10                             0x492a
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED10                             0x494a
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED10                             0x496a
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED10                             0x498a
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED10                             0x49ca
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED10                             0x49ea
+#define mmUNI

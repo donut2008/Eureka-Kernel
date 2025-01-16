@@ -1,44 +1,22 @@
-/* Unusual Devices File for SanDisk SDDR-55 SmartMedia reader
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if defined(CONFIG_USB_STORAGE_SDDR55) || \
-		defined(CONFIG_USB_STORAGE_SDDR55_MODULE)
-
-/* Contributed by Peter Waechtler */
-UNUSUAL_DEV( 0x07c4, 0xa103, 0x0000, 0x9999,
-		"Datafab",
-		"MDSM-B reader",
-		USB_SC_SCSI, USB_PR_SDDR55, NULL,
-		US_FL_FIX_INQUIRY),
-
-/* SM part - aeb <Andries.Brouwer@cwi.nl> */
-UNUSUAL_DEV(  0x07c4, 0xa109, 0x0000, 0xffff,
-		"Datafab Systems, Inc.",
-		"USB to CF + SM Combo (LC1)",
-		USB_SC_SCSI, USB_PR_SDDR55, NULL, 0),
-
-UNUSUAL_DEV( 0x0c0b, 0xa109, 0x0000, 0xffff,
-		"Acomdata",
-		"SM",
-		USB_SC_SCSI, USB_PR_SDDR55, NULL, 0),
-
-UNUSUAL_DEV(  0x55aa, 0xa103, 0x0000, 0x9999,
-		"Sandisk",
-		"ImageMate SDDR55",
-		USB_SC_SCSI, USB_PR_SDDR55, NULL, 0),
-
-#endif /* defined(CONFIG_USB_STORAGE_SDDR55) || ... */
+INK_WIDTH_CNTL__LC_WAIT_FOR_L_IDLE_IN_R_IDLE__SHIFT 0x1a
+#define D2F1_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_NON_EI_ON_RXL0S_EXIT_MASK 0x8000000
+#define D2F1_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_NON_EI_ON_RXL0S_EXIT__SHIFT 0x1b
+#define D2F1_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE_MASK 0x10000000
+#define D2F1_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE__SHIFT 0x1c
+#define D2F1_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI_MASK 0x20000000
+#define D2F1_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI__SHIFT 0x1d
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_MASK 0xff
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS__SHIFT 0x0
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_OVERRIDE_EN_MASK 0x100
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_OVERRIDE_EN__SHIFT 0x8
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_XMIT_FTS_BEFORE_RECOVERY_MASK 0x200
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_XMIT_FTS_BEFORE_RECOVERY__SHIFT 0x9
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_LIMIT_MASK 0xff0000
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_LIMIT__SHIFT 0x10
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_N_FTS_MASK 0xff000000
+#define D2F1_PCIE_LC_N_FTS_CNTL__LC_N_FTS__SHIFT 0x18
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_GEN2_EN_STRAP_MASK 0x1
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_GEN2_EN_STRAP__SHIFT 0x0
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_GEN3_EN_STRAP_MASK 0x2
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_GEN3_EN_STRAP__SHIFT 0x1
+#define D2F1_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPE

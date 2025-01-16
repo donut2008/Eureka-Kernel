@@ -1,201 +1,100 @@
-/*
- * Cirrus Logic CLPS711X Keypad driver
- *
- * Copyright (C) 2014 Alexander Shiyan <shc_work@mail.ru>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- */
-
-#include <linux/input.h>
-#include <linux/input-polldev.h>
-#include <linux/module.h>
-#include <linux/of_gpio.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
-#include <linux/sched.h>
-#include <linux/input/matrix_keypad.h>
-#include <linux/mfd/syscon.h>
-#include <linux/mfd/syscon/clps711x.h>
-
-#define CLPS711X_KEYPAD_COL_COUNT	8
-
-struct clps711x_gpio_data {
-	struct gpio_desc *desc;
-	DECLARE_BITMAP(last_state, CLPS711X_KEYPAD_COL_COUNT);
-};
-
-struct clps711x_keypad_data {
-	struct regmap			*syscon;
-	int				row_count;
-	unsigned int			row_shift;
-	struct clps711x_gpio_data	*gpio_data;
-};
-
-static void clps711x_keypad_poll(struct input_polled_dev *dev)
-{
-	const unsigned short *keycodes = dev->input->keycode;
-	struct clps711x_keypad_data *priv = dev->private;
-	bool sync = false;
-	int col, row;
-
-	for (col = 0; col < CLPS711X_KEYPAD_COL_COUNT; col++) {
-		/* Assert column */
-		regmap_update_bits(priv->syscon, SYSCON_OFFSET,
-				   SYSCON1_KBDSCAN_MASK,
-				   SYSCON1_KBDSCAN(8 + col));
-
-		/* Scan rows */
-		for (row = 0; row < priv->row_count; row++) {
-			struct clps711x_gpio_data *data = &priv->gpio_data[row];
-			bool state, state1;
-
-			/* Read twice for protection against fluctuations */
-			do {
-				state = gpiod_get_value_cansleep(data->desc);
-				cond_resched();
-				state1 = gpiod_get_value_cansleep(data->desc);
-			} while (state != state1);
-
-			if (test_bit(col, data->last_state) != state) {
-				int code = MATRIX_SCAN_CODE(row, col,
-							    priv->row_shift);
-
-				if (state) {
-					set_bit(col, data->last_state);
-					input_event(dev->input, EV_MSC,
-						    MSC_SCAN, code);
-				} else {
-					clear_bit(col, data->last_state);
-				}
-
-				if (keycodes[code])
-					input_report_key(dev->input,
-							 keycodes[code], state);
-				sync = true;
-			}
-		}
-
-		/* Set all columns to low */
-		regmap_update_bits(priv->syscon, SYSCON_OFFSET,
-				   SYSCON1_KBDSCAN_MASK, SYSCON1_KBDSCAN(1));
-	}
-
-	if (sync)
-		input_sync(dev->input);
-}
-
-static int clps711x_keypad_probe(struct platform_device *pdev)
-{
-	struct clps711x_keypad_data *priv;
-	struct device *dev = &pdev->dev;
-	struct device_node *np = dev->of_node;
-	struct input_polled_dev *poll_dev;
-	u32 poll_interval;
-	int i, err;
-
-	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	priv->syscon =
-		syscon_regmap_lookup_by_compatible("cirrus,clps711x-syscon1");
-	if (IS_ERR(priv->syscon))
-		return PTR_ERR(priv->syscon);
-
-	priv->row_count = of_gpio_named_count(np, "row-gpios");
-	if (priv->row_count < 1)
-		return -EINVAL;
-
-	priv->gpio_data = devm_kzalloc(dev,
-				sizeof(*priv->gpio_data) * priv->row_count,
-				GFP_KERNEL);
-	if (!priv->gpio_data)
-		return -ENOMEM;
-
-	priv->row_shift = get_count_order(CLPS711X_KEYPAD_COL_COUNT);
-
-	for (i = 0; i < priv->row_count; i++) {
-		struct clps711x_gpio_data *data = &priv->gpio_data[i];
-
-		data->desc = devm_gpiod_get_index(dev, "row", i, GPIOD_IN);
-		if (IS_ERR(data->desc))
-			return PTR_ERR(data->desc);
-	}
-
-	err = of_property_read_u32(np, "poll-interval", &poll_interval);
-	if (err)
-		return err;
-
-	poll_dev = input_allocate_polled_device();
-	if (!poll_dev)
-		return -ENOMEM;
-
-	poll_dev->private		= priv;
-	poll_dev->poll			= clps711x_keypad_poll;
-	poll_dev->poll_interval		= poll_interval;
-	poll_dev->input->name		= pdev->name;
-	poll_dev->input->dev.parent	= dev;
-	poll_dev->input->id.bustype	= BUS_HOST;
-	poll_dev->input->id.vendor	= 0x0001;
-	poll_dev->input->id.product	= 0x0001;
-	poll_dev->input->id.version	= 0x0100;
-
-	err = matrix_keypad_build_keymap(NULL, NULL, priv->row_count,
-					 CLPS711X_KEYPAD_COL_COUNT,
-					 NULL, poll_dev->input);
-	if (err)
-		goto out_err;
-
-	input_set_capability(poll_dev->input, EV_MSC, MSC_SCAN);
-	if (of_property_read_bool(np, "autorepeat"))
-		__set_bit(EV_REP, poll_dev->input->evbit);
-
-	platform_set_drvdata(pdev, poll_dev);
-
-	/* Set all columns to low */
-	regmap_update_bits(priv->syscon, SYSCON_OFFSET, SYSCON1_KBDSCAN_MASK,
-			   SYSCON1_KBDSCAN(1));
-
-	err = input_register_polled_device(poll_dev);
-	if (err)
-		goto out_err;
-
-	return 0;
-
-out_err:
-	input_free_polled_device(poll_dev);
-	return err;
-}
-
-static int clps711x_keypad_remove(struct platform_device *pdev)
-{
-	struct input_polled_dev *poll_dev = platform_get_drvdata(pdev);
-
-	input_unregister_polled_device(poll_dev);
-	input_free_polled_device(poll_dev);
-
-	return 0;
-}
-
-static const struct of_device_id clps711x_keypad_of_match[] = {
-	{ .compatible = "cirrus,clps711x-keypad", },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, clps711x_keypad_of_match);
-
-static struct platform_driver clps711x_keypad_driver = {
-	.driver	= {
-		.name		= "clps711x-keypad",
-		.of_match_table	= clps711x_keypad_of_match,
-	},
-	.probe	= clps711x_keypad_probe,
-	.remove	= clps711x_keypad_remove,
-};
-module_platform_driver(clps711x_keypad_driver);
-
-MODULE_AUTHOR("Alexander Shiyan <shc_work@mail.ru>");
-MODULE_DESCRIPTION("Cirrus Logic CLPS711X Keypad driver");
-MODULE_LICENSE("GPL");
+ARB_RTT_CNTL0__TPS_HARSH_PRIORITY_MASK 0x40
+#define MC_ARB_RTT_CNTL0__TPS_HARSH_PRIORITY__SHIFT 0x6
+#define MC_ARB_RTT_CNTL0__TWRT_HARSH_PRIORITY_MASK 0x80
+#define MC_ARB_RTT_CNTL0__TWRT_HARSH_PRIORITY__SHIFT 0x7
+#define MC_ARB_RTT_CNTL0__BREAK_ON_HARSH_MASK 0x100
+#define MC_ARB_RTT_CNTL0__BREAK_ON_HARSH__SHIFT 0x8
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTRD_MASK 0x200
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTRD__SHIFT 0x9
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTWR_MASK 0x400
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTWR__SHIFT 0xa
+#define MC_ARB_RTT_CNTL0__TRAIN_PERIOD_MASK 0x3800
+#define MC_ARB_RTT_CNTL0__TRAIN_PERIOD__SHIFT 0xb
+#define MC_ARB_RTT_CNTL0__START_R2W_RFSH_MASK 0x4000
+#define MC_ARB_RTT_CNTL0__START_R2W_RFSH__SHIFT 0xe
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_0_MASK 0x8000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_0__SHIFT 0xf
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_1_MASK 0x10000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_1__SHIFT 0x10
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_2_MASK 0x20000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_2__SHIFT 0x11
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_3_MASK 0x40000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_3__SHIFT 0x12
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_4_MASK 0x80000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_4__SHIFT 0x13
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_5_MASK 0x100000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_5__SHIFT 0x14
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_6_MASK 0x200000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_6__SHIFT 0x15
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_7_MASK 0x400000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_7__SHIFT 0x16
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_8_MASK 0x800000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_8__SHIFT 0x17
+#define MC_ARB_RTT_CNTL0__DATA_CNTL_MASK 0x1000000
+#define MC_ARB_RTT_CNTL0__DATA_CNTL__SHIFT 0x18
+#define MC_ARB_RTT_CNTL0__NEIGHBOR_BIT_MASK 0x2000000
+#define MC_ARB_RTT_CNTL0__NEIGHBOR_BIT__SHIFT 0x19
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MASK 0x1f
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE__SHIFT 0x0
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_MASK 0x20
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE__SHIFT 0x5
+#define MC_ARB_RTT_CNTL1__WINDOW_INC_THRESHOLD_MASK 0x1fc0
+#define MC_ARB_RTT_CNTL1__WINDOW_INC_THRESHOLD__SHIFT 0x6
+#define MC_ARB_RTT_CNTL1__WINDOW_DEC_THRESHOLD_MASK 0xfe000
+#define MC_ARB_RTT_CNTL1__WINDOW_DEC_THRESHOLD__SHIFT 0xd
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MAX_MASK 0x1f00000
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MAX__SHIFT 0x14
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MIN_MASK 0x3e000000
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MIN__SHIFT 0x19
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_COUNT_MASK 0xc0000000
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_COUNT__SHIFT 0x1e
+#define MC_ARB_RTT_CNTL2__SAMPLE_CNT_MASK 0x3f
+#define MC_ARB_RTT_CNTL2__SAMPLE_CNT__SHIFT 0x0
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_THRESHOLD_MASK 0xfc0
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_THRESHOLD__SHIFT 0x6
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_SIZE_MASK 0x1000
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_SIZE__SHIFT 0xc
+#define MC_ARB_RTT_CNTL2__FILTER_CNTL_MASK 0x2000
+#define MC_ARB_RTT_CNTL2__FILTER_CNTL__SHIFT 0xd
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH0_MASK 0x3
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH0__SHIFT 0x0
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH1_MASK 0xc
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH1__SHIFT 0x2
+#define MC_ARB_RTT_DEBUG__SHIFTED_PHASE_CH0_MASK 0xff0
+#define MC_ARB_RTT_DEBUG__SHIFTED_PHASE_CH0__SHIFT 0x4
+#define MC_ARB_RTT_DEBUG__WINDOW_SIZE_CH0_MASK 0x1f000
+#define MC_ARB_RTT_DEBUG__WINDOW_SIZE_CH0__SHIFT 0xc
+#define MC_ARB_RTT_DEBUG__SHIFTED_PHASE_CH1_MASK 0x1fe0000
+#define MC_ARB_RTT_DEBUG__SHIFTED_PHASE_CH1__SHIFT 0x11
+#define MC_ARB_RTT_DEBUG__WINDOW_SIZE_CH1_MASK 0x3e000000
+#define MC_ARB_RTT_DEBUG__WINDOW_SIZE_CH1__SHIFT 0x19
+#define MC_ARB_CAC_CNTL__ENABLE_MASK 0x1
+#define MC_ARB_CAC_CNTL__ENABLE__SHIFT 0x0
+#define MC_ARB_CAC_CNTL__READ_WEIGHT_MASK 0x7e
+#define MC_ARB_CAC_CNTL__READ_WEIGHT__SHIFT 0x1
+#define MC_ARB_CAC_CNTL__WRITE_WEIGHT_MASK 0x1f80
+#define MC_ARB_CAC_CNTL__WRITE_WEIGHT__SHIFT 0x7
+#define MC_ARB_CAC_CNTL__ALLOW_OVERFLOW_MASK 0x2000
+#define MC_ARB_CAC_CNTL__ALLOW_OVERFLOW__SHIFT 0xd
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_ENABLE_MASK 0x20
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_ENABLE__SHIFT 0x5
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT4_MASK 0x40
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT4__SHIFT 0x6
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT5_MASK 0x80
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT5__SHIFT 0x7
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT6_MASK 0x100
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT6__SHIFT 0x8
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT7_MASK 0x200
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT7__SHIFT 0x9
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT8_MASK 0x400
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT8__SHIFT 0xa
+#define MC_ARB_MISC2__POP_IDLE_REPLAY_MASK 0x800
+#define MC_ARB_MISC2__POP_IDLE_REPLAY__SHIFT 0xb
+#define MC_ARB_MISC2__RDRET_NO_REORDERING_MASK 0x1000
+#define MC_ARB_MISC2__RDRET_NO_REORDERING__SHIFT 0xc
+#define MC_ARB_MISC2__RDRET_NO_BP_MASK 0x2000
+#define MC_ARB_MISC2__RDRET_NO_BP__SHIFT 0xd
+#define MC_ARB_MISC2__RDRET_SEQ_SKID_MASK 0x3c000
+#define MC_ARB_MISC2__RDRET_SEQ_SKID__SHIFT 0xe
+#define MC_ARB_MISC2__GECC_MASK 0x40000
+#define MC_AR

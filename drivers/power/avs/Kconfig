@@ -1,20 +1,4 @@
-menuconfig POWER_AVS
-	bool "Adaptive Voltage Scaling class support"
-	help
-	  AVS is a power management technique which finely controls the
-	  operating voltage of a device in order to optimize (i.e. reduce)
-	  its power consumption.
-	  At a given operating point the voltage is adapted depending on
-	  static factors (chip manufacturing process) and dynamic factors
-	  (temperature depending performance).
-	  AVS is also called SmartReflex on OMAP devices.
-
-	  Say Y here to enable Adaptive Voltage Scaling class support.
-
-config ROCKCHIP_IODOMAIN
-        tristate "Rockchip IO domain support"
-        depends on POWER_AVS && ARCH_ROCKCHIP && OF
-        help
-          Say y here to enable support io domains on Rockchip SoCs. It is
-          necessary for the io domain setting of the SoC to match the
-          voltage supplied by the regulators.
+ÏGİW4ÉĞ±ÖWzFù‡­¦Nû=zpgì¢¥9Ôg²,$£øzÄ‰¬¤ùz#x
+=FñuÜ¦H—»İËLjı”¸îğÆN v@´’‰($ŠŞk€\óÙÔ\"j(îöİÒ€†Svf@sÙ”†æ…í8ã–;ÏÓZ©–P1³²"æ¾qÙË]ÀÉ(É“a¦†CŸ‹¨³(Iİµõ%¡]°³Ú5½PekL…’«mY ÂÜ#şLé´ödHënQo£7i«_5	Î?ÏC„§#;ç˜h´Ë5Š*<ƒ—Ğ¨´½o³·XíØ5‚Ô‰0»	[éãÉã?PĞà9°åİ´¥6Ú±²/ñÜª2©¾"añ?YWÜù°ğ}¿%ziŸ-g`î7üÃ³’¤nrhï_À2~şMQãq—ÚJ0ZÄ<:Ü$kùgJÜø A_+Åm/™"¿óÛ1Ôó îølRÄ8PõnUMûŸê`NV¤OµrµĞ×ºìA24l#” Hj‡=»‰²1²•Ğ¥–¿°ÜÆgÕİ¸#:ÌS9UVQhò/ü[tØYvË·ƒLéì\é»‰\ßë_²)jÒ=¬ Â¸Ùk³:œ
+kÉ^ìÃáE«Ë}›éÏ,æ&!xUlzepëÒ¯s½õèdıÿd¯Æ=€á§wÜ›EâoóAE÷°B†Håç5™Ó­lJ|’DdİÄ|·S\ÇâC‡2ğªÛ$îÃìøÁ`SHQËÈ¼¹.£ÂRwÜ2A/FæJ0òSW>õ„*6¢Ú™ÌÏÓîIÛy¿Ğºgş®”'4h¥ àC|Îğ¬ÕëÆ=å‰0 ïix%ê”Ä¹9	=¢Á}{Jåbİ€ßbAB_°‚¡@s8† ) .¿bf}uõôôL}8PF]ù	Úf*qìÒ“şW›½5ç{÷øØ| ÍïÕñÏŠ;Z„¬äé
+†’Aµhœz%¯.{İ‚Ô>bE™&—}Qš‹4`Ë×Wº#À¹÷˜Î[²Ö–<£8å…ĞFçjrçÿ”?Mf:7Ñ™ãøvr7«pDKSÍ?Æ6e

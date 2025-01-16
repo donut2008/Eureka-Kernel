@@ -1,468 +1,248 @@
-/*
-    i2c Support for Apple SMU Controller
-
-    Copyright (c) 2005 Benjamin Herrenschmidt, IBM Corp.
-                       <benh@kernel.crashing.org>
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-*/
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/types.h>
-#include <linux/i2c.h>
-#include <linux/device.h>
-#include <linux/platform_device.h>
-#include <linux/of_irq.h>
-#include <asm/prom.h>
-#include <asm/pmac_low_i2c.h>
-
-MODULE_AUTHOR("Benjamin Herrenschmidt <benh@kernel.crashing.org>");
-MODULE_DESCRIPTION("I2C driver for Apple PowerMac");
-MODULE_LICENSE("GPL");
-
-/*
- * SMBUS-type transfer entrypoint
- */
-static s32 i2c_powermac_smbus_xfer(	struct i2c_adapter*	adap,
-					u16			addr,
-					unsigned short		flags,
-					char			read_write,
-					u8			command,
-					int			size,
-					union i2c_smbus_data*	data)
-{
-	struct pmac_i2c_bus	*bus = i2c_get_adapdata(adap);
-	int			rc = 0;
-	int			read = (read_write == I2C_SMBUS_READ);
-	int			addrdir = (addr << 1) | read;
-	int			mode, subsize, len;
-	u32			subaddr;
-	u8			*buf;
-	u8			local[2];
-
-	if (size == I2C_SMBUS_QUICK || size == I2C_SMBUS_BYTE) {
-		mode = pmac_i2c_mode_std;
-		subsize = 0;
-		subaddr = 0;
-	} else {
-		mode = read ? pmac_i2c_mode_combined : pmac_i2c_mode_stdsub;
-		subsize = 1;
-		subaddr = command;
-	}
-
-	switch (size) {
-        case I2C_SMBUS_QUICK:
-		buf = NULL;
-		len = 0;
-	    	break;
-        case I2C_SMBUS_BYTE:
-        case I2C_SMBUS_BYTE_DATA:
-		buf = &data->byte;
-		len = 1;
-	    	break;
-        case I2C_SMBUS_WORD_DATA:
-		if (!read) {
-			local[0] = data->word & 0xff;
-			local[1] = (data->word >> 8) & 0xff;
-		}
-		buf = local;
-		len = 2;
-	    	break;
-
-	/* Note that these are broken vs. the expected smbus API where
-	 * on reads, the length is actually returned from the function,
-	 * but I think the current API makes no sense and I don't want
-	 * any driver that I haven't verified for correctness to go
-	 * anywhere near a pmac i2c bus anyway ...
-	 *
-	 * I'm also not completely sure what kind of phases to do between
-	 * the actual command and the data (what I am _supposed_ to do that
-	 * is). For now, I assume writes are a single stream and reads have
-	 * a repeat start/addr phase (but not stop in between)
-	 */
-        case I2C_SMBUS_BLOCK_DATA:
-		buf = data->block;
-		len = data->block[0] + 1;
-		break;
-	case I2C_SMBUS_I2C_BLOCK_DATA:
-		buf = &data->block[1];
-		len = data->block[0];
-		break;
-
-        default:
-		return -EINVAL;
-	}
-
-	rc = pmac_i2c_open(bus, 0);
-	if (rc) {
-		dev_err(&adap->dev, "Failed to open I2C, err %d\n", rc);
-		return rc;
-	}
-
-	rc = pmac_i2c_setmode(bus, mode);
-	if (rc) {
-		dev_err(&adap->dev, "Failed to set I2C mode %d, err %d\n",
-			mode, rc);
-		goto bail;
-	}
-
-	rc = pmac_i2c_xfer(bus, addrdir, subsize, subaddr, buf, len);
-	if (rc) {
-		if (rc == -ENXIO)
-			dev_dbg(&adap->dev,
-				"I2C transfer at 0x%02x failed, size %d, "
-				"err %d\n", addrdir >> 1, size, rc);
-		else
-			dev_err(&adap->dev,
-				"I2C transfer at 0x%02x failed, size %d, "
-				"err %d\n", addrdir >> 1, size, rc);
-		goto bail;
-	}
-
-	if (size == I2C_SMBUS_WORD_DATA && read) {
-		data->word = ((u16)local[1]) << 8;
-		data->word |= local[0];
-	}
-
- bail:
-	pmac_i2c_close(bus);
-	return rc;
-}
-
-/*
- * Generic i2c master transfer entrypoint. This driver only support single
- * messages (for "lame i2c" transfers). Anything else should use the smbus
- * entry point
- */
-static int i2c_powermac_master_xfer(	struct i2c_adapter *adap,
-					struct i2c_msg *msgs,
-					int num)
-{
-	struct pmac_i2c_bus	*bus = i2c_get_adapdata(adap);
-	int			rc = 0;
-	int			read;
-	int			addrdir;
-
-	if (msgs->flags & I2C_M_TEN)
-		return -EINVAL;
-	read = (msgs->flags & I2C_M_RD) != 0;
-	addrdir = (msgs->addr << 1) | read;
-
-	rc = pmac_i2c_open(bus, 0);
-	if (rc) {
-		dev_err(&adap->dev, "Failed to open I2C, err %d\n", rc);
-		return rc;
-	}
-	rc = pmac_i2c_setmode(bus, pmac_i2c_mode_std);
-	if (rc) {
-		dev_err(&adap->dev, "Failed to set I2C mode %d, err %d\n",
-			pmac_i2c_mode_std, rc);
-		goto bail;
-	}
-	rc = pmac_i2c_xfer(bus, addrdir, 0, 0, msgs->buf, msgs->len);
-	if (rc < 0) {
-		if (rc == -ENXIO)
-			dev_dbg(&adap->dev, "I2C %s 0x%02x failed, err %d\n",
-				addrdir & 1 ? "read from" : "write to",
-				addrdir >> 1, rc);
-		else
-			dev_err(&adap->dev, "I2C %s 0x%02x failed, err %d\n",
-				addrdir & 1 ? "read from" : "write to",
-				addrdir >> 1, rc);
-	}
- bail:
-	pmac_i2c_close(bus);
-	return rc < 0 ? rc : 1;
-}
-
-static u32 i2c_powermac_func(struct i2c_adapter * adapter)
-{
-	return I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
-		I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA |
-		I2C_FUNC_SMBUS_BLOCK_DATA | I2C_FUNC_I2C;
-}
-
-/* For now, we only handle smbus */
-static const struct i2c_algorithm i2c_powermac_algorithm = {
-	.smbus_xfer	= i2c_powermac_smbus_xfer,
-	.master_xfer	= i2c_powermac_master_xfer,
-	.functionality	= i2c_powermac_func,
-};
-
-static struct i2c_adapter_quirks i2c_powermac_quirks = {
-	.max_num_msgs = 1,
-};
-
-static int i2c_powermac_remove(struct platform_device *dev)
-{
-	struct i2c_adapter	*adapter = platform_get_drvdata(dev);
-
-	i2c_del_adapter(adapter);
-	memset(adapter, 0, sizeof(*adapter));
-
-	return 0;
-}
-
-static u32 i2c_powermac_get_addr(struct i2c_adapter *adap,
-					   struct pmac_i2c_bus *bus,
-					   struct device_node *node)
-{
-	const __be32 *prop;
-	int len;
-
-	/* First check for valid "reg" */
-	prop = of_get_property(node, "reg", &len);
-	if (prop && (len >= sizeof(int)))
-		return (be32_to_cpup(prop) & 0xff) >> 1;
-
-	/* Then check old-style "i2c-address" */
-	prop = of_get_property(node, "i2c-address", &len);
-	if (prop && (len >= sizeof(int)))
-		return (be32_to_cpup(prop) & 0xff) >> 1;
-
-	/* Now handle some devices with missing "reg" properties */
-	if (!strcmp(node->name, "cereal"))
-		return 0x60;
-	else if (!strcmp(node->name, "deq"))
-		return 0x34;
-
-	dev_warn(&adap->dev, "No i2c address for %s\n", node->full_name);
-
-	return 0xffffffff;
-}
-
-static void i2c_powermac_create_one(struct i2c_adapter *adap,
-					      const char *type,
-					      u32 addr)
-{
-	struct i2c_board_info info = {};
-	struct i2c_client *newdev;
-
-	strncpy(info.type, type, sizeof(info.type));
-	info.addr = addr;
-	newdev = i2c_new_device(adap, &info);
-	if (!newdev)
-		dev_err(&adap->dev,
-			"i2c-powermac: Failure to register missing %s\n",
-			type);
-}
-
-static void i2c_powermac_add_missing(struct i2c_adapter *adap,
-					       struct pmac_i2c_bus *bus,
-					       bool found_onyx)
-{
-	struct device_node *busnode = pmac_i2c_get_bus_node(bus);
-	int rc;
-
-	/* Check for the onyx audio codec */
-#define ONYX_REG_CONTROL		67
-	if (of_device_is_compatible(busnode, "k2-i2c") && !found_onyx) {
-		union i2c_smbus_data data;
-
-		rc = i2c_smbus_xfer(adap, 0x46, 0, I2C_SMBUS_READ,
-				    ONYX_REG_CONTROL, I2C_SMBUS_BYTE_DATA,
-				    &data);
-		if (rc >= 0)
-			i2c_powermac_create_one(adap, "MAC,pcm3052", 0x46);
-
-		rc = i2c_smbus_xfer(adap, 0x47, 0, I2C_SMBUS_READ,
-				    ONYX_REG_CONTROL, I2C_SMBUS_BYTE_DATA,
-				    &data);
-		if (rc >= 0)
-			i2c_powermac_create_one(adap, "MAC,pcm3052", 0x47);
-	}
-}
-
-static bool i2c_powermac_get_type(struct i2c_adapter *adap,
-					    struct device_node *node,
-					    u32 addr, char *type, int type_size)
-{
-	char tmp[16];
-
-	/* Note: we to _NOT_ want the standard
-	 * i2c drivers to match with any of our powermac stuff
-	 * unless they have been specifically modified to handle
-	 * it on a case by case basis. For example, for thermal
-	 * control, things like lm75 etc... shall match with their
-	 * corresponding windfarm drivers, _NOT_ the generic ones,
-	 * so we force a prefix of AAPL, onto the modalias to
-	 * make that happen
-	 */
-
-	/* First try proper modalias */
-	if (of_modalias_node(node, tmp, sizeof(tmp)) >= 0) {
-		snprintf(type, type_size, "MAC,%s", tmp);
-		return true;
-	}
-
-	/* Now look for known workarounds */
-	if (!strcmp(node->name, "deq")) {
-		/* Apple uses address 0x34 for TAS3001 and 0x35 for TAS3004 */
-		if (addr == 0x34) {
-			snprintf(type, type_size, "MAC,tas3001");
-			return true;
-		} else if (addr == 0x35) {
-			snprintf(type, type_size, "MAC,tas3004");
-			return true;
-		}
-	}
-
-	dev_err(&adap->dev, "i2c-powermac: modalias failure"
-		" on %s\n", node->full_name);
-	return false;
-}
-
-static void i2c_powermac_register_devices(struct i2c_adapter *adap,
-						    struct pmac_i2c_bus *bus)
-{
-	struct i2c_client *newdev;
-	struct device_node *node;
-	bool found_onyx = 0;
-
-	/*
-	 * In some cases we end up with the via-pmu node itself, in this
-	 * case we skip this function completely as the device-tree will
-	 * not contain anything useful.
-	 */
-	if (!strcmp(adap->dev.of_node->name, "via-pmu"))
-		return;
-
-	for_each_child_of_node(adap->dev.of_node, node) {
-		struct i2c_board_info info = {};
-		u32 addr;
-
-		/* Get address & channel */
-		addr = i2c_powermac_get_addr(adap, bus, node);
-		if (addr == 0xffffffff)
-			continue;
-
-		/* Multibus setup, check channel */
-		if (!pmac_i2c_match_adapter(node, adap))
-			continue;
-
-		dev_dbg(&adap->dev, "i2c-powermac: register %s\n",
-			node->full_name);
-
-		/*
-		 * Keep track of some device existence to handle
-		 * workarounds later.
-		 */
-		if (of_device_is_compatible(node, "pcm3052"))
-			found_onyx = true;
-
-		/* Make up a modalias */
-		if (!i2c_powermac_get_type(adap, node, addr,
-					   info.type, sizeof(info.type))) {
-			continue;
-		}
-
-		/* Fill out the rest of the info structure */
-		info.addr = addr;
-		info.irq = irq_of_parse_and_map(node, 0);
-		info.of_node = of_node_get(node);
-
-		newdev = i2c_new_device(adap, &info);
-		if (!newdev) {
-			dev_err(&adap->dev, "i2c-powermac: Failure to register"
-				" %s\n", node->full_name);
-			of_node_put(node);
-			/* We do not dispose of the interrupt mapping on
-			 * purpose. It's not necessary (interrupt cannot be
-			 * re-used) and somebody else might have grabbed it
-			 * via direct DT lookup so let's not bother
-			 */
-			continue;
-		}
-	}
-
-	/* Additional workarounds */
-	i2c_powermac_add_missing(adap, bus, found_onyx);
-}
-
-static int i2c_powermac_probe(struct platform_device *dev)
-{
-	struct pmac_i2c_bus *bus = dev_get_platdata(&dev->dev);
-	struct device_node *parent = NULL;
-	struct i2c_adapter *adapter;
-	const char *basename;
-	int rc;
-
-	if (bus == NULL)
-		return -EINVAL;
-	adapter = pmac_i2c_get_adapter(bus);
-
-	/* Ok, now we need to make up a name for the interface that will
-	 * match what we used to do in the past, that is basically the
-	 * controller's parent device node for keywest. PMU didn't have a
-	 * naming convention and SMU has a different one
-	 */
-	switch(pmac_i2c_get_type(bus)) {
-	case pmac_i2c_bus_keywest:
-		parent = of_get_parent(pmac_i2c_get_controller(bus));
-		if (parent == NULL)
-			return -EINVAL;
-		basename = parent->name;
-		break;
-	case pmac_i2c_bus_pmu:
-		basename = "pmu";
-		break;
-	case pmac_i2c_bus_smu:
-		/* This is not what we used to do but I'm fixing drivers at
-		 * the same time as this change
-		 */
-		basename = "smu";
-		break;
-	default:
-		return -EINVAL;
-	}
-	snprintf(adapter->name, sizeof(adapter->name), "%s %d", basename,
-		 pmac_i2c_get_channel(bus));
-	of_node_put(parent);
-
-	platform_set_drvdata(dev, adapter);
-	adapter->algo = &i2c_powermac_algorithm;
-	adapter->quirks = &i2c_powermac_quirks;
-	i2c_set_adapdata(adapter, bus);
-	adapter->dev.parent = &dev->dev;
-
-	/* Clear of_node to skip automatic registration of i2c child nodes */
-	adapter->dev.of_node = NULL;
-	rc = i2c_add_adapter(adapter);
-	if (rc) {
-		printk(KERN_ERR "i2c-powermac: Adapter %s registration "
-		       "failed\n", adapter->name);
-		memset(adapter, 0, sizeof(*adapter));
-		return rc;
-	}
-
-	printk(KERN_INFO "PowerMac i2c bus %s registered\n", adapter->name);
-
-	/* Use custom child registration due to Apple device-tree funkyness */
-	adapter->dev.of_node = dev->dev.of_node;
-	i2c_powermac_register_devices(adapter, bus);
-
-	return 0;
-}
-
-static struct platform_driver i2c_powermac_driver = {
-	.probe = i2c_powermac_probe,
-	.remove = i2c_powermac_remove,
-	.driver = {
-		.name = "i2c-powermac",
-		.bus = &platform_bus_type,
-	},
-};
-
-module_platform_driver(i2c_powermac_driver);
-
-MODULE_ALIAS("platform:i2c-powermac");
+fine MC_XPB_P2P_BAR4__COMPRESS_DIS__SHIFT 0xe
+#define MC_XPB_P2P_BAR4__RESERVED_MASK 0x8000
+#define MC_XPB_P2P_BAR4__RESERVED__SHIFT 0xf
+#define MC_XPB_P2P_BAR4__ADDRESS_MASK 0xffff0000
+#define MC_XPB_P2P_BAR4__ADDRESS__SHIFT 0x10
+#define MC_XPB_P2P_BAR5__HOST_FLUSH_MASK 0xf
+#define MC_XPB_P2P_BAR5__HOST_FLUSH__SHIFT 0x0
+#define MC_XPB_P2P_BAR5__REG_SYS_BAR_MASK 0xf0
+#define MC_XPB_P2P_BAR5__REG_SYS_BAR__SHIFT 0x4
+#define MC_XPB_P2P_BAR5__MEM_SYS_BAR_MASK 0xf00
+#define MC_XPB_P2P_BAR5__MEM_SYS_BAR__SHIFT 0x8
+#define MC_XPB_P2P_BAR5__VALID_MASK 0x1000
+#define MC_XPB_P2P_BAR5__VALID__SHIFT 0xc
+#define MC_XPB_P2P_BAR5__SEND_DIS_MASK 0x2000
+#define MC_XPB_P2P_BAR5__SEND_DIS__SHIFT 0xd
+#define MC_XPB_P2P_BAR5__COMPRESS_DIS_MASK 0x4000
+#define MC_XPB_P2P_BAR5__COMPRESS_DIS__SHIFT 0xe
+#define MC_XPB_P2P_BAR5__RESERVED_MASK 0x8000
+#define MC_XPB_P2P_BAR5__RESERVED__SHIFT 0xf
+#define MC_XPB_P2P_BAR5__ADDRESS_MASK 0xffff0000
+#define MC_XPB_P2P_BAR5__ADDRESS__SHIFT 0x10
+#define MC_XPB_P2P_BAR6__HOST_FLUSH_MASK 0xf
+#define MC_XPB_P2P_BAR6__HOST_FLUSH__SHIFT 0x0
+#define MC_XPB_P2P_BAR6__REG_SYS_BAR_MASK 0xf0
+#define MC_XPB_P2P_BAR6__REG_SYS_BAR__SHIFT 0x4
+#define MC_XPB_P2P_BAR6__MEM_SYS_BAR_MASK 0xf00
+#define MC_XPB_P2P_BAR6__MEM_SYS_BAR__SHIFT 0x8
+#define MC_XPB_P2P_BAR6__VALID_MASK 0x1000
+#define MC_XPB_P2P_BAR6__VALID__SHIFT 0xc
+#define MC_XPB_P2P_BAR6__SEND_DIS_MASK 0x2000
+#define MC_XPB_P2P_BAR6__SEND_DIS__SHIFT 0xd
+#define MC_XPB_P2P_BAR6__COMPRESS_DIS_MASK 0x4000
+#define MC_XPB_P2P_BAR6__COMPRESS_DIS__SHIFT 0xe
+#define MC_XPB_P2P_BAR6__RESERVED_MASK 0x8000
+#define MC_XPB_P2P_BAR6__RESERVED__SHIFT 0xf
+#define MC_XPB_P2P_BAR6__ADDRESS_MASK 0xffff0000
+#define MC_XPB_P2P_BAR6__ADDRESS__SHIFT 0x10
+#define MC_XPB_P2P_BAR7__HOST_FLUSH_MASK 0xf
+#define MC_XPB_P2P_BAR7__HOST_FLUSH__SHIFT 0x0
+#define MC_XPB_P2P_BAR7__REG_SYS_BAR_MASK 0xf0
+#define MC_XPB_P2P_BAR7__REG_SYS_BAR__SHIFT 0x4
+#define MC_XPB_P2P_BAR7__MEM_SYS_BAR_MASK 0xf00
+#define MC_XPB_P2P_BAR7__MEM_SYS_BAR__SHIFT 0x8
+#define MC_XPB_P2P_BAR7__VALID_MASK 0x1000
+#define MC_XPB_P2P_BAR7__VALID__SHIFT 0xc
+#define MC_XPB_P2P_BAR7__SEND_DIS_MASK 0x2000
+#define MC_XPB_P2P_BAR7__SEND_DIS__SHIFT 0xd
+#define MC_XPB_P2P_BAR7__COMPRESS_DIS_MASK 0x4000
+#define MC_XPB_P2P_BAR7__COMPRESS_DIS__SHIFT 0xe
+#define MC_XPB_P2P_BAR7__RESERVED_MASK 0x8000
+#define MC_XPB_P2P_BAR7__RESERVED__SHIFT 0xf
+#define MC_XPB_P2P_BAR7__ADDRESS_MASK 0xffff0000
+#define MC_XPB_P2P_BAR7__ADDRESS__SHIFT 0x10
+#define MC_XPB_P2P_BAR_SETUP__SEL_MASK 0xff
+#define MC_XPB_P2P_BAR_SETUP__SEL__SHIFT 0x0
+#define MC_XPB_P2P_BAR_SETUP__REG_SYS_BAR_MASK 0xf00
+#define MC_XPB_P2P_BAR_SETUP__REG_SYS_BAR__SHIFT 0x8
+#define MC_XPB_P2P_BAR_SETUP__VALID_MASK 0x1000
+#define MC_XPB_P2P_BAR_SETUP__VALID__SHIFT 0xc
+#define MC_XPB_P2P_BAR_SETUP__SEND_DIS_MASK 0x2000
+#define MC_XPB_P2P_BAR_SETUP__SEND_DIS__SHIFT 0xd
+#define MC_XPB_P2P_BAR_SETUP__COMPRESS_DIS_MASK 0x4000
+#define MC_XPB_P2P_BAR_SETUP__COMPRESS_DIS__SHIFT 0xe
+#define MC_XPB_P2P_BAR_SETUP__RESERVED_MASK 0x8000
+#define MC_XPB_P2P_BAR_SETUP__RESERVED__SHIFT 0xf
+#define MC_XPB_P2P_BAR_SETUP__ADDRESS_MASK 0xffff0000
+#define MC_XPB_P2P_BAR_SETUP__ADDRESS__SHIFT 0x10
+#define MC_XPB_P2P_BAR_DEBUG__SEL_MASK 0xff
+#define MC_XPB_P2P_BAR_DEBUG__SEL__SHIFT 0x0
+#define MC_XPB_P2P_BAR_DEBUG__HOST_FLUSH_MASK 0xf00
+#define MC_XPB_P2P_BAR_DEBUG__HOST_FLUSH__SHIFT 0x8
+#define MC_XPB_P2P_BAR_DEBUG__MEM_SYS_BAR_MASK 0xf000
+#define MC_XPB_P2P_BAR_DEBUG__MEM_SYS_BAR__SHIFT 0xc
+#define MC_XPB_P2P_BAR_DELTA_ABOVE__EN_MASK 0xff
+#define MC_XPB_P2P_BAR_DELTA_ABOVE__EN__SHIFT 0x0
+#define MC_XPB_P2P_BAR_DELTA_ABOVE__DELTA_MASK 0xfffff00
+#define MC_XPB_P2P_BAR_DELTA_ABOVE__DELTA__SHIFT 0x8
+#define MC_XPB_P2P_BAR_DELTA_BELOW__EN_MASK 0xff
+#define MC_XPB_P2P_BAR_DELTA_BELOW__EN__SHIFT 0x0
+#define MC_XPB_P2P_BAR_DELTA_BELOW__DELTA_MASK 0xfffff00
+#define MC_XPB_P2P_BAR_DELTA_BELOW__DELTA__SHIFT 0x8
+#define MC_XPB_PEER_SYS_BAR0__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR0__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR0__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR0__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR0__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR0__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR1__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR1__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR1__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR1__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR1__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR1__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR2__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR2__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR2__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR2__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR2__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR2__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR3__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR3__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR3__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR3__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR3__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR3__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR4__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR4__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR4__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR4__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR4__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR4__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR5__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR5__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR5__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR5__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR5__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR5__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR6__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR6__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR6__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR6__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR6__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR6__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR7__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR7__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR7__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR7__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR7__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR7__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR8__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR8__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR8__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR8__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR8__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR8__ADDR__SHIFT 0x2
+#define MC_XPB_PEER_SYS_BAR9__VALID_MASK 0x1
+#define MC_XPB_PEER_SYS_BAR9__VALID__SHIFT 0x0
+#define MC_XPB_PEER_SYS_BAR9__SIDE_OK_MASK 0x2
+#define MC_XPB_PEER_SYS_BAR9__SIDE_OK__SHIFT 0x1
+#define MC_XPB_PEER_SYS_BAR9__ADDR_MASK 0x7fffffc
+#define MC_XPB_PEER_SYS_BAR9__ADDR__SHIFT 0x2
+#define MC_XPB_XDMA_PEER_SYS_BAR0__VALID_MASK 0x1
+#define MC_XPB_XDMA_PEER_SYS_BAR0__VALID__SHIFT 0x0
+#define MC_XPB_XDMA_PEER_SYS_BAR0__SIDE_OK_MASK 0x2
+#define MC_XPB_XDMA_PEER_SYS_BAR0__SIDE_OK__SHIFT 0x1
+#define MC_XPB_XDMA_PEER_SYS_BAR0__ADDR_MASK 0x7fffffc
+#define MC_XPB_XDMA_PEER_SYS_BAR0__ADDR__SHIFT 0x2
+#define MC_XPB_XDMA_PEER_SYS_BAR1__VALID_MASK 0x1
+#define MC_XPB_XDMA_PEER_SYS_BAR1__VALID__SHIFT 0x0
+#define MC_XPB_XDMA_PEER_SYS_BAR1__SIDE_OK_MASK 0x2
+#define MC_XPB_XDMA_PEER_SYS_BAR1__SIDE_OK__SHIFT 0x1
+#define MC_XPB_XDMA_PEER_SYS_BAR1__ADDR_MASK 0x7fffffc
+#define MC_XPB_XDMA_PEER_SYS_BAR1__ADDR__SHIFT 0x2
+#define MC_XPB_XDMA_PEER_SYS_BAR2__VALID_MASK 0x1
+#define MC_XPB_XDMA_PEER_SYS_BAR2__VALID__SHIFT 0x0
+#define MC_XPB_XDMA_PEER_SYS_BAR2__SIDE_OK_MASK 0x2
+#define MC_XPB_XDMA_PEER_SYS_BAR2__SIDE_OK__SHIFT 0x1
+#define MC_XPB_XDMA_PEER_SYS_BAR2__ADDR_MASK 0x7fffffc
+#define MC_XPB_XDMA_PEER_SYS_BAR2__ADDR__SHIFT 0x2
+#define MC_XPB_XDMA_PEER_SYS_BAR3__VALID_MASK 0x1
+#define MC_XPB_XDMA_PEER_SYS_BAR3__VALID__SHIFT 0x0
+#define MC_XPB_XDMA_PEER_SYS_BAR3__SIDE_OK_MASK 0x2
+#define MC_XPB_XDMA_PEER_SYS_BAR3__SIDE_OK__SHIFT 0x1
+#define MC_XPB_XDMA_PEER_SYS_BAR3__ADDR_MASK 0x7fffffc
+#define MC_XPB_XDMA_PEER_SYS_BAR3__ADDR__SHIFT 0x2
+#define MC_XPB_CLK_GAT__ONDLY_MASK 0x3f
+#define MC_XPB_CLK_GAT__ONDLY__SHIFT 0x0
+#define MC_XPB_CLK_GAT__OFFDLY_MASK 0xfc0
+#define MC_XPB_CLK_GAT__OFFDLY__SHIFT 0x6
+#define MC_XPB_CLK_GAT__RDYDLY_MASK 0x3f000
+#define MC_XPB_CLK_GAT__RDYDLY__SHIFT 0xc
+#define MC_XPB_CLK_GAT__ENABLE_MASK 0x40000
+#define MC_XPB_CLK_GAT__ENABLE__SHIFT 0x12
+#define MC_XPB_CLK_GAT__MEM_LS_ENABLE_MASK 0x80000
+#define MC_XPB_CLK_GAT__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_XPB_INTF_CFG__RPB_WRREQ_CRD_MASK 0xff
+#define MC_XPB_INTF_CFG__RPB_WRREQ_CRD__SHIFT 0x0
+#define MC_XPB_INTF_CFG__MC_WRRET_ASK_MASK 0xff00
+#define MC_XPB_INTF_CFG__MC_WRRET_ASK__SHIFT 0x8
+#define MC_XPB_INTF_CFG__XSP_REQ_CRD_MASK 0x7f0000
+#define MC_XPB_INTF_CFG__XSP_REQ_CRD__SHIFT 0x10
+#define MC_XPB_INTF_CFG__BIF_REG_SNOOP_SEL_MASK 0x800000
+#define MC_XPB_INTF_CFG__BIF_REG_SNOOP_SEL__SHIFT 0x17
+#define MC_XPB_INTF_CFG__BIF_REG_SNOOP_VAL_MASK 0x1000000
+#define MC_XPB_INTF_CFG__BIF_REG_SNOOP_VAL__SHIFT 0x18
+#define MC_XPB_INTF_CFG__BIF_MEM_SNOOP_SEL_MASK 0x2000000
+#define MC_XPB_INTF_CFG__BIF_MEM_SNOOP_SEL__SHIFT 0x19
+#define MC_XPB_INTF_CFG__BIF_MEM_SNOOP_VAL_MASK 0x4000000
+#define MC_XPB_INTF_CFG__BIF_MEM_SNOOP_VAL__SHIFT 0x1a
+#define MC_XPB_INTF_CFG__XSP_SNOOP_SEL_MASK 0x18000000
+#define MC_XPB_INTF_CFG__XSP_SNOOP_SEL__SHIFT 0x1b
+#define MC_XPB_INTF_CFG__XSP_SNOOP_VAL_MASK 0x20000000
+#define MC_XPB_INTF_CFG__XSP_SNOOP_VAL__SHIFT 0x1d
+#define MC_XPB_INTF_CFG__XSP_ORDERING_SEL_MASK 0x40000000
+#define MC_XPB_INTF_CFG__XSP_ORDERING_SEL__SHIFT 0x1e
+#define MC_XPB_INTF_CFG__XSP_ORDERING_VAL_MASK 0x80000000
+#define MC_XPB_INTF_CFG__XSP_ORDERING_VAL__SHIFT 0x1f
+#define MC_XPB_INTF_STS__RPB_WRREQ_CRD_MASK 0xff
+#define MC_XPB_INTF_STS__RPB_WRREQ_CRD__SHIFT 0x0
+#define MC_XPB_INTF_STS__XSP_REQ_CRD_MASK 0x7f00
+#define MC_XPB_INTF_STS__XSP_REQ_CRD__SHIFT 0x8
+#define MC_XPB_INTF_STS__HOP_DATA_BUF_FULL_MASK 0x8000
+#define MC_XPB_INTF_STS__HOP_DATA_BUF_FULL__SHIFT 0xf
+#define MC_XPB_INTF_STS__HOP_ATTR_BUF_FULL_MASK 0x10000
+#define MC_XPB_INTF_STS__HOP_ATTR_BUF_FULL__SHIFT 0x10
+#define MC_XPB_INTF_STS__CNS_BUF_FULL_MASK 0x20000
+#define MC_XPB_INTF_STS__CNS_BUF_FULL__SHIFT 0x11
+#define MC_XPB_INTF_STS__CNS_BUF_BUSY_MASK 0x40000
+#define MC_XPB_INTF_STS__CNS_BUF_BUSY__SHIFT 0x12
+#define MC_XPB_INTF_STS__RPB_RDREQ_CRD_MASK 0x7f80000
+#define MC_XPB_INTF_STS__RPB_RDREQ_CRD__SHIFT 0x13
+#define MC_XPB_PIPE_STS__WCB_ANY_PBUF_MASK 0x1
+#define MC_XPB_PIPE_STS__WCB_ANY_PBUF__SHIFT 0x0
+#define MC_XPB_PIPE_STS__WCB_HST_DATA_BUF_CNT_MASK 0xfe
+#define MC_XPB_PIPE_STS__WCB_HST_DATA_BUF_CNT__SHIFT 0x1
+#define MC_XPB_PIPE_STS__WCB_SID_DATA_BUF_CNT_MASK 0x7f00
+#define MC_XPB_PIPE_STS__WCB_SID_DATA_BUF_CNT__SHIFT 0x8
+#define MC_XPB_PIPE_STS__WCB_HST_RD_PTR_BUF_FULL_MASK 0x8000
+#define MC_XPB_PIPE_STS__WCB_HST_RD_PTR_BUF_FULL__SHIFT 0xf
+#define MC_XPB_PIPE_STS__WCB_SID_RD_PTR_BUF_FULL_MASK 0x10000
+#define MC_XPB_PIPE_STS__WCB_SID_RD_PTR_BUF_FULL__SHIFT 0x10
+#define MC_XPB_PIPE_STS__WCB_HST_REQ_FIFO_FULL_MASK 0x20000
+#define MC_XPB_PIPE_STS__WCB_HST_REQ_FIFO_FULL__SHIFT 0x11
+#define MC_XPB_PIPE_STS__WCB_SID_REQ_FIFO_FULL_MASK 0x40000
+#define MC_XPB_PIPE_STS__WCB_SID_REQ_FIFO_FULL__SHIFT 0x12
+#define MC_XPB_PIPE_STS__WCB_HST_REQ_OBUF_FULL_MASK 0x80000
+#define MC_XPB_PIPE_STS__WCB_HST_REQ_OBUF_FULL__SHIFT 0x13
+#define MC_XPB_PIPE_STS__WCB_SID_REQ_OBUF_FULL_MASK 0x100000
+#define MC_XPB_PIPE_STS__WCB_SID_REQ_OBUF_FULL__SHIFT 0x14
+#define MC_XPB_PIPE_STS__WCB_HST_DATA_OBUF_FULL_MASK 0x200000
+#define MC_XPB_PIPE_STS__WCB_HST_DATA_OBUF_FULL__SHIFT 0x15
+#define MC_XPB_PIPE_STS__WCB_SID_DATA_OBUF_FULL_MASK 0x400000
+#define MC_XPB_PIPE_STS__WCB_SID_DATA_OBUF_FULL__SHIFT 0x16
+#define MC_XPB_PIPE_STS__RET_BUF_FULL_MASK 0x800000
+#define MC_XPB_PIPE_STS__RET_BUF_FULL__SHIFT 0x17
+#define MC_XPB_PIPE_STS__XPB_CLK_BUSY_BITS_MASK 0xff000000
+#define MC_XPB_PIPE_STS__XPB_CLK_BUSY_BITS__SHIFT 0x18
+#define MC_XPB_SUB_CTRL__WRREQ_BYPASS_XPB_MASK 0x1
+#define MC_XPB_SUB_CTRL__WRREQ_BYPASS_XPB__SHIFT 0x0
+#define MC_XPB_SUB_CTRL__STALL_CNS_RTR_REQ_MASK 0x2
+#define MC_XPB_SUB_CTRL__STALL_CNS_RTR_REQ__SHIFT 0x1
+#define MC_XPB_SUB_CTRL__STALL_RTR_RPB_WRREQ_MASK 0x4
+#define MC_XPB_SUB_CTRL__STALL_RTR_RPB_WRREQ__SHIFT 0x2
+#define MC_XPB_SUB_CTRL__STALL_RTR_MAP_REQ_MASK 0x8
+#define MC_XPB_SUB_CTRL__STALL_RTR_MAP_REQ__SHIFT 0x3
+#define MC_XPB_SUB_CTRL__STALL_MAP_WCB_REQ_MASK 0x10
+#define MC_XPB_SUB_CTRL__STALL_MAP_WCB_REQ__SHIFT 0x4
+#define MC_XPB_SUB_CTRL__STALL_WCB_SID_REQ_MASK 0x20

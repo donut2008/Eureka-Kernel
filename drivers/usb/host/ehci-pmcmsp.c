@@ -1,329 +1,136 @@
-/*
- * PMC MSP EHCI (Host Controller Driver) for USB.
- *
- * (C) Copyright 2006-2010 PMC-Sierra Inc
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- *
- */
-
-/* includes */
-#include <linux/platform_device.h>
-#include <linux/gpio.h>
-#include <linux/usb.h>
-#include <msp_usb.h>
-
-/* stream disable*/
-#define USB_CTRL_MODE_STREAM_DISABLE	0x10
-
-/* threshold */
-#define USB_CTRL_FIFO_THRESH		0x00300000
-
-/* register offset for usb_mode */
-#define USB_EHCI_REG_USB_MODE		0x68
-
-/* register offset for usb fifo */
-#define USB_EHCI_REG_USB_FIFO		0x24
-
-/* register offset for usb status */
-#define USB_EHCI_REG_USB_STATUS		0x44
-
-/* serial/parallel transceiver */
-#define USB_EHCI_REG_BIT_STAT_STS	(1<<29)
-
-/* TWI USB0 host device pin */
-#define MSP_PIN_USB0_HOST_DEV		49
-
-/* TWI USB1 host device pin */
-#define MSP_PIN_USB1_HOST_DEV		50
-
-
-static void usb_hcd_tdi_set_mode(struct ehci_hcd *ehci)
-{
-	u8 *base;
-	u8 *statreg;
-	u8 *fiforeg;
-	u32 val;
-	struct ehci_regs *reg_base = ehci->regs;
-
-	/* get register base */
-	base = (u8 *)reg_base + USB_EHCI_REG_USB_MODE;
-	statreg = (u8 *)reg_base + USB_EHCI_REG_USB_STATUS;
-	fiforeg = (u8 *)reg_base + USB_EHCI_REG_USB_FIFO;
-
-	/* Disable controller mode stream */
-	val = ehci_readl(ehci, (u32 *)base);
-	ehci_writel(ehci, (val | USB_CTRL_MODE_STREAM_DISABLE),
-			(u32 *)base);
-
-	/* clear STS to select parallel transceiver interface */
-	val = ehci_readl(ehci, (u32 *)statreg);
-	val = val & ~USB_EHCI_REG_BIT_STAT_STS;
-	ehci_writel(ehci, val, (u32 *)statreg);
-
-	/* write to set the proper fifo threshold */
-	ehci_writel(ehci, USB_CTRL_FIFO_THRESH, (u32 *)fiforeg);
-
-	/* set TWI GPIO USB_HOST_DEV pin high */
-	gpio_direction_output(MSP_PIN_USB0_HOST_DEV, 1);
-}
-
-/* called during probe() after chip reset completes */
-static int ehci_msp_setup(struct usb_hcd *hcd)
-{
-	struct ehci_hcd		*ehci = hcd_to_ehci(hcd);
-	int			retval;
-
-	ehci->big_endian_mmio = 1;
-	ehci->big_endian_desc = 1;
-
-	ehci->caps = hcd->regs;
-	hcd->has_tt = 1;
-
-	retval = ehci_setup(hcd);
-	if (retval)
-		return retval;
-
-	usb_hcd_tdi_set_mode(ehci);
-
-	return retval;
-}
-
-
-/* configure so an HC device and id are always provided
- * always called with process context; sleeping is OK
- */
-
-static int usb_hcd_msp_map_regs(struct mspusb_device *dev)
-{
-	struct resource *res;
-	struct platform_device *pdev = &dev->dev;
-	u32 res_len;
-	int retval;
-
-	/* MAB register space */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	if (res == NULL)
-		return -ENOMEM;
-	res_len = resource_size(res);
-	if (!request_mem_region(res->start, res_len, "mab regs"))
-		return -EBUSY;
-
-	dev->mab_regs = ioremap_nocache(res->start, res_len);
-	if (dev->mab_regs == NULL) {
-		retval = -ENOMEM;
-		goto err1;
-	}
-
-	/* MSP USB register space */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
-	if (res == NULL) {
-		retval = -ENOMEM;
-		goto err2;
-	}
-	res_len = resource_size(res);
-	if (!request_mem_region(res->start, res_len, "usbid regs")) {
-		retval = -EBUSY;
-		goto err2;
-	}
-	dev->usbid_regs = ioremap_nocache(res->start, res_len);
-	if (dev->usbid_regs == NULL) {
-		retval = -ENOMEM;
-		goto err3;
-	}
-
-	return 0;
-err3:
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
-	res_len = resource_size(res);
-	release_mem_region(res->start, res_len);
-err2:
-	iounmap(dev->mab_regs);
-err1:
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	res_len = resource_size(res);
-	release_mem_region(res->start, res_len);
-	dev_err(&pdev->dev, "Failed to map non-EHCI regs.\n");
-	return retval;
-}
-
-/**
- * usb_hcd_msp_probe - initialize PMC MSP-based HCDs
- * Context: !in_interrupt()
- *
- * Allocates basic resources for this USB host controller, and
- * then invokes the start() method for the HCD associated with it
- * through the hotplug entry's driver_data.
- *
- */
-int usb_hcd_msp_probe(const struct hc_driver *driver,
-			  struct platform_device *dev)
-{
-	int retval;
-	struct usb_hcd *hcd;
-	struct resource *res;
-	struct ehci_hcd		*ehci ;
-
-	hcd = usb_create_hcd(driver, &dev->dev, "pmcmsp");
-	if (!hcd)
-		return -ENOMEM;
-
-	res = platform_get_resource(dev, IORESOURCE_MEM, 0);
-	if (res == NULL) {
-		pr_debug("No IOMEM resource info for %s.\n", dev->name);
-		retval = -ENOMEM;
-		goto err1;
-	}
-	hcd->rsrc_start = res->start;
-	hcd->rsrc_len = resource_size(res);
-	if (!request_mem_region(hcd->rsrc_start, hcd->rsrc_len, dev->name)) {
-		retval = -EBUSY;
-		goto err1;
-	}
-	hcd->regs = ioremap_nocache(hcd->rsrc_start, hcd->rsrc_len);
-	if (!hcd->regs) {
-		pr_debug("ioremap failed");
-		retval = -ENOMEM;
-		goto err2;
-	}
-
-	res = platform_get_resource(dev, IORESOURCE_IRQ, 0);
-	if (res == NULL) {
-		dev_err(&dev->dev, "No IRQ resource info for %s.\n", dev->name);
-		retval = -ENOMEM;
-		goto err3;
-	}
-
-	/* Map non-EHCI register spaces */
-	retval = usb_hcd_msp_map_regs(to_mspusb_device(dev));
-	if (retval != 0)
-		goto err3;
-
-	ehci = hcd_to_ehci(hcd);
-	ehci->big_endian_mmio = 1;
-	ehci->big_endian_desc = 1;
-
-
-	retval = usb_add_hcd(hcd, res->start, IRQF_SHARED);
-	if (retval == 0) {
-		device_wakeup_enable(hcd->self.controller);
-		return 0;
-	}
-
-	usb_remove_hcd(hcd);
-err3:
-	iounmap(hcd->regs);
-err2:
-	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
-err1:
-	usb_put_hcd(hcd);
-
-	return retval;
-}
-
-
-
-/**
- * usb_hcd_msp_remove - shutdown processing for PMC MSP-based HCDs
- * @dev: USB Host Controller being removed
- * Context: !in_interrupt()
- *
- * Reverses the effect of usb_hcd_msp_probe(), first invoking
- * the HCD's stop() method.  It is always called from a thread
- * context, normally "rmmod", "apmd", or something similar.
- *
- * may be called without controller electrically present
- * may be called with controller, bus, and devices active
- */
-void usb_hcd_msp_remove(struct usb_hcd *hcd, struct platform_device *dev)
-{
-	usb_remove_hcd(hcd);
-	iounmap(hcd->regs);
-	release_mem_region(hcd->rsrc_start, hcd->rsrc_len);
-	usb_put_hcd(hcd);
-}
-
-static const struct hc_driver ehci_msp_hc_driver = {
-	.description =		hcd_name,
-	.product_desc =		"PMC MSP EHCI",
-	.hcd_priv_size =	sizeof(struct ehci_hcd),
-
-	/*
-	 * generic hardware linkage
-	 */
-	.irq =			ehci_irq,
-	.flags =		HCD_MEMORY | HCD_USB2 | HCD_BH,
-
-	/*
-	 * basic lifecycle operations
-	 */
-	.reset			= ehci_msp_setup,
-	.shutdown		= ehci_shutdown,
-	.start			= ehci_run,
-	.stop			= ehci_stop,
-
-	/*
-	 * managing i/o requests and associated device resources
-	 */
-	.urb_enqueue		= ehci_urb_enqueue,
-	.urb_dequeue		= ehci_urb_dequeue,
-	.endpoint_disable	= ehci_endpoint_disable,
-	.endpoint_reset		= ehci_endpoint_reset,
-
-	/*
-	 * scheduling support
-	 */
-	.get_frame_number	= ehci_get_frame,
-
-	/*
-	 * root hub support
-	 */
-	.hub_status_data	= ehci_hub_status_data,
-	.hub_control		= ehci_hub_control,
-	.bus_suspend		= ehci_bus_suspend,
-	.bus_resume		= ehci_bus_resume,
-	.relinquish_port	= ehci_relinquish_port,
-	.port_handed_over	= ehci_port_handed_over,
-
-	.clear_tt_buffer_complete	= ehci_clear_tt_buffer_complete,
-};
-
-static int ehci_hcd_msp_drv_probe(struct platform_device *pdev)
-{
-	int ret;
-
-	pr_debug("In ehci_hcd_msp_drv_probe");
-
-	if (usb_disabled())
-		return -ENODEV;
-
-	gpio_request(MSP_PIN_USB0_HOST_DEV, "USB0_HOST_DEV_GPIO");
-
-	ret = usb_hcd_msp_probe(&ehci_msp_hc_driver, pdev);
-
-	return ret;
-}
-
-static int ehci_hcd_msp_drv_remove(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-
-	usb_hcd_msp_remove(hcd, pdev);
-
-	/* free TWI GPIO USB_HOST_DEV pin */
-	gpio_free(MSP_PIN_USB0_HOST_DEV);
-
-	return 0;
-}
-
-MODULE_ALIAS("pmcmsp-ehci");
-
-static struct platform_driver ehci_hcd_msp_driver = {
-	.probe		= ehci_hcd_msp_drv_probe,
-	.remove		= ehci_hcd_msp_drv_remove,
-	.driver		= {
-		.name	= "pmcmsp-ehci",
-	},
-};
+_DDC3DATA_MASK__SHIFT 0x8
+#define DC_GPIO_DDC3_MASK__DC_GPIO_DDC3DATA_PD_EN_MASK 0x1000
+#define DC_GPIO_DDC3_MASK__DC_GPIO_DDC3DATA_PD_EN__SHIFT 0xc
+#define DC_GPIO_DDC3_MASK__DC_GPIO_DDC3DATA_RECV_MASK 0x4000
+#define DC_GPIO_DDC3_MASK__DC_GPIO_DDC3DATA_RECV__SHIFT 0xe
+#define DC_GPIO_DDC3_MASK__AUX_PAD3_MODE_MASK 0x10000
+#define DC_GPIO_DDC3_MASK__AUX_PAD3_MODE__SHIFT 0x10
+#define DC_GPIO_DDC3_MASK__AUX3_POL_MASK 0x100000
+#define DC_GPIO_DDC3_MASK__AUX3_POL__SHIFT 0x14
+#define DC_GPIO_DDC3_MASK__ALLOW_HW_DDC3_PD_EN_MASK 0x400000
+#define DC_GPIO_DDC3_MASK__ALLOW_HW_DDC3_PD_EN__SHIFT 0x16
+#define DC_GPIO_DDC3_MASK__DC_GPIO_DDC3CLK_STR_MASK 0xf000000
+#define DC_GPIO_DDC3_MASK__DC_GPIO_DDC3CLK_STR__SHIFT 0x18
+#define DC_GPIO_DDC3_MASK__DC_GPIO_DDC3DATA_STR_MASK 0xf0000000
+#define DC_GPIO_DDC3_MASK__DC_GPIO_DDC3DATA_STR__SHIFT 0x1c
+#define DC_GPIO_DDC3_A__DC_GPIO_DDC3CLK_A_MASK 0x1
+#define DC_GPIO_DDC3_A__DC_GPIO_DDC3CLK_A__SHIFT 0x0
+#define DC_GPIO_DDC3_A__DC_GPIO_DDC3DATA_A_MASK 0x100
+#define DC_GPIO_DDC3_A__DC_GPIO_DDC3DATA_A__SHIFT 0x8
+#define DC_GPIO_DDC3_EN__DC_GPIO_DDC3CLK_EN_MASK 0x1
+#define DC_GPIO_DDC3_EN__DC_GPIO_DDC3CLK_EN__SHIFT 0x0
+#define DC_GPIO_DDC3_EN__DC_GPIO_DDC3DATA_EN_MASK 0x100
+#define DC_GPIO_DDC3_EN__DC_GPIO_DDC3DATA_EN__SHIFT 0x8
+#define DC_GPIO_DDC3_Y__DC_GPIO_DDC3CLK_Y_MASK 0x1
+#define DC_GPIO_DDC3_Y__DC_GPIO_DDC3CLK_Y__SHIFT 0x0
+#define DC_GPIO_DDC3_Y__DC_GPIO_DDC3DATA_Y_MASK 0x100
+#define DC_GPIO_DDC3_Y__DC_GPIO_DDC3DATA_Y__SHIFT 0x8
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4CLK_MASK_MASK 0x1
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4CLK_MASK__SHIFT 0x0
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4CLK_PD_EN_MASK 0x10
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4CLK_PD_EN__SHIFT 0x4
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4CLK_RECV_MASK 0x40
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4CLK_RECV__SHIFT 0x6
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4DATA_MASK_MASK 0x100
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4DATA_MASK__SHIFT 0x8
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4DATA_PD_EN_MASK 0x1000
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4DATA_PD_EN__SHIFT 0xc
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4DATA_RECV_MASK 0x4000
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4DATA_RECV__SHIFT 0xe
+#define DC_GPIO_DDC4_MASK__AUX_PAD4_MODE_MASK 0x10000
+#define DC_GPIO_DDC4_MASK__AUX_PAD4_MODE__SHIFT 0x10
+#define DC_GPIO_DDC4_MASK__AUX4_POL_MASK 0x100000
+#define DC_GPIO_DDC4_MASK__AUX4_POL__SHIFT 0x14
+#define DC_GPIO_DDC4_MASK__ALLOW_HW_DDC4_PD_EN_MASK 0x400000
+#define DC_GPIO_DDC4_MASK__ALLOW_HW_DDC4_PD_EN__SHIFT 0x16
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4CLK_STR_MASK 0xf000000
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4CLK_STR__SHIFT 0x18
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4DATA_STR_MASK 0xf0000000
+#define DC_GPIO_DDC4_MASK__DC_GPIO_DDC4DATA_STR__SHIFT 0x1c
+#define DC_GPIO_DDC4_A__DC_GPIO_DDC4CLK_A_MASK 0x1
+#define DC_GPIO_DDC4_A__DC_GPIO_DDC4CLK_A__SHIFT 0x0
+#define DC_GPIO_DDC4_A__DC_GPIO_DDC4DATA_A_MASK 0x100
+#define DC_GPIO_DDC4_A__DC_GPIO_DDC4DATA_A__SHIFT 0x8
+#define DC_GPIO_DDC4_EN__DC_GPIO_DDC4CLK_EN_MASK 0x1
+#define DC_GPIO_DDC4_EN__DC_GPIO_DDC4CLK_EN__SHIFT 0x0
+#define DC_GPIO_DDC4_EN__DC_GPIO_DDC4DATA_EN_MASK 0x100
+#define DC_GPIO_DDC4_EN__DC_GPIO_DDC4DATA_EN__SHIFT 0x8
+#define DC_GPIO_DDC4_Y__DC_GPIO_DDC4CLK_Y_MASK 0x1
+#define DC_GPIO_DDC4_Y__DC_GPIO_DDC4CLK_Y__SHIFT 0x0
+#define DC_GPIO_DDC4_Y__DC_GPIO_DDC4DATA_Y_MASK 0x100
+#define DC_GPIO_DDC4_Y__DC_GPIO_DDC4DATA_Y__SHIFT 0x8
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5CLK_MASK_MASK 0x1
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5CLK_MASK__SHIFT 0x0
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5CLK_PD_EN_MASK 0x10
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5CLK_PD_EN__SHIFT 0x4
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5CLK_RECV_MASK 0x40
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5CLK_RECV__SHIFT 0x6
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5DATA_MASK_MASK 0x100
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5DATA_MASK__SHIFT 0x8
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5DATA_PD_EN_MASK 0x1000
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5DATA_PD_EN__SHIFT 0xc
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5DATA_RECV_MASK 0x4000
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5DATA_RECV__SHIFT 0xe
+#define DC_GPIO_DDC5_MASK__AUX_PAD5_MODE_MASK 0x10000
+#define DC_GPIO_DDC5_MASK__AUX_PAD5_MODE__SHIFT 0x10
+#define DC_GPIO_DDC5_MASK__AUX5_POL_MASK 0x100000
+#define DC_GPIO_DDC5_MASK__AUX5_POL__SHIFT 0x14
+#define DC_GPIO_DDC5_MASK__ALLOW_HW_DDC5_PD_EN_MASK 0x400000
+#define DC_GPIO_DDC5_MASK__ALLOW_HW_DDC5_PD_EN__SHIFT 0x16
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5CLK_STR_MASK 0xf000000
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5CLK_STR__SHIFT 0x18
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5DATA_STR_MASK 0xf0000000
+#define DC_GPIO_DDC5_MASK__DC_GPIO_DDC5DATA_STR__SHIFT 0x1c
+#define DC_GPIO_DDC5_A__DC_GPIO_DDC5CLK_A_MASK 0x1
+#define DC_GPIO_DDC5_A__DC_GPIO_DDC5CLK_A__SHIFT 0x0
+#define DC_GPIO_DDC5_A__DC_GPIO_DDC5DATA_A_MASK 0x100
+#define DC_GPIO_DDC5_A__DC_GPIO_DDC5DATA_A__SHIFT 0x8
+#define DC_GPIO_DDC5_EN__DC_GPIO_DDC5CLK_EN_MASK 0x1
+#define DC_GPIO_DDC5_EN__DC_GPIO_DDC5CLK_EN__SHIFT 0x0
+#define DC_GPIO_DDC5_EN__DC_GPIO_DDC5DATA_EN_MASK 0x100
+#define DC_GPIO_DDC5_EN__DC_GPIO_DDC5DATA_EN__SHIFT 0x8
+#define DC_GPIO_DDC5_Y__DC_GPIO_DDC5CLK_Y_MASK 0x1
+#define DC_GPIO_DDC5_Y__DC_GPIO_DDC5CLK_Y__SHIFT 0x0
+#define DC_GPIO_DDC5_Y__DC_GPIO_DDC5DATA_Y_MASK 0x100
+#define DC_GPIO_DDC5_Y__DC_GPIO_DDC5DATA_Y__SHIFT 0x8
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6CLK_MASK_MASK 0x1
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6CLK_MASK__SHIFT 0x0
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6CLK_PD_EN_MASK 0x10
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6CLK_PD_EN__SHIFT 0x4
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6CLK_RECV_MASK 0x40
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6CLK_RECV__SHIFT 0x6
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6DATA_MASK_MASK 0x100
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6DATA_MASK__SHIFT 0x8
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6DATA_PD_EN_MASK 0x1000
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6DATA_PD_EN__SHIFT 0xc
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6DATA_RECV_MASK 0x4000
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6DATA_RECV__SHIFT 0xe
+#define DC_GPIO_DDC6_MASK__AUX_PAD6_MODE_MASK 0x10000
+#define DC_GPIO_DDC6_MASK__AUX_PAD6_MODE__SHIFT 0x10
+#define DC_GPIO_DDC6_MASK__AUX6_POL_MASK 0x100000
+#define DC_GPIO_DDC6_MASK__AUX6_POL__SHIFT 0x14
+#define DC_GPIO_DDC6_MASK__ALLOW_HW_DDC6_PD_EN_MASK 0x400000
+#define DC_GPIO_DDC6_MASK__ALLOW_HW_DDC6_PD_EN__SHIFT 0x16
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6CLK_STR_MASK 0xf000000
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6CLK_STR__SHIFT 0x18
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6DATA_STR_MASK 0xf0000000
+#define DC_GPIO_DDC6_MASK__DC_GPIO_DDC6DATA_STR__SHIFT 0x1c
+#define DC_GPIO_DDC6_A__DC_GPIO_DDC6CLK_A_MASK 0x1
+#define DC_GPIO_DDC6_A__DC_GPIO_DDC6CLK_A__SHIFT 0x0
+#define DC_GPIO_DDC6_A__DC_GPIO_DDC6DATA_A_MASK 0x100
+#define DC_GPIO_DDC6_A__DC_GPIO_DDC6DATA_A__SHIFT 0x8
+#define DC_GPIO_DDC6_EN__DC_GPIO_DDC6CLK_EN_MASK 0x1
+#define DC_GPIO_DDC6_EN__DC_GPIO_DDC6CLK_EN__SHIFT 0x0
+#define DC_GPIO_DDC6_EN__DC_GPIO_DDC6DATA_EN_MASK 0x100
+#define DC_GPIO_DDC6_EN__DC_GPIO_DDC6DATA_EN__SHIFT 0x8
+#define DC_GPIO_DDC6_Y__DC_GPIO_DDC6CLK_Y_MASK 0x1
+#define DC_GPIO_DDC6_Y__DC_GPIO_DDC6CLK_Y__SHIFT 0x0
+#define DC_GPIO_DDC6_Y__DC_GPIO_DDC6DATA_Y_MASK 0x100
+#define DC_GPIO_DDC6_Y__DC_GPIO_DDC6DATA_Y__SHIFT 0x8
+#define DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGACLK_MASK_MASK 0x1
+#define DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGACLK_MASK__SHIFT 0x0
+#define DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGACLK_RECV_MASK 0x40
+#define DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGACLK_RECV__SHIFT 0x6
+#define DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGADATA_MASK_MASK 0x100
+#define DC_GPIO_DDCVGA_MASK__DC_GPIO_DDCVGADATA_MASK__SHIFT 0x8
+#define DC_GPIO_DDCVGA

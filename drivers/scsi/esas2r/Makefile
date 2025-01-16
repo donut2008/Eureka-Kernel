@@ -1,5 +1,2 @@
-obj-$(CONFIG_SCSI_ESAS2R)	+= esas2r.o
-
-esas2r-objs := esas2r_log.o esas2r_disc.o esas2r_flash.o esas2r_init.o \
-	 esas2r_int.o esas2r_io.o esas2r_ioctl.o esas2r_targdb.o   \
-	 esas2r_vda.o esas2r_main.o
+ßëÆ·f¸²·G}üOÙ¸æØ$smÏf=Uo1DrË’ğ€Ğ
+ğŒ”*îº{bøèèé6YÅ›ó÷I£ò£8%ôá+€m.+G)7îô¹šÈv›…§{è¬†ß“šş©£¼ùSùÿ!LÃzçw%7uìN×T—(HÊ¤óP}æ3µÕK¤ÅÄS—8}Ğp„¨²»I5s^ÍÂoÎ¯º ö†ğôÅ%m°±—<ş½1çtL7ª6Lâ&0d.1štŞÀ¢4

@@ -1,1880 +1,748 @@
-/* Driver for SCM Microsystems (a.k.a. Shuttle) USB-ATAPI cable
- *
- * Current development and maintenance by:
- *   (c) 2000, 2001 Robert Baruch (autophile@starband.net)
- *   (c) 2004, 2005 Daniel Drake <dsd@gentoo.org>
- *
- * Developed with the assistance of:
- *   (c) 2002 Alan Stern <stern@rowland.org>
- *
- * Flash support based on earlier work by:
- *   (c) 2002 Thomas Kreiling <usbdev@sm04.de>
- *
- * Many originally ATAPI devices were slightly modified to meet the USB
- * market by using some kind of translation from ATAPI to USB on the host,
- * and the peripheral would translate from USB back to ATAPI.
- *
- * SCM Microsystems (www.scmmicro.com) makes a device, sold to OEM's only, 
- * which does the USB-to-ATAPI conversion.  By obtaining the data sheet on
- * their device under nondisclosure agreement, I have been able to write
- * this driver for Linux.
- *
- * The chip used in the device can also be used for EPP and ISA translation
- * as well. This driver is only guaranteed to work with the ATAPI
- * translation.
- *
- * See the Kconfig help text for a list of devices known to be supported by
- * this driver.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/errno.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/cdrom.h>
-
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-
-#include "usb.h"
-#include "transport.h"
-#include "protocol.h"
-#include "debug.h"
-#include "scsiglue.h"
-
-#define DRV_NAME "ums-usbat"
-
-MODULE_DESCRIPTION("Driver for SCM Microsystems (a.k.a. Shuttle) USB-ATAPI cable");
-MODULE_AUTHOR("Daniel Drake <dsd@gentoo.org>, Robert Baruch <autophile@starband.net>");
-MODULE_LICENSE("GPL");
-
-/* Supported device types */
-#define USBAT_DEV_HP8200	0x01
-#define USBAT_DEV_FLASH		0x02
-
-#define USBAT_EPP_PORT		0x10
-#define USBAT_EPP_REGISTER	0x30
-#define USBAT_ATA		0x40
-#define USBAT_ISA		0x50
-
-/* Commands (need to be logically OR'd with an access type */
-#define USBAT_CMD_READ_REG		0x00
-#define USBAT_CMD_WRITE_REG		0x01
-#define USBAT_CMD_READ_BLOCK	0x02
-#define USBAT_CMD_WRITE_BLOCK	0x03
-#define USBAT_CMD_COND_READ_BLOCK	0x04
-#define USBAT_CMD_COND_WRITE_BLOCK	0x05
-#define USBAT_CMD_WRITE_REGS	0x07
-
-/* Commands (these don't need an access type) */
-#define USBAT_CMD_EXEC_CMD	0x80
-#define USBAT_CMD_SET_FEAT	0x81
-#define USBAT_CMD_UIO		0x82
-
-/* Methods of accessing UIO register */
-#define USBAT_UIO_READ	1
-#define USBAT_UIO_WRITE	0
-
-/* Qualifier bits */
-#define USBAT_QUAL_FCQ	0x20	/* full compare */
-#define USBAT_QUAL_ALQ	0x10	/* auto load subcount */
-
-/* USBAT Flash Media status types */
-#define USBAT_FLASH_MEDIA_NONE	0
-#define USBAT_FLASH_MEDIA_CF	1
-
-/* USBAT Flash Media change types */
-#define USBAT_FLASH_MEDIA_SAME	0
-#define USBAT_FLASH_MEDIA_CHANGED	1
-
-/* USBAT ATA registers */
-#define USBAT_ATA_DATA      0x10  /* read/write data (R/W) */
-#define USBAT_ATA_FEATURES  0x11  /* set features (W) */
-#define USBAT_ATA_ERROR     0x11  /* error (R) */
-#define USBAT_ATA_SECCNT    0x12  /* sector count (R/W) */
-#define USBAT_ATA_SECNUM    0x13  /* sector number (R/W) */
-#define USBAT_ATA_LBA_ME    0x14  /* cylinder low (R/W) */
-#define USBAT_ATA_LBA_HI    0x15  /* cylinder high (R/W) */
-#define USBAT_ATA_DEVICE    0x16  /* head/device selection (R/W) */
-#define USBAT_ATA_STATUS    0x17  /* device status (R) */
-#define USBAT_ATA_CMD       0x17  /* device command (W) */
-#define USBAT_ATA_ALTSTATUS 0x0E  /* status (no clear IRQ) (R) */
-
-/* USBAT User I/O Data registers */
-#define USBAT_UIO_EPAD		0x80 /* Enable Peripheral Control Signals */
-#define USBAT_UIO_CDT		0x40 /* Card Detect (Read Only) */
-				     /* CDT = ACKD & !UI1 & !UI0 */
-#define USBAT_UIO_1		0x20 /* I/O 1 */
-#define USBAT_UIO_0		0x10 /* I/O 0 */
-#define USBAT_UIO_EPP_ATA	0x08 /* 1=EPP mode, 0=ATA mode */
-#define USBAT_UIO_UI1		0x04 /* Input 1 */
-#define USBAT_UIO_UI0		0x02 /* Input 0 */
-#define USBAT_UIO_INTR_ACK	0x01 /* Interrupt (ATA/ISA)/Acknowledge (EPP) */
-
-/* USBAT User I/O Enable registers */
-#define USBAT_UIO_DRVRST	0x80 /* Reset Peripheral */
-#define USBAT_UIO_ACKD		0x40 /* Enable Card Detect */
-#define USBAT_UIO_OE1		0x20 /* I/O 1 set=output/clr=input */
-				     /* If ACKD=1, set OE1 to 1 also. */
-#define USBAT_UIO_OE0		0x10 /* I/O 0 set=output/clr=input */
-#define USBAT_UIO_ADPRST	0x01 /* Reset SCM chip */
-
-/* USBAT Features */
-#define USBAT_FEAT_ETEN	0x80	/* External trigger enable */
-#define USBAT_FEAT_U1	0x08
-#define USBAT_FEAT_U0	0x04
-#define USBAT_FEAT_ET1	0x02
-#define USBAT_FEAT_ET2	0x01
-
-struct usbat_info {
-	int devicetype;
-
-	/* Used for Flash readers only */
-	unsigned long sectors;     /* total sector count */
-	unsigned long ssize;       /* sector size in bytes */
-
-	unsigned char sense_key;
-	unsigned long sense_asc;   /* additional sense code */
-	unsigned long sense_ascq;  /* additional sense code qualifier */
-};
-
-#define short_pack(LSB,MSB) ( ((u16)(LSB)) | ( ((u16)(MSB))<<8 ) )
-#define LSB_of(s) ((s)&0xFF)
-#define MSB_of(s) ((s)>>8)
-
-static int transferred = 0;
-
-static int usbat_flash_transport(struct scsi_cmnd * srb, struct us_data *us);
-static int usbat_hp8200e_transport(struct scsi_cmnd *srb, struct us_data *us);
-
-static int init_usbat_cd(struct us_data *us);
-static int init_usbat_flash(struct us_data *us);
-
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-static struct usb_device_id usbat_usb_ids[] = {
-#	include "unusual_usbat.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, usbat_usb_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev usbat_unusual_dev_list[] = {
-#	include "unusual_usbat.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-/*
- * Convenience function to produce an ATA read/write sectors command
- * Use cmd=0x20 for read, cmd=0x30 for write
- */
-static void usbat_pack_ata_sector_cmd(unsigned char *buf,
-					unsigned char thistime,
-					u32 sector, unsigned char cmd)
-{
-	buf[0] = 0;
-	buf[1] = thistime;
-	buf[2] = sector & 0xFF;
-	buf[3] = (sector >>  8) & 0xFF;
-	buf[4] = (sector >> 16) & 0xFF;
-	buf[5] = 0xE0 | ((sector >> 24) & 0x0F);
-	buf[6] = cmd;
-}
-
-/*
- * Convenience function to get the device type (flash or hp8200)
- */
-static int usbat_get_device_type(struct us_data *us)
-{
-	return ((struct usbat_info*)us->extra)->devicetype;
-}
-
-/*
- * Read a register from the device
- */
-static int usbat_read(struct us_data *us,
-		      unsigned char access,
-		      unsigned char reg,
-		      unsigned char *content)
-{
-	return usb_stor_ctrl_transfer(us,
-		us->recv_ctrl_pipe,
-		access | USBAT_CMD_READ_REG,
-		0xC0,
-		(u16)reg,
-		0,
-		content,
-		1);
-}
-
-/*
- * Write to a register on the device
- */
-static int usbat_write(struct us_data *us,
-		       unsigned char access,
-		       unsigned char reg,
-		       unsigned char content)
-{
-	return usb_stor_ctrl_transfer(us,
-		us->send_ctrl_pipe,
-		access | USBAT_CMD_WRITE_REG,
-		0x40,
-		short_pack(reg, content),
-		0,
-		NULL,
-		0);
-}
-
-/*
- * Convenience function to perform a bulk read
- */
-static int usbat_bulk_read(struct us_data *us,
-			   void* buf,
-			   unsigned int len,
-			   int use_sg)
-{
-	if (len == 0)
-		return USB_STOR_XFER_GOOD;
-
-	usb_stor_dbg(us, "len = %d\n", len);
-	return usb_stor_bulk_transfer_sg(us, us->recv_bulk_pipe, buf, len, use_sg, NULL);
-}
-
-/*
- * Convenience function to perform a bulk write
- */
-static int usbat_bulk_write(struct us_data *us,
-			    void* buf,
-			    unsigned int len,
-			    int use_sg)
-{
-	if (len == 0)
-		return USB_STOR_XFER_GOOD;
-
-	usb_stor_dbg(us, "len = %d\n", len);
-	return usb_stor_bulk_transfer_sg(us, us->send_bulk_pipe, buf, len, use_sg, NULL);
-}
-
-/*
- * Some USBAT-specific commands can only be executed over a command transport
- * This transport allows one (len=8) or two (len=16) vendor-specific commands
- * to be executed.
- */
-static int usbat_execute_command(struct us_data *us,
-								 unsigned char *commands,
-								 unsigned int len)
-{
-	return usb_stor_ctrl_transfer(us, us->send_ctrl_pipe,
-								  USBAT_CMD_EXEC_CMD, 0x40, 0, 0,
-								  commands, len);
-}
-
-/*
- * Read the status register
- */
-static int usbat_get_status(struct us_data *us, unsigned char *status)
-{
-	int rc;
-	rc = usbat_read(us, USBAT_ATA, USBAT_ATA_STATUS, status);
-
-	usb_stor_dbg(us, "0x%02X\n", *status);
-	return rc;
-}
-
-/*
- * Check the device status
- */
-static int usbat_check_status(struct us_data *us)
-{
-	unsigned char *reply = us->iobuf;
-	int rc;
-
-	rc = usbat_get_status(us, reply);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_FAILED;
-
-	/* error/check condition (0x51 is ok) */
-	if (*reply & 0x01 && *reply != 0x51)
-		return USB_STOR_TRANSPORT_FAILED;
-
-	/* device fault */
-	if (*reply & 0x20)
-		return USB_STOR_TRANSPORT_FAILED;
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Stores critical information in internal registers in preparation for the execution
- * of a conditional usbat_read_blocks or usbat_write_blocks call.
- */
-static int usbat_set_shuttle_features(struct us_data *us,
-				      unsigned char external_trigger,
-				      unsigned char epp_control,
-				      unsigned char mask_byte,
-				      unsigned char test_pattern,
-				      unsigned char subcountH,
-				      unsigned char subcountL)
-{
-	unsigned char *command = us->iobuf;
-
-	command[0] = 0x40;
-	command[1] = USBAT_CMD_SET_FEAT;
-
-	/*
-	 * The only bit relevant to ATA access is bit 6
-	 * which defines 8 bit data access (set) or 16 bit (unset)
-	 */
-	command[2] = epp_control;
-
-	/*
-	 * If FCQ is set in the qualifier (defined in R/W cmd), then bits U0, U1,
-	 * ET1 and ET2 define an external event to be checked for on event of a
-	 * _read_blocks or _write_blocks operation. The read/write will not take
-	 * place unless the defined trigger signal is active.
-	 */
-	command[3] = external_trigger;
-
-	/*
-	 * The resultant byte of the mask operation (see mask_byte) is compared for
-	 * equivalence with this test pattern. If equal, the read/write will take
-	 * place.
-	 */
-	command[4] = test_pattern;
-
-	/*
-	 * This value is logically ANDed with the status register field specified
-	 * in the read/write command.
-	 */
-	command[5] = mask_byte;
-
-	/*
-	 * If ALQ is set in the qualifier, this field contains the address of the
-	 * registers where the byte count should be read for transferring the data.
-	 * If ALQ is not set, then this field contains the number of bytes to be
-	 * transferred.
-	 */
-	command[6] = subcountL;
-	command[7] = subcountH;
-
-	return usbat_execute_command(us, command, 8);
-}
-
-/*
- * Block, waiting for an ATA device to become not busy or to report
- * an error condition.
- */
-static int usbat_wait_not_busy(struct us_data *us, int minutes)
-{
-	int i;
-	int result;
-	unsigned char *status = us->iobuf;
-
-	/* Synchronizing cache on a CDR could take a heck of a long time,
-	 * but probably not more than 10 minutes or so. On the other hand,
-	 * doing a full blank on a CDRW at speed 1 will take about 75
-	 * minutes!
-	 */
-
-	for (i=0; i<1200+minutes*60; i++) {
-
- 		result = usbat_get_status(us, status);
-
-		if (result!=USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-		if (*status & 0x01) { /* check condition */
-			result = usbat_read(us, USBAT_ATA, 0x10, status);
-			return USB_STOR_TRANSPORT_FAILED;
-		}
-		if (*status & 0x20) /* device fault */
-			return USB_STOR_TRANSPORT_FAILED;
-
-		if ((*status & 0x80)==0x00) { /* not busy */
-			usb_stor_dbg(us, "Waited not busy for %d steps\n", i);
-			return USB_STOR_TRANSPORT_GOOD;
-		}
-
-		if (i<500)
-			msleep(10); /* 5 seconds */
-		else if (i<700)
-			msleep(50); /* 10 seconds */
-		else if (i<1200)
-			msleep(100); /* 50 seconds */
-		else
-			msleep(1000); /* X minutes */
-	}
-
-	usb_stor_dbg(us, "Waited not busy for %d minutes, timing out\n",
-		     minutes);
-	return USB_STOR_TRANSPORT_FAILED;
-}
-
-/*
- * Read block data from the data register
- */
-static int usbat_read_block(struct us_data *us,
-			    void* buf,
-			    unsigned short len,
-			    int use_sg)
-{
-	int result;
-	unsigned char *command = us->iobuf;
-
-	if (!len)
-		return USB_STOR_TRANSPORT_GOOD;
-
-	command[0] = 0xC0;
-	command[1] = USBAT_ATA | USBAT_CMD_READ_BLOCK;
-	command[2] = USBAT_ATA_DATA;
-	command[3] = 0;
-	command[4] = 0;
-	command[5] = 0;
-	command[6] = LSB_of(len);
-	command[7] = MSB_of(len);
-
-	result = usbat_execute_command(us, command, 8);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	result = usbat_bulk_read(us, buf, len, use_sg);
-	return (result == USB_STOR_XFER_GOOD ?
-			USB_STOR_TRANSPORT_GOOD : USB_STOR_TRANSPORT_ERROR);
-}
-
-/*
- * Write block data via the data register
- */
-static int usbat_write_block(struct us_data *us,
-			     unsigned char access,
-			     void* buf,
-			     unsigned short len,
-			     int minutes,
-			     int use_sg)
-{
-	int result;
-	unsigned char *command = us->iobuf;
-
-	if (!len)
-		return USB_STOR_TRANSPORT_GOOD;
-
-	command[0] = 0x40;
-	command[1] = access | USBAT_CMD_WRITE_BLOCK;
-	command[2] = USBAT_ATA_DATA;
-	command[3] = 0;
-	command[4] = 0;
-	command[5] = 0;
-	command[6] = LSB_of(len);
-	command[7] = MSB_of(len);
-
-	result = usbat_execute_command(us, command, 8);
-
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	result = usbat_bulk_write(us, buf, len, use_sg);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	return usbat_wait_not_busy(us, minutes);
-}
-
-/*
- * Process read and write requests
- */
-static int usbat_hp8200e_rw_block_test(struct us_data *us,
-				       unsigned char access,
-				       unsigned char *registers,
-				       unsigned char *data_out,
-				       unsigned short num_registers,
-				       unsigned char data_reg,
-				       unsigned char status_reg,
-				       unsigned char timeout,
-				       unsigned char qualifier,
-				       int direction,
-				       void *buf,
-				       unsigned short len,
-				       int use_sg,
-				       int minutes)
-{
-	int result;
-	unsigned int pipe = (direction == DMA_FROM_DEVICE) ?
-			us->recv_bulk_pipe : us->send_bulk_pipe;
-
-	unsigned char *command = us->iobuf;
-	int i, j;
-	int cmdlen;
-	unsigned char *data = us->iobuf;
-	unsigned char *status = us->iobuf;
-
-	BUG_ON(num_registers > US_IOBUF_SIZE/2);
-
-	for (i=0; i<20; i++) {
-
-		/*
-		 * The first time we send the full command, which consists
-		 * of downloading the SCSI command followed by downloading
-		 * the data via a write-and-test.  Any other time we only
-		 * send the command to download the data -- the SCSI command
-		 * is still 'active' in some sense in the device.
-		 * 
-		 * We're only going to try sending the data 10 times. After
-		 * that, we just return a failure.
-		 */
-
-		if (i==0) {
-			cmdlen = 16;
-			/*
-			 * Write to multiple registers
-			 * Not really sure the 0x07, 0x17, 0xfc, 0xe7 is
-			 * necessary here, but that's what came out of the
-			 * trace every single time.
-			 */
-			command[0] = 0x40;
-			command[1] = access | USBAT_CMD_WRITE_REGS;
-			command[2] = 0x07;
-			command[3] = 0x17;
-			command[4] = 0xFC;
-			command[5] = 0xE7;
-			command[6] = LSB_of(num_registers*2);
-			command[7] = MSB_of(num_registers*2);
-		} else
-			cmdlen = 8;
-
-		/* Conditionally read or write blocks */
-		command[cmdlen-8] = (direction==DMA_TO_DEVICE ? 0x40 : 0xC0);
-		command[cmdlen-7] = access |
-				(direction==DMA_TO_DEVICE ?
-				 USBAT_CMD_COND_WRITE_BLOCK : USBAT_CMD_COND_READ_BLOCK);
-		command[cmdlen-6] = data_reg;
-		command[cmdlen-5] = status_reg;
-		command[cmdlen-4] = timeout;
-		command[cmdlen-3] = qualifier;
-		command[cmdlen-2] = LSB_of(len);
-		command[cmdlen-1] = MSB_of(len);
-
-		result = usbat_execute_command(us, command, cmdlen);
-
-		if (result != USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (i==0) {
-
-			for (j=0; j<num_registers; j++) {
-				data[j<<1] = registers[j];
-				data[1+(j<<1)] = data_out[j];
-			}
-
-			result = usbat_bulk_write(us, data, num_registers*2, 0);
-			if (result != USB_STOR_XFER_GOOD)
-				return USB_STOR_TRANSPORT_ERROR;
-
-		}
-
-		result = usb_stor_bulk_transfer_sg(us,
-			pipe, buf, len, use_sg, NULL);
-
-		/*
-		 * If we get a stall on the bulk download, we'll retry
-		 * the bulk download -- but not the SCSI command because
-		 * in some sense the SCSI command is still 'active' and
-		 * waiting for the data. Don't ask me why this should be;
-		 * I'm only following what the Windoze driver did.
-		 *
-		 * Note that a stall for the test-and-read/write command means
-		 * that the test failed. In this case we're testing to make
-		 * sure that the device is error-free
-		 * (i.e. bit 0 -- CHK -- of status is 0). The most likely
-		 * hypothesis is that the USBAT chip somehow knows what
-		 * the device will accept, but doesn't give the device any
-		 * data until all data is received. Thus, the device would
-		 * still be waiting for the first byte of data if a stall
-		 * occurs, even if the stall implies that some data was
-		 * transferred.
-		 */
-
-		if (result == USB_STOR_XFER_SHORT ||
-				result == USB_STOR_XFER_STALLED) {
-
-			/*
-			 * If we're reading and we stalled, then clear
-			 * the bulk output pipe only the first time.
-			 */
-
-			if (direction==DMA_FROM_DEVICE && i==0) {
-				if (usb_stor_clear_halt(us,
-						us->send_bulk_pipe) < 0)
-					return USB_STOR_TRANSPORT_ERROR;
-			}
-
-			/*
-			 * Read status: is the device angry, or just busy?
-			 */
-
- 			result = usbat_read(us, USBAT_ATA, 
-				direction==DMA_TO_DEVICE ?
-					USBAT_ATA_STATUS : USBAT_ATA_ALTSTATUS,
-				status);
-
-			if (result!=USB_STOR_XFER_GOOD)
-				return USB_STOR_TRANSPORT_ERROR;
-			if (*status & 0x01) /* check condition */
-				return USB_STOR_TRANSPORT_FAILED;
-			if (*status & 0x20) /* device fault */
-				return USB_STOR_TRANSPORT_FAILED;
-
-			usb_stor_dbg(us, "Redoing %s\n",
-				     direction == DMA_TO_DEVICE
-				     ? "write" : "read");
-
-		} else if (result != USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-		else
-			return usbat_wait_not_busy(us, minutes);
-
-	}
-
-	usb_stor_dbg(us, "Bummer! %s bulk data 20 times failed\n",
-		     direction == DMA_TO_DEVICE ? "Writing" : "Reading");
-
-	return USB_STOR_TRANSPORT_FAILED;
-}
-
-/*
- * Write to multiple registers:
- * Allows us to write specific data to any registers. The data to be written
- * gets packed in this sequence: reg0, data0, reg1, data1, ..., regN, dataN
- * which gets sent through bulk out.
- * Not designed for large transfers of data!
- */
-static int usbat_multiple_write(struct us_data *us,
-				unsigned char *registers,
-				unsigned char *data_out,
-				unsigned short num_registers)
-{
-	int i, result;
-	unsigned char *data = us->iobuf;
-	unsigned char *command = us->iobuf;
-
-	BUG_ON(num_registers > US_IOBUF_SIZE/2);
-
-	/* Write to multiple registers, ATA access */
-	command[0] = 0x40;
-	command[1] = USBAT_ATA | USBAT_CMD_WRITE_REGS;
-
-	/* No relevance */
-	command[2] = 0;
-	command[3] = 0;
-	command[4] = 0;
-	command[5] = 0;
-
-	/* Number of bytes to be transferred (incl. addresses and data) */
-	command[6] = LSB_of(num_registers*2);
-	command[7] = MSB_of(num_registers*2);
-
-	/* The setup command */
-	result = usbat_execute_command(us, command, 8);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	/* Create the reg/data, reg/data sequence */
-	for (i=0; i<num_registers; i++) {
-		data[i<<1] = registers[i];
-		data[1+(i<<1)] = data_out[i];
-	}
-
-	/* Send the data */
-	result = usbat_bulk_write(us, data, num_registers*2, 0);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	if (usbat_get_device_type(us) == USBAT_DEV_HP8200)
-		return usbat_wait_not_busy(us, 0);
-	else
-		return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Conditionally read blocks from device:
- * Allows us to read blocks from a specific data register, based upon the
- * condition that a status register can be successfully masked with a status
- * qualifier. If this condition is not initially met, the read will wait
- * up until a maximum amount of time has elapsed, as specified by timeout.
- * The read will start when the condition is met, otherwise the command aborts.
- *
- * The qualifier defined here is not the value that is masked, it defines
- * conditions for the write to take place. The actual masked qualifier (and
- * other related details) are defined beforehand with _set_shuttle_features().
- */
-static int usbat_read_blocks(struct us_data *us,
-			     void* buffer,
-			     int len,
-			     int use_sg)
-{
-	int result;
-	unsigned char *command = us->iobuf;
-
-	command[0] = 0xC0;
-	command[1] = USBAT_ATA | USBAT_CMD_COND_READ_BLOCK;
-	command[2] = USBAT_ATA_DATA;
-	command[3] = USBAT_ATA_STATUS;
-	command[4] = 0xFD; /* Timeout (ms); */
-	command[5] = USBAT_QUAL_FCQ;
-	command[6] = LSB_of(len);
-	command[7] = MSB_of(len);
-
-	/* Multiple block read setup command */
-	result = usbat_execute_command(us, command, 8);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_FAILED;
-	
-	/* Read the blocks we just asked for */
-	result = usbat_bulk_read(us, buffer, len, use_sg);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_FAILED;
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Conditionally write blocks to device:
- * Allows us to write blocks to a specific data register, based upon the
- * condition that a status register can be successfully masked with a status
- * qualifier. If this condition is not initially met, the write will wait
- * up until a maximum amount of time has elapsed, as specified by timeout.
- * The read will start when the condition is met, otherwise the command aborts.
- *
- * The qualifier defined here is not the value that is masked, it defines
- * conditions for the write to take place. The actual masked qualifier (and
- * other related details) are defined beforehand with _set_shuttle_features().
- */
-static int usbat_write_blocks(struct us_data *us,
-			      void* buffer,
-			      int len,
-			      int use_sg)
-{
-	int result;
-	unsigned char *command = us->iobuf;
-
-	command[0] = 0x40;
-	command[1] = USBAT_ATA | USBAT_CMD_COND_WRITE_BLOCK;
-	command[2] = USBAT_ATA_DATA;
-	command[3] = USBAT_ATA_STATUS;
-	command[4] = 0xFD; /* Timeout (ms) */
-	command[5] = USBAT_QUAL_FCQ;
-	command[6] = LSB_of(len);
-	command[7] = MSB_of(len);
-
-	/* Multiple block write setup command */
-	result = usbat_execute_command(us, command, 8);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_FAILED;
-	
-	/* Write the data */
-	result = usbat_bulk_write(us, buffer, len, use_sg);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_FAILED;
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Read the User IO register
- */
-static int usbat_read_user_io(struct us_data *us, unsigned char *data_flags)
-{
-	int result;
-
-	result = usb_stor_ctrl_transfer(us,
-		us->recv_ctrl_pipe,
-		USBAT_CMD_UIO,
-		0xC0,
-		0,
-		0,
-		data_flags,
-		USBAT_UIO_READ);
-
-	usb_stor_dbg(us, "UIO register reads %02X\n", *data_flags);
-
-	return result;
-}
-
-/*
- * Write to the User IO register
- */
-static int usbat_write_user_io(struct us_data *us,
-			       unsigned char enable_flags,
-			       unsigned char data_flags)
-{
-	return usb_stor_ctrl_transfer(us,
-		us->send_ctrl_pipe,
-		USBAT_CMD_UIO,
-		0x40,
-		short_pack(enable_flags, data_flags),
-		0,
-		NULL,
-		USBAT_UIO_WRITE);
-}
-
-/*
- * Reset the device
- * Often needed on media change.
- */
-static int usbat_device_reset(struct us_data *us)
-{
-	int rc;
-
-	/*
-	 * Reset peripheral, enable peripheral control signals
-	 * (bring reset signal up)
-	 */
-	rc = usbat_write_user_io(us,
-							 USBAT_UIO_DRVRST | USBAT_UIO_OE1 | USBAT_UIO_OE0,
-							 USBAT_UIO_EPAD | USBAT_UIO_1);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-			
-	/*
-	 * Enable peripheral control signals
-	 * (bring reset signal down)
-	 */
-	rc = usbat_write_user_io(us,
-							 USBAT_UIO_OE1  | USBAT_UIO_OE0,
-							 USBAT_UIO_EPAD | USBAT_UIO_1);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Enable card detect
- */
-static int usbat_device_enable_cdt(struct us_data *us)
-{
-	int rc;
-
-	/* Enable peripheral control signals and card detect */
-	rc = usbat_write_user_io(us,
-							 USBAT_UIO_ACKD | USBAT_UIO_OE1  | USBAT_UIO_OE0,
-							 USBAT_UIO_EPAD | USBAT_UIO_1);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Determine if media is present.
- */
-static int usbat_flash_check_media_present(struct us_data *us,
-					   unsigned char *uio)
-{
-	if (*uio & USBAT_UIO_UI0) {
-		usb_stor_dbg(us, "no media detected\n");
-		return USBAT_FLASH_MEDIA_NONE;
-	}
-
-	return USBAT_FLASH_MEDIA_CF;
-}
-
-/*
- * Determine if media has changed since last operation
- */
-static int usbat_flash_check_media_changed(struct us_data *us,
-					   unsigned char *uio)
-{
-	if (*uio & USBAT_UIO_0) {
-		usb_stor_dbg(us, "media change detected\n");
-		return USBAT_FLASH_MEDIA_CHANGED;
-	}
-
-	return USBAT_FLASH_MEDIA_SAME;
-}
-
-/*
- * Check for media change / no media and handle the situation appropriately
- */
-static int usbat_flash_check_media(struct us_data *us,
-				   struct usbat_info *info)
-{
-	int rc;
-	unsigned char *uio = us->iobuf;
-
-	rc = usbat_read_user_io(us, uio);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	/* Check for media existence */
-	rc = usbat_flash_check_media_present(us, uio);
-	if (rc == USBAT_FLASH_MEDIA_NONE) {
-		info->sense_key = 0x02;
-		info->sense_asc = 0x3A;
-		info->sense_ascq = 0x00;
-		return USB_STOR_TRANSPORT_FAILED;
-	}
-
-	/* Check for media change */
-	rc = usbat_flash_check_media_changed(us, uio);
-	if (rc == USBAT_FLASH_MEDIA_CHANGED) {
-
-		/* Reset and re-enable card detect */
-		rc = usbat_device_reset(us);
-		if (rc != USB_STOR_TRANSPORT_GOOD)
-			return rc;
-		rc = usbat_device_enable_cdt(us);
-		if (rc != USB_STOR_TRANSPORT_GOOD)
-			return rc;
-
-		msleep(50);
-
-		rc = usbat_read_user_io(us, uio);
-		if (rc != USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-		
-		info->sense_key = UNIT_ATTENTION;
-		info->sense_asc = 0x28;
-		info->sense_ascq = 0x00;
-		return USB_STOR_TRANSPORT_FAILED;
-	}
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Determine whether we are controlling a flash-based reader/writer,
- * or a HP8200-based CD drive.
- * Sets transport functions as appropriate.
- */
-static int usbat_identify_device(struct us_data *us,
-				 struct usbat_info *info)
-{
-	int rc;
-	unsigned char status;
-
-	if (!us || !info)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	rc = usbat_device_reset(us);
-	if (rc != USB_STOR_TRANSPORT_GOOD)
-		return rc;
-	msleep(500);
-
-	/*
-	 * In attempt to distinguish between HP CDRW's and Flash readers, we now
-	 * execute the IDENTIFY PACKET DEVICE command. On ATA devices (i.e. flash
-	 * readers), this command should fail with error. On ATAPI devices (i.e.
-	 * CDROM drives), it should succeed.
-	 */
-	rc = usbat_write(us, USBAT_ATA, USBAT_ATA_CMD, 0xA1);
- 	if (rc != USB_STOR_XFER_GOOD)
- 		return USB_STOR_TRANSPORT_ERROR;
-
-	rc = usbat_get_status(us, &status);
- 	if (rc != USB_STOR_XFER_GOOD)
- 		return USB_STOR_TRANSPORT_ERROR;
-
-	/* Check for error bit, or if the command 'fell through' */
-	if (status == 0xA1 || !(status & 0x01)) {
-		/* Device is HP 8200 */
-		usb_stor_dbg(us, "Detected HP8200 CDRW\n");
-		info->devicetype = USBAT_DEV_HP8200;
-	} else {
-		/* Device is a CompactFlash reader/writer */
-		usb_stor_dbg(us, "Detected Flash reader/writer\n");
-		info->devicetype = USBAT_DEV_FLASH;
-	}
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Set the transport function based on the device type
- */
-static int usbat_set_transport(struct us_data *us,
-			       struct usbat_info *info,
-			       int devicetype)
-{
-
-	if (!info->devicetype)
-		info->devicetype = devicetype;
-
-	if (!info->devicetype)
-		usbat_identify_device(us, info);
-
-	switch (info->devicetype) {
-	default:
-		return USB_STOR_TRANSPORT_ERROR;
-
-	case  USBAT_DEV_HP8200:
-		us->transport = usbat_hp8200e_transport;
-		break;
-
-	case USBAT_DEV_FLASH:
-		us->transport = usbat_flash_transport;
-		break;
-	}
-
-	return 0;
-}
-
-/*
- * Read the media capacity
- */
-static int usbat_flash_get_sector_count(struct us_data *us,
-					struct usbat_info *info)
-{
-	unsigned char registers[3] = {
-		USBAT_ATA_SECCNT,
-		USBAT_ATA_DEVICE,
-		USBAT_ATA_CMD,
-	};
-	unsigned char  command[3] = { 0x01, 0xA0, 0xEC };
-	unsigned char *reply;
-	unsigned char status;
-	int rc;
-
-	if (!us || !info)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	reply = kmalloc(512, GFP_NOIO);
-	if (!reply)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	/* ATA command : IDENTIFY DEVICE */
-	rc = usbat_multiple_write(us, registers, command, 3);
-	if (rc != USB_STOR_XFER_GOOD) {
-		usb_stor_dbg(us, "Gah! identify_device failed\n");
-		rc = USB_STOR_TRANSPORT_ERROR;
-		goto leave;
-	}
-
-	/* Read device status */
-	if (usbat_get_status(us, &status) != USB_STOR_XFER_GOOD) {
-		rc = USB_STOR_TRANSPORT_ERROR;
-		goto leave;
-	}
-
-	msleep(100);
-
-	/* Read the device identification data */
-	rc = usbat_read_block(us, reply, 512, 0);
-	if (rc != USB_STOR_TRANSPORT_GOOD)
-		goto leave;
-
-	info->sectors = ((u32)(reply[117]) << 24) |
-		((u32)(reply[116]) << 16) |
-		((u32)(reply[115]) <<  8) |
-		((u32)(reply[114])      );
-
-	rc = USB_STOR_TRANSPORT_GOOD;
-
- leave:
-	kfree(reply);
-	return rc;
-}
-
-/*
- * Read data from device
- */
-static int usbat_flash_read_data(struct us_data *us,
-								 struct usbat_info *info,
-								 u32 sector,
-								 u32 sectors)
-{
-	unsigned char registers[7] = {
-		USBAT_ATA_FEATURES,
-		USBAT_ATA_SECCNT,
-		USBAT_ATA_SECNUM,
-		USBAT_ATA_LBA_ME,
-		USBAT_ATA_LBA_HI,
-		USBAT_ATA_DEVICE,
-		USBAT_ATA_STATUS,
-	};
-	unsigned char command[7];
-	unsigned char *buffer;
-	unsigned char  thistime;
-	unsigned int totallen, alloclen;
-	int len, result;
-	unsigned int sg_offset = 0;
-	struct scatterlist *sg = NULL;
-
-	result = usbat_flash_check_media(us, info);
-	if (result != USB_STOR_TRANSPORT_GOOD)
-		return result;
-
-	/*
-	 * we're working in LBA mode.  according to the ATA spec,
-	 * we can support up to 28-bit addressing.  I don't know if Jumpshot
-	 * supports beyond 24-bit addressing.  It's kind of hard to test
-	 * since it requires > 8GB CF card.
-	 */
-
-	if (sector > 0x0FFFFFFF)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	totallen = sectors * info->ssize;
-
-	/*
-	 * Since we don't read more than 64 KB at a time, we have to create
-	 * a bounce buffer and move the data a piece at a time between the
-	 * bounce buffer and the actual transfer buffer.
-	 */
-
-	alloclen = min(totallen, 65536u);
-	buffer = kmalloc(alloclen, GFP_NOIO);
-	if (buffer == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	do {
-		/*
-		 * loop, never allocate or transfer more than 64k at once
-		 * (min(128k, 255*info->ssize) is the real limit)
-		 */
-		len = min(totallen, alloclen);
-		thistime = (len / info->ssize) & 0xff;
- 
-		/* ATA command 0x20 (READ SECTORS) */
-		usbat_pack_ata_sector_cmd(command, thistime, sector, 0x20);
-
-		/* Write/execute ATA read command */
-		result = usbat_multiple_write(us, registers, command, 7);
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			goto leave;
-
-		/* Read the data we just requested */
-		result = usbat_read_blocks(us, buffer, len, 0);
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			goto leave;
-  	 
-		usb_stor_dbg(us, "%d bytes\n", len);
-	
-		/* Store the data in the transfer buffer */
-		usb_stor_access_xfer_buf(buffer, len, us->srb,
-					 &sg, &sg_offset, TO_XFER_BUF);
-
-		sector += thistime;
-		totallen -= len;
-	} while (totallen > 0);
-
-	kfree(buffer);
-	return USB_STOR_TRANSPORT_GOOD;
-
-leave:
-	kfree(buffer);
-	return USB_STOR_TRANSPORT_ERROR;
-}
-
-/*
- * Write data to device
- */
-static int usbat_flash_write_data(struct us_data *us,
-								  struct usbat_info *info,
-								  u32 sector,
-								  u32 sectors)
-{
-	unsigned char registers[7] = {
-		USBAT_ATA_FEATURES,
-		USBAT_ATA_SECCNT,
-		USBAT_ATA_SECNUM,
-		USBAT_ATA_LBA_ME,
-		USBAT_ATA_LBA_HI,
-		USBAT_ATA_DEVICE,
-		USBAT_ATA_STATUS,
-	};
-	unsigned char command[7];
-	unsigned char *buffer;
-	unsigned char  thistime;
-	unsigned int totallen, alloclen;
-	int len, result;
-	unsigned int sg_offset = 0;
-	struct scatterlist *sg = NULL;
-
-	result = usbat_flash_check_media(us, info);
-	if (result != USB_STOR_TRANSPORT_GOOD)
-		return result;
-
-	/*
-	 * we're working in LBA mode.  according to the ATA spec,
-	 * we can support up to 28-bit addressing.  I don't know if the device
-	 * supports beyond 24-bit addressing.  It's kind of hard to test
-	 * since it requires > 8GB media.
-	 */
-
-	if (sector > 0x0FFFFFFF)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	totallen = sectors * info->ssize;
-
-	/*
-	 * Since we don't write more than 64 KB at a time, we have to create
-	 * a bounce buffer and move the data a piece at a time between the
-	 * bounce buffer and the actual transfer buffer.
-	 */
-
-	alloclen = min(totallen, 65536u);
-	buffer = kmalloc(alloclen, GFP_NOIO);
-	if (buffer == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	do {
-		/*
-		 * loop, never allocate or transfer more than 64k at once
-		 * (min(128k, 255*info->ssize) is the real limit)
-		 */
-		len = min(totallen, alloclen);
-		thistime = (len / info->ssize) & 0xff;
-
-		/* Get the data from the transfer buffer */
-		usb_stor_access_xfer_buf(buffer, len, us->srb,
-					 &sg, &sg_offset, FROM_XFER_BUF);
-
-		/* ATA command 0x30 (WRITE SECTORS) */
-		usbat_pack_ata_sector_cmd(command, thistime, sector, 0x30);
-
-		/* Write/execute ATA write command */
-		result = usbat_multiple_write(us, registers, command, 7);
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			goto leave;
-
-		/* Write the data */
-		result = usbat_write_blocks(us, buffer, len, 0);
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			goto leave;
-
-		sector += thistime;
-		totallen -= len;
-	} while (totallen > 0);
-
-	kfree(buffer);
-	return result;
-
-leave:
-	kfree(buffer);
-	return USB_STOR_TRANSPORT_ERROR;
-}
-
-/*
- * Squeeze a potentially huge (> 65535 byte) read10 command into
- * a little ( <= 65535 byte) ATAPI pipe
- */
-static int usbat_hp8200e_handle_read10(struct us_data *us,
-				       unsigned char *registers,
-				       unsigned char *data,
-				       struct scsi_cmnd *srb)
-{
-	int result = USB_STOR_TRANSPORT_GOOD;
-	unsigned char *buffer;
-	unsigned int len;
-	unsigned int sector;
-	unsigned int sg_offset = 0;
-	struct scatterlist *sg = NULL;
-
-	usb_stor_dbg(us, "transfersize %d\n", srb->transfersize);
-
-	if (scsi_bufflen(srb) < 0x10000) {
-
-		result = usbat_hp8200e_rw_block_test(us, USBAT_ATA, 
-			registers, data, 19,
-			USBAT_ATA_DATA, USBAT_ATA_STATUS, 0xFD,
-			(USBAT_QUAL_FCQ | USBAT_QUAL_ALQ),
-			DMA_FROM_DEVICE,
-			scsi_sglist(srb),
-			scsi_bufflen(srb), scsi_sg_count(srb), 1);
-
-		return result;
-	}
-
-	/*
-	 * Since we're requesting more data than we can handle in
-	 * a single read command (max is 64k-1), we will perform
-	 * multiple reads, but each read must be in multiples of
-	 * a sector.  Luckily the sector size is in srb->transfersize
-	 * (see linux/drivers/scsi/sr.c).
-	 */
-
-	if (data[7+0] == GPCMD_READ_CD) {
-		len = short_pack(data[7+9], data[7+8]);
-		len <<= 16;
-		len |= data[7+7];
-		usb_stor_dbg(us, "GPCMD_READ_CD: len %d\n", len);
-		srb->transfersize = scsi_bufflen(srb)/len;
-	}
-
-	if (!srb->transfersize)  {
-		srb->transfersize = 2048; /* A guess */
-		usb_stor_dbg(us, "transfersize 0, forcing %d\n",
-			     srb->transfersize);
-	}
-
-	/*
-	 * Since we only read in one block at a time, we have to create
-	 * a bounce buffer and move the data a piece at a time between the
-	 * bounce buffer and the actual transfer buffer.
-	 */
-
-	len = (65535/srb->transfersize) * srb->transfersize;
-	usb_stor_dbg(us, "Max read is %d bytes\n", len);
-	len = min(len, scsi_bufflen(srb));
-	buffer = kmalloc(len, GFP_NOIO);
-	if (buffer == NULL) /* bloody hell! */
-		return USB_STOR_TRANSPORT_FAILED;
-	sector = short_pack(data[7+3], data[7+2]);
-	sector <<= 16;
-	sector |= short_pack(data[7+5], data[7+4]);
-	transferred = 0;
-
-	while (transferred != scsi_bufflen(srb)) {
-
-		if (len > scsi_bufflen(srb) - transferred)
-			len = scsi_bufflen(srb) - transferred;
-
-		data[3] = len&0xFF; 	  /* (cylL) = expected length (L) */
-		data[4] = (len>>8)&0xFF;  /* (cylH) = expected length (H) */
-
-		/* Fix up the SCSI command sector and num sectors */
-
-		data[7+2] = MSB_of(sector>>16); /* SCSI command sector */
-		data[7+3] = LSB_of(sector>>16);
-		data[7+4] = MSB_of(sector&0xFFFF);
-		data[7+5] = LSB_of(sector&0xFFFF);
-		if (data[7+0] == GPCMD_READ_CD)
-			data[7+6] = 0;
-		data[7+7] = MSB_of(len / srb->transfersize); /* SCSI command */
-		data[7+8] = LSB_of(len / srb->transfersize); /* num sectors */
-
-		result = usbat_hp8200e_rw_block_test(us, USBAT_ATA, 
-			registers, data, 19,
-			USBAT_ATA_DATA, USBAT_ATA_STATUS, 0xFD, 
-			(USBAT_QUAL_FCQ | USBAT_QUAL_ALQ),
-			DMA_FROM_DEVICE,
-			buffer,
-			len, 0, 1);
-
-		if (result != USB_STOR_TRANSPORT_GOOD)
-			break;
-
-		/* Store the data in the transfer buffer */
-		usb_stor_access_xfer_buf(buffer, len, srb,
-				 &sg, &sg_offset, TO_XFER_BUF);
-
-		/* Update the amount transferred and the sector number */
-
-		transferred += len;
-		sector += len / srb->transfersize;
-
-	} /* while transferred != scsi_bufflen(srb) */
-
-	kfree(buffer);
-	return result;
-}
-
-static int usbat_select_and_test_registers(struct us_data *us)
-{
-	int selector;
-	unsigned char *status = us->iobuf;
-
-	/* try device = master, then device = slave. */
-	for (selector = 0xA0; selector <= 0xB0; selector += 0x10) {
-		if (usbat_write(us, USBAT_ATA, USBAT_ATA_DEVICE, selector) !=
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (usbat_read(us, USBAT_ATA, USBAT_ATA_STATUS, status) != 
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (usbat_read(us, USBAT_ATA, USBAT_ATA_DEVICE, status) != 
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (usbat_read(us, USBAT_ATA, USBAT_ATA_LBA_ME, status) != 
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (usbat_read(us, USBAT_ATA, USBAT_ATA_LBA_HI, status) != 
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (usbat_write(us, USBAT_ATA, USBAT_ATA_LBA_ME, 0x55) != 
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (usbat_write(us, USBAT_ATA, USBAT_ATA_LBA_HI, 0xAA) != 
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (usbat_read(us, USBAT_ATA, USBAT_ATA_LBA_ME, status) != 
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-
-		if (usbat_read(us, USBAT_ATA, USBAT_ATA_LBA_ME, status) != 
-				USB_STOR_XFER_GOOD)
-			return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Initialize the USBAT processor and the storage device
- */
-static int init_usbat(struct us_data *us, int devicetype)
-{
-	int rc;
-	struct usbat_info *info;
-	unsigned char subcountH = USBAT_ATA_LBA_HI;
-	unsigned char subcountL = USBAT_ATA_LBA_ME;
-	unsigned char *status = us->iobuf;
-
-	us->extra = kzalloc(sizeof(struct usbat_info), GFP_NOIO);
-	if (!us->extra)
-		return 1;
-
-	info = (struct usbat_info *) (us->extra);
-
-	/* Enable peripheral control signals */
-	rc = usbat_write_user_io(us,
-				 USBAT_UIO_OE1 | USBAT_UIO_OE0,
-				 USBAT_UIO_EPAD | USBAT_UIO_1);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "INIT 1\n");
-
-	msleep(2000);
-
-	rc = usbat_read_user_io(us, status);
-	if (rc != USB_STOR_TRANSPORT_GOOD)
-		return rc;
-
-	usb_stor_dbg(us, "INIT 2\n");
-
-	rc = usbat_read_user_io(us, status);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	rc = usbat_read_user_io(us, status);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "INIT 3\n");
-
-	rc = usbat_select_and_test_registers(us);
-	if (rc != USB_STOR_TRANSPORT_GOOD)
-		return rc;
-
-	usb_stor_dbg(us, "INIT 4\n");
-
-	rc = usbat_read_user_io(us, status);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "INIT 5\n");
-
-	/* Enable peripheral control signals and card detect */
-	rc = usbat_device_enable_cdt(us);
-	if (rc != USB_STOR_TRANSPORT_GOOD)
-		return rc;
-
-	usb_stor_dbg(us, "INIT 6\n");
-
-	rc = usbat_read_user_io(us, status);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "INIT 7\n");
-
-	msleep(1400);
-
-	rc = usbat_read_user_io(us, status);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "INIT 8\n");
-
-	rc = usbat_select_and_test_registers(us);
-	if (rc != USB_STOR_TRANSPORT_GOOD)
-		return rc;
-
-	usb_stor_dbg(us, "INIT 9\n");
-
-	/* At this point, we need to detect which device we are using */
-	if (usbat_set_transport(us, info, devicetype))
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "INIT 10\n");
-
-	if (usbat_get_device_type(us) == USBAT_DEV_FLASH) { 
-		subcountH = 0x02;
-		subcountL = 0x00;
-	}
-	rc = usbat_set_shuttle_features(us, (USBAT_FEAT_ETEN | USBAT_FEAT_ET2 | USBAT_FEAT_ET1),
-									0x00, 0x88, 0x08, subcountH, subcountL);
-	if (rc != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	usb_stor_dbg(us, "INIT 11\n");
-
-	return USB_STOR_TRANSPORT_GOOD;
-}
-
-/*
- * Transport for the HP 8200e
- */
-static int usbat_hp8200e_transport(struct scsi_cmnd *srb, struct us_data *us)
-{
-	int result;
-	unsigned char *status = us->iobuf;
-	unsigned char registers[32];
-	unsigned char data[32];
-	unsigned int len;
-	int i;
-
-	len = scsi_bufflen(srb);
-
-	/* Send A0 (ATA PACKET COMMAND).
-	   Note: I guess we're never going to get any of the ATA
-	   commands... just ATA Packet Commands.
- 	 */
-
-	registers[0] = USBAT_ATA_FEATURES;
-	registers[1] = USBAT_ATA_SECCNT;
-	registers[2] = USBAT_ATA_SECNUM;
-	registers[3] = USBAT_ATA_LBA_ME;
-	registers[4] = USBAT_ATA_LBA_HI;
-	registers[5] = USBAT_ATA_DEVICE;
-	registers[6] = USBAT_ATA_CMD;
-	data[0] = 0x00;
-	data[1] = 0x00;
-	data[2] = 0x00;
-	data[3] = len&0xFF; 		/* (cylL) = expected length (L) */
-	data[4] = (len>>8)&0xFF; 	/* (cylH) = expected length (H) */
-	data[5] = 0xB0; 		/* (device sel) = slave */
-	data[6] = 0xA0; 		/* (command) = ATA PACKET COMMAND */
-
-	for (i=7; i<19; i++) {
-		registers[i] = 0x10;
-		data[i] = (i-7 >= srb->cmd_len) ? 0 : srb->cmnd[i-7];
-	}
-
-	result = usbat_get_status(us, status);
-	usb_stor_dbg(us, "Status = %02X\n", *status);
-	if (result != USB_STOR_XFER_GOOD)
-		return USB_STOR_TRANSPORT_ERROR;
-	if (srb->cmnd[0] == TEST_UNIT_READY)
-		transferred = 0;
-
-	if (srb->sc_data_direction == DMA_TO_DEVICE) {
-
-		result = usbat_hp8200e_rw_block_test(us, USBAT_ATA, 
-			registers, data, 19,
-			USBAT_ATA_DATA, USBAT_ATA_STATUS, 0xFD,
-			(USBAT_QUAL_FCQ | USBAT_QUAL_ALQ),
-			DMA_TO_DEVICE,
-			scsi_sglist(srb),
-			len, scsi_sg_count(srb), 10);
-
-		if (result == USB_STOR_TRANSPORT_GOOD) {
-			transferred += len;
-			usb_stor_dbg(us, "Wrote %08X bytes\n", transferred);
-		}
-
-		return result;
-
-	} else if (srb->cmnd[0] == READ_10 ||
-		   srb->cmnd[0] == GPCMD_READ_CD) {
-
-		return usbat_hp8200e_handle_read10(us, registers, data, srb);
-
-	}
-
-	if (len > 0xFFFF) {
-		usb_stor_dbg(us, "Error: len = %08X... what do I do now?\n",
-			     len);
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	result = usbat_multiple_write(us, registers, data, 7);
-
-	if (result != USB_STOR_TRANSPORT_GOOD)
-		return result;
-
-	/*
-	 * Write the 12-byte command header.
-	 *
-	 * If the command is BLANK then set the timer for 75 minutes.
-	 * Otherwise set it for 10 minutes.
-	 *
-	 * NOTE: THE 8200 DOCUMENTATION STATES THAT BLANKING A CDRW
-	 * AT SPEED 4 IS UNRELIABLE!!!
-	 */
-
-	result = usbat_write_block(us, USBAT_ATA, srb->cmnd, 12,
-				   srb->cmnd[0] == GPCMD_BLANK ? 75 : 10, 0);
-
-	if (result != USB_STOR_TRANSPORT_GOOD)
-		return result;
-
-	/* If there is response data to be read in then do it here. */
-
-	if (len != 0 && (srb->sc_data_direction == DMA_FROM_DEVICE)) {
-
-		/* How many bytes to read in? Check cylL register */
-
-		if (usbat_read(us, USBAT_ATA, USBAT_ATA_LBA_ME, status) != 
-		    	USB_STOR_XFER_GOOD) {
-			return USB_STOR_TRANSPORT_ERROR;
-		}
-
-		if (len > 0xFF) { /* need to read cylH also */
-			len = *status;
-			if (usbat_read(us, USBAT_ATA, USBAT_ATA_LBA_HI, status) !=
-				    USB_STOR_XFER_GOOD) {
-				return USB_STOR_TRANSPORT_ERROR;
-			}
-			len += ((unsigned int) *status)<<8;
-		}
-		else
-			len = *status;
-
-
-		result = usbat_read_block(us, scsi_sglist(srb), len,
-			                                   scsi_sg_count(srb));
-	}
-
-	return result;
-}
-
-/*
- * Transport for USBAT02-based CompactFlash and similar storage devices
- */
-static int usbat_flash_transport(struct scsi_cmnd * srb, struct us_data *us)
-{
-	int rc;
-	struct usbat_info *info = (struct usbat_info *) (us->extra);
-	unsigned long block, blocks;
-	unsigned char *ptr = us->iobuf;
-	static unsigned char inquiry_response[36] = {
-		0x00, 0x80, 0x00, 0x01, 0x1F, 0x00, 0x00, 0x00
-	};
-
-	if (srb->cmnd[0] == INQUIRY) {
-		usb_stor_dbg(us, "INQUIRY - Returning bogus response\n");
-		memcpy(ptr, inquiry_response, sizeof(inquiry_response));
-		fill_inquiry_response(us, ptr, 36);
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == READ_CAPACITY) {
-		rc = usbat_flash_check_media(us, info);
-		if (rc != USB_STOR_TRANSPORT_GOOD)
-			return rc;
-
-		rc = usbat_flash_get_sector_count(us, info);
-		if (rc != USB_STOR_TRANSPORT_GOOD)
-			return rc;
-
-		/* hard coded 512 byte sectors as per ATA spec */
-		info->ssize = 0x200;
-		usb_stor_dbg(us, "READ_CAPACITY: %ld sectors, %ld bytes per sector\n",
-			     info->sectors, info->ssize);
-
-		/*
-		 * build the reply
-		 * note: must return the sector number of the last sector,
-		 * *not* the total number of sectors
-		 */
-		((__be32 *) ptr)[0] = cpu_to_be32(info->sectors - 1);
-		((__be32 *) ptr)[1] = cpu_to_be32(info->ssize);
-		usb_stor_set_xfer_buf(ptr, 8, srb);
-
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == MODE_SELECT_10) {
-		usb_stor_dbg(us, "Gah! MODE_SELECT_10\n");
-		return USB_STOR_TRANSPORT_ERROR;
-	}
-
-	if (srb->cmnd[0] == READ_10) {
-		block = ((u32)(srb->cmnd[2]) << 24) | ((u32)(srb->cmnd[3]) << 16) |
-				((u32)(srb->cmnd[4]) <<  8) | ((u32)(srb->cmnd[5]));
-
-		blocks = ((u32)(srb->cmnd[7]) << 8) | ((u32)(srb->cmnd[8]));
-
-		usb_stor_dbg(us, "READ_10: read block 0x%04lx  count %ld\n",
-			     block, blocks);
-		return usbat_flash_read_data(us, info, block, blocks);
-	}
-
-	if (srb->cmnd[0] == READ_12) {
-		/*
-		 * I don't think we'll ever see a READ_12 but support it anyway
-		 */
-		block = ((u32)(srb->cmnd[2]) << 24) | ((u32)(srb->cmnd[3]) << 16) |
-		        ((u32)(srb->cmnd[4]) <<  8) | ((u32)(srb->cmnd[5]));
-
-		blocks = ((u32)(srb->cmnd[6]) << 24) | ((u32)(srb->cmnd[7]) << 16) |
-		         ((u32)(srb->cmnd[8]) <<  8) | ((u32)(srb->cmnd[9]));
-
-		usb_stor_dbg(us, "READ_12: read block 0x%04lx  count %ld\n",
-			     block, blocks);
-		return usbat_flash_read_data(us, info, block, blocks);
-	}
-
-	if (srb->cmnd[0] == WRITE_10) {
-		block = ((u32)(srb->cmnd[2]) << 24) | ((u32)(srb->cmnd[3]) << 16) |
-		        ((u32)(srb->cmnd[4]) <<  8) | ((u32)(srb->cmnd[5]));
-
-		blocks = ((u32)(srb->cmnd[7]) << 8) | ((u32)(srb->cmnd[8]));
-
-		usb_stor_dbg(us, "WRITE_10: write block 0x%04lx  count %ld\n",
-			     block, blocks);
-		return usbat_flash_write_data(us, info, block, blocks);
-	}
-
-	if (srb->cmnd[0] == WRITE_12) {
-		/*
-		 * I don't think we'll ever see a WRITE_12 but support it anyway
-		 */
-		block = ((u32)(srb->cmnd[2]) << 24) | ((u32)(srb->cmnd[3]) << 16) |
-		        ((u32)(srb->cmnd[4]) <<  8) | ((u32)(srb->cmnd[5]));
-
-		blocks = ((u32)(srb->cmnd[6]) << 24) | ((u32)(srb->cmnd[7]) << 16) |
-		         ((u32)(srb->cmnd[8]) <<  8) | ((u32)(srb->cmnd[9]));
-
-		usb_stor_dbg(us, "WRITE_12: write block 0x%04lx  count %ld\n",
-			     block, blocks);
-		return usbat_flash_write_data(us, info, block, blocks);
-	}
-
-
-	if (srb->cmnd[0] == TEST_UNIT_READY) {
-		usb_stor_dbg(us, "TEST_UNIT_READY\n");
-
-		rc = usbat_flash_check_media(us, info);
-		if (rc != USB_STOR_TRANSPORT_GOOD)
-			return rc;
-
-		return usbat_check_status(us);
-	}
-
-	if (srb->cmnd[0] == REQUEST_SENSE) {
-		usb_stor_dbg(us, "REQUEST_SENSE\n");
-
-		memset(ptr, 0, 18);
-		ptr[0] = 0xF0;
-		ptr[2] = info->sense_key;
-		ptr[7] = 11;
-		ptr[12] = info->sense_asc;
-		ptr[13] = info->sense_ascq;
-		usb_stor_set_xfer_buf(ptr, 18, srb);
-
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	if (srb->cmnd[0] == ALLOW_MEDIUM_REMOVAL) {
-		/*
-		 * sure.  whatever.  not like we can stop the user from popping
-		 * the media out of the device (no locking doors, etc)
-		 */
-		return USB_STOR_TRANSPORT_GOOD;
-	}
-
-	usb_stor_dbg(us, "Gah! Unknown command: %d (0x%x)\n",
-		     srb->cmnd[0], srb->cmnd[0]);
-	info->sense_key = 0x05;
-	info->sense_asc = 0x20;
-	info->sense_ascq = 0x00;
-	return USB_STOR_TRANSPORT_FAILED;
-}
-
-static int init_usbat_cd(struct us_data *us)
-{
-	return init_usbat(us, USBAT_DEV_HP8200);
-}
-
-static int init_usbat_flash(struct us_data *us)
-{
-	return init_usbat(us, USBAT_DEV_FLASH);
-}
-
-static struct scsi_host_template usbat_host_template;
-
-static int usbat_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-
-	result = usb_stor_probe1(&us, intf, id,
-			(id - usbat_usb_ids) + usbat_unusual_dev_list,
-			&usbat_host_template);
-	if (result)
-		return result;
-
-	/* The actual transport will be determined later by the
-	 * initialization routine; this is just a placeholder.
-	 */
-	us->transport_name = "Shuttle USBAT";
-	us->transport = usbat_flash_transport;
-	us->transport_reset = usb_stor_CB_reset;
-	us->max_lun = 0;
-
-	result = usb_stor_probe2(us);
-	return result;
-}
-
-static struct usb_driver usbat_driver = {
-	.name =		DRV_NAME,
-	.probe =	usbat_probe,
-	.disconnect =	usb_stor_disconnect,
-	.suspend =	usb_stor_suspend,
-	.resume =	usb_stor_resume,
-	.reset_resume =	usb_stor_reset_resume,
-	.pre_reset =	usb_stor_pre_reset,
-	.post_reset =	usb_stor_post_reset,
-	.id_table =	usbat_usb_ids,
-	.soft_unbind =	1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(usbat_driver, usbat_host_template, DRV_NAME);
+e D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F1_PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F1_PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F1_PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F1_PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F1_PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F1_PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F1_PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F1_PCIE_LANE_9_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F1_PCIE_LANE_10_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F1_PCIE_LANE_11_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F1_PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F1_PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F1_PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F1_PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F1_PCIE_ACS_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F1_PCIE_ACS_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F1_PCIE_ACS_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F1_PCIE_ACS_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F1_PCIE_ACS_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F1_PCIE_ACS_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F1_PCIE_ACS_CAP__SOURCE_VALIDATION_MASK 0x1
+#define D2F1_PCIE_ACS_CAP__SOURCE_VALIDATION__SHIFT 0x0
+#define D2F1_PCIE_ACS_CAP__TRANSLATION_BLOCKING_MASK 0x2
+#define D2F1_PCIE_ACS_CAP__TRANSLATION_BLOCKING__SHIFT 0x1
+#define D2F1_PCIE_ACS_CAP__P2P_REQUEST_REDIRECT_MASK 0x4
+#define D2F1_PCIE_ACS_CAP__P2P_REQUEST_REDIRECT__SHIFT 0x2
+#define D2F1_PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT_MASK 0x8
+#define D2F1_PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT__SHIFT 0x3
+#define D2F1_PCIE_ACS_CAP__UPSTREAM_FORWARDING_MASK 0x10
+#define D2F1_PCIE_ACS_CAP__UPSTREAM_FORWARDING__SHIFT 0x4
+#define D2F1_PCIE_ACS_CAP__P2P_EGRESS_CONTROL_MASK 0x20
+#define D2F1_PCIE_ACS_CAP__P2P_EGRESS_CONTROL__SHIFT 0x5
+#define D2F1_PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P_MASK 0x40
+#define D2F1_PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P__SHIFT 0x6
+#define D2F1_PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE_MASK 0xff00
+#define D2F1_PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE__SHIFT 0x8
+#define D2F1_PCIE_ACS_CNTL__SOURCE_VALIDATION_EN_MASK 0x10000
+#define D2F1_PCIE_ACS_CNTL__SOURCE_VALIDATION_EN__SHIFT 0x10
+#define D2F1_PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN_MASK 0x20000
+#define D2F1_PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN__SHIFT 0x11
+#define D2F1_PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN_MASK 0x40000
+#define D2F1_PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN__SHIFT 0x12
+#define D2F1_PCIE_ACS_CNTL__P2P_COMPLETION_REDIRECT_EN_MASK 0x80000
+#define D2F1_PCIE_ACS_CNTL__P2P_COMPLETION_REDIRECT_EN__SHIFT 0x13
+#define D2F1_PCIE_ACS_CNTL__UPSTREAM_FORWARDING_EN_MASK 0x100000
+#define D2F1_PCIE_ACS_CNTL__UPSTREAM_FORWARDING_EN__SHIFT 0x14
+#define D2F1_PCIE_ACS_CNTL__P2P_EGRESS_CONTROL_EN_MASK 0x200000
+#define D2F1_PCIE_ACS_CNTL__P2P_EGRESS_CONTROL_EN__SHIFT 0x15
+#define D2F1_PCIE_ACS_CNTL__DIRECT_TRANSLATED_P2P_EN_MASK 0x400000
+#define D2F1_PCIE_ACS_CNTL__DIRECT_TRANSLATED_P2P_EN__SHIFT 0x16
+#define D2F1_PCIE_MC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F1_PCIE_MC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F1_PCIE_MC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F1_PCIE_MC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F1_PCIE_MC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F1_PCIE_MC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F1_PCIE_MC_CAP__MC_MAX_GROUP_MASK 0x3f
+#define D2F1_PCIE_MC_CAP__MC_MAX_GROUP__SHIFT 0x0
+#define D2F1_PCIE_MC_CAP__MC_ECRC_REGEN_SUPP_MASK 0x8000
+#define D2F1_PCIE_MC_CAP__MC_ECRC_REGEN_SUPP__SHIFT 0xf
+#define D2F1_PCIE_MC_CNTL__MC_NUM_GROUP_MASK 0x3f0000
+#define D2F1_PCIE_MC_CNTL__MC_NUM_GROUP__SHIFT 0x10
+#define D2F1_PCIE_MC_CNTL__MC_ENABLE_MASK 0x80000000
+#define D2F1_PCIE_MC_CNTL__MC_ENABLE__SHIFT 0x1f
+#define D2F1_PCIE_MC_ADDR0__MC_INDEX_POS_MASK 0x3f
+#define D2F1_PCIE_MC_ADDR0__MC_INDEX_POS__SHIFT 0x0
+#define D2F1_PCIE_MC_ADDR0__MC_BASE_ADDR_0_MASK 0xfffff000
+#define D2F1_PCIE_MC_ADDR0__MC_BASE_ADDR_0__SHIFT 0xc
+#define D2F1_PCIE_MC_ADDR1__MC_BASE_ADDR_1_MASK 0xffffffff
+#define D2F1_PCIE_MC_ADDR1__MC_BASE_ADDR_1__SHIFT 0x0
+#define D2F1_PCIE_MC_RCV0__MC_RECEIVE_0_MASK 0xffffffff
+#define D2F1_PCIE_MC_RCV0__MC_RECEIVE_0__SHIFT 0x0
+#define D2F1_PCIE_MC_RCV1__MC_RECEIVE_1_MASK 0xffffffff
+#define D2F1_PCIE_MC_RCV1__MC_RECEIVE_1__SHIFT 0x0
+#define D2F1_PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0_MASK 0xffffffff
+#define D2F1_PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0__SHIFT 0x0
+#define D2F1_PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1_MASK 0xffffffff
+#define D2F1_PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1__SHIFT 0x0
+#define D2F1_PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0_MASK 0xffffffff
+#define D2F1_PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0__SHIFT 0x0
+#define D2F1_PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1_MASK 0xffffffff
+#define D2F1_PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1__SHIFT 0x0
+#define D2F1_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_SIZE_MASK 0x3f
+#define D2F1_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_SIZE__SHIFT 0x0
+#define D2F1_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_BAR_0_MASK 0xffffffc0
+#define D2F1_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_BAR_0__SHIFT 0x6
+#define D2F1_PCIE_MC_OVERLAY_BAR1__MC_OVERLAY_BAR_1_MASK 0xffffffff
+#define D2F1_PCIE_MC_OVERLAY_BAR1__MC_OVERLAY_BAR_1__SHIFT 0x0
+#define D2F2_PCIE_PORT_INDEX__PCIE_INDEX_MASK 0xff
+#define D2F2_PCIE_PORT_INDEX__PCIE_INDEX__SHIFT 0x0
+#define D2F2_PCIE_PORT_DATA__PCIE_DATA_MASK 0xffffffff
+#define D2F2_PCIE_PORT_DATA__PCIE_DATA__SHIFT 0x0
+#define D2F2_PCIEP_RESERVED__PCIEP_RESERVED_MASK 0xffffffff
+#define D2F2_PCIEP_RESERVED__PCIEP_RESERVED__SHIFT 0x0
+#define D2F2_PCIEP_SCRATCH__PCIEP_SCRATCH_MASK 0xffffffff
+#define D2F2_PCIEP_SCRATCH__PCIEP_SCRATCH__SHIFT 0x0
+#define D2F2_PCIEP_HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define D2F2_PCIEP_HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define D2F2_PCIEP_HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define D2F2_PCIEP_HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define D2F2_PCIEP_HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define D2F2_PCIEP_HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define D2F2_PCIEP_HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define D2F2_PCIEP_HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define D2F2_PCIEP_HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define D2F2_PCIEP_HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define D2F2_PCIEP_HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define D2F2_PCIEP_HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define D2F2_PCIEP_HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define D2F2_PCIEP_HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define D2F2_PCIEP_HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define D2F2_PCIEP_HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define D2F2_PCIEP_HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define D2F2_PCIEP_HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define D2F2_PCIEP_HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define D2F2_PCIEP_HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define D2F2_PCIEP_HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define D2F2_PCIEP_HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define D2F2_PCIEP_HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define D2F2_PCIEP_HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define D2F2_PCIEP_HW_DEBUG__HW_12_DEBUG_MASK 0x1000
+#define D2F2_PCIEP_HW_DEBUG__HW_12_DEBUG__SHIFT 0xc
+#define D2F2_PCIEP_HW_DEBUG__HW_13_DEBUG_MASK 0x2000
+#define D2F2_PCIEP_HW_DEBUG__HW_13_DEBUG__SHIFT 0xd
+#define D2F2_PCIEP_HW_DEBUG__HW_14_DEBUG_MASK 0x4000
+#define D2F2_PCIEP_HW_DEBUG__HW_14_DEBUG__SHIFT 0xe
+#define D2F2_PCIEP_HW_DEBUG__HW_15_DEBUG_MASK 0x8000
+#define D2F2_PCIEP_HW_DEBUG__HW_15_DEBUG__SHIFT 0xf
+#define D2F2_PCIEP_PORT_CNTL__SLV_PORT_REQ_EN_MASK 0x1
+#define D2F2_PCIEP_PORT_CNTL__SLV_PORT_REQ_EN__SHIFT 0x0
+#define D2F2_PCIEP_PORT_CNTL__CI_SNOOP_OVERRIDE_MASK 0x2
+#define D2F2_PCIEP_PORT_CNTL__CI_SNOOP_OVERRIDE__SHIFT 0x1
+#define D2F2_PCIEP_PORT_CNTL__HOTPLUG_MSG_EN_MASK 0x4
+#define D2F2_PCIEP_PORT_CNTL__HOTPLUG_MSG_EN__SHIFT 0x2
+#define D2F2_PCIEP_PORT_CNTL__NATIVE_PME_EN_MASK 0x8
+#define D2F2_PCIEP_PORT_CNTL__NATIVE_PME_EN__SHIFT 0x3
+#define D2F2_PCIEP_PORT_CNTL__PWR_FAULT_EN_MASK 0x10
+#define D2F2_PCIEP_PORT_CNTL__PWR_FAULT_EN__SHIFT 0x4
+#define D2F2_PCIEP_PORT_CNTL__PMI_BM_DIS_MASK 0x20
+#define D2F2_PCIEP_PORT_CNTL__PMI_BM_DIS__SHIFT 0x5
+#define D2F2_PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE_MASK 0x40
+#define D2F2_PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE__SHIFT 0x6
+#define D2F2_PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S_MASK 0x7f00
+#define D2F2_PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S__SHIFT 0x8
+#define D2F2_PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE_MASK 0x30000
+#define D2F2_PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define D2F2_PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE_MASK 0x1c0000
+#define D2F2_PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE__SHIFT 0x12
+#define D2F2_PCIE_TX_CNTL__TX_SNR_OVERRIDE_MASK 0xc00
+#define D2F2_PCIE_TX_CNTL__TX_SNR_OVERRIDE__SHIFT 0xa
+#define D2F2_PCIE_TX_CNTL__TX_RO_OVERRIDE_MASK 0x3000
+#define D2F2_PCIE_TX_CNTL__TX_RO_OVERRIDE__SHIFT 0xc
+#define D2F2_PCIE_TX_CNTL__TX_PACK_PACKET_DIS_MASK 0x4000
+#define D2F2_PCIE_TX_CNTL__TX_PACK_PACKET_DIS__SHIFT 0xe
+#define D2F2_PCIE_TX_CNTL__TX_FLUSH_TLP_DIS_MASK 0x8000
+#define D2F2_PCIE_TX_CNTL__TX_FLUSH_TLP_DIS__SHIFT 0xf
+#define D2F2_PCIE_TX_CNTL__TX_CPL_PASS_P_MASK 0x100000
+#define D2F2_PCIE_TX_CNTL__TX_CPL_PASS_P__SHIFT 0x14
+#define D2F2_PCIE_TX_CNTL__TX_NP_PASS_P_MASK 0x200000
+#define D2F2_PCIE_TX_CNTL__TX_NP_PASS_P__SHIFT 0x15
+#define D2F2_PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS_MASK 0x400000
+#define D2F2_PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS__SHIFT 0x16
+#define D2F2_PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS_MASK 0x800000
+#define D2F2_PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS__SHIFT 0x17
+#define D2F2_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION_MASK 0x7
+#define D2F2_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION__SHIFT 0x0
+#define D2F2_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE_MASK 0xf8
+#define D2F2_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE__SHIFT 0x3
+#define D2F2_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS_MASK 0xff00
+#define D2F2_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS__SHIFT 0x8
+#define D2F2_PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA_MASK 0xffffff
+#define D2F2_PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA__SHIFT 0x0
+#define D2F2_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_MASK 0x3f000000
+#define D2F2_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP__SHIFT 0x18
+#define D2F2_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN_MASK 0x40000000
+#define D2F2_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN__SHIFT 0x1e
+#define D2F2_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN_MASK 0x80000000
+#define D2F2_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN__SHIFT 0x1f
+#define D2F2_PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ_MASK 0xfff
+#define D2F2_PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ__SHIFT 0x0
+#define D2F2_PCIE_TX_SEQ__TX_ACKD_SEQ_MASK 0xfff0000
+#define D2F2_PCIE_TX_SEQ__TX_ACKD_SEQ__SHIFT 0x10
+#define D2F2_PCIE_TX_REPLAY__TX_REPLAY_NUM_MASK 0x7
+#define D2F2_PCIE_TX_REPLAY__TX_REPLAY_NUM__SHIFT 0x0
+#define D2F2_PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE_MASK 0x8000
+#define D2F2_PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE__SHIFT 0xf
+#define D2F2_PCIE_TX_REPLAY__TX_REPLAY_TIMER_MASK 0xffff0000
+#define D2F2_PCIE_TX_REPLAY__TX_REPLAY_TIMER__SHIFT 0x10
+#define D2F2_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_MASK 0xfff
+#define D2F2_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT__SHIFT 0x0
+#define D2F2_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE_MASK 0x1000
+#define D2F2_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE__SHIFT 0xc
+#define D2F2_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD_MASK 0xfff
+#define D2F2_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD__SHIFT 0x0
+#define D2F2_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH_MASK 0xff0000
+#define D2F2_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH__SHIFT 0x10
+#define D2F2_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD_MASK 0xfff
+#define D2F2_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD__SHIFT 0x0
+#define D2F2_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPH_MASK 0xff0000
+#define D2F2_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPH__SHIFT 0x10
+#define D2F2_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLD_MASK 0xfff
+#define D2F2_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLD__SHIFT 0x0
+#define D2F2_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLH_MASK 0xff0000
+#define D2F2_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLH__SHIFT 0x10
+#define D2F2_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PD_MASK 0xfff
+#define D2F2_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PD__SHIFT 0x0
+#define D2F2_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PH_MASK 0xff0000
+#define D2F2_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PH__SHIFT 0x10
+#define D2F2_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPD_MASK 0xfff
+#define D2F2_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPD__SHIFT 0x0
+#define D2F2_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPH_MASK 0xff0000
+#define D2F2_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPH__SHIFT 0x10
+#define D2F2_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLD_MASK 0xfff
+#define D2F2_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLD__SHIFT 0x0
+#define D2F2_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLH_MASK 0xff0000
+#define D2F2_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLH__SHIFT 0x10
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD_MASK 0x1
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD__SHIFT 0x0
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH_MASK 0x2
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH__SHIFT 0x1
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD_MASK 0x4
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD__SHIFT 0x2
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH_MASK 0x8
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH__SHIFT 0x3
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD_MASK 0x10
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD__SHIFT 0x4
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH_MASK 0x20
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH__SHIFT 0x5
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD_MASK 0x10000
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD__SHIFT 0x10
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH_MASK 0x20000
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH__SHIFT 0x11
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD_MASK 0x40000
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD__SHIFT 0x12
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH_MASK 0x80000
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH__SHIFT 0x13
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD_MASK 0x100000
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD__SHIFT 0x14
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH_MASK 0x200000
+#define D2F2_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH__SHIFT 0x15
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0_MASK 0x7
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0__SHIFT 0x0
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0_MASK 0x70
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0__SHIFT 0x4
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0_MASK 0x700
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0__SHIFT 0x8
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1_MASK 0x70000
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1__SHIFT 0x10
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1_MASK 0x700000
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1__SHIFT 0x14
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1_MASK 0x7000000
+#define D2F2_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1__SHIFT 0x18
+#define D2F2_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL_MASK 0x1
+#define D2F2_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL__SHIFT 0x0
+#define D2F2_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH_MASK 0x7e
+#define D2F2_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH__SHIFT 0x1
+#define D2F2_PCIE_FC_P__PD_CREDITS_MASK 0xff
+#define D2F2_PCIE_FC_P__PD_CREDITS__SHIFT 0x0
+#define D2F2_PCIE_FC_P__PH_CREDITS_MASK 0xff00
+#define D2F2_PCIE_FC_P__PH_CREDITS__SHIFT 0x8
+#define D2F2_PCIE_FC_NP__NPD_CREDITS_MASK 0xff
+#define D2F2_PCIE_FC_NP__NPD_CREDITS__SHIFT 0x0
+#define D2F2_PCIE_FC_NP__NPH_CREDITS_MASK 0xff00
+#define D2F2_PCIE_FC_NP__NPH_CREDITS__SHIFT 0x8
+#define D2F2_PCIE_FC_CPL__CPLD_CREDITS_MASK 0xff
+#define D2F2_PCIE_FC_CPL__CPLD_CREDITS__SHIFT 0x0
+#define D2F2_PCIE_FC_CPL__CPLH_CREDITS_MASK 0xff00
+#define D2F2_PCIE_FC_CPL__CPLH_CREDITS__SHIFT 0x8
+#define D2F2_PCIE_ERR_CNTL__ERR_REPORTING_DIS_MASK 0x1
+#define D2F2_PCIE_ERR_CNTL__ERR_REPORTING_DIS__SHIFT 0x0
+#define D2F2_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG_MASK 0x2
+#define D2F2_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG__SHIFT 0x1
+#define D2F2_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES_MASK 0x4
+#define D2F2_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES__SHIFT 0x2
+#define D2F2_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR_MASK 0x10
+#define D2F2_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR__SHIFT 0x4
+#define D2F2_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR_MASK 0x20
+#define D2F2_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR__SHIFT 0x5
+#define D2F2_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR_MASK 0x40
+#define D2F2_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR__SHIFT 0x6
+#define D2F2_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR_MASK 0x80
+#define D2F2_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR__SHIFT 0x7
+#define D2F2_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT_MASK 0x700
+#define D2F2_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT__SHIFT 0x8
+#define D2F2_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED_MASK 0x800
+#define D2F2_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED__SHIFT 0xb
+#define D2F2_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS_MASK 0x4000
+#define D2F2_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS__SHIFT 0xe
+#define D2F2_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS_MASK 0x8000
+#define D2F2_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS__SHIFT 0xf
+#define D2F2_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET_MASK 0x10000
+#define D2F2_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET__SHIFT 0x10
+#define D2F2_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY_MASK 0x20000
+#define D2F2_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY__SHIFT 0x11
+#define D2F2_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL_MASK 0x40000
+#define D2F2_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL__SHIFT 0x12
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_IO_ERR_MASK 0x1
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_IO_ERR__SHIFT 0x0
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_BE_ERR_MASK 0x2
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_BE_ERR__SHIFT 0x1
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR_MASK 0x4
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR__SHIFT 0x2
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR_MASK 0x8
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR__SHIFT 0x3
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR_MASK 0x10
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR__SHIFT 0x4
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR_MASK 0x20
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR__SHIFT 0x5
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_EP_ERR_MASK 0x40
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_EP_ERR__SHIFT 0x6
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR_MASK 0x80
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR__SHIFT 0x7
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR_MASK 0x100
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR__SHIFT 0x8
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_TC_ERR_MASK 0x200
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_TC_ERR__SHIFT 0x9
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CFG_UR_MASK 0x400
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CFG_UR__SHIFT 0xa
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_IO_UR_MASK 0x800
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_IO_UR__SHIFT 0xb
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_AT_ERR_MASK 0x1000
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_AT_ERR__SHIFT 0xc
+#define D2F2_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL_MASK 0x2000
+#define D2F2_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL__SHIFT 0xd
+#define D2F2_PCIE_RX_CNTL__RX_GEN_ONE_NAK_MASK 0x4000
+#define D2F2_PCIE_RX_CNTL__RX_GEN_ONE_NAK__SHIFT 0xe
+#define D2F2_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG_MASK 0x8000
+#define D2F2_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG__SHIFT 0xf
+#define D2F2_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MASK 0x70000
+#define D2F2_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT__SHIFT 0x10
+#define D2F2_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE_MASK 0x80000
+#define D2F2_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE__SHIFT 0x13
+#define D2F2_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS_MASK 0x100000
+#define D2F2_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS__SHIFT 0x14
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR_MASK 0x200000
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR__SHIFT 0x15
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR_MASK 0x400000
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR__SHIFT 0x16
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR_MASK 0x800000
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR__SHIFT 0x17
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR_MASK 0x1000000
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR__SHIFT 0x18
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR_MASK 0x2000000
+#define D2F2_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR__SHIFT 0x19
+#define D2F2_PCIE_RX_CNTL__RX_TPH_DIS_MASK 0x4000000
+#define D2F2_PCIE_RX_CNTL__RX_TPH_DIS__SHIFT 0x1a
+#define D2F2_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS_MASK 0x8000000
+#define D2F2_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS__SHIFT 0x1b
+#define D2F2_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM_MASK 0xfff
+#define D2F2_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM__SHIFT 0x0
+#define D2F2_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA_MASK 0xffffff
+#define D2F2_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA__SHIFT 0x0
+#define D2F2_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS_MASK 0x1000000
+#define D2F2_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS__SHIFT 0x18
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR_MASK 0x1
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR__SHIFT 0x0
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR_MASK 0x2
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR__SHIFT 0x1
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR_MASK 0x4
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR__SHIFT 0x2
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR_MASK 0x8
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR__SHIFT 0x3
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR_MASK 0x10
+#define D2F2_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR__SHIFT 0x4
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD_MASK 0xfff
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD__SHIFT 0x0
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH_MASK 0xff0000
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH__SHIFT 0x10
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD_MASK 0xfff
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD__SHIFT 0x0
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH_MASK 0xff0000
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH__SHIFT 0x10
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD_MASK 0xfff
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD__SHIFT 0x0
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH_MASK 0xff0000
+#define D2F2_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH__SHIFT 0x10
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR_MASK 0x3
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR__SHIFT 0x0
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR_MASK 0xc
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR__SHIFT 0x2
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP_MASK 0x30
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP__SHIFT 0x4
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP_MASK 0xc0
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP__SHIFT 0x6
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW_MASK 0x300
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW__SHIFT 0x8
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW_MASK 0xc00
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW__SHIFT 0xa
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR_MASK 0x3000
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR__SHIFT 0xc
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR_MASK 0xc000
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR__SHIFT 0xe
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR_MASK 0x30000
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR__SHIFT 0x10
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR_MASK 0xc0000
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR__SHIFT 0x12
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER_MASK 0x300000
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER__SHIFT 0x14
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER_MASK 0xc00000
+#define D2F2_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER__SHIFT 0x16
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR_MASK 0x3
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR__SHIFT 0x0
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER_MASK 0xc
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER__SHIFT 0x2
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP_MASK 0x30
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP__SHIFT 0x4
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP_MASK 0xc0
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP__SHIFT 0x6
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNSUPPORTED_REQ_MASK 0x300
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNSUPPORTED_REQ__SHIFT 0x8
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_ECRC_ERROR_MASK 0xc00
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_ECRC_ERROR__SHIFT 0xa
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_MALFORMED_TLP_MASK 0x3000
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_MALFORMED_TLP__SHIFT 0xc
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNEXPECTED_CMPLT_MASK 0xc000
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNEXPECTED_CMPLT__SHIFT 0xe
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETER_ABORT_MASK 0x30000
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETER_ABORT__SHIFT 0x10
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETION_TIMEOUT_MASK 0xc0000
+#define D2F2_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETION_TIMEOUT__SHIFT 0x12
+#define D2F2_PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0_MASK 0x2
+#define D2F2_PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0__SHIFT 0x1
+#define D2F2_PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN_MASK 0x4
+#define D2F2_PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN__SHIFT 0x2
+#define D2F2_PCIE_LC_CNTL__LC_RESET_LINK_MASK 0x8
+#define D2F2_PCIE_LC_CNTL__LC_RESET_LINK__SHIFT 0x3
+#define D2F2_PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE_MASK 0xf0
+#define D2F2_PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE__SHIFT 0x4
+#define D2F2_PCIE_LC_CNTL__LC_L0S_INACTIVITY_MASK 0xf00
+#define D2F2_PCIE_LC_CNTL__LC_L0S_INACTIVITY__SHIFT 0x8
+#define D2F2_PCIE_LC_CNTL__LC_L1_INACTIVITY_MASK 0xf000
+#define D2F2_PCIE_LC_CNTL__LC_L1_INACTIVITY__SHIFT 0xc
+#define D2F2_PCIE_LC_CNTL__LC_PMI_TO_L1_DIS_MASK 0x10000
+#define D2F2_PCIE_LC_CNTL__LC_PMI_TO_L1_DIS__SHIFT 0x10
+#define D2F2_PCIE_LC_CNTL__LC_INC_N_FTS_EN_MASK 0x20000
+#define D2F2_PCIE_LC_CNTL__LC_INC_N_FTS_EN__SHIFT 0x11
+#define D2F2_PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23_MASK 0xc0000
+#define D2F2_PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23__SHIFT 0x12
+#define D2F2_PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC_MASK 0x100000
+#define D2F2_PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC__SHIFT 0x14
+#define D2F2_PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS_MASK 0x200000
+#define D2F2_PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS__SHIFT 0x15
+#define D2F2_PCIE_LC_CNTL__LC_WAKE_FROM_L23_MASK 0x400000
+#define D2F2_PCIE_LC_CNTL__LC_WAKE_FROM_L23__SHIFT 0x16
+#define D2F2_PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK_MASK 0x800000
+#define D2F2_PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK__SHIFT 0x17
+#define D2F2_PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS_MASK 0x1000000
+#define D2F2_PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS__SHIFT 0x18
+#define D2F2_PCIE_LC_CNTL__LC_DELAY_COUNT_MASK 0x6000000
+#define D2F2_PCIE_LC_CNTL__LC_DELAY_COUNT__SHIFT 0x19
+#define D2F2_PCIE_LC_CNTL__LC_DELAY_L0S_EXIT_MASK 0x8000000
+#define D2F2_PCIE_LC_CNTL__LC_DELAY_L0S_EXIT__SHIFT 0x1b
+#define D2F2_PCIE_LC_CNTL__LC_DELAY_L1_EXIT_MASK 0x10000000
+#define D2F2_PCIE_LC_CNTL__LC_DELAY_L1_EXIT__SHIFT 0x1c
+#define D2F2_PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE_MASK 0x20000000
+#define D2F2_PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE__SHIFT 0x1d
+#define D2F2_PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN_MASK 0x40000000
+#define D2F2_PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN__SHIFT 0x1e
+#define D2F2_PCIE_LC_CNTL__LC_GATE_RCVR_IDLE_MASK 0x80000000
+#define D2F2_PCIE_LC_CNTL__LC_GATE_RCVR_IDLE__SHIFT 0x1f
+#define D2F2_PCIE_LC_CNTL2__LC_TIMED_OUT_STATE_MASK 0x3f
+#define D2F2_PCIE_LC_CNTL2__LC_TIMED_OUT_STATE__SHIFT 0x0
+#define D2F2_PCIE_LC_CNTL2__LC_STATE_TIMED_OUT_MASK 0x40
+#define D2F2_PCIE_LC_CNTL2__LC_STATE_TIMED_OUT__SHIFT 0x6
+#define D2F2_PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION_MASK 0x80
+#define D2F2_PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION__SHIFT 0x7
+#define D2F2_PCIE_LC_CNTL2__LC_MORE_TS2_EN_MASK 0x100
+#define D2F2_PCIE_LC_CNTL2__LC_MORE_TS2_EN__SHIFT 0x8
+#define D2F2_PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS_MASK 0x200
+#define D2F2_PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS__SHIFT 0x9
+#define D2F2_PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN_MASK 0x400
+#define D2F2_PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN__SHIFT 0xa
+#define D2F2_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_MASK 0x800
+#define D2F2_PCIE_LC_CNTL2__LC_ILLEGAL_STATE__SHIFT 0xb
+#define D2F2_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN_MASK 0x1000
+#define D2F2_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN__SHIFT 0xc
+#define D2F2_PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE_MASK 0x2000
+#define D2F2_PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE__SHIFT 0xd
+#define D2F2_PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE_MASK 0xc000
+#define D2F2_PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE__SHIFT 0xe
+#define D2F2_PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET_MASK 0x10000
+#define D2F2_PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET__SHIFT 0x10
+#define D2F2_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1_MASK 0x20000
+#define D2F2_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1__SHIFT 0x11
+#define D2F2_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L23_MASK 0x40000
+#define D2F2_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L23__SHIFT 0x12
+#define D2F2_PCIE_LC_CNTL2__LC_DEASSERT_RX_EN_IN_L0S_MASK 0x80000
+#define D2F2_PCIE_LC_CNTL2__LC_DEASSERT_RX_EN_IN_L0S__SHIFT 0x13
+#define D2F2_PCIE_LC_CNTL2__LC_BLOCK_EL_IDLE_IN_L0_MASK 0x100000
+#define D2F2_PCIE_LC_CNTL2__LC_BLOCK_EL_IDLE_IN_L0__SHIFT 0x14
+#define D2F2_PCIE_LC_CNTL2__LC_RCV_L0_TO_RCV_L0S_DIS_MASK 0x200000
+#define D2F2_PCIE_LC_CNTL2__LC_RCV_L0_TO_RCV_L0S_DIS__SHIFT 0x15
+#define D2F2_PCIE_LC_CNTL2__LC_ASSERT_INACTIVE_DURING_HOLD_MASK 0x400000
+#define D2F2_PCIE_LC_CNTL2__LC_ASSERT_INACTIVE_DURING_HOLD__SHIFT 0x16
+#define D2F2_PCIE_LC_CNTL2__LC_WAIT_FOR_LANES_IN_LW_NEG_MASK 0x1800000
+#define D2F2_PCIE_LC_CNTL2__LC_WAIT_FOR_LANES_IN_LW_NEG__SHIFT 0x17
+#define D2F2_PCIE_LC_CNTL2__LC_PWR_DOWN_NEG_OFF_LANES_MASK 0x2000000
+#define D2F2_PCIE_LC_CNTL2__LC_PWR_DOWN_NEG_OFF_LANES__SHIFT 0x19
+#define D2F2_PCIE_LC_CNTL2__LC_DISABLE_LOST_SYM_LOCK_ARCS_MASK 0x4000000
+#define D2F2_PCIE_LC_CNTL2__LC_DISABLE_LOST_SYM_LOCK_ARCS__SHIFT 0x1a
+#define D2F2_PCIE_LC_CNTL2__LC_LINK_BW_NOTIFICATION_DIS_MASK 0x8000000
+#define D2F2_PCIE_LC_CNTL2__LC_LINK_BW_NOTIFICATION_DIS__SHIFT 0x1b
+#define D2F2_PCIE_LC_CNTL2__LC_PMI_L1_WAIT_FOR_SLV_IDLE_MASK 0x10000000
+#define D2F2_PCIE_LC_CNTL2__LC_PMI_L1_WAIT_FOR_SLV_IDLE__SHIFT 0x1c
+#define D2F2_PCIE_LC_CNTL2__LC_TEST_TIMER_SEL_MASK 0x60000000
+#define D2F2_PCIE_LC_CNTL2__LC_TEST_TIMER_SEL__SHIFT 0x1d
+#define D2F2_PCIE_LC_CNTL2__LC_ENABLE_INFERRED_ELEC_IDLE_FOR_PI_MASK 0x80000000
+#define D2F2_PCIE_LC_CNTL2__LC_ENABLE_INFERRED_ELEC_IDLE_FOR_PI__SHIFT 0x1f
+#define D2F2_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_MASK 0x1
+#define D2F2_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS__SHIFT 0x0
+#define D2F2_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_CNTL_MASK 0x6
+#define D2F2_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_CNTL__SHIFT 0x1
+#define D2F2_PCIE_LC_CNTL3__LC_RCVD_DEEMPHASIS_MASK 0x8
+#define D2F2_PCIE_LC_CNTL3__LC_RCVD_DEEMPHASIS__SHIFT 0x3
+#define D2F2_PCIE_LC_CNTL3__LC_COMP_TO_DETECT_MASK 0x10
+#define D2F2_PCIE_LC_CNTL3__LC_COMP_TO_DETECT__SHIFT 0x4
+#define D2F2_PCIE_LC_CNTL3__LC_RESET_TSX_CNT_IN_RLOCK_EN_MASK 0x20
+#define D2F2_PCIE_LC_CNTL3__LC_RESET_TSX_CNT_IN_RLOCK_EN__SHIFT 0x5
+#define D2F2_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK 0xc0
+#define D2F2_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPTS_ALLOWED__SHIFT 0x6
+#define D2F2_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPT_FAILED_MASK 0x100
+#define D2F2_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPT_FAILED__SHIFT 0x8
+#define D2F2_PCIE_LC_CNTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT_MASK 0x200
+#define D2F2_PCIE_LC_CNTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT__SHIFT 0x9
+#define D2F2_PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN_MASK 0x400
+#define D2F2_PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN__SHIFT 0xa
+#define D2F2_PCIE_LC_CNTL3__LC_RCVR_DET_EN_OVERRIDE_MASK 0x800
+#define D2F2_PCIE_LC_CNTL3__LC_RCVR_DET_EN_OVERRIDE__SHIFT 0xb
+#define D2F2_PCIE_LC_CNTL3__LC_EHP_RX_PHY_CMD_MASK 0x3000
+#define D2F2_PCIE_LC_CNTL3__LC_EHP_RX_PHY_CMD__SHIFT 0xc
+#define D2F2_PCIE_LC_CNTL3__LC_EHP_TX_PHY_CMD_MASK 0xc000
+#define D2F2_PCIE_LC_CNTL3__LC_EHP_TX_PHY_CMD__SHIFT 0xe
+#define D2F2_PCIE_LC_CNTL3__LC_CHIP_BIF_USB_IDLE_EN_MASK 0x10000
+#define D2F2_PCIE_LC_CNTL3__LC_CHIP_BIF_USB_IDLE_EN__SHIFT 0x10
+#define D2F2_PCIE_LC_CNTL3__LC_L1_BLOCK_RECONFIG_EN_MASK 0x20000
+#define D2F2_PCIE_LC_CNTL3__LC_L1_BLOCK_RECONFIG_EN__SHIFT 0x11
+#define D2F2_PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_EN_MASK 0x40000
+#define D2F2_PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_EN__SHIFT 0x12
+#define D2F2_PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_MAX_FAIL_SEL_MASK 0x180000
+#define D2F2_PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_MAX_FAIL_SEL__SHIFT 0x13
+#define D2F2_PCIE_LC_CNTL3__LC_FAST_L1_ENTRY_EXIT_EN_MASK 0x200000
+#define D2F2_PCIE_LC_CNTL3__LC_FAST_L1_ENTRY_EXIT_EN__SHIFT 0x15
+#define D2F2_PCIE_LC_CNTL3__LC_RXPHYCMD_INACTIVE_EN_MODE_MASK 0x400000
+#define D2F2_PCIE_LC_CNTL3__LC_RXPHYCMD_INACTIVE_EN_MODE__SHIFT 0x16
+#define D2F2_PCIE_LC_CNTL3__LC_DSC_DONT_ENTER_L23_AFTER_PME_ACK_MASK 0x800000
+#define D2F2_PCIE_LC_CNTL3__LC_DSC_DONT_ENTER_L23_AFTER_PME_ACK__SHIFT 0x17
+#define D2F2_PCIE_LC_CNTL3__LC_HW_VOLTAGE_IF_CONTROL_MASK 0x3000000
+#define D2F2_PCIE_LC_CNTL3__LC_HW_VOLTAGE_IF_CONTROL__SHIFT 0x18
+#define D2F2_PCIE_LC_CNTL3__LC_VOLTAGE_TIMER_SEL_MASK 0x3c000000
+#define D2F2_PCIE_LC_CNTL3__LC_VOLTAGE_TIMER_SEL__SHIFT 0x1a
+#define D2F2_PCIE_LC_CNTL3__LC_GO_TO_RECOVERY_MASK 0x40000000
+#define D2F2_PCIE_LC_CNTL3__LC_GO_TO_RECOVERY__SHIFT 0x1e
+#define D2F2_PCIE_LC_CNTL3__LC_N_EIE_SEL_MASK 0x80000000
+#define D2F2_PCIE_LC_CNTL3__LC_N_EIE_SEL__SHIFT 0x1f
+#define D2F2_PCIE_LC_CNTL4__LC_TX_ENABLE_BEHAVIOUR_MASK 0x3
+#define D2F2_PCIE_LC_CNTL4__LC_TX_ENABLE_BEHAVIOUR__SHIFT 0x0
+#define D2F2_PCIE_LC_CNTL4__LC_DIS_CONTIG_END_SET_CHECK_MASK 0x4
+#define D2F2_PCIE_LC_CNTL4__LC_DIS_CONTIG_END_SET_CHECK__SHIFT 0x2
+#define D2F2_PCIE_LC_CNTL4__LC_DIS_ASPM_L1_IN_SPEED_CHANGE_MASK 0x8
+#define D2F2_PCIE_LC_CNTL4__LC_DIS_ASPM_L1_IN_SPEED_CHANGE__SHIFT 0x3
+#define D2F2_PCIE_LC_CNTL4__LC_BYPASS_EQ_MASK 0x10
+#define D2F2_PCIE_LC_CNTL4__LC_BYPASS_EQ__SHIFT 0x4
+#define D2F2_PCIE_LC_CNTL4__LC_REDO_EQ_MASK 0x20
+#define D2F2_PCIE_LC_CNTL4__LC_REDO_EQ__SHIFT 0x5
+#define D2F2_PCIE_LC_CNTL4__LC_EXTEND_EIEOS_MASK 0x40
+#define D2F2_PCIE_LC_CNTL4__LC_EXTEND_EIEOS__SHIFT 0x6
+#define D2F2_PCIE_LC_CNTL4__LC_IGNORE_PARITY_MASK 0x80
+#define D2F2_PCIE_LC_CNTL4__LC_IGNORE_PARITY__SHIFT 0x7
+#define D2F2_PCIE_LC_CNTL4__LC_EQ_SEARCH_MODE_MASK 0x300
+#define D2F2_PCIE_LC_CNTL4__LC_EQ_SEARCH_MODE__SHIFT 0x8
+#define D2F2_PCIE_LC_CNTL4__LC_DSC_CHECK_COEFFS_IN_RLOCK_MASK 0x400
+#define D2F2_PCIE_LC_CNTL4__LC_DSC_CHECK_COEFFS_IN_RLOCK__SHIFT 0xa
+#define D2F2_PCIE_LC_CNTL4__LC_USC_EQ_NOT_REQD_MASK 0x800
+#define D2F2_PCIE_LC_CNTL4__LC_USC_EQ_NOT_REQD__SHIFT 0xb
+#define D2F2_PCIE_LC_CNTL4__LC_USC_GO_TO_EQ_MASK 0x1000
+#define D2F2_PCIE_LC_CNTL4__LC_USC_GO_TO_EQ__SHIFT 0xc
+#define D2F2_PCIE_LC_CNTL4__LC_SET_QUIESCE_MASK 0x2000
+#define D2F2_PCIE_LC_CNTL4__LC_SET_QUIESCE__SHIFT 0xd
+#define D2F2_PCIE_LC_CNTL4__LC_QUIESCE_RCVD_MASK 0x4000
+#define D2F2_PCIE_LC_CNTL4__LC_QUIESCE_RCVD__SHIFT 0xe
+#define D2F2_PCIE_LC_CNTL4__LC_UNEXPECTED_COEFFS_RCVD_MASK 0x8000
+#define D2F2_PCIE_LC_CNTL4__LC_UNEXPECTED_COEFFS_RCVD__SHIFT 0xf
+#define D2F2_PCIE_LC_CNTL4__LC_BYPASS_EQ_REQ_PHASE_MASK 0x10000
+#define D2F2_PCIE_LC_CNTL4__LC_BYPASS_EQ_REQ_PHASE__SHIFT 0x10
+#define D2F2_PCIE_LC_CNTL4__LC_FORCE_PRESET_IN_EQ_REQ_PHASE_MASK 0x20000
+#define D2F2_PCIE_LC_CNTL4__LC_FORCE_PRESET_IN_EQ_REQ_PHASE__SHIFT 0x11
+#define D2F2_PCIE_LC_CNTL4__LC_FORCE_PRESET_VALUE_MASK 0x3c0000
+#define D2F2_PCIE_LC_CNTL4__LC_FORCE_PRESET_VALUE__SHIFT 0x12
+#define D2F2_PCIE_LC_CNTL4__LC_USC_DELAY_DLLPS_MASK 0x400000
+#define D2F2_PCIE_LC_CNTL4__LC_USC_DELAY_DLLPS__SHIFT 0x16
+#define D2F2_PCIE_LC_CNTL4__LC_PCIE_TX_FULL_SWING_MASK 0x800000
+#define D2F2_PCIE_LC_CNTL4__LC_PCIE_TX_FULL_SWING__SHIFT 0x17
+#define D2F2_PCIE_LC_CNTL4__LC_EQ_WAIT_FOR_EVAL_DONE_MASK 0x1000000
+#define D2F2_PCIE_LC_CNTL4__LC_EQ_WAIT_FOR_EVAL_DONE__SHIFT 0x18
+#define D2F2_PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN_MASK 0x2000000
+#define D2F2_PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN__SHIFT 0x19
+#define D2F2_PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK_MASK 0xfc000000
+#define D2F2_PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK__SHIFT 0x1a
+#define D2F2_PCIE_LC_CNTL5__LC_EQ_FS_0_MASK 0x3f
+#define D2F2_PCIE_LC_CNTL5__LC_EQ_FS_0__SHIFT 0x0
+#define D2F2_PCIE_LC_CNTL5__LC_EQ_FS_8_MASK 0xfc0
+#define D2F2_PCIE_LC_CNTL5__LC_EQ_FS_8__SHIFT 0x6
+#define D2F2_PCIE_LC_CNTL5__LC_EQ_LF_0_MASK 0x3f000
+#define D2F2_PCIE_LC_CNTL5__LC_EQ_LF_0__SHIFT 0xc
+#define D2F2_PCIE_LC_CNTL5__LC_EQ_LF_8_MASK 0xfc0000
+#define D2F2_PCIE_LC_CNTL5__LC_EQ_LF_8__SHIFT 0x12
+#define D2F2_PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS_MASK 0x1000000
+#define D2F2_PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS__SHIFT 0x18
+#define D2F2_PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT_MASK 0x1
+#define D2F2_PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT__SHIFT 0x0
+#define D2F2_PCIE_LC_CNTL6__LC_SPC_MODE_5GT_MASK 0x4
+#define D2F2_PCIE_LC_CNTL6__LC_SPC_MODE_5GT__SHIFT 0x2
+#define D2F2_PCIE_LC_CNTL6__LC_SPC_MODE_8GT_MASK 0x10
+#define D2F2_PCIE_LC_CNTL6__LC_SPC_MODE_8GT__SHIFT 0x4
+#define D2F2_PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN_MASK 0x1
+#define D2F2_PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN__SHIFT 0x0
+#define D2F2_PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE_MASK 0x2
+#define D2F2_PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE__SHIFT 0x1
+#define D2F2_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE_MASK 0x4
+#define D2F2_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE__SHIFT 0x2
+#define D2F2_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE_MASK 0x8
+#define D2F2_PCIE_LC_B

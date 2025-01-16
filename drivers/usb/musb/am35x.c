@@ -1,630 +1,352 @@
+              ucNumberOfObjects;
+  UCHAR               ucPadding[3];
+  ATOM_OBJECT         asObjects[1];
+}ATOM_OBJECT_TABLE;
 
-/*
- * Texas Instruments AM35x "glue layer"
- *
- * Copyright (c) 2010, by Texas Instruments
- *
- * Based on the DA8xx "glue layer" code.
- * Copyright (c) 2008-2009, MontaVista Software, Inc. <source@mvista.com>
- *
- * This file is part of the Inventra Controller Driver for Linux.
- *
- * The Inventra Controller Driver for Linux is free software; you
- * can redistribute it and/or modify it under the terms of the GNU
- * General Public License version 2 as published by the Free Software
- * Foundation.
- *
- * The Inventra Controller Driver for Linux is distributed in
- * the hope that it will be useful, but WITHOUT ANY WARRANTY;
- * without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
- * License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with The Inventra Controller Driver for Linux ; if not,
- * write to the Free Software Foundation, Inc., 59 Temple Place,
- * Suite 330, Boston, MA  02111-1307  USA
- *
- */
-
-#include <linux/module.h>
-#include <linux/clk.h>
-#include <linux/err.h>
-#include <linux/io.h>
-#include <linux/platform_device.h>
-#include <linux/dma-mapping.h>
-#include <linux/usb/usb_phy_generic.h>
-#include <linux/platform_data/usb-omap.h>
-
-#include "musb_core.h"
-
-/*
- * AM35x specific definitions
- */
-/* USB 2.0 OTG module registers */
-#define USB_REVISION_REG	0x00
-#define USB_CTRL_REG		0x04
-#define USB_STAT_REG		0x08
-#define USB_EMULATION_REG	0x0c
-/* 0x10 Reserved */
-#define USB_AUTOREQ_REG		0x14
-#define USB_SRP_FIX_TIME_REG	0x18
-#define USB_TEARDOWN_REG	0x1c
-#define EP_INTR_SRC_REG		0x20
-#define EP_INTR_SRC_SET_REG	0x24
-#define EP_INTR_SRC_CLEAR_REG	0x28
-#define EP_INTR_MASK_REG	0x2c
-#define EP_INTR_MASK_SET_REG	0x30
-#define EP_INTR_MASK_CLEAR_REG	0x34
-#define EP_INTR_SRC_MASKED_REG	0x38
-#define CORE_INTR_SRC_REG	0x40
-#define CORE_INTR_SRC_SET_REG	0x44
-#define CORE_INTR_SRC_CLEAR_REG	0x48
-#define CORE_INTR_MASK_REG	0x4c
-#define CORE_INTR_MASK_SET_REG	0x50
-#define CORE_INTR_MASK_CLEAR_REG 0x54
-#define CORE_INTR_SRC_MASKED_REG 0x58
-/* 0x5c Reserved */
-#define USB_END_OF_INTR_REG	0x60
-
-/* Control register bits */
-#define AM35X_SOFT_RESET_MASK	1
-
-/* USB interrupt register bits */
-#define AM35X_INTR_USB_SHIFT	16
-#define AM35X_INTR_USB_MASK	(0x1ff << AM35X_INTR_USB_SHIFT)
-#define AM35X_INTR_DRVVBUS	0x100
-#define AM35X_INTR_RX_SHIFT	16
-#define AM35X_INTR_TX_SHIFT	0
-#define AM35X_TX_EP_MASK	0xffff		/* EP0 + 15 Tx EPs */
-#define AM35X_RX_EP_MASK	0xfffe		/* 15 Rx EPs */
-#define AM35X_TX_INTR_MASK	(AM35X_TX_EP_MASK << AM35X_INTR_TX_SHIFT)
-#define AM35X_RX_INTR_MASK	(AM35X_RX_EP_MASK << AM35X_INTR_RX_SHIFT)
-
-#define USB_MENTOR_CORE_OFFSET	0x400
-
-struct am35x_glue {
-	struct device		*dev;
-	struct platform_device	*musb;
-	struct platform_device	*phy;
-	struct clk		*phy_clk;
-	struct clk		*clk;
-};
-
-/*
- * am35x_musb_enable - enable interrupts
- */
-static void am35x_musb_enable(struct musb *musb)
+typedef struct _ATOM_SRC_DST_TABLE_FOR_ONE_OBJECT         //usSrcDstTableOffset pointing to this structure
 {
-	void __iomem *reg_base = musb->ctrl_base;
-	u32 epmask;
+  UCHAR               ucNumberOfSrc;
+  USHORT              usSrcObjectID[1];
+  UCHAR               ucNumberOfDst;
+  USHORT              usDstObjectID[1];
+}ATOM_SRC_DST_TABLE_FOR_ONE_OBJECT;
 
-	/* Workaround: setup IRQs through both register sets. */
-	epmask = ((musb->epmask & AM35X_TX_EP_MASK) << AM35X_INTR_TX_SHIFT) |
-	       ((musb->epmask & AM35X_RX_EP_MASK) << AM35X_INTR_RX_SHIFT);
 
-	musb_writel(reg_base, EP_INTR_MASK_SET_REG, epmask);
-	musb_writel(reg_base, CORE_INTR_MASK_SET_REG, AM35X_INTR_USB_MASK);
+//Two definitions below are for OPM on MXM module designs
 
-	/* Force the DRVVBUS IRQ so we can start polling for ID change. */
-	musb_writel(reg_base, CORE_INTR_SRC_SET_REG,
-			AM35X_INTR_DRVVBUS << AM35X_INTR_USB_SHIFT);
-}
+#define EXT_HPDPIN_LUTINDEX_0                   0
+#define EXT_HPDPIN_LUTINDEX_1                   1
+#define EXT_HPDPIN_LUTINDEX_2                   2
+#define EXT_HPDPIN_LUTINDEX_3                   3
+#define EXT_HPDPIN_LUTINDEX_4                   4
+#define EXT_HPDPIN_LUTINDEX_5                   5
+#define EXT_HPDPIN_LUTINDEX_6                   6
+#define EXT_HPDPIN_LUTINDEX_7                   7
+#define MAX_NUMBER_OF_EXT_HPDPIN_LUT_ENTRIES   (EXT_HPDPIN_LUTINDEX_7+1)
 
-/*
- * am35x_musb_disable - disable HDRC and flush interrupts
- */
-static void am35x_musb_disable(struct musb *musb)
+#define EXT_AUXDDC_LUTINDEX_0                   0
+#define EXT_AUXDDC_LUTINDEX_1                   1
+#define EXT_AUXDDC_LUTINDEX_2                   2
+#define EXT_AUXDDC_LUTINDEX_3                   3
+#define EXT_AUXDDC_LUTINDEX_4                   4
+#define EXT_AUXDDC_LUTINDEX_5                   5
+#define EXT_AUXDDC_LUTINDEX_6                   6
+#define EXT_AUXDDC_LUTINDEX_7                   7
+#define MAX_NUMBER_OF_EXT_AUXDDC_LUT_ENTRIES   (EXT_AUXDDC_LUTINDEX_7+1)
+
+//ucChannelMapping are defined as following
+//for DP connector, eDP, DP to VGA/LVDS
+//Bit[1:0]: Define which pin connect to DP connector DP_Lane0, =0: source from GPU pin TX0, =1: from GPU pin TX1, =2: from GPU pin TX2, =3 from GPU pin TX3
+//Bit[3:2]: Define which pin connect to DP connector DP_Lane1, =0: source from GPU pin TX0, =1: from GPU pin TX1, =2: from GPU pin TX2, =3 from GPU pin TX3
+//Bit[5:4]: Define which pin connect to DP connector DP_Lane2, =0: source from GPU pin TX0, =1: from GPU pin TX1, =2: from GPU pin TX2, =3 from GPU pin TX3
+//Bit[7:6]: Define which pin connect to DP connector DP_Lane3, =0: source from GPU pin TX0, =1: from GPU pin TX1, =2: from GPU pin TX2, =3 from GPU pin TX3
+typedef struct _ATOM_DP_CONN_CHANNEL_MAPPING
 {
-	void __iomem *reg_base = musb->ctrl_base;
-
-	musb_writel(reg_base, CORE_INTR_MASK_CLEAR_REG, AM35X_INTR_USB_MASK);
-	musb_writel(reg_base, EP_INTR_MASK_CLEAR_REG,
-			 AM35X_TX_INTR_MASK | AM35X_RX_INTR_MASK);
-	musb_writeb(musb->mregs, MUSB_DEVCTL, 0);
-	musb_writel(reg_base, USB_END_OF_INTR_REG, 0);
-}
-
-#define portstate(stmt)		stmt
-
-static void am35x_musb_set_vbus(struct musb *musb, int is_on)
-{
-	WARN_ON(is_on && is_peripheral_active(musb));
-}
-
-#define	POLL_SECONDS	2
-
-static struct timer_list otg_workaround;
-
-static void otg_timer(unsigned long _musb)
-{
-	struct musb		*musb = (void *)_musb;
-	void __iomem		*mregs = musb->mregs;
-	u8			devctl;
-	unsigned long		flags;
-
-	/*
-	 * We poll because AM35x's won't expose several OTG-critical
-	 * status change events (from the transceiver) otherwise.
-	 */
-	devctl = musb_readb(mregs, MUSB_DEVCTL);
-	dev_dbg(musb->controller, "Poll devctl %02x (%s)\n", devctl,
-		usb_otg_state_string(musb->xceiv->otg->state));
-
-	spin_lock_irqsave(&musb->lock, flags);
-	switch (musb->xceiv->otg->state) {
-	case OTG_STATE_A_WAIT_BCON:
-		devctl &= ~MUSB_DEVCTL_SESSION;
-		musb_writeb(musb->mregs, MUSB_DEVCTL, devctl);
-
-		devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
-		if (devctl & MUSB_DEVCTL_BDEVICE) {
-			musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-			MUSB_DEV_MODE(musb);
-		} else {
-			musb->xceiv->otg->state = OTG_STATE_A_IDLE;
-			MUSB_HST_MODE(musb);
-		}
-		break;
-	case OTG_STATE_A_WAIT_VFALL:
-		musb->xceiv->otg->state = OTG_STATE_A_WAIT_VRISE;
-		musb_writel(musb->ctrl_base, CORE_INTR_SRC_SET_REG,
-			    MUSB_INTR_VBUSERROR << AM35X_INTR_USB_SHIFT);
-		break;
-	case OTG_STATE_B_IDLE:
-		devctl = musb_readb(mregs, MUSB_DEVCTL);
-		if (devctl & MUSB_DEVCTL_BDEVICE)
-			mod_timer(&otg_workaround, jiffies + POLL_SECONDS * HZ);
-		else
-			musb->xceiv->otg->state = OTG_STATE_A_IDLE;
-		break;
-	default:
-		break;
-	}
-	spin_unlock_irqrestore(&musb->lock, flags);
-}
-
-static void am35x_musb_try_idle(struct musb *musb, unsigned long timeout)
-{
-	static unsigned long last_timer;
-
-	if (timeout == 0)
-		timeout = jiffies + msecs_to_jiffies(3);
-
-	/* Never idle if active, or when VBUS timeout is not set as host */
-	if (musb->is_active || (musb->a_wait_bcon == 0 &&
-				musb->xceiv->otg->state == OTG_STATE_A_WAIT_BCON)) {
-		dev_dbg(musb->controller, "%s active, deleting timer\n",
-			usb_otg_state_string(musb->xceiv->otg->state));
-		del_timer(&otg_workaround);
-		last_timer = jiffies;
-		return;
-	}
-
-	if (time_after(last_timer, timeout) && timer_pending(&otg_workaround)) {
-		dev_dbg(musb->controller, "Longer idle timer already pending, ignoring...\n");
-		return;
-	}
-	last_timer = timeout;
-
-	dev_dbg(musb->controller, "%s inactive, starting idle timer for %u ms\n",
-		usb_otg_state_string(musb->xceiv->otg->state),
-		jiffies_to_msecs(timeout - jiffies));
-	mod_timer(&otg_workaround, timeout);
-}
-
-static irqreturn_t am35x_musb_interrupt(int irq, void *hci)
-{
-	struct musb  *musb = hci;
-	void __iomem *reg_base = musb->ctrl_base;
-	struct device *dev = musb->controller;
-	struct musb_hdrc_platform_data *plat = dev_get_platdata(dev);
-	struct omap_musb_board_data *data = plat->board_data;
-	struct usb_otg *otg = musb->xceiv->otg;
-	unsigned long flags;
-	irqreturn_t ret = IRQ_NONE;
-	u32 epintr, usbintr;
-
-	spin_lock_irqsave(&musb->lock, flags);
-
-	/* Get endpoint interrupts */
-	epintr = musb_readl(reg_base, EP_INTR_SRC_MASKED_REG);
-
-	if (epintr) {
-		musb_writel(reg_base, EP_INTR_SRC_CLEAR_REG, epintr);
-
-		musb->int_rx =
-			(epintr & AM35X_RX_INTR_MASK) >> AM35X_INTR_RX_SHIFT;
-		musb->int_tx =
-			(epintr & AM35X_TX_INTR_MASK) >> AM35X_INTR_TX_SHIFT;
-	}
-
-	/* Get usb core interrupts */
-	usbintr = musb_readl(reg_base, CORE_INTR_SRC_MASKED_REG);
-	if (!usbintr && !epintr)
-		goto eoi;
-
-	if (usbintr) {
-		musb_writel(reg_base, CORE_INTR_SRC_CLEAR_REG, usbintr);
-
-		musb->int_usb =
-			(usbintr & AM35X_INTR_USB_MASK) >> AM35X_INTR_USB_SHIFT;
-	}
-	/*
-	 * DRVVBUS IRQs are the only proxy we have (a very poor one!) for
-	 * AM35x's missing ID change IRQ.  We need an ID change IRQ to
-	 * switch appropriately between halves of the OTG state machine.
-	 * Managing DEVCTL.SESSION per Mentor docs requires that we know its
-	 * value but DEVCTL.BDEVICE is invalid without DEVCTL.SESSION set.
-	 * Also, DRVVBUS pulses for SRP (but not at 5V) ...
-	 */
-	if (usbintr & (AM35X_INTR_DRVVBUS << AM35X_INTR_USB_SHIFT)) {
-		int drvvbus = musb_readl(reg_base, USB_STAT_REG);
-		void __iomem *mregs = musb->mregs;
-		u8 devctl = musb_readb(mregs, MUSB_DEVCTL);
-		int err;
-
-		err = musb->int_usb & MUSB_INTR_VBUSERROR;
-		if (err) {
-			/*
-			 * The Mentor core doesn't debounce VBUS as needed
-			 * to cope with device connect current spikes. This
-			 * means it's not uncommon for bus-powered devices
-			 * to get VBUS errors during enumeration.
-			 *
-			 * This is a workaround, but newer RTL from Mentor
-			 * seems to allow a better one: "re"-starting sessions
-			 * without waiting for VBUS to stop registering in
-			 * devctl.
-			 */
-			musb->int_usb &= ~MUSB_INTR_VBUSERROR;
-			musb->xceiv->otg->state = OTG_STATE_A_WAIT_VFALL;
-			mod_timer(&otg_workaround, jiffies + POLL_SECONDS * HZ);
-			WARNING("VBUS error workaround (delay coming)\n");
-		} else if (drvvbus) {
-			MUSB_HST_MODE(musb);
-			otg->default_a = 1;
-			musb->xceiv->otg->state = OTG_STATE_A_WAIT_VRISE;
-			portstate(musb->port1_status |= USB_PORT_STAT_POWER);
-			del_timer(&otg_workaround);
-		} else {
-			musb->is_active = 0;
-			MUSB_DEV_MODE(musb);
-			otg->default_a = 0;
-			musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-			portstate(musb->port1_status &= ~USB_PORT_STAT_POWER);
-		}
-
-		/* NOTE: this must complete power-on within 100 ms. */
-		dev_dbg(musb->controller, "VBUS %s (%s)%s, devctl %02x\n",
-				drvvbus ? "on" : "off",
-				usb_otg_state_string(musb->xceiv->otg->state),
-				err ? " ERROR" : "",
-				devctl);
-		ret = IRQ_HANDLED;
-	}
-
-	/* Drop spurious RX and TX if device is disconnected */
-	if (musb->int_usb & MUSB_INTR_DISCONNECT) {
-		musb->int_tx = 0;
-		musb->int_rx = 0;
-	}
-
-	if (musb->int_tx || musb->int_rx || musb->int_usb)
-		ret |= musb_interrupt(musb);
-
-eoi:
-	/* EOI needs to be written for the IRQ to be re-asserted. */
-	if (ret == IRQ_HANDLED || epintr || usbintr) {
-		/* clear level interrupt */
-		if (data->clear_irq)
-			data->clear_irq();
-		/* write EOI */
-		musb_writel(reg_base, USB_END_OF_INTR_REG, 0);
-	}
-
-	/* Poll for ID change */
-	if (musb->xceiv->otg->state == OTG_STATE_B_IDLE)
-		mod_timer(&otg_workaround, jiffies + POLL_SECONDS * HZ);
-
-	spin_unlock_irqrestore(&musb->lock, flags);
-
-	return ret;
-}
-
-static int am35x_musb_set_mode(struct musb *musb, u8 musb_mode)
-{
-	struct device *dev = musb->controller;
-	struct musb_hdrc_platform_data *plat = dev_get_platdata(dev);
-	struct omap_musb_board_data *data = plat->board_data;
-	int     retval = 0;
-
-	if (data->set_mode)
-		data->set_mode(musb_mode);
-	else
-		retval = -EIO;
-
-	return retval;
-}
-
-static int am35x_musb_init(struct musb *musb)
-{
-	struct device *dev = musb->controller;
-	struct musb_hdrc_platform_data *plat = dev_get_platdata(dev);
-	struct omap_musb_board_data *data = plat->board_data;
-	void __iomem *reg_base = musb->ctrl_base;
-	u32 rev;
-
-	musb->mregs += USB_MENTOR_CORE_OFFSET;
-
-	/* Returns zero if e.g. not clocked */
-	rev = musb_readl(reg_base, USB_REVISION_REG);
-	if (!rev)
-		return -ENODEV;
-
-	musb->xceiv = usb_get_phy(USB_PHY_TYPE_USB2);
-	if (IS_ERR_OR_NULL(musb->xceiv))
-		return -EPROBE_DEFER;
-
-	setup_timer(&otg_workaround, otg_timer, (unsigned long) musb);
-
-	/* Reset the musb */
-	if (data->reset)
-		data->reset();
-
-	/* Reset the controller */
-	musb_writel(reg_base, USB_CTRL_REG, AM35X_SOFT_RESET_MASK);
-
-	/* Start the on-chip PHY and its PLL. */
-	if (data->set_phy_power)
-		data->set_phy_power(1);
-
-	msleep(5);
-
-	musb->isr = am35x_musb_interrupt;
-
-	/* clear level interrupt */
-	if (data->clear_irq)
-		data->clear_irq();
-
-	return 0;
-}
-
-static int am35x_musb_exit(struct musb *musb)
-{
-	struct device *dev = musb->controller;
-	struct musb_hdrc_platform_data *plat = dev_get_platdata(dev);
-	struct omap_musb_board_data *data = plat->board_data;
-
-	del_timer_sync(&otg_workaround);
-
-	/* Shutdown the on-chip PHY and its PLL. */
-	if (data->set_phy_power)
-		data->set_phy_power(0);
-
-	usb_put_phy(musb->xceiv);
-
-	return 0;
-}
-
-/* AM35x supports only 32bit read operation */
-static void am35x_read_fifo(struct musb_hw_ep *hw_ep, u16 len, u8 *dst)
-{
-	void __iomem *fifo = hw_ep->fifo;
-	u32		val;
-	int		i;
-
-	/* Read for 32bit-aligned destination address */
-	if (likely((0x03 & (unsigned long) dst) == 0) && len >= 4) {
-		readsl(fifo, dst, len >> 2);
-		dst += len & ~0x03;
-		len &= 0x03;
-	}
-	/*
-	 * Now read the remaining 1 to 3 byte or complete length if
-	 * unaligned address.
-	 */
-	if (len > 4) {
-		for (i = 0; i < (len >> 2); i++) {
-			*(u32 *) dst = musb_readl(fifo, 0);
-			dst += 4;
-		}
-		len &= 0x03;
-	}
-	if (len > 0) {
-		val = musb_readl(fifo, 0);
-		memcpy(dst, &val, len);
-	}
-}
-
-static const struct musb_platform_ops am35x_ops = {
-	.quirks		= MUSB_DMA_INVENTRA | MUSB_INDEXED_EP,
-	.init		= am35x_musb_init,
-	.exit		= am35x_musb_exit,
-
-	.read_fifo	= am35x_read_fifo,
-#ifdef CONFIG_USB_INVENTRA_DMA
-	.dma_init	= musbhs_dma_controller_create,
-	.dma_exit	= musbhs_dma_controller_destroy,
+#if ATOM_BIG_ENDIAN
+  UCHAR ucDP_Lane3_Source:2;
+  UCHAR ucDP_Lane2_Source:2;
+  UCHAR ucDP_Lane1_Source:2;
+  UCHAR ucDP_Lane0_Source:2;
+#else
+  UCHAR ucDP_Lane0_Source:2;
+  UCHAR ucDP_Lane1_Source:2;
+  UCHAR ucDP_Lane2_Source:2;
+  UCHAR ucDP_Lane3_Source:2;
 #endif
-	.enable		= am35x_musb_enable,
-	.disable	= am35x_musb_disable,
+}ATOM_DP_CONN_CHANNEL_MAPPING;
 
-	.set_mode	= am35x_musb_set_mode,
-	.try_idle	= am35x_musb_try_idle,
-
-	.set_vbus	= am35x_musb_set_vbus,
-};
-
-static const struct platform_device_info am35x_dev_info = {
-	.name		= "musb-hdrc",
-	.id		= PLATFORM_DEVID_AUTO,
-	.dma_mask	= DMA_BIT_MASK(32),
-};
-
-static int am35x_probe(struct platform_device *pdev)
+//for DVI/HDMI, in dual link case, both links have to have same mapping.
+//Bit[1:0]: Define which pin connect to DVI connector data Lane2, =0: source from GPU pin TX0, =1: from GPU pin TX1, =2: from GPU pin TX2, =3 from GPU pin TX3
+//Bit[3:2]: Define which pin connect to DVI connector data Lane1, =0: source from GPU pin TX0, =1: from GPU pin TX1, =2: from GPU pin TX2, =3 from GPU pin TX3
+//Bit[5:4]: Define which pin connect to DVI connector data Lane0, =0: source from GPU pin TX0, =1: from GPU pin TX1, =2: from GPU pin TX2, =3 from GPU pin TX3
+//Bit[7:6]: Define which pin connect to DVI connector clock lane, =0: source from GPU pin TX0, =1: from GPU pin TX1, =2: from GPU pin TX2, =3 from GPU pin TX3
+typedef struct _ATOM_DVI_CONN_CHANNEL_MAPPING
 {
-	struct musb_hdrc_platform_data	*pdata = dev_get_platdata(&pdev->dev);
-	struct platform_device		*musb;
-	struct am35x_glue		*glue;
-	struct platform_device_info	pinfo;
-	struct clk			*phy_clk;
-	struct clk			*clk;
-
-	int				ret = -ENOMEM;
-
-	glue = kzalloc(sizeof(*glue), GFP_KERNEL);
-	if (!glue) {
-		dev_err(&pdev->dev, "failed to allocate glue context\n");
-		goto err0;
-	}
-
-	phy_clk = clk_get(&pdev->dev, "fck");
-	if (IS_ERR(phy_clk)) {
-		dev_err(&pdev->dev, "failed to get PHY clock\n");
-		ret = PTR_ERR(phy_clk);
-		goto err3;
-	}
-
-	clk = clk_get(&pdev->dev, "ick");
-	if (IS_ERR(clk)) {
-		dev_err(&pdev->dev, "failed to get clock\n");
-		ret = PTR_ERR(clk);
-		goto err4;
-	}
-
-	ret = clk_enable(phy_clk);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to enable PHY clock\n");
-		goto err5;
-	}
-
-	ret = clk_enable(clk);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to enable clock\n");
-		goto err6;
-	}
-
-	glue->dev			= &pdev->dev;
-	glue->phy_clk			= phy_clk;
-	glue->clk			= clk;
-
-	pdata->platform_ops		= &am35x_ops;
-
-	glue->phy = usb_phy_generic_register();
-	if (IS_ERR(glue->phy))
-		goto err7;
-	platform_set_drvdata(pdev, glue);
-
-	pinfo = am35x_dev_info;
-	pinfo.parent = &pdev->dev;
-	pinfo.res = pdev->resource;
-	pinfo.num_res = pdev->num_resources;
-	pinfo.data = pdata;
-	pinfo.size_data = sizeof(*pdata);
-
-	glue->musb = musb = platform_device_register_full(&pinfo);
-	if (IS_ERR(musb)) {
-		ret = PTR_ERR(musb);
-		dev_err(&pdev->dev, "failed to register musb device: %d\n", ret);
-		goto err8;
-	}
-
-	return 0;
-
-err8:
-	usb_phy_generic_unregister(glue->phy);
-
-err7:
-	clk_disable(clk);
-
-err6:
-	clk_disable(phy_clk);
-
-err5:
-	clk_put(clk);
-
-err4:
-	clk_put(phy_clk);
-
-err3:
-	kfree(glue);
-
-err0:
-	return ret;
-}
-
-static int am35x_remove(struct platform_device *pdev)
-{
-	struct am35x_glue	*glue = platform_get_drvdata(pdev);
-
-	platform_device_unregister(glue->musb);
-	usb_phy_generic_unregister(glue->phy);
-	clk_disable(glue->clk);
-	clk_disable(glue->phy_clk);
-	clk_put(glue->clk);
-	clk_put(glue->phy_clk);
-	kfree(glue);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int am35x_suspend(struct device *dev)
-{
-	struct am35x_glue	*glue = dev_get_drvdata(dev);
-	struct musb_hdrc_platform_data *plat = dev_get_platdata(dev);
-	struct omap_musb_board_data *data = plat->board_data;
-
-	/* Shutdown the on-chip PHY and its PLL. */
-	if (data->set_phy_power)
-		data->set_phy_power(0);
-
-	clk_disable(glue->phy_clk);
-	clk_disable(glue->clk);
-
-	return 0;
-}
-
-static int am35x_resume(struct device *dev)
-{
-	struct am35x_glue	*glue = dev_get_drvdata(dev);
-	struct musb_hdrc_platform_data *plat = dev_get_platdata(dev);
-	struct omap_musb_board_data *data = plat->board_data;
-	int			ret;
-
-	/* Start the on-chip PHY and its PLL. */
-	if (data->set_phy_power)
-		data->set_phy_power(1);
-
-	ret = clk_enable(glue->phy_clk);
-	if (ret) {
-		dev_err(dev, "failed to enable PHY clock\n");
-		return ret;
-	}
-
-	ret = clk_enable(glue->clk);
-	if (ret) {
-		dev_err(dev, "failed to enable clock\n");
-		return ret;
-	}
-
-	return 0;
-}
+#if ATOM_BIG_ENDIAN
+  UCHAR ucDVI_CLK_Source:2;
+  UCHAR ucDVI_DATA0_Source:2;
+  UCHAR ucDVI_DATA1_Source:2;
+  UCHAR ucDVI_DATA2_Source:2;
+#else
+  UCHAR ucDVI_DATA2_Source:2;
+  UCHAR ucDVI_DATA1_Source:2;
+  UCHAR ucDVI_DATA0_Source:2;
+  UCHAR ucDVI_CLK_Source:2;
 #endif
+}ATOM_DVI_CONN_CHANNEL_MAPPING;
 
-static SIMPLE_DEV_PM_OPS(am35x_pm_ops, am35x_suspend, am35x_resume);
+typedef struct _EXT_DISPLAY_PATH
+{
+  USHORT  usDeviceTag;                    //A bit vector to show what devices are supported
+  USHORT  usDeviceACPIEnum;               //16bit device ACPI id.
+  USHORT  usDeviceConnector;              //A physical connector for displays to plug in, using object connector definitions
+  UCHAR   ucExtAUXDDCLutIndex;            //An index into external AUX/DDC channel LUT
+  UCHAR   ucExtHPDPINLutIndex;            //An index into external HPD pin LUT
+  USHORT  usExtEncoderObjId;              //external encoder object id
+  union{
+    UCHAR   ucChannelMapping;                  // if ucChannelMapping=0, using default one to one mapping
+    ATOM_DP_CONN_CHANNEL_MAPPING asDPMapping;
+    ATOM_DVI_CONN_CHANNEL_MAPPING asDVIMapping;
+  };
+  UCHAR   ucChPNInvert;                   // bit vector for up to 8 lanes, =0: P and N is not invert, =1 P and N is inverted
+  USHORT  usCaps;
+  USHORT  usReserved;
+}EXT_DISPLAY_PATH;
 
-static struct platform_driver am35x_driver = {
-	.probe		= am35x_probe,
-	.remove		= am35x_remove,
-	.driver		= {
-		.name	= "musb-am35x",
-		.pm	= &am35x_pm_ops,
-	},
-};
+#define NUMBER_OF_UCHAR_FOR_GUID          16
+#define MAX_NUMBER_OF_EXT_DISPLAY_PATH    7
 
-MODULE_DESCRIPTION("AM35x MUSB Glue Layer");
-MODULE_AUTHOR("Ajay Kumar Gupta <ajay.gupta@ti.com>");
-MODULE_LICENSE("GPL v2");
-module_platform_driver(am35x_driver);
+//usCaps
+#define  EXT_DISPLAY_PATH_CAPS__HBR2_DISABLE               0x01
+#define  EXT_DISPLAY_PATH_CAPS__DP_FIXED_VS_EN             0x02
+#define  EXT_DISPLAY_PATH_CAPS__HDMI20_PI3EQX1204          0x04
+#define  EXT_DISPLAY_PATH_CAPS__HDMI20_TISN65DP159RSBT     0x08
+
+typedef  struct _ATOM_EXTERNAL_DISPLAY_CONNECTION_INFO
+{
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  UCHAR                    ucGuid [NUMBER_OF_UCHAR_FOR_GUID];     // a GUID is a 16 byte long string
+  EXT_DISPLAY_PATH         sPath[MAX_NUMBER_OF_EXT_DISPLAY_PATH]; // total of fixed 7 entries.
+  UCHAR                    ucChecksum;                            // a simple Checksum of the sum of whole structure equal to 0x0.
+  UCHAR                    uc3DStereoPinId;                       // use for eDP panel
+  UCHAR                    ucRemoteDisplayConfig;
+  UCHAR                    uceDPToLVDSRxId;
+  UCHAR                    ucFixDPVoltageSwing;                   // usCaps[1]=1, this indicate DP_LANE_SET value
+  UCHAR                    Reserved[3];                           // for potential expansion
+}ATOM_EXTERNAL_DISPLAY_CONNECTION_INFO;
+
+//Related definitions, all records are differnt but they have a commond header
+typedef struct _ATOM_COMMON_RECORD_HEADER
+{
+  UCHAR               ucRecordType;                      //An emun to indicate the record type
+  UCHAR               ucRecordSize;                      //The size of the whole record in byte
+}ATOM_COMMON_RECORD_HEADER;
+
+
+#define ATOM_I2C_RECORD_TYPE                           1
+#define ATOM_HPD_INT_RECORD_TYPE                       2
+#define ATOM_OUTPUT_PROTECTION_RECORD_TYPE             3
+#define ATOM_CONNECTOR_DEVICE_TAG_RECORD_TYPE          4
+#define ATOM_CONNECTOR_DVI_EXT_INPUT_RECORD_TYPE       5 //Obsolete, switch to use GPIO_CNTL_RECORD_TYPE
+#define ATOM_ENCODER_FPGA_CONTROL_RECORD_TYPE          6 //Obsolete, switch to use GPIO_CNTL_RECORD_TYPE
+#define ATOM_CONNECTOR_CVTV_SHARE_DIN_RECORD_TYPE      7
+#define ATOM_JTAG_RECORD_TYPE                          8 //Obsolete, switch to use GPIO_CNTL_RECORD_TYPE
+#define ATOM_OBJECT_GPIO_CNTL_RECORD_TYPE              9
+#define ATOM_ENCODER_DVO_CF_RECORD_TYPE                10
+#define ATOM_CONNECTOR_CF_RECORD_TYPE                  11
+#define ATOM_CONNECTOR_HARDCODE_DTD_RECORD_TYPE        12
+#define ATOM_CONNECTOR_PCIE_SUBCONNECTOR_RECORD_TYPE   13
+#define ATOM_ROUTER_DDC_PATH_SELECT_RECORD_TYPE        14
+#define ATOM_ROUTER_DATA_CLOCK_PATH_SELECT_RECORD_TYPE 15
+#define ATOM_CONNECTOR_HPDPIN_LUT_RECORD_TYPE          16 //This is for the case when connectors are not known to object table
+#define ATOM_CONNECTOR_AUXDDC_LUT_RECORD_TYPE          17 //This is for the case when connectors are not known to object table
+#define ATOM_OBJECT_LINK_RECORD_TYPE                   18 //Once this record is present under one object, it indicats the oobject is linked to another obj described by the record
+#define ATOM_CONNECTOR_REMOTE_CAP_RECORD_TYPE          19
+#define ATOM_ENCODER_CAP_RECORD_TYPE                   20
+#define ATOM_BRACKET_LAYOUT_RECORD_TYPE                21
+
+
+//Must be updated when new record type is added,equal to that record definition!
+#define ATOM_MAX_OBJECT_RECORD_NUMBER             ATOM_ENCODER_CAP_RECORD_TYPE
+
+typedef struct  _ATOM_I2C_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  ATOM_I2C_ID_CONFIG          sucI2cId;
+  UCHAR                       ucI2CAddr;              //The slave address, it's 0 when the record is attached to connector for DDC
+}ATOM_I2C_RECORD;
+
+typedef struct  _ATOM_HPD_INT_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  UCHAR                       ucHPDIntGPIOID;         //Corresponding block in GPIO_PIN_INFO table gives the pin info
+  UCHAR                       ucPlugged_PinState;
+}ATOM_HPD_INT_RECORD;
+
+
+typedef struct  _ATOM_OUTPUT_PROTECTION_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  UCHAR                       ucProtectionFlag;
+  UCHAR                       ucReserved;
+}ATOM_OUTPUT_PROTECTION_RECORD;
+
+typedef struct  _ATOM_CONNECTOR_DEVICE_TAG
+{
+  ULONG                       ulACPIDeviceEnum;       //Reserved for now
+  USHORT                      usDeviceID;             //This Id is same as "ATOM_DEVICE_XXX_SUPPORT"
+  USHORT                      usPadding;
+}ATOM_CONNECTOR_DEVICE_TAG;
+
+typedef struct  _ATOM_CONNECTOR_DEVICE_TAG_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  UCHAR                       ucNumberOfDevice;
+  UCHAR                       ucReserved;
+  ATOM_CONNECTOR_DEVICE_TAG   asDeviceTag[1];         //This Id is same as "ATOM_DEVICE_XXX_SUPPORT", 1 is only for allocation
+}ATOM_CONNECTOR_DEVICE_TAG_RECORD;
+
+
+typedef struct  _ATOM_CONNECTOR_DVI_EXT_INPUT_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  UCHAR                              ucConfigGPIOID;
+  UCHAR                              ucConfigGPIOState;       //Set to 1 when it's active high to enable external flow in
+  UCHAR                       ucFlowinGPIPID;
+  UCHAR                       ucExtInGPIPID;
+}ATOM_CONNECTOR_DVI_EXT_INPUT_RECORD;
+
+typedef struct  _ATOM_ENCODER_FPGA_CONTROL_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  UCHAR                       ucCTL1GPIO_ID;
+  UCHAR                       ucCTL1GPIOState;        //Set to 1 when it's active high
+  UCHAR                       ucCTL2GPIO_ID;
+  UCHAR                       ucCTL2GPIOState;        //Set to 1 when it's active high
+  UCHAR                       ucCTL3GPIO_ID;
+  UCHAR                       ucCTL3GPIOState;        //Set to 1 when it's active high
+  UCHAR                       ucCTLFPGA_IN_ID;
+  UCHAR                       ucPadding[3];
+}ATOM_ENCODER_FPGA_CONTROL_RECORD;
+
+typedef struct  _ATOM_CONNECTOR_CVTV_SHARE_DIN_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  UCHAR                       ucGPIOID;               //Corresponding block in GPIO_PIN_INFO table gives the pin info
+  UCHAR                       ucTVActiveState;        //Indicating when the pin==0 or 1 when TV is connected
+}ATOM_CONNECTOR_CVTV_SHARE_DIN_RECORD;
+
+typedef struct  _ATOM_JTAG_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  UCHAR                       ucTMSGPIO_ID;
+  UCHAR                       ucTMSGPIOState;         //Set to 1 when it's active high
+  UCHAR                       ucTCKGPIO_ID;
+  UCHAR                       ucTCKGPIOState;         //Set to 1 when it's active high
+  UCHAR                       ucTDOGPIO_ID;
+  UCHAR                       ucTDOGPIOState;         //Set to 1 when it's active high
+  UCHAR                       ucTDIGPIO_ID;
+  UCHAR                       ucTDIGPIOState;         //Set to 1 when it's active high
+  UCHAR                       ucPadding[2];
+}ATOM_JTAG_RECORD;
+
+
+//The following generic object gpio pin control record type will replace JTAG_RECORD/FPGA_CONTROL_RECORD/DVI_EXT_INPUT_RECORD above gradually
+typedef struct _ATOM_GPIO_PIN_CONTROL_PAIR
+{
+  UCHAR                       ucGPIOID;               // GPIO_ID, find the corresponding ID in GPIO_LUT table
+  UCHAR                       ucGPIO_PinState;        // Pin state showing how to set-up the pin
+}ATOM_GPIO_PIN_CONTROL_PAIR;
+
+typedef struct  _ATOM_OBJECT_GPIO_CNTL_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  UCHAR                       ucFlags;                // Future expnadibility
+  UCHAR                       ucNumberOfPins;         // Number of GPIO pins used to control the object
+  ATOM_GPIO_PIN_CONTROL_PAIR  asGpio[1];              // the real gpio pin pair determined by number of pins ucNumberOfPins
+}ATOM_OBJECT_GPIO_CNTL_RECORD;
+
+//Definitions for GPIO pin state
+#define GPIO_PIN_TYPE_INPUT             0x00
+#define GPIO_PIN_TYPE_OUTPUT            0x10
+#define GPIO_PIN_TYPE_HW_CONTROL        0x20
+
+//For GPIO_PIN_TYPE_OUTPUT the following is defined
+#define GPIO_PIN_OUTPUT_STATE_MASK      0x01
+#define GPIO_PIN_OUTPUT_STATE_SHIFT     0
+#define GPIO_PIN_STATE_ACTIVE_LOW       0x0
+#define GPIO_PIN_STATE_ACTIVE_HIGH      0x1
+
+// Indexes to GPIO array in GLSync record
+// GLSync record is for Frame Lock/Gen Lock feature.
+#define ATOM_GPIO_INDEX_GLSYNC_REFCLK    0
+#define ATOM_GPIO_INDEX_GLSYNC_HSYNC     1
+#define ATOM_GPIO_INDEX_GLSYNC_VSYNC     2
+#define ATOM_GPIO_INDEX_GLSYNC_SWAP_REQ  3
+#define ATOM_GPIO_INDEX_GLSYNC_SWAP_GNT  4
+#define ATOM_GPIO_INDEX_GLSYNC_INTERRUPT 5
+#define ATOM_GPIO_INDEX_GLSYNC_V_RESET   6
+#define ATOM_GPIO_INDEX_GLSYNC_SWAP_CNTL 7
+#define ATOM_GPIO_INDEX_GLSYNC_SWAP_SEL  8
+#define ATOM_GPIO_INDEX_GLSYNC_MAX       9
+
+typedef struct  _ATOM_ENCODER_DVO_CF_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  ULONG                       ulStrengthControl;      // DVOA strength control for CF
+  UCHAR                       ucPadding[2];
+}ATOM_ENCODER_DVO_CF_RECORD;
+
+// Bit maps for ATOM_ENCODER_CAP_RECORD.ucEncoderCap
+#define ATOM_ENCODER_CAP_RECORD_HBR2                  0x01         // DP1.2 HBR2 is supported by HW encoder
+#define ATOM_ENCODER_CAP_RECORD_HBR2_EN               0x02         // DP1.2 HBR2 setting is qualified and HBR2 can be enabled
+#define ATOM_ENCODER_CAP_RECORD_HDMI6Gbps_EN          0x04         // HDMI2.0 6Gbps enable or not.
+
+typedef struct  _ATOM_ENCODER_CAP_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  union {
+    USHORT                    usEncoderCap;
+    struct {
+#if ATOM_BIG_ENDIAN
+      USHORT                  usReserved:14;        // Bit1-15 may be defined for other capability in future
+      USHORT                  usHBR2En:1;           // Bit1 is for DP1.2 HBR2 enable
+      USHORT                  usHBR2Cap:1;          // Bit0 is for DP1.2 HBR2 capability.
+#else
+      USHORT                  usHBR2Cap:1;          // Bit0 is for DP1.2 HBR2 capability.
+      USHORT                  usHBR2En:1;           // Bit1 is for DP1.2 HBR2 enable
+      USHORT                  usReserved:14;        // Bit1-15 may be defined for other capability in future
+#endif
+    };
+  };
+}ATOM_ENCODER_CAP_RECORD;
+
+// value for ATOM_CONNECTOR_CF_RECORD.ucConnectedDvoBundle
+#define ATOM_CONNECTOR_CF_RECORD_CONNECTED_UPPER12BITBUNDLEA   1
+#define ATOM_CONNECTOR_CF_RECORD_CONNECTED_LOWER12BITBUNDLEB   2
+
+typedef struct  _ATOM_CONNECTOR_CF_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+  USHORT                      usMaxPixClk;
+  UCHAR                       ucFlowCntlGpioId;
+  UCHAR                       ucSwapCntlGpioId;
+  UCHAR                       ucConnectedDvoBundle;
+  UCHAR                       ucPadding;
+}ATOM_CONNECTOR_CF_RECORD;
+
+typedef struct  _ATOM_CONNECTOR_HARDCODE_DTD_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;
+   ATOM_DTD_FORMAT                     asTiming;
+}ATOM_CONNECTOR_HARDCODE_DTD_RECORD;
+
+typedef struct _ATOM_CONNECTOR_PCIE_SUBCONNECTOR_RECORD
+{
+  ATOM_COMMON_RECORD_HEADER   sheader;                //ATOM_CONNECTOR_PCIE_SUBCONNECTOR_RECORD_TYPE
+  UCHAR                       ucSubConnectorType;     //CONNECTOR_OBJECT_ID_SINGLE_LINK_DVI_D|X_ID_DUAL_LINK_DVI_D|HDMI_TYPE_A
+  UCHAR                       ucReserved;
+}ATOM_CONNECTOR_PCIE_SUBCONNECTOR_RECORD;
+
+
+typedef struct _ATOM_ROUTER_DDC_PATH_SELECT_RECORD
+{
+   ATOM_COMMON_RECORD_HEADER   sheader;
+   UCHAR                                    ucMuxType;                     //decide the number of ucMuxState, =0, no pin state, =1: single state with complement, >1: multiple state
+   UCHAR                                    ucMuxControlPin;
+   UCHAR                                    ucMuxState[2];               //for alligment purpose
+}ATOM_ROUTER_DDC_PATH_SELECT_RECORD;
+
+typedef struct _ATOM_ROUTER_DATA_CLOCK_PATH_SELECT_RECORD
+{
+   ATOM_COMMON_RECORD_HEADER   sheader;
+   UCHAR                                    ucMuxType;
+   UCHAR                                    ucMuxControlPin;
+   UCHAR                                    ucMuxState[2];               //for alligment purpose
+}ATOM_ROUTER_DATA_CLOCK_PATH_SELECT_RECORD;
+
+// define ucMuxType
+#define ATOM_ROUTER_MUX_PIN_STATE_MASK                        0x0f
+#define ATOM_ROUTER_MUX_PIN_SINGLE_STATE_COMPLEMENT      0x01
+
+typ

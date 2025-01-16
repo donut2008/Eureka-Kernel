@@ -1,728 +1,502 @@
+  IB_ACCESS_REMOTE_WRITE)))
+			goto acc_err;
+		qp->r_sge.sg_list = NULL;
+		qp->r_sge.num_sge = 1;
+		qp->r_sge.total_len = wqe->length;
+		break;
+
+	case IB_WR_RDMA_READ:
+		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
+			goto inv_err;
+		if (unlikely(!qib_rkey_ok(qp, &sqp->s_sge.sge, wqe->length,
+					  wqe->rdma_wr.remote_addr,
+					  wqe->rdma_wr.rkey,
+					  IB_ACCESS_REMOTE_READ)))
+			goto acc_err;
+		release = 0;
+		sqp->s_sge.sg_list = NULL;
+		sqp->s_sge.num_sge = 1;
+		qp->r_sge.sge = wqe->sg_list[0];
+		qp->r_sge.sg_list = wqe->sg_list + 1;
+		qp->r_sge.num_sge = wqe->wr.num_sge;
+		qp->r_sge.total_len = wqe->length;
+		break;
+
+	case IB_WR_ATOMIC_CMP_AND_SWP:
+	case IB_WR_ATOMIC_FETCH_AND_ADD:
+		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
+			goto inv_err;
+		if (unlikely(!qib_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
+					  wqe->atomic_wr.remote_addr,
+					  wqe->atomic_wr.rkey,
+					  IB_ACCESS_REMOTE_ATOMIC)))
+			goto acc_err;
+		/* Perform atomic OP and save result. */
+		maddr = (atomic64_t *) qp->r_sge.sge.vaddr;
+		sdata = wqe->atomic_wr.compare_add;
+		*(u64 *) sqp->s_sge.sge.vaddr =
+			(wqe->atomic_wr.wr.opcode == IB_WR_ATOMIC_FETCH_AND_ADD) ?
+			(u64) atomic64_add_return(sdata, maddr) - sdata :
+			(u64) cmpxchg((u64 *) qp->r_sge.sge.vaddr,
+				      sdata, wqe->atomic_wr.swap);
+		qib_put_mr(qp->r_sge.sge.mr);
+		qp->r_sge.num_sge = 0;
+		goto send_comp;
+
+	default:
+		send_status = IB_WC_LOC_QP_OP_ERR;
+		goto serr;
+	}
+
+	sge = &sqp->s_sge.sge;
+	while (sqp->s_len) {
+		u32 len = sqp->s_len;
+
+		if (len > sge->length)
+			len = sge->length;
+		if (len > sge->sge_length)
+			len = sge->sge_length;
+		BUG_ON(len == 0);
+		qib_copy_sge(&qp->r_sge, sge->vaddr, len, release);
+		sge->vaddr += len;
+		sge->length -= len;
+		sge->sge_length -= len;
+		if (sge->sge_length == 0) {
+			if (!release)
+				qib_put_mr(sge->mr);
+			if (--sqp->s_sge.num_sge)
+				*sge = *sqp->s_sge.sg_list++;
+		} else if (sge->length == 0 && sge->mr->lkey) {
+			if (++sge->n >= QIB_SEGSZ) {
+				if (++sge->m >= sge->mr->mapsz)
+					break;
+				sge->n = 0;
+			}
+			sge->vaddr =
+				sge->mr->map[sge->m]->segs[sge->n].vaddr;
+			sge->length =
+				sge->mr->map[sge->m]->segs[sge->n].length;
+		}
+		sqp->s_len -= len;
+	}
+	if (release)
+		qib_put_ss(&qp->r_sge);
+
+	if (!test_and_clear_bit(QIB_R_WRID_VALID, &qp->r_aflags))
+		goto send_comp;
+
+	if (wqe->wr.opcode == IB_WR_RDMA_WRITE_WITH_IMM)
+		wc.opcode = IB_WC_RECV_RDMA_WITH_IMM;
+	else
+		wc.opcode = IB_WC_RECV;
+	wc.wr_id = qp->r_wr_id;
+	wc.status = IB_WC_SUCCESS;
+	wc.byte_len = wqe->length;
+	wc.qp = &qp->ibqp;
+	wc.src_qp = qp->remote_qpn;
+	wc.slid = qp->remote_ah_attr.dlid;
+	wc.sl = qp->remote_ah_attr.sl;
+	wc.port_num = 1;
+	/* Signal completion event if the solicited bit is set. */
+	qib_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,
+		       wqe->wr.send_flags & IB_SEND_SOLICITED);
+
+send_comp:
+	spin_lock_irqsave(&sqp->s_lock, flags);
+	ibp->n_loop_pkts++;
+flush_send:
+	sqp->s_rnr_retry = sqp->s_rnr_retry_cnt;
+	qib_send_complete(sqp, wqe, send_status);
+	goto again;
+
+rnr_nak:
+	/* Handle RNR NAK */
+	if (qp->ibqp.qp_type == IB_QPT_UC)
+		goto send_comp;
+	ibp->n_rnr_naks++;
+	/*
+	 * Note: we don't need the s_lock held since the BUSY flag
+	 * makes this single threaded.
+	 */
+	if (sqp->s_rnr_retry == 0) {
+		send_status = IB_WC_RNR_RETRY_EXC_ERR;
+		goto serr;
+	}
+	if (sqp->s_rnr_retry_cnt < 7)
+		sqp->s_rnr_retry--;
+	spin_lock_irqsave(&sqp->s_lock, flags);
+	if (!(ib_qib_state_ops[sqp->state] & QIB_PROCESS_RECV_OK))
+		goto clr_busy;
+	sqp->s_flags |= QIB_S_WAIT_RNR;
+	sqp->s_timer.function = qib_rc_rnr_retry;
+	sqp->s_timer.expires = jiffies +
+		usecs_to_jiffies(ib_qib_rnr_table[qp->r_min_rnr_timer]);
+	add_timer(&sqp->s_timer);
+	goto clr_busy;
+
+op_err:
+	send_status = IB_WC_REM_OP_ERR;
+	wc.status = IB_WC_LOC_QP_OP_ERR;
+	goto err;
+
+inv_err:
+	send_status = IB_WC_REM_INV_REQ_ERR;
+	wc.status = IB_WC_LOC_QP_OP_ERR;
+	goto err;
+
+acc_err:
+	send_status = IB_WC_REM_ACCESS_ERR;
+	wc.status = IB_WC_LOC_PROT_ERR;
+err:
+	/* responder goes to error state */
+	qib_rc_error(qp, wc.status);
+
+serr:
+	spin_lock_irqsave(&sqp->s_lock, flags);
+	qib_send_complete(sqp, wqe, send_status);
+	if (sqp->ibqp.qp_type == IB_QPT_RC) {
+		int lastwqe = qib_error_qp(sqp, IB_WC_WR_FLUSH_ERR);
+
+		sqp->s_flags &= ~QIB_S_BUSY;
+		spin_unlock_irqrestore(&sqp->s_lock, flags);
+		if (lastwqe) {
+			struct ib_event ev;
+
+			ev.device = sqp->ibqp.device;
+			ev.element.qp = &sqp->ibqp;
+			ev.event = IB_EVENT_QP_LAST_WQE_REACHED;
+			sqp->ibqp.event_handler(&ev, sqp->ibqp.qp_context);
+		}
+		goto done;
+	}
+clr_busy:
+	sqp->s_flags &= ~QIB_S_BUSY;
+unlock:
+	spin_unlock_irqrestore(&sqp->s_lock, flags);
+done:
+	if (qp && atomic_dec_and_test(&qp->refcount))
+		wake_up(&qp->wait);
+}
+
+/**
+ * qib_make_grh - construct a GRH header
+ * @ibp: a pointer to the IB port
+ * @hdr: a pointer to the GRH header being constructed
+ * @grh: the global route address to send to
+ * @hwords: the number of 32 bit words of header being sent
+ * @nwords: the number of 32 bit words of data being sent
+ *
+ * Return the size of the header in 32 bit words.
+ */
+u32 qib_make_grh(struct qib_ibport *ibp, struct ib_grh *hdr,
+		 struct ib_global_route *grh, u32 hwords, u32 nwords)
+{
+	hdr->version_tclass_flow =
+		cpu_to_be32((IB_GRH_VERSION << IB_GRH_VERSION_SHIFT) |
+			    (grh->traffic_class << IB_GRH_TCLASS_SHIFT) |
+			    (grh->flow_label << IB_GRH_FLOW_SHIFT));
+	hdr->paylen = cpu_to_be16((hwords - 2 + nwords + SIZE_OF_CRC) << 2);
+	/* next_hdr is defined by C8-7 in ch. 8.4.1 */
+	hdr->next_hdr = IB_GRH_NEXT_HDR;
+	hdr->hop_limit = grh->hop_limit;
+	/* The SGID is 32-bit aligned. */
+	hdr->sgid.global.subnet_prefix = ibp->gid_prefix;
+	hdr->sgid.global.interface_id = grh->sgid_index ?
+		ibp->guids[grh->sgid_index - 1] : ppd_from_ibp(ibp)->guid;
+	hdr->dgid = grh->dgid;
+
+	/* GRH header size in 32-bit words. */
+	return sizeof(struct ib_grh) / sizeof(u32);
+}
+
+void qib_make_ruc_header(struct qib_qp *qp, struct qib_other_headers *ohdr,
+			 u32 bth0, u32 bth2)
+{
+	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+	u16 lrh0;
+	u32 nwords;
+	u32 extra_bytes;
+
+	/* Construct the header. */
+	extra_bytes = -qp->s_cur_size & 3;
+	nwords = (qp->s_cur_size + extra_bytes) >> 2;
+	lrh0 = QIB_LRH_BTH;
+	if (unlikely(qp->remote_ah_attr.ah_flags & IB_AH_GRH)) {
+		qp->s_hdrwords += qib_make_grh(ibp, &qp->s_hdr->u.l.grh,
+					       &qp->remote_ah_attr.grh,
+					       qp->s_hdrwords, nwords);
+		lrh0 = QIB_LRH_GRH;
+	}
+	lrh0 |= ibp->sl_to_vl[qp->remote_ah_attr.sl] << 12 |
+		qp->remote_ah_attr.sl << 4;
+	qp->s_hdr->lrh[0] = cpu_to_be16(lrh0);
+	qp->s_hdr->lrh[1] = cpu_to_be16(qp->remote_ah_attr.dlid);
+	qp->s_hdr->lrh[2] = cpu_to_be16(qp->s_hdrwords + nwords + SIZE_OF_CRC);
+	qp->s_hdr->lrh[3] = cpu_to_be16(ppd_from_ibp(ibp)->lid |
+				       qp->remote_ah_attr.src_path_bits);
+	bth0 |= qib_get_pkey(ibp, qp->s_pkey_index);
+	bth0 |= extra_bytes << 20;
+	if (qp->s_mig_state == IB_MIG_MIGRATED)
+		bth0 |= IB_BTH_MIG_REQ;
+	ohdr->bth[0] = cpu_to_be32(bth0);
+	ohdr->bth[1] = cpu_to_be32(qp->remote_qpn);
+	ohdr->bth[2] = cpu_to_be32(bth2);
+	this_cpu_inc(ibp->pmastats->n_unicast_xmit);
+}
+
+/**
+ * qib_do_send - perform a send on a QP
+ * @work: contains a pointer to the QP
+ *
+ * Process entries in the send work queue until credit or queue is
+ * exhausted.  Only allow one CPU to send a packet per QP (tasklet).
+ * Otherwise, two threads could send packets out of order.
+ */
+void qib_do_send(struct work_struct *work)
+{
+	struct qib_qp *qp = container_of(work, struct qib_qp, s_work);
+	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	int (*make_req)(struct qib_qp *qp);
+	unsigned long flags;
+
+	if ((qp->ibqp.qp_type == IB_QPT_RC ||
+	     qp->ibqp.qp_type == IB_QPT_UC) &&
+	    (qp->remote_ah_attr.dlid & ~((1 << ppd->lmc) - 1)) == ppd->lid) {
+		qib_ruc_loopback(qp);
+		return;
+	}
+
+	if (qp->ibqp.qp_type == IB_QPT_RC)
+		make_req = qib_make_rc_req;
+	else if (qp->ibqp.qp_type == IB_QPT_UC)
+		make_req = qib_make_uc_req;
+	else
+		make_req = qib_make_ud_req;
+
+	spin_lock_irqsave(&qp->s_lock, flags);
+
+	/* Return if we are already busy processing a work request. */
+	if (!qib_send_ok(qp)) {
+		spin_unlock_irqrestore(&qp->s_lock, flags);
+		return;
+	}
+
+	qp->s_flags |= QIB_S_BUSY;
+
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+
+	do {
+		/* Check for a constructed packet to be sent. */
+		if (qp->s_hdrwords != 0) {
+			/*
+			 * If the packet cannot be sent now, return and
+			 * the send tasklet will be woken up later.
+			 */
+			if (qib_verbs_send(qp, qp->s_hdr, qp->s_hdrwords,
+					   qp->s_cur_sge, qp->s_cur_size))
+				break;
+			/* Record that s_hdr is empty. */
+			qp->s_hdrwords = 0;
+		}
+	} while (make_req(qp));
+}
+
 /*
- * Freescale CPM1/CPM2 I2C interface.
- * Copyright (c) 1999 Dan Malek (dmalek@jlc.net).
+ * This should be called with s_lock held.
+ */
+void qib_send_complete(struct qib_qp *qp, struct qib_swqe *wqe,
+		       enum ib_wc_status status)
+{
+	u32 old_last, last;
+	unsigned i;
+
+	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_OR_FLUSH_SEND))
+		return;
+
+	for (i = 0; i < wqe->wr.num_sge; i++) {
+		struct qib_sge *sge = &wqe->sg_list[i];
+
+		qib_put_mr(sge->mr);
+	}
+	if (qp->ibqp.qp_type == IB_QPT_UD ||
+	    qp->ibqp.qp_type == IB_QPT_SMI ||
+	    qp->ibqp.qp_type == IB_QPT_GSI)
+		atomic_dec(&to_iah(wqe->ud_wr.ah)->refcount);
+
+	/* See ch. 11.2.4.1 and 10.7.3.1 */
+	if (!(qp->s_flags & QIB_S_SIGNAL_REQ_WR) ||
+	    (wqe->wr.send_flags & IB_SEND_SIGNALED) ||
+	    status != IB_WC_SUCCESS) {
+		struct ib_wc wc;
+
+		memset(&wc, 0, sizeof(wc));
+		wc.wr_id = wqe->wr.wr_id;
+		wc.status = status;
+		wc.opcode = ib_qib_wc_opcode[wqe->wr.opcode];
+		wc.qp = &qp->ibqp;
+		if (status == IB_WC_SUCCESS)
+			wc.byte_len = wqe->length;
+		qib_cq_enter(to_icq(qp->ibqp.send_cq), &wc,
+			     status != IB_WC_SUCCESS);
+	}
+
+	last = qp->s_last;
+	old_last = last;
+	if (++last >= qp->s_size)
+		last = 0;
+	qp->s_last = last;
+	if (qp->s_acked == old_last)
+		qp->s_acked = last;
+	if (qp->s_cur == old_last)
+		qp->s_cur = last;
+	if (qp->s_tail == old_last)
+		qp->s_tail = last;
+	if (qp->state == IB_QPS_SQD && last == qp->s_cur)
+		qp->s_draining = 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * Copyright (c) 2013 Intel Corporation. All rights reserved.
+ * Copyright (c) 2006 - 2012 QLogic Corporation. All rights reserved.
+ * Copyright (c) 2003, 2004, 2005, 2006 PathScale, Inc. All rights reserved.
  *
- * moved into proper i2c interface;
- * Brad Parker (brad@heeltoe.com)
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
  *
- * Parts from dbox2_i2c.c (cvs.tuxbox.org)
- * (C) 2000-2001 Felix Domke (tmbinc@gmx.net), Gillem (htoa@gmx.net)
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
  *
- * (C) 2007 Montavista Software, Inc.
- * Vitaly Bordug <vitb@kernel.crashing.org>
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
  *
- * Converted to of_platform_device. Renamed to i2c-cpm.c.
- * (C) 2007,2008 Jochen Friedrich <jochen@scram.de>
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
  *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+/*
+ * This file contains all of the code that is specific to the SerDes
+ * on the QLogic_IB 7220 chip.
  */
 
-#include <linux/kernel.h>
-#include <linux/module.h>
+#include <linux/pci.h>
 #include <linux/delay.h>
-#include <linux/slab.h>
-#include <linux/interrupt.h>
-#include <linux/errno.h>
-#include <linux/stddef.h>
-#include <linux/i2c.h>
-#include <linux/io.h>
-#include <linux/dma-mapping.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
-#include <linux/of_irq.h>
-#include <linux/of_platform.h>
-#include <sysdev/fsl_soc.h>
-#include <asm/cpm.h>
+#include <linux/module.h>
+#include <linux/firmware.h>
 
-/* Try to define this if you have an older CPU (earlier than rev D4) */
-/* However, better use a GPIO based bitbang driver in this case :/   */
-#undef	I2C_CHIP_ERRATA
+#include "qib.h"
+#include "qib_7220.h"
 
-#define CPM_MAX_READ    513
-#define CPM_MAXBD       4
+#define SD7220_FW_NAME "qlogic/sd7220.fw"
+MODULE_FIRMWARE(SD7220_FW_NAME);
 
-#define I2C_EB			(0x10) /* Big endian mode */
-#define I2C_EB_CPM2		(0x30) /* Big endian mode, memory snoop */
+/*
+ * Same as in qib_iba7220.c, but just the registers needed here.
+ * Could move whole set to qib_7220.h, but decided better to keep
+ * local.
+ */
+#define KREG_IDX(regname) (QIB_7220_##regname##_OFFS / sizeof(u64))
+#define kr_hwerrclear KREG_IDX(HwErrClear)
+#define kr_hwerrmask KREG_IDX(HwErrMask)
+#define kr_hwerrstatus KREG_IDX(HwErrStatus)
+#define kr_ibcstatus KREG_IDX(IBCStatus)
+#define kr_ibserdesctrl KREG_IDX(IBSerDesCtrl)
+#define kr_scratch KREG_IDX(Scratch)
+#define kr_xgxs_cfg KREG_IDX(XGXSCfg)
+/* these are used only here, not in qib_iba7220.c */
+#define kr_ibsd_epb_access_ctrl KREG_IDX(ibsd_epb_access_ctrl)
+#define kr_ibsd_epb_transaction_reg KREG_IDX(ibsd_epb_transaction_reg)
+#define kr_pciesd_epb_transaction_reg KREG_IDX(pciesd_epb_transaction_reg)
+#define kr_pciesd_epb_access_ctrl KREG_IDX(pciesd_epb_access_ctrl)
+#define kr_serdes_ddsrxeq0 KREG_IDX(SerDes_DDSRXEQ0)
 
-#define DPRAM_BASE		((u8 __iomem __force *)cpm_muram_addr(0))
+/*
+ * The IBSerDesMappTable is a memory that holds values to be stored in
+ * various SerDes registers by IBC.
+ */
+#define kr_serdes_maptable KREG_IDX(IBSerDesMappTable)
 
-/* I2C parameter RAM. */
-struct i2c_ram {
-	ushort  rbase;		/* Rx Buffer descriptor base address */
-	ushort  tbase;		/* Tx Buffer descriptor base address */
-	u_char  rfcr;		/* Rx function code */
-	u_char  tfcr;		/* Tx function code */
-	ushort  mrblr;		/* Max receive buffer length */
-	uint    rstate;		/* Internal */
-	uint    rdp;		/* Internal */
-	ushort  rbptr;		/* Rx Buffer descriptor pointer */
-	ushort  rbc;		/* Internal */
-	uint    rxtmp;		/* Internal */
-	uint    tstate;		/* Internal */
-	uint    tdp;		/* Internal */
-	ushort  tbptr;		/* Tx Buffer descriptor pointer */
-	ushort  tbc;		/* Internal */
-	uint    txtmp;		/* Internal */
-	char    res1[4];	/* Reserved */
-	ushort  rpbase;		/* Relocation pointer */
-	char    res2[2];	/* Reserved */
-	/* The following elements are only for CPM2 */
-	char    res3[4];	/* Reserved */
-	uint    sdmatmp;	/* Internal */
-};
+/*
+ * Below used for sdnum parameter, selecting one of the two sections
+ * used for PCIe, or the single SerDes used for IB.
+ */
+#define PCIE_SERDES0 0
+#define PCIE_SERDES1 1
 
-#define I2COM_START	0x80
-#define I2COM_MASTER	0x01
-#define I2CER_TXE	0x10
-#define I2CER_BUSY	0x04
-#define I2CER_TXB	0x02
-#define I2CER_RXB	0x01
-#define I2MOD_EN	0x01
+/*
+ * The EPB requires addressing in a particular form. EPB_LOC() is intended
+ * to make #definitions a little more readable.
+ */
+#define EPB_ADDR_SHF 8
+#define EPB_LOC(chn, elt, reg) \
+	(((elt & 0xf) | ((chn & 7) << 4) | ((reg & 0x3f) << 9)) << \
+	 EPB_ADDR_SHF)
+#define EPB_IB_QUAD0_CS_SHF (25)
+#define EPB_IB_QUAD0_CS (1U <<  EPB_IB_QUAD0_CS_SHF)
+#define EPB_IB_UC_CS_SHF (26)
+#define EPB_PCIE_UC_CS_SHF (27)
+#define EPB_GLOBAL_WR (1U << (EPB_ADDR_SHF + 8))
 
-/* I2C Registers */
-struct i2c_reg {
-	u8	i2mod;
-	u8	res1[3];
-	u8	i2add;
-	u8	res2[3];
-	u8	i2brg;
-	u8	res3[3];
-	u8	i2com;
-	u8	res4[3];
-	u8	i2cer;
-	u8	res5[3];
-	u8	i2cmr;
-};
+/* Forward declarations. */
+static int qib_sd7220_reg_mod(struct qib_devdata *dd, int sdnum, u32 loc,
+			      u32 data, u32 mask);
+static int ibsd_mod_allchnls(struct qib_devdata *dd, int loc, int val,
+			     int mask);
+static int qib_sd_trimdone_poll(struct qib_devdata *dd);
+static void qib_sd_trimdone_monitor(struct qib_devdata *dd, const char *where);
+static int qib_sd_setvals(struct qib_devdata *dd);
+static int qib_sd_early(struct qib_devdata *dd);
+static int qib_sd_dactrim(struct qib_devdata *dd);
+static int qib_internal_presets(struct qib_devdata *dd);
+/* Tweak the register (CMUCTRL5) that contains the TRIMSELF controls */
+static int qib_sd_trimself(struct qib_devdata *dd, int val);
+static int epb_access(struct qib_devdata *dd, int sdnum, int claim);
+static int qib_sd7220_ib_load(struct qib_devdata *dd,
+			      const struct firmware *fw);
+static int qib_sd7220_ib_vfy(struct qib_devdata *dd,
+			     const struct firmware *fw);
 
-struct cpm_i2c {
-	char *base;
-	struct platform_device *ofdev;
-	struct i2c_adapter adap;
-	uint dp_addr;
-	int version; /* CPM1=1, CPM2=2 */
-	int irq;
-	int cp_command;
-	int freq;
-	struct i2c_reg __iomem *i2c_reg;
-	struct i2c_ram __iomem *i2c_ram;
-	u16 i2c_addr;
-	wait_queue_head_t i2c_wait;
-	cbd_t __iomem *tbase;
-	cbd_t __iomem *rbase;
-	u_char *txbuf[CPM_MAXBD];
-	u_char *rxbuf[CPM_MAXBD];
-	dma_addr_t txdma[CPM_MAXBD];
-	dma_addr_t rxdma[CPM_MAXBD];
-};
-
-static irqreturn_t cpm_i2c_interrupt(int irq, void *dev_id)
+/*
+ * Below keeps track of whether the "once per power-on" initialization has
+ * been done, because uC code Version 1.32.17 or higher allows the uC to
+ * be reset at will, and Automatic Equalization may require it. So the
+ * state of the reset "pin", is no longer valid. Instead, we check for the
+ * actual uC code having been loaded.
+ */
+static int qib_ibsd_ucode_loaded(struct qib_pportdata *ppd,
+				 const struct firmware *fw)
 {
-	struct cpm_i2c *cpm;
-	struct i2c_reg __iomem *i2c_reg;
-	struct i2c_adapter *adap = dev_id;
-	int i;
+	struct qib_devdata *dd = ppd->dd;
 
-	cpm = i2c_get_adapdata(dev_id);
-	i2c_reg = cpm->i2c_reg;
-
-	/* Clear interrupt. */
-	i = in_8(&i2c_reg->i2cer);
-	out_8(&i2c_reg->i2cer, i);
-
-	dev_dbg(&adap->dev, "Interrupt: %x\n", i);
-
-	wake_up(&cpm->i2c_wait);
-
-	return i ? IRQ_HANDLED : IRQ_NONE;
+	if (!dd->cspec->serdes_first_init_done &&
+	    qib_sd7220_ib_vfy(dd, fw) > 0)
+		dd->cspec->serdes_first_init_done = 1;
+	return dd->cspec->serdes_first_init_done;
 }
 
-static void cpm_reset_i2c_params(struct cpm_i2c *cpm)
+/* repeat #define for local use. "Real" #define is in qib_iba7220.c */
+#define QLOGIC_IB_HWE_IB_UC_MEMORYPARITYERR      0x0000004000000000ULL
+#define IB_MPREG5 (EPB_LOC(6, 0, 0xE) | (1L << EPB_IB_UC_CS_SHF))
+#define IB_MPREG6 (EPB_LOC(6, 0, 0xF) | (1U << EPB_IB_UC_CS_SHF))
+#define UC_PAR_CLR_D 8
+#define UC_PAR_CLR_M 0xC
+#define IB_CTRL2(chn) (EPB_LOC(chn, 7, 3) | EPB_IB_QUAD0_CS)
+#define START_EQ1(chan) EPB_LOC(chan, 7, 0x27)
+
+void qib_sd7220_clr_ibpar(struct qib_devdata *dd)
 {
-	struct i2c_ram __iomem *i2c_ram = cpm->i2c_ram;
-
-	/* Set up the I2C parameters in the parameter ram. */
-	out_be16(&i2c_ram->tbase, (u8 __iomem *)cpm->tbase - DPRAM_BASE);
-	out_be16(&i2c_ram->rbase, (u8 __iomem *)cpm->rbase - DPRAM_BASE);
-
-	if (cpm->version == 1) {
-		out_8(&i2c_ram->tfcr, I2C_EB);
-		out_8(&i2c_ram->rfcr, I2C_EB);
-	} else {
-		out_8(&i2c_ram->tfcr, I2C_EB_CPM2);
-		out_8(&i2c_ram->rfcr, I2C_EB_CPM2);
-	}
-
-	out_be16(&i2c_ram->mrblr, CPM_MAX_READ);
-
-	out_be32(&i2c_ram->rstate, 0);
-	out_be32(&i2c_ram->rdp, 0);
-	out_be16(&i2c_ram->rbptr, 0);
-	out_be16(&i2c_ram->rbc, 0);
-	out_be32(&i2c_ram->rxtmp, 0);
-	out_be32(&i2c_ram->tstate, 0);
-	out_be32(&i2c_ram->tdp, 0);
-	out_be16(&i2c_ram->tbptr, 0);
-	out_be16(&i2c_ram->tbc, 0);
-	out_be32(&i2c_ram->txtmp, 0);
-}
-
-static void cpm_i2c_force_close(struct i2c_adapter *adap)
-{
-	struct cpm_i2c *cpm = i2c_get_adapdata(adap);
-	struct i2c_reg __iomem *i2c_reg = cpm->i2c_reg;
-
-	dev_dbg(&adap->dev, "cpm_i2c_force_close()\n");
-
-	cpm_command(cpm->cp_command, CPM_CR_CLOSE_RX_BD);
-
-	out_8(&i2c_reg->i2cmr, 0x00);	/* Disable all interrupts */
-	out_8(&i2c_reg->i2cer, 0xff);
-}
-
-static void cpm_i2c_parse_message(struct i2c_adapter *adap,
-	struct i2c_msg *pmsg, int num, int tx, int rx)
-{
-	cbd_t __iomem *tbdf;
-	cbd_t __iomem *rbdf;
-	u_char addr;
-	u_char *tb;
-	u_char *rb;
-	struct cpm_i2c *cpm = i2c_get_adapdata(adap);
-
-	tbdf = cpm->tbase + tx;
-	rbdf = cpm->rbase + rx;
-
-	addr = pmsg->addr << 1;
-	if (pmsg->flags & I2C_M_RD)
-		addr |= 1;
-
-	tb = cpm->txbuf[tx];
-	rb = cpm->rxbuf[rx];
-
-	/* Align read buffer */
-	rb = (u_char *) (((ulong) rb + 1) & ~1);
-
-	tb[0] = addr;		/* Device address byte w/rw flag */
-
-	out_be16(&tbdf->cbd_datlen, pmsg->len + 1);
-	out_be16(&tbdf->cbd_sc, 0);
-
-	if (!(pmsg->flags & I2C_M_NOSTART))
-		setbits16(&tbdf->cbd_sc, BD_I2C_START);
-
-	if (tx + 1 == num)
-		setbits16(&tbdf->cbd_sc, BD_SC_LAST | BD_SC_WRAP);
-
-	if (pmsg->flags & I2C_M_RD) {
-		/*
-		 * To read, we need an empty buffer of the proper length.
-		 * All that is used is the first byte for address, the remainder
-		 * is just used for timing (and doesn't really have to exist).
-		 */
-
-		dev_dbg(&adap->dev, "cpm_i2c_read(abyte=0x%x)\n", addr);
-
-		out_be16(&rbdf->cbd_datlen, 0);
-		out_be16(&rbdf->cbd_sc, BD_SC_EMPTY | BD_SC_INTRPT);
-
-		if (rx + 1 == CPM_MAXBD)
-			setbits16(&rbdf->cbd_sc, BD_SC_WRAP);
-
-		eieio();
-		setbits16(&tbdf->cbd_sc, BD_SC_READY);
-	} else {
-		dev_dbg(&adap->dev, "cpm_i2c_write(abyte=0x%x)\n", addr);
-
-		memcpy(tb+1, pmsg->buf, pmsg->len);
-
-		eieio();
-		setbits16(&tbdf->cbd_sc, BD_SC_READY | BD_SC_INTRPT);
-	}
-}
-
-static int cpm_i2c_check_message(struct i2c_adapter *adap,
-	struct i2c_msg *pmsg, int tx, int rx)
-{
-	cbd_t __iomem *tbdf;
-	cbd_t __iomem *rbdf;
-	u_char *tb;
-	u_char *rb;
-	struct cpm_i2c *cpm = i2c_get_adapdata(adap);
-
-	tbdf = cpm->tbase + tx;
-	rbdf = cpm->rbase + rx;
-
-	tb = cpm->txbuf[tx];
-	rb = cpm->rxbuf[rx];
-
-	/* Align read buffer */
-	rb = (u_char *) (((uint) rb + 1) & ~1);
-
-	eieio();
-	if (pmsg->flags & I2C_M_RD) {
-		dev_dbg(&adap->dev, "tx sc 0x%04x, rx sc 0x%04x\n",
-			in_be16(&tbdf->cbd_sc), in_be16(&rbdf->cbd_sc));
-
-		if (in_be16(&tbdf->cbd_sc) & BD_SC_NAK) {
-			dev_dbg(&adap->dev, "I2C read; No ack\n");
-			return -ENXIO;
-		}
-		if (in_be16(&rbdf->cbd_sc) & BD_SC_EMPTY) {
-			dev_err(&adap->dev,
-				"I2C read; complete but rbuf empty\n");
-			return -EREMOTEIO;
-		}
-		if (in_be16(&rbdf->cbd_sc) & BD_SC_OV) {
-			dev_err(&adap->dev, "I2C read; Overrun\n");
-			return -EREMOTEIO;
-		}
-		memcpy(pmsg->buf, rb, pmsg->len);
-	} else {
-		dev_dbg(&adap->dev, "tx sc %d 0x%04x\n", tx,
-			in_be16(&tbdf->cbd_sc));
-
-		if (in_be16(&tbdf->cbd_sc) & BD_SC_NAK) {
-			dev_dbg(&adap->dev, "I2C write; No ack\n");
-			return -ENXIO;
-		}
-		if (in_be16(&tbdf->cbd_sc) & BD_SC_UN) {
-			dev_err(&adap->dev, "I2C write; Underrun\n");
-			return -EIO;
-		}
-		if (in_be16(&tbdf->cbd_sc) & BD_SC_CL) {
-			dev_err(&adap->dev, "I2C write; Collision\n");
-			return -EIO;
-		}
-	}
-	return 0;
-}
-
-static int cpm_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
-{
-	struct cpm_i2c *cpm = i2c_get_adapdata(adap);
-	struct i2c_reg __iomem *i2c_reg = cpm->i2c_reg;
-	struct i2c_ram __iomem *i2c_ram = cpm->i2c_ram;
-	struct i2c_msg *pmsg;
-	int ret;
-	int tptr;
-	int rptr;
-	cbd_t __iomem *tbdf;
-	cbd_t __iomem *rbdf;
-
-	/* Reset to use first buffer */
-	out_be16(&i2c_ram->rbptr, in_be16(&i2c_ram->rbase));
-	out_be16(&i2c_ram->tbptr, in_be16(&i2c_ram->tbase));
-
-	tbdf = cpm->tbase;
-	rbdf = cpm->rbase;
-
-	tptr = 0;
-	rptr = 0;
-
-	/*
-	 * If there was a collision in the last i2c transaction,
-	 * Set I2COM_MASTER as it was cleared during collision.
-	 */
-	if (in_be16(&tbdf->cbd_sc) & BD_SC_CL) {
-		out_8(&cpm->i2c_reg->i2com, I2COM_MASTER);
-	}
-
-	while (tptr < num) {
-		pmsg = &msgs[tptr];
-		dev_dbg(&adap->dev, "R: %d T: %d\n", rptr, tptr);
-
-		cpm_i2c_parse_message(adap, pmsg, num, tptr, rptr);
-		if (pmsg->flags & I2C_M_RD)
-			rptr++;
-		tptr++;
-	}
-	/* Start transfer now */
-	/* Enable RX/TX/Error interupts */
-	out_8(&i2c_reg->i2cmr, I2CER_TXE | I2CER_TXB | I2CER_RXB);
-	out_8(&i2c_reg->i2cer, 0xff);	/* Clear interrupt status */
-	/* Chip bug, set enable here */
-	setbits8(&i2c_reg->i2mod, I2MOD_EN);	/* Enable */
-	/* Begin transmission */
-	setbits8(&i2c_reg->i2com, I2COM_START);
-
-	tptr = 0;
-	rptr = 0;
-
-	while (tptr < num) {
-		/* Check for outstanding messages */
-		dev_dbg(&adap->dev, "test ready.\n");
-		pmsg = &msgs[tptr];
-		if (pmsg->flags & I2C_M_RD)
-			ret = wait_event_timeout(cpm->i2c_wait,
-				(in_be16(&tbdf[tptr].cbd_sc) & BD_SC_NAK) ||
-				!(in_be16(&rbdf[rptr].cbd_sc) & BD_SC_EMPTY),
-				1 * HZ);
-		else
-			ret = wait_event_timeout(cpm->i2c_wait,
-				!(in_be16(&tbdf[tptr].cbd_sc) & BD_SC_READY),
-				1 * HZ);
-		if (ret == 0) {
-			ret = -EREMOTEIO;
-			dev_err(&adap->dev, "I2C transfer: timeout\n");
-			goto out_err;
-		}
-		if (ret > 0) {
-			dev_dbg(&adap->dev, "ready.\n");
-			ret = cpm_i2c_check_message(adap, pmsg, tptr, rptr);
-			tptr++;
-			if (pmsg->flags & I2C_M_RD)
-				rptr++;
-			if (ret)
-				goto out_err;
-		}
-	}
-#ifdef I2C_CHIP_ERRATA
-	/*
-	 * Chip errata, clear enable. This is not needed on rev D4 CPUs.
-	 * Disabling I2C too early may cause too short stop condition
-	 */
-	udelay(4);
-	clrbits8(&i2c_reg->i2mod, I2MOD_EN);
-#endif
-	return (num);
-
-out_err:
-	cpm_i2c_force_close(adap);
-#ifdef I2C_CHIP_ERRATA
-	/*
-	 * Chip errata, clear enable. This is not needed on rev D4 CPUs.
-	 */
-	clrbits8(&i2c_reg->i2mod, I2MOD_EN);
-#endif
-	return ret;
-}
-
-static u32 cpm_i2c_func(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | (I2C_FUNC_SMBUS_EMUL & ~I2C_FUNC_SMBUS_QUICK);
-}
-
-/* -----exported algorithm data: -------------------------------------	*/
-
-static const struct i2c_algorithm cpm_i2c_algo = {
-	.master_xfer = cpm_i2c_xfer,
-	.functionality = cpm_i2c_func,
-};
-
-/* CPM_MAX_READ is also limiting writes according to the code! */
-static struct i2c_adapter_quirks cpm_i2c_quirks = {
-	.max_num_msgs = CPM_MAXBD,
-	.max_read_len = CPM_MAX_READ,
-	.max_write_len = CPM_MAX_READ,
-};
-
-static const struct i2c_adapter cpm_ops = {
-	.owner		= THIS_MODULE,
-	.name		= "i2c-cpm",
-	.algo		= &cpm_i2c_algo,
-	.quirks		= &cpm_i2c_quirks,
-};
-
-static int cpm_i2c_setup(struct cpm_i2c *cpm)
-{
-	struct platform_device *ofdev = cpm->ofdev;
-	const u32 *data;
-	int len, ret, i;
-	void __iomem *i2c_base;
-	cbd_t __iomem *tbdf;
-	cbd_t __iomem *rbdf;
-	unsigned char brg;
-
-	dev_dbg(&cpm->ofdev->dev, "cpm_i2c_setup()\n");
-
-	init_waitqueue_head(&cpm->i2c_wait);
-
-	cpm->irq = irq_of_parse_and_map(ofdev->dev.of_node, 0);
-	if (!cpm->irq)
-		return -EINVAL;
-
-	/* Install interrupt handler. */
-	ret = request_irq(cpm->irq, cpm_i2c_interrupt, 0, "cpm_i2c",
-			  &cpm->adap);
-	if (ret)
-		return ret;
-
-	/* I2C parameter RAM */
-	i2c_base = of_iomap(ofdev->dev.of_node, 1);
-	if (i2c_base == NULL) {
-		ret = -EINVAL;
-		goto out_irq;
-	}
-
-	if (of_device_is_compatible(ofdev->dev.of_node, "fsl,cpm1-i2c")) {
-
-		/* Check for and use a microcode relocation patch. */
-		cpm->i2c_ram = i2c_base;
-		cpm->i2c_addr = in_be16(&cpm->i2c_ram->rpbase);
-
-		/*
-		 * Maybe should use cpm_muram_alloc instead of hardcoding
-		 * this in micropatch.c
-		 */
-		if (cpm->i2c_addr) {
-			cpm->i2c_ram = cpm_muram_addr(cpm->i2c_addr);
-			iounmap(i2c_base);
-		}
-
-		cpm->version = 1;
-
-	} else if (of_device_is_compatible(ofdev->dev.of_node, "fsl,cpm2-i2c")) {
-		cpm->i2c_addr = cpm_muram_alloc(sizeof(struct i2c_ram), 64);
-		cpm->i2c_ram = cpm_muram_addr(cpm->i2c_addr);
-		out_be16(i2c_base, cpm->i2c_addr);
-		iounmap(i2c_base);
-
-		cpm->version = 2;
-
-	} else {
-		iounmap(i2c_base);
-		ret = -EINVAL;
-		goto out_irq;
-	}
-
-	/* I2C control/status registers */
-	cpm->i2c_reg = of_iomap(ofdev->dev.of_node, 0);
-	if (cpm->i2c_reg == NULL) {
-		ret = -EINVAL;
-		goto out_ram;
-	}
-
-	data = of_get_property(ofdev->dev.of_node, "fsl,cpm-command", &len);
-	if (!data || len != 4) {
-		ret = -EINVAL;
-		goto out_reg;
-	}
-	cpm->cp_command = *data;
-
-	data = of_get_property(ofdev->dev.of_node, "linux,i2c-class", &len);
-	if (data && len == 4)
-		cpm->adap.class = *data;
-
-	data = of_get_property(ofdev->dev.of_node, "clock-frequency", &len);
-	if (data && len == 4)
-		cpm->freq = *data;
-	else
-		cpm->freq = 60000; /* use 60kHz i2c clock by default */
-
-	/*
-	 * Allocate space for CPM_MAXBD transmit and receive buffer
-	 * descriptors in the DP ram.
-	 */
-	cpm->dp_addr = cpm_muram_alloc(sizeof(cbd_t) * 2 * CPM_MAXBD, 8);
-	if (!cpm->dp_addr) {
-		ret = -ENOMEM;
-		goto out_reg;
-	}
-
-	cpm->tbase = cpm_muram_addr(cpm->dp_addr);
-	cpm->rbase = cpm_muram_addr(cpm->dp_addr + sizeof(cbd_t) * CPM_MAXBD);
-
-	/* Allocate TX and RX buffers */
-
-	tbdf = cpm->tbase;
-	rbdf = cpm->rbase;
-
-	for (i = 0; i < CPM_MAXBD; i++) {
-		cpm->rxbuf[i] = dma_alloc_coherent(&cpm->ofdev->dev,
-						   CPM_MAX_READ + 1,
-						   &cpm->rxdma[i], GFP_KERNEL);
-		if (!cpm->rxbuf[i]) {
-			ret = -ENOMEM;
-			goto out_muram;
-		}
-		out_be32(&rbdf[i].cbd_bufaddr, ((cpm->rxdma[i] + 1) & ~1));
-
-		cpm->txbuf[i] = (unsigned char *)dma_alloc_coherent(&cpm->ofdev->dev, CPM_MAX_READ + 1, &cpm->txdma[i], GFP_KERNEL);
-		if (!cpm->txbuf[i]) {
-			ret = -ENOMEM;
-			goto out_muram;
-		}
-		out_be32(&tbdf[i].cbd_bufaddr, cpm->txdma[i]);
-	}
-
-	/* Initialize Tx/Rx parameters. */
-
-	cpm_reset_i2c_params(cpm);
-
-	dev_dbg(&cpm->ofdev->dev, "i2c_ram 0x%p, i2c_addr 0x%04x, freq %d\n",
-		cpm->i2c_ram, cpm->i2c_addr, cpm->freq);
-	dev_dbg(&cpm->ofdev->dev, "tbase 0x%04x, rbase 0x%04x\n",
-		(u8 __iomem *)cpm->tbase - DPRAM_BASE,
-		(u8 __iomem *)cpm->rbase - DPRAM_BASE);
-
-	cpm_command(cpm->cp_command, CPM_CR_INIT_TRX);
-
-	/*
-	 * Select an invalid address. Just make sure we don't use loopback mode
-	 */
-	out_8(&cpm->i2c_reg->i2add, 0x7f << 1);
-
-	/*
-	 * PDIV is set to 00 in i2mod, so brgclk/32 is used as input to the
-	 * i2c baud rate generator. This is divided by 2 x (DIV + 3) to get
-	 * the actual i2c bus frequency.
-	 */
-	brg = get_brgfreq() / (32 * 2 * cpm->freq) - 3;
-	out_8(&cpm->i2c_reg->i2brg, brg);
-
-	out_8(&cpm->i2c_reg->i2mod, 0x00);
-	out_8(&cpm->i2c_reg->i2com, I2COM_MASTER);	/* Master mode */
-
-	/* Disable interrupts. */
-	out_8(&cpm->i2c_reg->i2cmr, 0);
-	out_8(&cpm->i2c_reg->i2cer, 0xff);
-
-	return 0;
-
-out_muram:
-	for (i = 0; i < CPM_MAXBD; i++) {
-		if (cpm->rxbuf[i])
-			dma_free_coherent(&cpm->ofdev->dev, CPM_MAX_READ + 1,
-				cpm->rxbuf[i], cpm->rxdma[i]);
-		if (cpm->txbuf[i])
-			dma_free_coherent(&cpm->ofdev->dev, CPM_MAX_READ + 1,
-				cpm->txbuf[i], cpm->txdma[i]);
-	}
-	cpm_muram_free(cpm->dp_addr);
-out_reg:
-	iounmap(cpm->i2c_reg);
-out_ram:
-	if ((cpm->version == 1) && (!cpm->i2c_addr))
-		iounmap(cpm->i2c_ram);
-	if (cpm->version == 2)
-		cpm_muram_free(cpm->i2c_addr);
-out_irq:
-	free_irq(cpm->irq, &cpm->adap);
-	return ret;
-}
-
-static void cpm_i2c_shutdown(struct cpm_i2c *cpm)
-{
-	int i;
-
-	/* Shut down I2C. */
-	clrbits8(&cpm->i2c_reg->i2mod, I2MOD_EN);
-
-	/* Disable interrupts */
-	out_8(&cpm->i2c_reg->i2cmr, 0);
-	out_8(&cpm->i2c_reg->i2cer, 0xff);
-
-	free_irq(cpm->irq, &cpm->adap);
-
-	/* Free all memory */
-	for (i = 0; i < CPM_MAXBD; i++) {
-		dma_free_coherent(&cpm->ofdev->dev, CPM_MAX_READ + 1,
-			cpm->rxbuf[i], cpm->rxdma[i]);
-		dma_free_coherent(&cpm->ofdev->dev, CPM_MAX_READ + 1,
-			cpm->txbuf[i], cpm->txdma[i]);
-	}
-
-	cpm_muram_free(cpm->dp_addr);
-	iounmap(cpm->i2c_reg);
-
-	if ((cpm->version == 1) && (!cpm->i2c_addr))
-		iounmap(cpm->i2c_ram);
-	if (cpm->version == 2)
-		cpm_muram_free(cpm->i2c_addr);
-}
-
-static int cpm_i2c_probe(struct platform_device *ofdev)
-{
-	int result, len;
-	struct cpm_i2c *cpm;
-	const u32 *data;
-
-	cpm = kzalloc(sizeof(struct cpm_i2c), GFP_KERNEL);
-	if (!cpm)
-		return -ENOMEM;
-
-	cpm->ofdev = ofdev;
-
-	platform_set_drvdata(ofdev, cpm);
-
-	cpm->adap = cpm_ops;
-	i2c_set_adapdata(&cpm->adap, cpm);
-	cpm->adap.dev.parent = &ofdev->dev;
-	cpm->adap.dev.of_node = of_node_get(ofdev->dev.of_node);
-
-	result = cpm_i2c_setup(cpm);
-	if (result) {
-		dev_err(&ofdev->dev, "Unable to init hardware\n");
-		goto out_free;
-	}
-
-	/* register new adapter to i2c module... */
-
-	data = of_get_property(ofdev->dev.of_node, "linux,i2c-index", &len);
-	cpm->adap.nr = (data && len == 4) ? be32_to_cpup(data) : -1;
-	result = i2c_add_numbered_adapter(&cpm->adap);
-
-	if (result < 0) {
-		dev_err(&ofdev->dev, "Unable to register with I2C\n");
-		goto out_shut;
-	}
-
-	dev_dbg(&ofdev->dev, "hw routines for %s registered.\n",
-		cpm->adap.name);
-
-	return 0;
-out_shut:
-	cpm_i2c_shutdown(cpm);
-out_free:
-	kfree(cpm);
-
-	return result;
-}
-
-static int cpm_i2c_remove(struct platform_device *ofdev)
-{
-	struct cpm_i2c *cpm = platform_get_drvdata(ofdev);
-
-	i2c_del_adapter(&cpm->adap);
-
-	cpm_i2c_shutdown(cpm);
-
-	kfree(cpm);
-
-	return 0;
-}
-
-static const struct of_device_id cpm_i2c_match[] = {
-	{
-		.compatible = "fsl,cpm1-i2c",
-	},
-	{
-		.compatible = "fsl,cpm2-i2c",
-	},
-	{},
-};
-
-MODULE_DEVICE_TABLE(of, cpm_i2c_match);
-
-static struct platform_driver cpm_i2c_driver = {
-	.probe		= cpm_i2c_probe,
-	.remove		= cpm_i2c_remove,
-	.driver = {
-		.name = "fsl-i2c-cpm",
-		.of_match_table = cpm_i2c_match,
-	},
-};
-
-module_platform_driver(cpm_i2c_driver);
-
-MODULE_AUTHOR("Jochen Friedrich <jochen@scram.de>");
-MODULE_DESCRIPTION("I2C-Bus adapter routines for CPM boards");
-MODULE_LICENSE("GPL");
+	

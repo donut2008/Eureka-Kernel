@@ -1,298 +1,105 @@
-/*
- * max7359_keypad.c - MAX7359 Key Switch Controller Driver
- *
- * Copyright (C) 2009 Samsung Electronics
- * Kim Kyuwon <q1.kim@samsung.com>
- *
- * Based on pxa27x_keypad.c
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * Datasheet: http://www.maxim-ic.com/quick_view2.cfm/qv_pk/5456
- */
-
-#include <linux/module.h>
-#include <linux/i2c.h>
-#include <linux/slab.h>
-#include <linux/interrupt.h>
-#include <linux/pm.h>
-#include <linux/input.h>
-#include <linux/input/matrix_keypad.h>
-
-#define MAX7359_MAX_KEY_ROWS	8
-#define MAX7359_MAX_KEY_COLS	8
-#define MAX7359_MAX_KEY_NUM	(MAX7359_MAX_KEY_ROWS * MAX7359_MAX_KEY_COLS)
-#define MAX7359_ROW_SHIFT	3
-
-/*
- * MAX7359 registers
- */
-#define MAX7359_REG_KEYFIFO	0x00
-#define MAX7359_REG_CONFIG	0x01
-#define MAX7359_REG_DEBOUNCE	0x02
-#define MAX7359_REG_INTERRUPT	0x03
-#define MAX7359_REG_PORTS	0x04
-#define MAX7359_REG_KEYREP	0x05
-#define MAX7359_REG_SLEEP	0x06
-
-/*
- * Configuration register bits
- */
-#define MAX7359_CFG_SLEEP	(1 << 7)
-#define MAX7359_CFG_INTERRUPT	(1 << 5)
-#define MAX7359_CFG_KEY_RELEASE	(1 << 3)
-#define MAX7359_CFG_WAKEUP	(1 << 1)
-#define MAX7359_CFG_TIMEOUT	(1 << 0)
-
-/*
- * Autosleep register values (ms)
- */
-#define MAX7359_AUTOSLEEP_8192	0x01
-#define MAX7359_AUTOSLEEP_4096	0x02
-#define MAX7359_AUTOSLEEP_2048	0x03
-#define MAX7359_AUTOSLEEP_1024	0x04
-#define MAX7359_AUTOSLEEP_512	0x05
-#define MAX7359_AUTOSLEEP_256	0x06
-
-struct max7359_keypad {
-	/* matrix key code map */
-	unsigned short keycodes[MAX7359_MAX_KEY_NUM];
-
-	struct input_dev *input_dev;
-	struct i2c_client *client;
-};
-
-static int max7359_write_reg(struct i2c_client *client, u8 reg, u8 val)
-{
-	int ret = i2c_smbus_write_byte_data(client, reg, val);
-
-	if (ret < 0)
-		dev_err(&client->dev, "%s: reg 0x%x, val 0x%x, err %d\n",
-			__func__, reg, val, ret);
-	return ret;
-}
-
-static int max7359_read_reg(struct i2c_client *client, int reg)
-{
-	int ret = i2c_smbus_read_byte_data(client, reg);
-
-	if (ret < 0)
-		dev_err(&client->dev, "%s: reg 0x%x, err %d\n",
-			__func__, reg, ret);
-	return ret;
-}
-
-/* runs in an IRQ thread -- can (and will!) sleep */
-static irqreturn_t max7359_interrupt(int irq, void *dev_id)
-{
-	struct max7359_keypad *keypad = dev_id;
-	struct input_dev *input_dev = keypad->input_dev;
-	int val, row, col, release, code;
-
-	val = max7359_read_reg(keypad->client, MAX7359_REG_KEYFIFO);
-	row = val & 0x7;
-	col = (val >> 3) & 0x7;
-	release = val & 0x40;
-
-	code = MATRIX_SCAN_CODE(row, col, MAX7359_ROW_SHIFT);
-
-	dev_dbg(&keypad->client->dev,
-		"key[%d:%d] %s\n", row, col, release ? "release" : "press");
-
-	input_event(input_dev, EV_MSC, MSC_SCAN, code);
-	input_report_key(input_dev, keypad->keycodes[code], !release);
-	input_sync(input_dev);
-
-	return IRQ_HANDLED;
-}
-
-/*
- * Let MAX7359 fall into a deep sleep:
- * If no keys are pressed, enter sleep mode for 8192 ms. And if any
- * key is pressed, the MAX7359 returns to normal operating mode.
- */
-static inline void max7359_fall_deepsleep(struct i2c_client *client)
-{
-	max7359_write_reg(client, MAX7359_REG_SLEEP, MAX7359_AUTOSLEEP_8192);
-}
-
-/*
- * Let MAX7359 take a catnap:
- * Autosleep just for 256 ms.
- */
-static inline void max7359_take_catnap(struct i2c_client *client)
-{
-	max7359_write_reg(client, MAX7359_REG_SLEEP, MAX7359_AUTOSLEEP_256);
-}
-
-static int max7359_open(struct input_dev *dev)
-{
-	struct max7359_keypad *keypad = input_get_drvdata(dev);
-
-	max7359_take_catnap(keypad->client);
-
-	return 0;
-}
-
-static void max7359_close(struct input_dev *dev)
-{
-	struct max7359_keypad *keypad = input_get_drvdata(dev);
-
-	max7359_fall_deepsleep(keypad->client);
-}
-
-static void max7359_initialize(struct i2c_client *client)
-{
-	max7359_write_reg(client, MAX7359_REG_CONFIG,
-		MAX7359_CFG_KEY_RELEASE | /* Key release enable */
-		MAX7359_CFG_WAKEUP); /* Key press wakeup enable */
-
-	/* Full key-scan functionality */
-	max7359_write_reg(client, MAX7359_REG_DEBOUNCE, 0x1F);
-
-	/* nINT asserts every debounce cycles */
-	max7359_write_reg(client, MAX7359_REG_INTERRUPT, 0x01);
-
-	max7359_fall_deepsleep(client);
-}
-
-static int max7359_probe(struct i2c_client *client,
-					const struct i2c_device_id *id)
-{
-	const struct matrix_keymap_data *keymap_data =
-			dev_get_platdata(&client->dev);
-	struct max7359_keypad *keypad;
-	struct input_dev *input_dev;
-	int ret;
-	int error;
-
-	if (!client->irq) {
-		dev_err(&client->dev, "The irq number should not be zero\n");
-		return -EINVAL;
-	}
-
-	/* Detect MAX7359: The initial Keys FIFO value is '0x3F' */
-	ret = max7359_read_reg(client, MAX7359_REG_KEYFIFO);
-	if (ret < 0) {
-		dev_err(&client->dev, "failed to detect device\n");
-		return -ENODEV;
-	}
-
-	dev_dbg(&client->dev, "keys FIFO is 0x%02x\n", ret);
-
-	keypad = devm_kzalloc(&client->dev, sizeof(struct max7359_keypad),
-			      GFP_KERNEL);
-	if (!keypad) {
-		dev_err(&client->dev, "failed to allocate memory\n");
-		return -ENOMEM;
-	}
-
-	input_dev = devm_input_allocate_device(&client->dev);
-	if (!input_dev) {
-		dev_err(&client->dev, "failed to allocate input device\n");
-		return -ENOMEM;
-	}
-
-	keypad->client = client;
-	keypad->input_dev = input_dev;
-
-	input_dev->name = client->name;
-	input_dev->id.bustype = BUS_I2C;
-	input_dev->open = max7359_open;
-	input_dev->close = max7359_close;
-	input_dev->dev.parent = &client->dev;
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP);
-	input_dev->keycodesize = sizeof(keypad->keycodes[0]);
-	input_dev->keycodemax = ARRAY_SIZE(keypad->keycodes);
-	input_dev->keycode = keypad->keycodes;
-
-	input_set_capability(input_dev, EV_MSC, MSC_SCAN);
-	input_set_drvdata(input_dev, keypad);
-
-	error = matrix_keypad_build_keymap(keymap_data, NULL,
-					   MAX7359_MAX_KEY_ROWS,
-					   MAX7359_MAX_KEY_COLS,
-					   keypad->keycodes,
-					   input_dev);
-	if (error) {
-		dev_err(&client->dev, "failed to build keymap\n");
-		return error;
-	}
-
-	error = devm_request_threaded_irq(&client->dev, client->irq, NULL,
-					  max7359_interrupt,
-					  IRQF_TRIGGER_LOW | IRQF_ONESHOT,
-					  client->name, keypad);
-	if (error) {
-		dev_err(&client->dev, "failed to register interrupt\n");
-		return error;
-	}
-
-	/* Register the input device */
-	error = input_register_device(input_dev);
-	if (error) {
-		dev_err(&client->dev, "failed to register input device\n");
-		return error;
-	}
-
-	/* Initialize MAX7359 */
-	max7359_initialize(client);
-
-	i2c_set_clientdata(client, keypad);
-	device_init_wakeup(&client->dev, 1);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int max7359_suspend(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-
-	max7359_fall_deepsleep(client);
-
-	if (device_may_wakeup(&client->dev))
-		enable_irq_wake(client->irq);
-
-	return 0;
-}
-
-static int max7359_resume(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-
-	if (device_may_wakeup(&client->dev))
-		disable_irq_wake(client->irq);
-
-	/* Restore the default setting */
-	max7359_take_catnap(client);
-
-	return 0;
-}
-#endif
-
-static SIMPLE_DEV_PM_OPS(max7359_pm, max7359_suspend, max7359_resume);
-
-static const struct i2c_device_id max7359_ids[] = {
-	{ "max7359", 0 },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, max7359_ids);
-
-static struct i2c_driver max7359_i2c_driver = {
-	.driver = {
-		.name = "max7359",
-		.pm   = &max7359_pm,
-	},
-	.probe		= max7359_probe,
-	.id_table	= max7359_ids,
-};
-
-module_i2c_driver(max7359_i2c_driver);
-
-MODULE_AUTHOR("Kim Kyuwon <q1.kim@samsung.com>");
-MODULE_DESCRIPTION("MAX7359 Key Switch Controller Driver");
-MODULE_LICENSE("GPL v2");
+ION_FAULT_ENABLE_DEFAULT_MASK 0x10000
+#define VM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_DEFAULT__SHIFT 0x10
+#define VM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_SAVE_MASK 0x20000
+#define VM_CONTEXT1_CNTL__READ_PROTECTION_FAULT_ENABLE_SAVE__SHIFT 0x11
+#define VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK 0x40000
+#define VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_INTERRUPT__SHIFT 0x12
+#define VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_DEFAULT_MASK 0x80000
+#define VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_DEFAULT__SHIFT 0x13
+#define VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_SAVE_MASK 0x100000
+#define VM_CONTEXT1_CNTL__WRITE_PROTECTION_FAULT_ENABLE_SAVE__SHIFT 0x14
+#define VM_CONTEXT1_CNTL__PRIVILEGED_PROTECTION_FAULT_ENABLE_INTERRUPT_MASK 0x200000
+#define VM_CONTEXT1_CNTL__PRIVILEGED_PROTECTION_FAULT_ENABLE_INTERRUPT__SHIFT 0x15
+#define VM_CONTEXT1_CNTL__PRIVILEGED_PROTECTION_FAULT_ENABLE_DEFAULT_MASK 0x400000
+#define VM_CONTEXT1_CNTL__PRIVILEGED_PROTECTION_FAULT_ENABLE_DEFAULT__SHIFT 0x16
+#define VM_CONTEXT1_CNTL__PRIVILEGED_PROTECTION_FAULT_ENABLE_SAVE_MASK 0x800000
+#define VM_CONTEXT1_CNTL__PRIVILEGED_PROTECTION_FAULT_ENABLE_SAVE__SHIFT 0x17
+#define VM_CONTEXT1_CNTL__PAGE_TABLE_BLOCK_SIZE_MASK 0xf000000
+#define VM_CONTEXT1_CNTL__PAGE_TABLE_BLOCK_SIZE__SHIFT 0x18
+#define VM_DUMMY_PAGE_FAULT_CNTL__DUMMY_PAGE_FAULT_ENABLE_MASK 0x1
+#define VM_DUMMY_PAGE_FAULT_CNTL__DUMMY_PAGE_FAULT_ENABLE__SHIFT 0x0
+#define VM_DUMMY_PAGE_FAULT_CNTL__DUMMY_PAGE_ADDRESS_LOGICAL_MASK 0x2
+#define VM_DUMMY_PAGE_FAULT_CNTL__DUMMY_PAGE_ADDRESS_LOGICAL__SHIFT 0x1
+#define VM_DUMMY_PAGE_FAULT_CNTL__DUMMY_PAGE_COMPARE_MASK_MASK 0xc
+#define VM_DUMMY_PAGE_FAULT_CNTL__DUMMY_PAGE_COMPARE_MASK__SHIFT 0x2
+#define VM_DUMMY_PAGE_FAULT_ADDR__DUMMY_PAGE_ADDR_MASK 0xfffffff
+#define VM_DUMMY_PAGE_FAULT_ADDR__DUMMY_PAGE_ADDR__SHIFT 0x0
+#define VM_CONTEXT0_CNTL2__CLEAR_PROTECTION_FAULT_STATUS_ADDR_MASK 0x1
+#define VM_CONTEXT0_CNTL2__CLEAR_PROTECTION_FAULT_STATUS_ADDR__SHIFT 0x0
+#define VM_CONTEXT0_CNTL2__ENABLE_CLEAR_PROTECTION_FAULT_STATUS_ADDR_WHEN_INVALIDATE_CONTEXT_MASK 0x2
+#define VM_CONTEXT0_CNTL2__ENABLE_CLEAR_PROTECTION_FAULT_STATUS_ADDR_WHEN_INVALIDATE_CONTEXT__SHIFT 0x1
+#define VM_CONTEXT0_CNTL2__ENABLE_INTERRUPT_PROCESSING_FOR_SUBSEQUENT_FAULTS_PER_CONTEXT_MASK 0x4
+#define VM_CONTEXT0_CNTL2__ENABLE_INTERRUPT_PROCESSING_FOR_SUBSEQUENT_FAULTS_PER_CONTEXT__SHIFT 0x2
+#define VM_CONTEXT0_CNTL2__ALLOW_SUBSEQUENT_PROTECTION_FAULT_STATUS_ADDR_UPDATES_MASK 0x8
+#define VM_CONTEXT0_CNTL2__ALLOW_SUBSEQUENT_PROTECTION_FAULT_STATUS_ADDR_UPDATES__SHIFT 0x3
+#define VM_CONTEXT0_CNTL2__WAIT_FOR_IDLE_WHEN_INVALIDATE_MASK 0x10
+#define VM_CONTEXT0_CNTL2__WAIT_FOR_IDLE_WHEN_INVALIDATE__SHIFT 0x4
+#define VM_CONTEXT1_CNTL2__CLEAR_PROTECTION_FAULT_STATUS_ADDR_MASK 0x1
+#define VM_CONTEXT1_CNTL2__CLEAR_PROTECTION_FAULT_STATUS_ADDR__SHIFT 0x0
+#define VM_CONTEXT1_CNTL2__ENABLE_CLEAR_PROTECTION_FAULT_STATUS_ADDR_WHEN_INVALIDATE_CONTEXT_MASK 0x2
+#define VM_CONTEXT1_CNTL2__ENABLE_CLEAR_PROTECTION_FAULT_STATUS_ADDR_WHEN_INVALIDATE_CONTEXT__SHIFT 0x1
+#define VM_CONTEXT1_CNTL2__ENABLE_INTERRUPT_PROCESSING_FOR_SUBSEQUENT_FAULTS_PER_CONTEXT_MASK 0x4
+#define VM_CONTEXT1_CNTL2__ENABLE_INTERRUPT_PROCESSING_FOR_SUBSEQUENT_FAULTS_PER_CONTEXT__SHIFT 0x2
+#define VM_CONTEXT1_CNTL2__ALLOW_SUBSEQUENT_PROTECTION_FAULT_STATUS_ADDR_UPDATES_MASK 0x8
+#define VM_CONTEXT1_CNTL2__ALLOW_SUBSEQUENT_PROTECTION_FAULT_STATUS_ADDR_UPDATES__SHIFT 0x3
+#define VM_CONTEXT1_CNTL2__WAIT_FOR_IDLE_WHEN_INVALIDATE_MASK 0x10
+#define VM_CONTEXT1_CNTL2__WAIT_FOR_IDLE_WHEN_INVALIDATE__SHIFT 0x4
+#define VM_CONTEXT8_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_CONTEXT8_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_CONTEXT9_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_CONTEXT9_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_CONTEXT10_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_CONTEXT10_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_CONTEXT11_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_CONTEXT11_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_CONTEXT12_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_CONTEXT12_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_CONTEXT13_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_CONTEXT13_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_CONTEXT14_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_CONTEXT14_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_CONTEXT15_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER_MASK 0xfffffff
+#define VM_CONTEXT15_PAGE_TABLE_BASE_ADDR__PHYSICAL_PAGE_NUMBER__SHIFT 0x0
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_0_MASK 0x1
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_0__SHIFT 0x0
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_1_MASK 0x2
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_1__SHIFT 0x1
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_2_MASK 0x4
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_2__SHIFT 0x2
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_3_MASK 0x8
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_3__SHIFT 0x3
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_4_MASK 0x10
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_4__SHIFT 0x4
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_5_MASK 0x20
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_5__SHIFT 0x5
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_6_MASK 0x40
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_6__SHIFT 0x6
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_7_MASK 0x80
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_7__SHIFT 0x7
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_8_MASK 0x100
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_8__SHIFT 0x8
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_9_MASK 0x200
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_9__SHIFT 0x9
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_10_MASK 0x400
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_10__SHIFT 0xa
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_11_MASK 0x800
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_11__SHIFT 0xb
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_12_MASK 0x1000
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_12__SHIFT 0xc
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_13_MASK 0x2000
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_13__SHIFT 0xd
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_14_MASK 0x4000
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_14__SHIFT 0xe
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_15_MASK 0x8000
+#define VM_INVALIDATE_REQUEST__INVALIDATE_DOMAIN_15__SHIFT 0xf
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_0_MASK 0x1
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_0__SHIFT 0x0
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_1_MASK 0x2
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_1__SHIFT 0x1
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_2_MASK 0x4
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_2__SHIFT 0x2
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_3_MASK 0x8
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_3__SHIFT 0x3
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_4_MASK 0x10
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDATED_4__SHIFT 0x4
+#define VM_INVALIDATE_RESPONSE__DOMAIN_INVALIDA

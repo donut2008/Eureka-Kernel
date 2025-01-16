@@ -1,1223 +1,1193 @@
-/*
- *	Copyright (C) 2002 Motorola GSG-China
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License
- *	as published by the Free Software Foundation; either version 2
- *	of the License, or (at your option) any later version.
- *
- *	This program is distributed in the hope that it will be useful,
- *	but WITHOUT ANY WARRANTY; without even the implied warranty of
- *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *	GNU General Public License for more details.
- *
- * Author:
- *	Darius Augulis, Teltonika Inc.
- *
- * Desc.:
- *	Implementation of I2C Adapter/Algorithm Driver
- *	for I2C Bus integrated in Freescale i.MX/MXC processors
- *
- *	Derived from Motorola GSG China I2C example driver
- *
- *	Copyright (C) 2005 Torsten Koschorrek <koschorrek at synertronixx.de
- *	Copyright (C) 2005 Matthias Blaschke <blaschke at synertronixx.de
- *	Copyright (C) 2007 RightHand Technologies, Inc.
- *	Copyright (C) 2008 Darius Augulis <darius.augulis at teltonika.lt>
- *
- *	Copyright 2013 Freescale Semiconductor, Inc.
- *
- */
+ ((u64) be32_to_cpu(p[0]) << 32) |
+				be32_to_cpu(p[1]);
+		} else
+			val = 0;
+		if (!do_rc_ack(qp, aeth, psn, opcode, val, rcd) ||
+		    opcode != OP(RDMA_READ_RESPONSE_FIRST))
+			goto ack_done;
+		hdrsize += 4;
+		wqe = get_swqe_ptr(qp, qp->s_acked);
+		if (unlikely(wqe->wr.opcode != IB_WR_RDMA_READ))
+			goto ack_op_err;
+		/*
+		 * If this is a response to a resent RDMA read, we
+		 * have to be careful to copy the data to the right
+		 * location.
+		 */
+		qp->s_rdma_read_len = restart_sge(&qp->s_rdma_read_sge,
+						  wqe, psn, pmtu);
+		goto read_middle;
 
-/** Includes *******************************************************************
-*******************************************************************************/
+	case OP(RDMA_READ_RESPONSE_MIDDLE):
+		/* no AETH, no ACK */
+		if (unlikely(qib_cmp24(psn, qp->s_last_psn + 1)))
+			goto ack_seq_err;
+		if (unlikely(wqe->wr.opcode != IB_WR_RDMA_READ))
+			goto ack_op_err;
+read_middle:
+		if (unlikely(tlen != (hdrsize + pmtu + 4)))
+			goto ack_len_err;
+		if (unlikely(pmtu >= qp->s_rdma_read_len))
+			goto ack_len_err;
 
-#include <linux/clk.h>
-#include <linux/completion.h>
-#include <linux/delay.h>
-#include <linux/dma-mapping.h>
-#include <linux/dmaengine.h>
-#include <linux/dmapool.h>
-#include <linux/err.h>
-#include <linux/errno.h>
-#include <linux/i2c.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/of_dma.h>
-#include <linux/of_gpio.h>
-#include <linux/pinctrl/consumer.h>
-#include <linux/platform_data/i2c-imx.h>
-#include <linux/platform_device.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
+		/*
+		 * We got a response so update the timeout.
+		 * 4.096 usec. * (1 << qp->timeout)
+		 */
+		qp->s_flags |= QIB_S_TIMER;
+		mod_timer(&qp->s_timer, jiffies + qp->timeout_jiffies);
+		if (qp->s_flags & QIB_S_WAIT_ACK) {
+			qp->s_flags &= ~QIB_S_WAIT_ACK;
+			qib_schedule_send(qp);
+		}
 
-/** Defines ********************************************************************
-*******************************************************************************/
+		if (opcode == OP(RDMA_READ_RESPONSE_MIDDLE))
+			qp->s_retry = qp->s_retry_cnt;
 
-/* This will be the driver name the kernel reports */
-#define DRIVER_NAME "imx-i2c"
+		/*
+		 * Update the RDMA receive state but do the copy w/o
+		 * holding the locks and blocking interrupts.
+		 */
+		qp->s_rdma_read_len -= pmtu;
+		update_last_psn(qp, psn);
+		spin_unlock_irqrestore(&qp->s_lock, flags);
+		qib_copy_sge(&qp->s_rdma_read_sge, data, pmtu, 0);
+		goto bail;
 
-/* Default value */
-#define IMX_I2C_BIT_RATE	100000	/* 100kHz */
+	case OP(RDMA_READ_RESPONSE_ONLY):
+		aeth = be32_to_cpu(ohdr->u.aeth);
+		if (!do_rc_ack(qp, aeth, psn, opcode, 0, rcd))
+			goto ack_done;
+		/* Get the number of bytes the message was padded by. */
+		pad = (be32_to_cpu(ohdr->bth[0]) >> 20) & 3;
+		/*
+		 * Check that the data size is >= 0 && <= pmtu.
+		 * Remember to account for the AETH header (4) and
+		 * ICRC (4).
+		 */
+		if (unlikely(tlen < (hdrsize + pad + 8)))
+			goto ack_len_err;
+		/*
+		 * If this is a response to a resent RDMA read, we
+		 * have to be careful to copy the data to the right
+		 * location.
+		 */
+		wqe = get_swqe_ptr(qp, qp->s_acked);
+		qp->s_rdma_read_len = restart_sge(&qp->s_rdma_read_sge,
+						  wqe, psn, pmtu);
+		goto read_last;
 
-/*
- * Enable DMA if transfer byte size is bigger than this threshold.
- * As the hardware request, it must bigger than 4 bytes.\
- * I have set '16' here, maybe it's not the best but I think it's
- * the appropriate.
- */
-#define DMA_THRESHOLD	16
-#define DMA_TIMEOUT	1000
-
-/* IMX I2C registers:
- * the I2C register offset is different between SoCs,
- * to provid support for all these chips, split the
- * register offset into a fixed base address and a
- * variable shift value, then the full register offset
- * will be calculated by
- * reg_off = ( reg_base_addr << reg_shift)
- */
-#define IMX_I2C_IADR	0x00	/* i2c slave address */
-#define IMX_I2C_IFDR	0x01	/* i2c frequency divider */
-#define IMX_I2C_I2CR	0x02	/* i2c control */
-#define IMX_I2C_I2SR	0x03	/* i2c status */
-#define IMX_I2C_I2DR	0x04	/* i2c transfer data */
-
-#define IMX_I2C_REGSHIFT	2
-#define VF610_I2C_REGSHIFT	0
-
-/* Bits of IMX I2C registers */
-#define I2SR_RXAK	0x01
-#define I2SR_IIF	0x02
-#define I2SR_SRW	0x04
-#define I2SR_IAL	0x10
-#define I2SR_IBB	0x20
-#define I2SR_IAAS	0x40
-#define I2SR_ICF	0x80
-#define I2CR_DMAEN	0x02
-#define I2CR_RSTA	0x04
-#define I2CR_TXAK	0x08
-#define I2CR_MTX	0x10
-#define I2CR_MSTA	0x20
-#define I2CR_IIEN	0x40
-#define I2CR_IEN	0x80
-
-/* register bits different operating codes definition:
- * 1) I2SR: Interrupt flags clear operation differ between SoCs:
- * - write zero to clear(w0c) INT flag on i.MX,
- * - but write one to clear(w1c) INT flag on Vybrid.
- * 2) I2CR: I2C module enable operation also differ between SoCs:
- * - set I2CR_IEN bit enable the module on i.MX,
- * - but clear I2CR_IEN bit enable the module on Vybrid.
- */
-#define I2SR_CLR_OPCODE_W0C	0x0
-#define I2SR_CLR_OPCODE_W1C	(I2SR_IAL | I2SR_IIF)
-#define I2CR_IEN_OPCODE_0	0x0
-#define I2CR_IEN_OPCODE_1	I2CR_IEN
-
-/** Variables ******************************************************************
-*******************************************************************************/
-
-/*
- * sorted list of clock divider, register value pairs
- * taken from table 26-5, p.26-9, Freescale i.MX
- * Integrated Portable System Processor Reference Manual
- * Document Number: MC9328MXLRM, Rev. 5.1, 06/2007
- *
- * Duplicated divider values removed from list
- */
-struct imx_i2c_clk_pair {
-	u16	div;
-	u16	val;
-};
-
-static struct imx_i2c_clk_pair imx_i2c_clk_div[] = {
-	{ 22,	0x20 }, { 24,	0x21 }, { 26,	0x22 }, { 28,	0x23 },
-	{ 30,	0x00 },	{ 32,	0x24 }, { 36,	0x25 }, { 40,	0x26 },
-	{ 42,	0x03 }, { 44,	0x27 },	{ 48,	0x28 }, { 52,	0x05 },
-	{ 56,	0x29 }, { 60,	0x06 }, { 64,	0x2A },	{ 72,	0x2B },
-	{ 80,	0x2C }, { 88,	0x09 }, { 96,	0x2D }, { 104,	0x0A },
-	{ 112,	0x2E }, { 128,	0x2F }, { 144,	0x0C }, { 160,	0x30 },
-	{ 192,	0x31 },	{ 224,	0x32 }, { 240,	0x0F }, { 256,	0x33 },
-	{ 288,	0x10 }, { 320,	0x34 },	{ 384,	0x35 }, { 448,	0x36 },
-	{ 480,	0x13 }, { 512,	0x37 }, { 576,	0x14 },	{ 640,	0x38 },
-	{ 768,	0x39 }, { 896,	0x3A }, { 960,	0x17 }, { 1024,	0x3B },
-	{ 1152,	0x18 }, { 1280,	0x3C }, { 1536,	0x3D }, { 1792,	0x3E },
-	{ 1920,	0x1B },	{ 2048,	0x3F }, { 2304,	0x1C }, { 2560,	0x1D },
-	{ 3072,	0x1E }, { 3840,	0x1F }
-};
-
-/* Vybrid VF610 clock divider, register value pairs */
-static struct imx_i2c_clk_pair vf610_i2c_clk_div[] = {
-	{ 20,   0x00 }, { 22,   0x01 }, { 24,   0x02 }, { 26,   0x03 },
-	{ 28,   0x04 }, { 30,   0x05 }, { 32,   0x09 }, { 34,   0x06 },
-	{ 36,   0x0A }, { 40,   0x07 }, { 44,   0x0C }, { 48,   0x0D },
-	{ 52,   0x43 }, { 56,   0x0E }, { 60,   0x45 }, { 64,   0x12 },
-	{ 68,   0x0F }, { 72,   0x13 }, { 80,   0x14 }, { 88,   0x15 },
-	{ 96,   0x19 }, { 104,  0x16 }, { 112,  0x1A }, { 128,  0x17 },
-	{ 136,  0x4F }, { 144,  0x1C }, { 160,  0x1D }, { 176,  0x55 },
-	{ 192,  0x1E }, { 208,  0x56 }, { 224,  0x22 }, { 228,  0x24 },
-	{ 240,  0x1F }, { 256,  0x23 }, { 288,  0x5C }, { 320,  0x25 },
-	{ 384,  0x26 }, { 448,  0x2A }, { 480,  0x27 }, { 512,  0x2B },
-	{ 576,  0x2C }, { 640,  0x2D }, { 768,  0x31 }, { 896,  0x32 },
-	{ 960,  0x2F }, { 1024, 0x33 }, { 1152, 0x34 }, { 1280, 0x35 },
-	{ 1536, 0x36 }, { 1792, 0x3A }, { 1920, 0x37 }, { 2048, 0x3B },
-	{ 2304, 0x3C }, { 2560, 0x3D }, { 3072, 0x3E }, { 3584, 0x7A },
-	{ 3840, 0x3F }, { 4096, 0x7B }, { 5120, 0x7D }, { 6144, 0x7E },
-};
-
-enum imx_i2c_type {
-	IMX1_I2C,
-	IMX21_I2C,
-	VF610_I2C,
-};
-
-struct imx_i2c_hwdata {
-	enum imx_i2c_type	devtype;
-	unsigned		regshift;
-	struct imx_i2c_clk_pair	*clk_div;
-	unsigned		ndivs;
-	unsigned		i2sr_clr_opcode;
-	unsigned		i2cr_ien_opcode;
-};
-
-struct imx_i2c_dma {
-	struct dma_chan		*chan_tx;
-	struct dma_chan		*chan_rx;
-	struct dma_chan		*chan_using;
-	struct completion	cmd_complete;
-	dma_addr_t		dma_buf;
-	unsigned int		dma_len;
-	enum dma_transfer_direction dma_transfer_dir;
-	enum dma_data_direction dma_data_dir;
-};
-
-struct imx_i2c_struct {
-	struct i2c_adapter	adapter;
-	struct clk		*clk;
-	void __iomem		*base;
-	wait_queue_head_t	queue;
-	unsigned long		i2csr;
-	unsigned int		disable_delay;
-	int			stopped;
-	unsigned int		ifdr; /* IMX_I2C_IFDR */
-	unsigned int		cur_clk;
-	unsigned int		bitrate;
-	const struct imx_i2c_hwdata	*hwdata;
-	struct i2c_bus_recovery_info rinfo;
-
-	struct pinctrl *pinctrl;
-	struct pinctrl_state *pinctrl_pins_default;
-	struct pinctrl_state *pinctrl_pins_gpio;
-
-	struct imx_i2c_dma	*dma;
-};
-
-static const struct imx_i2c_hwdata imx1_i2c_hwdata  = {
-	.devtype		= IMX1_I2C,
-	.regshift		= IMX_I2C_REGSHIFT,
-	.clk_div		= imx_i2c_clk_div,
-	.ndivs			= ARRAY_SIZE(imx_i2c_clk_div),
-	.i2sr_clr_opcode	= I2SR_CLR_OPCODE_W0C,
-	.i2cr_ien_opcode	= I2CR_IEN_OPCODE_1,
-
-};
-
-static const struct imx_i2c_hwdata imx21_i2c_hwdata  = {
-	.devtype		= IMX21_I2C,
-	.regshift		= IMX_I2C_REGSHIFT,
-	.clk_div		= imx_i2c_clk_div,
-	.ndivs			= ARRAY_SIZE(imx_i2c_clk_div),
-	.i2sr_clr_opcode	= I2SR_CLR_OPCODE_W0C,
-	.i2cr_ien_opcode	= I2CR_IEN_OPCODE_1,
-
-};
-
-static struct imx_i2c_hwdata vf610_i2c_hwdata = {
-	.devtype		= VF610_I2C,
-	.regshift		= VF610_I2C_REGSHIFT,
-	.clk_div		= vf610_i2c_clk_div,
-	.ndivs			= ARRAY_SIZE(vf610_i2c_clk_div),
-	.i2sr_clr_opcode	= I2SR_CLR_OPCODE_W1C,
-	.i2cr_ien_opcode	= I2CR_IEN_OPCODE_0,
-
-};
-
-static const struct platform_device_id imx_i2c_devtype[] = {
-	{
-		.name = "imx1-i2c",
-		.driver_data = (kernel_ulong_t)&imx1_i2c_hwdata,
-	}, {
-		.name = "imx21-i2c",
-		.driver_data = (kernel_ulong_t)&imx21_i2c_hwdata,
-	}, {
-		/* sentinel */
+	case OP(RDMA_READ_RESPONSE_LAST):
+		/* ACKs READ req. */
+		if (unlikely(qib_cmp24(psn, qp->s_last_psn + 1)))
+			goto ack_seq_err;
+		if (unlikely(wqe->wr.opcode != IB_WR_RDMA_READ))
+			goto ack_op_err;
+		/* Get the number of bytes the message was padded by. */
+		pad = (be32_to_cpu(ohdr->bth[0]) >> 20) & 3;
+		/*
+		 * Check that the data size is >= 1 && <= pmtu.
+		 * Remember to account for the AETH header (4) and
+		 * ICRC (4).
+		 */
+		if (unlikely(tlen <= (hdrsize + pad + 8)))
+			goto ack_len_err;
+read_last:
+		tlen -= hdrsize + pad + 8;
+		if (unlikely(tlen != qp->s_rdma_read_len))
+			goto ack_len_err;
+		aeth = be32_to_cpu(ohdr->u.aeth);
+		qib_copy_sge(&qp->s_rdma_read_sge, data, tlen, 0);
+		WARN_ON(qp->s_rdma_read_sge.num_sge);
+		(void) do_rc_ack(qp, aeth, psn,
+				 OP(RDMA_READ_RESPONSE_LAST), 0, rcd);
+		goto ack_done;
 	}
-};
-MODULE_DEVICE_TABLE(platform, imx_i2c_devtype);
 
-static const struct of_device_id i2c_imx_dt_ids[] = {
-	{ .compatible = "fsl,imx1-i2c", .data = &imx1_i2c_hwdata, },
-	{ .compatible = "fsl,imx21-i2c", .data = &imx21_i2c_hwdata, },
-	{ .compatible = "fsl,vf610-i2c", .data = &vf610_i2c_hwdata, },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, i2c_imx_dt_ids);
+ack_op_err:
+	status = IB_WC_LOC_QP_OP_ERR;
+	goto ack_err;
 
-static inline int is_imx1_i2c(struct imx_i2c_struct *i2c_imx)
-{
-	return i2c_imx->hwdata->devtype == IMX1_I2C;
+ack_seq_err:
+	rdma_seq_err(qp, ibp, psn, rcd);
+	goto ack_done;
+
+ack_len_err:
+	status = IB_WC_LOC_LEN_ERR;
+ack_err:
+	if (qp->s_last == qp->s_acked) {
+		qib_send_complete(qp, wqe, status);
+		qib_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+	}
+ack_done:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+bail:
+	return;
 }
 
-static inline void imx_i2c_write_reg(unsigned int val,
-		struct imx_i2c_struct *i2c_imx, unsigned int reg)
+/**
+ * qib_rc_rcv_error - process an incoming duplicate or error RC packet
+ * @ohdr: the other headers for this packet
+ * @data: the packet data
+ * @qp: the QP for this packet
+ * @opcode: the opcode for this packet
+ * @psn: the packet sequence number for this packet
+ * @diff: the difference between the PSN and the expected PSN
+ *
+ * This is called from qib_rc_rcv() to process an unexpected
+ * incoming RC packet for the given QP.
+ * Called at interrupt level.
+ * Return 1 if no more processing is needed; otherwise return 0 to
+ * schedule a response to be sent.
+ */
+static int qib_rc_rcv_error(struct qib_other_headers *ohdr,
+			    void *data,
+			    struct qib_qp *qp,
+			    u32 opcode,
+			    u32 psn,
+			    int diff,
+			    struct qib_ctxtdata *rcd)
 {
-	writeb(val, i2c_imx->base + (reg << i2c_imx->hwdata->regshift));
+	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+	struct qib_ack_entry *e;
+	unsigned long flags;
+	u8 i, prev;
+	int old_req;
+
+	if (diff > 0) {
+		/*
+		 * Packet sequence error.
+		 * A NAK will ACK earlier sends and RDMA writes.
+		 * Don't queue the NAK if we already sent one.
+		 */
+		if (!qp->r_nak_state) {
+			ibp->n_rc_seqnak++;
+			qp->r_nak_state = IB_NAK_PSN_ERROR;
+			/* Use the expected PSN. */
+			qp->r_ack_psn = qp->r_psn;
+			/*
+			 * Wait to send the sequence NAK until all packets
+			 * in the receive queue have been processed.
+			 * Otherwise, we end up propagating congestion.
+			 */
+			if (list_empty(&qp->rspwait)) {
+				qp->r_flags |= QIB_R_RSP_NAK;
+				atomic_inc(&qp->refcount);
+				list_add_tail(&qp->rspwait, &rcd->qp_wait_list);
+			}
+		}
+		goto done;
+	}
+
+	/*
+	 * Handle a duplicate request.  Don't re-execute SEND, RDMA
+	 * write or atomic op.  Don't NAK errors, just silently drop
+	 * the duplicate request.  Note that r_sge, r_len, and
+	 * r_rcv_len may be in use so don't modify them.
+	 *
+	 * We are supposed to ACK the earliest duplicate PSN but we
+	 * can coalesce an outstanding duplicate ACK.  We have to
+	 * send the earliest so that RDMA reads can be restarted at
+	 * the requester's expected PSN.
+	 *
+	 * First, find where this duplicate PSN falls within the
+	 * ACKs previously sent.
+	 * old_req is true if there is an older response that is scheduled
+	 * to be sent before sending this one.
+	 */
+	e = NULL;
+	old_req = 1;
+	ibp->n_rc_dupreq++;
+
+	spin_lock_irqsave(&qp->s_lock, flags);
+
+	for (i = qp->r_head_ack_queue; ; i = prev) {
+		if (i == qp->s_tail_ack_queue)
+			old_req = 0;
+		if (i)
+			prev = i - 1;
+		else
+			prev = QIB_MAX_RDMA_ATOMIC;
+		if (prev == qp->r_head_ack_queue) {
+			e = NULL;
+			break;
+		}
+		e = &qp->s_ack_queue[prev];
+		if (!e->opcode) {
+			e = NULL;
+			break;
+		}
+		if (qib_cmp24(psn, e->psn) >= 0) {
+			if (prev == qp->s_tail_ack_queue &&
+			    qib_cmp24(psn, e->lpsn) <= 0)
+				old_req = 0;
+			break;
+		}
+	}
+	switch (opcode) {
+	case OP(RDMA_READ_REQUEST): {
+		struct ib_reth *reth;
+		u32 offset;
+		u32 len;
+
+		/*
+		 * If we didn't find the RDMA read request in the ack queue,
+		 * we can ignore this request.
+		 */
+		if (!e || e->opcode != OP(RDMA_READ_REQUEST))
+			goto unlock_done;
+		/* RETH comes after BTH */
+		reth = &ohdr->u.rc.reth;
+		/*
+		 * Address range must be a subset of the original
+		 * request and start on pmtu boundaries.
+		 * We reuse the old ack_queue slot since the requester
+		 * should not back up and request an earlier PSN for the
+		 * same request.
+		 */
+		offset = ((psn - e->psn) & QIB_PSN_MASK) *
+			qp->pmtu;
+		len = be32_to_cpu(reth->length);
+		if (unlikely(offset + len != e->rdma_sge.sge_length))
+			goto unlock_done;
+		if (e->rdma_sge.mr) {
+			qib_put_mr(e->rdma_sge.mr);
+			e->rdma_sge.mr = NULL;
+		}
+		if (len != 0) {
+			u32 rkey = be32_to_cpu(reth->rkey);
+			u64 vaddr = be64_to_cpu(reth->vaddr);
+			int ok;
+
+			ok = qib_rkey_ok(qp, &e->rdma_sge, len, vaddr, rkey,
+					 IB_ACCESS_REMOTE_READ);
+			if (unlikely(!ok))
+				goto unlock_done;
+		} else {
+			e->rdma_sge.vaddr = NULL;
+			e->rdma_sge.length = 0;
+			e->rdma_sge.sge_length = 0;
+		}
+		e->psn = psn;
+		if (old_req)
+			goto unlock_done;
+		qp->s_tail_ack_queue = prev;
+		break;
+	}
+
+	case OP(COMPARE_SWAP):
+	case OP(FETCH_ADD): {
+		/*
+		 * If we didn't find the atomic request in the ack queue
+		 * or the send tasklet is already backed up to send an
+		 * earlier entry, we can ignore this request.
+		 */
+		if (!e || e->opcode != (u8) opcode || old_req)
+			goto unlock_done;
+		qp->s_tail_ack_queue = prev;
+		break;
+	}
+
+	default:
+		/*
+		 * Ignore this operation if it doesn't request an ACK
+		 * or an earlier RDMA read or atomic is going to be resent.
+		 */
+		if (!(psn & IB_BTH_REQ_ACK) || old_req)
+			goto unlock_done;
+		/*
+		 * Resend the most recent ACK if this request is
+		 * after all the previous RDMA reads and atomics.
+		 */
+		if (i == qp->r_head_ack_queue) {
+			spin_unlock_irqrestore(&qp->s_lock, flags);
+			qp->r_nak_state = 0;
+			qp->r_ack_psn = qp->r_psn - 1;
+			goto send_ack;
+		}
+		/*
+		 * Try to send a simple ACK to work around a Mellanox bug
+		 * which doesn't accept a RDMA read response or atomic
+		 * response as an ACK for earlier SENDs or RDMA writes.
+		 */
+		if (!(qp->s_flags & QIB_S_RESP_PENDING)) {
+			spin_unlock_irqrestore(&qp->s_lock, flags);
+			qp->r_nak_state = 0;
+			qp->r_ack_psn = qp->s_ack_queue[i].psn - 1;
+			goto send_ack;
+		}
+		/*
+		 * Resend the RDMA read or atomic op which
+		 * ACKs this duplicate request.
+		 */
+		qp->s_tail_ack_queue = i;
+		break;
+	}
+	qp->s_ack_state = OP(ACKNOWLEDGE);
+	qp->s_flags |= QIB_S_RESP_PENDING;
+	qp->r_nak_state = 0;
+	qib_schedule_send(qp);
+
+unlock_done:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+done:
+	return 1;
+
+send_ack:
+	return 0;
 }
 
-static inline unsigned char imx_i2c_read_reg(struct imx_i2c_struct *i2c_imx,
-		unsigned int reg)
+void qib_rc_error(struct qib_qp *qp, enum ib_wc_status err)
 {
-	return readb(i2c_imx->base + (reg << i2c_imx->hwdata->regshift));
+	unsigned long flags;
+	int lastwqe;
+
+	spin_lock_irqsave(&qp->s_lock, flags);
+	lastwqe = qib_error_qp(qp, err);
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+
+	if (lastwqe) {
+		struct ib_event ev;
+
+		ev.device = qp->ibqp.device;
+		ev.element.qp = &qp->ibqp;
+		ev.event = IB_EVENT_QP_LAST_WQE_REACHED;
+		qp->ibqp.event_handler(&ev, qp->ibqp.qp_context);
+	}
 }
 
-/* Functions for DMA support */
-static void i2c_imx_dma_request(struct imx_i2c_struct *i2c_imx,
-						dma_addr_t phy_addr)
+static inline void qib_update_ack_queue(struct qib_qp *qp, unsigned n)
 {
-	struct imx_i2c_dma *dma;
-	struct dma_slave_config dma_sconfig;
-	struct device *dev = &i2c_imx->adapter.dev;
+	unsigned next;
+
+	next = n + 1;
+	if (next > QIB_MAX_RDMA_ATOMIC)
+		next = 0;
+	qp->s_tail_ack_queue = next;
+	qp->s_ack_state = OP(ACKNOWLEDGE);
+}
+
+/**
+ * qib_rc_rcv - process an incoming RC packet
+ * @rcd: the context pointer
+ * @hdr: the header of this packet
+ * @has_grh: true if the header has a GRH
+ * @data: the packet data
+ * @tlen: the packet length
+ * @qp: the QP for this packet
+ *
+ * This is called from qib_qp_rcv() to process an incoming RC packet
+ * for the given QP.
+ * Called at interrupt level.
+ */
+void qib_rc_rcv(struct qib_ctxtdata *rcd, struct qib_ib_header *hdr,
+		int has_grh, void *data, u32 tlen, struct qib_qp *qp)
+{
+	struct qib_ibport *ibp = &rcd->ppd->ibport_data;
+	struct qib_other_headers *ohdr;
+	u32 opcode;
+	u32 hdrsize;
+	u32 psn;
+	u32 pad;
+	struct ib_wc wc;
+	u32 pmtu = qp->pmtu;
+	int diff;
+	struct ib_reth *reth;
+	unsigned long flags;
 	int ret;
 
-	dma = devm_kzalloc(dev, sizeof(*dma), GFP_KERNEL);
-	if (!dma)
+	/* Check for GRH */
+	if (!has_grh) {
+		ohdr = &hdr->u.oth;
+		hdrsize = 8 + 12;       /* LRH + BTH */
+	} else {
+		ohdr = &hdr->u.l.oth;
+		hdrsize = 8 + 40 + 12;  /* LRH + GRH + BTH */
+	}
+
+	opcode = be32_to_cpu(ohdr->bth[0]);
+	if (qib_ruc_check_hdr(ibp, hdr, has_grh, qp, opcode))
 		return;
 
-	dma->chan_tx = dma_request_slave_channel(dev, "tx");
-	if (!dma->chan_tx) {
-		dev_dbg(dev, "can't request DMA tx channel\n");
-		goto fail_al;
+	psn = be32_to_cpu(ohdr->bth[2]);
+	opcode >>= 24;
+
+	/*
+	 * Process responses (ACKs) before anything else.  Note that the
+	 * packet sequence number will be for something in the send work
+	 * queue rather than the expected receive packet sequence number.
+	 * In other words, this QP is the requester.
+	 */
+	if (opcode >= OP(RDMA_READ_RESPONSE_FIRST) &&
+	    opcode <= OP(ATOMIC_ACKNOWLEDGE)) {
+		qib_rc_rcv_resp(ibp, ohdr, data, tlen, qp, opcode, psn,
+				hdrsize, pmtu, rcd);
+		return;
 	}
 
-	dma_sconfig.dst_addr = phy_addr +
-				(IMX_I2C_I2DR << i2c_imx->hwdata->regshift);
-	dma_sconfig.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
-	dma_sconfig.dst_maxburst = 1;
-	dma_sconfig.direction = DMA_MEM_TO_DEV;
-	ret = dmaengine_slave_config(dma->chan_tx, &dma_sconfig);
-	if (ret < 0) {
-		dev_dbg(dev, "can't configure tx channel\n");
-		goto fail_tx;
+	/* Compute 24 bits worth of difference. */
+	diff = qib_cmp24(psn, qp->r_psn);
+	if (unlikely(diff)) {
+		if (qib_rc_rcv_error(ohdr, data, qp, opcode, psn, diff, rcd))
+			return;
+		goto send_ack;
 	}
 
-	dma->chan_rx = dma_request_slave_channel(dev, "rx");
-	if (!dma->chan_rx) {
-		dev_dbg(dev, "can't request DMA rx channel\n");
-		goto fail_tx;
+	/* Check for opcode sequence errors. */
+	switch (qp->r_state) {
+	case OP(SEND_FIRST):
+	case OP(SEND_MIDDLE):
+		if (opcode == OP(SEND_MIDDLE) ||
+		    opcode == OP(SEND_LAST) ||
+		    opcode == OP(SEND_LAST_WITH_IMMEDIATE))
+			break;
+		goto nack_inv;
+
+	case OP(RDMA_WRITE_FIRST):
+	case OP(RDMA_WRITE_MIDDLE):
+		if (opcode == OP(RDMA_WRITE_MIDDLE) ||
+		    opcode == OP(RDMA_WRITE_LAST) ||
+		    opcode == OP(RDMA_WRITE_LAST_WITH_IMMEDIATE))
+			break;
+		goto nack_inv;
+
+	default:
+		if (opcode == OP(SEND_MIDDLE) ||
+		    opcode == OP(SEND_LAST) ||
+		    opcode == OP(SEND_LAST_WITH_IMMEDIATE) ||
+		    opcode == OP(RDMA_WRITE_MIDDLE) ||
+		    opcode == OP(RDMA_WRITE_LAST) ||
+		    opcode == OP(RDMA_WRITE_LAST_WITH_IMMEDIATE))
+			goto nack_inv;
+		/*
+		 * Note that it is up to the requester to not send a new
+		 * RDMA read or atomic operation before receiving an ACK
+		 * for the previous operation.
+		 */
+		break;
 	}
 
-	dma_sconfig.src_addr = phy_addr +
-				(IMX_I2C_I2DR << i2c_imx->hwdata->regshift);
-	dma_sconfig.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
-	dma_sconfig.src_maxburst = 1;
-	dma_sconfig.direction = DMA_DEV_TO_MEM;
-	ret = dmaengine_slave_config(dma->chan_rx, &dma_sconfig);
-	if (ret < 0) {
-		dev_dbg(dev, "can't configure rx channel\n");
-		goto fail_rx;
+	if (qp->state == IB_QPS_RTR && !(qp->r_flags & QIB_R_COMM_EST)) {
+		qp->r_flags |= QIB_R_COMM_EST;
+		if (qp->ibqp.event_handler) {
+			struct ib_event ev;
+
+			ev.device = qp->ibqp.device;
+			ev.element.qp = &qp->ibqp;
+			ev.event = IB_EVENT_COMM_EST;
+			qp->ibqp.event_handler(&ev, qp->ibqp.qp_context);
+		}
 	}
 
-	i2c_imx->dma = dma;
-	init_completion(&dma->cmd_complete);
-	dev_info(dev, "using %s (tx) and %s (rx) for DMA transfers\n",
-		dma_chan_name(dma->chan_tx), dma_chan_name(dma->chan_rx));
+	/* OK, process the packet. */
+	switch (opcode) {
+	case OP(SEND_FIRST):
+		ret = qib_get_rwqe(qp, 0);
+		if (ret < 0)
+			goto nack_op_err;
+		if (!ret)
+			goto rnr_nak;
+		qp->r_rcv_len = 0;
+		/* FALLTHROUGH */
+	case OP(SEND_MIDDLE):
+	case OP(RDMA_WRITE_MIDDLE):
+send_middle:
+		/* Check for invalid length PMTU or posted rwqe len. */
+		if (unlikely(tlen != (hdrsize + pmtu + 4)))
+			goto nack_inv;
+		qp->r_rcv_len += pmtu;
+		if (unlikely(qp->r_rcv_len > qp->r_len))
+			goto nack_inv;
+		qib_copy_sge(&qp->r_sge, data, pmtu, 1);
+		break;
 
+	case OP(RDMA_WRITE_LAST_WITH_IMMEDIATE):
+		/* consume RWQE */
+		ret = qib_get_rwqe(qp, 1);
+		if (ret < 0)
+			goto nack_op_err;
+		if (!ret)
+			goto rnr_nak;
+		goto send_last_imm;
+
+	case OP(SEND_ONLY):
+	case OP(SEND_ONLY_WITH_IMMEDIATE):
+		ret = qib_get_rwqe(qp, 0);
+		if (ret < 0)
+			goto nack_op_err;
+		if (!ret)
+			goto rnr_nak;
+		qp->r_rcv_len = 0;
+		if (opcode == OP(SEND_ONLY))
+			goto no_immediate_data;
+		/* FALLTHROUGH for SEND_ONLY_WITH_IMMEDIATE */
+	case OP(SEND_LAST_WITH_IMMEDIATE):
+send_last_imm:
+		wc.ex.imm_data = ohdr->u.imm_data;
+		hdrsize += 4;
+		wc.wc_flags = IB_WC_WITH_IMM;
+		goto send_last;
+	case OP(SEND_LAST):
+	case OP(RDMA_WRITE_LAST):
+no_immediate_data:
+		wc.wc_flags = 0;
+		wc.ex.imm_data = 0;
+send_last:
+		/* Get the number of bytes the message was padded by. */
+		pad = (be32_to_cpu(ohdr->bth[0]) >> 20) & 3;
+		/* Check for invalid length. */
+		/* XXX LAST len should be >= 1 */
+		if (unlikely(tlen < (hdrsize + pad + 4)))
+			goto nack_inv;
+		/* Don't count the CRC. */
+		tlen -= (hdrsize + pad + 4);
+		wc.byte_len = tlen + qp->r_rcv_len;
+		if (unlikely(wc.byte_len > qp->r_len))
+			goto nack_inv;
+		qib_copy_sge(&qp->r_sge, data, tlen, 1);
+		qib_put_ss(&qp->r_sge);
+		qp->r_msn++;
+		if (!test_and_clear_bit(QIB_R_WRID_VALID, &qp->r_aflags))
+			break;
+		wc.wr_id = qp->r_wr_id;
+		wc.status = IB_WC_SUCCESS;
+		if (opcode == OP(RDMA_WRITE_LAST_WITH_IMMEDIATE) ||
+		    opcode == OP(RDMA_WRITE_ONLY_WITH_IMMEDIATE))
+			wc.opcode = IB_WC_RECV_RDMA_WITH_IMM;
+		else
+			wc.opcode = IB_WC_RECV;
+		wc.qp = &qp->ibqp;
+		wc.src_qp = qp->remote_qpn;
+		wc.slid = qp->remote_ah_attr.dlid;
+		wc.sl = qp->remote_ah_attr.sl;
+		/* zero fields that are N/A */
+		wc.vendor_err = 0;
+		wc.pkey_index = 0;
+		wc.dlid_path_bits = 0;
+		wc.port_num = 0;
+		/* Signal completion event if the solicited bit is set. */
+		qib_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,
+			     (ohdr->bth[0] &
+			      cpu_to_be32(IB_BTH_SOLICITED)) != 0);
+		break;
+
+	case OP(RDMA_WRITE_FIRST):
+	case OP(RDMA_WRITE_ONLY):
+	case OP(RDMA_WRITE_ONLY_WITH_IMMEDIATE):
+		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_WRITE)))
+			goto nack_inv;
+		/* consume RWQE */
+		reth = &ohdr->u.rc.reth;
+		hdrsize += sizeof(*reth);
+		qp->r_len = be32_to_cpu(reth->length);
+		qp->r_rcv_len = 0;
+		qp->r_sge.sg_list = NULL;
+		if (qp->r_len != 0) {
+			u32 rkey = be32_to_cpu(reth->rkey);
+			u64 vaddr = be64_to_cpu(reth->vaddr);
+			int ok;
+
+			/* Check rkey & NAK */
+			ok = qib_rkey_ok(qp, &qp->r_sge.sge, qp->r_len, vaddr,
+					 rkey, IB_ACCESS_REMOTE_WRITE);
+			if (unlikely(!ok))
+				goto nack_acc;
+			qp->r_sge.num_sge = 1;
+		} else {
+			qp->r_sge.num_sge = 0;
+			qp->r_sge.sge.mr = NULL;
+			qp->r_sge.sge.vaddr = NULL;
+			qp->r_sge.sge.length = 0;
+			qp->r_sge.sge.sge_length = 0;
+		}
+		if (opcode == OP(RDMA_WRITE_FIRST))
+			goto send_middle;
+		else if (opcode == OP(RDMA_WRITE_ONLY))
+			goto no_immediate_data;
+		ret = qib_get_rwqe(qp, 1);
+		if (ret < 0)
+			goto nack_op_err;
+		if (!ret) {
+			qib_put_ss(&qp->r_sge);
+			goto rnr_nak;
+		}
+		wc.ex.imm_data = ohdr->u.rc.imm_data;
+		hdrsize += 4;
+		wc.wc_flags = IB_WC_WITH_IMM;
+		goto send_last;
+
+	case OP(RDMA_READ_REQUEST): {
+		struct qib_ack_entry *e;
+		u32 len;
+		u8 next;
+
+		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_READ)))
+			goto nack_inv;
+		next = qp->r_head_ack_queue + 1;
+		/* s_ack_queue is size QIB_MAX_RDMA_ATOMIC+1 so use > not >= */
+		if (next > QIB_MAX_RDMA_ATOMIC)
+			next = 0;
+		spin_lock_irqsave(&qp->s_lock, flags);
+		if (unlikely(next == qp->s_tail_ack_queue)) {
+			if (!qp->s_ack_queue[next].sent)
+				goto nack_inv_unlck;
+			qib_update_ack_queue(qp, next);
+		}
+		e = &qp->s_ack_queue[qp->r_head_ack_queue];
+		if (e->opcode == OP(RDMA_READ_REQUEST) && e->rdma_sge.mr) {
+			qib_put_mr(e->rdma_sge.mr);
+			e->rdma_sge.mr = NULL;
+		}
+		reth = &ohdr->u.rc.reth;
+		len = be32_to_cpu(reth->length);
+		if (len) {
+			u32 rkey = be32_to_cpu(reth->rkey);
+			u64 vaddr = be64_to_cpu(reth->vaddr);
+			int ok;
+
+			/* Check rkey & NAK */
+			ok = qib_rkey_ok(qp, &e->rdma_sge, len, vaddr,
+					 rkey, IB_ACCESS_REMOTE_READ);
+			if (unlikely(!ok))
+				goto nack_acc_unlck;
+			/*
+			 * Update the next expected PSN.  We add 1 later
+			 * below, so only add the remainder here.
+			 */
+			if (len > pmtu)
+				qp->r_psn += (len - 1) / pmtu;
+		} else {
+			e->rdma_sge.mr = NULL;
+			e->rdma_sge.vaddr = NULL;
+			e->rdma_sge.length = 0;
+			e->rdma_sge.sge_length = 0;
+		}
+		e->opcode = opcode;
+		e->sent = 0;
+		e->psn = psn;
+		e->lpsn = qp->r_psn;
+		/*
+		 * We need to increment the MSN here instead of when we
+		 * finish sending the result since a duplicate request would
+		 * increment it more than once.
+		 */
+		qp->r_msn++;
+		qp->r_psn++;
+		qp->r_state = opcode;
+		qp->r_nak_state = 0;
+		qp->r_head_ack_queue = next;
+
+		/* Schedule the send tasklet. */
+		qp->s_flags |= QIB_S_RESP_PENDING;
+		qib_schedule_send(qp);
+
+		goto sunlock;
+	}
+
+	case OP(COMPARE_SWAP):
+	case OP(FETCH_ADD): {
+		struct ib_atomic_eth *ateth;
+		struct qib_ack_entry *e;
+		u64 vaddr;
+		atomic64_t *maddr;
+		u64 sdata;
+		u32 rkey;
+		u8 next;
+
+		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
+			goto nack_inv;
+		next = qp->r_head_ack_queue + 1;
+		if (next > QIB_MAX_RDMA_ATOMIC)
+			next = 0;
+		spin_lock_irqsave(&qp->s_lock, flags);
+		if (unlikely(next == qp->s_tail_ack_queue)) {
+			if (!qp->s_ack_queue[next].sent)
+				goto nack_inv_unlck;
+			qib_update_ack_queue(qp, next);
+		}
+		e = &qp->s_ack_queue[qp->r_head_ack_queue];
+		if (e->opcode == OP(RDMA_READ_REQUEST) && e->rdma_sge.mr) {
+			qib_put_mr(e->rdma_sge.mr);
+			e->rdma_sge.mr = NULL;
+		}
+		ateth = &ohdr->u.atomic_eth;
+		vaddr = ((u64) be32_to_cpu(ateth->vaddr[0]) << 32) |
+			be32_to_cpu(ateth->vaddr[1]);
+		if (unlikely(vaddr & (sizeof(u64) - 1)))
+			goto nack_inv_unlck;
+		rkey = be32_to_cpu(ateth->rkey);
+		/* Check rkey & NAK */
+		if (unlikely(!qib_rkey_ok(qp, &qp->r_sge.sge, sizeof(u64),
+					  vaddr, rkey,
+					  IB_ACCESS_REMOTE_ATOMIC)))
+			goto nack_acc_unlck;
+		/* Perform atomic OP and save result. */
+		maddr = (atomic64_t *) qp->r_sge.sge.vaddr;
+		sdata = be64_to_cpu(ateth->swap_data);
+		e->atomic_data = (opcode == OP(FETCH_ADD)) ?
+			(u64) atomic64_add_return(sdata, maddr) - sdata :
+			(u64) cmpxchg((u64 *) qp->r_sge.sge.vaddr,
+				      be64_to_cpu(ateth->compare_data),
+				      sdata);
+		qib_put_mr(qp->r_sge.sge.mr);
+		qp->r_sge.num_sge = 0;
+		e->opcode = opcode;
+		e->sent = 0;
+		e->psn = psn;
+		e->lpsn = psn;
+		qp->r_msn++;
+		qp->r_psn++;
+		qp->r_state = opcode;
+		qp->r_nak_state = 0;
+		qp->r_head_ack_queue = next;
+
+		/* Schedule the send tasklet. */
+		qp->s_flags |= QIB_S_RESP_PENDING;
+		qib_schedule_send(qp);
+
+		goto sunlock;
+	}
+
+	default:
+		/* NAK unknown opcodes. */
+		goto nack_inv;
+	}
+	qp->r_psn++;
+	qp->r_state = opcode;
+	qp->r_ack_psn = psn;
+	qp->r_nak_state = 0;
+	/* Send an ACK if requested or required. */
+	if (psn & (1 << 31))
+		goto send_ack;
 	return;
 
-fail_rx:
-	dma_release_channel(dma->chan_rx);
-fail_tx:
-	dma_release_channel(dma->chan_tx);
-fail_al:
-	devm_kfree(dev, dma);
-	dev_info(dev, "can't use DMA\n");
-}
-
-static void i2c_imx_dma_callback(void *arg)
-{
-	struct imx_i2c_struct *i2c_imx = (struct imx_i2c_struct *)arg;
-	struct imx_i2c_dma *dma = i2c_imx->dma;
-
-	dma_unmap_single(dma->chan_using->device->dev, dma->dma_buf,
-			dma->dma_len, dma->dma_data_dir);
-	complete(&dma->cmd_complete);
-}
-
-static int i2c_imx_dma_xfer(struct imx_i2c_struct *i2c_imx,
-					struct i2c_msg *msgs)
-{
-	struct imx_i2c_dma *dma = i2c_imx->dma;
-	struct dma_async_tx_descriptor *txdesc;
-	struct device *dev = &i2c_imx->adapter.dev;
-	struct device *chan_dev = dma->chan_using->device->dev;
-
-	dma->dma_buf = dma_map_single(chan_dev, msgs->buf,
-					dma->dma_len, dma->dma_data_dir);
-	if (dma_mapping_error(chan_dev, dma->dma_buf)) {
-		dev_err(dev, "DMA mapping failed\n");
-		goto err_map;
+rnr_nak:
+	qp->r_nak_state = IB_RNR_NAK | qp->r_min_rnr_timer;
+	qp->r_ack_psn = qp->r_psn;
+	/* Queue RNR NAK for later */
+	if (list_empty(&qp->rspwait)) {
+		qp->r_flags |= QIB_R_RSP_NAK;
+		atomic_inc(&qp->refcount);
+		list_add_tail(&qp->rspwait, &rcd->qp_wait_list);
 	}
+	return;
 
-	txdesc = dmaengine_prep_slave_single(dma->chan_using, dma->dma_buf,
-					dma->dma_len, dma->dma_transfer_dir,
-					DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
-	if (!txdesc) {
-		dev_err(dev, "Not able to get desc for DMA xfer\n");
-		goto err_desc;
+nack_op_err:
+	qib_rc_error(qp, IB_WC_LOC_QP_OP_ERR);
+	qp->r_nak_state = IB_NAK_REMOTE_OPERATIONAL_ERROR;
+	qp->r_ack_psn = qp->r_psn;
+	/* Queue NAK for later */
+	if (list_empty(&qp->rspwait)) {
+		qp->r_flags |= QIB_R_RSP_NAK;
+		atomic_inc(&qp->refcount);
+		list_add_tail(&qp->rspwait, &rcd->qp_wait_list);
 	}
+	return;
 
-	reinit_completion(&dma->cmd_complete);
-	txdesc->callback = i2c_imx_dma_callback;
-	txdesc->callback_param = i2c_imx;
-	if (dma_submit_error(dmaengine_submit(txdesc))) {
-		dev_err(dev, "DMA submit failed\n");
-		goto err_submit;
+nack_inv_unlck:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+nack_inv:
+	qib_rc_error(qp, IB_WC_LOC_QP_OP_ERR);
+	qp->r_nak_state = IB_NAK_INVALID_REQUEST;
+	qp->r_ack_psn = qp->r_psn;
+	/* Queue NAK for later */
+	if (list_empty(&qp->rspwait)) {
+		qp->r_flags |= QIB_R_RSP_NAK;
+		atomic_inc(&qp->refcount);
+		list_add_tail(&qp->rspwait, &rcd->qp_wait_list);
 	}
+	return;
 
-	dma_async_issue_pending(dma->chan_using);
-	return 0;
+nack_acc_unlck:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+nack_acc:
+	qib_rc_error(qp, IB_WC_LOC_PROT_ERR);
+	qp->r_nak_state = IB_NAK_REMOTE_ACCESS_ERROR;
+	qp->r_ack_psn = qp->r_psn;
+send_ack:
+	qib_send_rc_ack(qp);
+	return;
 
-err_submit:
-err_desc:
-	dma_unmap_single(chan_dev, dma->dma_buf,
-			dma->dma_len, dma->dma_data_dir);
-err_map:
-	return -EINVAL;
+sunlock:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
 }
-
-static void i2c_imx_dma_free(struct imx_i2c_struct *i2c_imx)
-{
-	struct imx_i2c_dma *dma = i2c_imx->dma;
-
-	dma->dma_buf = 0;
-	dma->dma_len = 0;
-
-	dma_release_channel(dma->chan_tx);
-	dma->chan_tx = NULL;
-
-	dma_release_channel(dma->chan_rx);
-	dma->chan_rx = NULL;
-
-	dma->chan_using = NULL;
-}
-
-/** Functions for IMX I2C adapter driver ***************************************
-*******************************************************************************/
-
-static void i2c_imx_clear_irq(struct imx_i2c_struct *i2c_imx, unsigned int bits)
-{
-	unsigned int temp;
-
-	/*
-	 * i2sr_clr_opcode is the value to clear all interrupts. Here we want to
-	 * clear only <bits>, so we write ~i2sr_clr_opcode with just <bits>
-	 * toggled. This is required because i.MX needs W0C and Vybrid uses W1C.
-	 */
-	temp = ~i2c_imx->hwdata->i2sr_clr_opcode ^ bits;
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2SR);
-}
-
-static int i2c_imx_bus_busy(struct imx_i2c_struct *i2c_imx, int for_busy)
-{
-	unsigned long orig_jiffies = jiffies;
-	unsigned int temp;
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s>\n", __func__);
-
-	while (1) {
-		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR);
-
-		/* check for arbitration lost */
-		if (temp & I2SR_IAL) {
-			i2c_imx_clear_irq(i2c_imx, I2SR_IAL);
-			return -EAGAIN;
-		}
-
-		if (for_busy && (temp & I2SR_IBB))
-			break;
-		if (!for_busy && !(temp & I2SR_IBB))
-			break;
-		if (time_after(jiffies, orig_jiffies + msecs_to_jiffies(500))) {
-			dev_dbg(&i2c_imx->adapter.dev,
-				"<%s> I2C bus is busy\n", __func__);
-			return -ETIMEDOUT;
-		}
-		schedule();
-	}
-
-	return 0;
-}
-
-static int i2c_imx_trx_complete(struct imx_i2c_struct *i2c_imx)
-{
-	wait_event_timeout(i2c_imx->queue, i2c_imx->i2csr & I2SR_IIF, HZ / 10);
-
-	if (unlikely(!(i2c_imx->i2csr & I2SR_IIF))) {
-		dev_dbg(&i2c_imx->adapter.dev, "<%s> Timeout\n", __func__);
-		return -ETIMEDOUT;
-	}
-
-	/* check for arbitration lost */
-	if (i2c_imx->i2csr & I2SR_IAL) {
-		dev_dbg(&i2c_imx->adapter.dev, "<%s> Arbitration lost\n", __func__);
-		i2c_imx_clear_irq(i2c_imx, I2SR_IAL);
-
-		i2c_imx->i2csr = 0;
-		return -EAGAIN;
-	}
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s> TRX complete\n", __func__);
-	i2c_imx->i2csr = 0;
-	return 0;
-}
-
-static int i2c_imx_acked(struct imx_i2c_struct *i2c_imx)
-{
-	if (imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR) & I2SR_RXAK) {
-		dev_dbg(&i2c_imx->adapter.dev, "<%s> No ACK\n", __func__);
-		return -ENXIO;  /* No ACK */
-	}
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s> ACK received\n", __func__);
-	return 0;
-}
-
-static void i2c_imx_set_clk(struct imx_i2c_struct *i2c_imx)
-{
-	struct imx_i2c_clk_pair *i2c_clk_div = i2c_imx->hwdata->clk_div;
-	unsigned int i2c_clk_rate;
-	unsigned int div;
-	int i;
-
-	/* Divider value calculation */
-	i2c_clk_rate = clk_get_rate(i2c_imx->clk);
-	if (i2c_imx->cur_clk == i2c_clk_rate)
-		return;
-
-	i2c_imx->cur_clk = i2c_clk_rate;
-
-	div = (i2c_clk_rate + i2c_imx->bitrate - 1) / i2c_imx->bitrate;
-	if (div < i2c_clk_div[0].div)
-		i = 0;
-	else if (div > i2c_clk_div[i2c_imx->hwdata->ndivs - 1].div)
-		i = i2c_imx->hwdata->ndivs - 1;
-	else
-		for (i = 0; i2c_clk_div[i].div < div; i++)
-			;
-
-	/* Store divider value */
-	i2c_imx->ifdr = i2c_clk_div[i].val;
-
-	/*
-	 * There dummy delay is calculated.
-	 * It should be about one I2C clock period long.
-	 * This delay is used in I2C bus disable function
-	 * to fix chip hardware bug.
-	 */
-	i2c_imx->disable_delay = (500000U * i2c_clk_div[i].div
-		+ (i2c_clk_rate / 2) - 1) / (i2c_clk_rate / 2);
-
-#ifdef CONFIG_I2C_DEBUG_BUS
-	dev_dbg(&i2c_imx->adapter.dev, "I2C_CLK=%d, REQ DIV=%d\n",
-		i2c_clk_rate, div);
-	dev_dbg(&i2c_imx->adapter.dev, "IFDR[IC]=0x%x, REAL DIV=%d\n",
-		i2c_clk_div[i].val, i2c_clk_div[i].div);
-#endif
-}
-
-static int i2c_imx_start(struct imx_i2c_struct *i2c_imx)
-{
-	unsigned int temp = 0;
-	int result;
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s>\n", __func__);
-
-	i2c_imx_set_clk(i2c_imx);
-
-	result = clk_prepare_enable(i2c_imx->clk);
-	if (result)
-		return result;
-	imx_i2c_write_reg(i2c_imx->ifdr, i2c_imx, IMX_I2C_IFDR);
-	/* Enable I2C controller */
-	imx_i2c_write_reg(i2c_imx->hwdata->i2sr_clr_opcode, i2c_imx, IMX_I2C_I2SR);
-	imx_i2c_write_reg(i2c_imx->hwdata->i2cr_ien_opcode, i2c_imx, IMX_I2C_I2CR);
-
-	/* Wait controller to be stable */
-	udelay(50);
-
-	/* Start I2C transaction */
-	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-	temp |= I2CR_MSTA;
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-	result = i2c_imx_bus_busy(i2c_imx, 1);
-	if (result)
-		return result;
-	i2c_imx->stopped = 0;
-
-	temp |= I2CR_IIEN | I2CR_MTX | I2CR_TXAK;
-	temp &= ~I2CR_DMAEN;
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-	return result;
-}
-
-static void i2c_imx_stop(struct imx_i2c_struct *i2c_imx)
-{
-	unsigned int temp = 0;
-
-	if (!i2c_imx->stopped) {
-		/* Stop I2C transaction */
-		dev_dbg(&i2c_imx->adapter.dev, "<%s>\n", __func__);
-		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-		temp &= ~(I2CR_MSTA | I2CR_MTX);
-		if (i2c_imx->dma)
-			temp &= ~I2CR_DMAEN;
-		imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-	}
-	if (is_imx1_i2c(i2c_imx)) {
-		/*
-		 * This delay caused by an i.MXL hardware bug.
-		 * If no (or too short) delay, no "STOP" bit will be generated.
-		 */
-		udelay(i2c_imx->disable_delay);
-	}
-
-	if (!i2c_imx->stopped) {
-		i2c_imx_bus_busy(i2c_imx, 0);
-		i2c_imx->stopped = 1;
-	}
-
-	/* Disable I2C controller */
-	temp = i2c_imx->hwdata->i2cr_ien_opcode ^ I2CR_IEN,
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-	clk_disable_unprepare(i2c_imx->clk);
-}
-
-static irqreturn_t i2c_imx_isr(int irq, void *dev_id)
-{
-	struct imx_i2c_struct *i2c_imx = dev_id;
-	unsigned int temp;
-
-	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR);
-	if (temp & I2SR_IIF) {
-		/* save status register */
-		i2c_imx->i2csr = temp;
-		i2c_imx_clear_irq(i2c_imx, I2SR_IIF);
-		wake_up(&i2c_imx->queue);
-		return IRQ_HANDLED;
-	}
-
-	return IRQ_NONE;
-}
-
-static int i2c_imx_dma_write(struct imx_i2c_struct *i2c_imx,
-					struct i2c_msg *msgs)
-{
-	int result;
-	unsigned long time_left;
-	unsigned int temp = 0;
-	unsigned long orig_jiffies = jiffies;
-	struct imx_i2c_dma *dma = i2c_imx->dma;
-	struct device *dev = &i2c_imx->adapter.dev;
-
-	dma->chan_using = dma->chan_tx;
-	dma->dma_transfer_dir = DMA_MEM_TO_DEV;
-	dma->dma_data_dir = DMA_TO_DEVICE;
-	dma->dma_len = msgs->len - 1;
-	result = i2c_imx_dma_xfer(i2c_imx, msgs);
-	if (result)
-		return result;
-
-	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-	temp |= I2CR_DMAEN;
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-
-	/*
-	 * Write slave address.
-	 * The first byte must be transmitted by the CPU.
-	 */
-	imx_i2c_write_reg(msgs->addr << 1, i2c_imx, IMX_I2C_I2DR);
-	time_left = wait_for_completion_timeout(
-				&i2c_imx->dma->cmd_complete,
-				msecs_to_jiffies(DMA_TIMEOUT));
-	if (time_left == 0) {
-		dmaengine_terminate_all(dma->chan_using);
-		return -ETIMEDOUT;
-	}
-
-	/* Waiting for transfer complete. */
-	while (1) {
-		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR);
-		if (temp & I2SR_ICF)
-			break;
-		if (time_after(jiffies, orig_jiffies +
-				msecs_to_jiffies(DMA_TIMEOUT))) {
-			dev_dbg(dev, "<%s> Timeout\n", __func__);
-			return -ETIMEDOUT;
-		}
-		schedule();
-	}
-
-	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-	temp &= ~I2CR_DMAEN;
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-
-	/* The last data byte must be transferred by the CPU. */
-	imx_i2c_write_reg(msgs->buf[msgs->len-1],
-				i2c_imx, IMX_I2C_I2DR);
-	result = i2c_imx_trx_complete(i2c_imx);
-	if (result)
-		return result;
-
-	return i2c_imx_acked(i2c_imx);
-}
-
-static int i2c_imx_dma_read(struct imx_i2c_struct *i2c_imx,
-			struct i2c_msg *msgs, bool is_lastmsg)
-{
-	int result;
-	unsigned long time_left;
-	unsigned int temp;
-	unsigned long orig_jiffies = jiffies;
-	struct imx_i2c_dma *dma = i2c_imx->dma;
-	struct device *dev = &i2c_imx->adapter.dev;
-
-
-	dma->chan_using = dma->chan_rx;
-	dma->dma_transfer_dir = DMA_DEV_TO_MEM;
-	dma->dma_data_dir = DMA_FROM_DEVICE;
-	/* The last two data bytes must be transferred by the CPU. */
-	dma->dma_len = msgs->len - 2;
-	result = i2c_imx_dma_xfer(i2c_imx, msgs);
-	if (result)
-		return result;
-
-	time_left = wait_for_completion_timeout(
-				&i2c_imx->dma->cmd_complete,
-				msecs_to_jiffies(DMA_TIMEOUT));
-	if (time_left == 0) {
-		dmaengine_terminate_all(dma->chan_using);
-		return -ETIMEDOUT;
-	}
-
-	/* waiting for transfer complete. */
-	while (1) {
-		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR);
-		if (temp & I2SR_ICF)
-			break;
-		if (time_after(jiffies, orig_jiffies +
-				msecs_to_jiffies(DMA_TIMEOUT))) {
-			dev_dbg(dev, "<%s> Timeout\n", __func__);
-			return -ETIMEDOUT;
-		}
-		schedule();
-	}
-
-	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-	temp &= ~I2CR_DMAEN;
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-
-	/* read n-1 byte data */
-	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-	temp |= I2CR_TXAK;
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-
-	msgs->buf[msgs->len-2] = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
-	/* read n byte data */
-	result = i2c_imx_trx_complete(i2c_imx);
-	if (result)
-		return result;
-
-	if (is_lastmsg) {
-		/*
-		 * It must generate STOP before read I2DR to prevent
-		 * controller from generating another clock cycle
-		 */
-		dev_dbg(dev, "<%s> clear MSTA\n", __func__);
-		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-		temp &= ~(I2CR_MSTA | I2CR_MTX);
-		imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-		i2c_imx_bus_busy(i2c_imx, 0);
-		i2c_imx->stopped = 1;
-	} else {
-		/*
-		 * For i2c master receiver repeat restart operation like:
-		 * read -> repeat MSTA -> read/write
-		 * The controller must set MTX before read the last byte in
-		 * the first read operation, otherwise the first read cost
-		 * one extra clock cycle.
-		 */
-		temp = readb(i2c_imx->base + IMX_I2C_I2CR);
-		temp |= I2CR_MTX;
-		writeb(temp, i2c_imx->base + IMX_I2C_I2CR);
-	}
-	msgs->buf[msgs->len-1] = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
-
-	return 0;
-}
-
-static int i2c_imx_write(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs)
-{
-	int i, result;
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s> write slave address: addr=0x%x\n",
-		__func__, msgs->addr << 1);
-
-	/* write slave address */
-	imx_i2c_write_reg(msgs->addr << 1, i2c_imx, IMX_I2C_I2DR);
-	result = i2c_imx_trx_complete(i2c_imx);
-	if (result)
-		return result;
-	result = i2c_imx_acked(i2c_imx);
-	if (result)
-		return result;
-	dev_dbg(&i2c_imx->adapter.dev, "<%s> write data\n", __func__);
-
-	/* write data */
-	for (i = 0; i < msgs->len; i++) {
-		dev_dbg(&i2c_imx->adapter.dev,
-			"<%s> write byte: B%d=0x%X\n",
-			__func__, i, msgs->buf[i]);
-		imx_i2c_write_reg(msgs->buf[i], i2c_imx, IMX_I2C_I2DR);
-		result = i2c_imx_trx_complete(i2c_imx);
-		if (result)
-			return result;
-		result = i2c_imx_acked(i2c_imx);
-		if (result)
-			return result;
-	}
-	return 0;
-}
-
-static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs, bool is_lastmsg)
-{
-	int i, result;
-	unsigned int temp;
-	int block_data = msgs->flags & I2C_M_RECV_LEN;
-	int use_dma = i2c_imx->dma && msgs->len >= DMA_THRESHOLD && !block_data;
-
-	dev_dbg(&i2c_imx->adapter.dev,
-		"<%s> write slave address: addr=0x%x\n",
-		__func__, (msgs->addr << 1) | 0x01);
-
-	/* write slave address */
-	imx_i2c_write_reg((msgs->addr << 1) | 0x01, i2c_imx, IMX_I2C_I2DR);
-	result = i2c_imx_trx_complete(i2c_imx);
-	if (result)
-		return result;
-	result = i2c_imx_acked(i2c_imx);
-	if (result)
-		return result;
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s> setup bus\n", __func__);
-
-	/* setup bus to read data */
-	temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-	temp &= ~I2CR_MTX;
-
-	/*
-	 * Reset the I2CR_TXAK flag initially for SMBus block read since the
-	 * length is unknown
-	 */
-	if ((msgs->len - 1) || block_data)
-		temp &= ~I2CR_TXAK;
-	if (use_dma)
-		temp |= I2CR_DMAEN;
-	imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-	imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR); /* dummy read */
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s> read data\n", __func__);
-
-	if (use_dma)
-		return i2c_imx_dma_read(i2c_imx, msgs, is_lastmsg);
-
-	/* read data */
-	for (i = 0; i < msgs->len; i++) {
-		u8 len = 0;
-
-		result = i2c_imx_trx_complete(i2c_imx);
-		if (result)
-			return result;
-		/*
-		 * First byte is the length of remaining packet
-		 * in the SMBus block data read. Add it to
-		 * msgs->len.
-		 */
-		if ((!i) && block_data) {
-			len = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
-			if ((len == 0) || (len > I2C_SMBUS_BLOCK_MAX))
-				return -EPROTO;
-			dev_dbg(&i2c_imx->adapter.dev,
-				"<%s> read length: 0x%X\n",
-				__func__, len);
-			msgs->len += len;
-		}
-		if (i == (msgs->len - 1)) {
-			if (is_lastmsg) {
-				/*
-				 * It must generate STOP before read I2DR to prevent
-				 * controller from generating another clock cycle
-				 */
-				dev_dbg(&i2c_imx->adapter.dev,
-					"<%s> clear MSTA\n", __func__);
-				temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-				temp &= ~(I2CR_MSTA | I2CR_MTX);
-				imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-				i2c_imx_bus_busy(i2c_imx, 0);
-				i2c_imx->stopped = 1;
-			} else {
-				/*
-				 * For i2c master receiver repeat restart operation like:
-				 * read -> repeat MSTA -> read/write
-				 * The controller must set MTX before read the last byte in
-				 * the first read operation, otherwise the first read cost
-				 * one extra clock cycle.
-				 */
-				temp = readb(i2c_imx->base + IMX_I2C_I2CR);
-				temp |= I2CR_MTX;
-				writeb(temp, i2c_imx->base + IMX_I2C_I2CR);
-			}
-		} else if (i == (msgs->len - 2)) {
-			dev_dbg(&i2c_imx->adapter.dev,
-				"<%s> set TXAK\n", __func__);
-			temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-			temp |= I2CR_TXAK;
-			imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-		}
-		if ((!i) && block_data)
-			msgs->buf[0] = len;
-		else
-			msgs->buf[i] =  imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
-		dev_dbg(&i2c_imx->adapter.dev,
-			"<%s> read byte: B%d=0x%X\n",
-			__func__, i, msgs->buf[i]);
-	}
-	return 0;
-}
-
-static int i2c_imx_xfer(struct i2c_adapter *adapter,
-						struct i2c_msg *msgs, int num)
-{
-	unsigned int i, temp;
-	int result;
-	bool is_lastmsg = false;
-	struct imx_i2c_struct *i2c_imx = i2c_get_adapdata(adapter);
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s>\n", __func__);
-
-	/* Start I2C transfer */
-	result = i2c_imx_start(i2c_imx);
-	if (result) {
-		if (i2c_imx->adapter.bus_recovery_info) {
-			i2c_recover_bus(&i2c_imx->adapter);
-			result = i2c_imx_start(i2c_imx);
-		}
-	}
-
-	if (result)
-		goto fail0;
-
-	/* read/write data */
-	for (i = 0; i < num; i++) {
-		if (i == num - 1)
-			is_lastmsg = true;
-
-		if (i) {
-			dev_dbg(&i2c_imx->adapter.dev,
-				"<%s> repeated start\n", __func__);
-			temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-			temp |= I2CR_RSTA;
-			imx_i2c_write_reg(temp, i2c_imx, IMX_I2C_I2CR);
-			result =  i2c_imx_bus_busy(i2c_imx, 1);
-			if (result)
-				goto fail0;
-		}
-		dev_dbg(&i2c_imx->adapter.dev,
-			"<%s> transfer message: %d\n", __func__, i);
-		/* write/read data */
-#ifdef CONFIG_I2C_DEBUG_BUS
-		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-		dev_dbg(&i2c_imx->adapter.dev,
-			"<%s> CONTROL: IEN=%d, IIEN=%d, MSTA=%d, MTX=%d, TXAK=%d, RSTA=%d\n",
-			__func__,
-			(temp & I2CR_IEN ? 1 : 0), (temp & I2CR_IIEN ? 1 : 0),
-			(temp & I2CR_MSTA ? 1 : 0), (temp & I2CR_MTX ? 1 : 0),
-			(temp & I2CR_TXAK ? 1 : 0), (temp & I2CR_RSTA ? 1 : 0));
-		temp = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR);
-		dev_dbg(&i2c_imx->adapter.dev,
-			"<%s> STATUS: ICF=%d, IAAS=%d, IBB=%d, IAL=%d, SRW=%d, IIF=%d, RXAK=%d\n",
-			__func__,
-			(temp & I2SR_ICF ? 1 : 0), (temp & I2SR_IAAS ? 1 : 0),
-			(temp & I2SR_IBB ? 1 : 0), (temp & I2SR_IAL ? 1 : 0),
-			(temp & I2SR_SRW ? 1 : 0), (temp & I2SR_IIF ? 1 : 0),
-			(temp & I2SR_RXAK ? 1 : 0));
-#endif
-		if (msgs[i].flags & I2C_M_RD)
-			result = i2c_imx_read(i2c_imx, &msgs[i], is_lastmsg);
-		else {
-			if (i2c_imx->dma && msgs[i].len >= DMA_THRESHOLD)
-				result = i2c_imx_dma_write(i2c_imx, &msgs[i]);
-			else
-				result = i2c_imx_write(i2c_imx, &msgs[i]);
-		}
-		if (result)
-			goto fail0;
-	}
-
-fail0:
-	/* Stop I2C transfer */
-	i2c_imx_stop(i2c_imx);
-
-	dev_dbg(&i2c_imx->adapter.dev, "<%s> exit with: %s: %d\n", __func__,
-		(result < 0) ? "error" : "success msg",
-			(result < 0) ? result : num);
-	return (result < 0) ? result : num;
-}
-
-static void i2c_imx_prepare_recovery(struct i2c_adapter *adap)
-{
-	struct imx_i2c_struct *i2c_imx;
-
-	i2c_imx = container_of(adap, struct imx_i2c_struct, adapter);
-
-	pinctrl_select_state(i2c_imx->pinctrl, i2c_imx->pinctrl_pins_gpio);
-}
-
-static void i2c_imx_unprepare_recovery(struct i2c_adapter *adap)
-{
-	struct imx_i2c_struct *i2c_imx;
-
-	i2c_imx = container_of(adap, struct imx_i2c_struct, adapter);
-
-	pinctrl_select_state(i2c_imx->pinctrl, i2c_imx->pinctrl_pins_default);
-}
-
-static void i2c_imx_init_recovery_info(struct imx_i2c_struct *i2c_imx,
-		struct platform_device *pdev)
-{
-	struct i2c_bus_recovery_info *rinfo = &i2c_imx->rinfo;
-
-	i2c_imx->pinctrl_pins_default = pinctrl_lookup_state(i2c_imx->pinctrl,
-			PINCTRL_STATE_DEFAULT);
-	i2c_imx->pinctrl_pins_gpio = pinctrl_lookup_state(i2c_imx->pinctrl,
-			"gpio");
-	rinfo->sda_gpio = of_get_named_gpio_flags(pdev->dev.of_node,
-			"sda-gpios", 0, NULL);
-	rinfo->scl_gpio = of_get_named_gpio_flags(pdev->dev.of_node,
-			"scl-gpios", 0, NULL);
-
-	if (!gpio_is_valid(rinfo->sda_gpio) ||
-	    !gpio_is_valid(rinfo->scl_gpio) ||
-	    IS_ERR(i2c_imx->pinctrl_pins_default) ||
-	    IS_ERR(i2c_imx->pinctrl_pins_gpio)) {
-		dev_dbg(&pdev->dev, "recovery information incomplete\n");
-		return;
-	}
-
-	dev_dbg(&pdev->dev, "using scl-gpio %d and sda-gpio %d for recovery\n",
-			rinfo->sda_gpio, rinfo->scl_gpio);
-
-	rinfo->prepare_recovery = i2c_imx_prepare_recovery;
-	rinfo->unprepare_recovery = i2c_imx_unprepare_recovery;
-	rinfo->recover_bus = i2c_generic_gpio_recovery;
-	i2c_imx->adapter.bus_recovery_info = rinfo;
-}
-
-static u32 i2c_imx_func(struct i2c_adapter *adapter)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL
-		| I2C_FUNC_SMBUS_READ_BLOCK_DATA;
-}
-
-static struct i2c_algorithm i2c_imx_algo = {
-	.master_xfer	= i2c_imx_xfer,
-	.functionality	= i2c_imx_func,
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+ * Copyright (c) 2006, 2007, 2008, 2009 QLogic Corporation. All rights reserved.
+ * Copyright (c) 2005, 2006 PathScale, Inc. All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#include <linux/spinlock.h>
+#include <rdma/ib_smi.h>
+
+#include "qib.h"
+#include "qib_mad.h"
+
+/*
+ * Convert the AETH RNR timeout code into the number of microseconds.
+ */
+const u32 ib_qib_rnr_table[32] = {
+	655360,	/* 00: 655.36 */
+	10,	/* 01:    .01 */
+	20,	/* 02     .02 */
+	30,	/* 03:    .03 */
+	40,	/* 04:    .04 */
+	60,	/* 05:    .06 */
+	80,	/* 06:    .08 */
+	120,	/* 07:    .12 */
+	160,	/* 08:    .16 */
+	240,	/* 09:    .24 */
+	320,	/* 0A:    .32 */
+	480,	/* 0B:    .48 */
+	640,	/* 0C:    .64 */
+	960,	/* 0D:    .96 */
+	1280,	/* 0E:   1.28 */
+	1920,	/* 0F:   1.92 */
+	2560,	/* 10:   2.56 */
+	3840,	/* 11:   3.84 */
+	5120,	/* 12:   5.12 */
+	7680,	/* 13:   7.68 */
+	10240,	/* 14:  10.24 */
+	15360,	/* 15:  15.36 */
+	20480,	/* 16:  20.48 */
+	30720,	/* 17:  30.72 */
+	40960,	/* 18:  40.96 */
+	61440,	/* 19:  61.44 */
+	81920,	/* 1A:  81.92 */
+	122880,	/* 1B: 122.88 */
+	163840,	/* 1C: 163.84 */
+	245760,	/* 1D: 245.76 */
+	327680,	/* 1E: 327.68 */
+	491520	/* 1F: 491.52 */
 };
 
-static int i2c_imx_probe(struct platform_device *pdev)
+/*
+ * Validate a RWQE and fill in the SGE state.
+ * Return 1 if OK.
+ */
+static int qib_init_sge(struct qib_qp *qp, struct qib_rwqe *wqe)
 {
-	const struct of_device_id *of_id = of_match_device(i2c_imx_dt_ids,
-							   &pdev->dev);
-	struct imx_i2c_struct *i2c_imx;
-	struct resource *res;
-	struct imxi2c_platform_data *pdata = dev_get_platdata(&pdev->dev);
-	void __iomem *base;
-	int irq, ret;
-	dma_addr_t phy_addr;
+	int i, j, ret;
+	struct ib_wc wc;
+	struct qib_lkey_table *rkt;
+	struct qib_pd *pd;
+	struct qib_sge_state *ss;
 
-	dev_dbg(&pdev->dev, "<%s>\n", __func__);
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(&pdev->dev, "can't get irq number\n");
-		return irq;
+	rkt = &to_idev(qp->ibqp.device)->lk_table;
+	pd = to_ipd(qp->ibqp.srq ? qp->ibqp.srq->pd : qp->ibqp.pd);
+	ss = &qp->r_sge;
+	ss->sg_list = qp->r_sg_list;
+	qp->r_len = 0;
+	for (i = j = 0; i < wqe->num_sge; i++) {
+		if (wqe->sg_list[i].length == 0)
+			continue;
+		/* Check LKEY */
+		if (!qib_lkey_ok(rkt, pd, j ? &ss->sg_list[j - 1] : &ss->sge,
+				 &wqe->sg_list[i], IB_ACCESS_LOCAL_WRITE))
+			goto bad_lkey;
+		qp->r_len += wqe->sg_list[i].length;
+		j++;
 	}
+	ss->num_sge = j;
+	ss->total_len = qp->r_len;
+	ret = 1;
+	goto bail;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(base))
-		return PTR_ERR(base);
+bad_lkey:
+	while (j) {
+		struct qib_sge *sge = --j ? &ss->sg_list[j - 1] : &ss->sge;
 
-	phy_addr = (dma_addr_t)res->start;
-	i2c_imx = devm_kzalloc(&pdev->dev, sizeof(*i2c_imx), GFP_KERNEL);
-	if (!i2c_imx)
-		return -ENOMEM;
-
-	if (of_id)
-		i2c_imx->hwdata = of_id->data;
-	else
-		i2c_imx->hwdata = (struct imx_i2c_hwdata *)
-				platform_get_device_id(pdev)->driver_data;
-
-	/* Setup i2c_imx driver structure */
-	strlcpy(i2c_imx->adapter.name, pdev->name, sizeof(i2c_imx->adapter.name));
-	i2c_imx->adapter.owner		= THIS_MODULE;
-	i2c_imx->adapter.algo		= &i2c_imx_algo;
-	i2c_imx->adapter.dev.parent	= &pdev->dev;
-	i2c_imx->adapter.nr		= pdev->id;
-	i2c_imx->adapter.dev.of_node	= pdev->dev.of_node;
-	i2c_imx->base			= base;
-
-	/* Get I2C clock */
-	i2c_imx->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(i2c_imx->clk)) {
-		if (PTR_ERR(i2c_imx->clk) != -EPROBE_DEFER)
-			dev_err(&pdev->dev, "can't get I2C clock\n");
-		return PTR_ERR(i2c_imx->clk);
+		qib_put_mr(sge->mr);
 	}
-
-	ret = clk_prepare_enable(i2c_imx->clk);
-	if (ret) {
-		dev_err(&pdev->dev, "can't enable I2C clock\n");
-		return ret;
-	}
-
-	i2c_imx->pinctrl = devm_pinctrl_get(&pdev->dev);
-	if (IS_ERR(i2c_imx->pinctrl)) {
-		ret = PTR_ERR(i2c_imx->pinctrl);
-		goto clk_disable;
-	}
-
-	/* Init queue */
-	init_waitqueue_head(&i2c_imx->queue);
-
-	/* Set up adapter data */
-	i2c_set_adapdata(&i2c_imx->adapter, i2c_imx);
-
-	/* Request IRQ */
-	ret = request_threaded_irq(irq, i2c_imx_isr, NULL, 0,
-				   pdev->name, i2c_imx);
-	if (ret) {
-		dev_err(&pdev->dev, "can't claim irq %d\n", irq);
-		goto clk_disable;
-	}
-
-	/* Set up clock divider */
-	i2c_imx->bitrate = IMX_I2C_BIT_RATE;
-	ret = of_property_read_u32(pdev->dev.of_node,
-				   "clock-frequency", &i2c_imx->bitrate);
-	if (ret < 0 && pdata && pdata->bitrate)
-		i2c_imx->bitrate = pdata->bitrate;
-
-	/* Set up chip registers to defaults */
-	imx_i2c_write_reg(i2c_imx->hwdata->i2cr_ien_opcode ^ I2CR_IEN,
-			i2c_imx, IMX_I2C_I2CR);
-	imx_i2c_write_reg(i2c_imx->hwdata->i2sr_clr_opcode, i2c_imx, IMX_I2C_I2SR);
-
-	i2c_imx_init_recovery_info(i2c_imx, pdev);
-
-	/* Add I2C adapter */
-	ret = i2c_add_numbered_adapter(&i2c_imx->adapter);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "registration failed\n");
-		goto clk_free_irq;
-	}
-
-	/* Set up platform driver data */
-	platform_set_drvdata(pdev, i2c_imx);
-	clk_disable_unprepare(i2c_imx->clk);
-
-	dev_dbg(&i2c_imx->adapter.dev, "claimed irq %d\n", irq);
-	dev_dbg(&i2c_imx->adapter.dev, "device resources: %pR\n", res);
-	dev_dbg(&i2c_imx->adapter.dev, "adapter name: \"%s\"\n",
-		i2c_imx->adapter.name);
-	dev_info(&i2c_imx->adapter.dev, "IMX I2C adapter registered\n");
-
-	/* Init DMA config if supported */
-	i2c_imx_dma_request(i2c_imx, phy_addr);
-
-	return 0;   /* Return OK */
-
-clk_free_irq:
-	free_irq(irq, i2c_imx);
-clk_disable:
-	clk_disable_unprepare(i2c_imx->clk);
+	ss->num_sge = 0;
+	memset(&wc, 0, sizeof(wc));
+	wc.wr_id = wqe->wr_id;
+	wc.status = IB_WC_LOC_PROT_ERR;
+	wc.opcode = IB_WC_RECV;
+	wc.qp = &qp->ibqp;
+	/* Signal solicited completion event. */
+	qib_cq_enter(to_icq(qp->ibqp.recv_cq), &wc, 1);
+	ret = 0;
+bail:
 	return ret;
 }
 
-static int i2c_imx_remove(struct platform_device *pdev)
+/**
+ * qib_get_rwqe - copy the next RWQE into the QP's RWQE
+ * @qp: the QP
+ * @wr_id_only: update qp->r_wr_id only, not qp->r_sge
+ *
+ * Return -1 if there is a local error, 0 if no RWQE is available,
+ * otherwise return 1.
+ *
+ * Can be called from interrupt level.
+ */
+int qib_get_rwqe(struct qib_qp *qp, int wr_id_only)
 {
-	struct imx_i2c_struct *i2c_imx = platform_get_drvdata(pdev);
-	int irq;
+	unsigned long flags;
+	struct qib_rq *rq;
+	struct qib_rwq *wq;
+	struct qib_srq *srq;
+	struct qib_rwqe *wqe;
+	void (*handler)(struct ib_event *, void *);
+	u32 tail;
+	int ret;
 
-	/* remove adapter */
-	dev_dbg(&i2c_imx->adapter.dev, "adapter removed\n");
-	i2c_del_adapter(&i2c_imx->adapter);
+	if (qp->ibqp.srq) {
+		srq = to_isrq(qp->ibqp.srq);
+		handler = srq->ibsrq.event_handler;
+		rq = &srq->rq;
+	} else {
+		srq = NULL;
+		handler = NULL;
+		rq = &qp->r_rq;
+	}
 
-	if (i2c_imx->dma)
-		i2c_imx_dma_free(i2c_imx);
+	spin_lock_irqsave(&rq->lock, flags);
+	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK)) {
+		ret = 0;
+		goto unlock;
+	}
 
-	/* setup chip registers to defaults */
-	imx_i2c_write_reg(0, i2c_imx, IMX_I2C_IADR);
-	imx_i2c_write_reg(0, i2c_imx, IMX_I2C_IFDR);
-	imx_i2c_write_reg(0, i2c_imx, IMX_I2C_I2CR);
-	imx_i2c_write_reg(0, i2c_imx, IMX_I2C_I2SR);
+	wq = rq->wq;
+	tail = wq->tail;
+	/* Validate tail before using it since it is user writable. */
+	if (tail >= rq->size)
+		tail = 0;
+	if (unlikely(tail == wq->head)) {
+		ret = 0;
+		goto unlock;
+	}
+	/* Make sure entry is read after head index is read. */
+	smp_rmb();
+	wqe = get_rwqe_ptr(rq, tail);
+	/*
+	 * Even though we update the tail index in memory, the verbs
+	 * consumer is not supposed to post more entries until a
+	 * completion is generated.
+	 */
+	if (++tail >= rq->size)
+		tail = 0;
+	wq->tail = tail;
+	if (!wr_id_only && !qib_init_sge(qp, wqe)) {
+		ret = -1;
+		goto unlock;
+	}
+	qp->r_wr_id = wqe->wr_id;
 
-	irq = platform_get_irq(pdev, 0);
-	if (irq >= 0)
-		free_irq(irq, i2c_imx);
+	ret = 1;
+	set_bit(QIB_R_WRID_VALID, &qp->r_aflags);
+	if (handler) {
+		u32 n;
+
+		/*
+		 * Validate head pointer value and compute
+		 * the number of remaining WQEs.
+		 */
+		n = wq->head;
+		if (n >= rq->size)
+			n = 0;
+		if (n < tail)
+			n += rq->size - tail;
+		else
+			n -= tail;
+		if (n < srq->limit) {
+			struct ib_event ev;
+
+			srq->limit = 0;
+			spin_unlock_irqrestore(&rq->lock, flags);
+			ev.device = qp->ibqp.device;
+			ev.element.srq = qp->ibqp.srq;
+			ev.event = IB_EVENT_SRQ_LIMIT_REACHED;
+			handler(&ev, srq->ibsrq.srq_context);
+			goto bail;
+		}
+	}
+unlock:
+	spin_unlock_irqrestore(&rq->lock, flags);
+bail:
+	return ret;
+}
+
+/*
+ * Switch to alternate path.
+ * The QP s_lock should be held and interrupts disabled.
+ */
+void qib_migrate_qp(struct qib_qp *qp)
+{
+	struct ib_event ev;
+
+	qp->s_mig_state = IB_MIG_MIGRATED;
+	qp->remote_ah_attr = qp->alt_ah_attr;
+	qp->port_num = qp->alt_ah_attr.port_num;
+	qp->s_pkey_index = qp->s_alt_pkey_index;
+
+	ev.device = qp->ibqp.device;
+	ev.element.qp = &qp->ibqp;
+	ev.event = IB_EVENT_PATH_MIG;
+	qp->ibqp.event_handler(&ev, qp->ibqp.qp_context);
+}
+
+static __be64 get_sguid(struct qib_ibport *ibp, unsigned index)
+{
+	if (!index) {
+		struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+
+		return ppd->guid;
+	}
+	return ibp->guids[index - 1];
+}
+
+static int gid_ok(union ib_gid *gid, __be64 gid_prefix, __be64 id)
+{
+	return (gid->global.interface_id == id &&
+		(gid->global.subnet_prefix == gid_prefix ||
+		 gid->global.subnet_prefix == IB_DEFAULT_GID_PREFIX));
+}
+
+/*
+ *
+ * This should be called with the QP r_lock held.
+ *
+ * The s_lock will be acquired around the qib_migrate_qp() call.
+ */
+int qib_ruc_check_hdr(struct qib_ibport *ibp, struct qib_ib_header *hdr,
+		      int has_grh, struct qib_qp *qp, u32 bth0)
+{
+	__be64 guid;
+	unsigned long flags;
+
+	if (qp->s_mig_state == IB_MIG_ARMED && (bth0 & IB_BTH_MIG_REQ)) {
+		if (!has_grh) {
+			if (qp->alt_ah_attr.ah_flags & IB_AH_GRH)
+				goto err;
+		} else {
+			if (!(qp->alt_ah_attr.ah_flags & IB_AH_GRH))
+				goto err;
+			guid = get_sguid(ibp, qp->alt_ah_attr.grh.sgid_index);
+			if (!gid_ok(&hdr->u.l.grh.dgid, ibp->gid_prefix, guid))
+				goto err;
+			if (!gid_ok(&hdr->u.l.grh.sgid,
+			    qp->alt_ah_attr.grh.dgid.global.subnet_prefix,
+			    qp->alt_ah_attr.grh.dgid.global.interface_id))
+				goto err;
+		}
+		if (!qib_pkey_ok((u16)bth0,
+				 qib_get_pkey(ibp, qp->s_alt_pkey_index))) {
+			qib_bad_pqkey(ibp, IB_NOTICE_TRAP_BAD_PKEY,
+				      (u16)bth0,
+				      (be16_to_cpu(hdr->lrh[0]) >> 4) & 0xF,
+				      0, qp->ibqp.qp_num,
+				      hdr->lrh[3], hdr->lrh[1]);
+			goto err;
+		}
+		/* Validate the SLID. See Ch. 9.6.1.5 and 17.2.8 */
+		if (be16_to_cpu(hdr->lrh[3]) != qp->alt_ah_attr.dlid ||
+		    ppd_from_ibp(ibp)->port != qp->alt_ah_attr.port_num)
+			goto err;
+		spin_lock_irqsave(&qp->s_lock, flags);
+		qib_migrate_qp(qp);
+		spin_unlock_irqrestore(&qp->s_lock, flags);
+	} else {
+		if (!has_grh) {
+			if (qp->remote_ah_attr.ah_flags & IB_AH_GRH)
+				goto err;
+		} else {
+			if (!(qp->remote_ah_attr.ah_flags & IB_AH_GRH))
+				goto err;
+			guid = get_sguid(ibp,
+					 qp->remote_ah_attr.grh.sgid_index);
+			if (!gid_ok(&hdr->u.l.grh.dgid, ibp->gid_prefix, guid))
+				goto err;
+			if (!gid_ok(&hdr->u.l.grh.sgid,
+			    qp->remote_ah_attr.grh.dgid.global.subnet_prefix,
+			    qp->remote_ah_attr.grh.dgid.global.interface_id))
+				goto err;
+		}
+		if (!qib_pkey_ok((u16)bth0,
+				 qib_get_pkey(ibp, qp->s_pkey_index))) {
+			qib_bad_pqkey(ibp, IB_NOTICE_TRAP_BAD_PKEY,
+				      (u16)bth0,
+				      (be16_to_cpu(hdr->lrh[0]) >> 4) & 0xF,
+				      0, qp->ibqp.qp_num,
+				      hdr->lrh[3], hdr->lrh[1]);
+			goto err;
+		}
+		/* Validate the SLID. See Ch. 9.6.1.5 */
+		if (be16_to_cpu(hdr->lrh[3]) != qp->remote_ah_attr.dlid ||
+		    ppd_from_ibp(ibp)->port != qp->port_num)
+			goto err;
+		if (qp->s_mig_state == IB_MIG_REARM &&
+		    !(bth0 & IB_BTH_MIG_REQ))
+			qp->s_mig_state = IB_MIG_ARMED;
+	}
 
 	return 0;
+
+err:
+	return 1;
 }
 
-static struct platform_driver i2c_imx_driver = {
-	.probe = i2c_imx_probe,
-	.remove = i2c_imx_remove,
-	.driver	= {
-		.name	= DRIVER_NAME,
-		.of_match_table = i2c_imx_dt_ids,
-	},
-	.id_table	= imx_i2c_devtype,
-};
-
-static int __init i2c_adap_imx_init(void)
+/**
+ * qib_ruc_loopback - handle UC and RC lookback requests
+ * @sqp: the sending QP
+ *
+ * This is called from qib_do_send() to
+ * forward a WQE addressed to the same HCA.
+ * Note that although we are single threaded due to the tasklet, we still
+ * have to protect against post_send().  We don't have to worry about
+ * receive interrupts since this is a connected protocol and all packets
+ * will pass through here.
+ */
+static void qib_ruc_loopback(struct qib_qp *sqp)
 {
-	return platform_driver_register(&i2c_imx_driver);
-}
-subsys_initcall(i2c_adap_imx_init);
+	struct qib_ibport *ibp = to_iport(sqp->ibqp.device, sqp->port_num);
+	struct qib_qp *qp;
+	struct qib_swqe *wqe;
+	struct qib_sge *sge;
+	unsigned long flags;
+	struct ib_wc wc;
+	u64 sdata;
+	atomic64_t *maddr;
+	enum ib_wc_status send_status;
+	int release;
+	int ret;
 
-static void __exit i2c_adap_imx_exit(void)
-{
-	platform_driver_unregister(&i2c_imx_driver);
-}
-module_exit(i2c_adap_imx_exit);
+	/*
+	 * Note that we check the responder QP state after
+	 * checking the requester's state.
+	 */
+	qp = qib_lookup_qpn(ibp, sqp->remote_qpn);
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Darius Augulis");
-MODULE_DESCRIPTION("I2C adapter driver for IMX I2C bus");
-MODULE_ALIAS("platform:" DRIVER_NAME);
+	spin_lock_irqsave(&sqp->s_lock, flags);
+
+	/* Return if we are already busy processing a work request. */
+	if ((sqp->s_flags & (QIB_S_BUSY | QIB_S_ANY_WAIT)) ||
+	    !(ib_qib_

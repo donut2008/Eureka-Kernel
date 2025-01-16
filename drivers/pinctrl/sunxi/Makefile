@@ -1,16 +1,9 @@
-# Core
-obj-$(CONFIG_PINCTRL_SUNXI_COMMON)	+= pinctrl-sunxi.o
-
-# SoC Drivers
-obj-$(CONFIG_PINCTRL_SUN4I_A10)		+= pinctrl-sun4i-a10.o
-obj-$(CONFIG_PINCTRL_SUN5I_A10S)	+= pinctrl-sun5i-a10s.o
-obj-$(CONFIG_PINCTRL_SUN5I_A13)		+= pinctrl-sun5i-a13.o
-obj-$(CONFIG_PINCTRL_SUN6I_A31)		+= pinctrl-sun6i-a31.o
-obj-$(CONFIG_PINCTRL_SUN6I_A31S)	+= pinctrl-sun6i-a31s.o
-obj-$(CONFIG_PINCTRL_SUN6I_A31_R)	+= pinctrl-sun6i-a31-r.o
-obj-$(CONFIG_PINCTRL_SUN7I_A20)		+= pinctrl-sun7i-a20.o
-obj-$(CONFIG_PINCTRL_SUN8I_A23)		+= pinctrl-sun8i-a23.o
-obj-$(CONFIG_PINCTRL_SUN8I_A23_R)	+= pinctrl-sun8i-a23-r.o
-obj-$(CONFIG_PINCTRL_SUN8I_A33)		+= pinctrl-sun8i-a33.o
-obj-$(CONFIG_PINCTRL_SUN8I_A83T)	+= pinctrl-sun8i-a83t.o
-obj-$(CONFIG_PINCTRL_SUN9I_A80)		+= pinctrl-sun9i-a80.o
+ mmCNV_CSC_C21_C22                                                       0x5e22
+#define mmCNV_CSC_C23_C24                                                       0x5e23
+#define mmCNV_CSC_C31_C32                                                       0x5e24
+#define mmCNV_CSC_C33_C34                                                       0x5e25
+#define mmCNV_CSC_ROUND_OFFSET_R                                                0x5e26
+#define mmCNV_CSC_ROUND_OFFSET_G                                                0x5e27
+#define mmCNV_CSC_ROUND_OFFSET_B                                                0x5e28
+#define mmCNV_CSC_CLAMP_R                                                       0x5e29
+#define mmCNV_CSC_CLAMP_G                                           

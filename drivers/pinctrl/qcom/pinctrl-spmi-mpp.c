@@ -1,941 +1,342 @@
-/*
- * Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/gpio.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/pinctrl/pinconf-generic.h>
-#include <linux/pinctrl/pinconf.h>
-#include <linux/pinctrl/pinmux.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
-#include <linux/slab.h>
-#include <linux/types.h>
-
-#include <dt-bindings/pinctrl/qcom,pmic-mpp.h>
-
-#include "../core.h"
-#include "../pinctrl-utils.h"
-
-#define PMIC_MPP_ADDRESS_RANGE			0x100
-
-/*
- * Pull Up Values - it indicates whether a pull-up should be
- * applied for bidirectional mode only. The hardware ignores the
- * configuration when operating in other modes.
- */
-#define PMIC_MPP_PULL_UP_0P6KOHM		0
-#define PMIC_MPP_PULL_UP_10KOHM			1
-#define PMIC_MPP_PULL_UP_30KOHM			2
-#define PMIC_MPP_PULL_UP_OPEN			3
-
-/* type registers base address bases */
-#define PMIC_MPP_REG_TYPE			0x4
-#define PMIC_MPP_REG_SUBTYPE			0x5
-
-/* mpp peripheral type and subtype values */
-#define PMIC_MPP_TYPE				0x11
-#define PMIC_MPP_SUBTYPE_4CH_NO_ANA_OUT		0x3
-#define PMIC_MPP_SUBTYPE_ULT_4CH_NO_ANA_OUT	0x4
-#define PMIC_MPP_SUBTYPE_4CH_NO_SINK		0x5
-#define PMIC_MPP_SUBTYPE_ULT_4CH_NO_SINK	0x6
-#define PMIC_MPP_SUBTYPE_4CH_FULL_FUNC		0x7
-#define PMIC_MPP_SUBTYPE_8CH_FULL_FUNC		0xf
-
-#define PMIC_MPP_REG_RT_STS			0x10
-#define PMIC_MPP_REG_RT_STS_VAL_MASK		0x1
-
-/* control register base address bases */
-#define PMIC_MPP_REG_MODE_CTL			0x40
-#define PMIC_MPP_REG_DIG_VIN_CTL		0x41
-#define PMIC_MPP_REG_DIG_PULL_CTL		0x42
-#define PMIC_MPP_REG_DIG_IN_CTL			0x43
-#define PMIC_MPP_REG_EN_CTL			0x46
-#define PMIC_MPP_REG_AOUT_CTL			0x48
-#define PMIC_MPP_REG_AIN_CTL			0x4a
-#define PMIC_MPP_REG_SINK_CTL			0x4c
-
-/* PMIC_MPP_REG_MODE_CTL */
-#define PMIC_MPP_REG_MODE_VALUE_MASK		0x1
-#define PMIC_MPP_REG_MODE_FUNCTION_SHIFT	1
-#define PMIC_MPP_REG_MODE_FUNCTION_MASK		0x7
-#define PMIC_MPP_REG_MODE_DIR_SHIFT		4
-#define PMIC_MPP_REG_MODE_DIR_MASK		0x7
-
-/* PMIC_MPP_REG_DIG_VIN_CTL */
-#define PMIC_MPP_REG_VIN_SHIFT			0
-#define PMIC_MPP_REG_VIN_MASK			0x7
-
-/* PMIC_MPP_REG_DIG_PULL_CTL */
-#define PMIC_MPP_REG_PULL_SHIFT			0
-#define PMIC_MPP_REG_PULL_MASK			0x7
-
-/* PMIC_MPP_REG_EN_CTL */
-#define PMIC_MPP_REG_MASTER_EN_SHIFT		7
-
-/* PMIC_MPP_REG_AIN_CTL */
-#define PMIC_MPP_REG_AIN_ROUTE_SHIFT		0
-#define PMIC_MPP_REG_AIN_ROUTE_MASK		0x7
-
-#define PMIC_MPP_MODE_DIGITAL_INPUT		0
-#define PMIC_MPP_MODE_DIGITAL_OUTPUT		1
-#define PMIC_MPP_MODE_DIGITAL_BIDIR		2
-#define PMIC_MPP_MODE_ANALOG_BIDIR		3
-#define PMIC_MPP_MODE_ANALOG_INPUT		4
-#define PMIC_MPP_MODE_ANALOG_OUTPUT		5
-#define PMIC_MPP_MODE_CURRENT_SINK		6
-
-#define PMIC_MPP_SELECTOR_NORMAL		0
-#define PMIC_MPP_SELECTOR_PAIRED		1
-#define PMIC_MPP_SELECTOR_DTEST_FIRST		4
-
-#define PMIC_MPP_PHYSICAL_OFFSET		1
-
-/* Qualcomm specific pin configurations */
-#define PMIC_MPP_CONF_AMUX_ROUTE		(PIN_CONFIG_END + 1)
-#define PMIC_MPP_CONF_ANALOG_LEVEL		(PIN_CONFIG_END + 2)
-#define PMIC_MPP_CONF_DTEST_SELECTOR		(PIN_CONFIG_END + 3)
-#define PMIC_MPP_CONF_PAIRED			(PIN_CONFIG_END + 4)
-
-/**
- * struct pmic_mpp_pad - keep current MPP settings
- * @base: Address base in SPMI device.
- * @irq: IRQ number which this MPP generate.
- * @is_enabled: Set to false when MPP should be put in high Z state.
- * @out_value: Cached pin output value.
- * @output_enabled: Set to true if MPP output logic is enabled.
- * @input_enabled: Set to true if MPP input buffer logic is enabled.
- * @paired: Pin operates in paired mode
- * @num_sources: Number of power-sources supported by this MPP.
- * @power_source: Current power-source used.
- * @amux_input: Set the source for analog input.
- * @aout_level: Analog output level
- * @pullup: Pullup resistor value. Valid in Bidirectional mode only.
- * @function: See pmic_mpp_functions[].
- * @drive_strength: Amount of current in sink mode
- * @dtest: DTEST route selector
- */
-struct pmic_mpp_pad {
-	u16		base;
-	int		irq;
-	bool		is_enabled;
-	bool		out_value;
-	bool		output_enabled;
-	bool		input_enabled;
-	bool		paired;
-	unsigned int	num_sources;
-	unsigned int	power_source;
-	unsigned int	amux_input;
-	unsigned int	aout_level;
-	unsigned int	pullup;
-	unsigned int	function;
-	unsigned int	drive_strength;
-	unsigned int	dtest;
-};
-
-struct pmic_mpp_state {
-	struct device	*dev;
-	struct regmap	*map;
-	struct pinctrl_dev *ctrl;
-	struct gpio_chip chip;
-};
-
-static const struct pinconf_generic_params pmic_mpp_bindings[] = {
-	{"qcom,amux-route",	PMIC_MPP_CONF_AMUX_ROUTE,	0},
-	{"qcom,analog-level",	PMIC_MPP_CONF_ANALOG_LEVEL,	0},
-	{"qcom,dtest",		PMIC_MPP_CONF_DTEST_SELECTOR,	0},
-	{"qcom,paired",		PMIC_MPP_CONF_PAIRED,		0},
-};
-
-#ifdef CONFIG_DEBUG_FS
-static const struct pin_config_item pmic_conf_items[] = {
-	PCONFDUMP(PMIC_MPP_CONF_AMUX_ROUTE, "analog mux", NULL, true),
-	PCONFDUMP(PMIC_MPP_CONF_ANALOG_LEVEL, "analog level", NULL, true),
-	PCONFDUMP(PMIC_MPP_CONF_DTEST_SELECTOR, "dtest", NULL, true),
-	PCONFDUMP(PMIC_MPP_CONF_PAIRED, "paired", NULL, false),
-};
-#endif
-
-static const char *const pmic_mpp_groups[] = {
-	"mpp1", "mpp2", "mpp3", "mpp4", "mpp5", "mpp6", "mpp7", "mpp8",
-};
-
-#define PMIC_MPP_DIGITAL	0
-#define PMIC_MPP_ANALOG		1
-#define PMIC_MPP_SINK		2
-
-static const char *const pmic_mpp_functions[] = {
-	"digital", "analog", "sink"
-};
-
-static inline struct pmic_mpp_state *to_mpp_state(struct gpio_chip *chip)
-{
-	return container_of(chip, struct pmic_mpp_state, chip);
-};
-
-static int pmic_mpp_read(struct pmic_mpp_state *state,
-			 struct pmic_mpp_pad *pad, unsigned int addr)
-{
-	unsigned int val;
-	int ret;
-
-	ret = regmap_read(state->map, pad->base + addr, &val);
-	if (ret < 0)
-		dev_err(state->dev, "read 0x%x failed\n", addr);
-	else
-		ret = val;
-
-	return ret;
-}
-
-static int pmic_mpp_write(struct pmic_mpp_state *state,
-			  struct pmic_mpp_pad *pad, unsigned int addr,
-			  unsigned int val)
-{
-	int ret;
-
-	ret = regmap_write(state->map, pad->base + addr, val);
-	if (ret < 0)
-		dev_err(state->dev, "write 0x%x failed\n", addr);
-
-	return ret;
-}
-
-static int pmic_mpp_get_groups_count(struct pinctrl_dev *pctldev)
-{
-	/* Every PIN is a group */
-	return pctldev->desc->npins;
-}
-
-static const char *pmic_mpp_get_group_name(struct pinctrl_dev *pctldev,
-					   unsigned pin)
-{
-	return pctldev->desc->pins[pin].name;
-}
-
-static int pmic_mpp_get_group_pins(struct pinctrl_dev *pctldev,
-				   unsigned pin,
-				   const unsigned **pins, unsigned *num_pins)
-{
-	*pins = &pctldev->desc->pins[pin].number;
-	*num_pins = 1;
-	return 0;
-}
-
-static const struct pinctrl_ops pmic_mpp_pinctrl_ops = {
-	.get_groups_count	= pmic_mpp_get_groups_count,
-	.get_group_name		= pmic_mpp_get_group_name,
-	.get_group_pins		= pmic_mpp_get_group_pins,
-	.dt_node_to_map		= pinconf_generic_dt_node_to_map_group,
-	.dt_free_map		= pinctrl_utils_dt_free_map,
-};
-
-static int pmic_mpp_get_functions_count(struct pinctrl_dev *pctldev)
-{
-	return ARRAY_SIZE(pmic_mpp_functions);
-}
-
-static const char *pmic_mpp_get_function_name(struct pinctrl_dev *pctldev,
-					      unsigned function)
-{
-	return pmic_mpp_functions[function];
-}
-
-static int pmic_mpp_get_function_groups(struct pinctrl_dev *pctldev,
-					unsigned function,
-					const char *const **groups,
-					unsigned *const num_qgroups)
-{
-	*groups = pmic_mpp_groups;
-	*num_qgroups = pctldev->desc->npins;
-	return 0;
-}
-
-static int pmic_mpp_write_mode_ctl(struct pmic_mpp_state *state,
-				   struct pmic_mpp_pad *pad)
-{
-	unsigned int mode;
-	unsigned int sel;
-	unsigned int val;
-	unsigned int en;
-
-	switch (pad->function) {
-	case PMIC_MPP_ANALOG:
-		if (pad->input_enabled && pad->output_enabled)
-			mode = PMIC_MPP_MODE_ANALOG_BIDIR;
-		else if (pad->input_enabled)
-			mode = PMIC_MPP_MODE_ANALOG_INPUT;
-		else
-			mode = PMIC_MPP_MODE_ANALOG_OUTPUT;
-		break;
-	case PMIC_MPP_DIGITAL:
-		if (pad->input_enabled && pad->output_enabled)
-			mode = PMIC_MPP_MODE_DIGITAL_BIDIR;
-		else if (pad->input_enabled)
-			mode = PMIC_MPP_MODE_DIGITAL_INPUT;
-		else
-			mode = PMIC_MPP_MODE_DIGITAL_OUTPUT;
-		break;
-	case PMIC_MPP_SINK:
-	default:
-		mode = PMIC_MPP_MODE_CURRENT_SINK;
-		break;
-	}
-
-	if (pad->dtest)
-		sel = PMIC_MPP_SELECTOR_DTEST_FIRST + pad->dtest - 1;
-	else if (pad->paired)
-		sel = PMIC_MPP_SELECTOR_PAIRED;
-	else
-		sel = PMIC_MPP_SELECTOR_NORMAL;
-
-	en = !!pad->out_value;
-
-	val = mode << PMIC_MPP_REG_MODE_DIR_SHIFT |
-	      sel << PMIC_MPP_REG_MODE_FUNCTION_SHIFT |
-	      en;
-
-	return pmic_mpp_write(state, pad, PMIC_MPP_REG_MODE_CTL, val);
-}
-
-static int pmic_mpp_set_mux(struct pinctrl_dev *pctldev, unsigned function,
-				unsigned pin)
-{
-	struct pmic_mpp_state *state = pinctrl_dev_get_drvdata(pctldev);
-	struct pmic_mpp_pad *pad;
-	unsigned int val;
-	int ret;
-
-	pad = pctldev->desc->pins[pin].drv_data;
-
-	pad->function = function;
-
-	ret = pmic_mpp_write_mode_ctl(state, pad);
-	if (ret < 0)
-		return ret;
-
-	val = pad->is_enabled << PMIC_MPP_REG_MASTER_EN_SHIFT;
-
-	return pmic_mpp_write(state, pad, PMIC_MPP_REG_EN_CTL, val);
-}
-
-static const struct pinmux_ops pmic_mpp_pinmux_ops = {
-	.get_functions_count	= pmic_mpp_get_functions_count,
-	.get_function_name	= pmic_mpp_get_function_name,
-	.get_function_groups	= pmic_mpp_get_function_groups,
-	.set_mux		= pmic_mpp_set_mux,
-};
-
-static int pmic_mpp_config_get(struct pinctrl_dev *pctldev,
-			       unsigned int pin, unsigned long *config)
-{
-	unsigned param = pinconf_to_config_param(*config);
-	struct pmic_mpp_pad *pad;
-	unsigned arg = 0;
-
-	pad = pctldev->desc->pins[pin].drv_data;
-
-	switch (param) {
-	case PIN_CONFIG_BIAS_DISABLE:
-		if (pad->pullup != PMIC_MPP_PULL_UP_OPEN)
-			return -EINVAL;
-		arg = 1;
-		break;
-	case PIN_CONFIG_BIAS_PULL_UP:
-		switch (pad->pullup) {
-		case PMIC_MPP_PULL_UP_0P6KOHM:
-			arg = 600;
-			break;
-		case PMIC_MPP_PULL_UP_10KOHM:
-			arg = 10000;
-			break;
-		case PMIC_MPP_PULL_UP_30KOHM:
-			arg = 30000;
-			break;
-		default:
-			return -EINVAL;
-		}
-		break;
-	case PIN_CONFIG_BIAS_HIGH_IMPEDANCE:
-		if (pad->is_enabled)
-			return -EINVAL;
-		arg = 1;
-		break;
-	case PIN_CONFIG_POWER_SOURCE:
-		arg = pad->power_source;
-		break;
-	case PIN_CONFIG_INPUT_ENABLE:
-		if (!pad->input_enabled)
-			return -EINVAL;
-		arg = 1;
-		break;
-	case PIN_CONFIG_OUTPUT:
-		arg = pad->out_value;
-		break;
-	case PMIC_MPP_CONF_DTEST_SELECTOR:
-		arg = pad->dtest;
-		break;
-	case PMIC_MPP_CONF_AMUX_ROUTE:
-		arg = pad->amux_input;
-		break;
-	case PMIC_MPP_CONF_PAIRED:
-		if (!pad->paired)
-			return -EINVAL;
-		arg = 1;
-		break;
-	case PIN_CONFIG_DRIVE_STRENGTH:
-		arg = pad->drive_strength;
-		break;
-	case PMIC_MPP_CONF_ANALOG_LEVEL:
-		arg = pad->aout_level;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	/* Convert register value to pinconf value */
-	*config = pinconf_to_config_packed(param, arg);
-	return 0;
-}
-
-static int pmic_mpp_config_set(struct pinctrl_dev *pctldev, unsigned int pin,
-			       unsigned long *configs, unsigned nconfs)
-{
-	struct pmic_mpp_state *state = pinctrl_dev_get_drvdata(pctldev);
-	struct pmic_mpp_pad *pad;
-	unsigned param, arg;
-	unsigned int val;
-	int i, ret;
-
-	pad = pctldev->desc->pins[pin].drv_data;
-
-	/* Make it possible to enable the pin, by not setting high impedance */
-	pad->is_enabled = true;
-
-	for (i = 0; i < nconfs; i++) {
-		param = pinconf_to_config_param(configs[i]);
-		arg = pinconf_to_config_argument(configs[i]);
-
-		switch (param) {
-		case PIN_CONFIG_BIAS_DISABLE:
-			pad->pullup = PMIC_MPP_PULL_UP_OPEN;
-			break;
-		case PIN_CONFIG_BIAS_PULL_UP:
-			switch (arg) {
-			case 600:
-				pad->pullup = PMIC_MPP_PULL_UP_0P6KOHM;
-				break;
-			case 10000:
-				pad->pullup = PMIC_MPP_PULL_UP_10KOHM;
-				break;
-			case 30000:
-				pad->pullup = PMIC_MPP_PULL_UP_30KOHM;
-				break;
-			default:
-				return -EINVAL;
-			}
-			break;
-		case PIN_CONFIG_BIAS_HIGH_IMPEDANCE:
-			pad->is_enabled = false;
-			break;
-		case PIN_CONFIG_POWER_SOURCE:
-			if (arg >= pad->num_sources)
-				return -EINVAL;
-			pad->power_source = arg;
-			break;
-		case PIN_CONFIG_INPUT_ENABLE:
-			pad->input_enabled = arg ? true : false;
-			break;
-		case PIN_CONFIG_OUTPUT:
-			pad->output_enabled = true;
-			pad->out_value = arg;
-			break;
-		case PMIC_MPP_CONF_DTEST_SELECTOR:
-			pad->dtest = arg;
-			break;
-		case PIN_CONFIG_DRIVE_STRENGTH:
-			pad->drive_strength = arg;
-			break;
-		case PMIC_MPP_CONF_AMUX_ROUTE:
-			if (arg >= PMIC_MPP_AMUX_ROUTE_ABUS4)
-				return -EINVAL;
-			pad->amux_input = arg;
-			break;
-		case PMIC_MPP_CONF_ANALOG_LEVEL:
-			pad->aout_level = arg;
-			break;
-		case PMIC_MPP_CONF_PAIRED:
-			pad->paired = !!arg;
-			break;
-		default:
-			return -EINVAL;
-		}
-	}
-
-	val = pad->power_source << PMIC_MPP_REG_VIN_SHIFT;
-
-	ret = pmic_mpp_write(state, pad, PMIC_MPP_REG_DIG_VIN_CTL, val);
-	if (ret < 0)
-		return ret;
-
-	val = pad->pullup << PMIC_MPP_REG_PULL_SHIFT;
-
-	ret = pmic_mpp_write(state, pad, PMIC_MPP_REG_DIG_PULL_CTL, val);
-	if (ret < 0)
-		return ret;
-
-	val = pad->amux_input & PMIC_MPP_REG_AIN_ROUTE_MASK;
-
-	ret = pmic_mpp_write(state, pad, PMIC_MPP_REG_AIN_CTL, val);
-	if (ret < 0)
-		return ret;
-
-	ret = pmic_mpp_write(state, pad, PMIC_MPP_REG_AOUT_CTL, pad->aout_level);
-	if (ret < 0)
-		return ret;
-
-	ret = pmic_mpp_write_mode_ctl(state, pad);
-	if (ret < 0)
-		return ret;
-
-	ret = pmic_mpp_write(state, pad, PMIC_MPP_REG_SINK_CTL, pad->drive_strength);
-	if (ret < 0)
-		return ret;
-
-	val = pad->is_enabled << PMIC_MPP_REG_MASTER_EN_SHIFT;
-
-	return pmic_mpp_write(state, pad, PMIC_MPP_REG_EN_CTL, val);
-}
-
-static void pmic_mpp_config_dbg_show(struct pinctrl_dev *pctldev,
-				     struct seq_file *s, unsigned pin)
-{
-	struct pmic_mpp_state *state = pinctrl_dev_get_drvdata(pctldev);
-	struct pmic_mpp_pad *pad;
-	int ret;
-
-	static const char *const biases[] = {
-		"0.6kOhm", "10kOhm", "30kOhm", "Disabled"
-	};
-
-	pad = pctldev->desc->pins[pin].drv_data;
-
-	seq_printf(s, " mpp%-2d:", pin + PMIC_MPP_PHYSICAL_OFFSET);
-
-	if (!pad->is_enabled) {
-		seq_puts(s, " ---");
-	} else {
-
-		if (pad->input_enabled) {
-			ret = pmic_mpp_read(state, pad, PMIC_MPP_REG_RT_STS);
-			if (ret < 0)
-				return;
-
-			ret &= PMIC_MPP_REG_RT_STS_VAL_MASK;
-			pad->out_value = ret;
-		}
-
-		seq_printf(s, " %-4s", pad->output_enabled ? "out" : "in");
-		seq_printf(s, " %-7s", pmic_mpp_functions[pad->function]);
-		seq_printf(s, " vin-%d", pad->power_source);
-		seq_printf(s, " %d", pad->aout_level);
-		seq_printf(s, " %-8s", biases[pad->pullup]);
-		seq_printf(s, " %-4s", pad->out_value ? "high" : "low");
-		if (pad->dtest)
-			seq_printf(s, " dtest%d", pad->dtest);
-		if (pad->paired)
-			seq_puts(s, " paired");
-	}
-}
-
-static const struct pinconf_ops pmic_mpp_pinconf_ops = {
-	.is_generic = true,
-	.pin_config_group_get		= pmic_mpp_config_get,
-	.pin_config_group_set		= pmic_mpp_config_set,
-	.pin_config_group_dbg_show	= pmic_mpp_config_dbg_show,
-};
-
-static int pmic_mpp_direction_input(struct gpio_chip *chip, unsigned pin)
-{
-	struct pmic_mpp_state *state = to_mpp_state(chip);
-	unsigned long config;
-
-	config = pinconf_to_config_packed(PIN_CONFIG_INPUT_ENABLE, 1);
-
-	return pmic_mpp_config_set(state->ctrl, pin, &config, 1);
-}
-
-static int pmic_mpp_direction_output(struct gpio_chip *chip,
-				     unsigned pin, int val)
-{
-	struct pmic_mpp_state *state = to_mpp_state(chip);
-	unsigned long config;
-
-	config = pinconf_to_config_packed(PIN_CONFIG_OUTPUT, val);
-
-	return pmic_mpp_config_set(state->ctrl, pin, &config, 1);
-}
-
-static int pmic_mpp_get(struct gpio_chip *chip, unsigned pin)
-{
-	struct pmic_mpp_state *state = to_mpp_state(chip);
-	struct pmic_mpp_pad *pad;
-	int ret;
-
-	pad = state->ctrl->desc->pins[pin].drv_data;
-
-	if (pad->input_enabled) {
-		ret = pmic_mpp_read(state, pad, PMIC_MPP_REG_RT_STS);
-		if (ret < 0)
-			return ret;
-
-		pad->out_value = ret & PMIC_MPP_REG_RT_STS_VAL_MASK;
-	}
-
-	return pad->out_value;
-}
-
-static void pmic_mpp_set(struct gpio_chip *chip, unsigned pin, int value)
-{
-	struct pmic_mpp_state *state = to_mpp_state(chip);
-	unsigned long config;
-
-	config = pinconf_to_config_packed(PIN_CONFIG_OUTPUT, value);
-
-	pmic_mpp_config_set(state->ctrl, pin, &config, 1);
-}
-
-static int pmic_mpp_of_xlate(struct gpio_chip *chip,
-			     const struct of_phandle_args *gpio_desc,
-			     u32 *flags)
-{
-	if (chip->of_gpio_n_cells < 2)
-		return -EINVAL;
-
-	if (flags)
-		*flags = gpio_desc->args[1];
-
-	return gpio_desc->args[0] - PMIC_MPP_PHYSICAL_OFFSET;
-}
-
-static int pmic_mpp_to_irq(struct gpio_chip *chip, unsigned pin)
-{
-	struct pmic_mpp_state *state = to_mpp_state(chip);
-	struct pmic_mpp_pad *pad;
-
-	pad = state->ctrl->desc->pins[pin].drv_data;
-
-	return pad->irq;
-}
-
-static void pmic_mpp_dbg_show(struct seq_file *s, struct gpio_chip *chip)
-{
-	struct pmic_mpp_state *state = to_mpp_state(chip);
-	unsigned i;
-
-	for (i = 0; i < chip->ngpio; i++) {
-		pmic_mpp_config_dbg_show(state->ctrl, s, i);
-		seq_puts(s, "\n");
-	}
-}
-
-static const struct gpio_chip pmic_mpp_gpio_template = {
-	.direction_input	= pmic_mpp_direction_input,
-	.direction_output	= pmic_mpp_direction_output,
-	.get			= pmic_mpp_get,
-	.set			= pmic_mpp_set,
-	.request		= gpiochip_generic_request,
-	.free			= gpiochip_generic_free,
-	.of_xlate		= pmic_mpp_of_xlate,
-	.to_irq			= pmic_mpp_to_irq,
-	.dbg_show		= pmic_mpp_dbg_show,
-};
-
-static int pmic_mpp_populate(struct pmic_mpp_state *state,
-			     struct pmic_mpp_pad *pad)
-{
-	int type, subtype, val, dir;
-	unsigned int sel;
-
-	type = pmic_mpp_read(state, pad, PMIC_MPP_REG_TYPE);
-	if (type < 0)
-		return type;
-
-	if (type != PMIC_MPP_TYPE) {
-		dev_err(state->dev, "incorrect block type 0x%x at 0x%x\n",
-			type, pad->base);
-		return -ENODEV;
-	}
-
-	subtype = pmic_mpp_read(state, pad, PMIC_MPP_REG_SUBTYPE);
-	if (subtype < 0)
-		return subtype;
-
-	switch (subtype) {
-	case PMIC_MPP_SUBTYPE_4CH_NO_ANA_OUT:
-	case PMIC_MPP_SUBTYPE_ULT_4CH_NO_ANA_OUT:
-	case PMIC_MPP_SUBTYPE_4CH_NO_SINK:
-	case PMIC_MPP_SUBTYPE_ULT_4CH_NO_SINK:
-	case PMIC_MPP_SUBTYPE_4CH_FULL_FUNC:
-		pad->num_sources = 4;
-		break;
-	case PMIC_MPP_SUBTYPE_8CH_FULL_FUNC:
-		pad->num_sources = 8;
-		break;
-	default:
-		dev_err(state->dev, "unknown MPP type 0x%x at 0x%x\n",
-			subtype, pad->base);
-		return -ENODEV;
-	}
-
-	val = pmic_mpp_read(state, pad, PMIC_MPP_REG_MODE_CTL);
-	if (val < 0)
-		return val;
-
-	pad->out_value = val & PMIC_MPP_REG_MODE_VALUE_MASK;
-
-	dir = val >> PMIC_MPP_REG_MODE_DIR_SHIFT;
-	dir &= PMIC_MPP_REG_MODE_DIR_MASK;
-
-	switch (dir) {
-	case PMIC_MPP_MODE_DIGITAL_INPUT:
-		pad->input_enabled = true;
-		pad->output_enabled = false;
-		pad->function = PMIC_MPP_DIGITAL;
-		break;
-	case PMIC_MPP_MODE_DIGITAL_OUTPUT:
-		pad->input_enabled = false;
-		pad->output_enabled = true;
-		pad->function = PMIC_MPP_DIGITAL;
-		break;
-	case PMIC_MPP_MODE_DIGITAL_BIDIR:
-		pad->input_enabled = true;
-		pad->output_enabled = true;
-		pad->function = PMIC_MPP_DIGITAL;
-		break;
-	case PMIC_MPP_MODE_ANALOG_BIDIR:
-		pad->input_enabled = true;
-		pad->output_enabled = true;
-		pad->function = PMIC_MPP_ANALOG;
-		break;
-	case PMIC_MPP_MODE_ANALOG_INPUT:
-		pad->input_enabled = true;
-		pad->output_enabled = false;
-		pad->function = PMIC_MPP_ANALOG;
-		break;
-	case PMIC_MPP_MODE_ANALOG_OUTPUT:
-		pad->input_enabled = false;
-		pad->output_enabled = true;
-		pad->function = PMIC_MPP_ANALOG;
-		break;
-	case PMIC_MPP_MODE_CURRENT_SINK:
-		pad->input_enabled = false;
-		pad->output_enabled = true;
-		pad->function = PMIC_MPP_SINK;
-		break;
-	default:
-		dev_err(state->dev, "unknown MPP direction\n");
-		return -ENODEV;
-	}
-
-	sel = val >> PMIC_MPP_REG_MODE_FUNCTION_SHIFT;
-	sel &= PMIC_MPP_REG_MODE_FUNCTION_MASK;
-
-	if (sel >= PMIC_MPP_SELECTOR_DTEST_FIRST)
-		pad->dtest = sel + 1;
-	else if (sel == PMIC_MPP_SELECTOR_PAIRED)
-		pad->paired = true;
-
-	val = pmic_mpp_read(state, pad, PMIC_MPP_REG_DIG_VIN_CTL);
-	if (val < 0)
-		return val;
-
-	pad->power_source = val >> PMIC_MPP_REG_VIN_SHIFT;
-	pad->power_source &= PMIC_MPP_REG_VIN_MASK;
-
-	val = pmic_mpp_read(state, pad, PMIC_MPP_REG_DIG_PULL_CTL);
-	if (val < 0)
-		return val;
-
-	pad->pullup = val >> PMIC_MPP_REG_PULL_SHIFT;
-	pad->pullup &= PMIC_MPP_REG_PULL_MASK;
-
-	val = pmic_mpp_read(state, pad, PMIC_MPP_REG_AIN_CTL);
-	if (val < 0)
-		return val;
-
-	pad->amux_input = val >> PMIC_MPP_REG_AIN_ROUTE_SHIFT;
-	pad->amux_input &= PMIC_MPP_REG_AIN_ROUTE_MASK;
-
-	val = pmic_mpp_read(state, pad, PMIC_MPP_REG_SINK_CTL);
-	if (val < 0)
-		return val;
-
-	pad->drive_strength = val;
-
-	val = pmic_mpp_read(state, pad, PMIC_MPP_REG_AOUT_CTL);
-	if (val < 0)
-		return val;
-
-	pad->aout_level = val;
-
-	val = pmic_mpp_read(state, pad, PMIC_MPP_REG_EN_CTL);
-	if (val < 0)
-		return val;
-
-	pad->is_enabled = !!val;
-
-	return 0;
-}
-
-static int pmic_mpp_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct pinctrl_pin_desc *pindesc;
-	struct pinctrl_desc *pctrldesc;
-	struct pmic_mpp_pad *pad, *pads;
-	struct pmic_mpp_state *state;
-	int ret, npins, i;
-	u32 res[2];
-
-	ret = of_property_read_u32_array(dev->of_node, "reg", res, 2);
-	if (ret < 0) {
-		dev_err(dev, "missing base address and/or range");
-		return ret;
-	}
-
-	npins = res[1] / PMIC_MPP_ADDRESS_RANGE;
-	if (!npins)
-		return -EINVAL;
-
-	BUG_ON(npins > ARRAY_SIZE(pmic_mpp_groups));
-
-	state = devm_kzalloc(dev, sizeof(*state), GFP_KERNEL);
-	if (!state)
-		return -ENOMEM;
-
-	platform_set_drvdata(pdev, state);
-
-	state->dev = &pdev->dev;
-	state->map = dev_get_regmap(dev->parent, NULL);
-
-	pindesc = devm_kcalloc(dev, npins, sizeof(*pindesc), GFP_KERNEL);
-	if (!pindesc)
-		return -ENOMEM;
-
-	pads = devm_kcalloc(dev, npins, sizeof(*pads), GFP_KERNEL);
-	if (!pads)
-		return -ENOMEM;
-
-	pctrldesc = devm_kzalloc(dev, sizeof(*pctrldesc), GFP_KERNEL);
-	if (!pctrldesc)
-		return -ENOMEM;
-
-	pctrldesc->pctlops = &pmic_mpp_pinctrl_ops;
-	pctrldesc->pmxops = &pmic_mpp_pinmux_ops;
-	pctrldesc->confops = &pmic_mpp_pinconf_ops;
-	pctrldesc->owner = THIS_MODULE;
-	pctrldesc->name = dev_name(dev);
-	pctrldesc->pins = pindesc;
-	pctrldesc->npins = npins;
-
-	pctrldesc->num_custom_params = ARRAY_SIZE(pmic_mpp_bindings);
-	pctrldesc->custom_params = pmic_mpp_bindings;
-#ifdef CONFIG_DEBUG_FS
-	pctrldesc->custom_conf_items = pmic_conf_items;
-#endif
-
-	for (i = 0; i < npins; i++, pindesc++) {
-		pad = &pads[i];
-		pindesc->drv_data = pad;
-		pindesc->number = i;
-		pindesc->name = pmic_mpp_groups[i];
-
-		pad->irq = platform_get_irq(pdev, i);
-		if (pad->irq < 0)
-			return pad->irq;
-
-		pad->base = res[0] + i * PMIC_MPP_ADDRESS_RANGE;
-
-		ret = pmic_mpp_populate(state, pad);
-		if (ret < 0)
-			return ret;
-	}
-
-	state->chip = pmic_mpp_gpio_template;
-	state->chip.dev = dev;
-	state->chip.base = -1;
-	state->chip.ngpio = npins;
-	state->chip.label = dev_name(dev);
-	state->chip.of_gpio_n_cells = 2;
-	state->chip.can_sleep = false;
-
-	state->ctrl = pinctrl_register(pctrldesc, dev, state);
-	if (IS_ERR(state->ctrl))
-		return PTR_ERR(state->ctrl);
-
-	ret = gpiochip_add(&state->chip);
-	if (ret) {
-		dev_err(state->dev, "can't add gpio chip\n");
-		goto err_chip;
-	}
-
-	ret = gpiochip_add_pin_range(&state->chip, dev_name(dev), 0, 0, npins);
-	if (ret) {
-		dev_err(dev, "failed to add pin range\n");
-		goto err_range;
-	}
-
-	return 0;
-
-err_range:
-	gpiochip_remove(&state->chip);
-err_chip:
-	pinctrl_unregister(state->ctrl);
-	return ret;
-}
-
-static int pmic_mpp_remove(struct platform_device *pdev)
-{
-	struct pmic_mpp_state *state = platform_get_drvdata(pdev);
-
-	gpiochip_remove(&state->chip);
-	pinctrl_unregister(state->ctrl);
-	return 0;
-}
-
-static const struct of_device_id pmic_mpp_of_match[] = {
-	{ .compatible = "qcom,pm8841-mpp" },	/* 4 MPP's */
-	{ .compatible = "qcom,pm8916-mpp" },	/* 4 MPP's */
-	{ .compatible = "qcom,pm8941-mpp" },	/* 8 MPP's */
-	{ .compatible = "qcom,pma8084-mpp" },	/* 8 MPP's */
-	{ },
-};
-
-MODULE_DEVICE_TABLE(of, pmic_mpp_of_match);
-
-static struct platform_driver pmic_mpp_driver = {
-	.driver = {
-		   .name = "qcom-spmi-mpp",
-		   .of_match_table = pmic_mpp_of_match,
-	},
-	.probe	= pmic_mpp_probe,
-	.remove = pmic_mpp_remove,
-};
-
-module_platform_driver(pmic_mpp_driver);
-
-MODULE_AUTHOR("Ivan T. Ivanov <iivanov@mm-sol.com>");
-MODULE_DESCRIPTION("Qualcomm SPMI PMIC MPP pin control driver");
-MODULE_ALIAS("platform:qcom-spmi-mpp");
-MODULE_LICENSE("GPL v2");
+RITY__TLP_PREFIX_BLOCKED_ERR_SEVERITY_MASK 0x2000000
+#define D3F5_PCIE_UNCORR_ERR_SEVERITY__TLP_PREFIX_BLOCKED_ERR_SEVERITY__SHIFT 0x19
+#define D3F5_PCIE_CORR_ERR_STATUS__RCV_ERR_STATUS_MASK 0x1
+#define D3F5_PCIE_CORR_ERR_STATUS__RCV_ERR_STATUS__SHIFT 0x0
+#define D3F5_PCIE_CORR_ERR_STATUS__BAD_TLP_STATUS_MASK 0x40
+#define D3F5_PCIE_CORR_ERR_STATUS__BAD_TLP_STATUS__SHIFT 0x6
+#define D3F5_PCIE_CORR_ERR_STATUS__BAD_DLLP_STATUS_MASK 0x80
+#define D3F5_PCIE_CORR_ERR_STATUS__BAD_DLLP_STATUS__SHIFT 0x7
+#define D3F5_PCIE_CORR_ERR_STATUS__REPLAY_NUM_ROLLOVER_STATUS_MASK 0x100
+#define D3F5_PCIE_CORR_ERR_STATUS__REPLAY_NUM_ROLLOVER_STATUS__SHIFT 0x8
+#define D3F5_PCIE_CORR_ERR_STATUS__REPLAY_TIMER_TIMEOUT_STATUS_MASK 0x1000
+#define D3F5_PCIE_CORR_ERR_STATUS__REPLAY_TIMER_TIMEOUT_STATUS__SHIFT 0xc
+#define D3F5_PCIE_CORR_ERR_STATUS__ADVISORY_NONFATAL_ERR_STATUS_MASK 0x2000
+#define D3F5_PCIE_CORR_ERR_STATUS__ADVISORY_NONFATAL_ERR_STATUS__SHIFT 0xd
+#define D3F5_PCIE_CORR_ERR_STATUS__CORR_INT_ERR_STATUS_MASK 0x4000
+#define D3F5_PCIE_CORR_ERR_STATUS__CORR_INT_ERR_STATUS__SHIFT 0xe
+#define D3F5_PCIE_CORR_ERR_STATUS__HDR_LOG_OVFL_STATUS_MASK 0x8000
+#define D3F5_PCIE_CORR_ERR_STATUS__HDR_LOG_OVFL_STATUS__SHIFT 0xf
+#define D3F5_PCIE_CORR_ERR_MASK__RCV_ERR_MASK_MASK 0x1
+#define D3F5_PCIE_CORR_ERR_MASK__RCV_ERR_MASK__SHIFT 0x0
+#define D3F5_PCIE_CORR_ERR_MASK__BAD_TLP_MASK_MASK 0x40
+#define D3F5_PCIE_CORR_ERR_MASK__BAD_TLP_MASK__SHIFT 0x6
+#define D3F5_PCIE_CORR_ERR_MASK__BAD_DLLP_MASK_MASK 0x80
+#define D3F5_PCIE_CORR_ERR_MASK__BAD_DLLP_MASK__SHIFT 0x7
+#define D3F5_PCIE_CORR_ERR_MASK__REPLAY_NUM_ROLLOVER_MASK_MASK 0x100
+#define D3F5_PCIE_CORR_ERR_MASK__REPLAY_NUM_ROLLOVER_MASK__SHIFT 0x8
+#define D3F5_PCIE_CORR_ERR_MASK__REPLAY_TIMER_TIMEOUT_MASK_MASK 0x1000
+#define D3F5_PCIE_CORR_ERR_MASK__REPLAY_TIMER_TIMEOUT_MASK__SHIFT 0xc
+#define D3F5_PCIE_CORR_ERR_MASK__ADVISORY_NONFATAL_ERR_MASK_MASK 0x2000
+#define D3F5_PCIE_CORR_ERR_MASK__ADVISORY_NONFATAL_ERR_MASK__SHIFT 0xd
+#define D3F5_PCIE_CORR_ERR_MASK__CORR_INT_ERR_MASK_MASK 0x4000
+#define D3F5_PCIE_CORR_ERR_MASK__CORR_INT_ERR_MASK__SHIFT 0xe
+#define D3F5_PCIE_CORR_ERR_MASK__HDR_LOG_OVFL_MASK_MASK 0x8000
+#define D3F5_PCIE_CORR_ERR_MASK__HDR_LOG_OVFL_MASK__SHIFT 0xf
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__FIRST_ERR_PTR_MASK 0x1f
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__FIRST_ERR_PTR__SHIFT 0x0
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_CAP_MASK 0x20
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_CAP__SHIFT 0x5
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_EN_MASK 0x40
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_EN__SHIFT 0x6
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_CAP_MASK 0x80
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_CAP__SHIFT 0x7
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_EN_MASK 0x100
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_EN__SHIFT 0x8
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_CAP_MASK 0x200
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_CAP__SHIFT 0x9
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_EN_MASK 0x400
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_EN__SHIFT 0xa
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__TLP_PREFIX_LOG_PRESENT_MASK 0x800
+#define D3F5_PCIE_ADV_ERR_CAP_CNTL__TLP_PREFIX_LOG_PRESENT__SHIFT 0xb
+#define D3F5_PCIE_HDR_LOG0__TLP_HDR_MASK 0xffffffff
+#define D3F5_PCIE_HDR_LOG0__TLP_HDR__SHIFT 0x0
+#define D3F5_PCIE_HDR_LOG1__TLP_HDR_MASK 0xffffffff
+#define D3F5_PCIE_HDR_LOG1__TLP_HDR__SHIFT 0x0
+#define D3F5_PCIE_HDR_LOG2__TLP_HDR_MASK 0xffffffff
+#define D3F5_PCIE_HDR_LOG2__TLP_HDR__SHIFT 0x0
+#define D3F5_PCIE_HDR_LOG3__TLP_HDR_MASK 0xffffffff
+#define D3F5_PCIE_HDR_LOG3__TLP_HDR__SHIFT 0x0
+#define D3F5_PCIE_ROOT_ERR_CMD__CORR_ERR_REP_EN_MASK 0x1
+#define D3F5_PCIE_ROOT_ERR_CMD__CORR_ERR_REP_EN__SHIFT 0x0
+#define D3F5_PCIE_ROOT_ERR_CMD__NONFATAL_ERR_REP_EN_MASK 0x2
+#define D3F5_PCIE_ROOT_ERR_CMD__NONFATAL_ERR_REP_EN__SHIFT 0x1
+#define D3F5_PCIE_ROOT_ERR_CMD__FATAL_ERR_REP_EN_MASK 0x4
+#define D3F5_PCIE_ROOT_ERR_CMD__FATAL_ERR_REP_EN__SHIFT 0x2
+#define D3F5_PCIE_ROOT_ERR_STATUS__ERR_CORR_RCVD_MASK 0x1
+#define D3F5_PCIE_ROOT_ERR_STATUS__ERR_CORR_RCVD__SHIFT 0x0
+#define D3F5_PCIE_ROOT_ERR_STATUS__MULT_ERR_CORR_RCVD_MASK 0x2
+#define D3F5_PCIE_ROOT_ERR_STATUS__MULT_ERR_CORR_RCVD__SHIFT 0x1
+#define D3F5_PCIE_ROOT_ERR_STATUS__ERR_FATAL_NONFATAL_RCVD_MASK 0x4
+#define D3F5_PCIE_ROOT_ERR_STATUS__ERR_FATAL_NONFATAL_RCVD__SHIFT 0x2
+#define D3F5_PCIE_ROOT_ERR_STATUS__MULT_ERR_FATAL_NONFATAL_RCVD_MASK 0x8
+#define D3F5_PCIE_ROOT_ERR_STATUS__MULT_ERR_FATAL_NONFATAL_RCVD__SHIFT 0x3
+#define D3F5_PCIE_ROOT_ERR_STATUS__FIRST_UNCORRECTABLE_FATAL_MASK 0x10
+#define D3F5_PCIE_ROOT_ERR_STATUS__FIRST_UNCORRECTABLE_FATAL__SHIFT 0x4
+#define D3F5_PCIE_ROOT_ERR_STATUS__NONFATAL_ERROR_MSG_RCVD_MASK 0x20
+#define D3F5_PCIE_ROOT_ERR_STATUS__NONFATAL_ERROR_MSG_RCVD__SHIFT 0x5
+#define D3F5_PCIE_ROOT_ERR_STATUS__FATAL_ERROR_MSG_RCVD_MASK 0x40
+#define D3F5_PCIE_ROOT_ERR_STATUS__FATAL_ERROR_MSG_RCVD__SHIFT 0x6
+#define D3F5_PCIE_ROOT_ERR_STATUS__ADV_ERR_INT_MSG_NUM_MASK 0xf8000000
+#define D3F5_PCIE_ROOT_ERR_STATUS__ADV_ERR_INT_MSG_NUM__SHIFT 0x1b
+#define D3F5_PCIE_ERR_SRC_ID__ERR_CORR_SRC_ID_MASK 0xffff
+#define D3F5_PCIE_ERR_SRC_ID__ERR_CORR_SRC_ID__SHIFT 0x0
+#define D3F5_PCIE_ERR_SRC_ID__ERR_FATAL_NONFATAL_SRC_ID_MASK 0xffff0000
+#define D3F5_PCIE_ERR_SRC_ID__ERR_FATAL_NONFATAL_SRC_ID__SHIFT 0x10
+#define D3F5_PCIE_TLP_PREFIX_LOG0__TLP_PREFIX_MASK 0xffffffff
+#define D3F5_PCIE_TLP_PREFIX_LOG0__TLP_PREFIX__SHIFT 0x0
+#define D3F5_PCIE_TLP_PREFIX_LOG1__TLP_PREFIX_MASK 0xffffffff
+#define D3F5_PCIE_TLP_PREFIX_LOG1__TLP_PREFIX__SHIFT 0x0
+#define D3F5_PCIE_TLP_PREFIX_LOG2__TLP_PREFIX_MASK 0xffffffff
+#define D3F5_PCIE_TLP_PREFIX_LOG2__TLP_PREFIX__SHIFT 0x0
+#define D3F5_PCIE_TLP_PREFIX_LOG3__TLP_PREFIX_MASK 0xffffffff
+#define D3F5_PCIE_TLP_PREFIX_LOG3__TLP_PREFIX__SHIFT 0x0
+#define D3F5_PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F5_PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F5_PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F5_PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F5_PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F5_PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F5_PCIE_LINK_CNTL3__PERFORM_EQUALIZATION_MASK 0x1
+#define D3F5_PCIE_LINK_CNTL3__PERFORM_EQUALIZATION__SHIFT 0x0
+#define D3F5_PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN_MASK 0x2
+#define D3F5_PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN__SHIFT 0x1
+#define D3F5_PCIE_LINK_CNTL3__RESERVED_MASK 0xfffffffc
+#define D3F5_PCIE_LINK_CNTL3__RESERVED__SHIFT 0x2
+#define D3F5_PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS_MASK 0xffff
+#define D3F5_PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS__SHIFT 0x0
+#define D3F5_PCIE_LANE_ERROR_STATUS__RESERVED_MASK 0xffff0000
+#define D3F5_PCIE_LANE_ERROR_STATUS__RESERVED__SHIFT 0x10
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D3F5_PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D3F5_PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D3F5_PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D3F5_PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D3F5_PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D3F5_PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D3F5_PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D3F5_PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D3F5_PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D3F5_PCIE_LANE_9_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D3F5_PCIE_LANE_10_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D3F5_PCIE_LANE_11_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D3F5_PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D3F5_PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D3F5_PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D3F5_PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D3F5_PCIE_ACS_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F5_PCIE_ACS_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F5_PCIE_ACS_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F5_PCIE_ACS_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F5_PCIE_ACS_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F5_PCIE_ACS_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F5_PCIE_ACS_CAP__SOURCE_VALIDATION_MASK 0x1
+#define D3F5_PCIE_ACS_CAP__SOURCE_VALIDATION__SHIFT 0x0
+#define D3F5_PCIE_ACS_CAP__TRANSLATION_BLOCKING_MASK 0x2
+#define D3F5_PCIE_ACS_CAP__TRANSLATION_BLOCKING__SHIFT 0x1
+#define D3F5_PCIE_ACS_CAP__P2P_REQUEST_REDIRECT_MASK 0x4
+#define D3F5_PCIE_ACS_CAP__P2P_REQUEST_REDIRECT__SHIFT 0x2
+#define D3F5_PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT_MASK 0x8
+#define D3F5_PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT__SHIFT 0x3
+#define D3F5_PCIE_ACS_CAP__UPSTREAM_FORWARDING_MASK 0x10
+#define D3F5_PCIE_ACS_CAP__UPSTREAM_FORWARDING__SHIFT 0x4
+#define D3F5_PCIE_ACS_CAP__P2P_EGRESS_CONTROL_MASK 0x20
+#define D3F5_PCIE_ACS_CAP__P2P_EGRESS_CONTROL__SHIFT 0x5
+#define D3F5_PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P_MASK 0x40
+#define D3F5_PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P__SHIFT 0x6
+#define D3F5_PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE_MASK 0xff00
+#define D3F5_PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE__SHIFT 0x8
+#define D3F5_PCIE_ACS_CNTL__SOURCE_VALIDATION_EN_MASK 0x10000
+#define D3F5_PCIE_ACS_CNTL__SOURCE_VALIDATION_EN__SHIFT 0x10
+#define D3F5_PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN_MASK 0x20000
+#define D3F5_PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN__SHIFT 0x11
+#define D3F5_PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN_MASK 0x40000
+#define D3F5_PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN__SHIFT 0x12
+#define D3F5_PCIE_ACS_CNTL__P2P_COMPLETION_REDIRECT_EN_MASK 0x80000
+#define D3F5_PCIE_ACS_CNTL__P2P_COMPLETION_REDIRECT_EN__SHIFT 0x13
+#define D3F5_PCIE_ACS_CNTL__UPSTREAM_FORWARDING_EN_MASK 0x100000
+#define D3F5_PCIE_ACS_CNTL__UPSTREAM_FORWARDING_EN__SHIFT 0x14
+#define D3F5_PCIE_ACS_CNTL__P2P_EGRESS_CONTROL_EN_MASK 0x200000
+#define D3F5_PCIE_ACS_CNTL__P2P_EGRESS_CONTROL_EN__SHIFT 0x15
+#define D3F5_PCIE_ACS_CNTL__DIRECT_TRANSLATED_P2P_EN_MASK 0x400000
+#define D3F5_PCIE_ACS_CNTL__DIRECT_TRANSLATED_P2P_EN__SHIFT 0x16
+#define D3F5_PCIE_MC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F5_PCIE_MC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F5_PCIE_MC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F5_PCIE_MC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F5_PCIE_MC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F5_PCIE_MC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F5_PCIE_MC_CAP__MC_MAX_GROUP_MASK 0x3f
+#define D3F5_PCIE_MC_CAP__MC_MAX_GROUP__SHIFT 0x0
+#define D3F5_PCIE_MC_CAP__MC_ECRC_REGEN_SUPP_MASK 0x8000
+#define D3F5_PCIE_MC_CAP__MC_ECRC_REGEN_SUPP__SHIFT 0xf
+#define D3F5_PCIE_MC_CNTL__MC_NUM_GROUP_MASK 0x3f0000
+#define D3F5_PCIE_MC_CNTL__MC_NUM_GROUP__SHIFT 0x10
+#define D3F5_PCIE_MC_CNTL__MC_ENABLE_MASK 0x80000000
+#define D3F5_PCIE_MC_CNTL__MC_ENABLE__SHIFT 0x1f
+#define D3F5_PCIE_MC_ADDR0__MC_INDEX_POS_MASK 0x3f
+#define D3F5_PCIE_MC_ADDR0__MC_INDEX_POS__SHIFT 0x0
+#define D3F5_PCIE_MC_ADDR0__MC_BASE_ADDR_0_MASK 0xfffff000
+#define D3F5_PCIE_MC_ADDR0__MC_BASE_ADDR_0__SHIFT 0xc
+#define D3F5_PCIE_MC_ADDR1__MC_BASE_ADDR_1_MASK 0xffffffff
+#define D3F5_PCIE_MC_ADDR1__MC_BASE_ADDR_1__SHIFT 0x0
+#define D3F5_PCIE_MC_RCV0__MC_RECEIVE_0_MASK 0xffffffff
+#define D3F5_PCIE_MC_RCV0__MC_RECEIVE_0__SHIFT 0x0
+#define D3F5_PCIE_MC_RCV1__MC_RECEIVE_1_MASK 0xffffffff
+#define D3F5_PCIE_MC_RCV1__MC_RECEIVE_1__SHIFT 0x0
+#define D3F5_PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0_MASK 0xffffffff
+#define D3F5_PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0__SHIFT 0x0
+#define D3F5_PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1_MASK 0xffffffff
+#define D3F5_PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1__SHIFT 0x0
+#define D3F5_PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0_MASK 0xffffffff
+#define D3F5_PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0__SHIFT 0x0
+#define D3F5_PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1_MASK 0xffffffff
+#define D3F5_PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1__SHIFT 0x0
+#define D3F5_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_SIZE_MASK 0x3f
+#define D3F5_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_SIZE__SHIFT 0x0
+#define D3F5_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_BAR_0_MASK 0xffffffc0
+#define D3F5_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_BAR_0__SHIFT 0x6
+#define D3F5_PCIE_MC_OVERLAY_BAR1__MC_OVERLAY_BAR_1_MASK 0xffffffff
+#define D3F5_PCIE_MC_OVERLAY_BAR1__MC_OVERLAY_BAR_1__SHIF

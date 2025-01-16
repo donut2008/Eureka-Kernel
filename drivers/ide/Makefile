@@ -1,115 +1,129 @@
-#
-# link order is important here
-#
+_start, iop_chan, len);
+		iop_desc_set_dest_addr(grp_start, iop_chan, dma_dest);
+		sw_desc->async_tx.flags = flags;
+		while (src_cnt--)
+			iop_desc_set_xor_src_addr(grp_start, src_cnt,
+						  dma_src[src_cnt]);
+	}
+	spin_unlock_bh(&iop_chan->lock);
 
-ccflags-y				:= -Idrivers/ide
+	return sw_desc ? &sw_desc->async_tx : NULL;
+}
 
-ide-core-y += ide.o ide-ioctls.o ide-io.o ide-iops.o ide-lib.o ide-probe.o \
-	      ide-taskfile.o ide-pm.o ide-park.o ide-sysfs.o ide-devsets.o \
-	      ide-io-std.o ide-eh.o
+static struct dma_async_tx_descriptor *
+iop_adma_prep_dma_xor_val(struct dma_chan *chan, dma_addr_t *dma_src,
+			  unsigned int src_cnt, size_t len, u32 *result,
+			  unsigned long flags)
+{
+	struct iop_adma_chan *iop_chan = to_iop_adma_chan(chan);
+	struct iop_adma_desc_slot *sw_desc, *grp_start;
+	int slot_cnt, slots_per_op;
 
-# core IDE code
-ide-core-$(CONFIG_IDE_XFER_MODE)	+= ide-pio-blacklist.o ide-xfer-mode.o
-ide-core-$(CONFIG_IDE_TIMINGS)		+= ide-timings.o
-ide-core-$(CONFIG_IDE_ATAPI)		+= ide-atapi.o
-ide-core-$(CONFIG_BLK_DEV_IDEPCI)	+= setup-pci.o
-ide-core-$(CONFIG_BLK_DEV_IDEDMA)	+= ide-dma.o
-ide-core-$(CONFIG_BLK_DEV_IDEDMA_SFF)	+= ide-dma-sff.o
-ide-core-$(CONFIG_IDE_PROC_FS)		+= ide-proc.o
-ide-core-$(CONFIG_BLK_DEV_IDEACPI)	+= ide-acpi.o
-ide-core-$(CONFIG_IDE_LEGACY)		+= ide-legacy.o
+	if (unlikely(!len))
+		return NULL;
 
-obj-$(CONFIG_IDE)			+= ide-core.o
+	dev_dbg(iop_chan->device->common.dev, "%s src_cnt: %d len: %zu\n",
+		__func__, src_cnt, len);
 
-obj-$(CONFIG_BLK_DEV_ALI14XX)		+= ali14xx.o
-obj-$(CONFIG_BLK_DEV_UMC8672)		+= umc8672.o
-obj-$(CONFIG_BLK_DEV_DTC2278)		+= dtc2278.o
-obj-$(CONFIG_BLK_DEV_HT6560B)		+= ht6560b.o
-obj-$(CONFIG_BLK_DEV_QD65XX)		+= qd65xx.o
-obj-$(CONFIG_BLK_DEV_4DRIVES)		+= ide-4drives.o
+	spin_lock_bh(&iop_chan->lock);
+	slot_cnt = iop_chan_zero_sum_slot_count(len, src_cnt, &slots_per_op);
+	sw_desc = iop_adma_alloc_slots(iop_chan, slot_cnt, slots_per_op);
+	if (sw_desc) {
+		grp_start = sw_desc->group_head;
+		iop_desc_init_zero_sum(grp_start, src_cnt, flags);
+		iop_desc_set_zero_sum_byte_count(grp_start, len);
+		grp_start->xor_check_result = result;
+		pr_debug("\t%s: grp_start->xor_check_result: %p\n",
+			__func__, grp_start->xor_check_result);
+		sw_desc->async_tx.flags = flags;
+		while (src_cnt--)
+			iop_desc_set_zero_sum_src_addr(grp_start, src_cnt,
+						       dma_src[src_cnt]);
+	}
+	spin_unlock_bh(&iop_chan->lock);
 
-obj-$(CONFIG_BLK_DEV_GAYLE)		+= gayle.o
-obj-$(CONFIG_BLK_DEV_FALCON_IDE)	+= falconide.o
-obj-$(CONFIG_BLK_DEV_MAC_IDE)		+= macide.o
-obj-$(CONFIG_BLK_DEV_Q40IDE)		+= q40ide.o
-obj-$(CONFIG_BLK_DEV_BUDDHA)		+= buddha.o
+	return sw_desc ? &sw_desc->async_tx : NULL;
+}
 
-obj-$(CONFIG_BLK_DEV_AEC62XX)		+= aec62xx.o
-obj-$(CONFIG_BLK_DEV_ALI15X3)		+= alim15x3.o
-obj-$(CONFIG_BLK_DEV_AMD74XX)		+= amd74xx.o
-obj-$(CONFIG_BLK_DEV_ATIIXP)		+= atiixp.o
-obj-$(CONFIG_BLK_DEV_CMD64X)		+= cmd64x.o
-obj-$(CONFIG_BLK_DEV_CS5520)		+= cs5520.o
-obj-$(CONFIG_BLK_DEV_CS5530)		+= cs5530.o
-obj-$(CONFIG_BLK_DEV_CS5535)		+= cs5535.o
-obj-$(CONFIG_BLK_DEV_CS5536)		+= cs5536.o
-obj-$(CONFIG_BLK_DEV_SC1200)		+= sc1200.o
-obj-$(CONFIG_BLK_DEV_CY82C693)		+= cy82c693.o
-obj-$(CONFIG_BLK_DEV_DELKIN)		+= delkin_cb.o
-obj-$(CONFIG_BLK_DEV_HPT366)		+= hpt366.o
-obj-$(CONFIG_BLK_DEV_IT8172)		+= it8172.o
-obj-$(CONFIG_BLK_DEV_IT8213)		+= it8213.o
-obj-$(CONFIG_BLK_DEV_IT821X)		+= it821x.o
-obj-$(CONFIG_BLK_DEV_JMICRON)		+= jmicron.o
-obj-$(CONFIG_BLK_DEV_NS87415)		+= ns87415.o
-obj-$(CONFIG_BLK_DEV_OPTI621)		+= opti621.o
-obj-$(CONFIG_BLK_DEV_PDC202XX_OLD)	+= pdc202xx_old.o
-obj-$(CONFIG_BLK_DEV_PDC202XX_NEW)	+= pdc202xx_new.o
-obj-$(CONFIG_BLK_DEV_PIIX)		+= piix.o
-obj-$(CONFIG_BLK_DEV_RZ1000)		+= rz1000.o
-obj-$(CONFIG_BLK_DEV_SVWKS)		+= serverworks.o
-obj-$(CONFIG_BLK_DEV_SGIIOC4)		+= sgiioc4.o
-obj-$(CONFIG_BLK_DEV_SIIMAGE)		+= siimage.o
-obj-$(CONFIG_BLK_DEV_SIS5513)		+= sis5513.o
-obj-$(CONFIG_BLK_DEV_SL82C105)		+= sl82c105.o
-obj-$(CONFIG_BLK_DEV_SLC90E66)		+= slc90e66.o
-obj-$(CONFIG_BLK_DEV_TC86C001)		+= tc86c001.o
-obj-$(CONFIG_BLK_DEV_TRIFLEX)		+= triflex.o
-obj-$(CONFIG_BLK_DEV_TRM290)		+= trm290.o
-obj-$(CONFIG_BLK_DEV_VIA82CXXX)		+= via82cxxx.o
+static struct dma_async_tx_descriptor *
+iop_adma_prep_dma_pq(struct dma_chan *chan, dma_addr_t *dst, dma_addr_t *src,
+		     unsigned int src_cnt, const unsigned char *scf, size_t len,
+		     unsigned long flags)
+{
+	struct iop_adma_chan *iop_chan = to_iop_adma_chan(chan);
+	struct iop_adma_desc_slot *sw_desc, *g;
+	int slot_cnt, slots_per_op;
+	int continue_srcs;
 
-# Must appear at the end of the block
-obj-$(CONFIG_BLK_DEV_GENERIC)		+= ide-pci-generic.o
+	if (unlikely(!len))
+		return NULL;
+	BUG_ON(len > IOP_ADMA_XOR_MAX_BYTE_COUNT);
 
-obj-$(CONFIG_IDEPCI_PCIBUS_ORDER)	+= ide-scan-pci.o
+	dev_dbg(iop_chan->device->common.dev,
+		"%s src_cnt: %d len: %zu flags: %lx\n",
+		__func__, src_cnt, len, flags);
 
-obj-$(CONFIG_BLK_DEV_CMD640)		+= cmd640.o
+	if (dmaf_p_disabled_continue(flags))
+		continue_srcs = 1+src_cnt;
+	else if (dmaf_continue(flags))
+		continue_srcs = 3+src_cnt;
+	else
+		continue_srcs = 0+src_cnt;
 
-obj-$(CONFIG_BLK_DEV_IDE_PMAC)		+= pmac.o
+	spin_lock_bh(&iop_chan->lock);
+	slot_cnt = iop_chan_pq_slot_count(len, continue_srcs, &slots_per_op);
+	sw_desc = iop_adma_alloc_slots(iop_chan, slot_cnt, slots_per_op);
+	if (sw_desc) {
+		int i;
 
-obj-$(CONFIG_IDE_GENERIC)		+= ide-generic.o
-obj-$(CONFIG_BLK_DEV_IDEPNP)		+= ide-pnp.o
+		g = sw_desc->group_head;
+		iop_desc_set_byte_count(g, iop_chan, len);
 
-ide-gd_mod-y += ide-gd.o
-ide-cd_mod-y += ide-cd.o ide-cd_ioctl.o ide-cd_verbose.o
+		/* even if P is disabled its destination address (bits
+		 * [3:0]) must match Q.  It is ok if P points to an
+		 * invalid address, it won't be written.
+		 */
+		if (flags & DMA_PREP_PQ_DISABLE_P)
+			dst[0] = dst[1] & 0x7;
 
-ifeq ($(CONFIG_IDE_GD_ATA), y)
-	ide-gd_mod-y += ide-disk.o ide-disk_ioctl.o
-ifeq ($(CONFIG_IDE_PROC_FS), y)
-	ide-gd_mod-y += ide-disk_proc.o
-endif
-endif
+		iop_desc_set_pq_addr(g, dst);
+		sw_desc->async_tx.flags = flags;
+		for (i = 0; i < src_cnt; i++)
+			iop_desc_set_pq_src_addr(g, i, src[i], scf[i]);
 
-ifeq ($(CONFIG_IDE_GD_ATAPI), y)
-	ide-gd_mod-y += ide-floppy.o ide-floppy_ioctl.o
-ifeq ($(CONFIG_IDE_PROC_FS), y)
-	ide-gd_mod-y += ide-floppy_proc.o
-endif
-endif
+		/* if we are continuing a previous operation factor in
+		 * the old p and q values, see the comment for dma_maxpq
+		 * in include/linux/dmaengine.h
+		 */
+		if (dmaf_p_disabled_continue(flags))
+			iop_desc_set_pq_src_addr(g, i++, dst[1], 1);
+		else if (dmaf_continue(flags)) {
+			iop_desc_set_pq_src_addr(g, i++, dst[0], 0);
+			iop_desc_set_pq_src_addr(g, i++, dst[1], 1);
+			iop_desc_set_pq_src_addr(g, i++, dst[1], 0);
+		}
+		iop_desc_init_pq(g, i, flags);
+	}
+	spin_unlock_bh(&iop_chan->lock);
 
-obj-$(CONFIG_IDE_GD)			+= ide-gd_mod.o
-obj-$(CONFIG_BLK_DEV_IDECD)		+= ide-cd_mod.o
-obj-$(CONFIG_BLK_DEV_IDETAPE)		+= ide-tape.o
+	return sw_desc ? &sw_desc->async_tx : NULL;
+}
 
-obj-$(CONFIG_BLK_DEV_IDECS)		+= ide-cs.o
+static struct dma_async_tx_descriptor *
+iop_adma_prep_dma_pq_val(struct dma_chan *chan, dma_addr_t *pq, dma_addr_t *src,
+			 unsigned int src_cnt, const unsigned char *scf,
+			 size_t len, enum sum_check_flags *pqres,
+			 unsigned long flags)
+{
+	struct iop_adma_chan *iop_chan = to_iop_adma_chan(chan);
+	struct iop_adma_desc_slot *sw_desc, *g;
+	int slot_cnt, slots_per_op;
 
-obj-$(CONFIG_BLK_DEV_PLATFORM)		+= ide_platform.o
+	if (unlikely(!len))
+		return NULL;
+	BUG_ON(len > IOP_ADMA_XOR_MAX_BYTE_COUNT);
 
-obj-$(CONFIG_BLK_DEV_IDE_ICSIDE)	+= icside.o
-obj-$(CONFIG_BLK_DEV_IDE_RAPIDE)	+= rapide.o
-obj-$(CONFIG_BLK_DEV_PALMCHIP_BK3710)	+= palm_bk3710.o
+	dev_dbg(iop_chan->device->common.dev, "%s src_cnt: %d len: %zu\n",
+		__func__, src_cnt, len);
 
-obj-$(CONFIG_BLK_DEV_IDE_AU1XXX)	+= au1xxx-ide.o
-
-obj-$(CONFIG_BLK_DEV_IDE_TX4938)	+= tx4938ide.o
-obj-$(CONFIG_BLK_DEV_IDE_TX4939)	+= tx4939ide.o
+	spin_lock_b

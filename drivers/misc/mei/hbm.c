@@ -1,1244 +1,919 @@
-/*
+ = cmd->body.type - SVGA3D_SHADERTYPE_MIN;
+
+	vmw_binding_add(ctx_node->staged_bindings, &binding.bi,
+			binding.shader_slot, 0);
+out_unref:
+	if (res)
+		vmw_resource_unreference(&res);
+
+	return ret;
+}
+
+/**
+ * vmw_cmd_dx_set_vertex_buffers - Validates an
+ * SVGA_3D_CMD_DX_SET_VERTEX_BUFFERS command
  *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
  */
-
-#include <linux/export.h>
-#include <linux/sched.h>
-#include <linux/wait.h>
-#include <linux/pm_runtime.h>
-#include <linux/slab.h>
-
-#include <linux/mei.h>
-
-#include "mei_dev.h"
-#include "hbm.h"
-#include "client.h"
-
-static const char *mei_hbm_status_str(enum mei_hbm_status status)
+static int vmw_cmd_dx_set_vertex_buffers(struct vmw_private *dev_priv,
+					 struct vmw_sw_context *sw_context,
+					 SVGA3dCmdHeader *header)
 {
-#define MEI_HBM_STATUS(status) case MEI_HBMS_##status: return #status
-	switch (status) {
-	MEI_HBM_STATUS(SUCCESS);
-	MEI_HBM_STATUS(CLIENT_NOT_FOUND);
-	MEI_HBM_STATUS(ALREADY_EXISTS);
-	MEI_HBM_STATUS(REJECTED);
-	MEI_HBM_STATUS(INVALID_PARAMETER);
-	MEI_HBM_STATUS(NOT_ALLOWED);
-	MEI_HBM_STATUS(ALREADY_STARTED);
-	MEI_HBM_STATUS(NOT_STARTED);
-	default: return "unknown";
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct vmw_ctx_bindinfo_vb binding;
+	struct vmw_resource_val_node *res_node;
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXSetVertexBuffers body;
+		SVGA3dVertexBuffer buf[];
+	} *cmd;
+	int i, ret, num;
+
+	if (unlikely(ctx_node == NULL)) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
 	}
-#undef MEI_HBM_STATUS
+
+	cmd = container_of(header, typeof(*cmd), header);
+	num = (cmd->header.size - sizeof(cmd->body)) /
+		sizeof(SVGA3dVertexBuffer);
+	if ((u64)num + (u64)cmd->body.startBuffer >
+	    (u64)SVGA3D_DX_MAX_VERTEXBUFFERS) {
+		DRM_ERROR("Invalid number of vertex buffers.\n");
+		return -EINVAL;
+	}
+
+	for (i = 0; i < num; i++) {
+		ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+					user_surface_converter,
+					&cmd->buf[i].sid, &res_node);
+		if (unlikely(ret != 0))
+			return ret;
+
+		binding.bi.ctx = ctx_node->res;
+		binding.bi.bt = vmw_ctx_binding_vb;
+		binding.bi.res = ((res_node) ? res_node->res : NULL);
+		binding.offset = cmd->buf[i].offset;
+		binding.stride = cmd->buf[i].stride;
+		binding.slot = i + cmd->body.startBuffer;
+
+		vmw_binding_add(ctx_node->staged_bindings, &binding.bi,
+				0, binding.slot);
+	}
+
+	return 0;
+}
+
+/**
+ * vmw_cmd_dx_ia_set_vertex_buffers - Validate an
+ * SVGA_3D_CMD_DX_IA_SET_VERTEX_BUFFERS command.
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_set_index_buffer(struct vmw_private *dev_priv,
+				       struct vmw_sw_context *sw_context,
+				       SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct vmw_ctx_bindinfo_ib binding;
+	struct vmw_resource_val_node *res_node;
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXSetIndexBuffer body;
+	} *cmd;
+	int ret;
+
+	if (unlikely(ctx_node == NULL)) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	cmd = container_of(header, typeof(*cmd), header);
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				user_surface_converter,
+				&cmd->body.sid, &res_node);
+	if (unlikely(ret != 0))
+		return ret;
+
+	binding.bi.ctx = ctx_node->res;
+	binding.bi.res = ((res_node) ? res_node->res : NULL);
+	binding.bi.bt = vmw_ctx_binding_ib;
+	binding.offset = cmd->body.offset;
+	binding.format = cmd->body.format;
+
+	vmw_binding_add(ctx_node->staged_bindings, &binding.bi, 0, 0);
+
+	return 0;
+}
+
+/**
+ * vmw_cmd_dx_set_rendertarget - Validate an
+ * SVGA_3D_CMD_DX_SET_RENDERTARGETS command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_set_rendertargets(struct vmw_private *dev_priv,
+					struct vmw_sw_context *sw_context,
+					SVGA3dCmdHeader *header)
+{
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXSetRenderTargets body;
+	} *cmd = container_of(header, typeof(*cmd), header);
+	int ret;
+	u32 num_rt_view = (cmd->header.size - sizeof(cmd->body)) /
+		sizeof(SVGA3dRenderTargetViewId);
+
+	if (num_rt_view > SVGA3D_MAX_SIMULTANEOUS_RENDER_TARGETS) {
+		DRM_ERROR("Invalid DX Rendertarget binding.\n");
+		return -EINVAL;
+	}
+
+	ret = vmw_view_bindings_add(sw_context, vmw_view_ds,
+				    vmw_ctx_binding_ds, 0,
+				    &cmd->body.depthStencilViewId, 1, 0);
+	if (ret)
+		return ret;
+
+	return vmw_view_bindings_add(sw_context, vmw_view_rt,
+				     vmw_ctx_binding_dx_rt, 0,
+				     (void *)&cmd[1], num_rt_view, 0);
+}
+
+/**
+ * vmw_cmd_dx_clear_rendertarget_view - Validate an
+ * SVGA_3D_CMD_DX_CLEAR_RENDERTARGET_VIEW command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_clear_rendertarget_view(struct vmw_private *dev_priv,
+					      struct vmw_sw_context *sw_context,
+					      SVGA3dCmdHeader *header)
+{
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXClearRenderTargetView body;
+	} *cmd = container_of(header, typeof(*cmd), header);
+
+	return vmw_view_id_val_add(sw_context, vmw_view_rt,
+				   cmd->body.renderTargetViewId);
+}
+
+/**
+ * vmw_cmd_dx_clear_rendertarget_view - Validate an
+ * SVGA_3D_CMD_DX_CLEAR_DEPTHSTENCIL_VIEW command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_clear_depthstencil_view(struct vmw_private *dev_priv,
+					      struct vmw_sw_context *sw_context,
+					      SVGA3dCmdHeader *header)
+{
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXClearDepthStencilView body;
+	} *cmd = container_of(header, typeof(*cmd), header);
+
+	return vmw_view_id_val_add(sw_context, vmw_view_ds,
+				   cmd->body.depthStencilViewId);
+}
+
+static int vmw_cmd_dx_view_define(struct vmw_private *dev_priv,
+				  struct vmw_sw_context *sw_context,
+				  SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct vmw_resource_val_node *srf_node;
+	struct vmw_resource *res;
+	enum vmw_view_type view_type;
+	int ret;
+	/*
+	 * This is based on the fact that all affected define commands have
+	 * the same initial command body layout.
+	 */
+	struct {
+		SVGA3dCmdHeader header;
+		uint32 defined_id;
+		uint32 sid;
+	} *cmd;
+
+	if (unlikely(ctx_node == NULL)) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	view_type = vmw_view_cmd_to_type(header->id);
+	if (view_type == vmw_view_max)
+		return -EINVAL;
+	cmd = container_of(header, typeof(*cmd), header);
+	if (unlikely(cmd->sid == SVGA3D_INVALID_ID)) {
+		DRM_ERROR("Invalid surface id.\n");
+		return -EINVAL;
+	}
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				user_surface_converter,
+				&cmd->sid, &srf_node);
+	if (unlikely(ret != 0))
+		return ret;
+
+	res = vmw_context_cotable(ctx_node->res, vmw_view_cotables[view_type]);
+	ret = vmw_cotable_notify(res, cmd->defined_id);
+	vmw_resource_unreference(&res);
+	if (unlikely(ret != 0))
+		return ret;
+
+	return vmw_view_add(sw_context->man,
+			    ctx_node->res,
+			    srf_node->res,
+			    view_type,
+			    cmd->defined_id,
+			    header,
+			    header->size + sizeof(*header),
+			    &sw_context->staged_cmd_res);
+}
+
+/**
+ * vmw_cmd_dx_set_so_targets - Validate an
+ * SVGA_3D_CMD_DX_SET_SOTARGETS command.
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_set_so_targets(struct vmw_private *dev_priv,
+				     struct vmw_sw_context *sw_context,
+				     SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct vmw_ctx_bindinfo_so binding;
+	struct vmw_resource_val_node *res_node;
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXSetSOTargets body;
+		SVGA3dSoTarget targets[];
+	} *cmd;
+	int i, ret, num;
+
+	if (unlikely(ctx_node == NULL)) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	cmd = container_of(header, typeof(*cmd), header);
+	num = (cmd->header.size - sizeof(cmd->body)) /
+		sizeof(SVGA3dSoTarget);
+
+	if (num > SVGA3D_DX_MAX_SOTARGETS) {
+		DRM_ERROR("Invalid DX SO binding.\n");
+		return -EINVAL;
+	}
+
+	for (i = 0; i < num; i++) {
+		ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+					user_surface_converter,
+					&cmd->targets[i].sid, &res_node);
+		if (unlikely(ret != 0))
+			return ret;
+
+		binding.bi.ctx = ctx_node->res;
+		binding.bi.res = ((res_node) ? res_node->res : NULL);
+		binding.bi.bt = vmw_ctx_binding_so,
+		binding.offset = cmd->targets[i].offset;
+		binding.size = cmd->targets[i].sizeInBytes;
+		binding.slot = i;
+
+		vmw_binding_add(ctx_node->staged_bindings, &binding.bi,
+				0, binding.slot);
+	}
+
+	return 0;
+}
+
+static int vmw_cmd_dx_so_define(struct vmw_private *dev_priv,
+				struct vmw_sw_context *sw_context,
+				SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct vmw_resource *res;
+	/*
+	 * This is based on the fact that all affected define commands have
+	 * the same initial command body layout.
+	 */
+	struct {
+		SVGA3dCmdHeader header;
+		uint32 defined_id;
+	} *cmd;
+	enum vmw_so_type so_type;
+	int ret;
+
+	if (unlikely(ctx_node == NULL)) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	so_type = vmw_so_cmd_to_type(header->id);
+	res = vmw_context_cotable(ctx_node->res, vmw_so_cotables[so_type]);
+	cmd = container_of(header, typeof(*cmd), header);
+	ret = vmw_cotable_notify(res, cmd->defined_id);
+	vmw_resource_unreference(&res);
+
+	return ret;
+}
+
+/**
+ * vmw_cmd_dx_check_subresource - Validate an
+ * SVGA_3D_CMD_DX_[X]_SUBRESOURCE command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_check_subresource(struct vmw_private *dev_priv,
+					struct vmw_sw_context *sw_context,
+					SVGA3dCmdHeader *header)
+{
+	struct {
+		SVGA3dCmdHeader header;
+		union {
+			SVGA3dCmdDXReadbackSubResource r_body;
+			SVGA3dCmdDXInvalidateSubResource i_body;
+			SVGA3dCmdDXUpdateSubResource u_body;
+			SVGA3dSurfaceId sid;
+		};
+	} *cmd;
+
+	BUILD_BUG_ON(offsetof(typeof(*cmd), r_body.sid) !=
+		     offsetof(typeof(*cmd), sid));
+	BUILD_BUG_ON(offsetof(typeof(*cmd), i_body.sid) !=
+		     offsetof(typeof(*cmd), sid));
+	BUILD_BUG_ON(offsetof(typeof(*cmd), u_body.sid) !=
+		     offsetof(typeof(*cmd), sid));
+
+	cmd = container_of(header, typeof(*cmd), header);
+
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->sid, NULL);
+}
+
+static int vmw_cmd_dx_cid_check(struct vmw_private *dev_priv,
+				struct vmw_sw_context *sw_context,
+				SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+
+	if (unlikely(ctx_node == NULL)) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * vmw_cmd_dx_view_remove - validate a view remove command and
+ * schedule the view resource for removal.
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ *
+ * Check that the view exists, and if it was not created using this
+ * command batch, make sure it's validated (present in the device) so that
+ * the remove command will not confuse the device.
+ */
+static int vmw_cmd_dx_view_remove(struct vmw_private *dev_priv,
+				  struct vmw_sw_context *sw_context,
+				  SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct {
+		SVGA3dCmdHeader header;
+		union vmw_view_destroy body;
+	} *cmd = container_of(header, typeof(*cmd), header);
+	enum vmw_view_type view_type = vmw_view_cmd_to_type(header->id);
+	struct vmw_resource *view;
+	int ret;
+
+	if (!ctx_node) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	ret = vmw_view_remove(sw_context->man,
+			      cmd->body.view_id, view_type,
+			      &sw_context->staged_cmd_res,
+			      &view);
+	if (ret || !view)
+		return ret;
+
+	/*
+	 * Add view to the validate list iff it was not created using this
+	 * command batch.
+	 */
+	return vmw_view_res_val_add(sw_context, view);
+}
+
+/**
+ * vmw_cmd_dx_define_shader - Validate an SVGA_3D_CMD_DX_DEFINE_SHADER
+ * command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_define_shader(struct vmw_private *dev_priv,
+				    struct vmw_sw_context *sw_context,
+				    SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct vmw_resource *res;
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXDefineShader body;
+	} *cmd = container_of(header, typeof(*cmd), header);
+	int ret;
+
+	if (!ctx_node) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	res = vmw_context_cotable(ctx_node->res, SVGA_COTABLE_DXSHADER);
+	ret = vmw_cotable_notify(res, cmd->body.shaderId);
+	vmw_resource_unreference(&res);
+	if (ret)
+		return ret;
+
+	return vmw_dx_shader_add(sw_context->man, ctx_node->res,
+				 cmd->body.shaderId, cmd->body.type,
+				 &sw_context->staged_cmd_res);
+}
+
+/**
+ * vmw_cmd_dx_destroy_shader - Validate an SVGA_3D_CMD_DX_DESTROY_SHADER
+ * command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_destroy_shader(struct vmw_private *dev_priv,
+				     struct vmw_sw_context *sw_context,
+				     SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXDestroyShader body;
+	} *cmd = container_of(header, typeof(*cmd), header);
+	int ret;
+
+	if (!ctx_node) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	ret = vmw_shader_remove(sw_context->man, cmd->body.shaderId, 0,
+				&sw_context->staged_cmd_res);
+	if (ret)
+		DRM_ERROR("Could not find shader to remove.\n");
+
+	return ret;
+}
+
+/**
+ * vmw_cmd_dx_bind_shader - Validate an SVGA_3D_CMD_DX_BIND_SHADER
+ * command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_dx_bind_shader(struct vmw_private *dev_priv,
+				  struct vmw_sw_context *sw_context,
+				  SVGA3dCmdHeader *header)
+{
+	struct vmw_resource_val_node *ctx_node;
+	struct vmw_resource_val_node *res_node;
+	struct vmw_resource *res;
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXBindShader body;
+	} *cmd = container_of(header, typeof(*cmd), header);
+	int ret;
+
+	if (cmd->body.cid != SVGA3D_INVALID_ID) {
+		ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+					user_context_converter,
+					&cmd->body.cid, &ctx_node);
+		if (ret)
+			return ret;
+	} else {
+		ctx_node = sw_context->dx_ctx_node;
+		if (!ctx_node) {
+			DRM_ERROR("DX Context not set.\n");
+			return -EINVAL;
+		}
+	}
+
+	res = vmw_shader_lookup(vmw_context_res_man(ctx_node->res),
+				cmd->body.shid, 0);
+	if (IS_ERR(res)) {
+		DRM_ERROR("Could not find shader to bind.\n");
+		return PTR_ERR(res);
+	}
+
+	ret = vmw_resource_val_add(sw_context, res, &res_node);
+	if (ret) {
+		DRM_ERROR("Error creating resource validation node.\n");
+		goto out_unref;
+	}
+
+
+	ret = vmw_cmd_res_switch_backup(dev_priv, sw_context, res_node,
+					&cmd->body.mobid,
+					cmd->body.offsetInBytes);
+out_unref:
+	vmw_resource_unreference(&res);
+
+	return ret;
+}
+
+static int vmw_cmd_check_not_3d(struct vmw_private *dev_priv,
+				struct vmw_sw_context *sw_context,
+				void *buf, uint32_t *size)
+{
+	uint32_t size_remaining = *size;
+	uint32_t cmd_id;
+
+	cmd_id = ((uint32_t *)buf)[0];
+	switch (cmd_id) {
+	case SVGA_CMD_UPDATE:
+		*size = sizeof(uint32_t) + sizeof(SVGAFifoCmdUpdate);
+		break;
+	case SVGA_CMD_DEFINE_GMRFB:
+		*size = sizeof(uint32_t) + sizeof(SVGAFifoCmdDefineGMRFB);
+		break;
+	case SVGA_CMD_BLIT_GMRFB_TO_SCREEN:
+		*size = sizeof(uint32_t) + sizeof(SVGAFifoCmdBlitGMRFBToScreen);
+		break;
+	case SVGA_CMD_BLIT_SCREEN_TO_GMRFB:
+		*size = sizeof(uint32_t) + sizeof(SVGAFifoCmdBlitGMRFBToScreen);
+		break;
+	default:
+		DRM_ERROR("Unsupported SVGA command: %u.\n", cmd_id);
+		return -EINVAL;
+	}
+
+	if (*size > size_remaining) {
+		DRM_ERROR("Invalid SVGA command (size mismatch):"
+			  " %u.\n", cmd_id);
+		return -EINVAL;
+	}
+
+	if (unlikely(!sw_context->kernel)) {
+		DRM_ERROR("Kernel only SVGA command: %u.\n", cmd_id);
+		return -EPERM;
+	}
+
+	if (cmd_id == SVGA_CMD_DEFINE_GMRFB)
+		return vmw_cmd_check_define_gmrfb(dev_priv, sw_context, buf);
+
+	return 0;
+}
+
+static const struct vmw_cmd_entry vmw_cmd_entries[SVGA_3D_CMD_MAX] = {
+	VMW_CMD_DEF(SVGA_3D_CMD_SURFACE_DEFINE, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SURFACE_DESTROY, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SURFACE_COPY, &vmw_cmd_surface_copy_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SURFACE_STRETCHBLT, &vmw_cmd_stretch_blt_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SURFACE_DMA, &vmw_cmd_dma,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_CONTEXT_DEFINE, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_CONTEXT_DESTROY, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETTRANSFORM, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETZRANGE, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETRENDERSTATE, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETRENDERTARGET,
+		    &vmw_cmd_set_render_target_check, true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETTEXTURESTATE, &vmw_cmd_tex_state,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETMATERIAL, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETLIGHTDATA, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETLIGHTENABLED, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETVIEWPORT, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETCLIPPLANE, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_CLEAR, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_PRESENT, &vmw_cmd_present_check,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SHADER_DEFINE, &vmw_cmd_shader_define,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SHADER_DESTROY, &vmw_cmd_shader_destroy,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SET_SHADER, &vmw_cmd_set_shader,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SET_SHADER_CONST, &vmw_cmd_set_shader_const,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_DRAW_PRIMITIVES, &vmw_cmd_draw,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SETSCISSORRECT, &vmw_cmd_cid_check,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_BEGIN_QUERY, &vmw_cmd_begin_query,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_END_QUERY, &vmw_cmd_end_query,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_WAIT_FOR_QUERY, &vmw_cmd_wait_query,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_PRESENT_READBACK, &vmw_cmd_ok,
+		    true, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_BLIT_SURFACE_TO_SCREEN,
+		    &vmw_cmd_blt_surf_screen_check, false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SURFACE_DEFINE_V2, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_GENERATE_MIPMAPS, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_ACTIVATE_SURFACE, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_DEACTIVATE_SURFACE, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SCREEN_DMA, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SET_UNITY_SURFACE_COOKIE, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_OPEN_CONTEXT_SURFACE, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_LOGICOPS_BITBLT, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_LOGICOPS_TRANSBLT, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_LOGICOPS_STRETCHBLT, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_LOGICOPS_COLORFILL, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_LOGICOPS_ALPHABLEND, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_LOGICOPS_CLEARTYPEBLEND, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_SET_OTABLE_BASE, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_READBACK_OTABLE, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DEFINE_GB_MOB, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DESTROY_GB_MOB, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_REDEFINE_GB_MOB64, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_UPDATE_GB_MOB_MAPPING, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DEFINE_GB_SURFACE, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DESTROY_GB_SURFACE, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_BIND_GB_SURFACE, &vmw_cmd_bind_gb_surface,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_COND_BIND_GB_SURFACE, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_UPDATE_GB_IMAGE, &vmw_cmd_update_gb_image,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_UPDATE_GB_SURFACE,
+		    &vmw_cmd_update_gb_surface, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_READBACK_GB_IMAGE,
+		    &vmw_cmd_readback_gb_image, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_READBACK_GB_SURFACE,
+		    &vmw_cmd_readback_gb_surface, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_INVALIDATE_GB_IMAGE,
+		    &vmw_cmd_invalidate_gb_image, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_INVALIDATE_GB_SURFACE,
+		    &vmw_cmd_invalidate_gb_surface, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DEFINE_GB_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DESTROY_GB_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_BIND_GB_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_READBACK_GB_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_INVALIDATE_GB_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DEFINE_GB_SHADER, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_BIND_GB_SHADER, &vmw_cmd_bind_gb_shader,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DESTROY_GB_SHADER, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_SET_OTABLE_BASE64, &vmw_cmd_invalid,
+		    false, false, false),
+	VMW_CMD_DEF(SVGA_3D_CMD_BEGIN_GB_QUERY, &vmw_cmd_begin_gb_query,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_END_GB_QUERY, &vmw_cmd_end_gb_query,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_WAIT_FOR_GB_QUERY, &vmw_cmd_wait_gb_query,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_NOP, &vmw_cmd_ok,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_ENABLE_GART, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DISABLE_GART, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_MAP_MOB_INTO_GART, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_UNMAP_GART_RANGE, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DEFINE_GB_SCREENTARGET, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DESTROY_GB_SCREENTARGET, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_BIND_GB_SCREENTARGET, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_UPDATE_GB_SCREENTARGET, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_READBACK_GB_IMAGE_PARTIAL, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_INVALIDATE_GB_IMAGE_PARTIAL, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_SET_GB_SHADERCONSTS_INLINE, &vmw_cmd_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_GB_SCREEN_DMA, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_BIND_GB_SURFACE_WITH_PITCH, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_GB_MOB_FENCE, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DEFINE_GB_SURFACE_V2, &vmw_cmd_invalid,
+		    false, false, true),
+
+	/*
+	 * DX commands
+	 */
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_BIND_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_READBACK_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_INVALIDATE_CONTEXT, &vmw_cmd_invalid,
+		    false, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_SINGLE_CONSTANT_BUFFER,
+		    &vmw_cmd_dx_set_single_constant_buffer, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_SHADER_RESOURCES,
+		    &vmw_cmd_dx_set_shader_res, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_SHADER, &vmw_cmd_dx_set_shader,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_SAMPLERS, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DRAW, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DRAW_INDEXED, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DRAW_INSTANCED, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DRAW_INDEXED_INSTANCED,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DRAW_AUTO, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_VERTEX_BUFFERS,
+		    &vmw_cmd_dx_set_vertex_buffers, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_INDEX_BUFFER,
+		    &vmw_cmd_dx_set_index_buffer, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_RENDERTARGETS,
+		    &vmw_cmd_dx_set_rendertargets, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_BLEND_STATE, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_DEPTHSTENCIL_STATE,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_RASTERIZER_STATE,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_QUERY, &vmw_cmd_dx_define_query,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_QUERY, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_BIND_QUERY, &vmw_cmd_dx_bind_query,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_QUERY_OFFSET,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_BEGIN_QUERY, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_END_QUERY, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_READBACK_QUERY, &vmw_cmd_invalid,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_PREDICATION, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_VIEWPORTS, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_SCISSORRECTS, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_CLEAR_RENDERTARGET_VIEW,
+		    &vmw_cmd_dx_clear_rendertarget_view, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_CLEAR_DEPTHSTENCIL_VIEW,
+		    &vmw_cmd_dx_clear_depthstencil_view, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_PRED_COPY, &vmw_cmd_invalid,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_GENMIPS, &vmw_cmd_invalid,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_UPDATE_SUBRESOURCE,
+		    &vmw_cmd_dx_check_subresource, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_READBACK_SUBRESOURCE,
+		    &vmw_cmd_dx_check_subresource, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_INVALIDATE_SUBRESOURCE,
+		    &vmw_cmd_dx_check_subresource, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_SHADERRESOURCE_VIEW,
+		    &vmw_cmd_dx_view_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_SHADERRESOURCE_VIEW,
+		    &vmw_cmd_dx_view_remove, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_RENDERTARGET_VIEW,
+		    &vmw_cmd_dx_view_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_RENDERTARGET_VIEW,
+		    &vmw_cmd_dx_view_remove, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_DEPTHSTENCIL_VIEW,
+		    &vmw_cmd_dx_view_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_DEPTHSTENCIL_VIEW,
+		    &vmw_cmd_dx_view_remove, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_ELEMENTLAYOUT,
+		    &vmw_cmd_dx_so_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_ELEMENTLAYOUT,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_BLEND_STATE,
+		    &vmw_cmd_dx_so_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_BLEND_STATE,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_DEPTHSTENCIL_STATE,
+		    &vmw_cmd_dx_so_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_DEPTHSTENCIL_STATE,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_RASTERIZER_STATE,
+		    &vmw_cmd_dx_so_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_RASTERIZER_STATE,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_SAMPLER_STATE,
+		    &vmw_cmd_dx_so_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_SAMPLER_STATE,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_SHADER,
+		    &vmw_cmd_dx_define_shader, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_SHADER,
+		    &vmw_cmd_dx_destroy_shader, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_BIND_SHADER,
+		    &vmw_cmd_dx_bind_shader, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DEFINE_STREAMOUTPUT,
+		    &vmw_cmd_dx_so_define, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_DESTROY_STREAMOUTPUT,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_STREAMOUTPUT, &vmw_cmd_dx_cid_check,
+		    true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_SOTARGETS,
+		    &vmw_cmd_dx_set_so_targets, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_INPUT_LAYOUT,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_SET_TOPOLOGY,
+		    &vmw_cmd_dx_cid_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_BUFFER_COPY,
+		    &vmw_cmd_buffer_copy_check, true, false, true),
+	VMW_CMD_DEF(SVGA_3D_CMD_DX_PRED_COPY_REGION,
+		    &vmw_cmd_pred_copy_check, true, false, true),
 };
 
-static const char *mei_cl_conn_status_str(enum mei_cl_connect_status status)
+static int vmw_cmd_check(struct vmw_private *dev_priv,
+			 struct vmw_sw_context *sw_context,
+			 void *buf, uint32_t *size)
 {
-#define MEI_CL_CS(status) case MEI_CL_CONN_##status: return #status
-	switch (status) {
-	MEI_CL_CS(SUCCESS);
-	MEI_CL_CS(NOT_FOUND);
-	MEI_CL_CS(ALREADY_STARTED);
-	MEI_CL_CS(OUT_OF_RESOURCES);
-	MEI_CL_CS(MESSAGE_SMALL);
-	MEI_CL_CS(NOT_ALLOWED);
-	default: return "unknown";
-	}
-#undef MEI_CL_CCS
-}
-
-const char *mei_hbm_state_str(enum mei_hbm_state state)
-{
-#define MEI_HBM_STATE(state) case MEI_HBM_##state: return #state
-	switch (state) {
-	MEI_HBM_STATE(IDLE);
-	MEI_HBM_STATE(STARTING);
-	MEI_HBM_STATE(STARTED);
-	MEI_HBM_STATE(ENUM_CLIENTS);
-	MEI_HBM_STATE(CLIENT_PROPERTIES);
-	MEI_HBM_STATE(STOPPED);
-	default:
-		return "unknown";
-	}
-#undef MEI_HBM_STATE
-}
-
-/**
- * mei_cl_conn_status_to_errno - convert client connect response
- * status to error code
- *
- * @status: client connect response status
- *
- * Return: corresponding error code
- */
-static int mei_cl_conn_status_to_errno(enum mei_cl_connect_status status)
-{
-	switch (status) {
-	case MEI_CL_CONN_SUCCESS:          return 0;
-	case MEI_CL_CONN_NOT_FOUND:        return -ENOTTY;
-	case MEI_CL_CONN_ALREADY_STARTED:  return -EBUSY;
-	case MEI_CL_CONN_OUT_OF_RESOURCES: return -EBUSY;
-	case MEI_CL_CONN_MESSAGE_SMALL:    return -EINVAL;
-	case MEI_CL_CONN_NOT_ALLOWED:      return -EBUSY;
-	default:                           return -EINVAL;
-	}
-}
-
-/**
- * mei_hbm_idle - set hbm to idle state
- *
- * @dev: the device structure
- */
-void mei_hbm_idle(struct mei_device *dev)
-{
-	dev->init_clients_timer = 0;
-	dev->hbm_state = MEI_HBM_IDLE;
-}
-
-/**
- * mei_hbm_reset - reset hbm counters and book keeping data structurs
- *
- * @dev: the device structure
- */
-void mei_hbm_reset(struct mei_device *dev)
-{
-	dev->me_client_index = 0;
-
-	mei_me_cl_rm_all(dev);
-
-	mei_hbm_idle(dev);
-}
-
-/**
- * mei_hbm_hdr - construct hbm header
- *
- * @hdr: hbm header
- * @length: payload length
- */
-
-static inline void mei_hbm_hdr(struct mei_msg_hdr *hdr, size_t length)
-{
-	hdr->host_addr = 0;
-	hdr->me_addr = 0;
-	hdr->length = length;
-	hdr->msg_complete = 1;
-	hdr->reserved = 0;
-}
-
-/**
- * mei_hbm_cl_hdr - construct client hbm header
- *
- * @cl: client
- * @hbm_cmd: host bus message command
- * @buf: buffer for cl header
- * @len: buffer length
- */
-static inline
-void mei_hbm_cl_hdr(struct mei_cl *cl, u8 hbm_cmd, void *buf, size_t len)
-{
-	struct mei_hbm_cl_cmd *cmd = buf;
-
-	memset(cmd, 0, len);
-
-	cmd->hbm_cmd = hbm_cmd;
-	cmd->host_addr = mei_cl_host_addr(cl);
-	cmd->me_addr = mei_cl_me_id(cl);
-}
-
-/**
- * mei_hbm_cl_write - write simple hbm client message
- *
- * @dev: the device structure
- * @cl: client
- * @hbm_cmd: host bus message command
- * @len: buffer length
- *
- * Return: 0 on success, <0 on failure.
- */
-static inline
-int mei_hbm_cl_write(struct mei_device *dev,
-		     struct mei_cl *cl, u8 hbm_cmd, size_t len)
-{
-	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
-
-	mei_hbm_hdr(mei_hdr, len);
-	mei_hbm_cl_hdr(cl, hbm_cmd, dev->wr_msg.data, len);
-
-	return mei_write_message(dev, mei_hdr, dev->wr_msg.data);
-}
-
-/**
- * mei_hbm_cl_addr_equal - check if the client's and
- *	the message address match
- *
- * @cl: client
- * @cmd: hbm client message
- *
- * Return: true if addresses are the same
- */
-static inline
-bool mei_hbm_cl_addr_equal(struct mei_cl *cl, struct mei_hbm_cl_cmd *cmd)
-{
-	return  mei_cl_host_addr(cl) == cmd->host_addr &&
-		mei_cl_me_id(cl) == cmd->me_addr;
-}
-
-/**
- * mei_hbm_cl_find_by_cmd - find recipient client
- *
- * @dev: the device structure
- * @buf: a buffer with hbm cl command
- *
- * Return: the recipient client or NULL if not found
- */
-static inline
-struct mei_cl *mei_hbm_cl_find_by_cmd(struct mei_device *dev, void *buf)
-{
-	struct mei_hbm_cl_cmd *cmd = (struct mei_hbm_cl_cmd *)buf;
-	struct mei_cl *cl;
-
-	list_for_each_entry(cl, &dev->file_list, link)
-		if (mei_hbm_cl_addr_equal(cl, cmd))
-			return cl;
-	return NULL;
-}
-
-
-/**
- * mei_hbm_start_wait - wait for start response message.
- *
- * @dev: the device structure
- *
- * Return: 0 on success and < 0 on failure
- */
-int mei_hbm_start_wait(struct mei_device *dev)
-{
+	uint32_t cmd_id;
+	uint32_t size_remaining = *size;
+	SVGA3dCmdHeader *header = (SVGA3dCmdHeader *) buf;
 	int ret;
-
-	if (dev->hbm_state > MEI_HBM_STARTING)
-		return 0;
-
-	mutex_unlock(&dev->device_lock);
-	ret = wait_event_timeout(dev->wait_hbm_start,
-			dev->hbm_state != MEI_HBM_STARTING,
-			mei_secs_to_jiffies(MEI_HBM_TIMEOUT));
-	mutex_lock(&dev->device_lock);
-
-	if (ret == 0 && (dev->hbm_state <= MEI_HBM_STARTING)) {
-		dev->hbm_state = MEI_HBM_IDLE;
-		dev_err(dev->dev, "waiting for mei start failed\n");
-		return -ETIME;
-	}
-	return 0;
-}
-
-/**
- * mei_hbm_start_req - sends start request message.
- *
- * @dev: the device structure
- *
- * Return: 0 on success and < 0 on failure
- */
-int mei_hbm_start_req(struct mei_device *dev)
-{
-	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
-	struct hbm_host_version_request *start_req;
-	const size_t len = sizeof(struct hbm_host_version_request);
-	int ret;
-
-	mei_hbm_reset(dev);
-
-	mei_hbm_hdr(mei_hdr, len);
-
-	/* host start message */
-	start_req = (struct hbm_host_version_request *)dev->wr_msg.data;
-	memset(start_req, 0, len);
-	start_req->hbm_cmd = HOST_START_REQ_CMD;
-	start_req->host_version.major_version = HBM_MAJOR_VERSION;
-	start_req->host_version.minor_version = HBM_MINOR_VERSION;
-
-	dev->hbm_state = MEI_HBM_IDLE;
-	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
-	if (ret) {
-		dev_err(dev->dev, "version message write failed: ret = %d\n",
-			ret);
-		return ret;
-	}
-
-	dev->hbm_state = MEI_HBM_STARTING;
-	dev->init_clients_timer = MEI_CLIENTS_INIT_TIMEOUT;
-	return 0;
-}
-
-/**
- * mei_hbm_enum_clients_req - sends enumeration client request message.
- *
- * @dev: the device structure
- *
- * Return: 0 on success and < 0 on failure
- */
-static int mei_hbm_enum_clients_req(struct mei_device *dev)
-{
-	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
-	struct hbm_host_enum_request *enum_req;
-	const size_t len = sizeof(struct hbm_host_enum_request);
-	int ret;
-
-	/* enumerate clients */
-	mei_hbm_hdr(mei_hdr, len);
-
-	enum_req = (struct hbm_host_enum_request *)dev->wr_msg.data;
-	memset(enum_req, 0, len);
-	enum_req->hbm_cmd = HOST_ENUM_REQ_CMD;
-	enum_req->allow_add = dev->hbm_f_dc_supported;
-
-	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
-	if (ret) {
-		dev_err(dev->dev, "enumeration request write failed: ret = %d.\n",
-			ret);
-		return ret;
-	}
-	dev->hbm_state = MEI_HBM_ENUM_CLIENTS;
-	dev->init_clients_timer = MEI_CLIENTS_INIT_TIMEOUT;
-	return 0;
-}
-
-/**
- * mei_hbm_me_cl_add - add new me client to the list
- *
- * @dev: the device structure
- * @res: hbm property response
- *
- * Return: 0 on success and -ENOMEM on allocation failure
- */
-
-static int mei_hbm_me_cl_add(struct mei_device *dev,
-			     struct hbm_props_response *res)
-{
-	struct mei_me_client *me_cl;
-	const uuid_le *uuid = &res->client_properties.protocol_name;
-
-	mei_me_cl_rm_by_uuid(dev, uuid);
-
-	me_cl = kzalloc(sizeof(struct mei_me_client), GFP_KERNEL);
-	if (!me_cl)
-		return -ENOMEM;
-
-	mei_me_cl_init(me_cl);
-
-	me_cl->props = res->client_properties;
-	me_cl->client_id = res->me_addr;
-	me_cl->mei_flow_ctrl_creds = 0;
-
-	mei_me_cl_add(dev, me_cl);
-
-	return 0;
-}
-
-/**
- * mei_hbm_add_cl_resp - send response to fw on client add request
- *
- * @dev: the device structure
- * @addr: me address
- * @status: response status
- *
- * Return: 0 on success and < 0 on failure
- */
-static int mei_hbm_add_cl_resp(struct mei_device *dev, u8 addr, u8 status)
-{
-	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
-	struct hbm_add_client_response *resp;
-	const size_t len = sizeof(struct hbm_add_client_response);
-	int ret;
-
-	dev_dbg(dev->dev, "adding client response\n");
-
-	resp = (struct hbm_add_client_response *)dev->wr_msg.data;
-
-	mei_hbm_hdr(mei_hdr, len);
-	memset(resp, 0, sizeof(struct hbm_add_client_response));
-
-	resp->hbm_cmd = MEI_HBM_ADD_CLIENT_RES_CMD;
-	resp->me_addr = addr;
-	resp->status  = status;
-
-	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
-	if (ret)
-		dev_err(dev->dev, "add client response write failed: ret = %d\n",
-			ret);
-	return ret;
-}
-
-/**
- * mei_hbm_fw_add_cl_req - request from the fw to add a client
- *
- * @dev: the device structure
- * @req: add client request
- *
- * Return: 0 on success and < 0 on failure
- */
-static int mei_hbm_fw_add_cl_req(struct mei_device *dev,
-			      struct hbm_add_client_request *req)
-{
-	int ret;
-	u8 status = MEI_HBMS_SUCCESS;
-
-	BUILD_BUG_ON(sizeof(struct hbm_add_client_request) !=
-			sizeof(struct hbm_props_response));
-
-	ret = mei_hbm_me_cl_add(dev, (struct hbm_props_response *)req);
-	if (ret)
-		status = !MEI_HBMS_SUCCESS;
-
-	return mei_hbm_add_cl_resp(dev, req->me_addr, status);
-}
-
-/**
- * mei_hbm_cl_notify_req - send notification request
- *
- * @dev: the device structure
- * @cl: a client to disconnect from
- * @start: true for start false for stop
- *
- * Return: 0 on success and -EIO on write failure
- */
-int mei_hbm_cl_notify_req(struct mei_device *dev,
-			  struct mei_cl *cl, u8 start)
-{
-
-	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
-	struct hbm_notification_request *req;
-	const size_t len = sizeof(struct hbm_notification_request);
-	int ret;
-
-	mei_hbm_hdr(mei_hdr, len);
-	mei_hbm_cl_hdr(cl, MEI_HBM_NOTIFY_REQ_CMD, dev->wr_msg.data, len);
-
-	req = (struct hbm_notification_request *)dev->wr_msg.data;
-	req->start = start;
-
-	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
-	if (ret)
-		dev_err(dev->dev, "notify request failed: ret = %d\n", ret);
-
-	return ret;
-}
-
-/**
- *  notify_res_to_fop - convert notification response to the proper
- *      notification FOP
- *
- * @cmd: client notification start response command
- *
- * Return:  MEI_FOP_NOTIFY_START or MEI_FOP_NOTIFY_STOP;
- */
-static inline enum mei_cb_file_ops notify_res_to_fop(struct mei_hbm_cl_cmd *cmd)
-{
-	struct hbm_notification_response *rs =
-		(struct hbm_notification_response *)cmd;
-
-	return mei_cl_notify_req2fop(rs->start);
-}
-
-/**
- * mei_hbm_cl_notify_start_res - update the client state according
- *       notify start response
- *
- * @dev: the device structure
- * @cl: mei host client
- * @cmd: client notification start response command
- */
-static void mei_hbm_cl_notify_start_res(struct mei_device *dev,
-					struct mei_cl *cl,
-					struct mei_hbm_cl_cmd *cmd)
-{
-	struct hbm_notification_response *rs =
-		(struct hbm_notification_response *)cmd;
-
-	cl_dbg(dev, cl, "hbm: notify start response status=%d\n", rs->status);
-
-	if (rs->status == MEI_HBMS_SUCCESS ||
-	    rs->status == MEI_HBMS_ALREADY_STARTED) {
-		cl->notify_en = true;
-		cl->status = 0;
-	} else {
-		cl->status = -EINVAL;
-	}
-}
-
-/**
- * mei_hbm_cl_notify_stop_res - update the client state according
- *       notify stop response
- *
- * @dev: the device structure
- * @cl: mei host client
- * @cmd: client notification stop response command
- */
-static void mei_hbm_cl_notify_stop_res(struct mei_device *dev,
-				       struct mei_cl *cl,
-				       struct mei_hbm_cl_cmd *cmd)
-{
-	struct hbm_notification_response *rs =
-		(struct hbm_notification_response *)cmd;
-
-	cl_dbg(dev, cl, "hbm: notify stop response status=%d\n", rs->status);
-
-	if (rs->status == MEI_HBMS_SUCCESS ||
-	    rs->status == MEI_HBMS_NOT_STARTED) {
-		cl->notify_en = false;
-		cl->status = 0;
-	} else {
-		/* TODO: spec is not clear yet about other possible issues */
-		cl->status = -EINVAL;
-	}
-}
-
-/**
- * mei_hbm_cl_notify - signal notification event
- *
- * @dev: the device structure
- * @cmd: notification client message
- */
-static void mei_hbm_cl_notify(struct mei_device *dev,
-			      struct mei_hbm_cl_cmd *cmd)
-{
-	struct mei_cl *cl;
-
-	cl = mei_hbm_cl_find_by_cmd(dev, cmd);
-	if (cl)
-		mei_cl_notify(cl);
-}
-
-/**
- * mei_hbm_prop_req - request property for a single client
- *
- * @dev: the device structure
- *
- * Return: 0 on success and < 0 on failure
- */
-
-static int mei_hbm_prop_req(struct mei_device *dev)
-{
-
-	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
-	struct hbm_props_request *prop_req;
-	const size_t len = sizeof(struct hbm_props_request);
-	unsigned long next_client_index;
-	int ret;
-
-	next_client_index = find_next_bit(dev->me_clients_map, MEI_CLIENTS_MAX,
-					  dev->me_client_index);
-
-	/* We got all client properties */
-	if (next_client_index == MEI_CLIENTS_MAX) {
-		dev->hbm_state = MEI_HBM_STARTED;
-		schedule_work(&dev->init_work);
-
-		return 0;
-	}
-
-	mei_hbm_hdr(mei_hdr, len);
-	prop_req = (struct hbm_props_request *)dev->wr_msg.data;
-
-	memset(prop_req, 0, sizeof(struct hbm_props_request));
-
-	prop_req->hbm_cmd = HOST_CLIENT_PROPERTIES_REQ_CMD;
-	prop_req->me_addr = next_client_index;
-
-	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
-	if (ret) {
-		dev_err(dev->dev, "properties request write failed: ret = %d\n",
-			ret);
-		return ret;
-	}
-
-	dev->init_clients_timer = MEI_CLIENTS_INIT_TIMEOUT;
-	dev->me_client_index = next_client_index;
-
-	return 0;
-}
-
-/**
- * mei_hbm_pg - sends pg command
- *
- * @dev: the device structure
- * @pg_cmd: the pg command code
- *
- * Return: -EIO on write failure
- *         -EOPNOTSUPP if the operation is not supported by the protocol
- */
-int mei_hbm_pg(struct mei_device *dev, u8 pg_cmd)
-{
-	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
-	struct hbm_power_gate *req;
-	const size_t len = sizeof(struct hbm_power_gate);
-	int ret;
-
-	if (!dev->hbm_f_pg_supported)
-		return -EOPNOTSUPP;
-
-	mei_hbm_hdr(mei_hdr, len);
-
-	req = (struct hbm_power_gate *)dev->wr_msg.data;
-	memset(req, 0, len);
-	req->hbm_cmd = pg_cmd;
-
-	ret = mei_write_message(dev, mei_hdr, dev->wr_msg.data);
-	if (ret)
-		dev_err(dev->dev, "power gate command write failed.\n");
-	return ret;
-}
-EXPORT_SYMBOL_GPL(mei_hbm_pg);
-
-/**
- * mei_hbm_stop_req - send stop request message
- *
- * @dev: mei device
- *
- * Return: -EIO on write failure
- */
-static int mei_hbm_stop_req(struct mei_device *dev)
-{
-	struct mei_msg_hdr *mei_hdr = &dev->wr_msg.hdr;
-	struct hbm_host_stop_request *req =
-			(struct hbm_host_stop_request *)dev->wr_msg.data;
-	const size_t len = sizeof(struct hbm_host_stop_request);
-
-	mei_hbm_hdr(mei_hdr, len);
-
-	memset(req, 0, len);
-	req->hbm_cmd = HOST_STOP_REQ_CMD;
-	req->reason = DRIVER_STOP_REQUEST;
-
-	return mei_write_message(dev, mei_hdr, dev->wr_msg.data);
-}
-
-/**
- * mei_hbm_cl_flow_control_req - sends flow control request.
- *
- * @dev: the device structure
- * @cl: client info
- *
- * Return: -EIO on write failure
- */
-int mei_hbm_cl_flow_control_req(struct mei_device *dev, struct mei_cl *cl)
-{
-	const size_t len = sizeof(struct hbm_flow_control);
-
-	cl_dbg(dev, cl, "sending flow control\n");
-	return mei_hbm_cl_write(dev, cl, MEI_FLOW_CONTROL_CMD, len);
-}
-
-/**
- * mei_hbm_add_single_flow_creds - adds single buffer credentials.
- *
- * @dev: the device structure
- * @flow: flow control.
- *
- * Return: 0 on success, < 0 otherwise
- */
-static int mei_hbm_add_single_flow_creds(struct mei_device *dev,
-				  struct hbm_flow_control *flow)
-{
-	struct mei_me_client *me_cl;
-	int rets;
-
-	me_cl = mei_me_cl_by_id(dev, flow->me_addr);
-	if (!me_cl) {
-		dev_err(dev->dev, "no such me client %d\n",
-			flow->me_addr);
-		return -ENOENT;
-	}
-
-	if (WARN_ON(me_cl->props.single_recv_buf == 0)) {
-		rets = -EINVAL;
-		goto out;
-	}
-
-	me_cl->mei_flow_ctrl_creds++;
-	dev_dbg(dev->dev, "recv flow ctrl msg ME %d (single) creds = %d.\n",
-	    flow->me_addr, me_cl->mei_flow_ctrl_creds);
-
-	rets = 0;
-out:
-	mei_me_cl_put(me_cl);
-	return rets;
-}
-
-/**
- * mei_hbm_cl_flow_control_res - flow control response from me
- *
- * @dev: the device structure
- * @flow_control: flow control response bus message
- */
-static void mei_hbm_cl_flow_control_res(struct mei_device *dev,
-					struct hbm_flow_control *flow_control)
-{
-	struct mei_cl *cl;
-
-	if (!flow_control->host_addr) {
-		/* single receive buffer */
-		mei_hbm_add_single_flow_creds(dev, flow_control);
-		return;
-	}
-
-	cl = mei_hbm_cl_find_by_cmd(dev, flow_control);
-	if (cl) {
-		cl->mei_flow_ctrl_creds++;
-		cl_dbg(dev, cl, "flow control creds = %d.\n",
-				cl->mei_flow_ctrl_creds);
-	}
-}
-
-
-/**
- * mei_hbm_cl_disconnect_req - sends disconnect message to fw.
- *
- * @dev: the device structure
- * @cl: a client to disconnect from
- *
- * Return: -EIO on write failure
- */
-int mei_hbm_cl_disconnect_req(struct mei_device *dev, struct mei_cl *cl)
-{
-	const size_t len = sizeof(struct hbm_client_connect_request);
-
-	return mei_hbm_cl_write(dev, cl, CLIENT_DISCONNECT_REQ_CMD, len);
-}
-
-/**
- * mei_hbm_cl_disconnect_rsp - sends disconnect respose to the FW
- *
- * @dev: the device structure
- * @cl: a client to disconnect from
- *
- * Return: -EIO on write failure
- */
-int mei_hbm_cl_disconnect_rsp(struct mei_device *dev, struct mei_cl *cl)
-{
-	const size_t len = sizeof(struct hbm_client_connect_response);
-
-	return mei_hbm_cl_write(dev, cl, CLIENT_DISCONNECT_RES_CMD, len);
-}
-
-/**
- * mei_hbm_cl_disconnect_res - update the client state according
- *       disconnect response
- *
- * @dev: the device structure
- * @cl: mei host client
- * @cmd: disconnect client response host bus message
- */
-static void mei_hbm_cl_disconnect_res(struct mei_device *dev, struct mei_cl *cl,
-				      struct mei_hbm_cl_cmd *cmd)
-{
-	struct hbm_client_connect_response *rs =
-		(struct hbm_client_connect_response *)cmd;
-
-	cl_dbg(dev, cl, "hbm: disconnect response status=%d\n", rs->status);
-
-	if (rs->status == MEI_CL_DISCONN_SUCCESS)
-		cl->state = MEI_FILE_DISCONNECT_REPLY;
-	cl->status = 0;
-}
-
-/**
- * mei_hbm_cl_connect_req - send connection request to specific me client
- *
- * @dev: the device structure
- * @cl: a client to connect to
- *
- * Return: -EIO on write failure
- */
-int mei_hbm_cl_connect_req(struct mei_device *dev, struct mei_cl *cl)
-{
-	const size_t len = sizeof(struct hbm_client_connect_request);
-
-	return mei_hbm_cl_write(dev, cl, CLIENT_CONNECT_REQ_CMD, len);
-}
-
-/**
- * mei_hbm_cl_connect_res - update the client state according
- *        connection response
- *
- * @dev: the device structure
- * @cl: mei host client
- * @cmd: connect client response host bus message
- */
-static void mei_hbm_cl_connect_res(struct mei_device *dev, struct mei_cl *cl,
-				   struct mei_hbm_cl_cmd *cmd)
-{
-	struct hbm_client_connect_response *rs =
-		(struct hbm_client_connect_response *)cmd;
-
-	cl_dbg(dev, cl, "hbm: connect response status=%s\n",
-			mei_cl_conn_status_str(rs->status));
-
-	if (rs->status == MEI_CL_CONN_SUCCESS)
-		cl->state = MEI_FILE_CONNECTED;
-	else {
-		cl->state = MEI_FILE_DISCONNECT_REPLY;
-		if (rs->status == MEI_CL_CONN_NOT_FOUND)
-			mei_me_cl_del(dev, cl->me_cl);
-	}
-	cl->status = mei_cl_conn_status_to_errno(rs->status);
-}
-
-/**
- * mei_hbm_cl_res - process hbm response received on behalf
- *         an client
- *
- * @dev: the device structure
- * @rs:  hbm client message
- * @fop_type: file operation type
- */
-static void mei_hbm_cl_res(struct mei_device *dev,
-			   struct mei_hbm_cl_cmd *rs,
-			   enum mei_cb_file_ops fop_type)
-{
-	struct mei_cl *cl;
-	struct mei_cl_cb *cb, *next;
-
-	cl = NULL;
-	list_for_each_entry_safe(cb, next, &dev->ctrl_rd_list.list, list) {
-
-		cl = cb->cl;
-
-		if (cb->fop_type != fop_type)
-			continue;
-
-		if (mei_hbm_cl_addr_equal(cl, rs)) {
-			list_del_init(&cb->list);
-			break;
-		}
-	}
-
-	if (!cl)
-		return;
-
-	switch (fop_type) {
-	case MEI_FOP_CONNECT:
-		mei_hbm_cl_connect_res(dev, cl, rs);
-		break;
-	case MEI_FOP_DISCONNECT:
-		mei_hbm_cl_disconnect_res(dev, cl, rs);
-		break;
-	case MEI_FOP_NOTIFY_START:
-		mei_hbm_cl_notify_start_res(dev, cl, rs);
-		break;
-	case MEI_FOP_NOTIFY_STOP:
-		mei_hbm_cl_notify_stop_res(dev, cl, rs);
-		break;
-	default:
-		return;
-	}
-
-	cl->timer_count = 0;
-	wake_up(&cl->wait);
-}
-
-
-/**
- * mei_hbm_fw_disconnect_req - disconnect request initiated by ME firmware
- *  host sends disconnect response
- *
- * @dev: the device structure.
- * @disconnect_req: disconnect request bus message from the me
- *
- * Return: -ENOMEM on allocation failure
- */
-static int mei_hbm_fw_disconnect_req(struct mei_device *dev,
-		struct hbm_client_connect_request *disconnect_req)
-{
-	struct mei_cl *cl;
-	struct mei_cl_cb *cb;
-
-	cl = mei_hbm_cl_find_by_cmd(dev, disconnect_req);
-	if (cl) {
-		cl_dbg(dev, cl, "fw disconnect request received\n");
-		cl->state = MEI_FILE_DISCONNECTING;
-		cl->timer_count = 0;
-
-		cb = mei_io_cb_init(cl, MEI_FOP_DISCONNECT_RSP, NULL);
-		if (!cb)
-			return -ENOMEM;
-		list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
-	}
-	return 0;
-}
-
-/**
- * mei_hbm_pg_enter_res - PG enter response received
- *
- * @dev: the device structure.
- *
- * Return: 0 on success, -EPROTO on state mismatch
- */
-static int mei_hbm_pg_enter_res(struct mei_device *dev)
-{
-	if (mei_pg_state(dev) != MEI_PG_OFF ||
-	    dev->pg_event != MEI_PG_EVENT_WAIT) {
-		dev_err(dev->dev, "hbm: pg entry response: state mismatch [%s, %d]\n",
-			mei_pg_state_str(mei_pg_state(dev)), dev->pg_event);
-		return -EPROTO;
-	}
-
-	dev->pg_event = MEI_PG_EVENT_RECEIVED;
-	wake_up(&dev->wait_pg);
-
-	return 0;
-}
-
-/**
- * mei_hbm_pg_resume - process with PG resume
- *
- * @dev: the device structure.
- */
-void mei_hbm_pg_resume(struct mei_device *dev)
-{
-	pm_request_resume(dev->dev);
-}
-EXPORT_SYMBOL_GPL(mei_hbm_pg_resume);
-
-/**
- * mei_hbm_pg_exit_res - PG exit response received
- *
- * @dev: the device structure.
- *
- * Return: 0 on success, -EPROTO on state mismatch
- */
-static int mei_hbm_pg_exit_res(struct mei_device *dev)
-{
-	if (mei_pg_state(dev) != MEI_PG_ON ||
-	    (dev->pg_event != MEI_PG_EVENT_WAIT &&
-	     dev->pg_event != MEI_PG_EVENT_IDLE)) {
-		dev_err(dev->dev, "hbm: pg exit response: state mismatch [%s, %d]\n",
-			mei_pg_state_str(mei_pg_state(dev)), dev->pg_event);
-		return -EPROTO;
-	}
-
-	switch (dev->pg_event) {
-	case MEI_PG_EVENT_WAIT:
-		dev->pg_event = MEI_PG_EVENT_RECEIVED;
-		wake_up(&dev->wait_pg);
-		break;
-	case MEI_PG_EVENT_IDLE:
-		/*
-		* If the driver is not waiting on this then
-		* this is HW initiated exit from PG.
-		* Start runtime pm resume sequence to exit from PG.
-		*/
-		dev->pg_event = MEI_PG_EVENT_RECEIVED;
-		mei_hbm_pg_resume(dev);
-		break;
-	default:
-		WARN(1, "hbm: pg exit response: unexpected pg event = %d\n",
-		     dev->pg_event);
-		return -EPROTO;
-	}
-
-	return 0;
-}
-
-/**
- * mei_hbm_config_features - check what hbm features and commands
- *        are supported by the fw
- *
- * @dev: the device structure
- */
-static void mei_hbm_config_features(struct mei_device *dev)
-{
-	/* Power Gating Isolation Support */
-	dev->hbm_f_pg_supported = 0;
-	if (dev->version.major_version > HBM_MAJOR_VERSION_PGI)
-		dev->hbm_f_pg_supported = 1;
-
-	if (dev->version.major_version == HBM_MAJOR_VERSION_PGI &&
-	    dev->version.minor_version >= HBM_MINOR_VERSION_PGI)
-		dev->hbm_f_pg_supported = 1;
-
-	if (dev->version.major_version >= HBM_MAJOR_VERSION_DC)
-		dev->hbm_f_dc_supported = 1;
-
-	/* disconnect on connect timeout instead of link reset */
-	if (dev->version.major_version >= HBM_MAJOR_VERSION_DOT)
-		dev->hbm_f_dot_supported = 1;
-
-	/* Notification Event Support */
-	if (dev->version.major_version >= HBM_MAJOR_VERSION_EV)
-		dev->hbm_f_ev_supported = 1;
-}
-
-/**
- * mei_hbm_version_is_supported - checks whether the driver can
- *     support the hbm version of the device
- *
- * @dev: the device structure
- * Return: true if driver can support hbm version of the device
- */
-bool mei_hbm_version_is_supported(struct mei_device *dev)
-{
-	return	(dev->version.major_version < HBM_MAJOR_VERSION) ||
-		(dev->version.major_version == HBM_MAJOR_VERSION &&
-		 dev->version.minor_version <= HBM_MINOR_VERSION);
-}
-
-/**
- * mei_hbm_dispatch - bottom half read routine after ISR to
- * handle the read bus message cmd processing.
- *
- * @dev: the device structure
- * @hdr: header of bus message
- *
- * Return: 0 on success and < 0 on failure
- */
-int mei_hbm_dispatch(struct mei_device *dev, struct mei_msg_hdr *hdr)
-{
-	struct mei_bus_message *mei_msg;
-	struct hbm_host_version_response *version_res;
-	struct hbm_props_response *props_res;
-	struct hbm_host_enum_response *enum_res;
-	struct hbm_add_client_request *add_cl_req;
-	int ret;
-
-	struct mei_hbm_cl_cmd *cl_cmd;
-	struct hbm_client_connect_request *disconnect_req;
-	struct hbm_flow_control *flow_control;
-
-	/* read the message to our buffer */
-	BUG_ON(hdr->length >= sizeof(dev->rd_msg_buf));
-	mei_read_slots(dev, dev->rd_msg_buf, hdr->length);
-	mei_msg = (struct mei_bus_message *)dev->rd_msg_buf;
-	cl_cmd  = (struct mei_hbm_cl_cmd *)mei_msg;
-
-	/* ignore spurious message and prevent reset nesting
-	 * hbm is put to idle during system reset
-	 */
-	if (dev->hbm_state == MEI_HBM_IDLE) {
-		dev_dbg(dev->dev, "hbm: state is idle ignore spurious messages\n");
-		return 0;
-	}
-
-	switch (mei_msg->hbm_cmd) {
-	case HOST_START_RES_CMD:
-		dev_dbg(dev->dev, "hbm: start: response message received.\n");
-
-		dev->init_clients_timer = 0;
-
-		version_res = (struct hbm_host_version_response *)mei_msg;
-
-		dev_dbg(dev->dev, "HBM VERSION: DRIVER=%02d:%02d DEVICE=%02d:%02d\n",
-				HBM_MAJOR_VERSION, HBM_MINOR_VERSION,
-				version_res->me_max_version.major_version,
-				version_res->me_max_version.minor_version);
-
-		if (version_res->host_version_supported) {
-			dev->version.major_version = HBM_MAJOR_VERSION;
-			dev->version.minor_version = HBM_MINOR_VERSION;
-		} else {
-			dev->version.major_version =
-				version_res->me_max_version.major_version;
-			dev->version.minor_version =
-				version_res->me_max_version.minor_version;
-		}
-
-		if (!mei_hbm_version_is_supported(dev)) {
-			dev_warn(dev->dev, "hbm: start: version mismatch - stopping the driver.\n");
-
-			dev->hbm_state = MEI_HBM_STOPPED;
-			if (mei_hbm_stop_req(dev)) {
-				dev_err(dev->dev, "hbm: start: failed to send stop request\n");
-				return -EIO;
-			}
-			break;
-		}
-
-		mei_hbm_config_features(dev);
-
-		if (dev->dev_state != MEI_DEV_INIT_CLIENTS ||
-		    dev->hbm_state != MEI_HBM_STARTING) {
-			dev_err(dev->dev, "hbm: start: state mismatch, [%d, %d]\n",
-				dev->dev_state, dev->hbm_state);
-			return -EPROTO;
-		}
-
-		if (mei_hbm_enum_clients_req(dev)) {
-			dev_err(dev->dev, "hbm: start: failed to send enumeration request\n");
-			return -EIO;
-		}
-
-		wake_up(&dev->wait_hbm_start);
-		break;
-
-	case CLIENT_CONNECT_RES_CMD:
-		dev_dbg(dev->dev, "hbm: client connect response: message received.\n");
-		mei_hbm_cl_res(dev, cl_cmd, MEI_FOP_CONNECT);
-		break;
-
-	case CLIENT_DISCONNECT_RES_CMD:
-		dev_dbg(dev->dev, "hbm: client disconnect response: message received.\n");
-		mei_hbm_cl_res(dev, cl_cmd, MEI_FOP_DISCONNECT);
-		break;
-
-	case MEI_FLOW_CONTROL_CMD:
-		dev_dbg(dev->dev, "hbm: client flow control response: message received.\n");
-
-		flow_control = (struct hbm_flow_control *) mei_msg;
-		mei_hbm_cl_flow_control_res(dev, flow_control);
-		break;
-
-	case MEI_PG_ISOLATION_ENTRY_RES_CMD:
-		dev_dbg(dev->dev, "hbm: power gate isolation entry response received\n");
-		ret = mei_hbm_pg_enter_res(dev);
-		if (ret)
-			return ret;
-		break;
-
-	case MEI_PG_ISOLATION_EXIT_REQ_CMD:
-		dev_dbg(dev->dev, "hbm: power gate isolation exit request received\n");
-		ret = mei_hbm_pg_exit_res(dev);
-		if (ret)
-			return ret;
-		break;
-
-	case HOST_CLIENT_PROPERTIES_RES_CMD:
-		dev_dbg(dev->dev, "hbm: properties response: message received.\n");
-
-		dev->init_clients_timer = 0;
-
-		if (dev->dev_state != MEI_DEV_INIT_CLIENTS ||
-		    dev->hbm_state != MEI_HBM_CLIENT_PROPERTIES) {
-			dev_err(dev->dev, "hbm: properties response: state mismatch, [%d, %d]\n",
-				dev->dev_state, dev->hbm_state);
-			return -EPROTO;
-		}
-
-		props_res = (struct hbm_props_response *)mei_msg;
-
-		if (props_res->status) {
-			dev_err(dev->dev, "hbm: properties response: wrong status = %d %s\n",
-				props_res->status,
-				mei_hbm_status_str(props_res->status));
-			return -EPROTO;
-		}
-
-		mei_hbm_me_cl_add(dev, props_res);
-
-		dev->me_client_index++;
-
-		/* request property for the next client */
-		if (mei_hbm_prop_req(dev))
-			return -EIO;
-
-		break;
-
-	case HOST_ENUM_RES_CMD:
-		dev_dbg(dev->dev, "hbm: enumeration response: message received\n");
-
-		dev->init_clients_timer = 0;
-
-		enum_res = (struct hbm_host_enum_response *) mei_msg;
-		BUILD_BUG_ON(sizeof(dev->me_clients_map)
-				< sizeof(enum_res->valid_addresses));
-		memcpy(dev->me_clients_map, enum_res->valid_addresses,
-				sizeof(enum_res->valid_addresses));
-
-		if (dev->dev_state != MEI_DEV_INIT_CLIENTS ||
-		    dev->hbm_state != MEI_HBM_ENUM_CLIENTS) {
-			dev_err(dev->dev, "hbm: enumeration response: state mismatch, [%d, %d]\n",
-				dev->dev_state, dev->hbm_state);
-			return -EPROTO;
-		}
-
-		dev->hbm_state = MEI_HBM_CLIENT_PROPERTIES;
-
-		/* first property request */
-		if (mei_hbm_prop_req(dev))
-			return -EIO;
-
-		break;
-
-	case HOST_STOP_RES_CMD:
-		dev_dbg(dev->dev, "hbm: stop response: message received\n");
-
-		dev->init_clients_timer = 0;
-
-		if (dev->hbm_state != MEI_HBM_STOPPED) {
-			dev_err(dev->dev, "hbm: stop response: state mismatch, [%d, %d]\n",
-				dev->dev_state, dev->hbm_state);
-			return -EPROTO;
-		}
-
-		dev->dev_state = MEI_DEV_POWER_DOWN;
-		dev_info(dev->dev, "hbm: stop response: resetting.\n");
-		/* force the reset */
-		return -EPROTO;
-		break;
-
-	case CLIENT_DISCONNECT_REQ_CMD:
-		dev_dbg(dev->dev, "hbm: disconnect request: message received\n");
-
-		disconnect_req = (struct hbm_client_connect_request *)mei_msg;
-		mei_hbm_fw_disconnect_req(dev, disconnect_req);
-		break;
-
-	case ME_STOP_REQ_CMD:
-		dev_dbg(dev->dev, "hbm: stop request: message received\n");
-		dev->hbm_state = MEI_HBM_STOPPED;
-		if (mei_hbm_stop_req(dev)) {
-			dev_err(dev->dev, "hbm: stop request: failed to send stop request\n");
-			return -EIO;
-		}
-		break;
-
-	case MEI_HBM_ADD_CLIENT_REQ_CMD:
-		dev_dbg(dev->dev, "hbm: add client request received\n");
-		/*
-		 * after the host receives the enum_resp
-		 * message clients may be added or removed
-		 */
-		if (dev->hbm_state <= MEI_HBM_ENUM_CLIENTS ||
-		    dev->hbm_state >= MEI_HBM_STOPPED) {
-			dev_err(dev->dev, "hbm: add client: state mismatch, [%d, %d]\n",
-				dev->dev_state, dev->hbm_state);
-			return -EPROTO;
-		}
-		add_cl_req = (struct hbm_add_client_request *)mei_msg;
-		ret = mei_hbm_fw_add_cl_req(dev, add_cl_req);
-		if (ret) {
-			dev_err(dev->dev, "hbm: add client: failed to send response %d\n",
-				ret);
-			return -EIO;
-		}
-		dev_dbg(dev->dev, "hbm: add client request processed\n");
-		break;
-
-	case MEI_HBM_NOTIFY_RES_CMD:
-		dev_dbg(dev->dev, "hbm: notify response received\n");
-		mei_hbm_cl_res(dev, cl_cmd, notify_res_to_fop(cl_cmd));
-		break;
-
-	case MEI_HBM_NOTIFICATION_CMD:
-		dev_dbg(dev->dev, "hbm: notification\n");
-		mei_hbm_cl_notify(dev, cl_cmd);
-		break;
-
-	default:
-		BUG();
-		break;
-
-	}
-	return 0;
-}
-
+	const struct vmw_cmd_entry *entry;
+	bool gb = dev_priv->capabilities & SVGA_CAP_GBOBJECTS;
+
+	cmd_id = ((uint32_t *)buf)[0];
+	/* Handle any none 3D commands */
+	if (unlikely(cmd_id < SVGA_CMD_MAX))
+		return vmw_cmd_check_not_3d(dev

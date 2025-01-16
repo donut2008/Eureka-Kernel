@@ -1,10 +1,6 @@
-#
-# RapidIO master port configuration
-#
-
-config RAPIDIO_TSI721
-	tristate "IDT Tsi721 PCI Express SRIO Controller support"
-	depends on RAPIDIO && PCIEPORTBUS
-	default "n"
-	---help---
-	  Include support for IDT Tsi721 PCI Express Serial RapidIO controller.
+_SHIFT 0xa
+#define SRBM_DEBUG__VP8_CLOCK_DOMAIN_OVERRIDE_MASK 0x800
+#define SRBM_DEBUG__VP8_CLOCK_DOMAIN_OVERRIDE__SHIFT 0xb
+#define SRBM_DEBUG_SNAPSHOT__MCB_RDY_MASK 0x1
+#define SRBM_DEBUG_SNAPSHOT__MCB_RDY__SHIFT 0x0
+#define SRBM_DEBUG_SNAPSHOT__GIONB_R

@@ -1,6719 +1,168 @@
-/*
- * Copyright (C) 2009, 2010 Red Hat Inc, Steven Rostedt <srostedt@redhat.com>
- *
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation;
- * version 2.1 of the License (not later!)
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this program; if not,  see <http://www.gnu.org/licenses>
- *
- * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- *
- *  The parts for function graph printing was taken and modified from the
- *  Linux Kernel that were written by
- *    - Copyright (C) 2009  Frederic Weisbecker,
- *  Frederic Weisbecker gave his permission to relicense the code to
- *  the Lesser General Public License.
- */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>
-#include <ctype.h>
-#include <errno.h>
-#include <stdint.h>
-#include <limits.h>
-
-#include <netinet/ip6.h>
-#include "event-parse.h"
-#include "event-utils.h"
-
-static const char *input_buf;
-static unsigned long long input_buf_ptr;
-static unsigned long long input_buf_siz;
-
-static int is_flag_field;
-static int is_symbolic_field;
-
-static int show_warning = 1;
-
-#define do_warning(fmt, ...)				\
-	do {						\
-		if (show_warning)			\
-			warning(fmt, ##__VA_ARGS__);	\
-	} while (0)
-
-#define do_warning_event(event, fmt, ...)			\
-	do {							\
-		if (!show_warning)				\
-			continue;				\
-								\
-		if (event)					\
-			warning("[%s:%s] " fmt, event->system,	\
-				event->name, ##__VA_ARGS__);	\
-		else						\
-			warning(fmt, ##__VA_ARGS__);		\
-	} while (0)
-
-static void init_input_buf(const char *buf, unsigned long long size)
-{
-	input_buf = buf;
-	input_buf_siz = size;
-	input_buf_ptr = 0;
-}
-
-const char *pevent_get_input_buf(void)
-{
-	return input_buf;
-}
-
-unsigned long long pevent_get_input_buf_ptr(void)
-{
-	return input_buf_ptr;
-}
-
-struct event_handler {
-	struct event_handler		*next;
-	int				id;
-	const char			*sys_name;
-	const char			*event_name;
-	pevent_event_handler_func	func;
-	void				*context;
-};
-
-struct pevent_func_params {
-	struct pevent_func_params	*next;
-	enum pevent_func_arg_type	type;
-};
-
-struct pevent_function_handler {
-	struct pevent_function_handler	*next;
-	enum pevent_func_arg_type	ret_type;
-	char				*name;
-	pevent_func_handler		func;
-	struct pevent_func_params	*params;
-	int				nr_args;
-};
-
-static unsigned long long
-process_defined_func(struct trace_seq *s, void *data, int size,
-		     struct event_format *event, struct print_arg *arg);
-
-static void free_func_handle(struct pevent_function_handler *func);
-
-/**
- * pevent_buffer_init - init buffer for parsing
- * @buf: buffer to parse
- * @size: the size of the buffer
- *
- * For use with pevent_read_token(), this initializes the internal
- * buffer that pevent_read_token() will parse.
- */
-void pevent_buffer_init(const char *buf, unsigned long long size)
-{
-	init_input_buf(buf, size);
-}
-
-void breakpoint(void)
-{
-	static int x;
-	x++;
-}
-
-struct print_arg *alloc_arg(void)
-{
-	return calloc(1, sizeof(struct print_arg));
-}
-
-struct cmdline {
-	char *comm;
-	int pid;
-};
-
-static int cmdline_cmp(const void *a, const void *b)
-{
-	const struct cmdline *ca = a;
-	const struct cmdline *cb = b;
-
-	if (ca->pid < cb->pid)
-		return -1;
-	if (ca->pid > cb->pid)
-		return 1;
-
-	return 0;
-}
-
-struct cmdline_list {
-	struct cmdline_list	*next;
-	char			*comm;
-	int			pid;
-};
-
-static int cmdline_init(struct pevent *pevent)
-{
-	struct cmdline_list *cmdlist = pevent->cmdlist;
-	struct cmdline_list *item;
-	struct cmdline *cmdlines;
-	int i;
-
-	cmdlines = malloc(sizeof(*cmdlines) * pevent->cmdline_count);
-	if (!cmdlines)
-		return -1;
-
-	i = 0;
-	while (cmdlist) {
-		cmdlines[i].pid = cmdlist->pid;
-		cmdlines[i].comm = cmdlist->comm;
-		i++;
-		item = cmdlist;
-		cmdlist = cmdlist->next;
-		free(item);
-	}
-
-	qsort(cmdlines, pevent->cmdline_count, sizeof(*cmdlines), cmdline_cmp);
-
-	pevent->cmdlines = cmdlines;
-	pevent->cmdlist = NULL;
-
-	return 0;
-}
-
-static const char *find_cmdline(struct pevent *pevent, int pid)
-{
-	const struct cmdline *comm;
-	struct cmdline key;
-
-	if (!pid)
-		return "<idle>";
-
-	if (!pevent->cmdlines && cmdline_init(pevent))
-		return "<not enough memory for cmdlines!>";
-
-	key.pid = pid;
-
-	comm = bsearch(&key, pevent->cmdlines, pevent->cmdline_count,
-		       sizeof(*pevent->cmdlines), cmdline_cmp);
-
-	if (comm)
-		return comm->comm;
-	return "<...>";
-}
-
-/**
- * pevent_pid_is_registered - return if a pid has a cmdline registered
- * @pevent: handle for the pevent
- * @pid: The pid to check if it has a cmdline registered with.
- *
- * Returns 1 if the pid has a cmdline mapped to it
- * 0 otherwise.
- */
-int pevent_pid_is_registered(struct pevent *pevent, int pid)
-{
-	const struct cmdline *comm;
-	struct cmdline key;
-
-	if (!pid)
-		return 1;
-
-	if (!pevent->cmdlines && cmdline_init(pevent))
-		return 0;
-
-	key.pid = pid;
-
-	comm = bsearch(&key, pevent->cmdlines, pevent->cmdline_count,
-		       sizeof(*pevent->cmdlines), cmdline_cmp);
-
-	if (comm)
-		return 1;
-	return 0;
-}
-
-/*
- * If the command lines have been converted to an array, then
- * we must add this pid. This is much slower than when cmdlines
- * are added before the array is initialized.
- */
-static int add_new_comm(struct pevent *pevent, const char *comm, int pid)
-{
-	struct cmdline *cmdlines = pevent->cmdlines;
-	const struct cmdline *cmdline;
-	struct cmdline key;
-
-	if (!pid)
-		return 0;
-
-	/* avoid duplicates */
-	key.pid = pid;
-
-	cmdline = bsearch(&key, pevent->cmdlines, pevent->cmdline_count,
-		       sizeof(*pevent->cmdlines), cmdline_cmp);
-	if (cmdline) {
-		errno = EEXIST;
-		return -1;
-	}
-
-	cmdlines = realloc(cmdlines, sizeof(*cmdlines) * (pevent->cmdline_count + 1));
-	if (!cmdlines) {
-		errno = ENOMEM;
-		return -1;
-	}
-	pevent->cmdlines = cmdlines;
-
-	cmdlines[pevent->cmdline_count].comm = strdup(comm);
-	if (!cmdlines[pevent->cmdline_count].comm) {
-		errno = ENOMEM;
-		return -1;
-	}
-
-	cmdlines[pevent->cmdline_count].pid = pid;
-		
-	if (cmdlines[pevent->cmdline_count].comm)
-		pevent->cmdline_count++;
-
-	qsort(cmdlines, pevent->cmdline_count, sizeof(*cmdlines), cmdline_cmp);
-
-	return 0;
-}
-
-/**
- * pevent_register_comm - register a pid / comm mapping
- * @pevent: handle for the pevent
- * @comm: the command line to register
- * @pid: the pid to map the command line to
- *
- * This adds a mapping to search for command line names with
- * a given pid. The comm is duplicated.
- */
-int pevent_register_comm(struct pevent *pevent, const char *comm, int pid)
-{
-	struct cmdline_list *item;
-
-	if (pevent->cmdlines)
-		return add_new_comm(pevent, comm, pid);
-
-	item = malloc(sizeof(*item));
-	if (!item)
-		return -1;
-
-	if (comm)
-		item->comm = strdup(comm);
-	else
-		item->comm = strdup("<...>");
-	if (!item->comm) {
-		free(item);
-		return -1;
-	}
-	item->pid = pid;
-	item->next = pevent->cmdlist;
-
-	pevent->cmdlist = item;
-	pevent->cmdline_count++;
-
-	return 0;
-}
-
-int pevent_register_trace_clock(struct pevent *pevent, const char *trace_clock)
-{
-	pevent->trace_clock = strdup(trace_clock);
-	if (!pevent->trace_clock) {
-		errno = ENOMEM;
-		return -1;
-	}
-	return 0;
-}
-
-struct func_map {
-	unsigned long long		addr;
-	char				*func;
-	char				*mod;
-};
-
-struct func_list {
-	struct func_list	*next;
-	unsigned long long	addr;
-	char			*func;
-	char			*mod;
-};
-
-static int func_cmp(const void *a, const void *b)
-{
-	const struct func_map *fa = a;
-	const struct func_map *fb = b;
-
-	if (fa->addr < fb->addr)
-		return -1;
-	if (fa->addr > fb->addr)
-		return 1;
-
-	return 0;
-}
-
-/*
- * We are searching for a record in between, not an exact
- * match.
- */
-static int func_bcmp(const void *a, const void *b)
-{
-	const struct func_map *fa = a;
-	const struct func_map *fb = b;
-
-	if ((fa->addr == fb->addr) ||
-
-	    (fa->addr > fb->addr &&
-	     fa->addr < (fb+1)->addr))
-		return 0;
-
-	if (fa->addr < fb->addr)
-		return -1;
-
-	return 1;
-}
-
-static int func_map_init(struct pevent *pevent)
-{
-	struct func_list *funclist;
-	struct func_list *item;
-	struct func_map *func_map;
-	int i;
-
-	func_map = malloc(sizeof(*func_map) * (pevent->func_count + 1));
-	if (!func_map)
-		return -1;
-
-	funclist = pevent->funclist;
-
-	i = 0;
-	while (funclist) {
-		func_map[i].func = funclist->func;
-		func_map[i].addr = funclist->addr;
-		func_map[i].mod = funclist->mod;
-		i++;
-		item = funclist;
-		funclist = funclist->next;
-		free(item);
-	}
-
-	qsort(func_map, pevent->func_count, sizeof(*func_map), func_cmp);
-
-	/*
-	 * Add a special record at the end.
-	 */
-	func_map[pevent->func_count].func = NULL;
-	func_map[pevent->func_count].addr = 0;
-	func_map[pevent->func_count].mod = NULL;
-
-	pevent->func_map = func_map;
-	pevent->funclist = NULL;
-
-	return 0;
-}
-
-static struct func_map *
-__find_func(struct pevent *pevent, unsigned long long addr)
-{
-	struct func_map *func;
-	struct func_map key;
-
-	if (!pevent->func_map)
-		func_map_init(pevent);
-
-	key.addr = addr;
-
-	func = bsearch(&key, pevent->func_map, pevent->func_count,
-		       sizeof(*pevent->func_map), func_bcmp);
-
-	return func;
-}
-
-struct func_resolver {
-	pevent_func_resolver_t *func;
-	void		       *priv;
-	struct func_map	       map;
-};
-
-/**
- * pevent_set_function_resolver - set an alternative function resolver
- * @pevent: handle for the pevent
- * @resolver: function to be used
- * @priv: resolver function private state.
- *
- * Some tools may have already a way to resolve kernel functions, allow them to
- * keep using it instead of duplicating all the entries inside
- * pevent->funclist.
- */
-int pevent_set_function_resolver(struct pevent *pevent,
-				 pevent_func_resolver_t *func, void *priv)
-{
-	struct func_resolver *resolver = malloc(sizeof(*resolver));
-
-	if (resolver == NULL)
-		return -1;
-
-	resolver->func = func;
-	resolver->priv = priv;
-
-	free(pevent->func_resolver);
-	pevent->func_resolver = resolver;
-
-	return 0;
-}
-
-/**
- * pevent_reset_function_resolver - reset alternative function resolver
- * @pevent: handle for the pevent
- *
- * Stop using whatever alternative resolver was set, use the default
- * one instead.
- */
-void pevent_reset_function_resolver(struct pevent *pevent)
-{
-	free(pevent->func_resolver);
-	pevent->func_resolver = NULL;
-}
-
-static struct func_map *
-find_func(struct pevent *pevent, unsigned long long addr)
-{
-	struct func_map *map;
-
-	if (!pevent->func_resolver)
-		return __find_func(pevent, addr);
-
-	map = &pevent->func_resolver->map;
-	map->mod  = NULL;
-	map->addr = addr;
-	map->func = pevent->func_resolver->func(pevent->func_resolver->priv,
-						&map->addr, &map->mod);
-	if (map->func == NULL)
-		return NULL;
-
-	return map;
-}
-
-/**
- * pevent_find_function - find a function by a given address
- * @pevent: handle for the pevent
- * @addr: the address to find the function with
- *
- * Returns a pointer to the function stored that has the given
- * address. Note, the address does not have to be exact, it
- * will select the function that would contain the address.
- */
-const char *pevent_find_function(struct pevent *pevent, unsigned long long addr)
-{
-	struct func_map *map;
-
-	map = find_func(pevent, addr);
-	if (!map)
-		return NULL;
-
-	return map->func;
-}
-
-/**
- * pevent_find_function_address - find a function address by a given address
- * @pevent: handle for the pevent
- * @addr: the address to find the function with
- *
- * Returns the address the function starts at. This can be used in
- * conjunction with pevent_find_function to print both the function
- * name and the function offset.
- */
-unsigned long long
-pevent_find_function_address(struct pevent *pevent, unsigned long long addr)
-{
-	struct func_map *map;
-
-	map = find_func(pevent, addr);
-	if (!map)
-		return 0;
-
-	return map->addr;
-}
-
-/**
- * pevent_register_function - register a function with a given address
- * @pevent: handle for the pevent
- * @function: the function name to register
- * @addr: the address the function starts at
- * @mod: the kernel module the function may be in (NULL for none)
- *
- * This registers a function name with an address and module.
- * The @func passed in is duplicated.
- */
-int pevent_register_function(struct pevent *pevent, char *func,
-			     unsigned long long addr, char *mod)
-{
-	struct func_list *item = malloc(sizeof(*item));
-
-	if (!item)
-		return -1;
-
-	item->next = pevent->funclist;
-	item->func = strdup(func);
-	if (!item->func)
-		goto out_free;
-
-	if (mod) {
-		item->mod = strdup(mod);
-		if (!item->mod)
-			goto out_free_func;
-	} else
-		item->mod = NULL;
-	item->addr = addr;
-
-	pevent->funclist = item;
-	pevent->func_count++;
-
-	return 0;
-
-out_free_func:
-	free(item->func);
-	item->func = NULL;
-out_free:
-	free(item);
-	errno = ENOMEM;
-	return -1;
-}
-
-/**
- * pevent_print_funcs - print out the stored functions
- * @pevent: handle for the pevent
- *
- * This prints out the stored functions.
- */
-void pevent_print_funcs(struct pevent *pevent)
-{
-	int i;
-
-	if (!pevent->func_map)
-		func_map_init(pevent);
-
-	for (i = 0; i < (int)pevent->func_count; i++) {
-		printf("%016llx %s",
-		       pevent->func_map[i].addr,
-		       pevent->func_map[i].func);
-		if (pevent->func_map[i].mod)
-			printf(" [%s]\n", pevent->func_map[i].mod);
-		else
-			printf("\n");
-	}
-}
-
-struct printk_map {
-	unsigned long long		addr;
-	char				*printk;
-};
-
-struct printk_list {
-	struct printk_list	*next;
-	unsigned long long	addr;
-	char			*printk;
-};
-
-static int printk_cmp(const void *a, const void *b)
-{
-	const struct printk_map *pa = a;
-	const struct printk_map *pb = b;
-
-	if (pa->addr < pb->addr)
-		return -1;
-	if (pa->addr > pb->addr)
-		return 1;
-
-	return 0;
-}
-
-static int printk_map_init(struct pevent *pevent)
-{
-	struct printk_list *printklist;
-	struct printk_list *item;
-	struct printk_map *printk_map;
-	int i;
-
-	printk_map = malloc(sizeof(*printk_map) * (pevent->printk_count + 1));
-	if (!printk_map)
-		return -1;
-
-	printklist = pevent->printklist;
-
-	i = 0;
-	while (printklist) {
-		printk_map[i].printk = printklist->printk;
-		printk_map[i].addr = printklist->addr;
-		i++;
-		item = printklist;
-		printklist = printklist->next;
-		free(item);
-	}
-
-	qsort(printk_map, pevent->printk_count, sizeof(*printk_map), printk_cmp);
-
-	pevent->printk_map = printk_map;
-	pevent->printklist = NULL;
-
-	return 0;
-}
-
-static struct printk_map *
-find_printk(struct pevent *pevent, unsigned long long addr)
-{
-	struct printk_map *printk;
-	struct printk_map key;
-
-	if (!pevent->printk_map && printk_map_init(pevent))
-		return NULL;
-
-	key.addr = addr;
-
-	printk = bsearch(&key, pevent->printk_map, pevent->printk_count,
-			 sizeof(*pevent->printk_map), printk_cmp);
-
-	return printk;
-}
-
-/**
- * pevent_register_print_string - register a string by its address
- * @pevent: handle for the pevent
- * @fmt: the string format to register
- * @addr: the address the string was located at
- *
- * This registers a string by the address it was stored in the kernel.
- * The @fmt passed in is duplicated.
- */
-int pevent_register_print_string(struct pevent *pevent, const char *fmt,
-				 unsigned long long addr)
-{
-	struct printk_list *item = malloc(sizeof(*item));
-	char *p;
-
-	if (!item)
-		return -1;
-
-	item->next = pevent->printklist;
-	item->addr = addr;
-
-	/* Strip off quotes and '\n' from the end */
-	if (fmt[0] == '"')
-		fmt++;
-	item->printk = strdup(fmt);
-	if (!item->printk)
-		goto out_free;
-
-	p = item->printk + strlen(item->printk) - 1;
-	if (*p == '"')
-		*p = 0;
-
-	p -= 2;
-	if (strcmp(p, "\\n") == 0)
-		*p = 0;
-
-	pevent->printklist = item;
-	pevent->printk_count++;
-
-	return 0;
-
-out_free:
-	free(item);
-	errno = ENOMEM;
-	return -1;
-}
-
-/**
- * pevent_print_printk - print out the stored strings
- * @pevent: handle for the pevent
- *
- * This prints the string formats that were stored.
- */
-void pevent_print_printk(struct pevent *pevent)
-{
-	int i;
-
-	if (!pevent->printk_map)
-		printk_map_init(pevent);
-
-	for (i = 0; i < (int)pevent->printk_count; i++) {
-		printf("%016llx %s\n",
-		       pevent->printk_map[i].addr,
-		       pevent->printk_map[i].printk);
-	}
-}
-
-static struct event_format *alloc_event(void)
-{
-	return calloc(1, sizeof(struct event_format));
-}
-
-static int add_event(struct pevent *pevent, struct event_format *event)
-{
-	int i;
-	struct event_format **events = realloc(pevent->events, sizeof(event) *
-					       (pevent->nr_events + 1));
-	if (!events)
-		return -1;
-
-	pevent->events = events;
-
-	for (i = 0; i < pevent->nr_events; i++) {
-		if (pevent->events[i]->id > event->id)
-			break;
-	}
-	if (i < pevent->nr_events)
-		memmove(&pevent->events[i + 1],
-			&pevent->events[i],
-			sizeof(event) * (pevent->nr_events - i));
-
-	pevent->events[i] = event;
-	pevent->nr_events++;
-
-	event->pevent = pevent;
-
-	return 0;
-}
-
-static int event_item_type(enum event_type type)
-{
-	switch (type) {
-	case EVENT_ITEM ... EVENT_SQUOTE:
-		return 1;
-	case EVENT_ERROR ... EVENT_DELIM:
-	default:
-		return 0;
-	}
-}
-
-static void free_flag_sym(struct print_flag_sym *fsym)
-{
-	struct print_flag_sym *next;
-
-	while (fsym) {
-		next = fsym->next;
-		free(fsym->value);
-		free(fsym->str);
-		free(fsym);
-		fsym = next;
-	}
-}
-
-static void free_arg(struct print_arg *arg)
-{
-	struct print_arg *farg;
-
-	if (!arg)
-		return;
-
-	switch (arg->type) {
-	case PRINT_ATOM:
-		free(arg->atom.atom);
-		break;
-	case PRINT_FIELD:
-		free(arg->field.name);
-		break;
-	case PRINT_FLAGS:
-		free_arg(arg->flags.field);
-		free(arg->flags.delim);
-		free_flag_sym(arg->flags.flags);
-		break;
-	case PRINT_SYMBOL:
-		free_arg(arg->symbol.field);
-		free_flag_sym(arg->symbol.symbols);
-		break;
-	case PRINT_HEX:
-		free_arg(arg->hex.field);
-		free_arg(arg->hex.size);
-		break;
-	case PRINT_INT_ARRAY:
-		free_arg(arg->int_array.field);
-		free_arg(arg->int_array.count);
-		free_arg(arg->int_array.el_size);
-		break;
-	case PRINT_TYPE:
-		free(arg->typecast.type);
-		free_arg(arg->typecast.item);
-		break;
-	case PRINT_STRING:
-	case PRINT_BSTRING:
-		free(arg->string.string);
-		break;
-	case PRINT_BITMASK:
-		free(arg->bitmask.bitmask);
-		break;
-	case PRINT_DYNAMIC_ARRAY:
-	case PRINT_DYNAMIC_ARRAY_LEN:
-		free(arg->dynarray.index);
-		break;
-	case PRINT_OP:
-		free(arg->op.op);
-		free_arg(arg->op.left);
-		free_arg(arg->op.right);
-		break;
-	case PRINT_FUNC:
-		while (arg->func.args) {
-			farg = arg->func.args;
-			arg->func.args = farg->next;
-			free_arg(farg);
-		}
-		break;
-
-	case PRINT_NULL:
-	default:
-		break;
-	}
-
-	free(arg);
-}
-
-static enum event_type get_type(int ch)
-{
-	if (ch == '\n')
-		return EVENT_NEWLINE;
-	if (isspace(ch))
-		return EVENT_SPACE;
-	if (isalnum(ch) || ch == '_')
-		return EVENT_ITEM;
-	if (ch == '\'')
-		return EVENT_SQUOTE;
-	if (ch == '"')
-		return EVENT_DQUOTE;
-	if (!isprint(ch))
-		return EVENT_NONE;
-	if (ch == '(' || ch == ')' || ch == ',')
-		return EVENT_DELIM;
-
-	return EVENT_OP;
-}
-
-static int __read_char(void)
-{
-	if (input_buf_ptr >= input_buf_siz)
-		return -1;
-
-	return input_buf[input_buf_ptr++];
-}
-
-static int __peek_char(void)
-{
-	if (input_buf_ptr >= input_buf_siz)
-		return -1;
-
-	return input_buf[input_buf_ptr];
-}
-
-/**
- * pevent_peek_char - peek at the next character that will be read
- *
- * Returns the next character read, or -1 if end of buffer.
- */
-int pevent_peek_char(void)
-{
-	return __peek_char();
-}
-
-static int extend_token(char **tok, char *buf, int size)
-{
-	char *newtok = realloc(*tok, size);
-
-	if (!newtok) {
-		free(*tok);
-		*tok = NULL;
-		return -1;
-	}
-
-	if (!*tok)
-		strcpy(newtok, buf);
-	else
-		strcat(newtok, buf);
-	*tok = newtok;
-
-	return 0;
-}
-
-static enum event_type force_token(const char *str, char **tok);
-
-static enum event_type __read_token(char **tok)
-{
-	char buf[BUFSIZ];
-	int ch, last_ch, quote_ch, next_ch;
-	int i = 0;
-	int tok_size = 0;
-	enum event_type type;
-
-	*tok = NULL;
-
-
-	ch = __read_char();
-	if (ch < 0)
-		return EVENT_NONE;
-
-	type = get_type(ch);
-	if (type == EVENT_NONE)
-		return type;
-
-	buf[i++] = ch;
-
-	switch (type) {
-	case EVENT_NEWLINE:
-	case EVENT_DELIM:
-		if (asprintf(tok, "%c", ch) < 0)
-			return EVENT_ERROR;
-
-		return type;
-
-	case EVENT_OP:
-		switch (ch) {
-		case '-':
-			next_ch = __peek_char();
-			if (next_ch == '>') {
-				buf[i++] = __read_char();
-				break;
-			}
-			/* fall through */
-		case '+':
-		case '|':
-		case '&':
-		case '>':
-		case '<':
-			last_ch = ch;
-			ch = __peek_char();
-			if (ch != last_ch)
-				goto test_equal;
-			buf[i++] = __read_char();
-			switch (last_ch) {
-			case '>':
-			case '<':
-				goto test_equal;
-			default:
-				break;
-			}
-			break;
-		case '!':
-		case '=':
-			goto test_equal;
-		default: /* what should we do instead? */
-			break;
-		}
-		buf[i] = 0;
-		*tok = strdup(buf);
-		return type;
-
- test_equal:
-		ch = __peek_char();
-		if (ch == '=')
-			buf[i++] = __read_char();
-		goto out;
-
-	case EVENT_DQUOTE:
-	case EVENT_SQUOTE:
-		/* don't keep quotes */
-		i--;
-		quote_ch = ch;
-		last_ch = 0;
- concat:
-		do {
-			if (i == (BUFSIZ - 1)) {
-				buf[i] = 0;
-				tok_size += BUFSIZ;
-
-				if (extend_token(tok, buf, tok_size) < 0)
-					return EVENT_NONE;
-				i = 0;
-			}
-			last_ch = ch;
-			ch = __read_char();
-			buf[i++] = ch;
-			/* the '\' '\' will cancel itself */
-			if (ch == '\\' && last_ch == '\\')
-				last_ch = 0;
-		} while (ch != quote_ch || last_ch == '\\');
-		/* remove the last quote */
-		i--;
-
-		/*
-		 * For strings (double quotes) check the next token.
-		 * If it is another string, concatinate the two.
-		 */
-		if (type == EVENT_DQUOTE) {
-			unsigned long long save_input_buf_ptr = input_buf_ptr;
-
-			do {
-				ch = __read_char();
-			} while (isspace(ch));
-			if (ch == '"')
-				goto concat;
-			input_buf_ptr = save_input_buf_ptr;
-		}
-
-		goto out;
-
-	case EVENT_ERROR ... EVENT_SPACE:
-	case EVENT_ITEM:
-	default:
-		break;
-	}
-
-	while (get_type(__peek_char()) == type) {
-		if (i == (BUFSIZ - 1)) {
-			buf[i] = 0;
-			tok_size += BUFSIZ;
-
-			if (extend_token(tok, buf, tok_size) < 0)
-				return EVENT_NONE;
-			i = 0;
-		}
-		ch = __read_char();
-		buf[i++] = ch;
-	}
-
- out:
-	buf[i] = 0;
-	if (extend_token(tok, buf, tok_size + i + 1) < 0)
-		return EVENT_NONE;
-
-	if (type == EVENT_ITEM) {
-		/*
-		 * Older versions of the kernel has a bug that
-		 * creates invalid symbols and will break the mac80211
-		 * parsing. This is a work around to that bug.
-		 *
-		 * See Linux kernel commit:
-		 *  811cb50baf63461ce0bdb234927046131fc7fa8b
-		 */
-		if (strcmp(*tok, "LOCAL_PR_FMT") == 0) {
-			free(*tok);
-			*tok = NULL;
-			return force_token("\"\%s\" ", tok);
-		} else if (strcmp(*tok, "STA_PR_FMT") == 0) {
-			free(*tok);
-			*tok = NULL;
-			return force_token("\" sta:%pM\" ", tok);
-		} else if (strcmp(*tok, "VIF_PR_FMT") == 0) {
-			free(*tok);
-			*tok = NULL;
-			return force_token("\" vif:%p(%d)\" ", tok);
-		}
-	}
-
-	return type;
-}
-
-static enum event_type force_token(const char *str, char **tok)
-{
-	const char *save_input_buf;
-	unsigned long long save_input_buf_ptr;
-	unsigned long long save_input_buf_siz;
-	enum event_type type;
-	
-	/* save off the current input pointers */
-	save_input_buf = input_buf;
-	save_input_buf_ptr = input_buf_ptr;
-	save_input_buf_siz = input_buf_siz;
-
-	init_input_buf(str, strlen(str));
-
-	type = __read_token(tok);
-
-	/* reset back to original token */
-	input_buf = save_input_buf;
-	input_buf_ptr = save_input_buf_ptr;
-	input_buf_siz = save_input_buf_siz;
-
-	return type;
-}
-
-static void free_token(char *tok)
-{
-	if (tok)
-		free(tok);
-}
-
-static enum event_type read_token(char **tok)
-{
-	enum event_type type;
-
-	for (;;) {
-		type = __read_token(tok);
-		if (type != EVENT_SPACE)
-			return type;
-
-		free_token(*tok);
-	}
-
-	/* not reached */
-	*tok = NULL;
-	return EVENT_NONE;
-}
-
-/**
- * pevent_read_token - access to utilites to use the pevent parser
- * @tok: The token to return
- *
- * This will parse tokens from the string given by
- * pevent_init_data().
- *
- * Returns the token type.
- */
-enum event_type pevent_read_token(char **tok)
-{
-	return read_token(tok);
-}
-
-/**
- * pevent_free_token - free a token returned by pevent_read_token
- * @token: the token to free
- */
-void pevent_free_token(char *token)
-{
-	free_token(token);
-}
-
-/* no newline */
-static enum event_type read_token_item(char **tok)
-{
-	enum event_type type;
-
-	for (;;) {
-		type = __read_token(tok);
-		if (type != EVENT_SPACE && type != EVENT_NEWLINE)
-			return type;
-		free_token(*tok);
-		*tok = NULL;
-	}
-
-	/* not reached */
-	*tok = NULL;
-	return EVENT_NONE;
-}
-
-static int test_type(enum event_type type, enum event_type expect)
-{
-	if (type != expect) {
-		do_warning("Error: expected type %d but read %d",
-		    expect, type);
-		return -1;
-	}
-	return 0;
-}
-
-static int test_type_token(enum event_type type, const char *token,
-		    enum event_type expect, const char *expect_tok)
-{
-	if (type != expect) {
-		do_warning("Error: expected type %d but read %d",
-		    expect, type);
-		return -1;
-	}
-
-	if (strcmp(token, expect_tok) != 0) {
-		do_warning("Error: expected '%s' but read '%s'",
-		    expect_tok, token);
-		return -1;
-	}
-	return 0;
-}
-
-static int __read_expect_type(enum event_type expect, char **tok, int newline_ok)
-{
-	enum event_type type;
-
-	if (newline_ok)
-		type = read_token(tok);
-	else
-		type = read_token_item(tok);
-	return test_type(type, expect);
-}
-
-static int read_expect_type(enum event_type expect, char **tok)
-{
-	return __read_expect_type(expect, tok, 1);
-}
-
-static int __read_expected(enum event_type expect, const char *str,
-			   int newline_ok)
-{
-	enum event_type type;
-	char *token;
-	int ret;
-
-	if (newline_ok)
-		type = read_token(&token);
-	else
-		type = read_token_item(&token);
-
-	ret = test_type_token(type, token, expect, str);
-
-	free_token(token);
-
-	return ret;
-}
-
-static int read_expected(enum event_type expect, const char *str)
-{
-	return __read_expected(expect, str, 1);
-}
-
-static int read_expected_item(enum event_type expect, const char *str)
-{
-	return __read_expected(expect, str, 0);
-}
-
-static char *event_read_name(void)
-{
-	char *token;
-
-	if (read_expected(EVENT_ITEM, "name") < 0)
-		return NULL;
-
-	if (read_expected(EVENT_OP, ":") < 0)
-		return NULL;
-
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto fail;
-
-	return token;
-
- fail:
-	free_token(token);
-	return NULL;
-}
-
-static int event_read_id(void)
-{
-	char *token;
-	int id;
-
-	if (read_expected_item(EVENT_ITEM, "ID") < 0)
-		return -1;
-
-	if (read_expected(EVENT_OP, ":") < 0)
-		return -1;
-
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto fail;
-
-	id = strtoul(token, NULL, 0);
-	free_token(token);
-	return id;
-
- fail:
-	free_token(token);
-	return -1;
-}
-
-static int field_is_string(struct format_field *field)
-{
-	if ((field->flags & FIELD_IS_ARRAY) &&
-	    (strstr(field->type, "char") || strstr(field->type, "u8") ||
-	     strstr(field->type, "s8")))
-		return 1;
-
-	return 0;
-}
-
-static int field_is_dynamic(struct format_field *field)
-{
-	if (strncmp(field->type, "__data_loc", 10) == 0)
-		return 1;
-
-	return 0;
-}
-
-static int field_is_long(struct format_field *field)
-{
-	/* includes long long */
-	if (strstr(field->type, "long"))
-		return 1;
-
-	return 0;
-}
-
-static unsigned int type_size(const char *name)
-{
-	/* This covers all FIELD_IS_STRING types. */
-	static struct {
-		const char *type;
-		unsigned int size;
-	} table[] = {
-		{ "u8",   1 },
-		{ "u16",  2 },
-		{ "u32",  4 },
-		{ "u64",  8 },
-		{ "s8",   1 },
-		{ "s16",  2 },
-		{ "s32",  4 },
-		{ "s64",  8 },
-		{ "char", 1 },
-		{ },
-	};
-	int i;
-
-	for (i = 0; table[i].type; i++) {
-		if (!strcmp(table[i].type, name))
-			return table[i].size;
-	}
-
-	return 0;
-}
-
-static int event_read_fields(struct event_format *event, struct format_field **fields)
-{
-	struct format_field *field = NULL;
-	enum event_type type;
-	char *token;
-	char *last_token;
-	int count = 0;
-
-	do {
-		unsigned int size_dynamic = 0;
-
-		type = read_token(&token);
-		if (type == EVENT_NEWLINE) {
-			free_token(token);
-			return count;
-		}
-
-		count++;
-
-		if (test_type_token(type, token, EVENT_ITEM, "field"))
-			goto fail;
-		free_token(token);
-
-		type = read_token(&token);
-		/*
-		 * The ftrace fields may still use the "special" name.
-		 * Just ignore it.
-		 */
-		if (event->flags & EVENT_FL_ISFTRACE &&
-		    type == EVENT_ITEM && strcmp(token, "special") == 0) {
-			free_token(token);
-			type = read_token(&token);
-		}
-
-		if (test_type_token(type, token, EVENT_OP, ":") < 0)
-			goto fail;
-
-		free_token(token);
-		if (read_expect_type(EVENT_ITEM, &token) < 0)
-			goto fail;
-
-		last_token = token;
-
-		field = calloc(1, sizeof(*field));
-		if (!field)
-			goto fail;
-
-		field->event = event;
-
-		/* read the rest of the type */
-		for (;;) {
-			type = read_token(&token);
-			if (type == EVENT_ITEM ||
-			    (type == EVENT_OP && strcmp(token, "*") == 0) ||
-			    /*
-			     * Some of the ftrace fields are broken and have
-			     * an illegal "." in them.
-			     */
-			    (event->flags & EVENT_FL_ISFTRACE &&
-			     type == EVENT_OP && strcmp(token, ".") == 0)) {
-
-				if (strcmp(token, "*") == 0)
-					field->flags |= FIELD_IS_POINTER;
-
-				if (field->type) {
-					char *new_type;
-					new_type = realloc(field->type,
-							   strlen(field->type) +
-							   strlen(last_token) + 2);
-					if (!new_type) {
-						free(last_token);
-						goto fail;
-					}
-					field->type = new_type;
-					strcat(field->type, " ");
-					strcat(field->type, last_token);
-					free(last_token);
-				} else
-					field->type = last_token;
-				last_token = token;
-				continue;
-			}
-
-			break;
-		}
-
-		if (!field->type) {
-			do_warning_event(event, "%s: no type found", __func__);
-			goto fail;
-		}
-		field->name = field->alias = last_token;
-
-		if (test_type(type, EVENT_OP))
-			goto fail;
-
-		if (strcmp(token, "[") == 0) {
-			enum event_type last_type = type;
-			char *brackets = token;
-			char *new_brackets;
-			int len;
-
-			field->flags |= FIELD_IS_ARRAY;
-
-			type = read_token(&token);
-
-			if (type == EVENT_ITEM)
-				field->arraylen = strtoul(token, NULL, 0);
-			else
-				field->arraylen = 0;
-
-		        while (strcmp(token, "]") != 0) {
-				if (last_type == EVENT_ITEM &&
-				    type == EVENT_ITEM)
-					len = 2;
-				else
-					len = 1;
-				last_type = type;
-
-				new_brackets = realloc(brackets,
-						       strlen(brackets) +
-						       strlen(token) + len);
-				if (!new_brackets) {
-					free(brackets);
-					goto fail;
-				}
-				brackets = new_brackets;
-				if (len == 2)
-					strcat(brackets, " ");
-				strcat(brackets, token);
-				/* We only care about the last token */
-				field->arraylen = strtoul(token, NULL, 0);
-				free_token(token);
-				type = read_token(&token);
-				if (type == EVENT_NONE) {
-					do_warning_event(event, "failed to find token");
-					goto fail;
-				}
-			}
-
-			free_token(token);
-
-			new_brackets = realloc(brackets, strlen(brackets) + 2);
-			if (!new_brackets) {
-				free(brackets);
-				goto fail;
-			}
-			brackets = new_brackets;
-			strcat(brackets, "]");
-
-			/* add brackets to type */
-
-			type = read_token(&token);
-			/*
-			 * If the next token is not an OP, then it is of
-			 * the format: type [] item;
-			 */
-			if (type == EVENT_ITEM) {
-				char *new_type;
-				new_type = realloc(field->type,
-						   strlen(field->type) +
-						   strlen(field->name) +
-						   strlen(brackets) + 2);
-				if (!new_type) {
-					free(brackets);
-					goto fail;
-				}
-				field->type = new_type;
-				strcat(field->type, " ");
-				strcat(field->type, field->name);
-				size_dynamic = type_size(field->name);
-				free_token(field->name);
-				strcat(field->type, brackets);
-				field->name = field->alias = token;
-				type = read_token(&token);
-			} else {
-				char *new_type;
-				new_type = realloc(field->type,
-						   strlen(field->type) +
-						   strlen(brackets) + 1);
-				if (!new_type) {
-					free(brackets);
-					goto fail;
-				}
-				field->type = new_type;
-				strcat(field->type, brackets);
-			}
-			free(brackets);
-		}
-
-		if (field_is_string(field))
-			field->flags |= FIELD_IS_STRING;
-		if (field_is_dynamic(field))
-			field->flags |= FIELD_IS_DYNAMIC;
-		if (field_is_long(field))
-			field->flags |= FIELD_IS_LONG;
-
-		if (test_type_token(type, token,  EVENT_OP, ";"))
-			goto fail;
-		free_token(token);
-
-		if (read_expected(EVENT_ITEM, "offset") < 0)
-			goto fail_expect;
-
-		if (read_expected(EVENT_OP, ":") < 0)
-			goto fail_expect;
-
-		if (read_expect_type(EVENT_ITEM, &token))
-			goto fail;
-		field->offset = strtoul(token, NULL, 0);
-		free_token(token);
-
-		if (read_expected(EVENT_OP, ";") < 0)
-			goto fail_expect;
-
-		if (read_expected(EVENT_ITEM, "size") < 0)
-			goto fail_expect;
-
-		if (read_expected(EVENT_OP, ":") < 0)
-			goto fail_expect;
-
-		if (read_expect_type(EVENT_ITEM, &token))
-			goto fail;
-		field->size = strtoul(token, NULL, 0);
-		free_token(token);
-
-		if (read_expected(EVENT_OP, ";") < 0)
-			goto fail_expect;
-
-		type = read_token(&token);
-		if (type != EVENT_NEWLINE) {
-			/* newer versions of the kernel have a "signed" type */
-			if (test_type_token(type, token, EVENT_ITEM, "signed"))
-				goto fail;
-
-			free_token(token);
-
-			if (read_expected(EVENT_OP, ":") < 0)
-				goto fail_expect;
-
-			if (read_expect_type(EVENT_ITEM, &token))
-				goto fail;
-
-			if (strtoul(token, NULL, 0))
-				field->flags |= FIELD_IS_SIGNED;
-
-			free_token(token);
-			if (read_expected(EVENT_OP, ";") < 0)
-				goto fail_expect;
-
-			if (read_expect_type(EVENT_NEWLINE, &token))
-				goto fail;
-		}
-
-		free_token(token);
-
-		if (field->flags & FIELD_IS_ARRAY) {
-			if (field->arraylen)
-				field->elementsize = field->size / field->arraylen;
-			else if (field->flags & FIELD_IS_DYNAMIC)
-				field->elementsize = size_dynamic;
-			else if (field->flags & FIELD_IS_STRING)
-				field->elementsize = 1;
-			else if (field->flags & FIELD_IS_LONG)
-				field->elementsize = event->pevent ?
-						     event->pevent->long_size :
-						     sizeof(long);
-		} else
-			field->elementsize = field->size;
-
-		*fields = field;
-		fields = &field->next;
-
-	} while (1);
-
-	return 0;
-
-fail:
-	free_token(token);
-fail_expect:
-	if (field) {
-		free(field->type);
-		free(field->name);
-		free(field);
-	}
-	return -1;
-}
-
-static int event_read_format(struct event_format *event)
-{
-	char *token;
-	int ret;
-
-	if (read_expected_item(EVENT_ITEM, "format") < 0)
-		return -1;
-
-	if (read_expected(EVENT_OP, ":") < 0)
-		return -1;
-
-	if (read_expect_type(EVENT_NEWLINE, &token))
-		goto fail;
-	free_token(token);
-
-	ret = event_read_fields(event, &event->format.common_fields);
-	if (ret < 0)
-		return ret;
-	event->format.nr_common = ret;
-
-	ret = event_read_fields(event, &event->format.fields);
-	if (ret < 0)
-		return ret;
-	event->format.nr_fields = ret;
-
-	return 0;
-
- fail:
-	free_token(token);
-	return -1;
-}
-
-static enum event_type
-process_arg_token(struct event_format *event, struct print_arg *arg,
-		  char **tok, enum event_type type);
-
-static enum event_type
-process_arg(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	enum event_type type;
-	char *token;
-
-	type = read_token(&token);
-	*tok = token;
-
-	return process_arg_token(event, arg, tok, type);
-}
-
-static enum event_type
-process_op(struct event_format *event, struct print_arg *arg, char **tok);
-
-/*
- * For __print_symbolic() and __print_flags, we need to completely
- * evaluate the first argument, which defines what to print next.
- */
-static enum event_type
-process_field_arg(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	enum event_type type;
-
-	type = process_arg(event, arg, tok);
-
-	while (type == EVENT_OP) {
-		type = process_op(event, arg, tok);
-	}
-
-	return type;
-}
-
-static enum event_type
-process_cond(struct event_format *event, struct print_arg *top, char **tok)
-{
-	struct print_arg *arg, *left, *right;
-	enum event_type type;
-	char *token = NULL;
-
-	arg = alloc_arg();
-	left = alloc_arg();
-	right = alloc_arg();
-
-	if (!arg || !left || !right) {
-		do_warning_event(event, "%s: not enough memory!", __func__);
-		/* arg will be freed at out_free */
-		free_arg(left);
-		free_arg(right);
-		goto out_free;
-	}
-
-	arg->type = PRINT_OP;
-	arg->op.left = left;
-	arg->op.right = right;
-
-	*tok = NULL;
-	type = process_arg(event, left, &token);
-
- again:
-	if (type == EVENT_ERROR)
-		goto out_free;
-
-	/* Handle other operations in the arguments */
-	if (type == EVENT_OP && strcmp(token, ":") != 0) {
-		type = process_op(event, left, &token);
-		goto again;
-	}
-
-	if (test_type_token(type, token, EVENT_OP, ":"))
-		goto out_free;
-
-	arg->op.op = token;
-
-	type = process_arg(event, right, &token);
-
-	top->op.right = arg;
-
-	*tok = token;
-	return type;
-
-out_free:
-	/* Top may point to itself */
-	top->op.right = NULL;
-	free_token(token);
-	free_arg(arg);
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_array(struct event_format *event, struct print_arg *top, char **tok)
-{
-	struct print_arg *arg;
-	enum event_type type;
-	char *token = NULL;
-
-	arg = alloc_arg();
-	if (!arg) {
-		do_warning_event(event, "%s: not enough memory!", __func__);
-		/* '*tok' is set to top->op.op.  No need to free. */
-		*tok = NULL;
-		return EVENT_ERROR;
-	}
-
-	*tok = NULL;
-	type = process_arg(event, arg, &token);
-	if (test_type_token(type, token, EVENT_OP, "]"))
-		goto out_free;
-
-	top->op.right = arg;
-
-	free_token(token);
-	type = read_token_item(&token);
-	*tok = token;
-
-	return type;
-
-out_free:
-	free_token(token);
-	free_arg(arg);
-	return EVENT_ERROR;
-}
-
-static int get_op_prio(char *op)
-{
-	if (!op[1]) {
-		switch (op[0]) {
-		case '~':
-		case '!':
-			return 4;
-		case '*':
-		case '/':
-		case '%':
-			return 6;
-		case '+':
-		case '-':
-			return 7;
-			/* '>>' and '<<' are 8 */
-		case '<':
-		case '>':
-			return 9;
-			/* '==' and '!=' are 10 */
-		case '&':
-			return 11;
-		case '^':
-			return 12;
-		case '|':
-			return 13;
-		case '?':
-			return 16;
-		default:
-			do_warning("unknown op '%c'", op[0]);
-			return -1;
-		}
-	} else {
-		if (strcmp(op, "++") == 0 ||
-		    strcmp(op, "--") == 0) {
-			return 3;
-		} else if (strcmp(op, ">>") == 0 ||
-			   strcmp(op, "<<") == 0) {
-			return 8;
-		} else if (strcmp(op, ">=") == 0 ||
-			   strcmp(op, "<=") == 0) {
-			return 9;
-		} else if (strcmp(op, "==") == 0 ||
-			   strcmp(op, "!=") == 0) {
-			return 10;
-		} else if (strcmp(op, "&&") == 0) {
-			return 14;
-		} else if (strcmp(op, "||") == 0) {
-			return 15;
-		} else {
-			do_warning("unknown op '%s'", op);
-			return -1;
-		}
-	}
-}
-
-static int set_op_prio(struct print_arg *arg)
-{
-
-	/* single ops are the greatest */
-	if (!arg->op.left || arg->op.left->type == PRINT_NULL)
-		arg->op.prio = 0;
-	else
-		arg->op.prio = get_op_prio(arg->op.op);
-
-	return arg->op.prio;
-}
-
-/* Note, *tok does not get freed, but will most likely be saved */
-static enum event_type
-process_op(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	struct print_arg *left, *right = NULL;
-	enum event_type type;
-	char *token;
-
-	/* the op is passed in via tok */
-	token = *tok;
-
-	if (arg->type == PRINT_OP && !arg->op.left) {
-		/* handle single op */
-		if (token[1]) {
-			do_warning_event(event, "bad op token %s", token);
-			goto out_free;
-		}
-		switch (token[0]) {
-		case '~':
-		case '!':
-		case '+':
-		case '-':
-			break;
-		default:
-			do_warning_event(event, "bad op token %s", token);
-			goto out_free;
-
-		}
-
-		/* make an empty left */
-		left = alloc_arg();
-		if (!left)
-			goto out_warn_free;
-
-		left->type = PRINT_NULL;
-		arg->op.left = left;
-
-		right = alloc_arg();
-		if (!right)
-			goto out_warn_free;
-
-		arg->op.right = right;
-
-		/* do not free the token, it belongs to an op */
-		*tok = NULL;
-		type = process_arg(event, right, tok);
-
-	} else if (strcmp(token, "?") == 0) {
-
-		left = alloc_arg();
-		if (!left)
-			goto out_warn_free;
-
-		/* copy the top arg to the left */
-		*left = *arg;
-
-		arg->type = PRINT_OP;
-		arg->op.op = token;
-		arg->op.left = left;
-		arg->op.prio = 0;
-
-		/* it will set arg->op.right */
-		type = process_cond(event, arg, tok);
-
-	} else if (strcmp(token, ">>") == 0 ||
-		   strcmp(token, "<<") == 0 ||
-		   strcmp(token, "&") == 0 ||
-		   strcmp(token, "|") == 0 ||
-		   strcmp(token, "&&") == 0 ||
-		   strcmp(token, "||") == 0 ||
-		   strcmp(token, "-") == 0 ||
-		   strcmp(token, "+") == 0 ||
-		   strcmp(token, "*") == 0 ||
-		   strcmp(token, "^") == 0 ||
-		   strcmp(token, "/") == 0 ||
-		   strcmp(token, "<") == 0 ||
-		   strcmp(token, ">") == 0 ||
-		   strcmp(token, "<=") == 0 ||
-		   strcmp(token, ">=") == 0 ||
-		   strcmp(token, "==") == 0 ||
-		   strcmp(token, "!=") == 0) {
-
-		left = alloc_arg();
-		if (!left)
-			goto out_warn_free;
-
-		/* copy the top arg to the left */
-		*left = *arg;
-
-		arg->type = PRINT_OP;
-		arg->op.op = token;
-		arg->op.left = left;
-		arg->op.right = NULL;
-
-		if (set_op_prio(arg) == -1) {
-			event->flags |= EVENT_FL_FAILED;
-			/* arg->op.op (= token) will be freed at out_free */
-			arg->op.op = NULL;
-			goto out_free;
-		}
-
-		type = read_token_item(&token);
-		*tok = token;
-
-		/* could just be a type pointer */
-		if ((strcmp(arg->op.op, "*") == 0) &&
-		    type == EVENT_DELIM && (strcmp(token, ")") == 0)) {
-			char *new_atom;
-
-			if (left->type != PRINT_ATOM) {
-				do_warning_event(event, "bad pointer type");
-				goto out_free;
-			}
-			new_atom = realloc(left->atom.atom,
-					    strlen(left->atom.atom) + 3);
-			if (!new_atom)
-				goto out_warn_free;
-
-			left->atom.atom = new_atom;
-			strcat(left->atom.atom, " *");
-			free(arg->op.op);
-			*arg = *left;
-			free(left);
-
-			return type;
-		}
-
-		right = alloc_arg();
-		if (!right)
-			goto out_warn_free;
-
-		type = process_arg_token(event, right, tok, type);
-		if (type == EVENT_ERROR) {
-			free_arg(right);
-			/* token was freed in process_arg_token() via *tok */
-			token = NULL;
-			goto out_free;
-		}
-
-		if (right->type == PRINT_OP &&
-		    get_op_prio(arg->op.op) < get_op_prio(right->op.op)) {
-			struct print_arg tmp;
-
-			/* rotate ops according to the priority */
-			arg->op.right = right->op.left;
-
-			tmp = *arg;
-			*arg = *right;
-			*right = tmp;
-
-			arg->op.left = right;
-		} else {
-			arg->op.right = right;
-		}
-
-	} else if (strcmp(token, "[") == 0) {
-
-		left = alloc_arg();
-		if (!left)
-			goto out_warn_free;
-
-		*left = *arg;
-
-		arg->type = PRINT_OP;
-		arg->op.op = token;
-		arg->op.left = left;
-
-		arg->op.prio = 0;
-
-		/* it will set arg->op.right */
-		type = process_array(event, arg, tok);
-
-	} else {
-		do_warning_event(event, "unknown op '%s'", token);
-		event->flags |= EVENT_FL_FAILED;
-		/* the arg is now the left side */
-		goto out_free;
-	}
-
-	if (type == EVENT_OP && strcmp(*tok, ":") != 0) {
-		int prio;
-
-		/* higher prios need to be closer to the root */
-		prio = get_op_prio(*tok);
-
-		if (prio > arg->op.prio)
-			return process_op(event, arg, tok);
-
-		return process_op(event, right, tok);
-	}
-
-	return type;
-
-out_warn_free:
-	do_warning_event(event, "%s: not enough memory!", __func__);
-out_free:
-	free_token(token);
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_entry(struct event_format *event __maybe_unused, struct print_arg *arg,
-	      char **tok)
-{
-	enum event_type type;
-	char *field;
-	char *token;
-
-	if (read_expected(EVENT_OP, "->") < 0)
-		goto out_err;
-
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto out_free;
-	field = token;
-
-	arg->type = PRINT_FIELD;
-	arg->field.name = field;
-
-	if (is_flag_field) {
-		arg->field.field = pevent_find_any_field(event, arg->field.name);
-		arg->field.field->flags |= FIELD_IS_FLAG;
-		is_flag_field = 0;
-	} else if (is_symbolic_field) {
-		arg->field.field = pevent_find_any_field(event, arg->field.name);
-		arg->field.field->flags |= FIELD_IS_SYMBOLIC;
-		is_symbolic_field = 0;
-	}
-
-	type = read_token(&token);
-	*tok = token;
-
-	return type;
-
- out_free:
-	free_token(token);
- out_err:
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static int alloc_and_process_delim(struct event_format *event, char *next_token,
-				   struct print_arg **print_arg)
-{
-	struct print_arg *field;
-	enum event_type type;
-	char *token;
-	int ret = 0;
-
-	field = alloc_arg();
-	if (!field) {
-		do_warning_event(event, "%s: not enough memory!", __func__);
-		errno = ENOMEM;
-		return -1;
-	}
-
-	type = process_arg(event, field, &token);
-
-	if (test_type_token(type, token, EVENT_DELIM, next_token)) {
-		errno = EINVAL;
-		ret = -1;
-		free_arg(field);
-		goto out_free_token;
-	}
-
-	*print_arg = field;
-
-out_free_token:
-	free_token(token);
-
-	return ret;
-}
-
-static char *arg_eval (struct print_arg *arg);
-
-static unsigned long long
-eval_type_str(unsigned long long val, const char *type, int pointer)
-{
-	int sign = 0;
-	char *ref;
-	int len;
-
-	len = strlen(type);
-
-	if (pointer) {
-
-		if (type[len-1] != '*') {
-			do_warning("pointer expected with non pointer type");
-			return val;
-		}
-
-		ref = malloc(len);
-		if (!ref) {
-			do_warning("%s: not enough memory!", __func__);
-			return val;
-		}
-		memcpy(ref, type, len);
-
-		/* chop off the " *" */
-		ref[len - 2] = 0;
-
-		val = eval_type_str(val, ref, 0);
-		free(ref);
-		return val;
-	}
-
-	/* check if this is a pointer */
-	if (type[len - 1] == '*')
-		return val;
-
-	/* Try to figure out the arg size*/
-	if (strncmp(type, "struct", 6) == 0)
-		/* all bets off */
-		return val;
-
-	if (strcmp(type, "u8") == 0)
-		return val & 0xff;
-
-	if (strcmp(type, "u16") == 0)
-		return val & 0xffff;
-
-	if (strcmp(type, "u32") == 0)
-		return val & 0xffffffff;
-
-	if (strcmp(type, "u64") == 0 ||
-	    strcmp(type, "s64") == 0)
-		return val;
-
-	if (strcmp(type, "s8") == 0)
-		return (unsigned long long)(char)val & 0xff;
-
-	if (strcmp(type, "s16") == 0)
-		return (unsigned long long)(short)val & 0xffff;
-
-	if (strcmp(type, "s32") == 0)
-		return (unsigned long long)(int)val & 0xffffffff;
-
-	if (strncmp(type, "unsigned ", 9) == 0) {
-		sign = 0;
-		type += 9;
-	}
-
-	if (strcmp(type, "char") == 0) {
-		if (sign)
-			return (unsigned long long)(char)val & 0xff;
-		else
-			return val & 0xff;
-	}
-
-	if (strcmp(type, "short") == 0) {
-		if (sign)
-			return (unsigned long long)(short)val & 0xffff;
-		else
-			return val & 0xffff;
-	}
-
-	if (strcmp(type, "int") == 0) {
-		if (sign)
-			return (unsigned long long)(int)val & 0xffffffff;
-		else
-			return val & 0xffffffff;
-	}
-
-	return val;
-}
-
-/*
- * Try to figure out the type.
- */
-static unsigned long long
-eval_type(unsigned long long val, struct print_arg *arg, int pointer)
-{
-	if (arg->type != PRINT_TYPE) {
-		do_warning("expected type argument");
-		return 0;
-	}
-
-	return eval_type_str(val, arg->typecast.type, pointer);
-}
-
-static int arg_num_eval(struct print_arg *arg, long long *val)
-{
-	long long left, right;
-	int ret = 1;
-
-	switch (arg->type) {
-	case PRINT_ATOM:
-		*val = strtoll(arg->atom.atom, NULL, 0);
-		break;
-	case PRINT_TYPE:
-		ret = arg_num_eval(arg->typecast.item, val);
-		if (!ret)
-			break;
-		*val = eval_type(*val, arg, 0);
-		break;
-	case PRINT_OP:
-		switch (arg->op.op[0]) {
-		case '|':
-			ret = arg_num_eval(arg->op.left, &left);
-			if (!ret)
-				break;
-			ret = arg_num_eval(arg->op.right, &right);
-			if (!ret)
-				break;
-			if (arg->op.op[1])
-				*val = left || right;
-			else
-				*val = left | right;
-			break;
-		case '&':
-			ret = arg_num_eval(arg->op.left, &left);
-			if (!ret)
-				break;
-			ret = arg_num_eval(arg->op.right, &right);
-			if (!ret)
-				break;
-			if (arg->op.op[1])
-				*val = left && right;
-			else
-				*val = left & right;
-			break;
-		case '<':
-			ret = arg_num_eval(arg->op.left, &left);
-			if (!ret)
-				break;
-			ret = arg_num_eval(arg->op.right, &right);
-			if (!ret)
-				break;
-			switch (arg->op.op[1]) {
-			case 0:
-				*val = left < right;
-				break;
-			case '<':
-				*val = left << right;
-				break;
-			case '=':
-				*val = left <= right;
-				break;
-			default:
-				do_warning("unknown op '%s'", arg->op.op);
-				ret = 0;
-			}
-			break;
-		case '>':
-			ret = arg_num_eval(arg->op.left, &left);
-			if (!ret)
-				break;
-			ret = arg_num_eval(arg->op.right, &right);
-			if (!ret)
-				break;
-			switch (arg->op.op[1]) {
-			case 0:
-				*val = left > right;
-				break;
-			case '>':
-				*val = left >> right;
-				break;
-			case '=':
-				*val = left >= right;
-				break;
-			default:
-				do_warning("unknown op '%s'", arg->op.op);
-				ret = 0;
-			}
-			break;
-		case '=':
-			ret = arg_num_eval(arg->op.left, &left);
-			if (!ret)
-				break;
-			ret = arg_num_eval(arg->op.right, &right);
-			if (!ret)
-				break;
-
-			if (arg->op.op[1] != '=') {
-				do_warning("unknown op '%s'", arg->op.op);
-				ret = 0;
-			} else
-				*val = left == right;
-			break;
-		case '!':
-			ret = arg_num_eval(arg->op.left, &left);
-			if (!ret)
-				break;
-			ret = arg_num_eval(arg->op.right, &right);
-			if (!ret)
-				break;
-
-			switch (arg->op.op[1]) {
-			case '=':
-				*val = left != right;
-				break;
-			default:
-				do_warning("unknown op '%s'", arg->op.op);
-				ret = 0;
-			}
-			break;
-		case '-':
-			/* check for negative */
-			if (arg->op.left->type == PRINT_NULL)
-				left = 0;
-			else
-				ret = arg_num_eval(arg->op.left, &left);
-			if (!ret)
-				break;
-			ret = arg_num_eval(arg->op.right, &right);
-			if (!ret)
-				break;
-			*val = left - right;
-			break;
-		case '+':
-			if (arg->op.left->type == PRINT_NULL)
-				left = 0;
-			else
-				ret = arg_num_eval(arg->op.left, &left);
-			if (!ret)
-				break;
-			ret = arg_num_eval(arg->op.right, &right);
-			if (!ret)
-				break;
-			*val = left + right;
-			break;
-		default:
-			do_warning("unknown op '%s'", arg->op.op);
-			ret = 0;
-		}
-		break;
-
-	case PRINT_NULL:
-	case PRINT_FIELD ... PRINT_SYMBOL:
-	case PRINT_STRING:
-	case PRINT_BSTRING:
-	case PRINT_BITMASK:
-	default:
-		do_warning("invalid eval type %d", arg->type);
-		ret = 0;
-
-	}
-	return ret;
-}
-
-static char *arg_eval (struct print_arg *arg)
-{
-	long long val;
-	static char buf[24];
-
-	switch (arg->type) {
-	case PRINT_ATOM:
-		return arg->atom.atom;
-	case PRINT_TYPE:
-		return arg_eval(arg->typecast.item);
-	case PRINT_OP:
-		if (!arg_num_eval(arg, &val))
-			break;
-		sprintf(buf, "%lld", val);
-		return buf;
-
-	case PRINT_NULL:
-	case PRINT_FIELD ... PRINT_SYMBOL:
-	case PRINT_STRING:
-	case PRINT_BSTRING:
-	case PRINT_BITMASK:
-	default:
-		do_warning("invalid eval type %d", arg->type);
-		break;
-	}
-
-	return NULL;
-}
-
-static enum event_type
-process_fields(struct event_format *event, struct print_flag_sym **list, char **tok)
-{
-	enum event_type type;
-	struct print_arg *arg = NULL;
-	struct print_flag_sym *field;
-	char *token = *tok;
-	char *value;
-
-	do {
-		free_token(token);
-		type = read_token_item(&token);
-		if (test_type_token(type, token, EVENT_OP, "{"))
-			break;
-
-		arg = alloc_arg();
-		if (!arg)
-			goto out_free;
-
-		free_token(token);
-		type = process_arg(event, arg, &token);
-
-		if (type == EVENT_OP)
-			type = process_op(event, arg, &token);
-
-		if (type == EVENT_ERROR)
-			goto out_free;
-
-		if (test_type_token(type, token, EVENT_DELIM, ","))
-			goto out_free;
-
-		field = calloc(1, sizeof(*field));
-		if (!field)
-			goto out_free;
-
-		value = arg_eval(arg);
-		if (value == NULL)
-			goto out_free_field;
-		field->value = strdup(value);
-		if (field->value == NULL)
-			goto out_free_field;
-
-		free_arg(arg);
-		arg = alloc_arg();
-		if (!arg)
-			goto out_free;
-
-		free_token(token);
-		type = process_arg(event, arg, &token);
-		if (test_type_token(type, token, EVENT_OP, "}"))
-			goto out_free_field;
-
-		value = arg_eval(arg);
-		if (value == NULL)
-			goto out_free_field;
-		field->str = strdup(value);
-		if (field->str == NULL)
-			goto out_free_field;
-		free_arg(arg);
-		arg = NULL;
-
-		*list = field;
-		list = &field->next;
-
-		free_token(token);
-		type = read_token_item(&token);
-	} while (type == EVENT_DELIM && strcmp(token, ",") == 0);
-
-	*tok = token;
-	return type;
-
-out_free_field:
-	free_flag_sym(field);
-out_free:
-	free_arg(arg);
-	free_token(token);
-	*tok = NULL;
-
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_flags(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	struct print_arg *field;
-	enum event_type type;
-	char *token = NULL;
-
-	memset(arg, 0, sizeof(*arg));
-	arg->type = PRINT_FLAGS;
-
-	field = alloc_arg();
-	if (!field) {
-		do_warning_event(event, "%s: not enough memory!", __func__);
-		goto out_free;
-	}
-
-	type = process_field_arg(event, field, &token);
-
-	/* Handle operations in the first argument */
-	while (type == EVENT_OP)
-		type = process_op(event, field, &token);
-
-	if (test_type_token(type, token, EVENT_DELIM, ","))
-		goto out_free_field;
-	free_token(token);
-
-	arg->flags.field = field;
-
-	type = read_token_item(&token);
-	if (event_item_type(type)) {
-		arg->flags.delim = token;
-		type = read_token_item(&token);
-	}
-
-	if (test_type_token(type, token, EVENT_DELIM, ","))
-		goto out_free;
-
-	type = process_fields(event, &arg->flags.flags, &token);
-	if (test_type_token(type, token, EVENT_DELIM, ")"))
-		goto out_free;
-
-	free_token(token);
-	type = read_token_item(tok);
-	return type;
-
-out_free_field:
-	free_arg(field);
-out_free:
-	free_token(token);
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_symbols(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	struct print_arg *field;
-	enum event_type type;
-	char *token = NULL;
-
-	memset(arg, 0, sizeof(*arg));
-	arg->type = PRINT_SYMBOL;
-
-	field = alloc_arg();
-	if (!field) {
-		do_warning_event(event, "%s: not enough memory!", __func__);
-		goto out_free;
-	}
-
-	type = process_field_arg(event, field, &token);
-
-	if (test_type_token(type, token, EVENT_DELIM, ","))
-		goto out_free_field;
-
-	arg->symbol.field = field;
-
-	type = process_fields(event, &arg->symbol.symbols, &token);
-	if (test_type_token(type, token, EVENT_DELIM, ")"))
-		goto out_free;
-
-	free_token(token);
-	type = read_token_item(tok);
-	return type;
-
-out_free_field:
-	free_arg(field);
-out_free:
-	free_token(token);
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_hex(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	memset(arg, 0, sizeof(*arg));
-	arg->type = PRINT_HEX;
-
-	if (alloc_and_process_delim(event, ",", &arg->hex.field))
-		goto out;
-
-	if (alloc_and_process_delim(event, ")", &arg->hex.size))
-		goto free_field;
-
-	return read_token_item(tok);
-
-free_field:
-	free_arg(arg->hex.field);
-out:
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_int_array(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	memset(arg, 0, sizeof(*arg));
-	arg->type = PRINT_INT_ARRAY;
-
-	if (alloc_and_process_delim(event, ",", &arg->int_array.field))
-		goto out;
-
-	if (alloc_and_process_delim(event, ",", &arg->int_array.count))
-		goto free_field;
-
-	if (alloc_and_process_delim(event, ")", &arg->int_array.el_size))
-		goto free_size;
-
-	return read_token_item(tok);
-
-free_size:
-	free_arg(arg->int_array.count);
-free_field:
-	free_arg(arg->int_array.field);
-out:
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_dynamic_array(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	struct format_field *field;
-	enum event_type type;
-	char *token;
-
-	memset(arg, 0, sizeof(*arg));
-	arg->type = PRINT_DYNAMIC_ARRAY;
-
-	/*
-	 * The item within the parenthesis is another field that holds
-	 * the index into where the array starts.
-	 */
-	type = read_token(&token);
-	*tok = token;
-	if (type != EVENT_ITEM)
-		goto out_free;
-
-	/* Find the field */
-
-	field = pevent_find_field(event, token);
-	if (!field)
-		goto out_free;
-
-	arg->dynarray.field = field;
-	arg->dynarray.index = 0;
-
-	if (read_expected(EVENT_DELIM, ")") < 0)
-		goto out_free;
-
-	free_token(token);
-	type = read_token_item(&token);
-	*tok = token;
-	if (type != EVENT_OP || strcmp(token, "[") != 0)
-		return type;
-
-	free_token(token);
-	arg = alloc_arg();
-	if (!arg) {
-		do_warning_event(event, "%s: not enough memory!", __func__);
-		*tok = NULL;
-		return EVENT_ERROR;
-	}
-
-	type = process_arg(event, arg, &token);
-	if (type == EVENT_ERROR)
-		goto out_free_arg;
-
-	if (!test_type_token(type, token, EVENT_OP, "]"))
-		goto out_free_arg;
-
-	free_token(token);
-	type = read_token_item(tok);
-	return type;
-
- out_free_arg:
-	free_arg(arg);
- out_free:
-	free_token(token);
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_dynamic_array_len(struct event_format *event, struct print_arg *arg,
-			  char **tok)
-{
-	struct format_field *field;
-	enum event_type type;
-	char *token;
-
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto out_free;
-
-	arg->type = PRINT_DYNAMIC_ARRAY_LEN;
-
-	/* Find the field */
-	field = pevent_find_field(event, token);
-	if (!field)
-		goto out_free;
-
-	arg->dynarray.field = field;
-	arg->dynarray.index = 0;
-
-	if (read_expected(EVENT_DELIM, ")") < 0)
-		goto out_err;
-
-	free_token(token);
-	type = read_token(&token);
-	*tok = token;
-
-	return type;
-
- out_free:
-	free_token(token);
- out_err:
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_paren(struct event_format *event, struct print_arg *arg, char **tok)
-{
-	struct print_arg *item_arg;
-	enum event_type type;
-	char *token;
-
-	type = process_arg(event, arg, &token);
-
-	if (type == EVENT_ERROR)
-		goto out_free;
-
-	if (type == EVENT_OP)
-		type = process_op(event, arg, &token);
-
-	if (type == EVENT_ERROR)
-		goto out_free;
-
-	if (test_type_token(type, token, EVENT_DELIM, ")"))
-		goto out_free;
-
-	free_token(token);
-	type = read_token_item(&token);
-
-	/*
-	 * If the next token is an item or another open paren, then
-	 * this was a typecast.
-	 */
-	if (event_item_type(type) ||
-	    (type == EVENT_DELIM && strcmp(token, "(") == 0)) {
-
-		/* make this a typecast and contine */
-
-		/* prevous must be an atom */
-		if (arg->type != PRINT_ATOM) {
-			do_warning_event(event, "previous needed to be PRINT_ATOM");
-			goto out_free;
-		}
-
-		item_arg = alloc_arg();
-		if (!item_arg) {
-			do_warning_event(event, "%s: not enough memory!",
-					 __func__);
-			goto out_free;
-		}
-
-		arg->type = PRINT_TYPE;
-		arg->typecast.type = arg->atom.atom;
-		arg->typecast.item = item_arg;
-		type = process_arg_token(event, item_arg, &token, type);
-
-	}
-
-	*tok = token;
-	return type;
-
- out_free:
-	free_token(token);
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-
-static enum event_type
-process_str(struct event_format *event __maybe_unused, struct print_arg *arg,
-	    char **tok)
-{
-	enum event_type type;
-	char *token;
-
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto out_free;
-
-	arg->type = PRINT_STRING;
-	arg->string.string = token;
-	arg->string.offset = -1;
-
-	if (read_expected(EVENT_DELIM, ")") < 0)
-		goto out_err;
-
-	type = read_token(&token);
-	*tok = token;
-
-	return type;
-
- out_free:
-	free_token(token);
- out_err:
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_bitmask(struct event_format *event __maybe_unused, struct print_arg *arg,
-	    char **tok)
-{
-	enum event_type type;
-	char *token;
-
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto out_free;
-
-	arg->type = PRINT_BITMASK;
-	arg->bitmask.bitmask = token;
-	arg->bitmask.offset = -1;
-
-	if (read_expected(EVENT_DELIM, ")") < 0)
-		goto out_err;
-
-	type = read_token(&token);
-	*tok = token;
-
-	return type;
-
- out_free:
-	free_token(token);
- out_err:
-	*tok = NULL;
-	return EVENT_ERROR;
-}
-
-static struct pevent_function_handler *
-find_func_handler(struct pevent *pevent, char *func_name)
-{
-	struct pevent_function_handler *func;
-
-	if (!pevent)
-		return NULL;
-
-	for (func = pevent->func_handlers; func; func = func->next) {
-		if (strcmp(func->name, func_name) == 0)
-			break;
-	}
-
-	return func;
-}
-
-static void remove_func_handler(struct pevent *pevent, char *func_name)
-{
-	struct pevent_function_handler *func;
-	struct pevent_function_handler **next;
-
-	next = &pevent->func_handlers;
-	while ((func = *next)) {
-		if (strcmp(func->name, func_name) == 0) {
-			*next = func->next;
-			free_func_handle(func);
-			break;
-		}
-		next = &func->next;
-	}
-}
-
-static enum event_type
-process_func_handler(struct event_format *event, struct pevent_function_handler *func,
-		     struct print_arg *arg, char **tok)
-{
-	struct print_arg **next_arg;
-	struct print_arg *farg;
-	enum event_type type;
-	char *token;
-	int i;
-
-	arg->type = PRINT_FUNC;
-	arg->func.func = func;
-
-	*tok = NULL;
-
-	next_arg = &(arg->func.args);
-	for (i = 0; i < func->nr_args; i++) {
-		farg = alloc_arg();
-		if (!farg) {
-			do_warning_event(event, "%s: not enough memory!",
-					 __func__);
-			return EVENT_ERROR;
-		}
-
-		type = process_arg(event, farg, &token);
-		if (i < (func->nr_args - 1)) {
-			if (type != EVENT_DELIM || strcmp(token, ",") != 0) {
-				do_warning_event(event,
-					"Error: function '%s()' expects %d arguments but event %s only uses %d",
-					func->name, func->nr_args,
-					event->name, i + 1);
-				goto err;
-			}
-		} else {
-			if (type != EVENT_DELIM || strcmp(token, ")") != 0) {
-				do_warning_event(event,
-					"Error: function '%s()' only expects %d arguments but event %s has more",
-					func->name, func->nr_args, event->name);
-				goto err;
-			}
-		}
-
-		*next_arg = farg;
-		next_arg = &(farg->next);
-		free_token(token);
-	}
-
-	type = read_token(&token);
-	*tok = token;
-
-	return type;
-
-err:
-	free_arg(farg);
-	free_token(token);
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_function(struct event_format *event, struct print_arg *arg,
-		 char *token, char **tok)
-{
-	struct pevent_function_handler *func;
-
-	if (strcmp(token, "__print_flags") == 0) {
-		free_token(token);
-		is_flag_field = 1;
-		return process_flags(event, arg, tok);
-	}
-	if (strcmp(token, "__print_symbolic") == 0) {
-		free_token(token);
-		is_symbolic_field = 1;
-		return process_symbols(event, arg, tok);
-	}
-	if (strcmp(token, "__print_hex") == 0) {
-		free_token(token);
-		return process_hex(event, arg, tok);
-	}
-	if (strcmp(token, "__print_array") == 0) {
-		free_token(token);
-		return process_int_array(event, arg, tok);
-	}
-	if (strcmp(token, "__get_str") == 0) {
-		free_token(token);
-		return process_str(event, arg, tok);
-	}
-	if (strcmp(token, "__get_bitmask") == 0) {
-		free_token(token);
-		return process_bitmask(event, arg, tok);
-	}
-	if (strcmp(token, "__get_dynamic_array") == 0) {
-		free_token(token);
-		return process_dynamic_array(event, arg, tok);
-	}
-	if (strcmp(token, "__get_dynamic_array_len") == 0) {
-		free_token(token);
-		return process_dynamic_array_len(event, arg, tok);
-	}
-
-	func = find_func_handler(event->pevent, token);
-	if (func) {
-		free_token(token);
-		return process_func_handler(event, func, arg, tok);
-	}
-
-	do_warning_event(event, "function %s not defined", token);
-	free_token(token);
-	return EVENT_ERROR;
-}
-
-static enum event_type
-process_arg_token(struct event_format *event, struct print_arg *arg,
-		  char **tok, enum event_type type)
-{
-	char *token;
-	char *atom;
-
-	token = *tok;
-
-	switch (type) {
-	case EVENT_ITEM:
-		if (strcmp(token, "REC") == 0) {
-			free_token(token);
-			type = process_entry(event, arg, &token);
-			break;
-		}
-		atom = token;
-		/* test the next token */
-		type = read_token_item(&token);
-
-		/*
-		 * If the next token is a parenthesis, then this
-		 * is a function.
-		 */
-		if (type == EVENT_DELIM && strcmp(token, "(") == 0) {
-			free_token(token);
-			token = NULL;
-			/* this will free atom. */
-			type = process_function(event, arg, atom, &token);
-			break;
-		}
-		/* atoms can be more than one token long */
-		while (type == EVENT_ITEM) {
-			char *new_atom;
-			new_atom = realloc(atom,
-					   strlen(atom) + strlen(token) + 2);
-			if (!new_atom) {
-				free(atom);
-				*tok = NULL;
-				free_token(token);
-				return EVENT_ERROR;
-			}
-			atom = new_atom;
-			strcat(atom, " ");
-			strcat(atom, token);
-			free_token(token);
-			type = read_token_item(&token);
-		}
-
-		arg->type = PRINT_ATOM;
-		arg->atom.atom = atom;
-		break;
-
-	case EVENT_DQUOTE:
-	case EVENT_SQUOTE:
-		arg->type = PRINT_ATOM;
-		arg->atom.atom = token;
-		type = read_token_item(&token);
-		break;
-	case EVENT_DELIM:
-		if (strcmp(token, "(") == 0) {
-			free_token(token);
-			type = process_paren(event, arg, &token);
-			break;
-		}
-	case EVENT_OP:
-		/* handle single ops */
-		arg->type = PRINT_OP;
-		arg->op.op = token;
-		arg->op.left = NULL;
-		type = process_op(event, arg, &token);
-
-		/* On error, the op is freed */
-		if (type == EVENT_ERROR)
-			arg->op.op = NULL;
-
-		/* return error type if errored */
-		break;
-
-	case EVENT_ERROR ... EVENT_NEWLINE:
-	default:
-		do_warning_event(event, "unexpected type %d", type);
-		return EVENT_ERROR;
-	}
-	*tok = token;
-
-	return type;
-}
-
-static int event_read_print_args(struct event_format *event, struct print_arg **list)
-{
-	enum event_type type = EVENT_ERROR;
-	struct print_arg *arg;
-	char *token;
-	int args = 0;
-
-	do {
-		if (type == EVENT_NEWLINE) {
-			type = read_token_item(&token);
-			continue;
-		}
-
-		arg = alloc_arg();
-		if (!arg) {
-			do_warning_event(event, "%s: not enough memory!",
-					 __func__);
-			return -1;
-		}
-
-		type = process_arg(event, arg, &token);
-
-		if (type == EVENT_ERROR) {
-			free_token(token);
-			free_arg(arg);
-			return -1;
-		}
-
-		*list = arg;
-		args++;
-
-		if (type == EVENT_OP) {
-			type = process_op(event, arg, &token);
-			free_token(token);
-			if (type == EVENT_ERROR) {
-				*list = NULL;
-				free_arg(arg);
-				return -1;
-			}
-			list = &arg->next;
-			continue;
-		}
-
-		if (type == EVENT_DELIM && strcmp(token, ",") == 0) {
-			free_token(token);
-			*list = arg;
-			list = &arg->next;
-			continue;
-		}
-		break;
-	} while (type != EVENT_NONE);
-
-	if (type != EVENT_NONE && type != EVENT_ERROR)
-		free_token(token);
-
-	return args;
-}
-
-static int event_read_print(struct event_format *event)
-{
-	enum event_type type;
-	char *token;
-	int ret;
-
-	if (read_expected_item(EVENT_ITEM, "print") < 0)
-		return -1;
-
-	if (read_expected(EVENT_ITEM, "fmt") < 0)
-		return -1;
-
-	if (read_expected(EVENT_OP, ":") < 0)
-		return -1;
-
-	if (read_expect_type(EVENT_DQUOTE, &token) < 0)
-		goto fail;
-
- concat:
-	event->print_fmt.format = token;
-	event->print_fmt.args = NULL;
-
-	/* ok to have no arg */
-	type = read_token_item(&token);
-
-	if (type == EVENT_NONE)
-		return 0;
-
-	/* Handle concatenation of print lines */
-	if (type == EVENT_DQUOTE) {
-		char *cat;
-
-		if (asprintf(&cat, "%s%s", event->print_fmt.format, token) < 0)
-			goto fail;
-		free_token(token);
-		free_token(event->print_fmt.format);
-		event->print_fmt.format = NULL;
-		token = cat;
-		goto concat;
-	}
-			     
-	if (test_type_token(type, token, EVENT_DELIM, ","))
-		goto fail;
-
-	free_token(token);
-
-	ret = event_read_print_args(event, &event->print_fmt.args);
-	if (ret < 0)
-		return -1;
-
-	return ret;
-
- fail:
-	free_token(token);
-	return -1;
-}
-
-/**
- * pevent_find_common_field - return a common field by event
- * @event: handle for the event
- * @name: the name of the common field to return
- *
- * Returns a common field from the event by the given @name.
- * This only searchs the common fields and not all field.
- */
-struct format_field *
-pevent_find_common_field(struct event_format *event, const char *name)
-{
-	struct format_field *format;
-
-	for (format = event->format.common_fields;
-	     format; format = format->next) {
-		if (strcmp(format->name, name) == 0)
-			break;
-	}
-
-	return format;
-}
-
-/**
- * pevent_find_field - find a non-common field
- * @event: handle for the event
- * @name: the name of the non-common field
- *
- * Returns a non-common field by the given @name.
- * This does not search common fields.
- */
-struct format_field *
-pevent_find_field(struct event_format *event, const char *name)
-{
-	struct format_field *format;
-
-	for (format = event->format.fields;
-	     format; format = format->next) {
-		if (strcmp(format->name, name) == 0)
-			break;
-	}
-
-	return format;
-}
-
-/**
- * pevent_find_any_field - find any field by name
- * @event: handle for the event
- * @name: the name of the field
- *
- * Returns a field by the given @name.
- * This searchs the common field names first, then
- * the non-common ones if a common one was not found.
- */
-struct format_field *
-pevent_find_any_field(struct event_format *event, const char *name)
-{
-	struct format_field *format;
-
-	format = pevent_find_common_field(event, name);
-	if (format)
-		return format;
-	return pevent_find_field(event, name);
-}
-
-/**
- * pevent_read_number - read a number from data
- * @pevent: handle for the pevent
- * @ptr: the raw data
- * @size: the size of the data that holds the number
- *
- * Returns the number (converted to host) from the
- * raw data.
- */
-unsigned long long pevent_read_number(struct pevent *pevent,
-				      const void *ptr, int size)
-{
-	switch (size) {
-	case 1:
-		return *(unsigned char *)ptr;
-	case 2:
-		return data2host2(pevent, ptr);
-	case 4:
-		return data2host4(pevent, ptr);
-	case 8:
-		return data2host8(pevent, ptr);
-	default:
-		/* BUG! */
-		return 0;
-	}
-}
-
-/**
- * pevent_read_number_field - read a number from data
- * @field: a handle to the field
- * @data: the raw data to read
- * @value: the value to place the number in
- *
- * Reads raw data according to a field offset and size,
- * and translates it into @value.
- *
- * Returns 0 on success, -1 otherwise.
- */
-int pevent_read_number_field(struct format_field *field, const void *data,
-			     unsigned long long *value)
-{
-	if (!field)
-		return -1;
-	switch (field->size) {
-	case 1:
-	case 2:
-	case 4:
-	case 8:
-		*value = pevent_read_number(field->event->pevent,
-					    data + field->offset, field->size);
-		return 0;
-	default:
-		return -1;
-	}
-}
-
-static int get_common_info(struct pevent *pevent,
-			   const char *type, int *offset, int *size)
-{
-	struct event_format *event;
-	struct format_field *field;
-
-	/*
-	 * All events should have the same common elements.
-	 * Pick any event to find where the type is;
-	 */
-	if (!pevent->events) {
-		do_warning("no event_list!");
-		return -1;
-	}
-
-	event = pevent->events[0];
-	field = pevent_find_common_field(event, type);
-	if (!field)
-		return -1;
-
-	*offset = field->offset;
-	*size = field->size;
-
-	return 0;
-}
-
-static int __parse_common(struct pevent *pevent, void *data,
-			  int *size, int *offset, const char *name)
-{
-	int ret;
-
-	if (!*size) {
-		ret = get_common_info(pevent, name, offset, size);
-		if (ret < 0)
-			return ret;
-	}
-	return pevent_read_number(pevent, data + *offset, *size);
-}
-
-static int trace_parse_common_type(struct pevent *pevent, void *data)
-{
-	return __parse_common(pevent, data,
-			      &pevent->type_size, &pevent->type_offset,
-			      "common_type");
-}
-
-static int parse_common_pid(struct pevent *pevent, void *data)
-{
-	return __parse_common(pevent, data,
-			      &pevent->pid_size, &pevent->pid_offset,
-			      "common_pid");
-}
-
-static int parse_common_pc(struct pevent *pevent, void *data)
-{
-	return __parse_common(pevent, data,
-			      &pevent->pc_size, &pevent->pc_offset,
-			      "common_preempt_count");
-}
-
-static int parse_common_flags(struct pevent *pevent, void *data)
-{
-	return __parse_common(pevent, data,
-			      &pevent->flags_size, &pevent->flags_offset,
-			      "common_flags");
-}
-
-static int parse_common_lock_depth(struct pevent *pevent, void *data)
-{
-	return __parse_common(pevent, data,
-			      &pevent->ld_size, &pevent->ld_offset,
-			      "common_lock_depth");
-}
-
-static int parse_common_migrate_disable(struct pevent *pevent, void *data)
-{
-	return __parse_common(pevent, data,
-			      &pevent->ld_size, &pevent->ld_offset,
-			      "common_migrate_disable");
-}
-
-static int events_id_cmp(const void *a, const void *b);
-
-/**
- * pevent_find_event - find an event by given id
- * @pevent: a handle to the pevent
- * @id: the id of the event
- *
- * Returns an event that has a given @id.
- */
-struct event_format *pevent_find_event(struct pevent *pevent, int id)
-{
-	struct event_format **eventptr;
-	struct event_format key;
-	struct event_format *pkey = &key;
-
-	/* Check cache first */
-	if (pevent->last_event && pevent->last_event->id == id)
-		return pevent->last_event;
-
-	key.id = id;
-
-	eventptr = bsearch(&pkey, pevent->events, pevent->nr_events,
-			   sizeof(*pevent->events), events_id_cmp);
-
-	if (eventptr) {
-		pevent->last_event = *eventptr;
-		return *eventptr;
-	}
-
-	return NULL;
-}
-
-/**
- * pevent_find_event_by_name - find an event by given name
- * @pevent: a handle to the pevent
- * @sys: the system name to search for
- * @name: the name of the event to search for
- *
- * This returns an event with a given @name and under the system
- * @sys. If @sys is NULL the first event with @name is returned.
- */
-struct event_format *
-pevent_find_event_by_name(struct pevent *pevent,
-			  const char *sys, const char *name)
-{
-	struct event_format *event;
-	int i;
-
-	if (pevent->last_event &&
-	    strcmp(pevent->last_event->name, name) == 0 &&
-	    (!sys || strcmp(pevent->last_event->system, sys) == 0))
-		return pevent->last_event;
-
-	for (i = 0; i < pevent->nr_events; i++) {
-		event = pevent->events[i];
-		if (strcmp(event->name, name) == 0) {
-			if (!sys)
-				break;
-			if (strcmp(event->system, sys) == 0)
-				break;
-		}
-	}
-	if (i == pevent->nr_events)
-		event = NULL;
-
-	pevent->last_event = event;
-	return event;
-}
-
-static unsigned long long
-eval_num_arg(void *data, int size, struct event_format *event, struct print_arg *arg)
-{
-	struct pevent *pevent = event->pevent;
-	unsigned long long val = 0;
-	unsigned long long left, right;
-	struct print_arg *typearg = NULL;
-	struct print_arg *larg;
-	unsigned long offset;
-	unsigned int field_size;
-
-	switch (arg->type) {
-	case PRINT_NULL:
-		/* ?? */
-		return 0;
-	case PRINT_ATOM:
-		return strtoull(arg->atom.atom, NULL, 0);
-	case PRINT_FIELD:
-		if (!arg->field.field) {
-			arg->field.field = pevent_find_any_field(event, arg->field.name);
-			if (!arg->field.field)
-				goto out_warning_field;
-			
-		}
-		/* must be a number */
-		val = pevent_read_number(pevent, data + arg->field.field->offset,
-				arg->field.field->size);
-		break;
-	case PRINT_FLAGS:
-	case PRINT_SYMBOL:
-	case PRINT_INT_ARRAY:
-	case PRINT_HEX:
-		break;
-	case PRINT_TYPE:
-		val = eval_num_arg(data, size, event, arg->typecast.item);
-		return eval_type(val, arg, 0);
-	case PRINT_STRING:
-	case PRINT_BSTRING:
-	case PRINT_BITMASK:
-		return 0;
-	case PRINT_FUNC: {
-		struct trace_seq s;
-		trace_seq_init(&s);
-		val = process_defined_func(&s, data, size, event, arg);
-		trace_seq_destroy(&s);
-		return val;
-	}
-	case PRINT_OP:
-		if (strcmp(arg->op.op, "[") == 0) {
-			/*
-			 * Arrays are special, since we don't want
-			 * to read the arg as is.
-			 */
-			right = eval_num_arg(data, size, event, arg->op.right);
-
-			/* handle typecasts */
-			larg = arg->op.left;
-			while (larg->type == PRINT_TYPE) {
-				if (!typearg)
-					typearg = larg;
-				larg = larg->typecast.item;
-			}
-
-			/* Default to long size */
-			field_size = pevent->long_size;
-
-			switch (larg->type) {
-			case PRINT_DYNAMIC_ARRAY:
-				offset = pevent_read_number(pevent,
-						   data + larg->dynarray.field->offset,
-						   larg->dynarray.field->size);
-				if (larg->dynarray.field->elementsize)
-					field_size = larg->dynarray.field->elementsize;
-				/*
-				 * The actual length of the dynamic array is stored
-				 * in the top half of the field, and the offset
-				 * is in the bottom half of the 32 bit field.
-				 */
-				offset &= 0xffff;
-				offset += right;
-				break;
-			case PRINT_FIELD:
-				if (!larg->field.field) {
-					larg->field.field =
-						pevent_find_any_field(event, larg->field.name);
-					if (!larg->field.field) {
-						arg = larg;
-						goto out_warning_field;
-					}
-				}
-				field_size = larg->field.field->elementsize;
-				offset = larg->field.field->offset +
-					right * larg->field.field->elementsize;
-				break;
-			default:
-				goto default_op; /* oops, all bets off */
-			}
-			val = pevent_read_number(pevent,
-						 data + offset, field_size);
-			if (typearg)
-				val = eval_type(val, typearg, 1);
-			break;
-		} else if (strcmp(arg->op.op, "?") == 0) {
-			left = eval_num_arg(data, size, event, arg->op.left);
-			arg = arg->op.right;
-			if (left)
-				val = eval_num_arg(data, size, event, arg->op.left);
-			else
-				val = eval_num_arg(data, size, event, arg->op.right);
-			break;
-		}
- default_op:
-		left = eval_num_arg(data, size, event, arg->op.left);
-		right = eval_num_arg(data, size, event, arg->op.right);
-		switch (arg->op.op[0]) {
-		case '!':
-			switch (arg->op.op[1]) {
-			case 0:
-				val = !right;
-				break;
-			case '=':
-				val = left != right;
-				break;
-			default:
-				goto out_warning_op;
-			}
-			break;
-		case '~':
-			val = ~right;
-			break;
-		case '|':
-			if (arg->op.op[1])
-				val = left || right;
-			else
-				val = left | right;
-			break;
-		case '&':
-			if (arg->op.op[1])
-				val = left && right;
-			else
-				val = left & right;
-			break;
-		case '<':
-			switch (arg->op.op[1]) {
-			case 0:
-				val = left < right;
-				break;
-			case '<':
-				val = left << right;
-				break;
-			case '=':
-				val = left <= right;
-				break;
-			default:
-				goto out_warning_op;
-			}
-			break;
-		case '>':
-			switch (arg->op.op[1]) {
-			case 0:
-				val = left > right;
-				break;
-			case '>':
-				val = left >> right;
-				break;
-			case '=':
-				val = left >= right;
-				break;
-			default:
-				goto out_warning_op;
-			}
-			break;
-		case '=':
-			if (arg->op.op[1] != '=')
-				goto out_warning_op;
-
-			val = left == right;
-			break;
-		case '-':
-			val = left - right;
-			break;
-		case '+':
-			val = left + right;
-			break;
-		case '/':
-			val = left / right;
-			break;
-		case '*':
-			val = left * right;
-			break;
-		default:
-			goto out_warning_op;
-		}
-		break;
-	case PRINT_DYNAMIC_ARRAY_LEN:
-		offset = pevent_read_number(pevent,
-					    data + arg->dynarray.field->offset,
-					    arg->dynarray.field->size);
-		/*
-		 * The total allocated length of the dynamic array is
-		 * stored in the top half of the field, and the offset
-		 * is in the bottom half of the 32 bit field.
-		 */
-		val = (unsigned long long)(offset >> 16);
-		break;
-	case PRINT_DYNAMIC_ARRAY:
-		/* Without [], we pass the address to the dynamic data */
-		offset = pevent_read_number(pevent,
-					    data + arg->dynarray.field->offset,
-					    arg->dynarray.field->size);
-		/*
-		 * The total allocated length of the dynamic array is
-		 * stored in the top half of the field, and the offset
-		 * is in the bottom half of the 32 bit field.
-		 */
-		offset &= 0xffff;
-		val = (unsigned long long)((unsigned long)data + offset);
-		break;
-	default: /* not sure what to do there */
-		return 0;
-	}
-	return val;
-
-out_warning_op:
-	do_warning_event(event, "%s: unknown op '%s'", __func__, arg->op.op);
-	return 0;
-
-out_warning_field:
-	do_warning_event(event, "%s: field %s not found",
-			 __func__, arg->field.name);
-	return 0;
-}
-
-struct flag {
-	const char *name;
-	unsigned long long value;
-};
-
-static const struct flag flags[] = {
-	{ "HI_SOFTIRQ", 0 },
-	{ "TIMER_SOFTIRQ", 1 },
-	{ "NET_TX_SOFTIRQ", 2 },
-	{ "NET_RX_SOFTIRQ", 3 },
-	{ "BLOCK_SOFTIRQ", 4 },
-	{ "BLOCK_IOPOLL_SOFTIRQ", 5 },
-	{ "TASKLET_SOFTIRQ", 6 },
-	{ "SCHED_SOFTIRQ", 7 },
-	{ "HRTIMER_SOFTIRQ", 8 },
-	{ "RCU_SOFTIRQ", 9 },
-
-	{ "HRTIMER_NORESTART", 0 },
-	{ "HRTIMER_RESTART", 1 },
-};
-
-static long long eval_flag(const char *flag)
-{
-	int i;
-
-	/*
-	 * Some flags in the format files do not get converted.
-	 * If the flag is not numeric, see if it is something that
-	 * we already know about.
-	 */
-	if (isdigit(flag[0]))
-		return strtoull(flag, NULL, 0);
-
-	for (i = 0; i < (int)(sizeof(flags)/sizeof(flags[0])); i++)
-		if (strcmp(flags[i].name, flag) == 0)
-			return flags[i].value;
-
-	return -1LL;
-}
-
-static void print_str_to_seq(struct trace_seq *s, const char *format,
-			     int len_arg, const char *str)
-{
-	if (len_arg >= 0)
-		trace_seq_printf(s, format, len_arg, str);
-	else
-		trace_seq_printf(s, format, str);
-}
-
-static void print_bitmask_to_seq(struct pevent *pevent,
-				 struct trace_seq *s, const char *format,
-				 int len_arg, const void *data, int size)
-{
-	int nr_bits = size * 8;
-	int str_size = (nr_bits + 3) / 4;
-	int len = 0;
-	char buf[3];
-	char *str;
-	int index;
-	int i;
-
-	/*
-	 * The kernel likes to put in commas every 32 bits, we
-	 * can do the same.
-	 */
-	str_size += (nr_bits - 1) / 32;
-
-	str = malloc(str_size + 1);
-	if (!str) {
-		do_warning("%s: not enough memory!", __func__);
-		return;
-	}
-	str[str_size] = 0;
-
-	/* Start out with -2 for the two chars per byte */
-	for (i = str_size - 2; i >= 0; i -= 2) {
-		/*
-		 * data points to a bit mask of size bytes.
-		 * In the kernel, this is an array of long words, thus
-		 * endianess is very important.
-		 */
-		if (pevent->file_bigendian)
-			index = size - (len + 1);
-		else
-			index = len;
-
-		snprintf(buf, 3, "%02x", *((unsigned char *)data + index));
-		memcpy(str + i, buf, 2);
-		len++;
-		if (!(len & 3) && i > 0) {
-			i--;
-			str[i] = ',';
-		}
-	}
-
-	if (len_arg >= 0)
-		trace_seq_printf(s, format, len_arg, str);
-	else
-		trace_seq_printf(s, format, str);
-
-	free(str);
-}
-
-static void print_str_arg(struct trace_seq *s, void *data, int size,
-			  struct event_format *event, const char *format,
-			  int len_arg, struct print_arg *arg)
-{
-	struct pevent *pevent = event->pevent;
-	struct print_flag_sym *flag;
-	struct format_field *field;
-	struct printk_map *printk;
-	long long val, fval;
-	unsigned long long addr;
-	char *str;
-	unsigned char *hex;
-	int print;
-	int i, len;
-
-	switch (arg->type) {
-	case PRINT_NULL:
-		/* ?? */
-		return;
-	case PRINT_ATOM:
-		print_str_to_seq(s, format, len_arg, arg->atom.atom);
-		return;
-	case PRINT_FIELD:
-		field = arg->field.field;
-		if (!field) {
-			field = pevent_find_any_field(event, arg->field.name);
-			if (!field) {
-				str = arg->field.name;
-				goto out_warning_field;
-			}
-			arg->field.field = field;
-		}
-		/* Zero sized fields, mean the rest of the data */
-		len = field->size ? : size - field->offset;
-
-		/*
-		 * Some events pass in pointers. If this is not an array
-		 * and the size is the same as long_size, assume that it
-		 * is a pointer.
-		 */
-		if (!(field->flags & FIELD_IS_ARRAY) &&
-		    field->size == pevent->long_size) {
-
-			/* Handle heterogeneous recording and processing
-			 * architectures
-			 *
-			 * CASE I:
-			 * Traces recorded on 32-bit devices (32-bit
-			 * addressing) and processed on 64-bit devices:
-			 * In this case, only 32 bits should be read.
-			 *
-			 * CASE II:
-			 * Traces recorded on 64 bit devices and processed
-			 * on 32-bit devices:
-			 * In this case, 64 bits must be read.
-			 */
-			addr = (pevent->long_size == 8) ?
-				*(unsigned long long *)(data + field->offset) :
-				(unsigned long long)*(unsigned int *)(data + field->offset);
-
-			/* Check if it matches a print format */
-			printk = find_printk(pevent, addr);
-			if (printk)
-				trace_seq_puts(s, printk->printk);
-			else
-				trace_seq_printf(s, "%llx", addr);
-			break;
-		}
-		str = malloc(len + 1);
-		if (!str) {
-			do_warning_event(event, "%s: not enough memory!",
-					 __func__);
-			return;
-		}
-		memcpy(str, data + field->offset, len);
-		str[len] = 0;
-		print_str_to_seq(s, format, len_arg, str);
-		free(str);
-		break;
-	case PRINT_FLAGS:
-		val = eval_num_arg(data, size, event, arg->flags.field);
-		print = 0;
-		for (flag = arg->flags.flags; flag; flag = flag->next) {
-			fval = eval_flag(flag->value);
-			if (!val && fval < 0) {
-				print_str_to_seq(s, format, len_arg, flag->str);
-				break;
-			}
-			if (fval > 0 && (val & fval) == fval) {
-				if (print && arg->flags.delim)
-					trace_seq_puts(s, arg->flags.delim);
-				print_str_to_seq(s, format, len_arg, flag->str);
-				print = 1;
-				val &= ~fval;
-			}
-		}
-		break;
-	case PRINT_SYMBOL:
-		val = eval_num_arg(data, size, event, arg->symbol.field);
-		for (flag = arg->symbol.symbols; flag; flag = flag->next) {
-			fval = eval_flag(flag->value);
-			if (val == fval) {
-				print_str_to_seq(s, format, len_arg, flag->str);
-				break;
-			}
-		}
-		break;
-	case PRINT_HEX:
-		if (arg->hex.field->type == PRINT_DYNAMIC_ARRAY) {
-			unsigned long offset;
-			offset = pevent_read_number(pevent,
-				data + arg->hex.field->dynarray.field->offset,
-				arg->hex.field->dynarray.field->size);
-			hex = data + (offset & 0xffff);
-		} else {
-			field = arg->hex.field->field.field;
-			if (!field) {
-				str = arg->hex.field->field.name;
-				field = pevent_find_any_field(event, str);
-				if (!field)
-					goto out_warning_field;
-				arg->hex.field->field.field = field;
-			}
-			hex = data + field->offset;
-		}
-		len = eval_num_arg(data, size, event, arg->hex.size);
-		for (i = 0; i < len; i++) {
-			if (i)
-				trace_seq_putc(s, ' ');
-			trace_seq_printf(s, "%02x", hex[i]);
-		}
-		break;
-
-	case PRINT_INT_ARRAY: {
-		void *num;
-		int el_size;
-
-		if (arg->int_array.field->type == PRINT_DYNAMIC_ARRAY) {
-			unsigned long offset;
-			struct format_field *field =
-				arg->int_array.field->dynarray.field;
-			offset = pevent_read_number(pevent,
-						    data + field->offset,
-						    field->size);
-			num = data + (offset & 0xffff);
-		} else {
-			field = arg->int_array.field->field.field;
-			if (!field) {
-				str = arg->int_array.field->field.name;
-				field = pevent_find_any_field(event, str);
-				if (!field)
-					goto out_warning_field;
-				arg->int_array.field->field.field = field;
-			}
-			num = data + field->offset;
-		}
-		len = eval_num_arg(data, size, event, arg->int_array.count);
-		el_size = eval_num_arg(data, size, event,
-				       arg->int_array.el_size);
-		for (i = 0; i < len; i++) {
-			if (i)
-				trace_seq_putc(s, ' ');
-
-			if (el_size == 1) {
-				trace_seq_printf(s, "%u", *(uint8_t *)num);
-			} else if (el_size == 2) {
-				trace_seq_printf(s, "%u", *(uint16_t *)num);
-			} else if (el_size == 4) {
-				trace_seq_printf(s, "%u", *(uint32_t *)num);
-			} else if (el_size == 8) {
-				trace_seq_printf(s, "%"PRIu64, *(uint64_t *)num);
-			} else {
-				trace_seq_printf(s, "BAD SIZE:%d 0x%x",
-						 el_size, *(uint8_t *)num);
-				el_size = 1;
-			}
-
-			num += el_size;
-		}
-		break;
-	}
-	case PRINT_TYPE:
-		break;
-	case PRINT_STRING: {
-		int str_offset;
-
-		if (arg->string.offset == -1) {
-			struct format_field *f;
-
-			f = pevent_find_any_field(event, arg->string.string);
-			arg->string.offset = f->offset;
-		}
-		str_offset = data2host4(pevent, data + arg->string.offset);
-		str_offset &= 0xffff;
-		print_str_to_seq(s, format, len_arg, ((char *)data) + str_offset);
-		break;
-	}
-	case PRINT_BSTRING:
-		print_str_to_seq(s, format, len_arg, arg->string.string);
-		break;
-	case PRINT_BITMASK: {
-		int bitmask_offset;
-		int bitmask_size;
-
-		if (arg->bitmask.offset == -1) {
-			struct format_field *f;
-
-			f = pevent_find_any_field(event, arg->bitmask.bitmask);
-			arg->bitmask.offset = f->offset;
-		}
-		bitmask_offset = data2host4(pevent, data + arg->bitmask.offset);
-		bitmask_size = bitmask_offset >> 16;
-		bitmask_offset &= 0xffff;
-		print_bitmask_to_seq(pevent, s, format, len_arg,
-				     data + bitmask_offset, bitmask_size);
-		break;
-	}
-	case PRINT_OP:
-		/*
-		 * The only op for string should be ? :
-		 */
-		if (arg->op.op[0] != '?')
-			return;
-		val = eval_num_arg(data, size, event, arg->op.left);
-		if (val)
-			print_str_arg(s, data, size, event,
-				      format, len_arg, arg->op.right->op.left);
-		else
-			print_str_arg(s, data, size, event,
-				      format, len_arg, arg->op.right->op.right);
-		break;
-	case PRINT_FUNC:
-		process_defined_func(s, data, size, event, arg);
-		break;
-	default:
-		/* well... */
-		break;
-	}
-
-	return;
-
-out_warning_field:
-	do_warning_event(event, "%s: field %s not found",
-			 __func__, arg->field.name);
-}
-
-static unsigned long long
-process_defined_func(struct trace_seq *s, void *data, int size,
-		     struct event_format *event, struct print_arg *arg)
-{
-	struct pevent_function_handler *func_handle = arg->func.func;
-	struct pevent_func_params *param;
-	unsigned long long *args;
-	unsigned long long ret;
-	struct print_arg *farg;
-	struct trace_seq str;
-	struct save_str {
-		struct save_str *next;
-		char *str;
-	} *strings = NULL, *string;
-	int i;
-
-	if (!func_handle->nr_args) {
-		ret = (*func_handle->func)(s, NULL);
-		goto out;
-	}
-
-	farg = arg->func.args;
-	param = func_handle->params;
-
-	ret = ULLONG_MAX;
-	args = malloc(sizeof(*args) * func_handle->nr_args);
-	if (!args)
-		goto out;
-
-	for (i = 0; i < func_handle->nr_args; i++) {
-		switch (param->type) {
-		case PEVENT_FUNC_ARG_INT:
-		case PEVENT_FUNC_ARG_LONG:
-		case PEVENT_FUNC_ARG_PTR:
-			args[i] = eval_num_arg(data, size, event, farg);
-			break;
-		case PEVENT_FUNC_ARG_STRING:
-			trace_seq_init(&str);
-			print_str_arg(&str, data, size, event, "%s", -1, farg);
-			trace_seq_terminate(&str);
-			string = malloc(sizeof(*string));
-			if (!string) {
-				do_warning_event(event, "%s(%d): malloc str",
-						 __func__, __LINE__);
-				goto out_free;
-			}
-			string->next = strings;
-			string->str = strdup(str.buffer);
-			if (!string->str) {
-				free(string);
-				do_warning_event(event, "%s(%d): malloc str",
-						 __func__, __LINE__);
-				goto out_free;
-			}
-			args[i] = (uintptr_t)string->str;
-			strings = string;
-			trace_seq_destroy(&str);
-			break;
-		default:
-			/*
-			 * Something went totally wrong, this is not
-			 * an input error, something in this code broke.
-			 */
-			do_warning_event(event, "Unexpected end of arguments\n");
-			goto out_free;
-		}
-		farg = farg->next;
-		param = param->next;
-	}
-
-	ret = (*func_handle->func)(s, args);
-out_free:
-	free(args);
-	while (strings) {
-		string = strings;
-		strings = string->next;
-		free(string->str);
-		free(string);
-	}
-
- out:
-	/* TBD : handle return type here */
-	return ret;
-}
-
-static void free_args(struct print_arg *args)
-{
-	struct print_arg *next;
-
-	while (args) {
-		next = args->next;
-
-		free_arg(args);
-		args = next;
-	}
-}
-
-static struct print_arg *make_bprint_args(char *fmt, void *data, int size, struct event_format *event)
-{
-	struct pevent *pevent = event->pevent;
-	struct format_field *field, *ip_field;
-	struct print_arg *args, *arg, **next;
-	unsigned long long ip, val;
-	char *ptr;
-	void *bptr;
-	int vsize;
-
-	field = pevent->bprint_buf_field;
-	ip_field = pevent->bprint_ip_field;
-
-	if (!field) {
-		field = pevent_find_field(event, "buf");
-		if (!field) {
-			do_warning_event(event, "can't find buffer field for binary printk");
-			return NULL;
-		}
-		ip_field = pevent_find_field(event, "ip");
-		if (!ip_field) {
-			do_warning_event(event, "can't find ip field for binary printk");
-			return NULL;
-		}
-		pevent->bprint_buf_field = field;
-		pevent->bprint_ip_field = ip_field;
-	}
-
-	ip = pevent_read_number(pevent, data + ip_field->offset, ip_field->size);
-
-	/*
-	 * The first arg is the IP pointer.
-	 */
-	args = alloc_arg();
-	if (!args) {
-		do_warning_event(event, "%s(%d): not enough memory!",
-				 __func__, __LINE__);
-		return NULL;
-	}
-	arg = args;
-	arg->next = NULL;
-	next = &arg->next;
-
-	arg->type = PRINT_ATOM;
-		
-	if (asprintf(&arg->atom.atom, "%lld", ip) < 0)
-		goto out_free;
-
-	/* skip the first "%ps: " */
-	for (ptr = fmt + 5, bptr = data + field->offset;
-	     bptr < data + size && *ptr; ptr++) {
-		int ls = 0;
-
-		if (*ptr == '%') {
- process_again:
-			ptr++;
-			switch (*ptr) {
-			case '%':
-				break;
-			case 'l':
-				ls++;
-				goto process_again;
-			case 'L':
-				ls = 2;
-				goto process_again;
-			case '0' ... '9':
-				goto process_again;
-			case '.':
-				goto process_again;
-			case 'z':
-			case 'Z':
-				ls = 1;
-				goto process_again;
-			case 'p':
-				ls = 1;
-				/* fall through */
-			case 'd':
-			case 'u':
-			case 'x':
-			case 'i':
-				switch (ls) {
-				case 0:
-					vsize = 4;
-					break;
-				case 1:
-					vsize = pevent->long_size;
-					break;
-				case 2:
-					vsize = 8;
-					break;
-				default:
-					vsize = ls; /* ? */
-					break;
-				}
-			/* fall through */
-			case '*':
-				if (*ptr == '*')
-					vsize = 4;
-
-				/* the pointers are always 4 bytes aligned */
-				bptr = (void *)(((unsigned long)bptr + 3) &
-						~3);
-				val = pevent_read_number(pevent, bptr, vsize);
-				bptr += vsize;
-				arg = alloc_arg();
-				if (!arg) {
-					do_warning_event(event, "%s(%d): not enough memory!",
-						   __func__, __LINE__);
-					goto out_free;
-				}
-				arg->next = NULL;
-				arg->type = PRINT_ATOM;
-				if (asprintf(&arg->atom.atom, "%lld", val) < 0) {
-					free(arg);
-					goto out_free;
-				}
-				*next = arg;
-				next = &arg->next;
-				/*
-				 * The '*' case means that an arg is used as the length.
-				 * We need to continue to figure out for what.
-				 */
-				if (*ptr == '*')
-					goto process_again;
-
-				break;
-			case 's':
-				arg = alloc_arg();
-				if (!arg) {
-					do_warning_event(event, "%s(%d): not enough memory!",
-						   __func__, __LINE__);
-					goto out_free;
-				}
-				arg->next = NULL;
-				arg->type = PRINT_BSTRING;
-				arg->string.string = strdup(bptr);
-				if (!arg->string.string)
-					goto out_free;
-				bptr += strlen(bptr) + 1;
-				*next = arg;
-				next = &arg->next;
-			default:
-				break;
-			}
-		}
-	}
-
-	return args;
-
-out_free:
-	free_args(args);
-	return NULL;
-}
-
-static char *
-get_bprint_format(void *data, int size __maybe_unused,
-		  struct event_format *event)
-{
-	struct pevent *pevent = event->pevent;
-	unsigned long long addr;
-	struct format_field *field;
-	struct printk_map *printk;
-	char *format;
-
-	field = pevent->bprint_fmt_field;
-
-	if (!field) {
-		field = pevent_find_field(event, "fmt");
-		if (!field) {
-			do_warning_event(event, "can't find format field for binary printk");
-			return NULL;
-		}
-		pevent->bprint_fmt_field = field;
-	}
-
-	addr = pevent_read_number(pevent, data + field->offset, field->size);
-
-	printk = find_printk(pevent, addr);
-	if (!printk) {
-		if (asprintf(&format, "%%pf: (NO FORMAT FOUND at %llx)\n", addr) < 0)
-			return NULL;
-		return format;
-	}
-
-	if (asprintf(&format, "%s: %s", "%pf", printk->printk) < 0)
-		return NULL;
-
-	return format;
-}
-
-static void print_mac_arg(struct trace_seq *s, int mac, void *data, int size,
-			  struct event_format *event, struct print_arg *arg)
-{
-	unsigned char *buf;
-	const char *fmt = "%.2x:%.2x:%.2x:%.2x:%.2x:%.2x";
-
-	if (arg->type == PRINT_FUNC) {
-		process_defined_func(s, data, size, event, arg);
-		return;
-	}
-
-	if (arg->type != PRINT_FIELD) {
-		trace_seq_printf(s, "ARG TYPE NOT FIELD BUT %d",
-				 arg->type);
-		return;
-	}
-
-	if (mac == 'm')
-		fmt = "%.2x%.2x%.2x%.2x%.2x%.2x";
-	if (!arg->field.field) {
-		arg->field.field =
-			pevent_find_any_field(event, arg->field.name);
-		if (!arg->field.field) {
-			do_warning_event(event, "%s: field %s not found",
-					 __func__, arg->field.name);
-			return;
-		}
-	}
-	if (arg->field.field->size != 6) {
-		trace_seq_printf(s, "INVALIDMAC");
-		return;
-	}
-	buf = data + arg->field.field->offset;
-	trace_seq_printf(s, fmt, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
-}
-
-static void print_ip4_addr(struct trace_seq *s, char i, unsigned char *buf)
-{
-	const char *fmt;
-
-	if (i == 'i')
-		fmt = "%03d.%03d.%03d.%03d";
-	else
-		fmt = "%d.%d.%d.%d";
-
-	trace_seq_printf(s, fmt, buf[0], buf[1], buf[2], buf[3]);
-}
-
-static inline bool ipv6_addr_v4mapped(const struct in6_addr *a)
-{
-	return ((unsigned long)(a->s6_addr32[0] | a->s6_addr32[1]) |
-		(unsigned long)(a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL;
-}
-
-static inline bool ipv6_addr_is_isatap(const struct in6_addr *addr)
-{
-	return (addr->s6_addr32[2] | htonl(0x02000000)) == htonl(0x02005EFE);
-}
-
-static void print_ip6c_addr(struct trace_seq *s, unsigned char *addr)
-{
-	int i, j, range;
-	unsigned char zerolength[8];
-	int longest = 1;
-	int colonpos = -1;
-	uint16_t word;
-	uint8_t hi, lo;
-	bool needcolon = false;
-	bool useIPv4;
-	struct in6_addr in6;
-
-	memcpy(&in6, addr, sizeof(struct in6_addr));
-
-	useIPv4 = ipv6_addr_v4mapped(&in6) || ipv6_addr_is_isatap(&in6);
-
-	memset(zerolength, 0, sizeof(zerolength));
-
-	if (useIPv4)
-		range = 6;
-	else
-		range = 8;
-
-	/* find position of longest 0 run */
-	for (i = 0; i < range; i++) {
-		for (j = i; j < range; j++) {
-			if (in6.s6_addr16[j] != 0)
-				break;
-			zerolength[i]++;
-		}
-	}
-	for (i = 0; i < range; i++) {
-		if (zerolength[i] > longest) {
-			longest = zerolength[i];
-			colonpos = i;
-		}
-	}
-	if (longest == 1)		/* don't compress a single 0 */
-		colonpos = -1;
-
-	/* emit address */
-	for (i = 0; i < range; i++) {
-		if (i == colonpos) {
-			if (needcolon || i == 0)
-				trace_seq_printf(s, ":");
-			trace_seq_printf(s, ":");
-			needcolon = false;
-			i += longest - 1;
-			continue;
-		}
-		if (needcolon) {
-			trace_seq_printf(s, ":");
-			needcolon = false;
-		}
-		/* hex u16 without leading 0s */
-		word = ntohs(in6.s6_addr16[i]);
-		hi = word >> 8;
-		lo = word & 0xff;
-		if (hi)
-			trace_seq_printf(s, "%x%02x", hi, lo);
-		else
-			trace_seq_printf(s, "%x", lo);
-
-		needcolon = true;
-	}
-
-	if (useIPv4) {
-		if (needcolon)
-			trace_seq_printf(s, ":");
-		print_ip4_addr(s, 'I', &in6.s6_addr[12]);
-	}
-
-	return;
-}
-
-static void print_ip6_addr(struct trace_seq *s, char i, unsigned char *buf)
-{
-	int j;
-
-	for (j = 0; j < 16; j += 2) {
-		trace_seq_printf(s, "%02x%02x", buf[j], buf[j+1]);
-		if (i == 'I' && j < 14)
-			trace_seq_printf(s, ":");
-	}
-}
-
-/*
- * %pi4   print an IPv4 address with leading zeros
- * %pI4   print an IPv4 address without leading zeros
- * %pi6   print an IPv6 address without colons
- * %pI6   print an IPv6 address with colons
- * %pI6c  print an IPv6 address in compressed form with colons
- * %pISpc print an IP address based on sockaddr; p adds port.
- */
-static int print_ipv4_arg(struct trace_seq *s, const char *ptr, char i,
-			  void *data, int size, struct event_format *event,
-			  struct print_arg *arg)
-{
-	unsigned char *buf;
-
-	if (arg->type == PRINT_FUNC) {
-		process_defined_func(s, data, size, event, arg);
-		return 0;
-	}
-
-	if (arg->type != PRINT_FIELD) {
-		trace_seq_printf(s, "ARG TYPE NOT FIELD BUT %d", arg->type);
-		return 0;
-	}
-
-	if (!arg->field.field) {
-		arg->field.field =
-			pevent_find_any_field(event, arg->field.name);
-		if (!arg->field.field) {
-			do_warning("%s: field %s not found",
-				   __func__, arg->field.name);
-			return 0;
-		}
-	}
-
-	buf = data + arg->field.field->offset;
-
-	if (arg->field.field->size != 4) {
-		trace_seq_printf(s, "INVALIDIPv4");
-		return 0;
-	}
-	print_ip4_addr(s, i, buf);
-
-	return 0;
-}
-
-static int print_ipv6_arg(struct trace_seq *s, const char *ptr, char i,
-			  void *data, int size, struct event_format *event,
-			  struct print_arg *arg)
-{
-	char have_c = 0;
-	unsigned char *buf;
-	int rc = 0;
-
-	/* pI6c */
-	if (i == 'I' && *ptr == 'c') {
-		have_c = 1;
-		ptr++;
-		rc++;
-	}
-
-	if (arg->type == PRINT_FUNC) {
-		process_defined_func(s, data, size, event, arg);
-		return rc;
-	}
-
-	if (arg->type != PRINT_FIELD) {
-		trace_seq_printf(s, "ARG TYPE NOT FIELD BUT %d", arg->type);
-		return rc;
-	}
-
-	if (!arg->field.field) {
-		arg->field.field =
-			pevent_find_any_field(event, arg->field.name);
-		if (!arg->field.field) {
-			do_warning("%s: field %s not found",
-				   __func__, arg->field.name);
-			return rc;
-		}
-	}
-
-	buf = data + arg->field.field->offset;
-
-	if (arg->field.field->size != 16) {
-		trace_seq_printf(s, "INVALIDIPv6");
-		return rc;
-	}
-
-	if (have_c)
-		print_ip6c_addr(s, buf);
-	else
-		print_ip6_addr(s, i, buf);
-
-	return rc;
-}
-
-static int print_ipsa_arg(struct trace_seq *s, const char *ptr, char i,
-			  void *data, int size, struct event_format *event,
-			  struct print_arg *arg)
-{
-	char have_c = 0, have_p = 0;
-	unsigned char *buf;
-	struct sockaddr_storage *sa;
-	int rc = 0;
-
-	/* pISpc */
-	if (i == 'I') {
-		if (*ptr == 'p') {
-			have_p = 1;
-			ptr++;
-			rc++;
-		}
-		if (*ptr == 'c') {
-			have_c = 1;
-			ptr++;
-			rc++;
-		}
-	}
-
-	if (arg->type == PRINT_FUNC) {
-		process_defined_func(s, data, size, event, arg);
-		return rc;
-	}
-
-	if (arg->type != PRINT_FIELD) {
-		trace_seq_printf(s, "ARG TYPE NOT FIELD BUT %d", arg->type);
-		return rc;
-	}
-
-	if (!arg->field.field) {
-		arg->field.field =
-			pevent_find_any_field(event, arg->field.name);
-		if (!arg->field.field) {
-			do_warning("%s: field %s not found",
-				   __func__, arg->field.name);
-			return rc;
-		}
-	}
-
-	sa = (struct sockaddr_storage *) (data + arg->field.field->offset);
-
-	if (sa->ss_family == AF_INET) {
-		struct sockaddr_in *sa4 = (struct sockaddr_in *) sa;
-
-		if (arg->field.field->size < sizeof(struct sockaddr_in)) {
-			trace_seq_printf(s, "INVALIDIPv4");
-			return rc;
-		}
-
-		print_ip4_addr(s, i, (unsigned char *) &sa4->sin_addr);
-		if (have_p)
-			trace_seq_printf(s, ":%d", ntohs(sa4->sin_port));
-
-
-	} else if (sa->ss_family == AF_INET6) {
-		struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *) sa;
-
-		if (arg->field.field->size < sizeof(struct sockaddr_in6)) {
-			trace_seq_printf(s, "INVALIDIPv6");
-			return rc;
-		}
-
-		if (have_p)
-			trace_seq_printf(s, "[");
-
-		buf = (unsigned char *) &sa6->sin6_addr;
-		if (have_c)
-			print_ip6c_addr(s, buf);
-		else
-			print_ip6_addr(s, i, buf);
-
-		if (have_p)
-			trace_seq_printf(s, "]:%d", ntohs(sa6->sin6_port));
-	}
-
-	return rc;
-}
-
-static int print_ip_arg(struct trace_seq *s, const char *ptr,
-			void *data, int size, struct event_format *event,
-			struct print_arg *arg)
-{
-	char i = *ptr;  /* 'i' or 'I' */
-	char ver;
-	int rc = 0;
-
-	ptr++;
-	rc++;
-
-	ver = *ptr;
-	ptr++;
-	rc++;
-
-	switch (ver) {
-	case '4':
-		rc += print_ipv4_arg(s, ptr, i, data, size, event, arg);
-		break;
-	case '6':
-		rc += print_ipv6_arg(s, ptr, i, data, size, event, arg);
-		break;
-	case 'S':
-		rc += print_ipsa_arg(s, ptr, i, data, size, event, arg);
-		break;
-	default:
-		return 0;
-	}
-
-	return rc;
-}
-
-static int is_printable_array(char *p, unsigned int len)
-{
-	unsigned int i;
-
-	for (i = 0; i < len && p[i]; i++)
-		if (!isprint(p[i]) && !isspace(p[i]))
-		    return 0;
-	return 1;
-}
-
-static void print_event_fields(struct trace_seq *s, void *data,
-			       int size __maybe_unused,
-			       struct event_format *event)
-{
-	struct format_field *field;
-	unsigned long long val;
-	unsigned int offset, len, i;
-
-	field = event->format.fields;
-	while (field) {
-		trace_seq_printf(s, " %s=", field->name);
-		if (field->flags & FIELD_IS_ARRAY) {
-			offset = field->offset;
-			len = field->size;
-			if (field->flags & FIELD_IS_DYNAMIC) {
-				val = pevent_read_number(event->pevent, data + offset, len);
-				offset = val;
-				len = offset >> 16;
-				offset &= 0xffff;
-			}
-			if (field->flags & FIELD_IS_STRING &&
-			    is_printable_array(data + offset, len)) {
-				trace_seq_printf(s, "%s", (char *)data + offset);
-			} else {
-				trace_seq_puts(s, "ARRAY[");
-				for (i = 0; i < len; i++) {
-					if (i)
-						trace_seq_puts(s, ", ");
-					trace_seq_printf(s, "%02x",
-							 *((unsigned char *)data + offset + i));
-				}
-				trace_seq_putc(s, ']');
-				field->flags &= ~FIELD_IS_STRING;
-			}
-		} else {
-			val = pevent_read_number(event->pevent, data + field->offset,
-						 field->size);
-			if (field->flags & FIELD_IS_POINTER) {
-				trace_seq_printf(s, "0x%llx", val);
-			} else if (field->flags & FIELD_IS_SIGNED) {
-				switch (field->size) {
-				case 4:
-					/*
-					 * If field is long then print it in hex.
-					 * A long usually stores pointers.
-					 */
-					if (field->flags & FIELD_IS_LONG)
-						trace_seq_printf(s, "0x%x", (int)val);
-					else
-						trace_seq_printf(s, "%d", (int)val);
-					break;
-				case 2:
-					trace_seq_printf(s, "%2d", (short)val);
-					break;
-				case 1:
-					trace_seq_printf(s, "%1d", (char)val);
-					break;
-				default:
-					trace_seq_printf(s, "%lld", val);
-				}
-			} else {
-				if (field->flags & FIELD_IS_LONG)
-					trace_seq_printf(s, "0x%llx", val);
-				else
-					trace_seq_printf(s, "%llu", val);
-			}
-		}
-		field = field->next;
-	}
-}
-
-static void pretty_print(struct trace_seq *s, void *data, int size, struct event_format *event)
-{
-	struct pevent *pevent = event->pevent;
-	struct print_fmt *print_fmt = &event->print_fmt;
-	struct print_arg *arg = print_fmt->args;
-	struct print_arg *args = NULL;
-	const char *ptr = print_fmt->format;
-	unsigned long long val;
-	struct func_map *func;
-	const char *saveptr;
-	struct trace_seq p;
-	char *bprint_fmt = NULL;
-	char format[32];
-	int show_func;
-	int len_as_arg;
-	int len_arg;
-	int len;
-	int ls;
-
-	if (event->flags & EVENT_FL_FAILED) {
-		trace_seq_printf(s, "[FAILED TO PARSE]");
-		print_event_fields(s, data, size, event);
-		return;
-	}
-
-	if (event->flags & EVENT_FL_ISBPRINT) {
-		bprint_fmt = get_bprint_format(data, size, event);
-		args = make_bprint_args(bprint_fmt, data, size, event);
-		arg = args;
-		ptr = bprint_fmt;
-	}
-
-	for (; *ptr; ptr++) {
-		ls = 0;
-		if (*ptr == '\\') {
-			ptr++;
-			switch (*ptr) {
-			case 'n':
-				trace_seq_putc(s, '\n');
-				break;
-			case 't':
-				trace_seq_putc(s, '\t');
-				break;
-			case 'r':
-				trace_seq_putc(s, '\r');
-				break;
-			case '\\':
-				trace_seq_putc(s, '\\');
-				break;
-			default:
-				trace_seq_putc(s, *ptr);
-				break;
-			}
-
-		} else if (*ptr == '%') {
-			saveptr = ptr;
-			show_func = 0;
-			len_as_arg = 0;
- cont_process:
-			ptr++;
-			switch (*ptr) {
-			case '%':
-				trace_seq_putc(s, '%');
-				break;
-			case '#':
-				/* FIXME: need to handle properly */
-				goto cont_process;
-			case 'h':
-				ls--;
-				goto cont_process;
-			case 'l':
-				ls++;
-				goto cont_process;
-			case 'L':
-				ls = 2;
-				goto cont_process;
-			case '*':
-				/* The argument is the length. */
-				if (!arg) {
-					do_warning_event(event, "no argument match");
-					event->flags |= EVENT_FL_FAILED;
-					goto out_failed;
-				}
-				len_arg = eval_num_arg(data, size, event, arg);
-				len_as_arg = 1;
-				arg = arg->next;
-				goto cont_process;
-			case '.':
-			case 'z':
-			case 'Z':
-			case '0' ... '9':
-			case '-':
-				goto cont_process;
-			case 'p':
-				if (pevent->long_size == 4)
-					ls = 1;
-				else
-					ls = 2;
-
-				if (isalnum(ptr[1]))
-					ptr++;
-
-				if (*ptr == 'F' || *ptr == 'f' ||
-				    *ptr == 'S' || *ptr == 's') {
-					show_func = *ptr;
-				} else if (*ptr == 'M' || *ptr == 'm') {
-					print_mac_arg(s, *ptr, data, size, event, arg);
-					arg = arg->next;
-					break;
-				} else if (*ptr == 'I' || *ptr == 'i') {
-					int n;
-
-					n = print_ip_arg(s, ptr, data, size, event, arg);
-					if (n > 0) {
-						ptr += n - 1;
-						arg = arg->next;
-						break;
-					}
-				}
-
-				/* fall through */
-			case 'd':
-			case 'i':
-			case 'x':
-			case 'X':
-			case 'u':
-				if (!arg) {
-					do_warning_event(event, "no argument match");
-					event->flags |= EVENT_FL_FAILED;
-					goto out_failed;
-				}
-
-				len = ((unsigned long)ptr + 1) -
-					(unsigned long)saveptr;
-
-				/* should never happen */
-				if (len > 31) {
-					do_warning_event(event, "bad format!");
-					event->flags |= EVENT_FL_FAILED;
-					len = 31;
-				}
-
-				memcpy(format, saveptr, len);
-				format[len] = 0;
-
-				val = eval_num_arg(data, size, event, arg);
-				arg = arg->next;
-
-				if (show_func) {
-					func = find_func(pevent, val);
-					if (func) {
-						trace_seq_puts(s, func->func);
-						if (show_func == 'F')
-							trace_seq_printf(s,
-							       "+0x%llx",
-							       val - func->addr);
-						break;
-					}
-				}
-				if (pevent->long_size == 8 && ls &&
-				    sizeof(long) != 8) {
-					char *p;
-
-					/* make %l into %ll */
-					if (ls == 1 && (p = strchr(format, 'l')))
-						memmove(p+1, p, strlen(p)+1);
-					else if (strcmp(format, "%p") == 0)
-						strcpy(format, "0x%llx");
-					ls = 2;
-				}
-				switch (ls) {
-				case -2:
-					if (len_as_arg)
-						trace_seq_printf(s, format, len_arg, (char)val);
-					else
-						trace_seq_printf(s, format, (char)val);
-					break;
-				case -1:
-					if (len_as_arg)
-						trace_seq_printf(s, format, len_arg, (short)val);
-					else
-						trace_seq_printf(s, format, (short)val);
-					break;
-				case 0:
-					if (len_as_arg)
-						trace_seq_printf(s, format, len_arg, (int)val);
-					else
-						trace_seq_printf(s, format, (int)val);
-					break;
-				case 1:
-					if (len_as_arg)
-						trace_seq_printf(s, format, len_arg, (long)val);
-					else
-						trace_seq_printf(s, format, (long)val);
-					break;
-				case 2:
-					if (len_as_arg)
-						trace_seq_printf(s, format, len_arg,
-								 (long long)val);
-					else
-						trace_seq_printf(s, format, (long long)val);
-					break;
-				default:
-					do_warning_event(event, "bad count (%d)", ls);
-					event->flags |= EVENT_FL_FAILED;
-				}
-				break;
-			case 's':
-				if (!arg) {
-					do_warning_event(event, "no matching argument");
-					event->flags |= EVENT_FL_FAILED;
-					goto out_failed;
-				}
-
-				len = ((unsigned long)ptr + 1) -
-					(unsigned long)saveptr;
-
-				/* should never happen */
-				if (len > 31) {
-					do_warning_event(event, "bad format!");
-					event->flags |= EVENT_FL_FAILED;
-					len = 31;
-				}
-
-				memcpy(format, saveptr, len);
-				format[len] = 0;
-				if (!len_as_arg)
-					len_arg = -1;
-				/* Use helper trace_seq */
-				trace_seq_init(&p);
-				print_str_arg(&p, data, size, event,
-					      format, len_arg, arg);
-				trace_seq_terminate(&p);
-				trace_seq_puts(s, p.buffer);
-				trace_seq_destroy(&p);
-				arg = arg->next;
-				break;
-			default:
-				trace_seq_printf(s, ">%c<", *ptr);
-
-			}
-		} else
-			trace_seq_putc(s, *ptr);
-	}
-
-	if (event->flags & EVENT_FL_FAILED) {
-out_failed:
-		trace_seq_printf(s, "[FAILED TO PARSE]");
-	}
-
-	if (args) {
-		free_args(args);
-		free(bprint_fmt);
-	}
-}
-
-/**
- * pevent_data_lat_fmt - parse the data for the latency format
- * @pevent: a handle to the pevent
- * @s: the trace_seq to write to
- * @record: the record to read from
- *
- * This parses out the Latency format (interrupts disabled,
- * need rescheduling, in hard/soft interrupt, preempt count
- * and lock depth) and places it into the trace_seq.
- */
-void pevent_data_lat_fmt(struct pevent *pevent,
-			 struct trace_seq *s, struct pevent_record *record)
-{
-	static int check_lock_depth = 1;
-	static int check_migrate_disable = 1;
-	static int lock_depth_exists;
-	static int migrate_disable_exists;
-	unsigned int lat_flags;
-	unsigned int pc;
-	int lock_depth;
-	int migrate_disable;
-	int hardirq;
-	int softirq;
-	void *data = record->data;
-
-	lat_flags = parse_common_flags(pevent, data);
-	pc = parse_common_pc(pevent, data);
-	/* lock_depth may not always exist */
-	if (lock_depth_exists)
-		lock_depth = parse_common_lock_depth(pevent, data);
-	else if (check_lock_depth) {
-		lock_depth = parse_common_lock_depth(pevent, data);
-		if (lock_depth < 0)
-			check_lock_depth = 0;
-		else
-			lock_depth_exists = 1;
-	}
-
-	/* migrate_disable may not always exist */
-	if (migrate_disable_exists)
-		migrate_disable = parse_common_migrate_disable(pevent, data);
-	else if (check_migrate_disable) {
-		migrate_disable = parse_common_migrate_disable(pevent, data);
-		if (migrate_disable < 0)
-			check_migrate_disable = 0;
-		else
-			migrate_disable_exists = 1;
-	}
-
-	hardirq = lat_flags & TRACE_FLAG_HARDIRQ;
-	softirq = lat_flags & TRACE_FLAG_SOFTIRQ;
-
-	trace_seq_printf(s, "%c%c%c",
-	       (lat_flags & TRACE_FLAG_IRQS_OFF) ? 'd' :
-	       (lat_flags & TRACE_FLAG_IRQS_NOSUPPORT) ?
-	       'X' : '.',
-	       (lat_flags & TRACE_FLAG_NEED_RESCHED) ?
-	       'N' : '.',
-	       (hardirq && softirq) ? 'H' :
-	       hardirq ? 'h' : softirq ? 's' : '.');
-
-	if (pc)
-		trace_seq_printf(s, "%x", pc);
-	else
-		trace_seq_putc(s, '.');
-
-	if (migrate_disable_exists) {
-		if (migrate_disable < 0)
-			trace_seq_putc(s, '.');
-		else
-			trace_seq_printf(s, "%d", migrate_disable);
-	}
-
-	if (lock_depth_exists) {
-		if (lock_depth < 0)
-			trace_seq_putc(s, '.');
-		else
-			trace_seq_printf(s, "%d", lock_depth);
-	}
-
-	trace_seq_terminate(s);
-}
-
-/**
- * pevent_data_type - parse out the given event type
- * @pevent: a handle to the pevent
- * @rec: the record to read from
- *
- * This returns the event id from the @rec.
- */
-int pevent_data_type(struct pevent *pevent, struct pevent_record *rec)
-{
-	return trace_parse_common_type(pevent, rec->data);
-}
-
-/**
- * pevent_data_event_from_type - find the event by a given type
- * @pevent: a handle to the pevent
- * @type: the type of the event.
- *
- * This returns the event form a given @type;
- */
-struct event_format *pevent_data_event_from_type(struct pevent *pevent, int type)
-{
-	return pevent_find_event(pevent, type);
-}
-
-/**
- * pevent_data_pid - parse the PID from raw data
- * @pevent: a handle to the pevent
- * @rec: the record to parse
- *
- * This returns the PID from a raw data.
- */
-int pevent_data_pid(struct pevent *pevent, struct pevent_record *rec)
-{
-	return parse_common_pid(pevent, rec->data);
-}
-
-/**
- * pevent_data_comm_from_pid - return the command line from PID
- * @pevent: a handle to the pevent
- * @pid: the PID of the task to search for
- *
- * This returns a pointer to the command line that has the given
- * @pid.
- */
-const char *pevent_data_comm_from_pid(struct pevent *pevent, int pid)
-{
-	const char *comm;
-
-	comm = find_cmdline(pevent, pid);
-	return comm;
-}
-
-static struct cmdline *
-pid_from_cmdlist(struct pevent *pevent, const char *comm, struct cmdline *next)
-{
-	struct cmdline_list *cmdlist = (struct cmdline_list *)next;
-
-	if (cmdlist)
-		cmdlist = cmdlist->next;
-	else
-		cmdlist = pevent->cmdlist;
-
-	while (cmdlist && strcmp(cmdlist->comm, comm) != 0)
-		cmdlist = cmdlist->next;
-
-	return (struct cmdline *)cmdlist;
-}
-
-/**
- * pevent_data_pid_from_comm - return the pid from a given comm
- * @pevent: a handle to the pevent
- * @comm: the cmdline to find the pid from
- * @next: the cmdline structure to find the next comm
- *
- * This returns the cmdline structure that holds a pid for a given
- * comm, or NULL if none found. As there may be more than one pid for
- * a given comm, the result of this call can be passed back into
- * a recurring call in the @next paramater, and then it will find the
- * next pid.
- * Also, it does a linear seach, so it may be slow.
- */
-struct cmdline *pevent_data_pid_from_comm(struct pevent *pevent, const char *comm,
-					  struct cmdline *next)
-{
-	struct cmdline *cmdline;
-
-	/*
-	 * If the cmdlines have not been converted yet, then use
-	 * the list.
-	 */
-	if (!pevent->cmdlines)
-		return pid_from_cmdlist(pevent, comm, next);
-
-	if (next) {
-		/*
-		 * The next pointer could have been still from
-		 * a previous call before cmdlines were created
-		 */
-		if (next < pevent->cmdlines ||
-		    next >= pevent->cmdlines + pevent->cmdline_count)
-			next = NULL;
-		else
-			cmdline  = next++;
-	}
-
-	if (!next)
-		cmdline = pevent->cmdlines;
-
-	while (cmdline < pevent->cmdlines + pevent->cmdline_count) {
-		if (strcmp(cmdline->comm, comm) == 0)
-			return cmdline;
-		cmdline++;
-	}
-	return NULL;
-}
-
-/**
- * pevent_cmdline_pid - return the pid associated to a given cmdline
- * @cmdline: The cmdline structure to get the pid from
- *
- * Returns the pid for a give cmdline. If @cmdline is NULL, then
- * -1 is returned.
- */
-int pevent_cmdline_pid(struct pevent *pevent, struct cmdline *cmdline)
-{
-	struct cmdline_list *cmdlist = (struct cmdline_list *)cmdline;
-
-	if (!cmdline)
-		return -1;
-
-	/*
-	 * If cmdlines have not been created yet, or cmdline is
-	 * not part of the array, then treat it as a cmdlist instead.
-	 */
-	if (!pevent->cmdlines ||
-	    cmdline < pevent->cmdlines ||
-	    cmdline >= pevent->cmdlines + pevent->cmdline_count)
-		return cmdlist->pid;
-
-	return cmdline->pid;
-}
-
-/**
- * pevent_data_comm_from_pid - parse the data into the print format
- * @s: the trace_seq to write to
- * @event: the handle to the event
- * @record: the record to read from
- *
- * This parses the raw @data using the given @event information and
- * writes the print format into the trace_seq.
- */
-void pevent_event_info(struct trace_seq *s, struct event_format *event,
-		       struct pevent_record *record)
-{
-	int print_pretty = 1;
-
-	if (event->pevent->print_raw || (event->flags & EVENT_FL_PRINTRAW))
-		print_event_fields(s, record->data, record->size, event);
-	else {
-
-		if (event->handler && !(event->flags & EVENT_FL_NOHANDLE))
-			print_pretty = event->handler(s, record, event,
-						      event->context);
-
-		if (print_pretty)
-			pretty_print(s, record->data, record->size, event);
-	}
-
-	trace_seq_terminate(s);
-}
-
-static bool is_timestamp_in_us(char *trace_clock, bool use_trace_clock)
-{
-	if (!use_trace_clock)
-		return true;
-
-	if (!strcmp(trace_clock, "local") || !strcmp(trace_clock, "global")
-	    || !strcmp(trace_clock, "uptime") || !strcmp(trace_clock, "perf"))
-		return true;
-
-	/* trace_clock is setting in tsc or counter mode */
-	return false;
-}
-
-void pevent_print_event(struct pevent *pevent, struct trace_seq *s,
-			struct pevent_record *record, bool use_trace_clock)
-{
-	static const char *spaces = "                    "; /* 20 spaces */
-	struct event_format *event;
-	unsigned long secs;
-	unsigned long usecs;
-	unsigned long nsecs;
-	const char *comm;
-	void *data = record->data;
-	int type;
-	int pid;
-	int len;
-	int p;
-	bool use_usec_format;
-
-	use_usec_format = is_timestamp_in_us(pevent->trace_clock,
-							use_trace_clock);
-	if (use_usec_format) {
-		secs = record->ts / NSECS_PER_SEC;
-		nsecs = record->ts - secs * NSECS_PER_SEC;
-	}
-
-	if (record->size < 0) {
-		do_warning("ug! negative record size %d", record->size);
-		return;
-	}
-
-	type = trace_parse_common_type(pevent, data);
-
-	event = pevent_find_event(pevent, type);
-	if (!event) {
-		do_warning("ug! no event found for type %d", type);
-		return;
-	}
-
-	pid = parse_common_pid(pevent, data);
-	comm = find_cmdline(pevent, pid);
-
-	if (pevent->latency_format) {
-		trace_seq_printf(s, "%8.8s-%-5d %3d",
-		       comm, pid, record->cpu);
-		pevent_data_lat_fmt(pevent, s, record);
-	} else
-		trace_seq_printf(s, "%16s-%-5d [%03d]", comm, pid, record->cpu);
-
-	if (use_usec_format) {
-		if (pevent->flags & PEVENT_NSEC_OUTPUT) {
-			usecs = nsecs;
-			p = 9;
-		} else {
-			usecs = (nsecs + 500) / NSECS_PER_USEC;
-			p = 6;
-		}
-
-		trace_seq_printf(s, " %5lu.%0*lu: %s: ",
-					secs, p, usecs, event->name);
-	} else
-		trace_seq_printf(s, " %12llu: %s: ",
-					record->ts, event->name);
-
-	/* Space out the event names evenly. */
-	len = strlen(event->name);
-	if (len < 20)
-		trace_seq_printf(s, "%.*s", 20 - len, spaces);
-
-	pevent_event_info(s, event, record);
-}
-
-static int events_id_cmp(const void *a, const void *b)
-{
-	struct event_format * const * ea = a;
-	struct event_format * const * eb = b;
-
-	if ((*ea)->id < (*eb)->id)
-		return -1;
-
-	if ((*ea)->id > (*eb)->id)
-		return 1;
-
-	return 0;
-}
-
-static int events_name_cmp(const void *a, const void *b)
-{
-	struct event_format * const * ea = a;
-	struct event_format * const * eb = b;
-	int res;
-
-	res = strcmp((*ea)->name, (*eb)->name);
-	if (res)
-		return res;
-
-	res = strcmp((*ea)->system, (*eb)->system);
-	if (res)
-		return res;
-
-	return events_id_cmp(a, b);
-}
-
-static int events_system_cmp(const void *a, const void *b)
-{
-	struct event_format * const * ea = a;
-	struct event_format * const * eb = b;
-	int res;
-
-	res = strcmp((*ea)->system, (*eb)->system);
-	if (res)
-		return res;
-
-	res = strcmp((*ea)->name, (*eb)->name);
-	if (res)
-		return res;
-
-	return events_id_cmp(a, b);
-}
-
-struct event_format **pevent_list_events(struct pevent *pevent, enum event_sort_type sort_type)
-{
-	struct event_format **events;
-	int (*sort)(const void *a, const void *b);
-
-	events = pevent->sort_events;
-
-	if (events && pevent->last_type == sort_type)
-		return events;
-
-	if (!events) {
-		events = malloc(sizeof(*events) * (pevent->nr_events + 1));
-		if (!events)
-			return NULL;
-
-		memcpy(events, pevent->events, sizeof(*events) * pevent->nr_events);
-		events[pevent->nr_events] = NULL;
-
-		pevent->sort_events = events;
-
-		/* the internal events are sorted by id */
-		if (sort_type == EVENT_SORT_ID) {
-			pevent->last_type = sort_type;
-			return events;
-		}
-	}
-
-	switch (sort_type) {
-	case EVENT_SORT_ID:
-		sort = events_id_cmp;
-		break;
-	case EVENT_SORT_NAME:
-		sort = events_name_cmp;
-		break;
-	case EVENT_SORT_SYSTEM:
-		sort = events_system_cmp;
-		break;
-	default:
-		return events;
-	}
-
-	qsort(events, pevent->nr_events, sizeof(*events), sort);
-	pevent->last_type = sort_type;
-
-	return events;
-}
-
-static struct format_field **
-get_event_fields(const char *type, const char *name,
-		 int count, struct format_field *list)
-{
-	struct format_field **fields;
-	struct format_field *field;
-	int i = 0;
-
-	fields = malloc(sizeof(*fields) * (count + 1));
-	if (!fields)
-		return NULL;
-
-	for (field = list; field; field = field->next) {
-		fields[i++] = field;
-		if (i == count + 1) {
-			do_warning("event %s has more %s fields than specified",
-				name, type);
-			i--;
-			break;
-		}
-	}
-
-	if (i != count)
-		do_warning("event %s has less %s fields than specified",
-			name, type);
-
-	fields[i] = NULL;
-
-	return fields;
-}
-
-/**
- * pevent_event_common_fields - return a list of common fields for an event
- * @event: the event to return the common fields of.
- *
- * Returns an allocated array of fields. The last item in the array is NULL.
- * The array must be freed with free().
- */
-struct format_field **pevent_event_common_fields(struct event_format *event)
-{
-	return get_event_fields("common", event->name,
-				event->format.nr_common,
-				event->format.common_fields);
-}
-
-/**
- * pevent_event_fields - return a list of event specific fields for an event
- * @event: the event to return the fields of.
- *
- * Returns an allocated array of fields. The last item in the array is NULL.
- * The array must be freed with free().
- */
-struct format_field **pevent_event_fields(struct event_format *event)
-{
-	return get_event_fields("event", event->name,
-				event->format.nr_fields,
-				event->format.fields);
-}
-
-static void print_fields(struct trace_seq *s, struct print_flag_sym *field)
-{
-	trace_seq_printf(s, "{ %s, %s }", field->value, field->str);
-	if (field->next) {
-		trace_seq_puts(s, ", ");
-		print_fields(s, field->next);
-	}
-}
-
-/* for debugging */
-static void print_args(struct print_arg *args)
-{
-	int print_paren = 1;
-	struct trace_seq s;
-
-	switch (args->type) {
-	case PRINT_NULL:
-		printf("null");
-		break;
-	case PRINT_ATOM:
-		printf("%s", args->atom.atom);
-		break;
-	case PRINT_FIELD:
-		printf("REC->%s", args->field.name);
-		break;
-	case PRINT_FLAGS:
-		printf("__print_flags(");
-		print_args(args->flags.field);
-		printf(", %s, ", args->flags.delim);
-		trace_seq_init(&s);
-		print_fields(&s, args->flags.flags);
-		trace_seq_do_printf(&s);
-		trace_seq_destroy(&s);
-		printf(")");
-		break;
-	case PRINT_SYMBOL:
-		printf("__print_symbolic(");
-		print_args(args->symbol.field);
-		printf(", ");
-		trace_seq_init(&s);
-		print_fields(&s, args->symbol.symbols);
-		trace_seq_do_printf(&s);
-		trace_seq_destroy(&s);
-		printf(")");
-		break;
-	case PRINT_HEX:
-		printf("__print_hex(");
-		print_args(args->hex.field);
-		printf(", ");
-		print_args(args->hex.size);
-		printf(")");
-		break;
-	case PRINT_INT_ARRAY:
-		printf("__print_array(");
-		print_args(args->int_array.field);
-		printf(", ");
-		print_args(args->int_array.count);
-		printf(", ");
-		print_args(args->int_array.el_size);
-		printf(")");
-		break;
-	case PRINT_STRING:
-	case PRINT_BSTRING:
-		printf("__get_str(%s)", args->string.string);
-		break;
-	case PRINT_BITMASK:
-		printf("__get_bitmask(%s)", args->bitmask.bitmask);
-		break;
-	case PRINT_TYPE:
-		printf("(%s)", args->typecast.type);
-		print_args(args->typecast.item);
-		break;
-	case PRINT_OP:
-		if (strcmp(args->op.op, ":") == 0)
-			print_paren = 0;
-		if (print_paren)
-			printf("(");
-		print_args(args->op.left);
-		printf(" %s ", args->op.op);
-		print_args(args->op.right);
-		if (print_paren)
-			printf(")");
-		break;
-	default:
-		/* we should warn... */
-		return;
-	}
-	if (args->next) {
-		printf("\n");
-		print_args(args->next);
-	}
-}
-
-static void parse_header_field(const char *field,
-			       int *offset, int *size, int mandatory)
-{
-	unsigned long long save_input_buf_ptr;
-	unsigned long long save_input_buf_siz;
-	char *token;
-	int type;
-
-	save_input_buf_ptr = input_buf_ptr;
-	save_input_buf_siz = input_buf_siz;
-
-	if (read_expected(EVENT_ITEM, "field") < 0)
-		return;
-	if (read_expected(EVENT_OP, ":") < 0)
-		return;
-
-	/* type */
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto fail;
-	free_token(token);
-
-	/*
-	 * If this is not a mandatory field, then test it first.
-	 */
-	if (mandatory) {
-		if (read_expected(EVENT_ITEM, field) < 0)
-			return;
-	} else {
-		if (read_expect_type(EVENT_ITEM, &token) < 0)
-			goto fail;
-		if (strcmp(token, field) != 0)
-			goto discard;
-		free_token(token);
-	}
-
-	if (read_expected(EVENT_OP, ";") < 0)
-		return;
-	if (read_expected(EVENT_ITEM, "offset") < 0)
-		return;
-	if (read_expected(EVENT_OP, ":") < 0)
-		return;
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto fail;
-	*offset = atoi(token);
-	free_token(token);
-	if (read_expected(EVENT_OP, ";") < 0)
-		return;
-	if (read_expected(EVENT_ITEM, "size") < 0)
-		return;
-	if (read_expected(EVENT_OP, ":") < 0)
-		return;
-	if (read_expect_type(EVENT_ITEM, &token) < 0)
-		goto fail;
-	*size = atoi(token);
-	free_token(token);
-	if (read_expected(EVENT_OP, ";") < 0)
-		return;
-	type = read_token(&token);
-	if (type != EVENT_NEWLINE) {
-		/* newer versions of the kernel have a "signed" type */
-		if (type != EVENT_ITEM)
-			goto fail;
-
-		if (strcmp(token, "signed") != 0)
-			goto fail;
-
-		free_token(token);
-
-		if (read_expected(EVENT_OP, ":") < 0)
-			return;
-
-		if (read_expect_type(EVENT_ITEM, &token))
-			goto fail;
-
-		free_token(token);
-		if (read_expected(EVENT_OP, ";") < 0)
-			return;
-
-		if (read_expect_type(EVENT_NEWLINE, &token))
-			goto fail;
-	}
- fail:
-	free_token(token);
-	return;
-
- discard:
-	input_buf_ptr = save_input_buf_ptr;
-	input_buf_siz = save_input_buf_siz;
-	*offset = 0;
-	*size = 0;
-	free_token(token);
-}
-
-/**
- * pevent_parse_header_page - parse the data stored in the header page
- * @pevent: the handle to the pevent
- * @buf: the buffer storing the header page format string
- * @size: the size of @buf
- * @long_size: the long size to use if there is no header
- *
- * This parses the header page format for information on the
- * ring buffer used. The @buf should be copied from
- *
- * /sys/kernel/debug/tracing/events/header_page
- */
-int pevent_parse_header_page(struct pevent *pevent, char *buf, unsigned long size,
-			     int long_size)
-{
-	int ignore;
-
-	if (!size) {
-		/*
-		 * Old kernels did not have header page info.
-		 * Sorry but we just use what we find here in user space.
-		 */
-		pevent->header_page_ts_size = sizeof(long long);
-		pevent->header_page_size_size = long_size;
-		pevent->header_page_data_offset = sizeof(long long) + long_size;
-		pevent->old_format = 1;
-		return -1;
-	}
-	init_input_buf(buf, size);
-
-	parse_header_field("timestamp", &pevent->header_page_ts_offset,
-			   &pevent->header_page_ts_size, 1);
-	parse_header_field("commit", &pevent->header_page_size_offset,
-			   &pevent->header_page_size_size, 1);
-	parse_header_field("overwrite", &pevent->header_page_overwrite,
-			   &ignore, 0);
-	parse_header_field("data", &pevent->header_page_data_offset,
-			   &pevent->header_page_data_size, 1);
-
-	return 0;
-}
-
-static int event_matches(struct event_format *event,
-			 int id, const char *sys_name,
-			 const char *event_name)
-{
-	if (id >= 0 && id != event->id)
-		return 0;
-
-	if (event_name && (strcmp(event_name, event->name) != 0))
-		return 0;
-
-	if (sys_name && (strcmp(sys_name, event->system) != 0))
-		return 0;
-
-	return 1;
-}
-
-static void free_handler(struct event_handler *handle)
-{
-	free((void *)handle->sys_name);
-	free((void *)handle->event_name);
-	free(handle);
-}
-
-static int find_event_handle(struct pevent *pevent, struct event_format *event)
-{
-	struct event_handler *handle, **next;
-
-	for (next = &pevent->handlers; *next;
-	     next = &(*next)->next) {
-		handle = *next;
-		if (event_matches(event, handle->id,
-				  handle->sys_name,
-				  handle->event_name))
-			break;
-	}
-
-	if (!(*next))
-		return 0;
-
-	pr_stat("overriding event (%d) %s:%s with new print handler",
-		event->id, event->system, event->name);
-
-	event->handler = handle->func;
-	event->context = handle->context;
-
-	*next = handle->next;
-	free_handler(handle);
-
-	return 1;
-}
-
-/**
- * __pevent_parse_format - parse the event format
- * @buf: the buffer storing the event format string
- * @size: the size of @buf
- * @sys: the system the event belongs to
- *
- * This parses the event format and creates an event structure
- * to quickly parse raw data for a given event.
- *
- * These files currently come from:
- *
- * /sys/kernel/debug/tracing/events/.../.../format
- */
-enum pevent_errno __pevent_parse_format(struct event_format **eventp,
-					struct pevent *pevent, const char *buf,
-					unsigned long size, const char *sys)
-{
-	struct event_format *event;
-	int ret;
-
-	init_input_buf(buf, size);
-
-	*eventp = event = alloc_event();
-	if (!event)
-		return PEVENT_ERRNO__MEM_ALLOC_FAILED;
-
-	event->name = event_read_name();
-	if (!event->name) {
-		/* Bad event? */
-		ret = PEVENT_ERRNO__MEM_ALLOC_FAILED;
-		goto event_alloc_failed;
-	}
-
-	if (strcmp(sys, "ftrace") == 0) {
-		event->flags |= EVENT_FL_ISFTRACE;
-
-		if (strcmp(event->name, "bprint") == 0)
-			event->flags |= EVENT_FL_ISBPRINT;
-	}
-		
-	event->id = event_read_id();
-	if (event->id < 0) {
-		ret = PEVENT_ERRNO__READ_ID_FAILED;
-		/*
-		 * This isn't an allocation error actually.
-		 * But as the ID is critical, just bail out.
-		 */
-		goto event_alloc_failed;
-	}
-
-	event->system = strdup(sys);
-	if (!event->system) {
-		ret = PEVENT_ERRNO__MEM_ALLOC_FAILED;
-		goto event_alloc_failed;
-	}
-
-	/* Add pevent to event so that it can be referenced */
-	event->pevent = pevent;
-
-	ret = event_read_format(event);
-	if (ret < 0) {
-		ret = PEVENT_ERRNO__READ_FORMAT_FAILED;
-		goto event_parse_failed;
-	}
-
-	/*
-	 * If the event has an override, don't print warnings if the event
-	 * print format fails to parse.
-	 */
-	if (pevent && find_event_handle(pevent, event))
-		show_warning = 0;
-
-	ret = event_read_print(event);
-	show_warning = 1;
-
-	if (ret < 0) {
-		ret = PEVENT_ERRNO__READ_PRINT_FAILED;
-		goto event_parse_failed;
-	}
-
-	if (!ret && (event->flags & EVENT_FL_ISFTRACE)) {
-		struct format_field *field;
-		struct print_arg *arg, **list;
-
-		/* old ftrace had no args */
-		list = &event->print_fmt.args;
-		for (field = event->format.fields; field; field = field->next) {
-			arg = alloc_arg();
-			if (!arg) {
-				event->flags |= EVENT_FL_FAILED;
-				return PEVENT_ERRNO__OLD_FTRACE_ARG_FAILED;
-			}
-			arg->type = PRINT_FIELD;
-			arg->field.name = strdup(field->name);
-			if (!arg->field.name) {
-				event->flags |= EVENT_FL_FAILED;
-				free_arg(arg);
-				return PEVENT_ERRNO__OLD_FTRACE_ARG_FAILED;
-			}
-			arg->field.field = field;
-			*list = arg;
-			list = &arg->next;
-		}
-		return 0;
-	}
-
-	return 0;
-
- event_parse_failed:
-	event->flags |= EVENT_FL_FAILED;
-	return ret;
-
- event_alloc_failed:
-	free(event->system);
-	free(event->name);
-	free(event);
-	*eventp = NULL;
-	return ret;
-}
-
-static enum pevent_errno
-__pevent_parse_event(struct pevent *pevent,
-		     struct event_format **eventp,
-		     const char *buf, unsigned long size,
-		     const char *sys)
-{
-	int ret = __pevent_parse_format(eventp, pevent, buf, size, sys);
-	struct event_format *event = *eventp;
-
-	if (event == NULL)
-		return ret;
-
-	if (pevent && add_event(pevent, event)) {
-		ret = PEVENT_ERRNO__MEM_ALLOC_FAILED;
-		goto event_add_failed;
-	}
-
-#define PRINT_ARGS 0
-	if (PRINT_ARGS && event->print_fmt.args)
-		print_args(event->print_fmt.args);
-
-	return 0;
-
-event_add_failed:
-	pevent_free_format(event);
-	return ret;
-}
-
-/**
- * pevent_parse_format - parse the event format
- * @pevent: the handle to the pevent
- * @eventp: returned format
- * @buf: the buffer storing the event format string
- * @size: the size of @buf
- * @sys: the system the event belongs to
- *
- * This parses the event format and creates an event structure
- * to quickly parse raw data for a given event.
- *
- * These files currently come from:
- *
- * /sys/kernel/debug/tracing/events/.../.../format
- */
-enum pevent_errno pevent_parse_format(struct pevent *pevent,
-				      struct event_format **eventp,
-				      const char *buf,
-				      unsigned long size, const char *sys)
-{
-	return __pevent_parse_event(pevent, eventp, buf, size, sys);
-}
-
-/**
- * pevent_parse_event - parse the event format
- * @pevent: the handle to the pevent
- * @buf: the buffer storing the event format string
- * @size: the size of @buf
- * @sys: the system the event belongs to
- *
- * This parses the event format and creates an event structure
- * to quickly parse raw data for a given event.
- *
- * These files currently come from:
- *
- * /sys/kernel/debug/tracing/events/.../.../format
- */
-enum pevent_errno pevent_parse_event(struct pevent *pevent, const char *buf,
-				     unsigned long size, const char *sys)
-{
-	struct event_format *event = NULL;
-	return __pevent_parse_event(pevent, &event, buf, size, sys);
-}
-
-#undef _PE
-#define _PE(code, str) str
-static const char * const pevent_error_str[] = {
-	PEVENT_ERRORS
-};
-#undef _PE
-
-int pevent_strerror(struct pevent *pevent __maybe_unused,
-		    enum pevent_errno errnum, char *buf, size_t buflen)
-{
-	int idx;
-	const char *msg;
-
-	if (errnum >= 0) {
-		msg = strerror_r(errnum, buf, buflen);
-		if (msg != buf) {
-			size_t len = strlen(msg);
-			memcpy(buf, msg, min(buflen - 1, len));
-			*(buf + min(buflen - 1, len)) = '\0';
-		}
-		return 0;
-	}
-
-	if (errnum <= __PEVENT_ERRNO__START ||
-	    errnum >= __PEVENT_ERRNO__END)
-		return -1;
-
-	idx = errnum - __PEVENT_ERRNO__START - 1;
-	msg = pevent_error_str[idx];
-	snprintf(buf, buflen, "%s", msg);
-
-	return 0;
-}
-
-int get_field_val(struct trace_seq *s, struct format_field *field,
-		  const char *name, struct pevent_record *record,
-		  unsigned long long *val, int err)
-{
-	if (!field) {
-		if (err)
-			trace_seq_printf(s, "<CANT FIND FIELD %s>", name);
-		return -1;
-	}
-
-	if (pevent_read_number_field(field, record->data, val)) {
-		if (err)
-			trace_seq_printf(s, " %s=INVALID", name);
-		return -1;
-	}
-
-	return 0;
-}
-
-/**
- * pevent_get_field_raw - return the raw pointer into the data field
- * @s: The seq to print to on error
- * @event: the event that the field is for
- * @name: The name of the field
- * @record: The record with the field name.
- * @len: place to store the field length.
- * @err: print default error if failed.
- *
- * Returns a pointer into record->data of the field and places
- * the length of the field in @len.
- *
- * On failure, it returns NULL.
- */
-void *pevent_get_field_raw(struct trace_seq *s, struct event_format *event,
-			   const char *name, struct pevent_record *record,
-			   int *len, int err)
-{
-	struct format_field *field;
-	void *data = record->data;
-	unsigned offset;
-	int dummy;
-
-	if (!event)
-		return NULL;
-
-	field = pevent_find_field(event, name);
-
-	if (!field) {
-		if (err)
-			trace_seq_printf(s, "<CANT FIND FIELD %s>", name);
-		return NULL;
-	}
-
-	/* Allow @len to be NULL */
-	if (!len)
-		len = &dummy;
-
-	offset = field->offset;
-	if (field->flags & FIELD_IS_DYNAMIC) {
-		offset = pevent_read_number(event->pevent,
-					    data + offset, field->size);
-		*len = offset >> 16;
-		offset &= 0xffff;
-	} else
-		*len = field->size;
-
-	return data + offset;
-}
-
-/**
- * pevent_get_field_val - find a field and return its value
- * @s: The seq to print to on error
- * @event: the event that the field is for
- * @name: The name of the field
- * @record: The record with the field name.
- * @val: place to store the value of the field.
- * @err: print default error if failed.
- *
- * Returns 0 on success -1 on field not found.
- */
-int pevent_get_field_val(struct trace_seq *s, struct event_format *event,
-			 const char *name, struct pevent_record *record,
-			 unsigned long long *val, int err)
-{
-	struct format_field *field;
-
-	if (!event)
-		return -1;
-
-	field = pevent_find_field(event, name);
-
-	return get_field_val(s, field, name, record, val, err);
-}
-
-/**
- * pevent_get_common_field_val - find a common field and return its value
- * @s: The seq to print to on error
- * @event: the event that the field is for
- * @name: The name of the field
- * @record: The record with the field name.
- * @val: place to store the value of the field.
- * @err: print default error if failed.
- *
- * Returns 0 on success -1 on field not found.
- */
-int pevent_get_common_field_val(struct trace_seq *s, struct event_format *event,
-				const char *name, struct pevent_record *record,
-				unsigned long long *val, int err)
-{
-	struct format_field *field;
-
-	if (!event)
-		return -1;
-
-	field = pevent_find_common_field(event, name);
-
-	return get_field_val(s, field, name, record, val, err);
-}
-
-/**
- * pevent_get_any_field_val - find a any field and return its value
- * @s: The seq to print to on error
- * @event: the event that the field is for
- * @name: The name of the field
- * @record: The record with the field name.
- * @val: place to store the value of the field.
- * @err: print default error if failed.
- *
- * Returns 0 on success -1 on field not found.
- */
-int pevent_get_any_field_val(struct trace_seq *s, struct event_format *event,
-			     const char *name, struct pevent_record *record,
-			     unsigned long long *val, int err)
-{
-	struct format_field *field;
-
-	if (!event)
-		return -1;
-
-	field = pevent_find_any_field(event, name);
-
-	return get_field_val(s, field, name, record, val, err);
-}
-
-/**
- * pevent_print_num_field - print a field and a format
- * @s: The seq to print to
- * @fmt: The printf format to print the field with.
- * @event: the event that the field is for
- * @name: The name of the field
- * @record: The record with the field name.
- * @err: print default error if failed.
- *
- * Returns: 0 on success, -1 field not found, or 1 if buffer is full.
- */
-int pevent_print_num_field(struct trace_seq *s, const char *fmt,
-			   struct event_format *event, const char *name,
-			   struct pevent_record *record, int err)
-{
-	struct format_field *field = pevent_find_field(event, name);
-	unsigned long long val;
-
-	if (!field)
-		goto failed;
-
-	if (pevent_read_number_field(field, record->data, &val))
-		goto failed;
-
-	return trace_seq_printf(s, fmt, val);
-
- failed:
-	if (err)
-		trace_seq_printf(s, "CAN'T FIND FIELD \"%s\"", name);
-	return -1;
-}
-
-/**
- * pevent_print_func_field - print a field and a format for function pointers
- * @s: The seq to print to
- * @fmt: The printf format to print the field with.
- * @event: the event that the field is for
- * @name: The name of the field
- * @record: The record with the field name.
- * @err: print default error if failed.
- *
- * Returns: 0 on success, -1 field not found, or 1 if buffer is full.
- */
-int pevent_print_func_field(struct trace_seq *s, const char *fmt,
-			    struct event_format *event, const char *name,
-			    struct pevent_record *record, int err)
-{
-	struct format_field *field = pevent_find_field(event, name);
-	struct pevent *pevent = event->pevent;
-	unsigned long long val;
-	struct func_map *func;
-	char tmp[128];
-
-	if (!field)
-		goto failed;
-
-	if (pevent_read_number_field(field, record->data, &val))
-		goto failed;
-
-	func = find_func(pevent, val);
-
-	if (func)
-		snprintf(tmp, 128, "%s/0x%llx", func->func, func->addr - val);
-	else
-		sprintf(tmp, "0x%08llx", val);
-
-	return trace_seq_printf(s, fmt, tmp);
-
- failed:
-	if (err)
-		trace_seq_printf(s, "CAN'T FIND FIELD \"%s\"", name);
-	return -1;
-}
-
-static void free_func_handle(struct pevent_function_handler *func)
-{
-	struct pevent_func_params *params;
-
-	free(func->name);
-
-	while (func->params) {
-		params = func->params;
-		func->params = params->next;
-		free(params);
-	}
-
-	free(func);
-}
-
-/**
- * pevent_register_print_function - register a helper function
- * @pevent: the handle to the pevent
- * @func: the function to process the helper function
- * @ret_type: the return type of the helper function
- * @name: the name of the helper function
- * @parameters: A list of enum pevent_func_arg_type
- *
- * Some events may have helper functions in the print format arguments.
- * This allows a plugin to dynamically create a way to process one
- * of these functions.
- *
- * The @parameters is a variable list of pevent_func_arg_type enums that
- * must end with PEVENT_FUNC_ARG_VOID.
- */
-int pevent_register_print_function(struct pevent *pevent,
-				   pevent_func_handler func,
-				   enum pevent_func_arg_type ret_type,
-				   char *name, ...)
-{
-	struct pevent_function_handler *func_handle;
-	struct pevent_func_params **next_param;
-	struct pevent_func_params *param;
-	enum pevent_func_arg_type type;
-	va_list ap;
-	int ret;
-
-	func_handle = find_func_handler(pevent, name);
-	if (func_handle) {
-		/*
-		 * This is most like caused by the users own
-		 * plugins updating the function. This overrides the
-		 * system defaults.
-		 */
-		pr_stat("override of function helper '%s'", name);
-		remove_func_handler(pevent, name);
-	}
-
-	func_handle = calloc(1, sizeof(*func_handle));
-	if (!func_handle) {
-		do_warning("Failed to allocate function handler");
-		return PEVENT_ERRNO__MEM_ALLOC_FAILED;
-	}
-
-	func_handle->ret_type = ret_type;
-	func_handle->name = strdup(name);
-	func_handle->func = func;
-	if (!func_handle->name) {
-		do_warning("Failed to allocate function name");
-		free(func_handle);
-		return PEVENT_ERRNO__MEM_ALLOC_FAILED;
-	}
-
-	next_param = &(func_handle->params);
-	va_start(ap, name);
-	for (;;) {
-		type = va_arg(ap, enum pevent_func_arg_type);
-		if (type == PEVENT_FUNC_ARG_VOID)
-			break;
-
-		if (type >= PEVENT_FUNC_ARG_MAX_TYPES) {
-			do_warning("Invalid argument type %d", type);
-			ret = PEVENT_ERRNO__INVALID_ARG_TYPE;
-			goto out_free;
-		}
-
-		param = malloc(sizeof(*param));
-		if (!param) {
-			do_warning("Failed to allocate function param");
-			ret = PEVENT_ERRNO__MEM_ALLOC_FAILED;
-			goto out_free;
-		}
-		param->type = type;
-		param->next = NULL;
-
-		*next_param = param;
-		next_param = &(param->next);
-
-		func_handle->nr_args++;
-	}
-	va_end(ap);
-
-	func_handle->next = pevent->func_handlers;
-	pevent->func_handlers = func_handle;
-
-	return 0;
- out_free:
-	va_end(ap);
-	free_func_handle(func_handle);
-	return ret;
-}
-
-/**
- * pevent_unregister_print_function - unregister a helper function
- * @pevent: the handle to the pevent
- * @func: the function to process the helper function
- * @name: the name of the helper function
- *
- * This function removes existing print handler for function @name.
- *
- * Returns 0 if the handler was removed successully, -1 otherwise.
- */
-int pevent_unregister_print_function(struct pevent *pevent,
-				     pevent_func_handler func, char *name)
-{
-	struct pevent_function_handler *func_handle;
-
-	func_handle = find_func_handler(pevent, name);
-	if (func_handle && func_handle->func == func) {
-		remove_func_handler(pevent, name);
-		return 0;
-	}
-	return -1;
-}
-
-static struct event_format *pevent_search_event(struct pevent *pevent, int id,
-						const char *sys_name,
-						const char *event_name)
-{
-	struct event_format *event;
-
-	if (id >= 0) {
-		/* search by id */
-		event = pevent_find_event(pevent, id);
-		if (!event)
-			return NULL;
-		if (event_name && (strcmp(event_name, event->name) != 0))
-			return NULL;
-		if (sys_name && (strcmp(sys_name, event->system) != 0))
-			return NULL;
-	} else {
-		event = pevent_find_event_by_name(pevent, sys_name, event_name);
-		if (!event)
-			return NULL;
-	}
-	return event;
-}
-
-/**
- * pevent_register_event_handler - register a way to parse an event
- * @pevent: the handle to the pevent
- * @id: the id of the event to register
- * @sys_name: the system name the event belongs to
- * @event_name: the name of the event
- * @func: the function to call to parse the event information
- * @context: the data to be passed to @func
- *
- * This function allows a developer to override the parsing of
- * a given event. If for some reason the default print format
- * is not sufficient, this function will register a function
- * for an event to be used to parse the data instead.
- *
- * If @id is >= 0, then it is used to find the event.
- * else @sys_name and @event_name are used.
- */
-int pevent_register_event_handler(struct pevent *pevent, int id,
-				  const char *sys_name, const char *event_name,
-				  pevent_event_handler_func func, void *context)
-{
-	struct event_format *event;
-	struct event_handler *handle;
-
-	event = pevent_search_event(pevent, id, sys_name, event_name);
-	if (event == NULL)
-		goto not_found;
-
-	pr_stat("overriding event (%d) %s:%s with new print handler",
-		event->id, event->system, event->name);
-
-	event->handler = func;
-	event->context = context;
-	return 0;
-
- not_found:
-	/* Save for later use. */
-	handle = calloc(1, sizeof(*handle));
-	if (!handle) {
-		do_warning("Failed to allocate event handler");
-		return PEVENT_ERRNO__MEM_ALLOC_FAILED;
-	}
-
-	handle->id = id;
-	if (event_name)
-		handle->event_name = strdup(event_name);
-	if (sys_name)
-		handle->sys_name = strdup(sys_name);
-
-	if ((event_name && !handle->event_name) ||
-	    (sys_name && !handle->sys_name)) {
-		do_warning("Failed to allocate event/sys name");
-		free((void *)handle->event_name);
-		free((void *)handle->sys_name);
-		free(handle);
-		return PEVENT_ERRNO__MEM_ALLOC_FAILED;
-	}
-
-	handle->func = func;
-	handle->next = pevent->handlers;
-	pevent->handlers = handle;
-	handle->context = context;
-
-	return -1;
-}
-
-static int handle_matches(struct event_handler *handler, int id,
-			  const char *sys_name, const char *event_name,
-			  pevent_event_handler_func func, void *context)
-{
-	if (id >= 0 && id != handler->id)
-		return 0;
-
-	if (event_name && (strcmp(event_name, handler->event_name) != 0))
-		return 0;
-
-	if (sys_name && (strcmp(sys_name, handler->sys_name) != 0))
-		return 0;
-
-	if (func != handler->func || context != handler->context)
-		return 0;
-
-	return 1;
-}
-
-/**
- * pevent_unregister_event_handler - unregister an existing event handler
- * @pevent: the handle to the pevent
- * @id: the id of the event to unregister
- * @sys_name: the system name the handler belongs to
- * @event_name: the name of the event handler
- * @func: the function to call to parse the event information
- * @context: the data to be passed to @func
- *
- * This function removes existing event handler (parser).
- *
- * If @id is >= 0, then it is used to find the event.
- * else @sys_name and @event_name are used.
- *
- * Returns 0 if handler was removed successfully, -1 if event was not found.
- */
-int pevent_unregister_event_handler(struct pevent *pevent, int id,
-				    const char *sys_name, const char *event_name,
-				    pevent_event_handler_func func, void *context)
-{
-	struct event_format *event;
-	struct event_handler *handle;
-	struct event_handler **next;
-
-	event = pevent_search_event(pevent, id, sys_name, event_name);
-	if (event == NULL)
-		goto not_found;
-
-	if (event->handler == func && event->context == context) {
-		pr_stat("removing override handler for event (%d) %s:%s. Going back to default handler.",
-			event->id, event->system, event->name);
-
-		event->handler = NULL;
-		event->context = NULL;
-		return 0;
-	}
-
-not_found:
-	for (next = &pevent->handlers; *next; next = &(*next)->next) {
-		handle = *next;
-		if (handle_matches(handle, id, sys_name, event_name,
-				   func, context))
-			break;
-	}
-
-	if (!(*next))
-		return -1;
-
-	*next = handle->next;
-	free_handler(handle);
-
-	return 0;
-}
-
-/**
- * pevent_alloc - create a pevent handle
- */
-struct pevent *pevent_alloc(void)
-{
-	struct pevent *pevent = calloc(1, sizeof(*pevent));
-
-	if (pevent)
-		pevent->ref_count = 1;
-
-	return pevent;
-}
-
-void pevent_ref(struct pevent *pevent)
-{
-	pevent->ref_count++;
-}
-
-void pevent_free_format_field(struct format_field *field)
-{
-	free(field->type);
-	if (field->alias != field->name)
-		free(field->alias);
-	free(field->name);
-	free(field);
-}
-
-static void free_format_fields(struct format_field *field)
-{
-	struct format_field *next;
-
-	while (field) {
-		next = field->next;
-		pevent_free_format_field(field);
-		field = next;
-	}
-}
-
-static void free_formats(struct format *format)
-{
-	free_format_fields(format->common_fields);
-	free_format_fields(format->fields);
-}
-
-void pevent_free_format(struct event_format *event)
-{
-	free(event->name);
-	free(event->system);
-
-	free_formats(&event->format);
-
-	free(event->print_fmt.format);
-	free_args(event->print_fmt.args);
-
-	free(event);
-}
-
-/**
- * pevent_free - free a pevent handle
- * @pevent: the pevent handle to free
- */
-void pevent_free(struct pevent *pevent)
-{
-	struct cmdline_list *cmdlist, *cmdnext;
-	struct func_list *funclist, *funcnext;
-	struct printk_list *printklist, *printknext;
-	struct pevent_function_handler *func_handler;
-	struct event_handler *handle;
-	int i;
-
-	if (!pevent)
-		return;
-
-	cmdlist = pevent->cmdlist;
-	funclist = pevent->funclist;
-	printklist = pevent->printklist;
-
-	pevent->ref_count--;
-	if (pevent->ref_count)
-		return;
-
-	if (pevent->cmdlines) {
-		for (i = 0; i < pevent->cmdline_count; i++)
-			free(pevent->cmdlines[i].comm);
-		free(pevent->cmdlines);
-	}
-
-	while (cmdlist) {
-		cmdnext = cmdlist->next;
-		free(cmdlist->comm);
-		free(cmdlist);
-		cmdlist = cmdnext;
-	}
-
-	if (pevent->func_map) {
-		for (i = 0; i < (int)pevent->func_count; i++) {
-			free(pevent->func_map[i].func);
-			free(pevent->func_map[i].mod);
-		}
-		free(pevent->func_map);
-	}
-
-	while (funclist) {
-		funcnext = funclist->next;
-		free(funclist->func);
-		free(funclist->mod);
-		free(funclist);
-		funclist = funcnext;
-	}
-
-	while (pevent->func_handlers) {
-		func_handler = pevent->func_handlers;
-		pevent->func_handlers = func_handler->next;
-		free_func_handle(func_handler);
-	}
-
-	if (pevent->printk_map) {
-		for (i = 0; i < (int)pevent->printk_count; i++)
-			free(pevent->printk_map[i].printk);
-		free(pevent->printk_map);
-	}
-
-	while (printklist) {
-		printknext = printklist->next;
-		free(printklist->printk);
-		free(printklist);
-		printklist = printknext;
-	}
-
-	for (i = 0; i < pevent->nr_events; i++)
-		pevent_free_format(pevent->events[i]);
-
-	while (pevent->handlers) {
-		handle = pevent->handlers;
-		pevent->handlers = handle->next;
-		free_handler(handle);
-	}
-
-	free(pevent->trace_clock);
-	free(pevent->events);
-	free(pevent->sort_events);
-	free(pevent->func_resolver);
-
-	free(pevent);
-}
-
-void pevent_unref(struct pevent *pevent)
-{
-	pevent_free(pevent);
-}
+icado cuando se aplica tipos de retornohLos mÃ³dulos agregados se deben marcar con el atributo CLSCompliant para que coincidan con el ensambladohLos mÃ³dulos agregados se deben marcar con el atributo CLSCompliant para que coincidan con el ensamblado>'{0}': solo los miembros conformes a CLS pueden ser abstractos7Solo los miembros conformes a CLS pueden ser abstractos>Los mÃ©todos con argumentos de variable no son conformes a CLS>Los mÃ©todos con argumentos de variable no son conformes a CLS„Debe especificar el atributo CLSCompliant en el ensamblado, no en el mÃ³dulo, para habilitar la comprobaciÃ³n de conformidad con CLSxNo se puede especificar el atributo CLSCompliant en un mÃ³dulo que sea distinto del atributo CLSCompliant del ensambladoxNo se puede especificar el atributo CLSCompliant en un mÃ³dulo que sea distinto del atributo CLSCompliant del ensamblado„Debe especificar el atributo CLSCompliant en el ensamblado, no en el mÃ³dulo, para habilitar la comprobaciÃ³n de conformidad con CLSpEl mÃ©todo sobrecargado '{0}' que solo se diferencia en out o ref, o en el rango de matriz, no es conforme a CLSeEl mÃ©todo sobrecargado solo difiere en ref o out, o bien en el rango de matriz. No es conforme a CLShEl mÃ©todo sobrecargado '{0}' que solo se diferencia por tipos de matriz sin nombre no es conforme a CLSêEste error se produce cuando tiene un mÃ©todo sobrecargado que toma una matriz escalonada y cuando la Ãºnica diferencia entre firmas del mÃ©todo es el tipo de elemento del rango. Para evitar este error, considere utilizar una matriz rectangular en vez de una matriz escalonada. Utilice un parÃ¡metro adicional para desambiguar la funciÃ³n de llamada. Cambie el nombre de uno o de varios mÃ©todos sobrecargados. Si no necesita la conformidad a CLS, elimine el atributo CLSCompliantAttribute.\El mÃ©todo sobrecargado que solo difiere por tipos de matriz sin nombre no es conforme a CLS3El campo '{0}' conforme a CLS no puede ser volÃ¡til0El campo no conforme a CLS no puede ser volÃ¡tilšEl acceso a un miembro en '{0}' podrÃ­a provocar una excepciÃ³n en tiempo de ejecuciÃ³n, ya que es un campo de una clase de serializaciÃ³n por referencia.Esta advertencia se produce cuando intenta llamar a un mÃ©todo, a una propiedad o a un indizador en un miembro de una clase que deriva de MarshalByRefObject y el miembro es un tipo de valor. Los objetos que se heredan de MarshallByRefObject suelen estar diseÃ±ados para serializarse por referencia a travÃ©s del dominio de una aplicaciÃ³n. Si, alguna vez, algÃºn tipo de cÃ³digo intenta acceder directamente al miembro del tipo de valor de un objeto asÃ­ a travÃ©s del dominio de una aplicaciÃ³n, se producirÃ¡ una excepciÃ³n en tiempo de ejecuciÃ³n. Para resolver la advertencia, primero debe copiar el miembro en una variable local y llamar al mÃ©todo en esa variable.…El acceso a un miembro en un campo de una clase de serializaciÃ³n por referencia puede causar una excepciÃ³n en tiempo de ejecuciÃ³n.œEl atributo CallerArgumentExpressionAttribute aplicado al parÃ¡metro "{0}" no tendrÃ¡ ningÃºn efecto. Se ha aplicado con un nombre de parÃ¡metro no vÃ¡lido._El atributo CallerArgumentExpressionAttribute se aplica con un nombre de parÃ¡metro no vÃ¡lido.€El atributo CallerArgumentExpressionAttribute aplicado al parÃ¡metro "{0}" no tendrÃ¡ ningÃºn efecto porque es autorreferencial.zEl atributo CallerArgumentExpressionAttribute aplicado al parÃ¡metro no tendrÃ¡ ningÃºn efecto porque es autorreferencial.¸El atributo CallerArgumentExpressionAttribute aplicado al parÃ¡metro "{0}" no tendrÃ¡ efecto porque se aplica a un miembro que se usa en contextos que no permiten argumentos opcionalesŸEl atributo CallerArgumentExpressionAttribute no tendrÃ¡ efecto porque se aplica a un miembro que se utiliza en contextos que no permiten argumentos opcionales¥El CallerFilePathAttribute aplicado al parÃ¡metro '{0}' no tendrÃ¡ efecto porque se aplica a un miembro que se usa en contextos que no permiten argumentos opcionalesˆEl CallerFilePathAttribute no tendrÃ¡ efecto porque se aplica a un miembro que se usa en contextos que no permiten argumentos opcionales|El CallerArgumentExpressionAttribute aplicado al parÃ¡metro "{0}" no tendrÃ¡ efecto. Lo invalida el CallerFilePathAttribute.qEl atributo CallerArgumentExpressionAttribute no tendrÃ¡ efecto: lo reemplaza el atributo CallerFilePathAttributetEl CallerMemberNameAttribute aplicado al parÃ¡metro '{0}' no tendrÃ¡ efecto. Lo invalida el CallerFilePathAttribute.iEl atributo CallerMemberNameAttribute no tendrÃ¡ efecto: lo reemplaza el atributo CallerFilePathAttribute§El CallerLineNumberAttribute aplicado al parÃ¡metro '{0}' no tendrÃ¡ efecto porque se aplica a un miembro que se usa en contextos que no permiten argumentos opcionales—El atributo CallerLineNumberAttribute no tendrÃ¡ efecto porque se aplica a un miembro que se utiliza en contextos que no permiten argumentos opcionales~El CallerArgumentExpressionAttribute aplicado al parÃ¡metro "{0}" no tendrÃ¡ efecto. Lo invalida el CallerLineNumberAttribute.sEl atributo CallerArgumentExpressionAttribute no tendrÃ¡ efecto: lo reemplaza el atributo CallerLineNumberAttributetEl CallerFilePathAttribute aplicado al parÃ¡metro '{0}' no tendrÃ¡ efecto. Lo invalida el CallerLineNumberAttribute.iEl atributo CallerFilePathAttribute no tendrÃ¡ efecto: lo reemplaza el atributo CallerLineNumberAttributevEl CallerMemberNameAttribute aplicado al parÃ¡metro '{0}' no tendrÃ¡ efecto. Lo invalida el CallerLineNumberAttribute.kEl atributo CallerMemberNameAttribute no tendrÃ¡ efecto: lo reemplaza el atributo CallerLineNumberAttribute§El CallerMemberNameAttribute aplicado al parÃ¡metro '{0}' no tendrÃ¡ efecto porque se aplica a un miembro que se usa en contextos que no permiten argumentos opcionales—El atributo CallerMemberNameAttribute no tendrÃ¡ efecto porque se aplica a un miembro que se utiliza en contextos que no permiten argumentos opcionales‡El atributo CallerArgumentExpressionAttribute aplicado al parÃ¡metro "{0}" no tendrÃ¡ efecto. Lo invalida el CallerMemberNameAttribute.sEl atributo CallerArgumentExpressionAttribute no tendrÃ¡ efecto: lo reemplaza el atributo CallerMemberNameAttributeNSe omitirÃ¡ /win32manifest para el mÃ³dulo porque solo se aplica a ensambladosNSe omitirÃ¡ /win32manifest para el mÃ³dulo porque solo se aplica a ensamblados©El nombre "_" hace referencia a la constante, no al patrÃ³n de descarte. Use "var _" para descartar el valor o "@_" para hacer referencia a una constante con ese nombre.&No use "_" para una constante de caso.qLa opciÃ³n '{0}' invalida el atributo '{1}' especificado en un archivo de cÃ³digo fuente o en un mÃ³dulo agregadoĞEsta advertencia se emite cuando los atributos AssemblyKeyFileAttribute o AssemblyKeyNameAttribute del ensamblador encontrados en el origen entran en conflicto con las opciones de lÃ­nea de comando /keyfile o /keycontainer o con el nombre del archivo de clave o con el contenedor de claves especificados en las propiedades del proyecto._La opciÃ³n reemplaza el atributo proporcionado en el archivo de origen o en el mÃ³dulo aÃ±adido=La comparaciÃ³n con NULL de tipo '{0}' siempre genera 'false'@Comparar con tipos de estructura o nulos siempre produce 'false'['La interfaz '{0}' marcada con 'CoClassAttribute' no estÃ¡ marcada con 'ComImportAttribute'lLa interfaz marcada con el atributo 'CoClassAttribute' no estÃ¡ marcada con el atributo 'ComImportAttribute'TLa comparaciÃ³n se ha hecho con la misma variable. Â¿QuerÃ­a comparar otro elemento?&ComparaciÃ³n hecha a la misma variablejLa operaciÃ³n puede desbordar '{0}' en tiempo de ejecuciÃ³n (use la sintaxis "sin activar" para invalidar)iLa operaciÃ³n puede desbordarse en tiempo de ejecuciÃ³n (use la sintaxis "sin activar" para invalidarla).JSe han proporcionado distintos valores de suma de comprobaciÃ³n para '{0}'KSe han proporcionado diferentes valores de suma de comprobaciÃ³n de #pragmaXEl ensamblado '{0}' al que se hace referencia estÃ¡ destinado a un procesador diferente.NEl ensamblador al que se hace referencia tiene como objetivo a otro procesadortEl valor constante "{0}" puede desbordar "{1}" en tiempo de ejecuciÃ³n (use la sintaxis "unchecked" para invalidar).iEl valor constante puede desbordarse en tiempo de ejecuciÃ³n (use la sintaxis "unchecked" para invalidar)_Se va a convertir un literal nulo o un posible valor nulo en un tipo que no acepta valores NULL_Se va a convertir un literal nulo o un posible valor nulo en un tipo que no acepta valores NULLtEl nombre completo de '{0}' es demasiado largo para la informaciÃ³n de depuraciÃ³n. Compile sin la opciÃ³n '/debug'.IEl nombre completo es demasiado largo para la informaciÃ³n de depuraciÃ³n«El valor predeterminado especificado para el parÃ¡metro '{0}' no tendrÃ¡ efecto porque se aplica a un miembro que se usa en contextos que no permiten argumentos opcionales“El valor por defecto especificado no tendrÃ¡ efecto porque se aplica a un miembro que se utiliza en contextos que no permiten argumentos opcionales\Nombre no vÃ¡lido para un sÃ­mbolo de preprocesamiento; "{0}" no es un identificador vÃ¡lidoVNombre no vÃ¡lido para un sÃ­mbolo de preprocesamiento; no es un identificador vÃ¡lidolSe especificÃ³ un retraso en la firma y esto requiere una clave pÃºblica, pero no se ha especificado ningunalSe especificÃ³ un retraso en la firma y esto requiere una clave pÃºblica, pero no se ha especificado ningunagEl mejor mÃ©todo Add sobrecargado '{0}' para el elemento inicializador de la colecciÃ³n estÃ¡ obsoleto.kEl mejor mÃ©todo Add sobrecargado '{0}' para el elemento inicializador de la colecciÃ³n estÃ¡ obsoleto. {1}`El mejor mÃ©todo Add sobrecargado para el elemento inicializador de la colecciÃ³n estÃ¡ obsoleto`El mejor mÃ©todo Add sobrecargado para el elemento inicializador de la colecciÃ³n estÃ¡ obsoleto'{0}' estÃ¡ obsoleto'{0}' estÃ¡ obsoleto: '{1}'%El tipo o el miembro estÃ¡n obsoletos%El tipo o el miembro estÃ¡n obsoletosZNo se puede usar un posible valor null para un tipo marcado con [NotNull] o [DisallowNull]ZNo se puede usar un posible valor null para un tipo marcado con [NotNull] o [DisallowNull]”La comparaciÃ³n de los punteros de funciÃ³n puede proporcionar resultados inesperados, ya que los punteros a la misma funciÃ³n pueden ser distintos.3No comparar los valores de los punteros de funciÃ³nrEl mÃ©todo "{0}" carece de una anotaciÃ³n "[DoesNotReturn]" que coincida con un miembro implementado o invalidado.lEl mÃ©todo carece de una anotaciÃ³n "[DoesNotReturn]" que coincida con un miembro implementado o invalidado.nLa expresiÃ³n siempre producirÃ¡ System.NullReferenceException porque el valor predeterminado de '{0}' es NULLoLa expresiÃ³n siempre causarÃ¡ una excepciÃ³n System.NullReferenceException porque el valor por defecto es nullq"{0}" ya estÃ¡ en la lista de interfaces del tipo "{1}" con una nulabilidad diferente de los tipos de referencia.hLa interfaz ya estÃ¡ en la lista de interfaces con una nulabilidad diferente de los tipos de referencia.?El comentario XML tiene una etiqueta param duplicada para '{0}'<El comentario XML tiene una etiqueta de parÃ¡metro duplicadaCEl comentario XML tiene una etiqueta typeparam duplicada para '{0}'8El comentario XML tiene una etiqueta typeparam duplicadaLLa directiva using para '{0}' aparece previamente en este espacio de nombresDLa directiva using apareciÃ³ anteriormente en este espacio de nombre¥La llamada al mÃ©todo '{0}' enviada de forma dinÃ¡mica puede dar error en tiempo de ejecuciÃ³n porque una o varias sobrecargas aplicables son mÃ©todos condicionales.‘La llamada distribuida dinÃ¡micamente puede fallar en el tiempo de ejecuciÃ³n porque una o mÃ¡s sobrecargas aplicables son mÃ©todos condicionalesBloque switch vacÃ­oBloque switch vacÃ­o:Se esperaba un comentario de una lÃ­nea o un fin de lÃ­nea[Se esperaba un comentario de una lÃ­nea o un fin de lÃ­nea despuÃ©s de la directiva #pragmaU'{0}' define el operador == o el operador != pero no invalida Object.Equals(object o)_El tipo define operator == or operator !=, pero no reemplaza a override Object.Equals(object o)R'{0}' define el operador == o el operador != pero no invalida Object.GetHashCode()SEl tipo define operator == or operator !=, pero no reemplaza a Object.GetHashCode()L'{0}' invalida Object.Equals(object o) pero no invalida Object.GetHashCode()UEl tipo reemplaza a Object.Equals(object o), pero no reemplaza a Object.GetHashCode()!{0}. Vea tambiÃ©n el error CS{1}.§El compilador emite esta advertencia cuando reemplaza un error con una advertencia. Para obtener informaciÃ³n sobre el problema, busque el cÃ³digo de error mencionado.+La advertencia estÃ¡ remplazando a un errors"{0}" se incluye con fines de evaluaciÃ³n y estÃ¡ sujeto a cambios o a que se elimine en prÃ³ximas actualizaciones.|Este tipo se incluye solo con fines de evaluaciÃ³n y estÃ¡ sujeto a cambios o a que se elimine en prÃ³ximas actualizaciones.ØLa implementaciÃ³n de interfaz explÃ­cita '{0}' coincide con mÃ¡s de un miembro de interfaz. El miembro de interfaz que se elige depende de la implementaciÃ³n. Si quiere, puede usar una implementaciÃ³n no explÃ­cita.[La implementaciÃ³n de la interfaz explÃ­cita coincide con mÃ¡s de un miembro de la interfaz/El constructor '{0}' estÃ¡ marcado como externo)El constructor estÃ¡ marcado como externo³El mÃ©todo, operador o descriptor de acceso '{0}' estÃ¡ marcado como externo y no tiene atributos. Puede agregar un atributo DllImport para especificar la implementaciÃ³n externa.eEl mÃ©todo, el operador o el descriptor de acceso estÃ¡n marcados como externos y no tienen atributosLNo se puede incluir el fragmento de cÃ³digo XML '{1}' del archivo '{0}': {2}$No se puede incluir el fragmento XML>El archivo de cÃ³digo fuente '{0}' se especificÃ³ varias veces0Se especificÃ³ el archivo de origen varias veces~Nombre de archivo no vÃ¡lido especificado para la directiva del preprocesador. Nombre de archivo demasiado largo o no vÃ¡lido.USe ha especificado un nombre de archivo no vÃ¡lido para la directiva de preprocesadorULa expresiÃ³n de filtro es una constante "false", considere quitar la clÃ¡usula catchWLa expresiÃ³n de filtro es una constante "false", considere quitar el bloqueo try-catch2La expresiÃ³n de filtro es una constante "false". 0La expresiÃ³n de filtro es una constante "false"GLa expresiÃ³n de filtro es una constante "true", puede quitar el filtro/La expresiÃ³n de filtro es una constante "true"zLa introducciÃ³n de un mÃ©todo 'Finalize' puede afectar a la invocaciÃ³n del destructor. Â¿QuerÃ­a declarar un destructor?˜Esta advertencia se produce cuando crea una clase con un mÃ©todo cuya firma es public virtual void Finalize.
+
+Si se utiliza una clase de este tipo como clase base y si la clase derivada define un destructor, este reemplazarÃ¡ al mÃ©todo Finalize de la clase base, no a Finalize.HIntroducir un mÃ©todo 'Finalize' afectar a la invocaciÃ³n del destructorÆError del generador "{0}" al crear cÃ³digo fuente. No contribuirÃ¡ a la salida y pueden producirse errores de compilaciÃ³n como resultado. Se produjo la excepciÃ³n de tipo "{1}" con el mensaje "{2}"5El generador produjo la excepciÃ³n siguiente:
+"{0}".,Error del generador al crear cÃ³digo fuente.ÁError de inicializaciÃ³n del generador "{0}". No contribuirÃ¡ a la salida y pueden producirse errores de compilaciÃ³n como resultado. Se produjo la excepciÃ³n de tipo "{1}" con el mensaje "{2}"5El generador produjo la excepciÃ³n siguiente:
+"{0}".'Error de inicializaciÃ³n del generador.CLa expresiÃ³n dada coincide siempre con la constante proporcionada.CLa expresiÃ³n dada coincide siempre con la constante proporcionada.ALa expresiÃ³n dada coincide siempre con el patrÃ³n proporcionado.ALa expresiÃ³n dada coincide siempre con el patrÃ³n proporcionado.BLa expresiÃ³n dada no coincide nunca con el patrÃ³n proporcionado.BLa expresiÃ³n dada no coincide nunca con el patrÃ³n proporcionado.’No es aconsejable definir ningÃºn alias denominado 'global' porque 'global::' siempre hace referencia al espacio de nombres global y no a un alias8No se recomienda definir un alias con el nombre 'global'KEl valor 'goto case' no se puede convertir implÃ­citamente en el tipo '{0}'EEl valor "goto case" no es implÃ­citamente convertible al tipo switch4Se esperaba un identificador o un literal numÃ©rico.*Identificador o literal numÃ©rico esperado‰Sintaxis de #pragma checksum no vÃ¡lida; debe ser #pragma checksum "nombre de archivo" "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" "XXXX..."7Sintaxis de suma de comprobaciÃ³n de #pragma no vÃ¡lida!Se esperaba "disable" o "restore"GSe esperaba "disable" o "restore" despuÃ©s de la advertencia de #pragmaDirectiva #pragma no reconocidaDirectiva #pragma no reconocida„La llamada a un miembro "{0}" que no es de solo lectura desde un miembro "readonly" da como resultado una copia implÃ­cita de "{1}".uLa llamada a un miembro que no es de solo lectura desde un miembro "readonly" da como resultado una copia implÃ­cita.gLa asignaciÃ³n en la expresiÃ³n condicional siempre es constante; Â¿querÃ­a utilizar == en lugar de = ?ALa asignaciÃ³n en una expresiÃ³n condicional siempre es constante’El argumento InterpolatedStringHandlerArgument no tiene ningÃºn efecto cuando se aplica a parÃ¡metros lambda y se omitirÃ¡ en el sitio de llamada.’El argumento InterpolatedStringHandlerArgument no tiene ningÃºn efecto cuando se aplica a parÃ¡metros lambda y se omitirÃ¡ en el sitio de llamada.FLa referencia de ensamblado '{0}' no es vÃ¡lida y no se puede resolverkEsta advertencia indica que un atributo, como InternalsVisibleToAttribute, no se especificÃ³ correctamente.@La referencia de ensamblado no es vÃ¡lida y no se puede resolver¡'{0}' no es una ubicaciÃ³n de atributo reconocida. Las ubicaciones de atributo para esta declaraciÃ³n son '{1}'. Todos los atributos de este bloque se omitirÃ¡n.+No es una ubicaciÃ³n de atributo reconocida*Elemento de inclusiÃ³n XML no vÃ¡lido: {0}%Elemento de inclusiÃ³n XML no vÃ¡lido='{0}' tiene una firma incorrecta para ser un punto de entradaAEl mÃ©todo tiene la firma incorrecta para ser un punto de entradaNÃºmero no vÃ¡lidoNÃºmero no vÃ¡lidoSSe ha especificado una ruta de acceso de bÃºsqueda '{0}' no vÃ¡lida en '{1}': '{2}')Ruta de bÃºsqueda especificada no vÃ¡lidasLa cadena de versiÃ³n especificada no se ajusta al formato recomendado: principal,secundaria,compilaciÃ³n,revisiÃ³nsLa cadena de versiÃ³n especificada no se ajusta al formato recomendado: principal,secundaria,compilaciÃ³n,revisiÃ³n:La expresiÃ³n dada nunca es del tipo proporcionado ('{0}')F'La expresiÃ³n dada de la expresiÃ³n "is" nunca tiene el tipo provisto<La expresiÃ³n dada siempre es del tipo proporcionado ('{0}')H'La expresiÃ³n dada de la expresiÃ³n "is" siempre tiene el tipo provisto¯Usar '{0}' para probar la compatibilidad con '{1}' es, bÃ¡sicamente, lo mismo que probar la compatibilidad con '{2}' y surtirÃ¡ efecto para todos los valores distintos de NULLpUsar "is" para comprobar la compatibilidad con "dynamic" es idÃ©ntico a comprobar la compatibilidad con "Object"KUna expresiÃ³n de tipo "{0}" siempre coincide con el patrÃ³n proporcionado.9La entrada coincide siempre con el patrÃ³n proporcionado.yEl nombre "_" hace referencia al tipo "{0}", no al patrÃ³n de descarte. Use "@_" para el tipo o "var _" para el descarte.CNo use "_" para hacer referencia al tipo en una expresiÃ³n is-type.}El nombre de tipo '{0}' solo contiene caracteres ASCII en minÃºsculas. Estos nombres pueden quedar reservados para el idioma.pEl nombre de tipo solo contiene caracteres ASCII en minÃºsculas. Estos nombres pueden reservarse para el idioma.YEl sufijo 'l' se confunde fÃ¡cilmente con el dÃ­gito '1': utilice 'L' para mayor claridad8El sufijo "l" se confunde fÃ¡cilmente con el nÃºmero "1"O'{0}': un punto de entrada no puede ser genÃ©rico ni estar en un tipo genÃ©ricoHUn punto de entrada no puede ser genÃ©rico ni estar en un tipo genÃ©ricoXEl punto de entrada del programa es cÃ³digo global: se ignora el punto de entrada "{0}".REl punto de entrada del programa es cÃ³digo global; se ignora el punto de entrada.>El miembro "{0}" debe tener un valor que no sea nulo al salir.3No se puede usar el miembro "{0}" en este atributo.-No se puede usar el miembro en este atributo.HEl miembro "{0}" debe tener un valor que no sea nulo al salir con "{1}".MEl miembro debe tener un valor que no sea nulo al salir en alguna condiciÃ³n.8El miembro debe tener un valor que no sea nulo al salir.cConvirtiendo el grupo de mÃ©todos '{0}' al tipo no delegado '{1}'. Â¿PretendÃ­a invocar el mÃ©todo?1Convirtiendo grupo de mÃ©todos a tipo no delegadoLa anotaciÃ³n para tipos de referencia que aceptan valores NULL solo debe usarse en el cÃ³digo dentro de un contexto de anotaciones "#nullable".ñLa anotaciÃ³n de tipos de referencia que aceptan valores NULL solo se debe usar en el cÃ³digo en un contexto de anotaciones "#nullable". El cÃ³digo generado automÃ¡ticamente requiere una directiva "#nullable" explÃ­cita en el cÃ³digo fuente.ñLa anotaciÃ³n de tipos de referencia que aceptan valores NULL solo se debe usar en el cÃ³digo en un contexto de anotaciones "#nullable". El cÃ³digo generado automÃ¡ticamente requiere una directiva "#nullable" explÃ­cita en el cÃ³digo fuente.La anotaciÃ³n para tipos de referencia que aceptan valores NULL solo debe usarse en el cÃ³digo dentro de un contexto de anotaciones "#nullable".{El parÃ¡metro '{0}' no tiene la etiqueta param correspondiente en el comentario XML para '{1}' (pero otros parÃ¡metros sÃ­)gEl parÃ¡metro no tiene una etiqueta param coincidente en el comentario XML (pero otros parÃ¡metros sÃ­)’El parÃ¡metro de tipo '{0}' no tiene ninguna etiqueta typeparam correspondiente en el comentario XML en '{1}' (pero otros parÃ¡metros de tipo sÃ­){El parÃ¡metro de tipo no tiene una etiqueta typeparam coincidente en el comentario XML (pero otros parÃ¡metros de tipo sÃ­)NFalta el comentario XML para el tipo o miembro visible de forma pÃºblica '{0}'eSe especificÃ³ la opciÃ³n del compilador /doc, pero una o mÃ¡s construcciones no tenÃ­an comentarios.DFalta el comentario XML para el tipo o miembro visible pÃºblicamenteoEl tipo predefinido '{0}' estÃ¡ definido en varios ensamblados del alias global; se usa la definiciÃ³n de '{1}'§Este error se produce cuando un tipo de sistema predefinido como System.Int32 se encuentra en dos ensamblajes. Una forma de que esto suceda es si hace referencia a mscorlib o System.Runtime.dll desde dos lugares diferentes, como si intentase ejecutar dos versiones de .NET Framework en paralelo.KEl tipo predefinido estÃ¡ definido en varios ensamblajes en el alias globalÒEl miembro '{0}' implementa el miembro de interfaz '{1}' en el tipo '{2}'. Hay varias coincidencias para el miembro de interfaz en tiempo de ejecuciÃ³n. El mÃ©todo que se llamarÃ¡ depende de la implementaciÃ³n.ÎEsta advertencia puede producirse cuando dos mÃ©todos de interfaz solo se diferencian por la marca de un parÃ¡metro particular con ref o out. Es mejor cambiar su cÃ³digo para evitar esta advertencia porque no es obvio ni se garantiza quÃ© mÃ©todo se llamarÃ¡ en el tiempo de ejecuciÃ³n.
+
+A pesar de que C# distingue entre out y ref, el CLR los ve como iguales. Cuando decida quÃ© mÃ©todo implementa la interfaz, el CLR escoge uno.
+
+Indique al compilador alguna forma de diferenciar los mÃ©todos. Por ejemplo, puede darles nombres diferentes o dar un parÃ¡metro adicional a uno de ellos.cEl miembro implementa el miembro de la interfaz con varias coincidencias en el tiempo de ejecuciÃ³nÅEl miembro "{1}" invalida "{0}". Hay varios candidatos de invalidaciÃ³n en tiempo de ejecuciÃ³n. El mÃ©todo que se llamarÃ¡ depende de la implementaciÃ³n. Use un tiempo de ejecuciÃ³n mÃ¡s reciente.gEl miembro invalida los miembros base con varios candidatos de invalidaciÃ³n en el tiempo de ejecuciÃ³n`Indizando una matriz con un Ã­ndice negativo (los Ã­ndices de matriz siempre comienzan por cero),Indexando una matriz con un Ã­ndice negativoVEl miembro '{0}' no oculta un miembro accesible. La palabra clave new no es necesaria.PEl miembro no oculta un miembro heredado. No se necesita una nueva palabra clave®'{0}' oculta el miembro heredado '{1}'. Para hacer que el miembro actual invalide esa implementaciÃ³n, agregue la palabra clave override. Si no, agregue la palabra clave new.MEl miembro oculta el miembro heredado. Falta una contraseÃ±a de invalidaciÃ³n`'{0}' oculta el miembro heredado '{1}'. Use la palabra clave new si su intenciÃ³n era ocultarlo.ûSe declarÃ³ una variable con el mismo nombre que una variable de un tipo base. Sin embargo, no se usÃ³ la palabra clave new. Esta advertencia le informa de que deberÃ­a usar new. La variable se declarÃ³ como si new se hubiera usado en la declaraciÃ³n.BEl miembro oculta el miembro heredado. Falta una contraseÃ±a nueva1El ensamblado {0} no contiene ningÃºn analizador.,El ensamblado no contiene ningÃºn analizadorOOmitiendo la opciÃ³n /noconfig porque se especificÃ³ en un archivo de respuestaOOmitiendo la opciÃ³n /noconfig porque se especificÃ³ en un archivo de respuestaÑNo se encontrÃ³ ningÃºn valor para RuntimeMetadataVersion. No se encontrÃ³ ningÃºn ensamblado que contuviese System.Object ni se especificÃ³ ningÃºn valor para RuntimeMetadataVersion a travÃ©s de las opciones.9No se encontrÃ³ ningÃºn valor para RuntimeMetadataVersion/No se especificaron archivos de cÃ³digo fuente.&No se especificaron archivos de origen…La funcionalidad '{0}' no forma parte de la especificaciÃ³n de idioma C# ISO normalizado y puede que otros compiladores no la admitan‡La funcionalidad no es parte de la especificaciÃ³n de lenguaje C# estandarizada por ISO y puede no estar aceptada en otros compiladoresZEl miembro '{0}' invalida el miembro obsoleto '{1}'. Agregue el atributo Obsolete a '{0}'.*El miembro invalida los miembros obsoletossEl resultado de la expresiÃ³n siempre es '{0}' porque un valor del tipo '{1}' nunca es igual a 'NULL' de tipo '{2}'sEl resultado de la expresiÃ³n siempre es '{0}' porque un valor del tipo '{1}' nunca es igual a 'NULL' de tipo '{2}'hEl resultado de la expresiÃ³n siempre es el mismo ya que un valor de este tipo siempre es igual a "null"hEl resultado de la expresiÃ³n siempre es el mismo ya que un valor de este tipo siempre es igual a "null"ZNo se puede convertir un literal NULL en un tipo de referencia que no acepta valores NULL.ZNo se puede convertir un literal NULL en un tipo de referencia que no acepta valores NULL.REl parÃ¡metro '{0}' estÃ¡ marcado como null, pero es NULL de forma predeterminada.VEl parÃ¡metro estÃ¡ comprobado con valores NULL, pero es NULL de forma predeterminada.YEl tipo que acepta valores NULL '{0}' estÃ¡ activado como NULL y se iniciarÃ¡ si es NULL.XEl tipo que acepta valores NULL estÃ¡ activado con valor NULL y se iniciarÃ¡ si es null.GPosible argumento de referencia nulo para el parÃ¡metro "{0}" en "{1}".$Posible argumento de referencia nulo'Posible asignaciÃ³n de referencia nula.&Posible asignaciÃ³n de referencia nulamEl inicializador de objeto o colecciÃ³n desreferencia el miembro "{0}" posiblemente NULL de forma implÃ­cita.gEl inicializador de objeto o colecciÃ³n desreferencia el miembro posiblemente NULL de forma implÃ­cita.2Desreferencia de una referencia posiblemente NULL.2Desreferencia de una referencia posiblemente NULL.2Posible tipo de valor devuelto de referencia nulo.1Posible tipo de valor devuelto de referencia nulo¢El argumento de tipo "{0}" no se puede usar para el parÃ¡metro "{2}" de tipo "{1}" en "{3}" debido a las diferencias en la nulabilidad de los tipos de referencia.®El argumento de tipo "{0}" no se puede usar como salida de tipo "{1}" para el parÃ¡metro "{2}" en "{3}" debido a las diferencias en la nulabilidad de los tipos de referencia.ƒEl argumento no se puede usar como salida para el parÃ¡metro debido a las diferencias en la nulabilidad de los tipos de referencia.wEl argumento no se puede usar para el parÃ¡metro debido a las diferencias en la nulabilidad de los tipos de referencia.mLa nulabilidad de los tipos de referencia en el valor de tipo "{0}" no coincide con el tipo de destino "{1}".VLa nulabilidad de los tipos de referencia del valor no coincide con el tipo de destino÷La nulabilidad de las restricciones del parÃ¡metro de tipo "{0}" del mÃ©todo "{1}" no coincide con las restricciones del parÃ¡metro de tipo "{2}" del mÃ©todo de interfaz "{3}". Considere usar una implementaciÃ³n de interfaz explÃ­cita en su lugar.¬La nulabilidad de las restricciones del parÃ¡metro de tipo no coincide con las restricciones del parÃ¡metro de tipo del mÃ©todo de interfaz implementado de forma implÃ­cita‰Las declaraciones de mÃ©todos parciales de "{0}" tienen una nulabilidad incoherente de las restricciones para el parÃ¡metro de tipo "{1}"zLas declaraciones de mÃ©todos parciales tienen una nulabilidad incoherente de las restricciones para el parÃ¡metro de tipo†La nulabilidad de los tipos de referencia del especificador de interfaz explÃ­cito no coincide con la interfaz que el tipo implementa.†La nulabilidad de los tipos de referencia del especificador de interfaz explÃ­cito no coincide con la interfaz que el tipo implementa.“"{0}" no implementa el miembro de interfaz "{1}". La nulabilidad de los tipos de referencia de la interfaz que implementa el tipo base no coincide.El tipo no implementa un miembro de interfaz. La nulabilidad de los tipos de referencia de la interfaz que implementa el tipo base no coincide.±La nulabilidad de los tipos de referencia del tipo de parÃ¡metro"{0}" de "{1}" no coincide con el delegado de destino "{2}" (posiblemente debido a los atributos de nulabilidad).La nulabilidad de los tipos de referencia del tipo de parÃ¡metro no coincide con el delegado de destino (posiblemente debido a los atributos de nulabilidad).uLa nulabilidad de los tipos de referencia del tipo de parÃ¡metro "{0}" no coincide con el miembro implementado "{1}".hLa nulabilidad de los tipos de referencia del tipo de parÃ¡metro no coincide con el miembro implementado‘La nulabilidad de los tipos de referencia del tipo de parÃ¡metro"{0}" de "{1}" no coincide con el miembro "{2}" implementado de forma implÃ­cita.|La nulabilidad de los tipos de referencia del tipo de parÃ¡metro no coincide con el miembro implementado de forma implÃ­citamLa nulabilidad de los tipos de referencia del tipo de parÃ¡metro"{0}" no coincide con el miembro reemplazado.gLa nulabilidad de los tipos de referencia del tipo de parÃ¡metro no coincide con el miembro reemplazadoyLa nulabilidad de los tipos de referencia del tipo de parÃ¡metro"{0}" no coincide con la declaraciÃ³n de mÃ©todo parcial.sLa nulabilidad de los tipos de referencia del tipo de parÃ¡metro no coincide con la declaraciÃ³n de mÃ©todo parcial°La nulabilidad de los tipos de referencia del tipo de valor devuelto de "{0}" no coincide con el delegado de destino "{1}" (posiblemente debido a los atributos de nulabilidad).¡La nulabilidad de los tipos de referencia del tipo de valor devuelto no coincide con el delegado de destino (posiblemente debido a los atributos de nulabilidad).uLa nulabilidad de los tipos de referencia en el tipo de valor devuelto no coincide con el miembro implementado "{0}".nLa nulabilidad de los tipos de referencia en el tipo de valor devuelto no coincide con el miembro implementadoLa nulabilidad de los tipos de referencia del tipo de valor devuelto de "{0}" no coincide con el miembro "{1}" implementado de forma implÃ­cita.‚La nulabilidad de los tipos de referencia en el tipo de valor devuelto no coincide con el miembro implementado de forma implÃ­citanLa nulabilidad de los tipos de referencia en el tipo de valor devuelto no coincide con el miembro reemplazado.mLa nulabilidad de los tipos de referencia en el tipo de valor devuelto no coincide con el miembro reemplazadooLa nulabilidad de los tipos de referencia del tipo devuelto no coincide con la declaraciÃ³n de mÃ©todo parcial.oLa nulabilidad de los tipos de referencia del tipo devuelto no coincide con la declaraciÃ³n de mÃ©todo parcial.aLa nulabilidad de los tipos de referencia del tipo no coincide con el miembro implementado "{0}".ZLa nulabilidad de los tipos de referencia del tipo no coincide con el miembro implementado~La nulabilidad de los tipos de referencia del tipo de "{0}" no coincide con el miembro "{1}" implementado de forma implÃ­cita.nLa nulabilidad de los tipos de referencia del tipo no coincide con el miembro implementado de forma implÃ­citaZLa nulabilidad de los tipos de referencia del tipo no coincide con el miembro reemplazado.YLa nulabilidad de los tipos de referencia del tipo no coincide con el miembro reemplazado¼El tipo "{3}" no se puede usar como parÃ¡metro de tipo "{2}" en el tipo o mÃ©todo genÃ©rico "{0}". La nulabilidad del argumento de tipo "{3}" no coincide con el tipo de restricciÃ³n "{1}".El tipo no se puede usar como parÃ¡metro de tipo en el tipo o mÃ©todo genÃ©rico. La nulabilidad del argumento de tipo no coincide con el tipo de restricciÃ³n¸El tipo "{2}" no se puede usar como parÃ¡metro de tipo "{1}" en el mÃ©todo o tipo genÃ©rico "{0}". La nulabilidad del argumento de tipo "{2}" no coincide con la restricciÃ³n "notnull".ŸEl tipo no se puede usar como parÃ¡metro de tipo en el mÃ©todo o tipo genÃ©rico. La nulabilidad del argumento de tipo no coincide con la restricciÃ³n "notnull"¶El tipo "{2}" no se puede usar como parÃ¡metro de tipo "{1}" en el tipo o mÃ©todo genÃ©rico "{0}". La nulabilidad del argumento de tipo "{2}" no coincide con la restricciÃ³n "class".El tipo no se puede usar como parÃ¡metro de tipo en el tipo o mÃ©todo genÃ©rico. La nulabilidad del argumento de tipo no coincide con la restricciÃ³n "class"/Un tipo que acepta valores NULL puede ser nulo./Un tipo que acepta valores NULL puede ser nulo.?El miembro obsoleto '{0}' invalida el miembro no obsoleto '{1}'3El miembro obsoleto invalida un miembro no obsoleto_Es necesario asignar el parÃ¡metro '{0}' out antes de que el control abandone el mÃ©todo actualLDebe asignarse un parÃ¡metro out antes de que el control abandone el mÃ©todoKEl parÃ¡metro "{0}" debe tener un valor que no sea nulo al salir con "{1}".PEl parÃ¡metro debe tener un valor que no sea nulo al salir en alguna condiciÃ³n.AEl parÃ¡metro "{0}" debe tener un valor que no sea nulo al salir.;El parÃ¡metro debe tener un valor que no sea nulo al salir.>'{0}': los tipos estÃ¡ticos no se pueden usar como parÃ¡metros7Los tipos estÃ¡ticos no se pueden usar como parÃ¡metrosgEl parÃ¡metro "{0}" debe tener un valor que no sea NULL al salir porque el parÃ¡metro "{1}" no es NULL.ƒEl parÃ¡metro debe tener un valor que no sea NULL al salir porque el parÃ¡metro al que NotNullIfNotNull hace referencia no es NULL.–El parÃ¡metro "{0}" se produce despuÃ©s de "{1}" en la lista de parÃ¡metros, pero se usa como argumento para conversiones de controlador de cadena interpolada. Esto requerirÃ¡ que el autor de llamada reordene los parÃ¡metros con argumentos con nombre en el sitio de llamada. Considere la posibilidad de colocar el parÃ¡metro de controlador de cadena interpolada despuÃ©s de todos los argumentos implicados.tLa conversiÃ³n del parÃ¡metro al controlador de cadena interpolada se produce despuÃ©s del parÃ¡metro de controladorSLas declaraciones de mÃ©todo parcial "{0}" y "{1}" tienen diferencias de signatura.ELas declaraciones de mÃ©todo parcial tienen diferencias de signatura.G'{0}' no implementa el patrÃ³n '{1}'. '{2}' tiene una firma incorrecta.REl tipo no implementa la trama de colecciÃ³n. El miembro tiene la firma incorrectaA'{0}' no implementa el patrÃ³n '{1}'. '{2}' es ambiguo con '{3}'.GEl tipo no implementa la trama de colecciÃ³n. Los miembros son ambiguos`"{0}" no implementa el patrÃ³n "{1}". "{2}" no es un mÃ©todo de extensiÃ³n o instancia pÃºblica.oEl tipo no implementa el patrÃ³n de colecciÃ³n; el miembro no es un mÃ©todo de extensiÃ³n o instancia pÃºblica.WEl nombre local '{0}' es demasiado largo para PDB. Puede acortar o compilar sin /debug.+El nombre local es demasiado largo para PDB$Posible instrucciÃ³n vacÃ­a errÃ³nea$Posible instrucciÃ³n vacÃ­a errÃ³neamNo se puede usar el operador "{0}" aquÃ­ debido a la prioridad. Use parÃ©ntesis para eliminar la ambigÃ¼edad.9No se puede usar el operador aquÃ­ debido a la prioridad.;"{0}": nuevo miembro protegido declarado en el tipo sellado4Nuevo miembro protegido declarado en el tipo sellado+"{0}" define "Equals" pero no "GetHashCode"3El registro define "Equals", pero no "GetHashCode".4Los tipos y los alias no deben denominarse "record".4Los tipos y los alias no deben denominarse "record".pEl ensamblado '{0}' al que se hace referencia tiene una configuraciÃ³n de referencia cultural distinta de '{1}'.HEl ensamblaje referenciado tiene una configuraciÃ³n de cultura diferenteHEl ensamblado '{0}' al que se hace referencia no tiene un nombre seguro.AEl ensamblado al que se hace referencia no tiene un nombre seguro‚Se creÃ³ una referencia al ensamblado de interoperabilidad '{0}' incrustado debido a una referencia indirecta a ese ensamblado creado por el ensamblado '{1}'. Puede cambiar la propiedad 'Incrustar tipos de interoperabilidad' en cualquiera de los ensamblados.›Ha aÃ±adido una referencia a un ensamblado con /link (con la propiedad Embed Interop Types establecida como verdadera). Esto instruye al compilador para que inserte informaciÃ³n del tipo de interoperabilidad desde ese ensamblado. Sin embargo, el compilador no puede insertar informaciÃ³n del tipo de interoperabilidad desde ese ensamblado porque hay otro ensamblado que ha referenciado que hace referencia a ese ensamblado con /reference (con la propiedad Embed Interop Types establecida como falsa).
+
+Para insertar informaciÃ³n del tipo de interoperabilidad en ambos ensamblados, use /link para las referencias de ambos ensamblados (establezca la propiedad Embed Interop Types como verdadera).
+
+Para eliminar la advertencia puede usar /reference (establezca la propiedad Embed Interop Types como falsa). En este caso, un ensamblado de interoperabilidad primario (PIA) provee informaciÃ³n del tipo de interoperabilidad.zSe creÃ³ una referencia para el ensamblaje de interoperabilidad incrustado debido a una referencia al ensamblaje indirectaREl valor devuelto debe ser distinto de NULL porque el parÃ¡metro "{0}" no es NULL.CEl valor devuelto no debe ser NULL porque el parÃ¡metro no es NULL.M'{0}': los tipos estÃ¡ticos no se pueden usar como tipos de valores devueltosCLos tipos estÃ¡ticos no se pueden usar como tipos de valor devueltotEl tipo '{1}' de '{0}' estÃ¡ en conflicto con el tipo importado '{3}' de '{2}'. Se usarÃ¡ el tipo definido en '{0}'.0El tipo entra en conflicto con un tipo importado‚El tipo '{1}' de '{0}' estÃ¡ en conflicto con el espacio de nombres importado '{3}' de '{2}'. Se usarÃ¡ el tipo definido en '{0}'.>El tipo entra en conflicto con un espacio de nombres importadoEl espacio de nombres '{1}' de '{0}' estÃ¡ en conflicto con el tipo importado '{3}' de '{2}'. Se usarÃ¡ el espacio de nombres definido en '{0}'.>El espacio de nombres entra en conflicto con un tipo importado¾No hay ningÃºn orden definido entre campos en varias declaraciones de estructura parcial '{0}'. Para especificar un orden, todos los campos de instancia deben estar en la misma declaraciÃ³n.aNo hay un orden especÃ­fico entre los campos en declaraciones mÃºltiples de la estructura parcial>Un mÃ©todo marcado como [DoesNotReturn] no debe devolver nada.>Un mÃ©todo marcado como [DoesNotReturn] no debe devolver nada.SEl segundo operando de un operador 'is' o 'as' no puede ser el tipo estÃ¡tico '{0}'MEl segundo operando de un operador "is" o "as" no puede ser un tipo estÃ¡tico–La expresiÃ³n switch no controla todos los valores posibles de su tipo de entrada (no es exhaustivo). Por ejemplo, el patrÃ³n "{0}" no estÃ¡ incluido.{La expresiÃ³n switch no controla algunas entradas null (no es exhaustiva). Por ejemplo, el patrÃ³n "{0}" no estÃ¡ incluido.ÔLa expresiÃ³n switch no controla algunas entradas NULL (no es exhaustiva). Por ejemplo, no se cubre el patrÃ³n "{0}". Sin embargo, un patrÃ³n con una clÃ¡usula "when" puede coincidir correctamente con este valor.?La expresiÃ³n switch no controla algunas entradas de tipo NULL.?La expresiÃ³n switch no controla algunas entradas de tipo NULL.½La expresiÃ³n switch no controla algunos valores de su tipo de entrada (no es exhaustiva) que requieran un valor de enumeraciÃ³n sin nombre. Por ejemplo, el patrÃ³n "{0}" no estÃ¡ incluido.ŒLa expresiÃ³n switch no controla algunos valores de su tipo de entrada (no es exhaustiva) que requieran un valor de enumeraciÃ³n sin nombre.ïLa expresiÃ³n switch no controla todos los valores posibles de su tipo de entrada (no es exhaustiva). Por ejemplo, no se cubre el patrÃ³n "{0}". Sin embargo, un patrÃ³n con una clÃ¡usula "when" puede coincidir correctamente con este valor.eLa expresiÃ³n switch no controla todos los valores posibles de su tipo de entrada (no es exhaustiva).eLa expresiÃ³n switch no controla todos los valores posibles de su tipo de entrada (no es exhaustiva).nEl mÃ©todo "{0}" no se usarÃ¡ como punto de entrada porque se encontrÃ³ un punto de entrada "{1}" sincrÃ³nico.!El valor generado puede ser NULL.!El valor generado puede ser NULL.•El archivo de cÃ³digo fuente ha superado el lÃ­mite de 16.707.565 lÃ­neas representables en el PDB. La informaciÃ³n de depuraciÃ³n no serÃ¡ correcta.•El archivo de cÃ³digo fuente ha superado el lÃ­mite de 16.707.565 lÃ­neas representables en el PDB. La informaciÃ³n de depuraciÃ³n no serÃ¡ correcta.ªLa nulabilidad de los tipos de referencia del tipo de parÃ¡metro "{0}" no coincide con el miembro implementado "{1}" (posiblemente debido a los atributos de nulabilidad).La nulabilidad de los tipos de referencia del tipo de parÃ¡metro no coincide con el miembro implementado (posiblemente debido a los atributos de nulabilidad).ÆLa nulabilidad de los tipos de referencia del tipo de parÃ¡metro"{0}" de "{1}" no coincide con el miembro "{2}" implementado de forma implÃ­cita (posiblemente debido a los atributos de nulabilidad).²La nulabilidad de los tipos de referencia del tipo de parÃ¡metro no coincide con el miembro implementado de forma implÃ­cita (posiblemente debido a los atributos de nulabilidad).‡La nulabilidad del tipo de parÃ¡metro "{0}" no coincide con el miembro invalidado (posiblemente debido a los atributos de nulabilidad).La nulabilidad del tipo de parÃ¡metro no coincide con el miembro invalidado (posiblemente debido a los atributos de nulabilidad).¨La nulabilidad de los tipos de referencia del tipo de valor devuelto no coincide con el miembro "{0}" implementado (posiblemente debido a los atributos de nulabilidad).¢La nulabilidad de los tipos de referencia del tipo de valor devuelto no coincide con el miembro implementado (posiblemente debido a los atributos de nulabilidad).ÅLa nulabilidad de los tipos de referencia del tipo de valor devuelto de "{0}" no coincide con el miembro "{1}" implementado de forma implÃ­cita (posiblemente debido a los atributos de nulabilidad).¶La nulabilidad de los tipos de referencia del tipo de valor devuelto no coincide con el miembro implementado de forma implÃ­cita (posiblemente debido a los atributos de nulabilidad).…La nulabilidad del tipo de valor devuelto no coincide con el miembro invalidado (posiblemente debido a los atributos de nulabilidad).…La nulabilidad del tipo de valor devuelto no coincide con el miembro invalidado (posiblemente debido a los atributos de nulabilidad).½No se tiene en cuenta el nombre de elemento de tupla "{0}" porque no se ha especificado ningÃºn nombre, o se ha especificado uno diferente, en el otro lado del operador == o != de la tupla.·No se tiene en cuenta el nombre de elemento de tupla porque no se ha especificado ningÃºn nombre, o se ha especificado uno diferente, en el otro lado del operador == o != de la tupla.”No se tiene en cuenta el nombre de elemento de tupla "{0}" porque el tipo de destino "{1}" ha especificado otro nombre o no ha especificado ninguno.’No se tiene en cuenta el nombre de elemento de tupla porque el destino de la asignaciÃ³n ha especificado otro nombre o no ha especificado ninguno.eEl parÃ¡metro de tipo "{0}" tiene el mismo nombre que el parÃ¡metro de tipo del mÃ©todo externo "{1}"XEl parÃ¡metro de tipo tiene el mismo tipo que el parÃ¡metro de tipo del mÃ©todo externo.bEl parÃ¡metro de tipo '{0}' tiene el mismo nombre que el parÃ¡metro de tipo del tipo externo '{1}'XEl parÃ¡metro de tipo tiene el mismo nombre que el parÃ¡metro de tipo de un tipo externo8No se puede cargar el ensamblado del analizador {0}: {1}1No es posible cargar el ensamblaje del analizadorLEl campo '{0}' nunca se asigna y siempre tendrÃ¡ el valor predeterminado {1}BEl campo nunca se asigna y siempre tendrÃ¡ su valor predeterminado’Control is returned to caller before auto-implemented property '{0}' is explicitly assigned, causing a preceding implicit assignment of 'default'.ŒControl is returned to caller before auto-implemented property is explicitly assigned, causing a preceding implicit assignment of 'default'.ªAuto-implemented property '{0}' must be fully assigned before control is returned to the caller. Consider updating to language version '{1}' to auto-default the property.¢An auto-implemented property must be fully assigned before control is returned to the caller. Consider updating the language version to auto-default the property.~Control is returned to caller before field '{0}' is explicitly assigned, causing a preceding implicit assignment of 'default'.xControl is returned to caller before field is explicitly assigned, causing a preceding implicit assignment of 'default'.“Field '{0}' must be fully assigned before control is returned to the caller. Consider updating to language version '{1}' to auto-default the field.¦Fields of a struct must be fully assigned in a constructor before control is returned to the caller. Consider updating the language version to auto-default the field.2ConversiÃ³n unboxing a un valor posiblemente NULL.2ConversiÃ³n unboxing a un valor posiblemente NULL.æEl valor de EnumeratorCancellationAttribute aplicado al parÃ¡metro "{0}" no surtirÃ¡ efecto. El atributo solo es efectivo en un parÃ¡metro de tipo CancellationToken en un mÃ©todo iterador asincrÃ³nico que devuelve IAsyncEnumerableÉEl valor de EnumeratorCancellationAttribute no surtirÃ¡ efecto. El atributo solo es efectivo en un parÃ¡metro de tipo CancellationToken en un mÃ©todo iterador asincrÃ³nico que devuelve IAsyncEnumerablešEl iterador de asincronÃ­a "{0}" tiene uno o mÃ¡s parÃ¡metros de tipo "CancellationToken", pero en ninguno se incluye el atributo "EnumeratorCancellation", por lo que el parÃ¡metro de token de cancelaciÃ³n del objeto "IAsyncEnumerable<>.GetAsyncEnumerator" generado no se consumirÃ¡ El miembro del iterador de asincronÃ­a tiene uno o mÃ¡s parÃ¡metros de tipo "CancellationToken", pero en ninguno se incluye el atributo "EnumeratorCancellation", por lo que el parÃ¡metro de token de cancelaciÃ³n del objeto "IAsyncEnumerable<>.GetAsyncEnumerator" generado no se consumirÃ¡°Suponiendo que la referencia del ensamblado '{0}' usada por '{1}' coincide con la identidad '{2}' de '{3}', puede que necesite proporcionar la directiva en tiempo de ejecuciÃ³nãLos dos ensamblajes difieren en el nÃºmero de versiÃ³n y/o compilaciÃ³n. Para que haya unificaciÃ³n, debe especificar directivas en el archivo .config de la aplicaciÃ³n y debe proveer el nombre seguro correcto de un ensamblaje.CAsumiendo que la referencia al ensamblaje coincide con la identidad°Suponiendo que la referencia del ensamblado '{0}' usada por '{1}' coincide con la identidad '{2}' de '{3}', puede que necesite proporcionar la directiva en tiempo de ejecuciÃ³nãLos dos ensamblajes difieren en el nÃºmero de versiÃ³n y/o compilaciÃ³n. Para que haya unificaciÃ³n, debe especificar directivas en el archivo .config de la aplicaciÃ³n y debe proveer el nombre seguro correcto de un ensamblaje.CAsumiendo que la referencia al ensamblaje coincide con la identidadZEl modificador de lÃ­nea de comandos '{0}' todavÃ­a no se ha implementado y se ha omitido.=El switch de la lÃ­nea de comandos aÃºn no estÃ¡ implementadoÆEl elemento {0} "{1}" que no acepta valores NULL debe contener un valor distinto de NULL al salir del constructor. Considere la posibilidad de declarar el elemento {0} como que admite un valor NULL.«Un campo que no acepta valores NULL debe contener un valor distinto de NULL al salir del constructor. Considere la posibilidad de declararlo como que admite un valor NULL.pEl comentario XML de '{1}' tiene una etiqueta paramref para '{0}', pero no hay ningÃºn parÃ¡metro con ese nombre\El comentario XML tiene una etiqueta paramref, pero no hay ningÃºn parÃ¡metro con ese nombredEl comentario XML tiene una etiqueta param para '{0}', pero no hay ningÃºn parÃ¡metro con ese nombreYEl comentario XML tiene una etiqueta param, pero no hay ningÃºn parÃ¡metro con ese nombretEl comentario XML de '{1}' tiene una etiqueta typeparamref para '{0}', pero no hay ningÃºn parÃ¡metro con ese nombrehEl comentario XML tiene una etiqueta typeparamref, pero no hay ningÃºn parÃ¡metro de tipo con ese nombrehEl comentario XML tiene una etiqueta typeparam para '{0}', pero no hay ningÃºn parÃ¡metro con ese nombreeEl comentario XML tiene una etiqueta typeparam, pero no hay ningÃºn parÃ¡metro de tipo con ese nombre²Como esta llamada no es 'awaited', la ejecuciÃ³n del mÃ©todo actual continuarÃ¡ antes de que se complete la llamada. Puede aplicar el operador 'await' al resultado de la llamada.”El mÃ©todo actual llama a un mÃ©todo asincrÃ³nico que devuelve una tarea o un Task<TResult>, y no aplica el operador Await al resultado. La llamada al mÃ©todo asincrÃ³nico inicia una tarea asincrÃ³nica. Sin embargo, debido a que no se aplica ningÃºn operador Await, el programa continÃºa sin esperar a que finalice la tarea. En la mayorÃ­a de los casos, este comportamiento no es el esperado. Generalmente, otros aspectos del mÃ©todo de llamada dependen de los resultados de la llamada. O bien, se espera como mÃ­nimo que el mÃ©todo al que se llama se complete antes de volver al mÃ©todo que contiene la llamada.
+
+Un problema de igual importancia es el que se genera con las excepciones que se producen en el mÃ©todo asincrÃ³nico al que se llama. Las excepciones que se producen en un mÃ©todo que devuelve una tarea o un Task<TResult> se almacenan en la tarea devuelta. Si no espera por la tarea o no realiza una comprobaciÃ³n explÃ­cita de excepciones, la excepciÃ³n se pierde. Si espera por la tarea, su excepciÃ³n se vuelve a producir.
+
+Como procedimiento recomendado, siempre debe esperar por la llamada.
+
+Considere la posibilidad de suprimir la advertencia solo si tiene la seguridad de que no desea esperar a que la llamada asincrÃ³nica se complete y que el mÃ©todo al que se llama no producirÃ¡ excepciones. En ese caso, puede suprimir la advertencia asignando el resultado de la tarea de la llamada a una variable.vDado que no se esperaba esta llamada, la ejecuciÃ³n del mÃ©todo actual continuarÃ¡ antes de que se complete la llamadaDEl comentario XML no estÃ¡ situado en un elemento vÃ¡lido del idiomaDEl comentario XML no estÃ¡ situado en un elemento vÃ¡lido del idioma\Dentro de los atributos cref, se deben calificar los tipos anidados de los tipos genÃ©ricos.[Entre los atributos cref, los tipos anidados de tipos genÃ©ricos deberÃ­an ser cualificadosSe detectÃ³ cÃ³digo inaccesibleSe detectÃ³ cÃ³digo inaccesible¤Una clÃ¡usula catch previa ya detecta todas las excepciones. Las no excepciones producidas se incluirÃ¡n en System.Runtime.CompilerServices.RuntimeWrappedException.µEsta advertencia se produce cuando un bloque catch() no tiene especificado un tipo de excepciÃ³n despuÃ©s de un bloque catch (System.Exception e). La advertencia avisa de que el bloque catch() no abarcarÃ¡ ninguna excepciÃ³n.
+
+Un bloque catch() despuÃ©s de un bloque catch (System.Exception e) puede abarcar excepciones que no sean CLS si RuntimeCompatibilityAttribute se establece como falso en el archivo AssemblyInfo.cs: [assembly: RuntimeCompatibilityAttribute(WrapNonExceptionThrows = false)]. Si este atributo no se establece explÃ­citamente como falso, todas las excepciones que no sean CLS lanzadas se ajustarÃ¡n como Excepciones y el bloque catch (System.Exception e) las abarcarÃ¡.3Una clÃ¡usula catch ya abarca todas las excepcionescEl parÃ¡metro "{0}" no se ha leÃ­do. Â¿OlvidÃ³ usarlo para inicializar la propiedad con ese nombre?\El parÃ¡metro no se ha leÃ­do Â¿OlvidÃ³ usarlo para inicializar la propiedad con ese nombre?El evento '{0}' nunca se usaNunca se usa el eventoEl campo '{0}' nunca se usa8El campo '{0}' estÃ¡ asignado pero su valor nunca se usa2El campo estÃ¡ asignado pero nunca se usa su valorNunca se usa el campo,No existe ninguna referencia a esta etiqueta,No existe ninguna referencia a esta etiqueta5La funciÃ³n local "{0}" se declara pero nunca se usa..La funciÃ³n local se declara pero nunca se usa3La variable '{0}' se ha declarado pero nunca se usa;La variable '{0}' estÃ¡ asignada pero su valor nunca se usa5La variable estÃ¡ asignada pero nunca se usa su valor-La variable estÃ¡ declarada pero nunca se usa*Uso de la variable local no asignada '{0}',Uso del campo '{0}' posiblemente sin asignarkField '{0}' is read before being explicitly assigned, causing a preceding implicit assignment of 'default'.eField is read before being explicitly assigned, causing a preceding implicit assignment of 'default'.nUse of possibly unassigned field '{0}'. Consider updating to language version '{1}' to auto-default the field.cUse of possibly unassigned field. Consider updating the language version to auto-default the field.(Uso de un campo posiblemente sin asignar(Uso del parÃ¡metro out sin asignar '{0}'"Uso del parÃ¡metro out sin asignarQUso de una propiedad implementada automÃ¡ticamente posiblemente sin asignar '{0}'Auto-implemented property '{0}' is read before being explicitly assigned, causing a preceding implicit assignment of 'default'.yAuto-implemented property is read before being explicitly assigned, causing a preceding implicit assignment of 'default'.…Use of possibly unassigned auto-implemented property '{0}'. Consider updating to language version '{1}' to auto-default the property.zUse of possibly unassigned auto-implemented property. Consider updating the language version to auto-default the property.KUso de una propiedad implementada automÃ¡ticamente posiblemente sin asignarThe 'this' object is read before all of its fields have been assigned, causing preceding implicit assignments of 'default' to non-explicitly assigned fields.The 'this' object is read before all of its fields have been assigned, causing preceding implicit assignments of 'default' to non-explicitly assigned fields. The 'this' object cannot be used before all of its fields have been assigned. Consider updating to language version '{0}' to auto-default the unassigned fields.¬The 'this' object cannot be used in a constructor before all of its fields have been assigned. Consider updating the language version to auto-default the unassigned fields.%Uso de una variable local no asignadanLa comparaciÃ³n con la constante integral no es vÃ¡lida; la constante estÃ¡ fuera del intervalo del tipo '{0}'eLa comparaciÃ³n con la constante integral es inÃºtil. La constante estÃ¡ fuera del intervalo del tipoA'{0}': una referencia a un campo volÃ¡til no se tratarÃ¡ como talªNormalmente, no debe usarse un campo volÃ¡til como valor ref o out, porque no se tratarÃ¡ como volÃ¡til. Pero hay excepciones, como cuando se llama a una API entrelazada.?Una referencia a un campo volÃ¡til no se tratarÃ¡ como volÃ¡til#advertencia: '{0}'Directiva #warningAEl comentario XML tiene cÃ³digo XML con formato incorrecto: '{0}'3El comentario XML tiene XML formado incorrectamenteLXML con formato incorrecto en el archivo de comentarios de inclusiÃ³n: '{0}'EHay XML formado incorrectamente en el archivo de comentarios incluido(NÃºmero de argumentos de tipo incorrecto$Se esperaba un SemanticModel de {0}.BLa cadena literal ']]>' no se permite en el contenido de elemento.Atributo '{0}' duplicadoDLa etiqueta final '{0}' no coincide con la etiqueta de inicio '{1}'.6Se esperaba una etiqueta final para el elemento '{0}'.5No se esperaba una etiqueta final en esta ubicaciÃ³n.5Se esperaba '>' o '/>' para cerrar la etiqueta '{0}'.(CarÃ¡cter inesperado en esta ubicaciÃ³n.Se esperaba un identificador.1Se ha usado sintaxis incorrecta en un comentario.ISe encontrÃ³ un carÃ¡cter no vÃ¡lido dentro de una referencia de entidad.HEl/los carÃ¡cter/caracteres '{0}' no se puede/n usar en esta ubicaciÃ³n.CarÃ¡cter Unicode no vÃ¡lido.6No se permite un espacio en blanco en esta ubicaciÃ³n.:El carÃ¡cter '<' no se puede usar en un valor de atributo.>Falta el signo igual entre el atributo y el valor de atributo.'Referencia a entidad sin definir '{0}'.3Falta la comilla de cierre en el literal de cadena.NSe esperaba un literal de cadena, pero no se encontrÃ³ la comilla de apertura.?No se pueden usar comillas no ASCII en los literales de cadena.%Falta el espacio en blanco necesario.     t\ºÁei2'÷¿×Ò¬û>Y›Q.®lÀ‹üg³‰\ØFŞë±>³¦¡z3u8|àË®¯¼LA‰~vğòİGQÛÌkæïjW¤Ù Z,õa´aYdiÃA»b”•e€{Òú”ß/f;kAs4¶µ™ë¶ÎpKK                           ğ         *ğ                         ğ           _CorDllMain mscoree.dll     ÿ%                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       €                  0  €                   H   X  p          p4   V S _ V E R S I O N _ I N F O     ½ïş   , ÅT         ?                         D    V a r F i l e I n f o     $    T r a n s l a t i o n       °Ğ   S t r i n g F i l e I n f o   ¬   0 0 0 0 0 4 b 0   L   C o m p a n y N a m e     M i c r o s o f t   C o r p o r a t i o n   d   F i l e D e s c r i p t i o n     M i c r o s o f t . C o d e A n a l y s i s . C S h a r p   >   F i l e V e r s i o n     4 . 3 0 0 . 2 2 . 2 1 7 0 1     x ,  I n t e r n a l N a m e   M i c r o s o f t . C o d e A n a l y s i s . C S h a r p . r e s o u r c e s . d l l   € .  L e g a l C o p y r i g h t   ©   M i c r o s o f t   C o r p o r a t i o n .   A l l   r i g h t s   r e s e r v e d .   € ,  O r i g i n a l F i l e n a m e   M i c r o s o f t . C o d e A n a l y s i s . C S h a r p . r e s o u r c e s . d l l   \   P r o d u c t N a m e     M i c r o s o f t . C o d e A n a l y s i s . C S h a r p   – 9  P r o d u c t V e r s i o n   4 . 3 . 0 - 1 . 2 2 2 1 7 . 1 + 3 1 d 7 f 1 f 7 d a 0 0 f f c 8 a 6 a e a f 6 d e 9 7 1 5 9 e e 2 c a a 0 b a e     8   A s s e m b l y   V e r s i o n   4 . 3 . 0 . 0                                                                                                                                                                                                                                                                                                                            ğ    <0                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      €(    0‚(p	*†H†÷ ‚(a0‚(]10	`†He 0\
++‚7 N0L0
++‚70	  ¢€ 010	`†He  7.€\“rWÀÿB ºææ¨Ù­»–vk´0Å»#Ğj¢ ‚ğ0‚n0‚V 3  ~GÃ‚~*    0	*†H†÷ 0~10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1(0&UMicrosoft Code Signing PCA 20110211014184514Z221013184514Z0c10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation10U.NET0‚¢0	*†H†÷ ‚ 0‚Š‚ Ï§cñxEÜ$ÆÛ~­2cØ™ÿ¯¦Åò¿–×‹)m•˜Ş<Ã-´X$VV\4{üµk)Í×Ëöó°TèÉÓ,ˆŒÍOQÔŠóy?ÜÊJS7÷/öo¼jç„——@IõÆ¹Æ6¥·¦Í=İŸ¼Œµcö "kÛçG‘ˆşV9„¶ÿoî½£nÙ%[°µå§Ëí]•¯"Òãü1«>`–Ïƒñ¸Ú{DãÍE/.ïŠÁ;Z5¨N´õKÌ“G"·y93+^¶xà¯àgĞŠ8**“ ;q«ùÃNE5?97LèõI¯(.ˆÎÒªxèåÍº‡W9x:d¢d’«óùÚ£±<áşÏ½$ü_:ÿ¦ZÀ\…Ù‡^ü:ì¯˜ö&]bùLx±¦AëÁáø=Wˆ¦:÷-áë]“ËüÂR}èíãñ-¨¢d©À{'îg¤Ÿ#êU[ØW’oÕXŸ_2înİkÈ‘ £‚~0‚z0U%0
++‚7L+0U¯1HE¨	à1èšÇ¨ ^^Î0PUI0G¤E0C1)0'U Microsoft Operations Puerto Rico10U464223+4686260U#0€HndåPÓ‚ª77"µm¨Êu•0TUM0K0I G E†Chttp://www.microsoft.com/pkiops/crl/MicCodSigPCA2011_2011-07-08.crl0a+U0S0Q+0†Ehttp://www.microsoft.com/pkiops/certs/MicCodSigPCA2011_2011-07-08.crt0Uÿ0 0	*†H†÷ ‚ *šFîBŠÜ¿¡“^ ÿI„Ø;I•§ìm“Ä€mU‡³êòo±Ñ£…¥ğ
+ ®–È1abëñ>óhšFï¹1pŞÂÀ<>w¡Âs®“–"9ÿ®~x)şDË^¬Ù	:4ªı» Oöh)öİåeî’_¹§Z~¥EdD…Ê€Eë…š)9`?¡€–`£{Í5…Q 8‡p‚5ÌĞ¬BZ@TWø3¥oz{!h(TV‰R©ÿHùi“ƒ2½A+`OÉ§6˜ïGüı×*³Iïã
+ÖoüÁ=quÜˆ­ÌœæØd*›ìÍL÷Ñ¤ª_)0…€$0ïó6isş÷S–.ĞUÛ:r“ŠqœÉ€Å ]àv>|Ğ.„0}¤û	qË¾!%GH~((˜ò€.lRod¡&Å7uİèMwäøû/ÇyíÉê+mÀ,…Cˆj¢Z™3ZC_å{B„ÃãìKkHÌæº{íxŸ)2b7øyGª@Àá 2µ×‹ZHªº1¥Í¹Áš¨,ÅÃòşâuæ&[:½øë…µMkHf7Š`NĞ(¥>”s•s&¾2J»yİÛÃÂï~\Şu7ğµ|bÛ­æ<oj 5¢mÃ6éŸTĞLx'$_)ïCÌ€95¬v0‚z0‚b 
+aÒ     0	*†H†÷ 0ˆ10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1200U)Microsoft Root Certificate Authority 20110110708205909Z260708210909Z0~10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1(0&UMicrosoft Code Signing PCA 20110‚"0	*†H†÷ ‚ 0‚
+‚ «ğúr.­Ønª‚M4ºò¶X!ŸB*kéZPª¸8IºÃİ7kÆØğ8Â™°È9Õ1BÓ‰yd‡~”`$l¯Iœéh^Òß›S²
+,Ã¯Ù©+®z	¯×–YÊ`éfvè2R&/ç«PÏ³D·]ØÄ.u«hóËmó:\¡ôFºà8d¬nd5x¦ c-Ó@“øãŞÕ\y¥I)ç¾ w¾”=ïûã+ZMV(¢zrà:·I^ØííC‘ƒÙ{²{†Ù>±Œ]è‰O„ò¡/Yä;-®3XÅ·>ş2Ó³=±²¯’8~Ò€,õNV‘!5%Ã9ndSºœ­#„Ëôº†÷_ğĞR¿Œ”‡¼À!t%_(¶Ì'(8%˜9J6Ï|±’®#§©fìajá(I_ˆâ%]Ó!K>RÄµW?$ğÑz[/Õ#ãp]QFw³ø á¼¬‚_ÛÀ³½ÔUKç9¡é#I¼¸D|EäÁÃrzàrç$ß¿F™ÅïÂWÛƒìMI0§«ßì[Ÿ¯üİ°fâÁ—{íÖíKçI)§(¦§}g€æŠbx_²/„×Wœ\¿w((ñímÃ(,@7OÁá…D‰Ä	LÅÔ¥C/t•÷nøx X,]`•š>O3„Ú°ˆŞNô–°¼F l˜ÒàÖˆŒ £‚í0‚é0	+‚7 0UHndåPÓ‚ª77"µm¨Êu•0	+‚7
+ S u b C A0U†0Uÿ0ÿ0U#0€r-:1C¹Náê§Ç1Ñ#‰40ZUS0Q0O M K†Ihttp://crl.microsoft.com/pki/crl/products/MicRooCerAut2011_2011_03_22.crl0^+R0P0N+0†Bhttp://www.microsoft.com/pki/certs/MicRooCerAut2011_2011_03_22.crt0ŸU —0”0‘	+‚7.0ƒ0?+3http://www.microsoft.com/pkiops/docs/primarycps.htm0@+042  L e g a l _ p o l i c y _ s t a t e m e n t . 0	*†H†÷ ‚ gò†¥˜àTy.ÓØtg"›–ác’™B–}ÒyÁe_.,>øÃrÑmƒş¾?è
+Ê;¿G©£óiÛc¿"5¥—]e„}‹FPUØ’|ÒKó<B‹RĞ°ıkã>.)›æ=¥Ôµw”9âédÉD=xz#ó}¦tƒôË&F*ÂŠ»¤©›íhúh.• *?*kXIc	inZ˜–äƒôÀóF+Şü;Ğ½5ïn%®å¯'íĞİó¯™(—˜M=ò‰ÖÃ2âğÅ-Î[´I9
+Æ
+ÂÆ­®å²ÙÛˆQEX82q'±ô'øŞ,: i˜²Y‰hno§·tÃ@¦*(>‚?MfÀ³Mõáo}E§vå@*e£Ã]Rb†Ãc6—†ßÚóøò¡š'áÍ¥—Ğî]cAã[œ‡>wÑ±u¾aaµğÜÆ¾ßAÇ(îŞe/ì—ö¡\–Ø Ö¡F½Yó—¥	KH™€Ğ )Å±›¥?Ew5ÆÒ¢¢Ÿzz"úH•«ûG#€õø¿k·K—âëuxìê7™yKÿÖ³#huæ¯úü‹ë€êi;¯ü0íLßßumc‘=ÑVNO¿€W"¡x2!zïA
+±?û¨Ì¤]Á¡ˆ›WqVNHEÀBÉ›v[
+€HkıyŸÁ½mmjÉRszPÍ1‚ó0‚ï0•0~10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1(0&UMicrosoft Code Signing PCA 20113  ~GÃ‚~*    0	`†He  ®0	*†H†÷	1
++‚70
++‚710
++‚70/	*†H†÷	1" l˜— †‚ß:ÉÑ°ãåÈ*!G@¦Ñ
+ŞİlKò0B
++‚71402 € M i c r o s o f t¡€http://www.microsoft.com0	*†H†÷ ‚€ü¶ï,=’"dÖ¥dä34Ÿ+Ï€ÅİŸEGæ’ÊØ†ßVA¤š$­\;æ]z&RbºWŒH­,‹Ù€7g©^ürSÇØ"“@C‚©Ì:¿*ì¼ø–ì¬•1uš“ªhcTàê¢²#vJî-8¨› ìYêøøhõBäÊé¶ı†FÚ—Ñn	Fá8?G`t—,ÊŠ'Îİ ‚4*’#W¬cñôy5Ø@­•ëmîF ßh„a-l4W¬?ÅP„s`ñ'§ÙS513©>Åâ4…ÄBğtÓÊ%óœ³.İ…wpñÜq¯ş2Ãå¾’`á –l5 áE¢Ô`´+*>xhì1Dw >ÁìT«>­\¹Iu‡³^*¼ó-èW?‚R~vĞ3ÜS2e6[æw•×ğN/52Z¤iIòe>Qyw¦y€‡o6¥g”•üê‘€Êì>^Æ /1†Ê ‡w	›¯M¨ËÿPDö®¹‹˜8…ã¡‚ı0‚ù
++‚71‚é0‚å	*†H†÷ ‚Ö0‚Ò10	`†He 0‚Q*†H†÷	 ‚@‚<0‚8
++„Y
+010	`†He  °°©‘í1×t¸UQ¾nß…‰¬4<_ÒKß¦bG±¬½20220417160613.997Z0€ô Ğ¤Í0Ê10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1%0#UMicrosoft America Operations1&0$UThales TSS ESN:7BF1-E3EA-B8081%0#UMicrosoft Time-Stamp Service ‚T0‚0‚ô 3  Ÿ+E5.K]   Ÿ0	*†H†÷ 0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20100211202190522Z230228190522Z0Ê10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1%0#UMicrosoft America Operations1&0$UThales TSS ESN:7BF1-E3EA-B8081%0#UMicrosoft Time-Stamp Service0‚"0	*†H†÷ ‚ 0‚
+‚ ¤õy|MQ²‰/Îo-‡Ë?Lç/Ï7`2Óxì×õ³	¢\;4‘yIßÓ”g¯Õò]»šPcÈ¶Cµ87[ÇP9îùûK6D Y¥]¤˜qrÅy‚bêX|ËsUÕ3G‚ój„&´®)DÜ)ê°¿±»úÎŸ^× lèûü…Ë°ßZãu÷æëvÑ4¡Qæ®ÎF9ZG§º.©N›¾”‚ú¼¶¿‹¢2™/Ç÷ÌzV;^ĞÓÇèiÈ	?8?˜+·¨k1nÄÔ©d2‰kkŒÉsøÈ‚ŸMF¶ÄÅ
+-xŠâM¯|‘:8SS‡eM²e
+·\p˜$o.¤ØŞ@…/(zŞ<øy¡aØÓX<MÉ1WˆxŠZ*½¦˜ÇõÃ‚¨+!2íÆ¹’µ¨	!yhŠ_j„ÑãQZé¦£áuÁwuÅbTZ)xmËŒÌï«lR7
+ÙÆåRéå:w7éiÒó%ì“Èß/H¯lH•™( 3dÃeNP†Å"ĞúĞ2XÌÑô¬k¶ıı?ıÂŒwìıÙ~ğyŒ è’ ôk¾­Iµ\ıF|İo¹¶?ÓaÁ5Ñ"m!u4WëWB§âö öD 1ˆ´Ø&<{¬ùL˜ƒEaÅ‰¦6œ x0]‘A=ñ ÎÉ*…Ú1õ £‚60‚20Ub4òÕ+H.èßÙjÇÖÈa0U#0€Ÿ§] ^b]ƒôåÒe§S5ér0_UX0V0T R P†Nhttp://www.microsoft.com/pkiops/crl/Microsoft%20Time-Stamp%20PCA%202010(1).crl0l+`0^0\+0†Phttp://www.microsoft.com/pkiops/certs/Microsoft%20Time-Stamp%20PCA%202010(1).crt0Uÿ0 0U%0
++0	*†H†÷ ‚ Š()<;éóé½lõĞ 	¨û¬[(6ŠÄwÿÍ€ñu@1¯Q¤‹X&Gdµ¯‚é’ÆDd*u©`˜¢È`UÜù ƒç1[¯@X,Ê%–L´}Ì‰õAÓdƒJƒá›[&€>Ïg¥Ü$s…YØöÇD”:]˜s÷&Ô„w[ã•ÃpÊJse't^~ìã}ŸçAÎiEcçLÏ‰ÜëïxÊÚ!ÌçJ¹kã¡—2…†&İ!“_ànIf¬—{ÉüÏl‘æšÚèŒG:ˆ]}kÀ"…ÂÏŠ7ûÉÆ¼Gˆ_AÉX¨¹ş#	Àü;i÷‹h	*‹¨u'½uê¬¥A¢pèa`1ùmö©ªš¡.Ÿ´òò7%k'`¶}œ cl¢_vL€±”®Ñ •?ë\å$º)_Ã(Kü  #O½@b»³Åà±ñå4ES±Ù^ø)d9ùÆKd]˜„¶èÖl1, ÇDuuwÉ¶7%ÙM}·¤ˆ}BÅùaFÈä×o¹S"Ëšİ¹_„ø'*4©Ù¤¡6¤Şò,=J¶£gÑµÆ°ä6§0j­u<ÒPÆ_^ 1‘neèrì¸ñÇO›»2G)“óÔË0R¨IÒ^WŠTşİİ=·TÛQÒëA1ØŠvMÑŸ‚Ô½<ìÕi08Rç.’VãfD"…ø60‚q0‚Y 3   Åçk›I™     0	*†H†÷ 0ˆ10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1200U)Microsoft Root Certificate Authority 20100210930182225Z300930183225Z0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20100‚"0	*†H†÷ ‚ 0‚
+‚ äá¦Lç´r!y¢Ë×$y½Õ‚ÓıîœÒ©lNuÈÊ5WölJàâ½¹>`3ÿ\OÇf÷•SqZâ~JZş¸6g…F#µÏw2Àè`}jRƒD·¦FkóÅvõ†PÜÁDÈq\Q17 
+8ní×Ø&S|9azÄªıri¯«¬ö6¾5&dÚ˜;º{3­€[~ŒRş¶èb%ÜjÏ]ôşSÏÖì…VMïİ¼¤ã‘²9,QœépiÊ6-p1È5(½ã´‡$ÃàÉ~µTÜúU˜mh;šF½í¤®z)7¬ËëƒEçFnÊ2ÕÀ†0\O,âb²Í¹âˆä–¬J»¾q©[g`Şø’‘=ı Ïs}AšFuÍÄ_4İ‰Öı¥ }~üÙEß¶r/Û}_€ºÛª~6ì6Lö+n¨Qè¿£Ñs¦M7t”4‚ğò·Gí§è™|?LÛ¯^ÂóÕØs=CNÁ39L¼Bh.ê„QFâÑ½jZasÊg¢^×(vâ3r×§ ğÂú
+×coÉ6d‹[ ¦ƒ!]_0t‘””Ø¹Pù‰aó65„GÛÜÑı²ÔÅkö\RQ]Û%º¯PzlÅrïùRÄ…“À<Û7Ç?x«E¶õ‡^ÚriÆ®{··>jâ.­ £‚İ0‚Ù0	+‚7 0#	+‚7*§RşdÄš¾‚‘<F5)Ïÿ/î0UŸ§] ^b]ƒôåÒe§S5ér0\U U0S0Q+‚7Lƒ}0A0?+3http://www.microsoft.com/pkiops/Docs/Repository.htm0U%0
++0	+‚7
+ S u b C A0U†0Uÿ0ÿ0U#0€ÕöVËè¢\bhÑ=”[×ÎšÄ0VUO0M0K I G†Ehttp://crl.microsoft.com/pki/crl/products/MicRooCerAut_2010-06-23.crl0Z+N0L0J+0†>http://www.microsoft.com/pki/certs/MicRooCerAut_2010-06-23.crt0	*†H†÷ ‚ U}ü*­á,g1$[árKü©oê\¶>NGdx±“—=13µ9×Âq6?Údl|Ğu9m»1äÂûlÑ¡”"îéfg:SMİ˜º¶xØ6.œ©‚V °¾‰èiàº	î{ßjo¾)ËnØ?HuÙŞm‚õm#TäxSu$W¹İŸó=Æóhßeö¤Vª÷•¶(U'Ğ$½@ ¿¶]='à@–8¬÷ù)‰Ã¼°T…B³ü‹‰çğjÂBRuŠ6ÂÃas.,k{n?,	xé‘²©[ßI£t¼ì‘€Ò=æJ>f;O»†ú2Ù–ôö‘öÎÆtıöLro«u0Å4°zØPş
+Xİ@<ÇTmctH,±NG-Áq¿dù$¾smÊ	½³WITdÙs×[DZ‘kŸ¤(Üg($º8Kšnû!TkjEG©ñ·®Èè‰^OÒĞLvµWT	±iD~|¡alsş
+»ìAf=iıËÁAI~~“¾Ëø;ä·¿´Î>¥1Q„¼¿Á‚¢{‰pşçµĞ(‰6ÚºLù›ÿ
+é4ø$5g+à¸æŒ™Öá"êğ'B=%”ætt[jÑ>í~ 13}¼Ëé{¿8pDÑñÈ«:Š:bÙpcSMî‚m¥Áqj´U3X³¡pfò¡‚Ë0‚40ø¡Ğ¤Í0Ê10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1%0#UMicrosoft America Operations1&0$UThales TSS ESN:7BF1-E3EA-B8081%0#UMicrosoft Time-Stamp Service¢#
+0+ t]®˜òËE,TÂò²}ÿ\ö· ƒ0€¤~0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20100	*†H†÷  æk0"20220417221051Z20220418221051Z0t0:
++„Y
+1,0*0
+ æk 0  0 Æ0
+ æïë 06
++„Y
+1(0&0
++„Y
+ 
+0 ¡ ¡
+0 † 0	*†H†÷  y İ—¯«wÔ†è{7tjññ[*¹dÕú#À×y9±à€İï›*pÚßût}ªo§Z«Ê™`l.·ÈÓ;à4aQU[àŠ¯§¹léÕ3^öTEÔc@êêÂ;„Pm—Uò‰(_Ck¦üE³©&³`\€Ôá†-à{èğòÒ1‚0‚	0“0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20103  Ÿ+E5.K]   Ÿ0	`†He  ‚J0	*†H†÷	1*†H†÷	0/	*†H†÷	1" :Éè³‰
+éQöÙ¡Ü²»)°²Q¤‰;c{Â×yô0¿0ú*†H†÷	/1ê0ç0ä0½ †ñ^)¢'‰¥çW<QèŞ*É|Aû?èì§,7K|\Ú0˜0€¤~0|10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1&0$UMicrosoft Time-Stamp PCA 20103  Ÿ+E5.K]   Ÿ0" õßbñ¼^6™•ş_r£z€ù¥¯ÎÃÅP£DxĞ0	*†H†÷ ‚ ˆÆp4Ô7ıå›Üâ¤8—t‘™Øğ\ãhˆAR÷²ö]Rª³4hc¯ÉÔ6	¡¦gæü?Êåh·Õ­Ä½R!x*ªoÙsíòÖY ¶ J\",ön»!w«Z/gªÓ¾1pë=¨›¹}F™ª§¾ônã[ŠæJ™ÌÊøÔºèÑ™Éüq3+Ì%.q7>ã&jÌR%Ã8€˜˜³eY?ò#şÕ~E&ì|Z‘=¡dí5í¼€T*§ß¤Ù:Z¶şKJ/MÉéo›•“ÄGî‰hæp¦ ÓÓ5W•9øÕ÷xá TK¸©ÃŸ;—ØHqZkˆ|mw?Hd¿ÿæ¶û‘}ixd wçTÌÓ'Å}EosøñC\äNRõå<Â?¢¶ßLï´ÄŸhÙ"ˆÁÓù(T½IvÌ¨K²’æªŸÌíc˜ó¬ìğXX,ÄzÓ¹¹‹Ÿ´äëÃ±c ÆUcp³ÁÇL¼Ä!2ónÂfJås!õè:ÈÚm·{•óHŒ¬Fûëwêú»há?Û_Gá‹‘@×”İq/çRº§Á8¿_ñ3øoSüü*Á3<¡Ôˆ>È,ZçÖtÿ,FŸÓ–^NB@Å"¸É¡©-tÏòğp°Áñ5‡¯S„ÍnĞÄœD´ÕÊ+¤â·x                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    MZ       ÿÿ  ¸       @                                   €   º ´	Í!¸LÍ!This program cannot be run in DOS mode.
+$       PE  L ¤ ’·        à " 0  º        òÙ      à                               7º  @…                            Ù O    à Ì           Ä €(        „Ù                                                              H           .text   ø¹      º                   `.rsrc   Ì   à     ¼             @  @.reloc            Â             @  B                ÔÙ     H     P   l  	       ¼%  H³ Ù €                                   BSJB         v4.0.30319     l   0  #~  œ    #Strings          #US ¤     #GUID   ´  ¸  #Blob           	   ú3      
+      	   	                     o ú o  \ õ   á D Æ D J D g D ­ D 3 D           	 V  V  V
+ ) V 1 V 9 V A V I V Q V .  À .  É .  è . # ñ . + . 3 @. ; T. C ’. K ’€            Í
+                            <Module> pt-BR System.Runtime DebuggableAttribute AssemblyTitleAttribute AssemblyFileVersionAttribute AssemblyInformationalVersionAttribute CompilationRelaxationsAttribute AssemblyProductAttribute AssemblyCopyrightAttribute AssemblyCompanyAttribute RuntimeCompatibilityAttribute Microsoft.CodeAnalysis.CSharp.resources.dll System.Reflection .ctor System.Diagnostics System.Runtime.CompilerServices Microsoft.CodeAnalysis.CSharp.CSharpResources.pt-BR.resources Microsoft.CodeAnalysis.CSharp.resources DebuggingModes     ¢]œëoA¢PşœNLêş      °?_Õ
+:€  $  €  ”      $  RSA1     µüçg‡w:Ş‰8ÈÔºe¹ `Y>–Ä’eˆœÁ?ëµ?¬1®Ó3Åî`!g-—ê1¨®½ /%Ø}ºoÉıYÔÚ5äL9ŒECèã;„&=®Éõ–ƒo—È÷GPå—\dâŸEŞôk*+G­Ãe+õÃ]©        TWrapNonExceptionThrows       Microsoft Corporation  3 .Â© Microsoft Corporation. All rights reserved.   4.300.22.21701  = 84.3.0-1.22217.1+31d7f1f7da00ffc8a6aeaf6de97159ee2caa0bae  " Microsoft.CodeAnalysis.CSharp     A³ ÎÊï¾   ‘   lSystem.Resources.ResourceReader, mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089#System.Resources.RuntimeResourceSet   Ğ      PADPADPş¥€îœ2€9²<€¬ºI€ºs€-¬t€Ù‹À€~uí€.‡ï€›ª	Ì}YŞ>œ/1i‚%¢‡‚sÁ–‚è³‚‹Pƒ{Aƒ¡æEƒÑ}ƒ]€ƒO¶ôƒI“„¾ö„’›>„ıÌh„å“l„øm„Å¥„±%¹„+ÄÔ„Hğİ„ıå÷„:d…^Á7…ÙÍ?…ŸHG…,îY…Qø„…nˆ…d7… Ï¢…w‰ã…×?ü…ÿ…ûã†â„†ÇÕ]†_¼d†Êw†é©¡†UVõ† ;‡O ‡ğ°:‡hİa‡Zß³‡¿d´‡e5÷‡’ˆóA ˆ­$3ˆUc@ˆe>`ˆô~bˆáänˆˆ—šˆ³¸Ñˆ{ïˆBìòˆIÂ‰œ• ‰;'@‰Ëbs‰¡‘Ì‰—ô‰vWö‰¿Äù‰D|Š2	\ŠÒûdŠ’jŠolnŠg}ŠãŠÈ`òŠò‘?‹ûBE‹'H‹=£K‹AÇ\‹Lrh‹
+¹y‹/ ”‹n»‹.æ‹!ô‹¯eŒ–¦ŒyÉ°Œz¥ÓŒOöŒ;[ã/,¨É3øßtîü¥
+³mÃñ×â$+û?6ĞñcõmuˆšŠ¬¹û<œA•şB~LwÖ‚’…±ÒÑçîÙşsÛĞÊñƒ>òîjò{h&üs1_Eıïf|0uÇøu­ÙzöÆ·ü±è¾ÂÃW(Û#‘êYf‘rÓ‘7=2‘§Òy‘w½¡‘Æ$¸‘=³ç‘¾õ‘Q'’eä<’&¹A’ÈÊF’Â0G’£Q’¬Ÿg’¸•ˆ’1P£’Q|Ï’ÜÒ’ù/“Ÿ2“Ş5“HúI“Ş?S“dW“¨c“uÔj“B#p“Ç3“¨-´“ÃqĞ“~÷“´%ÿ“Ç§,”ÑÌ4”œUE”ÂÓ ”pO­”¥¨¾”À>Ó”.Çİ”,tñ”Ø•ÔA•¼YC•ŒJ}•ì£•½§•r±•Vü»•¯Ñ•0×•>8+–ƒ¦9–nE–`O–¹_–‹c–M¡h–Î½¥–?·9—¾Jo—/<—ßaº—ü»—«ñ—¬ï˜'Æ-˜§ê0˜ÕbI˜˜q˜ÓN˜´”‘˜ôÂ“˜u¦Ã˜<WÖ˜^®à˜¶ñ™›á%™¤¾2™˜–;™ÍR™‘…™.Ÿ™3È¨™é(Å™N)Ç™âî0š	>šiPMš ™išNšâú³šÜöÇšóÃßšúçšEÄøšà›W'›ØR››Î„›Úy–›zš½›ƒÍÈ›‰"œW·!œ´†}œù}ƒœÌ¨¸œŸÿÖœH 'NÔ(X:Fnáhiæ{±á®ìËBêY 4p™D÷¢}n£Íd¾#Äø¤æªHèp ŸÆ Ÿ ´NŸİûpŸ¸³„Ÿså‹Ÿ´ ‘j u> £Í1 •€2 ZLI ^f\ )™ ƒiº ¼ bÉ _Ü:¡.v;¡Ü‰b¡(é¡e¡Tİ¡€†O¢6¶“¢5µ¢ónÜ¢®oò¢-ˆ>£G+m£Y™£ p—£lŸ°£/Ä£¥è£Tbô£g· ¤B1¤Îş9¤ÀŞV¤yÇ^¤¥%v¤šßx¤6á…¤Óï†¤{¤÷¥¾¤G%Ä¤©*Ó¤ ¥×ï.¥xîY¥Òœ¥¼FÄ¥k›Ø¥â‹¦°Ø¦½ÉC¦“£J¦|l¦
+¨o¦%ù¦—¦‘¡¨¦"Jª¦=Qí¦hê5§R§G{]§àòƒ§§p¤§ñ7®§$î°§]‹¶§Æ­Ã§ãÏŞ§O¤ê§>B5¨¦Ò<¨€©@¨Ehx¨¾ˆ•¨â1­¨s€·¨»Õğ¨†ó1©òs©ı×‰©TSÊ©\çğ©ÓªêÿªÛÄ)ªkxœª.M©ªŸ·«ªL:²ªˆÖ«?Ñ«Ùê«:ØG«…jP«eyh« h«ejv«¥(z«oÊ¢«Ô@Á«XğÉ«s’Ø«úl$¬áã5¬qBA¬Å”{¬†€‹¬MÃ¬NÃ¬+¨¬ú}ª¬óÕ³¬Ì"¼¬“Y¾¬‡ÅÁ¬€
+­ğ€­ç?­´M­åCr­y¦¢­F×¼­>Ø­ø˜ì­“A®,)®S I®»„®—šÛ®«¯šÖ¯ò(¯È~W¯»ÖX¯¯Z¯×_¯V(r¯6}¯Ÿ©†¯Ä¤–¯°#¥¯Z ¨¯|±¯ëşÅ¯Ádà¯© ï¯ŸÁ(°Î T°B¾d°·E›°5¦Õ°äŞÙ°ˆPİ°mİD±`	E±a	E±c	E±Nó±§¦±“A­±«|Á±&ÿ±Ø~1²¯²>²ê¡@²|wt²D•¡²Âg¤²ü‰Æ²@±ã²/eû²<î,³Ö4`³8gg³²³h‰½³hãÃ³£×³ñ‡ß³)´c”7´¶@´y(v´í°œ´w|¶´e¹´ÛÅ´—ÇÖ´®àò´ÈÏù´±tû´ùµt{+µ†Õ5µ†›8µAëPµ4]fµ?Ênµİã}µôQµ4ğ’µ¿‚£µ§]Çµ%>¶†•b¶˜<¶¶‡¶ºrš¶‹§¶ù¹¶–Ã¶ô¶^á·…¶3·%64·Ä Q·l`[·‡S«·/sÅ·„ôÌ··-Ï·ïÑÕ·>Ø·c·¸ã×¸\CY¸•îy¸…Õ¸/Ÿ£¸
+‹Ş¸ c4¹²äH¹FÂ¾¹ü(Ì¹¢$Ñ¹?Ù¹Ö« º<º,=º>9~ºMLº%‘ºé·º1¶¼º»6¿ºGèÂºš/øº’£'»>8+»¤™J»Õ÷J»—åi»&ª»†Ø’»}P”»3š»\§»¤TË»#iè»ESñ»	H	¼²º¼àC¼ö×t¼÷àµ¼u½xq½¤+½Ù+½±OD½ı
+H½-*I½(v½ «w½ûˆ½nQÀ½H«Ä½…±Ú½Câ½Hä½¨"ò½Nû½	Û¾lë4¾0ãm¾œåv¾½¾X~œ¾h+¿Ğ†9¿dŒ¿³÷˜¿ËÖ§¿o«¿ëî¿è2ï¿qƒÀ÷ñ'Àÿ·JÀ¿õSÀeøhÀĞóxÀ&~ƒÀ*˜À »ŸÀxŸ¦Àµ;ÌÀ@0ÔÀTÑ-Á¡dJÁ$ NÁTcÁßófÁ´ˆsÁÇÁ«-ÓÁ<ÏåÁ\§éÁYÂ$œÂĞÏÂ; ÂOMÂ-±!Âl'*ÂÍò>Â:ÅMÂ…mÂ'ºsÂ‘ÖyÂ7&ÂÈ¢¤ÂzÂ¤ÂbWÄÂĞàÂYà Ã9%cÃ·5kÃzjwÃ3÷‘ÃÇá—ÃSšÃ£ØÃììçÃUÉôÃ·õÃŠcÄr$/Ä`‹KÄù´–Äñ@Å²„OÅ®ê~ÅBö”ÅàìÅÓYÆÕ;Æ†™Æ!‹_ÆõrÆÚb€ÆÙ‹ƒÆÌe–Æ×N®Æ|·Æä0ÊÆIğæÆT¤ Ç…AVÇ[ÇÙÇNß×ÇÖâÇôÎøÇÚŒ(Èj•+Èie:È-0ZÈ“”È½ıÈ®AÉªéÉJ´=ÉY eÉ‡htÉÍvÉ‡©³ÉpÔÉ Ê¡¼*Êşc:Ê=Ï<Ê¶úDÊÂRÊ'Ú“ÊËº˜Êp¢Ês¢ÊU*ÎÊ„Ë{¾#Ë—¦)Ëà67Ë3DË€JËé#RËÂxËæ©ËÎÉÛËCŞËÔıË ‚ÌØ=?ÌØÖJÌ¥/qÌzFÌuB“Ì´b”Ìš­œÌd“¤Ìz­ÌÁzºÌâ‚ÊÌß{ÍÌÊñÌvİÍÿĞÍ’Ğ%Í19ÍºG?Í-”eÍ¤PtÍ+œvÍÎzÍ1†Í†ˆÍöØ’Í›m¿ÍèóÍ¼<ÎĞ Î·3ÎßYÎÉzrÎÍ¶wÎ44¬Î² ÜÎİšóÎdmüÎú/Ï¾VÏ
+<ŠÏÁS–ÏØÄ™Ïü°ĞG“Ğ/O&Ğ„ê?Ğ2DĞ%EĞTNĞ@maĞ¦¼„Ğ|ˆ¥ĞÃ³Ğ´ÇĞŒ(æĞõÑ‚.ŒÑÛBñÑSbÒœSÒÑâ€Ò¦a•Ò1h¡Ò-½Òµ~àÒîÒ×)ÓAMÓ6HjÓ·@‚Óu‚Ó„Óo6²ÓsDºÓ¢êäÓAxÔ æ9ÔÑèºÔ:·ÜÔäÆöÔ+ÃÕçù*Õ&R3ÕpP<Õ©8sÕ—“Õ¿»ÀÕC8ÆÕƒ¬ÖÕ[•øÕØÛıÕ*¼şÕsšÖa)ÖKJÖ$’JÖ®Ë‹Ö9ZšÖ9XŸÖÔ¿ºÖÀ‚ëÖ'¤3×°AM×D(a×ŸEø×ÜË=ØÆàlØE8©Ø.ƒÙÖËÙ
+ÙvÙÇA'ÙÍzWÙÜ´†ÙÇ™ÙÉ¡Ù(§ÙDÏÒÙ åÙ¤îÙ–öÚ×.+Úd'vÚ5˜xÚ1‹ÚÕê¥Úïd§Ú¥µÚ&ÛÚ¡uêÚ¡íÚ]bûÚ®ÛãÛÂ8Û?×SÛ<1yÛ ÁÁÛù'ëÛ¿rìÛxÜ§„GÜ#îÜ¢òÜåõÜyYİgµ@İ’ÑkİjQnİY‡İÀ¹Ÿİ—¡ÆİŠ”ëİg©íİ ¡Ş¯9ŞÙäJŞØ·ŠŞ+V»ŞEßtõßD!ßŒ¾2ß{ğDßV-Qßa^ße‰ßÓxß›/ßÙ… ßñÖßê áß:~yà!ó¶à>ø¸à= Øàá¹Æ3á@'4áÚEHá ˆ]á|Çkáôµqáé?Ÿáo¤á
+6ÚánéáãUâÿÅ{â*ø›âl=¬â.³âW.ÌâÊ‡ğâ,ãQ6ãÕédãJrãï6ãFı¶ãÀ¶Èã‡…èã–‹Mä<ªä(1²ä;öÁä‘å2åğ=YåÛ~rå¼£xå³åÜ°Şå,ñúå“æo€æƒ†)æwT[æ¨r}æ 5‘æGİÂæm'İæ“Tßæ:Õâæ_¸çe-ç<Mç×èMçænç&£tçîÀÂçK9øçÎBèÆïUè82èÊ€è'‚èÁwØè2†ØèH•ãè)[sé·éÆVŒé3¦éK`÷é%`êJ''ê†%gê—wnêï°pêÿxqêˆú•ê¬9ÆêÁXÌê¶ëêë7®ë¦Åë·t0ë­6ë†-:ëoCë Çë3?#ì›+ìNœ>ìŒMìåMì–UìÖe–ì¨¬ìˆ‘³ìD£çìß)÷ìœ&ıìƒí/&í8míëİ„íÒ’ícT§í‚Æí½cÈí:÷îBStîL6~î3®°î:Ş¸îı¿îàûÓîâ²Hïbï;gïõİmïK!sï\Àï¸ëÏï*óïiVğráğKò.ğBğtLğ.`Pğ­èyğ ™ğ"d¸ğŠhäğ5Øìğõñf©ñT*Äñ×İñ 
+ò³'òm›0òÍ8`òl	kòí—xòµòKLÂò¦‘Èò¤ÖëòäNùò.eóĞ–óñÄ ó¹È ó…+)ó÷@ó&+^óq‡dó(Òló`'‚ó;«†ó Í±óf ¸óİ/ûóÖ,ôZ`ô+Ypôwgœô	ğ°ô‹Ê$õ³5/õ½R…õyy•õb…¿õoS1öFë>öQ§GöÜmJöòUYö"‚öo¬ö\²ö4&Àöo÷“ ÷7÷à¡;÷"şC÷æï{÷øl~÷Jƒ÷‰Kµ÷™ò÷Eé1ø}Ù8øäâ?øğqøá8wøÀÊ›øoë©ø–Í¯øÄ*Êø¸ÀÜøÛïİøâæèø‘Œù#Ÿùa#ù)(ùõW5ù68ùØFùC¬Lùv Mù?WùÇ@xù£=šù¤ÑÏùìIéùØøùû‘ûùŞ5úi ;úÏ‰Pú#[úÈéœú„ŒÎú1ıİúZâúq*âú¼îú{Ğ1û»’Aû1“FûÑŸXûûgfûÌdxûb=~û&EûKz¤ûOzåûF5óû‰,üQD.üÎDüÙÖUüK~ü£¬®üıŒµüJdı4§4ı¢ˆıGÙøı’ş3|ş=şjNşU|Yşjş`ónş=—ş8
+ÖştVíş™5ÿ7¬Cÿ¦ ´ÿİáŞÿÀö 2% e(A 6Fx =Ã« ÑjÂ ÛOù _ùù 6(O6ŒVÚ%œ7k¡½T«ğôqŠr_8t;§Ø{Íp“¤s/¬İ/ıRD(xgÈŠ|ãô™£§Õ‡§<ËÆxyÇ'wŞúpëïbD"éu"á1HïfÓ9x¥e}É˜Ó“°à²·Í
+¾<ˆVZï^¨D¶$
+ÅÀ¤áÍ(ı«)©e2ã÷Võ­À?éı¦j…‚?P7v8õŸÆëÓå›ÙqÒàÿç'ã&ˆÒW/eBö¤†•~»rÙ¦^	z&	¼!8	fÊC	uØD	ê§X	Céd	ãàq	¹åv	wš	s³¿	­Ã	1ùÔ	0ØŞ	¨}
+àû
+J
+JÔ.
+Õª>
+°t•
+õßÄ
+ì_Í
+D”Ş
+`±ğ
+Rnñ
+†û
+b¸'×xa*„d*õ‚/™ùœ¶"êÆƒµ;wCRÖQ€ûW÷c|HpŠ´`ßy ãI”§ù7d.@V(P	ºc6Ûnql~m™‚öc”ÓÄ¯ÔG•}µ'z~kIˆ7£©m ¶!­Æ§ŒÏu z¼%@3)ü>`ãcöqÊ6ƒ‘‡ÃWdÎ:Ó˜sİÌæIpúE9:/AÁ;C=WdßÕnÖ9Kî),¿ÏŞoã}4mÔòÜ·VúQÅ
+àf?"Z¼&NŒ1ÿ[Gz¼a>Fgİ/p,§” ÉŞøáº5ãBì¤i»vøUJÑCRº¿s<½à€¡k„¢7ú¿xñë–¸2P4%íRA„SÍ‹YßøÆ73Ô<ï%eûSÅpæA9çM¢ÿX0`e<|Ç\ºwfÂ°MÍ,äı‰ş9'	×Uh0¶÷06×xªr„¿·¡ÌH½HñÎMìĞò ×& œ(ù*SOásc&½“&{·8ÕCg°z?O•©±
+nÖZk·\í³gPG|XŠ$¼’º£r¨½<ºô²½ÍæUİ¸àåğ	‚öÇ¼(ÿ"[«ˆÅ¾¡]Ü_°M‡WVy<]W_p ,„£7 ¤§òï‘R0Xr\’`^FÄ¿îKŞöÃ*ş«)ÍN(”dIijO'u¤ê:õ= `I#ŸUgVá†±=X}äõö; ¼Rf S¹f ¤o óht 2*† ±Á A“º Î¾º Á¢Á fÎ ‡ìİ hû &‹!?|9!ã;!e
+I!ê&_!5_!ï!ˆ:¯!x¿²!ëœ´!áº!Š½å!PÁş!@ì"±""¤&"–WP"b.”"1ó"QÄ@#MÚi#„#ä)Ÿ#€BË#Rå#Pëş#F>$Ê3£$©$Ğ)%Ûv%¼¦%A8%%àŠb%…Xç%‰r&@å{&Ÿ¼³&‚Ş&¢§'»€2'éI'…ĞN'‡ƒ‚'Ñ†'l©¦'Ô™ê'„(ã™( .("T(GJY( ªr(eÌ(Ò}´(ìì')’X^)a)Æsx)ˆ†)à£î)î*p3:*I+Q*ÔÓS*ŠÃk*à’o*ßÿÉ*š±Ø*•×Ü*;Ş*òvß*Ñ{ß*$J7+©!x+Qñú+³5,3Í
+,+Y,ÿ˜G,	¶Z,	e,·©z,h0¾,ÍÇ,ºÕ,ŒŸÙ,o¡å,­ºK-yÊs-8¼’-#¾-ì#Û-Óäï-%…ø-ÕÌ.tA.x3.S.¡ÎT.˜ş|.ø–‘.ÁÅ.<ŸÖ.Ã<Ş.s¸ã.‹õæ.ÌÊ /ñ0>/!&D/-mS/ÇF•//â™/¨œÃ/Õˆâ/û0½t0…í!0å1"0+@0´:G0—¡V0‡İu0àô0pK‘0«—Î0j½Ó0û«ó0>-õ0Û*1`Ø-1©=1é¿=1…ÏÁ1èİ1êÙİ1Ó
+â1zãæ1¢ >2ğëF2dêR2äøR2Ë”2âºš2L©¼2.oÃ2©Å2
+–â2e€ù2ün3Í"3+Ü¥3ÿ‘µ3[»34‡É3ø¤4éÃ4™µ_4äi¥4 ˆ¬4Â…»4†Ìé4öèÿ4¬t+5û2e5ˆ5ß+‰5s ­5Ùô6_Œ6ã06Æ{^6ux6²´š6±îc77hp7£Ê7[š7Ùc¢7yX­7 ÿÀ7]Öß7èvà7Mâì7üù72ëš8(¼ 8PxÆ8sJÎ8²>Ú8Ş+á89%â8ó¸9™o9¦OÂ9•õç93.ö9Ô0:î- :e/:|
+0:fÒE:,¸^:®|:ºS¼:Î¼:ğüÔ:Fç:/|ê:*;˜–/;xEC;¶]V;<Ùl;øªª;Áğ;dÿ;" <‘Õ<py|<Ù¦‰<vkŒ<±ş< ÿ</.
+=-¼&=Å»B=ÏF=ØÍz=H‚=ˆ-=ùa”=8¹=óWÓ=gæØ=édü=¬>mP>î'>R÷L>‚5k>m>aL{>âX±>£Í>(ÆÎ>3ïë>Sêğ>Şz?!ÇC?a°E?&P?C<^?õÎe?@¸£?k$Æ?![@@ê
+%@<ÌU@Vf@K[u@ã~@éK@Ø9£@³Ó
+Aø4>Aö”IAXûNAíSaA–‡hAgÚiAnØ»AÇ¢ıAv%B4wB¹"Bfè1BÌBöBÄÿBFªB3ÀØB±èBDRCëåC¶ğC]”%C¦R<C‰JfCmÄnCgîC8D1ª-D`ÂRD²vD}GDM¥D-bÁD›LÊD¨äÚDMñDppEß†EŠjEdäqE¯E#K»E3u3FÜh7Fs„F(Š‡F/G­FI.G!4=GtğËG2®çG}«ëG0$H4-2HNd;HÕèXHáÅ\H¼ÈgHÑÿkH”Ò€H%FèHdòkIÓ¯lI™rpI9ìzIğ…{IyÌI9àIsäI´³õIråJ“‘Jñ1?J zJÊM‘Jû?ŸJW“ JBo£Jñ¦J¡WÂJg5KÜK9>K1K5ÇPKŞcoK’kwKc™KÓ	õK]m-L¦RL7—vL$+LVÍ—L{! L·!»LqÜÃLœ•ÌL¯ÅMv¦CM¦ÌaMpfvM†ˆ“MdpÂMbÇM	PÓMÕøÜM¨ENÍ‘ZN­ÍN‹ŞNÙ4àNjBãNãrúN¿OG™O
+ OPCHO&¬UO;·YO
+lwO÷~O~i»O”ò¼O³ÁOJJÎOÓaÓOY	İOpğO€6
+PÛLZP¹Æ€P&±ÄPdÌP×¢ÚPêÛPg#Q@5Q·AQl¶kQyQƒ~QÇ3•QÈ(›Q{¾Q¸?÷Q„&)Rgy4RøÇ9R‡úmRm­RºĞáR–méR´ÎòRô•S°S•S…‡'SıbcSò&dS$oƒS ¤‰Se]™Sf]™S PÛSĞtTu«TÄTprT´å)T6C0T>T!›nTcßwT€TbqŒTÚõÍT¯Uó÷;UÌË–U¾Õ±U¯náU	øğU¾ÿüUğ“VÓ²2V:Ú5Vâ=V9zKVÆõhVåzV"§ÄV®mÍVYÔVIÛVX)ßV¬øüVèIWÂø#Wé*Wyp0W†VW*_ÈWêXÑÅXN-+X3
+vXû€‰XÇX&¶æX¡%YŒc/YÚ\;YÆÀ>Yá´yYT*~YÔŸYÉûY>ıªYy9ÅYæŞY¨áßYûÑåY›çıY&4ZİeQZ”jZÖ]wZZ„ËZ#×Z‡KõZVgöZLc[tH[íÛ2[¼ñ‰['Âœ[$EÙ[?ÕJ\áJ\Õòw\cy\¹\¾º„\¼„\ïu°\Õëå\úæ\ó)]?†)]7[<]ê¯P]aX{]´—]’[¿]ïUÏ]e³í]p¬^C3^bV^’úW^bõb^âƒ^ÎG²^¸ª½^ó!Ã^ÖÂò^˜ô^Yú^ò¡Q_~x_ü)¯_ÆùØ_#Ş_şõæ_iÒø_3`mp`‘}`T…`V†³`I¼`V;İ`­lè`øWDaI/aa#üwa¬êa«Ê°aèæ¼aÁ¥ÏauÚaYzéa:)÷a¾Ób4†b›,Ab[Ob£©xbDÉ²b¼bñŞbòŞb<6ábJ,ùbwì]c§cÆ‰«cdÕc¡%ŞcİM÷c¢ûûc}d¹d†•d½d:§dZe_#e|Ú6eäUeÿVe4ÀWepïye{ëe–e^Ô¦eU²Úeğ$ffÿ)fW\fUš±fÂÕÕf_ğf‹ôf,Æg{¿|gZgä¼gÜÑ—g4rÜgıˆ!hU…hÁMˆh—GÙhÕaŞhİ8òh¢ñi£ñi¨ñi©ñi«ñi¬ñi­ñi®ñi¯ñi¼i(i`å(i áTi©T¶iNWíizÁñiIUöiS³#jÎ£Qj†•_jàéj	êj^Y#kEkØHk¹èJk@’k[U±k+ Ïk¶Ók½¬èkktòksl3l¤]*lM,lL›5lE«Yl¿F\lõY|l¾ó|li’}lC}l»j’lœn¸lÏšÃl˜%ØlZ½ßlÄ0?mKmÿ:^mşrmHÖtmN}mj¤€mÓ7–mS¯ümÃnÑ‚
+nğ•'nrCQnßç¸n¢£Ìn+ŠÑn56énõåïnêKünázoâ5oıF§oå>ÀoC^×odMpÄg"pC 5pí p=[“p%ô®p$<ùp,,q–'4qŸ©qq×sqàÕuq<eáqviêqi÷RrG~rr%Â‰rW¹r.¬¼rø†ÜrQZs2fgsÖf‚sƒ¡s"Ós¦?Õs(°ãsóåsàtósHtUWLtjYmt[”vteS}tƒ…tyQšt¸Îtd˜]uÁ…huvuºZvu¤Ø•u®¦u/îËu?Ñuğâ(vf‰`vZúcv4hvÖsve vvù’xvÉ¬ˆvuh¤vi¬v#»vN Îv]tèv!ôvEÍw[:wÕ4w™HwZ+#w¥&wÀk/wûqRw ŠXwãiw3{w K„w<I—w©weÇÛw6îwè x&óxâ°Hx“îaxİšlx({Šx·ª‹xß«xÔX²xš°¾x;yaS+y<+Ky‘OXy.•gybjyÆ syDwàyKŸñy£9z¤ABz†Jz|‚z=Æ‡zûzõ>¬z¿zf„İz™{D={Xr~{ë5Ò{4•ÿ{ %|E'|†1|@48|P;|z@?|œ&W|…^|õw|É§|:é}ÄÎ}†ğP}F”R}]÷…}O·“}Ğ”–}¶ˆÔ}šÈŞ}B5â}Eä}ªì}äC~õˆD~”uN~!3`~>,†~ğğö~îü~zG1X};şÊV®¢kjÆu«gÀ*ŸÄBqåğ  ƒª  }  Á.  E. î×  ¥} 3$ n ¶|  	m  Ò_  ®R  ÑÉ  ß-  · ÇV  ğ4  ZP  >b `ª QM ¸÷ \2 < áE é=  ²u ¯ -P  ŸÇ  ½t  ÒÅ R§  öf  ›  È#  ¡ í  ı0 iH {é  Ş × Ã k± P!  Yf x™ %¨  ¯  È  H7  cİ ²! ” µ  ú•  +¾ Z±  b  L ˜	  :%  w4  è  + [Ò  Pt Öb  Qj Ò‡  OÃ ü# T9  ?x ó  Á° Şv  s˜  ½™ O" 3¡ âï  9  ¸I  z^ >  ò ;í  L& P; œ l  OH  (=  àp  H¿ *´ …E  –à ÎP } I} øÄ   áî  ÎŒ  m m âk X¸  ëà  (É    =% |Í > ĞC   œ §k ªS  8‚  W8 7) Ê  > X* Ã  Ï¼  Dç “ MO IÍ Íb Şs ·R Ò  )S =  pí  ‘ #Ë a è[  Z  :µ  1 c  »ò ~«  >ï ˆ)  š‘  €- Tª  º 2s  p! Ş® Ê  ïü ¡#    Ÿ0 á8 ‘Æ ®É ïR  !  L'  ıè  k÷ ×q ™½ Ş­ äV Ë uU ‚o ©T  ß¸ ë³ X½ ;( 3®  ¸`  t)  ^ r ßˆ Û ö™ Då F: ƒ·  @V iÖ  !– Áü  2•  Œ Jğ  Ò0 à s aŞ ¾c  ´L ¦ˆ f× ğÏ jJ Ï  °ò  ÷  Á »Ü ÄÌ g1 [û  Ã±  5Ê  æ„  Öy ùJ ¡´  ’   Ù& 2f ÕÄ  İ N  ùœ F0  ½@ ›  Rø ü1  K  ‘„  nÁ  ( ZÆ E  1  Ûµ ÑN   O  |ç  JS = ÒA çD A;  Õ/  %  B	  Ağ X À İ÷  kb HÄ  Š5  g ² èT  4 e Ôz v  O E  ˆ	 -´  6A /“  l/  ¡o  »2  6ÿ Iæ  By  „Œ tI Ãç …D  / ‰[  ?  í/ Qc "< %e  ¼Ø  9  ç˜  ­H   ş$ M,  Èõ  T]  hÎ j —ú  ‘V ‚• nÄ >6  Ë  6  ÷Ÿ  Ìv Òã ½í  & F ’  -^  3.  ˆ?  Eµ “— MË  ¼  Nê  ¯  Æ  bq  †$  x  \  /O  1ü  H¦  ¢ yh  g * ¢  ÏÚ ®8  ‰  ® #„ ˆ  Z“ ¿( í  }„ É) i ­, G| õ–  d¯ µi »  % /  .  ªî  ¾  ÈØ u—  0x  ¤ÿ ê  D ¬¦  £  ê   ai íQ  wR  ’Â  h Ò¬  z P›  —n  ­ Ï ‘‘ ¢€ ¹ * A ÷ı  ˜  S  —F ç  {* ¬   ıİ u{ %ä ON  Ç  M’  ¼# İm   6   à- ´ ¾h   Œ  ’4 ¨Å  ê  j  %_  4„  µz §ı  I  ,1 ¦  6 j“      k  ßĞ  X\ íŠ  Š  [Š  Å‰  |¾ z  ş  qÑ ¡à  É $ K° ´ 	]  U¼ à$ ¥% Ÿ  Í«  Np  š  ô %l æ  §³  G  A3 Ÿ  SA  & t  °w  gØ · Û ua  Ã1 ÔÙ 
+Õ  äù 4 eQ Äí BÑ c? ë+   ºl  ØÀ  ´ u: è' áá ¤¹  nO  - <  ¯– §  R1  ¡{  :a  y¯  ÂÎ b% Î Â Ï7  Ç |Ù  R8  Uƒ °œ  š¢ ^œ  <  ‚N  P  Ï '‡  K3  ÂU "H  Oó  %  Z<  0k  .ü 8Î  Ç3 ÜŒ ÀA  Ü†  *÷ ï  Ë	 3 –Ë  E ßÿ `x kS ÜF  ºk  oµ    T  X— ÙX Õ­  ò¥ bú ıa 
+  ®‹ €İ  |š  Öÿ  F¹  ÷  p… 5  	m &3  m İä  ZU  Ü T ¢Ó è‚  ÿx }ß  á¿ >j  ¼  G ”ü  ¤ı f^  ]Ÿ  ‚  )  Ê‹  C> ÕN ¬¡ )/  Ô C&  ô&  |« ”Æ  íÚ  ìú ñ¶  ™9 ò{      —K æ% ¥M  Ÿ\ ğ @ óÈ     Ò
+ 5  şÑ ïL •    pô  Èy  
+ Ït c¼  éÑ  r êš  ¹j µ¤ R}  ­e  è½     §J <  òj Ğl ( ¤  üÂ 7İ  ôÜ  ó  Ùà 7 PÈ [ 3  " i%  {z ïy Y ' Y½  fù 5z -  UY â! ˜z ›  M ÉÆ  7{ q  N@ sõ  jŠ SX  ƒ %Ò yğ  Ê)  Âj  øó ØÓ  I:  ÂI U X/ `  ç[ Îå ©ô  Sy Á  uŒ  Éw èw ¼ ïu à Æn  ‚ó  ™Ğ 9  Ñ ö ½6  -  c< ‚.  °È ¤H ~ –c hZ Qº î. }ü F*  ¤-  ÂÌ  â  —u  "J  Š g	  ³! 0¹  eø  Ÿ ò’  c`  = «U  i5  - æ}  …   M£  Q • @ò æ½ Ä·  7   œ[ € S ¦e ˆ,  
+  ½  w˜ ¹!  T ä   ² U¶ }¦  Ï  «  mã <é  0‚ €° t 5Ü vÔ ğ¬ ì‘ à£  r  Î g5 fÙ Ñš wÄ  ‰_  €š lı  ¦Ä  ’ çS Ãİ  ËY  Š3  £]  @ˆ -º  Œ> A‘  NG 	 íÌ †ß «i  R kC 	D  )u  ‡¸  ÷x  }Ø  ÒJ  ¢ ğ qî  #ë V ßÖ  €Y ¢q ¥x ‰L :—  ² »o û` ? ïÉ 06 -« >  '  .¥  Ë>  Tz  ş  ì ª  ¤& ¯- ¬Ú Q1 z2  C4 N Û ø5  v&  ÃÒ  àr  '_ âÀ ¶  î^  )\  à  ³… ª¸ y wy  "Í «$  µš  ók  ç² np +® ms  w vn  ¯% pä ê   |†  Ä9 á(  iÚ Á, Ì·  v { k”  >1 J	 $¥ qò  <   ‚1 ¦  ×  H/ gB Y }ø «q  fö  á4 é‹ >¸ y& i¦ º  Uš  r ¦ A  Œº VC  ¤ ŸÀ y  U²  ‹  ¥^  ö çÊ  §g  `(  ‡è  B¶  ;î %Ø  OI ÿ Ÿù Ğu  A  %  ÿ÷ A   ¡J  ü( }B  O§ ßÕ  à§  ä  âã  o6 šr  ½r  eû ¦ø  ¿Ÿ t³  òU  @  wr  ôÆ  Ê  ´” Ù›  Õ z €X  ¢˜  d    ©¯ Á¢  9 ó ” e 
++ {©  † /³  ¶ &:  jä  ax  X4  µ  ”Û  u¾  lÔ  µ&  ^l ñ G~  Å	 Æ  ]+ †f  ‚T Z´  Í™  ªx  ÿA  m  ªİ *  I £  g 6©  ò+ 2N ä  ü  ¸- + «º  .' y  oñ  ÷  ) ¾  Vr   İ‘  Úo  Lm  Eô  ¨± ÔĞ Mw  ½  ¡F    A>  æ0  O  Í
+ Kå  Ø Ë‚ İ© ºÃ ‰ä  (Q  ¾ x( ‚£  ¯£  x U „d Ş  4  Ö2 Ú  –< < -õ ;š ˜N LG  Üş  Ğ% !  üÔ *5 >-  ± Ä:   (   Vo  su T" Ó£ uÿ . ’
+  Ô& ¤ğ  ¹d Ø{ <À  Fß  æ ›“  y .ù  Go Æ  gl  ü­  [² ¹Y 	J È Ó  ó  nÓ  õ{ ù¨ ÷I  _ w'  1  ¹3   # +¯ c# İ  c  d_ µ¬ f ¦E Í# ±$ wj  {È  q  ãƒ  d­ ş“  Cì  ¸ øV  ˜á .è o»  8 é" ¬ Bh    ÿu  h ùÛ  Ş– İŞ }8  ¼é  tF  An  — "  Ş C „X ‹ JÜ  E†  , ¶ ®Ÿ  ã  Êœ ï» Ç   âd  €} T‡  ’) ¦» ÔT ÈÆ fÖ ‡G  ÿj  Î( Í= Ñ  ö  kt  /  B& àí  2  2Ú Ìa  ´K  ¦”  '/ yn ÍW ĞJ öW ÑL  )ÿ  ¼+ E  À‰ E9 Ñæ ‡p  * C  ¹2 Ş¿  Ñ r0 E0  øÕ fk /Æ ˜¨ 	  ^  ù ²C ù¦   nK )4  |²  K ³ï  Ö¾ H ü,  ı —& —2 µ†  cr ü¹  x0 c é ‰È E  ›P  lÇ  ûÙ  ˆ ’#   ş'  z| ì^ ÃX  Úi  à€  Ø/  ıM W¬ 2e <n ú× ³ó  vL  P  ‡§  ıe Ğe  èÖ U 6U U÷  «¶ î1 o  Z  ×> ’Ğ  , /â  q × CÂ  Û   ‡  Hm ­{ †j Å _N P ÙH d  ¯Û L   ÀG  ,  i¥  Ú: Æù  á¤  b Xb  å  ¦É  T{ ŸI şO z  †  o 	  PØ  İ nÛ È  —Ù [ / õÌ  ‰‡ ‚V  ±1 ŸW  ¹Ç ,w ˆ¼ <€ /…  ñ u!  7­ Áf — »  õ  é” UY  ´ø Óc ‚i  ª  3 ,f  ¢  f© hñ ¹  Íf  K J   t  	 üü  
+  İœ  İ  ­Ş  â  D Î ! ˜¼  Nc  =F  éØ  êì ¤~  èÇ z2   z  ¥ ê\ ?~  ıF Ï~ S› ÷ H (  Çß  ¢" 0a £:  ‹ !. Õ  Ã* éE  wv  iş \ú  ûğ  ³Z êo  ğ ÕË  £Ò  Ô$  _Z  ßG _6  Æ¶  ì  v, N' ÷A  ¦  8  8B  KT  WŒ XÁ  ´  ±,  +  ñ± H µ  nº  ,"  ¦ß  yù  ”t  fg  Ëª  % É< Ü“ z#     _à ‰ ã   s  Ì [â Á œ»  ·p c  )ê  ×å  È_ Ö  !­  “  v:  UÆ  º  Z% Ë  @@  ® ²¡  Vÿ  #) Ow ·Î  _Í  ‹³ H¿  ä³  'Î Â  cÕ Æ¥  Ò  ;K ƒ+  ND †  ú p  32 *ó Şg  Ö  à6  " ¡| c  B[  àx |T  ÷Á s Â  é`  Q ¸G [ îq  ç 0»   5Ÿ ¤¤  q   •  Ë ¬ 
+ KJ  \Ç òß  â £¾ ?«  ¼  4 v$ ÓÂ   q _• ê2 ëû Û  ö  Á0  ƒÿ  ‚  'g  ‰v ˜   lŞ  ê7 â  ˜h b¢  Æ ¬Ö  q-  
+ ¤
+ °¹ 5Ô  ®=  îó  Ì\  /V  M( Y, 
+™ j \  Ä õP  İ! á Şm yˆ 2¾  Äa d “Ú  Q ôt  Ò  D &h   ìÛ Qh áZ  )¸  ï| - ï  0  œ Fv   ¼E  .  	: 
+Û ø  Î H #  ‚½  ÕÁ  `Ê  Qs ÅÕ †ï  yÉ ÖH  û~  Ç†  #õ  LL '  R  ı5 Å4  ¡  ¡M ì ¨ x®  10 u ıÓ ½Œ YĞ  # [$  ö²  8Ï  )W ¨? Zş  t  çø  —¬  P ñw  ’  á  ¸9  Là  BE  0B ŸÜ  9 ˆy 4+ )9  ÿ J  ;! ¥0 Ğ  $i ±Í ñ hÚ  ¹« VË ‰<  w/  íµ  m¹  ¡ú ‚á  V  õ  Yí í9  K ì]  ôŞ  ' × Ã jœ öƒ ú  âÃ  ]ı ²Ñ  F Î  õ  ù— ˆ› tÃ  ¦˜ F  :¬  x† g7 'Ó  ^Ò 6ò  s¿ ‰; @Ó Í] ´z  tM ¼  n– jW  • ?™ ª¿ KT ¥( ¼   ÎK ¾©  ï¾  ÑÍ  î  <³ é 'p )8  O Ô   üË  mã  %Ì  ¸(  àË ƒI  0  ‰Ì  9¨  <ñ  6y %  É› ½O ‚H  w pJ  Óº ¤w êª !  ›d  Ë1  g
+ NÌ  ¢—  ß¹ ıÙ Ï¨  U  !  ² fe  ˜ñ  ]
+  …- €Ÿ >Œ  ½• İ…  ÍB ~×  Q  »^ o= 	 :î  ±Ã  Cœ ”  ,l  ¡  X  r ë„ ‡ì › JD  7Ö ¥× ¼ &| ½×  !i  ã £ „’  >˜ åÅ  Î| “C  Y .R  ¼ä  ˆå  ¤ j  ¤~ 7^ Ç Í ãò  Ä  é G×  ß a òÍ Å  z ’‚ îº  `  ×'  s¤  uP ˜Õ  PÈ  Ÿª }*  ­y Ï  *x ˜{ -X V_  G  .` #2  " U ù_ N„ şİ  2Û  ‹ Ñ²  ıe  G¡  SÙ  îê  î… ‚,  Eç  ö  :À d  h  YÛ  í ¹Ï …¥ ó6 s€ ge €  & ƒÊ ’­  € –™  ²; s0  3Ş  X Š 1ı  †] jĞ ˜ İs  À  ÏÑ ¢ê v$ S’ ?ƒ  :M  *  ›  ­ “l Ñr Gß $Q c! €  ÖM Æ  ²ì  È‡ «' I)  } òÒ  â Wô ÏÄ $  Šµ   h. ¸ ç:  ;  /W  :ã  í	  … ¢Í  s ²È  d cS  ½ã  ¨ª  Ù  |Y  Ùæ  ê *ş ¥O  ±ë ƒ9  ½ Èà  Õ%  ¹ï ­¼ Yq 7	 İg 0  zW ,R é; HK  È  Œƒ  ‡À  üp ñG  ½  ;  ÎP  ª ­ Î´ À+  Áƒ †  s1  f  ñn R¤ 7  N  ã—  "‰ í OÅ  Pâ  $
+ ª F5  ŒB ¾. uE ÚQ ¨Q  '; …œ  À/ Q#  °n Ï   º5  Pd  à 5] ‡A Å$ (t  šs   –  ‹(  ? ¸³ 9Û •  KR ' w ¹Q du  «“ æ,  çz  ™  $É  Ö¸  Iæ s7  ¶Ê  çÎ ]™  ?k ´8  *‘ sk  Õh ë°  ìO  æô  ¡)  Á  £Ô  £+ •  l Ññ -œ  ©/  ,  	  c´ ª` Ù  ¢= q Ò" ÊD  †f øX  ÿ Ò ¶î Ê  3 ¿  |  U[ ÷¢ ³á  ‘•  ­. *S  å  BÂ Ÿ}  _g MÏ Şú  É5   ¦µ  'Ğ £\   ! ‹"  .Ş D ¥Â #È Iï  Õ»  .·  âY Ó¹   œ  =  çS  y  B¤  Md †s Rz Ñß fÌ zë  ®„ 3(  ÚÜ q‰   ‚;  ¦Š  8‹  ˆ  bˆ  ‹‡  7‰  ~‰  ©ˆ  ğˆ  çñ  jw iQ  ­s ™b  ~æ  ¼D 8 Ù ƒ ğ} s O# ô3  š÷  nR ,Í  =?  ± ‰ ¹ _  ÂÁ @F ª›  oÑ  "Å Q  ª*  > &  )  ÅŠ %  Ñ  ì¦ °ş ’b š¾  O–  x. i ‡  ß  C- aÉ  ñ  å- V  /+  'Á  ”!  9… Ká  i» ˆO «Ó  AÚ  Ş¼ ù '2 . ¨ Š6  _|  ‹w }m  …D ,$  Ó z¶ %  Ê Éç  À— ¿
+  	¿ Ğ0 f…  R+  ç   õ –  2™  ì• æ  ‹” Dõ  ¬Ñ •  j9 .İ «  ë?  º Ç z Ëë  „¨  ƒ » O ƒK  ¶  ùz 9ë   ¡@  `£ ­ )ş  Ö o=  š 1 i‚ ^® ÷ Ş<  àı  y`  ö/ 9 [á Š î"   C  °  ­Ö 5† à, ¼ô » "‡ ˜ã  ?  2{  9Ã  ¼è  Æâ  ¥è á˜ |°  ¼* Uf    ”3 Çä €¬ FI  2 F- ¥ó »®  îR ä2  ÒÒ “é °ü §T r 0 ( ã? Ÿ ƒz  ·’  ±;  Ï  µ½  Ô´  ®’ ¾§ ¡Ë ×*  ù) ô¯ rÜ ßì  N” Ğ;  kÓ ÄB  ÈF  èÇ   4 b\  Û8  [ üÂ  J`  Äû  Œƒ }  ¼Ú  ²/ Û Íâ Ì n  ãÈ ³ /Z " ­ö  zz <C a l l i n g C o n v e n t i o n T y p e I s I n v a l i d     LC a l l i n g C o n v e n t i o n T y p e s R e q u i r e U n m a n a g e d M   LC a n n o t C r e a t e C o n s t r u c t e d F r o m C o n s t r u c t e d ±   JC a n n o t C r e a t e C o n s t r u c t e d F r o m N o n g e n e r i c   4C a n t R e f e r e n c e C o m p i l a t i o n O f q  LC h a i n i n g S p e c u l a t i v e M o d e l I s N o t S u p p o r t e d È  C o m p i l a t i o n C a   C o u l d N o t F i n d F i l e v  *E R R _ A b s t r a c t A n d E x t e r n Ÿ  *E R R _ A b s t r a c t A n d S e a l e d Æ  4E R R _ A b s t r a c t A t t r i b u t e C l a s s ó  (E R R _ A b s t r a c t B a s e C a l l >  ^E R R _ A b s t r a c t C o n v e r s i o n N o t I n v o l v i n g C o n t a i n e d T y p e y  :E R R _ A b s t r a c t E v e n t H a s A c c e s s o r s   8E R R _ A b s t r a c t E v e n t I n i t i a l i z e r \  "E R R _ A b s t r a c t F i e l d   &E R R _ A b s t r a c t H a s B o d y ï  6E R R _ A b s t r a c t I n C o n c r e t e C l a s s :  ,E R R _ A b s t r a c t N o t V i r t u a l |  0E R R _ A b s t r a c t S e a l e d S t a t i c µ  8E R R _ A c c e s s M o d M i s s i n g A c c e s s o r ñ  <E R R _ A c c e s s o r I m p l e m e n t i n g M e t h o d   *E R R _ A d d M o d u l e A s s e m b l y   .E R R _ A d d O r R e m o v e E x p e c t e d _  2E R R _ A d d R e m o v e M u s t H a v e B o d y   PE R R _ A d d r e s s O f M e t h o d G r o u p I n E x p r e s s i o n T r e e ¬  BE R R _ A d d r e s s O f T o N o n F u n c t i o n P o i n t e r ö  6E R R _ A g n o s t i c T o M a c h i n e M o d u l e a  (E R R _ A l i a s M i s s i n g F i l e ³  "E R R _ A l i a s N o t F o u n d 	  2E R R _ A l i a s Q u a l A s E x p r e s s i o n 	  JE R R _ A l i a s Q u a l i f i e d N a m e N o t A n E x p r e s s i o n ¦	  \E R R _ A l t I n t e r p o l a t e d V e r b a t i m S t r i n g s N o t A v a i l a b l e Ş	  $E R R _ A m b i g B i n a r y O p s [
+  6E R R _ A m b i g B i n a r y O p s O n D e f a u l t 
+  PE R R _ A m b i g B i n a r y O p s O n U n c o n s t r a i n e d D e f a u l t ×
+  E R R _ A m b i g C a l l {   E R R _ A m b i g C o n t e x t Í  E R R _ A m b i g M e m b e r   "E R R _ A m b i g O v e r r i d e %  E R R _ A m b i g Q M ›  E R R _ A m b i g U D C o n v    E R R _ A m b i g U n a r y O p y  ,E R R _ A m b i g u o u s A t t r i b u t e ´  PE R R _ A n n o t a t i o n D i s a l l o w e d I n O b j e c t C r e a t i o n   .E R R _ A n o n D e l e g a t e C a n t U s e t  8E R R _ A n o n D e l e g a t e C a n t U s e L o c a l   0E R R _ A n o n M e t h G r p I n F o r E a c h •  (E R R _ A n o n M e t h T o N o n D e l İ  FE R R _ A n o n y m o u s M e t h o d T o E x p r e s s i o n T r e e 4  6E R R _ A n o n y m o u s R e t u r n E x p e c t e d   LE R R _ A n o n y m o u s T y p e D u p l i c a t e P r o p e r t y N a m e ×  :E R R _ A n o n y m o u s T y p e N o t A v a i l a b l e   RE R R _ A n o n y m o u s T y p e P r o p e r t y A s s i g n e d B a d V a l u e a  E R R _ A r g s I n v a l i d £  >E R R _ A r g u m e n t N a m e I n I T u p l e P a t t e r n ö  8E R R _ A r r a y E l e m e n t C a n t B e R e f A n y €  .E R R _ A r r a y I n i t I n B a d P l a c e ²  6E R R _ A r r a y I n i t T o N o n A r r a y T y p e ,  8E R R _ A r r a y I n i t i a l i z e r E x p e c t e d ª  FE R R _ A r r a y I n i t i a l i z e r I n c o r r e c t L e n g t h Û  ,E R R _ A r r a y O f S t a t i c C l a s s   4E R R _ A r r a y S i z e I n D e c l a r a t i o n O  6E R R _ A s M u s t H a v e R e f e r e n c e T y p e Í  $E R R _ A s N u l l a b l e T y p e a  "E R R _ A s W i t h T y p e V a r Ø  6E R R _ A s s e m b l y M a t c h B a d V e r s i o n k  6E R R _ A s s e m b l y N a m e O n N o n M o d u l e ö  DE R R _ A s s e m b l y S p e c i f i e d F o r L i n k A n d R e f W  ,E R R _ A s s g L v a l u e E x p e c t e d    E R R _ A s s g R e a d o n l y k  "E R R _ A s s g R e a d o n l y 2 2  *E R R _ A s s g R e a d o n l y L o c a l °  6E R R _ A s s g R e a d o n l y L o c a l 2 C a u s e ò  4E R R _ A s s g R e a d o n l y L o c a l C a u s e 7  (E R R _ A s s g R e a d o n l y P r o p r  ,E R R _ A s s g R e a d o n l y S t a t i c È  .E R R _ A s s g R e a d o n l y S t a t i c 2 G  4E R R _ A s s i g n R e a d o n l y N o t F i e l d Ö  6E R R _ A s s i g n R e a d o n l y N o t F i e l d 2 +  ,E R R _ A s s i g n m e n t I n i t O n l y ˆ  .E R R _ A t t r A r g W i t h T y p e V a r s M  >E R R _ A t t r D e p e n d e n t T y p e N o t A l l o w e d ‘  <E R R _ A t t r T y p e A r g C a n n o t B e T y p e V a r ö  8E R R _ A t t r i b u t e C t o r I n P a r a m e t e r A  4E R R _ A t t r i b u t e N o t O n A c c e s s o r ™  >E R R _ A t t r i b u t e N o t O n E v e n t A c c e s s o r   8E R R _ A t t r i b u t e O n B a d S y m b o l T y p e |  >E R R _ A t t r i b u t e P a r a m e t e r R e q u i r e d 1 ç  >E R R _ A t t r i b u t e P a r a m e t e r R e q u i r e d 2    JE R R _ A t t r i b u t e U s a g e O n N o n A t t r i b u t e C l a s s Z   0E R R _ A t t r i b u t e s N o t A l l o w e d ¦   dE R R _ A t t r i b u t e s R e q u i r e P a r e n t h e s i z e d L a m b d a E x p r e s s i o n Ô   HE R R _ A u t o P r o p e r t y C a n n o t B e R e f R e t u r n i n g (!  FE R R _ A u t o P r o p e r t y M u s t H a v e G e t A c c e s s o r o!  >E R R _ A u t o P r o p e r t y M u s t O v e r r i d e S e t ª!  PE R R _ A u t o P r o p e r t y W i t h S e t t e r C a n t B e R e a d O n l y "  .E R R _ A u t o P r o p s I n R o S t r u c t |"  8E R R _ A u t o S e t t e r C a n t B e R e a d O n l y à"  :E R R _ A w a i t F o r E a c h M i s s i n g M e m b e r 1#  NE R R _ A w a i t F o r E a c h M i s s i n g M e m b e r W r o n g A s y n c ç#  0E R R _ A w a i t I n U n s a f e C o n t e x t Ë$  LE R R _ B a d A b s t r a c t B i n a r y O p e r a t o r S i g n a t u r e %  8E R R _ B a d A b s t r a c t I n c D e c R e t T y p e u%  <E R R _ B a d A b s t r a c t I n c D e c S i g n a t u r e s&  JE R R _ B a d A b s t r a c t S h i f t O p e r a t o r S i g n a t u r e ç&  BE R R _ B a d A b s t r a c t S t a t i c M e m b e r A c c e s s ’'  JE R R _ B a d A b s t r a c t U n a r y O p e r a t o r S i g n a t u r e í'  E R R _ B a d A c c e s s X(  (E R R _ B a d A p p C o n f i g P a t h ’(  E R R _ B a d A r g C o u n t ´(  $E R R _ B a d A r g E x t r a R e f ñ(  E R R _ B a d A r g R e f 6)  E R R _ B a d A r g T y p e y)  <E R R _ B a d A r g T y p e D y n a m i c E x t e n s i o n ¹)  >E R R _ B a d A r g T y p e s F o r C o l l e c t i o n A d d ï*  4E R R _ B a d A r g u m e n t T o A t t r i b u t e Y+  E R R _ B a d A r i t y §+  $E R R _ B a d A r r a y S y n t a x á+  &E R R _ B a d A s s e m b l y N a m e 3,  &E R R _ B a d A s y n c A r g T y p e T,  4E R R _ B a d A s y n c E x p r e s s i o n T r e e ˜,  *E R R _ B a d A s y n c L a c k s B o d y ò,  *E R R _ B a d A s y n c L o c a l T y p e ;-  JE R R _ B a d A s y n c M e t h o d B u i l d e r T a s k P r o p e r t y {-  $E R R _ B a d A s y n c R e t u r n .  8E R R _ B a d A s y n c R e t u r n E x p r e s s i o n §.  0E R R _ B a d A t t r i b u t e A r g u m e n t /  HE R R _ B a d A t t r i b u t e P a r a m D e f a u l t A r g u m e n t ˆ/  2E R R _ B a d A t t r i b u t e P a r a m T y p e ú/  E R R _ B a d A w a i t A r g o0  0E R R _ B a d A w a i t A r g I n t r i n s i c µ0  .E R R _ B a d A w a i t A r g V o i d C a l l ×0  4E R R _ B a d A w a i t A r g _ N e e d S y s t e m ú0  0E R R _ B a d A w a i t A s I d e n t i f i e r t1  &E R R _ B a d A w a i t I n C a t c h İ1  2E R R _ B a d A w a i t I n C a t c h F i l t e r 2  *E R R _ B a d A w a i t I n F i n a l l y [2  $E R R _ B a d A w a i t I n L o c k ˜2  &E R R _ B a d A w a i t I n Q u e r y Õ2  NE R R _ B a d A w a i t I n S t a t i c V a r i a b l e I n i t i a l i z e r ‘3  0E R R _ B a d A w a i t W i t h o u t A s y n c ï3  <E R R _ B a d A w a i t W i t h o u t A s y n c L a m b d a m4  <E R R _ B a d A w a i t W i t h o u t A s y n c M e t h o d î4  DE R R _ B a d A w a i t W i t h o u t V o i d A s y n c M e t h o d °5  *E R R _ B a d A w a i t e r P a t t e r n V6  "E R R _ B a d B a s e N u m b e r 7  E R R _ B a d B a s e T y p e D7   E R R _ B a d B i n O p A r g s Y7  <E R R _ B a d B i n a r y O p e r a t o r S i g n a t u r e ™7   E R R _ B a d B i n a r y O p s á7  E R R _ B a d B o o l O p .8   E R R _ B a d B o u n d T y p e Ô8  nE R R _ B a d C a l l e r A r g u m e n t E x p r e s s i o n P a r a m W i t h o u t D e f a u l t V a l u e i9  ZE R R _ B a d C a l l e r F i l e P a t h P a r a m W i t h o u t D e f a u l t V a l u e Æ9  ^E R R _ B a d C a l l e r L i n e N u m b e r P a r a m W i t h o u t D e f a u l t V a l u e :  ^E R R _ B a d C a l l e r M e m b e r N a m e P a r a m W i t h o u t D e f a u l t V a l u e n:  $E R R _ B a d C a s t I n F i x e d Ã:  "E R R _ B a d C o C l a s s S i g 4;  "E R R _ B a d C o m p a t M o d e ³;  :E R R _ B a d C o m p i l a t i o n O p t i o n V a l u e <   E R R _ B a d C o n s t T y p e 9<  *E R R _ B a d C o n s t r a i n t T y p e e<  &E R R _ B a d C t o r A r g C o u n t î<   E R R _ B a d D e b u g T y p e *=  $E R R _ B a d D e l A r g C o u n t …=  4E R R _ B a d D e l e g a t e C o n s t r u c t o r °=  (E R R _ B a d D e l e g a t e L e a v e æ=  *E R R _ B a d D e s t r u c t o r N a m e 6>  2E R R _ B a d D i r e c t i v e P l a c e m e n t q>  0E R R _ B a d D o c u m e n t a t i o n M o d e ë>  4E R R _ B a d D y n a m i c A w a i t F o r E a c h 8?  0E R R _ B a d D y n a m i c C o n v e r s i o n ‹?  .E R R _ B a d D y n a m i c M e t h o d A r g æ?  :E R R _ B a d D y n a m i c M e t h o d A r g L a m b d a Z@  :E R R _ B a d D y n a m i c M e t h o d A r g M e m g r p A  &E R R _ B a d D y n a m i c Q u e r y ¤A  (E R R _ B a d D y n a m i c T y p e o f  B  &E R R _ B a d E m b e d d e d S t m t YB  "E R R _ B a d E m p t y T h r o w ¬B  4E R R _ B a d E m p t y T h r o w I n F i n a l l y  C  "E R R _ B a d E v e n t U s a g e šC  0E R R _ B a d E v e n t U s a g e N o F i e l d D  (E R R _ B a d E x c e p t i o n T y p e ED  &E R R _ B a d E x t e n s i o n A g g „D  (E R R _ B a d E x t e n s i o n M e t h ÕD  $E R R _ B a d E x t e r n A l i a s  E  .E R R _ B a d E x t e r n I d e n t i f i e r FE  0E R R _ B a d F i e l d T y p e I n R e c o r d ˜E  &E R R _ B a d F i n a l l y L e a v e ØE  (E R R _ B a d F i x e d I n i t T y p e F  $E R R _ B a d F o r e a c h D e c l iF  4E R R _ B a d F u n c P o i n t e r A r g C o u n t ²F  >E R R _ B a d F u n c P o i n t e r P a r a m M o d i f i e r èF  2E R R _ B a d G e t A s y n c E n u m e r a t o r AG  (E R R _ B a d G e t E n u m e r a t o r ÛG  (E R R _ B a d I n c D e c R e t T y p e bH  ,E R R _ B a d I n c D e c S i g n a t u r e ÜH  "E R R _ B a d I n d e x C o u n t 'I  E R R _ B a d I n d e x L H S aI  ,E R R _ B a d I n d e x e r N a m e A t t r °I  8E R R _ B a d I n h e r i t a n c e F r o m R e c o r d &J  &E R R _ B a d I n i t A c c e s s o r ]J  ,E R R _ B a d I n s t a n c e A r g T y p e —J  ,E R R _ B a d I t e r a t o r A r g T y p e K  0E R R _ B a d I t e r a t o r L o c a l T y p e UK  *E R R _ B a d I t e r a t o r R e t u r n ŠK  0E R R _ B a d I t e r a t o r R e t u r n R e f ÷K  ,E R R _ B a d L a n g u a g e V e r s i o n WL  "E R R _ B a d M e m b e r F l a g ¢L  .E R R _ B a d M e m b e r P r o t e c t i o n ÖL  .E R R _ B a d M o d i f i e r L o c a t i o n üL  6E R R _ B a d M o d i f i e r s O n N a m e s p a c e AM  "E R R _ B a d M o d u l e N a m e ŠM  (E R R _ B a d N a m e d A r g u m e n t ªM  JE R R _ B a d N a m e d A r g u m e n t F o r D e l e g a t e I n v o k e íM  :E R R _ B a d N a m e d A t t r i b u t e A r g u m e n t )N  BE R R _ B a d N a m e d A t t r i b u t e A r g u m e n t T y p e üN  E R R _ B a d N e w E x p r mO  >E R R _ B a d N o n T r a i l i n g N a m e d A r g u m e n t ½O  8E R R _ B a d N u l l a b l e C o n t e x t O p t i o n P  *E R R _ B a d N u l l a b l e T y p e o f ”P  :E R R _ B a d O p O n N u l l O r D e f a u l t O r N e w ßP  *E R R _ B a d O p e r a t o r S y n t a x Q  (E R R _ B a d P a r a m E x t r a R e f nQ  &E R R _ B a d P a r a m M o d T h i s °Q  E R R _ B a d P a r a m R e f R   E R R _ B a d P a r a m T y p e OR  2E R R _ B a d P a r a m e t e r M o d i f i e r s –R  0E R R _ B a d P a t t e r n E x p r e s s i o n ØR  E R R _ B a d P d b D a t a CS  &E R R _ B a d P l a t f o r m T y p e {S  (E R R _ B a d P r e f e r 3 2 O n L i b ØS  ,E R R _ B a d P r o t e c t e d A c c e s s 9T  "E R R _ B a d R e c o r d B a s e ĞT  RE R R _ B a d R e c o r d M e m b e r F o r P o s i t i o n a l P a r a m e t e r U  <E R R _ B a d R e f R e t u r n E x p r e s s i o n T r e e °U  $E R R _ B a d R e s o u r c e V i s V  E R R _ B a d R e t T y p e jV  E R R _ B a d S K k n o w n •V   E R R _ B a d S K u n k n o w n ÀV  :E R R _ B a d S h i f t O p e r a t o r S i g n a t u r e üV  *E R R _ B a d S o u r c e C o d e K i n d €W  6E R R _ B a d S p e c i a l B y R e f I t e r a t o r ËW  0E R R _ B a d S p e c i a l B y R e f L o c a l dX  *E R R _ B a d S t a c k A l l o c E x p r ÖX  E R R _ B a d S w i t c h Y  $E R R _ B a d S w i t c h V a l u e )Y   E R R _ B a d T h i s P a r a m ­Y  &E R R _ B a d T y p e A r g u m e n t 
+Z  (E R R _ B a d T y p e R e f e r e n c e FZ  $E R R _ B a d T y p e f o r T h i s µZ  E R R _ B a d U n O p A r g s [  E R R _ B a d U n a r y O p ?[  :E R R _ B a d U n a r y O p e r a t o r S i g n a t u r e ‚[  *E R R _ B a d U s i n g N a m e s p a c e Ã[   E R R _ B a d U s i n g T y p e ^\  E R R _ B a d V a r D e c l ô\  E R R _ B a d V a r a r g s N]  &E R R _ B a d V i s B a s e C l a s s µ]  .E R R _ B a d V i s B a s e I n t e r f a c e ^  E R R _ B a d V i s B o u n d o^  .E R R _ B a d V i s D e l e g a t e P a r a m É^  0E R R _ B a d V i s D e l e g a t e R e t u r n -_  &E R R _ B a d V i s E v e n t T y p e Œ_  &E R R _ B a d V i s F i e l d T y p e ê_  ,E R R _ B a d V i s I n d e x e r P a r a m F`  .E R R _ B a d V i s I n d e x e r R e t u r n «`  "E R R _ B a d V i s O p P a r a m a  $E R R _ B a d V i s O p R e t u r n ~a  &E R R _ B a d V i s P a r a m T y p e ßa  ,E R R _ B a d V i s P r o p e r t y T y p e Bb  (E R R _ B a d V i s R e t u r n T y p e ªb  &E R R _ B a d W a r n i n g L e v e l 
+c  E R R _ B a d W i n 3 2 R e s Bc  &E R R _ B a d Y i e l d I n C a t c h hc  *E R R _ B a d Y i e l d I n F i n a l l y ´c  0E R R _ B a d Y i e l d I n T r y O f C a t c h d  0E R R _ B a s e C l a s s M u s t B e F i r s t _d  4E R R _ B a s e C o n s t r a i n t C o n f l i c t ™d  E R R _ B a s e I l l e g a l æd  (E R R _ B a s e I n B a d C o n t e x t $e  (E R R _ B a s e I n S t a t i c M e t h ee  E R R _ B i n a r y F i l e ¬e  E R R _ B i n d T o B o g u s èe  (E R R _ B i n d T o B o g u s P r o p 1 f  (E R R _ B i n d T o B o g u s P r o p 2 f  <E R R _ B l o c k B o d y A n d E x p r e s s i o n B o d y g  *E R R _ B o g u s E x p l i c i t I m p l ]g  E R R _ B o g u s T y p e §g  <E R R _ B u i l d e r A t t r i b u t e D i s a l l o w e d Ïg  DE R R _ B y R e f P a r a m e t e r I n E x p r e s s i o n T r e e 9h  *E R R _ B y R e f T y p e A n d A w a i t —h  PE R R _ B y R e f e r e n c e V a r i a b l e M u s t B e I n i t i a l i z e d âh  E R R _ C S t y l e A r r a y -i  "E R R _ C a l l A r g M i x i n g "j  BE R R _ C a l l i n g B a s e F i n a l i z e D e p r e c a t e d Ìj  :E R R _ C a l l i n g F i n a l i z e D e p r e c a t e d 5k  6E R R _ C a n n o t B e C o n v e r t e d T o U T F 8 ¥k  0E R R _ C a n n o t B e M a d e N u l l a b l e ık  E R R _ C a n n o t C l o n e %l  HE R R _ C a n n o t C o n v e r t A d d r e s s O f T o D e l e g a t e }l  8E R R _ C a n n o t D e c o n s t r u c t D y n a m i c Íl  2E R R _ C a n n o t E m b e d W i t h o u t P d b m  6E R R _ C a n n o t I n f e r D e l e g a t e T y p e :m  FE R R _ C a n n o t P a s s N u l l F o r F r i e n d A s s e m b l y lm  ^E R R _ C a n n o t S p e c i f y M a n a g e d W i t h U n m a n a g e d S p e c i f i e r s «m  PE R R _ C a n n o t U s e F u n c t i o n P o i n t e r A s F i x e d L o c a l 'n  \E R R _ C a n n o t U s e M a n a g e d T y p e I n U n m a n a g e d C a l l e r s O n l y n  \E R R _ C a n n o t U s e R e d u c e d E x t e n s i o n M e t h o d I n A d d r e s s O f ôn  LE R R _ C a n n o t U s e R e f I n U n m a n a g e d C a l l e r s O n l y Uo  hE R R _ C a n n o t U s e S e l f A s I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t Åo  2E R R _ C a n t C a l l S p e c i a l M e t h o d Dp  <E R R _ C a n t C h a n g e A c c e s s O n O v e r r i d e Œp  @E R R _ C a n t C h a n g e I n i t O n l y O n O v e r r i d e ïp  BE R R _ C a n t C h a n g e R e f R e t u r n O n O v e r r i d e Gq  DE R R _ C a n t C h a n g e R e t u r n T y p e O n O v e r r i d e ˜q  DE R R _ C a n t C h a n g e T u p l e N a m e s O n O v e r r i d e îq  8E R R _ C a n t C h a n g e T y p e O n O v e r r i d e Kr  8E R R _ C a n t C o n v A n o n M e t h N o P a r a m s –r  4E R R _ C a n t C o n v A n o n M e t h P a r a m s .s  <E R R _ C a n t C o n v A n o n M e t h R e t u r n T y p e ´s  6E R R _ C a n t C o n v A n o n M e t h R e t u r n s -t  @E R R _ C a n t C o n v A s y n c A n o n F u n c R e t u r n s ât  8E R R _ C a n t D e r i v e F r o m S e a l e d T y p e ‡u  6E R R _ C a n t H a v e W i n 3 2 R e s A n d I c o n ¾u  >E R R _ C a n t H a v e W i n 3 2 R e s A n d M a n i f e s t v  2E R R _ C a n t I n f e r M e t h T y p e A r g s av  (E R R _ C a n t M a k e T e m p F i l e ìv  *E R R _ C a n t O p e n F i l e W r i t e  w   E R R _ C a n t O p e n I c o n Vw  2E R R _ C a n t O p e n W i n 3 2 M a n i f e s t …w  (E R R _ C a n t O p e n W i n 3 2 R e s ¼w  6E R R _ C a n t O v e r r i d e B o g u s M e t h o d ùw  0E R R _ C a n t O v e r r i d e N o n E v e n t Ix  6E R R _ C a n t O v e r r i d e N o n F u n c t i o n ‡x  6E R R _ C a n t O v e r r i d e N o n P r o p e r t y Îx  4E R R _ C a n t O v e r r i d e N o n V i r t u a l y  ,E R R _ C a n t O v e r r i d e S e a l e d •y  ,E R R _ C a n t R e a d C o n f i g F i l e æy  (E R R _ C a n t R e a d R e s o u r c e (z  .E R R _ C a n t R e a d R u l e s e t F i l e Nz  &E R R _ C a n t R e f R e s o u r c e ƒz  $E R R _ C a n t R e t u r n V o i d Èz  0E R R _ C a n t S e t W i n 3 2 M a n i f e s t {  6E R R _ C a n t U s e I n O r O u t I n A r g l i s t ;{  8E R R _ C a n t U s e R e q u i r e d A t t r i b u t e {{  0E R R _ C a n t U s e V o i d I n A r g l i s t ·{  :E R R _ C h e c k e d O p e r a t o r N e e d s M a t c h ê{  &E R R _ C h e c k e d O v e r f l o w I|  $E R R _ C i r c C o n s t V a l u e |   E R R _ C i r c u l a r B a s e Ş|  ,E R R _ C i r c u l a r C o n s t r a i n t }  ,E R R _ C l a s s B o u n d N o t F i r s t Z}  BE R R _ C l a s s D o e s n t I m p l e m e n t I n t e r f a c e ®}  *E R R _ C l a s s T y p e E x p e c t e d æ}  6E R R _ C l o n e D i s a l l o w e d I n R e c o r d "~  ,E R R _ C l o s e P a r e n E x p e c t e d c~  \E R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r N o t P u b l i c o~  \E R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r N o t S t a t i c ì~  VE R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r S t a t i c w  dE R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r W r o n g I n i t O n l y €  fE R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r W r o n g R e f R e t u r n \€  hE R R _ C l o s e U n i m p l e m e n t e d I n t e r f a c e M e m b e r W r o n g R e t u r n T y p e ñ€  8E R R _ C m d O p t i o n C o n f l i c t s S o u r c e €  .E R R _ C o l C o l W i t h T y p e A l i a s Ò  JE R R _ C o l l e c t i o n I n i t R e q u i r e s I E n u m e r a b l e E‚  *E R R _ C o m I m p o r t W i t h B a s e Í‚  *E R R _ C o m I m p o r t W i t h I m p l "ƒ  :E R R _ C o m I m p o r t W i t h I n i t i a l i z e r s jƒ  2E R R _ C o m I m p o r t W i t h U s e r C t o r Æƒ  BE R R _ C o m I m p o r t W i t h o u t U u i d A t t r i b u t e „  <E R R _ C o m R e f C a l l I n E x p r e s s i o n T r e e \„  (E R R _ C o m p i l e C a n c e l l e d Ò„  <E R R _ C o m p i l e r A n d L a n g u a g e V e r s i o n ø„  .E R R _ C o n W i t h U n m a n a g e d C o n 2…  "E R R _ C o n W i t h V a l C o n ±…  .E R R _ C o n c r e t e M i s s i n g B o d y -†  <E R R _ C o n d i t i o n a l I n I n t e r p o l a t i o n ††  :E R R _ C o n d i t i o n a l M u s t R e t u r n V o i d E‡  @E R R _ C o n d i t i o n a l O n I n t e r f a c e M e t h o d ‡  <E R R _ C o n d i t i o n a l O n L o c a l F u n c t i o n Ş‡  DE R R _ C o n d i t i o n a l O n N o n A t t r i b u t e C l a s s )ˆ  2E R R _ C o n d i t i o n a l O n O v e r r i d e oˆ  <E R R _ C o n d i t i o n a l O n S p e c i a l M e t h o d ¾ˆ  6E R R _ C o n d i t i o n a l W i t h O u t P a r a m [‰  4E R R _ C o n f l i c t A l i a s A n d M e m b e r •‰  BE R R _ C o n f l i c t i n g A l i a s A n d D e f i n i t i o n Ü‰  8E R R _ C o n f l i c t i n g M a c h i n e M o d u l e Š  &E R R _ C o n s t O u t O f R a n g e [Š  4E R R _ C o n s t O u t O f R a n g e C h e c k e d ™Š  ,E R R _ C o n s t V a l u e R e q u i r e d ‹  (E R R _ C o n s t a n t E x p e c t e d 2‹  :E R R _ C o n s t a n t P a t t e r n V s O p e n T y p e R‹  2E R R _ C o n s t a n t S t r i n g T o o L o n g Œ  6E R R _ C o n s t r a i n t I s S t a t i c C l a s s ÀŒ  LE R R _ C o n s t r a i n t O n l y A l l o w e d O n G e n e r i c D e c l   BE R R _ C o n s t r u c t e d D y n a m i c T y p e A s B o u n d K  8E R R _ C o n s t r u c t o r I n S t a t i c C l a s s ~  NE R R _ C o n v e r s i o n N o t I n v o l v i n g C o n t a i n e d T y p e ¸  @E R R _ C o n v e r s i o n N o t T u p l e C o m p a t i b l e   ,E R R _ C o n v e r s i o n W i t h B a s e a  2E R R _ C o n v e r s i o n W i t h D e r i v e d ½  6E R R _ C o n v e r s i o n W i t h I n t e r f a c e   0E R R _ C o n v e r t T o S t a t i c C l a s s w  `E R R _ C o p y C o n s t r u c t o r M u s t I n v o k e B a s e C o p y C o n s t r u c t o r ¬  JE R R _ C o p y C o n s t r u c t o r W r o n g A c c e s s i b i l i t y X  (E R R _ C r y p t o H a s h F a i l e d ¾  >E R R _ C y c l e I n I n t e r f a c e I n h e r i t a n c e î  0E R R _ C y c l e I n T y p e F o r w a r d e r 9‘  XE R R _ D e b u g E n t r y P o i n t N o t S o u r c e M e t h o d D e f i n i t i o n ƒ‘  "E R R _ D e c C o n s t E r r o r î‘  JE R R _ D e c l a r a t i o n E x p r e s s i o n N o t P e r m i t t e d $’  HE R R _ D e c o n s t r u c t P a r a m e t e r N a m e M i s m a t c h X’  BE R R _ D e c o n s t r u c t R e q u i r e s E x p r e s s i o n š’  :E R R _ D e c o n s t r u c t T o o F e w E l e m e n t s ì’  >E R R _ D e c o n s t r u c t W r o n g C a r d i n a l i t y '“  \E R R _ D e c o n s t r u c t i o n V a r F o r m D i s a l l o w s S p e c i f i c T y p e y“  BE R R _ D e f a u l t C o n s t r a i n t O v e r r i d e O n l y Ô“  ZE R R _ D e f a u l t I n t e r f a c e I m p l e m e n t a t i o n I n N o P I A T y p e M”  <E R R _ D e f a u l t L i t e r a l N o T a r g e t T y p e ÷”  4E R R _ D e f a u l t L i t e r a l N o t V a l i d ,•  <E R R _ D e f a u l t M e m b e r O n I n d e x e d T y p e e•  $E R R _ D e f a u l t P a t t e r n Á•  8E R R _ D e f a u l t V a l u e B a d V a l u e T y p e ‚–  FE R R _ D e f a u l t V a l u e B e f o r e R e q u i r e d V a l u e Ô–  JE R R _ D e f a u l t V a l u e F o r E x t e n s i o n P a r a m e t e r %—  DE R R _ D e f a u l t V a l u e F o r P a r a m s P a r a m e t e r n—  <E R R _ D e f a u l t V a l u e M u s t B e C o n s t a n t ½—  4E R R _ D e f a u l t V a l u e N o t A l l o w e d ˜  :E R R _ D e f a u l t V a l u e T y p e M u s t M a t c h D˜  DE R R _ D e f a u l t V a l u e U s e d W i t h A t t r i b u t e s §˜  2E R R _ D e l e g a t e O n C o n d i t i o n a l ™  ,E R R _ D e l e g a t e O n N u l l a b l e ’™  .E R R _ D e l e g a t e R e f M i s m a t c h ó™  DE R R _ D e p r e c a t e d C o l l e c t i o n I n i t A d d S t r 4š  .E R R _ D e p r e c a t e d S y m b o l S t r §š  @E R R _ D e r i v e F r o m C o n s t r u c t e d D y n a m i c Áš  *E R R _ D e r i v e F r o m D y n a m i c ›  :E R R _ D e r i v e F r o m E n u m O r V a l u e T y p e 9›  ,E R R _ D e r i v i n g F r o m A T y V a r k›  LE R R _ D e s i g n a t o r B e n e a t h P a t t e r n C o m b i n a t o r ³›  6E R R _ D e s t r u c t o r I n S t a t i c C l a s s ÷›  RE R R _ D i c t i o n a r y I n i t i a l i z e r I n E x p r e s s i o n T r e e &œ  <E R R _ D i s c a r d C a n n o t B e N u l l C h e c k e d ˆœ  FE R R _ D i s c a r d P a t t e r n I n S w i t c h S t a t e m e n t Ëœ  <E R R _ D i s c a r d T y p e I n f e r e n c e F a i l e d „  8E R R _ D l l I m p o r t O n G e n e r i c M e t h o d Æ  8E R R _ D l l I m p o r t O n I n v a l i d M e t h o d F  6E R R _ D o N o t U s e F i x e d B u f f e r A t t r ¡  JE R R _ D o N o t U s e F i x e d B u f f e r A t t r O n P r o p e r t y Ÿ  E R R _ D o c F i l e G e n mŸ  NE R R _ D o e s N o t O v e r r i d e B a s e E q u a l i t y C o n t r a c t ¢Ÿ  :E R R _ D o e s N o t O v e r r i d e B a s e M e t h o d ÙŸ  FE R R _ D o e s N o t O v e r r i d e M e t h o d F r o m O b j e c t    BE R R _ D o e s n t I m p l e m e n t A w a i t I n t e r f a c e B   >E R R _ D o t t e d T y p e N a m e N o t F o u n d I n A g g _   <E R R _ D o t t e d T y p e N a m e N o t F o u n d I n N S    BE R R _ D o t t e d T y p e N a m e N o t F o u n d I n N S F w d  ¡  E R R _ D u p P a r a m M o d ©¡  (E R R _ D u p R e t u r n T y p e M o d Ş¡  *E R R _ D u p l i c a t e A c c e s s o r ¢  $E R R _ D u p l i c a t e A l i a s D¢  ,E R R _ D u p l i c a t e A t t r i b u t e ¢  BE R R _ D u p l i c a t e A t t r i b u t e I n N e t M o d u l e ˜¢  $E R R _ D u p l i c a t e B o u n d º¢  ,E R R _ D u p l i c a t e C a s e L a b e l ö¢  :E R R _ D u p l i c a t e C o n s t r a i n t C l a u s e ?£  <E R R _ D u p l i c a t e C o n v e r s i o n I n C l a s s õ£  2E R R _ D u p l i c a t e E x p l i c i t I m p l 0¤  4E R R _ D u p l i c a t e G e n e r a t e d N a m e g¤  &E R R _ D u p l i c a t e I m p o r t Æ¤  2E R R _ D u p l i c a t e I m p o r t S i m p l e >¥  @E R R _ D u p l i c a t e I n t e r f a c e I n B a s e L i s t Ü¥  ^E R R _ D u p l i c a t e I n t e r f a c e W i t h D i f f e r e n c e s I n B a s e L i s t ¦  \E R R _ D u p l i c a t e I n t e r f a c e W i t h T u p l e N a m e s I n B a s e L i s t V¦  $E R R _ D u p l i c a t e L a b e l Ê¦  *E R R _ D u p l i c a t e M o d i f i e r ì¦  0E R R _ D u p l i c a t e N a m e I n C l a s s §  *E R R _ D u p l i c a t e N a m e I n N S =§  4E R R _ D u p l i c a t e N a m e d A r g u m e n t w§  FE R R _ D u p l i c a t e N a m e d A t t r i b u t e A r g u m e n t »§  8E R R _ D u p l i c a t e N u l l S u p p r e s s i o n é§  ,E R R _ D u p l i c a t e P a r a m N a m e ¨  >E R R _ D u p l i c a t e P r o p e r t y A c c e s s M o d s C¨  BE R R _ D u p l i c a t e P r o p e r t y R e a d O n l y M o d s ¶¨  4E R R _ D u p l i c a t e T y p e F o r w a r d e r t©  4E R R _ D u p l i c a t e T y p e P a r a m e t e r ©  6E R R _ D y n a m i c A t t r i b u t e M i s s i n g ¾©  NE R R _ D y n a m i c L o c a l F u n c t i o n P a r a m s P a r a m e t e r Pª  JE R R _ D y n a m i c L o c a l F u n c t i o n T y p e P a r a m e t e r ½ª  >E R R _ D y n a m i c R e q u i r e d T y p e s M i s s i n g =«  ,E R R _ D y n a m i c T y p e A s B o u n d Æ«  E R R _ E O F E x p e c t e d ô«  8E R R _ E l s e C a n n o t S t a r t S t a t e m e n t 4¬  $E R R _ E m p t y C h a r C o n s t _¬  6E R R _ E m p t y E l e m e n t I n i t i a l i z e r {¬  0E R R _ E m p t y F o r m a t S p e c i f i e r ®¬  E R R _ E m p t y Y i e l d Ï¬  *E R R _ E n c N o P I A R e f e r e n c e ÷¬  :E R R _ E n c R e f e r e n c e T o A d d e d M e m b e r Y­  LE R R _ E n c U p d a t e F a i l e d D e l e g a t e T y p e C h a n g e d Ù­  FE R R _ E n c U p d a t e F a i l e d M i s s i n g A t t r i b u t e )®  4E R R _ E n c o d i n g l e s s S y n t a x T r e e m®  .E R R _ E n d O f P P L i n e E x p e c t e d Ï®  <E R R _ E n d R e g i o n D i r e c t i v e E x p e c t e d ¯  4E R R _ E n d i f D i r e c t i v e E x p e c t e d #¯  TE R R _ E n t r y P o i n t C a n n o t B e U n m a n a g e d C a l l e r s O n l y =¯  ,E R R _ E n u m e r a t o r O v e r f l o w ˜¯  LE R R _ E n u m s C a n t C o n t a i n D e f a u l t C o n s t r u c t o r â¯  DE R R _ E q u a l i t y C o n t r a c t R e q u i r e s G e t t e r $°  >E R R _ E r r o r B u i l d i n g W i n 3 2 R e s o u r c e s |°  $E R R _ E r r o r D i r e c t i v e §°  :E R R _ E r r o r I n R e f e r e n c e d A s s e m b l y ¶°  E R R _ E s c a p e C a l l æ°  E R R _ E s c a p e C a l l 2 Œ±  E R R _ E s c a p e L o c a l ?²  E R R _ E s c a p e O t h e r Ç²  (E R R _ E s c a p e S t a c k A l l o c K³   E R R _ E s c a p e d C u r l y â³  6E R R _ E v e n t N e e d s B o t h A c c e s s o r s O´  (E R R _ E v e n t N o t D e l e g a t e –´  >E R R _ E x p e c t e d C o n t e x t u a l K e y w o r d B y Â´  FE R R _ E x p e c t e d C o n t e x t u a l K e y w o r d E q u a l s ê´  >E R R _ E x p e c t e d C o n t e x t u a l K e y w o r d O n µ  $E R R _ E x p e c t e d E n d T r y >µ  $E R R _ E x p e c t e d P P F i l e Yµ  2E R R _ E x p e c t e d S e l e c t O r G r o u p ‚µ  0E R R _ E x p e c t e d S i n g l e S c r i p t Ëµ  6E R R _ E x p e c t e d V e r b a t i m L i t e r a l ¶  .E R R _ E x p l i c i t D y n a m i c A t t r v¶  4E R R _ E x p l i c i t E v e n t F i e l d I m p l á¶  *E R R _ E x p l i c i t E x t e n s i o n F·  BE R R _ E x p l i c i t I m p l C o l l i s i o n O n R e f O u t °·  ,E R R _ E x p l i c i t I m p l P a r a m s c¸  bE R R _ E x p l i c i t I m p l e m e n t a t i o n O f O p e r a t o r s M u s t B e S t a t i c ¦¸  jE R R _ E x p l i c i t I n t e r f a c e I m p l e m e n t a t i o n I n N o n C l a s s O r S t r u c t ¹  ^E R R _ E x p l i c i t I n t e r f a c e I m p l e m e n t a t i o n N o t I n t e r f a c e ¹  <E R R _ E x p l i c i t M e t h o d I m p l A c c e s s o r Ó¹  :E R R _ E x p l i c i t N u l l a b l e A t t r i b u t e 6º  ,E R R _ E x p l i c i t P a r a m A r r a y šº  DE R R _ E x p l i c i t P r o p e r t y A d d i n g A c c e s s o r àº  HE R R _ E x p l i c i t P r o p e r t y M i s m a t c h I n i t O n l y )»  FE R R _ E x p l i c i t P r o p e r t y M i s s i n g A c c e s s o r v»  0E R R _ E x p l i c i t R e s e r v e d A t t r Á»  LE R R _ E x p l i c i t T u p l e E l e m e n t N a m e s A t t r i b u t e ü»  PE R R _ E x p o r t e d T y p e C o n f l i c t s W i t h D e c l a r a t i o n ª¼  2E R R _ E x p o r t e d T y p e s C o n f l i c t ½  *E R R _ E x p r C a n n o t B e F i x e d ½  ,E R R _ E x p r e s s i o n E x p e c t e d Æ½  .E R R _ E x p r e s s i o n H a s N o N a m e Û½  FE R R _ E x p r e s s i o n O r D e c l a r a t i o n E x p e c t e d û½  jE R R _ E x p r e s s i o n T r e e C a n t C o n t a i n N u l l C o a l e s c i n g A s s i g n m e n t 0¾  LE R R _ E x p r e s s i o n T r e e C a n t C o n t a i n R e f S t r u c t |¾  hE R R _ E x p r e s s i o n T r e e C o n t a i n s A b s t r a c t S t a t i c M e m b e r A c c e s s â¾  RE R R _ E x p r e s s i o n T r e e C o n t a i n s A n o n y m o u s M e t h o d B¿  HE R R _ E x p r e s s i o n T r e e C o n t a i n s A s s i g n m e n t ‘¿  JE R R _ E x p r e s s i o n T r e e C o n t a i n s B a d C o a l e s c e Ú¿  HE R R _ E x p r e s s i o n T r e e C o n t a i n s B a s e A c c e s s _À  BE R R _ E x p r e s s i o n T r e e C o n t a i n s D i s c a r d À  TE R R _ E x p r e s s i o n T r e e C o n t a i n s D y n a m i c O p e r a t i o n ×À  `E R R _ E x p r e s s i o n T r e e C o n t a i n s F r o m E n d I n d e x E x p r e s s i o n Á  RE R R _ E x p r e s s i o n T r e e C o n t a i n s I n d e x e d P r o p e r t y wÁ  zE R R _ E x p r e s s i o n T r e e C o n t a i n s I n t e r p o l a t e d S t r i n g H a n d l e r C o n v e r s i o n ¼Á  BE R R _ E x p r e s s i o n T r e e C o n t a i n s I s M a t c h +Â  NE R R _ E x p r e s s i o n T r e e C o n t a i n s L o c a l F u n c t i o n †Â  tE R R _ E x p r e s s i o n T r e e C o n t a i n s M u l t i D i m e n s i o n a l A r r a y I n i t i a l i z e r ×Â  NE R R _ E x p r e s s i o n T r e e C o n t a i n s N a m e d A r g u m e n t 0Ã  TE R R _ E x p r e s s i o n T r e e C o n t a i n s O p t i o n a l A r g u m e n t …Ã  JE R R _ E x p r e s s i o n T r e e C o n t a i n s O u t V a r i a b l e åÃ  `E R R _ E x p r e s s i o n T r e e C o n t a i n s P a t t e r n I m p l i c i t I n d e x e r AÄ  FE R R _ E x p r e s s i o n T r e e C o n t a i n s P o i n t e r O p ©Ä  RE R R _ E x p r e s s i o n T r e e C o n t a i n s R a n g e E x p r e s s i o n ùÄ  TE R R _ E x p r e s s i o n T r e e C o n t a i n s S w i t c h E x p r e s s i o n IÅ  RE R R _ E x p r e s s i o n T r e e C o n t a i n s T h r o w E x p r e s s i o n ŒÅ  HE R R _ E x p r e s s i o n T r e e C o n t a i n s T u p l e B i n O p ÎÅ  RE R R _ E x p r e s s i o n T r e e C o n t a i n s T u p l e C o n v e r s i o n Æ  LE R R _ E x p r e s s i o n T r e e C o n t a i n s T u p l e L i t e r a l ]Æ  XE R R _ E x p r e s s i o n T r e e C o n t a i n s U T F 8 S t r i n g L i t e r a l s Æ  PE R R _ E x p r e s s i o n T r e e C o n t a i n s W i t h E x p r e s s i o n åÆ  DE R R _ E x p r e s s i o n T r e e M u s t H a v e D e l e g a t e &Ç  2E R R _ E x t e n s i o n A t t r N o t F o u n d Ç  rE R R _ E x t e n s i o n C o l l e c t i o n E l e m e n t I n i t i a l i z e r I n E x p r e s s i o n T r e e QÈ  0E R R _ E x t e n s i o n M e t h o d s D e c l ÉÈ  .E R R _ E x t e r n A f t e r E l e m e n t s ;É  2E R R _ E x t e r n A l i a s N o t A l l o w e d É  4E R R _ E x t e r n E v e n t I n i t i a l i z e r ÍÉ  "E R R _ E x t e r n H a s B o d y Ê  FE R R _ E x t e r n H a s C o n s t r u c t o r I n i t i a l i z e r 3Ê  (E R R _ F e a t u r e I n P r e v i e w xÊ  2E R R _ F e a t u r e I s E x p e r i m e n t a l Ë  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 1 nË  DE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 1 0 ËË  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 2 +Ì  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 3 ˆÌ  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 4 åÌ  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 5 BÍ  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 6 ŸÍ  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 7 üÍ  FE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 7 _ 1 [Î  FE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 7 _ 2 ºÎ  FE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 7 _ 3 Ï  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 8 xÏ  FE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 8 _ 0 ×Ï  BE R R _ F e a t u r e N o t A v a i l a b l e I n V e r s i o n 9 6Ğ  FE R R _ F e a t u r e N o t V a l i d I n E x p r e s s i o n T r e e •Ğ  @E R R _ F i e l d A u t o P r o p C a n t B e B y R e f L i k e ÇĞ  *E R R _ F i e l d C a n t B e R e f A n y WÑ  2E R R _ F i e l d C a n t H a v e V o i d T y p e ‰Ñ  TE R R _ F i e l d H a s M u l t i p l e D i s t i n c t C o n s t a n t V a l u e s ªÑ  2E R R _ F i e l d I n i t R e f N o n s t a t i c İÑ  @E R R _ F i e l d L i k e E v e n t C a n t B e R e a d O n l y GÒ  :E R R _ F i e l d l i k e E v e n t s I n R o S t r u c t ˆÒ  (E R R _ F i e l d s I n R o S t r u c t ×Ò   E R R _ F i l e N o t F o u n d #Ó  @E R R _ F i l e S c o p e d A n d N o r m a l N a m e s p a c e VÓ  TE R R _ F i l e S c o p e d N a m e s p a c e N o t B e f o r e A l l M e m b e r s ³Ó  .E R R _ F i x e d B u f f e r N o t F i x e d 
+Ô  @E R R _ F i x e d B u f f e r T o o M a n y D i m e n s i o n s yÔ  *E R R _ F i x e d D i m s R e q u i r e d ©Ô  ,E R R _ F i x e d L o c a l I n L a m b d a Õ  "E R R _ F i x e d M u s t I n i t …Õ  E R R _ F i x e d N e e d e d ÒÕ  (E R R _ F i x e d N e e d s L v a l u e @Ö  (E R R _ F i x e d N o t I n S t r u c t Ö  $E R R _ F i x e d N o t N e e d e d ÑÖ  "E R R _ F i x e d O v e r f l o w )×  "E R R _ F l o a t O v e r f l o w q×  0E R R _ F o r E a c h M i s s i n g M e m b e r µ×  DE R R _ F o r E a c h M i s s i n g M e m b e r W r o n g A s y n c SØ  RE R R _ F o r w a r d e d T y p e C o n f l i c t s W i t h D e c l a r a t i o n +Ù  TE R R _ F o r w a r d e d T y p e C o n f l i c t s W i t h E x p o r t e d T y p e Ù  >E R R _ F o r w a r d e d T y p e I n T h i s A s s e m b l y úÙ  2E R R _ F o r w a r d e d T y p e I s N e s t e d ]Ú  4E R R _ F o r w a r d e d T y p e s C o n f l i c t °Ú  2E R R _ F r i e n d A s s e m b l y B a d A r g s !Û  .E R R _ F r i e n d A s s e m b l y S N R e q àÛ  6E R R _ F r i e n d R e f N o t E q u a l T o T h i s ˆÜ  8E R R _ F r i e n d R e f S i g n i n g M i s m a t c h Hİ  6E R R _ F u n c P t r M e t h M u s t B e S t a t i c æİ  ,E R R _ F u n c P t r R e f M i s m a t c h JŞ  ^E R R _ F u n c t i o n P o i n t e r T y p e s I n A t t r i b u t e N o t S u p p o r t e d ’Ş  hE R R _ F u n c t i o n P o i n t e r s C a n n o t B e C a l l e d W i t h N a m e d A r g u m e n t s ñŞ  6E R R _ G e n e r i c A r g I s S t a t i c C l a s s 9ß  †E R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d I n t e r f a c e W i t h S t a t i c A b s t r a c t M e m b e r s €ß  ZE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d N u l l a b l e E n u m Eà  dE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d N u l l a b l e I n t e r f a c e ÷à  PE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d R e f T y p e ûá  LE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d T y V a r ¡â  PE R R _ G e n e r i c C o n s t r a i n t N o t S a t i s f i e d V a l T y p e Xã  @E R R _ G e n e r i c s U s e d A c r o s s A s s e m b l i e s ëã  6E R R _ G e n e r i c s U s e d I n N o P I A T y p e ”ä  (E R R _ G e t O r S e t E x p e c t e d 7å  <E R R _ G l o b a l A t t r i b u t e s N o t A l l o w e d Vå  8E R R _ G l o b a l A t t r i b u t e s N o t F i r s t —å  NE R R _ G l o b a l D e f i n i t i o n O r S t a t e m e n t E x p e c t e d :æ  *E R R _ G l o b a l E x t e r n A l i a s {æ  @E R R _ G l o b a l S i n g l e T y p e N a m e N o t F o u n d ­æ  FE R R _ G l o b a l S i n g l e T y p e N a m e N o t F o u n d F w d +ç  &E R R _ G l o b a l S t a t e m e n t Õç  4E R R _ G l o b a l U s i n g I n N a m e s p a c e è  2E R R _ G l o b a l U s i n g O u t O f O r d e r pè  @E R R _ G o T o B a c k w a r d J u m p O v e r U s i n g V a r Áè  >E R R _ G o T o F o r w a r d J u m p O v e r U s i n g V a r é  "E R R _ H a s N o T y p e V a r s bé  4E R R _ H i d d e n P o s i t i o n a l M e m b e r ªé  0E R R _ H i d i n g A b s t r a c t M e t h o d ê  ,E R R _ I d e n t i f i e r E x p e c t e d /ê  0E R R _ I d e n t i f i e r E x p e c t e d K W Gê  ,E R R _ I d e n t i t y C o n v e r s i o n {ê  $E R R _ I l l e g a l A r g l i s t Éê  *E R R _ I l l e g a l A t S e q u e n c e )ë  "E R R _ I l l e g a l E s c a p e ñë  (E R R _ I l l e g a l F i x e d T y p e ì  ,E R R _ I l l e g a l I n n e r U n s a f e ¬ì  "E R R _ I l l e g a l P a r a m s äì  &E R R _ I l l e g a l R e f P a r a m í  (E R R _ I l l e g a l S t a t e m e n t 8í  ,E R R _ I l l e g a l S u p p r e s s i o n Äí  "E R R _ I l l e g a l U n s a f e ÿí  $E R R _ I l l e g a l V a r A r g s Nî  2E R R _ I l l e g a l V a r i a n c e S y n t a x xî  ,E R R _ I m p l B a d C o n s t r a i n t s ï  *E R R _ I m p l B a d T u p l e N a m e s ôï  VE R R _ I m p l i c i t C o n v e r s i o n O p e r a t o r C a n t B e C h e c k e d ¢ğ  hE R R _ I m p l i c i t I m p l e m e n t a t i o n O f N o n P u b l i c I n t e r f a c e M e m b e r íğ  @E R R _ I m p l i c i t I n d e x I n d e x e r W i t h N a m e œñ  VE R R _ I m p l i c i t O b j e c t C r e a t i o n I l l e g a l T a r g e t T y p e ìñ  LE R R _ I m p l i c i t O b j e c t C r e a t i o n N o T a r g e t T y p e .ò  DE R R _ I m p l i c i t O b j e c t C r e a t i o n N o t V a l i d Vò  @E R R _ I m p l i c i t R a n g e I n d e x e r W i t h N a m e …ò  DE R R _ I m p l i c i t l y T y p e d A r r a y N o B e s t T y p e ×ò  JE R R _ I m p l i c i t l y T y p e d L o c a l C a n n o t B e F i x e d  ó  nE R R _ I m p l i c i t l y T y p e d O u t V a r i a b l e U s e d I n T h e S a m e A r g u m e n t L i s t [ó  fE R R _ I m p l i c i t l y T y p e d V a r i a b l e A s s i g n e d A r r a y I n i t i a l i z e r Æó  VE R R _ I m p l i c i t l y T y p e d V a r i a b l e A s s i g n e d B a d V a l u e %ô  PE R R _ I m p l i c i t l y T y p e d V a r i a b l e C a n n o t B e C o n s t hô  ZE R R _ I m p l i c i t l y T y p e d V a r i a b l e M u l t i p l e D e c l a r a t o r ¡ô  XE R R _ I m p l i c i t l y T y p e d V a r i a b l e W i t h N o I n i t i a l i z e r äô  *E R R _ I m p o r t N o n A s s e m b l y õ  0E R R _ I m p o r t e d C i r c u l a r B a s e Mõ  (E R R _ I n A t t r O n O u t P a r a m §õ  ,E R R _ I n D y n a m i c M e t h o d A r g Ôõ  E R R _ I n E x p e c t e d 9ö  <E R R _ I n E x t e n s i o n M u s t B e V a l u e T y p e Hö  ,E R R _ I n a c c e s s i b l e G e t t e r ºö  ,E R R _ I n a c c e s s i b l e S e t t e r (÷  8E R R _ I n c o n s i s t e n t I n d e x e r N a m e s –÷  HE R R _ I n c o n s i s t e n t L a m b d a P a r a m e t e r U s a g e ø  6E R R _ I n c r e m e n t L v a l u e E x p e c t e d ø  XE R R _ I n d e x e d P r o p e r t y M u s t H a v e A l l O p t i o n a l P a r a m s èø  BE R R _ I n d e x e d P r o p e r t y R e q u i r e s P a r a m s +ù  6E R R _ I n d e x e r C a n t H a v e V o i d T y p e ~ù  0E R R _ I n d e x e r I n S t a t i c C l a s s ¦ù  *E R R _ I n d e x e r N e e d s P a r a m åù  HE R R _ I n d i r e c t R e c u r s i v e C o n s t r u c t o r C a l l ú  TE R R _ I n h e r i t i n g F r o m R e c o r d W i t h S e a l e d T o S t r i n g bú  0E R R _ I n i t C a n n o t B e R e a d o n l y åú  TE R R _ I n i t i a l i z e B y R e f e r e n c e V a r i a b l e W i t h V a l u e Oû  TE R R _ I n i t i a l i z e B y V a l u e V a r i a b l e W i t h R e f e r e n c e ™û  FE R R _ I n i t i a l i z e r A d d H a s P a r a m M o d i f i e r s ãû  FE R R _ I n i t i a l i z e r A d d H a s W r o n g S i g n a t u r e ¸ü  bE R R _ I n i t i a l i z e r I n S t r u c t W i t h o u t E x p l i c i t C o n s t r u c t o r tı  @E R R _ I n i t i a l i z e r O n N o n A u t o P r o p e r t y Ìı  >E R R _ I n s t a n c e M e m b e r I n S t a t i c C l a s s ş  TE R R _ I n s t a n c e P r o p e r t y I n i t i a l i z e r I n I n t e r f a c e dş  8E R R _ I n s t a n t i a t i n g S t a t i c C l a s s ²ş  *E R R _ I n s u f f i c i e n t S t a c k ôş   E R R _ I n t D i v B y Z e r o 2ÿ  E R R _ I n t O v e r f l o w Oÿ  0E R R _ I n t e g r a l T y p e E x p e c t e d sÿ  :E R R _ I n t e g r a l T y p e V a l u e E x p e c t e d ·ÿ  :E R R _ I n t e r f a c e E v e n t I n i t i a l i z e r Şÿ  JE R R _ I n t e r f a c e I m p l e m e n t e d B y C o n d i t i o n a l )  hE R R _ I n t e r f a c e I m p l e m e n t e d B y U n m a n a g e d C a l l e r s O n l y M e t h o d   XE R R _ I n t e r f a c e I m p l e m e n t e d I m p l i c i t l y B y V a r i a d i c é  6E R R _ I n t e r f a c e M e m b e r N o t F o u n d S JE R R _ I n t e r f a c e s C a n t C o n t a i n C o n s t r u c t o r s Í lE R R _ I n t e r f a c e s C a n t C o n t a i n C o n v e r s i o n O r E q u a l i t y O p e r a t o r s 	 >E R R _ I n t e r f a c e s C a n t C o n t a i n F i e l d s k "E R R _ I n t e r n a l E r r o r ¡ 2E R R _ I n t e r o p M e t h o d W i t h B o d y Á @E R R _ I n t e r o p S t r u c t C o n t a i n s M e t h o d s  >E R R _ I n t e r o p T y p e M i s s i n g A t t r i b u t e c FE R R _ I n t e r o p T y p e s W i t h S a m e N a m e A n d G u i d Ğ nE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t A t t r i b u t e M a l f o r m e d ˜ †E R R _ I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t L o c a t e d A f t e r I n t e r p o l a t e d S t r i n g A rE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t O p t i o n a l N o t S p e c i f i e d _ jE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r C r e a t i o n C a n n o t U s e D y n a m i c < jE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r M e t h o d R e t u r n I n c o n s i s t e n t Ê dE R R _ I n t e r p o l a t e d S t r i n g H a n d l e r M e t h o d R e t u r n M a l f o r m e d P ŒE R R _ I n t e r p o l a t e d S t r i n g s R e f e r e n c i n g I n s t a n c e C a n n o t B e I n O b j e c t I n i t i a l i z e r s É "E R R _ I n v a l i d A d d r O p ‰	 PE R R _ I n v a l i d A n o n y m o u s T y p e M e m b e r D e c l a r a t o r É	  E R R _ I n v a l i d A r r a y l
+ 4E R R _ I n v a l i d A s s e m b l y C u l t u r e ±
+ @E R R _ I n v a l i d A s s e m b l y C u l t u r e F o r E x e  .E R R _ I n v a l i d A s s e m b l y N a m e e 8E R R _ I n v a l i d A t t r i b u t e A r g u m e n t « DE R R _ I n v a l i d C o n s t a n t D e c l a r a t i o n T y p e ß (E R R _ I n v a l i d D e b u g I n f o Ê BE R R _ I n v a l i d D e b u g I n f o r m a t i o n F o r m a t 5 .E R R _ I n v a l i d D e l e g a t e T y p e n 6E R R _ I n v a l i d D y n a m i c C o n d i t i o n õ &E R R _ I n v a l i d E x p r T e r m b 0E R R _ I n v a l i d F i l e A l i g n m e n t ‡ 2E R R _ I n v a l i d F i x e d A r r a y S i z e º BE R R _ I n v a l i d F o r m a t F o r G u i d F o r O p t i o n ù PE R R _ I n v a l i d F u n c P o i n t e r R e t u r n T y p e M o d i f i e r T VE R R _ I n v a l i d F u n c t i o n P o i n t e r C a l l i n g C o n v e n t i o n Ş $E R R _ I n v a l i d F w d T y p e > &E R R _ I n v a l i d G o t o C a s e Š 8E R R _ I n v a l i d H a s h A l g o r i t h m N a m e È PE R R _ I n v a l i d I n i t i a l i z e r E l e m e n t I n i t i a l i z e r ô <E R R _ I n v a l i d I n s t r u m e n t a t i o n K i n d % `E R R _ I n v a l i d I n t e r p o l a t e d S t r i n g H a n d l e r A r g u m e n t N a m e R *E R R _ I n v a l i d L i n e N u m b e r ‰ *E R R _ I n v a l i d M e m b e r D e c l Ñ JE R R _ I n v a l i d M o d i f i e r F o r L a n g u a g e V e r s i o n 4 6E R R _ I n v a l i d N a m e I n S u b p a t t e r n ¡ 0E R R _ I n v a l i d N a m e d A r g u m e n t Ù "E R R _ I n v a l i d N u m b e r  2E R R _ I n v a l i d O b j e c t C r e a t i o n + *E R R _ I n v a l i d O u t p u t N a m e J $E R R _ I n v a l i d P a t h M a p i ,E R R _ I n v a l i d P r e p r o c E x p r š <E R R _ I n v a l i d P r e p r o c e s s i n g S y m b o l Æ 8E R R _ I n v a l i d P r o p e r t y A c c e s s M o d % >E R R _ I n v a l i d P r o p e r t y R e a d O n l y M o d s ™ E R R _ I n v a l i d Q M  E R R _ I n v a l i d R e a l  :E R R _ I n v a l i d S i g n a t u r e P u b l i c K e y © (E R R _ I n v a l i d S p e c i f i e r   4E R R _ I n v a l i d S t a c k A l l o c A r r a y 3 6E R R _ I n v a l i d S u b s y s t e m V e r s i o n r NE R R _ I n v a l i d U n m a n a g e d C a l l e r s O n l y C a l l C o n v ö 0E R R _ I n v a l i d V e r s i o n F o r m a t L 2E R R _ I n v a l i d V e r s i o n F o r m a t 2 Ğ JE R R _ I n v a l i d V e r s i o n F o r m a t D e t e r m i n i s t i c d 6E R R _ I n v a l i d W i t h R e c e i v e r T y p e 9 $E R R _ I s N u l l a b l e T y p e } .E R R _ I s P a t t e r n I m p o s s i b l e ù .E R R _ I t e r a t o r M u s t B e A s y n c E "E R R _ L a b e l N o t F o u n d ” E R R _ L a b e l S h a d o w Ï >E R R _ L a m b d a E x p l i c i t R e t u r n T y p e V a r !  E R R _ L a m b d a I n I s A s „ PE R R _ L a m b d a W i t h A t t r i b u t e s T o E x p r e s s i o n T r e e  TE R R _ L a n g u a g e V e r s i o n C a n n o t H a v e L e a d i n g Z e r o e s c E R R _ L a n g u a g e V e r s i o n D o e s N o t S u p p o r t D e f a u l t I n t e r f a c e I m p l e m e n t a t i o n F o r M e m b e r ® $E R R _ L b r a c e E x p e c t e d ] 0E R R _ L e g a c y O b j e c t I d S y n t a x i FE R R _ L i n e C o n t a i n s D i f f e r e n t W h i t e s p a c e   LE R R _ L i n e D o e s N o t S t a r t W i t h S a m e W h i t e s p a c e + JE R R _ L i n e S p a n D i r e c t i v e E n d L e s s T h a n S t a r t £ BE R R _ L i n e S p a n D i r e c t i v e I n v a l i d V a l u e õ bE R R _ L i n k e d N e t m o d u l e M e t a d a t a M u s t P r o v i d e F u l l P E I m a g e 6 :E R R _ L i s t P a t t e r n R e q u i r e s L e n g t h ‡ *E R R _ L i t e r a l D o u b l e C a s t   JE R R _ L o a d D i r e c t i v e O n l y A l l o w e d I n S c r i p t s    <E R R _ L o c a l C a n t B e F i x e d A n d H o i s t e d Å  $E R R _ L o c a l D u p l i c a t e L! 8E R R _ L o c a l F u n c t i o n M i s s i n g B o d y ¡! 6E R R _ L o c a l I l l e g a l l y O v e r r i d e s  " 8E R R _ L o c a l S a m e N a m e A s T y p e P a r a m ²" ,E R R _ L o c a l T y p e N a m e C l a s h 1# ,E R R _ L o c k N e e d s R e f e r e n c e õ# 0E R R _ L o o k u p I n T y p e V a r i a b l e B$ *E R R _ M a i n C l a s s I s I m p o r t ›$ *E R R _ M a i n C l a s s N o t C l a s s å$ *E R R _ M a i n C l a s s N o t F o u n d ^% E R R _ M a n a g e d A d d r £% RE R R _ M a r s h a l U n m a n a g e d T y p e N o t V a l i d F o r F i e l d s & TE R R _ M a r s h a l U n m a n a g e d T y p e O n l y V a l i d F o r F i e l d s J& 8E R R _ M e m G r o u p I n E x p r e s s i o n T r e e †& .E R R _ M e m b e r A l r e a d y E x i s t s Ü& 8E R R _ M e m b e r A l r e a d y I n i t i a l i z e d -' :E R R _ M e m b e r C a n n o t B e I n i t i a l i z e d W' 0E R R _ M e m b e r N a m e S a m e A s T y p e ¢' &E R R _ M e m b e r N e e d s T y p e ë' $E R R _ M e m b e r R e s e r v e d ( JE R R _ M e r g e _ c o n f l i c t _ m a r k e r _ e n c o u n t e r e d d( .E R R _ M e t a d a t a N a m e T o o L o n g ’( DE R R _ M e t a d a t a R e f e r e n c e s N o t S u p p o r t e d Ó( 0E R R _ M e t h D e l e g a t e M i s m a t c h ) .E R R _ M e t h F u n c P t r M i s m a t c h B) &E R R _ M e t h G r p T o N o n D e l ‰) 2E R R _ M e t h o d A r g C a n t B e R e f A n y  * <E R R _ M e t h o d I m p l e m e n t i n g A c c e s s o r @* ,E R R _ M e t h o d N a m e E x p e c t e d É* 8E R R _ M e t h o d R e t u r n C a n t B e R e f A n y ã* @E R R _ M i s m a t c h e d R e f E s c a p e I n T e r n a r y K+ &E R R _ M i s p l a c e d R e c o r d Ô+ 2E R R _ M i s p l a c e d S l i c e P a t t e r n 8, (E R R _ M i s s i n g A d d r e s s O f œ, &E R R _ M i s s i n g A r g u m e n t ş, (E R R _ M i s s i n g A r r a y S i z e - $E R R _ M i s s i n g C o C l a s s ^- ,E R R _ M i s s i n g D e b u g S w i t c h è- ,E R R _ M i s s i n g D e c o n s t r u c t '. 0E R R _ M i s s i n g G u i d F o r O p t i o n Æ. DE R R _ M i s s i n g M e t h o d O n S o u r c e I n t e r f a c e / :E R R _ M i s s i n g N e t M o d u l e R e f e r e n c e t/ "E R R _ M i s s i n g P P F i l e œ/ $E R R _ M i s s i n g P a r t i a l ò/ $E R R _ M i s s i n g P a t t e r n [0 6E R R _ M i s s i n g P r e d e f i n e d M e m b e r l0 4E R R _ M i s s i n g S o u r c e I n t e r f a c e  0 .E R R _ M i s s i n g S t r u c t O f f s e t 
+1 2E R R _ M i s s i n g T y p e I n A s s e m b l y ƒ1 .E R R _ M i s s i n g T y p e I n S o u r c e á1 >E R R _ M i x i n g W i n R T E v e n t W i t h R e g u l a r v2 *E R R _ M o d u l e E m i t F a i l u r e ì2 bE R R _ M o d u l e I n i t i a l i z e r C a n n o t B e U n m a n a g e d C a l l e r s O n l y 3 zE R R _ M o d u l e I n i t i a l i z e r M e t h o d A n d C o n t a i n i n g T y p e s M u s t N o t B e G e n e r i c c3 |E R R _ M o d u l e I n i t i a l i z e r M e t h o d M u s t B e A c c e s s i b l e O u t s i d e T o p L e v e l T y p e Ô3 RE R R _ M o d u l e I n i t i a l i z e r M e t h o d M u s t B e O r d i n a r y 

@@ -1,113 +1,138 @@
-/*
- * altera-jtag.h
- *
- * altera FPGA driver
- *
- * Copyright (C) Altera Corporation 1998-2001
- * Copyright (C) 2010 NetUP Inc.
- * Copyright (C) 2010 Igor M. Liplianin <liplianin@netup.ru>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
+error
+	 * state which happened during the execution of the r/w command.
+	 */
+	if (stop_status) {
+		brq->stop.resp[0] = stop_status;
+		brq->stop.error = 0;
+	}
+	return ERR_CONTINUE;
+}
 
-#ifndef ALTERA_JTAG_H
-#define ALTERA_JTAG_H
+static int mmc_blk_reset(struct mmc_blk_data *md, struct mmc_host *host,
+			 int type)
+{
+	int err;
 
-/* Function Prototypes */
-enum altera_jtag_state {
-	ILLEGAL_JTAG_STATE = -1,
-	RESET = 0,
-	IDLE = 1,
-	DRSELECT = 2,
-	DRCAPTURE = 3,
-	DRSHIFT = 4,
-	DREXIT1 = 5,
-	DRPAUSE = 6,
-	DREXIT2 = 7,
-	DRUPDATE = 8,
-	IRSELECT = 9,
-	IRCAPTURE = 10,
-	IRSHIFT = 11,
-	IREXIT1 = 12,
-	IRPAUSE = 13,
-	IREXIT2 = 14,
-	IRUPDATE = 15
+	if (md->reset_done & type)
+		return -EEXIST;
 
-};
+	md->reset_done |= type;
+	err = mmc_hw_reset(host);
+	/* Ensure we switch back to the correct partition */
+	if (err != -EOPNOTSUPP) {
+		struct mmc_blk_data *main_md =
+			dev_get_drvdata(&host->card->dev);
+		int part_err;
 
-struct altera_jtag {
-	/* Global variable to store the current JTAG state */
-	enum altera_jtag_state jtag_state;
+		main_md->part_curr = main_md->part_type;
+		part_err = mmc_blk_part_switch(host->card, md);
+		if (part_err) {
+			/*
+			 * We have failed to get back into the correct
+			 * partition, so we need to abort the whole request.
+			 */
+			return -ENODEV;
+		}
+	}
+	return err;
+}
 
-	/* Store current stop-state for DR and IR scan commands */
-	enum altera_jtag_state drstop_state;
-	enum altera_jtag_state irstop_state;
+static inline void mmc_blk_reset_success(struct mmc_blk_data *md, int type)
+{
+	md->reset_done &= ~type;
+}
 
-	/* Store current padding values */
-	u32 dr_pre;
-	u32 dr_post;
-	u32 ir_pre;
-	u32 ir_post;
-	u32 dr_length;
-	u32 ir_length;
-	u8 *dr_pre_data;
-	u8 *dr_post_data;
-	u8 *ir_pre_data;
-	u8 *ir_post_data;
-	u8 *dr_buffer;
-	u8 *ir_buffer;
-};
+int mmc_access_rpmb(struct mmc_queue *mq)
+{
+	struct mmc_blk_data *md = mq->data;
+	/*
+	 * If this is a RPMB partition access, return ture
+	 */
+	if (md && md->part_type == EXT_CSD_PART_CONFIG_ACC_RPMB)
+		return true;
 
-#define ALTERA_STACK_SIZE 128
-#define ALTERA_MESSAGE_LENGTH 1024
+	return false;
+}
 
-struct altera_state {
-	struct altera_config	*config;
-	struct altera_jtag	js;
-	char			msg_buff[ALTERA_MESSAGE_LENGTH + 1];
-	long			stack[ALTERA_STACK_SIZE];
-};
+static struct mmc_cmdq_req *mmc_blk_cmdq_prep_discard_req(struct mmc_queue *mq,
+						struct request *req)
+{
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	struct mmc_host *host = card->host;
+	struct mmc_cmdq_context_info *ctx_info = &host->cmdq_ctx;
+	struct mmc_cmdq_req *cmdq_req;
+	struct mmc_queue_req *active_mqrq;
 
-int altera_jinit(struct altera_state *astate);
-int altera_set_drstop(struct altera_jtag *js, enum altera_jtag_state state);
-int altera_set_irstop(struct altera_jtag *js, enum altera_jtag_state state);
-int altera_set_dr_pre(struct altera_jtag *js, u32 count, u32 start_index,
-				u8 *preamble_data);
-int altera_set_ir_pre(struct altera_jtag *js, u32 count, u32 start_index,
-				u8 *preamble_data);
-int altera_set_dr_post(struct altera_jtag *js, u32 count, u32 start_index,
-				u8 *postamble_data);
-int altera_set_ir_post(struct altera_jtag *js, u32 count, u32 start_index,
-				u8 *postamble_data);
-int altera_goto_jstate(struct altera_state *astate,
-				enum altera_jtag_state state);
-int altera_wait_cycles(struct altera_state *astate, s32 cycles,
-				enum altera_jtag_state wait_state);
-int altera_wait_msecs(struct altera_state *astate, s32 microseconds,
-				enum altera_jtag_state wait_state);
-int altera_irscan(struct altera_state *astate, u32 count,
-				u8 *tdi_data, u32 start_index);
-int altera_swap_ir(struct altera_state *astate,
-				u32 count, u8 *in_data,
-				u32 in_index, u8 *out_data,
-				u32 out_index);
-int altera_drscan(struct altera_state *astate, u32 count,
-				u8 *tdi_data, u32 start_index);
-int altera_swap_dr(struct altera_state *astate, u32 count,
-				u8 *in_data, u32 in_index,
-				u8 *out_data, u32 out_index);
-void altera_free_buffers(struct altera_state *astate);
-#endif /* ALTERA_JTAG_H */
+	BUG_ON(req->tag > card->ext_csd.cmdq_depth);
+	BUG_ON(test_and_set_bit(req->tag, &host->cmdq_ctx.active_reqs));
+
+	set_bit(CMDQ_STATE_DCMD_ACTIVE, &ctx_info->curr_state);
+
+	active_mqrq = &mq->mqrq_cmdq[req->tag];
+	active_mqrq->req = req;
+
+	cmdq_req = mmc_cmdq_prep_dcmd(active_mqrq, mq);
+	cmdq_req->cmdq_req_flags |= QBR;
+	cmdq_req->mrq.cmd = &cmdq_req->cmd;
+	cmdq_req->tag = req->tag;
+	return cmdq_req;
+}
+
+static int mmc_blk_cmdq_issue_discard_rq(struct mmc_queue *mq,
+					struct request *req)
+{
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	struct mmc_cmdq_req *cmdq_req = NULL;
+	struct mmc_host *host = card->host;
+	struct mmc_cmdq_context_info *ctx_info = &host->cmdq_ctx;
+	unsigned int from, nr, arg;
+	int err = 0;
+	unsigned long flags;
+
+	if (!mmc_can_erase(card)) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
+#ifdef CONFIG_MMC_CMDQ_DEBUG
+	/* cq debug */
+	exynos_ss_printk("[CQ] I_D: tag = %d, flag = 0x%lx, active = 0x%lx\n",
+				req->tag, ctx_info->curr_state,
+				ctx_info->active_reqs);
+#endif
+	from = blk_rq_pos(req);
+	nr = blk_rq_sectors(req);
+
+	if (mmc_can_discard(card))
+		arg = MMC_DISCARD_ARG;
+	else if (mmc_can_trim(card))
+		arg = MMC_TRIM_ARG;
+	else
+		arg = MMC_ERASE_ARG;
+
+	cmdq_req = mmc_blk_cmdq_prep_discard_req(mq, req);
+	if (card->quirks & MMC_QUIRK_INAND_CMD38) {
+		__mmc_switch_cmdq_mode(cmdq_req->mrq.cmd,
+				EXT_CSD_CMD_SET_NORMAL,
+				INAND_CMD38_ARG_EXT_CSD,
+				arg == MMC_TRIM_ARG ?
+				INAND_CMD38_ARG_TRIM :
+				INAND_CMD38_ARG_ERASE,
+				0, true, false);
+		err = mmc_cmdq_wait_for_dcmd(card->host, cmdq_req);
+		if (err)
+			goto clear_dcmd;
+	}
+
+	err = mmc_cmdq_erase(cmdq_req, card, from, nr, arg);
+clear_dcmd:
+	/* clear pending request */
+	if (cmdq_req) {
+		if (err) {
+			if (host->err_mrq == NULL)
+				host->err_mrq = &cmdq_req->mrq;
+
+			spin_lock_irqsave(&mq->eh_lock, flags);
+			list_add_tail(&cmdq_re

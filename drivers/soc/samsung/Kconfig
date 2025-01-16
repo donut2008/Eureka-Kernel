@@ -1,210 +1,61 @@
-#
-# EXYNOS Soc drivers
-#
-menuconfig SOC_SAMSUNG
-	bool "SAMSUNG SOC drivers support"
-
-if SOC_SAMSUNG
-config EXYNOS_CHIPID
-	bool "Exynos Chip ID Driver Support"
-	depends on ARCH_EXYNOS
-	select SOC_BUS
-
-config EXYNOS_PMU
-	bool "Exynos Power Management Unit Driver Support"
-	depends on ARCH_EXYNOS
-	select REG_MAP
-
-config EXYNOS_REBOOT
-	bool "Exynos Chip Reboot Driver Support"
-	depends on ARCH_EXYNOS
-
-config PWRCAL
-	bool "Exynos Power Chip Abstraction Layer"
-	help
-	Support Power CAL for Exynos SoC.
-
-config ECT
-	bool "Enable Exynos Characteristic Table File"
-	default n
-	depends on ARCH_EXYNOS
-
-config ECT_DUMP
-	bool "Enable Exynos Characteristic Table File Dump sysfs"
-	default n
-	depends on ECT
-
-config BYPASS_CPU_THROTTLING
-	bool "CPU throttling bypass feature"
-	default n
-	depends on ECT
-	help
-	  If enabled, cpu frequencies will not be throttled until temperature is above 95"C
-
-config EXYNOS_PD
-	bool "Exynos PM domain Support"
-	depends on ARCH_EXYNOS
-	depends on PM
-	select PM_GENERIC_DOMAINS
-
-config EPX
-	bool "Enable Exynos Performance Box"
-	default n
-	depends on ARCH_EXYNOS
-	depends on !SAMSUNG_PRODUCT_SHIP
-
-config EXYNOS_BCM
-	bool "EXYNOS_BCM driver support"
-	default n
-	help
-	  Enable exynos_bcm driver support
-
-config EXYNOS_RGT
-	bool "Exynos Regulator Debug Support"
-	depends on REGULATOR
-	depends on DEBUG_FS
-	depends on OF
-	help
-	  dummy device driver for debugging samsung PMIC
-
-config EXYNOS_WD_DVFS
-	bool "EXYNOS WD DVFS driver support"
-	default n
-	help
-	  Enable exynos wd dvfs support
-
-config SAMSUNG_DMADEV
-	bool
-	select ARM_AMBA
-	select DMADEVICES
-	select PL330_DMA
-	help
-	  Use DMA device engine for PL330 DMAC.
-
-config EXYNOS_HOTPLUG
-	bool "Exynos HOTPLUG Driver"
-	default y
-	depends on ARCH_EXYNOS
-	depends on CPU_FREQ
-	depends on HOTPLUG_CPU
-	help
-	   If unsure, say Y
-
-config EXYNOS_HOTPLUG_GOVERNOR
-	bool "Enable Exynos dynamic hotplug governor"
-	depends on EXYNOS_HOTPLUG
-
-config SCHED_HP_EVENT
-	bool "Gathers scheduler events to decide hotplug in/out"
-	depends on EXYNOS_HOTPLUG_GOVERNOR
-	default y
-
-config CAL_IF
-	bool "Exynos Chip Abstraction Layer Interface"
-	help
-	  Support CMU CAL for Exynos SoC.
-
-config PMUCAL
-	bool "Exynos PMU Chip Abstraction Layer"
-	depends on CAL_IF
-	default y
-	help
-	 Support PMUCAL for Exynos SoC.
-
-config CMUCAL
-	bool "Exynos CMU Chip Abstraction Layer"
-	depends on CAL_IF
-	default y
-	help
-	  Support CMUCAL for Exynos SoC.
-
-config CP_PMUCAL
-	bool "Exynos PMU(for CP) Chip Abstraction Layer"
-	depends on CAL_IF
-	help
-	  Support CP_PMUCAL for Exynos SoC.
-
-config GNSS_PMUCAL
-	bool "Exynos PMU(for GNSS) Chip Abstraction Layer"
-	depends on CAL_IF
-	help
-	  Support GNSS_PMUCAL for Exynos SoC.
-
-config CMUCAL_DEBUG
-	bool "CMUCAL Debug Interface"
-	depends on CMUCAL
-
-config CMUCAL_QCH_IGNORE_SUPPORT
-	bool "CMUCAL QCH IGNORE Support"
-	depends on CMUCAL
-
-config ACPM_DVFS
-	bool "Exynos ACPM DVFS manager"
-	depends on CAL_IF && CMUCAL
-	default y
-	help
-	  Support ACPM DVFS for Exynos SoC.
-
-config USI
-	bool "Enable Universal Serial Interface"
-	default n
-
-config EXYNOS_SECURE_LOG
-	bool "Exynos Secure Log"
-	default y
-	help
-	  Support Exynos Secure Log
-
-config EXYNOS_KERNEL_PROTECTION
-	bool "Exynos Kernel Code Protection"
-	help
-	  Support Exynos Kernel Code Protection
-
-config EXYNOS_SDM
-	bool "Exynos Security Dump Manager Support"
-	depends on EXYNOS_SNAPSHOT
-	default y
-	help
-	  Exynos Security Dump Manager
-
-config EXYNOS_CONTENT_PATH_PROTECTION
-	bool "Exynos Content Path Protection"
-	default y
-	help
-	  Enable content path protection of EXYNOS.
-
-source "drivers/soc/samsung/acpm/Kconfig"
-source "drivers/soc/samsung/exynos-hdcp/Kconfig"
-
-config EXYNOS_MCINFO
-	bool "Exynos memory controller information"
-	default n
-
-config MCINFO_SYSFS
-	bool "Exynos memory controller information sysfs"
-	depends on EXYNOS_MCINFO
-	default	y if SYSFS
-
-config EXYNOS_DVFS_MANAGER
-	bool "Exynos DVFS Manager"
-	default n
-	depends on ARCH_EXYNOS
-	help
-	  Enable DVFS Manager for Exynos SoC.
-	  This module controls constraint between each DVFS domains.
-
-endif #SOC_SAMSUNG
-
-config SEC_INCELL
-	bool "Incell data & function for Samsung"
-	default n
-	help
-	  say y to enable incell data & function for Samsung.
-
-config STATE_NOTIFIER
-	bool "State Notifier"
-	default n
-	help
-	  State notifier driver deeply hooks into our panel and sends notification
-	  to drivers whenever screen turns on/off - even for doze mode.
-	  Say y to enable this driver.
+EQ_TRAN_VOTING_2__ROM_FREQ_THROTTLING_VOTE_EN_MASK 0x4
+#define CG_FREQ_TRAN_VOTING_2__ROM_FREQ_THROTTLING_VOTE_EN__SHIFT 0x2
+#define CG_FREQ_TRAN_VOTING_2__IH_SEM_FREQ_THROTTLING_VOTE_EN_MASK 0x8
+#define CG_FREQ_TRAN_VOTING_2__IH_SEM_FREQ_THROTTLING_VOTE_EN__SHIFT 0x3
+#define CG_FREQ_TRAN_VOTING_2__PDMA_FREQ_THROTTLING_VOTE_EN_MASK 0x10
+#define CG_FREQ_TRAN_VOTING_2__PDMA_FREQ_THROTTLING_VOTE_EN__SHIFT 0x4
+#define CG_FREQ_TRAN_VOTING_2__DRM_FREQ_THROTTLING_VOTE_EN_MASK 0x20
+#define CG_FREQ_TRAN_VOTING_2__DRM_FREQ_THROTTLING_VOTE_EN__SHIFT 0x5
+#define CG_FREQ_TRAN_VOTING_2__IDCT_FREQ_THROTTLING_VOTE_EN_MASK 0x40
+#define CG_FREQ_TRAN_VOTING_2__IDCT_FREQ_THROTTLING_VOTE_EN__SHIFT 0x6
+#define CG_FREQ_TRAN_VOTING_2__ACP_FREQ_THROTTLING_VOTE_EN_MASK 0x80
+#define CG_FREQ_TRAN_VOTING_2__ACP_FREQ_THROTTLING_VOTE_EN__SHIFT 0x7
+#define CG_FREQ_TRAN_VOTING_2__SDMA_FREQ_THROTTLING_VOTE_EN_MASK 0x100
+#define CG_FREQ_TRAN_VOTING_2__SDMA_FREQ_THROTTLING_VOTE_EN__SHIFT 0x8
+#define CG_FREQ_TRAN_VOTING_2__UVD_FREQ_THROTTLING_VOTE_EN_MASK 0x200
+#define CG_FREQ_TRAN_VOTING_2__UVD_FREQ_THROTTLING_VOTE_EN__SHIFT 0x9
+#define CG_FREQ_TRAN_VOTING_2__VCE_FREQ_THROTTLING_VOTE_EN_MASK 0x400
+#define CG_FREQ_TRAN_VOTING_2__VCE_FREQ_THROTTLING_VOTE_EN__SHIFT 0xa
+#define CG_FREQ_TRAN_VOTING_2__DC_AZ_FREQ_THROTTLING_VOTE_EN_MASK 0x800
+#define CG_FREQ_TRAN_VOTING_2__DC_AZ_FREQ_THROTTLING_VOTE_EN__SHIFT 0xb
+#define CG_FREQ_TRAN_VOTING_2__SAM_FREQ_THROTTLING_VOTE_EN_MASK 0x1000
+#define CG_FREQ_TRAN_VOTING_2__SAM_FREQ_THROTTLING_VOTE_EN__SHIFT 0xc
+#define CG_FREQ_TRAN_VOTING_2__AVP_FREQ_THROTTLING_VOTE_EN_MASK 0x2000
+#define CG_FREQ_TRAN_VOTING_2__AVP_FREQ_THROTTLING_VOTE_EN__SHIFT 0xd
+#define CG_FREQ_TRAN_VOTING_2__GRBM_0_FREQ_THROTTLING_VOTE_EN_MASK 0x4000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_0_FREQ_THROTTLING_VOTE_EN__SHIFT 0xe
+#define CG_FREQ_TRAN_VOTING_2__GRBM_1_FREQ_THROTTLING_VOTE_EN_MASK 0x8000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_1_FREQ_THROTTLING_VOTE_EN__SHIFT 0xf
+#define CG_FREQ_TRAN_VOTING_2__GRBM_2_FREQ_THROTTLING_VOTE_EN_MASK 0x10000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_2_FREQ_THROTTLING_VOTE_EN__SHIFT 0x10
+#define CG_FREQ_TRAN_VOTING_2__GRBM_3_FREQ_THROTTLING_VOTE_EN_MASK 0x20000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_3_FREQ_THROTTLING_VOTE_EN__SHIFT 0x11
+#define CG_FREQ_TRAN_VOTING_2__GRBM_4_FREQ_THROTTLING_VOTE_EN_MASK 0x40000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_4_FREQ_THROTTLING_VOTE_EN__SHIFT 0x12
+#define CG_FREQ_TRAN_VOTING_2__GRBM_5_FREQ_THROTTLING_VOTE_EN_MASK 0x80000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_5_FREQ_THROTTLING_VOTE_EN__SHIFT 0x13
+#define CG_FREQ_TRAN_VOTING_2__GRBM_6_FREQ_THROTTLING_VOTE_EN_MASK 0x100000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_6_FREQ_THROTTLING_VOTE_EN__SHIFT 0x14
+#define CG_FREQ_TRAN_VOTING_2__GRBM_7_FREQ_THROTTLING_VOTE_EN_MASK 0x200000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_7_FREQ_THROTTLING_VOTE_EN__SHIFT 0x15
+#define CG_FREQ_TRAN_VOTING_2__GRBM_8_FREQ_THROTTLING_VOTE_EN_MASK 0x400000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_8_FREQ_THROTTLING_VOTE_EN__SHIFT 0x16
+#define CG_FREQ_TRAN_VOTING_2__GRBM_9_FREQ_THROTTLING_VOTE_EN_MASK 0x800000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_9_FREQ_THROTTLING_VOTE_EN__SHIFT 0x17
+#define CG_FREQ_TRAN_VOTING_2__GRBM_10_FREQ_THROTTLING_VOTE_EN_MASK 0x1000000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_10_FREQ_THROTTLING_VOTE_EN__SHIFT 0x18
+#define CG_FREQ_TRAN_VOTING_2__GRBM_11_FREQ_THROTTLING_VOTE_EN_MASK 0x2000000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_11_FREQ_THROTTLING_VOTE_EN__SHIFT 0x19
+#define CG_FREQ_TRAN_VOTING_2__GRBM_12_FREQ_THROTTLING_VOTE_EN_MASK 0x4000000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_12_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1a
+#define CG_FREQ_TRAN_VOTING_2__GRBM_13_FREQ_THROTTLING_VOTE_EN_MASK 0x8000000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_13_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1b
+#define CG_FREQ_TRAN_VOTING_2__GRBM_14_FREQ_THROTTLING_VOTE_EN_MASK 0x10000000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_14_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1c
+#define CG_FREQ_TRAN_VOTING_2__GRBM_15_FREQ_THROTTLING_VOTE_EN_MASK 0x20000000
+#define CG_FREQ_TRAN_VOTING_2__GRBM_15_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1d
+#define CG_FREQ_TRAN_VOTING_2__RLC_FREQ_THROTTLING_VOTE_EN_MASK 0x40000000
+#define CG_FREQ_TRAN_VOTING_2__RLC_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1e
+#define CG_FREQ_TRAN_VOTING_3__BIF_FREQ_THROTTLING_VOTE_EN_MASK 0x1
+#define CG_FREQ_TRAN_VOTING_3__BIF_FREQ_THROTTLING_VOTE_EN__SHIFT 0x0
+#define CG_FR

@@ -1,56 +1,29 @@
-/*
- * Wireless USB Host Controller
- * UWB Protocol Adaptation Layer (PAL) glue.
- *
- * Copyright (C) 2008 Cambridge Silicon Radio Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- */
-#include "wusbhc.h"
-
-static void wusbhc_channel_changed(struct uwb_pal *pal, int channel)
-{
-	struct wusbhc *wusbhc = container_of(pal, struct wusbhc, pal);
-
-	dev_dbg(wusbhc->dev, "%s: channel = %d\n", __func__, channel);
-	if (channel < 0)
-		wusbhc_stop(wusbhc);
-	else
-		wusbhc_start(wusbhc);
-}
-
-/**
- * wusbhc_pal_register - register the WUSB HC as a UWB PAL
- * @wusbhc: the WUSB HC
- */
-int wusbhc_pal_register(struct wusbhc *wusbhc)
-{
-	uwb_pal_init(&wusbhc->pal);
-
-	wusbhc->pal.name   = "wusbhc";
-	wusbhc->pal.device = wusbhc->usb_hcd.self.controller;
-	wusbhc->pal.rc     = wusbhc->uwb_rc;
-	wusbhc->pal.channel_changed = wusbhc_channel_changed;
-
-	return uwb_pal_register(&wusbhc->pal);
-}
-
-/**
- * wusbhc_pal_unregister - unregister the WUSB HC as a UWB PAL
- * @wusbhc: the WUSB HC
- */
-void wusbhc_pal_unregister(struct wusbhc *wusbhc)
-{
-	if (wusbhc->uwb_rc)
-		uwb_pal_unregister(&wusbhc->pal);
-}
+EN_2_MASK 0x40
+#define PB1_PIF_LANE2_OVRD__RXPWR_OVRD_EN_2__SHIFT 0x6
+#define PB1_PIF_LANE2_OVRD__RXPGENABLE_OVRD_EN_2_MASK 0x80
+#define PB1_PIF_LANE2_OVRD__RXPGENABLE_OVRD_EN_2__SHIFT 0x7
+#define PB1_PIF_LANE2_OVRD__ELECIDLEDETEN_OVRD_EN_2_MASK 0x100
+#define PB1_PIF_LANE2_OVRD__ELECIDLEDETEN_OVRD_EN_2__SHIFT 0x8
+#define PB1_PIF_LANE2_OVRD__ENABLEFOM_OVRD_EN_2_MASK 0x200
+#define PB1_PIF_LANE2_OVRD__ENABLEFOM_OVRD_EN_2__SHIFT 0x9
+#define PB1_PIF_LANE2_OVRD__REQUESTFOM_OVRD_EN_2_MASK 0x400
+#define PB1_PIF_LANE2_OVRD__REQUESTFOM_OVRD_EN_2__SHIFT 0xa
+#define PB1_PIF_LANE2_OVRD__RESPONSEMODE_OVRD_EN_2_MASK 0x800
+#define PB1_PIF_LANE2_OVRD__RESPONSEMODE_OVRD_EN_2__SHIFT 0xb
+#define PB1_PIF_LANE2_OVRD__REQUESTTRK_OVRD_EN_2_MASK 0x1000
+#define PB1_PIF_LANE2_OVRD__REQUESTTRK_OVRD_EN_2__SHIFT 0xc
+#define PB1_PIF_LANE2_OVRD__REQUESTTRN_OVRD_EN_2_MASK 0x2000
+#define PB1_PIF_LANE2_OVRD__REQUESTTRN_OVRD_EN_2__SHIFT 0xd
+#define PB1_PIF_LANE2_OVRD__COEFFICIENTID_OVRD_EN_2_MASK 0x4000
+#define PB1_PIF_LANE2_OVRD__COEFFICIENTID_OVRD_EN_2__SHIFT 0xe
+#define PB1_PIF_LANE2_OVRD__COEFFICIENT_OVRD_EN_2_MASK 0x8000
+#define PB1_PIF_LANE2_OVRD__COEFFICIENT_OVRD_EN_2__SHIFT 0xf
+#define PB1_PIF_LANE2_OVRD__CDREN_OVRD_EN_2_MASK 0x10000
+#define PB1_PIF_LANE2_OVRD__CDREN_OVRD_EN_2__SHIFT 0x10
+#define PB1_PIF_LANE2_OVRD__CDREN_OVRD_VAL_2_MASK 0x20000
+#define PB1_PIF_LANE2_OVRD__CDREN_OVRD_VAL_2__SHIFT 0x11
+#define PB1_PIF_LANE2_OVRD2__GANGMODE_2_MASK 0x7
+#define PB1_PIF_LANE2_OVRD2__GANGMODE_2__SHIFT 0x0
+#define PB1_PIF_LANE2_OVRD2__FREQDIV_2_MASK 0x18
+#define PB1_PIF_LANE2_OVRD2__FREQDIV_2__SHIFT 0x3
+#define PB1_PIF_LANE2

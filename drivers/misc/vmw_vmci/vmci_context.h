@@ -1,182 +1,87 @@
-/*
- * VMware VMCI driver (vmciContext.h)
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#ifndef _VMCI_CONTEXT_H_
-#define _VMCI_CONTEXT_H_
-
-#include <linux/vmw_vmci_defs.h>
-#include <linux/atomic.h>
-#include <linux/kref.h>
-#include <linux/types.h>
-#include <linux/wait.h>
-
-#include "vmci_handle_array.h"
-#include "vmci_datagram.h"
-
-/* Used to determine what checkpoint state to get and set. */
-enum {
-	VMCI_NOTIFICATION_CPT_STATE = 1,
-	VMCI_WELLKNOWN_CPT_STATE    = 2,
-	VMCI_DG_OUT_STATE           = 3,
-	VMCI_DG_IN_STATE            = 4,
-	VMCI_DG_IN_SIZE_STATE       = 5,
-	VMCI_DOORBELL_CPT_STATE     = 6,
-};
-
-/* Host specific struct used for signalling */
-struct vmci_host {
-	wait_queue_head_t wait_queue;
-};
-
-struct vmci_handle_list {
-	struct list_head node;
-	struct vmci_handle handle;
-};
-
-struct vmci_ctx {
-	struct list_head list_item;       /* For global VMCI list. */
-	u32 cid;
-	struct kref kref;
-	struct list_head datagram_queue;  /* Head of per VM queue. */
-	u32 pending_datagrams;
-	size_t datagram_queue_size;	  /* Size of datagram queue in bytes. */
-
-	/*
-	 * Version of the code that created
-	 * this context; e.g., VMX.
-	 */
-	int user_version;
-	spinlock_t lock;  /* Locks callQueue and handle_arrays. */
-
-	/*
-	 * queue_pairs attached to.  The array of
-	 * handles for queue pairs is accessed
-	 * from the code for QP API, and there
-	 * it is protected by the QP lock.  It
-	 * is also accessed from the context
-	 * clean up path, which does not
-	 * require a lock.  VMCILock is not
-	 * used to protect the QP array field.
-	 */
-	struct vmci_handle_arr *queue_pair_array;
-
-	/* Doorbells created by context. */
-	struct vmci_handle_arr *doorbell_array;
-
-	/* Doorbells pending for context. */
-	struct vmci_handle_arr *pending_doorbell_array;
-
-	/* Contexts current context is subscribing to. */
-	struct list_head notifier_list;
-	unsigned int n_notifiers;
-
-	struct vmci_host host_context;
-	u32 priv_flags;
-
-	const struct cred *cred;
-	bool *notify;		/* Notify flag pointer - hosted only. */
-	struct page *notify_page;	/* Page backing the notify UVA. */
-};
-
-/* VMCINotifyAddRemoveInfo: Used to add/remove remote context notifications. */
-struct vmci_ctx_info {
-	u32 remote_cid;
-	int result;
-};
-
-/* VMCICptBufInfo: Used to set/get current context's checkpoint state. */
-struct vmci_ctx_chkpt_buf_info {
-	u64 cpt_buf;
-	u32 cpt_type;
-	u32 buf_size;
-	s32 result;
-	u32 _pad;
-};
-
-/*
- * VMCINotificationReceiveInfo: Used to recieve pending notifications
- * for doorbells and queue pairs.
- */
-struct vmci_ctx_notify_recv_info {
-	u64 db_handle_buf_uva;
-	u64 db_handle_buf_size;
-	u64 qp_handle_buf_uva;
-	u64 qp_handle_buf_size;
-	s32 result;
-	u32 _pad;
-};
-
-/*
- * Utilility function that checks whether two entities are allowed
- * to interact. If one of them is restricted, the other one must
- * be trusted.
- */
-static inline bool vmci_deny_interaction(u32 part_one, u32 part_two)
-{
-	return ((part_one & VMCI_PRIVILEGE_FLAG_RESTRICTED) &&
-		!(part_two & VMCI_PRIVILEGE_FLAG_TRUSTED)) ||
-	       ((part_two & VMCI_PRIVILEGE_FLAG_RESTRICTED) &&
-		!(part_one & VMCI_PRIVILEGE_FLAG_TRUSTED));
-}
-
-struct vmci_ctx *vmci_ctx_create(u32 cid, u32 flags,
-				 uintptr_t event_hnd, int version,
-				 const struct cred *cred);
-void vmci_ctx_destroy(struct vmci_ctx *context);
-
-bool vmci_ctx_supports_host_qp(struct vmci_ctx *context);
-int vmci_ctx_enqueue_datagram(u32 cid, struct vmci_datagram *dg);
-int vmci_ctx_dequeue_datagram(struct vmci_ctx *context,
-			      size_t *max_size, struct vmci_datagram **dg);
-int vmci_ctx_pending_datagrams(u32 cid, u32 *pending);
-struct vmci_ctx *vmci_ctx_get(u32 cid);
-void vmci_ctx_put(struct vmci_ctx *context);
-bool vmci_ctx_exists(u32 cid);
-
-int vmci_ctx_add_notification(u32 context_id, u32 remote_cid);
-int vmci_ctx_remove_notification(u32 context_id, u32 remote_cid);
-int vmci_ctx_get_chkpt_state(u32 context_id, u32 cpt_type,
-			     u32 *num_cids, void **cpt_buf_ptr);
-int vmci_ctx_set_chkpt_state(u32 context_id, u32 cpt_type,
-			     u32 num_cids, void *cpt_buf);
-
-int vmci_ctx_qp_create(struct vmci_ctx *context, struct vmci_handle handle);
-int vmci_ctx_qp_destroy(struct vmci_ctx *context, struct vmci_handle handle);
-bool vmci_ctx_qp_exists(struct vmci_ctx *context, struct vmci_handle handle);
-
-void vmci_ctx_check_signal_notify(struct vmci_ctx *context);
-void vmci_ctx_unset_notify(struct vmci_ctx *context);
-
-int vmci_ctx_dbell_create(u32 context_id, struct vmci_handle handle);
-int vmci_ctx_dbell_destroy(u32 context_id, struct vmci_handle handle);
-int vmci_ctx_dbell_destroy_all(u32 context_id);
-int vmci_ctx_notify_dbell(u32 cid, struct vmci_handle handle,
-			  u32 src_priv_flags);
-
-int vmci_ctx_rcv_notifications_get(u32 context_id, struct vmci_handle_arr
-				   **db_handle_array, struct vmci_handle_arr
-				   **qp_handle_array);
-void vmci_ctx_rcv_notifications_release(u32 context_id, struct vmci_handle_arr
-					*db_handle_array, struct vmci_handle_arr
-					*qp_handle_array, bool success);
-
-static inline u32 vmci_ctx_get_id(struct vmci_ctx *context)
-{
-	if (!context)
-		return VMCI_INVALID_ID;
-	return context->cid;
-}
-
-#endif /* _VMCI_CONTEXT_H_ */
+H_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_DPA_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_DPA_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_DPA_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_DPA_CAP__SUBSTATE_MAX_MASK 0x1f
+#define PCIE_DPA_CAP__SUBSTATE_MAX__SHIFT 0x0
+#define PCIE_DPA_CAP__TRANS_LAT_UNIT_MASK 0x300
+#define PCIE_DPA_CAP__TRANS_LAT_UNIT__SHIFT 0x8
+#define PCIE_DPA_CAP__PWR_ALLOC_SCALE_MASK 0x3000
+#define PCIE_DPA_CAP__PWR_ALLOC_SCALE__SHIFT 0xc
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_0_MASK 0xff0000
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_0__SHIFT 0x10
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_1_MASK 0xff000000
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_1__SHIFT 0x18
+#define PCIE_DPA_LATENCY_INDICATOR__TRANS_LAT_INDICATOR_BITS_MASK 0xff
+#define PCIE_DPA_LATENCY_INDICATOR__TRANS_LAT_INDICATOR_BITS__SHIFT 0x0
+#define PCIE_DPA_STATUS__SUBSTATE_STATUS_MASK 0x1f
+#define PCIE_DPA_STATUS__SUBSTATE_STATUS__SHIFT 0x0
+#define PCIE_DPA_STATUS__SUBSTATE_CNTL_ENABLED_MASK 0x100
+#define PCIE_DPA_STATUS__SUBSTATE_CNTL_ENABLED__SHIFT 0x8
+#define PCIE_DPA_CNTL__SUBSTATE_CNTL_MASK 0x1f
+#define PCIE_DPA_CNTL__SUBSTATE_CNTL__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_0__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_0__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_7__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_7__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_LINK_CNTL3__PERFORM_EQUALIZATION_MASK 0x1
+#define PCIE_LINK_CNTL3__PERFORM_EQUALIZATION__SHIFT 0x0
+#define PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN_MASK 0x2
+#define PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN__SHIFT 0x1
+#define PCIE_LINK_CNTL3__RESERVED_MASK 0xfffffffc
+#define PCIE_LINK_CNTL3__RESERVED__SHIFT 0x2
+#define PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS_MASK 0xffff
+#define PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS__SHIFT 0x0
+#define PCIE_LANE_ERROR_STATUS__RESERVED_MASK 0xffff0000
+#define PCIE_LANE_ERROR_STATUS__RESERVED__SHIFT 0x10
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNS

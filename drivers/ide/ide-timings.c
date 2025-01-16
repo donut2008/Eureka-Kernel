@@ -1,211 +1,260 @@
-/*
- *  Copyright (c) 1999-2001 Vojtech Pavlik
- *  Copyright (c) 2007-2008 Bartlomiej Zolnierkiewicz
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- *
- * Should you need to contact me, the author, you can do so either by
- * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
- * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
+w_desc) {
+		/* for validate operations p and q are tagged onto the
+		 * end of the source list
+		 */
+		int pq_idx = src_cnt;
+
+		g = sw_desc->group_head;
+		iop_desc_init_pq_zero_sum(g, src_cnt+2, flags);
+		iop_desc_set_pq_zero_sum_byte_count(g, len);
+		g->pq_check_result = pqres;
+		pr_debug("\t%s: g->pq_check_result: %p\n",
+			__func__, g->pq_check_result);
+		sw_desc->async_tx.flags = flags;
+		while (src_cnt--)
+			iop_desc_set_pq_zero_sum_src_addr(g, src_cnt,
+							  src[src_cnt],
+							  scf[src_cnt]);
+		iop_desc_set_pq_zero_sum_addr(g, pq_idx, src);
+	}
+	spin_unlock_bh(&iop_chan->lock);
+
+	return sw_desc ? &sw_desc->async_tx : NULL;
+}
+
+static void iop_adma_free_chan_resources(struct dma_chan *chan)
+{
+	struct iop_adma_chan *iop_chan = to_iop_adma_chan(chan);
+	struct iop_adma_desc_slot *iter, *_iter;
+	int in_use_descs = 0;
+
+	iop_adma_slot_cleanup(iop_chan);
+
+	spin_lock_bh(&iop_chan->lock);
+	list_for_each_entry_safe(iter, _iter, &iop_chan->chain,
+					chain_node) {
+		in_use_descs++;
+		list_del(&iter->chain_node);
+	}
+	list_for_each_entry_safe_reverse(
+		iter, _iter, &iop_chan->all_slots, slot_node) {
+		list_del(&iter->slot_node);
+		kfree(iter);
+		iop_chan->slots_allocated--;
+	}
+	iop_chan->last_used = NULL;
+
+	dev_dbg(iop_chan->device->common.dev, "%s slots_allocated %d\n",
+		__func__, iop_chan->slots_allocated);
+	spin_unlock_bh(&iop_chan->lock);
+
+	/* one is ok since we left it on there on purpose */
+	if (in_use_descs > 1)
+		printk(KERN_ERR "IOP: Freeing %d in use descriptors!\n",
+			in_use_descs - 1);
+}
+
+/**
+ * iop_adma_status - poll the status of an ADMA transaction
+ * @chan: ADMA channel handle
+ * @cookie: ADMA transaction identifier
+ * @txstate: a holder for the current state of the channel or NULL
  */
+static enum dma_status iop_adma_status(struct dma_chan *chan,
+					dma_cookie_t cookie,
+					struct dma_tx_state *txstate)
+{
+	struct iop_adma_chan *iop_chan = to_iop_adma_chan(chan);
+	int ret;
 
-#include <linux/kernel.h>
-#include <linux/ide.h>
-#include <linux/module.h>
+	ret = dma_cookie_status(chan, cookie, txstate);
+	if (ret == DMA_COMPLETE)
+		return ret;
+
+	iop_adma_slot_cleanup(iop_chan);
+
+	return dma_cookie_status(chan, cookie, txstate);
+}
+
+static irqreturn_t iop_adma_eot_handler(int irq, void *data)
+{
+	struct iop_adma_chan *chan = data;
+
+	dev_dbg(chan->device->common.dev, "%s\n", __func__);
+
+	tasklet_schedule(&chan->irq_tasklet);
+
+	iop_adma_device_clear_eot_status(chan);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t iop_adma_eoc_handler(int irq, void *data)
+{
+	struct iop_adma_chan *chan = data;
+
+	dev_dbg(chan->device->common.dev, "%s\n", __func__);
+
+	tasklet_schedule(&chan->irq_tasklet);
+
+	iop_adma_device_clear_eoc_status(chan);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t iop_adma_err_handler(int irq, void *data)
+{
+	struct iop_adma_chan *chan = data;
+	unsigned long status = iop_chan_get_status(chan);
+
+	dev_err(chan->device->common.dev,
+		"error ( %s%s%s%s%s%s%s)\n",
+		iop_is_err_int_parity(status, chan) ? "int_parity " : "",
+		iop_is_err_mcu_abort(status, chan) ? "mcu_abort " : "",
+		iop_is_err_int_tabort(status, chan) ? "int_tabort " : "",
+		iop_is_err_int_mabort(status, chan) ? "int_mabort " : "",
+		iop_is_err_pci_tabort(status, chan) ? "pci_tabort " : "",
+		iop_is_err_pci_mabort(status, chan) ? "pci_mabort " : "",
+		iop_is_err_split_tx(status, chan) ? "split_tx " : "");
+
+	iop_adma_device_clear_err_status(chan);
+
+	BUG();
+
+	return IRQ_HANDLED;
+}
+
+static void iop_adma_issue_pending(struct dma_chan *chan)
+{
+	struct iop_adma_chan *iop_chan = to_iop_adma_chan(chan);
+
+	if (iop_chan->pending) {
+		iop_chan->pending = 0;
+		iop_chan_append(iop_chan);
+	}
+}
 
 /*
- * PIO 0-5, MWDMA 0-2 and UDMA 0-6 timings (in nanoseconds).
- * These were taken from ATA/ATAPI-6 standard, rev 0a, except
- * for PIO 5, which is a nonstandard extension and UDMA6, which
- * is currently supported only by Maxtor drives.
+ * Perform a transaction to verify the HW works.
  */
+#define IOP_ADMA_TEST_SIZE 2000
 
-static struct ide_timing ide_timing[] = {
-
-	{ XFER_UDMA_6,     0,   0,   0,   0,   0,   0,   0,  15 },
-	{ XFER_UDMA_5,     0,   0,   0,   0,   0,   0,   0,  20 },
-	{ XFER_UDMA_4,     0,   0,   0,   0,   0,   0,   0,  30 },
-	{ XFER_UDMA_3,     0,   0,   0,   0,   0,   0,   0,  45 },
-
-	{ XFER_UDMA_2,     0,   0,   0,   0,   0,   0,   0,  60 },
-	{ XFER_UDMA_1,     0,   0,   0,   0,   0,   0,   0,  80 },
-	{ XFER_UDMA_0,     0,   0,   0,   0,   0,   0,   0, 120 },
-
-	{ XFER_MW_DMA_4,  25,   0,   0,   0,  55,  20,  80,   0 },
-	{ XFER_MW_DMA_3,  25,   0,   0,   0,  65,  25, 100,   0 },
-	{ XFER_MW_DMA_2,  25,   0,   0,   0,  70,  25, 120,   0 },
-	{ XFER_MW_DMA_1,  45,   0,   0,   0,  80,  50, 150,   0 },
-	{ XFER_MW_DMA_0,  60,   0,   0,   0, 215, 215, 480,   0 },
-
-	{ XFER_SW_DMA_2,  60,   0,   0,   0, 120, 120, 240,   0 },
-	{ XFER_SW_DMA_1,  90,   0,   0,   0, 240, 240, 480,   0 },
-	{ XFER_SW_DMA_0, 120,   0,   0,   0, 480, 480, 960,   0 },
-
-	{ XFER_PIO_6,     10,  55,  20,  80,  55,  20,  80,   0 },
-	{ XFER_PIO_5,     15,  65,  25, 100,  65,  25, 100,   0 },
-	{ XFER_PIO_4,     25,  70,  25, 120,  70,  25, 120,   0 },
-	{ XFER_PIO_3,     30,  80,  70, 180,  80,  70, 180,   0 },
-
-	{ XFER_PIO_2,     30, 290,  40, 330, 100,  90, 240,   0 },
-	{ XFER_PIO_1,     50, 290,  93, 383, 125, 100, 383,   0 },
-	{ XFER_PIO_0,     70, 290, 240, 600, 165, 150, 600,   0 },
-
-	{ XFER_PIO_SLOW, 120, 290, 240, 960, 290, 240, 960,   0 },
-
-	{ 0xff }
-};
-
-struct ide_timing *ide_timing_find_mode(u8 speed)
+static int iop_adma_memcpy_self_test(struct iop_adma_device *device)
 {
-	struct ide_timing *t;
+	int i;
+	void *src, *dest;
+	dma_addr_t src_dma, dest_dma;
+	struct dma_chan *dma_chan;
+	dma_cookie_t cookie;
+	struct dma_async_tx_descriptor *tx;
+	int err = 0;
+	struct iop_adma_chan *iop_chan;
 
-	for (t = ide_timing; t->mode != speed; t++)
-		if (t->mode == 0xff)
-			return NULL;
-	return t;
-}
-EXPORT_SYMBOL_GPL(ide_timing_find_mode);
+	dev_dbg(device->common.dev, "%s\n", __func__);
 
-u16 ide_pio_cycle_time(ide_drive_t *drive, u8 pio)
-{
-	u16 *id = drive->id;
-	struct ide_timing *t = ide_timing_find_mode(XFER_PIO_0 + pio);
-	u16 cycle = 0;
-
-	if (id[ATA_ID_FIELD_VALID] & 2) {
-		if (ata_id_has_iordy(drive->id))
-			cycle = id[ATA_ID_EIDE_PIO_IORDY];
-		else
-			cycle = id[ATA_ID_EIDE_PIO];
-
-		/* conservative "downgrade" for all pre-ATA2 drives */
-		if (pio < 3 && cycle < t->cycle)
-			cycle = 0; /* use standard timing */
-
-		/* Use the standard timing for the CF specific modes too */
-		if (pio > 4 && ata_id_is_cfa(id))
-			cycle = 0;
+	src = kmalloc(IOP_ADMA_TEST_SIZE, GFP_KERNEL);
+	if (!src)
+		return -ENOMEM;
+	dest = kzalloc(IOP_ADMA_TEST_SIZE, GFP_KERNEL);
+	if (!dest) {
+		kfree(src);
+		return -ENOMEM;
 	}
 
-	return cycle ? cycle : t->cycle;
+	/* Fill in src buffer */
+	for (i = 0; i < IOP_ADMA_TEST_SIZE; i++)
+		((u8 *) src)[i] = (u8)i;
+
+	/* Start copy, using first DMA channel */
+	dma_chan = container_of(device->common.channels.next,
+				struct dma_chan,
+				device_node);
+	if (iop_adma_alloc_chan_resources(dma_chan) < 1) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	dest_dma = dma_map_single(dma_chan->device->dev, dest,
+				IOP_ADMA_TEST_SIZE, DMA_FROM_DEVICE);
+	src_dma = dma_map_single(dma_chan->device->dev, src,
+				IOP_ADMA_TEST_SIZE, DMA_TO_DEVICE);
+	tx = iop_adma_prep_dma_memcpy(dma_chan, dest_dma, src_dma,
+				      IOP_ADMA_TEST_SIZE,
+				      DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+
+	cookie = iop_adma_tx_submit(tx);
+	iop_adma_issue_pending(dma_chan);
+	msleep(1);
+
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
+			DMA_COMPLETE) {
+		dev_err(dma_chan->device->dev,
+			"Self-test copy timed out, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	iop_chan = to_iop_adma_chan(dma_chan);
+	dma_sync_single_for_cpu(&iop_chan->device->pdev->dev, dest_dma,
+		IOP_ADMA_TEST_SIZE, DMA_FROM_DEVICE);
+	if (memcmp(src, dest, IOP_ADMA_TEST_SIZE)) {
+		dev_err(dma_chan->device->dev,
+			"Self-test copy failed compare, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+free_resources:
+	iop_adma_free_chan_resources(dma_chan);
+out:
+	kfree(src);
+	kfree(dest);
+	return err;
 }
-EXPORT_SYMBOL_GPL(ide_pio_cycle_time);
 
-#define ENOUGH(v, unit)		(((v) - 1) / (unit) + 1)
-#define EZ(v, unit)		((v) ? ENOUGH(v, unit) : 0)
-
-static void ide_timing_quantize(struct ide_timing *t, struct ide_timing *q,
-				int T, int UT)
+#define IOP_ADMA_NUM_SRC_TEST 4 /* must be <= 15 */
+static int
+iop_adma_xor_val_self_test(struct iop_adma_device *device)
 {
-	q->setup   = EZ(t->setup   * 1000,  T);
-	q->act8b   = EZ(t->act8b   * 1000,  T);
-	q->rec8b   = EZ(t->rec8b   * 1000,  T);
-	q->cyc8b   = EZ(t->cyc8b   * 1000,  T);
-	q->active  = EZ(t->active  * 1000,  T);
-	q->recover = EZ(t->recover * 1000,  T);
-	q->cycle   = EZ(t->cycle   * 1000,  T);
-	q->udma    = EZ(t->udma    * 1000, UT);
-}
+	int i, src_idx;
+	struct page *dest;
+	struct page *xor_srcs[IOP_ADMA_NUM_SRC_TEST];
+	struct page *zero_sum_srcs[IOP_ADMA_NUM_SRC_TEST + 1];
+	dma_addr_t dma_srcs[IOP_ADMA_NUM_SRC_TEST + 1];
+	dma_addr_t dest_dma;
+	struct dma_async_tx_descriptor *tx;
+	struct dma_chan *dma_chan;
+	dma_cookie_t cookie;
+	u8 cmp_byte = 0;
+	u32 cmp_word;
+	u32 zero_sum_result;
+	int err = 0;
+	struct iop_adma_chan *iop_chan;
 
-void ide_timing_merge(struct ide_timing *a, struct ide_timing *b,
-		      struct ide_timing *m, unsigned int what)
-{
-	if (what & IDE_TIMING_SETUP)
-		m->setup   = max(a->setup,   b->setup);
-	if (what & IDE_TIMING_ACT8B)
-		m->act8b   = max(a->act8b,   b->act8b);
-	if (what & IDE_TIMING_REC8B)
-		m->rec8b   = max(a->rec8b,   b->rec8b);
-	if (what & IDE_TIMING_CYC8B)
-		m->cyc8b   = max(a->cyc8b,   b->cyc8b);
-	if (what & IDE_TIMING_ACTIVE)
-		m->active  = max(a->active,  b->active);
-	if (what & IDE_TIMING_RECOVER)
-		m->recover = max(a->recover, b->recover);
-	if (what & IDE_TIMING_CYCLE)
-		m->cycle   = max(a->cycle,   b->cycle);
-	if (what & IDE_TIMING_UDMA)
-		m->udma    = max(a->udma,    b->udma);
-}
-EXPORT_SYMBOL_GPL(ide_timing_merge);
+	dev_dbg(device->common.dev, "%s\n", __func__);
 
-int ide_timing_compute(ide_drive_t *drive, u8 speed,
-		       struct ide_timing *t, int T, int UT)
-{
-	u16 *id = drive->id;
-	struct ide_timing *s, p;
-
-	/*
-	 * Find the mode.
-	 */
-	s = ide_timing_find_mode(speed);
-	if (s == NULL)
-		return -EINVAL;
-
-	/*
-	 * Copy the timing from the table.
-	 */
-	*t = *s;
-
-	/*
-	 * If the drive is an EIDE drive, it can tell us it needs extended
-	 * PIO/MWDMA cycle timing.
-	 */
-	if (id[ATA_ID_FIELD_VALID] & 2) {	/* EIDE drive */
-		memset(&p, 0, sizeof(p));
-
-		if (speed >= XFER_PIO_0 && speed < XFER_SW_DMA_0) {
-			if (speed <= XFER_PIO_2)
-				p.cycle = p.cyc8b = id[ATA_ID_EIDE_PIO];
-			else if ((speed <= XFER_PIO_4) ||
-				 (speed == XFER_PIO_5 && !ata_id_is_cfa(id)))
-				p.cycle = p.cyc8b = id[ATA_ID_EIDE_PIO_IORDY];
-		} else if (speed >= XFER_MW_DMA_0 && speed <= XFER_MW_DMA_2)
-			p.cycle = id[ATA_ID_EIDE_DMA_MIN];
-
-		ide_timing_merge(&p, t, t, IDE_TIMING_CYCLE | IDE_TIMING_CYC8B);
+	for (src_idx = 0; src_idx < IOP_ADMA_NUM_SRC_TEST; src_idx++) {
+		xor_srcs[src_idx] = alloc_page(GFP_KERNEL);
+		if (!xor_srcs[src_idx]) {
+			while (src_idx--)
+				__free_page(xor_srcs[src_idx]);
+			return -ENOMEM;
+		}
 	}
 
-	/*
-	 * Convert the timing to bus clock counts.
-	 */
-	ide_timing_quantize(t, t, T, UT);
-
-	/*
-	 * Even in DMA/UDMA modes we still use PIO access for IDENTIFY,
-	 * S.M.A.R.T and some other commands. We have to ensure that the
-	 * DMA cycle timing is slower/equal than the current PIO timing.
-	 */
-	if (speed >= XFER_SW_DMA_0) {
-		ide_timing_compute(drive, drive->pio_mode, &p, T, UT);
-		ide_timing_merge(&p, t, t, IDE_TIMING_ALL);
+	dest = alloc_page(GFP_KERNEL);
+	if (!dest) {
+		while (src_idx--)
+			__free_page(xor_srcs[src_idx]);
+		return -ENOMEM;
 	}
 
-	/*
-	 * Lengthen active & recovery time so that cycle time is correct.
-	 */
-	if (t->act8b + t->rec8b < t->cyc8b) {
-		t->act8b += (t->cyc8b - (t->act8b + t->rec8b)) / 2;
-		t->rec8b = t->cyc8b - t->act8b;
+	/* Fill in src buffers */
+	for (src_idx = 0; src_idx < IOP_ADMA_NUM_SRC_TEST; src_idx++) {
+		u8 *ptr = page_address(xor_srcs[src_idx]);
+		for (i = 0; i < PAGE_SIZE; i++)
+			ptr[i] = (1 << src_idx);
 	}
 
-	if (t->active + t->recover < t->cycle) {
-		t->active += (t->cycle - (t->active + t->recover)) / 2;
-		t->recover = t->cycle - t->active;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(ide_timing_compute);
+	for (src_idx = 0; src_idx < IOP_ADMA_NUM_SRC_TEST; src_idx++)
+		cmp_byte ^= (u8)

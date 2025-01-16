@@ -1,10 +1,4 @@
-#
-# Allwinner sunXi SoC drivers
-#
-config SUNXI_SRAM
-	bool
-	default ARCH_SUNXI
-	help
-	  Say y here to enable the SRAM controller support. This
-	  device is responsible on mapping the SRAM in the sunXi SoCs
-	  whether to the CPU/DMA, or to the devices.
+x3f228
+#define ixDPM_TABLE_140                                                         0x3f22c
+#define ixDPM_TABLE_141                                                         0x3f230
+#define ixDPM_TABLE_142                                             

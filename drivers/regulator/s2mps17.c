@@ -1,892 +1,990 @@
-/*
- * s2mps17.c
- *
- * Copyright (c) 2015 Samsung Electronics Co., Ltd
- *              http://www.samsung.com
- *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the  License, or (at your
- *  option) any later version.
+e files
  *
  */
+DEVICE_CHANNEL(ch0_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 0);
+DEVICE_CHANNEL(ch1_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 1);
+DEVICE_CHANNEL(ch2_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 2);
+DEVICE_CHANNEL(ch3_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 3);
+DEVICE_CHANNEL(ch4_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 4);
+DEVICE_CHANNEL(ch5_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 5);
+DEVICE_CHANNEL(ch6_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 6);
+DEVICE_CHANNEL(ch7_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 7);
 
-#include <linux/bug.h>
-#include <linux/delay.h>
-#include <linux/err.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
-#include <../drivers/pinctrl/samsung/pinctrl-samsung.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/regmap.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/mfd/samsung/s2mps17.h>
-#include <linux/mfd/samsung/s2mps17-private.h>
-#include <linux/io.h>
-#include <linux/mutex.h>
-#include <linux/exynos-ss.h>
-#include <linux/debugfs.h>
-
-static struct s2mps17_info *static_info;
-static struct regulator_desc regulators[S2MPS17_REGULATOR_MAX];
-
-#ifdef CONFIG_DEBUG_FS
-static u8 i2caddr = 0;
-static u8 i2cdata = 0;
-static struct i2c_client *dbgi2c = NULL;
-static struct dentry *s2mps17_root = NULL;
-static struct dentry *s2mps17_i2caddr = NULL;
-static struct dentry *s2mps17_i2cdata = NULL;
-#endif
-
-struct s2mps17_info {
-	struct regulator_dev *rdev[S2MPS17_REGULATOR_MAX];
-	unsigned int opmode[S2MPS17_REGULATOR_MAX];
-	int num_regulators;
-	struct s2mps17_dev *iodev;
-	struct mutex lock;
-	bool g3d_en;
-	bool dvs_en;
-	int dvs_pin;	/*PMIC_BUCK6_DVS*/
-	struct i2c_client *i2c;
+/* Total possible dynamic DIMM Label attribute file table */
+static struct attribute *dynamic_csrow_dimm_attr[] = {
+	&dev_attr_legacy_ch0_dimm_label.attr.attr,
+	&dev_attr_legacy_ch1_dimm_label.attr.attr,
+	&dev_attr_legacy_ch2_dimm_label.attr.attr,
+	&dev_attr_legacy_ch3_dimm_label.attr.attr,
+	&dev_attr_legacy_ch4_dimm_label.attr.attr,
+	&dev_attr_legacy_ch5_dimm_label.attr.attr,
+	&dev_attr_legacy_ch6_dimm_label.attr.attr,
+	&dev_attr_legacy_ch7_dimm_label.attr.attr,
+	NULL
 };
 
-static unsigned int s2mps17_of_map_mode(unsigned int val) {
-	switch (val) {
-	case SEC_OPMODE_SUSPEND:	/* ON in Standby Mode */
-		return 0x1;
-	case SEC_OPMODE_MIF:		/* ON in PWREN_MIF mode */
-		return 0x2;
-	case SEC_OPMODE_ON:		/* ON in Normal Mode */
-		return 0x3;
-	default:
-		return 0x3;
-	}
-}
+/* possible dynamic channel ce_count attribute files */
+DEVICE_CHANNEL(ch0_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 0);
+DEVICE_CHANNEL(ch1_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 1);
+DEVICE_CHANNEL(ch2_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 2);
+DEVICE_CHANNEL(ch3_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 3);
+DEVICE_CHANNEL(ch4_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 4);
+DEVICE_CHANNEL(ch5_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 5);
+DEVICE_CHANNEL(ch6_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 6);
+DEVICE_CHANNEL(ch7_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 7);
 
-/* Some LDOs supports [LPM/Normal]ON mode during suspend state */
-static int s2m_set_mode(struct regulator_dev *rdev,
-				     unsigned int mode)
+/* Total possible dynamic ce_count attribute file table */
+static struct attribute *dynamic_csrow_ce_count_attr[] = {
+	&dev_attr_legacy_ch0_ce_count.attr.attr,
+	&dev_attr_legacy_ch1_ce_count.attr.attr,
+	&dev_attr_legacy_ch2_ce_count.attr.attr,
+	&dev_attr_legacy_ch3_ce_count.attr.attr,
+	&dev_attr_legacy_ch4_ce_count.attr.attr,
+	&dev_attr_legacy_ch5_ce_count.attr.attr,
+	&dev_attr_legacy_ch6_ce_count.attr.attr,
+	&dev_attr_legacy_ch7_ce_count.attr.attr,
+	NULL
+};
+
+static umode_t csrow_dev_is_visible(struct kobject *kobj,
+				    struct attribute *attr, int idx)
 {
-	struct s2mps17_info *s2mps17 = rdev_get_drvdata(rdev);
-	unsigned int val;
-	int ret, id = rdev_get_id(rdev);
+	struct device *dev = kobj_to_dev(kobj);
+	struct csrow_info *csrow = container_of(dev, struct csrow_info, dev);
 
-	val = mode << S2MPS17_ENABLE_SHIFT;
-
-	ret = s2mps17_update_reg(s2mps17->i2c, rdev->desc->enable_reg,
-				  val, rdev->desc->enable_mask);
-	if (ret)
-		return ret;
-
-	s2mps17->opmode[id] = val;
-	return 0;
-}
-
-static int s2m_enable(struct regulator_dev *rdev)
-{
-	struct s2mps17_info *s2mps17 = rdev_get_drvdata(rdev);
-
-	int reg_id = rdev_get_id(rdev);
-
-	/* disregard BUCK6 enable */
-	if (reg_id == S2MPS17_BUCK6 && s2mps17->g3d_en)
+	if (idx >= csrow->nr_channels)
 		return 0;
 
-	return s2mps17_update_reg(s2mps17->i2c, rdev->desc->enable_reg,
-				  s2mps17->opmode[rdev_get_id(rdev)],
-				  rdev->desc->enable_mask);
-}
+	if (idx >= ARRAY_SIZE(dynamic_csrow_ce_count_attr) - 1) {
+		WARN_ONCE(1, "idx: %d\n", idx);
+		return 0;
+	}
 
-static int s2m_disable_regmap(struct regulator_dev *rdev)
-{
-	struct s2mps17_info *s2mps17 = rdev_get_drvdata(rdev);
-	int reg_id = rdev_get_id(rdev);
-	unsigned int val;
-
-	/* disregard BUCK6 disable */
-	if (reg_id == S2MPS17_BUCK6 && s2mps17->g3d_en)
+	/* Only expose populated DIMMs */
+	if (!csrow->channels[idx]->dimm->nr_pages)
 		return 0;
 
-	if (rdev->desc->enable_is_inverted)
-		val = rdev->desc->enable_mask;
-	else
-		val = 0;
-
-	return s2mps17_update_reg(s2mps17->i2c, rdev->desc->enable_reg,
-				  val, rdev->desc->enable_mask);
-}
-
-static int s2m_is_enabled_regmap(struct regulator_dev *rdev)
-{
-	struct s2mps17_info *s2mps17 = rdev_get_drvdata(rdev);
-	int ret, reg_id = rdev_get_id(rdev);
-	u8 val;
-
-	/* BUCK6 is controlled by g3d gpio */
-	if (reg_id == S2MPS17_BUCK6 && s2mps17->g3d_en) {
-/*		exynos_pmu_read(EXYNOS_PMU_G3D_STATUS, &val);
-		if ((val & LOCAL_PWR_CFG) == LOCAL_PWR_CFG)
-			return 1;
-		else
-*/
-			return 0;
-	} else {
-		ret = s2mps17_read_reg(s2mps17->i2c,
-				rdev->desc->enable_reg, &val);
-		if (ret)
-			return ret;
-	}
-
-	if (rdev->desc->enable_is_inverted)
-		return (val & rdev->desc->enable_mask) == 0;
-	else
-		return (val & rdev->desc->enable_mask) != 0;
-}
-
-static int get_ramp_delay(int ramp_delay)
-{
-	unsigned char cnt = 0;
-
-	ramp_delay /= 6;
-
-	while (true) {
-		ramp_delay = ramp_delay >> 1;
-		if (ramp_delay == 0)
-			break;
-		cnt++;
-	}
-	return cnt;
-}
-
-static int s2m_set_ramp_delay(struct regulator_dev *rdev, int ramp_delay)
-{
-	struct s2mps17_info *s2mps17 = rdev_get_drvdata(rdev);
-	int ramp_shift, reg_id = rdev_get_id(rdev);
-	int ramp_mask = 0x03;
-	unsigned int ramp_value = 0;
-
-	ramp_value = get_ramp_delay(ramp_delay/1000);
-	if (ramp_value > 4) {
-		pr_warn("%s: ramp_delay: %d not supported\n",
-			rdev->desc->name, ramp_delay);
-	}
-
-	switch (reg_id) {
-	case S2MPS17_BUCK2:
-	case S2MPS17_BUCK4:
-	case S2MPS17_BUCK5:
-	case S2MPS17_BUCK10:
-	case S2MPS17_BUCK12:
-		ramp_shift = 6;
-		break;
-	case S2MPS17_BUCK1:
-	case S2MPS17_BUCK3:
-	case S2MPS17_BUCK6:
-		ramp_shift = 4;
-		break;
-	case S2MPS17_BUCK7:
-	case S2MPS17_BUCK11:
-		ramp_shift = 2;
-		break;
-	case S2MPS17_BUCK8:
-	case S2MPS17_BUCK9:
-/*	case S2MPS17_BB1:*/
-		ramp_shift = 0;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	return s2mps17_update_reg(s2mps17->i2c, S2MPS17_PMIC_REG_BUCKRAMP,
-		ramp_value << ramp_shift, ramp_mask << ramp_shift);
-}
-
-static int s2m_get_voltage_sel_regmap(struct regulator_dev *rdev)
-{
-	struct s2mps17_info *s2mps17 = rdev_get_drvdata(rdev);
-	int ret, reg_id = rdev_get_id(rdev);
-	u8 val;
-
-	/* if dvs pin set high, get the voltage on the diffrent register. */
-	if (reg_id == S2MPS17_BUCK6
-			&& s2mps17->g3d_en && gpio_is_valid(s2mps17->dvs_pin)) {
-		ret = s2mps17_read_reg(s2mps17->i2c, S2MPS17_PMIC_REG_B6OUT2, &val);
-		if (ret)
-			return ret;
-	} else {
-		ret = s2mps17_read_reg(s2mps17->i2c, rdev->desc->vsel_reg, &val);
-		if (ret)
-			return ret;
-	}
-
-	val &= rdev->desc->vsel_mask;
-
-	return val;
-}
-
-static int s2m_set_voltage_sel_regmap(struct regulator_dev *rdev, unsigned sel)
-{
-	struct s2mps17_info *s2mps17 = rdev_get_drvdata(rdev);
-	int reg_id = rdev_get_id(rdev);
-	int ret;
-	char name[16];
-	unsigned int voltage;
-
-	/* voltage information logging to snapshot feature */
-	snprintf(name, sizeof(name), "LDO%d", (reg_id - S2MPS17_LDO1) + 1);
-	voltage = ((sel & rdev->desc->vsel_mask) * S2MPS17_LDO_STEP2) + S2MPS17_LDO_MIN1;
-	ret = s2mps17_update_reg(s2mps17->i2c, rdev->desc->vsel_reg,
-				  sel, rdev->desc->vsel_mask);
-	if (ret < 0)
-		goto out;
-
-	if (rdev->desc->apply_bit)
-		ret = s2mps17_update_reg(s2mps17->i2c, rdev->desc->apply_reg,
-					 rdev->desc->apply_bit,
-					 rdev->desc->apply_bit);
-	return ret;
-out:
-	pr_warn("%s: failed to set voltage_sel_regmap\n", rdev->desc->name);
-	return ret;
-}
-
-static int s2m_set_voltage_sel_regmap_buck(struct regulator_dev *rdev,
-								unsigned sel)
-{
-	int ret;
-	struct s2mps17_info *s2mps17 = rdev_get_drvdata(rdev);
-	int reg_id = rdev_get_id(rdev);
-	/* If dvs_en = 0, dvs_pin = 1, occur BUG_ON
-		todo : dvs_en ? */
-	if (reg_id == S2MPS17_BUCK6
-		&& !s2mps17->g3d_en && gpio_is_valid(s2mps17->dvs_pin)) {
-		goto i2c_out;
-	}
-
-	ret = s2mps17_write_reg(s2mps17->i2c, rdev->desc->vsel_reg, sel);
-	if (ret < 0)
-		goto i2c_out;
-
-	if (rdev->desc->apply_bit)
-		ret = s2mps17_update_reg(s2mps17->i2c, rdev->desc->apply_reg,
-					 rdev->desc->apply_bit,
-					 rdev->desc->apply_bit);
-
-	return ret;
-
-i2c_out:
-	pr_warn("%s: failed to set voltage_sel_regmap\n", rdev->desc->name);
-	return ret;
-}
-
-static int s2m_set_voltage_time_sel(struct regulator_dev *rdev,
-				   unsigned int old_selector,
-				   unsigned int new_selector)
-{
-	unsigned int ramp_delay = 0;
-	int old_volt, new_volt;
-
-	if (rdev->constraints->ramp_delay)
-		ramp_delay = rdev->constraints->ramp_delay;
-	else if (rdev->desc->ramp_delay)
-		ramp_delay = rdev->desc->ramp_delay;
-
-	if (ramp_delay == 0) {
-		pr_warn("%s: ramp_delay not set\n", rdev->desc->name);
-		return -EINVAL;
-	}
-
-	/* sanity check */
-	if (!rdev->desc->ops->list_voltage)
-		return -EINVAL;
-
-	old_volt = rdev->desc->ops->list_voltage(rdev, old_selector);
-	new_volt = rdev->desc->ops->list_voltage(rdev, new_selector);
-
-	if (old_selector < new_selector)
-		return DIV_ROUND_UP(new_volt - old_volt, ramp_delay);
-
-	return 0;
+	return attr->mode;
 }
 
 
-void s2m_init_dvs(void)
-{
-/*	if (cal_dfs_ext_ctrl(dvfs_g3d, cal_dfs_dvs, 2) != 0) {
-		pr_info("%s: failed to init dvs\n", __func__);
-	}*/
-}
-
-static struct regulator_ops s2mps17_ldo_ops = {
-	.list_voltage		= regulator_list_voltage_linear,
-	.map_voltage		= regulator_map_voltage_linear,
-	.is_enabled		= s2m_is_enabled_regmap,
-	.enable			= s2m_enable,
-	.disable		= s2m_disable_regmap,
-	.get_voltage_sel	= s2m_get_voltage_sel_regmap,
-	.set_voltage_sel	= s2m_set_voltage_sel_regmap,
-	.set_voltage_time_sel	= s2m_set_voltage_time_sel,
-	.set_mode		= s2m_set_mode,
+static const struct attribute_group csrow_dev_dimm_group = {
+	.attrs = dynamic_csrow_dimm_attr,
+	.is_visible = csrow_dev_is_visible,
 };
 
-static struct regulator_ops s2mps17_buck_ops = {
-	.list_voltage		= regulator_list_voltage_linear,
-	.map_voltage		= regulator_map_voltage_linear,
-	.is_enabled		= s2m_is_enabled_regmap,
-	.enable			= s2m_enable,
-	.disable		= s2m_disable_regmap,
-	.get_voltage_sel	= s2m_get_voltage_sel_regmap,
-	.set_voltage_sel	= s2m_set_voltage_sel_regmap_buck,
-	.set_voltage_time_sel	= s2m_set_voltage_time_sel,
-	.set_mode		= s2m_set_mode,
-	.set_ramp_delay		= s2m_set_ramp_delay,
+static const struct attribute_group csrow_dev_ce_count_group = {
+	.attrs = dynamic_csrow_ce_count_attr,
+	.is_visible = csrow_dev_is_visible,
 };
 
-#define _BUCK(macro)	S2MPS17_BUCK##macro
-#define _buck_ops(num)	s2mps17_buck_ops##num
-
-#define _LDO(macro)	S2MPS17_LDO##macro
-#define _REG(ctrl)	S2MPS17_PMIC_REG##ctrl
-#define _ldo_ops(num)	s2mps17_ldo_ops##num
-#define _TIME(macro)	S2MPS17_ENABLE_TIME##macro
-
-#define BUCK_DESC(_name, _id, _ops, m, s, v, e, t)	{	\
-	.name		= _name,				\
-	.id		= _id,					\
-	.ops		= _ops,					\
-	.type		= REGULATOR_VOLTAGE,			\
-	.owner		= THIS_MODULE,				\
-	.min_uV		= m,					\
-	.uV_step	= s,					\
-	.n_voltages	= S2MPS17_BUCK_N_VOLTAGES,		\
-	.vsel_reg	= v,					\
-	.vsel_mask	= S2MPS17_BUCK_VSEL_MASK,		\
-	.enable_reg	= e,					\
-	.enable_mask	= S2MPS17_ENABLE_MASK,			\
-	.enable_time	= t,					\
-	.of_map_mode	= s2mps17_of_map_mode			\
-}
-
-#define LDO_DESC(_name, _id, _ops, m, s, v, e, t)	{	\
-	.name		= _name,				\
-	.id		= _id,					\
-	.ops		= _ops,					\
-	.type		= REGULATOR_VOLTAGE,			\
-	.owner		= THIS_MODULE,				\
-	.min_uV		= m,					\
-	.uV_step	= s,					\
-	.n_voltages	= S2MPS17_LDO_N_VOLTAGES,		\
-	.vsel_reg	= v,					\
-	.vsel_mask	= S2MPS17_LDO_VSEL_MASK,		\
-	.enable_reg	= e,					\
-	.enable_mask	= S2MPS17_ENABLE_MASK,			\
-	.enable_time	= t,					\
-	.of_map_mode	= s2mps17_of_map_mode			\
-}
-
-static struct regulator_desc regulators[S2MPS17_REGULATOR_MAX] = {
-	/* name, id, ops, min_uv, uV_step, vsel_reg, enable_reg */
-	LDO_DESC("LDO1", _LDO(1), &_ldo_ops(), _LDO(_MIN2),
-	_LDO(_STEP1), _REG(_L1CTRL), _REG(_L1CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO2", _LDO(2), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L2CTRL), _REG(_L2CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO3", _LDO(3), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L3CTRL), _REG(_L3CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO4", _LDO(4), &_ldo_ops(), _LDO(_MIN2),
-	_LDO(_STEP1), _REG(_L4CTRL), _REG(_L4CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO5", _LDO(5), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L5CTRL), _REG(_L5CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO6", _LDO(6), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L6CTRL), _REG(_L6CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO7", _LDO(7), &_ldo_ops(), _LDO(_MIN4),
-	_LDO(_STEP2), _REG(_L7CTRL), _REG(_L7CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO8", _LDO(8), &_ldo_ops(), _LDO(_MIN4),
-	_LDO(_STEP2), _REG(_L8CTRL), _REG(_L8CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO9", _LDO(9), &_ldo_ops(), _LDO(_MIN4),
-	_LDO(_STEP2), _REG(_L9CTRL1), _REG(_L9CTRL1), _TIME(_LDO)),
-	LDO_DESC("LDO10", _LDO(10), &_ldo_ops(), _LDO(_MIN2),
-	_LDO(_STEP1), _REG(_L10CTRL), _REG(_L10CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO11", _LDO(11), &_ldo_ops(), _LDO(_MIN2),
-	_LDO(_STEP1), _REG(_L11CTRL), _REG(_L11CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO12", _LDO(12), &_ldo_ops(), _LDO(_MIN2),
-	_LDO(_STEP1), _REG(_L12CTRL), _REG(_L12CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO13", _LDO(13), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP1), _REG(_L13CTRL), _REG(_L13CTRL), _TIME(_LDO)),
-/*	LDO_DESC("LDO14", _LDO(14), &_ldo_ops(), _LDO(_MIN4),
-	_LDO(_STEP2), _REG(_L14CTRL), _REG(_L14CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO15", _LDO(15), &_ldo_ops(), _LDO(_MIN2),
-	_LDO(_STEP1), _REG(_L15CTRL), _REG(_L15CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO16", _LDO(16), &_ldo_ops(), _LDO(_MIN2),
-	_LDO(_STEP1), _REG(_L16CTRL), _REG(_L16CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO17", _LDO(17), &_ldo_ops(), _LDO(_MIN2),
-	_LDO(_STEP1), _REG(_L17CTRL), _REG(_L17CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO18", _LDO(18), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP1), _REG(_L18CTRL), _REG(_L18CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO19", _LDO(19), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L19CTRL), _REG(_L19CTRL), _TIME(_LDO)),*/
-	LDO_DESC("LDO20", _LDO(20), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP1), _REG(_L20CTRL), _REG(_L20CTRL), _TIME(_LDO)),
-/*	LDO_DESC("LDO21", _LDO(21), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L21CTRL), _REG(_L21CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO22", _LDO(22), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP1), _REG(_L22CTRL), _REG(_L22CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO23", _LDO(23), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP1), _REG(_L23CTRL), _REG(_L23CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO24", _LDO(24), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L24CTRL), _REG(_L24CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO25", _LDO(25), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L25CTRL), _REG(_L25CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO26", _LDO(26), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L26CTRL), _REG(_L26CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO27", _LDO(27), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L27CTRL), _REG(_L27CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO28", _LDO(28), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L28CTRL), _REG(_L28CTRL), _TIME(_LDO)),*/
-	LDO_DESC("LDO29", _LDO(29), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L29CTRL), _REG(_L29CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO30", _LDO(30), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L30CTRL), _REG(_L30CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO31", _LDO(31), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L31CTRL), _REG(_L31CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO32", _LDO(32), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L32CTRL), _REG(_L32CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO33", _LDO(33), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP1), _REG(_L33CTRL), _REG(_L33CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO34", _LDO(34), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L34CTRL), _REG(_L34CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO35", _LDO(35), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L35CTRL), _REG(_L35CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO36", _LDO(36), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L36CTRL), _REG(_L36CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO37", _LDO(37), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L37CTRL), _REG(_L37CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO38", _LDO(38), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L38CTRL), _REG(_L38CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO39", _LDO(39), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L39CTRL), _REG(_L39CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO40", _LDO(40), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP1), _REG(_L40CTRL), _REG(_L40CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO41", _LDO(41), &_ldo_ops(), _LDO(_MIN3),
-	_LDO(_STEP2), _REG(_L41CTRL), _REG(_L41CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO42", _LDO(42), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP2), _REG(_L42CTRL), _REG(_L42CTRL), _TIME(_LDO)),
-	LDO_DESC("LDO43", _LDO(43), &_ldo_ops(), _LDO(_MIN1),
-	_LDO(_STEP1), _REG(_L43CTRL), _REG(_L43CTRL), _TIME(_LDO)),
-	BUCK_DESC("BUCK1", _BUCK(1), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B1OUT), _REG(_B1CTRL), _TIME(_BUCK1)),
-	BUCK_DESC("BUCK2", _BUCK(2), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B2OUT), _REG(_B2CTRL), _TIME(_BUCK2)),
-	BUCK_DESC("BUCK3", _BUCK(3), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B3OUT), _REG(_B3CTRL), _TIME(_BUCK3)),
-	BUCK_DESC("BUCK4", _BUCK(4), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B4OUT), _REG(_B4CTRL), _TIME(_BUCK4)),
-	BUCK_DESC("BUCK5", _BUCK(5), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B5OUT), _REG(_B5CTRL), _TIME(_BUCK5)),
-	BUCK_DESC("BUCK6", _BUCK(6), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B6OUT1), _REG(_B6CTRL), _TIME(_BUCK6)),
-	BUCK_DESC("BUCK7", _BUCK(7), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B7OUT), _REG(_B7CTRL), _TIME(_BUCK7)),
-	BUCK_DESC("BUCK8", _BUCK(8), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B8OUT), _REG(_B8CTRL), _TIME(_BUCK8)),
-	BUCK_DESC("BUCK9", _BUCK(9), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B9OUT), _REG(_B9CTRL), _TIME(_BUCK9)),
-	BUCK_DESC("BUCK10", _BUCK(10), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B10OUT), _REG(_B10CTRL), _TIME(_BUCK10)),
-	BUCK_DESC("BUCK11", _BUCK(11), &_buck_ops(), _BUCK(_MIN2),
-	_BUCK(_STEP2), _REG(_B11OUT), _REG(_B11CTRL), _TIME(_BUCK11)),
-	BUCK_DESC("BUCK12", _BUCK(12), &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_B12OUT1), _REG(_B12CTRL), _TIME(_BUCK12)),
-/*	BUCK_DESC("BB", S2MPS17_BB1, &_buck_ops(), _BUCK(_MIN1),
-	_BUCK(_STEP1), _REG(_BB1OUT), _REG(_BB1CTRL),
-	_TIME(_BB)),
-*/
+static const struct attribute_group *csrow_dev_groups[] = {
+	&csrow_dev_dimm_group,
+	&csrow_dev_ce_count_group,
+	NULL
 };
-#ifdef CONFIG_OF
-static int s2mps17_pmic_dt_parse_pdata(struct s2mps17_dev *iodev,
-					struct s2mps17_platform_data *pdata)
+
+static inline int nr_pages_per_csrow(struct csrow_info *csrow)
 {
-	struct device_node *pmic_np, *regulators_np, *reg_np;
-	struct s2mps17_regulator_data *rdata;
-	unsigned int i;
-	int ret;
-	u32 val;
-	pdata->smpl_warn_vth = 0;
-	pdata->smpl_warn_hys = 0;
+	int chan, nr_pages = 0;
 
-	pmic_np = iodev->dev->of_node;
-	if (!pmic_np) {
-		dev_err(iodev->dev, "could not find pmic sub-node\n");
-		return -ENODEV;
-	}
-	/* get 2 gpio values */
-	if (of_gpio_count(pmic_np) < 2) {
-		dev_err(iodev->dev, "could not find pmic gpios\n");
-		return -EINVAL;
-	}
-	pdata->smpl_warn = of_get_gpio(pmic_np, 0);
-	pdata->dvs_pin = of_get_gpio(pmic_np, 1);
+	for (chan = 0; chan < csrow->nr_channels; chan++)
+		nr_pages += csrow->channels[chan]->dimm->nr_pages;
 
-	ret = of_property_read_u32(pmic_np, "g3d_en", &val);
-	if (ret)
-		return -EINVAL;
-	pdata->g3d_en = !!val;
+	return nr_pages;
+}
 
-	ret = of_property_read_u32(pmic_np, "dvs_en", &val);
-	if (ret)
-		return -EINVAL;
-	pdata->dvs_en = !!val;
+/* Create a CSROW object under specifed edac_mc_device */
+static int edac_create_csrow_object(struct mem_ctl_info *mci,
+				    struct csrow_info *csrow, int index)
+{
+	int err;
 
-	ret = of_property_read_u32(pmic_np, "smpl_warn_en", &val);
-	if (ret)
-		return -EINVAL;
-	pdata->smpl_warn_en = !!val;
+	csrow->dev.type = &csrow_attr_type;
+	csrow->dev.bus = mci->bus;
+	csrow->dev.groups = csrow_dev_groups;
+	device_initialize(&csrow->dev);
+	csrow->dev.parent = &mci->dev;
+	csrow->mci = mci;
+	dev_set_name(&csrow->dev, "csrow%d", index);
+	dev_set_drvdata(&csrow->dev, csrow);
 
-	ret = of_property_read_u32(pmic_np, "smpl_warn_vth", &val);
-	if (ret)
-		return -EINVAL;
-	pdata->smpl_warn_vth = val;
+	edac_dbg(0, "creating (virtual) csrow node %s\n",
+		 dev_name(&csrow->dev));
 
-	ret = of_property_read_u32(pmic_np, "smpl_warn_hys", &val);
-	if (ret)
-		return -EINVAL;
-	pdata->smpl_warn_hys = val;
+	err = device_add(&csrow->dev);
+	if (err)
+		put_device(&csrow->dev);
 
-	pdata->adc_mode = 0;
-	ret = of_property_read_u32(pmic_np, "adc_mode", &val);
+	return err;
+}
 
-	pdata->adc_mode = val;
+/* Create a CSROW object under specifed edac_mc_device */
+static int edac_create_csrow_objects(struct mem_ctl_info *mci)
+{
+	int err, i;
+	struct csrow_info *csrow;
 
-	regulators_np = of_find_node_by_name(pmic_np, "regulators");
-	if (!regulators_np) {
-		dev_err(iodev->dev, "could not find regulators sub-node\n");
-		return -EINVAL;
-	}
-
-	/* count the number of regulators to be supported in pmic */
-	pdata->num_regulators = 0;
-	for_each_child_of_node(regulators_np, reg_np) {
-		pdata->num_regulators++;
-	}
-
-	rdata = devm_kzalloc(iodev->dev, sizeof(*rdata) *
-				pdata->num_regulators, GFP_KERNEL);
-	if (!rdata) {
-		dev_err(iodev->dev,
-			"could not allocate memory for regulator data\n");
-		return -ENOMEM;
-	}
-
-	pdata->regulators = rdata;
-	for_each_child_of_node(regulators_np, reg_np) {
-		for (i = 0; i < ARRAY_SIZE(regulators); i++)
-			if (!of_node_cmp(reg_np->name,
-					regulators[i].name))
-				break;
-
-		if (i == ARRAY_SIZE(regulators)) {
-			dev_warn(iodev->dev,
-			"don't know how to configure regulator %s\n",
-			reg_np->name);
+	for (i = 0; i < mci->nr_csrows; i++) {
+		csrow = mci->csrows[i];
+		if (!nr_pages_per_csrow(csrow))
 			continue;
+		err = edac_create_csrow_object(mci, mci->csrows[i], i);
+		if (err < 0) {
+			edac_dbg(1,
+				 "failure: create csrow objects for csrow %d\n",
+				 i);
+			goto error;
 		}
+	}
+	return 0;
 
-		rdata->id = i;
-		rdata->initdata = of_get_regulator_init_data(
-						iodev->dev, reg_np,
-						&regulators[i]);
-		rdata->reg_node = reg_np;
-		rdata++;
+error:
+	for (--i; i >= 0; i--) {
+		csrow = mci->csrows[i];
+		if (!nr_pages_per_csrow(csrow))
+			continue;
+		put_device(&mci->csrows[i]->dev);
 	}
 
-	return 0;
-}
-#else
-static int s2mps17_pmic_dt_parse_pdata(struct s2mps17_pmic_dev *iodev,
-					struct s2mps17_platform_data *pdata)
-{
-	return 0;
-}
-#endif /* CONFIG_OF */
-
-#ifdef CONFIG_DEBUG_FS
-static ssize_t s2mps17_i2caddr_read(struct file *file, char __user *user_buf,
-					size_t count, loff_t *ppos)
-{
-	char buf[10];
-	ssize_t ret;
-
-	ret = snprintf(buf, sizeof(buf), "0x%x\n", i2caddr);
-	if (ret < 0)
-		return ret;
-
-	return simple_read_from_buffer(user_buf, count, ppos, buf, ret);
+	return err;
 }
 
-static ssize_t s2mps17_i2caddr_write(struct file *file, const char __user *user_buf,
-					size_t count, loff_t *ppos)
+static void edac_delete_csrow_objects(struct mem_ctl_info *mci)
 {
-	char buf[10];
-	ssize_t len;
-	u8 val;
+	int i;
+	struct csrow_info *csrow;
 
-	len = simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);
-	if (len < 0)
-		return len;
-
-	buf[len] = '\0';
-
-	if (!kstrtou8(buf, 0, &val))
-		i2caddr = val;
-
-	return len;
-}
-
-static ssize_t s2mps17_i2cdata_read(struct file *file, char __user *user_buf,
-					size_t count, loff_t *ppos)
-{
-	char buf[10];
-	ssize_t ret;
-
-	ret = s2mps17_read_reg(dbgi2c, i2caddr, &i2cdata);
-	if (ret)
-		return ret;
-
-	ret = snprintf(buf, sizeof(buf), "0x%x\n", i2cdata);
-	if (ret < 0)
-		return ret;
-
-	return simple_read_from_buffer(user_buf, count, ppos, buf, ret);
-}
-
-static ssize_t s2mps17_i2cdata_write(struct file *file, const char __user *user_buf,
-					size_t count, loff_t *ppos)
-{
-	char buf[10];
-	ssize_t len, ret;
-	u8 val;
-
-	len = simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);
-	if (len < 0)
-		return len;
-
-	buf[len] = '\0';
-
-	if (!kstrtou8(buf, 0, &val)) {
-		ret = s2mps17_write_reg(dbgi2c, i2caddr, val);
-		if (ret < 0)
-			return ret;
+	for (i = mci->nr_csrows - 1; i >= 0; i--) {
+		csrow = mci->csrows[i];
+		if (!nr_pages_per_csrow(csrow))
+			continue;
+		device_unregister(&mci->csrows[i]->dev);
 	}
-
-	return len;
 }
-
-static const struct file_operations s2mps17_i2caddr_fops = {
-	.open = simple_open,
-	.read = s2mps17_i2caddr_read,
-	.write = s2mps17_i2caddr_write,
-	.llseek = default_llseek,
-};
-static const struct file_operations s2mps17_i2cdata_fops = {
-	.open = simple_open,
-	.read = s2mps17_i2cdata_read,
-	.write = s2mps17_i2cdata_write,
-	.llseek = default_llseek,
-};
 #endif
 
-static int s2mps17_pmic_probe(struct platform_device *pdev)
+/*
+ * Per-dimm (or per-rank) devices
+ */
+
+#define to_dimm(k) container_of(k, struct dimm_info, dev)
+
+/* show/store functions for DIMM Label attributes */
+static ssize_t dimmdev_location_show(struct device *dev,
+				     struct device_attribute *mattr, char *data)
 {
-	struct s2mps17_dev *iodev = dev_get_drvdata(pdev->dev.parent);
-	struct s2mps17_platform_data *pdata = iodev->pdata;
-	struct regulator_config config = { };
-	struct s2mps17_info *s2mps17;
-	int i, ret;
+	struct dimm_info *dimm = to_dimm(dev);
 
-//	ret = s2mps17_read_reg(iodev, S2MPS17_REG_ID, &SEC_PMIC_REV(iodev));
-//	if (ret < 0)
-//		return ret;
+	return edac_dimm_info_location(dimm, data, PAGE_SIZE);
+}
 
-	if (iodev->dev->of_node) {
-		ret = s2mps17_pmic_dt_parse_pdata(iodev, pdata);
-		if (ret)
-			return ret;
+static ssize_t dimmdev_label_show(struct device *dev,
+				  struct device_attribute *mattr, char *data)
+{
+	struct dimm_info *dimm = to_dimm(dev);
+
+	/* if field has not been initialized, there is nothing to send */
+	if (!dimm->label[0])
+		return 0;
+
+	return snprintf(data, sizeof(dimm->label) + 1, "%s\n", dimm->label);
+}
+
+static ssize_t dimmdev_label_store(struct device *dev,
+				   struct device_attribute *mattr,
+				   const char *data,
+				   size_t count)
+{
+	struct dimm_info *dimm = to_dimm(dev);
+	size_t copy_count = count;
+
+	if (count == 0)
+		return -EINVAL;
+
+	if (data[count - 1] == '\0' || data[count - 1] == '\n')
+		copy_count -= 1;
+
+	if (copy_count == 0 || copy_count >= sizeof(dimm->label))
+		return -EINVAL;
+
+	strncpy(dimm->label, data, copy_count);
+	dimm->label[copy_count] = '\0';
+
+	return count;
+}
+
+static ssize_t dimmdev_size_show(struct device *dev,
+				 struct device_attribute *mattr, char *data)
+{
+	struct dimm_info *dimm = to_dimm(dev);
+
+	return sprintf(data, "%u\n", PAGES_TO_MiB(dimm->nr_pages));
+}
+
+static ssize_t dimmdev_mem_type_show(struct device *dev,
+				     struct device_attribute *mattr, char *data)
+{
+	struct dimm_info *dimm = to_dimm(dev);
+
+	return sprintf(data, "%s\n", mem_types[dimm->mtype]);
+}
+
+static ssize_t dimmdev_dev_type_show(struct device *dev,
+				     struct device_attribute *mattr, char *data)
+{
+	struct dimm_info *dimm = to_dimm(dev);
+
+	return sprintf(data, "%s\n", dev_types[dimm->dtype]);
+}
+
+static ssize_t dimmdev_edac_mode_show(struct device *dev,
+				      struct device_attribute *mattr,
+				      char *data)
+{
+	struct dimm_info *dimm = to_dimm(dev);
+
+	return sprintf(data, "%s\n", edac_caps[dimm->edac_mode]);
+}
+
+/* dimm/rank attribute files */
+static DEVICE_ATTR(dimm_label, S_IRUGO | S_IWUSR,
+		   dimmdev_label_show, dimmdev_label_store);
+static DEVICE_ATTR(dimm_location, S_IRUGO, dimmdev_location_show, NULL);
+static DEVICE_ATTR(size, S_IRUGO, dimmdev_size_show, NULL);
+static DEVICE_ATTR(dimm_mem_type, S_IRUGO, dimmdev_mem_type_show, NULL);
+static DEVICE_ATTR(dimm_dev_type, S_IRUGO, dimmdev_dev_type_show, NULL);
+static DEVICE_ATTR(dimm_edac_mode, S_IRUGO, dimmdev_edac_mode_show, NULL);
+
+/* attributes of the dimm<id>/rank<id> object */
+static struct attribute *dimm_attrs[] = {
+	&dev_attr_dimm_label.attr,
+	&dev_attr_dimm_location.attr,
+	&dev_attr_size.attr,
+	&dev_attr_dimm_mem_type.attr,
+	&dev_attr_dimm_dev_type.attr,
+	&dev_attr_dimm_edac_mode.attr,
+	NULL,
+};
+
+static struct attribute_group dimm_attr_grp = {
+	.attrs	= dimm_attrs,
+};
+
+static const struct attribute_group *dimm_attr_groups[] = {
+	&dimm_attr_grp,
+	NULL
+};
+
+static void dimm_attr_release(struct device *dev)
+{
+	struct dimm_info *dimm = container_of(dev, struct dimm_info, dev);
+
+	edac_dbg(1, "Releasing dimm device %s\n", dev_name(dev));
+	kfree(dimm);
+}
+
+static struct device_type dimm_attr_type = {
+	.groups		= dimm_attr_groups,
+	.release	= dimm_attr_release,
+};
+
+/* Create a DIMM object under specifed memory controller device */
+static int edac_create_dimm_object(struct mem_ctl_info *mci,
+				   struct dimm_info *dimm,
+				   int index)
+{
+	int err;
+	dimm->mci = mci;
+
+	dimm->dev.type = &dimm_attr_type;
+	dimm->dev.bus = mci->bus;
+	device_initialize(&dimm->dev);
+
+	dimm->dev.parent = &mci->dev;
+	if (mci->csbased)
+		dev_set_name(&dimm->dev, "rank%d", index);
+	else
+		dev_set_name(&dimm->dev, "dimm%d", index);
+	dev_set_drvdata(&dimm->dev, dimm);
+	pm_runtime_forbid(&mci->dev);
+
+	err =  device_add(&dimm->dev);
+
+	edac_dbg(0, "creating rank/dimm device %s\n", dev_name(&dimm->dev));
+
+	return err;
+}
+
+/*
+ * Memory controller device
+ */
+
+#define to_mci(k) container_of(k, struct mem_ctl_info, dev)
+
+static ssize_t mci_reset_counters_store(struct device *dev,
+					struct device_attribute *mattr,
+					const char *data, size_t count)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	int cnt, row, chan, i;
+	mci->ue_mc = 0;
+	mci->ce_mc = 0;
+	mci->ue_noinfo_count = 0;
+	mci->ce_noinfo_count = 0;
+
+	for (row = 0; row < mci->nr_csrows; row++) {
+		struct csrow_info *ri = mci->csrows[row];
+
+		ri->ue_count = 0;
+		ri->ce_count = 0;
+
+		for (chan = 0; chan < ri->nr_channels; chan++)
+			ri->channels[chan]->ce_count = 0;
 	}
 
-	if (!pdata) {
-		dev_err(pdev->dev.parent, "Platform data not supplied\n");
-		return -ENODEV;
+	cnt = 1;
+	for (i = 0; i < mci->n_layers; i++) {
+		cnt *= mci->layers[i].size;
+		memset(mci->ce_per_layer[i], 0, cnt * sizeof(u32));
+		memset(mci->ue_per_layer[i], 0, cnt * sizeof(u32));
 	}
 
-	s2mps17 = devm_kzalloc(&pdev->dev, sizeof(struct s2mps17_info),
-				GFP_KERNEL);
-	if (!s2mps17)
+	mci->start_time = jiffies;
+	return count;
+}
+
+/* Memory scrubbing interface:
+ *
+ * A MC driver can limit the scrubbing bandwidth based on the CPU type.
+ * Therefore, ->set_sdram_scrub_rate should be made to return the actual
+ * bandwidth that is accepted or 0 when scrubbing is to be disabled.
+ *
+ * Negative value still means that an error has occurred while setting
+ * the scrub rate.
+ */
+static ssize_t mci_sdram_scrub_rate_store(struct device *dev,
+					  struct device_attribute *mattr,
+					  const char *data, size_t count)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	unsigned long bandwidth = 0;
+	int new_bw = 0;
+
+	if (kstrtoul(data, 10, &bandwidth) < 0)
+		return -EINVAL;
+
+	new_bw = mci->set_sdram_scrub_rate(mci, bandwidth);
+	if (new_bw < 0) {
+		edac_printk(KERN_WARNING, EDAC_MC,
+			    "Error setting scrub rate to: %lu\n", bandwidth);
+		return -EINVAL;
+	}
+
+	return count;
+}
+
+/*
+ * ->get_sdram_scrub_rate() return value semantics same as above.
+ */
+static ssize_t mci_sdram_scrub_rate_show(struct device *dev,
+					 struct device_attribute *mattr,
+					 char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	int bandwidth = 0;
+
+	bandwidth = mci->get_sdram_scrub_rate(mci);
+	if (bandwidth < 0) {
+		edac_printk(KERN_DEBUG, EDAC_MC, "Error reading scrub rate\n");
+		return bandwidth;
+	}
+
+	return sprintf(data, "%d\n", bandwidth);
+}
+
+/* default attribute files for the MCI object */
+static ssize_t mci_ue_count_show(struct device *dev,
+				 struct device_attribute *mattr,
+				 char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+
+	return sprintf(data, "%d\n", mci->ue_mc);
+}
+
+static ssize_t mci_ce_count_show(struct device *dev,
+				 struct device_attribute *mattr,
+				 char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+
+	return sprintf(data, "%d\n", mci->ce_mc);
+}
+
+static ssize_t mci_ce_noinfo_show(struct device *dev,
+				  struct device_attribute *mattr,
+				  char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+
+	return sprintf(data, "%d\n", mci->ce_noinfo_count);
+}
+
+static ssize_t mci_ue_noinfo_show(struct device *dev,
+				  struct device_attribute *mattr,
+				  char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+
+	return sprintf(data, "%d\n", mci->ue_noinfo_count);
+}
+
+static ssize_t mci_seconds_show(struct device *dev,
+				struct device_attribute *mattr,
+				char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+
+	return sprintf(data, "%ld\n", (jiffies - mci->start_time) / HZ);
+}
+
+static ssize_t mci_ctl_name_show(struct device *dev,
+				 struct device_attribute *mattr,
+				 char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+
+	return sprintf(data, "%s\n", mci->ctl_name);
+}
+
+static ssize_t mci_size_mb_show(struct device *dev,
+				struct device_attribute *mattr,
+				char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	int total_pages = 0, csrow_idx, j;
+
+	for (csrow_idx = 0; csrow_idx < mci->nr_csrows; csrow_idx++) {
+		struct csrow_info *csrow = mci->csrows[csrow_idx];
+
+		for (j = 0; j < csrow->nr_channels; j++) {
+			struct dimm_info *dimm = csrow->channels[j]->dimm;
+
+			total_pages += dimm->nr_pages;
+		}
+	}
+
+	return sprintf(data, "%u\n", PAGES_TO_MiB(total_pages));
+}
+
+static ssize_t mci_max_location_show(struct device *dev,
+				     struct device_attribute *mattr,
+				     char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	int i;
+	char *p = data;
+
+	for (i = 0; i < mci->n_layers; i++) {
+		p += sprintf(p, "%s %d ",
+			     edac_layer_name[mci->layers[i].type],
+			     mci->layers[i].size - 1);
+	}
+
+	return p - data;
+}
+
+/* default Control file */
+static DEVICE_ATTR(reset_counters, S_IWUSR, NULL, mci_reset_counters_store);
+
+/* default Attribute files */
+static DEVICE_ATTR(mc_name, S_IRUGO, mci_ctl_name_show, NULL);
+static DEVICE_ATTR(size_mb, S_IRUGO, mci_size_mb_show, NULL);
+static DEVICE_ATTR(seconds_since_reset, S_IRUGO, mci_seconds_show, NULL);
+static DEVICE_ATTR(ue_noinfo_count, S_IRUGO, mci_ue_noinfo_show, NULL);
+static DEVICE_ATTR(ce_noinfo_count, S_IRUGO, mci_ce_noinfo_show, NULL);
+static DEVICE_ATTR(ue_count, S_IRUGO, mci_ue_count_show, NULL);
+static DEVICE_ATTR(ce_count, S_IRUGO, mci_ce_count_show, NULL);
+static DEVICE_ATTR(max_location, S_IRUGO, mci_max_location_show, NULL);
+
+/* memory scrubber attribute file */
+DEVICE_ATTR(sdram_scrub_rate, 0, mci_sdram_scrub_rate_show,
+	    mci_sdram_scrub_rate_store); /* umode set later in is_visible */
+
+static struct attribute *mci_attrs[] = {
+	&dev_attr_reset_counters.attr,
+	&dev_attr_mc_name.attr,
+	&dev_attr_size_mb.attr,
+	&dev_attr_seconds_since_reset.attr,
+	&dev_attr_ue_noinfo_count.attr,
+	&dev_attr_ce_noinfo_count.attr,
+	&dev_attr_ue_count.attr,
+	&dev_attr_ce_count.attr,
+	&dev_attr_max_location.attr,
+	&dev_attr_sdram_scrub_rate.attr,
+	NULL
+};
+
+static umode_t mci_attr_is_visible(struct kobject *kobj,
+				   struct attribute *attr, int idx)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct mem_ctl_info *mci = to_mci(dev);
+	umode_t mode = 0;
+
+	if (attr != &dev_attr_sdram_scrub_rate.attr)
+		return attr->mode;
+	if (mci->get_sdram_scrub_rate)
+		mode |= S_IRUGO;
+	if (mci->set_sdram_scrub_rate)
+		mode |= S_IWUSR;
+	return mode;
+}
+
+static struct attribute_group mci_attr_grp = {
+	.attrs	= mci_attrs,
+	.is_visible = mci_attr_is_visible,
+};
+
+static const struct attribute_group *mci_attr_groups[] = {
+	&mci_attr_grp,
+	NULL
+};
+
+static void mci_attr_release(struct device *dev)
+{
+	struct mem_ctl_info *mci = container_of(dev, struct mem_ctl_info, dev);
+
+	edac_dbg(1, "Releasing csrow device %s\n", dev_name(dev));
+	kfree(mci);
+}
+
+static struct device_type mci_attr_type = {
+	.groups		= mci_attr_groups,
+	.release	= mci_attr_release,
+};
+
+/*
+ * Create a new Memory Controller kobject instance,
+ *	mc<id> under the 'mc' directory
+ *
+ * Return:
+ *	0	Success
+ *	!0	Failure
+ */
+int edac_create_sysfs_mci_device(struct mem_ctl_info *mci,
+				 const struct attribute_group **groups)
+{
+	char *name;
+	int i, err;
+
+	/*
+	 * The memory controller needs its own bus, in order to avoid
+	 * namespace conflicts at /sys/bus/edac.
+	 */
+	name = kasprintf(GFP_KERNEL, "mc%d", mci->mc_idx);
+	if (!name)
 		return -ENOMEM;
 
-	s2mps17->iodev = iodev;
-	s2mps17->i2c = iodev->pmic;
+	mci->bus->name = name;
 
-	mutex_init(&s2mps17->lock);
+	edac_dbg(0, "creating bus %s\n", mci->bus->name);
 
-	static_info = s2mps17;
-
-	s2mps17->dvs_en = pdata->dvs_en;
-	s2mps17->g3d_en = pdata->g3d_en;
-	static_info = s2mps17;
-
-	if (gpio_is_valid(pdata->dvs_pin)) {
-		ret = devm_gpio_request(&pdev->dev, pdata->dvs_pin,
-					"S2MPS17 DVS_PIN");
-		if (ret < 0)
-			return ret;
-		if (pdata->dvs_en) {
-			/* Set DVS Regulator Voltage 0x20 - 0.5 voltage */
-			ret = s2mps17_write_reg(s2mps17->i2c, S2MPS17_PMIC_REG_B6OUT2, 0x20);
-			if (ret < 0)
-				return ret;
-			s2m_init_dvs();
-			s2mps17->dvs_pin = pdata->dvs_pin;
-		} else
-			dev_err(&pdev->dev, "g3d dvs is not enabled.\n");
+	err = bus_register(mci->bus);
+	if (err < 0) {
+		kfree(name);
+		return err;
 	}
 
-	platform_set_drvdata(pdev, s2mps17);
+	/* get the /sys/devices/system/edac subsys reference */
+	mci->dev.type = &mci_attr_type;
+	device_initialize(&mci->dev);
 
-	for (i = 0; i < pdata->num_regulators; i++) {
-		int id = pdata->regulators[i].id;
-		config.dev = &pdev->dev;
-		config.init_data = pdata->regulators[i].initdata;
-		config.driver_data = s2mps17;
-		config.of_node = pdata->regulators[i].reg_node;
-		s2mps17->opmode[id] =
-			regulators[id].enable_mask;
+	mci->dev.parent = mci_pdev;
+	mci->dev.bus = mci->bus;
+	mci->dev.groups = groups;
+	dev_set_name(&mci->dev, "mc%d", mci->mc_idx);
+	dev_set_drvdata(&mci->dev, mci);
+	pm_runtime_forbid(&mci->dev);
 
-		s2mps17->rdev[i] = regulator_register(
-				&regulators[id], &config);
-		if (IS_ERR(s2mps17->rdev[i])) {
-			ret = PTR_ERR(s2mps17->rdev[i]);
-			dev_err(&pdev->dev, "regulator init failed for %d\n",
-				i);
-			s2mps17->rdev[i] = NULL;
-			goto err;
-		}
-
+	edac_dbg(0, "creating device %s\n", dev_name(&mci->dev));
+	err = device_add(&mci->dev);
+	if (err < 0) {
+		edac_dbg(1, "failure: create device %s\n", dev_name(&mci->dev));
+		goto fail_unregister_bus;
 	}
 
-	s2mps17->num_regulators = pdata->num_regulators;
+	/*
+	 * Create the dimm/rank devices
+	 */
+	for (i = 0; i < mci->tot_dimms; i++) {
+		struct dimm_info *dimm = mci->dimms[i];
+		/* Only expose populated DIMMs */
+		if (!dimm->nr_pages)
+			continue;
 
-	if (pdata->g3d_en) {
-		/* for buck6 gpio control, disable i2c control */
-		ret = s2mps17_update_reg(s2mps17->i2c, S2MPS17_PMIC_REG_B6CTRL,
-				0x80, 0xC0);
-		if (ret) {
-			dev_err(&pdev->dev, "buck6 gpio control error\n");
-			goto err;
+#ifdef CONFIG_EDAC_DEBUG
+		edac_dbg(1, "creating dimm%d, located at ", i);
+		if (edac_debug_level >= 1) {
+			int lay;
+			for (lay = 0; lay < mci->n_layers; lay++)
+				printk(KERN_CONT "%s %d ",
+					edac_layer_name[mci->layers[lay].type],
+					dimm->location[lay]);
+			printk(KERN_CONT "\n");
 		}
-		ret = s2mps17_update_reg(s2mps17->i2c, S2MPS17_PMIC_REG_L9CTRL1,
-				0x40, 0xC0);
-		if (ret) {
-			dev_err(&pdev->dev, "regulator sync enable error\n");
-				goto err;
+#endif
+		err = edac_create_dimm_object(mci, dimm, i);
+		if (err) {
+			edac_dbg(1, "failure: create dimm %d obj\n", i);
+			goto fail_unregister_dimm;
 		}
 	}
 
-	if (pdata->smpl_warn_en) {
-		ret = s2mps17_update_reg(s2mps17->i2c, S2MPS17_PMIC_REG_CTRL2,
-						pdata->smpl_warn_vth, 0xe0);
-		if (ret) {
-			dev_err(&pdev->dev, "set smpl_warn configuration i2c write error\n");
-			goto err;
-		}
-		pr_info("%s: smpl_warn vth is 0x%x\n", __func__,
-							pdata->smpl_warn_vth);
-
-		ret = s2mps17_update_reg(s2mps17->i2c, S2MPS17_PMIC_REG_CTRL2,
-						pdata->smpl_warn_hys, 0x18);
-		if (ret) {
-			dev_err(&pdev->dev, "set smpl_warn configuration i2c write error\n");
-			goto err;
-		}
-		pr_info("%s: smpl_warn hysteresis is 0x%x\n", __func__,
-							pdata->smpl_warn_hys);
-	}
-
-	s2mps17_update_reg(s2mps17->i2c, S2MPS17_PMIC_REG_RTCBUF, 0x4, 0x4);
-
-	/* SELMIF : LDO2,4,5,6,8,10,11,12,13 */
-	s2mps17_write_reg(s2mps17->i2c, S2MPS17_PMIC_REG_SELMIF1, 0xFF);
-	s2mps17_update_reg(s2mps17->i2c, S2MPS17_PMIC_REG_SELMIF2, 0x01, 0x01);
-
-#ifdef CONFIG_DEBUG_FS
-	dbgi2c = s2mps17->i2c;
-	s2mps17_root = debugfs_create_dir("s2mps17-regs", NULL);
-	s2mps17_i2caddr = debugfs_create_file("i2caddr", 0644, s2mps17_root, NULL, &s2mps17_i2caddr_fops);
-	s2mps17_i2cdata = debugfs_create_file("i2cdata", 0644, s2mps17_root, NULL, &s2mps17_i2cdata_fops);
+#ifdef CONFIG_EDAC_LEGACY_SYSFS
+	err = edac_create_csrow_objects(mci);
+	if (err < 0)
+		goto fail_unregister_dimm;
 #endif
 
-	iodev->adc_mode = pdata->adc_mode;
-	if (iodev->adc_mode > 0)
-		s2mps17_powermeter_init(iodev);
-
+	edac_create_debugfs_nodes(mci);
 	return 0;
-err:
-	for (i = 0; i < S2MPS17_REGULATOR_MAX; i++)
-		regulator_unregister(s2mps17->rdev[i]);
 
-	return ret;
+fail_unregister_dimm:
+	for (i--; i >= 0; i--) {
+		struct dimm_info *dimm = mci->dimms[i];
+		if (!dimm->nr_pages)
+			continue;
+
+		device_unregister(&dimm->dev);
+	}
+	device_unregister(&mci->dev);
+fail_unregister_bus:
+	bus_unregister(mci->bus);
+	kfree(name);
+
+	return err;
 }
 
-static int s2mps17_pmic_remove(struct platform_device *pdev)
+/*
+ * remove a Memory Controller instance
+ */
+void edac_remove_sysfs_mci_device(struct mem_ctl_info *mci)
 {
-	struct s2mps17_info *s2mps17 = platform_get_drvdata(pdev);
 	int i;
 
-#ifdef CONFIG_DEBUG_FS
-	debugfs_remove_recursive(s2mps17_i2cdata);
-	debugfs_remove_recursive(s2mps17_i2caddr);
-	debugfs_remove_recursive(s2mps17_root);
+	edac_dbg(0, "\n");
+
+#ifdef CONFIG_EDAC_DEBUG
+	edac_debugfs_remove_recursive(mci->debugfs);
+#endif
+#ifdef CONFIG_EDAC_LEGACY_SYSFS
+	edac_delete_csrow_objects(mci);
 #endif
 
-	for (i = 0; i < S2MPS17_REGULATOR_MAX; i++)
-		regulator_unregister(s2mps17->rdev[i]);
+	for (i = 0; i < mci->tot_dimms; i++) {
+		struct dimm_info *dimm = mci->dimms[i];
+		if (dimm->nr_pages == 0)
+			continue;
+		edac_dbg(0, "removing device %s\n", dev_name(&dimm->dev));
+		device_unregister(&dimm->dev);
+	}
+}
 
-	s2mps17_powermeter_deinit(s2mps17->iodev);
+void edac_unregister_sysfs(struct mem_ctl_info *mci)
+{
+	const char *name = mci->bus->name;
+
+	edac_dbg(1, "Unregistering device %s\n", dev_name(&mci->dev));
+	device_unregister(&mci->dev);
+	bus_unregister(mci->bus);
+	kfree(name);
+}
+
+static void mc_attr_release(struct device *dev)
+{
+	/*
+	 * There's no container structure here, as this is just the mci
+	 * parent device, used to create the /sys/devices/mc sysfs node.
+	 * So, there are no attributes on it.
+	 */
+	edac_dbg(1, "Releasing device %s\n", dev_name(dev));
+	kfree(dev);
+}
+
+static struct device_type mc_attr_type = {
+	.release	= mc_attr_release,
+};
+/*
+ * Init/exit code for the module. Basically, creates/removes /sys/class/rc
+ */
+int __init edac_mc_sysfs_init(void)
+{
+	struct bus_type *edac_subsys;
+	int err;
+
+	/* get the /sys/devices/system/edac subsys reference */
+	edac_subsys = edac_get_sysfs_subsys();
+	if (edac_subsys == NULL) {
+		edac_dbg(1, "no edac_subsys\n");
+		err = -EINVAL;
+		goto out;
+	}
+
+	mci_pdev = kzalloc(sizeof(*mci_pdev), GFP_KERNEL);
+	if (!mci_pdev) {
+		err = -ENOMEM;
+		goto out_put_sysfs;
+	}
+
+	mci_pdev->bus = edac_subsys;
+	mci_pdev->type = &mc_attr_type;
+	device_initialize(mci_pdev);
+	dev_set_name(mci_pdev, "mc");
+
+	err = device_add(mci_pdev);
+	if (err < 0)
+		goto out_dev_free;
+
+	edac_dbg(0, "device %s created\n", dev_name(mci_pdev));
+
 	return 0;
+
+ out_dev_free:
+	kfree(mci_pdev);
+ out_put_sysfs:
+	edac_put_sysfs_subsys();
+ out:
+	return err;
 }
 
-static const struct platform_device_id s2mps17_pmic_id[] = {
-	{ "s2mps17-regulator", 0},
-	{ },
-};
-MODULE_DEVICE_TABLE(platform, s2mps17_pmic_id);
-
-static struct platform_driver s2mps17_pmic_driver = {
-	.driver = {
-		.name = "s2mps17-regulator",
-		.owner = THIS_MODULE,
-	},
-	.probe = s2mps17_pmic_probe,
-	.remove = s2mps17_pmic_remove,
-	.id_table = s2mps17_pmic_id,
-};
-
-static int __init s2mps17_pmic_init(void)
+void edac_mc_sysfs_exit(void)
 {
-	return platform_driver_register(&s2mps17_pmic_driver);
+	device_unregister(mci_pdev);
+	edac_put_sysfs_subsys();
 }
-subsys_initcall(s2mps17_pmic_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+ * edac_module.c
+ *
+ * (C) 2007 www.softwarebitmaker.com
+ *
+ * This file is licensed under the terms of the GNU General Public
+ * License version 2. This program is licensed "as is" without any
+ * warranty of any kind, whether express or implied.
+ *
+ * Author: Doug Thompson <dougthompson@xmission.com>
+ *
+ */
+#include <linux/edac.h>
 
-static void __exit s2mps17_pmic_exit(void)
+#include "edac_core.h"
+#include "edac_module.h"
+
+#define EDAC_VERSION "Ver: 3.0.0"
+
+#ifdef CONFIG_EDAC_DEBUG
+
+static int edac_set_debug_level(const char *buf, struct kernel_param *kp)
 {
-	platform_driver_unregister(&s2mps17_pmic_driver);
-}
-module_exit(s2mps17_pmic_exit);
+	unsigned long val;
+	int ret;
 
-/* Module information */
-MODULE_AUTHOR("Sangbeom Kim <sbkim73@samsung.com>");
-MODULE_DESCRIPTION("SAMSUNG S2MPS17 Regulator Driver");
+	ret = kstrtoul(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	if (val > 4)
+		return -EINVAL;
+
+	return param_set_int(buf, kp);
+}
+
+/* Values of 0 to 4 will generate output */
+int edac_debug_level = 2;
+EXPORT_SYMBOL_GPL(edac_debug_level);
+
+module_param_call(edac_debug_level, edac_set_debug_level, param_get_int,
+		  &edac_debug_level, 0644);
+MODULE_PARM_DESC(edac_debug_level, "EDAC debug level: [0-4], default: 2");
+#endif
+
+/* scope is to module level only */
+struct workqueue_struct *edac_workqueue;
+
+/*
+ * edac_op_state_to_string()
+ */
+char *edac_op_state_to_string(int opstate)
+{
+	if (opstate == OP_RUNNING_POLL)
+		return "POLLED";
+	else if (opstate == OP_RUNNING_INTERRUPT)
+		return "INTERRUPT";
+	else if (opstate == OP_RUNNING_POLL_INTR)
+		return "POLL-INTR";
+	else if (opstate == OP_ALLOC)
+		return "ALLOC";
+	else if (opstate == OP_OFFLINE)
+		return "OFFLINE";
+
+	return "UNKNOWN";
+}
+
+/*
+ * edac_workqueue_setup
+ *	initialize the edac work queue for polling operations
+ */
+static int edac_workqueue_setup(void)
+{
+	edac_workqueue = create_singlethread_workqueue("edac-poller");
+	if (edac_workqueue == NULL)
+		return -ENODEV;
+	else
+		return 0;
+}
+
+/*
+ * edac_workqueue_teardown
+ *	teardown the edac workqueue
+ */
+static void edac_workqueue_teardown(void)
+{
+	if (edac_workqueue) {
+		flush_workqueue(edac_workqueue);
+		destroy_workqueue(edac_workqueue);
+		edac_workqueue = NULL;
+	}
+}
+
+/*
+ * edac_init
+ *      module initialization entry point
+ */
+static int __init edac_init(void)
+{
+	int err = 0;
+
+	edac_printk(KERN_INFO, EDAC_MC, EDAC_VERSION "\n");
+
+	/*
+	 * Harvest and clear any boot/initialization PCI parity errors
+	 *
+	 * FIXME: This only clears errors logged by devices present at time of
+	 *      module initialization.  We should also do an initial clear
+	 *      of each newly hotplugged device.
+	 */
+	edac_pci_clear_parity_errors();
+
+	err = edac_mc_sysfs_init();
+	if (err)
+		goto err_sysfs;
+
+	edac_debugfs_init();
+
+	err = edac_workqueue_setup();
+	if (err) {
+		edac_printk(KERN_ERR, EDAC_MC, "Failure initializing workqueue\n");
+		goto err_wq;
+	}
+
+	return 0;
+
+err_wq:
+	edac_debugfs_exit();
+	edac_mc_sysfs_exit();
+
+err_sysfs:
+	return err;
+}
+
+/*
+ * edac_exit()
+ *      module exit/termination function
+ */
+static void __exit edac_exit(void)
+{
+	edac_dbg(0, "\n");
+
+	/* tear down the various subsystems */
+	edac_workqueue_teardown();
+	edac_mc_sysfs_exit();
+	edac_debugfs_exit();
+}
+
+/*
+ * Inform the kernel of our entry and exit points
+ */
+subsys_initcall(edac_init);
+module_exit(edac_exit);
+
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Doug Thompson www.softwarebitmaker.com, et al");
+MODULE_DESCRIPTION("Core library routines for EDAC reporting");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+/*
+ * edac_module.h
+ *
+ * For defining functions/data for within the EDAC_CORE module only
+ *
+ * written by doug thompson <norsk5@xmission.h>
+ */
+
+#ifndef	__EDAC_MODULE_H__
+#define	__EDAC_MODULE_H__
+
+#include "edac_core.h"
+
+/*
+ * INTERNAL EDAC MODULE:
+ * EDAC memory controller sysfs create/remove functions
+ * and setup/teardown functions
+ *
+ * edac_mc objects
+ */
+	/* on edac_mc_sysfs.c */
+int edac_mc_sysfs_init(void);
+void edac_mc_sysfs_exit(void);
+extern int edac_create_sysfs_mci_device(struct mem_ctl_info *mci,
+					const struct attribute_group **groups);
+extern void edac_remove_sysfs_mci_device(struct mem_ctl_info *mci);
+void edac_unregister_sysfs(struct mem_ctl_info *mci);
+extern int edac_get_log_ue(void);
+extern int edac_get_log_ce(void);
+extern int edac_get_panic_on_ue(void);
+extern int edac_mc_get_log_ue(void);
+extern int edac_mc_get_log_ce(void);
+extern int edac_mc_get_panic_on_ue(void);
+extern int edac_get_poll_msec(void);
+extern unsigned int edac_mc_get_poll_msec(void);
+
+unsigned edac_dimm_info_location(struct dimm_info *dimm, char *buf,
+				 unsigned len);
+
+	/* on edac_device.c */
+extern int edac_device_register_sysfs_main_kobj(
+				struct edac_device_ctl_info *edac_dev);
+extern void edac_device_unregister_sysfs_main_kobj(
+				struct edac_device_ctl_info *edac_dev);
+extern int edac_device_create_sysfs(struct edac_device_ctl_info *edac_dev);
+extern void edac_device_remove_sysfs(struct edac_device_ctl_info *edac_dev);
+
+/* edac core workqueue: single CPU mode */
+extern struct workqueue_struct *edac_workqueue;
+extern void edac_dev

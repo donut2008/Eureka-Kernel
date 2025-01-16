@@ -1,68 +1,76 @@
-/*
- * iSCSI Initiator TCP Transport
- * Copyright (C) 2004 Dmitry Yusupov
- * Copyright (C) 2004 Alex Aizman
- * Copyright (C) 2005 - 2006 Mike Christie
- * Copyright (C) 2006 Red Hat, Inc.  All rights reserved.
- * maintained by open-iscsi@googlegroups.com
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published
- * by the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * General Public License for more details.
- *
- * See the file COPYING included with this distribution for more details.
- */
+nnel to dma engine */
+	list_add_tail(&chan->chan.device_node, &pdev->device.channels);
 
-#ifndef ISCSI_SW_TCP_H
-#define ISCSI_SW_TCP_H
+	return 0;
+}
 
-#include <scsi/libiscsi.h>
-#include <scsi/libiscsi_tcp.h>
-
-struct socket;
-struct iscsi_tcp_conn;
-
-/* Socket connection send helper */
-struct iscsi_sw_tcp_send {
-	struct iscsi_hdr	*hdr;
-	struct iscsi_segment	segment;
-	struct iscsi_segment	data_segment;
+static const struct of_device_id mmp_pdma_dt_ids[] = {
+	{ .compatible = "marvell,pdma-1.0", },
+	{}
 };
+MODULE_DEVICE_TABLE(of, mmp_pdma_dt_ids);
 
-struct iscsi_sw_tcp_conn {
-	struct socket		*sock;
+static struct dma_chan *mmp_pdma_dma_xlate(struct of_phandle_args *dma_spec,
+					   struct of_dma *ofdma)
+{
+	struct mmp_pdma_device *d = ofdma->of_dma_data;
+	struct dma_chan *chan;
 
-	struct iscsi_sw_tcp_send out;
-	/* old values for socket callbacks */
-	void			(*old_data_ready)(struct sock *);
-	void			(*old_state_change)(struct sock *);
-	void			(*old_write_space)(struct sock *);
+	chan = dma_get_any_slave_channel(&d->device);
+	if (!chan)
+		return NULL;
 
-	/* data and header digests */
-	struct hash_desc	tx_hash;	/* CRC32C (Tx) */
-	struct hash_desc	rx_hash;	/* CRC32C (Rx) */
+	to_mmp_pdma_chan(chan)->drcmr = dma_spec->args[0];
 
-	/* MIB custom statistics */
-	uint32_t		sendpage_failures_cnt;
-	uint32_t		discontiguous_hdr_cnt;
+	return chan;
+}
 
-	ssize_t (*sendpage)(struct socket *, struct page *, int, size_t, int);
-};
+static int mmp_pdma_probe(struct platform_device *op)
+{
+	struct mmp_pdma_device *pdev;
+	const struct of_device_id *of_id;
+	struct mmp_dma_platdata *pdata = dev_get_platdata(&op->dev);
+	struct resource *iores;
+	int i, ret, irq = 0;
+	int dma_channels = 0, irq_num = 0;
+	const enum dma_slave_buswidth widths =
+		DMA_SLAVE_BUSWIDTH_1_BYTE   | DMA_SLAVE_BUSWIDTH_2_BYTES |
+		DMA_SLAVE_BUSWIDTH_4_BYTES;
 
-struct iscsi_sw_tcp_host {
-	struct iscsi_session	*session;
-};
+	pdev = devm_kzalloc(&op->dev, sizeof(*pdev), GFP_KERNEL);
+	if (!pdev)
+		return -ENOMEM;
 
-struct iscsi_sw_tcp_hdrbuf {
-	struct iscsi_hdr	hdrbuf;
-	char			hdrextbuf[ISCSI_MAX_AHS_SIZE +
-		                                  ISCSI_DIGEST_SIZE];
-};
+	pdev->dev = &op->dev;
 
-#endif /* ISCSI_SW_TCP_H */
+	spin_lock_init(&pdev->phy_lock);
+
+	iores = platform_get_resource(op, IORESOURCE_MEM, 0);
+	pdev->base = devm_ioremap_resource(pdev->dev, iores);
+	if (IS_ERR(pdev->base))
+		return PTR_ERR(pdev->base);
+
+	of_id = of_match_device(mmp_pdma_dt_ids, pdev->dev);
+	if (of_id)
+		of_property_read_u32(pdev->dev->of_node, "#dma-channels",
+				     &dma_channels);
+	else if (pdata && pdata->dma_channels)
+		dma_channels = pdata->dma_channels;
+	else
+		dma_channels = 32;	/* default 32 channel */
+	pdev->dma_channels = dma_channels;
+
+	for (i = 0; i < dma_channels; i++) {
+		if (platform_get_irq(op, i) > 0)
+			irq_num++;
+	}
+
+	pdev->phy = devm_kcalloc(pdev->dev, dma_channels, sizeof(*pdev->phy),
+				 GFP_KERNEL);
+	if (pdev->phy == NULL)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&pdev->device.channels);
+
+	if (irq_num != dma_channels) {
+		/* all chan share one irq, 

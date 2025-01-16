@@ -1,1837 +1,932 @@
-/*
- * Elantech Touchpad driver (v6)
- *
- * Copyright (C) 2007-2009 Arjan Opmeer <arjan@opmeer.net>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published
- * by the Free Software Foundation.
- *
- * Trademarks are the property of their respective owners.
- */
-
-#include <linux/delay.h>
-#include <linux/dmi.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/input/mt.h>
-#include <linux/serio.h>
-#include <linux/libps2.h>
-#include <asm/unaligned.h>
-#include "psmouse.h"
-#include "elantech.h"
-
-#define elantech_debug(fmt, ...)					\
-	do {								\
-		if (etd->debug)						\
-			psmouse_printk(KERN_DEBUG, psmouse,		\
-					fmt, ##__VA_ARGS__);		\
-	} while (0)
-
-/*
- * Send a Synaptics style sliced query command
- */
-static int synaptics_send_cmd(struct psmouse *psmouse, unsigned char c,
-				unsigned char *param)
-{
-	if (psmouse_sliced_command(psmouse, c) ||
-	    ps2_command(&psmouse->ps2dev, param, PSMOUSE_CMD_GETINFO)) {
-		psmouse_err(psmouse, "%s query 0x%02x failed.\n", __func__, c);
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
- * V3 and later support this fast command
- */
-static int elantech_send_cmd(struct psmouse *psmouse, unsigned char c,
-				unsigned char *param)
-{
-	struct ps2dev *ps2dev = &psmouse->ps2dev;
-
-	if (ps2_command(ps2dev, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-	    ps2_command(ps2dev, NULL, c) ||
-	    ps2_command(ps2dev, param, PSMOUSE_CMD_GETINFO)) {
-		psmouse_err(psmouse, "%s query 0x%02x failed.\n", __func__, c);
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
- * A retrying version of ps2_command
- */
-static int elantech_ps2_command(struct psmouse *psmouse,
-				unsigned char *param, int command)
-{
-	struct ps2dev *ps2dev = &psmouse->ps2dev;
-	struct elantech_data *etd = psmouse->private;
-	int rc;
-	int tries = ETP_PS2_COMMAND_TRIES;
-
-	do {
-		rc = ps2_command(ps2dev, param, command);
-		if (rc == 0)
-			break;
-		tries--;
-		elantech_debug("retrying ps2 command 0x%02x (%d).\n",
-				command, tries);
-		msleep(ETP_PS2_COMMAND_DELAY);
-	} while (tries > 0);
-
-	if (rc)
-		psmouse_err(psmouse, "ps2 command 0x%02x failed.\n", command);
-
-	return rc;
-}
-
-/*
- * Send an Elantech style special command to read a value from a register
- */
-static int elantech_read_reg(struct psmouse *psmouse, unsigned char reg,
-				unsigned char *val)
-{
-	struct elantech_data *etd = psmouse->private;
-	unsigned char param[3];
-	int rc = 0;
-
-	if (reg < 0x07 || reg > 0x26)
-		return -1;
-
-	if (reg > 0x11 && reg < 0x20)
-		return -1;
-
-	switch (etd->hw_version) {
-	case 1:
-		if (psmouse_sliced_command(psmouse, ETP_REGISTER_READ) ||
-		    psmouse_sliced_command(psmouse, reg) ||
-		    ps2_command(&psmouse->ps2dev, param, PSMOUSE_CMD_GETINFO)) {
-			rc = -1;
-		}
-		break;
-
-	case 2:
-		if (elantech_ps2_command(psmouse,  NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse,  NULL, ETP_REGISTER_READ) ||
-		    elantech_ps2_command(psmouse,  NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse,  NULL, reg) ||
-		    elantech_ps2_command(psmouse, param, PSMOUSE_CMD_GETINFO)) {
-			rc = -1;
-		}
-		break;
-
-	case 3 ... 4:
-		if (elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_REGISTER_READWRITE) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, reg) ||
-		    elantech_ps2_command(psmouse, param, PSMOUSE_CMD_GETINFO)) {
-			rc = -1;
-		}
-		break;
-	}
-
-	if (rc)
-		psmouse_err(psmouse, "failed to read register 0x%02x.\n", reg);
-	else if (etd->hw_version != 4)
-		*val = param[0];
-	else
-		*val = param[1];
-
-	return rc;
-}
-
-/*
- * Send an Elantech style special command to write a register with a value
- */
-static int elantech_write_reg(struct psmouse *psmouse, unsigned char reg,
-				unsigned char val)
-{
-	struct elantech_data *etd = psmouse->private;
-	int rc = 0;
-
-	if (reg < 0x07 || reg > 0x26)
-		return -1;
-
-	if (reg > 0x11 && reg < 0x20)
-		return -1;
-
-	switch (etd->hw_version) {
-	case 1:
-		if (psmouse_sliced_command(psmouse, ETP_REGISTER_WRITE) ||
-		    psmouse_sliced_command(psmouse, reg) ||
-		    psmouse_sliced_command(psmouse, val) ||
-		    ps2_command(&psmouse->ps2dev, NULL, PSMOUSE_CMD_SETSCALE11)) {
-			rc = -1;
-		}
-		break;
-
-	case 2:
-		if (elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_REGISTER_WRITE) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, reg) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, val) ||
-		    elantech_ps2_command(psmouse, NULL, PSMOUSE_CMD_SETSCALE11)) {
-			rc = -1;
-		}
-		break;
-
-	case 3:
-		if (elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_REGISTER_READWRITE) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, reg) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, val) ||
-		    elantech_ps2_command(psmouse, NULL, PSMOUSE_CMD_SETSCALE11)) {
-			rc = -1;
-		}
-		break;
-
-	case 4:
-		if (elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_REGISTER_READWRITE) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, reg) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_REGISTER_READWRITE) ||
-		    elantech_ps2_command(psmouse, NULL, ETP_PS2_CUSTOM_COMMAND) ||
-		    elantech_ps2_command(psmouse, NULL, val) ||
-		    elantech_ps2_command(psmouse, NULL, PSMOUSE_CMD_SETSCALE11)) {
-			rc = -1;
-		}
-		break;
-	}
-
-	if (rc)
-		psmouse_err(psmouse,
-			    "failed to write register 0x%02x with value 0x%02x.\n",
-			    reg, val);
-
-	return rc;
-}
-
-/*
- * Dump a complete mouse movement packet to the syslog
- */
-static void elantech_packet_dump(struct psmouse *psmouse)
-{
-	int	i;
-
-	psmouse_printk(KERN_DEBUG, psmouse, "PS/2 packet [");
-	for (i = 0; i < psmouse->pktsize; i++)
-		printk("%s0x%02x ", i ? ", " : " ", psmouse->packet[i]);
-	printk("]\n");
-}
-
-/*
- * Interpret complete data packets and report absolute mode input events for
- * hardware version 1. (4 byte packets)
- */
-static void elantech_report_absolute_v1(struct psmouse *psmouse)
-{
-	struct input_dev *dev = psmouse->dev;
-	struct elantech_data *etd = psmouse->private;
-	unsigned char *packet = psmouse->packet;
-	int fingers;
-
-	if (etd->fw_version < 0x020000) {
-		/*
-		 * byte 0:  D   U  p1  p2   1  p3   R   L
-		 * byte 1:  f   0  th  tw  x9  x8  y9  y8
-		 */
-		fingers = ((packet[1] & 0x80) >> 7) +
-				((packet[1] & 0x30) >> 4);
-	} else {
-		/*
-		 * byte 0: n1  n0  p2  p1   1  p3   R   L
-		 * byte 1:  0   0   0   0  x9  x8  y9  y8
-		 */
-		fingers = (packet[0] & 0xc0) >> 6;
-	}
-
-	if (etd->jumpy_cursor) {
-		if (fingers != 1) {
-			etd->single_finger_reports = 0;
-		} else if (etd->single_finger_reports < 2) {
-			/* Discard first 2 reports of one finger, bogus */
-			etd->single_finger_reports++;
-			elantech_debug("discarding packet\n");
-			return;
-		}
-	}
-
-	input_report_key(dev, BTN_TOUCH, fingers != 0);
-
-	/*
-	 * byte 2: x7  x6  x5  x4  x3  x2  x1  x0
-	 * byte 3: y7  y6  y5  y4  y3  y2  y1  y0
-	 */
-	if (fingers) {
-		input_report_abs(dev, ABS_X,
-			((packet[1] & 0x0c) << 6) | packet[2]);
-		input_report_abs(dev, ABS_Y,
-			etd->y_max - (((packet[1] & 0x03) << 8) | packet[3]));
-	}
-
-	input_report_key(dev, BTN_TOOL_FINGER, fingers == 1);
-	input_report_key(dev, BTN_TOOL_DOUBLETAP, fingers == 2);
-	input_report_key(dev, BTN_TOOL_TRIPLETAP, fingers == 3);
-	input_report_key(dev, BTN_LEFT, packet[0] & 0x01);
-	input_report_key(dev, BTN_RIGHT, packet[0] & 0x02);
-
-	if (etd->fw_version < 0x020000 &&
-	    (etd->capabilities[0] & ETP_CAP_HAS_ROCKER)) {
-		/* rocker up */
-		input_report_key(dev, BTN_FORWARD, packet[0] & 0x40);
-		/* rocker down */
-		input_report_key(dev, BTN_BACK, packet[0] & 0x80);
-	}
-
-	input_sync(dev);
-}
-
-static void elantech_set_slot(struct input_dev *dev, int slot, bool active,
-			      unsigned int x, unsigned int y)
-{
-	input_mt_slot(dev, slot);
-	input_mt_report_slot_state(dev, MT_TOOL_FINGER, active);
-	if (active) {
-		input_report_abs(dev, ABS_MT_POSITION_X, x);
-		input_report_abs(dev, ABS_MT_POSITION_Y, y);
-	}
-}
-
-/* x1 < x2 and y1 < y2 when two fingers, x = y = 0 when not pressed */
-static void elantech_report_semi_mt_data(struct input_dev *dev,
-					 unsigned int num_fingers,
-					 unsigned int x1, unsigned int y1,
-					 unsigned int x2, unsigned int y2)
-{
-	elantech_set_slot(dev, 0, num_fingers != 0, x1, y1);
-	elantech_set_slot(dev, 1, num_fingers >= 2, x2, y2);
-}
-
-/*
- * Interpret complete data packets and report absolute mode input events for
- * hardware version 2. (6 byte packets)
- */
-static void elantech_report_absolute_v2(struct psmouse *psmouse)
-{
-	struct elantech_data *etd = psmouse->private;
-	struct input_dev *dev = psmouse->dev;
-	unsigned char *packet = psmouse->packet;
-	unsigned int fingers, x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-	unsigned int width = 0, pres = 0;
-
-	/* byte 0: n1  n0   .   .   .   .   R   L */
-	fingers = (packet[0] & 0xc0) >> 6;
-
-	switch (fingers) {
-	case 3:
-		/*
-		 * Same as one finger, except report of more than 3 fingers:
-		 * byte 3:  n4  .   w1  w0   .   .   .   .
-		 */
-		if (packet[3] & 0x80)
-			fingers = 4;
-		/* pass through... */
-	case 1:
-		/*
-		 * byte 1:  .   .   .   .  x11 x10 x9  x8
-		 * byte 2: x7  x6  x5  x4  x4  x2  x1  x0
-		 */
-		x1 = ((packet[1] & 0x0f) << 8) | packet[2];
-		/*
-		 * byte 4:  .   .   .   .  y11 y10 y9  y8
-		 * byte 5: y7  y6  y5  y4  y3  y2  y1  y0
-		 */
-		y1 = etd->y_max - (((packet[4] & 0x0f) << 8) | packet[5]);
-
-		pres = (packet[1] & 0xf0) | ((packet[4] & 0xf0) >> 4);
-		width = ((packet[0] & 0x30) >> 2) | ((packet[3] & 0x30) >> 4);
-		break;
-
-	case 2:
-		/*
-		 * The coordinate of each finger is reported separately
-		 * with a lower resolution for two finger touches:
-		 * byte 0:  .   .  ay8 ax8  .   .   .   .
-		 * byte 1: ax7 ax6 ax5 ax4 ax3 ax2 ax1 ax0
-		 */
-		x1 = (((packet[0] & 0x10) << 4) | packet[1]) << 2;
-		/* byte 2: ay7 ay6 ay5 ay4 ay3 ay2 ay1 ay0 */
-		y1 = etd->y_max -
-			((((packet[0] & 0x20) << 3) | packet[2]) << 2);
-		/*
-		 * byte 3:  .   .  by8 bx8  .   .   .   .
-		 * byte 4: bx7 bx6 bx5 bx4 bx3 bx2 bx1 bx0
-		 */
-		x2 = (((packet[3] & 0x10) << 4) | packet[4]) << 2;
-		/* byte 5: by7 by8 by5 by4 by3 by2 by1 by0 */
-		y2 = etd->y_max -
-			((((packet[3] & 0x20) << 3) | packet[5]) << 2);
-
-		/* Unknown so just report sensible values */
-		pres = 127;
-		width = 7;
-		break;
-	}
-
-	input_report_key(dev, BTN_TOUCH, fingers != 0);
-	if (fingers != 0) {
-		input_report_abs(dev, ABS_X, x1);
-		input_report_abs(dev, ABS_Y, y1);
-	}
-	elantech_report_semi_mt_data(dev, fingers, x1, y1, x2, y2);
-	input_report_key(dev, BTN_TOOL_FINGER, fingers == 1);
-	input_report_key(dev, BTN_TOOL_DOUBLETAP, fingers == 2);
-	input_report_key(dev, BTN_TOOL_TRIPLETAP, fingers == 3);
-	input_report_key(dev, BTN_TOOL_QUADTAP, fingers == 4);
-	input_report_key(dev, BTN_LEFT, packet[0] & 0x01);
-	input_report_key(dev, BTN_RIGHT, packet[0] & 0x02);
-	if (etd->reports_pressure) {
-		input_report_abs(dev, ABS_PRESSURE, pres);
-		input_report_abs(dev, ABS_TOOL_WIDTH, width);
-	}
-
-	input_sync(dev);
-}
-
-static void elantech_report_trackpoint(struct psmouse *psmouse,
-				       int packet_type)
-{
-	/*
-	 * byte 0:  0   0  sx  sy   0   M   R   L
-	 * byte 1:~sx   0   0   0   0   0   0   0
-	 * byte 2:~sy   0   0   0   0   0   0   0
-	 * byte 3:  0   0 ~sy ~sx   0   1   1   0
-	 * byte 4: x7  x6  x5  x4  x3  x2  x1  x0
-	 * byte 5: y7  y6  y5  y4  y3  y2  y1  y0
-	 *
-	 * x and y are written in two's complement spread
-	 * over 9 bits with sx/sy the relative top bit and
-	 * x7..x0 and y7..y0 the lower bits.
-	 * The sign of y is opposite to what the input driver
-	 * expects for a relative movement
-	 */
-
-	struct elantech_data *etd = psmouse->private;
-	struct input_dev *tp_dev = etd->tp_dev;
-	unsigned char *packet = psmouse->packet;
-	int x, y;
-	u32 t;
-
-	t = get_unaligned_le32(&packet[0]);
-
-	switch (t & ~7U) {
-	case 0x06000030U:
-	case 0x16008020U:
-	case 0x26800010U:
-	case 0x36808000U:
-
-		/*
-		 * This firmware misreport coordinates for trackpoint
-		 * occasionally. Discard packets outside of [-127, 127] range
-		 * to prevent cursor jumps.
-		 */
-		if (packet[4] == 0x80 || packet[5] == 0x80 ||
-		    packet[1] >> 7 == packet[4] >> 7 ||
-		    packet[2] >> 7 == packet[5] >> 7) {
-			elantech_debug("discarding packet [%6ph]\n", packet);
-			break;
-
-		}
-		x = packet[4] - (int)((packet[1]^0x80) << 1);
-		y = (int)((packet[2]^0x80) << 1) - packet[5];
-
-		input_report_key(tp_dev, BTN_LEFT, packet[0] & 0x01);
-		input_report_key(tp_dev, BTN_RIGHT, packet[0] & 0x02);
-		input_report_key(tp_dev, BTN_MIDDLE, packet[0] & 0x04);
-
-		input_report_rel(tp_dev, REL_X, x);
-		input_report_rel(tp_dev, REL_Y, y);
-
-		input_sync(tp_dev);
-
-		break;
-
-	default:
-		/* Dump unexpected packet sequences if debug=1 (default) */
-		if (etd->debug == 1)
-			elantech_packet_dump(psmouse);
-
-		break;
-	}
-}
-
-/*
- * Interpret complete data packets and report absolute mode input events for
- * hardware version 3. (12 byte packets for two fingers)
- */
-static void elantech_report_absolute_v3(struct psmouse *psmouse,
-					int packet_type)
-{
-	struct input_dev *dev = psmouse->dev;
-	struct elantech_data *etd = psmouse->private;
-	unsigned char *packet = psmouse->packet;
-	unsigned int fingers = 0, x1 = 0, y1 = 0, x2 = 0, y2 = 0;
-	unsigned int width = 0, pres = 0;
-
-	/* byte 0: n1  n0   .   .   .   .   R   L */
-	fingers = (packet[0] & 0xc0) >> 6;
-
-	switch (fingers) {
-	case 3:
-	case 1:
-		/*
-		 * byte 1:  .   .   .   .  x11 x10 x9  x8
-		 * byte 2: x7  x6  x5  x4  x4  x2  x1  x0
-		 */
-		x1 = ((packet[1] & 0x0f) << 8) | packet[2];
-		/*
-		 * byte 4:  .   .   .   .  y11 y10 y9  y8
-		 * byte 5: y7  y6  y5  y4  y3  y2  y1  y0
-		 */
-		y1 = etd->y_max - (((packet[4] & 0x0f) << 8) | packet[5]);
-		break;
-
-	case 2:
-		if (packet_type == PACKET_V3_HEAD) {
-			/*
-			 * byte 1:   .    .    .    .  ax11 ax10 ax9  ax8
-			 * byte 2: ax7  ax6  ax5  ax4  ax3  ax2  ax1  ax0
-			 */
-			etd->mt[0].x = ((packet[1] & 0x0f) << 8) | packet[2];
-			/*
-			 * byte 4:   .    .    .    .  ay11 ay10 ay9  ay8
-			 * byte 5: ay7  ay6  ay5  ay4  ay3  ay2  ay1  ay0
-			 */
-			etd->mt[0].y = etd->y_max -
-				(((packet[4] & 0x0f) << 8) | packet[5]);
-			/*
-			 * wait for next packet
-			 */
-			return;
-		}
-
-		/* packet_type == PACKET_V3_TAIL */
-		x1 = etd->mt[0].x;
-		y1 = etd->mt[0].y;
-		x2 = ((packet[1] & 0x0f) << 8) | packet[2];
-		y2 = etd->y_max - (((packet[4] & 0x0f) << 8) | packet[5]);
-		break;
-	}
-
-	pres = (packet[1] & 0xf0) | ((packet[4] & 0xf0) >> 4);
-	width = ((packet[0] & 0x30) >> 2) | ((packet[3] & 0x30) >> 4);
-
-	input_report_key(dev, BTN_TOUCH, fingers != 0);
-	if (fingers != 0) {
-		input_report_abs(dev, ABS_X, x1);
-		input_report_abs(dev, ABS_Y, y1);
-	}
-	elantech_report_semi_mt_data(dev, fingers, x1, y1, x2, y2);
-	input_report_key(dev, BTN_TOOL_FINGER, fingers == 1);
-	input_report_key(dev, BTN_TOOL_DOUBLETAP, fingers == 2);
-	input_report_key(dev, BTN_TOOL_TRIPLETAP, fingers == 3);
-
-	/* For clickpads map both buttons to BTN_LEFT */
-	if (etd->fw_version & 0x001000) {
-		input_report_key(dev, BTN_LEFT, packet[0] & 0x03);
-	} else {
-		input_report_key(dev, BTN_LEFT, packet[0] & 0x01);
-		input_report_key(dev, BTN_RIGHT, packet[0] & 0x02);
-	}
-
-	input_report_abs(dev, ABS_PRESSURE, pres);
-	input_report_abs(dev, ABS_TOOL_WIDTH, width);
-
-	input_sync(dev);
-}
-
-static void elantech_input_sync_v4(struct psmouse *psmouse)
-{
-	struct input_dev *dev = psmouse->dev;
-	struct elantech_data *etd = psmouse->private;
-	unsigned char *packet = psmouse->packet;
-
-	/* For clickpads map both buttons to BTN_LEFT */
-	if (etd->fw_version & 0x001000) {
-		input_report_key(dev, BTN_LEFT, packet[0] & 0x03);
-	} else {
-		input_report_key(dev, BTN_LEFT, packet[0] & 0x01);
-		input_report_key(dev, BTN_RIGHT, packet[0] & 0x02);
-		input_report_key(dev, BTN_MIDDLE, packet[0] & 0x04);
-	}
-
-	input_mt_report_pointer_emulation(dev, true);
-	input_sync(dev);
-}
-
-static void process_packet_status_v4(struct psmouse *psmouse)
-{
-	struct input_dev *dev = psmouse->dev;
-	unsigned char *packet = psmouse->packet;
-	unsigned fingers;
-	int i;
-
-	/* notify finger state change */
-	fingers = packet[1] & 0x1f;
-	for (i = 0; i < ETP_MAX_FINGERS; i++) {
-		if ((fingers & (1 << i)) == 0) {
-			input_mt_slot(dev, i);
-			input_mt_report_slot_state(dev, MT_TOOL_FINGER, false);
-		}
-	}
-
-	elantech_input_sync_v4(psmouse);
-}
-
-static void process_packet_head_v4(struct psmouse *psmouse)
-{
-	struct input_dev *dev = psmouse->dev;
-	struct elantech_data *etd = psmouse->private;
-	unsigned char *packet = psmouse->packet;
-	int id;
-	int pres, traces;
-
-	id = ((packet[3] & 0xe0) >> 5) - 1;
-	if (id < 0 || id >= ETP_MAX_FINGERS)
-		return;
-
-	etd->mt[id].x = ((packet[1] & 0x0f) << 8) | packet[2];
-	etd->mt[id].y = etd->y_max - (((packet[4] & 0x0f) << 8) | packet[5]);
-	pres = (packet[1] & 0xf0) | ((packet[4] & 0xf0) >> 4);
-	traces = (packet[0] & 0xf0) >> 4;
-
-	input_mt_slot(dev, id);
-	input_mt_report_slot_state(dev, MT_TOOL_FINGER, true);
-
-	input_report_abs(dev, ABS_MT_POSITION_X, etd->mt[id].x);
-	input_report_abs(dev, ABS_MT_POSITION_Y, etd->mt[id].y);
-	input_report_abs(dev, ABS_MT_PRESSURE, pres);
-	input_report_abs(dev, ABS_MT_TOUCH_MAJOR, traces * etd->width);
-	/* report this for backwards compatibility */
-	input_report_abs(dev, ABS_TOOL_WIDTH, traces);
-
-	elantech_input_sync_v4(psmouse);
-}
-
-static void process_packet_motion_v4(struct psmouse *psmouse)
-{
-	struct input_dev *dev = psmouse->dev;
-	struct elantech_data *etd = psmouse->private;
-	unsigned char *packet = psmouse->packet;
-	int weight, delta_x1 = 0, delta_y1 = 0, delta_x2 = 0, delta_y2 = 0;
-	int id, sid;
-
-	id = ((packet[0] & 0xe0) >> 5) - 1;
-	if (id < 0 || id >= ETP_MAX_FINGERS)
-		return;
-
-	sid = ((packet[3] & 0xe0) >> 5) - 1;
-	weight = (packet[0] & 0x10) ? ETP_WEIGHT_VALUE : 1;
-	/*
-	 * Motion packets give us the delta of x, y values of specific fingers,
-	 * but in two's complement. Let the compiler do the conversion for us.
-	 * Also _enlarge_ the numbers to int, in case of overflow.
-	 */
-	delta_x1 = (signed char)packet[1];
-	delta_y1 = (signed char)packet[2];
-	delta_x2 = (signed char)packet[4];
-	delta_y2 = (signed char)packet[5];
-
-	etd->mt[id].x += delta_x1 * weight;
-	etd->mt[id].y -= delta_y1 * weight;
-	input_mt_slot(dev, id);
-	input_report_abs(dev, ABS_MT_POSITION_X, etd->mt[id].x);
-	input_report_abs(dev, ABS_MT_POSITION_Y, etd->mt[id].y);
-
-	if (sid >= 0 && sid < ETP_MAX_FINGERS) {
-		etd->mt[sid].x += delta_x2 * weight;
-		etd->mt[sid].y -= delta_y2 * weight;
-		input_mt_slot(dev, sid);
-		input_report_abs(dev, ABS_MT_POSITION_X, etd->mt[sid].x);
-		input_report_abs(dev, ABS_MT_POSITION_Y, etd->mt[sid].y);
-	}
-
-	elantech_input_sync_v4(psmouse);
-}
-
-static void elantech_report_absolute_v4(struct psmouse *psmouse,
-					int packet_type)
-{
-	switch (packet_type) {
-	case PACKET_V4_STATUS:
-		process_packet_status_v4(psmouse);
-		break;
-
-	case PACKET_V4_HEAD:
-		process_packet_head_v4(psmouse);
-		break;
-
-	case PACKET_V4_MOTION:
-		process_packet_motion_v4(psmouse);
-		break;
-
-	case PACKET_UNKNOWN:
-	default:
-		/* impossible to get here */
-		break;
-	}
-}
-
-static int elantech_packet_check_v1(struct psmouse *psmouse)
-{
-	struct elantech_data *etd = psmouse->private;
-	unsigned char *packet = psmouse->packet;
-	unsigned char p1, p2, p3;
-
-	/* Parity bits are placed differently */
-	if (etd->fw_version < 0x020000) {
-		/* byte 0:  D   U  p1  p2   1  p3   R   L */
-		p1 = (packet[0] & 0x20) >> 5;
-		p2 = (packet[0] & 0x10) >> 4;
-	} else {
-		/* byte 0: n1  n0  p2  p1   1  p3   R   L */
-		p1 = (packet[0] & 0x10) >> 4;
-		p2 = (packet[0] & 0x20) >> 5;
-	}
-
-	p3 = (packet[0] & 0x04) >> 2;
-
-	return etd->parity[packet[1]] == p1 &&
-	       etd->parity[packet[2]] == p2 &&
-	       etd->parity[packet[3]] == p3;
-}
-
-static int elantech_debounce_check_v2(struct psmouse *psmouse)
-{
-        /*
-         * When we encounter packet that matches this exactly, it means the
-         * hardware is in debounce status. Just ignore the whole packet.
-         */
-        const u8 debounce_packet[] = { 0x84, 0xff, 0xff, 0x02, 0xff, 0xff };
-        unsigned char *packet = psmouse->packet;
-
-        return !memcmp(packet, debounce_packet, sizeof(debounce_packet));
-}
-
-static int elantech_packet_check_v2(struct psmouse *psmouse)
-{
-	struct elantech_data *etd = psmouse->private;
-	unsigned char *packet = psmouse->packet;
-
-	/*
-	 * V2 hardware has two flavors. Older ones that do not report pressure,
-	 * and newer ones that reports pressure and width. With newer ones, all
-	 * packets (1, 2, 3 finger touch) have the same constant bits. With
-	 * older ones, 1/3 finger touch packets and 2 finger touch packets
-	 * have different constant bits.
-	 * With all three cases, if the constant bits are not exactly what I
-	 * expected, I consider them invalid.
-	 */
-	if (etd->reports_pressure)
-		return (packet[0] & 0x0c) == 0x04 &&
-		       (packet[3] & 0x0f) == 0x02;
-
-	if ((packet[0] & 0xc0) == 0x80)
-		return (packet[0] & 0x0c) == 0x0c &&
-		       (packet[3] & 0x0e) == 0x08;
-
-	return (packet[0] & 0x3c) == 0x3c &&
-	       (packet[1] & 0xf0) == 0x00 &&
-	       (packet[3] & 0x3e) == 0x38 &&
-	       (packet[4] & 0xf0) == 0x00;
-}
-
-/*
- * We check the constant bits to determine what packet type we get,
- * so packet checking is mandatory for v3 and later hardware.
- */
-static int elantech_packet_check_v3(struct psmouse *psmouse)
-{
-	struct elantech_data *etd = psmouse->private;
-	const u8 debounce_packet[] = { 0xc4, 0xff, 0xff, 0x02, 0xff, 0xff };
-	unsigned char *packet = psmouse->packet;
-
-	/*
-	 * check debounce first, it has the same signature in byte 0
-	 * and byte 3 as PACKET_V3_HEAD.
-	 */
-	if (!memcmp(packet, debounce_packet, sizeof(debounce_packet)))
-		return PACKET_DEBOUNCE;
-
-	/*
-	 * If the hardware flag 'crc_enabled' is set the packets have
-	 * different signatures.
-	 */
-	if (etd->crc_enabled) {
-		if ((packet[3] & 0x09) == 0x08)
-			return PACKET_V3_HEAD;
-
-		if ((packet[3] & 0x09) == 0x09)
-			return PACKET_V3_TAIL;
-	} else {
-		if ((packet[0] & 0x0c) == 0x04 && (packet[3] & 0xcf) == 0x02)
-			return PACKET_V3_HEAD;
-
-		if ((packet[0] & 0x0c) == 0x0c && (packet[3] & 0xce) == 0x0c)
-			return PACKET_V3_TAIL;
-		if ((packet[3] & 0x0f) == 0x06)
-			return PACKET_TRACKPOINT;
-	}
-
-	return PACKET_UNKNOWN;
-}
-
-static int elantech_packet_check_v4(struct psmouse *psmouse)
-{
-	struct elantech_data *etd = psmouse->private;
-	unsigned char *packet = psmouse->packet;
-	unsigned char packet_type = packet[3] & 0x03;
-	unsigned int ic_version;
-	bool sanity_check;
-
-	if (etd->tp_dev && (packet[3] & 0x0f) == 0x06)
-		return PACKET_TRACKPOINT;
-
-	/* This represents the version of IC body. */
-	ic_version = (etd->fw_version & 0x0f0000) >> 16;
-
-	/*
-	 * Sanity check based on the constant bits of a packet.
-	 * The constant bits change depending on the value of
-	 * the hardware flag 'crc_enabled' and the version of
-	 * the IC body, but are the same for every packet,
-	 * regardless of the type.
-	 */
-	if (etd->crc_enabled)
-		sanity_check = ((packet[3] & 0x08) == 0x00);
-	else if (ic_version == 7 && etd->samples[1] == 0x2A)
-		sanity_check = ((packet[3] & 0x1c) == 0x10);
-	else
-		sanity_check = ((packet[0] & 0x08) == 0x00 &&
-				(packet[3] & 0x1c) == 0x10);
-
-	if (!sanity_check)
-		return PACKET_UNKNOWN;
-
-	switch (packet_type) {
-	case 0:
-		return PACKET_V4_STATUS;
-
-	case 1:
-		return PACKET_V4_HEAD;
-
-	case 2:
-		return PACKET_V4_MOTION;
-	}
-
-	return PACKET_UNKNOWN;
-}
-
-/*
- * Process byte stream from mouse and handle complete packets
- */
-static psmouse_ret_t elantech_process_byte(struct psmouse *psmouse)
-{
-	struct elantech_data *etd = psmouse->private;
-	int packet_type;
-
-	if (psmouse->pktcnt < psmouse->pktsize)
-		return PSMOUSE_GOOD_DATA;
-
-	if (etd->debug > 1)
-		elantech_packet_dump(psmouse);
-
-	switch (etd->hw_version) {
-	case 1:
-		if (etd->paritycheck && !elantech_packet_check_v1(psmouse))
-			return PSMOUSE_BAD_DATA;
-
-		elantech_report_absolute_v1(psmouse);
-		break;
-
-	case 2:
-		/* ignore debounce */
-		if (elantech_debounce_check_v2(psmouse))
-			return PSMOUSE_FULL_PACKET;
-
-		if (etd->paritycheck && !elantech_packet_check_v2(psmouse))
-			return PSMOUSE_BAD_DATA;
-
-		elantech_report_absolute_v2(psmouse);
-		break;
-
-	case 3:
-		packet_type = elantech_packet_check_v3(psmouse);
-		switch (packet_type) {
-		case PACKET_UNKNOWN:
-			return PSMOUSE_BAD_DATA;
-
-		case PACKET_DEBOUNCE:
-			/* ignore debounce */
-			break;
-
-		case PACKET_TRACKPOINT:
-			elantech_report_trackpoint(psmouse, packet_type);
-			break;
-
-		default:
-			elantech_report_absolute_v3(psmouse, packet_type);
-			break;
-		}
-
-		break;
-
-	case 4:
-		packet_type = elantech_packet_check_v4(psmouse);
-		switch (packet_type) {
-		case PACKET_UNKNOWN:
-			return PSMOUSE_BAD_DATA;
-
-		case PACKET_TRACKPOINT:
-			elantech_report_trackpoint(psmouse, packet_type);
-			break;
-
-		default:
-			elantech_report_absolute_v4(psmouse, packet_type);
-			break;
-		}
-
-		break;
-	}
-
-	return PSMOUSE_FULL_PACKET;
-}
-
-/*
- * This writes the reg_07 value again to the hardware at the end of every
- * set_rate call because the register loses its value. reg_07 allows setting
- * absolute mode on v4 hardware
- */
-static void elantech_set_rate_restore_reg_07(struct psmouse *psmouse,
-		unsigned int rate)
-{
-	struct elantech_data *etd = psmouse->private;
-
-	etd->original_set_rate(psmouse, rate);
-	if (elantech_write_reg(psmouse, 0x07, etd->reg_07))
-		psmouse_err(psmouse, "restoring reg_07 failed\n");
-}
-
-/*
- * Put the touchpad into absolute mode
- */
-static int elantech_set_absolute_mode(struct psmouse *psmouse)
-{
-	struct elantech_data *etd = psmouse->private;
-	unsigned char val;
-	int tries = ETP_READ_BACK_TRIES;
-	int rc = 0;
-
-	switch (etd->hw_version) {
-	case 1:
-		etd->reg_10 = 0x16;
-		etd->reg_11 = 0x8f;
-		if (elantech_write_reg(psmouse, 0x10, etd->reg_10) ||
-		    elantech_write_reg(psmouse, 0x11, etd->reg_11)) {
-			rc = -1;
-		}
-		break;
-
-	case 2:
-					/* Windows driver values */
-		etd->reg_10 = 0x54;
-		etd->reg_11 = 0x88;	/* 0x8a */
-		etd->reg_21 = 0x60;	/* 0x00 */
-		if (elantech_write_reg(psmouse, 0x10, etd->reg_10) ||
-		    elantech_write_reg(psmouse, 0x11, etd->reg_11) ||
-		    elantech_write_reg(psmouse, 0x21, etd->reg_21)) {
-			rc = -1;
-		}
-		break;
-
-	case 3:
-		if (etd->set_hw_resolution)
-			etd->reg_10 = 0x0b;
-		else
-			etd->reg_10 = 0x01;
-
-		if (elantech_write_reg(psmouse, 0x10, etd->reg_10))
-			rc = -1;
-
-		break;
-
-	case 4:
-		etd->reg_07 = 0x01;
-		if (elantech_write_reg(psmouse, 0x07, etd->reg_07))
-			rc = -1;
-
-		goto skip_readback_reg_10; /* v4 has no reg 0x10 to read */
-	}
-
-	if (rc == 0) {
-		/*
-		 * Read back reg 0x10. For hardware version 1 we must make
-		 * sure the absolute mode bit is set. For hardware version 2
-		 * the touchpad is probably initializing and not ready until
-		 * we read back the value we just wrote.
-		 */
-		do {
-			rc = elantech_read_reg(psmouse, 0x10, &val);
-			if (rc == 0)
-				break;
-			tries--;
-			elantech_debug("retrying read (%d).\n", tries);
-			msleep(ETP_READ_BACK_DELAY);
-		} while (tries > 0);
-
-		if (rc) {
-			psmouse_err(psmouse,
-				    "failed to read back register 0x10.\n");
-		} else if (etd->hw_version == 1 &&
-			   !(val & ETP_R10_ABSOLUTE_MODE)) {
-			psmouse_err(psmouse,
-				    "touchpad refuses to switch to absolute mode.\n");
-			rc = -1;
-		}
-	}
-
- skip_readback_reg_10:
-	if (rc)
-		psmouse_err(psmouse, "failed to initialise registers.\n");
-
-	return rc;
-}
-
-static int elantech_set_range(struct psmouse *psmouse,
-			      unsigned int *x_min, unsigned int *y_min,
-			      unsigned int *x_max, unsigned int *y_max,
-			      unsigned int *width)
-{
-	struct elantech_data *etd = psmouse->private;
-	unsigned char param[3];
-	unsigned char traces;
-
-	switch (etd->hw_version) {
-	case 1:
-		*x_min = ETP_XMIN_V1;
-		*y_min = ETP_YMIN_V1;
-		*x_max = ETP_XMAX_V1;
-		*y_max = ETP_YMAX_V1;
-		break;
-
-	case 2:
-		if (etd->fw_version == 0x020800 ||
-		    etd->fw_version == 0x020b00 ||
-		    etd->fw_version == 0x020030) {
-			*x_min = ETP_XMIN_V2;
-			*y_min = ETP_YMIN_V2;
-			*x_max = ETP_XMAX_V2;
-			*y_max = ETP_YMAX_V2;
-		} else {
-			int i;
-			int fixed_dpi;
-
-			i = (etd->fw_version > 0x020800 &&
-			     etd->fw_version < 0x020900) ? 1 : 2;
-
-			if (etd->send_cmd(psmouse, ETP_FW_ID_QUERY, param))
-				return -1;
-
-			fixed_dpi = param[1] & 0x10;
-
-			if (((etd->fw_version >> 16) == 0x14) && fixed_dpi) {
-				if (etd->send_cmd(psmouse, ETP_SAMPLE_QUERY, param))
-					return -1;
-
-				*x_max = (etd->capabilities[1] - i) * param[1] / 2;
-				*y_max = (etd->capabilities[2] - i) * param[2] / 2;
-			} else if (etd->fw_version == 0x040216) {
-				*x_max = 819;
-				*y_max = 405;
-			} else if (etd->fw_version == 0x040219 || etd->fw_version == 0x040215) {
-				*x_max = 900;
-				*y_max = 500;
-			} else {
-				*x_max = (etd->capabilities[1] - i) * 64;
-				*y_max = (etd->capabilities[2] - i) * 64;
-			}
-		}
-		break;
-
-	case 3:
-		if (etd->send_cmd(psmouse, ETP_FW_ID_QUERY, param))
-			return -1;
-
-		*x_max = (0x0f & param[0]) << 8 | param[1];
-		*y_max = (0xf0 & param[0]) << 4 | param[2];
-		break;
-
-	case 4:
-		if (etd->send_cmd(psmouse, ETP_FW_ID_QUERY, param))
-			return -1;
-
-		*x_max = (0x0f & param[0]) << 8 | param[1];
-		*y_max = (0xf0 & param[0]) << 4 | param[2];
-		traces = etd->capabilities[1];
-		if ((traces < 2) || (traces > *x_max))
-			return -1;
-
-		*width = *x_max / (traces - 1);
-		break;
-	}
-
-	return 0;
-}
-
-/*
- * (value from firmware) * 10 + 790 = dpi
- * we also have to convert dpi to dots/mm (*10/254 to avoid floating point)
- */
-static unsigned int elantech_convert_res(unsigned int val)
-{
-	return (val * 10 + 790) * 10 / 254;
-}
-
-static int elantech_get_resolution_v4(struct psmouse *psmouse,
-				      unsigned int *x_res,
-				      unsigned int *y_res)
-{
-	unsigned char param[3];
-
-	if (elantech_send_cmd(psmouse, ETP_RESOLUTION_QUERY, param))
-		return -1;
-
-	*x_res = elantech_convert_res(param[1] & 0x0f);
-	*y_res = elantech_convert_res((param[1] & 0xf0) >> 4);
-
-	return 0;
-}
-
-/*
- * Advertise INPUT_PROP_BUTTONPAD for clickpads. The testing of bit 12 in
- * fw_version for this is based on the following fw_version & caps table:
- *
- * Laptop-model:           fw_version:     caps:           buttons:
- * Acer S3                 0x461f00        10, 13, 0e      clickpad
- * Acer S7-392             0x581f01        50, 17, 0d      clickpad
- * Acer V5-131             0x461f02        01, 16, 0c      clickpad
- * Acer V5-551             0x461f00        ?               clickpad
- * Asus K53SV              0x450f01        78, 15, 0c      2 hw buttons
- * Asus G46VW              0x460f02        00, 18, 0c      2 hw buttons
- * Asus G750JX             0x360f00        00, 16, 0c      2 hw buttons
- * Asus TP500LN            0x381f17        10, 14, 0e      clickpad
- * Asus X750JN             0x381f17        10, 14, 0e      clickpad
- * Asus UX31               0x361f00        20, 15, 0e      clickpad
- * Asus UX32VD             0x361f02        00, 15, 0e      clickpad
- * Avatar AVIU-145A2       0x361f00        ?               clickpad
- * Fujitsu CELSIUS H760    0x570f02        40, 14, 0c      3 hw buttons (**)
- * Fujitsu CELSIUS H780    0x5d0f02        41, 16, 0d      3 hw buttons (**)
- * Fujitsu LIFEBOOK E544   0x470f00        d0, 12, 09      2 hw buttons
- * Fujitsu LIFEBOOK E546   0x470f00        50, 12, 09      2 hw buttons
- * Fujitsu LIFEBOOK E547   0x470f00        50, 12, 09      2 hw buttons
- * Fujitsu LIFEBOOK E554   0x570f01        40, 14, 0c      2 hw buttons
- * Fujitsu LIFEBOOK E557   0x570f01        40, 14, 0c      2 hw buttons
- * Fujitsu T725            0x470f01        05, 12, 09      2 hw buttons
- * Fujitsu H730            0x570f00        c0, 14, 0c      3 hw buttons (**)
- * Gigabyte U2442          0x450f01        58, 17, 0c      2 hw buttons
- * Lenovo L430             0x350f02        b9, 15, 0c      2 hw buttons (*)
- * Lenovo L530             0x350f02        b9, 15, 0c      2 hw buttons (*)
- * Samsung NF210           0x150b00        78, 14, 0a      2 hw buttons
- * Samsung NP770Z5E        0x575f01        10, 15, 0f      clickpad
- * Samsung NP700Z5B        0x361f06        21, 15, 0f      clickpad
- * Samsung NP900X3E-A02    0x575f03        ?               clickpad
- * Samsung NP-QX410        0x851b00        19, 14, 0c      clickpad
- * Samsung RC512           0x450f00        08, 15, 0c      2 hw buttons
- * Samsung RF710           0x450f00        ?               2 hw buttons
- * System76 Pangolin       0x250f01        ?               2 hw buttons
- * (*) + 3 trackpoint buttons
- * (**) + 0 trackpoint buttons
- * Note: Lenovo L430 and Lenovo L430 have the same fw_version/caps
- */
-static void elantech_set_buttonpad_prop(struct psmouse *psmouse)
-{
-	struct input_dev *dev = psmouse->dev;
-	struct elantech_data *etd = psmouse->private;
-
-	if (etd->fw_version & 0x001000) {
-		__set_bit(INPUT_PROP_BUTTONPAD, dev->propbit);
-		__clear_bit(BTN_RIGHT, dev->keybit);
-	}
-}
-
-/*
- * Some hw_version 4 models do have a middle button
- */
-static const struct dmi_system_id elantech_dmi_has_middle_button[] = {
-#if defined(CONFIG_DMI) && defined(CONFIG_X86)
-	{
-		/* Fujitsu H730 has a middle button */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "CELSIUS H730"),
-		},
-	},
-	{
-		/* Fujitsu H760 also has a middle button */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "CELSIUS H760"),
-		},
-	},
-	{
-		/* Fujitsu H780 also has a middle button */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "CELSIUS H780"),
-		},
-	},
-#endif
-	{ }
-};
-
-static const char * const middle_button_pnp_ids[] = {
-	"LEN2131", /* ThinkPad P52 w/ NFC */
-	"LEN2132", /* ThinkPad P52 */
-	"LEN2133", /* ThinkPad P72 w/ NFC */
-	"LEN2134", /* ThinkPad P72 */
-	"LEN0407",
-	"LEN0408",
-	NULL
-};
-
-/*
- * Set the appropriate event bits for the input subsystem
- */
-static int elantech_set_input_params(struct psmouse *psmouse)
-{
-	struct input_dev *dev = psmouse->dev;
-	struct elantech_data *etd = psmouse->private;
-	unsigned int x_min = 0, y_min = 0, x_max = 0, y_max = 0, width = 0;
-	unsigned int x_res = 31, y_res = 31;
-
-	if (elantech_set_range(psmouse, &x_min, &y_min, &x_max, &y_max, &width))
-		return -1;
-
-	__set_bit(INPUT_PROP_POINTER, dev->propbit);
-	__set_bit(EV_KEY, dev->evbit);
-	__set_bit(EV_ABS, dev->evbit);
-	__clear_bit(EV_REL, dev->evbit);
-
-	__set_bit(BTN_LEFT, dev->keybit);
-	if (dmi_check_system(elantech_dmi_has_middle_button) ||
-			psmouse_matches_pnp_id(psmouse, middle_button_pnp_ids))
-		__set_bit(BTN_MIDDLE, dev->keybit);
-	__set_bit(BTN_RIGHT, dev->keybit);
-
-	__set_bit(BTN_TOUCH, dev->keybit);
-	__set_bit(BTN_TOOL_FINGER, dev->keybit);
-	__set_bit(BTN_TOOL_DOUBLETAP, dev->keybit);
-	__set_bit(BTN_TOOL_TRIPLETAP, dev->keybit);
-
-	switch (etd->hw_version) {
-	case 1:
-		/* Rocker button */
-		if (etd->fw_version < 0x020000 &&
-		    (etd->capabilities[0] & ETP_CAP_HAS_ROCKER)) {
-			__set_bit(BTN_FORWARD, dev->keybit);
-			__set_bit(BTN_BACK, dev->keybit);
-		}
-		input_set_abs_params(dev, ABS_X, x_min, x_max, 0, 0);
-		input_set_abs_params(dev, ABS_Y, y_min, y_max, 0, 0);
-		break;
-
-	case 2:
-		__set_bit(BTN_TOOL_QUADTAP, dev->keybit);
-		__set_bit(INPUT_PROP_SEMI_MT, dev->propbit);
-		/* fall through */
-	case 3:
-		if (etd->hw_version == 3)
-			elantech_set_buttonpad_prop(psmouse);
-		input_set_abs_params(dev, ABS_X, x_min, x_max, 0, 0);
-		input_set_abs_params(dev, ABS_Y, y_min, y_max, 0, 0);
-		if (etd->reports_pressure) {
-			input_set_abs_params(dev, ABS_PRESSURE, ETP_PMIN_V2,
-					     ETP_PMAX_V2, 0, 0);
-			input_set_abs_params(dev, ABS_TOOL_WIDTH, ETP_WMIN_V2,
-					     ETP_WMAX_V2, 0, 0);
-		}
-		input_mt_init_slots(dev, 2, INPUT_MT_SEMI_MT);
-		input_set_abs_params(dev, ABS_MT_POSITION_X, x_min, x_max, 0, 0);
-		input_set_abs_params(dev, ABS_MT_POSITION_Y, y_min, y_max, 0, 0);
-		break;
-
-	case 4:
-		if (elantech_get_resolution_v4(psmouse, &x_res, &y_res)) {
-			/*
-			 * if query failed, print a warning and leave the values
-			 * zero to resemble synaptics.c behavior.
-			 */
-			psmouse_warn(psmouse, "couldn't query resolution data.\n");
-		}
-		elantech_set_buttonpad_prop(psmouse);
-		__set_bit(BTN_TOOL_QUADTAP, dev->keybit);
-		/* For X to recognize me as touchpad. */
-		input_set_abs_params(dev, ABS_X, x_min, x_max, 0, 0);
-		input_set_abs_params(dev, ABS_Y, y_min, y_max, 0, 0);
-		/*
-		 * range of pressure and width is the same as v2,
-		 * report ABS_PRESSURE, ABS_TOOL_WIDTH for compatibility.
-		 */
-		input_set_abs_params(dev, ABS_PRESSURE, ETP_PMIN_V2,
-				     ETP_PMAX_V2, 0, 0);
-		input_set_abs_params(dev, ABS_TOOL_WIDTH, ETP_WMIN_V2,
-				     ETP_WMAX_V2, 0, 0);
-		/* Multitouch capable pad, up to 5 fingers. */
-		input_mt_init_slots(dev, ETP_MAX_FINGERS, 0);
-		input_set_abs_params(dev, ABS_MT_POSITION_X, x_min, x_max, 0, 0);
-		input_set_abs_params(dev, ABS_MT_POSITION_Y, y_min, y_max, 0, 0);
-		input_set_abs_params(dev, ABS_MT_PRESSURE, ETP_PMIN_V2,
-				     ETP_PMAX_V2, 0, 0);
-		/*
-		 * The firmware reports how many trace lines the finger spans,
-		 * convert to surface unit as Protocol-B requires.
-		 */
-		input_set_abs_params(dev, ABS_MT_TOUCH_MAJOR, 0,
-				     ETP_WMAX_V2 * width, 0, 0);
-		break;
-	}
-
-	input_abs_set_res(dev, ABS_X, x_res);
-	input_abs_set_res(dev, ABS_Y, y_res);
-	if (etd->hw_version > 1) {
-		input_abs_set_res(dev, ABS_MT_POSITION_X, x_res);
-		input_abs_set_res(dev, ABS_MT_POSITION_Y, y_res);
-	}
-
-	etd->y_max = y_max;
-	etd->width = width;
-
-	return 0;
-}
-
-struct elantech_attr_data {
-	size_t		field_offset;
-	unsigned char	reg;
-};
-
-/*
- * Display a register value by reading a sysfs entry
- */
-static ssize_t elantech_show_int_attr(struct psmouse *psmouse, void *data,
-					char *buf)
-{
-	struct elantech_data *etd = psmouse->private;
-	struct elantech_attr_data *attr = data;
-	unsigned char *reg = (unsigned char *) etd + attr->field_offset;
-	int rc = 0;
-
-	if (attr->reg)
-		rc = elantech_read_reg(psmouse, attr->reg, reg);
-
-	return sprintf(buf, "0x%02x\n", (attr->reg && rc) ? -1 : *reg);
-}
-
-/*
- * Write a register value by writing a sysfs entry
- */
-static ssize_t elantech_set_int_attr(struct psmouse *psmouse,
-				     void *data, const char *buf, size_t count)
-{
-	struct elantech_data *etd = psmouse->private;
-	struct elantech_attr_data *attr = data;
-	unsigned char *reg = (unsigned char *) etd + attr->field_offset;
-	unsigned char value;
-	int err;
-
-	err = kstrtou8(buf, 16, &value);
-	if (err)
-		return err;
-
-	/* Do we need to preserve some bits for version 2 hardware too? */
-	if (etd->hw_version == 1) {
-		if (attr->reg == 0x10)
-			/* Force absolute mode always on */
-			value |= ETP_R10_ABSOLUTE_MODE;
-		else if (attr->reg == 0x11)
-			/* Force 4 byte mode always on */
-			value |= ETP_R11_4_BYTE_MODE;
-	}
-
-	if (!attr->reg || elantech_write_reg(psmouse, attr->reg, value) == 0)
-		*reg = value;
-
-	return count;
-}
-
-#define ELANTECH_INT_ATTR(_name, _register)				\
-	static struct elantech_attr_data elantech_attr_##_name = {	\
-		.field_offset = offsetof(struct elantech_data, _name),	\
-		.reg = _register,					\
-	};								\
-	PSMOUSE_DEFINE_ATTR(_name, S_IWUSR | S_IRUGO,			\
-			    &elantech_attr_##_name,			\
-			    elantech_show_int_attr,			\
-			    elantech_set_int_attr)
-
-ELANTECH_INT_ATTR(reg_07, 0x07);
-ELANTECH_INT_ATTR(reg_10, 0x10);
-ELANTECH_INT_ATTR(reg_11, 0x11);
-ELANTECH_INT_ATTR(reg_20, 0x20);
-ELANTECH_INT_ATTR(reg_21, 0x21);
-ELANTECH_INT_ATTR(reg_22, 0x22);
-ELANTECH_INT_ATTR(reg_23, 0x23);
-ELANTECH_INT_ATTR(reg_24, 0x24);
-ELANTECH_INT_ATTR(reg_25, 0x25);
-ELANTECH_INT_ATTR(reg_26, 0x26);
-ELANTECH_INT_ATTR(debug, 0);
-ELANTECH_INT_ATTR(paritycheck, 0);
-ELANTECH_INT_ATTR(crc_enabled, 0);
-
-static struct attribute *elantech_attrs[] = {
-	&psmouse_attr_reg_07.dattr.attr,
-	&psmouse_attr_reg_10.dattr.attr,
-	&psmouse_attr_reg_11.dattr.attr,
-	&psmouse_attr_reg_20.dattr.attr,
-	&psmouse_attr_reg_21.dattr.attr,
-	&psmouse_attr_reg_22.dattr.attr,
-	&psmouse_attr_reg_23.dattr.attr,
-	&psmouse_attr_reg_24.dattr.attr,
-	&psmouse_attr_reg_25.dattr.attr,
-	&psmouse_attr_reg_26.dattr.attr,
-	&psmouse_attr_debug.dattr.attr,
-	&psmouse_attr_paritycheck.dattr.attr,
-	&psmouse_attr_crc_enabled.dattr.attr,
-	NULL
-};
-
-static struct attribute_group elantech_attr_group = {
-	.attrs = elantech_attrs,
-};
-
-static bool elantech_is_signature_valid(const unsigned char *param)
-{
-	static const unsigned char rates[] = { 200, 100, 80, 60, 40, 20, 10 };
-	int i;
-
-	if (param[0] == 0)
-		return false;
-
-	if (param[1] == 0)
-		return true;
-
-	/*
-	 * Some hw_version >= 4 models have a revision higher then 20. Meaning
-	 * that param[2] may be 10 or 20, skip the rates check for these.
-	 */
-	if ((param[0] & 0x0f) >= 0x06 && (param[1] & 0xaf) == 0x0f &&
-	    param[2] < 40)
-		return true;
-
-	for (i = 0; i < ARRAY_SIZE(rates); i++)
-		if (param[2] == rates[i])
-			return false;
-
-	return true;
-}
-
-/*
- * Use magic knock to detect Elantech touchpad
- */
-int elantech_detect(struct psmouse *psmouse, bool set_properties)
-{
-	struct ps2dev *ps2dev = &psmouse->ps2dev;
-	unsigned char param[3];
-
-	ps2_command(&psmouse->ps2dev, NULL, PSMOUSE_CMD_RESET_DIS);
-
-	if (ps2_command(ps2dev,  NULL, PSMOUSE_CMD_DISABLE) ||
-	    ps2_command(ps2dev,  NULL, PSMOUSE_CMD_SETSCALE11) ||
-	    ps2_command(ps2dev,  NULL, PSMOUSE_CMD_SETSCALE11) ||
-	    ps2_command(ps2dev,  NULL, PSMOUSE_CMD_SETSCALE11) ||
-	    ps2_command(ps2dev, param, PSMOUSE_CMD_GETINFO)) {
-		psmouse_dbg(psmouse, "sending Elantech magic knock failed.\n");
-		return -1;
-	}
-
-	/*
-	 * Report this in case there are Elantech models that use a different
-	 * set of magic numbers
-	 */
-	if (param[0] != 0x3c || param[1] != 0x03 ||
-	    (param[2] != 0xc8 && param[2] != 0x00)) {
-		psmouse_dbg(psmouse,
-			    "unexpected magic knock result 0x%02x, 0x%02x, 0x%02x.\n",
-			    param[0], param[1], param[2]);
-		return -1;
-	}
-
-	/*
-	 * Query touchpad's firmware version and see if it reports known
-	 * value to avoid mis-detection. Logitech mice are known to respond
-	 * to Elantech magic knock and there might be more.
-	 */
-	if (synaptics_send_cmd(psmouse, ETP_FW_VERSION_QUERY, param)) {
-		psmouse_dbg(psmouse, "failed to query firmware version.\n");
-		return -1;
-	}
-
-	psmouse_dbg(psmouse,
-		    "Elantech version query result 0x%02x, 0x%02x, 0x%02x.\n",
-		    param[0], param[1], param[2]);
-
-	if (!elantech_is_signature_valid(param)) {
-		psmouse_dbg(psmouse,
-			    "Probably not a real Elantech touchpad. Aborting.\n");
-		return -1;
-	}
-
-	if (set_properties) {
-		psmouse->vendor = "Elantech";
-		psmouse->name = "Touchpad";
-	}
-
-	return 0;
-}
-
-/*
- * Clean up sysfs entries when disconnecting
- */
-static void elantech_disconnect(struct psmouse *psmouse)
-{
-	struct elantech_data *etd = psmouse->private;
-
-	if (etd->tp_dev)
-		input_unregister_device(etd->tp_dev);
-	sysfs_remove_group(&psmouse->ps2dev.serio->dev.kobj,
-			   &elantech_attr_group);
-	kfree(psmouse->private);
-	psmouse->private = NULL;
-}
-
-/*
- * Put the touchpad back into absolute mode when reconnecting
- */
-static int elantech_reconnect(struct psmouse *psmouse)
-{
-	psmouse_reset(psmouse);
-
-	if (elantech_detect(psmouse, 0))
-		return -1;
-
-	if (elantech_set_absolute_mode(psmouse)) {
-		psmouse_err(psmouse,
-			    "failed to put touchpad back into absolute mode.\n");
-		return -1;
-	}
-
-	return 0;
-}
-
-/*
- * Some hw_version 4 models do not work with crc_disabled
- */
-static const struct dmi_system_id elantech_dmi_force_crc_enabled[] = {
-#if defined(CONFIG_DMI) && defined(CONFIG_X86)
-	{
-		/* Fujitsu H730 does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "CELSIUS H730"),
-		},
-	},
-	{
-		/* Fujitsu H760 does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "CELSIUS H760"),
-		},
-	},
-	{
-		/* Fujitsu LIFEBOOK E544  does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK E544"),
-		},
-	},
-	{
-		/* Fujitsu LIFEBOOK E546  does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK E546"),
-		},
-	},
-	{
-		/* Fujitsu LIFEBOOK E547 does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK E547"),
-		},
-	},
-	{
-		/* Fujitsu LIFEBOOK E554  does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK E554"),
-		},
-	},
-	{
-		/* Fujitsu LIFEBOOK E556 does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK E556"),
-		},
-	},
-	{
-		/* Fujitsu LIFEBOOK E557 does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK E557"),
-		},
-	},
-	{
-		/* Fujitsu LIFEBOOK U745 does not work with crc_enabled == 0 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK U745"),
-		},
-	},
-#endif
-	{ }
-};
-
-/*
- * Some hw_version 3 models go into error state when we try to set
- * bit 3 and/or bit 1 of r10.
- */
-static const struct dmi_system_id no_hw_res_dmi_table[] = {
-#if defined(CONFIG_DMI) && defined(CONFIG_X86)
-	{
-		/* Gigabyte U2442 */
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "GIGABYTE"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "U2442"),
-		},
-	},
-#endif
-	{ }
-};
-
-/*
- * determine hardware version and set some properties according to it.
- */
-static int elantech_set_properties(struct elantech_data *etd)
-{
-	/* This represents the version of IC body. */
-	int ver = (etd->fw_version & 0x0f0000) >> 16;
-
-	/* Early version of Elan touchpads doesn't obey the rule. */
-	if (etd->fw_version < 0x020030 || etd->fw_version == 0x020600)
-		etd->hw_version = 1;
-	else {
-		switch (ver) {
-		case 2:
-		case 4:
-			etd->hw_version = 2;
-			break;
-		case 5:
-			etd->hw_version = 3;
-			break;
-		case 6 ... 15:
-			etd->hw_version = 4;
-			break;
-		default:
-			return -1;
-		}
-	}
-
-	/* decide which send_cmd we're gonna use early */
-	etd->send_cmd = etd->hw_version >= 3 ? elantech_send_cmd :
-					       synaptics_send_cmd;
-
-	/* Turn on packet checking by default */
-	etd->paritycheck = 1;
-
-	/*
-	 * This firmware suffers from misreporting coordinates when
-	 * a touch action starts causing the mouse cursor or scrolled page
-	 * to jump. Enable a workaround.
-	 */
-	etd->jumpy_cursor =
-		(etd->fw_version == 0x020022 || etd->fw_version == 0x020600);
-
-	if (etd->hw_version > 1) {
-		/* For now show extra debug information */
-		etd->debug = 1;
-
-		if (etd->fw_version >= 0x020800)
-			etd->reports_pressure = true;
-	}
-
-	/*
-	 * The signatures of v3 and v4 packets change depending on the
-	 * value of this hardware flag.
-	 */
-	etd->crc_enabled = (etd->fw_version & 0x4000) == 0x4000 ||
-			   dmi_check_system(elantech_dmi_force_crc_enabled);
-
-	/* Enable real hardware resolution on hw_version 3 ? */
-	etd->set_hw_resolution = !dmi_check_system(no_hw_res_dmi_table);
-
-	return 0;
-}
-
-/*
- * Initialize the touchpad and create sysfs entries
- */
-int elantech_init(struct psmouse *psmouse)
-{
-	struct elantech_data *etd;
-	int i;
-	int error = -EINVAL;
-	unsigned char param[3];
-	struct input_dev *tp_dev;
-
-	psmouse->private = etd = kzalloc(sizeof(struct elantech_data), GFP_KERNEL);
-	if (!etd)
-		return -ENOMEM;
-
-	psmouse_reset(psmouse);
-
-	etd->parity[0] = 1;
-	for (i = 1; i < 256; i++)
-		etd->parity[i] = etd->parity[i & (i - 1)] ^ 1;
-
-	/*
-	 * Do the version query again so we can store the result
-	 */
-	if (synaptics_send_cmd(psmouse, ETP_FW_VERSION_QUERY, param)) {
-		psmouse_err(psmouse, "failed to query firmware version.\n");
-		goto init_fail;
-	}
-	etd->fw_version = (param[0] << 16) | (param[1] << 8) | param[2];
-
-	if (elantech_set_properties(etd)) {
-		psmouse_err(psmouse, "unknown hardware version, aborting...\n");
-		goto init_fail;
-	}
-	psmouse_info(psmouse,
-		     "assuming hardware version %d (with firmware version 0x%02x%02x%02x)\n",
-		     etd->hw_version, param[0], param[1], param[2]);
-
-	if (etd->send_cmd(psmouse, ETP_CAPABILITIES_QUERY,
-	    etd->capabilities)) {
-		psmouse_err(psmouse, "failed to query capabilities.\n");
-		goto init_fail;
-	}
-	psmouse_info(psmouse,
-		     "Synaptics capabilities query result 0x%02x, 0x%02x, 0x%02x.\n",
-		     etd->capabilities[0], etd->capabilities[1],
-		     etd->capabilities[2]);
-
-	if (etd->hw_version != 1) {
-		if (etd->send_cmd(psmouse, ETP_SAMPLE_QUERY, etd->samples)) {
-			psmouse_err(psmouse, "failed to query sample data\n");
-			goto init_fail;
-		}
-		psmouse_info(psmouse,
-			     "Elan sample query result %02x, %02x, %02x\n",
-			     etd->samples[0], etd->samples[1], etd->samples[2]);
-	}
-
-	if (etd->samples[1] == 0x74 && etd->hw_version == 0x03) {
-		/*
-		 * This module has a bug which makes absolute mode
-		 * unusable, so let's abort so we'll be using standard
-		 * PS/2 protocol.
-		 */
-		psmouse_info(psmouse,
-			     "absolute mode broken, forcing standard PS/2 protocol\n");
-		goto init_fail;
-	}
-
-	if (elantech_set_absolute_mode(psmouse)) {
-		psmouse_err(psmouse,
-			    "failed to put touchpad into absolute mode.\n");
-		goto init_fail;
-	}
-
-	if (etd->fw_version == 0x381f17) {
-		etd->original_set_rate = psmouse->set_rate;
-		psmouse->set_rate = elantech_set_rate_restore_reg_07;
-	}
-
-	if (elantech_set_input_params(psmouse)) {
-		psmouse_err(psmouse, "failed to query touchpad range.\n");
-		goto init_fail;
-	}
-
-	error = sysfs_create_group(&psmouse->ps2dev.serio->dev.kobj,
-				   &elantech_attr_group);
-	if (error) {
-		psmouse_err(psmouse,
-			    "failed to create sysfs attributes, error: %d.\n",
-			    error);
-		goto init_fail;
-	}
-
-	/* The MSB indicates the presence of the trackpoint */
-	if ((etd->capabilities[0] & 0x80) == 0x80) {
-		tp_dev = input_allocate_device();
-
-		if (!tp_dev) {
-			error = -ENOMEM;
-			goto init_fail_tp_alloc;
-		}
-
-		etd->tp_dev = tp_dev;
-		snprintf(etd->tp_phys, sizeof(etd->tp_phys), "%s/input1",
-			psmouse->ps2dev.serio->phys);
-		tp_dev->phys = etd->tp_phys;
-		tp_dev->name = "Elantech PS/2 TrackPoint";
-		tp_dev->id.bustype = BUS_I8042;
-		tp_dev->id.vendor  = 0x0002;
-		tp_dev->id.product = PSMOUSE_ELANTECH;
-		tp_dev->id.version = 0x0000;
-		tp_dev->dev.parent = &psmouse->ps2dev.serio->dev;
-		tp_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REL);
-		tp_dev->relbit[BIT_WORD(REL_X)] =
-			BIT_MASK(REL_X) | BIT_MASK(REL_Y);
-		tp_dev->keybit[BIT_WORD(BTN_LEFT)] =
-			BIT_MASK(BTN_LEFT) | BIT_MASK(BTN_MIDDLE) |
-			BIT_MASK(BTN_RIGHT);
-
-		__set_bit(INPUT_PROP_POINTER, tp_dev->propbit);
-		__set_bit(INPUT_PROP_POINTING_STICK, tp_dev->propbit);
-
-		error = input_register_device(etd->tp_dev);
-		if (error < 0)
-			goto init_fail_tp_reg;
-	}
-
-	psmouse->protocol_handler = elantech_process_byte;
-	psmouse->disconnect = elantech_disconnect;
-	psmouse->reconnect = elantech_reconnect;
-	psmouse->pktsize = etd->hw_version > 1 ? 6 : 4;
-
-	return 0;
- init_fail_tp_reg:
-	input_free_device(tp_dev);
- init_fail_tp_alloc:
-	sysfs_remove_group(&psmouse->ps2dev.serio->dev.kobj,
-			   &elantech_attr_group);
- init_fail:
-	psmouse_reset(psmouse);
-	kfree(etd);
-	return error;
-}
+outputcliptoclipga_0__SHIFT 0x1e
+#define CLIPPER_DEBUG_REG16__sm0_clprim_to_clip_prim_valid_MASK 0x80000000
+#define CLIPPER_DEBUG_REG16__sm0_clprim_to_clip_prim_valid__SHIFT 0x1f
+#define CLIPPER_DEBUG_REG17__sm1_prim_end_state_MASK 0x7f
+#define CLIPPER_DEBUG_REG17__sm1_prim_end_state__SHIFT 0x0
+#define CLIPPER_DEBUG_REG17__sm1_ps_expand_MASK 0x80
+#define CLIPPER_DEBUG_REG17__sm1_ps_expand__SHIFT 0x7
+#define CLIPPER_DEBUG_REG17__sm1_clip_vert_cnt_MASK 0x1f00
+#define CLIPPER_DEBUG_REG17__sm1_clip_vert_cnt__SHIFT 0x8
+#define CLIPPER_DEBUG_REG17__sm1_vertex_clip_cnt_MASK 0x3e000
+#define CLIPPER_DEBUG_REG17__sm1_vertex_clip_cnt__SHIFT 0xd
+#define CLIPPER_DEBUG_REG17__sm1_inv_to_clip_data_valid_1_MASK 0x40000
+#define CLIPPER_DEBUG_REG17__sm1_inv_to_clip_data_valid_1__SHIFT 0x12
+#define CLIPPER_DEBUG_REG17__sm1_inv_to_clip_data_valid_0_MASK 0x80000
+#define CLIPPER_DEBUG_REG17__sm1_inv_to_clip_data_valid_0__SHIFT 0x13
+#define CLIPPER_DEBUG_REG17__sm1_current_state_MASK 0x7f00000
+#define CLIPPER_DEBUG_REG17__sm1_current_state__SHIFT 0x14
+#define CLIPPER_DEBUG_REG17__sm1_clip_to_clipga_clip_to_outsm_cnt_eq0_MASK 0x8000000
+#define CLIPPER_DEBUG_REG17__sm1_clip_to_clipga_clip_to_outsm_cnt_eq0__SHIFT 0x1b
+#define CLIPPER_DEBUG_REG17__sm1_clip_to_outsm_fifo_full_MASK 0x10000000
+#define CLIPPER_DEBUG_REG17__sm1_clip_to_outsm_fifo_full__SHIFT 0x1c
+#define CLIPPER_DEBUG_REG17__sm1_highest_priority_seq_MASK 0x20000000
+#define CLIPPER_DEBUG_REG17__sm1_highest_priority_seq__SHIFT 0x1d
+#define CLIPPER_DEBUG_REG17__sm1_outputcliptoclipga_0_MASK 0x40000000
+#define CLIPPER_DEBUG_REG17__sm1_outputcliptoclipga_0__SHIFT 0x1e
+#define CLIPPER_DEBUG_REG17__sm1_clprim_to_clip_prim_valid_MASK 0x80000000
+#define CLIPPER_DEBUG_REG17__sm1_clprim_to_clip_prim_valid__SHIFT 0x1f
+#define CLIPPER_DEBUG_REG18__sm2_prim_end_state_MASK 0x7f
+#define CLIPPER_DEBUG_REG18__sm2_prim_end_state__SHIFT 0x0
+#define CLIPPER_DEBUG_REG18__sm2_ps_expand_MASK 0x80
+#define CLIPPER_DEBUG_REG18__sm2_ps_expand__SHIFT 0x7
+#define CLIPPER_DEBUG_REG18__sm2_clip_vert_cnt_MASK 0x1f00
+#define CLIPPER_DEBUG_REG18__sm2_clip_vert_cnt__SHIFT 0x8
+#define CLIPPER_DEBUG_REG18__sm2_vertex_clip_cnt_MASK 0x3e000
+#define CLIPPER_DEBUG_REG18__sm2_vertex_clip_cnt__SHIFT 0xd
+#define CLIPPER_DEBUG_REG18__sm2_inv_to_clip_data_valid_1_MASK 0x40000
+#define CLIPPER_DEBUG_REG18__sm2_inv_to_clip_data_valid_1__SHIFT 0x12
+#define CLIPPER_DEBUG_REG18__sm2_inv_to_clip_data_valid_0_MASK 0x80000
+#define CLIPPER_DEBUG_REG18__sm2_inv_to_clip_data_valid_0__SHIFT 0x13
+#define CLIPPER_DEBUG_REG18__sm2_current_state_MASK 0x7f00000
+#define CLIPPER_DEBUG_REG18__sm2_current_state__SHIFT 0x14
+#define CLIPPER_DEBUG_REG18__sm2_clip_to_clipga_clip_to_outsm_cnt_eq0_MASK 0x8000000
+#define CLIPPER_DEBUG_REG18__sm2_clip_to_clipga_clip_to_outsm_cnt_eq0__SHIFT 0x1b
+#define CLIPPER_DEBUG_REG18__sm2_clip_to_outsm_fifo_full_MASK 0x10000000
+#define CLIPPER_DEBUG_REG18__sm2_clip_to_outsm_fifo_full__SHIFT 0x1c
+#define CLIPPER_DEBUG_REG18__sm2_highest_priority_seq_MASK 0x20000000
+#define CLIPPER_DEBUG_REG18__sm2_highest_priority_seq__SHIFT 0x1d
+#define CLIPPER_DEBUG_REG18__sm2_outputcliptoclipga_0_MASK 0x40000000
+#define CLIPPER_DEBUG_REG18__sm2_outputcliptoclipga_0__SHIFT 0x1e
+#define CLIPPER_DEBUG_REG18__sm2_clprim_to_clip_prim_valid_MASK 0x80000000
+#define CLIPPER_DEBUG_REG18__sm2_clprim_to_clip_prim_valid__SHIFT 0x1f
+#define CLIPPER_DEBUG_REG19__sm3_prim_end_state_MASK 0x7f
+#define CLIPPER_DEBUG_REG19__sm3_prim_end_state__SHIFT 0x0
+#define CLIPPER_DEBUG_REG19__sm3_ps_expand_MASK 0x80
+#define CLIPPER_DEBUG_REG19__sm3_ps_expand__SHIFT 0x7
+#define CLIPPER_DEBUG_REG19__sm3_clip_vert_cnt_MASK 0x1f00
+#define CLIPPER_DEBUG_REG19__sm3_clip_vert_cnt__SHIFT 0x8
+#define CLIPPER_DEBUG_REG19__sm3_vertex_clip_cnt_MASK 0x3e000
+#define CLIPPER_DEBUG_REG19__sm3_vertex_clip_cnt__SHIFT 0xd
+#define CLIPPER_DEBUG_REG19__sm3_inv_to_clip_data_valid_1_MASK 0x40000
+#define CLIPPER_DEBUG_REG19__sm3_inv_to_clip_data_valid_1__SHIFT 0x12
+#define CLIPPER_DEBUG_REG19__sm3_inv_to_clip_data_valid_0_MASK 0x80000
+#define CLIPPER_DEBUG_REG19__sm3_inv_to_clip_data_valid_0__SHIFT 0x13
+#define CLIPPER_DEBUG_REG19__sm3_current_state_MASK 0x7f00000
+#define CLIPPER_DEBUG_REG19__sm3_current_state__SHIFT 0x14
+#define CLIPPER_DEBUG_REG19__sm3_clip_to_clipga_clip_to_outsm_cnt_eq0_MASK 0x8000000
+#define CLIPPER_DEBUG_REG19__sm3_clip_to_clipga_clip_to_outsm_cnt_eq0__SHIFT 0x1b
+#define CLIPPER_DEBUG_REG19__sm3_clip_to_outsm_fifo_full_MASK 0x10000000
+#define CLIPPER_DEBUG_REG19__sm3_clip_to_outsm_fifo_full__SHIFT 0x1c
+#define CLIPPER_DEBUG_REG19__sm3_highest_priority_seq_MASK 0x20000000
+#define CLIPPER_DEBUG_REG19__sm3_highest_priority_seq__SHIFT 0x1d
+#define CLIPPER_DEBUG_REG19__sm3_outputcliptoclipga_0_MASK 0x40000000
+#define CLIPPER_DEBUG_REG19__sm3_outputcliptoclipga_0__SHIFT 0x1e
+#define CLIPPER_DEBUG_REG19__sm3_clprim_to_clip_prim_valid_MASK 0x80000000
+#define CLIPPER_DEBUG_REG19__sm3_clprim_to_clip_prim_valid__SHIFT 0x1f
+#define SXIFCCG_DEBUG_REG0__position_address_MASK 0x3f
+#define SXIFCCG_DEBUG_REG0__position_address__SHIFT 0x0
+#define SXIFCCG_DEBUG_REG0__point_address_MASK 0x1c0
+#define SXIFCCG_DEBUG_REG0__point_address__SHIFT 0x6
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_state_var_indx_MASK 0xe00
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_state_var_indx__SHIFT 0x9
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_req_mask_MASK 0xf000
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_req_mask__SHIFT 0xc
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_pci_MASK 0x3ff0000
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_pci__SHIFT 0x10
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_aux_sel_MASK 0xc000000
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_aux_sel__SHIFT 0x1a
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_sp_id_MASK 0x30000000
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_sp_id__SHIFT 0x1c
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_aux_inc_MASK 0x40000000
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_aux_inc__SHIFT 0x1e
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_advance_MASK 0x80000000
+#define SXIFCCG_DEBUG_REG0__sx_pending_rd_advance__SHIFT 0x1f
+#define SXIFCCG_DEBUG_REG1__available_positions_MASK 0x7f
+#define SXIFCCG_DEBUG_REG1__available_positions__SHIFT 0x0
+#define SXIFCCG_DEBUG_REG1__sx_receive_indx_MASK 0x380
+#define SXIFCCG_DEBUG_REG1__sx_receive_indx__SHIFT 0x7
+#define SXIFCCG_DEBUG_REG1__sx_pending_fifo_contents_MASK 0x7c00
+#define SXIFCCG_DEBUG_REG1__sx_pending_fifo_contents__SHIFT 0xa
+#define SXIFCCG_DEBUG_REG1__statevar_bits_vs_out_misc_vec_ena_MASK 0x8000
+#define SXIFCCG_DEBUG_REG1__statevar_bits_vs_out_misc_vec_ena__SHIFT 0xf
+#define SXIFCCG_DEBUG_REG1__statevar_bits_disable_sp_MASK 0xf0000
+#define SXIFCCG_DEBUG_REG1__statevar_bits_disable_sp__SHIFT 0x10
+#define SXIFCCG_DEBUG_REG1__aux_sel_MASK 0x300000
+#define SXIFCCG_DEBUG_REG1__aux_sel__SHIFT 0x14
+#define SXIFCCG_DEBUG_REG1__sx_to_pa_empty_1_MASK 0x400000
+#define SXIFCCG_DEBUG_REG1__sx_to_pa_empty_1__SHIFT 0x16
+#define SXIFCCG_DEBUG_REG1__sx_to_pa_empty_0_MASK 0x800000
+#define SXIFCCG_DEBUG_REG1__sx_to_pa_empty_0__SHIFT 0x17
+#define SXIFCCG_DEBUG_REG1__pasx_req_cnt_1_MASK 0xf000000
+#define SXIFCCG_DEBUG_REG1__pasx_req_cnt_1__SHIFT 0x18
+#define SXIFCCG_DEBUG_REG1__pasx_req_cnt_0_MASK 0xf0000000
+#define SXIFCCG_DEBUG_REG1__pasx_req_cnt_0__SHIFT 0x1c
+#define SXIFCCG_DEBUG_REG2__param_cache_base_MASK 0x7f
+#define SXIFCCG_DEBUG_REG2__param_cache_base__SHIFT 0x0
+#define SXIFCCG_DEBUG_REG2__sx_aux_MASK 0x180
+#define SXIFCCG_DEBUG_REG2__sx_aux__SHIFT 0x7
+#define SXIFCCG_DEBUG_REG2__sx_request_indx_MASK 0x7e00
+#define SXIFCCG_DEBUG_REG2__sx_request_indx__SHIFT 0x9
+#define SXIFCCG_DEBUG_REG2__req_active_verts_loaded_MASK 0x8000
+#define SXIFCCG_DEBUG_REG2__req_active_verts_loaded__SHIFT 0xf
+#define SXIFCCG_DEBUG_REG2__req_active_verts_MASK 0x7f0000
+#define SXIFCCG_DEBUG_REG2__req_active_verts__SHIFT 0x10
+#define SXIFCCG_DEBUG_REG2__vgt_to_ccgen_state_var_indx_MASK 0x3800000
+#define SXIFCCG_DEBUG_REG2__vgt_to_ccgen_state_var_indx__SHIFT 0x17
+#define SXIFCCG_DEBUG_REG2__vgt_to_ccgen_active_verts_MASK 0xfc000000
+#define SXIFCCG_DEBUG_REG2__vgt_to_ccgen_active_verts__SHIFT 0x1a
+#define SXIFCCG_DEBUG_REG3__ALWAYS_ZERO_MASK 0xff
+#define SXIFCCG_DEBUG_REG3__ALWAYS_ZERO__SHIFT 0x0
+#define SXIFCCG_DEBUG_REG3__vertex_fifo_entriesavailable_MASK 0xf00
+#define SXIFCCG_DEBUG_REG3__vertex_fifo_entriesavailable__SHIFT 0x8
+#define SXIFCCG_DEBUG_REG3__statevar_bits_vs_out_ccdist1_vec_ena_MASK 0x1000
+#define SXIFCCG_DEBUG_REG3__statevar_bits_vs_out_ccdist1_vec_ena__SHIFT 0xc
+#define SXIFCCG_DEBUG_REG3__statevar_bits_vs_out_ccdist0_vec_ena_MASK 0x2000
+#define SXIFCCG_DEBUG_REG3__statevar_bits_vs_out_ccdist0_vec_ena__SHIFT 0xd
+#define SXIFCCG_DEBUG_REG3__available_positions_MASK 0x1fc000
+#define SXIFCCG_DEBUG_REG3__available_positions__SHIFT 0xe
+#define SXIFCCG_DEBUG_REG3__current_state_MASK 0x600000
+#define SXIFCCG_DEBUG_REG3__current_state__SHIFT 0x15
+#define SXIFCCG_DEBUG_REG3__vertex_fifo_empty_MASK 0x800000
+#define SXIFCCG_DEBUG_REG3__vertex_fifo_empty__SHIFT 0x17
+#define SXIFCCG_DEBUG_REG3__vertex_fifo_full_MASK 0x1000000
+#define SXIFCCG_DEBUG_REG3__vertex_fifo_full__SHIFT 0x18
+#define SXIFCCG_DEBUG_REG3__sx0_receive_fifo_empty_MASK 0x2000000
+#define SXIFCCG_DEBUG_REG3__sx0_receive_fifo_empty__SHIFT 0x19
+#define SXIFCCG_DEBUG_REG3__sx0_receive_fifo_full_MASK 0x4000000
+#define SXIFCCG_DEBUG_REG3__sx0_receive_fifo_full__SHIFT 0x1a
+#define SXIFCCG_DEBUG_REG3__vgt_to_ccgen_fifo_empty_MASK 0x8000000
+#define SXIFCCG_DEBUG_REG3__vgt_to_ccgen_fifo_empty__SHIFT 0x1b
+#define SXIFCCG_DEBUG_REG3__vgt_to_ccgen_fifo_full_MASK 0x10000000
+#define SXIFCCG_DEBUG_REG3__vgt_to_ccgen_fifo_full__SHIFT 0x1c
+#define SXIFCCG_DEBUG_REG3__ccgen_to_clipcc_fifo_full_MASK 0x20000000
+#define SXIFCCG_DEBUG_REG3__ccgen_to_clipcc_fifo_full__SHIFT 0x1d
+#define SXIFCCG_DEBUG_REG3__sx0_receive_fifo_write_MASK 0x40000000
+#define SXIFCCG_DEBUG_REG3__sx0_receive_fifo_write__SHIFT 0x1e
+#define SXIFCCG_DEBUG_REG3__ccgen_to_clipcc_write_MASK 0x80000000
+#define SXIFCCG_DEBUG_REG3__ccgen_to_clipcc_write__SHIFT 0x1f
+#define SETUP_DEBUG_REG0__su_baryc_cntl_state_MASK 0x3
+#define SETUP_DEBUG_REG0__su_baryc_cntl_state__SHIFT 0x0
+#define SETUP_DEBUG_REG0__su_cntl_state_MASK 0x3c
+#define SETUP_DEBUG_REG0__su_cntl_state__SHIFT 0x2
+#define SETUP_DEBUG_REG0__pmode_state_MASK 0x3f00
+#define SETUP_DEBUG_REG0__pmode_state__SHIFT 0x8
+#define SETUP_DEBUG_REG0__ge_stallb_MASK 0x4000
+#define SETUP_DEBUG_REG0__ge_stallb__SHIFT 0xe
+#define SETUP_DEBUG_REG0__geom_enable_MASK 0x8000
+#define SETUP_DEBUG_REG0__geom_enable__SHIFT 0xf
+#define SETUP_DEBUG_REG0__su_clip_baryc_free_MASK 0x30000
+#define SETUP_DEBUG_REG0__su_clip_baryc_free__SHIFT 0x10
+#define SETUP_DEBUG_REG0__su_clip_rtr_MASK 0x40000
+#define SETUP_DEBUG_REG0__su_clip_rtr__SHIFT 0x12
+#define SETUP_DEBUG_REG0__pfifo_busy_MASK 0x80000
+#define SETUP_DEBUG_REG0__pfifo_busy__SHIFT 0x13
+#define SETUP_DEBUG_REG0__su_cntl_busy_MASK 0x100000
+#define SETUP_DEBUG_REG0__su_cntl_busy__SHIFT 0x14
+#define SETUP_DEBUG_REG0__geom_busy_MASK 0x200000
+#define SETUP_DEBUG_REG0__geom_busy__SHIFT 0x15
+#define SETUP_DEBUG_REG0__event_id_gated_MASK 0xfc00000
+#define SETUP_DEBUG_REG0__event_id_gated__SHIFT 0x16
+#define SETUP_DEBUG_REG0__event_gated_MASK 0x10000000
+#define SETUP_DEBUG_REG0__event_gated__SHIFT 0x1c
+#define SETUP_DEBUG_REG0__pmode_prim_gated_MASK 0x20000000
+#define SETUP_DEBUG_REG0__pmode_prim_gated__SHIFT 0x1d
+#define SETUP_DEBUG_REG0__su_dyn_sclk_vld_MASK 0x40000000
+#define SETUP_DEBUG_REG0__su_dyn_sclk_vld__SHIFT 0x1e
+#define SETUP_DEBUG_REG0__cl_dyn_sclk_vld_MASK 0x80000000
+#define SETUP_DEBUG_REG0__cl_dyn_sclk_vld__SHIFT 0x1f
+#define SETUP_DEBUG_REG1__y_sort0_gated_23_8_MASK 0xffff
+#define SETUP_DEBUG_REG1__y_sort0_gated_23_8__SHIFT 0x0
+#define SETUP_DEBUG_REG1__x_sort0_gated_23_8_MASK 0xffff0000
+#define SETUP_DEBUG_REG1__x_sort0_gated_23_8__SHIFT 0x10
+#define SETUP_DEBUG_REG2__y_sort1_gated_23_8_MASK 0xffff
+#define SETUP_DEBUG_REG2__y_sort1_gated_23_8__SHIFT 0x0
+#define SETUP_DEBUG_REG2__x_sort1_gated_23_8_MASK 0xffff0000
+#define SETUP_DEBUG_REG2__x_sort1_gated_23_8__SHIFT 0x10
+#define SETUP_DEBUG_REG3__y_sort2_gated_23_8_MASK 0xffff
+#define SETUP_DEBUG_REG3__y_sort2_gated_23_8__SHIFT 0x0
+#define SETUP_DEBUG_REG3__x_sort2_gated_23_8_MASK 0xffff0000
+#define SETUP_DEBUG_REG3__x_sort2_gated_23_8__SHIFT 0x10
+#define SETUP_DEBUG_REG4__attr_indx_sort0_gated_MASK 0x3fff
+#define SETUP_DEBUG_REG4__attr_indx_sort0_gated__SHIFT 0x0
+#define SETUP_DEBUG_REG4__null_prim_gated_MASK 0x4000
+#define SETUP_DEBUG_REG4__null_prim_gated__SHIFT 0xe
+#define SETUP_DEBUG_REG4__backfacing_gated_MASK 0x8000
+#define SETUP_DEBUG_REG4__backfacing_gated__SHIFT 0xf
+#define SETUP_DEBUG_REG4__st_indx_gated_MASK 0x70000
+#define SETUP_DEBUG_REG4__st_indx_gated__SHIFT 0x10
+#define SETUP_DEBUG_REG4__clipped_gated_MASK 0x80000
+#define SETUP_DEBUG_REG4__clipped_gated__SHIFT 0x13
+#define SETUP_DEBUG_REG4__dealloc_slot_gated_MASK 0x700000
+#define SETUP_DEBUG_REG4__dealloc_slot_gated__SHIFT 0x14
+#define SETUP_DEBUG_REG4__xmajor_gated_MASK 0x800000
+#define SETUP_DEBUG_REG4__xmajor_gated__SHIFT 0x17
+#define SETUP_DEBUG_REG4__diamond_rule_gated_MASK 0x3000000
+#define SETUP_DEBUG_REG4__diamond_rule_gated__SHIFT 0x18
+#define SETUP_DEBUG_REG4__type_gated_MASK 0x1c000000
+#define SETUP_DEBUG_REG4__type_gated__SHIFT 0x1a
+#define SETUP_DEBUG_REG4__fpov_gated_MASK 0x60000000
+#define SETUP_DEBUG_REG4__fpov_gated__SHIFT 0x1d
+#define SETUP_DEBUG_REG4__eop_gated_MASK 0x80000000
+#define SETUP_DEBUG_REG4__eop_gated__SHIFT 0x1f
+#define SETUP_DEBUG_REG5__attr_indx_sort2_gated_MASK 0x3fff
+#define SETUP_DEBUG_REG5__attr_indx_sort2_gated__SHIFT 0x0
+#define SETUP_DEBUG_REG5__attr_indx_sort1_gated_MASK 0xfffc000
+#define SETUP_DEBUG_REG5__attr_indx_sort1_gated__SHIFT 0xe
+#define SETUP_DEBUG_REG5__provoking_vtx_gated_MASK 0x30000000
+#define SETUP_DEBUG_REG5__provoking_vtx_gated__SHIFT 0x1c
+#define SETUP_DEBUG_REG5__valid_prim_gated_MASK 0x40000000
+#define SETUP_DEBUG_REG5__valid_prim_gated__SHIFT 0x1e
+#define SETUP_DEBUG_REG5__pa_reg_sclk_vld_MASK 0x80000000
+#define SETUP_DEBUG_REG5__pa_reg_sclk_vld__SHIFT 0x1f
+#define PA_SC_DEBUG_REG0__REG0_FIELD0_MASK 0x3
+#define PA_SC_DEBUG_REG0__REG0_FIELD0__SHIFT 0x0
+#define PA_SC_DEBUG_REG0__REG0_FIELD1_MASK 0xc
+#define PA_SC_DEBUG_REG0__REG0_FIELD1__SHIFT 0x2
+#define PA_SC_DEBUG_REG1__REG1_FIELD0_MASK 0x3
+#define PA_SC_DEBUG_REG1__REG1_FIELD0__SHIFT 0x0
+#define PA_SC_DEBUG_REG1__REG1_FIELD1_MASK 0xc
+#define PA_SC_DEBUG_REG1__REG1_FIELD1__SHIFT 0x2
+#define COMPUTE_DISPATCH_INITIATOR__COMPUTE_SHADER_EN_MASK 0x1
+#define COMPUTE_DISPATCH_INITIATOR__COMPUTE_SHADER_EN__SHIFT 0x0
+#define COMPUTE_DISPATCH_INITIATOR__PARTIAL_TG_EN_MASK 0x2
+#define COMPUTE_DISPATCH_INITIATOR__PARTIAL_TG_EN__SHIFT 0x1
+#define COMPUTE_DISPATCH_INITIATOR__FORCE_START_AT_000_MASK 0x4
+#define COMPUTE_DISPATCH_INITIATOR__FORCE_START_AT_000__SHIFT 0x2
+#define COMPUTE_DISPATCH_INITIATOR__ORDERED_APPEND_ENBL_MASK 0x8
+#define COMPUTE_DISPATCH_INITIATOR__ORDERED_APPEND_ENBL__SHIFT 0x3
+#define COMPUTE_DISPATCH_INITIATOR__ORDERED_APPEND_MODE_MASK 0x10
+#define COMPUTE_DISPATCH_INITIATOR__ORDERED_APPEND_MODE__SHIFT 0x4
+#define COMPUTE_DISPATCH_INITIATOR__USE_THREAD_DIMENSIONS_MASK 0x20
+#define COMPUTE_DISPATCH_INITIATOR__USE_THREAD_DIMENSIONS__SHIFT 0x5
+#define COMPUTE_DISPATCH_INITIATOR__ORDER_MODE_MASK 0x40
+#define COMPUTE_DISPATCH_INITIATOR__ORDER_MODE__SHIFT 0x6
+#define COMPUTE_DISPATCH_INITIATOR__DISPATCH_CACHE_CNTL_MASK 0x380
+#define COMPUTE_DISPATCH_INITIATOR__DISPATCH_CACHE_CNTL__SHIFT 0x7
+#define COMPUTE_DISPATCH_INITIATOR__SCALAR_L1_INV_VOL_MASK 0x400
+#define COMPUTE_DISPATCH_INITIATOR__SCALAR_L1_INV_VOL__SHIFT 0xa
+#define COMPUTE_DISPATCH_INITIATOR__VECTOR_L1_INV_VOL_MASK 0x800
+#define COMPUTE_DISPATCH_INITIATOR__VECTOR_L1_INV_VOL__SHIFT 0xb
+#define COMPUTE_DISPATCH_INITIATOR__DATA_ATC_MASK 0x1000
+#define COMPUTE_DISPATCH_INITIATOR__DATA_ATC__SHIFT 0xc
+#define COMPUTE_DISPATCH_INITIATOR__RESTORE_MASK 0x4000
+#define COMPUTE_DISPATCH_INITIATOR__RESTORE__SHIFT 0xe
+#define COMPUTE_DIM_X__SIZE_MASK 0xffffffff
+#define COMPUTE_DIM_X__SIZE__SHIFT 0x0
+#define COMPUTE_DIM_Y__SIZE_MASK 0xffffffff
+#define COMPUTE_DIM_Y__SIZE__SHIFT 0x0
+#define COMPUTE_DIM_Z__SIZE_MASK 0xffffffff
+#define COMPUTE_DIM_Z__SIZE__SHIFT 0x0
+#define COMPUTE_START_X__START_MASK 0xffffffff
+#define COMPUTE_START_X__START__SHIFT 0x0
+#define COMPUTE_START_Y__START_MASK 0xffffffff
+#define COMPUTE_START_Y__START__SHIFT 0x0
+#define COMPUTE_START_Z__START_MASK 0xffffffff
+#define COMPUTE_START_Z__START__SHIFT 0x0
+#define COMPUTE_NUM_THREAD_X__NUM_THREAD_FULL_MASK 0xffff
+#define COMPUTE_NUM_THREAD_X__NUM_THREAD_FULL__SHIFT 0x0
+#define COMPUTE_NUM_THREAD_X__NUM_THREAD_PARTIAL_MASK 0xffff0000
+#define COMPUTE_NUM_THREAD_X__NUM_THREAD_PARTIAL__SHIFT 0x10
+#define COMPUTE_NUM_THREAD_Y__NUM_THREAD_FULL_MASK 0xffff
+#define COMPUTE_NUM_THREAD_Y__NUM_THREAD_FULL__SHIFT 0x0
+#define COMPUTE_NUM_THREAD_Y__NUM_THREAD_PARTIAL_MASK 0xffff0000
+#define COMPUTE_NUM_THREAD_Y__NUM_THREAD_PARTIAL__SHIFT 0x10
+#define COMPUTE_NUM_THREAD_Z__NUM_THREAD_FULL_MASK 0xffff
+#define COMPUTE_NUM_THREAD_Z__NUM_THREAD_FULL__SHIFT 0x0
+#define COMPUTE_NUM_THREAD_Z__NUM_THREAD_PARTIAL_MASK 0xffff0000
+#define COMPUTE_NUM_THREAD_Z__NUM_THREAD_PARTIAL__SHIFT 0x10
+#define COMPUTE_PIPELINESTAT_ENABLE__PIPELINESTAT_ENABLE_MASK 0x1
+#define COMPUTE_PIPELINESTAT_ENABLE__PIPELINESTAT_ENABLE__SHIFT 0x0
+#define COMPUTE_PERFCOUNT_ENABLE__PERFCOUNT_ENABLE_MASK 0x1
+#define COMPUTE_PERFCOUNT_ENABLE__PERFCOUNT_ENABLE__SHIFT 0x0
+#define COMPUTE_PGM_LO__DATA_MASK 0xffffffff
+#define COMPUTE_PGM_LO__DATA__SHIFT 0x0
+#define COMPUTE_PGM_HI__DATA_MASK 0xff
+#define COMPUTE_PGM_HI__DATA__SHIFT 0x0
+#define COMPUTE_PGM_HI__INST_ATC_MASK 0x100
+#define COMPUTE_PGM_HI__INST_ATC__SHIFT 0x8
+#define COMPUTE_TBA_LO__DATA_MASK 0xffffffff
+#define COMPUTE_TBA_LO__DATA__SHIFT 0x0
+#define COMPUTE_TBA_HI__DATA_MASK 0xff
+#define COMPUTE_TBA_HI__DATA__SHIFT 0x0
+#define COMPUTE_TMA_LO__DATA_MASK 0xffffffff
+#define COMPUTE_TMA_LO__DATA__SHIFT 0x0
+#define COMPUTE_TMA_HI__DATA_MASK 0xff
+#define COMPUTE_TMA_HI__DATA__SHIFT 0x0
+#define COMPUTE_PGM_RSRC1__VGPRS_MASK 0x3f
+#define COMPUTE_PGM_RSRC1__VGPRS__SHIFT 0x0
+#define COMPUTE_PGM_RSRC1__SGPRS_MASK 0x3c0
+#define COMPUTE_PGM_RSRC1__SGPRS__SHIFT 0x6
+#define COMPUTE_PGM_RSRC1__PRIORITY_MASK 0xc00
+#define COMPUTE_PGM_RSRC1__PRIORITY__SHIFT 0xa
+#define COMPUTE_PGM_RSRC1__FLOAT_MODE_MASK 0xff000
+#define COMPUTE_PGM_RSRC1__FLOAT_MODE__SHIFT 0xc
+#define COMPUTE_PGM_RSRC1__PRIV_MASK 0x100000
+#define COMPUTE_PGM_RSRC1__PRIV__SHIFT 0x14
+#define COMPUTE_PGM_RSRC1__DX10_CLAMP_MASK 0x200000
+#define COMPUTE_PGM_RSRC1__DX10_CLAMP__SHIFT 0x15
+#define COMPUTE_PGM_RSRC1__DEBUG_MODE_MASK 0x400000
+#define COMPUTE_PGM_RSRC1__DEBUG_MODE__SHIFT 0x16
+#define COMPUTE_PGM_RSRC1__IEEE_MODE_MASK 0x800000
+#define COMPUTE_PGM_RSRC1__IEEE_MODE__SHIFT 0x17
+#define COMPUTE_PGM_RSRC1__BULKY_MASK 0x1000000
+#define COMPUTE_PGM_RSRC1__BULKY__SHIFT 0x18
+#define COMPUTE_PGM_RSRC1__CDBG_USER_MASK 0x2000000
+#define COMPUTE_PGM_RSRC1__CDBG_USER__SHIFT 0x19
+#define COMPUTE_PGM_RSRC2__SCRATCH_EN_MASK 0x1
+#define COMPUTE_PGM_RSRC2__SCRATCH_EN__SHIFT 0x0
+#define COMPUTE_PGM_RSRC2__USER_SGPR_MASK 0x3e
+#define COMPUTE_PGM_RSRC2__USER_SGPR__SHIFT 0x1
+#define COMPUTE_PGM_RSRC2__TRAP_PRESENT_MASK 0x40
+#define COMPUTE_PGM_RSRC2__TRAP_PRESENT__SHIFT 0x6
+#define COMPUTE_PGM_RSRC2__TGID_X_EN_MASK 0x80
+#define COMPUTE_PGM_RSRC2__TGID_X_EN__SHIFT 0x7
+#define COMPUTE_PGM_RSRC2__TGID_Y_EN_MASK 0x100
+#define COMPUTE_PGM_RSRC2__TGID_Y_EN__SHIFT 0x8
+#define COMPUTE_PGM_RSRC2__TGID_Z_EN_MASK 0x200
+#define COMPUTE_PGM_RSRC2__TGID_Z_EN__SHIFT 0x9
+#define COMPUTE_PGM_RSRC2__TG_SIZE_EN_MASK 0x400
+#define COMPUTE_PGM_RSRC2__TG_SIZE_EN__SHIFT 0xa
+#define COMPUTE_PGM_RSRC2__TIDIG_COMP_CNT_MASK 0x1800
+#define COMPUTE_PGM_RSRC2__TIDIG_COMP_CNT__SHIFT 0xb
+#define COMPUTE_PGM_RSRC2__EXCP_EN_MSB_MASK 0x6000
+#define COMPUTE_PGM_RSRC2__EXCP_EN_MSB__SHIFT 0xd
+#define COMPUTE_PGM_RSRC2__LDS_SIZE_MASK 0xff8000
+#define COMPUTE_PGM_RSRC2__LDS_SIZE__SHIFT 0xf
+#define COMPUTE_PGM_RSRC2__EXCP_EN_MASK 0x7f000000
+#define COMPUTE_PGM_RSRC2__EXCP_EN__SHIFT 0x18
+#define COMPUTE_VMID__DATA_MASK 0xf
+#define COMPUTE_VMID__DATA__SHIFT 0x0
+#define COMPUTE_RESOURCE_LIMITS__WAVES_PER_SH_MASK 0x3ff
+#define COMPUTE_RESOURCE_LIMITS__WAVES_PER_SH__SHIFT 0x0
+#define COMPUTE_RESOURCE_LIMITS__TG_PER_CU_MASK 0xf000
+#define COMPUTE_RESOURCE_LIMITS__TG_PER_CU__SHIFT 0xc
+#define COMPUTE_RESOURCE_LIMITS__LOCK_THRESHOLD_MASK 0x3f0000
+#define COMPUTE_RESOURCE_LIMITS__LOCK_THRESHOLD__SHIFT 0x10
+#define COMPUTE_RESOURCE_LIMITS__SIMD_DEST_CNTL_MASK 0x400000
+#define COMPUTE_RESOURCE_LIMITS__SIMD_DEST_CNTL__SHIFT 0x16
+#define COMPUTE_RESOURCE_LIMITS__FORCE_SIMD_DIST_MASK 0x800000
+#define COMPUTE_RESOURCE_LIMITS__FORCE_SIMD_DIST__SHIFT 0x17
+#define COMPUTE_RESOURCE_LIMITS__CU_GROUP_COUNT_MASK 0x7000000
+#define COMPUTE_RESOURCE_LIMITS__CU_GROUP_COUNT__SHIFT 0x18
+#define COMPUTE_STATIC_THREAD_MGMT_SE0__SH0_CU_EN_MASK 0xffff
+#define COMPUTE_STATIC_THREAD_MGMT_SE0__SH0_CU_EN__SHIFT 0x0
+#define COMPUTE_STATIC_THREAD_MGMT_SE0__SH1_CU_EN_MASK 0xffff0000
+#define COMPUTE_STATIC_THREAD_MGMT_SE0__SH1_CU_EN__SHIFT 0x10
+#define COMPUTE_STATIC_THREAD_MGMT_SE1__SH0_CU_EN_MASK 0xffff
+#define COMPUTE_STATIC_THREAD_MGMT_SE1__SH0_CU_EN__SHIFT 0x0
+#define COMPUTE_STATIC_THREAD_MGMT_SE1__SH1_CU_EN_MASK 0xffff0000
+#define COMPUTE_STATIC_THREAD_MGMT_SE1__SH1_CU_EN__SHIFT 0x10
+#define COMPUTE_TMPRING_SIZE__WAVES_MASK 0xfff
+#define COMPUTE_TMPRING_SIZE__WAVES__SHIFT 0x0
+#define COMPUTE_TMPRING_SIZE__WAVESIZE_MASK 0x1fff000
+#define COMPUTE_TMPRING_SIZE__WAVESIZE__SHIFT 0xc
+#define COMPUTE_STATIC_THREAD_MGMT_SE2__SH0_CU_EN_MASK 0xffff
+#define COMPUTE_STATIC_THREAD_MGMT_SE2__SH0_CU_EN__SHIFT 0x0
+#define COMPUTE_STATIC_THREAD_MGMT_SE2__SH1_CU_EN_MASK 0xffff0000
+#define COMPUTE_STATIC_THREAD_MGMT_SE2__SH1_CU_EN__SHIFT 0x10
+#define COMPUTE_STATIC_THREAD_MGMT_SE3__SH0_CU_EN_MASK 0xffff
+#define COMPUTE_STATIC_THREAD_MGMT_SE3__SH0_CU_EN__SHIFT 0x0
+#define COMPUTE_STATIC_THREAD_MGMT_SE3__SH1_CU_EN_MASK 0xffff0000
+#define COMPUTE_STATIC_THREAD_MGMT_SE3__SH1_CU_EN__SHIFT 0x10
+#define COMPUTE_RESTART_X__RESTART_MASK 0xffffffff
+#define COMPUTE_RESTART_X__RESTART__SHIFT 0x0
+#define COMPUTE_RESTART_Y__RESTART_MASK 0xffffffff
+#define COMPUTE_RESTART_Y__RESTART__SHIFT 0x0
+#define COMPUTE_RESTART_Z__RESTART_MASK 0xffffffff
+#define COMPUTE_RESTART_Z__RESTART__SHIFT 0x0
+#define COMPUTE_THREAD_TRACE_ENABLE__THREAD_TRACE_ENABLE_MASK 0x1
+#define COMPUTE_THREAD_TRACE_ENABLE__THREAD_TRACE_ENABLE__SHIFT 0x0
+#define COMPUTE_MISC_RESERVED__SEND_SEID_MASK 0x3
+#define COMPUTE_MISC_RESERVED__SEND_SEID__SHIFT 0x0
+#define COMPUTE_MISC_RESERVED__RESERVED2_MASK 0x4
+#define COMPUTE_MISC_RESERVED__RESERVED2__SHIFT 0x2
+#define COMPUTE_MISC_RESERVED__RESERVED3_MASK 0x8
+#define COMPUTE_MISC_RESERVED__RESERVED3__SHIFT 0x3
+#define COMPUTE_MISC_RESERVED__RESERVED4_MASK 0x10
+#define COMPUTE_MISC_RESERVED__RESERVED4__SHIFT 0x4
+#define COMPUTE_MISC_RESERVED__WAVE_ID_BASE_MASK 0x1ffe0
+#define COMPUTE_MISC_RESERVED__WAVE_ID_BASE__SHIFT 0x5
+#define COMPUTE_DISPATCH_ID__DISPATCH_ID_MASK 0xffffffff
+#define COMPUTE_DISPATCH_ID__DISPATCH_ID__SHIFT 0x0
+#define COMPUTE_THREADGROUP_ID__THREADGROUP_ID_MASK 0xffffffff
+#define COMPUTE_THREADGROUP_ID__THREADGROUP_ID__SHIFT 0x0
+#define COMPUTE_RELAUNCH__PAYLOAD_MASK 0x3fffffff
+#define COMPUTE_RELAUNCH__PAYLOAD__SHIFT 0x0
+#define COMPUTE_RELAUNCH__IS_EVENT_MASK 0x40000000
+#define COMPUTE_RELAUNCH__IS_EVENT__SHIFT 0x1e
+#define COMPUTE_RELAUNCH__IS_STATE_MASK 0x80000000
+#define COMPUTE_RELAUNCH__IS_STATE__SHIFT 0x1f
+#define COMPUTE_WAVE_RESTORE_ADDR_LO__ADDR_MASK 0xffffffff
+#define COMPUTE_WAVE_RESTORE_ADDR_LO__ADDR__SHIFT 0x0
+#define COMPUTE_WAVE_RESTORE_ADDR_HI__ADDR_MASK 0xffff
+#define COMPUTE_WAVE_RESTORE_ADDR_HI__ADDR__SHIFT 0x0
+#define COMPUTE_WAVE_RESTORE_CONTROL__ATC_MASK 0x1
+#define COMPUTE_WAVE_RESTORE_CONTROL__ATC__SHIFT 0x0
+#define COMPUTE_WAVE_RESTORE_CONTROL__MTYPE_MASK 0x6
+#define COMPUTE_WAVE_RESTORE_CONTROL__MTYPE__SHIFT 0x1
+#define COMPUTE_USER_DATA_0__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_0__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_1__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_1__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_2__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_2__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_3__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_3__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_4__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_4__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_5__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_5__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_6__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_6__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_7__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_7__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_8__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_8__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_9__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_9__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_10__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_10__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_11__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_11__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_12__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_12__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_13__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_13__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_14__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_14__DATA__SHIFT 0x0
+#define COMPUTE_USER_DATA_15__DATA_MASK 0xffffffff
+#define COMPUTE_USER_DATA_15__DATA__SHIFT 0x0
+#define COMPUTE_NOWHERE__DATA_MASK 0xffffffff
+#define COMPUTE_NOWHERE__DATA__SHIFT 0x0
+#define CSPRIV_CONNECT__DOORBELL_OFFSET_MASK 0x1fffff
+#define CSPRIV_CONNECT__DOORBELL_OFFSET__SHIFT 0x0
+#define CSPRIV_CONNECT__QUEUE_ID_MASK 0xe00000
+#define CSPRIV_CONNECT__QUEUE_ID__SHIFT 0x15
+#define CSPRIV_CONNECT__VMID_MASK 0x3c000000
+#define CSPRIV_CONNECT__VMID__SHIFT 0x1a
+#define CSPRIV_CONNECT__UNORD_DISP_MASK 0x80000000
+#define CSPRIV_CONNECT__UNORD_DISP__SHIFT 0x1f
+#define CSPRIV_THREAD_TRACE_TG0__TGID_X_MASK 0xffffffff
+#define CSPRIV_THREAD_TRACE_TG0__TGID_X__SHIFT 0x0
+#define CSPRIV_THREAD_TRACE_TG1__TGID_Y_MASK 0xffffffff
+#define CSPRIV_THREAD_TRACE_TG1__TGID_Y__SHIFT 0x0
+#define CSPRIV_THREAD_TRACE_TG2__TGID_Z_MASK 0xffffffff
+#define CSPRIV_THREAD_TRACE_TG2__TGID_Z__SHIFT 0x0
+#define CSPRIV_THREAD_TRACE_TG3__WAVE_ID_BASE_MASK 0xfff
+#define CSPRIV_THREAD_TRACE_TG3__WAVE_ID_BASE__SHIFT 0x0
+#define CSPRIV_THREAD_TRACE_TG3__THREADS_IN_GROUP_MASK 0xfff000
+#define CSPRIV_THREAD_TRACE_TG3__THREADS_IN_GROUP__SHIFT 0xc
+#define CSPRIV_THREAD_TRACE_TG3__PARTIAL_X_FLAG_MASK 0x1000000
+#define CSPRIV_THREAD_TRACE_TG3__PARTIAL_X_FLAG__SHIFT 0x18
+#define CSPRIV_THREAD_TRACE_TG3__PARTIAL_Y_FLAG_MASK 0x2000000
+#define CSPRIV_THREAD_TRACE_TG3__PARTIAL_Y_FLAG__SHIFT 0x19
+#define CSPRIV_THREAD_TRACE_TG3__PARTIAL_Z_FLAG_MASK 0x4000000
+#define CSPRIV_THREAD_TRACE_TG3__PARTIAL_Z_FLAG__SHIFT 0x1a
+#define CSPRIV_THREAD_TRACE_TG3__LAST_TG_MASK 0x8000000
+#define CSPRIV_THREAD_TRACE_TG3__LAST_TG__SHIFT 0x1b
+#define CSPRIV_THREAD_TRACE_TG3__FIRST_TG_MASK 0x10000000
+#define CSPRIV_THREAD_TRACE_TG3__FIRST_TG__SHIFT 0x1c
+#define CSPRIV_THREAD_TRACE_EVENT__EVENT_ID_MASK 0x1f
+#define CSPRIV_THREAD_TRACE_EVENT__EVENT_ID__SHIFT 0x0
+#define RLC_CNTL__RLC_ENABLE_F32_MASK 0x1
+#define RLC_CNTL__RLC_ENABLE_F32__SHIFT 0x0
+#define RLC_CNTL__FORCE_RETRY_MASK 0x2
+#define RLC_CNTL__FORCE_RETRY__SHIFT 0x1
+#define RLC_CNTL__READ_CACHE_DISABLE_MASK 0x4
+#define RLC_CNTL__READ_CACHE_DISABLE__SHIFT 0x2
+#define RLC_CNTL__RLC_STEP_F32_MASK 0x8
+#define RLC_CNTL__RLC_STEP_F32__SHIFT 0x3
+#define RLC_CNTL__SOFT_RESET_DEBUG_MODE_MASK 0x10
+#define RLC_CNTL__SOFT_RESET_DEBUG_MODE__SHIFT 0x4
+#define RLC_CNTL__RESERVED_MASK 0xffffff00
+#define RLC_CNTL__RESERVED__SHIFT 0x8
+#define RLC_DEBUG_SELECT__SELECT_MASK 0xff
+#define RLC_DEBUG_SELECT__SELECT__SHIFT 0x0
+#define RLC_DEBUG_SELECT__RESERVED_MASK 0xffffff00
+#define RLC_DEBUG_SELECT__RESERVED__SHIFT 0x8
+#define RLC_DEBUG__DATA_MASK 0xffffffff
+#define RLC_DEBUG__DATA__SHIFT 0x0
+#define RLC_MC_CNTL__WRREQ_SWAP_MASK 0x3
+#define RLC_MC_CNTL__WRREQ_SWAP__SHIFT 0x0
+#define RLC_MC_CNTL__WRREQ_TRAN_MASK 0x4
+#define RLC_MC_CNTL__WRREQ_TRAN__SHIFT 0x2
+#define RLC_MC_CNTL__WRREQ_PRIV_MASK 0x8
+#define RLC_MC_CNTL__WRREQ_PRIV__SHIFT 0x3
+#define RLC_MC_CNTL__WRNFO_STALL_MASK 0x10
+#define RLC_MC_CNTL__WRNFO_STALL__SHIFT 0x4
+#define RLC_MC_CNTL__WRNFO_URG_MASK 0x1e0
+#define RLC_MC_CNTL__WRNFO_URG__SHIFT 0x5
+#define RLC_MC_CNTL__WRREQ_DW_IMASK_MASK 0x1e00
+#define RLC_MC_CNTL__WRREQ_DW_IMASK__SHIFT 0x9
+#define RLC_MC_CNTL__RESERVED_B_MASK 0xfe000
+#define RLC_MC_CNTL__RESERVED_B__SHIFT 0xd
+#define RLC_MC_CNTL__RDNFO_URG_MASK 0xf00000
+#define RLC_MC_CNTL__RDNFO_URG__SHIFT 0x14
+#define RLC_MC_CNTL__RDREQ_SWAP_MASK 0x3000000
+#define RLC_MC_CNTL__RDREQ_SWAP__SHIFT 0x18
+#define RLC_MC_CNTL__RDREQ_TRAN_MASK 0x4000000
+#define RLC_MC_CNTL__RDREQ_TRAN__SHIFT 0x1a
+#define RLC_MC_CNTL__RDREQ_PRIV_MASK 0x8000000
+#define RLC_MC_CNTL__RDREQ_PRIV__SHIFT 0x1b
+#define RLC_MC_CNTL__RDNFO_STALL_MASK 0x10000000
+#define RLC_MC_CNTL__RDNFO_STALL__SHIFT 0x1c
+#define RLC_MC_CNTL__RESERVED_MASK 0xe0000000
+#define RLC_MC_CNTL__RESERVED__SHIFT 0x1d
+#define RLC_STAT__RLC_BUSY_MASK 0x1
+#define RLC_STAT__RLC_BUSY__SHIFT 0x0
+#define RLC_STAT__RLC_GPM_BUSY_MASK 0x2
+#define RLC_STAT__RLC_GPM_BUSY__SHIFT 0x1
+#define RLC_STAT__RLC_SPM_BUSY_MASK 0x4
+#define RLC_STAT__RLC_SPM_BUSY__SHIFT 0x2
+#define RLC_STAT__RLC_SRM_BUSY_MASK 0x8
+#define RLC_STAT__RLC_SRM_BUSY__SHIFT 0x3
+#define RLC_STAT__RESERVED_MASK 0xfffffff0
+#define RLC_STAT__RESERVED__SHIFT 0x4
+#define RLC_SAFE_MODE__CMD_MASK 0x1
+#define RLC_SAFE_MODE__CMD__SHIFT 0x0
+#define RLC_SAFE_MODE__MESSAGE_MASK 0x1e
+#define RLC_SAFE_MODE__MESSAGE__SHIFT 0x1
+#define RLC_SAFE_MODE__RESERVED1_MASK 0xe0
+#define RLC_SAFE_MODE__RESERVED1__SHIFT 0x5
+#define RLC_SAFE_MODE__RESPONSE_MASK 0xf00
+#define RLC_SAFE_MODE__RESPONSE__SHIFT 0x8
+#define RLC_SAFE_MODE__RESERVED_MASK 0xfffff000
+#define RLC_SAFE_MODE__RESERVED__SHIFT 0xc
+#define RLC_MEM_SLP_CNTL__RLC_MEM_LS_EN_MASK 0x1
+#define RLC_MEM_SLP_CNTL__RLC_MEM_LS_EN__SHIFT 0x0
+#define RLC_MEM_SLP_CNTL__RLC_MEM_DS_EN_MASK 0x2
+#define RLC_MEM_SLP_CNTL__RLC_MEM_DS_EN__SHIFT 0x1
+#define RLC_MEM_SLP_CNTL__RESERVED_MASK 0x7c
+#define RLC_MEM_SLP_CNTL__RESERVED__SHIFT 0x2
+#define RLC_MEM_SLP_CNTL__RLC_LS_DS_BUSY_OVERRIDE_MASK 0x80
+#define RLC_MEM_SLP_CNTL__RLC_LS_DS_BUSY_OVERRIDE__SHIFT 0x7
+#define RLC_MEM_SLP_CNTL__RLC_MEM_LS_ON_DELAY_MASK 0xff00
+#define RLC_MEM_SLP_CNTL__RLC_MEM_LS_ON_DELAY__SHIFT 0x8
+#define RLC_MEM_SLP_CNTL__RLC_MEM_LS_OFF_DELAY_MASK 0xff0000
+#define RLC_MEM_SLP_CNTL__RLC_MEM_LS_OFF_DELAY__SHIFT 0x10
+#define RLC_MEM_SLP_CNTL__RESERVED1_MASK 0xff000000
+#define RLC_MEM_SLP_CNTL__RESERVED1__SHIFT 0x18
+#define SMU_RLC_RESPONSE__RESP_MASK 0xffffffff
+#define SMU_RLC_RESPONSE__RESP__SHIFT 0x0
+#define RLC_RLCV_SAFE_MODE__CMD_MASK 0x1
+#define RLC_RLCV_SAFE_MODE__CMD__SHIFT 0x0
+#define RLC_RLCV_SAFE_MODE__MESSAGE_MASK 0x1e
+#define RLC_RLCV_SAFE_MODE__MESSAGE__SHIFT 0x1
+#define RLC_RLCV_SAFE_MODE__RESERVED1_MASK 0xe0
+#define RLC_RLCV_SAFE_MODE__RESERVED1__SHIFT 0x5
+#define RLC_RLCV_SAFE_MODE__RESPONSE_MASK 0xf00
+#define RLC_RLCV_SAFE_MODE__RESPONSE__SHIFT 0x8
+#define RLC_RLCV_SAFE_MODE__RESERVED_MASK 0xfffff000
+#define RLC_RLCV_SAFE_MODE__RESERVED__SHIFT 0xc
+#define RLC_SMU_SAFE_MODE__CMD_MASK 0x1
+#define RLC_SMU_SAFE_MODE__CMD__SHIFT 0x0
+#define RLC_SMU_SAFE_MODE__MESSAGE_MASK 0x1e
+#define RLC_SMU_SAFE_MODE__MESSAGE__SHIFT 0x1
+#define RLC_SMU_SAFE_MODE__RESERVED1_MASK 0xe0
+#define RLC_SMU_SAFE_MODE__RESERVED1__SHIFT 0x5
+#define RLC_SMU_SAFE_MODE__RESPONSE_MASK 0xf00
+#define RLC_SMU_SAFE_MODE__RESPONSE__SHIFT 0x8
+#define RLC_SMU_SAFE_MODE__RESERVED_MASK 0xfffff000
+#define RLC_SMU_SAFE_MODE__RESERVED__SHIFT 0xc
+#define RLC_RLCV_COMMAND__CMD_MASK 0xf
+#define RLC_RLCV_COMMAND__CMD__SHIFT 0x0
+#define RLC_RLCV_COMMAND__RESERVED_MASK 0xfffffff0
+#define RLC_RLCV_COMMAND__RESERVED__SHIFT 0x4
+#define RLC_CLK_CNTL__RLC_SRM_CLK_CNTL_MASK 0x1
+#define RLC_CLK_CNTL__RLC_SRM_CLK_CNTL__SHIFT 0x0
+#define RLC_CLK_CNTL__RLC_SPM_CLK_CNTL_MASK 0x2
+#define RLC_CLK_CNTL__RLC_SPM_CLK_CNTL__SHIFT 0x1
+#define RLC_CLK_CNTL__RESERVED_MASK 0xfffffffc
+#define RLC_CLK_CNTL__RESERVED__SHIFT 0x2
+#define RLC_PERFMON_CLK_CNTL__PERFMON_CLOCK_STATE_MASK 0x1
+#define RLC_PERFMON_CLK_CNTL__PERFMON_CLOCK_STATE__SHIFT 0x0
+#define RLC_PERFMON_CNTL__PERFMON_STATE_MASK 0x7
+#define RLC_PERFMON_CNTL__PERFMON_STATE__SHIFT 0x0
+#define RLC_PERFMON_CNTL__PERFMON_SAMPLE_ENABLE_MASK 0x400
+#define RLC_PERFMON_CNTL__PERFMON_SAMPLE_ENABLE__SHIFT 0xa
+#define RLC_PERFCOUNTER0_SELECT__PERFCOUNTER_SELECT_MASK 0xff
+#define RLC_PERFCOUNTER0_SELECT__PERFCOUNTER_SELECT__SHIFT 0x0
+#define RLC_PERFCOUNTER1_SELECT__PERFCOUNTER_SELECT_MASK 0xff
+#define RLC_PERFCOUNTER1_SELECT__PERFCOUNTER_SELECT__SHIFT 0x0
+#define RLC_PERFCOUNTER0_LO__PERFCOUNTER_LO_MASK 0xffffffff
+#define RLC_PERFCOUNTER0_LO__PERFCOUNTER_LO__SHIFT 0x0
+#define RLC_PERFCOUNTER1_LO__PERFCOUNTER_LO_MASK 0xffffffff
+#define RLC_PERFCOUNTER1_LO__PERFCOUNTER_LO__SHIFT 0x0
+#define RLC_PERFCOUNTER0_HI__PERFCOUNTER_HI_MASK 0xffffffff
+#define RLC_PERFCOUNTER0_HI__PERFCOUNTER_HI__SHIFT 0x0
+#define RLC_PERFCOUNTER1_HI__PERFCOUNTER_HI_MASK 0xffffffff
+#define RLC_PERFCOUNTER1_HI__PERFCOUNTER_HI__SHIFT 0x0
+#define CGTT_RLC_CLK_CTRL__ON_DELAY_MASK 0xf
+#define CGTT_RLC_CLK_CTRL__ON_DELAY__SHIFT 0x0
+#define CGTT_RLC_CLK_CTRL__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_RLC_CLK_CTRL__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_RLC_CLK_CTRL__SOFT_OVERRIDE_DYN_MASK 0x40000000
+#define CGTT_RLC_CLK_CTRL__SOFT_OVERRIDE_DYN__SHIFT 0x1e
+#define CGTT_RLC_CLK_CTRL__SOFT_OVERRIDE_REG_MASK 0x80000000
+#define CGTT_RLC_CLK_CTRL__SOFT_OVERRIDE_REG__SHIFT 0x1f
+#define RLC_LB_CNTL__LOAD_BALANCE_ENABLE_MASK 0x1
+#define RLC_LB_CNTL__LOAD_BALANCE_ENABLE__SHIFT 0x0
+#define RLC_LB_CNTL__LB_CNT_CP_BUSY_MASK 0x2
+#define RLC_LB_CNTL__LB_CNT_CP_BUSY__SHIFT 0x1
+#define RLC_LB_CNTL__LB_CNT_SPIM_ACTIVE_MASK 0x4
+#define RLC_LB_CNTL__LB_CNT_SPIM_ACTIVE__SHIFT 0x2
+#define RLC_LB_CNTL__LB_CNT_REG_INC_MASK 0x8
+#define RLC_LB_CNTL__LB_CNT_REG_INC__SHIFT 0x3
+#define RLC_LB_CNTL__CU_MASK_USED_OFF_HYST_MASK 0xff0
+#define RLC_LB_CNTL__CU_MASK_USED_OFF_HYST__SHIFT 0x4
+#define RLC_LB_CNTL__RESERVED_MASK 0xfffff000
+#define RLC_LB_CNTL__RESERVED__SHIFT 0xc
+#define RLC_LB_CNTR_MAX__LB_CNTR_MAX_MASK 0xffffffff
+#define RLC_LB_CNTR_MAX__LB_CNTR_MAX__SHIFT 0x0
+#define RLC_LB_CNTR_INIT__LB_CNTR_INIT_MASK 0xffffffff
+#define RLC_LB_CNTR_INIT__LB_CNTR_INIT__SHIFT 0x0
+#define RLC_LOAD_BALANCE_CNTR__RLC_LOAD_BALANCE_CNTR_MASK 0xffffffff
+#define RLC_LOAD_BALANCE_CNTR__RLC_LOAD_BALANCE_CNTR__SHIFT 0x0
+#define RLC_JUMP_TABLE_RESTORE__ADDR_MASK 0xffffffff
+#define RLC_JUMP_TABLE_RESTORE__ADDR__SHIFT 0x0
+#define RLC_PG_DELAY_2__SERDES_TIMEOUT_VALUE_MASK 0xff
+#define RLC_PG_DELAY_2__SERDES_TIMEOUT_VALUE__SHIFT 0x0
+#define RLC_PG_DELAY_2__SERDES_CMD_DELAY_MASK 0xff00
+#define RLC_PG_DELAY_2__SERDES_CMD_DELAY__SHIFT 0x8
+#define RLC_PG_DELAY_2__PERCU_TIMEOUT_VALUE_MASK 0xffff0000
+#define RLC_PG_DELAY_2__PERCU_TIMEOUT_VALUE__SHIFT 0x10
+#define RLC_GPM_DEBUG_SELECT__SELECT_MASK 0xff
+#define RLC_GPM_DEBUG_SELECT__SELECT__SHIFT 0x0
+#define RLC_GPM_DEBUG_SELECT__F32_DEBUG_SELECT_MASK 0x300
+#define RLC_GPM_DEBUG_SELECT__F32_DEBUG_SELECT__SHIFT 0x8
+#define RLC_GPM_DEBUG_SELECT__RESERVED_MASK 0xfffffc00
+#define RLC_GPM_DEBUG_SELECT__RESERVED__SHIFT 0xa
+#define RLC_GPM_DEBUG__DATA_MASK 0xffffffff
+#define RLC_GPM_DEBUG__DATA__SHIFT 0x0
+#define RLC_GPM_DEBUG_INST_A__INST_A_MASK 0xffffffff
+#define RLC_GPM_DEBUG_INST_A__INST_A__SHIFT 0x0
+#define RLC_GPM_DEBUG_INST_B__INST_B_MASK 0xffffffff
+#define RLC_GPM_DEBUG_INST_B__INST_B__SHIFT 0x0
+#define RLC_GPM_DEBUG_INST_ADDR__ADRR_A_MASK 0xffff
+#define RLC_GPM_DEBUG_INST_ADDR__ADRR_A__SHIFT 0x0
+#define RLC_GPM_DEBUG_INST_ADDR__ADDR_B_MASK 0xffff0000
+#define RLC_GPM_DEBUG_INST_ADDR__ADDR_B__SHIFT 0x10
+#define RLC_GPM_UCODE_ADDR__UCODE_ADDR_MASK 0xfff
+#define RLC_GPM_UCODE_ADDR__UCODE_ADDR__SHIFT 0x0
+#define RLC_GPM_UCODE_ADDR__RESERVED_MASK 0xfffff000
+#define RLC_GPM_UCODE_ADDR__RESERVED__SHIFT 0xc
+#define RLC_GPM_UCODE_DATA__UCODE_DATA_MASK 0xffffffff
+#define RLC_GPM_UCODE_DATA__UCODE_DATA__SHIFT 0x0
+#define GPU_BIST_CONTROL__STOP_ON_FAIL_HW_MASK 0x1
+#define GPU_BIST_CONTROL__STOP_ON_FAIL_HW__SHIFT 0x0
+#define GPU_BIST_CONTROL__STOP_ON_FAIL_CU_HARV_MASK 0x2
+#define GPU_BIST_CONTROL__STOP_ON_FAIL_CU_HARV__SHIFT 0x1
+#define GPU_BIST_CONTROL__CU_HARV_LOOP_COUNT_MASK 0x3c
+#define GPU_BIST_CONTROL__CU_HARV_LOOP_COUNT__SHIFT 0x2
+#define GPU_BIST_CONTROL__RESERVED_MASK 0xffff80
+#define GPU_BIST_CONTROL__RESERVED__SHIFT 0x7
+#define GPU_BIST_CONTROL__GLOBAL_LOOP_COUNT_MASK 0xff000000
+#define GPU_BIST_CONTROL__GLOBAL_LOOP_COUNT__SHIFT 0x18
+#define RLC_ROM_CNTL__USE_ROM_MASK 0x1
+#define RLC_ROM_CNTL__USE_ROM__SHIFT 0x0
+#define RLC_ROM_CNTL__SLP_MODE_EN_MASK 0x2
+#define RLC_ROM_CNTL__SLP_MODE_EN__SHIFT 0x1
+#define RLC_ROM_CNTL__EFUSE_DISTRIB_EN_MASK 0x4
+#define RLC_ROM_CNTL__EFUSE_DISTRIB_EN__SHIFT 0x2
+#define RLC_ROM_CNTL__HELLOWORLD_EN_MASK 0x8
+#define RLC_ROM_CNTL__HELLOWORLD_EN__SHIFT 0x3
+#define RLC_ROM_CNTL__CU_HARVEST_EN_MASK 0x10
+#define RLC_ROM_CNTL__CU_HARVEST_EN__SHIFT 0x4
+#define RLC_ROM_CNTL__RESERVED_MASK 0xffffffe0
+#define RLC_ROM_CNTL__RESERVED__SHIFT 0x5
+#define RLC_GPU_CLOCK_COUNT_LSB__GPU_CLOCKS_LSB_MASK 0xffffffff
+#define RLC_GPU_CLOCK_COUNT_LSB__GPU_CLOCKS_LSB__SHIFT 0x0
+#define RLC_GPU_CLOCK_COUNT_MSB__GPU_CLOCKS_MSB_MASK 0xffffffff
+#define RLC_GPU_CLOCK_COUNT_MSB__GPU_CLOCKS_MSB__SHIFT 0x0
+#define RLC_CAPTURE_GPU_CLOCK_COUNT__CAPTURE_MASK 0x1
+#define RLC_CAPTURE_GPU_CLOCK_COUNT__CAPTURE__SHIFT 0x0
+#define RLC_CAPTURE_GPU_CLOCK_COUNT__RESERVED_MASK 0xfffffffe
+#define RLC_CAPTURE_GPU_CLOCK_COUNT__RESERVED__SHIFT 0x1
+#define RLC_UCODE_CNTL__RLC_UCODE_FLAGS_MASK 0xffffffff
+#define RLC_UCODE_CNTL__RLC_UCODE_FLAGS__SHIFT 0x0
+#define RLC_GPM_STAT__RLC_BUSY_MASK 0x1
+#define RLC_GPM_STAT__RLC_BUSY__SHIFT 0x0
+#define RLC_GPM_STAT__GFX_POWER_STATUS_MASK 0x2
+#define RLC_GPM_STAT__GFX_POWER_STATUS__SHIFT 0x1
+#define RLC_GPM_STAT__GFX_CLOCK_STATUS_MASK 0x4
+#define RLC_GPM_STAT__GFX_CLOCK_STATUS__SHIFT 0x2
+#define RLC_GPM_STAT__GFX_LS_STATUS_MASK 0x8
+#define RLC_GPM_STAT__GFX_LS_STATUS__SHIFT 0x3
+#define RLC_GPM_STAT__GFX_PIPELINE_POWER_STATUS_MASK 0x10
+#define RLC_GPM_STAT__GFX_PIPELINE_POWER_STATUS__SHIFT 0x4
+#define RLC_GPM_STAT__CNTX_IDLE_BEING_PROCESSED_MASK 0x20
+#define RLC_GPM_STAT__CNTX_IDLE_BEING_PROCESSED__SHIFT 0x5
+#define RLC_GPM_STAT__CNTX_BUSY_BEING_PROCESSED_MASK 0x40
+#define RLC_GPM_STAT__CNTX_BUSY_BEING_PROCESSED__SHIFT 0x6
+#define RLC_GPM_STAT__GFX_IDLE_BEING_PROCESSED_MASK 0x80
+#define RLC_GPM_STAT__GFX_IDLE_BEING_PROCESSED__SHIFT 0x7
+#define RLC_GPM_STAT__CMP_BUSY_BEING_PROCESSED_MASK 0x100
+#define RLC_GPM_STAT__CMP_BUSY_BEING_PROCESSED__SHIFT 0x8
+#define RLC_GPM_STAT__SAVING_REGISTERS_MASK 0x200
+#define RLC_GPM_STAT__SAVING_REGISTERS__SHIFT 0x9
+#define RLC_GPM_STAT__RESTORING_REGISTERS_MASK 0x400
+#define RLC_GPM_STAT__RESTORING_REGISTERS__SHIFT 0xa
+#define RLC_GPM_STAT__GFX3D_BLOCKS_CHANGING_POWER_STATE_MASK 0x800
+#define RLC_GPM_STAT__GFX3D_BLOCKS_CHANGING_POWER_STATE__SHIFT 0xb
+#define RLC_GPM_STAT__CMP_BLOCKS_CHANGING_POWER_STATE_MASK 0x1000
+#define RLC_GPM_STAT__CMP_BLOCKS_CHANGING_POWER_STATE__SHIFT 0xc
+#define RLC_GPM_STAT__STATIC_CU_POWERING_UP_MASK 0x2000
+#define RLC_GPM_STAT__STATIC_CU_POWERING_UP__SHIFT 0xd
+#define RLC_GPM_STAT__STATIC_CU_POWERING_DOWN_MASK 0x4000
+#define RLC_GPM_STAT__STATIC_CU_POWERING_DOWN__SHIFT 0xe
+#define RLC_GPM_STAT__DYN_CU_POWERING_UP_MASK 0x8000
+#define RLC_GPM_STAT__DYN_CU_POWERING_UP__SHIFT 0xf
+#define RLC_GPM_STAT__DYN_CU_POWERING_DOWN_MASK 0x10000
+#define RLC_GPM_STAT__DYN_CU_POWERING_DOWN__SHIFT 0x10
+#define RLC_GPM_STAT__ABORTED_PD_SEQUENCE_MASK 0x20000
+#define RLC_GPM_STAT__ABORTED_PD_SEQUENCE__SHIFT 0x11
+#define RLC_GPM_STAT__RESERVED_MASK 0xfc0000
+#define RLC_GPM_STAT__RESERVED__SHIFT 0x12
+#define RLC_GPM_STAT__PG_ERROR_STATUS_MASK 0xff000000
+#define RLC_GPM_STAT__PG_ERROR_STATUS__SHIFT 0x18
+#define RLC_GPU_CLOCK_32_RES_SEL__RES_SEL_MASK 0x3f
+#define RLC_GPU_CLOCK_32_RES_SEL__RES_SEL__SHIFT 0x0
+#define RLC_GPU_CLOCK_32_RES_SEL__RESERVED_MASK 0xffffffc0
+#define RLC_GPU_CLOCK_32_RES_SEL__RESERVED__SHIFT 0x6
+#define RLC_GPU_CLOCK_32__GPU_CLOCK_32_MASK 0xffffffff
+#define RLC_GPU_CLOCK_32__GPU_CLOCK_32__SHIFT 0x0
+#define RLC_PG_CNTL__GFX_POWER_GATING_ENABLE_MASK 0x1
+#define RLC_PG_CNTL__GFX_POWER_GATING_ENABLE__SHIFT 0x0
+#define RLC_PG_CNTL__GFX_POWER_GATING_SRC_MASK 0x2
+#define RLC_PG_CNTL__GFX_POWER_GATING_SRC__SHIFT 0x1
+#define RLC_PG_CNTL__DYN_PER_CU_PG_ENABLE_MASK 0x4
+#define RLC_PG_CNTL__DYN_PER_CU_PG_ENABLE__SHIFT 0x2
+#define RLC_PG_CNTL__STATIC_PER_CU_PG_ENABLE_MASK 0x8
+#define RLC_PG_CNTL__STATIC_PER_CU_PG_ENABLE__SHIFT 0x3
+#define RLC_PG_CNTL__GFX_PIPELINE_PG_ENABLE_MASK 0x10
+#define RLC_PG_CNTL__GFX_PIPELINE_PG_ENABLE__SHIFT 0x4
+#define RLC_PG_CNTL__RESERVED_MASK 0x3fe0
+#define RLC_PG_CNTL__RESERVED__SHIFT 0x5
+#define RLC_PG_CNTL__PG_OVERRIDE_MASK 0x4000
+#define RLC_PG_CNTL__PG_OVERRIDE__SHIFT 0xe
+#define RLC_PG_CNTL__CP_PG_DISABLE_MASK 0x8000
+#define RLC_PG_CNTL__CP_PG_DISABLE__SHIFT 0xf
+#define RLC_PG_CNTL__CHUB_HANDSHAKE_ENABLE_MASK 0x10000
+#define RLC_PG_CNTL__CHUB_HANDSHAKE_ENABLE__SHIFT 0x10
+#define RLC_PG_CNTL__SMU_CLK_SLOWDOWN_ON_PU_ENABLE_MASK 0x20000
+#define RLC_PG_CNTL__SMU_CLK_SLOWDOWN_ON_PU_ENABLE__SHIFT 0x11
+#define RLC_PG_CNTL__SMU_CLK_SLOWDOWN_ON_PD_ENABLE_MASK 0x40000
+#define RLC_PG_CNTL__SMU_CLK_SLOWDOWN_ON_PD_ENABLE__SHIFT 0x12
+#define RLC_PG_CNTL__SMU_HANDSHAKE_ENABLE_MASK 0x80000
+#define RLC_PG_CNTL__SMU_HANDSHAKE_ENABLE__SHIFT 0x13
+#define RLC_PG_CNTL__RESERVED1_MASK 0xf00000
+#define RLC_PG_CNTL__RESERVED1__SHIFT 0x14
+#define RLC_GPM_THREAD_PRIORITY__THREAD0_PRIORITY_MASK 0xff
+#define RLC_GPM_THREAD_PRIORITY__THREAD0_PRIORITY__SHIFT 0x0
+#define RLC_GPM_THREAD_PRIORITY__THREAD1_PRIORITY_MASK 0xff00
+#define RLC_GPM_THREAD_PRIORITY__THREAD1_PRIORITY__SHIFT 0x8
+#define RLC_GPM_THREAD_PRIORITY__THREAD2_PRIORITY_MASK 0xff0000
+#define RLC_GPM_THREAD_PRIORITY__THREAD2_PRIORITY__SHIFT 0x10
+#define RLC_GPM_THREAD_PRIORITY__THREAD3_PRIORITY_MASK 0xff000000
+#define RLC_GPM_THREAD_PRIORITY__THREAD3_PRIORITY__SHIFT 0x18
+#define RLC_GPM_THREAD_ENABLE__THREAD0_ENABLE_MASK 0x1
+#define RLC_GPM_THREAD_ENABLE__THREAD0_ENABLE__SHIFT 0x0
+#define RLC_GPM_THREAD_ENABLE__THREAD1_ENABLE_MASK 0x2
+#define RLC_GPM_THREAD_ENABLE__THREAD1_ENABLE__SHIFT 0x1
+#define RLC_GPM_THREAD_ENABLE__THREAD2_ENABLE_MASK 0x4
+#define RLC_GPM_THREAD_ENABLE__THREAD2_ENABLE__SHIFT 0x2
+#define RLC_GPM_THREAD_ENABLE__THREAD3_ENABLE_MASK 0x8
+#define RLC_GPM_THREAD_ENABLE__THREAD3_ENABLE__SHIFT 0x3
+#define RLC_GPM_THREAD_ENABLE__RESERVED_MASK 0xfffffff0
+#define RLC_GPM_THREAD_ENABLE__RESERVED__SHIFT 0x4
+#define RLC_GPM_VMID_THREAD0__RLC_VMID_MASK 0xf
+#define RLC_GPM_VMID_THREAD0__RLC_VMID__SHIFT 0x0
+#define RLC_GPM_VMID_THREAD0__RESERVED0_MASK 0xf0
+#define RLC_GPM_VMID_THREAD0__RESERVED0__SHIFT 0x4
+#define RLC_GPM_VMID_THREAD0__RLC_QUEUEID_MASK 0x700
+#define RLC_GPM_VMID_THREAD0__RLC_QUEUEID__SHIFT 0x8
+#define RLC_GPM_VMID_THREAD0__RESERVED1_MASK 0xfffff800
+#define RLC_GPM_VMID_THREAD0__RESERVED1__SHIFT 0xb
+#define RLC_GPM_VMID_THREAD1__RLC_VMID_MASK 0xf
+#define RLC_GPM_VMID_THREAD1__RLC_VMID__SHIFT 0x0
+#define RLC_GPM_VMID_THREAD1__RESERVED0_MASK 0xf0
+#define RLC_GPM_VMID_THREAD1__RESERVED0__SHIFT 0x4
+#define RLC_GPM_VMID_THREAD1__RLC_QUEUEID_MASK 0x700
+#define RLC_GPM_VMID_THREAD1__RLC_QUEUEID__SHIFT 0x8
+#define RLC_GPM_VMID_THREAD1__RESERVED1_MASK 0xfffff800
+#define RLC_GPM_VMID_THREAD1__RESERVED1__SHIFT 0xb
+#define RLC_CGTT_MGCG_OVERRIDE__OVERRIDE_MASK 0xffffffff
+#define RLC_CGTT_MGCG_OVERRIDE__OVERRIDE__SHIFT 0x0
+#define RLC_CGCG_CGLS_CTRL__CGCG_EN_MASK 0x1
+#define RLC_CGCG_CGLS_CTRL__CGCG_EN__SHIFT 0x0
+#define RLC_CGCG_CGLS_CTRL__CGLS_EN_MASK 0x2
+#define RLC_CGCG_CGLS_CTRL__CGLS_EN__SHIFT 0x1
+#define RLC_CGCG_CGLS_CTRL__CGLS_REP_COMPANSAT_DELAY_MASK 0xfc
+#define RLC_CGCG_CGLS_CTRL__CGLS_REP_COMPANSAT_DELAY__SHIFT 0x2
+#define RLC_CGCG_CGLS_CTRL__CGCG_GFX_IDLE_THRESHOLD_MASK 0x7ffff00
+#define RLC_CGCG_CGLS_CTRL__CGCG_GFX_IDLE_THRESHOLD__SHIFT 0x8
+#define RLC_CGCG_CGLS_CTRL__CGCG_CONTROLLER_MASK 0x8000000
+#define RLC_CGCG_CGLS_CTRL__CGCG_CONTROLLER__SHIFT 0x1b
+#define RLC_CGCG_CGLS_CTRL__CGCG_REG_CTRL_MASK 0x10000000
+#define RLC_CGCG_CGLS_CTRL__CGCG_REG_CTRL__SHIFT 0x1c
+#define RLC_CGCG_CGLS_CTRL__SLEEP_MODE_MASK 0x60000000
+#define RLC_CGCG_CGLS_CTRL__SLEEP_MODE__SHIFT 0x1d
+#define RLC_CGCG_CGLS_CTRL__SIM_SILICON_EN_MASK 0x80000000
+#define RLC_CGCG_CGLS_CTRL__SIM_SILICON_EN__SHIFT 0x1f
+#define RLC_CGCG_RAMP_CTRL__DOWN_DIV_START_UNIT_MASK 0xf
+#define RLC_CGCG_RAMP_CTRL__DOWN_DIV_START_UNIT__SHIFT 0x0
+#define RLC_CGCG_RAMP_CTRL__DOWN_DIV_STEP_UNIT_MASK 0xf0
+#define RLC_CGCG_RAMP_CTRL__DOWN_DIV_STEP_UNIT__SHIFT 0x4
+#define RLC_CGCG_RAMP_CTRL__UP_DIV_START_UNIT_MASK 0xf00
+#define RLC_CGCG_RAMP_CTRL__UP_DIV_START_UNIT__SHIFT 0x8
+#define RLC_CGCG_RAMP_CTRL__UP_DIV_STEP_UNIT_MASK 0xf000
+#define RLC_CGCG_RAMP_CTRL__UP_DIV_STEP_UNIT__SHIFT 0xc
+#define RLC_CGCG_RAMP_CTRL__STEP_DELAY_CNT_MASK 0xfff0000
+#define RLC_CGCG_RAMP_CTRL__STEP_DELAY_CNT__SHIFT 0x10
+#define RLC_CGCG_RAMP_CTRL__STEP_DELAY_UNIT_MASK 0xf0000000
+#define RLC_CGCG_RAMP_CTRL__STEP_DELAY_UNIT__SHIFT 0x1c
+#define RLC_DYN_PG_STATUS__PG_STATUS_CU_MASK_MASK 0xffffffff
+#define RLC_DYN_PG_STATUS__PG_STATUS_CU_MASK__SHIFT 0x0
+#define RLC_DYN_PG_REQUEST__PG_REQUEST_CU_MASK_MASK 0xffffffff
+#define RLC_DYN_PG_REQUEST__PG_REQUEST_CU_MASK__SHIFT 0x0
+#define RLC_PG_DELAY__POWER_UP_DELAY_MASK 0xff
+#define RLC_PG_DELAY__POWER_UP_DELAY__SHIFT 0x0
+#define RLC_PG_DELAY__POWER_DOWN_DELAY_MASK 0xff00
+#define RLC_PG_DELAY__POWER_DOWN_DELAY__SHIFT 0x8
+#define RLC_PG_DELAY__CMD_PROPAGATE_DELAY_MASK 0xff0000
+#define RLC_PG_DELAY__CMD_PROPAGATE_DELAY__SHIFT 0x10
+#define RLC_PG_DELAY__MEM_SLEEP_DELAY_MASK 0xff000000
+#define RLC_PG_DELAY__MEM_SLEEP_DELAY__SHIFT 0x18
+#define RLC_CU_STATUS__WORK_PENDING_MASK 0xffffffff
+#define RLC_CU_STATUS__WORK_PENDING__SHIFT 0x0
+#define RLC_LB_INIT_CU_MASK__INIT_CU_MASK_MASK 0xffffffff
+#define RLC_LB_INIT_CU_MASK__INIT_CU_MASK__SHIFT 0x0
+#define RLC_LB_ALWAYS_ACTIVE_CU_MASK__ALWAYS_ACTIVE_CU_MASK_MASK 0xffffffff
+#define RLC_LB_ALWAYS_ACTIVE_CU_MASK__ALWAYS_ACTIVE_CU_MASK__SHIFT 0x0
+#define RLC_LB_PARAMS__SKIP_L2_CHECK_MASK 0x1
+#define RLC_LB_PARAMS__SKIP_L2_CHECK__SHIFT 0x0
+#define RLC_LB_PARAMS__FIFO_SAMPLES_MASK 0xfe
+#define RLC_LB_PARAMS__FIFO_SAMPLES__SHIFT 0x1
+#define RLC_LB_PARAMS__PG_IDLE_SAMPLES_MASK 0xff00
+#define RLC_LB_PARAMS__PG_IDLE_SAMPLES__SHIFT 0x8
+#define RLC_LB_PARAMS__PG_IDLE_SAMPLE_INTERVAL_MASK 0xffff0000
+#define RLC_LB_PARAMS__PG_IDLE_SAMPLE_INTERVAL__SHIFT 0x10
+#define RLC_THREAD1_DELAY__CU_IDEL_DELAY_MASK 0xff
+#define RLC_THREAD1_DELAY__CU_IDEL_DELAY__SHIFT 0x0
+#define RLC_THREAD1_DELAY__LBPW_INNER_LOOP_DELAY_MASK 0xff00
+#define RLC_THREAD1_DELAY__LBPW_INNER_LOOP_DELAY__SHIFT 0x8
+#define RLC_THREAD1_DELAY__LBPW_OUTER_LOOP_DELAY_MASK 0xff0000
+#define RLC_THREAD1_DELAY__LBPW_OUTER_LOOP_DELAY__SHIFT 0x10
+#define RLC_THREAD1_DELAY__SPARE_MASK 0xff000000
+#define RLC_THREAD1_DELAY__SPARE__SHIFT 0x18
+#define RLC_PG_ALWAYS_ON_CU_MASK__AON_CU_MASK_MASK 0xffffffff
+#define RLC_PG_ALWAYS_ON_CU_MASK__AON_CU_MASK__SHIFT 0x0
+#define RLC_MAX_PG_CU__MAX_POWERED_UP_CU_MASK 0xff
+#define RLC_MAX_PG_CU__MAX_POWERED_UP_CU__SHIFT 0x0
+#define RLC_MAX_PG_CU__SPARE_MASK 0xffffff00
+#define RLC_MAX_PG_CU__SPARE__SHIFT 0x8
+#define RLC_AUTO_PG_CTRL__AUTO_PG_EN_MASK 0x1
+#define RLC_AUTO_PG_CTRL__AUTO_PG_EN__SHIFT 0x0
+#define RLC_AUTO_PG_CTRL__AUTO_GRBM_REG_SAVE_ON_IDLE_EN_MASK 0x2
+#define RLC_AUTO_PG_CTRL__AUTO_GRBM_REG_SAVE_ON_IDLE_EN__SHIFT 0x1
+#define RLC_AUTO_PG_CTRL__AUTO_WAKE_UP_EN_MASK 0x4
+#define RLC_AUTO_PG_CTRL__AUTO_WAKE_UP_EN__SHIFT 0x2
+#define RLC_AUTO_PG_CTRL__GRBM_REG_SAVE_GFX_IDLE_THRESHOLD_MASK 0x7fff8
+#define RLC_AUTO_PG_CTRL__GRBM_REG_SAVE_GFX_IDLE_THRESHOLD__SHIFT 0x3
+#define RLC_AUTO_PG_CTRL__PG_AFTER_GRBM_REG_SAVE_THRESHOLD_MASK 0xfff80000
+#define RLC_AUTO_PG_CTRL__PG_AFTER_GRBM_REG_SAVE_THRESHOLD__SHIFT 0x13
+#define RLC_SMU_GRBM_REG_SAVE_CTRL__START_GRBM_REG_SAVE_MASK 0x1
+#define RLC_SMU_GRBM_REG_SAVE_CTRL__START_GRBM_REG_SAVE__SHIFT 0x0
+#define RLC_SMU_GRBM_REG_SAVE_CTRL__SPARE_MASK 0xfffffffe
+#define RLC_SMU_GRBM_REG_SAVE_CTRL__SPARE__SHIFT 0x1
+#define RLC_SERDES_RD_MASTER_INDEX__CU_ID_MASK 0xf
+#define RLC_SERDES_RD_MASTER_INDEX__CU_ID__SHIFT 0x0
+#define RLC_SERDES_RD_MASTER_INDEX__SH_ID_MASK 0x30
+#define RLC_SERDES_RD_MASTER_INDEX__SH_ID__SHIFT 0x4
+#define RLC_SERDES_RD_MASTER_INDEX__SE_ID_MASK 0x1c0
+#define RLC_SERDES_RD_MASTER_INDEX__SE_ID__SHIFT 0x6
+#define RLC_SERDES_RD_MASTER_INDEX__SE_NONCU_ID_MASK 0x200
+#define RLC_SERDES_RD_MASTER_INDEX__SE_NONCU_ID__SHIFT 0x9
+#define RLC_SERDES_RD_MASTER_INDEX__SE_NONCU_MASK 0x400
+#define RLC_SERDES_RD_MASTER_INDEX__SE_NONCU__SHIFT 0xa
+#define RLC_SERDES_RD_MASTER_INDEX__NON_SE_MASK 0x7800
+#define RLC_SERDES_RD_MASTER_INDEX__NON_SE__SHIFT 0xb
+#define RLC_SERDES_RD_MASTER_INDEX__DATA_REG_ID_MASK 0x18000
+#define RLC_SERDES_RD_MASTER_INDEX__DATA_REG_ID__SHIFT 0xf
+#define RLC_SERDES_RD_MASTER_INDEX__SPARE_MASK 0xfffe0000
+#define RLC_SERDES_RD_MASTER_INDEX__SPARE__SHIFT 0x11
+#define RLC_SERDES_RD_DATA_0__DATA_MASK 0xffffffff
+#define RLC_SERDES_RD_DATA_0__DATA__SHIFT 0x0
+#define RLC_SERDES_RD_DATA_1__DATA_MASK 0xffffffff
+#define RLC_SERDES_RD_DATA_1__DATA__SHIFT 0x0
+#define RLC_SERDES_RD_DATA_2__DATA_MASK 0xffffffff
+#define RLC_SERDES_RD_DATA_2__DATA__SHIFT 0x0
+#define RLC_SERDES_WR_CU_MASTER_MASK__MASTER_MASK_MASK 0xffffffff
+#define RLC_SERDES_WR_CU_MASTER_MASK__MASTER_MASK__SHIFT 0x0
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SE_MASTER_MASK_MASK 0xffff
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SE_MASTER_MASK__SHIFT 0x0
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__GC_MASTER_MASK_MASK 0x10000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__GC_MASTER_MASK__SHIFT 0x10
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__GC_GFX_MASTER_MASK_MASK 0x20000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__GC_GFX_MASTER_MASK__SHIFT 0x11
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__TC0_MASTER_MASK_MASK 0x40000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__TC0_MASTER_MASK__SHIFT 0x12
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__TC1_MASTER_MASK_MASK 0x80000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__TC1_MASTER_MASK__SHIFT 0x13
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SPARE0_MASTER_MASK_MASK 0x100000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SPARE0_MASTER_MASK__SHIFT 0x14
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SPARE1_MASTER_MASK_MASK 0x200000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SPARE1_MASTER_MASK__SHIFT 0x15
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SPARE2_MASTER_MASK_MASK 0x400000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SPARE2_MASTER_MASK__SHIFT 0x16
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SPARE3_MASTER_MASK_MASK 0x800000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__SPARE3_MASTER_MASK__SHIFT 0x17
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__RESERVED_MASK 0xff000000
+#define RLC_SERDES_WR_NONCU_MASTER_MASK__RESERVED__SHIFT 0x18
+#define RLC_SERDES_WR_CTRL__BPM_ADDR_M

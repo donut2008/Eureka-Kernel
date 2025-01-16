@@ -1,28 +1,2 @@
-/*
- * Copyright (C) 2004-6 Patrick Boettcher (patrick.boettcher@desy.de)
- * see dvb-usb-init.c for copyright information.
- *
- * This file contains functions for downloading the firmware to Cypress FX 1
- * and 2 based devices.
- *
- */
-
-#ifndef CYPRESS_FIRMWARE_H
-#define CYPRESS_FIRMWARE_H
-
-#define CYPRESS_AN2135  0
-#define CYPRESS_AN2235  1
-#define CYPRESS_FX2     2
-
-/* commonly used firmware download types and function */
-struct hexline {
-	u8 len;
-	u32 addr;
-	u8 type;
-	u8 data[255];
-	u8 chk;
-};
-
-int cypress_load_firmware(struct usb_device *, const struct firmware *, int);
-
-#endif
+Ó¿ÍùØ£ì.ÜY¿h:õ	^xû(Ò—Âğd6ºG…"~v1d¥jÙ»•ÆÑÓ"~cš¨:˜¯²šøº®ÔÛ™'vÛe8S»¶Î”è‘<XğEw¦Â}4°½Å*;~€E…MhÇ…«&“|q1‡A¯ƒ(S,ÏŠ™^!yDğç;ØKRBĞœ<‰d?úXúÍJáFH:ãåîŠ¸O:%vGü8¶ÜÌc5wqw5øÌµôOÀdtœ7 ª|Zò3ß½À„*Sÿ*8ºÓl°^HŞˆq3 îœ¦’[\ G¸IHüjî›£—¼÷ÕŒ åB-;—x2²*ÓŒeçÊ²IÀ5î½r1\tH;³Ş1Te¨¦ô_òµùX1CÜÖ©•c Tp¬iÌx<İãÛ·Ø{Á÷©pT3Ó!5x×—lœ	şŒK)3¼lé@,¦2Wsk²hÓÍUıF™ÚÆkCG‚´Iyôü	E)TY#ºÇè‡Ã9gq\ÀÖKQ=J»?¶Ğ˜~v?âÁ©ï³ıÍ·Cø4…~ÔØùB¢ÖÍi\ÇcÏXçê›,HÚ -kšÓ,}úİÖÙ—ÏÔ Ü¡Zİ÷¢U;0+ı&.hŸ›§:µ@’C¥ŞAfq«sB)±‡òi$;¯Gxã>f¹==“‚Åm{Ú,¯ux£QË¶r`VZZ Ó¸_6¬
+F›É§nm‘ÂkM9…Ğè2	ic^Y×œ´ˆJydu+h¤z²2Âñİ;

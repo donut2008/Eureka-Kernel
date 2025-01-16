@@ -1,491 +1,234 @@
-/*
- * Rockchip Generic power domain support.
- *
- * Copyright (c) 2015 ROCKCHIP, Co. Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/io.h>
-#include <linux/err.h>
-#include <linux/pm_clock.h>
-#include <linux/pm_domain.h>
-#include <linux/of_address.h>
-#include <linux/of_platform.h>
-#include <linux/clk.h>
-#include <linux/regmap.h>
-#include <linux/mfd/syscon.h>
-#include <dt-bindings/power/rk3288-power.h>
-
-struct rockchip_domain_info {
-	int pwr_mask;
-	int status_mask;
-	int req_mask;
-	int idle_mask;
-	int ack_mask;
-};
-
-struct rockchip_pmu_info {
-	u32 pwr_offset;
-	u32 status_offset;
-	u32 req_offset;
-	u32 idle_offset;
-	u32 ack_offset;
-
-	u32 core_pwrcnt_offset;
-	u32 gpu_pwrcnt_offset;
-
-	unsigned int core_power_transition_time;
-	unsigned int gpu_power_transition_time;
-
-	int num_domains;
-	const struct rockchip_domain_info *domain_info;
-};
-
-struct rockchip_pm_domain {
-	struct generic_pm_domain genpd;
-	const struct rockchip_domain_info *info;
-	struct rockchip_pmu *pmu;
-	int num_clks;
-	struct clk *clks[];
-};
-
-struct rockchip_pmu {
-	struct device *dev;
-	struct regmap *regmap;
-	const struct rockchip_pmu_info *info;
-	struct mutex mutex; /* mutex lock for pmu */
-	struct genpd_onecell_data genpd_data;
-	struct generic_pm_domain *domains[];
-};
-
-#define to_rockchip_pd(gpd) container_of(gpd, struct rockchip_pm_domain, genpd)
-
-#define DOMAIN(pwr, status, req, idle, ack)	\
-{						\
-	.pwr_mask = BIT(pwr),			\
-	.status_mask = BIT(status),		\
-	.req_mask = BIT(req),			\
-	.idle_mask = BIT(idle),			\
-	.ack_mask = BIT(ack),			\
-}
-
-#define DOMAIN_RK3288(pwr, status, req)		\
-	DOMAIN(pwr, status, req, req, (req) + 16)
-
-static bool rockchip_pmu_domain_is_idle(struct rockchip_pm_domain *pd)
-{
-	struct rockchip_pmu *pmu = pd->pmu;
-	const struct rockchip_domain_info *pd_info = pd->info;
-	unsigned int val;
-
-	regmap_read(pmu->regmap, pmu->info->idle_offset, &val);
-	return (val & pd_info->idle_mask) == pd_info->idle_mask;
-}
-
-static int rockchip_pmu_set_idle_request(struct rockchip_pm_domain *pd,
-					 bool idle)
-{
-	const struct rockchip_domain_info *pd_info = pd->info;
-	struct rockchip_pmu *pmu = pd->pmu;
-	unsigned int val;
-
-	regmap_update_bits(pmu->regmap, pmu->info->req_offset,
-			   pd_info->req_mask, idle ? -1U : 0);
-
-	dsb(sy);
-
-	do {
-		regmap_read(pmu->regmap, pmu->info->ack_offset, &val);
-	} while ((val & pd_info->ack_mask) != (idle ? pd_info->ack_mask : 0));
-
-	while (rockchip_pmu_domain_is_idle(pd) != idle)
-		cpu_relax();
-
-	return 0;
-}
-
-static bool rockchip_pmu_domain_is_on(struct rockchip_pm_domain *pd)
-{
-	struct rockchip_pmu *pmu = pd->pmu;
-	unsigned int val;
-
-	regmap_read(pmu->regmap, pmu->info->status_offset, &val);
-
-	/* 1'b0: power on, 1'b1: power off */
-	return !(val & pd->info->status_mask);
-}
-
-static void rockchip_do_pmu_set_power_domain(struct rockchip_pm_domain *pd,
-					     bool on)
-{
-	struct rockchip_pmu *pmu = pd->pmu;
-
-	regmap_update_bits(pmu->regmap, pmu->info->pwr_offset,
-			   pd->info->pwr_mask, on ? 0 : -1U);
-
-	dsb(sy);
-
-	while (rockchip_pmu_domain_is_on(pd) != on)
-		cpu_relax();
-}
-
-static int rockchip_pd_power(struct rockchip_pm_domain *pd, bool power_on)
-{
-	int i;
-
-	mutex_lock(&pd->pmu->mutex);
-
-	if (rockchip_pmu_domain_is_on(pd) != power_on) {
-		for (i = 0; i < pd->num_clks; i++)
-			clk_enable(pd->clks[i]);
-
-		if (!power_on) {
-			/* FIXME: add code to save AXI_QOS */
-
-			/* if powering down, idle request to NIU first */
-			rockchip_pmu_set_idle_request(pd, true);
-		}
-
-		rockchip_do_pmu_set_power_domain(pd, power_on);
-
-		if (power_on) {
-			/* if powering up, leave idle mode */
-			rockchip_pmu_set_idle_request(pd, false);
-
-			/* FIXME: add code to restore AXI_QOS */
-		}
-
-		for (i = pd->num_clks - 1; i >= 0; i--)
-			clk_disable(pd->clks[i]);
-	}
-
-	mutex_unlock(&pd->pmu->mutex);
-	return 0;
-}
-
-static int rockchip_pd_power_on(struct generic_pm_domain *domain)
-{
-	struct rockchip_pm_domain *pd = to_rockchip_pd(domain);
-
-	return rockchip_pd_power(pd, true);
-}
-
-static int rockchip_pd_power_off(struct generic_pm_domain *domain)
-{
-	struct rockchip_pm_domain *pd = to_rockchip_pd(domain);
-
-	return rockchip_pd_power(pd, false);
-}
-
-static int rockchip_pd_attach_dev(struct generic_pm_domain *genpd,
-				  struct device *dev)
-{
-	struct clk *clk;
-	int i;
-	int error;
-
-	dev_dbg(dev, "attaching to power domain '%s'\n", genpd->name);
-
-	error = pm_clk_create(dev);
-	if (error) {
-		dev_err(dev, "pm_clk_create failed %d\n", error);
-		return error;
-	}
-
-	i = 0;
-	while ((clk = of_clk_get(dev->of_node, i++)) && !IS_ERR(clk)) {
-		dev_dbg(dev, "adding clock '%pC' to list of PM clocks\n", clk);
-		error = pm_clk_add_clk(dev, clk);
-		if (error) {
-			dev_err(dev, "pm_clk_add_clk failed %d\n", error);
-			clk_put(clk);
-			pm_clk_destroy(dev);
-			return error;
-		}
-	}
-
-	return 0;
-}
-
-static void rockchip_pd_detach_dev(struct generic_pm_domain *genpd,
-				   struct device *dev)
-{
-	dev_dbg(dev, "detaching from power domain '%s'\n", genpd->name);
-
-	pm_clk_destroy(dev);
-}
-
-static int rockchip_pm_add_one_domain(struct rockchip_pmu *pmu,
-				      struct device_node *node)
-{
-	const struct rockchip_domain_info *pd_info;
-	struct rockchip_pm_domain *pd;
-	struct clk *clk;
-	int clk_cnt;
-	int i;
-	u32 id;
-	int error;
-
-	error = of_property_read_u32(node, "reg", &id);
-	if (error) {
-		dev_err(pmu->dev,
-			"%s: failed to retrieve domain id (reg): %d\n",
-			node->name, error);
-		return -EINVAL;
-	}
-
-	if (id >= pmu->info->num_domains) {
-		dev_err(pmu->dev, "%s: invalid domain id %d\n",
-			node->name, id);
-		return -EINVAL;
-	}
-
-	pd_info = &pmu->info->domain_info[id];
-	if (!pd_info) {
-		dev_err(pmu->dev, "%s: undefined domain id %d\n",
-			node->name, id);
-		return -EINVAL;
-	}
-
-	clk_cnt = of_count_phandle_with_args(node, "clocks", "#clock-cells");
-	pd = devm_kzalloc(pmu->dev,
-			  sizeof(*pd) + clk_cnt * sizeof(pd->clks[0]),
-			  GFP_KERNEL);
-	if (!pd)
-		return -ENOMEM;
-
-	pd->info = pd_info;
-	pd->pmu = pmu;
-
-	for (i = 0; i < clk_cnt; i++) {
-		clk = of_clk_get(node, i);
-		if (IS_ERR(clk)) {
-			error = PTR_ERR(clk);
-			dev_err(pmu->dev,
-				"%s: failed to get clk at index %d: %d\n",
-				node->name, i, error);
-			goto err_out;
-		}
-
-		error = clk_prepare(clk);
-		if (error) {
-			dev_err(pmu->dev,
-				"%s: failed to prepare clk %pC (index %d): %d\n",
-				node->name, clk, i, error);
-			clk_put(clk);
-			goto err_out;
-		}
-
-		pd->clks[pd->num_clks++] = clk;
-
-		dev_dbg(pmu->dev, "added clock '%pC' to domain '%s'\n",
-			clk, node->name);
-	}
-
-	error = rockchip_pd_power(pd, true);
-	if (error) {
-		dev_err(pmu->dev,
-			"failed to power on domain '%s': %d\n",
-			node->name, error);
-		goto err_out;
-	}
-
-	pd->genpd.name = node->name;
-	pd->genpd.power_off = rockchip_pd_power_off;
-	pd->genpd.power_on = rockchip_pd_power_on;
-	pd->genpd.attach_dev = rockchip_pd_attach_dev;
-	pd->genpd.detach_dev = rockchip_pd_detach_dev;
-	pd->genpd.flags = GENPD_FLAG_PM_CLK;
-	pm_genpd_init(&pd->genpd, NULL, false);
-
-	pmu->genpd_data.domains[id] = &pd->genpd;
-	return 0;
-
-err_out:
-	while (--i >= 0) {
-		clk_unprepare(pd->clks[i]);
-		clk_put(pd->clks[i]);
-	}
-	return error;
-}
-
-static void rockchip_pm_remove_one_domain(struct rockchip_pm_domain *pd)
-{
-	int i;
-
-	for (i = 0; i < pd->num_clks; i++) {
-		clk_unprepare(pd->clks[i]);
-		clk_put(pd->clks[i]);
-	}
-
-	/* protect the zeroing of pm->num_clks */
-	mutex_lock(&pd->pmu->mutex);
-	pd->num_clks = 0;
-	mutex_unlock(&pd->pmu->mutex);
-
-	/* devm will free our memory */
-}
-
-static void rockchip_pm_domain_cleanup(struct rockchip_pmu *pmu)
-{
-	struct generic_pm_domain *genpd;
-	struct rockchip_pm_domain *pd;
-	int i;
-
-	for (i = 0; i < pmu->genpd_data.num_domains; i++) {
-		genpd = pmu->genpd_data.domains[i];
-		if (genpd) {
-			pd = to_rockchip_pd(genpd);
-			rockchip_pm_remove_one_domain(pd);
-		}
-	}
-
-	/* devm will free our memory */
-}
-
-static void rockchip_configure_pd_cnt(struct rockchip_pmu *pmu,
-				      u32 domain_reg_offset,
-				      unsigned int count)
-{
-	/* First configure domain power down transition count ... */
-	regmap_write(pmu->regmap, domain_reg_offset, count);
-	/* ... and then power up count. */
-	regmap_write(pmu->regmap, domain_reg_offset + 4, count);
-}
-
-static int rockchip_pm_domain_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct device_node *np = dev->of_node;
-	struct device_node *node;
-	struct device *parent;
-	struct rockchip_pmu *pmu;
-	const struct of_device_id *match;
-	const struct rockchip_pmu_info *pmu_info;
-	int error;
-
-	if (!np) {
-		dev_err(dev, "device tree node not found\n");
-		return -ENODEV;
-	}
-
-	match = of_match_device(dev->driver->of_match_table, dev);
-	if (!match || !match->data) {
-		dev_err(dev, "missing pmu data\n");
-		return -EINVAL;
-	}
-
-	pmu_info = match->data;
-
-	pmu = devm_kzalloc(dev,
-			   sizeof(*pmu) +
-				pmu_info->num_domains * sizeof(pmu->domains[0]),
-			   GFP_KERNEL);
-	if (!pmu)
-		return -ENOMEM;
-
-	pmu->dev = &pdev->dev;
-	mutex_init(&pmu->mutex);
-
-	pmu->info = pmu_info;
-
-	pmu->genpd_data.domains = pmu->domains;
-	pmu->genpd_data.num_domains = pmu_info->num_domains;
-
-	parent = dev->parent;
-	if (!parent) {
-		dev_err(dev, "no parent for syscon devices\n");
-		return -ENODEV;
-	}
-
-	pmu->regmap = syscon_node_to_regmap(parent->of_node);
-
-	/*
-	 * Configure power up and down transition delays for CORE
-	 * and GPU domains.
-	 */
-	rockchip_configure_pd_cnt(pmu, pmu_info->core_pwrcnt_offset,
-				  pmu_info->core_power_transition_time);
-	rockchip_configure_pd_cnt(pmu, pmu_info->gpu_pwrcnt_offset,
-				  pmu_info->gpu_power_transition_time);
-
-	error = -ENODEV;
-
-	for_each_available_child_of_node(np, node) {
-		error = rockchip_pm_add_one_domain(pmu, node);
-		if (error) {
-			dev_err(dev, "failed to handle node %s: %d\n",
-				node->name, error);
-			of_node_put(node);
-			goto err_out;
-		}
-	}
-
-	if (error) {
-		dev_dbg(dev, "no power domains defined\n");
-		goto err_out;
-	}
-
-	of_genpd_add_provider_onecell(np, &pmu->genpd_data);
-
-	return 0;
-
-err_out:
-	rockchip_pm_domain_cleanup(pmu);
-	return error;
-}
-
-static const struct rockchip_domain_info rk3288_pm_domains[] = {
-	[RK3288_PD_VIO]		= DOMAIN_RK3288(7, 7, 4),
-	[RK3288_PD_HEVC]	= DOMAIN_RK3288(14, 10, 9),
-	[RK3288_PD_VIDEO]	= DOMAIN_RK3288(8, 8, 3),
-	[RK3288_PD_GPU]		= DOMAIN_RK3288(9, 9, 2),
-};
-
-static const struct rockchip_pmu_info rk3288_pmu = {
-	.pwr_offset = 0x08,
-	.status_offset = 0x0c,
-	.req_offset = 0x10,
-	.idle_offset = 0x14,
-	.ack_offset = 0x14,
-
-	.core_pwrcnt_offset = 0x34,
-	.gpu_pwrcnt_offset = 0x3c,
-
-	.core_power_transition_time = 24, /* 1us */
-	.gpu_power_transition_time = 24, /* 1us */
-
-	.num_domains = ARRAY_SIZE(rk3288_pm_domains),
-	.domain_info = rk3288_pm_domains,
-};
-
-static const struct of_device_id rockchip_pm_domain_dt_match[] = {
-	{
-		.compatible = "rockchip,rk3288-power-controller",
-		.data = (void *)&rk3288_pmu,
-	},
-	{ /* sentinel */ },
-};
-
-static struct platform_driver rockchip_pm_domain_driver = {
-	.probe = rockchip_pm_domain_probe,
-	.driver = {
-		.name   = "rockchip-pm-domain",
-		.of_match_table = rockchip_pm_domain_dt_match,
-		/*
-		 * We can't forcibly eject devices form power domain,
-		 * so we can't really remove power domains once they
-		 * were added.
-		 */
-		.suppress_bind_attrs = true,
-	},
-};
-
-static int __init rockchip_pm_domain_drv_register(void)
-{
-	return platform_driver_register(&rockchip_pm_domain_driver);
-}
-postcore_initcall(rockchip_pm_domain_drv_register);
+ine DPM_TABLE_456__Smio_13__SHIFT 0x0
+#define DPM_TABLE_457__Smio_14_MASK 0xffffffff
+#define DPM_TABLE_457__Smio_14__SHIFT 0x0
+#define DPM_TABLE_458__Smio_15_MASK 0xffffffff
+#define DPM_TABLE_458__Smio_15__SHIFT 0x0
+#define DPM_TABLE_459__Smio_16_MASK 0xffffffff
+#define DPM_TABLE_459__Smio_16__SHIFT 0x0
+#define DPM_TABLE_460__Smio_17_MASK 0xffffffff
+#define DPM_TABLE_460__Smio_17__SHIFT 0x0
+#define DPM_TABLE_461__Smio_18_MASK 0xffffffff
+#define DPM_TABLE_461__Smio_18__SHIFT 0x0
+#define DPM_TABLE_462__Smio_19_MASK 0xffffffff
+#define DPM_TABLE_462__Smio_19__SHIFT 0x0
+#define DPM_TABLE_463__Smio_20_MASK 0xffffffff
+#define DPM_TABLE_463__Smio_20__SHIFT 0x0
+#define DPM_TABLE_464__Smio_21_MASK 0xffffffff
+#define DPM_TABLE_464__Smio_21__SHIFT 0x0
+#define DPM_TABLE_465__Smio_22_MASK 0xffffffff
+#define DPM_TABLE_465__Smio_22__SHIFT 0x0
+#define DPM_TABLE_466__Smio_23_MASK 0xffffffff
+#define DPM_TABLE_466__Smio_23__SHIFT 0x0
+#define DPM_TABLE_467__Smio_24_MASK 0xffffffff
+#define DPM_TABLE_467__Smio_24__SHIFT 0x0
+#define DPM_TABLE_468__Smio_25_MASK 0xffffffff
+#define DPM_TABLE_468__Smio_25__SHIFT 0x0
+#define DPM_TABLE_469__Smio_26_MASK 0xffffffff
+#define DPM_TABLE_469__Smio_26__SHIFT 0x0
+#define DPM_TABLE_470__Smio_27_MASK 0xffffffff
+#define DPM_TABLE_470__Smio_27__SHIFT 0x0
+#define DPM_TABLE_471__Smio_28_MASK 0xffffffff
+#define DPM_TABLE_471__Smio_28__SHIFT 0x0
+#define DPM_TABLE_472__Smio_29_MASK 0xffffffff
+#define DPM_TABLE_472__Smio_29__SHIFT 0x0
+#define DPM_TABLE_473__Smio_30_MASK 0xffffffff
+#define DPM_TABLE_473__Smio_30__SHIFT 0x0
+#define DPM_TABLE_474__Smio_31_MASK 0xffffffff
+#define DPM_TABLE_474__Smio_31__SHIFT 0x0
+#define DPM_TABLE_475__SamuBootLevel_MASK 0xff
+#define DPM_TABLE_475__SamuBootLevel__SHIFT 0x0
+#define DPM_TABLE_475__AcpBootLevel_MASK 0xff00
+#define DPM_TABLE_475__AcpBootLevel__SHIFT 0x8
+#define DPM_TABLE_475__VceBootLevel_MASK 0xff0000
+#define DPM_TABLE_475__VceBootLevel__SHIFT 0x10
+#define DPM_TABLE_475__UvdBootLevel_MASK 0xff000000
+#define DPM_TABLE_475__UvdBootLevel__SHIFT 0x18
+#define DPM_TABLE_476__SAMUInterval_MASK 0xff
+#define DPM_TABLE_476__SAMUInterval__SHIFT 0x0
+#define DPM_TABLE_476__ACPInterval_MASK 0xff00
+#define DPM_TABLE_476__ACPInterval__SHIFT 0x8
+#define DPM_TABLE_476__VCEInterval_MASK 0xff0000
+#define DPM_TABLE_476__VCEInterval__SHIFT 0x10
+#define DPM_TABLE_476__UVDInterval_MASK 0xff000000
+#define DPM_TABLE_476__UVDInterval__SHIFT 0x18
+#define DPM_TABLE_477__GraphicsInterval_MASK 0xff
+#define DPM_TABLE_477__GraphicsInterval__SHIFT 0x0
+#define DPM_TABLE_477__GraphicsThermThrottleEnable_MASK 0xff00
+#define DPM_TABLE_477__GraphicsThermThrottleEnable__SHIFT 0x8
+#define DPM_TABLE_477__GraphicsVoltageChangeEnable_MASK 0xff0000
+#define DPM_TABLE_477__GraphicsVoltageChangeEnable__SHIFT 0x10
+#define DPM_TABLE_477__GraphicsBootLevel_MASK 0xff000000
+#define DPM_TABLE_477__GraphicsBootLevel__SHIFT 0x18
+#define DPM_TABLE_478__TemperatureLimitHigh_MASK 0xffff
+#define DPM_TABLE_478__TemperatureLimitHigh__SHIFT 0x0
+#define DPM_TABLE_478__ThermalInterval_MASK 0xff0000
+#define DPM_TABLE_478__ThermalInterval__SHIFT 0x10
+#define DPM_TABLE_478__VoltageInterval_MASK 0xff000000
+#define DPM_TABLE_478__VoltageInterval__SHIFT 0x18
+#define DPM_TABLE_479__MemoryVoltageChangeEnable_MASK 0xff
+#define DPM_TABLE_479__MemoryVoltageChangeEnable__SHIFT 0x0
+#define DPM_TABLE_479__MemoryBootLevel_MASK 0xff00
+#define DPM_TABLE_479__MemoryBootLevel__SHIFT 0x8
+#define DPM_TABLE_479__TemperatureLimitLow_MASK 0xffff0000
+#define DPM_TABLE_479__TemperatureLimitLow__SHIFT 0x10
+#define DPM_TABLE_480__VddcVddciDelta_MASK 0xffff
+#define DPM_TABLE_480__VddcVddciDelta__SHIFT 0x0
+#define DPM_TABLE_480__MemoryThermThrottleEnable_MASK 0xff0000
+#define DPM_TABLE_480__MemoryThermThrottleEnable__SHIFT 0x10
+#define DPM_TABLE_480__MemoryInterval_MASK 0xff000000
+#define DPM_TABLE_480__MemoryInterval__SHIFT 0x18
+#define DPM_TABLE_481__PhaseResponseTime_MASK 0xffff
+#define DPM_TABLE_481__PhaseResponseTime__SHIFT 0x0
+#define DPM_TABLE_481__VoltageResponseTime_MASK 0xffff0000
+#define DPM_TABLE_481__VoltageResponseTime__SHIFT 0x10
+#define DPM_TABLE_482__DTEMode_MASK 0xff
+#define DPM_TABLE_482__DTEMode__SHIFT 0x0
+#define DPM_TABLE_482__DTEInterval_MASK 0xff00
+#define DPM_TABLE_482__DTEInterval__SHIFT 0x8
+#define DPM_TABLE_482__PCIeGenInterval_MASK 0xff0000
+#define DPM_TABLE_482__PCIeGenInterval__SHIFT 0x10
+#define DPM_TABLE_482__PCIeBootLinkLevel_MASK 0xff000000
+#define DPM_TABLE_482__PCIeBootLinkLevel__SHIFT 0x18
+#define DPM_TABLE_483__ThermGpio_MASK 0xff
+#define DPM_TABLE_483__ThermGpio__SHIFT 0x0
+#define DPM_TABLE_483__AcDcGpio_MASK 0xff00
+#define DPM_TABLE_483__AcDcGpio__SHIFT 0x8
+#define DPM_TABLE_483__VRHotGpio_MASK 0xff0000
+#define DPM_TABLE_483__VRHotGpio__SHIFT 0x10
+#define DPM_TABLE_483__SVI2Enable_MASK 0xff000000
+#define DPM_TABLE_483__SVI2Enable__SHIFT 0x18
+#define DPM_TABLE_484__PPM_TemperatureLimit_MASK 0xffff
+#define DPM_TABLE_484__PPM_TemperatureLimit__SHIFT 0x0
+#define DPM_TABLE_484__PPM_PkgPwrLimit_MASK 0xffff0000
+#define DPM_TABLE_484__PPM_PkgPwrLimit__SHIFT 0x10
+#define DPM_TABLE_485__TargetTdp_MASK 0xffff
+#define DPM_TABLE_485__TargetTdp__SHIFT 0x0
+#define DPM_TABLE_485__DefaultTdp_MASK 0xffff0000
+#define DPM_TABLE_485__DefaultTdp__SHIFT 0x10
+#define DPM_TABLE_486__FpsLowThreshold_MASK 0xffff
+#define DPM_TABLE_486__FpsLowThreshold__SHIFT 0x0
+#define DPM_TABLE_486__FpsHighThreshold_MASK 0xffff0000
+#define DPM_TABLE_486__FpsHighThreshold__SHIFT 0x10
+#define DPM_TABLE_487__BAPMTI_R_0_1_0_MASK 0xffff
+#define DPM_TABLE_487__BAPMTI_R_0_1_0__SHIFT 0x0
+#define DPM_TABLE_487__BAPMTI_R_0_0_0_MASK 0xffff0000
+#define DPM_TABLE_487__BAPMTI_R_0_0_0__SHIFT 0x10
+#define DPM_TABLE_488__BAPMTI_R_1_0_0_MASK 0xffff
+#define DPM_TABLE_488__BAPMTI_R_1_0_0__SHIFT 0x0
+#define DPM_TABLE_488__BAPMTI_R_0_2_0_MASK 0xffff0000
+#define DPM_TABLE_488__BAPMTI_R_0_2_0__SHIFT 0x10
+#define DPM_TABLE_489__BAPMTI_R_1_2_0_MASK 0xffff
+#define DPM_TABLE_489__BAPMTI_R_1_2_0__SHIFT 0x0
+#define DPM_TABLE_489__BAPMTI_R_1_1_0_MASK 0xffff0000
+#define DPM_TABLE_489__BAPMTI_R_1_1_0__SHIFT 0x10
+#define DPM_TABLE_490__BAPMTI_R_2_1_0_MASK 0xffff
+#define DPM_TABLE_490__BAPMTI_R_2_1_0__SHIFT 0x0
+#define DPM_TABLE_490__BAPMTI_R_2_0_0_MASK 0xffff0000
+#define DPM_TABLE_490__BAPMTI_R_2_0_0__SHIFT 0x10
+#define DPM_TABLE_491__BAPMTI_R_3_0_0_MASK 0xffff
+#define DPM_TABLE_491__BAPMTI_R_3_0_0__SHIFT 0x0
+#define DPM_TABLE_491__BAPMTI_R_2_2_0_MASK 0xffff0000
+#define DPM_TABLE_491__BAPMTI_R_2_2_0__SHIFT 0x10
+#define DPM_TABLE_492__BAPMTI_R_3_2_0_MASK 0xffff
+#define DPM_TABLE_492__BAPMTI_R_3_2_0__SHIFT 0x0
+#define DPM_TABLE_492__BAPMTI_R_3_1_0_MASK 0xffff0000
+#define DPM_TABLE_492__BAPMTI_R_3_1_0__SHIFT 0x10
+#define DPM_TABLE_493__BAPMTI_R_4_1_0_MASK 0xffff
+#define DPM_TABLE_493__BAPMTI_R_4_1_0__SHIFT 0x0
+#define DPM_TABLE_493__BAPMTI_R_4_0_0_MASK 0xffff0000
+#define DPM_TABLE_493__BAPMTI_R_4_0_0__SHIFT 0x10
+#define DPM_TABLE_494__BAPMTI_RC_0_0_0_MASK 0xffff
+#define DPM_TABLE_494__BAPMTI_RC_0_0_0__SHIFT 0x0
+#define DPM_TABLE_494__BAPMTI_R_4_2_0_MASK 0xffff0000
+#define DPM_TABLE_494__BAPMTI_R_4_2_0__SHIFT 0x10
+#define DPM_TABLE_495__BAPMTI_RC_0_2_0_MASK 0xffff
+#define DPM_TABLE_495__BAPMTI_RC_0_2_0__SHIFT 0x0
+#define DPM_TABLE_495__BAPMTI_RC_0_1_0_MASK 0xffff0000
+#define DPM_TABLE_495__BAPMTI_RC_0_1_0__SHIFT 0x10
+#define DPM_TABLE_496__BAPMTI_RC_1_1_0_MASK 0xffff
+#define DPM_TABLE_496__BAPMTI_RC_1_1_0__SHIFT 0x0
+#define DPM_TABLE_496__BAPMTI_RC_1_0_0_MASK 0xffff0000
+#define DPM_TABLE_496__BAPMTI_RC_1_0_0__SHIFT 0x10
+#define DPM_TABLE_497__BAPMTI_RC_2_0_0_MASK 0xffff
+#define DPM_TABLE_497__BAPMTI_RC_2_0_0__SHIFT 0x0
+#define DPM_TABLE_497__BAPMTI_RC_1_2_0_MASK 0xffff0000
+#define DPM_TABLE_497__BAPMTI_RC_1_2_0__SHIFT 0x10
+#define DPM_TABLE_498__BAPMTI_RC_2_2_0_MASK 0xffff
+#define DPM_TABLE_498__BAPMTI_RC_2_2_0__SHIFT 0x0
+#define DPM_TABLE_498__BAPMTI_RC_2_1_0_MASK 0xffff0000
+#define DPM_TABLE_498__BAPMTI_RC_2_1_0__SHIFT 0x10
+#define DPM_TABLE_499__BAPMTI_RC_3_1_0_MASK 0xffff
+#define DPM_TABLE_499__BAPMTI_RC_3_1_0__SHIFT 0x0
+#define DPM_TABLE_499__BAPMTI_RC_3_0_0_MASK 0xffff0000
+#define DPM_TABLE_499__BAPMTI_RC_3_0_0__SHIFT 0x10
+#define DPM_TABLE_500__BAPMTI_RC_4_0_0_MASK 0xffff
+#define DPM_TABLE_500__BAPMTI_RC_4_0_0__SHIFT 0x0
+#define DPM_TABLE_500__BAPMTI_RC_3_2_0_MASK 0xffff0000
+#define DPM_TABLE_500__BAPMTI_RC_3_2_0__SHIFT 0x10
+#define DPM_TABLE_501__BAPMTI_RC_4_2_0_MASK 0xffff
+#define DPM_TABLE_501__BAPMTI_RC_4_2_0__SHIFT 0x0
+#define DPM_TABLE_501__BAPMTI_RC_4_1_0_MASK 0xffff0000
+#define DPM_TABLE_501__BAPMTI_RC_4_1_0__SHIFT 0x10
+#define DPM_TABLE_502__GpuTjHyst_MASK 0xff
+#define DPM_TABLE_502__GpuTjHyst__SHIFT 0x0
+#define DPM_TABLE_502__GpuTjMax_MASK 0xff00
+#define DPM_TABLE_502__GpuTjMax__SHIFT 0x8
+#define DPM_TABLE_502__DTETjOffset_MASK 0xff0000
+#define DPM_TABLE_502__DTETjOffset__SHIFT 0x10
+#define DPM_TABLE_502__DTEAmbientTempBase_MASK 0xff000000
+#define DPM_TABLE_502__DTEAmbientTempBase__SHIFT 0x18
+#define DPM_TABLE_503__BootVddci_MASK 0xffff
+#define DPM_TABLE_503__BootVddci__SHIFT 0x0
+#define DPM_TABLE_503__BootVddc_MASK 0xffff0000
+#define DPM_TABLE_503__BootVddc__SHIFT 0x10
+#define DPM_TABLE_504__padding_MASK 0xff
+#define DPM_TABLE_504__padding__SHIFT 0x0
+#define DPM_TABLE_504__PccGpio_MASK 0xff00
+#define DPM_TABLE_504__PccGpio__SHIFT 0x8
+#define DPM_TABLE_504__BootMVdd_MASK 0xffff0000
+#define DPM_TABLE_504__BootMVdd__SHIFT 0x10
+#define DPM_TABLE_505__BAPM_TEMP_GRADIENT_MASK 0xffffffff
+#define DPM_TABLE_505__BAPM_TEMP_GRADIENT__SHIFT 0x0
+#define DPM_TABLE_506__LowSclkInterruptThreshold_MASK 0xffffffff
+#define DPM_TABLE_506__LowSclkInterruptThreshold__SHIFT 0x0
+#define FIRMWARE_FLAGS__INTERRUPTS_ENABLED_MASK 0x1
+#define FIRMWARE_FLAGS__INTERRUPTS_ENABLED__SHIFT 0x0
+#define FIRMWARE_FLAGS__RESERVED_MASK 0xfffffe
+#define FIRMWARE_FLAGS__RESERVED__SHIFT 0x1
+#define FIRMWARE_FLAGS__TEST_COUNT_MASK 0xff000000
+#define FIRMWARE_FLAGS__TEST_COUNT__SHIFT 0x18
+#define TDC_STATUS__VDD_Boost_MASK 0xff
+#define TDC_STATUS__VDD_Boost__SHIFT 0x0
+#define TDC_STATUS__VDD_Throttle_MASK 0xff00
+#define TDC_STATUS__VDD_Throttle__SHIFT 0x8
+#define TDC_STATUS__VDDC_Boost_MASK 0xff0000
+#define TDC_STATUS__VDDC_Boost__SHIFT 0x10
+#define TDC_STATUS__VDDC_Throttle_MASK 0xff000000
+#define TDC_STATUS__VDDC_Throttle__SHIFT 0x18
+#define TDC_MV_AVERAGE__IDD_MASK 0xffff
+#define TDC_MV_AVERAGE__IDD__SHIFT 0x0
+#define TDC_MV_AVERAGE__IDDC_MASK 0xffff0000
+#define TDC_MV_AVERAGE__IDDC__SHIFT 0x10
+#define TDC_VRM_LIMIT__IDD_MASK 0xffff
+#define TDC_VRM_LIMIT__IDD__SHIFT 0x0
+#define TDC_VRM_LIMIT__IDDC_MASK 0xffff0000
+#define TDC_VRM_LIMIT__IDDC__SHIFT 0x10
+#define FEATURE_STATUS__SCLK_DPM_ON_MASK 0x1
+#define FEATURE_STATUS__SCLK_DPM_ON__SHIFT 0x0
+#define FEATURE_STATUS__MCLK_DPM_ON_MASK 0x2
+#define FEATURE_STATUS__MCLK_DPM_ON__SHIFT 0x1
+#define FEATURE_STATUS__LCLK_DPM_ON_MASK 0x4
+#define FEATURE_STATUS__LCLK_DPM_ON__SHIFT 0x2
+#define FEATURE_STATUS__UVD_DPM_ON_MASK 0x8
+#define FEATURE_STATUS__UVD_DPM_ON__SHIFT 0x3
+#define FEATURE_STATUS__VCE_DPM_ON_MASK 0x10
+#define FEATURE_STATUS__VCE_DPM_ON__SHIFT 0x4
+#define FEATURE_STATUS__ACP_DPM_ON_MASK 0x20
+#define FEATURE_STATUS__ACP_DPM_ON__SHIFT 0x5
+#define FEATURE_STATUS__SAMU_DPM_ON_MASK 0x40
+#define FEATURE_STATUS__SAMU_DPM_ON__SHIFT 0x6
+#define FEATURE_STATUS__PCIE_DPM_ON_MASK 0x80
+#define FEATURE_STATUS__PCIE_DPM_ON__SHIFT 0x7
+#define FEATURE_STATUS__BAPM_ON_MASK 0x100
+#define FEATURE_STATUS__BAPM_ON__SHIFT 0x8
+#define FEATURE_

@@ -1,35 +1,51 @@
-/*
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- *
- * Copyright (c) 2004-2008 Silicon Graphics, Inc.  All Rights Reserved.
- */
+TING_READ(VLV_IMR);
+}
 
-/*
- * The xp_nofault_PIOR function takes a pointer to a remote PIO register
- * and attempts to load and consume a value from it.  This function
- * will be registered as a nofault code block.  In the event that the
- * PIO read fails, the MCA handler will force the error to look
- * corrected and vector to the xp_error_PIOR which will return an error.
- *
- * The definition of "consumption" and the time it takes for an MCA
- * to surface is processor implementation specific.  This code
- * is sufficient on Itanium through the Montvale processor family.
- * It may need to be adjusted for future processor implementations.
- *
- *	extern int xp_nofault_PIOR(void *remote_register);
- */
+static void valleyview_display_irqs_uninstall(struct drm_i915_private *dev_priv)
+{
+	u32 pipestat_mask;
+	u32 iir_mask;
+	enum pipe pipe;
 
-	.global xp_nofault_PIOR
-xp_nofault_PIOR:
-	mov	r8=r0			// Stage a success return value
-	ld8.acq	r9=[r32];;		// PIO Read the specified register
-	adds	r9=1,r9;;		// Add to force consumption
-	srlz.i;;			// Allow time for MCA to surface
-	br.ret.sptk.many b0;;		// Return success
+	iir_mask = I915_DISPLAY_PORT_INTERRUPT |
+		   I915_DISPLAY_PIPE_A_EVENT_INTERRUPT |
+		   I915_DISPLAY_PIPE_B_EVENT_INTERRUPT;
+	if (IS_CHERRYVIEW(dev_priv))
+		iir_mask |= I915_DISPLAY_PIPE_C_EVENT_INTERRUPT;
 
-	.global xp_error_PIOR
-xp_error_PIOR:
-	mov	r8=1			// Return value of 1
-	br.ret.sptk.many b0;;		// Return failure
+	dev_priv->irq_mask |= iir_mask;
+	I915_WRITE(VLV_IMR, dev_priv->irq_mask);
+	I915_WRITE(VLV_IER, ~dev_priv->irq_mask);
+	I915_WRITE(VLV_IIR, iir_mask);
+	I915_WRITE(VLV_IIR, iir_mask);
+	POSTING_READ(VLV_IIR);
+
+	pipestat_mask = PLANE_FLIP_DONE_INT_STATUS_VLV |
+			PIPE_CRC_DONE_INTERRUPT_STATUS;
+
+	i915_disable_pipestat(dev_priv, PIPE_A, PIPE_GMBUS_INTERRUPT_STATUS);
+	for_each_pipe(dev_priv, pipe)
+		i915_disable_pipestat(dev_priv, pipe, pipestat_mask);
+
+	pipestat_mask = PIPESTAT_INT_STATUS_MASK |
+			PIPE_FIFO_UNDERRUN_STATUS;
+
+	for_each_pipe(dev_priv, pipe)
+		I915_WRITE(PIPESTAT(pipe), pipestat_mask);
+	POSTING_READ(PIPESTAT(PIPE_A));
+}
+
+void valleyview_enable_display_irqs(struct drm_i915_private *dev_priv)
+{
+	assert_spin_locked(&dev_priv->irq_lock);
+
+	if (dev_priv->display_irqs_enabled)
+		return;
+
+	dev_priv->display_irqs_enabled = true;
+
+	if (intel_irqs_enabled(dev_priv))
+		valleyview_display_irqs_install(dev_priv);
+}
+
+void valleyview_disable_display_

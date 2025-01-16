@@ -1,97 +1,101 @@
-/*
- * arch/sh/mm/tlb-sh3.c
- *
- * SH-3 specific TLB operations
- *
- * Copyright (C) 1999  Niibe Yutaka
- * Copyright (C) 2002  Paul Mundt
- *
- * Released under the terms of the GNU GPL v2.0.
+evel, tc_type, 0);
+	if (tc_info)
+		tc_info->pti_val = iprv.v0;
+	if (tc_pages)
+		*tc_pages = iprv.v1;
+	return iprv.status;
+}
+
+/* Get page size information about the virtual memory characteristics of the processor
+ * implementation.
  */
-#include <linux/signal.h>
-#include <linux/sched.h>
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/string.h>
-#include <linux/types.h>
-#include <linux/ptrace.h>
-#include <linux/mman.h>
-#include <linux/mm.h>
-#include <linux/smp.h>
-#include <linux/interrupt.h>
-
-#include <asm/io.h>
-#include <asm/uaccess.h>
-#include <asm/pgalloc.h>
-#include <asm/mmu_context.h>
-#include <asm/cacheflush.h>
-
-void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
+static inline s64 ia64_pal_vm_page_size(u64 *tr_pages, u64 *vw_pages)
 {
-	unsigned long flags, pteval, vpn;
-
-	/*
-	 * Handle debugger faulting in for debugee.
-	 */
-	if (vma && current->active_mm != vma->vm_mm)
-		return;
-
-	local_irq_save(flags);
-
-	/* Set PTEH register */
-	vpn = (address & MMU_VPN_MASK) | get_asid();
-	__raw_writel(vpn, MMU_PTEH);
-
-	pteval = pte_val(pte);
-
-	/* Set PTEL register */
-	pteval &= _PAGE_FLAGS_HARDWARE_MASK; /* drop software flags */
-	/* conveniently, we want all the software flags to be 0 anyway */
-	__raw_writel(pteval, MMU_PTEL);
-
-	/* Load the TLB */
-	asm volatile("ldtlb": /* no output */ : /* no input */ : "memory");
-	local_irq_restore(flags);
+	struct ia64_pal_retval iprv;
+	PAL_CALL(iprv, PAL_VM_PAGE_SIZE, 0, 0, 0);
+	if (tr_pages)
+		*tr_pages = iprv.v0;
+	if (vw_pages)
+		*vw_pages = iprv.v1;
+	return iprv.status;
 }
 
-void local_flush_tlb_one(unsigned long asid, unsigned long page)
+typedef union pal_vm_info_1_u {
+	u64			pvi1_val;
+	struct {
+		u64		vw		: 1,
+				phys_add_size	: 7,
+				key_size	: 8,
+				max_pkr		: 8,
+				hash_tag_id	: 8,
+				max_dtr_entry	: 8,
+				max_itr_entry	: 8,
+				max_unique_tcs	: 8,
+				num_tc_levels	: 8;
+	} pal_vm_info_1_s;
+} pal_vm_info_1_u_t;
+
+#define PAL_MAX_PURGES		0xFFFF		/* all ones is means unlimited */
+
+typedef union pal_vm_info_2_u {
+	u64			pvi2_val;
+	struct {
+		u64		impl_va_msb	: 8,
+				rid_size	: 8,
+				max_purges	: 16,
+				reserved	: 32;
+	} pal_vm_info_2_s;
+} pal_vm_info_2_u_t;
+
+/* Get summary information about the virtual memory characteristics of the processor
+ * implementation.
+ */
+static inline s64
+ia64_pal_vm_summary (pal_vm_info_1_u_t *vm_info_1, pal_vm_info_2_u_t *vm_info_2)
 {
-	unsigned long addr, data;
-	int i, ways = MMU_NTLB_WAYS;
-
-	/*
-	 * NOTE: PTEH.ASID should be set to this MM
-	 *       _AND_ we need to write ASID to the array.
-	 *
-	 * It would be simple if we didn't need to set PTEH.ASID...
-	 */
-	addr = MMU_TLB_ADDRESS_ARRAY | (page & 0x1F000);
-	data = (page & 0xfffe0000) | asid; /* VALID bit is off */
-
-	if ((current_cpu_data.flags & CPU_HAS_MMU_PAGE_ASSOC)) {
-		addr |= MMU_PAGE_ASSOC_BIT;
-		ways = 1;	/* we already know the way .. */
-	}
-
-	for (i = 0; i < ways; i++)
-		__raw_writel(data, addr + (i << 8));
+	struct ia64_pal_retval iprv;
+	PAL_CALL(iprv, PAL_VM_SUMMARY, 0, 0, 0);
+	if (vm_info_1)
+		vm_info_1->pvi1_val = iprv.v0;
+	if (vm_info_2)
+		vm_info_2->pvi2_val = iprv.v1;
+	return iprv.status;
 }
 
-void local_flush_tlb_all(void)
-{
-	unsigned long flags, status;
+typedef union pal_vp_info_u {
+	u64			pvi_val;
+	struct {
+		u64		index:		48,	/* virtual feature set info */
+				vmm_id:		16;	/* feature set id */
+	} pal_vp_info_s;
+} pal_vp_info_u_t;
 
-	/*
-	 * Flush all the TLB.
-	 *
-	 * Write to the MMU control register's bit:
-	 *	TF-bit for SH-3, TI-bit for SH-4.
-	 *      It's same position, bit #2.
-	 */
-	local_irq_save(flags);
-	status = __raw_readl(MMUCR);
-	status |= 0x04;
-	__raw_writel(status, MMUCR);
-	ctrl_barrier();
-	local_irq_restore(flags);
+/*
+ * Returns information about virtual processor features
+ */
+static inline s64
+ia64_pal_vp_info (u64 feature_set, u64 vp_buffer, u64 *vp_info, u64 *vmm_id)
+{
+	struct ia64_pal_retval iprv;
+	PAL_CALL(iprv, PAL_VP_INFO, feature_set, vp_buffer, 0);
+	if (vp_info)
+		*vp_info = iprv.v0;
+	if (vmm_id)
+		*vmm_id = iprv.v1;
+	return iprv.status;
 }
+
+typedef union pal_itr_valid_u {
+	u64			piv_val;
+	struct {
+	       u64		access_rights_valid	: 1,
+				priv_level_valid	: 1,
+				dirty_bit_valid		: 1,
+				mem_attr_valid		: 1,
+				reserved		: 60;
+	} pal_tr_valid_s;
+} pal_tr_valid_u_t;
+
+/* Read a translation register */
+static inline s64
+ia64_pal_tr_read (u64 reg_num, u64 

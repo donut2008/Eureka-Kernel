@@ -1,306 +1,261 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2013, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/sched.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/device.h>
-#include <linux/slab.h>
-#include <linux/uuid.h>
-
-#include <linux/mei_cl_bus.h>
-
-#include "mei_dev.h"
-#include "client.h"
-
-#define MEI_UUID_NFC_INFO UUID_LE(0xd2de1625, 0x382d, 0x417d, \
-			0x48, 0xa4, 0xef, 0xab, 0xba, 0x8a, 0x12, 0x06)
-
-static const uuid_le mei_nfc_info_guid = MEI_UUID_NFC_INFO;
-
-#define MEI_UUID_NFC_HCI UUID_LE(0x0bb17a78, 0x2a8e, 0x4c50, \
-			0x94, 0xd4, 0x50, 0x26, 0x67, 0x23, 0x77, 0x5c)
-
-#define MEI_UUID_ANY NULL_UUID_LE
-
-/**
- * number_of_connections - determine whether an client be on the bus
- *    according number of connections
- *    We support only clients:
- *       1. with single connection
- *       2. and fixed clients (max_number_of_connections == 0)
- *
- * @cldev: me clients device
- */
-static void number_of_connections(struct mei_cl_device *cldev)
-{
-	dev_dbg(&cldev->dev, "running hook %s on %pUl\n",
-			__func__, mei_me_cl_uuid(cldev->me_cl));
-
-	if (cldev->me_cl->props.max_number_of_connections > 1)
-		cldev->do_match = 0;
+verter,
+				 &cmd->body.image.sid, NULL);
 }
 
 /**
- * blacklist - blacklist a client from the bus
+ * vmw_cmd_readback_gb_surface - Validate an SVGA_3D_CMD_READBACK_GB_SURFACE
+ * command
  *
- * @cldev: me clients device
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
  */
-static void blacklist(struct mei_cl_device *cldev)
+static int vmw_cmd_readback_gb_surface(struct vmw_private *dev_priv,
+				       struct vmw_sw_context *sw_context,
+				       SVGA3dCmdHeader *header)
 {
-	dev_dbg(&cldev->dev, "running hook %s on %pUl\n",
-			__func__, mei_me_cl_uuid(cldev->me_cl));
-	cldev->do_match = 0;
+	struct vmw_gb_surface_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdReadbackGBSurface body;
+	} *cmd;
+
+	cmd = container_of(header, struct vmw_gb_surface_cmd, header);
+
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->body.sid, NULL);
 }
 
-struct mei_nfc_cmd {
-	u8 command;
-	u8 status;
-	u16 req_id;
-	u32 reserved;
-	u16 data_size;
-	u8 sub_command;
-	u8 data[];
-} __packed;
+/**
+ * vmw_cmd_invalidate_gb_image - Validate an SVGA_3D_CMD_INVALIDATE_GB_IMAGE
+ * command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_invalidate_gb_image(struct vmw_private *dev_priv,
+				       struct vmw_sw_context *sw_context,
+				       SVGA3dCmdHeader *header)
+{
+	struct vmw_gb_surface_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdInvalidateGBImage body;
+	} *cmd;
 
-struct mei_nfc_reply {
-	u8 command;
-	u8 status;
-	u16 req_id;
-	u32 reserved;
-	u16 data_size;
-	u8 sub_command;
-	u8 reply_status;
-	u8 data[];
-} __packed;
+	cmd = container_of(header, struct vmw_gb_surface_cmd, header);
 
-struct mei_nfc_if_version {
-	u8 radio_version_sw[3];
-	u8 reserved[3];
-	u8 radio_version_hw[3];
-	u8 i2c_addr;
-	u8 fw_ivn;
-	u8 vendor_id;
-	u8 radio_type;
-} __packed;
-
-
-#define MEI_NFC_CMD_MAINTENANCE 0x00
-#define MEI_NFC_SUBCMD_IF_VERSION 0x01
-
-/* Vendors */
-#define MEI_NFC_VENDOR_INSIDE 0x00
-#define MEI_NFC_VENDOR_NXP    0x01
-
-/* Radio types */
-#define MEI_NFC_VENDOR_INSIDE_UREAD 0x00
-#define MEI_NFC_VENDOR_NXP_PN544    0x01
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->body.image.sid, NULL);
+}
 
 /**
- * mei_nfc_if_version - get NFC interface version
+ * vmw_cmd_invalidate_gb_surface - Validate an
+ * SVGA_3D_CMD_INVALIDATE_GB_SURFACE command
  *
- * @cl: host client (nfc info)
- * @ver: NFC interface version to be filled in
- *
- * Return: 0 on success; < 0 otherwise
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
  */
-static int mei_nfc_if_version(struct mei_cl *cl,
-			      struct mei_nfc_if_version *ver)
+static int vmw_cmd_invalidate_gb_surface(struct vmw_private *dev_priv,
+					 struct vmw_sw_context *sw_context,
+					 SVGA3dCmdHeader *header)
 {
-	struct mei_device *bus;
-	struct mei_nfc_cmd cmd = {
-		.command = MEI_NFC_CMD_MAINTENANCE,
-		.data_size = 1,
-		.sub_command = MEI_NFC_SUBCMD_IF_VERSION,
-	};
-	struct mei_nfc_reply *reply = NULL;
-	size_t if_version_length;
-	int bytes_recv, ret;
+	struct vmw_gb_surface_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdInvalidateGBSurface body;
+	} *cmd;
 
-	bus = cl->dev;
+	cmd = container_of(header, struct vmw_gb_surface_cmd, header);
 
-	WARN_ON(mutex_is_locked(&bus->device_lock));
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->body.sid, NULL);
+}
 
-	ret = __mei_cl_send(cl, (u8 *)&cmd, sizeof(struct mei_nfc_cmd), 1);
-	if (ret < 0) {
-		dev_err(bus->dev, "Could not send IF version cmd\n");
+
+/**
+ * vmw_cmd_shader_define - Validate an SVGA_3D_CMD_SHADER_DEFINE
+ * command
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int vmw_cmd_shader_define(struct vmw_private *dev_priv,
+				 struct vmw_sw_context *sw_context,
+				 SVGA3dCmdHeader *header)
+{
+	struct vmw_shader_define_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDefineShader body;
+	} *cmd;
+	int ret;
+	size_t size;
+	struct vmw_resource_val_node *val;
+
+	cmd = container_of(header, struct vmw_shader_define_cmd,
+			   header);
+
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+				user_context_converter, &cmd->body.cid,
+				&val);
+	if (unlikely(ret != 0))
 		return ret;
-	}
 
-	/* to be sure on the stack we alloc memory */
-	if_version_length = sizeof(struct mei_nfc_reply) +
-		sizeof(struct mei_nfc_if_version);
+	if (unlikely(!dev_priv->has_mob))
+		return 0;
 
-	reply = kzalloc(if_version_length, GFP_KERNEL);
-	if (!reply)
-		return -ENOMEM;
+	size = cmd->header.size - sizeof(cmd->body);
+	ret = vmw_compat_shader_add(dev_priv,
+				    vmw_context_res_man(val->res),
+				    cmd->body.shid, cmd + 1,
+				    cmd->body.type, size,
+				    &sw_context->staged_cmd_res);
+	if (unlikely(ret != 0))
+		return ret;
 
-	ret = 0;
-	bytes_recv = __mei_cl_recv(cl, (u8 *)reply, if_version_length);
-	if (bytes_recv < 0 || bytes_recv < if_version_length) {
-		dev_err(bus->dev, "Could not read IF version\n");
-		ret = -EIO;
-		goto err;
-	}
+	return vmw_resource_relocation_add(&sw_context->res_relocations,
+					   NULL, &cmd->header.id -
+					   sw_context->buf_start);
 
-	memcpy(ver, reply->data, sizeof(struct mei_nfc_if_version));
-
-	dev_info(bus->dev, "NFC MEI VERSION: IVN 0x%x Vendor ID 0x%x Type 0x%x\n",
-		ver->fw_ivn, ver->vendor_id, ver->radio_type);
-
-err:
-	kfree(reply);
-	return ret;
+	return 0;
 }
 
 /**
- * mei_nfc_radio_name - derive nfc radio name from the interface version
+ * vmw_cmd_shader_destroy - Validate an SVGA_3D_CMD_SHADER_DESTROY
+ * command
  *
- * @ver: NFC radio version
- *
- * Return: radio name string
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
  */
-static const char *mei_nfc_radio_name(struct mei_nfc_if_version *ver)
+static int vmw_cmd_shader_destroy(struct vmw_private *dev_priv,
+				  struct vmw_sw_context *sw_context,
+				  SVGA3dCmdHeader *header)
 {
+	struct vmw_shader_destroy_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDestroyShader body;
+	} *cmd;
+	int ret;
+	struct vmw_resource_val_node *val;
 
-	if (ver->vendor_id == MEI_NFC_VENDOR_INSIDE) {
-		if (ver->radio_type == MEI_NFC_VENDOR_INSIDE_UREAD)
-			return "microread";
-	}
+	cmd = container_of(header, struct vmw_shader_destroy_cmd,
+			   header);
 
-	if (ver->vendor_id == MEI_NFC_VENDOR_NXP) {
-		if (ver->radio_type == MEI_NFC_VENDOR_NXP_PN544)
-			return "pn544";
-	}
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+				user_context_converter, &cmd->body.cid,
+				&val);
+	if (unlikely(ret != 0))
+		return ret;
 
-	return NULL;
+	if (unlikely(!dev_priv->has_mob))
+		return 0;
+
+	ret = vmw_shader_remove(vmw_context_res_man(val->res),
+				cmd->body.shid,
+				cmd->body.type,
+				&sw_context->staged_cmd_res);
+	if (unlikely(ret != 0))
+		return ret;
+
+	return vmw_resource_relocation_add(&sw_context->res_relocations,
+					   NULL, &cmd->header.id -
+					   sw_context->buf_start);
+
+	return 0;
 }
 
 /**
- * mei_nfc - The nfc fixup function. The function retrieves nfc radio
- *    name and set is as device attribute so we can load
- *    the proper device driver for it
+ * vmw_cmd_set_shader - Validate an SVGA_3D_CMD_SET_SHADER
+ * command
  *
- * @cldev: me client device (nfc)
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
  */
-static void mei_nfc(struct mei_cl_device *cldev)
+static int vmw_cmd_set_shader(struct vmw_private *dev_priv,
+			      struct vmw_sw_context *sw_context,
+			      SVGA3dCmdHeader *header)
 {
-	struct mei_device *bus;
-	struct mei_cl *cl;
-	struct mei_me_client *me_cl = NULL;
-	struct mei_nfc_if_version ver;
-	const char *radio_name = NULL;
+	struct vmw_set_shader_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdSetShader body;
+	} *cmd;
+	struct vmw_resource_val_node *ctx_node, *res_node = NULL;
+	struct vmw_ctx_bindinfo_shader binding;
+	struct vmw_resource *res = NULL;
 	int ret;
 
-	bus = cldev->bus;
+	cmd = container_of(header, struct vmw_set_shader_cmd,
+			   header);
 
-	dev_dbg(bus->dev, "running hook %s: %pUl match=%d\n",
-		__func__, mei_me_cl_uuid(cldev->me_cl), cldev->do_match);
-
-	mutex_lock(&bus->device_lock);
-	/* we need to connect to INFO GUID */
-	cl = mei_cl_alloc_linked(bus, MEI_HOST_CLIENT_ID_ANY);
-	if (IS_ERR(cl)) {
-		ret = PTR_ERR(cl);
-		cl = NULL;
-		dev_err(bus->dev, "nfc hook alloc failed %d\n", ret);
-		goto out;
+	if (cmd->body.type >= SVGA3D_SHADERTYPE_PREDX_MAX) {
+		DRM_ERROR("Illegal shader type %u.\n",
+			  (unsigned) cmd->body.type);
+		return -EINVAL;
 	}
 
-	me_cl = mei_me_cl_by_uuid(bus, &mei_nfc_info_guid);
-	if (!me_cl) {
-		ret = -ENOTTY;
-		dev_err(bus->dev, "Cannot find nfc info %d\n", ret);
-		goto out;
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+				user_context_converter, &cmd->body.cid,
+				&ctx_node);
+	if (unlikely(ret != 0))
+		return ret;
+
+	if (!dev_priv->has_mob)
+		return 0;
+
+	if (cmd->body.shid != SVGA3D_INVALID_ID) {
+		res = vmw_shader_lookup(vmw_context_res_man(ctx_node->res),
+					cmd->body.shid,
+					cmd->body.type);
+
+		if (!IS_ERR(res)) {
+			ret = vmw_cmd_res_reloc_add(dev_priv, sw_context,
+						    &cmd->body.shid, res,
+						    &res_node);
+			vmw_resource_unreference(&res);
+			if (unlikely(ret != 0))
+				return ret;
+		}
 	}
 
-	ret = mei_cl_connect(cl, me_cl, NULL);
-	if (ret < 0) {
-		dev_err(&cldev->dev, "Can't connect to the NFC INFO ME ret = %d\n",
-			ret);
-		goto out;
+	if (!res_node) {
+		ret = vmw_cmd_res_check(dev_priv, sw_context,
+					vmw_res_shader,
+					user_shader_converter,
+					&cmd->body.shid, &res_node);
+		if (unlikely(ret != 0))
+			return ret;
 	}
 
-	mutex_unlock(&bus->device_lock);
-
-	ret = mei_nfc_if_version(cl, &ver);
-	if (ret)
-		goto disconnect;
-
-	radio_name = mei_nfc_radio_name(&ver);
-
-	if (!radio_name) {
-		ret = -ENOENT;
-		dev_err(&cldev->dev, "Can't get the NFC interface version ret = %d\n",
-			ret);
-		goto disconnect;
-	}
-
-	dev_dbg(bus->dev, "nfc radio %s\n", radio_name);
-	strlcpy(cldev->name, radio_name, sizeof(cldev->name));
-
-disconnect:
-	mutex_lock(&bus->device_lock);
-	if (mei_cl_disconnect(cl) < 0)
-		dev_err(bus->dev, "Can't disconnect the NFC INFO ME\n");
-
-	mei_cl_flush_queues(cl, NULL);
-
-out:
-	mei_cl_unlink(cl);
-	mutex_unlock(&bus->device_lock);
-	mei_me_cl_put(me_cl);
-	kfree(cl);
-
-	if (ret)
-		cldev->do_match = 0;
-
-	dev_dbg(bus->dev, "end of fixup match = %d\n", cldev->do_match);
+	binding.bi.ctx = ctx_node->res;
+	binding.bi.res = res_node ? res_node->res : NULL;
+	binding.bi.bt = vmw_ctx_binding_shader;
+	binding.shader_slot = cmd->body.type - SVGA3D_SHADERTYPE_MIN;
+	vmw_binding_add(ctx_node->staged_bindings, &binding.bi,
+			binding.shader_slot, 0);
+	return 0;
 }
-
-#define MEI_FIXUP(_uuid, _hook) { _uuid, _hook }
-
-static struct mei_fixup {
-
-	const uuid_le uuid;
-	void (*hook)(struct mei_cl_device *cldev);
-} mei_fixups[] = {
-	MEI_FIXUP(MEI_UUID_ANY, number_of_connections),
-	MEI_FIXUP(MEI_UUID_NFC_INFO, blacklist),
-	MEI_FIXUP(MEI_UUID_NFC_HCI, mei_nfc),
-};
 
 /**
- * mei_cldev_fixup - run fixup handlers
+ * vmw_cmd_set_shader_const - Validate an SVGA_3D_CMD_SET_SHADER_CONST
+ * command
  *
- * @cldev: me client device
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
  */
-void mei_cl_bus_dev_fixup(struct mei_cl_device *cldev)
+static int vmw_cmd_set_shader_const(struct vmw_private *dev_priv,
+				    struct vmw_sw_context *sw_context,
+				    SVGA3dCmdHeader *header)
 {
-	struct mei_fixup *f;
-	const uuid_le *uuid = mei_me_cl_uuid(cldev->me_cl);
-	int i;
+	struct vmw_set_shader_const_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdSetShaderConst body;
+	} *cmd;
+	int ret;
 
-	for (i = 0; i < ARRAY_SIZE(mei_fixups); i++) {
-
-		f = &mei_fixups[i];
-		if (uuid_le_cmp(f->uuid, MEI_UUID_ANY) == 0 ||
-		    uuid_le_cmp(f->uuid, *uuid) == 0)
-			f->hook(cldev);
-	}
-}
-
+	cmd = container_of(header, struct vmw_set_shader_con

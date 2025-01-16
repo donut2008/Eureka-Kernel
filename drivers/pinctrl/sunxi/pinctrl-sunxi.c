@@ -1,1049 +1,559 @@
-/*
- * Allwinner A1X SoCs pinctrl driver.
- *
- * Copyright (C) 2012 Maxime Ripard
- *
- * Maxime Ripard <maxime.ripard@free-electrons.com>
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2.  This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
- */
-
-#include <linux/io.h>
-#include <linux/clk.h>
-#include <linux/gpio.h>
-#include <linux/irqdomain.h>
-#include <linux/irqchip/chained_irq.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
-#include <linux/of_irq.h>
-#include <linux/pinctrl/consumer.h>
-#include <linux/pinctrl/machine.h>
-#include <linux/pinctrl/pinctrl.h>
-#include <linux/pinctrl/pinconf-generic.h>
-#include <linux/pinctrl/pinmux.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-
-#include "../core.h"
-#include "../../gpio/gpiolib.h"
-#include "pinctrl-sunxi.h"
-
-static struct irq_chip sunxi_pinctrl_edge_irq_chip;
-static struct irq_chip sunxi_pinctrl_level_irq_chip;
-
-static struct sunxi_pinctrl_group *
-sunxi_pinctrl_find_group_by_name(struct sunxi_pinctrl *pctl, const char *group)
-{
-	int i;
-
-	for (i = 0; i < pctl->ngroups; i++) {
-		struct sunxi_pinctrl_group *grp = pctl->groups + i;
-
-		if (!strcmp(grp->name, group))
-			return grp;
-	}
-
-	return NULL;
-}
-
-static struct sunxi_pinctrl_function *
-sunxi_pinctrl_find_function_by_name(struct sunxi_pinctrl *pctl,
-				    const char *name)
-{
-	struct sunxi_pinctrl_function *func = pctl->functions;
-	int i;
-
-	for (i = 0; i < pctl->nfunctions; i++) {
-		if (!func[i].name)
-			break;
-
-		if (!strcmp(func[i].name, name))
-			return func + i;
-	}
-
-	return NULL;
-}
-
-static struct sunxi_desc_function *
-sunxi_pinctrl_desc_find_function_by_name(struct sunxi_pinctrl *pctl,
-					 const char *pin_name,
-					 const char *func_name)
-{
-	int i;
-
-	for (i = 0; i < pctl->desc->npins; i++) {
-		const struct sunxi_desc_pin *pin = pctl->desc->pins + i;
-
-		if (!strcmp(pin->pin.name, pin_name)) {
-			struct sunxi_desc_function *func = pin->functions;
-
-			while (func->name) {
-				if (!strcmp(func->name, func_name))
-					return func;
-
-				func++;
-			}
-		}
-	}
-
-	return NULL;
-}
-
-static struct sunxi_desc_function *
-sunxi_pinctrl_desc_find_function_by_pin(struct sunxi_pinctrl *pctl,
-					const u16 pin_num,
-					const char *func_name)
-{
-	int i;
-
-	for (i = 0; i < pctl->desc->npins; i++) {
-		const struct sunxi_desc_pin *pin = pctl->desc->pins + i;
-
-		if (pin->pin.number == pin_num) {
-			struct sunxi_desc_function *func = pin->functions;
-
-			while (func->name) {
-				if (!strcmp(func->name, func_name))
-					return func;
-
-				func++;
-			}
-		}
-	}
-
-	return NULL;
-}
-
-static int sunxi_pctrl_get_groups_count(struct pinctrl_dev *pctldev)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-
-	return pctl->ngroups;
-}
-
-static const char *sunxi_pctrl_get_group_name(struct pinctrl_dev *pctldev,
-					      unsigned group)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-
-	return pctl->groups[group].name;
-}
-
-static int sunxi_pctrl_get_group_pins(struct pinctrl_dev *pctldev,
-				      unsigned group,
-				      const unsigned **pins,
-				      unsigned *num_pins)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-
-	*pins = (unsigned *)&pctl->groups[group].pin;
-	*num_pins = 1;
-
-	return 0;
-}
-
-static int sunxi_pctrl_dt_node_to_map(struct pinctrl_dev *pctldev,
-				      struct device_node *node,
-				      struct pinctrl_map **map,
-				      unsigned *num_maps)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-	unsigned long *pinconfig;
-	struct property *prop;
-	const char *function;
-	const char *group;
-	int ret, nmaps, i = 0;
-	u32 val;
-
-	*map = NULL;
-	*num_maps = 0;
-
-	ret = of_property_read_string(node, "allwinner,function", &function);
-	if (ret) {
-		dev_err(pctl->dev,
-			"missing allwinner,function property in node %s\n",
-			node->name);
-		return -EINVAL;
-	}
-
-	nmaps = of_property_count_strings(node, "allwinner,pins") * 2;
-	if (nmaps < 0) {
-		dev_err(pctl->dev,
-			"missing allwinner,pins property in node %s\n",
-			node->name);
-		return -EINVAL;
-	}
-
-	*map = kmalloc(nmaps * sizeof(struct pinctrl_map), GFP_KERNEL);
-	if (!*map)
-		return -ENOMEM;
-
-	of_property_for_each_string(node, "allwinner,pins", prop, group) {
-		struct sunxi_pinctrl_group *grp =
-			sunxi_pinctrl_find_group_by_name(pctl, group);
-		int j = 0, configlen = 0;
-
-		if (!grp) {
-			dev_err(pctl->dev, "unknown pin %s", group);
-			continue;
-		}
-
-		if (!sunxi_pinctrl_desc_find_function_by_name(pctl,
-							      grp->name,
-							      function)) {
-			dev_err(pctl->dev, "unsupported function %s on pin %s",
-				function, group);
-			continue;
-		}
-
-		(*map)[i].type = PIN_MAP_TYPE_MUX_GROUP;
-		(*map)[i].data.mux.group = group;
-		(*map)[i].data.mux.function = function;
-
-		i++;
-
-		(*map)[i].type = PIN_MAP_TYPE_CONFIGS_GROUP;
-		(*map)[i].data.configs.group_or_pin = group;
-
-		if (of_find_property(node, "allwinner,drive", NULL))
-			configlen++;
-		if (of_find_property(node, "allwinner,pull", NULL))
-			configlen++;
-
-		pinconfig = kzalloc(configlen * sizeof(*pinconfig), GFP_KERNEL);
-		if (!pinconfig) {
-			kfree(*map);
-			return -ENOMEM;
-		}
-
-		if (!of_property_read_u32(node, "allwinner,drive", &val)) {
-			u16 strength = (val + 1) * 10;
-			pinconfig[j++] =
-				pinconf_to_config_packed(PIN_CONFIG_DRIVE_STRENGTH,
-							 strength);
-		}
-
-		if (!of_property_read_u32(node, "allwinner,pull", &val)) {
-			enum pin_config_param pull = PIN_CONFIG_END;
-			if (val == 1)
-				pull = PIN_CONFIG_BIAS_PULL_UP;
-			else if (val == 2)
-				pull = PIN_CONFIG_BIAS_PULL_DOWN;
-			pinconfig[j++] = pinconf_to_config_packed(pull, 0);
-		}
-
-		(*map)[i].data.configs.configs = pinconfig;
-		(*map)[i].data.configs.num_configs = configlen;
-
-		i++;
-	}
-
-	*num_maps = nmaps;
-
-	return 0;
-}
-
-static void sunxi_pctrl_dt_free_map(struct pinctrl_dev *pctldev,
-				    struct pinctrl_map *map,
-				    unsigned num_maps)
-{
-	int i;
-
-	for (i = 0; i < num_maps; i++) {
-		if (map[i].type == PIN_MAP_TYPE_CONFIGS_GROUP)
-			kfree(map[i].data.configs.configs);
-	}
-
-	kfree(map);
-}
-
-static const struct pinctrl_ops sunxi_pctrl_ops = {
-	.dt_node_to_map		= sunxi_pctrl_dt_node_to_map,
-	.dt_free_map		= sunxi_pctrl_dt_free_map,
-	.get_groups_count	= sunxi_pctrl_get_groups_count,
-	.get_group_name		= sunxi_pctrl_get_group_name,
-	.get_group_pins		= sunxi_pctrl_get_group_pins,
-};
-
-static int sunxi_pconf_group_get(struct pinctrl_dev *pctldev,
-				 unsigned group,
-				 unsigned long *config)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-
-	*config = pctl->groups[group].config;
-
-	return 0;
-}
-
-static int sunxi_pconf_group_set(struct pinctrl_dev *pctldev,
-				 unsigned group,
-				 unsigned long *configs,
-				 unsigned num_configs)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-	struct sunxi_pinctrl_group *g = &pctl->groups[group];
-	unsigned long flags;
-	unsigned pin = g->pin - pctl->desc->pin_base;
-	u32 val, mask;
-	u16 strength;
-	u8 dlevel;
-	int i;
-
-	spin_lock_irqsave(&pctl->lock, flags);
-
-	for (i = 0; i < num_configs; i++) {
-		switch (pinconf_to_config_param(configs[i])) {
-		case PIN_CONFIG_DRIVE_STRENGTH:
-			strength = pinconf_to_config_argument(configs[i]);
-			if (strength > 40) {
-				spin_unlock_irqrestore(&pctl->lock, flags);
-				return -EINVAL;
-			}
-			/*
-			 * We convert from mA to what the register expects:
-			 *   0: 10mA
-			 *   1: 20mA
-			 *   2: 30mA
-			 *   3: 40mA
-			 */
-			dlevel = strength / 10 - 1;
-			val = readl(pctl->membase + sunxi_dlevel_reg(pin));
-			mask = DLEVEL_PINS_MASK << sunxi_dlevel_offset(pin);
-			writel((val & ~mask)
-				| dlevel << sunxi_dlevel_offset(pin),
-				pctl->membase + sunxi_dlevel_reg(pin));
-			break;
-		case PIN_CONFIG_BIAS_PULL_UP:
-			val = readl(pctl->membase + sunxi_pull_reg(pin));
-			mask = PULL_PINS_MASK << sunxi_pull_offset(pin);
-			writel((val & ~mask) | 1 << sunxi_pull_offset(pin),
-				pctl->membase + sunxi_pull_reg(pin));
-			break;
-		case PIN_CONFIG_BIAS_PULL_DOWN:
-			val = readl(pctl->membase + sunxi_pull_reg(pin));
-			mask = PULL_PINS_MASK << sunxi_pull_offset(pin);
-			writel((val & ~mask) | 2 << sunxi_pull_offset(pin),
-				pctl->membase + sunxi_pull_reg(pin));
-			break;
-		default:
-			break;
-		}
-		/* cache the config value */
-		g->config = configs[i];
-	} /* for each config */
-
-	spin_unlock_irqrestore(&pctl->lock, flags);
-
-	return 0;
-}
-
-static const struct pinconf_ops sunxi_pconf_ops = {
-	.pin_config_group_get	= sunxi_pconf_group_get,
-	.pin_config_group_set	= sunxi_pconf_group_set,
-};
-
-static int sunxi_pmx_get_funcs_cnt(struct pinctrl_dev *pctldev)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-
-	return pctl->nfunctions;
-}
-
-static const char *sunxi_pmx_get_func_name(struct pinctrl_dev *pctldev,
-					   unsigned function)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-
-	return pctl->functions[function].name;
-}
-
-static int sunxi_pmx_get_func_groups(struct pinctrl_dev *pctldev,
-				     unsigned function,
-				     const char * const **groups,
-				     unsigned * const num_groups)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-
-	*groups = pctl->functions[function].groups;
-	*num_groups = pctl->functions[function].ngroups;
-
-	return 0;
-}
-
-static void sunxi_pmx_set(struct pinctrl_dev *pctldev,
-				 unsigned pin,
-				 u8 config)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-	unsigned long flags;
-	u32 val, mask;
-
-	spin_lock_irqsave(&pctl->lock, flags);
-
-	pin -= pctl->desc->pin_base;
-	val = readl(pctl->membase + sunxi_mux_reg(pin));
-	mask = MUX_PINS_MASK << sunxi_mux_offset(pin);
-	writel((val & ~mask) | config << sunxi_mux_offset(pin),
-		pctl->membase + sunxi_mux_reg(pin));
-
-	spin_unlock_irqrestore(&pctl->lock, flags);
-}
-
-static int sunxi_pmx_set_mux(struct pinctrl_dev *pctldev,
-			     unsigned function,
-			     unsigned group)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-	struct sunxi_pinctrl_group *g = pctl->groups + group;
-	struct sunxi_pinctrl_function *func = pctl->functions + function;
-	struct sunxi_desc_function *desc =
-		sunxi_pinctrl_desc_find_function_by_name(pctl,
-							 g->name,
-							 func->name);
-
-	if (!desc)
-		return -EINVAL;
-
-	sunxi_pmx_set(pctldev, g->pin, desc->muxval);
-
-	return 0;
-}
-
-static int
-sunxi_pmx_gpio_set_direction(struct pinctrl_dev *pctldev,
-			struct pinctrl_gpio_range *range,
-			unsigned offset,
-			bool input)
-{
-	struct sunxi_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
-	struct sunxi_desc_function *desc;
-	const char *func;
-
-	if (input)
-		func = "gpio_in";
-	else
-		func = "gpio_out";
-
-	desc = sunxi_pinctrl_desc_find_function_by_pin(pctl, offset, func);
-	if (!desc)
-		return -EINVAL;
-
-	sunxi_pmx_set(pctldev, offset, desc->muxval);
-
-	return 0;
-}
-
-static const struct pinmux_ops sunxi_pmx_ops = {
-	.get_functions_count	= sunxi_pmx_get_funcs_cnt,
-	.get_function_name	= sunxi_pmx_get_func_name,
-	.get_function_groups	= sunxi_pmx_get_func_groups,
-	.set_mux		= sunxi_pmx_set_mux,
-	.gpio_set_direction	= sunxi_pmx_gpio_set_direction,
-};
-
-static int sunxi_pinctrl_gpio_direction_input(struct gpio_chip *chip,
-					unsigned offset)
-{
-	return pinctrl_gpio_direction_input(chip->base + offset);
-}
-
-static int sunxi_pinctrl_gpio_get(struct gpio_chip *chip, unsigned offset)
-{
-	struct sunxi_pinctrl *pctl = dev_get_drvdata(chip->dev);
-	u32 reg = sunxi_data_reg(offset);
-	u8 index = sunxi_data_offset(offset);
-	u32 set_mux = pctl->desc->irq_read_needs_mux &&
-			test_bit(FLAG_USED_AS_IRQ, &chip->desc[offset].flags);
-	u32 val;
-
-	if (set_mux)
-		sunxi_pmx_set(pctl->pctl_dev, offset, SUN4I_FUNC_INPUT);
-
-	val = (readl(pctl->membase + reg) >> index) & DATA_PINS_MASK;
-
-	if (set_mux)
-		sunxi_pmx_set(pctl->pctl_dev, offset, SUN4I_FUNC_IRQ);
-
-	return val;
-}
-
-static void sunxi_pinctrl_gpio_set(struct gpio_chip *chip,
-				unsigned offset, int value)
-{
-	struct sunxi_pinctrl *pctl = dev_get_drvdata(chip->dev);
-	u32 reg = sunxi_data_reg(offset);
-	u8 index = sunxi_data_offset(offset);
-	unsigned long flags;
-	u32 regval;
-
-	spin_lock_irqsave(&pctl->lock, flags);
-
-	regval = readl(pctl->membase + reg);
-
-	if (value)
-		regval |= BIT(index);
-	else
-		regval &= ~(BIT(index));
-
-	writel(regval, pctl->membase + reg);
-
-	spin_unlock_irqrestore(&pctl->lock, flags);
-}
-
-static int sunxi_pinctrl_gpio_direction_output(struct gpio_chip *chip,
-					unsigned offset, int value)
-{
-	sunxi_pinctrl_gpio_set(chip, offset, value);
-	return pinctrl_gpio_direction_output(chip->base + offset);
-}
-
-static int sunxi_pinctrl_gpio_of_xlate(struct gpio_chip *gc,
-				const struct of_phandle_args *gpiospec,
-				u32 *flags)
-{
-	int pin, base;
-
-	base = PINS_PER_BANK * gpiospec->args[0];
-	pin = base + gpiospec->args[1];
-
-	if (pin > gc->ngpio)
-		return -EINVAL;
-
-	if (flags)
-		*flags = gpiospec->args[2];
-
-	return pin;
-}
-
-static int sunxi_pinctrl_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
-{
-	struct sunxi_pinctrl *pctl = dev_get_drvdata(chip->dev);
-	struct sunxi_desc_function *desc;
-	unsigned pinnum = pctl->desc->pin_base + offset;
-	unsigned irqnum;
-
-	if (offset >= chip->ngpio)
-		return -ENXIO;
-
-	desc = sunxi_pinctrl_desc_find_function_by_pin(pctl, pinnum, "irq");
-	if (!desc)
-		return -EINVAL;
-
-	irqnum = desc->irqbank * IRQ_PER_BANK + desc->irqnum;
-
-	dev_dbg(chip->dev, "%s: request IRQ for GPIO %d, return %d\n",
-		chip->label, offset + chip->base, irqnum);
-
-	return irq_find_mapping(pctl->domain, irqnum);
-}
-
-static int sunxi_pinctrl_irq_request_resources(struct irq_data *d)
-{
-	struct sunxi_pinctrl *pctl = irq_data_get_irq_chip_data(d);
-	struct sunxi_desc_function *func;
-	int ret;
-
-	func = sunxi_pinctrl_desc_find_function_by_pin(pctl,
-					pctl->irq_array[d->hwirq], "irq");
-	if (!func)
-		return -EINVAL;
-
-	ret = gpiochip_lock_as_irq(pctl->chip,
-			pctl->irq_array[d->hwirq] - pctl->desc->pin_base);
-	if (ret) {
-		dev_err(pctl->dev, "unable to lock HW IRQ %lu for IRQ\n",
-			irqd_to_hwirq(d));
-		return ret;
-	}
-
-	/* Change muxing to INT mode */
-	sunxi_pmx_set(pctl->pctl_dev, pctl->irq_array[d->hwirq], func->muxval);
-
-	return 0;
-}
-
-static void sunxi_pinctrl_irq_release_resources(struct irq_data *d)
-{
-	struct sunxi_pinctrl *pctl = irq_data_get_irq_chip_data(d);
-
-	gpiochip_unlock_as_irq(pctl->chip,
-			      pctl->irq_array[d->hwirq] - pctl->desc->pin_base);
-}
-
-static int sunxi_pinctrl_irq_set_type(struct irq_data *d, unsigned int type)
-{
-	struct sunxi_pinctrl *pctl = irq_data_get_irq_chip_data(d);
-	u32 reg = sunxi_irq_cfg_reg(d->hwirq, pctl->desc->irq_bank_base);
-	u8 index = sunxi_irq_cfg_offset(d->hwirq);
-	unsigned long flags;
-	u32 regval;
-	u8 mode;
-
-	switch (type) {
-	case IRQ_TYPE_EDGE_RISING:
-		mode = IRQ_EDGE_RISING;
-		break;
-	case IRQ_TYPE_EDGE_FALLING:
-		mode = IRQ_EDGE_FALLING;
-		break;
-	case IRQ_TYPE_EDGE_BOTH:
-		mode = IRQ_EDGE_BOTH;
-		break;
-	case IRQ_TYPE_LEVEL_HIGH:
-		mode = IRQ_LEVEL_HIGH;
-		break;
-	case IRQ_TYPE_LEVEL_LOW:
-		mode = IRQ_LEVEL_LOW;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	spin_lock_irqsave(&pctl->lock, flags);
-
-	if (type & IRQ_TYPE_LEVEL_MASK)
-		irq_set_chip_handler_name_locked(d, &sunxi_pinctrl_level_irq_chip,
-						 handle_fasteoi_irq, NULL);
-	else
-		irq_set_chip_handler_name_locked(d, &sunxi_pinctrl_edge_irq_chip,
-						 handle_edge_irq, NULL);
-
-	regval = readl(pctl->membase + reg);
-	regval &= ~(IRQ_CFG_IRQ_MASK << index);
-	writel(regval | (mode << index), pctl->membase + reg);
-
-	spin_unlock_irqrestore(&pctl->lock, flags);
-
-	return 0;
-}
-
-static void sunxi_pinctrl_irq_ack(struct irq_data *d)
-{
-	struct sunxi_pinctrl *pctl = irq_data_get_irq_chip_data(d);
-	u32 status_reg = sunxi_irq_status_reg(d->hwirq,
-					      pctl->desc->irq_bank_base);
-	u8 status_idx = sunxi_irq_status_offset(d->hwirq);
-
-	/* Clear the IRQ */
-	writel(1 << status_idx, pctl->membase + status_reg);
-}
-
-static void sunxi_pinctrl_irq_mask(struct irq_data *d)
-{
-	struct sunxi_pinctrl *pctl = irq_data_get_irq_chip_data(d);
-	u32 reg = sunxi_irq_ctrl_reg(d->hwirq, pctl->desc->irq_bank_base);
-	u8 idx = sunxi_irq_ctrl_offset(d->hwirq);
-	unsigned long flags;
-	u32 val;
-
-	spin_lock_irqsave(&pctl->lock, flags);
-
-	/* Mask the IRQ */
-	val = readl(pctl->membase + reg);
-	writel(val & ~(1 << idx), pctl->membase + reg);
-
-	spin_unlock_irqrestore(&pctl->lock, flags);
-}
-
-static void sunxi_pinctrl_irq_unmask(struct irq_data *d)
-{
-	struct sunxi_pinctrl *pctl = irq_data_get_irq_chip_data(d);
-	u32 reg = sunxi_irq_ctrl_reg(d->hwirq, pctl->desc->irq_bank_base);
-	u8 idx = sunxi_irq_ctrl_offset(d->hwirq);
-	unsigned long flags;
-	u32 val;
-
-	spin_lock_irqsave(&pctl->lock, flags);
-
-	/* Unmask the IRQ */
-	val = readl(pctl->membase + reg);
-	writel(val | (1 << idx), pctl->membase + reg);
-
-	spin_unlock_irqrestore(&pctl->lock, flags);
-}
-
-static void sunxi_pinctrl_irq_ack_unmask(struct irq_data *d)
-{
-	sunxi_pinctrl_irq_ack(d);
-	sunxi_pinctrl_irq_unmask(d);
-}
-
-static struct irq_chip sunxi_pinctrl_edge_irq_chip = {
-	.name		= "sunxi_pio_edge",
-	.irq_ack	= sunxi_pinctrl_irq_ack,
-	.irq_mask	= sunxi_pinctrl_irq_mask,
-	.irq_unmask	= sunxi_pinctrl_irq_unmask,
-	.irq_request_resources = sunxi_pinctrl_irq_request_resources,
-	.irq_release_resources = sunxi_pinctrl_irq_release_resources,
-	.irq_set_type	= sunxi_pinctrl_irq_set_type,
-	.flags		= IRQCHIP_SKIP_SET_WAKE,
-};
-
-static struct irq_chip sunxi_pinctrl_level_irq_chip = {
-	.name		= "sunxi_pio_level",
-	.irq_eoi	= sunxi_pinctrl_irq_ack,
-	.irq_mask	= sunxi_pinctrl_irq_mask,
-	.irq_unmask	= sunxi_pinctrl_irq_unmask,
-	/* Define irq_enable / disable to avoid spurious irqs for drivers
-	 * using these to suppress irqs while they clear the irq source */
-	.irq_enable	= sunxi_pinctrl_irq_ack_unmask,
-	.irq_disable	= sunxi_pinctrl_irq_mask,
-	.irq_request_resources = sunxi_pinctrl_irq_request_resources,
-	.irq_release_resources = sunxi_pinctrl_irq_release_resources,
-	.irq_set_type	= sunxi_pinctrl_irq_set_type,
-	.flags		= IRQCHIP_SKIP_SET_WAKE | IRQCHIP_EOI_THREADED |
-			  IRQCHIP_EOI_IF_HANDLED,
-};
-
-static int sunxi_pinctrl_irq_of_xlate(struct irq_domain *d,
-				      struct device_node *node,
-				      const u32 *intspec,
-				      unsigned int intsize,
-				      unsigned long *out_hwirq,
-				      unsigned int *out_type)
-{
-	struct sunxi_pinctrl *pctl = d->host_data;
-	struct sunxi_desc_function *desc;
-	int pin, base;
-
-	if (intsize < 3)
-		return -EINVAL;
-
-	base = PINS_PER_BANK * intspec[0];
-	pin = pctl->desc->pin_base + base + intspec[1];
-
-	desc = sunxi_pinctrl_desc_find_function_by_pin(pctl, pin, "irq");
-	if (!desc)
-		return -EINVAL;
-
-	*out_hwirq = desc->irqbank * PINS_PER_BANK + desc->irqnum;
-	*out_type = intspec[2];
-
-	return 0;
-}
-
-static struct irq_domain_ops sunxi_pinctrl_irq_domain_ops = {
-	.xlate		= sunxi_pinctrl_irq_of_xlate,
-};
-
-static void sunxi_pinctrl_irq_handler(struct irq_desc *desc)
-{
-	unsigned int irq = irq_desc_get_irq(desc);
-	struct irq_chip *chip = irq_desc_get_chip(desc);
-	struct sunxi_pinctrl *pctl = irq_desc_get_handler_data(desc);
-	unsigned long bank, reg, val;
-
-	for (bank = 0; bank < pctl->desc->irq_banks; bank++)
-		if (irq == pctl->irq[bank])
-			break;
-
-	if (bank == pctl->desc->irq_banks)
-		return;
-
-	reg = sunxi_irq_status_reg_from_bank(bank, pctl->desc->irq_bank_base);
-	val = readl(pctl->membase + reg);
-
-	if (val) {
-		int irqoffset;
-
-		chained_irq_enter(chip, desc);
-		for_each_set_bit(irqoffset, &val, IRQ_PER_BANK) {
-			int pin_irq = irq_find_mapping(pctl->domain,
-						       bank * IRQ_PER_BANK + irqoffset);
-			generic_handle_irq(pin_irq);
-		}
-		chained_irq_exit(chip, desc);
-	}
-}
-
-static int sunxi_pinctrl_add_function(struct sunxi_pinctrl *pctl,
-					const char *name)
-{
-	struct sunxi_pinctrl_function *func = pctl->functions;
-
-	while (func->name) {
-		/* function already there */
-		if (strcmp(func->name, name) == 0) {
-			func->ngroups++;
-			return -EEXIST;
-		}
-		func++;
-	}
-
-	func->name = name;
-	func->ngroups = 1;
-
-	pctl->nfunctions++;
-
-	return 0;
-}
-
-static int sunxi_pinctrl_build_state(struct platform_device *pdev)
-{
-	struct sunxi_pinctrl *pctl = platform_get_drvdata(pdev);
-	int i;
-
-	pctl->ngroups = pctl->desc->npins;
-
-	/* Allocate groups */
-	pctl->groups = devm_kzalloc(&pdev->dev,
-				    pctl->ngroups * sizeof(*pctl->groups),
-				    GFP_KERNEL);
-	if (!pctl->groups)
-		return -ENOMEM;
-
-	for (i = 0; i < pctl->desc->npins; i++) {
-		const struct sunxi_desc_pin *pin = pctl->desc->pins + i;
-		struct sunxi_pinctrl_group *group = pctl->groups + i;
-
-		group->name = pin->pin.name;
-		group->pin = pin->pin.number;
-	}
-
-	/*
-	 * We suppose that we won't have any more functions than pins,
-	 * we'll reallocate that later anyway
-	 */
-	pctl->functions = devm_kzalloc(&pdev->dev,
-				pctl->desc->npins * sizeof(*pctl->functions),
-				GFP_KERNEL);
-	if (!pctl->functions)
-		return -ENOMEM;
-
-	/* Count functions and their associated groups */
-	for (i = 0; i < pctl->desc->npins; i++) {
-		const struct sunxi_desc_pin *pin = pctl->desc->pins + i;
-		struct sunxi_desc_function *func = pin->functions;
-
-		while (func->name) {
-			/* Create interrupt mapping while we're at it */
-			if (!strcmp(func->name, "irq")) {
-				int irqnum = func->irqnum + func->irqbank * IRQ_PER_BANK;
-				pctl->irq_array[irqnum] = pin->pin.number;
-			}
-
-			sunxi_pinctrl_add_function(pctl, func->name);
-			func++;
-		}
-	}
-
-	pctl->functions = krealloc(pctl->functions,
-				pctl->nfunctions * sizeof(*pctl->functions),
-				GFP_KERNEL);
-
-	for (i = 0; i < pctl->desc->npins; i++) {
-		const struct sunxi_desc_pin *pin = pctl->desc->pins + i;
-		struct sunxi_desc_function *func = pin->functions;
-
-		while (func->name) {
-			struct sunxi_pinctrl_function *func_item;
-			const char **func_grp;
-
-			func_item = sunxi_pinctrl_find_function_by_name(pctl,
-									func->name);
-			if (!func_item)
-				return -EINVAL;
-
-			if (!func_item->groups) {
-				func_item->groups =
-					devm_kzalloc(&pdev->dev,
-						     func_item->ngroups * sizeof(*func_item->groups),
-						     GFP_KERNEL);
-				if (!func_item->groups)
-					return -ENOMEM;
-			}
-
-			func_grp = func_item->groups;
-			while (*func_grp)
-				func_grp++;
-
-			*func_grp = pin->pin.name;
-			func++;
-		}
-	}
-
-	return 0;
-}
-
-int sunxi_pinctrl_init(struct platform_device *pdev,
-		       const struct sunxi_pinctrl_desc *desc)
-{
-	struct device_node *node = pdev->dev.of_node;
-	struct pinctrl_desc *pctrl_desc;
-	struct pinctrl_pin_desc *pins;
-	struct sunxi_pinctrl *pctl;
-	struct resource *res;
-	int i, ret, last_pin;
-	struct clk *clk;
-
-	pctl = devm_kzalloc(&pdev->dev, sizeof(*pctl), GFP_KERNEL);
-	if (!pctl)
-		return -ENOMEM;
-	platform_set_drvdata(pdev, pctl);
-
-	spin_lock_init(&pctl->lock);
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	pctl->membase = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(pctl->membase))
-		return PTR_ERR(pctl->membase);
-
-	pctl->dev = &pdev->dev;
-	pctl->desc = desc;
-
-	pctl->irq_array = devm_kcalloc(&pdev->dev,
-				       IRQ_PER_BANK * pctl->desc->irq_banks,
-				       sizeof(*pctl->irq_array),
-				       GFP_KERNEL);
-	if (!pctl->irq_array)
-		return -ENOMEM;
-
-	ret = sunxi_pinctrl_build_state(pdev);
-	if (ret) {
-		dev_err(&pdev->dev, "dt probe failed: %d\n", ret);
-		return ret;
-	}
-
-	pins = devm_kzalloc(&pdev->dev,
-			    pctl->desc->npins * sizeof(*pins),
-			    GFP_KERNEL);
-	if (!pins)
-		return -ENOMEM;
-
-	for (i = 0; i < pctl->desc->npins; i++)
-		pins[i] = pctl->desc->pins[i].pin;
-
-	pctrl_desc = devm_kzalloc(&pdev->dev,
-				  sizeof(*pctrl_desc),
-				  GFP_KERNEL);
-	if (!pctrl_desc)
-		return -ENOMEM;
-
-	pctrl_desc->name = dev_name(&pdev->dev);
-	pctrl_desc->owner = THIS_MODULE;
-	pctrl_desc->pins = pins;
-	pctrl_desc->npins = pctl->desc->npins;
-	pctrl_desc->confops = &sunxi_pconf_ops;
-	pctrl_desc->pctlops = &sunxi_pctrl_ops;
-	pctrl_desc->pmxops =  &sunxi_pmx_ops;
-
-	pctl->pctl_dev = pinctrl_register(pctrl_desc,
-					  &pdev->dev, pctl);
-	if (IS_ERR(pctl->pctl_dev)) {
-		dev_err(&pdev->dev, "couldn't register pinctrl driver\n");
-		return PTR_ERR(pctl->pctl_dev);
-	}
-
-	pctl->chip = devm_kzalloc(&pdev->dev, sizeof(*pctl->chip), GFP_KERNEL);
-	if (!pctl->chip) {
-		ret = -ENOMEM;
-		goto pinctrl_error;
-	}
-
-	last_pin = pctl->desc->pins[pctl->desc->npins - 1].pin.number;
-	pctl->chip->owner = THIS_MODULE;
-	pctl->chip->request = gpiochip_generic_request,
-	pctl->chip->free = gpiochip_generic_free,
-	pctl->chip->direction_input = sunxi_pinctrl_gpio_direction_input,
-	pctl->chip->direction_output = sunxi_pinctrl_gpio_direction_output,
-	pctl->chip->get = sunxi_pinctrl_gpio_get,
-	pctl->chip->set = sunxi_pinctrl_gpio_set,
-	pctl->chip->of_xlate = sunxi_pinctrl_gpio_of_xlate,
-	pctl->chip->to_irq = sunxi_pinctrl_gpio_to_irq,
-	pctl->chip->of_gpio_n_cells = 3,
-	pctl->chip->can_sleep = false,
-	pctl->chip->ngpio = round_up(last_pin, PINS_PER_BANK) -
-			    pctl->desc->pin_base;
-	pctl->chip->label = dev_name(&pdev->dev);
-	pctl->chip->dev = &pdev->dev;
-	pctl->chip->base = pctl->desc->pin_base;
-
-	ret = gpiochip_add(pctl->chip);
-	if (ret)
-		goto pinctrl_error;
-
-	for (i = 0; i < pctl->desc->npins; i++) {
-		const struct sunxi_desc_pin *pin = pctl->desc->pins + i;
-
-		ret = gpiochip_add_pin_range(pctl->chip, dev_name(&pdev->dev),
-					     pin->pin.number - pctl->desc->pin_base,
-					     pin->pin.number, 1);
-		if (ret)
-			goto gpiochip_error;
-	}
-
-	clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(clk)) {
-		ret = PTR_ERR(clk);
-		goto gpiochip_error;
-	}
-
-	ret = clk_prepare_enable(clk);
-	if (ret)
-		goto gpiochip_error;
-
-	pctl->irq = devm_kcalloc(&pdev->dev,
-				 pctl->desc->irq_banks,
-				 sizeof(*pctl->irq),
-				 GFP_KERNEL);
-	if (!pctl->irq) {
-		ret = -ENOMEM;
-		goto clk_error;
-	}
-
-	for (i = 0; i < pctl->desc->irq_banks; i++) {
-		pctl->irq[i] = platform_get_irq(pdev, i);
-		if (pctl->irq[i] < 0) {
-			ret = pctl->irq[i];
-			goto clk_error;
-		}
-	}
-
-	pctl->domain = irq_domain_add_linear(node,
-					     pctl->desc->irq_banks * IRQ_PER_BANK,
-					     &sunxi_pinctrl_irq_domain_ops,
-					     pctl);
-	if (!pctl->domain) {
-		dev_err(&pdev->dev, "Couldn't register IRQ domain\n");
-		ret = -ENOMEM;
-		goto clk_error;
-	}
-
-	for (i = 0; i < (pctl->desc->irq_banks * IRQ_PER_BANK); i++) {
-		int irqno = irq_create_mapping(pctl->domain, i);
-
-		irq_set_chip_and_handler(irqno, &sunxi_pinctrl_edge_irq_chip,
-					 handle_edge_irq);
-		irq_set_chip_data(irqno, pctl);
-	}
-
-	for (i = 0; i < pctl->desc->irq_banks; i++) {
-		/* Mask and clear all IRQs before registering a handler */
-		writel(0, pctl->membase + sunxi_irq_ctrl_reg_from_bank(i,
-						pctl->desc->irq_bank_base));
-		writel(0xffffffff,
-		       pctl->membase + sunxi_irq_status_reg_from_bank(i,
-						pctl->desc->irq_bank_base));
-
-		irq_set_chained_handler_and_data(pctl->irq[i],
-						 sunxi_pinctrl_irq_handler,
-						 pctl);
-	}
-
-	dev_info(&pdev->dev, "initialized sunXi PIO driver\n");
-
-	return 0;
-
-clk_error:
-	clk_disable_unprepare(clk);
-gpiochip_error:
-	gpiochip_remove(pctl->chip);
-pinctrl_error:
-	pinctrl_unregister(pctl->pctl_dev);
-	return ret;
-}
+RCE_SEL_OUTPUT_PIX                    = 0x0,
+	DCP_CRC_SOURCE_SEL_INPUT_L32                     = 0x1,
+	DCP_CRC_SOURCE_SEL_INPUT_H32                     = 0x2,
+	DCP_CRC_SOURCE_SEL_OUTPUT_CNTL                   = 0x4,
+} DCP_CRC_SOURCE_SEL;
+typedef enum DCP_CRC_LINE_SEL {
+	DCP_CRC_LINE_SEL_RESERVED                        = 0x0,
+	DCP_CRC_LINE_SEL_EVEN                            = 0x1,
+	DCP_CRC_LINE_SEL_ODD                             = 0x2,
+	DCP_CRC_LINE_SEL_BOTH                            = 0x3,
+} DCP_CRC_LINE_SEL;
+typedef enum DCP_GRPH_FLIP_RATE {
+	DCP_GRPH_FLIP_RATE_1FRAME                        = 0x0,
+	DCP_GRPH_FLIP_RATE_2FRAME                        = 0x1,
+	DCP_GRPH_FLIP_RATE_3FRAME                        = 0x2,
+	DCP_GRPH_FLIP_RATE_4FRAME                        = 0x3,
+	DCP_GRPH_FLIP_RATE_5FRAME                        = 0x4,
+	DCP_GRPH_FLIP_RATE_6FRAME                        = 0x5,
+	DCP_GRPH_FLIP_RATE_7FRAME                        = 0x6,
+	DCP_GRPH_FLIP_RATE_8FRAME                        = 0x7,
+} DCP_GRPH_FLIP_RATE;
+typedef enum DCP_GRPH_FLIP_RATE_ENABLE {
+	DCP_GRPH_FLIP_RATE_ENABLE_FALSE                  = 0x0,
+	DCP_GRPH_FLIP_RATE_ENABLE_TRUE                   = 0x1,
+} DCP_GRPH_FLIP_RATE_ENABLE;
+typedef enum DCP_GSL0_EN {
+	DCP_GSL0_EN_FALSE                                = 0x0,
+	DCP_GSL0_EN_TRUE                                 = 0x1,
+} DCP_GSL0_EN;
+typedef enum DCP_GSL1_EN {
+	DCP_GSL1_EN_FALSE                                = 0x0,
+	DCP_GSL1_EN_TRUE                                 = 0x1,
+} DCP_GSL1_EN;
+typedef enum DCP_GSL2_EN {
+	DCP_GSL2_EN_FALSE                                = 0x0,
+	DCP_GSL2_EN_TRUE                                 = 0x1,
+} DCP_GSL2_EN;
+typedef enum DCP_GSL_MASTER_EN {
+	DCP_GSL_MASTER_EN_FALSE                          = 0x0,
+	DCP_GSL_MASTER_EN_TRUE                           = 0x1,
+} DCP_GSL_MASTER_EN;
+typedef enum DCP_GSL_XDMA_GROUP {
+	DCP_GSL_XDMA_GROUP_VSYNC                         = 0x0,
+	DCP_GSL_XDMA_GROUP_HSYNC0                        = 0x1,
+	DCP_GSL_XDMA_GROUP_HSYNC1                        = 0x2,
+	DCP_GSL_XDMA_GROUP_HSYNC2                        = 0x3,
+} DCP_GSL_XDMA_GROUP;
+typedef enum DCP_GSL_XDMA_GROUP_UNDERFLOW_EN {
+	DCP_GSL_XDMA_GROUP_UNDERFLOW_EN_FALSE            = 0x0,
+	DCP_GSL_XDMA_GROUP_UNDERFLOW_EN_TRUE             = 0x1,
+} DCP_GSL_XDMA_GROUP_UNDERFLOW_EN;
+typedef enum DCP_GSL_SYNC_SOURCE {
+	DCP_GSL_SYNC_SOURCE_FLIP                         = 0x0,
+	DCP_GSL_SYNC_SOURCE_PHASE0                       = 0x1,
+	DCP_GSL_SYNC_SOURCE_RESET                        = 0x2,
+	DCP_GSL_SYNC_SOURCE_PHASE1                       = 0x3,
+} DCP_GSL_SYNC_SOURCE;
+typedef enum DCP_GSL_DELAY_SURFACE_UPDATE_PENDING {
+	DCP_GSL_DELAY_SURFACE_UPDATE_PENDING_FALSE       = 0x0,
+	DCP_GSL_DELAY_SURFACE_UPDATE_PENDING_TRUE        = 0x1,
+} DCP_GSL_DELAY_SURFACE_UPDATE_PENDING;
+typedef enum DCP_TEST_DEBUG_WRITE_EN {
+	DCP_TEST_DEBUG_WRITE_EN_FALSE                    = 0x0,
+	DCP_TEST_DEBUG_WRITE_EN_TRUE                     = 0x1,
+} DCP_TEST_DEBUG_WRITE_EN;
+typedef enum DCP_GRPH_STEREOSYNC_FLIP_EN {
+	DCP_GRPH_STEREOSYNC_FLIP_EN_FALSE                = 0x0,
+	DCP_GRPH_STEREOSYNC_FLIP_EN_TRUE                 = 0x1,
+} DCP_GRPH_STEREOSYNC_FLIP_EN;
+typedef enum DCP_GRPH_STEREOSYNC_FLIP_MODE {
+	DCP_GRPH_STEREOSYNC_FLIP_MODE_FLIP               = 0x0,
+	DCP_GRPH_STEREOSYNC_FLIP_MODE_PHASE0             = 0x1,
+	DCP_GRPH_STEREOSYNC_FLIP_MODE_RESET              = 0x2,
+	DCP_GRPH_STEREOSYNC_FLIP_MODE_PHASE1             = 0x3,
+} DCP_GRPH_STEREOSYNC_FLIP_MODE;
+typedef enum DCP_GRPH_STEREOSYNC_SELECT_DISABLE {
+	DCP_GRPH_STEREOSYNC_SELECT_DISABLE_FALSE         = 0x0,
+	DCP_GRPH_STEREOSYNC_SELECT_DISABLE_TRUE          = 0x1,
+} DCP_GRPH_STEREOSYNC_SELECT_DISABLE;
+typedef enum DCP_GRPH_ROTATION_ANGLE {
+	DCP_GRPH_ROTATION_ANGLE_0                        = 0x0,
+	DCP_GRPH_ROTATION_ANGLE_90                       = 0x1,
+	DCP_GRPH_ROTATION_ANGLE_180                      = 0x2,
+	DCP_GRPH_ROTATION_ANGLE_270                      = 0x3,
+} DCP_GRPH_ROTATION_ANGLE;
+typedef enum DCP_GRPH_XDMA_CACHE_UNDERFLOW_CNT_EN {
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_CNT_EN_FALSE       = 0x0,
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_CNT_EN_TRUE        = 0x1,
+} DCP_GRPH_XDMA_CACHE_UNDERFLOW_CNT_EN;
+typedef enum DCP_GRPH_XDMA_CACHE_UNDERFLOW_CNT_MODE {
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_CNT_MODE_RELY_NUM  = 0x0,
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_CNT_MODE_RELY_ENABLE= 0x1,
+} DCP_GRPH_XDMA_CACHE_UNDERFLOW_CNT_MODE;
+typedef enum DCP_GRPH_REGAMMA_MODE {
+	DCP_GRPH_REGAMMA_MODE_BYPASS                     = 0x0,
+	DCP_GRPH_REGAMMA_MODE_SRGB                       = 0x1,
+	DCP_GRPH_REGAMMA_MODE_XVYCC                      = 0x2,
+	DCP_GRPH_REGAMMA_MODE_PROGA                      = 0x3,
+	DCP_GRPH_REGAMMA_MODE_PROGB                      = 0x4,
+} DCP_GRPH_REGAMMA_MODE;
+typedef enum DCP_ALPHA_ROUND_TRUNC_MODE {
+	DCP_ALPHA_ROUND_TRUNC_MODE_ROUND                 = 0x0,
+	DCP_ALPHA_ROUND_TRUNC_MODE_TRUNC                 = 0x1,
+} DCP_ALPHA_ROUND_TRUNC_MODE;
+typedef enum DCP_CURSOR_ALPHA_BLND_ENA {
+	DCP_CURSOR_ALPHA_BLND_ENA_FALSE                  = 0x0,
+	DCP_CURSOR_ALPHA_BLND_ENA_TRUE                   = 0x1,
+} DCP_CURSOR_ALPHA_BLND_ENA;
+typedef enum DCP_GRPH_XDMA_CACHE_UNDERFLOW_FRAME_MASK {
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_FRAME_MASK_FALSE   = 0x0,
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_FRAME_MASK_TRUE    = 0x1,
+} DCP_GRPH_XDMA_CACHE_UNDERFLOW_FRAME_MASK;
+typedef enum DCP_GRPH_XDMA_CACHE_UNDERFLOW_FRAME_ACK {
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_FRAME_ACK_FALSE    = 0x0,
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_FRAME_ACK_TRUE     = 0x1,
+} DCP_GRPH_XDMA_CACHE_UNDERFLOW_FRAME_ACK;
+typedef enum DCP_GRPH_XDMA_CACHE_UNDERFLOW_INT_MASK {
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_INT_MASK_FALSE     = 0x0,
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_INT_MASK_TRUE      = 0x1,
+} DCP_GRPH_XDMA_CACHE_UNDERFLOW_INT_MASK;
+typedef enum DCP_GRPH_XDMA_CACHE_UNDERFLOW_INT_ACK {
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_INT_ACK_FALSE      = 0x0,
+	DCP_GRPH_XDMA_CACHE_UNDERFLOW_INT_ACK_TRUE       = 0x1,
+} DCP_GRPH_XDMA_CACHE_UNDERFLOW_INT_ACK;
+typedef enum DCP_GRPH_SURFACE_COUNTER_EN {
+	DCP_GRPH_SURFACE_COUNTER_EN_DISABLE              = 0x0,
+	DCP_GRPH_SURFACE_COUNTER_EN_ENABLE               = 0x1,
+} DCP_GRPH_SURFACE_COUNTER_EN;
+typedef enum DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT {
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_0          = 0x0,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_1          = 0x1,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_2          = 0x2,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_3          = 0x3,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_4          = 0x4,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_5          = 0x5,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_6          = 0x6,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_7          = 0x7,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_8          = 0x8,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_9          = 0x9,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_10         = 0xa,
+	DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT_11         = 0xb,
+} DCP_GRPH_SURFACE_COUNTER_EVENT_SELECT;
+typedef enum DCP_GRPH_SURFACE_COUNTER_ERR_WRAP_OCCURED {
+	DCP_GRPH_SURFACE_COUNTER_ERR_WRAP_OCCURED_NO     = 0x0,
+	DCP_GRPH_SURFACE_COUNTER_ERR_WRAP_OCCURED_YES    = 0x1,
+} DCP_GRPH_SURFACE_COUNTER_ERR_WRAP_OCCURED;
+typedef enum HDMI_KEEPOUT_MODE {
+	HDMI_KEEPOUT_0_650PIX_AFTER_VSYNC                = 0x0,
+	HDMI_KEEPOUT_509_650PIX_AFTER_VSYNC              = 0x1,
+} HDMI_KEEPOUT_MODE;
+typedef enum HDMI_CLOCK_CHANNEL_RATE {
+	HDMI_CLOCK_CHANNEL_FREQ_EQUAL_TO_CHAR_RATE       = 0x0,
+	HDMI_CLOCK_CHANNEL_FREQ_QUARTER_TO_CHAR_RATE     = 0x1,
+} HDMI_CLOCK_CHANNEL_RATE;
+typedef enum HDMI_NO_EXTRA_NULL_PACKET_FILLED {
+	HDMI_EXTRA_NULL_PACKET_FILLED_ENABLE             = 0x0,
+	HDMI_EXTRA_NULL_PACKET_FILLED_DISABLE            = 0x1,
+} HDMI_NO_EXTRA_NULL_PACKET_FILLED;
+typedef enum HDMI_PACKET_GEN_VERSION {
+	HDMI_PACKET_GEN_VERSION_OLD                      = 0x0,
+	HDMI_PACKET_GEN_VERSION_NEW                      = 0x1,
+} HDMI_PACKET_GEN_VERSION;
+typedef enum HDMI_ERROR_ACK {
+	HDMI_ERROR_ACK_INT                               = 0x0,
+	HDMI_ERROR_NOT_ACK                               = 0x1,
+} HDMI_ERROR_ACK;
+typedef enum HDMI_ERROR_MASK {
+	HDMI_ERROR_MASK_INT                              = 0x0,
+	HDMI_ERROR_NOT_MASK                              = 0x1,
+} HDMI_ERROR_MASK;
+typedef enum HDMI_DEEP_COLOR_DEPTH {
+	HDMI_DEEP_COLOR_DEPTH_24BPP                      = 0x0,
+	HDMI_DEEP_COLOR_DEPTH_30BPP                      = 0x1,
+	HDMI_DEEP_COLOR_DEPTH_36BPP                      = 0x2,
+	HDMI_DEEP_COLOR_DEPTH_RESERVED                   = 0x3,
+} HDMI_DEEP_COLOR_DEPTH;
+typedef enum HDMI_AUDIO_DELAY_EN {
+	HDMI_AUDIO_DELAY_DISABLE                         = 0x0,
+	HDMI_AUDIO_DELAY_58CLK                           = 0x1,
+	HDMI_AUDIO_DELAY_56CLK                           = 0x2,
+	HDMI_AUDIO_DELAY_RESERVED                        = 0x3,
+} HDMI_AUDIO_DELAY_EN;
+typedef enum HDMI_AUDIO_SEND_MAX_PACKETS {
+	HDMI_NOT_SEND_MAX_AUDIO_PACKETS                  = 0x0,
+	HDMI_SEND_MAX_AUDIO_PACKETS                      = 0x1,
+} HDMI_AUDIO_SEND_MAX_PACKETS;
+typedef enum HDMI_ACR_SEND {
+	HDMI_ACR_NOT_SEND                                = 0x0,
+	HDMI_ACR_PKT_SEND                                = 0x1,
+} HDMI_ACR_SEND;
+typedef enum HDMI_ACR_CONT {
+	HDMI_ACR_CONT_DISABLE                            = 0x0,
+	HDMI_ACR_CONT_ENABLE                             = 0x1,
+} HDMI_ACR_CONT;
+typedef enum HDMI_ACR_SELECT {
+	HDMI_ACR_SELECT_HW                               = 0x0,
+	HDMI_ACR_SELECT_32K                              = 0x1,
+	HDMI_ACR_SELECT_44K                              = 0x2,
+	HDMI_ACR_SELECT_48K                              = 0x3,
+} HDMI_ACR_SELECT;
+typedef enum HDMI_ACR_SOURCE {
+	HDMI_ACR_SOURCE_HW                               = 0x0,
+	HDMI_ACR_SOURCE_SW                               = 0x1,
+} HDMI_ACR_SOURCE;
+typedef enum HDMI_ACR_N_MULTIPLE {
+	HDMI_ACR_0_MULTIPLE_RESERVED                     = 0x0,
+	HDMI_ACR_1_MULTIPLE                              = 0x1,
+	HDMI_ACR_2_MULTIPLE                              = 0x2,
+	HDMI_ACR_3_MULTIPLE_RESERVED                     = 0x3,
+	HDMI_ACR_4_MULTIPLE                              = 0x4,
+	HDMI_ACR_5_MULTIPLE_RESERVED                     = 0x5,
+	HDMI_ACR_6_MULTIPLE_RESERVED                     = 0x6,
+	HDMI_ACR_7_MULTIPLE_RESERVED                     = 0x7,
+} HDMI_ACR_N_MULTIPLE;
+typedef enum HDMI_ACR_AUDIO_PRIORITY {
+	HDMI_ACR_PKT_HIGH_PRIORITY_THAN_AUDIO_SAMPLE     = 0x0,
+	HDMI_AUDIO_SAMPLE_HIGH_PRIORITY_THAN_ACR_PKT     = 0x1,
+} HDMI_ACR_AUDIO_PRIORITY;
+typedef enum HDMI_NULL_SEND {
+	HDMI_NULL_NOT_SEND                               = 0x0,
+	HDMI_NULL_PKT_SEND                               = 0x1,
+} HDMI_NULL_SEND;
+typedef enum HDMI_GC_SEND {
+	HDMI_GC_NOT_SEND                                 = 0x0,
+	HDMI_GC_PKT_SEND                                 = 0x1,
+} HDMI_GC_SEND;
+typedef enum HDMI_GC_CONT {
+	HDMI_GC_CONT_DISABLE                             = 0x0,
+	HDMI_GC_CONT_ENABLE                              = 0x1,
+} HDMI_GC_CONT;
+typedef enum HDMI_ISRC_SEND {
+	HDMI_ISRC_NOT_SEND                               = 0x0,
+	HDMI_ISRC_PKT_SEND                               = 0x1,
+} HDMI_ISRC_SEND;
+typedef enum HDMI_ISRC_CONT {
+	HDMI_ISRC_CONT_DISABLE                           = 0x0,
+	HDMI_ISRC_CONT_ENABLE                            = 0x1,
+} HDMI_ISRC_CONT;
+typedef enum HDMI_AVI_INFO_SEND {
+	HDMI_AVI_INFO_NOT_SEND                           = 0x0,
+	HDMI_AVI_INFO_PKT_SEND                           = 0x1,
+} HDMI_AVI_INFO_SEND;
+typedef enum HDMI_AVI_INFO_CONT {
+	HDMI_AVI_INFO_CONT_DISABLE                       = 0x0,
+	HDMI_AVI_INFO_CONT_ENABLE                        = 0x1,
+} HDMI_AVI_INFO_CONT;
+typedef enum HDMI_AUDIO_INFO_SEND {
+	HDMI_AUDIO_INFO_NOT_SEND                         = 0x0,
+	HDMI_AUDIO_INFO_PKT_SEND                         = 0x1,
+} HDMI_AUDIO_INFO_SEND;
+typedef enum HDMI_AUDIO_INFO_CONT {
+	HDMI_AUDIO_INFO_CONT_DISABLE                     = 0x0,
+	HDMI_AUDIO_INFO_CONT_ENABLE                      = 0x1,
+} HDMI_AUDIO_INFO_CONT;
+typedef enum HDMI_MPEG_INFO_SEND {
+	HDMI_MPEG_INFO_NOT_SEND                          = 0x0,
+	HDMI_MPEG_INFO_PKT_SEND                          = 0x1,
+} HDMI_MPEG_INFO_SEND;
+typedef enum HDMI_MPEG_INFO_CONT {
+	HDMI_MPEG_INFO_CONT_DISABLE                      = 0x0,
+	HDMI_MPEG_INFO_CONT_ENABLE                       = 0x1,
+} HDMI_MPEG_INFO_CONT;
+typedef enum HDMI_GENERIC0_SEND {
+	HDMI_GENERIC0_NOT_SEND                           = 0x0,
+	HDMI_GENERIC0_PKT_SEND                           = 0x1,
+} HDMI_GENERIC0_SEND;
+typedef enum HDMI_GENERIC0_CONT {
+	HDMI_GENERIC0_CONT_DISABLE                       = 0x0,
+	HDMI_GENERIC0_CONT_ENABLE                        = 0x1,
+} HDMI_GENERIC0_CONT;
+typedef enum HDMI_GENERIC1_SEND {
+	HDMI_GENERIC1_NOT_SEND                           = 0x0,
+	HDMI_GENERIC1_PKT_SEND                           = 0x1,
+} HDMI_GENERIC1_SEND;
+typedef enum HDMI_GENERIC1_CONT {
+	HDMI_GENERIC1_CONT_DISABLE                       = 0x0,
+	HDMI_GENERIC1_CONT_ENABLE                        = 0x1,
+} HDMI_GENERIC1_CONT;
+typedef enum HDMI_GC_AVMUTE_CONT {
+	HDMI_GC_AVMUTE_CONT_DISABLE                      = 0x0,
+	HDMI_GC_AVMUTE_CONT_ENABLE                       = 0x1,
+} HDMI_GC_AVMUTE_CONT;
+typedef enum HDMI_PACKING_PHASE_OVERRIDE {
+	HDMI_PACKING_PHASE_SET_BY_HW                     = 0x0,
+	HDMI_PACKING_PHASE_SET_BY_SW                     = 0x1,
+} HDMI_PACKING_PHASE_OVERRIDE;
+typedef enum HDMI_GENERIC2_SEND {
+	HDMI_GENERIC2_NOT_SEND                           = 0x0,
+	HDMI_GENERIC2_PKT_SEND                           = 0x1,
+} HDMI_GENERIC2_SEND;
+typedef enum HDMI_GENERIC2_CONT {
+	HDMI_GENERIC2_CONT_DISABLE                       = 0x0,
+	HDMI_GENERIC2_CONT_ENABLE                        = 0x1,
+} HDMI_GENERIC2_CONT;
+typedef enum HDMI_GENERIC3_SEND {
+	HDMI_GENERIC3_NOT_SEND                           = 0x0,
+	HDMI_GENERIC3_PKT_SEND                           = 0x1,
+} HDMI_GENERIC3_SEND;
+typedef enum HDMI_GENERIC3_CONT {
+	HDMI_GENERIC3_CONT_DISABLE                       = 0x0,
+	HDMI_GENERIC3_CONT_ENABLE                        = 0x1,
+} HDMI_GENERIC3_CONT;
+typedef enum TMDS_PIXEL_ENCODING {
+	TMDS_PIXEL_ENCODING_444                          = 0x0,
+	TMDS_PIXEL_ENCODING_422                          = 0x1,
+} TMDS_PIXEL_ENCODING;
+typedef enum TMDS_COLOR_FORMAT {
+	TMDS_COLOR_FORMAT__24BPP__TWIN30BPP_MSB__DUAL48BPP= 0x0,
+	TMDS_COLOR_FORMAT_TWIN30BPP_LSB                  = 0x1,
+	TMDS_COLOR_FORMAT_DUAL30BPP                      = 0x2,
+	TMDS_COLOR_FORMAT_RESERVED                       = 0x3,
+} TMDS_COLOR_FORMAT;
+typedef enum TMDS_STEREOSYNC_CTL_SEL_REG {
+	TMDS_STEREOSYNC_CTL0                             = 0x0,
+	TMDS_STEREOSYNC_CTL1                             = 0x1,
+	TMDS_STEREOSYNC_CTL2                             = 0x2,
+	TMDS_STEREOSYNC_CTL3                             = 0x3,
+} TMDS_STEREOSYNC_CTL_SEL_REG;
+typedef enum TMDS_CTL0_DATA_SEL {
+	TMDS_CTL0_DATA_SEL0_RESERVED                     = 0x0,
+	TMDS_CTL0_DATA_SEL1_DISPLAY_ENABLE               = 0x1,
+	TMDS_CTL0_DATA_SEL2_VSYNC                        = 0x2,
+	TMDS_CTL0_DATA_SEL3_RESERVED                     = 0x3,
+	TMDS_CTL0_DATA_SEL4_HSYNC                        = 0x4,
+	TMDS_CTL0_DATA_SEL5_SEL7_RESERVED                = 0x5,
+	TMDS_CTL0_DATA_SEL8_RANDOM_DATA                  = 0x6,
+	TMDS_CTL0_DATA_SEL9_SEL15_RANDOM_DATA            = 0x7,
+} TMDS_CTL0_DATA_SEL;
+typedef enum TMDS_CTL0_DATA_DELAY {
+	TMDS_CTL0_DATA_DELAY_0PIX                        = 0x0,
+	TMDS_CTL0_DATA_DELAY_1PIX                        = 0x1,
+	TMDS_CTL0_DATA_DELAY_2PIX                        = 0x2,
+	TMDS_CTL0_DATA_DELAY_3PIX                        = 0x3,
+	TMDS_CTL0_DATA_DELAY_4PIX                        = 0x4,
+	TMDS_CTL0_DATA_DELAY_5PIX                        = 0x5,
+	TMDS_CTL0_DATA_DELAY_6PIX                        = 0x6,
+	TMDS_CTL0_DATA_DELAY_7PIX                        = 0x7,
+} TMDS_CTL0_DATA_DELAY;
+typedef enum TMDS_CTL0_DATA_INVERT {
+	TMDS_CTL0_DATA_NORMAL                            = 0x0,
+	TMDS_CTL0_DATA_INVERT_EN                         = 0x1,
+} TMDS_CTL0_DATA_INVERT;
+typedef enum TMDS_CTL0_DATA_MODULATION {
+	TMDS_CTL0_DATA_MODULATION_DISABLE                = 0x0,
+	TMDS_CTL0_DATA_MODULATION_BIT0                   = 0x1,
+	TMDS_CTL0_DATA_MODULATION_BIT1                   = 0x2,
+	TMDS_CTL0_DATA_MODULATION_BIT2                   = 0x3,
+} TMDS_CTL0_DATA_MODULATION;
+typedef enum TMDS_CTL0_PATTERN_OUT_EN {
+	TMDS_CTL0_PATTERN_OUT_DISABLE                    = 0x0,
+	TMDS_CTL0_PATTERN_OUT_ENABLE                     = 0x1,
+} TMDS_CTL0_PATTERN_OUT_EN;
+typedef enum TMDS_CTL1_DATA_SEL {
+	TMDS_CTL1_DATA_SEL0_RESERVED                     = 0x0,
+	TMDS_CTL1_DATA_SEL1_DISPLAY_ENABLE               = 0x1,
+	TMDS_CTL1_DATA_SEL2_VSYNC                        = 0x2,
+	TMDS_CTL1_DATA_SEL3_RESERVED                     = 0x3,
+	TMDS_CTL1_DATA_SEL4_HSYNC                        = 0x4,
+	TMDS_CTL1_DATA_SEL5_SEL7_RESERVED                = 0x5,
+	TMDS_CTL1_DATA_SEL8_BLANK_TIME                   = 0x6,
+	TMDS_CTL1_DATA_SEL9_SEL15_RESERVED               = 0x7,
+} TMDS_CTL1_DATA_SEL;
+typedef enum TMDS_CTL1_DATA_DELAY {
+	TMDS_CTL1_DATA_DELAY_0PIX                        = 0x0,
+	TMDS_CTL1_DATA_DELAY_1PIX                        = 0x1,
+	TMDS_CTL1_DATA_DELAY_2PIX                        = 0x2,
+	TMDS_CTL1_DATA_DELAY_3PIX                        = 0x3,
+	TMDS_CTL1_DATA_DELAY_4PIX                        = 0x4,
+	TMDS_CTL1_DATA_DELAY_5PIX                        = 0x5,
+	TMDS_CTL1_DATA_DELAY_6PIX                        = 0x6,
+	TMDS_CTL1_DATA_DELAY_7PIX                        = 0x7,
+} TMDS_CTL1_DATA_DELAY;
+typedef enum TMDS_CTL1_DATA_INVERT {
+	TMDS_CTL1_DATA_NORMAL                            = 0x0,
+	TMDS_CTL1_DATA_INVERT_EN                         = 0x1,
+} TMDS_CTL1_DATA_INVERT;
+typedef enum TMDS_CTL1_DATA_MODULATION {
+	TMDS_CTL1_DATA_MODULATION_DISABLE                = 0x0,
+	TMDS_CTL1_DATA_MODULATION_BIT0                   = 0x1,
+	TMDS_CTL1_DATA_MODULATION_BIT1                   = 0x2,
+	TMDS_CTL1_DATA_MODULATION_BIT2                   = 0x3,
+} TMDS_CTL1_DATA_MODULATION;
+typedef enum TMDS_CTL1_PATTERN_OUT_EN {
+	TMDS_CTL1_PATTERN_OUT_DISABLE                    = 0x0,
+	TMDS_CTL1_PATTERN_OUT_ENABLE                     = 0x1,
+} TMDS_CTL1_PATTERN_OUT_EN;
+typedef enum TMDS_CTL2_DATA_SEL {
+	TMDS_CTL2_DATA_SEL0_RESERVED                     = 0x0,
+	TMDS_CTL2_DATA_SEL1_DISPLAY_ENABLE               = 0x1,
+	TMDS_CTL2_DATA_SEL2_VSYNC                        = 0x2,
+	TMDS_CTL2_DATA_SEL3_RESERVED                     = 0x3,
+	TMDS_CTL2_DATA_SEL4_HSYNC                        = 0x4,
+	TMDS_CTL2_DATA_SEL5_SEL7_RESERVED                = 0x5,
+	TMDS_CTL2_DATA_SEL8_BLANK_TIME                   = 0x6,
+	TMDS_CTL2_DATA_SEL9_SEL15_RESERVED               = 0x7,
+} TMDS_CTL2_DATA_SEL;
+typedef enum TMDS_CTL2_DATA_DELAY {
+	TMDS_CTL2_DATA_DELAY_0PIX                        = 0x0,
+	TMDS_CTL2_DATA_DELAY_1PIX                        = 0x1,
+	TMDS_CTL2_DATA_DELAY_2PIX                        = 0x2,
+	TMDS_CTL2_DATA_DELAY_3PIX                        = 0x3,
+	TMDS_CTL2_DATA_DELAY_4PIX                        = 0x4,
+	TMDS_CTL2_DATA_DELAY_5PIX                        = 0x5,
+	TMDS_CTL2_DATA_DELAY_6PIX                        = 0x6,
+	TMDS_CTL2_DATA_DELAY_7PIX                        = 0x7,
+} TMDS_CTL2_DATA_DELAY;
+typedef enum TMDS_CTL2_DATA_INVERT {
+	TMDS_CTL2_DATA_NORMAL                            = 0x0,
+	TMDS_CTL2_DATA_INVERT_EN                         = 0x1,
+} TMDS_CTL2_DATA_INVERT;
+typedef enum TMDS_CTL2_DATA_MODULATION {
+	TMDS_CTL2_DATA_MODULATION_DISABLE                = 0x0,
+	TMDS_CTL2_DATA_MODULATION_BIT0                   = 0x1,
+	TMDS_CTL2_DATA_MODULATION_BIT1                   = 0x2,
+	TMDS_CTL2_DATA_MODULATION_BIT2                   = 0x3,
+} TMDS_CTL2_DATA_MODULATION;
+typedef enum TMDS_CTL2_PATTERN_OUT_EN {
+	TMDS_CTL2_PATTERN_OUT_DISABLE                    = 0x0,
+	TMDS_CTL2_PATTERN_OUT_ENABLE                     = 0x1,
+} TMDS_CTL2_PATTERN_OUT_EN;
+typedef enum TMDS_CTL3_DATA_DELAY {
+	TMDS_CTL3_DATA_DELAY_0PIX                        = 0x0,
+	TMDS_CTL3_DATA_DELAY_1PIX                        = 0x1,
+	TMDS_CTL3_DATA_DELAY_2PIX                        = 0x2,
+	TMDS_CTL3_DATA_DELAY_3PIX                        = 0x3,
+	TMDS_CTL3_DATA_DELAY_4PIX                        = 0x4,
+	TMDS_CTL3_DATA_DELAY_5PIX                        = 0x5,
+	TMDS_CTL3_DATA_DELAY_6PIX                        = 0x6,
+	TMDS_CTL3_DATA_DELAY_7PIX                        = 0x7,
+} TMDS_CTL3_DATA_DELAY;
+typedef enum TMDS_CTL3_DATA_INVERT {
+	TMDS_CTL3_DATA_NORMAL                            = 0x0,
+	TMDS_CTL3_DATA_INVERT_EN                         = 0x1,
+} TMDS_CTL3_DATA_INVERT;
+typedef enum TMDS_CTL3_DATA_MODULATION {
+	TMDS_CTL3_DATA_MODULATION_DISABLE                = 0x0,
+	TMDS_CTL3_DATA_MODULATION_BIT0                   = 0x1,
+	TMDS_CTL3_DATA_MODULATION_BIT1                   = 0x2,
+	TMDS_CTL3_DATA_MODULATION_BIT2                   = 0x3,
+} TMDS_CTL3_DATA_MODULATION;
+typedef enum TMDS_CTL3_PATTERN_OUT_EN {
+	TMDS_CTL3_PATTERN_OUT_DISABLE                    = 0x0,
+	TMDS_CTL3_PATTERN_OUT_ENABLE                     = 0x1,
+} TMDS_CTL3_PATTERN_OUT_EN;
+typedef enum TMDS_CTL3_DATA_SEL {
+	TMDS_CTL3_DATA_SEL0_RESERVED                     = 0x0,
+	TMDS_CTL3_DATA_SEL1_DISPLAY_ENABLE               = 0x1,
+	TMDS_CTL3_DATA_SEL2_VSYNC                        = 0x2,
+	TMDS_CTL3_DATA_SEL3_RESERVED                     = 0x3,
+	TMDS_CTL3_DATA_SEL4_HSYNC                        = 0x4,
+	TMDS_CTL3_DATA_SEL5_SEL7_RESERVED                = 0x5,
+	TMDS_CTL3_DATA_SEL8_BLANK_TIME                   = 0x6,
+	TMDS_CTL3_DATA_SEL9_SEL15_RESERVED               = 0x7,
+} TMDS_CTL3_DATA_SEL;
+typedef enum DIG_FE_CNTL_SOURCE_SELECT {
+	DIG_FE_SOURCE_FROM_FMT0                          = 0x0,
+	DIG_FE_SOURCE_FROM_FMT1                          = 0x1,
+	DIG_FE_SOURCE_FROM_FMT2                          = 0x2,
+	DIG_FE_SOURCE_FROM_FMT3                          = 0x3,
+} DIG_FE_CNTL_SOURCE_SELECT;
+typedef enum DIG_FE_CNTL_STEREOSYNC_SELECT {
+	DIG_FE_STEREOSYNC_FROM_FMT0                      = 0x0,
+	DIG_FE_STEREOSYNC_FROM_FMT1                      = 0x1,
+	DIG_FE_STEREOSYNC_FROM_FMT2                      = 0x2,
+	DIG_FE_STEREOSYNC_FROM_FMT3                      = 0x3,
+} DIG_FE_CNTL_STEREOSYNC_SELECT;
+typedef enum DIG_FIFO_READ_CLOCK_SRC {
+	DIG_FIFO_READ_CLOCK_SRC_FROM_DCCG                = 0x0,
+	DIG_FIFO_READ_CLOCK_SRC_FROM_DISPLAY_PIPE        = 0x1,
+} DIG_FIFO_READ_CLOCK_SRC;
+typedef enum DIG_OUTPUT_CRC_CNTL_LINK_SEL {
+	DIG_OUTPUT_CRC_ON_LINK0                          = 0x0,
+	DIG_OUTPUT_CRC_ON_LINK1                          = 0x1,
+} DIG_OUTPUT_CRC_CNTL_LINK_SEL;
+typedef enum DIG_OUTPUT_CRC_DATA_SEL {
+	DIG_OUTPUT_CRC_FOR_FULLFRAME                     = 0x0,
+	DIG_OUTPUT_CRC_FOR_ACTIVEONLY                    = 0x1,
+	DIG_OUTPUT_CRC_FOR_VBI                           = 0x2,
+	DIG_OUTPUT_CRC_FOR_AUDIO                         = 0x3,
+} DIG_OUTPUT_CRC_DATA_SEL;
+typedef enum DIG_TEST_PATTERN_TEST_PATTERN_OUT_EN {
+	DIG_IN_NORMAL_OPERATION                          = 0x0,
+	DIG_IN_DEBUG_MODE                                = 0x1,
+} DIG_TEST_PATTERN_TEST_PATTERN_OUT_EN;
+typedef enum DIG_TEST_PATTERN_HALF_CLOCK_PATTERN_SEL {
+	DIG_10BIT_TEST_PATTERN                           = 0x0,
+	DIG_ALTERNATING_TEST_PATTERN                     = 0x1,
+} DIG_TEST_PATTERN_HALF_CLOCK_PATTERN_SEL;
+typedef enum DIG_TEST_PATTERN_RANDOM_PATTERN_OUT_EN {
+	DIG_TEST_PATTERN_NORMAL                          = 0x0,
+	DIG_TEST_PATTERN_RANDOM                          = 0x1,
+} DIG_TEST_PATTERN_RANDOM_PATTERN_OUT_EN;
+typedef enum DIG_TEST_PATTERN_RANDOM_PATTERN_RESET {
+	DIG_RANDOM_PATTERN_ENABLED                       = 0x0,
+	DIG_RANDOM_PATTERN_RESETED                       = 0x1,
+} DIG_TEST_PATTERN_RANDOM_PATTERN_RESET;
+typedef enum DIG_TEST_PATTERN_EXTERNAL_RESET_EN {
+	DIG_TEST_PATTERN_EXTERNAL_RESET_ENABLE           = 0x0,
+	DIG_TEST_PATTERN_EXTERNAL_RESET_BY_EXT_SIG       = 0x1,
+} DIG_TEST_PATTERN_EXTERNAL_RESET_EN;
+typedef enum DIG_RANDOM_PATTERN_SEED_RAN_PAT {
+	DIG_RANDOM_PATTERN_SEED_RAN_PAT_ALL_PIXELS       = 0x0,
+	DIG_RANDOM_PATTERN_SEED_RAN_PAT_DE_HIGH          = 0x1,
+} DIG_RANDOM_PATTERN_SEED_RAN_PAT;
+typedef enum DIG_FIFO_STATUS_USE_OVERWRITE_LEVEL {
+	DIG_FIFO_USE_OVERWRITE_LEVEL                     = 0x0,
+	DIG_FIFO_USE_CAL_AVERAGE_LEVEL                   = 0x1,
+} DIG_FIFO_STATUS_USE_OVERWRITE_LEVEL;
+typedef enum DIG_FIFO_ERROR_ACK {
+	DIG_FIFO_ERROR_ACK_INT                           = 0x0,
+	DIG_FIFO_ERROR_NOT_ACK                           = 0x1,
+} DIG_FIFO_ERROR_ACK;
+typedef enum DIG_FIFO_STATUS_FORCE_RECAL_AVERAGE {
+	DIG_FIFO_NOT_FORCE_RECAL_AVERAGE                 = 0x0,
+	DIG_FIFO_FORCE_RECAL_AVERAGE_LEVEL               = 0x1,
+} DIG_FIFO_STATUS_FORCE_RECAL_AVERAGE;
+typedef enum DIG_FIFO_STATUS_FORCE_RECOMP_MINMAX {
+	DIG_FIFO_NOT_FORCE_RECOMP_MINMAX                 = 0x0,
+	DIG_FIFO_FORCE_RECOMP_MINMAX                     = 0x1,
+} DIG_FIFO_STATUS_FORCE_RECOMP_MINMAX;
+typedef enum DIG_DISPCLK_SWITCH_CNTL_SWITCH_POINT {
+	DIG_DISPCLK_SWITCH_AT_EARLY_VBLANK               = 0x0,
+	DIG_DISPCLK_SWITCH_AT_FIRST_HSYNC                = 0x1,
+} DIG_DISPCLK_SWITCH_CNTL_SWITCH_POINT;
+typedef enum DIG_DISPCLK_SWITCH_ALLOWED_INT_ACK {
+	DIG_DISPCLK_SWITCH_ALLOWED_ACK_INT               = 0x0,
+	DIG_DISPCLK_SWITCH_ALLOWED_INT_NOT_ACK           = 0x1,
+} DIG_DISPCLK_SWITCH_ALLOWED_INT_ACK;
+typedef enum DIG_DISPCLK_SWITCH_ALLOWED_INT_MASK {
+	DIG_DISPCLK_SWITCH_ALLOWED_MASK_INT              = 0x0,
+	DIG_DISPCLK_SWITCH_ALLOWED_INT_UNMASK            = 0x1,
+} DIG_DISPCLK_SWITCH_ALLOWED_INT_MASK;
+typedef enum AFMT_INTERRUPT_STATUS_CHG_MASK {
+	AFMT_INTERRUPT_DISABLE                           = 0x0,
+	AFMT_INTERRUPT_ENABLE                            = 0x1,
+} AFMT_INTERRUPT_STATUS_CHG_MASK;
+typedef enum HDMI_GC_AVMUTE {
+	HDMI_GC_AVMUTE_SET                               = 0x0,
+	HDMI_GC_AVMUTE_UNSET                             = 0x1,
+} HDMI_GC_AVMUTE;
+typedef enum HDMI_DEFAULT_PAHSE {
+	HDMI_DEFAULT_PHASE_IS_0                          = 0x0,
+	HDMI_DEFAULT_PHASE_IS_1                          = 0x1,
+} HDMI_DEFAULT_PAHSE;
+typedef enum AFMT_AUDIO_PACKET_CONTROL2_AUDIO_LAYOUT_OVRD {
+	AFMT_AUDIO_LAYOUT_DETERMINED_BY_AZ_AUDIO_CHANNEL_STATUS= 0x0,
+	AFMT_AUDIO_LAYOUT_OVRD_BY_REGISTER               = 0x1,
+} AFMT_AUDIO_PACKET_CONTROL2_AUDIO_LAYOUT_OVRD;
+typedef enum AUDIO_LAYOUT_SELECT {
+	AUDIO_LAYOUT_0                                   = 0x0,
+	AUDIO_LAYOUT_1                                   = 0x1,
+} AUDIO_LAYOUT_SELECT;
+typedef enum AFMT_AUDIO_CRC_CONTROL_CONT {
+	AFMT_AUDIO_CRC_ONESHOT                           = 0x0,
+	AFMT_AUDIO_CRC_AUTO_RESTART                      = 0x1,
+} AFMT_AUDIO_CRC_CONTROL_CONT;
+typedef enum AFMT_AUDIO_CRC_CONTROL_SOURCE {
+	AFMT_AUDIO_CRC_SOURCE_FROM_FIFO_INPUT            = 0x0,
+	AFMT_AUDIO_CRC_SOURCE_

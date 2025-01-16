@@ -1,3889 +1,3554 @@
-/***************************************************************************
+/*
+ * Cryptographic API.
  *
- * Copyright (c) 2014 - 2020 Samsung Electronics Co., Ltd. All rights reserved
+ * RIPEMD-256 - RACE Integrity Primitives Evaluation Message Digest.
  *
- ****************************************************************************/
+ * Based on the reference implementation by Antoon Bosselaers, ESAT-COSIC
+ *
+ * Copyright (c) 2008 Adrian-Ken Rueegsegger <ken@codelabs.ch>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ */
+#include <crypto/internal/hash.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/mm.h>
+#include <linux/types.h>
+#include <asm/byteorder.h>
 
-#include <linux/version.h>
-#include <net/cfg80211.h>
-#include <linux/etherdevice.h>
-#include "dev.h"
-#include "cfg80211_ops.h"
-#include "debug.h"
-#include "mgt.h"
-#include "mlme.h"
-#include "netif.h"
-#include "unifiio.h"
-#include "mib.h"
+#include "ripemd.h"
 
-#include "scsc_wifilogger_rings.h"
-#include "nl80211_vendor.h"
+struct rmd256_ctx {
+	u64 byte_count;
+	u32 state[8];
+	__le32 buffer[16];
+};
 
-#define SLSI_MAX_CHAN_2G_BAND          14
-/* TODO: Remove after FAPI update */
-#define SLSI_SCANTYPE_SINGLE_CHANNEL_SCAN   0x0013
+#define K1  RMD_K1
+#define K2  RMD_K2
+#define K3  RMD_K3
+#define K4  RMD_K4
+#define KK1 RMD_K6
+#define KK2 RMD_K7
+#define KK3 RMD_K8
+#define KK4 RMD_K1
 
-/* Ext capab is decided by firmware. But there are certain bits
- * which are set by supplicant. So we set the capab and mask in
- * such way so that supplicant sets only the bits our solution supports
+#define F1(x, y, z) (x ^ y ^ z)		/* XOR */
+#define F2(x, y, z) (z ^ (x & (y ^ z)))	/* x ? y : z */
+#define F3(x, y, z) ((x | ~y) ^ z)
+#define F4(x, y, z) (y ^ (z & (x ^ y)))	/* z ? x : y */
+
+#define ROUND(a, b, c, d, f, k, x, s)  { \
+	(a) += f((b), (c), (d)) + le32_to_cpup(&(x)) + (k); \
+	(a) = rol32((a), (s)); \
+}
+
+static void rmd256_transform(u32 *state, const __le32 *in)
+{
+	u32 aa, bb, cc, dd, aaa, bbb, ccc, ddd, tmp;
+
+	/* Initialize left lane */
+	aa = state[0];
+	bb = state[1];
+	cc = state[2];
+	dd = state[3];
+
+	/* Initialize right lane */
+	aaa = state[4];
+	bbb = state[5];
+	ccc = state[6];
+	ddd = state[7];
+
+	/* round 1: left lane */
+	ROUND(aa, bb, cc, dd, F1, K1, in[0],  11);
+	ROUND(dd, aa, bb, cc, F1, K1, in[1],  14);
+	ROUND(cc, dd, aa, bb, F1, K1, in[2],  15);
+	ROUND(bb, cc, dd, aa, F1, K1, in[3],  12);
+	ROUND(aa, bb, cc, dd, F1, K1, in[4],   5);
+	ROUND(dd, aa, bb, cc, F1, K1, in[5],   8);
+	ROUND(cc, dd, aa, bb, F1, K1, in[6],   7);
+	ROUND(bb, cc, dd, aa, F1, K1, in[7],   9);
+	ROUND(aa, bb, cc, dd, F1, K1, in[8],  11);
+	ROUND(dd, aa, bb, cc, F1, K1, in[9],  13);
+	ROUND(cc, dd, aa, bb, F1, K1, in[10], 14);
+	ROUND(bb, cc, dd, aa, F1, K1, in[11], 15);
+	ROUND(aa, bb, cc, dd, F1, K1, in[12],  6);
+	ROUND(dd, aa, bb, cc, F1, K1, in[13],  7);
+	ROUND(cc, dd, aa, bb, F1, K1, in[14],  9);
+	ROUND(bb, cc, dd, aa, F1, K1, in[15],  8);
+
+	/* round 1: right lane */
+	ROUND(aaa, bbb, ccc, ddd, F4, KK1, in[5],   8);
+	ROUND(ddd, aaa, bbb, ccc, F4, KK1, in[14],  9);
+	ROUND(ccc, ddd, aaa, bbb, F4, KK1, in[7],   9);
+	ROUND(bbb, ccc, ddd, aaa, F4, KK1, in[0],  11);
+	ROUND(aaa, bbb, ccc, ddd, F4, KK1, in[9],  13);
+	ROUND(ddd, aaa, bbb, ccc, F4, KK1, in[2],  15);
+	ROUND(ccc, ddd, aaa, bbb, F4, KK1, in[11], 15);
+	ROUND(bbb, ccc, ddd, aaa, F4, KK1, in[4],   5);
+	ROUND(aaa, bbb, ccc, ddd, F4, KK1, in[13],  7);
+	ROUND(ddd, aaa, bbb, ccc, F4, KK1, in[6],   7);
+	ROUND(ccc, ddd, aaa, bbb, F4, KK1, in[15],  8);
+	ROUND(bbb, ccc, ddd, aaa, F4, KK1, in[8],  11);
+	ROUND(aaa, bbb, ccc, ddd, F4, KK1, in[1],  14);
+	ROUND(ddd, aaa, bbb, ccc, F4, KK1, in[10], 14);
+	ROUND(ccc, ddd, aaa, bbb, F4, KK1, in[3],  12);
+	ROUND(bbb, ccc, ddd, aaa, F4, KK1, in[12],  6);
+
+	/* Swap contents of "a" registers */
+	tmp = aa; aa = aaa; aaa = tmp;
+
+	/* round 2: left lane */
+	ROUND(aa, bb, cc, dd, F2, K2, in[7],   7);
+	ROUND(dd, aa, bb, cc, F2, K2, in[4],   6);
+	ROUND(cc, dd, aa, bb, F2, K2, in[13],  8);
+	ROUND(bb, cc, dd, aa, F2, K2, in[1],  13);
+	ROUND(aa, bb, cc, dd, F2, K2, in[10], 11);
+	ROUND(dd, aa, bb, cc, F2, K2, in[6],   9);
+	ROUND(cc, dd, aa, bb, F2, K2, in[15],  7);
+	ROUND(bb, cc, dd, aa, F2, K2, in[3],  15);
+	ROUND(aa, bb, cc, dd, F2, K2, in[12],  7);
+	ROUND(dd, aa, bb, cc, F2, K2, in[0],  12);
+	ROUND(cc, dd, aa, bb, F2, K2, in[9],  15);
+	ROUND(bb, cc, dd, aa, F2, K2, in[5],   9);
+	ROUND(aa, bb, cc, dd, F2, K2, in[2],  11);
+	ROUND(dd, aa, bb, cc, F2, K2, in[14],  7);
+	ROUND(cc, dd, aa, bb, F2, K2, in[11], 13);
+	ROUND(bb, cc, dd, aa, F2, K2, in[8],  12);
+
+	/* round 2: right lane */
+	ROUND(aaa, bbb, ccc, ddd, F3, KK2, in[6],   9);
+	ROUND(ddd, aaa, bbb, ccc, F3, KK2, in[11], 13);
+	ROUND(ccc, ddd, aaa, bbb, F3, KK2, in[3],  15);
+	ROUND(bbb, ccc, ddd, aaa, F3, KK2, in[7],   7);
+	ROUND(aaa, bbb, ccc, ddd, F3, KK2, in[0],  12);
+	ROUND(ddd, aaa, bbb, ccc, F3, KK2, in[13],  8);
+	ROUND(ccc, ddd, aaa, bbb, F3, KK2, in[5],   9);
+	ROUND(bbb, ccc, ddd, aaa, F3, KK2, in[10], 11);
+	ROUND(aaa, bbb, ccc, ddd, F3, KK2, in[14],  7);
+	ROUND(ddd, aaa, bbb, ccc, F3, KK2, in[15],  7);
+	ROUND(ccc, ddd, aaa, bbb, F3, KK2, in[8],  12);
+	ROUND(bbb, ccc, ddd, aaa, F3, KK2, in[12],  7);
+	ROUND(aaa, bbb, ccc, ddd, F3, KK2, in[4],   6);
+	ROUND(ddd, aaa, bbb, ccc, F3, KK2, in[9],  15);
+	ROUND(ccc, ddd, aaa, bbb, F3, KK2, in[1],  13);
+	ROUND(bbb, ccc, ddd, aaa, F3, KK2, in[2],  11);
+
+	/* Swap contents of "b" registers */
+	tmp = bb; bb = bbb; bbb = tmp;
+
+	/* round 3: left lane */
+	ROUND(aa, bb, cc, dd, F3, K3, in[3],  11);
+	ROUND(dd, aa, bb, cc, F3, K3, in[10], 13);
+	ROUND(cc, dd, aa, bb, F3, K3, in[14],  6);
+	ROUND(bb, cc, dd, aa, F3, K3, in[4],   7);
+	ROUND(aa, bb, cc, dd, F3, K3, in[9],  14);
+	ROUND(dd, aa, bb, cc, F3, K3, in[15],  9);
+	ROUND(cc, dd, aa, bb, F3, K3, in[8],  13);
+	ROUND(bb, cc, dd, aa, F3, K3, in[1],  15);
+	ROUND(aa, bb, cc, dd, F3, K3, in[2],  14);
+	ROUND(dd, aa, bb, cc, F3, K3, in[7],   8);
+	ROUND(cc, dd, aa, bb, F3, K3, in[0],  13);
+	ROUND(bb, cc, dd, aa, F3, K3, in[6],   6);
+	ROUND(aa, bb, cc, dd, F3, K3, in[13],  5);
+	ROUND(dd, aa, bb, cc, F3, K3, in[11], 12);
+	ROUND(cc, dd, aa, bb, F3, K3, in[5],   7);
+	ROUND(bb, cc, dd, aa, F3, K3, in[12],  5);
+
+	/* round 3: right lane */
+	ROUND(aaa, bbb, ccc, ddd, F2, KK3, in[15],  9);
+	ROUND(ddd, aaa, bbb, ccc, F2, KK3, in[5],   7);
+	ROUND(ccc, ddd, aaa, bbb, F2, KK3, in[1],  15);
+	ROUND(bbb, ccc, ddd, aaa, F2, KK3, in[3],  11);
+	ROUND(aaa, bbb, ccc, ddd, F2, KK3, in[7],   8);
+	ROUND(ddd, aaa, bbb, ccc, F2, KK3, in[14],  6);
+	ROUND(ccc, ddd, aaa, bbb, F2, KK3, in[6],   6);
+	ROUND(bbb, ccc, ddd, aaa, F2, KK3, in[9],  14);
+	ROUND(aaa, bbb, ccc, ddd, F2, KK3, in[11], 12);
+	ROUND(ddd, aaa, bbb, ccc, F2, KK3, in[8],  13);
+	ROUND(ccc, ddd, aaa, bbb, F2, KK3, in[12],  5);
+	ROUND(bbb, ccc, ddd, aaa, F2, KK3, in[2],  14);
+	ROUND(aaa, bbb, ccc, ddd, F2, KK3, in[10], 13);
+	ROUND(ddd, aaa, bbb, ccc, F2, KK3, in[0],  13);
+	ROUND(ccc, ddd, aaa, bbb, F2, KK3, in[4],   7);
+	ROUND(bbb, ccc, ddd, aaa, F2, KK3, in[13],  5);
+
+	/* Swap contents of "c" registers */
+	tmp = cc; cc = ccc; ccc = tmp;
+
+	/* round 4: left lane */
+	ROUND(aa, bb, cc, dd, F4, K4, in[1],  11);
+	ROUND(dd, aa, bb, cc, F4, K4, in[9],  12);
+	ROUND(cc, dd, aa, bb, F4, K4, in[11], 14);
+	ROUND(bb, cc, dd, aa, F4, K4, in[10], 15);
+	ROUND(aa, bb, cc, dd, F4, K4, in[0],  14);
+	ROUND(dd, aa, bb, cc, F4, K4, in[8],  15);
+	ROUND(cc, dd, aa, bb, F4, K4, in[12],  9);
+	ROUND(bb, cc, dd, aa, F4, K4, in[4],   8);
+	ROUND(aa, bb, cc, dd, F4, K4, in[13],  9);
+	ROUND(dd, aa, bb, cc, F4, K4, in[3],  14);
+	ROUND(cc, dd, aa, bb, F4, K4, in[7],   5);
+	ROUND(bb, cc, dd, aa, F4, K4, in[15],  6);
+	ROUND(aa, bb, cc, dd, F4, K4, in[14],  8);
+	ROUND(dd, aa, bb, cc, F4, K4, in[5],   6);
+	ROUND(cc, dd, aa, bb, F4, K4, in[6],   5);
+	ROUND(bb, cc, dd, aa, F4, K4, in[2],  12);
+
+	/* round 4: right lane */
+	ROUND(aaa, bbb, ccc, ddd, F1, KK4, in[8],  15);
+	ROUND(ddd, aaa, bbb, ccc, F1, KK4, in[6],   5);
+	ROUND(ccc, ddd, aaa, bbb, F1, KK4, in[4],   8);
+	ROUND(bbb, ccc, ddd, aaa, F1, KK4, in[1],  11);
+	ROUND(aaa, bbb, ccc, ddd, F1, KK4, in[3],  14);
+	ROUND(ddd, aaa, bbb, ccc, F1, KK4, in[11], 14);
+	ROUND(ccc, ddd, aaa, bbb, F1, KK4, in[15],  6);
+	ROUND(bbb, ccc, ddd, aaa, F1, KK4, in[0],  14);
+	ROUND(aaa, bbb, ccc, ddd, F1, KK4, in[5],   6);
+	ROUND(ddd, aaa, bbb, ccc, F1, KK4, in[12],  9);
+	ROUND(ccc, ddd, aaa, bbb, F1, KK4, in[2],  12);
+	ROUND(bbb, ccc, ddd, aaa, F1, KK4, in[13],  9);
+	ROUND(aaa, bbb, ccc, ddd, F1, KK4, in[9],  12);
+	ROUND(ddd, aaa, bbb, ccc, F1, KK4, in[7],   5);
+	ROUND(ccc, ddd, aaa, bbb, F1, KK4, in[10], 15);
+	ROUND(bbb, ccc, ddd, aaa, F1, KK4, in[14],  8);
+
+	/* Swap contents of "d" registers */
+	tmp = dd; dd = ddd; ddd = tmp;
+
+	/* combine results */
+	state[0] += aa;
+	state[1] += bb;
+	state[2] += cc;
+	state[3] += dd;
+	state[4] += aaa;
+	state[5] += bbb;
+	state[6] += ccc;
+	state[7] += ddd;
+
+	return;
+}
+
+static int rmd256_init(struct shash_desc *desc)
+{
+	struct rmd256_ctx *rctx = shash_desc_ctx(desc);
+
+	rctx->byte_count = 0;
+
+	rctx->state[0] = RMD_H0;
+	rctx->state[1] = RMD_H1;
+	rctx->state[2] = RMD_H2;
+	rctx->state[3] = RMD_H3;
+	rctx->state[4] = RMD_H5;
+	rctx->state[5] = RMD_H6;
+	rctx->state[6] = RMD_H7;
+	rctx->state[7] = RMD_H8;
+
+	memset(rctx->buffer, 0, sizeof(rctx->buffer));
+
+	return 0;
+}
+
+static int rmd256_update(struct shash_desc *desc, const u8 *data,
+			 unsigned int len)
+{
+	struct rmd256_ctx *rctx = shash_desc_ctx(desc);
+	const u32 avail = sizeof(rctx->buffer) - (rctx->byte_count & 0x3f);
+
+	rctx->byte_count += len;
+
+	/* Enough space in buffer? If so copy and we're done */
+	if (avail > len) {
+		memcpy((char *)rctx->buffer + (sizeof(rctx->buffer) - avail),
+		       data, len);
+		goto out;
+	}
+
+	memcpy((char *)rctx->buffer + (sizeof(rctx->buffer) - avail),
+	       data, avail);
+
+	rmd256_transform(rctx->state, rctx->buffer);
+	data += avail;
+	len -= avail;
+
+	while (len >= sizeof(rctx->buffer)) {
+		memcpy(rctx->buffer, data, sizeof(rctx->buffer));
+		rmd256_transform(rctx->state, rctx->buffer);
+		data += sizeof(rctx->buffer);
+		len -= sizeof(rctx->buffer);
+	}
+
+	memcpy(rctx->buffer, data, len);
+
+out:
+	return 0;
+}
+
+/* Add padding and return the message digest. */
+static int rmd256_final(struct shash_desc *desc, u8 *out)
+{
+	struct rmd256_ctx *rctx = shash_desc_ctx(desc);
+	u32 i, index, padlen;
+	__le64 bits;
+	__le32 *dst = (__le32 *)out;
+	static const u8 padding[64] = { 0x80, };
+
+	bits = cpu_to_le64(rctx->byte_count << 3);
+
+	/* Pad out to 56 mod 64 */
+	index = rctx->byte_count & 0x3f;
+	padlen = (index < 56) ? (56 - index) : ((64+56) - index);
+	rmd256_update(desc, padding, padlen);
+
+	/* Append length */
+	rmd256_update(desc, (const u8 *)&bits, sizeof(bits));
+
+	/* Store state in digest */
+	for (i = 0; i < 8; i++)
+		dst[i] = cpu_to_le32p(&rctx->state[i]);
+
+	/* Wipe context */
+	memset(rctx, 0, sizeof(*rctx));
+
+	return 0;
+}
+
+static struct shash_alg alg = {
+	.digestsize	=	RMD256_DIGEST_SIZE,
+	.init		=	rmd256_init,
+	.update		=	rmd256_update,
+	.final		=	rmd256_final,
+	.descsize	=	sizeof(struct rmd256_ctx),
+	.base		=	{
+		.cra_name	 =	"rmd256",
+		.cra_flags	 =	CRYPTO_ALG_TYPE_SHASH,
+		.cra_blocksize	 =	RMD256_BLOCK_SIZE,
+		.cra_module	 =	THIS_MODULE,
+	}
+};
+
+static int __init rmd256_mod_init(void)
+{
+	return crypto_register_shash(&alg);
+}
+
+static void __exit rmd256_mod_fini(void)
+{
+	crypto_unregister_shash(&alg);
+}
+
+module_init(rmd256_mod_init);
+module_exit(rmd256_mod_fini);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Adrian-Ken Rueegsegger <ken@codelabs.ch>");
+MODULE_DESCRIPTION("RIPEMD-256 Message Digest");
+MODULE_ALIAS_CRYPTO("rmd256");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Cryptographic API.
+ *
+ * RIPEMD-320 - RACE Integrity Primitives Evaluation Message Digest.
+ *
+ * Based on the reference implementation by Antoon Bosselaers, ESAT-COSIC
+ *
+ * Copyright (c) 2008 Adrian-Ken Rueegsegger <ken@codelabs.ch>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ */
+#include <crypto/internal/hash.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/mm.h>
+#include <linux/types.h>
+#include <asm/byteorder.h>
+
+#include "ripemd.h"
+
+struct rmd320_ctx {
+	u64 byte_count;
+	u32 state[10];
+	__le32 buffer[16];
+};
+
+#define K1  RMD_K1
+#define K2  RMD_K2
+#define K3  RMD_K3
+#define K4  RMD_K4
+#define K5  RMD_K5
+#define KK1 RMD_K6
+#define KK2 RMD_K7
+#define KK3 RMD_K8
+#define KK4 RMD_K9
+#define KK5 RMD_K1
+
+#define F1(x, y, z) (x ^ y ^ z)		/* XOR */
+#define F2(x, y, z) (z ^ (x & (y ^ z)))	/* x ? y : z */
+#define F3(x, y, z) ((x | ~y) ^ z)
+#define F4(x, y, z) (y ^ (z & (x ^ y)))	/* z ? x : y */
+#define F5(x, y, z) (x ^ (y | ~z))
+
+#define ROUND(a, b, c, d, e, f, k, x, s)  { \
+	(a) += f((b), (c), (d)) + le32_to_cpup(&(x)) + (k); \
+	(a) = rol32((a), (s)) + (e); \
+	(c) = rol32((c), 10); \
+}
+
+static void rmd320_transform(u32 *state, const __le32 *in)
+{
+	u32 aa, bb, cc, dd, ee, aaa, bbb, ccc, ddd, eee, tmp;
+
+	/* Initialize left lane */
+	aa = state[0];
+	bb = state[1];
+	cc = state[2];
+	dd = state[3];
+	ee = state[4];
+
+	/* Initialize right lane */
+	aaa = state[5];
+	bbb = state[6];
+	ccc = state[7];
+	ddd = state[8];
+	eee = state[9];
+
+	/* round 1: left lane */
+	ROUND(aa, bb, cc, dd, ee, F1, K1, in[0],  11);
+	ROUND(ee, aa, bb, cc, dd, F1, K1, in[1],  14);
+	ROUND(dd, ee, aa, bb, cc, F1, K1, in[2],  15);
+	ROUND(cc, dd, ee, aa, bb, F1, K1, in[3],  12);
+	ROUND(bb, cc, dd, ee, aa, F1, K1, in[4],   5);
+	ROUND(aa, bb, cc, dd, ee, F1, K1, in[5],   8);
+	ROUND(ee, aa, bb, cc, dd, F1, K1, in[6],   7);
+	ROUND(dd, ee, aa, bb, cc, F1, K1, in[7],   9);
+	ROUND(cc, dd, ee, aa, bb, F1, K1, in[8],  11);
+	ROUND(bb, cc, dd, ee, aa, F1, K1, in[9],  13);
+	ROUND(aa, bb, cc, dd, ee, F1, K1, in[10], 14);
+	ROUND(ee, aa, bb, cc, dd, F1, K1, in[11], 15);
+	ROUND(dd, ee, aa, bb, cc, F1, K1, in[12],  6);
+	ROUND(cc, dd, ee, aa, bb, F1, K1, in[13],  7);
+	ROUND(bb, cc, dd, ee, aa, F1, K1, in[14],  9);
+	ROUND(aa, bb, cc, dd, ee, F1, K1, in[15],  8);
+
+	/* round 1: right lane */
+	ROUND(aaa, bbb, ccc, ddd, eee, F5, KK1, in[5],   8);
+	ROUND(eee, aaa, bbb, ccc, ddd, F5, KK1, in[14],  9);
+	ROUND(ddd, eee, aaa, bbb, ccc, F5, KK1, in[7],   9);
+	ROUND(ccc, ddd, eee, aaa, bbb, F5, KK1, in[0],  11);
+	ROUND(bbb, ccc, ddd, eee, aaa, F5, KK1, in[9],  13);
+	ROUND(aaa, bbb, ccc, ddd, eee, F5, KK1, in[2],  15);
+	ROUND(eee, aaa, bbb, ccc, ddd, F5, KK1, in[11], 15);
+	ROUND(ddd, eee, aaa, bbb, ccc, F5, KK1, in[4],   5);
+	ROUND(ccc, ddd, eee, aaa, bbb, F5, KK1, in[13],  7);
+	ROUND(bbb, ccc, ddd, eee, aaa, F5, KK1, in[6],   7);
+	ROUND(aaa, bbb, ccc, ddd, eee, F5, KK1, in[15],  8);
+	ROUND(eee, aaa, bbb, ccc, ddd, F5, KK1, in[8],  11);
+	ROUND(ddd, eee, aaa, bbb, ccc, F5, KK1, in[1],  14);
+	ROUND(ccc, ddd, eee, aaa, bbb, F5, KK1, in[10], 14);
+	ROUND(bbb, ccc, ddd, eee, aaa, F5, KK1, in[3],  12);
+	ROUND(aaa, bbb, ccc, ddd, eee, F5, KK1, in[12],  6);
+
+	/* Swap contents of "a" registers */
+	tmp = aa; aa = aaa; aaa = tmp;
+
+	/* round 2: left lane" */
+	ROUND(ee, aa, bb, cc, dd, F2, K2, in[7],   7);
+	ROUND(dd, ee, aa, bb, cc, F2, K2, in[4],   6);
+	ROUND(cc, dd, ee, aa, bb, F2, K2, in[13],  8);
+	ROUND(bb, cc, dd, ee, aa, F2, K2, in[1],  13);
+	ROUND(aa, bb, cc, dd, ee, F2, K2, in[10], 11);
+	ROUND(ee, aa, bb, cc, dd, F2, K2, in[6],   9);
+	ROUND(dd, ee, aa, bb, cc, F2, K2, in[15],  7);
+	ROUND(cc, dd, ee, aa, bb, F2, K2, in[3],  15);
+	ROUND(bb, cc, dd, ee, aa, F2, K2, in[12],  7);
+	ROUND(aa, bb, cc, dd, ee, F2, K2, in[0],  12);
+	ROUND(ee, aa, bb, cc, dd, F2, K2, in[9],  15);
+	ROUND(dd, ee, aa, bb, cc, F2, K2, in[5],   9);
+	ROUND(cc, dd, ee, aa, bb, F2, K2, in[2],  11);
+	ROUND(bb, cc, dd, ee, aa, F2, K2, in[14],  7);
+	ROUND(aa, bb, cc, dd, ee, F2, K2, in[11], 13);
+	ROUND(ee, aa, bb, cc, dd, F2, K2, in[8],  12);
+
+	/* round 2: right lane */
+	ROUND(eee, aaa, bbb, ccc, ddd, F4, KK2, in[6],   9);
+	ROUND(ddd, eee, aaa, bbb, ccc, F4, KK2, in[11], 13);
+	ROUND(ccc, ddd, eee, aaa, bbb, F4, KK2, in[3],  15);
+	ROUND(bbb, ccc, ddd, eee, aaa, F4, KK2, in[7],   7);
+	ROUND(aaa, bbb, ccc, ddd, eee, F4, KK2, in[0],  12);
+	ROUND(eee, aaa, bbb, ccc, ddd, F4, KK2, in[13],  8);
+	ROUND(ddd, eee, aaa, bbb, ccc, F4, KK2, in[5],   9);
+	ROUND(ccc, ddd, eee, aaa, bbb, F4, KK2, in[10], 11);
+	ROUND(bbb, ccc, ddd, eee, aaa, F4, KK2, in[14],  7);
+	ROUND(aaa, bbb, ccc, ddd, eee, F4, KK2, in[15],  7);
+	ROUND(eee, aaa, bbb, ccc, ddd, F4, KK2, in[8],  12);
+	ROUND(ddd, eee, aaa, bbb, ccc, F4, KK2, in[12],  7);
+	ROUND(ccc, ddd, eee, aaa, bbb, F4, KK2, in[4],   6);
+	ROUND(bbb, ccc, ddd, eee, aaa, F4, KK2, in[9],  15);
+	ROUND(aaa, bbb, ccc, ddd, eee, F4, KK2, in[1],  13);
+	ROUND(eee, aaa, bbb, ccc, ddd, F4, KK2, in[2],  11);
+
+	/* Swap contents of "b" registers */
+	tmp = bb; bb = bbb; bbb = tmp;
+
+	/* round 3: left lane" */
+	ROUND(dd, ee, aa, bb, cc, F3, K3, in[3],  11);
+	ROUND(cc, dd, ee, aa, bb, F3, K3, in[10], 13);
+	ROUND(bb, cc, dd, ee, aa, F3, K3, in[14],  6);
+	ROUND(aa, bb, cc, dd, ee, F3, K3, in[4],   7);
+	ROUND(ee, aa, bb, cc, dd, F3, K3, in[9],  14);
+	ROUND(dd, ee, aa, bb, cc, F3, K3, in[15],  9);
+	ROUND(cc, dd, ee, aa, bb, F3, K3, in[8],  13);
+	ROUND(bb, cc, dd, ee, aa, F3, K3, in[1],  15);
+	ROUND(aa, bb, cc, dd, ee, F3, K3, in[2],  14);
+	ROUND(ee, aa, bb, cc, dd, F3, K3, in[7],   8);
+	ROUND(dd, ee, aa, bb, cc, F3, K3, in[0],  13);
+	ROUND(cc, dd, ee, aa, bb, F3, K3, in[6],   6);
+	ROUND(bb, cc, dd, ee, aa, F3, K3, in[13],  5);
+	ROUND(aa, bb, cc, dd, ee, F3, K3, in[11], 12);
+	ROUND(ee, aa, bb, cc, dd, F3, K3, in[5],   7);
+	ROUND(dd, ee, aa, bb, cc, F3, K3, in[12],  5);
+
+	/* round 3: right lane */
+	ROUND(ddd, eee, aaa, bbb, ccc, F3, KK3, in[15],  9);
+	ROUND(ccc, ddd, eee, aaa, bbb, F3, KK3, in[5],   7);
+	ROUND(bbb, ccc, ddd, eee, aaa, F3, KK3, in[1],  15);
+	ROUND(aaa, bbb, ccc, ddd, eee, F3, KK3, in[3],  11);
+	ROUND(eee, aaa, bbb, ccc, ddd, F3, KK3, in[7],   8);
+	ROUND(ddd, eee, aaa, bbb, ccc, F3, KK3, in[14],  6);
+	ROUND(ccc, ddd, eee, aaa, bbb, F3, KK3, in[6],   6);
+	ROUND(bbb, ccc, ddd, eee, aaa, F3, KK3, in[9],  14);
+	ROUND(aaa, bbb, ccc, ddd, eee, F3, KK3, in[11], 12);
+	ROUND(eee, aaa, bbb, ccc, ddd, F3, KK3, in[8],  13);
+	ROUND(ddd, eee, aaa, bbb, ccc, F3, KK3, in[12],  5);
+	ROUND(ccc, ddd, eee, aaa, bbb, F3, KK3, in[2],  14);
+	ROUND(bbb, ccc, ddd, eee, aaa, F3, KK3, in[10], 13);
+	ROUND(aaa, bbb, ccc, ddd, eee, F3, KK3, in[0],  13);
+	ROUND(eee, aaa, bbb, ccc, ddd, F3, KK3, in[4],   7);
+	ROUND(ddd, eee, aaa, bbb, ccc, F3, KK3, in[13],  5);
+
+	/* Swap contents of "c" registers */
+	tmp = cc; cc = ccc; ccc = tmp;
+
+	/* round 4: left lane" */
+	ROUND(cc, dd, ee, aa, bb, F4, K4, in[1],  11);
+	ROUND(bb, cc, dd, ee, aa, F4, K4, in[9],  12);
+	ROUND(aa, bb, cc, dd, ee, F4, K4, in[11], 14);
+	ROUND(ee, aa, bb, cc, dd, F4, K4, in[10], 15);
+	ROUND(dd, ee, aa, bb, cc, F4, K4, in[0],  14);
+	ROUND(cc, dd, ee, aa, bb, F4, K4, in[8],  15);
+	ROUND(bb, cc, dd, ee, aa, F4, K4, in[12],  9);
+	ROUND(aa, bb, cc, dd, ee, F4, K4, in[4],   8);
+	ROUND(ee, aa, bb, cc, dd, F4, K4, in[13],  9);
+	ROUND(dd, ee, aa, bb, cc, F4, K4, in[3],  14);
+	ROUND(cc, dd, ee, aa, bb, F4, K4, in[7],   5);
+	ROUND(bb, cc, dd, ee, aa, F4, K4, in[15],  6);
+	ROUND(aa, bb, cc, dd, ee, F4, K4, in[14],  8);
+	ROUND(ee, aa, bb, cc, dd, F4, K4, in[5],   6);
+	ROUND(dd, ee, aa, bb, cc, F4, K4, in[6],   5);
+	ROUND(cc, dd, ee, aa, bb, F4, K4, in[2],  12);
+
+	/* round 4: right lane */
+	ROUND(ccc, ddd, eee, aaa, bbb, F2, KK4, in[8],  15);
+	ROUND(bbb, ccc, ddd, eee, aaa, F2, KK4, in[6],   5);
+	ROUND(aaa, bbb, ccc, ddd, eee, F2, KK4, in[4],   8);
+	ROUND(eee, aaa, bbb, ccc, ddd, F2, KK4, in[1],  11);
+	ROUND(ddd, eee, aaa, bbb, ccc, F2, KK4, in[3],  14);
+	ROUND(ccc, ddd, eee, aaa, bbb, F2, KK4, in[11], 14);
+	ROUND(bbb, ccc, ddd, eee, aaa, F2, KK4, in[15],  6);
+	ROUND(aaa, bbb, ccc, ddd, eee, F2, KK4, in[0],  14);
+	ROUND(eee, aaa, bbb, ccc, ddd, F2, KK4, in[5],   6);
+	ROUND(ddd, eee, aaa, bbb, ccc, F2, KK4, in[12],  9);
+	ROUND(ccc, ddd, eee, aaa, bbb, F2, KK4, in[2],  12);
+	ROUND(bbb, ccc, ddd, eee, aaa, F2, KK4, in[13],  9);
+	ROUND(aaa, bbb, ccc, ddd, eee, F2, KK4, in[9],  12);
+	ROUND(eee, aaa, bbb, ccc, ddd, F2, KK4, in[7],   5);
+	ROUND(ddd, eee, aaa, bbb, ccc, F2, KK4, in[10], 15);
+	ROUND(ccc, ddd, eee, aaa, bbb, F2, KK4, in[14],  8);
+
+	/* Swap contents of "d" registers */
+	tmp = dd; dd = ddd; ddd = tmp;
+
+	/* round 5: left lane" */
+	ROUND(bb, cc, dd, ee, aa, F5, K5, in[4],   9);
+	ROUND(aa, bb, cc, dd, ee, F5, K5, in[0],  15);
+	ROUND(ee, aa, bb, cc, dd, F5, K5, in[5],   5);
+	ROUND(dd, ee, aa, bb, cc, F5, K5, in[9],  11);
+	ROUND(cc, dd, ee, aa, bb, F5, K5, in[7],   6);
+	ROUND(bb, cc, dd, ee, aa, F5, K5, in[12],  8);
+	ROUND(aa, bb, cc, dd, ee, F5, K5, in[2],  13);
+	ROUND(ee, aa, bb, cc, dd, F5, K5, in[10], 12);
+	ROUND(dd, ee, aa, bb, cc, F5, K5, in[14],  5);
+	ROUND(cc, dd, ee, aa, bb, F5, K5, in[1],  12);
+	ROUND(bb, cc, dd, ee, aa, F5, K5, in[3],  13);
+	ROUND(aa, bb, cc, dd, ee, F5, K5, in[8],  14);
+	ROUND(ee, aa, bb, cc, dd, F5, K5, in[11], 11);
+	ROUND(dd, ee, aa, bb, cc, F5, K5, in[6],   8);
+	ROUND(cc, dd, ee, aa, bb, F5, K5, in[15],  5);
+	ROUND(bb, cc, dd, ee, aa, F5, K5, in[13],  6);
+
+	/* round 5: right lane */
+	ROUND(bbb, ccc, ddd, eee, aaa, F1, KK5, in[12],  8);
+	ROUND(aaa, bbb, ccc, ddd, eee, F1, KK5, in[15],  5);
+	ROUND(eee, aaa, bbb, ccc, ddd, F1, KK5, in[10], 12);
+	ROUND(ddd, eee, aaa, bbb, ccc, F1, KK5, in[4],   9);
+	ROUND(ccc, ddd, eee, aaa, bbb, F1, KK5, in[1],  12);
+	ROUND(bbb, ccc, ddd, eee, aaa, F1, KK5, in[5],   5);
+	ROUND(aaa, bbb, ccc, ddd, eee, F1, KK5, in[8],  14);
+	ROUND(eee, aaa, bbb, ccc, ddd, F1, KK5, in[7],   6);
+	ROUND(ddd, eee, aaa, bbb, ccc, F1, KK5, in[6],   8);
+	ROUND(ccc, ddd, eee, aaa, bbb, F1, KK5, in[2],  13);
+	ROUND(bbb, ccc, ddd, eee, aaa, F1, KK5, in[13],  6);
+	ROUND(aaa, bbb, ccc, ddd, eee, F1, KK5, in[14],  5);
+	ROUND(eee, aaa, bbb, ccc, ddd, F1, KK5, in[0],  15);
+	ROUND(ddd, eee, aaa, bbb, ccc, F1, KK5, in[3],  13);
+	ROUND(ccc, ddd, eee, aaa, bbb, F1, KK5, in[9],  11);
+	ROUND(bbb, ccc, ddd, eee, aaa, F1, KK5, in[11], 11);
+
+	/* Swap contents of "e" registers */
+	tmp = ee; ee = eee; eee = tmp;
+
+	/* combine results */
+	state[0] += aa;
+	state[1] += bb;
+	state[2] += cc;
+	state[3] += dd;
+	state[4] += ee;
+	state[5] += aaa;
+	state[6] += bbb;
+	state[7] += ccc;
+	state[8] += ddd;
+	state[9] += eee;
+
+	return;
+}
+
+static int rmd320_init(struct shash_desc *desc)
+{
+	struct rmd320_ctx *rctx = shash_desc_ctx(desc);
+
+	rctx->byte_count = 0;
+
+	rctx->state[0] = RMD_H0;
+	rctx->state[1] = RMD_H1;
+	rctx->state[2] = RMD_H2;
+	rctx->state[3] = RMD_H3;
+	rctx->state[4] = RMD_H4;
+	rctx->state[5] = RMD_H5;
+	rctx->state[6] = RMD_H6;
+	rctx->state[7] = RMD_H7;
+	rctx->state[8] = RMD_H8;
+	rctx->state[9] = RMD_H9;
+
+	memset(rctx->buffer, 0, sizeof(rctx->buffer));
+
+	return 0;
+}
+
+static int rmd320_update(struct shash_desc *desc, const u8 *data,
+			 unsigned int len)
+{
+	struct rmd320_ctx *rctx = shash_desc_ctx(desc);
+	const u32 avail = sizeof(rctx->buffer) - (rctx->byte_count & 0x3f);
+
+	rctx->byte_count += len;
+
+	/* Enough space in buffer? If so copy and we're done */
+	if (avail > len) {
+		memcpy((char *)rctx->buffer + (sizeof(rctx->buffer) - avail),
+		       data, len);
+		goto out;
+	}
+
+	memcpy((char *)rctx->buffer + (sizeof(rctx->buffer) - avail),
+	       data, avail);
+
+	rmd320_transform(rctx->state, rctx->buffer);
+	data += avail;
+	len -= avail;
+
+	while (len >= sizeof(rctx->buffer)) {
+		memcpy(rctx->buffer, data, sizeof(rctx->buffer));
+		rmd320_transform(rctx->state, rctx->buffer);
+		data += sizeof(rctx->buffer);
+		len -= sizeof(rctx->buffer);
+	}
+
+	memcpy(rctx->buffer, data, len);
+
+out:
+	return 0;
+}
+
+/* Add padding and return the message digest. */
+static int rmd320_final(struct shash_desc *desc, u8 *out)
+{
+	struct rmd320_ctx *rctx = shash_desc_ctx(desc);
+	u32 i, index, padlen;
+	__le64 bits;
+	__le32 *dst = (__le32 *)out;
+	static const u8 padding[64] = { 0x80, };
+
+	bits = cpu_to_le64(rctx->byte_count << 3);
+
+	/* Pad out to 56 mod 64 */
+	index = rctx->byte_count & 0x3f;
+	padlen = (index < 56) ? (56 - index) : ((64+56) - index);
+	rmd320_update(desc, padding, padlen);
+
+	/* Append length */
+	rmd320_update(desc, (const u8 *)&bits, sizeof(bits));
+
+	/* Store state in digest */
+	for (i = 0; i < 10; i++)
+		dst[i] = cpu_to_le32p(&rctx->state[i]);
+
+	/* Wipe context */
+	memset(rctx, 0, sizeof(*rctx));
+
+	return 0;
+}
+
+static struct shash_alg alg = {
+	.digestsize	=	RMD320_DIGEST_SIZE,
+	.init		=	rmd320_init,
+	.update		=	rmd320_update,
+	.final		=	rmd320_final,
+	.descsize	=	sizeof(struct rmd320_ctx),
+	.base		=	{
+		.cra_name	 =	"rmd320",
+		.cra_flags	 =	CRYPTO_ALG_TYPE_SHASH,
+		.cra_blocksize	 =	RMD320_BLOCK_SIZE,
+		.cra_module	 =	THIS_MODULE,
+	}
+};
+
+static int __init rmd320_mod_init(void)
+{
+	return crypto_register_shash(&alg);
+}
+
+static void __exit rmd320_mod_fini(void)
+{
+	crypto_unregister_shash(&alg);
+}
+
+module_init(rmd320_mod_init);
+module_exit(rmd320_mod_fini);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Adrian-Ken Rueegsegger <ken@codelabs.ch>");
+MODULE_DESCRIPTION("RIPEMD-320 Message Digest");
+MODULE_ALIAS_CRYPTO("rmd320");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Cryptographic API.
+ *
+ * RNG operations.
+ *
+ * Copyright (c) 2008 Neil Horman <nhorman@tuxdriver.com>
+ * Copyright (c) 2015 Herbert Xu <herbert@gondor.apana.org.au>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
  */
 
-static const u8                    slsi_extended_cap[] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+#include <linux/atomic.h>
+#include <crypto/internal/rng.h>
+#include <linux/err.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/random.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/cryptouser.h>
+#include <net/netlink.h>
+
+#include "internal.h"
+
+static DEFINE_MUTEX(crypto_default_rng_lock);
+struct crypto_rng *crypto_default_rng;
+EXPORT_SYMBOL_GPL(crypto_default_rng);
+static int crypto_default_rng_refcnt;
+
+static inline struct crypto_rng *__crypto_rng_cast(struct crypto_tfm *tfm)
+{
+	return container_of(tfm, struct crypto_rng, base);
+}
+
+int crypto_rng_reset(struct crypto_rng *tfm, const u8 *seed, unsigned int slen)
+{
+	u8 *buf = NULL;
+	int err;
+
+	if (!seed && slen) {
+		buf = kmalloc(slen, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+
+		get_random_bytes(buf, slen);
+		seed = buf;
+	}
+
+	err = crypto_rng_alg(tfm)->seed(tfm, seed, slen);
+
+	kzfree(buf);
+	return err;
+}
+EXPORT_SYMBOL_GPL(crypto_rng_reset);
+
+static int crypto_rng_init_tfm(struct crypto_tfm *tfm)
+{
+	return 0;
+}
+
+static unsigned int seedsize(struct crypto_alg *alg)
+{
+	struct rng_alg *ralg = container_of(alg, struct rng_alg, base);
+
+	return ralg->seedsize;
+}
+
+#ifdef CONFIG_NET
+static int crypto_rng_report(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	struct crypto_report_rng rrng;
+
+	strncpy(rrng.type, "rng", sizeof(rrng.type));
+
+	rrng.seedsize = seedsize(alg);
+
+	if (nla_put(skb, CRYPTOCFGA_REPORT_RNG,
+		    sizeof(struct crypto_report_rng), &rrng))
+		goto nla_put_failure;
+	return 0;
+
+nla_put_failure:
+	return -EMSGSIZE;
+}
+#else
+static int crypto_rng_report(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	return -ENOSYS;
+}
+#endif
+
+static void crypto_rng_show(struct seq_file *m, struct crypto_alg *alg)
+	__attribute__ ((unused));
+static void crypto_rng_show(struct seq_file *m, struct crypto_alg *alg)
+{
+	seq_printf(m, "type         : rng\n");
+	seq_printf(m, "seedsize     : %u\n", seedsize(alg));
+}
+
+static const struct crypto_type crypto_rng_type = {
+	.extsize = crypto_alg_extsize,
+	.init_tfm = crypto_rng_init_tfm,
+#ifdef CONFIG_PROC_FS
+	.show = crypto_rng_show,
+#endif
+	.report = crypto_rng_report,
+	.maskclear = ~CRYPTO_ALG_TYPE_MASK,
+	.maskset = CRYPTO_ALG_TYPE_MASK,
+	.type = CRYPTO_ALG_TYPE_RNG,
+	.tfmsize = offsetof(struct crypto_rng, base),
 };
 
-static const u8                    slsi_extended_cap_mask[] = {
-	0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
-};
-
-static uint keep_alive_period = SLSI_P2PGO_KEEP_ALIVE_PERIOD_SEC;
-module_param(keep_alive_period, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(keep_alive_period, "default is 10 seconds");
-
-static bool slsi_is_mhs_active(struct slsi_dev *sdev)
+struct crypto_rng *crypto_alloc_rng(const char *alg_name, u32 type, u32 mask)
 {
-	struct net_device *mhs_dev = sdev->netdev_ap;
-	struct netdev_vif *ndev_vif;
-	bool ret;
+	return crypto_alloc_tfm(alg_name, &crypto_rng_type, type, mask);
+}
+EXPORT_SYMBOL_GPL(crypto_alloc_rng);
 
-	if (mhs_dev) {
-		ndev_vif = netdev_priv(mhs_dev);
-		SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-		ret = ndev_vif->is_available;
-		SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-		return ret;
+int crypto_get_default_rng(void)
+{
+	struct crypto_rng *rng;
+	int err;
+
+	mutex_lock(&crypto_default_rng_lock);
+	if (!crypto_default_rng) {
+		rng = crypto_alloc_rng("stdrng", 0, 0);
+		err = PTR_ERR(rng);
+		if (IS_ERR(rng))
+			goto unlock;
+
+		err = crypto_rng_reset(rng, NULL, crypto_rng_seedsize(rng));
+		if (err) {
+			crypto_free_rng(rng);
+			goto unlock;
+		}
+
+		crypto_default_rng = rng;
 	}
 
-	return 0;
+	crypto_default_rng_refcnt++;
+	err = 0;
+
+unlock:
+	mutex_unlock(&crypto_default_rng_lock);
+
+	return err;
 }
+EXPORT_SYMBOL_GPL(crypto_get_default_rng);
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0))
-struct wireless_dev *slsi_add_virtual_intf(struct wiphy        *wiphy,
-					   const char          *name,
-					   unsigned char       name_assign_type,
-					   enum nl80211_iftype type,
-					   u32                 *flags,
-					   struct vif_params   *params)
+void crypto_put_default_rng(void)
 {
-#else
-struct wireless_dev *slsi_add_virtual_intf(struct wiphy        *wiphy,
-					   const char          *name,
-					   enum nl80211_iftype type,
-					   u32                 *flags,
-					   struct vif_params   *params)
-{
-#endif
-#else
-struct net_device *slsi_add_ virtual_intf(struct wiphy        *wiphy,
-					 char                *name,
-					 enum nl80211_iftype type,
-					 u32                 *flags,
-					 struct vif_params   *params)
-{
-#endif  /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9)) */
-	struct net_device *dev = NULL;
-	struct netdev_vif *ndev_vif = NULL;
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-
-	SLSI_UNUSED_PARAMETER(flags);
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "Intf name:%s, type:%d, macaddr:%pM\n", name, type, params->macaddr);
-	if (slsi_is_mhs_active(sdev)) {
-		SLSI_ERR(sdev, "MHS is active. cannot add new interface\n");
-		return ERR_PTR(-EOPNOTSUPP);
-	}
-	dev = slsi_dynamic_interface_create(wiphy, name, type, params);
-	if (!dev)
-		goto exit_with_error;
-	ndev_vif = netdev_priv(dev);
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	return &ndev_vif->wdev;
-#else
-	return dev;
-#endif  /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9)) */
-
-exit_with_error:
-	return ERR_PTR(-ENODEV);
+	mutex_lock(&crypto_default_rng_lock);
+	crypto_default_rng_refcnt--;
+	mutex_unlock(&crypto_default_rng_lock);
 }
+EXPORT_SYMBOL_GPL(crypto_put_default_rng);
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-int slsi_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wdev)
+#if defined(CONFIG_CRYPTO_RNG) || defined(CONFIG_CRYPTO_RNG_MODULE)
+int crypto_del_default_rng(void)
 {
-	struct net_device *dev = wdev->netdev;
+	int err = -EBUSY;
 
-#else
-int slsi_del_virtual_intf(struct wiphy *wiphy, struct net_device *dev)
-{
+	mutex_lock(&crypto_default_rng_lock);
+	if (crypto_default_rng_refcnt)
+		goto out;
+
+	crypto_free_rng(crypto_default_rng);
+	crypto_default_rng = NULL;
+
+	err = 0;
+
+out:
+	mutex_unlock(&crypto_default_rng_lock);
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(crypto_del_default_rng);
 #endif
-	struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
 
-	if (WARN_ON(!dev))
+int crypto_register_rng(struct rng_alg *alg)
+{
+	struct crypto_alg *base = &alg->base;
+
+	if (alg->seedsize > PAGE_SIZE / 8)
 		return -EINVAL;
 
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "Dev name:%s\n", dev->name);
+	base->cra_type = &crypto_rng_type;
+	base->cra_flags &= ~CRYPTO_ALG_TYPE_MASK;
+	base->cra_flags |= CRYPTO_ALG_TYPE_RNG;
 
-	slsi_stop_net_dev(sdev, dev);
-	slsi_netif_remove_rtlnl_locked(sdev, dev);
-	SLSI_MUTEX_LOCK(sdev->netdev_add_remove_mutex);
-	if (dev == sdev->netdev_ap)
-		rcu_assign_pointer(sdev->netdev_ap, NULL);
-	if (!sdev->netdev[SLSI_NET_INDEX_P2PX_SWLAN])
-		rcu_assign_pointer(sdev->netdev[SLSI_NET_INDEX_P2PX_SWLAN], sdev->netdev_ap);
-	SLSI_MUTEX_UNLOCK(sdev->netdev_add_remove_mutex);
-
-	return 0;
+	return crypto_register_alg(base);
 }
+EXPORT_SYMBOL_GPL(crypto_register_rng);
 
-int slsi_change_virtual_intf(struct wiphy *wiphy,
-			     struct net_device *dev,
-			     enum nl80211_iftype type, u32 *flags,
-			     struct vif_params *params)
+void crypto_unregister_rng(struct rng_alg *alg)
 {
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	int               r = 0;
-
-	SLSI_UNUSED_PARAMETER(flags);
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "type:%u, iftype:%d\n", type, ndev_vif->iftype);
-
-	if (WARN_ON(ndev_vif->activated)) {
-		r = -EINVAL;
-		goto exit;
-	}
-
-	switch (type) {
-	case NL80211_IFTYPE_UNSPECIFIED:
-	case NL80211_IFTYPE_ADHOC:
-	case NL80211_IFTYPE_STATION:
-	case NL80211_IFTYPE_AP:
-	case NL80211_IFTYPE_P2P_CLIENT:
-	case NL80211_IFTYPE_P2P_GO:
-		ndev_vif->iftype = type;
-		dev->ieee80211_ptr->iftype = type;
-		if (params)
-			dev->ieee80211_ptr->use_4addr = params->use_4addr;
-		break;
-	default:
-		r = -EINVAL;
-		break;
-	}
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
+	crypto_unregister_alg(&alg->base);
 }
+EXPORT_SYMBOL_GPL(crypto_unregister_rng);
 
-int slsi_add_key(struct wiphy *wiphy, struct net_device *dev,
-		 u8 key_index, bool pairwise, const u8 *mac_addr,
-		 struct key_params *params)
+int crypto_register_rngs(struct rng_alg *algs, int count)
 {
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_peer  *peer = NULL;
-	int               r = 0;
-	u16               key_type = FAPI_KEYTYPE_GROUP;
+	int i, ret;
 
-	if (WARN_ON(pairwise && !mac_addr))
-		return -EINVAL;
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "(key_index:%d, pairwise:%d, address:%pM, cipher:0x%.8X, key_len:%d,"
-		      "vif_type:%d)\n", key_index, pairwise, mac_addr, params->cipher, params->key_len,
-		      ndev_vif->vif_type);
-
-	if (!ndev_vif->activated) {
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "vif not active\n");
-		goto exit;
-	}
-
-	if (params->cipher == WLAN_CIPHER_SUITE_PMK) {
-		r = slsi_mlme_set_pmk(sdev, dev, params->key, params->key_len);
-		goto exit;
-	}
-
-	if (mac_addr && pairwise) {
-		/* All Pairwise Keys will have a peer record. */
-		peer = slsi_get_peer_from_mac(sdev, dev, mac_addr);
-		if (peer)
-			mac_addr = peer->address;
-	} else if (ndev_vif->vif_type == FAPI_VIFTYPE_STATION) {
-		/* Sta Group Key will use the peer address */
-		peer = slsi_get_peer_from_qs(sdev, dev, SLSI_STA_PEER_QUEUESET);
-		if (peer)
-			mac_addr = peer->address;
-	} else if (ndev_vif->vif_type == FAPI_VIFTYPE_AP && !pairwise)
-		/* AP Group Key will use the Interface address */
-		mac_addr = dev->dev_addr;
-	else {
-		r = -EINVAL;
-		goto exit;
-	}
-
-	/*Treat WEP key as pairwise key*/
-	if (ndev_vif->vif_type == FAPI_VIFTYPE_STATION &&
-	    (params->cipher == WLAN_CIPHER_SUITE_WEP40 ||
-	     params->cipher == WLAN_CIPHER_SUITE_WEP104) && peer) {
-		u8 bc_mac_addr[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-
-		SLSI_NET_DBG3(dev, SLSI_CFG80211, "WEP Key: store key\n");
-		r = slsi_mlme_set_key(sdev, dev, key_index, FAPI_KEYTYPE_WEP, bc_mac_addr, params);
-		if (r == FAPI_RESULTCODE_SUCCESS) {
-			ndev_vif->sta.wep_key_set = true;
-			/* if static ip is set before connection, after setting keys enable powersave. */
-			if (ndev_vif->ipaddress)
-				slsi_mlme_powermgt(sdev, dev, ndev_vif->set_power_mode);
-		} else {
-			SLSI_NET_ERR(dev, "Error adding WEP key\n");
-		}
-		goto exit;
-	}
-
-	if (pairwise) {
-		key_type = FAPI_KEYTYPE_PAIRWISE;
-		if (WARN_ON(!peer)) {
-			r = -EINVAL;
-			goto exit;
-		}
-	} else if (params->cipher == WLAN_CIPHER_SUITE_AES_CMAC || params->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_128 ||
-				params->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_256) {
-		key_type = FAPI_KEYTYPE_IGTK;
-	}
-
-	if (WARN(!mac_addr, "mac_addr not defined\n")) {
-		r = -EINVAL;
-		goto exit;
-	}
-	if (!(ndev_vif->vif_type == FAPI_VIFTYPE_AP && key_index == 4)) {
-		r = slsi_mlme_set_key(sdev, dev, key_index, key_type, mac_addr, params);
-		if (r) {
-			SLSI_NET_ERR(dev, "error in adding key (key_type: %d)\n", key_type);
-			goto exit;
-		}
-	}
-
-	if (ndev_vif->vif_type == FAPI_VIFTYPE_STATION) {
-		ndev_vif->sta.eap_hosttag = 0xFFFF;
-		/* if static IP is set before connection, after setting keys enable powersave. */
-		if (ndev_vif->ipaddress)
-			slsi_mlme_powermgt(sdev, dev, ndev_vif->set_power_mode);
-	}
-
-	if (key_type == FAPI_KEYTYPE_GROUP) {
-		ndev_vif->sta.group_key_set = true;
-		ndev_vif->ap.cipher = params->cipher;
-	} else if (key_type == FAPI_KEYTYPE_PAIRWISE) {
-		if (peer)
-			peer->pairwise_key_set = true;
-	}
-
-	if (peer) {
-		if (ndev_vif->vif_type == FAPI_VIFTYPE_STATION) {
-			if (pairwise) {
-				if (params->cipher == WLAN_CIPHER_SUITE_SMS4) { /*WAPI */
-					slsi_mlme_connect_resp(sdev, dev);
-					slsi_set_packet_filters(sdev, dev);
-					slsi_ps_port_control(sdev, dev, peer, SLSI_STA_CONN_STATE_CONNECTED);
-				}
-			}
-
-			if (ndev_vif->sta.gratuitous_arp_needed) {
-				ndev_vif->sta.gratuitous_arp_needed = false;
-				slsi_send_gratuitous_arp(sdev, dev);
-			}
-		} else if (ndev_vif->vif_type == FAPI_VIFTYPE_AP && pairwise) {
-			slsi_mlme_connected_resp(sdev, dev, peer->aid);
-			slsi_ps_port_control(sdev, dev, peer, SLSI_STA_CONN_STATE_CONNECTED);
-			peer->connected_state = SLSI_STA_CONN_STATE_CONNECTED;
-			if (ndev_vif->iftype == NL80211_IFTYPE_P2P_GO)
-				ndev_vif->ap.p2p_gc_keys_set = true;
-		}
-	}
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-int slsi_del_key(struct wiphy *wiphy, struct net_device *dev,
-		 u8 key_index, bool pairwise, const u8 *mac_addr)
-{
-	SLSI_UNUSED_PARAMETER(wiphy);
-	SLSI_UNUSED_PARAMETER(key_index);
-	SLSI_UNUSED_PARAMETER(pairwise);
-	SLSI_UNUSED_PARAMETER(mac_addr);
-
-	if (slsi_is_test_mode_enabled()) {
-		SLSI_NET_INFO(dev, "Skip sending signal, WlanLite FW does not support MLME_DELETEKEYS.request\n");
-		return -EOPNOTSUPP;
+	for (i = 0; i < count; i++) {
+		ret = crypto_register_rng(algs + i);
+		if (ret)
+			goto err;
 	}
 
 	return 0;
-}
 
-int slsi_get_key(struct wiphy *wiphy, struct net_device *dev,
-		 u8 key_index, bool pairwise, const u8 *mac_addr,
-		 void *cookie,
-		 void (*callback)(void *cookie, struct key_params *))
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct key_params params;
+err:
+	for (--i; i >= 0; --i)
+		crypto_unregister_rng(algs + i);
 
-#define SLSI_MAX_KEY_SIZE 8 /*used only for AP case, so WAPI not considered*/
-	u8                key_seq[SLSI_MAX_KEY_SIZE] = { 0 };
-	int               r = 0;
-
-	SLSI_UNUSED_PARAMETER(mac_addr);
-
-	if (slsi_is_test_mode_enabled()) {
-		SLSI_NET_INFO(dev, "Skip sending signal, WlanLite FW does not support MLME_GET_KEY_SEQUENCE.request\n");
-		return -EOPNOTSUPP;
-	}
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "(key_index:%d, pairwise:%d, mac_addr:%pM, vif_type:%d)\n", key_index,
-		      pairwise, mac_addr, ndev_vif->vif_type);
-
-	if (!ndev_vif->activated) {
-		SLSI_NET_ERR(dev, "vif not active\n");
-		r = -EINVAL;
-		goto exit;
-	}
-
-	/* The get_key call is expected only for AP vif with Group Key type */
-	if (FAPI_VIFTYPE_AP != ndev_vif->vif_type) {
-		SLSI_NET_ERR(dev, "Invalid vif type: %d\n", ndev_vif->vif_type);
-		r = -EINVAL;
-		goto exit;
-	}
-	if (pairwise) {
-		SLSI_NET_ERR(dev, "Invalid key type\n");
-		r = -EINVAL;
-		goto exit;
-	}
-
-	memset(&params, 0, sizeof(params));
-	/* Update params with sequence number, key field would be updated NULL */
-	params.key = NULL;
-	params.key_len = 0;
-	params.cipher = ndev_vif->ap.cipher;
-	if (!(ndev_vif->vif_type == FAPI_VIFTYPE_AP && key_index == 4)) {
-		r = slsi_mlme_get_key(sdev, dev, key_index, FAPI_KEYTYPE_GROUP, key_seq, &params.seq_len);
-
-		if (!r) {
-			params.seq = key_seq;
-			callback(cookie, &params);
-		}
-	}
-#undef SLSI_MAX_KEY_SIZE
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-static size_t slsi_strip_wsc_p2p_ie(const u8 *src_ie, size_t src_ie_len, u8 *dest_ie, bool strip_wsc, bool strip_p2p)
-{
-	const u8 *ie;
-	const u8 *next_ie;
-	size_t   dest_ie_len = 0;
-
-	if (!dest_ie || !(strip_p2p || strip_wsc))
-		return dest_ie_len;
-
-	for (ie = src_ie; (ie - src_ie) < src_ie_len; ie = next_ie) {
-		next_ie = ie + ie[1] + 2;
-
-		if (ie[0] == WLAN_EID_VENDOR_SPECIFIC && ie[1] > 4) {
-			int          i;
-			unsigned int oui = 0;
-
-			for (i = 0; i < 4; i++)
-				oui = (oui << 8) | ie[5 - i];
-
-			if (strip_wsc && oui == SLSI_WPS_OUI_PATTERN)
-				continue;
-			if (strip_p2p && oui == SLSI_P2P_OUI_PATTERN)
-				continue;
-		}
-
-		if (next_ie - src_ie <= src_ie_len) {
-			memcpy(dest_ie + dest_ie_len, ie, ie[1] + 2);
-			dest_ie_len += ie[1] + 2;
-		}
-	}
-
-	return dest_ie_len;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-int slsi_scan(struct wiphy                 *wiphy,
-	      struct cfg80211_scan_request *request)
-{
-	struct net_device *dev = request->wdev->netdev;
-
-#else
-int slsi_scan(struct wiphy *wiphy, struct net_device *dev,
-	      struct cfg80211_scan_request *request)
-{
-#endif  /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9)) */
-
-	struct netdev_vif         *ndev_vif = netdev_priv(dev);
-	struct slsi_dev           *sdev = SDEV_FROM_WIPHY(wiphy);
-	u16                       scan_type = FAPI_SCANTYPE_FULL_SCAN;
-	int                       r = 0;
-	u8                        *scan_ie;
-	size_t                    scan_ie_len;
-	bool                      strip_wsc = false;
-	bool                      strip_p2p = false;
-	struct ieee80211_channel  *channels[64];
-	int                       i, chan_count = 0;
-	bool                      wps_sta = false;
-
-#ifdef CONFIG_SCSC_WLAN_ENABLE_MAC_RANDOMISATION
-	u8 mac_addr_mask[ETH_ALEN] = {0xFF};
-#endif
-
-	if (WARN_ON(!request->wdev))
-		return -EINVAL;
-	if (WARN_ON(!dev))
-		return -EINVAL;
-
-	if (slsi_is_test_mode_enabled()) {
-		SLSI_NET_WARN(dev, "not supported in WlanLite mode\n");
-		return -EOPNOTSUPP;
-	}
-
-	/* Reject scan request if Group Formation is in progress */
-	if (sdev->p2p_state == P2P_ACTION_FRAME_TX_RX) {
-		SLSI_NET_INFO(dev, "Scan received in P2P Action Frame Tx/Rx state - Reject\n");
-		return -EBUSY;
-	}
-
-	SLSI_MUTEX_LOCK(ndev_vif->scan_mutex);
-
-	if (ndev_vif->scan[SLSI_SCAN_HW_ID].scan_req) {
-		SLSI_NET_INFO(dev, "Rejecting scan request as last scan is still running\n");
-		r = -EBUSY;
-		goto exit;
-	}
-#ifdef CONFIG_SLSI_WLAN_STA_FWD_BEACON
-	if (ndev_vif->is_wips_running && (ndev_vif->vif_type == FAPI_VIFTYPE_STATION) &&
-	    (ndev_vif->sta.vif_status == SLSI_VIF_STATUS_CONNECTED)) {
-		int ret = 0;
-
-		SLSI_NET_DBG3(dev, SLSI_CFG80211, "Scan invokes DRIVER_BCN_ABORT\n");
-		ret = slsi_mlme_set_forward_beacon(sdev, dev, FAPI_WIPSACTION_STOP);
-
-		if (!ret) {
-			ret = slsi_send_forward_beacon_abort_vendor_event(sdev,
-									  SLSI_FORWARD_BEACON_ABORT_REASON_SCANNING);
-		}
-	}
-#endif
-	SLSI_NET_DBG3(dev, SLSI_CFG80211, "channels:%d, ssids:%d, ie_len:%d, vif_index:%d\n", request->n_channels,
-		      request->n_ssids, (int)request->ie_len, ndev_vif->ifnum);
-
-	for (i = 0; i < request->n_channels; i++)
-		channels[i] = request->channels[i];
-	chan_count = request->n_channels;
-
-	if (SLSI_IS_VIF_INDEX_WLAN(ndev_vif)) {
-		if (chan_count == 1)
-			scan_type = SLSI_SCANTYPE_SINGLE_CHANNEL_SCAN;
-		else if (sdev->initial_scan) {
-			sdev->initial_scan = false;
-			scan_type = FAPI_SCANTYPE_INITIAL_SCAN;
-		}
-	}
-
-	/* Update scan timing for P2P social channels scan.*/
-	if (request->ie &&
-	    cfg80211_find_vendor_ie(WLAN_OUI_WFA, WLAN_OUI_TYPE_WFA_P2P, request->ie, request->ie_len) &&
-	    request->ssids && SLSI_IS_P2P_SSID(request->ssids[0].ssid, request->ssids[0].ssid_len)) {
-		/* In supplicant during joining procedure the P2P GO scan
-		 * with GO's operating channel comes on P2P device. Hence added the
-		 * check for n_channels as 1
-		 */
-		if (request->n_channels == SLSI_P2P_SOCIAL_CHAN_COUNT || request->n_channels == 1) {
-			scan_type = FAPI_SCANTYPE_P2P_SCAN_SOCIAL;
-		} else if (request->n_channels > SLSI_P2P_SOCIAL_CHAN_COUNT) {
-			scan_type = FAPI_SCANTYPE_P2P_SCAN_FULL;
-		}
-	}
-
-#ifdef CONFIG_SCSC_WLAN_DUAL_STATION
-	if ((SLSI_IS_VIF_INDEX_WLAN(ndev_vif) || ndev_vif->ifnum == SLSI_NET_INDEX_P2PX_SWLAN) && request->ie) {
-#else
-	if (SLSI_IS_VIF_INDEX_WLAN(ndev_vif) && request->ie) {
-#endif
-		const u8 *ie;
-
-		/* Supplicant adds wsc and p2p in Station scan at the end of scan request ie.
-		 * for non-wps case remove both wps and p2p IEs
-		 * for wps case remove only p2p IE
-		 */
-
-		ie = cfg80211_find_vendor_ie(WLAN_OUI_MICROSOFT, WLAN_OUI_TYPE_MICROSOFT_WPS, request->ie, request->ie_len);
-		if (ie && ie[1] > SLSI_WPS_REQUEST_TYPE_POS) {
-			/* Check whether scan is wps_scan or not, if not a wps_scan set strip_wsc to true
-			 * to strip WPS IE else wps_sta to true to disable mac radomization for wps_scan
-			 */
-			if (ie[SLSI_WPS_REQUEST_TYPE_POS] == SLSI_WPS_REQUEST_TYPE_ENROLEE_INFO_ONLY)
-				strip_wsc = true;
-			else
-				wps_sta = true;
-		}
-
-		ie = cfg80211_find_vendor_ie(WLAN_OUI_WFA, WLAN_OUI_TYPE_WFA_P2P, request->ie, request->ie_len);
-		if (ie)
-			strip_p2p = true;
-	}
-
-	if (strip_wsc || strip_p2p) {
-		scan_ie = kmalloc(request->ie_len, GFP_KERNEL);
-		if (!scan_ie) {
-			SLSI_NET_INFO(dev, "Out of memory for scan IEs\n");
-			r = -ENOMEM;
-			goto exit;
-		}
-		scan_ie_len = slsi_strip_wsc_p2p_ie(request->ie, request->ie_len, scan_ie, strip_wsc, strip_p2p);
-	} else {
-		scan_ie = (u8 *)request->ie;
-		scan_ie_len = request->ie_len;
-	}
-
-	/* Flush out any outstanding single scan timeout work */
-	cancel_delayed_work(&ndev_vif->scan_timeout_work);
-
-	ndev_vif->scan[SLSI_SCAN_HW_ID].is_blocking_scan = false;
-	slsi_purge_scan_results(ndev_vif, SLSI_SCAN_HW_ID);
-
-#ifdef CONFIG_SCSC_WLAN_ENABLE_MAC_RANDOMISATION
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0))
-	/* If Supplicant triggers WPS scan on station interface,
-	 * mac radomization for scan should be disbaled to avoid WPS overlap.
-	 * Firmware also disables Mac Randomization for WPS Scan.
-	 */
-	if (request->flags & NL80211_SCAN_FLAG_RANDOM_ADDR && !wps_sta) {
-		if (sdev->fw_mac_randomization_enabled) {
-			memcpy(sdev->scan_mac_addr, request->mac_addr, ETH_ALEN);
-			r = slsi_set_mac_randomisation_mask(sdev, request->mac_addr_mask);
-			if (!r)
-				sdev->scan_addr_set = 1;
-		} else {
-			SLSI_NET_INFO(dev, "Mac Randomization is not enabled in Firmware\n");
-			sdev->scan_addr_set = 0;
-		}
-	} else
-#endif
-		if (sdev->scan_addr_set) {
-			memset(mac_addr_mask, 0xFF, ETH_ALEN);
-			r = slsi_set_mac_randomisation_mask(sdev, mac_addr_mask);
-			sdev->scan_addr_set = 0;
-		}
-#endif
-
-	r = slsi_mlme_add_scan(sdev,
-			       dev,
-			       scan_type,
-			       FAPI_REPORTMODE_REAL_TIME,
-			       request->n_ssids,
-			       request->ssids,
-			       chan_count,
-			       channels,
-			       NULL,
-			       scan_ie,
-			       scan_ie_len,
-			       ndev_vif->scan[SLSI_SCAN_HW_ID].is_blocking_scan);
-
-	if (r != 0) {
-		if (r > 0) {
-			SLSI_NET_DBG2(dev, SLSI_CFG80211, "Nothing to be done\n");
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0))
-			cfg80211_scan_done(request, &info);
-#else
-			cfg80211_scan_done(request, false);
-#endif
-			r = 0;
-		} else {
-			SLSI_NET_DBG2(dev, SLSI_CFG80211, "add_scan error: %d\n", r);
-			r = -EIO;
-		}
-	} else {
-		ndev_vif->scan[SLSI_SCAN_HW_ID].scan_req = request;
-
-		/* if delayed work is already scheduled, queue delayed work fails. So set
-		 * requeue_timeout_work flag to enqueue delayed work in the timeout handler
-		 */
-		if (queue_delayed_work(sdev->device_wq, &ndev_vif->scan_timeout_work,
-				       msecs_to_jiffies(SLSI_FW_SCAN_DONE_TIMEOUT_MSEC)))
-			ndev_vif->scan[SLSI_SCAN_HW_ID].requeue_timeout_work = false;
-		else
-			ndev_vif->scan[SLSI_SCAN_HW_ID].requeue_timeout_work = true;
-
-		/* Update State only for scan in Device role */
-		if (SLSI_IS_VIF_INDEX_P2P(ndev_vif) && (!SLSI_IS_P2P_GROUP_STATE(sdev))) {
-			if (scan_type == FAPI_SCANTYPE_P2P_SCAN_SOCIAL)
-				SLSI_P2P_STATE_CHANGE(sdev, P2P_SCANNING);
-		} else if (!SLSI_IS_VIF_INDEX_P2P(ndev_vif) && scan_ie_len) {
-			kfree(ndev_vif->probe_req_ies);
-			ndev_vif->probe_req_ies = kmalloc(request->ie_len, GFP_KERNEL);
-			if (!ndev_vif->probe_req_ies) /* Don't fail, continue as it would still work */
-				ndev_vif->probe_req_ie_len = 0;
-			else {
-				ndev_vif->probe_req_ie_len = scan_ie_len;
-				memcpy(ndev_vif->probe_req_ies, scan_ie, scan_ie_len);
-			}
-		}
-	}
-	if (strip_p2p || strip_wsc)
-		kfree(scan_ie);
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->scan_mutex);
-	return r;
-}
-
-int slsi_sched_scan_start(struct wiphy                       *wiphy,
-			  struct net_device                  *dev,
-			  struct cfg80211_sched_scan_request *request)
-{
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	int               r;
-	u8                *scan_ie;
-	size_t            scan_ie_len;
-	bool              strip_wsc = false;
-	bool              strip_p2p = false;
-
-	if (slsi_is_test_mode_enabled()) {
-		SLSI_NET_INFO(dev, "Skip sending signal, WlanLite FW does not support MLME_ADD_SCAN.request\n");
-		return -EOPNOTSUPP;
-	}
-
-	/* Allow sched_scan only on wlan0. For P2PCLI interface, sched_scan might get requested following a
-	 * wlan0 scan and its results being shared to sibling interfaces. Reject sched_scan for other interfaces.
-	 */
-	if (!SLSI_IS_VIF_INDEX_WLAN(ndev_vif)) {
-		SLSI_NET_INFO(dev, "Scheduled scan req received on vif %d - Reject\n", ndev_vif->ifnum);
-		return -EINVAL;
-	}
-
-	/* Unlikely to get a schedule scan while Group formation is in progress.
-	 * In case it is requested, it will be rejected.
-	 */
-	if (sdev->p2p_state == P2P_ACTION_FRAME_TX_RX) {
-		SLSI_NET_INFO(dev, "Scheduled scan req received in P2P Action Frame Tx/Rx state - Reject\n");
-		return -EBUSY;
-	}
-
-	SLSI_MUTEX_LOCK(ndev_vif->scan_mutex);
-
-	SLSI_NET_DBG3(dev, SLSI_CFG80211, "channels:%d, ssids:%d, ie_len:%d, vif_index:%d\n", request->n_channels,
-		      request->n_ssids, (int)request->ie_len, ndev_vif->ifnum);
-
-	if (ndev_vif->scan[SLSI_SCAN_HW_ID].sched_req) {
-		r = -EBUSY;
-		goto exit;
-	}
-
-	if (request->ie) {
-		const u8 *ie;
-		/* Supplicant adds wsc and p2p in Station scan at the end of scan request ie.
-		 * Remove both wps and p2p IEs.
-		 * Scheduled scan is not used for wsc, So no need to check for wsc request type
-		 */
-
-		ie = cfg80211_find_vendor_ie(WLAN_OUI_MICROSOFT, WLAN_OUI_TYPE_MICROSOFT_WPS, request->ie, request->ie_len);
-		if (ie)
-			strip_wsc = true;
-
-		ie = cfg80211_find_vendor_ie(WLAN_OUI_WFA, WLAN_OUI_TYPE_WFA_P2P, request->ie, request->ie_len);
-		if (ie)
-			strip_p2p = true;
-	}
-
-	if (strip_wsc || strip_p2p) {
-		scan_ie = kmalloc(request->ie_len, GFP_KERNEL);
-		if (!scan_ie) {
-			SLSI_NET_INFO(dev, "Out of memory for scan IEs\n");
-			r = -ENOMEM;
-			goto exit;
-		}
-		scan_ie_len = slsi_strip_wsc_p2p_ie(request->ie, request->ie_len, scan_ie, strip_wsc, strip_p2p);
-	} else {
-		scan_ie = (u8 *)request->ie;
-		scan_ie_len = request->ie_len;
-	}
-
-	slsi_purge_scan_results(ndev_vif, SLSI_SCAN_SCHED_ID);
-	r = slsi_mlme_add_sched_scan(sdev, dev, request, scan_ie, scan_ie_len);
-
-	ndev_vif->scan[SLSI_SCAN_SCHED_ID].sched_req = request;
-	if (strip_p2p || strip_wsc)
-		kfree(scan_ie);
-
-	if (r != 0) {
-		if (r > 0) {
-			SLSI_NET_DBG2(dev, SLSI_CFG80211, "Nothing to be done\n");
-			queue_work(sdev->device_wq, &ndev_vif->sched_scan_stop_wk);
-			r = 0;
-		} else {
-			SLSI_NET_DBG2(dev, SLSI_CFG80211, "add_scan error: %d\n", r);
-			ndev_vif->scan[SLSI_SCAN_SCHED_ID].sched_req = NULL;
-			r = -EIO;
-		}
-	}
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->scan_mutex);
-	return r;
-}
-
-int slsi_sched_scan_stop(struct wiphy *wiphy, struct net_device *dev)
-{
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	int               r = 0;
-
-	SLSI_MUTEX_LOCK(ndev_vif->scan_mutex);
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "vif_index:%d", ndev_vif->ifnum);
-	if (!ndev_vif->scan[SLSI_SCAN_SCHED_ID].sched_req) {
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "No sched scan req\n");
-		goto exit;
-	}
-
-	r = slsi_mlme_del_scan(sdev, dev, (ndev_vif->ifnum << 8 | SLSI_SCAN_SCHED_ID), false);
-
-	ndev_vif->scan[SLSI_SCAN_SCHED_ID].sched_req = NULL;
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->scan_mutex);
-	return r;
-}
-
-static void slsi_abort_hw_scan(struct slsi_dev *sdev, struct net_device *dev)
-{
-	struct netdev_vif   *ndev_vif = netdev_priv(dev);
-
-	SLSI_MUTEX_LOCK(ndev_vif->scan_mutex);
-
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "Abort on-going scan, vif_index:%d,"
-		      "ndev_vif->scan[SLSI_SCAN_HW_ID].scan_req:%p\n", ndev_vif->ifnum,
-		      ndev_vif->scan[SLSI_SCAN_HW_ID].scan_req);
-
-	if (ndev_vif->scan[SLSI_SCAN_HW_ID].scan_req) {
-		(void)slsi_mlme_del_scan(sdev, dev, ndev_vif->ifnum << 8 | SLSI_SCAN_HW_ID, false);
-		slsi_scan_complete(sdev, dev, SLSI_SCAN_HW_ID, false, false);
-	}
-	SLSI_MUTEX_UNLOCK(ndev_vif->scan_mutex);
-}
-
-#ifdef CONFIG_SCSC_WLAN_BSS_SELECTION
-void slsi_save_connection_params(struct slsi_dev *sdev, struct net_device *dev,
-				 struct cfg80211_connect_params *sme,
-				 struct ieee80211_channel *channel, const u8 *bssid,
-				 u32 action_frame_bmap, u32 action_frame_suspend_bmap)
-{
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-
-	memset(&ndev_vif->sta.sme, 0, sizeof(struct cfg80211_connect_params));
-	ndev_vif->sta.sme = *sme;
-
-	if (sme->ie && sme->ie_len)
-		ndev_vif->sta.sme.ie = slsi_mem_dup((u8 *)sme->ie, sme->ie_len);
-	else
-		ndev_vif->sta.sme.ie = NULL;
-
-	if (sme->ssid && sme->ssid_len)
-		ndev_vif->sta.sme.ssid = slsi_mem_dup((u8 *)sme->ssid, sme->ssid_len);
-	else
-		ndev_vif->sta.sme.ssid = NULL;
-
-	if (sme->key && sme->key_len)
-		ndev_vif->sta.sme.key = slsi_mem_dup((u8 *)sme->key, sme->key_len);
-	else
-		ndev_vif->sta.sme.key = NULL;
-
-	ndev_vif->sta.action_frame_bmap = action_frame_bmap;
-	ndev_vif->sta.action_frame_suspend_bmap = action_frame_suspend_bmap;
-	ndev_vif->sta.connected_bssid = slsi_mem_dup((u8 *)bssid, ETH_ALEN);
-	ndev_vif->sta.connected_ssid_len = (int)sme->ssid_len;
-	ndev_vif->sta.connected_ssid = slsi_mem_dup((u8 *)sme->ssid, ndev_vif->sta.connected_ssid_len);
-}
-#endif
-
-int slsi_connect(struct wiphy *wiphy, struct net_device *dev,
-		 struct cfg80211_connect_params *sme)
-{
-	struct slsi_dev     *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif   *ndev_vif = netdev_priv(dev);
-	struct netdev_vif   *ndev_p2p_vif;
-	u8                  device_address[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-	int                 r = 0;
-	u16                 capability = WLAN_CAPABILITY_ESS;
-	struct slsi_peer    *peer;
-	u16                 prev_vif_type;
-	u32                 action_frame_bmap;
-	u32                 action_frame_suspend_bmap;
-	struct net_device   *p2p_dev;
-	const u8            *bssid;
-	struct ieee80211_channel *channel;
-	const u8            *connected_ssid = NULL;
-	u8                  peer_address[ETH_ALEN] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-	u16                 center_freq = 0;
-#ifdef CONFIG_SCSC_WLAN_BSS_SELECTION
-	bool                ap_found = false;
-#endif
-
-	if (slsi_is_test_mode_enabled()) {
-		SLSI_NET_INFO(dev, "Skip sending signal, WlanLite FW does not support MLME_CONNECT.request\n");
-		return -EOPNOTSUPP;
-	}
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0))
-	capability = sme->privacy ? IEEE80211_PRIVACY_ON : IEEE80211_PRIVACY_OFF;
-#else
-	if (sme->privacy)
-		capability |= WLAN_CAPABILITY_PRIVACY;
-#endif
-
-	SLSI_MUTEX_LOCK(sdev->start_stop_mutex);
-	if (sdev->device_state != SLSI_DEVICE_STATE_STARTED) {
-		SLSI_WARN(sdev, "device not started yet (device_state:%d)\n", sdev->device_state);
-		SLSI_MUTEX_UNLOCK(sdev->start_stop_mutex);
-		return -EINVAL;
-	}
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-	channel = sme->channel;
-	bssid = sme->bssid;
-#ifdef CONFIG_SCSC_WLAN_BSS_SELECTION
-	ndev_vif->sta.akm_type = slsi_bss_connect_type_get(sdev, sme->ie, sme->ie_len);
-	ndev_vif->sta.ssid_len = sme->ssid_len;
-	memcpy(ndev_vif->sta.ssid, sme->ssid, sme->ssid_len);
-	/* If bssid is not present, check if bssid hint is present, if even hint not present,
-	 * select bssid in driver set connect_attempted to true.
-	 */
-	if (!sme->bssid) {
-		ndev_vif->sta.drv_bss_selection = true;
-		if (sme->bssid_hint) {
-			bssid = sme->bssid_hint;
-			channel = sme->channel_hint;
-		} else {
-			ap_found = slsi_select_ap_for_connection(sdev, dev, &bssid, &channel, false);
-		}
-	} else {
-		ndev_vif->sta.drv_bss_selection = false;
-	}
-#endif
-
-	if (ndev_vif->sta.sta_bss)
-		SLSI_ETHER_COPY(peer_address, ndev_vif->sta.sta_bss->bssid);
-
-	center_freq = channel ? channel->center_freq : 0;
-
-	SLSI_NET_INFO(dev, "%.*s Freq=%d vifStatus=%d CurrBssid:%pM NewBssid:%pM Qinfo:%d ieLen:%d\n",
-		      (int)sme->ssid_len, sme->ssid, center_freq, ndev_vif->sta.vif_status,
-		      peer_address, bssid, sdev->device_config.qos_info, (int)sme->ie_len);
-
-#ifdef CONFIG_SCSC_WIFILOGGER
-	SCSC_WLOG_PKTFATE_NEW_ASSOC();
-	if (bssid) {
-		SCSC_WLOG_DRIVER_EVENT(WLOG_NORMAL, WIFI_EVENT_ASSOCIATION_REQUESTED, 3,
-				       WIFI_TAG_BSSID, ETH_ALEN, bssid,
-				       WIFI_TAG_SSID, sme->ssid_len, sme->ssid,
-				       WIFI_TAG_CHANNEL, sizeof(u16), &center_freq);
-				       // ?? WIFI_TAG_VENDOR_SPECIFIC, sizeof(RSSE), RSSE);
-	}
-#endif
-
-	if (SLSI_IS_HS2_UNSYNC_VIF(ndev_vif)) {
-		slsi_wlan_unsync_vif_deactivate(sdev, dev, true);
-	} else if (SLSI_IS_VIF_INDEX_P2P(ndev_vif)) {
-		SLSI_NET_ERR(dev, "Connect requested on incorrect vif\n");
-		goto exit_with_error;
-	}
-
-	if (WARN_ON(!sme->ssid))
-		goto exit_with_error;
-
-	if (WARN_ON(sme->ssid_len > IEEE80211_MAX_SSID_LEN))
-		goto exit_with_error;
-
-	if (bssid) {
-		if (SLSI_IS_VIF_INDEX_WLAN(ndev_vif) && sdev->p2p_state == P2P_GROUP_FORMED_CLI) {
-			p2p_dev = slsi_get_netdev(sdev, SLSI_NET_INDEX_P2PX_SWLAN);
-			if (p2p_dev) {
-				ndev_p2p_vif  = netdev_priv(p2p_dev);
-				if (ndev_p2p_vif->sta.sta_bss) {
-					if (SLSI_ETHER_EQUAL(ndev_p2p_vif->sta.sta_bss->bssid, bssid)) {
-						SLSI_NET_ERR(dev, "Connect Request Rejected\n");
-						goto exit_with_error;
-					}
-				}
-			}
-		}
-	}
-
-	if (ndev_vif->vif_type == FAPI_VIFTYPE_STATION && ndev_vif->sta.vif_status == SLSI_VIF_STATUS_CONNECTED) {
-		/*reassociation*/
-		peer = slsi_get_peer_from_qs(sdev, dev, SLSI_STA_PEER_QUEUESET);
-		if (WARN_ON(!peer))
-			goto exit_with_error;
-
-		if (!sme->bssid) {
-			SLSI_NET_ERR(dev, "Require bssid in reassoc but received null\n");
-			goto exit_with_error;
-		}
-		if (!memcmp(peer->address, sme->bssid, ETH_ALEN)) { /*same bssid*/
-			r = slsi_mlme_reassociate(sdev, dev);
-			if (r) {
-				SLSI_NET_ERR(dev, "Failed to reassociate : %d\n", r);
-			} else {
-				ndev_vif->sta.vif_status = SLSI_VIF_STATUS_CONNECTING;
-				slsi_ps_port_control(sdev, dev, peer, SLSI_STA_CONN_STATE_DISCONNECTED);
-			}
-			goto exit;
-		} else { /*different bssid*/
-			connected_ssid = cfg80211_find_ie(WLAN_EID_SSID, ndev_vif->sta.sta_bss->ies->data, ndev_vif->sta.sta_bss->ies->len);
-
-			if (!connected_ssid) {
-				SLSI_NET_ERR(dev, "Require ssid in roam but received null\n");
-				goto exit_with_error;
-			}
-
-			if (!memcmp(&connected_ssid[2], sme->ssid, connected_ssid[1])) { /*same ssid*/
-				if (!sme->channel) {
-					SLSI_NET_ERR(dev, "Roaming has been rejected, as sme->channel is null\n");
-					goto exit_with_error;
-				}
-				r = slsi_mlme_roam(sdev, dev, sme->bssid, sme->channel->center_freq);
-				if (r) {
-					SLSI_NET_ERR(dev, "Failed to roam : %d\n", r);
-					goto exit_with_error;
-				}
-				goto exit;
-			} else {
-				SLSI_NET_ERR(dev, "Connected but received connect to new ESS, without disconnect");
-				goto exit_with_error;
-			}
-		}
-	}
-	/* Sta started case */
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-	if (SLSI_IS_VIF_INDEX_MHS(sdev, ndev_vif))
-		if (ndev_vif->iftype == NL80211_IFTYPE_P2P_CLIENT) {
-			SLSI_NET_ERR(dev, "Iftype: %d\n", ndev_vif->iftype);
-			goto exit_with_error;
-		}
-#endif /*wifi sharing*/
-	if (WARN_ON(ndev_vif->activated)) {
-		SLSI_NET_ERR(dev, "Vif is activated: %d\n", ndev_vif->activated);
-		goto exit_with_error;
-	}
-	if (ndev_vif->vif_type == FAPI_VIFTYPE_STATION &&
-	    ndev_vif->sta.vif_status != SLSI_VIF_STATUS_UNSPECIFIED) {
-		SLSI_NET_ERR(dev, "VIF status: %d\n", ndev_vif->sta.vif_status);
-		goto exit_with_error;
-	}
-	prev_vif_type = ndev_vif->vif_type;
-
-	switch (ndev_vif->iftype) {
-	case NL80211_IFTYPE_UNSPECIFIED:
-	case NL80211_IFTYPE_STATION:
-		ndev_vif->iftype = NL80211_IFTYPE_STATION;
-		dev->ieee80211_ptr->iftype = NL80211_IFTYPE_STATION;
-		action_frame_bmap = SLSI_STA_ACTION_FRAME_BITMAP;
-		action_frame_suspend_bmap = SLSI_STA_ACTION_FRAME_SUSPEND_BITMAP;
-#ifdef CONFIG_SCSC_WLAN_WES_NCHO
-		if (sdev->device_config.wes_mode) {
-			action_frame_bmap |= SLSI_ACTION_FRAME_VENDOR_SPEC;
-			action_frame_suspend_bmap |= SLSI_ACTION_FRAME_VENDOR_SPEC;
-		}
-#endif
-		break;
-	case NL80211_IFTYPE_P2P_CLIENT:
-		slsi_p2p_group_start_remove_unsync_vif(sdev);
-		p2p_dev = slsi_get_netdev(sdev, SLSI_NET_INDEX_P2P);
-		if (p2p_dev)
-			SLSI_ETHER_COPY(device_address, p2p_dev->dev_addr);
-		action_frame_bmap = SLSI_ACTION_FRAME_PUBLIC;
-		action_frame_suspend_bmap = SLSI_ACTION_FRAME_PUBLIC;
-		break;
-	default:
-		SLSI_NET_ERR(dev, "Invalid Device Type: %d\n", ndev_vif->iftype);
-		goto exit_with_error;
-	}
-
-	/* Initial Roaming checks done - assign vif type */
-	ndev_vif->vif_type = FAPI_VIFTYPE_STATION;
-#ifndef CONFIG_SCSC_WLAN_BSS_SELECTION
-	channel = sme->channel;
-	bssid = sme->bssid;
-#endif
-	ndev_vif->sta.sta_bss = cfg80211_get_bss(wiphy,
-						 channel,
-						 bssid,
-						 sme->ssid,
-						 sme->ssid_len,
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0))
-						 IEEE80211_BSS_TYPE_ANY,
-#else
-						 capability,
-#endif
-						 capability);
-#ifdef CONFIG_SCSC_WLAN_BSS_SELECTION
-	if (!sme->bssid && !sme->bssid_hint && !ndev_vif->sta.sta_bss) {
-		struct list_head *pos;
-
-		list_for_each(pos, &ndev_vif->sta.ssid_info) {
-			struct slsi_ssid_info *ssid_info = list_entry(pos, struct slsi_ssid_info, list);
-			struct list_head *pos_bssid;
-
-			if (ssid_info->ssid.ssid_len != ndev_vif->sta.ssid_len ||
-			    memcmp(ssid_info->ssid.ssid, &ndev_vif->sta.ssid, ndev_vif->sta.ssid_len) != 0 ||
-			    !(ssid_info->akm_type & ndev_vif->sta.akm_type))
-				continue;
-			list_for_each(pos_bssid, &ssid_info->bssid_list) {
-				struct slsi_bssid_info *bssid_info = list_entry(pos_bssid, struct slsi_bssid_info, list);
-
-				if (bssid && !memcmp(bssid_info->bssid, bssid, ETH_ALEN))
-					continue;
-				ndev_vif->sta.sta_bss = cfg80211_get_bss(wiphy,
-									 ieee80211_get_channel(sdev->wiphy,
-											       (bssid_info->freq / 2)),
-									 bssid_info->bssid,
-									 sme->ssid,
-									 sme->ssid_len,
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0))
-									 IEEE80211_BSS_TYPE_ANY,
-#else
-									 capability,
-#endif
-									 capability);
-				if (ndev_vif->sta.sta_bss) {
-					bssid = bssid_info->bssid;
-					channel = ieee80211_get_channel(sdev->wiphy, (bssid_info->freq / 2));
-					break;
-				}
-			}
-		}
-	}
-#endif
-	if (!ndev_vif->sta.sta_bss) {
-		struct cfg80211_ssid ssid;
-
-		SLSI_NET_DBG3(dev, SLSI_CFG80211, "BSS info is not available - Perform scan\n");
-		ssid.ssid_len = sme->ssid_len;
-		memcpy(ssid.ssid, sme->ssid, ssid.ssid_len);
-		if (!(ssid.ssid_len > 0 && channel)) {
-			r = slsi_mlme_connect_scan(sdev, dev, 1, &ssid, channel);
-			if (r) {
-				SLSI_NET_ERR(dev, "slsi_mlme_connect_scan failed\n");
-				goto exit;
-			}
-			ndev_vif->sta.sta_bss = cfg80211_get_bss(wiphy,
-								 channel,
-								 bssid,
-								 sme->ssid,
-								 sme->ssid_len,
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0))
-								 IEEE80211_BSS_TYPE_ANY,
-#else
-								 capability,
-#endif
-								 capability);
-				if (!ndev_vif->sta.sta_bss) {
-					SLSI_NET_ERR(dev, "cfg80211_get_bss(%.*s, %pM) Not found\n",
-						     (int)sme->ssid_len, sme->ssid, bssid);
-					/*Set previous status in case of failure */
-					ndev_vif->vif_type = prev_vif_type;
-					r = -ENOENT;
-					goto exit;
-				}
-				channel = ndev_vif->sta.sta_bss->channel;
-				bssid = ndev_vif->sta.sta_bss->bssid;
-			}
-	} else {
-		channel = ndev_vif->sta.sta_bss->channel;
-		bssid = ndev_vif->sta.sta_bss->bssid;
-	}
-
-	ndev_vif->channel_type = NL80211_CHAN_NO_HT;
-	ndev_vif->chan = channel;
-#ifndef CONFIG_SCSC_WLAN_BSS_SELECTION
-	ndev_vif->sta.ssid_len = sme->ssid_len;
-	memcpy(ndev_vif->sta.ssid, sme->ssid, sme->ssid_len);
-#endif
-	/* Always check the BSSID is not null during connection
-	 * It will cause kernel panic if we access null BSSID.
-	 */
-	if (bssid)
-		SLSI_ETHER_COPY(ndev_vif->sta.bssid, bssid);
-	if (slsi_mlme_add_vif(sdev, dev, dev->dev_addr, device_address) != 0) {
-		SLSI_NET_ERR(dev, "slsi_mlme_add_vif failed\n");
-		goto exit_with_bss;
-	}
-	if (slsi_vif_activated(sdev, dev) != 0) {
-		SLSI_NET_ERR(dev, "slsi_vif_activated failed\n");
-		goto exit_with_vif;
-	}
-	if (slsi_mlme_register_action_frame(sdev, dev, action_frame_bmap, action_frame_suspend_bmap) != 0) {
-		SLSI_NET_ERR(dev, "Action frame registration failed for bitmap value 0x%x 0x%x\n", action_frame_bmap, action_frame_suspend_bmap);
-		goto exit_with_vif;
-	}
-
-	r = slsi_set_boost(sdev, dev);
-	if (r != 0)
-		SLSI_NET_ERR(dev, "Rssi Boost set failed: %d\n", r);
-
-	/* add_info_elements with Probe Req IEs. Proceed even if confirm fails for add_info as it would
-	 * still work if the fw pre-join scan does not include the vendor IEs
-	 */
-	if (ndev_vif->probe_req_ies) {
-		if (ndev_vif->iftype == NL80211_IFTYPE_P2P_CLIENT) {
-			if (sme->crypto.wpa_versions == 2)
-				ndev_vif->delete_probe_req_ies = true; /* Stored Probe Req can be deleted at vif
-									* deletion after WPA2 association
-									*/
-			else
-				/* Retain stored Probe Req at vif deletion until WPA2 connection to allow Probe req */
-				ndev_vif->delete_probe_req_ies = false;
-		} else {
-			ndev_vif->delete_probe_req_ies = true; /* Delete stored Probe Req at vif deletion for STA */
-		}
-		(void)slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_PROBE_REQUEST, ndev_vif->probe_req_ies,
-						  ndev_vif->probe_req_ie_len);
-	}
-
-	/* Sometimes netif stack takes more time to initialize and any packet
-	 * sent to stack would be dropped. This behavior is random in nature,
-	 * so start the netif stack before sending out the connect req, it shall
-	 * give enough time to netstack to initialize.
-	 */
-	netif_carrier_on(dev);
-	ndev_vif->sta.vif_status = SLSI_VIF_STATUS_CONNECTING;
-
-	r = slsi_set_ext_cap(sdev, dev, sme->ie, sme->ie_len, slsi_extended_cap_mask);
-	if (r != 0)
-		SLSI_NET_ERR(dev, "Failed to set extended capability MIB: %d\n", r);
-
-#ifdef CONFIG_SCSC_WLAN_SAE_CONFIG
-	if (sme->auth_type == NL80211_AUTHTYPE_SAE && (sme->flags & CONNECT_REQ_EXTERNAL_AUTH_SUPPORT)) {
-		const u8 *rsn;
-
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "N AKM Suites: : %1d\n", sme->crypto.n_akm_suites);
-		ndev_vif->sta.crypto.wpa_versions = 3;
-		rsn = cfg80211_find_ie(WLAN_EID_RSN, sme->ie, sme->ie_len);
-		if (rsn) {
-			int pos;
-
-			pos = 7 + 2 + (rsn[8] * 4) + 2;
-			ndev_vif->sta.crypto.akm_suites[0] = ((rsn[pos + 4] << 24) | (rsn[pos + 3] << 16) | (rsn[pos + 2] << 8) | (rsn[pos + 1]));
-			ndev_vif->sta.rsn_ie_len = rsn[1];
-			if (ndev_vif->sta.rsn_ie) {
-				kfree(ndev_vif->sta.rsn_ie);
-				ndev_vif->sta.rsn_ie = NULL;
-			}
-			/* Len+2 because RSN IE TAG and Length */
-			ndev_vif->sta.rsn_ie = kmalloc(ndev_vif->sta.rsn_ie_len + 2, GFP_KERNEL);
-
-			/* len+2 because RSNIE TAG and Length */
-			if (ndev_vif->sta.rsn_ie)
-				memcpy(ndev_vif->sta.rsn_ie, rsn, ndev_vif->sta.rsn_ie_len + 2);
-		}
-#ifdef CONFIG_SCSC_WLAN_BSS_SELECTION
-		if (ndev_vif->sta.crypto.wpa_versions == 3)
-			ndev_vif->sta.wpa3_auth_state = SLSI_WPA3_PREAUTH;
-#endif
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "RSN IE: : %1d\n", ndev_vif->sta.crypto.akm_suites[0]);
-
-	} else {
-		ndev_vif->sta.crypto.wpa_versions = 0;
-	}
-#endif
-	r = slsi_mlme_connect(sdev, dev, sme, channel, bssid);
-
-	if (r != 0) {
-		ndev_vif->sta.is_wps = false;
-		SLSI_NET_ERR(dev, "connect failed: %d\n", r);
-		netif_carrier_off(dev);
-		goto exit_with_vif;
-	}
-
-	peer = slsi_peer_add(sdev, dev, (u8 *)bssid, SLSI_STA_PEER_QUEUESET + 1);
-	ndev_vif->sta.resp_id = 0;
-	if (!peer) {
-		goto exit_with_error;
-	}
-
-#ifdef CONFIG_SCSC_WLAN_BSS_SELECTION
-	if (ndev_vif->sta.drv_bss_selection) {
-		slsi_save_connection_params(sdev, dev, sme, channel, bssid,
-					    action_frame_bmap, action_frame_suspend_bmap);
-		slsi_set_reset_connect_attempted_flag(sdev, dev, bssid);
-	}
-#endif
-	goto exit;
-
-exit_with_vif:
-	if (slsi_mlme_del_vif(sdev, dev) != 0)
-		SLSI_NET_ERR(dev, "slsi_mlme_del_vif failed\n");
-	slsi_vif_deactivated(sdev, dev);
-exit_with_bss:
-	if (ndev_vif->sta.sta_bss) {
-		slsi_cfg80211_put_bss(wiphy, ndev_vif->sta.sta_bss);
-		ndev_vif->sta.sta_bss = NULL;
-	}
-exit_with_error:
-	r = -EINVAL;
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	SLSI_MUTEX_UNLOCK(sdev->start_stop_mutex);
-	return r;
-}
-
-int slsi_disconnect(struct wiphy *wiphy, struct net_device *dev,
-		    u16 reason_code)
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_peer  *peer;
-	int               r = 0;
-
-	if (cancel_work_sync(&ndev_vif->set_multicast_filter_work))
-		slsi_wakeunlock(&sdev->wlan_wl);
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "reason: %d, vif_index = %d, vif_type = %d\n", reason_code,
-		      ndev_vif->ifnum, ndev_vif->vif_type);
-
-	/* Assuming that the time it takes the firmware to disconnect is not significant
-	 * as this function holds the locks until the MLME-DISCONNECT-IND comes back.
-	 * Unless the MLME-DISCONNECT-CFM fails.
-	 */
-	if (!ndev_vif->activated) {
-		r = 0;
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0))
-		cfg80211_disconnected(dev, reason_code, NULL, 0, false, GFP_KERNEL);
-#else
-		cfg80211_disconnected(dev, reason_code, NULL, 0, GFP_KERNEL);
-#endif
-		SLSI_NET_INFO(dev, "Vif is already Deactivated\n");
-		goto exit;
-	}
-
-	peer = ndev_vif->peer_sta_record[SLSI_STA_PEER_QUEUESET];
-
-	SCSC_WLOG_DRIVER_EVENT(WLOG_NORMAL, WIFI_EVENT_DISASSOCIATION_REQUESTED, 2,
-			       WIFI_TAG_BSSID, ETH_ALEN, peer->address,
-			       WIFI_TAG_REASON_CODE, sizeof(u16), &reason_code);
-
-	switch (ndev_vif->vif_type) {
-	case FAPI_VIFTYPE_STATION:
-	{
-		slsi_reset_throughput_stats(dev);
-		/* Disconnecting spans several host firmware interactions so track the status
-		 * so that the Host can ignore connect related signaling eg. MLME-CONNECT-IND
-		 * now that it has triggered a disconnect.
-		 */
-		ndev_vif->sta.vif_status = SLSI_VIF_STATUS_DISCONNECTING;
-
-		netif_carrier_off(dev);
-		if (peer->valid)
-			slsi_ps_port_control(sdev, dev, peer, SLSI_STA_CONN_STATE_DISCONNECTED);
-
-		/* MLME-DISCONNECT_CFM only means that the firmware has accepted the request it has not yet
-		 * disconnected. Completion of the disconnect is indicated by MLME-DISCONNECT-IND, so have
-		 * to wait for that before deleting the VIF. Also any new activities eg. connect can not yet
-		 * be started on the VIF until the disconnection is completed. So the MLME function also handles
-		 * waiting for the MLME-DISCONNECT-IND (if the CFM is successful)
-		 */
-
-		r = slsi_mlme_disconnect(sdev, dev, peer->address,  reason_code, true);
-		if (r != 0)
-			SLSI_NET_ERR(dev, "Disconnection returned with failure\n");
-		/* Even if we fail to disconnect cleanly, tidy up. */
-		r = slsi_handle_disconnect(sdev, dev, peer->address, 0, NULL, 0);
-
-		break;
-	}
-	default:
-		SLSI_NET_WARN(dev, "Invalid - vif type:%d, device type:%d)\n", ndev_vif->vif_type, ndev_vif->iftype);
-		r = -EINVAL;
-		break;
-	}
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-int slsi_set_default_key(struct wiphy *wiphy, struct net_device *dev,
-			 u8 key_index, bool unicast, bool multicast)
-{
-	SLSI_UNUSED_PARAMETER(wiphy);
-	SLSI_UNUSED_PARAMETER(dev);
-	SLSI_UNUSED_PARAMETER(key_index);
-	SLSI_UNUSED_PARAMETER(unicast);
-	SLSI_UNUSED_PARAMETER(multicast);
-	/* Key is set in add_key. Nothing to do here */
-	return 0;
-}
-
-int slsi_config_default_mgmt_key(struct wiphy      *wiphy,
-				 struct net_device *dev,
-				 u8                key_index)
-{
-	SLSI_UNUSED_PARAMETER(wiphy);
-	SLSI_UNUSED_PARAMETER(key_index);
-	SLSI_UNUSED_PARAMETER(dev);
-
-	return 0;
-}
-
-int slsi_set_wiphy_params(struct wiphy *wiphy, u32 changed)
-{
-	struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
-	int             r = 0;
-
-	SLSI_DBG1(sdev, SLSI_CFG80211, "slsi_set_wiphy_parms Frag Threshold = %d, RTS Threshold = %d",
-		  wiphy->frag_threshold, wiphy->rts_threshold);
-
-	if ((changed & WIPHY_PARAM_FRAG_THRESHOLD) && (wiphy->frag_threshold != -1)) {
-		r = slsi_set_uint_mib(sdev, NULL, SLSI_PSID_DOT11_FRAGMENTATION_THRESHOLD, wiphy->frag_threshold);
-		if (r != 0) {
-			SLSI_ERR(sdev, "Setting FRAG_THRESHOLD failed\n");
-			return r;
-		}
-	}
-
-	if ((changed & WIPHY_PARAM_RTS_THRESHOLD) && (wiphy->rts_threshold != -1)) {
-		r = slsi_set_uint_mib(sdev, NULL, SLSI_PSID_DOT11_RTS_THRESHOLD, wiphy->rts_threshold);
-		if (r != 0) {
-			SLSI_ERR(sdev, "Setting RTS_THRESHOLD failed\n");
-			return r;
-		}
-	}
-
-	return r;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-int slsi_set_tx_power(struct wiphy *wiphy, struct wireless_dev *wdev,
-		      enum nl80211_tx_power_setting type, int mbm)
-#else
-int slsi_set_tx_power(struct wiphy *wiphy,
-		      enum nl80211_tx_power_setting type, int mbm)
-#endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9)) */
-{
-	struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
-	int             r = 0;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	SLSI_UNUSED_PARAMETER(wdev);
-	SLSI_UNUSED_PARAMETER(type);
-#endif
-	SLSI_UNUSED_PARAMETER(mbm);
-	SLSI_UNUSED_PARAMETER_NOT_DEBUG(sdev);
-
-	r = -EOPNOTSUPP;
-
-	return r;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-int slsi_get_tx_power(struct wiphy *wiphy, struct wireless_dev *wdev, int *dbm)
-#else
-int slsi_get_tx_power(struct wiphy *wiphy, int *dbm)
-#endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9)) */
-{
-	struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
-	int             r = 0;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	SLSI_UNUSED_PARAMETER(wdev);
-#endif
-	SLSI_UNUSED_PARAMETER(dbm);
-	SLSI_UNUSED_PARAMETER_NOT_DEBUG(sdev);
-
-	r = -EOPNOTSUPP;
-
-	return r;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0))
-int slsi_del_station(struct wiphy *wiphy, struct net_device *dev,
-		     struct station_del_parameters *del_params)
-#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0))
-int slsi_del_station(struct wiphy *wiphy, struct net_device *dev,
-		     const u8 *mac)
-#else
-int slsi_del_station(struct wiphy *wiphy, struct net_device *dev,
-		     u8 *mac)
-#endif
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_peer  *peer;
-	int               r = 0;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0))
-	const u8          *mac = del_params->mac;
-#endif
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "%pM, vifType:%d, vifIndex:%d vifActivated:%d ap.p2p_gc_keys_set = %d\n",
-		      mac, ndev_vif->vif_type, ndev_vif->ifnum, ndev_vif->activated, ndev_vif->ap.p2p_gc_keys_set);
-
-	/* Function is called by cfg80211 before the VIF is added */
-	if (!ndev_vif->activated)
-		goto exit;
-
-	if (FAPI_VIFTYPE_AP != ndev_vif->vif_type) {
-		r = -EINVAL;
-		goto exit;
-	}
-	/* MAC with NULL value will come in case of flushing VLANS . Ignore this.*/
-	if (!mac)
-		goto exit;
-	else if (is_broadcast_ether_addr(mac)) {
-		int  i = 0;
-		bool peer_connected = false;
-
-		while (i < SLSI_PEER_INDEX_MAX) {
-			peer = ndev_vif->peer_sta_record[i];
-			if (peer && peer->valid) {
-				slsi_ps_port_control(sdev, dev, peer, SLSI_STA_CONN_STATE_DISCONNECTED);
-				peer_connected = true;
-			}
-			++i;
-		}
-		if (peer_connected) {
-			if (slsi_mlme_disconnect(sdev, dev, 0, WLAN_REASON_DEAUTH_LEAVING, true) != 0)
-				SLSI_NET_ERR(dev, "Disconnection for peermac=00:00:00:00:00:00 returned with CFM failure\n");
-		}
-		/* Note AP :: mlme_disconnect_request with broadcast mac address is
-		 * not required. Other third party devices don't support this. Conclusively,
-		 * BIP support is not present with AP
-		 */
-	} else {
-		peer = slsi_get_peer_from_mac(sdev, dev, mac);
-		if (peer) {  /* To handle race condition when disconnect_req is sent before procedure_strted_ind and before mlme-connected_ind*/
-			if (peer->connected_state == SLSI_STA_CONN_STATE_CONNECTING) {
-				SLSI_NET_DBG1(dev, SLSI_CFG80211, "SLSI_STA_CONN_STATE_CONNECTING : mlme-disconnect-req dropped at driver\n");
-				goto exit;
-			}
-			if (peer->is_wps) {
-				/* To inter-op with Intel STA in P2P cert need to discard the deauth after successful WPS handshake as a P2P GO */
-				SLSI_NET_INFO(dev, "DISCONNECT after WPS : mlme-disconnect-req dropped at driver\n");
-				goto exit;
-			}
-			slsi_ps_port_control(sdev, dev, peer, SLSI_STA_CONN_STATE_DISCONNECTED);
-			r = slsi_mlme_disconnect(sdev, dev, peer->address, WLAN_REASON_DEAUTH_LEAVING, true);
-			if (r != 0)
-				SLSI_NET_ERR(dev, "Disconnection returned with failure\n");
-			/* Even if we fail to disconnect cleanly, tidy up. */
-			r = slsi_handle_disconnect(sdev, dev, peer->address, WLAN_REASON_DEAUTH_LEAVING, NULL, 0);
-		}
-	}
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0))
-int slsi_get_station(struct wiphy *wiphy, struct net_device *dev,
-		     const u8 *mac, struct station_info *sinfo)
-#else
-int slsi_get_station(struct wiphy *wiphy, struct net_device *dev,
-		     u8 *mac, struct station_info *sinfo)
-#endif
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_peer  *peer;
-	int               r = 0;
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	if (!ndev_vif->activated) {
-		r = -EINVAL;
-		goto exit;
-	}
-
-	peer = slsi_get_peer_from_mac(sdev, dev, mac);
-	if (!peer) {
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "%pM : Not Found\n", mac);
-		r = -EINVAL;
-		goto exit;
-	}
-
-	if (((ndev_vif->iftype == NL80211_IFTYPE_STATION && !(ndev_vif->sta.roam_in_progress)) ||
-	     ndev_vif->iftype == NL80211_IFTYPE_P2P_CLIENT)) {
-		/*Read MIB and fill into the peer.sinfo*/
-		r = slsi_mlme_get_sinfo_mib(sdev, dev, peer);
-		if (r) {
-			SLSI_NET_DBG1(dev, SLSI_CFG80211, "failed to read Station Info Error:%d\n", r);
-			goto exit;
-		}
-	}
-
-	*sinfo = peer->sinfo;
-	sinfo->generation = ndev_vif->cfg80211_sinfo_generation;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-			SLSI_NET_DBG1(dev, SLSI_CFG80211, "%pM, tx:%d, txbytes:%llu, rx:%d, rxbytes:%llu tx_fail:%d tx_retry:%d\n",
-				      mac,
-				      peer->sinfo.tx_packets,
-				      peer->sinfo.tx_bytes,
-				      peer->sinfo.rx_packets,
-				      peer->sinfo.rx_bytes,
-				      peer->sinfo.tx_failed,
-				      peer->sinfo.tx_retries);
-#else
-			SLSI_NET_DBG1(dev, SLSI_CFG80211, "%pM, tx:%d, txbytes:%d, rx:%d, rxbytes:%d  tx_fail:%d tx_retry:%d\n",
-				      mac,
-				      peer->sinfo.tx_packets,
-				      peer->sinfo.tx_bytes,
-				      peer->sinfo.rx_packets,
-				      peer->sinfo.rx_bytes,
-				      peer->sinfo.tx_failed,
-				      peer->sinfo.tx_retries);
-#endif
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-int slsi_set_power_mgmt(struct wiphy *wiphy, struct net_device *dev,
-			bool enabled, int timeout)
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	int               r = -EINVAL;
-	u16               pwr_mode = enabled ? FAPI_POWERMANAGEMENTMODE_POWER_SAVE : FAPI_POWERMANAGEMENTMODE_ACTIVE_MODE;
-
-	SLSI_UNUSED_PARAMETER(timeout);
-	if (slsi_is_test_mode_enabled()) {
-		SLSI_NET_INFO(dev, "Skip sending signal, WlanLite FW does not support MLME_POWERMGT.request\n");
-		return -EOPNOTSUPP;
-	}
-
-	if (slsi_is_rf_test_mode_enabled()) {
-		SLSI_NET_INFO(dev, "Skip sending signal, RF test does not support.\n");
-		return -EOPNOTSUPP;
-	}
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG3(dev, SLSI_CFG80211, "enabled:%d, vif_type:%d, vif_index:%d\n", enabled, ndev_vif->vif_type,
-		      ndev_vif->ifnum);
-
-	if (ndev_vif->activated && ndev_vif->vif_type == FAPI_VIFTYPE_STATION) {
-		ndev_vif->set_power_mode = pwr_mode;
-		r = slsi_mlme_powermgt(sdev, dev, pwr_mode);
-	} else {
-		r = 0;
-	}
-
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 18))
-int slsi_tdls_oper(struct wiphy *wiphy, struct net_device *dev, const u8 *peer, enum nl80211_tdls_operation oper)
-#else
-int slsi_tdls_oper(struct wiphy *wiphy, struct net_device *dev, u8 *peer, enum nl80211_tdls_operation oper)
-#endif
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	int               r = 0;
-
-	SLSI_NET_DBG3(dev, SLSI_CFG80211, "oper:%d, vif_type:%d, vif_index:%d\n", oper, ndev_vif->vif_type,
-		      ndev_vif->ifnum);
-
-	if (!(wiphy->flags & WIPHY_FLAG_SUPPORTS_TDLS))
-		return -ENOTSUPP;
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	if (!ndev_vif->activated || SLSI_IS_VIF_INDEX_P2P_GROUP(sdev, ndev_vif) ||
-	    ndev_vif->sta.vif_status != SLSI_VIF_STATUS_CONNECTED) {
-		r = -ENOTSUPP;
-		goto exit;
-	}
-
-	switch (oper) {
-	case NL80211_TDLS_DISCOVERY_REQ:
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "NL80211_TDLS_DISCOVERY_REQ\n");
-		r = slsi_mlme_tdls_action(sdev, dev, peer, FAPI_TDLSACTION_DISCOVERY, 0, 0);
-		break;
-	case NL80211_TDLS_SETUP:
-		r = slsi_mlme_tdls_action(sdev, dev, peer, FAPI_TDLSACTION_SETUP, 0, 0);
-		break;
-	case NL80211_TDLS_TEARDOWN:
-		r = slsi_mlme_tdls_action(sdev, dev, peer, FAPI_TDLSACTION_TEARDOWN, 0, 0);
-		break;
-	default:
-		r = -EOPNOTSUPP;
-		goto exit;
-	}
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
-int slsi_set_qos_map(struct wiphy *wiphy, struct net_device *dev, struct cfg80211_qos_map *qos_map)
-{
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_peer  *peer;
-	int               r = 0;
-
-	/* Cleaning up is inherently taken care by driver */
-	if (!qos_map)
-		return r;
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	if (!ndev_vif->activated) {
-		r = -EINVAL;
-		goto exit;
-	}
-
-	if (ndev_vif->vif_type != FAPI_VIFTYPE_STATION) {
-		r = -EINVAL;
-		goto exit;
-	}
-
-	SLSI_NET_DBG3(dev, SLSI_CFG80211, "Set QoS Map\n");
-	peer = ndev_vif->peer_sta_record[SLSI_STA_PEER_QUEUESET];
-	if (!peer || !peer->valid) {
-		r = -EINVAL;
-		goto exit;
-	}
-
-	memcpy(&peer->qos_map, qos_map, sizeof(struct cfg80211_qos_map));
-	peer->qos_map_set = true;
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-#endif
-
-int slsi_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wow)
-{
-	SLSI_UNUSED_PARAMETER(wow);
-
-	return 0;
-}
-
-int slsi_resume(struct wiphy *wiphy)
-{
-	struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
-
-	/* Scheduling the IO thread */
-/*	(void)slsi_hip_run_bh(sdev); */
-	SLSI_UNUSED_PARAMETER(sdev);
-
-	return 0;
-}
-
-int slsi_set_pmksa(struct wiphy *wiphy, struct net_device *dev,
-		   struct cfg80211_pmksa *pmksa)
-{
-#ifdef CONFIG_SCSC_WLAN_SAE_CONFIG
-	int i = 0;
-	struct slsi_dev     *sdev = SDEV_FROM_WIPHY(wiphy);
-	u8 *rsnie; /* final RSN IE with the PMKID*/
-	u16 rsnie_len;
-	int left = 0;
-	u16 count = 0;
-	int ret = 0;
-	int pos = 0;
-	struct netdev_vif   *ndev_vif = netdev_priv(dev);
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-	if (ndev_vif->sta.rsn_ie) {
-		rsnie_len = ndev_vif->sta.rsn_ie_len;
-		rsnie = kmalloc(rsnie_len+2+PMKID_LEN, GFP_KERNEL); /* Length of RSNIE + PMKID */
-		if (rsnie) {
-			memset(rsnie, 0, rsnie_len+2+PMKID_LEN);
-			/* parse the RSN IE and copy PMKID to Required position in RSN IE*/
-			left = rsnie_len + 2; //FOR RSN IE TAG and Length
-
-			pos = 4; /* RSN IE ID, LEN, and Version*/
-			left -= 4;
-			if (left < 4) {
-				kfree(rsnie);
-				kfree(ndev_vif->sta.rsn_ie);
-				ndev_vif->sta.rsn_ie = NULL;
-				ret = -EINVAL;
-				goto exit;
-			}
-			pos += RSN_SELECTOR_LEN; /* Group cipher suite */
-			left -= RSN_SELECTOR_LEN;
-
-			/* Pairwise and AKM suite count and suite list */
-			i = 0;
-			while (i < 2) {
-				pos += 2;
-				left -= 2;
-				count = le16_to_cpu(*(u16 *)(&ndev_vif->sta.rsn_ie[pos-2]));
-				pos += count * RSN_SELECTOR_LEN;
-				left -= count * RSN_SELECTOR_LEN;
-				i++;
-			}
-			pos += 2; /* RSN Capabilities */
-			left -= 2;
-			count = le16_to_cpu(*(u16 *)(&ndev_vif->sta.rsn_ie[pos]));  /* PMKID count */
-			pos += 2; /* PMKID count */
-			left -= 2;
-			memcpy(rsnie, ndev_vif->sta.rsn_ie, pos);
-			rsnie[pos-2] = 1;
-			rsnie[pos-1] = 0;
-			memcpy(&rsnie[pos], pmksa->pmkid, PMKID_LEN); /* copy PMKID */
-			pos += PMKID_LEN;
-			if (count) {
-				left -= PMKID_LEN;
-				memcpy(&rsnie[pos], &ndev_vif->sta.rsn_ie[pos], left);
-			} else {
-				memcpy(&rsnie[pos], &ndev_vif->sta.rsn_ie[pos-PMKID_LEN], left);
-			}
-			pos += left;
-			rsnie_len = pos;
-			rsnie[1] = rsnie_len - 2;
-			ret = slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_ASSOCIATION_REQUEST, rsnie, rsnie_len);
-			if (ret != 0) {
-				SLSI_NET_ERR(dev, "RSN IE with PMKID setting failed\n");
-				kfree(rsnie);
-				kfree(ndev_vif->sta.rsn_ie);
-				ndev_vif->sta.rsn_ie = NULL;
-				goto exit;
-			}
-			kfree(rsnie);
-		} else {
-			SLSI_NET_ERR(dev, "Out of memory for RSN IE\n");
-			ret = -ENOMEM;
-			goto exit;
-		}
-	} else {
-		SLSI_NET_ERR(dev, "RSN IE is not present in Station VIF\n");
-		ret = -EINVAL;
-		goto exit;
-	}
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
 	return ret;
-#else
-	SLSI_UNUSED_PARAMETER(wiphy);
-	SLSI_UNUSED_PARAMETER(dev);
-	SLSI_UNUSED_PARAMETER(pmksa);
-	return 0;
-
-#endif
 }
+EXPORT_SYMBOL_GPL(crypto_register_rngs);
 
-int slsi_del_pmksa(struct wiphy *wiphy, struct net_device *dev,
-		   struct cfg80211_pmksa *pmksa)
-{
-#ifdef CONFIG_SCSC_WLAN_SAE_CONFIG
-	struct slsi_dev     *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif   *ndev_vif = netdev_priv(dev);
-	int ret = 0;
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-	if (!ndev_vif->activated) {
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "VIF not activated\n");
-		goto exit;
-	}
-	ret = slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_ASSOCIATION_REQUEST, NULL, 0);
-	if (ret != 0) {
-		SLSI_NET_ERR(dev, "Clearing PMKID failed\n");
-		goto exit;
-	}
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return ret;
-#else
-
-	SLSI_UNUSED_PARAMETER(wiphy);
-	SLSI_UNUSED_PARAMETER(dev);
-	SLSI_UNUSED_PARAMETER(pmksa);
-	return 0;
-#endif
-}
-
-int slsi_flush_pmksa(struct wiphy *wiphy, struct net_device *dev)
-{
-	SLSI_UNUSED_PARAMETER(wiphy);
-	SLSI_UNUSED_PARAMETER(dev);
-	return 0;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-int slsi_remain_on_channel(struct wiphy             *wiphy,
-			   struct wireless_dev      *wdev,
-			   struct ieee80211_channel *chan,
-			   unsigned int             duration,
-			   u64                      *cookie)
-{
-	struct net_device *dev = wdev->netdev;
-
-#else
-int slsi_remain_on_channel(struct wiphy              *wiphy,
-			   struct net_device         *dev,
-			   struct ieee80211_channel  *chan,
-			   enum nl80211_channel_type channel_type,
-			   unsigned int              duration,
-			   u64                       *cookie)
-{
-#endif  /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9)) */
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	int               r = 0;
-
-	SLSI_MUTEX_LOCK(sdev->start_stop_mutex);
-	if (sdev->device_state != SLSI_DEVICE_STATE_STARTED) {
-		SLSI_WARN(sdev, "device not started yet (device_state:%d)\n", sdev->device_state);
-		goto exit_with_error;
-	}
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "channel freq = %d, duration = %d, vif_type = %d, vif_index = %d,"
-		      "sdev->p2p_state = %s\n", chan->center_freq, duration, ndev_vif->vif_type, ndev_vif->ifnum,
-		      slsi_p2p_state_text(sdev->p2p_state));
-	if (!SLSI_IS_VIF_INDEX_P2P(ndev_vif)) {
-		SLSI_NET_ERR(dev, "Invalid vif type\n");
-		goto exit_with_error;
-	}
-
-	if (SLSI_IS_P2P_GROUP_STATE(sdev)) {
-		slsi_assign_cookie_id(cookie, &ndev_vif->unsync.roc_cookie);
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-		cfg80211_ready_on_channel(wdev, *cookie, chan, duration, GFP_KERNEL);
-		cfg80211_remain_on_channel_expired(wdev, *cookie, chan, GFP_KERNEL);
-#else
-		cfg80211_ready_on_channel(dev, *cookie, chan, channel_type, duration, GFP_KERNEL);
-		cfg80211_remain_on_channel_expired(dev, *cookie, chan, channel_type, GFP_KERNEL);
-#endif
-		goto exit;
-	}
-
-	/* Unsync vif will be required, cancel any pending work of its deletion */
-	cancel_delayed_work(&ndev_vif->unsync.del_vif_work);
-
-	/* Ideally, there should not be any ROC work pending. However, supplicant can send back to back ROC in a race scenario as below.
-	 * If action frame is received while P2P social scan, the response frame tx is delayed till scan completes. After scan completion,
-	 * frame tx is done and ROC is started. Upon frame tx status, supplicant sends another ROC without cancelling the previous one.
-	 */
-	cancel_delayed_work(&ndev_vif->unsync.roc_expiry_work);
-
-	/* If action frame tx is in progress and ROC comes, then it would mean action frame tx was done in ROC and
-	 * frame tx ind is awaited, don't change state. Also allow back to back ROC in case it comes.
-	 */
-	if (sdev->p2p_state == P2P_ACTION_FRAME_TX_RX || sdev->p2p_state == P2P_LISTENING) {
-		goto exit_with_roc;
-	}
-
-	/* Unsync vif activation: Possible P2P state at this point is P2P_IDLE_NO_VIF or P2P_IDLE_VIF_ACTIVE */
-	if (sdev->p2p_state == P2P_IDLE_NO_VIF) {
-		if (slsi_p2p_vif_activate(sdev, dev, chan, duration, true) != 0)
-			goto exit_with_error;
-	} else if (sdev->p2p_state == P2P_IDLE_VIF_ACTIVE) {
-		/* Configure Probe Response IEs in firmware if they have changed */
-		if (ndev_vif->unsync.ies_changed) {
-			u16 purpose = FAPI_PURPOSE_PROBE_RESPONSE;
-
-			if (slsi_mlme_add_info_elements(sdev, dev, purpose, ndev_vif->unsync.probe_rsp_ies, ndev_vif->unsync.probe_rsp_ies_len) != 0) {
-				SLSI_NET_ERR(dev, "Probe Rsp IEs setting failed\n");
-				goto exit_with_vif;
-			}
-			ndev_vif->unsync.ies_changed = false;
-		}
-		/* Channel Setting - Don't set if already on same channel */
-		if (ndev_vif->chan && (ndev_vif->chan->hw_value != chan->hw_value)) {
-			if (slsi_mlme_set_channel(sdev, dev, chan, SLSI_FW_CHANNEL_DURATION_UNSPECIFIED, 0, 0) != 0) {
-				SLSI_NET_ERR(dev, "Channel setting failed\n");
-				goto exit_with_vif;
-			} else {
-				ndev_vif->chan = chan;
-			}
-		}
-	} else {
-		SLSI_NET_ERR(dev, "Driver in incorrect P2P state (%s)", slsi_p2p_state_text(sdev->p2p_state));
-		goto exit_with_error;
-	}
-
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 9))
-	ndev_vif->channel_type = channel_type;
-#endif
-
-	SLSI_P2P_STATE_CHANGE(sdev, P2P_LISTENING);
-
-exit_with_roc:
-	queue_delayed_work(sdev->device_wq, &ndev_vif->unsync.roc_expiry_work,
-			   msecs_to_jiffies(duration + SLSI_P2P_ROC_EXTRA_MSEC));
-
-	slsi_assign_cookie_id(cookie, &ndev_vif->unsync.roc_cookie);
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "Cookie = 0x%llx\n", *cookie);
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	cfg80211_ready_on_channel(wdev, *cookie, chan, duration, GFP_KERNEL);
-#else
-	cfg80211_ready_on_channel(dev, *cookie, chan, channel_type, duration, GFP_KERNEL);
-#endif
-
-	goto exit;
-
-exit_with_vif:
-	slsi_p2p_vif_deactivate(sdev, dev, true);
-exit_with_error:
-	r = -EINVAL;
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	SLSI_MUTEX_UNLOCK(sdev->start_stop_mutex);
-	return r;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-int slsi_cancel_remain_on_channel(struct wiphy        *wiphy,
-				  struct wireless_dev *wdev,
-				  u64                 cookie)
-{
-	struct net_device *dev = wdev->netdev;
-
-#else
-int slsi_cancel_remain_on_channel(struct wiphy      *wiphy,
-				  struct net_device *dev,
-				  u64               cookie)
-{
-#endif  /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9)) */
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	int               r = 0;
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "Cookie = 0x%llx, vif_type = %d, vif_index = %d, sdev->p2p_state = %s,"
-		      "ndev_vif->ap.p2p_gc_keys_set = %d, ndev_vif->unsync.roc_cookie = 0x%llx\n", cookie,
-		      ndev_vif->vif_type, ndev_vif->ifnum, slsi_p2p_state_text(sdev->p2p_state),
-		      ndev_vif->ap.p2p_gc_keys_set, ndev_vif->unsync.roc_cookie);
-
-	if (!SLSI_IS_VIF_INDEX_P2P(ndev_vif)) {
-		SLSI_NET_ERR(dev, "Invalid vif type\n");
-		r = -EINVAL;
-		goto exit;
-	}
-
-	if (!((sdev->p2p_state == P2P_LISTENING) || (sdev->p2p_state == P2P_ACTION_FRAME_TX_RX))) {
-		goto exit;
-	}
-
-	if (sdev->p2p_state == P2P_ACTION_FRAME_TX_RX && ndev_vif->mgmt_tx_data.exp_frame != SLSI_PA_INVALID) {
-		/* Reset the expected action frame as procedure got completed */
-		SLSI_INFO(sdev, "Action frame (%s) was not received\n", slsi_pa_subtype_text(ndev_vif->mgmt_tx_data.exp_frame));
-		ndev_vif->mgmt_tx_data.exp_frame = SLSI_PA_INVALID;
-	}
-
-	cancel_delayed_work(&ndev_vif->unsync.roc_expiry_work);
-
-	/* Supplicant has stopped FIND/LISTEN. Clear Probe Response IEs in firmware and driver */
-	if (slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_PROBE_RESPONSE, NULL, 0) != 0)
-		SLSI_NET_ERR(dev, "Clearing Probe Response IEs failed for unsync vif\n");
-	slsi_unsync_vif_set_probe_rsp_ie(ndev_vif, NULL, 0);
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	cfg80211_remain_on_channel_expired(&ndev_vif->wdev, ndev_vif->unsync.roc_cookie, ndev_vif->chan, GFP_KERNEL);
-#else
-	cfg80211_remain_on_channel_expired(ndev_vif->wdev.netdev, ndev_vif->unsync.roc_cookie,
-					   ndev_vif->chan, ndev_vif->channel_type, GFP_KERNEL);
-#endif
-
-	/* Queue work to delete unsync vif */
-	slsi_p2p_queue_unsync_vif_del_work(ndev_vif, SLSI_P2P_UNSYNC_VIF_EXTRA_MSEC);
-	SLSI_P2P_STATE_CHANGE(sdev, P2P_IDLE_VIF_ACTIVE);
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-int slsi_change_bss(struct wiphy *wiphy, struct net_device *dev,
-		    struct bss_parameters *params)
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	int               r = 0;
-
-	SLSI_UNUSED_PARAMETER(params);
-	SLSI_UNUSED_PARAMETER_NOT_DEBUG(sdev);
-
-	return r;
-}
-
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(3, 5, 0))
-int slsi_set_channel(struct wiphy *wiphy, struct net_device *dev,
-		     struct ieee80211_channel *chan,
-		     enum nl80211_channel_type channel_type)
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	int               r = 0;
-
-	SLSI_UNUSED_PARAMETER_NOT_DEBUG(sdev);
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG3(dev, SLSI_CFG80211, "channel_type:%u, freq:%u, vif_index:%d, vif_type:%d\n", channel_type,
-		      chan->center_freq, ndev_vif->ifnum, ndev_vif->vif_type);
-	if (WARN_ON(ndev_vif->activated)) {
-		r = -EINVAL;
-		goto exit;
-	}
-
-	ndev_vif->channel_type = channel_type;
-	ndev_vif->chan = chan;
-
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-#endif /* (LINUX_VERSION_CODE <= KERNEL_VERSION(3, 5, 0)) */
-
-static void slsi_ap_start_obss_scan(struct slsi_dev *sdev, struct net_device *dev, struct netdev_vif *ndev_vif)
-{
-	struct cfg80211_ssid     ssids;
-	struct ieee80211_channel *channel;
-	int                      n_ssids = 1, n_channels = 1, i;
-
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "channel %u\n", ndev_vif->chan->hw_value);
-
-	SLSI_MUTEX_LOCK(ndev_vif->scan_mutex);
-
-	ssids.ssid_len = 0;
-	for (i = 0; i < IEEE80211_MAX_SSID_LEN; i++)
-		ssids.ssid[i] = 0x00;   /* Broadcast SSID */
-
-	channel = ieee80211_get_channel(sdev->wiphy, ndev_vif->chan->center_freq);
-
-	ndev_vif->scan[SLSI_SCAN_HW_ID].is_blocking_scan = true;
-	(void)slsi_mlme_add_scan(sdev,
-				 dev,
-				 FAPI_SCANTYPE_OBSS_SCAN,
-				 FAPI_REPORTMODE_REAL_TIME,
-				 n_ssids,
-				 &ssids,
-				 n_channels,
-				 &channel,
-				 NULL,
-				 NULL, /* No IEs */
-				 0,
-				 ndev_vif->scan[SLSI_SCAN_HW_ID].is_blocking_scan /* Wait for scan_done_ind */);
-
-	slsi_ap_obss_scan_done_ind(dev, ndev_vif);
-	ndev_vif->scan[SLSI_SCAN_HW_ID].is_blocking_scan = false;
-	SLSI_MUTEX_UNLOCK(ndev_vif->scan_mutex);
-}
-
-static int slsi_ap_start_validate(struct net_device *dev, struct slsi_dev *sdev, struct cfg80211_ap_settings *settings)
-{
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-
-	if (SLSI_IS_VIF_INDEX_P2P(ndev_vif)) {
-		SLSI_NET_ERR(dev, "AP start requested on incorrect vif\n");
-		goto exit_with_error;
-	}
-
-	if (!settings->ssid_len || !settings->ssid) {
-		SLSI_NET_ERR(dev, "SSID not provided\n");
-		goto exit_with_error;
-	}
-
-	if (!settings->beacon.head_len || !settings->beacon.head) {
-		SLSI_NET_ERR(dev, "Beacon not provided\n");
-		goto exit_with_error;
-	}
-
-	if (!settings->beacon_interval) {
-		SLSI_NET_ERR(dev, "Beacon Interval not provided\n");
-		goto exit_with_error;
-	}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	ndev_vif->chandef = &settings->chandef;
-	ndev_vif->chan = ndev_vif->chandef->chan;
-#endif
-	if (WARN_ON(!ndev_vif->chan))
-		goto exit_with_error;
-
-	if (WARN_ON(ndev_vif->activated))
-		goto exit_with_error;
-
-	if (WARN_ON((ndev_vif->iftype != NL80211_IFTYPE_AP) && (ndev_vif->iftype != NL80211_IFTYPE_P2P_GO)))
-		goto exit_with_error;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	if ((ndev_vif->chan->hw_value <= 14) && (!sdev->fw_SoftAp_2g_40mhz_enabled) &&
-	    (ndev_vif->chandef->width == NL80211_CHAN_WIDTH_40)) {
-		SLSI_NET_ERR(dev, "Configuration error: 40 MHz on 2.4 GHz is not supported. Channel_no: %d Channel_width: %d\n", ndev_vif->chan->hw_value, slsi_get_chann_info(sdev, ndev_vif->chandef));
-		goto exit_with_error;
-	}
-#else
-	if ((ndev_vif->chan->hw_value <= 14) && (!sdev->fw_SoftAp_2g_40mhz_enabled) &&
-	    (ndev_vif->channel_type > NL80211_CHAN_HT20)) {
-		SLSI_NET_ERR(dev, "Configuration error: 40 MHz on 2.4 GHz is not supported. Channel_no: %d Channel_width: %d\n", ndev_vif->chan->hw_value, slsi_get_chann_info(sdev, ndev_vif->channel_type));
-		goto exit_with_error;
-	}
-#endif
-
-	return 0;
-
-exit_with_error:
-	return -EINVAL;
-}
-
-static int slsi_get_max_bw_mhz(struct slsi_dev *sdev, u16 prim_chan_cf)
+void crypto_unregister_rngs(struct rng_alg *algs, int count)
 {
 	int i;
-	struct ieee80211_regdomain *regd = sdev->device_config.domain_info.regdomain;
 
-	if (!regd) {
-		SLSI_WARN(sdev, "NO regdomain info\n");
+	for (i = count - 1; i >= 0; --i)
+		crypto_unregister_rng(algs + i);
+}
+EXPORT_SYMBOL_GPL(crypto_unregister_rngs);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Random Number Generator");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /* RSA asymmetric public-key algorithm [RFC3447]
+ *
+ * Copyright (c) 2015, Intel Corporation
+ * Authors: Tadeusz Struk <tadeusz.struk@intel.com>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public Licence
+ * as published by the Free Software Foundation; either version
+ * 2 of the Licence, or (at your option) any later version.
+ */
+
+#include <linux/module.h>
+#include <crypto/internal/rsa.h>
+#include <crypto/internal/akcipher.h>
+#include <crypto/akcipher.h>
+
+/*
+ * RSAEP function [RFC3447 sec 5.1.1]
+ * c = m^e mod n;
+ */
+static int _rsa_enc(const struct rsa_key *key, MPI c, MPI m)
+{
+	/* (1) Validate 0 <= m < n */
+	if (mpi_cmp_ui(m, 0) < 0 || mpi_cmp(m, key->n) >= 0)
+		return -EINVAL;
+
+	/* (2) c = m^e mod n */
+	return mpi_powm(c, m, key->e, key->n);
+}
+
+/*
+ * RSADP function [RFC3447 sec 5.1.2]
+ * m = c^d mod n;
+ */
+static int _rsa_dec(const struct rsa_key *key, MPI m, MPI c)
+{
+	/* (1) Validate 0 <= c < n */
+	if (mpi_cmp_ui(c, 0) < 0 || mpi_cmp(c, key->n) >= 0)
+		return -EINVAL;
+
+	/* (2) m = c^d mod n */
+	return mpi_powm(m, c, key->d, key->n);
+}
+
+/*
+ * RSASP1 function [RFC3447 sec 5.2.1]
+ * s = m^d mod n
+ */
+static int _rsa_sign(const struct rsa_key *key, MPI s, MPI m)
+{
+	/* (1) Validate 0 <= m < n */
+	if (mpi_cmp_ui(m, 0) < 0 || mpi_cmp(m, key->n) >= 0)
+		return -EINVAL;
+
+	/* (2) s = m^d mod n */
+	return mpi_powm(s, m, key->d, key->n);
+}
+
+/*
+ * RSAVP1 function [RFC3447 sec 5.2.2]
+ * m = s^e mod n;
+ */
+static int _rsa_verify(const struct rsa_key *key, MPI m, MPI s)
+{
+	/* (1) Validate 0 <= s < n */
+	if (mpi_cmp_ui(s, 0) < 0 || mpi_cmp(s, key->n) >= 0)
+		return -EINVAL;
+
+	/* (2) m = s^e mod n */
+	return mpi_powm(m, s, key->e, key->n);
+}
+
+static inline struct rsa_key *rsa_get_key(struct crypto_akcipher *tfm)
+{
+	return akcipher_tfm_ctx(tfm);
+}
+
+static int rsa_enc(struct akcipher_request *req)
+{
+	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
+	const struct rsa_key *pkey = rsa_get_key(tfm);
+	MPI m, c = mpi_alloc(0);
+	int ret = 0;
+	int sign;
+
+	if (!c)
+		return -ENOMEM;
+
+	if (unlikely(!pkey->n || !pkey->e)) {
+		ret = -EINVAL;
+		goto err_free_c;
+	}
+
+	if (req->dst_len < mpi_get_size(pkey->n)) {
+		req->dst_len = mpi_get_size(pkey->n);
+		ret = -EOVERFLOW;
+		goto err_free_c;
+	}
+
+	ret = -ENOMEM;
+	m = mpi_read_raw_from_sgl(req->src, req->src_len);
+	if (!m)
+		goto err_free_c;
+
+	ret = _rsa_enc(pkey, c, m);
+	if (ret)
+		goto err_free_m;
+
+	ret = mpi_write_to_sgl(c, req->dst, &req->dst_len, &sign);
+	if (ret)
+		goto err_free_m;
+
+	if (sign < 0)
+		ret = -EBADMSG;
+
+err_free_m:
+	mpi_free(m);
+err_free_c:
+	mpi_free(c);
+	return ret;
+}
+
+static int rsa_dec(struct akcipher_request *req)
+{
+	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
+	const struct rsa_key *pkey = rsa_get_key(tfm);
+	MPI c, m = mpi_alloc(0);
+	int ret = 0;
+	int sign;
+
+	if (!m)
+		return -ENOMEM;
+
+	if (unlikely(!pkey->n || !pkey->d)) {
+		ret = -EINVAL;
+		goto err_free_m;
+	}
+
+	if (req->dst_len < mpi_get_size(pkey->n)) {
+		req->dst_len = mpi_get_size(pkey->n);
+		ret = -EOVERFLOW;
+		goto err_free_m;
+	}
+
+	ret = -ENOMEM;
+	c = mpi_read_raw_from_sgl(req->src, req->src_len);
+	if (!c)
+		goto err_free_m;
+
+	ret = _rsa_dec(pkey, m, c);
+	if (ret)
+		goto err_free_c;
+
+	ret = mpi_write_to_sgl(m, req->dst, &req->dst_len, &sign);
+	if (ret)
+		goto err_free_c;
+
+	if (sign < 0)
+		ret = -EBADMSG;
+err_free_c:
+	mpi_free(c);
+err_free_m:
+	mpi_free(m);
+	return ret;
+}
+
+static int rsa_sign(struct akcipher_request *req)
+{
+	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
+	const struct rsa_key *pkey = rsa_get_key(tfm);
+	MPI m, s = mpi_alloc(0);
+	int ret = 0;
+	int sign;
+
+	if (!s)
+		return -ENOMEM;
+
+	if (unlikely(!pkey->n || !pkey->d)) {
+		ret = -EINVAL;
+		goto err_free_s;
+	}
+
+	if (req->dst_len < mpi_get_size(pkey->n)) {
+		req->dst_len = mpi_get_size(pkey->n);
+		ret = -EOVERFLOW;
+		goto err_free_s;
+	}
+
+	ret = -ENOMEM;
+	m = mpi_read_raw_from_sgl(req->src, req->src_len);
+	if (!m)
+		goto err_free_s;
+
+	ret = _rsa_sign(pkey, s, m);
+	if (ret)
+		goto err_free_m;
+
+	ret = mpi_write_to_sgl(s, req->dst, &req->dst_len, &sign);
+	if (ret)
+		goto err_free_m;
+
+	if (sign < 0)
+		ret = -EBADMSG;
+
+err_free_m:
+	mpi_free(m);
+err_free_s:
+	mpi_free(s);
+	return ret;
+}
+
+static int rsa_verify(struct akcipher_request *req)
+{
+	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
+	const struct rsa_key *pkey = rsa_get_key(tfm);
+	MPI s, m = mpi_alloc(0);
+	int ret = 0;
+	int sign;
+
+	if (!m)
+		return -ENOMEM;
+
+	if (unlikely(!pkey->n || !pkey->e)) {
+		ret = -EINVAL;
+		goto err_free_m;
+	}
+
+	if (req->dst_len < mpi_get_size(pkey->n)) {
+		req->dst_len = mpi_get_size(pkey->n);
+		ret = -EOVERFLOW;
+		goto err_free_m;
+	}
+
+	ret = -ENOMEM;
+	s = mpi_read_raw_from_sgl(req->src, req->src_len);
+	if (!s) {
+		ret = -ENOMEM;
+		goto err_free_m;
+	}
+
+	ret = _rsa_verify(pkey, m, s);
+	if (ret)
+		goto err_free_s;
+
+	ret = mpi_write_to_sgl(m, req->dst, &req->dst_len, &sign);
+	if (ret)
+		goto err_free_s;
+
+	if (sign < 0)
+		ret = -EBADMSG;
+
+err_free_s:
+	mpi_free(s);
+err_free_m:
+	mpi_free(m);
+	return ret;
+}
+
+static int rsa_check_key_length(unsigned int len)
+{
+	switch (len) {
+	case 512:
+	case 1024:
+	case 1536:
+	case 2048:
+	case 3072:
+	case 4096:
 		return 0;
 	}
 
-	for (i = 0; i < regd->n_reg_rules; i++) {
-		if ((regd->reg_rules[i].freq_range.start_freq_khz / 1000 <= prim_chan_cf - 10) &&
-		    (regd->reg_rules[i].freq_range.end_freq_khz / 1000 >= prim_chan_cf + 10))
-			return regd->reg_rules[i].freq_range.max_bandwidth_khz / 1000;
-	}
-
-	SLSI_WARN(sdev, "Freq(%d) not found in regdomain\n", prim_chan_cf);
-	return 0;
+	return -EINVAL;
 }
 
-int slsi_start_ap(struct wiphy *wiphy, struct net_device *dev,
-		  struct cfg80211_ap_settings *settings)
+static int rsa_set_pub_key(struct crypto_akcipher *tfm, const void *key,
+			   unsigned int keylen)
 {
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct net_device *wlan_dev;
-	u8                device_address[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-	int               r = 0;
-	const u8          *wpa_ie_pos = NULL;
-	size_t            wpa_ie_len = 0;
-	const u8          *wmm_ie_pos = NULL;
-	size_t            wmm_ie_len = 0;
-	const u8          *country_ie = NULL;
-	char              alpha2[SLSI_COUNTRY_CODE_LEN];
-	bool              append_vht_ies = false;
-	const u8             *ie;
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-	int wifi_sharing_channel_switched = 0;
-	struct netdev_vif *ndev_sta_vif;
-	int invalid_channel = 0;
-#endif
-	int skip_indoor_check_for_wifi_sharing = 0;
-	u8 *ds_params_ie = NULL;
-	struct ieee80211_mgmt  *mgmt;
-	u16                    beacon_ie_head_len;
-	u8 *ht_operation_ie;
-	struct ieee80211_channel  *channel = NULL;
-	int indoor_channel = 0;
-	int i;
-	u32 chan_flags;
-	u16 center_freq;
+	struct rsa_key *pkey = akcipher_tfm_ctx(tfm);
+	int ret;
 
-	SLSI_MUTEX_LOCK(sdev->start_stop_mutex);
-	if (sdev->device_state != SLSI_DEVICE_STATE_STARTED) {
-		SLSI_WARN(sdev, "device not started yet (device_state:%d)\n", sdev->device_state);
-		r = -EINVAL;
-		goto exit_with_start_stop_mutex;
+	ret = rsa_parse_pub_key(pkey, key, keylen);
+	if (ret)
+		return ret;
+
+	if (rsa_check_key_length(mpi_get_size(pkey->n) << 3)) {
+		rsa_free_key(pkey);
+		ret = -EINVAL;
 	}
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-	/* Abort any ongoing wlan scan. */
-	wlan_dev = slsi_get_netdev(sdev, SLSI_NET_INDEX_WLAN);
-	if (wlan_dev)
-		slsi_abort_hw_scan(sdev, wlan_dev);
-
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "AP frequency received: %d\n", settings->chandef.chan->center_freq);
-	mgmt = (struct ieee80211_mgmt *)settings->beacon.head;
-	beacon_ie_head_len = settings->beacon.head_len - ((u8 *)mgmt->u.beacon.variable - (u8 *)mgmt);
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-	ndev_sta_vif = netdev_priv(wlan_dev);
-	if (SLSI_IS_VIF_INDEX_MHS(sdev, ndev_vif)) {
-		if (ndev_sta_vif) {
-			SLSI_MUTEX_LOCK(ndev_sta_vif->vif_mutex);
-			if ((ndev_sta_vif->activated) && (ndev_sta_vif->vif_type == FAPI_VIFTYPE_STATION) &&
-			    (ndev_sta_vif->sta.vif_status == SLSI_VIF_STATUS_CONNECTING ||
-			     ndev_sta_vif->sta.vif_status == SLSI_VIF_STATUS_CONNECTED)) {
-#ifdef CONFIG_SCSC_WLAN_SINGLE_ANTENNA
-				invalid_channel = slsi_get_mhs_ws_chan_vsdb(wiphy, dev, settings, sdev,
-									    &wifi_sharing_channel_switched);
-#else
-				invalid_channel = slsi_get_mhs_ws_chan_rsdb(wiphy, dev, settings, sdev,
-									    &wifi_sharing_channel_switched);
-#endif
-				skip_indoor_check_for_wifi_sharing = 1;
-				if (invalid_channel) {
-					SLSI_NET_ERR(dev, "Rejecting AP start req at host (invalid channel)\n");
-					SLSI_MUTEX_UNLOCK(ndev_sta_vif->vif_mutex);
-					r = -EINVAL;
-					goto exit_with_vif_mutex;
-				}
-
-				SLSI_DBG1(sdev, SLSI_CFG80211, "Station frequency: %d, SoftAP frequency: %d\n",
-					  ndev_sta_vif->chan->center_freq, settings->chandef.chan->center_freq);
-			}
-			SLSI_MUTEX_UNLOCK(ndev_sta_vif->vif_mutex);
-		}
-	}
-#endif
-
-	memset(&ndev_vif->ap, 0, sizeof(ndev_vif->ap));
-	/* Initialise all allocated peer structures to remove old data. */
-	/*slsi_netif_init_all_peers(sdev, dev);*/
-
-	/* Reg domain changes */
-	country_ie = cfg80211_find_ie(WLAN_EID_COUNTRY, settings->beacon.tail, settings->beacon.tail_len);
-	if (country_ie) {
-		country_ie += 2;
-		memcpy(alpha2, country_ie, SLSI_COUNTRY_CODE_LEN);
-		if (memcmp(sdev->device_config.domain_info.regdomain->alpha2, alpha2, SLSI_COUNTRY_CODE_LEN - 1) != 0) {
-			if (slsi_set_country_update_regd(sdev, alpha2, SLSI_COUNTRY_CODE_LEN) != 0) {
-				r = -EINVAL;
-				goto exit_with_vif_mutex;
-			}
-		}
-	}
-	if (!skip_indoor_check_for_wifi_sharing && sdev->band_5g_supported &&
-	    ((settings->chandef.chan->center_freq / 1000) == 5)) {
-		channel =  ieee80211_get_channel(sdev->wiphy, settings->chandef.chan->center_freq);
-		if (!channel) {
-			SLSI_ERR(sdev, "Invalid frequency %d used to start AP. Channel not found\n",
-				 settings->chandef.chan->center_freq);
-			r = -EINVAL;
-			goto exit_with_vif_mutex;
-		}
-		if (ndev_vif->iftype != NL80211_IFTYPE_P2P_GO) {
-			if ((channel->flags) & (IEEE80211_CHAN_INDOOR_ONLY)) {
-				chan_flags = (IEEE80211_CHAN_INDOOR_ONLY | IEEE80211_CHAN_RADAR |
-					      IEEE80211_CHAN_DISABLED |
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(3, 10, 13)
-					      IEEE80211_CHAN_PASSIVE_SCAN
-#else
-					      IEEE80211_CHAN_NO_IR
-#endif
-					     );
-
-				for (i = 0; i < wiphy->bands[NL80211_BAND_5GHZ]->n_channels; i++) {
-					if (!(wiphy->bands[NL80211_BAND_5GHZ]->channels[i].flags & chan_flags)) {
-						center_freq = wiphy->bands[NL80211_BAND_5GHZ]->channels[i].center_freq;
-						settings->chandef.chan = ieee80211_get_channel(wiphy, center_freq);
-						settings->chandef.center_freq1 = center_freq;
-						SLSI_DBG1(sdev, SLSI_CFG80211, "ap valid frequency:%d,chan_flags:%x\n",
-							  center_freq,
-							  wiphy->bands[NL80211_BAND_5GHZ]->channels[i].flags);
-						indoor_channel = 1;
-						break;
-					}
-				}
-				if (indoor_channel == 0) {
-					SLSI_ERR(sdev, "No valid channel found to start the AP");
-					r = -EINVAL;
-					goto exit_with_vif_mutex;
-				}
-			}
-		}
-	}
-
-	r = slsi_ap_start_validate(dev, sdev, settings);
-	if (r != 0)
-		goto exit_with_vif_mutex;
-
-	if (ndev_vif->iftype == NL80211_IFTYPE_P2P_GO) {
-		struct net_device   *p2p_dev;
-
-		slsi_p2p_group_start_remove_unsync_vif(sdev);
-		p2p_dev = slsi_get_netdev(sdev, SLSI_NET_INDEX_P2P);
-		SLSI_ETHER_COPY(device_address, p2p_dev->dev_addr);
-		if (keep_alive_period != SLSI_P2PGO_KEEP_ALIVE_PERIOD_SEC)
-			if (slsi_set_uint_mib(sdev, NULL, SLSI_PSID_UNIFI_MLMEGO_KEEP_ALIVE_TIMEOUT,
-					      keep_alive_period) != 0) {
-				SLSI_NET_ERR(dev, "P2PGO Keep Alive MIB set failed");
-				r = -EINVAL;
-				goto exit_with_vif_mutex;
-			}
-	}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-		SLSI_NET_DBG1(dev, SLSI_MLME, "Channel: %d, Maximum bandwidth: %d\n", ndev_vif->chandef->chan->hw_value,
-			      slsi_get_max_bw_mhz(sdev, ndev_vif->chandef->chan->center_freq));
-	/* 11ac configuration (5GHz and VHT) */
-	if ((ndev_vif->chandef->chan->hw_value >= 36) && (ndev_vif->chandef->chan->hw_value < 165) &&
-	    (sdev->fw_vht_enabled) && sdev->allow_switch_80_mhz &&
-	    (slsi_get_max_bw_mhz(sdev, ndev_vif->chandef->chan->center_freq) >= 80)) {
-		u16 oper_chan = ndev_vif->chandef->chan->hw_value;
-		append_vht_ies = true;
-		ndev_vif->chandef->width = NL80211_CHAN_WIDTH_80;
-
-		SLSI_NET_DBG1(dev, SLSI_MLME, "5 GHz- Include VHT\n");
-		if ((oper_chan >= 36) && (oper_chan <= 48))
-			ndev_vif->chandef->center_freq1 = ieee80211_channel_to_frequency(42, NL80211_BAND_5GHZ);
-		else if ((oper_chan >= 149) && (oper_chan <= 161))
-			ndev_vif->chandef->center_freq1 = ieee80211_channel_to_frequency(155, NL80211_BAND_5GHZ);
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-		/* In wifi sharing case, AP can start on STA channel even though it is DFS channel*/
-		if (wifi_sharing_channel_switched == 1) {
-			if ((oper_chan >= 52) && (oper_chan <= 64))
-				ndev_vif->chandef->center_freq1 = ieee80211_channel_to_frequency(58,
-												 NL80211_BAND_5GHZ);
-			else if ((oper_chan >= 100) && (oper_chan <= 112))
-				ndev_vif->chandef->center_freq1 = ieee80211_channel_to_frequency(106,
-												 NL80211_BAND_5GHZ);
-			else if ((oper_chan >= 116) && (oper_chan <= 128))
-				ndev_vif->chandef->center_freq1 = ieee80211_channel_to_frequency(122,
-												 NL80211_BAND_5GHZ);
-			else if ((oper_chan >= 132) && (oper_chan <= 144))
-				ndev_vif->chandef->center_freq1 = ieee80211_channel_to_frequency(138,
-												 NL80211_BAND_5GHZ);
-		}
-#endif
-	} else if (sdev->fw_ht_enabled && sdev->allow_switch_40_mhz &&
-			   slsi_get_max_bw_mhz(sdev, ndev_vif->chandef->chan->center_freq) >= 40 &&
-			   ((ndev_vif->chandef->chan->hw_value < 165 && ndev_vif->chandef->chan->hw_value >= 36))) {
-		/* HT40 configuration (5GHz/2GHz and HT) */
-		u16  oper_chan = ndev_vif->chandef->chan->hw_value;
-		u8   bw_40_minus_channels[] = { 40, 48, 153, 161, 5, 6, 7, 8, 9, 10, 11 };
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-		u8 bw_40_minus_dfs_channels[] = { 144, 136, 128, 120, 112, 104, 64, 56 };
-#endif
-		u8   ch;
-
-		ndev_vif->chandef->width = NL80211_CHAN_WIDTH_40;
-		ndev_vif->chandef->center_freq1 =  ndev_vif->chandef->chan->center_freq + 10;
-		for (ch = 0; ch < ARRAY_SIZE(bw_40_minus_channels); ch++)
-			if (oper_chan == bw_40_minus_channels[ch]) {
-				ndev_vif->chandef->center_freq1 =  ndev_vif->chandef->chan->center_freq - 10;
-				break;
-			}
-
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-		if (wifi_sharing_channel_switched == 1) {
-			for (ch = 0; ch < ARRAY_SIZE(bw_40_minus_dfs_channels); ch++)
-				if (oper_chan == bw_40_minus_dfs_channels[ch]) {
-					ndev_vif->chandef->center_freq1 =  ndev_vif->chandef->chan->center_freq - 10;
-					break;
-				}
-		}
-#endif
-	}
-#endif
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-	if (slsi_check_channelization(sdev, ndev_vif->chandef, wifi_sharing_channel_switched) != 0) {
-#else
-	if (slsi_check_channelization(sdev, ndev_vif->chandef, 0) != 0) {
-#endif
-#else
-	if (slsi_check_channelization(sdev, ndev_vif->channel_type) != 0) {
-#endif
-		r = -EINVAL;
-		goto exit_with_vif_mutex;
-	}
-
-	if (ndev_vif->iftype == NL80211_IFTYPE_AP) {
-		/* Legacy AP */
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-		if (ndev_vif->chandef->width == NL80211_CHAN_WIDTH_20)
-#else
-		if (ndev_vif->channel_type == NL80211_CHAN_HT20)
-#endif
-			slsi_ap_start_obss_scan(sdev, dev, ndev_vif);
-	}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	if (ndev_vif->chandef->width <= NL80211_CHAN_WIDTH_20) {
-		/* Enable LDPC, SGI20 and SGI40 for both SoftAP & P2PGO if firmware supports */
-		if (cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, settings->beacon.tail, settings->beacon.tail_len)) {
-			u8 enforce_ht_cap1 = sdev->fw_ht_cap[0] & (IEEE80211_HT_CAP_LDPC_CODING |
-								  IEEE80211_HT_CAP_SGI_20);
-			u8 enforce_ht_cap2 = sdev->fw_ht_cap[1] & (IEEE80211_HT_CAP_RX_STBC >> 8);
-
-			slsi_modify_ies(dev, WLAN_EID_HT_CAPABILITY, (u8 *)settings->beacon.tail,
-					settings->beacon.tail_len, 2, enforce_ht_cap1);
-			slsi_modify_ies(dev, WLAN_EID_HT_CAPABILITY, (u8 *)settings->beacon.tail,
-					settings->beacon.tail_len, 3, enforce_ht_cap2);
-		}
-	} else if (cfg80211_chandef_valid(ndev_vif->chandef)) {
-		u8 *ht_operation_ie;
-		u8 sec_chan_offset = 0;
-		u8 ch;
-		u8 bw_40_minus_channels[] = { 40, 48, 153, 161, 5, 6, 7, 8, 9, 10, 11 };
-
-		ht_operation_ie = (u8 *)cfg80211_find_ie(WLAN_EID_HT_OPERATION, settings->beacon.tail,
-							 settings->beacon.tail_len);
-		if (!ht_operation_ie) {
-			SLSI_NET_ERR(dev, "HT Operation IE is not passed by wpa_supplicant");
-			r = -EINVAL;
-			goto exit_with_vif_mutex;
-		}
-
-		sec_chan_offset = IEEE80211_HT_PARAM_CHA_SEC_ABOVE;
-		for (ch = 0; ch < ARRAY_SIZE(bw_40_minus_channels); ch++)
-			if (bw_40_minus_channels[ch] == ndev_vif->chandef->chan->hw_value) {
-				sec_chan_offset = IEEE80211_HT_PARAM_CHA_SEC_BELOW;
-				break;
-			}
-
-		/* Change HT Information IE subset 1 */
-		ht_operation_ie += 3;
-		*(ht_operation_ie) |= sec_chan_offset;
-		*(ht_operation_ie) |= IEEE80211_HT_PARAM_CHAN_WIDTH_ANY;
-
-		/* For 80MHz, Enable HT Capabilities : Support 40MHz Channel Width, SGI20 and SGI40
-		 * for AP (both softAp as well as P2P GO), if firmware supports.
-		 */
-		if (cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, settings->beacon.tail,
-				     settings->beacon.tail_len)) {
-			u8 enforce_ht_cap1 = sdev->fw_ht_cap[0] & (IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
-								  IEEE80211_HT_CAP_SGI_20 |
-								  IEEE80211_HT_CAP_SGI_40 |
-								  IEEE80211_HT_CAP_LDPC_CODING);
-			u8 enforce_ht_cap2 = sdev->fw_ht_cap[1] & (IEEE80211_HT_CAP_RX_STBC >> 8);
-
-			slsi_modify_ies(dev, WLAN_EID_HT_CAPABILITY, (u8 *)settings->beacon.tail,
-					settings->beacon.tail_len, 2, enforce_ht_cap1);
-			slsi_modify_ies(dev, WLAN_EID_HT_CAPABILITY, (u8 *)settings->beacon.tail,
-					settings->beacon.tail_len, 3, enforce_ht_cap2);
-		}
-	}
-#endif
-
-	if ((indoor_channel == 1)
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-	|| (wifi_sharing_channel_switched == 1)
-#endif
-	) {
-		slsi_modify_ies_on_channel_switch(dev, settings, ds_params_ie, ht_operation_ie, mgmt, beacon_ie_head_len);
-	}
-	ndev_vif->vif_type = FAPI_VIFTYPE_AP;
-
-	if (slsi_mlme_add_vif(sdev, dev, dev->dev_addr, device_address) != 0) {
-		SLSI_NET_ERR(dev, "slsi_mlme_add_vif failed\n");
-		r = -EINVAL;
-		goto exit_with_vif_mutex;
-	}
-
-	if (slsi_vif_activated(sdev, dev) != 0) {
-		SLSI_NET_ERR(dev, "slsi_vif_activated failed\n");
-		goto exit_with_vif;
-	}
-
-	/* Extract the WMM and WPA IEs from settings->beacon.tail - This is sent in add_info_elements and shouldn't be included in start_req
-	 * Cache IEs to be used in later add_info_elements_req. The IEs would be freed during AP stop
-	 */
-	wpa_ie_pos = cfg80211_find_vendor_ie(WLAN_OUI_MICROSOFT, WLAN_OUI_TYPE_MICROSOFT_WPA, settings->beacon.tail, settings->beacon.tail_len);
-	if (wpa_ie_pos) {
-		wpa_ie_len = (size_t)(*(wpa_ie_pos + 1) + 2);     /* For 0xdd (1) and Tag Length (1) */
-		SLSI_NET_DBG2(dev, SLSI_CFG80211, "WPA IE found: Length = %zu\n", wpa_ie_len);
-		SLSI_EC_GOTO(slsi_cache_ies(wpa_ie_pos, wpa_ie_len, &ndev_vif->ap.cache_wpa_ie, &ndev_vif->ap.wpa_ie_len), r, exit_with_vif);
-	}
-
-	wmm_ie_pos = cfg80211_find_vendor_ie(WLAN_OUI_MICROSOFT, WLAN_OUI_TYPE_MICROSOFT_WMM, settings->beacon.tail, settings->beacon.tail_len);
-	if (wmm_ie_pos) {
-		wmm_ie_len = (size_t)(*(wmm_ie_pos + 1) + 2);
-		SLSI_NET_DBG2(dev, SLSI_CFG80211, "WMM IE found: Length = %zu\n", wmm_ie_len);
-		SLSI_EC_GOTO(slsi_cache_ies(wmm_ie_pos, wmm_ie_len, &ndev_vif->ap.cache_wmm_ie, &ndev_vif->ap.wmm_ie_len), r, exit_with_vif);
-	}
-
-	slsi_clear_cached_ies(&ndev_vif->ap.add_info_ies, &ndev_vif->ap.add_info_ies_len);
-
-	/* Set Vendor specific IEs (WPA, WMM, WPS, P2P) for Beacon, Probe Response and Association Response
-	 * The Beacon and Assoc Rsp IEs can include Extended Capability (WLAN_EID_EXT_CAPAB) IE when supported.
-	 * Some other IEs (like internetworking, etc) can also come if supported.
-	 * The add_info should include only vendor specific IEs and other IEs should be removed if supported in future.
-	 */
-	if ((wmm_ie_pos) || (wpa_ie_pos) || (settings->beacon.beacon_ies_len > 0 && settings->beacon.beacon_ies)) {
-		SLSI_NET_DBG2(dev, SLSI_CFG80211, "Add info elements for beacon\n");
-		SLSI_EC_GOTO(slsi_ap_prepare_add_info_ies(ndev_vif, settings->beacon.beacon_ies, settings->beacon.beacon_ies_len), r, exit_with_vif);
-		SLSI_EC_GOTO(slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_BEACON, ndev_vif->ap.add_info_ies, ndev_vif->ap.add_info_ies_len), r, exit_with_vif);
-		slsi_clear_cached_ies(&ndev_vif->ap.add_info_ies, &ndev_vif->ap.add_info_ies_len);
-	}
-
-	if ((wmm_ie_pos) || (wpa_ie_pos) || (settings->beacon.proberesp_ies_len > 0 && settings->beacon.proberesp_ies)) {
-		SLSI_NET_DBG2(dev, SLSI_CFG80211, "Add info elements for probe response\n");
-		SLSI_EC_GOTO(slsi_ap_prepare_add_info_ies(ndev_vif, settings->beacon.proberesp_ies, settings->beacon.proberesp_ies_len), r, exit_with_vif);
-		SLSI_EC_GOTO(slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_PROBE_RESPONSE, ndev_vif->ap.add_info_ies, ndev_vif->ap.add_info_ies_len), r, exit_with_vif);
-		slsi_clear_cached_ies(&ndev_vif->ap.add_info_ies, &ndev_vif->ap.add_info_ies_len);
-	}
-
-	if ((wmm_ie_pos) || (wpa_ie_pos) || (settings->beacon.assocresp_ies_len > 0 && settings->beacon.assocresp_ies)) {
-		SLSI_NET_DBG2(dev, SLSI_CFG80211, "Add info elements for assoc response\n");
-		SLSI_EC_GOTO(slsi_ap_prepare_add_info_ies(ndev_vif, settings->beacon.assocresp_ies, settings->beacon.assocresp_ies_len), r, exit_with_vif);
-		SLSI_EC_GOTO(slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_ASSOCIATION_RESPONSE, ndev_vif->ap.add_info_ies, ndev_vif->ap.add_info_ies_len), r, exit_with_vif);
-		slsi_clear_cached_ies(&ndev_vif->ap.add_info_ies, &ndev_vif->ap.add_info_ies_len);
-	}
-
-	if (ndev_vif->iftype == NL80211_IFTYPE_P2P_GO) {
-		u32 af_bmap_active = SLSI_ACTION_FRAME_PUBLIC;
-		u32 af_bmap_suspended = SLSI_ACTION_FRAME_PUBLIC;
-
-		r = slsi_mlme_register_action_frame(sdev, dev, af_bmap_active, af_bmap_suspended);
-		if (r != 0) {
-			SLSI_NET_ERR(dev, "slsi_mlme_register_action_frame failed: resultcode = %d\n", r);
-			goto exit_with_vif;
-		}
-	}
-
-	if (append_vht_ies) {
-		ndev_vif->ap.mode = SLSI_80211_MODE_11AC;
-	} else if (cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, settings->beacon.tail, settings->beacon.tail_len) &&
-		cfg80211_find_ie(WLAN_EID_HT_OPERATION, settings->beacon.tail, settings->beacon.tail_len)) {
-		ndev_vif->ap.mode = SLSI_80211_MODE_11N;
-	} else {
-		ie = cfg80211_find_ie(WLAN_EID_SUPP_RATES, settings->beacon.tail, settings->beacon.tail_len);
-		if (ie)
-			ndev_vif->ap.mode = slsi_get_supported_mode(ie);
-	}
-
-	r = slsi_mlme_start(sdev, dev, dev->dev_addr, settings, wpa_ie_pos, wmm_ie_pos, append_vht_ies);
-
-	cfg80211_ch_switch_notify(dev, &settings->chandef);
-
-#ifdef CONFIG_SCSC_WLAN_WIFI_SHARING
-	if (r == 0)
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "Soft Ap started on frequency: %d\n",
-			      settings->chandef.chan->center_freq);
-	if (SLSI_IS_VIF_INDEX_MHS(sdev, ndev_vif))
-		ndev_vif->chan = settings->chandef.chan;
-#endif
-	if (r != 0) {
-		SLSI_NET_ERR(dev, "Start ap failed: resultcode = %d frequency = %d\n", r,
-			     settings->chandef.chan->center_freq);
-		goto exit_with_vif;
-	} else if (ndev_vif->iftype == NL80211_IFTYPE_P2P_GO) {
-		SLSI_P2P_STATE_CHANGE(sdev, P2P_GROUP_FORMED_GO);
-	}
-#ifdef CONFIG_SCSC_WLAN_SET_NUM_ANTENNAS
-	if (ndev_vif->iftype == NL80211_IFTYPE_AP) {
-		/* Don't care results. */
-		slsi_set_num_antennas(dev, 1 /*SISO*/);
-	}
-#endif
-	ndev_vif->ap.beacon_interval = settings->beacon_interval;
-	ndev_vif->ap.ssid_len = settings->ssid_len;
-	memcpy(ndev_vif->ap.ssid, settings->ssid, settings->ssid_len);
-
-	netif_carrier_on(dev);
-
-	if (ndev_vif->ipaddress != cpu_to_be32(0))
-		/* Static IP is assigned already */
-		slsi_ip_address_changed(sdev, dev, ndev_vif->ipaddress);
-
-	r = slsi_read_disconnect_ind_timeout(sdev, SLSI_PSID_UNIFI_DISCONNECT_TIMEOUT);
-	if (r != 0)
-		sdev->device_config.ap_disconnect_ind_timeout = *sdev->sig_wait_cfm_timeout;
-
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "slsi_read_disconnect_ind_timeout: timeout = %d", sdev->device_config.ap_disconnect_ind_timeout);
-
-#ifdef ANDROID_BUILD
-	pm_qos_add_request(&ap_pm_qos_req, PM_QOS_CPU_FREQ_MIN, 500000);
-#endif
-
-	goto exit_with_vif_mutex;
-
-exit_with_vif:
-	slsi_clear_cached_ies(&ndev_vif->ap.add_info_ies, &ndev_vif->ap.add_info_ies_len);
-	if (slsi_mlme_del_vif(sdev, dev) != 0)
-		SLSI_NET_ERR(dev, "slsi_mlme_del_vif failed\n");
-	slsi_vif_deactivated(sdev, dev);
-	r = -EINVAL;
-exit_with_vif_mutex:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-exit_with_start_stop_mutex:
-	SLSI_MUTEX_UNLOCK(sdev->start_stop_mutex);
-	return r;
-}
-
-int slsi_change_beacon(struct wiphy *wiphy, struct net_device *dev,
-		       struct cfg80211_beacon_data *info)
-{
-	SLSI_UNUSED_PARAMETER(info);
-
-	return -EOPNOTSUPP;
-}
-
-int slsi_stop_ap(struct wiphy *wiphy, struct net_device *dev)
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif;
-
-	if (WARN_ON(!dev)) {
-		SLSI_NET_DBG2(dev, SLSI_CFG80211, "softap dev is NULL\n");
-		return -EINVAL;
-	}
-	ndev_vif = netdev_priv(dev);
-
-	slsi_reset_throughput_stats(dev);
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_DBG1(dev, SLSI_CFG80211, "vif_type = %d, vif_index = %d, ndev_vif->activated = %d,"
-		      "ndev_vif->ap.p2p_gc_keys_set = %d\n", ndev_vif->vif_type, ndev_vif->ifnum, ndev_vif->activated,
-		      ndev_vif->ap.p2p_gc_keys_set);
-
-	if (!ndev_vif->activated) {
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "NetDev VIF not activated\n");
-		goto exit;
-	}
-
-	if (FAPI_VIFTYPE_AP != ndev_vif->vif_type) {
-		SLSI_NET_DBG1(dev, SLSI_CFG80211, "Invalid Device Type: %d\n", ndev_vif->iftype);
-		goto exit;
-	}
-
-	/* Free WPA and WMM IEs if present */
-	slsi_clear_cached_ies(&ndev_vif->ap.cache_wpa_ie, &ndev_vif->ap.wpa_ie_len);
-	slsi_clear_cached_ies(&ndev_vif->ap.cache_wmm_ie, &ndev_vif->ap.wmm_ie_len);
-
-	netif_carrier_off(dev);
-
-	/* All STA related packets and info should already have been flushed */
-	slsi_mlme_del_vif(sdev, dev);
-	slsi_vif_deactivated(sdev, dev);
-	ndev_vif->ipaddress = cpu_to_be32(0);
-
-	if (ndev_vif->ap.p2p_gc_keys_set) {
-		slsi_wakeunlock(&sdev->wlan_wl);
-		ndev_vif->ap.p2p_gc_keys_set = false;
-	}
-#ifdef ANDROID_BUILD
-	pm_qos_remove_request(&ap_pm_qos_req);
-#endif
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-
-	/* AP stop stuff is done in del_station callback*/
-
-	return 0;
-}
-
-static int slsi_p2p_group_mgmt_tx(const struct ieee80211_mgmt *mgmt, struct wiphy *wiphy,
-				  struct net_device *dev, struct ieee80211_channel *chan,
-				  unsigned int wait, const u8 *buf, size_t len,
-				  bool dont_wait_for_ack, u64 *cookie)
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif;
-	struct net_device *netdev;
-	int               subtype = slsi_get_public_action_subtype(mgmt);
-	int               r = 0;
-	u32               host_tag = slsi_tx_mgmt_host_tag(sdev);
-	u16               freq = 0;
-	u32               dwell_time = SLSI_FORCE_SCHD_ACT_FRAME_MSEC;
-	u16               data_unit_desc = FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME;
-
-	if (sdev->p2p_group_exp_frame != SLSI_PA_INVALID) {
-		SLSI_NET_ERR(dev, "sdev->p2p_group_exp_frame : %d\n", sdev->p2p_group_exp_frame);
-		return -EINVAL;
-	}
-	netdev = slsi_get_netdev(sdev, SLSI_NET_INDEX_P2PX_SWLAN);
-	ndev_vif = netdev_priv(netdev);
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "Sending Action frame (%s) on p2p group vif (%d), vif_index = %d,"
-		      "vif_type = %d, chan->hw_value = %d, ndev_vif->chan->hw_value = %d, wait = %d,"
-		      "sdev->p2p_group_exp_frame = %d\n", slsi_pa_subtype_text(subtype), ndev_vif->activated,
-		      ndev_vif->ifnum, ndev_vif->vif_type, chan->hw_value, ndev_vif->chan->hw_value, wait,
-		      ndev_vif->chan->hw_value);
-
-	if (!((ndev_vif->iftype == NL80211_IFTYPE_P2P_GO) || (ndev_vif->iftype == NL80211_IFTYPE_P2P_CLIENT)))
-		goto exit_with_error;
-
-	if (chan->hw_value != ndev_vif->chan->hw_value) {
-		freq = SLSI_FREQ_HOST_TO_FW(chan->center_freq);
-		dwell_time = wait;
-	}
-
-	/* Incase of GO dont wait for resp/cfm packets for go-negotiation.*/
-	if (subtype != SLSI_P2P_PA_GO_NEG_RSP)
-		sdev->p2p_group_exp_frame = slsi_get_exp_peer_frame_subtype(subtype);
-
-	r = slsi_mlme_send_frame_mgmt(sdev, netdev, buf, len, data_unit_desc, FAPI_MESSAGETYPE_IEEE80211_ACTION, host_tag, freq, dwell_time * 1000, 0);
-	if (r)
-		goto exit_with_lock;
-	slsi_assign_cookie_id(cookie, &ndev_vif->mgmt_tx_cookie);
-	r = slsi_set_mgmt_tx_data(ndev_vif, *cookie, host_tag, buf, len);         /* If error then it is returned in exit */
-	goto exit_with_lock;
-
-exit_with_error:
-	r = -EINVAL;
-exit_with_lock:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-
-/* Handle mgmt_tx callback for P2P modes */
-static int slsi_p2p_mgmt_tx(const struct ieee80211_mgmt *mgmt, struct wiphy *wiphy,
-			    struct net_device *dev, struct netdev_vif *ndev_vif,
-			    struct ieee80211_channel *chan, unsigned int wait,
-			    const u8 *buf, size_t len, bool dont_wait_for_ack, u64 *cookie)
-{
-	struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
-	int             ret = 0;
-
-	if (ieee80211_is_action(mgmt->frame_control)) {
-		u16 host_tag = slsi_tx_mgmt_host_tag(sdev);
-		int subtype = slsi_get_public_action_subtype(mgmt);
-		u8  exp_peer_frame;
-		u32 dwell_time = 0;
-
-		SLSI_NET_DBG2(dev, SLSI_CFG80211, "Action frame (%s), unsync_vif_active (%d)\n", slsi_pa_subtype_text(subtype), ndev_vif->activated);
-
-		if (subtype == SLSI_PA_INVALID) {
-			SLSI_NET_ERR(dev, "Invalid Action frame subtype\n");
-			goto exit_with_error;
-		}
-
-		/* Check if unsync vif is available */
-		if (sdev->p2p_state == P2P_IDLE_NO_VIF)
-			if (slsi_p2p_vif_activate(sdev, dev, chan, wait, false) != 0)
-				goto exit_with_error;
-
-		/* Vif might be present but frame tx could be requested on a different channel */
-		if (ndev_vif->chan && (ndev_vif->chan->hw_value != chan->hw_value)) {
-			/* Clear Probe Response IEs if vif was already present with a different channel */
-			if (slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_PROBE_RESPONSE, NULL, 0) != 0)
-				SLSI_NET_ERR(dev, "Clearing Probe Response IEs failed for unsync vif\n");
-			slsi_unsync_vif_set_probe_rsp_ie(ndev_vif, NULL, 0);
-
-			if (slsi_mlme_set_channel(sdev, dev, chan, SLSI_FW_CHANNEL_DURATION_UNSPECIFIED, 0, 0) != 0)
-				goto exit_with_vif;
-			else
-				ndev_vif->chan = chan;
-		}
-
-		/* Check if peer frame response is expected */
-		exp_peer_frame = slsi_get_exp_peer_frame_subtype(subtype);
-
-		if (exp_peer_frame != SLSI_PA_INVALID) {
-			if ((subtype == SLSI_P2P_PA_GO_NEG_RSP) && (slsi_p2p_get_go_neg_rsp_status(dev, mgmt) != SLSI_P2P_STATUS_CODE_SUCCESS)) {
-				SLSI_NET_DBG1(dev, SLSI_CFG80211, "GO_NEG_RSP Tx, peer response not expected\n");
-				exp_peer_frame = SLSI_PA_INVALID;
-			} else {
-				SLSI_NET_DBG1(dev, SLSI_CFG80211, "Peer response expected with action frame (%s)\n",
-					      slsi_pa_subtype_text(exp_peer_frame));
-
-				if (ndev_vif->mgmt_tx_data.exp_frame != SLSI_PA_INVALID)
-					(void)slsi_set_mgmt_tx_data(ndev_vif, 0, 0, NULL, 0);
-
-				/* Change Force Schedule Duration as peer response is expected */
-				dwell_time = SLSI_FORCE_SCHD_ACT_FRAME_MSEC;
-			}
-		}
-
-		slsi_assign_cookie_id(cookie, &ndev_vif->mgmt_tx_cookie);
-
-		/* Send the action frame, transmission status indication would be received later */
-		if (slsi_mlme_send_frame_mgmt(sdev, dev, buf, len, FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME, FAPI_MESSAGETYPE_IEEE80211_ACTION, host_tag, 0, dwell_time * 1000, 0) != 0)
-			goto exit_with_vif;
-
-		/* If multiple frames are requested for tx, only the info of first frame would be stored */
-		if (ndev_vif->mgmt_tx_data.host_tag == 0) {
-			unsigned int n_wait = 0;
-
-			SLSI_NET_DBG1(dev, SLSI_CFG80211, "Store mgmt frame tx data for cookie = 0x%llx\n", *cookie);
-
-			ret = slsi_set_mgmt_tx_data(ndev_vif, *cookie, host_tag, buf, len);
-			if (ret != 0)
-				goto exit_with_vif;
-			ndev_vif->mgmt_tx_data.exp_frame = exp_peer_frame;
-
-			SLSI_P2P_STATE_CHANGE(sdev, P2P_ACTION_FRAME_TX_RX);
-			if ((exp_peer_frame == SLSI_P2P_PA_GO_NEG_RSP) || (exp_peer_frame == SLSI_P2P_PA_GO_NEG_CFM))
-				/* Retain vif for larger duration that wpa_supplicant asks to wait,
-				 * during GO-Negotiation to allow peer to retry GO neg in bad radio condition.
-				 * Some of phones retry GO-Negotiation after 2 seconds
-				 */
-				n_wait = SLSI_P2P_NEG_PROC_UNSYNC_VIF_RETAIN_DURATION;
-			else if (exp_peer_frame != SLSI_PA_INVALID)
-				/* If a peer response is expected queue work to retain vif till wait time else the work will be handled in mgmt_tx_cancel_wait */
-				n_wait = wait + SLSI_P2P_MGMT_TX_EXTRA_MSEC;
-			if (n_wait) {
-				SLSI_NET_DBG2(dev, SLSI_CFG80211, "retain unsync vif for duration (%d) msec\n", n_wait);
-				slsi_p2p_queue_unsync_vif_del_work(ndev_vif, n_wait);
-			}
-		} else {
-			/* Already a frame Tx is in progress, send immediate tx_status as success. Sending immediate tx status should be ok
-			 * as supplicant is in another procedure and so these frames would be mostly only response frames.
-			 */
-			WARN_ON(sdev->p2p_state != P2P_ACTION_FRAME_TX_RX);
-
-			if (!dont_wait_for_ack) {
-				SLSI_NET_DBG1(dev, SLSI_CFG80211, "Send immediate tx_status (cookie = 0x%llx)\n", *cookie);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
-				cfg80211_mgmt_tx_status(&ndev_vif->wdev, *cookie, buf, len, true, GFP_KERNEL);
-#else
-				cfg80211_mgmt_tx_status(dev, *cookie, buf, len, true, GFP_KERNEL);
-#endif
-			}
-		}
-		goto exit;
-	}
-
-	/* Else send failure for unexpected management frame */
-	SLSI_NET_ERR(dev, "Drop Tx frame: Unexpected Management frame\n");
-	goto exit_with_error;
-
-exit_with_vif:
-	if (sdev->p2p_state != P2P_LISTENING)
-		slsi_p2p_vif_deactivate(sdev, dev, true);
-exit_with_error:
-	ret = -EINVAL;
-exit:
 	return ret;
 }
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
-int     slsi_mgmt_tx_cancel_wait(struct wiphy        *wiphy,
-				 struct wireless_dev *wdev,
-				 u64                 cookie)
+static int rsa_set_priv_key(struct crypto_akcipher *tfm, const void *key,
+			    unsigned int keylen)
 {
-	struct net_device *dev = wdev->netdev;
+	struct rsa_key *pkey = akcipher_tfm_ctx(tfm);
+	int ret;
 
-#else
-int     slsi_mgmt_tx_cancel_wait(struct wiphy      *wiphy,
-				 struct net_device *dev,
-				 u64               cookie)
-{
-#endif          /*  (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)) */
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
+	ret = rsa_parse_priv_key(pkey, key, keylen);
+	if (ret)
+		return ret;
 
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	SLSI_NET_INFO(dev, "iface_num = %d, cookie = 0x%llx, vif_index = %d, vif_type = %d,"
-		      "sdev->p2p_state = %d, ndev_vif->mgmt_tx_data.cookie = 0x%llx, sdev->p2p_group_exp_frame = %d,"
-		      "sdev->wlan_unsync_vif_state = %d\n", (int)ndev_vif->ifnum, cookie,(int)ndev_vif->ifnum,
-		      (int)ndev_vif->vif_type, sdev->p2p_state, ndev_vif->mgmt_tx_data.cookie,
-		      (int)sdev->p2p_group_exp_frame, sdev->wlan_unsync_vif_state);
-
-	/* If device was in frame tx_rx state, clear mgmt tx data and change state */
-	if (SLSI_IS_VIF_INDEX_P2P(ndev_vif) && (sdev->p2p_state == P2P_ACTION_FRAME_TX_RX) && (ndev_vif->mgmt_tx_data.cookie == cookie)) {
-		if (ndev_vif->mgmt_tx_data.exp_frame != SLSI_PA_INVALID)
-			(void)slsi_mlme_reset_dwell_time(sdev, dev);
-
-		(void)slsi_set_mgmt_tx_data(ndev_vif, 0, 0, NULL, 0);
-		ndev_vif->mgmt_tx_data.exp_frame = SLSI_PA_INVALID;
-
-		if (delayed_work_pending(&ndev_vif->unsync.roc_expiry_work)) {
-			SLSI_P2P_STATE_CHANGE(sdev, P2P_LISTENING);
-		} else {
-			slsi_p2p_queue_unsync_vif_del_work(ndev_vif, SLSI_P2P_UNSYNC_VIF_EXTRA_MSEC);
-			SLSI_P2P_STATE_CHANGE(ndev_vif->sdev, P2P_IDLE_VIF_ACTIVE);
-		}
-	} else if ((SLSI_IS_P2P_GROUP_STATE(sdev)) && (sdev->p2p_group_exp_frame != SLSI_PA_INVALID)) {
-		/* acquire mutex lock if it is not group net dev */
-		slsi_clear_offchannel_data(sdev, (!SLSI_IS_VIF_INDEX_P2P_GROUP(sdev, ndev_vif)) ? true : false);
-	} else if (SLSI_IS_VIF_INDEX_WLAN(ndev_vif) && (sdev->wlan_unsync_vif_state == WLAN_UNSYNC_VIF_TX) && (ndev_vif->mgmt_tx_data.cookie == cookie)) {
-		sdev->wlan_unsync_vif_state = WLAN_UNSYNC_VIF_ACTIVE;
-		cancel_delayed_work(&ndev_vif->unsync.hs2_del_vif_work);
-		queue_delayed_work(sdev->device_wq, &ndev_vif->unsync.hs2_del_vif_work, msecs_to_jiffies(SLSI_HS2_UNSYNC_VIF_EXTRA_MSEC));
-		if (ndev_vif->mgmt_tx_data.exp_frame != SLSI_PA_INVALID) {
-			ndev_vif->mgmt_tx_data.exp_frame = SLSI_PA_INVALID;
-			(void)slsi_mlme_reset_dwell_time(sdev, dev);
-		}
-	} else if (ndev_vif->activated && ndev_vif->vif_type == FAPI_VIFTYPE_STATION
-		   && ndev_vif->sta.vif_status == SLSI_VIF_STATUS_CONNECTED) {
-		if (ndev_vif->mgmt_tx_data.exp_frame != SLSI_PA_INVALID) {
-			ndev_vif->mgmt_tx_data.exp_frame = SLSI_PA_INVALID;
-			(void)slsi_mlme_reset_dwell_time(sdev, dev);
-		}
+	if (rsa_check_key_length(mpi_get_size(pkey->n) << 3)) {
+		rsa_free_key(pkey);
+		ret = -EINVAL;
 	}
+	return ret;
+}
 
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
+static int rsa_max_size(struct crypto_akcipher *tfm)
+{
+	struct rsa_key *pkey = akcipher_tfm_ctx(tfm);
+
+	return pkey->n ? mpi_get_size(pkey->n) : -EINVAL;
+}
+
+static void rsa_exit_tfm(struct crypto_akcipher *tfm)
+{
+	struct rsa_key *pkey = akcipher_tfm_ctx(tfm);
+
+	rsa_free_key(pkey);
+}
+
+static struct akcipher_alg rsa = {
+	.encrypt = rsa_enc,
+	.decrypt = rsa_dec,
+	.sign = rsa_sign,
+	.verify = rsa_verify,
+	.set_priv_key = rsa_set_priv_key,
+	.set_pub_key = rsa_set_pub_key,
+	.max_size = rsa_max_size,
+	.exit = rsa_exit_tfm,
+	.base = {
+		.cra_name = "rsa",
+		.cra_driver_name = "rsa-generic",
+		.cra_priority = 100,
+		.cra_module = THIS_MODULE,
+		.cra_ctxsize = sizeof(struct rsa_key),
+	},
+};
+
+static int rsa_init(void)
+{
+	return crypto_register_akcipher(&rsa);
+}
+
+static void rsa_exit(void)
+{
+	crypto_unregister_akcipher(&rsa);
+}
+
+module_init(rsa_init);
+module_exit(rsa_exit);
+MODULE_ALIAS_CRYPTO("rsa");
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("RSA generic algorithm");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * RSA key extract helper
+ *
+ * Copyright (c) 2015, Intel Corporation
+ * Authors: Tadeusz Struk <tadeusz.struk@intel.com>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ */
+#include <linux/kernel.h>
+#include <linux/export.h>
+#include <linux/err.h>
+#include <linux/fips.h>
+#include <crypto/internal/rsa.h>
+#include "rsapubkey-asn1.h"
+#include "rsaprivkey-asn1.h"
+
+int rsa_get_n(void *context, size_t hdrlen, unsigned char tag,
+	      const void *value, size_t vlen)
+{
+	struct rsa_key *key = context;
+
+	key->n = mpi_read_raw_data(value, vlen);
+
+	if (!key->n)
+		return -ENOMEM;
+
+	/* In FIPS mode only allow key size 2K & 3K */
+	if (fips_enabled && (mpi_get_size(key->n) != 256 &&
+			     mpi_get_size(key->n) != 384)) {
+		pr_err("RSA: key size not allowed in FIPS mode\n");
+		mpi_free(key->n);
+		key->n = NULL;
+		return -EINVAL;
+	}
 	return 0;
 }
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-void slsi_mgmt_frame_register(struct wiphy *wiphy,
-			      struct wireless_dev *wdev,
-			      u16 frame_type, bool reg)
+int rsa_get_e(void *context, size_t hdrlen, unsigned char tag,
+	      const void *value, size_t vlen)
 {
-	struct net_device *dev = wdev->netdev;
+	struct rsa_key *key = context;
 
-#else
-void slsi_mgmt_frame_register(struct wiphy *wiphy,
-			      struct net_device *dev,
-			      u16 frame_type, bool reg)
+	key->e = mpi_read_raw_data(value, vlen);
+
+	if (!key->e)
+		return -ENOMEM;
+
+	return 0;
+}
+
+int rsa_get_d(void *context, size_t hdrlen, unsigned char tag,
+	      const void *value, size_t vlen)
 {
-#endif          /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9)) */
-	struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
+	struct rsa_key *key = context;
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	SLSI_UNUSED_PARAMETER(frame_type);
-	SLSI_UNUSED_PARAMETER(reg);
-#endif
+	key->d = mpi_read_raw_data(value, vlen);
 
-	if (WARN_ON(!dev))
+	if (!key->d)
+		return -ENOMEM;
+
+	/* In FIPS mode only allow key size 2K & 3K */
+	if (fips_enabled && (mpi_get_size(key->d) != 256 &&
+			     mpi_get_size(key->d) != 384)) {
+		pr_err("RSA: key size not allowed in FIPS mode\n");
+		mpi_free(key->d);
+		key->d = NULL;
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static void free_mpis(struct rsa_key *key)
+{
+	mpi_free(key->n);
+	mpi_free(key->e);
+	mpi_free(key->d);
+	key->n = NULL;
+	key->e = NULL;
+	key->d = NULL;
+}
+
+/**
+ * rsa_free_key() - frees rsa key allocated by rsa_parse_key()
+ *
+ * @rsa_key:	struct rsa_key key representation
+ */
+void rsa_free_key(struct rsa_key *key)
+{
+	free_mpis(key);
+}
+EXPORT_SYMBOL_GPL(rsa_free_key);
+
+/**
+ * rsa_parse_pub_key() - extracts an rsa public key from BER encoded buffer
+ *			 and stores it in the provided struct rsa_key
+ *
+ * @rsa_key:	struct rsa_key key representation
+ * @key:	key in BER format
+ * @key_len:	length of key
+ *
+ * Return:	0 on success or error code in case of error
+ */
+int rsa_parse_pub_key(struct rsa_key *rsa_key, const void *key,
+		      unsigned int key_len)
+{
+	int ret;
+
+	free_mpis(rsa_key);
+	ret = asn1_ber_decoder(&rsapubkey_decoder, rsa_key, key, key_len);
+	if (ret < 0)
+		goto error;
+
+	return 0;
+error:
+	free_mpis(rsa_key);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rsa_parse_pub_key);
+
+/**
+ * rsa_parse_pub_key() - extracts an rsa private key from BER encoded buffer
+ *			 and stores it in the provided struct rsa_key
+ *
+ * @rsa_key:	struct rsa_key key representation
+ * @key:	key in BER format
+ * @key_len:	length of key
+ *
+ * Return:	0 on success or error code in case of error
+ */
+int rsa_parse_priv_key(struct rsa_key *rsa_key, const void *key,
+		       unsigned int key_len)
+{
+	int ret;
+
+	free_mpis(rsa_key);
+	ret = asn1_ber_decoder(&rsaprivkey_decoder, rsa_key, key, key_len);
+	if (ret < 0)
+		goto error;
+
+	return 0;
+error:
+	free_mpis(rsa_key);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rsa_parse_priv_key);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          RsaPrivKey ::= SEQUENCE {
+	version		INTEGER,
+	n		INTEGER ({ rsa_get_n }),
+	e		INTEGER ({ rsa_get_e }),
+	d		INTEGER ({ rsa_get_d }),
+	prime1		INTEGER,
+	prime2		INTEGER,
+	exponent1	INTEGER,
+	exponent2	INTEGER,
+	coefficient	INTEGER
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         RsaPubKey ::= SEQUENCE {
+	n INTEGER ({ rsa_get_n }),
+	e INTEGER ({ rsa_get_e })
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+ * Salsa20: Salsa20 stream cipher algorithm
+ *
+ * Copyright (c) 2007 Tan Swee Heng <thesweeheng@gmail.com>
+ *
+ * Derived from:
+ * - salsa20.c: Public domain C code by Daniel J. Bernstein <djb@cr.yp.to>
+ *
+ * Salsa20 is a stream cipher candidate in eSTREAM, the ECRYPT Stream
+ * Cipher Project. It is designed by Daniel J. Bernstein <djb@cr.yp.to>.
+ * More information about eSTREAM and Salsa20 can be found here:
+ *   http://www.ecrypt.eu.org/stream/
+ *   http://cr.yp.to/snuffle.html
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ */
+
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/errno.h>
+#include <linux/crypto.h>
+#include <linux/types.h>
+#include <linux/bitops.h>
+#include <crypto/algapi.h>
+#include <asm/byteorder.h>
+
+#define SALSA20_IV_SIZE        8U
+#define SALSA20_MIN_KEY_SIZE  16U
+#define SALSA20_MAX_KEY_SIZE  32U
+
+/*
+ * Start of code taken from D. J. Bernstein's reference implementation.
+ * With some modifications and optimizations made to suit our needs.
+ */
+
+/*
+salsa20-ref.c version 20051118
+D. J. Bernstein
+Public domain.
+*/
+
+#define U32TO8_LITTLE(p, v) \
+	{ (p)[0] = (v >>  0) & 0xff; (p)[1] = (v >>  8) & 0xff; \
+	  (p)[2] = (v >> 16) & 0xff; (p)[3] = (v >> 24) & 0xff; }
+#define U8TO32_LITTLE(p)   \
+	(((u32)((p)[0])      ) | ((u32)((p)[1]) <<  8) | \
+	 ((u32)((p)[2]) << 16) | ((u32)((p)[3]) << 24)   )
+
+struct salsa20_ctx
+{
+	u32 input[16];
+};
+
+static void salsa20_wordtobyte(u8 output[64], const u32 input[16])
+{
+	u32 x[16];
+	int i;
+
+	memcpy(x, input, sizeof(x));
+	for (i = 20; i > 0; i -= 2) {
+		x[ 4] ^= rol32((x[ 0] + x[12]),  7);
+		x[ 8] ^= rol32((x[ 4] + x[ 0]),  9);
+		x[12] ^= rol32((x[ 8] + x[ 4]), 13);
+		x[ 0] ^= rol32((x[12] + x[ 8]), 18);
+		x[ 9] ^= rol32((x[ 5] + x[ 1]),  7);
+		x[13] ^= rol32((x[ 9] + x[ 5]),  9);
+		x[ 1] ^= rol32((x[13] + x[ 9]), 13);
+		x[ 5] ^= rol32((x[ 1] + x[13]), 18);
+		x[14] ^= rol32((x[10] + x[ 6]),  7);
+		x[ 2] ^= rol32((x[14] + x[10]),  9);
+		x[ 6] ^= rol32((x[ 2] + x[14]), 13);
+		x[10] ^= rol32((x[ 6] + x[ 2]), 18);
+		x[ 3] ^= rol32((x[15] + x[11]),  7);
+		x[ 7] ^= rol32((x[ 3] + x[15]),  9);
+		x[11] ^= rol32((x[ 7] + x[ 3]), 13);
+		x[15] ^= rol32((x[11] + x[ 7]), 18);
+		x[ 1] ^= rol32((x[ 0] + x[ 3]),  7);
+		x[ 2] ^= rol32((x[ 1] + x[ 0]),  9);
+		x[ 3] ^= rol32((x[ 2] + x[ 1]), 13);
+		x[ 0] ^= rol32((x[ 3] + x[ 2]), 18);
+		x[ 6] ^= rol32((x[ 5] + x[ 4]),  7);
+		x[ 7] ^= rol32((x[ 6] + x[ 5]),  9);
+		x[ 4] ^= rol32((x[ 7] + x[ 6]), 13);
+		x[ 5] ^= rol32((x[ 4] + x[ 7]), 18);
+		x[11] ^= rol32((x[10] + x[ 9]),  7);
+		x[ 8] ^= rol32((x[11] + x[10]),  9);
+		x[ 9] ^= rol32((x[ 8] + x[11]), 13);
+		x[10] ^= rol32((x[ 9] + x[ 8]), 18);
+		x[12] ^= rol32((x[15] + x[14]),  7);
+		x[13] ^= rol32((x[12] + x[15]),  9);
+		x[14] ^= rol32((x[13] + x[12]), 13);
+		x[15] ^= rol32((x[14] + x[13]), 18);
+	}
+	for (i = 0; i < 16; ++i)
+		x[i] += input[i];
+	for (i = 0; i < 16; ++i)
+		U32TO8_LITTLE(output + 4 * i,x[i]);
+}
+
+static const char sigma[16] = "expand 32-byte k";
+static const char tau[16] = "expand 16-byte k";
+
+static void salsa20_keysetup(struct salsa20_ctx *ctx, const u8 *k, u32 kbytes)
+{
+	const char *constants;
+
+	ctx->input[1] = U8TO32_LITTLE(k + 0);
+	ctx->input[2] = U8TO32_LITTLE(k + 4);
+	ctx->input[3] = U8TO32_LITTLE(k + 8);
+	ctx->input[4] = U8TO32_LITTLE(k + 12);
+	if (kbytes == 32) { /* recommended */
+		k += 16;
+		constants = sigma;
+	} else { /* kbytes == 16 */
+		constants = tau;
+	}
+	ctx->input[11] = U8TO32_LITTLE(k + 0);
+	ctx->input[12] = U8TO32_LITTLE(k + 4);
+	ctx->input[13] = U8TO32_LITTLE(k + 8);
+	ctx->input[14] = U8TO32_LITTLE(k + 12);
+	ctx->input[0] = U8TO32_LITTLE(constants + 0);
+	ctx->input[5] = U8TO32_LITTLE(constants + 4);
+	ctx->input[10] = U8TO32_LITTLE(constants + 8);
+	ctx->input[15] = U8TO32_LITTLE(constants + 12);
+}
+
+static void salsa20_ivsetup(struct salsa20_ctx *ctx, const u8 *iv)
+{
+	ctx->input[6] = U8TO32_LITTLE(iv + 0);
+	ctx->input[7] = U8TO32_LITTLE(iv + 4);
+	ctx->input[8] = 0;
+	ctx->input[9] = 0;
+}
+
+static void salsa20_encrypt_bytes(struct salsa20_ctx *ctx, u8 *dst,
+				  const u8 *src, unsigned int bytes)
+{
+	u8 buf[64];
+
+	if (dst != src)
+		memcpy(dst, src, bytes);
+
+	while (bytes) {
+		salsa20_wordtobyte(buf, ctx->input);
+
+		ctx->input[8]++;
+		if (!ctx->input[8])
+			ctx->input[9]++;
+
+		if (bytes <= 64) {
+			crypto_xor(dst, buf, bytes);
+			return;
+		}
+
+		crypto_xor(dst, buf, 64);
+		bytes -= 64;
+		dst += 64;
+	}
+}
+
+/*
+ * End of code taken from D. J. Bernstein's reference implementation.
+ */
+
+static int setkey(struct crypto_tfm *tfm, const u8 *key,
+		  unsigned int keysize)
+{
+	struct salsa20_ctx *ctx = crypto_tfm_ctx(tfm);
+	salsa20_keysetup(ctx, key, keysize);
+	return 0;
+}
+
+static int encrypt(struct blkcipher_desc *desc,
+		   struct scatterlist *dst, struct scatterlist *src,
+		   unsigned int nbytes)
+{
+	struct blkcipher_walk walk;
+	struct crypto_blkcipher *tfm = desc->tfm;
+	struct salsa20_ctx *ctx = crypto_blkcipher_ctx(tfm);
+	int err;
+
+	blkcipher_walk_init(&walk, dst, src, nbytes);
+	err = blkcipher_walk_virt_block(desc, &walk, 64);
+
+	salsa20_ivsetup(ctx, desc->info);
+
+	while (walk.nbytes >= 64) {
+		salsa20_encrypt_bytes(ctx, walk.dst.virt.addr,
+				      walk.src.virt.addr,
+				      walk.nbytes - (walk.nbytes % 64));
+		err = blkcipher_walk_done(desc, &walk, walk.nbytes % 64);
+	}
+
+	if (walk.nbytes) {
+		salsa20_encrypt_bytes(ctx, walk.dst.virt.addr,
+				      walk.src.virt.addr, walk.nbytes);
+		err = blkcipher_walk_done(desc, &walk, 0);
+	}
+
+	return err;
+}
+
+static struct crypto_alg alg = {
+	.cra_name           =   "salsa20",
+	.cra_driver_name    =   "salsa20-generic",
+	.cra_priority       =   100,
+	.cra_flags          =   CRYPTO_ALG_TYPE_BLKCIPHER,
+	.cra_type           =   &crypto_blkcipher_type,
+	.cra_blocksize      =   1,
+	.cra_ctxsize        =   sizeof(struct salsa20_ctx),
+	.cra_alignmask      =	3,
+	.cra_module         =   THIS_MODULE,
+	.cra_u              =   {
+		.blkcipher = {
+			.setkey         =   setkey,
+			.encrypt        =   encrypt,
+			.decrypt        =   encrypt,
+			.min_keysize    =   SALSA20_MIN_KEY_SIZE,
+			.max_keysize    =   SALSA20_MAX_KEY_SIZE,
+			.ivsize         =   SALSA20_IV_SIZE,
+		}
+	}
+};
+
+static int __init salsa20_generic_mod_init(void)
+{
+	return crypto_register_alg(&alg);
+}
+
+static void __exit salsa20_generic_mod_fini(void)
+{
+	crypto_unregister_alg(&alg);
+}
+
+module_init(salsa20_generic_mod_init);
+module_exit(salsa20_generic_mod_fini);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION ("Salsa20 stream cipher algorithm");
+MODULE_ALIAS_CRYPTO("salsa20");
+MODULE_ALIAS_CRYPTO("salsa20-generic");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * Cryptographic API.
+ *
+ * Cipher operations.
+ *
+ * Copyright (c) 2002 James Morris <jmorris@intercode.com.au>
+ *               2002 Adam J. Richter <adam@yggdrasil.com>
+ *               2004 Jean-Luc Cooke <jlcooke@certainkey.com>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ */
+
+#include <crypto/scatterwalk.h>
+#include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/pagemap.h>
+#include <linux/highmem.h>
+#include <linux/scatterlist.h>
+
+static inline void memcpy_dir(void *buf, void *sgdata, size_t nbytes, int out)
+{
+	void *src = out ? buf : sgdata;
+	void *dst = out ? sgdata : buf;
+
+	memcpy(dst, src, nbytes);
+}
+
+void scatterwalk_start(struct scatter_walk *walk, struct scatterlist *sg)
+{
+	walk->sg = sg;
+
+	BUG_ON(!sg->length);
+
+	walk->offset = sg->offset;
+}
+EXPORT_SYMBOL_GPL(scatterwalk_start);
+
+void *scatterwalk_map(struct scatter_walk *walk)
+{
+	return kmap_atomic(scatterwalk_page(walk)) +
+	       offset_in_page(walk->offset);
+}
+EXPORT_SYMBOL_GPL(scatterwalk_map);
+
+static void scatterwalk_pagedone(struct scatter_walk *walk, int out,
+				 unsigned int more)
+{
+	if (out) {
+		struct page *page;
+
+		page = sg_page(walk->sg) + ((walk->offset - 1) >> PAGE_SHIFT);
+		/* Test ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE first as
+		 * PageSlab cannot be optimised away per se due to
+		 * use of volatile pointer.
+		 */
+		if (ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE && !PageSlab(page))
+			flush_dcache_page(page);
+	}
+
+	if (more) {
+		walk->offset += PAGE_SIZE - 1;
+		walk->offset &= PAGE_MASK;
+		if (walk->offset >= walk->sg->offset + walk->sg->length)
+			scatterwalk_start(walk, sg_next(walk->sg));
+	}
+}
+
+void scatterwalk_done(struct scatter_walk *walk, int out, int more)
+{
+	if (!more || walk->offset >= walk->sg->offset + walk->sg->length ||
+	    !(walk->offset & (PAGE_SIZE - 1)))
+		scatterwalk_pagedone(walk, out, more);
+}
+EXPORT_SYMBOL_GPL(scatterwalk_done);
+
+void scatterwalk_copychunks(void *buf, struct scatter_walk *walk,
+			    size_t nbytes, int out)
+{
+	for (;;) {
+		unsigned int len_this_page = scatterwalk_pagelen(walk);
+		u8 *vaddr;
+
+		if (len_this_page > nbytes)
+			len_this_page = nbytes;
+
+		vaddr = scatterwalk_map(walk);
+		memcpy_dir(buf, vaddr, len_this_page, out);
+		scatterwalk_unmap(vaddr);
+
+		scatterwalk_advance(walk, len_this_page);
+
+		if (nbytes == len_this_page)
+			break;
+
+		buf += len_this_page;
+		nbytes -= len_this_page;
+
+		scatterwalk_pagedone(walk, out, 1);
+	}
+}
+EXPORT_SYMBOL_GPL(scatterwalk_copychunks);
+
+void scatterwalk_map_and_copy(void *buf, struct scatterlist *sg,
+			      unsigned int start, unsigned int nbytes, int out)
+{
+	struct scatter_walk walk;
+	struct scatterlist tmp[2];
+
+	if (!nbytes)
 		return;
 
-	SLSI_UNUSED_PARAMETER_NOT_DEBUG(sdev);
+	sg = scatterwalk_ffwd(tmp, sg, start);
+
+	if (sg_page(sg) == virt_to_page(buf) &&
+	    sg->offset == offset_in_page(buf))
+		return;
+
+	scatterwalk_start(&walk, sg);
+	scatterwalk_copychunks(buf, &walk, nbytes, out);
+	scatterwalk_done(&walk, out, 0);
 }
+EXPORT_SYMBOL_GPL(scatterwalk_map_and_copy);
 
-static int slsi_wlan_mgmt_tx(struct slsi_dev *sdev, struct net_device *dev,
-			     struct ieee80211_channel *chan, unsigned int wait,
-			     const u8 *buf, size_t len, bool dont_wait_for_ack, u64 *cookie)
+int scatterwalk_bytes_sglen(struct scatterlist *sg, int num_bytes)
 {
-	u32                   host_tag = slsi_tx_mgmt_host_tag(sdev);
-	struct netdev_vif     *ndev_vif = netdev_priv(dev);
-	int                   r = 0;
-	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)buf;
-	u8                    exp_peer_frame = SLSI_PA_INVALID;
-	int                   subtype = SLSI_PA_INVALID;
+	int offset = 0, n = 0;
 
-	if (!ieee80211_is_auth(mgmt->frame_control))
-		slsi_wlan_dump_public_action_subtype(sdev, mgmt, true);
+	/* num_bytes is too small */
+	if (num_bytes < sg->length)
+		return -1;
 
-	if (ieee80211_is_action(mgmt->frame_control)) {
-		subtype = slsi_get_public_action_subtype(mgmt);
-
-		if (subtype != SLSI_PA_INVALID)
-			exp_peer_frame = slsi_get_exp_peer_frame_subtype(subtype);
-	}
-
-	if (!ndev_vif->activated) {
-		if (subtype >= SLSI_PA_GAS_INITIAL_REQ_SUBTYPE && subtype <= SLSI_PA_GAS_COMEBACK_RSP_SUBTYPE) {
-			ndev_vif->mgmt_tx_gas_frame = true;
-			SLSI_ETHER_COPY(ndev_vif->gas_frame_mac_addr, mgmt->sa);
-		} else {
-			ndev_vif->mgmt_tx_gas_frame = false;
-		}
-		r = slsi_wlan_unsync_vif_activate(sdev, dev, chan, wait);
-		if (r)
-			return r;
-
-		r = slsi_mlme_send_frame_mgmt(sdev, dev, buf, len, FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME, FAPI_MESSAGETYPE_IEEE80211_ACTION, host_tag, 0, wait * 1000, 0);
-		if (r)
-			goto exit_with_vif;
-		sdev->wlan_unsync_vif_state = WLAN_UNSYNC_VIF_TX;
-		queue_delayed_work(sdev->device_wq, &ndev_vif->unsync.hs2_del_vif_work, msecs_to_jiffies(wait));
-	} else {
-		/* vif is active*/
-		if (ieee80211_is_auth(mgmt->frame_control)) {
-			SLSI_NET_DBG1(dev, SLSI_CFG80211, "Transmit on the current frequency\n");
-			r = slsi_mlme_send_frame_mgmt(sdev, dev, buf, len, FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME,
-				                      FAPI_MESSAGETYPE_IEEE80211_MGMT, host_tag, 0, wait * 1000, 0);
-			if (r)
-				return r;
-		} else if (ndev_vif->vif_type == FAPI_VIFTYPE_UNSYNCHRONISED) {
-			if (subtype >= SLSI_PA_GAS_INITIAL_REQ_SUBTYPE && subtype <= SLSI_PA_GAS_COMEBACK_RSP_SUBTYPE) {
-				slsi_wlan_unsync_vif_deactivate(sdev, dev, true);
-				ndev_vif->mgmt_tx_gas_frame = true;
-				SLSI_ETHER_COPY(ndev_vif->gas_frame_mac_addr, mgmt->sa);
-				r = slsi_wlan_unsync_vif_activate(sdev, dev, chan, wait);
-				if (r)
-					return r;
-			} else {
-				if (ndev_vif->mgmt_tx_gas_frame) {
-					slsi_wlan_unsync_vif_deactivate(sdev, dev, true);
-					ndev_vif->mgmt_tx_gas_frame = false;
-					r = slsi_wlan_unsync_vif_activate(sdev, dev, chan, wait);
-					if (r)
-						return r;
-				}
-			}
-
-			cancel_delayed_work(&ndev_vif->unsync.hs2_del_vif_work);
-			/*even if we fail to cancel the delayed work, we shall go ahead and send action frames*/
-			if (ndev_vif->chan->hw_value != chan->hw_value) {
-				r = slsi_mlme_set_channel(sdev, dev, chan, SLSI_FW_CHANNEL_DURATION_UNSPECIFIED, 0, 0);
-				if (r)
-					goto exit_with_vif;
-			}
-			SLSI_NET_DBG1(dev, SLSI_CFG80211, "wlan unsync vif is active, send frame on channel freq = %d\n", chan->center_freq);
-			r = slsi_mlme_send_frame_mgmt(sdev, dev, buf, len, FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME, FAPI_MESSAGETYPE_IEEE80211_ACTION, host_tag, 0, wait * 1000, 0);
-			if (r)
-				goto exit_with_vif;
-			sdev->wlan_unsync_vif_state = WLAN_UNSYNC_VIF_TX;
-			queue_delayed_work(sdev->device_wq, &ndev_vif->unsync.hs2_del_vif_work, msecs_to_jiffies(wait));
-		} else if (ndev_vif->chan->hw_value == chan->hw_value) {
-			/* Dwell time not provided when sending frames on connected channel. */
-			SLSI_NET_DBG1(dev, SLSI_CFG80211, "STA VIF is active on same channel, send frame on channel freq %d\n", chan->center_freq);
-			r = slsi_mlme_send_frame_mgmt(sdev, dev, buf, len, FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME, FAPI_MESSAGETYPE_IEEE80211_ACTION, host_tag, 0, 0, 0);
-			if (r)
-				return r;
-		} else {
-			SLSI_NET_DBG1(dev, SLSI_CFG80211, "STA VIF is active on a different channel, send frame on channel freq %d\n", chan->center_freq);
-			/* Dwell time for GAS (ANQP) request packet set to 100ms if dwell time(wait) is more than 100ms */
-			if ((subtype == SLSI_PA_GAS_INITIAL_REQ_SUBTYPE || subtype == SLSI_PA_GAS_COMEBACK_REQ_SUBTYPE) && wait > SLSI_FW_MAX_OFFCHANNEL_DWELL_TIME)
-				wait = SLSI_FW_MAX_OFFCHANNEL_DWELL_TIME;
-			r = slsi_mlme_send_frame_mgmt(sdev, dev, buf, len, FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME, FAPI_MESSAGETYPE_IEEE80211_ACTION, host_tag, SLSI_FREQ_HOST_TO_FW(chan->center_freq), wait * 1000, 0);
-			if (r)
-				return r;
-		}
-	}
-
-	ndev_vif->mgmt_tx_data.exp_frame = exp_peer_frame;
-	slsi_assign_cookie_id(cookie, &ndev_vif->mgmt_tx_cookie);
-	slsi_set_mgmt_tx_data(ndev_vif, *cookie, host_tag, buf, len);
-	return r;
-
-exit_with_vif:
-	slsi_wlan_unsync_vif_deactivate(sdev, dev, true);
-	return r;
-}
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 13, 0))
-int slsi_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
-		 struct cfg80211_mgmt_tx_params *params,
-		 u64 *cookie)
-{
-#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
-int slsi_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
-		 struct ieee80211_channel *chan, bool offchan,
-		 unsigned int wait, const u8 *buf, size_t len, bool no_cck, bool dont_wait_for_ack, u64 *cookie)
-{
-	struct net_device *dev = wdev->netdev;
-
-#else
-int slsi_mgmt_tx(struct wiphy *wiphy, struct net_device *dev,
-		 struct ieee80211_channel *chan, bool offchan,
-		 enum nl80211_channel_type channel_type,
-		 bool channel_type_valid, unsigned int wait,
-		 const u8 *buf, size_t len, bool no_cck,
-		 bool dont_wait_for_ack, u64 *cookie)
-{
-#endif          /*  (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)) */
-
-	/* Note to explore for AP ::All public action frames which come to host should be handled properly
-	 * Additionally, if PMF is negotiated over the link, the host shall not issue "mlme-send-frame.request"
-	 * primitive  for action frames before the pairwise keys have been installed in F/W. Presently, for
-	 * SoftAP with PMF support, there is no scenario in which slsi_mlme_send_frame will be called for
-	 * action frames for VIF TYPE = AP.
-	 */
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 13, 0))
-	struct net_device           *dev = wdev->netdev;
-	struct ieee80211_channel    *chan = params->chan;
-	bool                        offchan = params->offchan;
-	unsigned int                wait = params->wait;
-	const u8                    *buf = params->buf;
-	size_t                      len = params->len;
-	bool                        no_cck = params->no_cck;
-	bool                        dont_wait_for_ack = params->dont_wait_for_ack;
-#endif
-
-	struct slsi_dev             *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif           *ndev_vif = netdev_priv(dev);
-	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *)buf;
-	int                         r = 0;
-
-	SLSI_UNUSED_PARAMETER(offchan);
-	SLSI_UNUSED_PARAMETER(no_cck);
-	SLSI_MUTEX_LOCK(sdev->start_stop_mutex);
-	if (sdev->device_state != SLSI_DEVICE_STATE_STARTED) {
-		SLSI_WARN(sdev, "device not started yet (device_state:%d)\n", sdev->device_state);
-		r = -EINVAL;
-		goto exit;
-	}
-
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	if (!(ieee80211_is_auth(mgmt->frame_control))) {
-		SLSI_NET_DBG2(dev, SLSI_CFG80211, "Mgmt Frame Tx: iface_num = %d, channel = %d, wait = %d, noAck = %d,"
-			      "offchannel = %d, mgmt->frame_control = %d, vif_type = %d\n", ndev_vif->ifnum, chan->hw_value,
-			      wait, dont_wait_for_ack, offchan, mgmt->frame_control, ndev_vif->vif_type);
-	} else {
-		SLSI_INFO(sdev, "Send Auth Frame\n");
-	}
-
-	if (!(ieee80211_is_mgmt(mgmt->frame_control))) {
-		SLSI_NET_ERR(dev, "Drop Tx frame: Not a Management frame\n");
-		r = -EINVAL;
-		goto exit;
-	}
-
-	if (SLSI_IS_VIF_INDEX_WLAN(ndev_vif)) {
-		r = slsi_wlan_mgmt_tx(SDEV_FROM_WIPHY(wiphy), dev, chan, wait, buf, len, dont_wait_for_ack, cookie);
-		goto exit;
-	}
-
-	/*P2P*/
-
-	/* Drop Probe Responses which can come in P2P Device and P2P Group role */
-	if (ieee80211_is_probe_resp(mgmt->frame_control)) {
-		/* Ideally supplicant doesn't expect Tx status for Probe Rsp. Send tx status just in case it requests ack */
-		if (!dont_wait_for_ack) {
-			slsi_assign_cookie_id(cookie, &ndev_vif->mgmt_tx_cookie);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
-			cfg80211_mgmt_tx_status(wdev, *cookie, buf, len, true, GFP_KERNEL);
-#else
-			cfg80211_mgmt_tx_status(dev, *cookie, buf, len, true, GFP_KERNEL);
-#endif
-		}
-		goto exit;
-	}
-
-	if (SLSI_IS_VIF_INDEX_P2P(ndev_vif)) {
-		struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
-		/* Check whether STA scan is running or not. If yes, then abort the STA scan */
-		slsi_abort_sta_scan(sdev);
-		if (SLSI_IS_P2P_GROUP_STATE(sdev))
-			r = slsi_p2p_group_mgmt_tx(mgmt, wiphy, dev, chan, wait, buf, len, dont_wait_for_ack, cookie);
-		else
-			r = slsi_p2p_mgmt_tx(mgmt, wiphy, dev, ndev_vif, chan, wait, buf, len, dont_wait_for_ack, cookie);
-	} else if (SLSI_IS_VIF_INDEX_P2P_GROUP(sdev, ndev_vif))
-		if (chan->hw_value == ndev_vif->chan->hw_value) {
-			struct slsi_dev *sdev = SDEV_FROM_WIPHY(wiphy);
-			u16             host_tag = slsi_tx_mgmt_host_tag(sdev);
-
-			r = slsi_mlme_send_frame_mgmt(sdev, dev, buf, len, FAPI_DATAUNITDESCRIPTOR_IEEE802_11_FRAME, FAPI_MESSAGETYPE_IEEE80211_ACTION, host_tag, 0, 0, 0);
-			if (r) {
-				SLSI_NET_ERR(dev, "Failed to send action frame, r = %d\n", r);
-				goto exit;
-			}
-			slsi_assign_cookie_id(cookie, &ndev_vif->mgmt_tx_cookie);
-			r = slsi_set_mgmt_tx_data(ndev_vif, *cookie, host_tag, buf, len);
-		}
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	SLSI_MUTEX_UNLOCK(sdev->start_stop_mutex);
-	return r;
-}
-
-/* cw = (2^n -1). But WMM IE needs value n. */
-u8 slsi_get_ecw(int cw)
-{
-	int ecw = 0;
-
-	cw = cw + 1;
 	do {
-		cw = cw >> 1;
-		ecw++;
-	} while (cw);
-	return ecw - 1;
+		offset += sg->length;
+		n++;
+		sg = sg_next(sg);
+
+		/* num_bytes is too large */
+		if (unlikely(!sg && (num_bytes < offset)))
+			return -1;
+	} while (sg && (num_bytes > offset));
+
+	return n;
 }
+EXPORT_SYMBOL_GPL(scatterwalk_bytes_sglen);
 
-int slsi_set_txq_params(struct wiphy *wiphy, struct net_device *ndev,
-			struct ieee80211_txq_params *params)
+struct scatterlist *scatterwalk_ffwd(struct scatterlist dst[2],
+				     struct scatterlist *src,
+				     unsigned int len)
 {
-	struct slsi_dev                   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif                 *ndev_vif = netdev_priv(ndev);
-	struct slsi_wmm_parameter_element *wmm_ie = &ndev_vif->ap.wmm_ie;
-	int                               r = 0;
+	for (;;) {
+		if (!len)
+			return src;
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
-	int                               ac = params->ac;
-#else
-	int                               ac = params->queue;
-#endif
-	/* Index remapping for AC from nl80211_ac enum to slsi_ac_index_wmm enum (index to be used in the IE).
-	 * Kernel version less than 3.5.0 doesn't support nl80211_ac enum hence not using the nl80211_ac enum.
-	 * Eg. NL80211_AC_VO (index value 0) would be remapped to AC_VO (index value 3).
-	 * Don't change the order of array elements.
-	 */
-	u8  ac_index_map[4] = { AC_VO, AC_VI, AC_BE, AC_BK };
-	int ac_remapped = ac_index_map[ac];
+		if (src->length > len)
+			break;
 
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-	SLSI_NET_DBG2(ndev, SLSI_CFG80211, " ac= %x, ac_remapped = %d aifs = %d, cmin=%x cmax = %x, txop = %x,"
-		      "vif_index = %d vif_type = %d", ac, ac_remapped, params->aifs, params->cwmin, params->cwmax,
-		      params->txop, ndev_vif->ifnum, ndev_vif->vif_type);
-
-	if (ndev_vif->activated) {
-		wmm_ie->ac[ac_remapped].aci_aifsn = (ac_remapped << 5) | (params->aifs & 0x0f);
-		wmm_ie->ac[ac_remapped].ecw = ((slsi_get_ecw(params->cwmax)) << 4) | ((slsi_get_ecw(params->cwmin)) & 0x0f);
-		wmm_ie->ac[ac_remapped].txop_limit = cpu_to_le16(params->txop);
-		if (ac == 3) {
-			wmm_ie->eid = SLSI_WLAN_EID_VENDOR_SPECIFIC;
-			wmm_ie->len = 24;
-			wmm_ie->oui[0] = 0x00;
-			wmm_ie->oui[1] = 0x50;
-			wmm_ie->oui[2] = 0xf2;
-			wmm_ie->oui_type = WLAN_OUI_TYPE_MICROSOFT_WMM;
-			wmm_ie->oui_subtype = 1;
-			wmm_ie->version = 1;
-			wmm_ie->qos_info = 0;
-			wmm_ie->reserved = 0;
-			r = slsi_mlme_add_info_elements(sdev, ndev, FAPI_PURPOSE_LOCAL, (const u8 *)wmm_ie, sizeof(struct slsi_wmm_parameter_element));
-			if (r)
-				SLSI_NET_ERR(ndev, "Error sending TX Queue Parameters for AP error = %d", r);
-		}
+		len -= src->length;
+		src = sg_next(src);
 	}
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
+
+	sg_init_table(dst, 2);
+	sg_set_page(dst, sg_page(src), src->length - len, src->offset + len);
+	scatterwalk_crypto_chain(dst, sg_next(src), 0, 2);
+
+	return dst;
+}
+EXPORT_SYMBOL_GPL(scatterwalk_ffwd);
+                                                   /*
+ * Cryptographic API.
+ *
+ * SEED Cipher Algorithm.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * Documentation of SEED can be found in RFC 4269.
+ * Copyright (C) 2007 Korea Information Security Agency (KISA).
+ */
+
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/types.h>
+#include <linux/errno.h>
+#include <linux/crypto.h>
+#include <asm/byteorder.h>
+
+#define SEED_NUM_KCONSTANTS	16
+#define SEED_KEY_SIZE		16
+#define SEED_BLOCK_SIZE		16
+#define SEED_KEYSCHED_LEN	32
+
+/*
+ * #define byte(x, nr) ((unsigned char)((x) >> (nr*8)))
+ */
+static inline u8
+byte(const u32 x, const unsigned n)
+{
+	return x >> (n << 3);
 }
 
-#ifdef CONFIG_SCSC_WLAN_SAE_CONFIG
-int slsi_synchronised_response(struct wiphy *wiphy, struct net_device *dev,
-                   struct cfg80211_external_auth_params *params)
+struct seed_ctx {
+	u32 keysched[SEED_KEYSCHED_LEN];
+};
+
+static const u32 SS0[256] = {
+	0x2989a1a8, 0x05858184, 0x16c6d2d4, 0x13c3d3d0,
+	0x14445054, 0x1d0d111c, 0x2c8ca0ac, 0x25052124,
+	0x1d4d515c, 0x03434340, 0x18081018, 0x1e0e121c,
+	0x11415150, 0x3cccf0fc, 0x0acac2c8, 0x23436360,
+	0x28082028, 0x04444044, 0x20002020, 0x1d8d919c,
+	0x20c0e0e0, 0x22c2e2e0, 0x08c8c0c8, 0x17071314,
+	0x2585a1a4, 0x0f8f838c, 0x03030300, 0x3b4b7378,
+	0x3b8bb3b8, 0x13031310, 0x12c2d2d0, 0x2ecee2ec,
+	0x30407070, 0x0c8c808c, 0x3f0f333c, 0x2888a0a8,
+	0x32023230, 0x1dcdd1dc, 0x36c6f2f4, 0x34447074,
+	0x2ccce0ec, 0x15859194, 0x0b0b0308, 0x17475354,
+	0x1c4c505c, 0x1b4b5358, 0x3d8db1bc, 0x01010100,
+	0x24042024, 0x1c0c101c, 0x33437370, 0x18889098,
+	0x10001010, 0x0cccc0cc, 0x32c2f2f0, 0x19c9d1d8,
+	0x2c0c202c, 0x27c7e3e4, 0x32427270, 0x03838380,
+	0x1b8b9398, 0x11c1d1d0, 0x06868284, 0x09c9c1c8,
+	0x20406060, 0x10405050, 0x2383a3a0, 0x2bcbe3e8,
+	0x0d0d010c, 0x3686b2b4, 0x1e8e929c, 0x0f4f434c,
+	0x3787b3b4, 0x1a4a5258, 0x06c6c2c4, 0x38487078,
+	0x2686a2a4, 0x12021210, 0x2f8fa3ac, 0x15c5d1d4,
+	0x21416160, 0x03c3c3c0, 0x3484b0b4, 0x01414140,
+	0x12425250, 0x3d4d717c, 0x0d8d818c, 0x08080008,
+	0x1f0f131c, 0x19899198, 0x00000000, 0x19091118,
+	0x04040004, 0x13435350, 0x37c7f3f4, 0x21c1e1e0,
+	0x3dcdf1fc, 0x36467274, 0x2f0f232c, 0x27072324,
+	0x3080b0b0, 0x0b8b8388, 0x0e0e020c, 0x2b8ba3a8,
+	0x2282a2a0, 0x2e4e626c, 0x13839390, 0x0d4d414c,
+	0x29496168, 0x3c4c707c, 0x09090108, 0x0a0a0208,
+	0x3f8fb3bc, 0x2fcfe3ec, 0x33c3f3f0, 0x05c5c1c4,
+	0x07878384, 0x14041014, 0x3ecef2fc, 0x24446064,
+	0x1eced2dc, 0x2e0e222c, 0x0b4b4348, 0x1a0a1218,
+	0x06060204, 0x21012120, 0x2b4b6368, 0x26466264,
+	0x02020200, 0x35c5f1f4, 0x12829290, 0x0a8a8288,
+	0x0c0c000c, 0x3383b3b0, 0x3e4e727c, 0x10c0d0d0,
+	0x3a4a7278, 0x07474344, 0x16869294, 0x25c5e1e4,
+	0x26062224, 0x00808080, 0x2d8da1ac, 0x1fcfd3dc,
+	0x2181a1a0, 0x30003030, 0x37073334, 0x2e8ea2ac,
+	0x36063234, 0x15051114, 0x22022220, 0x38083038,
+	0x34c4f0f4, 0x2787a3a4, 0x05454144, 0x0c4c404c,
+	0x01818180, 0x29c9e1e8, 0x04848084, 0x17879394,
+	0x35053134, 0x0bcbc3c8, 0x0ecec2cc, 0x3c0c303c,
+	0x31417170, 0x11011110, 0x07c7c3c4, 0x09898188,
+	0x35457174, 0x3bcbf3f8, 0x1acad2d8, 0x38c8f0f8,
+	0x14849094, 0x19495158, 0x02828280, 0x04c4c0c4,
+	0x3fcff3fc, 0x09494148, 0x39093138, 0x27476364,
+	0x00c0c0c0, 0x0fcfc3cc, 0x17c7d3d4, 0x3888b0b8,
+	0x0f0f030c, 0x0e8e828c, 0x02424240, 0x23032320,
+	0x11819190, 0x2c4c606c, 0x1bcbd3d8, 0x2484a0a4,
+	0x34043034, 0x31c1f1f0, 0x08484048, 0x02c2c2c0,
+	0x2f4f636c, 0x3d0d313c, 0x2d0d212c, 0x00404040,
+	0x3e8eb2bc, 0x3e0e323c, 0x3c8cb0bc, 0x01c1c1c0,
+	0x2a8aa2a8, 0x3a8ab2b8, 0x0e4e424c, 0x15455154,
+	0x3b0b3338, 0x1cccd0dc, 0x28486068, 0x3f4f737c,
+	0x1c8c909c, 0x18c8d0d8, 0x0a4a4248, 0x16465254,
+	0x37477374, 0x2080a0a0, 0x2dcde1ec, 0x06464244,
+	0x3585b1b4, 0x2b0b2328, 0x25456164, 0x3acaf2f8,
+	0x23c3e3e0, 0x3989b1b8, 0x3181b1b0, 0x1f8f939c,
+	0x1e4e525c, 0x39c9f1f8, 0x26c6e2e4, 0x3282b2b0,
+	0x31013130, 0x2acae2e8, 0x2d4d616c, 0x1f4f535c,
+	0x24c4e0e4, 0x30c0f0f0, 0x0dcdc1cc, 0x08888088,
+	0x16061214, 0x3a0a3238, 0x18485058, 0x14c4d0d4,
+	0x22426260, 0x29092128, 0x07070304, 0x33033330,
+	0x28c8e0e8, 0x1b0b1318, 0x05050104, 0x39497178,
+	0x10809090, 0x2a4a6268, 0x2a0a2228, 0x1a8a9298,
+};
+
+static const u32 SS1[256] = {
+	0x38380830, 0xe828c8e0, 0x2c2d0d21, 0xa42686a2,
+	0xcc0fcfc3, 0xdc1eced2, 0xb03383b3, 0xb83888b0,
+	0xac2f8fa3, 0x60204060, 0x54154551, 0xc407c7c3,
+	0x44044440, 0x6c2f4f63, 0x682b4b63, 0x581b4b53,
+	0xc003c3c3, 0x60224262, 0x30330333, 0xb43585b1,
+	0x28290921, 0xa02080a0, 0xe022c2e2, 0xa42787a3,
+	0xd013c3d3, 0x90118191, 0x10110111, 0x04060602,
+	0x1c1c0c10, 0xbc3c8cb0, 0x34360632, 0x480b4b43,
+	0xec2fcfe3, 0x88088880, 0x6c2c4c60, 0xa82888a0,
+	0x14170713, 0xc404c4c0, 0x14160612, 0xf434c4f0,
+	0xc002c2c2, 0x44054541, 0xe021c1e1, 0xd416c6d2,
+	0x3c3f0f33, 0x3c3d0d31, 0x8c0e8e82, 0x98188890,
+	0x28280820, 0x4c0e4e42, 0xf436c6f2, 0x3c3e0e32,
+	0xa42585a1, 0xf839c9f1, 0x0c0d0d01, 0xdc1fcfd3,
+	0xd818c8d0, 0x282b0b23, 0x64264662, 0x783a4a72,
+	0x24270723, 0x2c2f0f23, 0xf031c1f1, 0x70324272,
+	0x40024242, 0xd414c4d0, 0x40014141, 0xc000c0c0,
+	0x70334373, 0x64274763, 0xac2c8ca0, 0x880b8b83,
+	0xf437c7f3, 0xac2d8da1, 0x80008080, 0x1c1f0f13,
+	0xc80acac2, 0x2c2c0c20, 0xa82a8aa2, 0x34340430,
+	0xd012c2d2, 0x080b0b03, 0xec2ecee2, 0xe829c9e1,
+	0x5c1d4d51, 0x94148490, 0x18180810, 0xf838c8f0,
+	0x54174753, 0xac2e8ea2, 0x08080800, 0xc405c5c1,
+	0x10130313, 0xcc0dcdc1, 0x84068682, 0xb83989b1,
+	0xfc3fcff3, 0x7c3d4d71, 0xc001c1c1, 0x30310131,
+	0xf435c5f1, 0x880a8a82, 0x682a4a62, 0xb03181b1,
+	0xd011c1d1, 0x20200020, 0xd417c7d3, 0x00020202,
+	0x20220222, 0x04040400, 0x68284860, 0x70314171,
+	0x04070703, 0xd81bcbd3, 0x9c1d8d91, 0x98198991,
+	0x60214161, 0xbc3e8eb2, 0xe426c6e2, 0x58194951,
+	0xdc1dcdd1, 0x50114151, 0x90108090, 0xdc1cccd0,
+	0x981a8a92, 0xa02383a3, 0xa82b8ba3, 0xd010c0d0,
+	0x80018181, 0x0c0f0f03, 0x44074743, 0x181a0a12,
+	0xe023c3e3, 0xec2ccce0, 0x8c0d8d81, 0xbc3f8fb3,
+	0x94168692, 0x783b4b73, 0x5c1c4c50, 0xa02282a2,
+	0xa02181a1, 0x60234363, 0x20230323, 0x4c0d4d41,
+	0xc808c8c0, 0x9c1e8e92, 0x9c1c8c90, 0x383a0a32,
+	0x0c0c0c00, 0x2c2e0e22, 0xb83a8ab2, 0x6c2e4e62,
+	0x9c1f8f93, 0x581a4a52, 0xf032c2f2, 0x90128292,
+	0xf033c3f3, 0x48094941, 0x78384870, 0xcc0cccc0,
+	0x14150511, 0xf83bcbf3, 0x70304070, 0x74354571,
+	0x7c3f4f73, 0x34350531, 0x10100010, 0x00030303,
+	0x64244460, 0x6c2d4d61, 0xc406c6c2, 0x74344470,
+	0xd415c5d1, 0xb43484b0, 0xe82acae2, 0x08090901,
+	0x74364672, 0x18190911, 0xfc3ecef2, 0x40004040,
+	0x10120212, 0xe020c0e0, 0xbc3d8db1, 0x04050501,
+	0xf83acaf2, 0x00010101, 0xf030c0f0, 0x282a0a22,
+	0x5c1e4e52, 0xa82989a1, 0x54164652, 0x40034343,
+	0x84058581, 0x14140410, 0x88098981, 0x981b8b93,
+	0xb03080b0, 0xe425c5e1, 0x48084840, 0x78394971,
+	0x94178793, 0xfc3cccf0, 0x1c1e0e12, 0x80028282,
+	0x20210121, 0x8c0c8c80, 0x181b0b13, 0x5c1f4f53,
+	0x74374773, 0x54144450, 0xb03282b2, 0x1c1d0d11,
+	0x24250521, 0x4c0f4f43, 0x00000000, 0x44064642,
+	0xec2dcde1, 0x58184850, 0x50124252, 0xe82bcbe3,
+	0x7c3e4e72, 0xd81acad2, 0xc809c9c1, 0xfc3dcdf1,
+	0x30300030, 0x94158591, 0x64254561, 0x3c3c0c30,
+	0xb43686b2, 0xe424c4e0, 0xb83b8bb3, 0x7c3c4c70,
+	0x0c0e0e02, 0x50104050, 0x38390931, 0x24260622,
+	0x30320232, 0x84048480, 0x68294961, 0x90138393,
+	0x34370733, 0xe427c7e3, 0x24240420, 0xa42484a0,
+	0xc80bcbc3, 0x50134353, 0x080a0a02, 0x84078783,
+	0xd819c9d1, 0x4c0c4c40, 0x80038383, 0x8c0f8f83,
+	0xcc0ecec2, 0x383b0b33, 0x480a4a42, 0xb43787b3,
+};
+
+static const u32 SS2[256] = {
+	0xa1a82989, 0x81840585, 0xd2d416c6, 0xd3d013c3,
+	0x50541444, 0x111c1d0d, 0xa0ac2c8c, 0x21242505,
+	0x515c1d4d, 0x43400343, 0x10181808, 0x121c1e0e,
+	0x51501141, 0xf0fc3ccc, 0xc2c80aca, 0x63602343,
+	0x20282808, 0x40440444, 0x20202000, 0x919c1d8d,
+	0xe0e020c0, 0xe2e022c2, 0xc0c808c8, 0x13141707,
+	0xa1a42585, 0x838c0f8f, 0x03000303, 0x73783b4b,
+	0xb3b83b8b, 0x13101303, 0xd2d012c2, 0xe2ec2ece,
+	0x70703040, 0x808c0c8c, 0x333c3f0f, 0xa0a82888,
+	0x32303202, 0xd1dc1dcd, 0xf2f436c6, 0x70743444,
+	0xe0ec2ccc, 0x91941585, 0x03080b0b, 0x53541747,
+	0x505c1c4c, 0x53581b4b, 0xb1bc3d8d, 0x01000101,
+	0x20242404, 0x101c1c0c, 0x73703343, 0x90981888,
+	0x10101000, 0xc0cc0ccc, 0xf2f032c2, 0xd1d819c9,
+	0x202c2c0c, 0xe3e427c7, 0x72703242, 0x83800383,
+	0x93981b8b, 0xd1d011c1, 0x82840686, 0xc1c809c9,
+	0x60602040, 0x50501040, 0xa3a02383, 0xe3e82bcb,
+	0x010c0d0d, 0xb2b43686, 0x929c1e8e, 0x434c0f4f,
+	0xb3b43787, 0x52581a4a, 0xc2c406c6, 0x70783848,
+	0xa2a42686, 0x12101202, 0xa3ac2f8f, 0xd1d415c5,
+	0x61602141, 0xc3c003c3, 0xb0b43484, 0x41400141,
+	0x52501242, 0x717c3d4d, 0x818c0d8d, 0x00080808,
+	0x131c1f0f, 0x91981989, 0x00000000, 0x11181909,
+	0x00040404, 0x53501343, 0xf3f437c7, 0xe1e021c1,
+	0xf1fc3dcd, 0x72743646, 0x232c2f0f, 0x23242707,
+	0xb0b03080, 0x83880b8b, 0x020c0e0e, 0xa3a82b8b,
+	0xa2a02282, 0x626c2e4e, 0x93901383, 0x414c0d4d,
+	0x61682949, 0x707c3c4c, 0x01080909, 0x02080a0a,
+	0xb3bc3f8f, 0xe3ec2fcf, 0xf3f033c3, 0xc1c405c5,
+	0x83840787, 0x10141404, 0xf2fc3ece, 0x60642444,
+	0xd2dc1ece, 0x222c2e0e, 0x43480b4b, 0x12181a0a,
+	0x02040606, 0x21202101, 0x63682b4b, 0x62642646,
+	0x02000202, 0xf1f435c5, 0x92901282, 0x82880a8a,
+	0x000c0c0c, 0xb3b03383, 0x727c3e4e, 0xd0d010c0,
+	0x72783a4a, 0x43440747, 0x92941686, 0xe1e425c5,
+	0x22242606, 0x80800080, 0xa1ac2d8d, 0xd3dc1fcf,
+	0xa1a02181, 0x30303000, 0x33343707, 0xa2ac2e8e,
+	0x32343606, 0x11141505, 0x22202202, 0x30383808,
+	0xf0f434c4, 0xa3a42787, 0x41440545, 0x404c0c4c,
+	0x81800181, 0xe1e829c9, 0x80840484, 0x93941787,
+	0x31343505, 0xc3c80bcb, 0xc2cc0ece, 0x303c3c0c,
+	0x71703141, 0x11101101, 0xc3c407c7, 0x81880989,
+	0x71743545, 0xf3f83bcb, 0xd2d81aca, 0xf0f838c8,
+	0x90941484, 0x51581949, 0x82800282, 0xc0c404c4,
+	0xf3fc3fcf, 0x41480949, 0x31383909, 0x63642747,
+	0xc0c000c0, 0xc3cc0fcf, 0xd3d417c7, 0xb0b83888,
+	0x030c0f0f, 0x828c0e8e, 0x42400242, 0x23202303,
+	0x91901181, 0x606c2c4c, 0xd3d81bcb, 0xa0a42484,
+	0x30343404, 0xf1f031c1, 0x40480848, 0xc2c002c2,
+	0x636c2f4f, 0x313c3d0d, 0x212c2d0d, 0x40400040,
+	0xb2bc3e8e, 0x323c3e0e, 0xb0bc3c8c, 0xc1c001c1,
+	0xa2a82a8a, 0xb2b83a8a, 0x424c0e4e, 0x51541545,
+	0x33383b0b, 0xd0dc1ccc, 0x60682848, 0x737c3f4f,
+	0x909c1c8c, 0xd0d818c8, 0x42480a4a, 0x52541646,
+	0x73743747, 0xa0a02080, 0xe1ec2dcd, 0x42440646,
+	0xb1b43585, 0x23282b0b, 0x61642545, 0xf2f83aca,
+	0xe3e023c3, 0xb1b83989, 0xb1b03181, 0x939c1f8f,
+	0x525c1e4e, 0xf1f839c9, 0xe2e426c6, 0xb2b03282,
+	0x31303101, 0xe2e82aca, 0x616c2d4d, 0x535c1f4f,
+	0xe0e424c4, 0xf0f030c0, 0xc1cc0dcd, 0x80880888,
+	0x12141606, 0x32383a0a, 0x50581848, 0xd0d414c4,
+	0x62602242, 0x21282909, 0x03040707, 0x33303303,
+	0xe0e828c8, 0x13181b0b, 0x01040505, 0x71783949,
+	0x90901080, 0x62682a4a, 0x22282a0a, 0x92981a8a,
+};
+
+static const u32 SS3[256] = {
+	0x08303838, 0xc8e0e828, 0x0d212c2d, 0x86a2a426,
+	0xcfc3cc0f, 0xced2dc1e, 0x83b3b033, 0x88b0b838,
+	0x8fa3ac2f, 0x40606020, 0x45515415, 0xc7c3c407,
+	0x44404404, 0x4f636c2f, 0x4b63682b, 0x4b53581b,
+	0xc3c3c003, 0x42626022, 0x03333033, 0x85b1b435,
+	0x09212829, 0x80a0a020, 0xc2e2e022, 0x87a3a427,
+	0xc3d3d013, 0x81919011, 0x01111011, 0x06020406,
+	0x0c101c1c, 0x8cb0bc3c, 0x06323436, 0x4b43480b,
+	0xcfe3ec2f, 0x88808808, 0x4c606c2c, 0x88a0a828,
+	0x07131417, 0xc4c0c404, 0x06121416, 0xc4f0f434,
+	0xc2c2c002, 0x45414405, 0xc1e1e021, 0xc6d2d416,
+	0x0f333c3f, 0x0d313c3d, 0x8e828c0e, 0x88909818,
+	0x08202828, 0x4e424c0e, 0xc6f2f436, 0x0e323c3e,
+	0x85a1a425, 0xc9f1f839, 0x0d010c0d, 0xcfd3dc1f,
+	0xc8d0d818, 0x0b23282b, 0x46626426, 0x4a72783a,
+	0x07232427, 0x0f232c2f, 0xc1f1f031, 0x42727032,
+	0x42424002, 0xc4d0d414, 0x41414001, 0xc0c0c000,
+	0x43737033, 0x47636427, 0x8ca0ac2c, 0x8b83880b,
+	0xc7f3f437, 0x8da1ac2d, 0x80808000, 0x0f131c1f,
+	0xcac2c80a, 0x0c202c2c, 0x8aa2a82a, 0x04303434,
+	0xc2d2d012, 0x0b03080b, 0xcee2ec2e, 0xc9e1e829,
+	0x4d515c1d, 0x84909414, 0x08101818, 0xc8f0f838,
+	0x47535417, 0x8ea2ac2e, 0x08000808, 0xc5c1c405,
+	0x03131013, 0xcdc1cc0d, 0x86828406, 0x89b1b839,
+	0xcff3fc3f, 0x4d717c3d, 0xc1c1c001, 0x01313031,
+	0xc5f1f435, 0x8a82880a, 0x4a62682a, 0x81b1b031,
+	0xc1d1d011, 0x00202020, 0xc7d3d417, 0x02020002,
+	0x02222022, 0x04000404, 0x48606828, 0x41717031,
+	0x07030407, 0xcbd3d81b, 0x8d919c1d, 0x89919819,
+	0x41616021, 0x8eb2bc3e, 0xc6e2e426, 0x49515819,
+	0xcdd1dc1d, 0x41515011, 0x80909010, 0xccd0dc1c,
+	0x8a92981a, 0x83a3a023, 0x8ba3a82b, 0xc0d0d010,
+	0x81818001, 0x0f030c0f, 0x47434407, 0x0a12181a,
+	0xc3e3e023, 0xcce0ec2c, 0x8d818c0d, 0x8fb3bc3f,
+	0x86929416, 0x4b73783b, 0x4c505c1c, 0x82a2a022,
+	0x81a1a021, 0x43636023, 0x03232023, 0x4d414c0d,
+	0xc8c0c808, 0x8e929c1e, 0x8c909c1c, 0x0a32383a,
+	0x0c000c0c, 0x0e222c2e, 0x8ab2b83a, 0x4e626c2e,
+	0x8f939c1f, 0x4a52581a, 0xc2f2f032, 0x82929012,
+	0xc3f3f033, 0x49414809, 0x48707838, 0xccc0cc0c,
+	0x05111415, 0xcbf3f83b, 0x40707030, 0x45717435,
+	0x4f737c3f, 0x05313435, 0x00101010, 0x03030003,
+	0x44606424, 0x4d616c2d, 0xc6c2c406, 0x44707434,
+	0xc5d1d415, 0x84b0b434, 0xcae2e82a, 0x09010809,
+	0x46727436, 0x09111819, 0xcef2fc3e, 0x40404000,
+	0x02121012, 0xc0e0e020, 0x8db1bc3d, 0x05010405,
+	0xcaf2f83a, 0x01010001, 0xc0f0f030, 0x0a22282a,
+	0x4e525c1e, 0x89a1a829, 0x46525416, 0x43434003,
+	0x85818405, 0x04101414, 0x89818809, 0x8b93981b,
+	0x80b0b030, 0xc5e1e425, 0x48404808, 0x49717839,
+	0x87939417, 0xccf0fc3c, 0x0e121c1e, 0x82828002,
+	0x01212021, 0x8c808c0c, 0x0b13181b, 0x4f535c1f,
+	0x47737437, 0x44505414, 0x82b2b032, 0x0d111c1d,
+	0x05212425, 0x4f434c0f, 0x00000000, 0x46424406,
+	0xcde1ec2d, 0x48505818, 0x42525012, 0xcbe3e82b,
+	0x4e727c3e, 0xcad2d81a, 0xc9c1c809, 0xcdf1fc3d,
+	0x00303030, 0x85919415, 0x45616425, 0x0c303c3c,
+	0x86b2b436, 0xc4e0e424, 0x8bb3b83b, 0x4c707c3c,
+	0x0e020c0e, 0x40505010, 0x09313839, 0x06222426,
+	0x02323032, 0x84808404, 0x49616829, 0x83939013,
+	0x07333437, 0xc7e3e427, 0x04202424, 0x84a0a424,
+	0xcbc3c80b, 0x43535013, 0x0a02080a, 0x87838407,
+	0xc9d1d819, 0x4c404c0c, 0x83838003, 0x8f838c0f,
+	0xcec2cc0e, 0x0b33383b, 0x4a42480a, 0x87b3b437,
+};
+
+static const u32 KC[SEED_NUM_KCONSTANTS] = {
+	0x9e3779b9, 0x3c6ef373, 0x78dde6e6, 0xf1bbcdcc,
+	0xe3779b99, 0xc6ef3733, 0x8dde6e67, 0x1bbcdccf,
+	0x3779b99e, 0x6ef3733c, 0xdde6e678, 0xbbcdccf1,
+	0x779b99e3, 0xef3733c6, 0xde6e678d, 0xbcdccf1b,
+};
+
+#define OP(X1, X2, X3, X4, rbase)			\
+	t0 = X3 ^ ks[rbase];				\
+	t1 = X4 ^ ks[rbase+1];				\
+	t1 ^= t0;					\
+	t1 = SS0[byte(t1, 0)] ^ SS1[byte(t1, 1)] ^	\
+		SS2[byte(t1, 2)] ^ SS3[byte(t1, 3)];	\
+	t0 += t1;					\
+	t0 = SS0[byte(t0, 0)] ^ SS1[byte(t0, 1)] ^	\
+		SS2[byte(t0, 2)] ^ SS3[byte(t0, 3)];	\
+	t1 += t0;					\
+	t1 = SS0[byte(t1, 0)] ^ SS1[byte(t1, 1)] ^	\
+		SS2[byte(t1, 2)] ^ SS3[byte(t1, 3)];	\
+	t0 += t1;					\
+	X1 ^= t0;					\
+	X2 ^= t1;
+
+static int seed_set_key(struct crypto_tfm *tfm, const u8 *in_key,
+		        unsigned int key_len)
 {
-    struct slsi_dev                   *sdev = SDEV_FROM_WIPHY(wiphy);
-    struct netdev_vif                 *ndev_vif = netdev_priv(dev);
-    int r;
+	struct seed_ctx *ctx = crypto_tfm_ctx(tfm);
+	u32 *keyout = ctx->keysched;
+	const __be32 *key = (const __be32 *)in_key;
+	u32 i, t0, t1, x1, x2, x3, x4;
 
-    SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-    r = slsi_mlme_synchronised_response(sdev, dev, params);
-    SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-    return r;
-}
-#endif
+	x1 = be32_to_cpu(key[0]);
+	x2 = be32_to_cpu(key[1]);
+	x3 = be32_to_cpu(key[2]);
+	x4 = be32_to_cpu(key[3]);
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-static int slsi_update_ft_ies(struct wiphy *wiphy, struct net_device *dev, struct cfg80211_update_ft_ies_params *ftie)
-{
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	int               r = 0;
+	for (i = 0; i < SEED_NUM_KCONSTANTS; i++) {
+		t0 = x1 + x3 - KC[i];
+		t1 = x2 + KC[i] - x4;
+		*(keyout++) = SS0[byte(t0, 0)] ^ SS1[byte(t0, 1)] ^
+				SS2[byte(t0, 2)] ^ SS3[byte(t0, 3)];
+		*(keyout++) = SS0[byte(t1, 0)] ^ SS1[byte(t1, 1)] ^
+				SS2[byte(t1, 2)] ^ SS3[byte(t1, 3)];
 
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-
-	if (ndev_vif->vif_type == FAPI_VIFTYPE_STATION) {
-		const u8 *keo_ie_pos = NULL;
-		u8 *ie_buf = NULL;
-		int ie_len = 0;
-		int ie_buf_len = 0;
-
-		keo_ie_pos = cfg80211_find_vendor_ie(WLAN_OUI_SAMSUNG, WLAN_OUI_TYPE_SAMSUNG_KEO,
-						     ndev_vif->sta.assoc_req_add_info_elem,
-						     ndev_vif->sta.assoc_req_add_info_elem_len);
-		if (keo_ie_pos) {
-			ie_buf_len = ftie->ie_len +
-				     ndev_vif->sta.assoc_req_add_info_elem_len -
-				     (keo_ie_pos - ndev_vif->sta.assoc_req_add_info_elem);
-			ie_buf = kmalloc(ie_buf_len, GFP_KERNEL);
-			if (!ie_buf) {
-				SLSI_NET_ERR(dev, "kmalloc failed\n");
-				SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-				return -ENOMEM;
-			}
-			ie_len = ftie->ie_len;
-			if (ie_buf_len < ie_len) {
-				SLSI_NET_ERR(dev, "ft_ie buffer overflow!!\n");
-				kfree(ie_buf);
-				ie_buf = NULL;
-				SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-				return -EINVAL;
-			}
-			memcpy(ie_buf, ftie->ie, ie_len);
-			if ((ie_buf_len - ie_len) >= ((int)keo_ie_pos[1]+ 2)) {
-				memcpy(&ie_buf[ie_len], keo_ie_pos, ((int)keo_ie_pos[1]+ 2));
-				ie_len += (keo_ie_pos[1] + 2);
-				keo_ie_pos += (keo_ie_pos[1] + 2);
-			} else {
-				SLSI_NET_ERR(dev, "ie_buf buffer overflow!!\n");
-				kfree(ie_buf);
-				ie_buf = NULL;
-				SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-				return -EINVAL;
-			}
-			while ((ndev_vif->sta.assoc_req_add_info_elem_len -
-			       (keo_ie_pos - ndev_vif->sta.assoc_req_add_info_elem)) > 2) {
-				keo_ie_pos = cfg80211_find_vendor_ie(WLAN_OUI_SAMSUNG, WLAN_OUI_TYPE_SAMSUNG_KEO,
-								     keo_ie_pos,
-								     ndev_vif->sta.assoc_req_add_info_elem_len -
-								     (keo_ie_pos - ndev_vif->sta.assoc_req_add_info_elem));
-				if (!keo_ie_pos)
-					break;
-				if ((ie_buf_len - ie_len) >= ((int)keo_ie_pos[1]+ 2)) {
-					memcpy(&ie_buf[ie_len], keo_ie_pos, (keo_ie_pos[1]+ 2));
-					ie_len += (keo_ie_pos[1] + 2);
-					keo_ie_pos += (keo_ie_pos[1] + 2);
-				} else {
-					SLSI_NET_ERR(dev, "ie_buf buffer overflow!\n");
-					kfree(ie_buf);
-					ie_buf = NULL;
-					SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-					return -EINVAL;
-				}
-			}
-			r = slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_ASSOCIATION_REQUEST, ie_buf, ie_len);
+		if (i % 2 == 0) {
+			t0 = x1;
+			x1 = (x1 >> 8) ^ (x2 << 24);
+			x2 = (x2 >> 8) ^ (t0 << 24);
 		} else {
-			r = slsi_mlme_add_info_elements(sdev, dev, FAPI_PURPOSE_ASSOCIATION_REQUEST, ftie->ie, ftie->ie_len);
+			t0 = x3;
+			x3 = (x3 << 8) ^ (x4 >> 24);
+			x4 = (x4 << 8) ^ (t0 >> 24);
 		}
-		kfree(ie_buf);
-		ie_buf = NULL;
 	}
 
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
+	return 0;
 }
 
-int slsi_set_mac_acl(struct wiphy *wiphy, struct net_device *dev,
-		     const struct cfg80211_acl_data *params)
+/* encrypt a block of text */
+
+static void seed_encrypt(struct crypto_tfm *tfm, u8 *out, const u8 *in)
 {
-	struct slsi_dev   *sdev = SDEV_FROM_WIPHY(wiphy);
-	struct netdev_vif *ndev_vif = netdev_priv(dev);
-	int               r = 0;
+	const struct seed_ctx *ctx = crypto_tfm_ctx(tfm);
+	const __be32 *src = (const __be32 *)in;
+	__be32 *dst = (__be32 *)out;
+	u32 x1, x2, x3, x4, t0, t1;
+	const u32 *ks = ctx->keysched;
 
-	if (slsi_is_test_mode_enabled()) {
-		SLSI_NET_INFO(dev, "Skip sending signal, WlanLite FW does not support MLME_SET_ACL.request\n");
-		return -EOPNOTSUPP;
-	}
-	SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
-	if (FAPI_VIFTYPE_AP != ndev_vif->vif_type) {
-		SLSI_NET_ERR(dev, "Invalid vif type: %d\n", ndev_vif->vif_type);
-		r = -EINVAL;
-		goto exit;
-	}
-	SLSI_NET_DBG2(dev, SLSI_CFG80211, "ACL:: Policy: %d  Number of stations: %d\n", params->acl_policy, params->n_acl_entries);
-	r = slsi_mlme_set_acl(sdev, dev, ndev_vif->ifnum, params);
-	if (r != 0)
-		SLSI_NET_ERR(dev, "mlme_set_acl_req returned with CFM failure\n");
-exit:
-	SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
-	return r;
-}
-#endif
+	x1 = be32_to_cpu(src[0]);
+	x2 = be32_to_cpu(src[1]);
+	x3 = be32_to_cpu(src[2]);
+	x4 = be32_to_cpu(src[3]);
 
-static struct cfg80211_ops slsi_ops = {
-	.add_virtual_intf = slsi_add_virtual_intf,
-	.del_virtual_intf = slsi_del_virtual_intf,
-	.change_virtual_intf = slsi_change_virtual_intf,
+	OP(x1, x2, x3, x4, 0);
+	OP(x3, x4, x1, x2, 2);
+	OP(x1, x2, x3, x4, 4);
+	OP(x3, x4, x1, x2, 6);
+	OP(x1, x2, x3, x4, 8);
+	OP(x3, x4, x1, x2, 10);
+	OP(x1, x2, x3, x4, 12);
+	OP(x3, x4, x1, x2, 14);
+	OP(x1, x2, x3, x4, 16);
+	OP(x3, x4, x1, x2, 18);
+	OP(x1, x2, x3, x4, 20);
+	OP(x3, x4, x1, x2, 22);
+	OP(x1, x2, x3, x4, 24);
+	OP(x3, x4, x1, x2, 26);
+	OP(x1, x2, x3, x4, 28);
+	OP(x3, x4, x1, x2, 30);
 
-	.scan = slsi_scan,
-	.connect = slsi_connect,
-	.disconnect = slsi_disconnect,
-
-	.add_key = slsi_add_key,
-	.del_key = slsi_del_key,
-	.get_key = slsi_get_key,
-	.set_default_key = slsi_set_default_key,
-	.set_default_mgmt_key = slsi_config_default_mgmt_key,
-
-	.set_wiphy_params = slsi_set_wiphy_params,
-
-	.del_station = slsi_del_station,
-	.get_station = slsi_get_station,
-	.set_tx_power = slsi_set_tx_power,
-	.get_tx_power = slsi_get_tx_power,
-	.set_power_mgmt = slsi_set_power_mgmt,
-
-	.suspend = slsi_suspend,
-	.resume = slsi_resume,
-
-	.set_pmksa = slsi_set_pmksa,
-	.del_pmksa = slsi_del_pmksa,
-	.flush_pmksa = slsi_flush_pmksa,
-
-	.remain_on_channel = slsi_remain_on_channel,
-	.cancel_remain_on_channel = slsi_cancel_remain_on_channel,
-
-	.change_bss = slsi_change_bss,
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(3, 5, 0))
-	.set_channel = slsi_set_channel,
-#endif          /* (LINUX_VERSION_CODE <= KERNEL_VERSION(3, 5, 0)) */
-
-	.start_ap = slsi_start_ap,
-	.change_beacon = slsi_change_beacon,
-	.stop_ap = slsi_stop_ap,
-
-	.sched_scan_start = slsi_sched_scan_start,
-	.sched_scan_stop = slsi_sched_scan_stop,
-
-	.mgmt_frame_register = slsi_mgmt_frame_register,
-	.mgmt_tx = slsi_mgmt_tx,
-	.mgmt_tx_cancel_wait = slsi_mgmt_tx_cancel_wait,
-	.set_txq_params = slsi_set_txq_params,
-#ifdef CONFIG_SCSC_WLAN_SAE_CONFIG
-    .external_auth = slsi_synchronised_response,
-#endif
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	.set_mac_acl = slsi_set_mac_acl,
-	.update_ft_ies = slsi_update_ft_ies,
-#endif
-	.tdls_oper = slsi_tdls_oper,
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
-	.set_qos_map = slsi_set_qos_map
-#endif
-};
-
-#define RATE_LEGACY(_rate, _hw_value, _flags) { \
-		.bitrate = (_rate), \
-		.hw_value = (_hw_value), \
-		.flags = (_flags), \
+	dst[0] = cpu_to_be32(x3);
+	dst[1] = cpu_to_be32(x4);
+	dst[2] = cpu_to_be32(x1);
+	dst[3] = cpu_to_be32(x2);
 }
 
-#define CHAN2G(_freq, _idx)  { \
-		.band = NL80211_BAND_2GHZ, \
-		.center_freq = (_freq), \
-		.hw_value = (_idx), \
-		.max_power = 17, \
-}
+/* decrypt a block of text */
 
-#define CHAN5G(_freq, _idx)  { \
-		.band = NL80211_BAND_5GHZ, \
-		.center_freq = (_freq), \
-		.hw_value = (_idx), \
-		.max_power = 17, \
-}
-
-static struct ieee80211_channel slsi_2ghz_channels[] = {
-	CHAN2G(2412, 1),
-	CHAN2G(2417, 2),
-	CHAN2G(2422, 3),
-	CHAN2G(2427, 4),
-	CHAN2G(2432, 5),
-	CHAN2G(2437, 6),
-	CHAN2G(2442, 7),
-	CHAN2G(2447, 8),
-	CHAN2G(2452, 9),
-	CHAN2G(2457, 10),
-	CHAN2G(2462, 11),
-	CHAN2G(2467, 12),
-	CHAN2G(2472, 13),
-	CHAN2G(2484, 14),
-};
-
-static struct ieee80211_rate    slsi_11g_rates[] = {
-	RATE_LEGACY(10,  1,  0),
-	RATE_LEGACY(20,  2,  IEEE80211_RATE_SHORT_PREAMBLE),
-	RATE_LEGACY(55,  3,  IEEE80211_RATE_SHORT_PREAMBLE),
-	RATE_LEGACY(110, 6,  IEEE80211_RATE_SHORT_PREAMBLE),
-	RATE_LEGACY(60,  4,  0),
-	RATE_LEGACY(90,  5,  0),
-	RATE_LEGACY(120, 7,  0),
-	RATE_LEGACY(180, 8,  0),
-	RATE_LEGACY(240, 9,  0),
-	RATE_LEGACY(360, 10, 0),
-	RATE_LEGACY(480, 11, 0),
-	RATE_LEGACY(540, 12, 0),
-};
-
-static struct ieee80211_channel slsi_5ghz_channels[] = {
-	/* _We_ call this UNII 1 */
-	CHAN5G(5180, 36),
-	CHAN5G(5200, 40),
-	CHAN5G(5220, 44),
-	CHAN5G(5240, 48),
-	/* UNII 2 */
-	CHAN5G(5260, 52),
-	CHAN5G(5280, 56),
-	CHAN5G(5300, 60),
-	CHAN5G(5320, 64),
-	/* "Middle band" */
-	CHAN5G(5500, 100),
-	CHAN5G(5520, 104),
-	CHAN5G(5540, 108),
-	CHAN5G(5560, 112),
-	CHAN5G(5580, 116),
-	CHAN5G(5600, 120),
-	CHAN5G(5620, 124),
-	CHAN5G(5640, 128),
-	CHAN5G(5660, 132),
-	CHAN5G(5680, 136),
-	CHAN5G(5700, 140),
-	CHAN5G(5720, 144),
-	/* UNII 3 */
-	CHAN5G(5745, 149),
-	CHAN5G(5765, 153),
-	CHAN5G(5785, 157),
-	CHAN5G(5805, 161),
-	CHAN5G(5825, 165),
-};
-
-/* note fw_rate_idx_to_host_11a_idx[] below must change if this table changes */
-
-static struct ieee80211_rate       wifi_11a_rates[] = {
-	RATE_LEGACY(60,  4,  0),
-	RATE_LEGACY(90,  5,  0),
-	RATE_LEGACY(120, 7,  0),
-	RATE_LEGACY(180, 8,  0),
-	RATE_LEGACY(240, 9,  0),
-	RATE_LEGACY(360, 10, 0),
-	RATE_LEGACY(480, 11, 0),
-	RATE_LEGACY(540, 12, 0),
-};
-
-static struct ieee80211_sta_ht_cap slsi_ht_cap = {
-	.ht_supported       = true,
-	.cap                = IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
-			      IEEE80211_HT_CAP_LDPC_CODING |
-			      IEEE80211_HT_CAP_RX_STBC |
-			      IEEE80211_HT_CAP_GRN_FLD |
-			      IEEE80211_HT_CAP_SGI_20 |
-			      IEEE80211_HT_CAP_SGI_40,
-	.ampdu_factor       = IEEE80211_HT_MAX_AMPDU_64K,
-	.ampdu_density      = IEEE80211_HT_MPDU_DENSITY_4,
-	.mcs                = {
-		.rx_mask    = { 0xff, 0, },
-		.rx_highest = cpu_to_le16(0),
-		.tx_params  = 0,
-	},
-};
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-struct ieee80211_sta_vht_cap       slsi_vht_cap = {
-	.vht_supported = true,
-	.cap = IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_7991 |
-	       IEEE80211_VHT_CAP_SHORT_GI_80 |
-	       IEEE80211_VHT_CAP_RXSTBC_1 |
-	       IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE |
-	       (5 << IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT),
-	.vht_mcs = {
-		.rx_mcs_map = cpu_to_le16(0xfffe),
-		.rx_highest = cpu_to_le16(0),
-		.tx_mcs_map = cpu_to_le16(0xfffe),
-		.tx_highest = cpu_to_le16(0),
-	},
-};
-#endif
-
-struct ieee80211_supported_band    slsi_band_2ghz = {
-	.channels   = slsi_2ghz_channels,
-	.band       = NL80211_BAND_2GHZ,
-	.n_channels = ARRAY_SIZE(slsi_2ghz_channels),
-	.bitrates   = slsi_11g_rates,
-	.n_bitrates = ARRAY_SIZE(slsi_11g_rates),
-};
-
-struct ieee80211_supported_band    slsi_band_5ghz = {
-	.channels   = slsi_5ghz_channels,
-	.band       = NL80211_BAND_5GHZ,
-	.n_channels = ARRAY_SIZE(slsi_5ghz_channels),
-	.bitrates   = wifi_11a_rates,
-	.n_bitrates = ARRAY_SIZE(wifi_11a_rates),
-};
-
-static const u32                   slsi_cipher_suites[] = {
-	WLAN_CIPHER_SUITE_WEP40,
-	WLAN_CIPHER_SUITE_WEP104,
-	WLAN_CIPHER_SUITE_TKIP,
-	WLAN_CIPHER_SUITE_CCMP,
-	WLAN_CIPHER_SUITE_AES_CMAC,
-	WLAN_CIPHER_SUITE_SMS4,
-	WLAN_CIPHER_SUITE_PMK,
-	WLAN_CIPHER_SUITE_GCMP,
-	WLAN_CIPHER_SUITE_GCMP_256,
-	WLAN_CIPHER_SUITE_CCMP_256,
-	WLAN_CIPHER_SUITE_BIP_GMAC_128,
-	WLAN_CIPHER_SUITE_BIP_GMAC_256
-};
-
-static const struct ieee80211_txrx_stypes
-				   ieee80211_default_mgmt_stypes[NUM_NL80211_IFTYPES] = {
-	[NL80211_IFTYPE_AP] = {
-		.tx = 0xffff,
-		.rx = BIT(IEEE80211_STYPE_ACTION >> 4)
-	},
-	[NL80211_IFTYPE_STATION] = {
-		.tx = 0xffff,
-		.rx = BIT(IEEE80211_STYPE_ACTION >> 4) |
-		      BIT(IEEE80211_STYPE_PROBE_REQ >> 4)
-	},
-	[NL80211_IFTYPE_P2P_GO] = {
-		.tx = 0xffff,
-		.rx = BIT(IEEE80211_STYPE_ACTION >> 4) |
-		      BIT(IEEE80211_STYPE_PROBE_REQ >> 4)
-	},
-	[NL80211_IFTYPE_P2P_CLIENT] = {
-		.tx = 0xffff,
-		.rx = BIT(IEEE80211_STYPE_ACTION >> 4)
-	},
-};
-
-/* Interface combinations supported by driver */
-static struct ieee80211_iface_limit       iface_limits[] = {
-#ifdef CONFIG_SCSC_WLAN_STA_ONLY
-	/* Basic STA-only */
-	{
-		.max = CONFIG_SCSC_WLAN_MAX_INTERFACES,
-		.types = BIT(NL80211_IFTYPE_STATION),
-	},
-#else
-	/* AP mode: # AP <= 1 on channel = 1 */
-	{
-		.max = 1,
-		.types = BIT(NL80211_IFTYPE_AP),
-	},
-	/* STA and P2P mode: #STA <= 1, #{P2P-client,P2P-GO} <= 1 on two channels */
-	/* For P2P, the device mode and group mode is first started as STATION and then changed.
-	 * Similarly it is changed to STATION on group removal. Hence set maximum interfaces for STATION.
-	 */
-	{
-		.max = CONFIG_SCSC_WLAN_MAX_INTERFACES,
-		.types = BIT(NL80211_IFTYPE_STATION),
-	},
-	{
-		.max = 1,
-		.types = BIT(NL80211_IFTYPE_P2P_CLIENT) | BIT(NL80211_IFTYPE_P2P_GO),
-	},
-	/* ADHOC mode: #ADHOC <= 1 on channel = 1 */
-	{
-		.max = 1,
-		.types = BIT(NL80211_IFTYPE_ADHOC),
-	},
-#endif
-};
-
-static struct ieee80211_regdomain         slsi_regdomain = {
-	.reg_rules = {
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-		REG_RULE(0, 0, 0, 0, 0, 0),
-	}
-};
-
-static struct ieee80211_iface_combination iface_comb[] = {
-	{
-		.limits = iface_limits,
-		.n_limits = ARRAY_SIZE(iface_limits),
-		.num_different_channels = 2,
-		.max_interfaces = CONFIG_SCSC_WLAN_MAX_INTERFACES,
-	},
-};
-
-#ifdef CONFIG_PM
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0))
-static struct cfg80211_wowlan slsi_wowlan_config = {
-	.any = true,
-};
-#endif
-#endif
-
-struct slsi_dev                           *slsi_cfg80211_new(struct device *dev)
+static void seed_decrypt(struct crypto_tfm *tfm, u8 *out, const u8 *in)
 {
-	struct wiphy    *wiphy;
-	struct slsi_dev *sdev = NULL;
+	const struct seed_ctx *ctx = crypto_tfm_ctx(tfm);
+	const __be32 *src = (const __be32 *)in;
+	__be32 *dst = (__be32 *)out;
+	u32 x1, x2, x3, x4, t0, t1;
+	const u32 *ks = ctx->keysched;
 
-	SLSI_DBG1_NODEV(SLSI_CFG80211, "wiphy_new()\n");
-	wiphy = wiphy_new(&slsi_ops, sizeof(struct slsi_dev));
-	if (!wiphy) {
-		SLSI_ERR_NODEV("wiphy_new() failed");
-		return NULL;
+	x1 = be32_to_cpu(src[0]);
+	x2 = be32_to_cpu(src[1]);
+	x3 = be32_to_cpu(src[2]);
+	x4 = be32_to_cpu(src[3]);
+
+	OP(x1, x2, x3, x4, 30);
+	OP(x3, x4, x1, x2, 28);
+	OP(x1, x2, x3, x4, 26);
+	OP(x3, x4, x1, x2, 24);
+	OP(x1, x2, x3, x4, 22);
+	OP(x3, x4, x1, x2, 20);
+	OP(x1, x2, x3, x4, 18);
+	OP(x3, x4, x1, x2, 16);
+	OP(x1, x2, x3, x4, 14);
+	OP(x3, x4, x1, x2, 12);
+	OP(x1, x2, x3, x4, 10);
+	OP(x3, x4, x1, x2, 8);
+	OP(x1, x2, x3, x4, 6);
+	OP(x3, x4, x1, x2, 4);
+	OP(x1, x2, x3, x4, 2);
+	OP(x3, x4, x1, x2, 0);
+
+	dst[0] = cpu_to_be32(x3);
+	dst[1] = cpu_to_be32(x4);
+	dst[2] = cpu_to_be32(x1);
+	dst[3] = cpu_to_be32(x2);
+}
+
+
+static struct crypto_alg seed_alg = {
+	.cra_name		=	"seed",
+	.cra_driver_name	=	"seed-generic",
+	.cra_priority		=	100,
+	.cra_flags		=	CRYPTO_ALG_TYPE_CIPHER,
+	.cra_blocksize		=	SEED_BLOCK_SIZE,
+	.cra_ctxsize		=	sizeof(struct seed_ctx),
+	.cra_alignmask		=	3,
+	.cra_module		=	THIS_MODULE,
+	.cra_u			=	{
+		.cipher = {
+			.cia_min_keysize	=	SEED_KEY_SIZE,
+			.cia_max_keysize	=	SEED_KEY_SIZE,
+			.cia_setkey		=	seed_set_key,
+			.cia_encrypt		=	seed_encrypt,
+			.cia_decrypt		=	seed_decrypt
+		}
+	}
+};
+
+static int __init seed_init(void)
+{
+	return crypto_register_alg(&seed_alg);
+}
+
+static void __exit seed_fini(void)
+{
+	crypto_unregister_alg(&seed_alg);
+}
+
+module_init(seed_init);
+module_exit(seed_fini);
+
+MODULE_DESCRIPTION("SEED Cipher Algorithm");
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Hye-Shik Chang <perky@FreeBSD.org>, Kim Hyun <hkim@kisa.or.kr>");
+MODULE_ALIAS_CRYPTO("seed");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * seqiv: Sequence Number IV Generator
+ *
+ * This generator generates an IV based on a sequence number by xoring it
+ * with a salt.  This algorithm is mainly useful for CTR and similar modes.
+ *
+ * Copyright (c) 2007 Herbert Xu <herbert@gondor.apana.org.au>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ */
+
+#include <crypto/internal/geniv.h>
+#include <crypto/internal/skcipher.h>
+#include <crypto/rng.h>
+#include <crypto/scatterwalk.h>
+#include <linux/err.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+
+struct seqiv_ctx {
+	spinlock_t lock;
+	u8 salt[] __attribute__ ((aligned(__alignof__(u32))));
+};
+
+static void seqiv_free(struct crypto_instance *inst);
+
+static void seqiv_complete2(struct skcipher_givcrypt_request *req, int err)
+{
+	struct ablkcipher_request *subreq = skcipher_givcrypt_reqctx(req);
+	struct crypto_ablkcipher *geniv;
+
+	if (err == -EINPROGRESS)
+		return;
+
+	if (err)
+		goto out;
+
+	geniv = skcipher_givcrypt_reqtfm(req);
+	memcpy(req->creq.info, subreq->info, crypto_ablkcipher_ivsize(geniv));
+
+out:
+	kfree(subreq->info);
+}
+
+static void seqiv_complete(struct crypto_async_request *base, int err)
+{
+	struct skcipher_givcrypt_request *req = base->data;
+
+	seqiv_complete2(req, err);
+	skcipher_givcrypt_complete(req, err);
+}
+
+static void seqiv_aead_encrypt_complete2(struct aead_request *req, int err)
+{
+	struct aead_request *subreq = aead_request_ctx(req);
+	struct crypto_aead *geniv;
+
+	if (err == -EINPROGRESS)
+		return;
+
+	if (err)
+		goto out;
+
+	geniv = crypto_aead_reqtfm(req);
+	memcpy(req->iv, subreq->iv, crypto_aead_ivsize(geniv));
+
+out:
+	kzfree(subreq->iv);
+}
+
+static void seqiv_aead_encrypt_complete(struct crypto_async_request *base,
+					int err)
+{
+	struct aead_request *req = base->data;
+
+	seqiv_aead_encrypt_complete2(req, err);
+	aead_request_complete(req, err);
+}
+
+static void seqiv_geniv(struct seqiv_ctx *ctx, u8 *info, u64 seq,
+			unsigned int ivsize)
+{
+	unsigned int len = ivsize;
+
+	if (ivsize > sizeof(u64)) {
+		memset(info, 0, ivsize - sizeof(u64));
+		len = sizeof(u64);
+	}
+	seq = cpu_to_be64(seq);
+	memcpy(info + ivsize - len, &seq, len);
+	crypto_xor(info, ctx->salt, ivsize);
+}
+
+static int seqiv_givencrypt(struct skcipher_givcrypt_request *req)
+{
+	struct crypto_ablkcipher *geniv = skcipher_givcrypt_reqtfm(req);
+	struct seqiv_ctx *ctx = crypto_ablkcipher_ctx(geniv);
+	struct ablkcipher_request *subreq = skcipher_givcrypt_reqctx(req);
+	crypto_completion_t compl;
+	void *data;
+	u8 *info;
+	unsigned int ivsize;
+	int err;
+
+	ablkcipher_request_set_tfm(subreq, skcipher_geniv_cipher(geniv));
+
+	compl = req->creq.base.complete;
+	data = req->creq.base.data;
+	info = req->creq.info;
+
+	ivsize = crypto_ablkcipher_ivsize(geniv);
+
+	if (unlikely(!IS_ALIGNED((unsigned long)info,
+				 crypto_ablkcipher_alignmask(geniv) + 1))) {
+		info = kmalloc(ivsize, req->creq.base.flags &
+				       CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL:
+								  GFP_ATOMIC);
+		if (!info)
+			return -ENOMEM;
+
+		compl = seqiv_complete;
+		data = req;
 	}
 
-	sdev = (struct slsi_dev *)wiphy->priv;
+	ablkcipher_request_set_callback(subreq, req->creq.base.flags, compl,
+					data);
+	ablkcipher_request_set_crypt(subreq, req->creq.src, req->creq.dst,
+				     req->creq.nbytes, info);
 
-	sdev->wiphy = wiphy;
+	seqiv_geniv(ctx, info, req->seq, ivsize);
+	memcpy(req->giv, info, ivsize);
 
-	set_wiphy_dev(wiphy, dev);
-
-	/* Allow changing of the netns, if NOT set then no changes are allowed */
-	wiphy->flags |= WIPHY_FLAG_NETNS_OK;
-	wiphy->flags |= WIPHY_FLAG_PS_ON_BY_DEFAULT;
-	wiphy->flags |= WIPHY_FLAG_CONTROL_PORT_PROTOCOL;
-#ifdef CONFIG_SCSC_WLAN_BSS_SELECTION
-	wiphy->flags |= WIPHY_FLAG_SUPPORTS_FW_ROAM;
-#endif
-
-	wiphy->flags |= WIPHY_FLAG_HAVE_AP_SME |
-			WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD |
-			WIPHY_FLAG_AP_UAPSD;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	wiphy->max_acl_mac_addrs = SLSI_AP_PEER_CONNECTIONS_MAX;
-#endif
-
-	wiphy->privid = sdev;
-
-	wiphy->interface_modes =
-#ifdef CONFIG_SCSC_WLAN_STA_ONLY
-		BIT(NL80211_IFTYPE_STATION);
-#else
-		BIT(NL80211_IFTYPE_P2P_GO) |
-		BIT(NL80211_IFTYPE_P2P_CLIENT) |
-		BIT(NL80211_IFTYPE_STATION) |
-		BIT(NL80211_IFTYPE_AP) |
-		BIT(NL80211_IFTYPE_ADHOC);
-#endif
-	slsi_band_2ghz.ht_cap = slsi_ht_cap;
-	slsi_band_5ghz.ht_cap = slsi_ht_cap;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	slsi_band_5ghz.vht_cap = slsi_vht_cap;
-#endif
-	wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
-
-	wiphy->bands[NL80211_BAND_2GHZ] = &slsi_band_2ghz;
-	wiphy->bands[NL80211_BAND_5GHZ] = &slsi_band_5ghz;
-
-	sdev->device_config.band_5G = &slsi_band_5ghz;
-	sdev->device_config.band_2G = &slsi_band_2ghz;
-	sdev->device_config.domain_info.regdomain = &slsi_regdomain;
-
-	wiphy->flags |= WIPHY_FLAG_HAS_REMAIN_ON_CHANNEL;
-	wiphy->max_remain_on_channel_duration = 5000;         /* 5000 msec */
-
-	wiphy->cipher_suites = slsi_cipher_suites;
-	wiphy->n_cipher_suites = ARRAY_SIZE(slsi_cipher_suites);
-
-	wiphy->extended_capabilities = slsi_extended_cap;
-	wiphy->extended_capabilities_mask = slsi_extended_cap_mask;
-	wiphy->extended_capabilities_len = ARRAY_SIZE(slsi_extended_cap);
-
-	wiphy->mgmt_stypes = ieee80211_default_mgmt_stypes;
-
-	/* Driver interface combinations */
-	wiphy->n_iface_combinations = ARRAY_SIZE(iface_comb);
-	wiphy->iface_combinations = iface_comb;
-
-	/* Basic scan parameters */
-	wiphy->max_scan_ssids = 10;
-	wiphy->max_scan_ie_len = 2048;
-
-	/* Scheduled scanning support */
-	wiphy->flags |= WIPHY_FLAG_SUPPORTS_SCHED_SCAN;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0))
-	/* Parameters for Scheduled Scanning Support */
-	wiphy->max_sched_scan_reqs = 1;
-	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_SCHED_SCAN_RELATIVE_RSSI);
-
-	/* Randomize TA of Public Action frames. */
-	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_MGMT_TX_RANDOM_TA);
-#endif
-
-	/* Match the maximum number of SSIDs that could be requested from wpa_supplicant */
-	wiphy->max_sched_scan_ssids = 16;
-
-	/* To get a list of SSIDs rather than just the wildcard SSID need to support match sets */
-	wiphy->max_match_sets = 16;
-
-	wiphy->max_sched_scan_ie_len = 2048;
-
-#ifdef CONFIG_PM
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0))
-	wiphy->wowlan = NULL;
-	wiphy->wowlan_config = &slsi_wowlan_config;
-#endif
-#endif
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
-	wiphy->regulatory_flags |= (REGULATORY_STRICT_REG |
-				    REGULATORY_CUSTOM_REG |
-				    REGULATORY_DISABLE_BEACON_HINTS);
-#endif
-#ifndef CONFIG_SCSC_WLAN_STA_ONLY
-	/* P2P flags */
-	wiphy->flags |= WIPHY_FLAG_OFFCHAN_TX;
-
-	/* Enable Probe response offloading w.r.t WPS and P2P */
-	wiphy->probe_resp_offload |=
-		NL80211_PROBE_RESP_OFFLOAD_SUPPORT_WPS |
-		NL80211_PROBE_RESP_OFFLOAD_SUPPORT_WPS2 |
-		NL80211_PROBE_RESP_OFFLOAD_SUPPORT_P2P;
-
-	/* TDLS support */
-	wiphy->flags |= WIPHY_FLAG_SUPPORTS_TDLS;
-#endif
-	/* Mac Randomization */
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0))
-#ifdef CONFIG_SCSC_WLAN_ENABLE_MAC_RANDOMISATION
-	wiphy->features |= NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR;
-	wiphy->features |= NL80211_FEATURE_SCHED_SCAN_RANDOM_MAC_ADDR;
-#endif
-#endif
-#ifdef CONFIG_SCSC_WLAN_SAE_CONFIG
-    wiphy->features |= NL80211_FEATURE_SAE;
-#endif
-	return sdev;
+	err = crypto_ablkcipher_encrypt(subreq);
+	if (unlikely(info != req->creq.info))
+		seqiv_complete2(req, err);
+	return err;
 }
 
-int slsi_cfg80211_register(struct slsi_dev *sdev)
+static int seqiv_aead_encrypt(struct aead_request *req)
 {
-	SLSI_DBG1(sdev, SLSI_CFG80211, "wiphy_register()\n");
-	return wiphy_register(sdev->wiphy);
-}
+	struct crypto_aead *geniv = crypto_aead_reqtfm(req);
+	struct aead_geniv_ctx *ctx = crypto_aead_ctx(geniv);
+	struct aead_request *subreq = aead_request_ctx(req);
+	crypto_completion_t compl;
+	void *data;
+	u8 *info;
+	unsigned int ivsize = 8;
+	int err;
 
-void slsi_cfg80211_unregister(struct slsi_dev *sdev)
-{
-#ifdef CONFIG_PM
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0))
-	sdev->wiphy->wowlan = NULL;
-	sdev->wiphy->wowlan_config = NULL;
-#endif
-#endif
-	SLSI_DBG1(sdev, SLSI_CFG80211, "wiphy_unregister()\n");
-	wiphy_unregister(sdev->wiphy);
-}
+	if (req->cryptlen < ivsize)
+		return -EINVAL;
 
-void slsi_cfg80211_free(struct slsi_dev *sdev)
-{
-	SLSI_DBG1(sdev, SLSI_CFG80211, "wiphy_free()\n");
-	wiphy_free(sdev->wiphy);
-}
+	aead_request_set_tfm(subreq, ctx->child);
 
-void slsi_cfg80211_update_wiphy(struct slsi_dev *sdev)
-{
-	/* Band 2G probably be disabled by slsi_band_cfg_update() while factory test or NCHO.
-	 * So, we need to make sure that Band 2.4G enabled when initialized. */
-	sdev->wiphy->bands[NL80211_BAND_2GHZ] = &slsi_band_2ghz;
-	sdev->device_config.band_2G = &slsi_band_2ghz;
+	compl = req->base.complete;
+	data = req->base.data;
+	info = req->iv;
 
-	/* update supported Bands */
-	if (sdev->band_5g_supported) {
-		sdev->wiphy->bands[NL80211_BAND_5GHZ] = &slsi_band_5ghz;
-		sdev->device_config.band_5G = &slsi_band_5ghz;
-		sdev->device_config.supported_band = SLSI_FREQ_BAND_AUTO;
-	} else {
-		sdev->wiphy->bands[NL80211_BAND_5GHZ] = NULL;
-		sdev->device_config.band_5G = NULL;
-		sdev->device_config.supported_band = SLSI_FREQ_BAND_2GHZ;
+	if (req->src != req->dst) {
+		struct blkcipher_desc desc = {
+			.tfm = ctx->null,
+		};
+
+		err = crypto_blkcipher_encrypt(&desc, req->dst, req->src,
+					       req->assoclen + req->cryptlen);
+		if (err)
+			return err;
 	}
 
-	/* update HT features */
-	if (sdev->fw_ht_enabled) {
-		slsi_ht_cap.ht_supported = true;
-		slsi_ht_cap.cap = le16_to_cpu(*(u16 *)sdev->fw_ht_cap);
-		slsi_ht_cap.ampdu_density = (sdev->fw_ht_cap[2] & IEEE80211_HT_AMPDU_PARM_DENSITY) >> IEEE80211_HT_AMPDU_PARM_DENSITY_SHIFT;
-		slsi_ht_cap.ampdu_factor = sdev->fw_ht_cap[2] & IEEE80211_HT_AMPDU_PARM_FACTOR;
-	} else {
-		slsi_ht_cap.ht_supported = false;
-	}
-	slsi_band_2ghz.ht_cap = slsi_ht_cap;
-	slsi_band_5ghz.ht_cap = slsi_ht_cap;
+	if (unlikely(!IS_ALIGNED((unsigned long)info,
+				 crypto_aead_alignmask(geniv) + 1))) {
+		info = kmalloc(ivsize, req->base.flags &
+				       CRYPTO_TFM_REQ_MAY_SLEEP ? GFP_KERNEL:
+								  GFP_ATOMIC);
+		if (!info)
+			return -ENOMEM;
 
-	/* update VHT features */
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	if (sdev->fw_vht_enabled) {
-		slsi_vht_cap.vht_supported = true;
-		slsi_vht_cap.cap = le32_to_cpu(*(u32 *)sdev->fw_vht_cap);
-	} else {
-		slsi_vht_cap.vht_supported = false;
+		memcpy(info, req->iv, ivsize);
+		compl = seqiv_aead_encrypt_complete;
+		data = req;
 	}
-	slsi_band_5ghz.vht_cap = slsi_vht_cap;
-#endif
 
-	SLSI_INFO(sdev, "BANDS SUPPORTED -> 2.4:'%c' 5:'%c'\n", sdev->wiphy->bands[NL80211_BAND_2GHZ] ? 'Y' : 'N',
-		  sdev->wiphy->bands[NL80211_BAND_5GHZ] ? 'Y' : 'N');
-	SLSI_INFO(sdev, "HT/VHT SUPPORTED -> HT:'%c' VHT:'%c'\n", sdev->fw_ht_enabled ? 'Y' : 'N',
-		  sdev->fw_vht_enabled ? 'Y' : 'N');
-	SLSI_INFO(sdev, "HT  -> cap:0x%04x ampdu_density:%d ampdu_factor:%d\n", slsi_ht_cap.cap, slsi_ht_cap.ampdu_density, slsi_ht_cap.ampdu_factor);
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 9))
-	SLSI_INFO(sdev, "VHT -> cap:0x%08x\n", slsi_vht_cap.cap);
-#endif
+	aead_request_set_callback(subreq, req->base.flags, compl, data);
+	aead_request_set_crypt(subreq, req->dst, req->dst,
+			       req->cryptlen - ivsize, info);
+	aead_request_set_ad(subreq, req->assoclen + ivsize);
+
+	crypto_xor(info, ctx->salt, ivsize);
+	scatterwalk_map_and_copy(info, req->dst, req->assoclen, ivsize, 1);
+
+	err = crypto_aead_encrypt(subreq);
+	if (unlikely(info != req->iv))
+		seqiv_aead_encrypt_complete2(req, err);
+	return err;
 }
+
+static int seqiv_aead_decrypt(struct aead_request *req)
+{
+	struct crypto_aead *geniv = crypto_aead_reqtfm(req);
+	struct aead_geniv_ctx *ctx = crypto_aead_ctx(geniv);
+	struct aead_request *subreq = aead_request_ctx(req);
+	crypto_completion_t compl;
+	void *data;
+	unsigned int ivsize = 8;
+
+	if (req->cryptlen < ivsize + crypto_aead_authsize(geniv))
+		return -EINVAL;
+
+	aead_request_set_tfm(subreq, ctx->child);
+
+	compl = req->base.complete;
+	data = req->base.data;
+
+	aead_request_set_callback(subreq, req->base.flags, compl, data);
+	aead_request_set_crypt(subreq, req->src, req->dst,
+			       req->cryptlen - ivsize, req->iv);
+	aead_request_set_ad(subreq, req->assoclen + ivsize);
+
+	scatterwalk_map_and_copy(req->iv, req->src, req->assoclen, ivsize, 0);
+
+	return crypto_aead_decrypt(subreq);
+}
+
+static int seqiv_init(struct crypto_tfm *tfm)
+{
+	struct crypto_ablkcipher *geniv = __crypto_ablkcipher_cast(tfm);
+	struct seqiv_ctx *ctx = crypto_ablkcipher_ctx(geniv);
+	int err;
+
+	spin_lock_init(&ctx->lock);
+
+	tfm->crt_ablkcipher.reqsize = sizeof(struct ablkcipher_request);
+
+	err = 0;
+	if (!crypto_get_default_rng()) {
+		crypto_ablkcipher_crt(geniv)->givencrypt = seqiv_givencrypt;
+		err = crypto_rng_get_bytes(crypto_default_rng, ctx->salt,
+					   crypto_ablkcipher_ivsize(geniv));
+		crypto_put_default_rng();
+	}
+
+	return err ?: skcipher_geniv_init(tfm);
+}
+
+static int seqiv_ablkcipher_create(struct crypto_template *tmpl,
+				   struct rtattr **tb)
+{
+	struct crypto_instance *inst;
+	int err;
+
+	inst = skcipher_geniv_alloc(tmpl, tb, 0, 0);
+
+	if (IS_ERR(inst))
+		return PTR_ERR(inst);
+
+	err = -EINVAL;
+	if (inst->alg.cra_ablkcipher.ivsize < sizeof(u64))
+		goto free_inst;
+
+	inst->alg.cra_init = seqiv_init;
+	inst->alg.cra_exit = skcipher_geniv_exit;
+
+	inst->alg.cra_ctxsize += inst->alg.cra_ablkcipher.ivsize;
+	inst->alg.cra_ctxsize += sizeof(struct seqiv_ctx);
+
+	inst->alg.cra_alignmask |= __alignof__(u32) - 1;
+
+	err = crypto_register_instance(tmpl, inst);
+	if (err)
+		goto free_inst;
+
+out:
+	return err;
+
+free_inst:
+	skcipher_geniv_free(inst);
+	goto out;
+}
+
+static int seqiv_aead_create(struct crypto_template *tmpl, struct rtattr **tb)
+{
+	struct aead_instance *inst;
+	struct crypto_aead_spawn *spawn;
+	struct aead_alg *alg;
+	int err;
+
+	inst = aead_geniv_alloc(tmpl, tb, 0, 0);
+
+	if (IS_ERR(inst))
+		return PTR_ERR(inst);
+
+	inst->alg.base.cra_alignmask |= __alignof__(u32) - 1;
+
+	spawn = aead_instance_ctx(inst);
+	alg = crypto_spawn_aead_alg(spawn);
+
+	err = -EINVAL;
+	if (inst->alg.ivsize != sizeof(u64))
+		goto free_inst;
+
+	inst->alg.encrypt = seqiv_aead_encrypt;
+	inst->alg.decrypt = seqiv_aead_decrypt;
+
+	inst->alg.init = aead_init_geniv;
+	inst->alg.exit = aead_exit_geniv;
+
+	inst->alg.base.cra_ctxsize = sizeof(struct aead_geniv_ctx);
+	inst->alg.base.cra_ctxsize += inst->alg.ivsize;
+
+	err = aead_register_instance(tmpl, inst);
+	if (err)
+		goto free_inst;
+
+out:
+	return err;
+
+free_inst:
+	aead_geniv_free(inst);
+	goto out;
+}
+
+static int seqiv_create(struct crypto_template *tmpl, struct rtattr **tb)
+{
+	struct crypto_attr_type *algt;
+	int err;
+
+	algt = crypto_get_attr_type(tb);
+	if (IS_ERR(algt))
+		return PTR_ERR(algt);
+
+	if ((algt->type ^ CRYPTO_ALG_TYPE_AEAD) & CRYPTO_ALG_TYPE_MASK)
+		err = seqiv_ablkcipher_create(tmpl, tb);
+	else
+		err = seqiv_aead_create(tmpl, tb);
+
+	return err;
+}
+
+static void seqiv_free(struct crypto_instance *inst)
+{
+	if ((inst->alg.cra_flags ^ CRYPTO_ALG_TYPE_AEAD) & CRYPTO_ALG_TYPE_MASK)
+		skcipher_geniv_free(inst);
+	else
+		aead_geniv_free(aead_instance(inst));
+}
+
+static struct crypto_template seqiv_tmpl = {
+	.name = "seqiv",
+	.create = seqiv_create,
+	.free = seqiv_free,
+	.module = THIS_MODULE,
+};
+
+static int __init seqiv_module_init(void)
+{
+	return crypto_register_template(&seqiv_tmpl);
+}
+
+static void __exit seqiv_module_exit(void)
+{
+	crypto_unregister_template(&seqiv_tmpl);
+}
+
+module_init(seqiv_module_init);
+module_exit(seqiv_module_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Sequence Number IV Generator");
+MODULE_ALIAS_CRYPTO("seqiv");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+ * Cryptographic API.
+ *
+ * Serpent Cipher Algorithm.
+ *
+ * Copyright (C) 2002 Dag Arne Osvik <osvik@ii.uib.no>
+ *               2003 Herbert Valerio Riedel <hvr@gnu.org>
+ *
+ * Added tnepres support:
+ *		Ruben Jesus Garcia Hernandez <ruben@ugr.es>, 18.10.2004
+ *              Based on code by hvr
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ */
+
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/errno.h>
+#include <asm/byteorder.h>
+#include <linux/crypto.h>
+#include <linux/types.h>
+#include <crypto/serpent.h>
+
+/* Key is padded to the maximum of 256 bits before round key generation.
+ * Any key length <= 256 bits (32 bytes) is allowed by the algorithm.
+ */
+
+#define PHI 0x9e3779b9UL
+
+#define keyiter(a, b, c, d, i, j) \
+	({ b ^= d; b ^= c; b ^= a; b ^= PHI ^ i; b = rol32(b, 11); k[j] = b; })
+
+#define loadkeys(x0, x1, x2, x3, i) \
+	({ x0 = k[i]; x1 = k[i+1]; x2 = k[i+2]; x3 = k[i+3]; })
+
+#define storekeys(x0, x1, x2, x3, i) \
+	({ k[i] = x0; k[i+1] = x1; k[i+2] = x2; k[i+3] = x3; })
+
+#define store_and_load_keys(x0, x1, x2, x3, s, l) \
+	({ storekeys(x0, x1, x2, x3, s); loadkeys(x0, x1, x2, x3, l); })
+
+#define K(x0, x1, x2, x3, i) ({				\
+	x3 ^= k[4*(i)+3];        x2 ^= k[4*(i)+2];	\
+	x1 ^= k[4*(i)+1];        x0 ^= k[4*(i)+0];	\
+	})
+
+#define LK(x0, x1, x2, x3, x4, i) ({					   \
+							x0 = rol32(x0, 13);\
+	x2 = rol32(x2, 3);	x1 ^= x0;		x4  = x0 << 3;	   \
+	x3 ^= x2;		x1 ^= x2;				   \
+	x1 = rol32(x1, 1);	x3 ^= x4;				   \
+	x3 = rol32(x3, 7);	x4  = x1;				   \
+	x0 ^= x1;		x4 <<= 7;		x2 ^= x3;	   \
+	x0 ^= x3;		x2 ^= x4;		x3 ^= k[4*i+3];	   \
+	x1 ^= k[4*i+1];		x0 = rol32(x0, 5);	x2 = rol32(x2, 22);\
+	x0 ^= k[4*i+0];		x2 ^= k[4*i+2];				   \
+	})
+
+#define KL(x0, x1, x2, x3, x4, i) ({					   \
+	x0 ^= k[4*i+0];		x1 ^= k[4*i+1];		x2 ^= k[4*i+2];	   \
+	x3 ^= k[4*i+3];		x0 = ror32(x0, 5);	x2 = ror32(x2, 22);\
+	x4 =  x1;		x2 ^= x3;		x0 ^= x3;	   \
+	x4 <<= 7;		x0 ^= x1;		x1 = ror32(x1, 1); \
+	x2 ^= x4;		x3 = ror32(x3, 7);	x4 = x0 << 3;	   \
+	x1 ^= x0;		x3 ^= x4;		x0 = ror32(x0, 13);\
+	x1 ^= x2;		x3 ^= x2;		x2 = ror32(x2, 3); \
+	})
+
+#define S0(x0, x1, x2, x3, x4) ({			\
+					x4  = x3;	\
+	x3 |= x0;	x0 ^= x4;	x4 ^= x2;	\
+	x4 = ~x4;	x3 ^= x1;	x1 &= x0;	\
+	x1 ^= x4;	x2 ^= x0;	x0 ^= x3;	\
+	x4 |= x0;	x0 ^= x2;	x2 &= x1;	\
+	x3 ^= x2;	x1 = ~x1;	x2 ^= x4;	\
+	x1 ^= x2;					\
+	})
+
+#define S1(x0, x1, x2, x3, x4) ({			\
+					x4  = x1;	\
+	x1 ^= x0;	x0 ^= x3;	x3 = ~x3;	\
+	x4 &= x1;	x0 |= x1;	x3 ^= x2;	\
+	x0 ^= x3;	x1 ^= x3;	x3 ^= x4;	\
+	x1 |= x4;	x4 ^= x2;	x2 &= x0;	\
+	x2 ^= x1;	x1 |= x0;	x0 = ~x0;	\
+	x0 ^= x2;	x4 ^= x1;			\
+	})
+
+#define S2(x0, x1, x2, x3, x4) ({			\
+					x3 = ~x3;	\
+	x1 ^= x0;	x4  = x0;	x0 &= x2;	\
+	x0 ^= x3;	x3 |= x4;	x2 ^= x1;	\
+	x3 ^= x1;	x1 &= x0;	x0 ^= x2;	\
+	x2 &= x3;	x3 |= x1;	x0 = ~x0;	\
+	x3 ^= x0;	x4 ^= x0;	x0 ^= x2;	\
+	x1 |= x2;					\
+	})
+
+#define S3(x0, x1, x2, x3, x4) ({			\
+					x4  = x1;	\
+	x1 ^= x3;	x3 |= x0;	x4 &= x0;	\
+	x0 ^= x2;	x2 ^= x1;	x1 &= x3;	\
+	x2 ^= x3;	x0 |= x4;	x4 ^= x3;	\
+	x1 ^= x0;	x0 &= x3;	x3 &= x4;	\
+	x3 ^= x2;	x4 |= x1;	x2 &= x1;	\
+	x4 ^= x3;	x0 ^= x3;	x3 ^= x2;	\
+	})
+
+#define S4(x0, x1, x2, x3, x4) ({			\
+					x4  = x3;	\
+	x3 &= x0;	x0 ^= x4;			\
+	x3 ^= x2;	x2 |= x4;	x0 ^= x1;	\
+	x4 ^= x3;	x2 |= x0;			\
+	x2 ^= x1;	x1 &= x0;			\
+	x1 ^= x4;	x4 &= x2;	x2 ^= x3;	\
+	x4 ^= x0;	x3 |= x1;	x1 = ~x1;	\
+	x3 ^= x0;					\
+	})
+
+#define S5(x0, x1, x2, x3, x4) ({			\
+	x4  = x1;	x1 |= x0;			\
+	x2 ^= x1;	x3 = ~x3;	x4 ^= x0;	\
+	x0 ^= x2;	x1 &= x4;	x4 |= x3;	\
+	x4 ^= x0;	x0 &= x3;	x1 ^= x3;	\
+	x3 ^= x2;	x0 ^= x1;	x2 &= x4;	\
+	x1 ^= x2;	x2 &= x0;			\
+	x3 ^= x2;					\
+	})
+
+#define S6(x0, x1, x2, x3, x4) ({			\
+					x4  = x1;	\
+	x3 ^= x0;	x1 ^= x2;	x2 ^= x0;	\
+	x0 &= x3;	x1 |= x3;	x4 = ~x4;	\
+	x0 ^= x1;	x1 ^= x2;			\
+	x3 ^= x4;	x4 ^= x0;	x2 &= x0;	\
+	x4 ^= x1;	x2 ^= x3;	x3 &= x1;	\
+	x3 ^= x0;	x1 ^= x2;			\
+	})
+
+#define S7(x0, x1, x2, x3, x4) ({			\
+					x1 = ~x1;	\
+	x4  = x1;	x0 = ~x0;	x1 &= x2;	\
+	x1 ^= x3;	x3 |= x4;	x4 ^= x2;	\
+	x2 ^= x3;	x3 ^= x0;	x0 |= x1;	\
+	x2 &= x0;	x0 ^= x4;	x4 ^= x3;	\
+	x3 &= x0;	x4 ^= x1;			\
+	x2 ^= x4;	x3 ^= x1;	x4 |= x0;	\
+	x4 ^= x1;					\
+	})
+
+#define SI0(x0, x1, x2, x3, x4) ({			\
+			x4  = x3;	x1 ^= x0;	\
+	x3 |= x1;	x4 ^= x1;	x0 = ~x0;	\
+	x2 ^= x3;	x3 ^= x0;	x0 &= x1;	\
+	x0 ^= x2;	x2 &= x3;	x3 ^= x4;	\
+	x2 ^= x3;	x1 ^= x3;	x3 &= x0;	\
+	x1 ^= x0;	x0 ^= x2;	x4 ^= x3;	\
+	})
+
+#define SI1(x0, x1, x2, x3, x4) ({			\
+	x1 ^= x3;	x4  = x0;			\
+	x0 ^= x2;	x2 = ~x2;	x4 |= x1;	\
+	x4 ^= x3;	x3 &= x1;	x1 ^= x2;	\
+	x2 &= x4;	x4 ^= x1;	x1 |= x3;	\
+	x3 ^= x0;	x2 ^= x0;	x0 |= x4;	\
+	x2 ^= x4;	x1 ^= x0;			\
+	x4 ^= x1;					\
+	})
+
+#define SI2(x0, x1, x2, x3, x4) ({			\
+	x2 ^= x1;	x4  = x3;	x3 = ~x3;	\
+	x3 |= x2;	x2 ^= x4;	x4 ^= x0;	\
+	x3 ^= x1;	x1 |= x2;	x2 ^= x0;	\
+	x1 ^= x4;	x4 |= x3;	x2 ^= x3;	\
+	x4 ^= x2;	x2 &= x1;			\
+	x2 ^= x3;	x3 ^= x4;	x4 ^= x0;	\
+	})
+
+#define SI3(x0, x1, x2, x3, x4) ({			\
+					x2 ^= x1;	\
+	x4  = x1;	x1 &= x2;			\
+	x1 ^= x0;	x0 |= x4;	x4 ^= x3;	\
+	x0 ^= x3;	x3 |= x1;	x1 ^= x2;	\
+	x1 ^= x3;	x0 ^= x2;	x2 ^= x3;	\
+	x3 &= x1;	x1 ^= x0;	x0 &= x2;	\
+	x4 ^= x3;	x3 ^= x0;	x0 ^= x1;	\
+	})
+
+#define SI4(x0, x1, x2, x3, x4) ({			\
+	x2 ^= x3;	x4  = x0;	x0 &= x1;	\
+	x0 ^= x2;	x2 |= x3;	x4 = ~x4;	\
+	x1 ^= x0;	x0 ^= x2;	x2 &= x4;	\
+	x2 ^= x0;	x0 |= x4;			\
+	x0 ^= x3;	x3 &= x2;			\
+	x4 ^= x3;	x3 ^= x1;	x1 &= x0;	\
+	x4 ^= x1;	x0 ^= x3;			\
+	})
+
+#define SI5(x0, x1, x2, x3, x4) ({			\
+			x4  = x1;	x1 |= x2;	\
+	x2 ^= x4;	x1 ^= x3;	x3 &= x4;	\
+	x2 ^= x3;	x3 |= x0;	x0 = ~x0;	\
+	x3 ^= x2;	x2 |= x0;	x4 ^= x1;	\
+	x2 ^= x4;	x4 &= x0;	x0 ^= x1;	\
+	x1 ^= x3;	x0 &= x2;	x2 ^= x3;	\
+	x0 ^= x2;	x2 ^= x4;	x4 ^= x3;	\
+	})
+
+#define SI6(x0, x1, x2, x3, x4) ({			\
+			x0 ^= x2;			\
+	x4  = x0;	x0 &= x3;	x2 ^= x3;	\
+	x0 ^= x2;	x3 ^= x1;	x2 |= x4;	\
+	x2 ^= x3;	x3 &= x0;	x0 = ~x0;	\
+	x3 ^= x1;	x1 &= x2;	x4 ^= x0;	\
+	x3 ^= x4;	x4 ^= x2;	x0 ^= x1;	\
+	x2 ^= x0;					\
+	})
+
+#define SI7(x0, x1, x2, x3, x4) ({			\
+	x4  = x3;	x3 &= x0;	x0 ^= x2;	\
+	x2 |= x4;	x4 ^= x1;	x0 = ~x0;	\
+	x1 |= x3;	x4 ^= x0;	x0 &= x2;	\
+	x0 ^= x1;	x1 &= x2;	x3 ^= x2;	\
+	x4 ^= x3;	x2 &= x3;	x3 |= x0;	\
+	x1 ^= x4;	x3 ^= x4;	x4 &= x0;	\
+	x4 ^= x2;					\
+	})
+
+int __serpent_setkey(struct serpent_ctx *ctx, const u8 *key,
+		     unsigned int keylen)
+{
+	u32 *k = ctx->expkey;
+	u8  *k8 = (u8 *)k;
+	u32 r0, r1, r2, r3, r4;
+	int i;
+
+	/* Copy key, add padding */
+
+	for (i = 0; i < keylen; ++i)
+		k8[i] = key[i];
+	if (i < SERPENT_MAX_KEY_SIZE)
+		k8[i++] = 1;
+	while (i < SERPENT_MAX_KEY_SIZE)
+		k8[i++] = 0;
+
+	/* Expand key using polynomial */
+
+	r0 = le32_to_cpu(k[3]);
+	r1 = le32_to_cpu(k[4]);
+	r2 = le32_to_cpu(k[5]);
+	r3 = le32_to_cpu(k[6]);
+	r4 = le32_to_cpu(k[7]);
+
+	keyiter(le32_to_cpu(k[0]), r0, r4, r2, 0, 0);
+	keyiter(le32_to_cpu(k[1]), r1, r0, r3, 1, 1);
+	keyiter(le32_to_cpu(k[2]), r2, r1, r4, 2, 2);
+	keyiter(le32_to_cpu(k[3]), r3, r2, r0, 3, 3);
+	keyiter(le32_to_cpu(k[4]), r4, r3, r1, 4, 4);
+	keyiter(le32_to_cpu(k[5]), r0, r4, r2, 5, 5);
+	keyiter(le32_to_cpu(k[6]), r1, r0, r3, 6, 6);
+	keyiter(le32_to_cpu(k[7]), r2, r1, r4, 7, 7);
+
+	keyiter(k[0], r3, r2, r0, 8, 8);
+	keyiter(k[1], r4, r3, r1, 9, 9);
+	keyiter(k[2], r0, r4, r2, 10, 10);
+	keyiter(k[3], r1, r0, r3, 11, 11);
+	keyiter(k[4], r2, r1, r4, 12, 12);
+	keyiter(k[5], r3, r2, r0, 13, 13);
+	keyiter(k[6], r4, r3, r1, 14, 14);
+	keyiter(k[7], r0, r4, r2, 15, 15);
+	keyiter(k[8], r1, r0, r3, 16, 16);
+	keyiter(k[9], r2, r1, r4, 17, 17);
+	keyiter(k[10], r3, r2, r0, 18, 18);
+	keyiter(k[11], r4, r3, r1, 19, 19);
+	keyiter(k[12], r0, r4, r2, 20, 20);
+	keyiter(k[13], r1, r0, r3, 21, 21);
+	keyiter(k[14], r2, r1, r4, 22, 22);
+	keyiter(k[15], r3, r2, r0, 23, 23);
+	keyiter(k[16], r4, r3, r1, 24, 24);
+	keyiter(k[17], r0, r4, r2, 25, 25);
+	keyiter(k[18], r1, r0, r3, 26, 26);
+	keyiter(k[19], r2, r1, r4, 27, 27);
+	keyiter(k[20], r3, r2, r0, 28, 28);
+	keyiter(k[21], r4, r3, r1, 29, 29);
+	keyiter(k[22], r0, r4, r2, 30, 30);
+	keyiter(k[23], r1, r0, r3, 31, 31);
+
+	k += 50;
+
+	keyiter(k[-26], r2, r1, r4, 32, -18);
+	keyiter(k[-25], r3, r2, r0, 33, -17);
+	keyiter(k[-24], r4, r3, r1, 34, -16);
+	keyiter(k[-23], r0, r4, r2, 35, -15);
+	keyiter(k[-22], r1, r0, r3, 36, -14);
+	keyiter(k[-21], r2, r1, r4, 37, -13);
+	keyiter(k[-20], r3, r2, r0, 38, -12);
+	keyiter(k[-19], r4, r3, r1, 39, -11);
+	keyiter(k[-18], r0, r4, r2, 40, -10);
+	keyiter(k[-17], r1, r0, r3, 41, -9);
+	keyiter(k[-16], r2, r1, r4, 42, -8);
+	keyiter(k[-15], r3, r2, r0, 43, -7);
+	keyiter(k[-14], r4, r3, r1, 44, -6);
+	keyiter(k[-13], r0, r4, r2, 45, -5);
+	keyiter(k[-12], r1, r0, r3, 46, -4);
+	keyiter(k[-11], r2, r1, r4, 47, -3);
+	keyiter(k[-10], r3, r2, r0, 48, -2);
+	keyiter(k[-9], r4, r3, r1, 49, -1);
+	keyiter(k[-8], r0, r4, r2, 50, 0);
+	keyiter(k[-7], r1, r0, r3, 51, 1);
+	keyiter(k[-6], r2, r1, r4, 52, 2);
+	keyiter(k[-5], r3, r2, r0, 53, 3);
+	keyiter(k[-4], r4, r3, r1, 54, 4);
+	keyiter(k[-3], r0, r4, r2, 55, 5);
+	keyiter(k[-2], r1, r0, r3, 56, 6);
+	keyiter(k[-1], r2, r1, r4, 57, 7);
+	keyiter(k[0], r3, r2, r0, 58, 8);
+	keyiter(k[1], r4, r3, r1, 59, 9);
+	keyiter(k[2], r0, r4, r2, 60, 10);
+	keyiter(k[3], r1, r0, r3, 61, 11);
+	keyiter(k[4], r2, r1, r4, 62, 12);
+	keyiter(k[5], r3, r2, r0, 63, 13);
+	keyiter(k[6], r4, r3, r1, 64, 14);
+	keyiter(k[7], r0, r4, r2, 65, 15);
+	keyiter(k[8], r1, r0, r3, 66, 16);
+	keyiter(k[9], r2, r1, r4, 67, 17);
+	keyiter(k[10], r3, r2, r0, 68, 18);
+	keyiter(k[11], r4, r3, r1, 69, 19);
+	keyiter(k[12], r0, r4, r2, 70, 20);
+	keyiter(k[13], r1, r0, r3, 71, 21);
+	keyiter(k[14], r2, r1, r4, 72, 22);
+	keyiter(k[15], r3, r2, r0, 73, 23);
+	keyiter(k[16], r4, r3, r1, 74, 24);
+	keyiter(k[17], r0, r4, r2, 75, 25);
+	keyiter(k[18], r1, r0, r3, 76, 26);
+	keyiter(k[19], r2, r1, r4, 77, 27);
+	keyiter(k[20], r3, r2, r0, 78, 28);
+	keyiter(k[21], r4, r3, r1, 79, 29);
+	keyiter(k[22], r0, r4, r2, 80, 30);
+	keyiter(k[23], r1, r0, r3, 81, 31);
+
+	k += 50;
+
+	keyiter(k[-26], r2, r1, r4, 82, -18);
+	keyiter(k[-25], r3, r2, r0, 83, -17);
+	keyiter(k[-24], r4, r3, r1, 84, -16);
+	keyiter(k[-23], r0, r4, r2, 85, -15);
+	keyiter(k[-22], r1, r0, r3, 86, -14);
+	keyiter(k[-21], r2, r1, r4, 87, -13);
+	keyiter(k[-20], r3, r2, r0, 88, -12);
+	keyiter(k[-19], r4, r3, r1, 89, -11);
+	keyiter(k[-18], r0, r4, r2, 90, -10);
+	keyiter(k[-17], r1, r0, r3, 91, -9);
+	keyiter(k[-16], r2, r1, r4, 92, -8);
+	keyiter(k[-15], r3, r2, r0, 93, -7);
+	keyiter(k[-14], r4, r3, r1, 94, -6);
+	keyiter(k[-13], r0, r4, r2, 95, -5);
+	keyiter(k[-12], r1, r0, r3, 96, -4);
+	keyiter(k[-11], r2, r1, r4, 97, -3);
+	keyiter(k[-10], r3, r2, r0, 98, -2);
+	keyiter(k[-9], r4, r3, r1, 99, -1);
+	keyiter(k[-8], r0, r4, r2, 100, 0);
+	keyiter(k[-7], r1, r0, r3, 101, 1);
+	keyiter(k[-6], r2, r1, r4, 102, 2);
+	keyiter(k[-5], r3, r2, r0, 103, 3);
+	keyiter(k[-4], r4, r3, r1, 104, 4);
+	keyiter(k[-3], r0, r4, r2, 105, 5);
+	keyiter(k[-2], r1, r0, r3, 106, 6);
+	keyiter(k[-1], r2, r1, r4, 107, 7);
+	keyiter(k[0], r3, r2, r0, 108, 8);
+	keyiter(k[1], r4, r3, r1, 109, 9);
+	keyiter(k[2], r0, r4, r2, 110, 10);
+	keyiter(k[3], r1, r0, r3, 111, 11);
+	keyiter(k[4], r2, r1, r4, 112, 12);
+	keyiter(k[5], r3, r2, r0, 113, 13);
+	keyiter(k[6], r4, r3, r1, 114, 14);
+	keyiter(k[7], r0, r4, r2, 115, 15);
+	keyiter(k[8], r1, r0, r3, 116, 16);
+	keyiter(k[9], r2, r1, r4, 117, 17);
+	keyiter(k[10], r3, r2, r0, 118, 18);
+	keyiter(k[11], r4, r3, r1, 119, 19);
+	keyiter(k[12], r0, r4, r2, 120, 20);
+	keyiter(k[13], r1, r0, r3, 121, 21);
+	keyiter(k[14], r2, r1, r4, 122, 22);
+	keyiter(k[15], r3, r2, r0, 123, 23);
+	keyiter(k[16], r4, r3, r1, 124, 24);
+	keyiter(k[17], r0, r4, r2, 125, 25);
+	keyiter(k[18], r1, r0, r3, 126, 26);
+	keyiter(k[19], r2, r1, r4, 127, 27);
+	keyiter(k[20], r3, r2, r0, 128, 28);
+	keyiter(k[21], r4, r3, r1, 129, 29);
+	keyiter(k[22], r0, r4, r2, 130, 30);
+	keyiter(k[23], r1, r0, r3, 131, 31);
+
+	/* Apply S-boxes */
+
+	S3(r3, r4, r0, r1, r2); store_and_load_keys(r1, r2, r4, r3, 28, 24);
+	S4(r1, r2, r4, r3, r0); store_and_load_keys(r2, r4, r3, r0, 24, 20);
+	S5(r2, r4, r3, r0, r1); store_and_load_keys(r1, r2, r4, r0, 20, 16);
+	S6(r1, r2, r4, r0, r3); store_and_load_keys(r4, r3, r2, r0, 16, 12);
+	S7(r4, r3, r2, r0, r1); store_and_load_keys(r1, r2, r0, r4, 12, 8);
+	S0(r1, r2, r0, r4, r3); store_and_load_keys(r0, r2, r4, r1, 8, 4);
+	S1(r0, r2, r4, r1, r3); store_and_load_keys(r3, r4, r1, r0, 4, 0);
+	S2(r3, r4, r1, r0, r2); store_and_load_keys(r2, r4, r3, r0, 0, -4);
+	S3(r2, r4, r3, r0, r1); store_and_load_keys(r0, r1, r4, r2, -4, -8);
+	S4(r0, r1, r4, r2, r3); store_and_load_keys(r1, r4, r2, r3, -8, -12);
+	S5(r1, r4, r2, r3, r0); store_and_load_keys(r0, r1, r4, r3, -12, -16);
+	S6(r0, r1, r4, r3, r2); store_and_load_keys(r4, r2, r1, r3, -16, -20);
+	S7(r4, r2, r1, r3, r0); store_and_load_keys(r0, r1, r3, r4, -20, -24);
+	S0(r0, r1, r3, r4, r2); store_and_load_keys(r3, r1, r4, r0, -24, -28);
+	k -= 50;
+	S1(r3, r1, r4, r0, r2); store_and_load_keys(r2, r4, r0, r3, 22, 18);
+	S2(r2, r4, r0, r3, r1); store_and_load_keys(r1, r4, r2, r3, 18, 14);
+	S3(r1, r4, r2, r3, r0); store_and_load_keys(r3, r0, r4, r1, 14, 10);
+	S4(r3, r0, r4, r1, r2); store_and_load_keys(r0, r4, r1, r2, 10, 6);
+	S5(r0, r4, r1, r2, r3); store_and_load_keys(r3, r0, r4, r2, 6, 2);
+	S6(r3, r0, r4, r2, r1); store_and_load_keys(r4, r1, r0, r2, 2, -2);
+	S7(r4, r1, r0, r2, r3); store_and_load_keys(r3, r0, r2, r4, -2, -6);
+	S0(r3, r0, r2, r4, r1); store_and_load_keys(r2, r0, r4, r3, -6, -10);
+	S1(r2, r0, r4, r3, r1); store_and_load_keys(r1, r4, r3, r2, -10, -14);
+	S2(r1, r4, r3, r2, r0); store_and_load_keys(r0, r4, r1, r2, -14, -18);
+	S3(r0, r4, r1, r2, r3); store_and_load_keys(r2, r3, r4, r0, -18, -22);
+	k -= 50;
+	S4(r2, r3, r4, r0, r1); store_and_load_keys(r3, r4, r0, r1, 28, 24);
+	S5(r3, r4, r0, r1, r2); store_and_load_keys(r2, r3, r4, r1, 24, 20);
+	S6(r2, r3, r4, r1, r0); store_and_load_keys(r4, r0, r3, r1, 20, 16);
+	S7(r4, r0, r3, r1, r2); store_and_load_keys(r2, r3, r1, r4, 16, 12);
+	S0(r2, r3, r1, r4, r0); store_and_load_keys(r1, r3, r4, r2, 12, 8);
+	S1(r1, r3, r4, r2, r0); store_and_load_keys(r0, r4, r2, r1, 8, 4);
+	S2(r0, r4, r2, r1, r3); store_and_load_keys(r3, r4, r0, r1, 4, 0);
+	S3(r3, r4, r0, r1, r2); storekeys(r1, r2, r4, r3, 0);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(__serpent_setkey);
+
+int serpent_setkey(struct crypto_tfm *tfm, const u8 *key, unsigned int keylen)
+{
+	return __serpent_setkey(crypto_tfm_ctx(tfm), key, keylen);
+}
+EXPORT_SYMBOL_GPL(serpent_setkey);
+
+void __serpent_encrypt(struct serpent_ctx *ctx, u8 *dst, const u8 *src)
+{
+	const u32 *k = ctx->expkey;
+	const __le32 *s = (const __le32 *)src;
+	__le32	*d = (__le32 *)dst;
+	u32	r0, r1, r2, r3, r4;
+
+/*
+ * Note: The conversions between u8* and u32* might cause trouble
+ * on architectures with stricter alignment rules than x86
+ */
+
+	r0 = le32_to_cpu(s[0]);
+	r1 = le32_to_cpu(s[1]);
+	r2 = le32_to_cpu(s[2]);
+	r3 = le32_to_cpu(s[3]);
+
+					K(r0, r1, r2, r3, 0);
+	S0(r0, r1, r2, r3, r4);		LK(r2, r1, r3, r0, r4, 1);
+	S1(r2, r1, r3, r0, r4);		LK(r4, r3, r0, r2, r1, 2);
+	S2(r4, r3, r0, r2, r1);		LK(r1, r3, r4, r2, r0, 3);
+	S3(r1, r3, r4, r2, r0);		LK(r2, r0, r3, r1, r4, 4);
+	S4(r2, r0, r3, r1, r4);		LK(r0, r3, r1, r4, r2, 5);
+	S5(r0, r3, r1, r4, r2);		LK(r2, r0, r3, r4, r1, 6);
+	S6(r2, r0, r3, r4, r1);		LK(r3, r1, r0, r4, r2, 7);
+	S7(r3, r1, r0, r4, r2);		LK(r2, r0, r4, r3, r1, 8);
+	S0(r2, r0, r4, r3, r1);		LK(r4, r0, r3, r2, r1, 9);
+	S1(r4, r0, r3, r2, r1);		LK(r1, r3, r2, r4, r0, 10);
+	S2(r1, r3, r2, r4, r0);		LK(r0, r3, r1, r4, r2, 11);
+	S3(r0, r3, r1, r4, r2);		LK(r4, r2, r3, r0, r1, 12);
+	S4(r4, r2, r3, r0, r1);		LK(r2, r3, r0, r1, r4, 13);
+	S5(r2, r3, r0, r1, r4);		LK(r4, r2, r3, r1, r0, 14);
+	S6(r4, r2, r3, r1, r0);		LK(r3, r0, r2, r1, r4, 15);
+	S7(r3, r0, r2, r1, r4);		LK(r4, r2, r1, r3, r0, 16);
+	S0(r4, r2, r1, r3, r0);		LK(r1, r2, r3, r4, r0, 17);
+	S1(r1, r2, r3, r4, r0);		LK(r0, r3, r4, r1, r2, 18);
+	S2(r0, r3, r4, r1, r2);		LK(r2, r3, r0, r1, r4, 19);
+	S3(r2, r3, r0, r1, r4);		LK(r1, r4, r3, r2, r0, 20);
+	S4(r1, r4, r3, r2, r0);		LK(r4, r3, r2, r0, r1, 21);
+	S5(r4, r3, r2, r0, r1);		LK(r1, r4, r3, r0, r2, 22);
+	S6(r1, r4, r3, r0, r2);		LK(r3, r2, r4, r0, r1, 23);
+	S7(r3, r2, r4, r0, r1);		LK(r1, r4, r0, r3, r2, 24);
+	S0(r1, r4, r0, r3, r2);		LK(r0, r4, r3, r1, r2, 25);
+	S1(r0, r4, r3, r1, r2);		LK(r2, r3, r1, r0, r4, 26);
+	S2(r2, r3, r1, r0, r4);		LK(r4, r3, r2, r0, r1, 27);
+	S3(r4, r3, r2, r0, r1);		LK(r0, r1, r3, r4, r2, 28);
+	S4(r0, r1, r3, r4, r2);		LK(r1, r3, r4, r2, r0, 29);
+	S5(r1, r3, r4, r2, r0);		LK(r0, r1, r3, r2, r4, 30);
+	S6(r0, r1, r3, r2, r4);		LK(r3, r4, r1, r2, r0, 31);
+	S7(r3, r4, r1, r2, r0);		K(r0, r1, r2, r3, 32);
+
+	d[0] = cpu_to_le32(r0);
+	d[1] = cpu_to_le32(r1);
+	d[2] = cpu_to_le32(r2);
+	d[3] = cpu_to_le32(r3);
+}
+EXPORT_SYMBOL_GPL(__serpent_encrypt);
+
+static void serpent_encrypt(struct crypto_tfm *tfm, u8 *dst, const u8 *src)
+{
+	struct serpent_ctx *ctx = crypto_tfm_ctx(tfm);
+
+	__serpent_encrypt(ctx, dst, src);
+}
+
+void __serpent_decrypt(struct serpent_ctx *ctx, u8 *dst, const u8 *src)
+{
+	const u32 *k = ctx->expkey;
+	const __le32 *s = (const __le32 *)src;
+	__le32	*d = (__le32 *)dst;
+	u32	r0, r1, r2, r3, r4;
+
+	r0 = le32_to_cpu(s[0]);
+	r1 = le32_to_cpu(s[1]);
+	r2 = le32_to_cpu(s[2]);
+	r3 = le32_to_cpu(s[3]);
+
+					K(r0, r1, r2, r3, 32);
+	SI7(r0, r1, r2, r3, r4);	KL(r1, r3, r0, r4, r2, 31);
+	SI6(r1, r3, r0, r4, r2);	KL(r0, r2, r4, r1, r3, 30);
+	SI5(r0, r2, r4, r1, r3);	KL(r2, r3, r0, r4, r1, 29);
+	SI4(r2, r3, r0, r4, r1);	KL(r2, r0, r1, r4, r3, 28);
+	SI3(r2, r0, r1, r4, r3);	KL(r1, r2, r3, r4, r0, 27);
+	SI2(r1, r2, r3, r4, r0);	KL(r2, r0, r4, r3, r1, 26);
+	SI1(r2, r0, r4, r3, r1);	KL(r1, r0, r4, r3, r2, 25);
+	SI0(r1, r0, r4, r3, r2);	KL(r4, r2, r0, r1, r3, 24);
+	SI7(r4, r2, r0, r1, r3);	KL(r2, r1, r4, r3, r0, 23);
+	SI6(r2, r1, r4, r3, r0);	KL(r4, r0, r3, r2, r1, 22);
+	SI5(r4, r0, r3, r2, r1);	KL(r0, r1, r4, r3, r2, 21);
+	SI4(r0, r1, r4, r3, r2);	KL(r0, r4, r2, r3, r1, 20);
+	SI3(r0, r4, r2, r3, r1);	KL(r2, r0, r1, r3, r4, 19);
+	SI2(r2, r0, r1, r3, r4);	KL(r0, r4, r3, r1, r2, 18);
+	SI1(r0, r4, r3, r1, r2);	KL(r2, r4, r3, r1, r0, 17);
+	SI0(r2, r4, r3, r1, r0);	KL(r3, r0, r4, r2, r1, 16);
+	SI7(r3, r0, r4, r2, r1);	KL(r0, r2, r3, r1, r4, 15);
+	SI6(r0, r2, r3, r1, r4);	KL(r3, r4, r1, r0, r2, 14);
+	SI5(r3, r4, r1, r0, r2);	KL(r4, r2, r3, r1, r0, 13);
+	SI4(r4, r2, r3, r1, r0);	KL(r4, r3, r0, r1, r2, 12);
+	SI3(r4, r3, r0, r1, r2);	KL(r0, r4, r2, r1, r3, 11);
+	SI2(r0, r4, r2, r1, r3);	KL(r4, r3, r1, r2, r0, 10);
+	SI1(r4, r3, r1, r2, r0);	KL(r0, r3, r1, r2, r4, 9);
+	SI0(r0, r3, r1, r2, r4);	KL(r1, r4, r3, r0, r2, 8);
+	SI7(r1, r4, r3, r0, r2);	KL(r4, r0, r1, r2, r3, 7);
+	SI6(r4, r0, r1, r2, r3);	KL(r1, r3, r2, r4, r0, 6);
+	SI5(r1, r3, r2, r4, r0);	KL(r3, r0, r1, r2, r4, 5);
+	SI4(r3, r0, r1, r2, r4);	KL(r3, r1, r4, r2, r0, 4);
+	SI3(r3, r1, r4, r2, r0);	KL(r4, r3, r0, r2, r1, 3);
+	SI2(r4, r3, r0, r2, r1);	KL(r3, r1, r2, r0, r4, 2);
+	SI1(r3, r1, r2, r0, r4);	KL(r4, r1, r2, r0, r3, 1);
+	SI0(r4, r1, r2, r0, r3);	K(r2, r3, r1, r4, 0);
+
+	d[0] = cpu_to_le32(r2);
+	d[1] = cpu_to_le32(r3);
+	d[2] = cpu_to_le32(r1);
+	d[3] = cpu_to_le32(r4);
+}
+EXPORT_SYMBOL_GPL(__serpent_decrypt);
+
+static void serpent_decrypt(struct crypto_tfm *tfm, u8 *dst, const u8 *src)
+{
+	struct serpent_ctx *ctx = crypto_tfm_ctx(tfm);
+
+	__serpent_decrypt(ctx, dst, src);
+}
+
+static int tnepres_setkey(struct crypto_tfm *tfm, const u8 *key,
+			  unsigned int keylen)
+{
+	u8 rev_key[SERPENT_MAX_KEY_SIZE];
+	int i;
+
+	for (i = 0; i < keylen; ++i)
+		rev_key[keylen - i - 1] = key[i];
+
+	return serpent_setkey(tfm, rev_key, keylen);
+}
+
+static void tnepres_encrypt(struct crypto_tfm *tfm, u8 *dst, const u8 *src)
+{
+	const u32 * const s = (const u32 * const)src;
+	u32 * const d = (u32 * const)dst;
+
+	u32 rs[4], rd[4];
+
+	rs[0] = swab32(s[3]);
+	rs[1] = swab32(s[2]);
+	rs[2] = swab32(s[1]);
+	rs[3] = swab32(s[0]);
+
+	serpent_encrypt(tfm, (u8 *)rd, (u8 *)rs);
+
+	d[0] = swab32(rd[3]);
+	d[1] = swab32(rd[2]);
+	d[2] = swab32(rd[1]);
+	d[3] = swab32(rd[0]);
+}
+
+static void tnepres_decrypt(struct crypto_tfm *tfm, u8 *dst, const u8 *src)
+{
+	const u32 * const s = (const u32 * const)src;
+	u32 * const d = (u32 * const)dst;
+
+	u32 rs[4], rd[4];
+
+	rs[0] = swab32(s[3]);
+	rs[1] = swab32(s[2]);
+	rs[2] = swab32(s[1]);
+	rs[3] = swab32(s[0]);
+
+	serpent_decrypt(tfm, (u8 *)rd, (u8 *)rs);
+
+	d[0] = swab32(rd[3]);
+	d[1] = swab32(rd[2]);
+	d[2] = swab32(rd[1]);
+	d[3] = swab32(rd[0]);
+}
+
+static struct crypto_alg srp_algs[2] = { {
+	.cra_name		=	"serpent",
+	.cra_driver_name	=	"serpent-generic",
+	.cra_priority		=	100,
+	.cra_flags		=	CRYPTO_ALG_TYPE_CIPHER,
+	.cra_blocksize		=	SERPENT_BLOCK_SIZE,
+	.cra_ctxsize		=	sizeof(struct serpent_ctx),
+	.cra_alignmask		=	3,
+	.cra_module		=	THIS_MODULE,
+	.cra_u			=	{ .cipher = {
+	.cia_min_keysize	=	SERPENT_MIN_KEY_SIZE,
+	.cia_max_keysize	=	SERPENT_MAX_KEY_SIZE,
+	.cia_setkey		=	serpent_setkey,
+	.cia_encrypt		=	serpent_encrypt,
+	.cia_decrypt		=	serpent_decrypt } }
+}, {
+	.cra_name		=	"tnepres",
+	.cra_flags		=	CRYPTO_ALG_TYPE_CIPHER,
+	.cra_blocksize		=	SERPENT_BLOCK_SIZE,
+	.cra_ctxsize		=	sizeof(struct serpent_ctx),
+	.cra_alignmask		=	3,
+	.cra_module		=	THIS_MODULE,
+	.cra_u			=	{ .cipher = {
+	.cia_min_keysize	=	SERPENT_MIN_KEY_SIZE,
+	.cia_max_keysize	=	SERPENT_MAX_KEY_SIZE,
+	.cia_setkey		=	tnepres_setkey,
+	.cia_encrypt		=	tnepres_encrypt,
+	.cia_decrypt		=	tnepres_decrypt } }
+} };
+
+static int __init serpent_mod_init(void)
+{
+	return crypto_register_algs(srp_algs, ARRAY_SIZE(srp_algs));
+}
+
+static void __exit serpent_mod_fini(void)
+{
+	crypto_unregister_algs(srp_algs, ARRAY_SIZE(srp_algs));
+}
+
+module_init(serpent_mod_init);
+module_exit(serpent_mod_fini);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Serpent and tnepres (kerneli compatible serpent reversed) Cipher Algorithm");
+MODULE_AUTHOR("Dag Arne Osvik <osvik@ii.uib.no>");
+MODULE_ALIAS_CRYPTO("tnepres");
+MODULE_ALIAS_CRYPTO("serpent");
+MODULE_ALIAS_CRYPTO("serpent-generic");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * Cryptographic API.
+ *
+ * SHA1 Secure Hash Algorithm.
+ *
+ * Derived from cryptoapi implementation, adapted for in-place
+ * scatterlist interface.
+ *
+ * Copyright (c) Alan Smithee.
+ * Copyright (c) Andrew McDonald <andrew@mcdonald.org.uk>
+ * Copyright (c) Jean-Francois Dive <jef@linuxbe.org>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
+ */
+#include <crypto/internal/hash.h>
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/mm.h>
+#include <linux/cryptohash.h>
+#include <linux/types.h>
+#include <crypto/sha.h>
+#include <crypto/sha1_base.h>
+#include <asm/byteorder.h>
+
+static void sha1_generic_block_fn(struct sha1_state *sst, u8 const *src,
+				  int blocks)
+{
+	u32 temp[SHA_WORKSPACE_WORDS];
+
+	while (blocks--) {
+		sha_transform(sst->state, src, temp);
+		src += SHA1_BLOCK_SIZE;
+	}
+	memzero_explicit(temp, sizeof(temp));
+}
+
+int crypto_sha1_update(struct shash_desc *desc, const u8 *data,
+		       unsigned int len)
+{
+	return sha1_base_do_update(desc, data, len, sha1_generic_block_fn);
+}
+EXPORT_SYMBOL(crypto_sha1_update);
+
+static int sha1_final(struct shash_desc *desc, u8 *out)
+{
+	sha1_base_do_finalize(desc, sha1_generic_block_fn);
+	return sha1_base_finish(desc, out);
+}
+
+int crypto_sha1_finup(struct shash_desc *desc, const u8 *data,
+		      unsigned int len, u8 *out)
+{
+	sha1_base_do_update(desc, data, len, sha1_generic_block_fn);
+	return sha1_final(desc, out);
+}
+EXPORT_SYMBOL(crypto_sha1_finup);
+
+static struct shash_alg alg = {
+	.digestsize	=	SHA1_DIGEST_SIZE,
+	.init		=	sha1_base_init,
+	.update		=	crypto_sha1_update,
+	.final		=	sha1_final,
+	.finup		=	crypto_sha1_finup,
+	.descsize	=	sizeof(struct sha1_state),
+	.base		=	{
+		.cra_name	=	"sha1",
+		.cra_driver_name=	"sha1-generic",
+		.cra_flags	=	CRYPTO_ALG_TYPE_SHASH,
+		.cra_blocksize	=	SHA1_BLOCK_SIZE,
+		.cra_module	=	THIS_MODULE,
+	}
+};
+
+static int __init sha1_generic_mod_init(void)
+{
+	return crypto_register_shash(&alg);
+}
+
+static void __exit sha1_generic_mod_fini(void)
+{
+	crypto_unregister_shash(&alg);
+}
+
+module_init(sha1_generic_mod_init);
+module_exit(sha1_generic_mod_fini);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("SHA1 Secure Hash Algorithm");
+
+MODULE_ALIAS_CRYPTO("sha1");
+MODULE_ALIAS_CRYPTO("sha1-generic");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+ * Cryptographic API.
+ *
+ * SHA-256, as specified in
+ * http://csrc.nist.gov/groups/STM/cavp/documents/shs/sha256-384-512.pdf
+ *
+ * SHA-256 code by Jean-Luc Cooke <jlcooke@certainkey.com>.
+ *
+ * Copyright (c) Jean-Luc Cooke <jlcooke@certainkey.com>
+ * Copyright (c) Andrew McDonald <andrew@mcdonald.org.uk>
+ * Copyright (c) 2002 James Morris <jmorris@intercode.com.au>
+ * SHA224 Support Copyright 2007 Intel Corporation <jonathan.lynch@intel.com>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of th

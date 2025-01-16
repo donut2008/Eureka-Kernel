@@ -1,308 +1,127 @@
-/*
- * USB Serial Console driver
- *
- * Copyright (C) 2001 - 2002 Greg Kroah-Hartman (greg@kroah.com)
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License version
- *	2 as published by the Free Software Foundation.
- *
- * Thanks to Randy Dunlap for the original version of this code.
- *
- */
-
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/console.h>
-#include <linux/serial.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-
-struct usbcons_info {
-	int			magic;
-	int			break_flag;
-	struct usb_serial_port	*port;
-};
-
-static struct usbcons_info usbcons_info;
-static struct console usbcons;
-
-/*
- * ------------------------------------------------------------
- * USB Serial console driver
- *
- * Much of the code here is copied from drivers/char/serial.c
- * and implements a phony serial console in the same way that
- * serial.c does so that in case some software queries it,
- * it will get the same results.
- *
- * Things that are different from the way the serial port code
- * does things, is that we call the lower level usb-serial
- * driver code to initialize the device, and we set the initial
- * console speeds based on the command line arguments.
- * ------------------------------------------------------------
- */
-
-static const struct tty_operations usb_console_fake_tty_ops = {
-};
-
-/*
- * The parsing of the command line works exactly like the
- * serial.c code, except that the specifier is "ttyUSB" instead
- * of "ttyS".
- */
-static int usb_console_setup(struct console *co, char *options)
-{
-	struct usbcons_info *info = &usbcons_info;
-	int baud = 9600;
-	int bits = 8;
-	int parity = 'n';
-	int doflow = 0;
-	int cflag = CREAD | HUPCL | CLOCAL;
-	char *s;
-	struct usb_serial *serial;
-	struct usb_serial_port *port;
-	int retval;
-	struct tty_struct *tty = NULL;
-	struct ktermios dummy;
-
-	if (options) {
-		baud = simple_strtoul(options, NULL, 10);
-		s = options;
-		while (*s >= '0' && *s <= '9')
-			s++;
-		if (*s)
-			parity = *s++;
-		if (*s)
-			bits   = *s++ - '0';
-		if (*s)
-			doflow = (*s++ == 'r');
-	}
-	
-	/* Sane default */
-	if (baud == 0)
-		baud = 9600;
-
-	switch (bits) {
-	case 7:
-		cflag |= CS7;
-		break;
-	default:
-	case 8:
-		cflag |= CS8;
-		break;
-	}
-	switch (parity) {
-	case 'o': case 'O':
-		cflag |= PARODD;
-		break;
-	case 'e': case 'E':
-		cflag |= PARENB;
-		break;
-	}
-	co->cflag = cflag;
-
-	/*
-	 * no need to check the index here: if the index is wrong, console
-	 * code won't call us
-	 */
-	port = usb_serial_port_get_by_minor(co->index);
-	if (port == NULL) {
-		/* no device is connected yet, sorry :( */
-		pr_err("No USB device connected to ttyUSB%i\n", co->index);
-		return -ENODEV;
-	}
-	serial = port->serial;
-
-	retval = usb_autopm_get_interface(serial->interface);
-	if (retval)
-		goto error_get_interface;
-
-	tty_port_tty_set(&port->port, NULL);
-
-	info->port = port;
-
-	++port->port.count;
-	if (!test_bit(ASYNCB_INITIALIZED, &port->port.flags)) {
-		if (serial->type->set_termios) {
-			/*
-			 * allocate a fake tty so the driver can initialize
-			 * the termios structure, then later call set_termios to
-			 * configure according to command line arguments
-			 */
-			tty = kzalloc(sizeof(*tty), GFP_KERNEL);
-			if (!tty) {
-				retval = -ENOMEM;
-				goto reset_open_count;
-			}
-			kref_init(&tty->kref);
-			tty->driver = usb_serial_tty_driver;
-			tty->index = co->index;
-			init_ldsem(&tty->ldisc_sem);
-			INIT_LIST_HEAD(&tty->tty_files);
-			kref_get(&tty->driver->kref);
-			__module_get(tty->driver->owner);
-			tty->ops = &usb_console_fake_tty_ops;
-			if (tty_init_termios(tty)) {
-				retval = -ENOMEM;
-				goto put_tty;
-			}
-			tty_port_tty_set(&port->port, tty);
-		}
-
-		/* only call the device specific open if this
-		 * is the first time the port is opened */
-		retval = serial->type->open(NULL, port);
-		if (retval) {
-			dev_err(&port->dev, "could not open USB console port\n");
-			goto fail;
-		}
-
-		if (serial->type->set_termios) {
-			tty->termios.c_cflag = cflag;
-			tty_termios_encode_baud_rate(&tty->termios, baud, baud);
-			memset(&dummy, 0, sizeof(struct ktermios));
-			serial->type->set_termios(tty, port, &dummy);
-
-			tty_port_tty_set(&port->port, NULL);
-			tty_kref_put(tty);
-		}
-		set_bit(ASYNCB_INITIALIZED, &port->port.flags);
-	}
-	/* Now that any required fake tty operations are completed restore
-	 * the tty port count */
-	--port->port.count;
-	/* The console is special in terms of closing the device so
-	 * indicate this port is now acting as a system console. */
-	port->port.console = 1;
-
-	mutex_unlock(&serial->disc_mutex);
-	return retval;
-
- fail:
-	tty_port_tty_set(&port->port, NULL);
- put_tty:
-	tty_kref_put(tty);
- reset_open_count:
-	port->port.count = 0;
-	info->port = NULL;
-	usb_autopm_put_interface(serial->interface);
- error_get_interface:
-	usb_serial_put(serial);
-	mutex_unlock(&serial->disc_mutex);
-	return retval;
-}
-
-static void usb_console_write(struct console *co,
-					const char *buf, unsigned count)
-{
-	static struct usbcons_info *info = &usbcons_info;
-	struct usb_serial_port *port = info->port;
-	struct usb_serial *serial;
-	int retval = -ENODEV;
-
-	if (!port || port->serial->dev->state == USB_STATE_NOTATTACHED)
-		return;
-	serial = port->serial;
-
-	if (count == 0)
-		return;
-
-	dev_dbg(&port->dev, "%s - %d byte(s)\n", __func__, count);
-
-	if (!port->port.console) {
-		dev_dbg(&port->dev, "%s - port not opened\n", __func__);
-		return;
-	}
-
-	while (count) {
-		unsigned int i;
-		unsigned int lf;
-		/* search for LF so we can insert CR if necessary */
-		for (i = 0, lf = 0 ; i < count ; i++) {
-			if (*(buf + i) == 10) {
-				lf = 1;
-				i++;
-				break;
-			}
-		}
-		/* pass on to the driver specific version of this function if
-		   it is available */
-		retval = serial->type->write(NULL, port, buf, i);
-		dev_dbg(&port->dev, "%s - write: %d\n", __func__, retval);
-		if (lf) {
-			/* append CR after LF */
-			unsigned char cr = 13;
-			retval = serial->type->write(NULL, port, &cr, 1);
-			dev_dbg(&port->dev, "%s - write cr: %d\n",
-							__func__, retval);
-		}
-		buf += i;
-		count -= i;
-	}
-}
-
-static struct tty_driver *usb_console_device(struct console *co, int *index)
-{
-	struct tty_driver **p = (struct tty_driver **)co->data;
-
-	if (!*p)
-		return NULL;
-
-	*index = co->index;
-	return *p;
-}
-
-static struct console usbcons = {
-	.name =		"ttyUSB",
-	.write =	usb_console_write,
-	.device =	usb_console_device,
-	.setup =	usb_console_setup,
-	.flags =	CON_PRINTBUFFER,
-	.index =	-1,
-	.data = 	&usb_serial_tty_driver,
-};
-
-void usb_serial_console_disconnect(struct usb_serial *serial)
-{
-	if (serial && serial->port[0]
-				&& serial->port[0] == usbcons_info.port) {
-		usb_serial_console_exit();
-		usb_serial_put(serial);
-	}
-}
-
-void usb_serial_console_init(int minor)
-{
-	if (minor == 0) {
-		/*
-		 * Call register_console() if this is the first device plugged
-		 * in.  If we call it earlier, then the callback to
-		 * console_setup() will fail, as there is not a device seen by
-		 * the USB subsystem yet.
-		 */
-		/*
-		 * Register console.
-		 * NOTES:
-		 * console_setup() is called (back) immediately (from
-		 * register_console). console_write() is called immediately
-		 * from register_console iff CON_PRINTBUFFER is set in flags.
-		 */
-		pr_debug("registering the USB serial console.\n");
-		register_console(&usbcons);
-	}
-}
-
-void usb_serial_console_exit(void)
-{
-	if (usbcons_info.port) {
-		unregister_console(&usbcons);
-		usbcons_info.port->port.console = 0;
-		usbcons_info.port = NULL;
-	}
-}
-
+_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F3_MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F3_MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F3_MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F3_MSI_MSG_CNTL__MSI_EN_MASK 0x10000
+#define D3F3_MSI_MSG_CNTL__MSI_EN__SHIFT 0x10
+#define D3F3_MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe0000
+#define D3F3_MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x11
+#define D3F3_MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x700000
+#define D3F3_MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x14
+#define D3F3_MSI_MSG_CNTL__MSI_64BIT_MASK 0x800000
+#define D3F3_MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x17
+#define D3F3_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP_MASK 0x1000000
+#define D3F3_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP__SHIFT 0x18
+#define D3F3_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define D3F3_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define D3F3_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define D3F3_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define D3F3_MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define D3F3_MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define D3F3_MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define D3F3_MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define D3F3_SSID_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F3_SSID_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F3_SSID_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F3_SSID_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F3_SSID_CAP__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define D3F3_SSID_CAP__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define D3F3_SSID_CAP__SUBSYSTEM_ID_MASK 0xffff0000
+#define D3F3_SSID_CAP__SUBSYSTEM_ID__SHIFT 0x10
+#define D3F3_MSI_MAP_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F3_MSI_MAP_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F3_MSI_MAP_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F3_MSI_MAP_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F3_MSI_MAP_CAP__EN_MASK 0x10000
+#define D3F3_MSI_MAP_CAP__EN__SHIFT 0x10
+#define D3F3_MSI_MAP_CAP__FIXD_MASK 0x20000
+#define D3F3_MSI_MAP_CAP__FIXD__SHIFT 0x11
+#define D3F3_MSI_MAP_CAP__CAP_TYPE_MASK 0xf8000000
+#define D3F3_MSI_MAP_CAP__CAP_TYPE__SHIFT 0x1b
+#define D3F3_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO_MASK 0xfff00000
+#define D3F3_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO__SHIFT 0x14
+#define D3F3_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI_MASK 0xffffffff
+#define D3F3_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI__SHIFT 0x0
+#define D3F3_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F3_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F3_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F3_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F3_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F3_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F3_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID_MASK 0xffff
+#define D3F3_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID__SHIFT 0x0
+#define D3F3_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV_MASK 0xf0000
+#define D3F3_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV__SHIFT 0x10
+#define D3F3_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH_MASK 0xfff00000
+#define D3F3_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH__SHIFT 0x14
+#define D3F3_PCIE_VENDOR_SPECIFIC1__SCRATCH_MASK 0xffffffff
+#define D3F3_PCIE_VENDOR_SPECIFIC1__SCRATCH__SHIFT 0x0
+#define D3F3_PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define D3F3_PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define D3F3_PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F3_PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F3_PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F3_PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F3_PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F3_PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F3_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define D3F3_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define D3F3_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT_MASK 0x70
+#define D3F3_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT__SHIFT 0x4
+#define D3F3_PCIE_PORT_VC_CAP_REG1__REF_CLK_MASK 0x300
+#define D3F3_PCIE_PORT_VC_CAP_REG1__REF_CLK__SHIFT 0x8
+#define D3F3_PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE_MASK 0xc00
+#define D3F3_PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE__SHIFT 0xa
+#define D3F3_PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP_MASK 0xff
+#define D3F3_PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP__SHIFT 0x0
+#define D3F3_PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D3F3_PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D3F3_PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE_MASK 0x1
+#define D3F3_PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE__SHIFT 0x0
+#define D3F3_PCIE_PORT_VC_CNTL__VC_ARB_SELECT_MASK 0xe
+#define D3F3_PCIE_PORT_VC_CNTL__VC_ARB_SELECT__SHIFT 0x1
+#define D3F3_PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS_MASK 0x10000
+#define D3F3_PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS__SHIFT 0x10
+#define D3F3_PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define D3F3_PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define D3F3_PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define D3F3_PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D3F3_PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D3F3_PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D3F3_PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D3F3_PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define D3F3_PCIE_VC0_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define D3F3_PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x10000
+#define D3F3_PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x10
+#define D3F3_PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x20000
+#define D3F3_PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x11
+#define D3F3_PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define D3F3_PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define D3F3_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define D3F3_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D3F3_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D3F3_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D3F3_PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D3F3_PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define D3F3_PCIE_VC1_RESOURCE_CNTL__VC_ENAB

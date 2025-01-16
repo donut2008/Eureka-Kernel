@@ -1,256 +1,73 @@
-/*
- * Driver for EHCI UHP on Atmel chips
- *
- *  Copyright (C) 2009 Atmel Corporation,
- *                     Nicolas Ferre <nicolas.ferre@atmel.com>
- *
- *  Based on various ehci-*.c drivers
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file COPYING in the main directory of this archive for
- * more details.
- */
-
-#include <linux/clk.h>
-#include <linux/dma-mapping.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
-#include <linux/usb.h>
-#include <linux/usb/hcd.h>
-
-#include "ehci.h"
-
-#define DRIVER_DESC "EHCI Atmel driver"
-
-static const char hcd_name[] = "ehci-atmel";
-
-/* interface and function clocks */
-#define hcd_to_atmel_ehci_priv(h) \
-	((struct atmel_ehci_priv *)hcd_to_ehci(h)->priv)
-
-struct atmel_ehci_priv {
-	struct clk *iclk;
-	struct clk *uclk;
-	bool clocked;
-};
-
-static struct hc_driver __read_mostly ehci_atmel_hc_driver;
-
-static const struct ehci_driver_overrides ehci_atmel_drv_overrides __initconst = {
-	.extra_priv_size = sizeof(struct atmel_ehci_priv),
-};
-
-/*-------------------------------------------------------------------------*/
-
-static void atmel_start_clock(struct atmel_ehci_priv *atmel_ehci)
-{
-	if (atmel_ehci->clocked)
-		return;
-
-	clk_prepare_enable(atmel_ehci->uclk);
-	clk_prepare_enable(atmel_ehci->iclk);
-	atmel_ehci->clocked = true;
-}
-
-static void atmel_stop_clock(struct atmel_ehci_priv *atmel_ehci)
-{
-	if (!atmel_ehci->clocked)
-		return;
-
-	clk_disable_unprepare(atmel_ehci->iclk);
-	clk_disable_unprepare(atmel_ehci->uclk);
-	atmel_ehci->clocked = false;
-}
-
-static void atmel_start_ehci(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-	struct atmel_ehci_priv *atmel_ehci = hcd_to_atmel_ehci_priv(hcd);
-
-	dev_dbg(&pdev->dev, "start\n");
-	atmel_start_clock(atmel_ehci);
-}
-
-static void atmel_stop_ehci(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-	struct atmel_ehci_priv *atmel_ehci = hcd_to_atmel_ehci_priv(hcd);
-
-	dev_dbg(&pdev->dev, "stop\n");
-	atmel_stop_clock(atmel_ehci);
-}
-
-/*-------------------------------------------------------------------------*/
-
-static int ehci_atmel_drv_probe(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd;
-	const struct hc_driver *driver = &ehci_atmel_hc_driver;
-	struct resource *res;
-	struct ehci_hcd *ehci;
-	struct atmel_ehci_priv *atmel_ehci;
-	int irq;
-	int retval;
-
-	if (usb_disabled())
-		return -ENODEV;
-
-	pr_debug("Initializing Atmel-SoC USB Host Controller\n");
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq <= 0) {
-		dev_err(&pdev->dev,
-			"Found HC with no IRQ. Check %s setup!\n",
-			dev_name(&pdev->dev));
-		retval = -ENODEV;
-		goto fail_create_hcd;
-	}
-
-	/* Right now device-tree probed devices don't get dma_mask set.
-	 * Since shared usb code relies on it, set it here for now.
-	 * Once we have dma capability bindings this can go away.
-	 */
-	retval = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (retval)
-		goto fail_create_hcd;
-
-	hcd = usb_create_hcd(driver, &pdev->dev, dev_name(&pdev->dev));
-	if (!hcd) {
-		retval = -ENOMEM;
-		goto fail_create_hcd;
-	}
-	atmel_ehci = hcd_to_atmel_ehci_priv(hcd);
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(hcd->regs)) {
-		retval = PTR_ERR(hcd->regs);
-		goto fail_request_resource;
-	}
-
-	hcd->rsrc_start = res->start;
-	hcd->rsrc_len = resource_size(res);
-
-	atmel_ehci->iclk = devm_clk_get(&pdev->dev, "ehci_clk");
-	if (IS_ERR(atmel_ehci->iclk)) {
-		dev_err(&pdev->dev, "Error getting interface clock\n");
-		retval = -ENOENT;
-		goto fail_request_resource;
-	}
-
-	atmel_ehci->uclk = devm_clk_get(&pdev->dev, "usb_clk");
-	if (IS_ERR(atmel_ehci->uclk)) {
-		dev_err(&pdev->dev, "failed to get uclk\n");
-		retval = PTR_ERR(atmel_ehci->uclk);
-		goto fail_request_resource;
-	}
-
-	ehci = hcd_to_ehci(hcd);
-	/* registers start at offset 0x0 */
-	ehci->caps = hcd->regs;
-
-	atmel_start_ehci(pdev);
-
-	retval = usb_add_hcd(hcd, irq, IRQF_SHARED);
-	if (retval)
-		goto fail_add_hcd;
-	device_wakeup_enable(hcd->self.controller);
-
-	return retval;
-
-fail_add_hcd:
-	atmel_stop_ehci(pdev);
-fail_request_resource:
-	usb_put_hcd(hcd);
-fail_create_hcd:
-	dev_err(&pdev->dev, "init %s fail, %d\n",
-		dev_name(&pdev->dev), retval);
-
-	return retval;
-}
-
-static int ehci_atmel_drv_remove(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-
-	usb_remove_hcd(hcd);
-	usb_put_hcd(hcd);
-
-	atmel_stop_ehci(pdev);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM
-static int ehci_atmel_drv_suspend(struct device *dev)
-{
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-	struct atmel_ehci_priv *atmel_ehci = hcd_to_atmel_ehci_priv(hcd);
-	int ret;
-
-	ret = ehci_suspend(hcd, false);
-	if (ret)
-		return ret;
-
-	atmel_stop_clock(atmel_ehci);
-	return 0;
-}
-
-static int ehci_atmel_drv_resume(struct device *dev)
-{
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-	struct atmel_ehci_priv *atmel_ehci = hcd_to_atmel_ehci_priv(hcd);
-
-	atmel_start_clock(atmel_ehci);
-	return ehci_resume(hcd, false);
-}
-#endif
-
-#ifdef CONFIG_OF
-static const struct of_device_id atmel_ehci_dt_ids[] = {
-	{ .compatible = "atmel,at91sam9g45-ehci" },
-	{ /* sentinel */ }
-};
-
-MODULE_DEVICE_TABLE(of, atmel_ehci_dt_ids);
-#endif
-
-static SIMPLE_DEV_PM_OPS(ehci_atmel_pm_ops, ehci_atmel_drv_suspend,
-					ehci_atmel_drv_resume);
-
-static struct platform_driver ehci_atmel_driver = {
-	.probe		= ehci_atmel_drv_probe,
-	.remove		= ehci_atmel_drv_remove,
-	.shutdown	= usb_hcd_platform_shutdown,
-	.driver		= {
-		.name	= "atmel-ehci",
-		.pm	= &ehci_atmel_pm_ops,
-		.of_match_table	= of_match_ptr(atmel_ehci_dt_ids),
-	},
-};
-
-static int __init ehci_atmel_init(void)
-{
-	if (usb_disabled())
-		return -ENODEV;
-
-	pr_info("%s: " DRIVER_DESC "\n", hcd_name);
-	ehci_init_driver(&ehci_atmel_hc_driver, &ehci_atmel_drv_overrides);
-	return platform_driver_register(&ehci_atmel_driver);
-}
-module_init(ehci_atmel_init);
-
-static void __exit ehci_atmel_cleanup(void)
-{
-	platform_driver_unregister(&ehci_atmel_driver);
-}
-module_exit(ehci_atmel_cleanup);
-
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_ALIAS("platform:atmel-ehci");
-MODULE_AUTHOR("Nicolas Ferre");
-MODULE_LICENSE("GPL");
+                      0x1862
+#define mmDCO_MEM_PWR_CTRL2                                                     0x1863
+#define mmDCO_CLK_CNTL                                                          0x1864
+#define mmDCO_CLK_RAMP_CNTL                                                     0x1865
+#define mmDPDBG_CNTL                                                            0x1866
+#define mmDPDBG_INTERRUPT                                                       0x1867
+#define mmDCO_POWER_MANAGEMENT_CNTL                                             0x1868
+#define mmDCO_SOFT_RESET                                                        0x1871
+#define mmDIG_SOFT_RESET                                                        0x1872
+#define mmDCO_STEREOSYNC_SEL                                                    0x186e
+#define mmDCO_TEST_DEBUG_INDEX                                                  0x186f
+#define mmDCO_TEST_DEBUG_DATA                                                   0x1870
+#define mmDC_I2C_CONTROL                                                        0x16d4
+#define mmDC_I2C_ARBITRATION                                                    0x16d5
+#define mmDC_I2C_INTERRUPT_CONTROL                                              0x16d6
+#define mmDC_I2C_SW_STATUS                                                      0x16d7
+#define mmDC_I2C_DDC1_HW_STATUS                                                 0x16d8
+#define mmDC_I2C_DDC2_HW_STATUS                                                 0x16d9
+#define mmDC_I2C_DDC3_HW_STATUS                                                 0x16da
+#define mmDC_I2C_DDC4_HW_STATUS                                                 0x16db
+#define mmDC_I2C_DDC5_HW_STATUS                                                 0x16dc
+#define mmDC_I2C_DDC6_HW_STATUS                                                 0x16dd
+#define mmDC_I2C_DDC1_SPEED                                                     0x16de
+#define mmDC_I2C_DDC1_SETUP                                                     0x16df
+#define mmDC_I2C_DDC2_SPEED                                                     0x16e0
+#define mmDC_I2C_DDC2_SETUP                                                     0x16e1
+#define mmDC_I2C_DDC3_SPEED                                                     0x16e2
+#define mmDC_I2C_DDC3_SETUP                                                     0x16e3
+#define mmDC_I2C_DDC4_SPEED                                                     0x16e4
+#define mmDC_I2C_DDC4_SETUP                                                     0x16e5
+#define mmDC_I2C_DDC5_SPEED                                                     0x16e6
+#define mmDC_I2C_DDC5_SETUP                                                     0x16e7
+#define mmDC_I2C_DDC6_SPEED                                                     0x16e8
+#define mmDC_I2C_DDC6_SETUP                                                     0x16e9
+#define mmDC_I2C_TRANSACTION0                                                   0x16ea
+#define mmDC_I2C_TRANSACTION1                                                   0x16eb
+#define mmDC_I2C_TRANSACTION2                                                   0x16ec
+#define mmDC_I2C_TRANSACTION3                                                   0x16ed
+#define mmDC_I2C_DATA                                                           0x16ee
+#define mmDC_I2C_DDCVGA_HW_STATUS                                               0x16ef
+#define mmDC_I2C_DDCVGA_SPEED                                                   0x16f0
+#define mmDC_I2C_DDCVGA_SETUP                                                   0x16f1
+#define mmDC_I2C_EDID_DETECT_CTRL                                               0x16f2
+#define mmDC_I2C_READ_REQUEST_INTERRUPT                                         0x16f3
+#define mmGENERIC_I2C_CONTROL                                                   0x16f4
+#define mmGENERIC_I2C_INTERRUPT_CONTROL                                         0x16f5
+#define mmGENERIC_I2C_STATUS                                                    0x16f6
+#define mmGENERIC_I2C_SPEED                                                     0x16f7
+#define mmGENERIC_I2C_SETUP                                                     0x16f8
+#define mmGENERIC_I2C_TRANSACTION                                               0x16f9
+#define mmGENERIC_I2C_DATA                                                      0x16fa
+#define mmGENERIC_I2C_PIN_SELECTION                                             0x16fb
+#define mmGENERIC_I2C_PIN_DEBUG                                                 0x16fc
+#define mmXDMA_MC_PCIE_CLIENT_CONFIG                                            0x3e0
+#define mmXDMA_LOCAL_SURFACE_TILING1                                            0x3e1
+#define mmXDMA_LOCAL_SURFACE_TILING2                                            0x3e2
+#define mmXDMA_INTERRUPT                                                        0x3e3
+#define mmXDMA_CLOCK_GATING_CNTL                                                0x3e4
+#define mmXDMA_MEM_POWER_CNTL                                                   0x3e6
+#define mmXDMA_IF_BIF_STATUS                                                    0x3e7
+#define mmXDMA_PERF_MEAS_STATUS                                                 0x3e8
+#define mmXDMA_IF_STATUS                                                        0x3e9
+#define mmXDMA_TEST_DEBUG_INDEX                                                 0x3ea
+#define mmXDMA_TEST_DEBUG_DATA                                                  0x3eb
+#define mmXDMA_RBBMIF_RDWR_CNTL                                                 0x3f8
+#define mmXDMA_PG_CONTROL                                                       0x3f9
+#define mmXDMA_PG_WDATA                                                         0x3fa
+#define mmXDMA_PG_STATUS                                                        0x3fb
+#define mmXDMA_AON_TEST_DEBUG_INDEX                                             0x3fc
+#define mmXDMA_AON_TEST_DEBUG_DATA                                              0x3fd
+#define mmXDMA_MSTR_CNTL                                                        0x3ec
+#define mmXDMA_MSTR_STATUS                                                      0x3ed
+#define mmXDMA_MSTR_MEM_CLIENT_CONFIG            

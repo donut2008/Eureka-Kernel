@@ -1,272 +1,219 @@
-/*
- *    Out of line spinlock code.
- *
- *    Copyright IBM Corp. 2004, 2006
- *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com)
+ L4 headers*/
+	IB_FLOW_SPEC_TCP	= 0x40,
+	IB_FLOW_SPEC_UDP	= 0x41
+};
+#define IB_FLOW_SPEC_LAYER_MASK	0xF0
+#define IB_FLOW_SPEC_SUPPORT_LAYERS 4
+
+/* Flow steering rule priority is set according to it's domain.
+ * Lower domain value means higher priority.
  */
+enum ib_flow_domain {
+	IB_FLOW_DOMAIN_USER,
+	IB_FLOW_DOMAIN_ETHTOOL,
+	IB_FLOW_DOMAIN_RFS,
+	IB_FLOW_DOMAIN_NIC,
+	IB_FLOW_DOMAIN_NUM /* Must be last */
+};
 
-#include <linux/types.h>
-#include <linux/module.h>
-#include <linux/spinlock.h>
-#include <linux/init.h>
-#include <linux/smp.h>
-#include <asm/io.h>
+struct ib_flow_eth_filter {
+	u8	dst_mac[6];
+	u8	src_mac[6];
+	__be16	ether_type;
+	__be16	vlan_tag;
+};
 
-int spin_retry = -1;
+struct ib_flow_spec_eth {
+	enum ib_flow_spec_type	  type;
+	u16			  size;
+	struct ib_flow_eth_filter val;
+	struct ib_flow_eth_filter mask;
+};
 
-static int __init spin_retry_init(void)
-{
-	if (spin_retry < 0)
-		spin_retry = MACHINE_HAS_CAD ? 10 : 1000;
-	return 0;
-}
-early_initcall(spin_retry_init);
+struct ib_flow_ib_filter {
+	__be16 dlid;
+	__u8   sl;
+};
 
-/**
- * spin_retry= parameter
- */
-static int __init spin_retry_setup(char *str)
-{
-	spin_retry = simple_strtoul(str, &str, 0);
-	return 1;
-}
-__setup("spin_retry=", spin_retry_setup);
+struct ib_flow_spec_ib {
+	enum ib_flow_spec_type	 type;
+	u16			 size;
+	struct ib_flow_ib_filter val;
+	struct ib_flow_ib_filter mask;
+};
 
-static inline void _raw_compare_and_delay(unsigned int *lock, unsigned int old)
-{
-	asm(".insn rsy,0xeb0000000022,%0,0,%1" : : "d" (old), "Q" (*lock));
-}
+struct ib_flow_ipv4_filter {
+	__be32	src_ip;
+	__be32	dst_ip;
+};
 
-void arch_spin_lock_wait(arch_spinlock_t *lp)
-{
-	unsigned int cpu = SPINLOCK_LOCKVAL;
-	unsigned int owner;
-	int count;
+struct ib_flow_spec_ipv4 {
+	enum ib_flow_spec_type	   type;
+	u16			   size;
+	struct ib_flow_ipv4_filter val;
+	struct ib_flow_ipv4_filter mask;
+};
 
-	while (1) {
-		owner = ACCESS_ONCE(lp->lock);
-		/* Try to get the lock if it is free. */
-		if (!owner) {
-			if (_raw_compare_and_swap(&lp->lock, 0, cpu))
-				return;
-			continue;
-		}
-		/* Check if the lock owner is running. */
-		if (!smp_vcpu_scheduled(~owner)) {
-			smp_yield_cpu(~owner);
-			continue;
-		}
-		/* Loop for a while on the lock value. */
-		count = spin_retry;
-		do {
-			if (MACHINE_HAS_CAD)
-				_raw_compare_and_delay(&lp->lock, owner);
-			owner = ACCESS_ONCE(lp->lock);
-		} while (owner && count-- > 0);
-		if (!owner)
-			continue;
-		/*
-		 * For multiple layers of hypervisors, e.g. z/VM + LPAR
-		 * yield the CPU if the lock is still unavailable.
-		 */
-		if (!MACHINE_IS_LPAR)
-			smp_yield_cpu(~owner);
-	}
-}
-EXPORT_SYMBOL(arch_spin_lock_wait);
+struct ib_flow_tcp_udp_filter {
+	__be16	dst_port;
+	__be16	src_port;
+};
 
-void arch_spin_lock_wait_flags(arch_spinlock_t *lp, unsigned long flags)
-{
-	unsigned int cpu = SPINLOCK_LOCKVAL;
-	unsigned int owner;
-	int count;
+struct ib_flow_spec_tcp_udp {
+	enum ib_flow_spec_type	      type;
+	u16			      size;
+	struct ib_flow_tcp_udp_filter val;
+	struct ib_flow_tcp_udp_filter mask;
+};
 
-	local_irq_restore(flags);
-	while (1) {
-		owner = ACCESS_ONCE(lp->lock);
-		/* Try to get the lock if it is free. */
-		if (!owner) {
-			local_irq_disable();
-			if (_raw_compare_and_swap(&lp->lock, 0, cpu))
-				return;
-			local_irq_restore(flags);
-		}
-		/* Check if the lock owner is running. */
-		if (!smp_vcpu_scheduled(~owner)) {
-			smp_yield_cpu(~owner);
-			continue;
-		}
-		/* Loop for a while on the lock value. */
-		count = spin_retry;
-		do {
-			if (MACHINE_HAS_CAD)
-				_raw_compare_and_delay(&lp->lock, owner);
-			owner = ACCESS_ONCE(lp->lock);
-		} while (owner && count-- > 0);
-		if (!owner)
-			continue;
-		/*
-		 * For multiple layers of hypervisors, e.g. z/VM + LPAR
-		 * yield the CPU if the lock is still unavailable.
-		 */
-		if (!MACHINE_IS_LPAR)
-			smp_yield_cpu(~owner);
-	}
-}
-EXPORT_SYMBOL(arch_spin_lock_wait_flags);
+union ib_flow_spec {
+	struct {
+		enum ib_flow_spec_type	type;
+		u16			size;
+	};
+	struct ib_flow_spec_eth		eth;
+	struct ib_flow_spec_ib		ib;
+	struct ib_flow_spec_ipv4        ipv4;
+	struct ib_flow_spec_tcp_udp	tcp_udp;
+};
 
-int arch_spin_trylock_retry(arch_spinlock_t *lp)
-{
-	unsigned int cpu = SPINLOCK_LOCKVAL;
-	unsigned int owner;
-	int count;
+struct ib_flow_attr {
+	enum ib_flow_attr_type type;
+	u16	     size;
+	u16	     priority;
+	u32	     flags;
+	u8	     num_of_specs;
+	u8	     port;
+	/* Following are the optional layers according to user request
+	 * struct ib_flow_spec_xxx
+	 * struct ib_flow_spec_yyy
+	 */
+};
 
-	for (count = spin_retry; count > 0; count--) {
-		owner = ACCESS_ONCE(lp->lock);
-		/* Try to get the lock if it is free. */
-		if (!owner) {
-			if (_raw_compare_and_swap(&lp->lock, 0, cpu))
-				return 1;
-		} else if (MACHINE_HAS_CAD)
-			_raw_compare_and_delay(&lp->lock, owner);
-	}
-	return 0;
-}
-EXPORT_SYMBOL(arch_spin_trylock_retry);
+struct ib_flow {
+	struct ib_qp		*qp;
+	struct ib_uobject	*uobject;
+};
 
-void _raw_read_lock_wait(arch_rwlock_t *rw)
-{
-	unsigned int owner, old;
-	int count = spin_retry;
+struct ib_mad_hdr;
+struct ib_grh;
 
-#ifdef CONFIG_HAVE_MARCH_Z196_FEATURES
-	__RAW_LOCK(&rw->lock, -1, __RAW_OP_ADD);
-#endif
-	owner = 0;
-	while (1) {
-		if (count-- <= 0) {
-			if (owner && !smp_vcpu_scheduled(~owner))
-				smp_yield_cpu(~owner);
-			count = spin_retry;
-		}
-		old = ACCESS_ONCE(rw->lock);
-		owner = ACCESS_ONCE(rw->owner);
-		if ((int) old < 0) {
-			if (MACHINE_HAS_CAD)
-				_raw_compare_and_delay(&rw->lock, old);
-			continue;
-		}
-		if (_raw_compare_and_swap(&rw->lock, old, old + 1))
-			return;
-	}
-}
-EXPORT_SYMBOL(_raw_read_lock_wait);
+enum ib_process_mad_flags {
+	IB_MAD_IGNORE_MKEY	= 1,
+	IB_MAD_IGNORE_BKEY	= 2,
+	IB_MAD_IGNORE_ALL	= IB_MAD_IGNORE_MKEY | IB_MAD_IGNORE_BKEY
+};
 
-int _raw_read_trylock_retry(arch_rwlock_t *rw)
-{
-	unsigned int old;
-	int count = spin_retry;
+enum ib_mad_result {
+	IB_MAD_RESULT_FAILURE  = 0,      /* (!SUCCESS is the important flag) */
+	IB_MAD_RESULT_SUCCESS  = 1 << 0, /* MAD was successfully processed   */
+	IB_MAD_RESULT_REPLY    = 1 << 1, /* Reply packet needs to be sent    */
+	IB_MAD_RESULT_CONSUMED = 1 << 2  /* Packet consumed: stop processing */
+};
 
-	while (count-- > 0) {
-		old = ACCESS_ONCE(rw->lock);
-		if ((int) old < 0) {
-			if (MACHINE_HAS_CAD)
-				_raw_compare_and_delay(&rw->lock, old);
-			continue;
-		}
-		if (_raw_compare_and_swap(&rw->lock, old, old + 1))
-			return 1;
-	}
-	return 0;
-}
-EXPORT_SYMBOL(_raw_read_trylock_retry);
+#define IB_DEVICE_NAME_MAX 64
 
-#ifdef CONFIG_HAVE_MARCH_Z196_FEATURES
+struct ib_cache {
+	rwlock_t                lock;
+	struct ib_event_handler event_handler;
+	struct ib_pkey_cache  **pkey_cache;
+	struct ib_gid_table   **gid_cache;
+	u8                     *lmc_cache;
+};
 
-void _raw_write_lock_wait(arch_rwlock_t *rw, unsigned int prev)
-{
-	unsigned int owner, old;
-	int count = spin_retry;
+struct ib_dma_mapping_ops {
+	int		(*mapping_error)(struct ib_device *dev,
+					 u64 dma_addr);
+	u64		(*map_single)(struct ib_device *dev,
+				      void *ptr, size_t size,
+				      enum dma_data_direction direction);
+	void		(*unmap_single)(struct ib_device *dev,
+					u64 addr, size_t size,
+					enum dma_data_direction direction);
+	u64		(*map_page)(struct ib_device *dev,
+				    struct page *page, unsigned long offset,
+				    size_t size,
+				    enum dma_data_direction direction);
+	void		(*unmap_page)(struct ib_device *dev,
+				      u64 addr, size_t size,
+				      enum dma_data_direction direction);
+	int		(*map_sg)(struct ib_device *dev,
+				  struct scatterlist *sg, int nents,
+				  enum dma_data_direction direction);
+	void		(*unmap_sg)(struct ib_device *dev,
+				    struct scatterlist *sg, int nents,
+				    enum dma_data_direction direction);
+	void		(*sync_single_for_cpu)(struct ib_device *dev,
+					       u64 dma_handle,
+					       size_t size,
+					       enum dma_data_direction dir);
+	void		(*sync_single_for_device)(struct ib_device *dev,
+						  u64 dma_handle,
+						  size_t size,
+						  enum dma_data_direction dir);
+	void		*(*alloc_coherent)(struct ib_device *dev,
+					   size_t size,
+					   u64 *dma_handle,
+					   gfp_t flag);
+	void		(*free_coherent)(struct ib_device *dev,
+					 size_t size, void *cpu_addr,
+					 u64 dma_handle);
+};
 
-	owner = 0;
-	while (1) {
-		if (count-- <= 0) {
-			if (owner && !smp_vcpu_scheduled(~owner))
-				smp_yield_cpu(~owner);
-			count = spin_retry;
-		}
-		old = ACCESS_ONCE(rw->lock);
-		owner = ACCESS_ONCE(rw->owner);
-		smp_mb();
-		if ((int) old >= 0) {
-			prev = __RAW_LOCK(&rw->lock, 0x80000000, __RAW_OP_OR);
-			old = prev;
-		}
-		if ((old & 0x7fffffff) == 0 && (int) prev >= 0)
-			break;
-		if (MACHINE_HAS_CAD)
-			_raw_compare_and_delay(&rw->lock, old);
-	}
-}
-EXPORT_SYMBOL(_raw_write_lock_wait);
+struct iw_cm_verbs;
 
-#else /* CONFIG_HAVE_MARCH_Z196_FEATURES */
+struct ib_port_immutable {
+	int                           pkey_tbl_len;
+	int                           gid_tbl_len;
+	u32                           core_cap_flags;
+	u32                           max_mad_size;
+};
 
-void _raw_write_lock_wait(arch_rwlock_t *rw)
-{
-	unsigned int owner, old, prev;
-	int count = spin_retry;
+struct ib_device {
+	struct device                *dma_device;
 
-	prev = 0x80000000;
-	owner = 0;
-	while (1) {
-		if (count-- <= 0) {
-			if (owner && !smp_vcpu_scheduled(~owner))
-				smp_yield_cpu(~owner);
-			count = spin_retry;
-		}
-		old = ACCESS_ONCE(rw->lock);
-		owner = ACCESS_ONCE(rw->owner);
-		if ((int) old >= 0 &&
-		    _raw_compare_and_swap(&rw->lock, old, old | 0x80000000))
-			prev = old;
-		else
-			smp_mb();
-		if ((old & 0x7fffffff) == 0 && (int) prev >= 0)
-			break;
-		if (MACHINE_HAS_CAD)
-			_raw_compare_and_delay(&rw->lock, old);
-	}
-}
-EXPORT_SYMBOL(_raw_write_lock_wait);
+	char                          name[IB_DEVICE_NAME_MAX];
 
-#endif /* CONFIG_HAVE_MARCH_Z196_FEATURES */
+	struct list_head              event_handler_list;
+	spinlock_t                    event_handler_lock;
 
-int _raw_write_trylock_retry(arch_rwlock_t *rw)
-{
-	unsigned int old;
-	int count = spin_retry;
+	spinlock_t                    client_data_lock;
+	struct list_head              core_list;
+	/* Access to the client_data_list is protected by the client_data_lock
+	 * spinlock and the lists_rwsem read-write semaphore */
+	struct list_head              client_data_list;
 
-	while (count-- > 0) {
-		old = ACCESS_ONCE(rw->lock);
-		if (old) {
-			if (MACHINE_HAS_CAD)
-				_raw_compare_and_delay(&rw->lock, old);
-			continue;
-		}
-		if (_raw_compare_and_swap(&rw->lock, 0, 0x80000000))
-			return 1;
-	}
-	return 0;
-}
-EXPORT_SYMBOL(_raw_write_trylock_retry);
+	struct ib_cache               cache;
+	/**
+	 * port_immutable is indexed by port number
+	 */
+	struct ib_port_immutable     *port_immutable;
 
-void arch_lock_relax(unsigned int cpu)
-{
-	if (!cpu)
-		return;
-	if (MACHINE_IS_LPAR && smp_vcpu_scheduled(~cpu))
-		return;
-	smp_yield_cpu(~cpu);
-}
-EXPORT_SYMBOL(arch_lock_relax);
+	int			      num_comp_vectors;
+
+	struct iw_cm_verbs	     *iwcm;
+
+	int		           (*get_protocol_stats)(struct ib_device *device,
+							 union rdma_protocol_stats *stats);
+	int		           (*query_device)(struct ib_device *device,
+						   struct ib_device_attr *device_attr,
+						   struct ib_udata *udata);
+	int		           (*query_port)(struct ib_device *device,
+						 u8 port_num,
+						 struct ib_port_attr *port_attr);
+	enum rdma_link_layer	   (*get_link_layer)(struct ib_device *device,
+						     u8 port_num);
+	/* When calling get_netdev, the HW vendor's driver should return the
+	 * net device of device @device at port @port_num or NULL if such
+	 * a net device doesn't exist. The vendor driver should call dev_hold
+	 * on this net device. The HW vendor's device driver must guarantee
+	 * that this function returns NULL before the net device reaches
+	 * NETDEV_UNREGISTER_FINAL state.
+	 */
+	struct net_device	  *(*get_netdev)(struct ib_device *device,
+						 u8 port_num);
+	int		           (*query_gid)(struct ib_device *device,
+						u8 port_num, int index,
+						union ib_gid *gid);
+	/* When calling add_gid, the HW vendor's driver should
+	 * add the gid of device @device at gid ind

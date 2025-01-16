@@ -1,322 +1,338 @@
-/*
-    i2c-isch.c - Linux kernel driver for Intel SCH chipset SMBus
-    - Based on i2c-piix4.c
-    Copyright (c) 1998 - 2002 Frodo Looijaard <frodol@dds.nl> and
-    Philip Edelbrock <phil@netroedge.com>
-    - Intel SCH support
-    Copyright (c) 2007 - 2008 Jacob Jun Pan <jacob.jun.pan@intel.com>
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License version 2 as
-    published by the Free Software Foundation.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-*/
-
-/*
-   Supports:
-	Intel SCH chipsets (AF82US15W, AF82US15L, AF82UL11L)
-   Note: we assume there can only be one device, with one SMBus interface.
-*/
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/kernel.h>
-#include <linux/delay.h>
-#include <linux/stddef.h>
-#include <linux/ioport.h>
-#include <linux/i2c.h>
-#include <linux/io.h>
-#include <linux/acpi.h>
-
-/* SCH SMBus address offsets */
-#define SMBHSTCNT	(0 + sch_smba)
-#define SMBHSTSTS	(1 + sch_smba)
-#define SMBHSTCLK	(2 + sch_smba)
-#define SMBHSTADD	(4 + sch_smba) /* TSA */
-#define SMBHSTCMD	(5 + sch_smba)
-#define SMBHSTDAT0	(6 + sch_smba)
-#define SMBHSTDAT1	(7 + sch_smba)
-#define SMBBLKDAT	(0x20 + sch_smba)
-
-/* Other settings */
-#define MAX_RETRIES	5000
-
-/* I2C constants */
-#define SCH_QUICK		0x00
-#define SCH_BYTE		0x01
-#define SCH_BYTE_DATA		0x02
-#define SCH_WORD_DATA		0x03
-#define SCH_BLOCK_DATA		0x05
-
-static unsigned short sch_smba;
-static struct i2c_adapter sch_adapter;
-static int backbone_speed = 33000; /* backbone speed in kHz */
-module_param(backbone_speed, int, S_IRUSR | S_IWUSR);
-MODULE_PARM_DESC(backbone_speed, "Backbone speed in kHz, (default = 33000)");
-
-/*
- * Start the i2c transaction -- the i2c_access will prepare the transaction
- * and this function will execute it.
- * return 0 for success and others for failure.
- */
-static int sch_transaction(void)
+egrbufs(struct vm_area_struct *vma,
+			   struct qib_ctxtdata *rcd)
 {
-	int temp;
-	int result = 0;
-	int retries = 0;
+	struct qib_devdata *dd = rcd->dd;
+	unsigned long start, size;
+	size_t total_size, i;
+	unsigned long pfn;
+	int ret;
 
-	dev_dbg(&sch_adapter.dev, "Transaction (pre): CNT=%02x, CMD=%02x, "
-		"ADD=%02x, DAT0=%02x, DAT1=%02x\n", inb(SMBHSTCNT),
-		inb(SMBHSTCMD), inb(SMBHSTADD), inb(SMBHSTDAT0),
-		inb(SMBHSTDAT1));
-
-	/* Make sure the SMBus host is ready to start transmitting */
-	temp = inb(SMBHSTSTS) & 0x0f;
-	if (temp) {
-		/* Can not be busy since we checked it in sch_access */
-		if (temp & 0x01) {
-			dev_dbg(&sch_adapter.dev, "Completion (%02x). "
-				"Clear...\n", temp);
-		}
-		if (temp & 0x06) {
-			dev_dbg(&sch_adapter.dev, "SMBus error (%02x). "
-				"Resetting...\n", temp);
-		}
-		outb(temp, SMBHSTSTS);
-		temp = inb(SMBHSTSTS) & 0x0f;
-		if (temp) {
-			dev_err(&sch_adapter.dev,
-				"SMBus is not ready: (%02x)\n", temp);
-			return -EAGAIN;
-		}
+	size = rcd->rcvegrbuf_size;
+	total_size = rcd->rcvegrbuf_chunks * size;
+	if ((vma->vm_end - vma->vm_start) > total_size) {
+		qib_devinfo(dd->pcidev,
+			"FAIL on egr bufs: reqlen %lx > actual %lx\n",
+			 vma->vm_end - vma->vm_start,
+			 (unsigned long) total_size);
+		ret = -EINVAL;
+		goto bail;
 	}
 
-	/* start the transaction by setting bit 4 */
-	outb(inb(SMBHSTCNT) | 0x10, SMBHSTCNT);
-
-	do {
-		usleep_range(100, 200);
-		temp = inb(SMBHSTSTS) & 0x0f;
-	} while ((temp & 0x08) && (retries++ < MAX_RETRIES));
-
-	/* If the SMBus is still busy, we give up */
-	if (retries > MAX_RETRIES) {
-		dev_err(&sch_adapter.dev, "SMBus Timeout!\n");
-		result = -ETIMEDOUT;
+	if (vma->vm_flags & VM_WRITE) {
+		qib_devinfo(dd->pcidev,
+			"Can't map eager buffers as writable (flags=%lx)\n",
+			vma->vm_flags);
+		ret = -EPERM;
+		goto bail;
 	}
-	if (temp & 0x04) {
-		result = -EIO;
-		dev_dbg(&sch_adapter.dev, "Bus collision! SMBus may be "
-			"locked until next hard reset. (sorry!)\n");
-		/* Clock stops and slave is stuck in mid-transmission */
-	} else if (temp & 0x02) {
-		result = -EIO;
-		dev_err(&sch_adapter.dev, "Error: no response!\n");
-	} else if (temp & 0x01) {
-		dev_dbg(&sch_adapter.dev, "Post complete!\n");
-		outb(temp, SMBHSTSTS);
-		temp = inb(SMBHSTSTS) & 0x07;
-		if (temp & 0x06) {
-			/* Completion clear failed */
-			dev_dbg(&sch_adapter.dev, "Failed reset at end of "
-				"transaction (%02x), Bus error!\n", temp);
-		}
-	} else {
-		result = -ENXIO;
-		dev_dbg(&sch_adapter.dev, "No such address.\n");
+	/* don't allow them to later change to writeable with mprotect */
+	vma->vm_flags &= ~VM_MAYWRITE;
+
+	start = vma->vm_start;
+
+	for (i = 0; i < rcd->rcvegrbuf_chunks; i++, start += size) {
+		pfn = virt_to_phys(rcd->rcvegrbuf[i]) >> PAGE_SHIFT;
+		ret = remap_pfn_range(vma, start, pfn, size,
+				      vma->vm_page_prot);
+		if (ret < 0)
+			goto bail;
 	}
-	dev_dbg(&sch_adapter.dev, "Transaction (post): CNT=%02x, CMD=%02x, "
-		"ADD=%02x, DAT0=%02x, DAT1=%02x\n", inb(SMBHSTCNT),
-		inb(SMBHSTCMD), inb(SMBHSTADD), inb(SMBHSTDAT0),
-		inb(SMBHSTDAT1));
-	return result;
+	ret = 0;
+
+bail:
+	return ret;
 }
 
 /*
- * This is the main access entry for i2c-sch access
- * adap is i2c_adapter pointer, addr is the i2c device bus address, read_write
- * (0 for read and 1 for write), size is i2c transaction type and data is the
- * union of transaction for data to be transferred or data read from bus.
- * return 0 for success and others for failure.
+ * qib_file_vma_fault - handle a VMA page fault.
  */
-static s32 sch_access(struct i2c_adapter *adap, u16 addr,
-		 unsigned short flags, char read_write,
-		 u8 command, int size, union i2c_smbus_data *data)
+static int qib_file_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
-	int i, len, temp, rc;
+	struct page *page;
 
-	/* Make sure the SMBus host is not busy */
-	temp = inb(SMBHSTSTS) & 0x0f;
-	if (temp & 0x08) {
-		dev_dbg(&sch_adapter.dev, "SMBus busy (%02x)\n", temp);
-		return -EAGAIN;
-	}
-	temp = inw(SMBHSTCLK);
-	if (!temp) {
+	page = vmalloc_to_page((void *)(vmf->pgoff << PAGE_SHIFT));
+	if (!page)
+		return VM_FAULT_SIGBUS;
+
+	get_page(page);
+	vmf->page = page;
+
+	return 0;
+}
+
+static const struct vm_operations_struct qib_file_vm_ops = {
+	.fault = qib_file_vma_fault,
+};
+
+static int mmap_kvaddr(struct vm_area_struct *vma, u64 pgaddr,
+		       struct qib_ctxtdata *rcd, unsigned subctxt)
+{
+	struct qib_devdata *dd = rcd->dd;
+	unsigned subctxt_cnt;
+	unsigned long len;
+	void *addr;
+	size_t size;
+	int ret = 0;
+
+	subctxt_cnt = rcd->subctxt_cnt;
+	size = rcd->rcvegrbuf_chunks * rcd->rcvegrbuf_size;
+
+	/*
+	 * Each process has all the subctxt uregbase, rcvhdrq, and
+	 * rcvegrbufs mmapped - as an array for all the processes,
+	 * and also separately for this process.
+	 */
+	if (pgaddr == cvt_kvaddr(rcd->subctxt_uregbase)) {
+		addr = rcd->subctxt_uregbase;
+		size = PAGE_SIZE * subctxt_cnt;
+	} else if (pgaddr == cvt_kvaddr(rcd->subctxt_rcvhdr_base)) {
+		addr = rcd->subctxt_rcvhdr_base;
+		size = rcd->rcvhdrq_size * subctxt_cnt;
+	} else if (pgaddr == cvt_kvaddr(rcd->subctxt_rcvegrbuf)) {
+		addr = rcd->subctxt_rcvegrbuf;
+		size *= subctxt_cnt;
+	} else if (pgaddr == cvt_kvaddr(rcd->subctxt_uregbase +
+					PAGE_SIZE * subctxt)) {
+		addr = rcd->subctxt_uregbase + PAGE_SIZE * subctxt;
+		size = PAGE_SIZE;
+	} else if (pgaddr == cvt_kvaddr(rcd->subctxt_rcvhdr_base +
+					rcd->rcvhdrq_size * subctxt)) {
+		addr = rcd->subctxt_rcvhdr_base +
+			rcd->rcvhdrq_size * subctxt;
+		size = rcd->rcvhdrq_size;
+	} else if (pgaddr == cvt_kvaddr(&rcd->user_event_mask[subctxt])) {
+		addr = rcd->user_event_mask;
+		size = PAGE_SIZE;
+	} else if (pgaddr == cvt_kvaddr(rcd->subctxt_rcvegrbuf +
+					size * subctxt)) {
+		addr = rcd->subctxt_rcvegrbuf + size * subctxt;
+		/* rcvegrbufs are read-only on the slave */
+		if (vma->vm_flags & VM_WRITE) {
+			qib_devinfo(dd->pcidev,
+				 "Can't map eager buffers as writable (flags=%lx)\n",
+				 vma->vm_flags);
+			ret = -EPERM;
+			goto bail;
+		}
 		/*
-		 * We can't determine if we have 33 or 25 MHz clock for
-		 * SMBus, so expect 33 MHz and calculate a bus clock of
-		 * 100 kHz. If we actually run at 25 MHz the bus will be
-		 * run ~75 kHz instead which should do no harm.
+		 * Don't allow permission to later change to writeable
+		 * with mprotect.
 		 */
-		dev_notice(&sch_adapter.dev,
-			"Clock divider unitialized. Setting defaults\n");
-		outw(backbone_speed / (4 * 100), SMBHSTCLK);
+		vma->vm_flags &= ~VM_MAYWRITE;
+	} else
+		goto bail;
+	len = vma->vm_end - vma->vm_start;
+	if (len > size) {
+		ret = -EINVAL;
+		goto bail;
 	}
 
-	dev_dbg(&sch_adapter.dev, "access size: %d %s\n", size,
-		(read_write)?"READ":"WRITE");
-	switch (size) {
-	case I2C_SMBUS_QUICK:
-		outb((addr << 1) | read_write, SMBHSTADD);
-		size = SCH_QUICK;
-		break;
-	case I2C_SMBUS_BYTE:
-		outb((addr << 1) | read_write, SMBHSTADD);
-		if (read_write == I2C_SMBUS_WRITE)
-			outb(command, SMBHSTCMD);
-		size = SCH_BYTE;
-		break;
-	case I2C_SMBUS_BYTE_DATA:
-		outb((addr << 1) | read_write, SMBHSTADD);
-		outb(command, SMBHSTCMD);
-		if (read_write == I2C_SMBUS_WRITE)
-			outb(data->byte, SMBHSTDAT0);
-		size = SCH_BYTE_DATA;
-		break;
-	case I2C_SMBUS_WORD_DATA:
-		outb((addr << 1) | read_write, SMBHSTADD);
-		outb(command, SMBHSTCMD);
-		if (read_write == I2C_SMBUS_WRITE) {
-			outb(data->word & 0xff, SMBHSTDAT0);
-			outb((data->word & 0xff00) >> 8, SMBHSTDAT1);
-		}
-		size = SCH_WORD_DATA;
-		break;
-	case I2C_SMBUS_BLOCK_DATA:
-		outb((addr << 1) | read_write, SMBHSTADD);
-		outb(command, SMBHSTCMD);
-		if (read_write == I2C_SMBUS_WRITE) {
-			len = data->block[0];
-			if (len == 0 || len > I2C_SMBUS_BLOCK_MAX)
-				return -EINVAL;
-			outb(len, SMBHSTDAT0);
-			for (i = 1; i <= len; i++)
-				outb(data->block[i], SMBBLKDAT+i-1);
-		}
-		size = SCH_BLOCK_DATA;
-		break;
-	default:
-		dev_warn(&adap->dev, "Unsupported transaction %d\n", size);
-		return -EOPNOTSUPP;
-	}
-	dev_dbg(&sch_adapter.dev, "write size %d to 0x%04x\n", size, SMBHSTCNT);
-	outb((inb(SMBHSTCNT) & 0xb0) | (size & 0x7), SMBHSTCNT);
+	vma->vm_pgoff = (unsigned long) addr >> PAGE_SHIFT;
+	vma->vm_ops = &qib_file_vm_ops;
+	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+	ret = 1;
 
-	rc = sch_transaction();
-	if (rc)	/* Error in transaction */
-		return rc;
-
-	if ((read_write == I2C_SMBUS_WRITE) || (size == SCH_QUICK))
-		return 0;
-
-	switch (size) {
-	case SCH_BYTE:
-	case SCH_BYTE_DATA:
-		data->byte = inb(SMBHSTDAT0);
-		break;
-	case SCH_WORD_DATA:
-		data->word = inb(SMBHSTDAT0) + (inb(SMBHSTDAT1) << 8);
-		break;
-	case SCH_BLOCK_DATA:
-		data->block[0] = inb(SMBHSTDAT0);
-		if (data->block[0] == 0 || data->block[0] > I2C_SMBUS_BLOCK_MAX)
-			return -EPROTO;
-		for (i = 1; i <= data->block[0]; i++)
-			data->block[i] = inb(SMBBLKDAT+i-1);
-		break;
-	}
-	return 0;
+bail:
+	return ret;
 }
 
-static u32 sch_func(struct i2c_adapter *adapter)
+/**
+ * qib_mmapf - mmap various structures into user space
+ * @fp: the file pointer
+ * @vma: the VM area
+ *
+ * We use this to have a shared buffer between the kernel and the user code
+ * for the rcvhdr queue, egr buffers, and the per-context user regs and pio
+ * buffers in the chip.  We have the open and close entries so we can bump
+ * the ref count and keep the driver from being unloaded while still mapped.
+ */
+static int qib_mmapf(struct file *fp, struct vm_area_struct *vma)
 {
-	return I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
-	    I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA |
-	    I2C_FUNC_SMBUS_BLOCK_DATA;
+	struct qib_ctxtdata *rcd;
+	struct qib_devdata *dd;
+	u64 pgaddr, ureg;
+	unsigned piobufs, piocnt;
+	int ret, match = 1;
+
+	rcd = ctxt_fp(fp);
+	if (!rcd || !(vma->vm_flags & VM_SHARED)) {
+		ret = -EINVAL;
+		goto bail;
+	}
+	dd = rcd->dd;
+
+	/*
+	 * This is the qib_do_user_init() code, mapping the shared buffers
+	 * and per-context user registers into the user process. The address
+	 * referred to by vm_pgoff is the file offset passed via mmap().
+	 * For shared contexts, this is the kernel vmalloc() address of the
+	 * pages to share with the master.
+	 * For non-shared or master ctxts, this is a physical address.
+	 * We only do one mmap for each space mapped.
+	 */
+	pgaddr = vma->vm_pgoff << PAGE_SHIFT;
+
+	/*
+	 * Check for 0 in case one of the allocations failed, but user
+	 * called mmap anyway.
+	 */
+	if (!pgaddr)  {
+		ret = -EINVAL;
+		goto bail;
+	}
+
+	/*
+	 * Physical addresses must fit in 40 bits for our hardware.
+	 * Check for kernel virtual addresses first, anything else must
+	 * match a HW or memory address.
+	 */
+	ret = mmap_kvaddr(vma, pgaddr, rcd, subctxt_fp(fp));
+	if (ret) {
+		if (ret > 0)
+			ret = 0;
+		goto bail;
+	}
+
+	ureg = dd->uregbase + dd->ureg_align * rcd->ctxt;
+	if (!rcd->subctxt_cnt) {
+		/* ctxt is not shared */
+		piocnt = rcd->piocnt;
+		piobufs = rcd->piobufs;
+	} else if (!subctxt_fp(fp)) {
+		/* caller is the master */
+		piocnt = (rcd->piocnt / rcd->subctxt_cnt) +
+			 (rcd->piocnt % rcd->subctxt_cnt);
+		piobufs = rcd->piobufs +
+			dd->palign * (rcd->piocnt - piocnt);
+	} else {
+		unsigned slave = subctxt_fp(fp) - 1;
+
+		/* caller is a slave */
+		piocnt = rcd->piocnt / rcd->subctxt_cnt;
+		piobufs = rcd->piobufs + dd->palign * piocnt * slave;
+	}
+
+	if (pgaddr == ureg)
+		ret = mmap_ureg(vma, dd, ureg);
+	else if (pgaddr == piobufs)
+		ret = mmap_piobufs(vma, dd, rcd, piobufs, piocnt);
+	else if (pgaddr == dd->pioavailregs_phys)
+		/* in-memory copy of pioavail registers */
+		ret = qib_mmap_mem(vma, rcd, PAGE_SIZE,
+				   (void *) dd->pioavailregs_dma, 0,
+				   "pioavail registers");
+	else if (pgaddr == rcd->rcvegr_phys)
+		ret = mmap_rcvegrbufs(vma, rcd);
+	else if (pgaddr == (u64) rcd->rcvhdrq_phys)
+		/*
+		 * The rcvhdrq itself; multiple pages, contiguous
+		 * from an i/o perspective.  Shared contexts need
+		 * to map r/w, so we allow writing.
+		 */
+		ret = qib_mmap_mem(vma, rcd, rcd->rcvhdrq_size,
+				   rcd->rcvhdrq, 1, "rcvhdrq");
+	else if (pgaddr == (u64) rcd->rcvhdrqtailaddr_phys)
+		/* in-memory copy of rcvhdrq tail register */
+		ret = qib_mmap_mem(vma, rcd, PAGE_SIZE,
+				   rcd->rcvhdrtail_kvaddr, 0,
+				   "rcvhdrq tail");
+	else
+		match = 0;
+	if (!match)
+		ret = -EINVAL;
+
+	vma->vm_private_data = NULL;
+
+	if (ret < 0)
+		qib_devinfo(dd->pcidev,
+			 "mmap Failure %d: off %llx len %lx\n",
+			 -ret, (unsigned long long)pgaddr,
+			 vma->vm_end - vma->vm_start);
+bail:
+	return ret;
 }
 
-static const struct i2c_algorithm smbus_algorithm = {
-	.smbus_xfer	= sch_access,
-	.functionality	= sch_func,
-};
-
-static struct i2c_adapter sch_adapter = {
-	.owner		= THIS_MODULE,
-	.class		= I2C_CLASS_HWMON | I2C_CLASS_SPD,
-	.algo		= &smbus_algorithm,
-};
-
-static int smbus_sch_probe(struct platform_device *dev)
+static unsigned int qib_poll_urgent(struct qib_ctxtdata *rcd,
+				    struct file *fp,
+				    struct poll_table_struct *pt)
 {
-	struct resource *res;
-	int retval;
+	struct qib_devdata *dd = rcd->dd;
+	unsigned pollflag;
 
-	res = platform_get_resource(dev, IORESOURCE_IO, 0);
-	if (!res)
-		return -EBUSY;
+	poll_wait(fp, &rcd->wait, pt);
 
-	if (!devm_request_region(&dev->dev, res->start, resource_size(res),
-				 dev->name)) {
-		dev_err(&dev->dev, "SMBus region 0x%x already in use!\n",
-			sch_smba);
-		return -EBUSY;
+	spin_lock_irq(&dd->uctxt_lock);
+	if (rcd->urgent != rcd->urgent_poll) {
+		pollflag = POLLIN | POLLRDNORM;
+		rcd->urgent_poll = rcd->urgent;
+	} else {
+		pollflag = 0;
+		set_bit(QIB_CTXT_WAITING_URG, &rcd->flag);
 	}
+	spin_unlock_irq(&dd->uctxt_lock);
 
-	sch_smba = res->start;
-
-	dev_dbg(&dev->dev, "SMBA = 0x%X\n", sch_smba);
-
-	/* set up the sysfs linkage to our parent device */
-	sch_adapter.dev.parent = &dev->dev;
-
-	snprintf(sch_adapter.name, sizeof(sch_adapter.name),
-		"SMBus SCH adapter at %04x", sch_smba);
-
-	retval = i2c_add_adapter(&sch_adapter);
-	if (retval) {
-		dev_err(&dev->dev, "Couldn't register adapter!\n");
-		sch_smba = 0;
-	}
-
-	return retval;
+	return pollflag;
 }
 
-static int smbus_sch_remove(struct platform_device *pdev)
+static unsigned int qib_poll_next(struct qib_ctxtdata *rcd,
+				  struct file *fp,
+				  struct poll_table_struct *pt)
 {
-	if (sch_smba) {
-		i2c_del_adapter(&sch_adapter);
-		sch_smba = 0;
-	}
+	struct qib_devdata *dd = rcd->dd;
+	unsigned pollflag;
 
-	return 0;
+	poll_wait(fp, &rcd->wait, pt);
+
+	spin_lock_irq(&dd->uctxt_lock);
+	if (dd->f_hdrqempty(rcd)) {
+		set_bit(QIB_CTXT_WAITING_RCV, &rcd->flag);
+		dd->f_rcvctrl(rcd->ppd, QIB_RCVCTRL_INTRAVAIL_ENB, rcd->ctxt);
+		pollflag = 0;
+	} else
+		pollflag = POLLIN | POLLRDNORM;
+	spin_unlock_irq(&dd->uctxt_lock);
+
+	return pollflag;
 }
 
-static struct platform_driver smbus_sch_driver = {
-	.driver = {
-		.name = "isch_smbus",
-	},
-	.probe		= smbus_sch_probe,
-	.remove		= smbus_sch_remove,
-};
+static unsigned int qib_poll(struct file *fp, struct poll_table_struct *pt)
+{
+	struct qib_ctxtdata *rcd;
+	unsigned pollflag;
 
-module_platform_driver(smbus_sch_driver);
+	rcd = ctxt_fp(fp);
+	if (!rcd)
+		pollflag = POLLERR;
+	else if (rcd->poll_type == QIB_POLL_TYPE_URGENT)
+		pollflag = qib_poll_urgent(rcd, fp, pt);
+	else  if (rcd->poll_type == QIB_POLL_TYPE_ANYRCV)
+		pollflag = qib_poll_next(rcd, fp, pt);
+	else /* invalid */
+		pollflag = POLLERR;
 
-MODULE_AUTHOR("Jacob Pan <jacob.jun.pan@intel.com>");
-MODULE_DESCRIPTION("Intel SCH SMBus driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:isch_smbus");
+	return pollflag;
+}
+
+static void assign_ctxt_affinity(struct file *fp, struct qib_devdata *dd)
+{
+	struct qib_filedata *fd = fp->private_data;
+	const unsigned int weight = cpumask_weight(&current->cpus_allowed);
+	const struct cpumask *local_mask = cpumask_of_pcibus(dd->pcidev->bus);
+	int local_cpu;
+
+	/*
+	 * If process has NOT already set it's affinity, select and
+	 * reserve a processor for it on the local NUMA node.
+	 */
+	if ((weight >= qib_cpulist_count) &&
+		(cpumask_weight(local_mask) <= qib_cpulist_count)) {
+		for_each_cpu(local_cpu, local_mask)
+			if (!test_and_set_bit(local_cpu, qib_cpulist)) {
+				fd->rec_cpu_num = local_cpu;
+				return;
+			}
+	}
+
+	/*
+	 * If process has NOT already set it's affinity, select and
+	 * reserve a

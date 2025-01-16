@@ -1,822 +1,405 @@
-/*
- * muic_ccic.c
- *
- * Copyright (C) 2014 Samsung Electronics
- * Thomas Ryu <smilesr.ryu@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
- */
-
-#include <linux/gpio.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/slab.h>
-#include <linux/platform_device.h>
-#include <linux/module.h>
-#include <linux/delay.h>
-#include <linux/host_notify.h>
-#include <linux/string.h>
-#if defined (CONFIG_OF)
-#include <linux/of_device.h>
-#include <linux/of_gpio.h>
-#endif
-
-#include <linux/muic/muic.h>
-#if defined(CONFIG_MUIC_NOTIFIER)
-#include <linux/muic/muic_notifier.h>
-#endif
-#include "muic-internal.h"
-#include "muic_apis.h"
-#include "muic_debug.h"
-#include "muic_regmap.h"
-#include "muic_vps.h"
-
-#if defined(CONFIG_MUIC_SUPPORT_CCIC)
-#include <linux/ccic/ccic_notifier.h>
-#include <linux/ccic/s2mm005.h>
-#endif
-#if defined(CONFIG_USB_TYPEC_MANAGER_NOTIFIER)
-#include <linux/usb/manager/usb_typec_manager_notifier.h>
-#endif
-
-#if defined(CONFIG_MUIC_UNIVERSAL_MAX77854)
-#include "muic_hv.h"
-#include "muic_hv_max77854.h"
-#elif defined(CONFIG_MUIC_UNIVERSAL_MAX77865)
-#include "muic_hv.h"
-#include "muic_hv_max77865.h"
-#endif
-
-#define MUIC_CCIC_NOTI_ATTACH (1)
-#define MUIC_CCIC_NOTI_DETACH (-1)
-#define MUIC_CCIC_NOTI_UNDEFINED (0)
-
-struct mdev_rid_desc_t {
-	int mdev;
-};
-
-static struct mdev_desc_t {
-	int ccic_evt_attached; /* 1: attached, -1: detached, 0: undefined */
-	int ccic_evt_rid; /* the last rid */
-	int ccic_evt_rprd; /*rprd */
-	int ccic_evt_roleswap; /* check rprd role swap event */
-	int ccic_evt_dcdcnt; /* count dcd timeout */
-
-	int mdev; /* attached dev */
-}mdev_desc;
-
-static struct mdev_rid_desc_t mdev_rid_tbl[] = {
-	[RID_UNDEFINED] = {ATTACHED_DEV_NONE_MUIC},
-	[RID_000K] = {ATTACHED_DEV_OTG_MUIC},
-	[RID_001K] = {ATTACHED_DEV_MHL_MUIC},
-	[RID_255K] = {ATTACHED_DEV_JIG_USB_OFF_MUIC},
-	[RID_301K] = {ATTACHED_DEV_JIG_USB_ON_MUIC},
-	[RID_523K] = {ATTACHED_DEV_JIG_UART_OFF_MUIC},
-	[RID_619K] = {ATTACHED_DEV_JIG_UART_ON_MUIC},
-	[RID_OPEN] = {ATTACHED_DEV_NONE_MUIC},
-};
-
-int muic_is_ccic_supported_jig(muic_data_t *pmuic, muic_attached_dev_t mdev)
-{
-	switch (mdev) {
-	/* JIG */
-	case ATTACHED_DEV_JIG_UART_OFF_MUIC:
-	case ATTACHED_DEV_JIG_UART_OFF_VB_MUIC:
-	case ATTACHED_DEV_JIG_UART_OFF_VB_FG_MUIC:
-		pr_info("%s: Supported JIG(%d).\n", __func__, mdev);
-		return 1;
-	default:
-		pr_info("%s: mdev:%d Unsupported.\n", __func__, mdev);
-	}
-
-	return 0;
-}
-
-int muic_is_ccic_supported_dev(muic_data_t *pmuic, muic_attached_dev_t new_dev)
-{
-	switch (new_dev) {
-	/* Legacy TA/USB. Noti. will be sent when ATTACH is received from CCIC. */
-	case ATTACHED_DEV_USB_MUIC:
-	case ATTACHED_DEV_CDP_MUIC:
-	case ATTACHED_DEV_TA_MUIC:
-	case ATTACHED_DEV_TIMEOUT_OPEN_MUIC:
-		return 1;
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-static bool mdev_is_supported(int mdev)
-{
-	switch (mdev) {
-	case ATTACHED_DEV_USB_MUIC:
-	case ATTACHED_DEV_CDP_MUIC:
-	case ATTACHED_DEV_TA_MUIC:
-	case ATTACHED_DEV_JIG_UART_OFF_MUIC:
-	case ATTACHED_DEV_JIG_UART_OFF_VB_MUIC:
-	case ATTACHED_DEV_JIG_UART_ON_MUIC:
-	case ATTACHED_DEV_JIG_UART_ON_VB_MUIC:
-	case ATTACHED_DEV_JIG_USB_OFF_MUIC:
-	case ATTACHED_DEV_JIG_USB_ON_MUIC:
-	case ATTACHED_DEV_OTG_MUIC:
-	case ATTACHED_DEV_AFC_CHARGER_5V_MUIC:
-	case ATTACHED_DEV_AFC_CHARGER_9V_MUIC:
-#if defined(CONFIG_MUIC_HV_12V)
-	case ATTACHED_DEV_AFC_CHARGER_12V_MUIC:
-#endif
-	case ATTACHED_DEV_QC_CHARGER_5V_MUIC:
-	case ATTACHED_DEV_QC_CHARGER_9V_MUIC:
-		return true;
-	default:
-		break;
-	}
-
-	return false;
-}
-
-static int mdev_com_to(muic_data_t *pmuic, int path)
-{
-#if defined(CONFIG_MUIC_HV_MAX77854) || defined(CONFIG_MUIC_HV_MAX77865)
-	hv_clear_hvcontrol(pmuic->phv);
-#endif
-	switch (path) {
-	case MUIC_PATH_OPEN:
-		com_to_open_with_vbus(pmuic);
-		break;
-
-	case MUIC_PATH_USB_AP:
-	case MUIC_PATH_USB_CP:
-		switch_to_ap_usb(pmuic);
-		break;
-	case MUIC_PATH_UART_AP:
-	case MUIC_PATH_UART_CP:
-		if (pmuic->pdata->uart_path == MUIC_PATH_UART_AP)
-			switch_to_ap_uart(pmuic);
-		else
-			switch_to_cp_uart(pmuic);
-		break;
-
-	default:
-		pr_err("%s:A wrong com path!\n", __func__);
-		return -1;
-	}
-
-	return 0;
-}
-
-static int mdev_get_vbus(muic_data_t *pmuic)
-{
-	return pmuic->vps.t.vbvolt;
-}
-
-int mdev_noti_attached(int mdev)
-{
-	muic_notifier_attach_attached_dev(mdev);
-	return 0;
-}
-
-int mdev_noti_detached(int mdev)
-{
-	muic_notifier_detach_attached_dev(mdev);
-	return 0;
-}
-
-static void mdev_handle_ccic_detach(muic_data_t *pmuic)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-	struct vendor_ops *pvendor = pmuic->regmapdesc->vendorops;
-
-#if defined(CONFIG_MUIC_HV_MAX77854) || defined(CONFIG_MUIC_HV_MAX77865)
-	hv_do_detach(pmuic->phv);
-#endif
-	pmuic->is_ccic_attach = false;
-	pmuic->is_ccic_afc_enable = 0;
-	pmuic->is_ccic_rp56_enable = false;
-
-	if (pdesc->ccic_evt_rprd) {
-		if (pvendor && pvendor->enable_chgdet)
-			pvendor->enable_chgdet(pmuic->regmapdesc, 1);
-	}
-	mdev_com_to(pmuic, MUIC_PATH_OPEN);
-	if (mdev_is_supported(pdesc->mdev))
-		mdev_noti_detached(pdesc->mdev);
-	else if (pmuic->legacy_dev != ATTACHED_DEV_NONE_MUIC)
-		mdev_noti_detached(pmuic->legacy_dev);
-
-	if (pmuic->pdata->jig_uart_cb)
-		pmuic->pdata->jig_uart_cb(0);
-
-	/* Reset status & flags */
-	pdesc->mdev = 0;
-	pdesc->ccic_evt_rid = 0;
-	pdesc->ccic_evt_rprd = 0;
-	pdesc->ccic_evt_roleswap = 0;
-	pdesc->ccic_evt_dcdcnt = 0;
-	pdesc->ccic_evt_attached = MUIC_CCIC_NOTI_UNDEFINED;
-
-	pmuic->legacy_dev = 0;
-	pmuic->attached_dev = 0;
-#if defined(CONFIG_MUIC_HV_MAX77854) || defined(CONFIG_MUIC_HV_MAX77865)
-	pmuic->phv->attached_dev = 0;
-#endif
-#if defined(CONFIG_MUIC_TEST_FUNC)
-	pmuic->usb_to_ta_state = false;
-#endif
-	pmuic->is_dcdtmr_intr = false;
-
-	return;
-}
-
-static int mdev_handle_factory_jig(muic_data_t *pmuic, int rid, int vbus);
-
-int mdev_continue_for_TA_USB(muic_data_t *pmuic, int mdev)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-	struct vendor_ops *pvendor = pmuic->regmapdesc->vendorops;
-	int i;
-	int vbus = mdev_get_vbus(pmuic);
-
-	/* For Incomplete insertion case */
-	if (pdesc->ccic_evt_attached == MUIC_CCIC_NOTI_ATTACH &&
-			pmuic->is_dcdtmr_intr && vbus && pdesc->ccic_evt_dcdcnt < 1) {
-		pmuic->is_dcdtmr_intr = false;
-		/* W/A for DEX detected late case */
-		if (pdesc->ccic_evt_rprd) {
-			pr_info("%s: Dex connected. Set path and dev type to USB\n", __func__);
-			pdesc->mdev = ATTACHED_DEV_USB_MUIC;
-			mdev_com_to(pmuic, MUIC_PATH_USB_AP);
-			mdev_noti_attached(pdesc->mdev);
-		} else {
-			pr_info("%s: Incomplete insertion. Do chgdet again\n", __func__);
-			pdesc->ccic_evt_dcdcnt++;
-			if (pvendor && pvendor->run_chgdet)
-				pvendor->run_chgdet(pmuic->regmapdesc, 1);
-		}
-		return 0;
-	}
-	if (vbus == 0) {
-		pdesc->ccic_evt_dcdcnt = 0;
-		pmuic->is_dcdtmr_intr = false;
-	}
-
-	if (!muic_is_ccic_supported_dev(pmuic, mdev)) {
-		pr_info("%s:%s: NOT supported(%d).\n", __func__, MUIC_DEV_NAME, mdev);
-
-		if (pdesc->ccic_evt_attached == MUIC_CCIC_NOTI_DETACH) {
-			pr_info("%s:%s: detach event is occurred\n", __func__, MUIC_DEV_NAME);
-			mdev_handle_ccic_detach(pmuic);
-			return 0;
-		}
-		if (pdesc->ccic_evt_rprd && vbus) {
-			pr_info("%s:%s:RPRD detected. set path to USB\n",
-					__func__, MUIC_DEV_NAME);
-			mdev_com_to(pmuic, MUIC_PATH_USB_AP);
-		}
-		if (pdesc->ccic_evt_rid == 0) {
-			pr_info("%s:%s: No rid\n", __func__, MUIC_DEV_NAME);
-			return 0;
-		}
-	}
-
-	/* Some delays for CCIC's Noti. When VBUS comes in to MUIC */
-	for (i = 0; i < 4; i++) {
-		pr_info("%s:%s: Checking RID (%dth)....\n",
-				MUIC_DEV_NAME,__func__, i + 1);
-
-		/* Do not continue if this is an RID */
-		if (pdesc->ccic_evt_rid || pdesc->ccic_evt_rprd) {
-			pr_info("%s:%s: Not a TA or USB -> discarded.\n",
-					MUIC_DEV_NAME,__func__);
-			if (pdesc->ccic_evt_rid) {
-				vbus = mdev_get_vbus(pmuic);
-				mdev_handle_factory_jig(pmuic, pdesc->ccic_evt_rid, vbus);
-			}
-			pmuic->legacy_dev = 0;
-
-			return 0;
-		}
-
-		msleep(50);
-	}
-
-	pmuic->legacy_dev = mdev;
-	pr_info("%s:%s: A legacy TA or USB updated(%d).\n",
-				MUIC_DEV_NAME,__func__, mdev);
-
-	return 1;
-}
-
-void muic_set_legacy_dev(muic_data_t *pmuic, int new_dev)
-{
-	pr_info("%s:%s: %d->%d\n", MUIC_DEV_NAME, __func__, pmuic->legacy_dev, new_dev);
-
-	pmuic->legacy_dev = new_dev;
-}
-
-static void mdev_show_status(muic_data_t *pmuic)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-
-	pr_info("%s: mdev:%d rid:%d rprd:%d attached:%d legacy_dev:%d\n", __func__,
-			pdesc->mdev, pdesc->ccic_evt_rid, pdesc->ccic_evt_rprd,
-			pdesc->ccic_evt_attached, pmuic->legacy_dev);
-}
-
-/* Get the charger type from muic interrupt or by reading the register directly */
-static int muic_get_chgtyp_to_mdev(muic_data_t *pmuic)
-{
-	return pmuic->legacy_dev;
-}
-
-int muic_get_current_legacy_dev(muic_data_t *pmuic)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-
-	pr_info("%s: mdev:%d legacy_dev:%d cable_type:%d\n",
-			__func__, pdesc->mdev, pmuic->legacy_dev, pmuic->is_ccic_afc_enable);
-
-	if (pdesc->mdev)
-		return pdesc->mdev;
-	else if (pmuic->legacy_dev)
-		return pmuic->legacy_dev;
-
-	return 0;
-}
-
-static int mdev_handle_legacy_TA_USB(muic_data_t *pmuic)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-	int mdev = 0;
-
-	pr_info("%s: vbvolt:%d legacy_dev:%d\n", __func__,
-			pmuic->vps.t.vbvolt, pmuic->legacy_dev);
-
-	/* 1. Run a charger detection algorithm manually if necessary. */
-	msleep(200);
-
-	/* 2. Get the result by polling or via an interrupt */
-	mdev = muic_get_chgtyp_to_mdev(pmuic);
-	pr_info("%s: detected legacy_dev=%d\n", __func__, mdev);
-
-	/* 3. Noti. if supported. */
-	if (!muic_is_ccic_supported_dev(pmuic, mdev)) {
-		pr_info("%s: Unsupported legacy_dev=%d\n", __func__, mdev);
-		return 0;
-	}
-
-	if (mdev_is_supported(pdesc->mdev)) {
-		mdev_noti_detached(pdesc->mdev);
-		pdesc->mdev = 0;
-	}
-	else if (pmuic->legacy_dev != ATTACHED_DEV_NONE_MUIC) {
-		mdev_noti_detached(pmuic->legacy_dev);
-		pmuic->legacy_dev = 0;
-	}
-
-	pdesc->mdev = mdev;
-	mdev_noti_attached(mdev);
-
-	return 0;
-}
-
-
-void init_mdev_desc(muic_data_t *pmuic)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-
-	pr_info("%s\n", __func__);
-	pdesc->mdev = 0;
-	pdesc->ccic_evt_rid = 0;
-	pdesc->ccic_evt_rprd = 0;
-	pdesc->ccic_evt_roleswap = 0;
-	pdesc->ccic_evt_dcdcnt = 0;
-	pdesc->ccic_evt_attached = MUIC_CCIC_NOTI_UNDEFINED;
-}
-
-
-static int rid_to_mdev_with_vbus(muic_data_t *pmuic, int rid, int vbus)
-{
-	int mdev = 0;
-
-	if (rid < 0 || rid >  RID_OPEN) {
-		pr_err("%s:Out of RID range: %d\n", __func__, rid);
-		return 0;
-	}
-
-	if ((rid == RID_619K) && vbus)
-		mdev = ATTACHED_DEV_JIG_UART_ON_VB_MUIC;
-	else
-		mdev = mdev_rid_tbl[rid].mdev;
-
-	return mdev;
-}
-
-static bool mdev_is_valid_RID_OPEN(muic_data_t *pmuic, int vbus)
-{
-	int i, retry = 5;
-
-	if (vbus)
-		return true;
-
-	for (i = 0; i < retry; i++) {
-		pr_info("%s: %dth ...\n", __func__, i);
-		msleep(10);
-		if (mdev_get_vbus(pmuic))
-			return 1;
-	}
-
-	return 0;
-}
-
-static int muic_handle_ccic_ATTACH(muic_data_t *pmuic, CC_NOTI_ATTACH_TYPEDEF *pnoti)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-	int vbus = mdev_get_vbus(pmuic);
-	struct vendor_ops *pvendor = pmuic->regmapdesc->vendorops;
-	int prev_status = pdesc->ccic_evt_attached;
-
-	pr_info("%s: src:%d dest:%d id:%d attach:%d cable_type:%d rprd:%d\n", __func__,
-		pnoti->src, pnoti->dest, pnoti->id, pnoti->attach, pnoti->cable_type, pnoti->rprd);
-
-	pdesc->ccic_evt_attached = pnoti->attach ?
-		MUIC_CCIC_NOTI_ATTACH : MUIC_CCIC_NOTI_DETACH;
-
-	/* Attached */
-	if (pdesc->ccic_evt_attached == MUIC_CCIC_NOTI_ATTACH) {
-		pr_info("%s: Attach\n", __func__);
-		pmuic->is_ccic_attach = true;
-		pmuic->is_ccic_afc_enable = pnoti->cable_type;
-#if !defined(CONFIG_SEC_FACTORY)
-		switch (pnoti->cable_type) {
-		case Rp_56K:
-			if (!pmuic->is_ccic_rp56_enable) {
-				switch (pmuic->attached_dev) {
-				case ATTACHED_DEV_AFC_CHARGER_5V_MUIC:
-#if defined(CONFIG_MUIC_HV_12V)
-					pr_info("%s: 12V HV Charging Start!\n", __func__);
-					pmuic->phv->tx_data = MUIC_HV_12V;
-#else
-					pr_info("%s: 9V HV Charging Start!\n", __func__);
-					pmuic->phv->tx_data = MUIC_HV_9V;
-#endif
-					max77865_hv_muic_connect_start(pmuic->phv);
-					break;
-				default:
-					break;
-				}
-				pmuic->is_ccic_rp56_enable = true;
-			}
-			break;
-		case Rp_Abnormal:
-			// Chgtype re-detect for AFC detach -> TA attach
-			switch (pmuic->attached_dev) {
-			case ATTACHED_DEV_AFC_CHARGER_5V_MUIC:
-			case ATTACHED_DEV_AFC_CHARGER_9V_MUIC:
-			case ATTACHED_DEV_QC_CHARGER_5V_MUIC:
-			case ATTACHED_DEV_QC_CHARGER_9V_MUIC:
-				pr_info("%s: CC or SBU short. Chgdet Re-run.\n", __func__);
-				hv_muic_chgdet_ready(pmuic->phv);
-				if (pvendor && pvendor->run_chgdet)
-					pvendor->run_chgdet(pmuic->regmapdesc, 1);
-				break;
-			default:
-				break;
-			}
-		default:
-			break;
-		}
-#endif
-
-		if (pdesc->ccic_evt_roleswap) {
-			pr_info("%s: roleswap event, attach USB\n", __func__);
-			pdesc->ccic_evt_roleswap = 0;
-			if (mdev_get_vbus(pmuic)) {
-				pdesc->mdev = ATTACHED_DEV_USB_MUIC;
-				mdev_noti_attached(pdesc->mdev);
-			}
-			return 0;
-		}
-
-		if (pnoti->rprd) {
-			pr_info("%s: RPRD\n", __func__);
-			pdesc->ccic_evt_rprd = 1;
-			if (pvendor && pvendor->enable_chgdet)
-				pvendor->enable_chgdet(pmuic->regmapdesc, 0);
-			pdesc->mdev = ATTACHED_DEV_OTG_MUIC;
-			mdev_com_to(pmuic, MUIC_PATH_USB_AP);
-			mdev_noti_attached(pdesc->mdev);
-			return 0;
-		}
-
-		if (mdev_is_valid_RID_OPEN(pmuic, vbus))
-			pr_info("%s: Valid VBUS-> handled in irq handler\n", __func__);
-		else
-			pr_info("%s: No VBUS-> doing nothing.\n", __func__);
-
-		/* CCIC ATTACH means NO WATER */
-		if (pmuic->afc_water_disable) {
-			pr_info("%s: Water is not detected, AFC Enable\n", __func__);
-			if (pvendor && pvendor->enable_chgdet)
-				pvendor->enable_chgdet(pmuic->regmapdesc, 1);
-			pmuic->afc_water_disable = false;
-			pmuic->is_hiccup_mode = false;
-		}
-
-#if !defined(CONFIG_SEC_FACTORY)
-		/* For dry case after water */
-		if (pmuic->attached_dev == ATTACHED_DEV_TA_MUIC) {
-#if defined(CONFIG_MUIC_HV_MAX77854) || defined(CONFIG_MUIC_HV_MAX77865)
-			if (pmuic->pdata->afc_disable)
-				pr_info("%s:%s AFC Disable(%d) by USER!\n", MUIC_DEV_NAME,
-					__func__, pmuic->pdata->afc_disable);
-			else if ((pmuic->phv->is_afc_muic_ready == false) &&
-					vps_is_hv_ta(&pmuic->vps)) {
-				if (pmuic->is_ccic_afc_enable == Rp_56K) {
-					pmuic->phv->is_afc_muic_prepare = true;
-#if defined(CONFIG_MUIC_HV_MAX77854)
-					max77854_muic_prepare_afc_charger(pmuic->phv);
-#elif defined(CONFIG_MUIC_HV_MAX77865)
-					max77865_muic_prepare_afc_charger(pmuic->phv);
-#endif
-				}
-			}
-#endif
-		}
-#endif
-
-		/* W/A for Incomplete insertion case */
-		pdesc->ccic_evt_dcdcnt = 0;
-		if (prev_status != MUIC_CCIC_NOTI_ATTACH &&
-				pmuic->is_dcdtmr_intr && vbus) {
-			if (pmuic->vps.t.chgdetrun) {
-				pr_info("%s: Incomplete insertion. Chgdet runnung\n", __func__);
-				return 0;
-			}
-			pr_info("%s: Incomplete insertion. Do chgdet again\n", __func__);
-			pmuic->is_dcdtmr_intr = false;
-			if (pvendor && pvendor->run_chgdet)
-				pvendor->run_chgdet(pmuic->regmapdesc, 1);
-		}
-
-	} else {
-		if (pnoti->rprd) {
-			/* Role swap detach: attached=0, rprd=1 */
-			pr_info("%s: role swap event\n", __func__);
-			pdesc->ccic_evt_roleswap = 1;
-		} else if (vbus) {
-			pr_info("%s: Valid VBUS, return\n", __func__);
-		} else {
-			/* Detached */
-			mdev_handle_ccic_detach(pmuic);
-		}
-	}
-
-	return 0;
-}
-
-static int mdev_handle_factory_jig(muic_data_t *pmuic, int rid, int vbus)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-	int mdev = 0;
-
-	pr_info("%s: rid:%d vbus:%d\n", __func__, rid, vbus);
-
-	switch (rid) {
-	case RID_255K:
-	case RID_301K:
-		if (pmuic->pdata->jig_uart_cb)
-			pmuic->pdata->jig_uart_cb(1);
-		mdev_com_to(pmuic, MUIC_PATH_USB_AP);
-		break;
-	case RID_523K:
-	case RID_619K:
-		if (pmuic->pdata->jig_uart_cb)
-			pmuic->pdata->jig_uart_cb(1);
-		mdev_com_to(pmuic, MUIC_PATH_UART_AP);
-		break;
-	default:
-		pr_info("%s: Unsupported rid\n", __func__);
-		return 0;
-	}
-
-	mdev = rid_to_mdev_with_vbus(pmuic, rid, vbus);
-
-	if (mdev != pdesc->mdev) {
-		if (mdev_is_supported(pdesc->mdev)) {
-			mdev_noti_detached(pdesc->mdev);
-			pdesc->mdev = 0;
-		}
-		else if (pmuic->legacy_dev != ATTACHED_DEV_NONE_MUIC) {
-			mdev_noti_detached(pmuic->legacy_dev);
-			pmuic->legacy_dev = 0;
-		}
-
-		pdesc->mdev = mdev;
-		mdev_noti_attached(mdev);
-	}
-
-	return 0;
-}
-
-static int muic_handle_ccic_RID(muic_data_t *pmuic, CC_NOTI_RID_TYPEDEF *pnoti)
-{
-	struct mdev_desc_t *pdesc = &mdev_desc;
-	int rid, vbus;
-
-	pr_info("%s: src:%d dest:%d id:%d rid:%d sub2:%d sub3:%d\n", __func__,
-		pnoti->src, pnoti->dest, pnoti->id, pnoti->rid, pnoti->sub2, pnoti->sub3);
-
-	rid = pnoti->rid;
-
-	if (rid > RID_OPEN) {
-		pr_info("%s: Out of range of RID\n", __func__);
-		return 0;
-	}
-
-	if (pdesc->ccic_evt_attached != MUIC_CCIC_NOTI_ATTACH) {
-		pr_info("%s: RID but No ATTACH->discarded\n", __func__);
-		return 0;
-	}
-
-	pdesc->ccic_evt_rid = rid;
-	pmuic->rid = rid;
-
-	switch (rid) {
-	case RID_000K:
-		pr_info("%s: OTG -> RID000K\n", __func__);
-		mdev_com_to(pmuic, MUIC_PATH_USB_AP);
-		vbus = mdev_get_vbus(pmuic);
-		pdesc->mdev = rid_to_mdev_with_vbus(pmuic, rid, vbus);
-		return 0;
-	case RID_001K:
-		pr_info("%s: MHL -> discarded.\n", __func__);
-		return 0;
-	case RID_255K:
-	case RID_301K:
-	case RID_523K:
-	case RID_619K:
-		vbus = mdev_get_vbus(pmuic);
-		mdev_handle_factory_jig(pmuic, rid, vbus);
-		break;
-	case RID_OPEN:
-	case RID_UNDEFINED:
-		vbus = mdev_get_vbus(pmuic);
-		if (pdesc->ccic_evt_attached == MUIC_CCIC_NOTI_ATTACH &&
-				mdev_is_valid_RID_OPEN(pmuic, vbus)) {
-			if (pmuic->pdata->jig_uart_cb)
-				pmuic->pdata->jig_uart_cb(0);
-			/*
-			 * USB team's requirement.
-			 * Set AP USB for enumerations.
-			 */
-			mdev_com_to(pmuic, MUIC_PATH_USB_AP);
-
-			mdev_handle_legacy_TA_USB(pmuic);
-		} else {
-			/* RID OPEN + No VBUS = Assume detach */
-			mdev_handle_ccic_detach(pmuic);
-		}
-		break;
-	default:
-		pr_err("%s:Undefined RID\n", __func__);
-		return 0;
-	}
-
-	return 0;
-}
-
-static int muic_handle_ccic_WATER(muic_data_t *pmuic, CC_NOTI_ATTACH_TYPEDEF *pnoti)
-{
-	struct vendor_ops *pvendor = pmuic->regmapdesc->vendorops;
-
-	pr_info("%s: src:%d dest:%d id:%d attach:%d cable_type:%d rprd:%d\n", __func__,
-		pnoti->src, pnoti->dest, pnoti->id, pnoti->attach, pnoti->cable_type, pnoti->rprd);
-
-	if (pnoti->attach == CCIC_NOTIFY_ATTACH) {
-		pr_info("%s: Water detect\n", __func__);
-		if (pvendor && pvendor->enable_chgdet)
-			pvendor->enable_chgdet(pmuic->regmapdesc, 0);
-		pmuic->afc_water_disable = true;
-	} else {
-		pr_info("%s: dry detect\n", __func__);
-		pmuic->afc_water_disable = false;
-		pmuic->is_hiccup_mode = false;
-	}
-
-	return 0;
-}
-
-static int muic_handle_ccic_notification(struct notifier_block *nb,
-				unsigned long action, void *data)
-{
-	CC_NOTI_TYPEDEF *pnoti = (CC_NOTI_TYPEDEF *)data;
-#ifdef CONFIG_USB_TYPEC_MANAGER_NOTIFIER
-		muic_data_t *pmuic =
-			container_of(nb, muic_data_t, manager_nb);
-#else
-		muic_data_t *pmuic =
-			container_of(nb, muic_data_t, ccic_nb);
-#endif
-
-	pr_info("%s: Rcvd Noti=> action: %d src:%d dest:%d id:%d sub[%d %d %d]\n", __func__,
-		(int)action, pnoti->src, pnoti->dest, pnoti->id, pnoti->sub1, pnoti->sub2, pnoti->sub3);
-
-#ifdef CONFIG_USB_TYPEC_MANAGER_NOTIFIER
-	if(pnoti->dest != CCIC_NOTIFY_DEV_MUIC) {
-		pr_info("%s destination id is invalid\n", __func__);
-		return 0;
-	}
-#endif
-
-	mdev_show_status(pmuic);
-
-	switch (pnoti->id) {
-	case CCIC_NOTIFY_ID_ATTACH:
-		pr_info("%s: CCIC_NOTIFY_ID_ATTACH: %s\n", __func__,
-				pnoti->sub1 ? "Attached": "Detached");
-		muic_handle_ccic_ATTACH(pmuic, (CC_NOTI_ATTACH_TYPEDEF *)pnoti);
-		break;
-	case CCIC_NOTIFY_ID_RID:
-		pr_info("%s: CCIC_NOTIFY_ID_RID\n", __func__);
-		muic_handle_ccic_RID(pmuic, (CC_NOTI_RID_TYPEDEF *)pnoti);
-		break;
-	case CCIC_NOTIFY_ID_WATER:
-		pr_info("%s: CCIC_NOTIFY_ID_WATER\n", __func__);
-		muic_handle_ccic_WATER(pmuic, (CC_NOTI_ATTACH_TYPEDEF *)pnoti);
-		break;
-	default:
-		pr_info("%s: Undefined Noti. ID\n", __func__);
-		return NOTIFY_DONE;
-	}
-
-	mdev_show_status(pmuic);
-
-	muic_print_reg_dump(pmuic);
-
-	return NOTIFY_DONE;
-}
-
-
-void __delayed_ccic_notifier(struct work_struct *work)
-{
-	muic_data_t *pmuic;
-	int ret = 0;
-
-	pr_info("%s\n", __func__);
-
-	pmuic = container_of(work, muic_data_t, ccic_work.work);
-#ifdef CONFIG_USB_TYPEC_MANAGER_NOTIFIER
-	ret = manager_notifier_register(&pmuic->manager_nb,
-		muic_handle_ccic_notification, MANAGER_NOTIFY_CCIC_MUIC);
-#else
-	ret = ccic_notifier_register(&pmuic->ccic_nb,
-		muic_handle_ccic_notification, CCIC_NOTIFY_DEV_MUIC);
-#endif
-	if (ret < 0) {
-		pr_info("%s: CCIC Noti. is not ready. Try again in 4sec...\n", __func__);
-		schedule_delayed_work(&pmuic->ccic_work, msecs_to_jiffies(4000));
-		return;
-	}
-
-	pr_info("%s: done.\n", __func__);
-}
-
-void muic_register_ccic_notifier(muic_data_t *pmuic)
-{
-	int ret = 0;
-
-	pr_info("%s: Registering CCIC_NOTIFY_DEV_MUIC.\n", __func__);
-
-	init_mdev_desc(pmuic);
-#ifdef CONFIG_USB_TYPEC_MANAGER_NOTIFIER
-	ret = manager_notifier_register(&pmuic->manager_nb,
-		muic_handle_ccic_notification, MANAGER_NOTIFY_CCIC_MUIC);
-#else
-	ret = ccic_notifier_register(&pmuic->ccic_nb,
-		muic_handle_ccic_notification, CCIC_NOTIFY_DEV_MUIC);
-#endif
-	if (ret < 0) {
-		pr_info("%s: CCIC Noti. is not ready. Try again in 8sec...\n", __func__);
-		INIT_DELAYED_WORK(&pmuic->ccic_work, __delayed_ccic_notifier);
-		schedule_delayed_work(&pmuic->ccic_work, msecs_to_jiffies(8000));
-		return;
-	}
-
-	pr_info("%s: done.\n", __func__);
-}
-
+80000
+#define MC_CITF_MISC_RD_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_CITF_MISC_WR_CG__ONDLY_MASK 0x3f
+#define MC_CITF_MISC_WR_CG__ONDLY__SHIFT 0x0
+#define MC_CITF_MISC_WR_CG__OFFDLY_MASK 0xfc0
+#define MC_CITF_MISC_WR_CG__OFFDLY__SHIFT 0x6
+#define MC_CITF_MISC_WR_CG__RDYDLY_MASK 0x3f000
+#define MC_CITF_MISC_WR_CG__RDYDLY__SHIFT 0xc
+#define MC_CITF_MISC_WR_CG__ENABLE_MASK 0x40000
+#define MC_CITF_MISC_WR_CG__ENABLE__SHIFT 0x12
+#define MC_CITF_MISC_WR_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_CITF_MISC_WR_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_CITF_MISC_VM_CG__ONDLY_MASK 0x3f
+#define MC_CITF_MISC_VM_CG__ONDLY__SHIFT 0x0
+#define MC_CITF_MISC_VM_CG__OFFDLY_MASK 0xfc0
+#define MC_CITF_MISC_VM_CG__OFFDLY__SHIFT 0x6
+#define MC_CITF_MISC_VM_CG__RDYDLY_MASK 0x3f000
+#define MC_CITF_MISC_VM_CG__RDYDLY__SHIFT 0xc
+#define MC_CITF_MISC_VM_CG__ENABLE_MASK 0x40000
+#define MC_CITF_MISC_VM_CG__ENABLE__SHIFT 0x12
+#define MC_CITF_MISC_VM_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_CITF_MISC_VM_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_HUB_MISC_POWER__SRBM_GATE_OVERRIDE_MASK 0x4
+#define MC_HUB_MISC_POWER__SRBM_GATE_OVERRIDE__SHIFT 0x2
+#define MC_HUB_MISC_POWER__PM_BLACKOUT_CNTL_MASK 0x18
+#define MC_HUB_MISC_POWER__PM_BLACKOUT_CNTL__SHIFT 0x3
+#define MC_HUB_MISC_HUB_CG__ONDLY_MASK 0x3f
+#define MC_HUB_MISC_HUB_CG__ONDLY__SHIFT 0x0
+#define MC_HUB_MISC_HUB_CG__OFFDLY_MASK 0xfc0
+#define MC_HUB_MISC_HUB_CG__OFFDLY__SHIFT 0x6
+#define MC_HUB_MISC_HUB_CG__RDYDLY_MASK 0x3f000
+#define MC_HUB_MISC_HUB_CG__RDYDLY__SHIFT 0xc
+#define MC_HUB_MISC_HUB_CG__ENABLE_MASK 0x40000
+#define MC_HUB_MISC_HUB_CG__ENABLE__SHIFT 0x12
+#define MC_HUB_MISC_HUB_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_HUB_MISC_HUB_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_HUB_MISC_VM_CG__ONDLY_MASK 0x3f
+#define MC_HUB_MISC_VM_CG__ONDLY__SHIFT 0x0
+#define MC_HUB_MISC_VM_CG__OFFDLY_MASK 0xfc0
+#define MC_HUB_MISC_VM_CG__OFFDLY__SHIFT 0x6
+#define MC_HUB_MISC_VM_CG__RDYDLY_MASK 0x3f000
+#define MC_HUB_MISC_VM_CG__RDYDLY__SHIFT 0xc
+#define MC_HUB_MISC_VM_CG__ENABLE_MASK 0x40000
+#define MC_HUB_MISC_VM_CG__ENABLE__SHIFT 0x12
+#define MC_HUB_MISC_VM_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_HUB_MISC_VM_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_HUB_MISC_SIP_CG__ONDLY_MASK 0x3f
+#define MC_HUB_MISC_SIP_CG__ONDLY__SHIFT 0x0
+#define MC_HUB_MISC_SIP_CG__OFFDLY_MASK 0xfc0
+#define MC_HUB_MISC_SIP_CG__OFFDLY__SHIFT 0x6
+#define MC_HUB_MISC_SIP_CG__RDYDLY_MASK 0x3f000
+#define MC_HUB_MISC_SIP_CG__RDYDLY__SHIFT 0xc
+#define MC_HUB_MISC_SIP_CG__ENABLE_MASK 0x40000
+#define MC_HUB_MISC_SIP_CG__ENABLE__SHIFT 0x12
+#define MC_HUB_MISC_SIP_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_HUB_MISC_SIP_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_HUB_MISC_STATUS__OUTSTANDING_READ_MASK 0x1
+#define MC_HUB_MISC_STATUS__OUTSTANDING_READ__SHIFT 0x0
+#define MC_HUB_MISC_STATUS__OUTSTANDING_WRITE_MASK 0x2
+#define MC_HUB_MISC_STATUS__OUTSTANDING_WRITE__SHIFT 0x1
+#define MC_HUB_MISC_STATUS__OUTSTANDING_ATOMIC_MASK 0x4
+#define MC_HUB_MISC_STATUS__OUTSTANDING_ATOMIC__SHIFT 0x2
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_RDREQ_MASK 0x8
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_RDREQ__SHIFT 0x3
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_RDRET_MASK 0x10
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_RDRET__SHIFT 0x4
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_WRREQ_MASK 0x20
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_WRREQ__SHIFT 0x5
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_WRRET_MASK 0x40
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_WRRET__SHIFT 0x6
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_ATOMIC_REQ_MASK 0x80
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_ATOMIC_REQ__SHIFT 0x7
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_ATOMIC_RET_MASK 0x100
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_ATOMIC_RET__SHIFT 0x8
+#define MC_HUB_MISC_STATUS__OUTSTANDING_RPB_READ_MASK 0x200
+#define MC_HUB_MISC_STATUS__OUTSTANDING_RPB_READ__SHIFT 0x9
+#define MC_HUB_MISC_STATUS__OUTSTANDING_RPB_WRITE_MASK 0x400
+#define MC_HUB_MISC_STATUS__OUTSTANDING_RPB_WRITE__SHIFT 0xa
+#define MC_HUB_MISC_STATUS__OUTSTANDING_RPB_ATOMIC_MASK 0x800
+#define MC_HUB_MISC_STATUS__OUTSTANDING_RPB_ATOMIC__SHIFT 0xb
+#define MC_HUB_MISC_STATUS__OUTSTANDING_MCD_READ_MASK 0x1000
+#define MC_HUB_MISC_STATUS__OUTSTANDING_MCD_READ__SHIFT 0xc
+#define MC_HUB_MISC_STATUS__OUTSTANDING_MCD_WRITE_MASK 0x2000
+#define MC_HUB_MISC_STATUS__OUTSTANDING_MCD_WRITE__SHIFT 0xd
+#define MC_HUB_MISC_STATUS__OUTSTANDING_MCD_ATOMIC_MASK 0x4000
+#define MC_HUB_MISC_STATUS__OUTSTANDING_MCD_ATOMIC__SHIFT 0xe
+#define MC_HUB_MISC_STATUS__RPB_BUSY_MASK 0x8000
+#define MC_HUB_MISC_STATUS__RPB_BUSY__SHIFT 0xf
+#define MC_HUB_MISC_STATUS__WRITE_DEADLOCK_WARNING_MASK 0x10000
+#define MC_HUB_MISC_STATUS__WRITE_DEADLOCK_WARNING__SHIFT 0x10
+#define MC_HUB_MISC_STATUS__READ_DEADLOCK_WARNING_MASK 0x20000
+#define MC_HUB_MISC_STATUS__READ_DEADLOCK_WARNING__SHIFT 0x11
+#define MC_HUB_MISC_STATUS__ATOMIC_DEADLOCK_WARNING_MASK 0x40000
+#define MC_HUB_MISC_STATUS__ATOMIC_DEADLOCK_WARNING__SHIFT 0x12
+#define MC_HUB_MISC_STATUS__GFX_BUSY_MASK 0x80000
+#define MC_HUB_MISC_STATUS__GFX_BUSY__SHIFT 0x13
+#define MC_HUB_MISC_OVERRIDE__IDLE_MASK 0x3
+#define MC_HUB_MISC_OVERRIDE__IDLE__SHIFT 0x0
+#define MC_HUB_MISC_FRAMING__BITS_MASK 0xffffffff
+#define MC_HUB_MISC_FRAMING__BITS__SHIFT 0x0
+#define MC_HUB_WDP_CNTL__JUMPAHEAD_GBL0_MASK 0x2
+#define MC_HUB_WDP_CNTL__JUMPAHEAD_GBL0__SHIFT 0x1
+#define MC_HUB_WDP_CNTL__JUMPAHEAD_GBL1_MASK 0x4
+#define MC_HUB_WDP_CNTL__JUMPAHEAD_GBL1__SHIFT 0x2
+#define MC_HUB_WDP_CNTL__JUMPAHEAD_INTERNAL_MASK 0x8
+#define MC_HUB_WDP_CNTL__JUMPAHEAD_INTERNAL__SHIFT 0x3
+#define MC_HUB_WDP_CNTL__OVERRIDE_STALL_ENABLE_MASK 0x10
+#define MC_HUB_WDP_CNTL__OVERRIDE_STALL_ENABLE__SHIFT 0x4
+#define MC_HUB_WDP_CNTL__DEBUG_REG_MASK 0x1fe0
+#define MC_HUB_WDP_CNTL__DEBUG_REG__SHIFT 0x5
+#define MC_HUB_WDP_CNTL__DISABLE_SELF_INIT_GBL0_MASK 0x2000
+#define MC_HUB_WDP_CNTL__DISABLE_SELF_INIT_GBL0__SHIFT 0xd
+#define MC_HUB_WDP_CNTL__DISABLE_SELF_INIT_GBL1_MASK 0x4000
+#define MC_HUB_WDP_CNTL__DISABLE_SELF_INIT_GBL1__SHIFT 0xe
+#define MC_HUB_WDP_CNTL__DISABLE_SELF_INIT_INTERNAL_MASK 0x8000
+#define MC_HUB_WDP_CNTL__DISABLE_SELF_INIT_INTERNAL__SHIFT 0xf
+#define MC_HUB_WDP_CNTL__FAIR_CH_SW_MASK 0x10000
+#define MC_HUB_WDP_CNTL__FAIR_CH_SW__SHIFT 0x10
+#define MC_HUB_WDP_CNTL__LCLWRREQ_BYPASS_MASK 0x20000
+#define MC_HUB_WDP_CNTL__LCLWRREQ_BYPASS__SHIFT 0x11
+#define MC_HUB_WDP_CNTL__DISP_WAIT_EOP_MASK 0x40000
+#define MC_HUB_WDP_CNTL__DISP_WAIT_EOP__SHIFT 0x12
+#define MC_HUB_WDP_CNTL__MCD_WAIT_EOP_MASK 0x80000
+#define MC_HUB_WDP_CNTL__MCD_WAIT_EOP__SHIFT 0x13
+#define MC_HUB_WDP_CNTL__SIP_WAIT_EOP_MASK 0x100000
+#define MC_HUB_WDP_CNTL__SIP_WAIT_EOP__SHIFT 0x14
+#define MC_HUB_WDP_CNTL__UVD_VCE_WRITE_PRI_EN_MASK 0x200000
+#define MC_HUB_WDP_CNTL__UVD_VCE_WRITE_PRI_EN__SHIFT 0x15
+#define MC_HUB_WDP_CNTL__WRITE_PRI_EN_MASK 0x400000
+#define MC_HUB_WDP_CNTL__WRITE_PRI_EN__SHIFT 0x16
+#define MC_HUB_WDP_CNTL__IH_PHYSADDR_ENABLE_MASK 0x800000
+#define MC_HUB_WDP_CNTL__IH_PHYSADDR_ENABLE__SHIFT 0x17
+#define MC_HUB_WDP_ERR__MGPU1_TARG_SYS_MASK 0x1
+#define MC_HUB_WDP_ERR__MGPU1_TARG_SYS__SHIFT 0x0
+#define MC_HUB_WDP_ERR__MGPU2_TARG_SYS_MASK 0x2
+#define MC_HUB_WDP_ERR__MGPU2_TARG_SYS__SHIFT 0x1
+#define MC_HUB_WDP_BP__ENABLE_MASK 0x1
+#define MC_HUB_WDP_BP__ENABLE__SHIFT 0x0
+#define MC_HUB_WDP_BP__RDRET_MASK 0x3fffe
+#define MC_HUB_WDP_BP__RDRET__SHIFT 0x1
+#define MC_HUB_WDP_BP__WRREQ_MASK 0x3ffc0000
+#define MC_HUB_WDP_BP__WRREQ__SHIFT 0x12
+#define MC_HUB_WDP_STATUS__SIP_AVAIL_MASK 0x1
+#define MC_HUB_WDP_STATUS__SIP_AVAIL__SHIFT 0x0
+#define MC_HUB_WDP_STATUS__MCDW_RD_AVAIL_MASK 0x2
+#define MC_HUB_WDP_STATUS__MCDW_RD_AVAIL__SHIFT 0x1
+#define MC_HUB_WDP_STATUS__MCDX_RD_AVAIL_MASK 0x4
+#define MC_HUB_WDP_STATUS__MCDX_RD_AVAIL__SHIFT 0x2
+#define MC_HUB_WDP_STATUS__MCDY_RD_AVAIL_MASK 0x8
+#define MC_HUB_WDP_STATUS__MCDY_RD_AVAIL__SHIFT 0x3
+#define MC_HUB_WDP_STATUS__MCDZ_RD_AVAIL_MASK 0x10
+#define MC_HUB_WDP_STATUS__MCDZ_RD_AVAIL__SHIFT 0x4
+#define MC_HUB_WDP_STATUS__MCDS_RD_AVAIL_MASK 0x20
+#define MC_HUB_WDP_STATUS__MCDS_RD_AVAIL__SHIFT 0x5
+#define MC_HUB_WDP_STATUS__MCDT_RD_AVAIL_MASK 0x40
+#define MC_HUB_WDP_STATUS__MCDT_RD_AVAIL__SHIFT 0x6
+#define MC_HUB_WDP_STATUS__MCDU_RD_AVAIL_MASK 0x80
+#define MC_HUB_WDP_STATUS__MCDU_RD_AVAIL__SHIFT 0x7
+#define MC_HUB_WDP_STATUS__MCDV_RD_AVAIL_MASK 0x100
+#define MC_HUB_WDP_STATUS__MCDV_RD_AVAIL__SHIFT 0x8
+#define MC_HUB_WDP_STATUS__MCDW_WR_AVAIL_MASK 0x200
+#define MC_HUB_WDP_STATUS__MCDW_WR_AVAIL__SHIFT 0x9
+#define MC_HUB_WDP_STATUS__MCDX_WR_AVAIL_MASK 0x400
+#define MC_HUB_WDP_STATUS__MCDX_WR_AVAIL__SHIFT 0xa
+#define MC_HUB_WDP_STATUS__MCDY_WR_AVAIL_MASK 0x800
+#define MC_HUB_WDP_STATUS__MCDY_WR_AVAIL__SHIFT 0xb
+#define MC_HUB_WDP_STATUS__MCDZ_WR_AVAIL_MASK 0x1000
+#define MC_HUB_WDP_STATUS__MCDZ_WR_AVAIL__SHIFT 0xc
+#define MC_HUB_WDP_STATUS__MCDS_WR_AVAIL_MASK 0x2000
+#define MC_HUB_WDP_STATUS__MCDS_WR_AVAIL__SHIFT 0xd
+#define MC_HUB_WDP_STATUS__MCDT_WR_AVAIL_MASK 0x4000
+#define MC_HUB_WDP_STATUS__MCDT_WR_AVAIL__SHIFT 0xe
+#define MC_HUB_WDP_STATUS__MCDU_WR_AVAIL_MASK 0x8000
+#define MC_HUB_WDP_STATUS__MCDU_WR_AVAIL__SHIFT 0xf
+#define MC_HUB_WDP_STATUS__MCDV_WR_AVAIL_MASK 0x10000
+#define MC_HUB_WDP_STATUS__MCDV_WR_AVAIL__SHIFT 0x10
+#define MC_HUB_WDP_STATUS__GBL0_VM_FULL_MASK 0x20000
+#define MC_HUB_WDP_STATUS__GBL0_VM_FULL__SHIFT 0x11
+#define MC_HUB_WDP_STATUS__GBL0_STOR_FULL_MASK 0x40000
+#define MC_HUB_WDP_STATUS__GBL0_STOR_FULL__SHIFT 0x12
+#define MC_HUB_WDP_STATUS__GBL0_BYPASS_STOR_FULL_MASK 0x80000
+#define MC_HUB_WDP_STATUS__GBL0_BYPASS_STOR_FULL__SHIFT 0x13
+#define MC_HUB_WDP_STATUS__GBL1_VM_FULL_MASK 0x100000
+#define MC_HUB_WDP_STATUS__GBL1_VM_FULL__SHIFT 0x14
+#define MC_HUB_WDP_STATUS__GBL1_STOR_FULL_MASK 0x200000
+#define MC_HUB_WDP_STATUS__GBL1_STOR_FULL__SHIFT 0x15
+#define MC_HUB_WDP_STATUS__GBL1_BYPASS_STOR_FULL_MASK 0x400000
+#define MC_HUB_WDP_STATUS__GBL1_BYPASS_STOR_FULL__SHIFT 0x16
+#define MC_HUB_RDREQ_STATUS__SIP_AVAIL_MASK 0x1
+#define MC_HUB_RDREQ_STATUS__SIP_AVAIL__SHIFT 0x0
+#define MC_HUB_RDREQ_STATUS__MCDW_RD_AVAIL_MASK 0x2
+#define MC_HUB_RDREQ_STATUS__MCDW_RD_AVAIL__SHIFT 0x1
+#define MC_HUB_RDREQ_STATUS__MCDX_RD_AVAIL_MASK 0x4
+#define MC_HUB_RDREQ_STATUS__MCDX_RD_AVAIL__SHIFT 0x2
+#define MC_HUB_RDREQ_STATUS__MCDY_RD_AVAIL_MASK 0x8
+#define MC_HUB_RDREQ_STATUS__MCDY_RD_AVAIL__SHIFT 0x3
+#define MC_HUB_RDREQ_STATUS__MCDZ_RD_AVAIL_MASK 0x10
+#define MC_HUB_RDREQ_STATUS__MCDZ_RD_AVAIL__SHIFT 0x4
+#define MC_HUB_RDREQ_STATUS__MCDS_RD_AVAIL_MASK 0x20
+#define MC_HUB_RDREQ_STATUS__MCDS_RD_AVAIL__SHIFT 0x5
+#define MC_HUB_RDREQ_STATUS__MCDT_RD_AVAIL_MASK 0x40
+#define MC_HUB_RDREQ_STATUS__MCDT_RD_AVAIL__SHIFT 0x6
+#define MC_HUB_RDREQ_STATUS__MCDU_RD_AVAIL_MASK 0x80
+#define MC_HUB_RDREQ_STATUS__MCDU_RD_AVAIL__SHIFT 0x7
+#define MC_HUB_RDREQ_STATUS__MCDV_RD_AVAIL_MASK 0x100
+#define MC_HUB_RDREQ_STATUS__MCDV_RD_AVAIL__SHIFT 0x8
+#define MC_HUB_RDREQ_STATUS__GBL0_VM_FULL_MASK 0x200
+#define MC_HUB_RDREQ_STATUS__GBL0_VM_FULL__SHIFT 0x9
+#define MC_HUB_RDREQ_STATUS__GBL0_STOR_FULL_MASK 0x400
+#define MC_HUB_RDREQ_STATUS__GBL0_STOR_FULL__SHIFT 0xa
+#define MC_HUB_RDREQ_STATUS__GBL0_BYPASS_STOR_FULL_MASK 0x800
+#define MC_HUB_RDREQ_STATUS__GBL0_BYPASS_STOR_FULL__SHIFT 0xb
+#define MC_HUB_RDREQ_STATUS__GBL1_VM_FULL_MASK 0x1000
+#define MC_HUB_RDREQ_STATUS__GBL1_VM_FULL__SHIFT 0xc
+#define MC_HUB_RDREQ_STATUS__GBL1_STOR_FULL_MASK 0x2000
+#define MC_HUB_RDREQ_STATUS__GBL1_STOR_FULL__SHIFT 0xd
+#define MC_HUB_RDREQ_STATUS__GBL1_BYPASS_STOR_FULL_MASK 0x4000
+#define MC_HUB_RDREQ_STATUS__GBL1_BYPASS_STOR_FULL__SHIFT 0xe
+#define MC_HUB_RDREQ_STATUS__PWRXPRESS_ERR_MASK 0x8000
+#define MC_HUB_RDREQ_STATUS__PWRXPRESS_ERR__SHIFT 0xf
+#define MC_HUB_WRRET_STATUS__MCDW_AVAIL_MASK 0x1
+#define MC_HUB_WRRET_STATUS__MCDW_AVAIL__SHIFT 0x0
+#define MC_HUB_WRRET_STATUS__MCDX_AVAIL_MASK 0x2
+#define MC_HUB_WRRET_STATUS__MCDX_AVAIL__SHIFT 0x1
+#define MC_HUB_WRRET_STATUS__MCDY_AVAIL_MASK 0x4
+#define MC_HUB_WRRET_STATUS__MCDY_AVAIL__SHIFT 0x2
+#define MC_HUB_WRRET_STATUS__MCDZ_AVAIL_MASK 0x8
+#define MC_HUB_WRRET_STATUS__MCDZ_AVAIL__SHIFT 0x3
+#define MC_HUB_WRRET_STATUS__MCDS_AVAIL_MASK 0x10
+#define MC_HUB_WRRET_STATUS__MCDS_AVAIL__SHIFT 0x4
+#define MC_HUB_WRRET_STATUS__MCDT_AVAIL_MASK 0x20
+#define MC_HUB_WRRET_STATUS__MCDT_AVAIL__SHIFT 0x5
+#define MC_HUB_WRRET_STATUS__MCDU_AVAIL_MASK 0x40
+#define MC_HUB_WRRET_STATUS__MCDU_AVAIL__SHIFT 0x6
+#define MC_HUB_WRRET_STATUS__MCDV_AVAIL_MASK 0x80
+#define MC_HUB_WRRET_STATUS__MCDV_AVAIL__SHIFT 0x7
+#define MC_HUB_RDREQ_CNTL__REMOTE_BLACKOUT_MASK 0x1
+#define MC_HUB_RDREQ_CNTL__REMOTE_BLACKOUT__SHIFT 0x0
+#define MC_HUB_RDREQ_CNTL__JUMPAHEAD_GBL0_MASK 0x4
+#define MC_HUB_RDREQ_CNTL__JUMPAHEAD_GBL0__SHIFT 0x2
+#define MC_HUB_RDREQ_CNTL__JUMPAHEAD_GBL1_MASK 0x8
+#define MC_HUB_RDREQ_CNTL__JUMPAHEAD_GBL1__SHIFT 0x3
+#define MC_HUB_RDREQ_CNTL__OVERRIDE_STALL_ENABLE_MASK 0x10
+#define MC_HUB_RDREQ_CNTL__OVERRIDE_STALL_ENABLE__SHIFT 0x4
+#define MC_HUB_RDREQ_CNTL__MCDW_STALL_MODE_MASK 0x20
+#define MC_HUB_RDREQ_CNTL__MCDW_STALL_MODE__SHIFT 0x5
+#define MC_HUB_RDREQ_CNTL__MCDX_STALL_MODE_MASK 0x40
+#define MC_HUB_RDREQ_CNTL__MCDX_STALL_MODE__SHIFT 0x6
+#define MC_HUB_RDREQ_CNTL__MCDY_STALL_MODE_MASK 0x80
+#define MC_HUB_RDREQ_CNTL__MCDY_STALL_MODE__SHIFT 0x7
+#define MC_HUB_RDREQ_CNTL__MCDZ_STALL_MODE_MASK 0x100
+#define MC_HUB_RDREQ_CNTL__MCDZ_STALL_MODE__SHIFT 0x8
+#define MC_HUB_RDREQ_CNTL__MCDS_STALL_MODE_MASK 0x200
+#define MC_HUB_RDREQ_CNTL__MCDS_STALL_MODE__SHIFT 0x9
+#define MC_HUB_RDREQ_CNTL__MCDT_STALL_MODE_MASK 0x400
+#define MC_HUB_RDREQ_CNTL__MCDT_STALL_MODE__SHIFT 0xa
+#define MC_HUB_RDREQ_CNTL__MCDU_STALL_MODE_MASK 0x800
+#define MC_HUB_RDREQ_CNTL__MCDU_STALL_MODE__SHIFT 0xb
+#define MC_HUB_RDREQ_CNTL__MCDV_STALL_MODE_MASK 0x1000
+#define MC_HUB_RDREQ_CNTL__MCDV_STALL_MODE__SHIFT 0xc
+#define MC_HUB_RDREQ_CNTL__BREAK_HDP_DEADLOCK_MASK 0x2000
+#define MC_HUB_RDREQ_CNTL__BREAK_HDP_DEADLOCK__SHIFT 0xd
+#define MC_HUB_RDREQ_CNTL__DEBUG_REG_MASK 0x1fc000
+#define MC_HUB_RDREQ_CNTL__DEBUG_REG__SHIFT 0xe
+#define MC_HUB_RDREQ_CNTL__DISABLE_SELF_INIT_GBL0_MASK 0x200000
+#define MC_HUB_RDREQ_CNTL__DISABLE_SELF_INIT_GBL0__SHIFT 0x15
+#define MC_HUB_RDREQ_CNTL__DISABLE_SELF_INIT_GBL1_MASK 0x400000
+#define MC_HUB_RDREQ_CNTL__DISABLE_SELF_INIT_GBL1__SHIFT 0x16
+#define MC_HUB_RDREQ_CNTL__PWRXPRESS_MODE_MASK 0x800000
+#define MC_HUB_RDREQ_CNTL__PWRXPRESS_MODE__SHIFT 0x17
+#define MC_HUB_RDREQ_CNTL__ACPG_HP_TO_MCD_OVERRIDE_MASK 0x1000000
+#define MC_HUB_RDREQ_CNTL__ACPG_HP_TO_MCD_OVERRIDE__SHIFT 0x18
+#define MC_HUB_RDREQ_CNTL__GBL0_PRI_ENABLE_MASK 0x2000000
+#define MC_HUB_RDREQ_CNTL__GBL0_PRI_ENABLE__SHIFT 0x19
+#define MC_HUB_RDREQ_CNTL__UVD_TRANSCODE_ENABLE_MASK 0x4000000
+#define MC_HUB_RDREQ_CNTL__UVD_TRANSCODE_ENABLE__SHIFT 0x1a
+#define MC_HUB_RDREQ_CNTL__DMIF_URG_THRESHOLD_MASK 0x78000000
+#define MC_HUB_RDREQ_CNTL__DMIF_URG_THRESHOLD__SHIFT 0x1b
+#define MC_HUB_WRRET_CNTL__JUMPAHEAD_MASK 0x1
+#define MC_HUB_WRRET_CNTL__JUMPAHEAD__SHIFT 0x0
+#define MC_HUB_WRRET_CNTL__BP_MASK 0x1ffffe
+#define MC_HUB_WRRET_CNTL__BP__SHIFT 0x1
+#define MC_HUB_WRRET_CNTL__BP_ENABLE_MASK 0x200000
+#define MC_HUB_WRRET_CNTL__BP_ENABLE__SHIFT 0x15
+#define MC_HUB_WRRET_CNTL__DEBUG_REG_MASK 0x3fc00000
+#define MC_HUB_WRRET_CNTL__DEBUG_REG__SHIFT 0x16
+#define MC_HUB_WRRET_CNTL__DISABLE_SELF_INIT_MASK 0x40000000
+#define MC_HUB_WRRET_CNTL__DISABLE_SELF_INIT__SHIFT 0x1e
+#define MC_HUB_WRRET_CNTL__FAIR_CH_SW_MASK 0x80000000
+#define MC_HUB_WRRET_CNTL__FAIR_CH_SW__SHIFT 0x1f
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP0_DECREMENT_MASK 0x7
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP0_DECREMENT__SHIFT 0x0
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP1_DECREMENT_MASK 0x38
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP1_DECREMENT__SHIFT 0x3
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP2_DECREMENT_MASK 0x1c0
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP2_DECREMENT__SHIFT 0x6
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP3_DECREMENT_MASK 0xe00
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP3_DECREMENT__SHIFT 0x9
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP4_DECREMENT_MASK 0x7000
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP4_DECREMENT__SHIFT 0xc
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP5_DECREMENT_MASK 0x38000
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP5_DECREMENT__SHIFT 0xf
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP6_DECREMENT_MASK 0x1c0000
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP6_DECREMENT__SHIFT 0x12
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP7_DECREMENT_MASK 0xe00000
+#define MC_HUB_RDREQ_WTM_CNTL__GROUP7_DECREMENT__SHIFT 0x15
+#define MC_HUB_WDP_WTM_CNTL__GROUP0_DECREMENT_MASK 0x7
+#define MC_HUB_WDP_WTM_CNTL__GROUP0_DECREMENT__SHIFT 0x0
+#define MC_HUB_WDP_WTM_CNTL__GROUP1_DECREMENT_MASK 0x38
+#define MC_HUB_WDP_WTM_CNTL__GROUP1_DECREMENT__SHIFT 0x3
+#define MC_HUB_WDP_WTM_CNTL__GROUP2_DECREMENT_MASK 0x1c0
+#define MC_HUB_WDP_WTM_CNTL__GROUP2_DECREMENT__SHIFT 0x6
+#define MC_HUB_WDP_WTM_CNTL__GROUP3_DECREMENT_MASK 0xe00
+#define MC_HUB_WDP_WTM_CNTL__GROUP3_DECREMENT__SHIFT 0x9
+#define MC_HUB_WDP_WTM_CNTL__GROUP4_DECREMENT_MASK 0x7000
+#define MC_HUB_WDP_WTM_CNTL__GROUP4_DECREMENT__SHIFT 0xc
+#define MC_HUB_WDP_WTM_CNTL__GROUP5_DECREMENT_MASK 0x38000
+#define MC_HUB_WDP_WTM_CNTL__GROUP5_DECREMENT__SHIFT 0xf
+#define MC_HUB_WDP_WTM_CNTL__GROUP6_DECREMENT_MASK 0x1c0000
+#define MC_HUB_WDP_WTM_CNTL__GROUP6_DECREMENT__SHIFT 0x12
+#define MC_HUB_WDP_WTM_CNTL__GROUP7_DECREMENT_MASK 0xe00000
+#define MC_HUB_WDP_WTM_CNTL__GROUP7_DECREMENT__SHIFT 0x15
+#define MC_HUB_WDP_CREDITS__VM0_MASK 0xff
+#define MC_HUB_WDP_CREDITS__VM0__SHIFT 0x0
+#define MC_HUB_WDP_CREDITS__VM1_MASK 0xff00
+#define MC_HUB_WDP_CREDITS__VM1__SHIFT 0x8
+#define MC_HUB_WDP_CREDITS__STOR0_MASK 0xff0000
+#define MC_HUB_WDP_CREDITS__STOR0__SHIFT 0x10
+#define MC_HUB_WDP_CREDITS__STOR1_MASK 0xff000000
+#define MC_HUB_WDP_CREDITS__STOR1__SHIFT 0x18
+#define MC_HUB_WDP_CREDITS2__STOR0_PRI_MASK 0xff
+#define MC_HUB_WDP_CREDITS2__STOR0_PRI__SHIFT 0x0
+#define MC_HUB_WDP_CREDITS2__STOR1_PRI_MASK 0xff00
+#define MC_HUB_WDP_CREDITS2__STOR1_PRI__SHIFT 0x8
+#define MC_HUB_WDP_CREDITS2__VM2_MASK 0xff0000
+#define MC_HUB_WDP_CREDITS2__VM2__SHIFT 0x10
+#define MC_HUB_WDP_CREDITS2__VM3_MASK 0xff000000
+#define MC_HUB_WDP_CREDITS2__VM3__SHIFT 0x18
+#define MC_HUB_WDP_GBL0__MAXBURST_MASK 0xf
+#define MC_HUB_WDP_GBL0__MAXBURST__SHIFT 0x0
+#define MC_HUB_WDP_GBL0__LAZY_TIMER_MASK 0xf0
+#define MC_HUB_WDP_GBL0__LAZY_TIMER__SHIFT 0x4
+#define MC_HUB_WDP_GBL0__STALL_THRESHOLD_MASK 0xff00
+#define MC_HUB_WDP_GBL0__STALL_THRESHOLD__SHIFT 0x8
+#define MC_HUB_WDP_GBL0__STALL_MODE_MASK 0x10000
+#define MC_HUB_WDP_GBL0__STALL_MODE__SHIFT 0x10
+#define MC_HUB_WDP_GBL0__STALL_THRESHOLD_PRI_MASK 0x1fe0000
+#define MC_HUB_WDP_GBL0__STALL_THRESHOLD_PRI__SHIFT 0x11
+#define MC_HUB_WDP_GBL0__STALL_THRESHOLD_URG_MASK 0xfe000000
+#define MC_HUB_WDP_GBL0__STALL_THRESHOLD_URG__SHIFT 0x19
+#define MC_HUB_WDP_GBL1__MAXBURST_MASK 0xf
+#define MC_HUB_WDP_GBL1__MAXBURST__SHIFT 0x0
+#define MC_HUB_WDP_GBL1__LAZY_TIMER_MASK 0xf0
+#define MC_HUB_WDP_GBL1__LAZY_TIMER__SHIFT 0x4
+#define MC_HUB_WDP_GBL1__STALL_THRESHOLD_MASK 0xff00
+#define MC_HUB_WDP_GBL1__STALL_THRESHOLD__SHIFT 0x8
+#define MC_HUB_WDP_GBL1__STALL_MODE_MASK 0x10000
+#define MC_HUB_WDP_GBL1__STALL_MODE__SHIFT 0x10
+#define MC_HUB_WDP_GBL1__STALL_THRESHOLD_PRI_MASK 0x1fe0000
+#define MC_HUB_WDP_GBL1__STALL_THRESHOLD_PRI__SHIFT 0x11
+#define MC_HUB_WDP_GBL1__STALL_THRESHOLD_URG_MASK 0xfe000000
+#define MC_HUB_WDP_GBL1__STALL_THRESHOLD_URG__SHIFT 0x19
+#define MC_HUB_WDP_CREDITS3__STOR0_URG_MASK 0xff
+#define MC_HUB_WDP_CREDITS3__STOR0_URG__SHIFT 0x0
+#define MC_HUB_WDP_CREDITS3__STOR1_URG_MASK 0xff00
+#define MC_HUB_WDP_CREDITS3__STOR1_URG__SHIFT 0x8
+#define MC_HUB_RDREQ_CREDITS__VM0_MASK 0xff
+#define MC_HUB_RDREQ_CREDITS__VM0__SHIFT 0x0
+#define MC_HUB_RDREQ_CREDITS__VM1_MASK 0xff00
+#define MC_HUB_RDREQ_CREDITS__VM1__SHIFT 0x8
+#define MC_HUB_RDREQ_CREDITS__STOR0_MASK 0xff0000
+#define MC_HUB_RDREQ_CREDITS__STOR0__SHIFT 0x10
+#define MC_HUB_RDREQ_CREDITS__STOR1_MASK 0xff000000
+#define MC_HUB_RDREQ_CREDITS__STOR1__SHIFT 0x18
+#define MC_HUB_RDREQ_CREDITS2__STOR0_PRI_MASK 0xff
+#define MC_HUB_RDREQ_CREDITS2__STOR0_PRI__SHIFT 0x0
+#define MC_HUB_RDREQ_CREDITS2__STOR1_PRI_MASK 0xff00
+#define MC_HUB_RDREQ_CREDITS2__STOR1_PRI__SHIFT 0x8
+#define MC_HUB_SHARED_DAGB_DLY__DLY_MASK 0x3f
+#define MC_HUB_SHARED_DAGB_DLY__DLY__SHIFT 0x0
+#define MC_HUB_SHARED_DAGB_DLY__CLI_MASK 0x3f0000
+#define MC_HUB_SHARED_DAGB_DLY__CLI__SHIFT 0x10
+#define MC_HUB_SHARED_DAGB_DLY__POS_MASK 0x1f000000
+#define MC_HUB_SHARED_DAGB_DLY__POS__SHIFT 0x18
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_GFX_READ_MASK 0x1
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_GFX_READ__SHIFT 0x0
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_GFX_WRITE_MASK 0x2
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_GFX_WRITE__SHIFT 0x1
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_RLC_READ_MASK 0x4
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_RLC_READ__SHIFT 0x2
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_RLC_WRITE_MASK 0x8
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_RLC_WRITE__SHIFT 0x3
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_SDMA0_READ_MASK 0x10
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_SDMA0_READ__SHIFT 0x4
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_SDMA0_WRITE_MASK 0x20
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_SDMA0_WRITE__SHIFT 0x5
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_SDMA1_READ_MASK 0x40
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_SDMA1_READ__SHIFT 0x6
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_SDMA1_WRITE_MASK 0x80
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_SDMA1_WRITE__SHIFT 0x7
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_DISP_READ_MASK 0x100
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_DISP_READ__SHIFT 0x8
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_DISP_WRITE_MASK 0x200
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_DISP_WRITE__SHIFT 0x9
+#define MC_HUB_MISC_IDLE_STATUS__OUTSTANDING_U

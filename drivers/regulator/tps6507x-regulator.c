@@ -1,541 +1,378 @@
+Branch 1:\n");
+		for (slot_row = 0; slot_row < DIMMS_PER_CHANNEL; slot_row++)
+			decode_mtr(slot_row, pvt->b1_mtr[slot_row]);
+
+		pci_read_config_word(pvt->branch_1, AMBPRESENT_0,
+				&pvt->b1_ambpresent0);
+		edac_dbg(2, "\t\tAMB-Branch 1-present0 0x%x:\n",
+			 pvt->b1_ambpresent0);
+		pci_read_config_word(pvt->branch_1, AMBPRESENT_1,
+				&pvt->b1_ambpresent1);
+		edac_dbg(2, "\t\tAMB-Branch 1-present1 0x%x:\n",
+			 pvt->b1_ambpresent1);
+	}
+
+	/* Go and determine the size of each DIMM and place in an
+	 * orderly matrix */
+	calculate_dimm_size(pvt);
+}
+
 /*
- * tps6507x-regulator.c
+ *	i5400_init_dimms	Initialize the 'dimms' table within
+ *				the mci control	structure with the
+ *				addressing of memory.
  *
- * Regulator driver for TPS65073 PMIC
- *
- * Copyright (C) 2009 Texas Instrument Incorporated - http://www.ti.com/
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation version 2.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any kind,
- * whether express or implied; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
+ *	return:
+ *		0	success
+ *		1	no actual memory found on this MC
  */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/err.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/tps6507x.h>
-#include <linux/of.h>
-#include <linux/slab.h>
-#include <linux/mfd/tps6507x.h>
-#include <linux/regulator/of_regulator.h>
-
-/* DCDC's */
-#define TPS6507X_DCDC_1				0
-#define TPS6507X_DCDC_2				1
-#define TPS6507X_DCDC_3				2
-/* LDOs */
-#define TPS6507X_LDO_1				3
-#define TPS6507X_LDO_2				4
-
-#define TPS6507X_MAX_REG_ID			TPS6507X_LDO_2
-
-/* Number of step-down converters available */
-#define TPS6507X_NUM_DCDC			3
-/* Number of LDO voltage regulators  available */
-#define TPS6507X_NUM_LDO			2
-/* Number of total regulators available */
-#define TPS6507X_NUM_REGULATOR		(TPS6507X_NUM_DCDC + TPS6507X_NUM_LDO)
-
-/* Supported voltage values for regulators (in microVolts) */
-static const unsigned int VDCDCx_VSEL_table[] = {
-	725000, 750000, 775000, 800000,
-	825000, 850000, 875000, 900000,
-	925000, 950000, 975000, 1000000,
-	1025000, 1050000, 1075000, 1100000,
-	1125000, 1150000, 1175000, 1200000,
-	1225000, 1250000, 1275000, 1300000,
-	1325000, 1350000, 1375000, 1400000,
-	1425000, 1450000, 1475000, 1500000,
-	1550000, 1600000, 1650000, 1700000,
-	1750000, 1800000, 1850000, 1900000,
-	1950000, 2000000, 2050000, 2100000,
-	2150000, 2200000, 2250000, 2300000,
-	2350000, 2400000, 2450000, 2500000,
-	2550000, 2600000, 2650000, 2700000,
-	2750000, 2800000, 2850000, 2900000,
-	3000000, 3100000, 3200000, 3300000,
-};
-
-static const unsigned int LDO1_VSEL_table[] = {
-	1000000, 1100000, 1200000, 1250000,
-	1300000, 1350000, 1400000, 1500000,
-	1600000, 1800000, 2500000, 2750000,
-	2800000, 3000000, 3100000, 3300000,
-};
-
-/* The voltage mapping table for LDO2 is the same as VDCDCx */
-#define LDO2_VSEL_table VDCDCx_VSEL_table
-
-struct tps_info {
-	const char *name;
-	u8 table_len;
-	const unsigned int *table;
-
-	/* Does DCDC high or the low register defines output voltage? */
-	bool defdcdc_default;
-};
-
-static struct tps_info tps6507x_pmic_regs[] = {
-	{
-		.name = "VDCDC1",
-		.table_len = ARRAY_SIZE(VDCDCx_VSEL_table),
-		.table = VDCDCx_VSEL_table,
-	},
-	{
-		.name = "VDCDC2",
-		.table_len = ARRAY_SIZE(VDCDCx_VSEL_table),
-		.table = VDCDCx_VSEL_table,
-	},
-	{
-		.name = "VDCDC3",
-		.table_len = ARRAY_SIZE(VDCDCx_VSEL_table),
-		.table = VDCDCx_VSEL_table,
-	},
-	{
-		.name = "LDO1",
-		.table_len = ARRAY_SIZE(LDO1_VSEL_table),
-		.table = LDO1_VSEL_table,
-	},
-	{
-		.name = "LDO2",
-		.table_len = ARRAY_SIZE(LDO2_VSEL_table),
-		.table = LDO2_VSEL_table,
-	},
-};
-
-struct tps6507x_pmic {
-	struct regulator_desc desc[TPS6507X_NUM_REGULATOR];
-	struct tps6507x_dev *mfd;
-	struct regulator_dev *rdev[TPS6507X_NUM_REGULATOR];
-	struct tps_info *info[TPS6507X_NUM_REGULATOR];
-	struct mutex io_lock;
-};
-static inline int tps6507x_pmic_read(struct tps6507x_pmic *tps, u8 reg)
+static int i5400_init_dimms(struct mem_ctl_info *mci)
 {
-	u8 val;
-	int err;
+	struct i5400_pvt *pvt;
+	struct dimm_info *dimm;
+	int ndimms, channel_count;
+	int max_dimms;
+	int mtr;
+	int size_mb;
+	int  channel, slot;
 
-	err = tps->mfd->read_dev(tps->mfd, reg, 1, &val);
+	pvt = mci->pvt_info;
 
-	if (err)
-		return err;
+	channel_count = pvt->maxch;
+	max_dimms = pvt->maxdimmperch;
 
-	return val;
-}
+	ndimms = 0;
 
-static inline int tps6507x_pmic_write(struct tps6507x_pmic *tps, u8 reg, u8 val)
-{
-	return tps->mfd->write_dev(tps->mfd, reg, 1, &val);
-}
-
-static int tps6507x_pmic_set_bits(struct tps6507x_pmic *tps, u8 reg, u8 mask)
-{
-	int err, data;
-
-	mutex_lock(&tps->io_lock);
-
-	data = tps6507x_pmic_read(tps, reg);
-	if (data < 0) {
-		dev_err(tps->mfd->dev, "Read from reg 0x%x failed\n", reg);
-		err = data;
-		goto out;
-	}
-
-	data |= mask;
-	err = tps6507x_pmic_write(tps, reg, data);
-	if (err)
-		dev_err(tps->mfd->dev, "Write for reg 0x%x failed\n", reg);
-
-out:
-	mutex_unlock(&tps->io_lock);
-	return err;
-}
-
-static int tps6507x_pmic_clear_bits(struct tps6507x_pmic *tps, u8 reg, u8 mask)
-{
-	int err, data;
-
-	mutex_lock(&tps->io_lock);
-
-	data = tps6507x_pmic_read(tps, reg);
-	if (data < 0) {
-		dev_err(tps->mfd->dev, "Read from reg 0x%x failed\n", reg);
-		err = data;
-		goto out;
-	}
-
-	data &= ~mask;
-	err = tps6507x_pmic_write(tps, reg, data);
-	if (err)
-		dev_err(tps->mfd->dev, "Write for reg 0x%x failed\n", reg);
-
-out:
-	mutex_unlock(&tps->io_lock);
-	return err;
-}
-
-static int tps6507x_pmic_reg_read(struct tps6507x_pmic *tps, u8 reg)
-{
-	int data;
-
-	mutex_lock(&tps->io_lock);
-
-	data = tps6507x_pmic_read(tps, reg);
-	if (data < 0)
-		dev_err(tps->mfd->dev, "Read from reg 0x%x failed\n", reg);
-
-	mutex_unlock(&tps->io_lock);
-	return data;
-}
-
-static int tps6507x_pmic_reg_write(struct tps6507x_pmic *tps, u8 reg, u8 val)
-{
-	int err;
-
-	mutex_lock(&tps->io_lock);
-
-	err = tps6507x_pmic_write(tps, reg, val);
-	if (err < 0)
-		dev_err(tps->mfd->dev, "Write for reg 0x%x failed\n", reg);
-
-	mutex_unlock(&tps->io_lock);
-	return err;
-}
-
-static int tps6507x_pmic_is_enabled(struct regulator_dev *dev)
-{
-	struct tps6507x_pmic *tps = rdev_get_drvdata(dev);
-	int data, rid = rdev_get_id(dev);
-	u8 shift;
-
-	if (rid < TPS6507X_DCDC_1 || rid > TPS6507X_LDO_2)
-		return -EINVAL;
-
-	shift = TPS6507X_MAX_REG_ID - rid;
-	data = tps6507x_pmic_reg_read(tps, TPS6507X_REG_CON_CTRL1);
-
-	if (data < 0)
-		return data;
-	else
-		return (data & 1<<shift) ? 1 : 0;
-}
-
-static int tps6507x_pmic_enable(struct regulator_dev *dev)
-{
-	struct tps6507x_pmic *tps = rdev_get_drvdata(dev);
-	int rid = rdev_get_id(dev);
-	u8 shift;
-
-	if (rid < TPS6507X_DCDC_1 || rid > TPS6507X_LDO_2)
-		return -EINVAL;
-
-	shift = TPS6507X_MAX_REG_ID - rid;
-	return tps6507x_pmic_set_bits(tps, TPS6507X_REG_CON_CTRL1, 1 << shift);
-}
-
-static int tps6507x_pmic_disable(struct regulator_dev *dev)
-{
-	struct tps6507x_pmic *tps = rdev_get_drvdata(dev);
-	int rid = rdev_get_id(dev);
-	u8 shift;
-
-	if (rid < TPS6507X_DCDC_1 || rid > TPS6507X_LDO_2)
-		return -EINVAL;
-
-	shift = TPS6507X_MAX_REG_ID - rid;
-	return tps6507x_pmic_clear_bits(tps, TPS6507X_REG_CON_CTRL1,
-					1 << shift);
-}
-
-static int tps6507x_pmic_get_voltage_sel(struct regulator_dev *dev)
-{
-	struct tps6507x_pmic *tps = rdev_get_drvdata(dev);
-	int data, rid = rdev_get_id(dev);
-	u8 reg, mask;
-
-	switch (rid) {
-	case TPS6507X_DCDC_1:
-		reg = TPS6507X_REG_DEFDCDC1;
-		mask = TPS6507X_DEFDCDCX_DCDC_MASK;
-		break;
-	case TPS6507X_DCDC_2:
-		if (tps->info[rid]->defdcdc_default)
-			reg = TPS6507X_REG_DEFDCDC2_HIGH;
-		else
-			reg = TPS6507X_REG_DEFDCDC2_LOW;
-		mask = TPS6507X_DEFDCDCX_DCDC_MASK;
-		break;
-	case TPS6507X_DCDC_3:
-		if (tps->info[rid]->defdcdc_default)
-			reg = TPS6507X_REG_DEFDCDC3_HIGH;
-		else
-			reg = TPS6507X_REG_DEFDCDC3_LOW;
-		mask = TPS6507X_DEFDCDCX_DCDC_MASK;
-		break;
-	case TPS6507X_LDO_1:
-		reg = TPS6507X_REG_LDO_CTRL1;
-		mask = TPS6507X_REG_LDO_CTRL1_LDO1_MASK;
-		break;
-	case TPS6507X_LDO_2:
-		reg = TPS6507X_REG_DEFLDO2;
-		mask = TPS6507X_REG_DEFLDO2_LDO2_MASK;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	data = tps6507x_pmic_reg_read(tps, reg);
-	if (data < 0)
-		return data;
-
-	data &= mask;
-	return data;
-}
-
-static int tps6507x_pmic_set_voltage_sel(struct regulator_dev *dev,
-					  unsigned selector)
-{
-	struct tps6507x_pmic *tps = rdev_get_drvdata(dev);
-	int data, rid = rdev_get_id(dev);
-	u8 reg, mask;
-
-	switch (rid) {
-	case TPS6507X_DCDC_1:
-		reg = TPS6507X_REG_DEFDCDC1;
-		mask = TPS6507X_DEFDCDCX_DCDC_MASK;
-		break;
-	case TPS6507X_DCDC_2:
-		if (tps->info[rid]->defdcdc_default)
-			reg = TPS6507X_REG_DEFDCDC2_HIGH;
-		else
-			reg = TPS6507X_REG_DEFDCDC2_LOW;
-		mask = TPS6507X_DEFDCDCX_DCDC_MASK;
-		break;
-	case TPS6507X_DCDC_3:
-		if (tps->info[rid]->defdcdc_default)
-			reg = TPS6507X_REG_DEFDCDC3_HIGH;
-		else
-			reg = TPS6507X_REG_DEFDCDC3_LOW;
-		mask = TPS6507X_DEFDCDCX_DCDC_MASK;
-		break;
-	case TPS6507X_LDO_1:
-		reg = TPS6507X_REG_LDO_CTRL1;
-		mask = TPS6507X_REG_LDO_CTRL1_LDO1_MASK;
-		break;
-	case TPS6507X_LDO_2:
-		reg = TPS6507X_REG_DEFLDO2;
-		mask = TPS6507X_REG_DEFLDO2_LDO2_MASK;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	data = tps6507x_pmic_reg_read(tps, reg);
-	if (data < 0)
-		return data;
-
-	data &= ~mask;
-	data |= selector;
-
-	return tps6507x_pmic_reg_write(tps, reg, data);
-}
-
-static struct regulator_ops tps6507x_pmic_ops = {
-	.is_enabled = tps6507x_pmic_is_enabled,
-	.enable = tps6507x_pmic_enable,
-	.disable = tps6507x_pmic_disable,
-	.get_voltage_sel = tps6507x_pmic_get_voltage_sel,
-	.set_voltage_sel = tps6507x_pmic_set_voltage_sel,
-	.list_voltage = regulator_list_voltage_table,
-	.map_voltage = regulator_map_voltage_ascend,
-};
-
-static struct of_regulator_match tps6507x_matches[] = {
-	{ .name = "VDCDC1"},
-	{ .name = "VDCDC2"},
-	{ .name = "VDCDC3"},
-	{ .name = "LDO1"},
-	{ .name = "LDO2"},
-};
-
-static struct tps6507x_board *tps6507x_parse_dt_reg_data(
-		struct platform_device *pdev,
-		struct of_regulator_match **tps6507x_reg_matches)
-{
-	struct tps6507x_board *tps_board;
-	struct device_node *np = pdev->dev.parent->of_node;
-	struct device_node *regulators;
-	struct of_regulator_match *matches;
-	static struct regulator_init_data *reg_data;
-	int idx = 0, count, ret;
-
-	tps_board = devm_kzalloc(&pdev->dev, sizeof(*tps_board),
-					GFP_KERNEL);
-	if (!tps_board)
-		return NULL;
-
-	regulators = of_get_child_by_name(np, "regulators");
-	if (!regulators) {
-		dev_err(&pdev->dev, "regulator node not found\n");
-		return NULL;
-	}
-
-	count = ARRAY_SIZE(tps6507x_matches);
-	matches = tps6507x_matches;
-
-	ret = of_regulator_match(&pdev->dev, regulators, matches, count);
-	of_node_put(regulators);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "Error parsing regulator init data: %d\n",
-			ret);
-		return NULL;
-	}
-
-	*tps6507x_reg_matches = matches;
-
-	reg_data = devm_kzalloc(&pdev->dev, (sizeof(struct regulator_init_data)
-					* TPS6507X_NUM_REGULATOR), GFP_KERNEL);
-	if (!reg_data)
-		return NULL;
-
-	tps_board->tps6507x_pmic_init_data = reg_data;
-
-	for (idx = 0; idx < count; idx++) {
-		if (!matches[idx].init_data || !matches[idx].of_node)
-			continue;
-
-		memcpy(&reg_data[idx], matches[idx].init_data,
-				sizeof(struct regulator_init_data));
-
-	}
-
-	return tps_board;
-}
-
-static int tps6507x_pmic_probe(struct platform_device *pdev)
-{
-	struct tps6507x_dev *tps6507x_dev = dev_get_drvdata(pdev->dev.parent);
-	struct tps_info *info = &tps6507x_pmic_regs[0];
-	struct regulator_config config = { };
-	struct regulator_init_data *init_data;
-	struct regulator_dev *rdev;
-	struct tps6507x_pmic *tps;
-	struct tps6507x_board *tps_board;
-	struct of_regulator_match *tps6507x_reg_matches = NULL;
-	int i;
-	int error;
-	unsigned int prop;
-
-	/**
-	 * tps_board points to pmic related constants
-	 * coming from the board-evm file.
+	/*
+	 * FIXME: remove  pvt->dimm_info[slot][channel] and use the 3
+	 * layers here.
 	 */
+	for (channel = 0; channel < mci->layers[0].size * mci->layers[1].size;
+	     channel++) {
+		for (slot = 0; slot < mci->layers[2].size; slot++) {
+			mtr = determine_mtr(pvt, slot, channel);
 
-	tps_board = dev_get_platdata(tps6507x_dev->dev);
-	if (IS_ENABLED(CONFIG_OF) && !tps_board &&
-		tps6507x_dev->dev->of_node)
-		tps_board = tps6507x_parse_dt_reg_data(pdev,
-				&tps6507x_reg_matches);
-	if (!tps_board)
-		return -EINVAL;
+			/* if no DIMMS on this slot, continue */
+			if (!MTR_DIMMS_PRESENT(mtr))
+				continue;
 
-	/**
-	 * init_data points to array of regulator_init structures
-	 * coming from the board-evm file.
+			dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms, mci->n_layers,
+				       channel / 2, channel % 2, slot);
+
+			size_mb =  pvt->dimm_info[slot][channel].megabytes;
+
+			edac_dbg(2, "dimm (branch %d channel %d slot %d): %d.%03d GB\n",
+				 channel / 2, channel % 2, slot,
+				 size_mb / 1000, size_mb % 1000);
+
+			dimm->nr_pages = size_mb << 8;
+			dimm->grain = 8;
+			dimm->dtype = MTR_DRAM_WIDTH(mtr) == 8 ?
+				      DEV_X8 : DEV_X4;
+			dimm->mtype = MEM_FB_DDR2;
+			/*
+			 * The eccc mechanism is SDDC (aka SECC), with
+			 * is similar to Chipkill.
+			 */
+			dimm->edac_mode = MTR_DRAM_WIDTH(mtr) == 8 ?
+					  EDAC_S8ECD8ED : EDAC_S4ECD4ED;
+			ndimms++;
+		}
+	}
+
+	/*
+	 * When just one memory is provided, it should be at location (0,0,0).
+	 * With such single-DIMM mode, the SDCC algorithm degrades to SECDEC+.
 	 */
-	init_data = tps_board->tps6507x_pmic_init_data;
-	if (!init_data)
+	if (ndimms == 1)
+		mci->dimms[0]->edac_mode = EDAC_SECDED;
+
+	return (ndimms == 0);
+}
+
+/*
+ *	i5400_enable_error_reporting
+ *			Turn on the memory reporting features of the hardware
+ */
+static void i5400_enable_error_reporting(struct mem_ctl_info *mci)
+{
+	struct i5400_pvt *pvt;
+	u32 fbd_error_mask;
+
+	pvt = mci->pvt_info;
+
+	/* Read the FBD Error Mask Register */
+	pci_read_config_dword(pvt->branchmap_werrors, EMASK_FBD,
+			&fbd_error_mask);
+
+	/* Enable with a '0' */
+	fbd_error_mask &= ~(ENABLE_EMASK_ALL);
+
+	pci_write_config_dword(pvt->branchmap_werrors, EMASK_FBD,
+			fbd_error_mask);
+}
+
+/*
+ *	i5400_probe1	Probe for ONE instance of device to see if it is
+ *			present.
+ *	return:
+ *		0 for FOUND a device
+ *		< 0 for error code
+ */
+static int i5400_probe1(struct pci_dev *pdev, int dev_idx)
+{
+	struct mem_ctl_info *mci;
+	struct i5400_pvt *pvt;
+	struct edac_mc_layer layers[3];
+
+	if (dev_idx >= ARRAY_SIZE(i5400_devs))
 		return -EINVAL;
 
-	tps = devm_kzalloc(&pdev->dev, sizeof(*tps), GFP_KERNEL);
-	if (!tps)
+	edac_dbg(0, "MC: pdev bus %u dev=0x%x fn=0x%x\n",
+		 pdev->bus->number,
+		 PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
+
+	/* We only are looking for func 0 of the set */
+	if (PCI_FUNC(pdev->devfn) != 0)
+		return -ENODEV;
+
+	/*
+	 * allocate a new MC control structure
+	 *
+	 * This drivers uses the DIMM slot as "csrow" and the rest as "channel".
+	 */
+	layers[0].type = EDAC_MC_LAYER_BRANCH;
+	layers[0].size = MAX_BRANCHES;
+	layers[0].is_virt_csrow = false;
+	layers[1].type = EDAC_MC_LAYER_CHANNEL;
+	layers[1].size = CHANNELS_PER_BRANCH;
+	layers[1].is_virt_csrow = false;
+	layers[2].type = EDAC_MC_LAYER_SLOT;
+	layers[2].size = DIMMS_PER_CHANNEL;
+	layers[2].is_virt_csrow = true;
+	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers, sizeof(*pvt));
+	if (mci == NULL)
 		return -ENOMEM;
 
-	mutex_init(&tps->io_lock);
+	edac_dbg(0, "MC: mci = %p\n", mci);
 
-	/* common for all regulators */
-	tps->mfd = tps6507x_dev;
+	mci->pdev = &pdev->dev;	/* record ptr  to the generic device */
 
-	for (i = 0; i < TPS6507X_NUM_REGULATOR; i++, info++, init_data++) {
-		/* Register the regulators */
-		tps->info[i] = info;
-		if (init_data->driver_data) {
-			struct tps6507x_reg_platform_data *data =
-					init_data->driver_data;
-			tps->info[i]->defdcdc_default = data->defdcdc_default;
-		}
+	pvt = mci->pvt_info;
+	pvt->system_address = pdev;	/* Record this device in our private */
+	pvt->maxch = MAX_CHANNELS;
+	pvt->maxdimmperch = DIMMS_PER_CHANNEL;
 
-		tps->desc[i].name = info->name;
-		tps->desc[i].id = i;
-		tps->desc[i].n_voltages = info->table_len;
-		tps->desc[i].volt_table = info->table;
-		tps->desc[i].ops = &tps6507x_pmic_ops;
-		tps->desc[i].type = REGULATOR_VOLTAGE;
-		tps->desc[i].owner = THIS_MODULE;
+	/* 'get' the pci devices we want to reserve for our use */
+	if (i5400_get_devices(mci, dev_idx))
+		goto fail0;
 
-		config.dev = tps6507x_dev->dev;
-		config.init_data = init_data;
-		config.driver_data = tps;
+	/* Time to get serious */
+	i5400_get_mc_regs(mci);	/* retrieve the hardware registers */
 
-		if (tps6507x_reg_matches) {
-			error = of_property_read_u32(
-				tps6507x_reg_matches[i].of_node,
-					"ti,defdcdc_default", &prop);
+	mci->mc_idx = 0;
+	mci->mtype_cap = MEM_FLAG_FB_DDR2;
+	mci->edac_ctl_cap = EDAC_FLAG_NONE;
+	mci->edac_cap = EDAC_FLAG_NONE;
+	mci->mod_name = "i5400_edac.c";
+	mci->mod_ver = I5400_REVISION;
+	mci->ctl_name = i5400_devs[dev_idx].ctl_name;
+	mci->dev_name = pci_name(pdev);
+	mci->ctl_page_to_phys = NULL;
 
-			if (!error)
-				tps->info[i]->defdcdc_default = prop;
+	/* Set the function pointer to an actual operation function */
+	mci->edac_check = i5400_check_error;
 
-			config.of_node = tps6507x_reg_matches[i].of_node;
-		}
-
-		rdev = devm_regulator_register(&pdev->dev, &tps->desc[i],
-					       &config);
-		if (IS_ERR(rdev)) {
-			dev_err(tps6507x_dev->dev,
-				"failed to register %s regulator\n",
-				pdev->name);
-			return PTR_ERR(rdev);
-		}
-
-		/* Save regulator for cleanup */
-		tps->rdev[i] = rdev;
+	/* initialize the MC control structure 'dimms' table
+	 * with the mapping and control information */
+	if (i5400_init_dimms(mci)) {
+		edac_dbg(0, "MC: Setting mci->edac_cap to EDAC_FLAG_NONE because i5400_init_dimms() returned nonzero value\n");
+		mci->edac_cap = EDAC_FLAG_NONE;	/* no dimms found */
+	} else {
+		edac_dbg(1, "MC: Enable error reporting now\n");
+		i5400_enable_error_reporting(mci);
 	}
 
-	tps6507x_dev->pmic = tps;
-	platform_set_drvdata(pdev, tps6507x_dev);
+	/* add this new MC control structure to EDAC's list of MCs */
+	if (edac_mc_add_mc(mci)) {
+		edac_dbg(0, "MC: failed edac_mc_add_mc()\n");
+		/* FIXME: perhaps some code should go here that disables error
+		 * reporting if we just enabled it
+		 */
+		goto fail1;
+	}
+
+	i5400_clear_error(mci);
+
+	/* allocating generic PCI control info */
+	i5400_pci = edac_pci_create_generic_ctl(&pdev->dev, EDAC_MOD_STR);
+	if (!i5400_pci) {
+		printk(KERN_WARNING
+			"%s(): Unable to create PCI control\n",
+			__func__);
+		printk(KERN_WARNING
+			"%s(): PCI error report via EDAC not setup\n",
+			__func__);
+	}
 
 	return 0;
+
+	/* Error exit unwinding stack */
+fail1:
+
+	i5400_put_devices(mci);
+
+fail0:
+	edac_mc_free(mci);
+	return -ENODEV;
 }
 
-static struct platform_driver tps6507x_pmic_driver = {
-	.driver = {
-		.name = "tps6507x-pmic",
-	},
-	.probe = tps6507x_pmic_probe,
+/*
+ *	i5400_init_one	constructor for one instance of device
+ *
+ * 	returns:
+ *		negative on error
+ *		count (>= 0)
+ */
+static int i5400_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	int rc;
+
+	edac_dbg(0, "MC:\n");
+
+	/* wake up device */
+	rc = pci_enable_device(pdev);
+	if (rc)
+		return rc;
+
+	/* now probe and enable the device */
+	return i5400_probe1(pdev, id->driver_data);
+}
+
+/*
+ *	i5400_remove_one	destructor for one instance of device
+ *
+ */
+static void i5400_remove_one(struct pci_dev *pdev)
+{
+	struct mem_ctl_info *mci;
+
+	edac_dbg(0, "\n");
+
+	if (i5400_pci)
+		edac_pci_release_generic_ctl(i5400_pci);
+
+	mci = edac_mc_del_mc(&pdev->dev);
+	if (!mci)
+		return;
+
+	/* retrieve references to resources, and free those resources */
+	i5400_put_devices(mci);
+
+	pci_disable_device(pdev);
+
+	edac_mc_free(mci);
+}
+
+/*
+ *	pci_device_id	table for which devices we are looking for
+ *
+ *	The "E500P" device is the first device supported.
+ */
+static const struct pci_device_id i5400_pci_tbl[] = {
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_5400_ERR)},
+	{0,}			/* 0 terminated list. */
 };
 
-static int __init tps6507x_pmic_init(void)
-{
-	return platform_driver_register(&tps6507x_pmic_driver);
-}
-subsys_initcall(tps6507x_pmic_init);
+MODULE_DEVICE_TABLE(pci, i5400_pci_tbl);
 
-static void __exit tps6507x_pmic_cleanup(void)
-{
-	platform_driver_unregister(&tps6507x_pmic_driver);
-}
-module_exit(tps6507x_pmic_cleanup);
+/*
+ *	i5400_driver	pci_driver structure for this module
+ *
+ */
+static struct pci_driver i5400_driver = {
+	.name = "i5400_edac",
+	.probe = i5400_init_one,
+	.remove = i5400_remove_one,
+	.id_table = i5400_pci_tbl,
+};
 
-MODULE_AUTHOR("Texas Instruments");
-MODULE_DESCRIPTION("TPS6507x voltage regulator driver");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:tps6507x-pmic");
+/*
+ *	i5400_init		Module entry function
+ *			Try to initialize this module for its devices
+ */
+static int __init i5400_init(void)
+{
+	int pci_rc;
+
+	edac_dbg(2, "MC:\n");
+
+	/* Ensure that the OPSTATE is set correctly for POLL or NMI */
+	opstate_init();
+
+	pci_rc = pci_register_driver(&i5400_driver);
+
+	return (pci_rc < 0) ? pci_rc : 0;
+}
+
+/*
+ *	i5400_exit()	Module exit function
+ *			Unregister the driver
+ */
+static void __exit i5400_exit(void)
+{
+	edac_dbg(2, "MC:\n");
+	pci_unregister_driver(&i5400_driver);
+}
+
+module_init(i5400_init);
+module_exit(i5400_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Ben Woodard <woodard@redhat.com>");
+MODULE_AUTHOR("Mauro Carvalho Chehab");
+MODULE_AUTHOR("Red Hat Inc. (http://www.redhat.com)");
+MODULE_DESCRIPTION("MC Driver for Intel I5400 memory controllers - "
+		   I5400_REVISION);
+
+module_param(edac_op_state, int, 0444);
+MODULE_PARM_DESC(edac_op_state, "EDAC Error Reporting state: 0=Poll,1=NMI");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+ * Intel 7300 class Memory Controllers kernel module (Clarksboro)
+ *
+ * This file may be distributed under the terms of the
+ * GNU General Public License version 2 only.
+ *
+ * Copyright (c) 2010 by:
+ *	 Mauro Carvalho Chehab
+ *
+ * Red Hat Inc. http://www.redhat.com
+ *
+ * Intel 7300 Chipset Memory Controller Hub (MCH) - Datasheet
+ *	http://www.intel.com/Assets/PDF/datasheet/318082.pdf
+ *
+ * TODO: The chipset allow checking for PCI Express errors also. Currently,
+ *	 the driver covers only memory error errors
+ *
+ * This driver uses "csrows" EDAC attribute to represent DIMM slot#
+ */
+
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/pci.h>
+#include <linux/pci_ids.h>
+#include <linux/slab.h>
+#include <linux/edac.h>
+#include <linux/mmzone.h>
+
+#include "edac_core.h"
+
+/*
+ * Alter this version for the I7300 module when modifications are made
+ */
+#define I7300_REVISION    " Ver: 1.0.0"
+
+#define EDAC_MOD_STR      "i7300_edac"
+
+#define i7300_printk(level, fmt, arg...) \
+	edac_p

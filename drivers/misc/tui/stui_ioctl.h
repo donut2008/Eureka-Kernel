@@ -1,37 +1,14 @@
-/* tui/stui_ioctl.h
- *
- * Samsung TUI HW Handler driver.
- *
- * Copyright (c) 2015 Samsung Electronics
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#ifndef __STUI_IOCTL_H_
-#define __STUI_IOCTL_H_
-
-/* Commands and Structures for TUI */
-#define STUI_HW_IOCTL_START_TUI		0x10
-#define STUI_HW_IOCTL_FINISH_TUI	0x11
-#ifdef SAMSUNG_TUI_TEST
-#define STUI_HW_IOCTL_GET_PHYS_ADDR	0x12
-#endif //SAMSUNG_TUI_TEST
-#define STUI_HW_IOCTL_GET_RESOLUTION	0x13
-
-struct tui_hw_buffer {
-	uint32_t width;
-	uint32_t height;
-	uint64_t fb_physical;
-	uint64_t fb_size;
-	uint64_t wb_physical;
-	uint64_t wb_size;
-	uint64_t disp_physical;
-	uint64_t disp_size;
-} __packed;
-
-#define STUI_RET_OK                   0x00030000
-#define STUI_RET_ERR_INTERNAL_ERROR   0x00030003
-
-#endif /* __STUI_IOCTL_H_ */
+ATURES_CONTROL_MISC__ATC_PRG_RESP_PASID_UR_EN__SHIFT 0xb
+#define BIF_FEATURES_CONTROL_MISC__BIF_RB_SET_OVERFLOW_EN_MASK 0x1000
+#define BIF_FEATURES_CONTROL_MISC__BIF_RB_SET_OVERFLOW_EN__SHIFT 0xc
+#define BIF_FEATURES_CONTROL_MISC__ATOMIC_ERR_INT_DIS_MASK 0x2000
+#define BIF_FEATURES_CONTROL_MISC__ATOMIC_ERR_INT_DIS__SHIFT 0xd
+#define BIF_FEATURES_CONTROL_MISC__BME_HDL_NONVIR_EN_MASK 0x8000
+#define BIF_FEATURES_CONTROL_MISC__BME_HDL_NONVIR_EN__SHIFT 0xf
+#define BIF_FEATURES_CONTROL_MISC__INIT_PFFLR_CRS_RET_DIS_MASK 0x10000
+#define BIF_FEATURES_CONTROL_MISC__INIT_PFFLR_CRS_RET_DIS__SHIFT 0x10
+#define BIF_FEATURES_CONTROL_MISC__FLR_MST_PEND_CHK_DIS_MASK 0x20000
+#define BIF_FEATURES_CONTROL_MISC__FLR_MST_PEND_CHK_DIS__SHIFT 0x11
+#define BIF_FEATURES_CONTROL_MISC__FLR_SLV_PEND_CHK_DIS_MASK 0x40000
+#define BIF_FEATURES_CONTROL_MISC__FLR_SLV_PEND_CHK_DIS__SHIFT 0x12
+#define BIF_FEATURES_CONTROL_MISC__SOFT_PF_FLR_UR_CF

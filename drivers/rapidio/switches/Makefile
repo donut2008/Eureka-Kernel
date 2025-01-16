@@ -1,8 +1,5 @@
-#
-# Makefile for RIO switches
-#
-
-obj-$(CONFIG_RAPIDIO_TSI57X)	+= tsi57x.o
-obj-$(CONFIG_RAPIDIO_CPS_XX)	+= idtcps.o
-obj-$(CONFIG_RAPIDIO_TSI568)	+= tsi568.o
-obj-$(CONFIG_RAPIDIO_CPS_GEN2)	+= idt_gen2.o
+EADY_MASK 0x1000
+#define SDMA0_STATUS_REG__PACKET_READY__SHIFT 0xc
+#define SDMA0_STATUS_REG__MC_WR_IDLE_MASK 0x2000
+#define SDMA0_STATUS_REG__MC_WR_IDLE__SHIFT 0xd
+#define SDMA0_STATUS_REG__SRBM_IDLE_M

@@ -1,45 +1,29 @@
-/*
- * Samsung TUI HW Handler driver.
- *
- * Copyright (c) 2015 Samsung Electronics
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
-*/
-
-#ifndef __LINUX_SAMSUNG_TUI_INF_H
-#define __LINUX_SAMSUNG_TUI_INF_H
-
-#define STUI_MODE_OFF			0x00
-#define STUI_MODE_TUI_SESSION		0x01
-#define STUI_MODE_DISPLAY_SEC		0x02
-#define STUI_MODE_TOUCH_SEC		0x04
-#define STUI_MODE_ALL			(STUI_MODE_TUI_SESSION | STUI_MODE_DISPLAY_SEC | STUI_MODE_TOUCH_SEC)
-
-int  stui_inc_blank_ref(void);
-int  stui_dec_blank_ref(void);
-int  stui_get_blank_ref(void);
-void stui_set_blank_ref(int ref);
-
-int  stui_get_mode(void);
-void stui_set_mode(int mode);
-
-int  stui_set_mask(int mask);
-int  stui_clear_mask(int mask);
-
-int stui_cancel_session(void);
-
-#ifdef CONFIG_SOC_EXYNOS3250
-#define TRUSTEDUI_MODE_CHANGE		1
-#define TRUSTEDUI_MODE_OFF				STUI_MODE_OFF
-#define TRUSTEDUI_MODE_INPUT_SECURED	STUI_MODE_TOUCH_SEC
-#define TRUSTEDUI_MODE_ALL				STUI_MODE_ALL
-
-int trustedui_nb_register(struct notifier_block *nb);
-int trustedui_nb_unregister(struct notifier_block *nb);
-int trustedui_nb_send_event(unsigned long val, void *v);
-void trustedui_set_mode(int mode);
-#endif /* CONFIG_SOC_EXYNOS3250 */
-
-#endif /* __LINUX_SAMSUNG_TUI_INF_H */
+O_CNTL__BACO_HANG_PROTECTION_EN_MASK 0x20
+#define BACO_CNTL__BACO_HANG_PROTECTION_EN__SHIFT 0x5
+#define BACO_CNTL__BACO_MODE_MASK 0x40
+#define BACO_CNTL__BACO_MODE__SHIFT 0x6
+#define BACO_CNTL__BACO_ANA_ISO_DIS_MASK 0x80
+#define BACO_CNTL__BACO_ANA_ISO_DIS__SHIFT 0x7
+#define BACO_CNTL__RCU_BIF_CONFIG_DONE_MASK 0x100
+#define BACO_CNTL__RCU_BIF_CONFIG_DONE__SHIFT 0x8
+#define BACO_CNTL__PWRGOOD_BF_MASK 0x200
+#define BACO_CNTL__PWRGOOD_BF__SHIFT 0x9
+#define BACO_CNTL__PWRGOOD_GPIO_MASK 0x400
+#define BACO_CNTL__PWRGOOD_GPIO__SHIFT 0xa
+#define BACO_CNTL__PWRGOOD_MEM_MASK 0x800
+#define BACO_CNTL__PWRGOOD_MEM__SHIFT 0xb
+#define BACO_CNTL__PWRGOOD_DVO_MASK 0x1000
+#define BACO_CNTL__PWRGOOD_DVO__SHIFT 0xc
+#define BACO_CNTL__PWRGOOD_IDSC_MASK 0x2000
+#define BACO_CNTL__PWRGOOD_IDSC__SHIFT 0xd
+#define BACO_CNTL__BACO_POWER_OFF_DRAM_MASK 0x10000
+#define BACO_CNTL__BACO_POWER_OFF_DRAM__SHIFT 0x10
+#define BACO_CNTL__BACO_BF_MEM_PHY_ISO_CNTRL_MASK 0x20000
+#define BACO_CNTL__BACO_BF_MEM_PHY_ISO_CNTRL__SHIFT 0x11
+#define BACO_CNTL__BACO_BIF_SCLK_SWITCH_MASK 0x40000
+#define BACO_CNTL__BACO_BIF_SCLK_SWITCH__SHIFT 0x12
+#define BF_ANA_ISO_CNTL__BF_ANA_ISO_DIS_MASK_MASK 0x1
+#define BF_ANA_ISO_CNTL__BF_ANA_ISO_DIS_MASK__SHIFT 0x0
+#define BF_ANA_ISO_CNTL__BF_VDDC_ISO_DIS_MASK_MASK 0x2
+#define BF_ANA_ISO_CNTL__BF_VDDC_ISO_DIS_MASK__SHIFT 0x1
+#de

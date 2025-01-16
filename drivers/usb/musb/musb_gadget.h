@@ -1,147 +1,91 @@
-/*
- * MUSB OTG driver peripheral defines
- *
- * Copyright 2005 Mentor Graphics Corporation
- * Copyright (C) 2005-2006 by Texas Instruments
- * Copyright (C) 2006-2007 Nokia Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- */
+set;
+  USHORT  usHSyncWidth;
+  USHORT  usVSyncOffset;
+  USHORT  usVSyncWidth;
+  USHORT  usImageHSize;
+  USHORT  usImageVSize;
+  UCHAR   ucHBorder;
+  UCHAR   ucVBorder;
+  ATOM_MODE_MISC_INFO_ACCESS susModeMiscInfo;
+  UCHAR   ucInternalModeNumber;
+  UCHAR   ucRefreshRate;
+}ATOM_DTD_FORMAT;
 
-#ifndef __MUSB_GADGET_H
-#define __MUSB_GADGET_H
+/****************************************************************************/
+// Structure used in LVDS_InfoTable
+//  * Need a document to describe this table
+/****************************************************************************/
+#define SUPPORTED_LCD_REFRESHRATE_30Hz          0x0004
+#define SUPPORTED_LCD_REFRESHRATE_40Hz          0x0008
+#define SUPPORTED_LCD_REFRESHRATE_50Hz          0x0010
+#define SUPPORTED_LCD_REFRESHRATE_60Hz          0x0020
+#define SUPPORTED_LCD_REFRESHRATE_48Hz          0x0040
 
-#include <linux/list.h>
-
-#if IS_ENABLED(CONFIG_USB_MUSB_GADGET) || IS_ENABLED(CONFIG_USB_MUSB_DUAL_ROLE)
-extern irqreturn_t musb_g_ep0_irq(struct musb *);
-extern void musb_g_tx(struct musb *, u8);
-extern void musb_g_rx(struct musb *, u8);
-extern void musb_g_reset(struct musb *);
-extern void musb_g_suspend(struct musb *);
-extern void musb_g_resume(struct musb *);
-extern void musb_g_wakeup(struct musb *);
-extern void musb_g_disconnect(struct musb *);
-extern void musb_gadget_cleanup(struct musb *);
-extern int musb_gadget_setup(struct musb *);
-
-#else
-static inline irqreturn_t musb_g_ep0_irq(struct musb *musb)
+//ucTableFormatRevision=1
+//ucTableContentRevision=1
+typedef struct _ATOM_LVDS_INFO
 {
-	return 0;
-}
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  ATOM_DTD_FORMAT     sLCDTiming;
+  USHORT              usModePatchTableOffset;
+  USHORT              usSupportedRefreshRate;     //Refer to panel info table in ATOMBIOS extension Spec.
+  USHORT              usOffDelayInMs;
+  UCHAR               ucPowerSequenceDigOntoDEin10Ms;
+  UCHAR               ucPowerSequenceDEtoBLOnin10Ms;
+  UCHAR               ucLVDS_Misc;               // Bit0:{=0:single, =1:dual},Bit1 {=0:666RGB, =1:888RGB},Bit2:3:{Grey level}
+                                                 // Bit4:{=0:LDI format for RGB888, =1 FPDI format for RGB888}
+                                                 // Bit5:{=0:Spatial Dithering disabled;1 Spatial Dithering enabled}
+                                                 // Bit6:{=0:Temporal Dithering disabled;1 Temporal Dithering enabled}
+  UCHAR               ucPanelDefaultRefreshRate;
+  UCHAR               ucPanelIdentification;
+  UCHAR               ucSS_Id;
+}ATOM_LVDS_INFO;
 
-static inline void musb_g_tx(struct musb *musb, u8 epnum)	{}
-static inline void musb_g_rx(struct musb *musb, u8 epnum)	{}
-static inline void musb_g_reset(struct musb *musb)		{}
-static inline void musb_g_suspend(struct musb *musb)		{}
-static inline void musb_g_resume(struct musb *musb)		{}
-static inline void musb_g_wakeup(struct musb *musb)		{}
-static inline void musb_g_disconnect(struct musb *musb)		{}
-static inline void musb_gadget_cleanup(struct musb *musb)	{}
-static inline int musb_gadget_setup(struct musb *musb)
+//ucTableFormatRevision=1
+//ucTableContentRevision=2
+typedef struct _ATOM_LVDS_INFO_V12
 {
-	return 0;
-}
-#endif
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  ATOM_DTD_FORMAT     sLCDTiming;
+  USHORT              usExtInfoTableOffset;
+  USHORT              usSupportedRefreshRate;     //Refer to panel info table in ATOMBIOS extension Spec.
+  USHORT              usOffDelayInMs;
+  UCHAR               ucPowerSequenceDigOntoDEin10Ms;
+  UCHAR               ucPowerSequenceDEtoBLOnin10Ms;
+  UCHAR               ucLVDS_Misc;               // Bit0:{=0:single, =1:dual},Bit1 {=0:666RGB, =1:888RGB},Bit2:3:{Grey level}
+                                                 // Bit4:{=0:LDI format for RGB888, =1 FPDI format for RGB888}
+                                                 // Bit5:{=0:Spatial Dithering disabled;1 Spatial Dithering enabled}
+                                                 // Bit6:{=0:Temporal Dithering disabled;1 Temporal Dithering enabled}
+  UCHAR               ucPanelDefaultRefreshRate;
+  UCHAR               ucPanelIdentification;
+  UCHAR               ucSS_Id;
+  USHORT              usLCDVenderID;
+  USHORT              usLCDProductID;
+  UCHAR               ucLCDPanel_SpecialHandlingCap;
+   UCHAR                        ucPanelInfoSize;               //  start from ATOM_DTD_FORMAT to end of panel info, include ExtInfoTable
+  UCHAR               ucReserved[2];
+}ATOM_LVDS_INFO_V12;
 
-enum buffer_map_state {
-	UN_MAPPED = 0,
-	PRE_MAPPED,
-	MUSB_MAPPED
-};
+//Definitions for ucLCDPanel_SpecialHandlingCap:
 
-struct musb_request {
-	struct usb_request	request;
-	struct list_head	list;
-	struct musb_ep		*ep;
-	struct musb		*musb;
-	u8 tx;			/* endpoint direction */
-	u8 epnum;
-	enum buffer_map_state map_state;
-};
+//Once DAL sees this CAP is set, it will read EDID from LCD on its own instead of using sLCDTiming in ATOM_LVDS_INFO_V12.
+//Other entries in ATOM_LVDS_INFO_V12 are still valid/useful to DAL
+#define   LCDPANEL_CAP_READ_EDID                  0x1
 
-static inline struct musb_request *to_musb_request(struct usb_request *req)
-{
-	return req ? container_of(req, struct musb_request, request) : NULL;
-}
+//If a design supports DRR (dynamic refresh rate) on internal panels (LVDS or EDP), this cap is set in ucLCDPanel_SpecialHandlingCap together
+//with multiple supported refresh rates@usSupportedRefreshRate. This cap should not be set when only slow refresh rate is supported (static
+//refresh rate switch by SW. This is only valid from ATOM_LVDS_INFO_V12
+#define   LCDPANEL_CAP_DRR_SUPPORTED              0x2
 
-extern struct usb_request *
-musb_alloc_request(struct usb_ep *ep, gfp_t gfp_flags);
-extern void musb_free_request(struct usb_ep *ep, struct usb_request *req);
+//Use this cap bit for a quick reference whether an embadded panel (LCD1 ) is LVDS or eDP.
+#define   LCDPANEL_CAP_eDP                        0x4
 
 
-/*
- * struct musb_ep - peripheral side view of endpoint rx or tx side
- */
-struct musb_ep {
-	/* stuff towards the head is basically write-once. */
-	struct usb_ep			end_point;
-	char				name[12];
-	struct musb_hw_ep		*hw_ep;
-	struct musb			*musb;
-	u8				current_epnum;
-
-	/* ... when enabled/disabled ... */
-	u8				type;
-	u8				is_in;
-	u16				packet_sz;
-	const struct usb_endpoint_descriptor	*desc;
-	struct dma_channel		*dma;
-
-	/* later things are modified based on usage */
-	struct list_head		req_list;
-
-	u8				wedged;
-
-	/* true if lock must be dropped but req_list may not be advanced */
-	u8				busy;
-
-	u8				hb_mult;
-};
-
-static inline struct musb_ep *to_musb_ep(struct usb_ep *ep)
-{
-	return ep ? container_of(ep, struct musb_ep, end_point) : NULL;
-}
-
-static inline struct musb_request *next_request(struct musb_ep *ep)
-{
-	struct list_head	*queue = &ep->req_list;
-
-	if (list_empty(queue))
-		return NULL;
-	return container_of(queue->next, struct musb_request, list);
-}
-
-extern const struct usb_ep_ops musb_g_ep0_ops;
-
-extern void musb_g_giveback(struct musb_ep *, struct usb_request *, int);
-
-extern void musb_ep_restart(struct musb *, struct musb_request *);
-
-#endif		/* __MUSB_GADGET_H */
+//Color Bit Depth definition in EDID V1.4 @BYTE 14h
+//Bit 6  5  4
+                              //      0  0  0  -  Color bit depth is undefined
+                              //      0  0  1  -  6 Bits per Primary Color
+                              //      0  1  0  -  8 Bits per Primary Color
+                              //      0  1  1  - 10 Bits per Primary Color
+                              //      1  0  0  - 12 Bits per Primary Color
+              

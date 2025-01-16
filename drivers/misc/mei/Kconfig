@@ -1,45 +1,35 @@
-config INTEL_MEI
-	tristate "Intel Management Engine Interface"
-	depends on X86 && PCI && WATCHDOG_CORE
-	help
-	  The Intel Management Engine (Intel ME) provides Manageability,
-	  Security and Media services for system containing Intel chipsets.
-	  if selected /dev/mei misc device will be created.
+) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 1);
+			status += MXL_SetGPIO(fe, 4, 1);
+			status += MXL_SetGPIO(fe, 3, 1);
+			status += MXL_SetGPIO(fe, 1, 1);
+		}
+	}
 
-	  For more information see
-	  <http://software.intel.com/en-us/manageability/>
+	if (state->TF_Type == MXL_TF_D) { /* Tracking Filter type D */
 
-config INTEL_MEI_ME
-	tristate "ME Enabled Intel Chipsets"
-	select INTEL_MEI
-	depends on X86 && PCI && WATCHDOG_CORE
-	help
-	  MEI support for ME Enabled Intel chipsets.
+		status += MXL_ControlWrite(fe, DAC_DIN_B, 0);
 
-	  Supported Chipsets are:
-	  7 Series Chipset Family
-	  6 Series Chipset Family
-	  5 Series Chipset Family
-	  4 Series Chipset Family
-	  Mobile 4 Series Chipset Family
-	  ICH9
-	  82946GZ/GL
-	  82G35 Express
-	  82Q963/Q965
-	  82P965/G965
-	  Mobile PM965/GM965
-	  Mobile GME965/GLE960
-	  82Q35 Express
-	  82G33/G31/P35/P31 Express
-	  82Q33 Express
-	  82X38/X48 Express
-
-config INTEL_MEI_TXE
-	tristate "Intel Trusted Execution Environment with ME Interface"
-	select INTEL_MEI
-	depends on X86 && PCI && WATCHDOG_CORE
-	help
-	  MEI Support for Trusted Execution Environment device on Intel SoCs
-
-	  Supported SoCs:
-	  Intel Bay Trail
+		if (state->RF_IN >= 43000000 && state->RF_IN < 174000000) {
+			status += MXL_ControlWrite(fe, DAC_B_ENABLE, 0);
+			status += MXL_SetGPIO(fe, 4, 0);
+			status += MXL_SetGPIO(fe, 1, 1);
+			status += MXL_SetGPIO(fe, 3, 1);
+		}
+		if (state->RF_IN >= 174000000 && state->RF_IN < 250000000) {
+			status += MXL_ControlWrite(fe, DAC_B_ENABLE, 0);
+			status += MXL_SetGPIO(fe, 4, 0);
+			status += MXL_SetGPIO(fe, 1, 0);
+			status += MXL_SetGPIO(fe, 3, 1);
+		}
+		if (state->RF_IN >= 250000000 && state->RF_IN < 310000000) {
+			status += MXL_ControlWrite(fe, DAC_B_ENABLE, 0);
+			status += MXL_SetGPIO(fe, 4, 1);
+			status += MXL_SetGPIO(fe, 1, 0);
+			status += MXL_SetGPIO(fe, 3, 1);
+		}
+		if (state->RF_IN >= 310000000 && state->RF_IN < 360000000) {
+			status += MXL_ControlWrite(fe, DAC_B_ENABLE, 0);
+			status += MXL_SetGPIO(fe, 4, 1);
+			status += MXL_SetGPIO(fe, 1, 0);
+			status += MXL_SetGPIO

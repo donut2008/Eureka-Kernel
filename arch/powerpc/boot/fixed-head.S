@@ -1,4 +1,1 @@
-	.text
-	.global _zimage_start
-_zimage_start:
-	b	_zimage_start_lib
+Üœ‚ñøú>þæôØÒêûmú¼½µjð%nÒzxˆÍ,Kç|ÄC­qˆ>*‰Lœª–Pžd)AàcƒûÂ

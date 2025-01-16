@@ -1,26 +1,19 @@
-#
-# Makefile - Intel Management Engine Interface (Intel MEI) Linux driver
-# Copyright (c) 2010-2014, Intel Corporation.
-#
-obj-$(CONFIG_INTEL_MEI) += mei.o
-mei-objs := init.o
-mei-objs += hbm.o
-mei-objs += interrupt.o
-mei-objs += client.o
-mei-objs += main.o
-mei-objs += amthif.o
-mei-objs += wd.o
-mei-objs += bus.o
-mei-objs += bus-fixup.o
-mei-$(CONFIG_DEBUG_FS) += debugfs.o
-
-obj-$(CONFIG_INTEL_MEI_ME) += mei-me.o
-mei-me-objs := pci-me.o
-mei-me-objs += hw-me.o
-
-obj-$(CONFIG_INTEL_MEI_TXE) += mei-txe.o
-mei-txe-objs := pci-txe.o
-mei-txe-objs += hw-txe.o
-
-mei-$(CONFIG_EVENT_TRACING) += mei-trace.o
-CFLAGS_mei-trace.o = -I$(src)
+e an
+ * SVGA_3D_CMD_DX_SET_SINGLE_CONSTANT_BUFFER command.
+ *
+ * @dev_priv: Pointer to a device private struct.
+ * @sw_context: The software context being used for this batch.
+ * @header: Pointer to the command header in the command stream.
+ */
+static int
+vmw_cmd_dx_set_single_constant_buffer(struct vmw_private *dev_priv,
+				      struct vmw_sw_context *sw_context,
+				      SVGA3dCmdHeader *header)
+{
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXSetSingleConstantBuffer body;
+	} *cmd;
+	struct vmw_resource_val_node *res_node = NULL;
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct vmw_ctx_b

@@ -1,202 +1,57 @@
-/*
- * PCMCIA driver for SL811HS (as found in REX-CFU1U)
- * Filename: sl811_cs.c
- * Author:   Yukio Yamamoto
- *
- *  Port to sl811-hcd and 2.6.x by
- *    Botond Botyanszki <boti@rocketmail.com>
- *    Simon Pickering
- *
- *  Last update: 2005-05-12
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/ptrace.h>
-#include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/timer.h>
-#include <linux/ioport.h>
-#include <linux/platform_device.h>
-
-#include <pcmcia/cistpl.h>
-#include <pcmcia/cisreg.h>
-#include <pcmcia/ds.h>
-
-#include <linux/usb/sl811.h>
-
-MODULE_AUTHOR("Botond Botyanszki");
-MODULE_DESCRIPTION("REX-CFU1U PCMCIA driver for 2.6");
-MODULE_LICENSE("GPL");
-
-
-/*====================================================================*/
-/* MACROS                                                             */
-/*====================================================================*/
-
-#define INFO(args...) printk(KERN_INFO "sl811_cs: " args)
-
-/*====================================================================*/
-/* VARIABLES                                                          */
-/*====================================================================*/
-
-typedef struct local_info_t {
-	struct pcmcia_device	*p_dev;
-} local_info_t;
-
-static void sl811_cs_release(struct pcmcia_device * link);
-
-/*====================================================================*/
-
-static void release_platform_dev(struct device * dev)
-{
-	dev_dbg(dev, "sl811_cs platform_dev release\n");
-	dev->parent = NULL;
-}
-
-static struct sl811_platform_data platform_data = {
-	.potpg		= 100,
-	.power		= 50,		/* == 100mA */
-	// .reset	= ... FIXME:  invoke CF reset on the card
-};
-
-static struct resource resources[] = {
-	[0] = {
-		.flags	= IORESOURCE_IRQ,
-	},
-	[1] = {
-		// .name   = "address",
-		.flags	= IORESOURCE_IO,
-	},
-	[2] = {
-		// .name   = "data",
-		.flags	= IORESOURCE_IO,
-	},
-};
-
-extern struct platform_driver sl811h_driver;
-
-static struct platform_device platform_dev = {
-	.id			= -1,
-	.dev = {
-		.platform_data = &platform_data,
-		.release       = release_platform_dev,
-	},
-	.resource		= resources,
-	.num_resources		= ARRAY_SIZE(resources),
-};
-
-static int sl811_hc_init(struct device *parent, resource_size_t base_addr,
-			 int irq)
-{
-	if (platform_dev.dev.parent)
-		return -EBUSY;
-	platform_dev.dev.parent = parent;
-
-	/* finish seting up the platform device */
-	resources[0].start = irq;
-
-	resources[1].start = base_addr;
-	resources[1].end = base_addr;
-
-	resources[2].start = base_addr + 1;
-	resources[2].end   = base_addr + 1;
-
-	/* The driver core will probe for us.  We know sl811-hcd has been
-	 * initialized already because of the link order dependency created
-	 * by referencing "sl811h_driver".
-	 */
-	platform_dev.name = sl811h_driver.driver.name;
-	return platform_device_register(&platform_dev);
-}
-
-/*====================================================================*/
-
-static void sl811_cs_detach(struct pcmcia_device *link)
-{
-	dev_dbg(&link->dev, "sl811_cs_detach\n");
-
-	sl811_cs_release(link);
-
-	/* This points to the parent local_info_t struct */
-	kfree(link->priv);
-}
-
-static void sl811_cs_release(struct pcmcia_device * link)
-{
-	dev_dbg(&link->dev, "sl811_cs_release\n");
-
-	pcmcia_disable_device(link);
-	platform_device_unregister(&platform_dev);
-}
-
-static int sl811_cs_config_check(struct pcmcia_device *p_dev, void *priv_data)
-{
-	if (p_dev->config_index == 0)
-		return -EINVAL;
-
-	return pcmcia_request_io(p_dev);
-}
-
-
-static int sl811_cs_config(struct pcmcia_device *link)
-{
-	struct device		*parent = &link->dev;
-	int			ret;
-
-	dev_dbg(&link->dev, "sl811_cs_config\n");
-
-	link->config_flags |= CONF_ENABLE_IRQ |	CONF_AUTO_SET_VPP |
-		CONF_AUTO_CHECK_VCC | CONF_AUTO_SET_IO;
-
-	if (pcmcia_loop_config(link, sl811_cs_config_check, NULL))
-		goto failed;
-
-	/* require an IRQ and two registers */
-	if (resource_size(link->resource[0]) < 2)
-		goto failed;
-
-	if (!link->irq)
-		goto failed;
-
-	ret = pcmcia_enable_device(link);
-	if (ret)
-		goto failed;
-
-	if (sl811_hc_init(parent, link->resource[0]->start, link->irq)
-			< 0) {
-failed:
-		printk(KERN_WARNING "sl811_cs_config failed\n");
-		sl811_cs_release(link);
-		return  -ENODEV;
-	}
-	return 0;
-}
-
-static int sl811_cs_probe(struct pcmcia_device *link)
-{
-	local_info_t *local;
-
-	local = kzalloc(sizeof(local_info_t), GFP_KERNEL);
-	if (!local)
-		return -ENOMEM;
-	local->p_dev = link;
-	link->priv = local;
-
-	return sl811_cs_config(link);
-}
-
-static const struct pcmcia_device_id sl811_ids[] = {
-	PCMCIA_DEVICE_MANF_CARD(0xc015, 0x0001), /* RATOC USB HOST CF+ Card */
-	PCMCIA_DEVICE_NULL,
-};
-MODULE_DEVICE_TABLE(pcmcia, sl811_ids);
-
-static struct pcmcia_driver sl811_cs_driver = {
-	.owner		= THIS_MODULE,
-	.name		= "sl811_cs",
-	.probe		= sl811_cs_probe,
-	.remove		= sl811_cs_detach,
-	.id_table	= sl811_ids,
-};
-module_pcmcia_driver(sl811_cs_driver);
+_F0_PIN_CONTROL_CODEC_CS_OVERRIDE_8                             0x61
+#define ixAZALIA_F0_CODEC_PIN_ASSOCIATION_INFO                                  0x62
+#define ixAZALIA_F0_CODEC_PIN_CONTROL_DIGITAL_OUTPUT_STATUS                     0x63
+#define ixAZALIA_F0_CODEC_PIN_CONTROL_LPIB_SNAPSHOT_CONTROL                     0x64
+#define ixAZALIA_F0_CODEC_PIN_CONTROL_LPIB                                      0x65
+#define ixAZALIA_F0_CODEC_PIN_CONTROL_LPIB_TIMER_SNAPSHOT                       0x66
+#define ixAZALIA_F0_CODEC_PIN_CONTROL_CODING_TYPE                               0x67
+#define ixAZALIA_F0_CODEC_PIN_CONTROL_FORMAT_CHANGED                            0x68
+#define ixAZALIA_F0_CODEC_PIN_CONTROL_WIRELESS_DISPLAY_IDENTIFICATION           0x69
+#define ixAZALIA_F0_CODEC_PIN_CONTROL_REMOTE_KEEPALIVE                          0x6a
+#define ixAZALIA_F0_AUDIO_ENABLE_STATUS                                         0x6b
+#define ixAZALIA_F0_AUDIO_ENABLED_INT_STATUS                                    0x6c
+#define ixAZALIA_F0_AUDIO_DISABLED_INT_STATUS                                   0x6d
+#define ixAZALIA_F0_AUDIO_FORMAT_CHANGED_INT_STATUS                             0x6e
+#define mmAZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX                                  0x59d4
+#define mmAZF0INPUTENDPOINT0_AZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX               0x59d4
+#define mmAZF0INPUTENDPOINT1_AZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX               0x59d8
+#define mmAZF0INPUTENDPOINT2_AZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX               0x59dc
+#define mmAZF0INPUTENDPOINT3_AZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX               0x59e0
+#define mmAZF0INPUTENDPOINT4_AZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX               0x59e4
+#define mmAZF0INPUTENDPOINT5_AZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX               0x59e8
+#define mmAZF0INPUTENDPOINT6_AZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX               0x59ec
+#define mmAZF0INPUTENDPOINT7_AZALIA_F0_CODEC_INPUT_ENDPOINT_INDEX               0x59f0
+#define mmAZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                                   0x59d5
+#define mmAZF0INPUTENDPOINT0_AZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                0x59d5
+#define mmAZF0INPUTENDPOINT1_AZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                0x59d9
+#define mmAZF0INPUTENDPOINT2_AZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                0x59dd
+#define mmAZF0INPUTENDPOINT3_AZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                0x59e1
+#define mmAZF0INPUTENDPOINT4_AZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                0x59e5
+#define mmAZF0INPUTENDPOINT5_AZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                0x59e9
+#define mmAZF0INPUTENDPOINT6_AZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                0x59ed
+#define mmAZF0INPUTENDPOINT7_AZALIA_F0_CODEC_INPUT_ENDPOINT_DATA                0x59f1
+#define ixAZALIA_F0_CODEC_INPUT_CONVERTER_PIN_DEBUG                             0x0
+#define ixAZALIA_F0_CODEC_INPUT_CONVERTER_PARAMETER_AUDIO_WIDGET_CAPABILITIES   0x1
+#define ixAZALIA_F0_CODEC_INPUT_CONVERTER_CONTROL_CONVERTER_FORMAT              0x2
+#define ixAZALIA_F0_CODEC_INPUT_CONVERTER_CONTROL_CHANNEL_STREAM_ID             0x3
+#define ixAZALIA_F0_CODEC_INPUT_CONVERTER_CONTROL_DIGITAL_CONVERTER             0x4
+#define ixAZALIA_F0_CODEC_INPUT_CONVERTER_PARAMETER_STREAM_FORMATS              0x5
+#define ixAZALIA_F0_CODEC_INPUT_CONVERTER_PARAMETER_SUPPORTED_SIZE_RATES        0x6
+#define ixAZALIA_F0_CODEC_INPUT_PIN_PARAMETER_AUDIO_WIDGET_CAPABILITIES         0x20
+#define ixAZALIA_F0_CODEC_INPUT_PIN_PARAMETER_CAPABILITIES                      0x21
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_UNSOLICITED_RESPONSE                0x22
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_RESPONSE_INPUT_PIN_SENSE            0x23
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_WIDGET_CONTROL                      0x24
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL_ENABLE                 0x36
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_MULTICHANNEL_ENABLE2                0x37
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_RESPONSE_HBR                        0x38
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_CHANNEL_ALLOCATION                  0x53
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_HOT_PLUG_CONTROL                    0x54
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_UNSOLICITED_RESPONSE_FORCE          0x55
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT      0x56
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_INPUT_STATUS_CONTROL                0x67
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_INFOFRAME                           0x68
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_LPIB_SNAPSHOT_CONTROL               0x64
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_LPIB                                0x65
+#define ixAZALIA_F0_CODEC_INPUT_PIN_CONTROL_LPIB_TIMER_SNAPSHOT                 0x66
+#define mmAZENDPOINT_IMMEDIATE_COMMAND_INPUT_I

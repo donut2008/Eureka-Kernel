@@ -1,1 +1,1 @@
-obj-y				+= common.o biuctrl.o
+PM_TABLE_337__LinkLevel_6_Enabl

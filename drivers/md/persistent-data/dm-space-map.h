@@ -1,157 +1,75 @@
-/*
- * Copyright (C) 2011 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-
-#ifndef _LINUX_DM_SPACE_MAP_H
-#define _LINUX_DM_SPACE_MAP_H
-
-#include "dm-block-manager.h"
-
-typedef void (*dm_sm_threshold_fn)(void *context);
-
-/*
- * struct dm_space_map keeps a record of how many times each block in a device
- * is referenced.  It needs to be fixed on disk as part of the transaction.
- */
-struct dm_space_map {
-	void (*destroy)(struct dm_space_map *sm);
-
-	/*
-	 * You must commit before allocating the newly added space.
-	 */
-	int (*extend)(struct dm_space_map *sm, dm_block_t extra_blocks);
-
-	/*
-	 * Extensions do not appear in this count until after commit has
-	 * been called.
-	 */
-	int (*get_nr_blocks)(struct dm_space_map *sm, dm_block_t *count);
-
-	/*
-	 * Space maps must never allocate a block from the previous
-	 * transaction, in case we need to rollback.  This complicates the
-	 * semantics of get_nr_free(), it should return the number of blocks
-	 * that are available for allocation _now_.  For instance you may
-	 * have blocks with a zero reference count that will not be
-	 * available for allocation until after the next commit.
-	 */
-	int (*get_nr_free)(struct dm_space_map *sm, dm_block_t *count);
-
-	int (*get_count)(struct dm_space_map *sm, dm_block_t b, uint32_t *result);
-	int (*count_is_more_than_one)(struct dm_space_map *sm, dm_block_t b,
-				      int *result);
-	int (*set_count)(struct dm_space_map *sm, dm_block_t b, uint32_t count);
-
-	int (*commit)(struct dm_space_map *sm);
-
-	int (*inc_block)(struct dm_space_map *sm, dm_block_t b);
-	int (*dec_block)(struct dm_space_map *sm, dm_block_t b);
-
-	/*
-	 * new_block will increment the returned block.
-	 */
-	int (*new_block)(struct dm_space_map *sm, dm_block_t *b);
-
-	/*
-	 * The root contains all the information needed to fix the space map.
-	 * Generally this info is small, so squirrel it away in a disk block
-	 * along with other info.
-	 */
-	int (*root_size)(struct dm_space_map *sm, size_t *result);
-	int (*copy_root)(struct dm_space_map *sm, void *copy_to_here_le, size_t len);
-
-	/*
-	 * You can register one threshold callback which is edge-triggered
-	 * when the free space in the space map drops below the threshold.
-	 */
-	int (*register_threshold_callback)(struct dm_space_map *sm,
-					   dm_block_t threshold,
-					   dm_sm_threshold_fn fn,
-					   void *context);
-};
-
-/*----------------------------------------------------------------*/
-
-static inline void dm_sm_destroy(struct dm_space_map *sm)
-{
-	sm->destroy(sm);
-}
-
-static inline int dm_sm_extend(struct dm_space_map *sm, dm_block_t extra_blocks)
-{
-	return sm->extend(sm, extra_blocks);
-}
-
-static inline int dm_sm_get_nr_blocks(struct dm_space_map *sm, dm_block_t *count)
-{
-	return sm->get_nr_blocks(sm, count);
-}
-
-static inline int dm_sm_get_nr_free(struct dm_space_map *sm, dm_block_t *count)
-{
-	return sm->get_nr_free(sm, count);
-}
-
-static inline int dm_sm_get_count(struct dm_space_map *sm, dm_block_t b,
-				  uint32_t *result)
-{
-	return sm->get_count(sm, b, result);
-}
-
-static inline int dm_sm_count_is_more_than_one(struct dm_space_map *sm,
-					       dm_block_t b, int *result)
-{
-	return sm->count_is_more_than_one(sm, b, result);
-}
-
-static inline int dm_sm_set_count(struct dm_space_map *sm, dm_block_t b,
-				  uint32_t count)
-{
-	return sm->set_count(sm, b, count);
-}
-
-static inline int dm_sm_commit(struct dm_space_map *sm)
-{
-	return sm->commit(sm);
-}
-
-static inline int dm_sm_inc_block(struct dm_space_map *sm, dm_block_t b)
-{
-	return sm->inc_block(sm, b);
-}
-
-static inline int dm_sm_dec_block(struct dm_space_map *sm, dm_block_t b)
-{
-	return sm->dec_block(sm, b);
-}
-
-static inline int dm_sm_new_block(struct dm_space_map *sm, dm_block_t *b)
-{
-	return sm->new_block(sm, b);
-}
-
-static inline int dm_sm_root_size(struct dm_space_map *sm, size_t *result)
-{
-	return sm->root_size(sm, result);
-}
-
-static inline int dm_sm_copy_root(struct dm_space_map *sm, void *copy_to_here_le, size_t len)
-{
-	return sm->copy_root(sm, copy_to_here_le, len);
-}
-
-static inline int dm_sm_register_threshold_callback(struct dm_space_map *sm,
-						    dm_block_t threshold,
-						    dm_sm_threshold_fn fn,
-						    void *context)
-{
-	if (sm->register_threshold_callback)
-		return sm->register_threshold_callback(sm, threshold, fn, context);
-
-	return -EINVAL;
-}
-
-
-#endif	/* _LINUX_DM_SPACE_MAP_H */
+evel_4_VClkBypassCntl__SHIFT 0x18
+#define DPM_TABLE_103__UvdLevel_5_VclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_103__UvdLevel_5_VclkFrequency__SHIFT 0x0
+#define DPM_TABLE_104__UvdLevel_5_DclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_104__UvdLevel_5_DclkFrequency__SHIFT 0x0
+#define DPM_TABLE_105__UvdLevel_5_DclkDivider_MASK 0xff
+#define DPM_TABLE_105__UvdLevel_5_DclkDivider__SHIFT 0x0
+#define DPM_TABLE_105__UvdLevel_5_VclkDivider_MASK 0xff00
+#define DPM_TABLE_105__UvdLevel_5_VclkDivider__SHIFT 0x8
+#define DPM_TABLE_105__UvdLevel_5_MinVddNb_MASK 0xffff0000
+#define DPM_TABLE_105__UvdLevel_5_MinVddNb__SHIFT 0x10
+#define DPM_TABLE_106__UvdLevel_5_padding_1_MASK 0xff
+#define DPM_TABLE_106__UvdLevel_5_padding_1__SHIFT 0x0
+#define DPM_TABLE_106__UvdLevel_5_padding_0_MASK 0xff00
+#define DPM_TABLE_106__UvdLevel_5_padding_0__SHIFT 0x8
+#define DPM_TABLE_106__UvdLevel_5_DClkBypassCntl_MASK 0xff0000
+#define DPM_TABLE_106__UvdLevel_5_DClkBypassCntl__SHIFT 0x10
+#define DPM_TABLE_106__UvdLevel_5_VClkBypassCntl_MASK 0xff000000
+#define DPM_TABLE_106__UvdLevel_5_VClkBypassCntl__SHIFT 0x18
+#define DPM_TABLE_107__UvdLevel_6_VclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_107__UvdLevel_6_VclkFrequency__SHIFT 0x0
+#define DPM_TABLE_108__UvdLevel_6_DclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_108__UvdLevel_6_DclkFrequency__SHIFT 0x0
+#define DPM_TABLE_109__UvdLevel_6_DclkDivider_MASK 0xff
+#define DPM_TABLE_109__UvdLevel_6_DclkDivider__SHIFT 0x0
+#define DPM_TABLE_109__UvdLevel_6_VclkDivider_MASK 0xff00
+#define DPM_TABLE_109__UvdLevel_6_VclkDivider__SHIFT 0x8
+#define DPM_TABLE_109__UvdLevel_6_MinVddNb_MASK 0xffff0000
+#define DPM_TABLE_109__UvdLevel_6_MinVddNb__SHIFT 0x10
+#define DPM_TABLE_110__UvdLevel_6_padding_1_MASK 0xff
+#define DPM_TABLE_110__UvdLevel_6_padding_1__SHIFT 0x0
+#define DPM_TABLE_110__UvdLevel_6_padding_0_MASK 0xff00
+#define DPM_TABLE_110__UvdLevel_6_padding_0__SHIFT 0x8
+#define DPM_TABLE_110__UvdLevel_6_DClkBypassCntl_MASK 0xff0000
+#define DPM_TABLE_110__UvdLevel_6_DClkBypassCntl__SHIFT 0x10
+#define DPM_TABLE_110__UvdLevel_6_VClkBypassCntl_MASK 0xff000000
+#define DPM_TABLE_110__UvdLevel_6_VClkBypassCntl__SHIFT 0x18
+#define DPM_TABLE_111__UvdLevel_7_VclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_111__UvdLevel_7_VclkFrequency__SHIFT 0x0
+#define DPM_TABLE_112__UvdLevel_7_DclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_112__UvdLevel_7_DclkFrequency__SHIFT 0x0
+#define DPM_TABLE_113__UvdLevel_7_DclkDivider_MASK 0xff
+#define DPM_TABLE_113__UvdLevel_7_DclkDivider__SHIFT 0x0
+#define DPM_TABLE_113__UvdLevel_7_VclkDivider_MASK 0xff00
+#define DPM_TABLE_113__UvdLevel_7_VclkDivider__SHIFT 0x8
+#define DPM_TABLE_113__UvdLevel_7_MinVddNb_MASK 0xffff0000
+#define DPM_TABLE_113__UvdLevel_7_MinVddNb__SHIFT 0x10
+#define DPM_TABLE_114__UvdLevel_7_padding_1_MASK 0xff
+#define DPM_TABLE_114__UvdLevel_7_padding_1__SHIFT 0x0
+#define DPM_TABLE_114__UvdLevel_7_padding_0_MASK 0xff00
+#define DPM_TABLE_114__UvdLevel_7_padding_0__SHIFT 0x8
+#define DPM_TABLE_114__UvdLevel_7_DClkBypassCntl_MASK 0xff0000
+#define DPM_TABLE_114__UvdLevel_7_DClkBypassCntl__SHIFT 0x10
+#define DPM_TABLE_114__UvdLevel_7_VClkBypassCntl_MASK 0xff000000
+#define DPM_TABLE_114__UvdLevel_7_VClkBypassCntl__SHIFT 0x18
+#define DPM_TABLE_115__VceLevel_0_Frequency_MASK 0xffffffff
+#define DPM_TABLE_115__VceLevel_0_Frequency__SHIFT 0x0
+#define DPM_TABLE_116__VceLevel_0_ClkBypassCntl_MASK 0xff
+#define DPM_TABLE_116__VceLevel_0_ClkBypassCntl__SHIFT 0x0
+#define DPM_TABLE_116__VceLevel_0_Divider_MASK 0xff00
+#define DPM_TABLE_116__VceLevel_0_Divider__SHIFT 0x8
+#define DPM_TABLE_116__VceLevel_0_MinVoltage_MASK 0xffff0000
+#define DPM_TABLE_116__VceLevel_0_MinVoltage__SHIFT 0x10
+#define DPM_TABLE_117__VceLevel_0_Reserved_MASK 0xffffffff
+#define DPM_TABLE_117__VceLevel_0_Reserved__SHIFT 0x0
+#define DPM_TABLE_118__VceLevel_1_Frequency_MASK 0xffffffff
+#define DPM_TABLE_118__VceLevel_1_Frequency__SHIFT 0x0
+#define DPM_TABLE_119__VceLevel_1_ClkBypassCntl_MASK 0xff
+#define DPM_TABLE_119__VceLevel_1_ClkBypassCntl__SHIFT 0x0
+#define DPM_TABLE_119__VceLevel_1_Divider_MASK 0xff00
+#define DPM_TABLE_119__VceLevel_1_Divider__SHIFT 0x8
+#define DPM_TABLE_119__VceLevel_1_MinVoltage_MASK 0xffff0000
+#define DPM_TABLE_119__VceLevel_1_MinVoltage__SHIFT 0x10
+#define DPM_TABLE_120__VceLevel_1_Reserved_MASK 0xffffffff
+#define DPM_TABLE_120__VceLe

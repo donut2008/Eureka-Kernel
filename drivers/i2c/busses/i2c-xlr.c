@@ -1,274 +1,268 @@
-/*
- * Copyright 2011, Netlogic Microsystems Inc.
- * Copyright 2004, Matt Porter <mporter@kernel.crashing.org>
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2.  This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
- */
+	struct list_head *l = dev->txreq_free.next;
 
-#include <linux/err.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/ioport.h>
-#include <linux/delay.h>
-#include <linux/errno.h>
-#include <linux/i2c.h>
-#include <linux/io.h>
-#include <linux/platform_device.h>
-
-/* XLR I2C REGISTERS */
-#define XLR_I2C_CFG		0x00
-#define XLR_I2C_CLKDIV		0x01
-#define XLR_I2C_DEVADDR		0x02
-#define XLR_I2C_ADDR		0x03
-#define XLR_I2C_DATAOUT		0x04
-#define XLR_I2C_DATAIN		0x05
-#define XLR_I2C_STATUS		0x06
-#define XLR_I2C_STARTXFR	0x07
-#define XLR_I2C_BYTECNT		0x08
-#define XLR_I2C_HDSTATIM	0x09
-
-/* XLR I2C REGISTERS FLAGS */
-#define XLR_I2C_BUS_BUSY	0x01
-#define XLR_I2C_SDOEMPTY	0x02
-#define XLR_I2C_RXRDY		0x04
-#define XLR_I2C_ACK_ERR		0x08
-#define XLR_I2C_ARB_STARTERR	0x30
-
-/* Register Values */
-#define XLR_I2C_CFG_ADDR	0xF8
-#define XLR_I2C_CFG_NOADDR	0xFA
-#define XLR_I2C_STARTXFR_ND	0x02    /* No Data */
-#define XLR_I2C_STARTXFR_RD	0x01    /* Read */
-#define XLR_I2C_STARTXFR_WR	0x00    /* Write */
-
-#define XLR_I2C_TIMEOUT		10	/* timeout per byte in msec */
-
-/*
- * On XLR/XLS, we need to use __raw_ IO to read the I2C registers
- * because they are in the big-endian MMIO area on the SoC.
- *
- * The readl/writel implementation on XLR/XLS byteswaps, because
- * those are for its little-endian PCI space (see arch/mips/Kconfig).
- */
-static inline void xlr_i2c_wreg(u32 __iomem *base, unsigned int reg, u32 val)
-{
-	__raw_writel(val, base + reg);
-}
-
-static inline u32 xlr_i2c_rdreg(u32 __iomem *base, unsigned int reg)
-{
-	return __raw_readl(base + reg);
-}
-
-struct xlr_i2c_private {
-	struct i2c_adapter adap;
-	u32 __iomem *iobase;
-};
-
-static int xlr_i2c_tx(struct xlr_i2c_private *priv,  u16 len,
-	u8 *buf, u16 addr)
-{
-	struct i2c_adapter *adap = &priv->adap;
-	unsigned long timeout, stoptime, checktime;
-	u32 i2c_status;
-	int pos, timedout;
-	u8 offset, byte;
-
-	offset = buf[0];
-	xlr_i2c_wreg(priv->iobase, XLR_I2C_ADDR, offset);
-	xlr_i2c_wreg(priv->iobase, XLR_I2C_DEVADDR, addr);
-	xlr_i2c_wreg(priv->iobase, XLR_I2C_CFG, XLR_I2C_CFG_ADDR);
-	xlr_i2c_wreg(priv->iobase, XLR_I2C_BYTECNT, len - 1);
-
-	timeout = msecs_to_jiffies(XLR_I2C_TIMEOUT);
-	stoptime = jiffies + timeout;
-	timedout = 0;
-	pos = 1;
-retry:
-	if (len == 1) {
-		xlr_i2c_wreg(priv->iobase, XLR_I2C_STARTXFR,
-				XLR_I2C_STARTXFR_ND);
+		list_del(l);
+		spin_unlock(&dev->pending_lock);
+		spin_unlock_irqrestore(&qp->s_lock, flags);
+		tx = list_entry(l, struct qib_verbs_txreq, txreq.list);
 	} else {
-		xlr_i2c_wreg(priv->iobase, XLR_I2C_DATAOUT, buf[pos]);
-		xlr_i2c_wreg(priv->iobase, XLR_I2C_STARTXFR,
-				XLR_I2C_STARTXFR_WR);
-	}
-
-	while (!timedout) {
-		checktime = jiffies;
-		i2c_status = xlr_i2c_rdreg(priv->iobase, XLR_I2C_STATUS);
-
-		if (i2c_status & XLR_I2C_SDOEMPTY) {
-			pos++;
-			/* need to do a empty dataout after the last byte */
-			byte = (pos < len) ? buf[pos] : 0;
-			xlr_i2c_wreg(priv->iobase, XLR_I2C_DATAOUT, byte);
-
-			/* reset timeout on successful xmit */
-			stoptime = jiffies + timeout;
+		if (ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK &&
+		    list_empty(&qp->iowait)) {
+			dev->n_txwait++;
+			qp->s_flags |= QIB_S_WAIT_TX;
+			list_add_tail(&qp->iowait, &dev->txwait);
 		}
-		timedout = time_after(checktime, stoptime);
-
-		if (i2c_status & XLR_I2C_ARB_STARTERR) {
-			if (timedout)
-				break;
-			goto retry;
-		}
-
-		if (i2c_status & XLR_I2C_ACK_ERR)
-			return -EIO;
-
-		if ((i2c_status & XLR_I2C_BUS_BUSY) == 0 && pos >= len)
-			return 0;
+		qp->s_flags &= ~QIB_S_BUSY;
+		spin_unlock(&dev->pending_lock);
+		spin_unlock_irqrestore(&qp->s_lock, flags);
+		tx = ERR_PTR(-EBUSY);
 	}
-	dev_err(&adap->dev, "I2C transmit timeout\n");
-	return -ETIMEDOUT;
+	return tx;
 }
 
-static int xlr_i2c_rx(struct xlr_i2c_private *priv, u16 len, u8 *buf, u16 addr)
+static inline struct qib_verbs_txreq *get_txreq(struct qib_ibdev *dev,
+					 struct qib_qp *qp)
 {
-	struct i2c_adapter *adap = &priv->adap;
-	u32 i2c_status;
-	unsigned long timeout, stoptime, checktime;
-	int nbytes, timedout;
-	u8 byte;
+	struct qib_verbs_txreq *tx;
+	unsigned long flags;
 
-	xlr_i2c_wreg(priv->iobase, XLR_I2C_CFG, XLR_I2C_CFG_NOADDR);
-	xlr_i2c_wreg(priv->iobase, XLR_I2C_BYTECNT, len);
-	xlr_i2c_wreg(priv->iobase, XLR_I2C_DEVADDR, addr);
+	spin_lock_irqsave(&dev->pending_lock, flags);
+	/* assume the list non empty */
+	if (likely(!list_empty(&dev->txreq_free))) {
+		struct list_head *l = dev->txreq_free.next;
 
-	timeout = msecs_to_jiffies(XLR_I2C_TIMEOUT);
-	stoptime = jiffies + timeout;
-	timedout = 0;
-	nbytes = 0;
-retry:
-	xlr_i2c_wreg(priv->iobase, XLR_I2C_STARTXFR, XLR_I2C_STARTXFR_RD);
-
-	while (!timedout) {
-		checktime = jiffies;
-		i2c_status = xlr_i2c_rdreg(priv->iobase, XLR_I2C_STATUS);
-		if (i2c_status & XLR_I2C_RXRDY) {
-			if (nbytes > len)
-				return -EIO;	/* should not happen */
-
-			/* we need to do a dummy datain when nbytes == len */
-			byte = xlr_i2c_rdreg(priv->iobase, XLR_I2C_DATAIN);
-			if (nbytes < len)
-				buf[nbytes] = byte;
-			nbytes++;
-
-			/* reset timeout on successful read */
-			stoptime = jiffies + timeout;
-		}
-
-		timedout = time_after(checktime, stoptime);
-		if (i2c_status & XLR_I2C_ARB_STARTERR) {
-			if (timedout)
-				break;
-			goto retry;
-		}
-
-		if (i2c_status & XLR_I2C_ACK_ERR)
-			return -EIO;
-
-		if ((i2c_status & XLR_I2C_BUS_BUSY) == 0)
-			return 0;
+		list_del(l);
+		spin_unlock_irqrestore(&dev->pending_lock, flags);
+		tx = list_entry(l, struct qib_verbs_txreq, txreq.list);
+	} else {
+		/* call slow path to get the extra lock */
+		spin_unlock_irqrestore(&dev->pending_lock, flags);
+		tx =  __get_txreq(dev, qp);
 	}
-
-	dev_err(&adap->dev, "I2C receive timeout\n");
-	return -ETIMEDOUT;
+	return tx;
 }
 
-static int xlr_i2c_xfer(struct i2c_adapter *adap,
-	struct i2c_msg *msgs, int num)
+void qib_put_txreq(struct qib_verbs_txreq *tx)
 {
-	struct i2c_msg *msg;
-	int i;
+	struct qib_ibdev *dev;
+	struct qib_qp *qp;
+	unsigned long flags;
+
+	qp = tx->qp;
+	dev = to_idev(qp->ibqp.device);
+
+	if (atomic_dec_and_test(&qp->refcount))
+		wake_up(&qp->wait);
+	if (tx->mr) {
+		qib_put_mr(tx->mr);
+		tx->mr = NULL;
+	}
+	if (tx->txreq.flags & QIB_SDMA_TXREQ_F_FREEBUF) {
+		tx->txreq.flags &= ~QIB_SDMA_TXREQ_F_FREEBUF;
+		dma_unmap_single(&dd_from_dev(dev)->pcidev->dev,
+				 tx->txreq.addr, tx->hdr_dwords << 2,
+				 DMA_TO_DEVICE);
+		kfree(tx->align_buf);
+	}
+
+	spin_lock_irqsave(&dev->pending_lock, flags);
+
+	/* Put struct back on free list */
+	list_add(&tx->txreq.list, &dev->txreq_free);
+
+	if (!list_empty(&dev->txwait)) {
+		/* Wake up first QP wanting a free struct */
+		qp = list_entry(dev->txwait.next, struct qib_qp, iowait);
+		list_del_init(&qp->iowait);
+		atomic_inc(&qp->refcount);
+		spin_unlock_irqrestore(&dev->pending_lock, flags);
+
+		spin_lock_irqsave(&qp->s_lock, flags);
+		if (qp->s_flags & QIB_S_WAIT_TX) {
+			qp->s_flags &= ~QIB_S_WAIT_TX;
+			qib_schedule_send(qp);
+		}
+		spin_unlock_irqrestore(&qp->s_lock, flags);
+
+		if (atomic_dec_and_test(&qp->refcount))
+			wake_up(&qp->wait);
+	} else
+		spin_unlock_irqrestore(&dev->pending_lock, flags);
+}
+
+/*
+ * This is called when there are send DMA descriptors that might be
+ * available.
+ *
+ * This is called with ppd->sdma_lock held.
+ */
+void qib_verbs_sdma_desc_avail(struct qib_pportdata *ppd, unsigned avail)
+{
+	struct qib_qp *qp, *nqp;
+	struct qib_qp *qps[20];
+	struct qib_ibdev *dev;
+	unsigned i, n;
+
+	n = 0;
+	dev = &ppd->dd->verbs_dev;
+	spin_lock(&dev->pending_lock);
+
+	/* Search wait list for first QP wanting DMA descriptors. */
+	list_for_each_entry_safe(qp, nqp, &dev->dmawait, iowait) {
+		if (qp->port_num != ppd->port)
+			continue;
+		if (n == ARRAY_SIZE(qps))
+			break;
+		if (qp->s_tx->txreq.sg_count > avail)
+			break;
+		avail -= qp->s_tx->txreq.sg_count;
+		list_del_init(&qp->iowait);
+		atomic_inc(&qp->refcount);
+		qps[n++] = qp;
+	}
+
+	spin_unlock(&dev->pending_lock);
+
+	for (i = 0; i < n; i++) {
+		qp = qps[i];
+		spin_lock(&qp->s_lock);
+		if (qp->s_flags & QIB_S_WAIT_DMA_DESC) {
+			qp->s_flags &= ~QIB_S_WAIT_DMA_DESC;
+			qib_schedule_send(qp);
+		}
+		spin_unlock(&qp->s_lock);
+		if (atomic_dec_and_test(&qp->refcount))
+			wake_up(&qp->wait);
+	}
+}
+
+/*
+ * This is called with ppd->sdma_lock held.
+ */
+static void sdma_complete(struct qib_sdma_txreq *cookie, int status)
+{
+	struct qib_verbs_txreq *tx =
+		container_of(cookie, struct qib_verbs_txreq, txreq);
+	struct qib_qp *qp = tx->qp;
+
+	spin_lock(&qp->s_lock);
+	if (tx->wqe)
+		qib_send_complete(qp, tx->wqe, IB_WC_SUCCESS);
+	else if (qp->ibqp.qp_type == IB_QPT_RC) {
+		struct qib_ib_header *hdr;
+
+		if (tx->txreq.flags & QIB_SDMA_TXREQ_F_FREEBUF)
+			hdr = &tx->align_buf->hdr;
+		else {
+			struct qib_ibdev *dev = to_idev(qp->ibqp.device);
+
+			hdr = &dev->pio_hdrs[tx->hdr_inx].hdr;
+		}
+		qib_rc_send_complete(qp, hdr);
+	}
+	if (atomic_dec_and_test(&qp->s_dma_busy)) {
+		if (qp->state == IB_QPS_RESET)
+			wake_up(&qp->wait_dma);
+		else if (qp->s_flags & QIB_S_WAIT_DMA) {
+			qp->s_flags &= ~QIB_S_WAIT_DMA;
+			qib_schedule_send(qp);
+		}
+	}
+	spin_unlock(&qp->s_lock);
+
+	qib_put_txreq(tx);
+}
+
+static int wait_kmem(struct qib_ibdev *dev, struct qib_qp *qp)
+{
+	unsigned long flags;
 	int ret = 0;
-	struct xlr_i2c_private *priv = i2c_get_adapdata(adap);
 
-	for (i = 0; ret == 0 && i < num; i++) {
-		msg = &msgs[i];
-		if (msg->flags & I2C_M_RD)
-			ret = xlr_i2c_rx(priv, msg->len, &msg->buf[0],
-					msg->addr);
-		else
-			ret = xlr_i2c_tx(priv, msg->len, &msg->buf[0],
-					msg->addr);
+	spin_lock_irqsave(&qp->s_lock, flags);
+	if (ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK) {
+		spin_lock(&dev->pending_lock);
+		if (list_empty(&qp->iowait)) {
+			if (list_empty(&dev->memwait))
+				mod_timer(&dev->mem_timer, jiffies + 1);
+			qp->s_flags |= QIB_S_WAIT_KMEM;
+			list_add_tail(&qp->iowait, &dev->memwait);
+		}
+		spin_unlock(&dev->pending_lock);
+		qp->s_flags &= ~QIB_S_BUSY;
+		ret = -EBUSY;
 	}
+	spin_unlock_irqrestore(&qp->s_lock, flags);
 
-	return (ret != 0) ? ret : num;
+	return ret;
 }
 
-static u32 xlr_func(struct i2c_adapter *adap)
+static int qib_verbs_send_dma(struct qib_qp *qp, struct qib_ib_header *hdr,
+			      u32 hdrwords, struct qib_sge_state *ss, u32 len,
+			      u32 plen, u32 dwords)
 {
-	/* Emulate SMBUS over I2C */
-	return I2C_FUNC_SMBUS_EMUL | I2C_FUNC_I2C;
-}
-
-static struct i2c_algorithm xlr_i2c_algo = {
-	.master_xfer	= xlr_i2c_xfer,
-	.functionality	= xlr_func,
-};
-
-static int xlr_i2c_probe(struct platform_device *pdev)
-{
-	struct xlr_i2c_private  *priv;
-	struct resource *res;
+	struct qib_ibdev *dev = to_idev(qp->ibqp.device);
+	struct qib_devdata *dd = dd_from_dev(dev);
+	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	struct qib_verbs_txreq *tx;
+	struct qib_pio_header *phdr;
+	u32 control;
+	u32 ndesc;
 	int ret;
 
-	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	priv->iobase = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(priv->iobase))
-		return PTR_ERR(priv->iobase);
-
-	priv->adap.dev.parent = &pdev->dev;
-	priv->adap.owner	= THIS_MODULE;
-	priv->adap.algo_data	= priv;
-	priv->adap.algo		= &xlr_i2c_algo;
-	priv->adap.nr		= pdev->id;
-	priv->adap.class	= I2C_CLASS_HWMON;
-	snprintf(priv->adap.name, sizeof(priv->adap.name), "xlr-i2c");
-
-	i2c_set_adapdata(&priv->adap, priv);
-	ret = i2c_add_numbered_adapter(&priv->adap);
-	if (ret < 0) {
-		dev_err(&priv->adap.dev, "Failed to add i2c bus.\n");
-		return ret;
+	tx = qp->s_tx;
+	if (tx) {
+		qp->s_tx = NULL;
+		/* resend previously constructed packet */
+		ret = qib_sdma_verbs_send(ppd, tx->ss, tx->dwords, tx);
+		goto bail;
 	}
 
-	platform_set_drvdata(pdev, priv);
-	dev_info(&priv->adap.dev, "Added I2C Bus.\n");
-	return 0;
-}
+	tx = get_txreq(dev, qp);
+	if (IS_ERR(tx))
+		goto bail_tx;
 
-static int xlr_i2c_remove(struct platform_device *pdev)
-{
-	struct xlr_i2c_private *priv;
+	control = dd->f_setpbc_control(ppd, plen, qp->s_srate,
+				       be16_to_cpu(hdr->lrh[0]) >> 12);
+	tx->qp = qp;
+	atomic_inc(&qp->refcount);
+	tx->wqe = qp->s_wqe;
+	tx->mr = qp->s_rdma_mr;
+	if (qp->s_rdma_mr)
+		qp->s_rdma_mr = NULL;
+	tx->txreq.callback = sdma_complete;
+	if (dd->flags & QIB_HAS_SDMA_TIMEOUT)
+		tx->txreq.flags = QIB_SDMA_TXREQ_F_HEADTOHOST;
+	else
+		tx->txreq.flags = QIB_SDMA_TXREQ_F_INTREQ;
+	if (plen + 1 > dd->piosize2kmax_dwords)
+		tx->txreq.flags |= QIB_SDMA_TXREQ_F_USELARGEBUF;
 
-	priv = platform_get_drvdata(pdev);
-	i2c_del_adapter(&priv->adap);
-	return 0;
-}
+	if (len) {
+		/*
+		 * Don't try to DMA if it takes more descriptors than
+		 * the queue holds.
+		 */
+		ndesc = qib_count_sge(ss, len);
+		if (ndesc >= ppd->sdma_descq_cnt)
+			ndesc = 0;
+	} else
+		ndesc = 1;
+	if (ndesc) {
+		phdr = &dev->pio_hdrs[tx->hdr_inx];
+		phdr->pbc[0] = cpu_to_le32(plen);
+		phdr->pbc[1] = cpu_to_le32(control);
+		memcpy(&phdr->hdr, hdr, hdrwords << 2);
+		tx->txreq.flags |= QIB_SDMA_TXREQ_F_FREEDESC;
+		tx->txreq.sg_count = ndesc;
+		tx->txreq.addr = dev->pio_hdrs_phys +
+			tx->hdr_inx * sizeof(struct qib_pio_header);
+		tx->hdr_dwords = hdrwords + 2; /* add PBC length */
+		ret = qib_sdma_verbs_send(ppd, ss, dwords, tx);
+		goto bail;
+	}
 
-static struct platform_driver xlr_i2c_driver = {
-	.probe  = xlr_i2c_probe,
-	.remove = xlr_i2c_remove,
-	.driver = {
-		.name   = "xlr-i2cbus",
-	},
-};
-
-module_platform_driver(xlr_i2c_driver);
-
-MODULE_AUTHOR("Ganesan Ramalingam <ganesanr@netlogicmicro.com>");
-MODULE_DESCRIPTION("XLR/XLS SoC I2C Controller driver");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:xlr-i2cbus");
+	/* Allocate a buffer and copy the header and payload to it. */
+	tx->hdr_dwords = plen + 1;
+	phdr = kmalloc(tx->hdr_dwords << 2, GFP_ATOMIC);
+	if (!phdr)
+		got

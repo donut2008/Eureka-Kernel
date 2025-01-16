@@ -1,732 +1,395 @@
-/*
- * muic_regmap_max77865.c
- *
- * Copyright (C) 2016 Samsung Electronics
- * Insun Choi <insun77.choi@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
- *
- */
-
-#include <linux/gpio.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/slab.h>
-#include <linux/platform_device.h>
-#include <linux/module.h>
-#include <linux/delay.h>
-#include <linux/host_notify.h>
-#include <linux/string.h>
-
-#include <linux/muic/muic.h>
-
-#if defined(CONFIG_MUIC_NOTIFIER)
-#include <linux/muic/muic_notifier.h>
-#endif /* CONFIG_MUIC_NOTIFIER */
-
-#if defined(CONFIG_OF)
-#include <linux/of_device.h>
-#include <linux/of_gpio.h>
-#endif /* CONFIG_OF */
-
-#include "muic-internal.h"
-#include "muic_i2c.h"
-#include "muic_regmap.h"
-
-/* Control2 Initialization */
-#define INIT_CONTROL2	(0x00)
-
-/*
-    Control4 Initialization value : 00_1_1_0000
-    [7:6] RSVD
-    [5] FacAuto, 1:Factory Auto detectioni Enabled
-    [4] USBAuto, 1:USB Auto detection Enabled(valid only if AccDet=1)
-    [3:0] RSVD
-*/
-#define	INIT_CONTROL4	(0x30)
-
-/* Workaround for CL65 */
-#define INIT_CCDET	(0x00)
-
-/* max77865 I2C registers */
-enum max77865_muic_reg {
-	REG_ID			= 0x00,
-	REG_INT_MAIN		= 0x01,
-	REG_INT_BC		= 0x02,
-	REG_INT_FC		= 0x03,
-	REG_INT_GP		= 0x04,
-	REG_INTMASK_MAIN	= 0x07,
-	REG_INTMASK_BC		= 0x08,
-	REG_INTMASK_FC		= 0x09,
-	REG_INTMASK_GP		= 0x0A,
-	REG_STATUS1_BC		= 0x0D,
-	REG_STATUS2_BC		= 0x0E,
-	REG_STATUS_GP		= 0x0F,
-	REG_CONTROL1_BC		= 0x13,
-	REG_CONTROL2_BC		= 0x14,
-	REG_CCDET		= 0x15,
-	REG_CONTROL1		= 0x19,
-	REG_CONTROL2		= 0x1A,
-	REG_CONTROL3		= 0x1B,
-	REG_CONTROL4		= 0x1C,
-	REG_HVCONTROL1		= 0x1D,
-	REG_HVCONTROL2		= 0x1E,
-
-	REG_END,
-};
-
-/* UID table */
-typedef enum {
-	UID_JIG_USB_ON		= 0x0, /* 301Kohm */
-	UID_JIG_UART_OFF	= 0x1, /* 523Kohm */
-	UID_RSVD		= 0x2,
-	UID_OPEN		= 0x3,
-} muic_uid_t;
-
-#define REG_ITEM(addr, bitp, mask) ((bitp<<16) | (mask<<8) | addr)
-
-/* Field */
-enum max77865_muic_reg_item {
-	ID_CHIP_REV		= REG_ITEM(REG_ID, _BIT0, _MASK8),
-
-	INT_MAIN_GP		= REG_ITEM(REG_INT_MAIN, _BIT4, _MASK1),
-	INT_MAIN_FC		= REG_ITEM(REG_INT_MAIN, _BIT3, _MASK1),
-	INT_MAIN_BC		= REG_ITEM(REG_INT_MAIN, _BIT1, _MASK1),
-
-	INT_BC_VBVolt		= REG_ITEM(REG_INT_BC, _BIT7, _MASK1),
-	INT_BC_DxOVP		= REG_ITEM(REG_INT_BC, _BIT6, _MASK1),
-	INT_BC_DNVDATREF	= REG_ITEM(REG_INT_BC, _BIT5, _MASK1), /* = VDNMon */
-	INT_BC_ChgDetRunF	= REG_ITEM(REG_INT_BC, _BIT4, _MASK1), /* Falling edge */
-	INT_BC_ChgDetRunR	= REG_ITEM(REG_INT_BC, _BIT3, _MASK1), /* Rising edge */
-	INT_BC_PrChgTyp		= REG_ITEM(REG_INT_BC, _BIT2, _MASK1),
-	INT_BC_DCDTmr		= REG_ITEM(REG_INT_BC, _BIT1, _MASK1),
-	INT_BC_ChgTyp		= REG_ITEM(REG_INT_BC, _BIT0, _MASK1),
-
-	INT_FC_MRxRdy		= REG_ITEM(REG_INT_FC, _BIT7, _MASK1),
-	INT_FC_MRxPerr		= REG_ITEM(REG_INT_FC, _BIT6, _MASK1),
-	INT_FC_MRxTrf		= REG_ITEM(REG_INT_FC, _BIT5, _MASK1),
-	INT_FC_MRxBufOw		= REG_ITEM(REG_INT_FC, _BIT4, _MASK1),
-	INT_FC_MPNack		= REG_ITEM(REG_INT_FC, _BIT3, _MASK1),
-	INT_FC_MPGDone		= REG_ITEM(REG_INT_FC, _BIT2, _MASK1),
-
-	INT_GP_UIDGND		= REG_ITEM(REG_INT_GP, _BIT4, _MASK1),
-	INT_GP_TSHUT		= REG_ITEM(REG_INT_GP, _BIT3, _MASK1),
-	INT_GP_VbADC		= REG_ITEM(REG_INT_GP, _BIT2, _MASK1),
-	INT_GP_RST		= REG_ITEM(REG_INT_GP, _BIT1, _MASK1),
-	INT_GP_UID		= REG_ITEM(REG_INT_GP, _BIT0, _MASK1),
-
-	INTMASK_MAIN_GP		= REG_ITEM(REG_INTMASK_MAIN, _BIT4, _MASK1),
-	INTMASK_MAIN_FC		= REG_ITEM(REG_INTMASK_MAIN, _BIT3, _MASK1),
-	INTMASK_MAIN_BC		= REG_ITEM(REG_INTMASK_MAIN, _BIT1, _MASK1),
-
-	INTMASK_BC_VBVolt	= REG_ITEM(REG_INTMASK_BC, _BIT7, _MASK1),
-	INTMASK_BC_DxOVP	= REG_ITEM(REG_INTMASK_BC, _BIT6, _MASK1),
-	INTMASK_BC_DNVDATREF	= REG_ITEM(REG_INTMASK_BC, _BIT5, _MASK1),
-	INTMASK_BC_ChgDetRunF	= REG_ITEM(REG_INTMASK_BC, _BIT4, _MASK1),
-	INTMASK_BC_ChgDetRunR	= REG_ITEM(REG_INTMASK_BC, _BIT3, _MASK1),
-	INTMASK_BC_PrChgTyp	= REG_ITEM(REG_INTMASK_BC, _BIT2, _MASK1),
-	INTMASK_BC_DCDTmr	= REG_ITEM(REG_INTMASK_BC, _BIT1, _MASK1),
-	INTMASK_BC_ChgTyp	= REG_ITEM(REG_INTMASK_BC, _BIT0, _MASK1),
-
-	INTMASK_FC_MRxRdy	= REG_ITEM(REG_INTMASK_FC, _BIT7, _MASK1),
-	INTMASK_FC_MRxPerr	= REG_ITEM(REG_INTMASK_FC, _BIT6, _MASK1),
-	INTMASK_FC_MRxTrf	= REG_ITEM(REG_INTMASK_FC, _BIT5, _MASK1),
-	INTMASK_FC_MRxBufOw	= REG_ITEM(REG_INTMASK_FC, _BIT4, _MASK1),
-	INTMASK_FC_MPNack	= REG_ITEM(REG_INTMASK_FC, _BIT3, _MASK1),
-	INTMASK_FC_MPGDone	= REG_ITEM(REG_INTMASK_FC, _BIT2, _MASK1),
-
-	INTMASK_GP_UIDGND	= REG_ITEM(REG_INTMASK_GP, _BIT4, _MASK1),
-	INTMASK_GP_TSHUT	= REG_ITEM(REG_INTMASK_GP, _BIT3, _MASK1),
-	INTMASK_GP_VbADC	= REG_ITEM(REG_INTMASK_GP, _BIT2, _MASK1),
-	INTMASK_GP_RST		= REG_ITEM(REG_INTMASK_GP, _BIT1, _MASK1),
-	INTMASK_GP_UID		= REG_ITEM(REG_INTMASK_GP, _BIT0, _MASK1),
-
-	STATUS1_BC_VBVolt	= REG_ITEM(REG_STATUS1_BC, _BIT7, _MASK1),
-	STATUS1_BC_ChgDetRun	= REG_ITEM(REG_STATUS1_BC, _BIT6, _MASK1),
-	STATUS1_BC_PrChgTyp	= REG_ITEM(REG_STATUS1_BC, _BIT3, _MASK3),
-	STATUS1_BC_DCDTmr	= REG_ITEM(REG_STATUS1_BC, _BIT2, _MASK1),
-	STATUS1_BC_ChgTyp	= REG_ITEM(REG_STATUS1_BC, _BIT0, _MASK2),
-
-	STATUS2_BC_DxOVP	= REG_ITEM(REG_STATUS2_BC, _BIT1, _MASK1),
-	STATUS2_BC_DNVDATREF	= REG_ITEM(REG_STATUS2_BC, _BIT0, _MASK1),
-
-	STATUS_GP_UID		= REG_ITEM(REG_STATUS_GP, _BIT6, _MASK2),
-	STATUS_GP_UIDGND	= REG_ITEM(REG_STATUS_GP, _BIT5, _MASK1),
-	STATUS_GP_TSHUT		= REG_ITEM(REG_STATUS_GP, _BIT4, _MASK1),
-	STATUS_GP_VbADC		= REG_ITEM(REG_STATUS_GP, _BIT0, _MASK4),
-
-	CONTROL1_BC_DCDCpl	= REG_ITEM(REG_CONTROL1_BC, _BIT7, _MASK1),
-	CONTROL1_BC_UIDEn	= REG_ITEM(REG_CONTROL1_BC, _BIT6, _MASK1),
-	CONTROL1_BC_NoAutoIBUS	= REG_ITEM(REG_CONTROL1_BC, _BIT5, _MASK1),
-	CONTROL1_BC_3ADCPDet	= REG_ITEM(REG_CONTROL1_BC, _BIT4, _MASK1),
-	CONTROL1_BC_SfOutCtrl	= REG_ITEM(REG_CONTROL1_BC, _BIT2, _MASK2),
-	CONTROL1_BC_ChgDetMan	= REG_ITEM(REG_CONTROL1_BC, _BIT1, _MASK1),
-	CONTROL1_BC_ChgDetEn	= REG_ITEM(REG_CONTROL1_BC, _BIT0, _MASK1),
-
-	CONTROL2_BC_DNMonEn	= REG_ITEM(REG_CONTROL2_BC, _BIT5, _MASK1),
-	CONTROL2_BC_DPDNMan	= REG_ITEM(REG_CONTROL2_BC, _BIT4, _MASK1),
-	CONTROL2_BC_DPDrv	= REG_ITEM(REG_CONTROL2_BC, _BIT2, _MASK2),
-	CONTROL2_BC_DNDrv	= REG_ITEM(REG_CONTROL2_BC, _BIT0, _MASK2),
-
-	CONTROL1_NoBCComp	= REG_ITEM(REG_CONTROL1, _BIT7, _MASK1),
-	CONTROL1_RCPS		= REG_ITEM(REG_CONTROL1, _BIT6, _MASK1),
-	CONTROL1_COMP2Sw	= REG_ITEM(REG_CONTROL1, _BIT3, _MASK3),
-	CONTROL1_COMN1Sw	= REG_ITEM(REG_CONTROL1, _BIT0, _MASK3),
-
-	CONTROL2_CPEn		= REG_ITEM(REG_CONTROL2, _BIT2, _MASK1),
-	CONTROL2_CHGEnCtrl	= REG_ITEM(REG_CONTROL2, _BIT1, _MASK1),
-
-	CONTROL3_RES3Set	= REG_ITEM(REG_CONTROL3, _BIT5, _MASK1),
-	CONTROL3_RES2Set	= REG_ITEM(REG_CONTROL3, _BIT3, _MASK2),
-	CONTROL3_RES1Set	= REG_ITEM(REG_CONTROL3, _BIT1, _MASK2),
-	CONTROL3_JIGSet		= REG_ITEM(REG_CONTROL3, _BIT0, _MASK1),
-
-	CONTROL4_FctAuto	= REG_ITEM(REG_CONTROL4, _BIT5, _MASK1),
-	CONTROL4_USBAuto	= REG_ITEM(REG_CONTROL4, _BIT4, _MASK1),
-
-	HVCONTROL1_VbusADCEn	= REG_ITEM(REG_HVCONTROL1, _BIT0, _MASK1),
-
-	HVCONTROL2_FCRXDebEn	= REG_ITEM(REG_HVCONTROL2, _BIT7, _MASK1),
-	HVCONTROL2_MPngEnb	= REG_ITEM(REG_HVCONTROL2, _BIT6, _MASK1),
-	HVCONTROL2_MTxBusRes	= REG_ITEM(REG_HVCONTROL2, _BIT5, _MASK1),
-	HVCONTROL2_MTxEn	= REG_ITEM(REG_HVCONTROL2, _BIT4, _MASK1),
-	HVCONTROL2_MPing	= REG_ITEM(REG_HVCONTROL2, _BIT3, _MASK1),
-	HVCONTROL2_DP06En	= REG_ITEM(REG_HVCONTROL2, _BIT1, _MASK1),
-	HVCONTROL2_HVDigEn	= REG_ITEM(REG_HVCONTROL2, _BIT0, _MASK1),
-};
-
-/* For adcmode
-struct reg_value_set {
-	int value;
-	char *alias;
-};
-*/
-
-/*
- * Path Switching (Control1)
- * D+ [5:3] / D- [2:0]
- * 000: Open all / 001: USB / 010: AUDIO / 011: UART / 100 : USB_CP / 101 : UART_CP
- */
-enum {
-	_ID_OPEN	= 0x0,
-	_ID_BYPASS      = 0x1,
-	_NO_BC_COMP_OFF	= 0x0,
-	_NO_BC_COMP_ON	= 0x1,
-	_D_OPEN	        = 0x0,
-	_D_USB	        = 0x1,
-	_D_AUDIO	= 0x2,
-	_D_UART	        = 0x3,
-	_D_USB_CP	= 0x4,
-	_D_UART_CP      = 0x5,
-};
-
-/* COM patch Values */
-#define COM_VALUE(dm, open, comp_onoff) ((dm<<3)|(dm<<0)|(open<<6)| \
-					(comp_onoff<<7))
-
-#define _COM_OPEN		COM_VALUE(_D_OPEN, _ID_OPEN, _NO_BC_COMP_ON)
-#define _COM_OPEN_WITH_V_BUS	_COM_OPEN
-#define _COM_UART_AP		COM_VALUE(_D_UART, _ID_OPEN, _NO_BC_COMP_ON)
-#define _COM_UART_CP		COM_VALUE(_D_UART_CP, _ID_OPEN, _NO_BC_COMP_ON)
-#define _COM_USB_CP		COM_VALUE(_D_USB_CP, _ID_OPEN, _NO_BC_COMP_ON)
-#define _COM_USB_AP		COM_VALUE(_D_USB, _ID_OPEN, _NO_BC_COMP_ON)
-#define _COM_AUDIO		COM_VALUE(_D_AUDIO, _ID_OPEN, _NO_BC_COMP_OFF)
-
-static int max77865_com_value_tbl[] = {
-	[COM_OPEN]		= _COM_OPEN,
-	[COM_OPEN_WITH_V_BUS]	= _COM_OPEN_WITH_V_BUS,
-	[COM_UART_AP]		= _COM_UART_AP,
-	[COM_UART_CP]		= _COM_UART_CP,
-	[COM_USB_AP]		= _COM_USB_AP,
-	[COM_USB_CP]		= _COM_USB_CP,
-	[COM_AUDIO]		= _COM_AUDIO,
-};
-
-static regmap_t max77865_muic_regmap_table[] = {
-	[REG_ID]		= {"ID",		0x65, 0x00, INIT_NONE},
-	[REG_INT_MAIN]		= {"INT_MAIN",		0x00, 0x00, INIT_INT_CLR,},
-	[REG_INT_BC]		= {"INT_BC",		0x00, 0x00, INIT_INT_CLR,},
-	[REG_INT_FC]		= {"INT_FC",		0x00, 0x00, INIT_INT_CLR,},
-	[REG_INT_GP]		= {"INT_GP",		0x00, 0x00, INIT_INT_CLR,},
-	[REG_INTMASK_MAIN]	= {"INTMASK_MAIN",	0x0F, 0x00, INIT_NONE,},
-	[REG_INTMASK_BC]	= {"INTMASK_BC",	0xFF, 0x00, INIT_NONE,},
-	[REG_INTMASK_FC]	= {"INTMASK_FC",	0xFF, 0x00, INIT_NONE,},
-	[REG_INTMASK_GP]	= {"INTMASK_GP",	0xFD, 0x00, INIT_NONE,},
-	[REG_STATUS1_BC]	= {"STATUS1_BC",	0x00, 0x00, INIT_NONE,},
-	[REG_STATUS2_BC]	= {"STATUS2_BC",	0x00, 0x00, INIT_NONE,},
-	[REG_STATUS_GP]		= {"STATUS_GP",		0xE0, 0x00, INIT_NONE,},
-	[REG_CONTROL1_BC]	= {"CONTROL1_BC",	0xC5, 0x00, INIT_NONE,},
-	[REG_CONTROL2_BC]	= {"CONTROL2_BC",	0x00, 0x00, INIT_NONE,},
-	[REG_CCDET]		= {"CCDET",		0x00, 0x00, INIT_CCDET,},
-	[REG_CONTROL1]		= {"CONTROL1",		0x00, 0x00, INIT_NONE,},
-#if defined(CONFIG_SEC_FACTORY)
-	[REG_CONTROL2]		= {"CONTROL2",		0x00, 0x00, INIT_NONE,},
-#else
-	[REG_CONTROL2]		= {"CONTROL2",		0x00, 0x00, INIT_CONTROL2,},
-#endif
-	[REG_CONTROL3]		= {"CONTROL3",		0x20, 0x00, INIT_NONE,},
-	[REG_CONTROL4]		= {"CONTROL4",		0x30, 0x00, INIT_CONTROL4,},
-	[REG_HVCONTROL1]	= {"HVCONTROL1",	0x00, 0x00, INIT_NONE,},
-	[REG_HVCONTROL2]	= {"HVCONTROL2",	0x00, 0x00, INIT_NONE,},
-	[REG_END]		= {NULL,		0, 0, INIT_NONE},
-};
-
-static int max77865_muic_ioctl(struct regmap_desc *pdesc,
-		int arg1, int *arg2, int *arg3)
-{
-	int ret = 0;
-
-	switch (arg1) {
-	case GET_COM_VAL:
-		*arg2 = max77865_com_value_tbl[*arg2];
-		*arg3 = REG_CONTROL1;
-		break;
-	case GET_ADC:
-		*arg3 = STATUS_GP_UID;
-		break;
-	case GET_REVISION:
-		*arg3 = ID_CHIP_REV;
-		break;
-	case GET_OTG_STATUS:
-		*arg3 = INTMASK_BC_VBVolt;
-		break;
-
-	case GET_CHGTYPE:
-		*arg3 = STATUS1_BC_ChgTyp;
-		break;
-
-	case GET_PRCHGTYPE:
-		*arg3 = STATUS1_BC_PrChgTyp;
-		break;
-
-	default:
-		ret = -1;
-		break;
-	}
-
-	if (pdesc->trace) {
-		pr_info("%s: ret:%d arg1:%x,", __func__, ret, arg1);
-
-		if (arg2)
-			pr_info(" arg2:%x,", *arg2);
-
-		if (arg3)
-			pr_info(" arg3:%x - %s", *arg3,
-				regmap_to_name(pdesc, _ATTR_ADDR(*arg3)));
-		pr_info("\n");
-	}
-
-	return ret;
-}
-static int max77865_attach_ta(struct regmap_desc *pdesc)
-{
-	int attr, value, ret;
-
-	pr_info("%s\n", __func__);
-
-	attr = REG_CONTROL1;
-	value = _COM_OPEN;
-	ret = regmap_write_value(pdesc, attr, value);
-	if (ret < 0)
-		pr_err("%s CNTR1 reg write fail.\n", __func__);
-	else
-		_REGMAP_TRACE(pdesc, 'w', ret, attr, value);
-
-	return ret;
-}
-
-static int max77865_detach_ta(struct regmap_desc *pdesc)
-{
-	int attr, value, ret;
-
-	pr_info("%s\n", __func__);
-
-	attr = REG_CONTROL1 | _ATTR_OVERWRITE_M;
-	value = _COM_OPEN;
-	ret = regmap_write_value(pdesc, attr, value);
-	if (ret < 0)
-		pr_err("%s CNTR1 reg write fail.\n", __func__);
-	else
-		_REGMAP_TRACE(pdesc, 'w', ret, attr, value);
-
-	return ret;
-}
-
-static int max77865_set_rustproof(struct regmap_desc *pdesc, int op)
-{
-	pr_info("%s: Not implemented.\n", __func__);
-
-	return 0;
-}
-
-static int max77865_get_vps_data(struct regmap_desc *pdesc, void *pbuf)
-{
-	vps_data_t *pvps = (vps_data_t *)pbuf;
-	int attr;
-
-	attr = REG_ITEM(REG_STATUS1_BC, _BIT0, _MASK8);
-	*(u8 *)&pvps->t.status[0] = regmap_read_value(pdesc, attr + 0); /* BC STATUS1 */
-	*(u8 *)&pvps->t.status[1] = regmap_read_value(pdesc, attr + 1); /* BC STATUS2 */
-	*(u8 *)&pvps->t.status[2] = regmap_read_value(pdesc, attr + 2); /* GP STATUS */
-
-	attr = REG_ITEM(REG_CONTROL1_BC, _BIT0, _MASK8);
-	*(u8 *)&pvps->t.bccontrol[0] = regmap_read_value(pdesc, attr + 0);
-	*(u8 *)&pvps->t.bccontrol[1] = regmap_read_value(pdesc, attr + 1);
-
-	attr = REG_ITEM(REG_CONTROL1, _BIT0, _MASK8);
-	*(u8 *)&pvps->t.control[0] = regmap_read_value(pdesc, attr + 0);
-	*(u8 *)&pvps->t.control[1] = regmap_read_value(pdesc, attr + 1);
-	*(u8 *)&pvps->t.control[2] = regmap_read_value(pdesc, attr + 2);
-	*(u8 *)&pvps->t.control[3] = regmap_read_value(pdesc, attr + 3);
-
-	attr = REG_ITEM(REG_HVCONTROL1, _BIT0, _MASK8);
-	*(u8 *)&pvps->t.hvcontrol[0] = regmap_read_value(pdesc, attr + 0);
-	*(u8 *)&pvps->t.hvcontrol[1] = regmap_read_value(pdesc, attr + 1);
-
-	attr = STATUS_GP_UID;
-	*(u8 *)&pvps->t.uid = (pvps->t.status[2] >> _ATTR_BITP(attr)) & _ATTR_MASK(attr);
-	switch(pvps->t.uid) {
-	case 0: /* 301Kohm */
-		pvps->t.adc = 0x19;
-		break;
-	case 1: /* 523Kohm */
-		pvps->t.adc = 0x1c;
-		break;
-	case 2: /* RSVD */
-		break;
-	case 3: /* OPEN */
-		pvps->t.adc = 0x1f;
-		break;
-	default:
-		break;
-	}
-
-	attr = STATUS_GP_UIDGND;
-	*(u8 *)&pvps->t.uidgnd = (pvps->t.status[2] >> _ATTR_BITP(attr)) & _ATTR_MASK(attr);
-
-	attr = STATUS1_BC_VBVolt;
-	*(u8 *)&pvps->t.vbvolt = (pvps->t.status[0] >> _ATTR_BITP(attr)) & _ATTR_MASK(attr);
-
-	attr = STATUS1_BC_ChgDetRun;
-	*(u8 *)&pvps->t.chgdetrun = (pvps->t.status[0] >> _ATTR_BITP(attr)) & _ATTR_MASK(attr);
-
-	attr = STATUS1_BC_ChgTyp;
-	*(u8 *)&pvps->t.chgtyp = (pvps->t.status[0] >> _ATTR_BITP(attr)) & _ATTR_MASK(attr);
-
-	attr = STATUS1_BC_PrChgTyp;
-	*(u8 *)&pvps->t.prchgtyp = (pvps->t.status[0] >> _ATTR_BITP(attr)) & _ATTR_MASK(attr);
-
-	/* 1: timedout, 0: Not yet expired */
-	attr = STATUS1_BC_DCDTmr;
-	*(u8 *)&pvps->t.DCDTimedout = (pvps->t.status[0] >> _ATTR_BITP(attr)) & _ATTR_MASK(attr);
-
-	return 0;
-}
-
-static int max77865_enable_accdet(struct regmap_desc *pdesc, int enable)
-{
-	pr_info("%s: %s\n", __func__, enable ? "Enable": "Disable");
-	pr_info("%s: Not USE\n", __func__);
-	return 0;
-}
-
-static int max77865_enable_chgdet(struct regmap_desc *pdesc, int enable)
-{
-	int attr, value, ret;
-
-	pr_info("%s: %s\n", __func__, enable ? "Enable": "Disable");
-
-	attr = CONTROL1_BC_ChgDetEn;
-	value = enable ? 1: 0; /* 1: enable, 0: disable */
-	ret = regmap_write_value(pdesc, attr, value);
-	if (ret < 0)
-		pr_err("%s CNTR1 reg write fail.\n", __func__);
-	else
-		_REGMAP_TRACE(pdesc, 'w', ret, attr, value);
-
-	return ret;
-}
-
-#define BC_CONTROL1_CHGDETMAN_SHIFT	1
-#define BC_CONTROL1_CHGDETMAN_MASK	(0x1 << BC_CONTROL1_CHGDETMAN_SHIFT)
-
-static int max77865_run_chgdet(struct regmap_desc *pdesc, bool started)
-{
-	int value, ret, rvalue, wvalue;
-
-	pr_info("%s: %s\n", __func__, started ? "started": "disabled");
-
-	value = started ? 1 : 0; /* 0: Disabled, 1: Force a Manual Charger Detection */
-
-	rvalue = muic_i2c_read_byte(pdesc->muic->i2c, REG_CONTROL1_BC);
-	if (value)
-		wvalue = rvalue | BC_CONTROL1_CHGDETMAN_MASK;
-	else
-		wvalue = rvalue & (~BC_CONTROL1_CHGDETMAN_MASK);
-
-	ret = muic_i2c_write_byte(pdesc->muic->i2c, REG_CONTROL1_BC, wvalue);
-	if (ret < 0)
-		pr_err("%s CNTR1 reg write fail.\n", __func__);
-	else
-		pr_info("%s: 0x%02x -> 0x%02x\n", __func__, rvalue, wvalue);
-
-	return ret;
-}
-
-
-static int max77865_start_otg_test(struct regmap_desc *pdesc, int started)
-{
-	pr_info("%s: %s\n", __func__, started ? "started": "stopped");
-
-	if (started) {
-		max77865_enable_chgdet(pdesc, 0);
-		max77865_enable_accdet(pdesc, 1);
-	} else 
-		max77865_enable_chgdet(pdesc, 1);
-
-	return 0;
-}
-
-static int max77865_get_adc_scan_mode(struct regmap_desc *pdesc)
-{
-	pr_info("%s: Not USE\n", __func__);
-	return 0;
-}
-
-static void max77865_set_adc_scan_mode(struct regmap_desc *pdesc,
-		const int mode)
-{
-	pr_info("%s: Not USE\n", __func__);
-}
-
-enum switching_mode_val{
-	_SWMODE_AUTO = 0,
-	_SWMODE_MANUAL = 1,
-};
-
-static int max77865_get_switching_mode(struct regmap_desc *pdesc)
-{
-	return SWMODE_AUTO;
-}
-
-static void max77865_set_switching_mode(struct regmap_desc *pdesc, int mode)
-{
-        int attr, value;
-	int ret = 0;
-
-	pr_info("%s\n",__func__);
-
-	value = (mode == SWMODE_AUTO) ? _SWMODE_AUTO : _SWMODE_MANUAL;
-	attr = CONTROL1_NoBCComp;
-	ret = regmap_write_value(pdesc, attr, value);
-	if (ret < 0)
-		pr_err("%s REG_CTRL write fail.\n", __func__);
-	else
-		_REGMAP_TRACE(pdesc, 'w', ret, attr, value);
-}
-
-#if defined(CONFIG_MUIC_TEST_FUNC)
-static int max77854_usb_to_ta(struct regmap_desc *pdesc, int mode)
-{
-	int ret = -1;
-	muic_data_t *pmuic = pdesc->muic;
-	vps_data_t *pmsr = &pmuic->vps;
-
-	pr_info("%s\n",__func__);
-
-	if (mode == 0) {
-		pr_info("%s, Disable USB to TA\n",__func__);
-		if (pmuic->attached_dev == ATTACHED_DEV_TA_MUIC && pmuic->usb_to_ta_state) {
-			switch (pmsr->t.chgtyp) {
-			case 1:
-				pmuic->attached_dev = ATTACHED_DEV_USB_MUIC;
-				break;
-			case 2:
-				pmuic->attached_dev =ATTACHED_DEV_CDP_MUIC;
-				break;
-			}
-			muic_notifier_detach_attached_dev(ATTACHED_DEV_TA_MUIC);
-			muic_notifier_attach_attached_dev(pmuic->attached_dev);
-			pmuic->usb_to_ta_state = false;
-		}
-	} else if (mode == 1) {
-		pr_info("%s, Enable USB to TA\n",__func__);
-		if ((pdesc->muic->attached_dev == ATTACHED_DEV_CDP_MUIC ||
-				pdesc->muic->attached_dev == ATTACHED_DEV_USB_MUIC)
-				&& !pmuic->usb_to_ta_state) {
-			muic_notifier_detach_attached_dev(pdesc->muic->attached_dev);
-			muic_notifier_attach_attached_dev(ATTACHED_DEV_TA_MUIC);
-			pmuic->attached_dev = ATTACHED_DEV_TA_MUIC;
-			pmuic->usb_to_ta_state = true;
-		}
-	} else if (mode == 2) {
-		pr_info("%s, USB to TA %s\n",__func__,
-				pmuic->usb_to_ta_state?"Enabled":"Disabled");
-		ret = pmuic->usb_to_ta_state;
-	} else {
-		pr_info("%s, Unknown CMD\n",__func__);
-	}
-	return ret;
-}
-#endif
-
-static int max77865_get_vbus_value(struct regmap_desc *pdesc)
-{
-	muic_data_t *muic = pdesc->muic;
-	int vbadc, result = 0;
-	int adcen;
-	pr_info("%s\n",__func__);
-
-	adcen = i2c_smbus_read_byte_data(muic->i2c, REG_HVCONTROL1);
-	i2c_smbus_write_byte_data(muic->i2c, REG_HVCONTROL1, adcen | 0x01);
-	msleep(100);
-	vbadc = regmap_read_value(pdesc, STATUS_GP_VbADC);
-
-	switch (vbadc) {
-	case 0:
-		result = 0;
-		break;
-	case 1:
-	case 2:
-	case 3:
-		result = 5;
-		break;
-	case 4:
-		result = vbadc+3;
-		break;
-	case 5:
-	case 6:
-		result = 9;
-		break;
-	case 7:
-	case 8:
-	case 9:
-		result = 12;
-		break;
-	case (10)...(15):
-		result = vbadc+4;
-		break;
-	default:
-		break;
-	}
-
-	i2c_smbus_write_byte_data(muic->i2c, REG_HVCONTROL1, adcen);
-	return result;
-}
-
-static void max77865_get_fromatted_dump(struct regmap_desc *pdesc, char *mesg)
-{
-	muic_data_t *muic = pdesc->muic;
-	int val;
-
-	if (pdesc->trace)
-		pr_info("%s\n", __func__);
-
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_STATUS1_BC);
-	sprintf(mesg+strlen(mesg), "ST1_BC:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_STATUS2_BC);
-	sprintf(mesg+strlen(mesg), "ST2_BC:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_STATUS_GP);
-	sprintf(mesg+strlen(mesg), "ST_GP:%x ", val);
-
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_INTMASK_MAIN);
-	sprintf(mesg+strlen(mesg), "IM_MAIN:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_INTMASK_BC);
-	sprintf(mesg+strlen(mesg), "IM_BC:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_INTMASK_FC);
-	sprintf(mesg+strlen(mesg), "IM_FC:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_INTMASK_GP);
-	sprintf(mesg+strlen(mesg), "IM_GP:%x ", val);
-
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_CONTROL1_BC);
-	sprintf(mesg+strlen(mesg), "CT1_BC:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_CONTROL2_BC);
-	sprintf(mesg+strlen(mesg), "CT2_BC:%x ", val);
-
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_CONTROL1);
-	sprintf(mesg+strlen(mesg), "CT1:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_CONTROL2);
-	sprintf(mesg+strlen(mesg), "CT2:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_CONTROL3);
-	sprintf(mesg+strlen(mesg), "CT3:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_CONTROL4);
-	sprintf(mesg+strlen(mesg), "CT4:%x ", val);
-
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_HVCONTROL1);
-	sprintf(mesg+strlen(mesg), "HV1:%x ", val);
-	val = i2c_smbus_read_byte_data(muic->i2c, REG_HVCONTROL2);
-	sprintf(mesg+strlen(mesg), "HV2:%x ", val);
-}
-
-static int max77865_get_sizeof_regmap(void)
-{
-	pr_info("%s:%s\n", MUIC_DEV_NAME, __func__);
-	return (int)ARRAY_SIZE(max77865_muic_regmap_table);
-}
-
-/* Need to implement */
-void _max77865_muic_read_register(struct i2c_client *i2c)
-{
-	pr_info("%s: Not implemented.\n", __func__);
-}
-
-int max77865_muic_read_register(struct i2c_client *i2c)
-	__attribute__((weak, alias("_max77865_muic_read_register")));
-
-static int max77865_init_reg_func(struct regmap_desc *pdesc)
-{
-	pr_info("%s\n", __func__);
-
-	return 0;
-}
-
-static struct regmap_ops max77865_muic_regmap_ops = {
-	.get_size = max77865_get_sizeof_regmap,
-	.ioctl = max77865_muic_ioctl,
-	.get_formatted_dump = max77865_get_fromatted_dump,
-	.init = max77865_init_reg_func,
-};
-
-static struct vendor_ops max77865_muic_vendor_ops = {
-	.attach_ta = max77865_attach_ta,
-	.detach_ta = max77865_detach_ta,
-	.get_switch = max77865_get_switching_mode,
-	.set_switch = max77865_set_switching_mode,
-	.set_adc_scan_mode = max77865_set_adc_scan_mode,
-	.get_adc_scan_mode =  max77865_get_adc_scan_mode,
-	.set_rustproof = max77865_set_rustproof,
-	.enable_accdet = max77865_enable_accdet,
-	.enable_chgdet = max77865_enable_chgdet,
-	.run_chgdet = max77865_run_chgdet,
-	.start_otg_test = max77865_start_otg_test,
-	.get_vps_data = max77865_get_vps_data,
-	.get_vbus_value = max77865_get_vbus_value,
-#if defined(CONFIG_MUIC_TEST_FUNC)
-	.usb_to_ta = max77854_usb_to_ta,
-#endif
-};
-
-static struct regmap_desc max77865_muic_regmap_desc = {
-	.name = "max77865-MUIC",
-	.regmap = max77865_muic_regmap_table,
-	.size = REG_END,
-	.regmapops = &max77865_muic_regmap_ops,
-	.vendorops = &max77865_muic_vendor_ops,
-};
-
-void muic_register_max77865_regmap_desc(struct regmap_desc **pdesc)
-{
-	*pdesc = &max77865_muic_regmap_desc;
-}
+                      = 0x1,
+	ADDR_CONFIG_GPU_TILE_64                          = 0x2,
+	ADDR_CONFIG_GPU_TILE_128                         = 0x3,
+} MultiGPUTileSize;
+typedef enum RowSize {
+	ADDR_CONFIG_1KB_ROW                              = 0x0,
+	ADDR_CONFIG_2KB_ROW                              = 0x1,
+	ADDR_CONFIG_4KB_ROW                              = 0x2,
+} RowSize;
+typedef enum NumLowerPipes {
+	ADDR_CONFIG_1_LOWER_PIPES                        = 0x0,
+	ADDR_CONFIG_2_LOWER_PIPES                        = 0x1,
+} NumLowerPipes;
+typedef enum DebugBlockId {
+	DBG_CLIENT_BLKID_RESERVED                        = 0x0,
+	DBG_CLIENT_BLKID_dbg                             = 0x1,
+	DBG_CLIENT_BLKID_scf2                            = 0x2,
+	DBG_CLIENT_BLKID_mcd5                            = 0x3,
+	DBG_CLIENT_BLKID_vmc                             = 0x4,
+	DBG_CLIENT_BLKID_sx30                            = 0x5,
+	DBG_CLIENT_BLKID_mcd2                            = 0x6,
+	DBG_CLIENT_BLKID_bci1                            = 0x7,
+	DBG_CLIENT_BLKID_xdma_dbg_client_wrapper         = 0x8,
+	DBG_CLIENT_BLKID_mcc0                            = 0x9,
+	DBG_CLIENT_BLKID_uvdf_0                          = 0xa,
+	DBG_CLIENT_BLKID_uvdf_1                          = 0xb,
+	DBG_CLIENT_BLKID_bci0                            = 0xc,
+	DBG_CLIENT_BLKID_vcec0_0                         = 0xd,
+	DBG_CLIENT_BLKID_cb100                           = 0xe,
+	DBG_CLIENT_BLKID_cb001                           = 0xf,
+	DBG_CLIENT_BLKID_mcd4                            = 0x10,
+	DBG_CLIENT_BLKID_tmonw00                         = 0x11,
+	DBG_CLIENT_BLKID_cb101                           = 0x12,
+	DBG_CLIENT_BLKID_sx10                            = 0x13,
+	DBG_CLIENT_BLKID_cb301                           = 0x14,
+	DBG_CLIENT_BLKID_tmonw01                         = 0x15,
+	DBG_CLIENT_BLKID_vcea0_0                         = 0x16,
+	DBG_CLIENT_BLKID_vcea0_1                         = 0x17,
+	DBG_CLIENT_BLKID_vcea0_2                         = 0x18,
+	DBG_CLIENT_BLKID_vcea0_3                         = 0x19,
+	DBG_CLIENT_BLKID_scf1                            = 0x1a,
+	DBG_CLIENT_BLKID_sx20                            = 0x1b,
+	DBG_CLIENT_BLKID_spim1                           = 0x1c,
+	DBG_CLIENT_BLKID_pa10                            = 0x1d,
+	DBG_CLIENT_BLKID_pa00                            = 0x1e,
+	DBG_CLIENT_BLKID_gmcon                           = 0x1f,
+	DBG_CLIENT_BLKID_mcb                             = 0x20,
+	DBG_CLIENT_BLKID_vgt0                            = 0x21,
+	DBG_CLIENT_BLKID_pc0                             = 0x22,
+	DBG_CLIENT_BLKID_bci2                            = 0x23,
+	DBG_CLIENT_BLKID_uvdb_0                          = 0x24,
+	DBG_CLIENT_BLKID_spim3                           = 0x25,
+	DBG_CLIENT_BLKID_cpc_0                           = 0x26,
+	DBG_CLIENT_BLKID_cpc_1                           = 0x27,
+	DBG_CLIENT_BLKID_uvdm_0                          = 0x28,
+	DBG_CLIENT_BLKID_uvdm_1                          = 0x29,
+	DBG_CLIENT_BLKID_uvdm_2                          = 0x2a,
+	DBG_CLIENT_BLKID_uvdm_3                          = 0x2b,
+	DBG_CLIENT_BLKID_cb000                           = 0x2c,
+	DBG_CLIENT_BLKID_spim0                           = 0x2d,
+	DBG_CLIENT_BLKID_mcc2                            = 0x2e,
+	DBG_CLIENT_BLKID_ds0                             = 0x2f,
+	DBG_CLIENT_BLKID_srbm                            = 0x30,
+	DBG_CLIENT_BLKID_ih                              = 0x31,
+	DBG_CLIENT_BLKID_sem                             = 0x32,
+	DBG_CLIENT_BLKID_sdma_0                          = 0x33,
+	DBG_CLIENT_BLKID_sdma_1                          = 0x34,
+	DBG_CLIENT_BLKID_hdp                             = 0x35,
+	DBG_CLIENT_BLKID_acp_0                           = 0x36,
+	DBG_CLIENT_BLKID_acp_1                           = 0x37,
+	DBG_CLIENT_BLKID_cb200                           = 0x38,
+	DBG_CLIENT_BLKID_scf3                            = 0x39,
+	DBG_CLIENT_BLKID_vceb1_0                         = 0x3a,
+	DBG_CLIENT_BLKID_vcea1_0                         = 0x3b,
+	DBG_CLIENT_BLKID_vcea1_1                         = 0x3c,
+	DBG_CLIENT_BLKID_vcea1_2                         = 0x3d,
+	DBG_CLIENT_BLKID_vcea1_3                         = 0x3e,
+	DBG_CLIENT_BLKID_bci3                            = 0x3f,
+	DBG_CLIENT_BLKID_mcd0                            = 0x40,
+	DBG_CLIENT_BLKID_pa11                            = 0x41,
+	DBG_CLIENT_BLKID_pa01                            = 0x42,
+	DBG_CLIENT_BLKID_cb201                           = 0x43,
+	DBG_CLIENT_BLKID_spim2                           = 0x44,
+	DBG_CLIENT_BLKID_vgt2                            = 0x45,
+	DBG_CLIENT_BLKID_pc2                             = 0x46,
+	DBG_CLIENT_BLKID_smu_0                           = 0x47,
+	DBG_CLIENT_BLKID_smu_1                           = 0x48,
+	DBG_CLIENT_BLKID_smu_2                           = 0x49,
+	DBG_CLIENT_BLKID_cb1                             = 0x4a,
+	DBG_CLIENT_BLKID_ia0                             = 0x4b,
+	DBG_CLIENT_BLKID_wd                              = 0x4c,
+	DBG_CLIENT_BLKID_ia1                             = 0x4d,
+	DBG_CLIENT_BLKID_vcec1_0                         = 0x4e,
+	DBG_CLIENT_BLKID_scf0                            = 0x4f,
+	DBG_CLIENT_BLKID_vgt1                            = 0x50,
+	DBG_CLIENT_BLKID_pc1                             = 0x51,
+	DBG_CLIENT_BLKID_cb0                             = 0x52,
+	DBG_CLIENT_BLKID_gdc_one_0                       = 0x53,
+	DBG_CLIENT_BLKID_gdc_one_1                       = 0x54,
+	DBG_CLIENT_BLKID_gdc_one_2                       = 0x55,
+	DBG_CLIENT_BLKID_gdc_one_3                       = 0x56,
+	DBG_CLIENT_BLKID_gdc_one_4                       = 0x57,
+	DBG_CLIENT_BLKID_gdc_one_5                       = 0x58,
+	DBG_CLIENT_BLKID_gdc_one_6                       = 0x59,
+	DBG_CLIENT_BLKID_gdc_one_7                       = 0x5a,
+	DBG_CLIENT_BLKID_gdc_one_8                       = 0x5b,
+	DBG_CLIENT_BLKID_gdc_one_9                       = 0x5c,
+	DBG_CLIENT_BLKID_gdc_one_10                      = 0x5d,
+	DBG_CLIENT_BLKID_gdc_one_11                      = 0x5e,
+	DBG_CLIENT_BLKID_gdc_one_12                      = 0x5f,
+	DBG_CLIENT_BLKID_gdc_one_13                      = 0x60,
+	DBG_CLIENT_BLKID_gdc_one_14                      = 0x61,
+	DBG_CLIENT_BLKID_gdc_one_15                      = 0x62,
+	DBG_CLIENT_BLKID_gdc_one_16                      = 0x63,
+	DBG_CLIENT_BLKID_gdc_one_17                      = 0x64,
+	DBG_CLIENT_BLKID_gdc_one_18                      = 0x65,
+	DBG_CLIENT_BLKID_gdc_one_19                      = 0x66,
+	DBG_CLIENT_BLKID_gdc_one_20                      = 0x67,
+	DBG_CLIENT_BLKID_gdc_one_21                      = 0x68,
+	DBG_CLIENT_BLKID_gdc_one_22                      = 0x69,
+	DBG_CLIENT_BLKID_gdc_one_23                      = 0x6a,
+	DBG_CLIENT_BLKID_gdc_one_24                      = 0x6b,
+	DBG_CLIENT_BLKID_gdc_one_25                      = 0x6c,
+	DBG_CLIENT_BLKID_gdc_one_26                      = 0x6d,
+	DBG_CLIENT_BLKID_gdc_one_27                      = 0x6e,
+	DBG_CLIENT_BLKID_gdc_one_28                      = 0x6f,
+	DBG_CLIENT_BLKID_gdc_one_29                      = 0x70,
+	DBG_CLIENT_BLKID_gdc_one_30                      = 0x71,
+	DBG_CLIENT_BLKID_gdc_one_31                      = 0x72,
+	DBG_CLIENT_BLKID_gdc_one_32                      = 0x73,
+	DBG_CLIENT_BLKID_gdc_one_33                      = 0x74,
+	DBG_CLIENT_BLKID_gdc_one_34                      = 0x75,
+	DBG_CLIENT_BLKID_gdc_one_35                      = 0x76,
+	DBG_CLIENT_BLKID_vceb0_0                         = 0x77,
+	DBG_CLIENT_BLKID_vgt3                            = 0x78,
+	DBG_CLIENT_BLKID_pc3                             = 0x79,
+	DBG_CLIENT_BLKID_mcd3                            = 0x7a,
+	DBG_CLIENT_BLKID_uvdu_0                          = 0x7b,
+	DBG_CLIENT_BLKID_uvdu_1                          = 0x7c,
+	DBG_CLIENT_BLKID_uvdu_2                          = 0x7d,
+	DBG_CLIENT_BLKID_uvdu_3                          = 0x7e,
+	DBG_CLIENT_BLKID_uvdu_4                          = 0x7f,
+	DBG_CLIENT_BLKID_uvdu_5                          = 0x80,
+	DBG_CLIENT_BLKID_uvdu_6                          = 0x81,
+	DBG_CLIENT_BLKID_cb300                           = 0x82,
+	DBG_CLIENT_BLKID_mcd1                            = 0x83,
+	DBG_CLIENT_BLKID_sx00                            = 0x84,
+	DBG_CLIENT_BLKID_uvdc_0                          = 0x85,
+	DBG_CLIENT_BLKID_uvdc_1                          = 0x86,
+	DBG_CLIENT_BLKID_mcc3                            = 0x87,
+	DBG_CLIENT_BLKID_cpg_0                           = 0x88,
+	DBG_CLIENT_BLKID_cpg_1                           = 0x89,
+	DBG_CLIENT_BLKID_gck                             = 0x8a,
+	DBG_CLIENT_BLKID_mcc1                            = 0x8b,
+	DBG_CLIENT_BLKID_cpf_0                           = 0x8c,
+	DBG_CLIENT_BLKID_cpf_1                           = 0x8d,
+	DBG_CLIENT_BLKID_rlc                             = 0x8e,
+	DBG_CLIENT_BLKID_grbm                            = 0x8f,
+	DBG_CLIENT_BLKID_sammsp                          = 0x90,
+	DBG_CLIENT_BLKID_dci_pg                          = 0x91,
+	DBG_CLIENT_BLKID_dci_0                           = 0x92,
+	DBG_CLIENT_BLKID_dccg0_0                         = 0x93,
+	DBG_CLIENT_BLKID_dccg0_1                         = 0x94,
+	DBG_CLIENT_BLKID_dcfe01_0                        = 0x95,
+	DBG_CLIENT_BLKID_dcfe02_0                        = 0x96,
+	DBG_CLIENT_BLKID_dcfe03_0                        = 0x97,
+	DBG_CLIENT_BLKID_dcfe04_0                        = 0x98,
+	DBG_CLIENT_BLKID_dcfe05_0                        = 0x99,
+	DBG_CLIENT_BLKID_dcfe06_0                        = 0x9a,
+	DBG_CLIENT_BLKID_RESERVED_LAST                   = 0x9b,
+} DebugBlockId;
+typedef enum DebugBlockId_OLD {
+	DBG_BLOCK_ID_RESERVED                            = 0x0,
+	DBG_BLOCK_ID_DBG                                 = 0x1,
+	DBG_BLOCK_ID_VMC                                 = 0x2,
+	DBG_BLOCK_ID_PDMA                                = 0x3,
+	DBG_BLOCK_ID_CG                                  = 0x4,
+	DBG_BLOCK_ID_SRBM                                = 0x5,
+	DBG_BLOCK_ID_GRBM                                = 0x6,
+	DBG_BLOCK_ID_RLC                                 = 0x7,
+	DBG_BLOCK_ID_CSC                                 = 0x8,
+	DBG_BLOCK_ID_SEM                                 = 0x9,
+	DBG_BLOCK_ID_IH                                  = 0xa,
+	DBG_BLOCK_ID_SC                                  = 0xb,
+	DBG_BLOCK_ID_SQ                                  = 0xc,
+	DBG_BLOCK_ID_AVP                                 = 0xd,
+	DBG_BLOCK_ID_GMCON                               = 0xe,
+	DBG_BLOCK_ID_SMU                                 = 0xf,
+	DBG_BLOCK_ID_DMA0                                = 0x10,
+	DBG_BLOCK_ID_DMA1                                = 0x11,
+	DBG_BLOCK_ID_SPIM                                = 0x12,
+	DBG_BLOCK_ID_GDS                                 = 0x13,
+	DBG_BLOCK_ID_SPIS                                = 0x14,
+	DBG_BLOCK_ID_UNUSED0                             = 0x15,
+	DBG_BLOCK_ID_PA0                                 = 0x16,
+	DBG_BLOCK_ID_PA1                                 = 0x17,
+	DBG_BLOCK_ID_CP0                                 = 0x18,
+	DBG_BLOCK_ID_CP1                                 = 0x19,
+	DBG_BLOCK_ID_CP2                                 = 0x1a,
+	DBG_BLOCK_ID_UNUSED1                             = 0x1b,
+	DBG_BLOCK_ID_UVDU                                = 0x1c,
+	DBG_BLOCK_ID_UVDM                                = 0x1d,
+	DBG_BLOCK_ID_VCE                                 = 0x1e,
+	DBG_BLOCK_ID_UNUSED2                             = 0x1f,
+	DBG_BLOCK_ID_VGT0                                = 0x20,
+	DBG_BLOCK_ID_VGT1                                = 0x21,
+	DBG_BLOCK_ID_IA                                  = 0x22,
+	DBG_BLOCK_ID_UNUSED3                             = 0x23,
+	DBG_BLOCK_ID_SCT0                                = 0x24,
+	DBG_BLOCK_ID_SCT1                                = 0x25,
+	DBG_BLOCK_ID_SPM0                                = 0x26,
+	DBG_BLOCK_ID_SPM1                                = 0x27,
+	DBG_BLOCK_ID_TCAA                                = 0x28,
+	DBG_BLOCK_ID_TCAB                                = 0x29,
+	DBG_BLOCK_ID_TCCA                                = 0x2a,
+	DBG_BLOCK_ID_TCCB                                = 0x2b,
+	DBG_BLOCK_ID_MCC0                                = 0x2c,
+	DBG_BLOCK_ID_MCC1                                = 0x2d,
+	DBG_BLOCK_ID_MCC2                                = 0x2e,
+	DBG_BLOCK_ID_MCC3                                = 0x2f,
+	DBG_BLOCK_ID_SX0                                 = 0x30,
+	DBG_BLOCK_ID_SX1                                 = 0x31,
+	DBG_BLOCK_ID_SX2                                 = 0x32,
+	DBG_BLOCK_ID_SX3                                 = 0x33,
+	DBG_BLOCK_ID_UNUSED4                             = 0x34,
+	DBG_BLOCK_ID_UNUSED5                             = 0x35,
+	DBG_BLOCK_ID_UNUSED6                             = 0x36,
+	DBG_BLOCK_ID_UNUSED7                             = 0x37,
+	DBG_BLOCK_ID_PC0                                 = 0x38,
+	DBG_BLOCK_ID_PC1                                 = 0x39,
+	DBG_BLOCK_ID_UNUSED8                             = 0x3a,
+	DBG_BLOCK_ID_UNUSED9                             = 0x3b,
+	DBG_BLOCK_ID_UNUSED10                            = 0x3c,
+	DBG_BLOCK_ID_UNUSED11                            = 0x3d,
+	DBG_BLOCK_ID_MCB                                 = 0x3e,
+	DBG_BLOCK_ID_UNUSED12                            = 0x3f,
+	DBG_BLOCK_ID_SCB0                                = 0x40,
+	DBG_BLOCK_ID_SCB1                                = 0x41,
+	DBG_BLOCK_ID_UNUSED13                            = 0x42,
+	DBG_BLOCK_ID_UNUSED14                            = 0x43,
+	DBG_BLOCK_ID_SCF0                                = 0x44,
+	DBG_BLOCK_ID_SCF1                                = 0x45,
+	DBG_BLOCK_ID_UNUSED15                            = 0x46,
+	DBG_BLOCK_ID_UNUSED16                            = 0x47,
+	DBG_BLOCK_ID_BCI0                                = 0x48,
+	DBG_BLOCK_ID_BCI1                                = 0x49,
+	DBG_BLOCK_ID_BCI2                                = 0x4a,
+	DBG_BLOCK_ID_BCI3                                = 0x4b,
+	DBG_BLOCK_ID_UNUSED17                            = 0x4c,
+	DBG_BLOCK_ID_UNUSED18                            = 0x4d,
+	DBG_BLOCK_ID_UNUSED19                            = 0x4e,
+	DBG_BLOCK_ID_UNUSED20                            = 0x4f,
+	DBG_BLOCK_ID_CB00                                = 0x50,
+	DBG_BLOCK_ID_CB01                                = 0x51,
+	DBG_BLOCK_ID_CB02                                = 0x52,
+	DBG_BLOCK_ID_CB03                                = 0x53,
+	DBG_BLOCK_ID_CB04                                = 0x54,
+	DBG_BLOCK_ID_UNUSED21                            = 0x55,
+	DBG_BLOCK_ID_UNUSED22                            = 0x56,
+	DBG_BLOCK_ID_UNUSED23                            = 0x57,
+	DBG_BLOCK_ID_CB10                                = 0x58,
+	DBG_BLOCK_ID_CB11                                = 0x59,
+	DBG_BLOCK_ID_CB12                                = 0x5a,
+	DBG_BLOCK_ID_CB13                                = 0x5b,
+	DBG_BLOCK_ID_CB14                                = 0x5c,
+	DBG_BLOCK_ID_UNUSED24                            = 0x5d,
+	DBG_BLOCK_ID_UNUSED25                            = 0x5e,
+	DBG_BLOCK_ID_UNUSED26                            = 0x5f,
+	DBG_BLOCK_ID_TCP0                                = 0x60,
+	DBG_BLOCK_ID_TCP1                                = 0x61,
+	DBG_BLOCK_ID_TCP2                                = 0x62,
+	DBG_BLOCK_ID_TCP3                                = 0x63,
+	DBG_BLOCK_ID_TCP4                                = 0x64,
+	DBG_BLOCK_ID_TCP5                                = 0x65,
+	DBG_BLOCK_ID_TCP6                                = 0x66,
+	DBG_BLOCK_ID_TCP7                                = 0x67,
+	DBG_BLOCK_ID_TCP8                                = 0x68,
+	DBG_BLOCK_ID_TCP9                                = 0x69,
+	DBG_BLOCK_ID_TCP10                               = 0x6a,
+	DBG_BLOCK_ID_TCP11                               = 0x6b,
+	DBG_BLOCK_ID_TCP12                               = 0x6c,
+	DBG_BLOCK_ID_TCP13                               = 0x6d,
+	DBG_BLOCK_ID_TCP14                               = 0x6e,
+	DBG_BLOCK_ID_TCP15                               = 0x6f,
+	DBG_BLOCK_ID_TCP16                               = 0x70,
+	DBG_BLOCK_ID_TCP17                               = 0x71,
+	DBG_BLOCK_ID_TCP18                               = 0x72,
+	DBG_BLOCK_ID_TCP19                               = 0x73,
+	DBG_BLOCK_ID_TCP20                               = 0x74,
+	DBG_BLOCK_ID_TCP21                               = 0x75,
+	DBG_BLOCK_ID_TCP22                               = 0x76,
+	DBG_BLOCK_ID_TCP23                               = 0x77,
+	DBG_BLOCK_ID_TCP_RESERVED0                       = 0x78,
+	DBG_BLOCK_ID_TCP_RESERVED1                       = 0x79,
+	DBG_BLOCK_ID_TCP_RESERVED2                       = 0x7a,
+	DBG_BLOCK_ID_TCP_RESERVED3                       = 0x7b,
+	DBG_BLOCK_ID_TCP_RESERVED4                       = 0x7c,
+	DBG_BLOCK_ID_TCP_RESERVED5                       = 0x7d,
+	DBG_BLOCK_ID_TCP_RESERVED6                       = 0x7e,
+	DBG_BLOCK_ID_TCP_RESERVED7                       = 0x7f,
+	DBG_BLOCK_ID_DB00                                = 0x80,
+	DBG_BLOCK_ID_DB01                                = 0x81,
+	DBG_BLOCK_ID_DB02                                = 0x82,
+	DBG_BLOCK_ID_DB03                                = 0x83,
+	DBG_BLOCK_ID_DB04                                = 0x84,
+	DBG_BLOCK_ID_UNUSED27                            = 0x85,
+	DBG_BLOCK_ID_UNUSED28                            = 0x86,
+	DBG_BLOCK_ID_UNUSED29                            = 0x87,
+	DBG_BLOCK_ID_DB10                                = 0x88,
+	DBG_BLOCK_ID_DB11                                = 0x89,
+	DBG_BLOCK_ID_DB12                                = 0x8a,
+	DBG_BLOCK_ID_DB13                                = 0x8b,
+	DBG_BLOCK_ID_DB14                                = 0x8c,
+	DBG_BLOCK_ID_UNUSED30                            = 0x8d,
+	DBG_BLOCK_ID_UNUSED31                            = 0x8e,
+	DBG_BLOCK_ID_UNUSED32                            = 0x8f,
+	DBG_BLOCK_ID_TCC0                                = 0x90,
+	DBG_BLOCK_ID_TCC1                                = 0x91,
+	DBG_BLOCK_ID_TCC2                                = 0x92,
+	DBG_BLOCK_ID_TCC3                                = 0x93,
+	DBG_BLOCK_ID_TCC4                                = 0x94,
+	DBG_BLOCK_ID_TCC5                                = 0x95,
+	DBG_BLOCK_ID_TCC6                                = 0x96,
+	DBG_BLOCK_ID_TCC7                                = 0x97,
+	DBG_BLOCK_ID_SPS00                               = 0x98,
+	DBG_BLOCK_ID_SPS01                               = 0x99,
+	DBG_BLOCK_ID_SPS02                               = 0x9a,
+	DBG_BLOCK_ID_SPS10                               = 0x9b,
+	DBG_BLOCK_ID_SPS11                               = 0x9c,
+	DBG_BLOCK_ID_SPS12                               = 0x9d,
+	DBG_BLOCK_ID_UNUSED33                            = 0x9e,
+	DBG_BLOCK_ID_UNUSED34                            = 0x9f,
+	DBG_BLOCK_ID_TA00                                = 0xa0,
+	DBG_BLOCK_ID_TA01                                = 0xa1,
+	DBG_BLOCK_ID_TA02                                = 0xa2,
+	DBG_BLOCK_ID_TA03                                = 0xa3,
+	DBG_BLOCK_ID_TA04                                = 0xa4,
+	DBG_BLOCK_ID_TA05                                = 0xa5,
+	DBG_BLOCK_ID_TA06                                = 0xa6,
+	DBG_BLOCK_ID_TA07                                = 0xa7,
+	DBG_BLOCK_ID_TA08                                = 0xa8,
+	DBG_BLOCK_ID_TA09                                = 0xa9,
+	DBG_BLOCK_ID_TA0A                                = 0xaa,
+	DBG_BLOCK_ID_TA0B                                = 0xab,
+	DBG_BLOCK_ID_UNUSED35                            = 0xac,
+	DBG_BLOCK_ID_UNUSED36                            = 0xad,
+	DBG_BLOCK_ID_UNUSED37                            = 0xae,
+	DBG_BLOCK_ID_UNUSED38                            = 0xaf,
+	DBG_BLOCK_ID_TA10                                = 0xb0,
+	DBG_BLOCK_ID_TA11                                = 0xb1,
+	DBG_BLOCK_ID_TA12                                = 0xb2,
+	DBG_BLOCK_ID_TA13                                = 0xb3,
+	DBG_BLOCK_ID_TA14                                = 0xb4,
+	DBG_BLOCK_ID_TA15                                = 0xb5,
+	DBG_BLOCK_ID_TA16                                = 0xb6,
+	DBG_BLOCK_ID_TA17                                = 0xb7,
+	DBG_BLOCK_ID_TA18                                = 0xb8,
+	DBG_BLOCK_ID_TA19                                = 0xb9,
+	DBG_BLOCK_ID_TA1A                                = 0xba,
+	DBG_BLOCK_ID_TA1B                                = 0xbb,
+	DBG_BLOCK_ID_UNUSED39                            = 0xbc,
+	DBG_BLOCK_ID_UNUSED40                            = 0xbd,
+	DBG_BLOCK_ID_UNUSED41                            = 0xbe,
+	DBG_BLOCK_ID_UNUSED42                            = 0xbf,
+	DBG_BLOCK_ID_TD00                                = 0xc0,
+	DBG_BLOCK_ID_TD01                                = 0xc1,
+	DBG_BLOCK_ID_TD02                                = 0xc2,
+	DBG_BLOCK_ID_TD03                                = 0xc3,
+	DBG_BLOCK_ID_TD04                                = 0xc4,
+	DBG_BLOCK_ID_TD05                                = 0xc5,
+	DBG_BLOCK_ID_TD06                                = 0xc6,
+	DBG_BLOCK_ID_TD07                                = 0xc7,
+	DBG_BLOCK_ID_TD08                                = 0xc8,
+	DBG_BLOCK_ID_TD09                                = 0xc9,
+	DBG_BLOCK_ID_TD0A                                = 0xca,
+	DBG_BLOCK_ID_TD0B                                = 0xcb,
+	DBG_BLOCK_ID_UNUSED43                            = 0xcc,
+	DBG_BLOCK_ID_UNUSED44                            = 0xcd,
+	DBG_BLOCK_ID_UNUSED45                            = 0xce,
+	DBG_BLOCK_ID_UNUSED46                            = 0xcf,
+	DBG_BLOCK_ID_TD10                                = 0xd0,
+	DBG_BLOCK_ID_TD11                                = 0xd1,
+	DBG_BLOCK_ID_TD12                                = 0xd2,
+	DBG_BLOCK_ID_TD13                                = 0xd3,
+	DBG_BLOCK_ID_TD14                                = 0xd4,
+	DBG_BLOCK_ID_TD15                                = 0xd5,
+	DBG_BLOCK_ID_TD16                                = 0xd6,
+	DBG_BLOCK_ID_TD17                                = 0xd7,
+	DBG_BLOCK_ID_TD18                                = 0xd8,
+	DBG_BLOCK_ID_TD19                                = 0xd9,
+	DBG_BLOCK_ID_TD1A                                = 0xda,
+	DBG_BLOCK_ID_TD1B                                = 0xdb,
+	DBG_BLOCK_ID_UNUSED47                            = 0xdc,
+	DBG_BLOCK_ID_UNUSED48                            = 0xdd,
+	DBG

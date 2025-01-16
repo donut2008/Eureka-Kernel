@@ -1,95 +1,2 @@
-#include <linux/linkage.h>
-#include <linux/init.h>
-
-#include <asm/entry.h>
-#include <asm/page.h>
-#include <asm/contregs.h>
-#include <asm/sun3-head.h>
-
-PSL_HIGHIPL     = 0x2700
-NBSG            = 0x20000
-ICACHE_ONLY	= 0x00000009
-CACHES_OFF	= 0x00000008	| actually a clear and disable --m
-#define MAS_STACK INT_STACK
-ROOT_TABLE_SIZE = 128
-PAGESIZE	= 8192
-SUN3_INVALID_PMEG = 255
-.globl bootup_user_stack
-.globl bootup_kernel_stack
-.globl pg0
-.globl swapper_pg_dir
-.globl kernel_pmd_table
-.globl availmem
-.global m68k_pgtable_cachemode
-.global kpt
-| todo: all these should be in bss!
-swapper_pg_dir:                .skip 0x2000
-pg0:                           .skip 0x2000
-kernel_pmd_table:              .skip 0x2000
-
-.globl kernel_pg_dir
-.equ    kernel_pg_dir,kernel_pmd_table
-
-	__HEAD
-ENTRY(_stext)
-ENTRY(_start)
-
-/* Firstly, disable interrupts and set up function codes. */
-	movew	#PSL_HIGHIPL, %sr
-	moveq	#FC_CONTROL, %d0
-	movec	%d0, %sfc
-	movec	%d0, %dfc
-
-/* Make sure we're in context zero. */
-	moveq	#0, %d0
-	movsb	%d0, AC_CONTEXT
-
-/* map everything the bootloader left us into high memory, clean up the
-   excess later */
-	lea	(AC_SEGMAP+0),%a0
-	lea	(AC_SEGMAP+KERNBASE),%a1
-1:
-	movsb	%a0@, %d1
-	movsb	%d1, %a1@
-	cmpib	#SUN3_INVALID_PMEG, %d1
-	beq	2f
-	addl	#NBSG,%a0
-	addl	#NBSG,%a1
-	jmp	1b
-
-2:
-
-/* Disable caches and jump to high code. */
-	moveq	#ICACHE_ONLY,%d0	| Cache disabled until we're ready to enable it
-	movc	%d0, %cacr	|   is this the right value? (yes --m)
-	jmp	1f:l
-
-/* Following code executes at high addresses (0xE000xxx). */
-1:	lea	init_task,%curptr			| get initial thread...
-	lea	init_thread_union+THREAD_SIZE,%sp	| ...and its stack.
-
-/* Point MSP at an invalid page to trap if it's used. --m */
-	movl	#(PAGESIZE),%d0
-	movc	%d0,%msp
-	moveq	#-1,%d0
-	movsb	%d0,(AC_SEGMAP+0x0)
-
-	jbsr	sun3_init
-
-	jbsr	base_trap_init
-
-        jbsr    start_kernel
-	trap	#15
-
-        .data
-        .even
-kpt:
-        .long 0
-availmem:
-        .long 0
-| todo: remove next two. --m
-is_medusa:
-        .long 0
-m68k_pgtable_cachemode:
-        .long 0
-
+$WF$WF$WF$WFhWF$WFàbF…PF…PFÑPFÑPF…PF…PFÑPFÑPFÑPFÑPFÑPF…PFÑPF´aF·KF·KFﬁAFﬁAF·KF·KFﬁAFﬁAFﬁAFﬁAFﬁAF·KFﬁAF<[FÙPFÙPF¨PF¨PFÙPFÙPF¨PF¨PF¨PF¨PF¨PFÙPF¨PFDaFFMFFMFáEFáEFFMFFMFáEFáEFáEFáEFáEFFMFáEFe[F‡\F‡\Fv[Fv[F‡\F‡\Fv[Fv[Fv[Fv[Fv[F‡\Fv[F"fF0\F0\F•ZF•ZF0\F0\F•ZF•ZF•ZF•ZF•ZF0\F•ZF˛cF†F†F†F†F†F†FëâF†F†FëâFëâFëâFà∫Fà∫FëâFëâFëâFy¡FëâFëâFáâFëâFK∞FK∞FëâFK∞F†F†F†FëâFëâFëâFëâF†F†FëâF†F†F†FëâFëâFëâFëâFëâFëâFëâFëâFëâFëâFëâF†F†FrGrGrG<Gé)GâGâG`G`GGG`G`GGGGGG`GGıG@˙F@˙FŸˆFŸˆF@˙F@˙FŸˆFŸˆFŸˆFŸˆFŸˆF@˙FŸˆFùGGGG£
+G%)G™G™GmGmGmG\Gj$G„G„G¯G¯GvGvG¯G¯GvGvGvGvGvG¯GvGD"Gﬂ!Gﬂ!Gﬂ!G“!G"G"G"G%ÓF%ÓF◊ÈF◊ÈF%ÓF%ÓF◊ÈF◊ÈF◊ÈF◊ÈF◊ÈF%ÓF◊ÈF*˙F7ÔF7ÔFË"GË"GË"GË"GË"G7ÔFË"GË"GË"G÷GGGË"GË"GË"GË"GË"GË"G7ÔFË"GË"GË"GË"G˘FË"GË"GË"GË"GË"GË"G#GË"Gﬂ"GË"GË"GË"GË"GË"G#GË"GË"GçGË"G›ÛF˘F[ÚFŸ"GË"GË"GË"G°ÓF°ÓF5"G5"G5"G5"G5"G°ÓF5"G5"G5"G<G^G^G5"G5"G5"G5"G5"G5"G°ÓF5"G5"G5"G5"GS¯F5"G5"G5"G5"G5"G5"GL"G5"G,"G5"G5"G5"G5"G5"GL"G5"G5"GËG5"G(ÛFS¯F´ÒF&"G5"G5"G5"GÌGÌGÌGµÎF∂&GGGπGπGπG¨Gø(G]G]GPFGPFGFGFGPFGPFGFGFGFGFGFGPFGFGUÁGEGEG€DG€DGEGEG€DG€DG€DG€DG€DGEG€DGÁGJGJGHGHGJGJGHGHGHGHGHGJGHG	ÓGKIGKIG%GG%GGKIGKIG%GG%GG%GG%GG%GGKIG%GG¢ÏGJGJGËGGËGGJGJGËGGËGGËGGËGGËGGJGËGG¢ÌGÀ\GÀ\Gá\Gá\GÀ\GÀ\Gá\Gá\Gá\Gá\Gá\GÀ\Gá\GOÊG!]G!]G›\G›\G!]G!]G›\G›\G›\G›\G›\G!]G›\G ÊGw]Gw]G3]G3]Gw]Gw]G3]G3]G3]G3]G3]Gw]G3]GÒÂG~∫G~∫G:∫G:∫G~∫G~∫G:∫G:∫G:∫G:∫G:∫G~∫G:∫G∑ÌG∏πG∏πGtπGtπG∏πG∏πGtπGtπGtπGtπGtπG∏πGtπGvÌG—ZG—ZGTHTHTHTHTH—ZGTHTHTHÉ¯G5G5GTHTHTHTHTHTH—ZGTHTHTHTHrªGT

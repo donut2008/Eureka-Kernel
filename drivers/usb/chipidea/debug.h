@@ -1,30 +1,13 @@
-/*
- * debug.h - ChipIdea USB driver debug interfaces
- *
- * Copyright (C) 2008 Chipidea - MIPS Technologies, Inc. All rights reserved.
- *
- * Author: David Lopo
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#ifndef __DRIVERS_USB_CHIPIDEA_DEBUG_H
-#define __DRIVERS_USB_CHIPIDEA_DEBUG_H
-
-#ifdef CONFIG_USB_CHIPIDEA_DEBUG
-int dbg_create_files(struct ci_hdrc *ci);
-void dbg_remove_files(struct ci_hdrc *ci);
-#else
-static inline int dbg_create_files(struct ci_hdrc *ci)
-{
-	return 0;
-}
-
-static inline void dbg_remove_files(struct ci_hdrc *ci)
-{
-}
-#endif
-
-#endif /* __DRIVERS_USB_CHIPIDEA_DEBUG_H */
+3__AcpLevel_3_MinVoltage_Phases__SHIFT 0x0
+#define DPM_TABLE_323__AcpLevel_3_MinVoltage_VddGfx_MASK 0xff00
+#define DPM_TABLE_323__AcpLevel_3_MinVoltage_VddGfx__SHIFT 0x8
+#define DPM_TABLE_323__AcpLevel_3_MinVoltage_Vddci_MASK 0xff0000
+#define DPM_TABLE_323__AcpLevel_3_MinVoltage_Vddci__SHIFT 0x10
+#define DPM_TABLE_323__AcpLevel_3_MinVoltage_Vddc_MASK 0xff000000
+#define DPM_TABLE_323__AcpLevel_3_MinVoltage_Vddc__SHIFT 0x18
+#define DPM_TABLE_324__AcpLevel_3_padding_2_MASK 0xff
+#define DPM_TABLE_324__AcpLevel_3_padding_2__SHIFT 0x0
+#define DPM_TABLE_324__AcpLevel_3_padding_1_MASK 0xff00
+#define DPM_TABLE_324__AcpLevel_3_padding_1__SHIFT 0x8
+#define DPM_TABLE_324__AcpLevel_3_padding_0_MASK 0xff0000
+#define DPM_TABLE_324__AcpLevel_3_pa

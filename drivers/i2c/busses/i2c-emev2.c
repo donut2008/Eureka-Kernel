@@ -1,332 +1,167 @@
-/*
- * I2C driver for the Renesas EMEV2 SoC
- *
- * Copyright (C) 2015 Wolfram Sang <wsa@sang-engineering.com>
- * Copyright 2013 Codethink Ltd.
- * Copyright 2010-2015 Renesas Electronics Corporation
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2
- * as published by the Free Software Foundation.
- */
-
-#include <linux/clk.h>
-#include <linux/completion.h>
-#include <linux/device.h>
-#include <linux/i2c.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/of_device.h>
-#include <linux/platform_device.h>
-#include <linux/sched.h>
-
-/* I2C Registers */
-#define I2C_OFS_IICACT0		0x00	/* start */
-#define I2C_OFS_IIC0		0x04	/* shift */
-#define I2C_OFS_IICC0		0x08	/* control */
-#define I2C_OFS_SVA0		0x0c	/* slave address */
-#define I2C_OFS_IICCL0		0x10	/* clock select */
-#define I2C_OFS_IICX0		0x14	/* extension */
-#define I2C_OFS_IICS0		0x18	/* status */
-#define I2C_OFS_IICSE0		0x1c	/* status For emulation */
-#define I2C_OFS_IICF0		0x20	/* IIC flag */
-
-/* I2C IICACT0 Masks */
-#define I2C_BIT_IICE0		0x0001
-
-/* I2C IICC0 Masks */
-#define I2C_BIT_LREL0		0x0040
-#define I2C_BIT_WREL0		0x0020
-#define I2C_BIT_SPIE0		0x0010
-#define I2C_BIT_WTIM0		0x0008
-#define I2C_BIT_ACKE0		0x0004
-#define I2C_BIT_STT0		0x0002
-#define I2C_BIT_SPT0		0x0001
-
-/* I2C IICCL0 Masks */
-#define I2C_BIT_SMC0		0x0008
-#define I2C_BIT_DFC0		0x0004
-
-/* I2C IICSE0 Masks */
-#define I2C_BIT_MSTS0		0x0080
-#define I2C_BIT_ALD0		0x0040
-#define I2C_BIT_EXC0		0x0020
-#define I2C_BIT_COI0		0x0010
-#define I2C_BIT_TRC0		0x0008
-#define I2C_BIT_ACKD0		0x0004
-#define I2C_BIT_STD0		0x0002
-#define I2C_BIT_SPD0		0x0001
-
-/* I2C IICF0 Masks */
-#define I2C_BIT_STCF		0x0080
-#define I2C_BIT_IICBSY		0x0040
-#define I2C_BIT_STCEN		0x0002
-#define I2C_BIT_IICRSV		0x0001
-
-struct em_i2c_device {
-	void __iomem *base;
-	struct i2c_adapter adap;
-	struct completion msg_done;
-	struct clk *sclk;
-};
-
-static inline void em_clear_set_bit(struct em_i2c_device *priv, u8 clear, u8 set, u8 reg)
-{
-	writeb((readb(priv->base + reg) & ~clear) | set, priv->base + reg);
-}
-
-static int em_i2c_wait_for_event(struct em_i2c_device *priv)
-{
-	unsigned long time_left;
-	int status;
-
-	reinit_completion(&priv->msg_done);
-
-	time_left = wait_for_completion_timeout(&priv->msg_done, priv->adap.timeout);
-
-	if (!time_left)
-		return -ETIMEDOUT;
-
-	status = readb(priv->base + I2C_OFS_IICSE0);
-	return status & I2C_BIT_ALD0 ? -EAGAIN : status;
-}
-
-static void em_i2c_stop(struct em_i2c_device *priv)
-{
-	/* Send Stop condition */
-	em_clear_set_bit(priv, 0, I2C_BIT_SPT0 | I2C_BIT_SPIE0, I2C_OFS_IICC0);
-
-	/* Wait for stop condition */
-	em_i2c_wait_for_event(priv);
-}
-
-static void em_i2c_reset(struct i2c_adapter *adap)
-{
-	struct em_i2c_device *priv = i2c_get_adapdata(adap);
-	int retr;
-
-	/* If I2C active */
-	if (readb(priv->base + I2C_OFS_IICACT0) & I2C_BIT_IICE0) {
-		/* Disable I2C operation */
-		writeb(0, priv->base + I2C_OFS_IICACT0);
-
-		retr = 1000;
-		while (readb(priv->base + I2C_OFS_IICACT0) == 1 && retr)
-			retr--;
-		WARN_ON(retr == 0);
-	}
-
-	/* Transfer mode set */
-	writeb(I2C_BIT_DFC0, priv->base + I2C_OFS_IICCL0);
-
-	/* Can Issue start without detecting a stop, Reservation disabled. */
-	writeb(I2C_BIT_STCEN | I2C_BIT_IICRSV, priv->base + I2C_OFS_IICF0);
-
-	/* I2C enable, 9 bit interrupt mode */
-	writeb(I2C_BIT_WTIM0, priv->base + I2C_OFS_IICC0);
-
-	/* Enable I2C operation */
-	writeb(I2C_BIT_IICE0, priv->base + I2C_OFS_IICACT0);
-
-	retr = 1000;
-	while (readb(priv->base + I2C_OFS_IICACT0) == 0 && retr)
-		retr--;
-	WARN_ON(retr == 0);
-}
-
-static int __em_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msg,
-				int stop)
-{
-	struct em_i2c_device *priv = i2c_get_adapdata(adap);
-	int count, status, read = !!(msg->flags & I2C_M_RD);
-
-	/* Send start condition */
-	em_clear_set_bit(priv, 0, I2C_BIT_ACKE0 | I2C_BIT_WTIM0, I2C_OFS_IICC0);
-	em_clear_set_bit(priv, 0, I2C_BIT_STT0, I2C_OFS_IICC0);
-
-	/* Send slave address and R/W type */
-	writeb((msg->addr << 1) | read, priv->base + I2C_OFS_IIC0);
-
-	/* Wait for transaction */
-	status = em_i2c_wait_for_event(priv);
-	if (status < 0)
-		goto out_reset;
-
-	/* Received NACK (result of setting slave address and R/W) */
-	if (!(status & I2C_BIT_ACKD0)) {
-		em_i2c_stop(priv);
-		goto out;
-	}
-
-	/* Extra setup for read transactions */
-	if (read) {
-		/* 8 bit interrupt mode */
-		em_clear_set_bit(priv, I2C_BIT_WTIM0, I2C_BIT_ACKE0, I2C_OFS_IICC0);
-		em_clear_set_bit(priv, I2C_BIT_WTIM0, I2C_BIT_WREL0, I2C_OFS_IICC0);
-
-		/* Wait for transaction */
-		status = em_i2c_wait_for_event(priv);
-		if (status < 0)
-			goto out_reset;
-	}
-
-	/* Send / receive data */
-	for (count = 0; count < msg->len; count++) {
-		if (read) { /* Read transaction */
-			msg->buf[count] = readb(priv->base + I2C_OFS_IIC0);
-			em_clear_set_bit(priv, 0, I2C_BIT_WREL0, I2C_OFS_IICC0);
-
-		} else { /* Write transaction */
-			/* Received NACK */
-			if (!(status & I2C_BIT_ACKD0)) {
-				em_i2c_stop(priv);
-				goto out;
-			}
-
-			/* Write data */
-			writeb(msg->buf[count], priv->base + I2C_OFS_IIC0);
-		}
-
-		/* Wait for R/W transaction */
-		status = em_i2c_wait_for_event(priv);
-		if (status < 0)
-			goto out_reset;
-	}
-
-	if (stop)
-		em_i2c_stop(priv);
-
-	return count;
-
-out_reset:
-	em_i2c_reset(adap);
-out:
-	return status < 0 ? status : -ENXIO;
-}
-
-static int em_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
-	int num)
-{
-	struct em_i2c_device *priv = i2c_get_adapdata(adap);
-	int ret, i;
-
-	if (readb(priv->base + I2C_OFS_IICF0) & I2C_BIT_IICBSY)
-		return -EAGAIN;
-
-	for (i = 0; i < num; i++) {
-		ret = __em_i2c_xfer(adap, &msgs[i], (i == (num - 1)));
-		if (ret < 0)
-			return ret;
-	}
-
-	/* I2C transfer completed */
-	return num;
-}
-
-static irqreturn_t em_i2c_irq_handler(int this_irq, void *dev_id)
-{
-	struct em_i2c_device *priv = dev_id;
-
-	complete(&priv->msg_done);
-	return IRQ_HANDLED;
-}
-
-static u32 em_i2c_func(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static struct i2c_algorithm em_i2c_algo = {
-	.master_xfer = em_i2c_xfer,
-	.functionality = em_i2c_func,
-};
-
-static int em_i2c_probe(struct platform_device *pdev)
-{
-	struct em_i2c_device *priv;
-	struct resource *r;
-	int irq, ret;
-
-	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	priv->base = devm_ioremap_resource(&pdev->dev, r);
-	if (IS_ERR(priv->base))
-		return PTR_ERR(priv->base);
-
-	strlcpy(priv->adap.name, "EMEV2 I2C", sizeof(priv->adap.name));
-
-	priv->sclk = devm_clk_get(&pdev->dev, "sclk");
-	if (IS_ERR(priv->sclk))
-		return PTR_ERR(priv->sclk);
-
-	clk_prepare_enable(priv->sclk);
-
-	priv->adap.timeout = msecs_to_jiffies(100);
-	priv->adap.retries = 5;
-	priv->adap.dev.parent = &pdev->dev;
-	priv->adap.algo = &em_i2c_algo;
-	priv->adap.owner = THIS_MODULE;
-	priv->adap.dev.of_node = pdev->dev.of_node;
-
-	init_completion(&priv->msg_done);
-
-	platform_set_drvdata(pdev, priv);
-	i2c_set_adapdata(&priv->adap, priv);
-
-	em_i2c_reset(&priv->adap);
-
-	irq = platform_get_irq(pdev, 0);
-	ret = devm_request_irq(&pdev->dev, irq, em_i2c_irq_handler, 0,
-				"em_i2c", priv);
-	if (ret)
-		goto err_clk;
-
-	ret = i2c_add_adapter(&priv->adap);
-
-	if (ret)
-		goto err_clk;
-
-	dev_info(&pdev->dev, "Added i2c controller %d, irq %d\n", priv->adap.nr, irq);
-
-	return 0;
-
-err_clk:
-	clk_disable_unprepare(priv->sclk);
-	return ret;
-}
-
-static int em_i2c_remove(struct platform_device *dev)
-{
-	struct em_i2c_device *priv = platform_get_drvdata(dev);
-
-	i2c_del_adapter(&priv->adap);
-	clk_disable_unprepare(priv->sclk);
-
-	return 0;
-}
-
-static const struct of_device_id em_i2c_ids[] = {
-	{ .compatible = "renesas,iic-emev2", },
-	{ }
-};
-
-static struct platform_driver em_i2c_driver = {
-	.probe = em_i2c_probe,
-	.remove = em_i2c_remove,
-	.driver = {
-		.name = "em-i2c",
-		.of_match_table = em_i2c_ids,
-	}
-};
-module_platform_driver(em_i2c_driver);
-
-MODULE_DESCRIPTION("EMEV2 I2C bus driver");
-MODULE_AUTHOR("Ian Molton and Wolfram Sang <wsa@sang-engineering.com>");
-MODULE_LICENSE("GPL v2");
-MODULE_DEVICE_TABLE(of, em_i2c_ids);
+OOP__SDMA_GRP_RD_MASK 0x700
+#define MC_ARB_SNOOP__SDMA_GRP_RD__SHIFT 0x8
+#define MC_ARB_SNOOP__SDMA_GRP_RD_EN_MASK 0x800
+#define MC_ARB_SNOOP__SDMA_GRP_RD_EN__SHIFT 0xb
+#define MC_ARB_SNOOP__SDMA_GRP_WR_MASK 0x7000
+#define MC_ARB_SNOOP__SDMA_GRP_WR__SHIFT 0xc
+#define MC_ARB_SNOOP__SDMA_GRP_WR_EN_MASK 0x8000
+#define MC_ARB_SNOOP__SDMA_GRP_WR_EN__SHIFT 0xf
+#define MC_ARB_SNOOP__OUTSTANDING_RD_MASK 0xff0000
+#define MC_ARB_SNOOP__OUTSTANDING_RD__SHIFT 0x10
+#define MC_ARB_SNOOP__OUTSTANDING_WR_MASK 0xff000000
+#define MC_ARB_SNOOP__OUTSTANDING_WR__SHIFT 0x18
+#define MC_ARB_GRUB__GRUB_WATERMARK_MASK 0xff
+#define MC_ARB_GRUB__GRUB_WATERMARK__SHIFT 0x0
+#define MC_ARB_GRUB__GRUB_WATERMARK_PRI_MASK 0xff00
+#define MC_ARB_GRUB__GRUB_WATERMARK_PRI__SHIFT 0x8
+#define MC_ARB_GRUB__GRUB_WATERMARK_MED_MASK 0xff0000
+#define MC_ARB_GRUB__GRUB_WATERMARK_MED__SHIFT 0x10
+#define MC_ARB_GRUB__REG_WR_EN_MASK 0x3000000
+#define MC_ARB_GRUB__REG_WR_EN__SHIFT 0x18
+#define MC_ARB_GRUB__REG_RD_SEL_MASK 0x4000000
+#define MC_ARB_GRUB__REG_RD_SEL__SHIFT 0x1a
+#define MC_ARB_GECC2__ENABLE_MASK 0x1
+#define MC_ARB_GECC2__ENABLE__SHIFT 0x0
+#define MC_ARB_GECC2__ECC_MODE_MASK 0x6
+#define MC_ARB_GECC2__ECC_MODE__SHIFT 0x1
+#define MC_ARB_GECC2__PAGE_BIT0_MASK 0x18
+#define MC_ARB_GECC2__PAGE_BIT0__SHIFT 0x3
+#define MC_ARB_GECC2__EXOR_BANK_SEL_MASK 0x60
+#define MC_ARB_GECC2__EXOR_BANK_SEL__SHIFT 0x5
+#define MC_ARB_GECC2__NO_GECC_CLI_MASK 0x780
+#define MC_ARB_GECC2__NO_GECC_CLI__SHIFT 0x7
+#define MC_ARB_GECC2__READ_ERR_MASK 0x3800
+#define MC_ARB_GECC2__READ_ERR__SHIFT 0xb
+#define MC_ARB_GECC2__CLOSE_BANK_RMW_MASK 0x4000
+#define MC_ARB_GECC2__CLOSE_BANK_RMW__SHIFT 0xe
+#define MC_ARB_GECC2__COLFIFO_WATER_MASK 0x1f8000
+#define MC_ARB_GECC2__COLFIFO_WATER__SHIFT 0xf
+#define MC_ARB_GECC2__WRADDR_CONV_MASK 0x200000
+#define MC_ARB_GECC2__WRADDR_CONV__SHIFT 0x15
+#define MC_ARB_GECC2__RMWRD_UNCOR_POISON_MASK 0x400000
+#define MC_ARB_GECC2__RMWRD_UNCOR_POISON__SHIFT 0x16
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI0_MASK 0xff
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI0__SHIFT 0x0
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI1_MASK 0xff00
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI1__SHIFT 0x8
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI2_MASK 0xff0000
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI2__SHIFT 0x10
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI3_MASK 0xff000000
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI3__SHIFT 0x18
+#define MC_ARB_ADDR_SWIZ0__A8_MASK 0xf
+#define MC_ARB_ADDR_SWIZ0__A8__SHIFT 0x0
+#define MC_ARB_ADDR_SWIZ0__A9_MASK 0xf0
+#define MC_ARB_ADDR_SWIZ0__A9__SHIFT 0x4
+#define MC_ARB_ADDR_SWIZ0__A10_MASK 0xf00
+#define MC_ARB_ADDR_SWIZ0__A10__SHIFT 0x8
+#define MC_ARB_ADDR_SWIZ0__A11_MASK 0xf000
+#define MC_ARB_ADDR_SWIZ0__A11__SHIFT 0xc
+#define MC_ARB_ADDR_SWIZ0__A12_MASK 0xf0000
+#define MC_ARB_ADDR_SWIZ0__A12__SHIFT 0x10
+#define MC_ARB_ADDR_SWIZ0__A13_MASK 0xf00000
+#define MC_ARB_ADDR_SWIZ0__A13__SHIFT 0x14
+#define MC_ARB_ADDR_SWIZ0__A14_MASK 0xf000000
+#define MC_ARB_ADDR_SWIZ0__A14__SHIFT 0x18
+#define MC_ARB_ADDR_SWIZ0__A15_MASK 0xf0000000
+#define MC_ARB_ADDR_SWIZ0__A15__SHIFT 0x1c
+#define MC_ARB_ADDR_SWIZ1__A16_MASK 0xf
+#define MC_ARB_ADDR_SWIZ1__A16__SHIFT 0x0
+#define MC_ARB_ADDR_SWIZ1__A17_MASK 0xf0
+#define MC_ARB_ADDR_SWIZ1__A17__SHIFT 0x4
+#define MC_ARB_ADDR_SWIZ1__A18_MASK 0xf00
+#define MC_ARB_ADDR_SWIZ1__A18__SHIFT 0x8
+#define MC_ARB_ADDR_SWIZ1__A19_MASK 0xf000
+#define MC_ARB_ADDR_SWIZ1__A19__SHIFT 0xc
+#define MC_ARB_MISC3__NO_GECC_EXT_EOB_MASK 0x1
+#define MC_ARB_MISC3__NO_GECC_EXT_EOB__SHIFT 0x0
+#define MC_ARB_MISC3__CHAN4_EN_MASK 0x2
+#define MC_ARB_MISC3__CHAN4_EN__SHIFT 0x1
+#define MC_ARB_MISC3__CHAN4_ARB_SEL_MASK 0x4
+#define MC_ARB_MISC3__CHAN4_ARB_SEL__SHIFT 0x2
+#define MC_ARB_MISC3__UVD_URG_MODE_MASK 0x8
+#define MC_ARB_MISC3__UVD_URG_MODE__SHIFT 0x3
+#define MC_ARB_MISC3__UVD_DMIF_HARSH_WT_EN_MASK 0x10
+#define MC_ARB_MISC3__UVD_DMIF_HARSH_WT_EN__SHIFT 0x4
+#define MC_ARB_MISC3__TBD_FIELD_MASK 0xffffffe0
+#define MC_ARB_MISC3__TBD_FIELD__SHIFT 0x5
+#define MC_ARB_GRUB_PROMOTE__URGENT_RD_MASK 0xff
+#define MC_ARB_GRUB_PROMOTE__URGENT_RD__SHIFT 0x0
+#define MC_ARB_GRUB_PROMOTE__URGENT_WR_MASK 0xff00
+#define MC_ARB_GRUB_PROMOTE__URGENT_WR__SHIFT 0x8
+#define MC_ARB_GRUB_PROMOTE__PROMOTE_RD_MASK 0xff0000
+#define MC_ARB_GRUB_PROMOTE__PROMOTE_RD__SHIFT 0x10
+#define MC_ARB_GRUB_PROMOTE__PROMOTE_WR_MASK 0xff000000
+#define MC_ARB_GRUB_PROMOTE__PROMOTE_WR__SHIFT 0x18
+#define MC_ARB_RTT_DATA__PATTERN_MASK 0xff
+#define MC_ARB_RTT_DATA__PATTERN__SHIFT 0x0
+#define MC_ARB_RTT_CNTL0__ENABLE_MASK 0x1
+#define MC_ARB_RTT_CNTL0__ENABLE__SHIFT 0x0
+#define MC_ARB_RTT_CNTL0__START_IDLE_MASK 0x2
+#define MC_ARB_RTT_CNTL0__START_IDLE__SHIFT 0x1
+#define MC_ARB_RTT_CNTL0__START_R2W_MASK 0xc
+#define MC_ARB_RTT_CNTL0__START_R2W__SHIFT 0x2
+#define MC_ARB_RTT_CNTL0__FLUSH_ON_ENTER_MASK 0x10
+#define MC_ARB_RTT_CNTL0__FLUSH_ON_ENTER__SHIFT 0x4
+#define MC_ARB_RTT_CNTL0__HARSH_START_MASK 0x20
+#define MC_ARB_RTT_CNTL0__HARSH_START__SHIFT 0x5
+#define MC_ARB_RTT_CNTL0__TPS_HARSH_PRIORITY_MASK 0x40
+#define MC_ARB_RTT_CNTL0__TPS_HARSH_PRIORITY__SHIFT 0x6
+#define MC_ARB_RTT_CNTL0__TWRT_HARSH_PRIORITY_MASK 0x80
+#define MC_ARB_RTT_CNTL0__TWRT_HARSH_PRIORITY__SHIFT 0x7
+#define MC_ARB_RTT_CNTL0__BREAK_ON_HARSH_MASK 0x100
+#define MC_ARB_RTT_CNTL0__BREAK_ON_HARSH__SHIFT 0x8
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTRD_MASK 0x200
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTRD__SHIFT 0x9
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTWR_MASK 0x400
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTWR__SHIFT 0xa
+#define MC_ARB_RTT_CNTL0__TRAIN_PERIOD_MASK 0x3800
+#define MC_ARB_RTT_CNTL0__TRAIN_PERIOD__SHIFT 0xb
+#define MC_ARB_RTT_CNTL0__START_R2W_RFSH_MASK 0x4000
+#define MC_ARB_RTT_CNTL0__START_R2W_RFSH__SHIFT 0xe
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_0_MASK 0x8000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_0__SHIFT 0xf
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_1_MASK 0x10000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_1__SHIFT 0x10
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_2_MASK 0x20000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_2__SHIFT 0x11
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_3_MASK 0x40000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_3__SHIFT 0x12
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_4_MASK 0x80000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_4__SHIFT 0x13
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_5_MASK 0x100000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_5__SHIFT 0x14
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_6_MASK 0x200000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_6__SHIFT 0x15
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_7_MASK 0x400000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_7__SHIFT 0x16
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_8_MASK 0x800000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_8__SHIFT 0x17
+#define MC_ARB_RTT_CNTL0__DATA_CNTL_MASK 0x1000000
+#define MC_ARB_RTT_CNTL0__DATA_CNTL__SHIFT 0x18
+#define MC_ARB_RTT_CNTL0__NEIGHBOR_BIT_MASK 0x2000000
+#define MC_ARB_RTT_CNTL0__NEIGHBOR_BIT__SHIFT 0x19
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MASK 0x1f
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE__SHIFT 0x0
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_MASK 0x20
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE__SHIFT 0x5
+#define MC_ARB_RTT_CNTL1__WINDOW_INC_THRESHOLD_MASK 0x1fc0
+#define MC_ARB_RTT_CNTL1__WINDOW_INC_THRESHOLD__SHIFT 0x6
+#define MC_ARB_RTT_CNTL1__WINDOW_DEC_THRESHOLD_MASK 0xfe000
+#define MC_ARB_RTT_CNTL1__WINDOW_DEC_THRESHOLD__SHIFT 0xd
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MAX_MASK 0x1f00000
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MAX__SHIFT 0x14
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MIN_MASK 0x3e000000
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MIN__SHIFT 0x19
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_COUNT_MASK 0xc0000000
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_COUNT__SHIFT 0x1e
+#define MC_ARB_RTT_CNTL2__SAMPLE_CNT_MASK 0x3f
+#define MC_ARB_RTT_CNTL2__SAMPLE_CNT__SHIFT 0x0
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_THRESHOLD_MASK 0xfc0
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_THRESHOLD__SHIFT 0x6
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_SIZE_MASK 0x1000
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_SIZE__SHIFT 0xc
+#define MC_ARB_RTT_CNTL2__FILTER_CNTL_MASK 0x2000
+#define MC_ARB_RTT_CNTL2__FILTER_CNTL__SHIFT 0xd
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH0_MASK 0x3
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH0__SHIFT 0x0
+#define MC_ARB_RTT_DEBUG__DEBUG_

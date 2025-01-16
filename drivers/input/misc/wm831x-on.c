@@ -1,150 +1,162 @@
+device *sdev)
+{
+	struct ib_port_modify port_modify = {
+		.clr_port_cap_mask = IB_PORT_DEVICE_MGMT_SUP,
+	};
+	struct srpt_port *sport;
+	int i;
+
+	for (i = 1; i <= sdev->device->phys_port_cnt; i++) {
+		sport = &sdev->port[i - 1];
+		WARN_ON(sport->port != i);
+		if (ib_modify_port(sdev->device, i, 0, &port_modify) < 0)
+			pr_err("disabling MAD processing failed.\n");
+		if (sport->mad_agent) {
+			ib_unregister_mad_agent(sport->mad_agent);
+			sport->mad_agent = NULL;
+		}
+	}
+}
+
 /**
- * wm831x-on.c - WM831X ON pin driver
- *
- * Copyright (C) 2009 Wolfson Microelectronics plc
- *
- * This file is subject to the terms and conditions of the GNU General
- * Public License. See the file "COPYING" in the main directory of this
- * archive for more details.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * srpt_alloc_ioctx() - Allocate an SRPT I/O context structure.
  */
-
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/platform_device.h>
-#include <linux/workqueue.h>
-#include <linux/mfd/wm831x/core.h>
-
-struct wm831x_on {
-	struct input_dev *dev;
-	struct delayed_work work;
-	struct wm831x *wm831x;
-};
-
-/*
- * The chip gives us an interrupt when the ON pin is asserted but we
- * then need to poll to see when the pin is deasserted.
- */
-static void wm831x_poll_on(struct work_struct *work)
+static struct srpt_ioctx *srpt_alloc_ioctx(struct srpt_device *sdev,
+					   int ioctx_size, int dma_size,
+					   enum dma_data_direction dir)
 {
-	struct wm831x_on *wm831x_on = container_of(work, struct wm831x_on,
-						   work.work);
-	struct wm831x *wm831x = wm831x_on->wm831x;
-	int poll, ret;
+	struct srpt_ioctx *ioctx;
 
-	ret = wm831x_reg_read(wm831x, WM831X_ON_PIN_CONTROL);
-	if (ret >= 0) {
-		poll = !(ret & WM831X_ON_PIN_STS);
-
-		input_report_key(wm831x_on->dev, KEY_POWER, poll);
-		input_sync(wm831x_on->dev);
-	} else {
-		dev_err(wm831x->dev, "Failed to read ON status: %d\n", ret);
-		poll = 1;
-	}
-
-	if (poll)
-		schedule_delayed_work(&wm831x_on->work, 100);
-}
-
-static irqreturn_t wm831x_on_irq(int irq, void *data)
-{
-	struct wm831x_on *wm831x_on = data;
-
-	schedule_delayed_work(&wm831x_on->work, 0);
-
-	return IRQ_HANDLED;
-}
-
-static int wm831x_on_probe(struct platform_device *pdev)
-{
-	struct wm831x *wm831x = dev_get_drvdata(pdev->dev.parent);
-	struct wm831x_on *wm831x_on;
-	int irq = wm831x_irq(wm831x, platform_get_irq(pdev, 0));
-	int ret;
-
-	wm831x_on = devm_kzalloc(&pdev->dev, sizeof(struct wm831x_on),
-				 GFP_KERNEL);
-	if (!wm831x_on) {
-		dev_err(&pdev->dev, "Can't allocate data\n");
-		return -ENOMEM;
-	}
-
-	wm831x_on->wm831x = wm831x;
-	INIT_DELAYED_WORK(&wm831x_on->work, wm831x_poll_on);
-
-	wm831x_on->dev = devm_input_allocate_device(&pdev->dev);
-	if (!wm831x_on->dev) {
-		dev_err(&pdev->dev, "Can't allocate input dev\n");
-		ret = -ENOMEM;
+	ioctx = kmalloc(ioctx_size, GFP_KERNEL);
+	if (!ioctx)
 		goto err;
-	}
 
-	wm831x_on->dev->evbit[0] = BIT_MASK(EV_KEY);
-	wm831x_on->dev->keybit[BIT_WORD(KEY_POWER)] = BIT_MASK(KEY_POWER);
-	wm831x_on->dev->name = "wm831x_on";
-	wm831x_on->dev->phys = "wm831x_on/input0";
-	wm831x_on->dev->dev.parent = &pdev->dev;
+	ioctx->buf = kmalloc(dma_size, GFP_KERNEL);
+	if (!ioctx->buf)
+		goto err_free_ioctx;
 
-	ret = request_threaded_irq(irq, NULL, wm831x_on_irq,
-				   IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-				   "wm831x_on",
-				   wm831x_on);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "Unable to request IRQ: %d\n", ret);
-		goto err_input_dev;
-	}
-	ret = input_register_device(wm831x_on->dev);
-	if (ret) {
-		dev_dbg(&pdev->dev, "Can't register input device: %d\n", ret);
-		goto err_irq;
-	}
+	ioctx->dma = ib_dma_map_single(sdev->device, ioctx->buf, dma_size, dir);
+	if (ib_dma_mapping_error(sdev->device, ioctx->dma))
+		goto err_free_buf;
 
-	platform_set_drvdata(pdev, wm831x_on);
+	return ioctx;
 
-	return 0;
-
-err_irq:
-	free_irq(irq, wm831x_on);
-err_input_dev:
+err_free_buf:
+	kfree(ioctx->buf);
+err_free_ioctx:
+	kfree(ioctx);
 err:
-	return ret;
+	return NULL;
 }
 
-static int wm831x_on_remove(struct platform_device *pdev)
+/**
+ * srpt_free_ioctx() - Free an SRPT I/O context structure.
+ */
+static void srpt_free_ioctx(struct srpt_device *sdev, struct srpt_ioctx *ioctx,
+			    int dma_size, enum dma_data_direction dir)
 {
-	struct wm831x_on *wm831x_on = platform_get_drvdata(pdev);
-	int irq = platform_get_irq(pdev, 0);
+	if (!ioctx)
+		return;
 
-	free_irq(irq, wm831x_on);
-	cancel_delayed_work_sync(&wm831x_on->work);
-
-	return 0;
+	ib_dma_unmap_single(sdev->device, ioctx->dma, dma_size, dir);
+	kfree(ioctx->buf);
+	kfree(ioctx);
 }
 
-static struct platform_driver wm831x_on_driver = {
-	.probe		= wm831x_on_probe,
-	.remove		= wm831x_on_remove,
-	.driver		= {
-		.name	= "wm831x-on",
-	},
-};
-module_platform_driver(wm831x_on_driver);
+/**
+ * srpt_alloc_ioctx_ring() - Allocate a ring of SRPT I/O context structures.
+ * @sdev:       Device to allocate the I/O context ring for.
+ * @ring_size:  Number of elements in the I/O context ring.
+ * @ioctx_size: I/O context size.
+ * @dma_size:   DMA buffer size.
+ * @dir:        DMA data direction.
+ */
+static struct srpt_ioctx **srpt_alloc_ioctx_ring(struct srpt_device *sdev,
+				int ring_size, int ioctx_size,
+				int dma_size, enum dma_data_direction dir)
+{
+	struct srpt_ioctx **ring;
+	int i;
 
-MODULE_ALIAS("platform:wm831x-on");
-MODULE_DESCRIPTION("WM831x ON pin");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Mark Brown <broonie@opensource.wolfsonmicro.com>");
+	WARN_ON(ioctx_size != sizeof(struct srpt_recv_ioctx)
+		&& ioctx_size != sizeof(struct srpt_send_ioctx));
 
+	ring = kmalloc(ring_size * sizeof(ring[0]), GFP_KERNEL);
+	if (!ring)
+		goto out;
+	for (i = 0; i < ring_size; ++i) {
+		ring[i] = srpt_alloc_ioctx(sdev, ioctx_size, dma_size, dir);
+		if (!ring[i])
+			goto err;
+		ring[i]->index = i;
+	}
+	goto out;
+
+err:
+	while (--i >= 0)
+		srpt_free_ioctx(sdev, ring[i], dma_size, dir);
+	kfree(ring);
+	ring = NULL;
+out:
+	return ring;
+}
+
+/**
+ * srpt_free_ioctx_ring() - Free the ring of SRPT I/O context structures.
+ */
+static void srpt_free_ioctx_ring(struct srpt_ioctx **ioctx_ring,
+				 struct srpt_device *sdev, int ring_size,
+				 int dma_size, enum dma_data_direction dir)
+{
+	int i;
+
+	for (i = 0; i < ring_size; ++i)
+		srpt_free_ioctx(sdev, ioctx_ring[i], dma_size, dir);
+	kfree(ioctx_ring);
+}
+
+/**
+ * srpt_get_cmd_state() - Get the state of a SCSI command.
+ */
+static enum srpt_command_state srpt_get_cmd_state(struct srpt_send_ioctx *ioctx)
+{
+	enum srpt_command_state state;
+	unsigned long flags;
+
+	BUG_ON(!ioctx);
+
+	spin_lock_irqsave(&ioctx->spinlock, flags);
+	state = ioctx->state;
+	spin_unlock_irqrestore(&ioctx->spinlock, flags);
+	return state;
+}
+
+/**
+ * srpt_set_cmd_state() - Set the state of a SCSI command.
+ *
+ * Does not modify the state of aborted commands. Returns the previous command
+ * state.
+ */
+static enum srpt_command_state srpt_set_cmd_state(struct srpt_send_ioctx *ioctx,
+						  enum srpt_command_state new)
+{
+	enum srpt_command_state previous;
+	unsigned long flags;
+
+	BUG_ON(!ioctx);
+
+	spin_lock_irqsave(&ioctx->spinlock, flags);
+	previous = ioctx->state;
+	if (previous != SRPT_STATE_DONE)
+		ioctx->state = new;
+	spin_unlock_irqrestore(&ioctx->spinlock, flags);
+
+	return previous;
+}
+
+/**
+ * srpt_test_and_set_cmd_state() - Test and set the state of a command.
+ *
+ * Returns true if and only if the previous command state was equal to 'old'.
+ */
+static bool srpt_test_and_set_cmd_state(struct srpt_send

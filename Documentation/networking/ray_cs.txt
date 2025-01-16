@@ -1,150 +1,232 @@
-September 21, 1999
+ale's manuals.
+ */
+static unsigned int ecc_table[16] = {
+	/* MSB           LSB */
+	/* [0:31]    [32:63] */
+	0xf00fe11e, 0xc33c0ff7,	/* Syndrome bit 7 */
+	0x00ff00ff, 0x00fff0ff,
+	0x0f0f0f0f, 0x0f0fff00,
+	0x11113333, 0x7777000f,
+	0x22224444, 0x8888222f,
+	0x44448888, 0xffff4441,
+	0x8888ffff, 0x11118882,
+	0xffff1111, 0x22221114,	/* Syndrome bit 0 */
+};
 
-Copyright (c) 1998  Corey Thomas (corey@world.std.com)
+/*
+ * Calculate the correct ECC value for a 64-bit value specified by high:low
+ */
+static u8 calculate_ecc(u32 high, u32 low)
+{
+	u32 mask_low;
+	u32 mask_high;
+	int bit_cnt;
+	u8 ecc = 0;
+	int i;
+	int j;
 
-This file is the documentation for the Raylink Wireless LAN card driver for
-Linux.  The Raylink wireless LAN card is a PCMCIA card which provides IEEE
-802.11 compatible wireless network connectivity at 1 and 2 megabits/second.
-See http://www.raytheon.com/micro/raylink/ for more information on the Raylink
-card.  This driver is in early development and does have bugs.  See the known
-bugs and limitations at the end of this document for more information.
-This driver also works with WebGear's Aviator 2.4 and Aviator Pro
-wireless LAN cards.
+	for (i = 0; i < 8; i++) {
+		mask_high = ecc_table[i * 2];
+		mask_low = ecc_table[i * 2 + 1];
+		bit_cnt = 0;
 
-As of kernel 2.3.18, the ray_cs driver is part of the Linux kernel
-source.  My web page for the development of ray_cs is at
-http://web.ralinktech.com/ralink/Home/Support/Linux.html 
-and I can be emailed at corey@world.std.com
+		for (j = 0; j < 32; j++) {
+			if ((mask_high >> j) & 1)
+				bit_cnt ^= (high >> j) & 1;
+			if ((mask_low >> j) & 1)
+				bit_cnt ^= (low >> j) & 1;
+		}
 
-The kernel driver is based on ray_cs-1.62.tgz
+		ecc |= bit_cnt << i;
+	}
 
-The driver at my web page is intended to be used as an add on to
-David Hinds pcmcia package.  All the command line parameters are
-available when compiled as a module.  When built into the kernel, only
-the essid= string parameter is available via the kernel command line.
-This will change after the method of sorting out parameters for all
-the PCMCIA drivers is agreed upon.  If you must have a built in driver
-with nondefault parameters, they can be edited in
-/usr/src/linux/drivers/net/pcmcia/ray_cs.c.  Searching for module_param
-will find them all.
+	return ecc;
+}
 
-Information on card services is available at:
-	http://pcmcia-cs.sourceforge.net/
+/*
+ * Create the syndrome code which is generated if the data line specified by
+ * 'bit' failed.  Eg generate an 8-bit codes seen in Table 8-55 in the MPC8641
+ * User's Manual and 9-61 in the MPC8572 User's Manual.
+ */
+static u8 syndrome_from_bit(unsigned int bit) {
+	int i;
+	u8 syndrome = 0;
 
+	/*
+	 * Cycle through the upper or lower 32-bit portion of each value in
+	 * ecc_table depending on if 'bit' is in the upper or lower half of
+	 * 64-bit data.
+	 */
+	for (i = bit < 32; i < 16; i += 2)
+		syndrome |= ((ecc_table[i] >> (bit % 32)) & 1) << (i / 2);
 
-Card services user programs are still required for PCMCIA devices.
-pcmcia-cs-3.1.1 or greater is required for the kernel version of
-the driver.
+	return syndrome;
+}
 
-Currently, ray_cs is not part of David Hinds card services package,
-so the following magic is required.
+/*
+ * Decode data and ecc syndrome to determine what went wrong
+ * Note: This can only decode single-bit errors
+ */
+static void sbe_ecc_decode(u32 cap_high, u32 cap_low, u32 cap_ecc,
+		       int *bad_data_bit, int *bad_ecc_bit)
+{
+	int i;
+	u8 syndrome;
 
-At the end of the /etc/pcmcia/config.opts file, add the line: 
-source ./ray_cs.opts 
-This will make card services read the ray_cs.opts file
-when starting.  Create the file /etc/pcmcia/ray_cs.opts containing the
-following:
+	*bad_data_bit = -1;
+	*bad_ecc_bit = -1;
 
-#### start of /etc/pcmcia/ray_cs.opts ###################
-# Configuration options for Raylink Wireless LAN PCMCIA card
-device "ray_cs"
-  class "network" module "misc/ray_cs"
+	/*
+	 * Calculate the ECC of the captured data and XOR it with the captured
+	 * ECC to find an ECC syndrome value we can search for
+	 */
+	syndrome = calculate_ecc(cap_high, cap_low) ^ cap_ecc;
 
-card "RayLink PC Card WLAN Adapter"
-  manfid 0x01a6, 0x0000
-  bind "ray_cs"
+	/* Check if a data line is stuck... */
+	for (i = 0; i < 64; i++) {
+		if (syndrome == syndrome_from_bit(i)) {
+			*bad_data_bit = i;
+			return;
+		}
+	}
 
-module "misc/ray_cs" opts ""
-#### end of /etc/pcmcia/ray_cs.opts #####################
+	/* If data is correct, check ECC bits for errors... */
+	for (i = 0; i < 8; i++) {
+		if ((syndrome >> i) & 0x1) {
+			*bad_ecc_bit = i;
+			return;
+		}
+	}
+}
 
+#define make64(high, low) (((u64)(high) << 32) | (low))
 
-To join an existing network with
-different parameters, contact the network administrator for the 
-configuration information, and edit /etc/pcmcia/ray_cs.opts.
-Add the parameters below between the empty quotes.
+static void mpc85xx_mc_check(struct mem_ctl_info *mci)
+{
+	struct mpc85xx_mc_pdata *pdata = mci->pvt_info;
+	struct csrow_info *csrow;
+	u32 bus_width;
+	u32 err_detect;
+	u32 syndrome;
+	u64 err_addr;
+	u32 pfn;
+	int row_index;
+	u32 cap_high;
+	u32 cap_low;
+	int bad_data_bit;
+	int bad_ecc_bit;
 
-Parameters for ray_cs driver which may be specified in ray_cs.opts:
+	err_detect = in_be32(pdata->mc_vbase + MPC85XX_MC_ERR_DETECT);
+	if (!err_detect)
+		return;
 
-bc              integer         0 = normal mode (802.11 timing)
-                                1 = slow down inter frame timing to allow
-                                    operation with older breezecom access
-                                    points.
+	mpc85xx_mc_printk(mci, KERN_ERR, "Err Detect Register: %#8.8x\n",
+			  err_detect);
 
-beacon_period	integer         beacon period in Kilo-microseconds
-				legal values = must be integer multiple 
-                                               of hop dwell
-                                default = 256
+	/* no more processing if not ECC bit errors */
+	if (!(err_detect & (DDR_EDE_SBE | DDR_EDE_MBE))) {
+		out_be32(pdata->mc_vbase + MPC85XX_MC_ERR_DETECT, err_detect);
+		return;
+	}
 
-country         integer         1 = USA (default)
-                                2 = Europe
-                                3 = Japan
-                                4 = Korea
-                                5 = Spain
-                                6 = France
-                                7 = Israel
-                                8 = Australia
+	syndrome = in_be32(pdata->mc_vbase + MPC85XX_MC_CAPTURE_ECC);
 
-essid		string		ESS ID - network name to join
-				string with maximum length of 32 chars
-				default value = "ADHOC_ESSID"
+	/* Mask off appropriate bits of syndrome based on bus width */
+	bus_width = (in_be32(pdata->mc_vbase + MPC85XX_MC_DDR_SDRAM_CFG) &
+			DSC_DBW_MASK) ? 32 : 64;
+	if (bus_width == 64)
+		syndrome &= 0xff;
+	else
+		syndrome &= 0xffff;
 
-hop_dwell	integer         hop dwell time in Kilo-microseconds 
-				legal values = 16,32,64,128(default),256
+	err_addr = make64(
+		in_be32(pdata->mc_vbase + MPC85XX_MC_CAPTURE_EXT_ADDRESS),
+		in_be32(pdata->mc_vbase + MPC85XX_MC_CAPTURE_ADDRESS));
+	pfn = err_addr >> PAGE_SHIFT;
 
-irq_mask	integer         linux standard 16 bit value 1bit/IRQ
-				lsb is IRQ 0, bit 1 is IRQ 1 etc.
-				Used to restrict choice of IRQ's to use.
-                                Recommended method for controlling
-                                interrupts is in /etc/pcmcia/config.opts
+	for (row_index = 0; row_index < mci->nr_csrows; row_index++) {
+		csrow = mci->csrows[row_index];
+		if ((pfn >= csrow->first_page) && (pfn <= csrow->last_page))
+			break;
+	}
 
-net_type	integer		0 (default) = adhoc network, 
-				1 = infrastructure
+	cap_high = in_be32(pdata->mc_vbase + MPC85XX_MC_CAPTURE_DATA_HI);
+	cap_low = in_be32(pdata->mc_vbase + MPC85XX_MC_CAPTURE_DATA_LO);
 
-phy_addr	string          string containing new MAC address in
-				hex, must start with x eg
-				x00008f123456
+	/*
+	 * Analyze single-bit errors on 64-bit wide buses
+	 * TODO: Add support for 32-bit wide buses
+	 */
+	if ((err_detect & DDR_EDE_SBE) && (bus_width == 64)) {
+		sbe_ecc_decode(cap_high, cap_low, syndrome,
+				&bad_data_bit, &bad_ecc_bit);
 
-psm		integer         0 = continuously active
-				1 = power save mode (not useful yet)
+		if (bad_data_bit != -1)
+			mpc85xx_mc_printk(mci, KERN_ERR,
+				"Faulty Data bit: %d\n", bad_data_bit);
+		if (bad_ecc_bit != -1)
+			mpc85xx_mc_printk(mci, KERN_ERR,
+				"Faulty ECC bit: %d\n", bad_ecc_bit);
 
-pc_debug	integer		(0-5) larger values for more verbose
-				logging.  Replaces ray_debug.
+		mpc85xx_mc_printk(mci, KERN_ERR,
+			"Expected Data / ECC:\t%#8.8x_%08x / %#2.2x\n",
+			cap_high ^ (1 << (bad_data_bit - 32)),
+			cap_low ^ (1 << bad_data_bit),
+			syndrome ^ (1 << bad_ecc_bit));
+	}
 
-ray_debug	integer		Replaced with pc_debug
+	mpc85xx_mc_printk(mci, KERN_ERR,
+			"Captured Data / ECC:\t%#8.8x_%08x / %#2.2x\n",
+			cap_high, cap_low, syndrome);
+	mpc85xx_mc_printk(mci, KERN_ERR, "Err addr: %#8.8llx\n", err_addr);
+	mpc85xx_mc_printk(mci, KERN_ERR, "PFN: %#8.8x\n", pfn);
 
-ray_mem_speed   integer         defaults to 500
+	/* we are out of range */
+	if (row_index == mci->nr_csrows)
+		mpc85xx_mc_printk(mci, KERN_ERR, "PFN out of range!\n");
 
-sniffer         integer         0 = not sniffer (default)
-                                1 = sniffer which can be used to record all
-                                    network traffic using tcpdump or similar, 
-                                    but no normal network use is allowed.
+	if (err_detect & DDR_EDE_SBE)
+		edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1,
+				     pfn, err_addr & ~PAGE_MASK, syndrome,
+				     row_index, 0, -1,
+				     mci->ctl_name, "");
 
-translate	integer		0 = no translation (encapsulate frames)
-				1 = translation    (RFC1042/802.1)
+	if (err_detect & DDR_EDE_MBE)
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1,
+				     pfn, err_addr & ~PAGE_MASK, syndrome,
+				     row_index, 0, -1,
+				     mci->ctl_name, "");
 
+	out_be32(pdata->mc_vbase + MPC85XX_MC_ERR_DETECT, err_detect);
+}
 
-More on sniffer mode:
+static irqreturn_t mpc85xx_mc_isr(int irq, void *dev_id)
+{
+	struct mem_ctl_info *mci = dev_id;
+	struct mpc85xx_mc_pdata *pdata = mci->pvt_info;
+	u32 err_detect;
 
-tcpdump does not understand 802.11 headers, so it can't
-interpret the contents, but it can record to a file.  This is only
-useful for debugging 802.11 lowlevel protocols that are not visible to
-linux.  If you want to watch ftp xfers, or do similar things, you
-don't need to use sniffer mode.  Also, some packet types are never
-sent up by the card, so you will never see them (ack, rts, cts, probe
-etc.)  There is a simple program (showcap) included in the ray_cs
-package which parses the 802.11 headers.
+	err_detect = in_be32(pdata->mc_vbase + MPC85XX_MC_ERR_DETECT);
+	if (!err_detect)
+		return IRQ_NONE;
 
-Known Problems and missing features
+	mpc85xx_mc_check(mci);
 
-        Does not work with non x86
+	return IRQ_HANDLED;
+}
 
-	Does not work with SMP
+static void mpc85xx_init_csrows(struct mem_ctl_info *mci)
+{
+	struct mpc85xx_mc_pdata *pdata = mci->pvt_info;
+	struct csrow_info *csrow;
+	struct dimm_info *dimm;
+	u32 sdram_ctl;
+	u32 sdtype;
+	enum mem_type mtype;
+	u32 cs_bnds;
+	int index;
 
-	Support for defragmenting frames is not yet debugged, and in
-	fact is known to not work.  I have never encountered a net set
-	up to fragment, but still, it should be fixed.
+	sdram_ctl = in_be32(pdata->mc_vbase + MPC85XX_MC_DDR_SDRAM_CFG);
 
-	The ioctl support is incomplete.  The hardware address cannot be set
-	using ifconfig yet.  If a different hardware address is needed, it may
-	be set using the phy_addr parameter in ray_cs.opts.  This requires
-	a card insertion to take effect.
+	sdtype = sdram_ctl & DSC_SDTYPE_MASK;
+	if (sdram

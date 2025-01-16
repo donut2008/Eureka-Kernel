@@ -1,118 +1,106 @@
-/*
- * Generic GPIO beeper driver
- *
- * Copyright (C) 2013-2014 Alexander Shiyan <shc_work@mail.ru>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- */
+a_len, data_left, rdma_write_max, va_offset = 0;
+	int ret = 0, i, ib_sge_cnt;
 
-#include <linux/input.h>
-#include <linux/module.h>
-#include <linux/gpio/consumer.h>
-#include <linux/of.h>
-#include <linux/workqueue.h>
-#include <linux/platform_device.h>
+	isert_cmd->tx_desc.isert_cmd = isert_cmd;
 
-#define BEEPER_MODNAME		"gpio-beeper"
+	offset = wr->iser_ib_op == ISER_IB_RDMA_READ ? cmd->write_data_done : 0;
+	ret = isert_map_data_buf(isert_conn, isert_cmd, se_cmd->t_data_sg,
+				 se_cmd->t_data_nents, se_cmd->data_length,
+				 offset, wr->iser_ib_op, &wr->data);
+	if (ret)
+		return ret;
 
-struct gpio_beeper {
-	struct work_struct	work;
-	struct gpio_desc	*desc;
-	bool			beeping;
-};
+	data_left = data->len;
+	offset = data->offset;
 
-static void gpio_beeper_toggle(struct gpio_beeper *beep, bool on)
-{
-	gpiod_set_value_cansleep(beep->desc, on);
-}
+	ib_sge = kzalloc(sizeof(struct ib_sge) * data->nents, GFP_KERNEL);
+	if (!ib_sge) {
+		isert_warn("Unable to allocate ib_sge\n");
+		ret = -ENOMEM;
+		goto unmap_cmd;
+	}
+	wr->ib_sge = ib_sge;
 
-static void gpio_beeper_work(struct work_struct *work)
-{
-	struct gpio_beeper *beep = container_of(work, struct gpio_beeper, work);
+	wr->rdma_wr_num = DIV_ROUND_UP(data->nents, isert_conn->max_sge);
+	wr->rdma_wr = kzalloc(sizeof(struct ib_rdma_wr) * wr->rdma_wr_num,
+				GFP_KERNEL);
+	if (!wr->rdma_wr) {
+		isert_dbg("Unable to allocate wr->rdma_wr\n");
+		ret = -ENOMEM;
+		goto unmap_cmd;
+	}
 
-	gpio_beeper_toggle(beep, beep->beeping);
-}
+	wr->isert_cmd = isert_cmd;
+	rdma_write_max = isert_conn->max_sge * PAGE_SIZE;
 
-static int gpio_beeper_event(struct input_dev *dev, unsigned int type,
-			     unsigned int code, int value)
-{
-	struct gpio_beeper *beep = input_get_drvdata(dev);
+	for (i = 0; i < wr->rdma_wr_num; i++) {
+		rdma_wr = &isert_cmd->rdma_wr.rdma_wr[i];
+		data_len = min(data_left, rdma_write_max);
 
-	if (type != EV_SND || code != SND_BELL)
-		return -ENOTSUPP;
+		rdma_wr->wr.send_flags = 0;
+		if (wr->iser_ib_op == ISER_IB_RDMA_WRITE) {
+			rdma_wr->wr.opcode = IB_WR_RDMA_WRITE;
+			rdma_wr->remote_addr = isert_cmd->read_va + offset;
+			rdma_wr->rkey = isert_cmd->read_stag;
+			if (i + 1 == wr->rdma_wr_num)
+				rdma_wr->wr.next = &isert_cmd->tx_desc.send_wr;
+			else
+				rdma_wr->wr.next = &wr->rdma_wr[i + 1].wr;
+		} else {
+			rdma_wr->wr.opcode = IB_WR_RDMA_READ;
+			rdma_wr->remote_addr = isert_cmd->write_va + va_offset;
+			rdma_wr->rkey = isert_cmd->write_stag;
+			if (i + 1 == wr->rdma_wr_num)
+				rdma_wr->wr.send_flags = IB_SEND_SIGNALED;
+			else
+				rdma_wr->wr.next = &wr->rdma_wr[i + 1].wr;
+		}
 
-	if (value < 0)
-		return -EINVAL;
+		ib_sge_cnt = isert_build_rdma_wr(isert_conn, isert_cmd, ib_sge,
+					rdma_wr, data_len, offset);
+		ib_sge += ib_sge_cnt;
 
-	beep->beeping = value;
-	/* Schedule work to actually turn the beeper on or off */
-	schedule_work(&beep->work);
+		offset += data_len;
+		va_offset += data_len;
+		data_left -= data_len;
+	}
 
 	return 0;
+unmap_cmd:
+	isert_unmap_data_buf(isert_conn, data);
+
+	return ret;
 }
 
-static void gpio_beeper_close(struct input_dev *input)
+static inline void
+isert_inv_rkey(struct ib_send_wr *inv_wr, struct ib_mr *mr)
 {
-	struct gpio_beeper *beep = input_get_drvdata(input);
+	u32 rkey;
 
-	cancel_work_sync(&beep->work);
-	gpio_beeper_toggle(beep, false);
+	memset(inv_wr, 0, sizeof(*inv_wr));
+	inv_wr->wr_id = ISER_FASTREG_LI_WRID;
+	inv_wr->opcode = IB_WR_LOCAL_INV;
+	inv_wr->ex.invalidate_rkey = mr->rkey;
+
+	/* Bump the key */
+	rkey = ib_inc_rkey(mr->rkey);
+	ib_update_fast_reg_key(mr, rkey);
 }
 
-static int gpio_beeper_probe(struct platform_device *pdev)
+static int
+isert_fast_reg_mr(struct isert_conn *isert_conn,
+		  struct fast_reg_descriptor *fr_desc,
+		  struct isert_data_buf *mem,
+		  enum isert_indicator ind,
+		  struct ib_sge *sge)
 {
-	struct gpio_beeper *beep;
-	struct input_dev *input;
+	struct isert_device *device = isert_conn->device;
+	struct ib_device *ib_dev = device->ib_device;
+	struct ib_mr *mr;
+	struct ib_reg_wr reg_wr;
+	struct ib_send_wr inv_wr, *bad_wr, *wr = NULL;
+	int ret, n;
 
-	beep = devm_kzalloc(&pdev->dev, sizeof(*beep), GFP_KERNEL);
-	if (!beep)
-		return -ENOMEM;
-
-	beep->desc = devm_gpiod_get(&pdev->dev, NULL, GPIOD_OUT_LOW);
-	if (IS_ERR(beep->desc))
-		return PTR_ERR(beep->desc);
-
-	input = devm_input_allocate_device(&pdev->dev);
-	if (!input)
-		return -ENOMEM;
-
-	INIT_WORK(&beep->work, gpio_beeper_work);
-
-	input->name		= pdev->name;
-	input->id.bustype	= BUS_HOST;
-	input->id.vendor	= 0x0001;
-	input->id.product	= 0x0001;
-	input->id.version	= 0x0100;
-	input->close		= gpio_beeper_close;
-	input->event		= gpio_beeper_event;
-
-	input_set_capability(input, EV_SND, SND_BELL);
-
-	input_set_drvdata(input, beep);
-
-	return input_register_device(input);
-}
-
-#ifdef CONFIG_OF
-static const struct of_device_id gpio_beeper_of_match[] = {
-	{ .compatible = BEEPER_MODNAME, },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, gpio_beeper_of_match);
-#endif
-
-static struct platform_driver gpio_beeper_platform_driver = {
-	.driver	= {
-		.name		= BEEPER_MODNAME,
-		.of_match_table	= of_match_ptr(gpio_beeper_of_match),
-	},
-	.probe	= gpio_beeper_probe,
-};
-module_platform_driver(gpio_beeper_platform_driver);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Alexander Shiyan <shc_work@mail.ru>");
-MODULE_DESCRIPTION("Generic GPIO beeper driver");
+	if (mem->dma_nents == 1) {
+		sge->lkey = device->pd->local_dma_lkey;
+		sge->addr = ib_sg_dma_address(ib_dev, &mem->sg[0]

@@ -1,553 +1,448 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-
-
-#include <linux/export.h>
-#include <linux/kthread.h>
-#include <linux/interrupt.h>
-#include <linux/fs.h>
-#include <linux/jiffies.h>
-#include <linux/slab.h>
-#include <linux/pm_runtime.h>
-
-#include <linux/mei.h>
-
-#include "mei_dev.h"
-#include "hbm.h"
-#include "client.h"
-
-
-/**
- * mei_irq_compl_handler - dispatch complete handlers
- *	for the completed callbacks
- *
- * @dev: mei device
- * @compl_list: list of completed cbs
- */
-void mei_irq_compl_handler(struct mei_device *dev, struct mei_cl_cb *compl_list)
-{
-	struct mei_cl_cb *cb, *next;
-	struct mei_cl *cl;
-
-	list_for_each_entry_safe(cb, next, &compl_list->list, list) {
-		cl = cb->cl;
-		list_del_init(&cb->list);
-
-		dev_dbg(dev->dev, "completing call back.\n");
-		if (cl == &dev->iamthif_cl)
-			mei_amthif_complete(dev, cb);
-		else
-			mei_cl_complete(cl, cb);
+kely(cur_size != 0)) {
+		DRM_ERROR("Command verifier out of sync.\n");
+		return -EINVAL;
 	}
-}
-EXPORT_SYMBOL_GPL(mei_irq_compl_handler);
-
-/**
- * mei_cl_hbm_equal - check if hbm is addressed to the client
- *
- * @cl: host client
- * @mei_hdr: header of mei client message
- *
- * Return: true if matches, false otherwise
- */
-static inline int mei_cl_hbm_equal(struct mei_cl *cl,
-			struct mei_msg_hdr *mei_hdr)
-{
-	return  mei_cl_host_addr(cl) == mei_hdr->host_addr &&
-		mei_cl_me_id(cl) == mei_hdr->me_addr;
-}
-
-/**
- * mei_irq_discard_msg  - discard received message
- *
- * @dev: mei device
- * @hdr: message header
- */
-void mei_irq_discard_msg(struct mei_device *dev, struct mei_msg_hdr *hdr)
-{
-	/*
-	 * no need to check for size as it is guarantied
-	 * that length fits into rd_msg_buf
-	 */
-	mei_read_slots(dev, dev->rd_msg_buf, hdr->length);
-	dev_dbg(dev->dev, "discarding message " MEI_HDR_FMT "\n",
-		MEI_HDR_PRM(hdr));
-}
-
-/**
- * mei_cl_irq_read_msg - process client message
- *
- * @cl: reading client
- * @mei_hdr: header of mei client message
- * @complete_list: completion list
- *
- * Return: always 0
- */
-int mei_cl_irq_read_msg(struct mei_cl *cl,
-		       struct mei_msg_hdr *mei_hdr,
-		       struct mei_cl_cb *complete_list)
-{
-	struct mei_device *dev = cl->dev;
-	struct mei_cl_cb *cb;
-	unsigned char *buffer = NULL;
-
-	cb = list_first_entry_or_null(&cl->rd_pending, struct mei_cl_cb, list);
-	if (!cb) {
-		cl_err(dev, cl, "pending read cb not found\n");
-		goto out;
-	}
-
-	if (!mei_cl_is_connected(cl)) {
-		cl_dbg(dev, cl, "not connected\n");
-		cb->status = -ENODEV;
-		goto out;
-	}
-
-	if (cb->buf.size == 0 || cb->buf.data == NULL) {
-		cl_err(dev, cl, "response buffer is not allocated.\n");
-		list_move_tail(&cb->list, &complete_list->list);
-		cb->status = -ENOMEM;
-		goto out;
-	}
-
-	if (cb->buf.size < mei_hdr->length + cb->buf_idx) {
-		cl_dbg(dev, cl, "message overflow. size %d len %d idx %ld\n",
-			cb->buf.size, mei_hdr->length, cb->buf_idx);
-		buffer = krealloc(cb->buf.data, mei_hdr->length + cb->buf_idx,
-				  GFP_KERNEL);
-
-		if (!buffer) {
-			cb->status = -ENOMEM;
-			list_move_tail(&cb->list, &complete_list->list);
-			goto out;
-		}
-		cb->buf.data = buffer;
-		cb->buf.size = mei_hdr->length + cb->buf_idx;
-	}
-
-	buffer = cb->buf.data + cb->buf_idx;
-	mei_read_slots(dev, buffer, mei_hdr->length);
-
-	cb->buf_idx += mei_hdr->length;
-
-	if (mei_hdr->msg_complete) {
-		cb->read_time = jiffies;
-		cl_dbg(dev, cl, "completed read length = %lu\n", cb->buf_idx);
-		list_move_tail(&cb->list, &complete_list->list);
-	} else {
-		pm_runtime_mark_last_busy(dev->dev);
-		pm_request_autosuspend(dev->dev);
-	}
-
-out:
-	if (!buffer)
-		mei_irq_discard_msg(dev, mei_hdr);
 
 	return 0;
 }
 
-/**
- * mei_cl_irq_disconnect_rsp - send disconnection response message
- *
- * @cl: client
- * @cb: callback block.
- * @cmpl_list: complete list.
- *
- * Return: 0, OK; otherwise, error.
- */
-static int mei_cl_irq_disconnect_rsp(struct mei_cl *cl, struct mei_cl_cb *cb,
-				     struct mei_cl_cb *cmpl_list)
+static void vmw_free_relocations(struct vmw_sw_context *sw_context)
 {
-	struct mei_device *dev = cl->dev;
-	u32 msg_slots;
-	int slots;
-	int ret;
-
-	slots = mei_hbuf_empty_slots(dev);
-	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_response));
-
-	if (slots < msg_slots)
-		return -EMSGSIZE;
-
-	ret = mei_hbm_cl_disconnect_rsp(dev, cl);
-	list_move_tail(&cb->list, &cmpl_list->list);
-
-	return ret;
+	sw_context->cur_reloc = 0;
 }
 
-/**
- * mei_cl_irq_read - processes client read related operation from the
- *	interrupt thread context - request for flow control credits
- *
- * @cl: client
- * @cb: callback block.
- * @cmpl_list: complete list.
- *
- * Return: 0, OK; otherwise, error.
- */
-static int mei_cl_irq_read(struct mei_cl *cl, struct mei_cl_cb *cb,
-			   struct mei_cl_cb *cmpl_list)
+static void vmw_apply_relocations(struct vmw_sw_context *sw_context)
 {
-	struct mei_device *dev = cl->dev;
-	u32 msg_slots;
-	int slots;
-	int ret;
+	uint32_t i;
+	struct vmw_relocation *reloc;
+	struct ttm_validate_buffer *validate;
+	struct ttm_buffer_object *bo;
 
-	msg_slots = mei_data2slots(sizeof(struct hbm_flow_control));
-	slots = mei_hbuf_empty_slots(dev);
-
-	if (slots < msg_slots)
-		return -EMSGSIZE;
-
-	ret = mei_hbm_cl_flow_control_req(dev, cl);
-	if (ret) {
-		cl->status = ret;
-		cb->buf_idx = 0;
-		list_move_tail(&cb->list, &cmpl_list->list);
-		return ret;
-	}
-
-	pm_runtime_mark_last_busy(dev->dev);
-	pm_request_autosuspend(dev->dev);
-
-	list_move_tail(&cb->list, &cl->rd_pending);
-
-	return 0;
-}
-
-/**
- * mei_irq_read_handler - bottom half read routine after ISR to
- * handle the read processing.
- *
- * @dev: the device structure
- * @cmpl_list: An instance of our list structure
- * @slots: slots to read.
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_irq_read_handler(struct mei_device *dev,
-		struct mei_cl_cb *cmpl_list, s32 *slots)
-{
-	struct mei_msg_hdr *mei_hdr;
-	struct mei_cl *cl;
-	int ret;
-
-	if (!dev->rd_msg_hdr) {
-		dev->rd_msg_hdr = mei_read_hdr(dev);
-		(*slots)--;
-		dev_dbg(dev->dev, "slots =%08x.\n", *slots);
-	}
-	mei_hdr = (struct mei_msg_hdr *) &dev->rd_msg_hdr;
-	dev_dbg(dev->dev, MEI_HDR_FMT, MEI_HDR_PRM(mei_hdr));
-
-	if (mei_hdr->reserved || !dev->rd_msg_hdr) {
-		dev_err(dev->dev, "corrupted message header 0x%08X\n",
-				dev->rd_msg_hdr);
-		ret = -EBADMSG;
-		goto end;
-	}
-
-	if (mei_slots2data(*slots) < mei_hdr->length) {
-		dev_err(dev->dev, "less data available than length=%08x.\n",
-				*slots);
-		/* we can't read the message */
-		ret = -ENODATA;
-		goto end;
-	}
-
-	/*  HBM message */
-	if (mei_hdr->host_addr == 0 && mei_hdr->me_addr == 0) {
-		ret = mei_hbm_dispatch(dev, mei_hdr);
-		if (ret) {
-			dev_dbg(dev->dev, "mei_hbm_dispatch failed ret = %d\n",
-					ret);
-			goto end;
-		}
-		goto reset_slots;
-	}
-
-	/* find recipient cl */
-	list_for_each_entry(cl, &dev->file_list, link) {
-		if (mei_cl_hbm_equal(cl, mei_hdr)) {
-			cl_dbg(dev, cl, "got a message\n");
+	for (i = 0; i < sw_context->cur_reloc; ++i) {
+		reloc = &sw_context->relocs[i];
+		validate = &sw_context->val_bufs[reloc->index].base;
+		bo = validate->bo;
+		switch (bo->mem.mem_type) {
+		case TTM_PL_VRAM:
+			reloc->location->offset += bo->offset;
+			reloc->location->gmrId = SVGA_GMR_FRAMEBUFFER;
 			break;
-		}
-	}
-
-	/* if no recipient cl was found we assume corrupted header */
-	if (&cl->link == &dev->file_list) {
-		dev_err(dev->dev, "no destination client found 0x%08X\n",
-				dev->rd_msg_hdr);
-		ret = -EBADMSG;
-		goto end;
-	}
-
-	if (cl == &dev->iamthif_cl) {
-		ret = mei_amthif_irq_read_msg(cl, mei_hdr, cmpl_list);
-	} else {
-		ret = mei_cl_irq_read_msg(cl, mei_hdr, cmpl_list);
-	}
-
-
-reset_slots:
-	/* reset the number of slots and header */
-	*slots = mei_count_full_read_slots(dev);
-	dev->rd_msg_hdr = 0;
-
-	if (*slots == -EOVERFLOW) {
-		/* overflow - reset */
-		dev_err(dev->dev, "resetting due to slots overflow.\n");
-		/* set the event since message has been read */
-		ret = -ERANGE;
-		goto end;
-	}
-end:
-	return ret;
-}
-EXPORT_SYMBOL_GPL(mei_irq_read_handler);
-
-
-/**
- * mei_irq_write_handler -  dispatch write requests
- *  after irq received
- *
- * @dev: the device structure
- * @cmpl_list: An instance of our list structure
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_irq_write_handler(struct mei_device *dev, struct mei_cl_cb *cmpl_list)
-{
-
-	struct mei_cl *cl;
-	struct mei_cl_cb *cb, *next;
-	struct mei_cl_cb *list;
-	s32 slots;
-	int ret;
-
-
-	if (!mei_hbuf_acquire(dev))
-		return 0;
-
-	slots = mei_hbuf_empty_slots(dev);
-	if (slots <= 0)
-		return -EMSGSIZE;
-
-	/* complete all waiting for write CB */
-	dev_dbg(dev->dev, "complete all waiting for write cb.\n");
-
-	list = &dev->write_waiting_list;
-	list_for_each_entry_safe(cb, next, &list->list, list) {
-		cl = cb->cl;
-
-		cl->status = 0;
-		cl_dbg(dev, cl, "MEI WRITE COMPLETE\n");
-		cl->writing_state = MEI_WRITE_COMPLETE;
-		list_move_tail(&cb->list, &cmpl_list->list);
-	}
-
-	if (dev->wd_state == MEI_WD_STOPPING) {
-		dev->wd_state = MEI_WD_IDLE;
-		wake_up(&dev->wait_stop_wd);
-	}
-
-	if (mei_cl_is_connected(&dev->wd_cl)) {
-		if (dev->wd_pending &&
-		    mei_cl_flow_ctrl_creds(&dev->wd_cl) > 0) {
-			ret = mei_wd_send(dev);
-			if (ret)
-				return ret;
-			dev->wd_pending = false;
-		}
-	}
-
-	/* complete control write list CB */
-	dev_dbg(dev->dev, "complete control write list cb.\n");
-	list_for_each_entry_safe(cb, next, &dev->ctrl_wr_list.list, list) {
-		cl = cb->cl;
-		switch (cb->fop_type) {
-		case MEI_FOP_DISCONNECT:
-			/* send disconnect message */
-			ret = mei_cl_irq_disconnect(cl, cb, cmpl_list);
-			if (ret)
-				return ret;
-
+		case VMW_PL_GMR:
+			reloc->location->gmrId = bo->mem.start;
 			break;
-		case MEI_FOP_READ:
-			/* send flow control message */
-			ret = mei_cl_irq_read(cl, cb, cmpl_list);
-			if (ret)
-				return ret;
-
-			break;
-		case MEI_FOP_CONNECT:
-			/* connect message */
-			ret = mei_cl_irq_connect(cl, cb, cmpl_list);
-			if (ret)
-				return ret;
-
-			break;
-		case MEI_FOP_DISCONNECT_RSP:
-			/* send disconnect resp */
-			ret = mei_cl_irq_disconnect_rsp(cl, cb, cmpl_list);
-			if (ret)
-				return ret;
-			break;
-
-		case MEI_FOP_NOTIFY_START:
-		case MEI_FOP_NOTIFY_STOP:
-			ret = mei_cl_irq_notify(cl, cb, cmpl_list);
-			if (ret)
-				return ret;
+		case VMW_PL_MOB:
+			*reloc->mob_loc = bo->mem.start;
 			break;
 		default:
 			BUG();
 		}
-
 	}
-	/* complete  write list CB */
-	dev_dbg(dev->dev, "complete write list cb.\n");
-	list_for_each_entry_safe(cb, next, &dev->write_list.list, list) {
-		cl = cb->cl;
-		if (cl == &dev->iamthif_cl)
-			ret = mei_amthif_irq_write(cl, cb, cmpl_list);
-		else
-			ret = mei_cl_irq_write(cl, cb, cmpl_list);
-		if (ret)
+	vmw_free_relocations(sw_context);
+}
+
+/**
+ * vmw_resource_list_unrefererence - Free up a resource list and unreference
+ * all resources referenced by it.
+ *
+ * @list: The resource list.
+ */
+static void vmw_resource_list_unreference(struct vmw_sw_context *sw_context,
+					  struct list_head *list)
+{
+	struct vmw_resource_val_node *val, *val_next;
+
+	/*
+	 * Drop references to resources held during command submission.
+	 */
+
+	list_for_each_entry_safe(val, val_next, list, head) {
+		list_del_init(&val->head);
+		vmw_resource_unreference(&val->res);
+
+		if (val->staged_bindings) {
+			if (val->staged_bindings != sw_context->staged_bindings)
+				vmw_binding_state_free(val->staged_bindings);
+			else
+				sw_context->staged_bindings_inuse = false;
+			val->staged_bindings = NULL;
+		}
+
+		kfree(val);
+	}
+}
+
+static void vmw_clear_validations(struct vmw_sw_context *sw_context)
+{
+	struct vmw_validate_buffer *entry, *next;
+	struct vmw_resource_val_node *val;
+
+	/*
+	 * Drop references to DMA buffers held during command submission.
+	 */
+	list_for_each_entry_safe(entry, next, &sw_context->validate_nodes,
+				 base.head) {
+		list_del(&entry->base.head);
+		ttm_bo_unref(&entry->base.bo);
+		(void) drm_ht_remove_item(&sw_context->res_ht, &entry->hash);
+		sw_context->cur_val_buf--;
+	}
+	BUG_ON(sw_context->cur_val_buf != 0);
+
+	list_for_each_entry(val, &sw_context->resource_list, head)
+		(void) drm_ht_remove_item(&sw_context->res_ht, &val->hash);
+}
+
+int vmw_validate_single_buffer(struct vmw_private *dev_priv,
+			       struct ttm_buffer_object *bo,
+			       bool interruptible,
+			       bool validate_as_mob)
+{
+	struct vmw_dma_buffer *vbo = container_of(bo, struct vmw_dma_buffer,
+						  base);
+	int ret;
+
+	if (vbo->pin_count > 0)
+		return 0;
+
+	if (validate_as_mob)
+		return ttm_bo_validate(bo, &vmw_mob_placement, interruptible,
+				       false);
+
+	/**
+	 * Put BO in VRAM if there is space, otherwise as a GMR.
+	 * If there is no space in VRAM and GMR ids are all used up,
+	 * start evicting GMRs to make room. If the DMA buffer can't be
+	 * used as a GMR, this will return -ENOMEM.
+	 */
+
+	ret = ttm_bo_validate(bo, &vmw_vram_gmr_placement, interruptible,
+			      false);
+	if (likely(ret == 0 || ret == -ERESTARTSYS))
+		return ret;
+
+	/**
+	 * If that failed, try VRAM again, this time evicting
+	 * previous contents.
+	 */
+
+	ret = ttm_bo_validate(bo, &vmw_vram_placement, interruptible, false);
+	return ret;
+}
+
+static int vmw_validate_buffers(struct vmw_private *dev_priv,
+				struct vmw_sw_context *sw_context)
+{
+	struct vmw_validate_buffer *entry;
+	int ret;
+
+	list_for_each_entry(entry, &sw_context->validate_nodes, base.head) {
+		ret = vmw_validate_single_buffer(dev_priv, entry->base.bo,
+						 true,
+						 entry->validate_as_mob);
+		if (unlikely(ret != 0))
 			return ret;
 	}
 	return 0;
 }
-EXPORT_SYMBOL_GPL(mei_irq_write_handler);
 
-
-/**
- * mei_connect_timeout  - connect/disconnect timeouts
- *
- * @cl: host client
- */
-static void mei_connect_timeout(struct mei_cl *cl)
+static int vmw_resize_cmd_bounce(struct vmw_sw_context *sw_context,
+				 uint32_t size)
 {
-	struct mei_device *dev = cl->dev;
+	if (likely(sw_context->cmd_bounce_size >= size))
+		return 0;
 
-	if (cl->state == MEI_FILE_CONNECTING) {
-		if (dev->hbm_f_dot_supported) {
-			cl->state = MEI_FILE_DISCONNECT_REQUIRED;
-			wake_up(&cl->wait);
-			return;
-		}
+	if (sw_context->cmd_bounce_size == 0)
+		sw_context->cmd_bounce_size = VMWGFX_CMD_BOUNCE_INIT_SIZE;
+
+	while (sw_context->cmd_bounce_size < size) {
+		sw_context->cmd_bounce_size =
+			PAGE_ALIGN(sw_context->cmd_bounce_size +
+				   (sw_context->cmd_bounce_size >> 1));
 	}
-	mei_reset(dev);
+
+	if (sw_context->cmd_bounce != NULL)
+		vfree(sw_context->cmd_bounce);
+
+	sw_context->cmd_bounce = vmalloc(sw_context->cmd_bounce_size);
+
+	if (sw_context->cmd_bounce == NULL) {
+		DRM_ERROR("Failed to allocate command bounce buffer.\n");
+		sw_context->cmd_bounce_size = 0;
+		return -ENOMEM;
+	}
+
+	return 0;
 }
 
 /**
- * mei_timer - timer function.
+ * vmw_execbuf_fence_commands - create and submit a command stream fence
  *
- * @work: pointer to the work_struct structure
+ * Creates a fence object and submits a command stream marker.
+ * If this fails for some reason, We sync the fifo and return NULL.
+ * It is then safe to fence buffers with a NULL pointer.
  *
+ * If @p_handle is not NULL @file_priv must also not be NULL. Creates
+ * a userspace handle if @p_handle is not NULL, otherwise not.
  */
-void mei_timer(struct work_struct *work)
+
+int vmw_execbuf_fence_commands(struct drm_file *file_priv,
+			       struct vmw_private *dev_priv,
+			       struct vmw_fence_obj **p_fence,
+			       uint32_t *p_handle)
 {
-	unsigned long timeout;
-	struct mei_cl *cl;
+	uint32_t sequence;
+	int ret;
+	bool synced = false;
 
-	struct mei_device *dev = container_of(work,
-					struct mei_device, timer_work.work);
+	/* p_handle implies file_priv. */
+	BUG_ON(p_handle != NULL && file_priv == NULL);
 
-
-	mutex_lock(&dev->device_lock);
-
-	/* Catch interrupt stalls during HBM init handshake */
-	if (dev->dev_state == MEI_DEV_INIT_CLIENTS &&
-	    dev->hbm_state != MEI_HBM_IDLE) {
-
-		if (dev->init_clients_timer) {
-			if (--dev->init_clients_timer == 0) {
-				dev_err(dev->dev, "timer: init clients timeout hbm_state = %d.\n",
-					dev->hbm_state);
-				mei_reset(dev);
-				goto out;
-			}
-		}
+	ret = vmw_fifo_send_fence(dev_priv, &sequence);
+	if (unlikely(ret != 0)) {
+		DRM_ERROR("Fence submission error. Syncing.\n");
+		synced = true;
 	}
 
-	if (dev->dev_state != MEI_DEV_ENABLED)
-		goto out;
+	if (p_handle != NULL)
+		ret = vmw_user_fence_create(file_priv, dev_priv->fman,
+					    sequence, p_fence, p_handle);
+	else
+		ret = vmw_fence_create(dev_priv->fman, sequence, p_fence);
 
-	/*** connect/disconnect timeouts ***/
-	list_for_each_entry(cl, &dev->file_list, link) {
-		if (cl->timer_count) {
-			if (--cl->timer_count == 0) {
-				dev_err(dev->dev, "timer: connect/disconnect timeout.\n");
-				mei_connect_timeout(cl);
-				goto out;
-			}
-		}
+	if (unlikely(ret != 0 && !synced)) {
+		(void) vmw_fallback_wait(dev_priv, false, false,
+					 sequence, false,
+					 VMW_FENCE_WAIT_TIMEOUT);
+		*p_fence = NULL;
 	}
 
-	if (!mei_cl_is_connected(&dev->iamthif_cl))
-		goto out;
-
-	if (dev->iamthif_stall_timer) {
-		if (--dev->iamthif_stall_timer == 0) {
-			dev_err(dev->dev, "timer: amthif  hanged.\n");
-			mei_reset(dev);
-			dev->iamthif_canceled = false;
-			dev->iamthif_state = MEI_IAMTHIF_IDLE;
-			dev->iamthif_timer = 0;
-
-			mei_io_cb_free(dev->iamthif_current_cb);
-			dev->iamthif_current_cb = NULL;
-
-			dev->iamthif_file_object = NULL;
-			mei_amthif_run_next_cmd(dev);
-		}
-	}
-
-	if (dev->iamthif_timer) {
-
-		timeout = dev->iamthif_timer +
-			mei_secs_to_jiffies(MEI_IAMTHIF_READ_TIMER);
-
-		dev_dbg(dev->dev, "dev->iamthif_timer = %ld\n",
-				dev->iamthif_timer);
-		dev_dbg(dev->dev, "timeout = %ld\n", timeout);
-		dev_dbg(dev->dev, "jiffies = %ld\n", jiffies);
-		if (time_after(jiffies, timeout)) {
-			/*
-			 * User didn't read the AMTHI data on time (15sec)
-			 * freeing AMTHI for other requests
-			 */
-
-			dev_dbg(dev->dev, "freeing AMTHI for other requests\n");
-
-			mei_io_list_flush(&dev->amthif_rd_complete_list,
-				&dev->iamthif_cl);
-			mei_io_cb_free(dev->iamthif_current_cb);
-			dev->iamthif_current_cb = NULL;
-
-			dev->iamthif_file_object->private_data = NULL;
-			dev->iamthif_file_object = NULL;
-			dev->iamthif_timer = 0;
-			mei_amthif_run_next_cmd(dev);
-
-		}
-	}
-out:
-	if (dev->dev_state != MEI_DEV_DISABLED)
-		schedule_delayed_work(&dev->timer_work, 2 * HZ);
-	mutex_unlock(&dev->device_lock);
+	return ret;
 }
+
+/**
+ * vmw_execbuf_copy_fence_user - copy fence object information to
+ * user-space.
+ *
+ * @dev_priv: Pointer to a vmw_private struct.
+ * @vmw_fp: Pointer to the struct vmw_fpriv representing the calling file.
+ * @ret: Return value from fence object creation.
+ * @user_fence_rep: User space address of a struct drm_vmw_fence_rep to
+ * which the information should be copied.
+ * @fence: Pointer to the fenc object.
+ * @fence_handle: User-space fence handle.
+ *
+ * This function copies fence information to user-space. If copying fails,
+ * The user-space struct drm_vmw_fence_rep::error member is hopefully
+ * left untouched, and if it's preloaded with an -EFAULT by user-space,
+ * the error will hopefully be detected.
+ * Also if copying fails, user-space will be unable to signal the fence
+ * object so we wait for it immediately, and then unreference the
+ * user-space reference.
+ */
+void
+vmw_execbuf_copy_fence_user(struct vmw_private *dev_priv,
+			    struct vmw_fpriv *vmw_fp,
+			    int ret,
+			    struct drm_vmw_fence_rep __user *user_fence_rep,
+			    struct vmw_fence_obj *fence,
+			    uint32_t fence_handle)
+{
+	struct drm_vmw_fence_rep fence_rep;
+
+	if (user_fence_rep == NULL)
+		return;
+
+	memset(&fence_rep, 0, sizeof(fence_rep));
+
+	fence_rep.error = ret;
+	if (ret == 0) {
+		BUG_ON(fence == NULL);
+
+		fence_rep.handle = fence_handle;
+		fence_rep.seqno = fence->base.seqno;
+		vmw_update_seqno(dev_priv, &dev_priv->fifo);
+		fence_rep.passed_seqno = dev_priv->last_read_seqno;
+	}
+
+	/*
+	 * copy_to_user errors will be detected by user space not
+	 * seeing fence_rep::error filled in. Typically
+	 * user-space would have pre-set that member to -EFAULT.
+	 */
+	ret = copy_to_user(user_fence_rep, &fence_rep,
+			   sizeof(fence_rep));
+
+	/*
+	 * User-space lost the fence object. We need to sync
+	 * and unreference the handle.
+	 */
+	if (unlikely(ret != 0) && (fence_rep.error == 0)) {
+		ttm_ref_object_base_unref(vmw_fp->tfile,
+					  fence_handle, TTM_REF_USAGE);
+		DRM_ERROR("Fence copy error. Syncing.\n");
+		(void) vmw_fence_obj_wait(fence, false, false,
+					  VMW_FENCE_WAIT_TIMEOUT);
+	}
+}
+
+/**
+ * vmw_execbuf_submit_fifo - Patch a command batch and submit it using
+ * the fifo.
+ *
+ * @dev_priv: Pointer to a device private structure.
+ * @kernel_commands: Pointer to the unpatched command batch.
+ * @command_size: Size of the unpatched command batch.
+ * @sw_context: Structure holding the relocation lists.
+ *
+ * Side effects: If this function returns 0, then the command batch
+ * pointed to by @kernel_commands will have been modified.
+ */
+static int vmw_execbuf_submit_fifo(struct vmw_private *dev_priv,
+				   void *kernel_commands,
+				   u32 command_size,
+				   struct vmw_sw_context *sw_context)
+{
+	void *cmd;
+
+	if (sw_context->dx_ctx_node)
+		cmd = vmw_fifo_reserve_dx(dev_priv, command_size,
+					  sw_context->dx_ctx_node->res->id);
+	else
+		cmd = vmw_fifo_reserve(dev_priv, command_size);
+	if (!cmd) {
+		DRM_ERROR("Failed reserving fifo space for commands.\n");
+		return -ENOMEM;
+	}
+
+	vmw_apply_relocations(sw_context);
+	memcpy(cmd, kernel_commands, command_size);
+	vmw_resource_relocations_apply(cmd, &sw_context->res_relocations);
+	vmw_resource_relocations_free(&sw_context->res_relocations);
+	vmw_fifo_commit(dev_priv, command_size);
+
+	return 0;
+}
+
+/**
+ * vmw_execbuf_submit_cmdbuf - Patch a command batch and submit it using
+ * the command buffer manager.
+ *
+ * @dev_priv: Pointer to a device private structure.
+ * @header: Opaque handle to the command buffer allocation.
+ * @command_size: Size of the unpatched command batch.
+ * @sw_context: Structure holding the relocation lists.
+ *
+ * Side effects: If this function returns 0, then the command buffer
+ * represented by @header will have been modified.
+ */
+static int vmw_execbuf_submit_cmdbuf(struct vmw_private *dev_priv,
+				     struct vmw_cmdbuf_header *header,
+				     u32 command_size,
+				     struct vmw_sw_context *sw_context)
+{
+	u32 id = ((sw_context->dx_ctx_node) ? sw_context->dx_ctx_node->res->id :
+		  SVGA3D_INVALID_ID);
+	void *cmd = vmw_cmdbuf_reserve(dev_priv->cman, command_size,
+				       id, false, header);
+
+	vmw_apply_relocations(sw_context);
+	vmw_resource_relocations_apply(cmd, &sw_context->res_relocations);
+	vmw_resource_relocations_free(&sw_context->res_relocations);
+	vmw_cmdbuf_commit(dev_priv->cman, command_size, header, false);
+
+	return 0;
+}
+
+/**
+ * vmw_execbuf_cmdbuf - Prepare, if possible, a user-space command batch for
+ * submission using a command buffer.
+ *
+ * @dev_priv: Pointer to a device private structure.
+ * @user_commands: User-space pointer to the commands to be submitted.
+ * @command_size: Size of the unpatched command batch.
+ * @header: Out parameter returning the opaque pointer to the command buffer.
+ *
+ * This function checks whether we can use the command buffer manager for
+ * submission and if so, creates a command buffer of suitable size and
+ * copies the user data into that buffer.
+ *
+ * On successful return, the function returns a pointer to the data in the
+ * command buffer and *@header is set to non-NULL.
+ * If command buffers could not be used, the function will return the value
+ * of @kernel_commands on function call. That value may be NULL. In that case,
+ * the value of *@header will be set to NULL.
+ * If an error is encountered, the function will return a pointer error value.
+ * If the function is interrupted by a signal while sleeping, it will return
+ * -ERESTARTSYS casted to a pointer error value.
+ */
+static void *vmw_execbuf_cmdbuf(struct vmw_private *dev_priv,
+				void __user *user_commands,
+				void *kernel_commands,
+				u32 command_size,
+				struct vmw_cmdbuf_header **header)
+{
+	size_t cmdbuf_size;
+	int ret;
+
+	*header = NULL;
+	if (command_size > SVGA_CB_MAX_SIZE) {
+		DRM_ERROR("Command buffer is too large.\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (!dev_priv->cman || kernel_commands)
+		return kernel_commands;
+
+	/* If possible, add a little space for fencing. */
+	cmdbuf_size = command_size + 512;
+	cmdbuf_size = min_t(size_t, cmdbuf_size, SVGA_CB_MAX_SIZE);
+	kernel_commands = vmw_cmdbuf_alloc(dev_priv->cman, cmdbuf_size,
+					   true, header);
+	if (IS_ERR(kernel_commands))
+		return kernel_commands;
+
+	ret = copy_from_user(kernel_commands, user_commands,
+			     command_size);
+	if (ret) {
+		DRM_ERROR("Failed copying commands.\n");
+		vmw_cmdbuf_header_free(*header);
+		*header = NULL;
+		return ERR_PTR(-EFAULT);
+	}
+
+	return kernel_commands;
+}
+
+static int vmw_execbuf_tie_context(struct vmw_private *dev_priv,
+				   struct vmw_sw_context *sw_context,
+				   uint32_t handle)
+{
+	struct vmw_resource_val_node *ctx_node;
+	struct vmw_resource *res;
+	int ret;
+
+	if (handle == SVGA3D_INVALID_ID)
+		return 0;
+
+	ret = vmw_user_resource_lookup_handle(dev_priv, sw_context->fp->tfile,
+					      handle, user_context_converter,
+					      &res);
+	if (unlikely(ret != 0)) {
+		DRM_ERROR("Could not find or user DX context 0x%08x.\n",
+			  (unsigned) handle);
+		return ret;
+	}
+
+	ret = vmw_resource_val_add(sw_context, res, &ctx_node);
+	if (unlikely(ret != 0))
+		goto out_err;
+
+	sw_context->dx_ctx_node = ctx_node;
+	sw_context->man = vmw_context_res_man(res);
+out_err:
+	vmw_resource_unreference(&res);
+	return ret;
+}
+
+int vmw_execbuf_process(struct drm_file *file_priv,
+			struct vmw_private *dev_pr

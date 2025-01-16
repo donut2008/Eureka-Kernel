@@ -1,267 +1,133 @@
-/*
- * USB ZyXEL omni.net LCD PLUS driver
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License version
- *	2 as published by the Free Software Foundation.
- *
- * See Documentation/usb/usb-serial.txt for more information on using this
- * driver
- *
- * Please report both successes and troubles to the author at omninet@kroah.com
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/uaccess.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-
-#define DRIVER_AUTHOR "Alessandro Zummo"
-#define DRIVER_DESC "USB ZyXEL omni.net LCD PLUS Driver"
-
-#define ZYXEL_VENDOR_ID		0x0586
-#define ZYXEL_OMNINET_ID	0x1000
-#define ZYXEL_OMNI_56K_PLUS_ID	0x1500
-/* This one seems to be a re-branded ZyXEL device */
-#define BT_IGNITIONPRO_ID	0x2000
-
-/* function prototypes */
-static int  omninet_open(struct tty_struct *tty, struct usb_serial_port *port);
-static void omninet_process_read_urb(struct urb *urb);
-static void omninet_write_bulk_callback(struct urb *urb);
-static int  omninet_write(struct tty_struct *tty, struct usb_serial_port *port,
-				const unsigned char *buf, int count);
-static int  omninet_write_room(struct tty_struct *tty);
-static void omninet_disconnect(struct usb_serial *serial);
-static int omninet_attach(struct usb_serial *serial);
-static int omninet_port_probe(struct usb_serial_port *port);
-static int omninet_port_remove(struct usb_serial_port *port);
-
-static const struct usb_device_id id_table[] = {
-	{ USB_DEVICE(ZYXEL_VENDOR_ID, ZYXEL_OMNINET_ID) },
-	{ USB_DEVICE(ZYXEL_VENDOR_ID, ZYXEL_OMNI_56K_PLUS_ID) },
-	{ USB_DEVICE(ZYXEL_VENDOR_ID, BT_IGNITIONPRO_ID) },
-	{ }						/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, id_table);
-
-static struct usb_serial_driver zyxel_omninet_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"omninet",
-	},
-	.description =		"ZyXEL - omni.net lcd plus usb",
-	.id_table =		id_table,
-	.num_ports =		1,
-	.attach =		omninet_attach,
-	.port_probe =		omninet_port_probe,
-	.port_remove =		omninet_port_remove,
-	.open =			omninet_open,
-	.write =		omninet_write,
-	.write_room =		omninet_write_room,
-	.write_bulk_callback =	omninet_write_bulk_callback,
-	.process_read_urb =	omninet_process_read_urb,
-	.disconnect =		omninet_disconnect,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&zyxel_omninet_device, NULL
-};
-
-
-/*
- * The protocol.
- *
- * The omni.net always exchange 64 bytes of data with the host. The first
- * four bytes are the control header.
- *
- * oh_seq is a sequence number. Don't know if/how it's used.
- * oh_len is the length of the data bytes in the packet.
- * oh_xxx Bit-mapped, related to handshaking and status info.
- *	I normally set it to 0x03 in transmitted frames.
- *	7: Active when the TA is in a CONNECTed state.
- *	6: unknown
- *	5: handshaking, unknown
- *	4: handshaking, unknown
- *	3: unknown, usually 0
- *	2: unknown, usually 0
- *	1: handshaking, unknown, usually set to 1 in transmitted frames
- *	0: handshaking, unknown, usually set to 1 in transmitted frames
- * oh_pad Probably a pad byte.
- *
- * After the header you will find data bytes if oh_len was greater than zero.
- */
-struct omninet_header {
-	__u8	oh_seq;
-	__u8	oh_len;
-	__u8	oh_xxx;
-	__u8	oh_pad;
-};
-
-struct omninet_data {
-	__u8	od_outseq;	/* Sequence number for bulk_out URBs */
-};
-
-static int omninet_attach(struct usb_serial *serial)
-{
-	/* The second bulk-out endpoint is used for writing. */
-	if (serial->num_bulk_out < 2) {
-		dev_err(&serial->interface->dev, "missing endpoints\n");
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-static int omninet_port_probe(struct usb_serial_port *port)
-{
-	struct omninet_data *od;
-
-	od = kzalloc(sizeof(*od), GFP_KERNEL);
-	if (!od)
-		return -ENOMEM;
-
-	usb_set_serial_port_data(port, od);
-
-	return 0;
-}
-
-static int omninet_port_remove(struct usb_serial_port *port)
-{
-	struct omninet_data *od;
-
-	od = usb_get_serial_port_data(port);
-	kfree(od);
-
-	return 0;
-}
-
-static int omninet_open(struct tty_struct *tty, struct usb_serial_port *port)
-{
-	return usb_serial_generic_open(tty, port);
-}
-
-#define OMNINET_HEADERLEN	4
-#define OMNINET_BULKOUTSIZE	64
-#define OMNINET_PAYLOADSIZE	(OMNINET_BULKOUTSIZE - OMNINET_HEADERLEN)
-
-static void omninet_process_read_urb(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	const struct omninet_header *hdr = urb->transfer_buffer;
-	const unsigned char *data;
-	size_t data_len;
-
-	if (urb->actual_length <= OMNINET_HEADERLEN || !hdr->oh_len)
-		return;
-
-	data = (char *)urb->transfer_buffer + OMNINET_HEADERLEN;
-	data_len = min_t(size_t, urb->actual_length - OMNINET_HEADERLEN,
-								hdr->oh_len);
-	tty_insert_flip_string(&port->port, data, data_len);
-	tty_flip_buffer_push(&port->port);
-}
-
-static int omninet_write(struct tty_struct *tty, struct usb_serial_port *port,
-					const unsigned char *buf, int count)
-{
-	struct usb_serial *serial = port->serial;
-	struct usb_serial_port *wport = serial->port[1];
-
-	struct omninet_data *od = usb_get_serial_port_data(port);
-	struct omninet_header *header = (struct omninet_header *)
-					wport->write_urb->transfer_buffer;
-
-	int			result;
-
-	if (count == 0) {
-		dev_dbg(&port->dev, "%s - write request of 0 bytes\n", __func__);
-		return 0;
-	}
-
-	if (!test_and_clear_bit(0, &port->write_urbs_free)) {
-		dev_dbg(&port->dev, "%s - already writing\n", __func__);
-		return 0;
-	}
-
-	count = (count > OMNINET_PAYLOADSIZE) ? OMNINET_PAYLOADSIZE : count;
-
-	memcpy(wport->write_urb->transfer_buffer + OMNINET_HEADERLEN,
-								buf, count);
-
-	usb_serial_debug_data(&port->dev, __func__, count,
-			      wport->write_urb->transfer_buffer);
-
-	header->oh_seq 	= od->od_outseq++;
-	header->oh_len 	= count;
-	header->oh_xxx  = 0x03;
-	header->oh_pad 	= 0x00;
-
-	/* send the data out the bulk port, always 64 bytes */
-	wport->write_urb->transfer_buffer_length = OMNINET_BULKOUTSIZE;
-
-	result = usb_submit_urb(wport->write_urb, GFP_ATOMIC);
-	if (result) {
-		set_bit(0, &wport->write_urbs_free);
-		dev_err_console(port,
-			"%s - failed submitting write urb, error %d\n",
-			__func__, result);
-	} else
-		result = count;
-
-	return result;
-}
-
-
-static int omninet_write_room(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct usb_serial 	*serial = port->serial;
-	struct usb_serial_port 	*wport 	= serial->port[1];
-
-	int room = 0; /* Default: no room */
-
-	if (test_bit(0, &wport->write_urbs_free))
-		room = wport->bulk_out_size - OMNINET_HEADERLEN;
-
-	dev_dbg(&port->dev, "%s - returns %d\n", __func__, room);
-
-	return room;
-}
-
-static void omninet_write_bulk_callback(struct urb *urb)
-{
-/*	struct omninet_header	*header = (struct omninet_header  *)
-						urb->transfer_buffer; */
-	struct usb_serial_port 	*port   =  urb->context;
-	int status = urb->status;
-
-	set_bit(0, &port->write_urbs_free);
-	if (status) {
-		dev_dbg(&port->dev, "%s - nonzero write bulk status received: %d\n",
-			__func__, status);
-		return;
-	}
-
-	usb_serial_port_softint(port);
-}
-
-
-static void omninet_disconnect(struct usb_serial *serial)
-{
-	struct usb_serial_port *wport = serial->port[1];
-
-	usb_kill_urb(wport->write_urb);
-}
-
-module_usb_serial_driver(serial_drivers, id_table);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+2_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES_MASK 0xc00000
+#define D3F2_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES__SHIFT 0x16
+#define D3F2_DEVICE_CNTL2__CPL_TIMEOUT_VALUE_MASK 0xf
+#define D3F2_DEVICE_CNTL2__CPL_TIMEOUT_VALUE__SHIFT 0x0
+#define D3F2_DEVICE_CNTL2__CPL_TIMEOUT_DIS_MASK 0x10
+#define D3F2_DEVICE_CNTL2__CPL_TIMEOUT_DIS__SHIFT 0x4
+#define D3F2_DEVICE_CNTL2__ARI_FORWARDING_EN_MASK 0x20
+#define D3F2_DEVICE_CNTL2__ARI_FORWARDING_EN__SHIFT 0x5
+#define D3F2_DEVICE_CNTL2__ATOMICOP_REQUEST_EN_MASK 0x40
+#define D3F2_DEVICE_CNTL2__ATOMICOP_REQUEST_EN__SHIFT 0x6
+#define D3F2_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING_MASK 0x80
+#define D3F2_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING__SHIFT 0x7
+#define D3F2_DEVICE_CNTL2__IDO_REQUEST_ENABLE_MASK 0x100
+#define D3F2_DEVICE_CNTL2__IDO_REQUEST_ENABLE__SHIFT 0x8
+#define D3F2_DEVICE_CNTL2__IDO_COMPLETION_ENABLE_MASK 0x200
+#define D3F2_DEVICE_CNTL2__IDO_COMPLETION_ENABLE__SHIFT 0x9
+#define D3F2_DEVICE_CNTL2__LTR_EN_MASK 0x400
+#define D3F2_DEVICE_CNTL2__LTR_EN__SHIFT 0xa
+#define D3F2_DEVICE_CNTL2__OBFF_EN_MASK 0x6000
+#define D3F2_DEVICE_CNTL2__OBFF_EN__SHIFT 0xd
+#define D3F2_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING_MASK 0x8000
+#define D3F2_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING__SHIFT 0xf
+#define D3F2_DEVICE_STATUS2__RESERVED_MASK 0xffff0000
+#define D3F2_DEVICE_STATUS2__RESERVED__SHIFT 0x10
+#define D3F2_LINK_CAP2__SUPPORTED_LINK_SPEED_MASK 0xfe
+#define D3F2_LINK_CAP2__SUPPORTED_LINK_SPEED__SHIFT 0x1
+#define D3F2_LINK_CAP2__CROSSLINK_SUPPORTED_MASK 0x100
+#define D3F2_LINK_CAP2__CROSSLINK_SUPPORTED__SHIFT 0x8
+#define D3F2_LINK_CAP2__RESERVED_MASK 0xfffffe00
+#define D3F2_LINK_CAP2__RESERVED__SHIFT 0x9
+#define D3F2_LINK_CNTL2__TARGET_LINK_SPEED_MASK 0xf
+#define D3F2_LINK_CNTL2__TARGET_LINK_SPEED__SHIFT 0x0
+#define D3F2_LINK_CNTL2__ENTER_COMPLIANCE_MASK 0x10
+#define D3F2_LINK_CNTL2__ENTER_COMPLIANCE__SHIFT 0x4
+#define D3F2_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE_MASK 0x20
+#define D3F2_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define D3F2_LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define D3F2_LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define D3F2_LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define D3F2_LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define D3F2_LINK_CNTL2__ENTER_MOD_COMPLIANCE_MASK 0x400
+#define D3F2_LINK_CNTL2__ENTER_MOD_COMPLIANCE__SHIFT 0xa
+#define D3F2_LINK_CNTL2__COMPLIANCE_SOS_MASK 0x800
+#define D3F2_LINK_CNTL2__COMPLIANCE_SOS__SHIFT 0xb
+#define D3F2_LINK_CNTL2__COMPLIANCE_DEEMPHASIS_MASK 0xf000
+#define D3F2_LINK_CNTL2__COMPLIANCE_DEEMPHASIS__SHIFT 0xc
+#define D3F2_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL_MASK 0x10000
+#define D3F2_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL__SHIFT 0x10
+#define D3F2_LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x20000
+#define D3F2_LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x11
+#define D3F2_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x40000
+#define D3F2_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x12
+#define D3F2_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS_MASK 0x80000
+#define D3F2_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS__SHIFT 0x13
+#define D3F2_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS_MASK 0x100000
+#define D3F2_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS__SHIFT 0x14
+#define D3F2_LINK_STATUS2__LINK_EQUALIZATION_REQUEST_MASK 0x200000
+#define D3F2_LINK_STATUS2__LINK_EQUALIZATION_REQUEST__SHIFT 0x15
+#define D3F2_SLOT_CAP2__RESERVED_MASK 0xffffffff
+#define D3F2_SLOT_CAP2__RESERVED__SHIFT 0x0
+#define D3F2_SLOT_CNTL2__RESERVED_MASK 0xffff
+#define D3F2_SLOT_CNTL2__RESERVED__SHIFT 0x0
+#define D3F2_SLOT_STATUS2__RESERVED_MASK 0xffff0000
+#define D3F2_SLOT_STATUS2__RESERVED__SHIFT 0x10
+#define D3F2_MSI_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F2_MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F2_MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F2_MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F2_MSI_MSG_CNTL__MSI_EN_MASK 0x10000
+#define D3F2_MSI_MSG_CNTL__MSI_EN__SHIFT 0x10
+#define D3F2_MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe0000
+#define D3F2_MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x11
+#define D3F2_MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x700000
+#define D3F2_MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x14
+#define D3F2_MSI_MSG_CNTL__MSI_64BIT_MASK 0x800000
+#define D3F2_MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x17
+#define D3F2_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP_MASK 0x1000000
+#define D3F2_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP__SHIFT 0x18
+#define D3F2_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define D3F2_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define D3F2_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define D3F2_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define D3F2_MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define D3F2_MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define D3F2_MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define D3F2_MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define D3F2_SSID_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F2_SSID_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F2_SSID_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F2_SSID_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F2_SSID_CAP__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define D3F2_SSID_CAP__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define D3F2_SSID_CAP__SUBSYSTEM_ID_MASK 0xffff0000
+#define D3F2_SSID_CAP__SUBSYSTEM_ID__SHIFT 0x10
+#define D3F2_MSI_MAP_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F2_MSI_MAP_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F2_MSI_MAP_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F2_MSI_MAP_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F2_MSI_MAP_CAP__EN_MASK 0x10000
+#define D3F2_MSI_MAP_CAP__EN__SHIFT 0x10
+#define D3F2_MSI_MAP_CAP__FIXD_MASK 0x20000
+#define D3F2_MSI_MAP_CAP__FIXD__SHIFT 0x11
+#define D3F2_MSI_MAP_CAP__CAP_TYPE_MASK 0xf8000000
+#define D3F2_MSI_MAP_CAP__CAP_TYPE__SHIFT 0x1b
+#define D3F2_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO_MASK 0xfff00000
+#define D3F2_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO__SHIFT 0x14
+#define D3F2_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI_MASK 0xffffffff
+#define D3F2_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI__SHIFT 0x0
+#define D3F2_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F2_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F2_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F2_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F2_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F2_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F2_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID_MASK 0xffff
+#define D3F2_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID__SHIFT 0x0
+#define D3F2_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV_MASK 0xf0000
+#define D3F2_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV__SHIFT 0x10
+#define D3F2_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH_MASK 0xfff00000
+#define D3F2_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH__SHIFT 0x14
+#define D3F2_PCIE_VENDOR_SPECIFIC1__SCRATCH_MASK 0xffffffff
+#define D3F2_PCIE_VENDOR_SPECIFIC1__SCRATCH__SHIFT 0x0
+#define D3F2_PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define D3F2_PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define D3F2_PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F2_PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F2_PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F2_PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F2_PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F2_PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F2_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define D3F2_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define D3F2_

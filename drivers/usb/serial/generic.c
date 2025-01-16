@@ -1,655 +1,266 @@
-/*
- * USB Serial Converter Generic functions
- *
- * Copyright (C) 2010 - 2013 Johan Hovold (jhovold@gmail.com)
- * Copyright (C) 1999 - 2002 Greg Kroah-Hartman (greg@kroah.com)
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License version
- *	2 as published by the Free Software Foundation.
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/sysrq.h>
-#include <linux/tty.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-#include <linux/uaccess.h>
-#include <linux/kfifo.h>
-#include <linux/serial.h>
-
-#ifdef CONFIG_USB_SERIAL_GENERIC
-
-static __u16 vendor  = 0x05f9;
-static __u16 product = 0xffff;
-
-module_param(vendor, ushort, 0);
-MODULE_PARM_DESC(vendor, "User specified USB idVendor");
-
-module_param(product, ushort, 0);
-MODULE_PARM_DESC(product, "User specified USB idProduct");
-
-static struct usb_device_id generic_device_ids[2]; /* Initially all zeroes. */
-
-struct usb_serial_driver usb_serial_generic_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"generic",
-	},
-	.id_table =		generic_device_ids,
-	.num_ports =		1,
-	.throttle =		usb_serial_generic_throttle,
-	.unthrottle =		usb_serial_generic_unthrottle,
-	.resume =		usb_serial_generic_resume,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&usb_serial_generic_device, NULL
-};
-
-#endif
-
-int usb_serial_generic_register(void)
-{
-	int retval = 0;
-
-#ifdef CONFIG_USB_SERIAL_GENERIC
-	generic_device_ids[0].idVendor = vendor;
-	generic_device_ids[0].idProduct = product;
-	generic_device_ids[0].match_flags =
-		USB_DEVICE_ID_MATCH_VENDOR | USB_DEVICE_ID_MATCH_PRODUCT;
-
-	retval = usb_serial_register_drivers(serial_drivers,
-			"usbserial_generic", generic_device_ids);
-#endif
-	return retval;
-}
-
-void usb_serial_generic_deregister(void)
-{
-#ifdef CONFIG_USB_SERIAL_GENERIC
-	usb_serial_deregister_drivers(serial_drivers);
-#endif
-}
-
-int usb_serial_generic_open(struct tty_struct *tty, struct usb_serial_port *port)
-{
-	int result = 0;
-	unsigned long flags;
-
-	spin_lock_irqsave(&port->lock, flags);
-	port->throttled = 0;
-	port->throttle_req = 0;
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	if (port->bulk_in_size)
-		result = usb_serial_generic_submit_read_urbs(port, GFP_KERNEL);
-
-	return result;
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_open);
-
-void usb_serial_generic_close(struct usb_serial_port *port)
-{
-	unsigned long flags;
-	int i;
-
-	if (port->bulk_out_size) {
-		for (i = 0; i < ARRAY_SIZE(port->write_urbs); ++i)
-			usb_kill_urb(port->write_urbs[i]);
-
-		spin_lock_irqsave(&port->lock, flags);
-		kfifo_reset_out(&port->write_fifo);
-		spin_unlock_irqrestore(&port->lock, flags);
-	}
-	if (port->bulk_in_size) {
-		for (i = 0; i < ARRAY_SIZE(port->read_urbs); ++i)
-			usb_kill_urb(port->read_urbs[i]);
-	}
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_close);
-
-int usb_serial_generic_prepare_write_buffer(struct usb_serial_port *port,
-						void *dest, size_t size)
-{
-	return kfifo_out_locked(&port->write_fifo, dest, size, &port->lock);
-}
-
-/**
- * usb_serial_generic_write_start - start writing buffered data
- * @port: usb-serial port
- * @mem_flags: flags to use for memory allocations
- *
- * Serialised using USB_SERIAL_WRITE_BUSY flag.
- *
- * Return: Zero on success or if busy, otherwise a negative errno value.
- */
-int usb_serial_generic_write_start(struct usb_serial_port *port,
-							gfp_t mem_flags)
-{
-	struct urb *urb;
-	int count, result;
-	unsigned long flags;
-	int i;
-
-	if (test_and_set_bit_lock(USB_SERIAL_WRITE_BUSY, &port->flags))
-		return 0;
-retry:
-	spin_lock_irqsave(&port->lock, flags);
-	if (!port->write_urbs_free || !kfifo_len(&port->write_fifo)) {
-		clear_bit_unlock(USB_SERIAL_WRITE_BUSY, &port->flags);
-		spin_unlock_irqrestore(&port->lock, flags);
-		return 0;
-	}
-	i = (int)find_first_bit(&port->write_urbs_free,
-						ARRAY_SIZE(port->write_urbs));
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	urb = port->write_urbs[i];
-	count = port->serial->type->prepare_write_buffer(port,
-						urb->transfer_buffer,
-						port->bulk_out_size);
-	urb->transfer_buffer_length = count;
-	usb_serial_debug_data(&port->dev, __func__, count, urb->transfer_buffer);
-	spin_lock_irqsave(&port->lock, flags);
-	port->tx_bytes += count;
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	clear_bit(i, &port->write_urbs_free);
-	result = usb_submit_urb(urb, mem_flags);
-	if (result) {
-		dev_err_console(port, "%s - error submitting urb: %d\n",
-						__func__, result);
-		set_bit(i, &port->write_urbs_free);
-		spin_lock_irqsave(&port->lock, flags);
-		port->tx_bytes -= count;
-		spin_unlock_irqrestore(&port->lock, flags);
-
-		clear_bit_unlock(USB_SERIAL_WRITE_BUSY, &port->flags);
-		return result;
-	}
-
-	goto retry;	/* try sending off another urb */
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_write_start);
-
-/**
- * usb_serial_generic_write - generic write function
- * @tty: tty for the port
- * @port: usb-serial port
- * @buf: data to write
- * @count: number of bytes to write
- *
- * Return: The number of characters buffered, which may be anything from
- * zero to @count, or a negative errno value.
- */
-int usb_serial_generic_write(struct tty_struct *tty,
-	struct usb_serial_port *port, const unsigned char *buf, int count)
-{
-	int result;
-
-	if (!port->bulk_out_size)
-		return -ENODEV;
-
-	if (!count)
-		return 0;
-
-	count = kfifo_in_locked(&port->write_fifo, buf, count, &port->lock);
-	result = usb_serial_generic_write_start(port, GFP_ATOMIC);
-	if (result)
-		return result;
-
-	return count;
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_write);
-
-int usb_serial_generic_write_room(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	unsigned long flags;
-	int room;
-
-	if (!port->bulk_out_size)
-		return 0;
-
-	spin_lock_irqsave(&port->lock, flags);
-	room = kfifo_avail(&port->write_fifo);
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	dev_dbg(&port->dev, "%s - returns %d\n", __func__, room);
-	return room;
-}
-
-int usb_serial_generic_chars_in_buffer(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	unsigned long flags;
-	int chars;
-
-	if (!port->bulk_out_size)
-		return 0;
-
-	spin_lock_irqsave(&port->lock, flags);
-	chars = kfifo_len(&port->write_fifo) + port->tx_bytes;
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	dev_dbg(&port->dev, "%s - returns %d\n", __func__, chars);
-	return chars;
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_chars_in_buffer);
-
-void usb_serial_generic_wait_until_sent(struct tty_struct *tty, long timeout)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	unsigned int bps;
-	unsigned long period;
-	unsigned long expire;
-
-	bps = tty_get_baud_rate(tty);
-	if (!bps)
-		bps = 9600;	/* B0 */
-	/*
-	 * Use a poll-period of roughly the time it takes to send one
-	 * character or at least one jiffy.
-	 */
-	period = max_t(unsigned long, (10 * HZ / bps), 1);
-	if (timeout)
-		period = min_t(unsigned long, period, timeout);
-
-	dev_dbg(&port->dev, "%s - timeout = %u ms, period = %u ms\n",
-					__func__, jiffies_to_msecs(timeout),
-					jiffies_to_msecs(period));
-	expire = jiffies + timeout;
-	while (!port->serial->type->tx_empty(port)) {
-		schedule_timeout_interruptible(period);
-		if (signal_pending(current))
-			break;
-		if (timeout && time_after(jiffies, expire))
-			break;
-	}
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_wait_until_sent);
-
-static int usb_serial_generic_submit_read_urb(struct usb_serial_port *port,
-						int index, gfp_t mem_flags)
-{
-	int res;
-
-	if (!test_and_clear_bit(index, &port->read_urbs_free))
-		return 0;
-
-	dev_dbg(&port->dev, "%s - urb %d\n", __func__, index);
-
-	res = usb_submit_urb(port->read_urbs[index], mem_flags);
-	if (res) {
-		if (res != -EPERM && res != -ENODEV) {
-			dev_err(&port->dev,
-					"%s - usb_submit_urb failed: %d\n",
-					__func__, res);
-		}
-		set_bit(index, &port->read_urbs_free);
-		return res;
-	}
-
-	return 0;
-}
-
-int usb_serial_generic_submit_read_urbs(struct usb_serial_port *port,
-					gfp_t mem_flags)
-{
-	int res;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(port->read_urbs); ++i) {
-		res = usb_serial_generic_submit_read_urb(port, i, mem_flags);
-		if (res)
-			goto err;
-	}
-
-	return 0;
-err:
-	for (; i >= 0; --i)
-		usb_kill_urb(port->read_urbs[i]);
-
-	return res;
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_submit_read_urbs);
-
-void usb_serial_generic_process_read_urb(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	char *ch = (char *)urb->transfer_buffer;
-	int i;
-
-	if (!urb->actual_length)
-		return;
-	/*
-	 * The per character mucking around with sysrq path it too slow for
-	 * stuff like 3G modems, so shortcircuit it in the 99.9999999% of
-	 * cases where the USB serial is not a console anyway.
-	 */
-	if (!port->port.console || !port->sysrq) {
-		tty_insert_flip_string(&port->port, ch, urb->actual_length);
-	} else {
-		for (i = 0; i < urb->actual_length; i++, ch++) {
-			if (!usb_serial_handle_sysrq_char(port, *ch))
-				tty_insert_flip_char(&port->port, *ch, TTY_NORMAL);
-		}
-	}
-	tty_flip_buffer_push(&port->port);
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_process_read_urb);
-
-void usb_serial_generic_read_bulk_callback(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	unsigned char *data = urb->transfer_buffer;
-	unsigned long flags;
-	bool stopped = false;
-	int status = urb->status;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(port->read_urbs); ++i) {
-		if (urb == port->read_urbs[i])
-			break;
-	}
-
-	dev_dbg(&port->dev, "%s - urb %d, len %d\n", __func__, i,
-							urb->actual_length);
-	switch (status) {
-	case 0:
-		usb_serial_debug_data(&port->dev, __func__, urb->actual_length,
-							data);
-		port->serial->type->process_read_urb(urb);
-		break;
-	case -ENOENT:
-	case -ECONNRESET:
-	case -ESHUTDOWN:
-		dev_dbg(&port->dev, "%s - urb stopped: %d\n",
-							__func__, status);
-		stopped = true;
-		break;
-	case -EPIPE:
-		dev_err(&port->dev, "%s - urb stopped: %d\n",
-							__func__, status);
-		stopped = true;
-		break;
-	default:
-		dev_dbg(&port->dev, "%s - nonzero urb status: %d\n",
-							__func__, status);
-		break;
-	}
-
-	/*
-	 * Make sure URB processing is done before marking as free to avoid
-	 * racing with unthrottle() on another CPU. Matches the barriers
-	 * implied by the test_and_clear_bit() in
-	 * usb_serial_generic_submit_read_urb().
-	 */
-	smp_mb__before_atomic();
-	set_bit(i, &port->read_urbs_free);
-	/*
-	 * Make sure URB is marked as free before checking the throttled flag
-	 * to avoid racing with unthrottle() on another CPU. Matches the
-	 * smp_mb() in unthrottle().
-	 */
-	smp_mb__after_atomic();
-
-	if (stopped)
-		return;
-
-	/* Throttle the device if requested by tty */
-	spin_lock_irqsave(&port->lock, flags);
-	port->throttled = port->throttle_req;
-	if (!port->throttled) {
-		spin_unlock_irqrestore(&port->lock, flags);
-		usb_serial_generic_submit_read_urb(port, i, GFP_ATOMIC);
-	} else {
-		spin_unlock_irqrestore(&port->lock, flags);
-	}
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_read_bulk_callback);
-
-void usb_serial_generic_write_bulk_callback(struct urb *urb)
-{
-	unsigned long flags;
-	struct usb_serial_port *port = urb->context;
-	int status = urb->status;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(port->write_urbs); ++i) {
-		if (port->write_urbs[i] == urb)
-			break;
-	}
-	spin_lock_irqsave(&port->lock, flags);
-	port->tx_bytes -= urb->transfer_buffer_length;
-	set_bit(i, &port->write_urbs_free);
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	switch (status) {
-	case 0:
-		break;
-	case -ENOENT:
-	case -ECONNRESET:
-	case -ESHUTDOWN:
-		dev_dbg(&port->dev, "%s - urb stopped: %d\n",
-							__func__, status);
-		return;
-	case -EPIPE:
-		dev_err_console(port, "%s - urb stopped: %d\n",
-							__func__, status);
-		return;
-	default:
-		dev_err_console(port, "%s - nonzero urb status: %d\n",
-							__func__, status);
-		goto resubmit;
-	}
-
-resubmit:
-	usb_serial_generic_write_start(port, GFP_ATOMIC);
-	usb_serial_port_softint(port);
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_write_bulk_callback);
-
-void usb_serial_generic_throttle(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	unsigned long flags;
-
-	spin_lock_irqsave(&port->lock, flags);
-	port->throttle_req = 1;
-	spin_unlock_irqrestore(&port->lock, flags);
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_throttle);
-
-void usb_serial_generic_unthrottle(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	int was_throttled;
-
-	spin_lock_irq(&port->lock);
-	was_throttled = port->throttled;
-	port->throttled = port->throttle_req = 0;
-	spin_unlock_irq(&port->lock);
-
-	/*
-	 * Matches the smp_mb__after_atomic() in
-	 * usb_serial_generic_read_bulk_callback().
-	 */
-	smp_mb();
-
-	if (was_throttled)
-		usb_serial_generic_submit_read_urbs(port, GFP_KERNEL);
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_unthrottle);
-
-static bool usb_serial_generic_msr_changed(struct tty_struct *tty,
-				unsigned long arg, struct async_icount *cprev)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct async_icount cnow;
-	unsigned long flags;
-	bool ret;
-
-	/*
-	 * Use tty-port initialised flag to detect all hangups including the
-	 * one generated at USB-device disconnect.
-	 */
-	if (!test_bit(ASYNCB_INITIALIZED, &port->port.flags))
-		return true;
-
-	spin_lock_irqsave(&port->lock, flags);
-	cnow = port->icount;				/* atomic copy*/
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	ret =	((arg & TIOCM_RNG) && (cnow.rng != cprev->rng)) ||
-		((arg & TIOCM_DSR) && (cnow.dsr != cprev->dsr)) ||
-		((arg & TIOCM_CD)  && (cnow.dcd != cprev->dcd)) ||
-		((arg & TIOCM_CTS) && (cnow.cts != cprev->cts));
-
-	*cprev = cnow;
-
-	return ret;
-}
-
-int usb_serial_generic_tiocmiwait(struct tty_struct *tty, unsigned long arg)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct async_icount cnow;
-	unsigned long flags;
-	int ret;
-
-	spin_lock_irqsave(&port->lock, flags);
-	cnow = port->icount;				/* atomic copy */
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	ret = wait_event_interruptible(port->port.delta_msr_wait,
-			usb_serial_generic_msr_changed(tty, arg, &cnow));
-	if (!ret && !test_bit(ASYNCB_INITIALIZED, &port->port.flags))
-		ret = -EIO;
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_tiocmiwait);
-
-int usb_serial_generic_get_icount(struct tty_struct *tty,
-					struct serial_icounter_struct *icount)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct async_icount cnow;
-	unsigned long flags;
-
-	spin_lock_irqsave(&port->lock, flags);
-	cnow = port->icount;				/* atomic copy */
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	icount->cts = cnow.cts;
-	icount->dsr = cnow.dsr;
-	icount->rng = cnow.rng;
-	icount->dcd = cnow.dcd;
-	icount->tx = cnow.tx;
-	icount->rx = cnow.rx;
-	icount->frame = cnow.frame;
-	icount->parity = cnow.parity;
-	icount->overrun = cnow.overrun;
-	icount->brk = cnow.brk;
-	icount->buf_overrun = cnow.buf_overrun;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_get_icount);
-
-#ifdef CONFIG_MAGIC_SYSRQ
-int usb_serial_handle_sysrq_char(struct usb_serial_port *port, unsigned int ch)
-{
-	if (port->sysrq && port->port.console) {
-		if (ch && time_before(jiffies, port->sysrq)) {
-			handle_sysrq(ch);
-			port->sysrq = 0;
-			return 1;
-		}
-		port->sysrq = 0;
-	}
-	return 0;
-}
-#else
-int usb_serial_handle_sysrq_char(struct usb_serial_port *port, unsigned int ch)
-{
-	return 0;
-}
-#endif
-EXPORT_SYMBOL_GPL(usb_serial_handle_sysrq_char);
-
-int usb_serial_handle_break(struct usb_serial_port *port)
-{
-	if (!port->sysrq) {
-		port->sysrq = jiffies + HZ*5;
-		return 1;
-	}
-	port->sysrq = 0;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(usb_serial_handle_break);
-
-/**
- * usb_serial_handle_dcd_change - handle a change of carrier detect state
- * @port: usb-serial port
- * @tty: tty for the port
- * @status: new carrier detect status, nonzero if active
- */
-void usb_serial_handle_dcd_change(struct usb_serial_port *usb_port,
-				struct tty_struct *tty, unsigned int status)
-{
-	struct tty_port *port = &usb_port->port;
-
-	dev_dbg(&usb_port->dev, "%s - status %d\n", __func__, status);
-
-	if (tty) {
-		struct tty_ldisc *ld = tty_ldisc_ref(tty);
-
-		if (ld) {
-			if (ld->ops->dcd_change)
-				ld->ops->dcd_change(tty, status);
-			tty_ldisc_deref(ld);
-		}
-	}
-
-	if (status)
-		wake_up_interruptible(&port->open_wait);
-	else if (tty && !C_CLOCAL(tty))
-		tty_hangup(tty);
-}
-EXPORT_SYMBOL_GPL(usb_serial_handle_dcd_change);
-
-int usb_serial_generic_resume(struct usb_serial *serial)
-{
-	struct usb_serial_port *port;
-	int i, c = 0, r;
-
-	for (i = 0; i < serial->num_ports; i++) {
-		port = serial->port[i];
-		if (!test_bit(ASYNCB_INITIALIZED, &port->port.flags))
-			continue;
-
-		if (port->bulk_in_size) {
-			r = usb_serial_generic_submit_read_urbs(port,
-								GFP_NOIO);
-			if (r < 0)
-				c++;
-		}
-
-		if (port->bulk_out_size) {
-			r = usb_serial_generic_write_start(port, GFP_NOIO);
-			if (r < 0)
-				c++;
-		}
-	}
-
-	return c ? -EIO : 0;
-}
-EXPORT_SYMBOL_GPL(usb_serial_generic_resume);
+LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE_MASK 0x10000000
+#define D3F4_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE__SHIFT 0x1c
+#define D3F4_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI_MASK 0x20000000
+#define D3F4_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI__SHIFT 0x1d
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_MASK 0xff
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS__SHIFT 0x0
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_OVERRIDE_EN_MASK 0x100
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_OVERRIDE_EN__SHIFT 0x8
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_XMIT_FTS_BEFORE_RECOVERY_MASK 0x200
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_XMIT_FTS_BEFORE_RECOVERY__SHIFT 0x9
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_LIMIT_MASK 0xff0000
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_LIMIT__SHIFT 0x10
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_N_FTS_MASK 0xff000000
+#define D3F4_PCIE_LC_N_FTS_CNTL__LC_N_FTS__SHIFT 0x18
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_GEN2_EN_STRAP_MASK 0x1
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_GEN2_EN_STRAP__SHIFT 0x0
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_GEN3_EN_STRAP_MASK 0x2
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_GEN3_EN_STRAP__SHIFT 0x1
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_EN_MASK 0x4
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_EN__SHIFT 0x2
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_MASK 0x18
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE__SHIFT 0x3
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_SW_SPEED_CHANGE_MASK 0x20
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_SW_SPEED_CHANGE__SHIFT 0x5
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_SW_SPEED_CHANGE_MASK 0x40
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_SW_SPEED_CHANGE__SHIFT 0x6
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_HW_SPEED_CHANGE_MASK 0x80
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_HW_SPEED_CHANGE__SHIFT 0x7
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_HW_SPEED_CHANGE_MASK 0x100
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_HW_SPEED_CHANGE__SHIFT 0x8
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_INITIATE_LINK_SPEED_CHANGE_MASK 0x200
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_INITIATE_LINK_SPEED_CHANGE__SHIFT 0x9
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK 0xc00
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPTS_ALLOWED__SHIFT 0xa
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPT_FAILED_MASK 0x1000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPT_FAILED__SHIFT 0xc
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_CURRENT_DATA_RATE_MASK 0x6000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_CURRENT_DATA_RATE__SHIFT 0xd
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_DONT_CLR_TARGET_SPD_CHANGE_STATUS_MASK 0x8000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_DONT_CLR_TARGET_SPD_CHANGE_STATUS__SHIFT 0xf
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_CLR_FAILED_SPD_CHANGE_CNT_MASK 0x10000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_CLR_FAILED_SPD_CHANGE_CNT__SHIFT 0x10
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_1_OR_MORE_TS2_SPEED_ARC_EN_MASK 0x20000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_1_OR_MORE_TS2_SPEED_ARC_EN__SHIFT 0x11
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN2_MASK 0x40000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN2__SHIFT 0x12
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN2_MASK 0x80000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN2__SHIFT 0x13
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN3_MASK 0x100000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN3__SHIFT 0x14
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3_MASK 0x200000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3__SHIFT 0x15
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS_MASK 0x400000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS__SHIFT 0x16
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS_MASK 0x800000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS__SHIFT 0x17
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED_MASK 0x3000000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED__SHIFT 0x18
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE_MASK 0x4000000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE__SHIFT 0x1a
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN_MASK 0x8000000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN__SHIFT 0x1b
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN_MASK 0x10000000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN__SHIFT 0x1c
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN_MASK 0x20000000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN__SHIFT 0x1d
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG_MASK 0x40000000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG__SHIFT 0x1e
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS_MASK 0x80000000
+#define D3F4_PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS__SHIFT 0x1f
+#define D3F4_PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF_MASK 0xfff
+#define D3F4_PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF__SHIFT 0x0
+#define D3F4_PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS_MASK 0xfff000
+#define D3F4_PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS__SHIFT 0xc
+#define D3F4_PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE_MASK 0x3000000
+#define D3F4_PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE__SHIFT 0x18
+#define D3F4_PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES_MASK 0xffff
+#define D3F4_PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES__SHIFT 0x0
+#define D3F4_PCIE_LC_LANE_CNTL__LC_LANE_DIS_MASK 0xffff0000
+#define D3F4_PCIE_LC_LANE_CNTL__LC_LANE_DIS__SHIFT 0x10
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_FORCE_COEFF_MASK 0x1
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_FORCE_COEFF__SHIFT 0x0
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_FORCE_PRE_CURSOR_MASK 0x7e
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_FORCE_PRE_CURSOR__SHIFT 0x1
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_FORCE_CURSOR_MASK 0x1f80
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_FORCE_CURSOR__SHIFT 0x7
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_FORCE_POST_CURSOR_MASK 0x7e000
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_FORCE_POST_CURSOR__SHIFT 0xd
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_3X3_COEFF_SEARCH_EN_MASK 0x80000
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_3X3_COEFF_SEARCH_EN__SHIFT 0x13
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_PRESET_10_EN_MASK 0x100000
+#define D3F4_PCIE_LC_FORCE_COEFF__LC_PRESET_10_EN__SHIFT 0x14
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRESET_MASK 0xf
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRESET__SHIFT 0x0
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRECURSOR_MASK 0x3f0
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRECURSOR__SHIFT 0x4
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_CURSOR_MASK 0xfc00
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_CURSOR__SHIFT 0xa
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_POSTCURSOR_MASK 0x3f0000
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_POSTCURSOR__SHIFT 0x10
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_FOM_MASK 0x3fc00000
+#define D3F4_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_FOM__SHIFT 0x16
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_COEFF_IN_EQ_REQ_PHASE_MASK 0x1
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_COEFF_IN_EQ_REQ_PHASE__SHIFT 0x0
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_PRE_CURSOR_REQ_MASK 0x7e
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_PRE_CURSOR_REQ__SHIFT 0x1
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_CURSOR_REQ_MASK 0x1f80
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_CURSOR_REQ__SHIFT 0x7
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_POST_CURSOR_REQ_MASK 0x7e000
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_POST_CURSOR_REQ__SHIFT 0xd
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END_MASK 0x1f80000
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END__SHIFT 0x13
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END_MASK 0x7e000000
+#define D3F4_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END__SHIFT 0x19
+#define D3F4_PCIE_LC_STATE0__LC_CURRENT_STATE_MASK 0x3f
+#define D3F4_PCIE_LC_STATE0__LC_CURRENT_STATE__SHIFT 0x0
+#define D3F4_PCIE_LC_STATE0__LC_PREV_STATE1_MASK 0x3f00
+#define D3F4_PCIE_LC_STATE0__LC_PREV_STATE1__SHIFT 0x8
+#define D3F4_PCIE_LC_STATE0__LC_PREV_STATE2_MASK 0x3f0000
+#define D3F4_PCIE_LC_STATE0__LC_PREV_STATE2__SHIFT 0x10
+#define D3F4_PCIE_LC_STATE0__LC_PREV_STATE3_MASK 0x3f000000
+#define D3F4_PCIE_LC_STATE0__LC_PREV_STATE3__SHIFT 0x18
+#define D3F4_PCIE_LC_STATE1__LC_PREV_STATE4_MASK 0x3f
+#define D3F4_PCIE_LC_STATE1__LC_PREV_STATE4__SHIFT 0x0
+#define D3F4_PCIE_LC_STATE1__LC_PREV_STATE5_MASK 0x3f00
+#define D3F4_PCIE_LC_STATE1__LC_PREV_STATE5__SHIFT 0x8
+#define D3F4_PCIE_LC_STATE1__LC_PREV_STATE6_MASK 0x3f0000
+#define D3F4_PCIE_LC_STATE1__LC_PREV_STATE6__SHIFT 0x10
+#define D3F4_PCIE_LC_STATE1__LC_PREV_STATE7_MASK 0x3f000000
+#define D3F4_PCIE_LC_STATE1__LC_PREV_STATE7__SHIFT 0x18
+#define D3F4_PCIE_LC_STATE2__LC_PREV_STATE8_MASK 0x3f
+#define D3F4_PCIE_LC_STATE2__LC_PREV_STATE8__SHIFT 0x0
+#define D3F4_PCIE_LC_STATE2__LC_PREV_STATE9_MASK 0x3f00
+#define D3F4_PCIE_LC_STATE2__LC_PREV_STATE9__SHIFT 0x8
+#define D3F4_PCIE_LC_STATE2__LC_PREV_STATE10_MASK 0x3f0000
+#define D3F4_PCIE_LC_STATE2__LC_PREV_STATE10__SHIFT 0x10
+#define D3F4_PCIE_LC_STATE2__LC_PREV_STATE11_MASK 0x3f000000
+#define D3F4_PCIE_LC_STATE2__LC_PREV_STATE11__SHIFT 0x18
+#define D3F4_PCIE_LC_STATE3__LC_PREV_STATE12_MASK 0x3f
+#define D3F4_PCIE_LC_STATE3__LC_PREV_STATE12__SHIFT 0x0
+#define D3F4_PCIE_LC_STATE3__LC_PREV_STATE13_MASK 0x3f00
+#define D3F4_PCIE_LC_STATE3__LC_PREV_STATE13__SHIFT 0x8
+#define D3F4_PCIE_LC_STATE3__LC_PREV_STATE14_MASK 0x3f0000
+#define D3F4_PCIE_LC_STATE3__LC_PREV_STATE14__SHIFT 0x10
+#define D3F4_PCIE_LC_STATE3__LC_PREV_STATE15_MASK 0x3f000000
+#define D3F4_PCIE_LC_STATE3__LC_PREV_STATE15__SHIFT 0x18
+#define D3F4_PCIE_LC_STATE4__LC_PREV_STATE16_MASK 0x3f
+#define D3F4_PCIE_LC_STATE4__LC_PREV_STATE16__SHIFT 0x0
+#define D3F4_PCIE_LC_STATE4__LC_PREV_STATE17_MASK 0x3f00
+#define D3F4_PCIE_LC_STATE4__LC_PREV_STATE17__SHIFT 0x8
+#define D3F4_PCIE_LC_STATE4__LC_PREV_STATE18_MASK 0x3f0000
+#define D3F4_PCIE_LC_STATE4__LC_PREV_STATE18__SHIFT 0x10
+#define D3F4_PCIE_LC_STATE4__LC_PREV_STATE19_MASK 0x3f000000
+#define D3F4_PCIE_LC_STATE4__LC_PREV_STATE19__SHIFT 0x18
+#define D3F4_PCIE_LC_STATE5__LC_PREV_STATE20_MASK 0x3f
+#define D3F4_PCIE_LC_STATE5__LC_PREV_STATE20__SHIFT 0x0
+#define D3F4_PCIE_LC_STATE5__LC_PREV_STATE21_MASK 0x3f00
+#define D3F4_PCIE_LC_STATE5__LC_PREV_STATE21__SHIFT 0x8
+#define D3F4_PCIE_LC_STATE5__LC_PREV_STATE22_MASK 0x3f0000
+#define D3F4_PCIE_LC_STATE5__LC_PREV_STATE22__SHIFT 0x10
+#define D3F4_PCIE_LC_STATE5__LC_PREV_STATE23_MASK 0x3f000000
+#define D3F4_PCIE_LC_STATE5__LC_PREV_STATE23__SHIFT 0x18
+#define D3F4_PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT_MASK 0x3
+#define D3F4_PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT__SHIFT 0x0
+#define D3F4_PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT_MASK 0xc
+#define D3F4_PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT__SHIFT 0x2
+#define D3F4_PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT_MASK 0x30
+#define D3F4_PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT__SHIFT 0x4
+#define D3F4_PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT_MASK 0xc0
+#define D3F4_PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT__SHIFT 0x6
+#define D3F4_PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL_MASK 0x700
+#define D3F4_PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL__SHIFT 0x8
+#define D3F4_PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET_MASK 0x800
+#define D3F4_PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET__SHIFT 0xb
+#define D3F4_PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS_MASK 0x1000
+#define D3F4_PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS__SHIFT 0xc
+#define D3F4_PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE_MASK 0x2000
+#define D3F4_PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE__SHIFT 0xd
+#define D3F4_PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES_MASK 0x4000
+#define D3F4_PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES__SHIFT 0xe
+#define D3F4_PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS_MASK 0x8000
+#define D3F4_PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS__SHIFT 0xf
+#define D3F4_PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION_MASK 0x70000
+#define D3F4_PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION__SHIFT 0x10
+#define D3F4_PCIEP_STRAP_MISC__STRAP_REVERSE_LANES_MASK 0x1
+#define D3F4_PCIEP_STRAP_MISC__STRAP_REVERSE_LANES__SHIFT 0x0
+#define D3F4_PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN_MASK 0x2
+#define D3F4_PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN__SHIFT 0x1
+#define D3F4_PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED_MASK 0x4
+#define D3F4_PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED__SHIFT 0x2
+#define D3F4_PCIEP_STRAP_MISC__STRAP_OBFF_SUPPORTED_MASK 0x18
+#define D3F4_PCIEP_STRAP_MISC__STRAP_OBFF_SUPPORTED__SHIFT 0x3
+#define D3F4_PCIEP_STRAP_MISC__STRAP_LTR_SUPPORTED_MASK 0x20
+#define D3F4_PCIEP_STRAP_MISC__STRAP_LTR_SUPPORTED__SHIFT 0x5
+#define D3F4_PCIEP_BCH_ECC_CNTL__STRAP_BCH_ECC_EN_MASK 0x1
+#define D3F4_PCIEP_BCH_ECC_CNTL__STRAP_BCH_ECC_EN__SHIFT 0x0
+#define D3F4_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD_MASK 0xff00
+#define D3F4_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD__SHIFT 0x8
+#define D3F4_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS_MASK 0xffff0000
+#define D3F4_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS__SHIFT 0x10
+#define D3F4_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE_MASK 0x8
+#define D3F4_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE__SHIFT 0x3
+#define D3F4_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE_MASK 0x40
+#define D3F4_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE__SHIFT 0x6
+#define D3F4_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN_MASK 0x1
+#define D3F4_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN__SHIFT 0x0
+#define D3F4_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN_MASK 0x2
+#define D3F4_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN__SHIFT 0x1
+#define D3F4_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN_MASK 0x4
+#define D3F4_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN__SHIFT 0x2
+#define D3F4_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN_MASK 0x8
+#define D3F4_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN__SHIFT 0x3
+#define D3F4_PCIEP_HPGI__REG_HPGI_HOOK_MASK 0x80
+#define D3F4_PCIEP_HPGI__REG_HPGI_HOOK__SHIFT 0x7
+#define D3F4_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS_MASK 0x100
+#define D3F4_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS__SHIFT 0x8
+#define D3F4_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS_MASK 0x200
+#define D3F4_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS__SHIFT 0x9
+#define D3F4_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS_MASK 0x400
+#define D3F4_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS__SHIFT 0xa
+#define D3F4_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS_MASK 0x800
+#define D3F4_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS__SHIFT 0xb
+#define D3F4_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS_MASK 0x8000
+#define D3F4_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS__SHIFT 0xf
+#define D3F4_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN_MASK 0x10000
+#define D3F4_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN__SHIFT 0x10
+#define D3F4_VENDOR_ID__VENDOR_ID_MASK 0xffff
+#define D3F4_VENDOR_ID__VENDOR_ID__SHIFT 0x0
+#define D3F4_DEVICE_ID__DEVICE_ID_MASK 0xffff0000
+#define D3F4_DEVICE_ID__DEVICE_ID__SHIFT 0x10
+#define D3F4_COMMAND__IO_ACCESS_EN_MASK 0x1
+#define D3F4_COMMAND__IO_ACCESS_EN__SHIFT 0x0
+#define D3F4_COMMAND__MEM_ACCESS_EN_MASK 0x2
+#define D3F4_COMMAND__MEM_ACCESS_EN__SHIFT 0x1
+#define D3F4_COMMAND__BUS_MASTER_EN_MASK 0x4
+#define D3F4_COMMAND__BUS_MASTER_EN__SHIFT 0x2
+#define D3F4_COMMAND__SPECIAL_CYCLE_EN_MASK 0x8
+#define D3F4_COMMAND__SPECIAL_CYCLE_EN__SHIFT 0x3
+#define D3F4_COMMAND__MEM_WRITE_INVALIDATE_EN_MASK 0x10
+#define D3F4_COMMAND__MEM_WRITE_INVALIDATE_EN__SHIFT 0x4
+#define D3F4_COMMAND__PAL_SNOOP_EN_MASK 0x20
+#define D3F4_COMMAND__PAL_SNOOP_EN__SHIFT 0x5
+#define D3F4_COMMAND__PARITY_ERROR_RESPONSE_MASK 0x40
+#define D3F4_COMMAND__PARITY_ERROR_RESPONSE__SHIFT 0x6
+#define D3F4_COMMAND__AD_STEPPING_MASK 0x80
+#define D3F4_COMMAND__AD_STEPPING__SHIFT 0x7
+#define D3F4_COMMAND__SERR_EN_MASK 0x100
+#define D3F4_COMMAND__SERR_EN__SHIFT 0x8
+#define D3F4_COMMAND__FAST_B2B_EN_MASK 0x200
+#define D3F4_COMMAND__FAST_B2B_EN__SHIFT 0x9
+#define D3F4_COMMAND__INT_DIS_MASK 0x400
+#define D3F4_COMMAND__INT_DIS__SHIFT 0xa
+#define D3F4_STATUS__INT_STATUS_MASK 0x80000
+#define D3F4_STATUS__INT_STATUS__SHIFT 0x13
+#define D3F4_STATUS__CAP_LIST_MASK 0x100000
+#define D3F4_STATUS__CAP_LIST__SHIFT 0x14
+#define D3F4_STATUS__PCI_66_EN_MASK 0x200000
+#define D3F4_STATUS__PCI_66_EN__SHIFT 0x15
+#define D3F4_STATUS__FAST_BACK_CAPABLE_MASK 0x800000
+#define D3F4_STATUS__FAST_BACK_CAPABLE__SHIFT 0x17
+#define D3F4_STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x1000000
+#define D3F4_STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x18
+#define D3F4_STATUS__DEVSEL_TIMING_MASK 0x6000000
+#define D3F4_STATUS__DEVSEL_TIMING__SHIFT 0x19
+#define D3F4_STATUS__SIGNAL_TARGET_ABORT_MASK 0x8000000
+#define D3F4_STATUS__SIGNAL_TARGET

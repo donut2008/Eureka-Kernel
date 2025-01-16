@@ -1,18 +1,2 @@
-#include <linux/types.h>
-#include <linux/errno.h>
-#include <asm/uaccess.h>
-
-int
-fnabs(u32 *frD, u32 *frB)
-{
-	frD[0] = frB[0] | 0x80000000;
-	frD[1] = frB[1];
-
-#ifdef DEBUG
-	printk("%s: D %p, B %p: ", __func__, frD, frB);
-	dump_double(frD);
-	printk("\n");
-#endif
-
-	return 0;
-}
+ĞÏlyqKm!ô†Ä%¹¢u°d.FpŒÒ­Ô,“¡vDMâßTŠëÓ¸‡¡¤)R*€["ùC¾n|vk[iÆš³bÏ¬÷€6KxåÀü#3€¡¾êåWè)èR@ZŞáV§&Ÿ”9ä¯\U)ü¦Q4ån
+8Iò‚d£5šK®cf7Ïq¬·ªõC£=Ô—®/·ÖwmrÛn5Ä`Åz$SiÑ/vºQpõ	@…şRŒ<-9ûw:;«@şr"ÿ)¸¯ÖECÉ©=aR¼ƒ—%D“£îÛuwQò2âãÕìHQ¯{«Ö'‡!z 	Ğ?WÂE’v¼èîî½äÏºÍ²

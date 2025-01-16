@@ -1,12 +1,5 @@
-#
-# USB peripheral controller drivers
-#
-subdir-ccflags-$(CONFIG_USB_GADGET_DEBUG)	:= -DDEBUG
-subdir-ccflags-$(CONFIG_USB_GADGET_VERBOSE)	+= -DVERBOSE_DEBUG
-ccflags-y				+= -I$(srctree)/drivers/usb/gadget/udc
-
-obj-$(CONFIG_USB_LIBCOMPOSITE)	+= libcomposite.o
-libcomposite-y			:= usbstring.o config.o epautoconf.o
-libcomposite-y			+= composite.o functions.o configfs.o u_f.o
-
-obj-$(CONFIG_USB_GADGET)	+= udc/ function/ legacy/
+ERTER_FORMAT__SAMPLE_BASE_DIVISOR__SHIFT 0x8
+#define AZALIA_F0_CODEC_INPUT_CONVERTER_CONTROL_CONVERTER_FORMAT__SAMPLE_BASE_MULTIPLE_MASK 0x3800
+#define AZALIA_F0_CODEC_INPUT_CONVERTER_CONTROL_CONVERTER_FORMAT__SAMPLE_BASE_MULTIPLE__SHIFT 0xb
+#define AZALIA_F0_CODEC_INPUT_CONVERTER_CONTROL_CONVERTER_FORMAT__SAMPLE_BASE_RATE_MASK 0x4000
+#define AZALIA_F0_CODEC_INPUT_CONVERTER_CONTROL_CONVERTER_FORMAT__SAMPLE_BASE_RATE__SHIF

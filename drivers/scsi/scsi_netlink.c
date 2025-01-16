@@ -1,158 +1,135 @@
-/*
- *  scsi_netlink.c  - SCSI Transport Netlink Interface
- *
- *  Copyright (C) 2006   James Smart, Emulex Corporation
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- *
- */
-#include <linux/time.h>
-#include <linux/jiffies.h>
-#include <linux/security.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
-#include <linux/export.h>
-#include <net/sock.h>
-#include <net/netlink.h>
+han_id;
 
-#include <scsi/scsi_netlink.h>
-#include "scsi_priv.h"
+	/* freeze the channel */
+	if (dma_is_apbh(mxs_dma) && apbh_is_old(mxs_dma))
+		writel(1 << chan_id,
+			mxs_dma->base + HW_APBHX_CTRL0 + STMP_OFFSET_REG_SET);
+	else
+		writel(1 << chan_id,
+			mxs_dma->base + HW_APBHX_CHANNEL_CTRL + STMP_OFFSET_REG_SET);
 
-struct sock *scsi_nl_sock = NULL;
-EXPORT_SYMBOL_GPL(scsi_nl_sock);
-
-/**
- * scsi_nl_rcv_msg - Receive message handler.
- * @skb:		socket receive buffer
- *
- * Description: Extracts message from a receive buffer.
- *    Validates message header and calls appropriate transport message handler
- *
- *
- **/
-static void
-scsi_nl_rcv_msg(struct sk_buff *skb)
-{
-	struct nlmsghdr *nlh;
-	struct scsi_nl_hdr *hdr;
-	u32 rlen;
-	int err, tport;
-
-	while (skb->len >= NLMSG_HDRLEN) {
-		err = 0;
-
-		nlh = nlmsg_hdr(skb);
-		if ((nlh->nlmsg_len < (sizeof(*nlh) + sizeof(*hdr))) ||
-		    (skb->len < nlh->nlmsg_len)) {
-			printk(KERN_WARNING "%s: discarding partial skb\n",
-				 __func__);
-			return;
-		}
-
-		rlen = NLMSG_ALIGN(nlh->nlmsg_len);
-		if (rlen > skb->len)
-			rlen = skb->len;
-
-		if (nlh->nlmsg_type != SCSI_TRANSPORT_MSG) {
-			err = -EBADMSG;
-			goto next_msg;
-		}
-
-		hdr = nlmsg_data(nlh);
-		if ((hdr->version != SCSI_NL_VERSION) ||
-		    (hdr->magic != SCSI_NL_MAGIC)) {
-			err = -EPROTOTYPE;
-			goto next_msg;
-		}
-
-		if (!netlink_capable(skb, CAP_SYS_ADMIN)) {
-			err = -EPERM;
-			goto next_msg;
-		}
-
-		if (nlh->nlmsg_len < (sizeof(*nlh) + hdr->msglen)) {
-			printk(KERN_WARNING "%s: discarding partial message\n",
-				 __func__);
-			goto next_msg;
-		}
-
-		/*
-		 * Deliver message to the appropriate transport
-		 */
-		tport = hdr->transport;
-		if (tport == SCSI_NL_TRANSPORT) {
-			switch (hdr->msgtype) {
-			case SCSI_NL_SHOST_VENDOR:
-				/* Locate the driver that corresponds to the message */
-				err = -ESRCH;
-				break;
-			default:
-				err = -EBADR;
-				break;
-			}
-			if (err)
-				printk(KERN_WARNING "%s: Msgtype %d failed - err %d\n",
-				       __func__, hdr->msgtype, err);
-		}
-		else
-			err = -ENOENT;
-
-next_msg:
-		if ((err) || (nlh->nlmsg_flags & NLM_F_ACK))
-			netlink_ack(skb, nlh, err);
-
-		skb_pull(skb, rlen);
-	}
+	mxs_chan->status = DMA_PAUSED;
+	return 0;
 }
 
-/**
- * scsi_netlink_init - Called by SCSI subsystem to initialize
- * 	the SCSI transport netlink interface
- *
- **/
-void
-scsi_netlink_init(void)
+static int mxs_dma_resume_chan(struct dma_chan *chan)
 {
-	struct netlink_kernel_cfg cfg = {
-		.input	= scsi_nl_rcv_msg,
-		.groups	= SCSI_NL_GRP_CNT,
-	};
+	struct mxs_dma_chan *mxs_chan = to_mxs_dma_chan(chan);
+	struct mxs_dma_engine *mxs_dma = mxs_chan->mxs_dma;
+	int chan_id = mxs_chan->chan.chan_id;
 
-	scsi_nl_sock = netlink_kernel_create(&init_net, NETLINK_SCSITRANSPORT,
-					     &cfg);
-	if (!scsi_nl_sock) {
-		printk(KERN_ERR "%s: register of receive handler failed\n",
-				__func__);
-		return;
-	}
+	/* unfreeze the channel */
+	if (dma_is_apbh(mxs_dma) && apbh_is_old(mxs_dma))
+		writel(1 << chan_id,
+			mxs_dma->base + HW_APBHX_CTRL0 + STMP_OFFSET_REG_CLR);
+	else
+		writel(1 << chan_id,
+			mxs_dma->base + HW_APBHX_CHANNEL_CTRL + STMP_OFFSET_REG_CLR);
 
-	return;
+	mxs_chan->status = DMA_IN_PROGRESS;
+	return 0;
 }
 
-
-/**
- * scsi_netlink_exit - Called by SCSI subsystem to disable the SCSI transport netlink interface
- *
- **/
-void
-scsi_netlink_exit(void)
+static dma_cookie_t mxs_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 {
-	if (scsi_nl_sock) {
-		netlink_kernel_release(scsi_nl_sock);
-	}
-
-	return;
+	return dma_cookie_assign(tx);
 }
 
+static void mxs_dma_tasklet(unsigned long data)
+{
+	struct mxs_dma_chan *mxs_chan = (struct mxs_dma_chan *) data;
+
+	if (mxs_chan->desc.callback)
+		mxs_chan->desc.callback(mxs_chan->desc.callback_param);
+}
+
+static int mxs_dma_irq_to_chan(struct mxs_dma_engine *mxs_dma, int irq)
+{
+	int i;
+
+	for (i = 0; i != mxs_dma->nr_channels; ++i)
+		if (mxs_dma->mxs_chans[i].chan_irq == irq)
+			return i;
+
+	return -EINVAL;
+}
+
+static irqreturn_t mxs_dma_int_handler(int irq, void *dev_id)
+{
+	struct mxs_dma_engine *mxs_dma = dev_id;
+	struct mxs_dma_chan *mxs_chan;
+	u32 completed;
+	u32 err;
+	int chan = mxs_dma_irq_to_chan(mxs_dma, irq);
+
+	if (chan < 0)
+		return IRQ_NONE;
+
+	/* completion status */
+	completed = readl(mxs_dma->base + HW_APBHX_CTRL1);
+	completed = (completed >> chan) & 0x1;
+
+	/* Clear interrupt */
+	writel((1 << chan),
+			mxs_dma->base + HW_APBHX_CTRL1 + STMP_OFFSET_REG_CLR);
+
+	/* error status */
+	err = readl(mxs_dma->base + HW_APBHX_CTRL2);
+	err &= (1 << (MXS_DMA_CHANNELS + chan)) | (1 << chan);
+
+	/*
+	 * error status bit is in the upper 16 bits, error irq bit in the lower
+	 * 16 bits. We transform it into a simpler error code:
+	 * err: 0x00 = no error, 0x01 = TERMINATION, 0x02 = BUS_ERROR
+	 */
+	err = (err >> (MXS_DMA_CHANNELS + chan)) + (err >> chan);
+
+	/* Clear error irq */
+	writel((1 << chan),
+			mxs_dma->base + HW_APBHX_CTRL2 + STMP_OFFSET_REG_CLR);
+
+	/*
+	 * When both completion and error of termination bits set at the
+	 * same time, we do not take it as an error.  IOW, it only becomes
+	 * an error we need to handle here in case of either it's a bus
+	 * error or a termination error with no completion. 0x01 is termination
+	 * error, so we can subtract err & completed to get the real error case.
+	 */
+	err -= err & completed;
+
+	mxs_chan = &mxs_dma->mxs_chans[chan];
+
+	if (err) {
+		dev_dbg(mxs_dma->dma_device.dev,
+			"%s: error in channel %d\n", __func__,
+			chan);
+		mxs_chan->status = DMA_ERROR;
+		mxs_dma_reset_chan(&mxs_chan->chan);
+	} else if (mxs_chan->status != DMA_COMPLETE) {
+		if (mxs_chan->flags & MXS_DMA_SG_LOOP) {
+			mxs_chan->status = DMA_IN_PROGRESS;
+			if (mxs_chan->flags & MXS_DMA_USE_SEMAPHORE)
+				writel(1, mxs_dma->base +
+					HW_APBHX_CHn_SEMA(mxs_dma, chan));
+		} else {
+			mxs_chan->status = DMA_COMPLETE;
+		}
+	}
+
+	if (mxs_chan->status == DMA_COMPLETE) {
+		if (mxs_chan->reset)
+			return IRQ_HANDLED;
+		dma_cookie_complete(&mxs_chan->desc);
+	}
+
+	/* schedule tasklet on this channel */
+	tasklet_schedule(&mxs_chan->tasklet);
+
+	return IRQ_HANDLED;
+}
+
+static int mxs_dma_alloc_chan_resources(struct dma_chan *chan)
+{
+	struct mxs_dma_chan *mxs_chan = to_mxs_dma_chan(chan);
+	struct mxs_dma_engine *mxs_dma = mxs_chan->mxs_dma;
+	int

@@ -1,110 +1,90 @@
+ut_user((x) >> 16, ((u16 __user *)(ptr) + 1))); break;		\
+		case 8: __ret = (__put_user((x), (u32 __user *)(ptr)))				\
+			| (__put_user((x) >> 32, ((u32 __user *)(ptr) + 1))); break;		\
+		default: __ret = __put_user_unaligned_unknown();				\
+	}											\
+	__ret;											\
+})
+
+extern long __get_user_unaligned_unknown (void);
+
+#define __get_user_unaligned(x, ptr)								\
+({												\
+	long __ret;										\
+	switch (sizeof(*(ptr))) {								\
+		case 1: __ret = __get_user((x), (ptr)); break;					\
+		case 2: __ret = (__get_user((x), (u8 __user *)(ptr)))				\
+			| (__get_user((x) >> 8, ((u8 __user *)(ptr) + 1))); break;		\
+		case 4: __ret = (__get_user((x), (u16 __user *)(ptr)))				\
+			| (__get_user((x) >> 16, ((u16 __user *)(ptr) + 1))); break;		\
+		case 8: __ret = (__get_user((x), (u32 __user *)(ptr)))				\
+			| (__get_user((x) >> 32, ((u32 __user *)(ptr) + 1))); break;		\
+		default: __ret = __get_user_unaligned_unknown();				\
+	}											\
+	__ret;											\
+})
+
+#ifdef ASM_SUPPORTED
+  struct __large_struct { unsigned long buf[100]; };
+# define __m(x) (*(struct __large_struct __user *)(x))
+
+/* We need to declare the __ex_table section before we can use it in .xdata.  */
+asm (".section \"__ex_table\", \"a\"\n\t.previous");
+
+# define __get_user_size(val, addr, n, err)							\
+do {												\
+	register long __gu_r8 asm ("r8") = 0;							\
+	register long __gu_r9 asm ("r9");							\
+	asm ("\n[1:]\tld"#n" %0=%2%P2\t// %0 and %1 get overwritten by exception handler\n"	\
+	     "\t.xdata4 \"__ex_table\", 1b-., 1f-.+4\n"						\
+	     "[1:]"										\
+	     : "=r"(__gu_r9), "=r"(__gu_r8) : "m"(__m(addr)), "1"(__gu_r8));			\
+	(err) = __gu_r8;									\
+	(val) = __gu_r9;									\
+} while (0)
+
 /*
- * Copyright IBM Corp. 1999, 2010
- *
- *   Author(s):	Hartmut Penner <hp@de.ibm.com>
- *		Martin Schwidefsky <schwidefsky@de.ibm.com>
- *		Rob van der Heij <rvdhei@iae.nl>
- *		Heiko Carstens <heiko.carstens@de.ibm.com>
- *
+ * The "__put_user_size()" macro tells gcc it reads from memory instead of writing it.  This
+ * is because they do not write to any memory gcc knows about, so there are no aliasing
+ * issues.
  */
+# define __put_user_size(val, addr, n, err)							\
+do {												\
+	register long __pu_r8 asm ("r8") = 0;							\
+	asm volatile ("\n[1:]\tst"#n" %1=%r2%P1\t// %0 gets overwritten by exception handler\n"	\
+		      "\t.xdata4 \"__ex_table\", 1b-., 1f-.\n"					\
+		      "[1:]"									\
+		      : "=r"(__pu_r8) : "m"(__m(addr)), "rO"(val), "0"(__pu_r8));		\
+	(err) = __pu_r8;									\
+} while (0)
 
-#include <linux/init.h>
-#include <linux/linkage.h>
-#include <asm/asm-offsets.h>
-#include <asm/thread_info.h>
-#include <asm/page.h>
+#else /* !ASM_SUPPORTED */
+# define RELOC_TYPE	2	/* ip-rel */
+# define __get_user_size(val, addr, n, err)				\
+do {									\
+	__ld_user("__ex_table", (unsigned long) addr, n, RELOC_TYPE);	\
+	(err) = ia64_getreg(_IA64_REG_R8);				\
+	(val) = ia64_getreg(_IA64_REG_R9);				\
+} while (0)
+# define __put_user_size(val, addr, n, err)				\
+do {									\
+	__st_user("__ex_table", (unsigned long) addr, n, RELOC_TYPE,	\
+		  (__force unsigned long) (val));			\
+	(err) = ia64_getreg(_IA64_REG_R8);				\
+} while (0)
+#endif /* !ASM_SUPPORTED */
 
-__HEAD
-ENTRY(startup_continue)
-	tm	__LC_STFL_FAC_LIST+5,0x80	# LPP available ?
-	jz	0f
-	xc	__LC_LPP+1(7,0),__LC_LPP+1	# clear lpp and current_pid
-	mvi	__LC_LPP,0x80			#   and set LPP_MAGIC
-	.insn	s,0xb2800000,__LC_LPP		# load program parameter
-0:	larl	%r1,sched_clock_base_cc
-	mvc	0(8,%r1),__LC_LAST_UPDATE_CLOCK
-	larl	%r13,.LPG1		# get base
-	lctlg	%c0,%c15,.Lctl-.LPG1(%r13)	# load control registers
-	lg	%r12,.Lparmaddr-.LPG1(%r13)	# pointer to parameter area
-					# move IPL device to lowcore
-	lghi	%r0,__LC_PASTE
-	stg	%r0,__LC_VDSO_PER_CPU
-#
-# Setup stack
-#
-	larl	%r15,init_thread_union
-	stg	%r15,__LC_THREAD_INFO	# cache thread info in lowcore
-	lg	%r14,__TI_task(%r15)	# cache current in lowcore
-	stg	%r14,__LC_CURRENT
-	aghi	%r15,1<<(PAGE_SHIFT+THREAD_ORDER) # init_task_union + THREAD_SIZE
-	stg	%r15,__LC_KERNEL_STACK	# set end of kernel stack
-	aghi	%r15,-160
-#
-# Save ipl parameters, clear bss memory, initialize storage key for kernel pages,
-# and create a kernel NSS if the SAVESYS= parm is defined
-#
-	brasl	%r14,startup_init
-	lpswe	.Lentry-.LPG1(13)	# jump to _stext in primary-space,
-					# virtual and never return ...
-	.align	16
-.LPG1:
-.Lentry:.quad	0x0000000180000000,_stext
-.Lctl:	.quad	0x04040000		# cr0: AFP registers & secondary space
-	.quad	0			# cr1: primary space segment table
-	.quad	.Lduct			# cr2: dispatchable unit control table
-	.quad	0			# cr3: instruction authorization
-	.quad	0			# cr4: instruction authorization
-	.quad	.Lduct			# cr5: primary-aste origin
-	.quad	0			# cr6:	I/O interrupts
-	.quad	0			# cr7:	secondary space segment table
-	.quad	0			# cr8:	access registers translation
-	.quad	0			# cr9:	tracing off
-	.quad	0			# cr10: tracing off
-	.quad	0			# cr11: tracing off
-	.quad	0			# cr12: tracing off
-	.quad	0			# cr13: home space segment table
-	.quad	0xc0000000		# cr14: machine check handling off
-	.quad	.Llinkage_stack		# cr15: linkage stack operations
-.Lpcmsk:.quad	0x0000000180000000
-.L4malign:.quad 0xffffffffffc00000
-.Lscan2g:.quad	0x80000000 + 0x20000 - 8	# 2GB + 128K - 8
-.Lnop:	.long	0x07000700
-.Lparmaddr:
-	.quad	PARMAREA
-	.align	64
-.Lduct: .long	0,.Laste,.Laste,0,.Lduald,0,0,0
-	.long	0,0,0,0,0,0,0,0
-.Laste:	.quad	0,0xffffffffffffffff,0,0,0,0,0,0
-	.align	128
-.Lduald:.rept	8
-	.long	0x80000000,0,0,0	# invalid access-list entries
-	.endr
-.Llinkage_stack:
-	.long	0,0,0x89000000,0,0,0,0x8a000000,0
+extern void __get_user_unknown (void);
 
-ENTRY(_ehead)
-
-	.org	0x100000 - 0x11000	# head.o ends at 0x11000
-#
-# startup-code, running in absolute addressing mode
-#
-ENTRY(_stext)
-	basr	%r13,0			# get base
-.LPG3:
-# check control registers
-	stctg	%c0,%c15,0(%r15)
-	oi	6(%r15),0x60		# enable sigp emergency & external call
-	oi	4(%r15),0x10		# switch on low address proctection
-	lctlg	%c0,%c15,0(%r15)
-
-	lam	0,15,.Laregs-.LPG3(%r13)	# load acrs needed by uaccess
-	brasl	%r14,start_kernel	# go to C code
-#
-# We returned from start_kernel ?!? PANIK
-#
-	basr	%r13,0
-	lpswe	.Ldw-.(%r13)		# load disabled wait psw
-
-	.align	8
-.Ldw:	.quad	0x0002000180000000,0x0000000000000000
-.Laregs:.long	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+/*
+ * Evaluating arguments X, PTR, SIZE, and SEGMENT may involve subroutine-calls, which
+ * could clobber r8 and r9 (among others).  Thus, be careful not to evaluate it while
+ * using r8/r9.
+ */
+#define __do_get_user(check, x, ptr, size, segment)					\
+({											\
+	const __typeof__(*(ptr)) __user *__gu_ptr = (ptr);				\
+	__typeof__ (size) __gu_size = (size);						\
+	long __gu_err = -EFAULT;							\
+	unsigned long __gu_val = 0;							\
+	if (!check || __access_ok(_

@@ -1,433 +1,219 @@
-/*
- * ci.h - common structures, functions, and macros of the ChipIdea driver
- *
- * Copyright (C) 2008 Chipidea - MIPS Technologies, Inc. All rights reserved.
- *
- * Author: David Lopo
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#ifndef __DRIVERS_USB_CHIPIDEA_CI_H
-#define __DRIVERS_USB_CHIPIDEA_CI_H
-
-#include <linux/list.h>
-#include <linux/irqreturn.h>
-#include <linux/usb.h>
-#include <linux/usb/gadget.h>
-#include <linux/usb/otg-fsm.h>
-
-/******************************************************************************
- * DEFINE
- *****************************************************************************/
-#define TD_PAGE_COUNT      5
-#define CI_HDRC_PAGE_SIZE  4096ul /* page size for TD's */
-#define ENDPT_MAX          32
-
-/******************************************************************************
- * REGISTERS
- *****************************************************************************/
-/* Identification Registers */
-#define ID_ID				0x0
-#define ID_HWGENERAL			0x4
-#define ID_HWHOST			0x8
-#define ID_HWDEVICE			0xc
-#define ID_HWTXBUF			0x10
-#define ID_HWRXBUF			0x14
-#define ID_SBUSCFG			0x90
-
-/* register indices */
-enum ci_hw_regs {
-	CAP_CAPLENGTH,
-	CAP_HCCPARAMS,
-	CAP_DCCPARAMS,
-	CAP_TESTMODE,
-	CAP_LAST = CAP_TESTMODE,
-	OP_USBCMD,
-	OP_USBSTS,
-	OP_USBINTR,
-	OP_DEVICEADDR,
-	OP_ENDPTLISTADDR,
-	OP_TTCTRL,
-	OP_BURSTSIZE,
-	OP_PORTSC,
-	OP_DEVLC,
-	OP_OTGSC,
-	OP_USBMODE,
-	OP_ENDPTSETUPSTAT,
-	OP_ENDPTPRIME,
-	OP_ENDPTFLUSH,
-	OP_ENDPTSTAT,
-	OP_ENDPTCOMPLETE,
-	OP_ENDPTCTRL,
-	/* endptctrl1..15 follow */
-	OP_LAST = OP_ENDPTCTRL + ENDPT_MAX / 2,
-};
-
-/******************************************************************************
- * STRUCTURES
- *****************************************************************************/
-/**
- * struct ci_hw_ep - endpoint representation
- * @ep: endpoint structure for gadget drivers
- * @dir: endpoint direction (TX/RX)
- * @num: endpoint number
- * @type: endpoint type
- * @name: string description of the endpoint
- * @qh: queue head for this endpoint
- * @wedge: is the endpoint wedged
- * @ci: pointer to the controller
- * @lock: pointer to controller's spinlock
- * @td_pool: pointer to controller's TD pool
- */
-struct ci_hw_ep {
-	struct usb_ep				ep;
-	u8					dir;
-	u8					num;
-	u8					type;
-	char					name[16];
-	struct {
-		struct list_head	queue;
-		struct ci_hw_qh		*ptr;
-		dma_addr_t		dma;
-	}					qh;
-	int					wedge;
-
-	/* global resources */
-	struct ci_hdrc				*ci;
-	spinlock_t				*lock;
-	struct dma_pool				*td_pool;
-	struct td_node				*pending_td;
-};
-
-enum ci_role {
-	CI_ROLE_HOST = 0,
-	CI_ROLE_GADGET,
-	CI_ROLE_END,
-};
-
-enum ci_revision {
-	CI_REVISION_1X = 10,	/* Revision 1.x */
-	CI_REVISION_20 = 20, /* Revision 2.0 */
-	CI_REVISION_21, /* Revision 2.1 */
-	CI_REVISION_22, /* Revision 2.2 */
-	CI_REVISION_23, /* Revision 2.3 */
-	CI_REVISION_24, /* Revision 2.4 */
-	CI_REVISION_25, /* Revision 2.5 */
-	CI_REVISION_25_PLUS, /* Revision above than 2.5 */
-	CI_REVISION_UNKNOWN = 99, /* Unknown Revision */
-};
-
-/**
- * struct ci_role_driver - host/gadget role driver
- * @start: start this role
- * @stop: stop this role
- * @irq: irq handler for this role
- * @name: role name string (host/gadget)
- */
-struct ci_role_driver {
-	int		(*start)(struct ci_hdrc *);
-	void		(*stop)(struct ci_hdrc *);
-	irqreturn_t	(*irq)(struct ci_hdrc *);
-	const char	*name;
-};
-
-/**
- * struct hw_bank - hardware register mapping representation
- * @lpm: set if the device is LPM capable
- * @phys: physical address of the controller's registers
- * @abs: absolute address of the beginning of register window
- * @cap: capability registers
- * @op: operational registers
- * @size: size of the register window
- * @regmap: register lookup table
- */
-struct hw_bank {
-	unsigned	lpm;
-	resource_size_t	phys;
-	void __iomem	*abs;
-	void __iomem	*cap;
-	void __iomem	*op;
-	size_t		size;
-	void __iomem	*regmap[OP_LAST + 1];
-};
-
-/**
- * struct ci_hdrc - chipidea device representation
- * @dev: pointer to parent device
- * @lock: access synchronization
- * @hw_bank: hardware register mapping
- * @irq: IRQ number
- * @roles: array of supported roles for this controller
- * @role: current role
- * @is_otg: if the device is otg-capable
- * @fsm: otg finite state machine
- * @otg_fsm_hrtimer: hrtimer for otg fsm timers
- * @hr_timeouts: time out list for active otg fsm timers
- * @enabled_otg_timer_bits: bits of enabled otg timers
- * @next_otg_timer: next nearest enabled timer to be expired
- * @work: work for role changing
- * @wq: workqueue thread
- * @qh_pool: allocation pool for queue heads
- * @td_pool: allocation pool for transfer descriptors
- * @gadget: device side representation for peripheral controller
- * @driver: gadget driver
- * @hw_ep_max: total number of endpoints supported by hardware
- * @ci_hw_ep: array of endpoints
- * @ep0_dir: ep0 direction
- * @ep0out: pointer to ep0 OUT endpoint
- * @ep0in: pointer to ep0 IN endpoint
- * @status: ep0 status request
- * @setaddr: if we should set the address on status completion
- * @address: usb address received from the host
- * @remote_wakeup: host-enabled remote wakeup
- * @suspended: suspended by host
- * @test_mode: the selected test mode
- * @platdata: platform specific information supplied by parent device
- * @vbus_active: is VBUS active
- * @phy: pointer to PHY, if any
- * @usb_phy: pointer to USB PHY, if any and if using the USB PHY framework
- * @hcd: pointer to usb_hcd for ehci host driver
- * @debugfs: root dentry for this controller in debugfs
- * @id_event: indicates there is an id event, and handled at ci_otg_work
- * @b_sess_valid_event: indicates there is a vbus event, and handled
- * at ci_otg_work
- * @imx28_write_fix: Freescale imx28 needs swp instruction for writing
- * @supports_runtime_pm: if runtime pm is supported
- * @in_lpm: if the core in low power mode
- * @wakeup_int: if wakeup interrupt occur
- * @rev: The revision number for controller
- */
-struct ci_hdrc {
-	struct device			*dev;
-	spinlock_t			lock;
-	struct hw_bank			hw_bank;
-	int				irq;
-	struct ci_role_driver		*roles[CI_ROLE_END];
-	enum ci_role			role;
-	bool				is_otg;
-	struct usb_otg			otg;
-	struct otg_fsm			fsm;
-	struct hrtimer			otg_fsm_hrtimer;
-	ktime_t				hr_timeouts[NUM_OTG_FSM_TIMERS];
-	unsigned			enabled_otg_timer_bits;
-	enum otg_fsm_timer		next_otg_timer;
-	struct work_struct		work;
-	struct workqueue_struct		*wq;
-
-	struct dma_pool			*qh_pool;
-	struct dma_pool			*td_pool;
-
-	struct usb_gadget		gadget;
-	struct usb_gadget_driver	*driver;
-	unsigned			hw_ep_max;
-	struct ci_hw_ep			ci_hw_ep[ENDPT_MAX];
-	u32				ep0_dir;
-	struct ci_hw_ep			*ep0out, *ep0in;
-
-	struct usb_request		*status;
-	bool				setaddr;
-	u8				address;
-	u8				remote_wakeup;
-	u8				suspended;
-	u8				test_mode;
-
-	struct ci_hdrc_platform_data	*platdata;
-	int				vbus_active;
-	struct phy			*phy;
-	/* old usb_phy interface */
-	struct usb_phy			*usb_phy;
-	struct usb_hcd			*hcd;
-	struct dentry			*debugfs;
-	bool				id_event;
-	bool				b_sess_valid_event;
-	bool				imx28_write_fix;
-	bool				supports_runtime_pm;
-	bool				in_lpm;
-	bool				wakeup_int;
-	enum ci_revision		rev;
-};
-
-static inline struct ci_role_driver *ci_role(struct ci_hdrc *ci)
-{
-	BUG_ON(ci->role >= CI_ROLE_END || !ci->roles[ci->role]);
-	return ci->roles[ci->role];
-}
-
-static inline int ci_role_start(struct ci_hdrc *ci, enum ci_role role)
-{
-	int ret;
-
-	if (role >= CI_ROLE_END)
-		return -EINVAL;
-
-	if (!ci->roles[role])
-		return -ENXIO;
-
-	ret = ci->roles[role]->start(ci);
-	if (!ret)
-		ci->role = role;
-	return ret;
-}
-
-static inline void ci_role_stop(struct ci_hdrc *ci)
-{
-	enum ci_role role = ci->role;
-
-	if (role == CI_ROLE_END)
-		return;
-
-	ci->role = CI_ROLE_END;
-
-	ci->roles[role]->stop(ci);
-}
-
-/**
- * hw_read_id_reg: reads from a identification register
- * @ci: the controller
- * @offset: offset from the beginning of identification registers region
- * @mask: bitfield mask
- *
- * This function returns register contents
- */
-static inline u32 hw_read_id_reg(struct ci_hdrc *ci, u32 offset, u32 mask)
-{
-	return ioread32(ci->hw_bank.abs + offset) & mask;
-}
-
-/**
- * hw_write_id_reg: writes to a identification register
- * @ci: the controller
- * @offset: offset from the beginning of identification registers region
- * @mask: bitfield mask
- * @data: new value
- */
-static inline void hw_write_id_reg(struct ci_hdrc *ci, u32 offset,
-			    u32 mask, u32 data)
-{
-	if (~mask)
-		data = (ioread32(ci->hw_bank.abs + offset) & ~mask)
-			| (data & mask);
-
-	iowrite32(data, ci->hw_bank.abs + offset);
-}
-
-/**
- * hw_read: reads from a hw register
- * @ci: the controller
- * @reg:  register index
- * @mask: bitfield mask
- *
- * This function returns register contents
- */
-static inline u32 hw_read(struct ci_hdrc *ci, enum ci_hw_regs reg, u32 mask)
-{
-	return ioread32(ci->hw_bank.regmap[reg]) & mask;
-}
-
-#ifdef CONFIG_SOC_IMX28
-static inline void imx28_ci_writel(u32 val, volatile void __iomem *addr)
-{
-	__asm__ ("swp %0, %0, [%1]" : : "r"(val), "r"(addr));
-}
-#else
-static inline void imx28_ci_writel(u32 val, volatile void __iomem *addr)
-{
-}
-#endif
-
-static inline void __hw_write(struct ci_hdrc *ci, u32 val,
-		void __iomem *addr)
-{
-	if (ci->imx28_write_fix)
-		imx28_ci_writel(val, addr);
-	else
-		iowrite32(val, addr);
-}
-
-/**
- * hw_write: writes to a hw register
- * @ci: the controller
- * @reg:  register index
- * @mask: bitfield mask
- * @data: new value
- */
-static inline void hw_write(struct ci_hdrc *ci, enum ci_hw_regs reg,
-			    u32 mask, u32 data)
-{
-	if (~mask)
-		data = (ioread32(ci->hw_bank.regmap[reg]) & ~mask)
-			| (data & mask);
-
-	__hw_write(ci, data, ci->hw_bank.regmap[reg]);
-}
-
-/**
- * hw_test_and_clear: tests & clears a hw register
- * @ci: the controller
- * @reg:  register index
- * @mask: bitfield mask
- *
- * This function returns register contents
- */
-static inline u32 hw_test_and_clear(struct ci_hdrc *ci, enum ci_hw_regs reg,
-				    u32 mask)
-{
-	u32 val = ioread32(ci->hw_bank.regmap[reg]) & mask;
-
-	__hw_write(ci, val, ci->hw_bank.regmap[reg]);
-	return val;
-}
-
-/**
- * hw_test_and_write: tests & writes a hw register
- * @ci: the controller
- * @reg:  register index
- * @mask: bitfield mask
- * @data: new value
- *
- * This function returns register contents
- */
-static inline u32 hw_test_and_write(struct ci_hdrc *ci, enum ci_hw_regs reg,
-				    u32 mask, u32 data)
-{
-	u32 val = hw_read(ci, reg, ~0);
-
-	hw_write(ci, reg, mask, data);
-	return (val & mask) >> __ffs(mask);
-}
-
-/**
- * ci_otg_is_fsm_mode: runtime check if otg controller
- * is in otg fsm mode.
- *
- * @ci: chipidea device
- */
-static inline bool ci_otg_is_fsm_mode(struct ci_hdrc *ci)
-{
-#ifdef CONFIG_USB_OTG_FSM
-	struct usb_otg_caps *otg_caps = &ci->platdata->ci_otg_caps;
-
-	return ci->is_otg && ci->roles[CI_ROLE_HOST] &&
-		ci->roles[CI_ROLE_GADGET] && (otg_caps->srp_support ||
-		otg_caps->hnp_support || otg_caps->adp_support);
-#else
-	return false;
-#endif
-}
-
-u32 hw_read_intr_enable(struct ci_hdrc *ci);
-
-u32 hw_read_intr_status(struct ci_hdrc *ci);
-
-int hw_device_reset(struct ci_hdrc *ci);
-
-int hw_port_test_set(struct ci_hdrc *ci, u8 mode);
-
-u8 hw_port_test_get(struct ci_hdrc *ci);
-
-void ci_platform_configure(struct ci_hdrc *ci);
-
-#endif	/* __DRIVERS_USB_CHIPIDEA_CI_H */
+POINT2_MASK 0x400
+#define CC_RCU_FUSES__RCU_BREAK_POINT2__SHIFT 0xa
+#define CC_RCU_FUSES__SMU_IOC_MST_DISABLE_MASK 0x4000
+#define CC_RCU_FUSES__SMU_IOC_MST_DISABLE__SHIFT 0xe
+#define CC_RCU_FUSES__FCH_LOCKOUT_ENABLE_MASK 0x8000
+#define CC_RCU_FUSES__FCH_LOCKOUT_ENABLE__SHIFT 0xf
+#define CC_RCU_FUSES__FCH_XFIRE_FILTER_ENABLE_MASK 0x10000
+#define CC_RCU_FUSES__FCH_XFIRE_FILTER_ENABLE__SHIFT 0x10
+#define CC_RCU_FUSES__XFIRE_DISABLE_MASK 0x20000
+#define CC_RCU_FUSES__XFIRE_DISABLE__SHIFT 0x11
+#define CC_RCU_FUSES__SAMU_FUSE_DISABLE_MASK 0x40000
+#define CC_RCU_FUSES__SAMU_FUSE_DISABLE__SHIFT 0x12
+#define CC_RCU_FUSES__BIF_RST_POLLING_DISABLE_MASK 0x80000
+#define CC_RCU_FUSES__BIF_RST_POLLING_DISABLE__SHIFT 0x13
+#define CC_RCU_FUSES__MEM_HARDREP_EN_MASK 0x200000
+#define CC_RCU_FUSES__MEM_HARDREP_EN__SHIFT 0x15
+#define CC_RCU_FUSES__PCIE_INIT_DISABLE_MASK 0x400000
+#define CC_RCU_FUSES__PCIE_INIT_DISABLE__SHIFT 0x16
+#define CC_RCU_FUSES__DSMU_DISABLE_MASK 0x800000
+#define CC_RCU_FUSES__DSMU_DISABLE__SHIFT 0x17
+#define CC_RCU_FUSES__WRP_FUSE_VALID_MASK 0x1000000
+#define CC_RCU_FUSES__WRP_FUSE_VALID__SHIFT 0x18
+#define CC_RCU_FUSES__PHY_FUSE_VALID_MASK 0x2000000
+#define CC_RCU_FUSES__PHY_FUSE_VALID__SHIFT 0x19
+#define CC_RCU_FUSES__RCU_SPARE_MASK 0xfc000000
+#define CC_RCU_FUSES__RCU_SPARE__SHIFT 0x1a
+#define CC_SMU_MISC_FUSES__IOMMU_V2_DISABLE_MASK 0x2
+#define CC_SMU_MISC_FUSES__IOMMU_V2_DISABLE__SHIFT 0x1
+#define CC_SMU_MISC_FUSES__MinSClkDid_MASK 0x1fc
+#define CC_SMU_MISC_FUSES__MinSClkDid__SHIFT 0x2
+#define CC_SMU_MISC_FUSES__MISC_SPARE_MASK 0x600
+#define CC_SMU_MISC_FUSES__MISC_SPARE__SHIFT 0x9
+#define CC_SMU_MISC_FUSES__PostResetGnbClkDid_MASK 0x3f800
+#define CC_SMU_MISC_FUSES__PostResetGnbClkDid__SHIFT 0xb
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_dtc_half_MASK 0x40000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_dtc_half__SHIFT 0x12
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_ptc_half_MASK 0x80000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_ptc_half__SHIFT 0x13
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_itc_half_MASK 0x100000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_itc_half__SHIFT 0x14
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_pdc_half_MASK 0x200000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_pdc_half__SHIFT 0x15
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_ptc_dis_MASK 0x400000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_ptc_dis__SHIFT 0x16
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_itc_dis_MASK 0x800000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_itc_dis__SHIFT 0x17
+#define CC_SMU_MISC_FUSES__VCE_DISABLE_MASK 0x8000000
+#define CC_SMU_MISC_FUSES__VCE_DISABLE__SHIFT 0x1b
+#define CC_SMU_MISC_FUSES__IOC_IOMMU_DISABLE_MASK 0x10000000
+#define CC_SMU_MISC_FUSES__IOC_IOMMU_DISABLE__SHIFT 0x1c
+#define CC_SMU_MISC_FUSES__GNB_SPARE_MASK 0x60000000
+#define CC_SMU_MISC_FUSES__GNB_SPARE__SHIFT 0x1d
+#define CC_SCLK_VID_FUSES__SClkVid0_MASK 0xff
+#define CC_SCLK_VID_FUSES__SClkVid0__SHIFT 0x0
+#define CC_SCLK_VID_FUSES__SClkVid1_MASK 0xff00
+#define CC_SCLK_VID_FUSES__SClkVid1__SHIFT 0x8
+#define CC_SCLK_VID_FUSES__SClkVid2_MASK 0xff0000
+#define CC_SCLK_VID_FUSES__SClkVid2__SHIFT 0x10
+#define CC_SCLK_VID_FUSES__SClkVid3_MASK 0xff000000
+#define CC_SCLK_VID_FUSES__SClkVid3__SHIFT 0x18
+#define CC_GIO_IOCCFG_FUSES__NB_REV_ID_MASK 0x7fe
+#define CC_GIO_IOCCFG_FUSES__NB_REV_ID__SHIFT 0x1
+#define CC_GIO_IOC_FUSES__IOC_FUSES_MASK 0x3e
+#define CC_GIO_IOC_FUSES__IOC_FUSES__SHIFT 0x1
+#define CC_SMU_TST_EFUSE1_MISC__RF_RM_6_2_MASK 0x3e
+#define CC_SMU_TST_EFUSE1_MISC__RF_RM_6_2__SHIFT 0x1
+#define CC_SMU_TST_EFUSE1_MISC__RME_MASK 0x40
+#define CC_SMU_TST_EFUSE1_MISC__RME__SHIFT 0x6
+#define CC_SMU_TST_EFUSE1_MISC__MBIST_DISABLE_MASK 0x80
+#define CC_SMU_TST_EFUSE1_MISC__MBIST_DISABLE__SHIFT 0x7
+#define CC_SMU_TST_EFUSE1_MISC__HARD_REPAIR_DISABLE_MASK 0x100
+#define CC_SMU_TST_EFUSE1_MISC__HARD_REPAIR_DISABLE__SHIFT 0x8
+#define CC_SMU_TST_EFUSE1_MISC__SOFT_REPAIR_DISABLE_MASK 0x200
+#define CC_SMU_TST_EFUSE1_MISC__SOFT_REPAIR_DISABLE__SHIFT 0x9
+#define CC_SMU_TST_EFUSE1_MISC__GPU_DIS_MASK 0x400
+#define CC_SMU_TST_EFUSE1_MISC__GPU_DIS__SHIFT 0xa
+#define CC_SMU_TST_EFUSE1_MISC__SMS_PWRDWN_DISABLE_MASK 0x800
+#define CC_SMU_TST_EFUSE1_MISC__SMS_PWRDWN_DISABLE__SHIFT 0xb
+#define CC_SMU_TST_EFUSE1_MISC__CRBBMP1500_DISA_MASK 0x1000
+#define CC_SMU_TST_EFUSE1_MISC__CRBBMP1500_DISA__SHIFT 0xc
+#define CC_SMU_TST_EFUSE1_MISC__CRBBMP1500_DISB_MASK 0x2000
+#define CC_SMU_TST_EFUSE1_MISC__CRBBMP1500_DISB__SHIFT 0xd
+#define CC_SMU_TST_EFUSE1_MISC__RM_RF8_MASK 0x4000
+#define CC_SMU_TST_EFUSE1_MISC__RM_RF8__SHIFT 0xe
+#define CC_SMU_TST_EFUSE1_MISC__DFT_SPARE1_MASK 0x400000
+#define CC_SMU_TST_EFUSE1_MISC__DFT_SPARE1__SHIFT 0x16
+#define CC_SMU_TST_EFUSE1_MISC__DFT_SPARE2_MASK 0x800000
+#define CC_SMU_TST_EFUSE1_MISC__DFT_SPARE2__SHIFT 0x17
+#define CC_SMU_TST_EFUSE1_MISC__DFT_SPARE3_MASK 0x1000000
+#define CC_SMU_TST_EFUSE1_MISC__DFT_SPARE3__SHIFT 0x18
+#define CC_SMU_TST_EFUSE1_MISC__VCE_DISABLE_MASK 0x2000000
+#define CC_SMU_TST_EFUSE1_MISC__VCE_DISABLE__SHIFT 0x19
+#define CC_SMU_TST_EFUSE1_MISC__DCE_SCAN_DISABLE_MASK 0x4000000
+#define CC_SMU_TST_EFUSE1_MISC__DCE_SCAN_DISABLE__SHIFT 0x1a
+#define CC_TST_ID_STRAPS__DEVICE_ID_MASK 0xffff0
+#define CC_TST_ID_STRAPS__DEVICE_ID__SHIFT 0x4
+#define CC_TST_ID_STRAPS__MAJOR_REV_ID_MASK 0xf00000
+#define CC_TST_ID_STRAPS__MAJOR_REV_ID__SHIFT 0x14
+#define CC_TST_ID_STRAPS__MINOR_REV_ID_MASK 0xf000000
+#define CC_TST_ID_STRAPS__MINOR_REV_ID__SHIFT 0x18
+#define CC_TST_ID_STRAPS__ATI_REV_ID_MASK 0xf0000000
+#define CC_TST_ID_STRAPS__ATI_REV_ID__SHIFT 0x1c
+#define CC_FCTRL_FUSES__EXT_EFUSE_MACRO_PRESENT_MASK 0x2
+#define CC_FCTRL_FUSES__EXT_EFUSE_MACRO_PRESENT__SHIFT 0x1
+#define CC_HARVEST_FUSES__VCE_DISABLE_MASK 0x6
+#define CC_HARVEST_FUSES__VCE_DISABLE__SHIFT 0x1
+#define CC_HARVEST_FUSES__UVD_DISABLE_MASK 0x10
+#define CC_HARVEST_FUSES__UVD_DISABLE__SHIFT 0x4
+#define CC_HARVEST_FUSES__ACP_DISABLE_MASK 0x40
+#define CC_HARVEST_FUSES__ACP_DISABLE__SHIFT 0x6
+#define CC_HARVEST_FUSES__DC_DISABLE_MASK 0x3f00
+#define CC_HARVEST_FUSES__DC_DISABLE__SHIFT 0x8
+#define SMU_MAIN_PLL_OP_FREQ__PLL_OP_FREQ_MASK 0xffffffff
+#define SMU_MAIN_PLL_OP_FREQ__PLL_OP_FREQ__SHIFT 0x0
+#define SMU_STATUS__SMU_DONE_MASK 0x1
+#define SMU_STATUS__SMU_DONE__SHIFT 0x0
+#define SMU_STATUS__SMU_PASS_MASK 0x2
+#define SMU_STATUS__SMU_PASS__SHIFT 0x1
+#define SMU_FIRMWARE__SMU_IN_PROG_MASK 0x1
+#define SMU_FIRMWARE__SMU_IN_PROG__SHIFT 0x0
+#define SMU_FIRMWARE__SMU_RD_DONE_MASK 0x6
+#define SMU_FIRMWARE__SMU_RD_DONE__SHIFT 0x1
+#define SMU_FIRMWARE__SMU_SRAM_RD_BLOCK_EN_MASK 0x8
+#define SMU_FIRMWARE__SMU_SRAM_RD_BLOCK_EN__SHIFT 0x3
+#define SMU_FIRMWARE__SMU_SRAM_WR_BLOCK_EN_MASK 0x10
+#define SMU_FIRMWARE__SMU_SRAM_WR_BLOCK_EN__SHIFT 0x4
+#define SMU_FIRMWARE__SMU_counter_MASK 0xf00
+#define SMU_FIRMWARE__SMU_counter__SHIFT 0x8
+#define SMU_FIRMWARE__SMU_MODE_MASK 0x10000
+#define SMU_FIRMWARE__SMU_MODE__SHIFT 0x10
+#define SMU_FIRMWARE__SMU_SEL_MASK 0x20000
+#define SMU_FIRMWARE__SMU_SEL__SHIFT 0x11
+#define SMU_INPUT_DATA__START_ADDR_MASK 0x7fffffff
+#define SMU_INPUT_DATA__START_ADDR__SHIFT 0x0
+#define SMU_INPUT_DATA__AUTO_START_MASK 0x80000000
+#define SMU_INPUT_DATA__AUTO_START__SHIFT 0x1f
+#define SMU_EFUSE_0__EFUSE_DATA_MASK 0xffffffff
+#define SMU_EFUSE_0__EFUSE_DATA__SHIFT 0x0
+#define FIRMWARE_FLAGS__INTERRUPTS_ENABLED_MASK 0x1
+#define FIRMWARE_FLAGS__INTERRUPTS_ENABLED__SHIFT 0x0
+#define FIRMWARE_FLAGS__RESERVED_MASK 0xfffffe
+#define FIRMWARE_FLAGS__RESERVED__SHIFT 0x1
+#define FIRMWARE_FLAGS__TEST_COUNT_MASK 0xff000000
+#define FIRMWARE_FLAGS__TEST_COUNT__SHIFT 0x18
+#define TDC_STATUS__VDD_Boost_MASK 0xff
+#define TDC_STATUS__VDD_Boost__SHIFT 0x0
+#define TDC_STATUS__VDD_Throttle_MASK 0xff00
+#define TDC_STATUS__VDD_Throttle__SHIFT 0x8
+#define TDC_STATUS__VDDC_Boost_MASK 0xff0000
+#define TDC_STATUS__VDDC_Boost__SHIFT 0x10
+#define TDC_STATUS__VDDC_Throttle_MASK 0xff000000
+#define TDC_STATUS__VDDC_Throttle__SHIFT 0x18
+#define TDC_MV_AVERAGE__IDD_MASK 0xffff
+#define TDC_MV_AVERAGE__IDD__SHIFT 0x0
+#define TDC_MV_AVERAGE__IDDC_MASK 0xffff0000
+#define TDC_MV_AVERAGE__IDDC__SHIFT 0x10
+#define TDC_VRM_LIMIT__IDD_MASK 0xffff
+#define TDC_VRM_LIMIT__IDD__SHIFT 0x0
+#define TDC_VRM_LIMIT__IDDC_MASK 0xffff0000
+#define TDC_VRM_LIMIT__IDDC__SHIFT 0x10
+#define FEATURE_STATUS__SCLK_DPM_ON_MASK 0x1
+#define FEATURE_STATUS__SCLK_DPM_ON__SHIFT 0x0
+#define FEATURE_STATUS__MCLK_DPM_ON_MASK 0x2
+#define FEATURE_STATUS__MCLK_DPM_ON__SHIFT 0x1
+#define FEATURE_STATUS__LCLK_DPM_ON_MASK 0x4
+#define FEATURE_STATUS__LCLK_DPM_ON__SHIFT 0x2
+#define FEATURE_STATUS__UVD_DPM_ON_MASK 0x8
+#define FEATURE_STATUS__UVD_DPM_ON__SHIFT 0x3
+#define FEATURE_STATUS__VCE_DPM_ON_MASK 0x10
+#define FEATURE_STATUS__VCE_DPM_ON__SHIFT 0x4
+#define FEATURE_STATUS__SAMU_DPM_ON_MASK 0x20
+#define FEATURE_STATUS__SAMU_DPM_ON__SHIFT 0x5
+#define FEATURE_STATUS__ACP_DPM_ON_MASK 0x40
+#define FEATURE_STATUS__ACP_DPM_ON__SHIFT 0x6
+#define FEATURE_STATUS__PCIE_DPM_ON_MASK 0x80
+#define FEATURE_STATUS__PCIE_DPM_ON__SHIFT 0x7
+#define FEATURE_STATUS__BAPM_ON_MASK 0x100
+#define FEATURE_STATUS__BAPM_ON__SHIFT 0x8
+#define FEATURE_STATUS__LPMX_ON_MASK 0x200
+#define FEATURE_STATUS__LPMX_ON__SHIFT 0x9
+#define FEATURE_STATUS__NBDPM_ON_MASK 0x400
+#define FEATURE_STATUS__NBDPM_ON__SHIFT 0xa
+#define FEATURE_STATUS__LHTC_ON_MASK 0x800
+#define FEATURE_STATUS__LHTC_ON__SHIFT 0xb
+#define FEATURE_STATUS__VPC_ON_MASK 0x1000
+#define FEATURE_STATUS__VPC_ON__SHIFT 0xc
+#define FEATURE_STATUS__VOLTAGE_CONTROLLER_ON_MASK 0x2000
+#define FEATURE_STATUS__VOLTAGE_CONTROLLER_ON__SHIFT 0xd
+#define FEATURE_STATUS__TDC_LIMIT_ON_MASK 0x4000
+#define FEATURE_STATUS__TDC_LIMIT_ON__SHIFT 0xe
+#define FEATURE_STATUS__GPU_CAC_ON_MASK 0x8000
+#define FEATURE_STATUS__GPU_CAC_ON__SHIFT 0xf
+#define FEATURE_STATUS__AVS_ON_MASK 0x10000
+#define FEATURE_STATUS__AVS_ON__SHIFT 0x10
+#define FEATURE_STATUS__SPMI_ON_MASK 0x20000
+#define FEATURE_STATUS__SPMI_ON__SHIFT 0x11
+#define FEATURE_STATUS__SCLK_DPM_FORCED_MASK 0x40000
+#define FEATURE_STATUS__SCLK_DPM_FORCED__SHIFT 0x12
+#define FEATURE_STATUS__MCLK_DPM_FORCED_MASK 0x80000
+#define FEATURE_STATUS__MCLK_DPM_FORCED__SHIFT 0x13
+#define FEATURE_STATUS__LCLK_DPM_FORCED_MASK 0x100000
+#define FEATURE_STATUS__LCLK_DPM_FORCED__SHIFT 0x14
+#define FEATURE_STATUS__PCIE_DPM_FORCED_MASK 0x200000
+#define FEATURE_STATUS__PCIE_DPM_FORCED__SHIFT 0x15
+#define FEATURE_STATUS__RESERVED_MASK 0xffc00000
+#define FEATURE_STATUS__RESERVED__SHIFT 0x16
+#define ENTITY_TEMPERATURES_1__GPU_MASK 0xffffffff
+#define ENTITY_TEMPERATURES_1__GPU__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_1__entries_0_0_McArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_1__entries_0_0_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_2__entries_0_0_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_2__entries_0_0_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_3__entries_0_0_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_3__entries_0_0_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_3__entries_0_0_padding_1_MASK 0xff00
+#define MCARB_DRAM_TIMING_TABLE_3__entries_0_0_padding_1__SHIFT 0x8
+#define MCARB_DRAM_TIMING_TABLE_3__entries_0_0_padding_0_MASK 0xff0000
+#define MCARB_DRAM_TIMING_TABLE_3__entries_0_0_padding_0__SHIFT 0x10
+#define MCARB_DRAM_TIMING_TABLE_3__entries_0_0_McArbBurstTime

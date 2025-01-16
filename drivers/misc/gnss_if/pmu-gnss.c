@@ -1,327 +1,137 @@
-#include <linux/io.h>
-#include <linux/cpumask.h>
-#include <linux/suspend.h>
-#include <linux/notifier.h>
-#include <linux/bug.h>
-#include <linux/delay.h>
-#include <linux/clk.h>
-#include <linux/smc.h>
-#include <soc/samsung/exynos-pmu.h>
-#include <soc/samsung/cal-if.h>
-#include "pmu-gnss.h"
-#include "gnss_prj.h"
-#include <linux/mcu_ipc.h>
-
-#ifdef USE_IOREMAP_NOPMU
-
-#if defined(CONFIG_SOC_EXYNOS7870)
-#define PMU_ADDR		(0x10480000)
-#define PMU_SIZE		(SZ_64K)
-#elif defined(CONFIG_SOC_EXYNOS7880)
-#define PMU_ADDR		(0x106B0000)
-#define PMU_SIZE		(SZ_64K)
-#elif defined(CONFIG_SOC_EXYNOS7570)
-#define PMU_ADDR		(0x11C80000)
-#define PMU_SIZE		(SZ_64K)
-#elif defined(CONFIG_SOC_EXYNOS7872)
-#define PMU_ADDR		(0x11C80000)
-#define PMU_SIZE		(SZ_64K)
-#endif
-
-static void __iomem *pmu_reg;
-
-static int gnss_nopmu_read(unsigned int reg_offset, unsigned int *ret)
-{
-	*ret = __raw_readl(pmu_reg + reg_offset);
-	return 0;
-}
-
-static int gnss_nopmu_write(unsigned int reg_offset, unsigned int val)
-{
-	unsigned int tmp, tmp2;
-	tmp = __raw_readl(pmu_reg + reg_offset);
-	__raw_writel(val, pmu_reg + reg_offset);
-	tmp2 = __raw_readl(pmu_reg + reg_offset);
-
-	return (tmp == tmp2) ? 0 : -EINVAL;
-}
-
-static int gnss_nopmu_update(unsigned int reg_offset, unsigned int mask,
-			unsigned int val)
-{
-	unsigned int memcfg_val;
-	unsigned int tmp, tmp2;
-	tmp = __raw_readl(pmu_reg + reg_offset);
-	memcfg_val = tmp;
-	memcfg_val &= ~mask;
-	memcfg_val |= val;
-	__raw_writel(memcfg_val, pmu_reg + reg_offset);
-	tmp2 = __raw_readl(pmu_reg + reg_offset);
-
-	return (memcfg_val == tmp2) ? 0 : -EINVAL;
-}
-
-#define gnss_pmu_read	gnss_nopmu_read
-#define gnss_pmu_write	gnss_nopmu_write
-#define gnss_pmu_update	gnss_nopmu_update
-
-#else
-
-#define gnss_pmu_read	exynos_pmu_read
-#define gnss_pmu_write	exynos_pmu_write
-#define gnss_pmu_update exynos_pmu_update
-
-#endif /* USE_IOREMAP_NOPMU */
-
-static void __set_shdmem_size(u32 reg_offset, u32 memsz)
-{
-	memsz /= MEMSIZE_RES;
-	gnss_pmu_update(reg_offset, MEMSIZE_MASK, memsz << MEMSIZE_OFFSET);
-}
-
-static void set_shdmem_size(u32 memsz)
-{
-	gif_info("Set shared mem size: %dB\n", memsz);
-
-	__set_shdmem_size(EXYNOS_PMU_GNSS2AP_MEM_CONFIG0, memsz);
-}
-
-static void __set_shdmem_base(u32 reg_offset, u32 shmem_base)
-{
-	u32 base_addr;
-	base_addr = (shmem_base >> MEMBASE_ADDR_SHIFT);
-
-	gnss_pmu_update(reg_offset, MEMBASE_ADDR_MASK << MEMBASE_ADDR_OFFSET,
-			base_addr << MEMBASE_ADDR_OFFSET);
-}
-
-static void set_shdmem_base(u32 shmem_base)
-{
-	gif_info("Set shared mem baseaddr : 0x%x\n", shmem_base);
-
-	__set_shdmem_base(EXYNOS_PMU_GNSS2AP_MEM_CONFIG1, shmem_base);
-}
-
-static void exynos_sys_powerdown_conf_gnss(void)
-{
-	gnss_pmu_write(EXYNOS_PMU_RESET_AHEAD_GNSS_SYS_PWR_REG, 0);
-	gnss_pmu_write(EXYNOS_PMU_CLEANY_BUS_SYS_PWR_REG, 0);
-	gnss_pmu_write(EXYNOS_PMU_LOGIC_RESET_GNSS_SYS_PWR_REG, 0);
-	gnss_pmu_write(EXYNOS_PMU_TCXO_GATE_GNSS_SYS_PWR_REG, 0);
-	gnss_pmu_write(EXYNOS_PMU_GNSS_DISABLE_ISO_SYS_PWR_REG, 1);
-	gnss_pmu_write(EXYNOS_PMU_GNSS_RESET_ISO_SYS_PWR_REG, 0);
-	gnss_pmu_write(EXYNOS_PMU_CENTRAL_SEQ_GNSS_CONFIGURATION, 0);
-}
-
-#ifdef CONFIG_GNSS_PMUCAL
-static int gnss_pmu_clear_interrupt(enum gnss_int_clear gnss_int)
-{
-	int ret = 0;
-
-	gif_debug("gnss_int = %d\n", gnss_int);
-	switch (gnss_int) {
-	case GNSS_INT_WAKEUP_CLEAR:
-		ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_NS,
-				GNSS_WAKEUP_REQ_CLR, GNSS_WAKEUP_REQ_CLR);
-		break;
-	case GNSS_INT_ACTIVE_CLEAR:
-		cal_gnss_active_clear();
-		break;
-	case GNSS_INT_WDT_RESET_CLEAR:
-		cal_gnss_reset_req_clear();
-		break;
-	default:
-		gif_err("Unexpected interrupt value!\n");
-		return -EIO;
-	}
-
-	if (ret < 0) {
-		gif_err("ERR! GNSS Reset Fail: %d\n", ret);
-		return -EIO;
-	}
-
-	return ret;
-}
-
-static int gnss_pmu_release_reset(void)
-{
-	exynos_pmu_shared_reg_enable();
-	cal_gnss_reset_release();
-	exynos_pmu_shared_reg_disable();
-}
-
-static int gnss_pmu_hold_reset(void)
-{
-	cal_gnss_reset_assert();
-}
-
-static int gnss_pmu_power_on(enum gnss_mode mode)
-{
-
-	u32 gnss_ctrl = 0;
-
-	gif_err("mode[%d]\n", mode);
-	gnss_pmu_read(EXYNOS_PMU_GNSS_CTRL_NS, &gnss_ctrl);
-
-	if (mode == GNSS_POWER_ON && !(gnss_ctrl & GNSS_PWRON)) {
-		cal_gnss_init();
-	} else {
-		gif_err("Something is strange. mode[%d]\n", mode);
-		gif_err("PMU_GNSS_CTRL_S[0x%08x]\n", gnss_ctrl);
-	}
-
-	return 0;
-}
-#else
-static int gnss_pmu_clear_interrupt(enum gnss_int_clear gnss_int)
-{
-	int ret = 0;
-
-	gif_debug("gnss_int = %d\n", gnss_int);
-	switch (gnss_int) {
-	case GNSS_INT_WAKEUP_CLEAR:
-		ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_NS,
-				GNSS_WAKEUP_REQ_CLR, GNSS_WAKEUP_REQ_CLR);
-		break;
-	case GNSS_INT_ACTIVE_CLEAR:
-		ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_NS,
-				GNSS_ACTIVE_REQ_CLR, GNSS_ACTIVE_REQ_CLR);
-		break;
-	case GNSS_INT_WDT_RESET_CLEAR:
-		ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_NS,
-				GNSS_RESET_REQ_CLR, GNSS_RESET_REQ_CLR);
-		break;
-	default:
-		gif_err("Unexpected interrupt value!\n");
-		return -EIO;
-	}
-
-	if (ret < 0) {
-		gif_err("ERR! GNSS Reset Fail: %d\n", ret);
-		return -EIO;
-	}
-
-	return ret;
-}
-
-static int gnss_pmu_release_reset(void)
-{
-	u32 gnss_ctrl = 0;
-	int ret = 0;
-
-	exynos_pmu_shared_reg_enable();
-	gnss_pmu_read(EXYNOS_PMU_GNSS_CTRL_NS, &gnss_ctrl);
-	if (!(gnss_ctrl & GNSS_PWRON)) {
-		ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_NS, GNSS_PWRON,
-				GNSS_PWRON);
-		if (ret < 0) {
-			gif_err("ERR! write Fail: %d\n", ret);
-			ret = -EIO;
-		}
-	}
-	ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_S, GNSS_START, GNSS_START);
-	if (ret < 0) {
-		gif_err("ERR! GNSS Release Fail: %d\n", ret);
-	} else {
-		gnss_pmu_read(EXYNOS_PMU_GNSS_CTRL_S, &gnss_ctrl);
-		gif_info("PMU_GNSS_CTRL_S[0x%08x]\n", gnss_ctrl);
-		ret = -EIO;
-	}
-	exynos_pmu_shared_reg_disable();
-	return ret;
-}
-
-static int gnss_pmu_hold_reset(void)
-{
-	int ret = 0;
-
-	/* set sys_pwr_cfg registers */
-	exynos_sys_powerdown_conf_gnss();
-
-	ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_NS, GNSS_RESET_SET,
-			GNSS_RESET_SET);
-	if (ret < 0) {
-		gif_err("ERR! GNSS Reset Fail: %d\n", ret);
-		return -1;
-	}
-
-	/* some delay */
-	cpu_relax();
-	usleep_range(80, 100);
-
-	return ret;
-}
-
-static int gnss_pmu_power_on(enum gnss_mode mode)
-{
-	u32 gnss_ctrl;
-	int ret = 0;
-
-	gif_err("mode[%d]\n", mode);
-
-	gnss_pmu_read(EXYNOS_PMU_GNSS_CTRL_NS, &gnss_ctrl);
-	if (mode == GNSS_POWER_ON) {
-		if (!(gnss_ctrl & GNSS_PWRON)) {
-			ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_NS,
-					GNSS_PWRON, GNSS_PWRON);
-			if (ret < 0)
-				gif_err("ERR! write Fail: %d\n", ret);
-		}
-
-		ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_S, GNSS_START,
-				GNSS_START);
-		if (ret < 0)
-			gif_err("ERR! write Fail: %d\n", ret);
-	} else {
-		ret = gnss_pmu_update(EXYNOS_PMU_GNSS_CTRL_NS, GNSS_PWRON, 0);
-		if (ret < 0) {
-			gif_err("ERR! write Fail: %d\n", ret);
-			return ret;
-		}
-		/* set sys_pwr_cfg registers */
-		exynos_sys_powerdown_conf_gnss();
-	}
-
-	return ret;
-}
-#endif
-
-static int gnss_pmu_init_conf(struct gnss_ctl *gc)
-{
-	u32 shmem_size, shmem_base;
-
-#ifdef USE_IOREMAP_NOPMU
-	pmu_reg = devm_ioremap(gc->dev, PMU_ADDR, PMU_SIZE);
-	if (pmu_reg == NULL)
-		gif_err("%s: pmu ioremap failed.\n", gc->gnss_data->name);
-	else
-		gif_err("pmu_reg : 0x%p\n", pmu_reg);
-#endif
-
-	shmem_size = gc->gnss_data->shmem_size;
-	shmem_base = gc->gnss_data->shmem_base;
-
-	set_shdmem_size(shmem_size);
-	set_shdmem_base(shmem_base);
-
-	/* set access window for GNSS */
-	gnss_pmu_write(EXYNOS_PMU_GNSS2AP_MIF_ACCESS_WIN0, 0x0);
-	gnss_pmu_write(EXYNOS_PMU_GNSS2AP_PERI_ACCESS_WIN0, 0x0);
-	gnss_pmu_write(EXYNOS_PMU_GNSS2AP_PERI_ACCESS_WIN1, 0x0);
-
-	return 0;
-}
-
-static struct gnssctl_pmu_ops pmu_ops = {
-	.init_conf = gnss_pmu_init_conf,
-	.hold_reset = gnss_pmu_hold_reset,
-	.release_reset = gnss_pmu_release_reset,
-	.power_on = gnss_pmu_power_on,
-	.clear_int = gnss_pmu_clear_interrupt,
-};
-
-void gnss_get_pmu_ops(struct gnss_ctl *gc)
-{
-	gc->pmu_ops = &pmu_ops;
-	return;
-}
+         = 0x3b,
+	DBG_BLOCK_ID_TCP_RESERVED0_BY2                   = 0x3c,
+	DBG_BLOCK_ID_TCP_RESERVED2_BY2                   = 0x3d,
+	DBG_BLOCK_ID_TCP_RESERVED4_BY2                   = 0x3e,
+	DBG_BLOCK_ID_TCP_RESERVED6_BY2                   = 0x3f,
+	DBG_BLOCK_ID_DB00_BY2                            = 0x40,
+	DBG_BLOCK_ID_DB02_BY2                            = 0x41,
+	DBG_BLOCK_ID_DB04_BY2                            = 0x42,
+	DBG_BLOCK_ID_UNUSED28_BY2                        = 0x43,
+	DBG_BLOCK_ID_DB10_BY2                            = 0x44,
+	DBG_BLOCK_ID_DB12_BY2                            = 0x45,
+	DBG_BLOCK_ID_DB14_BY2                            = 0x46,
+	DBG_BLOCK_ID_UNUSED31_BY2                        = 0x47,
+	DBG_BLOCK_ID_TCC0_BY2                            = 0x48,
+	DBG_BLOCK_ID_TCC2_BY2                            = 0x49,
+	DBG_BLOCK_ID_TCC4_BY2                            = 0x4a,
+	DBG_BLOCK_ID_TCC6_BY2                            = 0x4b,
+	DBG_BLOCK_ID_SPS00_BY2                           = 0x4c,
+	DBG_BLOCK_ID_SPS02_BY2                           = 0x4d,
+	DBG_BLOCK_ID_SPS11_BY2                           = 0x4e,
+	DBG_BLOCK_ID_UNUSED33_BY2                        = 0x4f,
+	DBG_BLOCK_ID_TA00_BY2                            = 0x50,
+	DBG_BLOCK_ID_TA02_BY2                            = 0x51,
+	DBG_BLOCK_ID_TA04_BY2                            = 0x52,
+	DBG_BLOCK_ID_TA06_BY2                            = 0x53,
+	DBG_BLOCK_ID_TA08_BY2                            = 0x54,
+	DBG_BLOCK_ID_TA0A_BY2                            = 0x55,
+	DBG_BLOCK_ID_UNUSED35_BY2                        = 0x56,
+	DBG_BLOCK_ID_UNUSED37_BY2                        = 0x57,
+	DBG_BLOCK_ID_TA10_BY2                            = 0x58,
+	DBG_BLOCK_ID_TA12_BY2                            = 0x59,
+	DBG_BLOCK_ID_TA14_BY2                            = 0x5a,
+	DBG_BLOCK_ID_TA16_BY2                            = 0x5b,
+	DBG_BLOCK_ID_TA18_BY2                            = 0x5c,
+	DBG_BLOCK_ID_TA1A_BY2                            = 0x5d,
+	DBG_BLOCK_ID_UNUSED39_BY2                        = 0x5e,
+	DBG_BLOCK_ID_UNUSED41_BY2                        = 0x5f,
+	DBG_BLOCK_ID_TD00_BY2                            = 0x60,
+	DBG_BLOCK_ID_TD02_BY2                            = 0x61,
+	DBG_BLOCK_ID_TD04_BY2                            = 0x62,
+	DBG_BLOCK_ID_TD06_BY2                            = 0x63,
+	DBG_BLOCK_ID_TD08_BY2                            = 0x64,
+	DBG_BLOCK_ID_TD0A_BY2                            = 0x65,
+	DBG_BLOCK_ID_UNUSED43_BY2                        = 0x66,
+	DBG_BLOCK_ID_UNUSED45_BY2                        = 0x67,
+	DBG_BLOCK_ID_TD10_BY2                            = 0x68,
+	DBG_BLOCK_ID_TD12_BY2                            = 0x69,
+	DBG_BLOCK_ID_TD14_BY2                            = 0x6a,
+	DBG_BLOCK_ID_TD16_BY2                            = 0x6b,
+	DBG_BLOCK_ID_TD18_BY2                            = 0x6c,
+	DBG_BLOCK_ID_TD1A_BY2                            = 0x6d,
+	DBG_BLOCK_ID_UNUSED47_BY2                        = 0x6e,
+	DBG_BLOCK_ID_UNUSED49_BY2                        = 0x6f,
+	DBG_BLOCK_ID_MCD0_BY2                            = 0x70,
+	DBG_BLOCK_ID_MCD2_BY2                            = 0x71,
+	DBG_BLOCK_ID_MCD4_BY2                            = 0x72,
+	DBG_BLOCK_ID_UNUSED51_BY2                        = 0x73,
+} DebugBlockId_BY2;
+typedef enum DebugBlockId_BY4 {
+	DBG_BLOCK_ID_RESERVED_BY4                        = 0x0,
+	DBG_BLOCK_ID_CG_BY4                              = 0x1,
+	DBG_BLOCK_ID_CSC_BY4                             = 0x2,
+	DBG_BLOCK_ID_SQ_BY4                              = 0x3,
+	DBG_BLOCK_ID_DMA0_BY4                            = 0x4,
+	DBG_BLOCK_ID_SPIS_BY4                            = 0x5,
+	DBG_BLOCK_ID_CP0_BY4                             = 0x6,
+	DBG_BLOCK_ID_UVDU_BY4                            = 0x7,
+	DBG_BLOCK_ID_VGT0_BY4                            = 0x8,
+	DBG_BLOCK_ID_SCT0_BY4                            = 0x9,
+	DBG_BLOCK_ID_TCAA_BY4                            = 0xa,
+	DBG_BLOCK_ID_MCC0_BY4                            = 0xb,
+	DBG_BLOCK_ID_SX0_BY4                             = 0xc,
+	DBG_BLOCK_ID_UNUSED4_BY4                         = 0xd,
+	DBG_BLOCK_ID_PC0_BY4                             = 0xe,
+	DBG_BLOCK_ID_UNUSED10_BY4                        = 0xf,
+	DBG_BLOCK_ID_SCB0_BY4                            = 0x10,
+	DBG_BLOCK_ID_SCF0_BY4                            = 0x11,
+	DBG_BLOCK_ID_BCI0_BY4                            = 0x12,
+	DBG_BLOCK_ID_UNUSED17_BY4                        = 0x13,
+	DBG_BLOCK_ID_CB00_BY4                            = 0x14,
+	DBG_BLOCK_ID_CB04_BY4                            = 0x15,
+	DBG_BLOCK_ID_CB10_BY4                            = 0x16,
+	DBG_BLOCK_ID_CB14_BY4                            = 0x17,
+	DBG_BLOCK_ID_TCP0_BY4                            = 0x18,
+	DBG_BLOCK_ID_TCP4_BY4                            = 0x19,
+	DBG_BLOCK_ID_TCP8_BY4                            = 0x1a,
+	DBG_BLOCK_ID_TCP12_BY4                           = 0x1b,
+	DBG_BLOCK_ID_TCP16_BY4                           = 0x1c,
+	DBG_BLOCK_ID_TCP20_BY4                           = 0x1d,
+	DBG_BLOCK_ID_TCP_RESERVED0_BY4                   = 0x1e,
+	DBG_BLOCK_ID_TCP_RESERVED4_BY4                   = 0x1f,
+	DBG_BLOCK_ID_DB_BY4                              = 0x20,
+	DBG_BLOCK_ID_DB04_BY4                            = 0x21,
+	DBG_BLOCK_ID_DB10_BY4                            = 0x22,
+	DBG_BLOCK_ID_DB14_BY4                            = 0x23,
+	DBG_BLOCK_ID_TCC0_BY4                            = 0x24,
+	DBG_BLOCK_ID_TCC4_BY4                            = 0x25,
+	DBG_BLOCK_ID_SPS00_BY4                           = 0x26,
+	DBG_BLOCK_ID_SPS11_BY4                           = 0x27,
+	DBG_BLOCK_ID_TA00_BY4                            = 0x28,
+	DBG_BLOCK_ID_TA04_BY4                            = 0x29,
+	DBG_BLOCK_ID_TA08_BY4                            = 0x2a,
+	DBG_BLOCK_ID_UNUSED35_BY4                        = 0x2b,
+	DBG_BLOCK_ID_TA10_BY4                            = 0x2c,
+	DBG_BLOCK_ID_TA14_BY4                            = 0x2d,
+	DBG_BLOCK_ID_TA18_BY4                            = 0x2e,
+	DBG_BLOCK_ID_UNUSED39_BY4                        = 0x2f,
+	DBG_BLOCK_ID_TD00_BY4                            = 0x30,
+	DBG_BLOCK_ID_TD04_BY4                            = 0x31,
+	DBG_BLOCK_ID_TD08_BY4                            = 0x32,
+	DBG_BLOCK_ID_UNUSED43_BY4                        = 0x33,
+	DBG_BLOCK_ID_TD10_BY4                            = 0x34,
+	DBG_BLOCK_ID_TD14_BY4                            = 0x35,
+	DBG_BLOCK_ID_TD18_BY4                            = 0x36,
+	DBG_BLOCK_ID_UNUSED47_BY4                        = 0x37,
+	DBG_BLOCK_ID_MCD0_BY4                            = 0x38,
+	DBG_BLOCK_ID_MCD4_BY4                            = 0x39,
+} DebugBlockId_BY4;
+typedef enum DebugBlockId_BY8 {
+	DBG_BLOCK_ID_RESERVED_BY8                        = 0x0,
+	DBG_BLOCK_ID_CSC_BY8                             = 0x1,
+	DBG_BLOCK_ID_DMA0_BY8                            = 0x2,
+	DBG_BLOCK_ID_CP0_BY8                             = 0x3,
+	DBG_BLOCK_ID_VGT0_BY8                            = 0x4,
+	DBG_BLOCK_ID_TCAA_BY8                            = 0x5,
+	DBG_BLOCK_ID_SX0_BY8                             = 0x6,
+	DBG_BLOCK_ID_PC0_BY8                             = 0x7,
+	DBG_BLOCK_ID_SCB0_BY8                            = 0x8,
+	DBG_BLOCK_ID_BCI0_BY8                            = 0x9,
+	DBG_BLOCK_ID_CB00_BY8                            = 0xa,
+	DBG_BLOCK_ID_CB10_BY8                            = 0xb,
+	DBG_BLOCK_ID_TCP0_BY8                            = 0xc,
+	DBG_BLOCK_ID_TCP8_BY8                            = 0xd,
+	DBG_BLOCK_ID_TCP16_BY8                           = 0xe,
+	DBG_BLOCK_ID_TCP_RESERVED0_BY8                   = 0xf,
+	DBG_BLOCK_ID_DB00_BY8                            = 0x10,
+	DBG_BLOCK_ID_DB10_BY8              

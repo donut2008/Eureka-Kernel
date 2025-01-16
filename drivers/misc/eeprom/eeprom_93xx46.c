@@ -1,384 +1,136 @@
-/*
- * Driver for 93xx46 EEPROMs
- *
- * (C) 2011 DENX Software Engineering, Anatolij Gustschin <agust@denx.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/delay.h>
-#include <linux/device.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/mutex.h>
-#include <linux/slab.h>
-#include <linux/spi/spi.h>
-#include <linux/sysfs.h>
-#include <linux/eeprom_93xx46.h>
-
-#define OP_START	0x4
-#define OP_WRITE	(OP_START | 0x1)
-#define OP_READ		(OP_START | 0x2)
-#define ADDR_EWDS	0x00
-#define ADDR_ERAL	0x20
-#define ADDR_EWEN	0x30
-
-struct eeprom_93xx46_dev {
-	struct spi_device *spi;
-	struct eeprom_93xx46_platform_data *pdata;
-	struct bin_attribute bin;
-	struct mutex lock;
-	int addrlen;
-};
-
-static ssize_t
-eeprom_93xx46_bin_read(struct file *filp, struct kobject *kobj,
-		       struct bin_attribute *bin_attr,
-		       char *buf, loff_t off, size_t count)
-{
-	struct eeprom_93xx46_dev *edev;
-	struct device *dev;
-	struct spi_message m;
-	struct spi_transfer t[2];
-	int bits, ret;
-	u16 cmd_addr;
-
-	dev = container_of(kobj, struct device, kobj);
-	edev = dev_get_drvdata(dev);
-
-	cmd_addr = OP_READ << edev->addrlen;
-
-	if (edev->addrlen == 7) {
-		cmd_addr |= off & 0x7f;
-		bits = 10;
-	} else {
-		cmd_addr |= off & 0x3f;
-		bits = 9;
-	}
-
-	dev_dbg(&edev->spi->dev, "read cmd 0x%x, %d Hz\n",
-		cmd_addr, edev->spi->max_speed_hz);
-
-	spi_message_init(&m);
-	memset(t, 0, sizeof(t));
-
-	t[0].tx_buf = (char *)&cmd_addr;
-	t[0].len = 2;
-	t[0].bits_per_word = bits;
-	spi_message_add_tail(&t[0], &m);
-
-	t[1].rx_buf = buf;
-	t[1].len = count;
-	t[1].bits_per_word = 8;
-	spi_message_add_tail(&t[1], &m);
-
-	mutex_lock(&edev->lock);
-
-	if (edev->pdata->prepare)
-		edev->pdata->prepare(edev);
-
-	ret = spi_sync(edev->spi, &m);
-	/* have to wait at least Tcsl ns */
-	ndelay(250);
-	if (ret) {
-		dev_err(&edev->spi->dev, "read %zu bytes at %d: err. %d\n",
-			count, (int)off, ret);
-	}
-
-	if (edev->pdata->finish)
-		edev->pdata->finish(edev);
-
-	mutex_unlock(&edev->lock);
-	return ret ? : count;
-}
-
-static int eeprom_93xx46_ew(struct eeprom_93xx46_dev *edev, int is_on)
-{
-	struct spi_message m;
-	struct spi_transfer t;
-	int bits, ret;
-	u16 cmd_addr;
-
-	cmd_addr = OP_START << edev->addrlen;
-	if (edev->addrlen == 7) {
-		cmd_addr |= (is_on ? ADDR_EWEN : ADDR_EWDS) << 1;
-		bits = 10;
-	} else {
-		cmd_addr |= (is_on ? ADDR_EWEN : ADDR_EWDS);
-		bits = 9;
-	}
-
-	dev_dbg(&edev->spi->dev, "ew cmd 0x%04x\n", cmd_addr);
-
-	spi_message_init(&m);
-	memset(&t, 0, sizeof(t));
-
-	t.tx_buf = &cmd_addr;
-	t.len = 2;
-	t.bits_per_word = bits;
-	spi_message_add_tail(&t, &m);
-
-	mutex_lock(&edev->lock);
-
-	if (edev->pdata->prepare)
-		edev->pdata->prepare(edev);
-
-	ret = spi_sync(edev->spi, &m);
-	/* have to wait at least Tcsl ns */
-	ndelay(250);
-	if (ret)
-		dev_err(&edev->spi->dev, "erase/write %sable error %d\n",
-			is_on ? "en" : "dis", ret);
-
-	if (edev->pdata->finish)
-		edev->pdata->finish(edev);
-
-	mutex_unlock(&edev->lock);
-	return ret;
-}
-
-static ssize_t
-eeprom_93xx46_write_word(struct eeprom_93xx46_dev *edev,
-			 const char *buf, unsigned off)
-{
-	struct spi_message m;
-	struct spi_transfer t[2];
-	int bits, data_len, ret;
-	u16 cmd_addr;
-
-	cmd_addr = OP_WRITE << edev->addrlen;
-
-	if (edev->addrlen == 7) {
-		cmd_addr |= off & 0x7f;
-		bits = 10;
-		data_len = 1;
-	} else {
-		cmd_addr |= off & 0x3f;
-		bits = 9;
-		data_len = 2;
-	}
-
-	dev_dbg(&edev->spi->dev, "write cmd 0x%x\n", cmd_addr);
-
-	spi_message_init(&m);
-	memset(t, 0, sizeof(t));
-
-	t[0].tx_buf = (char *)&cmd_addr;
-	t[0].len = 2;
-	t[0].bits_per_word = bits;
-	spi_message_add_tail(&t[0], &m);
-
-	t[1].tx_buf = buf;
-	t[1].len = data_len;
-	t[1].bits_per_word = 8;
-	spi_message_add_tail(&t[1], &m);
-
-	ret = spi_sync(edev->spi, &m);
-	/* have to wait program cycle time Twc ms */
-	mdelay(6);
-	return ret;
-}
-
-static ssize_t
-eeprom_93xx46_bin_write(struct file *filp, struct kobject *kobj,
-			struct bin_attribute *bin_attr,
-			char *buf, loff_t off, size_t count)
-{
-	struct eeprom_93xx46_dev *edev;
-	struct device *dev;
-	int i, ret, step = 1;
-
-	dev = container_of(kobj, struct device, kobj);
-	edev = dev_get_drvdata(dev);
-
-	/* only write even number of bytes on 16-bit devices */
-	if (edev->addrlen == 6) {
-		step = 2;
-		count &= ~1;
-	}
-
-	/* erase/write enable */
-	ret = eeprom_93xx46_ew(edev, 1);
-	if (ret)
-		return ret;
-
-	mutex_lock(&edev->lock);
-
-	if (edev->pdata->prepare)
-		edev->pdata->prepare(edev);
-
-	for (i = 0; i < count; i += step) {
-		ret = eeprom_93xx46_write_word(edev, &buf[i], off + i);
-		if (ret) {
-			dev_err(&edev->spi->dev, "write failed at %d: %d\n",
-				(int)off + i, ret);
-			break;
-		}
-	}
-
-	if (edev->pdata->finish)
-		edev->pdata->finish(edev);
-
-	mutex_unlock(&edev->lock);
-
-	/* erase/write disable */
-	eeprom_93xx46_ew(edev, 0);
-	return ret ? : count;
-}
-
-static int eeprom_93xx46_eral(struct eeprom_93xx46_dev *edev)
-{
-	struct eeprom_93xx46_platform_data *pd = edev->pdata;
-	struct spi_message m;
-	struct spi_transfer t;
-	int bits, ret;
-	u16 cmd_addr;
-
-	cmd_addr = OP_START << edev->addrlen;
-	if (edev->addrlen == 7) {
-		cmd_addr |= ADDR_ERAL << 1;
-		bits = 10;
-	} else {
-		cmd_addr |= ADDR_ERAL;
-		bits = 9;
-	}
-
-	spi_message_init(&m);
-	memset(&t, 0, sizeof(t));
-
-	t.tx_buf = &cmd_addr;
-	t.len = 2;
-	t.bits_per_word = bits;
-	spi_message_add_tail(&t, &m);
-
-	mutex_lock(&edev->lock);
-
-	if (edev->pdata->prepare)
-		edev->pdata->prepare(edev);
-
-	ret = spi_sync(edev->spi, &m);
-	if (ret)
-		dev_err(&edev->spi->dev, "erase error %d\n", ret);
-	/* have to wait erase cycle time Tec ms */
-	mdelay(6);
-
-	if (pd->finish)
-		pd->finish(edev);
-
-	mutex_unlock(&edev->lock);
-	return ret;
-}
-
-static ssize_t eeprom_93xx46_store_erase(struct device *dev,
-					 struct device_attribute *attr,
-					 const char *buf, size_t count)
-{
-	struct eeprom_93xx46_dev *edev = dev_get_drvdata(dev);
-	int erase = 0, ret;
-
-	sscanf(buf, "%d", &erase);
-	if (erase) {
-		ret = eeprom_93xx46_ew(edev, 1);
-		if (ret)
-			return ret;
-		ret = eeprom_93xx46_eral(edev);
-		if (ret)
-			return ret;
-		ret = eeprom_93xx46_ew(edev, 0);
-		if (ret)
-			return ret;
-	}
-	return count;
-}
-static DEVICE_ATTR(erase, S_IWUSR, NULL, eeprom_93xx46_store_erase);
-
-static int eeprom_93xx46_probe(struct spi_device *spi)
-{
-	struct eeprom_93xx46_platform_data *pd;
-	struct eeprom_93xx46_dev *edev;
-	int err;
-
-	pd = spi->dev.platform_data;
-	if (!pd) {
-		dev_err(&spi->dev, "missing platform data\n");
-		return -ENODEV;
-	}
-
-	edev = kzalloc(sizeof(*edev), GFP_KERNEL);
-	if (!edev)
-		return -ENOMEM;
-
-	if (pd->flags & EE_ADDR8)
-		edev->addrlen = 7;
-	else if (pd->flags & EE_ADDR16)
-		edev->addrlen = 6;
-	else {
-		dev_err(&spi->dev, "unspecified address type\n");
-		err = -EINVAL;
-		goto fail;
-	}
-
-	mutex_init(&edev->lock);
-
-	edev->spi = spi_dev_get(spi);
-	edev->pdata = pd;
-
-	sysfs_bin_attr_init(&edev->bin);
-	edev->bin.attr.name = "eeprom";
-	edev->bin.attr.mode = S_IRUSR;
-	edev->bin.read = eeprom_93xx46_bin_read;
-	edev->bin.size = 128;
-	if (!(pd->flags & EE_READONLY)) {
-		edev->bin.write = eeprom_93xx46_bin_write;
-		edev->bin.attr.mode |= S_IWUSR;
-	}
-
-	err = sysfs_create_bin_file(&spi->dev.kobj, &edev->bin);
-	if (err)
-		goto fail;
-
-	dev_info(&spi->dev, "%d-bit eeprom %s\n",
-		(pd->flags & EE_ADDR8) ? 8 : 16,
-		(pd->flags & EE_READONLY) ? "(readonly)" : "");
-
-	if (!(pd->flags & EE_READONLY)) {
-		if (device_create_file(&spi->dev, &dev_attr_erase))
-			dev_err(&spi->dev, "can't create erase interface\n");
-	}
-
-	spi_set_drvdata(spi, edev);
-	return 0;
-fail:
-	kfree(edev);
-	return err;
-}
-
-static int eeprom_93xx46_remove(struct spi_device *spi)
-{
-	struct eeprom_93xx46_dev *edev = spi_get_drvdata(spi);
-
-	if (!(edev->pdata->flags & EE_READONLY))
-		device_remove_file(&spi->dev, &dev_attr_erase);
-
-	sysfs_remove_bin_file(&spi->dev.kobj, &edev->bin);
-	kfree(edev);
-	return 0;
-}
-
-static struct spi_driver eeprom_93xx46_driver = {
-	.driver = {
-		.name	= "93xx46",
-	},
-	.probe		= eeprom_93xx46_probe,
-	.remove		= eeprom_93xx46_remove,
-};
-
-module_spi_driver(eeprom_93xx46_driver);
-
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Driver for 93xx46 EEPROMs");
-MODULE_AUTHOR("Anatolij Gustschin <agust@denx.de>");
-MODULE_ALIAS("spi:93xx46");
-MODULE_ALIAS("spi:eeprom-93xx46");
+e PB1_GLB_CTRL_REG1__PLL_CFG_DISPCLK_DIV_MASK 0x80000000
+#define PB1_GLB_CTRL_REG1__PLL_CFG_DISPCLK_DIV__SHIFT 0x1f
+#define PB1_GLB_CTRL_REG2__RXDBG_D2TH_BYP_EN_MASK 0x1
+#define PB1_GLB_CTRL_REG2__RXDBG_D2TH_BYP_EN__SHIFT 0x0
+#define PB1_GLB_CTRL_REG2__RXDBG_D2TH_BYP_VAL_MASK 0xfe
+#define PB1_GLB_CTRL_REG2__RXDBG_D2TH_BYP_VAL__SHIFT 0x1
+#define PB1_GLB_CTRL_REG2__RXDBG_D3TH_BYP_EN_MASK 0x100
+#define PB1_GLB_CTRL_REG2__RXDBG_D3TH_BYP_EN__SHIFT 0x8
+#define PB1_GLB_CTRL_REG2__RXDBG_D3TH_BYP_VAL_MASK 0xfe00
+#define PB1_GLB_CTRL_REG2__RXDBG_D3TH_BYP_VAL__SHIFT 0x9
+#define PB1_GLB_CTRL_REG2__RXDBG_DXTH_BYP_EN_MASK 0x10000
+#define PB1_GLB_CTRL_REG2__RXDBG_DXTH_BYP_EN__SHIFT 0x10
+#define PB1_GLB_CTRL_REG2__RXDBG_DXTH_BYP_VAL_MASK 0xfe0000
+#define PB1_GLB_CTRL_REG2__RXDBG_DXTH_BYP_VAL__SHIFT 0x11
+#define PB1_GLB_CTRL_REG2__RXDBG_ETH_BYP_EN_MASK 0x1000000
+#define PB1_GLB_CTRL_REG2__RXDBG_ETH_BYP_EN__SHIFT 0x18
+#define PB1_GLB_CTRL_REG2__RXDBG_ETH_BYP_VAL_MASK 0xfe000000
+#define PB1_GLB_CTRL_REG2__RXDBG_ETH_BYP_VAL__SHIFT 0x19
+#define PB1_GLB_CTRL_REG3__RXDBG_SEL_MASK 0x1f
+#define PB1_GLB_CTRL_REG3__RXDBG_SEL__SHIFT 0x0
+#define PB1_GLB_CTRL_REG3__BG_CFG_LC_REG_VREF0_SEL_MASK 0x60
+#define PB1_GLB_CTRL_REG3__BG_CFG_LC_REG_VREF0_SEL__SHIFT 0x5
+#define PB1_GLB_CTRL_REG3__BG_CFG_LC_REG_VREF1_SEL_MASK 0x180
+#define PB1_GLB_CTRL_REG3__BG_CFG_LC_REG_VREF1_SEL__SHIFT 0x7
+#define PB1_GLB_CTRL_REG3__BG_CFG_RO_REG_VREF_SEL_MASK 0x600
+#define PB1_GLB_CTRL_REG3__BG_CFG_RO_REG_VREF_SEL__SHIFT 0x9
+#define PB1_GLB_CTRL_REG3__BG_DBG_VREFBYP_EN_MASK 0x800
+#define PB1_GLB_CTRL_REG3__BG_DBG_VREFBYP_EN__SHIFT 0xb
+#define PB1_GLB_CTRL_REG3__BG_DBG_IREFBYP_EN_MASK 0x1000
+#define PB1_GLB_CTRL_REG3__BG_DBG_IREFBYP_EN__SHIFT 0xc
+#define PB1_GLB_CTRL_REG3__BG_DBG_ANALOG_SEL_MASK 0x1c000
+#define PB1_GLB_CTRL_REG3__BG_DBG_ANALOG_SEL__SHIFT 0xe
+#define PB1_GLB_CTRL_REG3__DBG_DLL_CLK_SEL_MASK 0x1c0000
+#define PB1_GLB_CTRL_REG3__DBG_DLL_CLK_SEL__SHIFT 0x12
+#define PB1_GLB_CTRL_REG3__PLL_DISPCLK_CMOS_SEL_MASK 0x200000
+#define PB1_GLB_CTRL_REG3__PLL_DISPCLK_CMOS_SEL__SHIFT 0x15
+#define PB1_GLB_CTRL_REG3__DBG_RXPI_OFFSET_BYP_EN_MASK 0x400000
+#define PB1_GLB_CTRL_REG3__DBG_RXPI_OFFSET_BYP_EN__SHIFT 0x16
+#define PB1_GLB_CTRL_REG3__DBG_RXPI_OFFSET_BYP_VAL_MASK 0x7800000
+#define PB1_GLB_CTRL_REG3__DBG_RXPI_OFFSET_BYP_VAL__SHIFT 0x17
+#define PB1_GLB_CTRL_REG3__DBG_RXSWAPDX_BYP_EN_MASK 0x8000000
+#define PB1_GLB_CTRL_REG3__DBG_RXSWAPDX_BYP_EN__SHIFT 0x1b
+#define PB1_GLB_CTRL_REG3__DBG_RXSWAPDX_BYP_VAL_MASK 0x70000000
+#define PB1_GLB_CTRL_REG3__DBG_RXSWAPDX_BYP_VAL__SHIFT 0x1c
+#define PB1_GLB_CTRL_REG3__DBG_RXLEQ_DCATTN_BYP_OVR_DISABLE_MASK 0x80000000
+#define PB1_GLB_CTRL_REG3__DBG_RXLEQ_DCATTN_BYP_OVR_DISABLE__SHIFT 0x1f
+#define PB1_GLB_CTRL_REG4__DBG_RXAPU_INST_MASK 0xffff
+#define PB1_GLB_CTRL_REG4__DBG_RXAPU_INST__SHIFT 0x0
+#define PB1_GLB_CTRL_REG4__DBG_RXDFEMUX_BYP_VAL_MASK 0x30000
+#define PB1_GLB_CTRL_REG4__DBG_RXDFEMUX_BYP_VAL__SHIFT 0x10
+#define PB1_GLB_CTRL_REG4__DBG_RXDFEMUX_BYP_EN_MASK 0x40000
+#define PB1_GLB_CTRL_REG4__DBG_RXDFEMUX_BYP_EN__SHIFT 0x12
+#define PB1_GLB_CTRL_REG4__DBG_RXAPU_EXEC_MASK 0x3c00000
+#define PB1_GLB_CTRL_REG4__DBG_RXAPU_EXEC__SHIFT 0x16
+#define PB1_GLB_CTRL_REG4__DBG_RXDLL_VREG_REF_SEL_MASK 0x4000000
+#define PB1_GLB_CTRL_REG4__DBG_RXDLL_VREG_REF_SEL__SHIFT 0x1a
+#define PB1_GLB_CTRL_REG4__PWRGOOD_OVRD_MASK 0x8000000
+#define PB1_GLB_CTRL_REG4__PWRGOOD_OVRD__SHIFT 0x1b
+#define PB1_GLB_CTRL_REG4__DBG_RXRDATA_GATING_DISABLE_MASK 0x10000000
+#define PB1_GLB_CTRL_REG4__DBG_RXRDATA_GATING_DISABLE__SHIFT 0x1c
+#define PB1_GLB_CTRL_REG5__DBG_RXAPU_MODE_MASK 0xff
+#define PB1_GLB_CTRL_REG5__DBG_RXAPU_MODE__SHIFT 0x0
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_SCI_UPDT_L0T3_MASK 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_SCI_UPDT_L0T3__SHIFT 0x0
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_SCI_UPDT_L4T7_MASK 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_SCI_UPDT_L4T7__SHIFT 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_SCI_UPDT_L8T11_MASK 0x4
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_SCI_UPDT_L8T11__SHIFT 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_SCI_UPDT_L12T15_MASK 0x8
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_ALL_SCI_UPDT_L12T15__SHIFT 0x3
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_IMPCAL_ACTIVE_SCI_UPDT_MASK 0x10
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IGNR_IMPCAL_ACTIVE_SCI_UPDT__SHIFT 0x4
+#define PB1_GLB_SCI_STAT_OVRD_REG0__TXNIMP_MASK 0xf00
+#define PB1_GLB_SCI_STAT_OVRD_REG0__TXNIMP__SHIFT 0x8
+#define PB1_GLB_SCI_STAT_OVRD_REG0__TXPIMP_MASK 0xf000
+#define PB1_GLB_SCI_STAT_OVRD_REG0__TXPIMP__SHIFT 0xc
+#define PB1_GLB_SCI_STAT_OVRD_REG0__RXIMP_MASK 0xf0000
+#define PB1_GLB_SCI_STAT_OVRD_REG0__RXIMP__SHIFT 0x10
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IMPCAL_ACTIVE_MASK 0x100000
+#define PB1_GLB_SCI_STAT_OVRD_REG0__IMPCAL_ACTIVE__SHIFT 0x14
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_MODE_SCI_UPDT_L0T3_MASK 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_MODE_SCI_UPDT_L0T3__SHIFT 0x0
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_FREQDIV_SCI_UPDT_L0T3_MASK 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_FREQDIV_SCI_UPDT_L0T3__SHIFT 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_DLL_LOCK_SCI_UPDT_L0T3_MASK 0x4
+#define PB1_GLB_SCI_STAT_OVRD_REG1__IGNR_DLL_LOCK_SCI_UPDT_L0T3__SHIFT 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_0_MASK 0x1000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_0__SHIFT 0xc
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_1_MASK 0x2000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_1__SHIFT 0xd
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_2_MASK 0x4000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_2__SHIFT 0xe
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_3_MASK 0x8000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__DLL_LOCK_3__SHIFT 0xf
+#define PB1_GLB_SCI_STAT_OVRD_REG1__MODE_0_MASK 0x30000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__MODE_0__SHIFT 0x10
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_0_MASK 0xc0000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_0__SHIFT 0x12
+#define PB1_GLB_SCI_STAT_OVRD_REG1__MODE_1_MASK 0x300000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__MODE_1__SHIFT 0x14
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_1_MASK 0xc00000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_1__SHIFT 0x16
+#define PB1_GLB_SCI_STAT_OVRD_REG1__MODE_2_MASK 0x3000000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__MODE_2__SHIFT 0x18
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_2_MASK 0xc000000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_2__SHIFT 0x1a
+#define PB1_GLB_SCI_STAT_OVRD_REG1__MODE_3_MASK 0x30000000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__MODE_3__SHIFT 0x1c
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_3_MASK 0xc0000000
+#define PB1_GLB_SCI_STAT_OVRD_REG1__FREQDIV_3__SHIFT 0x1e
+#define PB1_GLB_SCI_STAT_OVRD_REG2__IGNR_MODE_SCI_UPDT_L4T7_MASK 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG2__IGNR_MODE_SCI_UPDT_L4T7__SHIFT 0x0
+#define PB1_GLB_SCI_STAT_OVRD_REG2__IGNR_FREQDIV_SCI_UPDT_L4T7_MASK 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG2__IGNR_FREQDIV_SCI_UPDT_L4T7__SHIFT 0x1
+#define PB1_GLB_SCI_STAT_OVRD_REG2__IGNR_DLL_LOCK_SCI_UPDT_L4T7_MASK 0x4
+#define PB1_GLB_SCI_STAT_OVRD_REG2__IGNR_DLL_LOCK_SCI_UPDT_L4T7__SHIFT 0x2
+#define PB1_GLB_SCI_STAT_OVRD_REG2__DLL_LOCK_4_MASK 0x1000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__DLL_LOCK_4__SHIFT 0xc
+#define PB1_GLB_SCI_STAT_OVRD_REG2__DLL_LOCK_5_MASK 0x2000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__DLL_LOCK_5__SHIFT 0xd
+#define PB1_GLB_SCI_STAT_OVRD_REG2__DLL_LOCK_6_MASK 0x4000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__DLL_LOCK_6__SHIFT 0xe
+#define PB1_GLB_SCI_STAT_OVRD_REG2__DLL_LOCK_7_MASK 0x8000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__DLL_LOCK_7__SHIFT 0xf
+#define PB1_GLB_SCI_STAT_OVRD_REG2__MODE_4_MASK 0x30000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__MODE_4__SHIFT 0x10
+#define PB1_GLB_SCI_STAT_OVRD_REG2__FREQDIV_4_MASK 0xc0000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__FREQDIV_4__SHIFT 0x12
+#define PB1_GLB_SCI_STAT_OVRD_REG2__MODE_5_MASK 0x300000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__MODE_5__SHIFT 0x14
+#define PB1_GLB_SCI_STAT_OVRD_REG2__FREQDIV_5_MASK 0xc00000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__FREQDIV_5__SHIFT 0x16
+#define PB1_GLB_SCI_STAT_OVRD_REG2__MODE_6_MASK 0x3000000
+#define PB1_GLB_SCI_STAT_OVRD_REG2__MODE_6__SHIFT 0x18
+#define PB1_GLB_SCI_STAT_OVRD_REG2__FREQDIV_6_MASK 0xc000000
+#define PB1_GLB_SCI_STAT_OVRD_

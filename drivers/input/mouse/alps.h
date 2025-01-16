@@ -1,304 +1,176 @@
-/*
- * ALPS touchpad PS/2 mouse driver
- *
- * Copyright (c) 2003 Peter Osterlund <petero2@telia.com>
- * Copyright (c) 2005 Vojtech Pavlik <vojtech@suse.cz>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- */
-
-#ifndef _ALPS_H
-#define _ALPS_H
-
-#include <linux/input/mt.h>
-
-#define ALPS_PROTO_V1		0x100
-#define ALPS_PROTO_V2		0x200
-#define ALPS_PROTO_V3		0x300
-#define ALPS_PROTO_V3_RUSHMORE	0x310
-#define ALPS_PROTO_V4		0x400
-#define ALPS_PROTO_V5		0x500
-#define ALPS_PROTO_V6		0x600
-#define ALPS_PROTO_V7		0x700	/* t3btl t4s */
-#define ALPS_PROTO_V8		0x800	/* SS4btl SS4s */
-
-#define MAX_TOUCHES	4
-
-#define DOLPHIN_COUNT_PER_ELECTRODE	64
-#define DOLPHIN_PROFILE_XOFFSET		8	/* x-electrode offset */
-#define DOLPHIN_PROFILE_YOFFSET		1	/* y-electrode offset */
-
-/*
- * enum SS4_PACKET_ID - defines the packet type for V8
- * SS4_PACKET_ID_IDLE: There's no finger and no button activity.
- * SS4_PACKET_ID_ONE: There's one finger on touchpad
- *  or there's button activities.
- * SS4_PACKET_ID_TWO: There's two or more fingers on touchpad
- * SS4_PACKET_ID_MULTI: There's three or more fingers on touchpad
-*/
-enum SS4_PACKET_ID {
-	SS4_PACKET_ID_IDLE = 0,
-	SS4_PACKET_ID_ONE,
-	SS4_PACKET_ID_TWO,
-	SS4_PACKET_ID_MULTI,
-};
-
-#define SS4_COUNT_PER_ELECTRODE		256
-#define SS4_NUMSENSOR_XOFFSET		7
-#define SS4_NUMSENSOR_YOFFSET		7
-#define SS4_MIN_PITCH_MM		50
-
-#define SS4_MASK_NORMAL_BUTTONS		0x07
-
-#define SS4_1F_X_V2(_b)		((_b[0] & 0x0007) |		\
-				 ((_b[1] << 3) & 0x0078) |	\
-				 ((_b[1] << 2) & 0x0380) |	\
-				 ((_b[2] << 5) & 0x1C00)	\
-				)
-
-#define SS4_1F_Y_V2(_b)		(((_b[2]) & 0x000F) |		\
-				 ((_b[3] >> 2) & 0x0030) |	\
-				 ((_b[4] << 6) & 0x03C0) |	\
-				 ((_b[4] << 5) & 0x0C00)	\
-				)
-
-#define SS4_1F_Z_V2(_b)		(((_b[5]) & 0x0F) |		\
-				 ((_b[5] >> 1) & 0x70) |	\
-				 ((_b[4]) & 0x80)		\
-				)
-
-#define SS4_1F_LFB_V2(_b)	(((_b[2] >> 4) & 0x01) == 0x01)
-
-#define SS4_MF_LF_V2(_b, _i)	((_b[1 + (_i) * 3] & 0x0004) == 0x0004)
-
-#define SS4_BTN_V2(_b)		((_b[0] >> 5) & SS4_MASK_NORMAL_BUTTONS)
-
-#define SS4_STD_MF_X_V2(_b, _i)	(((_b[0 + (_i) * 3] << 5) & 0x00E0) |	\
-				 ((_b[1 + _i * 3]  << 5) & 0x1F00)	\
-				)
-
-#define SS4_STD_MF_Y_V2(_b, _i)	(((_b[1 + (_i) * 3] << 3) & 0x0010) |	\
-				 ((_b[2 + (_i) * 3] << 5) & 0x01E0) |	\
-				 ((_b[2 + (_i) * 3] << 4) & 0x0E00)	\
-				)
-
-#define SS4_BTL_MF_X_V2(_b, _i)	(SS4_STD_MF_X_V2(_b, _i) |		\
-				 ((_b[0 + (_i) * 3] >> 3) & 0x0010)	\
-				)
-
-#define SS4_BTL_MF_Y_V2(_b, _i)	(SS4_STD_MF_Y_V2(_b, _i) | \
-				 ((_b[0 + (_i) * 3] >> 3) & 0x0008)	\
-				)
-
-#define SS4_MF_Z_V2(_b, _i)	(((_b[1 + (_i) * 3]) & 0x0001) |	\
-				 ((_b[1 + (_i) * 3] >> 1) & 0x0002)	\
-				)
-
-#define SS4_IS_MF_CONTINUE(_b)	((_b[2] & 0x10) == 0x10)
-#define SS4_IS_5F_DETECTED(_b)	((_b[2] & 0x10) == 0x10)
-
-
-#define SS4_MFPACKET_NO_AX	8160	/* X-Coordinate value */
-#define SS4_MFPACKET_NO_AY	4080	/* Y-Coordinate value */
-#define SS4_MFPACKET_NO_AX_BL	8176	/* Buttonless X-Coordinate value */
-#define SS4_MFPACKET_NO_AY_BL	4088	/* Buttonless Y-Coordinate value */
-
-/*
- * enum V7_PACKET_ID - defines the packet type for V7
- * V7_PACKET_ID_IDLE: There's no finger and no button activity.
- * V7_PACKET_ID_TWO: There's one or two non-resting fingers on touchpad
- *  or there's button activities.
- * V7_PACKET_ID_MULTI: There are at least three non-resting fingers.
- * V7_PACKET_ID_NEW: The finger position in slot is not continues from
- *  previous packet.
-*/
-enum V7_PACKET_ID {
-	 V7_PACKET_ID_IDLE,
-	 V7_PACKET_ID_TWO,
-	 V7_PACKET_ID_MULTI,
-	 V7_PACKET_ID_NEW,
-	 V7_PACKET_ID_UNKNOWN,
-};
-
-/**
- * struct alps_protocol_info - information about protocol used by a device
- * @version: Indicates V1/V2/V3/...
- * @byte0: Helps figure out whether a position report packet matches the
- *   known format for this model.  The first byte of the report, ANDed with
- *   mask0, should match byte0.
- * @mask0: The mask used to check the first byte of the report.
- * @flags: Additional device capabilities (passthrough port, trackstick, etc.).
- */
-struct alps_protocol_info {
-	u16 version;
-	u8 byte0, mask0;
-	unsigned int flags;
-};
-
-/**
- * struct alps_model_info - touchpad ID table
- * @signature: E7 response string to match.
- * @command_mode_resp: For V3/V4 touchpads, the final byte of the EC response
- *   (aka command mode response) identifies the firmware minor version.  This
- *   can be used to distinguish different hardware models which are not
- *   uniquely identifiable through their E7 responses.
- * @protocol_info: information about protcol used by the device.
- *
- * Many (but not all) ALPS touchpads can be identified by looking at the
- * values returned in the "E7 report" and/or the "EC report."  This table
- * lists a number of such touchpads.
- */
-struct alps_model_info {
-	u8 signature[3];
-	u8 command_mode_resp;
-	struct alps_protocol_info protocol_info;
-};
-
-/**
- * struct alps_nibble_commands - encodings for register accesses
- * @command: PS/2 command used for the nibble
- * @data: Data supplied as an argument to the PS/2 command, if applicable
- *
- * The ALPS protocol uses magic sequences to transmit binary data to the
- * touchpad, as it is generally not OK to send arbitrary bytes out the
- * PS/2 port.  Each of the sequences in this table sends one nibble of the
- * register address or (write) data.  Different versions of the ALPS protocol
- * use slightly different encodings.
- */
-struct alps_nibble_commands {
-	int command;
-	unsigned char data;
-};
-
-struct alps_bitmap_point {
-	int start_bit;
-	int num_bits;
-};
-
-/**
- * struct alps_fields - decoded version of the report packet
- * @x_map: Bitmap of active X positions for MT.
- * @y_map: Bitmap of active Y positions for MT.
- * @fingers: Number of fingers for MT.
- * @pressure: Pressure.
- * @st: position for ST.
- * @mt: position for MT.
- * @first_mp: Packet is the first of a multi-packet report.
- * @is_mp: Packet is part of a multi-packet report.
- * @left: Left touchpad button is active.
- * @right: Right touchpad button is active.
- * @middle: Middle touchpad button is active.
- * @ts_left: Left trackstick button is active.
- * @ts_right: Right trackstick button is active.
- * @ts_middle: Middle trackstick button is active.
- */
-struct alps_fields {
-	unsigned int x_map;
-	unsigned int y_map;
-	unsigned int fingers;
-
-	int pressure;
-	struct input_mt_pos st;
-	struct input_mt_pos mt[MAX_TOUCHES];
-
-	unsigned int first_mp:1;
-	unsigned int is_mp:1;
-
-	unsigned int left:1;
-	unsigned int right:1;
-	unsigned int middle:1;
-
-	unsigned int ts_left:1;
-	unsigned int ts_right:1;
-	unsigned int ts_middle:1;
-};
-
-/**
- * struct alps_data - private data structure for the ALPS driver
- * @psmouse: Pointer to parent psmouse device
- * @dev2: Trackstick device (can be NULL).
- * @dev3: Generic PS/2 mouse (can be NULL, delayed registering).
- * @phys2: Physical path for the trackstick device.
- * @phys3: Physical path for the generic PS/2 mouse.
- * @dev3_register_work: Delayed work for registering PS/2 mouse.
- * @nibble_commands: Command mapping used for touchpad register accesses.
- * @addr_command: Command used to tell the touchpad that a register address
- *   follows.
- * @proto_version: Indicates V1/V2/V3/...
- * @byte0: Helps figure out whether a position report packet matches the
- *   known format for this model.  The first byte of the report, ANDed with
- *   mask0, should match byte0.
- * @mask0: The mask used to check the first byte of the report.
- * @fw_ver: cached copy of firmware version (EC report)
- * @flags: Additional device capabilities (passthrough port, trackstick, etc.).
- * @x_max: Largest possible X position value.
- * @y_max: Largest possible Y position value.
- * @x_bits: Number of X bits in the MT bitmap.
- * @y_bits: Number of Y bits in the MT bitmap.
- * @hw_init: Protocol-specific hardware init function.
- * @process_packet: Protocol-specific function to process a report packet.
- * @decode_fields: Protocol-specific function to read packet bitfields.
- * @set_abs_params: Protocol-specific function to configure the input_dev.
- * @prev_fin: Finger bit from previous packet.
- * @multi_packet: Multi-packet data in progress.
- * @multi_data: Saved multi-packet data.
- * @f: Decoded packet data fields.
- * @quirks: Bitmap of ALPS_QUIRK_*.
- * @timer: Timer for flushing out the final report packet in the stream.
- */
-struct alps_data {
-	struct psmouse *psmouse;
-	struct input_dev *dev2;
-	struct input_dev *dev3;
-	char phys2[32];
-	char phys3[32];
-	struct delayed_work dev3_register_work;
-
-	/* these are autodetected when the device is identified */
-	const struct alps_nibble_commands *nibble_commands;
-	int addr_command;
-	u16 proto_version;
-	u8 byte0, mask0;
-	u8 fw_ver[3];
-	int flags;
-	int x_max;
-	int y_max;
-	int x_bits;
-	int y_bits;
-	unsigned int x_res;
-	unsigned int y_res;
-
-	int (*hw_init)(struct psmouse *psmouse);
-	void (*process_packet)(struct psmouse *psmouse);
-	int (*decode_fields)(struct alps_fields *f, unsigned char *p,
-			      struct psmouse *psmouse);
-	void (*set_abs_params)(struct alps_data *priv, struct input_dev *dev1);
-
-	int prev_fin;
-	int multi_packet;
-	int second_touch;
-	unsigned char multi_data[6];
-	struct alps_fields f;
-	u8 quirks;
-	struct timer_list timer;
-};
-
-#define ALPS_QUIRK_TRACKSTICK_BUTTONS	1 /* trakcstick buttons in trackstick packet */
-
-#ifdef CONFIG_MOUSE_PS2_ALPS
-int alps_detect(struct psmouse *psmouse, bool set_properties);
-int alps_init(struct psmouse *psmouse);
-#else
-inline int alps_detect(struct psmouse *psmouse, bool set_properties)
-{
-	return -ENOSYS;
-}
-inline int alps_init(struct psmouse *psmouse)
-{
-	return -ENOSYS;
-}
-#endif /* CONFIG_MOUSE_PS2_ALPS */
-
-#endif
+USY__GS_VTX_BUSY__SHIFT 0x3
+#define SPI_SLAVE_DEBUG_BUSY__VS_VTX_BUSY_MASK 0x10
+#define SPI_SLAVE_DEBUG_BUSY__VS_VTX_BUSY__SHIFT 0x4
+#define SPI_SLAVE_DEBUG_BUSY__VGPR_WC00_BUSY_MASK 0x20
+#define SPI_SLAVE_DEBUG_BUSY__VGPR_WC00_BUSY__SHIFT 0x5
+#define SPI_SLAVE_DEBUG_BUSY__VGPR_WC01_BUSY_MASK 0x40
+#define SPI_SLAVE_DEBUG_BUSY__VGPR_WC01_BUSY__SHIFT 0x6
+#define SPI_SLAVE_DEBUG_BUSY__VGPR_WC10_BUSY_MASK 0x80
+#define SPI_SLAVE_DEBUG_BUSY__VGPR_WC10_BUSY__SHIFT 0x7
+#define SPI_SLAVE_DEBUG_BUSY__VGPR_WC11_BUSY_MASK 0x100
+#define SPI_SLAVE_DEBUG_BUSY__VGPR_WC11_BUSY__SHIFT 0x8
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC00_BUSY_MASK 0x200
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC00_BUSY__SHIFT 0x9
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC01_BUSY_MASK 0x400
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC01_BUSY__SHIFT 0xa
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC02_BUSY_MASK 0x800
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC02_BUSY__SHIFT 0xb
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC03_BUSY_MASK 0x1000
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC03_BUSY__SHIFT 0xc
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC10_BUSY_MASK 0x2000
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC10_BUSY__SHIFT 0xd
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC11_BUSY_MASK 0x4000
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC11_BUSY__SHIFT 0xe
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC12_BUSY_MASK 0x8000
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC12_BUSY__SHIFT 0xf
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC13_BUSY_MASK 0x10000
+#define SPI_SLAVE_DEBUG_BUSY__SGPR_WC13_BUSY__SHIFT 0x10
+#define SPI_SLAVE_DEBUG_BUSY__WAVEBUFFER0_BUSY_MASK 0x20000
+#define SPI_SLAVE_DEBUG_BUSY__WAVEBUFFER0_BUSY__SHIFT 0x11
+#define SPI_SLAVE_DEBUG_BUSY__WAVEBUFFER1_BUSY_MASK 0x40000
+#define SPI_SLAVE_DEBUG_BUSY__WAVEBUFFER1_BUSY__SHIFT 0x12
+#define SPI_SLAVE_DEBUG_BUSY__WAVE_WC0_BUSY_MASK 0x80000
+#define SPI_SLAVE_DEBUG_BUSY__WAVE_WC0_BUSY__SHIFT 0x13
+#define SPI_SLAVE_DEBUG_BUSY__WAVE_WC1_BUSY_MASK 0x100000
+#define SPI_SLAVE_DEBUG_BUSY__WAVE_WC1_BUSY__SHIFT 0x14
+#define SPI_SLAVE_DEBUG_BUSY__EVENT_CNTL_BUSY_MASK 0x200000
+#define SPI_SLAVE_DEBUG_BUSY__EVENT_CNTL_BUSY__SHIFT 0x15
+#define SPI_SLAVE_DEBUG_BUSY__SAVE_CTX_BUSY_MASK 0x400000
+#define SPI_SLAVE_DEBUG_BUSY__SAVE_CTX_BUSY__SHIFT 0x16
+#define SPI_LB_CTR_CTRL__LOAD_MASK 0x1
+#define SPI_LB_CTR_CTRL__LOAD__SHIFT 0x0
+#define SPI_LB_CU_MASK__CU_MASK_MASK 0xffff
+#define SPI_LB_CU_MASK__CU_MASK__SHIFT 0x0
+#define SPI_LB_DATA_REG__CNT_DATA_MASK 0xffffffff
+#define SPI_LB_DATA_REG__CNT_DATA__SHIFT 0x0
+#define SPI_PG_ENABLE_STATIC_CU_MASK__CU_MASK_MASK 0xffff
+#define SPI_PG_ENABLE_STATIC_CU_MASK__CU_MASK__SHIFT 0x0
+#define SPI_GDS_CREDITS__DS_DATA_CREDITS_MASK 0xff
+#define SPI_GDS_CREDITS__DS_DATA_CREDITS__SHIFT 0x0
+#define SPI_GDS_CREDITS__DS_CMD_CREDITS_MASK 0xff00
+#define SPI_GDS_CREDITS__DS_CMD_CREDITS__SHIFT 0x8
+#define SPI_GDS_CREDITS__UNUSED_MASK 0xffff0000
+#define SPI_GDS_CREDITS__UNUSED__SHIFT 0x10
+#define SPI_SX_EXPORT_BUFFER_SIZES__COLOR_BUFFER_SIZE_MASK 0xffff
+#define SPI_SX_EXPORT_BUFFER_SIZES__COLOR_BUFFER_SIZE__SHIFT 0x0
+#define SPI_SX_EXPORT_BUFFER_SIZES__POSITION_BUFFER_SIZE_MASK 0xffff0000
+#define SPI_SX_EXPORT_BUFFER_SIZES__POSITION_BUFFER_SIZE__SHIFT 0x10
+#define SPI_SX_SCOREBOARD_BUFFER_SIZES__COLOR_SCOREBOARD_SIZE_MASK 0xffff
+#define SPI_SX_SCOREBOARD_BUFFER_SIZES__COLOR_SCOREBOARD_SIZE__SHIFT 0x0
+#define SPI_SX_SCOREBOARD_BUFFER_SIZES__POSITION_SCOREBOARD_SIZE_MASK 0xffff0000
+#define SPI_SX_SCOREBOARD_BUFFER_SIZES__POSITION_SCOREBOARD_SIZE__SHIFT 0x10
+#define SPI_CSQ_WF_ACTIVE_STATUS__ACTIVE_MASK 0xffffffff
+#define SPI_CSQ_WF_ACTIVE_STATUS__ACTIVE__SHIFT 0x0
+#define SPI_CSQ_WF_ACTIVE_COUNT_0__COUNT_MASK 0x7ff
+#define SPI_CSQ_WF_ACTIVE_COUNT_0__COUNT__SHIFT 0x0
+#define SPI_CSQ_WF_ACTIVE_COUNT_1__COUNT_MASK 0x7ff
+#define SPI_CSQ_WF_ACTIVE_COUNT_1__COUNT__SHIFT 0x0
+#define SPI_CSQ_WF_ACTIVE_COUNT_2__COUNT_MASK 0x7ff
+#define SPI_CSQ_WF_ACTIVE_COUNT_2__COUNT__SHIFT 0x0
+#define SPI_CSQ_WF_ACTIVE_COUNT_3__COUNT_MASK 0x7ff
+#define SPI_CSQ_WF_ACTIVE_COUNT_3__COUNT__SHIFT 0x0
+#define SPI_CSQ_WF_ACTIVE_COUNT_4__COUNT_MASK 0x7ff
+#define SPI_CSQ_WF_ACTIVE_COUNT_4__COUNT__SHIFT 0x0
+#define SPI_CSQ_WF_ACTIVE_COUNT_5__COUNT_MASK 0x7ff
+#define SPI_CSQ_WF_ACTIVE_COUNT_5__COUNT__SHIFT 0x0
+#define SPI_CSQ_WF_ACTIVE_COUNT_6__COUNT_MASK 0x7ff
+#define SPI_CSQ_WF_ACTIVE_COUNT_6__COUNT__SHIFT 0x0
+#define SPI_CSQ_WF_ACTIVE_COUNT_7__COUNT_MASK 0x7ff
+#define SPI_CSQ_WF_ACTIVE_COUNT_7__COUNT__SHIFT 0x0
+#define BCI_DEBUG_READ__DATA_MASK 0xffffff
+#define BCI_DEBUG_READ__DATA__SHIFT 0x0
+#define SPI_P0_TRAP_SCREEN_PSBA_LO__MEM_BASE_MASK 0xffffffff
+#define SPI_P0_TRAP_SCREEN_PSBA_LO__MEM_BASE__SHIFT 0x0
+#define SPI_P0_TRAP_SCREEN_PSBA_HI__MEM_BASE_MASK 0xff
+#define SPI_P0_TRAP_SCREEN_PSBA_HI__MEM_BASE__SHIFT 0x0
+#define SPI_P0_TRAP_SCREEN_PSMA_LO__MEM_BASE_MASK 0xffffffff
+#define SPI_P0_TRAP_SCREEN_PSMA_LO__MEM_BASE__SHIFT 0x0
+#define SPI_P0_TRAP_SCREEN_PSMA_HI__MEM_BASE_MASK 0xff
+#define SPI_P0_TRAP_SCREEN_PSMA_HI__MEM_BASE__SHIFT 0x0
+#define SPI_P0_TRAP_SCREEN_GPR_MIN__VGPR_MIN_MASK 0x3f
+#define SPI_P0_TRAP_SCREEN_GPR_MIN__VGPR_MIN__SHIFT 0x0
+#define SPI_P0_TRAP_SCREEN_GPR_MIN__SGPR_MIN_MASK 0x3c0
+#define SPI_P0_TRAP_SCREEN_GPR_MIN__SGPR_MIN__SHIFT 0x6
+#define SPI_P1_TRAP_SCREEN_PSBA_LO__MEM_BASE_MASK 0xffffffff
+#define SPI_P1_TRAP_SCREEN_PSBA_LO__MEM_BASE__SHIFT 0x0
+#define SPI_P1_TRAP_SCREEN_PSBA_HI__MEM_BASE_MASK 0xff
+#define SPI_P1_TRAP_SCREEN_PSBA_HI__MEM_BASE__SHIFT 0x0
+#define SPI_P1_TRAP_SCREEN_PSMA_LO__MEM_BASE_MASK 0xffffffff
+#define SPI_P1_TRAP_SCREEN_PSMA_LO__MEM_BASE__SHIFT 0x0
+#define SPI_P1_TRAP_SCREEN_PSMA_HI__MEM_BASE_MASK 0xff
+#define SPI_P1_TRAP_SCREEN_PSMA_HI__MEM_BASE__SHIFT 0x0
+#define SPI_P1_TRAP_SCREEN_GPR_MIN__VGPR_MIN_MASK 0x3f
+#define SPI_P1_TRAP_SCREEN_GPR_MIN__VGPR_MIN__SHIFT 0x0
+#define SPI_P1_TRAP_SCREEN_GPR_MIN__SGPR_MIN_MASK 0x3c0
+#define SPI_P1_TRAP_SCREEN_GPR_MIN__SGPR_MIN__SHIFT 0x6
+#define SPI_SHADER_TBA_LO_PS__MEM_BASE_MASK 0xffffffff
+#define SPI_SHADER_TBA_LO_PS__MEM_BASE__SHIFT 0x0
+#define SPI_SHADER_TBA_HI_PS__MEM_BASE_MASK 0xff
+#define SPI_SHADER_TBA_HI_PS__MEM_BASE__SHIFT 0x0
+#define SPI_SHADER_TMA_LO_PS__MEM_BASE_MASK 0xffffffff
+#define SPI_SHADER_TMA_LO_PS__MEM_BASE__SHIFT 0x0
+#define SPI_SHADER_TMA_HI_PS__MEM_BASE_MASK 0xff
+#define SPI_SHADER_TMA_HI_PS__MEM_BASE__SHIFT 0x0
+#define SPI_SHADER_PGM_LO_PS__MEM_BASE_MASK 0xffffffff
+#define SPI_SHADER_PGM_LO_PS__MEM_BASE__SHIFT 0x0
+#define SPI_SHADER_PGM_HI_PS__MEM_BASE_MASK 0xff
+#define SPI_SHADER_PGM_HI_PS__MEM_BASE__SHIFT 0x0
+#define SPI_SHADER_PGM_RSRC1_PS__VGPRS_MASK 0x3f
+#define SPI_SHADER_PGM_RSRC1_PS__VGPRS__SHIFT 0x0
+#define SPI_SHADER_PGM_RSRC1_PS__SGPRS_MASK 0x3c0
+#define SPI_SHADER_PGM_RSRC1_PS__SGPRS__SHIFT 0x6
+#define SPI_SHADER_PGM_RSRC1_PS__PRIORITY_MASK 0xc00
+#define SPI_SHADER_PGM_RSRC1_PS__PRIORITY__SHIFT 0xa
+#define SPI_SHADER_PGM_RSRC1_PS__FLOAT_MODE_MASK 0xff000
+#define SPI_SHADER_PGM_RSRC1_PS__FLOAT_MODE__SHIFT 0xc
+#define SPI_SHADER_PGM_RSRC1_PS__PRIV_MASK 0x100000
+#define SPI_SHADER_PGM_RSRC1_PS__PRIV__SHIFT 0x14
+#define SPI_SHADER_PGM_RSRC1_PS__DX10_CLAMP_MASK 0x200000
+#define SPI_SHADER_PGM_RSRC1_PS__DX10_CLAMP__SHIFT 0x15
+#define SPI_SHADER_PGM_RSRC1_PS__DEBUG_MODE_MASK 0x400000
+#define SPI_SHADER_PGM_RSRC1_PS__DEBUG_MODE__SHIFT 0x16
+#define SPI_SHADER_PGM_RSRC1_PS__IEEE_MODE_MASK 0x800000
+#define SPI_SHADER_PGM_RSRC1_PS__IEEE_MODE__SHIFT 0x17
+#define SPI_SHADER_PGM_RSRC1_PS__CU_GROUP_DISABLE_MASK 0x1000000
+#define SPI_SHADER_PGM_RSRC1_PS__CU_GROUP_DISABLE__SHIFT 0x18
+#define SPI_SHADER_PGM_RSRC1_PS__CACHE_CTL_MASK 0xe000000
+#define SPI_SHADER_PGM_RSRC1_PS__CACHE_CTL__SHIFT 0x19
+#define SPI_SHADER_PGM_RSRC1_PS__CDBG_USER_MASK 0x10000000
+#define SPI_SHADER_PGM_RSRC1_PS__CDBG_USER__SHIFT 0x1c
+#define SPI_SHADER_PGM_RSRC2_PS__SCRATCH_EN_MASK 0x1
+#define SPI_SHADER_PGM_RSRC2_PS__SCRATCH_EN__SHIFT 0x0
+#define SPI_SHADER_PGM_RSRC2_PS__USER_SGPR_MASK 0x3e
+#define SPI_SHADER_PGM_RSRC2_PS__USER_SGPR__SHIFT 0x1
+#define SPI_SHADER_PGM_RSRC2_PS__TRAP_PRESENT_MASK 0x40
+#define SPI_SHADER_PGM_RSRC2_PS__TRAP_PRESENT__SHIFT 0x6
+#define SPI_SHADER_PGM_RSRC2_PS__WAVE_CNT_EN_MASK 0x80
+#define SPI_SHADER_PGM_RSRC2_PS__WAVE_CNT_EN__SHIFT 0x7
+#define SPI_SHADER_PGM_RSRC2_PS__EXTRA_LDS_SIZE_MASK 0xff00
+#define SPI_SHADER_PGM_RSRC2_PS__EXTRA_LDS_SIZE__SHIFT 0x8
+#define SPI_SHADER_PGM_RSRC2_PS__EXCP_EN_MASK 0x1ff0000
+#define SPI_SHADER_PGM_RSRC2_PS__EXCP_EN__SHIFT 0x10
+#define SPI_SHADER_PGM_RSRC3_PS__CU_EN_MASK 0xffff
+#define SPI_SHADER_PGM_RSRC3_PS__CU_EN__SHIFT 0x0
+#define SPI_SHADER_PGM_RSRC3_PS__WAVE_LIMIT_MASK 0x3f0000
+#define SPI_SHADER_PGM_RSRC3_PS__WAVE_LIMIT__SHIFT 0x10
+#define SPI_SHADER_PGM_RSRC3_PS__LOCK_LOW_THRESHOLD_MASK 0x3c00000
+#define SPI_SHADER_PGM_RSRC3_PS__LOCK_LOW_THRESHOLD__SHIFT 0x16
+#define SPI_SHADER_USER_DATA_PS_0__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_0__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_PS_1__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_1__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_PS_2__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_2__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_PS_3__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_3__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_PS_4__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_4__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_PS_5__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_5__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_PS_6__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_6__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_PS_7__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_7__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_PS_8__DATA_MASK 0xffffffff
+#define SPI_SHADER_USER_DATA_PS_8__DATA__SHIFT 0x0
+#define SPI_SHADER_USER_DATA_P

@@ -1,321 +1,218 @@
-/*
- * DRV2665 haptics driver family
- *
- * Author: Dan Murphy <dmurphy@ti.com>
- *
- * Copyright: (C) 2015 Texas Instruments, Inc.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- */
+ IS_QME(ppd->dd) ? 0 : 1;
+	ibsd_wr_allchans(ppd, 13, (le_val << 5), (1 << 5));
 
-#include <linux/i2c.h>
-#include <linux/input.h>
-#include <linux/module.h>
-#include <linux/regmap.h>
-#include <linux/slab.h>
-#include <linux/delay.h>
-#include <linux/regulator/consumer.h>
+	/* Clear cmode-override, may be set from older driver */
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 10, 0 << 14, 1 << 14);
 
-/* Contol registers */
-#define DRV2665_STATUS	0x00
-#define DRV2665_CTRL_1	0x01
-#define DRV2665_CTRL_2	0x02
-#define DRV2665_FIFO	0x0b
+	/* Timing Recovery: rxtapsel addr 5 bits [9:8] = 0 */
+	ibsd_wr_allchans(ppd, 5, (0 << 8), BMASK(9, 8));
 
-/* Status Register */
-#define DRV2665_FIFO_FULL		BIT(0)
-#define DRV2665_FIFO_EMPTY		BIT(1)
+	/* setup LoS params; these are subsystem, so chan == 5 */
+	/* LoS filter threshold_count on, ch 0-3, set to 8 */
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 5, 8 << 11, BMASK(14, 11));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 7, 8 << 4, BMASK(7, 4));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 8, 8 << 11, BMASK(14, 11));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 10, 8 << 4, BMASK(7, 4));
 
-/* Control 1 Register */
-#define DRV2665_25_VPP_GAIN		0x00
-#define DRV2665_50_VPP_GAIN		0x01
-#define DRV2665_75_VPP_GAIN		0x02
-#define DRV2665_100_VPP_GAIN		0x03
-#define DRV2665_DIGITAL_IN		0xfc
-#define DRV2665_ANALOG_IN		BIT(2)
+	/* LoS filter threshold_count off, ch 0-3, set to 4 */
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 6, 4 << 0, BMASK(3, 0));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 7, 4 << 8, BMASK(11, 8));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 9, 4 << 0, BMASK(3, 0));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 10, 4 << 8, BMASK(11, 8));
 
-/* Control 2 Register */
-#define DRV2665_BOOST_EN		BIT(1)
-#define DRV2665_STANDBY			BIT(6)
-#define DRV2665_DEV_RST			BIT(7)
-#define DRV2665_5_MS_IDLE_TOUT		0x00
-#define DRV2665_10_MS_IDLE_TOUT		0x04
-#define DRV2665_15_MS_IDLE_TOUT		0x08
-#define DRV2665_20_MS_IDLE_TOUT		0x0c
+	/* LoS filter select enabled */
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 9, 1 << 15, 1 << 15);
 
-/**
- * struct drv2665_data -
- * @input_dev - Pointer to the input device
- * @client - Pointer to the I2C client
- * @regmap - Register map of the device
- * @work - Work item used to off load the enable/disable of the vibration
- * @regulator - Pointer to the regulator for the IC
- */
-struct drv2665_data {
-	struct input_dev *input_dev;
-	struct i2c_client *client;
-	struct regmap *regmap;
-	struct work_struct work;
-	struct regulator *regulator;
-};
+	/* LoS target data:  SDR=4, DDR=2, QDR=1 */
+	ibsd_wr_allchans(ppd, 14, (1 << 3), BMASK(5, 3)); /* QDR */
+	ibsd_wr_allchans(ppd, 20, (2 << 10), BMASK(12, 10)); /* DDR */
+	ibsd_wr_allchans(ppd, 20, (4 << 13), BMASK(15, 13)); /* SDR */
 
-/* 8kHz Sine wave to stream to the FIFO */
-static const u8 drv2665_sine_wave_form[] = {
-	0x00, 0x10, 0x20, 0x2e, 0x3c, 0x48, 0x53, 0x5b, 0x61, 0x65, 0x66,
-	0x65, 0x61, 0x5b, 0x53, 0x48, 0x3c, 0x2e, 0x20, 0x10,
-	0x00, 0xf0, 0xe0, 0xd2, 0xc4, 0xb8, 0xad, 0xa5, 0x9f, 0x9b, 0x9a,
-	0x9b, 0x9f, 0xa5, 0xad, 0xb8, 0xc4, 0xd2, 0xe0, 0xf0, 0x00,
-};
+	serdes_7322_los_enable(ppd, 1);
 
-static const struct reg_default drv2665_reg_defs[] = {
-	{ DRV2665_STATUS, 0x02 },
-	{ DRV2665_CTRL_1, 0x28 },
-	{ DRV2665_CTRL_2, 0x40 },
-	{ DRV2665_FIFO, 0x00 },
-};
+	/* rxbistena; set 0 to avoid effects of it switch later */
+	ibsd_wr_allchans(ppd, 9, 0 << 15, 1 << 15);
 
-static void drv2665_worker(struct work_struct *work)
-{
-	struct drv2665_data *haptics =
-				container_of(work, struct drv2665_data, work);
-	unsigned int read_buf;
-	int error;
+	/* Configure 4 DFE taps, and only they adapt */
+	ibsd_wr_allchans(ppd, 16, 0 << 0, BMASK(1, 0));
 
-	error = regmap_read(haptics->regmap, DRV2665_STATUS, &read_buf);
-	if (error) {
-		dev_err(&haptics->client->dev,
-			"Failed to read status: %d\n", error);
-		return;
+	/* gain hi stop 32 (22) (6:1) lo stop 7 (10:7) target 22 (13) (15:11) */
+	le_val = (ppd->dd->cspec->r1 || IS_QME(ppd->dd)) ? 0xb6c0 : 0x6bac;
+	ibsd_wr_allchans(ppd, 21, le_val, 0xfffe);
+
+	/*
+	 * Set receive adaptation mode.  SDR and DDR adaptation are
+	 * always on, and QDR is initially enabled; later disabled.
+	 */
+	qib_write_kreg_port(ppd, krp_static_adapt_dis(0), 0ULL);
+	qib_write_kreg_port(ppd, krp_static_adapt_dis(1), 0ULL);
+	qib_write_kreg_port(ppd, krp_static_adapt_dis(2),
+			    ppd->dd->cspec->r1 ?
+			    QDR_STATIC_ADAPT_DOWN_R1 : QDR_STATIC_ADAPT_DOWN);
+	ppd->cpspec->qdr_dfe_on = 1;
+
+	/* FLoop LOS gate: PPM filter  enabled */
+	ibsd_wr_allchans(ppd, 38, 0 << 10, 1 << 10);
+
+	/* rx offset center enabled */
+	ibsd_wr_allchans(ppd, 12, 1 << 4, 1 << 4);
+
+	if (!ppd->dd->cspec->r1) {
+		ibsd_wr_allchans(ppd, 12, 1 << 12, 1 << 12);
+		ibsd_wr_allchans(ppd, 12, 2 << 8, 0x0f << 8);
 	}
 
-	if (read_buf & DRV2665_FIFO_EMPTY) {
-		error = regmap_bulk_write(haptics->regmap,
-					  DRV2665_FIFO,
-					  drv2665_sine_wave_form,
-					  ARRAY_SIZE(drv2665_sine_wave_form));
-		if (error) {
-			dev_err(&haptics->client->dev,
-				"Failed to write FIFO: %d\n", error);
-			return;
-		}
-	}
-}
-
-static int drv2665_haptics_play(struct input_dev *input, void *data,
-				struct ff_effect *effect)
-{
-	struct drv2665_data *haptics = input_get_drvdata(input);
-
-	schedule_work(&haptics->work);
+	/* Set the frequency loop bandwidth to 15 */
+	ibsd_wr_allchans(ppd, 2, 15 << 5, BMASK(8, 5));
 
 	return 0;
 }
 
-static void drv2665_close(struct input_dev *input)
+static int serdes_7322_init_new(struct qib_pportdata *ppd)
 {
-	struct drv2665_data *haptics = input_get_drvdata(input);
-	int error;
+	unsigned long tend;
+	u32 le_val, rxcaldone;
+	int chan, chan_done = (1 << SERDES_CHANS) - 1;
 
-	cancel_work_sync(&haptics->work);
+	/* Clear cmode-override, may be set from older driver */
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 10, 0 << 14, 1 << 14);
 
-	error = regmap_update_bits(haptics->regmap,
-				   DRV2665_CTRL_2, DRV2665_STANDBY, 1);
-	if (error)
-		dev_err(&haptics->client->dev,
-			"Failed to enter standby mode: %d\n", error);
-}
+	/* ensure no tx overrides from earlier driver loads */
+	qib_write_kreg_port(ppd, krp_tx_deemph_override,
+		SYM_MASK(IBSD_TX_DEEMPHASIS_OVERRIDE_0,
+		reset_tx_deemphasis_override));
 
-static const struct reg_sequence drv2665_init_regs[] = {
-	{ DRV2665_CTRL_2, 0 | DRV2665_10_MS_IDLE_TOUT },
-	{ DRV2665_CTRL_1, DRV2665_25_VPP_GAIN },
-};
-
-static int drv2665_init(struct drv2665_data *haptics)
-{
-	int error;
-
-	error = regmap_register_patch(haptics->regmap,
-				      drv2665_init_regs,
-				      ARRAY_SIZE(drv2665_init_regs));
-	if (error) {
-		dev_err(&haptics->client->dev,
-			"Failed to write init registers: %d\n",
-			error);
-		return error;
+	/* START OF LSI SUGGESTED SERDES BRINGUP */
+	/* Reset - Calibration Setup */
+	/*       Stop DFE adaptaion */
+	ibsd_wr_allchans(ppd, 1, 0, BMASK(9, 1));
+	/*       Disable LE1 */
+	ibsd_wr_allchans(ppd, 13, 0, BMASK(5, 5));
+	/*       Disable autoadapt for LE1 */
+	ibsd_wr_allchans(ppd, 1, 0, BMASK(15, 15));
+	/*       Disable LE2 */
+	ibsd_wr_allchans(ppd, 13, 0, BMASK(6, 6));
+	/*       Disable VGA */
+	ibsd_wr_allchans(ppd, 5, 0, BMASK(0, 0));
+	/*       Disable AFE Offset Cancel */
+	ibsd_wr_allchans(ppd, 12, 0, BMASK(12, 12));
+	/*       Disable Timing Loop */
+	ibsd_wr_allchans(ppd, 2, 0, BMASK(3, 3));
+	/*       Disable Frequency Loop */
+	ibsd_wr_allchans(ppd, 2, 0, BMASK(4, 4));
+	/*       Disable Baseline Wander Correction */
+	ibsd_wr_allchans(ppd, 13, 0, BMASK(13, 13));
+	/*       Disable RX Calibration */
+	ibsd_wr_allchans(ppd, 4, 0, BMASK(10, 10));
+	/*       Disable RX Offset Calibration */
+	ibsd_wr_allchans(ppd, 12, 0, BMASK(4, 4));
+	/*       Select BB CDR */
+	ibsd_wr_allchans(ppd, 2, (1 << 15), BMASK(15, 15));
+	/*       CDR Step Size */
+	ibsd_wr_allchans(ppd, 5, 0, BMASK(9, 8));
+	/*       Enable phase Calibration */
+	ibsd_wr_allchans(ppd, 12, (1 << 5), BMASK(5, 5));
+	/*       DFE Bandwidth [2:14-12] */
+	ibsd_wr_allchans(ppd, 2, (4 << 12), BMASK(14, 12));
+	/*       DFE Config (4 taps only) */
+	ibsd_wr_allchans(ppd, 16, 0, BMASK(1, 0));
+	/*       Gain Loop Bandwidth */
+	if (!ppd->dd->cspec->r1) {
+		ibsd_wr_allchans(ppd, 12, 1 << 12, BMASK(12, 12));
+		ibsd_wr_allchans(ppd, 12, 2 << 8, BMASK(11, 8));
+	} else {
+		ibsd_wr_allchans(ppd, 19, (3 << 11), BMASK(13, 11));
 	}
+	/*       Baseline Wander Correction Gain [13:4-0] (leave as default) */
+	/*       Baseline Wander Correction Gain [3:7-5] (leave as default) */
+	/*       Data Rate Select [5:7-6] (leave as default) */
+	/*       RX Parallel Word Width [3:10-8] (leave as default) */
 
-	return 0;
-}
+	/* RX REST */
+	/*       Single- or Multi-channel reset */
+	/*       RX Analog reset */
+	/*       RX Digital reset */
+	ibsd_wr_allchans(ppd, 0, 0, BMASK(15, 13));
+	msleep(20);
+	/*       RX Analog reset */
+	ibsd_wr_allchans(ppd, 0, (1 << 14), BMASK(14, 14));
+	msleep(20);
+	/*       RX Digital reset */
+	ibsd_wr_allchans(ppd, 0, (1 << 13), BMASK(13, 13));
+	msleep(20);
 
-static const struct regmap_config drv2665_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 8,
+	/* setup LoS params; these are subsystem, so chan == 5 */
+	/* LoS filter threshold_count on, ch 0-3, set to 8 */
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 5, 8 << 11, BMASK(14, 11));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 7, 8 << 4, BMASK(7, 4));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 8, 8 << 11, BMASK(14, 11));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 10, 8 << 4, BMASK(7, 4));
 
-	.max_register = DRV2665_FIFO,
-	.reg_defaults = drv2665_reg_defs,
-	.num_reg_defaults = ARRAY_SIZE(drv2665_reg_defs),
-	.cache_type = REGCACHE_NONE,
-};
+	/* LoS filter threshold_count off, ch 0-3, set to 4 */
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 6, 4 << 0, BMASK(3, 0));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 7, 4 << 8, BMASK(11, 8));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 9, 4 << 0, BMASK(3, 0));
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 10, 4 << 8, BMASK(11, 8));
 
-static int drv2665_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
-{
-	struct drv2665_data *haptics;
-	int error;
+	/* LoS filter select enabled */
+	ahb_mod(ppd->dd, IBSD(ppd->hw_pidx), 5, 9, 1 << 15, 1 << 15);
 
-	haptics = devm_kzalloc(&client->dev, sizeof(*haptics), GFP_KERNEL);
-	if (!haptics)
-		return -ENOMEM;
+	/* LoS target data:  SDR=4, DDR=2, QDR=1 */
+	ibsd_wr_allchans(ppd, 14, (1 << 3), BMASK(5, 3)); /* QDR */
+	ibsd_wr_allchans(ppd, 20, (2 << 10), BMASK(12, 10)); /* DDR */
+	ibsd_wr_allchans(ppd, 20, (4 << 13), BMASK(15, 13)); /* SDR */
 
-	haptics->regulator = devm_regulator_get(&client->dev, "vbat");
-	if (IS_ERR(haptics->regulator)) {
-		error = PTR_ERR(haptics->regulator);
-		dev_err(&client->dev,
-			"unable to get regulator, error: %d\n", error);
-		return error;
-	}
+	/* Turn on LOS on initial SERDES init */
+	serdes_7322_los_enable(ppd, 1);
+	/* FLoop LOS gate: PPM filter  enabled */
+	ibsd_wr_allchans(ppd, 38, 0 << 10, 1 << 10);
 
-	haptics->input_dev = devm_input_allocate_device(&client->dev);
-	if (!haptics->input_dev) {
-		dev_err(&client->dev, "Failed to allocate input device\n");
-		return -ENOMEM;
-	}
-
-	haptics->input_dev->name = "drv2665:haptics";
-	haptics->input_dev->dev.parent = client->dev.parent;
-	haptics->input_dev->close = drv2665_close;
-	input_set_drvdata(haptics->input_dev, haptics);
-	input_set_capability(haptics->input_dev, EV_FF, FF_RUMBLE);
-
-	error = input_ff_create_memless(haptics->input_dev, NULL,
-					drv2665_haptics_play);
-	if (error) {
-		dev_err(&client->dev, "input_ff_create() failed: %d\n",
-			error);
-		return error;
-	}
-
-	INIT_WORK(&haptics->work, drv2665_worker);
-
-	haptics->client = client;
-	i2c_set_clientdata(client, haptics);
-
-	haptics->regmap = devm_regmap_init_i2c(client, &drv2665_regmap_config);
-	if (IS_ERR(haptics->regmap)) {
-		error = PTR_ERR(haptics->regmap);
-		dev_err(&client->dev, "Failed to allocate register map: %d\n",
-			error);
-		return error;
-	}
-
-	error = drv2665_init(haptics);
-	if (error) {
-		dev_err(&client->dev, "Device init failed: %d\n", error);
-		return error;
-	}
-
-	error = input_register_device(haptics->input_dev);
-	if (error) {
-		dev_err(&client->dev, "couldn't register input device: %d\n",
-			error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int __maybe_unused drv2665_suspend(struct device *dev)
-{
-	struct drv2665_data *haptics = dev_get_drvdata(dev);
-	int ret = 0;
-
-	mutex_lock(&haptics->input_dev->mutex);
-
-	if (haptics->input_dev->users) {
-		ret = regmap_update_bits(haptics->regmap, DRV2665_CTRL_2,
-				DRV2665_STANDBY, 1);
-		if (ret) {
-			dev_err(dev, "Failed to set standby mode\n");
-			regulator_disable(haptics->regulator);
-			goto out;
-		}
-
-		ret = regulator_disable(haptics->regulator);
-		if (ret) {
-			dev_err(dev, "Failed to disable regulator\n");
-			regmap_update_bits(haptics->regmap,
-					   DRV2665_CTRL_2,
-					   DRV2665_STANDBY, 0);
+	/* RX LATCH CALIBRATION */
+	/*       Enable Eyefinder Phase Calibration latch */
+	ibsd_wr_allchans(ppd, 15, 1, BMASK(0, 0));
+	/*       Enable RX Offset Calibration latch */
+	ibsd_wr_allchans(ppd, 12, (1 << 4), BMASK(4, 4));
+	msleep(20);
+	/*       Start Calibration */
+	ibsd_wr_allchans(ppd, 4, (1 << 10), BMASK(10, 10));
+	tend = jiffies + msecs_to_jiffies(500);
+	while (chan_done && !time_is_before_jiffies(tend)) {
+		msleep(20);
+		for (chan = 0; chan < SERDES_CHANS; ++chan) {
+			rxcaldone = ahb_mod(ppd->dd, IBSD(ppd->hw_pidx),
+					    (chan + (chan >> 1)),
+					    25, 0, 0);
+			if ((~rxcaldone & (u32)BMASK(9, 9)) == 0 &&
+			    (~chan_done & (1 << chan)) == 0)
+				chan_done &= ~(1 << chan);
 		}
 	}
-out:
-	mutex_unlock(&haptics->input_dev->mutex);
-	return ret;
-}
-
-static int __maybe_unused drv2665_resume(struct device *dev)
-{
-	struct drv2665_data *haptics = dev_get_drvdata(dev);
-	int ret = 0;
-
-	mutex_lock(&haptics->input_dev->mutex);
-
-	if (haptics->input_dev->users) {
-		ret = regulator_enable(haptics->regulator);
-		if (ret) {
-			dev_err(dev, "Failed to enable regulator\n");
-			goto out;
+	if (chan_done) {
+		pr_info("Serdes %d calibration not done after .5 sec: 0x%x\n",
+			 IBSD(ppd->hw_pidx), chan_done);
+	} else {
+		for (chan = 0; chan < SERDES_CHANS; ++chan) {
+			rxcaldone = ahb_mod(ppd->dd, IBSD(ppd->hw_pidx),
+					    (chan + (chan >> 1)),
+					    25, 0, 0);
+			if ((~rxcaldone & (u32)BMASK(10, 10)) == 0)
+				pr_info("Serdes %d chan %d calibration failed\n",
+					IBSD(ppd->hw_pidx), chan);
 		}
-
-		ret = regmap_update_bits(haptics->regmap, DRV2665_CTRL_2,
-					 DRV2665_STANDBY, 0);
-		if (ret) {
-			dev_err(dev, "Failed to unset standby mode\n");
-			regulator_disable(haptics->regulator);
-			goto out;
-		}
-
 	}
 
-out:
-	mutex_unlock(&haptics->input_dev->mutex);
-	return ret;
-}
+	/*       Turn off Calibration */
+	ibsd_wr_allchans(ppd, 4, 0, BMASK(10, 10));
+	msleep(20);
 
-static SIMPLE_DEV_PM_OPS(drv2665_pm_ops, drv2665_suspend, drv2665_resume);
-
-static const struct i2c_device_id drv2665_id[] = {
-	{ "drv2665", 0 },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, drv2665_id);
-
-#ifdef CONFIG_OF
-static const struct of_device_id drv2665_of_match[] = {
-	{ .compatible = "ti,drv2665", },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, drv2665_of_match);
-#endif
-
-static struct i2c_driver drv2665_driver = {
-	.probe		= drv2665_probe,
-	.driver		= {
-		.name	= "drv2665-haptics",
-		.of_match_table = of_match_ptr(drv2665_of_match),
-		.pm	= &drv2665_pm_ops,
-	},
-	.id_table = drv2665_id,
-};
-module_i2c_driver(drv2665_driver);
-
-MODULE_DESCRIPTION("TI DRV2665 haptics driver");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Dan Murphy <dmurphy@ti.com>");
+	/* BRING RX UP */
+	/*       Set LE2 value (May be overridden in qsfp_7322_event) */
+	le_val = IS_QME(ppd->dd) ? LE2_QME : LE2_DEFAULT;
+	ibsd_wr_allchans(ppd, 13, (le_val << 7), BMASK(9, 7));
+	/*       Set LE2 Loop bandwidth */
+	ibsd_wr_allchans(ppd, 3, (7 << 5), BMASK(7, 5));
+	/*       Enable LE2 */
+	ibsd_wr_allchans(ppd, 13, (1 << 6), BMASK(6, 6));
+	msleep(20);
+	/*       Enable H0 only */
+	ibsd_wr_allchans(ppd, 1, 1

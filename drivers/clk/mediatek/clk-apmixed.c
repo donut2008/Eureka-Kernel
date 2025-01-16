@@ -1,107 +1,37 @@
-/*
- * Copyright (c) 2015 MediaTek Inc.
- * Author: James Liao <jamesjj.liao@mediatek.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/delay.h>
-#include <linux/of_address.h>
-#include <linux/slab.h>
-
-#include "clk-mtk.h"
-
-#define REF2USB_TX_EN		BIT(0)
-#define REF2USB_TX_LPF_EN	BIT(1)
-#define REF2USB_TX_OUT_EN	BIT(2)
-#define REF2USB_EN_MASK		(REF2USB_TX_EN | REF2USB_TX_LPF_EN | \
-				 REF2USB_TX_OUT_EN)
-
-struct mtk_ref2usb_tx {
-	struct clk_hw	hw;
-	void __iomem	*base_addr;
-};
-
-static inline struct mtk_ref2usb_tx *to_mtk_ref2usb_tx(struct clk_hw *hw)
-{
-	return container_of(hw, struct mtk_ref2usb_tx, hw);
-}
-
-static int mtk_ref2usb_tx_is_prepared(struct clk_hw *hw)
-{
-	struct mtk_ref2usb_tx *tx = to_mtk_ref2usb_tx(hw);
-
-	return (readl(tx->base_addr) & REF2USB_EN_MASK) == REF2USB_EN_MASK;
-}
-
-static int mtk_ref2usb_tx_prepare(struct clk_hw *hw)
-{
-	struct mtk_ref2usb_tx *tx = to_mtk_ref2usb_tx(hw);
-	u32 val;
-
-	val = readl(tx->base_addr);
-
-	val |= REF2USB_TX_EN;
-	writel(val, tx->base_addr);
-	udelay(100);
-
-	val |= REF2USB_TX_LPF_EN;
-	writel(val, tx->base_addr);
-
-	val |= REF2USB_TX_OUT_EN;
-	writel(val, tx->base_addr);
-
-	return 0;
-}
-
-static void mtk_ref2usb_tx_unprepare(struct clk_hw *hw)
-{
-	struct mtk_ref2usb_tx *tx = to_mtk_ref2usb_tx(hw);
-	u32 val;
-
-	val = readl(tx->base_addr);
-	val &= ~REF2USB_EN_MASK;
-	writel(val, tx->base_addr);
-}
-
-static const struct clk_ops mtk_ref2usb_tx_ops = {
-	.is_prepared	= mtk_ref2usb_tx_is_prepared,
-	.prepare	= mtk_ref2usb_tx_prepare,
-	.unprepare	= mtk_ref2usb_tx_unprepare,
-};
-
-struct clk * __init mtk_clk_register_ref2usb_tx(const char *name,
-			const char *parent_name, void __iomem *reg)
-{
-	struct mtk_ref2usb_tx *tx;
-	struct clk_init_data init = {};
-	struct clk *clk;
-
-	tx = kzalloc(sizeof(*tx), GFP_KERNEL);
-	if (!tx)
-		return ERR_PTR(-ENOMEM);
-
-	tx->base_addr = reg;
-	tx->hw.init = &init;
-
-	init.name = name;
-	init.ops = &mtk_ref2usb_tx_ops;
-	init.parent_names = &parent_name;
-	init.num_parents = 1;
-
-	clk = clk_register(NULL, &tx->hw);
-
-	if (IS_ERR(clk)) {
-		pr_err("Failed to register clk %s: %ld\n", name, PTR_ERR(clk));
-		kfree(tx);
-	}
-
-	return clk;
-}
+_DELAY_LINKA__SHIFT 0x14
+#define UNIPHY_IMPCAL_LINKA__UNIPHY_IMPCAL_OVERRIDE_LINKA_MASK 0xf000000
+#define UNIPHY_IMPCAL_LINKA__UNIPHY_IMPCAL_OVERRIDE_LINKA__SHIFT 0x18
+#define UNIPHY_IMPCAL_LINKA__UNIPHY_IMPCAL_OVERRIDE_ENABLE_LINKA_MASK 0x10000000
+#define UNIPHY_IMPCAL_LINKA__UNIPHY_IMPCAL_OVERRIDE_ENABLE_LINKA__SHIFT 0x1c
+#define UNIPHY_IMPCAL_LINKA__UNIPHY_IMPCAL_SEL_LINKA_MASK 0x40000000
+#define UNIPHY_IMPCAL_LINKA__UNIPHY_IMPCAL_SEL_LINKA__SHIFT 0x1e
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_ENABLE_LINKB_MASK 0x1
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_ENABLE_LINKB__SHIFT 0x0
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_CALOUT_LINKB_MASK 0x100
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_CALOUT_LINKB__SHIFT 0x8
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_CALOUT_ERROR_LINKB_MASK 0x200
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_CALOUT_ERROR_LINKB__SHIFT 0x9
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_CALOUT_ERROR_LINKB_AK_MASK 0x400
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_CALOUT_ERROR_LINKB_AK__SHIFT 0xa
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_VALUE_LINKB_MASK 0xf0000
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_VALUE_LINKB__SHIFT 0x10
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_STEP_DELAY_LINKB_MASK 0xf00000
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_STEP_DELAY_LINKB__SHIFT 0x14
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_OVERRIDE_LINKB_MASK 0xf000000
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_OVERRIDE_LINKB__SHIFT 0x18
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_OVERRIDE_ENABLE_LINKB_MASK 0x10000000
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_OVERRIDE_ENABLE_LINKB__SHIFT 0x1c
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_SEL_LINKB_MASK 0x40000000
+#define UNIPHY_IMPCAL_LINKB__UNIPHY_IMPCAL_SEL_LINKB__SHIFT 0x1e
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_IMPCAL_ENABLE_LINKC_MASK 0x1
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_IMPCAL_ENABLE_LINKC__SHIFT 0x0
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_IMPCAL_CALOUT_LINKC_MASK 0x100
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_IMPCAL_CALOUT_LINKC__SHIFT 0x8
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_CALOUT_ERROR_LINKC_MASK 0x200
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_CALOUT_ERROR_LINKC__SHIFT 0x9
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_CALOUT_ERROR_LINKC_AK_MASK 0x400
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_CALOUT_ERROR_LINKC_AK__SHIFT 0xa
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_IMPCAL_VALUE_LINKC_MASK 0xf0000
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_IMPCAL_VALUE_LINKC__SHIFT 0x10
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_IMPCAL_STEP_DELAY_LINKC_MASK 0xf00000
+#define UNIPHY_IMPCAL_LINKC__UNIPHY_IMPCAL_STEP_DELAY_LINKC__S

@@ -1,1100 +1,369 @@
-/*
- * WUSB Wire Adapter: Control/Data Streaming Interface (WUSB[8])
- * Device Connect handling
- *
- * Copyright (C) 2006 Intel Corporation
- * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
- *
- * FIXME: docs
- * FIXME: this file needs to be broken up, it's grown too big
- *
- *
- * WUSB1.0[7.1, 7.5.1, ]
- *
- * WUSB device connection is kind of messy. Some background:
- *
- *     When a device wants to connect it scans the UWB radio channels
- *     looking for a WUSB Channel; a WUSB channel is defined by MMCs
- *     (Micro Managed Commands or something like that) [see
- *     Design-overview for more on this] .
- *
- * So, device scans the radio, finds MMCs and thus a host and checks
- * when the next DNTS is. It sends a Device Notification Connect
- * (DN_Connect); the host picks it up (through nep.c and notif.c, ends
- * up in wusb_devconnect_ack(), which creates a wusb_dev structure in
- * wusbhc->port[port_number].wusb_dev), assigns an unauth address
- * to the device (this means from 0x80 to 0xfe) and sends, in the MMC
- * a Connect Ack Information Element (ConnAck IE).
- *
- * So now the device now has a WUSB address. From now on, we use
- * that to talk to it in the RPipes.
- *
- * ASSUMPTIONS:
- *
- *  - We use the the as device address the port number where it is
- *    connected (port 0 doesn't exist). For unauth, it is 128 + that.
- *
- * ROADMAP:
- *
- *   This file contains the logic for doing that--entry points:
- *
- *   wusb_devconnect_ack()      Ack a device until _acked() called.
- *                              Called by notif.c:wusb_handle_dn_connect()
- *                              when a DN_Connect is received.
- *
- *     wusb_devconnect_acked()  Ack done, release resources.
- *
- *   wusb_handle_dn_alive()     Called by notif.c:wusb_handle_dn()
- *                              for processing a DN_Alive pong from a device.
- *
- *   wusb_handle_dn_disconnect()Called by notif.c:wusb_handle_dn() to
- *                              process a disconenct request from a
- *                              device.
- *
- *   __wusb_dev_disable()       Called by rh.c:wusbhc_rh_clear_port_feat() when
- *                              disabling a port.
- *
- *   wusb_devconnect_create()   Called when creating the host by
- *                              lc.c:wusbhc_create().
- *
- *   wusb_devconnect_destroy()  Cleanup called removing the host. Called
- *                              by lc.c:wusbhc_destroy().
- *
- *   Each Wireless USB host maintains a list of DN_Connect requests
- *   (actually we maintain a list of pending Connect Acks, the
- *   wusbhc->ca_list).
- *
- * LIFE CYCLE OF port->wusb_dev
- *
- *   Before the @wusbhc structure put()s the reference it owns for
- *   port->wusb_dev [and clean the wusb_dev pointer], it needs to
- *   lock @wusbhc->mutex.
- */
-
-#include <linux/jiffies.h>
-#include <linux/ctype.h>
-#include <linux/slab.h>
-#include <linux/workqueue.h>
-#include <linux/export.h>
-#include "wusbhc.h"
-
-static void wusbhc_devconnect_acked_work(struct work_struct *work);
-
-static void wusb_dev_free(struct wusb_dev *wusb_dev)
-{
-	kfree(wusb_dev);
-}
-
-static struct wusb_dev *wusb_dev_alloc(struct wusbhc *wusbhc)
-{
-	struct wusb_dev *wusb_dev;
-
-	wusb_dev = kzalloc(sizeof(*wusb_dev), GFP_KERNEL);
-	if (wusb_dev == NULL)
-		goto err;
-
-	wusb_dev->wusbhc = wusbhc;
-
-	INIT_WORK(&wusb_dev->devconnect_acked_work, wusbhc_devconnect_acked_work);
-
-	return wusb_dev;
-err:
-	wusb_dev_free(wusb_dev);
-	return NULL;
-}
-
-
-/*
- * Using the Connect-Ack list, fill out the @wusbhc Connect-Ack WUSB IE
- * properly so that it can be added to the MMC.
- *
- * We just get the @wusbhc->ca_list and fill out the first four ones or
- * less (per-spec WUSB1.0[7.5, before T7-38). If the ConnectAck WUSB
- * IE is not allocated, we alloc it.
- *
- * @wusbhc->mutex must be taken
- */
-static void wusbhc_fill_cack_ie(struct wusbhc *wusbhc)
-{
-	unsigned cnt;
-	struct wusb_dev *dev_itr;
-	struct wuie_connect_ack *cack_ie;
-
-	cack_ie = &wusbhc->cack_ie;
-	cnt = 0;
-	list_for_each_entry(dev_itr, &wusbhc->cack_list, cack_node) {
-		cack_ie->blk[cnt].CDID = dev_itr->cdid;
-		cack_ie->blk[cnt].bDeviceAddress = dev_itr->addr;
-		if (++cnt >= WUIE_ELT_MAX)
-			break;
-	}
-	cack_ie->hdr.bLength = sizeof(cack_ie->hdr)
-		+ cnt * sizeof(cack_ie->blk[0]);
-}
-
-/*
- * Register a new device that wants to connect
- *
- * A new device wants to connect, so we add it to the Connect-Ack
- * list. We give it an address in the unauthorized range (bit 8 set);
- * user space will have to drive authorization further on.
- *
- * @dev_addr: address to use for the device (which is also the port
- *            number).
- *
- * @wusbhc->mutex must be taken
- */
-static struct wusb_dev *wusbhc_cack_add(struct wusbhc *wusbhc,
-					struct wusb_dn_connect *dnc,
-					const char *pr_cdid, u8 port_idx)
-{
-	struct device *dev = wusbhc->dev;
-	struct wusb_dev *wusb_dev;
-	int new_connection = wusb_dn_connect_new_connection(dnc);
-	u8 dev_addr;
-	int result;
-
-	/* Is it registered already? */
-	list_for_each_entry(wusb_dev, &wusbhc->cack_list, cack_node)
-		if (!memcmp(&wusb_dev->cdid, &dnc->CDID,
-			    sizeof(wusb_dev->cdid)))
-			return wusb_dev;
-	/* We don't have it, create an entry, register it */
-	wusb_dev = wusb_dev_alloc(wusbhc);
-	if (wusb_dev == NULL)
-		return NULL;
-	wusb_dev_init(wusb_dev);
-	wusb_dev->cdid = dnc->CDID;
-	wusb_dev->port_idx = port_idx;
-
-	/*
-	 * Devices are always available within the cluster reservation
-	 * and since the hardware will take the intersection of the
-	 * per-device availability and the cluster reservation, the
-	 * per-device availability can simply be set to always
-	 * available.
-	 */
-	bitmap_fill(wusb_dev->availability.bm, UWB_NUM_MAS);
-
-	/* FIXME: handle reconnects instead of assuming connects are
-	   always new. */
-	if (1 && new_connection == 0)
-		new_connection = 1;
-	if (new_connection) {
-		dev_addr = (port_idx + 2) | WUSB_DEV_ADDR_UNAUTH;
-
-		dev_info(dev, "Connecting new WUSB device to address %u, "
-			"port %u\n", dev_addr, port_idx);
-
-		result = wusb_set_dev_addr(wusbhc, wusb_dev, dev_addr);
-		if (result < 0)
-			return NULL;
-	}
-	wusb_dev->entry_ts = jiffies;
-	list_add_tail(&wusb_dev->cack_node, &wusbhc->cack_list);
-	wusbhc->cack_count++;
-	wusbhc_fill_cack_ie(wusbhc);
-
-	return wusb_dev;
-}
-
-/*
- * Remove a Connect-Ack context entry from the HCs view
- *
- * @wusbhc->mutex must be taken
- */
-static void wusbhc_cack_rm(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev)
-{
-	list_del_init(&wusb_dev->cack_node);
-	wusbhc->cack_count--;
-	wusbhc_fill_cack_ie(wusbhc);
-}
-
-/*
- * @wusbhc->mutex must be taken */
-static
-void wusbhc_devconnect_acked(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev)
-{
-	wusbhc_cack_rm(wusbhc, wusb_dev);
-	if (wusbhc->cack_count)
-		wusbhc_mmcie_set(wusbhc, 0, 0, &wusbhc->cack_ie.hdr);
-	else
-		wusbhc_mmcie_rm(wusbhc, &wusbhc->cack_ie.hdr);
-}
-
-static void wusbhc_devconnect_acked_work(struct work_struct *work)
-{
-	struct wusb_dev *wusb_dev = container_of(work, struct wusb_dev,
-						 devconnect_acked_work);
-	struct wusbhc *wusbhc = wusb_dev->wusbhc;
-
-	mutex_lock(&wusbhc->mutex);
-	wusbhc_devconnect_acked(wusbhc, wusb_dev);
-	mutex_unlock(&wusbhc->mutex);
-
-	wusb_dev_put(wusb_dev);
-}
-
-/*
- * Ack a device for connection
- *
- * FIXME: docs
- *
- * @pr_cdid:	Printable CDID...hex Use @dnc->cdid for the real deal.
- *
- * So we get the connect ack IE (may have been allocated already),
- * find an empty connect block, an empty virtual port, create an
- * address with it (see below), make it an unauth addr [bit 7 set] and
- * set the MMC.
- *
- * Addresses: because WUSB hosts have no downstream hubs, we can do a
- *            1:1 mapping between 'port number' and device
- *            address. This simplifies many things, as during this
- *            initial connect phase the USB stack has no knowledge of
- *            the device and hasn't assigned an address yet--we know
- *            USB's choose_address() will use the same heuristics we
- *            use here, so we can assume which address will be assigned.
- *
- *            USB stack always assigns address 1 to the root hub, so
- *            to the port number we add 2 (thus virtual port #0 is
- *            addr #2).
- *
- * @wusbhc shall be referenced
- */
-static
-void wusbhc_devconnect_ack(struct wusbhc *wusbhc, struct wusb_dn_connect *dnc,
-			   const char *pr_cdid)
-{
-	int result;
-	struct device *dev = wusbhc->dev;
-	struct wusb_dev *wusb_dev;
-	struct wusb_port *port;
-	unsigned idx;
-
-	mutex_lock(&wusbhc->mutex);
-
-	/* Check we are not handling it already */
-	for (idx = 0; idx < wusbhc->ports_max; idx++) {
-		port = wusb_port_by_idx(wusbhc, idx);
-		if (port->wusb_dev
-		    && memcmp(&dnc->CDID, &port->wusb_dev->cdid, sizeof(dnc->CDID)) == 0)
-			goto error_unlock;
-	}
-	/* Look up those fake ports we have for a free one */
-	for (idx = 0; idx < wusbhc->ports_max; idx++) {
-		port = wusb_port_by_idx(wusbhc, idx);
-		if ((port->status & USB_PORT_STAT_POWER)
-		    && !(port->status & USB_PORT_STAT_CONNECTION))
-			break;
-	}
-	if (idx >= wusbhc->ports_max) {
-		dev_err(dev, "Host controller can't connect more devices "
-			"(%u already connected); device %s rejected\n",
-			wusbhc->ports_max, pr_cdid);
-		/* NOTE: we could send a WUIE_Disconnect here, but we haven't
-		 *       event acked, so the device will eventually timeout the
-		 *       connection, right? */
-		goto error_unlock;
-	}
-
-	/* Make sure we are using no crypto on that "virtual port" */
-	wusbhc->set_ptk(wusbhc, idx, 0, NULL, 0);
-
-	/* Grab a filled in Connect-Ack context, fill out the
-	 * Connect-Ack Wireless USB IE, set the MMC */
-	wusb_dev = wusbhc_cack_add(wusbhc, dnc, pr_cdid, idx);
-	if (wusb_dev == NULL)
-		goto error_unlock;
-	result = wusbhc_mmcie_set(wusbhc, 0, 0, &wusbhc->cack_ie.hdr);
-	if (result < 0)
-		goto error_unlock;
-	/* Give the device at least 2ms (WUSB1.0[7.5.1p3]), let's do
-	 * three for a good measure */
-	msleep(3);
-	port->wusb_dev = wusb_dev;
-	port->status |= USB_PORT_STAT_CONNECTION;
-	port->change |= USB_PORT_STAT_C_CONNECTION;
-	/* Now the port status changed to connected; hub_wq will
-	 * pick the change up and try to reset the port to bring it to
-	 * the enabled state--so this process returns up to the stack
-	 * and it calls back into wusbhc_rh_port_reset().
-	 */
-error_unlock:
-	mutex_unlock(&wusbhc->mutex);
-	return;
-
-}
-
-/*
- * Disconnect a Wireless USB device from its fake port
- *
- * Marks the port as disconnected so that hub_wq can pick up the change
- * and drops our knowledge about the device.
- *
- * Assumes there is a device connected
- *
- * @port_index: zero based port number
- *
- * NOTE: @wusbhc->mutex is locked
- *
- * WARNING: From here it is not very safe to access anything hanging off
- *	    wusb_dev
- */
-static void __wusbhc_dev_disconnect(struct wusbhc *wusbhc,
-				    struct wusb_port *port)
-{
-	struct wusb_dev *wusb_dev = port->wusb_dev;
-
-	port->status &= ~(USB_PORT_STAT_CONNECTION | USB_PORT_STAT_ENABLE
-			  | USB_PORT_STAT_SUSPEND | USB_PORT_STAT_RESET
-			  | USB_PORT_STAT_LOW_SPEED | USB_PORT_STAT_HIGH_SPEED);
-	port->change |= USB_PORT_STAT_C_CONNECTION | USB_PORT_STAT_C_ENABLE;
-	if (wusb_dev) {
-		dev_dbg(wusbhc->dev, "disconnecting device from port %d\n", wusb_dev->port_idx);
-		if (!list_empty(&wusb_dev->cack_node))
-			list_del_init(&wusb_dev->cack_node);
-		/* For the one in cack_add() */
-		wusb_dev_put(wusb_dev);
-	}
-	port->wusb_dev = NULL;
-
-	/* After a device disconnects, change the GTK (see [WUSB]
-	 * section 6.2.11.2). */
-	if (wusbhc->active)
-		wusbhc_gtk_rekey(wusbhc);
-
-	/* The Wireless USB part has forgotten about the device already; now
-	 * hub_wq's timer will pick up the disconnection and remove the USB
-	 * device from the system
-	 */
-}
-
-/*
- * Refresh the list of keep alives to emit in the MMC
- *
- * We only publish the first four devices that have a coming timeout
- * condition. Then when we are done processing those, we go for the
- * next ones. We ignore the ones that have timed out already (they'll
- * be purged).
- *
- * This might cause the first devices to timeout the last devices in
- * the port array...FIXME: come up with a better algorithm?
- *
- * Note we can't do much about MMC's ops errors; we hope next refresh
- * will kind of handle it.
- *
- * NOTE: @wusbhc->mutex is locked
- */
-static void __wusbhc_keep_alive(struct wusbhc *wusbhc)
-{
-	struct device *dev = wusbhc->dev;
-	unsigned cnt;
-	struct wusb_dev *wusb_dev;
-	struct wusb_port *wusb_port;
-	struct wuie_keep_alive *ie = &wusbhc->keep_alive_ie;
-	unsigned keep_alives, old_keep_alives;
-
-	old_keep_alives = ie->hdr.bLength - sizeof(ie->hdr);
-	keep_alives = 0;
-	for (cnt = 0;
-	     keep_alives < WUIE_ELT_MAX && cnt < wusbhc->ports_max;
-	     cnt++) {
-		unsigned tt = msecs_to_jiffies(wusbhc->trust_timeout);
-
-		wusb_port = wusb_port_by_idx(wusbhc, cnt);
-		wusb_dev = wusb_port->wusb_dev;
-
-		if (wusb_dev == NULL)
-			continue;
-		if (wusb_dev->usb_dev == NULL)
-			continue;
-
-		if (time_after(jiffies, wusb_dev->entry_ts + tt)) {
-			dev_err(dev, "KEEPALIVE: device %u timed out\n",
-				wusb_dev->addr);
-			__wusbhc_dev_disconnect(wusbhc, wusb_port);
-		} else if (time_after(jiffies, wusb_dev->entry_ts + tt/3)) {
-			/* Approaching timeout cut off, need to refresh */
-			ie->bDeviceAddress[keep_alives++] = wusb_dev->addr;
-		}
-	}
-	if (keep_alives & 0x1)	/* pad to even number ([WUSB] section 7.5.9) */
-		ie->bDeviceAddress[keep_alives++] = 0x7f;
-	ie->hdr.bLength = sizeof(ie->hdr) +
-		keep_alives*sizeof(ie->bDeviceAddress[0]);
-	if (keep_alives > 0)
-		wusbhc_mmcie_set(wusbhc, 10, 5, &ie->hdr);
-	else if (old_keep_alives != 0)
-		wusbhc_mmcie_rm(wusbhc, &ie->hdr);
-}
-
-/*
- * Do a run through all devices checking for timeouts
- */
-static void wusbhc_keep_alive_run(struct work_struct *ws)
-{
-	struct delayed_work *dw = to_delayed_work(ws);
-	struct wusbhc *wusbhc =	container_of(dw, struct wusbhc, keep_alive_timer);
-
-	mutex_lock(&wusbhc->mutex);
-	__wusbhc_keep_alive(wusbhc);
-	mutex_unlock(&wusbhc->mutex);
-
-	queue_delayed_work(wusbd, &wusbhc->keep_alive_timer,
-			   msecs_to_jiffies(wusbhc->trust_timeout / 2));
-}
-
-/*
- * Find the wusb_dev from its device address.
- *
- * The device can be found directly from the address (see
- * wusb_cack_add() for where the device address is set to port_idx
- * +2), except when the address is zero.
- */
-static struct wusb_dev *wusbhc_find_dev_by_addr(struct wusbhc *wusbhc, u8 addr)
-{
-	int p;
-
-	if (addr == 0xff) /* unconnected */
-		return NULL;
-
-	if (addr > 0) {
-		int port = (addr & ~0x80) - 2;
-		if (port < 0 || port >= wusbhc->ports_max)
-			return NULL;
-		return wusb_port_by_idx(wusbhc, port)->wusb_dev;
-	}
-
-	/* Look for the device with address 0. */
-	for (p = 0; p < wusbhc->ports_max; p++) {
-		struct wusb_dev *wusb_dev = wusb_port_by_idx(wusbhc, p)->wusb_dev;
-		if (wusb_dev && wusb_dev->addr == addr)
-			return wusb_dev;
-	}
-	return NULL;
-}
-
-/*
- * Handle a DN_Alive notification (WUSB1.0[7.6.1])
- *
- * This just updates the device activity timestamp and then refreshes
- * the keep alive IE.
- *
- * @wusbhc shall be referenced and unlocked
- */
-static void wusbhc_handle_dn_alive(struct wusbhc *wusbhc, u8 srcaddr)
-{
-	struct wusb_dev *wusb_dev;
-
-	mutex_lock(&wusbhc->mutex);
-	wusb_dev = wusbhc_find_dev_by_addr(wusbhc, srcaddr);
-	if (wusb_dev == NULL) {
-		dev_dbg(wusbhc->dev, "ignoring DN_Alive from unconnected device %02x\n",
-			srcaddr);
-	} else {
-		wusb_dev->entry_ts = jiffies;
-		__wusbhc_keep_alive(wusbhc);
-	}
-	mutex_unlock(&wusbhc->mutex);
-}
-
-/*
- * Handle a DN_Connect notification (WUSB1.0[7.6.1])
- *
- * @wusbhc
- * @pkt_hdr
- * @size:    Size of the buffer where the notification resides; if the
- *           notification data suggests there should be more data than
- *           available, an error will be signaled and the whole buffer
- *           consumed.
- *
- * @wusbhc->mutex shall be held
- */
-static void wusbhc_handle_dn_connect(struct wusbhc *wusbhc,
-				     struct wusb_dn_hdr *dn_hdr,
-				     size_t size)
-{
-	struct device *dev = wusbhc->dev;
-	struct wusb_dn_connect *dnc;
-	char pr_cdid[WUSB_CKHDID_STRSIZE];
-	static const char *beacon_behaviour[] = {
-		"reserved",
-		"self-beacon",
-		"directed-beacon",
-		"no-beacon"
-	};
-
-	if (size < sizeof(*dnc)) {
-		dev_err(dev, "DN CONNECT: short notification (%zu < %zu)\n",
-			size, sizeof(*dnc));
-		return;
-	}
-
-	dnc = container_of(dn_hdr, struct wusb_dn_connect, hdr);
-	ckhdid_printf(pr_cdid, sizeof(pr_cdid), &dnc->CDID);
-	dev_info(dev, "DN CONNECT: device %s @ %x (%s) wants to %s\n",
-		 pr_cdid,
-		 wusb_dn_connect_prev_dev_addr(dnc),
-		 beacon_behaviour[wusb_dn_connect_beacon_behavior(dnc)],
-		 wusb_dn_connect_new_connection(dnc) ? "connect" : "reconnect");
-	/* ACK the connect */
-	wusbhc_devconnect_ack(wusbhc, dnc, pr_cdid);
-}
-
-/*
- * Handle a DN_Disconnect notification (WUSB1.0[7.6.1])
- *
- * Device is going down -- do the disconnect.
- *
- * @wusbhc shall be referenced and unlocked
- */
-static void wusbhc_handle_dn_disconnect(struct wusbhc *wusbhc, u8 srcaddr)
-{
-	struct device *dev = wusbhc->dev;
-	struct wusb_dev *wusb_dev;
-
-	mutex_lock(&wusbhc->mutex);
-	wusb_dev = wusbhc_find_dev_by_addr(wusbhc, srcaddr);
-	if (wusb_dev == NULL) {
-		dev_dbg(dev, "ignoring DN DISCONNECT from unconnected device %02x\n",
-			srcaddr);
-	} else {
-		dev_info(dev, "DN DISCONNECT: device 0x%02x going down\n",
-			wusb_dev->addr);
-		__wusbhc_dev_disconnect(wusbhc, wusb_port_by_idx(wusbhc,
-			wusb_dev->port_idx));
-	}
-	mutex_unlock(&wusbhc->mutex);
-}
-
-/*
- * Handle a Device Notification coming a host
- *
- * The Device Notification comes from a host (HWA, DWA or WHCI)
- * wrapped in a set of headers. Somebody else has peeled off those
- * headers for us and we just get one Device Notifications.
- *
- * Invalid DNs (e.g., too short) are discarded.
- *
- * @wusbhc shall be referenced
- *
- * FIXMES:
- *  - implement priorities as in WUSB1.0[Table 7-55]?
- */
-void wusbhc_handle_dn(struct wusbhc *wusbhc, u8 srcaddr,
-		      struct wusb_dn_hdr *dn_hdr, size_t size)
-{
-	struct device *dev = wusbhc->dev;
-
-	if (size < sizeof(struct wusb_dn_hdr)) {
-		dev_err(dev, "DN data shorter than DN header (%d < %d)\n",
-			(int)size, (int)sizeof(struct wusb_dn_hdr));
-		return;
-	}
-	switch (dn_hdr->bType) {
-	case WUSB_DN_CONNECT:
-		wusbhc_handle_dn_connect(wusbhc, dn_hdr, size);
-		break;
-	case WUSB_DN_ALIVE:
-		wusbhc_handle_dn_alive(wusbhc, srcaddr);
-		break;
-	case WUSB_DN_DISCONNECT:
-		wusbhc_handle_dn_disconnect(wusbhc, srcaddr);
-		break;
-	case WUSB_DN_MASAVAILCHANGED:
-	case WUSB_DN_RWAKE:
-	case WUSB_DN_SLEEP:
-		/* FIXME: handle these DNs. */
-		break;
-	case WUSB_DN_EPRDY:
-		/* The hardware handles these. */
-		break;
-	default:
-		dev_warn(dev, "unknown DN %u (%d octets) from %u\n",
-			 dn_hdr->bType, (int)size, srcaddr);
-	}
-}
-EXPORT_SYMBOL_GPL(wusbhc_handle_dn);
-
-/*
- * Disconnect a WUSB device from a the cluster
- *
- * @wusbhc
- * @port     Fake port where the device is (wusbhc index, not USB port number).
- *
- * In Wireless USB, a disconnect is basically telling the device he is
- * being disconnected and forgetting about him.
- *
- * We send the device a Device Disconnect IE (WUSB1.0[7.5.11]) for 100
- * ms and then keep going.
- *
- * We don't do much in case of error; we always pretend we disabled
- * the port and disconnected the device. If physically the request
- * didn't get there (many things can fail in the way there), the stack
- * will reject the device's communication attempts.
- *
- * @wusbhc should be refcounted and locked
- */
-void __wusbhc_dev_disable(struct wusbhc *wusbhc, u8 port_idx)
-{
-	int result;
-	struct device *dev = wusbhc->dev;
-	struct wusb_dev *wusb_dev;
-	struct wuie_disconnect *ie;
-
-	wusb_dev = wusb_port_by_idx(wusbhc, port_idx)->wusb_dev;
-	if (wusb_dev == NULL) {
-		/* reset no device? ignore */
-		dev_dbg(dev, "DISCONNECT: no device at port %u, ignoring\n",
-			port_idx);
-		return;
-	}
-	__wusbhc_dev_disconnect(wusbhc, wusb_port_by_idx(wusbhc, port_idx));
-
-	ie = kzalloc(sizeof(*ie), GFP_KERNEL);
-	if (ie == NULL)
-		return;
-	ie->hdr.bLength = sizeof(*ie);
-	ie->hdr.bIEIdentifier = WUIE_ID_DEVICE_DISCONNECT;
-	ie->bDeviceAddress = wusb_dev->addr;
-	result = wusbhc_mmcie_set(wusbhc, 0, 0, &ie->hdr);
-	if (result < 0)
-		dev_err(dev, "DISCONNECT: can't set MMC: %d\n", result);
-	else {
-		/* At least 6 MMCs, assuming at least 1 MMC per zone. */
-		msleep(7*4);
-		wusbhc_mmcie_rm(wusbhc, &ie->hdr);
-	}
-	kfree(ie);
-}
-
-/*
- * Walk over the BOS descriptor, verify and grok it
- *
- * @usb_dev: referenced
- * @wusb_dev: referenced and unlocked
- *
- * The BOS descriptor is defined at WUSB1.0[7.4.1], and it defines a
- * "flexible" way to wrap all kinds of descriptors inside an standard
- * descriptor (wonder why they didn't use normal descriptors,
- * btw). Not like they lack code.
- *
- * At the end we go to look for the WUSB Device Capabilities
- * (WUSB1.0[7.4.1.1]) that is wrapped in a device capability descriptor
- * that is part of the BOS descriptor set. That tells us what does the
- * device support (dual role, beacon type, UWB PHY rates).
- */
-static int wusb_dev_bos_grok(struct usb_device *usb_dev,
-			     struct wusb_dev *wusb_dev,
-			     struct usb_bos_descriptor *bos, size_t desc_size)
-{
-	ssize_t result;
-	struct device *dev = &usb_dev->dev;
-	void *itr, *top;
-
-	/* Walk over BOS capabilities, verify them */
-	itr = (void *)bos + sizeof(*bos);
-	top = itr + desc_size - sizeof(*bos);
-	while (itr < top) {
-		struct usb_dev_cap_header *cap_hdr = itr;
-		size_t cap_size;
-		u8 cap_type;
-		if (top - itr < sizeof(*cap_hdr)) {
-			dev_err(dev, "Device BUG? premature end of BOS header "
-				"data [offset 0x%02x]: only %zu bytes left\n",
-				(int)(itr - (void *)bos), top - itr);
-			result = -ENOSPC;
-			goto error_bad_cap;
-		}
-		cap_size = cap_hdr->bLength;
-		cap_type = cap_hdr->bDevCapabilityType;
-		if (cap_size == 0)
-			break;
-		if (cap_size > top - itr) {
-			dev_err(dev, "Device BUG? premature end of BOS data "
-				"[offset 0x%02x cap %02x %zu bytes]: "
-				"only %zu bytes left\n",
-				(int)(itr - (void *)bos),
-				cap_type, cap_size, top - itr);
-			result = -EBADF;
-			goto error_bad_cap;
-		}
-		switch (cap_type) {
-		case USB_CAP_TYPE_WIRELESS_USB:
-			if (cap_size != sizeof(*wusb_dev->wusb_cap_descr))
-				dev_err(dev, "Device BUG? WUSB Capability "
-					"descriptor is %zu bytes vs %zu "
-					"needed\n", cap_size,
-					sizeof(*wusb_dev->wusb_cap_descr));
-			else
-				wusb_dev->wusb_cap_descr = itr;
-			break;
-		default:
-			dev_err(dev, "BUG? Unknown BOS capability 0x%02x "
-				"(%zu bytes) at offset 0x%02x\n", cap_type,
-				cap_size, (int)(itr - (void *)bos));
-		}
-		itr += cap_size;
-	}
-	result = 0;
-error_bad_cap:
-	return result;
-}
-
-/*
- * Add information from the BOS descriptors to the device
- *
- * @usb_dev: referenced
- * @wusb_dev: referenced and unlocked
- *
- * So what we do is we alloc a space for the BOS descriptor of 64
- * bytes; read the first four bytes which include the wTotalLength
- * field (WUSB1.0[T7-26]) and if it fits in those 64 bytes, read the
- * whole thing. If not we realloc to that size.
- *
- * Then we call the groking function, that will fill up
- * wusb_dev->wusb_cap_descr, which is what we'll need later on.
- */
-static int wusb_dev_bos_add(struct usb_device *usb_dev,
-			    struct wusb_dev *wusb_dev)
-{
-	ssize_t result;
-	struct device *dev = &usb_dev->dev;
-	struct usb_bos_descriptor *bos;
-	size_t alloc_size = 32, desc_size = 4;
-
-	bos = kmalloc(alloc_size, GFP_KERNEL);
-	if (bos == NULL)
-		return -ENOMEM;
-	result = usb_get_descriptor(usb_dev, USB_DT_BOS, 0, bos, desc_size);
-	if (result < 4) {
-		dev_err(dev, "Can't get BOS descriptor or too short: %zd\n",
-			result);
-		goto error_get_descriptor;
-	}
-	desc_size = le16_to_cpu(bos->wTotalLength);
-	if (desc_size >= alloc_size) {
-		kfree(bos);
-		alloc_size = desc_size;
-		bos = kmalloc(alloc_size, GFP_KERNEL);
-		if (bos == NULL)
-			return -ENOMEM;
-	}
-	result = usb_get_descriptor(usb_dev, USB_DT_BOS, 0, bos, desc_size);
-	if (result < 0 || result != desc_size) {
-		dev_err(dev, "Can't get  BOS descriptor or too short (need "
-			"%zu bytes): %zd\n", desc_size, result);
-		goto error_get_descriptor;
-	}
-	if (result < sizeof(*bos)
-	    || le16_to_cpu(bos->wTotalLength) != desc_size) {
-		dev_err(dev, "Can't get  BOS descriptor or too short (need "
-			"%zu bytes): %zd\n", desc_size, result);
-		goto error_get_descriptor;
-	}
-
-	result = wusb_dev_bos_grok(usb_dev, wusb_dev, bos, result);
-	if (result < 0)
-		goto error_bad_bos;
-	wusb_dev->bos = bos;
-	return 0;
-
-error_bad_bos:
-error_get_descriptor:
-	kfree(bos);
-	wusb_dev->wusb_cap_descr = NULL;
-	return result;
-}
-
-static void wusb_dev_bos_rm(struct wusb_dev *wusb_dev)
-{
-	kfree(wusb_dev->bos);
-	wusb_dev->wusb_cap_descr = NULL;
-};
-
-/*
- * USB stack's device addition Notifier Callback
- *
- * Called from drivers/usb/core/hub.c when a new device is added; we
- * use this hook to perform certain WUSB specific setup work on the
- * new device. As well, it is the first time we can connect the
- * wusb_dev and the usb_dev. So we note it down in wusb_dev and take a
- * reference that we'll drop.
- *
- * First we need to determine if the device is a WUSB device (else we
- * ignore it). For that we use the speed setting (USB_SPEED_WIRELESS)
- * [FIXME: maybe we'd need something more definitive]. If so, we track
- * it's usb_busd and from there, the WUSB HC.
- *
- * Because all WUSB HCs are contained in a 'struct wusbhc', voila, we
- * get the wusbhc for the device.
- *
- * We have a reference on @usb_dev (as we are called at the end of its
- * enumeration).
- *
- * NOTE: @usb_dev locked
- */
-static void wusb_dev_add_ncb(struct usb_device *usb_dev)
-{
-	int result = 0;
-	struct wusb_dev *wusb_dev;
-	struct wusbhc *wusbhc;
-	struct device *dev = &usb_dev->dev;
-	u8 port_idx;
-
-	if (usb_dev->wusb == 0 || usb_dev->devnum == 1)
-		return;		/* skip non wusb and wusb RHs */
-
-	usb_set_device_state(usb_dev, USB_STATE_UNAUTHENTICATED);
-
-	wusbhc = wusbhc_get_by_usb_dev(usb_dev);
-	if (wusbhc == NULL)
-		goto error_nodev;
-	mutex_lock(&wusbhc->mutex);
-	wusb_dev = __wusb_dev_get_by_usb_dev(wusbhc, usb_dev);
-	port_idx = wusb_port_no_to_idx(usb_dev->portnum);
-	mutex_unlock(&wusbhc->mutex);
-	if (wusb_dev == NULL)
-		goto error_nodev;
-	wusb_dev->usb_dev = usb_get_dev(usb_dev);
-	usb_dev->wusb_dev = wusb_dev_get(wusb_dev);
-	result = wusb_dev_sec_add(wusbhc, usb_dev, wusb_dev);
-	if (result < 0) {
-		dev_err(dev, "Cannot enable security: %d\n", result);
-		goto error_sec_add;
-	}
-	/* Now query the device for it's BOS and attach it to wusb_dev */
-	result = wusb_dev_bos_add(usb_dev, wusb_dev);
-	if (result < 0) {
-		dev_err(dev, "Cannot get BOS descriptors: %d\n", result);
-		goto error_bos_add;
-	}
-	result = wusb_dev_sysfs_add(wusbhc, usb_dev, wusb_dev);
-	if (result < 0)
-		goto error_add_sysfs;
-out:
-	wusb_dev_put(wusb_dev);
-	wusbhc_put(wusbhc);
-error_nodev:
-	return;
-
-	wusb_dev_sysfs_rm(wusb_dev);
-error_add_sysfs:
-	wusb_dev_bos_rm(wusb_dev);
-error_bos_add:
-	wusb_dev_sec_rm(wusb_dev);
-error_sec_add:
-	mutex_lock(&wusbhc->mutex);
-	__wusbhc_dev_disconnect(wusbhc, wusb_port_by_idx(wusbhc, port_idx));
-	mutex_unlock(&wusbhc->mutex);
-	goto out;
-}
-
-/*
- * Undo all the steps done at connection by the notifier callback
- *
- * NOTE: @usb_dev locked
- */
-static void wusb_dev_rm_ncb(struct usb_device *usb_dev)
-{
-	struct wusb_dev *wusb_dev = usb_dev->wusb_dev;
-
-	if (usb_dev->wusb == 0 || usb_dev->devnum == 1)
-		return;		/* skip non wusb and wusb RHs */
-
-	wusb_dev_sysfs_rm(wusb_dev);
-	wusb_dev_bos_rm(wusb_dev);
-	wusb_dev_sec_rm(wusb_dev);
-	wusb_dev->usb_dev = NULL;
-	usb_dev->wusb_dev = NULL;
-	wusb_dev_put(wusb_dev);
-	usb_put_dev(usb_dev);
-}
-
-/*
- * Handle notifications from the USB stack (notifier call back)
- *
- * This is called when the USB stack does a
- * usb_{bus,device}_{add,remove}() so we can do WUSB specific
- * handling. It is called with [for the case of
- * USB_DEVICE_{ADD,REMOVE} with the usb_dev locked.
- */
-int wusb_usb_ncb(struct notifier_block *nb, unsigned long val,
-		 void *priv)
-{
-	int result = NOTIFY_OK;
-
-	switch (val) {
-	case USB_DEVICE_ADD:
-		wusb_dev_add_ncb(priv);
-		break;
-	case USB_DEVICE_REMOVE:
-		wusb_dev_rm_ncb(priv);
-		break;
-	case USB_BUS_ADD:
-		/* ignore (for now) */
-	case USB_BUS_REMOVE:
-		break;
-	default:
-		WARN_ON(1);
-		result = NOTIFY_BAD;
-	}
-	return result;
-}
-
-/*
- * Return a referenced wusb_dev given a @wusbhc and @usb_dev
- */
-struct wusb_dev *__wusb_dev_get_by_usb_dev(struct wusbhc *wusbhc,
-					   struct usb_device *usb_dev)
-{
-	struct wusb_dev *wusb_dev;
-	u8 port_idx;
-
-	port_idx = wusb_port_no_to_idx(usb_dev->portnum);
-	BUG_ON(port_idx > wusbhc->ports_max);
-	wusb_dev = wusb_port_by_idx(wusbhc, port_idx)->wusb_dev;
-	if (wusb_dev != NULL)		/* ops, device is gone */
-		wusb_dev_get(wusb_dev);
-	return wusb_dev;
-}
-EXPORT_SYMBOL_GPL(__wusb_dev_get_by_usb_dev);
-
-void wusb_dev_destroy(struct kref *_wusb_dev)
-{
-	struct wusb_dev *wusb_dev = container_of(_wusb_dev, struct wusb_dev, refcnt);
-
-	list_del_init(&wusb_dev->cack_node);
-	wusb_dev_free(wusb_dev);
-}
-EXPORT_SYMBOL_GPL(wusb_dev_destroy);
-
-/*
- * Create all the device connect handling infrastructure
- *
- * This is basically the device info array, Connect Acknowledgement
- * (cack) lists, keep-alive timers (and delayed work thread).
- */
-int wusbhc_devconnect_create(struct wusbhc *wusbhc)
-{
-	wusbhc->keep_alive_ie.hdr.bIEIdentifier = WUIE_ID_KEEP_ALIVE;
-	wusbhc->keep_alive_ie.hdr.bLength = sizeof(wusbhc->keep_alive_ie.hdr);
-	INIT_DELAYED_WORK(&wusbhc->keep_alive_timer, wusbhc_keep_alive_run);
-
-	wusbhc->cack_ie.hdr.bIEIdentifier = WUIE_ID_CONNECTACK;
-	wusbhc->cack_ie.hdr.bLength = sizeof(wusbhc->cack_ie.hdr);
-	INIT_LIST_HEAD(&wusbhc->cack_list);
-
-	return 0;
-}
-
-/*
- * Release all resources taken by the devconnect stuff
- */
-void wusbhc_devconnect_destroy(struct wusbhc *wusbhc)
-{
-	/* no op */
-}
-
-/*
- * wusbhc_devconnect_start - start accepting device connections
- * @wusbhc: the WUSB HC
- *
- * Sets the Host Info IE to accept all new connections.
- *
- * FIXME: This also enables the keep alives but this is not necessary
- * until there are connected and authenticated devices.
- */
-int wusbhc_devconnect_start(struct wusbhc *wusbhc)
-{
-	struct device *dev = wusbhc->dev;
-	struct wuie_host_info *hi;
-	int result;
-
-	hi = kzalloc(sizeof(*hi), GFP_KERNEL);
-	if (hi == NULL)
-		return -ENOMEM;
-
-	hi->hdr.bLength       = sizeof(*hi);
-	hi->hdr.bIEIdentifier = WUIE_ID_HOST_INFO;
-	hi->attributes        = cpu_to_le16((wusbhc->rsv->stream << 3) | WUIE_HI_CAP_ALL);
-	hi->CHID              = wusbhc->chid;
-	result = wusbhc_mmcie_set(wusbhc, 0, 0, &hi->hdr);
-	if (result < 0) {
-		dev_err(dev, "Cannot add Host Info MMCIE: %d\n", result);
-		goto error_mmcie_set;
-	}
-	wusbhc->wuie_host_info = hi;
-
-	queue_delayed_work(wusbd, &wusbhc->keep_alive_timer,
-			   msecs_to_jiffies(wusbhc->trust_timeout / 2));
-
-	return 0;
-
-error_mmcie_set:
-	kfree(hi);
-	return result;
-}
-
-/*
- * wusbhc_devconnect_stop - stop managing connected devices
- * @wusbhc: the WUSB HC
- *
- * Disconnects any devices still connected, stops the keep alives and
- * removes the Host Info IE.
- */
-void wusbhc_devconnect_stop(struct wusbhc *wusbhc)
-{
-	int i;
-
-	mutex_lock(&wusbhc->mutex);
-	for (i = 0; i < wusbhc->ports_max; i++) {
-		if (wusbhc->port[i].wusb_dev)
-			__wusbhc_dev_disconnect(wusbhc, &wusbhc->port[i]);
-	}
-	mutex_unlock(&wusbhc->mutex);
-
-	cancel_delayed_work_sync(&wusbhc->keep_alive_timer);
-	wusbhc_mmcie_rm(wusbhc, &wusbhc->wuie_host_info->hdr);
-	kfree(wusbhc->wuie_host_info);
-	wusbhc->wuie_host_info = NULL;
-}
-
-/*
- * wusb_set_dev_addr - set the WUSB device address used by the host
- * @wusbhc: the WUSB HC the device is connect to
- * @wusb_dev: the WUSB device
- * @addr: new device address
- */
-int wusb_set_dev_addr(struct wusbhc *wusbhc, struct wusb_dev *wusb_dev, u8 addr)
-{
-	int result;
-
-	wusb_dev->addr = addr;
-	result = wusbhc->dev_info_set(wusbhc, wusb_dev);
-	if (result < 0)
-		dev_err(wusbhc->dev, "device %d: failed to set device "
-			"address\n", wusb_dev->port_idx);
-	else
-		dev_info(wusbhc->dev, "device %d: %s addr %u\n",
-			 wusb_dev->port_idx,
-			 (addr & WUSB_DEV_ADDR_UNAUTH) ? "unauth" : "auth",
-			 wusb_dev->addr);
-
-	return result;
-}
+                                               0x9
+#define mmROM_BASE_ADDR                                                         0xc
+#define mmCAP_PTR                                                               0xd
+#define mmINTERRUPT_LINE                                                        0xf
+#define mmINTERRUPT_PIN                                                         0xf
+#define mmADAPTER_ID                                                            0xb
+#define mmMIN_GRANT                                                             0xf
+#define mmMAX_LATENCY                                                           0xf
+#define mmVENDOR_CAP_LIST                                                       0x12
+#define mmADAPTER_ID_W                                                          0x13
+#define mmPMI_CAP_LIST                                                          0x14
+#define mmPMI_CAP                                                               0x14
+#define mmPMI_STATUS_CNTL                                                       0x15
+#define mmPCIE_CAP_LIST                                                         0x16
+#define mmPCIE_CAP                                                              0x16
+#define mmDEVICE_CAP                                                            0x17
+#define mmDEVICE_CNTL                                                           0x18
+#define mmDEVICE_STATUS                                                         0x18
+#define mmLINK_CAP                                                              0x19
+#define mmLINK_CNTL                                                             0x1a
+#define mmLINK_STATUS                                                           0x1a
+#define mmDEVICE_CAP2                                                           0x1f
+#define mmDEVICE_CNTL2                                                          0x20
+#define mmDEVICE_STATUS2                                                        0x20
+#define mmLINK_CAP2                                                             0x21
+#define mmLINK_CNTL2                                                            0x22
+#define mmLINK_STATUS2                                                          0x22
+#define mmMSI_CAP_LIST                                                          0x28
+#define mmMSI_MSG_CNTL                                                          0x28
+#define mmMSI_MSG_ADDR_LO                                                       0x29
+#define mmMSI_MSG_ADDR_HI                                                       0x2a
+#define mmMSI_MSG_DATA_64                                                       0x2b
+#define mmMSI_MSG_DATA                                                          0x2a
+#define mmPCIE_VENDOR_SPECIFIC_ENH_CAP_LIST                                     0x40
+#define mmPCIE_VENDOR_SPECIFIC_HDR                                              0x41
+#define mmPCIE_VENDOR_SPECIFIC1                                                 0x42
+#define mmPCIE_VENDOR_SPECIFIC2                                                 0x43
+#define mmPCIE_VC_ENH_CAP_LIST                                                  0x44
+#define mmPCIE_PORT_VC_CAP_REG1                                                 0x45
+#define mmPCIE_PORT_VC_CAP_REG2                                                 0x46
+#define mmPCIE_PORT_VC_CNTL                                                     0x47
+#define mmPCIE_PORT_VC_STATUS                                                   0x47
+#define mmPCIE_VC0_RESOURCE_CAP                                                 0x48
+#define mmPCIE_VC0_RESOURCE_CNTL                                                0x49
+#define mmPCIE_VC0_RESOURCE_STATUS                                              0x4a
+#define mmPCIE_VC1_RESOURCE_CAP                                                 0x4b
+#define mmPCIE_VC1_RESOURCE_CNTL                                                0x4c
+#define mmPCIE_VC1_RESOURCE_STATUS                                              0x4d
+#define mmPCIE_DEV_SERIAL_NUM_ENH_CAP_LIST                                      0x50
+#define mmPCIE_DEV_SERIAL_NUM_DW1                                               0x51
+#define mmPCIE_DEV_SERIAL_NUM_DW2                                               0x52
+#define mmPCIE_ADV_ERR_RPT_ENH_CAP_LIST                                         0x54
+#define mmPCIE_UNCORR_ERR_STATUS                                                0x55
+#define mmPCIE_UNCORR_ERR_MASK                                                  0x56
+#define mmPCIE_UNCORR_ERR_SEVERITY                                              0x57
+#define mmPCIE_CORR_ERR_STATUS                                                  0x58
+#define mmPCIE_CORR_ERR_MASK                                                    0x59
+#define mmPCIE_ADV_ERR_CAP_CNTL                                                 0x5a
+#define mmPCIE_HDR_LOG0                                                         0x5b
+#define mmPCIE_HDR_LOG1                                                         0x5c
+#define mmPCIE_HDR_LOG2                                                         0x5d
+#define mmPCIE_HDR_LOG3                                                         0x5e
+#define mmPCIE_TLP_PREFIX_LOG0                                                  0x62
+#define mmPCIE_TLP_PREFIX_LOG1                                                  0x63
+#define mmPCIE_TLP_PREFIX_LOG2                                                  0x64
+#define mmPCIE_TLP_PREFIX_LOG3                                                  0x65
+#define mmPCIE_BAR_ENH_CAP_LIST                                                 0x80
+#define mmPCIE_BAR1_CAP                                                         0x81
+#define mmPCIE_BAR1_CNTL                                                        0x82
+#define mmPCIE_BAR2_CAP                                                         0x83
+#define mmPCIE_BAR2_CNTL                                                        0x84
+#define mmPCIE_BAR3_CAP                                                         0x85
+#define mmPCIE_BAR3_CNTL                                                        0x86
+#define mmPCIE_BAR4_CAP                                                         0x87
+#define mmPCIE_BAR4_CNTL                                                        0x88
+#define mmPCIE_BAR5_CAP                                                         0x89
+#define mmPCIE_BAR5_CNTL                                                        0x8a
+#define mmPCIE_BAR6_CAP                                                         0x8b
+#define mmPCIE_BAR6_CNTL                                                        0x8c
+#define mmPCIE_PWR_BUDGET_ENH_CAP_LIST                                          0x90
+#define mmPCIE_PWR_BUDGET_DATA_SELECT                                           0x91
+#define mmPCIE_PWR_BUDGET_DATA                                                  0x92
+#define mmPCIE_PWR_BUDGET_CAP                                                   0x93
+#define mmPCIE_DPA_ENH_CAP_LIST                                                 0x94
+#define mmPCIE_DPA_CAP                                                          0x95
+#define mmPCIE_DPA_LATENCY_INDICATOR                                            0x96
+#define mmPCIE_DPA_STATUS                                                       0x97
+#define mmPCIE_DPA_CNTL                                                         0x97
+#define mmPCIE_DPA_SUBSTATE_PWR_ALLOC_0                                         0x98
+#define mmPCIE_DPA_SUBSTATE_PWR_ALLOC_1                                         0x98
+#define mmPCIE_DPA_SUBSTATE_PWR_ALLOC_2                                         0x98
+#define mmPCIE_DPA_SUBSTATE_PWR_ALLOC_3                                         0x98
+#define mmPCIE_DPA_SUBSTATE_PWR_ALLOC_4                                         0x99
+#define mmPCIE_DPA_SUBSTATE_PWR_ALLOC_5                                         0x99
+#define mmPCIE_DPA_SUBSTATE_PWR_ALLOC_6                                         0x99
+#define mmPCIE_DPA_SUBSTATE_PWR_ALLOC_7                                         0x99
+#define mmPCIE_SECONDARY_ENH_CAP_LIST                                           0x9c
+#define mmPCIE_LINK_CNTL3                                                       0x9d
+#define mmPCIE_LANE_ERROR_STATUS                                                0x9e
+#define mmPCIE_LANE_0_EQUALIZATION_CNTL                                         0x9f
+#define mmPCIE_LANE_1_EQUALIZATION_CNTL                                         0x9f
+#define mmPCIE_LANE_2_EQUALIZATION_CNTL                                         0xa0
+#define mmPCIE_LANE_3_EQUALIZATION_CNTL                                         0xa0
+#define mmPCIE_LANE_4_EQUALIZATION_CNTL                                         0xa1
+#define mmPCIE_LANE_5_EQUALIZATION_CNTL                                         0xa1
+#define mmPCIE_LANE_6_EQUALIZATION_CNTL                                         0xa2
+#define mmPCIE_LANE_7_EQUALIZATION_CNTL                                         0xa2
+#define mmPCIE_LANE_8_EQUALIZATION_CNTL                                         0xa3
+#define mmPCIE_LANE_9_EQUALIZATION_CNTL                                         0xa3
+#define mmPCIE_LANE_10_EQUALIZATION_CNTL                                        0xa4
+#define mmPCIE_LANE_11_EQUALIZATION_CNTL                                        0xa4
+#define mmPCIE_LANE_12_EQUALIZATION_CNTL                                        0xa5
+#define mmPCIE_LANE_13_EQUALIZATION_CNTL                                        0xa5
+#define mmPCIE_LANE_14_EQUALIZATION_CNTL                                        0xa6
+#define mmPCIE_LANE_15_EQUALIZATION_CNTL                                        0xa6
+#define mmPCIE_ACS_ENH_CAP_LIST                                                 0xa8
+#define mmPCIE_ACS_CAP                                                          0xa9
+#define mmPCIE_ACS_CNTL                                                         0xa9
+#define mmPCIE_ATS_ENH_CAP_LIST                                                 0xac
+#define mmPCIE_ATS_CAP                                                          0xad
+#define mmPCIE_ATS_CNTL                                                         0xad
+#define mmPCIE_PAGE_REQ_ENH_CAP_LIST                                            0xb0
+#define mmPCIE_PAGE_REQ_CNTL                                                    0xb1
+#define mmPCIE_PAGE_REQ_STATUS                                                  0xb1
+#define mmPCIE_OUTSTAND_PAGE_REQ_CAPACITY                                       0xb2
+#define mmPCIE_OUTSTAND_PAGE_REQ_ALLOC                                          0xb3
+#define mmPCIE_PASID_ENH_CAP_LIST                                               0xb4
+#define mmPCIE_PASID_CAP                                                        0xb5
+#define mmPCIE_PASID_CNTL                                                       0xb5
+#define mmPCIE_TPH_REQR_ENH_CAP_LIST                                            0xb8
+#define mmPCIE_TPH_REQR_CAP                                                     0xb9
+#define mmPCIE_TPH_REQR_CNTL                                                    0xba
+#define mmPCIE_MC_ENH_CAP_LIST                                                  0xbc
+#define mmPCIE_MC_CAP                                                           0xbd
+#define mmPCIE_MC_CNTL                                                          0xbd
+#define mmPCIE_MC_ADDR0                                                         0xbe
+#define mmPCIE_MC_ADDR1                                                         0xbf
+#define mmPCIE_MC_RCV0                                                          0xc0
+#define mmPCIE_MC_RCV1                                                          0xc1
+#define mmPCIE_MC_BLOCK_ALL0                                                    0xc2
+#define mmPCIE_MC_BLOCK_ALL1                                                    0xc3
+#define mmPCIE_MC_BLOCK_UNTRANSLATED_0                                          0xc4
+#define mmPCIE_MC_BLOCK_UNTRANSLATED_1                                          0xc5
+#define mmPCIE_LTR_ENH_CAP_LIST                                                 0xc8
+#define mmPCIE_LTR_CAP                                                          0xc9
+#define ixMM_INDEX_IND                                                          0x1090000
+#define ixMM_INDEX_HI_IND                                                       0x1090006
+#define ixMM_DATA_IND                                                           0x1090001
+#define ixBIF_MM_INDACCESS_CNTL_IND                                             0x1091500
+#define ixBUS_CNTL_IND                                                          0x1091508
+#define ixCONFIG_CNTL_IND                                                       0x1091509
+#define ixCONFIG_MEMSIZE_IND                                                    0x109150a
+#define ixCONFIG_F0_BASE_IND                                                    0x109150b
+#define ixCONFIG_APER_SIZE_IND                                                  0x109150c
+#define ixCONFIG_REG_APER_SIZE_IND                                              0x109150d
+#define ixBIF_SCRATCH0_IND                                                      0x109150e
+#define ixBIF_SCRATCH1_IND                                                      0x109150f
+#define ixBX_RESET_EN_IND                                                       0x1091514
+#define ixMM_CFGREGS_CNTL_IND                                                   0x1091513
+#define ixHW_DEBUG_IND                                                          0x1091515
+#define ixMASTER_CREDIT_CNTL_IND                                                0x1091516
+#define ixSLAVE_REQ_CREDIT_CNTL_IND                                             0x1091517
+#define ixBX_RESET_CNTL_IND                                                     0x1091518
+#define ixINTERRUPT_CNTL_IND                                                    0x109151a
+#define ixINTERRUPT_CNTL2_IND                                                   0x109151b
+#define ixBIF_DEBUG_CNTL_IND                                                    0x109151c
+#define ixBIF_DEBUG_MUX_IND                                                     0x109151d
+#define ixBIF_DEBUG_OUT_IND                                                     0x109151e
+#define ixHDP_REG_COHERENCY_FLUSH_CNTL_IND                                      0x1091528
+#define ixHDP_MEM_COHERENCY_FLUSH_CNTL_IND                                      0x1091520
+#define ixCLKREQB_PAD_CNTL_IND                                                  0x1091521
+#define ixSMBDAT_PAD_CNTL_IND                                                   0x1091522
+#define ixSMBCLK_PAD_CNTL_IND                                                   0x1091523
+#define ixBIF_XDMA_LO_IND                                                       0x10914c0
+#define ixBIF_XDMA_HI_IND                                                       0x10914c1
+#define ixBIF_FEATURES_CONTROL_MISC_IND                                         0x10914c2
+#define ixBIF_DOORBELL_CNTL_IND                                                 0x10914c3
+#define ixBIF_SLVARB_MODE_IND                                                   0x10914c4
+#define ixBIF_FB_EN_IND                                                         0x1091524
+#define ixBIF_BUSNUM_CNTL1_IND                                                  0x1091525
+#define ixBIF_BUSNUM_LIST0_IND                                                  0x1091526
+#define ixBIF_BUSNUM_LIST1_IND                                                  0x1091527
+#define ixBIF_BUSNUM_CNTL2_IND                                                  0x109152b
+#define ixBIF_BUSY_DELAY_CNTR_IND                                               0x1091529
+#define ixBIF_PERFMON_CNTL_IND                                                  0x109152c
+#define ixBIF_PERFCOUNTER0_RESULT_IND                                           0x109152d
+#define ixBIF_PERFCOUNTER1_RESULT_IND                                           0x109152e
+#define ixSLAVE_HANG_PROTECTION_CNTL_IND                                        0x1091536
+#define ixGPU_HDP_FLUSH_REQ_IND                                                 0x1091537
+#define ixGPU_HDP_FLUSH_DONE_IND                                                0x1091538
+#define ixSLAVE_HANG_ERROR_IND                                                  0x109153b
+#define ixCAPTURE_HOST_BUSNUM_IND                                               0x109153c
+#define ixHOST_BUSNUM_IND                                                       0x109153d
+#define ixPEER_REG_RANGE0_IND                                                   0x109153e
+#define ixPEER_REG_RANGE1_IND                                                   0x109153f
+#define ixPEER0_FB_OFFSET_HI_IND                                                0x10914f3
+#define ixPEER0_FB_OFFSET_LO_IND                                                0x10914f2
+#define ixPEER1_FB_OFFSET_HI_IND                                                0x10914f1
+#define ixPEER1_FB_OFFSET_LO_IND                                                0x10914f0
+#define ixPEER2_FB_OFFSET_HI_IND                                                0x10914ef
+#define ixPEER2_FB_OFFSET_LO_IND                                                0x10914ee
+#define ixPEER3_FB_OFFSET_HI_IND                                                0x10914ed
+#define ixPEER3_FB_OFFSET_LO_IND                                                0x10914ec
+#define ixDBG_BYPASS_SRBM_ACCESS_IND                                            0x10914eb
+#define ixSMBUS_BACO_DUMMY_IND                                                  0x10914c6
+#define ixBIF_DEVFUNCNUM_LIST0_IND                                              0x10914e8
+#define ixBIF_DEVFUNCNUM_LIST1_IND                                              0x10914e7
+#define ixBACO_CNTL_IND                                                         0x10914e5
+#define ixBF_ANA_ISO_CNTL_IND                                                   0x10914c7
+#define ixMEM_TYPE_CNTL_IND                                                     0x10914e4
+#define ixBIF_BACO_DEBUG_IND                                                    0x10914df
+#define ixBIF_BACO_DEBUG_LATCH_IND                                              0x10914dc
+#define ixBACO_CNTL_MISC_IND                                                    0x10914db
+#define ixSMU_BIF_VDDGFX_PWR_STATUS_IND                                         0x10914f8
+#define ixBIF_VDDGFX_GFX0_LOWER_IND                                             0x1091428
+#define ixBIF_VDDGFX_GFX0_UPPER_IND                                             0x1091429
+#define ixBIF_VDDGFX_GFX1_LOWER_IND                                             0x109142a
+#define ixBIF_VDDGFX_GFX1_UPPER_IND                                             0x109142b
+#define ixBIF_VDDGFX_GFX2_LOWER_IND                                             0x109142c
+#define ixBIF_VDDGFX_GFX2_UPPER_IND                                             0x109142d
+#define ixBIF_VDDGFX_GFX3_LOWER_IND                                             0x109142e
+#define ixBIF_VDDGFX_GFX3_UPPER_IND                                             0x109142f
+#define ixBIF_VDDGFX_GFX4_LOWER_IND                                             0x1091430
+#define ixBIF_VDDGFX_GFX4_UPPER_IND                                             0x1091431
+#define ixBIF_VDDGFX_GFX5_LOWER_IND                                             0x1091432
+#define ixBIF_VDDGFX_GFX5_UPPER_IND                                             0x1091433
+#define ixBIF_VDDGFX_RSV1_LOWER_IND                                             0x1091434
+#define ixBIF_VDDGFX_RSV1_UPPER_IND                                             0x1091435
+#define ixBIF_VDDGFX_RSV2_LOWER_IND                                             0x1091436
+#define ixBIF_VDDGFX_RSV2_UPPER_IND                                             0x1091437
+#define ixBIF_VDDGFX_RSV3_LOWER_IND                                             0x1091438
+#define ixBIF_VDDGFX_RSV3_UPPER_IND                                             0x1091439
+#define ixBIF_VDDGFX_RSV4_LOWER_IND                                             0x109143a
+#define ixBIF_VDDGFX_RSV4_UPPER_IND                                             0x109143b
+#define ixBIF_VDDGFX_FB_CMP_IND                                                 0x109143c
+#define ixBIF_DOORBELL_GBLAPER1_LOWER_IND                                       0x10914fc
+#define ixBIF_DOORBELL_GBLAPER1_UPPER_IND                                       0x10914fd
+#define ixBIF_DOORBELL_GBLAPER2_LOWER_IND                                       0x10914fe
+#define ixBIF_DOORBELL_GBLAPER2_UPPER_IND                                       0x10914ff
+#define ixBIF_SMU_INDEX_IND                                                     0x109143d
+#define ixBIF_SMU_DATA_IND                                                      0x109143e
+#define ixIMPCTL_RESET_IND                                                      0x10914f5
+#define ixGARLIC_FLUSH_CNTL_IND                                                 0x1091401
+#define ixGARLIC_FLUSH_REQ_IND                                                  0x1091412
+#define ixGPU_GARLIC_FLUSH_REQ_IND                                              0x1091413
+#define ixGPU_GARLIC_FLUSH_DONE_IND                                             0x1091414
+#define ixGARLIC_COHE_CP_RB0_WPTR_IND                                           0x1091415
+#define ixGARLIC_COHE_CP_RB1_WPTR_IND                                           0x1091416
+#define ixGARLIC_COHE_CP_RB2_WPTR_IND                                           0x1091417
+#define ixGARLIC_COHE_UVD_RBC_RB_WPTR_IND                                       0x1091418
+#define ixGARLIC_COHE_SDMA0_GFX_RB_WPTR_IND                                     0x1091419
+#define ixGARLIC_COHE_SDMA1_GFX_RB_WPTR_IND                                     0x109141a
+#define ixGARLIC_COHE_CP_DMA_ME_COMMAND_IND                                     0x109141b
+#define ixGARLIC_COHE_CP_DMA_PFP_COMMAND_IND                                    0x109141c
+#define ixGARLIC_COHE_SAM_SAB_RBI_WPTR_IND                                      0x109141d
+#define ixGARLIC_COHE_SAM_SAB_RBO_WPTR_IND                                      0x109141e
+#define ixGARLIC_COHE_VCE_OUT_RB_WPTR_IND                                       0x109141f
+#define ixGARLIC_COHE_VCE_RB_WPTR2_IND                                          0x1091420
+#define ixGARLIC_COHE_VCE_RB_WPTR_IND                                           0x1091421
+#define ixGARLIC_COHE_SDMA2_GFX_RB_WPTR_IND                                     0x1091422
+#define ixGARLIC_COHE_SDMA3_GFX_RB_WPTR_IND                                     0x1091423
+#define ixGARLIC_COHE_CP_DMA_PIO_COMMAND_IND                                    0x1091424
+#define ixGARLIC_COHE_GARLIC_FLUSH_REQ_IND                                      0x1091425
+#define ixREMAP_HDP_MEM_FLUSH_CNTL_IND                                          0x1091426
+#define ixREMAP_HDP_REG_FLUSH_CNTL_IND                                          0x1091427
+#define ixBIOS_SCRATCH_0_IND                                                    0x10905c9
+#define ixBIOS_SCRATCH_1_IND                                                    0x10905ca
+#define ixBIOS_SCRATCH_2_IND                                                    0x10905cb
+#define ixBIOS_SCRATCH_3_IND                                                    0x10905cc
+#define ixBIOS_SCRATCH_4_IND                                                    0x10905cd
+#define ixBIOS_SCRATCH_5_IND                                                    0x10905ce
+#define ixBIOS_SCRATCH_6_IND                                                    0x10905cf
+#define ixBIOS_SCRATCH_7_IND                                                    0x10905d0
+#define ixBIOS_SCRATCH_8_IND                                                    0x10905d1
+#define ixBIOS_SCRATCH_9_IND                                                    0x10905d2
+#define ixBIOS_SCRATCH_10_IND                                                   0x10905d3
+#define ixBIOS_SCRATCH_11_IND                                                   0x10905d4
+#define ixBIOS_SCRATCH_12_IND                                                   0x10905d5
+#define ixBIOS_SCRATCH_13_IND                                                   0x10905d6
+#define ixBIOS_SCRATCH_14_IND                                                   0x10905d7
+#define ixBIOS_SCRATCH_15_IND                                                   0x10905d8
+#define ixBIF_RB_CNTL_IND                                                       0x1091530
+#define ixBIF_RB_BASE_IND                                                       0x1091531
+#define ixBIF_RB_RPTR_IND                                                       0x1091532
+#define ixBIF_RB_WPTR_IND                                                       0x1091533
+#define ixBIF_RB_WPTR_ADDR_HI_IND                                               0x1091534
+#define ixBIF_RB_WPTR_ADDR_LO_IND                                               0x1091535
+#define mmNB_GBIF_INDEX                                                         0x34
+#define mmNB_GBIF_DATA                                                          0x35
+#define mmPCIE_INDEX                                                            0xe
+#define mmPCIE_DATA                                                             0xf
+#define mmPCIE_INDEX_2                                                          0xc
+#define mmPCIE_DATA_2                                                           0xd
+#define ixPCIE_RESERVED                                                         0x1400000
+#define ixPCIE_SCRATCH                                                          0x1400001
+#define ixPCIE_HW_DEBUG                                                         0x1400002
+#define ixPCIE_RX_NUM_NAK                                                       0x140000e
+#define ixPCIE_RX_NUM_NAK_GENERATED                                             0x140000f
+#define ixPCIE_CNTL                                                             0x1400010
+#define ixPCIE_CONFIG_CNTL                                                      0x1400011
+#define ixPCIE_DEBUG_CNTL                                                       0x1400012
+#define ixPCIE_INT_CNTL                                                         0x140001a
+#define ixPCIE_INT_STATUS                                                       0x140001b
+#define ixPCIE_CNTL2                                                            0x140001c
+#define ixPCIE_RX_CNTL2                                                         0x140001d
+#define ixPCIE_TX_F0_ATTR_CNTL                                                  0x140001e
+#define ixPCIE_TX_F1_F2_ATTR_CNTL                                               0x140001f
+#define ixPCIE_CI_CNTL                                                          0x1400020
+#define ixPCIE_BUS_CNTL                                                         0x1400021
+#define ixPCIE_LC_STATE6                                                        0x1400022
+#define ixPCIE_LC_STATE7                                                        0x1400023
+#define ixPCIE_LC_STATE8                                                        0x1400024
+#define ixPCIE_LC_STATE9                                                        0x1400025
+#define ixPCIE_LC_STATE10                                                       0x1400026
+#define ixPCIE_LC_STATE11                                                       0x1400027
+#define ixPCIE_LC_STATUS1                                                       0x1400028
+#define ixPCIE_LC_STATUS2                                                       0x1400029
+#define ixPCIE_WPR_CNTL                                                         0x1400030
+#define ixPCIE_RX_LAST_TLP0                                                     0x1400031
+#define ixPCIE_RX_LAST_TLP1                                                     0x1400032
+#define ixPCIE_RX_LAST_TLP2                                                     0x1400033
+#define ixPCIE_RX_LAST_TLP3                                                     0x1400034
+#define ixPCIE_TX_LAST_TLP0                                                     0x1400035
+#define ixPCIE_TX_LAST_TLP1                                                     0x1400036
+#define ixPCIE_TX_LAST_TLP2                                                     0x1400037
+#define ixPCIE_TX_LAST_TLP3                                                     0x1400038
+#define ixPCIE_I2C_REG_ADDR_EXPAND                                              0x140003a
+#define ixPCIE_I2C_REG_DATA                                                     0x140003b
+#define ixPCIE_CFG_CNTL                                                         0x140003c
+#define ixPCIE_P_CNTL                                                           0x1400040
+#define ixPCIE_P_BUF_STATUS                                                     0x1400041
+#define ixPCIE_P_DECODER_STATUS                                                 0x1400042
+#define ixPCIE_P_MISC_STATUS                                                    0x1400043
+#define ixPCIE_P_RCV_L0S_FTS_DET                                                0x1400050
+#define ixPCIE_OBFF_CNTL                                                        0x1400061
+#define ixPCIE_TX_LTR_CNTL                                                      0x1400060
+#define ixPCIE_PERF_COUNT_CNTL                                                  0x1400080
+#define ixPCIE_PERF_CNTL_TXCLK                                                  0x1400081
+#define ixPCIE_PERF_COUNT0_TXCLK                                                0x1400082
+#define ixPCIE_PERF_COUNT1_TXCLK                                                0x1400083
+#define ixPCIE_PERF_CNTL_MST_R_CLK                                              0x1400084
+#define ixPCIE_PERF_COUNT0_MST_R_CLK                                            0x1400085
+#define ixPCIE_PERF_COUNT1_MST_R_CLK                                            0x1400086
+#define ixPCIE_PERF_CNTL_MST_C_CLK                                              0x1400087
+#define ixPCIE_PERF_COUNT0_MST_C_CLK                                            0x1400088
+#define ixPCIE_PERF_COUNT1_MST_C_CLK                                            0x1400089
+#define ixPCIE_PERF_CNTL_SLV_R_CLK                                              0x140008a
+#define ixPCIE_PERF_COUNT0_SLV_R_CLK                                            0x140008b
+#define ixPCIE_PERF_COUNT1_SLV_R_CLK                                            0x140008c
+#define ixPCIE_PERF_CNTL_SLV_S_C_CLK                                            0x140008d
+#define ixPCIE_PERF_COUNT0_SLV_S_C_CLK                                          0x140008e
+#define ixPCIE_PERF_COUNT1_SLV_S_C_CLK                                          0x140008f
+#define ixPCIE_PERF_CNTL_SLV_NS_C_CLK                                           0x1400090
+#define ixPCIE_PERF_COUNT0_SLV_NS_C_CLK                                         0x1400091
+#define ixPCIE_PERF_COUNT1_SLV_NS_C_CLK                                         0x1400092
+#define ixPCIE_PERF_CNTL_EVENT0_PORT_SEL                                        0x1400093
+#define ixPCIE_PERF_CNTL_EVENT1_PORT_SEL                                        0x1400094
+#define ixPCIE_PERF_CNTL_TXCLK2                                                 0x1400095
+#define ixPCIE_PERF_COUNT0_TXCLK2                                               0x1400096
+#define ixPCIE_PERF_COUNT1_TXCLK2                                               0x1400097
+#define ixPCIE_STRAP_F0                                                         0x14000b0
+#define ixPCIE_STRAP_F1                                                         0x14000b1
+#define ixPCIE_STRAP_F2                                                         0x14000b2
+#define ixPCIE_STRAP_F3                                                         0x14000b3
+#define ixPCIE_STRAP_F4                                                         0x14000b4
+#define ixPCIE_STRAP_F5                                                         0x14000b5
+#define ixPCIE_STRAP_F6                                                         0x14000b6
+#define ixPCIE_STRAP_F7                                                         0x14000b7
+#define ixPCIE_STRAP_MISC                             

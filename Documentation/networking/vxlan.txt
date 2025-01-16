@@ -1,51 +1,63 @@
-Virtual eXtensible Local Area Networking documentation
-======================================================
+/*
+ * APM X-Gene SoC EDAC (error detection and correction)
+ *
+ * Copyright (c) 2015, Applied Micro Circuits Corporation
+ * Author: Feng Kan <fkan@apm.com>
+ *         Loc Ho <lho@apm.com>
+ *
+ * This program is free software; you can redistribute  it and/or modify it
+ * under  the terms of  the GNU General  Public License as published by the
+ * Free Software Foundation;  either version 2 of the  License, or (at your
+ * option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-The VXLAN protocol is a tunnelling protocol designed to solve the
-problem of limited VLAN IDs (4096) in IEEE 802.1q.  With VXLAN the
-size of the identifier is expanded to 24 bits (16777216).
+#include <linux/ctype.h>
+#include <linux/edac.h>
+#include <linux/interrupt.h>
+#include <linux/mfd/syscon.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/regmap.h>
 
-VXLAN is described by IETF RFC 7348, and has been implemented by a
-number of vendors.  The protocol runs over UDP using a single
-destination port.  This document describes the Linux kernel tunnel
-device, there is also a separate implementation of VXLAN for
-Openvswitch.
+#include "edac_core.h"
+#include "edac_module.h"
 
-Unlike most tunnels, a VXLAN is a 1 to N network, not just point to
-point. A VXLAN device can learn the IP address of the other endpoint
-either dynamically in a manner similar to a learning bridge, or make
-use of statically-configured forwarding entries.
+#define EDAC_MOD_STR			"xgene_edac"
 
-The management of vxlan is done in a manner similar to its two closest
-neighbors GRE and VLAN. Configuring VXLAN requires the version of
-iproute2 that matches the kernel release where VXLAN was first merged
-upstream.
+/* Global error configuration status registers (CSR) */
+#define PCPHPERRINTSTS			0x0000
+#define PCPHPERRINTMSK			0x0004
+#define  MCU_CTL_ERR_MASK		BIT(12)
+#define  IOB_PA_ERR_MASK		BIT(11)
+#define  IOB_BA_ERR_MASK		BIT(10)
+#define  IOB_XGIC_ERR_MASK		BIT(9)
+#define  IOB_RB_ERR_MASK		BIT(8)
+#define  L3C_UNCORR_ERR_MASK		BIT(5)
+#define  MCU_UNCORR_ERR_MASK		BIT(4)
+#define  PMD3_MERR_MASK			BIT(3)
+#define  PMD2_MERR_MASK			BIT(2)
+#define  PMD1_MERR_MASK			BIT(1)
+#define  PMD0_MERR_MASK			BIT(0)
+#define PCPLPERRINTSTS			0x0008
+#define PCPLPERRINTMSK			0x000C
+#define  CSW_SWITCH_TRACE_ERR_MASK	BIT(2)
+#define  L3C_CORR_ERR_MASK		BIT(1)
+#define  MCU_CORR_ERR_MASK		BIT(0)
+#define MEMERRINTSTS			0x0010
+#define MEMERRINTMSK			0x0014
 
-1. Create vxlan device
- # ip link add vxlan0 type vxlan id 42 group 239.1.1.1 dev eth1 dstport 4789
-
-This creates a new device named vxlan0.  The device uses the multicast
-group 239.1.1.1 over eth1 to handle traffic for which there is no
-entry in the forwarding table.  The destination port number is set to
-the IANA-assigned value of 4789.  The Linux implementation of VXLAN
-pre-dates the IANA's selection of a standard destination port number
-and uses the Linux-selected value by default to maintain backwards
-compatibility.
-
-2. Delete vxlan device
-  # ip link delete vxlan0
-
-3. Show vxlan info
-  # ip -d link show vxlan0
-
-It is possible to create, destroy and display the vxlan
-forwarding table using the new bridge command.
-
-1. Create forwarding table entry
-  # bridge fdb add to 00:17:42:8a:b4:05 dst 192.19.0.2 dev vxlan0
-
-2. Delete forwarding table entry
-  # bridge fdb delete 00:17:42:8a:b4:05 dev vxlan0
-
-3. Show forwarding table
-  # bridge fdb show dev vxlan0
+struct xgene_edac {
+	struct device		*dev;
+	struct regmap		*csw_map;
+	struct regmap		*mcba_map;
+	struct regmap		*mcbb_map;
+	struct regmap		

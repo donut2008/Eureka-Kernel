@@ -1,414 +1,132 @@
-/*
- * Copyright (c) 2004 Topspin Corporation.  All rights reserved.
- * Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-#include <linux/errno.h>
-#include <linux/string.h>
-#include <linux/export.h>
-#include <linux/if_ether.h>
-
-#include <rdma/ib_pack.h>
-
-#define STRUCT_FIELD(header, field) \
-	.struct_offset_bytes = offsetof(struct ib_unpacked_ ## header, field),      \
-	.struct_size_bytes   = sizeof ((struct ib_unpacked_ ## header *) 0)->field, \
-	.field_name          = #header ":" #field
-
-static const struct ib_field lrh_table[]  = {
-	{ STRUCT_FIELD(lrh, virtual_lane),
-	  .offset_words = 0,
-	  .offset_bits  = 0,
-	  .size_bits    = 4 },
-	{ STRUCT_FIELD(lrh, link_version),
-	  .offset_words = 0,
-	  .offset_bits  = 4,
-	  .size_bits    = 4 },
-	{ STRUCT_FIELD(lrh, service_level),
-	  .offset_words = 0,
-	  .offset_bits  = 8,
-	  .size_bits    = 4 },
-	{ RESERVED,
-	  .offset_words = 0,
-	  .offset_bits  = 12,
-	  .size_bits    = 2 },
-	{ STRUCT_FIELD(lrh, link_next_header),
-	  .offset_words = 0,
-	  .offset_bits  = 14,
-	  .size_bits    = 2 },
-	{ STRUCT_FIELD(lrh, destination_lid),
-	  .offset_words = 0,
-	  .offset_bits  = 16,
-	  .size_bits    = 16 },
-	{ RESERVED,
-	  .offset_words = 1,
-	  .offset_bits  = 0,
-	  .size_bits    = 5 },
-	{ STRUCT_FIELD(lrh, packet_length),
-	  .offset_words = 1,
-	  .offset_bits  = 5,
-	  .size_bits    = 11 },
-	{ STRUCT_FIELD(lrh, source_lid),
-	  .offset_words = 1,
-	  .offset_bits  = 16,
-	  .size_bits    = 16 }
-};
-
-static const struct ib_field eth_table[]  = {
-	{ STRUCT_FIELD(eth, dmac_h),
-	  .offset_words = 0,
-	  .offset_bits  = 0,
-	  .size_bits    = 32 },
-	{ STRUCT_FIELD(eth, dmac_l),
-	  .offset_words = 1,
-	  .offset_bits  = 0,
-	  .size_bits    = 16 },
-	{ STRUCT_FIELD(eth, smac_h),
-	  .offset_words = 1,
-	  .offset_bits  = 16,
-	  .size_bits    = 16 },
-	{ STRUCT_FIELD(eth, smac_l),
-	  .offset_words = 2,
-	  .offset_bits  = 0,
-	  .size_bits    = 32 },
-	{ STRUCT_FIELD(eth, type),
-	  .offset_words = 3,
-	  .offset_bits  = 0,
-	  .size_bits    = 16 }
-};
-
-static const struct ib_field vlan_table[]  = {
-	{ STRUCT_FIELD(vlan, tag),
-	  .offset_words = 0,
-	  .offset_bits  = 0,
-	  .size_bits    = 16 },
-	{ STRUCT_FIELD(vlan, type),
-	  .offset_words = 0,
-	  .offset_bits  = 16,
-	  .size_bits    = 16 }
-};
-
-static const struct ib_field grh_table[]  = {
-	{ STRUCT_FIELD(grh, ip_version),
-	  .offset_words = 0,
-	  .offset_bits  = 0,
-	  .size_bits    = 4 },
-	{ STRUCT_FIELD(grh, traffic_class),
-	  .offset_words = 0,
-	  .offset_bits  = 4,
-	  .size_bits    = 8 },
-	{ STRUCT_FIELD(grh, flow_label),
-	  .offset_words = 0,
-	  .offset_bits  = 12,
-	  .size_bits    = 20 },
-	{ STRUCT_FIELD(grh, payload_length),
-	  .offset_words = 1,
-	  .offset_bits  = 0,
-	  .size_bits    = 16 },
-	{ STRUCT_FIELD(grh, next_header),
-	  .offset_words = 1,
-	  .offset_bits  = 16,
-	  .size_bits    = 8 },
-	{ STRUCT_FIELD(grh, hop_limit),
-	  .offset_words = 1,
-	  .offset_bits  = 24,
-	  .size_bits    = 8 },
-	{ STRUCT_FIELD(grh, source_gid),
-	  .offset_words = 2,
-	  .offset_bits  = 0,
-	  .size_bits    = 128 },
-	{ STRUCT_FIELD(grh, destination_gid),
-	  .offset_words = 6,
-	  .offset_bits  = 0,
-	  .size_bits    = 128 }
-};
-
-static const struct ib_field bth_table[]  = {
-	{ STRUCT_FIELD(bth, opcode),
-	  .offset_words = 0,
-	  .offset_bits  = 0,
-	  .size_bits    = 8 },
-	{ STRUCT_FIELD(bth, solicited_event),
-	  .offset_words = 0,
-	  .offset_bits  = 8,
-	  .size_bits    = 1 },
-	{ STRUCT_FIELD(bth, mig_req),
-	  .offset_words = 0,
-	  .offset_bits  = 9,
-	  .size_bits    = 1 },
-	{ STRUCT_FIELD(bth, pad_count),
-	  .offset_words = 0,
-	  .offset_bits  = 10,
-	  .size_bits    = 2 },
-	{ STRUCT_FIELD(bth, transport_header_version),
-	  .offset_words = 0,
-	  .offset_bits  = 12,
-	  .size_bits    = 4 },
-	{ STRUCT_FIELD(bth, pkey),
-	  .offset_words = 0,
-	  .offset_bits  = 16,
-	  .size_bits    = 16 },
-	{ RESERVED,
-	  .offset_words = 1,
-	  .offset_bits  = 0,
-	  .size_bits    = 8 },
-	{ STRUCT_FIELD(bth, destination_qpn),
-	  .offset_words = 1,
-	  .offset_bits  = 8,
-	  .size_bits    = 24 },
-	{ STRUCT_FIELD(bth, ack_req),
-	  .offset_words = 2,
-	  .offset_bits  = 0,
-	  .size_bits    = 1 },
-	{ RESERVED,
-	  .offset_words = 2,
-	  .offset_bits  = 1,
-	  .size_bits    = 7 },
-	{ STRUCT_FIELD(bth, psn),
-	  .offset_words = 2,
-	  .offset_bits  = 8,
-	  .size_bits    = 24 }
-};
-
-static const struct ib_field deth_table[] = {
-	{ STRUCT_FIELD(deth, qkey),
-	  .offset_words = 0,
-	  .offset_bits  = 0,
-	  .size_bits    = 32 },
-	{ RESERVED,
-	  .offset_words = 1,
-	  .offset_bits  = 0,
-	  .size_bits    = 8 },
-	{ STRUCT_FIELD(deth, source_qpn),
-	  .offset_words = 1,
-	  .offset_bits  = 8,
-	  .size_bits    = 24 }
-};
-
-/**
- * ib_ud_header_init - Initialize UD header structure
- * @payload_bytes:Length of packet payload
- * @lrh_present: specify if LRH is present
- * @eth_present: specify if Eth header is present
- * @vlan_present: packet is tagged vlan
- * @grh_present:GRH flag (if non-zero, GRH will be included)
- * @immediate_present: specify if immediate data is present
- * @header:Structure to initialize
- */
-void ib_ud_header_init(int     		    payload_bytes,
-		       int		    lrh_present,
-		       int		    eth_present,
-		       int		    vlan_present,
-		       int    		    grh_present,
-		       int		    immediate_present,
-		       struct ib_ud_header *header)
-{
-	memset(header, 0, sizeof *header);
-
-	if (lrh_present) {
-		u16 packet_length;
-
-		header->lrh.link_version     = 0;
-		header->lrh.link_next_header =
-			grh_present ? IB_LNH_IBA_GLOBAL : IB_LNH_IBA_LOCAL;
-		packet_length = (IB_LRH_BYTES	+
-				 IB_BTH_BYTES	+
-				 IB_DETH_BYTES	+
-				 (grh_present ? IB_GRH_BYTES : 0) +
-				 payload_bytes	+
-				 4		+ /* ICRC     */
-				 3) / 4;	  /* round up */
-		header->lrh.packet_length = cpu_to_be16(packet_length);
-	}
-
-	if (vlan_present)
-		header->eth.type = cpu_to_be16(ETH_P_8021Q);
-
-	if (grh_present) {
-		header->grh.ip_version      = 6;
-		header->grh.payload_length  =
-			cpu_to_be16((IB_BTH_BYTES     +
-				     IB_DETH_BYTES    +
-				     payload_bytes    +
-				     4                + /* ICRC     */
-				     3) & ~3);          /* round up */
-		header->grh.next_header     = 0x1b;
-	}
-
-	if (immediate_present)
-		header->bth.opcode           = IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE;
-	else
-		header->bth.opcode           = IB_OPCODE_UD_SEND_ONLY;
-	header->bth.pad_count                = (4 - payload_bytes) & 3;
-	header->bth.transport_header_version = 0;
-
-	header->lrh_present = lrh_present;
-	header->eth_present = eth_present;
-	header->vlan_present = vlan_present;
-	header->grh_present = grh_present;
-	header->immediate_present = immediate_present;
-}
-EXPORT_SYMBOL(ib_ud_header_init);
-
-/**
- * ib_ud_header_pack - Pack UD header struct into wire format
- * @header:UD header struct
- * @buf:Buffer to pack into
- *
- * ib_ud_header_pack() packs the UD header structure @header into wire
- * format in the buffer @buf.
- */
-int ib_ud_header_pack(struct ib_ud_header *header,
-		      void                *buf)
-{
-	int len = 0;
-
-	if (header->lrh_present) {
-		ib_pack(lrh_table, ARRAY_SIZE(lrh_table),
-			&header->lrh, buf + len);
-		len += IB_LRH_BYTES;
-	}
-	if (header->eth_present) {
-		ib_pack(eth_table, ARRAY_SIZE(eth_table),
-			&header->eth, buf + len);
-		len += IB_ETH_BYTES;
-	}
-	if (header->vlan_present) {
-		ib_pack(vlan_table, ARRAY_SIZE(vlan_table),
-			&header->vlan, buf + len);
-		len += IB_VLAN_BYTES;
-	}
-	if (header->grh_present) {
-		ib_pack(grh_table, ARRAY_SIZE(grh_table),
-			&header->grh, buf + len);
-		len += IB_GRH_BYTES;
-	}
-
-	ib_pack(bth_table, ARRAY_SIZE(bth_table),
-		&header->bth, buf + len);
-	len += IB_BTH_BYTES;
-
-	ib_pack(deth_table, ARRAY_SIZE(deth_table),
-		&header->deth, buf + len);
-	len += IB_DETH_BYTES;
-
-	if (header->immediate_present) {
-		memcpy(buf + len, &header->immediate_data, sizeof header->immediate_data);
-		len += sizeof header->immediate_data;
-	}
-
-	return len;
-}
-EXPORT_SYMBOL(ib_ud_header_pack);
-
-/**
- * ib_ud_header_unpack - Unpack UD header struct from wire format
- * @header:UD header struct
- * @buf:Buffer to pack into
- *
- * ib_ud_header_pack() unpacks the UD header structure @header from wire
- * format in the buffer @buf.
- */
-int ib_ud_header_unpack(void                *buf,
-			struct ib_ud_header *header)
-{
-	ib_unpack(lrh_table, ARRAY_SIZE(lrh_table),
-		  buf, &header->lrh);
-	buf += IB_LRH_BYTES;
-
-	if (header->lrh.link_version != 0) {
-		printk(KERN_WARNING "Invalid LRH.link_version %d\n",
-		       header->lrh.link_version);
-		return -EINVAL;
-	}
-
-	switch (header->lrh.link_next_header) {
-	case IB_LNH_IBA_LOCAL:
-		header->grh_present = 0;
-		break;
-
-	case IB_LNH_IBA_GLOBAL:
-		header->grh_present = 1;
-		ib_unpack(grh_table, ARRAY_SIZE(grh_table),
-			  buf, &header->grh);
-		buf += IB_GRH_BYTES;
-
-		if (header->grh.ip_version != 6) {
-			printk(KERN_WARNING "Invalid GRH.ip_version %d\n",
-			       header->grh.ip_version);
-			return -EINVAL;
-		}
-		if (header->grh.next_header != 0x1b) {
-			printk(KERN_WARNING "Invalid GRH.next_header 0x%02x\n",
-			       header->grh.next_header);
-			return -EINVAL;
-		}
-		break;
-
-	default:
-		printk(KERN_WARNING "Invalid LRH.link_next_header %d\n",
-		       header->lrh.link_next_header);
-		return -EINVAL;
-	}
-
-	ib_unpack(bth_table, ARRAY_SIZE(bth_table),
-		  buf, &header->bth);
-	buf += IB_BTH_BYTES;
-
-	switch (header->bth.opcode) {
-	case IB_OPCODE_UD_SEND_ONLY:
-		header->immediate_present = 0;
-		break;
-	case IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE:
-		header->immediate_present = 1;
-		break;
-	default:
-		printk(KERN_WARNING "Invalid BTH.opcode 0x%02x\n",
-		       header->bth.opcode);
-		return -EINVAL;
-	}
-
-	if (header->bth.transport_header_version != 0) {
-		printk(KERN_WARNING "Invalid BTH.transport_header_version %d\n",
-		       header->bth.transport_header_version);
-		return -EINVAL;
-	}
-
-	ib_unpack(deth_table, ARRAY_SIZE(deth_table),
-		  buf, &header->deth);
-	buf += IB_DETH_BYTES;
-
-	if (header->immediate_present)
-		memcpy(&header->immediate_data, buf, sizeof header->immediate_data);
-
-	return 0;
-}
-EXPORT_SYMBOL(ib_ud_header_unpack);
+  0x5c63
+#define mmDP_AUX4_AUX_GTC_SYNC_ERROR_CONTROL                                    0x5c7f
+#define mmDP_AUX5_AUX_GTC_SYNC_ERROR_CONTROL                                    0x5c9b
+#define mmAUX_GTC_SYNC_CONTROLLER_STATUS                                        0x5c10
+#define mmDP_AUX0_AUX_GTC_SYNC_CONTROLLER_STATUS                                0x5c10
+#define mmDP_AUX1_AUX_GTC_SYNC_CONTROLLER_STATUS                                0x5c2c
+#define mmDP_AUX2_AUX_GTC_SYNC_CONTROLLER_STATUS                                0x5c48
+#define mmDP_AUX3_AUX_GTC_SYNC_CONTROLLER_STATUS                                0x5c64
+#define mmDP_AUX4_AUX_GTC_SYNC_CONTROLLER_STATUS                                0x5c80
+#define mmDP_AUX5_AUX_GTC_SYNC_CONTROLLER_STATUS                                0x5c9c
+#define mmAUX_GTC_SYNC_STATUS                                                   0x5c11
+#define mmDP_AUX0_AUX_GTC_SYNC_STATUS                                           0x5c11
+#define mmDP_AUX1_AUX_GTC_SYNC_STATUS                                           0x5c2d
+#define mmDP_AUX2_AUX_GTC_SYNC_STATUS                                           0x5c49
+#define mmDP_AUX3_AUX_GTC_SYNC_STATUS                                           0x5c65
+#define mmDP_AUX4_AUX_GTC_SYNC_STATUS                                           0x5c81
+#define mmDP_AUX5_AUX_GTC_SYNC_STATUS                                           0x5c9d
+#define mmAUX_GTC_SYNC_DATA                                                     0x5c12
+#define mmDP_AUX0_AUX_GTC_SYNC_DATA                                             0x5c12
+#define mmDP_AUX1_AUX_GTC_SYNC_DATA                                             0x5c2e
+#define mmDP_AUX2_AUX_GTC_SYNC_DATA                                             0x5c4a
+#define mmDP_AUX3_AUX_GTC_SYNC_DATA                                             0x5c66
+#define mmDP_AUX4_AUX_GTC_SYNC_DATA                                             0x5c82
+#define mmDP_AUX5_AUX_GTC_SYNC_DATA                                             0x5c9e
+#define mmAUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE                                    0x5c13
+#define mmDP_AUX0_AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE                            0x5c13
+#define mmDP_AUX1_AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE                            0x5c2f
+#define mmDP_AUX2_AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE                            0x5c4b
+#define mmDP_AUX3_AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE                            0x5c67
+#define mmDP_AUX4_AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE                            0x5c83
+#define mmDP_AUX5_AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE                            0x5c9f
+#define mmAUX_TEST_DEBUG_INDEX                                                  0x5c14
+#define mmDP_AUX0_AUX_TEST_DEBUG_INDEX                                          0x5c14
+#define mmDP_AUX1_AUX_TEST_DEBUG_INDEX                                          0x5c30
+#define mmDP_AUX2_AUX_TEST_DEBUG_INDEX                                          0x5c4c
+#define mmDP_AUX3_AUX_TEST_DEBUG_INDEX                                          0x5c68
+#define mmDP_AUX4_AUX_TEST_DEBUG_INDEX                                          0x5c84
+#define mmDP_AUX5_AUX_TEST_DEBUG_INDEX                                          0x5ca0
+#define mmAUX_TEST_DEBUG_DATA                                                   0x5c15
+#define mmDP_AUX0_AUX_TEST_DEBUG_DATA                                           0x5c15
+#define mmDP_AUX1_AUX_TEST_DEBUG_DATA                                           0x5c31
+#define mmDP_AUX2_AUX_TEST_DEBUG_DATA                                           0x5c4d
+#define mmDP_AUX3_AUX_TEST_DEBUG_DATA                                           0x5c69
+#define mmDP_AUX4_AUX_TEST_DEBUG_DATA                                           0x5c85
+#define mmDP_AUX5_AUX_TEST_DEBUG_DATA                                           0x5ca1
+#define ixDP_AUX_DEBUG_A                                                        0x10
+#define ixDP_AUX_DEBUG_B                                                        0x11
+#define ixDP_AUX_DEBUG_C                                                        0x12
+#define ixDP_AUX_DEBUG_D                                                        0x13
+#define ixDP_AUX_DEBUG_E                                                        0x14
+#define ixDP_AUX_DEBUG_F                                                        0x15
+#define ixDP_AUX_DEBUG_G                                                        0x16
+#define ixDP_AUX_DEBUG_H                                                        0x17
+#define ixDP_AUX_DEBUG_I                                                        0x18
+#define ixDP_AUX_DEBUG_J                                                        0x19
+#define ixDP_AUX_DEBUG_K                                                        0x1a
+#define ixDP_AUX_DEBUG_L                                                        0x1b
+#define ixDP_AUX_DEBUG_M                                                        0x1c
+#define ixDP_AUX_DEBUG_N                                                        0x1d
+#define ixDP_AUX_DEBUG_O                                                        0x1e
+#define ixDP_AUX_DEBUG_P                                                        0x1f
+#define ixDP_AUX_DEBUG_Q                                                        0x20
+#define mmDVO_ENABLE                                                            0x16a0
+#define mmDVO_SOURCE_SELECT                                                     0x16a1
+#define mmDVO_OUTPUT                                                            0x16a2
+#define mmDVO_CONTROL                                                           0x16a3
+#define mmDVO_CRC_EN                                                            0x16a4
+#define mmDVO_CRC2_SIG_MASK                                                     0x16a5
+#define mmDVO_CRC2_SIG_RESULT                                                   0x16a6
+#define mmDVO_FIFO_ERROR_STATUS                                                 0x16a7
+#define mmDVO_TEST_DEBUG_INDEX                                                  0x16a8
+#define mmDVO_TEST_DEBUG_DATA                                                   0x16a9
+#define mmFBC_CNTL                                                              0x280
+#define mmFBC_IDLE_MASK                                                         0x281
+#define mmFBC_IDLE_FORCE_CLEAR_MASK                                             0x282
+#define mmFBC_START_STOP_DELAY                                                  0x283
+#define mmFBC_COMP_CNTL                                                         0x284
+#define mmFBC_COMP_MODE                                                         0x285
+#define mmFBC_DEBUG0                                                            0x286
+#define mmFBC_DEBUG1                                                            0x287
+#define mmFBC_DEBUG2                                                            0x288
+#define mmFBC_IND_LUT0                                                          0x289
+#define mmFBC_IND_LUT1                                                          0x28a
+#define mmFBC_IND_LUT2                                                          0x28b
+#define mmFBC_IND_LUT3                                                          0x28c
+#define mmFBC_IND_LUT4                                                          0x28d
+#define mmFBC_IND_LUT5                                                          0x28e
+#define mmFBC_IND_LUT6                                                          0x28f
+#define mmFBC_IND_LUT7                                                          0x290
+#define mmFBC_IND_LUT8                                                          0x291
+#define mmFBC_IND_LUT9                                                          0x292
+#define mmFBC_IND_LUT10                                                         0x293
+#define mmFBC_IND_LUT11                                                         0x294
+#define mmFBC_IND_LUT12                                                         0x295
+#define mmFBC_IND_LUT13                                                         0x296
+#define mmFBC_IND_LUT14                                                         0x297
+#define mmFBC_IND_LUT15                                                         0x298
+#define mmFBC_CSM_REGION_OFFSET_01                                              0x299
+#define mmFBC_CSM_REGION_OFFSET_23                                              0x29a
+#define mmFBC_CLIENT_REGION_MASK                                                0x29b
+#define mmFBC_DEBUG_COMP                                                        0x29c
+#define mmFBC_DEBUG_CSR                                                         0x29d
+#define mmFBC_DEBUG_CSR_RDATA                                                   0x29e
+#define mmFBC_DEBUG_CSR_WDATA                                                   0x29f
+#define mmFBC_DEBUG_CSR_RDATA_HI                                                0x2a0
+#define mmFBC_DEBUG_CSR_WDATA_HI                                                0x2a1
+#define mmFBC_MISC                                                              0x2a2
+#define mmFBC_STATUS                                                            0x2a3
+#define mmFBC_TEST_DEBUG_INDEX                                                  0x2a4
+#define mmFBC_TEST_DEBUG_DATA                                                   0x2a5
+#define mmFMT_CLAMP_COMPONENT_R                                                 0x1be8
+#define mmFMT0_FMT_CLAMP_COMPONENT_R                                            0x1be8
+#define mmFMT1_FMT_CLAMP_COMPONENT_R                                            0x1de8
+#define mmFMT2_FMT_CLAMP_COMPONENT_R                                            0x1fe8
+#define mmFMT3_FMT_CLAMP_COMPONENT_R                                            0x41e8
+#define mmFMT4_FMT_CLAMP_COMPONENT_R                                            0x43e8
+#define mmFMT5_FMT_CLAMP_COMPONENT_R                                            0x45e8
+#define mmFMT_CLAMP_COMPONENT_G                                                 0x1be9
+#define mmFMT0_FMT_CLAMP_COMPONENT_G                                            0x1be9
+#define mmFMT1_FMT_CLAMP_COMPONENT_G                                            0x1de9
+#define mmFMT2_FMT_CLAMP_COMPONENT_G                                            0x1fe9
+#define mmFMT3_FMT_CLAMP_COMPONENT_G                                            0x41e9
+#define mmFMT4_FMT_CLAMP_COMPONENT_G                                            0x43e9
+#define mmFMT5_FMT_CLAMP_COMPONENT_G                                            0x45e9
+#define mmFMT_CLAMP_COMPONENT_B                                                 0x1bea
+#define mmFMT0_FMT_CLAMP_COMPONENT_B                                            0x1bea
+#define mmFMT1_FMT_CLAMP_COMPONENT_B                                            0x1dea
+#define mmFMT2_FMT_CLAMP_COMPONENT_B                                            0x1fea
+#define mmFMT3_FMT_CLAMP_COMPONENT_B                                            0x41ea
+#define mmFMT4_FMT_CLAMP_COMPONENT_B                                            0x43ea
+#define mmFMT5_FMT_CLAMP_COMPONENT_B                                            0x45ea
+#define mmFMT_DYNAMIC_EXP_CNTL       

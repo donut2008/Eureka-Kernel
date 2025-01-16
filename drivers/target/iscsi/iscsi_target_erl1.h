@@ -1,26 +1,17 @@
-#ifndef ISCSI_TARGET_ERL1_H
-#define ISCSI_TARGET_ERL1_H
-
-extern int iscsit_dump_data_payload(struct iscsi_conn *, u32, int);
-extern int iscsit_create_recovery_datain_values_datasequenceinorder_yes(
-			struct iscsi_cmd *, struct iscsi_datain_req *);
-extern int iscsit_create_recovery_datain_values_datasequenceinorder_no(
-			struct iscsi_cmd *, struct iscsi_datain_req *);
-extern int iscsit_handle_recovery_datain_or_r2t(struct iscsi_conn *, unsigned char *,
-			itt_t, u32, u32, u32);
-extern int iscsit_handle_status_snack(struct iscsi_conn *, itt_t, u32,
-			u32, u32);
-extern int iscsit_handle_data_ack(struct iscsi_conn *, u32, u32, u32);
-extern int iscsit_dataout_datapduinorder_no_fbit(struct iscsi_cmd *, struct iscsi_pdu *);
-extern int iscsit_recover_dataout_sequence(struct iscsi_cmd *, u32, u32);
-extern void iscsit_clear_ooo_cmdsns_for_conn(struct iscsi_conn *);
-extern void iscsit_free_all_ooo_cmdsns(struct iscsi_session *);
-extern int iscsit_execute_ooo_cmdsns(struct iscsi_session *);
-extern int iscsit_execute_cmd(struct iscsi_cmd *, int);
-extern int iscsit_handle_ooo_cmdsn(struct iscsi_session *, struct iscsi_cmd *, u32);
-extern void iscsit_remove_ooo_cmdsn(struct iscsi_session *, struct iscsi_ooo_cmdsn *);
-extern void iscsit_mod_dataout_timer(struct iscsi_cmd *);
-extern void iscsit_start_dataout_timer(struct iscsi_cmd *, struct iscsi_conn *);
-extern void iscsit_stop_dataout_timer(struct iscsi_cmd *);
-
-#endif /* ISCSI_TARGET_ERL1_H */
+_MACRO_CNTL_RESERVED15                                          0x48cf
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED15                             0x48cf
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED15                             0x48ef
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED15                             0x490f
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED15                             0x492f
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED15                             0x494f
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED15                             0x496f
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED15                             0x498f
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED15                             0x49cf
+#define mmDCIO_UNIPHY8_UNIPHY_MACRO_CNTL_RESERVED15                             0x49ef
+#define mmUNIPHY_MACRO_CNTL_RESERVED16                                          0x48d0
+#define mmDCIO_UNIPHY0_UNIPHY_MACRO_CNTL_RESERVED16                             0x48d0
+#define mmDCIO_UNIPHY1_UNIPHY_MACRO_CNTL_RESERVED16                             0x48f0
+#define mmDCIO_UNIPHY2_UNIPHY_MACRO_CNTL_RESERVED16                             0x4910
+#define mmDCIO_UNIPHY3_UNIPHY_MACRO_CNTL_RESERVED16                             0x4930
+#define mmDCIO_UNIPHY4_UNIPHY_MACRO_CNTL_RESERVED16                             0x4950
+#define mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED16                             0

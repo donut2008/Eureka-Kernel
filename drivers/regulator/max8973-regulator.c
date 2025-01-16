@@ -1,754 +1,709 @@
 /*
- * max8973-regulator.c -- Maxim max8973
+ * Intel 3200/3210 Memory Controller kernel module
+ * Copyright (C) 2008-2009 Akamai Technologies, Inc.
+ * Portions by Hitoshi Mitake <h.mitake@gmail.com>.
  *
- * Regulator driver for MAXIM 8973 DC-DC step-down switching regulator.
- *
- * Copyright (c) 2012, NVIDIA Corporation.
- *
- * Author: Laxman Dewangan <ldewangan@nvidia.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation version 2.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any kind,
- * whether express or implied; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
- * 02111-1307, USA
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
  */
 
-#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/err.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/max8973-regulator.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
-#include <linux/i2c.h>
-#include <linux/slab.h>
-#include <linux/regmap.h>
+#include <linux/pci.h>
+#include <linux/pci_ids.h>
+#include <linux/edac.h>
+#include <linux/io.h>
+#include "edac_core.h"
 
-/* Register definitions */
-#define MAX8973_VOUT					0x0
-#define MAX8973_VOUT_DVS				0x1
-#define MAX8973_CONTROL1				0x2
-#define MAX8973_CONTROL2				0x3
-#define MAX8973_CHIPID1					0x4
-#define MAX8973_CHIPID2					0x5
+#include <linux/io-64-nonatomic-lo-hi.h>
 
-#define MAX8973_MAX_VOUT_REG				2
+#define I3200_REVISION        "1.1"
 
-/* MAX8973_VOUT */
-#define MAX8973_VOUT_ENABLE				BIT(7)
-#define MAX8973_VOUT_MASK				0x7F
+#define EDAC_MOD_STR        "i3200_edac"
 
-/* MAX8973_VOUT_DVS */
-#define MAX8973_DVS_VOUT_MASK				0x7F
+#define PCI_DEVICE_ID_INTEL_3200_HB    0x29f0
 
-/* MAX8973_CONTROL1 */
-#define MAX8973_SNS_ENABLE				BIT(7)
-#define MAX8973_FPWM_EN_M				BIT(6)
-#define MAX8973_NFSR_ENABLE				BIT(5)
-#define MAX8973_AD_ENABLE				BIT(4)
-#define MAX8973_BIAS_ENABLE				BIT(3)
-#define MAX8973_FREQSHIFT_9PER				BIT(2)
+#define I3200_DIMMS		4
+#define I3200_RANKS		8
+#define I3200_RANKS_PER_CHANNEL	4
+#define I3200_CHANNELS		2
 
-#define MAX8973_RAMP_12mV_PER_US			0x0
-#define MAX8973_RAMP_25mV_PER_US			0x1
-#define MAX8973_RAMP_50mV_PER_US			0x2
-#define MAX8973_RAMP_200mV_PER_US			0x3
-#define MAX8973_RAMP_MASK				0x3
+/* Intel 3200 register addresses - device 0 function 0 - DRAM Controller */
 
-/* MAX8973_CONTROL2 */
-#define MAX8973_WDTMR_ENABLE				BIT(6)
-#define MAX8973_DISCH_ENBABLE				BIT(5)
-#define MAX8973_FT_ENABLE				BIT(4)
+#define I3200_MCHBAR_LOW	0x48	/* MCH Memory Mapped Register BAR */
+#define I3200_MCHBAR_HIGH	0x4c
+#define I3200_MCHBAR_MASK	0xfffffc000ULL	/* bits 35:14 */
+#define I3200_MMR_WINDOW_SIZE	16384
 
-#define MAX8973_CKKADV_TRIP_MASK			0xC
-#define MAX8973_CKKADV_TRIP_DISABLE			0xC
-#define MAX8973_CKKADV_TRIP_75mV_PER_US			0x0
-#define MAX8973_CKKADV_TRIP_150mV_PER_US		0x4
-#define MAX8973_CKKADV_TRIP_75mV_PER_US_HIST_DIS	0x8
-#define MAX8973_CONTROL_CLKADV_TRIP_MASK		0x00030000
+#define I3200_TOM		0xa0	/* Top of Memory (16b)
+		 *
+		 * 15:10 reserved
+		 *  9:0  total populated physical memory
+		 */
+#define I3200_TOM_MASK		0x3ff	/* bits 9:0 */
+#define I3200_TOM_SHIFT		26	/* 64MiB grain */
 
-#define MAX8973_INDUCTOR_MIN_30_PER			0x0
-#define MAX8973_INDUCTOR_NOMINAL			0x1
-#define MAX8973_INDUCTOR_PLUS_30_PER			0x2
-#define MAX8973_INDUCTOR_PLUS_60_PER			0x3
-#define MAX8973_CONTROL_INDUCTOR_VALUE_MASK		0x00300000
+#define I3200_ERRSTS		0xc8	/* Error Status Register (16b)
+		 *
+		 * 15    reserved
+		 * 14    Isochronous TBWRR Run Behind FIFO Full
+		 *       (ITCV)
+		 * 13    Isochronous TBWRR Run Behind FIFO Put
+		 *       (ITSTV)
+		 * 12    reserved
+		 * 11    MCH Thermal Sensor Event
+		 *       for SMI/SCI/SERR (GTSE)
+		 * 10    reserved
+		 *  9    LOCK to non-DRAM Memory Flag (LCKF)
+		 *  8    reserved
+		 *  7    DRAM Throttle Flag (DTF)
+		 *  6:2  reserved
+		 *  1    Multi-bit DRAM ECC Error Flag (DMERR)
+		 *  0    Single-bit DRAM ECC Error Flag (DSERR)
+		 */
+#define I3200_ERRSTS_UE		0x0002
+#define I3200_ERRSTS_CE		0x0001
+#define I3200_ERRSTS_BITS	(I3200_ERRSTS_UE | I3200_ERRSTS_CE)
 
-#define MAX8973_MIN_VOLATGE				606250
-#define MAX8973_MAX_VOLATGE				1400000
-#define MAX8973_VOLATGE_STEP				6250
-#define MAX8973_BUCK_N_VOLTAGE				0x80
 
-enum device_id {
-	MAX8973,
-	MAX77621
+/* Intel  MMIO register space - device 0 function 0 - MMR space */
+
+#define I3200_C0DRB	0x200	/* Channel 0 DRAM Rank Boundary (16b x 4)
+		 *
+		 * 15:10 reserved
+		 *  9:0  Channel 0 DRAM Rank Boundary Address
+		 */
+#define I3200_C1DRB	0x600	/* Channel 1 DRAM Rank Boundary (16b x 4) */
+#define I3200_DRB_MASK	0x3ff	/* bits 9:0 */
+#define I3200_DRB_SHIFT	26	/* 64MiB grain */
+
+#define I3200_C0ECCERRLOG	0x280	/* Channel 0 ECC Error Log (64b)
+		 *
+		 * 63:48 Error Column Address (ERRCOL)
+		 * 47:32 Error Row Address (ERRROW)
+		 * 31:29 Error Bank Address (ERRBANK)
+		 * 28:27 Error Rank Address (ERRRANK)
+		 * 26:24 reserved
+		 * 23:16 Error Syndrome (ERRSYND)
+		 * 15: 2 reserved
+		 *    1  Multiple Bit Error Status (MERRSTS)
+		 *    0  Correctable Error Status (CERRSTS)
+		 */
+#define I3200_C1ECCERRLOG		0x680	/* Chan 1 ECC Error Log (64b) */
+#define I3200_ECCERRLOG_CE		0x1
+#define I3200_ECCERRLOG_UE		0x2
+#define I3200_ECCERRLOG_RANK_BITS	0x18000000
+#define I3200_ECCERRLOG_RANK_SHIFT	27
+#define I3200_ECCERRLOG_SYNDROME_BITS	0xff0000
+#define I3200_ECCERRLOG_SYNDROME_SHIFT	16
+#define I3200_CAPID0			0xe0	/* P.95 of spec for details */
+
+struct i3200_priv {
+	void __iomem *window;
 };
 
-/* Maxim 8973 chip information */
-struct max8973_chip {
-	struct device *dev;
-	struct regulator_desc desc;
-	struct regmap *regmap;
-	bool enable_external_control;
-	int enable_gpio;
-	int dvs_gpio;
-	int lru_index[MAX8973_MAX_VOUT_REG];
-	int curr_vout_val[MAX8973_MAX_VOUT_REG];
-	int curr_vout_reg;
-	int curr_gpio_val;
-	struct regulator_ops ops;
-	enum device_id id;
+static int nr_channels;
+
+static int how_many_channels(struct pci_dev *pdev)
+{
+	int n_channels;
+
+	unsigned char capid0_8b; /* 8th byte of CAPID0 */
+
+	pci_read_config_byte(pdev, I3200_CAPID0 + 8, &capid0_8b);
+
+	if (capid0_8b & 0x20) { /* check DCD: Dual Channel Disable */
+		edac_dbg(0, "In single channel mode\n");
+		n_channels = 1;
+	} else {
+		edac_dbg(0, "In dual channel mode\n");
+		n_channels = 2;
+	}
+
+	if (capid0_8b & 0x10) /* check if both channels are filled */
+		edac_dbg(0, "2 DIMMS per channel disabled\n");
+	else
+		edac_dbg(0, "2 DIMMS per channel enabled\n");
+
+	return n_channels;
+}
+
+static unsigned long eccerrlog_syndrome(u64 log)
+{
+	return (log & I3200_ECCERRLOG_SYNDROME_BITS) >>
+		I3200_ECCERRLOG_SYNDROME_SHIFT;
+}
+
+static int eccerrlog_row(int channel, u64 log)
+{
+	u64 rank = ((log & I3200_ECCERRLOG_RANK_BITS) >>
+		I3200_ECCERRLOG_RANK_SHIFT);
+	return rank | (channel * I3200_RANKS_PER_CHANNEL);
+}
+
+enum i3200_chips {
+	I3200 = 0,
 };
 
-/*
- * find_voltage_set_register: Find new voltage configuration register (VOUT).
- * The finding of the new VOUT register will be based on the LRU mechanism.
- * Each VOUT register will have different voltage configured . This
- * Function will look if any of the VOUT register have requested voltage set
- * or not.
- *     - If it is already there then it will make that register as most
- *       recently used and return as found so that caller need not to set
- *       the VOUT register but need to set the proper gpios to select this
- *       VOUT register.
- *     - If requested voltage is not found then it will use the least
- *       recently mechanism to get new VOUT register for new configuration
- *       and will return not_found so that caller need to set new VOUT
- *       register and then gpios (both).
- */
-static bool find_voltage_set_register(struct max8973_chip *tps,
-		int req_vsel, int *vout_reg, int *gpio_val)
+struct i3200_dev_info {
+	const char *ctl_name;
+};
+
+struct i3200_error_info {
+	u16 errsts;
+	u16 errsts2;
+	u64 eccerrlog[I3200_CHANNELS];
+};
+
+static const struct i3200_dev_info i3200_devs[] = {
+	[I3200] = {
+		.ctl_name = "i3200"
+	},
+};
+
+static struct pci_dev *mci_pdev;
+static int i3200_registered = 1;
+
+
+static void i3200_clear_error_info(struct mem_ctl_info *mci)
 {
-	int i;
-	bool found = false;
-	int new_vout_reg = tps->lru_index[MAX8973_MAX_VOUT_REG - 1];
-	int found_index = MAX8973_MAX_VOUT_REG - 1;
+	struct pci_dev *pdev;
 
-	for (i = 0; i < MAX8973_MAX_VOUT_REG; ++i) {
-		if (tps->curr_vout_val[tps->lru_index[i]] == req_vsel) {
-			new_vout_reg = tps->lru_index[i];
-			found_index = i;
-			found = true;
-			goto update_lru_index;
-		}
-	}
-
-update_lru_index:
-	for (i = found_index; i > 0; i--)
-		tps->lru_index[i] = tps->lru_index[i - 1];
-
-	tps->lru_index[0] = new_vout_reg;
-	*gpio_val = new_vout_reg;
-	*vout_reg = MAX8973_VOUT + new_vout_reg;
-	return found;
-}
-
-static int max8973_dcdc_get_voltage_sel(struct regulator_dev *rdev)
-{
-	struct max8973_chip *max = rdev_get_drvdata(rdev);
-	unsigned int data;
-	int ret;
-
-	ret = regmap_read(max->regmap, max->curr_vout_reg, &data);
-	if (ret < 0) {
-		dev_err(max->dev, "register %d read failed, err = %d\n",
-			max->curr_vout_reg, ret);
-		return ret;
-	}
-	return data & MAX8973_VOUT_MASK;
-}
-
-static int max8973_dcdc_set_voltage_sel(struct regulator_dev *rdev,
-	     unsigned vsel)
-{
-	struct max8973_chip *max = rdev_get_drvdata(rdev);
-	int ret;
-	bool found = false;
-	int vout_reg = max->curr_vout_reg;
-	int gpio_val = max->curr_gpio_val;
+	pdev = to_pci_dev(mci->pdev);
 
 	/*
-	 * If gpios are available to select the VOUT register then least
-	 * recently used register for new configuration.
+	 * Clear any error bits.
+	 * (Yes, we really clear bits by writing 1 to them.)
 	 */
-	if (gpio_is_valid(max->dvs_gpio))
-		found = find_voltage_set_register(max, vsel,
-					&vout_reg, &gpio_val);
+	pci_write_bits16(pdev, I3200_ERRSTS, I3200_ERRSTS_BITS,
+		I3200_ERRSTS_BITS);
+}
 
-	if (!found) {
-		ret = regmap_update_bits(max->regmap, vout_reg,
-					MAX8973_VOUT_MASK, vsel);
-		if (ret < 0) {
-			dev_err(max->dev, "register %d update failed, err %d\n",
-				 vout_reg, ret);
-			return ret;
+static void i3200_get_and_clear_error_info(struct mem_ctl_info *mci,
+		struct i3200_error_info *info)
+{
+	struct pci_dev *pdev;
+	struct i3200_priv *priv = mci->pvt_info;
+	void __iomem *window = priv->window;
+
+	pdev = to_pci_dev(mci->pdev);
+
+	/*
+	 * This is a mess because there is no atomic way to read all the
+	 * registers at once and the registers can transition from CE being
+	 * overwritten by UE.
+	 */
+	pci_read_config_word(pdev, I3200_ERRSTS, &info->errsts);
+	if (!(info->errsts & I3200_ERRSTS_BITS))
+		return;
+
+	info->eccerrlog[0] = readq(window + I3200_C0ECCERRLOG);
+	if (nr_channels == 2)
+		info->eccerrlog[1] = readq(window + I3200_C1ECCERRLOG);
+
+	pci_read_config_word(pdev, I3200_ERRSTS, &info->errsts2);
+
+	/*
+	 * If the error is the same for both reads then the first set
+	 * of reads is valid.  If there is a change then there is a CE
+	 * with no info and the second set of reads is valid and
+	 * should be UE info.
+	 */
+	if ((info->errsts ^ info->errsts2) & I3200_ERRSTS_BITS) {
+		info->eccerrlog[0] = readq(window + I3200_C0ECCERRLOG);
+		if (nr_channels == 2)
+			info->eccerrlog[1] = readq(window + I3200_C1ECCERRLOG);
+	}
+
+	i3200_clear_error_info(mci);
+}
+
+static void i3200_process_error_info(struct mem_ctl_info *mci,
+		struct i3200_error_info *info)
+{
+	int channel;
+	u64 log;
+
+	if (!(info->errsts & I3200_ERRSTS_BITS))
+		return;
+
+	if ((info->errsts ^ info->errsts2) & I3200_ERRSTS_BITS) {
+		edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1, 0, 0, 0,
+				     -1, -1, -1, "UE overwrote CE", "");
+		info->errsts = info->errsts2;
+	}
+
+	for (channel = 0; channel < nr_channels; channel++) {
+		log = info->eccerrlog[channel];
+		if (log & I3200_ECCERRLOG_UE) {
+			edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1,
+					     0, 0, 0,
+					     eccerrlog_row(channel, log),
+					     -1, -1,
+					     "i3000 UE", "");
+		} else if (log & I3200_ECCERRLOG_CE) {
+			edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1,
+					     0, 0, eccerrlog_syndrome(log),
+					     eccerrlog_row(channel, log),
+					     -1, -1,
+					     "i3000 CE", "");
 		}
-		max->curr_vout_reg = vout_reg;
-		max->curr_vout_val[gpio_val] = vsel;
 	}
-
-	/* Select proper VOUT register vio gpios */
-	if (gpio_is_valid(max->dvs_gpio)) {
-		gpio_set_value_cansleep(max->dvs_gpio, gpio_val & 0x1);
-		max->curr_gpio_val = gpio_val;
-	}
-	return 0;
 }
 
-static int max8973_dcdc_set_mode(struct regulator_dev *rdev, unsigned int mode)
+static void i3200_check(struct mem_ctl_info *mci)
 {
-	struct max8973_chip *max = rdev_get_drvdata(rdev);
-	int ret;
-	int pwm;
+	struct i3200_error_info info;
 
-	/* Enable force PWM mode in FAST mode only. */
-	switch (mode) {
-	case REGULATOR_MODE_FAST:
-		pwm = MAX8973_FPWM_EN_M;
-		break;
-
-	case REGULATOR_MODE_NORMAL:
-		pwm = 0;
-		break;
-
-	default:
-		return -EINVAL;
-	}
-
-	ret = regmap_update_bits(max->regmap, MAX8973_CONTROL1,
-				MAX8973_FPWM_EN_M, pwm);
-	if (ret < 0)
-		dev_err(max->dev, "register %d update failed, err %d\n",
-				MAX8973_CONTROL1, ret);
-	return ret;
+	edac_dbg(1, "MC%d\n", mci->mc_idx);
+	i3200_get_and_clear_error_info(mci, &info);
+	i3200_process_error_info(mci, &info);
 }
 
-static unsigned int max8973_dcdc_get_mode(struct regulator_dev *rdev)
+static void __iomem *i3200_map_mchbar(struct pci_dev *pdev)
 {
-	struct max8973_chip *max = rdev_get_drvdata(rdev);
-	unsigned int data;
-	int ret;
+	union {
+		u64 mchbar;
+		struct {
+			u32 mchbar_low;
+			u32 mchbar_high;
+		};
+	} u;
+	void __iomem *window;
 
-	ret = regmap_read(max->regmap, MAX8973_CONTROL1, &data);
-	if (ret < 0) {
-		dev_err(max->dev, "register %d read failed, err %d\n",
-				MAX8973_CONTROL1, ret);
-		return ret;
-	}
-	return (data & MAX8973_FPWM_EN_M) ?
-		REGULATOR_MODE_FAST : REGULATOR_MODE_NORMAL;
-}
+	pci_read_config_dword(pdev, I3200_MCHBAR_LOW, &u.mchbar_low);
+	pci_read_config_dword(pdev, I3200_MCHBAR_HIGH, &u.mchbar_high);
+	u.mchbar &= I3200_MCHBAR_MASK;
 
-static int max8973_set_ramp_delay(struct regulator_dev *rdev,
-		int ramp_delay)
-{
-	struct max8973_chip *max = rdev_get_drvdata(rdev);
-	unsigned int control;
-	int ret;
-	int ret_val;
-
-	/* Set ramp delay */
-	if (ramp_delay < 25000) {
-		control = MAX8973_RAMP_12mV_PER_US;
-		ret_val = 12000;
-	} else if (ramp_delay < 50000) {
-		control = MAX8973_RAMP_25mV_PER_US;
-		ret_val = 25000;
-	} else if (ramp_delay < 200000) {
-		control = MAX8973_RAMP_50mV_PER_US;
-		ret_val = 50000;
-	} else {
-		control = MAX8973_RAMP_200mV_PER_US;
-		ret_val = 200000;
-	}
-
-	ret = regmap_update_bits(max->regmap, MAX8973_CONTROL1,
-			MAX8973_RAMP_MASK, control);
-	if (ret < 0)
-		dev_err(max->dev, "register %d update failed, %d",
-				MAX8973_CONTROL1, ret);
-	return ret;
-}
-
-static int max8973_set_current_limit(struct regulator_dev *rdev,
-		int min_ua, int max_ua)
-{
-	struct max8973_chip *max = rdev_get_drvdata(rdev);
-	unsigned int val;
-	int ret;
-
-	if (max_ua <= 9000000)
-		val = MAX8973_CKKADV_TRIP_75mV_PER_US;
-	else if (max_ua <= 12000000)
-		val = MAX8973_CKKADV_TRIP_150mV_PER_US;
-	else
-		val = MAX8973_CKKADV_TRIP_DISABLE;
-
-	ret = regmap_update_bits(max->regmap, MAX8973_CONTROL2,
-			MAX8973_CKKADV_TRIP_MASK, val);
-	if (ret < 0) {
-		dev_err(max->dev, "register %d update failed: %d\n",
-				MAX8973_CONTROL2, ret);
-		return ret;
-	}
-	return 0;
-}
-
-static int max8973_get_current_limit(struct regulator_dev *rdev)
-{
-	struct max8973_chip *max = rdev_get_drvdata(rdev);
-	unsigned int control2;
-	int ret;
-
-	ret = regmap_read(max->regmap, MAX8973_CONTROL2, &control2);
-	if (ret < 0) {
-		dev_err(max->dev, "register %d read failed: %d\n",
-				MAX8973_CONTROL2, ret);
-		return ret;
-	}
-	switch (control2 & MAX8973_CKKADV_TRIP_MASK) {
-	case MAX8973_CKKADV_TRIP_DISABLE:
-		return 15000000;
-	case MAX8973_CKKADV_TRIP_150mV_PER_US:
-		return 12000000;
-	case MAX8973_CKKADV_TRIP_75mV_PER_US:
-		return 9000000;
-	default:
-		break;
-	}
-	return 9000000;
-}
-
-static const struct regulator_ops max8973_dcdc_ops = {
-	.get_voltage_sel	= max8973_dcdc_get_voltage_sel,
-	.set_voltage_sel	= max8973_dcdc_set_voltage_sel,
-	.list_voltage		= regulator_list_voltage_linear,
-	.set_mode		= max8973_dcdc_set_mode,
-	.get_mode		= max8973_dcdc_get_mode,
-	.set_voltage_time_sel	= regulator_set_voltage_time_sel,
-	.set_ramp_delay		= max8973_set_ramp_delay,
-};
-
-static int max8973_init_dcdc(struct max8973_chip *max,
-			     struct max8973_regulator_platform_data *pdata)
-{
-	int ret;
-	uint8_t	control1 = 0;
-	uint8_t control2 = 0;
-	unsigned int data;
-
-	ret = regmap_read(max->regmap, MAX8973_CONTROL1, &data);
-	if (ret < 0) {
-		dev_err(max->dev, "register %d read failed, err = %d",
-				MAX8973_CONTROL1, ret);
-		return ret;
-	}
-	control1 = data & MAX8973_RAMP_MASK;
-	switch (control1) {
-	case MAX8973_RAMP_12mV_PER_US:
-		max->desc.ramp_delay = 12000;
-		break;
-	case MAX8973_RAMP_25mV_PER_US:
-		max->desc.ramp_delay = 25000;
-		break;
-	case MAX8973_RAMP_50mV_PER_US:
-		max->desc.ramp_delay = 50000;
-		break;
-	case MAX8973_RAMP_200mV_PER_US:
-		max->desc.ramp_delay = 200000;
-		break;
-	}
-
-	if (pdata->control_flags & MAX8973_CONTROL_REMOTE_SENSE_ENABLE)
-		control1 |= MAX8973_SNS_ENABLE;
-
-	if (!(pdata->control_flags & MAX8973_CONTROL_FALLING_SLEW_RATE_ENABLE))
-		control1 |= MAX8973_NFSR_ENABLE;
-
-	if (pdata->control_flags & MAX8973_CONTROL_OUTPUT_ACTIVE_DISCH_ENABLE)
-		control1 |= MAX8973_AD_ENABLE;
-
-	if (pdata->control_flags & MAX8973_CONTROL_BIAS_ENABLE) {
-		control1 |= MAX8973_BIAS_ENABLE;
-		max->desc.enable_time = 20;
-	} else {
-		max->desc.enable_time = 240;
-	}
-
-	if (pdata->control_flags & MAX8973_CONTROL_FREQ_SHIFT_9PER_ENABLE)
-		control1 |= MAX8973_FREQSHIFT_9PER;
-
-	if (!(pdata->control_flags & MAX8973_CONTROL_PULL_DOWN_ENABLE))
-		control2 |= MAX8973_DISCH_ENBABLE;
-
-	/*  Clock advance trip configuration */
-	switch (pdata->control_flags & MAX8973_CONTROL_CLKADV_TRIP_MASK) {
-	case MAX8973_CONTROL_CLKADV_TRIP_DISABLED:
-		control2 |= MAX8973_CKKADV_TRIP_DISABLE;
-		break;
-
-	case MAX8973_CONTROL_CLKADV_TRIP_75mV_PER_US:
-		control2 |= MAX8973_CKKADV_TRIP_75mV_PER_US;
-		break;
-
-	case MAX8973_CONTROL_CLKADV_TRIP_150mV_PER_US:
-		control2 |= MAX8973_CKKADV_TRIP_150mV_PER_US;
-		break;
-
-	case MAX8973_CONTROL_CLKADV_TRIP_75mV_PER_US_HIST_DIS:
-		control2 |= MAX8973_CKKADV_TRIP_75mV_PER_US_HIST_DIS;
-		break;
-	}
-
-	/* Configure inductor value */
-	switch (pdata->control_flags & MAX8973_CONTROL_INDUCTOR_VALUE_MASK) {
-	case MAX8973_CONTROL_INDUCTOR_VALUE_NOMINAL:
-		control2 |= MAX8973_INDUCTOR_NOMINAL;
-		break;
-
-	case MAX8973_CONTROL_INDUCTOR_VALUE_MINUS_30_PER:
-		control2 |= MAX8973_INDUCTOR_MIN_30_PER;
-		break;
-
-	case MAX8973_CONTROL_INDUCTOR_VALUE_PLUS_30_PER:
-		control2 |= MAX8973_INDUCTOR_PLUS_30_PER;
-		break;
-
-	case MAX8973_CONTROL_INDUCTOR_VALUE_PLUS_60_PER:
-		control2 |= MAX8973_INDUCTOR_PLUS_60_PER;
-		break;
-	}
-
-	ret = regmap_write(max->regmap, MAX8973_CONTROL1, control1);
-	if (ret < 0) {
-		dev_err(max->dev, "register %d write failed, err = %d",
-				MAX8973_CONTROL1, ret);
-		return ret;
-	}
-
-	ret = regmap_write(max->regmap, MAX8973_CONTROL2, control2);
-	if (ret < 0) {
-		dev_err(max->dev, "register %d write failed, err = %d",
-				MAX8973_CONTROL2, ret);
-		return ret;
-	}
-
-	/* If external control is enabled then disable EN bit */
-	if (max->enable_external_control && (max->id == MAX8973)) {
-		ret = regmap_update_bits(max->regmap, MAX8973_VOUT,
-						MAX8973_VOUT_ENABLE, 0);
-		if (ret < 0)
-			dev_err(max->dev, "register %d update failed, err = %d",
-				MAX8973_VOUT, ret);
-	}
-	return ret;
-}
-
-static const struct regmap_config max8973_regmap_config = {
-	.reg_bits		= 8,
-	.val_bits		= 8,
-	.max_register		= MAX8973_CHIPID2,
-	.cache_type		= REGCACHE_RBTREE,
-};
-
-static struct max8973_regulator_platform_data *max8973_parse_dt(
-		struct device *dev)
-{
-	struct max8973_regulator_platform_data *pdata;
-	struct device_node *np = dev->of_node;
-	int ret;
-	u32 pval;
-	bool etr_enable;
-	bool etr_sensitivity_high;
-
-	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata)
+	if (u.mchbar != (resource_size_t)u.mchbar) {
+		printk(KERN_ERR
+			"i3200: mmio space beyond accessible range (0x%llx)\n",
+			(unsigned long long)u.mchbar);
 		return NULL;
-
-	pdata->enable_ext_control = of_property_read_bool(np,
-						"maxim,externally-enable");
-	pdata->enable_gpio = of_get_named_gpio(np, "maxim,enable-gpio", 0);
-	pdata->dvs_gpio = of_get_named_gpio(np, "maxim,dvs-gpio", 0);
-
-	ret = of_property_read_u32(np, "maxim,dvs-default-state", &pval);
-	if (!ret)
-		pdata->dvs_def_state = pval;
-
-	if (of_property_read_bool(np, "maxim,enable-remote-sense"))
-		pdata->control_flags  |= MAX8973_CONTROL_REMOTE_SENSE_ENABLE;
-
-	if (of_property_read_bool(np, "maxim,enable-falling-slew-rate"))
-		pdata->control_flags  |=
-				MAX8973_CONTROL_FALLING_SLEW_RATE_ENABLE;
-
-	if (of_property_read_bool(np, "maxim,enable-active-discharge"))
-		pdata->control_flags  |=
-				MAX8973_CONTROL_OUTPUT_ACTIVE_DISCH_ENABLE;
-
-	if (of_property_read_bool(np, "maxim,enable-frequency-shift"))
-		pdata->control_flags  |= MAX8973_CONTROL_FREQ_SHIFT_9PER_ENABLE;
-
-	if (of_property_read_bool(np, "maxim,enable-bias-control"))
-		pdata->control_flags  |= MAX8973_CONTROL_BIAS_ENABLE;
-
-	etr_enable = of_property_read_bool(np, "maxim,enable-etr");
-	etr_sensitivity_high = of_property_read_bool(np,
-				"maxim,enable-high-etr-sensitivity");
-	if (etr_sensitivity_high)
-		etr_enable = true;
-
-	if (etr_enable) {
-		if (etr_sensitivity_high)
-			pdata->control_flags |=
-				MAX8973_CONTROL_CLKADV_TRIP_75mV_PER_US;
-		else
-			pdata->control_flags |=
-				MAX8973_CONTROL_CLKADV_TRIP_150mV_PER_US;
-	} else {
-		pdata->control_flags |= MAX8973_CONTROL_CLKADV_TRIP_DISABLED;
 	}
 
-	return pdata;
+	window = ioremap_nocache(u.mchbar, I3200_MMR_WINDOW_SIZE);
+	if (!window)
+		printk(KERN_ERR "i3200: cannot map mmio space at 0x%llx\n",
+			(unsigned long long)u.mchbar);
+
+	return window;
 }
 
-static const struct of_device_id of_max8973_match_tbl[] = {
-	{ .compatible = "maxim,max8973", .data = (void *)MAX8973, },
-	{ .compatible = "maxim,max77621", .data = (void *)MAX77621, },
-	{ },
-};
-MODULE_DEVICE_TABLE(of, of_max8973_match_tbl);
 
-static int max8973_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
+static void i3200_get_drbs(void __iomem *window,
+	u16 drbs[I3200_CHANNELS][I3200_RANKS_PER_CHANNEL])
 {
-	struct max8973_regulator_platform_data *pdata;
-	struct regulator_init_data *ridata;
-	struct regulator_config config = { };
-	struct regulator_dev *rdev;
-	struct max8973_chip *max;
-	bool pdata_from_dt = false;
-	unsigned int chip_id;
-	int ret;
+	int i;
 
-	pdata = dev_get_platdata(&client->dev);
+	for (i = 0; i < I3200_RANKS_PER_CHANNEL; i++) {
+		drbs[0][i] = readw(window + I3200_C0DRB + 2*i) & I3200_DRB_MASK;
+		drbs[1][i] = readw(window + I3200_C1DRB + 2*i) & I3200_DRB_MASK;
 
-	if (!pdata && client->dev.of_node) {
-		pdata = max8973_parse_dt(&client->dev);
-		pdata_from_dt = true;
+		edac_dbg(0, "drb[0][%d] = %d, drb[1][%d] = %d\n", i, drbs[0][i], i, drbs[1][i]);
 	}
+}
 
-	if (!pdata) {
-		dev_err(&client->dev, "No Platform data");
-		return -EIO;
-	}
+static bool i3200_is_stacked(struct pci_dev *pdev,
+	u16 drbs[I3200_CHANNELS][I3200_RANKS_PER_CHANNEL])
+{
+	u16 tom;
 
-	if ((pdata->dvs_gpio == -EPROBE_DEFER) ||
-		(pdata->enable_gpio == -EPROBE_DEFER))
-		return -EPROBE_DEFER;
+	pci_read_config_word(pdev, I3200_TOM, &tom);
+	tom &= I3200_TOM_MASK;
 
-	max = devm_kzalloc(&client->dev, sizeof(*max), GFP_KERNEL);
-	if (!max)
+	return drbs[I3200_CHANNELS - 1][I3200_RANKS_PER_CHANNEL - 1] == tom;
+}
+
+static unsigned long drb_to_nr_pages(
+	u16 drbs[I3200_CHANNELS][I3200_RANKS_PER_CHANNEL], bool stacked,
+	int channel, int rank)
+{
+	int n;
+
+	n = drbs[channel][rank];
+	if (!n)
+		return 0;
+
+	if (rank > 0)
+		n -= drbs[channel][rank - 1];
+	if (stacked && (channel == 1) &&
+	drbs[channel][rank] == drbs[channel][I3200_RANKS_PER_CHANNEL - 1])
+		n -= drbs[0][I3200_RANKS_PER_CHANNEL - 1];
+
+	n <<= (I3200_DRB_SHIFT - PAGE_SHIFT);
+	return n;
+}
+
+static int i3200_probe1(struct pci_dev *pdev, int dev_idx)
+{
+	int rc;
+	int i, j;
+	struct mem_ctl_info *mci = NULL;
+	struct edac_mc_layer layers[2];
+	u16 drbs[I3200_CHANNELS][I3200_RANKS_PER_CHANNEL];
+	bool stacked;
+	void __iomem *window;
+	struct i3200_priv *priv;
+
+	edac_dbg(0, "MC:\n");
+
+	window = i3200_map_mchbar(pdev);
+	if (!window)
+		return -ENODEV;
+
+	i3200_get_drbs(window, drbs);
+	nr_channels = how_many_channels(pdev);
+
+	layers[0].type = EDAC_MC_LAYER_CHIP_SELECT;
+	layers[0].size = I3200_DIMMS;
+	layers[0].is_virt_csrow = true;
+	layers[1].type = EDAC_MC_LAYER_CHANNEL;
+	layers[1].size = nr_channels;
+	layers[1].is_virt_csrow = false;
+	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers,
+			    sizeof(struct i3200_priv));
+	if (!mci)
 		return -ENOMEM;
 
-	max->regmap = devm_regmap_init_i2c(client, &max8973_regmap_config);
-	if (IS_ERR(max->regmap)) {
-		ret = PTR_ERR(max->regmap);
-		dev_err(&client->dev, "regmap init failed, err %d\n", ret);
-		return ret;
+	edac_dbg(3, "MC: init mci\n");
+
+	mci->pdev = &pdev->dev;
+	mci->mtype_cap = MEM_FLAG_DDR2;
+
+	mci->edac_ctl_cap = EDAC_FLAG_SECDED;
+	mci->edac_cap = EDAC_FLAG_SECDED;
+
+	mci->mod_name = EDAC_MOD_STR;
+	mci->mod_ver = I3200_REVISION;
+	mci->ctl_name = i3200_devs[dev_idx].ctl_name;
+	mci->dev_name = pci_name(pdev);
+	mci->edac_check = i3200_check;
+	mci->ctl_page_to_phys = NULL;
+	priv = mci->pvt_info;
+	priv->window = window;
+
+	stacked = i3200_is_stacked(pdev, drbs);
+
+	/*
+	 * The dram rank boundary (DRB) reg values are boundary addresses
+	 * for each DRAM rank with a granularity of 64MB.  DRB regs are
+	 * cumulative; the last one will contain the total memory
+	 * contained in all ranks.
+	 */
+	for (i = 0; i < I3200_DIMMS; i++) {
+		unsigned long nr_pages;
+
+		for (j = 0; j < nr_channels; j++) {
+			struct dimm_info *dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms,
+							       mci->n_layers, i, j, 0);
+
+			nr_pages = drb_to_nr_pages(drbs, stacked, j, i);
+			if (nr_pages == 0)
+				continue;
+
+			edac_dbg(0, "csrow %d, channel %d%s, size = %ld Mb\n", i, j,
+				 stacked ? " (stacked)" : "", PAGES_TO_MiB(nr_pages));
+
+			dimm->nr_pages = nr_pages;
+			dimm->grain = nr_pages << PAGE_SHIFT;
+			dimm->mtype = MEM_DDR2;
+			dimm->dtype = DEV_UNKNOWN;
+			dimm->edac_mode = EDAC_UNKNOWN;
+		}
 	}
 
-	if (client->dev.of_node) {
-		const struct of_device_id *match;
+	i3200_clear_error_info(mci);
 
-		match = of_match_device(of_match_ptr(of_max8973_match_tbl),
-				&client->dev);
-		if (!match)
-			return -ENODATA;
-		max->id = (u32)((uintptr_t)match->data);
-	} else {
-		max->id = id->driver_data;
+	rc = -ENODEV;
+	if (edac_mc_add_mc(mci)) {
+		edac_dbg(3, "MC: failed edac_mc_add_mc()\n");
+		goto fail;
 	}
 
-	ret = regmap_read(max->regmap, MAX8973_CHIPID1, &chip_id);
-	if (ret < 0) {
-		dev_err(&client->dev, "register CHIPID1 read failed, %d", ret);
-		return ret;
-	}
+	/* get this far and it's successful */
+	edac_dbg(3, "MC: success\n");
+	return 0;
 
-	dev_info(&client->dev, "CHIP-ID OTP: 0x%02x ID_M: 0x%02x\n",
-			(chip_id >> 4) & 0xF, (chip_id >> 1) & 0x7);
+fail:
+	iounmap(window);
+	if (mci)
+		edac_mc_free(mci);
 
-	i2c_set_clientdata(client, max);
-	max->ops = max8973_dcdc_ops;
-	max->dev = &client->dev;
-	max->desc.name = id->name;
-	max->desc.id = 0;
-	max->desc.ops = &max->ops;
-	max->desc.type = REGULATOR_VOLTAGE;
-	max->desc.owner = THIS_MODULE;
-	max->desc.min_uV = MAX8973_MIN_VOLATGE;
-	max->desc.uV_step = MAX8973_VOLATGE_STEP;
-	max->desc.n_voltages = MAX8973_BUCK_N_VOLTAGE;
+	return rc;
+}
 
-	max->dvs_gpio = (pdata->dvs_gpio) ? pdata->dvs_gpio : -EINVAL;
-	max->enable_gpio = (pdata->enable_gpio) ? pdata->enable_gpio : -EINVAL;
-	max->enable_external_control = pdata->enable_ext_control;
-	max->curr_gpio_val = pdata->dvs_def_state;
-	max->curr_vout_reg = MAX8973_VOUT + pdata->dvs_def_state;
+static int i3200_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+{
+	int rc;
 
-	if (gpio_is_valid(max->enable_gpio))
-		max->enable_external_control = true;
+	edac_dbg(0, "MC:\n");
 
-	max->lru_index[0] = max->curr_vout_reg;
+	if (pci_enable_device(pdev) < 0)
+		return -EIO;
 
-	if (gpio_is_valid(max->dvs_gpio)) {
-		int gpio_flags;
-		int i;
+	rc = i3200_probe1(pdev, ent->driver_data);
+	if (!mci_pdev)
+		mci_pdev = pci_dev_get(pdev);
 
-		gpio_flags = (pdata->dvs_def_state) ?
-				GPIOF_OUT_INIT_HIGH : GPIOF_OUT_INIT_LOW;
-		ret = devm_gpio_request_one(&client->dev, max->dvs_gpio,
-				gpio_flags, "max8973-dvs");
-		if (ret) {
-			dev_err(&client->dev,
-				"gpio_request for gpio %d failed, err = %d\n",
-				max->dvs_gpio, ret);
-			return ret;
+	return rc;
+}
+
+static void i3200_remove_one(struct pci_dev *pdev)
+{
+	struct mem_ctl_info *mci;
+	struct i3200_priv *priv;
+
+	edac_dbg(0, "\n");
+
+	mci = edac_mc_del_mc(&pdev->dev);
+	if (!mci)
+		return;
+
+	priv = mci->pvt_info;
+	iounmap(priv->window);
+
+	edac_mc_free(mci);
+
+	pci_disable_device(pdev);
+}
+
+static const struct pci_device_id i3200_pci_tbl[] = {
+	{
+		PCI_VEND_DEV(INTEL, 3200_HB), PCI_ANY_ID, PCI_ANY_ID, 0, 0,
+		I3200},
+	{
+		0,
+	}            /* 0 terminated list. */
+};
+
+MODULE_DEVICE_TABLE(pci, i3200_pci_tbl);
+
+static struct pci_driver i3200_driver = {
+	.name = EDAC_MOD_STR,
+	.probe = i3200_init_one,
+	.remove = i3200_remove_one,
+	.id_table = i3200_pci_tbl,
+};
+
+static int __init i3200_init(void)
+{
+	int pci_rc;
+
+	edac_dbg(3, "MC:\n");
+
+	/* Ensure that the OPSTATE is set correctly for POLL or NMI */
+	opstate_init();
+
+	pci_rc = pci_register_driver(&i3200_driver);
+	if (pci_rc < 0)
+		goto fail0;
+
+	if (!mci_pdev) {
+		i3200_registered = 0;
+		mci_pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_INTEL_3200_HB, NULL);
+		if (!mci_pdev) {
+			edac_dbg(0, "i3200 pci_get_device fail\n");
+			pci_rc = -ENODEV;
+			goto fail1;
 		}
 
-		/*
-		 * Initialize the lru index with vout_reg id
-		 * The index 0 will be most recently used and
-		 * set with the max->curr_vout_reg */
-		for (i = 0; i < MAX8973_MAX_VOUT_REG; ++i)
-			max->lru_index[i] = i;
-		max->lru_index[0] = max->curr_vout_reg;
-		max->lru_index[max->curr_vout_reg] = 0;
-	} else {
-		/*
-		 * If there is no DVS GPIO, the VOUT register
-		 * address is fixed.
-		 */
-		max->ops.set_voltage_sel = regulator_set_voltage_sel_regmap;
-		max->ops.get_voltage_sel = regulator_get_voltage_sel_regmap;
-		max->desc.vsel_reg = max->curr_vout_reg;
-		max->desc.vsel_mask = MAX8973_VOUT_MASK;
-	}
-
-	if (pdata_from_dt)
-		pdata->reg_init_data = of_get_regulator_init_data(&client->dev,
-					client->dev.of_node, &max->desc);
-
-	ridata = pdata->reg_init_data;
-	switch (max->id) {
-	case MAX8973:
-		if (!pdata->enable_ext_control) {
-			max->desc.enable_reg = MAX8973_VOUT;
-			max->desc.enable_mask = MAX8973_VOUT_ENABLE;
-			max->ops.enable = regulator_enable_regmap;
-			max->ops.disable = regulator_disable_regmap;
-			max->ops.is_enabled = regulator_is_enabled_regmap;
-			break;
+		pci_rc = i3200_init_one(mci_pdev, i3200_pci_tbl);
+		if (pci_rc < 0) {
+			edac_dbg(0, "i3200 init fail\n");
+			pci_rc = -ENODEV;
+			goto fail1;
 		}
-
-		if (gpio_is_valid(max->enable_gpio)) {
-			config.ena_gpio_flags = GPIOF_OUT_INIT_LOW;
-			if (ridata && (ridata->constraints.always_on ||
-					ridata->constraints.boot_on))
-				config.ena_gpio_flags = GPIOF_OUT_INIT_HIGH;
-			config.ena_gpio = max->enable_gpio;
-		}
-		break;
-
-	case MAX77621:
-		if (gpio_is_valid(max->enable_gpio)) {
-			ret = devm_gpio_request_one(&client->dev,
-					max->enable_gpio, GPIOF_OUT_INIT_HIGH,
-					"max8973-en-gpio");
-			if (ret) {
-				dev_err(&client->dev,
-					"gpio_request for gpio %d failed: %d\n",
-					max->enable_gpio, ret);
-				return ret;
-			}
-		}
-
-		max->desc.enable_reg = MAX8973_VOUT;
-		max->desc.enable_mask = MAX8973_VOUT_ENABLE;
-		max->ops.enable = regulator_enable_regmap;
-		max->ops.disable = regulator_disable_regmap;
-		max->ops.is_enabled = regulator_is_enabled_regmap;
-		max->ops.set_current_limit = max8973_set_current_limit;
-		max->ops.get_current_limit = max8973_get_current_limit;
-		break;
-	default:
-		break;
-	}
-
-	ret = max8973_init_dcdc(max, pdata);
-	if (ret < 0) {
-		dev_err(max->dev, "Max8973 Init failed, err = %d\n", ret);
-		return ret;
-	}
-
-	config.dev = &client->dev;
-	config.init_data = pdata->reg_init_data;
-	config.driver_data = max;
-	config.of_node = client->dev.of_node;
-	config.regmap = max->regmap;
-
-	/* Register the regulators */
-	rdev = devm_regulator_register(&client->dev, &max->desc, &config);
-	if (IS_ERR(rdev)) {
-		ret = PTR_ERR(rdev);
-		dev_err(max->dev, "regulator register failed, err %d\n", ret);
-		return ret;
 	}
 
 	return 0;
+
+fail1:
+	pci_unregister_driver(&i3200_driver);
+
+fail0:
+	pci_dev_put(mci_pdev);
+
+	return pci_rc;
 }
 
-static const struct i2c_device_id max8973_id[] = {
-	{.name = "max8973", .driver_data = MAX8973},
-	{.name = "max77621", .driver_data = MAX77621},
-	{},
-};
-MODULE_DEVICE_TABLE(i2c, max8973_id);
-
-static struct i2c_driver max8973_i2c_driver = {
-	.driver = {
-		.name = "max8973",
-		.of_match_table = of_max8973_match_tbl,
-	},
-	.probe = max8973_probe,
-	.id_table = max8973_id,
-};
-
-static int __init max8973_init(void)
+static void __exit i3200_exit(void)
 {
-	return i2c_add_driver(&max8973_i2c_driver);
-}
-subsys_initcall(max8973_init);
+	edac_dbg(3, "MC:\n");
 
-static void __exit max8973_cleanup(void)
-{
-	i2c_del_driver(&max8973_i2c_driver);
+	pci_unregister_driver(&i3200_driver);
+	if (!i3200_registered) {
+		i3200_remove_one(mci_pdev);
+		pci_dev_put(mci_pdev);
+	}
 }
-module_exit(max8973_cleanup);
 
-MODULE_AUTHOR("Laxman Dewangan <ldewangan@nvidia.com>");
-MODULE_DESCRIPTION("MAX8973 voltage regulator driver");
-MODULE_LICENSE("GPL v2");
+module_init(i3200_init);
+module_exit(i3200_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Akamai Technologies, Inc.");
+MODULE_DESCRIPTION("MC support for Intel 3200 memory hub controllers");
+
+module_param(edac_op_state, int, 0444);
+MODULE_PARM_DESC(edac_op_state, "EDAC Error Reporting state: 0=Poll,1=NMI");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+ * Intel 5000(P/V/X) class Memory Controllers kernel module
+ *
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
+ *
+ * Written by Douglas Thompson Linux Networx (http://lnxi.com)
+ *	norsk5@xmission.com
+ *
+ * This module is based on the following document:
+ *
+ * Intel 5000X Chipset Memory Controller Hub (MCH) - Datasheet
+ * 	http://developer.intel.com/design/chipsets/datashts/313070.htm
+ *
+ */
+
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/pci.h>
+#include <linux/pci_ids.h>
+#include <linux/slab.h>
+#include <linux/edac.h>
+#include <asm/mmzone.h>
+
+#include "edac_core.h"
+
+/*
+ * Alter this version for the I5000 module when modifications are made
+ */
+#define I5000_REVISION    " Ver: 2.0.12"
+#define EDAC_MOD_STR      "i5000_edac"
+
+#define i5000_printk(level, fmt, arg...) \
+        edac_printk(level, "i5000", fmt, ##arg)
+
+#define i5000_mc_printk(mci, level, fmt, arg...) \
+        edac_mc_chipset_printk(mci, level, "i5000", fmt, ##arg)
+
+#ifndef PCI_DEVICE_ID_INTEL_FBD_0
+#define PCI_DEVICE_ID_INTEL_FBD_0	0x25F5
+#endif
+#ifndef PCI_DEVICE_ID_INTEL_FBD_1
+#define PCI_DEVICE_ID_INTEL_FBD_1	0x25F6
+#endif
+
+/* Device 16,
+ * Function 0: System Address
+ * Function 1: Memory Branch Map, Control, Errors Register
+ * Function 2: FSB Error Registers
+ *
+ * All 3 functions of Device 16 (0,1,2) share the SAME DID
+ */
+#define	PCI_DEVICE_ID_INTEL_I5000_DEV16	0x25F0
+
+/* OFFSETS for Function 0 */
+
+/* OFFSETS for Function 1 */
+#define		AMBASE			0x48
+#define		MAXCH			0x56
+#define		MAXDIMMPERCH		0x57
+#define		TOLM			0x6C
+#define		REDMEMB			0x7C
+#define			RED_ECC_LOCATOR(x)	((x) & 0x3FFFF)
+#define			REC_ECC_LOCATOR_EVEN(x)	((x) & 0x001FF)
+#define			REC_ECC_LOCATOR_ODD(x)	((x) & 0x3FE00)
+#define		MIR0			0x80
+#define		MIR1			0x84
+#define		MIR2			0x88
+#define		AMIR0			0x8C
+#define		AMIR1			0x90
+#define		AMIR2			0x94
+
+#define		FERR_FAT_FBD		0x98
+#define		NERR_FAT_FBD		0x9C
+#define			EXTRACT_FBDCHAN_INDX(x)	(((x)>>28) & 0x3)
+#define			FERR_FAT_FBDCHAN 0x30000000
+#define			FERR_FAT_M3ERR	0x00000004
+#define			FERR_FAT_M2ERR	0x00000002
+#define			FERR_FAT_M1ERR	0x00000001
+#define			FERR_FAT_MASK	(FERR_FAT_M1ERR | \
+						FERR_FAT_M2ERR | \
+						FERR_FAT_M3ERR)
+
+#define		FERR_NF_FBD		0xA0
+
+/* Thermal and SPD or BFD errors */
+#define			FERR_NF_M28ERR	0x01000000
+#define			FERR_NF_M27ERR	0x00800000
+#define			FERR_NF_M26ERR	0x00400000
+#define			FERR_NF_M25ERR	0x00200000
+#define			FERR_NF_M24ERR	0x00100000
+#define			FERR_NF_M23ERR	0x00080000
+#define			FERR_NF_M22ERR	0x00040000
+#define			FERR_NF_M21ERR	0x00020000
+
+/* Correctable errors */
+#define			FERR_NF_M20ERR	0x00010000
+#define			FERR_NF_M19ERR	0x00008000
+#define			FERR_NF_M18ERR	0x00004000
+#define			FERR_NF_M17ERR	0x00002000
+
+/* Non-Retry or redundant Retry errors */
+#define			FERR_NF_M16ERR	0x00001000
+#define			FERR_NF_M15ERR	0x00000800
+#define			FERR_NF_M14ERR	0x00000400
+#define			FERR_NF_M13ERR	0x00000200
+
+/* Uncorrectable errors */
+#define			FERR_NF_M12ERR	0x00000100
+#define			FERR_NF_M11ERR	0x00000080
+#define			FERR_NF_M10ERR	0x00000040
+#define			FERR_NF_M9ERR	0x00000020
+#define			FERR_NF_M8ERR	0x00000010
+#define			FERR_NF_M7ERR	0x00000008
+#define			FERR_NF_M6ERR	0x00000004
+#define			FERR_NF_M5ERR	0x00000002
+#define			FERR_NF_M4ERR	0x00000001
+
+#define			FERR_NF_UNCORRECTABLE	(FERR_NF_M12ERR | \
+							FERR_NF_M11ERR | \
+							FERR_NF_M10ERR | \
+							FERR_NF_M9ERR | \
+							FERR_NF_M8ERR | \
+							FERR_NF_M7ERR | \
+							FERR_NF_M6ERR | \
+							FERR_NF_M5ERR | \
+							FERR_NF_M4ERR)
+#define			FERR_NF_CORRECTABLE	(FERR_NF_M20ERR | \
+							FERR_NF_M19ERR | \
+							FERR_NF_M18ERR | \
+							FERR_NF_M17ERR)
+#define			FERR_NF_DIMM_SPARE	(FERR_NF_M27ERR | \
+							FERR_NF_M28ERR)
+#define			FERR_NF_THERMAL		(FERR_NF_M26ERR | \
+							FERR_NF_M25ERR | \
+							FERR_NF_M24ERR | \
+							FERR_NF_M23ERR)
+#define			FERR_NF_SPD_PROTOCOL	(FERR_NF_M22ERR)
+#define			FERR_NF_NORTH_CRC	(FERR_NF_M21ERR)
+#define			FERR_NF_NON_RETRY	(FERR_NF_M13ERR | \
+							FERR_NF_M14ERR | \
+							FERR_NF_M15ERR)
+
+#define		NERR_NF_FBD		0xA4
+#define			FERR_NF_MASK		(FERR_NF_UNCORRECTABLE | \
+							FERR_NF_CORRECTABLE | \
+							FERR_NF_DIMM_SPARE | \
+							FERR_NF_THERMAL | \
+							FERR_NF_SPD_PROTOCOL | \
+							FERR_NF_NORTH_CRC | \
+							FERR_NF_NON_RETRY)
+
+#define		EMASK_FBD		0xA8
+#define			EMASK_FBD_M28ERR	0x08000000
+#define			EMASK_FBD_M27ERR	0x04000000
+#define			EMASK_FBD_M26ERR	0x02000000
+#define			EMASK_FBD_M25ERR	0x01000000
+#define			EMASK_FBD_M24ERR	0x00800000
+#define			EMASK_FBD_M23E

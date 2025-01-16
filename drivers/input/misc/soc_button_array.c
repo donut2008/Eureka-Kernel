@@ -1,221 +1,187 @@
-/*
- * Supports for the button array on SoC tablets originally running
- * Windows 8.
- *
- * (C) Copyright 2014 Intel Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; version 2
- * of the License.
- */
-
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/acpi.h>
-#include <linux/gpio/consumer.h>
-#include <linux/gpio_keys.h>
-#include <linux/platform_device.h>
-
-/*
- * Definition of buttons on the tablet. The ACPI index of each button
- * is defined in section 2.8.7.2 of "Windows ACPI Design Guide for SoC
- * Platforms"
- */
-#define MAX_NBUTTONS	5
-
-struct soc_button_info {
-	const char *name;
-	int acpi_index;
-	unsigned int event_type;
-	unsigned int event_code;
-	bool autorepeat;
-	bool wakeup;
-};
-
-/*
- * Some of the buttons like volume up/down are auto repeat, while others
- * are not. To support both, we register two platform devices, and put
- * buttons into them based on whether the key should be auto repeat.
- */
-#define BUTTON_TYPES	2
-
-struct soc_button_data {
-	struct platform_device *children[BUTTON_TYPES];
-};
-
-/*
- * Get the Nth GPIO number from the ACPI object.
- */
-static int soc_button_lookup_gpio(struct device *dev, int acpi_index)
-{
-	struct gpio_desc *desc;
-	int gpio;
-
-	desc = gpiod_get_index(dev, KBUILD_MODNAME, acpi_index, GPIOD_ASIS);
-	if (IS_ERR(desc))
-		return PTR_ERR(desc);
-
-	gpio = desc_to_gpio(desc);
-
-	gpiod_put(desc);
-
-	return gpio;
+d_hdr.status = 0;
 }
 
-static struct platform_device *
-soc_button_device_create(struct platform_device *pdev,
-			 const struct soc_button_info *button_info,
-			 bool autorepeat)
+/**
+ * srpt_get_iou() - Write IOUnitInfo to a management datagram.
+ *
+ * See also section 16.3.3.3 IOUnitInfo in the InfiniBand Architecture
+ * Specification. See also section B.7, table B.6 in the SRP r16a document.
+ */
+static void srpt_get_iou(struct ib_dm_mad *mad)
 {
-	const struct soc_button_info *info;
-	struct platform_device *pd;
-	struct gpio_keys_button *gpio_keys;
-	struct gpio_keys_platform_data *gpio_keys_pdata;
-	int n_buttons = 0;
-	int gpio;
-	int error;
-
-	gpio_keys_pdata = devm_kzalloc(&pdev->dev,
-				       sizeof(*gpio_keys_pdata) +
-					sizeof(*gpio_keys) * MAX_NBUTTONS,
-				       GFP_KERNEL);
-	if (!gpio_keys_pdata)
-		return ERR_PTR(-ENOMEM);
-
-	gpio_keys = (void *)(gpio_keys_pdata + 1);
-
-	for (info = button_info; info->name; info++) {
-		if (info->autorepeat != autorepeat)
-			continue;
-
-		gpio = soc_button_lookup_gpio(&pdev->dev, info->acpi_index);
-		if (gpio < 0)
-			continue;
-
-		gpio_keys[n_buttons].type = info->event_type;
-		gpio_keys[n_buttons].code = info->event_code;
-		gpio_keys[n_buttons].gpio = gpio;
-		gpio_keys[n_buttons].active_low = 1;
-		gpio_keys[n_buttons].desc = info->name;
-		gpio_keys[n_buttons].wakeup = info->wakeup;
-		n_buttons++;
-	}
-
-	if (n_buttons == 0) {
-		error = -ENODEV;
-		goto err_free_mem;
-	}
-
-	gpio_keys_pdata->buttons = gpio_keys;
-	gpio_keys_pdata->nbuttons = n_buttons;
-	gpio_keys_pdata->rep = autorepeat;
-
-	pd = platform_device_alloc("gpio-keys", PLATFORM_DEVID_AUTO);
-	if (!pd) {
-		error = -ENOMEM;
-		goto err_free_mem;
-	}
-
-	error = platform_device_add_data(pd, gpio_keys_pdata,
-					 sizeof(*gpio_keys_pdata));
-	if (error)
-		goto err_free_pdev;
-
-	error = platform_device_add(pd);
-	if (error)
-		goto err_free_pdev;
-
-	return pd;
-
-err_free_pdev:
-	platform_device_put(pd);
-err_free_mem:
-	devm_kfree(&pdev->dev, gpio_keys_pdata);
-	return ERR_PTR(error);
-}
-
-static int soc_button_remove(struct platform_device *pdev)
-{
-	struct soc_button_data *priv = platform_get_drvdata(pdev);
-
+	struct ib_dm_iou_info *ioui;
+	u8 slot;
 	int i;
 
-	for (i = 0; i < BUTTON_TYPES; i++)
-		if (priv->children[i])
-			platform_device_unregister(priv->children[i]);
+	ioui = (struct ib_dm_iou_info *)mad->data;
+	ioui->change_id = cpu_to_be16(1);
+	ioui->max_controllers = 16;
 
-	return 0;
+	/* set present for slot 1 and empty for the rest */
+	srpt_set_ioc(ioui->controller_list, 1, 1);
+	for (i = 1, slot = 2; i < 16; i++, slot++)
+		srpt_set_ioc(ioui->controller_list, slot, 0);
+
+	mad->mad_hdr.status = 0;
 }
 
-static int soc_button_probe(struct platform_device *pdev)
+/**
+ * srpt_get_ioc() - Write IOControllerprofile to a management datagram.
+ *
+ * See also section 16.3.3.4 IOControllerProfile in the InfiniBand
+ * Architecture Specification. See also section B.7, table B.7 in the SRP
+ * r16a document.
+ */
+static void srpt_get_ioc(struct srpt_port *sport, u32 slot,
+			 struct ib_dm_mad *mad)
 {
-	struct device *dev = &pdev->dev;
-	const struct acpi_device_id *id;
-	struct soc_button_info *button_info;
-	struct soc_button_data *priv;
-	struct platform_device *pd;
-	int i;
-	int error;
+	struct srpt_device *sdev = sport->sdev;
+	struct ib_dm_ioc_profile *iocp;
 
-	id = acpi_match_device(dev->driver->acpi_match_table, dev);
-	if (!id)
-		return -ENODEV;
+	iocp = (struct ib_dm_ioc_profile *)mad->data;
 
-	button_info = (struct soc_button_info *)id->driver_data;
-
-	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	platform_set_drvdata(pdev, priv);
-
-	for (i = 0; i < BUTTON_TYPES; i++) {
-		pd = soc_button_device_create(pdev, button_info, i == 0);
-		if (IS_ERR(pd)) {
-			error = PTR_ERR(pd);
-			if (error != -ENODEV) {
-				soc_button_remove(pdev);
-				return error;
-			}
-			continue;
-		}
-
-		priv->children[i] = pd;
+	if (!slot || slot > 16) {
+		mad->mad_hdr.status
+			= cpu_to_be16(DM_MAD_STATUS_INVALID_FIELD);
+		return;
 	}
 
-	if (!priv->children[0] && !priv->children[1])
-		return -ENODEV;
+	if (slot > 2) {
+		mad->mad_hdr.status
+			= cpu_to_be16(DM_MAD_STATUS_NO_IOC);
+		return;
+	}
 
-	return 0;
+	memset(iocp, 0, sizeof *iocp);
+	strcpy(iocp->id_string, SRPT_ID_STRING);
+	iocp->guid = cpu_to_be64(srpt_service_guid);
+	iocp->vendor_id = cpu_to_be32(sdev->dev_attr.vendor_id);
+	iocp->device_id = cpu_to_be32(sdev->dev_attr.vendor_part_id);
+	iocp->device_version = cpu_to_be16(sdev->dev_attr.hw_ver);
+	iocp->subsys_vendor_id = cpu_to_be32(sdev->dev_attr.vendor_id);
+	iocp->subsys_device_id = 0x0;
+	iocp->io_class = cpu_to_be16(SRP_REV16A_IB_IO_CLASS);
+	iocp->io_subclass = cpu_to_be16(SRP_IO_SUBCLASS);
+	iocp->protocol = cpu_to_be16(SRP_PROTOCOL);
+	iocp->protocol_version = cpu_to_be16(SRP_PROTOCOL_VERSION);
+	iocp->send_queue_depth = cpu_to_be16(sdev->srq_size);
+	iocp->rdma_read_depth = 4;
+	iocp->send_size = cpu_to_be32(srp_max_req_size);
+	iocp->rdma_size = cpu_to_be32(min(sport->port_attrib.srp_max_rdma_size,
+					  1U << 24));
+	iocp->num_svc_entries = 1;
+	iocp->op_cap_mask = SRP_SEND_TO_IOC | SRP_SEND_FROM_IOC |
+		SRP_RDMA_READ_FROM_IOC | SRP_RDMA_WRITE_FROM_IOC;
+
+	mad->mad_hdr.status = 0;
 }
 
-static struct soc_button_info soc_button_PNP0C40[] = {
-	{ "power", 0, EV_KEY, KEY_POWER, false, true },
-	{ "home", 1, EV_KEY, KEY_LEFTMETA, false, true },
-	{ "volume_up", 2, EV_KEY, KEY_VOLUMEUP, true, false },
-	{ "volume_down", 3, EV_KEY, KEY_VOLUMEDOWN, true, false },
-	{ "rotation_lock", 4, EV_SW, SW_ROTATE_LOCK, false, false },
-	{ }
-};
+/**
+ * srpt_get_svc_entries() - Write ServiceEntries to a management datagram.
+ *
+ * See also section 16.3.3.5 ServiceEntries in the InfiniBand Architecture
+ * Specification. See also section B.7, table B.8 in the SRP r16a document.
+ */
+static void srpt_get_svc_entries(u64 ioc_guid,
+				 u16 slot, u8 hi, u8 lo, struct ib_dm_mad *mad)
+{
+	struct ib_dm_svc_entries *svc_entries;
 
-static const struct acpi_device_id soc_button_acpi_match[] = {
-	{ "PNP0C40", (unsigned long)soc_button_PNP0C40 },
-	{ }
-};
+	WARN_ON(!ioc_guid);
 
-MODULE_DEVICE_TABLE(acpi, soc_button_acpi_match);
+	if (!slot || slot > 16) {
+		mad->mad_hdr.status
+			= cpu_to_be16(DM_MAD_STATUS_INVALID_FIELD);
+		return;
+	}
 
-static struct platform_driver soc_button_driver = {
-	.probe          = soc_button_probe,
-	.remove		= soc_button_remove,
-	.driver		= {
-		.name = KBUILD_MODNAME,
-		.acpi_match_table = ACPI_PTR(soc_button_acpi_match),
-	},
-};
-module_platform_driver(soc_button_driver);
+	if (slot > 2 || lo > hi || hi > 1) {
+		mad->mad_hdr.status
+			= cpu_to_be16(DM_MAD_STATUS_NO_IOC);
+		return;
+	}
 
-MODULE_LICENSE("GPL");
+	svc_entries = (struct ib_dm_svc_entries *)mad->data;
+	memset(svc_entries, 0, sizeof *svc_entries);
+	svc_entries->service_entries[0].id = cpu_to_be64(ioc_guid);
+	snprintf(svc_entries->service_entries[0].name,
+		 sizeof(svc_entries->service_entries[0].name),
+		 "%s%016llx",
+		 SRP_SERVICE_NAME_PREFIX,
+		 ioc_guid);
+
+	mad->mad_hdr.status = 0;
+}
+
+/**
+ * srpt_mgmt_method_get() - Process a received management datagram.
+ * @sp:      source port through which the MAD has been received.
+ * @rq_mad:  received MAD.
+ * @rsp_mad: response MAD.
+ */
+static void srpt_mgmt_method_get(struct srpt_port *sp, struct ib_mad *rq_mad,
+				 struct ib_dm_mad *rsp_mad)
+{
+	u16 attr_id;
+	u32 slot;
+	u8 hi, lo;
+
+	attr_id = be16_to_cpu(rq_mad->mad_hdr.attr_id);
+	switch (attr_id) {
+	case DM_ATTR_CLASS_PORT_INFO:
+		srpt_get_class_port_info(rsp_mad);
+		break;
+	case DM_ATTR_IOU_INFO:
+		srpt_get_iou(rsp_mad);
+		break;
+	case DM_ATTR_IOC_PROFILE:
+		slot = be32_to_cpu(rq_mad->mad_hdr.attr_mod);
+		srpt_get_ioc(sp, slot, rsp_mad);
+		break;
+	case DM_ATTR_SVC_ENTRIES:
+		slot = be32_to_cpu(rq_mad->mad_hdr.attr_mod);
+		hi = (u8) ((slot >> 8) & 0xff);
+		lo = (u8) (slot & 0xff);
+		slot = (u16) ((slot >> 16) & 0xffff);
+		srpt_get_svc_entries(srpt_service_guid,
+				     slot, hi, lo, rsp_mad);
+		break;
+	default:
+		rsp_mad->mad_hdr.status =
+		    cpu_to_be16(DM_MAD_STATUS_UNSUP_METHOD_ATTR);
+		break;
+	}
+}
+
+/**
+ * srpt_mad_send_handler() - Post MAD-send callback function.
+ */
+static void srpt_mad_send_handler(struct ib_mad_agent *mad_agent,
+				  struct ib_mad_send_wc *mad_wc)
+{
+	ib_destroy_ah(mad_wc->send_buf->ah);
+	ib_free_send_mad(mad_wc->send_buf);
+}
+
+/**
+ * srpt_mad_recv_handler() - MAD reception callback function.
+ */
+static void srpt_mad_recv_handler(struct ib_mad_agent *mad_agent,
+				  struct ib_mad_recv_wc *mad_wc)
+{
+	struct srpt_port *sport = (struct srpt_port *)mad_agent->context;
+	struct ib_ah *ah;
+	struct ib_mad_send_buf *rsp;
+	struct ib_dm_mad *dm_mad;
+
+	if (!mad_wc || !mad_wc->recv_buf.mad)
+		return;
+
+	ah = ib_create_ah_from_wc(mad_agent->qp->pd, mad_wc->wc,
+				  mad_wc->recv_buf.grh, mad_agent->port_num);
+	if (IS_ERR(ah))
+		goto err;
+
+	BUILD_BUG_ON(offsetof(struct ib_dm_mad, data) != IB_MGMT_DEVICE_HDR);
+
+	rsp = ib_create_send_mad(mad_ag

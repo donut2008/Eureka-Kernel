@@ -1,218 +1,274 @@
-/******************************************************************************
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Intel MEI Interface Header
- *
- * This file is provided under a dual BSD/GPLv2 license.  When using or
- * redistributing this file, you may do so under either license.
- *
- * GPL LICENSE SUMMARY
- *
- * Copyright(c) 2003 - 2012 Intel Corporation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of version 2 of the GNU General Public License as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110,
- * USA
- *
- * The full GNU General Public License is included in this distribution
- * in the file called LICENSE.GPL.
- *
- * Contact Information:
- *	Intel Corporation.
- *	linux-mei@linux.intel.com
- *	http://www.intel.com
- *
- * BSD LICENSE
- *
- * Copyright(c) 2003 - 2012 Intel Corporation. All rights reserved.
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- *  * Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *  * Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
- *  * Neither the name Intel Corporation nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- *****************************************************************************/
-#ifndef _MEI_HW_MEI_REGS_H_
-#define _MEI_HW_MEI_REGS_H_
+eg);
+	return inb(ioreg + 1);
+}
+
+static inline void
+superio_select(int ioreg, int ld)
+{
+	outb(SIO_REG_LDSEL, ioreg);
+	outb(ld, ioreg + 1);
+}
+
+static inline int
+superio_enter(int ioreg)
+{
+	/*
+	 * Try to reserve <ioreg> and <ioreg + 1> for exclusive access.
+	 */
+	if (!request_muxed_region(ioreg, 2, DRVNAME))
+		return -EBUSY;
+
+	outb(0x87, ioreg);
+	outb(0x87, ioreg);
+
+	return 0;
+}
+
+static inline void
+superio_exit(int ioreg)
+{
+	outb(0xaa, ioreg);
+	outb(0x02, ioreg);
+	outb(0x02, ioreg + 1);
+	release_region(ioreg, 2);
+}
 
 /*
- * MEI device IDs
+ * ISA constants
  */
-#define MEI_DEV_ID_82946GZ    0x2974  /* 82946GZ/GL */
-#define MEI_DEV_ID_82G35      0x2984  /* 82G35 Express */
-#define MEI_DEV_ID_82Q965     0x2994  /* 82Q963/Q965 */
-#define MEI_DEV_ID_82G965     0x29A4  /* 82P965/G965 */
 
-#define MEI_DEV_ID_82GM965    0x2A04  /* Mobile PM965/GM965 */
-#define MEI_DEV_ID_82GME965   0x2A14  /* Mobile GME965/GLE960 */
+#define IOREGION_ALIGNMENT	(~7)
+#define IOREGION_OFFSET		5
+#define IOREGION_LENGTH		2
+#define ADDR_REG_OFFSET		0
+#define DATA_REG_OFFSET		1
 
-#define MEI_DEV_ID_ICH9_82Q35 0x29B4  /* 82Q35 Express */
-#define MEI_DEV_ID_ICH9_82G33 0x29C4  /* 82G33/G31/P35/P31 Express */
-#define MEI_DEV_ID_ICH9_82Q33 0x29D4  /* 82Q33 Express */
-#define MEI_DEV_ID_ICH9_82X38 0x29E4  /* 82X38/X48 Express */
-#define MEI_DEV_ID_ICH9_3200  0x29F4  /* 3200/3210 Server */
-
-#define MEI_DEV_ID_ICH9_6     0x28B4  /* Bearlake */
-#define MEI_DEV_ID_ICH9_7     0x28C4  /* Bearlake */
-#define MEI_DEV_ID_ICH9_8     0x28D4  /* Bearlake */
-#define MEI_DEV_ID_ICH9_9     0x28E4  /* Bearlake */
-#define MEI_DEV_ID_ICH9_10    0x28F4  /* Bearlake */
-
-#define MEI_DEV_ID_ICH9M_1    0x2A44  /* Cantiga */
-#define MEI_DEV_ID_ICH9M_2    0x2A54  /* Cantiga */
-#define MEI_DEV_ID_ICH9M_3    0x2A64  /* Cantiga */
-#define MEI_DEV_ID_ICH9M_4    0x2A74  /* Cantiga */
-
-#define MEI_DEV_ID_ICH10_1    0x2E04  /* Eaglelake */
-#define MEI_DEV_ID_ICH10_2    0x2E14  /* Eaglelake */
-#define MEI_DEV_ID_ICH10_3    0x2E24  /* Eaglelake */
-#define MEI_DEV_ID_ICH10_4    0x2E34  /* Eaglelake */
-
-#define MEI_DEV_ID_IBXPK_1    0x3B64  /* Calpella */
-#define MEI_DEV_ID_IBXPK_2    0x3B65  /* Calpella */
-
-#define MEI_DEV_ID_CPT_1      0x1C3A  /* Couger Point */
-#define MEI_DEV_ID_PBG_1      0x1D3A  /* C600/X79 Patsburg */
-
-#define MEI_DEV_ID_PPT_1      0x1E3A  /* Panther Point */
-#define MEI_DEV_ID_PPT_2      0x1CBA  /* Panther Point */
-#define MEI_DEV_ID_PPT_3      0x1DBA  /* Panther Point */
-
-#define MEI_DEV_ID_LPT_H      0x8C3A  /* Lynx Point H */
-#define MEI_DEV_ID_LPT_W      0x8D3A  /* Lynx Point - Wellsburg */
-#define MEI_DEV_ID_LPT_LP     0x9C3A  /* Lynx Point LP */
-#define MEI_DEV_ID_LPT_HR     0x8CBA  /* Lynx Point H Refresh */
-
-#define MEI_DEV_ID_WPT_LP     0x9CBA  /* Wildcat Point LP */
-#define MEI_DEV_ID_WPT_LP_2   0x9CBB  /* Wildcat Point LP 2 */
-
-#define MEI_DEV_ID_SPT        0x9D3A  /* Sunrise Point */
-#define MEI_DEV_ID_SPT_2      0x9D3B  /* Sunrise Point 2 */
-#define MEI_DEV_ID_SPT_H      0xA13A  /* Sunrise Point H */
-#define MEI_DEV_ID_SPT_H_2    0xA13B  /* Sunrise Point H 2 */
-
-#define MEI_DEV_ID_KBP        0xA2BA  /* Kaby Point */
-#define MEI_DEV_ID_KBP_2      0xA2BB  /* Kaby Point 2 */
-
-#define MEI_DEV_ID_LBG        0xA1BA  /* Lewisburg (SPT) */
-
-#define MEI_DEV_ID_BXT_M      0x1A9A  /* Broxton M */
-#define MEI_DEV_ID_APL_I      0x5A9A  /* Apollo Lake I */
+#define NCT6775_REG_BANK	0x4E
+#define NCT6775_REG_CONFIG	0x40
 
 /*
- * MEI HW Section
+ * Not currently used:
+ * REG_MAN_ID has the value 0x5ca3 for all supported chips.
+ * REG_CHIP_ID == 0x88/0xa1/0xc1 depending on chip model.
+ * REG_MAN_ID is at port 0x4f
+ * REG_CHIP_ID is at port 0x58
  */
 
-/* Host Firmware Status Registers in PCI Config Space */
-#define PCI_CFG_HFS_1         0x40
-#  define PCI_CFG_HFS_1_D0I3_MSK     0x80000000
-#define PCI_CFG_HFS_2         0x48
-#define PCI_CFG_HFS_3         0x60
-#define PCI_CFG_HFS_4         0x64
-#define PCI_CFG_HFS_5         0x68
-#define PCI_CFG_HFS_6         0x6C
+#define NUM_TEMP	10	/* Max number of temp attribute sets w/ limits*/
+#define NUM_TEMP_FIXED	6	/* Max number of fixed temp attribute sets */
 
-/* MEI registers */
-/* H_CB_WW - Host Circular Buffer (CB) Write Window register */
-#define H_CB_WW    0
-/* H_CSR - Host Control Status register */
-#define H_CSR      4
-/* ME_CB_RW - ME Circular Buffer Read Window register (read only) */
-#define ME_CB_RW   8
-/* ME_CSR_HA - ME Control Status Host Access register (read only) */
-#define ME_CSR_HA  0xC
-/* H_HGC_CSR - PGI register */
-#define H_HPG_CSR  0x10
-/* H_D0I3C - D0I3 Control  */
-#define H_D0I3C    0x800
+#define NUM_REG_ALARM	7	/* Max number of alarm registers */
+#define NUM_REG_BEEP	5	/* Max number of beep registers */
 
-/* register bits of H_CSR (Host Control Status register) */
-/* Host Circular Buffer Depth - maximum number of 32-bit entries in CB */
-#define H_CBD             0xFF000000
-/* Host Circular Buffer Write Pointer */
-#define H_CBWP            0x00FF0000
-/* Host Circular Buffer Read Pointer */
-#define H_CBRP            0x0000FF00
-/* Host Reset */
-#define H_RST             0x00000010
-/* Host Ready */
-#define H_RDY             0x00000008
-/* Host Interrupt Generate */
-#define H_IG              0x00000004
-/* Host Interrupt Status */
-#define H_IS              0x00000002
-/* Host Interrupt Enable */
-#define H_IE              0x00000001
-/* Host D0I3 Interrupt Enable */
-#define H_D0I3C_IE        0x00000020
-/* Host D0I3 Interrupt Status */
-#define H_D0I3C_IS        0x00000040
+#define NUM_FAN		6
 
-/* H_CSR masks */
-#define H_CSR_IE_MASK     (H_IE | H_D0I3C_IE)
-#define H_CSR_IS_MASK     (H_IS | H_D0I3C_IS)
+/* Common and NCT6775 specific data */
 
-/* register bits of ME_CSR_HA (ME Control Status Host Access register) */
-/* ME CB (Circular Buffer) Depth HRA (Host Read Access) - host read only
-access to ME_CBD */
-#define ME_CBD_HRA        0xFF000000
-/* ME CB Write Pointer HRA - host read only access to ME_CBWP */
-#define ME_CBWP_HRA       0x00FF0000
-/* ME CB Read Pointer HRA - host read only access to ME_CBRP */
-#define ME_CBRP_HRA       0x0000FF00
-/* ME Power Gate Isolation Capability HRA  - host ready only access */
-#define ME_PGIC_HRA       0x00000040
-/* ME Reset HRA - host read only access to ME_RST */
-#define ME_RST_HRA        0x00000010
-/* ME Ready HRA - host read only access to ME_RDY */
-#define ME_RDY_HRA        0x00000008
-/* ME Interrupt Generate HRA - host read only access to ME_IG */
-#define ME_IG_HRA         0x00000004
-/* ME Interrupt Status HRA - host read only access to ME_IS */
-#define ME_IS_HRA         0x00000002
-/* ME Interrupt Enable HRA - host read only access to ME_IE */
-#define ME_IE_HRA         0x00000001
+/* Voltage min/max registers for nr=7..14 are in bank 5 */
 
+static const u16 NCT6775_REG_IN_MAX[] = {
+	0x2b, 0x2d, 0x2f, 0x31, 0x33, 0x35, 0x37, 0x554, 0x556, 0x558, 0x55a,
+	0x55c, 0x55e, 0x560, 0x562 };
+static const u16 NCT6775_REG_IN_MIN[] = {
+	0x2c, 0x2e, 0x30, 0x32, 0x34, 0x36, 0x38, 0x555, 0x557, 0x559, 0x55b,
+	0x55d, 0x55f, 0x561, 0x563 };
+static const u16 NCT6775_REG_IN[] = {
+	0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x550, 0x551, 0x552
+};
 
-/* H_HPG_CSR register bits */
-#define H_HPG_CSR_PGIHEXR 0x00000001
-#define H_HPG_CSR_PGI     0x00000002
+#define NCT6775_REG_VBAT		0x5D
+#define NCT6775_REG_DIODE		0x5E
+#define NCT6775_DIODE_MASK		0x02
 
-/* H_D0I3C register bits */
-#define H_D0I3C_CIP      0x00000001
-#define H_D0I3C_IR       0x00000002
-#define H_D0I3C_I3       0x00000004
-#define H_D0I3C_RR       0x00000008
+#define NCT6775_REG_FANDIV1		0x506
+#define NCT6775_REG_FANDIV2		0x507
 
-#endif /* _MEI_HW_MEI_REGS_H_ */
+#define NCT6775_REG_CR_FAN_DEBOUNCE	0xf0
+
+static const u16 NCT6775_REG_ALARM[NUM_REG_ALARM] = { 0x459, 0x45A, 0x45B };
+
+/* 0..15 voltages, 16..23 fans, 24..29 temperatures, 30..31 intrusion */
+
+static const s8 NCT6775_ALARM_BITS[] = {
+	0, 1, 2, 3, 8, 21, 20, 16,	/* in0.. in7 */
+	17, -1, -1, -1, -1, -1, -1,	/* in8..in14 */
+	-1,				/* unused */
+	6, 7, 11, -1, -1,		/* fan1..fan5 */
+	-1, -1, -1,			/* unused */
+	4, 5, 13, -1, -1, -1,		/* temp1..temp6 */
+	12, -1 };			/* intrusion0, intrusion1 */
+
+#define FAN_ALARM_BASE		16
+#define TEMP_ALARM_BASE		24
+#define INTRUSION_ALARM_BASE	30
+
+static const u16 NCT6775_REG_BEEP[NUM_REG_BEEP] = { 0x56, 0x57, 0x453, 0x4e };
+
+/*
+ * 0..14 voltages, 15 global beep enable, 16..23 fans, 24..29 temperatures,
+ * 30..31 intrusion
+ */
+static const s8 NCT6775_BEEP_BITS[] = {
+	0, 1, 2, 3, 8, 9, 10, 16,	/* in0.. in7 */
+	17, -1, -1, -1, -1, -1, -1,	/* in8..in14 */
+	21,				/* global beep enable */
+	6, 7, 11, 28, -1,		/* fan1..fan5 */
+	-1, -1, -1,			/* unused */
+	4, 5, 13, -1, -1, -1,		/* temp1..temp6 */
+	12, -1 };			/* intrusion0, intrusion1 */
+
+#define BEEP_ENABLE_BASE		15
+
+static const u8 NCT6775_REG_CR_CASEOPEN_CLR[] = { 0xe6, 0xee };
+static const u8 NCT6775_CR_CASEOPEN_CLR_MASK[] = { 0x20, 0x01 };
+
+/* DC or PWM output fan configuration */
+static const u8 NCT6775_REG_PWM_MODE[] = { 0x04, 0x04, 0x12 };
+static const u8 NCT6775_PWM_MODE_MASK[] = { 0x01, 0x02, 0x01 };
+
+/* Advanced Fan control, some values are common for all fans */
+
+static const u16 NCT6775_REG_TARGET[] = {
+	0x101, 0x201, 0x301, 0x801, 0x901, 0xa01 };
+static const u16 NCT6775_REG_FAN_MODE[] = {
+	0x102, 0x202, 0x302, 0x802, 0x902, 0xa02 };
+static const u16 NCT6775_REG_FAN_STEP_DOWN_TIME[] = {
+	0x103, 0x203, 0x303, 0x803, 0x903, 0xa03 };
+static const u16 NCT6775_REG_FAN_STEP_UP_TIME[] = {
+	0x104, 0x204, 0x304, 0x804, 0x904, 0xa04 };
+static const u16 NCT6775_REG_FAN_STOP_OUTPUT[] = {
+	0x105, 0x205, 0x305, 0x805, 0x905, 0xa05 };
+static const u16 NCT6775_REG_FAN_START_OUTPUT[] = {
+	0x106, 0x206, 0x306, 0x806, 0x906, 0xa06 };
+static const u16 NCT6775_REG_FAN_MAX_OUTPUT[] = { 0x10a, 0x20a, 0x30a };
+static const u16 NCT6775_REG_FAN_STEP_OUTPUT[] = { 0x10b, 0x20b, 0x30b };
+
+static const u16 NCT6775_REG_FAN_STOP_TIME[] = {
+	0x107, 0x207, 0x307, 0x807, 0x907, 0xa07 };
+static const u16 NCT6775_REG_PWM[] = {
+	0x109, 0x209, 0x309, 0x809, 0x909, 0xa09 };
+static const u16 NCT6775_REG_PWM_READ[] = {
+	0x01, 0x03, 0x11, 0x13, 0x15, 0xa09 };
+
+static const u16 NCT6775_REG_FAN[] = { 0x630, 0x632, 0x634, 0x636, 0x638 };
+static const u16 NCT6775_REG_FAN_MIN[] = { 0x3b, 0x3c, 0x3d };
+static const u16 NCT6775_REG_FAN_PULSES[] = { 0x641, 0x642, 0x643, 0x644, 0 };
+static const u16 NCT6775_FAN_PULSE_SHIFT[] = { 0, 0, 0, 0, 0, 0 };
+
+static const u16 NCT6775_REG_TEMP[] = {
+	0x27, 0x150, 0x250, 0x62b, 0x62c, 0x62d };
+
+static const u16 NCT6775_REG_TEMP_MON[] = { 0x73, 0x75, 0x77 };
+
+static const u16 NCT6775_REG_TEMP_CONFIG[ARRAY_SIZE(NCT6775_REG_TEMP)] = {
+	0, 0x152, 0x252, 0x628, 0x629, 0x62A };
+static const u16 NCT6775_REG_TEMP_HYST[ARRAY_SIZE(NCT6775_REG_TEMP)] = {
+	0x3a, 0x153, 0x253, 0x673, 0x678, 0x67D };
+static const u16 NCT6775_REG_TEMP_OVER[ARRAY_SIZE(NCT6775_REG_TEMP)] = {
+	0x39, 0x155, 0x255, 0x672, 0x677, 0x67C };
+
+static const u16 NCT6775_REG_TEMP_SOURCE[ARRAY_SIZE(NCT6775_REG_TEMP)] = {
+	0x621, 0x622, 0x623, 0x624, 0x625, 0x626 };
+
+static const u16 NCT6775_REG_TEMP_SEL[] = {
+	0x100, 0x200, 0x300, 0x800, 0x900, 0xa00 };
+
+static const u16 NCT6775_REG_WEIGHT_TEMP_SEL[] = {
+	0x139, 0x239, 0x339, 0x839, 0x939, 0xa39 };
+static const u16 NCT6775_REG_WEIGHT_TEMP_STEP[] = {
+	0x13a, 0x23a, 0x33a, 0x83a, 0x93a, 0xa3a };
+static const u16 NCT6775_REG_WEIGHT_TEMP_STEP_TOL[] = {
+	0x13b, 0x23b, 0x33b, 0x83b, 0x93b, 0xa3b };
+static const u16 NCT6775_REG_WEIGHT_DUTY_STEP[] = {
+	0x13c, 0x23c, 0x33c, 0x83c, 0x93c, 0xa3c };
+static const u16 NCT6775_REG_WEIGHT_TEMP_BASE[] = {
+	0x13d, 0x23d, 0x33d, 0x83d, 0x93d, 0xa3d };
+
+static const u16 NCT6775_REG_TEMP_OFFSET[] = { 0x454, 0x455, 0x456 };
+
+static const u16 NCT6775_REG_AUTO_TEMP[] = {
+	0x121, 0x221, 0x321, 0x821, 0x921, 0xa21 };
+static const u16 NCT6775_REG_AUTO_PWM[] = {
+	0x127, 0x227, 0x327, 0x827, 0x927, 0xa27 };
+
+#define NCT6775_AUTO_TEMP(data, nr, p)	((data)->REG_AUTO_TEMP[nr] + (p))
+#define NCT6775_AUTO_PWM(data, nr, p)	((data)->REG_AUTO_PWM[nr] + (p))
+
+static const u16 NCT6775_REG_CRITICAL_ENAB[] = { 0x134, 0x234, 0x334 };
+
+static const u16 NCT6775_REG_CRITICAL_TEMP[] = {
+	0x135, 0x235, 0x335, 0x835, 0x935, 0xa35 };
+static const u16 NCT6775_REG_CRITICAL_TEMP_TOLERANCE[] = {
+	0x138, 0x238, 0x338, 0x838, 0x938, 0xa38 };
+
+static const char *const nct6775_temp_label[] = {
+	"",
+	"SYSTIN",
+	"CPUTIN",
+	"AUXTIN",
+	"AMD SB-TSI",
+	"PECI Agent 0",
+	"PECI Agent 1",
+	"PECI Agent 2",
+	"PECI Agent 3",
+	"PECI Agent 4",
+	"PECI Agent 5",
+	"PECI Agent 6",
+	"PECI Agent 7",
+	"PCH_CHIP_CPU_MAX_TEMP",
+	"PCH_CHIP_TEMP",
+	"PCH_CPU_TEMP",
+	"PCH_MCH_TEMP",
+	"PCH_DIM0_TEMP",
+	"PCH_DIM1_TEMP",
+	"PCH_DIM2_TEMP",
+	"PCH_DIM3_TEMP"
+};
+
+static const u16 NCT6775_REG_TEMP_ALTERNATE[ARRAY_SIZE(nct6775_temp_label) - 1]
+	= { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x661, 0x662, 0x664 };
+
+static const u16 NCT6775_REG_TEMP_CRIT[ARRAY_SIZE(nct6775_temp_label) - 1]
+	= { 0, 0, 0, 0, 0xa00, 0xa01, 0xa02, 0xa03, 0xa04, 0xa05, 0xa06,
+	    0xa07 };
+
+/* NCT6776 specific data */
+
+/* STEP_UP_TIME and STEP_DOWN_TIME regs are swapped for all chips but NCT6775 */
+#define NCT6776_REG_FAN_STEP_UP_TIME NCT6775_REG_FAN_STEP_DOWN_TIME
+#define NCT6776_REG_FAN_STEP_DOWN_TIME NCT6775_REG_FAN_STEP_UP_TIME
+
+static const s8 NCT6776_ALARM_BITS[] = {
+	0, 1, 2, 3, 8, 21, 20, 16,	/* in0.. in7 */
+	17, -1, -1, -1, -1, -1, -1,	/* in8..in14 */
+	-1,				/* unused */
+	6, 7, 11, 10, 23,		/* fan1..fan5 */
+	-1, -1, -1,			/* unused */
+	4, 5, 13, -1, -1, -1,		/* temp1..temp6 */
+	12, 9 };			/* intrusion0, intrusion1 */
+
+static const u16 NCT6776_REG_BEEP[NUM_REG_BEEP] = { 0xb2, 0xb3, 0xb4, 0xb5 };
+
+static const s8 NCT6776_BEEP_BITS[] = {
+	0, 1, 2, 3, 4, 5, 6, 7,		/* in0.. in7 */
+	8, -1, -1, -1, -1, -1, -1,	/* in8..in14 */
+	24,				/* global beep enable */
+	25, 26, 27, 28, 29,		/* fan1..fan5 */
+	-1, -1, -1,			/* unused */
+	16, 17, 18, 19, 20, 21,		/* temp1..temp6 */
+	30, 31 };			/* intrusion0, intrusion1 */
+
+static const u16 NCT6776_REG_TOLERANCE_H[] = {
+	0x10c, 0x20c, 0x30c, 0x80c, 0x90c, 0xa0c };
+
+static const u8 NCT6776_REG_PWM_MODE[] = { 0x04, 0, 0, 0, 0, 0 };
+static const u8 NCT6776_PWM_MODE_MASK[] = { 0x01, 0, 0, 0, 0, 0 };
+
+static const u16 NCT6776_REG_FAN_MIN[] = { 0x63a, 0x63c, 0x63e, 0x640, 0x642 };
+static const u16 NCT6776_REG_FAN_PULSES[] = { 0x644, 0x645, 0x646, 0, 0 };
+
+static const u16 NCT6776_REG_WEIGHT_DUTY_BASE[] = {
+	0x13e, 0x23e, 0x33e, 0x83e, 0x93e, 0xa3e };
+
+static const u16 NCT6776_REG_TEMP_CONFIG[ARRAY_SIZE(NCT6775_REG_TEMP)] = {
+	0x18, 0x152, 0x252, 0x628, 0

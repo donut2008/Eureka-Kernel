@@ -1,1380 +1,963 @@
-/*
- *  i2c_adap_pxa.c
- *
- *  I2C adapter for the PXA I2C bus access.
- *
- *  Copyright (C) 2002 Intrinsyc Software Inc.
- *  Copyright (C) 2004-2005 Deep Blue Solutions Ltd.
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License version 2 as
- *  published by the Free Software Foundation.
- *
- *  History:
- *    Apr 2002: Initial version [CS]
- *    Jun 2002: Properly separated algo/adap [FB]
- *    Jan 2003: Fixed several bugs concerning interrupt handling [Kai-Uwe Bloem]
- *    Jan 2003: added limited signal handling [Kai-Uwe Bloem]
- *    Sep 2004: Major rework to ensure efficient bus handling [RMK]
- *    Dec 2004: Added support for PXA27x and slave device probing [Liam Girdwood]
- *    Feb 2005: Rework slave mode handling [RMK]
- */
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/i2c.h>
-#include <linux/init.h>
-#include <linux/time.h>
-#include <linux/sched.h>
-#include <linux/delay.h>
-#include <linux/errno.h>
-#include <linux/interrupt.h>
-#include <linux/i2c-pxa.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/platform_device.h>
-#include <linux/err.h>
-#include <linux/clk.h>
-#include <linux/slab.h>
-#include <linux/io.h>
-#include <linux/i2c/pxa-i2c.h>
-
-#include <asm/irq.h>
-
-struct pxa_reg_layout {
-	u32 ibmr;
-	u32 idbr;
-	u32 icr;
-	u32 isr;
-	u32 isar;
-	u32 ilcr;
-	u32 iwcr;
+lease = qib_port_release,
+	.sysfs_ops = &qib_diagc_ops,
+	.default_attrs = diagc_default_attributes
 };
 
-enum pxa_i2c_types {
-	REGS_PXA2XX,
-	REGS_PXA3XX,
-	REGS_CE4100,
-	REGS_PXA910,
-};
+/* End diag_counters */
+
+/* end of per-port file structures and support code */
 
 /*
- * I2C registers definitions
+ * Start of per-unit (or driver, in some cases, but replicated
+ * per unit) functions (these get a device *)
  */
-static struct pxa_reg_layout pxa_reg_layout[] = {
-	[REGS_PXA2XX] = {
-		.ibmr =	0x00,
-		.idbr =	0x08,
-		.icr =	0x10,
-		.isr =	0x18,
-		.isar =	0x20,
-	},
-	[REGS_PXA3XX] = {
-		.ibmr =	0x00,
-		.idbr =	0x04,
-		.icr =	0x08,
-		.isr =	0x0c,
-		.isar =	0x10,
-	},
-	[REGS_CE4100] = {
-		.ibmr =	0x14,
-		.idbr =	0x0c,
-		.icr =	0x00,
-		.isr =	0x04,
-		/* no isar register */
-	},
-	[REGS_PXA910] = {
-		.ibmr = 0x00,
-		.idbr = 0x08,
-		.icr =	0x10,
-		.isr =	0x18,
-		.isar = 0x20,
-		.ilcr = 0x28,
-		.iwcr = 0x30,
-	},
-};
-
-static const struct platform_device_id i2c_pxa_id_table[] = {
-	{ "pxa2xx-i2c",		REGS_PXA2XX },
-	{ "pxa3xx-pwri2c",	REGS_PXA3XX },
-	{ "ce4100-i2c",		REGS_CE4100 },
-	{ "pxa910-i2c",		REGS_PXA910 },
-	{ },
-};
-MODULE_DEVICE_TABLE(platform, i2c_pxa_id_table);
-
-/*
- * I2C bit definitions
- */
-
-#define ICR_START	(1 << 0)	   /* start bit */
-#define ICR_STOP	(1 << 1)	   /* stop bit */
-#define ICR_ACKNAK	(1 << 2)	   /* send ACK(0) or NAK(1) */
-#define ICR_TB		(1 << 3)	   /* transfer byte bit */
-#define ICR_MA		(1 << 4)	   /* master abort */
-#define ICR_SCLE	(1 << 5)	   /* master clock enable */
-#define ICR_IUE		(1 << 6)	   /* unit enable */
-#define ICR_GCD		(1 << 7)	   /* general call disable */
-#define ICR_ITEIE	(1 << 8)	   /* enable tx interrupts */
-#define ICR_IRFIE	(1 << 9)	   /* enable rx interrupts */
-#define ICR_BEIE	(1 << 10)	   /* enable bus error ints */
-#define ICR_SSDIE	(1 << 11)	   /* slave STOP detected int enable */
-#define ICR_ALDIE	(1 << 12)	   /* enable arbitration interrupt */
-#define ICR_SADIE	(1 << 13)	   /* slave address detected int enable */
-#define ICR_UR		(1 << 14)	   /* unit reset */
-#define ICR_FM		(1 << 15)	   /* fast mode */
-#define ICR_HS		(1 << 16)	   /* High Speed mode */
-#define ICR_GPIOEN	(1 << 19)	   /* enable GPIO mode for SCL in HS */
-
-#define ISR_RWM		(1 << 0)	   /* read/write mode */
-#define ISR_ACKNAK	(1 << 1)	   /* ack/nak status */
-#define ISR_UB		(1 << 2)	   /* unit busy */
-#define ISR_IBB		(1 << 3)	   /* bus busy */
-#define ISR_SSD		(1 << 4)	   /* slave stop detected */
-#define ISR_ALD		(1 << 5)	   /* arbitration loss detected */
-#define ISR_ITE		(1 << 6)	   /* tx buffer empty */
-#define ISR_IRF		(1 << 7)	   /* rx buffer full */
-#define ISR_GCAD	(1 << 8)	   /* general call address detected */
-#define ISR_SAD		(1 << 9)	   /* slave address detected */
-#define ISR_BED		(1 << 10)	   /* bus error no ACK/NAK */
-
-/* bit field shift & mask */
-#define ILCR_SLV_SHIFT		0
-#define ILCR_SLV_MASK		(0x1FF << ILCR_SLV_SHIFT)
-#define ILCR_FLV_SHIFT		9
-#define ILCR_FLV_MASK		(0x1FF << ILCR_FLV_SHIFT)
-#define ILCR_HLVL_SHIFT		18
-#define ILCR_HLVL_MASK		(0x1FF << ILCR_HLVL_SHIFT)
-#define ILCR_HLVH_SHIFT		27
-#define ILCR_HLVH_MASK		(0x1F << ILCR_HLVH_SHIFT)
-
-#define IWCR_CNT_SHIFT		0
-#define IWCR_CNT_MASK		(0x1F << IWCR_CNT_SHIFT)
-#define IWCR_HS_CNT1_SHIFT	5
-#define IWCR_HS_CNT1_MASK	(0x1F << IWCR_HS_CNT1_SHIFT)
-#define IWCR_HS_CNT2_SHIFT	10
-#define IWCR_HS_CNT2_MASK	(0x1F << IWCR_HS_CNT2_SHIFT)
-
-struct pxa_i2c {
-	spinlock_t		lock;
-	wait_queue_head_t	wait;
-	struct i2c_msg		*msg;
-	unsigned int		msg_num;
-	unsigned int		msg_idx;
-	unsigned int		msg_ptr;
-	unsigned int		slave_addr;
-	unsigned int		req_slave_addr;
-
-	struct i2c_adapter	adap;
-	struct clk		*clk;
-#ifdef CONFIG_I2C_PXA_SLAVE
-	struct i2c_slave_client *slave;
-#endif
-
-	unsigned int		irqlogidx;
-	u32			isrlog[32];
-	u32			icrlog[32];
-
-	void __iomem		*reg_base;
-	void __iomem		*reg_ibmr;
-	void __iomem		*reg_idbr;
-	void __iomem		*reg_icr;
-	void __iomem		*reg_isr;
-	void __iomem		*reg_isar;
-	void __iomem		*reg_ilcr;
-	void __iomem		*reg_iwcr;
-
-	unsigned long		iobase;
-	unsigned long		iosize;
-
-	int			irq;
-	unsigned int		use_pio :1;
-	unsigned int		fast_mode :1;
-	unsigned int		high_mode:1;
-	unsigned char		master_code;
-	unsigned long		rate;
-	bool			highmode_enter;
-};
-
-#define _IBMR(i2c)	((i2c)->reg_ibmr)
-#define _IDBR(i2c)	((i2c)->reg_idbr)
-#define _ICR(i2c)	((i2c)->reg_icr)
-#define _ISR(i2c)	((i2c)->reg_isr)
-#define _ISAR(i2c)	((i2c)->reg_isar)
-#define _ILCR(i2c)	((i2c)->reg_ilcr)
-#define _IWCR(i2c)	((i2c)->reg_iwcr)
-
-/*
- * I2C Slave mode address
- */
-#define I2C_PXA_SLAVE_ADDR      0x1
-
-#ifdef DEBUG
-
-struct bits {
-	u32	mask;
-	const char *set;
-	const char *unset;
-};
-#define PXA_BIT(m, s, u)	{ .mask = m, .set = s, .unset = u }
-
-static inline void
-decode_bits(const char *prefix, const struct bits *bits, int num, u32 val)
+static ssize_t show_rev(struct device *device, struct device_attribute *attr,
+			char *buf)
 {
-	printk("%s %08x: ", prefix, val);
-	while (num--) {
-		const char *str = val & bits->mask ? bits->set : bits->unset;
-		if (str)
-			printk("%s ", str);
-		bits++;
-	}
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+
+	return sprintf(buf, "%x\n", dd_from_dev(dev)->minrev);
 }
 
-static const struct bits isr_bits[] = {
-	PXA_BIT(ISR_RWM,	"RX",		"TX"),
-	PXA_BIT(ISR_ACKNAK,	"NAK",		"ACK"),
-	PXA_BIT(ISR_UB,		"Bsy",		"Rdy"),
-	PXA_BIT(ISR_IBB,	"BusBsy",	"BusRdy"),
-	PXA_BIT(ISR_SSD,	"SlaveStop",	NULL),
-	PXA_BIT(ISR_ALD,	"ALD",		NULL),
-	PXA_BIT(ISR_ITE,	"TxEmpty",	NULL),
-	PXA_BIT(ISR_IRF,	"RxFull",	NULL),
-	PXA_BIT(ISR_GCAD,	"GenCall",	NULL),
-	PXA_BIT(ISR_SAD,	"SlaveAddr",	NULL),
-	PXA_BIT(ISR_BED,	"BusErr",	NULL),
-};
-
-static void decode_ISR(unsigned int val)
+static ssize_t show_hca(struct device *device, struct device_attribute *attr,
+			char *buf)
 {
-	decode_bits(KERN_DEBUG "ISR", isr_bits, ARRAY_SIZE(isr_bits), val);
-	printk("\n");
-}
-
-static const struct bits icr_bits[] = {
-	PXA_BIT(ICR_START,  "START",	NULL),
-	PXA_BIT(ICR_STOP,   "STOP",	NULL),
-	PXA_BIT(ICR_ACKNAK, "ACKNAK",	NULL),
-	PXA_BIT(ICR_TB,     "TB",	NULL),
-	PXA_BIT(ICR_MA,     "MA",	NULL),
-	PXA_BIT(ICR_SCLE,   "SCLE",	"scle"),
-	PXA_BIT(ICR_IUE,    "IUE",	"iue"),
-	PXA_BIT(ICR_GCD,    "GCD",	NULL),
-	PXA_BIT(ICR_ITEIE,  "ITEIE",	NULL),
-	PXA_BIT(ICR_IRFIE,  "IRFIE",	NULL),
-	PXA_BIT(ICR_BEIE,   "BEIE",	NULL),
-	PXA_BIT(ICR_SSDIE,  "SSDIE",	NULL),
-	PXA_BIT(ICR_ALDIE,  "ALDIE",	NULL),
-	PXA_BIT(ICR_SADIE,  "SADIE",	NULL),
-	PXA_BIT(ICR_UR,     "UR",		"ur"),
-};
-
-#ifdef CONFIG_I2C_PXA_SLAVE
-static void decode_ICR(unsigned int val)
-{
-	decode_bits(KERN_DEBUG "ICR", icr_bits, ARRAY_SIZE(icr_bits), val);
-	printk("\n");
-}
-#endif
-
-static unsigned int i2c_debug = DEBUG;
-
-static void i2c_pxa_show_state(struct pxa_i2c *i2c, int lno, const char *fname)
-{
-	dev_dbg(&i2c->adap.dev, "state:%s:%d: ISR=%08x, ICR=%08x, IBMR=%02x\n", fname, lno,
-		readl(_ISR(i2c)), readl(_ICR(i2c)), readl(_IBMR(i2c)));
-}
-
-#define show_state(i2c) i2c_pxa_show_state(i2c, __LINE__, __func__)
-
-static void i2c_pxa_scream_blue_murder(struct pxa_i2c *i2c, const char *why)
-{
-	unsigned int i;
-	struct device *dev = &i2c->adap.dev;
-
-	dev_err(dev, "slave_0x%x error: %s\n",
-		i2c->req_slave_addr >> 1, why);
-	dev_err(dev, "msg_num: %d msg_idx: %d msg_ptr: %d\n",
-		i2c->msg_num, i2c->msg_idx, i2c->msg_ptr);
-	dev_err(dev, "IBMR: %08x IDBR: %08x ICR: %08x ISR: %08x\n",
-		readl(_IBMR(i2c)), readl(_IDBR(i2c)), readl(_ICR(i2c)),
-		readl(_ISR(i2c)));
-	dev_err(dev, "log:");
-	for (i = 0; i < i2c->irqlogidx; i++)
-		pr_cont(" [%03x:%05x]", i2c->isrlog[i], i2c->icrlog[i]);
-	pr_cont("\n");
-}
-
-#else /* ifdef DEBUG */
-
-#define i2c_debug	0
-
-#define show_state(i2c) do { } while (0)
-#define decode_ISR(val) do { } while (0)
-#define decode_ICR(val) do { } while (0)
-#define i2c_pxa_scream_blue_murder(i2c, why) do { } while (0)
-
-#endif /* ifdef DEBUG / else */
-
-static void i2c_pxa_master_complete(struct pxa_i2c *i2c, int ret);
-static irqreturn_t i2c_pxa_handler(int this_irq, void *dev_id);
-
-static inline int i2c_pxa_is_slavemode(struct pxa_i2c *i2c)
-{
-	return !(readl(_ICR(i2c)) & ICR_SCLE);
-}
-
-static void i2c_pxa_abort(struct pxa_i2c *i2c)
-{
-	int i = 250;
-
-	if (i2c_pxa_is_slavemode(i2c)) {
-		dev_dbg(&i2c->adap.dev, "%s: called in slave mode\n", __func__);
-		return;
-	}
-
-	while ((i > 0) && (readl(_IBMR(i2c)) & 0x1) == 0) {
-		unsigned long icr = readl(_ICR(i2c));
-
-		icr &= ~ICR_START;
-		icr |= ICR_ACKNAK | ICR_STOP | ICR_TB;
-
-		writel(icr, _ICR(i2c));
-
-		show_state(i2c);
-
-		mdelay(1);
-		i --;
-	}
-
-	writel(readl(_ICR(i2c)) & ~(ICR_MA | ICR_START | ICR_STOP),
-	       _ICR(i2c));
-}
-
-static int i2c_pxa_wait_bus_not_busy(struct pxa_i2c *i2c)
-{
-	int timeout = DEF_TIMEOUT;
-
-	while (timeout-- && readl(_ISR(i2c)) & (ISR_IBB | ISR_UB)) {
-		if ((readl(_ISR(i2c)) & ISR_SAD) != 0)
-			timeout += 4;
-
-		msleep(2);
-		show_state(i2c);
-	}
-
-	if (timeout < 0)
-		show_state(i2c);
-
-	return timeout < 0 ? I2C_RETRY : 0;
-}
-
-static int i2c_pxa_wait_master(struct pxa_i2c *i2c)
-{
-	unsigned long timeout = jiffies + HZ*4;
-
-	while (time_before(jiffies, timeout)) {
-		if (i2c_debug > 1)
-			dev_dbg(&i2c->adap.dev, "%s: %ld: ISR=%08x, ICR=%08x, IBMR=%02x\n",
-				__func__, (long)jiffies, readl(_ISR(i2c)), readl(_ICR(i2c)), readl(_IBMR(i2c)));
-
-		if (readl(_ISR(i2c)) & ISR_SAD) {
-			if (i2c_debug > 0)
-				dev_dbg(&i2c->adap.dev, "%s: Slave detected\n", __func__);
-			goto out;
-		}
-
-		/* wait for unit and bus being not busy, and we also do a
-		 * quick check of the i2c lines themselves to ensure they've
-		 * gone high...
-		 */
-		if ((readl(_ISR(i2c)) & (ISR_UB | ISR_IBB)) == 0 && readl(_IBMR(i2c)) == 3) {
-			if (i2c_debug > 0)
-				dev_dbg(&i2c->adap.dev, "%s: done\n", __func__);
-			return 1;
-		}
-
-		msleep(1);
-	}
-
-	if (i2c_debug > 0)
-		dev_dbg(&i2c->adap.dev, "%s: did not free\n", __func__);
- out:
-	return 0;
-}
-
-static int i2c_pxa_set_master(struct pxa_i2c *i2c)
-{
-	if (i2c_debug)
-		dev_dbg(&i2c->adap.dev, "setting to bus master\n");
-
-	if ((readl(_ISR(i2c)) & (ISR_UB | ISR_IBB)) != 0) {
-		dev_dbg(&i2c->adap.dev, "%s: unit is busy\n", __func__);
-		if (!i2c_pxa_wait_master(i2c)) {
-			dev_dbg(&i2c->adap.dev, "%s: error: unit busy\n", __func__);
-			return I2C_RETRY;
-		}
-	}
-
-	writel(readl(_ICR(i2c)) | ICR_SCLE, _ICR(i2c));
-	return 0;
-}
-
-#ifdef CONFIG_I2C_PXA_SLAVE
-static int i2c_pxa_wait_slave(struct pxa_i2c *i2c)
-{
-	unsigned long timeout = jiffies + HZ*1;
-
-	/* wait for stop */
-
-	show_state(i2c);
-
-	while (time_before(jiffies, timeout)) {
-		if (i2c_debug > 1)
-			dev_dbg(&i2c->adap.dev, "%s: %ld: ISR=%08x, ICR=%08x, IBMR=%02x\n",
-				__func__, (long)jiffies, readl(_ISR(i2c)), readl(_ICR(i2c)), readl(_IBMR(i2c)));
-
-		if ((readl(_ISR(i2c)) & (ISR_UB|ISR_IBB)) == 0 ||
-		    (readl(_ISR(i2c)) & ISR_SAD) != 0 ||
-		    (readl(_ICR(i2c)) & ICR_SCLE) == 0) {
-			if (i2c_debug > 1)
-				dev_dbg(&i2c->adap.dev, "%s: done\n", __func__);
-			return 1;
-		}
-
-		msleep(1);
-	}
-
-	if (i2c_debug > 0)
-		dev_dbg(&i2c->adap.dev, "%s: did not free\n", __func__);
-	return 0;
-}
-
-/*
- * clear the hold on the bus, and take of anything else
- * that has been configured
- */
-static void i2c_pxa_set_slave(struct pxa_i2c *i2c, int errcode)
-{
-	show_state(i2c);
-
-	if (errcode < 0) {
-		udelay(100);   /* simple delay */
-	} else {
-		/* we need to wait for the stop condition to end */
-
-		/* if we where in stop, then clear... */
-		if (readl(_ICR(i2c)) & ICR_STOP) {
-			udelay(100);
-			writel(readl(_ICR(i2c)) & ~ICR_STOP, _ICR(i2c));
-		}
-
-		if (!i2c_pxa_wait_slave(i2c)) {
-			dev_err(&i2c->adap.dev, "%s: wait timedout\n",
-				__func__);
-			return;
-		}
-	}
-
-	writel(readl(_ICR(i2c)) & ~(ICR_STOP|ICR_ACKNAK|ICR_MA), _ICR(i2c));
-	writel(readl(_ICR(i2c)) & ~ICR_SCLE, _ICR(i2c));
-
-	if (i2c_debug) {
-		dev_dbg(&i2c->adap.dev, "ICR now %08x, ISR %08x\n", readl(_ICR(i2c)), readl(_ISR(i2c)));
-		decode_ICR(readl(_ICR(i2c)));
-	}
-}
-#else
-#define i2c_pxa_set_slave(i2c, err)	do { } while (0)
-#endif
-
-static void i2c_pxa_reset(struct pxa_i2c *i2c)
-{
-	pr_debug("Resetting I2C Controller Unit\n");
-
-	/* abort any transfer currently under way */
-	i2c_pxa_abort(i2c);
-
-	/* reset according to 9.8 */
-	writel(ICR_UR, _ICR(i2c));
-	writel(I2C_ISR_INIT, _ISR(i2c));
-	writel(readl(_ICR(i2c)) & ~ICR_UR, _ICR(i2c));
-
-	if (i2c->reg_isar && IS_ENABLED(CONFIG_I2C_PXA_SLAVE))
-		writel(i2c->slave_addr, _ISAR(i2c));
-
-	/* set control register values */
-	writel(I2C_ICR_INIT | (i2c->fast_mode ? ICR_FM : 0), _ICR(i2c));
-	writel(readl(_ICR(i2c)) | (i2c->high_mode ? ICR_HS : 0), _ICR(i2c));
-
-#ifdef CONFIG_I2C_PXA_SLAVE
-	dev_info(&i2c->adap.dev, "Enabling slave mode\n");
-	writel(readl(_ICR(i2c)) | ICR_SADIE | ICR_ALDIE | ICR_SSDIE, _ICR(i2c));
-#endif
-
-	i2c_pxa_set_slave(i2c, 0);
-
-	/* enable unit */
-	writel(readl(_ICR(i2c)) | ICR_IUE, _ICR(i2c));
-	udelay(100);
-}
-
-
-#ifdef CONFIG_I2C_PXA_SLAVE
-/*
- * PXA I2C Slave mode
- */
-
-static void i2c_pxa_slave_txempty(struct pxa_i2c *i2c, u32 isr)
-{
-	if (isr & ISR_BED) {
-		/* what should we do here? */
-	} else {
-		int ret = 0;
-
-		if (i2c->slave != NULL)
-			ret = i2c->slave->read(i2c->slave->data);
-
-		writel(ret, _IDBR(i2c));
-		writel(readl(_ICR(i2c)) | ICR_TB, _ICR(i2c));   /* allow next byte */
-	}
-}
-
-static void i2c_pxa_slave_rxfull(struct pxa_i2c *i2c, u32 isr)
-{
-	unsigned int byte = readl(_IDBR(i2c));
-
-	if (i2c->slave != NULL)
-		i2c->slave->write(i2c->slave->data, byte);
-
-	writel(readl(_ICR(i2c)) | ICR_TB, _ICR(i2c));
-}
-
-static void i2c_pxa_slave_start(struct pxa_i2c *i2c, u32 isr)
-{
-	int timeout;
-
-	if (i2c_debug > 0)
-		dev_dbg(&i2c->adap.dev, "SAD, mode is slave-%cx\n",
-		       (isr & ISR_RWM) ? 'r' : 't');
-
-	if (i2c->slave != NULL)
-		i2c->slave->event(i2c->slave->data,
-				 (isr & ISR_RWM) ? I2C_SLAVE_EVENT_START_READ : I2C_SLAVE_EVENT_START_WRITE);
-
-	/*
-	 * slave could interrupt in the middle of us generating a
-	 * start condition... if this happens, we'd better back off
-	 * and stop holding the poor thing up
-	 */
-	writel(readl(_ICR(i2c)) & ~(ICR_START|ICR_STOP), _ICR(i2c));
-	writel(readl(_ICR(i2c)) | ICR_TB, _ICR(i2c));
-
-	timeout = 0x10000;
-
-	while (1) {
-		if ((readl(_IBMR(i2c)) & 2) == 2)
-			break;
-
-		timeout--;
-
-		if (timeout <= 0) {
-			dev_err(&i2c->adap.dev, "timeout waiting for SCL high\n");
-			break;
-		}
-	}
-
-	writel(readl(_ICR(i2c)) & ~ICR_SCLE, _ICR(i2c));
-}
-
-static void i2c_pxa_slave_stop(struct pxa_i2c *i2c)
-{
-	if (i2c_debug > 2)
-		dev_dbg(&i2c->adap.dev, "ISR: SSD (Slave Stop)\n");
-
-	if (i2c->slave != NULL)
-		i2c->slave->event(i2c->slave->data, I2C_SLAVE_EVENT_STOP);
-
-	if (i2c_debug > 2)
-		dev_dbg(&i2c->adap.dev, "ISR: SSD (Slave Stop) acked\n");
-
-	/*
-	 * If we have a master-mode message waiting,
-	 * kick it off now that the slave has completed.
-	 */
-	if (i2c->msg)
-		i2c_pxa_master_complete(i2c, I2C_RETRY);
-}
-#else
-static void i2c_pxa_slave_txempty(struct pxa_i2c *i2c, u32 isr)
-{
-	if (isr & ISR_BED) {
-		/* what should we do here? */
-	} else {
-		writel(0, _IDBR(i2c));
-		writel(readl(_ICR(i2c)) | ICR_TB, _ICR(i2c));
-	}
-}
-
-static void i2c_pxa_slave_rxfull(struct pxa_i2c *i2c, u32 isr)
-{
-	writel(readl(_ICR(i2c)) | ICR_TB | ICR_ACKNAK, _ICR(i2c));
-}
-
-static void i2c_pxa_slave_start(struct pxa_i2c *i2c, u32 isr)
-{
-	int timeout;
-
-	/*
-	 * slave could interrupt in the middle of us generating a
-	 * start condition... if this happens, we'd better back off
-	 * and stop holding the poor thing up
-	 */
-	writel(readl(_ICR(i2c)) & ~(ICR_START|ICR_STOP), _ICR(i2c));
-	writel(readl(_ICR(i2c)) | ICR_TB | ICR_ACKNAK, _ICR(i2c));
-
-	timeout = 0x10000;
-
-	while (1) {
-		if ((readl(_IBMR(i2c)) & 2) == 2)
-			break;
-
-		timeout--;
-
-		if (timeout <= 0) {
-			dev_err(&i2c->adap.dev, "timeout waiting for SCL high\n");
-			break;
-		}
-	}
-
-	writel(readl(_ICR(i2c)) & ~ICR_SCLE, _ICR(i2c));
-}
-
-static void i2c_pxa_slave_stop(struct pxa_i2c *i2c)
-{
-	if (i2c->msg)
-		i2c_pxa_master_complete(i2c, I2C_RETRY);
-}
-#endif
-
-/*
- * PXA I2C Master mode
- */
-
-static inline unsigned int i2c_pxa_addr_byte(struct i2c_msg *msg)
-{
-	unsigned int addr = (msg->addr & 0x7f) << 1;
-
-	if (msg->flags & I2C_M_RD)
-		addr |= 1;
-
-	return addr;
-}
-
-static inline void i2c_pxa_start_message(struct pxa_i2c *i2c)
-{
-	u32 icr;
-
-	/*
-	 * Step 1: target slave address into IDBR
-	 */
-	writel(i2c_pxa_addr_byte(i2c->msg), _IDBR(i2c));
-	i2c->req_slave_addr = i2c_pxa_addr_byte(i2c->msg);
-
-	/*
-	 * Step 2: initiate the write.
-	 */
-	icr = readl(_ICR(i2c)) & ~(ICR_STOP | ICR_ALDIE);
-	writel(icr | ICR_START | ICR_TB, _ICR(i2c));
-}
-
-static inline void i2c_pxa_stop_message(struct pxa_i2c *i2c)
-{
-	u32 icr;
-
-	/* Clear the START, STOP, ACK, TB and MA flags */
-	icr = readl(_ICR(i2c));
-	icr &= ~(ICR_START | ICR_STOP | ICR_ACKNAK | ICR_TB | ICR_MA);
-	writel(icr, _ICR(i2c));
-}
-
-static int i2c_pxa_pio_set_master(struct pxa_i2c *i2c)
-{
-	/* make timeout the same as for interrupt based functions */
-	long timeout = 2 * DEF_TIMEOUT;
-
-	/*
-	 * Wait for the bus to become free.
-	 */
-	while (timeout-- && readl(_ISR(i2c)) & (ISR_IBB | ISR_UB)) {
-		udelay(1000);
-		show_state(i2c);
-	}
-
-	if (timeout < 0) {
-		show_state(i2c);
-		dev_err(&i2c->adap.dev,
-			"i2c_pxa: timeout waiting for bus free\n");
-		return I2C_RETRY;
-	}
-
-	/*
-	 * Set master mode.
-	 */
-	writel(readl(_ICR(i2c)) | ICR_SCLE, _ICR(i2c));
-
-	return 0;
-}
-
-/*
- * PXA I2C send master code
- * 1. Load master code to IDBR and send it.
- *    Note for HS mode, set ICR [GPIOEN].
- * 2. Wait until win arbitration.
- */
-static int i2c_pxa_send_mastercode(struct pxa_i2c *i2c)
-{
-	u32 icr;
-	long timeout;
-
-	spin_lock_irq(&i2c->lock);
-	i2c->highmode_enter = true;
-	writel(i2c->master_code, _IDBR(i2c));
-
-	icr = readl(_ICR(i2c)) & ~(ICR_STOP | ICR_ALDIE);
-	icr |= ICR_GPIOEN | ICR_START | ICR_TB | ICR_ITEIE;
-	writel(icr, _ICR(i2c));
-
-	spin_unlock_irq(&i2c->lock);
-	timeout = wait_event_timeout(i2c->wait,
-			i2c->highmode_enter == false, HZ * 1);
-
-	i2c->highmode_enter = false;
-
-	return (timeout == 0) ? I2C_RETRY : 0;
-}
-
-static int i2c_pxa_do_pio_xfer(struct pxa_i2c *i2c,
-			       struct i2c_msg *msg, int num)
-{
-	unsigned long timeout = 500000; /* 5 seconds */
-	int ret = 0;
-
-	ret = i2c_pxa_pio_set_master(i2c);
-	if (ret)
-		goto out;
-
-	i2c->msg = msg;
-	i2c->msg_num = num;
-	i2c->msg_idx = 0;
-	i2c->msg_ptr = 0;
-	i2c->irqlogidx = 0;
-
-	i2c_pxa_start_message(i2c);
-
-	while (i2c->msg_num > 0 && --timeout) {
-		i2c_pxa_handler(0, i2c);
-		udelay(10);
-	}
-
-	i2c_pxa_stop_message(i2c);
-
-	/*
-	 * We place the return code in i2c->msg_idx.
-	 */
-	ret = i2c->msg_idx;
-
-out:
-	if (timeout == 0) {
-		i2c_pxa_scream_blue_murder(i2c, "timeout");
-		ret = I2C_RETRY;
-	}
-
-	return ret;
-}
-
-/*
- * We are protected by the adapter bus mutex.
- */
-static int i2c_pxa_do_xfer(struct pxa_i2c *i2c, struct i2c_msg *msg, int num)
-{
-	long timeout;
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+	struct qib_devdata *dd = dd_from_dev(dev);
 	int ret;
 
-	/*
-	 * Wait for the bus to become free.
-	 */
-	ret = i2c_pxa_wait_bus_not_busy(i2c);
-	if (ret) {
-		dev_err(&i2c->adap.dev, "i2c_pxa: timeout waiting for bus free\n");
-		goto out;
-	}
-
-	/*
-	 * Set master mode.
-	 */
-	ret = i2c_pxa_set_master(i2c);
-	if (ret) {
-		dev_err(&i2c->adap.dev, "i2c_pxa_set_master: error %d\n", ret);
-		goto out;
-	}
-
-	if (i2c->high_mode) {
-		ret = i2c_pxa_send_mastercode(i2c);
-		if (ret) {
-			dev_err(&i2c->adap.dev, "i2c_pxa_send_mastercode timeout\n");
-			goto out;
-			}
-	}
-
-	spin_lock_irq(&i2c->lock);
-
-	i2c->msg = msg;
-	i2c->msg_num = num;
-	i2c->msg_idx = 0;
-	i2c->msg_ptr = 0;
-	i2c->irqlogidx = 0;
-
-	i2c_pxa_start_message(i2c);
-
-	spin_unlock_irq(&i2c->lock);
-
-	/*
-	 * The rest of the processing occurs in the interrupt handler.
-	 */
-	timeout = wait_event_timeout(i2c->wait, i2c->msg_num == 0, HZ * 5);
-	i2c_pxa_stop_message(i2c);
-
-	/*
-	 * We place the return code in i2c->msg_idx.
-	 */
-	ret = i2c->msg_idx;
-
-	if (!timeout && i2c->msg_num) {
-		i2c_pxa_scream_blue_murder(i2c, "timeout");
-		ret = I2C_RETRY;
-	}
-
- out:
+	if (!dd->boardname)
+		ret = -EINVAL;
+	else
+		ret = scnprintf(buf, PAGE_SIZE, "%s\n", dd->boardname);
 	return ret;
 }
 
-static int i2c_pxa_pio_xfer(struct i2c_adapter *adap,
-			    struct i2c_msg msgs[], int num)
+static ssize_t show_version(struct device *device,
+			    struct device_attribute *attr, char *buf)
 {
-	struct pxa_i2c *i2c = adap->algo_data;
-	int ret, i;
+	/* The string printed here is already newline-terminated. */
+	return scnprintf(buf, PAGE_SIZE, "%s", (char *)ib_qib_version);
+}
 
-	/* If the I2C controller is disabled we need to reset it
-	  (probably due to a suspend/resume destroying state). We do
-	  this here as we can then avoid worrying about resuming the
-	  controller before its users. */
-	if (!(readl(_ICR(i2c)) & ICR_IUE))
-		i2c_pxa_reset(i2c);
+static ssize_t show_boardversion(struct device *device,
+				 struct device_attribute *attr, char *buf)
+{
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+	struct qib_devdata *dd = dd_from_dev(dev);
 
-	for (i = adap->retries; i >= 0; i--) {
-		ret = i2c_pxa_do_pio_xfer(i2c, msgs, num);
-		if (ret != I2C_RETRY)
-			goto out;
+	/* The string printed here is already newline-terminated. */
+	return scnprintf(buf, PAGE_SIZE, "%s", dd->boardversion);
+}
 
-		if (i2c_debug)
-			dev_dbg(&adap->dev, "Retrying transmission\n");
-		udelay(100);
+
+static ssize_t show_localbus_info(struct device *device,
+				  struct device_attribute *attr, char *buf)
+{
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+
+	/* The string printed here is already newline-terminated. */
+	return scnprintf(buf, PAGE_SIZE, "%s", dd->lbus_info);
+}
+
+
+static ssize_t show_nctxts(struct device *device,
+			   struct device_attribute *attr, char *buf)
+{
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+
+	/* Return the number of user ports (contexts) available. */
+	/* The calculation below deals with a special case where
+	 * cfgctxts is set to 1 on a single-port board. */
+	return scnprintf(buf, PAGE_SIZE, "%u\n",
+			(dd->first_user_ctxt > dd->cfgctxts) ? 0 :
+			(dd->cfgctxts - dd->first_user_ctxt));
+}
+
+static ssize_t show_nfreectxts(struct device *device,
+			   struct device_attribute *attr, char *buf)
+{
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+
+	/* Return the number of free user ports (contexts) available. */
+	return scnprintf(buf, PAGE_SIZE, "%u\n", dd->freectxts);
+}
+
+static ssize_t show_serial(struct device *device,
+			   struct device_attribute *attr, char *buf)
+{
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+
+	buf[sizeof(dd->serial)] = '\0';
+	memcpy(buf, dd->serial, sizeof(dd->serial));
+	strcat(buf, "\n");
+	return strlen(buf);
+}
+
+static ssize_t store_chip_reset(struct device *device,
+				struct device_attribute *attr, const char *buf,
+				size_t count)
+{
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+	int ret;
+
+	if (count < 5 || memcmp(buf, "reset", 5) || !dd->diag_client) {
+		ret = -EINVAL;
+		goto bail;
 	}
-	i2c_pxa_scream_blue_murder(i2c, "exhausted retries");
-	ret = -EREMOTEIO;
- out:
-	i2c_pxa_set_slave(i2c, ret);
+
+	ret = qib_reset_device(dd->unit);
+bail:
+	return ret < 0 ? ret : count;
+}
+
+/*
+ * Dump tempsense regs. in decimal, to ease shell-scripts.
+ */
+static ssize_t show_tempsense(struct device *device,
+			      struct device_attribute *attr, char *buf)
+{
+	struct qib_ibdev *dev =
+		container_of(device, struct qib_ibdev, ibdev.dev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+	int ret;
+	int idx;
+	u8 regvals[8];
+
+	ret = -ENXIO;
+	for (idx = 0; idx < 8; ++idx) {
+		if (idx == 6)
+			continue;
+		ret = dd->f_tempsense_rd(dd, idx);
+		if (ret < 0)
+			break;
+		regvals[idx] = ret;
+	}
+	if (idx == 8)
+		ret = scnprintf(buf, PAGE_SIZE, "%d %d %02X %02X %d %d\n",
+				*(signed char *)(regvals),
+				*(signed char *)(regvals + 1),
+				regvals[2], regvals[3],
+				*(signed char *)(regvals + 5),
+				*(signed char *)(regvals + 7));
 	return ret;
 }
 
 /*
- * i2c_pxa_master_complete - complete the message and wake up.
+ * end of per-unit (or driver, in some cases, but replicated
+ * per unit) functions
  */
-static void i2c_pxa_master_complete(struct pxa_i2c *i2c, int ret)
+
+/* start of per-unit file structures and support code */
+static DEVICE_ATTR(hw_rev, S_IRUGO, show_rev, NULL);
+static DEVICE_ATTR(hca_type, S_IRUGO, show_hca, NULL);
+static DEVICE_ATTR(board_id, S_IRUGO, show_hca, NULL);
+static DEVICE_ATTR(version, S_IRUGO, show_version, NULL);
+static DEVICE_ATTR(nctxts, S_IRUGO, show_nctxts, NULL);
+static DEVICE_ATTR(nfreectxts, S_IRUGO, show_nfreectxts, NULL);
+static DEVICE_ATTR(serial, S_IRUGO, show_serial, NULL);
+static DEVICE_ATTR(boardversion, S_IRUGO, show_boardversion, NULL);
+static DEVICE_ATTR(tempsense, S_IRUGO, show_tempsense, NULL);
+static DEVICE_ATTR(localbus_info, S_IRUGO, show_localbus_info, NULL);
+static DEVICE_ATTR(chip_reset, S_IWUSR, NULL, store_chip_reset);
+
+static struct device_attribute *qib_attributes[] = {
+	&dev_attr_hw_rev,
+	&dev_attr_hca_type,
+	&dev_attr_board_id,
+	&dev_attr_version,
+	&dev_attr_nctxts,
+	&dev_attr_nfreectxts,
+	&dev_attr_serial,
+	&dev_attr_boardversion,
+	&dev_attr_tempsense,
+	&dev_attr_localbus_info,
+	&dev_attr_chip_reset,
+};
+
+int qib_create_port_files(struct ib_device *ibdev, u8 port_num,
+			  struct kobject *kobj)
 {
-	i2c->msg_ptr = 0;
-	i2c->msg = NULL;
-	i2c->msg_idx ++;
-	i2c->msg_num = 0;
-	if (ret)
-		i2c->msg_idx = ret;
-	if (!i2c->use_pio)
-		wake_up(&i2c->wait);
-}
+	struct qib_pportdata *ppd;
+	struct qib_devdata *dd = dd_from_ibdev(ibdev);
+	int ret;
 
-static void i2c_pxa_irq_txempty(struct pxa_i2c *i2c, u32 isr)
-{
-	u32 icr = readl(_ICR(i2c)) & ~(ICR_START|ICR_STOP|ICR_ACKNAK|ICR_TB);
+	if (!port_num || port_num > dd->num_pports) {
+		qib_dev_err(dd,
+			"Skipping infiniband class with invalid port %u\n",
+			port_num);
+		ret = -ENODEV;
+		goto bail;
+	}
+	ppd = &dd->pport[port_num - 1];
 
- again:
-	/*
-	 * If ISR_ALD is set, we lost arbitration.
-	 */
-	if (isr & ISR_ALD) {
-		/*
-		 * Do we need to do anything here?  The PXA docs
-		 * are vague about what happens.
-		 */
-		i2c_pxa_scream_blue_murder(i2c, "ALD set");
+	ret = kobject_init_and_add(&ppd->pport_kobj, &qib_port_ktype, kobj,
+				   "linkcontrol");
+	if (ret) {
+		qib_dev_err(dd,
+			"Skipping linkcontrol sysfs info, (err %d) port %u\n",
+			ret, port_num);
+		goto bail_link;
+	}
+	kobject_uevent(&ppd->pport_kobj, KOBJ_ADD);
 
-		/*
-		 * We ignore this error.  We seem to see spurious ALDs
-		 * for seemingly no reason.  If we handle them as I think
-		 * they should, we end up causing an I2C error, which
-		 * is painful for some systems.
-		 */
-		return; /* ignore */
+	ret = kobject_init_and_add(&ppd->sl2vl_kobj, &qib_sl2vl_ktype, kobj,
+				   "sl2vl");
+	if (ret) {
+		qib_dev_err(dd,
+			"Skipping sl2vl sysfs info, (err %d) port %u\n",
+			ret, port_num);
+		goto bail_sl;
+	}
+	kobject_uevent(&ppd->sl2vl_kobj, KOBJ_ADD);
+
+	ret = kobject_init_and_add(&ppd->diagc_kobj, &qib_diagc_ktype, kobj,
+				   "diag_counters");
+	if (ret) {
+		qib_dev_err(dd,
+			"Skipping diag_counters sysfs info, (err %d) port %u\n",
+			ret, port_num);
+		goto bail_diagc;
+	}
+	kobject_uevent(&ppd->diagc_kobj, KOBJ_ADD);
+
+	if (!qib_cc_table_size || !ppd->congestion_entries_shadow)
+		return 0;
+
+	ret = kobject_init_and_add(&ppd->pport_cc_kobj, &qib_port_cc_ktype,
+				kobj, "CCMgtA");
+	if (ret) {
+		qib_dev_err(dd,
+		 "Skipping Congestion Control sysfs info, (err %d) port %u\n",
+		 ret, port_num);
+		goto bail_cc;
 	}
 
-	if ((isr & ISR_BED) &&
-		(!((i2c->msg->flags & I2C_M_IGNORE_NAK) &&
-			(isr & ISR_ACKNAK)))) {
-		int ret = BUS_ERROR;
+	kobject_uevent(&ppd->pport_cc_kobj, KOBJ_ADD);
 
-		/*
-		 * I2C bus error - either the device NAK'd us, or
-		 * something more serious happened.  If we were NAK'd
-		 * on the initial address phase, we can retry.
-		 */
-		if (isr & ISR_ACKNAK) {
-			if (i2c->msg_ptr == 0 && i2c->msg_idx == 0)
-				ret = I2C_RETRY;
-			else
-				ret = XFER_NAKED;
-		}
-		i2c_pxa_master_complete(i2c, ret);
-	} else if (isr & ISR_RWM) {
-		/*
-		 * Read mode.  We have just sent the address byte, and
-		 * now we must initiate the transfer.
-		 */
-		if (i2c->msg_ptr == i2c->msg->len - 1 &&
-		    i2c->msg_idx == i2c->msg_num - 1)
-			icr |= ICR_STOP | ICR_ACKNAK;
-
-		icr |= ICR_ALDIE | ICR_TB;
-	} else if (i2c->msg_ptr < i2c->msg->len) {
-		/*
-		 * Write mode.  Write the next data byte.
-		 */
-		writel(i2c->msg->buf[i2c->msg_ptr++], _IDBR(i2c));
-
-		icr |= ICR_ALDIE | ICR_TB;
-
-		/*
-		 * If this is the last byte of the last message or last byte
-		 * of any message with I2C_M_STOP (e.g. SCCB), send a STOP.
-		 */
-		if ((i2c->msg_ptr == i2c->msg->len) &&
-			((i2c->msg->flags & I2C_M_STOP) ||
-			(i2c->msg_idx == i2c->msg_num - 1)))
-				icr |= ICR_STOP;
-
-	} else if (i2c->msg_idx < i2c->msg_num - 1) {
-		/*
-		 * Next segment of the message.
-		 */
-		i2c->msg_ptr = 0;
-		i2c->msg_idx ++;
-		i2c->msg++;
-
-		/*
-		 * If we aren't doing a repeated start and address,
-		 * go back and try to send the next byte.  Note that
-		 * we do not support switching the R/W direction here.
-		 */
-		if (i2c->msg->flags & I2C_M_NOSTART)
-			goto again;
-
-		/*
-		 * Write the next address.
-		 */
-		writel(i2c_pxa_addr_byte(i2c->msg), _IDBR(i2c));
-		i2c->req_slave_addr = i2c_pxa_addr_byte(i2c->msg);
-
-		/*
-		 * And trigger a repeated start, and send the byte.
-		 */
-		icr &= ~ICR_ALDIE;
-		icr |= ICR_START | ICR_TB;
-	} else {
-		if (i2c->msg->len == 0) {
-			/*
-			 * Device probes have a message length of zero
-			 * and need the bus to be reset before it can
-			 * be used again.
-			 */
-			i2c_pxa_reset(i2c);
-		}
-		i2c_pxa_master_complete(i2c, 0);
+	ret = sysfs_create_bin_file(&ppd->pport_cc_kobj,
+				&cc_setting_bin_attr);
+	if (ret) {
+		qib_dev_err(dd,
+		 "Skipping Congestion Control setting sysfs info, (err %d) port %u\n",
+		 ret, port_num);
+		goto bail_cc;
 	}
 
-	i2c->icrlog[i2c->irqlogidx-1] = icr;
-
-	writel(icr, _ICR(i2c));
-	show_state(i2c);
-}
-
-static void i2c_pxa_irq_rxfull(struct pxa_i2c *i2c, u32 isr)
-{
-	u32 icr = readl(_ICR(i2c)) & ~(ICR_START|ICR_STOP|ICR_ACKNAK|ICR_TB);
-
-	/*
-	 * Read the byte.
-	 */
-	i2c->msg->buf[i2c->msg_ptr++] = readl(_IDBR(i2c));
-
-	if (i2c->msg_ptr < i2c->msg->len) {
-		/*
-		 * If this is the last byte of the last
-		 * message, send a STOP.
-		 */
-		if (i2c->msg_ptr == i2c->msg->len - 1)
-			icr |= ICR_STOP | ICR_ACKNAK;
-
-		icr |= ICR_ALDIE | ICR_TB;
-	} else {
-		i2c_pxa_master_complete(i2c, 0);
+	ret = sysfs_create_bin_file(&ppd->pport_cc_kobj,
+				&cc_table_bin_attr);
+	if (ret) {
+		qib_dev_err(dd,
+		 "Skipping Congestion Control table sysfs info, (err %d) port %u\n",
+		 ret, port_num);
+		goto bail_cc_entry_bin;
 	}
 
-	i2c->icrlog[i2c->irqlogidx-1] = icr;
+	qib_devinfo(dd->pcidev,
+		"IB%u: Congestion Control Agent enabled for port %d\n",
+		dd->unit, port_num);
 
-	writel(icr, _ICR(i2c));
-}
+	return 0;
 
-#define VALID_INT_SOURCE	(ISR_SSD | ISR_ALD | ISR_ITE | ISR_IRF | \
-				ISR_SAD | ISR_BED)
-static irqreturn_t i2c_pxa_handler(int this_irq, void *dev_id)
-{
-	struct pxa_i2c *i2c = dev_id;
-	u32 isr = readl(_ISR(i2c));
-
-	if (!(isr & VALID_INT_SOURCE))
-		return IRQ_NONE;
-
-	if (i2c_debug > 2 && 0) {
-		dev_dbg(&i2c->adap.dev, "%s: ISR=%08x, ICR=%08x, IBMR=%02x\n",
-			__func__, isr, readl(_ICR(i2c)), readl(_IBMR(i2c)));
-		decode_ISR(isr);
-	}
-
-	if (i2c->irqlogidx < ARRAY_SIZE(i2c->isrlog))
-		i2c->isrlog[i2c->irqlogidx++] = isr;
-
-	show_state(i2c);
-
-	/*
-	 * Always clear all pending IRQs.
-	 */
-	writel(isr & VALID_INT_SOURCE, _ISR(i2c));
-
-	if (isr & ISR_SAD)
-		i2c_pxa_slave_start(i2c, isr);
-	if (isr & ISR_SSD)
-		i2c_pxa_slave_stop(i2c);
-
-	if (i2c_pxa_is_slavemode(i2c)) {
-		if (isr & ISR_ITE)
-			i2c_pxa_slave_txempty(i2c, isr);
-		if (isr & ISR_IRF)
-			i2c_pxa_slave_rxfull(i2c, isr);
-	} else if (i2c->msg && (!i2c->highmode_enter)) {
-		if (isr & ISR_ITE)
-			i2c_pxa_irq_txempty(i2c, isr);
-		if (isr & ISR_IRF)
-			i2c_pxa_irq_rxfull(i2c, isr);
-	} else if ((isr & ISR_ITE) && i2c->highmode_enter) {
-		i2c->highmode_enter = false;
-		wake_up(&i2c->wait);
-	} else {
-		i2c_pxa_scream_blue_murder(i2c, "spurious irq");
-	}
-
-	return IRQ_HANDLED;
-}
-
-
-static int i2c_pxa_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
-{
-	struct pxa_i2c *i2c = adap->algo_data;
-	int ret, i;
-
-	for (i = adap->retries; i >= 0; i--) {
-		ret = i2c_pxa_do_xfer(i2c, msgs, num);
-		if (ret != I2C_RETRY)
-			goto out;
-
-		if (i2c_debug)
-			dev_dbg(&adap->dev, "Retrying transmission\n");
-		udelay(100);
-	}
-	i2c_pxa_scream_blue_murder(i2c, "exhausted retries");
-	ret = -EREMOTEIO;
- out:
-	i2c_pxa_set_slave(i2c, ret);
+bail_cc_entry_bin:
+	sysfs_remove_bin_file(&ppd->pport_cc_kobj, &cc_setting_bin_attr);
+bail_cc:
+	kobject_put(&ppd->pport_cc_kobj);
+bail_diagc:
+	kobject_put(&ppd->diagc_kobj);
+bail_sl:
+	kobject_put(&ppd->sl2vl_kobj);
+bail_link:
+	kobject_put(&ppd->pport_kobj);
+bail:
 	return ret;
 }
 
-static u32 i2c_pxa_functionality(struct i2c_adapter *adap)
+/*
+ * Register and create our files in /sys/class/infiniband.
+ */
+int qib_verbs_register_sysfs(struct qib_devdata *dd)
 {
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL |
-		I2C_FUNC_PROTOCOL_MANGLING | I2C_FUNC_NOSTART;
-}
+	struct ib_device *dev = &dd->verbs_dev.ibdev;
+	int i, ret;
 
-static const struct i2c_algorithm i2c_pxa_algorithm = {
-	.master_xfer	= i2c_pxa_xfer,
-	.functionality	= i2c_pxa_functionality,
-};
-
-static const struct i2c_algorithm i2c_pxa_pio_algorithm = {
-	.master_xfer	= i2c_pxa_pio_xfer,
-	.functionality	= i2c_pxa_functionality,
-};
-
-static const struct of_device_id i2c_pxa_dt_ids[] = {
-	{ .compatible = "mrvl,pxa-i2c", .data = (void *)REGS_PXA2XX },
-	{ .compatible = "mrvl,pwri2c", .data = (void *)REGS_PXA3XX },
-	{ .compatible = "mrvl,mmp-twsi", .data = (void *)REGS_PXA910 },
-	{}
-};
-MODULE_DEVICE_TABLE(of, i2c_pxa_dt_ids);
-
-static int i2c_pxa_probe_dt(struct platform_device *pdev, struct pxa_i2c *i2c,
-			    enum pxa_i2c_types *i2c_types)
-{
-	struct device_node *np = pdev->dev.of_node;
-	const struct of_device_id *of_id =
-			of_match_device(i2c_pxa_dt_ids, &pdev->dev);
-
-	if (!of_id)
-		return 1;
-
-	/* For device tree we always use the dynamic or alias-assigned ID */
-	i2c->adap.nr = -1;
-
-	if (of_get_property(np, "mrvl,i2c-polling", NULL))
-		i2c->use_pio = 1;
-	if (of_get_property(np, "mrvl,i2c-fast-mode", NULL))
-		i2c->fast_mode = 1;
-
-	*i2c_types = (enum pxa_i2c_types)(of_id->data);
+	for (i = 0; i < ARRAY_SIZE(qib_attributes); ++i) {
+		ret = device_create_file(&dev->dev, qib_attributes[i]);
+		if (ret)
+			goto bail;
+	}
 
 	return 0;
+bail:
+	for (i = 0; i < ARRAY_SIZE(qib_attributes); ++i)
+		device_remove_file(&dev->dev, qib_attributes[i]);
+	return ret;
 }
 
-static int i2c_pxa_probe_pdata(struct platform_device *pdev,
-			       struct pxa_i2c *i2c,
-			       enum pxa_i2c_types *i2c_types)
+/*
+ * Unregister and remove our files in /sys/class/infiniband.
+ */
+void qib_verbs_unregister_sysfs(struct qib_devdata *dd)
 {
-	struct i2c_pxa_platform_data *plat = dev_get_platdata(&pdev->dev);
-	const struct platform_device_id *id = platform_get_device_id(pdev);
+	struct qib_pportdata *ppd;
+	int i;
 
-	*i2c_types = id->driver_data;
-	if (plat) {
-		i2c->use_pio = plat->use_pio;
-		i2c->fast_mode = plat->fast_mode;
-		i2c->high_mode = plat->high_mode;
-		i2c->master_code = plat->master_code;
-		if (!i2c->master_code)
-			i2c->master_code = 0xe;
-		i2c->rate = plat->rate;
+	for (i = 0; i < dd->num_pports; i++) {
+		ppd = &dd->pport[i];
+		if (qib_cc_table_size &&
+			ppd->congestion_entries_shadow) {
+			sysfs_remove_bin_file(&ppd->pport_cc_kobj,
+				&cc_setting_bin_attr);
+			sysfs_remove_bin_file(&ppd->pport_cc_kobj,
+				&cc_table_bin_attr);
+			kobject_put(&ppd->pport_cc_kobj);
+		}
+		kobject_put(&ppd->diagc_kobj);
+		kobject_put(&ppd->sl2vl_kobj);
+		kobject_put(&ppd->pport_kobj);
 	}
-	return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Copyright (c) 2012 Intel Corporation. All rights reserved.
+ * Copyright (c) 2006 - 2012 QLogic Corporation. All rights reserved.
+ * Copyright (c) 2003, 2004, 2005, 2006 PathScale, Inc. All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#include <linux/delay.h>
+#include <linux/pci.h>
+#include <linux/vmalloc.h>
+
+#include "qib.h"
+
+/*
+ * QLogic_IB "Two Wire Serial Interface" driver.
+ * Originally written for a not-quite-i2c serial eeprom, which is
+ * still used on some supported boards. Later boards have added a
+ * variety of other uses, most board-specific, so the bit-boffing
+ * part has been split off to this file, while the other parts
+ * have been moved to chip-specific files.
+ *
+ * We have also dropped all pretense of fully generic (e.g. pretend
+ * we don't know whether '1' is the higher voltage) interface, as
+ * the restrictions of the generic i2c interface (e.g. no access from
+ * driver itself) make it unsuitable for this use.
+ */
+
+#define READ_CMD 1
+#define WRITE_CMD 0
+
+/**
+ * i2c_wait_for_writes - wait for a write
+ * @dd: the qlogic_ib device
+ *
+ * We use this instead of udelay directly, so we can make sure
+ * that previous register writes have been flushed all the way
+ * to the chip.  Since we are delaying anyway, the cost doesn't
+ * hurt, and makes the bit twiddling more regular
+ */
+static void i2c_wait_for_writes(struct qib_devdata *dd)
+{
+	/*
+	 * implicit read of EXTStatus is as good as explicit
+	 * read of scratch, if all we want to do is flush
+	 * writes.
+	 */
+	dd->f_gpio_mod(dd, 0, 0, 0);
+	rmb(); /* inlined, so prevent compiler reordering */
 }
 
-static int i2c_pxa_probe(struct platform_device *dev)
+/*
+ * QSFP modules are allowed to hold SCL low for 500uSec. Allow twice that
+ * for "almost compliant" modules
+ */
+#define SCL_WAIT_USEC 1000
+
+/* BUF_WAIT is time bus must be free between STOP or ACK and to next START.
+ * Should be 20, but some chips need more.
+ */
+#define TWSI_BUF_WAIT_USEC 60
+
+static void scl_out(struct qib_devdata *dd, u8 bit)
 {
-	struct i2c_pxa_platform_data *plat = dev_get_platdata(&dev->dev);
-	enum pxa_i2c_types i2c_type;
-	struct pxa_i2c *i2c;
-	struct resource *res = NULL;
-	int ret, irq;
+	u32 mask;
 
-	i2c = devm_kzalloc(&dev->dev, sizeof(struct pxa_i2c), GFP_KERNEL);
-	if (!i2c)
-		return -ENOMEM;
+	udelay(1);
 
-	res = platform_get_resource(dev, IORESOURCE_MEM, 0);
-	i2c->reg_base = devm_ioremap_resource(&dev->dev, res);
-	if (IS_ERR(i2c->reg_base))
-		return PTR_ERR(i2c->reg_base);
+	mask = 1UL << dd->gpio_scl_num;
 
-	irq = platform_get_irq(dev, 0);
-	if (irq < 0) {
-		dev_err(&dev->dev, "no irq resource: %d\n", irq);
-		return irq;
+	/* SCL is meant to be bare-drain, so never set "OUT", just DIR */
+	dd->f_gpio_mod(dd, 0, bit ? 0 : mask, mask);
+
+	/*
+	 * Allow for slow slaves by simple
+	 * delay for falling edge, sampling on rise.
+	 */
+	if (!bit)
+		udelay(2);
+	else {
+		int rise_usec;
+
+		for (rise_usec = SCL_WAIT_USEC; rise_usec > 0; rise_usec -= 2) {
+			if (mask & dd->f_gpio_mod(dd, 0, 0, 0))
+				break;
+			udelay(2);
+		}
+		if (rise_usec <= 0)
+			qib_dev_err(dd, "SCL interface stuck low > %d uSec\n",
+				    SCL_WAIT_USEC);
 	}
+	i2c_wait_for_writes(dd);
+}
 
-	/* Default adapter num to device id; i2c_pxa_probe_dt can override. */
-	i2c->adap.nr = dev->id;
+static void sda_out(struct qib_devdata *dd, u8 bit)
+{
+	u32 mask;
 
-	ret = i2c_pxa_probe_dt(dev, i2c, &i2c_type);
-	if (ret > 0)
-		ret = i2c_pxa_probe_pdata(dev, i2c, &i2c_type);
-	if (ret < 0)
-		return ret;
+	mask = 1UL << dd->gpio_sda_num;
 
-	i2c->adap.owner   = THIS_MODULE;
-	i2c->adap.retries = 5;
+	/* SDA is meant to be bare-drain, so never set "OUT", just DIR */
+	dd->f_gpio_mod(dd, 0, bit ? 0 : mask, mask);
 
-	spin_lock_init(&i2c->lock);
-	init_waitqueue_head(&i2c->wait);
+	i2c_wait_for_writes(dd);
+	udelay(2);
+}
 
-	strlcpy(i2c->adap.name, "pxa_i2c-i2c", sizeof(i2c->adap.name));
+static u8 sda_in(struct qib_devdata *dd, int wait)
+{
+	int bnum;
+	u32 read_val, mask;
 
-	i2c->clk = devm_clk_get(&dev->dev, NULL);
-	if (IS_ERR(i2c->clk)) {
-		dev_err(&dev->dev, "failed to get the clk: %ld\n", PTR_ERR(i2c->clk));
-		return PTR_ERR(i2c->clk);
+	bnum = dd->gpio_sda_num;
+	mask = (1UL << bnum);
+	/* SDA is meant to be bare-drain, so never set "OUT", just DIR */
+	dd->f_gpio_mod(dd, 0, 0, mask);
+	read_val = dd->f_gpio_mod(dd, 0, 0, 0);
+	if (wait)
+		i2c_wait_for_writes(dd);
+	return (read_val & mask) >> bnum;
+}
+
+/**
+ * i2c_ackrcv - see if ack following write is true
+ * @dd: the qlogic_ib device
+ */
+static int i2c_ackrcv(struct qib_devdata *dd)
+{
+	u8 ack_received;
+
+	/* AT ENTRY SCL = LOW */
+	/* change direction, ignore data */
+	ack_received = sda_in(dd, 1);
+	scl_out(dd, 1);
+	ack_received = sda_in(dd, 1) == 0;
+	scl_out(dd, 0);
+	return ack_received;
+}
+
+static void stop_cmd(struct qib_devdata *dd);
+
+/**
+ * rd_byte - read a byte, sending STOP on last, else ACK
+ * @dd: the qlogic_ib device
+ *
+ * Returns byte shifted out of device
+ */
+static int rd_byte(struct qib_devdata *dd, int last)
+{
+	int bit_cntr, data;
+
+	data = 0;
+
+	for (bit_cntr = 7; bit_cntr >= 0; --bit_cntr) {
+		data <<= 1;
+		scl_out(dd, 1);
+		data |= sda_in(dd, 0);
+		scl_out(dd, 0);
 	}
-
-	i2c->reg_ibmr = i2c->reg_base + pxa_reg_layout[i2c_type].ibmr;
-	i2c->reg_idbr = i2c->reg_base + pxa_reg_layout[i2c_type].idbr;
-	i2c->reg_icr = i2c->reg_base + pxa_reg_layout[i2c_type].icr;
-	i2c->reg_isr = i2c->reg_base + pxa_reg_layout[i2c_type].isr;
-	if (i2c_type != REGS_CE4100)
-		i2c->reg_isar = i2c->reg_base + pxa_reg_layout[i2c_type].isar;
-
-	if (i2c_type == REGS_PXA910) {
-		i2c->reg_ilcr = i2c->reg_base + pxa_reg_layout[i2c_type].ilcr;
-		i2c->reg_iwcr = i2c->reg_base + pxa_reg_layout[i2c_type].iwcr;
-	}
-
-	i2c->iobase = res->start;
-	i2c->iosize = resource_size(res);
-
-	i2c->irq = irq;
-
-	i2c->slave_addr = I2C_PXA_SLAVE_ADDR;
-	i2c->highmode_enter = false;
-
-	if (plat) {
-#ifdef CONFIG_I2C_PXA_SLAVE
-		i2c->slave_addr = plat->slave_addr;
-		i2c->slave = plat->slave;
-#endif
-		i2c->adap.class = plat->class;
-	}
-
-	if (i2c->high_mode) {
-		if (i2c->rate) {
-			clk_set_rate(i2c->clk, i2c->rate);
-			pr_info("i2c: <%s> set rate to %ld\n",
-				i2c->adap.name, clk_get_rate(i2c->clk));
-		} else
-			pr_warn("i2c: <%s> clock rate not set\n",
-				i2c->adap.name);
-	}
-
-	clk_prepare_enable(i2c->clk);
-
-	if (i2c->use_pio) {
-		i2c->adap.algo = &i2c_pxa_pio_algorithm;
+	if (last) {
+		scl_out(dd, 1);
+		stop_cmd(dd);
 	} else {
-		i2c->adap.algo = &i2c_pxa_algorithm;
-		ret = devm_request_irq(&dev->dev, irq, i2c_pxa_handler,
-				IRQF_SHARED | IRQF_NO_SUSPEND,
-				dev_name(&dev->dev), i2c);
+		sda_out(dd, 0);
+		scl_out(dd, 1);
+		scl_out(dd, 0);
+		sda_out(dd, 1);
+	}
+	return data;
+}
+
+/**
+ * wr_byte - write a byte, one bit at a time
+ * @dd: the qlogic_ib device
+ * @data: the byte to write
+ *
+ * Returns 0 if we got the following ack, otherwise 1
+ */
+static int wr_byte(struct qib_devdata *dd, u8 data)
+{
+	int bit_cntr;
+	u8 bit;
+
+	for (bit_cntr = 7; bit_cntr >= 0; bit_cntr--) {
+		bit = (data >> bit_cntr) & 1;
+		sda_out(dd, bit);
+		scl_out(dd, 1);
+		scl_out(dd, 0);
+	}
+	return (!i2c_ackrcv(dd)) ? 1 : 0;
+}
+
+/*
+ * issue TWSI start sequence:
+ * (both clock/data high, clock high, data low while clock is high)
+ */
+static void start_seq(struct qib_devdata *dd)
+{
+	sda_out(dd, 1);
+	scl_out(dd, 1);
+	sda_out(dd, 0);
+	udelay(1);
+	scl_out(dd, 0);
+}
+
+/**
+ * stop_seq - transmit the stop sequence
+ * @dd: the qlogic_ib device
+ *
+ * (both clock/data low, clock high, data high while clock is high)
+ */
+static void stop_seq(struct qib_devdata *dd)
+{
+	scl_out(dd, 0);
+	sda_out(dd, 0);
+	scl_out(dd, 1);
+	sda_out(dd, 1);
+}
+
+/**
+ * stop_cmd - transmit the stop condition
+ * @dd: the qlogic_ib device
+ *
+ * (both clock/data low, clock high, data high while clock is high)
+ */
+static void stop_cmd(struct qib_devdata *dd)
+{
+	stop_seq(dd);
+	udelay(TWSI_BUF_WAIT_USEC);
+}
+
+/**
+ * qib_twsi_reset - reset I2C communication
+ * @dd: the qlogic_ib device
+ */
+
+int qib_twsi_reset(struct qib_devdata *dd)
+{
+	int clock_cycles_left = 9;
+	int was_high = 0;
+	u32 pins, mask;
+
+	/* Both SCL and SDA should be high. If not, there
+	 * is something wrong.
+	 */
+	mask = (1UL << dd->gpio_scl_num) | (1UL << dd->gpio_sda_num);
+
+	/*
+	 * Force pins to desired innocuous state.
+	 * This is the default power-on state with out=0 and dir=0,
+	 * So tri-stated and should be floating high (barring HW problems)
+	 */
+	dd->f_gpio_mod(dd, 0, 0, mask);
+
+	/*
+	 * Clock nine times to get all listeners into a sane state.
+	 * If SDA does not go high at any point, we are wedged.
+	 * One vendor recommends then issuing START followed by STOP.
+	 * we cannot use our "normal" functions to do that, because
+	 * if SCL drops between them, another vendor's part will
+	 * wedge, dropping SDA and keeping it low forever, at the end of
+	 * the next transaction (even if it was not the device addressed).
+	 * So our START and STOP take place with SCL held high.
+	 */
+	while (clock_cycles_left--) {
+		scl_out(dd, 0);
+		scl_out(dd, 1);
+		/* Note if SDA is high, but keep clocking to sync slave */
+		was_high |= sda_in(dd, 0);
+	}
+
+	if (was_high) {
+		/*
+		 * We saw a high, which we hope means the slave is sync'd.
+		 * Issue START, STOP, pause for T_BUF.
+		 */
+
+		pins = dd->f_gpio_mod(dd, 0, 0, 0);
+		if ((pins & mask) != mask)
+			qib_dev_err(dd, "GPIO pins not at rest: %d\n",
+				    pins & mask);
+		/* Drop SDA to issue START */
+		udelay(1); /* Guarantee .6 uSec setup */
+		sda_out(dd, 0);
+		udelay(1); /* Guarantee .6 uSec hold */
+		/* At this point, SCL is high, SDA low. Raise SDA for STOP */
+		sda_out(dd, 1);
+		udelay(TWSI_BUF_WAIT_USEC);
+	}
+
+	return !was_high;
+}
+
+#define QIB_TWSI_START 0x100
+#define QIB_TWSI_STOP 0x200
+
+/* Write byte to TWSI, optionally prefixed with START or suffixed with
+ * STOP.
+ * returns 0 if OK (ACK received), else != 0
+ */
+static int qib_twsi_wr(struct qib_devdata *dd, int data, int flags)
+{
+	int ret = 1;
+
+	if (flags & QIB_TWSI_START)
+		start_seq(dd);
+
+	ret = wr_byte(dd, data); /* Leaves SCL low (from i2c_ackrcv()) */
+
+	if (flags & QIB_TWSI_STOP)
+		stop_cmd(dd);
+	return ret;
+}
+
+/* Added functionality for IBA7220-based cards */
+#define QIB_TEMP_DEV 0x98
+
+/*
+ * qib_twsi_blk_rd
+ * Formerly called qib_eeprom_internal_read, and only used for eeprom,
+ * but now the general interface for data transfer from twsi devices.
+ * One vestige of its former role is that it recognizes a device
+ * QIB_TWSI_NO_DEV and does the correct operation for the legacy part,
+ * which responded to all TWSI device codes, interpreting them as
+ * address within device. On all other devices found on board handled by
+ * this driver, the device is followed by a one-byte "address" which selects
+ * the "register" or "offset" within the device from which data should
+ * be read.
+ */
+int qib_twsi_blk_rd(struct qib_devdata *dd, int dev, int addr,
+		    void *buffer, int len)
+{
+	int ret;
+	u8 *bp = buffer;
+
+	ret = 1;
+
+	if (dev == QIB_TWSI_NO_DEV) {
+		/* legacy not-really-I2C */
+		addr = (addr << 1) | READ_CMD;
+		ret = qib_twsi_wr(dd, addr, QIB_TWSI_START);
+	} else {
+		/* Actual I2C */
+		ret = qib_twsi_wr(dd, dev | WRITE_CMD, QIB_TWSI_START);
 		if (ret) {
-			dev_err(&dev->dev, "failed to request irq: %d\n", ret);
-			goto ereqirq;
+			stop_cmd(dd);
+			ret = 1;
+			goto bail;
 		}
+		/*
+		 * SFF spec claims we do _not_ stop after the addr
+		 * but simply issue a start with the "read" dev-addr.
+		 * Since we are implicitely waiting for ACK here,
+		 * we need t_buf (nominally 20uSec) before that start,
+		 * and cannot rely on the delay built in to the STOP
+		 */
+		ret = qib_twsi_wr(dd, addr, 0);
+		udelay(TWSI_BUF_WAIT_USEC);
+
+		if (ret) {
+			qib_dev_err(dd,
+				"Failed to write interface read addr %02X\n",
+				addr);
+			ret = 1;
+			goto bail;
+		}
+		ret = qib_twsi_wr(dd, dev | READ_CMD, QIB_TWSI_START);
+	}
+	if (ret) {
+		stop_cmd(dd);
+		ret = 1;
+		goto bail;
 	}
 
-	i2c_pxa_reset(i2c);
-
-	i2c->adap.algo_data = i2c;
-	i2c->adap.dev.parent = &dev->dev;
-#ifdef CONFIG_OF
-	i2c->adap.dev.of_node = dev->dev.of_node;
-#endif
-
-	ret = i2c_add_numbered_adapter(&i2c->adap);
-	if (ret < 0) {
-		dev_err(&dev->dev, "failed to add bus: %d\n", ret);
-		goto ereqirq;
+	/*
+	 * block devices keeps clocking data out as long as we ack,
+	 * automatically incrementing the address. Some have "pages"
+	 * whose boundaries will not be crossed, but the handling
+	 * of these is left to the caller, who is in a better
+	 * position to know.
+	 */
+	while (len-- > 0) {
+		/*
+		 * Get and store data, sending ACK if length remaining,
+		 * else STOP
+		 */
+		*bp++ = rd_byte(dd, !len);
 	}
 
-	platform_set_drvdata(dev, i2c);
+	ret = 0;
 
-#ifdef CONFIG_I2C_PXA_SLAVE
-	dev_info(&i2c->adap.dev, " PXA I2C adapter, slave address %d\n",
-		i2c->slave_addr);
-#else
-	dev_info(&i2c->adap.dev, " PXA I2C adapter\n");
-#endif
-	return 0;
-
-ereqirq:
-	clk_disable_unprepare(i2c->clk);
+bail:
 	return ret;
 }
 
-static int i2c_pxa_remove(struct platform_device *dev)
+/*
+ * qib_twsi_blk_wr
+ * Formerly called qib_eeprom_internal_write, and only used for eeprom,
+ * but now the general interface for data transfer to twsi devices.
+ * One vestige of its former role is that it recognizes a device
+ * QIB_TWSI_NO_DEV and does the correct operation for the legacy part,
+ * which responded to all TWSI device codes, interpreting them as
+ * address within device. On all other devices found on board handled by
+ * this driver, the device is followed by a one-byte "address" which selects
+ * the "register" or "offset" within the device to which data should
+ * be written.
+ */
+int qib_twsi_blk_wr(struct qib_devdata *dd, int dev, int addr,
+		    const void *buffer, int len)
 {
-	struct pxa_i2c *i2c = platform_get_drvdata(dev);
+	int sub_len;
+	const u8 *bp = buffer;
+	int max_wait_time, i;
+	int ret = 1;
 
-	i2c_del_adapter(&i2c->adap);
+	while (len > 0) {
+		if (dev == QIB_TWSI_NO_DEV) {
+			if (qib_twsi_wr(dd, (addr << 1) | WRITE_CMD,
+					QIB_TWSI_START)) {
+				goto failed_write;
+			}
+		} else {
+			/* Real I2C */
+			if (qib_twsi_wr(dd, dev | WRITE_CMD, QIB_TWSI_START))
+				goto failed_write;
+			ret = qib_twsi_wr(dd, addr, 0);
+			if (ret) {
+				qib_dev_err(dd,
+					"Failed to write interface write addr %02X\n",
+					addr);
+				goto failed_write;
+			}
+		}
 
-	clk_disable_unprepare(i2c->clk);
+		sub_len = min(len, 4);
+		addr += sub_len;
+		len -= sub_len;
 
+		for (i = 0; i < sub_len; i++)
+			if (qib_twsi_wr(dd, *bp++, 0))
+				goto failed_write;
+
+		stop_cmd(dd);
+
+		/*
+		 * Wait for write complete by waiting for a successful
+		 * read (the chip replies with a zero after the write
+		 * cmd completes, and before it writes to the eeprom.
+		 * The startcmd for the read will fail the ack until
+		 * the writes have completed.   We do this inline to avoid
+		 * the debug prints that are in the real read routine
+		 * if the startcmd fails.
+		 * We also use the proper device address, so it doesn't matter
+		 * whether we have real eeprom_dev. Legacy likes any address.
+		 */
+		max_wait_time = 100;
+		while (qib_twsi_wr(dd, dev | READ_CMD, QIB_TWSI_START)) {
+			stop_cmd(dd);
+			if (!--max_wait_time)
+				goto failed_write;
+		}
+		/* now read (and ignore) the resulting byte */
+		rd_byte(dd, 1);
+	}
+
+	ret = 0;
+	goto bail;
+
+failed_write:
+	stop_cmd(dd);
+	ret = 1;
+
+bail:
+	return ret;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+ * Copyright (c) 2008, 2009, 2010 QLogic Corporation. All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#include <linux/spinlock.h>
+#include <linux/pci.h>
+#include <linux/io.h>
+#include <linux/delay.h>
+#include <linux/netdevice.h>
+#include <linux/vmalloc.h>
+#include <linux/moduleparam.h>
+
+#include "qib.h"
+
+static unsigned qib_hol_timeout_ms = 3000;
+module_param_named(hol_timeout_ms, qib_hol_timeout_ms, uint, S_IRUGO);
+MODULE_PARM_DESC(hol_timeout_ms,
+		 "duration of user app suspension after link failure");
+
+unsigned qib_sdma_fetch_arb = 1;
+module_param_named(fetch_arb, qib_sdma_fetch_arb, uint, S_IRUGO);
+MODULE_PARM_DESC(fetch_arb, "IBA7220: change SDMA descriptor arbitration");
+
+/**
+ * qib_disarm_piobufs - cancel a range of PIO buffers
+ * @dd: the qlogic_ib device
+ * @first: the first PIO buffer to cancel
+ * @cnt: the number of PIO buffers to cancel
+ *
+ * Cancel a range of PIO buffers. Used at user process close,
+ * in case it died while writing to a PIO buffer.
+ */
+void qib_disarm_piobufs(struct qib_devdata *dd, unsigned first, unsigned cnt)
+{
+	unsigned long flags;
+	unsigned i;
+	unsigned last;
+
+	last = first + cnt;
+	spin_lock_irqsave(&dd->pioavail_lock, flags);
+	for (i = first; i < last; i++) {
+		__clear_bit(i, dd->pio_need_disarm);
+		dd->f_sendctrl(dd->pport, QIB_SENDCTRL_DISARM_BUF(i));
+	}
+	spin_unlock_irqrestore(&dd->pioavail_lock, flags);
+}
+
+/*
+ * This is called by a user process when it sees the DISARM_BUFS event
+ * bit is set.
+ */
+int qib_disarm_piobufs_ifneeded(struct qib_ctxtdata *rcd)
+{
+	struct qib_devdata *dd = rcd->dd;
+	unsigned i;
+	unsigned last;
+	unsigned n = 0;
+
+	last = rcd->pio_base + rcd->piocnt;
+	/*
+	 * Don't need uctxt_lock here, since user has called in to us.
+	 * Clear at start in case more interrupts set bits while we
+	 * are disarming
+	 */
+	if (rcd->user_event_mask) {
+		/*
+		 * subctxt_cnt is 0 if not shared, so do base
+		 * separately, first, then remaining subctxt, if any
+		 */
+		clear_bit(_QIB_EVENT_DISARM_BUFS_BIT, &rcd->user_event_mask[0]);
+		for (i = 1; i < rcd->subctxt_cnt; i++)
+			clear_bit(_QIB_EVENT_DISARM_BUFS_BIT,
+				  &rcd->user_event_mask[i]);
+	}
+	spin_lock_irq(&dd->pioavail_lock);
+	for (i = rcd->pio_base; i < last; i++) {
+		if (__test_and_clear_bit(i, dd->pio_need_disarm)) {
+			n++;
+			dd->f_sendctrl(rcd->ppd, QIB_SENDCTRL_DISARM_BUF(i));
+		}
+	}
+	spin_unlock_irq(&dd->pioavail_lock);
 	return 0;
 }
 
-#ifdef CONFIG_PM
-static int i2c_pxa_suspend_noirq(struct device *dev)
+static struct qib_pportdata *is_sdma_buf(struct qib_devdata *dd, unsigned i)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct pxa_i2c *i2c = platform_get_drvdata(pdev);
+	struct qib_pportdata *ppd;
+	unsigned pidx;
 
-	clk_disable(i2c->clk);
-
-	return 0;
+	for (pidx = 0; pidx < dd->num_pports; pidx++) {
+		ppd = dd->pport + pidx;
+		if (i >= ppd->sdma_state.first_sendbuf &&
+		    i < ppd->sdma_state.last_sendbuf)
+			return ppd;
+	}
+	return NULL;
 }
 
-static int i2c_pxa_resume_noirq(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct pxa_i2c *i2c = platform_get_drvdata(pdev);
-
-	clk_enable(i2c->clk);
-	i2c_pxa_reset(i2c);
-
-	return 0;
-}
-
-static const struct dev_pm_ops i2c_pxa_dev_pm_ops = {
-	.suspend_noirq = i2c_pxa_suspend_noirq,
-	.resume_noirq = i2c_pxa_resume_noirq,
-};
-
-#define I2C_PXA_DEV_PM_OPS (&i2c_pxa_dev_pm_ops)
-#else
-#define I2C_PXA_DEV_PM_OPS NULL
-#endif
-
-static struct platform_driver i2c_pxa_driver = {
-	.probe		= i2c_pxa_probe,
-	.remove		= i2c_pxa_remove,
-	.driver		= {
-		.name	= "pxa2xx-i2c",
-		.pm	= I2C_PXA_DEV_PM_OPS,
-		.of_match_table = i2c_pxa_dt_ids,
-	},
-	.id_table	= i2c_pxa_id_table,
-};
-
-static int __init i2c_adap_pxa_init(void)
-{
-	return platform_driver_register(&i2c_pxa_driver);
-}
-
-static void __exit i2c_adap_pxa_exit(void)
-{
-	platform_driver_unregister(&i2c_pxa_driver);
-}
-
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:pxa2xx-i2c");
-
-subsys_initcall(i2c_adap_pxa_init);
-module_exit(i2c_adap_pxa_exit);
+/*
+ * Return true if send buffer is being used by a user context.
+ * Sets  _QIB_EVENT_DISARM_BUFS_BIT in user_event_mask as a side ef

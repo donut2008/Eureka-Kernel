@@ -1,7 +1,3 @@
-#
-# Makefile for RapidIO devices
-#
-
-obj-$(CONFIG_RAPIDIO_TSI721)	+= tsi721_mport.o
-tsi721_mport-y			:= tsi721.o
-tsi721_mport-$(CONFIG_RAPIDIO_DMA_ENGINE) += tsi721_dma.o
+efine IH_CLIENT_MAY_SEND_INCOMPLETE_INT__SAMMSP_MASK 0x8
+#define IH_CLIENT_MAY_SEND_INCOMPLETE_INT__SAMMSP__SHIFT 0x3
+#define IH_CLIENT_MAY_SEND_INCOMPLETE_INT__RLC_MASK 

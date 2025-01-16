@@ -1,1409 +1,398 @@
-/*
- * Copyright (c) 2004 Topspin Communications.  All rights reserved.
- * Copyright (c) 2005 Voltaire, Inc. All rights reserved.
- * Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
- * Copyright (c) 2008 Cisco. All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-#define pr_fmt(fmt) "user_mad: " fmt
-
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/device.h>
-#include <linux/err.h>
-#include <linux/fs.h>
-#include <linux/cdev.h>
-#include <linux/dma-mapping.h>
-#include <linux/poll.h>
-#include <linux/mutex.h>
-#include <linux/kref.h>
-#include <linux/compat.h>
-#include <linux/sched.h>
-#include <linux/semaphore.h>
-#include <linux/slab.h>
-#include <linux/nospec.h>
-
-#include <asm/uaccess.h>
-
-#include <rdma/ib_mad.h>
-#include <rdma/ib_user_mad.h>
-
-MODULE_AUTHOR("Roland Dreier");
-MODULE_DESCRIPTION("InfiniBand userspace MAD packet access");
-MODULE_LICENSE("Dual BSD/GPL");
-
-enum {
-	IB_UMAD_MAX_PORTS  = 64,
-	IB_UMAD_MAX_AGENTS = 32,
-
-	IB_UMAD_MAJOR      = 231,
-	IB_UMAD_MINOR_BASE = 0
-};
-
-/*
- * Our lifetime rules for these structs are the following:
- * device special file is opened, we take a reference on the
- * ib_umad_port's struct ib_umad_device. We drop these
- * references in the corresponding close().
- *
- * In addition to references coming from open character devices, there
- * is one more reference to each ib_umad_device representing the
- * module's reference taken when allocating the ib_umad_device in
- * ib_umad_add_one().
- *
- * When destroying an ib_umad_device, we drop the module's reference.
- */
-
-struct ib_umad_port {
-	struct cdev           cdev;
-	struct device	      *dev;
-
-	struct cdev           sm_cdev;
-	struct device	      *sm_dev;
-	struct semaphore       sm_sem;
-
-	struct mutex	       file_mutex;
-	struct list_head       file_list;
-
-	struct ib_device      *ib_dev;
-	struct ib_umad_device *umad_dev;
-	int                    dev_num;
-	u8                     port_num;
-};
-
-struct ib_umad_device {
-	struct kobject       kobj;
-	struct ib_umad_port  port[0];
-};
-
-struct ib_umad_file {
-	struct mutex		mutex;
-	struct ib_umad_port    *port;
-	struct list_head	recv_list;
-	struct list_head	send_list;
-	struct list_head	port_list;
-	spinlock_t		send_lock;
-	wait_queue_head_t	recv_wait;
-	struct ib_mad_agent    *agent[IB_UMAD_MAX_AGENTS];
-	int			agents_dead;
-	u8			use_pkey_index;
-	u8			already_used;
-};
-
-struct ib_umad_packet {
-	struct ib_mad_send_buf *msg;
-	struct ib_mad_recv_wc  *recv_wc;
-	struct list_head   list;
-	int		   length;
-	struct ib_user_mad mad;
-};
-
-static struct class *umad_class;
-
-static const dev_t base_dev = MKDEV(IB_UMAD_MAJOR, IB_UMAD_MINOR_BASE);
-
-static DEFINE_SPINLOCK(port_lock);
-static DECLARE_BITMAP(dev_map, IB_UMAD_MAX_PORTS);
-
-static void ib_umad_add_one(struct ib_device *device);
-static void ib_umad_remove_one(struct ib_device *device, void *client_data);
-
-static void ib_umad_release_dev(struct kobject *kobj)
-{
-	struct ib_umad_device *dev =
-		container_of(kobj, struct ib_umad_device, kobj);
-
-	kfree(dev);
-}
-
-static struct kobj_type ib_umad_dev_ktype = {
-	.release = ib_umad_release_dev,
-};
-
-static int hdr_size(struct ib_umad_file *file)
-{
-	return file->use_pkey_index ? sizeof (struct ib_user_mad_hdr) :
-		sizeof (struct ib_user_mad_hdr_old);
-}
-
-/* caller must hold file->mutex */
-static struct ib_mad_agent *__get_agent(struct ib_umad_file *file, int id)
-{
-	return file->agents_dead ? NULL : file->agent[id];
-}
-
-static int queue_packet(struct ib_umad_file *file,
-			struct ib_mad_agent *agent,
-			struct ib_umad_packet *packet)
-{
-	int ret = 1;
-
-	mutex_lock(&file->mutex);
-
-	for (packet->mad.hdr.id = 0;
-	     packet->mad.hdr.id < IB_UMAD_MAX_AGENTS;
-	     packet->mad.hdr.id++)
-		if (agent == __get_agent(file, packet->mad.hdr.id)) {
-			list_add_tail(&packet->list, &file->recv_list);
-			wake_up_interruptible(&file->recv_wait);
-			ret = 0;
-			break;
-		}
-
-	mutex_unlock(&file->mutex);
-
-	return ret;
-}
-
-static void dequeue_send(struct ib_umad_file *file,
-			 struct ib_umad_packet *packet)
-{
-	spin_lock_irq(&file->send_lock);
-	list_del(&packet->list);
-	spin_unlock_irq(&file->send_lock);
-}
-
-static void send_handler(struct ib_mad_agent *agent,
-			 struct ib_mad_send_wc *send_wc)
-{
-	struct ib_umad_file *file = agent->context;
-	struct ib_umad_packet *packet = send_wc->send_buf->context[0];
-
-	dequeue_send(file, packet);
-	ib_destroy_ah(packet->msg->ah);
-	ib_free_send_mad(packet->msg);
-
-	if (send_wc->status == IB_WC_RESP_TIMEOUT_ERR) {
-		packet->length = IB_MGMT_MAD_HDR;
-		packet->mad.hdr.status = ETIMEDOUT;
-		if (!queue_packet(file, agent, packet))
-			return;
-	}
-	kfree(packet);
-}
-
-static void recv_handler(struct ib_mad_agent *agent,
-			 struct ib_mad_recv_wc *mad_recv_wc)
-{
-	struct ib_umad_file *file = agent->context;
-	struct ib_umad_packet *packet;
-
-	if (mad_recv_wc->wc->status != IB_WC_SUCCESS)
-		goto err1;
-
-	packet = kzalloc(sizeof *packet, GFP_KERNEL);
-	if (!packet)
-		goto err1;
-
-	packet->length = mad_recv_wc->mad_len;
-	packet->recv_wc = mad_recv_wc;
-
-	packet->mad.hdr.status	   = 0;
-	packet->mad.hdr.length	   = hdr_size(file) + mad_recv_wc->mad_len;
-	packet->mad.hdr.qpn	   = cpu_to_be32(mad_recv_wc->wc->src_qp);
-	packet->mad.hdr.lid	   = cpu_to_be16(mad_recv_wc->wc->slid);
-	packet->mad.hdr.sl	   = mad_recv_wc->wc->sl;
-	packet->mad.hdr.path_bits  = mad_recv_wc->wc->dlid_path_bits;
-	packet->mad.hdr.pkey_index = mad_recv_wc->wc->pkey_index;
-	packet->mad.hdr.grh_present = !!(mad_recv_wc->wc->wc_flags & IB_WC_GRH);
-	if (packet->mad.hdr.grh_present) {
-		struct ib_ah_attr ah_attr;
-
-		ib_init_ah_from_wc(agent->device, agent->port_num,
-				   mad_recv_wc->wc, mad_recv_wc->recv_buf.grh,
-				   &ah_attr);
-
-		packet->mad.hdr.gid_index = ah_attr.grh.sgid_index;
-		packet->mad.hdr.hop_limit = ah_attr.grh.hop_limit;
-		packet->mad.hdr.traffic_class = ah_attr.grh.traffic_class;
-		memcpy(packet->mad.hdr.gid, &ah_attr.grh.dgid, 16);
-		packet->mad.hdr.flow_label = cpu_to_be32(ah_attr.grh.flow_label);
-	}
-
-	if (queue_packet(file, agent, packet))
-		goto err2;
-	return;
-
-err2:
-	kfree(packet);
-err1:
-	ib_free_recv_mad(mad_recv_wc);
-}
-
-static ssize_t copy_recv_mad(struct ib_umad_file *file, char __user *buf,
-			     struct ib_umad_packet *packet, size_t count)
-{
-	struct ib_mad_recv_buf *recv_buf;
-	int left, seg_payload, offset, max_seg_payload;
-	size_t seg_size;
-
-	recv_buf = &packet->recv_wc->recv_buf;
-	seg_size = packet->recv_wc->mad_seg_size;
-
-	/* We need enough room to copy the first (or only) MAD segment. */
-	if ((packet->length <= seg_size &&
-	     count < hdr_size(file) + packet->length) ||
-	    (packet->length > seg_size &&
-	     count < hdr_size(file) + seg_size))
-		return -EINVAL;
-
-	if (copy_to_user(buf, &packet->mad, hdr_size(file)))
-		return -EFAULT;
-
-	buf += hdr_size(file);
-	seg_payload = min_t(int, packet->length, seg_size);
-	if (copy_to_user(buf, recv_buf->mad, seg_payload))
-		return -EFAULT;
-
-	if (seg_payload < packet->length) {
-		/*
-		 * Multipacket RMPP MAD message. Copy remainder of message.
-		 * Note that last segment may have a shorter payload.
-		 */
-		if (count < hdr_size(file) + packet->length) {
-			/*
-			 * The buffer is too small, return the first RMPP segment,
-			 * which includes the RMPP message length.
-			 */
-			return -ENOSPC;
-		}
-		offset = ib_get_mad_data_offset(recv_buf->mad->mad_hdr.mgmt_class);
-		max_seg_payload = seg_size - offset;
-
-		for (left = packet->length - seg_payload, buf += seg_payload;
-		     left; left -= seg_payload, buf += seg_payload) {
-			recv_buf = container_of(recv_buf->list.next,
-						struct ib_mad_recv_buf, list);
-			seg_payload = min(left, max_seg_payload);
-			if (copy_to_user(buf, ((void *) recv_buf->mad) + offset,
-					 seg_payload))
-				return -EFAULT;
-		}
-	}
-	return hdr_size(file) + packet->length;
-}
-
-static ssize_t copy_send_mad(struct ib_umad_file *file, char __user *buf,
-			     struct ib_umad_packet *packet, size_t count)
-{
-	ssize_t size = hdr_size(file) + packet->length;
-
-	if (count < size)
-		return -EINVAL;
-
-	if (copy_to_user(buf, &packet->mad, hdr_size(file)))
-		return -EFAULT;
-
-	buf += hdr_size(file);
-
-	if (copy_to_user(buf, packet->mad.data, packet->length))
-		return -EFAULT;
-
-	return size;
-}
-
-static ssize_t ib_umad_read(struct file *filp, char __user *buf,
-			    size_t count, loff_t *pos)
-{
-	struct ib_umad_file *file = filp->private_data;
-	struct ib_umad_packet *packet;
-	ssize_t ret;
-
-	if (count < hdr_size(file))
-		return -EINVAL;
-
-	mutex_lock(&file->mutex);
-
-	if (file->agents_dead) {
-		mutex_unlock(&file->mutex);
-		return -EIO;
-	}
-
-	while (list_empty(&file->recv_list)) {
-		mutex_unlock(&file->mutex);
-
-		if (filp->f_flags & O_NONBLOCK)
-			return -EAGAIN;
-
-		if (wait_event_interruptible(file->recv_wait,
-					     !list_empty(&file->recv_list)))
-			return -ERESTARTSYS;
-
-		mutex_lock(&file->mutex);
-	}
-
-	packet = list_entry(file->recv_list.next, struct ib_umad_packet, list);
-	list_del(&packet->list);
-
-	mutex_unlock(&file->mutex);
-
-	if (packet->recv_wc)
-		ret = copy_recv_mad(file, buf, packet, count);
-	else
-		ret = copy_send_mad(file, buf, packet, count);
-
-	if (ret < 0) {
-		/* Requeue packet */
-		mutex_lock(&file->mutex);
-		list_add(&packet->list, &file->recv_list);
-		mutex_unlock(&file->mutex);
-	} else {
-		if (packet->recv_wc)
-			ib_free_recv_mad(packet->recv_wc);
-		kfree(packet);
-	}
-	return ret;
-}
-
-static int copy_rmpp_mad(struct ib_mad_send_buf *msg, const char __user *buf)
-{
-	int left, seg;
-
-	/* Copy class specific header */
-	if ((msg->hdr_len > IB_MGMT_RMPP_HDR) &&
-	    copy_from_user(msg->mad + IB_MGMT_RMPP_HDR, buf + IB_MGMT_RMPP_HDR,
-			   msg->hdr_len - IB_MGMT_RMPP_HDR))
-		return -EFAULT;
-
-	/* All headers are in place.  Copy data segments. */
-	for (seg = 1, left = msg->data_len, buf += msg->hdr_len; left > 0;
-	     seg++, left -= msg->seg_size, buf += msg->seg_size) {
-		if (copy_from_user(ib_get_rmpp_segment(msg, seg), buf,
-				   min(left, msg->seg_size)))
-			return -EFAULT;
-	}
-	return 0;
-}
-
-static int same_destination(struct ib_user_mad_hdr *hdr1,
-			    struct ib_user_mad_hdr *hdr2)
-{
-	if (!hdr1->grh_present && !hdr2->grh_present)
-	   return (hdr1->lid == hdr2->lid);
-
-	if (hdr1->grh_present && hdr2->grh_present)
-	   return !memcmp(hdr1->gid, hdr2->gid, 16);
-
-	return 0;
-}
-
-static int is_duplicate(struct ib_umad_file *file,
-			struct ib_umad_packet *packet)
-{
-	struct ib_umad_packet *sent_packet;
-	struct ib_mad_hdr *sent_hdr, *hdr;
-
-	hdr = (struct ib_mad_hdr *) packet->mad.data;
-	list_for_each_entry(sent_packet, &file->send_list, list) {
-		sent_hdr = (struct ib_mad_hdr *) sent_packet->mad.data;
-
-		if ((hdr->tid != sent_hdr->tid) ||
-		    (hdr->mgmt_class != sent_hdr->mgmt_class))
-			continue;
-
-		/*
-		 * No need to be overly clever here.  If two new operations have
-		 * the same TID, reject the second as a duplicate.  This is more
-		 * restrictive than required by the spec.
-		 */
-		if (!ib_response_mad(hdr)) {
-			if (!ib_response_mad(sent_hdr))
-				return 1;
-			continue;
-		} else if (!ib_response_mad(sent_hdr))
-			continue;
-
-		if (same_destination(&packet->mad.hdr, &sent_packet->mad.hdr))
-			return 1;
-	}
-
-	return 0;
-}
-
-static ssize_t ib_umad_write(struct file *filp, const char __user *buf,
-			     size_t count, loff_t *pos)
-{
-	struct ib_umad_file *file = filp->private_data;
-	struct ib_umad_packet *packet;
-	struct ib_mad_agent *agent;
-	struct ib_ah_attr ah_attr;
-	struct ib_ah *ah;
-	struct ib_rmpp_mad *rmpp_mad;
-	__be64 *tid;
-	int ret, data_len, hdr_len, copy_offset, rmpp_active;
-	u8 base_version;
-
-	if (count < hdr_size(file) + IB_MGMT_RMPP_HDR)
-		return -EINVAL;
-
-	packet = kzalloc(sizeof *packet + IB_MGMT_RMPP_HDR, GFP_KERNEL);
-	if (!packet)
-		return -ENOMEM;
-
-	if (copy_from_user(&packet->mad, buf, hdr_size(file))) {
-		ret = -EFAULT;
-		goto err;
-	}
-
-	if (packet->mad.hdr.id >= IB_UMAD_MAX_AGENTS) {
-		ret = -EINVAL;
-		goto err;
-	}
-
-	buf += hdr_size(file);
-
-	if (copy_from_user(packet->mad.data, buf, IB_MGMT_RMPP_HDR)) {
-		ret = -EFAULT;
-		goto err;
-	}
-
-	mutex_lock(&file->mutex);
-
-	agent = __get_agent(file, packet->mad.hdr.id);
-	if (!agent) {
-		ret = -EIO;
-		goto err_up;
-	}
-
-	memset(&ah_attr, 0, sizeof ah_attr);
-	ah_attr.dlid          = be16_to_cpu(packet->mad.hdr.lid);
-	ah_attr.sl            = packet->mad.hdr.sl;
-	ah_attr.src_path_bits = packet->mad.hdr.path_bits;
-	ah_attr.port_num      = file->port->port_num;
-	if (packet->mad.hdr.grh_present) {
-		ah_attr.ah_flags = IB_AH_GRH;
-		memcpy(ah_attr.grh.dgid.raw, packet->mad.hdr.gid, 16);
-		ah_attr.grh.sgid_index	   = packet->mad.hdr.gid_index;
-		ah_attr.grh.flow_label	   = be32_to_cpu(packet->mad.hdr.flow_label);
-		ah_attr.grh.hop_limit	   = packet->mad.hdr.hop_limit;
-		ah_attr.grh.traffic_class  = packet->mad.hdr.traffic_class;
-	}
-
-	ah = ib_create_ah(agent->qp->pd, &ah_attr);
-	if (IS_ERR(ah)) {
-		ret = PTR_ERR(ah);
-		goto err_up;
-	}
-
-	rmpp_mad = (struct ib_rmpp_mad *) packet->mad.data;
-	hdr_len = ib_get_mad_data_offset(rmpp_mad->mad_hdr.mgmt_class);
-
-	if (ib_is_mad_class_rmpp(rmpp_mad->mad_hdr.mgmt_class)
-	    && ib_mad_kernel_rmpp_agent(agent)) {
-		copy_offset = IB_MGMT_RMPP_HDR;
-		rmpp_active = ib_get_rmpp_flags(&rmpp_mad->rmpp_hdr) &
-						IB_MGMT_RMPP_FLAG_ACTIVE;
-	} else {
-		copy_offset = IB_MGMT_MAD_HDR;
-		rmpp_active = 0;
-	}
-
-	base_version = ((struct ib_mad_hdr *)&packet->mad.data)->base_version;
-	data_len = count - hdr_size(file) - hdr_len;
-	packet->msg = ib_create_send_mad(agent,
-					 be32_to_cpu(packet->mad.hdr.qpn),
-					 packet->mad.hdr.pkey_index, rmpp_active,
-					 hdr_len, data_len, GFP_KERNEL,
-					 base_version);
-	if (IS_ERR(packet->msg)) {
-		ret = PTR_ERR(packet->msg);
-		goto err_ah;
-	}
-
-	packet->msg->ah		= ah;
-	packet->msg->timeout_ms = packet->mad.hdr.timeout_ms;
-	packet->msg->retries	= packet->mad.hdr.retries;
-	packet->msg->context[0] = packet;
-
-	/* Copy MAD header.  Any RMPP header is already in place. */
-	memcpy(packet->msg->mad, packet->mad.data, IB_MGMT_MAD_HDR);
-
-	if (!rmpp_active) {
-		if (copy_from_user(packet->msg->mad + copy_offset,
-				   buf + copy_offset,
-				   hdr_len + data_len - copy_offset)) {
-			ret = -EFAULT;
-			goto err_msg;
-		}
-	} else {
-		ret = copy_rmpp_mad(packet->msg, buf);
-		if (ret)
-			goto err_msg;
-	}
-
-	/*
-	 * Set the high-order part of the transaction ID to make MADs from
-	 * different agents unique, and allow routing responses back to the
-	 * original requestor.
-	 */
-	if (!ib_response_mad(packet->msg->mad)) {
-		tid = &((struct ib_mad_hdr *) packet->msg->mad)->tid;
-		*tid = cpu_to_be64(((u64) agent->hi_tid) << 32 |
-				   (be64_to_cpup(tid) & 0xffffffff));
-		rmpp_mad->mad_hdr.tid = *tid;
-	}
-
-	if (!ib_mad_kernel_rmpp_agent(agent)
-	   && ib_is_mad_class_rmpp(rmpp_mad->mad_hdr.mgmt_class)
-	   && (ib_get_rmpp_flags(&rmpp_mad->rmpp_hdr) & IB_MGMT_RMPP_FLAG_ACTIVE)) {
-		spin_lock_irq(&file->send_lock);
-		list_add_tail(&packet->list, &file->send_list);
-		spin_unlock_irq(&file->send_lock);
-	} else {
-		spin_lock_irq(&file->send_lock);
-		ret = is_duplicate(file, packet);
-		if (!ret)
-			list_add_tail(&packet->list, &file->send_list);
-		spin_unlock_irq(&file->send_lock);
-		if (ret) {
-			ret = -EINVAL;
-			goto err_msg;
-		}
-	}
-
-	ret = ib_post_send_mad(packet->msg, NULL);
-	if (ret)
-		goto err_send;
-
-	mutex_unlock(&file->mutex);
-	return count;
-
-err_send:
-	dequeue_send(file, packet);
-err_msg:
-	ib_free_send_mad(packet->msg);
-err_ah:
-	ib_destroy_ah(ah);
-err_up:
-	mutex_unlock(&file->mutex);
-err:
-	kfree(packet);
-	return ret;
-}
-
-static unsigned int ib_umad_poll(struct file *filp, struct poll_table_struct *wait)
-{
-	struct ib_umad_file *file = filp->private_data;
-
-	/* we will always be able to post a MAD send */
-	unsigned int mask = POLLOUT | POLLWRNORM;
-
-	poll_wait(filp, &file->recv_wait, wait);
-
-	if (!list_empty(&file->recv_list))
-		mask |= POLLIN | POLLRDNORM;
-
-	return mask;
-}
-
-static int ib_umad_reg_agent(struct ib_umad_file *file, void __user *arg,
-			     int compat_method_mask)
-{
-	struct ib_user_mad_reg_req ureq;
-	struct ib_mad_reg_req req;
-	struct ib_mad_agent *agent = NULL;
-	int agent_id;
-	int ret;
-
-	mutex_lock(&file->port->file_mutex);
-	mutex_lock(&file->mutex);
-
-	if (!file->port->ib_dev) {
-		dev_notice(file->port->dev,
-			   "ib_umad_reg_agent: invalid device\n");
-		ret = -EPIPE;
-		goto out;
-	}
-
-	if (copy_from_user(&ureq, arg, sizeof ureq)) {
-		ret = -EFAULT;
-		goto out;
-	}
-
-	if (ureq.qpn != 0 && ureq.qpn != 1) {
-		dev_notice(file->port->dev,
-			   "ib_umad_reg_agent: invalid QPN %d specified\n",
-			   ureq.qpn);
-		ret = -EINVAL;
-		goto out;
-	}
-
-	for (agent_id = 0; agent_id < IB_UMAD_MAX_AGENTS; ++agent_id)
-		if (!__get_agent(file, agent_id))
-			goto found;
-
-	dev_notice(file->port->dev,
-		   "ib_umad_reg_agent: Max Agents (%u) reached\n",
-		   IB_UMAD_MAX_AGENTS);
-	ret = -ENOMEM;
-	goto out;
-
-found:
-	if (ureq.mgmt_class) {
-		memset(&req, 0, sizeof(req));
-		req.mgmt_class         = ureq.mgmt_class;
-		req.mgmt_class_version = ureq.mgmt_class_version;
-		memcpy(req.oui, ureq.oui, sizeof req.oui);
-
-		if (compat_method_mask) {
-			u32 *umm = (u32 *) ureq.method_mask;
-			int i;
-
-			for (i = 0; i < BITS_TO_LONGS(IB_MGMT_MAX_METHODS); ++i)
-				req.method_mask[i] =
-					umm[i * 2] | ((u64) umm[i * 2 + 1] << 32);
-		} else
-			memcpy(req.method_mask, ureq.method_mask,
-			       sizeof req.method_mask);
-	}
-
-	agent = ib_register_mad_agent(file->port->ib_dev, file->port->port_num,
-				      ureq.qpn ? IB_QPT_GSI : IB_QPT_SMI,
-				      ureq.mgmt_class ? &req : NULL,
-				      ureq.rmpp_version,
-				      send_handler, recv_handler, file, 0);
-	if (IS_ERR(agent)) {
-		ret = PTR_ERR(agent);
-		agent = NULL;
-		goto out;
-	}
-
-	if (put_user(agent_id,
-		     (u32 __user *) (arg + offsetof(struct ib_user_mad_reg_req, id)))) {
-		ret = -EFAULT;
-		goto out;
-	}
-
-	if (!file->already_used) {
-		file->already_used = 1;
-		if (!file->use_pkey_index) {
-			dev_warn(file->port->dev,
-				"process %s did not enable P_Key index support.\n",
-				current->comm);
-			dev_warn(file->port->dev,
-				"   Documentation/infiniband/user_mad.txt has info on the new ABI.\n");
-		}
-	}
-
-	file->agent[agent_id] = agent;
-	ret = 0;
-
-out:
-	mutex_unlock(&file->mutex);
-
-	if (ret && agent)
-		ib_unregister_mad_agent(agent);
-
-	mutex_unlock(&file->port->file_mutex);
-
-	return ret;
-}
-
-static int ib_umad_reg_agent2(struct ib_umad_file *file, void __user *arg)
-{
-	struct ib_user_mad_reg_req2 ureq;
-	struct ib_mad_reg_req req;
-	struct ib_mad_agent *agent = NULL;
-	int agent_id;
-	int ret;
-
-	mutex_lock(&file->port->file_mutex);
-	mutex_lock(&file->mutex);
-
-	if (!file->port->ib_dev) {
-		dev_notice(file->port->dev,
-			   "ib_umad_reg_agent2: invalid device\n");
-		ret = -EPIPE;
-		goto out;
-	}
-
-	if (copy_from_user(&ureq, arg, sizeof(ureq))) {
-		ret = -EFAULT;
-		goto out;
-	}
-
-	if (ureq.qpn != 0 && ureq.qpn != 1) {
-		dev_notice(file->port->dev,
-			   "ib_umad_reg_agent2: invalid QPN %d specified\n",
-			   ureq.qpn);
-		ret = -EINVAL;
-		goto out;
-	}
-
-	if (ureq.flags & ~IB_USER_MAD_REG_FLAGS_CAP) {
-		dev_notice(file->port->dev,
-			   "ib_umad_reg_agent2 failed: invalid registration flags specified 0x%x; supported 0x%x\n",
-			   ureq.flags, IB_USER_MAD_REG_FLAGS_CAP);
-		ret = -EINVAL;
-
-		if (put_user((u32)IB_USER_MAD_REG_FLAGS_CAP,
-				(u32 __user *) (arg + offsetof(struct
-				ib_user_mad_reg_req2, flags))))
-			ret = -EFAULT;
-
-		goto out;
-	}
-
-	for (agent_id = 0; agent_id < IB_UMAD_MAX_AGENTS; ++agent_id)
-		if (!__get_agent(file, agent_id))
-			goto found;
-
-	dev_notice(file->port->dev,
-		   "ib_umad_reg_agent2: Max Agents (%u) reached\n",
-		   IB_UMAD_MAX_AGENTS);
-	ret = -ENOMEM;
-	goto out;
-
-found:
-	if (ureq.mgmt_class) {
-		memset(&req, 0, sizeof(req));
-		req.mgmt_class         = ureq.mgmt_class;
-		req.mgmt_class_version = ureq.mgmt_class_version;
-		if (ureq.oui & 0xff000000) {
-			dev_notice(file->port->dev,
-				   "ib_umad_reg_agent2 failed: oui invalid 0x%08x\n",
-				   ureq.oui);
-			ret = -EINVAL;
-			goto out;
-		}
-		req.oui[2] =  ureq.oui & 0x0000ff;
-		req.oui[1] = (ureq.oui & 0x00ff00) >> 8;
-		req.oui[0] = (ureq.oui & 0xff0000) >> 16;
-		memcpy(req.method_mask, ureq.method_mask,
-			sizeof(req.method_mask));
-	}
-
-	agent = ib_register_mad_agent(file->port->ib_dev, file->port->port_num,
-				      ureq.qpn ? IB_QPT_GSI : IB_QPT_SMI,
-				      ureq.mgmt_class ? &req : NULL,
-				      ureq.rmpp_version,
-				      send_handler, recv_handler, file,
-				      ureq.flags);
-	if (IS_ERR(agent)) {
-		ret = PTR_ERR(agent);
-		agent = NULL;
-		goto out;
-	}
-
-	if (put_user(agent_id,
-		     (u32 __user *)(arg +
-				offsetof(struct ib_user_mad_reg_req2, id)))) {
-		ret = -EFAULT;
-		goto out;
-	}
-
-	if (!file->already_used) {
-		file->already_used = 1;
-		file->use_pkey_index = 1;
-	}
-
-	file->agent[agent_id] = agent;
-	ret = 0;
-
-out:
-	mutex_unlock(&file->mutex);
-
-	if (ret && agent)
-		ib_unregister_mad_agent(agent);
-
-	mutex_unlock(&file->port->file_mutex);
-
-	return ret;
-}
-
-
-static int ib_umad_unreg_agent(struct ib_umad_file *file, u32 __user *arg)
-{
-	struct ib_mad_agent *agent = NULL;
-	u32 id;
-	int ret = 0;
-
-	if (get_user(id, arg))
-		return -EFAULT;
-	if (id >= IB_UMAD_MAX_AGENTS)
-		return -EINVAL;
-
-	mutex_lock(&file->port->file_mutex);
-	mutex_lock(&file->mutex);
-
-	id = array_index_nospec(id, IB_UMAD_MAX_AGENTS);
-	if (!__get_agent(file, id)) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	agent = file->agent[id];
-	file->agent[id] = NULL;
-
-out:
-	mutex_unlock(&file->mutex);
-
-	if (agent)
-		ib_unregister_mad_agent(agent);
-
-	mutex_unlock(&file->port->file_mutex);
-
-	return ret;
-}
-
-static long ib_umad_enable_pkey(struct ib_umad_file *file)
-{
-	int ret = 0;
-
-	mutex_lock(&file->mutex);
-	if (file->already_used)
-		ret = -EINVAL;
-	else
-		file->use_pkey_index = 1;
-	mutex_unlock(&file->mutex);
-
-	return ret;
-}
-
-static long ib_umad_ioctl(struct file *filp, unsigned int cmd,
-			  unsigned long arg)
-{
-	switch (cmd) {
-	case IB_USER_MAD_REGISTER_AGENT:
-		return ib_umad_reg_agent(filp->private_data, (void __user *) arg, 0);
-	case IB_USER_MAD_UNREGISTER_AGENT:
-		return ib_umad_unreg_agent(filp->private_data, (__u32 __user *) arg);
-	case IB_USER_MAD_ENABLE_PKEY:
-		return ib_umad_enable_pkey(filp->private_data);
-	case IB_USER_MAD_REGISTER_AGENT2:
-		return ib_umad_reg_agent2(filp->private_data, (void __user *) arg);
-	default:
-		return -ENOIOCTLCMD;
-	}
-}
-
-#ifdef CONFIG_COMPAT
-static long ib_umad_compat_ioctl(struct file *filp, unsigned int cmd,
-				 unsigned long arg)
-{
-	switch (cmd) {
-	case IB_USER_MAD_REGISTER_AGENT:
-		return ib_umad_reg_agent(filp->private_data, compat_ptr(arg), 1);
-	case IB_USER_MAD_UNREGISTER_AGENT:
-		return ib_umad_unreg_agent(filp->private_data, compat_ptr(arg));
-	case IB_USER_MAD_ENABLE_PKEY:
-		return ib_umad_enable_pkey(filp->private_data);
-	case IB_USER_MAD_REGISTER_AGENT2:
-		return ib_umad_reg_agent2(filp->private_data, compat_ptr(arg));
-	default:
-		return -ENOIOCTLCMD;
-	}
-}
-#endif
-
-/*
- * ib_umad_open() does not need the BKL:
- *
- *  - the ib_umad_port structures are properly reference counted, and
- *    everything else is purely local to the file being created, so
- *    races against other open calls are not a problem;
- *  - the ioctl method does not affect any global state outside of the
- *    file structure being operated on;
- */
-static int ib_umad_open(struct inode *inode, struct file *filp)
-{
-	struct ib_umad_port *port;
-	struct ib_umad_file *file;
-	int ret = -ENXIO;
-
-	port = container_of(inode->i_cdev, struct ib_umad_port, cdev);
-
-	mutex_lock(&port->file_mutex);
-
-	if (!port->ib_dev)
-		goto out;
-
-	ret = -ENOMEM;
-	file = kzalloc(sizeof *file, GFP_KERNEL);
-	if (!file)
-		goto out;
-
-	mutex_init(&file->mutex);
-	spin_lock_init(&file->send_lock);
-	INIT_LIST_HEAD(&file->recv_list);
-	INIT_LIST_HEAD(&file->send_list);
-	init_waitqueue_head(&file->recv_wait);
-
-	file->port = port;
-	filp->private_data = file;
-
-	list_add_tail(&file->port_list, &port->file_list);
-
-	ret = nonseekable_open(inode, filp);
-	if (ret) {
-		list_del(&file->port_list);
-		kfree(file);
-		goto out;
-	}
-
-	kobject_get(&port->umad_dev->kobj);
-
-out:
-	mutex_unlock(&port->file_mutex);
-	return ret;
-}
-
-static int ib_umad_close(struct inode *inode, struct file *filp)
-{
-	struct ib_umad_file *file = filp->private_data;
-	struct ib_umad_device *dev = file->port->umad_dev;
-	struct ib_umad_packet *packet, *tmp;
-	int already_dead;
-	int i;
-
-	mutex_lock(&file->port->file_mutex);
-	mutex_lock(&file->mutex);
-
-	already_dead = file->agents_dead;
-	file->agents_dead = 1;
-
-	list_for_each_entry_safe(packet, tmp, &file->recv_list, list) {
-		if (packet->recv_wc)
-			ib_free_recv_mad(packet->recv_wc);
-		kfree(packet);
-	}
-
-	list_del(&file->port_list);
-
-	mutex_unlock(&file->mutex);
-
-	if (!already_dead)
-		for (i = 0; i < IB_UMAD_MAX_AGENTS; ++i)
-			if (file->agent[i])
-				ib_unregister_mad_agent(file->agent[i]);
-
-	mutex_unlock(&file->port->file_mutex);
-
-	kfree(file);
-	kobject_put(&dev->kobj);
-
-	return 0;
-}
-
-static const struct file_operations umad_fops = {
-	.owner		= THIS_MODULE,
-	.read		= ib_umad_read,
-	.write		= ib_umad_write,
-	.poll		= ib_umad_poll,
-	.unlocked_ioctl = ib_umad_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl	= ib_umad_compat_ioctl,
-#endif
-	.open		= ib_umad_open,
-	.release	= ib_umad_close,
-	.llseek		= no_llseek,
-};
-
-static int ib_umad_sm_open(struct inode *inode, struct file *filp)
-{
-	struct ib_umad_port *port;
-	struct ib_port_modify props = {
-		.set_port_cap_mask = IB_PORT_SM
-	};
-	int ret;
-
-	port = container_of(inode->i_cdev, struct ib_umad_port, sm_cdev);
-
-	if (filp->f_flags & O_NONBLOCK) {
-		if (down_trylock(&port->sm_sem)) {
-			ret = -EAGAIN;
-			goto fail;
-		}
-	} else {
-		if (down_interruptible(&port->sm_sem)) {
-			ret = -ERESTARTSYS;
-			goto fail;
-		}
-	}
-
-	ret = ib_modify_port(port->ib_dev, port->port_num, 0, &props);
-	if (ret)
-		goto err_up_sem;
-
-	filp->private_data = port;
-
-	ret = nonseekable_open(inode, filp);
-	if (ret)
-		goto err_clr_sm_cap;
-
-	kobject_get(&port->umad_dev->kobj);
-
-	return 0;
-
-err_clr_sm_cap:
-	swap(props.set_port_cap_mask, props.clr_port_cap_mask);
-	ib_modify_port(port->ib_dev, port->port_num, 0, &props);
-
-err_up_sem:
-	up(&port->sm_sem);
-
-fail:
-	return ret;
-}
-
-static int ib_umad_sm_close(struct inode *inode, struct file *filp)
-{
-	struct ib_umad_port *port = filp->private_data;
-	struct ib_port_modify props = {
-		.clr_port_cap_mask = IB_PORT_SM
-	};
-	int ret = 0;
-
-	mutex_lock(&port->file_mutex);
-	if (port->ib_dev)
-		ret = ib_modify_port(port->ib_dev, port->port_num, 0, &props);
-	mutex_unlock(&port->file_mutex);
-
-	up(&port->sm_sem);
-
-	kobject_put(&port->umad_dev->kobj);
-
-	return ret;
-}
-
-static const struct file_operations umad_sm_fops = {
-	.owner	 = THIS_MODULE,
-	.open	 = ib_umad_sm_open,
-	.release = ib_umad_sm_close,
-	.llseek	 = no_llseek,
-};
-
-static struct ib_client umad_client = {
-	.name   = "umad",
-	.add    = ib_umad_add_one,
-	.remove = ib_umad_remove_one
-};
-
-static ssize_t show_ibdev(struct device *dev, struct device_attribute *attr,
-			  char *buf)
-{
-	struct ib_umad_port *port = dev_get_drvdata(dev);
-
-	if (!port)
-		return -ENODEV;
-
-	return sprintf(buf, "%s\n", port->ib_dev->name);
-}
-static DEVICE_ATTR(ibdev, S_IRUGO, show_ibdev, NULL);
-
-static ssize_t show_port(struct device *dev, struct device_attribute *attr,
-			 char *buf)
-{
-	struct ib_umad_port *port = dev_get_drvdata(dev);
-
-	if (!port)
-		return -ENODEV;
-
-	return sprintf(buf, "%d\n", port->port_num);
-}
-static DEVICE_ATTR(port, S_IRUGO, show_port, NULL);
-
-static CLASS_ATTR_STRING(abi_version, S_IRUGO,
-			 __stringify(IB_USER_MAD_ABI_VERSION));
-
-static dev_t overflow_maj;
-static DECLARE_BITMAP(overflow_map, IB_UMAD_MAX_PORTS);
-static int find_overflow_devnum(struct ib_device *device)
-{
-	int ret;
-
-	if (!overflow_maj) {
-		ret = alloc_chrdev_region(&overflow_maj, 0, IB_UMAD_MAX_PORTS * 2,
-					  "infiniband_mad");
-		if (ret) {
-			dev_err(&device->dev,
-				"couldn't register dynamic device number\n");
-			return ret;
-		}
-	}
-
-	ret = find_first_zero_bit(overflow_map, IB_UMAD_MAX_PORTS);
-	if (ret >= IB_UMAD_MAX_PORTS)
-		return -1;
-
-	return ret;
-}
-
-static int ib_umad_init_port(struct ib_device *device, int port_num,
-			     struct ib_umad_device *umad_dev,
-			     struct ib_umad_port *port)
-{
-	int devnum;
-	dev_t base;
-
-	spin_lock(&port_lock);
-	devnum = find_first_zero_bit(dev_map, IB_UMAD_MAX_PORTS);
-	if (devnum >= IB_UMAD_MAX_PORTS) {
-		spin_unlock(&port_lock);
-		devnum = find_overflow_devnum(device);
-		if (devnum < 0)
-			return -1;
-
-		spin_lock(&port_lock);
-		port->dev_num = devnum + IB_UMAD_MAX_PORTS;
-		base = devnum + overflow_maj;
-		set_bit(devnum, overflow_map);
-	} else {
-		port->dev_num = devnum;
-		base = devnum + base_dev;
-		set_bit(devnum, dev_map);
-	}
-	spin_unlock(&port_lock);
-
-	port->ib_dev   = device;
-	port->port_num = port_num;
-	sema_init(&port->sm_sem, 1);
-	mutex_init(&port->file_mutex);
-	INIT_LIST_HEAD(&port->file_list);
-
-	cdev_init(&port->cdev, &umad_fops);
-	port->cdev.owner = THIS_MODULE;
-	port->cdev.kobj.parent = &umad_dev->kobj;
-	kobject_set_name(&port->cdev.kobj, "umad%d", port->dev_num);
-	if (cdev_add(&port->cdev, base, 1))
-		goto err_cdev;
-
-	port->dev = device_create(umad_class, device->dma_device,
-				  port->cdev.dev, port,
-				  "umad%d", port->dev_num);
-	if (IS_ERR(port->dev))
-		goto err_cdev;
-
-	if (device_create_file(port->dev, &dev_attr_ibdev))
-		goto err_dev;
-	if (device_create_file(port->dev, &dev_attr_port))
-		goto err_dev;
-
-	base += IB_UMAD_MAX_PORTS;
-	cdev_init(&port->sm_cdev, &umad_sm_fops);
-	port->sm_cdev.owner = THIS_MODULE;
-	port->sm_cdev.kobj.parent = &umad_dev->kobj;
-	kobject_set_name(&port->sm_cdev.kobj, "issm%d", port->dev_num);
-	if (cdev_add(&port->sm_cdev, base, 1))
-		goto err_sm_cdev;
-
-	port->sm_dev = device_create(umad_class, device->dma_device,
-				     port->sm_cdev.dev, port,
-				     "issm%d", port->dev_num);
-	if (IS_ERR(port->sm_dev))
-		goto err_sm_cdev;
-
-	if (device_create_file(port->sm_dev, &dev_attr_ibdev))
-		goto err_sm_dev;
-	if (device_create_file(port->sm_dev, &dev_attr_port))
-		goto err_sm_dev;
-
-	return 0;
-
-err_sm_dev:
-	device_destroy(umad_class, port->sm_cdev.dev);
-
-err_sm_cdev:
-	cdev_del(&port->sm_cdev);
-
-err_dev:
-	device_destroy(umad_class, port->cdev.dev);
-
-err_cdev:
-	cdev_del(&port->cdev);
-	if (port->dev_num < IB_UMAD_MAX_PORTS)
-		clear_bit(devnum, dev_map);
-	else
-		clear_bit(devnum, overflow_map);
-
-	return -1;
-}
-
-static void ib_umad_kill_port(struct ib_umad_port *port)
-{
-	struct ib_umad_file *file;
-	int id;
-
-	dev_set_drvdata(port->dev,    NULL);
-	dev_set_drvdata(port->sm_dev, NULL);
-
-	device_destroy(umad_class, port->cdev.dev);
-	device_destroy(umad_class, port->sm_cdev.dev);
-
-	cdev_del(&port->cdev);
-	cdev_del(&port->sm_cdev);
-
-	mutex_lock(&port->file_mutex);
-
-	port->ib_dev = NULL;
-
-	list_for_each_entry(file, &port->file_list, port_list) {
-		mutex_lock(&file->mutex);
-		file->agents_dead = 1;
-		mutex_unlock(&file->mutex);
-
-		for (id = 0; id < IB_UMAD_MAX_AGENTS; ++id)
-			if (file->agent[id])
-				ib_unregister_mad_agent(file->agent[id]);
-	}
-
-	mutex_unlock(&port->file_mutex);
-
-	if (port->dev_num < IB_UMAD_MAX_PORTS)
-		clear_bit(port->dev_num, dev_map);
-	else
-		clear_bit(port->dev_num - IB_UMAD_MAX_PORTS, overflow_map);
-}
-
-static void ib_umad_add_one(struct ib_device *device)
-{
-	struct ib_umad_device *umad_dev;
-	int s, e, i;
-	int count = 0;
-
-	s = rdma_start_port(device);
-	e = rdma_end_port(device);
-
-	umad_dev = kzalloc(sizeof *umad_dev +
-			   (e - s + 1) * sizeof (struct ib_umad_port),
-			   GFP_KERNEL);
-	if (!umad_dev)
-		return;
-
-	kobject_init(&umad_dev->kobj, &ib_umad_dev_ktype);
-
-	for (i = s; i <= e; ++i) {
-		if (!rdma_cap_ib_mad(device, i))
-			continue;
-
-		umad_dev->port[i - s].umad_dev = umad_dev;
-
-		if (ib_umad_init_port(device, i, umad_dev,
-				      &umad_dev->port[i - s]))
-			goto err;
-
-		count++;
-	}
-
-	if (!count)
-		goto free;
-
-	ib_set_client_data(device, &umad_client, umad_dev);
-
-	return;
-
-err:
-	while (--i >= s) {
-		if (!rdma_cap_ib_mad(device, i))
-			continue;
-
-		ib_umad_kill_port(&umad_dev->port[i - s]);
-	}
-free:
-	kobject_put(&umad_dev->kobj);
-}
-
-static void ib_umad_remove_one(struct ib_device *device, void *client_data)
-{
-	struct ib_umad_device *umad_dev = client_data;
-	int i;
-
-	if (!umad_dev)
-		return;
-
-	for (i = 0; i <= rdma_end_port(device) - rdma_start_port(device); ++i) {
-		if (rdma_cap_ib_mad(device, i + rdma_start_port(device)))
-			ib_umad_kill_port(&umad_dev->port[i]);
-	}
-
-	kobject_put(&umad_dev->kobj);
-}
-
-static char *umad_devnode(struct device *dev, umode_t *mode)
-{
-	return kasprintf(GFP_KERNEL, "infiniband/%s", dev_name(dev));
-}
-
-static int __init ib_umad_init(void)
-{
-	int ret;
-
-	ret = register_chrdev_region(base_dev, IB_UMAD_MAX_PORTS * 2,
-				     "infiniband_mad");
-	if (ret) {
-		pr_err("couldn't register device number\n");
-		goto out;
-	}
-
-	umad_class = class_create(THIS_MODULE, "infiniband_mad");
-	if (IS_ERR(umad_class)) {
-		ret = PTR_ERR(umad_class);
-		pr_err("couldn't create class infiniband_mad\n");
-		goto out_chrdev;
-	}
-
-	umad_class->devnode = umad_devnode;
-
-	ret = class_create_file(umad_class, &class_attr_abi_version.attr);
-	if (ret) {
-		pr_err("couldn't create abi_version attribute\n");
-		goto out_class;
-	}
-
-	ret = ib_register_client(&umad_client);
-	if (ret) {
-		pr_err("couldn't register ib_umad client\n");
-		goto out_class;
-	}
-
-	return 0;
-
-out_class:
-	class_destroy(umad_class);
-
-out_chrdev:
-	unregister_chrdev_region(base_dev, IB_UMAD_MAX_PORTS * 2);
-
-out:
-	return ret;
-}
-
-static void __exit ib_umad_cleanup(void)
-{
-	ib_unregister_client(&umad_client);
-	class_destroy(umad_class);
-	unregister_chrdev_region(base_dev, IB_UMAD_MAX_PORTS * 2);
-	if (overflow_maj)
-		unregister_chrdev_region(overflow_maj, IB_UMAD_MAX_PORTS * 2);
-}
-
-module_init(ib_umad_init);
-module_exit(ib_umad_cleanup);
+   0x4b2e
+#define mmDIG2_HDMI_ACR_32_0                                                    0x4c2e
+#define mmDIG3_HDMI_ACR_32_0                                                    0x4d2e
+#define mmDIG4_HDMI_ACR_32_0                                                    0x4e2e
+#define mmDIG5_HDMI_ACR_32_0                                                    0x4f2e
+#define mmDIG6_HDMI_ACR_32_0                                                    0x542e
+#define mmDIG7_HDMI_ACR_32_0                                                    0x562e
+#define mmDIG8_HDMI_ACR_32_0                                                    0x572e
+#define mmHDMI_ACR_32_1                                                         0x4a2f
+#define mmDIG0_HDMI_ACR_32_1                                                    0x4a2f
+#define mmDIG1_HDMI_ACR_32_1                                                    0x4b2f
+#define mmDIG2_HDMI_ACR_32_1                                                    0x4c2f
+#define mmDIG3_HDMI_ACR_32_1                                                    0x4d2f
+#define mmDIG4_HDMI_ACR_32_1                                                    0x4e2f
+#define mmDIG5_HDMI_ACR_32_1                                                    0x4f2f
+#define mmDIG6_HDMI_ACR_32_1                                                    0x542f
+#define mmDIG7_HDMI_ACR_32_1                                                    0x562f
+#define mmDIG8_HDMI_ACR_32_1                                                    0x572f
+#define mmHDMI_ACR_44_0                                                         0x4a30
+#define mmDIG0_HDMI_ACR_44_0                                                    0x4a30
+#define mmDIG1_HDMI_ACR_44_0                                                    0x4b30
+#define mmDIG2_HDMI_ACR_44_0                                                    0x4c30
+#define mmDIG3_HDMI_ACR_44_0                                                    0x4d30
+#define mmDIG4_HDMI_ACR_44_0                                                    0x4e30
+#define mmDIG5_HDMI_ACR_44_0                                                    0x4f30
+#define mmDIG6_HDMI_ACR_44_0                                                    0x5430
+#define mmDIG7_HDMI_ACR_44_0                                                    0x5630
+#define mmDIG8_HDMI_ACR_44_0                                                    0x5730
+#define mmHDMI_ACR_44_1                                                         0x4a31
+#define mmDIG0_HDMI_ACR_44_1                                                    0x4a31
+#define mmDIG1_HDMI_ACR_44_1                                                    0x4b31
+#define mmDIG2_HDMI_ACR_44_1                                                    0x4c31
+#define mmDIG3_HDMI_ACR_44_1                                                    0x4d31
+#define mmDIG4_HDMI_ACR_44_1                                                    0x4e31
+#define mmDIG5_HDMI_ACR_44_1                                                    0x4f31
+#define mmDIG6_HDMI_ACR_44_1                                                    0x5431
+#define mmDIG7_HDMI_ACR_44_1                                                    0x5631
+#define mmDIG8_HDMI_ACR_44_1                                                    0x5731
+#define mmHDMI_ACR_48_0                                                         0x4a32
+#define mmDIG0_HDMI_ACR_48_0                                                    0x4a32
+#define mmDIG1_HDMI_ACR_48_0                                                    0x4b32
+#define mmDIG2_HDMI_ACR_48_0                                                    0x4c32
+#define mmDIG3_HDMI_ACR_48_0                                                    0x4d32
+#define mmDIG4_HDMI_ACR_48_0                                                    0x4e32
+#define mmDIG5_HDMI_ACR_48_0                                                    0x4f32
+#define mmDIG6_HDMI_ACR_48_0                                                    0x5432
+#define mmDIG7_HDMI_ACR_48_0                                                    0x5632
+#define mmDIG8_HDMI_ACR_48_0                                                    0x5732
+#define mmHDMI_ACR_48_1                                                         0x4a33
+#define mmDIG0_HDMI_ACR_48_1                                                    0x4a33
+#define mmDIG1_HDMI_ACR_48_1                                                    0x4b33
+#define mmDIG2_HDMI_ACR_48_1                                                    0x4c33
+#define mmDIG3_HDMI_ACR_48_1                                                    0x4d33
+#define mmDIG4_HDMI_ACR_48_1                                                    0x4e33
+#define mmDIG5_HDMI_ACR_48_1                                                    0x4f33
+#define mmDIG6_HDMI_ACR_48_1                                                    0x5433
+#define mmDIG7_HDMI_ACR_48_1                                                    0x5633
+#define mmDIG8_HDMI_ACR_48_1                                                    0x5733
+#define mmHDMI_ACR_STATUS_0                                                     0x4a34
+#define mmDIG0_HDMI_ACR_STATUS_0                                                0x4a34
+#define mmDIG1_HDMI_ACR_STATUS_0                                                0x4b34
+#define mmDIG2_HDMI_ACR_STATUS_0                                                0x4c34
+#define mmDIG3_HDMI_ACR_STATUS_0                                                0x4d34
+#define mmDIG4_HDMI_ACR_STATUS_0                                                0x4e34
+#define mmDIG5_HDMI_ACR_STATUS_0                                                0x4f34
+#define mmDIG6_HDMI_ACR_STATUS_0                                                0x5434
+#define mmDIG7_HDMI_ACR_STATUS_0                                                0x5634
+#define mmDIG8_HDMI_ACR_STATUS_0                                                0x5734
+#define mmHDMI_ACR_STATUS_1                                                     0x4a35
+#define mmDIG0_HDMI_ACR_STATUS_1                                                0x4a35
+#define mmDIG1_HDMI_ACR_STATUS_1                                                0x4b35
+#define mmDIG2_HDMI_ACR_STATUS_1                                                0x4c35
+#define mmDIG3_HDMI_ACR_STATUS_1                                                0x4d35
+#define mmDIG4_HDMI_ACR_STATUS_1                                                0x4e35
+#define mmDIG5_HDMI_ACR_STATUS_1                                                0x4f35
+#define mmDIG6_HDMI_ACR_STATUS_1                                                0x5435
+#define mmDIG7_HDMI_ACR_STATUS_1                                                0x5635
+#define mmDIG8_HDMI_ACR_STATUS_1                                                0x5735
+#define mmAFMT_AUDIO_INFO0                                                      0x4a36
+#define mmDIG0_AFMT_AUDIO_INFO0                                                 0x4a36
+#define mmDIG1_AFMT_AUDIO_INFO0                                                 0x4b36
+#define mmDIG2_AFMT_AUDIO_INFO0                                                 0x4c36
+#define mmDIG3_AFMT_AUDIO_INFO0                                                 0x4d36
+#define mmDIG4_AFMT_AUDIO_INFO0                                                 0x4e36
+#define mmDIG5_AFMT_AUDIO_INFO0                                                 0x4f36
+#define mmDIG6_AFMT_AUDIO_INFO0                                                 0x5436
+#define mmDIG7_AFMT_AUDIO_INFO0                                                 0x5636
+#define mmDIG8_AFMT_AUDIO_INFO0                                                 0x5736
+#define mmAFMT_AUDIO_INFO1                                                      0x4a37
+#define mmDIG0_AFMT_AUDIO_INFO1                                                 0x4a37
+#define mmDIG1_AFMT_AUDIO_INFO1                                                 0x4b37
+#define mmDIG2_AFMT_AUDIO_INFO1                                                 0x4c37
+#define mmDIG3_AFMT_AUDIO_INFO1                                                 0x4d37
+#define mmDIG4_AFMT_AUDIO_INFO1                                                 0x4e37
+#define mmDIG5_AFMT_AUDIO_INFO1                                                 0x4f37
+#define mmDIG6_AFMT_AUDIO_INFO1                                                 0x5437
+#define mmDIG7_AFMT_AUDIO_INFO1                                                 0x5637
+#define mmDIG8_AFMT_AUDIO_INFO1                                                 0x5737
+#define mmAFMT_60958_0                                                          0x4a38
+#define mmDIG0_AFMT_60958_0                                                     0x4a38
+#define mmDIG1_AFMT_60958_0                                                     0x4b38
+#define mmDIG2_AFMT_60958_0                                                     0x4c38
+#define mmDIG3_AFMT_60958_0                                                     0x4d38
+#define mmDIG4_AFMT_60958_0                                                     0x4e38
+#define mmDIG5_AFMT_60958_0                                                     0x4f38
+#define mmDIG6_AFMT_60958_0                                                     0x5438
+#define mmDIG7_AFMT_60958_0                                                     0x5638
+#define mmDIG8_AFMT_60958_0                                                     0x5738
+#define mmAFMT_60958_1                                                          0x4a39
+#define mmDIG0_AFMT_60958_1                                                     0x4a39
+#define mmDIG1_AFMT_60958_1                                                     0x4b39
+#define mmDIG2_AFMT_60958_1                                                     0x4c39
+#define mmDIG3_AFMT_60958_1                                                     0x4d39
+#define mmDIG4_AFMT_60958_1                                                     0x4e39
+#define mmDIG5_AFMT_60958_1                                                     0x4f39
+#define mmDIG6_AFMT_60958_1                                                     0x5439
+#define mmDIG7_AFMT_60958_1                                                     0x5639
+#define mmDIG8_AFMT_60958_1                                                     0x5739
+#define mmAFMT_AUDIO_CRC_CONTROL                                                0x4a3a
+#define mmDIG0_AFMT_AUDIO_CRC_CONTROL                                           0x4a3a
+#define mmDIG1_AFMT_AUDIO_CRC_CONTROL                                           0x4b3a
+#define mmDIG2_AFMT_AUDIO_CRC_CONTROL                                           0x4c3a
+#define mmDIG3_AFMT_AUDIO_CRC_CONTROL                                           0x4d3a
+#define mmDIG4_AFMT_AUDIO_CRC_CONTROL                                           0x4e3a
+#define mmDIG5_AFMT_AUDIO_CRC_CONTROL                                           0x4f3a
+#define mmDIG6_AFMT_AUDIO_CRC_CONTROL                                           0x543a
+#define mmDIG7_AFMT_AUDIO_CRC_CONTROL                                           0x563a
+#define mmDIG8_AFMT_AUDIO_CRC_CONTROL                                           0x573a
+#define mmAFMT_RAMP_CONTROL0                                                    0x4a3b
+#define mmDIG0_AFMT_RAMP_CONTROL0                                               0x4a3b
+#define mmDIG1_AFMT_RAMP_CONTROL0                                               0x4b3b
+#define mmDIG2_AFMT_RAMP_CONTROL0                                               0x4c3b
+#define mmDIG3_AFMT_RAMP_CONTROL0                                               0x4d3b
+#define mmDIG4_AFMT_RAMP_CONTROL0                                               0x4e3b
+#define mmDIG5_AFMT_RAMP_CONTROL0                                               0x4f3b
+#define mmDIG6_AFMT_RAMP_CONTROL0                                               0x543b
+#define mmDIG7_AFMT_RAMP_CONTROL0                                               0x563b
+#define mmDIG8_AFMT_RAMP_CONTROL0                                               0x573b
+#define mmAFMT_RAMP_CONTROL1                                                    0x4a3c
+#define mmDIG0_AFMT_RAMP_CONTROL1                                               0x4a3c
+#define mmDIG1_AFMT_RAMP_CONTROL1                                               0x4b3c
+#define mmDIG2_AFMT_RAMP_CONTROL1                                               0x4c3c
+#define mmDIG3_AFMT_RAMP_CONTROL1                                               0x4d3c
+#define mmDIG4_AFMT_RAMP_CONTROL1                                               0x4e3c
+#define mmDIG5_AFMT_RAMP_CONTROL1                                               0x4f3c
+#define mmDIG6_AFMT_RAMP_CONTROL1                                               0x543c
+#define mmDIG7_AFMT_RAMP_CONTROL1                                               0x563c
+#define mmDIG8_AFMT_RAMP_CONTROL1                                               0x573c
+#define mmAFMT_RAMP_CONTROL2                                                    0x4a3d
+#define mmDIG0_AFMT_RAMP_CONTROL2                                               0x4a3d
+#define mmDIG1_AFMT_RAMP_CONTROL2                                               0x4b3d
+#define mmDIG2_AFMT_RAMP_CONTROL2                                               0x4c3d
+#define mmDIG3_AFMT_RAMP_CONTROL2                                               0x4d3d
+#define mmDIG4_AFMT_RAMP_CONTROL2                                               0x4e3d
+#define mmDIG5_AFMT_RAMP_CONTROL2                                               0x4f3d
+#define mmDIG6_AFMT_RAMP_CONTROL2                                               0x543d
+#define mmDIG7_AFMT_RAMP_CONTROL2                                               0x563d
+#define mmDIG8_AFMT_RAMP_CONTROL2                                               0x573d
+#define mmAFMT_RAMP_CONTROL3                                                    0x4a3e
+#define mmDIG0_AFMT_RAMP_CONTROL3                                               0x4a3e
+#define mmDIG1_AFMT_RAMP_CONTROL3                                               0x4b3e
+#define mmDIG2_AFMT_RAMP_CONTROL3                                               0x4c3e
+#define mmDIG3_AFMT_RAMP_CONTROL3                                               0x4d3e
+#define mmDIG4_AFMT_RAMP_CONTROL3                                               0x4e3e
+#define mmDIG5_AFMT_RAMP_CONTROL3                                               0x4f3e
+#define mmDIG6_AFMT_RAMP_CONTROL3                                               0x543e
+#define mmDIG7_AFMT_RAMP_CONTROL3                                               0x563e
+#define mmDIG8_AFMT_RAMP_CONTROL3                                               0x573e
+#define mmAFMT_60958_2                                                          0x4a3f
+#define mmDIG0_AFMT_60958_2                                                     0x4a3f
+#define mmDIG1_AFMT_60958_2                                                     0x4b3f
+#define mmDIG2_AFMT_60958_2                                                     0x4c3f
+#define mmDIG3_AFMT_60958_2                                                     0x4d3f
+#define mmDIG4_AFMT_60958_2                                                     0x4e3f
+#define mmDIG5_AFMT_60958_2                                                     0x4f3f
+#define mmDIG6_AFMT_60958_2                                                     0x543f
+#define mmDIG7_AFMT_60958_2                                                     0x563f
+#define mmDIG8_AFMT_60958_2                                                     0x573f
+#define mmAFMT_AUDIO_CRC_RESULT                                                 0x4a40
+#define mmDIG0_AFMT_AUDIO_CRC_RESULT                                            0x4a40
+#define mmDIG1_AFMT_AUDIO_CRC_RESULT                                            0x4b40
+#define mmDIG2_AFMT_AUDIO_CRC_RESULT                                            0x4c40
+#define mmDIG3_AFMT_AUDIO_CRC_RESULT                                            0x4d40
+#define mmDIG4_AFMT_AUDIO_CRC_RESULT                                            0x4e40
+#define mmDIG5_AFMT_AUDIO_CRC_RESULT                                            0x4f40
+#define mmDIG6_AFMT_AUDIO_CRC_RESULT                                            0x5440
+#define mmDIG7_AFMT_AUDIO_CRC_RESULT                                            0x5640
+#define mmDIG8_AFMT_AUDIO_CRC_RESULT                                            0x5740
+#define mmAFMT_STATUS                                                           0x4a41
+#define mmDIG0_AFMT_STATUS                                                      0x4a41
+#define mmDIG1_AFMT_STATUS                                                      0x4b41
+#define mmDIG2_AFMT_STATUS                                                      0x4c41
+#define mmDIG3_AFMT_STATUS                                                      0x4d41
+#define mmDIG4_AFMT_STATUS                                                      0x4e41
+#define mmDIG5_AFMT_STATUS                                                      0x4f41
+#define mmDIG6_AFMT_STATUS                                                      0x5441
+#define mmDIG7_AFMT_STATUS                                                      0x5641
+#define mmDIG8_AFMT_STATUS                                                      0x5741
+#define mmAFMT_AUDIO_PACKET_CONTROL                                             0x4a42
+#define mmDIG0_AFMT_AUDIO_PACKET_CONTROL                                        0x4a42
+#define mmDIG1_AFMT_AUDIO_PACKET_CONTROL                                        0x4b42
+#define mmDIG2_AFMT_AUDIO_PACKET_CONTROL                                        0x4c42
+#define mmDIG3_AFMT_AUDIO_PACKET_CONTROL                                        0x4d42
+#define mmDIG4_AFMT_AUDIO_PACKET_CONTROL                                        0x4e42
+#define mmDIG5_AFMT_AUDIO_PACKET_CONTROL                                        0x4f42
+#define mmDIG6_AFMT_AUDIO_PACKET_CONTROL                                        0x5442
+#define mmDIG7_AFMT_AUDIO_PACKET_CONTROL                                        0x5642
+#define mmDIG8_AFMT_AUDIO_PACKET_CONTROL                                        0x5742
+#define mmAFMT_VBI_PACKET_CONTROL                                               0x4a43
+#define mmDIG0_AFMT_VBI_PACKET_CONTROL                                          0x4a43
+#define mmDIG1_AFMT_VBI_PACKET_CONTROL                                          0x4b43
+#define mmDIG2_AFMT_VBI_PACKET_CONTROL                                          0x4c43
+#define mmDIG3_AFMT_VBI_PACKET_CONTROL                                          0x4d43
+#define mmDIG4_AFMT_VBI_PACKET_CONTROL                                          0x4e43
+#define mmDIG5_AFMT_VBI_PACKET_CONTROL                                          0x4f43
+#define mmDIG6_AFMT_VBI_PACKET_CONTROL                                          0x5443
+#define mmDIG7_AFMT_VBI_PACKET_CONTROL                                          0x5643
+#define mmDIG8_AFMT_VBI_PACKET_CONTROL                                          0x5743
+#define mmAFMT_INFOFRAME_CONTROL0                                               0x4a44
+#define mmDIG0_AFMT_INFOFRAME_CONTROL0                                          0x4a44
+#define mmDIG1_AFMT_INFOFRAME_CONTROL0                                          0x4b44
+#define mmDIG2_AFMT_INFOFRAME_CONTROL0                                          0x4c44
+#define mmDIG3_AFMT_INFOFRAME_CONTROL0                                          0x4d44
+#define mmDIG4_AFMT_INFOFRAME_CONTROL0                                          0x4e44
+#define mmDIG5_AFMT_INFOFRAME_CONTROL0                                          0x4f44
+#define mmDIG6_AFMT_INFOFRAME_CONTROL0                                          0x5444
+#define mmDIG7_AFMT_INFOFRAME_CONTROL0                                          0x5644
+#define mmDIG8_AFMT_INFOFRAME_CONTROL0                                          0x5744
+#define mmAFMT_AUDIO_SRC_CONTROL                                                0x4a45
+#define mmDIG0_AFMT_AUDIO_SRC_CONTROL                                           0x4a45
+#define mmDIG1_AFMT_AUDIO_SRC_CONTROL                                           0x4b45
+#define mmDIG2_AFMT_AUDIO_SRC_CONTROL                                           0x4c45
+#define mmDIG3_AFMT_AUDIO_SRC_CONTROL                                           0x4d45
+#define mmDIG4_AFMT_AUDIO_SRC_CONTROL                                           0x4e45
+#define mmDIG5_AFMT_AUDIO_SRC_CONTROL                                           0x4f45
+#define mmDIG6_AFMT_AUDIO_SRC_CONTROL                                           0x5445
+#define mmDIG7_AFMT_AUDIO_SRC_CONTROL                                           0x5645
+#define mmDIG8_AFMT_AUDIO_SRC_CONTROL                                           0x5745
+#define mmAFMT_AUDIO_DBG_DTO_CNTL                                               0x4a46
+#define mmDIG0_AFMT_AUDIO_DBG_DTO_CNTL                                          0x4a46
+#define mmDIG1_AFMT_AUDIO_DBG_DTO_CNTL                                          0x4b46
+#define mmDIG2_AFMT_AUDIO_DBG_DTO_CNTL                                          0x4c46
+#define mmDIG3_AFMT_AUDIO_DBG_DTO_CNTL                                          0x4d46
+#define mmDIG4_AFMT_AUDIO_DBG_DTO_CNTL                                          0x4e46
+#define mmDIG5_AFMT_AUDIO_DBG_DTO_CNTL                                          0x4f46
+#define mmDIG6_AFMT_AUDIO_DBG_DTO_CNTL                                          0x5446
+#define mmDIG7_AFMT_AUDIO_DBG_DTO_CNTL                                          0x5646
+#define mmDIG8_AFMT_AUDIO_DBG_DTO_CNTL                                          0x5746
+#define mmAFMT_CNTL                                                             0x4a7e
+#define mmDIG0_AFMT_CNTL                                                        0x4a7e
+#define mmDIG1_AFMT_CNTL                                                        0x4b7e
+#define mmDIG2_AFMT_CNTL                                                        0x4c7e
+#define mmDIG3_AFMT_CNTL                                                        0x4d7e
+#define mmDIG4_AFMT_CNTL                                                        0x4e7e
+#define mmDIG5_AFMT_CNTL                                                        0x4f7e
+#define mmDIG6_AFMT_CNTL                                                        0x547e
+#define mmDIG7_AFMT_CNTL                                                        0x567e
+#define mmDIG8_AFMT_CNTL                                                        0x577e
+#define mmDIG_BE_CNTL                                                           0x4a47
+#define mmDIG0_DIG_BE_CNTL                                                      0x4a47
+#define mmDIG1_DIG_BE_CNTL                                                      0x4b47
+#define mmDIG2_DIG_BE_CNTL                                                      0x4c47
+#define mmDIG3_DIG_BE_CNTL                                                      0x4d47
+#define mmDIG4_DIG_BE_CNTL                                                      0x4e47
+#define mmDIG5_DIG_BE_CNTL                                                      0x4f47
+#define mmDIG6_DIG_BE_CNTL                                                      0x5447
+#define mmDIG7_DIG_BE_CNTL                                                      0x5647
+#define mmDIG8_DIG_BE_CNTL                                                      0x5747
+#define mmDIG_BE_EN_CNTL                                                        0x4a48
+#define mmDIG0_DIG_BE_EN_CNTL                                                   0x4a48
+#define mmDIG1_DIG_BE_EN_CNTL                                                   0x4b48
+#define mmDIG2_DIG_BE_EN_CNTL                                                   0x4c48
+#define mmDIG3_DIG_BE_EN_CNTL                                                   0x4d48
+#define mmDIG4_DIG_BE_EN_CNTL                                                   0x4e48
+#define mmDIG5_DIG_BE_EN_CNTL                                                   0x4f48
+#define mmDIG6_DIG_BE_EN_CNTL                                                   0x5448
+#define mmDIG7_DIG_BE_EN_CNTL                                                   0x5648
+#define mmDIG8_DIG_BE_EN_CNTL                                                   0x5748
+#define mmTMDS_CNTL                                                             0x4a6b
+#define mmDIG0_TMDS_CNTL                                                        0x4a6b
+#define mmDIG1_TMDS_CNTL                                                        0x4b6b
+#define mmDIG2_TMDS_CNTL                                                        0x4c6b
+#define mmDIG3_TMDS_CNTL                                                        0x4d6b
+#define mmDIG4_TMDS_CNTL                                                        0x4e6b
+#define mmDIG5_TMDS_CNTL                                                        0x4f6b
+#define mmDIG6_TMDS_CNTL                                                        0x546b
+#define mmDIG7_TMDS_CNTL                                                        0x566b
+#define mmDIG8_TMDS_CNTL                                                        0x576b
+#define mmTMDS_CONTROL_CHAR                                                     0x4a6c
+#define mmDIG0_TMDS_CONTROL_CHAR                                                0x4a6c
+#define mmDIG1_TMDS_CONTROL_CHAR                                                0x4b6c
+#define mmDIG2_TMDS_CONTROL_CHAR                                                0x4c6c
+#define mmDIG3_TMDS_CONTROL_CHAR                                                0x4d6c
+#define mmDIG4_TMDS_CONTROL_CHAR                                                0x4e6c
+#define mmDIG5_TMDS_CONTROL_CHAR                                                0x4f6c
+#define mmDIG6_TMDS_CONTROL_CHAR                                                0x546c
+#define mmDIG7_TMDS_CONTROL_CHAR                                                0x566c
+#define mmDIG8_TMDS_CONTROL_CHAR                                                0x576c
+#define mmTMDS_CONTROL0_FEEDBACK                                                0x4a6d
+#define mmDIG0_TMDS_CONTROL0_FEEDBACK                                           0x4a6d
+#define mmDIG1_TMDS_CONTROL0_FEEDBACK                                           0x4b6d
+#define mmDIG2_TMDS_CONTROL0_FEEDBACK                                           0x4c6d
+#define mmDIG3_TMDS_CONTROL0_FEEDBACK                                           0x4d6d
+#define mmDIG4_TMDS_CONTROL0_FEEDBACK                                           0x4e6d
+#define mmDIG5_TMDS_CONTROL0_FEEDBACK                                           0x4f6d
+#define mmDIG6_TMDS_CONTROL0_FEEDBACK                                           0x546d
+#define mmDIG7_TMDS_CONTROL0_FEEDBACK                                           0x566d
+#define mmDIG8_TMDS_CONTROL0_FEEDBACK                                           0x576d
+#define mmTMDS_STEREOSYNC_CTL_SEL                                               0x4a6e
+#define mmDIG0_TMDS_STEREOSYNC_CTL_SEL                                          0x4a6e
+#define mmDIG1_TMDS_STEREOSYNC_CTL_SEL                                          0x4b6e
+#define mmDIG2_TMDS_STEREOSYNC_CTL_SEL                                          0x4c6e
+#define mmDIG3_TMDS_STEREOSYNC_CTL_SEL                                          0x4d6e
+#define mmDIG4_TMDS_STEREOSYNC_CTL_SEL                                          0x4e6e
+#define mmDIG5_TMDS_STEREOSYNC_CTL_SEL                                          0x4f6e
+#define mmDIG6_TMDS_STEREOSYNC_CTL_SEL                                          0x546e
+#define mmDIG7_TMDS_STEREOSYNC_CTL_SEL                                          0x566e
+#define mmDIG8_TMDS_STEREOSYNC_CTL_SEL                                          0x576e
+#define mmTMDS_SYNC_CHAR_PATTERN_0_1                                            0x4a6f
+#define mmDIG0_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x4a6f
+#define mmDIG1_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x4b6f
+#define mmDIG2_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x4c6f
+#define mmDIG3_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x4d6f
+#define mmDIG4_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x4e6f
+#define mmDIG5_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x4f6f
+#define mmDIG6_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x546f
+#define mmDIG7_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x566f
+#define mmDIG8_TMDS_SYNC_CHAR_PATTERN_0_1                                       0x576f
+#define mmTMDS_SYNC_CHAR_PATTERN_2_3                                            0x4a70
+#define mmDIG0_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x4a70
+#define mmDIG1_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x4b70
+#define mmDIG2_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x4c70
+#define mmDIG3_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x4d70
+#define mmDIG4_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x4e70
+#define mmDIG5_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x4f70
+#define mmDIG6_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x5470
+#define mmDIG7_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x5670
+#define mmDIG8_TMDS_SYNC_CHAR_PATTERN_2_3                                       0x5770
+#define mmTMDS_DEBUG                                                            0x4a71
+#define mmDIG0_TMDS_DEBUG                                                       0x4a71
+#define mmDIG1_TMDS_DEBUG                                                       0x4b71
+#define mmDIG2_TMDS_DEBUG                                                       0x4c71
+#define mmDIG3_TMDS_DEBUG                                                       0x4d71
+#define mmDIG4_TMDS_DEBUG                                                       0x4e71
+#define mmDIG5_TMDS_DEBUG                                                       0x4f71
+#define mmDIG6_TMDS_DEBUG                                                       0x5471
+#define mmDIG7_TMDS_DEBUG                                                       0x5671
+#define mmDIG8_TMDS_DEBUG                                                       0x5771
+#define mmTMDS_CTL_BITS                                                         0x4a72
+#define mmDIG0_TMDS_CTL_BITS                                                    0x4a72
+#define mmDIG1_TMDS_CTL_BITS                                                    0x4b72
+#define mmDIG2_TMDS_CTL_BITS                                                    0x4c72
+#define mmDIG3_TMDS_CTL_BITS                                                    0x4d72
+#define mmDIG4_TMDS_CTL_BITS                                                    0x4e72
+#define mmDIG5_TMDS_CTL_BITS                                                    0x4f72
+#define mmDIG6_TMDS_CTL_BITS                                                    0x5472
+#define mmDIG7_TMDS_CTL_BITS                                                    0x5672
+#define mmDIG8_TMDS_CTL_BITS                                                    0x5772
+#define mmTMDS_DCBALANCER_CONTROL                                               0x4a73
+#define mmDIG0_TMDS_DCBALANCER_CONTROL                                          0x4a73
+#define mmDIG1_TMDS_DCBALANCER_CONTROL                                          0x4b73
+#define mmDIG2_TMDS_DCBALANCER_CONTROL                                          0x4c73
+#define mmDIG3_TMDS_DCBALANCER_CONTROL                                          0x4d73
+#define mmDIG4_TMDS_DCBALANCER_CONTROL                                          0x4e73
+#define mmDIG5_TMDS_DCBALANCER_CONTROL                                          0x4f73
+#define mmDIG6_TMDS_DCBALANCER_CONTROL                                          0x5473
+#define mmDIG7_TMDS_DCBALANCER_CONTROL                                          0x5673
+#define mmDIG8_TMDS_DCBALANCER_CONTROL                                          0x5773
+#define mmTMDS_CTL0_1_GEN_CNTL                                                  0x4a75
+#define mmDIG0_TMDS_CTL0_1_GEN_CNTL                                             0x4a75
+#define mmDIG1_TMDS_CTL0_1_GEN_CNTL                                             0x4b75
+#define mmDIG2_TMDS_CTL0_1_GEN_CNTL                                             0x4c75
+#define mmDIG3_TMDS_CTL0_1_GEN_CNTL                                             0x4d75
+#define mmDIG4_TMDS_CTL0_1_GEN_CNTL                                             0x4e75
+#define mmDIG5_TMDS_CTL0_1_GEN_CNTL                                             0x4f75
+#define mmDIG6_TMDS_CTL0_1_GEN_CNTL                                             0x5475
+#define mmDIG7_TMDS_CTL0_1_GEN_CNTL                                             0x5675
+#define mmDIG8_TMDS_CTL0_1_GEN_CNTL                                             0x5775
+#define mmTMDS_CTL2_3_GEN_CNTL                                                  0x4a76
+#define mmDIG0_TMDS_CTL2_3_GEN_CNTL                                             0x4a76
+#define mmDIG1_TMDS_CTL2_3_GEN_CNTL                                             0x4b76
+#define mmDIG2_TMDS_CTL2_3_GEN_CNTL                                             0x4c76
+#define mmDIG3_TMDS_CTL2_3_GEN_CNTL                                             0x4d76
+#define mmDIG4_TMDS_CTL2_3_GEN_CNTL                                             0x4e76
+#define mmDIG5_TMDS_CTL2_3_GEN_CNTL                                             0x4f76
+#define mmDIG6_TMDS_CTL2_3_GEN_CNTL                                             0x5476
+#define mmDIG7_TMDS_CTL2_3_GEN_CNTL                                             0x5676
+#define mmDIG8_TMDS_CTL2_3_GEN_CNTL                                             0x5776
+#define mmDIG_VERSION                                                           0x4a78
+#define mmDIG0_DIG_VERSION                                                      0x4a78
+#define mmDIG1_DIG_VERSION                                                      0x4b78
+#define mmDIG2_DIG_VERSION                                                      0x4c78
+#define mmDIG3_DIG_VERSION                                                      0x4d78
+#define mmDIG4_DIG_VERSION                                                      0x4e78
+#define mmDIG5_DIG_VERSION                                                      0x4f78
+#define mmDIG6_DIG_VERSION                                                      0x5478
+#define mmDIG7_DIG_VERSION                                                      0x5678
+#define mmDIG8_DIG_VERSION                                                      0x577

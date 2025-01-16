@@ -1,132 +1,76 @@
+E_LEVELS == 4
+#define PGDIR_SHIFT		(PUD_SHIFT + (PTRS_PER_PTD_SHIFT))
+#else
+#define PGDIR_SHIFT		(PMD_SHIFT + (PTRS_PER_PTD_SHIFT))
+#endif
+#define PGDIR_SIZE		(__IA64_UL(1) << PGDIR_SHIFT)
+#define PGDIR_MASK		(~(PGDIR_SIZE-1))
+#define PTRS_PER_PGD_SHIFT	PTRS_PER_PTD_SHIFT
+#define PTRS_PER_PGD		(1UL << PTRS_PER_PGD_SHIFT)
+#define USER_PTRS_PER_PGD	(5*PTRS_PER_PGD/8)	/* regions 0-4 are user regions */
+#define FIRST_USER_ADDRESS	0UL
+
 /*
- * debugfs ops for the L1 cache
- *
- *  Copyright (C) 2006  Paul Mundt
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ * All the normal masks have the "page accessed" bits on, as any time
+ * they are used, the page is accessed. They are cleared only by the
+ * page-out routines.
  */
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
-#include <asm/processor.h>
-#include <asm/uaccess.h>
-#include <asm/cache.h>
-#include <asm/io.h>
+#define PAGE_NONE	__pgprot(_PAGE_PROTNONE | _PAGE_A)
+#define PAGE_SHARED	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_RW)
+#define PAGE_READONLY	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_R)
+#define PAGE_COPY	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_R)
+#define PAGE_COPY_EXEC	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_RX)
+#define PAGE_GATE	__pgprot(__ACCESS_BITS | _PAGE_PL_0 | _PAGE_AR_X_RX)
+#define PAGE_KERNEL	__pgprot(__DIRTY_BITS  | _PAGE_PL_0 | _PAGE_AR_RWX)
+#define PAGE_KERNELRX	__pgprot(__ACCESS_BITS | _PAGE_PL_0 | _PAGE_AR_RX)
+#define PAGE_KERNEL_UC	__pgprot(__DIRTY_BITS  | _PAGE_PL_0 | _PAGE_AR_RWX | \
+				 _PAGE_MA_UC)
 
-enum cache_type {
-	CACHE_TYPE_ICACHE,
-	CACHE_TYPE_DCACHE,
-	CACHE_TYPE_UNIFIED,
-};
+# ifndef __ASSEMBLY__
 
-static int cache_seq_show(struct seq_file *file, void *iter)
-{
-	unsigned int cache_type = (unsigned int)file->private;
-	struct cache_info *cache;
-	unsigned int waysize, way;
-	unsigned long ccr;
-	unsigned long addrstart = 0;
+#include <linux/sched.h>	/* for mm_struct */
+#include <linux/bitops.h>
+#include <asm/cacheflush.h>
+#include <asm/mmu_context.h>
 
-	/*
-	 * Go uncached immediately so we don't skew the results any
-	 * more than we already are..
-	 */
-	jump_to_uncached();
+/*
+ * Next come the mappings that determine how mmap() protection bits
+ * (PROT_EXEC, PROT_READ, PROT_WRITE, PROT_NONE) get implemented.  The
+ * _P version gets used for a private shared memory segment, the _S
+ * version gets used for a shared memory segment with MAP_SHARED on.
+ * In a private shared memory segment, we do a copy-on-write if a task
+ * attempts to write to the page.
+ */
+	/* xwr */
+#define __P000	PAGE_NONE
+#define __P001	PAGE_READONLY
+#define __P010	PAGE_READONLY	/* write to priv pg -> copy & make writable */
+#define __P011	PAGE_READONLY	/* ditto */
+#define __P100	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_X_RX)
+#define __P101	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_RX)
+#define __P110	PAGE_COPY_EXEC
+#define __P111	PAGE_COPY_EXEC
 
-	ccr = __raw_readl(SH_CCR);
-	if ((ccr & CCR_CACHE_ENABLE) == 0) {
-		back_to_cached();
+#define __S000	PAGE_NONE
+#define __S001	PAGE_READONLY
+#define __S010	PAGE_SHARED	/* we don't have (and don't need) write-only */
+#define __S011	PAGE_SHARED
+#define __S100	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_X_RX)
+#define __S101	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_RX)
+#define __S110	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_RWX)
+#define __S111	__pgprot(__ACCESS_BITS | _PAGE_PL_3 | _PAGE_AR_RWX)
 
-		seq_printf(file, "disabled\n");
-		return 0;
-	}
+#define pgd_ERROR(e)	printk("%s:%d: bad pgd %016lx.\n", __FILE__, __LINE__, pgd_val(e))
+#if CONFIG_PGTABLE_LEVELS == 4
+#define pud_ERROR(e)	printk("%s:%d: bad pud %016lx.\n", __FILE__, __LINE__, pud_val(e))
+#endif
+#define pmd_ERROR(e)	printk("%s:%d: bad pmd %016lx.\n", __FILE__, __LINE__, pmd_val(e))
+#define pte_ERROR(e)	printk("%s:%d: bad pte %016lx.\n", __FILE__, __LINE__, pte_val(e))
 
-	if (cache_type == CACHE_TYPE_DCACHE) {
-		addrstart = CACHE_OC_ADDRESS_ARRAY;
-		cache = &current_cpu_data.dcache;
-	} else {
-		addrstart = CACHE_IC_ADDRESS_ARRAY;
-		cache = &current_cpu_data.icache;
-	}
 
-	waysize = cache->sets;
+/*
+ * Some definitions to translate between mem_map, PTEs, and page addresses:
+ */
 
-	/*
-	 * If the OC is already in RAM mode, we only have
-	 * half of the entries to consider..
-	 */
-	if ((ccr & CCR_CACHE_ORA) && cache_type == CACHE_TYPE_DCACHE)
-		waysize >>= 1;
 
-	waysize <<= cache->entry_shift;
-
-	for (way = 0; way < cache->ways; way++) {
-		unsigned long addr;
-		unsigned int line;
-
-		seq_printf(file, "-----------------------------------------\n");
-		seq_printf(file, "Way %d\n", way);
-		seq_printf(file, "-----------------------------------------\n");
-
-		for (addr = addrstart, line = 0;
-		     addr < addrstart + waysize;
-		     addr += cache->linesz, line++) {
-			unsigned long data = __raw_readl(addr);
-
-			/* Check the V bit, ignore invalid cachelines */
-			if ((data & 1) == 0)
-				continue;
-
-			/* U: Dirty, cache tag is 10 bits up */
-			seq_printf(file, "%3d: %c 0x%lx\n",
-				   line, data & 2 ? 'U' : ' ',
-				   data & 0x1ffffc00);
-		}
-
-		addrstart += cache->way_incr;
-	}
-
-	back_to_cached();
-
-	return 0;
-}
-
-static int cache_debugfs_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, cache_seq_show, inode->i_private);
-}
-
-static const struct file_operations cache_debugfs_fops = {
-	.owner		= THIS_MODULE,
-	.open		= cache_debugfs_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int __init cache_debugfs_init(void)
-{
-	struct dentry *dcache_dentry, *icache_dentry;
-
-	dcache_dentry = debugfs_create_file("dcache", S_IRUSR, arch_debugfs_dir,
-					    (unsigned int *)CACHE_TYPE_DCACHE,
-					    &cache_debugfs_fops);
-	if (!dcache_dentry)
-		return -ENOMEM;
-
-	icache_dentry = debugfs_create_file("icache", S_IRUSR, arch_debugfs_dir,
-					    (unsigned int *)CACHE_TYPE_ICACHE,
-					    &cache_debugfs_fops);
-	if (!icache_dentry) {
-		debugfs_remove(dcache_dentry);
-		return -ENOMEM;
-	}
-
-	return 0;
-}
-module_init(cache_debugfs_init);
-
-MODULE_LICENSE("GPL v2");
+/* Quick test to s

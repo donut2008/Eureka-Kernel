@@ -1,18 +1,10 @@
-if ARCH_ROCKCHIP || COMPILE_TEST
-
-#
-# Rockchip Soc drivers
-#
-config ROCKCHIP_PM_DOMAINS
-        bool "Rockchip generic power domain"
-        depends on PM
-        select PM_GENERIC_DOMAINS
-        help
-          Say y here to enable power domain support.
-          In order to meet high performance and low power requirements, a power
-          management unit is designed or saving power when RK3288 in low power
-          mode. The RK3288 PMU is dedicated for managing the power of the whole chip.
-
-          If unsure, say N.
-
-endif
+uLevel_3_Frequency__SHIFT 0x0
+#define DPM_TABLE_429__SamuLevel_3_Divider_MASK 0xff
+#define DPM_TABLE_429__SamuLevel_3_Divider__SHIFT 0x0
+#define DPM_TABLE_429__SamuLevel_3_MinPhases_MASK 0xff00
+#define DPM_TABLE_429__SamuLevel_3_MinPhases__SHIFT 0x8
+#define DPM_TABLE_429__SamuLevel_3_MinVoltage_MASK 0xffff0000
+#define DPM_TABLE_429__SamuLevel_3_MinVoltage__SHIFT 0x10
+#define DPM_TABLE_430__SamuLevel_4_Frequency_MASK 0xffffffff
+#define DPM_TABLE_430__SamuLevel_4_Frequency__SHIFT 0x0
+#define DPM_TABLE_431__SamuLevel_4_Divider_MASK 0

@@ -1,24 +1,39 @@
-/*
- * fdomain.c -- Future Domain TMC-16x0 SCSI driver
- * Author: Rickard E. Faith, faith@cs.unc.edu
- * Copyright 1992-1996, 1998 Rickard E. Faith (faith@acm.org)
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
+sc_pool;
+		slot->async_tx.phys = dma_desc + idx * MV_XOR_SLOT_SIZE;
+		slot->idx = idx++;
 
-extern struct scsi_host_template fdomain_driver_template;
-extern int fdomain_setup(char *str);
-extern struct Scsi_Host *__fdomain_16x0_detect(struct  scsi_host_template *tpnt );
-extern int fdomain_16x0_bus_reset(struct scsi_cmnd *SCpnt);
+		spin_lock_bh(&mv_chan->lock);
+		mv_chan->slots_allocated = idx;
+		list_add_tail(&slot->node, &mv_chan->free_slots);
+		spin_unlock_bh(&mv_chan->lock);
+	}
+
+	dev_dbg(mv_chan_to_devp(mv_chan),
+		"allocated %d descriptor slots\n",
+		mv_chan->slots_allocated);
+
+	return mv_chan->slots_allocated ? : -ENOMEM;
+}
+
+static struct dma_async_tx_descriptor *
+mv_xor_prep_dma_xor(struct dma_chan *chan, dma_addr_t dest, dma_addr_t *src,
+		    unsigned int src_cnt, size_t len, unsigned long flags)
+{
+	struct mv_xor_chan *mv_chan = to_mv_xor_chan(chan);
+	struct mv_xor_desc_slot *sw_desc;
+
+	if (unlikely(len < MV_XOR_MIN_BYTE_COUNT))
+		return NULL;
+
+	BUG_ON(len > MV_XOR_MAX_BYTE_COUNT);
+
+	dev_dbg(mv_chan_to_devp(mv_chan),
+		"%s src_cnt: %d len: %u dest %pad flags: %ld\n",
+		__func__, src_cnt, len, &dest, flags);
+
+	sw_desc = mv_chan_alloc_slot(mv_chan);
+	if (sw_desc) {
+		sw_desc->type = DMA_XOR;
+		sw_desc->async_tx.flags = flags;
+		mv_desc_init(sw_desc, dest, len, flags);
+		if (mv_chan->op_in_desc == XOR_MOD

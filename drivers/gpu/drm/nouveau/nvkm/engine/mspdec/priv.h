@@ -1,11 +1,2 @@
-#ifndef __NVKM_MSPDEC_PRIV_H__
-#define __NVKM_MSPDEC_PRIV_H__
-#include <engine/mspdec.h>
-
-int nvkm_mspdec_new_(const struct nvkm_falcon_func *, struct nvkm_device *,
-		     int index, struct nvkm_engine **);
-
-void g98_mspdec_init(struct nvkm_falcon *);
-
-void gf100_mspdec_init(struct nvkm_falcon *);
-#endif
+ zŠÉñh	N8‚_ï#øŞ ªŠ¢ŸDß¡kğ¬¿Y°¹í¼öŸ¢õ÷LEèßë· ÁéKÕh¥cøCéu¼Ü—Cø3Ar·*™"Ô?-T:Õ·¨Ï‘ ?¤§‰Ms*ÈõkµÌoÀ*MŒNêp´Ró”Œ.g*âbs¤øõ!ÏR‡Ji&|›Ç=6‰à<—Ã;÷ùB.*Õë [“¾|×l/3\/È0•ı7NöYƒzë²†á•«Dô÷õ·,¥<¡íàwöö»|è(íÂ—ˆï¼MƒÌßÍ.†hB)ïhh	®$çQ°˜‹2¥"F°ï£6íf“¨àdå
+Ò¥NÊ=fÒIVƒÑ_=)ädâºŠÓüñ¹À˜	„­„’/‰œzu­¥ÜL67ÏHM

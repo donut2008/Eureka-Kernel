@@ -1,9 +1,3 @@
-config ISCSI_TARGET
-	tristate "Linux-iSCSI.org iSCSI Target Mode Stack"
-	depends on NET
-	select CRYPTO
-	select CRYPTO_CRC32C
-	select CRYPTO_CRC32C_INTEL if X86
-	help
-	Say M here to enable the ConfigFS enabled Linux-iSCSI.org iSCSI
-	Target Mode Stack.
+efine mmDCIO_UNIPHY5_UNIPHY_MACRO_CNTL_RESERVED5                              0x4965
+#define mmDCIO_UNIPHY6_UNIPHY_MACRO_CNTL_RESERVED5                              0x4985
+#define mmDCIO_UNIPHY7_UNIPHY_MACRO_CNTL_RESERVED5                             

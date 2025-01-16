@@ -1,473 +1,304 @@
+qib_devdata *dd)
+{
+	dd->upd_pio_shadow = 1;
+
+	/* not atomic, but if we lose a stat count in a while, that's OK */
+	qib_stats.sps_nopiobufs++;
+}
+
 /*
- *  Nano River Technologies viperboard i2c master driver
+ * Common code for normal driver send buffer allocation, and reserved
+ * allocation.
  *
- *  (C) 2012 by Lemonage GmbH
- *  Author: Lars Poeschel <poeschel@lemonage.de>
- *  All rights reserved.
- *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the	License, or (at your
- *  option) any later version.
- *
+ * Do appropriate marking as busy, etc.
+ * Returns buffer pointer if one is found, otherwise NULL.
  */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/types.h>
-#include <linux/mutex.h>
-#include <linux/platform_device.h>
-
-#include <linux/usb.h>
-#include <linux/i2c.h>
-
-#include <linux/mfd/viperboard.h>
-
-struct vprbrd_i2c {
-	struct i2c_adapter i2c;
-	u8 bus_freq_param;
-};
-
-/* i2c bus frequency module parameter */
-static u8 i2c_bus_param;
-static unsigned int i2c_bus_freq = 100;
-module_param(i2c_bus_freq, int, 0);
-MODULE_PARM_DESC(i2c_bus_freq,
-	"i2c bus frequency in khz (default is 100) valid values: 10, 100, 200, 400, 1000, 3000, 6000");
-
-static int vprbrd_i2c_status(struct i2c_adapter *i2c,
-	struct vprbrd_i2c_status *status, bool prev_error)
+u32 __iomem *qib_getsendbuf_range(struct qib_devdata *dd, u32 *pbufnum,
+				  u32 first, u32 last)
 {
-	u16 bytes_xfer;
-	int ret;
-	struct vprbrd *vb = (struct vprbrd *)i2c->algo_data;
+	unsigned i, j, updated = 0;
+	unsigned nbufs;
+	unsigned long flags;
+	unsigned long *shadow = dd->pioavailshadow;
+	u32 __iomem *buf;
 
-	/* check for protocol error */
-	bytes_xfer = sizeof(struct vprbrd_i2c_status);
+	if (!(dd->flags & QIB_PRESENT))
+		return NULL;
 
-	ret = usb_control_msg(vb->usb_dev, usb_rcvctrlpipe(vb->usb_dev, 0),
-		VPRBRD_USB_REQUEST_I2C, VPRBRD_USB_TYPE_IN, 0x0000, 0x0000,
-		status, bytes_xfer, VPRBRD_USB_TIMEOUT_MS);
-
-	if (ret != bytes_xfer)
-		prev_error = true;
-
-	if (prev_error) {
-		dev_err(&i2c->dev, "failure in usb communication\n");
-		return -EREMOTEIO;
+	nbufs = last - first + 1; /* number in range to check */
+	if (dd->upd_pio_shadow) {
+update_shadow:
+		/*
+		 * Minor optimization.  If we had no buffers on last call,
+		 * start out by doing the update; continue and do scan even
+		 * if no buffers were updated, to be paranoid.
+		 */
+		update_send_bufs(dd);
+		updated++;
 	}
-
-	dev_dbg(&i2c->dev, "  status = %d\n", status->status);
-	if (status->status != 0x00) {
-		dev_err(&i2c->dev, "failure: i2c protocol error\n");
-		return -EPROTO;
+	i = first;
+	/*
+	 * While test_and_set_bit() is atomic, we do that and then the
+	 * change_bit(), and the pair is not.  See if this is the cause
+	 * of the remaining armlaunch errors.
+	 */
+	spin_lock_irqsave(&dd->pioavail_lock, flags);
+	if (dd->last_pio >= first && dd->last_pio <= last)
+		i = dd->last_pio + 1;
+	if (!first)
+		/* adjust to min possible  */
+		nbufs = last - dd->min_kernel_pio + 1;
+	for (j = 0; j < nbufs; j++, i++) {
+		if (i > last)
+			i = !first ? dd->min_kernel_pio : first;
+		if (__test_and_set_bit((2 * i) + 1, shadow))
+			continue;
+		/* flip generation bit */
+		__change_bit(2 * i, shadow);
+		/* remember that the buffer can be written to now */
+		__set_bit(i, dd->pio_writing);
+		if (!first && first != last) /* first == last on VL15, avoid */
+			dd->last_pio = i;
+		break;
 	}
-	return 0;
-}
+	spin_unlock_irqrestore(&dd->pioavail_lock, flags);
 
-static int vprbrd_i2c_receive(struct usb_device *usb_dev,
-	struct vprbrd_i2c_read_msg *rmsg, int bytes_xfer)
-{
-	int ret, bytes_actual;
-	int error = 0;
-
-	/* send the read request */
-	ret = usb_bulk_msg(usb_dev,
-		usb_sndbulkpipe(usb_dev, VPRBRD_EP_OUT), rmsg,
-		sizeof(struct vprbrd_i2c_read_hdr), &bytes_actual,
-		VPRBRD_USB_TIMEOUT_MS);
-
-	if ((ret < 0)
-		|| (bytes_actual != sizeof(struct vprbrd_i2c_read_hdr))) {
-		dev_err(&usb_dev->dev, "failure transmitting usb\n");
-		error = -EREMOTEIO;
-	}
-
-	/* read the actual data */
-	ret = usb_bulk_msg(usb_dev,
-		usb_rcvbulkpipe(usb_dev, VPRBRD_EP_IN), rmsg,
-		bytes_xfer, &bytes_actual, VPRBRD_USB_TIMEOUT_MS);
-
-	if ((ret < 0) || (bytes_xfer != bytes_actual)) {
-		dev_err(&usb_dev->dev, "failure receiving usb\n");
-		error = -EREMOTEIO;
-	}
-	return error;
-}
-
-static int vprbrd_i2c_addr(struct usb_device *usb_dev,
-	struct vprbrd_i2c_addr_msg *amsg)
-{
-	int ret, bytes_actual;
-
-	ret = usb_bulk_msg(usb_dev,
-		usb_sndbulkpipe(usb_dev, VPRBRD_EP_OUT), amsg,
-		sizeof(struct vprbrd_i2c_addr_msg), &bytes_actual,
-		VPRBRD_USB_TIMEOUT_MS);
-
-	if ((ret < 0) ||
-			(sizeof(struct vprbrd_i2c_addr_msg) != bytes_actual)) {
-		dev_err(&usb_dev->dev, "failure transmitting usb\n");
-		return -EREMOTEIO;
-	}
-	return 0;
-}
-
-static int vprbrd_i2c_read(struct vprbrd *vb, struct i2c_msg *msg)
-{
-	int ret;
-	u16 remain_len, len1, len2, start = 0x0000;
-	struct vprbrd_i2c_read_msg *rmsg =
-		(struct vprbrd_i2c_read_msg *)vb->buf;
-
-	remain_len = msg->len;
-	rmsg->header.cmd = VPRBRD_I2C_CMD_READ;
-	while (remain_len > 0) {
-		rmsg->header.addr = cpu_to_le16(start + 0x4000);
-		if (remain_len <= 255) {
-			len1 = remain_len;
-			len2 = 0x00;
-			rmsg->header.len0 = remain_len;
-			rmsg->header.len1 = 0x00;
-			rmsg->header.len2 = 0x00;
-			rmsg->header.len3 = 0x00;
-			rmsg->header.len4 = 0x00;
-			rmsg->header.len5 = 0x00;
-			remain_len = 0;
-		} else if (remain_len <= 510) {
-			len1 = remain_len;
-			len2 = 0x00;
-			rmsg->header.len0 = remain_len - 255;
-			rmsg->header.len1 = 0xff;
-			rmsg->header.len2 = 0x00;
-			rmsg->header.len3 = 0x00;
-			rmsg->header.len4 = 0x00;
-			rmsg->header.len5 = 0x00;
-			remain_len = 0;
-		} else if (remain_len <= 512) {
-			len1 = remain_len;
-			len2 = 0x00;
-			rmsg->header.len0 = remain_len - 510;
-			rmsg->header.len1 = 0xff;
-			rmsg->header.len2 = 0xff;
-			rmsg->header.len3 = 0x00;
-			rmsg->header.len4 = 0x00;
-			rmsg->header.len5 = 0x00;
-			remain_len = 0;
-		} else if (remain_len <= 767) {
-			len1 = 512;
-			len2 = remain_len - 512;
-			rmsg->header.len0 = 0x02;
-			rmsg->header.len1 = 0xff;
-			rmsg->header.len2 = 0xff;
-			rmsg->header.len3 = remain_len - 512;
-			rmsg->header.len4 = 0x00;
-			rmsg->header.len5 = 0x00;
-			remain_len = 0;
-		} else if (remain_len <= 1022) {
-			len1 = 512;
-			len2 = remain_len - 512;
-			rmsg->header.len0 = 0x02;
-			rmsg->header.len1 = 0xff;
-			rmsg->header.len2 = 0xff;
-			rmsg->header.len3 = remain_len - 767;
-			rmsg->header.len4 = 0xff;
-			rmsg->header.len5 = 0x00;
-			remain_len = 0;
-		} else if (remain_len <= 1024) {
-			len1 = 512;
-			len2 = remain_len - 512;
-			rmsg->header.len0 = 0x02;
-			rmsg->header.len1 = 0xff;
-			rmsg->header.len2 = 0xff;
-			rmsg->header.len3 = remain_len - 1022;
-			rmsg->header.len4 = 0xff;
-			rmsg->header.len5 = 0xff;
-			remain_len = 0;
-		} else {
-			len1 = 512;
-			len2 = 512;
-			rmsg->header.len0 = 0x02;
-			rmsg->header.len1 = 0xff;
-			rmsg->header.len2 = 0xff;
-			rmsg->header.len3 = 0x02;
-			rmsg->header.len4 = 0xff;
-			rmsg->header.len5 = 0xff;
-			remain_len -= 1024;
-			start += 1024;
-		}
-		rmsg->header.tf1 = cpu_to_le16(len1);
-		rmsg->header.tf2 = cpu_to_le16(len2);
-
-		/* first read transfer */
-		ret = vprbrd_i2c_receive(vb->usb_dev, rmsg, len1);
-		if (ret < 0)
-			return ret;
-		/* copy the received data */
-		memcpy(msg->buf + start, rmsg, len1);
-
-		/* second read transfer if neccessary */
-		if (len2 > 0) {
-			ret = vprbrd_i2c_receive(vb->usb_dev, rmsg, len2);
-			if (ret < 0)
-				return ret;
-			/* copy the received data */
-			memcpy(msg->buf + start + 512, rmsg, len2);
-		}
-	}
-	return 0;
-}
-
-static int vprbrd_i2c_write(struct vprbrd *vb, struct i2c_msg *msg)
-{
-	int ret, bytes_actual;
-	u16 remain_len, bytes_xfer,
-		start = 0x0000;
-	struct vprbrd_i2c_write_msg *wmsg =
-		(struct vprbrd_i2c_write_msg *)vb->buf;
-
-	remain_len = msg->len;
-	wmsg->header.cmd = VPRBRD_I2C_CMD_WRITE;
-	wmsg->header.last = 0x00;
-	wmsg->header.chan = 0x00;
-	wmsg->header.spi = 0x0000;
-	while (remain_len > 0) {
-		wmsg->header.addr = cpu_to_le16(start + 0x4000);
-		if (remain_len > 503) {
-			wmsg->header.len1 = 0xff;
-			wmsg->header.len2 = 0xf8;
-			remain_len -= 503;
-			bytes_xfer = 503 + sizeof(struct vprbrd_i2c_write_hdr);
-			start += 503;
-		} else if (remain_len > 255) {
-			wmsg->header.len1 = 0xff;
-			wmsg->header.len2 = (remain_len - 255);
-			bytes_xfer = remain_len +
-				sizeof(struct vprbrd_i2c_write_hdr);
-			remain_len = 0;
-		} else {
-			wmsg->header.len1 = remain_len;
-			wmsg->header.len2 = 0x00;
-			bytes_xfer = remain_len +
-				sizeof(struct vprbrd_i2c_write_hdr);
-			remain_len = 0;
-		}
-		memcpy(wmsg->data, msg->buf + start,
-			bytes_xfer - sizeof(struct vprbrd_i2c_write_hdr));
-
-		ret = usb_bulk_msg(vb->usb_dev,
-			usb_sndbulkpipe(vb->usb_dev,
-			VPRBRD_EP_OUT), wmsg,
-			bytes_xfer, &bytes_actual, VPRBRD_USB_TIMEOUT_MS);
-		if ((ret < 0) || (bytes_xfer != bytes_actual))
-			return -EREMOTEIO;
-	}
-	return 0;
-}
-
-static int vprbrd_i2c_xfer(struct i2c_adapter *i2c, struct i2c_msg *msgs,
-		int num)
-{
-	struct i2c_msg *pmsg;
-	int i, ret,
-		error = 0;
-	struct vprbrd *vb = (struct vprbrd *)i2c->algo_data;
-	struct vprbrd_i2c_addr_msg *amsg =
-		(struct vprbrd_i2c_addr_msg *)vb->buf;
-	struct vprbrd_i2c_status *smsg = (struct vprbrd_i2c_status *)vb->buf;
-
-	dev_dbg(&i2c->dev, "master xfer %d messages:\n", num);
-
-	for (i = 0 ; i < num ; i++) {
-		pmsg = &msgs[i];
-
-		dev_dbg(&i2c->dev,
-			"  %d: %s (flags %d) %d bytes to 0x%02x\n",
-			i, pmsg->flags & I2C_M_RD ? "read" : "write",
-			pmsg->flags, pmsg->len, pmsg->addr);
-
-		mutex_lock(&vb->lock);
-		/* directly send the message */
-		if (pmsg->flags & I2C_M_RD) {
-			/* read data */
-			amsg->cmd = VPRBRD_I2C_CMD_ADDR;
-			amsg->unknown2 = 0x00;
-			amsg->unknown3 = 0x00;
-			amsg->addr = pmsg->addr;
-			amsg->unknown1 = 0x01;
-			amsg->len = cpu_to_le16(pmsg->len);
-			/* send the addr and len, we're interested to board */
-			ret = vprbrd_i2c_addr(vb->usb_dev, amsg);
-			if (ret < 0)
-				error = ret;
-
-			ret = vprbrd_i2c_read(vb, pmsg);
-			if (ret < 0)
-				error = ret;
-
-			ret = vprbrd_i2c_status(i2c, smsg, error);
-			if (ret < 0)
-				error = ret;
-			/* in case of protocol error, return the error */
-			if (error < 0)
-				goto error;
-		} else {
-			/* write data */
-			ret = vprbrd_i2c_write(vb, pmsg);
-
-			amsg->cmd = VPRBRD_I2C_CMD_ADDR;
-			amsg->unknown2 = 0x00;
-			amsg->unknown3 = 0x00;
-			amsg->addr = pmsg->addr;
-			amsg->unknown1 = 0x00;
-			amsg->len = cpu_to_le16(pmsg->len);
-			/* send the addr, the data goes to to board */
-			ret = vprbrd_i2c_addr(vb->usb_dev, amsg);
-			if (ret < 0)
-				error = ret;
-
-			ret = vprbrd_i2c_status(i2c, smsg, error);
-			if (ret < 0)
-				error = ret;
-
-			if (error < 0)
-				goto error;
-		}
-		mutex_unlock(&vb->lock);
-	}
-	return 0;
-error:
-	mutex_unlock(&vb->lock);
-	return error;
-}
-
-static u32 vprbrd_i2c_func(struct i2c_adapter *i2c)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-/* This is the actual algorithm we define */
-static const struct i2c_algorithm vprbrd_algorithm = {
-	.master_xfer	= vprbrd_i2c_xfer,
-	.functionality	= vprbrd_i2c_func,
-};
-
-static struct i2c_adapter_quirks vprbrd_quirks = {
-	.max_read_len = 2048,
-	.max_write_len = 2048,
-};
-
-static int vprbrd_i2c_probe(struct platform_device *pdev)
-{
-	struct vprbrd *vb = dev_get_drvdata(pdev->dev.parent);
-	struct vprbrd_i2c *vb_i2c;
-	int ret;
-	int pipe;
-
-	vb_i2c = devm_kzalloc(&pdev->dev, sizeof(*vb_i2c), GFP_KERNEL);
-	if (vb_i2c == NULL)
-		return -ENOMEM;
-
-	/* setup i2c adapter description */
-	vb_i2c->i2c.owner = THIS_MODULE;
-	vb_i2c->i2c.class = I2C_CLASS_HWMON;
-	vb_i2c->i2c.algo = &vprbrd_algorithm;
-	vb_i2c->i2c.quirks = &vprbrd_quirks;
-	vb_i2c->i2c.algo_data = vb;
-	/* save the param in usb capabable memory */
-	vb_i2c->bus_freq_param = i2c_bus_param;
-
-	snprintf(vb_i2c->i2c.name, sizeof(vb_i2c->i2c.name),
-		 "viperboard at bus %03d device %03d",
-		 vb->usb_dev->bus->busnum, vb->usb_dev->devnum);
-
-	/* setting the bus frequency */
-	if ((i2c_bus_param <= VPRBRD_I2C_FREQ_10KHZ)
-		&& (i2c_bus_param >= VPRBRD_I2C_FREQ_6MHZ)) {
-		pipe = usb_sndctrlpipe(vb->usb_dev, 0);
-		ret = usb_control_msg(vb->usb_dev, pipe,
-			VPRBRD_USB_REQUEST_I2C_FREQ, VPRBRD_USB_TYPE_OUT,
-			0x0000, 0x0000, &vb_i2c->bus_freq_param, 1,
-			VPRBRD_USB_TIMEOUT_MS);
-		if (ret != 1) {
-			dev_err(&pdev->dev, "failure setting i2c_bus_freq to %d\n",
-				i2c_bus_freq);
-			return -EIO;
-		}
+	if (j == nbufs) {
+		if (!updated)
+			/*
+			 * First time through; shadow exhausted, but may be
+			 * buffers available, try an update and then rescan.
+			 */
+			goto update_shadow;
+		no_send_bufs(dd);
+		buf = NULL;
 	} else {
-		dev_err(&pdev->dev,
-			"invalid i2c_bus_freq setting:%d\n", i2c_bus_freq);
-		return -EIO;
+		if (i < dd->piobcnt2k)
+			buf = (u32 __iomem *)(dd->pio2kbase +
+				i * dd->palign);
+		else if (i < dd->piobcnt2k + dd->piobcnt4k || !dd->piovl15base)
+			buf = (u32 __iomem *)(dd->pio4kbase +
+				(i - dd->piobcnt2k) * dd->align4k);
+		else
+			buf = (u32 __iomem *)(dd->piovl15base +
+				(i - (dd->piobcnt2k + dd->piobcnt4k)) *
+				dd->align4k);
+		if (pbufnum)
+			*pbufnum = i;
+		dd->upd_pio_shadow = 0;
 	}
 
-	vb_i2c->i2c.dev.parent = &pdev->dev;
-
-	/* attach to i2c layer */
-	i2c_add_adapter(&vb_i2c->i2c);
-
-	platform_set_drvdata(pdev, vb_i2c);
-
-	return 0;
+	return buf;
 }
 
-static int vprbrd_i2c_remove(struct platform_device *pdev)
+/*
+ * Record that the caller is finished writing to the buffer so we don't
+ * disarm it while it is being written and disarm it now if needed.
+ */
+void qib_sendbuf_done(struct qib_devdata *dd, unsigned n)
 {
-	struct vprbrd_i2c *vb_i2c = platform_get_drvdata(pdev);
+	unsigned long flags;
 
-	i2c_del_adapter(&vb_i2c->i2c);
-
-	return 0;
+	spin_lock_irqsave(&dd->pioavail_lock, flags);
+	__clear_bit(n, dd->pio_writing);
+	if (__test_and_clear_bit(n, dd->pio_need_disarm))
+		dd->f_sendctrl(dd->pport, QIB_SENDCTRL_DISARM_BUF(n));
+	spin_unlock_irqrestore(&dd->pioavail_lock, flags);
 }
 
-static struct platform_driver vprbrd_i2c_driver = {
-	.driver.name	= "viperboard-i2c",
-	.driver.owner	= THIS_MODULE,
-	.probe		= vprbrd_i2c_probe,
-	.remove		= vprbrd_i2c_remove,
-};
-
-static int __init vprbrd_i2c_init(void)
+/**
+ * qib_chg_pioavailkernel - change which send buffers are available for kernel
+ * @dd: the qlogic_ib device
+ * @start: the starting send buffer number
+ * @len: the number of send buffers
+ * @avail: true if the buffers are available for kernel use, false otherwise
+ */
+void qib_chg_pioavailkernel(struct qib_devdata *dd, unsigned start,
+	unsigned len, u32 avail, struct qib_ctxtdata *rcd)
 {
-	switch (i2c_bus_freq) {
-	case 6000:
-		i2c_bus_param = VPRBRD_I2C_FREQ_6MHZ;
-		break;
-	case 3000:
-		i2c_bus_param = VPRBRD_I2C_FREQ_3MHZ;
-		break;
-	case 1000:
-		i2c_bus_param = VPRBRD_I2C_FREQ_1MHZ;
-		break;
-	case 400:
-		i2c_bus_param = VPRBRD_I2C_FREQ_400KHZ;
-		break;
-	case 200:
-		i2c_bus_param = VPRBRD_I2C_FREQ_200KHZ;
-		break;
-	case 100:
-		i2c_bus_param = VPRBRD_I2C_FREQ_100KHZ;
-		break;
-	case 10:
-		i2c_bus_param = VPRBRD_I2C_FREQ_10KHZ;
-		break;
-	default:
-		pr_warn("invalid i2c_bus_freq (%d)\n", i2c_bus_freq);
-		i2c_bus_param = VPRBRD_I2C_FREQ_100KHZ;
+	unsigned long flags;
+	unsigned end;
+	unsigned ostart = start;
+
+	/* There are two bits per send buffer (busy and generation) */
+	start *= 2;
+	end = start + len * 2;
+
+	spin_lock_irqsave(&dd->pioavail_lock, flags);
+	/* Set or clear the busy bit in the shadow. */
+	while (start < end) {
+		if (avail) {
+			unsigned long dma;
+			int i;
+
+			/*
+			 * The BUSY bit will never be set, because we disarm
+			 * the user buffers before we hand them back to the
+			 * kernel.  We do have to make sure the generation
+			 * bit is set correctly in shadow, since it could
+			 * have changed many times while allocated to user.
+			 * We can't use the bitmap functions on the full
+			 * dma array because it is always little-endian, so
+			 * we have to flip to host-order first.
+			 * BITS_PER_LONG is slightly wrong, since it's
+			 * always 64 bits per register in chip...
+			 * We only work on 64 bit kernels, so that's OK.
+			 */
+			i = start / BITS_PER_LONG;
+			__clear_bit(QLOGIC_IB_SENDPIOAVAIL_BUSY_SHIFT + start,
+				    dd->pioavailshadow);
+			dma = (unsigned long)
+				le64_to_cpu(dd->pioavailregs_dma[i]);
+			if (test_bit((QLOGIC_IB_SENDPIOAVAIL_CHECK_SHIFT +
+				      start) % BITS_PER_LONG, &dma))
+				__set_bit(QLOGIC_IB_SENDPIOAVAIL_CHECK_SHIFT +
+					  start, dd->pioavailshadow);
+			else
+				__clear_bit(QLOGIC_IB_SENDPIOAVAIL_CHECK_SHIFT
+					    + start, dd->pioavailshadow);
+			__set_bit(start, dd->pioavailkernel);
+			if ((start >> 1) < dd->min_kernel_pio)
+				dd->min_kernel_pio = start >> 1;
+		} else {
+			__set_bit(start + QLOGIC_IB_SENDPIOAVAIL_BUSY_SHIFT,
+				  dd->pioavailshadow);
+			__clear_bit(start, dd->pioavailkernel);
+			if ((start >> 1) > dd->min_kernel_pio)
+				dd->min_kernel_pio = start >> 1;
+		}
+		start += 2;
 	}
 
-	return platform_driver_register(&vprbrd_i2c_driver);
-}
-subsys_initcall(vprbrd_i2c_init);
+	if (dd->min_kernel_pio > 0 && dd->last_pio < dd->min_kernel_pio - 1)
+		dd->last_pio = dd->min_kernel_pio - 1;
+	spin_unlock_irqrestore(&dd->pioavail_lock, flags);
 
-static void __exit vprbrd_i2c_exit(void)
+	dd->f_txchk_change(dd, ostart, len, avail, rcd);
+}
+
+/*
+ * Flush all sends that might be in the ready to send state, as well as any
+ * that are in the process of being sent.  Used whenever we need to be
+ * sure the send side is idle.  Cleans up all buffer state by canceling
+ * all pio buffers, and issuing an abort, which cleans up anything in the
+ * launch fifo.  The cancel is superfluous on some chip versions, but
+ * it's safer to always do it.
+ * PIOAvail bits are updated by the chip as if a normal send had happened.
+ */
+void qib_cancel_sends(struct qib_pportdata *ppd)
 {
-	platform_driver_unregister(&vprbrd_i2c_driver);
-}
-module_exit(vprbrd_i2c_exit);
+	struct qib_devdata *dd = ppd->dd;
+	struct qib_ctxtdata *rcd;
+	unsigned long flags;
+	unsigned ctxt;
+	unsigned i;
+	unsigned last;
 
-MODULE_AUTHOR("Lars Poeschel <poeschel@lemonage.de>");
-MODULE_DESCRIPTION("I2C master driver for Nano River Techs Viperboard");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:viperboard-i2c");
+	/*
+	 * Tell PSM to disarm buffers again before trying to reuse them.
+	 * We need to be sure the rcd doesn't change out from under us
+	 * while we do so.  We hold the two locks sequentially.  We might
+	 * needlessly set some need_disarm bits as a result, if the
+	 * context is closed after we release the uctxt_lock, but that's
+	 * fairly benign, and safer than nesting the locks.
+	 */
+	for (ctxt = dd->first_user_ctxt; ctxt < dd->cfgctxts; ctxt++) {
+		spin_lock_irqsave(&dd->uctxt_lock, flags);
+		rcd = dd->rcd[ctxt];
+		if (rcd && rcd->ppd == ppd) {
+			last = rcd->pio_base + rcd->piocnt;
+			if (rcd->user_event_mask) {
+				/*
+				 * subctxt_cnt is 0 if not shared, so do base
+				 * separately, first, then remaining subctxt,
+				 * if any
+				 */
+				set_bit(_QIB_EVENT_DISARM_BUFS_BIT,
+					&rcd->user_event_mask[0]);
+				for (i = 1; i < rcd->subctxt_cnt; i++)
+					set_bit(_QIB_EVENT_DISARM_BUFS_BIT,
+						&rcd->user_event_mask[i]);
+			}
+			i = rcd->pio_base;
+			spin_unlock_irqrestore(&dd->uctxt_lock, flags);
+			spin_lock_irqsave(&dd->pioavail_lock, flags);
+			for (; i < last; i++)
+				__set_bit(i, dd->pio_need_disarm);
+			spin_unlock_irqrestore(&dd->pioavail_lock, flags);
+		} else
+			spin_unlock_irqrestore(&dd->uctxt_lock, flags);
+	}
+
+	if (!(dd->flags & QIB_HAS_SEND_DMA))
+		dd->f_sendctrl(ppd, QIB_SENDCTRL_DISARM_ALL |
+				    QIB_SENDCTRL_FLUSH);
+}
+
+/*
+ * Force an update of in-memory copy of the pioavail registers, when
+ * needed for any of a variety of reasons.
+ * If already off, this routine is a nop, on the assumption that the
+ * caller (or set of callers) will "do the right thing".
+ * This is a per-device operation, so just the first port.
+ */
+void qib_force_pio_avail_update(struct qib_devdata *dd)
+{
+	dd->f_sendctrl(dd->pport, QIB_SENDCTRL_AVAIL_BLIP);
+}
+
+void qib_hol_down(struct qib_pportdata *ppd)
+{
+	/*
+	 * Cancel sends when the link goes DOWN so that we aren't doing it
+	 * at INIT when we might be trying to send SMI packets.
+	 */
+	if (!(ppd->lflags & QIBL_IB_AUTONEG_INPROG))
+		qib_cancel_sends(ppd);
+}
+
+/*
+ * Link is at INIT.
+ * We start the HoL timer so we can detect stuck packets blocking SMP replies.
+ * Timer may already be running, so use mod_timer, not add_timer.
+ */
+void qib_hol_init(struct qib_pportdata *ppd)
+{
+	if (ppd->hol_state != QIB_HOL_INIT) {
+		ppd->hol_state = QIB_HOL_INIT;
+		mod_timer(&ppd->hol_timer,
+			  jiffies + msecs_to_jiffies(qib_hol_timeout_ms));
+	}
+}
+
+/*
+ * Link is up, continue any user processes, and ensure timer
+ * is a nop, if running.  Let timer keep running, if set; it
+ * will nop when it sees the link is up.
+ */
+void qib_hol_up(struct qib_pportdata *ppd)
+{
+	ppd->hol_state = QIB_HOL_UP;
+}
+
+/*
+ * This is only called via the timer.
+ */
+void qib_hol_event(unsigned long opaque)
+{
+	struct qib_pportdata *ppd = (struct qib_pportdata *)opaque;
+
+	/* If hardware error, etc, skip. */
+	if (!(ppd->dd->flags & QIB_INITTED))
+		return;
+
+	if (ppd->hol_state != QIB_HOL_UP) {
+		/*
+		 * Try to flush sends in case a stuck packet is blocking
+		 * SMP replies.
+		 */
+		qib_hol_down(ppd);
+		mod_timer(&ppd->hol_timer,
+			  jiffies + msecs_to_jiffies(qib_hol_timeout_ms));
+	}
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                

@@ -1,460 +1,413 @@
 /*
- * FAN53555 Fairchild Digitally Programmable TinyBuck Regulator Driver.
+ * (C) 2005, 2006 Linux Networx (http://lnxi.com)
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
  *
- * Supported Part Numbers:
- * FAN53555UC00X/01X/03X/04X/05X
- *
- * Copyright (c) 2012 Marvell Technology Ltd.
- * Yunfan Zhang <yfzhang@marvell.com>
- *
- * This package is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
+ * Written Doug Thompson <norsk5@xmission.com>
  *
  */
 #include <linux/module.h>
-#include <linux/param.h>
-#include <linux/err.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/of_device.h>
-#include <linux/i2c.h>
+#include <linux/edac.h>
 #include <linux/slab.h>
-#include <linux/regmap.h>
-#include <linux/regulator/fan53555.h>
+#include <linux/ctype.h>
 
-/* Voltage setting */
-#define FAN53555_VSEL0		0x00
-#define FAN53555_VSEL1		0x01
-/* Control register */
-#define FAN53555_CONTROL	0x02
-/* IC Type */
-#define FAN53555_ID1		0x03
-/* IC mask version */
-#define FAN53555_ID2		0x04
-/* Monitor register */
-#define FAN53555_MONITOR	0x05
+#include "edac_core.h"
+#include "edac_module.h"
 
-/* VSEL bit definitions */
-#define VSEL_BUCK_EN	(1 << 7)
-#define VSEL_MODE		(1 << 6)
-#define VSEL_NSEL_MASK	0x3F
-/* Chip ID and Verison */
-#define DIE_ID		0x0F	/* ID1 */
-#define DIE_REV		0x0F	/* ID2 */
-/* Control bit definitions */
-#define CTL_OUTPUT_DISCHG	(1 << 7)
-#define CTL_SLEW_MASK		(0x7 << 4)
-#define CTL_SLEW_SHIFT		4
-#define CTL_RESET			(1 << 2)
+#define EDAC_PCI_SYMLINK	"device"
 
-#define FAN53555_NVOLTAGES	64	/* Numbers of voltages */
+/* data variables exported via sysfs */
+static int check_pci_errors;		/* default NO check PCI parity */
+static int edac_pci_panic_on_pe;	/* default NO panic on PCI Parity */
+static int edac_pci_log_pe = 1;		/* log PCI parity errors */
+static int edac_pci_log_npe = 1;	/* log PCI non-parity error errors */
+static int edac_pci_poll_msec = 1000;	/* one second workq period */
 
-enum fan53555_vendor {
-	FAN53555_VENDOR_FAIRCHILD = 0,
-	FAN53555_VENDOR_SILERGY,
-};
+static atomic_t pci_parity_count = ATOMIC_INIT(0);
+static atomic_t pci_nonparity_count = ATOMIC_INIT(0);
 
-/* IC Type */
-enum {
-	FAN53555_CHIP_ID_00 = 0,
-	FAN53555_CHIP_ID_01,
-	FAN53555_CHIP_ID_02,
-	FAN53555_CHIP_ID_03,
-	FAN53555_CHIP_ID_04,
-	FAN53555_CHIP_ID_05,
-};
+static struct kobject *edac_pci_top_main_kobj;
+static atomic_t edac_pci_sysfs_refcount = ATOMIC_INIT(0);
 
-enum {
-	SILERGY_SYR82X = 8,
-};
-
-struct fan53555_device_info {
-	enum fan53555_vendor vendor;
-	struct regmap *regmap;
-	struct device *dev;
-	struct regulator_desc desc;
-	struct regulator_dev *rdev;
-	struct regulator_init_data *regulator;
-	/* IC Type and Rev */
-	int chip_id;
-	int chip_rev;
-	/* Voltage setting register */
-	unsigned int vol_reg;
-	unsigned int sleep_reg;
-	/* Voltage range and step(linear) */
-	unsigned int vsel_min;
-	unsigned int vsel_step;
-	/* Voltage slew rate limiting */
-	unsigned int slew_rate;
-	/* Sleep voltage cache */
-	unsigned int sleep_vol_cache;
-};
-
-static int fan53555_set_suspend_voltage(struct regulator_dev *rdev, int uV)
+/* getter functions for the data variables */
+int edac_pci_get_check_errors(void)
 {
-	struct fan53555_device_info *di = rdev_get_drvdata(rdev);
-	int ret;
+	return check_pci_errors;
+}
 
-	if (di->sleep_vol_cache == uV)
+static int edac_pci_get_log_pe(void)
+{
+	return edac_pci_log_pe;
+}
+
+static int edac_pci_get_log_npe(void)
+{
+	return edac_pci_log_npe;
+}
+
+static int edac_pci_get_panic_on_pe(void)
+{
+	return edac_pci_panic_on_pe;
+}
+
+int edac_pci_get_poll_msec(void)
+{
+	return edac_pci_poll_msec;
+}
+
+/**************************** EDAC PCI sysfs instance *******************/
+static ssize_t instance_pe_count_show(struct edac_pci_ctl_info *pci, char *data)
+{
+	return sprintf(data, "%u\n", atomic_read(&pci->counters.pe_count));
+}
+
+static ssize_t instance_npe_count_show(struct edac_pci_ctl_info *pci,
+				char *data)
+{
+	return sprintf(data, "%u\n", atomic_read(&pci->counters.npe_count));
+}
+
+#define to_instance(k) container_of(k, struct edac_pci_ctl_info, kobj)
+#define to_instance_attr(a) container_of(a, struct instance_attribute, attr)
+
+/* DEVICE instance kobject release() function */
+static void edac_pci_instance_release(struct kobject *kobj)
+{
+	struct edac_pci_ctl_info *pci;
+
+	edac_dbg(0, "\n");
+
+	/* Form pointer to containing struct, the pci control struct */
+	pci = to_instance(kobj);
+
+	/* decrement reference count on top main kobj */
+	kobject_put(edac_pci_top_main_kobj);
+
+	kfree(pci);	/* Free the control struct */
+}
+
+/* instance specific attribute structure */
+struct instance_attribute {
+	struct attribute attr;
+	ssize_t(*show) (struct edac_pci_ctl_info *, char *);
+	ssize_t(*store) (struct edac_pci_ctl_info *, const char *, size_t);
+};
+
+/* Function to 'show' fields from the edac_pci 'instance' structure */
+static ssize_t edac_pci_instance_show(struct kobject *kobj,
+				struct attribute *attr, char *buffer)
+{
+	struct edac_pci_ctl_info *pci = to_instance(kobj);
+	struct instance_attribute *instance_attr = to_instance_attr(attr);
+
+	if (instance_attr->show)
+		return instance_attr->show(pci, buffer);
+	return -EIO;
+}
+
+/* Function to 'store' fields into the edac_pci 'instance' structure */
+static ssize_t edac_pci_instance_store(struct kobject *kobj,
+				struct attribute *attr,
+				const char *buffer, size_t count)
+{
+	struct edac_pci_ctl_info *pci = to_instance(kobj);
+	struct instance_attribute *instance_attr = to_instance_attr(attr);
+
+	if (instance_attr->store)
+		return instance_attr->store(pci, buffer, count);
+	return -EIO;
+}
+
+/* fs_ops table */
+static const struct sysfs_ops pci_instance_ops = {
+	.show = edac_pci_instance_show,
+	.store = edac_pci_instance_store
+};
+
+#define INSTANCE_ATTR(_name, _mode, _show, _store)	\
+static struct instance_attribute attr_instance_##_name = {	\
+	.attr	= {.name = __stringify(_name), .mode = _mode },	\
+	.show	= _show,					\
+	.store	= _store,					\
+};
+
+INSTANCE_ATTR(pe_count, S_IRUGO, instance_pe_count_show, NULL);
+INSTANCE_ATTR(npe_count, S_IRUGO, instance_npe_count_show, NULL);
+
+/* pci instance attributes */
+static struct instance_attribute *pci_instance_attr[] = {
+	&attr_instance_pe_count,
+	&attr_instance_npe_count,
+	NULL
+};
+
+/* the ktype for a pci instance */
+static struct kobj_type ktype_pci_instance = {
+	.release = edac_pci_instance_release,
+	.sysfs_ops = &pci_instance_ops,
+	.default_attrs = (struct attribute **)pci_instance_attr,
+};
+
+/*
+ * edac_pci_create_instance_kobj
+ *
+ *	construct one EDAC PCI instance's kobject for use
+ */
+static int edac_pci_create_instance_kobj(struct edac_pci_ctl_info *pci, int idx)
+{
+	struct kobject *main_kobj;
+	int err;
+
+	edac_dbg(0, "\n");
+
+	/* First bump the ref count on the top main kobj, which will
+	 * track the number of PCI instances we have, and thus nest
+	 * properly on keeping the module loaded
+	 */
+	main_kobj = kobject_get(edac_pci_top_main_kobj);
+	if (!main_kobj) {
+		err = -ENODEV;
+		goto error_out;
+	}
+
+	/* And now register this new kobject under the main kobj */
+	err = kobject_init_and_add(&pci->kobj, &ktype_pci_instance,
+				   edac_pci_top_main_kobj, "pci%d", idx);
+	if (err != 0) {
+		edac_dbg(2, "failed to register instance pci%d\n", idx);
+		kobject_put(edac_pci_top_main_kobj);
+		goto error_out;
+	}
+
+	kobject_uevent(&pci->kobj, KOBJ_ADD);
+	edac_dbg(1, "Register instance 'pci%d' kobject\n", idx);
+
+	return 0;
+
+	/* Error unwind statck */
+error_out:
+	return err;
+}
+
+/*
+ * edac_pci_unregister_sysfs_instance_kobj
+ *
+ *	unregister the kobj for the EDAC PCI instance
+ */
+static void edac_pci_unregister_sysfs_instance_kobj(
+			struct edac_pci_ctl_info *pci)
+{
+	edac_dbg(0, "\n");
+
+	/* Unregister the instance kobject and allow its release
+	 * function release the main reference count and then
+	 * kfree the memory
+	 */
+	kobject_put(&pci->kobj);
+}
+
+/***************************** EDAC PCI sysfs root **********************/
+#define to_edacpci(k) container_of(k, struct edac_pci_ctl_info, kobj)
+#define to_edacpci_attr(a) container_of(a, struct edac_pci_attr, attr)
+
+/* simple show/store functions for attributes */
+static ssize_t edac_pci_int_show(void *ptr, char *buffer)
+{
+	int *value = ptr;
+	return sprintf(buffer, "%d\n", *value);
+}
+
+static ssize_t edac_pci_int_store(void *ptr, const char *buffer, size_t count)
+{
+	int *value = ptr;
+
+	if (isdigit(*buffer))
+		*value = simple_strtoul(buffer, NULL, 0);
+
+	return count;
+}
+
+struct edac_pci_dev_attribute {
+	struct attribute attr;
+	void *value;
+	 ssize_t(*show) (void *, char *);
+	 ssize_t(*store) (void *, const char *, size_t);
+};
+
+/* Set of show/store abstract level functions for PCI Parity object */
+static ssize_t edac_pci_dev_show(struct kobject *kobj, struct attribute *attr,
+				 char *buffer)
+{
+	struct edac_pci_dev_attribute *edac_pci_dev;
+	edac_pci_dev = (struct edac_pci_dev_attribute *)attr;
+
+	if (edac_pci_dev->show)
+		return edac_pci_dev->show(edac_pci_dev->value, buffer);
+	return -EIO;
+}
+
+static ssize_t edac_pci_dev_store(struct kobject *kobj,
+				struct attribute *attr, const char *buffer,
+				size_t count)
+{
+	struct edac_pci_dev_attribute *edac_pci_dev;
+	edac_pci_dev = (struct edac_pci_dev_attribute *)attr;
+
+	if (edac_pci_dev->store)
+		return edac_pci_dev->store(edac_pci_dev->value, buffer, count);
+	return -EIO;
+}
+
+static const struct sysfs_ops edac_pci_sysfs_ops = {
+	.show = edac_pci_dev_show,
+	.store = edac_pci_dev_store
+};
+
+#define EDAC_PCI_ATTR(_name,_mode,_show,_store)			\
+static struct edac_pci_dev_attribute edac_pci_attr_##_name = {		\
+	.attr = {.name = __stringify(_name), .mode = _mode },	\
+	.value  = &_name,					\
+	.show   = _show,					\
+	.store  = _store,					\
+};
+
+#define EDAC_PCI_STRING_ATTR(_name,_data,_mode,_show,_store)	\
+static struct edac_pci_dev_attribute edac_pci_attr_##_name = {		\
+	.attr = {.name = __stringify(_name), .mode = _mode },	\
+	.value  = _data,					\
+	.show   = _show,					\
+	.store  = _store,					\
+};
+
+/* PCI Parity control files */
+EDAC_PCI_ATTR(check_pci_errors, S_IRUGO | S_IWUSR, edac_pci_int_show,
+	edac_pci_int_store);
+EDAC_PCI_ATTR(edac_pci_log_pe, S_IRUGO | S_IWUSR, edac_pci_int_show,
+	edac_pci_int_store);
+EDAC_PCI_ATTR(edac_pci_log_npe, S_IRUGO | S_IWUSR, edac_pci_int_show,
+	edac_pci_int_store);
+EDAC_PCI_ATTR(edac_pci_panic_on_pe, S_IRUGO | S_IWUSR, edac_pci_int_show,
+	edac_pci_int_store);
+EDAC_PCI_ATTR(pci_parity_count, S_IRUGO, edac_pci_int_show, NULL);
+EDAC_PCI_ATTR(pci_nonparity_count, S_IRUGO, edac_pci_int_show, NULL);
+
+/* Base Attributes of the memory ECC object */
+static struct edac_pci_dev_attribute *edac_pci_attr[] = {
+	&edac_pci_attr_check_pci_errors,
+	&edac_pci_attr_edac_pci_log_pe,
+	&edac_pci_attr_edac_pci_log_npe,
+	&edac_pci_attr_edac_pci_panic_on_pe,
+	&edac_pci_attr_pci_parity_count,
+	&edac_pci_attr_pci_nonparity_count,
+	NULL,
+};
+
+/*
+ * edac_pci_release_main_kobj
+ *
+ *	This release function is called when the reference count to the
+ *	passed kobj goes to zero.
+ *
+ *	This kobj is the 'main' kobject that EDAC PCI instances
+ *	link to, and thus provide for proper nesting counts
+ */
+static void edac_pci_release_main_kobj(struct kobject *kobj)
+{
+	edac_dbg(0, "here to module_put(THIS_MODULE)\n");
+
+	kfree(kobj);
+
+	/* last reference to top EDAC PCI kobject has been removed,
+	 * NOW release our ref count on the core module
+	 */
+	module_put(THIS_MODULE);
+}
+
+/* ktype struct for the EDAC PCI main kobj */
+static struct kobj_type ktype_edac_pci_main_kobj = {
+	.release = edac_pci_release_main_kobj,
+	.sysfs_ops = &edac_pci_sysfs_ops,
+	.default_attrs = (struct attribute **)edac_pci_attr,
+};
+
+/**
+ * edac_pci_main_kobj_setup()
+ *
+ *	setup the sysfs for EDAC PCI attributes
+ *	assumes edac_subsys has already been initialized
+ */
+static int edac_pci_main_kobj_setup(void)
+{
+	int err;
+	struct bus_type *edac_subsys;
+
+	edac_dbg(0, "\n");
+
+	/* check and count if we have already created the main kobject */
+	if (atomic_inc_return(&edac_pci_sysfs_refcount) != 1)
 		return 0;
-	ret = regulator_map_voltage_linear(rdev, uV, uV);
-	if (ret < 0)
-		return ret;
-	ret = regmap_update_bits(di->regmap, di->sleep_reg,
-					VSEL_NSEL_MASK, ret);
-	if (ret < 0)
-		return ret;
-	/* Cache the sleep voltage setting.
-	 * Might not be the real voltage which is rounded */
-	di->sleep_vol_cache = uV;
+
+	/* First time, so create the main kobject and its
+	 * controls and attributes
+	 */
+	edac_subsys = edac_get_sysfs_subsys();
+	if (edac_subsys == NULL) {
+		edac_dbg(1, "no edac_subsys\n");
+		err = -ENODEV;
+		goto decrement_count_fail;
+	}
+
+	/* Bump the reference count on this module to ensure the
+	 * modules isn't unloaded until we deconstruct the top
+	 * level main kobj for EDAC PCI
+	 */
+	if (!try_module_get(THIS_MODULE)) {
+		edac_dbg(1, "try_module_get() failed\n");
+		err = -ENODEV;
+		goto mod_get_fail;
+	}
+
+	edac_pci_top_main_kobj = kzalloc(sizeof(struct kobject), GFP_KERNEL);
+	if (!edac_pci_top_main_kobj) {
+		edac_dbg(1, "Failed to allocate\n");
+		err = -ENOMEM;
+		goto kzalloc_fail;
+	}
+
+	/* Instanstiate the pci object */
+	err = kobject_init_and_add(edac_pci_top_main_kobj,
+				   &ktype_edac_pci_main_kobj,
+				   &edac_subsys->dev_root->kobj, "pci");
+	if (err) {
+		edac_dbg(1, "Failed to register '.../edac/pci'\n");
+		goto kobject_init_and_add_fail;
+	}
+
+	/* At this point, to 'release' the top level kobject
+	 * for EDAC PCI, then edac_pci_main_kobj_teardown()
+	 * must be used, for resources to be cleaned up properly
+	 */
+	kobject_uevent(edac_pci_top_main_kobj, KOBJ_ADD);
+	edac_dbg(1, "Registered '.../edac/pci' kobject\n");
 
 	return 0;
+
+	/* Error unwind statck */
+kobject_init_and_add_fail:
+	kobject_put(edac_pci_top_main_kobj);
+
+kzalloc_fail:
+	module_put(THIS_MODULE);
+
+mod_get_fail:
+	edac_put_sysfs_subsys();
+
+decrement_count_fail:
+	/* if are on this error exit, nothing to tear down */
+	atomic_dec(&edac_pci_sysfs_refcount);
+
+	return err;
 }
 
-static int fan53555_set_mode(struct regulator_dev *rdev, unsigned int mode)
-{
-	struct fan53555_device_info *di = rdev_get_drvdata(rdev);
-
-	switch (mode) {
-	case REGULATOR_MODE_FAST:
-		regmap_update_bits(di->regmap, di->vol_reg,
-				VSEL_MODE, VSEL_MODE);
-		break;
-	case REGULATOR_MODE_NORMAL:
-		regmap_update_bits(di->regmap, di->vol_reg, VSEL_MODE, 0);
-		break;
-	default:
-		return -EINVAL;
-	}
-	return 0;
-}
-
-static unsigned int fan53555_get_mode(struct regulator_dev *rdev)
-{
-	struct fan53555_device_info *di = rdev_get_drvdata(rdev);
-	unsigned int val;
-	int ret = 0;
-
-	ret = regmap_read(di->regmap, di->vol_reg, &val);
-	if (ret < 0)
-		return ret;
-	if (val & VSEL_MODE)
-		return REGULATOR_MODE_FAST;
-	else
-		return REGULATOR_MODE_NORMAL;
-}
-
-static const int slew_rates[] = {
-	64000,
-	32000,
-	16000,
-	 8000,
-	 4000,
-	 2000,
-	 1000,
-	  500,
-};
-
-static int fan53555_set_ramp(struct regulator_dev *rdev, int ramp)
-{
-	struct fan53555_device_info *di = rdev_get_drvdata(rdev);
-	int regval = -1, i;
-
-	for (i = 0; i < ARRAY_SIZE(slew_rates); i++) {
-		if (ramp <= slew_rates[i])
-			regval = i;
-		else
-			break;
-	}
-
-	if (regval < 0) {
-		dev_err(di->dev, "unsupported ramp value %d\n", ramp);
-		return -EINVAL;
-	}
-
-	return regmap_update_bits(di->regmap, FAN53555_CONTROL,
-				  CTL_SLEW_MASK, regval << CTL_SLEW_SHIFT);
-}
-
-static struct regulator_ops fan53555_regulator_ops = {
-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
-	.get_voltage_sel = regulator_get_voltage_sel_regmap,
-	.set_voltage_time_sel = regulator_set_voltage_time_sel,
-	.map_voltage = regulator_map_voltage_linear,
-	.list_voltage = regulator_list_voltage_linear,
-	.set_suspend_voltage = fan53555_set_suspend_voltage,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.is_enabled = regulator_is_enabled_regmap,
-	.set_mode = fan53555_set_mode,
-	.get_mode = fan53555_get_mode,
-	.set_ramp_delay = fan53555_set_ramp,
-};
-
-static int fan53555_voltages_setup_fairchild(struct fan53555_device_info *di)
-{
-	/* Init voltage range and step */
-	switch (di->chip_id) {
-	case FAN53555_CHIP_ID_00:
-	case FAN53555_CHIP_ID_01:
-	case FAN53555_CHIP_ID_03:
-	case FAN53555_CHIP_ID_05:
-		di->vsel_min = 600000;
-		di->vsel_step = 10000;
-		break;
-	case FAN53555_CHIP_ID_04:
-		di->vsel_min = 603000;
-		di->vsel_step = 12826;
-		break;
-	default:
-		dev_err(di->dev,
-			"Chip ID %d not supported!\n", di->chip_id);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int fan53555_voltages_setup_silergy(struct fan53555_device_info *di)
-{
-	/* Init voltage range and step */
-	switch (di->chip_id) {
-	case SILERGY_SYR82X:
-		di->vsel_min = 712500;
-		di->vsel_step = 12500;
-		break;
-	default:
-		dev_err(di->dev,
-			"Chip ID %d not supported!\n", di->chip_id);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-/* For 00,01,03,05 options:
- * VOUT = 0.60V + NSELx * 10mV, from 0.60 to 1.23V.
- * For 04 option:
- * VOUT = 0.603V + NSELx * 12.826mV, from 0.603 to 1.411V.
- * */
-static int fan53555_device_setup(struct fan53555_device_info *di,
-				struct fan53555_platform_data *pdata)
-{
-	int ret = 0;
-
-	/* Setup voltage control register */
-	switch (pdata->sleep_vsel_id) {
-	case FAN53555_VSEL_ID_0:
-		di->sleep_reg = FAN53555_VSEL0;
-		di->vol_reg = FAN53555_VSEL1;
-		break;
-	case FAN53555_VSEL_ID_1:
-		di->sleep_reg = FAN53555_VSEL1;
-		di->vol_reg = FAN53555_VSEL0;
-		break;
-	default:
-		dev_err(di->dev, "Invalid VSEL ID!\n");
-		return -EINVAL;
-	}
-
-	switch (di->vendor) {
-	case FAN53555_VENDOR_FAIRCHILD:
-		ret = fan53555_voltages_setup_fairchild(di);
-		break;
-	case FAN53555_VENDOR_SILERGY:
-		ret = fan53555_voltages_setup_silergy(di);
-		break;
-	default:
-		dev_err(di->dev, "vendor %d not supported!\n", di->vendor);
-		return -EINVAL;
-	}
-
-	return ret;
-}
-
-static int fan53555_regulator_register(struct fan53555_device_info *di,
-			struct regulator_config *config)
-{
-	struct regulator_desc *rdesc = &di->desc;
-
-	rdesc->name = "fan53555-reg";
-	rdesc->supply_name = "vin";
-	rdesc->ops = &fan53555_regulator_ops;
-	rdesc->type = REGULATOR_VOLTAGE;
-	rdesc->n_voltages = FAN53555_NVOLTAGES;
-	rdesc->enable_reg = di->vol_reg;
-	rdesc->enable_mask = VSEL_BUCK_EN;
-	rdesc->min_uV = di->vsel_min;
-	rdesc->uV_step = di->vsel_step;
-	rdesc->vsel_reg = di->vol_reg;
-	rdesc->vsel_mask = VSEL_NSEL_MASK;
-	rdesc->owner = THIS_MODULE;
-
-	di->rdev = devm_regulator_register(di->dev, &di->desc, config);
-	return PTR_ERR_OR_ZERO(di->rdev);
-}
-
-static const struct regmap_config fan53555_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 8,
-};
-
-static struct fan53555_platform_data *fan53555_parse_dt(struct device *dev,
-					      struct device_node *np,
-					      const struct regulator_desc *desc)
-{
-	struct fan53555_platform_data *pdata;
-	int ret;
-	u32 tmp;
-
-	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata)
-		return NULL;
-
-	pdata->regulator = of_get_regulator_init_data(dev, np, desc);
-
-	ret = of_property_read_u32(np, "fcs,suspend-voltage-selector",
-				   &tmp);
-	if (!ret)
-		pdata->sleep_vsel_id = tmp;
-
-	return pdata;
-}
-
-static const struct of_device_id fan53555_dt_ids[] = {
-	{
-		.compatible = "fcs,fan53555",
-		.data = (void *)FAN53555_VENDOR_FAIRCHILD
-	}, {
-		.compatible = "silergy,syr827",
-		.data = (void *)FAN53555_VENDOR_SILERGY,
-	}, {
-		.compatible = "silergy,syr828",
-		.data = (void *)FAN53555_VENDOR_SILERGY,
-	},
-	{ }
-};
-MODULE_DEVICE_TABLE(of, fan53555_dt_ids);
-
-static int fan53555_regulator_probe(struct i2c_client *client,
-				const struct i2c_device_id *id)
-{
-	struct device_node *np = client->dev.of_node;
-	struct fan53555_device_info *di;
-	struct fan53555_platform_data *pdata;
-	struct regulator_config config = { };
-	unsigned int val;
-	int ret;
-
-	di = devm_kzalloc(&client->dev, sizeof(struct fan53555_device_info),
-					GFP_KERNEL);
-	if (!di)
-		return -ENOMEM;
-
-	pdata = dev_get_platdata(&client->dev);
-	if (!pdata)
-		pdata = fan53555_parse_dt(&client->dev, np, &di->desc);
-
-	if (!pdata || !pdata->regulator) {
-		dev_err(&client->dev, "Platform data not found!\n");
-		return -ENODEV;
-	}
-
-	di->regulator = pdata->regulator;
-	if (client->dev.of_node) {
-		const struct of_device_id *match;
-
-		match = of_match_device(of_match_ptr(fan53555_dt_ids),
-					&client->dev);
-		if (!match)
-			return -ENODEV;
-
-		di->vendor = (unsigned long) match->data;
-	} else {
-		/* if no ramp constraint set, get the pdata ramp_delay */
-		if (!di->regulator->constraints.ramp_delay) {
-			int slew_idx = (pdata->slew_rate & 0x7)
-						? pdata->slew_rate : 0;
-
-			di->regulator->constraints.ramp_delay
-						= slew_rates[slew_idx];
-		}
-
-		di->vendor = id->driver_data;
-	}
-
-	di->regmap = devm_regmap_init_i2c(client, &fan53555_regmap_config);
-	if (IS_ERR(di->regmap)) {
-		dev_err(&client->dev, "Failed to allocate regmap!\n");
-		return PTR_ERR(di->regmap);
-	}
-	di->dev = &client->dev;
-	i2c_set_clientdata(client, di);
-	/* Get chip ID */
-	ret = regmap_read(di->regmap, FAN53555_ID1, &val);
-	if (ret < 0) {
-		dev_err(&client->dev, "Failed to get chip ID!\n");
-		return ret;
-	}
-	di->chip_id = val & DIE_ID;
-	/* Get chip revision */
-	ret = regmap_read(di->regmap, FAN53555_ID2, &val);
-	if (ret < 0) {
-		dev_err(&client->dev, "Failed to get chip Rev!\n");
-		return ret;
-	}
-	di->chip_rev = val & DIE_REV;
-	dev_info(&client->dev, "FAN53555 Option[%d] Rev[%d] Detected!\n",
-				di->chip_id, di->chip_rev);
-	/* Device init */
-	ret = fan53555_device_setup(di, pdata);
-	if (ret < 0) {
-		dev_err(&client->dev, "Failed to setup device!\n");
-		return ret;
-	}
-	/* Register regulator */
-	config.dev = di->dev;
-	config.init_data = di->regulator;
-	config.regmap = di->regmap;
-	config.driver_data = di;
-	config.of_node = np;
-
-	ret = fan53555_regulator_register(di, &config);
-	if (ret < 0)
-		dev_err(&client->dev, "Failed to register regulator!\n");
-	return ret;
-
-}
-
-static const struct i2c_device_id fan53555_id[] = {
-	{
-		.name = "fan53555",
-		.driver_data = FAN53555_VENDOR_FAIRCHILD
-	}, {
-		.name = "syr827",
-		.driver_data = FAN53555_VENDOR_SILERGY
-	}, {
-		.name = "syr828",
-		.driver_data = FAN53555_VENDOR_SILERGY
-	},
-	{ },
-};
-MODULE_DEVICE_TABLE(i2c, fan53555_id);
-
-static struct i2c_driver fan53555_regulator_driver = {
-	.driver = {
-		.name = "fan53555-regulator",
-		.of_match_table = of_match_ptr(fan53555_dt_ids),
-	},
-	.probe = fan53555_regulator_probe,
-	.id_table = fan53555_id,
-};
-
-module_i2c_driver(fan53555_regulator_driver);
-
-MODULE_AUTHOR("Yunfan Zhang <yfzhang@marvell.com>");
-MODULE_DESCRIPTION("FAN53555 regulator driver");
-MODULE_LICENSE("GPL v2");
+/*
+ * 

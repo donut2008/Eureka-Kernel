@@ -1,358 +1,474 @@
-/*
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- *
- * Copyright (C) 2004-2008 Silicon Graphics, Inc. All rights reserved.
- */
 
-/*
- * External Cross Partition (XP) structures and defines.
- */
+	struct vmw_resource_val_node *node;
+	int ret;
 
-#ifndef _DRIVERS_MISC_SGIXP_XP_H
-#define _DRIVERS_MISC_SGIXP_XP_H
+	if (*id_loc == SVGA3D_INVALID_ID) {
+		if (p_val)
+			*p_val = NULL;
+		if (res_type == vmw_res_context) {
+			DRM_ERROR("Illegal context invalid id.\n");
+			return -EINVAL;
+		}
+		return 0;
+	}
 
-#include <linux/mutex.h>
+	/*
+	 * Fastpath in case of repeated commands referencing the same
+	 * resource
+	 */
 
-#if defined CONFIG_X86_UV || defined CONFIG_IA64_SGI_UV
-#include <asm/uv/uv.h>
-#define is_uv()		is_uv_system()
-#endif
+	if (likely(rcache->valid && *id_loc == rcache->handle)) {
+		const struct vmw_resource *res = rcache->res;
 
-#ifndef is_uv
-#define is_uv()		0
-#endif
+		rcache->node->first_usage = false;
+		if (p_val)
+			*p_val = rcache->node;
 
-#if defined CONFIG_IA64
-#include <asm/sn/arch.h>	/* defines is_shub1() and is_shub2() */
-#define is_shub()	ia64_platform_is("sn2")
-#endif
+		return vmw_resource_relocation_add
+			(&sw_context->res_relocations, res,
+			 id_loc - sw_context->buf_start);
+	}
 
-#ifndef is_shub1
-#define is_shub1()	0
-#endif
+	ret = vmw_user_resource_lookup_handle(dev_priv,
+					      sw_context->fp->tfile,
+					      *id_loc,
+					      converter,
+					      &res);
+	if (unlikely(ret != 0)) {
+		DRM_ERROR("Could not find or use resource 0x%08x.\n",
+			  (unsigned) *id_loc);
+		dump_stack();
+		return ret;
+	}
 
-#ifndef is_shub2
-#define is_shub2()	0
-#endif
+	rcache->valid = true;
+	rcache->res = res;
+	rcache->handle = *id_loc;
 
-#ifndef is_shub
-#define is_shub()	0
-#endif
+	ret = vmw_cmd_res_reloc_add(dev_priv, sw_context, id_loc,
+				    res, &node);
+	if (unlikely(ret != 0))
+		goto out_no_reloc;
 
-#ifdef USE_DBUG_ON
-#define DBUG_ON(condition)	BUG_ON(condition)
-#else
-#define DBUG_ON(condition)
-#endif
+	rcache->node = node;
+	if (p_val)
+		*p_val = node;
+	vmw_resource_unreference(&res);
+	return 0;
 
-/*
- * Define the maximum number of partitions the system can possibly support.
- * It is based on the maximum number of hardware partitionable regions. The
- * term 'region' in this context refers to the minimum number of nodes that
- * can comprise an access protection grouping. The access protection is in
- * regards to memory, IPI and IOI.
- *
- * The maximum number of hardware partitionable regions is equal to the
- * maximum number of nodes in the entire system divided by the minimum number
- * of nodes that comprise an access protection grouping.
- */
-#define XP_MAX_NPARTITIONS_SN2	64
-#define XP_MAX_NPARTITIONS_UV	256
+out_no_reloc:
+	BUG_ON(sw_context->error_resource != NULL);
+	sw_context->error_resource = res;
 
-/*
- * XPC establishes channel connections between the local partition and any
- * other partition that is currently up. Over these channels, kernel-level
- * `users' can communicate with their counterparts on the other partitions.
- *
- * If the need for additional channels arises, one can simply increase
- * XPC_MAX_NCHANNELS accordingly. If the day should come where that number
- * exceeds the absolute MAXIMUM number of channels possible (eight), then one
- * will need to make changes to the XPC code to accommodate for this.
- *
- * The absolute maximum number of channels possible is limited to eight for
- * performance reasons on sn2 hardware. The internal cross partition structures
- * require sixteen bytes per channel, and eight allows all of this
- * interface-shared info to fit in one 128-byte cacheline.
- */
-#define XPC_MEM_CHANNEL		0	/* memory channel number */
-#define	XPC_NET_CHANNEL		1	/* network channel number */
-
-#define XPC_MAX_NCHANNELS	2	/* max #of channels allowed */
-
-#if XPC_MAX_NCHANNELS > 8
-#error	XPC_MAX_NCHANNELS exceeds absolute MAXIMUM possible.
-#endif
-
-/*
- * Define macro, XPC_MSG_SIZE(), is provided for the user
- * that wants to fit as many msg entries as possible in a given memory size
- * (e.g. a memory page).
- */
-#define XPC_MSG_MAX_SIZE	128
-#define XPC_MSG_HDR_MAX_SIZE	16
-#define XPC_MSG_PAYLOAD_MAX_SIZE (XPC_MSG_MAX_SIZE - XPC_MSG_HDR_MAX_SIZE)
-
-#define XPC_MSG_SIZE(_payload_size) \
-				ALIGN(XPC_MSG_HDR_MAX_SIZE + (_payload_size), \
-				      is_uv() ? 64 : 128)
-
-
-/*
- * Define the return values and values passed to user's callout functions.
- * (It is important to add new value codes at the end just preceding
- * xpUnknownReason, which must have the highest numerical value.)
- */
-enum xp_retval {
-	xpSuccess = 0,
-
-	xpNotConnected,		/*  1: channel is not connected */
-	xpConnected,		/*  2: channel connected (opened) */
-	xpRETIRED1,		/*  3: (formerly xpDisconnected) */
-
-	xpMsgReceived,		/*  4: message received */
-	xpMsgDelivered,		/*  5: message delivered and acknowledged */
-
-	xpRETIRED2,		/*  6: (formerly xpTransferFailed) */
-
-	xpNoWait,		/*  7: operation would require wait */
-	xpRetry,		/*  8: retry operation */
-	xpTimeout,		/*  9: timeout in xpc_allocate_msg_wait() */
-	xpInterrupted,		/* 10: interrupted wait */
-
-	xpUnequalMsgSizes,	/* 11: message size disparity between sides */
-	xpInvalidAddress,	/* 12: invalid address */
-
-	xpNoMemory,		/* 13: no memory available for XPC structures */
-	xpLackOfResources,	/* 14: insufficient resources for operation */
-	xpUnregistered,		/* 15: channel is not registered */
-	xpAlreadyRegistered,	/* 16: channel is already registered */
-
-	xpPartitionDown,	/* 17: remote partition is down */
-	xpNotLoaded,		/* 18: XPC module is not loaded */
-	xpUnloading,		/* 19: this side is unloading XPC module */
-
-	xpBadMagic,		/* 20: XPC MAGIC string not found */
-
-	xpReactivating,		/* 21: remote partition was reactivated */
-
-	xpUnregistering,	/* 22: this side is unregistering channel */
-	xpOtherUnregistering,	/* 23: other side is unregistering channel */
-
-	xpCloneKThread,		/* 24: cloning kernel thread */
-	xpCloneKThreadFailed,	/* 25: cloning kernel thread failed */
-
-	xpNoHeartbeat,		/* 26: remote partition has no heartbeat */
-
-	xpPioReadError,		/* 27: PIO read error */
-	xpPhysAddrRegFailed,	/* 28: registration of phys addr range failed */
-
-	xpRETIRED3,		/* 29: (formerly xpBteDirectoryError) */
-	xpRETIRED4,		/* 30: (formerly xpBtePoisonError) */
-	xpRETIRED5,		/* 31: (formerly xpBteWriteError) */
-	xpRETIRED6,		/* 32: (formerly xpBteAccessError) */
-	xpRETIRED7,		/* 33: (formerly xpBtePWriteError) */
-	xpRETIRED8,		/* 34: (formerly xpBtePReadError) */
-	xpRETIRED9,		/* 35: (formerly xpBteTimeOutError) */
-	xpRETIRED10,		/* 36: (formerly xpBteXtalkError) */
-	xpRETIRED11,		/* 37: (formerly xpBteNotAvailable) */
-	xpRETIRED12,		/* 38: (formerly xpBteUnmappedError) */
-
-	xpBadVersion,		/* 39: bad version number */
-	xpVarsNotSet,		/* 40: the XPC variables are not set up */
-	xpNoRsvdPageAddr,	/* 41: unable to get rsvd page's phys addr */
-	xpInvalidPartid,	/* 42: invalid partition ID */
-	xpLocalPartid,		/* 43: local partition ID */
-
-	xpOtherGoingDown,	/* 44: other side going down, reason unknown */
-	xpSystemGoingDown,	/* 45: system is going down, reason unknown */
-	xpSystemHalt,		/* 46: system is being halted */
-	xpSystemReboot,		/* 47: system is being rebooted */
-	xpSystemPoweroff,	/* 48: system is being powered off */
-
-	xpDisconnecting,	/* 49: channel disconnecting (closing) */
-
-	xpOpenCloseError,	/* 50: channel open/close protocol error */
-
-	xpDisconnected,		/* 51: channel disconnected (closed) */
-
-	xpBteCopyError,		/* 52: bte_copy() returned error */
-	xpSalError,		/* 53: sn SAL error */
-	xpRsvdPageNotSet,	/* 54: the reserved page is not set up */
-	xpPayloadTooBig,	/* 55: payload too large for message slot */
-
-	xpUnsupported,		/* 56: unsupported functionality or resource */
-	xpNeedMoreInfo,		/* 57: more info is needed by SAL */
-
-	xpGruCopyError,		/* 58: gru_copy_gru() returned error */
-	xpGruSendMqError,	/* 59: gru send message queue related error */
-
-	xpBadChannelNumber,	/* 60: invalid channel number */
-	xpBadMsgType,		/* 61: invalid message type */
-	xpBiosError,		/* 62: BIOS error */
-
-	xpUnknownReason		/* 63: unknown reason - must be last in enum */
-};
-
-/*
- * Define the callout function type used by XPC to update the user on
- * connection activity and state changes via the user function registered
- * by xpc_connect().
- *
- * Arguments:
- *
- *	reason - reason code.
- *	partid - partition ID associated with condition.
- *	ch_number - channel # associated with condition.
- *	data - pointer to optional data.
- *	key - pointer to optional user-defined value provided as the "key"
- *	      argument to xpc_connect().
- *
- * A reason code of xpConnected indicates that a connection has been
- * established to the specified partition on the specified channel. The data
- * argument indicates the max number of entries allowed in the message queue.
- *
- * A reason code of xpMsgReceived indicates that a XPC message arrived from
- * the specified partition on the specified channel. The data argument
- * specifies the address of the message's payload. The user must call
- * xpc_received() when finished with the payload.
- *
- * All other reason codes indicate failure. The data argmument is NULL.
- * When a failure reason code is received, one can assume that the channel
- * is not connected.
- */
-typedef void (*xpc_channel_func) (enum xp_retval reason, short partid,
-				  int ch_number, void *data, void *key);
-
-/*
- * Define the callout function type used by XPC to notify the user of
- * messages received and delivered via the user function registered by
- * xpc_send_notify().
- *
- * Arguments:
- *
- *	reason - reason code.
- *	partid - partition ID associated with condition.
- *	ch_number - channel # associated with condition.
- *	key - pointer to optional user-defined value provided as the "key"
- *	      argument to xpc_send_notify().
- *
- * A reason code of xpMsgDelivered indicates that the message was delivered
- * to the intended recipient and that they have acknowledged its receipt by
- * calling xpc_received().
- *
- * All other reason codes indicate failure.
- *
- * NOTE: The user defined function must be callable by an interrupt handler
- *       and thus cannot block.
- */
-typedef void (*xpc_notify_func) (enum xp_retval reason, short partid,
-				 int ch_number, void *key);
-
-/*
- * The following is a registration entry. There is a global array of these,
- * one per channel. It is used to record the connection registration made
- * by the users of XPC. As long as a registration entry exists, for any
- * partition that comes up, XPC will attempt to establish a connection on
- * that channel. Notification that a connection has been made will occur via
- * the xpc_channel_func function.
- *
- * The 'func' field points to the function to call when aynchronous
- * notification is required for such events as: a connection established/lost,
- * or an incoming message received, or an error condition encountered. A
- * non-NULL 'func' field indicates that there is an active registration for
- * the channel.
- */
-struct xpc_registration {
-	struct mutex mutex;
-	xpc_channel_func func;	/* function to call */
-	void *key;		/* pointer to user's key */
-	u16 nentries;		/* #of msg entries in local msg queue */
-	u16 entry_size;		/* message queue's message entry size */
-	u32 assigned_limit;	/* limit on #of assigned kthreads */
-	u32 idle_limit;		/* limit on #of idle kthreads */
-} ____cacheline_aligned;
-
-#define XPC_CHANNEL_REGISTERED(_c)	(xpc_registrations[_c].func != NULL)
-
-/* the following are valid xpc_send() or xpc_send_notify() flags */
-#define XPC_WAIT	0	/* wait flag */
-#define XPC_NOWAIT	1	/* no wait flag */
-
-struct xpc_interface {
-	void (*connect) (int);
-	void (*disconnect) (int);
-	enum xp_retval (*send) (short, int, u32, void *, u16);
-	enum xp_retval (*send_notify) (short, int, u32, void *, u16,
-					xpc_notify_func, void *);
-	void (*received) (short, int, void *);
-	enum xp_retval (*partid_to_nasids) (short, void *);
-};
-
-extern struct xpc_interface xpc_interface;
-
-extern void xpc_set_interface(void (*)(int),
-			      void (*)(int),
-			      enum xp_retval (*)(short, int, u32, void *, u16),
-			      enum xp_retval (*)(short, int, u32, void *, u16,
-						 xpc_notify_func, void *),
-			      void (*)(short, int, void *),
-			      enum xp_retval (*)(short, void *));
-extern void xpc_clear_interface(void);
-
-extern enum xp_retval xpc_connect(int, xpc_channel_func, void *, u16,
-				   u16, u32, u32);
-extern void xpc_disconnect(int);
-
-static inline enum xp_retval
-xpc_send(short partid, int ch_number, u32 flags, void *payload,
-	 u16 payload_size)
-{
-	return xpc_interface.send(partid, ch_number, flags, payload,
-				  payload_size);
+	return ret;
 }
 
-static inline enum xp_retval
-xpc_send_notify(short partid, int ch_number, u32 flags, void *payload,
-		u16 payload_size, xpc_notify_func func, void *key)
+/**
+ * vmw_rebind_dx_query - Rebind DX query associated with the context
+ *
+ * @ctx_res: context the query belongs to
+ *
+ * This function assumes binding_mutex is held.
+ */
+static int vmw_rebind_all_dx_query(struct vmw_resource *ctx_res)
 {
-	return xpc_interface.send_notify(partid, ch_number, flags, payload,
-					 payload_size, func, key);
+	struct vmw_private *dev_priv = ctx_res->dev_priv;
+	struct vmw_dma_buffer *dx_query_mob;
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXBindAllQuery body;
+	} *cmd;
+
+
+	dx_query_mob = vmw_context_get_dx_query_mob(ctx_res);
+
+	if (!dx_query_mob || dx_query_mob->dx_query_ctx)
+		return 0;
+
+	cmd = vmw_fifo_reserve_dx(dev_priv, sizeof(*cmd), ctx_res->id);
+
+	if (cmd == NULL) {
+		DRM_ERROR("Failed to rebind queries.\n");
+		return -ENOMEM;
+	}
+
+	cmd->header.id = SVGA_3D_CMD_DX_BIND_ALL_QUERY;
+	cmd->header.size = sizeof(cmd->body);
+	cmd->body.cid = ctx_res->id;
+	cmd->body.mobid = dx_query_mob->base.mem.start;
+	vmw_fifo_commit(dev_priv, sizeof(*cmd));
+
+	vmw_context_bind_dx_query(ctx_res, dx_query_mob);
+
+	return 0;
 }
 
-static inline void
-xpc_received(short partid, int ch_number, void *payload)
+/**
+ * vmw_rebind_contexts - Rebind all resources previously bound to
+ * referenced contexts.
+ *
+ * @sw_context: Pointer to the software context.
+ *
+ * Rebind context binding points that have been scrubbed because of eviction.
+ */
+static int vmw_rebind_contexts(struct vmw_sw_context *sw_context)
 {
-	return xpc_interface.received(partid, ch_number, payload);
+	struct vmw_resource_val_node *val;
+	int ret;
+
+	list_for_each_entry(val, &sw_context->resource_list, head) {
+		if (unlikely(!val->staged_bindings))
+			break;
+
+		ret = vmw_binding_rebind_all
+			(vmw_context_binding_state(val->res));
+		if (unlikely(ret != 0)) {
+			if (ret != -ERESTARTSYS)
+				DRM_ERROR("Failed to rebind context.\n");
+			return ret;
+		}
+
+		ret = vmw_rebind_all_dx_query(val->res);
+		if (ret != 0)
+			return ret;
+	}
+
+	return 0;
 }
 
-static inline enum xp_retval
-xpc_partid_to_nasids(short partid, void *nasids)
+/**
+ * vmw_view_bindings_add - Add an array of view bindings to a context
+ * binding state tracker.
+ *
+ * @sw_context: The execbuf state used for this command.
+ * @view_type: View type for the bindings.
+ * @binding_type: Binding type for the bindings.
+ * @shader_slot: The shader slot to user for the bindings.
+ * @view_ids: Array of view ids to be bound.
+ * @num_views: Number of view ids in @view_ids.
+ * @first_slot: The binding slot to be used for the first view id in @view_ids.
+ */
+static int vmw_view_bindings_add(struct vmw_sw_context *sw_context,
+				 enum vmw_view_type view_type,
+				 enum vmw_ctx_binding_type binding_type,
+				 uint32 shader_slot,
+				 uint32 view_ids[], u32 num_views,
+				 u32 first_slot)
 {
-	return xpc_interface.partid_to_nasids(partid, nasids);
+	struct vmw_resource_val_node *ctx_node = sw_context->dx_ctx_node;
+	struct vmw_cmdbuf_res_manager *man;
+	u32 i;
+	int ret;
+
+	if (!ctx_node) {
+		DRM_ERROR("DX Context not set.\n");
+		return -EINVAL;
+	}
+
+	man = sw_context->man;
+	for (i = 0; i < num_views; ++i) {
+		struct vmw_ctx_bindinfo_view binding;
+		struct vmw_resource *view = NULL;
+
+		if (view_ids[i] != SVGA3D_INVALID_ID) {
+			view = vmw_view_lookup(man, view_type, view_ids[i]);
+			if (IS_ERR(view)) {
+				DRM_ERROR("View not found.\n");
+				return PTR_ERR(view);
+			}
+
+			ret = vmw_view_res_val_add(sw_context, view);
+			if (ret) {
+				DRM_ERROR("Could not add view to "
+					  "validation list.\n");
+				vmw_resource_unreference(&view);
+				return ret;
+			}
+		}
+		binding.bi.ctx = ctx_node->res;
+		binding.bi.res = view;
+		binding.bi.bt = binding_type;
+		binding.shader_slot = shader_slot;
+		binding.slot = first_slot + i;
+		vmw_binding_add(ctx_node->staged_bindings, &binding.bi,
+				shader_slot, binding.slot);
+		if (view)
+			vmw_resource_unreference(&view);
+	}
+
+	return 0;
 }
 
-extern short xp_max_npartitions;
-extern short xp_partition_id;
-extern u8 xp_region_size;
+/**
+ * vmw_cmd_cid_check - Check a command header for valid context information.
+ *
+ * @dev_priv: Pointer to a device private structure.
+ * @sw_context: Pointer to the software context.
+ * @header: A command header with an embedded user-space context handle.
+ *
+ * Convenience function: Call vmw_cmd_res_check with the user-space context
+ * handle embedded in @header.
+ */
+static int vmw_cmd_cid_check(struct vmw_private *dev_priv,
+			     struct vmw_sw_context *sw_context,
+			     SVGA3dCmdHeader *header)
+{
+	struct vmw_cid_cmd {
+		SVGA3dCmdHeader header;
+		uint32_t cid;
+	} *cmd;
 
-extern unsigned long (*xp_pa) (void *);
-extern unsigned long (*xp_socket_pa) (unsigned long);
-extern enum xp_retval (*xp_remote_memcpy) (unsigned long, const unsigned long,
-		       size_t);
-extern int (*xp_cpu_to_nasid) (int);
-extern enum xp_retval (*xp_expand_memprotect) (unsigned long, unsigned long);
-extern enum xp_retval (*xp_restrict_memprotect) (unsigned long, unsigned long);
+	cmd = container_of(header, struct vmw_cid_cmd, header);
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+				 user_context_converter, &cmd->cid, NULL);
+}
 
-extern u64 xp_nofault_PIOR_target;
-extern int xp_nofault_PIOR(void *);
-extern int xp_error_PIOR(void);
+static int vmw_cmd_set_render_target_check(struct vmw_private *dev_priv,
+					   struct vmw_sw_context *sw_context,
+					   SVGA3dCmdHeader *header)
+{
+	struct vmw_sid_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdSetRenderTarget body;
+	} *cmd;
+	struct vmw_resource_val_node *ctx_node;
+	struct vmw_resource_val_node *res_node;
+	int ret;
 
-extern struct device *xp;
-extern enum xp_retval xp_init_sn2(void);
-extern enum xp_retval xp_init_uv(void);
-extern void xp_exit_sn2(void);
-extern void xp_exit_uv(void);
+	cmd = container_of(header, struct vmw_sid_cmd, header);
 
-#endif /* _DRIVERS_MISC_SGIXP_XP_H */
+	if (cmd->body.type >= SVGA3D_RT_MAX) {
+		DRM_ERROR("Illegal render target type %u.\n",
+			  (unsigned) cmd->body.type);
+		return -EINVAL;
+	}
+
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_context,
+				user_context_converter, &cmd->body.cid,
+				&ctx_node);
+	if (unlikely(ret != 0))
+		return ret;
+
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				user_surface_converter,
+				&cmd->body.target.sid, &res_node);
+	if (unlikely(ret != 0))
+		return ret;
+
+	if (dev_priv->has_mob) {
+		struct vmw_ctx_bindinfo_view binding;
+
+		binding.bi.ctx = ctx_node->res;
+		binding.bi.res = res_node ? res_node->res : NULL;
+		binding.bi.bt = vmw_ctx_binding_rt;
+		binding.slot = cmd->body.type;
+		vmw_binding_add(ctx_node->staged_bindings,
+				&binding.bi, 0, binding.slot);
+	}
+
+	return 0;
+}
+
+static int vmw_cmd_surface_copy_check(struct vmw_private *dev_priv,
+				      struct vmw_sw_context *sw_context,
+				      SVGA3dCmdHeader *header)
+{
+	struct vmw_sid_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdSurfaceCopy body;
+	} *cmd;
+	int ret;
+
+	cmd = container_of(header, struct vmw_sid_cmd, header);
+
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				user_surface_converter,
+				&cmd->body.src.sid, NULL);
+	if (ret)
+		return ret;
+
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->body.dest.sid, NULL);
+}
+
+static int vmw_cmd_buffer_copy_check(struct vmw_private *dev_priv,
+				      struct vmw_sw_context *sw_context,
+				      SVGA3dCmdHeader *header)
+{
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXBufferCopy body;
+	} *cmd;
+	int ret;
+
+	cmd = container_of(header, typeof(*cmd), header);
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				user_surface_converter,
+				&cmd->body.src, NULL);
+	if (ret != 0)
+		return ret;
+
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->body.dest, NULL);
+}
+
+static int vmw_cmd_pred_copy_check(struct vmw_private *dev_priv,
+				   struct vmw_sw_context *sw_context,
+				   SVGA3dCmdHeader *header)
+{
+	struct {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdDXPredCopyRegion body;
+	} *cmd;
+	int ret;
+
+	cmd = container_of(header, typeof(*cmd), header);
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				user_surface_converter,
+				&cmd->body.srcSid, NULL);
+	if (ret != 0)
+		return ret;
+
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->body.dstSid, NULL);
+}
+
+static int vmw_cmd_stretch_blt_check(struct vmw_private *dev_priv,
+				     struct vmw_sw_context *sw_context,
+				     SVGA3dCmdHeader *header)
+{
+	struct vmw_sid_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdSurfaceStretchBlt body;
+	} *cmd;
+	int ret;
+
+	cmd = container_of(header, struct vmw_sid_cmd, header);
+	ret = vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				user_surface_converter,
+				&cmd->body.src.sid, NULL);
+	if (unlikely(ret != 0))
+		return ret;
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->body.dest.sid, NULL);
+}
+
+static int vmw_cmd_blt_surf_screen_check(struct vmw_private *dev_priv,
+					 struct vmw_sw_context *sw_context,
+					 SVGA3dCmdHeader *header)
+{
+	struct vmw_sid_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdBlitSurfaceToScreen body;
+	} *cmd;
+
+	cmd = container_of(header, struct vmw_sid_cmd, header);
+
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter,
+				 &cmd->body.srcImage.sid, NULL);
+}
+
+static int vmw_cmd_present_check(struct vmw_private *dev_priv,
+				 struct vmw_sw_context *sw_context,
+				 SVGA3dCmdHeader *header)
+{
+	struct vmw_sid_cmd {
+		SVGA3dCmdHeader header;
+		SVGA3dCmdPresent body;
+	} *cmd;
+
+
+	cmd = container_of(header, struct vmw_sid_cmd, header);
+
+	return vmw_cmd_res_check(dev_priv, sw_context, vmw_res_surface,
+				 user_surface_converter, &cmd->body.sid,
+				 NULL);
+}
+
+/**
+ * vmw_query_bo_switch_prepare - Prepare to switch pinned buffer for queries.
+ *
+ * @dev_priv: The device private structure.
+ * @new_query_bo: The new buffer holding query results.
+ * @sw_context: The software context used for this command submission.
+ *
+ * This function checks whether @new_query_bo is suitable for holding
+ * query results, and if another buffer currently is pinned for query
+ * results. If so, the function prepares the state of @sw_context for
+ * switching pinned buffers after successful submission of the current
+ * command batch.
+ */
+static int vmw_query_bo_switch_prepare(struct vmw_private *dev_priv,
+				       struct vmw_dma_buffer *new_query_bo,
+				       struct vmw_sw_context *sw_context)
+{
+	struct vmw_res_cache_entry *ctx_entry =
+		&sw_context->res_cache[vmw_res_context];
+	int ret;
+
+	BUG_ON(!ctx_entry->valid);
+	sw_context->last_query_ctx = ctx_entry->res;
+
+	if (unlikely(new_query_bo != sw_context->cur_query_bo)) {
+
+		if (unlikely(new_query_bo->base.num_pages > 4)) {
+			DRM_ERROR("Query buffer too large.\n");
+			return -EINVAL;
+		}
+
+		if (unlikely(sw_context->cur_query_bo != NULL)) {
+			sw_context->needs_post_query_barrier = true;
+			ret = vmw_bo_to_validate_list(sw_context,
+						      sw_context->cur_query_bo,
+						      dev_priv->has_mob, NULL);
+			if (unlikely(ret != 0))
+				return ret;
+		}
+		sw_context->cur_query_bo = new_query_bo;
+
+		ret = vmw_bo_to_validate_list(sw_context,
+					      dev_priv->dummy_query_bo,
+					      dev_priv->has_mob, NULL);
+		if (unlikely(ret != 0))
+			return ret;
+
+	}
+
+	return 0;
+}
+
+
+/**
+ * vmw_query_bo_switch_commit - Finalize switching pinned query buffer
+ *
+ * @dev_priv: The device private structure.
+ * @sw_context: The software context used for this command submission batch.
+ *
+ * This function will check if we're switching query buffers, and will then,
+ * issue a dummy occlusion query wait used as a query barrier. When the fence
+ * object following that query wait has signaled, we are sure that all
+ * preceding queries have finished, and the old query buffer can be unpinned.
+ * However, since both the new query buffer and the old one are fenced with
+ * that fence, we can do an asynchronus unpin now, and be sure that the
+ * old query buffer won't be moved until the fence has signaled.
+ *
+ * As mentioned above, both the new - and old query buffers need to be fenced
+ * using a sequence emitted *after* calling this function.
+ */
+static void vmw_query_bo_switch_commit(struct vmw_private *dev_priv,
+				     struct vmw_sw_context *sw_context)
+{
+	/*
+	 * The validate list should still hold references to all
+	 * contexts here.
+	 */
+
+	if (sw_context->needs_post_query_barrier) {
+		struct vmw_res_cache_entry *ctx_entry =
+			&sw_context->res_cache[vmw_res_context];
+		struct vmw_resource *ctx;

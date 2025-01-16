@@ -1,1244 +1,940 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2013-2014, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
- * more details.
- *
- */
+ 109;
+	state->CH_Ctrl[20].bit[2] = 4;
+	state->CH_Ctrl[20].val[2] = 0;
+	state->CH_Ctrl[20].addr[3] = 109;
+	state->CH_Ctrl[20].bit[3] = 5;
+	state->CH_Ctrl[20].val[3] = 0;
+	state->CH_Ctrl[20].addr[4] = 109;
+	state->CH_Ctrl[20].bit[4] = 6;
+	state->CH_Ctrl[20].val[4] = 0;
+	state->CH_Ctrl[20].addr[5] = 109;
+	state->CH_Ctrl[20].bit[5] = 7;
+	state->CH_Ctrl[20].val[5] = 0;
+	state->CH_Ctrl[20].addr[6] = 108;
+	state->CH_Ctrl[20].bit[6] = 0;
+	state->CH_Ctrl[20].val[6] = 0;
+	state->CH_Ctrl[20].addr[7] = 108;
+	state->CH_Ctrl[20].bit[7] = 1;
+	state->CH_Ctrl[20].val[7] = 0;
+	state->CH_Ctrl[20].addr[8] = 108;
+	state->CH_Ctrl[20].bit[8] = 2;
+	state->CH_Ctrl[20].val[8] = 1;
+	state->CH_Ctrl[20].addr[9] = 108;
+	state->CH_Ctrl[20].bit[9] = 3;
+	state->CH_Ctrl[20].val[9] = 1;
+	state->CH_Ctrl[20].addr[10] = 108;
+	state->CH_Ctrl[20].bit[10] = 4;
+	state->CH_Ctrl[20].val[10] = 1;
 
-#include <linux/pci.h>
-#include <linux/jiffies.h>
-#include <linux/ktime.h>
-#include <linux/delay.h>
-#include <linux/kthread.h>
-#include <linux/irqreturn.h>
+	state->CH_Ctrl[21].Ctrl_Num = TG_VCO_BIAS ;
+	state->CH_Ctrl[21].size = 6 ;
+	state->CH_Ctrl[21].addr[0] = 106;
+	state->CH_Ctrl[21].bit[0] = 2;
+	state->CH_Ctrl[21].val[0] = 0;
+	state->CH_Ctrl[21].addr[1] = 106;
+	state->CH_Ctrl[21].bit[1] = 3;
+	state->CH_Ctrl[21].val[1] = 0;
+	state->CH_Ctrl[21].addr[2] = 106;
+	state->CH_Ctrl[21].bit[2] = 4;
+	state->CH_Ctrl[21].val[2] = 0;
+	state->CH_Ctrl[21].addr[3] = 106;
+	state->CH_Ctrl[21].bit[3] = 5;
+	state->CH_Ctrl[21].val[3] = 0;
+	state->CH_Ctrl[21].addr[4] = 106;
+	state->CH_Ctrl[21].bit[4] = 6;
+	state->CH_Ctrl[21].val[4] = 0;
+	state->CH_Ctrl[21].addr[5] = 106;
+	state->CH_Ctrl[21].bit[5] = 7;
+	state->CH_Ctrl[21].val[5] = 1;
 
-#include <linux/mei.h>
+	state->CH_Ctrl[22].Ctrl_Num = SEQ_EXTPOWERUP ;
+	state->CH_Ctrl[22].size = 1 ;
+	state->CH_Ctrl[22].addr[0] = 138;
+	state->CH_Ctrl[22].bit[0] = 4;
+	state->CH_Ctrl[22].val[0] = 1;
 
-#include "mei_dev.h"
-#include "hw-txe.h"
-#include "client.h"
-#include "hbm.h"
+	state->CH_Ctrl[23].Ctrl_Num = OVERRIDE_2 ;
+	state->CH_Ctrl[23].size = 1 ;
+	state->CH_Ctrl[23].addr[0] = 17;
+	state->CH_Ctrl[23].bit[0] = 5;
+	state->CH_Ctrl[23].val[0] = 0;
 
-/**
- * mei_txe_reg_read - Reads 32bit data from the txe device
- *
- * @base_addr: registers base address
- * @offset: register offset
- *
- * Return: register value
- */
-static inline u32 mei_txe_reg_read(void __iomem *base_addr,
-					unsigned long offset)
-{
-	return ioread32(base_addr + offset);
+	state->CH_Ctrl[24].Ctrl_Num = OVERRIDE_3 ;
+	state->CH_Ctrl[24].size = 1 ;
+	state->CH_Ctrl[24].addr[0] = 111;
+	state->CH_Ctrl[24].bit[0] = 3;
+	state->CH_Ctrl[24].val[0] = 0;
+
+	state->CH_Ctrl[25].Ctrl_Num = OVERRIDE_4 ;
+	state->CH_Ctrl[25].size = 1 ;
+	state->CH_Ctrl[25].addr[0] = 112;
+	state->CH_Ctrl[25].bit[0] = 7;
+	state->CH_Ctrl[25].val[0] = 0;
+
+	state->CH_Ctrl[26].Ctrl_Num = SEQ_FSM_PULSE ;
+	state->CH_Ctrl[26].size = 1 ;
+	state->CH_Ctrl[26].addr[0] = 136;
+	state->CH_Ctrl[26].bit[0] = 7;
+	state->CH_Ctrl[26].val[0] = 0;
+
+	state->CH_Ctrl[27].Ctrl_Num = GPIO_4B ;
+	state->CH_Ctrl[27].size = 1 ;
+	state->CH_Ctrl[27].addr[0] = 149;
+	state->CH_Ctrl[27].bit[0] = 7;
+	state->CH_Ctrl[27].val[0] = 0;
+
+	state->CH_Ctrl[28].Ctrl_Num = GPIO_3B ;
+	state->CH_Ctrl[28].size = 1 ;
+	state->CH_Ctrl[28].addr[0] = 149;
+	state->CH_Ctrl[28].bit[0] = 6;
+	state->CH_Ctrl[28].val[0] = 0;
+
+	state->CH_Ctrl[29].Ctrl_Num = GPIO_4 ;
+	state->CH_Ctrl[29].size = 1 ;
+	state->CH_Ctrl[29].addr[0] = 149;
+	state->CH_Ctrl[29].bit[0] = 5;
+	state->CH_Ctrl[29].val[0] = 1;
+
+	state->CH_Ctrl[30].Ctrl_Num = GPIO_3 ;
+	state->CH_Ctrl[30].size = 1 ;
+	state->CH_Ctrl[30].addr[0] = 149;
+	state->CH_Ctrl[30].bit[0] = 4;
+	state->CH_Ctrl[30].val[0] = 1;
+
+	state->CH_Ctrl[31].Ctrl_Num = GPIO_1B ;
+	state->CH_Ctrl[31].size = 1 ;
+	state->CH_Ctrl[31].addr[0] = 149;
+	state->CH_Ctrl[31].bit[0] = 3;
+	state->CH_Ctrl[31].val[0] = 0;
+
+	state->CH_Ctrl[32].Ctrl_Num = DAC_A_ENABLE ;
+	state->CH_Ctrl[32].size = 1 ;
+	state->CH_Ctrl[32].addr[0] = 93;
+	state->CH_Ctrl[32].bit[0] = 1;
+	state->CH_Ctrl[32].val[0] = 0;
+
+	state->CH_Ctrl[33].Ctrl_Num = DAC_B_ENABLE ;
+	state->CH_Ctrl[33].size = 1 ;
+	state->CH_Ctrl[33].addr[0] = 93;
+	state->CH_Ctrl[33].bit[0] = 0;
+	state->CH_Ctrl[33].val[0] = 0;
+
+	state->CH_Ctrl[34].Ctrl_Num = DAC_DIN_A ;
+	state->CH_Ctrl[34].size = 6 ;
+	state->CH_Ctrl[34].addr[0] = 92;
+	state->CH_Ctrl[34].bit[0] = 2;
+	state->CH_Ctrl[34].val[0] = 0;
+	state->CH_Ctrl[34].addr[1] = 92;
+	state->CH_Ctrl[34].bit[1] = 3;
+	state->CH_Ctrl[34].val[1] = 0;
+	state->CH_Ctrl[34].addr[2] = 92;
+	state->CH_Ctrl[34].bit[2] = 4;
+	state->CH_Ctrl[34].val[2] = 0;
+	state->CH_Ctrl[34].addr[3] = 92;
+	state->CH_Ctrl[34].bit[3] = 5;
+	state->CH_Ctrl[34].val[3] = 0;
+	state->CH_Ctrl[34].addr[4] = 92;
+	state->CH_Ctrl[34].bit[4] = 6;
+	state->CH_Ctrl[34].val[4] = 0;
+	state->CH_Ctrl[34].addr[5] = 92;
+	state->CH_Ctrl[34].bit[5] = 7;
+	state->CH_Ctrl[34].val[5] = 0;
+
+	state->CH_Ctrl[35].Ctrl_Num = DAC_DIN_B ;
+	state->CH_Ctrl[35].size = 6 ;
+	state->CH_Ctrl[35].addr[0] = 93;
+	state->CH_Ctrl[35].bit[0] = 2;
+	state->CH_Ctrl[35].val[0] = 0;
+	state->CH_Ctrl[35].addr[1] = 93;
+	state->CH_Ctrl[35].bit[1] = 3;
+	state->CH_Ctrl[35].val[1] = 0;
+	state->CH_Ctrl[35].addr[2] = 93;
+	state->CH_Ctrl[35].bit[2] = 4;
+	state->CH_Ctrl[35].val[2] = 0;
+	state->CH_Ctrl[35].addr[3] = 93;
+	state->CH_Ctrl[35].bit[3] = 5;
+	state->CH_Ctrl[35].val[3] = 0;
+	state->CH_Ctrl[35].addr[4] = 93;
+	state->CH_Ctrl[35].bit[4] = 6;
+	state->CH_Ctrl[35].val[4] = 0;
+	state->CH_Ctrl[35].addr[5] = 93;
+	state->CH_Ctrl[35].bit[5] = 7;
+	state->CH_Ctrl[35].val[5] = 0;
+
+#ifdef _MXL_PRODUCTION
+	state->CH_Ctrl[36].Ctrl_Num = RFSYN_EN_DIV ;
+	state->CH_Ctrl[36].size = 1 ;
+	state->CH_Ctrl[36].addr[0] = 109;
+	state->CH_Ctrl[36].bit[0] = 1;
+	state->CH_Ctrl[36].val[0] = 1;
+
+	state->CH_Ctrl[37].Ctrl_Num = RFSYN_DIVM ;
+	state->CH_Ctrl[37].size = 2 ;
+	state->CH_Ctrl[37].addr[0] = 112;
+	state->CH_Ctrl[37].bit[0] = 5;
+	state->CH_Ctrl[37].val[0] = 0;
+	state->CH_Ctrl[37].addr[1] = 112;
+	state->CH_Ctrl[37].bit[1] = 6;
+	state->CH_Ctrl[37].val[1] = 0;
+
+	state->CH_Ctrl[38].Ctrl_Num = DN_BYPASS_AGC_I2C ;
+	state->CH_Ctrl[38].size = 1 ;
+	state->CH_Ctrl[38].addr[0] = 65;
+	state->CH_Ctrl[38].bit[0] = 1;
+	state->CH_Ctrl[38].val[0] = 0;
+#endif
+
+	return 0 ;
 }
 
-/**
- * mei_txe_reg_write - Writes 32bit data to the txe device
- *
- * @base_addr: registers base address
- * @offset: register offset
- * @value: the value to write
- */
-static inline void mei_txe_reg_write(void __iomem *base_addr,
-				unsigned long offset, u32 value)
+static void InitTunerControls(struct dvb_frontend *fe)
 {
-	iowrite32(value, base_addr + offset);
+	MXL5005_RegisterInit(fe);
+	MXL5005_ControlInit(fe);
+#ifdef _MXL_INTERNAL
+	MXL5005_MXLControlInit(fe);
+#endif
 }
 
-/**
- * mei_txe_sec_reg_read_silent - Reads 32bit data from the SeC BAR
- *
- * @hw: the txe hardware structure
- * @offset: register offset
- *
- * Doesn't check for aliveness while Reads 32bit data from the SeC BAR
- *
- * Return: register value
- */
-static inline u32 mei_txe_sec_reg_read_silent(struct mei_txe_hw *hw,
-				unsigned long offset)
+static u16 MXL5005_TunerConfig(struct dvb_frontend *fe,
+	u8	Mode,		/* 0: Analog Mode ; 1: Digital Mode */
+	u8	IF_mode,	/* for Analog Mode, 0: zero IF; 1: low IF */
+	u32	Bandwidth,	/* filter  channel bandwidth (6, 7, 8) */
+	u32	IF_out,		/* Desired IF Out Frequency */
+	u32	Fxtal,		/* XTAL Frequency */
+	u8	AGC_Mode,	/* AGC Mode - Dual AGC: 0, Single AGC: 1 */
+	u16	TOP,		/* 0: Dual AGC; Value: take over point */
+	u16	IF_OUT_LOAD,	/* IF Out Load Resistor (200 / 300 Ohms) */
+	u8	CLOCK_OUT, 	/* 0: turn off clk out; 1: turn on clock out */
+	u8	DIV_OUT,	/* 0: Div-1; 1: Div-4 */
+	u8	CAPSELECT, 	/* 0: disable On-Chip pulling cap; 1: enable */
+	u8	EN_RSSI, 	/* 0: disable RSSI; 1: enable RSSI */
+
+	/* Modulation Type; */
+	/* 0 - Default;	1 - DVB-T; 2 - ATSC; 3 - QAM; 4 - Analog Cable */
+	u8	Mod_Type,
+
+	/* Tracking Filter */
+	/* 0 - Default; 1 - Off; 2 - Type C; 3 - Type C-H */
+	u8	TF_Type
+	)
 {
-	return mei_txe_reg_read(hw->mem_addr[SEC_BAR], offset);
+	struct mxl5005s_state *state = fe->tuner_priv;
+
+	state->Mode = Mode;
+	state->IF_Mode = IF_mode;
+	state->Chan_Bandwidth = Bandwidth;
+	state->IF_OUT = IF_out;
+	state->Fxtal = Fxtal;
+	state->AGC_Mode = AGC_Mode;
+	state->TOP = TOP;
+	state->IF_OUT_LOAD = IF_OUT_LOAD;
+	state->CLOCK_OUT = CLOCK_OUT;
+	state->DIV_OUT = DIV_OUT;
+	state->CAPSELECT = CAPSELECT;
+	state->EN_RSSI = EN_RSSI;
+	state->Mod_Type = Mod_Type;
+	state->TF_Type = TF_Type;
+
+	/* Initialize all the controls and registers */
+	InitTunerControls(fe);
+
+	/* Synthesizer LO frequency calculation */
+	MXL_SynthIFLO_Calc(fe);
+
+	return 0;
 }
 
-/**
- * mei_txe_sec_reg_read - Reads 32bit data from the SeC BAR
- *
- * @hw: the txe hardware structure
- * @offset: register offset
- *
- * Reads 32bit data from the SeC BAR and shout loud if aliveness is not set
- *
- * Return: register value
- */
-static inline u32 mei_txe_sec_reg_read(struct mei_txe_hw *hw,
-				unsigned long offset)
+static void MXL_SynthIFLO_Calc(struct dvb_frontend *fe)
 {
-	WARN(!hw->aliveness, "sec read: aliveness not asserted\n");
-	return mei_txe_sec_reg_read_silent(hw, offset);
-}
-/**
- * mei_txe_sec_reg_write_silent - Writes 32bit data to the SeC BAR
- *   doesn't check for aliveness
- *
- * @hw: the txe hardware structure
- * @offset: register offset
- * @value: value to write
- *
- * Doesn't check for aliveness while writes 32bit data from to the SeC BAR
- */
-static inline void mei_txe_sec_reg_write_silent(struct mei_txe_hw *hw,
-				unsigned long offset, u32 value)
-{
-	mei_txe_reg_write(hw->mem_addr[SEC_BAR], offset, value);
-}
-
-/**
- * mei_txe_sec_reg_write - Writes 32bit data to the SeC BAR
- *
- * @hw: the txe hardware structure
- * @offset: register offset
- * @value: value to write
- *
- * Writes 32bit data from the SeC BAR and shout loud if aliveness is not set
- */
-static inline void mei_txe_sec_reg_write(struct mei_txe_hw *hw,
-				unsigned long offset, u32 value)
-{
-	WARN(!hw->aliveness, "sec write: aliveness not asserted\n");
-	mei_txe_sec_reg_write_silent(hw, offset, value);
-}
-/**
- * mei_txe_br_reg_read - Reads 32bit data from the Bridge BAR
- *
- * @hw: the txe hardware structure
- * @offset: offset from which to read the data
- *
- * Return: the byte read.
- */
-static inline u32 mei_txe_br_reg_read(struct mei_txe_hw *hw,
-				unsigned long offset)
-{
-	return mei_txe_reg_read(hw->mem_addr[BRIDGE_BAR], offset);
-}
-
-/**
- * mei_txe_br_reg_write - Writes 32bit data to the Bridge BAR
- *
- * @hw: the txe hardware structure
- * @offset: offset from which to write the data
- * @value: the byte to write
- */
-static inline void mei_txe_br_reg_write(struct mei_txe_hw *hw,
-				unsigned long offset, u32 value)
-{
-	mei_txe_reg_write(hw->mem_addr[BRIDGE_BAR], offset, value);
-}
-
-/**
- * mei_txe_aliveness_set - request for aliveness change
- *
- * @dev: the device structure
- * @req: requested aliveness value
- *
- * Request for aliveness change and returns true if the change is
- *   really needed and false if aliveness is already
- *   in the requested state
- *
- * Locking: called under "dev->device_lock" lock
- *
- * Return: true if request was send
- */
-static bool mei_txe_aliveness_set(struct mei_device *dev, u32 req)
-{
-
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	bool do_req = hw->aliveness != req;
-
-	dev_dbg(dev->dev, "Aliveness current=%d request=%d\n",
-				hw->aliveness, req);
-	if (do_req) {
-		dev->pg_event = MEI_PG_EVENT_WAIT;
-		mei_txe_br_reg_write(hw, SICR_HOST_ALIVENESS_REQ_REG, req);
+	struct mxl5005s_state *state = fe->tuner_priv;
+	if (state->Mode == 1) /* Digital Mode */
+		state->IF_LO = state->IF_OUT;
+	else /* Analog Mode */ {
+		if (state->IF_Mode == 0) /* Analog Zero IF mode */
+			state->IF_LO = state->IF_OUT + 400000;
+		else /* Analog Low IF mode */
+			state->IF_LO = state->IF_OUT + state->Chan_Bandwidth/2;
 	}
-	return do_req;
 }
 
-
-/**
- * mei_txe_aliveness_req_get - get aliveness requested register value
- *
- * @dev: the device structure
- *
- * Extract HICR_HOST_ALIVENESS_RESP_ACK bit from
- * from HICR_HOST_ALIVENESS_REQ register value
- *
- * Return: SICR_HOST_ALIVENESS_REQ_REQUESTED bit value
- */
-static u32 mei_txe_aliveness_req_get(struct mei_device *dev)
+static void MXL_SynthRFTGLO_Calc(struct dvb_frontend *fe)
 {
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	u32 reg;
+	struct mxl5005s_state *state = fe->tuner_priv;
 
-	reg = mei_txe_br_reg_read(hw, SICR_HOST_ALIVENESS_REQ_REG);
-	return reg & SICR_HOST_ALIVENESS_REQ_REQUESTED;
-}
-
-/**
- * mei_txe_aliveness_get - get aliveness response register value
- *
- * @dev: the device structure
- *
- * Return: HICR_HOST_ALIVENESS_RESP_ACK bit from HICR_HOST_ALIVENESS_RESP
- *         register
- */
-static u32 mei_txe_aliveness_get(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	u32 reg;
-
-	reg = mei_txe_br_reg_read(hw, HICR_HOST_ALIVENESS_RESP_REG);
-	return reg & HICR_HOST_ALIVENESS_RESP_ACK;
-}
-
-/**
- * mei_txe_aliveness_poll - waits for aliveness to settle
- *
- * @dev: the device structure
- * @expected: expected aliveness value
- *
- * Polls for HICR_HOST_ALIVENESS_RESP.ALIVENESS_RESP to be set
- *
- * Return: 0 if the expected value was received, -ETIME otherwise
- */
-static int mei_txe_aliveness_poll(struct mei_device *dev, u32 expected)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	ktime_t stop, start;
-
-	start = ktime_get();
-	stop = ktime_add(start, ms_to_ktime(SEC_ALIVENESS_WAIT_TIMEOUT));
-	do {
-		hw->aliveness = mei_txe_aliveness_get(dev);
-		if (hw->aliveness == expected) {
-			dev->pg_event = MEI_PG_EVENT_IDLE;
-			dev_dbg(dev->dev, "aliveness settled after %lld usecs\n",
-				ktime_to_us(ktime_sub(ktime_get(), start)));
-			return 0;
+	if (state->Mode == 1) /* Digital Mode */ {
+			/* remove 20.48MHz setting for 2.6.10 */
+			state->RF_LO = state->RF_IN;
+			/* change for 2.6.6 */
+			state->TG_LO = state->RF_IN - 750000;
+	} else /* Analog Mode */ {
+		if (state->IF_Mode == 0) /* Analog Zero IF mode */ {
+			state->RF_LO = state->RF_IN - 400000;
+			state->TG_LO = state->RF_IN - 1750000;
+		} else /* Analog Low IF mode */ {
+			state->RF_LO = state->RF_IN - state->Chan_Bandwidth/2;
+			state->TG_LO = state->RF_IN -
+				state->Chan_Bandwidth + 500000;
 		}
-		usleep_range(20, 50);
-	} while (ktime_before(ktime_get(), stop));
-
-	dev->pg_event = MEI_PG_EVENT_IDLE;
-	dev_err(dev->dev, "aliveness timed out\n");
-	return -ETIME;
+	}
 }
 
-/**
- * mei_txe_aliveness_wait - waits for aliveness to settle
- *
- * @dev: the device structure
- * @expected: expected aliveness value
- *
- * Waits for HICR_HOST_ALIVENESS_RESP.ALIVENESS_RESP to be set
- *
- * Return: 0 on success and < 0 otherwise
- */
-static int mei_txe_aliveness_wait(struct mei_device *dev, u32 expected)
+static u16 MXL_OverwriteICDefault(struct dvb_frontend *fe)
 {
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	const unsigned long timeout =
-			msecs_to_jiffies(SEC_ALIVENESS_WAIT_TIMEOUT);
-	long err;
-	int ret;
+	u16 status = 0;
 
-	hw->aliveness = mei_txe_aliveness_get(dev);
-	if (hw->aliveness == expected)
-		return 0;
+	status += MXL_ControlWrite(fe, OVERRIDE_1, 1);
+	status += MXL_ControlWrite(fe, OVERRIDE_2, 1);
+	status += MXL_ControlWrite(fe, OVERRIDE_3, 1);
+	status += MXL_ControlWrite(fe, OVERRIDE_4, 1);
 
-	mutex_unlock(&dev->device_lock);
-	err = wait_event_timeout(hw->wait_aliveness_resp,
-			dev->pg_event == MEI_PG_EVENT_RECEIVED, timeout);
-	mutex_lock(&dev->device_lock);
+	return status;
+}
 
-	hw->aliveness = mei_txe_aliveness_get(dev);
-	ret = hw->aliveness == expected ? 0 : -ETIME;
+static u16 MXL_BlockInit(struct dvb_frontend *fe)
+{
+	struct mxl5005s_state *state = fe->tuner_priv;
+	u16 status = 0;
 
-	if (ret)
-		dev_warn(dev->dev, "aliveness timed out = %ld aliveness = %d event = %d\n",
-			err, hw->aliveness, dev->pg_event);
+	status += MXL_OverwriteICDefault(fe);
+
+	/* Downconverter Control Dig Ana */
+	status += MXL_ControlWrite(fe, DN_IQTN_AMP_CUT, state->Mode ? 1 : 0);
+
+	/* Filter Control  Dig  Ana */
+	status += MXL_ControlWrite(fe, BB_MODE, state->Mode ? 0 : 1);
+	status += MXL_ControlWrite(fe, BB_BUF, state->Mode ? 3 : 2);
+	status += MXL_ControlWrite(fe, BB_BUF_OA, state->Mode ? 1 : 0);
+	status += MXL_ControlWrite(fe, BB_IQSWAP, state->Mode ? 0 : 1);
+	status += MXL_ControlWrite(fe, BB_INITSTATE_DLPF_TUNE, 0);
+
+	/* Initialize Low-Pass Filter */
+	if (state->Mode) { /* Digital Mode */
+		switch (state->Chan_Bandwidth) {
+		case 8000000:
+			status += MXL_ControlWrite(fe, BB_DLPF_BANDSEL, 0);
+			break;
+		case 7000000:
+			status += MXL_ControlWrite(fe, BB_DLPF_BANDSEL, 2);
+			break;
+		case 6000000:
+			status += MXL_ControlWrite(fe,
+					BB_DLPF_BANDSEL, 3);
+			break;
+		}
+	} else { /* Analog Mode */
+		switch (state->Chan_Bandwidth) {
+		case 8000000:	/* Low Zero */
+			status += MXL_ControlWrite(fe, BB_ALPF_BANDSELECT,
+					(state->IF_Mode ? 0 : 3));
+			break;
+		case 7000000:
+			status += MXL_ControlWrite(fe, BB_ALPF_BANDSELECT,
+					(state->IF_Mode ? 1 : 4));
+			break;
+		case 6000000:
+			status += MXL_ControlWrite(fe, BB_ALPF_BANDSELECT,
+					(state->IF_Mode ? 2 : 5));
+			break;
+		}
+	}
+
+	/* Charge Pump Control Dig  Ana */
+	status += MXL_ControlWrite(fe, RFSYN_CHP_GAIN, state->Mode ? 5 : 8);
+	status += MXL_ControlWrite(fe,
+		RFSYN_EN_CHP_HIGAIN, state->Mode ? 1 : 1);
+	status += MXL_ControlWrite(fe, EN_CHP_LIN_B, state->Mode ? 0 : 0);
+
+	/* AGC TOP Control */
+	if (state->AGC_Mode == 0) /* Dual AGC */ {
+		status += MXL_ControlWrite(fe, AGC_IF, 15);
+		status += MXL_ControlWrite(fe, AGC_RF, 15);
+	} else /*  Single AGC Mode Dig  Ana */
+		status += MXL_ControlWrite(fe, AGC_RF, state->Mode ? 15 : 12);
+
+	if (state->TOP == 55) /* TOP == 5.5 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x0);
+
+	if (state->TOP == 72) /* TOP == 7.2 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x1);
+
+	if (state->TOP == 92) /* TOP == 9.2 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x2);
+
+	if (state->TOP == 110) /* TOP == 11.0 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x3);
+
+	if (state->TOP == 129) /* TOP == 12.9 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x4);
+
+	if (state->TOP == 147) /* TOP == 14.7 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x5);
+
+	if (state->TOP == 168) /* TOP == 16.8 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x6);
+
+	if (state->TOP == 194) /* TOP == 19.4 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x7);
+
+	if (state->TOP == 212) /* TOP == 21.2 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0x9);
+
+	if (state->TOP == 232) /* TOP == 23.2 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0xA);
+
+	if (state->TOP == 252) /* TOP == 25.2 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0xB);
+
+	if (state->TOP == 271) /* TOP == 27.1 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0xC);
+
+	if (state->TOP == 292) /* TOP == 29.2 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0xD);
+
+	if (state->TOP == 317) /* TOP == 31.7 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0xE);
+
+	if (state->TOP == 349) /* TOP == 34.9 */
+		status += MXL_ControlWrite(fe, AGC_IF, 0xF);
+
+	/* IF Synthesizer Control */
+	status += MXL_IFSynthInit(fe);
+
+	/* IF UpConverter Control */
+	if (state->IF_OUT_LOAD == 200) {
+		status += MXL_ControlWrite(fe, DRV_RES_SEL, 6);
+		status += MXL_ControlWrite(fe, I_DRIVER, 2);
+	}
+	if (state->IF_OUT_LOAD == 300) {
+		status += MXL_ControlWrite(fe, DRV_RES_SEL, 4);
+		status += MXL_ControlWrite(fe, I_DRIVER, 1);
+	}
+
+	/* Anti-Alias Filtering Control
+	 * initialise Anti-Aliasing Filter
+	 */
+	if (state->Mode) { /* Digital Mode */
+		if (state->IF_OUT >= 4000000UL && state->IF_OUT <= 6280000UL) {
+			status += MXL_ControlWrite(fe, EN_AAF, 1);
+			status += MXL_ControlWrite(fe, EN_3P, 1);
+			status += MXL_ControlWrite(fe, EN_AUX_3P, 1);
+			status += MXL_ControlWrite(fe, SEL_AAF_BAND, 0);
+		}
+		if ((state->IF_OUT == 36125000UL) ||
+			(state->IF_OUT == 36150000UL)) {
+			status += MXL_ControlWrite(fe, EN_AAF, 1);
+			status += MXL_ControlWrite(fe, EN_3P, 1);
+			status += MXL_ControlWrite(fe, EN_AUX_3P, 1);
+			status += MXL_ControlWrite(fe, SEL_AAF_BAND, 1);
+		}
+		if (state->IF_OUT > 36150000UL) {
+			status += MXL_ControlWrite(fe, EN_AAF, 0);
+			status += MXL_ControlWrite(fe, EN_3P, 1);
+			status += MXL_ControlWrite(fe, EN_AUX_3P, 1);
+			status += MXL_ControlWrite(fe, SEL_AAF_BAND, 1);
+		}
+	} else { /* Analog Mode */
+		if (state->IF_OUT >= 4000000UL && state->IF_OUT <= 5000000UL) {
+			status += MXL_ControlWrite(fe, EN_AAF, 1);
+			status += MXL_ControlWrite(fe, EN_3P, 1);
+			status += MXL_ControlWrite(fe, EN_AUX_3P, 1);
+			status += MXL_ControlWrite(fe, SEL_AAF_BAND, 0);
+		}
+		if (state->IF_OUT > 5000000UL) {
+			status += MXL_ControlWrite(fe, EN_AAF, 0);
+			status += MXL_ControlWrite(fe, EN_3P, 0);
+			status += MXL_ControlWrite(fe, EN_AUX_3P, 0);
+			status += MXL_ControlWrite(fe, SEL_AAF_BAND, 0);
+		}
+	}
+
+	/* Demod Clock Out */
+	if (state->CLOCK_OUT)
+		status += MXL_ControlWrite(fe, SEQ_ENCLK16_CLK_OUT, 1);
 	else
-		dev_dbg(dev->dev, "aliveness settled after = %d msec aliveness = %d event = %d\n",
-			jiffies_to_msecs(timeout - err),
-			hw->aliveness, dev->pg_event);
+		status += MXL_ControlWrite(fe, SEQ_ENCLK16_CLK_OUT, 0);
 
-	dev->pg_event = MEI_PG_EVENT_IDLE;
-	return ret;
-}
+	if (state->DIV_OUT == 1)
+		status += MXL_ControlWrite(fe, SEQ_SEL4_16B, 1);
+	if (state->DIV_OUT == 0)
+		status += MXL_ControlWrite(fe, SEQ_SEL4_16B, 0);
 
-/**
- * mei_txe_aliveness_set_sync - sets an wait for aliveness to complete
- *
- * @dev: the device structure
- * @req: requested aliveness value
- *
- * Return: 0 on success and < 0 otherwise
- */
-int mei_txe_aliveness_set_sync(struct mei_device *dev, u32 req)
-{
-	if (mei_txe_aliveness_set(dev, req))
-		return mei_txe_aliveness_wait(dev, req);
-	return 0;
-}
+	/* Crystal Control */
+	if (state->CAPSELECT)
+		status += MXL_ControlWrite(fe, XTAL_CAPSELECT, 1);
+	else
+		status += MXL_ControlWrite(fe, XTAL_CAPSELECT, 0);
 
-/**
- * mei_txe_pg_in_transition - is device now in pg transition
- *
- * @dev: the device structure
- *
- * Return: true if in pg transition, false otherwise
- */
-static bool mei_txe_pg_in_transition(struct mei_device *dev)
-{
-	return dev->pg_event == MEI_PG_EVENT_WAIT;
-}
+	if (state->Fxtal >= 12000000UL && state->Fxtal <= 16000000UL)
+		status += MXL_ControlWrite(fe, IF_SEL_DBL, 1);
+	if (state->Fxtal > 16000000UL && state->Fxtal <= 32000000UL)
+		status += MXL_ControlWrite(fe, IF_SEL_DBL, 0);
 
-/**
- * mei_txe_pg_is_enabled - detect if PG is supported by HW
- *
- * @dev: the device structure
- *
- * Return: true is pg supported, false otherwise
- */
-static bool mei_txe_pg_is_enabled(struct mei_device *dev)
-{
-	return true;
-}
+	if (state->Fxtal >= 12000000UL && state->Fxtal <= 22000000UL)
+		status += MXL_ControlWrite(fe, RFSYN_R_DIV, 3);
+	if (state->Fxtal > 22000000UL && state->Fxtal <= 32000000UL)
+		status += MXL_ControlWrite(fe, RFSYN_R_DIV, 0);
 
-/**
- * mei_txe_pg_state  - translate aliveness register value
- *   to the mei power gating state
- *
- * @dev: the device structure
- *
- * Return: MEI_PG_OFF if aliveness is on and MEI_PG_ON otherwise
- */
-static inline enum mei_pg_state mei_txe_pg_state(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
+	/* Misc Controls */
+	if (state->Mode == 0 && state->IF_Mode == 1) /* Analog LowIF mode */
+		status += MXL_ControlWrite(fe, SEQ_EXTIQFSMPULSE, 0);
+	else
+		status += MXL_ControlWrite(fe, SEQ_EXTIQFSMPULSE, 1);
 
-	return hw->aliveness ? MEI_PG_OFF : MEI_PG_ON;
-}
+	/* status += MXL_ControlRead(fe, IF_DIVVAL, &IF_DIVVAL_Val); */
 
-/**
- * mei_txe_input_ready_interrupt_enable - sets the Input Ready Interrupt
- *
- * @dev: the device structure
- */
-static void mei_txe_input_ready_interrupt_enable(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	u32 hintmsk;
-	/* Enable the SEC_IPC_HOST_INT_MASK_IN_RDY interrupt */
-	hintmsk = mei_txe_sec_reg_read(hw, SEC_IPC_HOST_INT_MASK_REG);
-	hintmsk |= SEC_IPC_HOST_INT_MASK_IN_RDY;
-	mei_txe_sec_reg_write(hw, SEC_IPC_HOST_INT_MASK_REG, hintmsk);
-}
+	/* Set TG_R_DIV */
+	status += MXL_ControlWrite(fe, TG_R_DIV,
+		MXL_Ceiling(state->Fxtal, 1000000));
 
-/**
- * mei_txe_input_doorbell_set - sets bit 0 in
- *    SEC_IPC_INPUT_DOORBELL.IPC_INPUT_DOORBELL.
- *
- * @hw: the txe hardware structure
- */
-static void mei_txe_input_doorbell_set(struct mei_txe_hw *hw)
-{
-	/* Clear the interrupt cause */
-	clear_bit(TXE_INTR_IN_READY_BIT, &hw->intr_cause);
-	mei_txe_sec_reg_write(hw, SEC_IPC_INPUT_DOORBELL_REG, 1);
-}
+	/* Apply Default value to BB_INITSTATE_DLPF_TUNE */
 
-/**
- * mei_txe_output_ready_set - Sets the SICR_SEC_IPC_OUTPUT_STATUS bit to 1
- *
- * @hw: the txe hardware structure
- */
-static void mei_txe_output_ready_set(struct mei_txe_hw *hw)
-{
-	mei_txe_br_reg_write(hw,
-			SICR_SEC_IPC_OUTPUT_STATUS_REG,
-			SEC_IPC_OUTPUT_STATUS_RDY);
-}
+	/* RSSI Control */
+	if (state->EN_RSSI) {
+		status += MXL_ControlWrite(fe, SEQ_EXTSYNTHCALIF, 1);
+		status += MXL_ControlWrite(fe, SEQ_EXTDCCAL, 1);
+		status += MXL_ControlWrite(fe, AGC_EN_RSSI, 1);
+		status += MXL_ControlWrite(fe, RFA_ENCLKRFAGC, 1);
 
-/**
- * mei_txe_is_input_ready - check if TXE is ready for receiving data
- *
- * @dev: the device structure
- *
- * Return: true if INPUT STATUS READY bit is set
- */
-static bool mei_txe_is_input_ready(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	u32 status;
+		/* RSSI reference point */
+		status += MXL_ControlWrite(fe, RFA_RSSI_REF, 2);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFH, 3);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFL, 1);
 
-	status = mei_txe_sec_reg_read(hw, SEC_IPC_INPUT_STATUS_REG);
-	return !!(SEC_IPC_INPUT_STATUS_RDY & status);
-}
-
-/**
- * mei_txe_intr_clear - clear all interrupts
- *
- * @dev: the device structure
- */
-static inline void mei_txe_intr_clear(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	mei_txe_sec_reg_write_silent(hw, SEC_IPC_HOST_INT_STATUS_REG,
-		SEC_IPC_HOST_INT_STATUS_PENDING);
-	mei_txe_br_reg_write(hw, HISR_REG, HISR_INT_STS_MSK);
-	mei_txe_br_reg_write(hw, HHISR_REG, IPC_HHIER_MSK);
-}
-
-/**
- * mei_txe_intr_disable - disable all interrupts
- *
- * @dev: the device structure
- */
-static void mei_txe_intr_disable(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	mei_txe_br_reg_write(hw, HHIER_REG, 0);
-	mei_txe_br_reg_write(hw, HIER_REG, 0);
-}
-/**
- * mei_txe_intr_enable - enable all interrupts
- *
- * @dev: the device structure
- */
-static void mei_txe_intr_enable(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	mei_txe_br_reg_write(hw, HHIER_REG, IPC_HHIER_MSK);
-	mei_txe_br_reg_write(hw, HIER_REG, HIER_INT_EN_MSK);
-}
-
-/**
- * mei_txe_pending_interrupts - check if there are pending interrupts
- *	only Aliveness, Input ready, and output doorbell are of relevance
- *
- * @dev: the device structure
- *
- * Checks if there are pending interrupts
- * only Aliveness, Readiness, Input ready, and Output doorbell are relevant
- *
- * Return: true if there are pending interrupts
- */
-static bool mei_txe_pending_interrupts(struct mei_device *dev)
-{
-
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	bool ret = (hw->intr_cause & (TXE_INTR_READINESS |
-				      TXE_INTR_ALIVENESS |
-				      TXE_INTR_IN_READY  |
-				      TXE_INTR_OUT_DB));
-
-	if (ret) {
-		dev_dbg(dev->dev,
-			"Pending Interrupts InReady=%01d Readiness=%01d, Aliveness=%01d, OutDoor=%01d\n",
-			!!(hw->intr_cause & TXE_INTR_IN_READY),
-			!!(hw->intr_cause & TXE_INTR_READINESS),
-			!!(hw->intr_cause & TXE_INTR_ALIVENESS),
-			!!(hw->intr_cause & TXE_INTR_OUT_DB));
-	}
-	return ret;
-}
-
-/**
- * mei_txe_input_payload_write - write a dword to the host buffer
- *	at offset idx
- *
- * @dev: the device structure
- * @idx: index in the host buffer
- * @value: value
- */
-static void mei_txe_input_payload_write(struct mei_device *dev,
-			unsigned long idx, u32 value)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	mei_txe_sec_reg_write(hw, SEC_IPC_INPUT_PAYLOAD_REG +
-			(idx * sizeof(u32)), value);
-}
-
-/**
- * mei_txe_out_data_read - read dword from the device buffer
- *	at offset idx
- *
- * @dev: the device structure
- * @idx: index in the device buffer
- *
- * Return: register value at index
- */
-static u32 mei_txe_out_data_read(const struct mei_device *dev,
-					unsigned long idx)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	return mei_txe_br_reg_read(hw,
-		BRIDGE_IPC_OUTPUT_PAYLOAD_REG + (idx * sizeof(u32)));
-}
-
-/* Readiness */
-
-/**
- * mei_txe_readiness_set_host_rdy - set host readiness bit
- *
- * @dev: the device structure
- */
-static void mei_txe_readiness_set_host_rdy(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	mei_txe_br_reg_write(hw,
-		SICR_HOST_IPC_READINESS_REQ_REG,
-		SICR_HOST_IPC_READINESS_HOST_RDY);
-}
-
-/**
- * mei_txe_readiness_clear - clear host readiness bit
- *
- * @dev: the device structure
- */
-static void mei_txe_readiness_clear(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	mei_txe_br_reg_write(hw, SICR_HOST_IPC_READINESS_REQ_REG,
-				SICR_HOST_IPC_READINESS_RDY_CLR);
-}
-/**
- * mei_txe_readiness_get - Reads and returns
- *	the HICR_SEC_IPC_READINESS register value
- *
- * @dev: the device structure
- *
- * Return: the HICR_SEC_IPC_READINESS register value
- */
-static u32 mei_txe_readiness_get(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	return mei_txe_br_reg_read(hw, HICR_SEC_IPC_READINESS_REG);
-}
-
-
-/**
- * mei_txe_readiness_is_sec_rdy - check readiness
- *  for HICR_SEC_IPC_READINESS_SEC_RDY
- *
- * @readiness: cached readiness state
- *
- * Return: true if readiness bit is set
- */
-static inline bool mei_txe_readiness_is_sec_rdy(u32 readiness)
-{
-	return !!(readiness & HICR_SEC_IPC_READINESS_SEC_RDY);
-}
-
-/**
- * mei_txe_hw_is_ready - check if the hw is ready
- *
- * @dev: the device structure
- *
- * Return: true if sec is ready
- */
-static bool mei_txe_hw_is_ready(struct mei_device *dev)
-{
-	u32 readiness =  mei_txe_readiness_get(dev);
-
-	return mei_txe_readiness_is_sec_rdy(readiness);
-}
-
-/**
- * mei_txe_host_is_ready - check if the host is ready
- *
- * @dev: the device structure
- *
- * Return: true if host is ready
- */
-static inline bool mei_txe_host_is_ready(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	u32 reg = mei_txe_br_reg_read(hw, HICR_SEC_IPC_READINESS_REG);
-
-	return !!(reg & HICR_SEC_IPC_READINESS_HOST_RDY);
-}
-
-/**
- * mei_txe_readiness_wait - wait till readiness settles
- *
- * @dev: the device structure
- *
- * Return: 0 on success and -ETIME on timeout
- */
-static int mei_txe_readiness_wait(struct mei_device *dev)
-{
-	if (mei_txe_hw_is_ready(dev))
-		return 0;
-
-	mutex_unlock(&dev->device_lock);
-	wait_event_timeout(dev->wait_hw_ready, dev->recvd_hw_ready,
-			msecs_to_jiffies(SEC_RESET_WAIT_TIMEOUT));
-	mutex_lock(&dev->device_lock);
-	if (!dev->recvd_hw_ready) {
-		dev_err(dev->dev, "wait for readiness failed\n");
-		return -ETIME;
+		/* TOP point */
+		status += MXL_ControlWrite(fe, RFA_FLR, 0);
+		status += MXL_ControlWrite(fe, RFA_CEIL, 12);
 	}
 
-	dev->recvd_hw_ready = false;
-	return 0;
-}
-
-static const struct mei_fw_status mei_txe_fw_sts = {
-	.count = 2,
-	.status[0] = PCI_CFG_TXE_FW_STS0,
-	.status[1] = PCI_CFG_TXE_FW_STS1
-};
-
-/**
- * mei_txe_fw_status - read fw status register from pci config space
- *
- * @dev: mei device
- * @fw_status: fw status register values
- *
- * Return: 0 on success, error otherwise
- */
-static int mei_txe_fw_status(struct mei_device *dev,
-			     struct mei_fw_status *fw_status)
-{
-	const struct mei_fw_status *fw_src = &mei_txe_fw_sts;
-	struct pci_dev *pdev = to_pci_dev(dev->dev);
-	int ret;
-	int i;
-
-	if (!fw_status)
-		return -EINVAL;
-
-	fw_status->count = fw_src->count;
-	for (i = 0; i < fw_src->count && i < MEI_FW_STATUS_MAX; i++) {
-		ret = pci_read_config_dword(pdev,
-			fw_src->status[i], &fw_status->status[i]);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-/**
- *  mei_txe_hw_config - configure hardware at the start of the devices
- *
- * @dev: the device structure
- *
- * Configure hardware at the start of the device should be done only
- *   once at the device probe time
- */
-static void mei_txe_hw_config(struct mei_device *dev)
-{
-
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	/* Doesn't change in runtime */
-	dev->hbuf_depth = PAYLOAD_SIZE / 4;
-
-	hw->aliveness = mei_txe_aliveness_get(dev);
-	hw->readiness = mei_txe_readiness_get(dev);
-
-	dev_dbg(dev->dev, "aliveness_resp = 0x%08x, readiness = 0x%08x.\n",
-		hw->aliveness, hw->readiness);
-}
-
-
-/**
- * mei_txe_write - writes a message to device.
- *
- * @dev: the device structure
- * @header: header of message
- * @buf: message buffer will be written
- *
- * Return: 0 if success, <0 - otherwise.
- */
-
-static int mei_txe_write(struct mei_device *dev,
-		struct mei_msg_hdr *header, unsigned char *buf)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	unsigned long rem;
-	unsigned long length;
-	int slots = dev->hbuf_depth;
-	u32 *reg_buf = (u32 *)buf;
-	u32 dw_cnt;
-	int i;
-
-	if (WARN_ON(!header || !buf))
-		return -EINVAL;
-
-	length = header->length;
-
-	dev_dbg(dev->dev, MEI_HDR_FMT, MEI_HDR_PRM(header));
-
-	dw_cnt = mei_data2slots(length);
-	if (dw_cnt > slots)
-		return -EMSGSIZE;
-
-	if (WARN(!hw->aliveness, "txe write: aliveness not asserted\n"))
-		return -EAGAIN;
-
-	/* Enable Input Ready Interrupt. */
-	mei_txe_input_ready_interrupt_enable(dev);
-
-	if (!mei_txe_is_input_ready(dev)) {
-		char fw_sts_str[MEI_FW_STATUS_STR_SZ];
-
-		mei_fw_status_str(dev, fw_sts_str, MEI_FW_STATUS_STR_SZ);
-		dev_err(dev->dev, "Input is not ready %s\n", fw_sts_str);
-		return -EAGAIN;
-	}
-
-	mei_txe_input_payload_write(dev, 0, *((u32 *)header));
-
-	for (i = 0; i < length / 4; i++)
-		mei_txe_input_payload_write(dev, i + 1, reg_buf[i]);
-
-	rem = length & 0x3;
-	if (rem > 0) {
-		u32 reg = 0;
-
-		memcpy(&reg, &buf[length - rem], rem);
-		mei_txe_input_payload_write(dev, i + 1, reg);
-	}
-
-	/* after each write the whole buffer is consumed */
-	hw->slots = 0;
-
-	/* Set Input-Doorbell */
-	mei_txe_input_doorbell_set(hw);
-
-	return 0;
-}
-
-/**
- * mei_txe_hbuf_max_len - mimics the me hbuf circular buffer
- *
- * @dev: the device structure
- *
- * Return: the PAYLOAD_SIZE - 4
- */
-static size_t mei_txe_hbuf_max_len(const struct mei_device *dev)
-{
-	return PAYLOAD_SIZE - sizeof(struct mei_msg_hdr);
-}
-
-/**
- * mei_txe_hbuf_empty_slots - mimics the me hbuf circular buffer
- *
- * @dev: the device structure
- *
- * Return: always hbuf_depth
- */
-static int mei_txe_hbuf_empty_slots(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	return hw->slots;
-}
-
-/**
- * mei_txe_count_full_read_slots - mimics the me device circular buffer
- *
- * @dev: the device structure
- *
- * Return: always buffer size in dwords count
- */
-static int mei_txe_count_full_read_slots(struct mei_device *dev)
-{
-	/* read buffers has static size */
-	return  PAYLOAD_SIZE / 4;
-}
-
-/**
- * mei_txe_read_hdr - read message header which is always in 4 first bytes
- *
- * @dev: the device structure
- *
- * Return: mei message header
- */
-
-static u32 mei_txe_read_hdr(const struct mei_device *dev)
-{
-	return mei_txe_out_data_read(dev, 0);
-}
-/**
- * mei_txe_read - reads a message from the txe device.
- *
- * @dev: the device structure
- * @buf: message buffer will be written
- * @len: message size will be read
- *
- * Return: -EINVAL on error wrong argument and 0 on success
- */
-static int mei_txe_read(struct mei_device *dev,
-		unsigned char *buf, unsigned long len)
-{
-
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	u32 *reg_buf, reg;
-	u32 rem;
-	u32 i;
-
-	if (WARN_ON(!buf || !len))
-		return -EINVAL;
-
-	reg_buf = (u32 *)buf;
-	rem = len & 0x3;
-
-	dev_dbg(dev->dev, "buffer-length = %lu buf[0]0x%08X\n",
-		len, mei_txe_out_data_read(dev, 0));
-
-	for (i = 0; i < len / 4; i++) {
-		/* skip header: index starts from 1 */
-		reg = mei_txe_out_data_read(dev, i + 1);
-		dev_dbg(dev->dev, "buf[%d] = 0x%08X\n", i, reg);
-		*reg_buf++ = reg;
-	}
-
-	if (rem) {
-		reg = mei_txe_out_data_read(dev, i + 1);
-		memcpy(reg_buf, &reg, rem);
-	}
-
-	mei_txe_output_ready_set(hw);
-	return 0;
-}
-
-/**
- * mei_txe_hw_reset - resets host and fw.
- *
- * @dev: the device structure
- * @intr_enable: if interrupt should be enabled after reset.
- *
- * Return: 0 on success and < 0 in case of error
- */
-static int mei_txe_hw_reset(struct mei_device *dev, bool intr_enable)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-
-	u32 aliveness_req;
-	/*
-	 * read input doorbell to ensure consistency between  Bridge and SeC
-	 * return value might be garbage return
+	/* Modulation type bit settings
+	 * Override the control values preset
 	 */
-	(void)mei_txe_sec_reg_read_silent(hw, SEC_IPC_INPUT_DOORBELL_REG);
+	if (state->Mod_Type == MXL_DVBT) /* DVB-T Mode */ {
+		state->AGC_Mode = 1; /* Single AGC Mode */
 
-	aliveness_req = mei_txe_aliveness_req_get(dev);
-	hw->aliveness = mei_txe_aliveness_get(dev);
+		/* Enable RSSI */
+		status += MXL_ControlWrite(fe, SEQ_EXTSYNTHCALIF, 1);
+		status += MXL_ControlWrite(fe, SEQ_EXTDCCAL, 1);
+		status += MXL_ControlWrite(fe, AGC_EN_RSSI, 1);
+		status += MXL_ControlWrite(fe, RFA_ENCLKRFAGC, 1);
 
-	/* Disable interrupts in this stage we will poll */
-	mei_txe_intr_disable(dev);
+		/* RSSI reference point */
+		status += MXL_ControlWrite(fe, RFA_RSSI_REF, 3);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFH, 5);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFL, 1);
 
-	/*
-	 * If Aliveness Request and Aliveness Response are not equal then
-	 * wait for them to be equal
-	 * Since we might have interrupts disabled - poll for it
-	 */
-	if (aliveness_req != hw->aliveness)
-		if (mei_txe_aliveness_poll(dev, aliveness_req) < 0) {
-			dev_err(dev->dev, "wait for aliveness settle failed ... bailing out\n");
-			return -EIO;
+		/* TOP point */
+		status += MXL_ControlWrite(fe, RFA_FLR, 2);
+		status += MXL_ControlWrite(fe, RFA_CEIL, 13);
+		if (state->IF_OUT <= 6280000UL)	/* Low IF */
+			status += MXL_ControlWrite(fe, BB_IQSWAP, 0);
+		else /* High IF */
+			status += MXL_ControlWrite(fe, BB_IQSWAP, 1);
+
+	}
+	if (state->Mod_Type == MXL_ATSC) /* ATSC Mode */ {
+		state->AGC_Mode = 1;	/* Single AGC Mode */
+
+		/* Enable RSSI */
+		status += MXL_ControlWrite(fe, SEQ_EXTSYNTHCALIF, 1);
+		status += MXL_ControlWrite(fe, SEQ_EXTDCCAL, 1);
+		status += MXL_ControlWrite(fe, AGC_EN_RSSI, 1);
+		status += MXL_ControlWrite(fe, RFA_ENCLKRFAGC, 1);
+
+		/* RSSI reference point */
+		status += MXL_ControlWrite(fe, RFA_RSSI_REF, 2);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFH, 4);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFL, 1);
+
+		/* TOP point */
+		status += MXL_ControlWrite(fe, RFA_FLR, 2);
+		status += MXL_ControlWrite(fe, RFA_CEIL, 13);
+		status += MXL_ControlWrite(fe, BB_INITSTATE_DLPF_TUNE, 1);
+		/* Low Zero */
+		status += MXL_ControlWrite(fe, RFSYN_CHP_GAIN, 5);
+
+		if (state->IF_OUT <= 6280000UL)	/* Low IF */
+			status += MXL_ControlWrite(fe, BB_IQSWAP, 0);
+		else /* High IF */
+			status += MXL_ControlWrite(fe, BB_IQSWAP, 1);
+	}
+	if (state->Mod_Type == MXL_QAM) /* QAM Mode */ {
+		state->Mode = MXL_DIGITAL_MODE;
+
+		/* state->AGC_Mode = 1; */ /* Single AGC Mode */
+
+		/* Disable RSSI */	/* change here for v2.6.5 */
+		status += MXL_ControlWrite(fe, SEQ_EXTSYNTHCALIF, 1);
+		status += MXL_ControlWrite(fe, SEQ_EXTDCCAL, 1);
+		status += MXL_ControlWrite(fe, AGC_EN_RSSI, 0);
+		status += MXL_ControlWrite(fe, RFA_ENCLKRFAGC, 1);
+
+		/* RSSI reference point */
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFH, 5);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REF, 3);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFL, 2);
+		/* change here for v2.6.5 */
+		status += MXL_ControlWrite(fe, RFSYN_CHP_GAIN, 3);
+
+		if (state->IF_OUT <= 6280000UL)	/* Low IF */
+			status += MXL_ControlWrite(fe, BB_IQSWAP, 0);
+		else /* High IF */
+			status += MXL_ControlWrite(fe, BB_IQSWAP, 1);
+		status += MXL_ControlWrite(fe, RFSYN_CHP_GAIN, 2);
+
+	}
+	if (state->Mod_Type == MXL_ANALOG_CABLE) {
+		/* Analog Cable Mode */
+		/* state->Mode = MXL_DIGITAL_MODE; */
+
+		state->AGC_Mode = 1; /* Single AGC Mode */
+
+		/* Disable RSSI */
+		status += MXL_ControlWrite(fe, SEQ_EXTSYNTHCALIF, 1);
+		status += MXL_ControlWrite(fe, SEQ_EXTDCCAL, 1);
+		status += MXL_ControlWrite(fe, AGC_EN_RSSI, 0);
+		status += MXL_ControlWrite(fe, RFA_ENCLKRFAGC, 1);
+		/* change for 2.6.3 */
+		status += MXL_ControlWrite(fe, AGC_IF, 1);
+		status += MXL_ControlWrite(fe, AGC_RF, 15);
+		status += MXL_ControlWrite(fe, BB_IQSWAP, 1);
+	}
+
+	if (state->Mod_Type == MXL_ANALOG_OTA) {
+		/* Analog OTA Terrestrial mode add for 2.6.7 */
+		/* state->Mode = MXL_ANALOG_MODE; */
+
+		/* Enable RSSI */
+		status += MXL_ControlWrite(fe, SEQ_EXTSYNTHCALIF, 1);
+		status += MXL_ControlWrite(fe, SEQ_EXTDCCAL, 1);
+		status += MXL_ControlWrite(fe, AGC_EN_RSSI, 1);
+		status += MXL_ControlWrite(fe, RFA_ENCLKRFAGC, 1);
+
+		/* RSSI reference point */
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFH, 5);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REF, 3);
+		status += MXL_ControlWrite(fe, RFA_RSSI_REFL, 2);
+		status += MXL_ControlWrite(fe, RFSYN_CHP_GAIN, 3);
+		status += MXL_ControlWrite(fe, BB_IQSWAP, 1);
+	}
+
+	/* RSSI disable */
+	if (state->EN_RSSI == 0) {
+		status += MXL_ControlWrite(fe, SEQ_EXTSYNTHCALIF, 1);
+		status += MXL_ControlWrite(fe, SEQ_EXTDCCAL, 1);
+		status += MXL_ControlWrite(fe, AGC_EN_RSSI, 0);
+		status += MXL_ControlWrite(fe, RFA_ENCLKRFAGC, 1);
+	}
+
+	return status;
+}
+
+static u16 MXL_IFSynthInit(struct dvb_frontend *fe)
+{
+	struct mxl5005s_state *state = fe->tuner_priv;
+	u16 status = 0 ;
+	u32	Fref = 0 ;
+	u32	Kdbl, intModVal ;
+	u32	fracModVal ;
+	Kdbl = 2 ;
+
+	if (state->Fxtal >= 12000000UL && state->Fxtal <= 16000000UL)
+		Kdbl = 2 ;
+	if (state->Fxtal > 16000000UL && state->Fxtal <= 32000000UL)
+		Kdbl = 1 ;
+
+	/* IF Synthesizer Control */
+	if (state->Mode == 0 && state->IF_Mode == 1) /* Analog Low IF mode */ {
+		if (state->IF_LO == 41000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x0C);
+			Fref = 328000000UL ;
 		}
-
-	/*
-	 * If Aliveness Request and Aliveness Response are set then clear them
-	 */
-	if (aliveness_req) {
-		mei_txe_aliveness_set(dev, 0);
-		if (mei_txe_aliveness_poll(dev, 0) < 0) {
-			dev_err(dev->dev, "wait for aliveness failed ... bailing out\n");
-			return -EIO;
+		if (state->IF_LO == 47000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 376000000UL ;
+		}
+		if (state->IF_LO == 54000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x10);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x0C);
+			Fref = 324000000UL ;
+		}
+		if (state->IF_LO == 60000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x10);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 360000000UL ;
+		}
+		if (state->IF_LO == 39250000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x0C);
+			Fref = 314000000UL ;
+		}
+		if (state->IF_LO == 39650000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x0C);
+			Fref = 317200000UL ;
+		}
+		if (state->IF_LO == 40150000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x0C);
+			Fref = 321200000UL ;
+		}
+		if (state->IF_LO == 40650000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x0C);
+			Fref = 325200000UL ;
 		}
 	}
 
-	/*
-	 * Set readiness RDY_CLR bit
-	 */
-	mei_txe_readiness_clear(dev);
-
-	return 0;
-}
-
-/**
- * mei_txe_hw_start - start the hardware after reset
- *
- * @dev: the device structure
- *
- * Return: 0 on success an error code otherwise
- */
-static int mei_txe_hw_start(struct mei_device *dev)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	int ret;
-
-	u32 hisr;
-
-	/* bring back interrupts */
-	mei_txe_intr_enable(dev);
-
-	ret = mei_txe_readiness_wait(dev);
-	if (ret < 0) {
-		dev_err(dev->dev, "waiting for readiness failed\n");
-		return ret;
-	}
-
-	/*
-	 * If HISR.INT2_STS interrupt status bit is set then clear it.
-	 */
-	hisr = mei_txe_br_reg_read(hw, HISR_REG);
-	if (hisr & HISR_INT_2_STS)
-		mei_txe_br_reg_write(hw, HISR_REG, HISR_INT_2_STS);
-
-	/* Clear the interrupt cause of OutputDoorbell */
-	clear_bit(TXE_INTR_OUT_DB_BIT, &hw->intr_cause);
-
-	ret = mei_txe_aliveness_set_sync(dev, 1);
-	if (ret < 0) {
-		dev_err(dev->dev, "wait for aliveness failed ... bailing out\n");
-		return ret;
-	}
-
-	/* enable input ready interrupts:
-	 * SEC_IPC_HOST_INT_MASK.IPC_INPUT_READY_INT_MASK
-	 */
-	mei_txe_input_ready_interrupt_enable(dev);
-
-
-	/*  Set the SICR_SEC_IPC_OUTPUT_STATUS.IPC_OUTPUT_READY bit */
-	mei_txe_output_ready_set(hw);
-
-	/* Set bit SICR_HOST_IPC_READINESS.HOST_RDY
-	 */
-	mei_txe_readiness_set_host_rdy(dev);
-
-	return 0;
-}
-
-/**
- * mei_txe_check_and_ack_intrs - translate multi BAR interrupt into
- *  single bit mask and acknowledge the interrupts
- *
- * @dev: the device structure
- * @do_ack: acknowledge interrupts
- *
- * Return: true if found interrupts to process.
- */
-static bool mei_txe_check_and_ack_intrs(struct mei_device *dev, bool do_ack)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	u32 hisr;
-	u32 hhisr;
-	u32 ipc_isr;
-	u32 aliveness;
-	bool generated;
-
-	/* read interrupt registers */
-	hhisr = mei_txe_br_reg_read(hw, HHISR_REG);
-	generated = (hhisr & IPC_HHIER_MSK);
-	if (!generated)
-		goto out;
-
-	hisr = mei_txe_br_reg_read(hw, HISR_REG);
-
-	aliveness = mei_txe_aliveness_get(dev);
-	if (hhisr & IPC_HHIER_SEC && aliveness) {
-		ipc_isr = mei_txe_sec_reg_read_silent(hw,
-				SEC_IPC_HOST_INT_STATUS_REG);
-	} else {
-		ipc_isr = 0;
-		hhisr &= ~IPC_HHIER_SEC;
-	}
-
-	generated = generated ||
-		(hisr & HISR_INT_STS_MSK) ||
-		(ipc_isr & SEC_IPC_HOST_INT_STATUS_PENDING);
-
-	if (generated && do_ack) {
-		/* Save the interrupt causes */
-		hw->intr_cause |= hisr & HISR_INT_STS_MSK;
-		if (ipc_isr & SEC_IPC_HOST_INT_STATUS_IN_RDY)
-			hw->intr_cause |= TXE_INTR_IN_READY;
-
-
-		mei_txe_intr_disable(dev);
-		/* Clear the interrupts in hierarchy:
-		 * IPC and Bridge, than the High Level */
-		mei_txe_sec_reg_write_silent(hw,
-			SEC_IPC_HOST_INT_STATUS_REG, ipc_isr);
-		mei_txe_br_reg_write(hw, HISR_REG, hisr);
-		mei_txe_br_reg_write(hw, HHISR_REG, hhisr);
-	}
-
-out:
-	return generated;
-}
-
-/**
- * mei_txe_irq_quick_handler - The ISR of the MEI device
- *
- * @irq: The irq number
- * @dev_id: pointer to the device structure
- *
- * Return: IRQ_WAKE_THREAD if interrupt is designed for the device
- *         IRQ_NONE otherwise
- */
-irqreturn_t mei_txe_irq_quick_handler(int irq, void *dev_id)
-{
-	struct mei_device *dev = dev_id;
-
-	if (mei_txe_check_and_ack_intrs(dev, true))
-		return IRQ_WAKE_THREAD;
-	return IRQ_NONE;
-}
-
-
-/**
- * mei_txe_irq_thread_handler - txe interrupt thread
- *
- * @irq: The irq number
- * @dev_id: pointer to the device structure
- *
- * Return: IRQ_HANDLED
- */
-irqreturn_t mei_txe_irq_thread_handler(int irq, void *dev_id)
-{
-	struct mei_device *dev = (struct mei_device *) dev_id;
-	struct mei_txe_hw *hw = to_txe_hw(dev);
-	struct mei_cl_cb complete_list;
-	s32 slots;
-	int rets = 0;
-
-	dev_dbg(dev->dev, "irq thread: Interrupt Registers HHISR|HISR|SEC=%02X|%04X|%02X\n",
-		mei_txe_br_reg_read(hw, HHISR_REG),
-		mei_txe_br_reg_read(hw, HISR_REG),
-		mei_txe_sec_reg_read_silent(hw, SEC_IPC_HOST_INT_STATUS_REG));
-
-
-	/* initialize our complete list */
-	mutex_lock(&dev->device_lock);
-	mei_io_list_init(&complete_list);
-
-	if (pci_dev_msi_enabled(to_pci_dev(dev->dev)))
-		mei_txe_check_and_ack_intrs(dev, true);
-
-	/* show irq events */
-	mei_txe_pending_interrupts(dev);
-
-	hw->aliveness = mei_txe_aliveness_get(dev);
-	hw->readiness = mei_txe_readiness_get(dev);
-
-	/* Readiness:
-	 * Detection of TXE driver going through reset
-	 * or TXE driver resetting the HECI interface.
-	 */
-	if (test_and_clear_bit(TXE_INTR_READINESS_BIT, &hw->intr_cause)) {
-		dev_dbg(dev->dev, "Readiness Interrupt was received...\n");
-
-		/* Check if SeC is going through reset */
-		if (mei_txe_readiness_is_sec_rdy(hw->readiness)) {
-			dev_dbg(dev->dev, "we need to start the dev.\n");
-			dev->recvd_hw_ready = true;
-		} else {
-			dev->recvd_hw_ready = false;
-			if (dev->dev_state != MEI_DEV_RESETTING) {
-
-				dev_warn(dev->dev, "FW not ready: resetting.\n");
-				schedule_work(&dev->reset_work);
-				goto end;
-
-			}
+	if (state->Mode || (state->Mode == 0 && state->IF_Mode == 0)) {
+		if (state->IF_LO == 57000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x10);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 342000000UL ;
 		}
-		wake_up(&dev->wait_hw_ready);
-	}
-
-	/************************************************************/
-	/* Check interrupt cause:
-	 * Aliveness: Detection of SeC acknowledge of host request that
-	 * it remain alive or host cancellation of that request.
-	 */
-
-	if (test_and_clear_bit(TXE_INTR_ALIVENESS_BIT, &hw->intr_cause)) {
-		/* Clear the interrupt cause */
-		dev_dbg(dev->dev,
-			"Aliveness Interrupt: Status: %d\n", hw->aliveness);
-		dev->pg_event = MEI_PG_EVENT_RECEIVED;
-		if (waitqueue_active(&hw->wait_aliveness_resp))
-			wake_up(&hw->wait_aliveness_resp);
-	}
-
-
-	/* Output Doorbell:
-	 * Detection of SeC having sent output to host
-	 */
-	slots = mei_count_full_read_slots(dev);
-	if (test_and_clear_bit(TXE_INTR_OUT_DB_BIT, &hw->intr_cause)) {
-		/* Read from TXE */
-		rets = mei_irq_read_handler(dev, &complete_list, &slots);
-		if (rets && dev->dev_state != MEI_DEV_RESETTING) {
-			dev_err(dev->dev,
-				"mei_irq_read_handler ret = %d.\n", rets);
-
-			schedule_work(&dev->reset_work);
-			goto end;
+		if (state->IF_LO == 44000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 352000000UL ;
+		}
+		if (state->IF_LO == 43750000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 350000000UL ;
+		}
+		if (state->IF_LO == 36650000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x04);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 366500000UL ;
+		}
+		if (state->IF_LO == 36150000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x04);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 361500000UL ;
+		}
+		if (state->IF_LO == 36000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x04);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 360000000UL ;
+		}
+		if (state->IF_LO == 35250000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x04);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 352500000UL ;
+		}
+		if (state->IF_LO == 34750000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x04);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 347500000UL ;
+		}
+		if (state->IF_LO == 6280000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x07);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 376800000UL ;
+		}
+		if (state->IF_LO == 5000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x09);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 360000000UL ;
+		}
+		if (state->IF_LO == 4500000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x06);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 360000000UL ;
+		}
+		if (state->IF_LO == 4570000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x06);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 365600000UL ;
+		}
+		if (state->IF_LO == 4000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x05);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 360000000UL ;
+		}
+		if (state->IF_LO == 57400000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x10);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 344400000UL ;
+		}
+		if (state->IF_LO == 44400000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 355200000UL ;
+		}
+		if (state->IF_LO == 44150000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x08);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 353200000UL ;
+		}
+		if (state->IF_LO == 37050000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x04);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 370500000UL ;
+		}
+		if (state->IF_LO == 36550000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x04);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 365500000UL ;
+		}
+		if (state->IF_LO == 36125000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x04);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 361250000UL ;
+		}
+		if (state->IF_LO == 6000000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x07);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 360000000UL ;
+		}
+		if (state->IF_LO == 5400000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x07);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x0C);
+			Fref = 324000000UL ;
+		}
+		if (state->IF_LO == 5380000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x07);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x0C);
+			Fref = 322800000UL ;
+		}
+		if (state->IF_LO == 5200000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x09);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 374400000UL ;
+		}
+		if (state->IF_LO == 4900000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x09);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 352800000UL ;
+		}
+		if (state->IF_LO == 4400000UL) {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x06);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 352000000UL ;
+		}
+		if (state->IF_LO == 4063000UL)  /* add for 2.6.8 */ {
+			status += MXL_ControlWrite(fe, IF_DIVVAL,   0x05);
+			status += MXL_ControlWrite(fe, IF_VCO_BIAS, 0x08);
+			Fref = 365670000UL ;
 		}
 	}
-	/* Input Ready: Detection if host can write to SeC */
-	if (test_and_clear_bit(TXE_INTR_IN_READY_BIT, &hw->intr_cause)) {
-		dev->hbuf_is_ready = true;
-		hw->slots = dev->hbuf_depth;
-	}
+	/* CHCAL_INT_MOD_IF */
+	/* CHCAL_FRAC_MOD_IF */
+	intModVal = Fref / (state->Fxtal * Kdbl/2);
+	status += MXL_ControlWrite(fe, CHCAL_INT_MOD_IF, intModVal);
 
-	if (hw->aliveness && dev->hbuf_is_ready) {
-		/* get the real register value */
-		dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
-		rets = mei_irq_write_handler(dev, &complete_list);
-		if (rets && rets != -EMSGSIZE)
-			dev_err(dev->dev, "mei_irq_write_handler ret = %d.\n",
-				rets);
-		dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
-	}
+	fracModVal = (2<<15)*(Fref/1000 - (state->Fxtal/1000 * Kdbl/2) *
+		intModVal);
 
-	mei_irq_compl_handler(dev, &complete_list);
+	fracModVal = fracModVal / ((state->Fxtal * Kdbl/2)/1000);
+	status += MXL_ControlWrite(fe, CHCAL_FRAC_MOD_IF, fracModVal);
 
-end:
-	dev_dbg(dev->dev, "interrupt thread end ret = %d\n", rets);
-
-	mutex_unlock(&dev->device_lock);
-
-	mei_enable_interrupts(dev);
-	return IRQ_HANDLED;
+	return status ;
 }
 
-static const struct mei_hw_ops mei_txe_hw_ops = {
-
-	.host_is_ready = mei_txe_host_is_ready,
-
-	.fw_status = mei_txe_fw_status,
-	.pg_state = mei_txe_pg_state,
-
-	.hw_is_ready = mei_txe_hw_is_ready,
-	.hw_reset = mei_txe_hw_reset,
-	.hw_config = mei_txe_hw_config,
-	.hw_start = mei_txe_hw_start,
-
-	.pg_in_transition = mei_txe_pg_in_transition,
-	.pg_is_enabled = mei_txe_pg_is_enabled,
-
-	.intr_clear = mei_txe_intr_clear,
-	.intr_enable = mei_txe_intr_enable,
-	.intr_disable = mei_txe_intr_disable,
-
-	.hbuf_free_slots = mei_txe_hbuf_empty_slots,
-	.hbuf_is_ready = mei_txe_is_input_ready,
-	.hbuf_max_len = mei_txe_hbuf_max_len,
-
-	.write = mei_txe_write,
-
-	.rdbuf_full_slots = mei_txe_count_full_read_slots,
-	.read_hdr = mei_txe_read_hdr,
-
-	.read = mei_txe_read,
-
-};
-
-/**
- * mei_txe_dev_init - allocates and initializes txe hardware specific structure
- *
- * @pdev: pci device
- *
- * Return: struct mei_device * on success or NULL
- */
-struct mei_device *mei_txe_dev_init(struct pci_dev *pdev)
+static u16 MXL_TuneRF(struct dvb_frontend *fe, u32 RF_Freq)
 {
-	struct mei_device *dev;
-	struct mei_txe_hw *hw;
+	struct mxl5005s_state *state = fe->tuner_priv;
+	u16 status = 0;
+	u32 divider_val, E3, E4, E5, E5A;
+	u32 Fmax, Fmin, FmaxBin, FminBin;
+	u32 Kdbl_RF = 2;
+	u32 tg_divval;
+	u32 tg_lo;
 
-	dev = kzalloc(sizeof(struct mei_device) +
-			 sizeof(struct mei_txe_hw), GFP_KERNEL);
-	if (!dev)
-		return NULL;
+	u32 Fref_TG;
+	u32 Fvco;
 
-	mei_device_init(dev, &pdev->dev, &mei_txe_hw_ops);
+	state->RF_IN = RF_Freq;
 
-	hw = to_txe_hw(dev);
+	MXL_SynthRFTGLO_Calc(fe);
 
-	init_waitqueue_head(&hw->wait_aliveness_resp);
+	if (state->Fxtal >= 12000000UL && state->Fxtal <= 22000000UL)
+		Kdbl_RF = 2;
+	if (state->Fxtal > 22000000 && state->Fxtal <= 32000000)
+		Kdbl_RF = 1;
 
-	return dev;
-}
+	/* Downconverter Controls
+	 * Look-Up Table Implementation for:
+	 *	DN_POLY
+	 *	DN_RFGAIN
+	 *	DN_CAP_RFLPF
+	 *	DN_EN_VHFUHFBAR
+	 *	DN_GAIN_ADJUST
+	 *  Change the boundary reference from RF_IN to RF_LO
+	 */
+	if (state->RF_LO < 40000000UL)
+		return -1;
 
-/**
- * mei_txe_setup_satt2 - SATT2 configuration for DMA support.
- *
- * @dev:   the device structure
- * @addr:  physical address start of the range
- * @range: physical range size
- *
- * Return: 0 on success an error code otherwise
- */
-int mei_txe_setup_satt2(struct mei_device *dev, phys_addr_t addr, u32 range)
-{
-	struct mei_txe_hw *hw = to_txe_hw(dev);
+	if (state->RF_LO >= 40000000UL && state->RF_LO <= 75000000UL) {
+		status += MXL_ControlWrite(fe, DN_POLY,              2);
+		status += MXL_ControlWrite(fe, DN_RFGAIN,            3);
+		status += MXL_ControlWrite(fe, DN_CAP_RFLPF,         423);
+		status += MXL_ControlWrite(fe, DN_EN_VHFUHFBAR,      1);
+		status += MXL_ControlWrite(fe, DN_GAIN_ADJUST,       1);
+	}
+	if (state->RF_LO > 75000000UL && state->RF_LO <= 100000000UL) {
+		status += MXL_ControlWrite(fe, DN_POLY,              3);
+		status += MXL_ControlWrite(fe, DN_RFGAIN,            3);
+		status += MXL_ControlWrite(fe, DN_CAP_RFLPF,         222);
+		status += MXL_ControlWrite(fe, DN_EN_VHFUHFBAR,      1);
+		status += MXL_ControlWrite(fe, DN_GAIN_ADJUST,       1);
+	}
+	if (state->RF_LO > 100000000UL && state->RF_LO <= 150000000UL) {
+		status += MXL_ControlWrite(fe, DN_POLY,              3);
+		status += MXL_ControlWrite(fe, DN_RFGAIN,            3);
+		status += MXL_ControlWrite(fe, DN_CAP_RFLPF,         147);
+		status += MXL_ControlWrite(fe, DN_EN_VHFUHFBAR,      1);
+		status += MXL_ControlWrite(fe, DN_GAIN_ADJUST,       2);
+	}
+	if (state->RF_LO > 150000000UL && state->RF_LO <= 200000000UL) {
+		status += MXL_ControlWrite(fe, DN_POLY,              3);
+		status += MXL_ControlWrite(fe, DN_RFGAIN,            3);
+		status += MXL_ControlWrite(fe, DN_CAP_RFLPF,         9);
+		status += MXL_ControlWrite(fe, DN_EN_VHFUHFBAR,      1);
+		status += MXL_ControlWrite(fe, DN_GAIN_ADJUST,       2);
+	}
+	if (state->RF_LO > 200000000UL && state->RF_LO <= 300000000UL) {
+		status += MXL_ControlWrite(fe, DN_POLY,              3);
+		status += MXL_ControlWrite(fe, DN_RFGAIN,            3);
+		status += MXL_ControlWrite(fe, DN_CAP_RFLPF,         0);
+		status += MXL_ControlWrite(fe, DN_EN_VHFUHFBAR,      1);
+		status += MXL_ControlWrite(fe, DN_GAIN_ADJUST,       3);
+	}
+	if (state->RF_LO > 300000000UL && state->RF_LO <= 650000000UL) {
+		status += MXL_ControlWrite(fe, DN_POLY,              3);
+		status += MXL_ControlWrite(fe, DN_RFGAIN,            1);
+		status += MXL_ControlWrite(fe, DN_CAP_RFLPF,         0);
+		status += MXL_ControlWrite(fe, DN_EN_VHFUHFBAR,      0);
+		status += MXL_ControlWrite(fe, DN_GAIN_ADJUST,       3);
+	}
+	if (state->RF_LO > 650000000UL && state->RF_LO <= 900000000UL) {
+		status += MXL_ControlWrite(fe, DN_POLY,              3);
+		status += MXL_ControlWrite(fe, DN_RFGAIN,            2);
+		status += MXL_ControlWrite(fe, DN_CAP_RFLPF,         0);
+		status += MXL_ControlWrite(fe, DN_EN_VHFUHFBAR,      0);
+		status += MXL_ControlWrite(fe, DN_GAIN_ADJUST,       3);
+	}
+	if (state->RF_LO > 900000000UL)
+		return -1;
 
-	u32 lo32 = lower_32_bits(addr);
-	u32 hi32 = upper_32_bits(addr);
-	u32 ctrl;
-
-	/* SATT is limited to 36 Bits */
-	if (hi32 & ~0xF)
-		return -EINVAL;
-
-	/* SATT has to be 16Byte aligned */
-	if (lo32 & 0xF)
-		return -EINVAL;
-
-	/* SATT range has to be 4Bytes aligned */
-	if (range & 0x4)
-		return -EINVAL;
-
-	/* SATT is limited to 32 MB range*/
-	if (range > SATT_RANGE_MAX)
-		return -EINVAL;
-
-	ctrl = SATT2_CTRL_VALID_MSK;
-	ctrl |= hi32  << SATT2_CTRL_BR_BASE_ADDR_REG_SHIFT;
-
-	mei_txe_br_reg_write(hw, SATT2_SAP_SIZE_REG, range);
-	mei_txe_br_reg_write(hw, SATT2_BRG_BA_LSB_REG, lo32);
-	mei_txe_br_reg_write(hw, SATT2_CTRL_REG, ctrl);
-	dev_dbg(dev->dev, "SATT2: SAP_SIZE_OFFSET=0x%08X, BRG_BA_LSB_OFFSET=0x%08X, CTRL_OFFSET=0x%08X\n",
-		range, lo32, ctrl);
-
-	return 0;
-}
+	/*	DN_IQTNBUF_AMP */
+	/*	DN_IQTNGNBFBIAS_BST */
+	if (state->RF_LO >= 40000000UL && state->RF_LO <= 75000000UL) {
+		status += MXL_ControlWrite(fe, DN_IQTNBUF_AMP,       1);
+		status += MXL_ControlWrite(fe, DN_IQTNGNBFBIAS_BST,  0);
+	}
+	if (state->RF_LO > 75000000UL && state->RF_LO <= 100000000UL) {
+		status += MXL_ControlWrite(fe, DN_IQTNBUF_AMP,       1);
+		status += MXL_ControlWrite(fe, DN_IQTNGNBFBIAS_BST,  0);
+	}
+	if (state->RF_LO > 100000000UL && state->RF_LO <= 150000000UL) {
+		status += MXL_ControlWrite(fe, DN_IQTNBUF_AMP,       1);
+		status += MXL_ControlWrite(fe, DN_IQTNGNBFBIAS_BST,  0);
+	}
+	if (state->RF_LO > 150000000UL && state->RF_LO <= 200000000UL) {
+		status += MXL_ControlWrite(fe, DN_IQTNBUF_AMP,       1);
+		status += MXL_ControlWrite(fe, DN_IQTNGNBFBIAS_BST,  0);
+	}
+	if (state->RF_LO > 200000000UL

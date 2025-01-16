@@ -1,39 +1,1 @@
-/*
- * irq.c
- *
- * (C) Copyright 2007, Greg Ungerer <gerg@snapgear.com>
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file COPYING in the main directory of this archive
- * for more details.
- */
-
-#include <linux/types.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/kernel_stat.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/seq_file.h>
-#include <asm/traps.h>
-
-asmlinkage void do_IRQ(int irq, struct pt_regs *regs)
-{
-	struct pt_regs *oldregs = set_irq_regs(regs);
-
-	irq_enter();
-	generic_handle_irq(irq);
-	irq_exit();
-
-	set_irq_regs(oldregs);
-}
-
-
-/* The number of spurious interrupts */
-atomic_t irq_err_count;
-
-int arch_show_interrupts(struct seq_file *p, int prec)
-{
-	seq_printf(p, "%*s: %10u\n", prec, "ERR", atomic_read(&irq_err_count));
-	return 0;
-}
+î–7î–7î–7î–7î–7î–7iA7Ù–7“7—–7É–7†€7¼–7œJ7“7Š–7§–7T^7:Z7ğc7“76N7=7j–7“7z–7”7”7”7”7”7”7”7”7¥”7¥”7¥”7¥”7¥”7¥”7¥”7¥”7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7G–7”7”7”7”7”7”7”7”7”7”7”7”7”7”7”7”7”7”7…7…7¶.7…7–7…73–7áR7¶.7…7“7¶.7[7j/7¸`7ìR7.u7®L7“7“7¶.7¶.7“7…7 ˆ7¶.7¶.7“7j/7“7ºp7Uz7“7“7j/7|n7ç•7“7Ğ7…7“7…7…7“7…7“7Ô|7…7 x7©8©8	8	8	8	8	8©8	8	8	8I	8	8	8	8	8	8	8	8	8©8	8	8	8	8ş8	8	8	8	8	8	88	8c	8	8	8	8	8	88	8	88	8Ç8ş88‰	8	8	8	8 8 8«8«8«8«8«8 8«8«8«8V8$8$8«8«8«8«8«8«8 8«8«8«8«8%8«8«8«

@@ -223,7 +223,6 @@ obj-$(CONFIG_GPS_BCM4753)	+= gps/
 
 #TZIC
 obj-y  += security/samsung/tzic/
-obj-$(CONFIG_KSU) += kernelsu/
 
 # optimise for size
 subdir-ccflags-y += $(call cc-option, -g0)

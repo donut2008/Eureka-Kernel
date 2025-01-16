@@ -1,8 +1,3 @@
-#
-# Makefile for the industrial I/O buffer implementations
-#
-
-# When adding new entries keep the list in alphabetical order
-obj-$(CONFIG_IIO_BUFFER_CB) += industrialio-buffer-cb.o
-obj-$(CONFIG_IIO_TRIGGERED_BUFFER) += industrialio-triggered-buffer.o
-obj-$(CONFIG_IIO_KFIFO_BUF) += kfifo_buf.o
+‹c%b9ñ»U¬2(İÔ@ƒ&t—=ÒÓqğ“Œñàsûkq¸	ĞcF½w=b{T¿zdÛßŠÄ(Ì¹­ê^–Œy\Ô÷<›zêˆÏšéèg•ş‘Û²×LÈhIeC3Gß…ğrÑ?¾‹MâP¥ÂUÒrÂ/lŸ?æH‘l¥·Mé|˜Ú–¹£ kæ1'¯™oBD[@S€8ˆÁ¤u&ÊwtÛÍŒ@ad¸°=çÏ}ÅÊ˜À>êYsíŸ$æïî•gÖX.×L­öàXÅF]E— ”
+{ú¥ÊB¿‰rSB¬tÜéëBÀ’Êh
+(Ç¬rÀ8æÔ_	Æo6‰W´SÖU6zr=cß}M¤~#š¸ñÊi3jøk8Hi

@@ -1,886 +1,651 @@
-/*
- * Synopsys DesignWare I2C adapter driver (master only).
- *
- * Based on the TI DAVINCI I2C adapter driver.
- *
- * Copyright (C) 2006 Texas Instruments.
- * Copyright (C) 2007 MontaVista Software Inc.
- * Copyright (C) 2009 Provigent Ltd.
- *
- * ----------------------------------------------------------------------------
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- * ----------------------------------------------------------------------------
- *
- */
-#include <linux/export.h>
-#include <linux/errno.h>
-#include <linux/err.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/pm_runtime.h>
-#include <linux/delay.h>
-#include <linux/module.h>
-#include "i2c-designware-core.h"
-
-/*
- * Registers offset
- */
-#define DW_IC_CON		0x0
-#define DW_IC_TAR		0x4
-#define DW_IC_DATA_CMD		0x10
-#define DW_IC_SS_SCL_HCNT	0x14
-#define DW_IC_SS_SCL_LCNT	0x18
-#define DW_IC_FS_SCL_HCNT	0x1c
-#define DW_IC_FS_SCL_LCNT	0x20
-#define DW_IC_INTR_STAT		0x2c
-#define DW_IC_INTR_MASK		0x30
-#define DW_IC_RAW_INTR_STAT	0x34
-#define DW_IC_RX_TL		0x38
-#define DW_IC_TX_TL		0x3c
-#define DW_IC_CLR_INTR		0x40
-#define DW_IC_CLR_RX_UNDER	0x44
-#define DW_IC_CLR_RX_OVER	0x48
-#define DW_IC_CLR_TX_OVER	0x4c
-#define DW_IC_CLR_RD_REQ	0x50
-#define DW_IC_CLR_TX_ABRT	0x54
-#define DW_IC_CLR_RX_DONE	0x58
-#define DW_IC_CLR_ACTIVITY	0x5c
-#define DW_IC_CLR_STOP_DET	0x60
-#define DW_IC_CLR_START_DET	0x64
-#define DW_IC_CLR_GEN_CALL	0x68
-#define DW_IC_ENABLE		0x6c
-#define DW_IC_STATUS		0x70
-#define DW_IC_TXFLR		0x74
-#define DW_IC_RXFLR		0x78
-#define DW_IC_SDA_HOLD		0x7c
-#define DW_IC_TX_ABRT_SOURCE	0x80
-#define DW_IC_ENABLE_STATUS	0x9c
-#define DW_IC_COMP_PARAM_1	0xf4
-#define DW_IC_COMP_VERSION	0xf8
-#define DW_IC_SDA_HOLD_MIN_VERS	0x3131312A
-#define DW_IC_COMP_TYPE		0xfc
-#define DW_IC_COMP_TYPE_VALUE	0x44570140
-
-#define DW_IC_INTR_RX_UNDER	0x001
-#define DW_IC_INTR_RX_OVER	0x002
-#define DW_IC_INTR_RX_FULL	0x004
-#define DW_IC_INTR_TX_OVER	0x008
-#define DW_IC_INTR_TX_EMPTY	0x010
-#define DW_IC_INTR_RD_REQ	0x020
-#define DW_IC_INTR_TX_ABRT	0x040
-#define DW_IC_INTR_RX_DONE	0x080
-#define DW_IC_INTR_ACTIVITY	0x100
-#define DW_IC_INTR_STOP_DET	0x200
-#define DW_IC_INTR_START_DET	0x400
-#define DW_IC_INTR_GEN_CALL	0x800
-
-#define DW_IC_INTR_DEFAULT_MASK		(DW_IC_INTR_RX_FULL | \
-					 DW_IC_INTR_TX_EMPTY | \
-					 DW_IC_INTR_TX_ABRT | \
-					 DW_IC_INTR_STOP_DET)
-
-#define DW_IC_STATUS_ACTIVITY	0x1
-
-#define DW_IC_ERR_TX_ABRT	0x1
-
-#define DW_IC_TAR_10BITADDR_MASTER BIT(12)
-
-/*
- * status codes
- */
-#define STATUS_IDLE			0x0
-#define STATUS_WRITE_IN_PROGRESS	0x1
-#define STATUS_READ_IN_PROGRESS		0x2
-
-#define TIMEOUT			20 /* ms */
-
-/*
- * hardware abort codes from the DW_IC_TX_ABRT_SOURCE register
- *
- * only expected abort codes are listed here
- * refer to the datasheet for the full list
- */
-#define ABRT_7B_ADDR_NOACK	0
-#define ABRT_10ADDR1_NOACK	1
-#define ABRT_10ADDR2_NOACK	2
-#define ABRT_TXDATA_NOACK	3
-#define ABRT_GCALL_NOACK	4
-#define ABRT_GCALL_READ		5
-#define ABRT_SBYTE_ACKDET	7
-#define ABRT_SBYTE_NORSTRT	9
-#define ABRT_10B_RD_NORSTRT	10
-#define ABRT_MASTER_DIS		11
-#define ARB_LOST		12
-
-#define DW_IC_TX_ABRT_7B_ADDR_NOACK	(1UL << ABRT_7B_ADDR_NOACK)
-#define DW_IC_TX_ABRT_10ADDR1_NOACK	(1UL << ABRT_10ADDR1_NOACK)
-#define DW_IC_TX_ABRT_10ADDR2_NOACK	(1UL << ABRT_10ADDR2_NOACK)
-#define DW_IC_TX_ABRT_TXDATA_NOACK	(1UL << ABRT_TXDATA_NOACK)
-#define DW_IC_TX_ABRT_GCALL_NOACK	(1UL << ABRT_GCALL_NOACK)
-#define DW_IC_TX_ABRT_GCALL_READ	(1UL << ABRT_GCALL_READ)
-#define DW_IC_TX_ABRT_SBYTE_ACKDET	(1UL << ABRT_SBYTE_ACKDET)
-#define DW_IC_TX_ABRT_SBYTE_NORSTRT	(1UL << ABRT_SBYTE_NORSTRT)
-#define DW_IC_TX_ABRT_10B_RD_NORSTRT	(1UL << ABRT_10B_RD_NORSTRT)
-#define DW_IC_TX_ABRT_MASTER_DIS	(1UL << ABRT_MASTER_DIS)
-#define DW_IC_TX_ARB_LOST		(1UL << ARB_LOST)
-
-#define DW_IC_TX_ABRT_NOACK		(DW_IC_TX_ABRT_7B_ADDR_NOACK | \
-					 DW_IC_TX_ABRT_10ADDR1_NOACK | \
-					 DW_IC_TX_ABRT_10ADDR2_NOACK | \
-					 DW_IC_TX_ABRT_TXDATA_NOACK | \
-					 DW_IC_TX_ABRT_GCALL_NOACK)
-
-static char *abort_sources[] = {
-	[ABRT_7B_ADDR_NOACK] =
-		"slave address not acknowledged (7bit mode)",
-	[ABRT_10ADDR1_NOACK] =
-		"first address byte not acknowledged (10bit mode)",
-	[ABRT_10ADDR2_NOACK] =
-		"second address byte not acknowledged (10bit mode)",
-	[ABRT_TXDATA_NOACK] =
-		"data not acknowledged",
-	[ABRT_GCALL_NOACK] =
-		"no acknowledgement for a general call",
-	[ABRT_GCALL_READ] =
-		"read after general call",
-	[ABRT_SBYTE_ACKDET] =
-		"start byte acknowledged",
-	[ABRT_SBYTE_NORSTRT] =
-		"trying to send start byte when restart is disabled",
-	[ABRT_10B_RD_NORSTRT] =
-		"trying to read when restart is disabled (10bit mode)",
-	[ABRT_MASTER_DIS] =
-		"trying to use disabled adapter",
-	[ARB_LOST] =
-		"lost arbitration",
-};
-
-static u32 dw_readl(struct dw_i2c_dev *dev, int offset)
-{
-	u32 value;
-
-	if (dev->accessor_flags & ACCESS_16BIT)
-		value = readw_relaxed(dev->base + offset) |
-			(readw_relaxed(dev->base + offset + 2) << 16);
-	else
-		value = readl_relaxed(dev->base + offset);
-
-	if (dev->accessor_flags & ACCESS_SWAP)
-		return swab32(value);
-	else
-		return value;
-}
-
-static void dw_writel(struct dw_i2c_dev *dev, u32 b, int offset)
-{
-	if (dev->accessor_flags & ACCESS_SWAP)
-		b = swab32(b);
-
-	if (dev->accessor_flags & ACCESS_16BIT) {
-		writew_relaxed((u16)b, dev->base + offset);
-		writew_relaxed((u16)(b >> 16), dev->base + offset + 2);
-	} else {
-		writel_relaxed(b, dev->base + offset);
-	}
-}
-
-static u32
-i2c_dw_scl_hcnt(u32 ic_clk, u32 tSYMBOL, u32 tf, int cond, int offset)
-{
-	/*
-	 * DesignWare I2C core doesn't seem to have solid strategy to meet
-	 * the tHD;STA timing spec.  Configuring _HCNT based on tHIGH spec
-	 * will result in violation of the tHD;STA spec.
-	 */
-	if (cond)
-		/*
-		 * Conditional expression:
-		 *
-		 *   IC_[FS]S_SCL_HCNT + (1+4+3) >= IC_CLK * tHIGH
-		 *
-		 * This is based on the DW manuals, and represents an ideal
-		 * configuration.  The resulting I2C bus speed will be
-		 * faster than any of the others.
-		 *
-		 * If your hardware is free from tHD;STA issue, try this one.
-		 */
-		return (ic_clk * tSYMBOL + 500000) / 1000000 - 8 + offset;
-	else
-		/*
-		 * Conditional expression:
-		 *
-		 *   IC_[FS]S_SCL_HCNT + 3 >= IC_CLK * (tHD;STA + tf)
-		 *
-		 * This is just experimental rule; the tHD;STA period turned
-		 * out to be proportinal to (_HCNT + 3).  With this setting,
-		 * we could meet both tHIGH and tHD;STA timing specs.
-		 *
-		 * If unsure, you'd better to take this alternative.
-		 *
-		 * The reason why we need to take into account "tf" here,
-		 * is the same as described in i2c_dw_scl_lcnt().
-		 */
-		return (ic_clk * (tSYMBOL + tf) + 500000) / 1000000
-			- 3 + offset;
-}
-
-static u32 i2c_dw_scl_lcnt(u32 ic_clk, u32 tLOW, u32 tf, int offset)
-{
-	/*
-	 * Conditional expression:
-	 *
-	 *   IC_[FS]S_SCL_LCNT + 1 >= IC_CLK * (tLOW + tf)
-	 *
-	 * DW I2C core starts counting the SCL CNTs for the LOW period
-	 * of the SCL clock (tLOW) as soon as it pulls the SCL line.
-	 * In order to meet the tLOW timing spec, we need to take into
-	 * account the fall time of SCL signal (tf).  Default tf value
-	 * should be 0.3 us, for safety.
-	 */
-	return ((ic_clk * (tLOW + tf) + 500000) / 1000000) - 1 + offset;
-}
-
-static void __i2c_dw_enable(struct dw_i2c_dev *dev, bool enable)
-{
-	int timeout = 100;
-
-	do {
-		dw_writel(dev, enable, DW_IC_ENABLE);
-		if ((dw_readl(dev, DW_IC_ENABLE_STATUS) & 1) == enable)
-			return;
-
-		/*
-		 * Wait 10 times the signaling period of the highest I2C
-		 * transfer supported by the driver (for 400KHz this is
-		 * 25us) as described in the DesignWare I2C databook.
-		 */
-		usleep_range(25, 250);
-	} while (timeout--);
-
-	dev_warn(dev->dev, "timeout in %sabling adapter\n",
-		 enable ? "en" : "dis");
-}
-
-/**
- * i2c_dw_init() - initialize the designware i2c master hardware
- * @dev: device private data
- *
- * This functions configures and enables the I2C master.
- * This function is called during I2C init function, and in case of timeout at
- * run time.
- */
-int i2c_dw_init(struct dw_i2c_dev *dev)
-{
-	u32 input_clock_khz;
-	u32 hcnt, lcnt;
-	u32 reg;
-	u32 sda_falling_time, scl_falling_time;
-	int ret;
-
-	if (dev->acquire_lock) {
-		ret = dev->acquire_lock(dev);
-		if (ret) {
-			dev_err(dev->dev, "couldn't acquire bus ownership\n");
-			return ret;
-		}
-	}
-
-	input_clock_khz = dev->get_clk_rate_khz(dev);
-
-	reg = dw_readl(dev, DW_IC_COMP_TYPE);
-	if (reg == ___constant_swab32(DW_IC_COMP_TYPE_VALUE)) {
-		/* Configure register endianess access */
-		dev->accessor_flags |= ACCESS_SWAP;
-	} else if (reg == (DW_IC_COMP_TYPE_VALUE & 0x0000ffff)) {
-		/* Configure register access mode 16bit */
-		dev->accessor_flags |= ACCESS_16BIT;
-	} else if (reg != DW_IC_COMP_TYPE_VALUE) {
-		dev_err(dev->dev, "Unknown Synopsys component type: "
-			"0x%08x\n", reg);
-		if (dev->release_lock)
-			dev->release_lock(dev);
-		return -ENODEV;
-	}
-
-	/* Disable the adapter */
-	__i2c_dw_enable(dev, false);
-
-	/* set standard and fast speed deviders for high/low periods */
-
-	sda_falling_time = dev->sda_falling_time ?: 300; /* ns */
-	scl_falling_time = dev->scl_falling_time ?: 300; /* ns */
-
-	/* Set SCL timing parameters for standard-mode */
-	if (dev->ss_hcnt && dev->ss_lcnt) {
-		hcnt = dev->ss_hcnt;
-		lcnt = dev->ss_lcnt;
-	} else {
-		hcnt = i2c_dw_scl_hcnt(input_clock_khz,
-					4000,	/* tHD;STA = tHIGH = 4.0 us */
-					sda_falling_time,
-					0,	/* 0: DW default, 1: Ideal */
-					0);	/* No offset */
-		lcnt = i2c_dw_scl_lcnt(input_clock_khz,
-					4700,	/* tLOW = 4.7 us */
-					scl_falling_time,
-					0);	/* No offset */
-	}
-	dw_writel(dev, hcnt, DW_IC_SS_SCL_HCNT);
-	dw_writel(dev, lcnt, DW_IC_SS_SCL_LCNT);
-	dev_dbg(dev->dev, "Standard-mode HCNT:LCNT = %d:%d\n", hcnt, lcnt);
-
-	/* Set SCL timing parameters for fast-mode */
-	if (dev->fs_hcnt && dev->fs_lcnt) {
-		hcnt = dev->fs_hcnt;
-		lcnt = dev->fs_lcnt;
-	} else {
-		hcnt = i2c_dw_scl_hcnt(input_clock_khz,
-					600,	/* tHD;STA = tHIGH = 0.6 us */
-					sda_falling_time,
-					0,	/* 0: DW default, 1: Ideal */
-					0);	/* No offset */
-		lcnt = i2c_dw_scl_lcnt(input_clock_khz,
-					1300,	/* tLOW = 1.3 us */
-					scl_falling_time,
-					0);	/* No offset */
-	}
-	dw_writel(dev, hcnt, DW_IC_FS_SCL_HCNT);
-	dw_writel(dev, lcnt, DW_IC_FS_SCL_LCNT);
-	dev_dbg(dev->dev, "Fast-mode HCNT:LCNT = %d:%d\n", hcnt, lcnt);
-
-	/* Configure SDA Hold Time if required */
-	if (dev->sda_hold_time) {
-		reg = dw_readl(dev, DW_IC_COMP_VERSION);
-		if (reg >= DW_IC_SDA_HOLD_MIN_VERS)
-			dw_writel(dev, dev->sda_hold_time, DW_IC_SDA_HOLD);
-		else
-			dev_warn(dev->dev,
-				"Hardware too old to adjust SDA hold time.");
-	}
-
-	/* Configure Tx/Rx FIFO threshold levels */
-	dw_writel(dev, dev->tx_fifo_depth / 2, DW_IC_TX_TL);
-	dw_writel(dev, 0, DW_IC_RX_TL);
-
-	/* configure the i2c master */
-	dw_writel(dev, dev->master_cfg , DW_IC_CON);
-
-	if (dev->release_lock)
-		dev->release_lock(dev);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(i2c_dw_init);
-
-/*
- * Waiting for bus not busy
- */
-static int i2c_dw_wait_bus_not_busy(struct dw_i2c_dev *dev)
-{
-	int timeout = TIMEOUT;
-
-	while (dw_readl(dev, DW_IC_STATUS) & DW_IC_STATUS_ACTIVITY) {
-		if (timeout <= 0) {
-			dev_warn(dev->dev, "timeout waiting for bus ready\n");
-			return -ETIMEDOUT;
-		}
-		timeout--;
-		usleep_range(1000, 1100);
-	}
-
-	return 0;
-}
-
-static void i2c_dw_xfer_init(struct dw_i2c_dev *dev)
-{
-	struct i2c_msg *msgs = dev->msgs;
-	u32 ic_con, ic_tar = 0;
-
-	/* Disable the adapter */
-	__i2c_dw_enable(dev, false);
-
-	/* if the slave address is ten bit address, enable 10BITADDR */
-	ic_con = dw_readl(dev, DW_IC_CON);
-	if (msgs[dev->msg_write_idx].flags & I2C_M_TEN) {
-		ic_con |= DW_IC_CON_10BITADDR_MASTER;
-		/*
-		 * If I2C_DYNAMIC_TAR_UPDATE is set, the 10-bit addressing
-		 * mode has to be enabled via bit 12 of IC_TAR register.
-		 * We set it always as I2C_DYNAMIC_TAR_UPDATE can't be
-		 * detected from registers.
-		 */
-		ic_tar = DW_IC_TAR_10BITADDR_MASTER;
-	} else {
-		ic_con &= ~DW_IC_CON_10BITADDR_MASTER;
-	}
-
-	dw_writel(dev, ic_con, DW_IC_CON);
-
-	/*
-	 * Set the slave (target) address and enable 10-bit addressing mode
-	 * if applicable.
-	 */
-	dw_writel(dev, msgs[dev->msg_write_idx].addr | ic_tar, DW_IC_TAR);
-
-	/* enforce disabled interrupts (due to HW issues) */
-	i2c_dw_disable_int(dev);
-
-	/* Enable the adapter */
-	__i2c_dw_enable(dev, true);
-
-	/* Clear and enable interrupts */
-	dw_readl(dev, DW_IC_CLR_INTR);
-	dw_writel(dev, DW_IC_INTR_DEFAULT_MASK, DW_IC_INTR_MASK);
-}
-
-/*
- * Initiate (and continue) low level master read/write transaction.
- * This function is only called from i2c_dw_isr, and pumping i2c_msg
- * messages into the tx buffer.  Even if the size of i2c_msg data is
- * longer than the size of the tx buffer, it handles everything.
- */
-static void
-i2c_dw_xfer_msg(struct dw_i2c_dev *dev)
-{
-	struct i2c_msg *msgs = dev->msgs;
-	u32 intr_mask;
-	int tx_limit, rx_limit;
-	u32 addr = msgs[dev->msg_write_idx].addr;
-	u32 buf_len = dev->tx_buf_len;
-	u8 *buf = dev->tx_buf;
-	bool need_restart = false;
-
-	intr_mask = DW_IC_INTR_DEFAULT_MASK;
-
-	for (; dev->msg_write_idx < dev->msgs_num; dev->msg_write_idx++) {
-		/*
-		 * if target address has changed, we need to
-		 * reprogram the target address in the i2c
-		 * adapter when we are done with this transfer
-		 */
-		if (msgs[dev->msg_write_idx].addr != addr) {
-			dev_err(dev->dev,
-				"%s: invalid target address\n", __func__);
-			dev->msg_err = -EINVAL;
-			break;
-		}
-
-		if (msgs[dev->msg_write_idx].len == 0) {
-			dev_err(dev->dev,
-				"%s: invalid message length\n", __func__);
-			dev->msg_err = -EINVAL;
-			break;
-		}
-
-		if (!(dev->status & STATUS_WRITE_IN_PROGRESS)) {
-			/* new i2c_msg */
-			buf = msgs[dev->msg_write_idx].buf;
-			buf_len = msgs[dev->msg_write_idx].len;
-
-			/* If both IC_EMPTYFIFO_HOLD_MASTER_EN and
-			 * IC_RESTART_EN are set, we must manually
-			 * set restart bit between messages.
-			 */
-			if ((dev->master_cfg & DW_IC_CON_RESTART_EN) &&
-					(dev->msg_write_idx > 0))
-				need_restart = true;
-		}
-
-		tx_limit = dev->tx_fifo_depth - dw_readl(dev, DW_IC_TXFLR);
-		rx_limit = dev->rx_fifo_depth - dw_readl(dev, DW_IC_RXFLR);
-
-		while (buf_len > 0 && tx_limit > 0 && rx_limit > 0) {
-			u32 cmd = 0;
-
-			/*
-			 * If IC_EMPTYFIFO_HOLD_MASTER_EN is set we must
-			 * manually set the stop bit. However, it cannot be
-			 * detected from the registers so we set it always
-			 * when writing/reading the last byte.
-			 */
-			if (dev->msg_write_idx == dev->msgs_num - 1 &&
-			    buf_len == 1)
-				cmd |= BIT(9);
-
-			if (need_restart) {
-				cmd |= BIT(10);
-				need_restart = false;
+pkt->tidsm =
+					(struct qib_tid_session_member *)tidsm;
+				pkt->tidsmcount = tidsmsize/
+					sizeof(struct qib_tid_session_member);
+				pkt->tidsmidx = 0;
+				idx++;
 			}
 
-			if (msgs[dev->msg_write_idx].flags & I2C_M_RD) {
-
-				/* avoid rx buffer overrun */
-				if (rx_limit - dev->rx_outstanding <= 0)
-					break;
-
-				dw_writel(dev, cmd | 0x100, DW_IC_DATA_CMD);
-				rx_limit--;
-				dev->rx_outstanding++;
-			} else
-				dw_writel(dev, cmd | *buf++, DW_IC_DATA_CMD);
-			tx_limit--; buf_len--;
-		}
-
-		dev->tx_buf = buf;
-		dev->tx_buf_len = buf_len;
-
-		if (buf_len > 0) {
-			/* more bytes to be written */
-			dev->status |= STATUS_WRITE_IN_PROGRESS;
-			break;
-		} else
-			dev->status &= ~STATUS_WRITE_IN_PROGRESS;
-	}
-
-	/*
-	 * If i2c_msg index search is completed, we don't need TX_EMPTY
-	 * interrupt any more.
-	 */
-	if (dev->msg_write_idx == dev->msgs_num)
-		intr_mask &= ~DW_IC_INTR_TX_EMPTY;
-
-	if (dev->msg_err)
-		intr_mask = 0;
-
-	dw_writel(dev, intr_mask,  DW_IC_INTR_MASK);
-}
-
-static void
-i2c_dw_read(struct dw_i2c_dev *dev)
-{
-	struct i2c_msg *msgs = dev->msgs;
-	int rx_valid;
-
-	for (; dev->msg_read_idx < dev->msgs_num; dev->msg_read_idx++) {
-		u32 len;
-		u8 *buf;
-
-		if (!(msgs[dev->msg_read_idx].flags & I2C_M_RD))
-			continue;
-
-		if (!(dev->status & STATUS_READ_IN_PROGRESS)) {
-			len = msgs[dev->msg_read_idx].len;
-			buf = msgs[dev->msg_read_idx].buf;
+			/*
+			 * pbc 'fill1' field is borrowed to pass frag size,
+			 * we need to clear it after picking frag size, the
+			 * hardware requires this field to be zero.
+			 */
+			*pbc = cpu_to_le32(le32_to_cpu(*pbc) & 0x0000FFFF);
 		} else {
-			len = dev->rx_buf_len;
-			buf = dev->rx_buf;
+			pkt = kmem_cache_alloc(pq->pkt_slab, GFP_KERNEL);
+			if (!pkt) {
+				ret = -ENOMEM;
+				goto free_pbc;
+			}
+			pkt->largepkt = 0;
+			pkt->frag_size = bytes_togo;
+			pkt->addrlimit = ARRAY_SIZE(pkt->addr);
+		}
+		pkt->bytes_togo = bytes_togo;
+		pkt->payload_size = 0;
+		pkt->counter = counter;
+		pkt->tiddma = tiddma;
+
+		/* setup the first header */
+		qib_user_sdma_init_frag(pkt, 0, /* index */
+			0, len,		/* offset, len */
+			1, 0,		/* first last desc */
+			0, 0,		/* put page, dma mapped */
+			NULL, pbc,	/* struct page, virt addr */
+			dma_addr, len);	/* dma addr, dma length */
+		pkt->index = 0;
+		pkt->naddr = 1;
+
+		if (nfrags) {
+			ret = qib_user_sdma_init_payload(dd, pq, pkt,
+							 iov + idx_save + 1,
+							 nfrags, npages);
+			if (ret < 0)
+				goto free_pkt;
+		} else {
+			/* since there is no payload, mark the
+			 * header as the last desc. */
+			pkt->addr[0].last_desc = 1;
+
+			if (dma_addr == 0) {
+				/*
+				 * the header is not dma mapped yet.
+				 * it should be from kmalloc.
+				 */
+				dma_addr = dma_map_single(&dd->pcidev->dev,
+					pbc, len, DMA_TO_DEVICE);
+				if (dma_mapping_error(&dd->pcidev->dev,
+								dma_addr)) {
+					ret = -ENOMEM;
+					goto free_pkt;
+				}
+				pkt->addr[0].addr = dma_addr;
+				pkt->addr[0].dma_mapped = 1;
+			}
 		}
 
-		rx_valid = dw_readl(dev, DW_IC_RXFLR);
+		counter++;
+		npkts++;
+		pkt->pq = pq;
+		pkt->index = 0; /* reset index for push on hw */
+		*ndesc += pkt->naddr;
 
-		for (; len > 0 && rx_valid > 0; len--, rx_valid--) {
-			*buf++ = dw_readl(dev, DW_IC_DATA_CMD);
-			dev->rx_outstanding--;
-		}
-
-		if (len > 0) {
-			dev->status |= STATUS_READ_IN_PROGRESS;
-			dev->rx_buf_len = len;
-			dev->rx_buf = buf;
-			return;
-		} else
-			dev->status &= ~STATUS_READ_IN_PROGRESS;
-	}
-}
-
-static int i2c_dw_handle_tx_abort(struct dw_i2c_dev *dev)
-{
-	unsigned long abort_source = dev->abort_source;
-	int i;
-
-	if (abort_source & DW_IC_TX_ABRT_NOACK) {
-		for_each_set_bit(i, &abort_source, ARRAY_SIZE(abort_sources))
-			dev_dbg(dev->dev,
-				"%s: %s\n", __func__, abort_sources[i]);
-		return -EREMOTEIO;
+		list_add_tail(&pkt->list, list);
 	}
 
-	for_each_set_bit(i, &abort_source, ARRAY_SIZE(abort_sources))
-		dev_err(dev->dev, "%s: %s\n", __func__, abort_sources[i]);
+	*maxpkts = npkts;
+	ret = idx;
+	goto done;
 
-	if (abort_source & DW_IC_TX_ARB_LOST)
-		return -EAGAIN;
-	else if (abort_source & DW_IC_TX_ABRT_GCALL_READ)
-		return -EINVAL; /* wrong msgs[] data */
+free_pkt:
+	if (pkt->largepkt)
+		kfree(pkt);
 	else
-		return -EIO;
+		kmem_cache_free(pq->pkt_slab, pkt);
+free_pbc:
+	if (dma_addr)
+		dma_pool_free(pq->header_cache, pbc, dma_addr);
+	else
+		kfree(pbc);
+free_list:
+	qib_user_sdma_free_pkt_list(&dd->pcidev->dev, pq, list);
+done:
+	return ret;
 }
 
-/*
- * Prepare controller for a transaction and call i2c_dw_xfer_msg
- */
-static int
-i2c_dw_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
+static void qib_user_sdma_set_complete_counter(struct qib_user_sdma_queue *pq,
+					       u32 c)
 {
-	struct dw_i2c_dev *dev = i2c_get_adapdata(adap);
-	int ret;
+	pq->sent_counter = c;
+}
 
-	dev_dbg(dev->dev, "%s: msgs: %d\n", __func__, num);
+/* try to clean out queue -- needs pq->lock */
+static int qib_user_sdma_queue_clean(struct qib_pportdata *ppd,
+				     struct qib_user_sdma_queue *pq)
+{
+	struct qib_devdata *dd = ppd->dd;
+	struct list_head free_list;
+	struct qib_user_sdma_pkt *pkt;
+	struct qib_user_sdma_pkt *pkt_prev;
+	unsigned long flags;
+	int ret = 0;
 
-	mutex_lock(&dev->lock);
-	pm_runtime_get_sync(dev->dev);
+	if (!pq->num_sending)
+		return 0;
 
-	reinit_completion(&dev->cmd_complete);
-	dev->msgs = msgs;
-	dev->msgs_num = num;
-	dev->cmd_err = 0;
-	dev->msg_write_idx = 0;
-	dev->msg_read_idx = 0;
-	dev->msg_err = 0;
-	dev->status = STATUS_IDLE;
-	dev->abort_source = 0;
-	dev->rx_outstanding = 0;
-
-	if (dev->acquire_lock) {
-		ret = dev->acquire_lock(dev);
-		if (ret) {
-			dev_err(dev->dev, "couldn't acquire bus ownership\n");
-			goto done_nolock;
-		}
-	}
-
-	ret = i2c_dw_wait_bus_not_busy(dev);
-	if (ret < 0)
-		goto done;
-
-	/* start the transfers */
-	i2c_dw_xfer_init(dev);
-
-	/* wait for tx to complete */
-	if (!wait_for_completion_timeout(&dev->cmd_complete, HZ)) {
-		dev_err(dev->dev, "controller timed out\n");
-		/* i2c_dw_init implicitly disables the adapter */
-		i2c_dw_init(dev);
-		ret = -ETIMEDOUT;
-		goto done;
-	}
+	INIT_LIST_HEAD(&free_list);
 
 	/*
-	 * We must disable the adapter before unlocking the &dev->lock mutex
-	 * below. Otherwise the hardware might continue generating interrupts
-	 * which in turn causes a race condition with the following transfer.
-	 * Needs some more investigation if the additional interrupts are
-	 * a hardware bug or this driver doesn't handle them correctly yet.
+	 * We need this spin lock here because interrupt handler
+	 * might modify this list in qib_user_sdma_send_desc(), also
+	 * we can not get interrupted, otherwise it is a deadlock.
 	 */
-	__i2c_dw_enable(dev, false);
+	spin_lock_irqsave(&pq->sent_lock, flags);
+	list_for_each_entry_safe(pkt, pkt_prev, &pq->sent, list) {
+		s64 descd = ppd->sdma_descq_removed - pkt->added;
 
-	if (dev->msg_err) {
-		ret = dev->msg_err;
-		goto done;
+		if (descd < 0)
+			break;
+
+		list_move_tail(&pkt->list, &free_list);
+
+		/* one more packet cleaned */
+		ret++;
+		pq->num_sending--;
 	}
+	spin_unlock_irqrestore(&pq->sent_lock, flags);
 
-	/* no error */
-	if (likely(!dev->cmd_err)) {
-		ret = num;
-		goto done;
+	if (!list_empty(&free_list)) {
+		u32 counter;
+
+		pkt = list_entry(free_list.prev,
+				 struct qib_user_sdma_pkt, list);
+		counter = pkt->counter;
+
+		qib_user_sdma_free_pkt_list(&dd->pcidev->dev, pq, &free_list);
+		qib_user_sdma_set_complete_counter(pq, counter);
 	}
-
-	/* We have an error */
-	if (dev->cmd_err == DW_IC_ERR_TX_ABRT) {
-		ret = i2c_dw_handle_tx_abort(dev);
-		goto done;
-	}
-	ret = -EIO;
-
-done:
-	if (dev->release_lock)
-		dev->release_lock(dev);
-
-done_nolock:
-	pm_runtime_mark_last_busy(dev->dev);
-	pm_runtime_put_autosuspend(dev->dev);
-	mutex_unlock(&dev->lock);
 
 	return ret;
 }
 
-static u32 i2c_dw_func(struct i2c_adapter *adap)
+void qib_user_sdma_queue_destroy(struct qib_user_sdma_queue *pq)
 {
-	struct dw_i2c_dev *dev = i2c_get_adapdata(adap);
-	return dev->functionality;
-}
+	if (!pq)
+		return;
 
-static struct i2c_algorithm i2c_dw_algo = {
-	.master_xfer	= i2c_dw_xfer,
-	.functionality	= i2c_dw_func,
-};
-
-static u32 i2c_dw_read_clear_intrbits(struct dw_i2c_dev *dev)
-{
-	u32 stat;
-
-	/*
-	 * The IC_INTR_STAT register just indicates "enabled" interrupts.
-	 * Ths unmasked raw version of interrupt status bits are available
-	 * in the IC_RAW_INTR_STAT register.
-	 *
-	 * That is,
-	 *   stat = dw_readl(IC_INTR_STAT);
-	 * equals to,
-	 *   stat = dw_readl(IC_RAW_INTR_STAT) & dw_readl(IC_INTR_MASK);
-	 *
-	 * The raw version might be useful for debugging purposes.
-	 */
-	stat = dw_readl(dev, DW_IC_INTR_STAT);
-
-	/*
-	 * Do not use the IC_CLR_INTR register to clear interrupts, or
-	 * you'll miss some interrupts, triggered during the period from
-	 * dw_readl(IC_INTR_STAT) to dw_readl(IC_CLR_INTR).
-	 *
-	 * Instead, use the separately-prepared IC_CLR_* registers.
-	 */
-	if (stat & DW_IC_INTR_RX_UNDER)
-		dw_readl(dev, DW_IC_CLR_RX_UNDER);
-	if (stat & DW_IC_INTR_RX_OVER)
-		dw_readl(dev, DW_IC_CLR_RX_OVER);
-	if (stat & DW_IC_INTR_TX_OVER)
-		dw_readl(dev, DW_IC_CLR_TX_OVER);
-	if (stat & DW_IC_INTR_RD_REQ)
-		dw_readl(dev, DW_IC_CLR_RD_REQ);
-	if (stat & DW_IC_INTR_TX_ABRT) {
-		/*
-		 * The IC_TX_ABRT_SOURCE register is cleared whenever
-		 * the IC_CLR_TX_ABRT is read.  Preserve it beforehand.
-		 */
-		dev->abort_source = dw_readl(dev, DW_IC_TX_ABRT_SOURCE);
-		dw_readl(dev, DW_IC_CLR_TX_ABRT);
+	pq->sdma_rb_node->refcount--;
+	if (pq->sdma_rb_node->refcount == 0) {
+		rb_erase(&pq->sdma_rb_node->node, &qib_user_sdma_rb_root);
+		kfree(pq->sdma_rb_node);
 	}
-	if (stat & DW_IC_INTR_RX_DONE)
-		dw_readl(dev, DW_IC_CLR_RX_DONE);
-	if (stat & DW_IC_INTR_ACTIVITY)
-		dw_readl(dev, DW_IC_CLR_ACTIVITY);
-	if (stat & DW_IC_INTR_STOP_DET)
-		dw_readl(dev, DW_IC_CLR_STOP_DET);
-	if (stat & DW_IC_INTR_START_DET)
-		dw_readl(dev, DW_IC_CLR_START_DET);
-	if (stat & DW_IC_INTR_GEN_CALL)
-		dw_readl(dev, DW_IC_CLR_GEN_CALL);
-
-	return stat;
+	dma_pool_destroy(pq->header_cache);
+	kmem_cache_destroy(pq->pkt_slab);
+	kfree(pq);
 }
 
-/*
- * Interrupt service routine. This gets called whenever an I2C interrupt
- * occurs.
+/* clean descriptor queue, returns > 0 if some elements cleaned */
+static int qib_user_sdma_hwqueue_clean(struct qib_pportdata *ppd)
+{
+	int ret;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ppd->sdma_lock, flags);
+	ret = qib_sdma_make_progress(ppd);
+	spin_unlock_irqrestore(&ppd->sdma_lock, flags);
+
+	return ret;
+}
+
+/* we're in close, drain packets so that we can cleanup successfully... */
+void qib_user_sdma_queue_drain(struct qib_pportdata *ppd,
+			       struct qib_user_sdma_queue *pq)
+{
+	struct qib_devdata *dd = ppd->dd;
+	unsigned long flags;
+	int i;
+
+	if (!pq)
+		return;
+
+	for (i = 0; i < QIB_USER_SDMA_DRAIN_TIMEOUT; i++) {
+		mutex_lock(&pq->lock);
+		if (!pq->num_pending && !pq->num_sending) {
+			mutex_unlock(&pq->lock);
+			break;
+		}
+		qib_user_sdma_hwqueue_clean(ppd);
+		qib_user_sdma_queue_clean(ppd, pq);
+		mutex_unlock(&pq->lock);
+		msleep(20);
+	}
+
+	if (pq->num_pending || pq->num_sending) {
+		struct qib_user_sdma_pkt *pkt;
+		struct qib_user_sdma_pkt *pkt_prev;
+		struct list_head free_list;
+
+		mutex_lock(&pq->lock);
+		spin_lock_irqsave(&ppd->sdma_lock, flags);
+		/*
+		 * Since we hold sdma_lock, it is safe without sent_lock.
+		 */
+		if (pq->num_pending) {
+			list_for_each_entry_safe(pkt, pkt_prev,
+					&ppd->sdma_userpending, list) {
+				if (pkt->pq == pq) {
+					list_move_tail(&pkt->list, &pq->sent);
+					pq->num_pending--;
+					pq->num_sending++;
+				}
+			}
+		}
+		spin_unlock_irqrestore(&ppd->sdma_lock, flags);
+
+		qib_dev_err(dd, "user sdma lists not empty: forcing!\n");
+		INIT_LIST_HEAD(&free_list);
+		list_splice_init(&pq->sent, &free_list);
+		pq->num_sending = 0;
+		qib_user_sdma_free_pkt_list(&dd->pcidev->dev, pq, &free_list);
+		mutex_unlock(&pq->lock);
+	}
+}
+
+static inline __le64 qib_sdma_make_desc0(u8 gen,
+					 u64 addr, u64 dwlen, u64 dwoffset)
+{
+	return cpu_to_le64(/* SDmaPhyAddr[31:0] */
+			   ((addr & 0xfffffffcULL) << 32) |
+			   /* SDmaGeneration[1:0] */
+			   ((gen & 3ULL) << 30) |
+			   /* SDmaDwordCount[10:0] */
+			   ((dwlen & 0x7ffULL) << 16) |
+			   /* SDmaBufOffset[12:2] */
+			   (dwoffset & 0x7ffULL));
+}
+
+static inline __le64 qib_sdma_make_first_desc0(__le64 descq)
+{
+	return descq | cpu_to_le64(1ULL << 12);
+}
+
+static inline __le64 qib_sdma_make_last_desc0(__le64 descq)
+{
+					      /* last */  /* dma head */
+	return descq | cpu_to_le64(1ULL << 11 | 1ULL << 13);
+}
+
+static inline __le64 qib_sdma_make_desc1(u64 addr)
+{
+	/* SDmaPhyAddr[47:32] */
+	return cpu_to_le64(addr >> 32);
+}
+
+static void qib_user_sdma_send_frag(struct qib_pportdata *ppd,
+				    struct qib_user_sdma_pkt *pkt, int idx,
+				    unsigned ofs, u16 tail, u8 gen)
+{
+	const u64 addr = (u64) pkt->addr[idx].addr +
+		(u64) pkt->addr[idx].offset;
+	const u64 dwlen = (u64) pkt->addr[idx].length / 4;
+	__le64 *descqp;
+	__le64 descq0;
+
+	descqp = &ppd->sdma_descq[tail].qw[0];
+
+	descq0 = qib_sdma_make_desc0(gen, addr, dwlen, ofs);
+	if (pkt->addr[idx].first_desc)
+		descq0 = qib_sdma_make_first_desc0(descq0);
+	if (pkt->addr[idx].last_desc) {
+		descq0 = qib_sdma_make_last_desc0(descq0);
+		if (ppd->sdma_intrequest) {
+			descq0 |= cpu_to_le64(1ULL << 15);
+			ppd->sdma_intrequest = 0;
+		}
+	}
+
+	descqp[0] = descq0;
+	descqp[1] = qib_sdma_make_desc1(addr);
+}
+
+void qib_user_sdma_send_desc(struct qib_pportdata *ppd,
+				struct list_head *pktlist)
+{
+	struct qib_devdata *dd = ppd->dd;
+	u16 nfree, nsent;
+	u16 tail, tail_c;
+	u8 gen, gen_c;
+
+	nfree = qib_sdma_descq_freecnt(ppd);
+	if (!nfree)
+		return;
+
+retry:
+	nsent = 0;
+	tail_c = tail = ppd->sdma_descq_tail;
+	gen_c = gen = ppd->sdma_generation;
+	while (!list_empty(pktlist)) {
+		struct qib_user_sdma_pkt *pkt =
+			list_entry(pktlist->next, struct qib_user_sdma_pkt,
+				   list);
+		int i, j, c = 0;
+		unsigned ofs = 0;
+		u16 dtail = tail;
+
+		for (i = pkt->index; i < pkt->naddr && nfree; i++) {
+			qib_user_sdma_send_frag(ppd, pkt, i, ofs, tail, gen);
+			ofs += pkt->addr[i].length >> 2;
+
+			if (++tail == ppd->sdma_descq_cnt) {
+				tail = 0;
+				++gen;
+				ppd->sdma_intrequest = 1;
+			} else if (tail == (ppd->sdma_descq_cnt>>1)) {
+				ppd->sdma_intrequest = 1;
+			}
+			nfree--;
+			if (pkt->addr[i].last_desc == 0)
+				continue;
+
+			/*
+			 * If the packet is >= 2KB mtu equivalent, we
+			 * have to use the large buffers, and have to
+			 * mark each descriptor as part of a large
+			 * buffer packet.
+			 */
+			if (ofs > dd->piosize2kmax_dwords) {
+				for (j = pkt->index; j <= i; j++) {
+					ppd->sdma_descq[dtail].qw[0] |=
+						cpu_to_le64(1ULL << 14);
+					if (++dtail == ppd->sdma_descq_cnt)
+						dtail = 0;
+				}
+			}
+			c += i + 1 - pkt->index;
+			pkt->index = i + 1; /* index for next first */
+			tail_c = dtail = tail;
+			gen_c = gen;
+			ofs = 0;  /* reset for next packet */
+		}
+
+		ppd->sdma_descq_added += c;
+		nsent += c;
+		if (pkt->index == pkt->naddr) {
+			pkt->added = ppd->sdma_descq_added;
+			pkt->pq->added = pkt->added;
+			pkt->pq->num_pending--;
+			spin_lock(&pkt->pq->sent_lock);
+			pkt->pq->num_sending++;
+			list_move_tail(&pkt->list, &pkt->pq->sent);
+			spin_unlock(&pkt->pq->sent_lock);
+		}
+		if (!nfree || (nsent<<2) > ppd->sdma_descq_cnt)
+			break;
+	}
+
+	/* advance the tail on the chip if necessary */
+	if (ppd->sdma_descq_tail != tail_c) {
+		ppd->sdma_generation = gen_c;
+		dd->f_sdma_update_tail(ppd, tail_c);
+	}
+
+	if (nfree && !list_empty(pktlist))
+		goto retry;
+}
+
+/* pq->lock must be held, get packets on the wire... */
+static int qib_user_sdma_push_pkts(struct qib_pportdata *ppd,
+				 struct qib_user_sdma_queue *pq,
+				 struct list_head *pktlist, int count)
+{
+	unsigned long flags;
+
+	if (unlikely(!(ppd->lflags & QIBL_LINKACTIVE)))
+		return -ECOMM;
+
+	/* non-blocking mode */
+	if (pq->sdma_rb_node->refcount > 1) {
+		spin_lock_irqsave(&ppd->sdma_lock, flags);
+		if (unlikely(!__qib_sdma_running(ppd))) {
+			spin_unlock_irqrestore(&ppd->sdma_lock, flags);
+			return -ECOMM;
+		}
+		pq->num_pending += count;
+		list_splice_tail_init(pktlist, &ppd->sdma_userpending);
+		qib_user_sdma_send_desc(ppd, &ppd->sdma_userpending);
+		spin_unlock_irqrestore(&ppd->sdma_lock, flags);
+		return 0;
+	}
+
+	/* In this case, descriptors from this process are not
+	 * linked to ppd pending queue, interrupt handler
+	 * won't update this process, it is OK to directly
+	 * modify without sdma lock.
+	 */
+
+
+	pq->num_pending += count;
+	/*
+	 * Blocking mode for single rail process, we must
+	 * release/regain sdma_lock to give other process
+	 * chance to make progress. This is important for
+	 * performance.
+	 */
+	do {
+		spin_lock_irqsave(&ppd->sdma_lock, flags);
+		if (unlikely(!__qib_sdma_running(ppd))) {
+			spin_unlock_irqrestore(&ppd->sdma_lock, flags);
+			return -ECOMM;
+		}
+		qib_user_sdma_send_desc(ppd, pktlist);
+		if (!list_empty(pktlist))
+			qib_sdma_make_progress(ppd);
+		spin_unlock_irqrestore(&ppd->sdma_lock, flags);
+	} while (!list_empty(pktlist));
+
+	return 0;
+}
+
+int qib_user_sdma_writev(struct qib_ctxtdata *rcd,
+			 struct qib_user_sdma_queue *pq,
+			 const struct iovec *iov,
+			 unsigned long dim)
+{
+	struct qib_devdata *dd = rcd->dd;
+	struct qib_pportdata *ppd = rcd->ppd;
+	int ret = 0;
+	struct list_head list;
+	int npkts = 0;
+
+	INIT_LIST_HEAD(&list);
+
+	mutex_lock(&pq->lock);
+
+	/* why not -ECOMM like qib_user_sdma_push_pkts() below? */
+	if (!qib_sdma_running(ppd))
+		goto done_unlock;
+
+	/* if I have packets not complete yet */
+	if (pq->added > ppd->sdma_descq_removed)
+		qib_user_sdma_hwqueue_clean(ppd);
+	/* if I have complete packets to be freed */
+	if (pq->num_sending)
+		qib_user_sdma_queue_clean(ppd, pq);
+
+	while (dim) {
+		int mxp = 1;
+		int ndesc = 0;
+
+		ret = qib_user_sdma_queue_pkts(dd, ppd, pq,
+				iov, dim, &list, &mxp, &ndesc);
+		if (ret < 0)
+			goto done_unlock;
+		else {
+			dim -= ret;
+			iov += ret;
+		}
+
+		/* force packets onto the sdma hw queue... */
+		if (!list_empty(&list)) {
+			/*
+			 * Lazily clean hw queue.
+			 */
+			if (qib_sdma_descq_freecnt(ppd) < ndesc) {
+				qib_user_sdma_hwqueue_clean(ppd);
+				if (pq->num_sending)
+					qib_user_sdma_queue_clean(ppd, pq);
+			}
+
+			ret = qib_user_sdma_push_pkts(ppd, pq, &list, mxp);
+			if (ret < 0)
+				goto done_unlock;
+			else {
+				npkts += mxp;
+				pq->counter += mxp;
+			}
+		}
+	}
+
+done_unlock:
+	if (!list_empty(&list))
+		qib_user_sdma_free_pkt_list(&dd->pcidev->dev, pq, &list);
+	mutex_unlock(&pq->lock);
+
+	return (ret < 0) ? ret : npkts;
+}
+
+int qib_user_sdma_make_progress(struct qib_pportdata *ppd,
+				struct qib_user_sdma_queue *pq)
+{
+	int ret = 0;
+
+	mutex_lock(&pq->lock);
+	qib_user_sdma_hwqueue_clean(ppd);
+	ret = qib_user_sdma_queue_clean(ppd, pq);
+	mutex_unlock(&pq->lock);
+
+	return ret;
+}
+
+u32 qib_user_sdma_complete_counter(const struct qib_user_sdma_queue *pq)
+{
+	return pq ? pq->sent_counter : 0;
+}
+
+u32 qib_user_sdma_inflight_counter(struct qib_user_sdma_queue *pq)
+{
+	return pq ? pq->counter : 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+ * Copyright (c) 2007, 2008 QLogic Corporation. All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
-static irqreturn_t i2c_dw_isr(int this_irq, void *dev_id)
-{
-	struct dw_i2c_dev *dev = dev_id;
-	u32 stat, enabled;
+#include <linux/device.h>
 
-	enabled = dw_readl(dev, DW_IC_ENABLE);
-	stat = dw_readl(dev, DW_IC_RAW_INTR_STAT);
-	dev_dbg(dev->dev, "%s: enabled=%#x stat=%#x\n", __func__, enabled, stat);
-	if (!enabled || !(stat & ~DW_IC_INTR_ACTIVITY))
-		return IRQ_NONE;
+struct qib_user_sdma_queue;
 
-	stat = i2c_dw_read_clear_intrbits(dev);
+struct qib_user_sdma_queue *
+qib_user_sdma_queue_create(struct device *dev, int unit, int port, int sport);
+void qib_user_sdma_queue_destroy(struct qib_user_sdma_queue *pq);
 
-	if (stat & DW_IC_INTR_TX_ABRT) {
-		dev->cmd_err |= DW_IC_ERR_TX_ABRT;
-		dev->status = STATUS_IDLE;
+int qib_user_sdma_writev(struct qib_ctxtdata *pd,
+			 struct qib_user_sdma_queue *pq,
+			 const struct iovec *iov,
+			 unsigned long dim);
 
-		/*
-		 * Anytime TX_ABRT is set, the contents of the tx/rx
-		 * buffers are flushed.  Make sure to skip them.
-		 */
-		dw_writel(dev, 0, DW_IC_INTR_MASK);
-		goto tx_aborted;
-	}
+int qib_user_sdma_make_progress(struct qib_pportdata *ppd,
+				struct qib_user_sdma_queue *pq);
 
-	if (stat & DW_IC_INTR_RX_FULL)
-		i2c_dw_read(dev);
+void qib_user_sdma_queue_drain(struct qib_pportdata *ppd,
+			       struct qib_user_sdma_queue *pq);
 
-	if (stat & DW_IC_INTR_TX_EMPTY)
-		i2c_dw_xfer_msg(dev);
+u32 qib_user_sdma_complete_counter(const struct qib_user_sdma_queue *pq);
+u32 qib_user_sdma_inflight_counter(struct qib_user_sdma_queue *pq);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * Copyright (c) 2012, 2013 Intel Corporation.  All rights reserved.
+ * Copyright (c) 2006 - 2012 QLogic Corporation. All rights reserved.
+ * Copyright (c) 2005, 2006 PathScale, Inc. All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
-	/*
-	 * No need to modify or disable the interrupt mask here.
-	 * i2c_dw_xfer_msg() will take care of it according to
-	 * the current transmit status.
-	 */
+#include <rdma/ib_mad.h>
+#include <rdma/ib_user_verbs.h>
+#include <linux/io.h>
+#include <linux/module.h>
+#include <linux/utsname.h>
+#include <linux/rculist.h>
+#include <linux/mm.h>
+#include <linux/random.h>
+#include <linux/vmalloc.h>
 
-tx_aborted:
-	if ((stat & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET)) || dev->msg_err)
-		complete(&dev->cmd_complete);
-	else if (unlikely(dev->accessor_flags & ACCESS_INTR_MASK)) {
-		/* workaround to trigger pending interrupt */
-		stat = dw_readl(dev, DW_IC_INTR_MASK);
-		i2c_dw_disable_int(dev);
-		dw_writel(dev, stat, DW_IC_INTR_MASK);
-	}
+#include "qib.h"
+#include "qib_common.h"
 
-	return IRQ_HANDLED;
-}
+static unsigned int ib_qib_qp_table_size = 256;
+module_param_named(qp_table_size, ib_qib_qp_table_size, uint, S_IRUGO);
+MODULE_PARM_DESC(qp_table_size, "QP table size");
 
-void i2c_dw_disable(struct dw_i2c_dev *dev)
-{
-	/* Disable controller */
-	__i2c_dw_enable(dev, false);
+unsigned int ib_qib_lkey_table_size = 16;
+module_param_named(lkey_table_size, ib_qib_lkey_table_size, uint,
+		   S_IRUGO);
+MODULE_PARM_DESC(lkey_table_size,
+		 "LKEY table size in bits (2^n, 1 <= n <= 23)");
 
-	/* Disable all interupts */
-	dw_writel(dev, 0, DW_IC_INTR_MASK);
-	dw_readl(dev, DW_IC_CLR_INTR);
-}
-EXPORT_SYMBOL_GPL(i2c_dw_disable);
+static unsigned int ib_qib_max_pds = 0xFFFF;
+module_param_named(max_pds, ib_qib_max_pds, uint, S_IRUGO);
+MODULE_PARM_DESC(max_pds,
+		 "Maximum number of protection domains to support");
 
-void i2c_dw_disable_int(struct dw_i2c_dev *dev)
-{
-	dw_writel(dev, 0, DW_IC_INTR_MASK);
-}
-EXPORT_SYMBOL_GPL(i2c_dw_disable_int);
+static unsigned int ib_qib_max_ahs = 0xFFFF;
+module_param_named(max_ahs, ib_qib_max_ahs, uint, S_IRUGO);
+MODULE_PARM_DESC(max_ahs, "Maximum number of address handles to support");
 
-u32 i2c_dw_read_comp_param(struct dw_i2c_dev *dev)
-{
-	return dw_readl(dev, DW_IC_COMP_PARAM_1);
-}
-EXPORT_SYMBOL_GPL(i2c_dw_read_comp_param);
+unsigned int ib_qib_max_cqes = 0x2FFFF;
+module_param_named(max_cqes, ib_qib_max_cqes, uint, S_IRUGO);
+MODULE_PARM_DESC(max_cqes,
+		 "Maximum number of completion queue entries to support");
 
-int i2c_dw_probe(struct dw_i2c_dev *dev)
-{
-	struct i2c_adapter *adap = &dev->adapter;
-	int r;
+unsigned int ib_qib_max_cqs = 0x1FFFF;
+module_param_named(max_cqs, ib_qib_max_cqs, uint, S_IRUGO);
+MODULE_PARM_DESC(max_cqs, "Maximum number of completion queues to support");
 
-	init_completion(&dev->cmd_complete);
-	mutex_init(&dev->lock);
+unsigned int ib_qib_max_qp_wrs = 0x3FFF;
+module_param_named(max_qp_wrs, ib_qib_max_qp_wrs, uint, S_IRUGO);
+MODULE_PARM_DESC(max_qp_wrs, "Maximum number of QP WRs to support");
 
-	r = i2c_dw_init(dev);
-	if (r)
-		return r;
-
-	snprintf(adap->name, sizeof(adap->name),
-		 "Synopsys DesignWare I2C adapter");
-	adap->algo = &i2c_dw_algo;
-	adap->dev.parent = dev->dev;
-	i2c_set_adapdata(adap, dev);
-
-	i2c_dw_disable_int(dev);
-	r = devm_request_irq(dev->dev, dev->irq, i2c_dw_isr,
-			     IRQF_SHARED | IRQF_COND_SUSPEND,
-			     dev_name(dev->dev), dev);
-	if (r) {
-		dev_err(dev->dev, "failure requesting irq %i: %d\n",
-			dev->irq, r);
-		return r;
-	}
-
-	r = i2c_add_numbered_adapter(adap);
-	if (r)
-		dev_err(dev->dev, "failure adding adapter: %d\n", r);
-
-	return r;
-}
-EXPORT_SYMBOL_GPL(i2c_dw_probe);
-
-MODULE_DESCRIPTION("Synopsys DesignWare I2C bus adapter core");
-MODULE_LICENSE("GPL");
+unsigned int ib_qib_max_q

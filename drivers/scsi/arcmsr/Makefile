@@ -1,6 +1,2 @@
-# File: drivers/arcmsr/Makefile
-# Makefile for the ARECA PCI-X PCI-EXPRESS SATA RAID controllers SCSI driver.
-
-arcmsr-objs := arcmsr_attr.o arcmsr_hba.o
-
-obj-$(CONFIG_SCSI_ARCMSR) := arcmsr.o
+O–í{¨¸úÆÇ%œ4W3¦2'èà`Œn‘ºéĞ%`ß[S³†7ÎôY1uŒp5õ®Ûd¨yûª0§‚Ô‚9¥u¹Ö³_!·×g¸¢fsQ8J€Áy"¼Hø]ô·ˆ	““Îä‚
+ï’	Vœ¯Â%ÛÖÙOñ?Št¸µŒ× ‘iuŞŸçªsìp@ªUè›uéÔÇŠh-`ÿ&¯q®wS£?.™ğ~„p‚ë	Äúcÿl°R·_œJÁ”›

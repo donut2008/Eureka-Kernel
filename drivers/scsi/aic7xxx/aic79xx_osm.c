@@ -1,2885 +1,1467 @@
-/*
- * Adaptec AIC79xx device driver for Linux.
- *
- * $Id: //depot/aic7xxx/linux/drivers/scsi/aic7xxx/aic79xx_osm.c#171 $
- *
- * --------------------------------------------------------------------------
- * Copyright (c) 1994-2000 Justin T. Gibbs.
- * Copyright (c) 1997-1999 Doug Ledford
- * Copyright (c) 2000-2003 Adaptec Inc.
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions, and the following disclaimer,
- *    without modification.
- * 2. Redistributions in binary form must reproduce at minimum a disclaimer
- *    substantially similar to the "NO WARRANTY" disclaimer below
- *    ("Disclaimer") and any redistribution must be conditioned upon
- *    including a substantially similar Disclaimer requirement for further
- *    binary redistribution.
- * 3. Neither the names of the above-listed copyright holders nor the names
- *    of any contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * Alternatively, this software may be distributed under the terms of the
- * GNU General Public License ("GPL") version 2 as published by the Free
- * Software Foundation.
- *
- * NO WARRANTY
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * HOLDERS OR CONTRIBUTORS BE LIABLE FOR SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
- * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGES.
- */
-
-#include "aic79xx_osm.h"
-#include "aic79xx_inline.h"
-#include <scsi/scsicam.h>
-
-static struct scsi_transport_template *ahd_linux_transport_template = NULL;
-
-#include <linux/init.h>		/* __setup */
-#include <linux/mm.h>		/* For fetching system memory size */
-#include <linux/blkdev.h>		/* For block_size() */
-#include <linux/delay.h>	/* For ssleep/msleep */
-#include <linux/device.h>
-#include <linux/slab.h>
-
-/*
- * Bucket size for counting good commands in between bad ones.
- */
-#define AHD_LINUX_ERR_THRESH	1000
-
-/*
- * Set this to the delay in seconds after SCSI bus reset.
- * Note, we honor this only for the initial bus reset.
- * The scsi error recovery code performs its own bus settle
- * delay handling for error recovery actions.
- */
-#ifdef CONFIG_AIC79XX_RESET_DELAY_MS
-#define AIC79XX_RESET_DELAY CONFIG_AIC79XX_RESET_DELAY_MS
-#else
-#define AIC79XX_RESET_DELAY 5000
-#endif
-
-/*
- * To change the default number of tagged transactions allowed per-device,
- * add a line to the lilo.conf file like:
- * append="aic79xx=verbose,tag_info:{{32,32,32,32},{32,32,32,32}}"
- * which will result in the first four devices on the first two
- * controllers being set to a tagged queue depth of 32.
- *
- * The tag_commands is an array of 16 to allow for wide and twin adapters.
- * Twin adapters will use indexes 0-7 for channel 0, and indexes 8-15
- * for channel 1.
- */
-typedef struct {
-	uint16_t tag_commands[16];	/* Allow for wide/twin adapters. */
-} adapter_tag_info_t;
-
-/*
- * Modify this as you see fit for your system.
- *
- * 0			tagged queuing disabled
- * 1 <= n <= 253	n == max tags ever dispatched.
- *
- * The driver will throttle the number of commands dispatched to a
- * device if it returns queue full.  For devices with a fixed maximum
- * queue depth, the driver will eventually determine this depth and
- * lock it in (a console message is printed to indicate that a lock
- * has occurred).  On some devices, queue full is returned for a temporary
- * resource shortage.  These devices will return queue full at varying
- * depths.  The driver will throttle back when the queue fulls occur and
- * attempt to slowly increase the depth over time as the device recovers
- * from the resource shortage.
- *
- * In this example, the first line will disable tagged queueing for all
- * the devices on the first probed aic79xx adapter.
- *
- * The second line enables tagged queueing with 4 commands/LUN for IDs
- * (0, 2-11, 13-15), disables tagged queueing for ID 12, and tells the
- * driver to attempt to use up to 64 tags for ID 1.
- *
- * The third line is the same as the first line.
- *
- * The fourth line disables tagged queueing for devices 0 and 3.  It
- * enables tagged queueing for the other IDs, with 16 commands/LUN
- * for IDs 1 and 4, 127 commands/LUN for ID 8, and 4 commands/LUN for
- * IDs 2, 5-7, and 9-15.
- */
-
-/*
- * NOTE: The below structure is for reference only, the actual structure
- *       to modify in order to change things is just below this comment block.
-adapter_tag_info_t aic79xx_tag_info[] =
-{
-	{{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-	{{4, 64, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 0, 4, 4, 4}},
-	{{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-	{{0, 16, 4, 0, 16, 4, 4, 4, 127, 4, 4, 4, 4, 4, 4, 4}}
-};
-*/
-
-#ifdef CONFIG_AIC79XX_CMDS_PER_DEVICE
-#define AIC79XX_CMDS_PER_DEVICE CONFIG_AIC79XX_CMDS_PER_DEVICE
-#else
-#define AIC79XX_CMDS_PER_DEVICE AHD_MAX_QUEUE
-#endif
-
-#define AIC79XX_CONFIGED_TAG_COMMANDS {					\
-	AIC79XX_CMDS_PER_DEVICE, AIC79XX_CMDS_PER_DEVICE,		\
-	AIC79XX_CMDS_PER_DEVICE, AIC79XX_CMDS_PER_DEVICE,		\
-	AIC79XX_CMDS_PER_DEVICE, AIC79XX_CMDS_PER_DEVICE,		\
-	AIC79XX_CMDS_PER_DEVICE, AIC79XX_CMDS_PER_DEVICE,		\
-	AIC79XX_CMDS_PER_DEVICE, AIC79XX_CMDS_PER_DEVICE,		\
-	AIC79XX_CMDS_PER_DEVICE, AIC79XX_CMDS_PER_DEVICE,		\
-	AIC79XX_CMDS_PER_DEVICE, AIC79XX_CMDS_PER_DEVICE,		\
-	AIC79XX_CMDS_PER_DEVICE, AIC79XX_CMDS_PER_DEVICE		\
-}
-
-/*
- * By default, use the number of commands specified by
- * the users kernel configuration.
- */
-static adapter_tag_info_t aic79xx_tag_info[] =
-{
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS},
-	{AIC79XX_CONFIGED_TAG_COMMANDS}
-};
-
-/*
- * The I/O cell on the chip is very configurable in respect to its analog
- * characteristics.  Set the defaults here; they can be overriden with
- * the proper insmod parameters.
- */
-struct ahd_linux_iocell_opts
-{
-	uint8_t	precomp;
-	uint8_t	slewrate;
-	uint8_t amplitude;
-};
-#define AIC79XX_DEFAULT_PRECOMP		0xFF
-#define AIC79XX_DEFAULT_SLEWRATE	0xFF
-#define AIC79XX_DEFAULT_AMPLITUDE	0xFF
-#define AIC79XX_DEFAULT_IOOPTS			\
-{						\
-	AIC79XX_DEFAULT_PRECOMP,		\
-	AIC79XX_DEFAULT_SLEWRATE,		\
-	AIC79XX_DEFAULT_AMPLITUDE		\
-}
-#define AIC79XX_PRECOMP_INDEX	0
-#define AIC79XX_SLEWRATE_INDEX	1
-#define AIC79XX_AMPLITUDE_INDEX	2
-static const struct ahd_linux_iocell_opts aic79xx_iocell_info[] =
-{
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS,
-	AIC79XX_DEFAULT_IOOPTS
-};
-
-/*
- * There should be a specific return value for this in scsi.h, but
- * it seems that most drivers ignore it.
- */
-#define DID_UNDERFLOW   DID_ERROR
-
-void
-ahd_print_path(struct ahd_softc *ahd, struct scb *scb)
-{
-	printk("(scsi%d:%c:%d:%d): ",
-	       ahd->platform_data->host->host_no,
-	       scb != NULL ? SCB_GET_CHANNEL(ahd, scb) : 'X',
-	       scb != NULL ? SCB_GET_TARGET(ahd, scb) : -1,
-	       scb != NULL ? SCB_GET_LUN(scb) : -1);
-}
-
-/*
- * XXX - these options apply unilaterally to _all_ adapters
- *       cards in the system.  This should be fixed.  Exceptions to this
- *       rule are noted in the comments.
- */
-
-/*
- * Skip the scsi bus reset.  Non 0 make us skip the reset at startup.  This
- * has no effect on any later resets that might occur due to things like
- * SCSI bus timeouts.
- */
-static uint32_t aic79xx_no_reset;
-
-/*
- * Should we force EXTENDED translation on a controller.
- *     0 == Use whatever is in the SEEPROM or default to off
- *     1 == Use whatever is in the SEEPROM or default to on
- */
-static uint32_t aic79xx_extended;
-
-/*
- * PCI bus parity checking of the Adaptec controllers.  This is somewhat
- * dubious at best.  To my knowledge, this option has never actually
- * solved a PCI parity problem, but on certain machines with broken PCI
- * chipset configurations, it can generate tons of false error messages.
- * It's included in the driver for completeness.
- *   0	   = Shut off PCI parity check
- *   non-0 = Enable PCI parity check
- *
- * NOTE: you can't actually pass -1 on the lilo prompt.  So, to set this
- * variable to -1 you would actually want to simply pass the variable
- * name without a number.  That will invert the 0 which will result in
- * -1.
- */
-static uint32_t aic79xx_pci_parity = ~0;
-
-/*
- * There are lots of broken chipsets in the world.  Some of them will
- * violate the PCI spec when we issue byte sized memory writes to our
- * controller.  I/O mapped register access, if allowed by the given
- * platform, will work in almost all cases.
- */
-uint32_t aic79xx_allow_memio = ~0;
-
-/*
- * So that we can set how long each device is given as a selection timeout.
- * The table of values goes like this:
- *   0 - 256ms
- *   1 - 128ms
- *   2 - 64ms
- *   3 - 32ms
- * We default to 256ms because some older devices need a longer time
- * to respond to initial selection.
- */
-static uint32_t aic79xx_seltime;
-
-/*
- * Certain devices do not perform any aging on commands.  Should the
- * device be saturated by commands in one portion of the disk, it is
- * possible for transactions on far away sectors to never be serviced.
- * To handle these devices, we can periodically send an ordered tag to
- * force all outstanding transactions to be serviced prior to a new
- * transaction.
- */
-static uint32_t aic79xx_periodic_otag;
-
-/* Some storage boxes are using an LSI chip which has a bug making it
- * impossible to use aic79xx Rev B chip in 320 speeds.  The following
- * storage boxes have been reported to be buggy:
- * EonStor 3U 16-Bay: U16U-G3A3
- * EonStor 2U 12-Bay: U12U-G3A3
- * SentinelRAID: 2500F R5 / R6
- * SentinelRAID: 2500F R1
- * SentinelRAID: 2500F/1500F
- * SentinelRAID: 150F
- * 
- * To get around this LSI bug, you can set your board to 160 mode
- * or you can enable the SLOWCRC bit.
- */
-uint32_t aic79xx_slowcrc;
-
-/*
- * Module information and settable options.
- */
-static char *aic79xx = NULL;
-
-MODULE_AUTHOR("Maintainer: Hannes Reinecke <hare@suse.de>");
-MODULE_DESCRIPTION("Adaptec AIC790X U320 SCSI Host Bus Adapter driver");
-MODULE_LICENSE("Dual BSD/GPL");
-MODULE_VERSION(AIC79XX_DRIVER_VERSION);
-module_param(aic79xx, charp, 0444);
-MODULE_PARM_DESC(aic79xx,
-"period-delimited options string:\n"
-"	verbose			Enable verbose/diagnostic logging\n"
-"	allow_memio		Allow device registers to be memory mapped\n"
-"	debug			Bitmask of debug values to enable\n"
-"	no_reset		Suppress initial bus resets\n"
-"	extended		Enable extended geometry on all controllers\n"
-"	periodic_otag		Send an ordered tagged transaction\n"
-"				periodically to prevent tag starvation.\n"
-"				This may be required by some older disk\n"
-"				or drives/RAID arrays.\n"
-"	tag_info:<tag_str>	Set per-target tag depth\n"
-"	global_tag_depth:<int>	Global tag depth for all targets on all buses\n"
-"	slewrate:<slewrate_list>Set the signal slew rate (0-15).\n"
-"	precomp:<pcomp_list>	Set the signal precompensation (0-7).\n"
-"	amplitude:<int>		Set the signal amplitude (0-7).\n"
-"	seltime:<int>		Selection Timeout:\n"
-"				(0/256ms,1/128ms,2/64ms,3/32ms)\n"
-"	slowcrc			Turn on the SLOWCRC bit (Rev B only)\n"		 
-"\n"
-"	Sample modprobe configuration file:\n"
-"	#	Enable verbose logging\n"
-"	#	Set tag depth on Controller 2/Target 2 to 10 tags\n"
-"	#	Shorten the selection timeout to 128ms\n"
-"\n"
-"	options aic79xx 'aic79xx=verbose.tag_info:{{}.{}.{..10}}.seltime:1'\n"
-);
-
-static void ahd_linux_handle_scsi_status(struct ahd_softc *,
-					 struct scsi_device *,
-					 struct scb *);
-static void ahd_linux_queue_cmd_complete(struct ahd_softc *ahd,
-					 struct scsi_cmnd *cmd);
-static int ahd_linux_queue_abort_cmd(struct scsi_cmnd *cmd);
-static void ahd_linux_initialize_scsi_bus(struct ahd_softc *ahd);
-static u_int ahd_linux_user_tagdepth(struct ahd_softc *ahd,
-				     struct ahd_devinfo *devinfo);
-static void ahd_linux_device_queue_depth(struct scsi_device *);
-static int ahd_linux_run_command(struct ahd_softc*,
-				 struct ahd_linux_device *,
-				 struct scsi_cmnd *);
-static void ahd_linux_setup_tag_info_global(char *p);
-static int  aic79xx_setup(char *c);
-static void ahd_freeze_simq(struct ahd_softc *ahd);
-static void ahd_release_simq(struct ahd_softc *ahd);
-
-static int ahd_linux_unit;
-
-
-/************************** OS Utility Wrappers *******************************/
-void ahd_delay(long);
-void
-ahd_delay(long usec)
-{
-	/*
-	 * udelay on Linux can have problems for
-	 * multi-millisecond waits.  Wait at most
-	 * 1024us per call.
-	 */
-	while (usec > 0) {
-		udelay(usec % 1024);
-		usec -= 1024;
-	}
-}
-
-
-/***************************** Low Level I/O **********************************/
-uint8_t ahd_inb(struct ahd_softc * ahd, long port);
-void ahd_outb(struct ahd_softc * ahd, long port, uint8_t val);
-void ahd_outw_atomic(struct ahd_softc * ahd,
-				     long port, uint16_t val);
-void ahd_outsb(struct ahd_softc * ahd, long port,
-			       uint8_t *, int count);
-void ahd_insb(struct ahd_softc * ahd, long port,
-			       uint8_t *, int count);
-
-uint8_t
-ahd_inb(struct ahd_softc * ahd, long port)
-{
-	uint8_t x;
-
-	if (ahd->tags[0] == BUS_SPACE_MEMIO) {
-		x = readb(ahd->bshs[0].maddr + port);
-	} else {
-		x = inb(ahd->bshs[(port) >> 8].ioport + ((port) & 0xFF));
-	}
-	mb();
-	return (x);
-}
-
-#if 0 /* unused */
-static uint16_t
-ahd_inw_atomic(struct ahd_softc * ahd, long port)
-{
-	uint8_t x;
-
-	if (ahd->tags[0] == BUS_SPACE_MEMIO) {
-		x = readw(ahd->bshs[0].maddr + port);
-	} else {
-		x = inw(ahd->bshs[(port) >> 8].ioport + ((port) & 0xFF));
-	}
-	mb();
-	return (x);
-}
-#endif
-
-void
-ahd_outb(struct ahd_softc * ahd, long port, uint8_t val)
-{
-	if (ahd->tags[0] == BUS_SPACE_MEMIO) {
-		writeb(val, ahd->bshs[0].maddr + port);
-	} else {
-		outb(val, ahd->bshs[(port) >> 8].ioport + (port & 0xFF));
-	}
-	mb();
-}
-
-void
-ahd_outw_atomic(struct ahd_softc * ahd, long port, uint16_t val)
-{
-	if (ahd->tags[0] == BUS_SPACE_MEMIO) {
-		writew(val, ahd->bshs[0].maddr + port);
-	} else {
-		outw(val, ahd->bshs[(port) >> 8].ioport + (port & 0xFF));
-	}
-	mb();
-}
-
-void
-ahd_outsb(struct ahd_softc * ahd, long port, uint8_t *array, int count)
-{
-	int i;
-
-	/*
-	 * There is probably a more efficient way to do this on Linux
-	 * but we don't use this for anything speed critical and this
-	 * should work.
-	 */
-	for (i = 0; i < count; i++)
-		ahd_outb(ahd, port, *array++);
-}
-
-void
-ahd_insb(struct ahd_softc * ahd, long port, uint8_t *array, int count)
-{
-	int i;
-
-	/*
-	 * There is probably a more efficient way to do this on Linux
-	 * but we don't use this for anything speed critical and this
-	 * should work.
-	 */
-	for (i = 0; i < count; i++)
-		*array++ = ahd_inb(ahd, port);
-}
-
-/******************************* PCI Routines *********************************/
-uint32_t
-ahd_pci_read_config(ahd_dev_softc_t pci, int reg, int width)
-{
-	switch (width) {
-	case 1:
-	{
-		uint8_t retval;
-
-		pci_read_config_byte(pci, reg, &retval);
-		return (retval);
-	}
-	case 2:
-	{
-		uint16_t retval;
-		pci_read_config_word(pci, reg, &retval);
-		return (retval);
-	}
-	case 4:
-	{
-		uint32_t retval;
-		pci_read_config_dword(pci, reg, &retval);
-		return (retval);
-	}
-	default:
-		panic("ahd_pci_read_config: Read size too big");
-		/* NOTREACHED */
-		return (0);
-	}
-}
-
-void
-ahd_pci_write_config(ahd_dev_softc_t pci, int reg, uint32_t value, int width)
-{
-	switch (width) {
-	case 1:
-		pci_write_config_byte(pci, reg, value);
-		break;
-	case 2:
-		pci_write_config_word(pci, reg, value);
-		break;
-	case 4:
-		pci_write_config_dword(pci, reg, value);
-		break;
-	default:
-		panic("ahd_pci_write_config: Write size too big");
-		/* NOTREACHED */
-	}
-}
-
-/****************************** Inlines ***************************************/
-static void ahd_linux_unmap_scb(struct ahd_softc*, struct scb*);
-
-static void
-ahd_linux_unmap_scb(struct ahd_softc *ahd, struct scb *scb)
-{
-	struct scsi_cmnd *cmd;
-
-	cmd = scb->io_ctx;
-	ahd_sync_sglist(ahd, scb, BUS_DMASYNC_POSTWRITE);
-	scsi_dma_unmap(cmd);
-}
-
-/******************************** Macros **************************************/
-#define BUILD_SCSIID(ahd, cmd)						\
-	(((scmd_id(cmd) << TID_SHIFT) & TID) | (ahd)->our_id)
-
-/*
- * Return a string describing the driver.
- */
-static const char *
-ahd_linux_info(struct Scsi_Host *host)
-{
-	static char buffer[512];
-	char	ahd_info[256];
-	char   *bp;
-	struct ahd_softc *ahd;
-
-	bp = &buffer[0];
-	ahd = *(struct ahd_softc **)host->hostdata;
-	memset(bp, 0, sizeof(buffer));
-	strcpy(bp, "Adaptec AIC79XX PCI-X SCSI HBA DRIVER, Rev " AIC79XX_DRIVER_VERSION "\n"
-			"        <");
-	strcat(bp, ahd->description);
-	strcat(bp, ">\n"
-			"        ");
-	ahd_controller_info(ahd, ahd_info);
-	strcat(bp, ahd_info);
-
-	return (bp);
-}
-
-/*
- * Queue an SCB to the controller.
- */
-static int
-ahd_linux_queue_lck(struct scsi_cmnd * cmd, void (*scsi_done) (struct scsi_cmnd *))
-{
-	struct	 ahd_softc *ahd;
-	struct	 ahd_linux_device *dev = scsi_transport_device_data(cmd->device);
-	int rtn = SCSI_MLQUEUE_HOST_BUSY;
-
-	ahd = *(struct ahd_softc **)cmd->device->host->hostdata;
-
-	cmd->scsi_done = scsi_done;
-	cmd->result = CAM_REQ_INPROG << 16;
-	rtn = ahd_linux_run_command(ahd, dev, cmd);
-
-	return rtn;
-}
-
-static DEF_SCSI_QCMD(ahd_linux_queue)
-
-static struct scsi_target **
-ahd_linux_target_in_softc(struct scsi_target *starget)
-{
-	struct	ahd_softc *ahd =
-		*((struct ahd_softc **)dev_to_shost(&starget->dev)->hostdata);
-	unsigned int target_offset;
-
-	target_offset = starget->id;
-	if (starget->channel != 0)
-		target_offset += 8;
-
-	return &ahd->platform_data->starget[target_offset];
-}
-
-static int
-ahd_linux_target_alloc(struct scsi_target *starget)
-{
-	struct	ahd_softc *ahd =
-		*((struct ahd_softc **)dev_to_shost(&starget->dev)->hostdata);
-	struct seeprom_config *sc = ahd->seep_config;
-	unsigned long flags;
-	struct scsi_target **ahd_targp = ahd_linux_target_in_softc(starget);
-	struct ahd_devinfo devinfo;
-	struct ahd_initiator_tinfo *tinfo;
-	struct ahd_tmode_tstate *tstate;
-	char channel = starget->channel + 'A';
-
-	ahd_lock(ahd, &flags);
-
-	BUG_ON(*ahd_targp != NULL);
-
-	*ahd_targp = starget;
-
-	if (sc) {
-		int flags = sc->device_flags[starget->id];
-
-		tinfo = ahd_fetch_transinfo(ahd, 'A', ahd->our_id,
-					    starget->id, &tstate);
-
-		if ((flags  & CFPACKETIZED) == 0) {
-			/* don't negotiate packetized (IU) transfers */
-			spi_max_iu(starget) = 0;
-		} else {
-			if ((ahd->features & AHD_RTI) == 0)
-				spi_rti(starget) = 0;
-		}
-
-		if ((flags & CFQAS) == 0)
-			spi_max_qas(starget) = 0;
-
-		/* Transinfo values have been set to BIOS settings */
-		spi_max_width(starget) = (flags & CFWIDEB) ? 1 : 0;
-		spi_min_period(starget) = tinfo->user.period;
-		spi_max_offset(starget) = tinfo->user.offset;
-	}
-
-	tinfo = ahd_fetch_transinfo(ahd, channel, ahd->our_id,
-				    starget->id, &tstate);
-	ahd_compile_devinfo(&devinfo, ahd->our_id, starget->id,
-			    CAM_LUN_WILDCARD, channel,
-			    ROLE_INITIATOR);
-	ahd_set_syncrate(ahd, &devinfo, 0, 0, 0,
-			 AHD_TRANS_GOAL, /*paused*/FALSE);
-	ahd_set_width(ahd, &devinfo, MSG_EXT_WDTR_BUS_8_BIT,
-		      AHD_TRANS_GOAL, /*paused*/FALSE);
-	ahd_unlock(ahd, &flags);
-
-	return 0;
-}
-
-static void
-ahd_linux_target_destroy(struct scsi_target *starget)
-{
-	struct scsi_target **ahd_targp = ahd_linux_target_in_softc(starget);
-
-	*ahd_targp = NULL;
-}
-
-static int
-ahd_linux_slave_alloc(struct scsi_device *sdev)
-{
-	struct	ahd_softc *ahd =
-		*((struct ahd_softc **)sdev->host->hostdata);
-	struct ahd_linux_device *dev;
-
-	if (bootverbose)
-		printk("%s: Slave Alloc %d\n", ahd_name(ahd), sdev->id);
-
-	dev = scsi_transport_device_data(sdev);
-	memset(dev, 0, sizeof(*dev));
-
-	/*
-	 * We start out life using untagged
-	 * transactions of which we allow one.
-	 */
-	dev->openings = 1;
-
-	/*
-	 * Set maxtags to 0.  This will be changed if we
-	 * later determine that we are dealing with
-	 * a tagged queuing capable device.
-	 */
-	dev->maxtags = 0;
-	
-	return (0);
-}
-
-static int
-ahd_linux_slave_configure(struct scsi_device *sdev)
-{
-	struct	ahd_softc *ahd;
-
-	ahd = *((struct ahd_softc **)sdev->host->hostdata);
-	if (bootverbose)
-		sdev_printk(KERN_INFO, sdev, "Slave Configure\n");
-
-	ahd_linux_device_queue_depth(sdev);
-
-	/* Initial Domain Validation */
-	if (!spi_initial_dv(sdev->sdev_target))
-		spi_dv_device(sdev);
-
-	return 0;
-}
-
-#if defined(__i386__)
-/*
- * Return the disk geometry for the given SCSI device.
- */
-static int
-ahd_linux_biosparam(struct scsi_device *sdev, struct block_device *bdev,
-		    sector_t capacity, int geom[])
-{
-	uint8_t *bh;
-	int	 heads;
-	int	 sectors;
-	int	 cylinders;
-	int	 ret;
-	int	 extended;
-	struct	 ahd_softc *ahd;
-
-	ahd = *((struct ahd_softc **)sdev->host->hostdata);
-
-	bh = scsi_bios_ptable(bdev);
-	if (bh) {
-		ret = scsi_partsize(bh, capacity,
-				    &geom[2], &geom[0], &geom[1]);
-		kfree(bh);
-		if (ret != -1)
-			return (ret);
-	}
-	heads = 64;
-	sectors = 32;
-	cylinders = aic_sector_div(capacity, heads, sectors);
-
-	if (aic79xx_extended != 0)
-		extended = 1;
-	else
-		extended = (ahd->flags & AHD_EXTENDED_TRANS_A) != 0;
-	if (extended && cylinders >= 1024) {
-		heads = 255;
-		sectors = 63;
-		cylinders = aic_sector_div(capacity, heads, sectors);
-	}
-	geom[0] = heads;
-	geom[1] = sectors;
-	geom[2] = cylinders;
-	return (0);
-}
-#endif
-
-/*
- * Abort the current SCSI command(s).
- */
-static int
-ahd_linux_abort(struct scsi_cmnd *cmd)
-{
-	int error;
-	
-	error = ahd_linux_queue_abort_cmd(cmd);
-
-	return error;
-}
-
-/*
- * Attempt to send a target reset message to the device that timed out.
- */
-static int
-ahd_linux_dev_reset(struct scsi_cmnd *cmd)
-{
-	struct ahd_softc *ahd;
-	struct ahd_linux_device *dev;
-	struct scb *reset_scb;
-	u_int  cdb_byte;
-	int    retval = SUCCESS;
-	int    paused;
-	int    wait;
-	struct	ahd_initiator_tinfo *tinfo;
-	struct	ahd_tmode_tstate *tstate;
-	unsigned long flags;
-	DECLARE_COMPLETION_ONSTACK(done);
-
-	reset_scb = NULL;
-	paused = FALSE;
-	wait = FALSE;
-	ahd = *(struct ahd_softc **)cmd->device->host->hostdata;
-
-	scmd_printk(KERN_INFO, cmd,
-		    "Attempting to queue a TARGET RESET message:");
-
-	printk("CDB:");
-	for (cdb_byte = 0; cdb_byte < cmd->cmd_len; cdb_byte++)
-		printk(" 0x%x", cmd->cmnd[cdb_byte]);
-	printk("\n");
-
-	/*
-	 * Determine if we currently own this command.
-	 */
-	dev = scsi_transport_device_data(cmd->device);
-
-	if (dev == NULL) {
-		/*
-		 * No target device for this command exists,
-		 * so we must not still own the command.
-		 */
-		scmd_printk(KERN_INFO, cmd, "Is not an active device\n");
-		return SUCCESS;
-	}
-
-	/*
-	 * Generate us a new SCB
-	 */
-	reset_scb = ahd_get_scb(ahd, AHD_NEVER_COL_IDX);
-	if (!reset_scb) {
-		scmd_printk(KERN_INFO, cmd, "No SCB available\n");
-		return FAILED;
-	}
-
-	tinfo = ahd_fetch_transinfo(ahd, 'A', ahd->our_id,
-				    cmd->device->id, &tstate);
-	reset_scb->io_ctx = cmd;
-	reset_scb->platform_data->dev = dev;
-	reset_scb->sg_count = 0;
-	ahd_set_residual(reset_scb, 0);
-	ahd_set_sense_residual(reset_scb, 0);
-	reset_scb->platform_data->xfer_len = 0;
-	reset_scb->hscb->control = 0;
-	reset_scb->hscb->scsiid = BUILD_SCSIID(ahd,cmd);
-	reset_scb->hscb->lun = cmd->device->lun;
-	reset_scb->hscb->cdb_len = 0;
-	reset_scb->hscb->task_management = SIU_TASKMGMT_LUN_RESET;
-	reset_scb->flags |= SCB_DEVICE_RESET|SCB_RECOVERY_SCB|SCB_ACTIVE;
-	if ((tinfo->curr.ppr_options & MSG_EXT_PPR_IU_REQ) != 0) {
-		reset_scb->flags |= SCB_PACKETIZED;
-	} else {
-		reset_scb->hscb->control |= MK_MESSAGE;
-	}
-	dev->openings--;
-	dev->active++;
-	dev->commands_issued++;
-
-	ahd_lock(ahd, &flags);
-
-	LIST_INSERT_HEAD(&ahd->pending_scbs, reset_scb, pending_links);
-	ahd_queue_scb(ahd, reset_scb);
-
-	ahd->platform_data->eh_done = &done;
-	ahd_unlock(ahd, &flags);
-
-	printk("%s: Device reset code sleeping\n", ahd_name(ahd));
-	if (!wait_for_completion_timeout(&done, 5 * HZ)) {
-		ahd_lock(ahd, &flags);
-		ahd->platform_data->eh_done = NULL;
-		ahd_unlock(ahd, &flags);
-		printk("%s: Device reset timer expired (active %d)\n",
-		       ahd_name(ahd), dev->active);
-		retval = FAILED;
-	}
-	printk("%s: Device reset returning 0x%x\n", ahd_name(ahd), retval);
-
-	return (retval);
-}
-
-/*
- * Reset the SCSI bus.
- */
-static int
-ahd_linux_bus_reset(struct scsi_cmnd *cmd)
-{
-	struct ahd_softc *ahd;
-	int    found;
-	unsigned long flags;
-
-	ahd = *(struct ahd_softc **)cmd->device->host->hostdata;
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_RECOVERY) != 0)
-		printk("%s: Bus reset called for cmd %p\n",
-		       ahd_name(ahd), cmd);
-#endif
-	ahd_lock(ahd, &flags);
-
-	found = ahd_reset_channel(ahd, scmd_channel(cmd) + 'A',
-				  /*initiate reset*/TRUE);
-	ahd_unlock(ahd, &flags);
-
-	if (bootverbose)
-		printk("%s: SCSI bus reset delivered. "
-		       "%d SCBs aborted.\n", ahd_name(ahd), found);
-
-	return (SUCCESS);
-}
-
-struct scsi_host_template aic79xx_driver_template = {
-	.module			= THIS_MODULE,
-	.name			= "aic79xx",
-	.proc_name		= "aic79xx",
-	.show_info		= ahd_linux_show_info,
-	.write_info	 	= ahd_proc_write_seeprom,
-	.info			= ahd_linux_info,
-	.queuecommand		= ahd_linux_queue,
-	.eh_abort_handler	= ahd_linux_abort,
-	.eh_device_reset_handler = ahd_linux_dev_reset,
-	.eh_bus_reset_handler	= ahd_linux_bus_reset,
-#if defined(__i386__)
-	.bios_param		= ahd_linux_biosparam,
-#endif
-	.can_queue		= AHD_MAX_QUEUE,
-	.this_id		= -1,
-	.max_sectors		= 8192,
-	.cmd_per_lun		= 2,
-	.use_clustering		= ENABLE_CLUSTERING,
-	.slave_alloc		= ahd_linux_slave_alloc,
-	.slave_configure	= ahd_linux_slave_configure,
-	.target_alloc		= ahd_linux_target_alloc,
-	.target_destroy		= ahd_linux_target_destroy,
-};
-
-/******************************** Bus DMA *************************************/
-int
-ahd_dma_tag_create(struct ahd_softc *ahd, bus_dma_tag_t parent,
-		   bus_size_t alignment, bus_size_t boundary,
-		   dma_addr_t lowaddr, dma_addr_t highaddr,
-		   bus_dma_filter_t *filter, void *filterarg,
-		   bus_size_t maxsize, int nsegments,
-		   bus_size_t maxsegsz, int flags, bus_dma_tag_t *ret_tag)
-{
-	bus_dma_tag_t dmat;
-
-	dmat = kmalloc(sizeof(*dmat), GFP_ATOMIC);
-	if (dmat == NULL)
-		return (ENOMEM);
-
-	/*
-	 * Linux is very simplistic about DMA memory.  For now don't
-	 * maintain all specification information.  Once Linux supplies
-	 * better facilities for doing these operations, or the
-	 * needs of this particular driver change, we might need to do
-	 * more here.
-	 */
-	dmat->alignment = alignment;
-	dmat->boundary = boundary;
-	dmat->maxsize = maxsize;
-	*ret_tag = dmat;
-	return (0);
-}
-
-void
-ahd_dma_tag_destroy(struct ahd_softc *ahd, bus_dma_tag_t dmat)
-{
-	kfree(dmat);
-}
-
-int
-ahd_dmamem_alloc(struct ahd_softc *ahd, bus_dma_tag_t dmat, void** vaddr,
-		 int flags, bus_dmamap_t *mapp)
-{
-	*vaddr = pci_alloc_consistent(ahd->dev_softc,
-				      dmat->maxsize, mapp);
-	if (*vaddr == NULL)
-		return (ENOMEM);
-	return(0);
-}
-
-void
-ahd_dmamem_free(struct ahd_softc *ahd, bus_dma_tag_t dmat,
-		void* vaddr, bus_dmamap_t map)
-{
-	pci_free_consistent(ahd->dev_softc, dmat->maxsize,
-			    vaddr, map);
-}
-
-int
-ahd_dmamap_load(struct ahd_softc *ahd, bus_dma_tag_t dmat, bus_dmamap_t map,
-		void *buf, bus_size_t buflen, bus_dmamap_callback_t *cb,
-		void *cb_arg, int flags)
-{
-	/*
-	 * Assume for now that this will only be used during
-	 * initialization and not for per-transaction buffer mapping.
-	 */
-	bus_dma_segment_t stack_sg;
-
-	stack_sg.ds_addr = map;
-	stack_sg.ds_len = dmat->maxsize;
-	cb(cb_arg, &stack_sg, /*nseg*/1, /*error*/0);
-	return (0);
-}
-
-void
-ahd_dmamap_destroy(struct ahd_softc *ahd, bus_dma_tag_t dmat, bus_dmamap_t map)
-{
-}
-
-int
-ahd_dmamap_unload(struct ahd_softc *ahd, bus_dma_tag_t dmat, bus_dmamap_t map)
-{
-	/* Nothing to do */
-	return (0);
-}
-
-/********************* Platform Dependent Functions ***************************/
-static void
-ahd_linux_setup_iocell_info(u_long index, int instance, int targ, int32_t value)
-{
-
-	if ((instance >= 0)
-	 && (instance < ARRAY_SIZE(aic79xx_iocell_info))) {
-		uint8_t *iocell_info;
-
-		iocell_info = (uint8_t*)&aic79xx_iocell_info[instance];
-		iocell_info[index] = value & 0xFFFF;
-		if (bootverbose)
-			printk("iocell[%d:%ld] = %d\n", instance, index, value);
-	}
-}
-
-static void
-ahd_linux_setup_tag_info_global(char *p)
-{
-	int tags, i, j;
-
-	tags = simple_strtoul(p + 1, NULL, 0) & 0xff;
-	printk("Setting Global Tags= %d\n", tags);
-
-	for (i = 0; i < ARRAY_SIZE(aic79xx_tag_info); i++) {
-		for (j = 0; j < AHD_NUM_TARGETS; j++) {
-			aic79xx_tag_info[i].tag_commands[j] = tags;
-		}
-	}
-}
-
-static void
-ahd_linux_setup_tag_info(u_long arg, int instance, int targ, int32_t value)
-{
-
-	if ((instance >= 0) && (targ >= 0)
-	 && (instance < ARRAY_SIZE(aic79xx_tag_info))
-	 && (targ < AHD_NUM_TARGETS)) {
-		aic79xx_tag_info[instance].tag_commands[targ] = value & 0x1FF;
-		if (bootverbose)
-			printk("tag_info[%d:%d] = %d\n", instance, targ, value);
-	}
-}
-
-static char *
-ahd_parse_brace_option(char *opt_name, char *opt_arg, char *end, int depth,
-		       void (*callback)(u_long, int, int, int32_t),
-		       u_long callback_arg)
-{
-	char	*tok_end;
-	char	*tok_end2;
-	int      i;
-	int      instance;
-	int	 targ;
-	int	 done;
-	char	 tok_list[] = {'.', ',', '{', '}', '\0'};
-
-	/* All options use a ':' name/arg separator */
-	if (*opt_arg != ':')
-		return (opt_arg);
-	opt_arg++;
-	instance = -1;
-	targ = -1;
-	done = FALSE;
-	/*
-	 * Restore separator that may be in
-	 * the middle of our option argument.
-	 */
-	tok_end = strchr(opt_arg, '\0');
-	if (tok_end < end)
-		*tok_end = ',';
-	while (!done) {
-		switch (*opt_arg) {
-		case '{':
-			if (instance == -1) {
-				instance = 0;
-			} else {
-				if (depth > 1) {
-					if (targ == -1)
-						targ = 0;
-				} else {
-					printk("Malformed Option %s\n",
-					       opt_name);
-					done = TRUE;
-				}
-			}
-			opt_arg++;
-			break;
-		case '}':
-			if (targ != -1)
-				targ = -1;
-			else if (instance != -1)
-				instance = -1;
-			opt_arg++;
-			break;
-		case ',':
-		case '.':
-			if (instance == -1)
-				done = TRUE;
-			else if (targ >= 0)
-				targ++;
-			else if (instance >= 0)
-				instance++;
-			opt_arg++;
-			break;
-		case '\0':
-			done = TRUE;
-			break;
-		default:
-			tok_end = end;
-			for (i = 0; tok_list[i]; i++) {
-				tok_end2 = strchr(opt_arg, tok_list[i]);
-				if ((tok_end2) && (tok_end2 < tok_end))
-					tok_end = tok_end2;
-			}
-			callback(callback_arg, instance, targ,
-				 simple_strtol(opt_arg, NULL, 0));
-			opt_arg = tok_end;
-			break;
-		}
-	}
-	return (opt_arg);
-}
-
-/*
- * Handle Linux boot parameters. This routine allows for assigning a value
- * to a parameter with a ':' between the parameter and the value.
- * ie. aic79xx=stpwlev:1,extended
- */
-static int
-aic79xx_setup(char *s)
-{
-	int	i, n;
-	char   *p;
-	char   *end;
-
-	static const struct {
-		const char *name;
-		uint32_t *flag;
-	} options[] = {
-		{ "extended", &aic79xx_extended },
-		{ "no_reset", &aic79xx_no_reset },
-		{ "verbose", &aic79xx_verbose },
-		{ "allow_memio", &aic79xx_allow_memio},
-#ifdef AHD_DEBUG
-		{ "debug", &ahd_debug },
-#endif
-		{ "periodic_otag", &aic79xx_periodic_otag },
-		{ "pci_parity", &aic79xx_pci_parity },
-		{ "seltime", &aic79xx_seltime },
-		{ "tag_info", NULL },
-		{ "global_tag_depth", NULL},
-		{ "slewrate", NULL },
-		{ "precomp", NULL },
-		{ "amplitude", NULL },
-		{ "slowcrc", &aic79xx_slowcrc },
-	};
-
-	end = strchr(s, '\0');
-
-	/*
-	 * XXX ia64 gcc isn't smart enough to know that ARRAY_SIZE
-	 * will never be 0 in this case.
-	 */
-	n = 0;
-
-	while ((p = strsep(&s, ",.")) != NULL) {
-		if (*p == '\0')
-			continue;
-		for (i = 0; i < ARRAY_SIZE(options); i++) {
-
-			n = strlen(options[i].name);
-			if (strncmp(options[i].name, p, n) == 0)
-				break;
-		}
-		if (i == ARRAY_SIZE(options))
-			continue;
-
-		if (strncmp(p, "global_tag_depth", n) == 0) {
-			ahd_linux_setup_tag_info_global(p + n);
-		} else if (strncmp(p, "tag_info", n) == 0) {
-			s = ahd_parse_brace_option("tag_info", p + n, end,
-			    2, ahd_linux_setup_tag_info, 0);
-		} else if (strncmp(p, "slewrate", n) == 0) {
-			s = ahd_parse_brace_option("slewrate",
-			    p + n, end, 1, ahd_linux_setup_iocell_info,
-			    AIC79XX_SLEWRATE_INDEX);
-		} else if (strncmp(p, "precomp", n) == 0) {
-			s = ahd_parse_brace_option("precomp",
-			    p + n, end, 1, ahd_linux_setup_iocell_info,
-			    AIC79XX_PRECOMP_INDEX);
-		} else if (strncmp(p, "amplitude", n) == 0) {
-			s = ahd_parse_brace_option("amplitude",
-			    p + n, end, 1, ahd_linux_setup_iocell_info,
-			    AIC79XX_AMPLITUDE_INDEX);
-		} else if (p[n] == ':') {
-			*(options[i].flag) = simple_strtoul(p + n + 1, NULL, 0);
-		} else if (!strncmp(p, "verbose", n)) {
-			*(options[i].flag) = 1;
-		} else {
-			*(options[i].flag) ^= 0xFFFFFFFF;
-		}
-	}
-	return 1;
-}
-
-__setup("aic79xx=", aic79xx_setup);
-
-uint32_t aic79xx_verbose;
-
-int
-ahd_linux_register_host(struct ahd_softc *ahd, struct scsi_host_template *template)
-{
-	char	buf[80];
-	struct	Scsi_Host *host;
-	char	*new_name;
-	u_long	s;
-	int	retval;
-
-	template->name = ahd->description;
-	host = scsi_host_alloc(template, sizeof(struct ahd_softc *));
-	if (host == NULL)
-		return (ENOMEM);
-
-	*((struct ahd_softc **)host->hostdata) = ahd;
-	ahd->platform_data->host = host;
-	host->can_queue = AHD_MAX_QUEUE;
-	host->cmd_per_lun = 2;
-	host->sg_tablesize = AHD_NSEG;
-	host->this_id = ahd->our_id;
-	host->irq = ahd->platform_data->irq;
-	host->max_id = (ahd->features & AHD_WIDE) ? 16 : 8;
-	host->max_lun = AHD_NUM_LUNS;
-	host->max_channel = 0;
-	host->sg_tablesize = AHD_NSEG;
-	ahd_lock(ahd, &s);
-	ahd_set_unit(ahd, ahd_linux_unit++);
-	ahd_unlock(ahd, &s);
-	sprintf(buf, "scsi%d", host->host_no);
-	new_name = kmalloc(strlen(buf) + 1, GFP_ATOMIC);
-	if (new_name != NULL) {
-		strcpy(new_name, buf);
-		ahd_set_name(ahd, new_name);
-	}
-	host->unique_id = ahd->unit;
-	ahd_linux_initialize_scsi_bus(ahd);
-	ahd_intr_enable(ahd, TRUE);
-
-	host->transportt = ahd_linux_transport_template;
-
-	retval = scsi_add_host(host, &ahd->dev_softc->dev);
-	if (retval) {
-		printk(KERN_WARNING "aic79xx: scsi_add_host failed\n");
-		scsi_host_put(host);
-		return retval;
-	}
-
-	scsi_scan_host(host);
-	return 0;
-}
-
-/*
- * Place the SCSI bus into a known state by either resetting it,
- * or forcing transfer negotiations on the next command to any
- * target.
- */
-static void
-ahd_linux_initialize_scsi_bus(struct ahd_softc *ahd)
-{
-	u_int target_id;
-	u_int numtarg;
-	unsigned long s;
-
-	target_id = 0;
-	numtarg = 0;
-
-	if (aic79xx_no_reset != 0)
-		ahd->flags &= ~AHD_RESET_BUS_A;
-
-	if ((ahd->flags & AHD_RESET_BUS_A) != 0)
-		ahd_reset_channel(ahd, 'A', /*initiate_reset*/TRUE);
-	else
-		numtarg = (ahd->features & AHD_WIDE) ? 16 : 8;
-
-	ahd_lock(ahd, &s);
-
-	/*
-	 * Force negotiation to async for all targets that
-	 * will not see an initial bus reset.
-	 */
-	for (; target_id < numtarg; target_id++) {
-		struct ahd_devinfo devinfo;
-		struct ahd_initiator_tinfo *tinfo;
-		struct ahd_tmode_tstate *tstate;
-
-		tinfo = ahd_fetch_transinfo(ahd, 'A', ahd->our_id,
-					    target_id, &tstate);
-		ahd_compile_devinfo(&devinfo, ahd->our_id, target_id,
-				    CAM_LUN_WILDCARD, 'A', ROLE_INITIATOR);
-		ahd_update_neg_request(ahd, &devinfo, tstate,
-				       tinfo, AHD_NEG_ALWAYS);
-	}
-	ahd_unlock(ahd, &s);
-	/* Give the bus some time to recover */
-	if ((ahd->flags & AHD_RESET_BUS_A) != 0) {
-		ahd_freeze_simq(ahd);
-		msleep(AIC79XX_RESET_DELAY);
-		ahd_release_simq(ahd);
-	}
-}
-
-int
-ahd_platform_alloc(struct ahd_softc *ahd, void *platform_arg)
-{
-	ahd->platform_data =
-	    kzalloc(sizeof(struct ahd_platform_data), GFP_ATOMIC);
-	if (ahd->platform_data == NULL)
-		return (ENOMEM);
-	ahd->platform_data->irq = AHD_LINUX_NOIRQ;
-	ahd_lockinit(ahd);
-	ahd->seltime = (aic79xx_seltime & 0x3) << 4;
-	return (0);
-}
-
-void
-ahd_platform_free(struct ahd_softc *ahd)
-{
-	struct scsi_target *starget;
-	int i;
-
-	if (ahd->platform_data != NULL) {
-		/* destroy all of the device and target objects */
-		for (i = 0; i < AHD_NUM_TARGETS; i++) {
-			starget = ahd->platform_data->starget[i];
-			if (starget != NULL) {
-				ahd->platform_data->starget[i] = NULL;
-			}
-		}
-
-		if (ahd->platform_data->irq != AHD_LINUX_NOIRQ)
-			free_irq(ahd->platform_data->irq, ahd);
-		if (ahd->tags[0] == BUS_SPACE_PIO
-		 && ahd->bshs[0].ioport != 0)
-			release_region(ahd->bshs[0].ioport, 256);
-		if (ahd->tags[1] == BUS_SPACE_PIO
-		 && ahd->bshs[1].ioport != 0)
-			release_region(ahd->bshs[1].ioport, 256);
-		if (ahd->tags[0] == BUS_SPACE_MEMIO
-		 && ahd->bshs[0].maddr != NULL) {
-			iounmap(ahd->bshs[0].maddr);
-			release_mem_region(ahd->platform_data->mem_busaddr,
-					   0x1000);
-		}
-		if (ahd->platform_data->host)
-			scsi_host_put(ahd->platform_data->host);
-
-		kfree(ahd->platform_data);
-	}
-}
-
-void
-ahd_platform_init(struct ahd_softc *ahd)
-{
-	/*
-	 * Lookup and commit any modified IO Cell options.
-	 */
-	if (ahd->unit < ARRAY_SIZE(aic79xx_iocell_info)) {
-		const struct ahd_linux_iocell_opts *iocell_opts;
-
-		iocell_opts = &aic79xx_iocell_info[ahd->unit];
-		if (iocell_opts->precomp != AIC79XX_DEFAULT_PRECOMP)
-			AHD_SET_PRECOMP(ahd, iocell_opts->precomp);
-		if (iocell_opts->slewrate != AIC79XX_DEFAULT_SLEWRATE)
-			AHD_SET_SLEWRATE(ahd, iocell_opts->slewrate);
-		if (iocell_opts->amplitude != AIC79XX_DEFAULT_AMPLITUDE)
-			AHD_SET_AMPLITUDE(ahd, iocell_opts->amplitude);
-	}
-
-}
-
-void
-ahd_platform_freeze_devq(struct ahd_softc *ahd, struct scb *scb)
-{
-	ahd_platform_abort_scbs(ahd, SCB_GET_TARGET(ahd, scb),
-				SCB_GET_CHANNEL(ahd, scb),
-				SCB_GET_LUN(scb), SCB_LIST_NULL,
-				ROLE_UNKNOWN, CAM_REQUEUE_REQ);
-}
-
-void
-ahd_platform_set_tags(struct ahd_softc *ahd, struct scsi_device *sdev,
-		      struct ahd_devinfo *devinfo, ahd_queue_alg alg)
-{
-	struct ahd_linux_device *dev;
-	int was_queuing;
-	int now_queuing;
-
-	if (sdev == NULL)
-		return;
-
-	dev = scsi_transport_device_data(sdev);
-
-	if (dev == NULL)
-		return;
-	was_queuing = dev->flags & (AHD_DEV_Q_BASIC|AHD_DEV_Q_TAGGED);
-	switch (alg) {
-	default:
-	case AHD_QUEUE_NONE:
-		now_queuing = 0;
-		break; 
-	case AHD_QUEUE_BASIC:
-		now_queuing = AHD_DEV_Q_BASIC;
-		break;
-	case AHD_QUEUE_TAGGED:
-		now_queuing = AHD_DEV_Q_TAGGED;
-		break;
-	}
-	if ((dev->flags & AHD_DEV_FREEZE_TIL_EMPTY) == 0
-	 && (was_queuing != now_queuing)
-	 && (dev->active != 0)) {
-		dev->flags |= AHD_DEV_FREEZE_TIL_EMPTY;
-		dev->qfrozen++;
-	}
-
-	dev->flags &= ~(AHD_DEV_Q_BASIC|AHD_DEV_Q_TAGGED|AHD_DEV_PERIODIC_OTAG);
-	if (now_queuing) {
-		u_int usertags;
-
-		usertags = ahd_linux_user_tagdepth(ahd, devinfo);
-		if (!was_queuing) {
-			/*
-			 * Start out aggressively and allow our
-			 * dynamic queue depth algorithm to take
-			 * care of the rest.
-			 */
-			dev->maxtags = usertags;
-			dev->openings = dev->maxtags - dev->active;
-		}
-		if (dev->maxtags == 0) {
-			/*
-			 * Queueing is disabled by the user.
-			 */
-			dev->openings = 1;
-		} else if (alg == AHD_QUEUE_TAGGED) {
-			dev->flags |= AHD_DEV_Q_TAGGED;
-			if (aic79xx_periodic_otag != 0)
-				dev->flags |= AHD_DEV_PERIODIC_OTAG;
-		} else
-			dev->flags |= AHD_DEV_Q_BASIC;
-	} else {
-		/* We can only have one opening. */
-		dev->maxtags = 0;
-		dev->openings =  1 - dev->active;
-	}
-
-	switch ((dev->flags & (AHD_DEV_Q_BASIC|AHD_DEV_Q_TAGGED))) {
-	case AHD_DEV_Q_BASIC:
-	case AHD_DEV_Q_TAGGED:
-		scsi_change_queue_depth(sdev,
-				dev->openings + dev->active);
-		break;
-	default:
-		/*
-		 * We allow the OS to queue 2 untagged transactions to
-		 * us at any time even though we can only execute them
-		 * serially on the controller/device.  This should
-		 * remove some latency.
-		 */
-		scsi_change_queue_depth(sdev, 1);
-		break;
-	}
-}
-
-int
-ahd_platform_abort_scbs(struct ahd_softc *ahd, int target, char channel,
-			int lun, u_int tag, role_t role, uint32_t status)
-{
-	return 0;
-}
-
-static u_int
-ahd_linux_user_tagdepth(struct ahd_softc *ahd, struct ahd_devinfo *devinfo)
-{
-	static int warned_user;
-	u_int tags;
-
-	tags = 0;
-	if ((ahd->user_discenable & devinfo->target_mask) != 0) {
-		if (ahd->unit >= ARRAY_SIZE(aic79xx_tag_info)) {
-
-			if (warned_user == 0) {
-				printk(KERN_WARNING
-"aic79xx: WARNING: Insufficient tag_info instances\n"
-"aic79xx: for installed controllers.  Using defaults\n"
-"aic79xx: Please update the aic79xx_tag_info array in\n"
-"aic79xx: the aic79xx_osm.c source file.\n");
-				warned_user++;
-			}
-			tags = AHD_MAX_QUEUE;
-		} else {
-			adapter_tag_info_t *tag_info;
-
-			tag_info = &aic79xx_tag_info[ahd->unit];
-			tags = tag_info->tag_commands[devinfo->target_offset];
-			if (tags > AHD_MAX_QUEUE)
-				tags = AHD_MAX_QUEUE;
-		}
-	}
-	return (tags);
-}
-
-/*
- * Determines the queue depth for a given device.
- */
-static void
-ahd_linux_device_queue_depth(struct scsi_device *sdev)
-{
-	struct	ahd_devinfo devinfo;
-	u_int	tags;
-	struct ahd_softc *ahd = *((struct ahd_softc **)sdev->host->hostdata);
-
-	ahd_compile_devinfo(&devinfo,
-			    ahd->our_id,
-			    sdev->sdev_target->id, sdev->lun,
-			    sdev->sdev_target->channel == 0 ? 'A' : 'B',
-			    ROLE_INITIATOR);
-	tags = ahd_linux_user_tagdepth(ahd, &devinfo);
-	if (tags != 0 && sdev->tagged_supported != 0) {
-
-		ahd_platform_set_tags(ahd, sdev, &devinfo, AHD_QUEUE_TAGGED);
-		ahd_send_async(ahd, devinfo.channel, devinfo.target,
-			       devinfo.lun, AC_TRANSFER_NEG);
-		ahd_print_devinfo(ahd, &devinfo);
-		printk("Tagged Queuing enabled.  Depth %d\n", tags);
-	} else {
-		ahd_platform_set_tags(ahd, sdev, &devinfo, AHD_QUEUE_NONE);
-		ahd_send_async(ahd, devinfo.channel, devinfo.target,
-			       devinfo.lun, AC_TRANSFER_NEG);
-	}
-}
-
-static int
-ahd_linux_run_command(struct ahd_softc *ahd, struct ahd_linux_device *dev,
-		      struct scsi_cmnd *cmd)
-{
-	struct	 scb *scb;
-	struct	 hardware_scb *hscb;
-	struct	 ahd_initiator_tinfo *tinfo;
-	struct	 ahd_tmode_tstate *tstate;
-	u_int	 col_idx;
-	uint16_t mask;
-	unsigned long flags;
-	int nseg;
-
-	nseg = scsi_dma_map(cmd);
-	if (nseg < 0)
-		return SCSI_MLQUEUE_HOST_BUSY;
-
-	ahd_lock(ahd, &flags);
-
-	/*
-	 * Get an scb to use.
-	 */
-	tinfo = ahd_fetch_transinfo(ahd, 'A', ahd->our_id,
-				    cmd->device->id, &tstate);
-	if ((dev->flags & (AHD_DEV_Q_TAGGED|AHD_DEV_Q_BASIC)) == 0
-	 || (tinfo->curr.ppr_options & MSG_EXT_PPR_IU_REQ) != 0) {
-		col_idx = AHD_NEVER_COL_IDX;
-	} else {
-		col_idx = AHD_BUILD_COL_IDX(cmd->device->id,
-					    cmd->device->lun);
-	}
-	if ((scb = ahd_get_scb(ahd, col_idx)) == NULL) {
-		ahd->flags |= AHD_RESOURCE_SHORTAGE;
-		ahd_unlock(ahd, &flags);
-		scsi_dma_unmap(cmd);
-		return SCSI_MLQUEUE_HOST_BUSY;
-	}
-
-	scb->io_ctx = cmd;
-	scb->platform_data->dev = dev;
-	hscb = scb->hscb;
-	cmd->host_scribble = (char *)scb;
-
-	/*
-	 * Fill out basics of the HSCB.
-	 */
-	hscb->control = 0;
-	hscb->scsiid = BUILD_SCSIID(ahd, cmd);
-	hscb->lun = cmd->device->lun;
-	scb->hscb->task_management = 0;
-	mask = SCB_GET_TARGET_MASK(ahd, scb);
-
-	if ((ahd->user_discenable & mask) != 0)
-		hscb->control |= DISCENB;
-
-	if ((tinfo->curr.ppr_options & MSG_EXT_PPR_IU_REQ) != 0)
-		scb->flags |= SCB_PACKETIZED;
-
-	if ((tstate->auto_negotiate & mask) != 0) {
-		scb->flags |= SCB_AUTO_NEGOTIATE;
-		scb->hscb->control |= MK_MESSAGE;
-	}
-
-	if ((dev->flags & (AHD_DEV_Q_TAGGED|AHD_DEV_Q_BASIC)) != 0) {
-		if (dev->commands_since_idle_or_otag == AHD_OTAG_THRESH
-		 && (dev->flags & AHD_DEV_Q_TAGGED) != 0) {
-			hscb->control |= MSG_ORDERED_TASK;
-			dev->commands_since_idle_or_otag = 0;
-		} else {
-			hscb->control |= MSG_SIMPLE_TASK;
-		}
-	}
-
-	hscb->cdb_len = cmd->cmd_len;
-	memcpy(hscb->shared_data.idata.cdb, cmd->cmnd, hscb->cdb_len);
-
-	scb->platform_data->xfer_len = 0;
-	ahd_set_residual(scb, 0);
-	ahd_set_sense_residual(scb, 0);
-	scb->sg_count = 0;
-
-	if (nseg > 0) {
-		void *sg = scb->sg_list;
-		struct scatterlist *cur_seg;
-		int i;
-
-		scb->platform_data->xfer_len = 0;
-
-		scsi_for_each_sg(cmd, cur_seg, nseg, i) {
-			dma_addr_t addr;
-			bus_size_t len;
-
-			addr = sg_dma_address(cur_seg);
-			len = sg_dma_len(cur_seg);
-			scb->platform_data->xfer_len += len;
-			sg = ahd_sg_setup(ahd, scb, sg, addr, len,
-					  i == (nseg - 1));
-		}
-	}
-
-	LIST_INSERT_HEAD(&ahd->pending_scbs, scb, pending_links);
-	dev->openings--;
-	dev->active++;
-	dev->commands_issued++;
-
-	if ((dev->flags & AHD_DEV_PERIODIC_OTAG) != 0)
-		dev->commands_since_idle_or_otag++;
-	scb->flags |= SCB_ACTIVE;
-	ahd_queue_scb(ahd, scb);
-
-	ahd_unlock(ahd, &flags);
-
-	return 0;
-}
-
-/*
- * SCSI controller interrupt handler.
- */
-irqreturn_t
-ahd_linux_isr(int irq, void *dev_id)
-{
-	struct	ahd_softc *ahd;
-	u_long	flags;
-	int	ours;
-
-	ahd = (struct ahd_softc *) dev_id;
-	ahd_lock(ahd, &flags); 
-	ours = ahd_intr(ahd);
-	ahd_unlock(ahd, &flags);
-	return IRQ_RETVAL(ours);
-}
-
-void
-ahd_send_async(struct ahd_softc *ahd, char channel,
-	       u_int target, u_int lun, ac_code code)
-{
-	switch (code) {
-	case AC_TRANSFER_NEG:
-	{
-		struct  scsi_target *starget;
-		struct	ahd_initiator_tinfo *tinfo;
-		struct	ahd_tmode_tstate *tstate;
-		unsigned int target_ppr_options;
-
-		BUG_ON(target == CAM_TARGET_WILDCARD);
-
-		tinfo = ahd_fetch_transinfo(ahd, channel, ahd->our_id,
-					    target, &tstate);
-
-		/*
-		 * Don't bother reporting results while
-		 * negotiations are still pending.
-		 */
-		if (tinfo->curr.period != tinfo->goal.period
-		 || tinfo->curr.width != tinfo->goal.width
-		 || tinfo->curr.offset != tinfo->goal.offset
-		 || tinfo->curr.ppr_options != tinfo->goal.ppr_options)
-			if (bootverbose == 0)
-				break;
-
-		/*
-		 * Don't bother reporting results that
-		 * are identical to those last reported.
-		 */
-		starget = ahd->platform_data->starget[target];
-		if (starget == NULL)
-			break;
-
-		target_ppr_options =
-			(spi_dt(starget) ? MSG_EXT_PPR_DT_REQ : 0)
-			+ (spi_qas(starget) ? MSG_EXT_PPR_QAS_REQ : 0)
-			+ (spi_iu(starget) ?  MSG_EXT_PPR_IU_REQ : 0)
-			+ (spi_rd_strm(starget) ? MSG_EXT_PPR_RD_STRM : 0)
-			+ (spi_pcomp_en(starget) ? MSG_EXT_PPR_PCOMP_EN : 0)
-			+ (spi_rti(starget) ? MSG_EXT_PPR_RTI : 0)
-			+ (spi_wr_flow(starget) ? MSG_EXT_PPR_WR_FLOW : 0)
-			+ (spi_hold_mcs(starget) ? MSG_EXT_PPR_HOLD_MCS : 0);
-
-		if (tinfo->curr.period == spi_period(starget)
-		    && tinfo->curr.width == spi_width(starget)
-		    && tinfo->curr.offset == spi_offset(starget)
-		 && tinfo->curr.ppr_options == target_ppr_options)
-			if (bootverbose == 0)
-				break;
-
-		spi_period(starget) = tinfo->curr.period;
-		spi_width(starget) = tinfo->curr.width;
-		spi_offset(starget) = tinfo->curr.offset;
-		spi_dt(starget) = tinfo->curr.ppr_options & MSG_EXT_PPR_DT_REQ ? 1 : 0;
-		spi_qas(starget) = tinfo->curr.ppr_options & MSG_EXT_PPR_QAS_REQ ? 1 : 0;
-		spi_iu(starget) = tinfo->curr.ppr_options & MSG_EXT_PPR_IU_REQ ? 1 : 0;
-		spi_rd_strm(starget) = tinfo->curr.ppr_options & MSG_EXT_PPR_RD_STRM ? 1 : 0;
-		spi_pcomp_en(starget) =  tinfo->curr.ppr_options & MSG_EXT_PPR_PCOMP_EN ? 1 : 0;
-		spi_rti(starget) =  tinfo->curr.ppr_options &  MSG_EXT_PPR_RTI ? 1 : 0;
-		spi_wr_flow(starget) = tinfo->curr.ppr_options & MSG_EXT_PPR_WR_FLOW ? 1 : 0;
-		spi_hold_mcs(starget) = tinfo->curr.ppr_options & MSG_EXT_PPR_HOLD_MCS ? 1 : 0;
-		spi_display_xfer_agreement(starget);
-		break;
-	}
-        case AC_SENT_BDR:
-	{
-		WARN_ON(lun != CAM_LUN_WILDCARD);
-		scsi_report_device_reset(ahd->platform_data->host,
-					 channel - 'A', target);
-		break;
-	}
-        case AC_BUS_RESET:
-		if (ahd->platform_data->host != NULL) {
-			scsi_report_bus_reset(ahd->platform_data->host,
-					      channel - 'A');
-		}
-                break;
-        default:
-                panic("ahd_send_async: Unexpected async event");
-        }
-}
-
-/*
- * Calls the higher level scsi done function and frees the scb.
- */
-void
-ahd_done(struct ahd_softc *ahd, struct scb *scb)
-{
-	struct scsi_cmnd *cmd;
-	struct	  ahd_linux_device *dev;
-
-	if ((scb->flags & SCB_ACTIVE) == 0) {
-		printk("SCB %d done'd twice\n", SCB_GET_TAG(scb));
-		ahd_dump_card_state(ahd);
-		panic("Stopping for safety");
-	}
-	LIST_REMOVE(scb, pending_links);
-	cmd = scb->io_ctx;
-	dev = scb->platform_data->dev;
-	dev->active--;
-	dev->openings++;
-	if ((cmd->result & (CAM_DEV_QFRZN << 16)) != 0) {
-		cmd->result &= ~(CAM_DEV_QFRZN << 16);
-		dev->qfrozen--;
-	}
-	ahd_linux_unmap_scb(ahd, scb);
-
-	/*
-	 * Guard against stale sense data.
-	 * The Linux mid-layer assumes that sense
-	 * was retrieved anytime the first byte of
-	 * the sense buffer looks "sane".
-	 */
-	cmd->sense_buffer[0] = 0;
-	if (ahd_get_transaction_status(scb) == CAM_REQ_INPROG) {
-		uint32_t amount_xferred;
-
-		amount_xferred =
-		    ahd_get_transfer_length(scb) - ahd_get_residual(scb);
-		if ((scb->flags & SCB_TRANSMISSION_ERROR) != 0) {
-#ifdef AHD_DEBUG
-			if ((ahd_debug & AHD_SHOW_MISC) != 0) {
-				ahd_print_path(ahd, scb);
-				printk("Set CAM_UNCOR_PARITY\n");
-			}
-#endif
-			ahd_set_transaction_status(scb, CAM_UNCOR_PARITY);
-#ifdef AHD_REPORT_UNDERFLOWS
-		/*
-		 * This code is disabled by default as some
-		 * clients of the SCSI system do not properly
-		 * initialize the underflow parameter.  This
-		 * results in spurious termination of commands
-		 * that complete as expected (e.g. underflow is
-		 * allowed as command can return variable amounts
-		 * of data.
-		 */
-		} else if (amount_xferred < scb->io_ctx->underflow) {
-			u_int i;
-
-			ahd_print_path(ahd, scb);
-			printk("CDB:");
-			for (i = 0; i < scb->io_ctx->cmd_len; i++)
-				printk(" 0x%x", scb->io_ctx->cmnd[i]);
-			printk("\n");
-			ahd_print_path(ahd, scb);
-			printk("Saw underflow (%ld of %ld bytes). "
-			       "Treated as error\n",
-				ahd_get_residual(scb),
-				ahd_get_transfer_length(scb));
-			ahd_set_transaction_status(scb, CAM_DATA_RUN_ERR);
-#endif
-		} else {
-			ahd_set_transaction_status(scb, CAM_REQ_CMP);
-		}
-	} else if (ahd_get_transaction_status(scb) == CAM_SCSI_STATUS_ERROR) {
-		ahd_linux_handle_scsi_status(ahd, cmd->device, scb);
-	}
-
-	if (dev->openings == 1
-	 && ahd_get_transaction_status(scb) == CAM_REQ_CMP
-	 && ahd_get_scsi_status(scb) != SCSI_STATUS_QUEUE_FULL)
-		dev->tag_success_count++;
-	/*
-	 * Some devices deal with temporary internal resource
-	 * shortages by returning queue full.  When the queue
-	 * full occurrs, we throttle back.  Slowly try to get
-	 * back to our previous queue depth.
-	 */
-	if ((dev->openings + dev->active) < dev->maxtags
-	 && dev->tag_success_count > AHD_TAG_SUCCESS_INTERVAL) {
-		dev->tag_success_count = 0;
-		dev->openings++;
-	}
-
-	if (dev->active == 0)
-		dev->commands_since_idle_or_otag = 0;
-
-	if ((scb->flags & SCB_RECOVERY_SCB) != 0) {
-		printk("Recovery SCB completes\n");
-		if (ahd_get_transaction_status(scb) == CAM_BDR_SENT
-		 || ahd_get_transaction_status(scb) == CAM_REQ_ABORTED)
-			ahd_set_transaction_status(scb, CAM_CMD_TIMEOUT);
-
-		if (ahd->platform_data->eh_done)
-			complete(ahd->platform_data->eh_done);
-	}
-
-	ahd_free_scb(ahd, scb);
-	ahd_linux_queue_cmd_complete(ahd, cmd);
-}
-
-static void
-ahd_linux_handle_scsi_status(struct ahd_softc *ahd,
-			     struct scsi_device *sdev, struct scb *scb)
-{
-	struct	ahd_devinfo devinfo;
-	struct ahd_linux_device *dev = scsi_transport_device_data(sdev);
-
-	ahd_compile_devinfo(&devinfo,
-			    ahd->our_id,
-			    sdev->sdev_target->id, sdev->lun,
-			    sdev->sdev_target->channel == 0 ? 'A' : 'B',
-			    ROLE_INITIATOR);
-	
-	/*
-	 * We don't currently trust the mid-layer to
-	 * properly deal with queue full or busy.  So,
-	 * when one occurs, we tell the mid-layer to
-	 * unconditionally requeue the command to us
-	 * so that we can retry it ourselves.  We also
-	 * implement our own throttling mechanism so
-	 * we don't clobber the device with too many
-	 * commands.
-	 */
-	switch (ahd_get_scsi_status(scb)) {
-	default:
-		break;
-	case SCSI_STATUS_CHECK_COND:
-	case SCSI_STATUS_CMD_TERMINATED:
-	{
-		struct scsi_cmnd *cmd;
-
-		/*
-		 * Copy sense information to the OS's cmd
-		 * structure if it is available.
-		 */
-		cmd = scb->io_ctx;
-		if ((scb->flags & (SCB_SENSE|SCB_PKT_SENSE)) != 0) {
-			struct scsi_status_iu_header *siu;
-			u_int sense_size;
-			u_int sense_offset;
-
-			if (scb->flags & SCB_SENSE) {
-				sense_size = min(sizeof(struct scsi_sense_data)
-					       - ahd_get_sense_residual(scb),
-						 (u_long)SCSI_SENSE_BUFFERSIZE);
-				sense_offset = 0;
-			} else {
-				/*
-				 * Copy only the sense data into the provided
-				 * buffer.
-				 */
-				siu = (struct scsi_status_iu_header *)
-				    scb->sense_data;
-				sense_size = min_t(size_t,
-						scsi_4btoul(siu->sense_length),
-						SCSI_SENSE_BUFFERSIZE);
-				sense_offset = SIU_SENSE_OFFSET(siu);
-			}
-
-			memset(cmd->sense_buffer, 0, SCSI_SENSE_BUFFERSIZE);
-			memcpy(cmd->sense_buffer,
-			       ahd_get_sense_buf(ahd, scb)
-			       + sense_offset, sense_size);
-			cmd->result |= (DRIVER_SENSE << 24);
-
-#ifdef AHD_DEBUG
-			if (ahd_debug & AHD_SHOW_SENSE) {
-				int i;
-
-				printk("Copied %d bytes of sense data at %d:",
-				       sense_size, sense_offset);
-				for (i = 0; i < sense_size; i++) {
-					if ((i & 0xF) == 0)
-						printk("\n");
-					printk("0x%x ", cmd->sense_buffer[i]);
-				}
-				printk("\n");
-			}
-#endif
-		}
-		break;
-	}
-	case SCSI_STATUS_QUEUE_FULL:
-		/*
-		 * By the time the core driver has returned this
-		 * command, all other commands that were queued
-		 * to us but not the device have been returned.
-		 * This ensures that dev->active is equal to
-		 * the number of commands actually queued to
-		 * the device.
-		 */
-		dev->tag_success_count = 0;
-		if (dev->active != 0) {
-			/*
-			 * Drop our opening count to the number
-			 * of commands currently outstanding.
-			 */
-			dev->openings = 0;
-#ifdef AHD_DEBUG
-			if ((ahd_debug & AHD_SHOW_QFULL) != 0) {
-				ahd_print_path(ahd, scb);
-				printk("Dropping tag count to %d\n",
-				       dev->active);
-			}
-#endif
-			if (dev->active == dev->tags_on_last_queuefull) {
-
-				dev->last_queuefull_same_count++;
-				/*
-				 * If we repeatedly see a queue full
-				 * at the same queue depth, this
-				 * device has a fixed number of tag
-				 * slots.  Lock in this tag depth
-				 * so we stop seeing queue fulls from
-				 * this device.
-				 */
-				if (dev->last_queuefull_same_count
-				 == AHD_LOCK_TAGS_COUNT) {
-					dev->maxtags = dev->active;
-					ahd_print_path(ahd, scb);
-					printk("Locking max tag count at %d\n",
-					       dev->active);
-				}
-			} else {
-				dev->tags_on_last_queuefull = dev->active;
-				dev->last_queuefull_same_count = 0;
-			}
-			ahd_set_transaction_status(scb, CAM_REQUEUE_REQ);
-			ahd_set_scsi_status(scb, SCSI_STATUS_OK);
-			ahd_platform_set_tags(ahd, sdev, &devinfo,
-				     (dev->flags & AHD_DEV_Q_BASIC)
-				   ? AHD_QUEUE_BASIC : AHD_QUEUE_TAGGED);
-			break;
-		}
-		/*
-		 * Drop down to a single opening, and treat this
-		 * as if the target returned BUSY SCSI status.
-		 */
-		dev->openings = 1;
-		ahd_platform_set_tags(ahd, sdev, &devinfo,
-			     (dev->flags & AHD_DEV_Q_BASIC)
-			   ? AHD_QUEUE_BASIC : AHD_QUEUE_TAGGED);
-		ahd_set_scsi_status(scb, SCSI_STATUS_BUSY);
-	}
-}
-
-static void
-ahd_linux_queue_cmd_complete(struct ahd_softc *ahd, struct scsi_cmnd *cmd)
-{
-	int status;
-	int new_status = DID_OK;
-	int do_fallback = 0;
-	int scsi_status;
-
-	/*
-	 * Map CAM error codes into Linux Error codes.  We
-	 * avoid the conversion so that the DV code has the
-	 * full error information available when making
-	 * state change decisions.
-	 */
-
-	status = ahd_cmd_get_transaction_status(cmd);
-	switch (status) {
-	case CAM_REQ_INPROG:
-	case CAM_REQ_CMP:
-		new_status = DID_OK;
-		break;
-	case CAM_AUTOSENSE_FAIL:
-		new_status = DID_ERROR;
-		/* Fallthrough */
-	case CAM_SCSI_STATUS_ERROR:
-		scsi_status = ahd_cmd_get_scsi_status(cmd);
-
-		switch(scsi_status) {
-		case SCSI_STATUS_CMD_TERMINATED:
-		case SCSI_STATUS_CHECK_COND:
-			if ((cmd->result >> 24) != DRIVER_SENSE) {
-				do_fallback = 1;
-			} else {
-				struct scsi_sense_data *sense;
-				
-				sense = (struct scsi_sense_data *)
-					cmd->sense_buffer;
-				if (sense->extra_len >= 5 &&
-				    (sense->add_sense_code == 0x47
-				     || sense->add_sense_code == 0x48))
-					do_fallback = 1;
-			}
-			break;
-		default:
-			break;
-		}
-		break;
-	case CAM_REQ_ABORTED:
-		new_status = DID_ABORT;
-		break;
-	case CAM_BUSY:
-		new_status = DID_BUS_BUSY;
-		break;
-	case CAM_REQ_INVALID:
-	case CAM_PATH_INVALID:
-		new_status = DID_BAD_TARGET;
-		break;
-	case CAM_SEL_TIMEOUT:
-		new_status = DID_NO_CONNECT;
-		break;
-	case CAM_SCSI_BUS_RESET:
-	case CAM_BDR_SENT:
-		new_status = DID_RESET;
-		break;
-	case CAM_UNCOR_PARITY:
-		new_status = DID_PARITY;
-		do_fallback = 1;
-		break;
-	case CAM_CMD_TIMEOUT:
-		new_status = DID_TIME_OUT;
-		do_fallback = 1;
-		break;
-	case CAM_REQ_CMP_ERR:
-	case CAM_UNEXP_BUSFREE:
-	case CAM_DATA_RUN_ERR:
-		new_status = DID_ERROR;
-		do_fallback = 1;
-		break;
-	case CAM_UA_ABORT:
-	case CAM_NO_HBA:
-	case CAM_SEQUENCE_FAIL:
-	case CAM_CCB_LEN_ERR:
-	case CAM_PROVIDE_FAIL:
-	case CAM_REQ_TERMIO:
-	case CAM_UNREC_HBA_ERROR:
-	case CAM_REQ_TOO_BIG:
-		new_status = DID_ERROR;
-		break;
-	case CAM_REQUEUE_REQ:
-		new_status = DID_REQUEUE;
-		break;
-	default:
-		/* We should never get here */
-		new_status = DID_ERROR;
-		break;
-	}
-
-	if (do_fallback) {
-		printk("%s: device overrun (status %x) on %d:%d:%d\n",
-		       ahd_name(ahd), status, cmd->device->channel,
-		       cmd->device->id, (u8)cmd->device->lun);
-	}
-
-	ahd_cmd_set_transaction_status(cmd, new_status);
-
-	cmd->scsi_done(cmd);
-}
-
-static void
-ahd_freeze_simq(struct ahd_softc *ahd)
-{
-	scsi_block_requests(ahd->platform_data->host);
-}
-
-static void
-ahd_release_simq(struct ahd_softc *ahd)
-{
-	scsi_unblock_requests(ahd->platform_data->host);
-}
-
-static int
-ahd_linux_queue_abort_cmd(struct scsi_cmnd *cmd)
-{
-	struct ahd_softc *ahd;
-	struct ahd_linux_device *dev;
-	struct scb *pending_scb;
-	u_int  saved_scbptr;
-	u_int  active_scbptr;
-	u_int  last_phase;
-	u_int  saved_scsiid;
-	u_int  cdb_byte;
-	int    retval;
-	int    was_paused;
-	int    paused;
-	int    wait;
-	int    disconnected;
-	ahd_mode_state saved_modes;
-	unsigned long flags;
-
-	pending_scb = NULL;
-	paused = FALSE;
-	wait = FALSE;
-	ahd = *(struct ahd_softc **)cmd->device->host->hostdata;
-
-	scmd_printk(KERN_INFO, cmd,
-		    "Attempting to queue an ABORT message:");
-
-	printk("CDB:");
-	for (cdb_byte = 0; cdb_byte < cmd->cmd_len; cdb_byte++)
-		printk(" 0x%x", cmd->cmnd[cdb_byte]);
-	printk("\n");
-
-	ahd_lock(ahd, &flags);
-
-	/*
-	 * First determine if we currently own this command.
-	 * Start by searching the device queue.  If not found
-	 * there, check the pending_scb list.  If not found
-	 * at all, and the system wanted us to just abort the
-	 * command, return success.
-	 */
-	dev = scsi_transport_device_data(cmd->device);
-
-	if (dev == NULL) {
-		/*
-		 * No target device for this command exists,
-		 * so we must not still own the command.
-		 */
-		scmd_printk(KERN_INFO, cmd, "Is not an active device\n");
-		retval = SUCCESS;
-		goto no_cmd;
-	}
-
-	/*
-	 * See if we can find a matching cmd in the pending list.
-	 */
-	LIST_FOREACH(pending_scb, &ahd->pending_scbs, pending_links) {
-		if (pending_scb->io_ctx == cmd)
-			break;
-	}
-
-	if (pending_scb == NULL) {
-		scmd_printk(KERN_INFO, cmd, "Command not found\n");
-		goto no_cmd;
-	}
-
-	if ((pending_scb->flags & SCB_RECOVERY_SCB) != 0) {
-		/*
-		 * We can't queue two recovery actions using the same SCB
-		 */
-		retval = FAILED;
-		goto  done;
-	}
-
-	/*
-	 * Ensure that the card doesn't do anything
-	 * behind our back.  Also make sure that we
-	 * didn't "just" miss an interrupt that would
-	 * affect this cmd.
-	 */
-	was_paused = ahd_is_paused(ahd);
-	ahd_pause_and_flushwork(ahd);
-	paused = TRUE;
-
-	if ((pending_scb->flags & SCB_ACTIVE) == 0) {
-		scmd_printk(KERN_INFO, cmd, "Command already completed\n");
-		goto no_cmd;
-	}
-
-	printk("%s: At time of recovery, card was %spaused\n",
-	       ahd_name(ahd), was_paused ? "" : "not ");
-	ahd_dump_card_state(ahd);
-
-	disconnected = TRUE;
-	if (ahd_search_qinfifo(ahd, cmd->device->id, 
-			       cmd->device->channel + 'A',
-			       cmd->device->lun,
-			       pending_scb->hscb->tag,
-			       ROLE_INITIATOR, CAM_REQ_ABORTED,
-			       SEARCH_COMPLETE) > 0) {
-		printk("%s:%d:%d:%d: Cmd aborted from QINFIFO\n",
-		       ahd_name(ahd), cmd->device->channel, 
-		       cmd->device->id, (u8)cmd->device->lun);
-		retval = SUCCESS;
-		goto done;
-	}
-
-	saved_modes = ahd_save_modes(ahd);
-	ahd_set_modes(ahd, AHD_MODE_SCSI, AHD_MODE_SCSI);
-	last_phase = ahd_inb(ahd, LASTPHASE);
-	saved_scbptr = ahd_get_scbptr(ahd);
-	active_scbptr = saved_scbptr;
-	if (disconnected && (ahd_inb(ahd, SEQ_FLAGS) & NOT_IDENTIFIED) == 0) {
-		struct scb *bus_scb;
-
-		bus_scb = ahd_lookup_scb(ahd, active_scbptr);
-		if (bus_scb == pending_scb)
-			disconnected = FALSE;
-	}
-
-	/*
-	 * At this point, pending_scb is the scb associated with the
-	 * passed in command.  That command is currently active on the
-	 * bus or is in the disconnected state.
-	 */
-	saved_scsiid = ahd_inb(ahd, SAVED_SCSIID);
-	if (last_phase != P_BUSFREE
-	    && SCB_GET_TAG(pending_scb) == active_scbptr) {
-
-		/*
-		 * We're active on the bus, so assert ATN
-		 * and hope that the target responds.
-		 */
-		pending_scb = ahd_lookup_scb(ahd, active_scbptr);
-		pending_scb->flags |= SCB_RECOVERY_SCB|SCB_ABORT;
-		ahd_outb(ahd, MSG_OUT, HOST_MSG);
-		ahd_outb(ahd, SCSISIGO, last_phase|ATNO);
-		scmd_printk(KERN_INFO, cmd, "Device is active, asserting ATN\n");
-		wait = TRUE;
-	} else if (disconnected) {
-
-		/*
-		 * Actually re-queue this SCB in an attempt
-		 * to select the device before it reconnects.
-		 */
-		pending_scb->flags |= SCB_RECOVERY_SCB|SCB_ABORT;
-		ahd_set_scbptr(ahd, SCB_GET_TAG(pending_scb));
-		pending_scb->hscb->cdb_len = 0;
-		pending_scb->hscb->task_attribute = 0;
-		pending_scb->hscb->task_management = SIU_TASKMGMT_ABORT_TASK;
-
-		if ((pending_scb->flags & SCB_PACKETIZED) != 0) {
-			/*
-			 * Mark the SCB has having an outstanding
-			 * task management function.  Should the command
-			 * complete normally before the task management
-			 * function can be sent, the host will be notified
-			 * to abort our requeued SCB.
-			 */
-			ahd_outb(ahd, SCB_TASK_MANAGEMENT,
-				 pending_scb->hscb->task_management);
-		} else {
-			/*
-			 * If non-packetized, set the MK_MESSAGE control
-			 * bit indicating that we desire to send a message.
-			 * We also set the disconnected flag since there is
-			 * no guarantee that our SCB control byte matches
-			 * the version on the card.  We don't want the
-			 * sequencer to abort the command thinking an
-			 * unsolicited reselection occurred.
-			 */
-			pending_scb->hscb->control |= MK_MESSAGE|DISCONNECTED;
-
-			/*
-			 * The sequencer will never re-reference the
-			 * in-core SCB.  To make sure we are notified
-			 * during reselection, set the MK_MESSAGE flag in
-			 * the card's copy of the SCB.
-			 */
-			ahd_outb(ahd, SCB_CONTROL,
-				 ahd_inb(ahd, SCB_CONTROL)|MK_MESSAGE);
-		}
-
-		/*
-		 * Clear out any entries in the QINFIFO first
-		 * so we are the next SCB for this target
-		 * to run.
-		 */
-		ahd_search_qinfifo(ahd, cmd->device->id,
-				   cmd->device->channel + 'A', cmd->device->lun,
-				   SCB_LIST_NULL, ROLE_INITIATOR,
-				   CAM_REQUEUE_REQ, SEARCH_COMPLETE);
-		ahd_qinfifo_requeue_tail(ahd, pending_scb);
-		ahd_set_scbptr(ahd, saved_scbptr);
-		ahd_print_path(ahd, pending_scb);
-		printk("Device is disconnected, re-queuing SCB\n");
-		wait = TRUE;
-	} else {
-		scmd_printk(KERN_INFO, cmd, "Unable to deliver message\n");
-		retval = FAILED;
-		goto done;
-	}
-
-no_cmd:
-	/*
-	 * Our assumption is that if we don't have the command, no
-	 * recovery action was required, so we return success.  Again,
-	 * the semantics of the mid-layer recovery engine are not
-	 * well defined, so this may change in time.
-	 */
-	retval = SUCCESS;
-done:
-	if (paused)
-		ahd_unpause(ahd);
-	if (wait) {
-		DECLARE_COMPLETION_ONSTACK(done);
-
-		ahd->platform_data->eh_done = &done;
-		ahd_unlock(ahd, &flags);
-
-		printk("%s: Recovery code sleeping\n", ahd_name(ahd));
-		if (!wait_for_completion_timeout(&done, 5 * HZ)) {
-			ahd_lock(ahd, &flags);
-			ahd->platform_data->eh_done = NULL;
-			ahd_unlock(ahd, &flags);
-			printk("%s: Timer Expired (active %d)\n",
-			       ahd_name(ahd), dev->active);
-			retval = FAILED;
-		}
-		printk("Recovery code awake\n");
-	} else
-		ahd_unlock(ahd, &flags);
-
-	if (retval != SUCCESS)
-		printk("%s: Command abort returning 0x%x\n",
-		       ahd_name(ahd), retval);
-
-	return retval;
-}
-
-static void ahd_linux_set_width(struct scsi_target *starget, int width)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_devinfo devinfo;
-	unsigned long flags;
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_lock(ahd, &flags);
-	ahd_set_width(ahd, &devinfo, width, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_period(struct scsi_target *starget, int period)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options;
-	unsigned int dt;
-	unsigned long flags;
-	unsigned long offset = tinfo->goal.offset;
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: set period to %d\n", ahd_name(ahd), period);
-#endif
-	if (offset == 0)
-		offset = MAX_OFFSET;
-
-	if (period < 8)
-		period = 8;
-	if (period < 10) {
-		if (spi_max_width(starget)) {
-			ppr_options |= MSG_EXT_PPR_DT_REQ;
-			if (period == 8)
-				ppr_options |= MSG_EXT_PPR_IU_REQ;
-		} else
-			period = 10;
-	}
-
-	dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-
-	/* all PPR requests apart from QAS require wide transfers */
-	if (ppr_options & ~MSG_EXT_PPR_QAS_REQ) {
-		if (spi_width(starget) == 0)
-			ppr_options &= MSG_EXT_PPR_QAS_REQ;
-	}
-
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_offset(struct scsi_target *starget, int offset)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = 0;
-	unsigned int period = 0;
-	unsigned int dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-	unsigned long flags;
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: set offset to %d\n", ahd_name(ahd), offset);
-#endif
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	if (offset != 0) {
-		period = tinfo->goal.period;
-		ppr_options = tinfo->goal.ppr_options;
-		ahd_find_syncrate(ahd, &period, &ppr_options, 
-				  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-	}
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, offset, ppr_options,
-			 AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_dt(struct scsi_target *starget, int dt)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options
-		& ~MSG_EXT_PPR_DT_REQ;
-	unsigned int period = tinfo->goal.period;
-	unsigned int width = tinfo->goal.width;
-	unsigned long flags;
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: %s DT\n", ahd_name(ahd),
-		       dt ? "enabling" : "disabling");
-#endif
-	if (dt && spi_max_width(starget)) {
-		ppr_options |= MSG_EXT_PPR_DT_REQ;
-		if (!width)
-			ahd_linux_set_width(starget, 1);
-	} else {
-		if (period <= 9)
-			period = 10; /* If resetting DT, period must be >= 25ns */
-		/* IU is invalid without DT set */
-		ppr_options &= ~MSG_EXT_PPR_IU_REQ;
-	}
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, tinfo->goal.offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_qas(struct scsi_target *starget, int qas)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options
-		& ~MSG_EXT_PPR_QAS_REQ;
-	unsigned int period = tinfo->goal.period;
-	unsigned int dt;
-	unsigned long flags;
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: %s QAS\n", ahd_name(ahd),
-		       qas ? "enabling" : "disabling");
-#endif
-
-	if (qas) {
-		ppr_options |= MSG_EXT_PPR_QAS_REQ; 
-	}
-
-	dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, tinfo->goal.offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_iu(struct scsi_target *starget, int iu)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options
-		& ~MSG_EXT_PPR_IU_REQ;
-	unsigned int period = tinfo->goal.period;
-	unsigned int dt;
-	unsigned long flags;
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: %s IU\n", ahd_name(ahd),
-		       iu ? "enabling" : "disabling");
-#endif
-
-	if (iu && spi_max_width(starget)) {
-		ppr_options |= MSG_EXT_PPR_IU_REQ;
-		ppr_options |= MSG_EXT_PPR_DT_REQ; /* IU requires DT */
-	}
-
-	dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, tinfo->goal.offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_rd_strm(struct scsi_target *starget, int rdstrm)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options
-		& ~MSG_EXT_PPR_RD_STRM;
-	unsigned int period = tinfo->goal.period;
-	unsigned int dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-	unsigned long flags;
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: %s Read Streaming\n", ahd_name(ahd),
-		       rdstrm  ? "enabling" : "disabling");
-#endif
-
-	if (rdstrm && spi_max_width(starget))
-		ppr_options |= MSG_EXT_PPR_RD_STRM;
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, tinfo->goal.offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_wr_flow(struct scsi_target *starget, int wrflow)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options
-		& ~MSG_EXT_PPR_WR_FLOW;
-	unsigned int period = tinfo->goal.period;
-	unsigned int dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-	unsigned long flags;
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: %s Write Flow Control\n", ahd_name(ahd),
-		       wrflow ? "enabling" : "disabling");
-#endif
-
-	if (wrflow && spi_max_width(starget))
-		ppr_options |= MSG_EXT_PPR_WR_FLOW;
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, tinfo->goal.offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_rti(struct scsi_target *starget, int rti)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options
-		& ~MSG_EXT_PPR_RTI;
-	unsigned int period = tinfo->goal.period;
-	unsigned int dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-	unsigned long flags;
-
-	if ((ahd->features & AHD_RTI) == 0) {
-#ifdef AHD_DEBUG
-		if ((ahd_debug & AHD_SHOW_DV) != 0)
-			printk("%s: RTI not available\n", ahd_name(ahd));
-#endif
-		return;
-	}
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: %s RTI\n", ahd_name(ahd),
-		       rti ? "enabling" : "disabling");
-#endif
-
-	if (rti && spi_max_width(starget))
-		ppr_options |= MSG_EXT_PPR_RTI;
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, tinfo->goal.offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_pcomp_en(struct scsi_target *starget, int pcomp)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options
-		& ~MSG_EXT_PPR_PCOMP_EN;
-	unsigned int period = tinfo->goal.period;
-	unsigned int dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-	unsigned long flags;
-
-#ifdef AHD_DEBUG
-	if ((ahd_debug & AHD_SHOW_DV) != 0)
-		printk("%s: %s Precompensation\n", ahd_name(ahd),
-		       pcomp ? "Enable" : "Disable");
-#endif
-
-	if (pcomp && spi_max_width(starget)) {
-		uint8_t precomp;
-
-		if (ahd->unit < ARRAY_SIZE(aic79xx_iocell_info)) {
-			const struct ahd_linux_iocell_opts *iocell_opts;
-
-			iocell_opts = &aic79xx_iocell_info[ahd->unit];
-			precomp = iocell_opts->precomp;
-		} else {
-			precomp = AIC79XX_DEFAULT_PRECOMP;
-		}
-		ppr_options |= MSG_EXT_PPR_PCOMP_EN;
-		AHD_SET_PRECOMP(ahd, precomp);
-	} else {
-		AHD_SET_PRECOMP(ahd, 0);
-	}
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, tinfo->goal.offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_set_hold_mcs(struct scsi_target *starget, int hold)
-{
-	struct Scsi_Host *shost = dev_to_shost(starget->dev.parent);
-	struct ahd_softc *ahd = *((struct ahd_softc **)shost->hostdata);
-	struct ahd_tmode_tstate *tstate;
-	struct ahd_initiator_tinfo *tinfo 
-		= ahd_fetch_transinfo(ahd,
-				      starget->channel + 'A',
-				      shost->this_id, starget->id, &tstate);
-	struct ahd_devinfo devinfo;
-	unsigned int ppr_options = tinfo->goal.ppr_options
-		& ~MSG_EXT_PPR_HOLD_MCS;
-	unsigned int period = tinfo->goal.period;
-	unsigned int dt = ppr_options & MSG_EXT_PPR_DT_REQ;
-	unsigned long flags;
-
-	if (hold && spi_max_width(starget))
-		ppr_options |= MSG_EXT_PPR_HOLD_MCS;
-
-	ahd_compile_devinfo(&devinfo, shost->this_id, starget->id, 0,
-			    starget->channel + 'A', ROLE_INITIATOR);
-	ahd_find_syncrate(ahd, &period, &ppr_options,
-			  dt ? AHD_SYNCRATE_MAX : AHD_SYNCRATE_ULTRA2);
-
-	ahd_lock(ahd, &flags);
-	ahd_set_syncrate(ahd, &devinfo, period, tinfo->goal.offset,
-			 ppr_options, AHD_TRANS_GOAL, FALSE);
-	ahd_unlock(ahd, &flags);
-}
-
-static void ahd_linux_get_signalling(struct Scsi_Host *shost)
-{
-	struct ahd_softc *ahd = *(struct ahd_softc **)shost->hostdata;
-	unsigned long flags;
-	u8 mode;
-
-	ahd_lock(ahd, &flags);
-	ahd_pause(ahd);
-	mode = ahd_inb(ahd, SBLKCTL);
-	ahd_unpause(ahd);
-	ahd_unlock(ahd, &flags);
-
-	if (mode & ENAB40)
-		spi_signalling(shost) = SPI_SIGNAL_LVD;
-	else if (mode & ENAB20)
-		spi_signalling(shost) = SPI_SIGNAL_SE;
-	else
-		spi_signalling(shost) = SPI_SIGNAL_UNKNOWN;
-}
-
-static struct spi_function_template ahd_linux_transport_functions = {
-	.set_offset	= ahd_linux_set_offset,
-	.show_offset	= 1,
-	.set_period	= ahd_linux_set_period,
-	.show_period	= 1,
-	.set_width	= ahd_linux_set_width,
-	.show_width	= 1,
-	.set_dt		= ahd_linux_set_dt,
-	.show_dt	= 1,
-	.set_iu		= ahd_linux_set_iu,
-	.show_iu	= 1,
-	.set_qas	= ahd_linux_set_qas,
-	.show_qas	= 1,
-	.set_rd_strm	= ahd_linux_set_rd_strm,
-	.show_rd_strm	= 1,
-	.set_wr_flow	= ahd_linux_set_wr_flow,
-	.show_wr_flow	= 1,
-	.set_rti	= ahd_linux_set_rti,
-	.show_rti	= 1,
-	.set_pcomp_en	= ahd_linux_set_pcomp_en,
-	.show_pcomp_en	= 1,
-	.set_hold_mcs	= ahd_linux_set_hold_mcs,
-	.show_hold_mcs	= 1,
-	.get_signalling = ahd_linux_get_signalling,
-};
-
-static int __init
-ahd_linux_init(void)
-{
-	int	error = 0;
-
-	/*
-	 * If we've been passed any parameters, process them now.
-	 */
-	if (aic79xx)
-		aic79xx_setup(aic79xx);
-
-	ahd_linux_transport_template =
-		spi_attach_transport(&ahd_linux_transport_functions);
-	if (!ahd_linux_transport_template)
-		return -ENODEV;
-
-	scsi_transport_reserve_device(ahd_linux_transport_template,
-				      sizeof(struct ahd_linux_device));
-
-	error = ahd_linux_pci_init();
-	if (error)
-		spi_release_transport(ahd_linux_transport_template);
-	return error;
-}
-
-static void __exit
-ahd_linux_exit(void)
-{
-	ahd_linux_pci_exit();
-	spi_release_transport(ahd_linux_transport_template);
-}
-
-module_init(ahd_linux_init);
-module_exit(ahd_linux_exit);
+t/arm/requestsync.odex|396053-396057
+/system/framework/oat/arm/saiv.odex|396058-396063
+/system/framework/oat/arm/saiv.vdex|396064-396065
+/system/framework/oat/arm/samsungkeystoreutils.odex|396066-396070
+/system/framework/oat/arm/scamera_sdk_util.odex|396071-396075
+/system/framework/oat/arm/sec_platform_library.odex|396076-396080
+/system/framework/oat/arm/secimaging.odex|396081-396085
+/system/framework/oat/arm/secinputdev-service.odex|396086-396090
+/system/framework/oat/arm/semcontextservice.odex|396091-396096
+/system/framework/oat/arm/semcontextservice.vdex|396097-396100
+/system/framework/oat/arm/semextendedformat.odex|396101-396105
+/system/framework/oat/arm/semmediatranscoder.odex|396106-396110
+/system/framework/oat/arm/semsdrvideoconverter.odex|396111-396115
+/system/framework/oat/arm/sm.odex|396116-396120
+/system/framework/oat/arm/sprengine.odex|396121-396125
+/system/framework/oat/arm/svc.odex|396126-396130
+/system/framework/oat/arm/telecom.odex|396131-396135
+/system/framework/oat/arm/uiautomator.odex|396136-396141
+/system/framework/oat/arm/uiautomator.vdex|396142-396144
+/system/framework/oat/arm/uinput.odex|396145-396149
+/system/framework/oat/arm/vendor.samsung.frameworks.codecsolution-service.odex|396150-396154
+/system/framework/oat/arm/vendor.samsung.frameworks.hdrsolution-service.odex|396155-396159
+/system/framework/oat/arm/videoeditor_sdk.odex|396160-396164
+/system/framework/oat/arm/vr.odex|396165-396169
+/system/framework/oat/arm/vsimmanager.odex|396170-396175
+/system/framework/oat/arm/vsimmanager.vdex|396176-396179
+/system/framework/oat/arm64/EpdgManager.odex|396183-396187
+/system/framework/oat/arm64/SemAudioThumbnail.odex|396188-396192
+/system/framework/oat/arm64/abx.odex|396193-396197
+/system/framework/oat/arm64/am.odex|396198-396203
+/system/framework/oat/arm64/am.vdex|396204-396205
+/system/framework/oat/arm64/android.hidl.base-V1.0-java.odex|396206-396210
+/system/framework/oat/arm64/android.hidl.manager-V1.0-java.odex|396211-396215
+/system/framework/oat/arm64/android.test.base.odex|396216-396220
+/system/framework/oat/arm64/android.test.mock.odex|396221-396226
+/system/framework/oat/arm64/android.test.mock.vdex|396227-396228
+/system/framework/oat/arm64/android.test.runner.odex|396229-396233
+/system/framework/oat/arm64/aod.odex|396234-396238
+/system/framework/oat/arm64/appwidget.odex|396239-396243
+/system/framework/oat/arm64/bmgr.odex|396244-396248
+/system/framework/oat/arm64/bu.odex|396249-396253
+/system/framework/oat/arm64/com.android.future.usb.accessory.odex|396254-396258
+/system/framework/oat/arm64/com.android.location.provider.odex|396259-396270
+/system/framework/oat/arm64/com.android.media.remotedisplay.odex|396271-396275
+/system/framework/oat/arm64/com.android.mediadrm.signer.odex|396276-396280
+/system/framework/oat/arm64/com.publicnfc.odex|396281-396285
+/system/framework/oat/arm64/com.samsung.android.ibs.framework-v1.odex|396286-396290
+/system/framework/oat/arm64/com.samsung.android.nfc.mpos.odex|396291-396295
+/system/framework/oat/arm64/com.samsung.android.nfc.rfcontrol.odex|396296-396300
+/system/framework/oat/arm64/com.samsung.android.nfc.t4t.odex|396301-396305
+/system/framework/oat/arm64/com.samsung.android.privacydashboard.framework-v1.odex|396306-396310
+/system/framework/oat/arm64/com.samsung.android.psitrackersdk.framework-v1.odex|396311-396315
+/system/framework/oat/arm64/com.samsung.android.semtelephonesdk.framework-v1.odex|396316-396320
+/system/framework/oat/arm64/com.samsung.android.semtelephonesdk.framework-v1.vdex|396321
+/system/framework/oat/arm64/com.samsung.android.spensdk.framework-v1.odex|396322-396326
+/system/framework/oat/arm64/com.samsung.bbccommon.odex|396327-396331
+/system/framework/oat/arm64/com.samsung.device.odex|396332-396336
+/system/framework/oat/arm64/hcm.odex|396388-396392
+/system/framework/oat/arm64/com.sec.android.sdhmssdk.framework-v1.odex|396337-396341
+/system/framework/oat/arm64/content.odex|396342-396346
+/system/framework/oat/arm64/ethernet-service.odex|396347-396372
+/system/framework/oat/arm64/gamemanager.odex|396373-396377
+/system/framework/oat/arm64/gamesdk.odex|396378-396382
+/system/framework/oat/arm64/gamesdkWrapper.odex|396383-396387
+/system/framework/oat/arm64/hid.odex|396393-396397
+/system/framework/oat/arm64/hqm.odex|396398-396402
+/system/framework/oat/arm64/imsmanager.odex|396403-396408
+/system/framework/oat/arm64/imsmanager.vdex|396409-396410
+/system/framework/oat/arm64/incident-helper-cmd.odex|396411-396415
+/system/framework/oat/arm64/javax.obex.odex|396416-396420
+/system/framework/oat/arm64/locksettings.odex|396421-396425
+/system/framework/oat/arm64/monkey.odex|396426-396430
+/system/framework/oat/arm64/motionrecognitionservice.odex|396431-396435
+/system/framework/oat/arm64/motionrecognitionservice.vdex|396436
+/system/framework/oat/arm64/mw.odex|396437-396441
+/system/framework/oat/arm64/org.apache.http.legacy.odex|396442-396526
+/system/framework/oat/arm64/org.apache.http.legacy.vdex|396527-396529
+/system/framework/oat/arm64/org.simalliance.openmobileapi.odex|396530-396534
+/system/framework/oat/arm64/perfsdk.odex|396535-396539
+/system/framework/oat/arm64/perfsdkservice.odex|396540-396544
+/system/framework/oat/arm64/rcsopenapi.odex|396545-396550
+/system/framework/oat/arm64/rcsopenapi.vdex|396551-396552
+/system/framework/oat/arm64/requestsync.odex|396553-396557
+/system/framework/oat/arm64/saiv.odex|396558-396563
+/system/framework/oat/arm64/saiv.vdex|396564-396565
+/system/framework/oat/arm64/samsungkeystoreutils.odex|396566-396570
+/system/framework/oat/arm64/scamera_sdk_util.odex|396571-396575
+/system/framework/oat/arm64/sec_platform_library.odex|396576-396580
+/system/framework/oat/arm64/secimaging.odex|396581-396585
+/system/framework/oat/arm64/secinputdev-service.odex|396586-396590
+/system/framework/oat/arm64/semcontextservice.odex|396591-396596
+/system/framework/oat/arm64/semcontextservice.vdex|396597-396600
+/system/framework/oat/arm64/semextendedformat.odex|396601-396605
+/system/framework/oat/arm64/semmediatranscoder.odex|396606-396610
+/system/framework/oat/arm64/semsdrvideoconverter.odex|396611-396615
+/system/framework/oat/arm64/semwifi-service.odex|396616-397863
+/system/framework/oat/arm64/semwifi-service.vdex|397864-397870
+/system/framework/oat/arm64/services.art|397871-398489
+/system/framework/oat/arm64/services.odex|398490-415431
+/system/framework/oat/arm64/services.vdex|415432-415530
+/system/framework/oat/arm64/sm.odex|415531-415535
+/system/framework/oat/arm64/sprengine.odex|415536-415540
+/system/framework/oat/arm64/ssrm.odex|415541-415625
+/system/framework/oat/arm64/ssrm.vdex|415626
+/system/framework/oat/arm64/svc.odex|415627-415631
+/system/framework/oat/arm64/telecom.odex|415632-415636
+/system/framework/oat/arm64/uiautomator.odex|415637-415642
+/system/framework/oat/arm64/uiautomator.vdex|415643-415645
+/system/framework/oat/arm64/uinput.odex|415646-415650
+/system/framework/oat/arm64/vr.odex|415666-415670
+/system/framework/oat/arm64/vendor.samsung.frameworks.codecsolution-service.odex|415651-415655
+/system/framework/oat/arm64/vendor.samsung.frameworks.hdrsolution-service.odex|415656-415660
+/system/framework/oat/arm64/videoeditor_sdk.odex|415661-415665
+/system/framework/oat/arm64/vsimmanager.odex|415671-415676
+/system/framework/oat/arm64/vsimmanager.vdex|415677-415680
+/system/framework/saiv.jar|415924-416093
+/system/framework/org.apache.http.legacy.jar|415681-415800
+/system/framework/org.simalliance.openmobileapi.jar|415801-415810
+/system/framework/perfsdk.jar|415811-415816
+/system/framework/perfsdkservice.jar|415817-415821
+/system/framework/rcsopenapi.jar|415822-415919
+/system/framework/requestsync.jar|415920-415923
+/system/framework/samsungkeystoreutils.jar|416094-416099
+/system/framework/scamera_sdk_util.jar|416100-416102
+/system/framework/sec_platform_library.jar|416103-416105
+/system/framework/secimaging.jar|416106-416110
+/system/framework/secinputdev-service.jar|416111-416146
+/system/framework/sem-telephony-common.jar|416147-416165
+/system/framework/semcontextservice.jar|416166-416360
+/system/framework/semextendedformat.jar|416361-416386
+/system/framework/semmediatranscoder.jar|416387-416425
+/system/framework/semsdrvideoconverter.jar|416426-416442
+/system/framework/semwifi-service.jar|416443-417034
+/system/framework/services.jar|417035-425052
+/system/framework/services.jar.prof|425053-425133
+/system/framework/sm.jar|425134-425137
+/system/framework/sprengine.jar|425138-425170
+/system/framework/ssrm.jar|425171-425218
+/system/framework/svc.jar|425219-425222
+/system/framework/telecom.jar|425223-425227
+/system/framework/telephony-common.jar|425228-426538
+/system/framework/uiautomator.jar|426539-426638
+/system/framework/uibc_java.jar|426639-426650
+/system/framework/uinput.jar|426651-426656
+/system/framework/vendor.samsung.frameworks.codecsolution-service.jar|426657-426674
+/system/framework/vendor.samsung.frameworks.hdrsolution-service.jar|426675-426680
+/system/framework/videoeditor_sdk.jar|426681-426725
+/system/framework/voip-common.jar|426726-426926
+/system/framework/vr.jar|426927-426928
+/system/framework/vsimmanager.jar|426929-427065
+/system/hidden/INTERNAL_SDCARD/Music/Samsung/Over_the_Horizon.mp3|427079-427521 428034-428770
+/system/hidden/SmartTutor/SmartTutor.apk|428772-433616
+/system/hidden/SmartTutor/oat/arm64/SmartTutor.odex|433618-433638
+/system/hidden/SmartTutor/oat/arm64/SmartTutor.vdex|433639-433677
+/system/lib/aaudio-aidl-cpp.so|433694-433703
+/system/lib/android.frameworks.bufferhub@1.0.so|433704-433725
+/system/lib/android.frameworks.schedulerservice@1.0.so|433726-433739
+/system/lib/android.frameworks.sensorservice@1.0.so|433740-433778
+/system/lib/android.frameworks.stats-V1-ndk_platform.so|433779-433784
+/system/lib/android.frameworks.stats@1.0.so|433785-433804
+/system/lib/android.hardware.audio.common-util.so|433805-433806
+/system/lib/android.hardware.audio.common@2.0.so|433807
+/system/lib/android.hardware.audio.common@4.0-util.so|433808-433810
+/system/lib/android.hardware.audio.common@4.0.so|433811
+/system/lib/android.hardware.audio.common@5.0-util.so|433812-433815
+/system/lib/android.hardware.audio.common@5.0.so|433816-433818
+/system/lib/android.hardware.audio.common@6.0-util.so|433819-433822
+/system/lib/android.hardware.audio.common@6.0.so|433823-433825
+/system/lib/android.hardware.audio.common@7.0-enums.so|433826-433848
+/system/lib/android.hardware.audio.common@7.0-util.so|433849-433881
+/system/lib/android.hardware.audio.common@7.0.so|433882-433898
+/system/lib/android.hardware.audio.effect@4.0-util.so|433899-433900
+/system/lib/android.hardware.audio.effect@4.0.so|433901-434120
+/system/lib/android.hardware.audio.effect@5.0-util.so|434121-434122
+/system/lib/android.hardware.audio.effect@5.0.so|434123-434177 434690-434854
+/system/lib/android.hardware.audio.effect@6.0-util.so|434855-434856
+/system/lib/android.hardware.audio.effect@6.0.so|434857-435076
+/system/lib/android.hardware.audio.effect@7.0-util.so|435077-435078
+/system/lib/android.hardware.audio.effect@7.0.so|435079-435302
+/system/lib/android.hardware.audio@4.0-util.so|435303-435306
+/system/lib/android.hardware.audio@4.0.so|435307-435421
+/system/lib/android.hardware.audio@5.0-util.so|435422-435425
+/system/lib/android.hardware.audio@5.0.so|435426-435541
+/system/lib/android.hardware.audio@6.0-util.so|435542-435545
+/system/lib/android.hardware.audio@6.0.so|435546-435674
+/system/lib/android.hardware.audio@7.0-util.so|435675-435681
+/system/lib/android.hardware.audio@7.0.so|435682-435805
+/system/lib/android.hardware.biometrics.fingerprint@2.1.so|435806-435834
+/system/lib/android.hardware.bluetooth@1.0.so|435835-435857
+/system/lib/android.hardware.broadcastradio@1.0.so|435858-435901
+/system/lib/android.hardware.broadcastradio@1.1.so|435902-435951
+/system/lib/android.hardware.camera.common@1.0.so|435952-435953
+/system/lib/android.hardware.camera.device@3.2.so|435954-435989
+/system/lib/android.hardware.cas.native@1.0.so|435990-436004
+/system/lib/android.hardware.cas@1.0.so|436005-436044
+/system/lib/audio_common-aidl-cpp.so|439138-439139
+/system/lib/android.hardware.common-V2-ndk_platform.so|436045-436047
+/system/lib/android.hardware.configstore-utils.so|436048-436049
+/system/lib/android.hardware.configstore@1.0.so|436050-436070
+/system/lib/android.hardware.configstore@1.1.so|436071-436088
+/system/lib/android.hardware.contexthub@1.0.so|436089-436114
+/system/lib/android.hardware.drm@1.0.so|436115-436178
+/system/lib/android.hardware.drm@1.1.so|436179-436222
+/system/lib/android.hardware.drm@1.2.so|436223-436288
+/system/lib/android.hardware.drm@1.3.so|436289-436313
+/system/lib/android.hardware.drm@1.4.so|436314-436373
+/system/lib/android.hardware.fastboot@1.0.so|436374-436389
+/system/lib/android.hardware.gnss-V1-cpp.so|436390-436420
+/system/lib/android.hardware.gnss.measurement_corrections@1.0.so|436421-436442
+/system/lib/android.hardware.gnss.measurement_corrections@1.1.so|436443-436457
+/system/lib/android.hardware.gnss.visibility_control@1.0.so|436458-436479
+/system/lib/android.hardware.gnss@1.0.so|436480-436644
+/system/lib/android.hardware.gnss@1.1.so|436645-436701
+/system/lib/android.hardware.gnss@2.0.so|436702-436815
+/system/lib/android.hardware.gnss@2.1.so|436816-436903
+/system/lib/android.hardware.graphics.allocator@2.0.so|436904-436917
+/system/lib/android.hardware.graphics.allocator@3.0.so|436918-436931
+/system/lib/android.hardware.graphics.allocator@4.0.so|436932-436945
+/system/lib/android.hardware.graphics.bufferqueue@1.0.so|436946-436981
+/system/lib/android.hardware.graphics.bufferqueue@2.0.so|436982-437013
+/system/lib/android.hardware.graphics.common-V2-ndk_platform.so|437014-437017
+/system/lib/android.hardware.graphics.mapper@2.0.so|437018-437033
+/system/lib/android.hardware.graphics.mapper@2.1.so|437034-437050
+/system/lib/android.hardware.graphics.mapper@3.0.so|437051-437068
+/system/lib/android.hardware.graphics.mapper@4.0.so|437069-437090
+/system/lib/android.hardware.input.classifier@1.0.so|437091-437104
+/system/lib/android.hardware.input.common@1.0.so|437105-437106
+/system/lib/android.hardware.ir@1.0.so|437107-437120
+/system/lib/android.hardware.light@2.0.so|437121-437133
+/system/lib/android.hardware.media.bufferpool@2.0.so|437134-437168
+/system/lib/android.hardware.media.c2@1.0.so|437169-437260
+/system/lib/android.hardware.media.c2@1.1.so|437261-437292
+/system/lib/android.hardware.media.c2@1.2.so|437293-437326
+/system/lib/android.hardware.media.omx@1.0.so|437327-437396
+/system/lib/android.hardware.memtrack-V1-ndk_platform.so|437397-437402
+/system/lib/bootstrap/libc.so|439215-439425
+/system/lib/bootstrap/libdl.so|439426-439427
+/system/lib/bootstrap/libm.so|439428-439458
+/system/lib/android.hardware.power.stats-V1-ndk_platform.so|437425-437435
+/system/lib/android.hardware.power.stats@1.0.so|437436-437453
+/system/lib/android.hardware.power@1.0.so|437454-437468
+/system/lib/android.hardware.power@1.1.so|437469-437484
+/system/lib/android.hardware.radio.deprecated@1.0.so|437514-437542
+/system/lib/android.hardware.radio@1.1.so|437770-437929
+/system/lib/android.hardware.renderscript@1.0.so|438469-438525
+/system/lib/android.hardware.security.secureclock-V1-ndk_platform.so|438571-438576
+/system/lib/android.hardware.sensors@1.0.so|438577-438595
+/system/lib/android.hardware.sensors@2.1.so|438622-438648
+/system/lib/android.hardware.tv.input@1.0.so|438664-438685
+/system/lib/android.hardware.vibrator@1.2.so|438776-438791
+/system/lib/android.hardware.vr@1.0.so|438810-438822
+/system/lib/android.hardware.wifi@1.0.so|438823-439004
+/system/lib/android.hidl.allocator@1.0.so|439005-439018
+/system/lib/android.hidl.token@1.0-utils.so|439054-439056
+/system/lib/android.hidl.token@1.0.so|439057-439071
+/system/lib/android.system.net.netd@1.0.so|439072-439084
+/system/lib/android.system.suspend.control-V1-cpp.so|439085-439095
+/system/lib/android.system.wifi.keystore@1.0.so|439123-439137
+/system/lib/audiopolicy-types-aidl-cpp.so|439208-439211
+/system/lib/capture_state_listener-aidl-cpp.so|439459-439462
+/system/lib/drm/libfwdlockengine.so|439463-439472
+/system/lib/drm/libomaplugin.so|439473-439489
+/system/lib/effect-aidl-cpp.so|439490-439496
+/system/lib/heapprofd_client.so|439503-439506
+/system/lib/heapprofd_client_api.so|439507-439515
+/system/lib/lib-platform-compat-native-api.so|439892-439896
+/system/lib/libBestComposition.polarr.so|439963-440012
+/system/lib/libBright_core.camera.samsung.so|440013-440021
+/system/lib/libEventFinder.camera.samsung.so|440168-440297
+/system/lib/libFFTEm.so|440298-440359
+/system/lib/libFaceRestoration.camera.samsung.so|440455-440465
+/system/lib/libFacialAttributeDetection.arcsoft.so|441883-441884
+/system/lib/libFacialBasedSelfieCorrection.camera.samsung.so|441885-441903
+/system/lib/libGLESv1_CM.so|442176-442181
+/system/lib/libGLESv2.so|442182-442198
+/system/lib/libGLESv3.so|442199-442215
+/system/lib/libHprFace_GAE_jni.camera.samsung.so|442243-442249
+/system/lib/libHpr_RecFace_dl_v1.0.camera.samsung.so|442250-442441
+/system/lib/libHpr_RecGAE_cvFeature_v1.0.camera.samsung.so|442442-442477
+/system/lib/libHpr_TaskFaceClustering_hierarchical_v1.0.camera.samsung.so|442478-442526
+/system/lib/libInteractiveSegmentation.camera.samsung.so|442764-442770
+/system/lib/libMyFilter.camera.samsung.so|442851-443389
+/system/lib/libMyFilterPlugin.camera.samsung.so|443390-443399
+/system/lib/libPortraitSolution.camera.samsung.so|447352-447464
+/system/lib/libRSDriver.so|448031-448069
+/system/lib/libRScpp.so|448127-448182
+/system/lib/libSAG_VM_Score_v217.so|448763-448772
+/system/lib/libSEF.quram.so|449412-449444
+/system/lib/libSceneDetector_v1.camera.samsung.so|450791-451296
+/system/lib/libaaudio.so|454142-454144
+/system/lib/libSmartScan.camera.samsung.so|451423-452795
+/system/lib/libSoundAlive_VSP_ver316c_ARMCpp.so|452796-452808
+/system/lib/libStride.camera.samsung.so|452809-452985
+/system/lib/libStrideTensorflowLite.camera.samsung.so|452986-453341
+/system/lib/libUltraWideDistortionCorrection.camera.samsung.so|453559-453588
+/system/lib/lib_SoundAlive_SRC384_ver320.so|453715-453731
+/system/lib/lib_SoundAlive_play_plus_ver400.so|453732-454047
+/system/lib/lib_SoundBooster_ver1100.so|454048-454128
+/system/lib/lib_nativeJni.dk.samsung.so|454129-454132
+/system/lib/lib_native_client.dk.samsung.so|454133-454134
+/system/lib/libactivitymanager_aidl.so|454191-454197
+/system/lib/libadbd_auth.so|454198-454238
+/system/lib/libamidi.so|454506-454511
+/system/lib/libandroid.so|454512-454542
+/system/lib/libandroid_runtime_lazy.so|454921-454922
+/system/lib/libandroid_servers.so|454923-455133
+/system/lib/libandroidfw.so|455134-455232
+/system/lib/libapex_cmn.so|455411-455448
+/system/lib/libappfuse.so|456014-456022
+/system/lib/libartpalette-system.so|456023-456028
+/system/lib/libaudio-resampler.so|456029-456033
+/system/lib/libaudioclient.so|456034-456157
+/system/lib/libaudioclient_aidl_conversion.so|456158-456188
+/system/lib/libaudioflinger.so|456202-456356
+/system/lib/libaudiofoundation.so|456357-456394
+/system/lib/libaudiohal@6.0.so|456450-456477
+/system/lib/libaudiopolicyengineconfigurable.so|456528-456614
+/system/lib/libaudiosaplus_sec_legacy.so|456757-456763
+/system/lib/libaudiosolution_jni.so|456764-456768
+/system/lib/libaudiospdif.so|456769-456772
+/system/lib/libaudiotracer.so|456773-456782
+/system/lib/libbacktrace.so|456809-456835
+/system/lib/libbase.so|456836-456878
+/system/lib/libbcinfo.so|456884-457097
+/system/lib/libbeautyshot.arcsoft.so|457098-460283
+/system/lib/libbinder.so|460284-460384
+/system/lib/libbinder_ndk.so|460385-460398
+/system/lib/libbufferhubqueue.so|460641-460661
+/system/lib/libc++.so|460662-460781
+/system/lib/libcamera_client.so|460814-460895
+/system/lib/libcgrouprc.so|460915-460917
+/system/lib/libclang_rt.ubsan_standalone-arm-android.so|461587-461699
+/system/lib/libclcore_debug_g.bc|461852-462081
+/system/lib/libclcore_g.bc|462082-462342
+/system/lib/libclcore_neon.bc|462343-462416
+/system/lib/libcodec2_vndk.so|462466-462588
+/system/lib/libcodecdatautils.so|462589-462590
+/system/lib/libcodecsolutionhelper.so|462591-462599
+/system/lib/libcorefx.so|462620-462656
+/system/lib/libcrypto.so|462657-462880
+/system/lib/libcutils.so|462887-462899
+/system/lib/libdataloader.so|462900-462912
+/system/lib/libdatasource.so|462913-462927
+/system/lib/libdatasource_local_cache.so|462928-462937
+/system/lib/libdebuggerd_client.so|462938-462946
+/system/lib/libdk_native_keymint.so|462952-462953
+/system/lib/libdng_sdk.so|462969-463108
+/system/lib/libdrm.so|463109-463122
+/system/lib/libdrmframework_jni.so|463131-463137
+/system/lib/libdrmframeworkcommon.so|463138-463158
+/system/lib/libenf_gc_system.so|463558-463609
+/system/lib/libenf_uv_gc_system.so|463610-463661
+/system/lib/libenn_common_utils.so|463662-463669
+/system/lib/libenn_engine_lib.so|463670-463808
+/system/lib/libenn_public_api_cpp.so|463890-463892
+/system/lib/libenn_user_lib.so|465463-465502
+/system/lib/android.hardware.memtrack@1.0.so|437403-437415
+/system/lib/android.hardware.power-V2-cpp.so|437416-437424
+/system/lib/android.hardware.radio.config@1.0.so|437485-437513
+/system/lib/android.hardware.radio@1.0.so|437543-437769
+/system/lib/android.hardware.radio@1.2.so|437930-438107
+/system/lib/android.hardware.radio@1.3.so|438108-438274
+/system/lib/android.hardware.radio@1.4.so|438275-438468
+/system/lib/android.hardware.secure_element@1.0.so|438526-438549
+/system/lib/android.hardware.security.keymint-V1-ndk_platform.so|438550-438570
+/system/lib/android.hardware.sensors@2.0.so|438596-438621
+/system/lib/android.hardware.thermal@1.0.so|438649-438663
+/system/lib/android.hardware.usb@1.0.so|438686-438706
+/system/lib/android.hardware.usb@1.1.so|438707-438728
+/system/lib/android.hardware.vibrator-V2-cpp.so|438729-438745
+/system/lib/android.hardware.vibrator@1.0.so|438746-438760
+/system/lib/android.hardware.vibrator@1.1.so|438761-438775
+/system/lib/android.hardware.vibrator@1.3.so|438792-438809
+/system/lib/android.hidl.memory.token@1.0.so|439019-439031
+/system/lib/android.hidl.memory@1.0.so|439032-439053
+/system/lib/android.system.suspend.control.internal-cpp.so|439096-439102
+/system/lib/android.system.suspend@1.0.so|439103-439122
+/system/lib/audioclient-types-aidl-cpp.so|439140-439148
+/system/lib/audioflinger-aidl-cpp.so|439149-439178
+/system/lib/audiopolicy-aidl-cpp.so|439179-439207
+/system/lib/av-types-aidl-cpp.so|439212-439214
+/system/lib/framework-permission-aidl-cpp.so|439497-439502
+/system/lib/hidl_comm_iccc_client.so|439516-439519
+/system/lib/hidl_comm_kg_client.so|439520-439525
+/system/lib/hidl_tlc_payment_comm_client.so|439526-439530
+/system/lib/hw/android.hidl.memory@1.0-impl.so|439531-439534
+/system/lib/hw/audio.a2dp.default.so|439535-439549
+/system/lib/hw/audio.hearing_aid.default.so|439550-439891
+/system/lib/lib.engmode.samsung.so|439897-439908
+/system/lib/lib.engmodejni.samsung.so|439909-439914
+/system/lib/libAiSolution_wrapper_v1.camera.samsung.so|439915-439920
+/system/lib/libBSD_jni.so|439921-439922
+/system/lib/libBeauty_v4.camera.samsung.so|439923-439962
+/system/lib/libDocRectifyWrapper.camera.samsung.so|440022-440117
+/system/lib/libEGL.so|440118-440165
+/system/lib/libETC1.so|440166-440167
+/system/lib/libFacePreProcessing.camera.samsung.so|440360-440446
+/system/lib/libFacePreProcessing_jni.camera.samsung.so|440447-440454
+/system/lib/libFace_Landmark_API.camera.samsung.so|440466-440475
+/system/lib/libFace_Landmark_Engine.camera.samsung.so|440476-441882
+/system/lib/libFacialStickerEngine.arcsoft.so|441904-441908
+/system/lib/libFeature.polarr.so|441909-442153
+/system/lib/libFood.camera.samsung.so|442154-442166
+/system/lib/libFoodDetector.camera.samsung.so|442167-442175
+/system/lib/libGeoTrans10.so|442216-442234
+/system/lib/libHWRenderer.penlibrary.samsung.so|442235-442237
+/system/lib/libHprFace_GAE_api.camera.samsung.so|442238-442242
+/system/lib/libImageScreener.camera.samsung.so|442527-442763
+/system/lib/libMattingCore.camera.samsung.so|442771-442850
+/system/lib/libOpenCv.camera.samsung.so|444091-446041
+/system/lib/libObjectAndSceneClassification_2.5_OD.camera.samsung.so|443400-444090
+/system/lib/libOpenMAXAL.so|446042-446043
+/system/lib/libOpenSLES.so|446044-446045
+/system/lib/libPolarrSnap.polarr.so|446046-446077
+/system/lib/libPortraitDistortionCorrection.arcsoft.so|446078-447348
+/system/lib/libPortraitDistortionCorrectionCali.arcsoft.so|447349-447351
+/system/lib/libQREngine_common.camera.samsung.so|447465-447770
+/system/lib/libQmageDecoder.so|447771-447918
+/system/lib/libRS.so|447919-447930
+/system/lib/libRSCacheDir.so|447931-447932
+/system/lib/libRSCpuRef.so|447933-448030
+/system/lib/libRS_internal.so|448070-448126
+/system/lib/libRectify.camera.samsung.so|448183-448753
+/system/lib/libSAG_VM_Energy_v217.so|448754-448762
+/system/lib/libSDKRecognitionText.spensdk.samsung.so|448773-449411
+/system/lib/libSFEffect.fonteffect.samsung.so|449445-450776
+/system/lib/libSamsungVAD_v3.0.so|450777-450790
+/system/lib/libSegmentationCore.camera.samsung.so|451297-451336
+/system/lib/libSimpleDocRectify.camera.samsung.so|451337-451422
+/system/lib/libSurfaceFlingerProp.so|453342-453356
+/system/lib/libTracking.polarr.so|453357-453558
+/system/lib/libYuv.polarr.so|453589-453648
+/system/lib/lib_SoundAlive_AlbumArt_ver105.so|453649-453704
+/system/lib/lib_SoundAlive_SRC192_ver205a.so|453705-453714
+/system/lib/lib_soundaliveresampler.so|454135-454136
+/system/lib/lib_vnd_client.dk.samsung.so|454137-454141
+/system/lib/libaaudio_internal.so|454145-454187
+/system/lib/libaccauthentication_jni.so|454188-454190
+/system/lib/libadbd_fs.so|454239-454244
+/system/lib/libagifencoder.quram.so|454245-454413
+/system/lib/libalarm_jni.so|454414-454417
+/system/lib/libamex.so|454418-454505
+/system/lib/libandroid_net.so|454543-454544
+/system/lib/libandroid_runtime.so|454545-454920
+/system/lib/libann_gc_system.so|455233-455400
+/system/lib/libapex_client.so|455401-455410
+/system/lib/libapex_intf.so|455449-455466
+/system/lib/libapex_jni.media.samsung.so|455467-455491
+/system/lib/libapex_utils.so|455492-455499
+/system/lib/libaplayer.so|455500-455990
+/system/lib/libaplayer_cache.so|455991-456013
+/system/lib/libaudiocoreaaudiorecorder.so|456189-456192
+/system/lib/libaudioeffect_jni.so|456193-456201
+/system/lib/libaudiohal.so|456395-456396
+/system/lib/libaudiohal@4.0.so|456397-456422
+/system/lib/libaudiohal@5.0.so|456423-456449
+/system/lib/libaudiohal@7.0.so|456478-456507
+/system/lib/libaudiohal_deathhandler.so|456508-456510
+/system/lib/libaudiomanager.so|456511-456514
+/system/lib/libaudiopolicy.so|456515-456527
+/system/lib/libaudioprocessing.so|456615-456756
+/system/lib/libaudioutils.so|456783-456808
+/system/lib/libbatterystats_aidl.so|456879-456883
+/system/lib/libblas.so|460399-460612
+/system/lib/libbpf.so|460613-460619
+/system/lib/libbpf_android.so|460620-460629
+/system/lib/libbufferhub.so|460630-460640
+/system/lib/libcamera2ndk.so|460782-460813
+/system/lib/libcamera_metadata.so|460896-460905
+/system/lib/libcap.so|460906-460911
+/system/lib/libcfms.ssrm.samsung.so|460912-460914
+/system/lib/libchrome.so|460918-461148
+/system/lib/libclang_rt.asan-arm-android.so|461149-461586
+/system/lib/libclcore.bc|461700-461772
+/system/lib/libclcore_debug.bc|461773-461851
+/system/lib/libcodec2_client.so|462417-462446
+/system/lib/libcodec2_hidl_client@1.0.so|462447-462465
+/system/lib/libcompiler_rt.so|462600-462607
+/system/lib/libenn_user.samsung_slsi.so|463896-463941
+/system/lib/libenn_user_driver_cpu.so|463942-464057
+/system/lib/libfacialrestoration.arcsoft.so|470769-470787
+/system/lib/libfilterfw.so|470842-470873
+/system/lib/libfmq.so|470880-470882
+/system/lib/libgetopts.dylib.so|471039-471061
+/system/lib/libgfxgrab.so|471062-471134
+/system/lib/libgui.so|471159-471374
+/system/lib/libhardware_legacy.so|471404-471407
+/system/lib/libharfbuzz_ng.so|471408-471654
+/system/lib/libheif.so|471672-471677
+/system/lib/libhidl-gen-utils.so|471753-471762
+/system/lib/libhidlbase.so|471764-471885
+/system/lib/libhumantracking.arcsoft.so|472986-478575
+/system/lib/libhwui.so|478579-480506
+/system/lib/libhypervintf.so|480510-480515
+/system/lib/libimagecodec.quram.so|480516-481191
+/system/lib/libimageconverter.so|481192-481203
+/system/lib/libinputservice.so|482338-482358
+/system/lib/libiprouteutil.so|482361-482379
+/system/lib/libjpegsq.media.samsung.so|482472-482475
+/system/lib/liblog.so|482540-482550
+/system/lib/liblzma.so|484423-484451
+/system/lib/libmdnssd.so|484452-484457
+/system/lib/libmedia_omx.so|484748-484783
+/system/lib/libmediacapture.so|484788-484806
+/system/lib/libmediacapture_jni.so|484807-484814
+/system/lib/libmediadrmmetrics_full.so|485009-485034
+/system/lib/libmediadrmmetrics_lite.so|485035-485055
+/system/lib/libmediandk.so|485076-485103
+/system/lib/libmediandk_utils.so|485104-485106
+/system/lib/libmediautils.so|485483-485524
+/system/lib/libmemtrack.so|485540-485542
+/system/lib/libmidas_DNNInterface.camera.samsung.so|485580-485723
+/system/lib/libmidas_core.camera.samsung.so|485724-485743
+/system/lib/libminui.so|485783-485816
+/system/lib/libnativedisplay.so|485927-485940
+/system/lib/libnetdutils.so|486015-486029
+/system/lib/libnetutils.so|486034-486039
+/system/lib/libneural.snap.samsung.so|486040-486041
+/system/lib/libneuralnetworks_packageinfo.so|486042-486043
+/system/lib/libofi_klm.so|486955-487000
+/system/lib/libofi_rt_framework_user.so|487472-487510
+/system/lib/libpadm.so|487732-487757
+/system/lib/libperflog.so|488914-488915
+/system/lib/libpermission.so|488920-488931
+/system/lib/libphotoeditorEngine.camera.samsung.so|488932-489112
+/system/lib/libprocessgroup.so|489297-489355
+/system/lib/libprocinfo.so|489356-489357
+/system/lib/libprofileparamstorage.so|489358-489391
+/system/lib/libremote-processor.so|489887-489907
+/system/lib/libremotedisplayservice.so|490363-490383
+/system/lib/librepeater.so|490384-490386
+/system/lib/libresourcemanagerservice.so|490387-490425
+/system/lib/librtp_jni.so|490438-490477
+/system/lib/libsaiv_HprFace_cmh_support_jni.camera.samsung.so|490512-490542
+/system/lib/libsavscmn.so|490702-490839
+/system/lib/libsec_skpmHal.so|491352-491353
+/system/lib/libsecaudioeventutils.so|491428-491430
+/system/lib/libsecaudiohal.so|491431-491432
+/system/lib/libsecaudiotestutils.so|491444-491445
+/system/lib/libsecimaging_pdk.camera.samsung.so|491538-491595
+/system/lib/libsecjpeginterface.camera.samsung.so|491596-491601
+/system/lib/libsecphotoremaster.camera.samsung.so|491610-491657
+/system/lib/libsecure_storage.so|491712-491715
+/system/lib/libsemimagecrop_jni.media.samsung.so|491773-491774
+/system/lib/libsemmediaplayer_jni.so|491775-491784
+/system/lib/libsemnativecarrierfeature.so|491785-491825
+/system/lib/libsmat.so|496009-496177
+/system/lib/libsensorservice.so|491852-491965
+/system/lib/libsfplugin_ccodec_utils.so|492126-492182
+/system/lib/libsmsd.so|496178-496346
+/system/lib/libsonivox.so|496456-496592
+/system/lib/libsrib_humanaware_engine.camera.samsung.so|497010-497394
+/system/lib/libssl.so|497400-497458
+/system/lib/libstagefright_amrnb_common.so|497835-497849
+/system/lib/libstd.dylib.so|498199-498371
+/system/lib/libsthmbc.so|498375-498805
+/system/lib/libswdht_legacy.so|499362-499643
+/system/lib/libsync.so|499644-499645
+/system/lib/libtensorflowlite_c.camera.samsung.so|500319-500636
+/system/lib/libtensorflowlite_inference_api.myfilter.camera.samsung.so|500665-500689
+/system/lib/libterrier.so|500723-500734
+/system/lib/libtest.dylib.so|500735-500788
+/system/lib/libtimeinstate.so|500789-500799
+/system/lib/libtimestats_atoms_proto.so|500800-500814
+/system/lib/libtlc_payment_spay.so|500837-500838
+/system/lib/libucm_esecomm_adapter.so|500849-500851
+/system/lib/libucm_tlc_hidl_api.so|500852-500855
+/system/lib/libuibcmanager_jni.so|500931-500934
+/system/lib/libuuid.so|501084-501087
+/system/lib/libvoicechanger.so|503543-503544
+/system/lib/libvolumemonitor_score.so|503580-503583
+/system/lib/libvpx.so|503616-504070
+/system/lib/libvulkan.so|504071-504110
+/system/lib/libwifipackettrackerjni.so|504116-504118
+/system/lib/vendor.samsung.frameworks.security.dsms@1.0.so|504647-504659
+/system/lib/vendor.samsung.hardware.audio@1.0.so|504675-504705
+/system/lib/vendor.samsung.hardware.media.converter-V1-ndk_platform.so|504862-504875
+/system/lib/vendor.samsung.hardware.media.mpp-V1-ndk_platform.so|504876-504889
+/system/lib/vendor.samsung.hardware.security.hdcp.wifidisplay-V2-ndk_platform.so|504931-504937
+/system/lib/vendor.samsung.hardware.security.skpm@1.0.so|504938-504951
+/system/lib/vendor.samsung.hardware.security.vaultkeeper@2.0.so|504952-504972
+/system/lib/vendor.samsung.hardware.snap@1.2.so|505025-505049
+/system/lib/vendor.samsung.hardware.tlc.kg@1.0.so|505100-505128
+/system/lib/vendor.samsung.hardware.tlc.ucm@2.0.so|505146-505166
+/system/lib/vendor.samsung_slsi.hardware.enn@1.0.so|505309-505336
+/system/lib/vintf-codecsolution-V2-cpp.so|505415-505422
+/system/lib/vintf-hdrsolution-cpp.so|505423-505427
+/system/lib/libcore2nativeutil.camera.samsung.so|462608-462619
+/system/lib/libdevicehealth.ssrm.samsung.so|462947-462951
+/system/lib/libdmabufheap.so|462954-462968
+/system/lib/libeden_nn_on_system.so|463159-463165
+/system/lib/libeden_rt_stub.samsung_slsi.so|463178-463185
+/system/lib/libedmnativehelperservice.so|463552-463557
+/system/lib/libenn_model.so|463809-463868
+/system/lib/libenn_profiler.so|463869-463889
+/system/lib/libexfat_utils.so|465573-465597
+/system/lib/libextmediaformatdef.so|465661-465662
+/system/lib/libfrigatebird_shared.so|470883-470884
+/system/lib/libfrpunlock.so|470885-470888
+/system/lib/libft2.so|470889-471034
+/system/lib/libgralloctypes.so|471135-471148
+/system/lib/libhal.wsm.samsung.so|471375-471401
+/system/lib/libhdcp_client_aidl.so|471667-471669
+/system/lib/libhdrsolutionhelper.so|471670-471671
+/system/lib/libheifcapture_jni.media.samsung.so|471699-471700
+/system/lib/libhiddensound.so|471748-471752
+/system/lib/libhidlmemory.so|471886-471889
+/system/lib/libhyperintf.so|480507-480509
+/system/lib/libincfs.so|481217-481247
+/system/lib/libincident.so|481248-481249
+/system/lib/libinference_engine.so|481269-482037
+/system/lib/libinputflinger.so|482111-482204
+/system/lib/libion.so|482359-482360
+/system/lib/libjsoncpp.so|482476-482510
+/system/lib/liblz4.so|484397-484422
+/system/lib/libmedia_jni.so|484629-484744
+/system/lib/libmedia_omx_client.so|484784-484787
+/system/lib/libmediadrmmetrics_consumer.so|485004-485008
+/system/lib/libmemunreachable.so|485547-485579
+/system/lib/libmpbase.so|485817-485818
+/system/lib/libmtp.so|485850-485884
+/system/lib/libnativebridge_lazy.so|485912
+/system/lib/libnetd_client.so|485995-486001
+/system/lib/libnetdbpf.so|486002-486014
+/system/lib/libnetlink.so|486030-486033
+/system/lib/libofi_gc.so|486070-486954
+/system/lib/libofi_seva.so|487575-487635
+/system/lib/libomafldrm.so|487636-487717
+/system/lib/libomission_avoidance.so|487718-487721
+/system/lib/libparameter.so|487758-487885
+/system/lib/libpdfium.so|487954-488886
+/system/lib/libpolicy-subsystem.so|489173-489176
+/system/lib/libpower.so|489177-489180
+/system/lib/libprotobuf-cpp-full.so|489392-489787
+/system/lib/libradio_metadata.so|489885-489886
+/system/lib/libremotedisplay_wfd.so|489947-490362
+/system/lib/librs_jni.so|490426-490437
+/system/lib/libsamsungSoundbooster_plus_legacy.so|490543-490547
+/system/lib/libsavsac.so|490587-490701
+/system/lib/libsbwcdecomp.so|491143-491158
+/system/lib/libsccore.so|491159-491201
+/system/lib/libsce_v1.crypto.samsung.so|491202-491210
+/system/lib/libschedulerservicehidl.so|491211-491212
+/system/lib/libsd2p.so|491213-491221
+/system/lib/libsecimaging.camera.samsung.so|491446-491537
+/system/lib/libsecril-client.so|491658-491664
+/system/lib/libselinux.so|491719-491736
+/system/lib/libselinux_ext.so|491737-491760
+/system/lib/libsemimagecrop.so|491761-491772
+/system/lib/libsensor.so|491826-491841
+/system/lib/libserde.dylib.so|491976-491983
+/system/lib/libshmemcompat.so|492183-492184
+/system/lib/libsimba.so|492185-492202
+/system/lib/libsonic.so|496453-496455
+/system/lib/libsoundextractor.so|496593-496605
+/system/lib/libspeexresampler.so|496622-496625
+/system/lib/libspeg.so|496626-496635
+/system/lib/libsqlite3_udr.so|496856-496868
+/system/lib/libsrib_CNNInterface.camera.samsung.so|496869-497009
+/system/lib/libstagefright_foundation.so|497911-497949
+/system/lib/libstdc++.so|498372-498374
+/system/lib/libsume_core.so|498808-498824
+/system/lib/libtensorflowLite.myfilter.camera.samsung.so|499919-500318
+/system/lib/libtinyxml2.so|500822-500834
+/system/lib/libtlc_payment_comm.so|500835-500836
+/system/lib/libucmscp.so|500856-500870
+/system/lib/libuibc.so|500927-500930
+/system/lib/libunwindstack.so|500935-501036
+/system/lib/libusbhost.so|501037-501039
+/system/lib/libuuid.dylib.so|501063-501083
+/system/lib/libveengine.arcsoft.so|501088-503384
+/system/lib/libvibrator.so|503385-503392
+/system/lib/libvoicechangercore.so|503545-503575
+/system/lib/mediametricsservice-aidl-cpp.so|504416-504419
+/system/lib/shared-file-region-aidl-cpp.so|504645-504646
+/system/lib/vendor.samsung.frameworks.security.ucm.crypto@1.0.so|504660-504674
+/system/lib/vendor.samsung.hardware.gnss-V2-cpp.so|504724-504745
+/system/lib/vendor.samsung.hardware.gnss@2.0.so|504746-504800
+/system/lib/vendor.samsung.hardware.security.engmode@1.0.so|504903-504930
+/system/lib/vendor.samsung.hardware.snap@1.1.so|505007-505024
+/system/lib/vendor.samsung.hardware.tlc.hdm@1.1.so|505067-505082
+/system/lib/vendor.samsung_slsi.hardware.ExynosHWCServiceTW@1.0.so|505253-505273
+/system/lib/vendor.samsung_slsi.hardware.ofi@2.0.so|505365-505395
+/system/lib/vendor.samsung_slsi.hardware.ofi@2.1.so|505396-505414
+/system/lib/libenn_public_api_cpp_lib.so|463893-463895
+/system/lib/libenn_user_driver_unified.so|465401-465462
+/system/lib/libface_landmark.arcsoft.so|465663-470768
+/system/lib/libfilterpack_imageproc.so|470874-470875
+/system/lib/libgraphicsenv.so|471149-471158
+/system/lib/libheifcapture.so|471678-471698
+/system/lib/libheifregiondec_jni.so|471717-471731
+/system/lib/libhigh_dynamic_range.arcsoft.so|471890-472985
+/system/lib/libinput.so|482038-482110
+/system/lib/libinputflinger_base.so|482205-482213
+/system/lib/libinputreader.so|482214-482335
+/system/lib/libinputreporter.so|482336-482337
+/system/lib/liblow_light_hdr.arcsoft.so|482554-484396
+/system/lib/libmedia.so|484458-484595
+/system/lib/libmedia_codeclist.so|484596-484606
+/system/lib/libmediadrm.so|484953-485003
+/system/lib/libmysound_legacy.so|485894-485911
+/system/lib/libnativecfms.so|485913-485926
+/system/lib/libnativeloader_lazy.so|485941-485942
+/system/lib/libnativewindow.so|485943-485947
+/system/lib/libnbaio.so|485948-485953
+/system/lib/libnblog.so|485954-485994
+/system/lib/libnl.so|486044-486067
+/system/lib/libofi_service_interface.so|487511-487574
+/system/lib/libpacm_client.so|487726-487731
+/system/lib/libperfsdk.performance.samsung.so|488916-488919
+/system/lib/libpiex.so|489113-489130
+/system/lib/libpredeflicker_native.so|489213-489296
+/system/lib/libprotoutil.so|489875-489882
+/system/lib/libpsi.so|489883-489884
+/system/lib/libremotedesktopservice.so|489908-489915
+/system/lib/libremotedisplay.so|489916-489946
+/system/lib/libsaiv_HprFace_api.camera.samsung.so|490478-490511
+/system/lib/libsamsungvad.so|490586
+/system/lib/libsavsvc.so|490840-491142
+/system/lib/libsec_skpmTlc.so|491354
+/system/lib/libsec_wvkprov_serverHal.so|491355-491356
+/system/lib/libsecaudiohal@1.0.so|491433-491436
+/system/lib/libsecnativefeature.so|491604-491609
+/system/lib/libsecuibc.so|491665-491711
+/system/lib/libsefinfoutils.so|491716-491718
+/system/lib/libsensorprivacy.so|491842-491851
+/system/lib/libsfextcp.so|491987-491994
+/system/lib/libsfplugin_ccodec.so|491995-492125
+/system/lib/libsoundpool.so|496606-496621
+/system/lib/libsqlite.so|496636-496855
+/system/lib/libss_jni.securestorage.samsung.so|497395-497399
+/system/lib/libstagefright_http_support.so|497988-497990
+/system/lib/libstagefright_httplive_sec.so|497991-498098
+/system/lib/libstagefright_omx.so|498099-498156
+/system/lib/libstagefright_omx_utils.so|498157-498160
+/system/lib/libstagefright_xmlparser.so|498161-498177
+/system/lib/libstatshidl.so|498178-498181
+/system/lib/libstatslog.so|498182-498198
+/system/lib/libsthmbcadapter.so|498806-498807
+/system/lib/libsume_mediabuffer_jni.media.samsung.so|498825-498830
+/system/lib/libsysutils.so|499646-499653
+/system/lib/libtensorflowLite.camera.samsung.so|499670-499918
+/system/lib/libterm.dylib.so|500690-500722
+/system/lib/libtinyalsa.so|500815-500821
+/system/lib/libtombstoned_client.so|500839-500843
+/system/lib/libui.so|500871-500926
+/system/lib/libutils.so|501040-501058
+/system/lib/libvkjni.so|503530-503536
+/system/lib/libvkmanager.so|503537-503540
+/system/lib/libvndksupport.so|503541-503542
+/system/lib/libvolumemonitor_energy.so|503576-503579
+/system/lib/libvorbisidec.so|503584-503615
+/system/lib/libwebviewchromium_plat_support.so|504113-504115
+/system/lib/libwilhelm.so|504119-504165
+/system/lib/libxml2.so|504166-504382
+/system/lib/libziparchive.so|504401-504415
+/system/lib/server_configurable_flags.so|504420-504422
+/system/lib/vendor.samsung.hardware.keymint-V1-ndk_platform.so|504851-504861
+/system/lib/vendor.samsung.hardware.security.widevine.keyprov@1.0.so|504973-504986
+/system/lib/vendor.samsung.hardware.snap@1.0.so|504987-505006
+/system/lib/vendor.samsung.hardware.tlc.iccc@1.0.so|505083-505099
+/system/lib/vendor.samsung.hardware.vibrator-V4-cpp.so|505167-505177
+/system/lib/vendor.samsung_slsi.hardware.eden_runtime@1.0.so|505274-505308
+/system/lib/vendor.samsung_slsi.hardware.enn_aux@1.0.so|505337-505349
+/system/lib/vendor.samsung_slsi.hardware.geoTransService@1.0.so|505350-505364
+/system/lib/libcryptoucmkeystorehal.so|462881-462886
+/system/lib/libdrmframework.so|463123-463130
+/system/lib/libeden_rt_stub.edensdk.samsung.so|463166-463177
+/system/lib/libeden_wrapper_system.so|463186-463545
+/system/lib/libedmnativehelper.so|463546-463551
+/system/lib/libenn_user_driver_gpu_lib.so|464058-465400
+/system/lib/libevent.so|465503-465572
+/system/lib/libexifa.camera.samsung.so|465598-465636
+/system/lib/libexpat.so|465637-465660
+/system/lib/libfdtrack.so|470788-470841
+/system/lib/libfloatingfeature.so|470876-470879
+/system/lib/libgatekeeper.so|471035-471038
+/system/lib/libhardware.so|471402-471403
+/system/lib/libhdcp2.so|471655-471666
+/system/lib/libheifcodec_jni.so|471701-471716
+/system/lib/libhermes_cred.so|471732-471747
+/system/lib/libhidlallocatorutils.so|471763
+/system/lib/libhumantracking_util.camera.samsung.so|478576-478578
+/system/lib/libimg_utils.so|481204-481216
+/system/lib/libincidentpriv.so|481250-481268
+/system/lib/libjnigraphics.so|482380-482383
+/system/lib/libjpeg.so|482384-482468
+/system/lib/libjpega.camera.samsung.so|482469-482471
+/system/lib/libkll.so|482511-482526
+/system/lib/libknox_remotedesktopclient.knox.samsung.so|482527-482535
+/system/lib/liblegacyeffects.so|482536-482539
+/system/lib/liblogwrap.so|482551-482553
+/system/lib/libmedia_helper.so|484607-484628
+/system/lib/libmedia_jni_utils.so|484745-484747
+/system/lib/libmediacaptureservice.so|484815-484952
+/system/lib/libmedialogservice.so|485056-485063
+/system/lib/libmediametrics.so|485064-485075
+/system/lib/libmediaplayerservice.so|485107-485475
+/system/lib/libmediaresourcehelper.so|485476-485482
+/system/lib/libmeminfo.so|485525-485539
+/system/lib/libmemtrackproxy.so|485543-485546
+/system/lib/libminikin.so|485744-485782
+/system/lib/libmppclient.so|485819-485849
+/system/lib/libmultirecord.so|485885-485893
+/system/lib/libnvaccessor_fb.so|486068-486069
+/system/lib/libofi_plugin.so|487001-487471
+/system/lib/libpa.so|487722-487723
+/system/lib/libpackagelistparser.so|487724-487725
+/system/lib/libpcre2.so|487886-487953
+/system/lib/libpdx_default_transport.so|488887-488913
+/system/lib/libpng.so|489131-489172
+/system/lib/libpowermanager.so|489181-489212
+/system/lib/libprotobuf-cpp-lite.so|489788-489874
+/system/lib/libsamsungpowersound.so|490548-490585
+/system/lib/libsec_skpm.so|491222-491351
+/system/lib/libsecairevital.camera.samsung.so|491357-491427
+/system/lib/libsecaudioinfo.so|491437-491443
+/system/lib/libsecjpegquram.so|491602-491603
+/system/lib/libsensorservicehidl.so|491966-491975
+/system/lib/libsextractorcmn.so|491984-491986
+/system/lib/libskqp_app.so|492203-494900
+/system/lib/libsmart_cropping.camera.samsung.so|494901-496008
+/system/lib/libsnaace.so|496347-496432
+/system/lib/libsnap_hidl.snap.samsung.so|496433-496452
+/system/lib/libstagefright.so|497459-497834
+/system/lib/libstagefright_bufferpool@2.0.1.so|497850-497883
+/system/lib/libstagefright_bufferqueue_helper.so|497884-497903
+/system/lib/libstagefright_codecbase.so|497904-497910
+/system/lib/libstagefright_framecapture_utils.so|497950-497985
+/system/lib/libstagefright_hdcp.so|497986-497987
+/system/lib/libteecl.so|499654-499669
+/system/lib/libsurfaceutil.camera.samsung.so|498831-498841
+/system/lib/libswdap_legacy.so|498842-499361
+/system/lib/libtensorflowlite_inference_api.camera.samsung.so|500637-500664
+/system/lib/libtsmux.so|500844-500848
+/system/lib/libutilscallstack.so|501059-501062
+/system/lib/libvibratorservice.so|503393-503425
+/system/lib/libvintf.so|503426-503529
+/system/lib/libwebviewchromium_loader.so|504111-504112
+/system/lib/libz.so|504383-504400
+/system/lib/service.incremental.so|504423-504644
+/system/lib/vendor.samsung.hardware.biometrics.fingerprint@3.0.so|504706-504723
+/system/lib/vendor.samsung.hardware.gnss@2.1.so|504801-504836
+/system/lib/vendor.samsung.hardware.hyper-V2-cpp.so|504837-504843
+/system/lib/vendor.samsung.hardware.hyper-V2-ndk_platform.so|504844-504850
+/system/lib/vendor.samsung.hardware.security.drk@2.0.so|504890-504902
+/system/lib/vendor.samsung.hardware.tlc.hdm@1.0.so|505050-505066
+/system/lib/vendor.samsung.hardware.tlc.payment@1.0.so|505129-505145
+/system/lib/vendor.samsung.hardware.vibrator@2.0.so|505178-505203
+/system/lib/vendor.samsung.hardware.vibrator@2.1.so|505204-505227
+/system/lib/vendor.samsung.hardware.vibrator@2.2.so|505228-505252
+/system/lib64/aaudio-aidl-cpp.so|505453-505469
+/system/lib64/android.frameworks.bufferhub@1.0.so|505470-505499
+/system/lib64/android.frameworks.cameraservice.common@2.0.so|505500-505502
+/system/lib64/android.frameworks.cameraservice.device@2.0.so|505503-505550
+/system/lib64/android.frameworks.cameraservice.device@2.1.so|505551-505576
+/system/lib64/android.frameworks.cameraservice.service@2.0.so|505577-505611
+/system/lib64/android.frameworks.cameraservice.service@2.1.so|505612-505647
+/system/lib64/android.frameworks.cameraservice.service@2.2.so|505648-505670
+/system/lib64/android.frameworks.displayservice@1.0.so|505671-505710
+/system/lib64/android.frameworks.schedulerservice@1.0.so|505711-505730
+/system/lib64/android.frameworks.sensorservice@1.0.so|505731-505783
+/system/lib64/android.frameworks.stats-V1-ndk_platform.so|505784-505792
+/system/lib64/android.frameworks.stats@1.0.so|505793-505819
+/system/lib64/android.hardware.atrace@1.0.so|505820-505840
+/system/lib64/android.hardware.audio.common-util.so|505841-505844
+/system/lib64/android.hardware.audio.common@2.0.so|505845-505847
+/system/lib64/android.hardware.audio.common@4.0-util.so|505848-505852
+/system/lib64/android.hardware.audio.common@4.0.so|505853-505855
+/system/lib64/android.hardware.audio.common@5.0-util.so|505856-505857 506882-506884
+/system/lib64/android.hardware.audio.common@5.0.so|506885-506890
+/system/lib64/android.hardware.audio.common@6.0-util.so|506891-506895
+/system/lib64/android.hardware.audio.common@6.0.so|506896-506901
+/system/lib64/android.hardware.audio.common@7.0-enums.so|506902-506930
+/system/lib64/android.hardware.audio.common@7.0-util.so|506931-506974
+/system/lib64/android.hardware.audio.common@7.0.so|506975-506996
+/system/lib64/android.hardware.audio.effect@4.0-util.so|506997-506999
+/system/lib64/android.hardware.audio.effect@4.0.so|507000-507299
+/system/lib64/android.hardware.audio.effect@5.0-util.so|507300-507302
+/system/lib64/android.hardware.audio.effect@5.0.so|507303-507602
+/system/lib64/android.hardware.audio.effect@6.0-util.so|507603-507605
+/system/lib64/android.hardware.audio.effect@6.0.so|507606-507905
+/system/lib64/android.hardware.audio.effect@7.0-util.so|507906-507909
+/system/lib64/android.hardware.audio.effect@7.0.so|507910-508214
+/system/lib64/android.hardware.audio@4.0-util.so|508215-508219
+/system/lib64/android.hardware.audio@4.0.so|508220-508378
+/system/lib64/android.hardware.audio@5.0-util.so|508379-508384
+/system/lib64/android.hardware.audio@5.0.so|508385-508544
+/system/lib64/android.hardware.audio@6.0-util.so|508545-508550
+/system/lib64/android.hardware.audio@6.0.so|508551-508728
+/system/lib64/android.hardware.audio@7.0-util.so|508729-508738
+/system/lib64/bootstrap/libc.so|515342-515590
+/system/lib64/bootstrap/libdl.so|515591-515594
+/system/lib64/bootstrap/libdl_android.so|515595-515597
+/system/lib64/bootstrap/libm.so|515598-515651
+/system/lib64/android.hardware.audio@7.0.so|508739-508910
+/system/lib64/android.hardware.biometrics.face@1.0.so|508911-508953
+/system/lib64/android.hardware.biometrics.fingerprint@2.1.so|508954-508992
+/system/lib64/android.hardware.bluetooth@1.0.so|508993-509023
+/system/lib64/android.hardware.bluetooth@1.1.so|509024-509056
+/system/lib64/android.hardware.boot@1.0.so|509057-509080
+/system/lib64/android.hardware.boot@1.1.so|509081-509102
+/system/lib64/android.hardware.broadcastradio@1.0.so|509103-509163
+/system/lib64/android.hardware.broadcastradio@1.1.so|509164-509232
+/system/lib64/android.hardware.camera.common@1.0.so|509233-509235
+/system/lib64/android.hardware.camera.device@1.0.so|509236-509302
+/system/lib64/android.hardware.camera.device@3.2.so|509303-509351
+/system/lib64/android.hardware.camera.device@3.3.so|509352-509374
+/system/lib64/android.hardware.camera.device@3.4.so|509375-509411
+/system/lib64/android.hardware.camera.device@3.5.so|509412-509469
+/system/lib64/android.hardware.camera.device@3.6.so|509470-509526
+/system/lib64/android.hardware.camera.device@3.7.so|509527-509593
+/system/lib64/android.hardware.camera.metadata@3.2.so|509594-509596
+/system/lib64/android.hardware.camera.metadata@3.3.so|509597-509599
+/system/lib64/android.hardware.camera.metadata@3.4.so|509600-509602
+/system/lib64/android.hardware.camera.metadata@3.5.so|509603-509605
+/system/lib64/android.hardware.camera.metadata@3.6.so|509606-509608
+/system/lib64/android.hardware.camera.provider@2.4.so|509609-509644
+/system/lib64/android.hardware.camera.provider@2.5.so|509645-509666
+/system/lib64/android.hardware.camera.provider@2.6.so|509667-509703
+/system/lib64/android.hardware.camera.provider@2.7.so|509704-509730
+/system/lib64/android.hardware.cas.native@1.0.so|509731-509752
+/system/lib64/android.hardware.cas@1.0.so|509753-509809
+/system/lib64/android.hardware.common-V2-ndk_platform.so|509810-509813
+/system/lib64/android.hardware.configstore-utils.so|509814-509816
+/system/lib64/android.hardware.configstore@1.0.so|509817-509845
+/system/lib64/android.hardware.configstore@1.1.so|509846-509870
+/system/lib64/android.hardware.confirmationui@1.0.so|509871-509900
+/system/lib64/android.hardware.contexthub@1.0.so|509901-509936
+/system/lib64/android.hardware.drm@1.0.so|509937-510025
+/system/lib64/android.hardware.drm@1.1.so|510026-510085
+/system/lib64/android.hardware.drm@1.2.so|510086-510175
+/system/lib64/android.hardware.drm@1.3.so|510176-510210
+/system/lib64/android.hardware.drm@1.4.so|510211-510291
+/system/lib64/android.hardware.dumpstate@1.0.so|510292-510309
+/system/lib64/android.hardware.dumpstate@1.1.so|510310-510329
+/system/lib64/android.hardware.fastboot@1.0.so|510330-510352
+/system/lib64/android.hardware.gatekeeper@1.0.so|510353-510374
+/system/lib64/android.hardware.gnss-V1-cpp.so|510375-510419
+/system/lib64/audio_common-aidl-cpp.so|515193-515195
+/system/lib64/android.hardware.gnss.measurement_corrections@1.0.so|510420-510448
+/system/lib64/android.hardware.gnss.measurement_corrections@1.1.so|510449-510469
+/system/lib64/android.hardware.gnss@1.0.so|510500-510727
+/system/lib64/android.hardware.gnss@1.1.so|510728-510805
+/system/lib64/android.hardware.gnss@2.0.so|510806-510961
+/system/lib64/android.hardware.graphics.allocator@2.0.so|511082-511101
+/system/lib64/android.hardware.graphics.allocator@3.0.so|511102-511121
+/system/lib64/android.hardware.graphics.bufferqueue@1.0.so|511141-511190
+/system/lib64/android.hardware.graphics.common@1.2.so|511247-511249
+/system/lib64/android.hardware.graphics.composer@2.2.so|511312-511363
+/system/lib64/android.hardware.health.storage-V1-ndk_platform.so|511606-511616
+/system/lib64/android.hardware.health.storage@1.0.so|511617-511644
+/system/lib64/android.hardware.health@1.0.so|511645-511647
+/system/lib64/android.hardware.health@2.0.so|511648-511686
+/system/lib64/android.hardware.health@2.1.so|511687-511724
+/system/lib64/android.hardware.input.classifier@1.0.so|511765-511784
+/system/lib64/android.hardware.input.common@1.0.so|511785-511787
+/system/lib64/android.hardware.ir@1.0.so|511788-511806
+/system/lib64/android.hardware.keymaster@3.0.so|511807-511846
+/system/lib64/android.hardware.keymaster@4.0.so|511847-511894
+/system/lib64/android.hardware.keymaster@4.1.so|511895-511927
+/system/lib64/android.hardware.media.c2@1.1.so|512123-512165
+/system/lib64/android.hardware.media.c2@1.2.so|512166-512212
+/system/lib64/android.hardware.media.omx@1.0.so|512213-512310
+/system/lib64/android.hardware.nfc@1.1.so|512381-512422
+/system/lib64/android.hardware.power.stats-V1-cpp.so|512473-512487
+/system/lib64/android.hardware.power.stats-V1-ndk_platform.so|512488-512503
+/system/lib64/android.hardware.power.stats@1.0.so|512504-512528
+/system/lib64/android.hardware.power@1.0.so|512529-512549
+/system/lib64/android.hardware.power@1.1.so|512550-512571
+/system/lib64/android.hardware.power@1.2.so|512572-512593
+/system/lib64/android.hardware.power@1.3.so|512594-512616
+/system/lib64/android.hardware.radio.deprecated@1.0.so|512657-512696
+/system/lib64/android.hardware.radio@1.1.so|513014-513240
+/system/lib64/android.hardware.renderscript@1.0.so|514002-514077
+/system/lib64/android.hardware.security.keymint-V1-cpp.so|514112-514148
+/system/lib64/android.hardware.security.secureclock-V1-ndk_platform.so|514195-514204
+/system/lib64/android.hardware.security.sharedsecret-V1-ndk_platform.so|514205-514215
+/system/lib64/android.hardware.sensors@1.0.so|514216-514240
+/system/lib64/android.hardware.sensors@2.1.so|514278-514314
+/system/lib64/android.hardware.tv.input@1.0.so|514336-514365
+/system/lib64/android.hardware.usb.gadget@1.0.so|514366-514394
+/system/lib64/android.hardware.vibrator@1.2.so|514524-514545
+/system/lib64/drm/libfwdlockengine.so|515687-515701
+/system/lib64/drm/libomaplugin.so|515702-515725
+/system/lib64/android.hardware.vr@1.0.so|514571-514589
+/system/lib64/android.hardware.wifi@1.0.so|514590-514842
+/system/lib64/android.hidl.allocator@1.0.so|514843-514861
+/system/lib64/android.hidl.safe_union@1.0.so|514911-514913
+/system/lib64/android.hidl.token@1.0-utils.so|514914-514917
+/system/lib64/android.hidl.token@1.0.so|514918-514938
+/system/lib64/android.security.apc-ndk_platform.so|514939-514950
+/system/lib64/android.security.compat-ndk_platform.so|514962-514971
+/system/lib64/android.security.maintenance-ndk_platform.so|514982-514993
+/system/lib64/android.system.keystore2-V1-cpp.so|514994-515018
+/system/lib64/android.system.keystore2-V1-ndk_platform.so|515019-515044
+/system/lib64/android.system.net.netd@1.0.so|515045-515063
+/system/lib64/android.system.net.netd@1.1.so|515064-515086
+/system/lib64/android.system.suspend.control-V1-cpp.so|515087-515101
+/system/lib64/android.system.suspend.control-V1-ndk.so|515102-515116
+/system/lib64/android.system.wifi.keystore@1.0.so|515155-515175
+/system/lib64/apex_aidl_interface-cpp.so|515176-515192
+/system/lib64/audiopolicy-types-aidl-cpp.so|515331-515337
+/system/lib64/camera-service-worker-aidl-V2-cpp.so|515652-515659
+/system/lib64/capture_state_listener-aidl-cpp.so|515660-515668
+/system/lib64/effect-aidl-cpp.so|515726-515739
+/system/lib64/extractors/libsaacextractor.so|515740-515758
+/system/lib64/extractors/libsaviextractor.so|515759-515790
+/system/lib64/extractors/libsecamrextractor.so|515791-515798
+/system/lib64/extractors/libsecmidiextractor.so|515799-515938
+/system/lib64/extractors/libsecmkvextractor.so|515939-515981
+/system/lib64/extractors/libsecmp3extractor.so|515982-516000
+/system/lib64/extractors/libsecmp4extractor.so|516001-516106
+/system/lib64/extractors/libsecmpeg2extractor.so|516107-516441
+/system/lib64/extractors/libsecoggextractor.so|516442-516460
+/system/lib64/extractors/libsecwavextractor.so|516461-516470
+/system/lib64/extractors/libsflacextractor.so|516471-516486
+/system/lib64/extractors/libsflvextractor.so|516487-516510
+/system/lib64/extractors/libsmkvextractor.so|516511-516543
+/system/lib64/extractors/libsubextractor.so|516544-516562
+/system/lib64/extractors/libswmfextractor.so|516563-516587
+/system/lib64/heapprofd_client.so|516623-516628
+/system/lib64/heapprofd_client_api.so|516629-516640
+/system/lib64/lib-platform-compat-native-api.so|517152-517159
+/system/lib64/libAudioFWInterface.so|517202-517205
+/system/lib64/libBestComposition.polarr.so|517259-517343
+/system/lib64/libBright_core.camera.samsung.so|517344-517356
+/system/lib64/libEventFinder.camera.samsung.so|517650-517850
+/system/lib64/libFFTEm.so|517851-517934
+/system/lib64/libFaceRestoration.camera.samsung.so|518088-518102
+/system/lib64/libFacialAttributeDetection.arcsoft.so|519610-526597
+/system/lib64/libFacialBasedSelfieCorrection.camera.samsung.so|526598-526622
+/system/lib64/libGLESv1_CM.so|531148-531156
+/system/lib64/libGLESv2.so|531157-531182
+/system/lib64/libGLESv3.so|531183-531208
+/system/lib64/libHprFace_GAE_jni.camera.samsung.so|531240-531245
+/system/lib64/libHpr_RecFace_dl_v1.0.camera.samsung.so|531246-531543
+/system/lib64/libHpr_RecGAE_cvFeature_v1.0.camera.samsung.so|531544-531581
+/system/lib64/libHpr_TaskFaceClustering_hierarchical_v1.0.camera.samsung.so|531582-531657
+/system/lib64/libInteractiveSegmentation.camera.samsung.so|532201-532211
+/system/lib64/libIss_Operations.so|532212-532270
+/system/lib64/libIss_mw.so|532286-532301
+/system/lib64/libLLVM_android.so|532368-536993
+/system/lib64/libMyFilter.camera.samsung.so|537085-537908
+/system/lib64/libMyFilterPlugin.camera.samsung.so|537909-537922
+/system/lib64/libPortraitSolution.camera.samsung.so|546820-546933
+/system/lib64/libRSDriver.so|547633-547683
+/system/lib64/libRScpp.so|547762-547831
+/system/lib64/libRecorder.so|547832-547883
+/system/lib64/libResampler.so|548672-548680
+/system/lib64/libSAG_VM_Score_v217.so|548692-548703
+/system/lib64/libSEF.quram.so|549589-549637
+/system/lib64/libSTE.so|551355-551383
+/system/lib64/android.hardware.gnss.visibility_control@1.0.so|510470-510499
+/system/lib64/android.hardware.gnss@2.1.so|510962-511081
+/system/lib64/android.hardware.graphics.allocator@4.0.so|511122-511140
+/system/lib64/android.hardware.graphics.bufferqueue@2.0.so|511191-511234
+/system/lib64/android.hardware.graphics.common-V2-ndk_platform.so|511235-511240
+/system/lib64/android.hardware.graphics.common@1.0.so|511241-511243
+/system/lib64/android.hardware.graphics.common@1.1.so|511244-511246
+/system/lib64/android.hardware.graphics.composer@2.1.so|511250-511311
+/system/lib64/android.hardware.graphics.composer@2.3.so|511364-511426
+/system/lib64/android.hardware.graphics.composer@2.4.so|511427-511505
+/system/lib64/android.hardware.graphics.mapper@2.0.so|511506-511527
+/system/lib64/android.hardware.graphics.mapper@2.1.so|511528-511550
+/system/lib64/android.hardware.graphics.mapper@3.0.so|511551-511574
+/system/lib64/android.hardware.graphics.mapper@4.0.so|511575-511605
+/system/lib64/android.hardware.identity-support-lib.so|511725-511764
+/system/lib64/android.hardware.light@2.0.so|511928-511946
+/system/lib64/android.hardware.media.bufferpool@2.0.so|511947-511995
+/system/lib64/android.hardware.media.c2@1.0.so|511996-512122
+/system/lib64/android.hardware.media@1.0.so|512311-512313
+/system/lib64/android.hardware.memtrack-V1-ndk_platform.so|512314-512322
+/system/lib64/android.hardware.memtrack@1.0.so|512323-512341
+/system/lib64/android.hardware.nfc@1.0.so|512342-512380
+/system/lib64/android.hardware.nfc@1.2.so|512423-512451
+/system/lib64/android.hardware.power-V1-cpp.so|512452-512459
+/system/lib64/android.hardware.power-V2-cpp.so|512460-512472
+/system/lib64/android.hardware.radio.config@1.0.so|512617-512656
+/system/lib64/android.hardware.radio@1.0.so|512697-513013
+/system/lib64/android.hardware.radio@1.2.so|513241-513491
+/system/lib64/android.hardware.radio@1.3.so|513492-513727
+/system/lib64/android.hardware.radio@1.4.so|513728-514001
+/system/lib64/android.hardware.secure_element@1.0.so|514078-514111
+/system/lib64/android.hardware.security.keymint-V1-ndk_platform.so|514149-514184
+/system/lib64/android.hardware.security.secureclock-V1-cpp.so|514185-514194
+/system/lib64/android.hardware.sensors@2.0.so|514241-514277
+/system/lib64/android.hardware.thermal@1.0.so|514315-514335
+/system/lib64/android.hardware.usb@1.0.so|514395-514424
+/system/lib64/android.hardware.usb@1.1.so|514425-514456
+/system/lib64/android.hardware.vibrator-V2-cpp.so|514457-514481
+/system/lib64/android.hardware.vibrator@1.0.so|514482-514502
+/system/lib64/android.hardware.vibrator@1.1.so|514503-514523
+/system/lib64/android.hardware.vibrator@1.3.so|514546-514570
+/system/lib64/android.hidl.memory.token@1.0.so|514862-514880
+/system/lib64/android.hidl.memory@1.0.so|514881-514910
+/system/lib64/android.security.authorization-ndk_platform.so|514951-514961
+/system/lib64/audioflinger-aidl-cpp.so|515213-515273
+/system/lib64/android.security.legacykeystore-ndk_platform.so|514972-514981
+/system/lib64/android.system.suspend.control.internal-cpp.so|515117-515126
+/system/lib64/android.system.suspend@1.0.so|515127-515154
+/system/lib64/audioclient-types-aidl-cpp.so|515196-515212
+/system/lib64/audiopolicy-aidl-cpp.so|515274-515330
+/system/lib64/av-types-aidl-cpp.so|515338-515341
+/system/lib64/dnsresolver_aidl_interface-V7-cpp.so|515669-515686
+/system/lib64/framework-permission-aidl-cpp.so|516588-516597
+/system/lib64/gsi_aidl_interface-cpp.so|516598-516622
+/system/lib64/hidl_comm_iccc_client.so|516641-516645
+/system/lib64/hidl_comm_kg_client.so|516646-516654
+/system/lib64/hidl_tlc_payment_comm_client.so|516655-516662
+/system/lib64/hw/android.hidl.memory@1.0-impl.so|516663-516668
+/system/lib64/hw/audio.a2dp.default.so|516669-516691
+/system/lib64/hw/audio.hearing_aid.default.so|516692-517148
+/system/lib64/ld-android.so|517149-517151
+/system/lib64/lib.engmode.samsung.so|517160-517176
+/system/lib64/lib.engmodejni.samsung.so|517177-517184
+/system/lib64/libAiSolution_wrapper_v1.camera.samsung.so|517185-517201
+/system/lib64/libAudioTranscoder.so|517206-517211
+/system/lib64/libBSD_jni.so|517212-517214
+/system/lib64/libBeauty_v4.camera.samsung.so|517215-517258
+/system/lib64/libDLInterface_hidl.camera.samsung.so|517357-517382
+/system/lib64/libDocRectifyWrapper.camera.samsung.so|517383-517559
+/system/lib64/libEGL.so|517560-517645
+/system/lib64/libETC1.so|517646-517649
+/system/lib64/libFacePreProcessing.camera.samsung.so|517935-518080
+/system/lib64/libFacePreProcessing_jni.camera.samsung.so|518081-518087
+/system/lib64/libFace_Landmark_API.camera.samsung.so|518103-518113
+/system/lib64/libFace_Landmark_Engine.camera.samsung.so|518114-519609
+/system/lib64/libFacialStickerEngine.arcsoft.so|526623-530760
+/system/lib64/libFeature.polarr.so|530761-531115
+/system/lib64/libFood.camera.samsung.so|531116-531138
+/system/lib64/libFoodDetector.camera.samsung.so|531139-531147
+/system/lib64/libGeoTrans10.so|531209-531226
+/system/lib64/libHWRenderer.penlibrary.samsung.so|531227-531231
+/system/lib64/libHprFace_GAE_api.camera.samsung.so|531232-531239
+/system/lib64/libImageScreener.camera.samsung.so|531658-532200
+/system/lib64/libIss_jni.so|532271-532285
+/system/lib64/libIss_mwVold.so|532302-532360
+/system/lib64/libIss_utils.so|532361-532367
+/system/lib64/libMattingCore.camera.samsung.so|536994-537084
+/system/lib64/libObjectAndSceneClassification_2.5_OD.camera.samsung.so|537923-538808
+/system/lib64/libOpenCv.camera.samsung.so|538809-541462
+/system/lib64/libOpenMAXAL.so|541463-541466
+/system/lib64/libOpenSLES.so|541467-541470
+/system/lib64/libPSI.so|541471-541489
+/system/lib64/libPolarrSnap.polarr.so|541490-541542
+/system/lib64/libPortraitDistortionCorrection.arcsoft.so|541543-546816
+/system/lib64/libPortraitDistortionCorrectionCali.arcsoft.so|546817-546819
+/system/lib64/libQREngine_common.camera.samsung.so|546934-547356
+/system/lib64/libQmageDecoder.so|547357-547489
+/system/lib64/libRS.so|547490-547506
+/system/lib64/libRSCacheDir.so|547507-547509
+/system/lib64/libRSCpuRef.so|547510-547632
+/system/lib64/libRS_internal.so|547684-547761
+/system/lib64/libRectify.camera.samsung.so|547884-548671
+/system/lib64/libSAG_VM_Energy_v217.so|548681-548691
+/system/lib64/libSDKRecognitionText.spensdk.samsung.so|548704-549588
+/system/lib64/libSceneDetector_v1.camera.samsung.so|551514-552042
+/system/lib64/libSoundAlive_VSP_ver316c_ARMCpp.so|554213-554227
+/system/lib64/libSuspendProperties.so|555043-555045
+/system/lib64/libVoiceCommandEngine.so|555405-555410
+/system/lib64/lib_android_keymaster_keymint_utils.so|555949-555955
+/system/lib64/lib_nativeJni.dk.samsung.so|555956-555960
+/system/lib64/lib_native_client.dk.samsung.so|555961-555963
+/system/lib64/libabcfingr.so|556122-556124
+/system/lib64/libadbd_auth.so|556141-556202
+/system/lib64/libandroid.so|556627-556670
+/system/lib64/libandroid_runtime_lazy.so|557204-557206
+/system/lib64/libandroid_servers.so|557207-557491
+/system/lib64/libasyncio.so|558733-558735
+/system/lib64/libaudio-resampler.so|558736-558743
+/system/lib64/libaudioclient.so|558744-558946
+/system/lib64/libaudioclient_aidl_conversion.so|558947-558987
+/system/lib64/libaudioflinger.so|559008-559361
+/system/lib64/libaudiohal@6.0.so|559521-559572
+/system/lib64/libaudiosolution_jni.so|560586-560589
+/system/lib64/libaudiotracer.so|560596-560608
+/system/lib64/libbacktrace.so|560648-560686
+/system/lib64/libbcinfo.so|560822-561104
+/system/lib64/libbinder.so|564277-564425
+/system/lib64/libbinder_ndk.so|564426-564446
+/system/lib64/libbootloader_message.so|566967-567014
+/system/lib64/libbrillo-binder.so|567039-567042
+/system/lib64/libbt-iopdb.so|567140-567143
+/system/lib64/libbt-iopdb_mod.so|567144-567147
+/system/lib64/libbufferhubqueue.so|567163-567190
+/system/lib64/libc++.so|567191-567361
+/system/lib64/libcgrouprc.so|568247-568250
+/system/lib64/libclang_rt.ubsan_standalone-aarch64-android.so|569252-569443
+/system/lib64/libclcore_debug_g.bc|569612-569874
+/system/lib64/libclcore_g.bc|569875-570149
+/system/lib64/libclcore_neon.bc|570150-570231
+/system/lib64/libcodec2.so|570232-570234
+/system/lib64/libcodecsolutionhelper.so|570484-570497
+/system/lib64/libcurl.so|571044-571138
+/system/lib64/libcutils.so|571233-571250
+/system/lib64/libdatasource_local_cache.so|571291-571302
+/system/lib64/libdebuggerd_client.so|571303-571314
+/system/lib64/libdk_native_keymint.so|571335-571338
+/system/lib64/libdng_sdk.so|571360-571550
+/system/lib64/libdrm.so|571551-571570
+/system/lib64/libdrmframework_jni.so|571584-571595
+/system/lib64/libdrmframeworkcommon.so|571596-571625
+/system/lib64/libdynamic_depth.so|571657-571724
+/system/lib64/libeffectsconfig.so|572324-572332
+/system/lib64/libenf_uv_gc_system.so|572418-572503
+/system/lib64/libenn_engine_lib.so|572516-572697
+/system/lib64/libenn_public_api_cpp.so|572812-572816
+/system/lib64/libenn_user.samsung_slsi.so|572822-572883
+/system/lib64/libenn_user_driver_cpu.so|572884-573038
+/system/lib64/liberis_charon.so|574713-574892
+/system/lib64/libext2_misc.so|575881-575885
+/system/lib64/libext4_utils.so|575992-575995
+/system/lib64/libextSdUnionStorage.so|575999-576001
+/system/lib64/libfacialrestoration.arcsoft.so|581161-585592
+/system/lib64/libfilterfw.so|585686-585730
+/system/lib64/libfmq.so|585843-585846
+/system/lib64/libfsverity.so|586271-586276
+/system/lib64/libgetopts.dylib.so|586445-586458
+/system/lib64/libgfxgrab.so|586459-586528
+/system/lib64/libgui.so|586941-587247
+/system/lib64/libhardware_legacy.so|587288-587294
+/system/lib64/libharfbuzz_ng.so|587295-587539
+/system/lib64/libheif.so|587543-587553
+/system/lib64/libhermes_jni.so|587647-587649
+/system/lib64/libhidcommand_jni.so|587650-587656
+/system/lib64/libhidl-gen-utils.so|587692-587705
+/system/lib64/libhidlbase.so|587709-587879
+/system/lib64/libhumantracking.arcsoft.so|588980-594574
+/system/lib64/libhwui.so|594583-597785
+/system/lib64/libhypervintf.so|597791-597798
+/system/lib64/libimagecodec.quram.so|597898-598633
+/system/lib64/libimageconverter.so|598634-598650
+/system/lib64/libinputservice.so|600226-600252
+/system/lib64/libiprouteutil.so|600256-600284
+/system/lib64/libjpegsq.media.samsung.so|600383-600387
+/system/lib64/libkeystore2_crypto.so|600754-600763
+/system/lib64/libknox_encryption.so|600855-600861
+/system/lib64/liblayers_proto.so|600911-600963
+/system/lib64/libldacBT_enc.so|600967-600978
+/system/lib64/liblog.so|600985-601000
+/system/lib64/liblzma.so|603041-603080
+/system/lib64/libmdnssd.so|603186-603194
+/system/lib64/libmedia_omx.so|603591-603637
+/system/lib64/libmediacapture.so|603644-603674
+/system/lib64/libmediacapture_jni.so|603675-603685
+/system/lib64/libmediadrmmetrics_full.so|603765-603800
+/system/lib64/libmediadrmmetrics_lite.so|603801-603830
+/system/lib64/libmediandk.so|603986-604038
+/system/lib64/libmediandk_utils.so|604039-604042
+/system/lib64/libmediarelayengine.so|604043-604205
+/system/lib64/libmediautils.so|604217-604283
+/system/lib64/libmemtrack.so|604305-604309
+/system/lib64/libmidas_DNNInterface.camera.samsung.so|604366-604509
+/system/lib64/libmidas_core.camera.samsung.so|604510-604534
+/system/lib64/libminijail.so|604535-604573
+/system/lib64/libminui.so|604626-604675
+/system/lib64/libnativedisplay.so|604835-604853
+/system/lib64/libnetdutils.so|604956-604975
+/system/lib64/libnetutils.so|604983-604991
+/system/lib64/libneural.snap.samsung.so|604992-604994
+/system/lib64/libneuralnetworks_packageinfo.so|604995-604997
+/system/lib64/libnfc-sec.so|604998-605296
+/system/lib64/libofi_klm.so|606734-606798
+/system/lib64/libofi_rt_framework_user.so|607451-607501
+/system/lib64/libpadm.so|607803-607830
+/system/lib64/libpcap.so|608012-608089
+/system/lib64/libperflog.so|609472-609474
+/system/lib64/libpermission.so|609482-609499
+/system/lib64/libpersona.so|609500-609505
+/system/lib64/libphotoeditorEngine.camera.samsung.so|609506-609705
+/system/lib64/libprocessgroup.so|609983-610063
+/system/lib64/libprocessgroup_setup.so|610064-610071
+/system/lib64/libprocinfo.so|610072-610074
+/system/lib64/libprofileparamstorage.so|610075-610123
+/system/lib64/libremote-processor.so|610829-610858
+/system/lib64/libresourcemanagerservice.so|610923-610983
+/system/lib64/librtp.so|611002-611021
+/system/lib64/librtp_jni.so|611022-611074
+/system/lib64/libsaiv_HprFace_cmh_support_jni.camera.samsung.so|611156-611214
+/system/lib64/libsavscmn.so|611538-611675
+/system/lib64/libsec_skpmHal.so|614382-614384
+/system/lib64/libsecaudioeventutils.so|614501-614504
+/system/lib64/libsecaudiohal.so|614505-614508
+/system/lib64/libsecaudiotestutils.so|614527-614529
+/system/lib64/libseccameracore2.so|614530-614532
+/system/lib64/libsecimaging_pdk.camera.samsung.so|614662-614743
+/system/lib64/libsecjpeginterface.camera.samsung.so|614744-614752
+/system/lib64/libsecphotoremaster.camera.samsung.so|614766-614853
+/system/lib64/libsecure_storage.so|614864-614866
+/system/lib64/libsem_jni.so|614930-614934
+/system/lib64/libsemimagecrop_jni.media.samsung.so|614953-614955
+/system/lib64/libsemmediaplayer_jni.so|614956-614969
+/system/lib64/libsemnativecarrierfeature.so|614970-615026
+/system/lib64/libsensorservice.so|615065-615214
+/system/lib64/libsfplugin_ccodec_utils.so|615446-615525
+/system/lib64/libsmat.so|620117-620299
+/system/lib64/libsmsd.so|620300-620480
+/system/lib64/libsonivox.so|620605-620748
+/system/lib64/libsparse.so|620789-620798
+/system/lib64/libsrib_humanaware_engine.camera.samsung.so|621318-621665
+/system/lib64/libSFEffect.fonteffect.samsung.so|549638-551330
+/system/lib64/libSRTP.so|551331-551354
+/system/lib64/libSimpleDocRectify.camera.samsung.so|552083-552243
+/system/lib64/libSurfaceFlingerProp.so|555022-555042
+/system/lib64/lib_SoundAlive_SRC192_ver205a.so|555578-555588
+/system/lib64/lib_android_FrameCapture.so|555940-555948
+/system/lib64/lib_vnd_client.dk.samsung.so|555967-555974
+/system/lib64/libaaudio_internal.so|555982-556058
+/system/lib64/libaaudioservice.so|556059-556121
+/system/lib64/libaccauthentication_jni.so|556125-556129
+/system/lib64/libamex.so|556375-556492
+/system/lib64/libamrwb_float.so|556570-556626
+/system/lib64/libandroid_runtime.so|556674-557203
+/system/lib64/libapex_intf.so|557962-557988
+/system/lib64/libapex_jni.media.samsung.so|557989-558024
+/system/lib64/libaplayer.so|558036-558656
+/system/lib64/libaplayer_cache.so|558657-558685
+/system/lib64/libaudiohal.so|559417-559421
+/system/lib64/libaudiohal@4.0.so|559422-559470
+/system/lib64/libaudiohal@5.0.so|559471-559520
+/system/lib64/libaudiohal@7.0.so|559573-559626
+/system/lib64/libaudiohal_deathhandler.so|559627-559631
+/system/lib64/libaudioprocessing.so|560388-560575
+/system/lib64/libbatterystats_aidl.so|560747-560753
+/system/lib64/libbluetooth_jni.so|566880-566966
+/system/lib64/libbpf.so|567015-567024
+/system/lib64/libbpf_android.so|567025-567038
+/system/lib64/libbrillo.so|567071-567139
+/system/lib64/libbufferhub.so|567148-567162
+/system/lib64/libcamera_metadata.so|567565-567577
+/system/lib64/libcameraservice.so|567578-568233
+/system/lib64/libcap.so|568234-568242
+/system/lib64/libcharon.so|568251-568441
+/system/lib64/libclcore.bc|569444-569524
+/system/lib64/libclcore_debug.bc|569525-569611
+/system/lib64/libcodec2_client.so|570235-570278
+/system/lib64/libcodec2_hidl_client@1.1.so|570305-570308
+/system/lib64/libcore2nativeutil.camera.samsung.so|570512-570529
+/system/lib64/libcups.so|570958-571043
+/system/lib64/libdevicehealth.ssrm.samsung.so|571315-571320
+/system/lib64/libdmabufheap.so|571339-571359
+/system/lib64/libdumpstateaidl.so|571633-571643
+/system/lib64/libeden_nn_on_system.so|571725-571733
+/system/lib64/libeden_rt_stub.samsung_slsi.so|571750-571760
+/system/lib64/libedmnativehelperservice.so|572315-572323
+/system/lib64/libenn_model.so|572698-572780
+/system/lib64/libenn_profiler.so|572781-572811
+/system/lib64/libepm.so|574676-574712
+/system/lib64/liberis_simaka.so|574893-574899
+/system/lib64/libevs_float.so|575224-575735
+/system/lib64/libexif.so|575736-575765
+/system/lib64/libextmediaformatdef.so|576002-576005
+/system/lib64/libf2fs_sparseblock.so|576006-576008
+/system/lib64/libfec.so|585666-585685
+/system/lib64/libframestats.so|585916-585924
+/system/lib64/libfrigatebird_shared.so|585925-585928
+/system/lib64/libfrpunlock.so|585929-585934
+/system/lib64/libfs_mgr.so|585935-586084
+/system/lib64/libft2.so|586277-586426
+/system/lib64/libgatekeeper_aidl.so|586435-586444
+/system/lib64/libgpumem.so|586539-586548
+/system/lib64/libgpumemtracer.so|586549-586774
+/system/lib64/libgpuservice.so|586775-586782
+/system/lib64/libgralloctypes.so|586904-586922
+/system/lib64/libhal.wsm.samsung.so|587248-587284
+/system/lib64/libhdrsolutionhelper.so|587540-587542
+/system/lib64/libheifcapture_jni.media.samsung.so|587583-587586
+/system/lib64/libhiddensound.so|587657-587663
+/system/lib64/libhidlmemory.so|587880-587886
+/system/lib64/libhidltransport.so|587887-587889
+/system/lib64/libhwbinder.so|594580-594582
+/system/lib64/libhyperintf.so|597786-597790
+/system/lib64/libincfs.so|598680-598720
+/system/lib64/libincident.so|598721-598724
+/system/lib64/libion.so|600253-600255
+/system/lib64/libinference_engine.so|598753-599828
+/system/lib64/libinputflinger.so|599927-600047
+/system/lib64/libjsoncpp.so|600388-600436
+/system/lib64/libkeymaster4_1support.so|600437-600472
+/system/lib64/libkeymaster4support.so|600473-600499
+/system/lib64/libkeymint.so|600649-600678
+/system/lib64/libkeystore2_aaid.so|600743-600746
+/system/lib64/libkeystore2_apc_compat.so|600747-600753
+/system/lib64/libkeyutils.so|600768-600770
+/system/lib64/libkm_compat.so|600792-600849
+/system/lib64/libknox_filemanager.so|600862-600889
+/system/lib64/liblp.so|602912-602956
+/system/lib64/liblz4.so|603007-603040
+/system/lib64/libmedia_jni.so|603428-603586
+/system/lib64/libmedia_omx_client.so|603638-603643
+/system/lib64/libmediadrmmetrics_consumer.so|603757-603764
+/system/lib64/libmediametricsservice.so|603870-603985
+/system/lib64/libmemunreachable.so|604316-604365
+/system/lib64/libmpbase.so|604676-604677
+/system/lib64/libmtp.so|604718-604777
+/system/lib64/libnativebridge_lazy.so|604812-604814
+/system/lib64/libnetd_client.so|604933-604940
+/system/lib64/libnetdbpf.so|604941-604955
+/system/lib64/libnetlink.so|604976-604982
+/system/lib64/libofi_gc.so|605522-606733
+/system/lib64/libofi_seva.so|607587-607672
+/system/lib64/libomafldrm.so|607673-607784
+/system/lib64/libomission_avoidance.so|607785-607791
+/system/lib64/libparameter.so|607831-608011
+/system/lib64/libpdfium.so|608173-609127
+/system/lib64/libpolicy-subsystem.so|609788-609795
+/system/lib64/libpower.so|609796-609800
+/system/lib64/libprotobuf-cpp-full.so|610124-610671
+/system/lib64/libradio_metadata.so|610826-610828
+/system/lib64/librs_jni.so|610984-611001
+/system/lib64/libsamsungSoundbooster_plus_legacy.so|611215-611221
+/system/lib64/libsamsung_keystore_utils.so|611222-611226
+/system/lib64/libsamsung_videoengine_9_0.so|611227-611421
+/system/lib64/libsavsac.so|611422-611537
+/system/lib64/libsbwcdecomp.so|611978-611999
+/system/lib64/libsccore.so|612000-612060
+/system/lib64/libsce_v1.crypto.samsung.so|612061-612070
+/system/lib64/libschedulerservicehidl.so|612071-612074
+/system/lib64/libsd2p.so|612075-612081
+/system/lib64/libsecimaging.camera.samsung.so|614533-614661
+/system/lib64/libsecril-client.so|614854-614863
+/system/lib64/libselinux.so|614870-614894
+/system/lib64/libselinux_ext.so|614895-614929
+/system/lib64/libsemimagecrop.so|614935-614952
+/system/lib64/libsensor.so|615027-615050
+/system/lib64/libserde.dylib.so|615228-615239
+/system/lib64/libservices.so|615240-615250
+/system/lib64/libshmemcompat.so|615526-615529
+/system/lib64/libshmemutil.so|615530-615533
+/system/lib64/libsimba.so|615534-615559
+/system/lib64/libsonic.so|620599-620604
+/system/lib64/libsoundextractor.so|620749-620765
+/system/lib64/libspeexresampler.so|620799-620803
+/system/lib64/libspeg.so|620804-620817
+/system/lib64/libsqlite3_expert.so|621131-621133
+/system/lib64/libsqlite3_udr.so|621134-621152
+/system/lib64/libsquashfs_utils.so|621153-621155
+/system/lib64/libsrib_CNNInterface.camera.samsung.so|621156-621317
+/system/lib64/libstagefright_foundation.so|622377-622430
+/system/lib64/libstdc++.so|622991-622994
+/system/lib64/libsume_core.so|623681-623705
+/system/lib64/libsuspend.so|623729-623733
+/system/lib64/libsveservice.so|623783-623791
+/system/lib64/libtensorflowLite.myfilter.camera.samsung.so|625176-625765
+/system/lib64/libtinyxml2.so|627487-627514
+/system/lib64/libtlc_payment_comm.so|627515-627517
+/system/lib64/libtui_service_jni.so|627539-627543
+/system/lib64/libucmscp.so|627557-627576
+/system/lib64/libuibc.so|627671-627676
+/system/lib64/libunionfs.so|627691-627721
+/system/lib64/libunwindstack.so|627722-627860
+/system/lib64/libupdate_engine_stable-V1-cpp.so|627861-627872
+/system/lib64/libusbhost.so|627873-627877
+/system/lib64/libSamsungAPVoiceEngine.so|551384-551488
+/system/lib64/libScalable_Encoder.so|551489-551513
+/system/lib64/libSmartScan.camera.samsung.so|552244-554212
+/system/lib64/libStride.camera.samsung.so|554228-554503
+/system/lib64/libStrideTensorflowLite.camera.samsung.so|554504-555021
+/system/lib64/libUltraWideDistortionCorrection.camera.samsung.so|555345-555404
+/system/lib64/lib_SoundAlive_SRC384_ver320.so|555589-555609
+/system/lib64/lib_SoundAlive_play_plus_ver400.so|555610-555857
+/system/lib64/lib_SoundBooster_ver1100.so|555858-555939
+/system/lib64/libaaudio.so|555975-555981
+/system/lib64/libactivitymanager_aidl.so|556130-556140
+/system/lib64/libamidi.so|556493-556502
+/system

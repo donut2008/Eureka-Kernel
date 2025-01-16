@@ -1,579 +1,270 @@
-/*
- *  KOBIL USB Smart Card Terminal Driver
- *
- *  Copyright (C) 2002  KOBIL Systems GmbH
- *  Author: Thomas Wahrenbruch
- *
- *  Contact: linuxusb@kobil.de
- *
- *  This program is largely derived from work by the linux-usb group
- *  and associated source files.  Please see the usb/serial files for
- *  individual credits and copyrights.
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  Thanks to Greg Kroah-Hartman (greg@kroah.com) for his help and
- *  patience.
- *
- * Supported readers: USB TWIN, KAAN Standard Plus and SecOVID Reader Plus
- * (Adapter K), B1 Professional and KAAN Professional (Adapter B)
- */
-
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/spinlock.h>
-#include <linux/uaccess.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-#include <linux/ioctl.h>
-#include "kobil_sct.h"
-
-#define DRIVER_AUTHOR "KOBIL Systems GmbH - http://www.kobil.com"
-#define DRIVER_DESC "KOBIL USB Smart Card Terminal Driver (experimental)"
-
-#define KOBIL_VENDOR_ID			0x0D46
-#define KOBIL_ADAPTER_B_PRODUCT_ID	0x2011
-#define KOBIL_ADAPTER_K_PRODUCT_ID	0x2012
-#define KOBIL_USBTWIN_PRODUCT_ID	0x0078
-#define KOBIL_KAAN_SIM_PRODUCT_ID       0x0081
-
-#define KOBIL_TIMEOUT		500
-#define KOBIL_BUF_LENGTH	300
-
-
-/* Function prototypes */
-static int kobil_attach(struct usb_serial *serial);
-static int kobil_port_probe(struct usb_serial_port *probe);
-static int kobil_port_remove(struct usb_serial_port *probe);
-static int  kobil_open(struct tty_struct *tty, struct usb_serial_port *port);
-static void kobil_close(struct usb_serial_port *port);
-static int  kobil_write(struct tty_struct *tty, struct usb_serial_port *port,
-			 const unsigned char *buf, int count);
-static int  kobil_write_room(struct tty_struct *tty);
-static int  kobil_ioctl(struct tty_struct *tty,
-			unsigned int cmd, unsigned long arg);
-static int  kobil_tiocmget(struct tty_struct *tty);
-static int  kobil_tiocmset(struct tty_struct *tty,
-			   unsigned int set, unsigned int clear);
-static void kobil_read_int_callback(struct urb *urb);
-static void kobil_write_int_callback(struct urb *urb);
-static void kobil_set_termios(struct tty_struct *tty,
-			struct usb_serial_port *port, struct ktermios *old);
-static void kobil_init_termios(struct tty_struct *tty);
-
-static const struct usb_device_id id_table[] = {
-	{ USB_DEVICE(KOBIL_VENDOR_ID, KOBIL_ADAPTER_B_PRODUCT_ID) },
-	{ USB_DEVICE(KOBIL_VENDOR_ID, KOBIL_ADAPTER_K_PRODUCT_ID) },
-	{ USB_DEVICE(KOBIL_VENDOR_ID, KOBIL_USBTWIN_PRODUCT_ID) },
-	{ USB_DEVICE(KOBIL_VENDOR_ID, KOBIL_KAAN_SIM_PRODUCT_ID) },
-	{ }			/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, id_table);
-
-static struct usb_serial_driver kobil_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"kobil",
-	},
-	.description =		"KOBIL USB smart card terminal",
-	.id_table =		id_table,
-	.num_ports =		1,
-	.attach =		kobil_attach,
-	.port_probe =		kobil_port_probe,
-	.port_remove =		kobil_port_remove,
-	.ioctl =		kobil_ioctl,
-	.set_termios =		kobil_set_termios,
-	.init_termios =		kobil_init_termios,
-	.tiocmget =		kobil_tiocmget,
-	.tiocmset =		kobil_tiocmset,
-	.open =			kobil_open,
-	.close =		kobil_close,
-	.write =		kobil_write,
-	.write_room =		kobil_write_room,
-	.read_int_callback =	kobil_read_int_callback,
-	.write_int_callback =	kobil_write_int_callback,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&kobil_device, NULL
-};
-
-struct kobil_private {
-	unsigned char buf[KOBIL_BUF_LENGTH]; /* buffer for the APDU to send */
-	int filled;  /* index of the last char in buf */
-	int cur_pos; /* index of the next char to send in buf */
-	__u16 device_type;
-};
-
-
-static int kobil_attach(struct usb_serial *serial)
-{
-	if (serial->num_interrupt_out < serial->num_ports) {
-		dev_err(&serial->interface->dev, "missing interrupt-out endpoint\n");
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-static int kobil_port_probe(struct usb_serial_port *port)
-{
-	struct usb_serial *serial = port->serial;
-	struct kobil_private *priv;
-
-	priv = kmalloc(sizeof(struct kobil_private), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	priv->filled = 0;
-	priv->cur_pos = 0;
-	priv->device_type = le16_to_cpu(serial->dev->descriptor.idProduct);
-
-	switch (priv->device_type) {
-	case KOBIL_ADAPTER_B_PRODUCT_ID:
-		dev_dbg(&serial->dev->dev, "KOBIL B1 PRO / KAAN PRO detected\n");
-		break;
-	case KOBIL_ADAPTER_K_PRODUCT_ID:
-		dev_dbg(&serial->dev->dev, "KOBIL KAAN Standard Plus / SecOVID Reader Plus detected\n");
-		break;
-	case KOBIL_USBTWIN_PRODUCT_ID:
-		dev_dbg(&serial->dev->dev, "KOBIL USBTWIN detected\n");
-		break;
-	case KOBIL_KAAN_SIM_PRODUCT_ID:
-		dev_dbg(&serial->dev->dev, "KOBIL KAAN SIM detected\n");
-		break;
-	}
-	usb_set_serial_port_data(port, priv);
-
-	return 0;
-}
-
-
-static int kobil_port_remove(struct usb_serial_port *port)
-{
-	struct kobil_private *priv;
-
-	priv = usb_get_serial_port_data(port);
-	kfree(priv);
-
-	return 0;
-}
-
-static void kobil_init_termios(struct tty_struct *tty)
-{
-	/* Default to echo off and other sane device settings */
-	tty->termios.c_lflag = 0;
-	tty->termios.c_iflag &= ~(ISIG | ICANON | ECHO | IEXTEN | XCASE);
-	tty->termios.c_iflag |= IGNBRK | IGNPAR | IXOFF;
-	/* do NOT translate CR to CR-NL (0x0A -> 0x0A 0x0D) */
-	tty->termios.c_oflag &= ~ONLCR;
-}
-
-static int kobil_open(struct tty_struct *tty, struct usb_serial_port *port)
-{
-	struct device *dev = &port->dev;
-	int result = 0;
-	struct kobil_private *priv;
-	unsigned char *transfer_buffer;
-	int transfer_buffer_length = 8;
-
-	priv = usb_get_serial_port_data(port);
-
-	/* allocate memory for transfer buffer */
-	transfer_buffer = kzalloc(transfer_buffer_length, GFP_KERNEL);
-	if (!transfer_buffer)
-		return -ENOMEM;
-
-	/* get hardware version */
-	result = usb_control_msg(port->serial->dev,
-			  usb_rcvctrlpipe(port->serial->dev, 0),
-			  SUSBCRequest_GetMisc,
-			  USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_IN,
-			  SUSBCR_MSC_GetHWVersion,
-			  0,
-			  transfer_buffer,
-			  transfer_buffer_length,
-			  KOBIL_TIMEOUT
-	);
-	dev_dbg(dev, "%s - Send get_HW_version URB returns: %i\n", __func__, result);
-	dev_dbg(dev, "Hardware version: %i.%i.%i\n", transfer_buffer[0],
-		transfer_buffer[1], transfer_buffer[2]);
-
-	/* get firmware version */
-	result = usb_control_msg(port->serial->dev,
-			  usb_rcvctrlpipe(port->serial->dev, 0),
-			  SUSBCRequest_GetMisc,
-			  USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_IN,
-			  SUSBCR_MSC_GetFWVersion,
-			  0,
-			  transfer_buffer,
-			  transfer_buffer_length,
-			  KOBIL_TIMEOUT
-	);
-	dev_dbg(dev, "%s - Send get_FW_version URB returns: %i\n", __func__, result);
-	dev_dbg(dev, "Firmware version: %i.%i.%i\n", transfer_buffer[0],
-		transfer_buffer[1], transfer_buffer[2]);
-
-	if (priv->device_type == KOBIL_ADAPTER_B_PRODUCT_ID ||
-			priv->device_type == KOBIL_ADAPTER_K_PRODUCT_ID) {
-		/* Setting Baudrate, Parity and Stopbits */
-		result = usb_control_msg(port->serial->dev,
-			  usb_sndctrlpipe(port->serial->dev, 0),
-			  SUSBCRequest_SetBaudRateParityAndStopBits,
-			  USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_OUT,
-			  SUSBCR_SBR_9600 | SUSBCR_SPASB_EvenParity |
-							SUSBCR_SPASB_1StopBit,
-			  0,
-			  NULL,
-			  0,
-			  KOBIL_TIMEOUT
-		);
-		dev_dbg(dev, "%s - Send set_baudrate URB returns: %i\n", __func__, result);
-
-		/* reset all queues */
-		result = usb_control_msg(port->serial->dev,
-			  usb_sndctrlpipe(port->serial->dev, 0),
-			  SUSBCRequest_Misc,
-			  USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_OUT,
-			  SUSBCR_MSC_ResetAllQueues,
-			  0,
-			  NULL,
-			  0,
-			  KOBIL_TIMEOUT
-		);
-		dev_dbg(dev, "%s - Send reset_all_queues URB returns: %i\n", __func__, result);
-	}
-	if (priv->device_type == KOBIL_USBTWIN_PRODUCT_ID ||
-	    priv->device_type == KOBIL_ADAPTER_B_PRODUCT_ID ||
-	    priv->device_type == KOBIL_KAAN_SIM_PRODUCT_ID) {
-		/* start reading (Adapter B 'cause PNP string) */
-		result = usb_submit_urb(port->interrupt_in_urb, GFP_KERNEL);
-		dev_dbg(dev, "%s - Send read URB returns: %i\n", __func__, result);
-	}
-
-	kfree(transfer_buffer);
-	return 0;
-}
-
-
-static void kobil_close(struct usb_serial_port *port)
-{
-	/* FIXME: Add rts/dtr methods */
-	usb_kill_urb(port->interrupt_out_urb);
-	usb_kill_urb(port->interrupt_in_urb);
-}
-
-
-static void kobil_read_int_callback(struct urb *urb)
-{
-	int result;
-	struct usb_serial_port *port = urb->context;
-	unsigned char *data = urb->transfer_buffer;
-	int status = urb->status;
-
-	if (status) {
-		dev_dbg(&port->dev, "%s - Read int status not zero: %d\n", __func__, status);
-		return;
-	}
-
-	if (urb->actual_length) {
-		usb_serial_debug_data(&port->dev, __func__, urb->actual_length,
-									data);
-		tty_insert_flip_string(&port->port, data, urb->actual_length);
-		tty_flip_buffer_push(&port->port);
-	}
-
-	result = usb_submit_urb(port->interrupt_in_urb, GFP_ATOMIC);
-	dev_dbg(&port->dev, "%s - Send read URB returns: %i\n", __func__, result);
-}
-
-
-static void kobil_write_int_callback(struct urb *urb)
-{
-}
-
-
-static int kobil_write(struct tty_struct *tty, struct usb_serial_port *port,
-			const unsigned char *buf, int count)
-{
-	int length = 0;
-	int result = 0;
-	int todo = 0;
-	struct kobil_private *priv;
-
-	if (count == 0) {
-		dev_dbg(&port->dev, "%s - write request of 0 bytes\n", __func__);
-		return 0;
-	}
-
-	priv = usb_get_serial_port_data(port);
-
-	if (count > (KOBIL_BUF_LENGTH - priv->filled)) {
-		dev_dbg(&port->dev, "%s - Error: write request bigger than buffer size\n", __func__);
-		return -ENOMEM;
-	}
-
-	/* Copy data to buffer */
-	memcpy(priv->buf + priv->filled, buf, count);
-	usb_serial_debug_data(&port->dev, __func__, count, priv->buf + priv->filled);
-	priv->filled = priv->filled + count;
-
-	/* only send complete block. TWIN, KAAN SIM and adapter K
-	   use the same protocol. */
-	if (((priv->device_type != KOBIL_ADAPTER_B_PRODUCT_ID) && (priv->filled > 2) && (priv->filled >= (priv->buf[1] + 3))) ||
-	     ((priv->device_type == KOBIL_ADAPTER_B_PRODUCT_ID) && (priv->filled > 3) && (priv->filled >= (priv->buf[2] + 4)))) {
-		/* stop reading (except TWIN and KAAN SIM) */
-		if ((priv->device_type == KOBIL_ADAPTER_B_PRODUCT_ID)
-			|| (priv->device_type == KOBIL_ADAPTER_K_PRODUCT_ID))
-			usb_kill_urb(port->interrupt_in_urb);
-
-		todo = priv->filled - priv->cur_pos;
-
-		while (todo > 0) {
-			/* max 8 byte in one urb (endpoint size) */
-			length = min(todo, port->interrupt_out_size);
-			/* copy data to transfer buffer */
-			memcpy(port->interrupt_out_buffer,
-					priv->buf + priv->cur_pos, length);
-			port->interrupt_out_urb->transfer_buffer_length = length;
-
-			priv->cur_pos = priv->cur_pos + length;
-			result = usb_submit_urb(port->interrupt_out_urb,
-					GFP_ATOMIC);
-			dev_dbg(&port->dev, "%s - Send write URB returns: %i\n", __func__, result);
-			todo = priv->filled - priv->cur_pos;
-
-			if (todo > 0)
-				msleep(24);
-		}
-
-		priv->filled = 0;
-		priv->cur_pos = 0;
-
-		/* start reading (except TWIN and KAAN SIM) */
-		if (priv->device_type == KOBIL_ADAPTER_B_PRODUCT_ID ||
-			priv->device_type == KOBIL_ADAPTER_K_PRODUCT_ID) {
-			result = usb_submit_urb(port->interrupt_in_urb,
-					GFP_ATOMIC);
-			dev_dbg(&port->dev, "%s - Send read URB returns: %i\n", __func__, result);
-		}
-	}
-	return count;
-}
-
-
-static int kobil_write_room(struct tty_struct *tty)
-{
-	/* FIXME */
-	return 8;
-}
-
-
-static int kobil_tiocmget(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct kobil_private *priv;
-	int result;
-	unsigned char *transfer_buffer;
-	int transfer_buffer_length = 8;
-
-	priv = usb_get_serial_port_data(port);
-	if (priv->device_type == KOBIL_USBTWIN_PRODUCT_ID
-			|| priv->device_type == KOBIL_KAAN_SIM_PRODUCT_ID) {
-		/* This device doesn't support ioctl calls */
-		return -EINVAL;
-	}
-
-	/* allocate memory for transfer buffer */
-	transfer_buffer = kzalloc(transfer_buffer_length, GFP_KERNEL);
-	if (!transfer_buffer)
-		return -ENOMEM;
-
-	result = usb_control_msg(port->serial->dev,
-			  usb_rcvctrlpipe(port->serial->dev, 0),
-			  SUSBCRequest_GetStatusLineState,
-			  USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_IN,
-			  0,
-			  0,
-			  transfer_buffer,
-			  transfer_buffer_length,
-			  KOBIL_TIMEOUT);
-
-	dev_dbg(&port->dev, "Send get_status_line_state URB returns: %i\n",
-			result);
-	if (result < 1) {
-		if (result >= 0)
-			result = -EIO;
-		goto out_free;
-	}
-
-	dev_dbg(&port->dev, "Statusline: %02x\n", transfer_buffer[0]);
-
-	result = 0;
-	if ((transfer_buffer[0] & SUSBCR_GSL_DSR) != 0)
-		result = TIOCM_DSR;
-out_free:
-	kfree(transfer_buffer);
-	return result;
-}
-
-static int kobil_tiocmset(struct tty_struct *tty,
-			   unsigned int set, unsigned int clear)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct device *dev = &port->dev;
-	struct kobil_private *priv;
-	int result;
-	int dtr = 0;
-	int rts = 0;
-
-	/* FIXME: locking ? */
-	priv = usb_get_serial_port_data(port);
-	if (priv->device_type == KOBIL_USBTWIN_PRODUCT_ID
-		|| priv->device_type == KOBIL_KAAN_SIM_PRODUCT_ID) {
-		/* This device doesn't support ioctl calls */
-		return -EINVAL;
-	}
-
-	if (set & TIOCM_RTS)
-		rts = 1;
-	if (set & TIOCM_DTR)
-		dtr = 1;
-	if (clear & TIOCM_RTS)
-		rts = 0;
-	if (clear & TIOCM_DTR)
-		dtr = 0;
-
-	if (priv->device_type == KOBIL_ADAPTER_B_PRODUCT_ID) {
-		if (dtr != 0)
-			dev_dbg(dev, "%s - Setting DTR\n", __func__);
-		else
-			dev_dbg(dev, "%s - Clearing DTR\n", __func__);
-		result = usb_control_msg(port->serial->dev,
-			  usb_sndctrlpipe(port->serial->dev, 0),
-			  SUSBCRequest_SetStatusLinesOrQueues,
-			  USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_OUT,
-			  ((dtr != 0) ? SUSBCR_SSL_SETDTR : SUSBCR_SSL_CLRDTR),
-			  0,
-			  NULL,
-			  0,
-			  KOBIL_TIMEOUT);
-	} else {
-		if (rts != 0)
-			dev_dbg(dev, "%s - Setting RTS\n", __func__);
-		else
-			dev_dbg(dev, "%s - Clearing RTS\n", __func__);
-		result = usb_control_msg(port->serial->dev,
-			usb_sndctrlpipe(port->serial->dev, 0),
-			SUSBCRequest_SetStatusLinesOrQueues,
-			USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_OUT,
-			((rts != 0) ? SUSBCR_SSL_SETRTS : SUSBCR_SSL_CLRRTS),
-			0,
-			NULL,
-			0,
-			KOBIL_TIMEOUT);
-	}
-	dev_dbg(dev, "%s - Send set_status_line URB returns: %i\n", __func__, result);
-	return (result < 0) ? result : 0;
-}
-
-static void kobil_set_termios(struct tty_struct *tty,
-			struct usb_serial_port *port, struct ktermios *old)
-{
-	struct kobil_private *priv;
-	int result;
-	unsigned short urb_val = 0;
-	int c_cflag = tty->termios.c_cflag;
-	speed_t speed;
-
-	priv = usb_get_serial_port_data(port);
-	if (priv->device_type == KOBIL_USBTWIN_PRODUCT_ID ||
-			priv->device_type == KOBIL_KAAN_SIM_PRODUCT_ID) {
-		/* This device doesn't support ioctl calls */
-		tty_termios_copy_hw(&tty->termios, old);
-		return;
-	}
-
-	speed = tty_get_baud_rate(tty);
-	switch (speed) {
-	case 1200:
-		urb_val = SUSBCR_SBR_1200;
-		break;
-	default:
-		speed = 9600;
-	case 9600:
-		urb_val = SUSBCR_SBR_9600;
-		break;
-	}
-	urb_val |= (c_cflag & CSTOPB) ? SUSBCR_SPASB_2StopBits :
-							SUSBCR_SPASB_1StopBit;
-	if (c_cflag & PARENB) {
-		if  (c_cflag & PARODD)
-			urb_val |= SUSBCR_SPASB_OddParity;
-		else
-			urb_val |= SUSBCR_SPASB_EvenParity;
-	} else
-		urb_val |= SUSBCR_SPASB_NoParity;
-	tty->termios.c_cflag &= ~CMSPAR;
-	tty_encode_baud_rate(tty, speed, speed);
-
-	result = usb_control_msg(port->serial->dev,
-		  usb_sndctrlpipe(port->serial->dev, 0),
-		  SUSBCRequest_SetBaudRateParityAndStopBits,
-		  USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_OUT,
-		  urb_val,
-		  0,
-		  NULL,
-		  0,
-		  KOBIL_TIMEOUT
-		);
-}
-
-static int kobil_ioctl(struct tty_struct *tty,
-					unsigned int cmd, unsigned long arg)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct kobil_private *priv = usb_get_serial_port_data(port);
-	int result;
-
-	if (priv->device_type == KOBIL_USBTWIN_PRODUCT_ID ||
-			priv->device_type == KOBIL_KAAN_SIM_PRODUCT_ID)
-		/* This device doesn't support ioctl calls */
-		return -ENOIOCTLCMD;
-
-	switch (cmd) {
-	case TCFLSH:
-		result = usb_control_msg(port->serial->dev,
-			  usb_sndctrlpipe(port->serial->dev, 0),
-			  SUSBCRequest_Misc,
-			  USB_TYPE_VENDOR | USB_RECIP_ENDPOINT | USB_DIR_OUT,
-			  SUSBCR_MSC_ResetAllQueues,
-			  0,
-			  NULL,
-			  0,
-			  KOBIL_TIMEOUT
-			);
-
-		dev_dbg(&port->dev,
-			"%s - Send reset_all_queues (FLUSH) URB returns: %i\n",
-			__func__, result);
-		return (result < 0) ? -EIO: 0;
-	default:
-		return -ENOIOCTLCMD;
-	}
-}
-
-module_usb_serial_driver(serial_drivers, id_table);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+0x400
+#define D2F5_DEVICE_CNTL2__LTR_EN__SHIFT 0xa
+#define D2F5_DEVICE_CNTL2__OBFF_EN_MASK 0x6000
+#define D2F5_DEVICE_CNTL2__OBFF_EN__SHIFT 0xd
+#define D2F5_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING_MASK 0x8000
+#define D2F5_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING__SHIFT 0xf
+#define D2F5_DEVICE_STATUS2__RESERVED_MASK 0xffff0000
+#define D2F5_DEVICE_STATUS2__RESERVED__SHIFT 0x10
+#define D2F5_LINK_CAP2__SUPPORTED_LINK_SPEED_MASK 0xfe
+#define D2F5_LINK_CAP2__SUPPORTED_LINK_SPEED__SHIFT 0x1
+#define D2F5_LINK_CAP2__CROSSLINK_SUPPORTED_MASK 0x100
+#define D2F5_LINK_CAP2__CROSSLINK_SUPPORTED__SHIFT 0x8
+#define D2F5_LINK_CAP2__RESERVED_MASK 0xfffffe00
+#define D2F5_LINK_CAP2__RESERVED__SHIFT 0x9
+#define D2F5_LINK_CNTL2__TARGET_LINK_SPEED_MASK 0xf
+#define D2F5_LINK_CNTL2__TARGET_LINK_SPEED__SHIFT 0x0
+#define D2F5_LINK_CNTL2__ENTER_COMPLIANCE_MASK 0x10
+#define D2F5_LINK_CNTL2__ENTER_COMPLIANCE__SHIFT 0x4
+#define D2F5_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE_MASK 0x20
+#define D2F5_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define D2F5_LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define D2F5_LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define D2F5_LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define D2F5_LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define D2F5_LINK_CNTL2__ENTER_MOD_COMPLIANCE_MASK 0x400
+#define D2F5_LINK_CNTL2__ENTER_MOD_COMPLIANCE__SHIFT 0xa
+#define D2F5_LINK_CNTL2__COMPLIANCE_SOS_MASK 0x800
+#define D2F5_LINK_CNTL2__COMPLIANCE_SOS__SHIFT 0xb
+#define D2F5_LINK_CNTL2__COMPLIANCE_DEEMPHASIS_MASK 0xf000
+#define D2F5_LINK_CNTL2__COMPLIANCE_DEEMPHASIS__SHIFT 0xc
+#define D2F5_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL_MASK 0x10000
+#define D2F5_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL__SHIFT 0x10
+#define D2F5_LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x20000
+#define D2F5_LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x11
+#define D2F5_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x40000
+#define D2F5_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x12
+#define D2F5_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS_MASK 0x80000
+#define D2F5_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS__SHIFT 0x13
+#define D2F5_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS_MASK 0x100000
+#define D2F5_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS__SHIFT 0x14
+#define D2F5_LINK_STATUS2__LINK_EQUALIZATION_REQUEST_MASK 0x200000
+#define D2F5_LINK_STATUS2__LINK_EQUALIZATION_REQUEST__SHIFT 0x15
+#define D2F5_SLOT_CAP2__RESERVED_MASK 0xffffffff
+#define D2F5_SLOT_CAP2__RESERVED__SHIFT 0x0
+#define D2F5_SLOT_CNTL2__RESERVED_MASK 0xffff
+#define D2F5_SLOT_CNTL2__RESERVED__SHIFT 0x0
+#define D2F5_SLOT_STATUS2__RESERVED_MASK 0xffff0000
+#define D2F5_SLOT_STATUS2__RESERVED__SHIFT 0x10
+#define D2F5_MSI_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F5_MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F5_MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F5_MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F5_MSI_MSG_CNTL__MSI_EN_MASK 0x10000
+#define D2F5_MSI_MSG_CNTL__MSI_EN__SHIFT 0x10
+#define D2F5_MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe0000
+#define D2F5_MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x11
+#define D2F5_MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x700000
+#define D2F5_MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x14
+#define D2F5_MSI_MSG_CNTL__MSI_64BIT_MASK 0x800000
+#define D2F5_MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x17
+#define D2F5_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP_MASK 0x1000000
+#define D2F5_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP__SHIFT 0x18
+#define D2F5_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define D2F5_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define D2F5_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define D2F5_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define D2F5_MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define D2F5_MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define D2F5_MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define D2F5_MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define D2F5_SSID_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F5_SSID_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F5_SSID_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F5_SSID_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F5_SSID_CAP__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define D2F5_SSID_CAP__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define D2F5_SSID_CAP__SUBSYSTEM_ID_MASK 0xffff0000
+#define D2F5_SSID_CAP__SUBSYSTEM_ID__SHIFT 0x10
+#define D2F5_MSI_MAP_CAP_LIST__CAP_ID_MASK 0xff
+#define D2F5_MSI_MAP_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F5_MSI_MAP_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D2F5_MSI_MAP_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D2F5_MSI_MAP_CAP__EN_MASK 0x10000
+#define D2F5_MSI_MAP_CAP__EN__SHIFT 0x10
+#define D2F5_MSI_MAP_CAP__FIXD_MASK 0x20000
+#define D2F5_MSI_MAP_CAP__FIXD__SHIFT 0x11
+#define D2F5_MSI_MAP_CAP__CAP_TYPE_MASK 0xf8000000
+#define D2F5_MSI_MAP_CAP__CAP_TYPE__SHIFT 0x1b
+#define D2F5_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO_MASK 0xfff00000
+#define D2F5_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO__SHIFT 0x14
+#define D2F5_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI_MASK 0xffffffff
+#define D2F5_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI__SHIFT 0x0
+#define D2F5_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F5_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F5_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F5_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F5_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F5_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F5_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID_MASK 0xffff
+#define D2F5_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID__SHIFT 0x0
+#define D2F5_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV_MASK 0xf0000
+#define D2F5_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV__SHIFT 0x10
+#define D2F5_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH_MASK 0xfff00000
+#define D2F5_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH__SHIFT 0x14
+#define D2F5_PCIE_VENDOR_SPECIFIC1__SCRATCH_MASK 0xffffffff
+#define D2F5_PCIE_VENDOR_SPECIFIC1__SCRATCH__SHIFT 0x0
+#define D2F5_PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define D2F5_PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define D2F5_PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F5_PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F5_PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F5_PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F5_PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F5_PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F5_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define D2F5_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define D2F5_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT_MASK 0x70
+#define D2F5_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT__SHIFT 0x4
+#define D2F5_PCIE_PORT_VC_CAP_REG1__REF_CLK_MASK 0x300
+#define D2F5_PCIE_PORT_VC_CAP_REG1__REF_CLK__SHIFT 0x8
+#define D2F5_PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE_MASK 0xc00
+#define D2F5_PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE__SHIFT 0xa
+#define D2F5_PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP_MASK 0xff
+#define D2F5_PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP__SHIFT 0x0
+#define D2F5_PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D2F5_PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D2F5_PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE_MASK 0x1
+#define D2F5_PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE__SHIFT 0x0
+#define D2F5_PCIE_PORT_VC_CNTL__VC_ARB_SELECT_MASK 0xe
+#define D2F5_PCIE_PORT_VC_CNTL__VC_ARB_SELECT__SHIFT 0x1
+#define D2F5_PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS_MASK 0x10000
+#define D2F5_PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS__SHIFT 0x10
+#define D2F5_PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define D2F5_PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define D2F5_PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define D2F5_PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D2F5_PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D2F5_PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D2F5_PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D2F5_PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define D2F5_PCIE_VC0_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define D2F5_PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x10000
+#define D2F5_PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x10
+#define D2F5_PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x20000
+#define D2F5_PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x11
+#define D2F5_PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define D2F5_PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define D2F5_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define D2F5_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D2F5_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D2F5_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D2F5_PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D2F5_PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define D2F5_PCIE_VC1_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define D2F5_PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x10000
+#define D2F5_PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x10
+#define D2F5_PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x20000
+#define D2F5_PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x11
+#define D2F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F5_PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F5_PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO_MASK 0xffffffff
+#define D2F5_PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO__SHIFT 0x0
+#define D2F5_PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI_MASK 0xffffffff
+#define D2F5_PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI__SHIFT 0x0
+#define D2F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F5_PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F5_PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS_MASK 0x10
+#define D2F5_PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS__SHIFT 0x4
+#define D2F5_PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS_MASK 0x20
+#define D2F5_PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS__SHIFT 0x5
+#define D2F5_PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS_MASK 0x1000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS__SHIFT 0xc
+#define D2F5_PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS_MASK 0x2000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS__SHIFT 0xd
+#define D2F5_PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS_MASK 0x4000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS__SHIFT 0xe
+#define D2F5_PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS_MASK 0x8000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS__SHIFT 0xf
+#define D2F5_PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS_MASK 0x10000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS__SHIFT 0x10
+#define D2F5_PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS_MASK 0x20000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS__SHIFT 0x11
+#define D2F5_PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS_MASK 0x40000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS__SHIFT 0x12
+#define D2F5_PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS_MASK 0x80000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS__SHIFT 0x13
+#define D2F5_PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS_MASK 0x100000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS__SHIFT 0x14
+#define D2F5_PCIE_UNCORR_ERR_STATUS__ACS_VIOLATION_STATUS_MASK 0x200000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__ACS_VIOLATION_STATUS__SHIFT 0x15
+#define D2F5_PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS_MASK 0x400000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS__SHIFT 0x16
+#define D2F5_PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS_MASK 0x800000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS__SHIFT 0x17
+#define D2F5_PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS_MASK 0x1000000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS__SHIFT 0x18
+#define D2F5_PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS_MASK 0x2000000
+#define D2F5_PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS__SHIFT 0x19
+#define D2F5_PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK_MASK 0x10
+#define D2F5_PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK__SHIFT 0x4
+#define D2F5_PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK_MASK 0x20
+#define D2F5_PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK__SHIFT 0x5
+#define D2F5_PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK_MASK 0x1000
+#define D2F5_PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK__SHIFT 0xc
+#define D2F5_PCIE_UNCORR_ERR_MASK__FC_ERR_MASK_MASK 0x2000
+#define D2F5_PCIE_UNCORR_ERR_MASK__FC_ERR_MASK__SHIFT 0xd
+#define D2F5_PCIE_UNCORR_ERR_MASK__CPL_TIMEOUT_MASK_MASK 0x4000
+#define D2F5_PCIE_UNCORR_ERR_MASK__CPL_TIMEOUT_MASK__SHIFT 0xe
+#define D2F5_PCIE_UNCORR_ERR_MASK__CPL_ABORT_ERR_MASK_MASK 0x8000
+#define D2F5_PCIE_UNCORR_ERR_MASK__CPL_ABORT_ERR_MASK__SHIFT 0xf
+#define D2F5_PCIE_UNCORR_ERR_MASK__UNEXP_CPL_MASK_MASK 0x10000
+#define D2F5_PCIE_UNCORR_ERR_MASK__UNEXP_CPL_MASK__SHIFT 0x10
+#define D2F5_PCIE_UNCORR_ERR_MASK__RCV_OVFL_MASK_MASK 0x20000
+#define D2F5_PCIE_UNCORR_ERR_MASK__RCV_OVFL_MASK__SHIFT 0x11
+#define D2F5_PCIE_UNCORR_ERR_MASK__MAL_TLP_MASK_MASK 0x40000
+#define D2F5_PCIE_UNCORR_ERR_MASK__MAL_TLP_MASK__SHIFT 0x12
+#define D2F5_PCIE_UNCORR_ERR_MASK__ECRC_ERR_MASK_MASK 0x80000
+#define D2F5_PCIE_UNCORR_ERR_MASK__ECRC_ERR_MASK__SHIFT 0x13
+#define D2F5_PCIE_UNCORR_ERR_MASK__UNSUPP_REQ_ERR_MASK_MASK 0x100000
+#define D2F5_PCIE_UNCORR_ERR_MASK__UNSUPP_REQ_ERR_MASK__SHIFT 0x14
+#define D2F5_PCIE_UNCORR_ERR_MASK__ACS_VIOLATION_MASK_MASK 0x200000
+#define D2F5_PCIE_UNCORR_ERR_MASK__ACS_VIOLATION_MASK__SHIFT 0x15
+#define D2F5_PCIE_UNCORR_ERR_MASK__UNCORR_INT_ERR_MASK_MASK 0x400000
+#define D2F5_PCIE_UNCORR_ERR_MASK__UNCORR_INT_ERR_MASK__SHIFT 0x16
+#define D2F5_PCIE_UNCORR_ERR_MASK__MC_BLOCKED_TLP_MASK_MASK 0x800000
+#define D2F5_PCIE_UNCORR_ERR_MASK__MC_BLOCKED_TLP_MASK__SHIFT 0x17
+#define D2F5_PCIE_UNCORR_ERR_MASK__ATOMICOP_EGRESS_BLOCKED_MASK_MASK 0x1000000
+#define D2F5_PCIE_UNCORR_ERR_MASK__ATOMICOP_EGRESS_BLOCKED_MASK__SHIFT 0x18
+#define D2F5_PCIE_UNCORR_ERR_MASK__TLP_PREFIX_BLOCKED_ERR_MASK_MASK 0x2000000
+#define D2F5_PCIE_UNCORR_ERR_MASK__TLP_PREFIX_BLOCKED_ERR_MASK__SHIFT 0x19
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__DLP_ERR_SEVERITY_MASK 0x10
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__DLP_ERR_SEVERITY__SHIFT 0x4
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__SURPDN_ERR_SEVERITY_MASK 0x20
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__SURPDN_ERR_SEVERITY__SHIFT 0x5
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__PSN_ERR_SEVERITY_MASK 0x1000
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__PSN_ERR_SEVERITY__SHIFT 0xc
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__FC_ERR_SEVERITY_MASK 0x2000
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__FC_ERR_SEVERITY__SHIFT 0xd
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__CPL_TIMEOUT_SEVERITY_MASK 0x4000
+#define D2F5_PCIE_UNCORR_ERR_SEVERITY__CP

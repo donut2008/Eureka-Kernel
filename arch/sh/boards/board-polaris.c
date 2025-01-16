@@ -1,155 +1,110 @@
-/*
- * June 2006 Steve Glendinning <steve.glendinning@shawell.net>
- *
- * Polaris-specific resource declaration
- *
+_query_srq(struct ib_srq *srq,
+		 struct ib_srq_attr *srq_attr);
+
+/**
+ * ib_destroy_srq - Destroys the specified SRQ.
+ * @srq: The SRQ to destroy.
  */
+int ib_destroy_srq(struct ib_srq *srq);
 
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/fixed.h>
-#include <linux/regulator/machine.h>
-#include <linux/smsc911x.h>
-#include <linux/io.h>
-#include <asm/irq.h>
-#include <asm/machvec.h>
-#include <asm/heartbeat.h>
-#include <cpu/gpio.h>
-#include <mach-se/mach/se.h>
-
-#define BCR2		(0xFFFFFF62)
-#define WCR2		(0xFFFFFF66)
-#define AREA5_WAIT_CTRL	(0x1C00)
-#define WAIT_STATES_10	(0x7)
-
-/* Dummy supplies, where voltage doesn't matter */
-static struct regulator_consumer_supply dummy_supplies[] = {
-	REGULATOR_SUPPLY("vddvario", "smsc911x.0"),
-	REGULATOR_SUPPLY("vdd33a", "smsc911x.0"),
-};
-
-static struct resource smsc911x_resources[] = {
-	[0] = {
-		.name		= "smsc911x-memory",
-		.start		= PA_EXT5,
-		.end		= PA_EXT5 + 0x1fff,
-		.flags		= IORESOURCE_MEM,
-	},
-	[1] = {
-		.name		= "smsc911x-irq",
-		.start		= IRQ0_IRQ,
-		.end		= IRQ0_IRQ,
-		.flags		= IORESOURCE_IRQ,
-	},
-};
-
-static struct smsc911x_platform_config smsc911x_config = {
-	.irq_polarity	= SMSC911X_IRQ_POLARITY_ACTIVE_LOW,
-	.irq_type	= SMSC911X_IRQ_TYPE_OPEN_DRAIN,
-	.flags		= SMSC911X_USE_32BIT,
-	.phy_interface	= PHY_INTERFACE_MODE_MII,
-};
-
-static struct platform_device smsc911x_device = {
-	.name		= "smsc911x",
-	.id		= 0,
-	.num_resources	= ARRAY_SIZE(smsc911x_resources),
-	.resource	= smsc911x_resources,
-	.dev = {
-		.platform_data = &smsc911x_config,
-	},
-};
-
-static unsigned char heartbeat_bit_pos[] = { 0, 1, 2, 3 };
-
-static struct heartbeat_data heartbeat_data = {
-	.bit_pos	= heartbeat_bit_pos,
-	.nr_bits	= ARRAY_SIZE(heartbeat_bit_pos),
-};
-
-static struct resource heartbeat_resource = {
-	.start	= PORT_PCDR,
-	.end	= PORT_PCDR,
-	.flags	= IORESOURCE_MEM | IORESOURCE_MEM_8BIT,
-};
-
-static struct platform_device heartbeat_device = {
-	.name		= "heartbeat",
-	.id		= -1,
-	.dev	= {
-		.platform_data	= &heartbeat_data,
-	},
-	.num_resources	= 1,
-	.resource	= &heartbeat_resource,
-};
-
-static struct platform_device *polaris_devices[] __initdata = {
-	&smsc911x_device,
-	&heartbeat_device,
-};
-
-static int __init polaris_initialise(void)
+/**
+ * ib_post_srq_recv - Posts a list of work requests to the specified SRQ.
+ * @srq: The SRQ to post the work request on.
+ * @recv_wr: A list of work requests to post on the receive queue.
+ * @bad_recv_wr: On an immediate failure, this parameter will reference
+ *   the work request that failed to be posted on the QP.
+ */
+static inline int ib_post_srq_recv(struct ib_srq *srq,
+				   struct ib_recv_wr *recv_wr,
+				   struct ib_recv_wr **bad_recv_wr)
 {
-	u16 wcr, bcr_mask;
-
-	printk(KERN_INFO "Configuring Polaris external bus\n");
-
-	regulator_register_fixed(0, dummy_supplies, ARRAY_SIZE(dummy_supplies));
-
-	/* Configure area 5 with 2 wait states */
-	wcr = __raw_readw(WCR2);
-	wcr &= (~AREA5_WAIT_CTRL);
-	wcr |= (WAIT_STATES_10 << 10);
-	__raw_writew(wcr, WCR2);
-
-	/* Configure area 5 for 32-bit access */
-	bcr_mask = __raw_readw(BCR2);
-	bcr_mask |= 1 << 10;
-	__raw_writew(bcr_mask, BCR2);
-
-	return platform_add_devices(polaris_devices,
-				    ARRAY_SIZE(polaris_devices));
-}
-arch_initcall(polaris_initialise);
-
-static struct ipr_data ipr_irq_table[] = {
-	/* External IRQs */
-	{ IRQ0_IRQ, 0,  0,  1, },	/* IRQ0 */
-	{ IRQ1_IRQ, 0,  4,  1, },	/* IRQ1 */
-};
-
-static unsigned long ipr_offsets[] = {
-	INTC_IPRC
-};
-
-static struct ipr_desc ipr_irq_desc = {
-	.ipr_offsets	= ipr_offsets,
-	.nr_offsets	= ARRAY_SIZE(ipr_offsets),
-
-	.ipr_data	= ipr_irq_table,
-	.nr_irqs	= ARRAY_SIZE(ipr_irq_table),
-	.chip = {
-		.name	= "sh7709-ext",
-	},
-};
-
-static void __init init_polaris_irq(void)
-{
-	/* Disable all interrupts */
-	__raw_writew(0, BCR_ILCRA);
-	__raw_writew(0, BCR_ILCRB);
-	__raw_writew(0, BCR_ILCRC);
-	__raw_writew(0, BCR_ILCRD);
-	__raw_writew(0, BCR_ILCRE);
-	__raw_writew(0, BCR_ILCRF);
-	__raw_writew(0, BCR_ILCRG);
-
-	register_ipr_controller(&ipr_irq_desc);
+	return srq->device->post_srq_recv(srq, recv_wr, bad_recv_wr);
 }
 
-static struct sh_machine_vector mv_polaris __initmv = {
-	.mv_name		= "Polaris",
-	.mv_init_irq		= init_polaris_irq,
-};
+/**
+ * ib_create_qp - Creates a QP associated with the specified protection
+ *   domain.
+ * @pd: The protection domain associated with the QP.
+ * @qp_init_attr: A list of initial attributes required to create the
+ *   QP.  If QP creation succeeds, then the attributes are updated to
+ *   the actual capabilities of the created QP.
+ */
+struct ib_qp *ib_create_qp(struct ib_pd *pd,
+			   struct ib_qp_init_attr *qp_init_attr);
+
+/**
+ * ib_modify_qp - Modifies the attributes for the specified QP and then
+ *   transitions the QP to the given state.
+ * @qp: The QP to modify.
+ * @qp_attr: On input, specifies the QP attributes to modify.  On output,
+ *   the current values of selected QP attributes are returned.
+ * @qp_attr_mask: A bit-mask used to specify which attributes of the QP
+ *   are being modified.
+ */
+int ib_modify_qp(struct ib_qp *qp,
+		 struct ib_qp_attr *qp_attr,
+		 int qp_attr_mask);
+
+/**
+ * ib_query_qp - Returns the attribute list and current values for the
+ *   specified QP.
+ * @qp: The QP to query.
+ * @qp_attr: The attributes of the specified QP.
+ * @qp_attr_mask: A bit-mask used to select specific attributes to query.
+ * @qp_init_attr: Additional attributes of the selected QP.
+ *
+ * The qp_attr_mask may be used to limit the query to gathering only the
+ * selected attributes.
+ */
+int ib_query_qp(struct ib_qp *qp,
+		struct ib_qp_attr *qp_attr,
+		int qp_attr_mask,
+		struct ib_qp_init_attr *qp_init_attr);
+
+/**
+ * ib_destroy_qp - Destroys the specified QP.
+ * @qp: The QP to destroy.
+ */
+int ib_destroy_qp(struct ib_qp *qp);
+
+/**
+ * ib_open_qp - Obtain a reference to an existing sharable QP.
+ * @xrcd - XRC domain
+ * @qp_open_attr: Attributes identifying the QP to open.
+ *
+ * Returns a reference to a sharable QP.
+ */
+struct ib_qp *ib_open_qp(struct ib_xrcd *xrcd,
+			 struct ib_qp_open_attr *qp_open_attr);
+
+/**
+ * ib_close_qp - Release an external reference to a QP.
+ * @qp: The QP handle to release
+ *
+ * The opened QP handle is released by the caller.  The underlying
+ * shared QP is not destroyed until all internal references are released.
+ */
+int ib_close_qp(struct ib_qp *qp);
+
+/**
+ * ib_post_send - Posts a list of work requests to the send queue of
+ *   the specified QP.
+ * @qp: The QP to post the work request on.
+ * @send_wr: A list of work requests to post on the send queue.
+ * @bad_send_wr: On an immediate failure, this parameter will reference
+ *   the work request that failed to be posted on the QP.
+ *
+ * While IBA Vol. 1 section 11.4.1.1 specifies that if an immediate
+ * error is returned, the QP state shall not be affected,
+ * ib_post_send() will return an immediate error after queueing any
+ * earlier work requests in the list.
+ */
+static inline int ib_post_send(struct ib_qp *qp,
+			       struct ib_send_wr *send_wr,
+			       struct ib_send_wr **bad_send_wr)
+{
+	return qp->device->post_send(qp, send_wr, bad_send_wr);
+}
+
+/**
+ * ib_post_recv - Pos

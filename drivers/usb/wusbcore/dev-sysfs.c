@@ -1,139 +1,67 @@
-/*
- * WUSB devices
- * sysfs bindings
- *
- * Copyright (C) 2007 Intel Corporation
- * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
- *
- * Get them out of the way...
- */
-
-#include <linux/jiffies.h>
-#include <linux/ctype.h>
-#include <linux/workqueue.h>
-#include "wusbhc.h"
-
-static ssize_t wusb_disconnect_store(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t size)
-{
-	struct usb_device *usb_dev;
-	struct wusbhc *wusbhc;
-	unsigned command;
-	u8 port_idx;
-
-	if (sscanf(buf, "%u", &command) != 1)
-		return -EINVAL;
-	if (command == 0)
-		return size;
-	usb_dev = to_usb_device(dev);
-	wusbhc = wusbhc_get_by_usb_dev(usb_dev);
-	if (wusbhc == NULL)
-		return -ENODEV;
-
-	mutex_lock(&wusbhc->mutex);
-	port_idx = wusb_port_no_to_idx(usb_dev->portnum);
-	__wusbhc_dev_disable(wusbhc, port_idx);
-	mutex_unlock(&wusbhc->mutex);
-	wusbhc_put(wusbhc);
-	return size;
-}
-static DEVICE_ATTR(wusb_disconnect, 0200, NULL, wusb_disconnect_store);
-
-static ssize_t wusb_cdid_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
-{
-	ssize_t result;
-	struct wusb_dev *wusb_dev;
-
-	wusb_dev = wusb_dev_get_by_usb_dev(to_usb_device(dev));
-	if (wusb_dev == NULL)
-		return -ENODEV;
-	result = ckhdid_printf(buf, PAGE_SIZE, &wusb_dev->cdid);
-	strcat(buf, "\n");
-	wusb_dev_put(wusb_dev);
-	return result + 1;
-}
-static DEVICE_ATTR(wusb_cdid, 0444, wusb_cdid_show, NULL);
-
-static ssize_t wusb_ck_store(struct device *dev,
-			     struct device_attribute *attr,
-			     const char *buf, size_t size)
-{
-	int result;
-	struct usb_device *usb_dev;
-	struct wusbhc *wusbhc;
-	struct wusb_ckhdid ck;
-
-	result = sscanf(buf,
-			"%02hhx %02hhx %02hhx %02hhx "
-			"%02hhx %02hhx %02hhx %02hhx "
-			"%02hhx %02hhx %02hhx %02hhx "
-			"%02hhx %02hhx %02hhx %02hhx\n",
-			&ck.data[0] , &ck.data[1],
-			&ck.data[2] , &ck.data[3],
-			&ck.data[4] , &ck.data[5],
-			&ck.data[6] , &ck.data[7],
-			&ck.data[8] , &ck.data[9],
-			&ck.data[10], &ck.data[11],
-			&ck.data[12], &ck.data[13],
-			&ck.data[14], &ck.data[15]);
-	if (result != 16)
-		return -EINVAL;
-
-	usb_dev = to_usb_device(dev);
-	wusbhc = wusbhc_get_by_usb_dev(usb_dev);
-	if (wusbhc == NULL)
-		return -ENODEV;
-	result = wusb_dev_4way_handshake(wusbhc, usb_dev->wusb_dev, &ck);
-	memzero_explicit(&ck, sizeof(ck));
-	wusbhc_put(wusbhc);
-	return result < 0 ? result : size;
-}
-static DEVICE_ATTR(wusb_ck, 0200, NULL, wusb_ck_store);
-
-static struct attribute *wusb_dev_attrs[] = {
-		&dev_attr_wusb_disconnect.attr,
-		&dev_attr_wusb_cdid.attr,
-		&dev_attr_wusb_ck.attr,
-		NULL,
-};
-
-static struct attribute_group wusb_dev_attr_group = {
-	.name = NULL,	/* we want them in the same directory */
-	.attrs = wusb_dev_attrs,
-};
-
-int wusb_dev_sysfs_add(struct wusbhc *wusbhc, struct usb_device *usb_dev,
-		       struct wusb_dev *wusb_dev)
-{
-	int result = sysfs_create_group(&usb_dev->dev.kobj,
-					&wusb_dev_attr_group);
-	struct device *dev = &usb_dev->dev;
-	if (result < 0)
-		dev_err(dev, "Cannot register WUSB-dev attributes: %d\n",
-			result);
-	return result;
-}
-
-void wusb_dev_sysfs_rm(struct wusb_dev *wusb_dev)
-{
-	struct usb_device *usb_dev = wusb_dev->usb_dev;
-	if (usb_dev)
-		sysfs_remove_group(&usb_dev->dev.kobj, &wusb_dev_attr_group);
-}
+DIS_MASK 0x20
+#define PCIEP_PORT_CNTL__PMI_BM_DIS__SHIFT 0x5
+#define PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE_MASK 0x40
+#define PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE__SHIFT 0x6
+#define PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S_MASK 0x7f00
+#define PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S__SHIFT 0x8
+#define PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE_MASK 0x30000
+#define PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE_MASK 0x1c0000
+#define PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE__SHIFT 0x12
+#define PCIE_TX_CNTL__TX_SNR_OVERRIDE_MASK 0xc00
+#define PCIE_TX_CNTL__TX_SNR_OVERRIDE__SHIFT 0xa
+#define PCIE_TX_CNTL__TX_RO_OVERRIDE_MASK 0x3000
+#define PCIE_TX_CNTL__TX_RO_OVERRIDE__SHIFT 0xc
+#define PCIE_TX_CNTL__TX_PACK_PACKET_DIS_MASK 0x4000
+#define PCIE_TX_CNTL__TX_PACK_PACKET_DIS__SHIFT 0xe
+#define PCIE_TX_CNTL__TX_FLUSH_TLP_DIS_MASK 0x8000
+#define PCIE_TX_CNTL__TX_FLUSH_TLP_DIS__SHIFT 0xf
+#define PCIE_TX_CNTL__TX_CPL_PASS_P_MASK 0x100000
+#define PCIE_TX_CNTL__TX_CPL_PASS_P__SHIFT 0x14
+#define PCIE_TX_CNTL__TX_NP_PASS_P_MASK 0x200000
+#define PCIE_TX_CNTL__TX_NP_PASS_P__SHIFT 0x15
+#define PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS_MASK 0x400000
+#define PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS__SHIFT 0x16
+#define PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS_MASK 0x800000
+#define PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS__SHIFT 0x17
+#define PCIE_TX_CNTL__TX_F0_TPH_DIS_MASK 0x1000000
+#define PCIE_TX_CNTL__TX_F0_TPH_DIS__SHIFT 0x18
+#define PCIE_TX_CNTL__TX_F1_TPH_DIS_MASK 0x2000000
+#define PCIE_TX_CNTL__TX_F1_TPH_DIS__SHIFT 0x19
+#define PCIE_TX_CNTL__TX_F2_TPH_DIS_MASK 0x4000000
+#define PCIE_TX_CNTL__TX_F2_TPH_DIS__SHIFT 0x1a
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION_MASK 0x7
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION__SHIFT 0x0
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE_MASK 0xf8
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE__SHIFT 0x3
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS_MASK 0xff00
+#define PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS__SHIFT 0x8
+#define PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA_MASK 0xffffff
+#define PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA__SHIFT 0x0
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_MASK 0x3f000000
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP__SHIFT 0x18
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN_MASK 0x40000000
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN__SHIFT 0x1e
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN_MASK 0x80000000
+#define PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN__SHIFT 0x1f
+#define PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ_MASK 0xfff
+#define PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ__SHIFT 0x0
+#define PCIE_TX_SEQ__TX_ACKD_SEQ_MASK 0xfff0000
+#define PCIE_TX_SEQ__TX_ACKD_SEQ__SHIFT 0x10
+#define PCIE_TX_REPLAY__TX_REPLAY_NUM_MASK 0x7
+#define PCIE_TX_REPLAY__TX_REPLAY_NUM__SHIFT 0x0
+#define PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE_MASK 0x8000
+#define PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE__SHIFT 0xf
+#define PCIE_TX_REPLAY__TX_REPLAY_TIMER_MASK 0xffff0000
+#define PCIE_TX_REPLAY__TX_REPLAY_TIMER__SHIFT 0x10
+#define PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_MASK 0xfff
+#define PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT__SHIFT 0x0
+#define PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE_MASK 0x1000
+#define PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE__SHIFT 0xc
+#define PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD_MASK 0xfff
+#define PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD__SHIFT 0x0
+#define PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH_MASK 0xff0000
+#define PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH__SHIFT 0x10
+#define PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD_MASK 0xfff
+#define PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD__SHIFT 0x0
+#define PCIE_TX_CREDITS

@@ -1,11 +1,1 @@
-#include <linux/types.h>
-#include <linux/errno.h>
-#include <asm/uaccess.h>
-
-int frsqrtes(void *frD, void *frB)
-{
-#ifdef DEBUG
-	printk("%s: %p %p\n", __func__, frD, frB);
-#endif
-	return 0;
-}
+Á„‚3)Œst‘Ø‰: pHrïÌúD~\“šºp%®h¹|C:jWÚù97û{ÇÀ%9~™ŒzˆuŞ	ÊØÈôğ¼Æ®­dmxÍ½®~87éÄ 1Ó/ÍòPqøgëÊª¿Îòv£FŠD’õcÃèß®/¯´Jòp4‹I¿vZ ›’fç¢2Ôõ»I|Ô#)p®“K`#nØq‡¬a»\³‚˜¶ï.—Ù s<“9KØ

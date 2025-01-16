@@ -1,25 +1,16 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#ifndef __VMCI_EVENT_H__
-#define __VMCI_EVENT_H__
-
-#include <linux/vmw_vmci_api.h>
-
-int vmci_event_init(void);
-void vmci_event_exit(void);
-int vmci_event_dispatch(struct vmci_datagram *msg);
-
-#endif /*__VMCI_EVENT_H__ */
+ine PCIE_CNTL2__SLV_MEM_LS_EN__SHIFT 0x10
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN_MASK 0x20000
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN__SHIFT 0x11
+#define PCIE_CNTL2__MST_MEM_LS_EN_MASK 0x40000
+#define PCIE_CNTL2__MST_MEM_LS_EN__SHIFT 0x12
+#define PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK 0x80000
+#define PCIE_CNTL2__REPLAY_MEM_LS_EN__SHIFT 0x13
+#define PCIE_CNTL2__SLV_MEM_SD_EN_MASK 0x100000
+#define PCIE_CNTL2__SLV_MEM_SD_EN__SHIFT 0x14
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN_MASK 0x200000
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN__SHIFT 0x15
+#define PCIE_CNTL2__MST_MEM_SD_EN_MASK 0x400000
+#define PCIE_CNTL2__MST_MEM_SD_EN__SHIFT 0x16
+#define PCIE_CNTL2__REPLAY_MEM_SD_EN_MASK 0x800000
+#define PCIE_CNTL2__REPLAY_MEM_SD_EN__SHIFT 0x17
+#define PCIE_CNTL

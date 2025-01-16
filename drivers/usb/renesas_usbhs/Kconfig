@@ -1,17 +1,9 @@
-#
-# Renesas USBHS Controller Drivers
-#
-
-config USB_RENESAS_USBHS
-	tristate 'Renesas USBHS controller'
-	depends on USB_GADGET
-	depends on ARCH_SHMOBILE || SUPERH || COMPILE_TEST
-	depends on EXTCON || !EXTCON # if EXTCON=m, USBHS cannot be built-in
-	default n
-	help
-	  Renesas USBHS is a discrete USB host and peripheral controller chip
-	  that supports both full and high speed USB 2.0 data transfers.
-	  It has nine or more configurable endpoints, and endpoint zero.
-
-	  Say "y" to link the driver statically, or "m" to build a
-	  dynamically linked module called "renesas_usbhs"
+GRBM_1_FREQ_THROTTLING_VOTE_EN_MASK 0x8000
+#define CG_FREQ_TRAN_VOTING_3__GRBM_1_FREQ_THROTTLING_VOTE_EN__SHIFT 0xf
+#define CG_FREQ_TRAN_VOTING_3__GRBM_2_FREQ_THROTTLING_VOTE_EN_MASK 0x10000
+#define CG_FREQ_TRAN_VOTING_3__GRBM_2_FREQ_THROTTLING_VOTE_EN__SHIFT 0x10
+#define CG_FREQ_TRAN_VOTING_3__GRBM_3_FREQ_THROTTLING_VOTE_EN_MASK 0x20000
+#define CG_FREQ_TRAN_VOTING_3__GRBM_3_FREQ_THROTTLING_VOTE_EN__SHIFT 0x11
+#define CG_FREQ_TRAN_VOTING_3__GRBM_4_FREQ_THROTTLING_VOTE_EN_MASK 0x40000
+#define CG_FREQ_TRAN_VOTING_3__GRBM_4_FREQ_THROTTLING_VOTE_EN__SHIFT 0x12
+#define CG_FREQ_T

@@ -1,42 +1,53 @@
-/*
- * VTI CMA3000_D0x Accelerometer driver
+etting device queue depth
+ * @sdev: scsi device struct
+ * @qdepth: requested queue depth
  *
- * Copyright (C) 2010 Texas Instruments
- * Author: Hemanth V <hemanthv@ti.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program.  If not, see <http://www.gnu.org/licenses/>.
+ * Returns queue depth.
  */
+static int
+srp_change_queue_depth(struct scsi_device *sdev, int qdepth)
+{
+	if (!sdev->tagged_supported)
+		qdepth = 1;
+	return scsi_change_queue_depth(sdev, qdepth);
+}
 
-#ifndef _INPUT_CMA3000_H
-#define _INPUT_CMA3000_H
+static int srp_send_tsk_mgmt(struct srp_rdma_ch *ch, u64 req_tag, u64 lun,
+			     u8 func, u8 *status)
+{
+	struct srp_target_port *target = ch->target;
+	struct srp_rport *rport = target->rport;
+	struct ib_device *dev = target->srp_host->srp_dev->dev;
+	struct srp_iu *iu;
+	struct srp_tsk_mgmt *tsk_mgmt;
+	int res;
 
-#include <linux/types.h>
-#include <linux/input.h>
+	if (!ch->connected || target->qp_in_error)
+		return -1;
 
-struct device;
-struct cma3000_accl_data;
+	/*
+	 * Lock the rport mutex to avoid that srp_create_ch_ib() is
+	 * invoked while a task management function is being sent.
+	 */
+	mutex_lock(&rport->mutex);
+	spin_lock_irq(&ch->lock);
+	iu = __srp_get_tx_iu(ch, SRP_IU_TSK_MGMT);
+	spin_unlock_irq(&ch->lock);
 
-struct cma3000_bus_ops {
-	u16 bustype;
-	u8 ctrl_mod;
-	int (*read)(struct device *, u8, char *);
-	int (*write)(struct device *, u8, u8, char *);
-};
+	if (!iu) {
+		mutex_unlock(&rport->mutex);
 
-struct cma3000_accl_data *cma3000_init(struct device *dev, int irq,
-					const struct cma3000_bus_ops *bops);
-void cma3000_exit(struct cma3000_accl_data *);
-void cma3000_suspend(struct cma3000_accl_data *);
-void cma3000_resume(struct cma3000_accl_data *);
+		return -1;
+	}
 
-#endif
+	ib_dma_sync_single_for_cpu(dev, iu->dma, sizeof *tsk_mgmt,
+				   DMA_TO_DEVICE);
+	tsk_mgmt = iu->buf;
+	memset(tsk_mgmt, 0, sizeof *tsk_mgmt);
+
+	tsk_mgmt->opcode 	= SRP_TSK_MGMT;
+	int_to_scsilun(lun, &tsk_mgmt->lun);
+	tsk_mgmt->tsk_mgmt_func = func;
+	tsk_mgmt->task_tag	= req_tag;
+
+	spin_l

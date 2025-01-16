@@ -1,378 +1,247 @@
-/*
- * Renesas Technology Corp. R0P7785LC0011RL Support.
+contained within is corrupted. */
+#define V4L2_BUF_FLAG_ERROR			0x00000040
+/* timecode field is valid */
+#define V4L2_BUF_FLAG_TIMECODE			0x00000100
+/* Buffer is prepared for queuing */
+#define V4L2_BUF_FLAG_PREPARED			0x00000400
+/* Cache handling flags */
+#define V4L2_BUF_FLAG_NO_CACHE_INVALIDATE	0x00000800
+#define V4L2_BUF_FLAG_NO_CACHE_CLEAN		0x00001000
+/* Timestamp type */
+#define V4L2_BUF_FLAG_TIMESTAMP_MASK		0x0000e000
+#define V4L2_BUF_FLAG_TIMESTAMP_UNKNOWN		0x00000000
+#define V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC	0x00002000
+#define V4L2_BUF_FLAG_TIMESTAMP_COPY		0x00004000
+/* Expects and returns an Android sync fence */
+#define V4L2_BUF_FLAG_USE_SYNC         0x00008000
+/* Timestamp sources. */
+#define V4L2_BUF_FLAG_TSTAMP_SRC_MASK		0x00070000
+#define V4L2_BUF_FLAG_TSTAMP_SRC_EOF		0x00000000
+#define V4L2_BUF_FLAG_TSTAMP_SRC_SOE		0x00010000
+/* mem2mem encoder/decoder */
+#define V4L2_BUF_FLAG_LAST			0x00100000
+
+/**
+ * struct v4l2_exportbuffer - export of video buffer as DMABUF file descriptor
  *
- * Copyright (C) 2008  Yoshihiro Shimoda
- * Copyright (C) 2009  Paul Mundt
+ * @index:	id number of the buffer
+ * @type:	enum v4l2_buf_type; buffer type (type == *_MPLANE for
+ *		multiplanar buffers);
+ * @plane:	index of the plane to be exported, 0 for single plane queues
+ * @flags:	flags for newly created file, currently only O_CLOEXEC is
+ *		supported, refer to manual of open syscall for more details
+ * @fd:		file descriptor associated with DMABUF (set by driver)
  *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ * Contains data used for exporting a video buffer as DMABUF file descriptor.
+ * The buffer is identified by a 'cookie' returned by VIDIOC_QUERYBUF
+ * (identical to the cookie used to mmap() the buffer to userspace). All
+ * reserved fields must be set to zero. The field reserved0 is expected to
+ * become a structure 'type' allowing an alternative layout of the structure
+ * content. Therefore this field should not be used for any other extensions.
  */
-#include <linux/init.h>
-#include <linux/platform_device.h>
-#include <linux/sm501.h>
-#include <linux/sm501-regs.h>
-#include <linux/fb.h>
-#include <linux/mtd/physmap.h>
-#include <linux/delay.h>
-#include <linux/interrupt.h>
-#include <linux/i2c.h>
-#include <linux/i2c-pca-platform.h>
-#include <linux/i2c-algo-pca.h>
-#include <linux/usb/r8a66597.h>
-#include <linux/sh_intc.h>
-#include <linux/irq.h>
-#include <linux/io.h>
-#include <linux/clk.h>
-#include <linux/errno.h>
-#include <mach/sh7785lcr.h>
-#include <cpu/sh7785.h>
-#include <asm/heartbeat.h>
-#include <asm/clock.h>
-#include <asm/bl_bit.h>
+struct v4l2_exportbuffer {
+	__u32		type; /* enum v4l2_buf_type */
+	__u32		index;
+	__u32		plane;
+	__u32		flags;
+	__s32		fd;
+	__u32		reserved[11];
+};
 
 /*
- * NOTE: This board has 2 physical memory maps.
- *	 Please look at include/asm-sh/sh7785lcr.h or hardware manual.
+ *	O V E R L A Y   P R E V I E W
  */
-static struct resource heartbeat_resource = {
-	.start	= PLD_LEDCR,
-	.end	= PLD_LEDCR,
-	.flags	= IORESOURCE_MEM | IORESOURCE_MEM_8BIT,
+struct v4l2_framebuffer {
+	__u32			capability;
+	__u32			flags;
+/* FIXME: in theory we should pass something like PCI device + memory
+ * region + offset instead of some physical address */
+	void                    *base;
+	struct {
+		__u32		width;
+		__u32		height;
+		__u32		pixelformat;
+		__u32		field;		/* enum v4l2_field */
+		__u32		bytesperline;	/* for padding, zero if unused */
+		__u32		sizeimage;
+		__u32		colorspace;	/* enum v4l2_colorspace */
+		__u32		priv;		/* reserved field, set to 0 */
+	} fmt;
+};
+/*  Flags for the 'capability' field. Read only */
+#define V4L2_FBUF_CAP_EXTERNOVERLAY	0x0001
+#define V4L2_FBUF_CAP_CHROMAKEY		0x0002
+#define V4L2_FBUF_CAP_LIST_CLIPPING     0x0004
+#define V4L2_FBUF_CAP_BITMAP_CLIPPING	0x0008
+#define V4L2_FBUF_CAP_LOCAL_ALPHA	0x0010
+#define V4L2_FBUF_CAP_GLOBAL_ALPHA	0x0020
+#define V4L2_FBUF_CAP_LOCAL_INV_ALPHA	0x0040
+#define V4L2_FBUF_CAP_SRC_CHROMAKEY	0x0080
+/*  Flags for the 'flags' field. */
+#define V4L2_FBUF_FLAG_PRIMARY		0x0001
+#define V4L2_FBUF_FLAG_OVERLAY		0x0002
+#define V4L2_FBUF_FLAG_CHROMAKEY	0x0004
+#define V4L2_FBUF_FLAG_LOCAL_ALPHA	0x0008
+#define V4L2_FBUF_FLAG_GLOBAL_ALPHA	0x0010
+#define V4L2_FBUF_FLAG_LOCAL_INV_ALPHA	0x0020
+#define V4L2_FBUF_FLAG_SRC_CHROMAKEY	0x0040
+
+struct v4l2_clip {
+	struct v4l2_rect        c;
+	struct v4l2_clip	__user *next;
 };
 
-static struct platform_device heartbeat_device = {
-	.name		= "heartbeat",
-	.id		= -1,
-	.num_resources	= 1,
-	.resource	= &heartbeat_resource,
+struct v4l2_window {
+	struct v4l2_rect        w;
+	__u32			field;	 /* enum v4l2_field */
+	__u32			chromakey;
+	struct v4l2_clip	__user *clips;
+	__u32			clipcount;
+	void			__user *bitmap;
+	__u8                    global_alpha;
 };
-
-static struct mtd_partition nor_flash_partitions[] = {
-	{
-		.name		= "loader",
-		.offset		= 0x00000000,
-		.size		= 512 * 1024,
-	},
-	{
-		.name		= "bootenv",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= 512 * 1024,
-	},
-	{
-		.name		= "kernel",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= 4 * 1024 * 1024,
-	},
-	{
-		.name		= "data",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= MTDPART_SIZ_FULL,
-	},
-};
-
-static struct physmap_flash_data nor_flash_data = {
-	.width		= 4,
-	.parts		= nor_flash_partitions,
-	.nr_parts	= ARRAY_SIZE(nor_flash_partitions),
-};
-
-static struct resource nor_flash_resources[] = {
-	[0]	= {
-		.start	= NOR_FLASH_ADDR,
-		.end	= NOR_FLASH_ADDR + NOR_FLASH_SIZE - 1,
-		.flags	= IORESOURCE_MEM,
-	}
-};
-
-static struct platform_device nor_flash_device = {
-	.name		= "physmap-flash",
-	.dev		= {
-		.platform_data	= &nor_flash_data,
-	},
-	.num_resources	= ARRAY_SIZE(nor_flash_resources),
-	.resource	= nor_flash_resources,
-};
-
-static struct r8a66597_platdata r8a66597_data = {
-	.xtal = R8A66597_PLATDATA_XTAL_12MHZ,
-	.vif = 1,
-};
-
-static struct resource r8a66597_usb_host_resources[] = {
-	[0] = {
-		.start	= R8A66597_ADDR,
-		.end	= R8A66597_ADDR + R8A66597_SIZE - 1,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= evt2irq(0x240),
-		.end	= evt2irq(0x240),
-		.flags	= IORESOURCE_IRQ | IRQF_TRIGGER_LOW,
-	},
-};
-
-static struct platform_device r8a66597_usb_host_device = {
-	.name		= "r8a66597_hcd",
-	.id		= -1,
-	.dev = {
-		.dma_mask		= NULL,
-		.coherent_dma_mask	= 0xffffffff,
-		.platform_data		= &r8a66597_data,
-	},
-	.num_resources	= ARRAY_SIZE(r8a66597_usb_host_resources),
-	.resource	= r8a66597_usb_host_resources,
-};
-
-static struct resource sm501_resources[] = {
-	[0]	= {
-		.start	= SM107_MEM_ADDR,
-		.end	= SM107_MEM_ADDR + SM107_MEM_SIZE - 1,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1]	= {
-		.start	= SM107_REG_ADDR,
-		.end	= SM107_REG_ADDR + SM107_REG_SIZE - 1,
-		.flags	= IORESOURCE_MEM,
-	},
-	[2]	= {
-		.start	= evt2irq(0x340),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct fb_videomode sm501_default_mode_crt = {
-	.pixclock	= 35714,	/* 28MHz */
-	.xres		= 640,
-	.yres		= 480,
-	.left_margin	= 105,
-	.right_margin	= 16,
-	.upper_margin	= 33,
-	.lower_margin	= 10,
-	.hsync_len	= 39,
-	.vsync_len	= 2,
-	.sync = FB_SYNC_HOR_HIGH_ACT | FB_SYNC_VERT_HIGH_ACT,
-};
-
-static struct fb_videomode sm501_default_mode_pnl = {
-	.pixclock	= 40000,	/* 25MHz */
-	.xres		= 640,
-	.yres		= 480,
-	.left_margin	= 2,
-	.right_margin	= 16,
-	.upper_margin	= 33,
-	.lower_margin	= 10,
-	.hsync_len	= 39,
-	.vsync_len	= 2,
-	.sync		= 0,
-};
-
-static struct sm501_platdata_fbsub sm501_pdata_fbsub_pnl = {
-	.def_bpp	= 16,
-	.def_mode	= &sm501_default_mode_pnl,
-	.flags		= SM501FB_FLAG_USE_INIT_MODE |
-			  SM501FB_FLAG_USE_HWCURSOR |
-			  SM501FB_FLAG_USE_HWACCEL |
-			  SM501FB_FLAG_DISABLE_AT_EXIT |
-			  SM501FB_FLAG_PANEL_NO_VBIASEN,
-};
-
-static struct sm501_platdata_fbsub sm501_pdata_fbsub_crt = {
-	.def_bpp	= 16,
-	.def_mode	= &sm501_default_mode_crt,
-	.flags		= SM501FB_FLAG_USE_INIT_MODE |
-			  SM501FB_FLAG_USE_HWCURSOR |
-			  SM501FB_FLAG_USE_HWACCEL |
-			  SM501FB_FLAG_DISABLE_AT_EXIT,
-};
-
-static struct sm501_platdata_fb sm501_fb_pdata = {
-	.fb_route	= SM501_FB_OWN,
-	.fb_crt		= &sm501_pdata_fbsub_crt,
-	.fb_pnl		= &sm501_pdata_fbsub_pnl,
-};
-
-static struct sm501_initdata sm501_initdata = {
-	.gpio_high	= {
-		.set	= 0x00001fe0,
-		.mask	= 0x0,
-	},
-	.devices	= 0,
-	.mclk		= 84 * 1000000,
-	.m1xclk		= 112 * 1000000,
-};
-
-static struct sm501_platdata sm501_platform_data = {
-	.init		= &sm501_initdata,
-	.fb		= &sm501_fb_pdata,
-};
-
-static struct platform_device sm501_device = {
-	.name		= "sm501",
-	.id		= -1,
-	.dev		= {
-		.platform_data	= &sm501_platform_data,
-	},
-	.num_resources	= ARRAY_SIZE(sm501_resources),
-	.resource	= sm501_resources,
-};
-
-static struct resource i2c_proto_resources[] = {
-	[0] = {
-		.start	= PCA9564_PROTO_32BIT_ADDR,
-		.end	= PCA9564_PROTO_32BIT_ADDR + PCA9564_SIZE - 1,
-		.flags	= IORESOURCE_MEM | IORESOURCE_MEM_8BIT,
-	},
-	[1] = {
-		.start	= evt2irq(0x380),
-		.end	= evt2irq(0x380),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct resource i2c_resources[] = {
-	[0] = {
-		.start	= PCA9564_ADDR,
-		.end	= PCA9564_ADDR + PCA9564_SIZE - 1,
-		.flags	= IORESOURCE_MEM | IORESOURCE_MEM_8BIT,
-	},
-	[1] = {
-		.start	= evt2irq(0x380),
-		.end	= evt2irq(0x380),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct i2c_pca9564_pf_platform_data i2c_platform_data = {
-	.gpio			= 0,
-	.i2c_clock_speed	= I2C_PCA_CON_330kHz,
-	.timeout		= HZ,
-};
-
-static struct platform_device i2c_device = {
-	.name		= "i2c-pca-platform",
-	.id		= -1,
-	.dev		= {
-		.platform_data	= &i2c_platform_data,
-	},
-	.num_resources	= ARRAY_SIZE(i2c_resources),
-	.resource	= i2c_resources,
-};
-
-static struct platform_device *sh7785lcr_devices[] __initdata = {
-	&heartbeat_device,
-	&nor_flash_device,
-	&r8a66597_usb_host_device,
-	&sm501_device,
-	&i2c_device,
-};
-
-static struct i2c_board_info __initdata sh7785lcr_i2c_devices[] = {
-	{
-		I2C_BOARD_INFO("r2025sd", 0x32),
-	},
-};
-
-static int __init sh7785lcr_devices_setup(void)
-{
-	i2c_register_board_info(0, sh7785lcr_i2c_devices,
-				ARRAY_SIZE(sh7785lcr_i2c_devices));
-
-	if (mach_is_sh7785lcr_pt()) {
-		i2c_device.resource = i2c_proto_resources;
-		i2c_device.num_resources = ARRAY_SIZE(i2c_proto_resources);
-	}
-
-	return platform_add_devices(sh7785lcr_devices,
-				    ARRAY_SIZE(sh7785lcr_devices));
-}
-device_initcall(sh7785lcr_devices_setup);
-
-/* Initialize IRQ setting */
-void __init init_sh7785lcr_IRQ(void)
-{
-	plat_irq_setup_pins(IRQ_MODE_IRQ7654);
-	plat_irq_setup_pins(IRQ_MODE_IRQ3210);
-}
-
-static int sh7785lcr_clk_init(void)
-{
-	struct clk *clk;
-	int ret;
-
-	clk = clk_get(NULL, "extal");
-	if (IS_ERR(clk))
-		return PTR_ERR(clk);
-	ret = clk_set_rate(clk, 33333333);
-	clk_put(clk);
-
-	return ret;
-}
-
-static void sh7785lcr_power_off(void)
-{
-	unsigned char *p;
-
-	p = ioremap(PLD_POFCR, PLD_POFCR + 1);
-	if (!p) {
-		printk(KERN_ERR "%s: ioremap error.\n", __func__);
-		return;
-	}
-	*p = 0x01;
-	iounmap(p);
-	set_bl_bit();
-	while (1)
-		cpu_relax();
-}
-
-/* Initialize the board */
-static void __init sh7785lcr_setup(char **cmdline_p)
-{
-	void __iomem *sm501_reg;
-
-	printk(KERN_INFO "Renesas Technology Corp. R0P7785LC0011RL support.\n");
-
-	pm_power_off = sh7785lcr_power_off;
-
-	/* sm501 DRAM configuration */
-	sm501_reg = ioremap_nocache(SM107_REG_ADDR, SM501_DRAM_CONTROL);
-	if (!sm501_reg) {
-		printk(KERN_ERR "%s: ioremap error.\n", __func__);
-		return;
-	}
-
-	writel(0x000307c2, sm501_reg + SM501_DRAM_CONTROL);
-	iounmap(sm501_reg);
-}
-
-/* Return the board specific boot mode pin configuration */
-static int sh7785lcr_mode_pins(void)
-{
-	int value = 0;
-
-	/* These are the factory default settings of S1 and S2.
-	 * If you change these dip switches then you will need to
-	 * adjust the values below as well.
-	 */
-	value |= MODE_PIN4; /* Clock Mode 16 */
-	value |= MODE_PIN5; /* 32-bit Area0 bus width */
-	value |= MODE_PIN6; /* 32-bit Area0 bus width */
-	value |= MODE_PIN7; /* Area 0 SRAM interface [fixed] */
-	value |= MODE_PIN8; /* Little Endian */
-	value |= MODE_PIN9; /* Master Mode */
-	value |= MODE_PIN14; /* No PLL step-up */
-
-	return value;
-}
 
 /*
- * The Machine Vector
+ *	C A P T U R E   P A R A M E T E R S
  */
-static struct sh_machine_vector mv_sh7785lcr __initmv = {
-	.mv_name		= "SH7785LCR",
-	.mv_setup		= sh7785lcr_setup,
-	.mv_clk_init		= sh7785lcr_clk_init,
-	.mv_init_irq		= init_sh7785lcr_IRQ,
-	.mv_mode_pins		= sh7785lcr_mode_pins,
+struct v4l2_captureparm {
+	__u32		   capability;	  /*  Supported modes */
+	__u32		   capturemode;	  /*  Current mode */
+	struct v4l2_fract  timeperframe;  /*  Time per frame in seconds */
+	__u32		   extendedmode;  /*  Driver-specific extensions */
+	__u32              readbuffers;   /*  # of buffers for read */
+	__u32		   reserved[4];
 };
 
+/*  Flags for 'capability' and 'capturemode' fields */
+#define V4L2_MODE_HIGHQUALITY	0x0001	/*  High quality imaging mode */
+#define V4L2_CAP_TIMEPERFRAME	0x1000	/*  timeperframe field is supported */
+
+struct v4l2_outputparm {
+	__u32		   capability;	 /*  Supported modes */
+	__u32		   outputmode;	 /*  Current mode */
+	struct v4l2_fract  timeperframe; /*  Time per frame in seconds */
+	__u32		   extendedmode; /*  Driver-specific extensions */
+	__u32              writebuffers; /*  # of buffers for write */
+	__u32		   reserved[4];
+};
+
+/*
+ *	I N P U T   I M A G E   C R O P P I N G
+ */
+struct v4l2_cropcap {
+	__u32			type;	/* enum v4l2_buf_type */
+	struct v4l2_rect        bounds;
+	struct v4l2_rect        defrect;
+	struct v4l2_fract       pixelaspect;
+};
+
+struct v4l2_crop {
+	__u32			type;	/* enum v4l2_buf_type */
+	struct v4l2_rect        c;
+};
+
+/**
+ * struct v4l2_selection - selection info
+ * @type:	buffer type (do not use *_MPLANE types)
+ * @target:	Selection target, used to choose one of possible rectangles;
+ *		defined in v4l2-common.h; V4L2_SEL_TGT_* .
+ * @flags:	constraints flags, defined in v4l2-common.h; V4L2_SEL_FLAG_*.
+ * @r:		coordinates of selection window
+ * @reserved:	for future use, rounds structure size to 64 bytes, set to zero
+ *
+ * Hardware may use multiple helper windows to process a video stream.
+ * The structure is used to exchange this selection areas between
+ * an application and a driver.
+ */
+struct v4l2_selection {
+	__u32			type;
+	__u32			target;
+	__u32                   flags;
+	struct v4l2_rect        r;
+	__u32                   reserved[9];
+};
+
+
+/*
+ *      A N A L O G   V I D E O   S T A N D A R D
+ */
+
+typedef __u64 v4l2_std_id;
+
+/* one bit for each */
+#define V4L2_STD_PAL_B          ((v4l2_std_id)0x00000001)
+#define V4L2_STD_PAL_B1         ((v4l2_std_id)0x00000002)
+#define V4L2_STD_PAL_G          ((v4l2_std_id)0x00000004)
+#define V4L2_STD_PAL_H          ((v4l2_std_id)0x00000008)
+#define V4L2_STD_PAL_I          ((v4l2_std_id)0x00000010)
+#define V4L2_STD_PAL_D          ((v4l2_std_id)0x00000020)
+#define V4L2_STD_PAL_D1         ((v4l2_std_id)0x00000040)
+#define V4L2_STD_PAL_K          ((v4l2_std_id)0x00000080)
+
+#define V4L2_STD_PAL_M          ((v4l2_std_id)0x00000100)
+#define V4L2_STD_PAL_N          ((v4l2_std_id)0x00000200)
+#define V4L2_STD_PAL_Nc         ((v4l2_std_id)0x00000400)
+#define V4L2_STD_PAL_60         ((v4l2_std_id)0x00000800)
+
+#define V4L2_STD_NTSC_M         ((v4l2_std_id)0x00001000)	/* BTSC */
+#define V4L2_STD_NTSC_M_JP      ((v4l2_std_id)0x00002000)	/* EIA-J */
+#define V4L2_STD_NTSC_443       ((v4l2_std_id)0x00004000)
+#define V4L2_STD_NTSC_M_KR      ((v4l2_std_id)0x00008000)	/* FM A2 */
+
+#define V4L2_STD_SECAM_B        ((v4l2_std_id)0x00010000)
+#define V4L2_STD_SECAM_D        ((v4l2_std_id)0x00020000)
+#define V4L2_STD_SECAM_G        ((v4l2_std_id)0x00040000)
+#define V4L2_STD_SECAM_H        ((v4l2_std_id)0x00080000)
+#define V4L2_STD_SECAM_K        ((v4l2_std_id)0x00100000)
+#define V4L2_STD_SECAM_K1       ((v4l2_std_id)0x00200000)
+#define V4L2_STD_SECAM_L        ((v4l2_std_id)0x00400000)
+#define V4L2_STD_SECAM_LC       ((v4l2_std_id)0x00800000)
+
+/* ATSC/HDTV */
+#define V4L2_STD_ATSC_8_VSB     ((v4l2_std_id)0x01000000)
+#define V4L2_STD_ATSC_16_VSB    ((v4l2_std_id)0x02000000)
+
+/* FIXME:
+   Although std_id is 64 bits, there is an issue on PPC32 architecture that
+   makes switch(__u64) to break. So, there's a hack on v4l2-common.c rounding
+   this value to 32 bits.
+   As, currently, the max value is for V4L2_STD_ATSC_16_VSB (30 bits wide),
+   it should work fine. However, if needed to add more than two standards,
+   v4l2-common.c should be fixed.
+ */
+
+/*
+ * Some macros to merge video standards in order to make live easier for the
+ * drivers and V4L2 applications
+ */
+
+/*
+ * "Common" NTSC/M - It should be noticed that V4L2_STD_NTSC_443 is
+ * Missing here.
+ */
+#define V4L2_STD_NTSC           (V4L2_STD_NTSC_M	|\
+				 V4L2_STD_NTSC_M_JP     |\
+				 V4L2_STD_NTSC_M_KR)
+/* Secam macros */
+#define V4L2_STD_SECAM_DK      	(V4L2_STD_SECAM_D	|\
+				 V4L2_STD_SECAM_K	|\
+				 V4L2_STD_SECAM_K1)
+/* All Secam Standards */
+#define V4L2_STD_SECAM		(V4L2_STD_SECAM_B	|\
+				 V4L2_STD_SECAM_G	|\
+				 V4L2_STD_SECAM_H	|\
+				 V4L2_STD_SECAM_DK	|\
+				 V4L2_STD_SECAM_L       |\
+				 V4L2_STD_SECAM_LC)
+/* PAL macros */
+#define V4L2_STD_PAL_BG		(V4L2_STD_PAL_B		|\
+				 V4L2_STD_PAL_B1	|\
+				 V4L2_STD_PAL_G)
+#define V4L2_STD_PAL_DK		(V4L2_STD_PAL_D		|\
+				 V4L2_STD_PAL_D1	|\
+				 V4L2_STD_PAL_K)
+/*
+ * "Common" PAL - This macro is there to be compatible with the old
+ * V4L1 concept of "PAL": /BGDKHI.
+ * Several PAL standards are missing here:

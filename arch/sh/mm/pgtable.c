@@ -1,57 +1,37 @@
-#include <linux/mm.h>
-#include <linux/slab.h>
+ne GET_BASE		(PAGE_OFFSET | AS_GET_SPACE)
 
-#define PGALLOC_GFP GFP_KERNEL | __GFP_REPEAT | __GFP_ZERO
-
-static struct kmem_cache *pgd_cachep;
-#if PAGETABLE_LEVELS > 2
-static struct kmem_cache *pmd_cachep;
+/*
+ * Convert Memory addresses between various addressing modes.
+ */
+#define TO_PHYS(x)		(TO_PHYS_MASK & (x))
+#define TO_CAC(x)		(CAC_BASE     | TO_PHYS(x))
+#ifdef CONFIG_SGI_SN
+#define TO_AMO(x)		(AMO_BASE     | TO_PHYS(x))
+#define TO_GET(x)		(GET_BASE     | TO_PHYS(x))
+#else
+#define TO_AMO(x)		({ BUG(); x; })
+#define TO_GET(x)		({ BUG(); x; })
 #endif
 
-void pgd_ctor(void *x)
-{
-	pgd_t *pgd = x;
+/*
+ * Covert from processor physical address to II/TIO physical address:
+ *	II - squeeze out the AS bits
+ *	TIO- requires a chiplet id in bits 38-39.  For DMA to memory,
+ *           the chiplet id is zero.  If we implement TIO-TIO dma, we might need
+ *           to insert a chiplet id into this macro.  However, it is our belief
+ *           right now that this chiplet id will be ICE, which is also zero.
+ */
+#define SH1_TIO_PHYS_TO_DMA(x) 						\
+	((((u64)(NASID_GET(x))) << 40) | NODE_OFFSET(x))
 
-	memcpy(pgd + USER_PTRS_PER_PGD,
-	       swapper_pg_dir + USER_PTRS_PER_PGD,
-	       (PTRS_PER_PGD - USER_PTRS_PER_PGD) * sizeof(pgd_t));
-}
+#define SH2_NETWORK_BANK_OFFSET(x) 					\
+        ((u64)(x) & ((1UL << (sn_hub_info->nasid_shift - 4)) -1))
 
-void pgtable_cache_init(void)
-{
-	pgd_cachep = kmem_cache_create("pgd_cache",
-				       PTRS_PER_PGD * (1<<PTE_MAGNITUDE),
-				       PAGE_SIZE, SLAB_PANIC, pgd_ctor);
-#if PAGETABLE_LEVELS > 2
-	pmd_cachep = kmem_cache_create("pmd_cache",
-				       PTRS_PER_PMD * (1<<PTE_MAGNITUDE),
-				       PAGE_SIZE, SLAB_PANIC, NULL);
-#endif
-}
+#define SH2_NETWORK_BANK_SELECT(x) 					\
+        ((((u64)(x) & (0x3UL << (sn_hub_info->nasid_shift - 4)))	\
+        	>> (sn_hub_info->nasid_shift - 4)) << 36)
 
-pgd_t *pgd_alloc(struct mm_struct *mm)
-{
-	return kmem_cache_alloc(pgd_cachep, PGALLOC_GFP);
-}
+#define SH2_NETWORK_ADDRESS(x) 						\
+	(SH2_NETWORK_BANK_OFFSET(x) | SH2_NETWORK_BANK_SELECT(x))
 
-void pgd_free(struct mm_struct *mm, pgd_t *pgd)
-{
-	kmem_cache_free(pgd_cachep, pgd);
-}
-
-#if PAGETABLE_LEVELS > 2
-void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
-{
-	set_pud(pud, __pud((unsigned long)pmd));
-}
-
-pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long address)
-{
-	return kmem_cache_alloc(pmd_cachep, PGALLOC_GFP);
-}
-
-void pmd_free(struct mm_struct *mm, pmd_t *pmd)
-{
-	kmem_cache_free(pmd_cachep, pmd);
-}
-#endif /* PAGETABLE_LEVELS > 2 */
+#define SH2_TIO_PHYS_TO_DMA

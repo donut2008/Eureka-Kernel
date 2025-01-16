@@ -1,3579 +1,3231 @@
-/*
- * GPL HEADER START
- *
- * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 only,
- * as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License version 2 for more details (a copy is included
- * in the LICENSE file that accompanied this code).
- *
- * You should have received a copy of the GNU General Public License
- * version 2 along with this program; If not, see
- * http://www.sun.com/software/products/lustre/docs/GPLv2.pdf
- *
- * Please contact Sun Microsystems, Inc., 4150 Network Circle, Santa Clara,
- * CA 95054 USA or visit www.sun.com if you need additional information or
- * have any questions.
- *
- * GPL HEADER END
- */
-/*
- * Copyright (c) 2002, 2010, Oracle and/or its affiliates. All rights reserved.
- * Use is subject to license terms.
- *
- * Copyright (c) 2011, 2012, Intel Corporation.
- */
-/*
- * This file is part of Lustre, http://www.lustre.org/
- * Lustre is a trademark of Sun Microsystems, Inc.
- *
- * lustre/llite/file.c
- *
- * Author: Peter Braam <braam@clusterfs.com>
- * Author: Phil Schwan <phil@clusterfs.com>
- * Author: Andreas Dilger <adilger@clusterfs.com>
- */
+eada_lock);
 
-#define DEBUG_SUBSYSTEM S_LLITE
-#include "../include/lustre_dlm.h"
-#include "../include/lustre_lite.h"
-#include <linux/pagemap.h>
-#include <linux/file.h>
-#include "llite_internal.h"
-#include "../include/lustre/ll_fiemap.h"
+	if (!re)
+		return -1;
 
-#include "../include/cl_object.h"
-
-static int
-ll_put_grouplock(struct inode *inode, struct file *file, unsigned long arg);
-
-static int ll_lease_close(struct obd_client_handle *och, struct inode *inode,
-			  bool *lease_broken);
-
-static enum llioc_iter
-ll_iocontrol_call(struct inode *inode, struct file *file,
-		  unsigned int cmd, unsigned long arg, int *rcp);
-
-static struct ll_file_data *ll_file_data_get(void)
-{
-	struct ll_file_data *fd;
-
-	fd = kmem_cache_alloc(ll_file_data_slab, GFP_NOFS | __GFP_ZERO);
-	if (fd == NULL)
-		return NULL;
-	fd->fd_write_failed = false;
-	return fd;
-}
-
-static void ll_file_data_put(struct ll_file_data *fd)
-{
-	if (fd != NULL)
-		kmem_cache_free(ll_file_data_slab, fd);
-}
-
-void ll_pack_inode2opdata(struct inode *inode, struct md_op_data *op_data,
-			  struct lustre_handle *fh)
-{
-	op_data->op_fid1 = ll_i2info(inode)->lli_fid;
-	op_data->op_attr.ia_mode = inode->i_mode;
-	op_data->op_attr.ia_atime = inode->i_atime;
-	op_data->op_attr.ia_mtime = inode->i_mtime;
-	op_data->op_attr.ia_ctime = inode->i_ctime;
-	op_data->op_attr.ia_size = i_size_read(inode);
-	op_data->op_attr_blocks = inode->i_blocks;
-	((struct ll_iattr *)&op_data->op_attr)->ia_attr_flags =
-					ll_inode_to_ext_flags(inode->i_flags);
-	op_data->op_ioepoch = ll_i2info(inode)->lli_ioepoch;
-	if (fh)
-		op_data->op_handle = *fh;
-
-	if (ll_i2info(inode)->lli_flags & LLIF_DATA_MODIFIED)
-		op_data->op_bias |= MDS_DATA_MODIFIED;
-}
-
-/**
- * Closes the IO epoch and packs all the attributes into @op_data for
- * the CLOSE rpc.
- */
-static void ll_prepare_close(struct inode *inode, struct md_op_data *op_data,
-			     struct obd_client_handle *och)
-{
-	op_data->op_attr.ia_valid = ATTR_MODE | ATTR_ATIME | ATTR_ATIME_SET |
-					ATTR_MTIME | ATTR_MTIME_SET |
-					ATTR_CTIME | ATTR_CTIME_SET;
-
-	if (!(och->och_flags & FMODE_WRITE))
-		goto out;
-
-	if (!exp_connect_som(ll_i2mdexp(inode)) || !S_ISREG(inode->i_mode))
-		op_data->op_attr.ia_valid |= ATTR_SIZE | ATTR_BLOCKS;
-	else
-		ll_ioepoch_close(inode, op_data, &och, 0);
-
-out:
-	ll_pack_inode2opdata(inode, op_data, &och->och_fh);
-	ll_prep_md_op_data(op_data, inode, NULL, NULL,
-			   0, 0, LUSTRE_OPC_ANY, NULL);
-}
-
-static int ll_close_inode_openhandle(struct obd_export *md_exp,
-				     struct inode *inode,
-				     struct obd_client_handle *och,
-				     const __u64 *data_version)
-{
-	struct obd_export *exp = ll_i2mdexp(inode);
-	struct md_op_data *op_data;
-	struct ptlrpc_request *req = NULL;
-	struct obd_device *obd = class_exp2obd(exp);
-	int epoch_close = 1;
-	int rc;
-
-	if (obd == NULL) {
-		/*
-		 * XXX: in case of LMV, is this correct to access
-		 * ->exp_handle?
-		 */
-		CERROR("Invalid MDC connection handle %#llx\n",
-		       ll_i2mdexp(inode)->exp_handle.h_cookie);
-		rc = 0;
-		goto out;
-	}
-
-	op_data = kzalloc(sizeof(*op_data), GFP_NOFS);
-	if (!op_data) {
-		/* XXX We leak openhandle and request here. */
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	ll_prepare_close(inode, op_data, och);
-	if (data_version != NULL) {
-		/* Pass in data_version implies release. */
-		op_data->op_bias |= MDS_HSM_RELEASE;
-		op_data->op_data_version = *data_version;
-		op_data->op_lease_handle = och->och_lease_handle;
-		op_data->op_attr.ia_valid |= ATTR_SIZE | ATTR_BLOCKS;
-	}
-	epoch_close = op_data->op_flags & MF_EPOCH_CLOSE;
-	rc = md_close(md_exp, op_data, och->och_mod, &req);
-	if (rc == -EAGAIN) {
-		/* This close must have the epoch closed. */
-		LASSERT(epoch_close);
-		/* MDS has instructed us to obtain Size-on-MDS attribute from
-		 * OSTs and send setattr to back to MDS. */
-		rc = ll_som_update(inode, op_data);
-		if (rc) {
-			CERROR("inode %lu mdc Size-on-MDS update failed: rc = %d\n",
-			       inode->i_ino, rc);
-			rc = 0;
-		}
-	} else if (rc) {
-		CERROR("inode %lu mdc close failed: rc = %d\n",
-		       inode->i_ino, rc);
-	}
-
-	/* DATA_MODIFIED flag was successfully sent on close, cancel data
-	 * modification flag. */
-	if (rc == 0 && (op_data->op_bias & MDS_DATA_MODIFIED)) {
-		struct ll_inode_info *lli = ll_i2info(inode);
-
-		spin_lock(&lli->lli_lock);
-		lli->lli_flags &= ~LLIF_DATA_MODIFIED;
-		spin_unlock(&lli->lli_lock);
-	}
-
-	if (rc == 0) {
-		rc = ll_objects_destroy(req, inode);
-		if (rc)
-			CERROR("inode %lu ll_objects destroy: rc = %d\n",
-			       inode->i_ino, rc);
-	}
-	if (rc == 0 && op_data->op_bias & MDS_HSM_RELEASE) {
-		struct mdt_body *body;
-
-		body = req_capsule_server_get(&req->rq_pill, &RMF_MDT_BODY);
-		if (!(body->valid & OBD_MD_FLRELEASED))
-			rc = -EBUSY;
-	}
-
-	ll_finish_md_op_data(op_data);
-
-out:
-	if (exp_connect_som(exp) && !epoch_close &&
-	    S_ISREG(inode->i_mode) && (och->och_flags & FMODE_WRITE)) {
-		ll_queue_done_writing(inode, LLIF_DONE_WRITING);
-	} else {
-		md_clear_open_replay_data(md_exp, och);
-		/* Free @och if it is not waiting for DONE_WRITING. */
-		och->och_fh.cookie = DEAD_HANDLE_MAGIC;
-		kfree(och);
-	}
-	if (req) /* This is close request */
-		ptlrpc_req_finished(req);
-	return rc;
-}
-
-int ll_md_real_close(struct inode *inode, fmode_t fmode)
-{
-	struct ll_inode_info *lli = ll_i2info(inode);
-	struct obd_client_handle **och_p;
-	struct obd_client_handle *och;
-	__u64 *och_usecount;
-	int rc = 0;
-
-	if (fmode & FMODE_WRITE) {
-		och_p = &lli->lli_mds_write_och;
-		och_usecount = &lli->lli_open_fd_write_count;
-	} else if (fmode & FMODE_EXEC) {
-		och_p = &lli->lli_mds_exec_och;
-		och_usecount = &lli->lli_open_fd_exec_count;
-	} else {
-		LASSERT(fmode & FMODE_READ);
-		och_p = &lli->lli_mds_read_och;
-		och_usecount = &lli->lli_open_fd_read_count;
-	}
-
-	mutex_lock(&lli->lli_och_mutex);
-	if (*och_usecount > 0) {
-		/* There are still users of this handle, so skip
-		 * freeing it. */
-		mutex_unlock(&lli->lli_och_mutex);
-		return 0;
-	}
-
-	och = *och_p;
-	*och_p = NULL;
-	mutex_unlock(&lli->lli_och_mutex);
-
-	if (och != NULL) {
-		/* There might be a race and this handle may already
-		   be closed. */
-		rc = ll_close_inode_openhandle(ll_i2sbi(inode)->ll_md_exp,
-					       inode, och, NULL);
-	}
-
-	return rc;
-}
-
-static int ll_md_close(struct obd_export *md_exp, struct inode *inode,
-		       struct file *file)
-{
-	struct ll_file_data *fd = LUSTRE_FPRIVATE(file);
-	struct ll_inode_info *lli = ll_i2info(inode);
-	int lockmode;
-	__u64 flags = LDLM_FL_BLOCK_GRANTED | LDLM_FL_TEST_LOCK;
-	struct lustre_handle lockh;
-	ldlm_policy_data_t policy = {.l_inodebits = {MDS_INODELOCK_OPEN} };
-	int rc = 0;
-
-	/* clear group lock, if present */
-	if (unlikely(fd->fd_flags & LL_FILE_GROUP_LOCKED))
-		ll_put_grouplock(inode, file, fd->fd_grouplock.cg_gid);
-
-	if (fd->fd_lease_och != NULL) {
-		bool lease_broken;
-
-		/* Usually the lease is not released when the
-		 * application crashed, we need to release here. */
-		rc = ll_lease_close(fd->fd_lease_och, inode, &lease_broken);
-		CDEBUG(rc ? D_ERROR : D_INODE, "Clean up lease "DFID" %d/%d\n",
-			PFID(&lli->lli_fid), rc, lease_broken);
-
-		fd->fd_lease_och = NULL;
-	}
-
-	if (fd->fd_och != NULL) {
-		rc = ll_close_inode_openhandle(md_exp, inode, fd->fd_och, NULL);
-		fd->fd_och = NULL;
-		goto out;
-	}
-
-	/* Let's see if we have good enough OPEN lock on the file and if
-	   we can skip talking to MDS */
-
-	mutex_lock(&lli->lli_och_mutex);
-	if (fd->fd_omode & FMODE_WRITE) {
-		lockmode = LCK_CW;
-		LASSERT(lli->lli_open_fd_write_count);
-		lli->lli_open_fd_write_count--;
-	} else if (fd->fd_omode & FMODE_EXEC) {
-		lockmode = LCK_PR;
-		LASSERT(lli->lli_open_fd_exec_count);
-		lli->lli_open_fd_exec_count--;
-	} else {
-		lockmode = LCK_CR;
-		LASSERT(lli->lli_open_fd_read_count);
-		lli->lli_open_fd_read_count--;
-	}
-	mutex_unlock(&lli->lli_och_mutex);
-
-	if (!md_lock_match(md_exp, flags, ll_inode2fid(inode),
-			   LDLM_IBITS, &policy, lockmode, &lockh))
-		rc = ll_md_real_close(inode, fd->fd_omode);
-
-out:
-	LUSTRE_FPRIVATE(file) = NULL;
-	ll_file_data_put(fd);
-
-	return rc;
-}
-
-/* While this returns an error code, fput() the caller does not, so we need
- * to make every effort to clean up all of our state here.  Also, applications
- * rarely check close errors and even if an error is returned they will not
- * re-try the close call.
- */
-int ll_file_release(struct inode *inode, struct file *file)
-{
-	struct ll_file_data *fd;
-	struct ll_sb_info *sbi = ll_i2sbi(inode);
-	struct ll_inode_info *lli = ll_i2info(inode);
-	int rc;
-
-	CDEBUG(D_VFSTRACE, "VFS Op:inode=%lu/%u(%p)\n", inode->i_ino,
-	       inode->i_generation, inode);
-
-#ifdef CONFIG_FS_POSIX_ACL
-	if (sbi->ll_flags & LL_SBI_RMT_CLIENT && is_root_inode(inode)) {
-		struct ll_file_data *fd = LUSTRE_FPRIVATE(file);
-
-		LASSERT(fd != NULL);
-		if (unlikely(fd->fd_flags & LL_FILE_RMTACL)) {
-			fd->fd_flags &= ~LL_FILE_RMTACL;
-			rct_del(&sbi->ll_rct, current_pid());
-			et_search_free(&sbi->ll_et, current_pid());
-		}
-	}
-#endif
-
-	if (!is_root_inode(inode))
-		ll_stats_ops_tally(sbi, LPROC_LL_RELEASE, 1);
-	fd = LUSTRE_FPRIVATE(file);
-	LASSERT(fd != NULL);
-
-	/* The last ref on @file, maybe not the owner pid of statahead.
-	 * Different processes can open the same dir, "ll_opendir_key" means:
-	 * it is me that should stop the statahead thread. */
-	if (S_ISDIR(inode->i_mode) && lli->lli_opendir_key == fd &&
-	    lli->lli_opendir_pid != 0)
-		ll_stop_statahead(inode, lli->lli_opendir_key);
-
-	if (is_root_inode(inode)) {
-		LUSTRE_FPRIVATE(file) = NULL;
-		ll_file_data_put(fd);
-		return 0;
-	}
-
-	if (!S_ISDIR(inode->i_mode)) {
-		lov_read_and_clear_async_rc(lli->lli_clob);
-		lli->lli_async_rc = 0;
-	}
-
-	rc = ll_md_close(sbi->ll_md_exp, inode, file);
-
-	if (CFS_FAIL_TIMEOUT_MS(OBD_FAIL_PTLRPC_DUMP_LOG, cfs_fail_val))
-		libcfs_debug_dumplog();
-
-	return rc;
-}
-
-static int ll_intent_file_open(struct dentry *dentry, void *lmm,
-			       int lmmsize, struct lookup_intent *itp)
-{
-	struct inode *inode = d_inode(dentry);
-	struct ll_sb_info *sbi = ll_i2sbi(inode);
-	struct dentry *parent = dentry->d_parent;
-	const char *name = dentry->d_name.name;
-	const int len = dentry->d_name.len;
-	struct md_op_data *op_data;
-	struct ptlrpc_request *req;
-	__u32 opc = LUSTRE_OPC_ANY;
-	int rc;
-
-	/* Usually we come here only for NFSD, and we want open lock.
-	   But we can also get here with pre 2.6.15 patchless kernels, and in
-	   that case that lock is also ok */
-	/* We can also get here if there was cached open handle in revalidate_it
-	 * but it disappeared while we were getting from there to ll_file_open.
-	 * But this means this file was closed and immediately opened which
-	 * makes a good candidate for using OPEN lock */
-	/* If lmmsize & lmm are not 0, we are just setting stripe info
-	 * parameters. No need for the open lock */
-	if (lmm == NULL && lmmsize == 0) {
-		itp->it_flags |= MDS_OPEN_LOCK;
-		if (itp->it_flags & FMODE_WRITE)
-			opc = LUSTRE_OPC_CREATE;
-	}
-
-	op_data  = ll_prep_md_op_data(NULL, d_inode(parent),
-				      inode, name, len,
-				      O_RDWR, opc, NULL);
-	if (IS_ERR(op_data))
-		return PTR_ERR(op_data);
-
-	itp->it_flags |= MDS_OPEN_BY_FID;
-	rc = md_intent_lock(sbi->ll_md_exp, op_data, lmm, lmmsize, itp,
-			    0 /*unused */, &req, ll_md_blocking_ast, 0);
-	ll_finish_md_op_data(op_data);
-	if (rc == -ESTALE) {
-		/* reason for keep own exit path - don`t flood log
-		* with messages with -ESTALE errors.
-		*/
-		if (!it_disposition(itp, DISP_OPEN_OPEN) ||
-		     it_open_error(DISP_OPEN_OPEN, itp))
-			goto out;
-		ll_release_openhandle(inode, itp);
-		goto out;
-	}
-
-	if (it_disposition(itp, DISP_LOOKUP_NEG)) {
-		rc = -ENOENT;
-		goto out;
-	}
-
-	if (rc != 0 || it_open_error(DISP_OPEN_OPEN, itp)) {
-		rc = rc ? rc : it_open_error(DISP_OPEN_OPEN, itp);
-		CDEBUG(D_VFSTRACE, "lock enqueue: err: %d\n", rc);
-		goto out;
-	}
-
-	rc = ll_prep_inode(&inode, req, NULL, itp);
-	if (!rc && itp->d.lustre.it_lock_mode)
-		ll_set_lock_data(sbi->ll_md_exp, inode, itp, NULL);
-
-out:
-	ptlrpc_req_finished(req);
-	ll_intent_drop_lock(itp);
-
-	return rc;
-}
-
-/**
- * Assign an obtained @ioepoch to client's inode. No lock is needed, MDS does
- * not believe attributes if a few ioepoch holders exist. Attributes for
- * previous ioepoch if new one is opened are also skipped by MDS.
- */
-void ll_ioepoch_open(struct ll_inode_info *lli, __u64 ioepoch)
-{
-	if (ioepoch && lli->lli_ioepoch != ioepoch) {
-		lli->lli_ioepoch = ioepoch;
-		CDEBUG(D_INODE, "Epoch %llu opened on "DFID"\n",
-		       ioepoch, PFID(&lli->lli_fid));
-	}
-}
-
-static int ll_och_fill(struct obd_export *md_exp, struct lookup_intent *it,
-		       struct obd_client_handle *och)
-{
-	struct ptlrpc_request *req = it->d.lustre.it_data;
-	struct mdt_body *body;
-
-	body = req_capsule_server_get(&req->rq_pill, &RMF_MDT_BODY);
-	och->och_fh = body->handle;
-	och->och_fid = body->fid1;
-	och->och_lease_handle.cookie = it->d.lustre.it_lock_handle;
-	och->och_magic = OBD_CLIENT_HANDLE_MAGIC;
-	och->och_flags = it->it_flags;
-
-	return md_set_open_replay_data(md_exp, och, it);
-}
-
-static int ll_local_open(struct file *file, struct lookup_intent *it,
-			 struct ll_file_data *fd, struct obd_client_handle *och)
-{
-	struct inode *inode = file_inode(file);
-	struct ll_inode_info *lli = ll_i2info(inode);
-
-	LASSERT(!LUSTRE_FPRIVATE(file));
-
-	LASSERT(fd != NULL);
-
-	if (och) {
-		struct ptlrpc_request *req = it->d.lustre.it_data;
-		struct mdt_body *body;
-		int rc;
-
-		rc = ll_och_fill(ll_i2sbi(inode)->ll_md_exp, it, och);
-		if (rc != 0)
-			return rc;
-
-		body = req_capsule_server_get(&req->rq_pill, &RMF_MDT_BODY);
-		ll_ioepoch_open(lli, body->ioepoch);
-	}
-
-	LUSTRE_FPRIVATE(file) = fd;
-	ll_readahead_init(inode, &fd->fd_ras);
-	fd->fd_omode = it->it_flags & (FMODE_READ | FMODE_WRITE | FMODE_EXEC);
-	return 0;
-}
-
-/* Open a file, and (for the very first open) create objects on the OSTs at
- * this time.  If opened with O_LOV_DELAY_CREATE, then we don't do the object
- * creation or open until ll_lov_setstripe() ioctl is called.
- *
- * If we already have the stripe MD locally then we don't request it in
- * md_open(), by passing a lmm_size = 0.
- *
- * It is up to the application to ensure no other processes open this file
- * in the O_LOV_DELAY_CREATE case, or the default striping pattern will be
- * used.  We might be able to avoid races of that sort by getting lli_open_sem
- * before returning in the O_LOV_DELAY_CREATE case and dropping it here
- * or in ll_file_release(), but I'm not sure that is desirable/necessary.
- */
-int ll_file_open(struct inode *inode, struct file *file)
-{
-	struct ll_inode_info *lli = ll_i2info(inode);
-	struct lookup_intent *it, oit = { .it_op = IT_OPEN,
-					  .it_flags = file->f_flags };
-	struct obd_client_handle **och_p = NULL;
-	__u64 *och_usecount = NULL;
-	struct ll_file_data *fd;
-	int rc = 0, opendir_set = 0;
-
-	CDEBUG(D_VFSTRACE, "VFS Op:inode=%lu/%u(%p), flags %o\n", inode->i_ino,
-	       inode->i_generation, inode, file->f_flags);
-
-	it = file->private_data; /* XXX: compat macro */
-	file->private_data = NULL; /* prevent ll_local_open assertion */
-
-	fd = ll_file_data_get();
-	if (fd == NULL) {
-		rc = -ENOMEM;
-		goto out_openerr;
-	}
-
-	fd->fd_file = file;
-	if (S_ISDIR(inode->i_mode)) {
-		spin_lock(&lli->lli_sa_lock);
-		if (lli->lli_opendir_key == NULL && lli->lli_sai == NULL &&
-		    lli->lli_opendir_pid == 0) {
-			lli->lli_opendir_key = fd;
-			lli->lli_opendir_pid = current_pid();
-			opendir_set = 1;
-		}
-		spin_unlock(&lli->lli_sa_lock);
-	}
-
-	if (is_root_inode(inode)) {
-		LUSTRE_FPRIVATE(file) = fd;
-		return 0;
-	}
-
-	if (!it || !it->d.lustre.it_disposition) {
-		/* Convert f_flags into access mode. We cannot use file->f_mode,
-		 * because everything but O_ACCMODE mask was stripped from
-		 * there */
-		if ((oit.it_flags + 1) & O_ACCMODE)
-			oit.it_flags++;
-		if (file->f_flags & O_TRUNC)
-			oit.it_flags |= FMODE_WRITE;
-
-		/* kernel only call f_op->open in dentry_open.  filp_open calls
-		 * dentry_open after call to open_namei that checks permissions.
-		 * Only nfsd_open call dentry_open directly without checking
-		 * permissions and because of that this code below is safe. */
-		if (oit.it_flags & (FMODE_WRITE | FMODE_READ))
-			oit.it_flags |= MDS_OPEN_OWNEROVERRIDE;
-
-		/* We do not want O_EXCL here, presumably we opened the file
-		 * already? XXX - NFS implications? */
-		oit.it_flags &= ~O_EXCL;
-
-		/* bug20584, if "it_flags" contains O_CREAT, the file will be
-		 * created if necessary, then "IT_CREAT" should be set to keep
-		 * consistent with it */
-		if (oit.it_flags & O_CREAT)
-			oit.it_op |= IT_CREAT;
-
-		it = &oit;
-	}
-
-restart:
-	/* Let's see if we have file open on MDS already. */
-	if (it->it_flags & FMODE_WRITE) {
-		och_p = &lli->lli_mds_write_och;
-		och_usecount = &lli->lli_open_fd_write_count;
-	} else if (it->it_flags & FMODE_EXEC) {
-		och_p = &lli->lli_mds_exec_och;
-		och_usecount = &lli->lli_open_fd_exec_count;
-	 } else {
-		och_p = &lli->lli_mds_read_och;
-		och_usecount = &lli->lli_open_fd_read_count;
-	}
-
-	mutex_lock(&lli->lli_och_mutex);
-	if (*och_p) { /* Open handle is present */
-		if (it_disposition(it, DISP_OPEN_OPEN)) {
-			/* Well, there's extra open request that we do not need,
-			   let's close it somehow. This will decref request. */
-			rc = it_open_error(DISP_OPEN_OPEN, it);
-			if (rc) {
-				mutex_unlock(&lli->lli_och_mutex);
-				goto out_openerr;
-			}
-
-			ll_release_openhandle(inode, it);
-		}
-		(*och_usecount)++;
-
-		rc = ll_local_open(file, it, fd, NULL);
-		if (rc) {
-			(*och_usecount)--;
-			mutex_unlock(&lli->lli_och_mutex);
-			goto out_openerr;
-		}
-	} else {
-		LASSERT(*och_usecount == 0);
-		if (!it->d.lustre.it_disposition) {
-			/* We cannot just request lock handle now, new ELC code
-			   means that one of other OPEN locks for this file
-			   could be cancelled, and since blocking ast handler
-			   would attempt to grab och_mutex as well, that would
-			   result in a deadlock */
-			mutex_unlock(&lli->lli_och_mutex);
-			it->it_create_mode |= M_CHECK_STALE;
-			rc = ll_intent_file_open(file->f_path.dentry, NULL, 0, it);
-			it->it_create_mode &= ~M_CHECK_STALE;
-			if (rc)
-				goto out_openerr;
-
-			goto restart;
-		}
-		*och_p = kzalloc(sizeof(struct obd_client_handle), GFP_NOFS);
-		if (!*och_p) {
-			rc = -ENOMEM;
-			goto out_och_free;
-		}
-
-		(*och_usecount)++;
-
-		/* md_intent_lock() didn't get a request ref if there was an
-		 * open error, so don't do cleanup on the request here
-		 * (bug 3430) */
-		/* XXX (green): Should not we bail out on any error here, not
-		 * just open error? */
-		rc = it_open_error(DISP_OPEN_OPEN, it);
-		if (rc)
-			goto out_och_free;
-
-		LASSERT(it_disposition(it, DISP_ENQ_OPEN_REF));
-
-		rc = ll_local_open(file, it, fd, *och_p);
-		if (rc)
-			goto out_och_free;
-	}
-	mutex_unlock(&lli->lli_och_mutex);
-	fd = NULL;
-
-	/* Must do this outside lli_och_mutex lock to prevent deadlock where
-	   different kind of OPEN lock for this same inode gets cancelled
-	   by ldlm_cancel_lru */
-	if (!S_ISREG(inode->i_mode))
-		goto out_och_free;
-
-	if (!lli->lli_has_smd &&
-	    (cl_is_lov_delay_create(file->f_flags) ||
-	     (file->f_mode & FMODE_WRITE) == 0)) {
-		CDEBUG(D_INODE, "object creation was delayed\n");
-		goto out_och_free;
-	}
-	cl_lov_delay_create_clear(&file->f_flags);
-	goto out_och_free;
-
-out_och_free:
-	if (rc) {
-		if (och_p && *och_p) {
-			kfree(*och_p);
-			*och_p = NULL;
-			(*och_usecount)--;
-		}
-		mutex_unlock(&lli->lli_och_mutex);
-
-out_openerr:
-		if (opendir_set != 0)
-			ll_stop_statahead(inode, lli->lli_opendir_key);
-		ll_file_data_put(fd);
-	} else {
-		ll_stats_ops_tally(ll_i2sbi(inode), LPROC_LL_OPEN, 1);
-	}
-
-	if (it && it_disposition(it, DISP_ENQ_OPEN_REF)) {
-		ptlrpc_req_finished(it->d.lustre.it_data);
-		it_clear_disposition(it, DISP_ENQ_OPEN_REF);
-	}
-
-	return rc;
-}
-
-static int ll_md_blocking_lease_ast(struct ldlm_lock *lock,
-			struct ldlm_lock_desc *desc, void *data, int flag)
-{
-	int rc;
-	struct lustre_handle lockh;
-
-	switch (flag) {
-	case LDLM_CB_BLOCKING:
-		ldlm_lock2handle(lock, &lockh);
-		rc = ldlm_cli_cancel(&lockh, LCF_ASYNC);
-		if (rc < 0) {
-			CDEBUG(D_INODE, "ldlm_cli_cancel: %d\n", rc);
-			return rc;
-		}
-		break;
-	case LDLM_CB_CANCELING:
-		/* do nothing */
-		break;
-	}
-	return 0;
-}
-
-/**
- * Acquire a lease and open the file.
- */
-static struct obd_client_handle *
-ll_lease_open(struct inode *inode, struct file *file, fmode_t fmode,
-	      __u64 open_flags)
-{
-	struct lookup_intent it = { .it_op = IT_OPEN };
-	struct ll_sb_info *sbi = ll_i2sbi(inode);
-	struct md_op_data *op_data;
-	struct ptlrpc_request *req;
-	struct lustre_handle old_handle = { 0 };
-	struct obd_client_handle *och = NULL;
-	int rc;
-	int rc2;
-
-	if (fmode != FMODE_WRITE && fmode != FMODE_READ)
-		return ERR_PTR(-EINVAL);
-
-	if (file != NULL) {
-		struct ll_inode_info *lli = ll_i2info(inode);
-		struct ll_file_data *fd = LUSTRE_FPRIVATE(file);
-		struct obd_client_handle **och_p;
-		__u64 *och_usecount;
-
-		if (!(fmode & file->f_mode) || (file->f_mode & FMODE_EXEC))
-			return ERR_PTR(-EPERM);
-
-		/* Get the openhandle of the file */
-		rc = -EBUSY;
-		mutex_lock(&lli->lli_och_mutex);
-		if (fd->fd_lease_och != NULL) {
-			mutex_unlock(&lli->lli_och_mutex);
-			return ERR_PTR(rc);
-		}
-
-		if (fd->fd_och == NULL) {
-			if (file->f_mode & FMODE_WRITE) {
-				LASSERT(lli->lli_mds_write_och != NULL);
-				och_p = &lli->lli_mds_write_och;
-				och_usecount = &lli->lli_open_fd_write_count;
-			} else {
-				LASSERT(lli->lli_mds_read_och != NULL);
-				och_p = &lli->lli_mds_read_och;
-				och_usecount = &lli->lli_open_fd_read_count;
-			}
-			if (*och_usecount == 1) {
-				fd->fd_och = *och_p;
-				*och_p = NULL;
-				*och_usecount = 0;
-				rc = 0;
-			}
-		}
-		mutex_unlock(&lli->lli_och_mutex);
-		if (rc < 0) /* more than 1 opener */
-			return ERR_PTR(rc);
-
-		LASSERT(fd->fd_och != NULL);
-		old_handle = fd->fd_och->och_fh;
-	}
-
-	och = kzalloc(sizeof(*och), GFP_NOFS);
-	if (!och)
-		return ERR_PTR(-ENOMEM);
-
-	op_data = ll_prep_md_op_data(NULL, inode, inode, NULL, 0, 0,
-					LUSTRE_OPC_ANY, NULL);
-	if (IS_ERR(op_data)) {
-		rc = PTR_ERR(op_data);
-		goto out;
-	}
-
-	/* To tell the MDT this openhandle is from the same owner */
-	op_data->op_handle = old_handle;
-
-	it.it_flags = fmode | open_flags;
-	it.it_flags |= MDS_OPEN_LOCK | MDS_OPEN_BY_FID | MDS_OPEN_LEASE;
-	rc = md_intent_lock(sbi->ll_md_exp, op_data, NULL, 0, &it, 0, &req,
-				ll_md_blocking_lease_ast,
-	/* LDLM_FL_NO_LRU: To not put the lease lock into LRU list, otherwise
-	 * it can be cancelled which may mislead applications that the lease is
-	 * broken;
-	 * LDLM_FL_EXCL: Set this flag so that it won't be matched by normal
-	 * open in ll_md_blocking_ast(). Otherwise as ll_md_blocking_lease_ast
-	 * doesn't deal with openhandle, so normal openhandle will be leaked. */
-				LDLM_FL_NO_LRU | LDLM_FL_EXCL);
-	ll_finish_md_op_data(op_data);
-	ptlrpc_req_finished(req);
-	if (rc < 0)
-		goto out_release_it;
-
-	if (it_disposition(&it, DISP_LOOKUP_NEG)) {
-		rc = -ENOENT;
-		goto out_release_it;
-	}
-
-	rc = it_open_error(DISP_OPEN_OPEN, &it);
-	if (rc)
-		goto out_release_it;
-
-	LASSERT(it_disposition(&it, DISP_ENQ_OPEN_REF));
-	ll_och_fill(sbi->ll_md_exp, &it, och);
-
-	if (!it_disposition(&it, DISP_OPEN_LEASE)) /* old server? */ {
-		rc = -EOPNOTSUPP;
-		goto out_close;
-	}
-
-	/* already get lease, handle lease lock */
-	ll_set_lock_data(sbi->ll_md_exp, inode, &it, NULL);
-	if (it.d.lustre.it_lock_mode == 0 ||
-	    it.d.lustre.it_lock_bits != MDS_INODELOCK_OPEN) {
-		/* open lock must return for lease */
-		CERROR(DFID "lease granted but no open lock, %d/%llu.\n",
-			PFID(ll_inode2fid(inode)), it.d.lustre.it_lock_mode,
-			it.d.lustre.it_lock_bits);
-		rc = -EPROTO;
-		goto out_close;
-	}
-
-	ll_intent_release(&it);
-	return och;
-
-out_close:
-	rc2 = ll_close_inode_openhandle(sbi->ll_md_exp, inode, och, NULL);
-	if (rc2)
-		CERROR("Close openhandle returned %d\n", rc2);
-
-	/* cancel open lock */
-	if (it.d.lustre.it_lock_mode != 0) {
-		ldlm_lock_decref_and_cancel(&och->och_lease_handle,
-						it.d.lustre.it_lock_mode);
-		it.d.lustre.it_lock_mode = 0;
-	}
-out_release_it:
-	ll_intent_release(&it);
-out:
-	kfree(och);
-	return ERR_PTR(rc);
-}
-
-/**
- * Release lease and close the file.
- * It will check if the lease has ever broken.
- */
-static int ll_lease_close(struct obd_client_handle *och, struct inode *inode,
-			  bool *lease_broken)
-{
-	struct ldlm_lock *lock;
-	bool cancelled = true;
-	int rc;
-
-	lock = ldlm_handle2lock(&och->och_lease_handle);
-	if (lock != NULL) {
-		lock_res_and_lock(lock);
-		cancelled = ldlm_is_cancel(lock);
-		unlock_res_and_lock(lock);
-		ldlm_lock_put(lock);
-	}
-
-	CDEBUG(D_INODE, "lease for "DFID" broken? %d\n",
-		PFID(&ll_i2info(inode)->lli_fid), cancelled);
-
-	if (!cancelled)
-		ldlm_cli_cancel(&och->och_lease_handle, 0);
-	if (lease_broken != NULL)
-		*lease_broken = cancelled;
-
-	rc = ll_close_inode_openhandle(ll_i2sbi(inode)->ll_md_exp, inode, och,
-				       NULL);
-	return rc;
-}
-
-/* Fills the obdo with the attributes for the lsm */
-static int ll_lsm_getattr(struct lov_stripe_md *lsm, struct obd_export *exp,
-			  struct obdo *obdo, __u64 ioepoch, int sync)
-{
-	struct ptlrpc_request_set *set;
-	struct obd_info	    oinfo = { };
-	int			rc;
-
-	LASSERT(lsm != NULL);
-
-	oinfo.oi_md = lsm;
-	oinfo.oi_oa = obdo;
-	oinfo.oi_oa->o_oi = lsm->lsm_oi;
-	oinfo.oi_oa->o_mode = S_IFREG;
-	oinfo.oi_oa->o_ioepoch = ioepoch;
-	oinfo.oi_oa->o_valid = OBD_MD_FLID | OBD_MD_FLTYPE |
-			       OBD_MD_FLSIZE | OBD_MD_FLBLOCKS |
-			       OBD_MD_FLBLKSZ | OBD_MD_FLATIME |
-			       OBD_MD_FLMTIME | OBD_MD_FLCTIME |
-			       OBD_MD_FLGROUP | OBD_MD_FLEPOCH |
-			       OBD_MD_FLDATAVERSION;
-	if (sync) {
-		oinfo.oi_oa->o_valid |= OBD_MD_FLFLAGS;
-		oinfo.oi_oa->o_flags |= OBD_FL_SRVLOCK;
-	}
-
-	set = ptlrpc_prep_set();
-	if (set == NULL) {
-		CERROR("can't allocate ptlrpc set\n");
-		rc = -ENOMEM;
-	} else {
-		rc = obd_getattr_async(exp, &oinfo, set);
-		if (rc == 0)
-			rc = ptlrpc_set_wait(set);
-		ptlrpc_set_destroy(set);
-	}
-	if (rc == 0)
-		oinfo.oi_oa->o_valid &= (OBD_MD_FLBLOCKS | OBD_MD_FLBLKSZ |
-					 OBD_MD_FLATIME | OBD_MD_FLMTIME |
-					 OBD_MD_FLCTIME | OBD_MD_FLSIZE |
-					 OBD_MD_FLDATAVERSION);
-	return rc;
-}
-
-/**
-  * Performs the getattr on the inode and updates its fields.
-  * If @sync != 0, perform the getattr under the server-side lock.
-  */
-int ll_inode_getattr(struct inode *inode, struct obdo *obdo,
-		     __u64 ioepoch, int sync)
-{
-	struct lov_stripe_md *lsm;
-	int rc;
-
-	lsm = ccc_inode_lsm_get(inode);
-	rc = ll_lsm_getattr(lsm, ll_i2dtexp(inode),
-			    obdo, ioepoch, sync);
-	if (rc == 0) {
-		struct ost_id *oi = lsm ? &lsm->lsm_oi : &obdo->o_oi;
-
-		obdo_refresh_inode(inode, obdo, obdo->o_valid);
-		CDEBUG(D_INODE, "objid " DOSTID " size %llu, blocks %llu, blksize %lu\n",
-		       POSTID(oi), i_size_read(inode),
-		       (unsigned long long)inode->i_blocks,
-		       1UL << inode->i_blkbits);
-	}
-	ccc_inode_lsm_put(inode, lsm);
-	return rc;
-}
-
-int ll_merge_lvb(const struct lu_env *env, struct inode *inode)
-{
-	struct ll_inode_info *lli = ll_i2info(inode);
-	struct cl_object *obj = lli->lli_clob;
-	struct cl_attr *attr = ccc_env_thread_attr(env);
-	struct ost_lvb lvb;
-	int rc = 0;
-
-	ll_inode_size_lock(inode);
-	/* merge timestamps the most recently obtained from mds with
-	   timestamps obtained from osts */
-	LTIME_S(inode->i_atime) = lli->lli_lvb.lvb_atime;
-	LTIME_S(inode->i_mtime) = lli->lli_lvb.lvb_mtime;
-	LTIME_S(inode->i_ctime) = lli->lli_lvb.lvb_ctime;
-
-	lvb.lvb_size = i_size_read(inode);
-	lvb.lvb_blocks = inode->i_blocks;
-	lvb.lvb_mtime = LTIME_S(inode->i_mtime);
-	lvb.lvb_atime = LTIME_S(inode->i_atime);
-	lvb.lvb_ctime = LTIME_S(inode->i_ctime);
-
-	cl_object_attr_lock(obj);
-	rc = cl_object_attr_get(env, obj, attr);
-	cl_object_attr_unlock(obj);
-
-	if (rc == 0) {
-		if (lvb.lvb_atime < attr->cat_atime)
-			lvb.lvb_atime = attr->cat_atime;
-		if (lvb.lvb_ctime < attr->cat_ctime)
-			lvb.lvb_ctime = attr->cat_ctime;
-		if (lvb.lvb_mtime < attr->cat_mtime)
-			lvb.lvb_mtime = attr->cat_mtime;
-
-		CDEBUG(D_VFSTRACE, DFID" updating i_size %llu\n",
-				PFID(&lli->lli_fid), attr->cat_size);
-		cl_isize_write_nolock(inode, attr->cat_size);
-
-		inode->i_blocks = attr->cat_blocks;
-
-		LTIME_S(inode->i_mtime) = lvb.lvb_mtime;
-		LTIME_S(inode->i_atime) = lvb.lvb_atime;
-		LTIME_S(inode->i_ctime) = lvb.lvb_ctime;
-	}
-	ll_inode_size_unlock(inode);
-
-	return rc;
-}
-
-int ll_glimpse_ioctl(struct ll_sb_info *sbi, struct lov_stripe_md *lsm,
-		     lstat_t *st)
-{
-	struct obdo obdo = { 0 };
-	int rc;
-
-	rc = ll_lsm_getattr(lsm, sbi->ll_dt_exp, &obdo, 0, 0);
-	if (rc == 0) {
-		st->st_size   = obdo.o_size;
-		st->st_blocks = obdo.o_blocks;
-		st->st_mtime  = obdo.o_mtime;
-		st->st_atime  = obdo.o_atime;
-		st->st_ctime  = obdo.o_ctime;
-	}
-	return rc;
-}
-
-static bool file_is_noatime(const struct file *file)
-{
-	const struct vfsmount *mnt = file->f_path.mnt;
-	const struct inode *inode = file_inode(file);
-
-	/* Adapted from file_accessed() and touch_atime().*/
-	if (file->f_flags & O_NOATIME)
-		return true;
-
-	if (inode->i_flags & S_NOATIME)
-		return true;
-
-	if (IS_NOATIME(inode))
-		return true;
-
-	if (mnt->mnt_flags & (MNT_NOATIME | MNT_READONLY))
-		return true;
-
-	if ((mnt->mnt_flags & MNT_NODIRATIME) && S_ISDIR(inode->i_mode))
-		return true;
-
-	if ((inode->i_sb->s_flags & MS_NODIRATIME) && S_ISDIR(inode->i_mode))
-		return true;
-
-	return false;
-}
-
-void ll_io_init(struct cl_io *io, const struct file *file, int write)
-{
-	struct inode *inode = file_inode(file);
-
-	io->u.ci_rw.crw_nonblock = file->f_flags & O_NONBLOCK;
-	if (write) {
-		io->u.ci_wr.wr_append = !!(file->f_flags & O_APPEND);
-		io->u.ci_wr.wr_sync = file->f_flags & O_SYNC ||
-				      file->f_flags & O_DIRECT ||
-				      IS_SYNC(inode);
-	}
-	io->ci_obj     = ll_i2info(inode)->lli_clob;
-	io->ci_lockreq = CILR_MAYBE;
-	if (ll_file_nolock(file)) {
-		io->ci_lockreq = CILR_NEVER;
-		io->ci_no_srvlock = 1;
-	} else if (file->f_flags & O_APPEND) {
-		io->ci_lockreq = CILR_MANDATORY;
-	}
-
-	io->ci_noatime = file_is_noatime(file);
-}
-
-static ssize_t
-ll_file_io_generic(const struct lu_env *env, struct vvp_io_args *args,
-		   struct file *file, enum cl_io_type iot,
-		   loff_t *ppos, size_t count)
-{
-	struct ll_inode_info *lli = ll_i2info(file_inode(file));
-	struct ll_file_data  *fd  = LUSTRE_FPRIVATE(file);
-	struct cl_io	 *io;
-	ssize_t	       result;
-
-restart:
-	io = ccc_env_thread_io(env);
-	ll_io_init(io, file, iot == CIT_WRITE);
-
-	if (cl_io_rw_init(env, io, iot, *ppos, count) == 0) {
-		struct vvp_io *vio = vvp_env_io(env);
-		struct ccc_io *cio = ccc_env_io(env);
-		int write_mutex_locked = 0;
-
-		cio->cui_fd  = LUSTRE_FPRIVATE(file);
-		vio->cui_io_subtype = args->via_io_subtype;
-
-		switch (vio->cui_io_subtype) {
-		case IO_NORMAL:
-			cio->cui_iter = args->u.normal.via_iter;
-			cio->cui_iocb = args->u.normal.via_iocb;
-			if ((iot == CIT_WRITE) &&
-			    !(cio->cui_fd->fd_flags & LL_FILE_GROUP_LOCKED)) {
-				if (mutex_lock_interruptible(&lli->
-							       lli_write_mutex)) {
-					result = -ERESTARTSYS;
-					goto out;
-				}
-				write_mutex_locked = 1;
-			} else if (iot == CIT_READ) {
-				down_read(&lli->lli_trunc_sem);
-			}
-			break;
-		case IO_SPLICE:
-			vio->u.splice.cui_pipe = args->u.splice.via_pipe;
-			vio->u.splice.cui_flags = args->u.splice.via_flags;
-			break;
-		default:
-			CERROR("Unknown IO type - %u\n", vio->cui_io_subtype);
-			LBUG();
-		}
-		result = cl_io_loop(env, io);
-		if (write_mutex_locked)
-			mutex_unlock(&lli->lli_write_mutex);
-		else if (args->via_io_subtype == IO_NORMAL && iot == CIT_READ)
-			up_read(&lli->lli_trunc_sem);
-	} else {
-		/* cl_io_rw_init() handled IO */
-		result = io->ci_result;
-	}
-
-	if (io->ci_nob > 0) {
-		result = io->ci_nob;
-		*ppos = io->u.ci_wr.wr.crw_pos;
-	}
-	goto out;
-out:
-	cl_io_fini(env, io);
-	/* If any bit been read/written (result != 0), we just return
-	 * short read/write instead of restart io. */
-	if ((result == 0 || result == -ENODATA) && io->ci_need_restart) {
-		CDEBUG(D_VFSTRACE, "Restart %s on %pD from %lld, count:%zd\n",
-		       iot == CIT_READ ? "read" : "write",
-		       file, *ppos, count);
-		LASSERTF(io->ci_nob == 0, "%zd", io->ci_nob);
-		goto restart;
-	}
-
-	if (iot == CIT_READ) {
-		if (result >= 0)
-			ll_stats_ops_tally(ll_i2sbi(file_inode(file)),
-					   LPROC_LL_READ_BYTES, result);
-	} else if (iot == CIT_WRITE) {
-		if (result >= 0) {
-			ll_stats_ops_tally(ll_i2sbi(file_inode(file)),
-					   LPROC_LL_WRITE_BYTES, result);
-			fd->fd_write_failed = false;
-		} else if (result != -ERESTARTSYS) {
-			fd->fd_write_failed = true;
-		}
-	}
-
-	return result;
-}
-
-static ssize_t ll_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
-{
-	struct lu_env      *env;
-	struct vvp_io_args *args;
-	ssize_t	     result;
-	int		 refcheck;
-
-	env = cl_env_get(&refcheck);
-	if (IS_ERR(env))
-		return PTR_ERR(env);
-
-	args = vvp_env_args(env, IO_NORMAL);
-	args->u.normal.via_iter = to;
-	args->u.normal.via_iocb = iocb;
-
-	result = ll_file_io_generic(env, args, iocb->ki_filp, CIT_READ,
-				    &iocb->ki_pos, iov_iter_count(to));
-	cl_env_put(env, &refcheck);
-	return result;
-}
-
-/*
- * Write to a file (through the page cache).
- */
-static ssize_t ll_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
-{
-	struct lu_env      *env;
-	struct vvp_io_args *args;
-	ssize_t	     result;
-	int		 refcheck;
-
-	env = cl_env_get(&refcheck);
-	if (IS_ERR(env))
-		return PTR_ERR(env);
-
-	args = vvp_env_args(env, IO_NORMAL);
-	args->u.normal.via_iter = from;
-	args->u.normal.via_iocb = iocb;
-
-	result = ll_file_io_generic(env, args, iocb->ki_filp, CIT_WRITE,
-				  &iocb->ki_pos, iov_iter_count(from));
-	cl_env_put(env, &refcheck);
-	return result;
-}
-
-/*
- * Send file content (through pagecache) somewhere with helper
- */
-static ssize_t ll_file_splice_read(struct file *in_file, loff_t *ppos,
-				   struct pipe_inode_info *pipe, size_t count,
-				   unsigned int flags)
-{
-	struct lu_env      *env;
-	struct vvp_io_args *args;
-	ssize_t	     result;
-	int		 refcheck;
-
-	env = cl_env_get(&refcheck);
-	if (IS_ERR(env))
-		return PTR_ERR(env);
-
-	args = vvp_env_args(env, IO_SPLICE);
-	args->u.splice.via_pipe = pipe;
-	args->u.splice.via_flags = flags;
-
-	result = ll_file_io_generic(env, args, in_file, CIT_READ, ppos, count);
-	cl_env_put(env, &refcheck);
-	return result;
-}
-
-static int ll_lov_recreate(struct inode *inode, struct ost_id *oi, u32 ost_idx)
-{
-	struct obd_export *exp = ll_i2dtexp(inode);
-	struct obd_trans_info oti = { 0 };
-	struct obdo *oa = NULL;
-	int lsm_size;
-	int rc = 0;
-	struct lov_stripe_md *lsm = NULL, *lsm2;
-
-	oa = kmem_cache_alloc(obdo_cachep, GFP_NOFS | __GFP_ZERO);
-	if (oa == NULL)
-		return -ENOMEM;
-
-	lsm = ccc_inode_lsm_get(inode);
-	if (!lsm_has_objects(lsm)) {
-		rc = -ENOENT;
-		goto out;
-	}
-
-	lsm_size = sizeof(*lsm) + (sizeof(struct lov_oinfo) *
-		   (lsm->lsm_stripe_count));
-
-	lsm2 = libcfs_kvzalloc(lsm_size, GFP_NOFS);
-	if (lsm2 == NULL) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	oa->o_oi = *oi;
-	oa->o_nlink = ost_idx;
-	oa->o_flags |= OBD_FL_RECREATE_OBJS;
-	oa->o_valid = OBD_MD_FLID | OBD_MD_FLFLAGS | OBD_MD_FLGROUP;
-	obdo_from_inode(oa, inode, OBD_MD_FLTYPE | OBD_MD_FLATIME |
-				   OBD_MD_FLMTIME | OBD_MD_FLCTIME);
-	obdo_set_parent_fid(oa, &ll_i2info(inode)->lli_fid);
-	memcpy(lsm2, lsm, lsm_size);
-	ll_inode_size_lock(inode);
-	rc = obd_create(NULL, exp, oa, &lsm2, &oti);
-	ll_inode_size_unlock(inode);
-
-	kvfree(lsm2);
-	goto out;
-out:
-	ccc_inode_lsm_put(inode, lsm);
-	kmem_cache_free(obdo_cachep, oa);
-	return rc;
-}
-
-static int ll_lov_recreate_obj(struct inode *inode, unsigned long arg)
-{
-	struct ll_recreate_obj ucreat;
-	struct ost_id		oi;
-
-	if (!capable(CFS_CAP_SYS_ADMIN))
-		return -EPERM;
-
-	if (copy_from_user(&ucreat, (struct ll_recreate_obj *)arg,
-			   sizeof(ucreat)))
-		return -EFAULT;
-
-	ostid_set_seq_mdt0(&oi);
-	ostid_set_id(&oi, ucreat.lrc_id);
-	return ll_lov_recreate(inode, &oi, ucreat.lrc_ost_idx);
-}
-
-static int ll_lov_recreate_fid(struct inode *inode, unsigned long arg)
-{
-	struct lu_fid	fid;
-	struct ost_id	oi;
-	u32		ost_idx;
-
-	if (!capable(CFS_CAP_SYS_ADMIN))
-		return -EPERM;
-
-	if (copy_from_user(&fid, (struct lu_fid *)arg, sizeof(fid)))
-		return -EFAULT;
-
-	fid_to_ostid(&fid, &oi);
-	ost_idx = (fid_seq(&fid) >> 16) & 0xffff;
-	return ll_lov_recreate(inode, &oi, ost_idx);
-}
-
-int ll_lov_setstripe_ea_info(struct inode *inode, struct dentry *dentry,
-			     int flags, struct lov_user_md *lum, int lum_size)
-{
-	struct lov_stripe_md *lsm = NULL;
-	struct lookup_intent oit = {.it_op = IT_OPEN, .it_flags = flags};
-	int rc = 0;
-
-	lsm = ccc_inode_lsm_get(inode);
-	if (lsm != NULL) {
-		ccc_inode_lsm_put(inode, lsm);
-		CDEBUG(D_IOCTL, "stripe already exists for ino %lu\n",
-		       inode->i_ino);
-		rc = -EEXIST;
-		goto out;
-	}
-
-	ll_inode_size_lock(inode);
-	rc = ll_intent_file_open(dentry, lum, lum_size, &oit);
-	if (rc)
-		goto out_unlock;
-	rc = oit.d.lustre.it_status;
-	if (rc < 0)
-		goto out_req_free;
-
-	ll_release_openhandle(inode, &oit);
-
-out_unlock:
-	ll_inode_size_unlock(inode);
-	ll_intent_release(&oit);
-	ccc_inode_lsm_put(inode, lsm);
-out:
-	return rc;
-out_req_free:
-	ptlrpc_req_finished((struct ptlrpc_request *) oit.d.lustre.it_data);
-	goto out;
-}
-
-int ll_lov_getstripe_ea_info(struct inode *inode, const char *filename,
-			     struct lov_mds_md **lmmp, int *lmm_size,
-			     struct ptlrpc_request **request)
-{
-	struct ll_sb_info *sbi = ll_i2sbi(inode);
-	struct mdt_body  *body;
-	struct lov_mds_md *lmm = NULL;
-	struct ptlrpc_request *req = NULL;
-	struct md_op_data *op_data;
-	int rc, lmmsize;
-
-	rc = ll_get_default_mdsize(sbi, &lmmsize);
-	if (rc)
-		return rc;
-
-	op_data = ll_prep_md_op_data(NULL, inode, NULL, filename,
-				     strlen(filename), lmmsize,
-				     LUSTRE_OPC_ANY, NULL);
-	if (IS_ERR(op_data))
-		return PTR_ERR(op_data);
-
-	op_data->op_valid = OBD_MD_FLEASIZE | OBD_MD_FLDIREA;
-	rc = md_getattr_name(sbi->ll_md_exp, op_data, &req);
-	ll_finish_md_op_data(op_data);
-	if (rc < 0) {
-		CDEBUG(D_INFO, "md_getattr_name failed on %s: rc %d\n",
-		       filename, rc);
-		goto out;
-	}
-
-	body = req_capsule_server_get(&req->rq_pill, &RMF_MDT_BODY);
-	LASSERT(body != NULL); /* checked by mdc_getattr_name */
-
-	lmmsize = body->eadatasize;
-
-	if (!(body->valid & (OBD_MD_FLEASIZE | OBD_MD_FLDIREA)) ||
-			lmmsize == 0) {
-		rc = -ENODATA;
-		goto out;
-	}
-
-	lmm = req_capsule_server_sized_get(&req->rq_pill, &RMF_MDT_MD, lmmsize);
-	LASSERT(lmm != NULL);
-
-	if ((lmm->lmm_magic != cpu_to_le32(LOV_MAGIC_V1)) &&
-	    (lmm->lmm_magic != cpu_to_le32(LOV_MAGIC_V3))) {
-		rc = -EPROTO;
-		goto out;
-	}
-
+	spin_lock(&re->lock);
 	/*
-	 * This is coming from the MDS, so is probably in
-	 * little endian.  We convert it to host endian before
-	 * passing it to userspace.
+	 * just take the full list from the extent. afterwards we
+	 * don't need the lock anymore
 	 */
-	if (cpu_to_le32(LOV_MAGIC) != LOV_MAGIC) {
-		int stripe_count;
-
-		stripe_count = le16_to_cpu(lmm->lmm_stripe_count);
-		if (le32_to_cpu(lmm->lmm_pattern) & LOV_PATTERN_F_RELEASED)
-			stripe_count = 0;
-
-		/* if function called for directory - we should
-		 * avoid swab not existent lsm objects */
-		if (lmm->lmm_magic == cpu_to_le32(LOV_MAGIC_V1)) {
-			lustre_swab_lov_user_md_v1((struct lov_user_md_v1 *)lmm);
-			if (S_ISREG(body->mode))
-				lustre_swab_lov_user_md_objects(
-				 ((struct lov_user_md_v1 *)lmm)->lmm_objects,
-				 stripe_count);
-		} else if (lmm->lmm_magic == cpu_to_le32(LOV_MAGIC_V3)) {
-			lustre_swab_lov_user_md_v3((struct lov_user_md_v3 *)lmm);
-			if (S_ISREG(body->mode))
-				lustre_swab_lov_user_md_objects(
-				 ((struct lov_user_md_v3 *)lmm)->lmm_objects,
-				 stripe_count);
-		}
-	}
-
-out:
-	*lmmp = lmm;
-	*lmm_size = lmmsize;
-	*request = req;
-	return rc;
-}
-
-static int ll_lov_setea(struct inode *inode, struct file *file,
-			    unsigned long arg)
-{
-	int			 flags = MDS_OPEN_HAS_OBJS | FMODE_WRITE;
-	struct lov_user_md	*lump;
-	int			 lum_size = sizeof(struct lov_user_md) +
-					    sizeof(struct lov_user_ost_data);
-	int			 rc;
-
-	if (!capable(CFS_CAP_SYS_ADMIN))
-		return -EPERM;
-
-	lump = libcfs_kvzalloc(lum_size, GFP_NOFS);
-	if (lump == NULL)
-		return -ENOMEM;
-
-	if (copy_from_user(lump, (struct lov_user_md *)arg, lum_size)) {
-		kvfree(lump);
-		return -EFAULT;
-	}
-
-	rc = ll_lov_setstripe_ea_info(inode, file->f_path.dentry, flags, lump,
-				     lum_size);
-	cl_lov_delay_create_clear(&file->f_flags);
-
-	kvfree(lump);
-	return rc;
-}
-
-static int ll_lov_setstripe(struct inode *inode, struct file *file,
-			    unsigned long arg)
-{
-	struct lov_user_md_v3	 lumv3;
-	struct lov_user_md_v1	*lumv1 = (struct lov_user_md_v1 *)&lumv3;
-	struct lov_user_md_v1	*lumv1p = (struct lov_user_md_v1 *)arg;
-	struct lov_user_md_v3	*lumv3p = (struct lov_user_md_v3 *)arg;
-	int			 lum_size, rc;
-	int			 flags = FMODE_WRITE;
-
-	/* first try with v1 which is smaller than v3 */
-	lum_size = sizeof(struct lov_user_md_v1);
-	if (copy_from_user(lumv1, lumv1p, lum_size))
-		return -EFAULT;
-
-	if (lumv1->lmm_magic == LOV_USER_MAGIC_V3) {
-		lum_size = sizeof(struct lov_user_md_v3);
-		if (copy_from_user(&lumv3, lumv3p, lum_size))
-			return -EFAULT;
-	}
-
-	rc = ll_lov_setstripe_ea_info(inode, file->f_path.dentry, flags, lumv1,
-				      lum_size);
-	cl_lov_delay_create_clear(&file->f_flags);
-	if (rc == 0) {
-		struct lov_stripe_md *lsm;
-		__u32 gen;
-
-		put_user(0, &lumv1p->lmm_stripe_count);
-
-		ll_layout_refresh(inode, &gen);
-		lsm = ccc_inode_lsm_get(inode);
-		rc = obd_iocontrol(LL_IOC_LOV_GETSTRIPE, ll_i2dtexp(inode),
-				   0, lsm, (void *)arg);
-		ccc_inode_lsm_put(inode, lsm);
-	}
-	return rc;
-}
-
-static int ll_lov_getstripe(struct inode *inode, unsigned long arg)
-{
-	struct lov_stripe_md *lsm;
-	int rc = -ENODATA;
-
-	lsm = ccc_inode_lsm_get(inode);
-	if (lsm != NULL)
-		rc = obd_iocontrol(LL_IOC_LOV_GETSTRIPE, ll_i2dtexp(inode), 0,
-				   lsm, (void *)arg);
-	ccc_inode_lsm_put(inode, lsm);
-	return rc;
-}
-
-static int
-ll_get_grouplock(struct inode *inode, struct file *file, unsigned long arg)
-{
-	struct ll_inode_info   *lli = ll_i2info(inode);
-	struct ll_file_data    *fd = LUSTRE_FPRIVATE(file);
-	struct ccc_grouplock    grouplock;
-	int		     rc;
-
-	if (arg == 0) {
-		CWARN("group id for group lock must not be 0\n");
-		return -EINVAL;
-	}
-
-	if (ll_file_nolock(file))
-		return -EOPNOTSUPP;
-
-	spin_lock(&lli->lli_lock);
-	if (fd->fd_flags & LL_FILE_GROUP_LOCKED) {
-		CWARN("group lock already existed with gid %lu\n",
-		      fd->fd_grouplock.cg_gid);
-		spin_unlock(&lli->lli_lock);
-		return -EINVAL;
-	}
-	LASSERT(fd->fd_grouplock.cg_lock == NULL);
-	spin_unlock(&lli->lli_lock);
-
-	rc = cl_get_grouplock(cl_i2info(inode)->lli_clob,
-			      arg, (file->f_flags & O_NONBLOCK), &grouplock);
-	if (rc)
-		return rc;
-
-	spin_lock(&lli->lli_lock);
-	if (fd->fd_flags & LL_FILE_GROUP_LOCKED) {
-		spin_unlock(&lli->lli_lock);
-		CERROR("another thread just won the race\n");
-		cl_put_grouplock(&grouplock);
-		return -EINVAL;
-	}
-
-	fd->fd_flags |= LL_FILE_GROUP_LOCKED;
-	fd->fd_grouplock = grouplock;
-	spin_unlock(&lli->lli_lock);
-
-	CDEBUG(D_INFO, "group lock %lu obtained\n", arg);
-	return 0;
-}
-
-static int ll_put_grouplock(struct inode *inode, struct file *file,
-			    unsigned long arg)
-{
-	struct ll_inode_info   *lli = ll_i2info(inode);
-	struct ll_file_data    *fd = LUSTRE_FPRIVATE(file);
-	struct ccc_grouplock    grouplock;
-
-	spin_lock(&lli->lli_lock);
-	if (!(fd->fd_flags & LL_FILE_GROUP_LOCKED)) {
-		spin_unlock(&lli->lli_lock);
-		CWARN("no group lock held\n");
-		return -EINVAL;
-	}
-	LASSERT(fd->fd_grouplock.cg_lock != NULL);
-
-	if (fd->fd_grouplock.cg_gid != arg) {
-		CWARN("group lock %lu doesn't match current id %lu\n",
-		       arg, fd->fd_grouplock.cg_gid);
-		spin_unlock(&lli->lli_lock);
-		return -EINVAL;
-	}
-
-	grouplock = fd->fd_grouplock;
-	memset(&fd->fd_grouplock, 0, sizeof(fd->fd_grouplock));
-	fd->fd_flags &= ~LL_FILE_GROUP_LOCKED;
-	spin_unlock(&lli->lli_lock);
-
-	cl_put_grouplock(&grouplock);
-	CDEBUG(D_INFO, "group lock %lu released\n", arg);
-	return 0;
-}
-
-/**
- * Close inode open handle
- *
- * \param inode  [in]     inode in question
- * \param it     [in,out] intent which contains open info and result
- *
- * \retval 0     success
- * \retval <0    failure
- */
-int ll_release_openhandle(struct inode *inode, struct lookup_intent *it)
-{
-	struct obd_client_handle *och;
-	int rc;
-
-	LASSERT(inode);
-
-	/* Root ? Do nothing. */
-	if (is_root_inode(inode))
-		return 0;
-
-	/* No open handle to close? Move away */
-	if (!it_disposition(it, DISP_OPEN_OPEN))
-		return 0;
-
-	LASSERT(it_open_error(DISP_OPEN_OPEN, it) == 0);
-
-	och = kzalloc(sizeof(*och), GFP_NOFS);
-	if (!och) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	ll_och_fill(ll_i2sbi(inode)->ll_md_exp, it, och);
-
-	rc = ll_close_inode_openhandle(ll_i2sbi(inode)->ll_md_exp,
-				       inode, och, NULL);
-out:
-	/* this one is in place of ll_file_open */
-	if (it_disposition(it, DISP_ENQ_OPEN_REF)) {
-		ptlrpc_req_finished(it->d.lustre.it_data);
-		it_clear_disposition(it, DISP_ENQ_OPEN_REF);
-	}
-	return rc;
-}
-
-/**
- * Get size for inode for which FIEMAP mapping is requested.
- * Make the FIEMAP get_info call and returns the result.
- */
-static int ll_do_fiemap(struct inode *inode, struct ll_user_fiemap *fiemap,
-			size_t num_bytes)
-{
-	struct obd_export *exp = ll_i2dtexp(inode);
-	struct lov_stripe_md *lsm = NULL;
-	struct ll_fiemap_info_key fm_key = { .name = KEY_FIEMAP, };
-	__u32 vallen = num_bytes;
-	int rc;
-
-	/* Checks for fiemap flags */
-	if (fiemap->fm_flags & ~LUSTRE_FIEMAP_FLAGS_COMPAT) {
-		fiemap->fm_flags &= ~LUSTRE_FIEMAP_FLAGS_COMPAT;
-		return -EBADR;
-	}
-
-	/* Check for FIEMAP_FLAG_SYNC */
-	if (fiemap->fm_flags & FIEMAP_FLAG_SYNC) {
-		rc = filemap_fdatawrite(inode->i_mapping);
-		if (rc)
-			return rc;
-	}
-
-	lsm = ccc_inode_lsm_get(inode);
-	if (lsm == NULL)
-		return -ENOENT;
-
-	/* If the stripe_count > 1 and the application does not understand
-	 * DEVICE_ORDER flag, then it cannot interpret the extents correctly.
-	 */
-	if (lsm->lsm_stripe_count > 1 &&
-	    !(fiemap->fm_flags & FIEMAP_FLAG_DEVICE_ORDER)) {
-		rc = -EOPNOTSUPP;
-		goto out;
-	}
-
-	fm_key.oa.o_oi = lsm->lsm_oi;
-	fm_key.oa.o_valid = OBD_MD_FLID | OBD_MD_FLGROUP;
-
-	if (i_size_read(inode) == 0) {
-		rc = ll_glimpse_size(inode);
-		if (rc)
-			goto out;
-	}
-
-	obdo_from_inode(&fm_key.oa, inode, OBD_MD_FLSIZE);
-	obdo_set_parent_fid(&fm_key.oa, &ll_i2info(inode)->lli_fid);
-	/* If filesize is 0, then there would be no objects for mapping */
-	if (fm_key.oa.o_size == 0) {
-		fiemap->fm_mapped_extents = 0;
-		rc = 0;
-		goto out;
-	}
-
-	memcpy(&fm_key.fiemap, fiemap, sizeof(*fiemap));
-
-	rc = obd_get_info(NULL, exp, sizeof(fm_key), &fm_key, &vallen,
-			  fiemap, lsm);
-	if (rc)
-		CERROR("obd_get_info failed: rc = %d\n", rc);
-
-out:
-	ccc_inode_lsm_put(inode, lsm);
-	return rc;
-}
-
-int ll_fid2path(struct inode *inode, void __user *arg)
-{
-	struct obd_export *exp = ll_i2mdexp(inode);
-	const struct getinfo_fid2path __user *gfin = arg;
-	struct getinfo_fid2path *gfout;
-	u32 pathlen;
-	size_t outsize;
-	int rc;
-
-	if (!capable(CFS_CAP_DAC_READ_SEARCH) &&
-	    !(ll_i2sbi(inode)->ll_flags & LL_SBI_USER_FID2PATH))
-		return -EPERM;
-
-	/* Only need to get the buflen */
-	if (get_user(pathlen, &gfin->gf_pathlen))
-		return -EFAULT;
-
-	if (pathlen > PATH_MAX)
-		return -EINVAL;
-
-	outsize = sizeof(*gfout) + pathlen;
-
-	gfout = kzalloc(outsize, GFP_NOFS);
-	if (!gfout)
-		return -ENOMEM;
-
-	if (copy_from_user(gfout, arg, sizeof(*gfout))) {
-		rc = -EFAULT;
-		goto gf_free;
-	}
-
-	/* Call mdc_iocontrol */
-	rc = obd_iocontrol(OBD_IOC_FID2PATH, exp, outsize, gfout, NULL);
-	if (rc != 0)
-		goto gf_free;
-
-	if (copy_to_user(arg, gfout, outsize))
-		rc = -EFAULT;
-
-gf_free:
-	kfree(gfout);
-	return rc;
-}
-
-static int ll_ioctl_fiemap(struct inode *inode, unsigned long arg)
-{
-	struct ll_user_fiemap *fiemap_s;
-	size_t num_bytes, ret_bytes;
-	unsigned int extent_count;
-	int rc = 0;
-
-	/* Get the extent count so we can calculate the size of
-	 * required fiemap buffer */
-	if (get_user(extent_count,
-	    &((struct ll_user_fiemap __user *)arg)->fm_extent_count))
-		return -EFAULT;
-
-	if (extent_count >=
-	    (SIZE_MAX - sizeof(*fiemap_s)) / sizeof(struct ll_fiemap_extent))
-		return -EINVAL;
-	num_bytes = sizeof(*fiemap_s) + (extent_count *
-					 sizeof(struct ll_fiemap_extent));
-
-	fiemap_s = libcfs_kvzalloc(num_bytes, GFP_NOFS);
-	if (fiemap_s == NULL)
-		return -ENOMEM;
-
-	/* get the fiemap value */
-	if (copy_from_user(fiemap_s, (struct ll_user_fiemap __user *)arg,
-			   sizeof(*fiemap_s))) {
-		rc = -EFAULT;
-		goto error;
-	}
-
-	/* If fm_extent_count is non-zero, read the first extent since
-	 * it is used to calculate end_offset and device from previous
-	 * fiemap call. */
-	if (extent_count) {
-		if (copy_from_user(&fiemap_s->fm_extents[0],
-		    (char __user *)arg + sizeof(*fiemap_s),
-		    sizeof(struct ll_fiemap_extent))) {
-			rc = -EFAULT;
-			goto error;
-		}
-	}
-
-	rc = ll_do_fiemap(inode, fiemap_s, num_bytes);
-	if (rc)
-		goto error;
-
-	ret_bytes = sizeof(struct ll_user_fiemap);
-
-	if (extent_count != 0)
-		ret_bytes += (fiemap_s->fm_mapped_extents *
-				 sizeof(struct ll_fiemap_extent));
-
-	if (copy_to_user((void *)arg, fiemap_s, ret_bytes))
-		rc = -EFAULT;
-
-error:
-	kvfree(fiemap_s);
-	return rc;
-}
-
-/*
- * Read the data_version for inode.
- *
- * This value is computed using stripe object version on OST.
- * Version is computed using server side locking.
- *
- * @param extent_lock  Take extent lock. Not needed if a process is already
- *		       holding the OST object group locks.
- */
-int ll_data_version(struct inode *inode, __u64 *data_version,
-		    int extent_lock)
-{
-	struct lov_stripe_md	*lsm = NULL;
-	struct ll_sb_info	*sbi = ll_i2sbi(inode);
-	struct obdo		*obdo = NULL;
-	int			 rc;
-
-	/* If no stripe, we consider version is 0. */
-	lsm = ccc_inode_lsm_get(inode);
-	if (!lsm_has_objects(lsm)) {
-		*data_version = 0;
-		CDEBUG(D_INODE, "No object for inode\n");
-		rc = 0;
-		goto out;
-	}
-
-	obdo = kzalloc(sizeof(*obdo), GFP_NOFS);
-	if (!obdo) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	rc = ll_lsm_getattr(lsm, sbi->ll_dt_exp, obdo, 0, extent_lock);
-	if (rc == 0) {
-		if (!(obdo->o_valid & OBD_MD_FLDATAVERSION))
-			rc = -EOPNOTSUPP;
-		else
-			*data_version = obdo->o_data_version;
-	}
-
-	kfree(obdo);
-out:
-	ccc_inode_lsm_put(inode, lsm);
-	return rc;
-}
-
-/*
- * Trigger a HSM release request for the provided inode.
- */
-int ll_hsm_release(struct inode *inode)
-{
-	struct cl_env_nest nest;
-	struct lu_env *env;
-	struct obd_client_handle *och = NULL;
-	__u64 data_version = 0;
-	int rc;
-
-	CDEBUG(D_INODE, "%s: Releasing file "DFID".\n",
-	       ll_get_fsname(inode->i_sb, NULL, 0),
-	       PFID(&ll_i2info(inode)->lli_fid));
-
-	och = ll_lease_open(inode, NULL, FMODE_WRITE, MDS_OPEN_RELEASE);
-	if (IS_ERR(och)) {
-		rc = PTR_ERR(och);
-		goto out;
-	}
-
-	/* Grab latest data_version and [am]time values */
-	rc = ll_data_version(inode, &data_version, 1);
-	if (rc != 0)
-		goto out;
-
-	env = cl_env_nested_get(&nest);
-	if (IS_ERR(env)) {
-		rc = PTR_ERR(env);
-		goto out;
-	}
-
-	ll_merge_lvb(env, inode);
-	cl_env_nested_put(&nest, env);
-
-	/* Release the file.
-	 * NB: lease lock handle is released in mdc_hsm_release_pack() because
-	 * we still need it to pack l_remote_handle to MDT. */
-	rc = ll_close_inode_openhandle(ll_i2sbi(inode)->ll_md_exp, inode, och,
-				       &data_version);
-	och = NULL;
-
-out:
-	if (och != NULL && !IS_ERR(och)) /* close the file */
-		ll_lease_close(och, inode, NULL);
-
-	return rc;
-}
-
-struct ll_swap_stack {
-	struct iattr		 ia1, ia2;
-	__u64			 dv1, dv2;
-	struct inode		*inode1, *inode2;
-	bool			 check_dv1, check_dv2;
-};
-
-static int ll_swap_layouts(struct file *file1, struct file *file2,
-			   struct lustre_swap_layouts *lsl)
-{
-	struct mdc_swap_layouts	 msl;
-	struct md_op_data	*op_data;
-	__u32			 gid;
-	__u64			 dv;
-	struct ll_swap_stack	*llss = NULL;
-	int			 rc;
-
-	llss = kzalloc(sizeof(*llss), GFP_NOFS);
-	if (!llss)
-		return -ENOMEM;
-
-	llss->inode1 = file_inode(file1);
-	llss->inode2 = file_inode(file2);
-
-	if (!S_ISREG(llss->inode2->i_mode)) {
-		rc = -EINVAL;
-		goto free;
-	}
-
-	if (inode_permission(llss->inode1, MAY_WRITE) ||
-	    inode_permission(llss->inode2, MAY_WRITE)) {
-		rc = -EPERM;
-		goto free;
-	}
-
-	if (llss->inode2->i_sb != llss->inode1->i_sb) {
-		rc = -EXDEV;
-		goto free;
-	}
-
-	/* we use 2 bool because it is easier to swap than 2 bits */
-	if (lsl->sl_flags & SWAP_LAYOUTS_CHECK_DV1)
-		llss->check_dv1 = true;
-
-	if (lsl->sl_flags & SWAP_LAYOUTS_CHECK_DV2)
-		llss->check_dv2 = true;
-
-	/* we cannot use lsl->sl_dvX directly because we may swap them */
-	llss->dv1 = lsl->sl_dv1;
-	llss->dv2 = lsl->sl_dv2;
-
-	rc = lu_fid_cmp(ll_inode2fid(llss->inode1), ll_inode2fid(llss->inode2));
-	if (rc == 0) /* same file, done! */ {
-		rc = 0;
-		goto free;
-	}
-
-	if (rc < 0) { /* sequentialize it */
-		swap(llss->inode1, llss->inode2);
-		swap(file1, file2);
-		swap(llss->dv1, llss->dv2);
-		swap(llss->check_dv1, llss->check_dv2);
-	}
-
-	gid = lsl->sl_gid;
-	if (gid != 0) { /* application asks to flush dirty cache */
-		rc = ll_get_grouplock(llss->inode1, file1, gid);
-		if (rc < 0)
-			goto free;
-
-		rc = ll_get_grouplock(llss->inode2, file2, gid);
-		if (rc < 0) {
-			ll_put_grouplock(llss->inode1, file1, gid);
-			goto free;
-		}
-	}
-
-	/* to be able to restore mtime and atime after swap
-	 * we need to first save them */
-	if (lsl->sl_flags &
-	    (SWAP_LAYOUTS_KEEP_MTIME | SWAP_LAYOUTS_KEEP_ATIME)) {
-		llss->ia1.ia_mtime = llss->inode1->i_mtime;
-		llss->ia1.ia_atime = llss->inode1->i_atime;
-		llss->ia1.ia_valid = ATTR_MTIME | ATTR_ATIME;
-		llss->ia2.ia_mtime = llss->inode2->i_mtime;
-		llss->ia2.ia_atime = llss->inode2->i_atime;
-		llss->ia2.ia_valid = ATTR_MTIME | ATTR_ATIME;
-	}
-
-	/* ultimate check, before swapping the layouts we check if
-	 * dataversion has changed (if requested) */
-	if (llss->check_dv1) {
-		rc = ll_data_version(llss->inode1, &dv, 0);
-		if (rc)
-			goto putgl;
-		if (dv != llss->dv1) {
-			rc = -EAGAIN;
-			goto putgl;
-		}
-	}
-
-	if (llss->check_dv2) {
-		rc = ll_data_version(llss->inode2, &dv, 0);
-		if (rc)
-			goto putgl;
-		if (dv != llss->dv2) {
-			rc = -EAGAIN;
-			goto putgl;
-		}
-	}
-
-	/* struct md_op_data is used to send the swap args to the mdt
-	 * only flags is missing, so we use struct mdc_swap_layouts
-	 * through the md_op_data->op_data */
-	/* flags from user space have to be converted before they are send to
-	 * server, no flag is sent today, they are only used on the client */
-	msl.msl_flags = 0;
-	rc = -ENOMEM;
-	op_data = ll_prep_md_op_data(NULL, llss->inode1, llss->inode2, NULL, 0,
-				     0, LUSTRE_OPC_ANY, &msl);
-	if (IS_ERR(op_data)) {
-		rc = PTR_ERR(op_data);
-		goto free;
-	}
-
-	rc = obd_iocontrol(LL_IOC_LOV_SWAP_LAYOUTS, ll_i2mdexp(llss->inode1),
-			   sizeof(*op_data), op_data, NULL);
-	ll_finish_md_op_data(op_data);
-
-putgl:
-	if (gid != 0) {
-		ll_put_grouplock(llss->inode2, file2, gid);
-		ll_put_grouplock(llss->inode1, file1, gid);
-	}
-
-	/* rc can be set from obd_iocontrol() or from a GOTO(putgl, ...) */
-	if (rc != 0)
-		goto free;
-
-	/* clear useless flags */
-	if (!(lsl->sl_flags & SWAP_LAYOUTS_KEEP_MTIME)) {
-		llss->ia1.ia_valid &= ~ATTR_MTIME;
-		llss->ia2.ia_valid &= ~ATTR_MTIME;
-	}
-
-	if (!(lsl->sl_flags & SWAP_LAYOUTS_KEEP_ATIME)) {
-		llss->ia1.ia_valid &= ~ATTR_ATIME;
-		llss->ia2.ia_valid &= ~ATTR_ATIME;
-	}
-
-	/* update time if requested */
-	rc = 0;
-	if (llss->ia2.ia_valid != 0) {
-		mutex_lock(&llss->inode1->i_mutex);
-		rc = ll_setattr(file1->f_path.dentry, &llss->ia2);
-		mutex_unlock(&llss->inode1->i_mutex);
-	}
-
-	if (llss->ia1.ia_valid != 0) {
-		int rc1;
-
-		mutex_lock(&llss->inode2->i_mutex);
-		rc1 = ll_setattr(file2->f_path.dentry, &llss->ia1);
-		mutex_unlock(&llss->inode2->i_mutex);
-		if (rc == 0)
-			rc = rc1;
-	}
-
-free:
-	kfree(llss);
-
-	return rc;
-}
-
-static int ll_hsm_state_set(struct inode *inode, struct hsm_state_set *hss)
-{
-	struct md_op_data	*op_data;
-	int			 rc;
-
-	/* Detect out-of range masks */
-	if ((hss->hss_setmask | hss->hss_clearmask) & ~HSM_FLAGS_MASK)
-		return -EINVAL;
-
-	/* Non-root users are forbidden to set or clear flags which are
-	 * NOT defined in HSM_USER_MASK. */
-	if (((hss->hss_setmask | hss->hss_clearmask) & ~HSM_USER_MASK) &&
-	    !capable(CFS_CAP_SYS_ADMIN))
-		return -EPERM;
-
-	/* Detect out-of range archive id */
-	if ((hss->hss_valid & HSS_ARCHIVE_ID) &&
-	    (hss->hss_archive_id > LL_HSM_MAX_ARCHIVE))
-		return -EINVAL;
-
-	op_data = ll_prep_md_op_data(NULL, inode, NULL, NULL, 0, 0,
-				     LUSTRE_OPC_ANY, hss);
-	if (IS_ERR(op_data))
-		return PTR_ERR(op_data);
-
-	rc = obd_iocontrol(LL_IOC_HSM_STATE_SET, ll_i2mdexp(inode),
-			   sizeof(*op_data), op_data, NULL);
-
-	ll_finish_md_op_data(op_data);
-
-	return rc;
-}
-
-static int ll_hsm_import(struct inode *inode, struct file *file,
-			 struct hsm_user_import *hui)
-{
-	struct hsm_state_set	*hss = NULL;
-	struct iattr		*attr = NULL;
-	int			 rc;
-
-	if (!S_ISREG(inode->i_mode))
-		return -EINVAL;
-
-	/* set HSM flags */
-	hss = kzalloc(sizeof(*hss), GFP_NOFS);
-	if (!hss)
-		return -ENOMEM;
-
-	hss->hss_valid = HSS_SETMASK | HSS_ARCHIVE_ID;
-	hss->hss_archive_id = hui->hui_archive_id;
-	hss->hss_setmask = HS_ARCHIVED | HS_EXISTS | HS_RELEASED;
-	rc = ll_hsm_state_set(inode, hss);
-	if (rc != 0)
-		goto free_hss;
-
-	attr = kzalloc(sizeof(*attr), GFP_NOFS);
-	if (!attr) {
-		rc = -ENOMEM;
-		goto free_hss;
-	}
-
-	attr->ia_mode = hui->hui_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
-	attr->ia_mode |= S_IFREG;
-	attr->ia_uid = make_kuid(&init_user_ns, hui->hui_uid);
-	attr->ia_gid = make_kgid(&init_user_ns, hui->hui_gid);
-	attr->ia_size = hui->hui_size;
-	attr->ia_mtime.tv_sec = hui->hui_mtime;
-	attr->ia_mtime.tv_nsec = hui->hui_mtime_ns;
-	attr->ia_atime.tv_sec = hui->hui_atime;
-	attr->ia_atime.tv_nsec = hui->hui_atime_ns;
-
-	attr->ia_valid = ATTR_SIZE | ATTR_MODE | ATTR_FORCE |
-			 ATTR_UID | ATTR_GID |
-			 ATTR_MTIME | ATTR_MTIME_SET |
-			 ATTR_ATIME | ATTR_ATIME_SET;
-
-	mutex_lock(&inode->i_mutex);
-
-	rc = ll_setattr_raw(file->f_path.dentry, attr, true);
-	if (rc == -ENODATA)
-		rc = 0;
-
-	mutex_unlock(&inode->i_mutex);
-
-	kfree(attr);
-free_hss:
-	kfree(hss);
-	return rc;
-}
-
-static long
-ll_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	struct inode		*inode = file_inode(file);
-	struct ll_file_data	*fd = LUSTRE_FPRIVATE(file);
-	int			 flags, rc;
-
-	CDEBUG(D_VFSTRACE, "VFS Op:inode=%lu/%u(%p),cmd=%x\n", inode->i_ino,
-	       inode->i_generation, inode, cmd);
-	ll_stats_ops_tally(ll_i2sbi(inode), LPROC_LL_IOCTL, 1);
-
-	/* asm-ppc{,64} declares TCGETS, et. al. as type 't' not 'T' */
-	if (_IOC_TYPE(cmd) == 'T' || _IOC_TYPE(cmd) == 't') /* tty ioctls */
-		return -ENOTTY;
-
-	switch (cmd) {
-	case LL_IOC_GETFLAGS:
-		/* Get the current value of the file flags */
-		return put_user(fd->fd_flags, (int *)arg);
-	case LL_IOC_SETFLAGS:
-	case LL_IOC_CLRFLAGS:
-		/* Set or clear specific file flags */
-		/* XXX This probably needs checks to ensure the flags are
-		 *     not abused, and to handle any flag side effects.
+	list_replace_init(&re->extctl, &list);
+	for_dev = re->scheduled_for;
+	re->scheduled_for = NULL;
+	spin_unlock(&re->lock);
+
+	if (err == 0) {
+		nritems = level ? btrfs_header_nritems(eb) : 0;
+		generation = btrfs_header_generation(eb);
+		/*
+		 * FIXME: currently we just set nritems to 0 if this is a leaf,
+		 * effectively ignoring the content. In a next step we could
+		 * trigger more readahead depending from the content, e.g.
+		 * fetch the checksums for the extents in the leaf.
 		 */
-		if (get_user(flags, (int *) arg))
-			return -EFAULT;
-
-		if (cmd == LL_IOC_SETFLAGS) {
-			if ((flags & LL_FILE_IGNORE_LOCK) &&
-			    !(file->f_flags & O_DIRECT)) {
-				CERROR("%s: unable to disable locking on non-O_DIRECT file\n",
-				       current->comm);
-				return -EINVAL;
-			}
-
-			fd->fd_flags |= flags;
-		} else {
-			fd->fd_flags &= ~flags;
-		}
-		return 0;
-	case LL_IOC_LOV_SETSTRIPE:
-		return ll_lov_setstripe(inode, file, arg);
-	case LL_IOC_LOV_SETEA:
-		return ll_lov_setea(inode, file, arg);
-	case LL_IOC_LOV_SWAP_LAYOUTS: {
-		struct file *file2;
-		struct lustre_swap_layouts lsl;
-
-		if (copy_from_user(&lsl, (char *)arg,
-				       sizeof(struct lustre_swap_layouts)))
-			return -EFAULT;
-
-		if ((file->f_flags & O_ACCMODE) == 0) /* O_RDONLY */
-			return -EPERM;
-
-		file2 = fget(lsl.sl_fd);
-		if (file2 == NULL)
-			return -EBADF;
-
-		rc = -EPERM;
-		if ((file2->f_flags & O_ACCMODE) != 0) /* O_WRONLY or O_RDWR */
-			rc = ll_swap_layouts(file, file2, &lsl);
-		fput(file2);
-		return rc;
-	}
-	case LL_IOC_LOV_GETSTRIPE:
-		return ll_lov_getstripe(inode, arg);
-	case LL_IOC_RECREATE_OBJ:
-		return ll_lov_recreate_obj(inode, arg);
-	case LL_IOC_RECREATE_FID:
-		return ll_lov_recreate_fid(inode, arg);
-	case FSFILT_IOC_FIEMAP:
-		return ll_ioctl_fiemap(inode, arg);
-	case FSFILT_IOC_GETFLAGS:
-	case FSFILT_IOC_SETFLAGS:
-		return ll_iocontrol(inode, file, cmd, arg);
-	case FSFILT_IOC_GETVERSION_OLD:
-	case FSFILT_IOC_GETVERSION:
-		return put_user(inode->i_generation, (int *)arg);
-	case LL_IOC_GROUP_LOCK:
-		return ll_get_grouplock(inode, file, arg);
-	case LL_IOC_GROUP_UNLOCK:
-		return ll_put_grouplock(inode, file, arg);
-	case IOC_OBD_STATFS:
-		return ll_obd_statfs(inode, (void *)arg);
-
-	/* We need to special case any other ioctls we want to handle,
-	 * to send them to the MDS/OST as appropriate and to properly
-	 * network encode the arg field.
-	case FSFILT_IOC_SETVERSION_OLD:
-	case FSFILT_IOC_SETVERSION:
-	*/
-	case LL_IOC_FLUSHCTX:
-		return ll_flush_ctx(inode);
-	case LL_IOC_PATH2FID: {
-		if (copy_to_user((void *)arg, ll_inode2fid(inode),
-				 sizeof(struct lu_fid)))
-			return -EFAULT;
-
-		return 0;
-	}
-	case OBD_IOC_FID2PATH:
-		return ll_fid2path(inode, (void *)arg);
-	case LL_IOC_DATA_VERSION: {
-		struct ioc_data_version	idv;
-		int			rc;
-
-		if (copy_from_user(&idv, (char *)arg, sizeof(idv)))
-			return -EFAULT;
-
-		rc = ll_data_version(inode, &idv.idv_version,
-				!(idv.idv_flags & LL_DV_NOFLUSH));
-
-		if (rc == 0 && copy_to_user((char *) arg, &idv, sizeof(idv)))
-			return -EFAULT;
-
-		return rc;
-	}
-
-	case LL_IOC_GET_MDTIDX: {
-		int mdtidx;
-
-		mdtidx = ll_get_mdt_idx(inode);
-		if (mdtidx < 0)
-			return mdtidx;
-
-		if (put_user((int)mdtidx, (int *)arg))
-			return -EFAULT;
-
-		return 0;
-	}
-	case OBD_IOC_GETDTNAME:
-	case OBD_IOC_GETMDNAME:
-		return ll_get_obd_name(inode, cmd, arg);
-	case LL_IOC_HSM_STATE_GET: {
-		struct md_op_data	*op_data;
-		struct hsm_user_state	*hus;
-		int			 rc;
-
-		hus = kzalloc(sizeof(*hus), GFP_NOFS);
-		if (!hus)
-			return -ENOMEM;
-
-		op_data = ll_prep_md_op_data(NULL, inode, NULL, NULL, 0, 0,
-					     LUSTRE_OPC_ANY, hus);
-		if (IS_ERR(op_data)) {
-			kfree(hus);
-			return PTR_ERR(op_data);
-		}
-
-		rc = obd_iocontrol(cmd, ll_i2mdexp(inode), sizeof(*op_data),
-				   op_data, NULL);
-
-		if (copy_to_user((void *)arg, hus, sizeof(*hus)))
-			rc = -EFAULT;
-
-		ll_finish_md_op_data(op_data);
-		kfree(hus);
-		return rc;
-	}
-	case LL_IOC_HSM_STATE_SET: {
-		struct hsm_state_set	*hss;
-		int			 rc;
-
-		hss = memdup_user((char *)arg, sizeof(*hss));
-		if (IS_ERR(hss))
-			return PTR_ERR(hss);
-
-		rc = ll_hsm_state_set(inode, hss);
-
-		kfree(hss);
-		return rc;
-	}
-	case LL_IOC_HSM_ACTION: {
-		struct md_op_data		*op_data;
-		struct hsm_current_action	*hca;
-		int				 rc;
-
-		hca = kzalloc(sizeof(*hca), GFP_NOFS);
-		if (!hca)
-			return -ENOMEM;
-
-		op_data = ll_prep_md_op_data(NULL, inode, NULL, NULL, 0, 0,
-					     LUSTRE_OPC_ANY, hca);
-		if (IS_ERR(op_data)) {
-			kfree(hca);
-			return PTR_ERR(op_data);
-		}
-
-		rc = obd_iocontrol(cmd, ll_i2mdexp(inode), sizeof(*op_data),
-				   op_data, NULL);
-
-		if (copy_to_user((char *)arg, hca, sizeof(*hca)))
-			rc = -EFAULT;
-
-		ll_finish_md_op_data(op_data);
-		kfree(hca);
-		return rc;
-	}
-	case LL_IOC_SET_LEASE: {
-		struct ll_inode_info *lli = ll_i2info(inode);
-		struct obd_client_handle *och = NULL;
-		bool lease_broken;
-		fmode_t mode = 0;
-
-		switch (arg) {
-		case F_WRLCK:
-			if (!(file->f_mode & FMODE_WRITE))
-				return -EPERM;
-			mode = FMODE_WRITE;
-			break;
-		case F_RDLCK:
-			if (!(file->f_mode & FMODE_READ))
-				return -EPERM;
-			mode = FMODE_READ;
-			break;
-		case F_UNLCK:
-			mutex_lock(&lli->lli_och_mutex);
-			if (fd->fd_lease_och != NULL) {
-				och = fd->fd_lease_och;
-				fd->fd_lease_och = NULL;
-			}
-			mutex_unlock(&lli->lli_och_mutex);
-
-			if (och != NULL) {
-				mode = och->och_flags &
-				       (FMODE_READ|FMODE_WRITE);
-				rc = ll_lease_close(och, inode, &lease_broken);
-				if (rc == 0 && lease_broken)
-					mode = 0;
-			} else {
-				rc = -ENOLCK;
-			}
-
-			/* return the type of lease or error */
-			return rc < 0 ? rc : (int)mode;
-		default:
-			return -EINVAL;
-		}
-
-		CDEBUG(D_INODE, "Set lease with mode %d\n", mode);
-
-		/* apply for lease */
-		och = ll_lease_open(inode, file, mode, 0);
-		if (IS_ERR(och))
-			return PTR_ERR(och);
-
-		rc = 0;
-		mutex_lock(&lli->lli_och_mutex);
-		if (fd->fd_lease_och == NULL) {
-			fd->fd_lease_och = och;
-			och = NULL;
-		}
-		mutex_unlock(&lli->lli_och_mutex);
-		if (och != NULL) {
-			/* impossible now that only excl is supported for now */
-			ll_lease_close(och, inode, &lease_broken);
-			rc = -EBUSY;
-		}
-		return rc;
-	}
-	case LL_IOC_GET_LEASE: {
-		struct ll_inode_info *lli = ll_i2info(inode);
-		struct ldlm_lock *lock = NULL;
-
-		rc = 0;
-		mutex_lock(&lli->lli_och_mutex);
-		if (fd->fd_lease_och != NULL) {
-			struct obd_client_handle *och = fd->fd_lease_och;
-
-			lock = ldlm_handle2lock(&och->och_lease_handle);
-			if (lock != NULL) {
-				lock_res_and_lock(lock);
-				if (!ldlm_is_cancel(lock))
-					rc = och->och_flags &
-						(FMODE_READ | FMODE_WRITE);
-				unlock_res_and_lock(lock);
-				ldlm_lock_put(lock);
-			}
-		}
-		mutex_unlock(&lli->lli_och_mutex);
-		return rc;
-	}
-	case LL_IOC_HSM_IMPORT: {
-		struct hsm_user_import *hui;
-
-		hui = memdup_user((void *)arg, sizeof(*hui));
-		if (IS_ERR(hui))
-			return PTR_ERR(hui);
-
-		rc = ll_hsm_import(inode, file, hui);
-
-		kfree(hui);
-		return rc;
-	}
-	default: {
-		int err;
-
-		if (ll_iocontrol_call(inode, file, cmd, arg, &err) ==
-		     LLIOC_STOP)
-			return err;
-
-		return obd_iocontrol(cmd, ll_i2dtexp(inode), 0, NULL,
-				     (void *)arg);
-	}
-	}
-}
-
-static loff_t ll_file_seek(struct file *file, loff_t offset, int origin)
-{
-	struct inode *inode = file_inode(file);
-	loff_t retval, eof = 0;
-
-	retval = offset + ((origin == SEEK_END) ? i_size_read(inode) :
-			   (origin == SEEK_CUR) ? file->f_pos : 0);
-	CDEBUG(D_VFSTRACE, "VFS Op:inode=%lu/%u(%p), to=%llu=%#llx(%d)\n",
-	       inode->i_ino, inode->i_generation, inode, retval, retval,
-	       origin);
-	ll_stats_ops_tally(ll_i2sbi(inode), LPROC_LL_LLSEEK, 1);
-
-	if (origin == SEEK_END || origin == SEEK_HOLE || origin == SEEK_DATA) {
-		retval = ll_glimpse_size(inode);
-		if (retval != 0)
-			return retval;
-		eof = i_size_read(inode);
-	}
-
-	retval = generic_file_llseek_size(file, offset, origin,
-					  ll_file_maxbytes(inode), eof);
-	return retval;
-}
-
-static int ll_flush(struct file *file, fl_owner_t id)
-{
-	struct inode *inode = file_inode(file);
-	struct ll_inode_info *lli = ll_i2info(inode);
-	struct ll_file_data *fd = LUSTRE_FPRIVATE(file);
-	int rc, err;
-
-	LASSERT(!S_ISDIR(inode->i_mode));
-
-	/* catch async errors that were recorded back when async writeback
-	 * failed for pages in this mapping. */
-	rc = lli->lli_async_rc;
-	lli->lli_async_rc = 0;
-	err = lov_read_and_clear_async_rc(lli->lli_clob);
-	if (rc == 0)
-		rc = err;
-
-	/* The application has been told write failure already.
-	 * Do not report failure again. */
-	if (fd->fd_write_failed)
-		return 0;
-	return rc ? -EIO : 0;
-}
-
-/**
- * Called to make sure a portion of file has been written out.
- * if @mode is not CL_FSYNC_LOCAL, it will send OST_SYNC RPCs to OST.
- *
- * Return how many pages have been written.
- */
-int cl_sync_file_range(struct inode *inode, loff_t start, loff_t end,
-		       enum cl_fsync_mode mode, int ignore_layout)
-{
-	struct cl_env_nest nest;
-	struct lu_env *env;
-	struct cl_io *io;
-	struct cl_fsync_io *fio;
-	int result;
-
-	if (mode != CL_FSYNC_NONE && mode != CL_FSYNC_LOCAL &&
-	    mode != CL_FSYNC_DISCARD && mode != CL_FSYNC_ALL)
-		return -EINVAL;
-
-	env = cl_env_nested_get(&nest);
-	if (IS_ERR(env))
-		return PTR_ERR(env);
-
-	io = ccc_env_thread_io(env);
-	io->ci_obj = cl_i2info(inode)->lli_clob;
-	io->ci_ignore_layout = ignore_layout;
-
-	/* initialize parameters for sync */
-	fio = &io->u.ci_fsync;
-	fio->fi_start = start;
-	fio->fi_end = end;
-	fio->fi_fid = ll_inode2fid(inode);
-	fio->fi_mode = mode;
-	fio->fi_nr_written = 0;
-
-	if (cl_io_init(env, io, CIT_FSYNC, io->ci_obj) == 0)
-		result = cl_io_loop(env, io);
-	else
-		result = io->ci_result;
-	if (result == 0)
-		result = fio->fi_nr_written;
-	cl_io_fini(env, io);
-	cl_env_nested_put(&nest, env);
-
-	return result;
-}
-
-int ll_fsync(struct file *file, loff_t start, loff_t end, int datasync)
-{
-	struct inode *inode = file_inode(file);
-	struct ll_inode_info *lli = ll_i2info(inode);
-	struct ptlrpc_request *req;
-	int rc, err;
-
-	CDEBUG(D_VFSTRACE, "VFS Op:inode=%lu/%u(%p)\n", inode->i_ino,
-	       inode->i_generation, inode);
-	ll_stats_ops_tally(ll_i2sbi(inode), LPROC_LL_FSYNC, 1);
-
-	rc = filemap_write_and_wait_range(inode->i_mapping, start, end);
-	mutex_lock(&inode->i_mutex);
-
-	/* catch async errors that were recorded back when async writeback
-	 * failed for pages in this mapping. */
-	if (!S_ISDIR(inode->i_mode)) {
-		err = lli->lli_async_rc;
-		lli->lli_async_rc = 0;
-		if (rc == 0)
-			rc = err;
-		err = lov_read_and_clear_async_rc(lli->lli_clob);
-		if (rc == 0)
-			rc = err;
-	}
-
-	err = md_sync(ll_i2sbi(inode)->ll_md_exp, ll_inode2fid(inode), &req);
-	if (!rc)
-		rc = err;
-	if (!err)
-		ptlrpc_req_finished(req);
-
-	if (S_ISREG(inode->i_mode)) {
-		struct ll_file_data *fd = LUSTRE_FPRIVATE(file);
-
-		err = cl_sync_file_range(inode, start, end, CL_FSYNC_ALL, 0);
-		if (rc == 0 && err < 0)
-			rc = err;
-		if (rc < 0)
-			fd->fd_write_failed = true;
-		else
-			fd->fd_write_failed = false;
-	}
-
-	mutex_unlock(&inode->i_mutex);
-	return rc;
-}
-
-static int
-ll_file_flock(struct file *file, int cmd, struct file_lock *file_lock)
-{
-	struct inode *inode = file_inode(file);
-	struct ll_sb_info *sbi = ll_i2sbi(inode);
-	struct ldlm_enqueue_info einfo = {
-		.ei_type	= LDLM_FLOCK,
-		.ei_cb_cp	= ldlm_flock_completion_ast,
-		.ei_cbdata	= file_lock,
-	};
-	struct md_op_data *op_data;
-	struct lustre_handle lockh = {0};
-	ldlm_policy_data_t flock = { {0} };
-	__u64 flags = 0;
-	int rc;
-	int rc2 = 0;
-
-	CDEBUG(D_VFSTRACE, "VFS Op:inode=%lu file_lock=%p\n",
-	       inode->i_ino, file_lock);
-
-	ll_stats_ops_tally(ll_i2sbi(inode), LPROC_LL_FLOCK, 1);
-
-	if (file_lock->fl_flags & FL_FLOCK)
-		LASSERT((cmd == F_SETLKW) || (cmd == F_SETLK));
-	else if (!(file_lock->fl_flags & FL_POSIX))
-		return -EINVAL;
-
-	flock.l_flock.owner = (unsigned long)file_lock->fl_owner;
-	flock.l_flock.pid = file_lock->fl_pid;
-	flock.l_flock.start = file_lock->fl_start;
-	flock.l_flock.end = file_lock->fl_end;
-
-	/* Somewhat ugly workaround for svc lockd.
-	 * lockd installs custom fl_lmops->lm_compare_owner that checks
-	 * for the fl_owner to be the same (which it always is on local node
-	 * I guess between lockd processes) and then compares pid.
-	 * As such we assign pid to the owner field to make it all work,
-	 * conflict with normal locks is unlikely since pid space and
-	 * pointer space for current->files are not intersecting */
-	if (file_lock->fl_lmops && file_lock->fl_lmops->lm_compare_owner)
-		flock.l_flock.owner = (unsigned long)file_lock->fl_pid;
-
-	switch (file_lock->fl_type) {
-	case F_RDLCK:
-		einfo.ei_mode = LCK_PR;
-		break;
-	case F_UNLCK:
-		/* An unlock request may or may not have any relation to
-		 * existing locks so we may not be able to pass a lock handle
-		 * via a normal ldlm_lock_cancel() request. The request may even
-		 * unlock a byte range in the middle of an existing lock. In
-		 * order to process an unlock request we need all of the same
-		 * information that is given with a normal read or write record
-		 * lock request. To avoid creating another ldlm unlock (cancel)
-		 * message we'll treat a LCK_NL flock request as an unlock. */
-		einfo.ei_mode = LCK_NL;
-		break;
-	case F_WRLCK:
-		einfo.ei_mode = LCK_PW;
-		break;
-	default:
-		CDEBUG(D_INFO, "Unknown fcntl lock type: %d\n",
-			file_lock->fl_type);
-		return -ENOTSUPP;
-	}
-
-	switch (cmd) {
-	case F_SETLKW:
-#ifdef F_SETLKW64
-	case F_SETLKW64:
-#endif
-		flags = 0;
-		break;
-	case F_SETLK:
-#ifdef F_SETLK64
-	case F_SETLK64:
-#endif
-		flags = LDLM_FL_BLOCK_NOWAIT;
-		break;
-	case F_GETLK:
-#ifdef F_GETLK64
-	case F_GETLK64:
-#endif
-		flags = LDLM_FL_TEST_LOCK;
-		/* Save the old mode so that if the mode in the lock changes we
-		 * can decrement the appropriate reader or writer refcount. */
-		file_lock->fl_type = einfo.ei_mode;
-		break;
-	default:
-		CERROR("unknown fcntl lock command: %d\n", cmd);
-		return -EINVAL;
-	}
-
-	op_data = ll_prep_md_op_data(NULL, inode, NULL, NULL, 0, 0,
-				     LUSTRE_OPC_ANY, NULL);
-	if (IS_ERR(op_data))
-		return PTR_ERR(op_data);
-
-	CDEBUG(D_DLMTRACE, "inode=%lu, pid=%u, flags=%#llx, mode=%u, start=%llu, end=%llu\n",
-	       inode->i_ino, flock.l_flock.pid, flags, einfo.ei_mode,
-	       flock.l_flock.start, flock.l_flock.end);
-
-	rc = md_enqueue(sbi->ll_md_exp, &einfo, NULL,
-			op_data, &lockh, &flock, 0, NULL /* req */, flags);
-
-	if ((rc == 0 || file_lock->fl_type == F_UNLCK) &&
-	    !(flags & LDLM_FL_TEST_LOCK))
-		rc2  = locks_lock_file_wait(file, file_lock);
-
-	if (rc2 && file_lock->fl_type != F_UNLCK) {
-		einfo.ei_mode = LCK_NL;
-		md_enqueue(sbi->ll_md_exp, &einfo, NULL,
-			op_data, &lockh, &flock, 0, NULL /* req */, flags);
-		rc = rc2;
-	}
-
-	ll_finish_md_op_data(op_data);
-
-	return rc;
-}
-
-static int
-ll_file_noflock(struct file *file, int cmd, struct file_lock *file_lock)
-{
-	return -ENOSYS;
-}
-
-/**
- * test if some locks matching bits and l_req_mode are acquired
- * - bits can be in different locks
- * - if found clear the common lock bits in *bits
- * - the bits not found, are kept in *bits
- * \param inode [IN]
- * \param bits [IN] searched lock bits [IN]
- * \param l_req_mode [IN] searched lock mode
- * \retval boolean, true iff all bits are found
- */
-int ll_have_md_lock(struct inode *inode, __u64 *bits,  ldlm_mode_t l_req_mode)
-{
-	struct lustre_handle lockh;
-	ldlm_policy_data_t policy;
-	ldlm_mode_t mode = (l_req_mode == LCK_MINMODE) ?
-				(LCK_CR|LCK_CW|LCK_PR|LCK_PW) : l_req_mode;
-	struct lu_fid *fid;
-	__u64 flags;
-	int i;
-
-	if (!inode)
-		return 0;
-
-	fid = &ll_i2info(inode)->lli_fid;
-	CDEBUG(D_INFO, "trying to match res "DFID" mode %s\n", PFID(fid),
-	       ldlm_lockname[mode]);
-
-	flags = LDLM_FL_BLOCK_GRANTED | LDLM_FL_CBPENDING | LDLM_FL_TEST_LOCK;
-	for (i = 0; i <= MDS_INODELOCK_MAXSHIFT && *bits != 0; i++) {
-		policy.l_inodebits.bits = *bits & (1 << i);
-		if (policy.l_inodebits.bits == 0)
-			continue;
-
-		if (md_lock_match(ll_i2mdexp(inode), flags, fid, LDLM_IBITS,
-				  &policy, mode, &lockh)) {
-			struct ldlm_lock *lock;
-
-			lock = ldlm_handle2lock(&lockh);
-			if (lock) {
-				*bits &=
-				      ~(lock->l_policy_data.l_inodebits.bits);
-				LDLM_LOCK_PUT(lock);
-			} else {
-				*bits &= ~policy.l_inodebits.bits;
-			}
-		}
-	}
-	return *bits == 0;
-}
-
-ldlm_mode_t ll_take_md_lock(struct inode *inode, __u64 bits,
-			    struct lustre_handle *lockh, __u64 flags,
-			    ldlm_mode_t mode)
-{
-	ldlm_policy_data_t policy = { .l_inodebits = {bits} };
-	struct lu_fid *fid;
-	ldlm_mode_t rc;
-
-	fid = &ll_i2info(inode)->lli_fid;
-	CDEBUG(D_INFO, "trying to match res "DFID"\n", PFID(fid));
-
-	rc = md_lock_match(ll_i2mdexp(inode), flags | LDLM_FL_BLOCK_GRANTED,
-			   fid, LDLM_IBITS, &policy, mode, lockh);
-
-	return rc;
-}
-
-static int ll_inode_revalidate_fini(struct inode *inode, int rc)
-{
-	/* Already unlinked. Just update nlink and return success */
-	if (rc == -ENOENT) {
-		clear_nlink(inode);
-		/* This path cannot be hit for regular files unless in
-		 * case of obscure races, so no need to validate size.
-		 */
-		if (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
-			return 0;
-	} else if (rc != 0) {
-		CDEBUG_LIMIT((rc == -EACCES || rc == -EIDRM) ? D_INFO : D_ERROR,
-			     "%s: revalidate FID "DFID" error: rc = %d\n",
-			     ll_get_fsname(inode->i_sb, NULL, 0),
-			     PFID(ll_inode2fid(inode)), rc);
-	}
-
-	return rc;
-}
-
-static int __ll_inode_revalidate(struct dentry *dentry, __u64 ibits)
-{
-	struct inode *inode = d_inode(dentry);
-	struct ptlrpc_request *req = NULL;
-	struct obd_export *exp;
-	int rc = 0;
-
-	LASSERT(inode != NULL);
-
-	CDEBUG(D_VFSTRACE, "VFS Op:inode=%lu/%u(%p),name=%pd\n",
-	       inode->i_ino, inode->i_generation, inode, dentry);
-
-	exp = ll_i2mdexp(inode);
-
-	/* XXX: Enable OBD_CONNECT_ATTRFID to reduce unnecessary getattr RPC.
-	 *      But under CMD case, it caused some lock issues, should be fixed
-	 *      with new CMD ibits lock. See bug 12718 */
-	if (exp_connect_flags(exp) & OBD_CONNECT_ATTRFID) {
-		struct lookup_intent oit = { .it_op = IT_GETATTR };
-		struct md_op_data *op_data;
-
-		if (ibits == MDS_INODELOCK_LOOKUP)
-			oit.it_op = IT_LOOKUP;
-
-		/* Call getattr by fid, so do not provide name at all. */
-		op_data = ll_prep_md_op_data(NULL, inode,
-					     inode, NULL, 0, 0,
-					     LUSTRE_OPC_ANY, NULL);
-		if (IS_ERR(op_data))
-			return PTR_ERR(op_data);
-
-		oit.it_create_mode |= M_CHECK_STALE;
-		rc = md_intent_lock(exp, op_data, NULL, 0,
-				    /* we are not interested in name
-				       based lookup */
-				    &oit, 0, &req,
-				    ll_md_blocking_ast, 0);
-		ll_finish_md_op_data(op_data);
-		oit.it_create_mode &= ~M_CHECK_STALE;
-		if (rc < 0) {
-			rc = ll_inode_revalidate_fini(inode, rc);
-			goto out;
-		}
-
-		rc = ll_revalidate_it_finish(req, &oit, inode);
-		if (rc != 0) {
-			ll_intent_release(&oit);
-			goto out;
-		}
-
-		/* Unlinked? Unhash dentry, so it is not picked up later by
-		   do_lookup() -> ll_revalidate_it(). We cannot use d_drop
-		   here to preserve get_cwd functionality on 2.6.
-		   Bug 10503 */
-		if (!d_inode(dentry)->i_nlink)
-			d_lustre_invalidate(dentry, 0);
-
-		ll_lookup_finish_locks(&oit, inode);
-	} else if (!ll_have_md_lock(d_inode(dentry), &ibits, LCK_MINMODE)) {
-		struct ll_sb_info *sbi = ll_i2sbi(d_inode(dentry));
-		u64 valid = OBD_MD_FLGETATTR;
-		struct md_op_data *op_data;
-		int ealen = 0;
-
-		if (S_ISREG(inode->i_mode)) {
-			rc = ll_get_default_mdsize(sbi, &ealen);
-			if (rc)
-				return rc;
-			valid |= OBD_MD_FLEASIZE | OBD_MD_FLMODEASIZE;
-		}
-
-		op_data = ll_prep_md_op_data(NULL, inode, NULL, NULL,
-					     0, ealen, LUSTRE_OPC_ANY,
-					     NULL);
-		if (IS_ERR(op_data))
-			return PTR_ERR(op_data);
-
-		op_data->op_valid = valid;
-		rc = md_getattr(sbi->ll_md_exp, op_data, &req);
-		ll_finish_md_op_data(op_data);
-		if (rc) {
-			rc = ll_inode_revalidate_fini(inode, rc);
-			return rc;
-		}
-
-		rc = ll_prep_inode(&inode, req, NULL, NULL);
-	}
-out:
-	ptlrpc_req_finished(req);
-	return rc;
-}
-
-static int ll_inode_revalidate(struct dentry *dentry, __u64 ibits)
-{
-	struct inode *inode = d_inode(dentry);
-	int rc;
-
-	rc = __ll_inode_revalidate(dentry, ibits);
-	if (rc != 0)
-		return rc;
-
-	/* if object isn't regular file, don't validate size */
-	if (!S_ISREG(inode->i_mode)) {
-		LTIME_S(inode->i_atime) = ll_i2info(inode)->lli_lvb.lvb_atime;
-		LTIME_S(inode->i_mtime) = ll_i2info(inode)->lli_lvb.lvb_mtime;
-		LTIME_S(inode->i_ctime) = ll_i2info(inode)->lli_lvb.lvb_ctime;
 	} else {
-		/* In case of restore, the MDT has the right size and has
-		 * already send it back without granting the layout lock,
-		 * inode is up-to-date so glimpse is useless.
-		 * Also to glimpse we need the layout, in case of a running
-		 * restore the MDT holds the layout lock so the glimpse will
-		 * block up to the end of restore (getattr will block)
+		/*
+		 * this is the error case, the extent buffer has not been
+		 * read correctly. We won't access anything from it and
+		 * just cleanup our data structures. Effectively this will
+		 * cut the branch below this node from read ahead.
 		 */
-		if (!(ll_i2info(inode)->lli_flags & LLIF_FILE_RESTORING))
-			rc = ll_glimpse_size(inode);
+		nritems = 0;
+		generation = 0;
 	}
-	return rc;
-}
 
-int ll_getattr(struct vfsmount *mnt, struct dentry *de, struct kstat *stat)
-{
-	struct inode *inode = d_inode(de);
-	struct ll_sb_info *sbi = ll_i2sbi(inode);
-	struct ll_inode_info *lli = ll_i2info(inode);
-	int res;
+	for (i = 0; i < nritems; i++) {
+		struct reada_extctl *rec;
+		u64 n_gen;
+		struct btrfs_key key;
+		struct btrfs_key next_key;
 
-	res = ll_inode_revalidate(de, MDS_INODELOCK_UPDATE |
-				      MDS_INODELOCK_LOOKUP);
-	ll_stats_ops_tally(sbi, LPROC_LL_GETATTR, 1);
+		btrfs_node_key_to_cpu(eb, &key, i);
+		if (i + 1 < nritems)
+			btrfs_node_key_to_cpu(eb, &next_key, i + 1);
+		else
+			next_key = re->top;
+		bytenr = btrfs_node_blockptr(eb, i);
+		n_gen = btrfs_node_ptr_generation(eb, i);
 
-	if (res)
-		return res;
+		list_for_each_entry(rec, &list, list) {
+			struct reada_control *rc = rec->rc;
 
-	stat->dev = inode->i_sb->s_dev;
-	if (ll_need_32bit_api(sbi))
-		stat->ino = cl_fid_build_ino(&lli->lli_fid, 1);
-	else
-		stat->ino = inode->i_ino;
-	stat->mode = inode->i_mode;
-	stat->nlink = inode->i_nlink;
-	stat->uid = inode->i_uid;
-	stat->gid = inode->i_gid;
-	stat->rdev = inode->i_rdev;
-	stat->atime = inode->i_atime;
-	stat->mtime = inode->i_mtime;
-	stat->ctime = inode->i_ctime;
-	stat->blksize = 1 << inode->i_blkbits;
+			/*
+			 * if the generation doesn't match, just ignore this
+			 * extctl. This will probably cut off a branch from
+			 * prefetch. Alternatively one could start a new (sub-)
+			 * prefetch for this branch, starting again from root.
+			 * FIXME: move the generation check out of this loop
+			 */
+#ifdef DEBUG
+			if (rec->generation != generation) {
+				btrfs_debug(root->fs_info,
+					   "generation mismatch for (%llu,%d,%llu) %llu != %llu",
+				       key.objectid, key.type, key.offset,
+				       rec->generation, generation);
+			}
+#endif
+			if (rec->generation == generation &&
+			    btrfs_comp_cpu_keys(&key, &rc->key_end) < 0 &&
+			    btrfs_comp_cpu_keys(&next_key, &rc->key_start) > 0)
+				reada_add_block(rc, bytenr, &next_key,
+						level - 1, n_gen);
+		}
+	}
+	/*
+	 * free extctl records
+	 */
+	while (!list_empty(&list)) {
+		struct reada_control *rc;
+		struct reada_extctl *rec;
 
-	stat->size = i_size_read(inode);
-	stat->blocks = inode->i_blocks;
+		rec = list_first_entry(&list, struct reada_extctl, list);
+		list_del(&rec->list);
+		rc = rec->rc;
+		kfree(rec);
+
+		kref_get(&rc->refcnt);
+		if (atomic_dec_and_test(&rc->elems)) {
+			kref_put(&rc->refcnt, reada_control_release);
+			wake_up(&rc->wait);
+		}
+		kref_put(&rc->refcnt, reada_control_release);
+
+		reada_extent_put(fs_info, re);	/* one ref for each entry */
+	}
+	reada_extent_put(fs_info, re);	/* our ref */
+	if (for_dev)
+		atomic_dec(&for_dev->reada_in_flight);
 
 	return 0;
 }
 
-static int ll_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
-		     __u64 start, __u64 len)
+/*
+ * start is passed separately in case eb in NULL, which may be the case with
+ * failed I/O
+ */
+int btree_readahead_hook(struct btrfs_root *root, struct extent_buffer *eb,
+			 u64 start, int err)
 {
-	int rc;
-	size_t num_bytes;
-	struct ll_user_fiemap *fiemap;
-	unsigned int extent_count = fieinfo->fi_extents_max;
+	int ret;
 
-	num_bytes = sizeof(*fiemap) + (extent_count *
-				       sizeof(struct ll_fiemap_extent));
-	fiemap = libcfs_kvzalloc(num_bytes, GFP_NOFS);
+	ret = __readahead_hook(root, eb, start, err);
 
-	if (fiemap == NULL)
-		return -ENOMEM;
+	reada_start_machine(root->fs_info);
 
-	fiemap->fm_flags = fieinfo->fi_flags;
-	fiemap->fm_extent_count = fieinfo->fi_extents_max;
-	fiemap->fm_start = start;
-	fiemap->fm_length = len;
-	if (extent_count > 0)
-		memcpy(&fiemap->fm_extents[0], fieinfo->fi_extents_start,
-		       sizeof(struct ll_fiemap_extent));
-
-	rc = ll_do_fiemap(inode, fiemap, num_bytes);
-
-	fieinfo->fi_flags = fiemap->fm_flags;
-	fieinfo->fi_extents_mapped = fiemap->fm_mapped_extents;
-	if (extent_count > 0)
-		memcpy(fieinfo->fi_extents_start, &fiemap->fm_extents[0],
-		       fiemap->fm_mapped_extents *
-		       sizeof(struct ll_fiemap_extent));
-
-	kvfree(fiemap);
-	return rc;
-}
-
-struct posix_acl *ll_get_acl(struct inode *inode, int type)
-{
-	struct ll_inode_info *lli = ll_i2info(inode);
-	struct posix_acl *acl = NULL;
-
-	spin_lock(&lli->lli_lock);
-	/* VFS' acl_permission_check->check_acl will release the refcount */
-	acl = posix_acl_dup(lli->lli_posix_acl);
-	spin_unlock(&lli->lli_lock);
-
-	return acl;
-}
-
-int ll_inode_permission(struct inode *inode, int mask)
-{
-	int rc = 0;
-
-#ifdef MAY_NOT_BLOCK
-	if (mask & MAY_NOT_BLOCK)
-		return -ECHILD;
-#endif
-
-       /* as root inode are NOT getting validated in lookup operation,
-	* need to do it before permission check. */
-
-	if (is_root_inode(inode)) {
-		rc = __ll_inode_revalidate(inode->i_sb->s_root,
-					   MDS_INODELOCK_LOOKUP);
-		if (rc)
-			return rc;
-	}
-
-	CDEBUG(D_VFSTRACE, "VFS Op:inode=%lu/%u(%p), inode mode %x mask %o\n",
-	       inode->i_ino, inode->i_generation, inode, inode->i_mode, mask);
-
-	if (ll_i2sbi(inode)->ll_flags & LL_SBI_RMT_CLIENT)
-		return lustre_check_remote_perm(inode, mask);
-
-	ll_stats_ops_tally(ll_i2sbi(inode), LPROC_LL_INODE_PERM, 1);
-	rc = generic_permission(inode, mask);
-
-	return rc;
-}
-
-/* -o localflock - only provides locally consistent flock locks */
-struct file_operations ll_file_operations = {
-	.read_iter = ll_file_read_iter,
-	.write_iter = ll_file_write_iter,
-	.unlocked_ioctl = ll_file_ioctl,
-	.open	   = ll_file_open,
-	.release	= ll_file_release,
-	.mmap	   = ll_file_mmap,
-	.llseek	 = ll_file_seek,
-	.splice_read    = ll_file_splice_read,
-	.fsync	  = ll_fsync,
-	.flush	  = ll_flush
-};
-
-struct file_operations ll_file_operations_flock = {
-	.read_iter    = ll_file_read_iter,
-	.write_iter   = ll_file_write_iter,
-	.unlocked_ioctl = ll_file_ioctl,
-	.open	   = ll_file_open,
-	.release	= ll_file_release,
-	.mmap	   = ll_file_mmap,
-	.llseek	 = ll_file_seek,
-	.splice_read    = ll_file_splice_read,
-	.fsync	  = ll_fsync,
-	.flush	  = ll_flush,
-	.flock	  = ll_file_flock,
-	.lock	   = ll_file_flock
-};
-
-/* These are for -o noflock - to return ENOSYS on flock calls */
-struct file_operations ll_file_operations_noflock = {
-	.read_iter    = ll_file_read_iter,
-	.write_iter   = ll_file_write_iter,
-	.unlocked_ioctl = ll_file_ioctl,
-	.open	   = ll_file_open,
-	.release	= ll_file_release,
-	.mmap	   = ll_file_mmap,
-	.llseek	 = ll_file_seek,
-	.splice_read    = ll_file_splice_read,
-	.fsync	  = ll_fsync,
-	.flush	  = ll_flush,
-	.flock	  = ll_file_noflock,
-	.lock	   = ll_file_noflock
-};
-
-struct inode_operations ll_file_inode_operations = {
-	.setattr	= ll_setattr,
-	.getattr	= ll_getattr,
-	.permission	= ll_inode_permission,
-	.setxattr	= ll_setxattr,
-	.getxattr	= ll_getxattr,
-	.listxattr	= ll_listxattr,
-	.removexattr	= ll_removexattr,
-	.fiemap		= ll_fiemap,
-	.get_acl	= ll_get_acl,
-};
-
-/* dynamic ioctl number support routines */
-static struct llioc_ctl_data {
-	struct rw_semaphore	ioc_sem;
-	struct list_head	      ioc_head;
-} llioc = {
-	__RWSEM_INITIALIZER(llioc.ioc_sem),
-	LIST_HEAD_INIT(llioc.ioc_head)
-};
-
-struct llioc_data {
-	struct list_head	      iocd_list;
-	unsigned int	    iocd_size;
-	llioc_callback_t	iocd_cb;
-	unsigned int	    iocd_count;
-	unsigned int	    iocd_cmd[0];
-};
-
-void *ll_iocontrol_register(llioc_callback_t cb, int count, unsigned int *cmd)
-{
-	unsigned int size;
-	struct llioc_data *in_data = NULL;
-
-	if (cb == NULL || cmd == NULL ||
-	    count > LLIOC_MAX_CMD || count < 0)
-		return NULL;
-
-	size = sizeof(*in_data) + count * sizeof(unsigned int);
-	in_data = kzalloc(size, GFP_NOFS);
-	if (!in_data)
-		return NULL;
-
-	memset(in_data, 0, sizeof(*in_data));
-	in_data->iocd_size = size;
-	in_data->iocd_cb = cb;
-	in_data->iocd_count = count;
-	memcpy(in_data->iocd_cmd, cmd, sizeof(unsigned int) * count);
-
-	down_write(&llioc.ioc_sem);
-	list_add_tail(&in_data->iocd_list, &llioc.ioc_head);
-	up_write(&llioc.ioc_sem);
-
-	return in_data;
-}
-EXPORT_SYMBOL(ll_iocontrol_register);
-
-void ll_iocontrol_unregister(void *magic)
-{
-	struct llioc_data *tmp;
-
-	if (magic == NULL)
-		return;
-
-	down_write(&llioc.ioc_sem);
-	list_for_each_entry(tmp, &llioc.ioc_head, iocd_list) {
-		if (tmp == magic) {
-			list_del(&tmp->iocd_list);
-			up_write(&llioc.ioc_sem);
-
-			kfree(tmp);
-			return;
-		}
-	}
-	up_write(&llioc.ioc_sem);
-
-	CWARN("didn't find iocontrol register block with magic: %p\n", magic);
-}
-EXPORT_SYMBOL(ll_iocontrol_unregister);
-
-static enum llioc_iter
-ll_iocontrol_call(struct inode *inode, struct file *file,
-		  unsigned int cmd, unsigned long arg, int *rcp)
-{
-	enum llioc_iter ret = LLIOC_CONT;
-	struct llioc_data *data;
-	int rc = -EINVAL, i;
-
-	down_read(&llioc.ioc_sem);
-	list_for_each_entry(data, &llioc.ioc_head, iocd_list) {
-		for (i = 0; i < data->iocd_count; i++) {
-			if (cmd != data->iocd_cmd[i])
-				continue;
-
-			ret = data->iocd_cb(inode, file, cmd, arg, data, &rc);
-			break;
-		}
-
-		if (ret == LLIOC_STOP)
-			break;
-	}
-	up_read(&llioc.ioc_sem);
-
-	if (rcp)
-		*rcp = rc;
 	return ret;
 }
 
-int ll_layout_conf(struct inode *inode, const struct cl_object_conf *conf)
+static struct reada_zone *reada_find_zone(struct btrfs_fs_info *fs_info,
+					  struct btrfs_device *dev, u64 logical,
+					  struct btrfs_bio *bbio)
 {
-	struct ll_inode_info *lli = ll_i2info(inode);
-	struct cl_env_nest nest;
-	struct lu_env *env;
-	int result;
+	int ret;
+	struct reada_zone *zone;
+	struct btrfs_block_group_cache *cache = NULL;
+	u64 start;
+	u64 end;
+	int i;
 
-	if (lli->lli_clob == NULL)
-		return 0;
+	zone = NULL;
+	spin_lock(&fs_info->reada_lock);
+	ret = radix_tree_gang_lookup(&dev->reada_zones, (void **)&zone,
+				     logical >> PAGE_CACHE_SHIFT, 1);
+	if (ret == 1)
+		kref_get(&zone->refcnt);
+	spin_unlock(&fs_info->reada_lock);
 
-	env = cl_env_nested_get(&nest);
-	if (IS_ERR(env))
-		return PTR_ERR(env);
+	if (ret == 1) {
+		if (logical >= zone->start && logical < zone->end)
+			return zone;
+		spin_lock(&fs_info->reada_lock);
+		kref_put(&zone->refcnt, reada_zone_release);
+		spin_unlock(&fs_info->reada_lock);
+	}
 
-	result = cl_conf_set(env, lli->lli_clob, conf);
-	cl_env_nested_put(&nest, env);
+	cache = btrfs_lookup_block_group(fs_info, logical);
+	if (!cache)
+		return NULL;
 
-	if (conf->coc_opc == OBJECT_CONF_SET) {
-		struct ldlm_lock *lock = conf->coc_lock;
+	start = cache->key.objectid;
+	end = start + cache->key.offset - 1;
+	btrfs_put_block_group(cache);
 
-		LASSERT(lock != NULL);
-		LASSERT(ldlm_has_layout(lock));
-		if (result == 0) {
-			/* it can only be allowed to match after layout is
-			 * applied to inode otherwise false layout would be
-			 * seen. Applying layout should happen before dropping
-			 * the intent lock. */
-			ldlm_lock_allow_match(lock);
+	zone = kzalloc(sizeof(*zone), GFP_NOFS);
+	if (!zone)
+		return NULL;
+
+	zone->start = start;
+	zone->end = end;
+	INIT_LIST_HEAD(&zone->list);
+	spin_lock_init(&zone->lock);
+	zone->locked = 0;
+	kref_init(&zone->refcnt);
+	zone->elems = 0;
+	zone->device = dev; /* our device always sits at index 0 */
+	for (i = 0; i < bbio->num_stripes; ++i) {
+		/* bounds have already been checked */
+		zone->devs[i] = bbio->stripes[i].dev;
+	}
+	zone->ndevs = bbio->num_stripes;
+
+	spin_lock(&fs_info->reada_lock);
+	ret = radix_tree_insert(&dev->reada_zones,
+				(unsigned long)(zone->end >> PAGE_CACHE_SHIFT),
+				zone);
+
+	if (ret == -EEXIST) {
+		kfree(zone);
+		ret = radix_tree_gang_lookup(&dev->reada_zones, (void **)&zone,
+					     logical >> PAGE_CACHE_SHIFT, 1);
+		if (ret == 1)
+			kref_get(&zone->refcnt);
+	}
+	spin_unlock(&fs_info->reada_lock);
+
+	return zone;
+}
+
+static struct reada_extent *reada_find_extent(struct btrfs_root *root,
+					      u64 logical,
+					      struct btrfs_key *top, int level)
+{
+	int ret;
+	struct reada_extent *re = NULL;
+	struct reada_extent *re_exist = NULL;
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct btrfs_bio *bbio = NULL;
+	struct btrfs_device *dev;
+	struct btrfs_device *prev_dev;
+	u32 blocksize;
+	u64 length;
+	int real_stripes;
+	int nzones = 0;
+	int i;
+	unsigned long index = logical >> PAGE_CACHE_SHIFT;
+	int dev_replace_is_ongoing;
+
+	spin_lock(&fs_info->reada_lock);
+	re = radix_tree_lookup(&fs_info->reada_tree, index);
+	if (re)
+		re->refcnt++;
+	spin_unlock(&fs_info->reada_lock);
+
+	if (re)
+		return re;
+
+	re = kzalloc(sizeof(*re), GFP_NOFS);
+	if (!re)
+		return NULL;
+
+	blocksize = root->nodesize;
+	re->logical = logical;
+	re->top = *top;
+	INIT_LIST_HEAD(&re->extctl);
+	spin_lock_init(&re->lock);
+	re->refcnt = 1;
+
+	/*
+	 * map block
+	 */
+	length = blocksize;
+	ret = btrfs_map_block(fs_info, REQ_GET_READ_MIRRORS, logical, &length,
+			      &bbio, 0);
+	if (ret || !bbio || length < blocksize)
+		goto error;
+
+	if (bbio->num_stripes > BTRFS_MAX_MIRRORS) {
+		btrfs_err(root->fs_info,
+			   "readahead: more than %d copies not supported",
+			   BTRFS_MAX_MIRRORS);
+		goto error;
+	}
+
+	real_stripes = bbio->num_stripes - bbio->num_tgtdevs;
+	for (nzones = 0; nzones < real_stripes; ++nzones) {
+		struct reada_zone *zone;
+
+		dev = bbio->stripes[nzones].dev;
+		zone = reada_find_zone(fs_info, dev, logical, bbio);
+		if (!zone)
+			break;
+
+		re->zones[nzones] = zone;
+		spin_lock(&zone->lock);
+		if (!zone->elems)
+			kref_get(&zone->refcnt);
+		++zone->elems;
+		spin_unlock(&zone->lock);
+		spin_lock(&fs_info->reada_lock);
+		kref_put(&zone->refcnt, reada_zone_release);
+		spin_unlock(&fs_info->reada_lock);
+	}
+	re->nzones = nzones;
+	if (nzones == 0) {
+		/* not a single zone found, error and out */
+		goto error;
+	}
+
+	/* insert extent in reada_tree + all per-device trees, all or nothing */
+	btrfs_dev_replace_lock(&fs_info->dev_replace);
+	spin_lock(&fs_info->reada_lock);
+	ret = radix_tree_insert(&fs_info->reada_tree, index, re);
+	if (ret == -EEXIST) {
+		re_exist = radix_tree_lookup(&fs_info->reada_tree, index);
+		BUG_ON(!re_exist);
+		re_exist->refcnt++;
+		spin_unlock(&fs_info->reada_lock);
+		btrfs_dev_replace_unlock(&fs_info->dev_replace);
+		goto error;
+	}
+	if (ret) {
+		spin_unlock(&fs_info->reada_lock);
+		btrfs_dev_replace_unlock(&fs_info->dev_replace);
+		goto error;
+	}
+	prev_dev = NULL;
+	dev_replace_is_ongoing = btrfs_dev_replace_is_ongoing(
+			&fs_info->dev_replace);
+	for (i = 0; i < nzones; ++i) {
+		dev = bbio->stripes[i].dev;
+		if (dev == prev_dev) {
+			/*
+			 * in case of DUP, just add the first zone. As both
+			 * are on the same device, there's nothing to gain
+			 * from adding both.
+			 * Also, it wouldn't work, as the tree is per device
+			 * and adding would fail with EEXIST
+			 */
+			continue;
+		}
+		if (!dev->bdev) {
+			/*
+			 * cannot read ahead on missing device, but for RAID5/6,
+			 * REQ_GET_READ_MIRRORS return 1. So don't skip missing
+			 * device for such case.
+			 */
+			if (nzones > 1)
+				continue;
+		}
+		if (dev_replace_is_ongoing &&
+		    dev == fs_info->dev_replace.tgtdev) {
+			/*
+			 * as this device is selected for reading only as
+			 * a last resort, skip it for read ahead.
+			 */
+			continue;
+		}
+		prev_dev = dev;
+		ret = radix_tree_insert(&dev->reada_extents, index, re);
+		if (ret) {
+			while (--i >= 0) {
+				dev = bbio->stripes[i].dev;
+				BUG_ON(dev == NULL);
+				/* ignore whether the entry was inserted */
+				radix_tree_delete(&dev->reada_extents, index);
+			}
+			BUG_ON(fs_info == NULL);
+			radix_tree_delete(&fs_info->reada_tree, index);
+			spin_unlock(&fs_info->reada_lock);
+			btrfs_dev_replace_unlock(&fs_info->dev_replace);
+			goto error;
 		}
 	}
-	return result;
+	spin_unlock(&fs_info->reada_lock);
+	btrfs_dev_replace_unlock(&fs_info->dev_replace);
+
+	btrfs_put_bbio(bbio);
+	return re;
+
+error:
+	while (nzones) {
+		struct reada_zone *zone;
+
+		--nzones;
+		zone = re->zones[nzones];
+		kref_get(&zone->refcnt);
+		spin_lock(&zone->lock);
+		--zone->elems;
+		if (zone->elems == 0) {
+			/*
+			 * no fs_info->reada_lock needed, as this can't be
+			 * the last ref
+			 */
+			kref_put(&zone->refcnt, reada_zone_release);
+		}
+		spin_unlock(&zone->lock);
+
+		spin_lock(&fs_info->reada_lock);
+		kref_put(&zone->refcnt, reada_zone_release);
+		spin_unlock(&fs_info->reada_lock);
+	}
+	btrfs_put_bbio(bbio);
+	kfree(re);
+	return re_exist;
 }
 
-/* Fetch layout from MDT with getxattr request, if it's not ready yet */
-static int ll_layout_fetch(struct inode *inode, struct ldlm_lock *lock)
-
+static void reada_extent_put(struct btrfs_fs_info *fs_info,
+			     struct reada_extent *re)
 {
-	struct ll_sb_info *sbi = ll_i2sbi(inode);
-	struct ptlrpc_request *req;
-	struct mdt_body *body;
-	void *lvbdata;
-	void *lmm;
-	int lmmsize;
-	int rc;
+	int i;
+	unsigned long index = re->logical >> PAGE_CACHE_SHIFT;
 
-	CDEBUG(D_INODE, DFID" LVB_READY=%d l_lvb_data=%p l_lvb_len=%d\n",
-	       PFID(ll_inode2fid(inode)), !!(lock->l_flags & LDLM_FL_LVB_READY),
-	       lock->l_lvb_data, lock->l_lvb_len);
-
-	if ((lock->l_lvb_data != NULL) && (lock->l_flags & LDLM_FL_LVB_READY))
-		return 0;
-
-	/* if layout lock was granted right away, the layout is returned
-	 * within DLM_LVB of dlm reply; otherwise if the lock was ever
-	 * blocked and then granted via completion ast, we have to fetch
-	 * layout here. Please note that we can't use the LVB buffer in
-	 * completion AST because it doesn't have a large enough buffer */
-	rc = ll_get_default_mdsize(sbi, &lmmsize);
-	if (rc == 0)
-		rc = md_getxattr(sbi->ll_md_exp, ll_inode2fid(inode),
-				 OBD_MD_FLXATTR, XATTR_NAME_LOV, NULL, 0,
-				 lmmsize, 0, &req);
-	if (rc < 0)
-		return rc;
-
-	body = req_capsule_server_get(&req->rq_pill, &RMF_MDT_BODY);
-	if (body == NULL) {
-		rc = -EPROTO;
-		goto out;
+	spin_lock(&fs_info->reada_lock);
+	if (--re->refcnt) {
+		spin_unlock(&fs_info->reada_lock);
+		return;
 	}
 
-	lmmsize = body->eadatasize;
-	if (lmmsize == 0) /* empty layout */ {
-		rc = 0;
-		goto out;
+	radix_tree_delete(&fs_info->reada_tree, index);
+	for (i = 0; i < re->nzones; ++i) {
+		struct reada_zone *zone = re->zones[i];
+
+		radix_tree_delete(&zone->device->reada_extents, index);
 	}
 
-	lmm = req_capsule_server_sized_get(&req->rq_pill, &RMF_EADATA, lmmsize);
-	if (lmm == NULL) {
-		rc = -EFAULT;
-		goto out;
+	spin_unlock(&fs_info->reada_lock);
+
+	for (i = 0; i < re->nzones; ++i) {
+		struct reada_zone *zone = re->zones[i];
+
+		kref_get(&zone->refcnt);
+		spin_lock(&zone->lock);
+		--zone->elems;
+		if (zone->elems == 0) {
+			/* no fs_info->reada_lock needed, as this can't be
+			 * the last ref */
+			kref_put(&zone->refcnt, reada_zone_release);
+		}
+		spin_unlock(&zone->lock);
+
+		spin_lock(&fs_info->reada_lock);
+		kref_put(&zone->refcnt, reada_zone_release);
+		spin_unlock(&fs_info->reada_lock);
 	}
+	if (re->scheduled_for)
+		atomic_dec(&re->scheduled_for->reada_in_flight);
 
-	lvbdata = libcfs_kvzalloc(lmmsize, GFP_NOFS);
-	if (lvbdata == NULL) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	memcpy(lvbdata, lmm, lmmsize);
-	lock_res_and_lock(lock);
-	if (lock->l_lvb_data != NULL)
-		kvfree(lock->l_lvb_data);
-
-	lock->l_lvb_data = lvbdata;
-	lock->l_lvb_len = lmmsize;
-	unlock_res_and_lock(lock);
-
-out:
-	ptlrpc_req_finished(req);
-	return rc;
+	kfree(re);
 }
 
-/**
- * Apply the layout to the inode. Layout lock is held and will be released
- * in this function.
+static void reada_zone_release(struct kref *kref)
+{
+	struct reada_zone *zone = container_of(kref, struct reada_zone, refcnt);
+
+	radix_tree_delete(&zone->device->reada_zones,
+			  zone->end >> PAGE_CACHE_SHIFT);
+
+	kfree(zone);
+}
+
+static void reada_control_release(struct kref *kref)
+{
+	struct reada_control *rc = container_of(kref, struct reada_control,
+						refcnt);
+
+	kfree(rc);
+}
+
+static int reada_add_block(struct reada_control *rc, u64 logical,
+			   struct btrfs_key *top, int level, u64 generation)
+{
+	struct btrfs_root *root = rc->root;
+	struct reada_extent *re;
+	struct reada_extctl *rec;
+
+	re = reada_find_extent(root, logical, top, level); /* takes one ref */
+	if (!re)
+		return -1;
+
+	rec = kzalloc(sizeof(*rec), GFP_NOFS);
+	if (!rec) {
+		reada_extent_put(root->fs_info, re);
+		return -ENOMEM;
+	}
+
+	rec->rc = rc;
+	rec->generation = generation;
+	atomic_inc(&rc->elems);
+
+	spin_lock(&re->lock);
+	list_add_tail(&rec->list, &re->extctl);
+	spin_unlock(&re->lock);
+
+	/* leave the ref on the extent */
+
+	return 0;
+}
+
+/*
+ * called with fs_info->reada_lock held
  */
-static int ll_layout_lock_set(struct lustre_handle *lockh, ldlm_mode_t mode,
-				struct inode *inode, __u32 *gen, bool reconf)
+static void reada_peer_zones_set_lock(struct reada_zone *zone, int lock)
 {
-	struct ll_inode_info *lli = ll_i2info(inode);
-	struct ll_sb_info    *sbi = ll_i2sbi(inode);
-	struct ldlm_lock *lock;
-	struct lustre_md md = { NULL };
-	struct cl_object_conf conf;
-	int rc = 0;
-	bool lvb_ready;
-	bool wait_layout = false;
+	int i;
+	unsigned long index = zone->end >> PAGE_CACHE_SHIFT;
 
-	LASSERT(lustre_handle_is_used(lockh));
-
-	lock = ldlm_handle2lock(lockh);
-	LASSERT(lock != NULL);
-	LASSERT(ldlm_has_layout(lock));
-
-	LDLM_DEBUG(lock, "File %p/"DFID" being reconfigured: %d.\n",
-		   inode, PFID(&lli->lli_fid), reconf);
-
-	/* in case this is a caching lock and reinstate with new inode */
-	md_set_lock_data(sbi->ll_md_exp, &lockh->cookie, inode, NULL);
-
-	lock_res_and_lock(lock);
-	lvb_ready = !!(lock->l_flags & LDLM_FL_LVB_READY);
-	unlock_res_and_lock(lock);
-	/* checking lvb_ready is racy but this is okay. The worst case is
-	 * that multi processes may configure the file on the same time. */
-	if (lvb_ready || !reconf) {
-		rc = -ENODATA;
-		if (lvb_ready) {
-			/* layout_gen must be valid if layout lock is not
-			 * cancelled and stripe has already set */
-			*gen = ll_layout_version_get(lli);
-			rc = 0;
-		}
-		goto out;
+	for (i = 0; i < zone->ndevs; ++i) {
+		struct reada_zone *peer;
+		peer = radix_tree_lookup(&zone->devs[i]->reada_zones, index);
+		if (peer && peer->device != zone->device)
+			peer->locked = lock;
 	}
+}
 
-	rc = ll_layout_fetch(inode, lock);
-	if (rc < 0)
-		goto out;
+/*
+ * called with fs_info->reada_lock held
+ */
+static int reada_pick_zone(struct btrfs_device *dev)
+{
+	struct reada_zone *top_zone = NULL;
+	struct reada_zone *top_locked_zone = NULL;
+	u64 top_elems = 0;
+	u64 top_locked_elems = 0;
+	unsigned long index = 0;
+	int ret;
 
-	/* for layout lock, lmm is returned in lock's lvb.
-	 * lvb_data is immutable if the lock is held so it's safe to access it
-	 * without res lock. See the description in ldlm_lock_decref_internal()
-	 * for the condition to free lvb_data of layout lock */
-	if (lock->l_lvb_data != NULL) {
-		rc = obd_unpackmd(sbi->ll_dt_exp, &md.lsm,
-				  lock->l_lvb_data, lock->l_lvb_len);
-		if (rc >= 0) {
-			*gen = LL_LAYOUT_GEN_EMPTY;
-			if (md.lsm != NULL)
-				*gen = md.lsm->lsm_layout_gen;
-			rc = 0;
+	if (dev->reada_curr_zone) {
+		reada_peer_zones_set_lock(dev->reada_curr_zone, 0);
+		kref_put(&dev->reada_curr_zone->refcnt, reada_zone_release);
+		dev->reada_curr_zone = NULL;
+	}
+	/* pick the zone with the most elements */
+	while (1) {
+		struct reada_zone *zone;
+
+		ret = radix_tree_gang_lookup(&dev->reada_zones,
+					     (void **)&zone, index, 1);
+		if (ret == 0)
+			break;
+		index = (zone->end >> PAGE_CACHE_SHIFT) + 1;
+		if (zone->locked) {
+			if (zone->elems > top_locked_elems) {
+				top_locked_elems = zone->elems;
+				top_locked_zone = zone;
+			}
 		} else {
-			CERROR("%s: file "DFID" unpackmd error: %d\n",
-				ll_get_fsname(inode->i_sb, NULL, 0),
-				PFID(&lli->lli_fid), rc);
+			if (zone->elems > top_elems) {
+				top_elems = zone->elems;
+				top_zone = zone;
+			}
 		}
 	}
-	if (rc < 0)
-		goto out;
-
-	/* set layout to file. Unlikely this will fail as old layout was
-	 * surely eliminated */
-	memset(&conf, 0, sizeof(conf));
-	conf.coc_opc = OBJECT_CONF_SET;
-	conf.coc_inode = inode;
-	conf.coc_lock = lock;
-	conf.u.coc_md = &md;
-	rc = ll_layout_conf(inode, &conf);
-
-	if (md.lsm != NULL)
-		obd_free_memmd(sbi->ll_dt_exp, &md.lsm);
-
-	/* refresh layout failed, need to wait */
-	wait_layout = rc == -EBUSY;
-
-out:
-	LDLM_LOCK_PUT(lock);
-	ldlm_lock_decref(lockh, mode);
-
-	/* wait for IO to complete if it's still being used. */
-	if (wait_layout) {
-		CDEBUG(D_INODE, "%s: %p/"DFID" wait for layout reconf.\n",
-			ll_get_fsname(inode->i_sb, NULL, 0),
-			inode, PFID(&lli->lli_fid));
-
-		memset(&conf, 0, sizeof(conf));
-		conf.coc_opc = OBJECT_CONF_WAIT;
-		conf.coc_inode = inode;
-		rc = ll_layout_conf(inode, &conf);
-		if (rc == 0)
-			rc = -EAGAIN;
-
-		CDEBUG(D_INODE, "file: "DFID" waiting layout return: %d.\n",
-			PFID(&lli->lli_fid), rc);
-	}
-	return rc;
-}
-
-/**
- * This function checks if there exists a LAYOUT lock on the client side,
- * or enqueues it if it doesn't have one in cache.
- *
- * This function will not hold layout lock so it may be revoked any time after
- * this function returns. Any operations depend on layout should be redone
- * in that case.
- *
- * This function should be called before lov_io_init() to get an uptodate
- * layout version, the caller should save the version number and after IO
- * is finished, this function should be called again to verify that layout
- * is not changed during IO time.
- */
-int ll_layout_refresh(struct inode *inode, __u32 *gen)
-{
-	struct ll_inode_info  *lli = ll_i2info(inode);
-	struct ll_sb_info     *sbi = ll_i2sbi(inode);
-	struct md_op_data     *op_data;
-	struct lookup_intent   it;
-	struct lustre_handle   lockh;
-	ldlm_mode_t	       mode;
-	struct ldlm_enqueue_info einfo = {
-		.ei_type = LDLM_IBITS,
-		.ei_mode = LCK_CR,
-		.ei_cb_bl = ll_md_blocking_ast,
-		.ei_cb_cp = ldlm_completion_ast,
-	};
-	int rc;
-
-	*gen = ll_layout_version_get(lli);
-	if (!(sbi->ll_flags & LL_SBI_LAYOUT_LOCK) || *gen != LL_LAYOUT_GEN_NONE)
+	if (top_zone)
+		dev->reada_curr_zone = top_zone;
+	else if (top_locked_zone)
+		dev->reada_curr_zone = top_locked_zone;
+	else
 		return 0;
 
-	/* sanity checks */
-	LASSERT(fid_is_sane(ll_inode2fid(inode)));
-	LASSERT(S_ISREG(inode->i_mode));
+	dev->reada_next = dev->reada_curr_zone->start;
+	kref_get(&dev->reada_curr_zone->refcnt);
+	reada_peer_zones_set_lock(dev->reada_curr_zone, 1);
 
-	/* take layout lock mutex to enqueue layout lock exclusively. */
-	mutex_lock(&lli->lli_layout_mutex);
+	return 1;
+}
+
+static int reada_start_machine_dev(struct btrfs_fs_info *fs_info,
+				   struct btrfs_device *dev)
+{
+	struct reada_extent *re = NULL;
+	int mirror_num = 0;
+	struct extent_buffer *eb = NULL;
+	u64 logical;
+	int ret;
+	int i;
+	int need_kick = 0;
+
+	spin_lock(&fs_info->reada_lock);
+	if (dev->reada_curr_zone == NULL) {
+		ret = reada_pick_zone(dev);
+		if (!ret) {
+			spin_unlock(&fs_info->reada_lock);
+			return 0;
+		}
+	}
+	/*
+	 * FIXME currently we issue the reads one extent at a time. If we have
+	 * a contiguous block of extents, we could also coagulate them or use
+	 * plugging to speed things up
+	 */
+	ret = radix_tree_gang_lookup(&dev->reada_extents, (void **)&re,
+				     dev->reada_next >> PAGE_CACHE_SHIFT, 1);
+	if (ret == 0 || re->logical >= dev->reada_curr_zone->end) {
+		ret = reada_pick_zone(dev);
+		if (!ret) {
+			spin_unlock(&fs_info->reada_lock);
+			return 0;
+		}
+		re = NULL;
+		ret = radix_tree_gang_lookup(&dev->reada_extents, (void **)&re,
+					dev->reada_next >> PAGE_CACHE_SHIFT, 1);
+	}
+	if (ret == 0) {
+		spin_unlock(&fs_info->reada_lock);
+		return 0;
+	}
+	dev->reada_next = re->logical + fs_info->tree_root->nodesize;
+	re->refcnt++;
+
+	spin_unlock(&fs_info->reada_lock);
+
+	/*
+	 * find mirror num
+	 */
+	for (i = 0; i < re->nzones; ++i) {
+		if (re->zones[i]->device == dev) {
+			mirror_num = i + 1;
+			break;
+		}
+	}
+	logical = re->logical;
+
+	spin_lock(&re->lock);
+	if (re->scheduled_for == NULL) {
+		re->scheduled_for = dev;
+		need_kick = 1;
+	}
+	spin_unlock(&re->lock);
+
+	reada_extent_put(fs_info, re);
+
+	if (!need_kick)
+		return 0;
+
+	atomic_inc(&dev->reada_in_flight);
+	ret = reada_tree_block_flagged(fs_info->extent_root, logical,
+			mirror_num, &eb);
+	if (ret)
+		__readahead_hook(fs_info->extent_root, NULL, logical, ret);
+	else if (eb)
+		__readahead_hook(fs_info->extent_root, eb, eb->start, ret);
+
+	if (eb)
+		free_extent_buffer(eb);
+
+	return 1;
+
+}
+
+static void reada_start_machine_worker(struct btrfs_work *work)
+{
+	struct reada_machine_work *rmw;
+	struct btrfs_fs_info *fs_info;
+	int old_ioprio;
+
+	rmw = container_of(work, struct reada_machine_work, work);
+	fs_info = rmw->fs_info;
+
+	kfree(rmw);
+
+	old_ioprio = IOPRIO_PRIO_VALUE(task_nice_ioclass(current),
+				       task_nice_ioprio(current));
+	set_task_ioprio(current, BTRFS_IOPRIO_READA);
+	__reada_start_machine(fs_info);
+	set_task_ioprio(current, old_ioprio);
+}
+
+static void __reada_start_machine(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_device *device;
+	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
+	u64 enqueued;
+	u64 total = 0;
+	int i;
 
 again:
-	/* mostly layout lock is caching on the local side, so try to match
-	 * it before grabbing layout lock mutex. */
-	mode = ll_take_md_lock(inode, MDS_INODELOCK_LAYOUT, &lockh, 0,
-			       LCK_CR | LCK_CW | LCK_PR | LCK_PW);
-	if (mode != 0) { /* hit cached lock */
-		rc = ll_layout_lock_set(&lockh, mode, inode, gen, true);
-		if (rc == -EAGAIN)
-			goto again;
-
-		mutex_unlock(&lli->lli_layout_mutex);
-		return rc;
+	do {
+		enqueued = 0;
+		mutex_lock(&fs_devices->device_list_mutex);
+		list_for_each_entry(device, &fs_devices->devices, dev_list) {
+			if (atomic_read(&device->reada_in_flight) <
+			    MAX_IN_FLIGHT)
+				enqueued += reada_start_machine_dev(fs_info,
+								    device);
+		}
+		mutex_unlock(&fs_devices->device_list_mutex);
+		total += enqueued;
+	} while (enqueued && total < 10000);
+	if (fs_devices->seed) {
+		fs_devices = fs_devices->seed;
+		goto again;
 	}
 
-	op_data = ll_prep_md_op_data(NULL, inode, inode, NULL,
-			0, 0, LUSTRE_OPC_ANY, NULL);
-	if (IS_ERR(op_data)) {
-		mutex_unlock(&lli->lli_layout_mutex);
-		return PTR_ERR(op_data);
+	if (enqueued == 0)
+		return;
+
+	/*
+	 * If everything is already in the cache, this is effectively single
+	 * threaded. To a) not hold the caller for too long and b) to utilize
+	 * more cores, we broke the loop above after 10000 iterations and now
+	 * enqueue to workers to finish it. This will distribute the load to
+	 * the cores.
+	 */
+	for (i = 0; i < 2; ++i)
+		reada_start_machine(fs_info);
+}
+
+static void reada_start_machine(struct btrfs_fs_info *fs_info)
+{
+	struct reada_machine_work *rmw;
+
+	rmw = kzalloc(sizeof(*rmw), GFP_NOFS);
+	if (!rmw) {
+		/* FIXME we cannot handle this properly right now */
+		BUG();
+	}
+	btrfs_init_work(&rmw->work, btrfs_readahead_helper,
+			reada_start_machine_worker, NULL, NULL);
+	rmw->fs_info = fs_info;
+
+	btrfs_queue_work(fs_info->readahead_workers, &rmw->work);
+}
+
+#ifdef DEBUG
+static void dump_devs(struct btrfs_fs_info *fs_info, int all)
+{
+	struct btrfs_device *device;
+	struct btrfs_fs_devices *fs_devices = fs_info->fs_devices;
+	unsigned long index;
+	int ret;
+	int i;
+	int j;
+	int cnt;
+
+	spin_lock(&fs_info->reada_lock);
+	list_for_each_entry(device, &fs_devices->devices, dev_list) {
+		printk(KERN_DEBUG "dev %lld has %d in flight\n", device->devid,
+			atomic_read(&device->reada_in_flight));
+		index = 0;
+		while (1) {
+			struct reada_zone *zone;
+			ret = radix_tree_gang_lookup(&device->reada_zones,
+						     (void **)&zone, index, 1);
+			if (ret == 0)
+				break;
+			printk(KERN_DEBUG "  zone %llu-%llu elems %llu locked "
+				"%d devs", zone->start, zone->end, zone->elems,
+				zone->locked);
+			for (j = 0; j < zone->ndevs; ++j) {
+				printk(KERN_CONT " %lld",
+					zone->devs[j]->devid);
+			}
+			if (device->reada_curr_zone == zone)
+				printk(KERN_CONT " curr off %llu",
+					device->reada_next - zone->start);
+			printk(KERN_CONT "\n");
+			index = (zone->end >> PAGE_CACHE_SHIFT) + 1;
+		}
+		cnt = 0;
+		index = 0;
+		while (all) {
+			struct reada_extent *re = NULL;
+
+			ret = radix_tree_gang_lookup(&device->reada_extents,
+						     (void **)&re, index, 1);
+			if (ret == 0)
+				break;
+			printk(KERN_DEBUG
+				"  re: logical %llu size %u empty %d for %lld",
+				re->logical, fs_info->tree_root->nodesize,
+				list_empty(&re->extctl), re->scheduled_for ?
+				re->scheduled_for->devid : -1);
+
+			for (i = 0; i < re->nzones; ++i) {
+				printk(KERN_CONT " zone %llu-%llu devs",
+					re->zones[i]->start,
+					re->zones[i]->end);
+				for (j = 0; j < re->zones[i]->ndevs; ++j) {
+					printk(KERN_CONT " %lld",
+						re->zones[i]->devs[j]->devid);
+				}
+			}
+			printk(KERN_CONT "\n");
+			index = (re->logical >> PAGE_CACHE_SHIFT) + 1;
+			if (++cnt > 15)
+				break;
+		}
 	}
 
-	/* have to enqueue one */
-	memset(&it, 0, sizeof(it));
-	it.it_op = IT_LAYOUT;
-	lockh.cookie = 0ULL;
+	index = 0;
+	cnt = 0;
+	while (all) {
+		struct reada_extent *re = NULL;
 
-	LDLM_DEBUG_NOLOCK("%s: requeue layout lock for file %p/"DFID".\n",
-			ll_get_fsname(inode->i_sb, NULL, 0), inode,
-			PFID(&lli->lli_fid));
-
-	rc = md_enqueue(sbi->ll_md_exp, &einfo, &it, op_data, &lockh,
-			NULL, 0, NULL, 0);
-	if (it.d.lustre.it_data != NULL)
-		ptlrpc_req_finished(it.d.lustre.it_data);
-	it.d.lustre.it_data = NULL;
-
-	ll_finish_md_op_data(op_data);
-
-	mode = it.d.lustre.it_lock_mode;
-	it.d.lustre.it_lock_mode = 0;
-	ll_intent_drop_lock(&it);
-
-	if (rc == 0) {
-		/* set lock data in case this is a new lock */
-		ll_set_lock_data(sbi->ll_md_exp, inode, &it, NULL);
-		rc = ll_layout_lock_set(&lockh, mode, inode, gen, true);
-		if (rc == -EAGAIN)
-			goto again;
+		ret = radix_tree_gang_lookup(&fs_info->reada_tree, (void **)&re,
+					     index, 1);
+		if (ret == 0)
+			break;
+		if (!re->scheduled_for) {
+			index = (re->logical >> PAGE_CACHE_SHIFT) + 1;
+			continue;
+		}
+		printk(KERN_DEBUG
+			"re: logical %llu size %u list empty %d for %lld",
+			re->logical, fs_info->tree_root->nodesize,
+			list_empty(&re->extctl),
+			re->scheduled_for ? re->scheduled_for->devid : -1);
+		for (i = 0; i < re->nzones; ++i) {
+			printk(KERN_CONT " zone %llu-%llu devs",
+				re->zones[i]->start,
+				re->zones[i]->end);
+			for (i = 0; i < re->nzones; ++i) {
+				printk(KERN_CONT " zone %llu-%llu devs",
+					re->zones[i]->start,
+					re->zones[i]->end);
+				for (j = 0; j < re->zones[i]->ndevs; ++j) {
+					printk(KERN_CONT " %lld",
+						re->zones[i]->devs[j]->devid);
+				}
+			}
+		}
+		printk(KERN_CONT "\n");
+		index = (re->logical >> PAGE_CACHE_SHIFT) + 1;
 	}
-	mutex_unlock(&lli->lli_layout_mutex);
+	spin_unlock(&fs_info->reada_lock);
+}
+#endif
+
+/*
+ * interface
+ */
+struct reada_control *btrfs_reada_add(struct btrfs_root *root,
+			struct btrfs_key *key_start, struct btrfs_key *key_end)
+{
+	struct reada_control *rc;
+	u64 start;
+	u64 generation;
+	int level;
+	int ret;
+	struct extent_buffer *node;
+	static struct btrfs_key max_key = {
+		.objectid = (u64)-1,
+		.type = (u8)-1,
+		.offset = (u64)-1
+	};
+
+	rc = kzalloc(sizeof(*rc), GFP_NOFS);
+	if (!rc)
+		return ERR_PTR(-ENOMEM);
+
+	rc->root = root;
+	rc->key_start = *key_start;
+	rc->key_end = *key_end;
+	atomic_set(&rc->elems, 0);
+	init_waitqueue_head(&rc->wait);
+	kref_init(&rc->refcnt);
+	kref_get(&rc->refcnt); /* one ref for having elements */
+
+	node = btrfs_root_node(root);
+	start = node->start;
+	level = btrfs_header_level(node);
+	generation = btrfs_header_generation(node);
+	free_extent_buffer(node);
+
+	ret = reada_add_block(rc, start, &max_key, level, generation);
+	if (ret) {
+		kfree(rc);
+		return ERR_PTR(ret);
+	}
+
+	reada_start_machine(root->fs_info);
 
 	return rc;
 }
 
-/**
- *  This function send a restore request to the MDT
- */
-int ll_layout_restore(struct inode *inode)
+#ifdef DEBUG
+int btrfs_reada_wait(void *handle)
 {
-	struct hsm_user_request	*hur;
-	int			 len, rc;
+	struct reada_control *rc = handle;
 
-	len = sizeof(struct hsm_user_request) +
-	      sizeof(struct hsm_user_item);
-	hur = kzalloc(len, GFP_NOFS);
-	if (!hur)
+	while (atomic_read(&rc->elems)) {
+		wait_event_timeout(rc->wait, atomic_read(&rc->elems) == 0,
+				   5 * HZ);
+		dump_devs(rc->root->fs_info,
+			  atomic_read(&rc->elems) < 10 ? 1 : 0);
+	}
+
+	dump_devs(rc->root->fs_info, atomic_read(&rc->elems) < 10 ? 1 : 0);
+
+	kref_put(&rc->refcnt, reada_control_release);
+
+	return 0;
+}
+#else
+int btrfs_reada_wait(void *handle)
+{
+	struct reada_control *rc = handle;
+
+	while (atomic_read(&rc->elems)) {
+		wait_event(rc->wait, atomic_read(&rc->elems) == 0);
+	}
+
+	kref_put(&rc->refcnt, reada_control_release);
+
+	return 0;
+}
+#endif
+
+void btrfs_reada_detach(void *handle)
+{
+	struct reada_control *rc = handle;
+
+	kref_put(&rc->refcnt, reada_control_release);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Copyright (C) 2007 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/err.h>
+#include <linux/uuid.h>
+#include "ctree.h"
+#include "transaction.h"
+#include "disk-io.h"
+#include "print-tree.h"
+
+/*
+ * Read a root item from the tree. In case we detect a root item smaller then
+ * sizeof(root_item), we know it's an old version of the root structure and
+ * initialize all new fields to zero. The same happens if we detect mismatching
+ * generation numbers as then we know the root was once mounted with an older
+ * kernel that was not aware of the root item structure change.
+ */
+static void btrfs_read_root_item(struct extent_buffer *eb, int slot,
+				struct btrfs_root_item *item)
+{
+	uuid_le uuid;
+	int len;
+	int need_reset = 0;
+
+	len = btrfs_item_size_nr(eb, slot);
+	read_extent_buffer(eb, item, btrfs_item_ptr_offset(eb, slot),
+			min_t(int, len, (int)sizeof(*item)));
+	if (len < sizeof(*item))
+		need_reset = 1;
+	if (!need_reset && btrfs_root_generation(item)
+		!= btrfs_root_generation_v2(item)) {
+		if (btrfs_root_generation_v2(item) != 0) {
+			btrfs_warn(eb->fs_info,
+					"mismatching "
+					"generation and generation_v2 "
+					"found in root item. This root "
+					"was probably mounted with an "
+					"older kernel. Resetting all "
+					"new fields.");
+		}
+		need_reset = 1;
+	}
+	if (need_reset) {
+		memset(&item->generation_v2, 0,
+			sizeof(*item) - offsetof(struct btrfs_root_item,
+					generation_v2));
+
+		uuid_le_gen(&uuid);
+		memcpy(item->uuid, uuid.b, BTRFS_UUID_SIZE);
+	}
+}
+
+/*
+ * btrfs_find_root - lookup the root by the key.
+ * root: the root of the root tree
+ * search_key: the key to search
+ * path: the path we search
+ * root_item: the root item of the tree we look for
+ * root_key: the reak key of the tree we look for
+ *
+ * If ->offset of 'seach_key' is -1ULL, it means we are not sure the offset
+ * of the search key, just lookup the root with the highest offset for a
+ * given objectid.
+ *
+ * If we find something return 0, otherwise > 0, < 0 on error.
+ */
+int btrfs_find_root(struct btrfs_root *root, struct btrfs_key *search_key,
+		    struct btrfs_path *path, struct btrfs_root_item *root_item,
+		    struct btrfs_key *root_key)
+{
+	struct btrfs_key found_key;
+	struct extent_buffer *l;
+	int ret;
+	int slot;
+
+	ret = btrfs_search_slot(NULL, root, search_key, path, 0, 0);
+	if (ret < 0)
+		return ret;
+
+	if (search_key->offset != -1ULL) {	/* the search key is exact */
+		if (ret > 0)
+			goto out;
+	} else {
+		BUG_ON(ret == 0);		/* Logical error */
+		if (path->slots[0] == 0)
+			goto out;
+		path->slots[0]--;
+		ret = 0;
+	}
+
+	l = path->nodes[0];
+	slot = path->slots[0];
+
+	btrfs_item_key_to_cpu(l, &found_key, slot);
+	if (found_key.objectid != search_key->objectid ||
+	    found_key.type != BTRFS_ROOT_ITEM_KEY) {
+		ret = 1;
+		goto out;
+	}
+
+	if (root_item)
+		btrfs_read_root_item(l, slot, root_item);
+	if (root_key)
+		memcpy(root_key, &found_key, sizeof(found_key));
+out:
+	btrfs_release_path(path);
+	return ret;
+}
+
+void btrfs_set_root_node(struct btrfs_root_item *item,
+			 struct extent_buffer *node)
+{
+	btrfs_set_root_bytenr(item, node->start);
+	btrfs_set_root_level(item, btrfs_header_level(node));
+	btrfs_set_root_generation(item, btrfs_header_generation(node));
+}
+
+/*
+ * copy the data in 'item' into the btree
+ */
+int btrfs_update_root(struct btrfs_trans_handle *trans, struct btrfs_root
+		      *root, struct btrfs_key *key, struct btrfs_root_item
+		      *item)
+{
+	struct btrfs_path *path;
+	struct extent_buffer *l;
+	int ret;
+	int slot;
+	unsigned long ptr;
+	u32 old_len;
+
+	path = btrfs_alloc_path();
+	if (!path)
 		return -ENOMEM;
 
-	hur->hur_request.hr_action = HUA_RESTORE;
-	hur->hur_request.hr_archive_id = 0;
-	hur->hur_request.hr_flags = 0;
-	memcpy(&hur->hur_user_item[0].hui_fid, &ll_i2info(inode)->lli_fid,
-	       sizeof(hur->hur_user_item[0].hui_fid));
-	hur->hur_user_item[0].hui_extent.length = -1;
-	hur->hur_request.hr_itemcount = 1;
-	rc = obd_iocontrol(LL_IOC_HSM_REQUEST, cl_i2sbi(inode)->ll_md_exp,
-			   len, hur, NULL);
-	kfree(hur);
-	return rc;
+	ret = btrfs_search_slot(trans, root, key, path, 0, 1);
+	if (ret < 0) {
+		btrfs_abort_transaction(trans, root, ret);
+		goto out;
+	}
+
+	if (ret != 0) {
+		btrfs_print_leaf(root, path->nodes[0]);
+		btrfs_crit(root->fs_info, "unable to update root key %llu %u %llu",
+		       key->objectid, key->type, key->offset);
+		BUG_ON(1);
+	}
+
+	l = path->nodes[0];
+	slot = path->slots[0];
+	ptr = btrfs_item_ptr_offset(l, slot);
+	old_len = btrfs_item_size_nr(l, slot);
+
+	/*
+	 * If this is the first time we update the root item which originated
+	 * from an older kernel, we need to enlarge the item size to make room
+	 * for the added fields.
+	 */
+	if (old_len < sizeof(*item)) {
+		btrfs_release_path(path);
+		ret = btrfs_search_slot(trans, root, key, path,
+				-1, 1);
+		if (ret < 0) {
+			btrfs_abort_transaction(trans, root, ret);
+			goto out;
+		}
+
+		ret = btrfs_del_item(trans, root, path);
+		if (ret < 0) {
+			btrfs_abort_transaction(trans, root, ret);
+			goto out;
+		}
+		btrfs_release_path(path);
+		ret = btrfs_insert_empty_item(trans, root, path,
+				key, sizeof(*item));
+		if (ret < 0) {
+			btrfs_abort_transaction(trans, root, ret);
+			goto out;
+		}
+		l = path->nodes[0];
+		slot = path->slots[0];
+		ptr = btrfs_item_ptr_offset(l, slot);
+	}
+
+	/*
+	 * Update generation_v2 so at the next mount we know the new root
+	 * fields are valid.
+	 */
+	btrfs_set_root_generation_v2(item, btrfs_root_generation(item));
+
+	write_extent_buffer(l, item, ptr, sizeof(*item));
+	btrfs_mark_buffer_dirty(path->nodes[0]);
+out:
+	btrfs_free_path(path);
+	return ret;
 }
+
+int btrfs_insert_root(struct btrfs_trans_handle *trans, struct btrfs_root *root,
+		      struct btrfs_key *key, struct btrfs_root_item *item)
+{
+	/*
+	 * Make sure generation v1 and v2 match. See update_root for details.
+	 */
+	btrfs_set_root_generation_v2(item, btrfs_root_generation(item));
+	return btrfs_insert_item(trans, root, key, item, sizeof(*item));
+}
+
+int btrfs_find_orphan_roots(struct btrfs_root *tree_root)
+{
+	struct extent_buffer *leaf;
+	struct btrfs_path *path;
+	struct btrfs_key key;
+	struct btrfs_key root_key;
+	struct btrfs_root *root;
+	int err = 0;
+	int ret;
+	bool can_recover = true;
+
+	if (tree_root->fs_info->sb->s_flags & MS_RDONLY)
+		can_recover = false;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	key.objectid = BTRFS_ORPHAN_OBJECTID;
+	key.type = BTRFS_ORPHAN_ITEM_KEY;
+	key.offset = 0;
+
+	root_key.type = BTRFS_ROOT_ITEM_KEY;
+	root_key.offset = (u64)-1;
+
+	while (1) {
+		ret = btrfs_search_slot(NULL, tree_root, &key, path, 0, 0);
+		if (ret < 0) {
+			err = ret;
+			break;
+		}
+
+		leaf = path->nodes[0];
+		if (path->slots[0] >= btrfs_header_nritems(leaf)) {
+			ret = btrfs_next_leaf(tree_root, path);
+			if (ret < 0)
+				err = ret;
+			if (ret != 0)
+				break;
+			leaf = path->nodes[0];
+		}
+
+		btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);
+		btrfs_release_path(path);
+
+		if (key.objectid != BTRFS_ORPHAN_OBJECTID ||
+		    key.type != BTRFS_ORPHAN_ITEM_KEY)
+			break;
+
+		root_key.objectid = key.offset;
+		key.offset++;
+
+		/*
+		 * The root might have been inserted already, as before we look
+		 * for orphan roots, log replay might have happened, which
+		 * triggers a transaction commit and qgroup accounting, which
+		 * in turn reads and inserts fs roots while doing backref
+		 * walking.
+		 */
+		root = btrfs_lookup_fs_root(tree_root->fs_info,
+					    root_key.objectid);
+		if (root) {
+			WARN_ON(!test_bit(BTRFS_ROOT_ORPHAN_ITEM_INSERTED,
+					  &root->state));
+			if (btrfs_root_refs(&root->root_item) == 0)
+				btrfs_add_dead_root(root);
+			continue;
+		}
+
+		root = btrfs_read_fs_root(tree_root, &root_key);
+		err = PTR_ERR_OR_ZERO(root);
+		if (err && err != -ENOENT) {
+			break;
+		} else if (err == -ENOENT) {
+			struct btrfs_trans_handle *trans;
+
+			btrfs_release_path(path);
+
+			trans = btrfs_join_transaction(tree_root);
+			if (IS_ERR(trans)) {
+				err = PTR_ERR(trans);
+				btrfs_std_error(tree_root->fs_info, err,
+					    "Failed to start trans to delete "
+					    "orphan item");
+				break;
+			}
+			err = btrfs_del_orphan_item(trans, tree_root,
+						    root_key.objectid);
+			btrfs_end_transaction(trans, tree_root);
+			if (err) {
+				btrfs_std_error(tree_root->fs_info, err,
+					    "Failed to delete root orphan "
+					    "item");
+				break;
+			}
+			continue;
+		}
+
+		err = btrfs_init_fs_root(root);
+		if (err) {
+			btrfs_free_fs_root(root);
+			break;
+		}
+
+		set_bit(BTRFS_ROOT_ORPHAN_ITEM_INSERTED, &root->state);
+
+		err = btrfs_insert_fs_root(root->fs_info, root);
+		if (err) {
+			BUG_ON(err == -EEXIST);
+			btrfs_free_fs_root(root);
+			break;
+		}
+
+		if (btrfs_root_refs(&root->root_item) == 0)
+			btrfs_add_dead_root(root);
+	}
+
+	btrfs_free_path(path);
+	return err;
+}
+
+/* drop the root item for 'key' from 'root' */
+int btrfs_del_root(struct btrfs_trans_handle *trans, struct btrfs_root *root,
+		   struct btrfs_key *key)
+{
+	struct btrfs_path *path;
+	int ret;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+	ret = btrfs_search_slot(trans, root, key, path, -1, 1);
+	if (ret < 0)
+		goto out;
+
+	BUG_ON(ret != 0);
+
+	ret = btrfs_del_item(trans, root, path);
+out:
+	btrfs_free_path(path);
+	return ret;
+}
+
+int btrfs_del_root_ref(struct btrfs_trans_handle *trans,
+		       struct btrfs_root *tree_root,
+		       u64 root_id, u64 ref_id, u64 dirid, u64 *sequence,
+		       const char *name, int name_len)
+
+{
+	struct btrfs_path *path;
+	struct btrfs_root_ref *ref;
+	struct extent_buffer *leaf;
+	struct btrfs_key key;
+	unsigned long ptr;
+	int err = 0;
+	int ret;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	key.objectid = root_id;
+	key.type = BTRFS_ROOT_BACKREF_KEY;
+	key.offset = ref_id;
+again:
+	ret = btrfs_search_slot(trans, tree_root, &key, path, -1, 1);
+	BUG_ON(ret < 0);
+	if (ret == 0) {
+		leaf = path->nodes[0];
+		ref = btrfs_item_ptr(leaf, path->slots[0],
+				     struct btrfs_root_ref);
+
+		WARN_ON(btrfs_root_ref_dirid(leaf, ref) != dirid);
+		WARN_ON(btrfs_root_ref_name_len(leaf, ref) != name_len);
+		ptr = (unsigned long)(ref + 1);
+		WARN_ON(memcmp_extent_buffer(leaf, name, ptr, name_len));
+		*sequence = btrfs_root_ref_sequence(leaf, ref);
+
+		ret = btrfs_del_item(trans, tree_root, path);
+		if (ret) {
+			err = ret;
+			goto out;
+		}
+	} else
+		err = -ENOENT;
+
+	if (key.type == BTRFS_ROOT_BACKREF_KEY) {
+		btrfs_release_path(path);
+		key.objectid = ref_id;
+		key.type = BTRFS_ROOT_REF_KEY;
+		key.offset = root_id;
+		goto again;
+	}
+
+out:
+	btrfs_free_path(path);
+	return err;
+}
+
+/*
+ * add a btrfs_root_ref item.  type is either BTRFS_ROOT_REF_KEY
+ * or BTRFS_ROOT_BACKREF_KEY.
+ *
+ * The dirid, sequence, name and name_len refer to the directory entry
+ * that is referencing the root.
+ *
+ * For a forward ref, the root_id is the id of the tree referencing
+ * the root and ref_id is the id of the subvol  or snapshot.
+ *
+ * For a back ref the root_id is the id of the subvol or snapshot and
+ * ref_id is the id of the tree referencing it.
+ *
+ * Will return 0, -ENOMEM, or anything from the CoW path
+ */
+int btrfs_add_root_ref(struct btrfs_trans_handle *trans,
+		       struct btrfs_root *tree_root,
+		       u64 root_id, u64 ref_id, u64 dirid, u64 sequence,
+		       const char *name, int name_len)
+{
+	struct btrfs_key key;
+	int ret;
+	struct btrfs_path *path;
+	struct btrfs_root_ref *ref;
+	struct extent_buffer *leaf;
+	unsigned long ptr;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	key.objectid = root_id;
+	key.type = BTRFS_ROOT_BACKREF_KEY;
+	key.offset = ref_id;
+again:
+	ret = btrfs_insert_empty_item(trans, tree_root, path, &key,
+				      sizeof(*ref) + name_len);
+	if (ret) {
+		btrfs_abort_transaction(trans, tree_root, ret);
+		btrfs_free_path(path);
+		return ret;
+	}
+
+	leaf = path->nodes[0];
+	ref = btrfs_item_ptr(leaf, path->slots[0], struct btrfs_root_ref);
+	btrfs_set_root_ref_dirid(leaf, ref, dirid);
+	btrfs_set_root_ref_sequence(leaf, ref, sequence);
+	btrfs_set_root_ref_name_len(leaf, ref, name_len);
+	ptr = (unsigned long)(ref + 1);
+	write_extent_buffer(leaf, name, ptr, name_len);
+	btrfs_mark_buffer_dirty(leaf);
+
+	if (key.type == BTRFS_ROOT_BACKREF_KEY) {
+		btrfs_release_path(path);
+		key.objectid = ref_id;
+		key.type = BTRFS_ROOT_REF_KEY;
+		key.offset = root_id;
+		goto again;
+	}
+
+	btrfs_free_path(path);
+	return 0;
+}
+
+/*
+ * Old btrfs forgets to init root_item->flags and root_item->byte_limit
+ * for subvolumes. To work around this problem, we steal a bit from
+ * root_item->inode_item->flags, and use it to indicate if those fields
+ * have been properly initialized.
+ */
+void btrfs_check_and_init_root_item(struct btrfs_root_item *root_item)
+{
+	u64 inode_flags = btrfs_stack_inode_flags(&root_item->inode);
+
+	if (!(inode_flags & BTRFS_INODE_ROOT_ITEM_INIT)) {
+		inode_flags |= BTRFS_INODE_ROOT_ITEM_INIT;
+		btrfs_set_stack_inode_flags(&root_item->inode, inode_flags);
+		btrfs_set_root_flags(root_item, 0);
+		btrfs_set_root_limit(root_item, 0);
+	}
+}
+
+void btrfs_update_root_times(struct btrfs_trans_handle *trans,
+			     struct btrfs_root *root)
+{
+	struct btrfs_root_item *item = &root->root_item;
+	struct timespec ct = CURRENT_TIME;
+
+	spin_lock(&root->root_item_lock);
+	btrfs_set_root_ctransid(item, trans->transid);
+	btrfs_set_stack_timespec_sec(&item->ctime, ct.tv_sec);
+	btrfs_set_stack_timespec_nsec(&item->ctime, ct.tv_nsec);
+	spin_unlock(&root->root_item_lock);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * Copyright (C) 2012 Alexander Block.  All rights reserved.
+ * Copyright (C) 2012 STRATO.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include "ctree.h"
+
+#define BTRFS_SEND_STREAM_MAGIC "btrfs-stream"
+#define BTRFS_SEND_STREAM_VERSION 1
+
+#define BTRFS_SEND_BUF_SIZE (1024 * 64)
+#define BTRFS_SEND_READ_SIZE (1024 * 48)
+
+enum btrfs_tlv_type {
+	BTRFS_TLV_U8,
+	BTRFS_TLV_U16,
+	BTRFS_TLV_U32,
+	BTRFS_TLV_U64,
+	BTRFS_TLV_BINARY,
+	BTRFS_TLV_STRING,
+	BTRFS_TLV_UUID,
+	BTRFS_TLV_TIMESPEC,
+};
+
+struct btrfs_stream_header {
+	char magic[sizeof(BTRFS_SEND_STREAM_MAGIC)];
+	__le32 version;
+} __attribute__ ((__packed__));
+
+struct btrfs_cmd_header {
+	/* len excluding the header */
+	__le32 len;
+	__le16 cmd;
+	/* crc including the header with zero crc field */
+	__le32 crc;
+} __attribute__ ((__packed__));
+
+struct btrfs_tlv_header {
+	__le16 tlv_type;
+	/* len excluding the header */
+	__le16 tlv_len;
+} __attribute__ ((__packed__));
+
+/* commands */
+enum btrfs_send_cmd {
+	BTRFS_SEND_C_UNSPEC,
+
+	BTRFS_SEND_C_SUBVOL,
+	BTRFS_SEND_C_SNAPSHOT,
+
+	BTRFS_SEND_C_MKFILE,
+	BTRFS_SEND_C_MKDIR,
+	BTRFS_SEND_C_MKNOD,
+	BTRFS_SEND_C_MKFIFO,
+	BTRFS_SEND_C_MKSOCK,
+	BTRFS_SEND_C_SYMLINK,
+
+	BTRFS_SEND_C_RENAME,
+	BTRFS_SEND_C_LINK,
+	BTRFS_SEND_C_UNLINK,
+	BTRFS_SEND_C_RMDIR,
+
+	BTRFS_SEND_C_SET_XATTR,
+	BTRFS_SEND_C_REMOVE_XATTR,
+
+	BTRFS_SEND_C_WRITE,
+	BTRFS_SEND_C_CLONE,
+
+	BTRFS_SEND_C_TRUNCATE,
+	BTRFS_SEND_C_CHMOD,
+	BTRFS_SEND_C_CHOWN,
+	BTRFS_SEND_C_UTIMES,
+
+	BTRFS_SEND_C_END,
+	BTRFS_SEND_C_UPDATE_EXTENT,
+	__BTRFS_SEND_C_MAX,
+};
+#define BTRFS_SEND_C_MAX (__BTRFS_SEND_C_MAX - 1)
+
+/* attributes in send stream */
+enum {
+	BTRFS_SEND_A_UNSPEC,
+
+	BTRFS_SEND_A_UUID,
+	BTRFS_SEND_A_CTRANSID,
+
+	BTRFS_SEND_A_INO,
+	BTRFS_SEND_A_SIZE,
+	BTRFS_SEND_A_MODE,
+	BTRFS_SEND_A_UID,
+	BTRFS_SEND_A_GID,
+	BTRFS_SEND_A_RDEV,
+	BTRFS_SEND_A_CTIME,
+	BTRFS_SEND_A_MTIME,
+	BTRFS_SEND_A_ATIME,
+	BTRFS_SEND_A_OTIME,
+
+	BTRFS_SEND_A_XATTR_NAME,
+	BTRFS_SEND_A_XATTR_DATA,
+
+	BTRFS_SEND_A_PATH,
+	BTRFS_SEND_A_PATH_TO,
+	BTRFS_SEND_A_PATH_LINK,
+
+	BTRFS_SEND_A_FILE_OFFSET,
+	BTRFS_SEND_A_DATA,
+
+	BTRFS_SEND_A_CLONE_UUID,
+	BTRFS_SEND_A_CLONE_CTRANSID,
+	BTRFS_SEND_A_CLONE_PATH,
+	BTRFS_SEND_A_CLONE_OFFSET,
+	BTRFS_SEND_A_CLONE_LEN,
+
+	__BTRFS_SEND_A_MAX,
+};
+#define BTRFS_SEND_A_MAX (__BTRFS_SEND_A_MAX - 1)
+
+#ifdef __KERNEL__
+long btrfs_ioctl_send(struct file *mnt_file, void __user *arg);
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /*
+ * Copyright (C) 2007 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/highmem.h>
+#include <asm/unaligned.h>
+
+#include "ctree.h"
+
+static inline u8 get_unaligned_le8(const void *p)
+{
+       return *(u8 *)p;
+}
+
+static inline void put_unaligned_le8(u8 val, void *p)
+{
+       *(u8 *)p = val;
+}
+
+/*
+ * this is some deeply nasty code.
+ *
+ * The end result is that anyone who #includes ctree.h gets a
+ * declaration for the btrfs_set_foo functions and btrfs_foo functions,
+ * which are wappers of btrfs_set_token_#bits functions and
+ * btrfs_get_token_#bits functions, which are defined in this file.
+ *
+ * These setget functions do all the extent_buffer related mapping
+ * required to efficiently read and write specific fields in the extent
+ * buffers.  Every pointer to metadata items in btrfs is really just
+ * an unsigned long offset into the extent buffer which has been
+ * cast to a specific type.  This gives us all the gcc type checking.
+ *
+ * The extent buffer api is used to do the page spanning work required to
+ * have a metadata blocksize different from the page size.
+ */
+
+#define DEFINE_BTRFS_SETGET_BITS(bits)					\
+u##bits btrfs_get_token_##bits(const struct extent_buffer *eb,		\
+			       const void *ptr, unsigned long off,	\
+			       struct btrfs_map_token *token)		\
+{									\
+	unsigned long part_offset = (unsigned long)ptr;			\
+	unsigned long offset = part_offset + off;			\
+	void *p;							\
+	int err;							\
+	char *kaddr;							\
+	unsigned long map_start;					\
+	unsigned long map_len;						\
+	int size = sizeof(u##bits);					\
+	u##bits res;							\
+									\
+	if (token && token->kaddr && token->offset <= offset &&		\
+	    token->eb == eb &&						\
+	   (token->offset + PAGE_CACHE_SIZE >= offset + size)) {	\
+		kaddr = token->kaddr;					\
+		p = kaddr + part_offset - token->offset;		\
+		res = get_unaligned_le##bits(p + off);			\
+		return res;						\
+	}								\
+	err = map_private_extent_buffer(eb, offset, size,		\
+					&kaddr, &map_start, &map_len);	\
+	if (err) {							\
+		__le##bits leres;					\
+									\
+		read_extent_buffer(eb, &leres, offset, size);		\
+		return le##bits##_to_cpu(leres);			\
+	}								\
+	p = kaddr + part_offset - map_start;				\
+	res = get_unaligned_le##bits(p + off);				\
+	if (token) {							\
+		token->kaddr = kaddr;					\
+		token->offset = map_start;				\
+		token->eb = eb;						\
+	}								\
+	return res;							\
+}									\
+void btrfs_set_token_##bits(struct extent_buffer *eb,			\
+			    const void *ptr, unsigned long off,		\
+			    u##bits val,				\
+			    struct btrfs_map_token *token)		\
+{									\
+	unsigned long part_offset = (unsigned long)ptr;			\
+	unsigned long offset = part_offset + off;			\
+	void *p;							\
+	int err;							\
+	char *kaddr;							\
+	unsigned long map_start;					\
+	unsigned long map_len;						\
+	int size = sizeof(u##bits);					\
+									\
+	if (token && token->kaddr && token->offset <= offset &&		\
+	    token->eb == eb &&						\
+	   (token->offset + PAGE_CACHE_SIZE >= offset + size)) {	\
+		kaddr = token->kaddr;					\
+		p = kaddr + part_offset - token->offset;		\
+		put_unaligned_le##bits(val, p + off);			\
+		return;							\
+	}								\
+	err = map_private_extent_buffer(eb, offset, size,		\
+			&kaddr, &map_start, &map_len);			\
+	if (err) {							\
+		__le##bits val2;					\
+									\
+		val2 = cpu_to_le##bits(val);				\
+		write_extent_buffer(eb, &val2, offset, size);		\
+		return;							\
+	}								\
+	p = kaddr + part_offset - map_start;				\
+	put_unaligned_le##bits(val, p + off);				\
+	if (token) {							\
+		token->kaddr = kaddr;					\
+		token->offset = map_start;				\
+		token->eb = eb;						\
+	}								\
+}
+
+DEFINE_BTRFS_SETGET_BITS(8)
+DEFINE_BTRFS_SETGET_BITS(16)
+DEFINE_BTRFS_SETGET_BITS(32)
+DEFINE_BTRFS_SETGET_BITS(64)
+
+void btrfs_node_key(const struct extent_buffer *eb,
+		    struct btrfs_disk_key *disk_key, int nr)
+{
+	unsigned long ptr = btrfs_node_key_ptr_offset(nr);
+	read_eb_member(eb, (struct btrfs_key_ptr *)ptr,
+		       struct btrfs_key_ptr, key, disk_key);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ * Copyright (C) 2007 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/blkdev.h>
+#include <linux/module.h>
+#include <linux/buffer_head.h>
+#include <linux/fs.h>
+#include <linux/pagemap.h>
+#include <linux/highmem.h>
+#include <linux/time.h>
+#include <linux/init.h>
+#include <linux/seq_file.h>
+#include <linux/string.h>
+#include <linux/backing-dev.h>
+#include <linux/mount.h>
+#include <linux/mpage.h>
+#include <linux/swap.h>
+#include <linux/writeback.h>
+#include <linux/statfs.h>
+#include <linux/compat.h>
+#include <linux/parser.h>
+#include <linux/ctype.h>
+#include <linux/namei.h>
+#include <linux/miscdevice.h>
+#include <linux/magic.h>
+#include <linux/slab.h>
+#include <linux/cleancache.h>
+#include <linux/ratelimit.h>
+#include <linux/btrfs.h>
+#include "delayed-inode.h"
+#include "ctree.h"
+#include "disk-io.h"
+#include "transaction.h"
+#include "btrfs_inode.h"
+#include "print-tree.h"
+#include "hash.h"
+#include "props.h"
+#include "xattr.h"
+#include "volumes.h"
+#include "export.h"
+#include "compression.h"
+#include "rcu-string.h"
+#include "dev-replace.h"
+#include "free-space-cache.h"
+#include "backref.h"
+#include "tests/btrfs-tests.h"
+
+#include "qgroup.h"
+#define CREATE_TRACE_POINTS
+#include <trace/events/btrfs.h>
+
+static const struct super_operations btrfs_super_ops;
+static struct file_system_type btrfs_fs_type;
+
+static int btrfs_remount(struct super_block *sb, int *flags, char *data);
+
+const char *btrfs_decode_error(int errno)
+{
+	char *errstr = "unknown";
+
+	switch (errno) {
+	case -EIO:
+		errstr = "IO failure";
+		break;
+	case -ENOMEM:
+		errstr = "Out of memory";
+		break;
+	case -EROFS:
+		errstr = "Readonly filesystem";
+		break;
+	case -EEXIST:
+		errstr = "Object already exists";
+		break;
+	case -ENOSPC:
+		errstr = "No space left";
+		break;
+	case -ENOENT:
+		errstr = "No such entry";
+		break;
+	}
+
+	return errstr;
+}
+
+static void save_error_info(struct btrfs_fs_info *fs_info)
+{
+	/*
+	 * today we only save the error info into ram.  Long term we'll
+	 * also send it down to the disk
+	 */
+	set_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state);
+}
+
+/* btrfs handle error by forcing the filesystem readonly */
+static void btrfs_handle_error(struct btrfs_fs_info *fs_info)
+{
+	struct super_block *sb = fs_info->sb;
+
+	if (sb->s_flags & MS_RDONLY)
+		return;
+
+	if (test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state)) {
+		sb->s_flags |= MS_RDONLY;
+		btrfs_info(fs_info, "forced readonly");
+		/*
+		 * Note that a running device replace operation is not
+		 * canceled here although there is no way to update
+		 * the progress. It would add the risk of a deadlock,
+		 * therefore the canceling is ommited. The only penalty
+		 * is that some I/O remains active until the procedure
+		 * completes. The next time when the filesystem is
+		 * mounted writeable again, the device replace
+		 * operation continues.
+		 */
+	}
+}
+
+/*
+ * __btrfs_std_error decodes expected errors from the caller and
+ * invokes the approciate error response.
+ */
+__cold
+void __btrfs_std_error(struct btrfs_fs_info *fs_info, const char *function,
+		       unsigned int line, int errno, const char *fmt, ...)
+{
+	struct super_block *sb = fs_info->sb;
+#ifdef CONFIG_PRINTK
+	const char *errstr;
+#endif
+
+	/*
+	 * Special case: if the error is EROFS, and we're already
+	 * under MS_RDONLY, then it is safe here.
+	 */
+	if (errno == -EROFS && (sb->s_flags & MS_RDONLY))
+  		return;
+
+#ifdef CONFIG_PRINTK
+	errstr = btrfs_decode_error(errno);
+	if (fmt) {
+		struct va_format vaf;
+		va_list args;
+
+		va_start(args, fmt);
+		vaf.fmt = fmt;
+		vaf.va = &args;
+
+		printk(KERN_CRIT
+			"BTRFS: error (device %s) in %s:%d: errno=%d %s (%pV)\n",
+			sb->s_id, function, line, errno, errstr, &vaf);
+		va_end(args);
+	} else {
+		printk(KERN_CRIT "BTRFS: error (device %s) in %s:%d: errno=%d %s\n",
+			sb->s_id, function, line, errno, errstr);
+	}
+#endif
+
+	/* Don't go through full error handling during mount */
+	save_error_info(fs_info);
+	if (sb->s_flags & MS_BORN)
+		btrfs_handle_error(fs_info);
+}
+
+#ifdef CONFIG_PRINTK
+static const char * const logtypes[] = {
+	"emergency",
+	"alert",
+	"critical",
+	"error",
+	"warning",
+	"notice",
+	"info",
+	"debug",
+};
+
+void btrfs_printk(const struct btrfs_fs_info *fs_info, const char *fmt, ...)
+{
+	struct super_block *sb = fs_info->sb;
+	char lvl[4];
+	struct va_format vaf;
+	va_list args;
+	const char *type = logtypes[4];
+	int kern_level;
+
+	va_start(args, fmt);
+
+	kern_level = printk_get_level(fmt);
+	if (kern_level) {
+		size_t size = printk_skip_level(fmt) - fmt;
+		memcpy(lvl, fmt,  size);
+		lvl[size] = '\0';
+		fmt += size;
+		type = logtypes[kern_level - '0'];
+	} else
+		*lvl = '\0';
+
+	vaf.fmt = fmt;
+	vaf.va = &args;
+
+	printk("%sBTRFS %s (device %s): %pV\n", lvl, type, sb->s_id, &vaf);
+
+	va_end(args);
+}
+#endif
+
+/*
+ * We only mark the transaction aborted and then set the file system read-only.
+ * This will prevent new transactions from starting or trying to join this
+ * one.
+ *
+ * This means that error recovery at the call site is limited to freeing
+ * any local memory allocations and passing the error code up without
+ * further cleanup. The transaction should complete as it normally would
+ * in the call path but will return -EIO.
+ *
+ * We'll complete the cleanup in btrfs_end_transaction and
+ * btrfs_commit_transaction.
+ */
+__cold
+void __btrfs_abort_transaction(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root, const char *function,
+			       unsigned int line, int errno)
+{
+	trans->aborted = errno;
+	/* Nothing used. The other threads that have joined this
+	 * transaction may be able to continue. */
+	if (!trans->dirty && list_empty(&trans->new_bgs)) {
+		const char *errstr;
+
+		errstr = btrfs_decode_error(errno);
+		btrfs_warn(root->fs_info,
+		           "%s:%d: Aborting unused transaction(%s).",
+		           function, line, errstr);
+		return;
+	}
+	ACCESS_ONCE(trans->transaction->aborted) = errno;
+	/* Wake up anybody who may be waiting on this transaction */
+	wake_up(&root->fs_info->transaction_wait);
+	wake_up(&root->fs_info->transaction_blocked_wait);
+	__btrfs_std_error(root->fs_info, function, line, errno, NULL);
+}
+/*
+ * __btrfs_panic decodes unexpected, fatal errors from the caller,
+ * issues an alert, and either panics or BUGs, depending on mount options.
+ */
+__cold
+void __btrfs_panic(struct btrfs_fs_info *fs_info, const char *function,
+		   unsigned int line, int errno, const char *fmt, ...)
+{
+	char *s_id = "<unknown>";
+	const char *errstr;
+	struct va_format vaf = { .fmt = fmt };
+	va_list args;
+
+	if (fs_info)
+		s_id = fs_info->sb->s_id;
+
+	va_start(args, fmt);
+	vaf.va = &args;
+
+	errstr = btrfs_decode_error(errno);
+	if (fs_info && (fs_info->mount_opt & BTRFS_MOUNT_PANIC_ON_FATAL_ERROR))
+		panic(KERN_CRIT "BTRFS panic (device %s) in %s:%d: %pV (errno=%d %s)\n",
+			s_id, function, line, &vaf, errno, errstr);
+
+	btrfs_crit(fs_info, "panic in %s:%d: %pV (errno=%d %s)",
+		   function, line, &vaf, errno, errstr);
+	va_end(args);
+	/* Caller calls BUG() */
+}
+
+static void btrfs_put_super(struct super_block *sb)
+{
+	close_ctree(btrfs_sb(sb)->tree_root);
+}
+
+enum {
+	Opt_degraded, Opt_subvol, Opt_subvolid, Opt_device, Opt_nodatasum,
+	Opt_nodatacow, Opt_max_inline, Opt_alloc_start, Opt_nobarrier, Opt_ssd,
+	Opt_nossd, Opt_ssd_spread, Opt_thread_pool, Opt_noacl, Opt_compress,
+	Opt_compress_type, Opt_compress_force, Opt_compress_force_type,
+	Opt_notreelog, Opt_ratio, Opt_flushoncommit, Opt_discard,
+	Opt_space_cache, Opt_clear_cache, Opt_user_subvol_rm_allowed,
+	Opt_enospc_debug, Opt_subvolrootid, Opt_defrag, Opt_inode_cache,
+	Opt_no_space_cache, Opt_recovery, Opt_skip_balance,
+	Opt_check_integrity, Opt_check_integrity_including_extent_data,
+	Opt_check_integrity_print_mask, Opt_fatal_errors, Opt_rescan_uuid_tree,
+	Opt_commit_interval, Opt_barrier, Opt_nodefrag, Opt_nodiscard,
+	Opt_noenospc_debug, Opt_noflushoncommit, Opt_acl, Opt_datacow,
+	Opt_datasum, Opt_treelog, Opt_noinode_cache,
+#ifdef CONFIG_BTRFS_DEBUG
+	Opt_fragment_data, Opt_fragment_metadata, Opt_fragment_all,
+#endif
+	Opt_err,
+};
+
+static match_table_t tokens = {
+	{Opt_degraded, "degraded"},
+	{Opt_subvol, "subvol=%s"},
+	{Opt_subvolid, "subvolid=%s"},
+	{Opt_device, "device=%s"},
+	{Opt_nodatasum, "nodatasum"},
+	{Opt_datasum, "datasum"},
+	{Opt_nodatacow, "nodatacow"},
+	{Opt_datacow, "datacow"},
+	{Opt_nobarrier, "nobarrier"},
+	{Opt_barrier, "barrier"},
+	{Opt_max_inline, "max_inline=%s"},
+	{Opt_alloc_start, "alloc_start=%s"},
+	{Opt_thread_pool, "thread_pool=%d"},
+	{Opt_compress, "compress"},
+	{Opt_compress_type, "compress=%s"},
+	{Opt_compress_force, "compress-force"},
+	{Opt_compress_force_type, "compress-force=%s"},
+	{Opt_ssd, "ssd"},
+	{Opt_ssd_spread, "ssd_spread"},
+	{Opt_nossd, "nossd"},
+	{Opt_acl, "acl"},
+	{Opt_noacl, "noacl"},
+	{Opt_notreelog, "notreelog"},
+	{Opt_treelog, "treelog"},
+	{Opt_flushoncommit, "flushoncommit"},
+	{Opt_noflushoncommit, "noflushoncommit"},
+	{Opt_ratio, "metadata_ratio=%d"},
+	{Opt_discard, "discard"},
+	{Opt_nodiscard, "nodiscard"},
+	{Opt_space_cache, "space_cache"},
+	{Opt_clear_cache, "clear_cache"},
+	{Opt_user_subvol_rm_allowed, "user_subvol_rm_allowed"},
+	{Opt_enospc_debug, "enospc_debug"},
+	{Opt_noenospc_debug, "noenospc_debug"},
+	{Opt_subvolrootid, "subvolrootid=%d"},
+	{Opt_defrag, "autodefrag"},
+	{Opt_nodefrag, "noautodefrag"},
+	{Opt_inode_cache, "inode_cache"},
+	{Opt_noinode_cache, "noinode_cache"},
+	{Opt_no_space_cache, "nospace_cache"},
+	{Opt_recovery, "recovery"},
+	{Opt_skip_balance, "skip_balance"},
+	{Opt_check_integrity, "check_int"},
+	{Opt_check_integrity_including_extent_data, "check_int_data"},
+	{Opt_check_integrity_print_mask, "check_int_print_mask=%d"},
+	{Opt_rescan_uuid_tree, "rescan_uuid_tree"},
+	{Opt_fatal_errors, "fatal_errors=%s"},
+	{Opt_commit_interval, "commit=%d"},
+#ifdef CONFIG_BTRFS_DEBUG
+	{Opt_fragment_data, "fragment=data"},
+	{Opt_fragment_metadata, "fragment=metadata"},
+	{Opt_fragment_all, "fragment=all"},
+#endif
+	{Opt_err, NULL},
+};
+
+/*
+ * Regular mount options parser.  Everything that is needed only when
+ * reading in a new superblock is parsed here.
+ * XXX JDM: This needs to be cleaned up for remount.
+ */
+int btrfs_parse_options(struct btrfs_root *root, char *options)
+{
+	struct btrfs_fs_info *info = root->fs_info;
+	substring_t args[MAX_OPT_ARGS];
+	char *p, *num, *orig = NULL;
+	u64 cache_gen;
+	int intarg;
+	int ret = 0;
+	char *compress_type;
+	bool compress_force = false;
+
+	cache_gen = btrfs_super_cache_generation(root->fs_info->super_copy);
+	if (cache_gen)
+		btrfs_set_opt(info->mount_opt, SPACE_CACHE);
+
+	if (!options)
+		goto out;
+
+	/*
+	 * strsep changes the string, duplicate it because parse_options
+	 * gets called twice
+	 */
+	options = kstrdup(options, GFP_NOFS);
+	if (!options)
+		return -ENOMEM;
+
+	orig = options;
+
+	while ((p = strsep(&options, ",")) != NULL) {
+		int token;
+		if (!*p)
+			continue;
+
+		token = match_token(p, tokens, args);
+		switch (token) {
+		case Opt_degraded:
+			btrfs_info(root->fs_info, "allowing degraded mounts");
+			btrfs_set_opt(info->mount_opt, DEGRADED);
+			break;
+		case Opt_subvol:
+		case Opt_subvolid:
+		case Opt_subvolrootid:
+		case Opt_device:
+			/*
+			 * These are parsed by btrfs_parse_early_options
+			 * and can be happily ignored here.
+			 */
+			break;
+		case Opt_nodatasum:
+			btrfs_set_and_info(root, NODATASUM,
+					   "setting nodatasum");
+			break;
+		case Opt_datasum:
+			if (btrfs_test_opt(root, NODATASUM)) {
+				if (btrfs_test_opt(root, NODATACOW))
+					btrfs_info(root->fs_info, "setting datasum, datacow enabled");
+				else
+					btrfs_info(root->fs_info, "setting datasum");
+			}
+			btrfs_clear_opt(info->mount_opt, NODATACOW);
+			btrfs_clear_opt(info->mount_opt, NODATASUM);
+			break;
+		case Opt_nodatacow:
+			if (!btrfs_test_opt(root, NODATACOW)) {
+				if (!btrfs_test_opt(root, COMPRESS) ||
+				    !btrfs_test_opt(root, FORCE_COMPRESS)) {
+					btrfs_info(root->fs_info,
+						   "setting nodatacow, compression disabled");
+				} else {
+					btrfs_info(root->fs_info, "setting nodatacow");
+				}
+			}
+			btrfs_clear_opt(info->mount_opt, COMPRESS);
+			btrfs_clear_opt(info->mount_opt, FORCE_COMPRESS);
+			btrfs_set_opt(info->mount_opt, NODATACOW);
+			btrfs_set_opt(info->mount_opt, NODATASUM);
+			break;
+		case Opt_datacow:
+			btrfs_clear_and_info(root, NODATACOW,
+					     "setting datacow");
+			break;
+		case Opt_compress_force:
+		case Opt_compress_force_type:
+			compress_force = true;
+			/* Fallthrough */
+		case Opt_compress:
+		case Opt_compress_type:
+			if (token == Opt_compress ||
+			    token == Opt_compress_force ||
+			    strcmp(args[0].from, "zlib") == 0) {
+				compress_type = "zlib";
+				info->compress_type = BTRFS_COMPRESS_ZLIB;
+				btrfs_set_opt(info->mount_opt, COMPRESS);
+				btrfs_clear_opt(info->mount_opt, NODATACOW);
+				btrfs_clear_opt(info->mount_opt, NODATASUM);
+			} else if (strcmp(args[0].from, "lzo") == 0) {
+				compress_type = "lzo";
+				info->compress_type = BTRFS_COMPRESS_LZO;
+				btrfs_set_opt(info->mount_opt, COMPRESS);
+				btrfs_clear_opt(info->mount_opt, NODATACOW);
+				btrfs_clear_opt(info->mount_opt, NODATASUM);
+				btrfs_set_fs_incompat(info, COMPRESS_LZO);
+			} else if (strncmp(args[0].from, "no", 2) == 0) {
+				compress_type = "no";
+				btrfs_clear_opt(info->mount_opt, COMPRESS);
+				btrfs_clear_opt(info->mount_opt, FORCE_COMPRESS);
+				compress_force = false;
+			} else {
+				ret = -EINVAL;
+				goto out;
+			}
+
+			if (compress_force) {
+				btrfs_set_and_info(root, FORCE_COMPRESS,
+						   "force %s compression",
+						   compress_type);
+			} else {
+				if (!btrfs_test_opt(root, COMPRESS))
+					btrfs_info(root->fs_info,
+						   "btrfs: use %s compression",
+						   compress_type);
+				/*
+				 * If we remount from compress-force=xxx to
+				 * compress=xxx, we need clear FORCE_COMPRESS
+				 * flag, otherwise, there is no way for users
+				 * to disable forcible compression separately.
+				 */
+				btrfs_clear_opt(info->mount_opt, FORCE_COMPRESS);
+			}
+			break;
+		case Opt_ssd:
+			btrfs_set_and_info(root, SSD,
+					   "use ssd allocation scheme");
+			break;
+		case Opt_ssd_spread:
+			btrfs_set_and_info(root, SSD_SPREAD,
+					   "use spread ssd allocation scheme");
+			btrfs_set_opt(info->mount_opt, SSD);
+			break;
+		case Opt_nossd:
+			btrfs_set_and_info(root, NOSSD,
+					     "not using ssd allocation scheme");
+			btrfs_clear_opt(info->mount_opt, SSD);
+			break;
+		case Opt_barrier:
+			btrfs_clear_and_info(root, NOBARRIER,
+					     "turning on barriers");
+			break;
+		case Opt_nobarrier:
+			btrfs_set_and_info(root, NOBARRIER,
+					   "turning off barriers");
+			break;
+		case Opt_thread_pool:
+			ret = match_int(&args[0], &intarg);
+			if (ret) {
+				goto out;
+			} else if (intarg > 0) {
+				info->thread_pool_size = intarg;
+			} else {
+				ret = -EINVAL;
+				goto out;
+			}
+			break;
+		case Opt_max_inline:
+			num = match_strdup(&args[0]);
+			if (num) {
+				info->max_inline = memparse(num, NULL);
+				kfree(num);
+
+				if (info->max_inline) {
+					info->max_inline = min_t(u64,
+						info->max_inline,
+						root->sectorsize);
+				}
+				btrfs_info(root->fs_info, "max_inline at %llu",
+					info->max_inline);
+			} else {
+				ret = -ENOMEM;
+				goto out;
+			}
+			break;
+		case Opt_alloc_start:
+			num = match_strdup(&args[0]);
+			if (num) {
+				mutex_lock(&info->chunk_mutex);
+				info->alloc_start = memparse(num, NULL);
+				mutex_unlock(&info->chunk_mutex);
+				kfree(num);
+				btrfs_info(root->fs_info, "allocations start at %llu",
+					info->alloc_start);
+			} else {
+				ret = -ENOMEM;
+				goto out;
+			}
+			break;
+		case Opt_acl:
+#ifdef CONFIG_BTRFS_FS_POSIX_ACL
+			root->fs_info->sb->s_flags |= MS_POSIXACL;
+			break;
+#else
+			btrfs_err(root->fs_info,
+				"support for ACL not compiled in!");
+			ret = -EINVAL;
+			goto out;
+#endif
+		case Opt_noacl:
+			root->fs_info->sb->s_flags &= ~MS_POSIXACL;
+			break;
+		case Opt_notreelog:
+			btrfs_set_and_info(root, NOTREELOG,
+					   "disabling tree log");
+			break;
+		case Opt_treelog:
+			btrfs_clear_and_info(root, NOTREELOG,
+					     "enabling tree log");
+			break;
+		case Opt_flushoncommit:
+			btrfs_set_and_info(root, FLUSHONCOMMIT,
+					   "turning on flush-on-commit");
+			break;
+		case Opt_noflushoncommit:
+			btrfs_clear_and_info(root, FLUSHONCOMMIT,
+					     "turning off flush-on-commit");
+			break;
+		case Opt_ratio:
+			ret = match_int(&args[0], &intarg);
+			if (ret) {
+				goto out;
+			} else if (intarg >= 0) {
+				info->metadata_ratio = intarg;
+				btrfs_info(root->fs_info, "metadata ratio %d",
+				       info->metadata_ratio);
+			} else {
+				ret = -EINVAL;
+				goto out;
+			}
+			break;
+		case Opt_discard:
+			btrfs_set_and_info(root, DISCARD,
+					   "turning on discard");
+			break;
+		case Opt_nodiscard:
+			btrfs_clear_and_info(root, DISCARD,
+					     "turning off discard");
+			break;
+		case Opt_space_cache:
+			btrfs_set_and_info(root, SPACE_CACHE,
+					   "enabling disk space caching");
+			break;
+		case Opt_rescan_uuid_tree:
+			btrfs_set_opt(info->mount_opt, RESCAN_UUID_TREE);
+			break;
+		case Opt_no_space_cache:
+			btrfs_clear_and_info(root, SPACE_CACHE,
+					     "disabling disk space caching");
+			break;
+		case Opt_inode_cache:
+			btrfs_set_pending_and_info(info, INODE_MAP_CACHE,
+					   "enabling inode map caching");
+			break;
+		case Opt_noinode_cache:
+			btrfs_clear_pending_and_info(info, INODE_MAP_CACHE,
+					     "disabling inode map caching");
+			break;
+		case Opt_clear_cache:
+			btrfs_set_and_info(root, CLEAR_CACHE,
+					   "force clearing of disk cache");
+			break;
+		case Opt_user_subvol_rm_allowed:
+			btrfs_set_opt(info->mount_opt, USER_SUBVOL_RM_ALLOWED);
+			break;
+		case Opt_enospc_debug:
+			btrfs_set_opt(info->mount_opt, ENOSPC_DEBUG);
+			break;
+		case Opt_noenospc_debug:
+			btrfs_clear_opt(info->mount_opt, ENOSPC_DEBUG);
+			break;
+		case Opt_defrag:
+			btrfs_set_and_info(root, AUTO_DEFRAG,
+					   "enabling auto defrag");
+			break;
+		case Opt_nodefrag:
+			btrfs_clear_and_info(root, AUTO_DEFRAG,
+					     "disabling auto defrag");
+			break;
+		case Opt_recovery:
+			btrfs_info(root->fs_info, "enabling auto recovery");
+			btrfs_set_opt(info->mount_opt, RECOVERY);
+			break;
+		case Opt_skip_balance:
+			btrfs_set_opt(info->mount_opt, SKIP_BALANCE);
+			break;
+#ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+		case Opt_check_integrity_including_extent_data:
+			btrfs_info(root->fs_info,
+				   "enabling check integrity including extent data");
+			btrfs_set_opt(info->mount_opt,
+				      CHECK_INTEGRITY_INCLUDING_EXTENT_DATA);
+			btrfs_set_opt(info->mount_opt, CHECK_INTEGRITY);
+			break;
+		case Opt_check_integrity:
+			btrfs_info(root->fs_info, "enabling check integrity");
+			btrfs_set_opt(info->mount_opt, CHECK_INTEGRITY);
+			break;
+		case Opt_check_integrity_print_mask:
+			ret = match_int(&args[0], &intarg);
+			if (ret) {
+				goto out;
+			} else if (intarg >= 0) {
+				info->check_integrity_print_mask = intarg;
+				btrfs_info(root->fs_info, "check_integrity_print_mask 0x%x",
+				       info->check_integrity_print_mask);
+			} else {
+				ret = -EINVAL;
+				goto out;
+			}
+			break;
+#else
+		case Opt_check_integrity_including_extent_data:
+		case Opt_check_integrity:
+		case Opt_check_integrity_print_mask:
+			btrfs_err(root->fs_info,
+				"support for check_integrity* not compiled in!");
+			ret = -EINVAL;
+			goto out;
+#endif
+		case Opt_fatal_errors:
+			if (strcmp(args[0].from, "panic") == 0)
+				btrfs_set_opt(info->mount_opt,
+					      PANIC_ON_FATAL_ERROR);
+			else if (strcmp(args[0].from, "bug") == 0)
+				btrfs_clear_opt(info->mount_opt,
+					      PANIC_ON_FATAL_ERROR);
+			else {
+				ret = -EINVAL;
+				goto out;
+			}
+			break;
+		case Opt_commit_interval:
+			intarg = 0;
+			ret = match_int(&args[0], &intarg);
+			if (ret < 0) {
+				btrfs_err(root->fs_info, "invalid commit interval");
+				ret = -EINVAL;
+				goto out;
+			}
+			if (intarg > 0) {
+				if (intarg > 300) {
+					btrfs_warn(root->fs_info, "excessive commit interval %d",
+							intarg);
+				}
+				info->commit_interval = intarg;
+			} else {
+				btrfs_info(root->fs_info, "using default commit interval %ds",
+				    BTRFS_DEFAULT_COMMIT_INTERVAL);
+				info->commit_interval = BTRFS_DEFAULT_COMMIT_INTERVAL;
+			}
+			break;
+#ifdef CONFIG_BTRFS_DEBUG
+		case Opt_fragment_all:
+			btrfs_info(root->fs_info, "fragmenting all space");
+			btrfs_set_opt(info->mount_opt, FRAGMENT_DATA);
+			btrfs_set_opt(info->mount_opt, FRAGMENT_METADATA);
+			break;
+		case Opt_fragment_metadata:
+			btrfs_info(root->fs_info, "fragmenting metadata");
+			btrfs_set_opt(info->mount_opt,
+				      FRAGMENT_METADATA);
+			break;
+		case Opt_fragment_data:
+			btrfs_info(root->fs_info, "fragmenting data");
+			btrfs_set_opt(info->mount_opt, FRAGMENT_DATA);
+			break;
+#endif
+		case Opt_err:
+			btrfs_info(root->fs_info, "unrecognized mount option '%s'", p);
+			ret = -EINVAL;
+			goto out;
+		default:
+			break;
+		}
+	}
+out:
+	if (!ret && btrfs_test_opt(root, SPACE_CACHE))
+		btrfs_info(root->fs_info, "disk space caching is enabled");
+	kfree(orig);
+	return ret;
+}
+
+/*
+ * Parse mount options that are required early in the mount process.
+ *
+ * All other options will be parsed on much later in the mount process and
+ * only when we need to allocate a new super block.
+ */
+static int btrfs_parse_early_options(const char *options, fmode_t flags,
+		void *holder, char **subvol_name, u64 *subvol_objectid,
+		struct btrfs_fs_devices **fs_devices)
+{
+	substring_t args[MAX_OPT_ARGS];
+	char *device_name, *opts, *orig, *p;
+	char *num = NULL;
+	int error = 0;
+
+	if (!options)
+		return 0;
+
+	/*
+	 * strsep changes the string, duplicate it because parse_options
+	 * gets called twice
+	 */
+	opts = kstrdup(options, GFP_KERNEL);
+	if (!opts)
+		return -ENOMEM;
+	orig = opts;
+
+	while ((p = strsep(&opts, ",")) != NULL) {
+		int token;
+		if (!*p)
+			continue;
+
+		token = match_token(p, tokens, args);
+		switch (token) {
+		case Opt_subvol:
+			kfree(*subvol_name);
+			*subvol_name = match_strdup(&args[0]);
+			if (!*subvol_name) {
+				error = -ENOMEM;
+				goto out;
+			}
+			break;
+		case Opt_subvolid:
+			num = match_strdup(&args[0]);
+			if (num) {
+				*subvol_objectid = memparse(num, NULL);
+				kfree(num);
+				/* we want the original fs_tree */
+				if (!*subvol_objectid)
+					*subvol_objectid =
+						BTRFS_FS_TREE_OBJECTID;
+			} else {
+				error = -EINVAL;
+				goto out;
+			}
+			break;
+		case Opt_subvolrootid:
+			printk(KERN_WARNING
+				"BTRFS: 'subvolrootid' mount option is deprecated and has "
+				"no effect\n");
+			break;
+		case Opt_device:
+			device_name = match_strdup(&args[0]);
+			if (!device_name) {
+				error = -ENOMEM;
+				goto out;
+			}
+			error = btrfs_scan_one_device(device_name,
+					flags, holder, fs_devices);
+			kfree(device_name);
+			if (error)
+				goto out;
+			break;
+		default:
+			break;
+		}
+	}
+
+out:
+	kfree(orig);
+	return error;
+}
+
+char *btrfs_get_subvol_name_from_objectid(struct btrfs_fs_info *fs_info,
+					  u64 subvol_objectid)
+{
+	struct btrfs_root *root = fs_info->tree_root;
+	struct btrfs_root *fs_root;
+	struct btrfs_root_ref *root_ref;
+	struct btrfs_inode_ref *inode_ref;
+	struct btrfs_key key;
+	struct btrfs_path *path = NULL;
+	char *name = NULL, *ptr;
+	u64 dirid;
+	int len;
+	int ret;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	path->leave_spinning = 1;
+
+	name = kmalloc(PATH_MAX, GFP_NOFS);
+	if (!name) {
+		ret = -ENOMEM;
+		goto err;
+	}
+	ptr = name + PATH_MAX - 1;
+	ptr[0] = '\0';
+
+	/*
+	 * Walk up the subvolume trees in the tree of tree roots by root
+	 * backrefs until we hit the top-level subvolume.
+	 */
+	while (subvol_objectid != BTRFS_FS_TREE_OBJECTID) {
+		key.objectid = subvol_objectid;
+		key.type = BTRFS_ROOT_BACKREF_KEY;
+		key.offset = (u64)-1;
+
+		ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+		if (ret < 0) {
+			goto err;
+		} else if (ret > 0) {
+			ret = btrfs_previous_item(root, path, subvol_objectid,
+						  BTRFS_ROOT_BACKREF_KEY);
+			if (ret < 0) {
+				goto err;
+			} else if (ret > 0) {
+				ret = -ENOENT;
+				goto err;
+			}
+		}
+
+		btrfs_item_key_to_cpu(path->nodes[0], &key, path->slots[0]);
+		subvol_objectid = key.offset;
+
+		root_ref = btrfs_item_ptr(path->nodes[0], path->slots[0],
+					  struct btrfs_root_ref);
+		len = btrfs_root_ref_name_len(path->nodes[0], root_ref);
+		ptr -= len + 1;
+		if (ptr < name) {
+			ret = -ENAMETOOLONG;
+			goto err;
+		}
+		read_extent_buffer(path->nodes[0], ptr + 1,
+				   (unsigned long)(root_ref + 1), len);
+		ptr[0] = '/';
+		dirid = btrfs_root_ref_dirid(path->nodes[0], root_ref);
+		btrfs_release_path(path);
+
+		key.objectid = subvol_objectid;
+		key.type = BTRFS_ROOT_ITEM_KEY;
+		key.offset = (u64)-1;
+		fs_root = btrfs_read_fs_root_no_name(fs_info, &key);
+		if (IS_ERR(fs_root)) {
+			ret = PTR_ERR(fs_root);
+			goto err;
+		}
+
+		/*
+		 * Walk up the filesystem tree by inode refs until we hit the
+		 * root directory.
+		 */
+		while (dirid != BTRFS_FIRST_FREE_OBJECTID) {
+			key.objectid = dirid;
+			key.type = BTRFS_INODE_REF_KEY;
+			key.offset = (u64)-1;
+
+			ret = btrfs_search_slot(NULL, fs_root, &key, path, 0, 0);
+			if (ret < 0) {
+				goto err;
+			} else if (ret > 0) {
+				ret = btrfs_previous_item(fs_root, path, dirid,
+							  BTRFS_INODE_REF_KEY);
+				if (ret < 0) {
+					goto err;
+				} else if (ret > 0) {
+					ret = -ENOENT;
+					goto err;
+				}
+			}
+
+			btrfs_item_key_to_cpu(path->nodes[0], &key, path->slots[0]);
+			dirid = key.offset;
+
+			inode_ref = btrfs_item_ptr(path->nodes[0],
+						   path->slots[0],
+						   struct btrfs_inode_ref);
+			len = btrfs_inode_ref_name_len(path->nodes[0],
+						       inode_ref);
+			ptr -= len + 1;
+			if (ptr < name) {
+				ret = -ENAMETOOLONG;
+				goto err;
+			}
+			read_extent_buffer(path->nodes[0], ptr + 1,
+					   (unsigned long)(inode_ref + 1), len);
+			ptr[0] = '/';
+			btrfs_release_path(path);
+		}
+	}
+
+	btrfs_free_path(path);
+	if (ptr == name + PATH_MAX - 1) {
+		name[0] = '/';
+		name[1] = '\0';
+	} else {
+		memmove(name, ptr, name + PATH_MAX - ptr);
+	}
+	return name;
+
+err:
+	btrfs_free_path(path);
+	kfree(name);
+	return ERR_PTR(ret);
+}
+
+static int get_default_subvol_objectid(struct btrfs_fs_info *fs_info, u64 *objectid)
+{
+	struct btrfs_root *root = fs_info->tree_root;
+	struct btrfs_dir_item *di;
+	struct btrfs_path *path;
+	struct btrfs_key location;
+	u64 dir_id;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+	path->leave_spinning = 1;
+
+	/*
+	 * Find the "default" dir item which points to the root item that we
+	 * will mount by default if we haven't been given a specific subvolume
+	 * to mount.
+	 */
+	dir_id = btrfs_super_root_dir(fs_info->super_copy);
+	di = btrfs_lookup_dir_item(NULL, root, path, dir_id, "default", 7, 0);
+	if (IS_ERR(di)) {
+		btrfs_free_path(path);
+		return PTR_ERR(di);
+	}
+	if (!di) {
+		/*
+		 * Ok the default dir item isn't there.  This is weird since
+		 * it's always been there, but don't freak out, just try and
+		 * mount the top-level subvolume.
+		 */
+		btrfs_free_path(path);
+		*objectid = BTRFS_FS_TREE_OBJECTID;
+		return 0;
+	}
+
+	btrfs_dir_item_key_to_cpu(path->nodes[0], di, &location);
+	btrfs_free_path(path);
+	*objectid = location.objectid;
+	return 0;
+}
+
+static int btrfs_fill_super(struct super_block *sb,
+			    struct btrfs_fs_devices *fs_devices,
+			    void *data, int silent)
+{
+	struct inode *inode;
+	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
+	struct btrfs_key key;
+	int err;
+
+	sb->s_maxbytes = MAX_LFS_FILESIZE;
+	sb->s_magic = BTRFS_SUPER_MAGIC;
+	sb->s_op = &btrfs_super_ops;
+	sb->s_d_op = &btrfs_dentry_operations;
+	sb->s_export_op = &btrfs_export_ops;
+	sb->s_xattr = btrfs_xattr_handlers;
+	sb->s_time_gran = 1;
+#ifdef CONFIG_BTRFS_FS_POSIX_ACL
+	sb->s_flags |= MS_POSIXACL;
+#endif
+	sb->s_flags |= MS_I_VERSION;
+	sb->s_iflags |= SB_I_CGROUPWB;
+	err = open_ctree(sb, fs_devices, (char *)data);
+	if (err) {
+		printk(KERN_ERR "BTRFS: open_ctree failed\n");
+		return err;
+	}
+
+	key.objectid = BTRFS_FIRST_FREE_OBJECTID;
+	key.type = BTRFS_INODE_ITEM_KEY;
+	key.offset = 0;
+	inode = btrfs_iget(sb, &key, fs_info->fs_root, NULL);
+	if (IS_ERR(inode)) {
+		err = PTR_ERR(inode);
+		goto fail_close;
+	}
+
+	sb->s_root = d_make_root(inode);
+	if (!sb->s_root) {
+		err = -ENOMEM;
+		goto fail_close;
+	}
+
+	save_mount_options(sb, data);
+	cleancache_init_fs(sb);
+	sb->s_flags |= MS_ACTIVE;
+	return 0;
+
+fail_close:
+	close_ctree(fs_info->tree_root);
+	return err;
+}
+
+int btrfs_sync_fs(struct super_block *sb, int wait)
+{
+	struct btrfs_trans_handle *trans;
+	struct btrfs_fs_info *fs_info = btrfs_sb(sb);
+	struct btrfs_root *root = fs_info->tree_root;
+
+	trace_btrfs_sync_fs(wait);
+
+	if (!wait) {
+		filemap_flush(fs_info->btree_inode->i_mapping);
+		return 0;
+	}
+
+	btrfs_wait_ordered_roots(fs_info, -1);
+
+	trans = btrfs_attach_transaction_barrier(root);
+	if (IS_ERR(trans)) {
+		/* no transaction, don't bother */
+		if (PTR_ERR(trans) == -ENOENT) {
+			/*
+			 * Exit unless we have some pending changes
+			 * that need to go through commit
+			 */
+			if (fs_info->pending_changes == 0)
+				return 0;
+			/*
+			 * A non-blocking test if the fs is frozen. We must not
+			 * start a new transaction here otherwise a deadlock
+			 * happens. The pending operations are delayed to the
+			 * next commit after thawing.
+			 */
+			if (__sb_start_write(sb, SB_FREEZE_WRITE, false))
+				__sb_end_write(sb, SB_FREEZE_WRITE);
+			else
+				return 0;
+			trans = btrfs_start_transaction(root, 0);
+		}
+		if (IS_ERR(trans))
+			return PTR_ERR(trans);
+	}
+	return btrfs_commit_transaction(trans, root);
+}
+
+static int btrfs_show_options(struct seq_file *seq, struct dentry *dentry)
+{
+	struct btrfs_fs_info *info = btrfs_sb(dentry->d_sb);
+	struct btrfs_root *root = info->tree_root;
+	char *compress_type;
+	const char *subvol_name;
+
+	if (btrfs_test_opt(root, DEGRADED))
+		seq_puts(seq, ",degraded");
+	if (btrfs_test_opt(root, NODATASUM))
+		seq_puts(seq, ",nodatasum");
+	if (btrfs_test_opt(root, NODATACOW))
+		seq_puts(seq, ",nodatacow");
+	if (btrfs_test_opt(root, NOBARRIER))
+		seq_puts(seq, ",nobarrier");
+	if (info->max_inline != BTRFS_DEFAULT_MAX_INLINE)
+		seq_printf(seq, ",max_inline=%llu", info->max_inline);
+	if (info->alloc_start != 0)
+		seq_printf(seq, ",alloc_start=%llu", info->alloc_start);
+	if (info->thread_pool_size !=  min_t(unsigned long,
+					     num_online_cpus() + 2, 8))
+		seq_printf(seq, ",thread_pool=%d", info->thread_pool_size);
+	if (btrfs_test_opt(root, COMPRESS)) {
+		if (info->compress_type == BTRFS_COMPRESS_ZLIB)
+			compress_type = "zlib";
+		else
+			compress_type = "lzo";
+		if (btrfs_test_opt(root, FORCE_COMPRESS))
+			seq_printf(seq, ",compress-force=%s", compress_type);
+		else
+			seq_printf(seq, ",compress=%s", compress_type);
+	}
+	if (btrfs_test_opt(root, NOSSD))
+		seq_puts(seq, ",nossd");
+	if (btrfs_test_opt(root, SSD_SPREAD))
+		seq_puts(seq, ",ssd_spread");
+	else if (btrfs_test_opt(root, SSD))
+		seq_puts(seq, ",ssd");
+	if (btrfs_test_opt(root, NOTREELOG))
+		seq_puts(seq, ",notreelog");
+	if (btrfs_test_opt(root, FLUSHONCOMMIT))
+		seq_puts(seq, ",flushoncommit");
+	if (btrfs_test_opt(root, DISCARD))
+		seq_puts(seq, ",discard");
+	if (!(root->fs_info->sb->s_flags & MS_POSIXACL))
+		seq_puts(seq, ",noacl");
+	if (btrfs_test_opt(root, SPACE_CACHE))
+		seq_puts(seq, ",space_cache");
+	else
+		seq_puts(seq, ",nospace_cache");
+	if (btrfs_test_opt(root, RESCAN_UUID_TREE))
+		seq_puts(seq, ",rescan_uuid_tree");
+	if (btrfs_test_opt(root, CLEAR_CACHE))
+		seq_puts(seq, ",clear_cache");
+	if (btrfs_test_opt(root, USER_SUBVOL_RM_ALLOWED))
+		seq_puts(seq, ",user_subvol_rm_allowed");
+	if (btrfs_test_opt(root, ENOSPC_DEBUG))
+		seq_puts(seq, ",enospc_debug");
+	if (btrfs_test_opt(root, AUTO_DEFRAG))
+		seq_puts(seq, ",autodefrag");
+	if (btrfs_test_opt(root, INODE_MAP_CACHE))
+		seq_puts(seq, ",inode_cache");
+	if (btrfs_test_opt(root, SKIP_BALANCE))
+		seq_puts(seq, ",skip_balance");
+	if (btrfs_test_opt(root, RECOVERY))
+		seq_puts(seq, ",recovery");
+#ifdef CONFIG_BTRFS_FS_CHECK_INTEGRITY
+	if (btrfs_test_opt(root, CHECK_INTEGRITY_INCLUDING_EXTENT_DATA))
+		seq_puts(seq, ",check_int_data");
+	else if (btrfs_test_opt(root, CHECK_INTEGRITY))
+		seq_puts(seq, ",check_int");
+	if (info->check_integrity_print_mask)
+		seq_printf(seq, ",check_int_print_mask=%d",
+				info->check_integrity_print_mask);
+#endif
+	if (info->metadata_ratio)
+		seq_printf(seq, ",metadata_ratio=%d",
+				info->metadata_ratio);
+	if (btrfs_test_opt(root, PANIC_ON_FATAL_ERROR))
+		seq_puts(seq, ",fatal_errors=panic");
+	if (info->commit_interval != BTRFS_DEFAULT_COMMIT_INTERVAL)
+		seq_printf(seq, ",commit=%d", info->commit_interval);
+#ifdef CONFIG_BTRFS_DEBUG
+	if (btrfs_test_opt(root, FRAGMENT_DATA))
+		seq_puts(seq, ",fragment=data");
+	if (btrfs_test_opt(root, FRAGMENT_METADATA))
+		seq_puts(seq, ",fragment=metadata");
+#endif
+	seq_printf(seq, ",subvolid=%llu",
+		  BTRFS_I(d_inode(dentry))->root->root_key.objectid);
+	subvol_name = btrfs_get_subvol_name_from_objectid(info,
+			BTRFS_I(d_inode(dentry))->root->root_key.objectid);
+	if (!IS_ERR(subvol_name)) {
+		seq_puts(seq, ",subvol=");
+		seq_escape(seq, subvol_name, " \t\n\\");
+		kfree(subvol_name);
+	}
+	return 0;
+}
+
+static int btrfs_test_super(struct super_block *s, void *data)
+{
+	struct btrfs_fs_info *p = data;
+	struct btrfs_fs_info *fs_info = btrfs_sb(s);
+
+	return fs_info->fs_devices == p->fs_devices;
+}
+
+static int btrfs_set_super(struct super_block *s, void *data)
+{
+	int err = set_anon_super(s, data);
+	if (!err)
+		s->s_fs_info = data;
+	return err;
+}
+
+/*
+ * subvolumes are identified by ino 256
+ */
+static inline int is_subvolume_inode(struct inode *inode)
+{
+	if (inode && inode->i_ino == BTRFS_FIRST_FREE_OBJECTID)
+		return 1;
+	return 0;
+}
+
+/*
+ * This will add subvolid=0 to the argument string while removing any subvol=
+ * and subvolid= arguments to make sure we get the top-level root for path
+ * walking to the subvol we want.
+ */
+static char *setup_root_args(char *args)
+{
+	char *buf, *dst, *sep;
+
+	if (!args)
+		return kstrdup("subvolid=0", GFP_NOFS);
+
+	/* The worst case is that we add ",subvolid=0" to the end. */
+	buf = dst = kmalloc(strlen(args) + strlen(",subvolid=0") + 1, GFP_NOFS);
+	if (!buf)
+		return NULL;
+
+	while (1) {
+		sep = strchrnul(args, ',');
+		if (!strstarts(args, "subvol=") &&
+		    !strstarts(args, "subvolid=")) {
+			memcpy(dst, args, sep - args);
+			dst += sep - args;
+			*dst++ = ',';
+		}
+		if (*sep)
+			args = sep + 1;
+		else
+			break;
+	}
+	strcpy(dst, "subvolid=0");
+
+	return buf;
+}
+
+static struct dentry *mount_subvol(const char *subvol_name, u64 subvol_objectid,
+				   int flags, const char *device_name,
+				   char *data)
+{
+	struct dentry *root;
+	struct vfsmount *mnt = NULL;
+	char *newargs;
+	int ret;
+
+	newargs = setup_root_args(data);
+	if (!newargs) {
+		root = ERR_PTR(-ENOMEM);
+		goto out;
+	}
+
+	mnt = vfs_kern_mount(&btrfs_fs_type, flags, device_name, newargs);
+	if (PTR_ERR_OR_ZERO(mnt) == -EBUSY) {
+		if (flags & MS_RDONLY) {
+			mnt = vfs_kern_mount(&btrfs_fs_type, flags & ~MS_RDONLY,
+					     device_name, newargs);
+		} else {
+			mnt = vfs_kern_mount(&btrfs_fs_type, flags | MS_RDONLY,
+					     device_name, newargs);
+			if (IS_ERR(mnt)) {
+				root = ERR_CAST(mnt);
+				mnt = NULL;
+				goto out;
+			}
+
+			down_write(&mnt->mnt_sb->s_umount);
+			ret = btrfs_remount(mnt->mnt_sb, &flags, NULL);
+			up_write(&mnt->mnt_sb->s_umount);
+			if (ret < 0) {
+				root = ERR_PTR(ret);
+				goto out;
+			}
+		}
+	}
+	if (IS_ERR(mnt)) {
+		root = ERR_CAST(mnt);
+		mnt = NULL;
+		goto out;
+	}
+
+	if (!subvol_name) {
+		if (!subvol_objectid) {
+			ret = get_default_subvol_objectid(btrfs_sb(mnt->mnt_sb),
+							  &subvol_objectid);
+			if (ret) {
+				root = ERR_PTR(ret);
+				goto out;
+			}
+		}
+		subvol_name = btrfs_get_subvol_name_from_objectid(
+					btrfs_sb(mnt->mnt_sb), subvol_objectid);
+		if (IS_ERR(subvol_name)) {
+			root = ERR_CAST(subvol_name);
+			subvol_name = NULL;
+			goto out;
+		}
+
+	}
+
+	root = mount_subtree(mnt, subvol_name);
+	/* mount_subtree() drops our reference on the vfsmount. */
+	mnt = NULL;
+
+	if (!IS_ERR(root)) {
+		struct super_block *s = root->d_sb;
+		struct inode *root_inode = d_inode(root);
+		u64 root_objectid = BTRFS_I(root_inode)->root->root_key.objectid;
+
+		ret = 0;
+		if (!is_subvolume_inode(root_inode)) {
+			pr_err("BTRFS: '%s' is not a valid subvolume\n",
+			       subvol_name);
+			ret = -EINVAL;
+		}
+		if (subvol_objectid && root_objectid != subvol_objectid) {
+			/*
+			 * This will also catch a race condition where a
+			 * subvolume which was passed by ID is renamed and
+			 * another subvolume is renamed over the old location.
+			 */
+			pr_err("BTRFS: subvol '%s' does not match subvolid %llu\n",
+			       subvol_name, subvol_objectid);
+			ret = -EINVAL;
+		}
+		if (ret) {
+			dput(root);
+			root = ERR_PTR(ret);
+			deactivate_locked_super(s);
+		}
+	}
+
+out:
+	mntput(mnt);
+	kfree(newargs);
+	kfree(subvol_name);
+	return root;
+}
+
+static int parse_security_options(char *orig_opts,
+				  struct security_mnt_opts *sec_opts)
+{
+	char *secdata = NULL;
+	int ret = 0;
+
+	secdata = alloc_secdata();
+	if (!secdata)
+		return -ENOMEM;
+	ret = security_sb_copy_data(orig_opts, secdata);
+	if (ret) {
+		free_secdata(secdata);
+		return ret;
+	}
+	ret = security_sb_parse_opts_str(secdata, sec_opts);
+	free_secdata(secdata);
+	return ret;
+}
+
+static int setup_security_options(struct btrfs_fs_info *fs_info,
+				  struct super_block *sb,
+				  struct security_mnt_opts *sec_opts)
+{
+	int ret = 0;
+
+	/*
+	 * Call security_sb_set_mnt_opts() to check whether new sec_opts
+	 * is valid.
+	 */
+	ret = security_sb_set_mnt_opts(sb, sec_opts, 0, NULL);
+	if (ret)
+		return ret;
+
+#ifdef CONFIG_SECURITY
+	if (!fs_info->security_opts.num_mnt_opts) {
+		/* first time security setup, copy sec_opts to fs_info */
+		memcpy(&fs_info->security_opts, sec_opts, sizeof(*sec_opts));
+	} else {
+		/*
+		 * Since SELinux(the only one supports security_mnt_opts) does
+		 * NOT support changing context during remount/mount same sb,
+		 * This must be the same or part of the same security options,
+		 * just free it.
+		 */
+		security_free_mnt_opts(sec_opts);
+	}
+#endif
+	return ret;
+}
+
+/*
+ * Find a superblock for the given device / mount point.
+ *
+ * Note:  This is based on get_sb_bdev from fs/super.c with a few additions
+ *	  for multiple device setup.  Make sure to keep it in sync.
+ */
+static struct dentry *btrfs_mount(struct file_system_type *fs_type, int flags,
+		const char *device_name, void *data)
+{
+	struct block_device *bdev = NULL;
+	struct super_block *s;
+	struct btrfs_fs_devices *fs_devices = NULL;
+	struct btrfs_fs_info *fs_info = NULL;
+	struct security_mnt_opts new_sec_opts;
+	fmode_t mode = FMODE_READ;
+	char *subvol_name = NULL;
+	u64 subvol_objectid = 0;
+	int error = 0;
+
+	if (!(flags & MS_RDONLY))
+		mode |= FMODE_WRITE;
+
+	error = btrfs_parse_early_options(data, mode, fs_type,
+					  &subvol_name, &subvol_objectid,
+					  &fs_devices);
+	if (error) {
+		kfree(subvol_name);
+		return ERR_PTR(error);
+	}
+
+	if (subvol_name || subvol_objectid != BTRFS_FS_TREE_OBJECTID) {
+		/* mount_subvol() will free subvol_name. */
+		return mount_subvol(subvol_name, subvol_objectid, flags,
+				    device_name, data);
+	}
+
+	security_init_mnt_opts(&new_sec_opts);
+	if (data) {
+		error = parse_security_options(data, &new_sec_opts);
+		if (error)
+			return ERR_PTR(error);
+	}
+
+	error = btrfs_scan_one_device(device_name, mode, fs_type, &fs_devices);
+	if (error)
+		goto error_sec_opts;
+
+	/*
+	 * Setup a dummy root and fs_info for test/set super.  This is because
+	 * we don't actually fill this stuff out until open_ctree, but we need
+	 * it for searching for existing supers, so this lets us do that and
+	 * then open_ctree will properly initialize everything later.
+	 */
+	fs_info = kzalloc(sizeof(struct btrfs_fs_info), GFP_NOFS);
+	if (!fs_info) {
+		error = -ENOMEM;
+		goto error_sec_opts;
+	}
+
+	fs_info->fs_devices = fs_devices;
+
+	fs_info->super_copy = kzalloc(BTRFS_SUPER_INFO_SIZE, GFP_NOFS);
+	fs_info->super_for_commit = kzalloc(BTRFS_SUPER_INFO_SIZE, GFP_NOFS);
+	security_init_mnt_opts(&fs_info->security_opts);
+	if (!fs_info->super_copy || !fs_info->super_for_commit) {
+		error = -ENOMEM;
+		goto error_fs_info;
+	}
+
+	error = btrfs_open_devices(fs_devices, mode, fs_type);
+	if (error)
+		goto error_fs_info;
+
+	if (!(flags & MS_RDONLY) && fs_devices->rw_devices == 0) {
+		error = -EACCES;
+		goto error_close_devices;
+	}
+
+	bdev = fs_devices->latest_bdev;
+	s = sget(fs_type, btrfs_test_super, btrfs_set_super, flags | MS_NOSEC,
+		 fs_info);
+	if (IS_ERR(s)) {
+		error = PTR_ERR(s);
+		goto error_close_devices;
+	}
+
+	if (s->s_root) {
+		btrfs_close_devices(fs_devices);
+		free_fs_info(fs_info);
+		if ((flags ^ s->s_flags) & MS_RDONLY)
+			error = -EBUSY;
+	} else {
+		char b[BDEVNAME_SIZE];
+
+		strlcpy(s->s_id, bdevname(bdev, b), sizeof(s->s_id));
+		btrfs_sb(s)->bdev_holder = fs_type;
+		error = btrfs_fill_super(s, fs_devices, data,
+					 flags & MS_SILENT ? 1 : 0);
+	}
+	if (error) {
+		deactivate_locked_super(s);
+		goto error_sec_opts;
+	}
+
+	fs_info = btrfs_sb(s);
+	error = setup_security_options(fs_info, s, &new_sec_opts);
+	if (error) {
+		deactivate_locked_super(s);
+		goto error_sec_opts;
+	}
+
+	return dget(s->s_root);
+
+error_close_devices:
+	btrfs_close_devices(fs_devices);
+error_fs_info:
+	free_fs_info(fs_info);
+error_sec_opts:
+	security_free_mnt_opts(&new_sec_opts);
+	return ERR_PTR(error);
+}
+
+static void btrfs_resize_thread_pool(struct btrfs_fs_info *fs_info,
+				     int new_pool_size, int old_pool_size)
+{
+	if (new_pool_size == old_pool_size)
+		return;
+
+	fs_info->thread_pool_size = new_pool_size;
+
+	btrfs_info(fs_info, "resize thread pool %d -> %d",
+	       old_pool_size, new_pool_size);
+
+	btrfs_workqueue_set_max(fs_info->workers, new_pool_size);
+	btrfs_workqueue_set_max(fs_info->delalloc_workers, new

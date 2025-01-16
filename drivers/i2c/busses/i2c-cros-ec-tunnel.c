@@ -1,323 +1,152 @@
-/*
- *  Copyright (C) 2013 Google, Inc
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- * Expose an I2C passthrough to the ChromeOS EC.
- */
-
-#include <linux/module.h>
-#include <linux/i2c.h>
-#include <linux/mfd/cros_ec.h>
-#include <linux/mfd/cros_ec_commands.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-
-#define I2C_MAX_RETRIES 3
-
-/**
- * struct ec_i2c_device - Driver data for I2C tunnel
- *
- * @dev: Device node
- * @adap: I2C adapter
- * @ec: Pointer to EC device
- * @remote_bus: The EC bus number we tunnel to on the other side.
- * @request_buf: Buffer for transmitting data; we expect most transfers to fit.
- * @response_buf: Buffer for receiving data; we expect most transfers to fit.
- */
-
-struct ec_i2c_device {
-	struct device *dev;
-	struct i2c_adapter adap;
-	struct cros_ec_device *ec;
-
-	u16 remote_bus;
-
-	u8 request_buf[256];
-	u8 response_buf[256];
-};
-
-/**
- * ec_i2c_count_message - Count bytes needed for ec_i2c_construct_message
- *
- * @i2c_msgs: The i2c messages to read
- * @num: The number of i2c messages.
- *
- * Returns the number of bytes the messages will take up.
- */
-static int ec_i2c_count_message(const struct i2c_msg i2c_msgs[], int num)
-{
-	int i;
-	int size;
-
-	size = sizeof(struct ec_params_i2c_passthru);
-	size += num * sizeof(struct ec_params_i2c_passthru_msg);
-	for (i = 0; i < num; i++)
-		if (!(i2c_msgs[i].flags & I2C_M_RD))
-			size += i2c_msgs[i].len;
-
-	return size;
-}
-
-/**
- * ec_i2c_construct_message - construct a message to go to the EC
- *
- * This function effectively stuffs the standard i2c_msg format of Linux into
- * a format that the EC understands.
- *
- * @buf: The buffer to fill.  We assume that the buffer is big enough.
- * @i2c_msgs: The i2c messages to read.
- * @num: The number of i2c messages.
- * @bus_num: The remote bus number we want to talk to.
- *
- * Returns 0 or a negative error number.
- */
-static int ec_i2c_construct_message(u8 *buf, const struct i2c_msg i2c_msgs[],
-				    int num, u16 bus_num)
-{
-	struct ec_params_i2c_passthru *params;
-	u8 *out_data;
-	int i;
-
-	out_data = buf + sizeof(struct ec_params_i2c_passthru) +
-		   num * sizeof(struct ec_params_i2c_passthru_msg);
-
-	params = (struct ec_params_i2c_passthru *)buf;
-	params->port = bus_num;
-	params->num_msgs = num;
-	for (i = 0; i < num; i++) {
-		const struct i2c_msg *i2c_msg = &i2c_msgs[i];
-		struct ec_params_i2c_passthru_msg *msg = &params->msg[i];
-
-		msg->len = i2c_msg->len;
-		msg->addr_flags = i2c_msg->addr;
-
-		if (i2c_msg->flags & I2C_M_TEN)
-			return -EINVAL;
-
-		if (i2c_msg->flags & I2C_M_RD) {
-			msg->addr_flags |= EC_I2C_FLAG_READ;
-		} else {
-			memcpy(out_data, i2c_msg->buf, msg->len);
-			out_data += msg->len;
-		}
-	}
-
-	return 0;
-}
-
-/**
- * ec_i2c_count_response - Count bytes needed for ec_i2c_parse_response
- *
- * @i2c_msgs: The i2c messages to to fill up.
- * @num: The number of i2c messages expected.
- *
- * Returns the number of response bytes expeced.
- */
-static int ec_i2c_count_response(struct i2c_msg i2c_msgs[], int num)
-{
-	int size;
-	int i;
-
-	size = sizeof(struct ec_response_i2c_passthru);
-	for (i = 0; i < num; i++)
-		if (i2c_msgs[i].flags & I2C_M_RD)
-			size += i2c_msgs[i].len;
-
-	return size;
-}
-
-/**
- * ec_i2c_parse_response - Parse a response from the EC
- *
- * We'll take the EC's response and copy it back into msgs.
- *
- * @buf: The buffer to parse.
- * @i2c_msgs: The i2c messages to to fill up.
- * @num: The number of i2c messages; will be modified to include the actual
- *	 number received.
- *
- * Returns 0 or a negative error number.
- */
-static int ec_i2c_parse_response(const u8 *buf, struct i2c_msg i2c_msgs[],
-				 int *num)
-{
-	const struct ec_response_i2c_passthru *resp;
-	const u8 *in_data;
-	int i;
-
-	in_data = buf + sizeof(struct ec_response_i2c_passthru);
-
-	resp = (const struct ec_response_i2c_passthru *)buf;
-	if (resp->i2c_status & EC_I2C_STATUS_TIMEOUT)
-		return -ETIMEDOUT;
-	else if (resp->i2c_status & EC_I2C_STATUS_ERROR)
-		return -EREMOTEIO;
-
-	/* Other side could send us back fewer messages, but not more */
-	if (resp->num_msgs > *num)
-		return -EPROTO;
-	*num = resp->num_msgs;
-
-	for (i = 0; i < *num; i++) {
-		struct i2c_msg *i2c_msg = &i2c_msgs[i];
-
-		if (i2c_msgs[i].flags & I2C_M_RD) {
-			memcpy(i2c_msg->buf, in_data, i2c_msg->len);
-			in_data += i2c_msg->len;
-		}
-	}
-
-	return 0;
-}
-
-static int ec_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg i2c_msgs[],
-		       int num)
-{
-	struct ec_i2c_device *bus = adap->algo_data;
-	struct device *dev = bus->dev;
-	const u16 bus_num = bus->remote_bus;
-	int request_len;
-	int response_len;
-	int alloc_size;
-	int result;
-	struct cros_ec_command *msg;
-
-	request_len = ec_i2c_count_message(i2c_msgs, num);
-	if (request_len < 0) {
-		dev_warn(dev, "Error constructing message %d\n", request_len);
-		return request_len;
-	}
-
-	response_len = ec_i2c_count_response(i2c_msgs, num);
-	if (response_len < 0) {
-		/* Unexpected; no errors should come when NULL response */
-		dev_warn(dev, "Error preparing response %d\n", response_len);
-		return response_len;
-	}
-
-	alloc_size = max(request_len, response_len);
-	msg = kmalloc(sizeof(*msg) + alloc_size, GFP_KERNEL);
-	if (!msg)
-		return -ENOMEM;
-
-	result = ec_i2c_construct_message(msg->data, i2c_msgs, num, bus_num);
-	if (result) {
-		dev_err(dev, "Error constructing EC i2c message %d\n", result);
-		goto exit;
-	}
-
-	msg->version = 0;
-	msg->command = EC_CMD_I2C_PASSTHRU;
-	msg->outsize = request_len;
-	msg->insize = response_len;
-
-	result = cros_ec_cmd_xfer_status(bus->ec, msg);
-	if (result < 0) {
-		dev_err(dev, "Error transferring EC i2c message %d\n", result);
-		goto exit;
-	}
-
-	result = ec_i2c_parse_response(msg->data, i2c_msgs, &num);
-	if (result < 0) {
-		dev_err(dev, "Error parsing EC i2c message %d\n", result);
-		goto exit;
-	}
-
-	/* Indicate success by saying how many messages were sent */
-	result = num;
-exit:
-	kfree(msg);
-	return result;
-}
-
-static u32 ec_i2c_functionality(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static const struct i2c_algorithm ec_i2c_algorithm = {
-	.master_xfer	= ec_i2c_xfer,
-	.functionality	= ec_i2c_functionality,
-};
-
-static int ec_i2c_probe(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct cros_ec_device *ec = dev_get_drvdata(pdev->dev.parent);
-	struct device *dev = &pdev->dev;
-	struct ec_i2c_device *bus = NULL;
-	u32 remote_bus;
-	int err;
-
-	if (!ec->cmd_xfer) {
-		dev_err(dev, "Missing sendrecv\n");
-		return -EINVAL;
-	}
-
-	bus = devm_kzalloc(dev, sizeof(*bus), GFP_KERNEL);
-	if (bus == NULL)
-		return -ENOMEM;
-
-	err = of_property_read_u32(np, "google,remote-bus", &remote_bus);
-	if (err) {
-		dev_err(dev, "Couldn't read remote-bus property\n");
-		return err;
-	}
-	bus->remote_bus = remote_bus;
-
-	bus->ec = ec;
-	bus->dev = dev;
-
-	bus->adap.owner = THIS_MODULE;
-	strlcpy(bus->adap.name, "cros-ec-i2c-tunnel", sizeof(bus->adap.name));
-	bus->adap.algo = &ec_i2c_algorithm;
-	bus->adap.algo_data = bus;
-	bus->adap.dev.parent = &pdev->dev;
-	bus->adap.dev.of_node = np;
-	bus->adap.retries = I2C_MAX_RETRIES;
-
-	err = i2c_add_adapter(&bus->adap);
-	if (err) {
-		dev_err(dev, "cannot register i2c adapter\n");
-		return err;
-	}
-	platform_set_drvdata(pdev, bus);
-
-	return err;
-}
-
-static int ec_i2c_remove(struct platform_device *dev)
-{
-	struct ec_i2c_device *bus = platform_get_drvdata(dev);
-
-	i2c_del_adapter(&bus->adap);
-
-	return 0;
-}
-
-#ifdef CONFIG_OF
-static const struct of_device_id cros_ec_i2c_of_match[] = {
-	{ .compatible = "google,cros-ec-i2c-tunnel" },
-	{},
-};
-MODULE_DEVICE_TABLE(of, cros_ec_i2c_of_match);
-#endif
-
-static struct platform_driver ec_i2c_tunnel_driver = {
-	.probe = ec_i2c_probe,
-	.remove = ec_i2c_remove,
-	.driver = {
-		.name = "cros-ec-i2c-tunnel",
-		.of_match_table = of_match_ptr(cros_ec_i2c_of_match),
-	},
-};
-
-module_platform_driver(ec_i2c_tunnel_driver);
-
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("EC I2C tunnel driver");
-MODULE_ALIAS("platform:cros-ec-i2c-tunnel");
+EL_MASK 0xc0000
+#define MC_IO_RXCNTL_DPHY1_D1__RX_PEAKSEL__SHIFT 0x12
+#define MC_IO_RXCNTL_DPHY1_D1__DLL_ADJ_B0_MASK 0x700000
+#define MC_IO_RXCNTL_DPHY1_D1__DLL_ADJ_B0__SHIFT 0x14
+#define MC_IO_RXCNTL_DPHY1_D1__DLL_ADJ_B1_MASK 0x7000000
+#define MC_IO_RXCNTL_DPHY1_D1__DLL_ADJ_B1__SHIFT 0x18
+#define MC_IO_RXCNTL_DPHY1_D1__DLL_ADJ_M_MASK 0x10000000
+#define MC_IO_RXCNTL_DPHY1_D1__DLL_ADJ_M__SHIFT 0x1c
+#define MC_IO_RXCNTL_DPHY1_D1__REFCLK_PWRON_MASK 0x20000000
+#define MC_IO_RXCNTL_DPHY1_D1__REFCLK_PWRON__SHIFT 0x1d
+#define MC_IO_RXCNTL_DPHY1_D1__DLL_BW_CTRL_MASK 0xc0000000
+#define MC_IO_RXCNTL_DPHY1_D1__DLL_BW_CTRL__SHIFT 0x1e
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFCAL1_MSB_MASK 0xf
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFCAL1_MSB__SHIFT 0x0
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFCAL2_MSB_MASK 0xf0
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFCAL2_MSB__SHIFT 0x4
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFCAL3_MASK 0xff00
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFCAL3__SHIFT 0x8
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFSEL2_MASK 0x10000
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFSEL2__SHIFT 0x10
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFSEL3_MASK 0x20000
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFSEL3__SHIFT 0x11
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFPDNB_1_MASK 0x40000
+#define MC_IO_RXCNTL1_DPHY1_D1__VREFPDNB_1__SHIFT 0x12
+#define MC_IO_RXCNTL1_DPHY1_D1__DLL_PWRGOOD_OVR_MASK 0x80000
+#define MC_IO_RXCNTL1_DPHY1_D1__DLL_PWRGOOD_OVR__SHIFT 0x13
+#define MC_IO_RXCNTL1_DPHY1_D1__DLL_VCTRLADC_EN_MASK 0x100000
+#define MC_IO_RXCNTL1_DPHY1_D1__DLL_VCTRLADC_EN__SHIFT 0x14
+#define MC_IO_RXCNTL1_DPHY1_D1__DLL_MSTR_STBY_MASK 0x200000
+#define MC_IO_RXCNTL1_DPHY1_D1__DLL_MSTR_STBY__SHIFT 0x15
+#define MC_IO_RXCNTL1_DPHY1_D1__RXLEQ_EN_MASK 0x400000
+#define MC_IO_RXCNTL1_DPHY1_D1__RXLEQ_EN__SHIFT 0x16
+#define MC_IO_RXCNTL1_DPHY1_D1__RXLEQ_NXT_MASK 0x800000
+#define MC_IO_RXCNTL1_DPHY1_D1__RXLEQ_NXT__SHIFT 0x17
+#define MC_IO_RXCNTL1_DPHY1_D1__PMD_LOOPBACK_MASK 0xe000000
+#define MC_IO_RXCNTL1_DPHY1_D1__PMD_LOOPBACK__SHIFT 0x19
+#define MC_IO_RXCNTL1_DPHY1_D1__DLL_RSV_MASK 0xf0000000
+#define MC_IO_RXCNTL1_DPHY1_D1__DLL_RSV__SHIFT 0x1c
+#define MC_IO_DPHY_STR_CNTL_D1__PSTR_OFF_D_MASK 0x3f
+#define MC_IO_DPHY_STR_CNTL_D1__PSTR_OFF_D__SHIFT 0x0
+#define MC_IO_DPHY_STR_CNTL_D1__NSTR_OFF_D_MASK 0xfc0
+#define MC_IO_DPHY_STR_CNTL_D1__NSTR_OFF_D__SHIFT 0x6
+#define MC_IO_DPHY_STR_CNTL_D1__PSTR_OFF_S_MASK 0x3f000
+#define MC_IO_DPHY_STR_CNTL_D1__PSTR_OFF_S__SHIFT 0xc
+#define MC_IO_DPHY_STR_CNTL_D1__NSTR_OFF_S_MASK 0xfc0000
+#define MC_IO_DPHY_STR_CNTL_D1__NSTR_OFF_S__SHIFT 0x12
+#define MC_IO_DPHY_STR_CNTL_D1__USE_D_CAL_MASK 0x1000000
+#define MC_IO_DPHY_STR_CNTL_D1__USE_D_CAL__SHIFT 0x18
+#define MC_IO_DPHY_STR_CNTL_D1__USE_S_CAL_MASK 0x2000000
+#define MC_IO_DPHY_STR_CNTL_D1__USE_S_CAL__SHIFT 0x19
+#define MC_IO_DPHY_STR_CNTL_D1__CAL_SEL_MASK 0xc000000
+#define MC_IO_DPHY_STR_CNTL_D1__CAL_SEL__SHIFT 0x1a
+#define MC_IO_DPHY_STR_CNTL_D1__LOAD_D_STR_MASK 0x10000000
+#define MC_IO_DPHY_STR_CNTL_D1__LOAD_D_STR__SHIFT 0x1c
+#define MC_IO_DPHY_STR_CNTL_D1__LOAD_S_STR_MASK 0x20000000
+#define MC_IO_DPHY_STR_CNTL_D1__LOAD_S_STR__SHIFT 0x1d
+#define MC_IO_DPHY_STR_CNTL_D1__AUTO_LD_STR_MASK 0x40000000
+#define MC_IO_DPHY_STR_CNTL_D1__AUTO_LD_STR__SHIFT 0x1e
+#define MC_IO_APHY_STR_CNTL_D1__PSTR_OFF_A_MASK 0x3f
+#define MC_IO_APHY_STR_CNTL_D1__PSTR_OFF_A__SHIFT 0x0
+#define MC_IO_APHY_STR_CNTL_D1__NSTR_OFF_A_MASK 0xfc0
+#define MC_IO_APHY_STR_CNTL_D1__NSTR_OFF_A__SHIFT 0x6
+#define MC_IO_APHY_STR_CNTL_D1__PSTR_OFF_D_RD_MASK 0x3f000
+#define MC_IO_APHY_STR_CNTL_D1__PSTR_OFF_D_RD__SHIFT 0xc
+#define MC_IO_APHY_STR_CNTL_D1__USE_A_CAL_MASK 0x1000000
+#define MC_IO_APHY_STR_CNTL_D1__USE_A_CAL__SHIFT 0x18
+#define MC_IO_APHY_STR_CNTL_D1__USE_D_RD_CAL_MASK 0x2000000
+#define MC_IO_APHY_STR_CNTL_D1__USE_D_RD_CAL__SHIFT 0x19
+#define MC_IO_APHY_STR_CNTL_D1__CAL_SEL_MASK 0xc000000
+#define MC_IO_APHY_STR_CNTL_D1__CAL_SEL__SHIFT 0x1a
+#define MC_IO_APHY_STR_CNTL_D1__LOAD_A_STR_MASK 0x10000000
+#define MC_IO_APHY_STR_CNTL_D1__LOAD_A_STR__SHIFT 0x1c
+#define MC_IO_APHY_STR_CNTL_D1__LOAD_D_RD_STR_MASK 0x20000000
+#define MC_IO_APHY_STR_CNTL_D1__LOAD_D_RD_STR__SHIFT 0x1d
+#define MC_IO_CDRCNTL_D0__RXPHASE_B01_MASK 0xf
+#define MC_IO_CDRCNTL_D0__RXPHASE_B01__SHIFT 0x0
+#define MC_IO_CDRCNTL_D0__RXPHASE_B23_MASK 0xf0
+#define MC_IO_CDRCNTL_D0__RXPHASE_B23__SHIFT 0x4
+#define MC_IO_CDRCNTL_D0__RXCDREN_B01_MASK 0x100
+#define MC_IO_CDRCNTL_D0__RXCDREN_B01__SHIFT 0x8
+#define MC_IO_CDRCNTL_D0__RXCDREN_B23_MASK 0x200
+#define MC_IO_CDRCNTL_D0__RXCDREN_B23__SHIFT 0x9
+#define MC_IO_CDRCNTL_D0__RXCDRBYPASS_B01_MASK 0x400
+#define MC_IO_CDRCNTL_D0__RXCDRBYPASS_B01__SHIFT 0xa
+#define MC_IO_CDRCNTL_D0__RXCDRBYPASS_B23_MASK 0x800
+#define MC_IO_CDRCNTL_D0__RXCDRBYPASS_B23__SHIFT 0xb
+#define MC_IO_CDRCNTL_D0__RXPHASE1_B01_MASK 0xf000
+#define MC_IO_CDRCNTL_D0__RXPHASE1_B01__SHIFT 0xc
+#define MC_IO_CDRCNTL_D0__RXPHASE1_B23_MASK 0xf0000
+#define MC_IO_CDRCNTL_D0__RXPHASE1_B23__SHIFT 0x10
+#define MC_IO_CDRCNTL_D0__DQTXCDREN_B0_MASK 0x100000
+#define MC_IO_CDRCNTL_D0__DQTXCDREN_B0__SHIFT 0x14
+#define MC_IO_CDRCNTL_D0__DQTXCDREN_B1_MASK 0x200000
+#define MC_IO_CDRCNTL_D0__DQTXCDREN_B1__SHIFT 0x15
+#define MC_IO_CDRCNTL_D0__DQRXCDREN_B0_MASK 0x400000
+#define MC_IO_CDRCNTL_D0__DQRXCDREN_B0__SHIFT 0x16
+#define MC_IO_CDRCNTL_D0__DQRXCDREN_B1_MASK 0x800000
+#define MC_IO_CDRCNTL_D0__DQRXCDREN_B1__SHIFT 0x17
+#define MC_IO_CDRCNTL_D0__WCDRRXCDREN_B0_MASK 0x1000000
+#define MC_IO_CDRCNTL_D0__WCDRRXCDREN_B0__SHIFT 0x18
+#define MC_IO_CDRCNTL_D0__WCDRRXCDREN_B1_MASK 0x2000000
+#define MC_IO_CDRCNTL_D0__WCDRRXCDREN_B1__SHIFT 0x19
+#define MC_IO_CDRCNTL_D0__WCDREDC_B0_MASK 0x4000000
+#define MC_IO_CDRCNTL_D0__WCDREDC_B0__SHIFT 0x1a
+#define MC_IO_CDRCNTL_D0__WCDREDC_B1_MASK 0x8000000
+#define MC_IO_CDRCNTL_D0__WCDREDC_B1__SHIFT 0x1b
+#define MC_IO_CDRCNTL_D0__DQRXSEL_B0_MASK 0x10000000
+#define MC_IO_CDRCNTL_D0__DQRXSEL_B0__SHIFT 0x1c
+#define MC_IO_CDRCNTL_D0__DQRXSEL_B1_MASK 0x20000000
+#define MC_IO_CDRCNTL_D0__DQRXSEL_B1__SHIFT 0x1d
+#define MC_IO_CDRCNTL_D0__DQTXSEL_B0_MASK 0x40000000
+#define MC_IO_CDRCNTL_D0__DQTXSEL_B0__SHIFT 0x1e
+#define MC_IO_CDRCNTL_D0__DQTXSEL_B1_MASK 0x80000000
+#define MC_IO_CDRCNTL_D0__DQTXSEL_B1__SHIFT 0x1f
+#define MC_IO_CDRCNTL1_D0__DQ_RXPHASE_B0_MASK 0xff
+#define MC_IO_CDRCNTL1_D0__DQ_RXPHASE_B0__SHIFT 0x0
+#define MC_IO_CDRCNTL1_D0__DQ_RXPHASE_B1_MASK 0xff00
+#define MC_IO_CDRCNTL1_D0__DQ_RXPHASE_B1__SHIFT 0x8
+#define MC_IO_CDRCNTL1_D0__WCDR_TXPHASE_B0_MASK 0xff0000
+#define MC_IO_CDRCNTL1_D0__WCDR_TXPHASE_B0__SHIFT 0x10
+#define MC_IO_CDRCNTL1_D0__WCDR_TXPHASE_B1_MASK 0xff000000
+#define MC_IO_CDRCNTL1_D0__WCDR_TXPHASE_B1__SHIFT 0x18
+#define MC_IO_CDRCNTL2_D0__CDR_FB_SEL0_MASK 0x1
+#define MC_IO_CDRCNTL2_D0__CDR_FB_SEL0__SHIFT 0x0
+#define MC_IO_CDRCNTL2_D0__CDR_FB_SEL1_MASK 0x2
+#define MC_IO_CDRCNTL2_D0__CDR_FB_SEL1__SHIFT 0x1
+#define MC_IO_CDRCNTL2_D0__EDC_RXEN_OVR0_MASK 0x4
+#define MC_IO_CDRCNTL2_D0__EDC_RXEN_OVR0__SHIFT 0x2
+#define MC_IO_CDRCNTL2_D0__EDC_RXEN_OVR1_MASK 0x8
+#define MC_IO_CDRCNTL2_D0__EDC_RXEN_OVR1__SHIFT 0x3
+#define MC_IO_CDRCNTL2_D0__TXCDRBYPASS0_MASK 0x10
+#define MC_IO_CDRCNTL2_D0__TXCDRBYPASS0__SHIFT 0x4
+#define MC_IO_CDRCNTL2_D0__TXCDRBYPASS1_MASK 0x20
+#define MC_IO_CDRCNTL2_D0__TXCDRBYPASS1__SHIFT 0x5
+#define MC_IO_CDRCNTL2_D0__WCK_RXEN_OVR0_MASK 0x40
+#define MC_IO_CDRCNTL2_D0__WCK_RXEN_OVR0__SHIFT 0x6
+#define MC_IO_CDRCNTL2_D0__WCK_RXEN_OVR1_MASK 0x80
+#define MC_IO_CDRCNTL2_D0__WCK_RXEN_OVR1__SHIFT 0x7
+#define MC_IO_CDRCNTL2_D0__WCDRTXPWRON_MASK 0xf00
+#define MC_IO_CDRCNTL2_D0__WCDRTXPWRON__SHIFT 0x8
+#define MC_IO_CDRCNTL2_D0__WCDRTXSEL_MASK 0xf000
+#define MC_IO_CDRCNTL2_D0__WCDRTXSEL__SHIFT 0xc
+#define MC_IO_CDRCNTL2_D0__WCDRTRACK01_MASK 0xf0000
+#define MC_IO_CDRCNTL2_D0__WCDRTRACK01__SHIFT 0x10
+#define MC_IO_CDRCNTL_D1__RXPHASE_B01_MASK 0xf
+#define MC_IO_CDRCNTL_D1__RXPHASE_B01__SHIFT 0x0
+#define MC_IO_CDRCNTL_D1__RXPHASE_B23_MASK 0xf0
+#define MC_IO_CDRCNTL_D1__RXPHASE_B23__SHIFT 0x4
+#define MC_IO_CDRCNTL_D1__RXCDREN_B01_MASK 0x100
+#define MC_IO_CDRCNTL_D1__RXCDREN_B01__SHIFT 0x8
+#define MC_IO_CDRCNTL_D1__RXCDREN_B23_MASK 0x200
+#define MC_IO_CDRCNTL_D1__RXCDRE

@@ -1,621 +1,637 @@
-/*
- * arch/sh/mm/cache-sh5.c
- *
- * Copyright (C) 2000, 2001  Paolo Alberelli
- * Copyright (C) 2002  Benedict Gaster
- * Copyright (C) 2003  Richard Curnow
- * Copyright (C) 2003 - 2008  Paul Mundt
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- */
-#include <linux/init.h>
-#include <linux/mman.h>
-#include <linux/mm.h>
-#include <asm/tlb.h>
-#include <asm/processor.h>
-#include <asm/cache.h>
-#include <asm/pgalloc.h>
-#include <asm/uaccess.h>
-#include <asm/mmu_context.h>
+l processor mapping */
+#define PAL_CACHE_SHARED_INFO	43	/* returns information on caches shared by logical processor */
+#define PAL_GET_HW_POLICY	48	/* Get current hardware resource sharing policy */
+#define PAL_SET_HW_POLICY	49	/* Set current hardware resource sharing policy */
+#define PAL_VP_INFO		50	/* Information about virtual processor features */
+#define PAL_MC_HW_TRACKING	51	/* Hardware tracking status */
 
-extern void __weak sh4__flush_region_init(void);
+#define PAL_COPY_PAL		256	/* relocate PAL procedures and PAL PMI */
+#define PAL_HALT_INFO		257	/* return the low power capabilities of processor */
+#define PAL_TEST_PROC		258	/* perform late processor self-test */
+#define PAL_CACHE_READ		259	/* read tag & data of cacheline for diagnostic testing */
+#define PAL_CACHE_WRITE		260	/* write tag & data of cacheline for diagnostic testing */
+#define PAL_VM_TR_READ		261	/* read contents of translation register */
+#define PAL_GET_PSTATE		262	/* get the current P-state */
+#define PAL_SET_PSTATE		263	/* set the P-state */
+#define PAL_BRAND_INFO		274	/* Processor branding information */
 
-/* Wired TLB entry for the D-cache */
-static unsigned long long dtlb_cache_slot;
+#define PAL_GET_PSTATE_TYPE_LASTSET	0
+#define PAL_GET_PSTATE_TYPE_AVGANDRESET	1
+#define PAL_GET_PSTATE_TYPE_AVGNORESET	2
+#define PAL_GET_PSTATE_TYPE_INSTANT	3
 
-/*
- * The following group of functions deal with mapping and unmapping a
- * temporary page into a DTLB slot that has been set aside for exclusive
- * use.
- */
-static inline void
-sh64_setup_dtlb_cache_slot(unsigned long eaddr, unsigned long asid,
-			   unsigned long paddr)
-{
-	local_irq_disable();
-	sh64_setup_tlb_slot(dtlb_cache_slot, eaddr, asid, paddr);
-}
+#define PAL_MC_ERROR_INJECT	276	/* Injects processor error or returns injection capabilities */
 
-static inline void sh64_teardown_dtlb_cache_slot(void)
-{
-	sh64_teardown_tlb_slot(dtlb_cache_slot);
-	local_irq_enable();
-}
+#ifndef __ASSEMBLY__
 
-static inline void sh64_icache_inv_all(void)
-{
-	unsigned long long addr, flag, data;
-	unsigned long flags;
-
-	addr = ICCR0;
-	flag = ICCR0_ICI;
-	data = 0;
-
-	/* Make this a critical section for safety (probably not strictly necessary.) */
-	local_irq_save(flags);
-
-	/* Without %1 it gets unexplicably wrong */
-	__asm__ __volatile__ (
-		"getcfg	%3, 0, %0\n\t"
-		"or	%0, %2, %0\n\t"
-		"putcfg	%3, 0, %0\n\t"
-		"synci"
-		: "=&r" (data)
-		: "0" (data), "r" (flag), "r" (addr));
-
-	local_irq_restore(flags);
-}
-
-static void sh64_icache_inv_kernel_range(unsigned long start, unsigned long end)
-{
-	/* Invalidate range of addresses [start,end] from the I-cache, where
-	 * the addresses lie in the kernel superpage. */
-
-	unsigned long long ullend, addr, aligned_start;
-	aligned_start = (unsigned long long)(signed long long)(signed long) start;
-	addr = L1_CACHE_ALIGN(aligned_start);
-	ullend = (unsigned long long) (signed long long) (signed long) end;
-
-	while (addr <= ullend) {
-		__asm__ __volatile__ ("icbi %0, 0" : : "r" (addr));
-		addr += L1_CACHE_BYTES;
-	}
-}
-
-static void sh64_icache_inv_user_page(struct vm_area_struct *vma, unsigned long eaddr)
-{
-	/* If we get called, we know that vma->vm_flags contains VM_EXEC.
-	   Also, eaddr is page-aligned. */
-	unsigned int cpu = smp_processor_id();
-	unsigned long long addr, end_addr;
-	unsigned long flags = 0;
-	unsigned long running_asid, vma_asid;
-	addr = eaddr;
-	end_addr = addr + PAGE_SIZE;
-
-	/* Check whether we can use the current ASID for the I-cache
-	   invalidation.  For example, if we're called via
-	   access_process_vm->flush_cache_page->here, (e.g. when reading from
-	   /proc), 'running_asid' will be that of the reader, not of the
-	   victim.
-
-	   Also, note the risk that we might get pre-empted between the ASID
-	   compare and blocking IRQs, and before we regain control, the
-	   pid->ASID mapping changes.  However, the whole cache will get
-	   invalidated when the mapping is renewed, so the worst that can
-	   happen is that the loop below ends up invalidating somebody else's
-	   cache entries.
-	*/
-
-	running_asid = get_asid();
-	vma_asid = cpu_asid(cpu, vma->vm_mm);
-	if (running_asid != vma_asid) {
-		local_irq_save(flags);
-		switch_and_save_asid(vma_asid);
-	}
-	while (addr < end_addr) {
-		/* Worth unrolling a little */
-		__asm__ __volatile__("icbi %0,  0" : : "r" (addr));
-		__asm__ __volatile__("icbi %0, 32" : : "r" (addr));
-		__asm__ __volatile__("icbi %0, 64" : : "r" (addr));
-		__asm__ __volatile__("icbi %0, 96" : : "r" (addr));
-		addr += 128;
-	}
-	if (running_asid != vma_asid) {
-		switch_and_save_asid(running_asid);
-		local_irq_restore(flags);
-	}
-}
-
-static void sh64_icache_inv_user_page_range(struct mm_struct *mm,
-			  unsigned long start, unsigned long end)
-{
-	/* Used for invalidating big chunks of I-cache, i.e. assume the range
-	   is whole pages.  If 'start' or 'end' is not page aligned, the code
-	   is conservative and invalidates to the ends of the enclosing pages.
-	   This is functionally OK, just a performance loss. */
-
-	/* See the comments below in sh64_dcache_purge_user_range() regarding
-	   the choice of algorithm.  However, for the I-cache option (2) isn't
-	   available because there are no physical tags so aliases can't be
-	   resolved.  The icbi instruction has to be used through the user
-	   mapping.   Because icbi is cheaper than ocbp on a cache hit, it
-	   would be cheaper to use the selective code for a large range than is
-	   possible with the D-cache.  Just assume 64 for now as a working
-	   figure.
-	   */
-	int n_pages;
-
-	if (!mm)
-		return;
-
-	n_pages = ((end - start) >> PAGE_SHIFT);
-	if (n_pages >= 64) {
-		sh64_icache_inv_all();
-	} else {
-		unsigned long aligned_start;
-		unsigned long eaddr;
-		unsigned long after_last_page_start;
-		unsigned long mm_asid, current_asid;
-		unsigned long flags = 0;
-
-		mm_asid = cpu_asid(smp_processor_id(), mm);
-		current_asid = get_asid();
-
-		if (mm_asid != current_asid) {
-			/* Switch ASID and run the invalidate loop under cli */
-			local_irq_save(flags);
-			switch_and_save_asid(mm_asid);
-		}
-
-		aligned_start = start & PAGE_MASK;
-		after_last_page_start = PAGE_SIZE + ((end - 1) & PAGE_MASK);
-
-		while (aligned_start < after_last_page_start) {
-			struct vm_area_struct *vma;
-			unsigned long vma_end;
-			vma = find_vma(mm, aligned_start);
-			if (!vma || (aligned_start <= vma->vm_end)) {
-				/* Avoid getting stuck in an error condition */
-				aligned_start += PAGE_SIZE;
-				continue;
-			}
-			vma_end = vma->vm_end;
-			if (vma->vm_flags & VM_EXEC) {
-				/* Executable */
-				eaddr = aligned_start;
-				while (eaddr < vma_end) {
-					sh64_icache_inv_user_page(vma, eaddr);
-					eaddr += PAGE_SIZE;
-				}
-			}
-			aligned_start = vma->vm_end; /* Skip to start of next region */
-		}
-
-		if (mm_asid != current_asid) {
-			switch_and_save_asid(current_asid);
-			local_irq_restore(flags);
-		}
-	}
-}
-
-static void sh64_icache_inv_current_user_range(unsigned long start, unsigned long end)
-{
-	/* The icbi instruction never raises ITLBMISS.  i.e. if there's not a
-	   cache hit on the virtual tag the instruction ends there, without a
-	   TLB lookup. */
-
-	unsigned long long aligned_start;
-	unsigned long long ull_end;
-	unsigned long long addr;
-
-	ull_end = end;
-
-	/* Just invalidate over the range using the natural addresses.  TLB
-	   miss handling will be OK (TBC).  Since it's for the current process,
-	   either we're already in the right ASID context, or the ASIDs have
-	   been recycled since we were last active in which case we might just
-	   invalidate another processes I-cache entries : no worries, just a
-	   performance drop for him. */
-	aligned_start = L1_CACHE_ALIGN(start);
-	addr = aligned_start;
-	while (addr < ull_end) {
-		__asm__ __volatile__ ("icbi %0, 0" : : "r" (addr));
-		__asm__ __volatile__ ("nop");
-		__asm__ __volatile__ ("nop");
-		addr += L1_CACHE_BYTES;
-	}
-}
-
-/* Buffer used as the target of alloco instructions to purge data from cache
-   sets by natural eviction. -- RPC */
-#define DUMMY_ALLOCO_AREA_SIZE ((L1_CACHE_BYTES << 10) + (1024 * 4))
-static unsigned char dummy_alloco_area[DUMMY_ALLOCO_AREA_SIZE] __cacheline_aligned = { 0, };
-
-static void inline sh64_dcache_purge_sets(int sets_to_purge_base, int n_sets)
-{
-	/* Purge all ways in a particular block of sets, specified by the base
-	   set number and number of sets.  Can handle wrap-around, if that's
-	   needed.  */
-
-	int dummy_buffer_base_set;
-	unsigned long long eaddr, eaddr0, eaddr1;
-	int j;
-	int set_offset;
-
-	dummy_buffer_base_set = ((int)&dummy_alloco_area &
-				 cpu_data->dcache.entry_mask) >>
-				 cpu_data->dcache.entry_shift;
-	set_offset = sets_to_purge_base - dummy_buffer_base_set;
-
-	for (j = 0; j < n_sets; j++, set_offset++) {
-		set_offset &= (cpu_data->dcache.sets - 1);
-		eaddr0 = (unsigned long long)dummy_alloco_area +
-			(set_offset << cpu_data->dcache.entry_shift);
-
-		/*
-		 * Do one alloco which hits the required set per cache
-		 * way.  For write-back mode, this will purge the #ways
-		 * resident lines.  There's little point unrolling this
-		 * loop because the allocos stall more if they're too
-		 * close together.
-		 */
-		eaddr1 = eaddr0 + cpu_data->dcache.way_size *
-				  cpu_data->dcache.ways;
-
-		for (eaddr = eaddr0; eaddr < eaddr1;
-		     eaddr += cpu_data->dcache.way_size) {
-			__asm__ __volatile__ ("alloco %0, 0" : : "r" (eaddr));
-			__asm__ __volatile__ ("synco"); /* TAKum03020 */
-		}
-
-		eaddr1 = eaddr0 + cpu_data->dcache.way_size *
-				  cpu_data->dcache.ways;
-
-		for (eaddr = eaddr0; eaddr < eaddr1;
-		     eaddr += cpu_data->dcache.way_size) {
-			/*
-			 * Load from each address.  Required because
-			 * alloco is a NOP if the cache is write-through.
-			 */
-			if (test_bit(SH_CACHE_MODE_WT, &(cpu_data->dcache.flags)))
-				__raw_readb((unsigned long)eaddr);
-		}
-	}
-
-	/*
-	 * Don't use OCBI to invalidate the lines.  That costs cycles
-	 * directly.  If the dummy block is just left resident, it will
-	 * naturally get evicted as required.
-	 */
-}
+#include <linux/types.h>
+#include <asm/fpu.h>
 
 /*
- * Purge the entire contents of the dcache.  The most efficient way to
- * achieve this is to use alloco instructions on a region of unused
- * memory equal in size to the cache, thereby causing the current
- * contents to be discarded by natural eviction.  The alternative, namely
- * reading every tag, setting up a mapping for the corresponding page and
- * doing an OCBP for the line, would be much more expensive.
+ * Data types needed to pass information into PAL procedures and
+ * interpret information returned by them.
  */
-static void sh64_dcache_purge_all(void)
-{
 
-	sh64_dcache_purge_sets(0, cpu_data->dcache.sets);
-}
+/* Return status from the PAL procedure */
+typedef s64				pal_status_t;
+
+#define PAL_STATUS_SUCCESS		0	/* No error */
+#define PAL_STATUS_UNIMPLEMENTED	(-1)	/* Unimplemented procedure */
+#define PAL_STATUS_EINVAL		(-2)	/* Invalid argument */
+#define PAL_STATUS_ERROR		(-3)	/* Error */
+#define PAL_STATUS_CACHE_INIT_FAIL	(-4)	/* Could not initialize the
+						 * specified level and type of
+						 * cache without sideeffects
+						 * and "restrict" was 1
+						 */
+#define PAL_STATUS_REQUIRES_MEMORY	(-9)	/* Call requires PAL memory buffer */
+
+/* Processor cache level in the hierarchy */
+typedef u64				pal_cache_level_t;
+#define PAL_CACHE_LEVEL_L0		0	/* L0 */
+#define PAL_CACHE_LEVEL_L1		1	/* L1 */
+#define PAL_CACHE_LEVEL_L2		2	/* L2 */
 
 
-/* Assumes this address (+ (2**n_synbits) pages up from it) aren't used for
-   anything else in the kernel */
-#define MAGIC_PAGE0_START 0xffffffffec000000ULL
+/* Processor cache type at a particular level in the hierarchy */
 
-/* Purge the physical page 'paddr' from the cache.  It's known that any
- * cache lines requiring attention have the same page colour as the the
- * address 'eaddr'.
- *
- * This relies on the fact that the D-cache matches on physical tags when
- * no virtual tag matches.  So we create an alias for the original page
- * and purge through that.  (Alternatively, we could have done this by
- * switching ASID to match the original mapping and purged through that,
- * but that involves ASID switching cost + probably a TLBMISS + refill
- * anyway.)
- */
-static void sh64_dcache_purge_coloured_phy_page(unsigned long paddr,
-					        unsigned long eaddr)
-{
-	unsigned long long magic_page_start;
-	unsigned long long magic_eaddr, magic_eaddr_end;
+typedef u64				pal_cache_type_t;
+#define PAL_CACHE_TYPE_INSTRUCTION	1	/* Instruction cache */
+#define PAL_CACHE_TYPE_DATA		2	/* Data or unified cache */
+#define PAL_CACHE_TYPE_INSTRUCTION_DATA	3	/* Both Data & Instruction */
 
-	magic_page_start = MAGIC_PAGE0_START + (eaddr & CACHE_OC_SYN_MASK);
 
-	/* As long as the kernel is not pre-emptible, this doesn't need to be
-	   under cli/sti. */
-	sh64_setup_dtlb_cache_slot(magic_page_start, get_asid(), paddr);
+#define PAL_CACHE_FLUSH_INVALIDATE	1	/* Invalidate clean lines */
+#define PAL_CACHE_FLUSH_CHK_INTRS	2	/* check for interrupts/mc while flushing */
 
-	magic_eaddr = magic_page_start;
-	magic_eaddr_end = magic_eaddr + PAGE_SIZE;
+/* Processor cache line size in bytes  */
+typedef int				pal_cache_line_size_t;
 
-	while (magic_eaddr < magic_eaddr_end) {
-		/* Little point in unrolling this loop - the OCBPs are blocking
-		   and won't go any quicker (i.e. the loop overhead is parallel
-		   to part of the OCBP execution.) */
-		__asm__ __volatile__ ("ocbp %0, 0" : : "r" (magic_eaddr));
-		magic_eaddr += L1_CACHE_BYTES;
-	}
+/* Processor cache line state */
+typedef u64				pal_cache_line_state_t;
+#define PAL_CACHE_LINE_STATE_INVALID	0	/* Invalid */
+#define PAL_CACHE_LINE_STATE_SHARED	1	/* Shared */
+#define PAL_CACHE_LINE_STATE_EXCLUSIVE	2	/* Exclusive */
+#define PAL_CACHE_LINE_STATE_MODIFIED	3	/* Modified */
 
-	sh64_teardown_dtlb_cache_slot();
-}
+typedef struct pal_freq_ratio {
+	u32 den, num;		/* numerator & denominator */
+} itc_ratio, proc_ratio;
 
-/*
- * Purge a page given its physical start address, by creating a temporary
- * 1 page mapping and purging across that.  Even if we know the virtual
- * address (& vma or mm) of the page, the method here is more elegant
- * because it avoids issues of coping with page faults on the purge
- * instructions (i.e. no special-case code required in the critical path
- * in the TLB miss handling).
- */
-static void sh64_dcache_purge_phy_page(unsigned long paddr)
-{
-	unsigned long long eaddr_start, eaddr, eaddr_end;
-	int i;
+typedef	union  pal_cache_config_info_1_s {
+	struct {
+		u64		u		: 1,	/* 0 Unified cache ? */
+				at		: 2,	/* 2-1 Cache mem attr*/
+				reserved	: 5,	/* 7-3 Reserved */
+				associativity	: 8,	/* 16-8 Associativity*/
+				line_size	: 8,	/* 23-17 Line size */
+				stride		: 8,	/* 31-24 Stride */
+				store_latency	: 8,	/*39-32 Store latency*/
+				load_latency	: 8,	/* 47-40 Load latency*/
+				store_hints	: 8,	/* 55-48 Store hints*/
+				load_hints	: 8;	/* 63-56 Load hints */
+	} pcci1_bits;
+	u64			pcci1_data;
+} pal_cache_config_info_1_t;
 
-	/* As long as the kernel is not pre-emptible, this doesn't need to be
-	   under cli/sti. */
-	eaddr_start = MAGIC_PAGE0_START;
-	for (i = 0; i < (1 << CACHE_OC_N_SYNBITS); i++) {
-		sh64_setup_dtlb_cache_slot(eaddr_start, get_asid(), paddr);
+typedef	union  pal_cache_config_info_2_s {
+	struct {
+		u32		cache_size;		/*cache size in bytes*/
 
-		eaddr = eaddr_start;
-		eaddr_end = eaddr + PAGE_SIZE;
-		while (eaddr < eaddr_end) {
-			__asm__ __volatile__ ("ocbp %0, 0" : : "r" (eaddr));
-			eaddr += L1_CACHE_BYTES;
-		}
 
-		sh64_teardown_dtlb_cache_slot();
-		eaddr_start += PAGE_SIZE;
-	}
-}
+		u32		alias_boundary	: 8,	/* 39-32 aliased addr
+							 * separation for max
+							 * performance.
+							 */
+				tag_ls_bit	: 8,	/* 47-40 LSb of addr*/
+				tag_ms_bit	: 8,	/* 55-48 MSb of addr*/
+				reserved	: 8;	/* 63-56 Reserved */
+	} pcci2_bits;
+	u64			pcci2_data;
+} pal_cache_config_info_2_t;
 
-static void sh64_dcache_purge_user_pages(struct mm_struct *mm,
-				unsigned long addr, unsigned long end)
-{
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-	pte_t entry;
-	spinlock_t *ptl;
-	unsigned long paddr;
 
-	if (!mm)
-		return; /* No way to find physical address of page */
+typedef struct pal_cache_config_info_s {
+	pal_status_t			pcci_status;
+	pal_cache_config_info_1_t	pcci_info_1;
+	pal_cache_config_info_2_t	pcci_info_2;
+	u64				pcci_reserved;
+} pal_cache_config_info_t;
 
-	pgd = pgd_offset(mm, addr);
-	if (pgd_bad(*pgd))
-		return;
+#define pcci_ld_hints		pcci_info_1.pcci1_bits.load_hints
+#define pcci_st_hints		pcci_info_1.pcci1_bits.store_hints
+#define pcci_ld_latency		pcci_info_1.pcci1_bits.load_latency
+#define pcci_st_latency		pcci_info_1.pcci1_bits.store_latency
+#define pcci_stride		pcci_info_1.pcci1_bits.stride
+#define pcci_line_size		pcci_info_1.pcci1_bits.line_size
+#define pcci_assoc		pcci_info_1.pcci1_bits.associativity
+#define pcci_cache_attr		pcci_info_1.pcci1_bits.at
+#define pcci_unified		pcci_info_1.pcci1_bits.u
+#define pcci_tag_msb		pcci_info_2.pcci2_bits.tag_ms_bit
+#define pcci_tag_lsb		pcci_info_2.pcci2_bits.tag_ls_bit
+#define pcci_alias_boundary	pcci_info_2.pcci2_bits.alias_boundary
+#define pcci_cache_size		pcci_info_2.pcci2_bits.cache_size
 
-	pud = pud_offset(pgd, addr);
-	if (pud_none(*pud) || pud_bad(*pud))
-		return;
 
-	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd) || pmd_bad(*pmd))
-		return;
 
-	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
-	do {
-		entry = *pte;
-		if (pte_none(entry) || !pte_present(entry))
-			continue;
-		paddr = pte_val(entry) & PAGE_MASK;
-		sh64_dcache_purge_coloured_phy_page(paddr, addr);
-	} while (pte++, addr += PAGE_SIZE, addr != end);
-	pte_unmap_unlock(pte - 1, ptl);
-}
+/* Possible values for cache attributes */
 
-/*
- * There are at least 5 choices for the implementation of this, with
- * pros (+), cons(-), comments(*):
- *
- * 1. ocbp each line in the range through the original user's ASID
- *    + no lines spuriously evicted
- *    - tlbmiss handling (must either handle faults on demand => extra
- *	special-case code in tlbmiss critical path), or map the page in
- *	advance (=> flush_tlb_range in advance to avoid multiple hits)
- *    - ASID switching
- *    - expensive for large ranges
- *
- * 2. temporarily map each page in the range to a special effective
- *    address and ocbp through the temporary mapping; relies on the
- *    fact that SH-5 OCB* always do TLB lookup and match on ptags (they
- *    never look at the etags)
- *    + no spurious evictions
- *    - expensive for large ranges
- *    * surely cheaper than (1)
- *
- * 3. walk all the lines in the cache, check the tags, if a match
- *    occurs create a page mapping to ocbp the line through
- *    + no spurious evictions
- *    - tag inspection overhead
- *    - (especially for small ranges)
- *    - potential cost of setting up/tearing down page mapping for
- *	every line that matches the range
- *    * cost partly independent of range size
- *
- * 4. walk all the lines in the cache, check the tags, if a match
- *    occurs use 4 * alloco to purge the line (+3 other probably
- *    innocent victims) by natural eviction
- *    + no tlb mapping overheads
- *    - spurious evictions
- *    - tag inspection overhead
- *
- * 5. implement like flush_cache_all
- *    + no tag inspection overhead
- *    - spurious evictions
- *    - bad for small ranges
- *
- * (1) can be ruled out as more expensive than (2).  (2) appears best
- * for small ranges.  The choice between (3), (4) and (5) for large
- * ranges and the range size for the large/small boundary need
- * benchmarking to determine.
- *
- * For now use approach (2) for small ranges and (5) for large ones.
- */
-static void sh64_dcache_purge_user_range(struct mm_struct *mm,
-			  unsigned long start, unsigned long end)
-{
-	int n_pages = ((end - start) >> PAGE_SHIFT);
+#define PAL_CACHE_ATTR_WT		0	/* Write through cache */
+#define PAL_CACHE_ATTR_WB		1	/* Write back cache */
+#define PAL_CACHE_ATTR_WT_OR_WB		2	/* Either write thru or write
+						 * back depending on TLB
+						 * memory attributes
+						 */
 
-	if (n_pages >= 64 || ((start ^ (end - 1)) & PMD_MASK)) {
-		sh64_dcache_purge_all();
-	} else {
-		/* Small range, covered by a single page table page */
-		start &= PAGE_MASK;	/* should already be so */
-		end = PAGE_ALIGN(end);	/* should already be so */
-		sh64_dcache_purge_user_pages(mm, start, end);
-	}
-}
 
-/*
- * Invalidate the entire contents of both caches, after writing back to
- * memory any dirty data from the D-cache.
- */
-static void sh5_flush_cache_all(void *unused)
-{
-	sh64_dcache_purge_all();
-	sh64_icache_inv_all();
-}
+/* Possible values for cache hints */
 
-/*
- * Invalidate an entire user-address space from both caches, after
- * writing back dirty data (e.g. for shared mmap etc).
- *
- * This could be coded selectively by inspecting all the tags then
- * doing 4*alloco on any set containing a match (as for
- * flush_cache_range), but fork/exit/execve (where this is called from)
- * are expensive anyway.
- *
- * Have to do a purge here, despite the comments re I-cache below.
- * There could be odd-coloured dirty data associated with the mm still
- * in the cache - if this gets written out through natural eviction
- * after the kernel has reused the page there will be chaos.
- *
- * The mm being torn down won't ever be active again, so any Icache
- * lines tagged with its ASID won't be visible for the rest of the
- * lifetime of this ASID cycle.  Before the ASID gets reused, there
- * will be a flush_cache_all.  Hence we don't need to touch the
- * I-cache.  This is similar to the lack of action needed in
- * flush_tlb_mm - see fault.c.
- */
-static void sh5_flush_cache_mm(void *unused)
-{
-	sh64_dcache_purge_all();
-}
+#define PAL_CACHE_HINT_TEMP_1		0	/* Temporal level 1 */
+#define PAL_CACHE_HINT_NTEMP_1		1	/* Non-temporal level 1 */
+#define PAL_CACHE_HINT_NTEMP_ALL	3	/* Non-temporal all levels */
 
-/*
- * Invalidate (from both caches) the range [start,end) of virtual
- * addresses from the user address space specified by mm, after writing
- * back any dirty data.
- *
- * Note, 'end' is 1 byte beyond the end of the range to flush.
- */
-static void sh5_flush_cache_range(void *args)
-{
-	struct flusher_data *data = args;
-	struct vm_area_struct *vma;
-	unsigned long start, end;
+/* Processor cache protection  information */
+typedef union pal_cache_protection_element_u {
+	u32			pcpi_data;
+	struct {
+		u32		data_bits	: 8, /* # data bits covered by
+						      * each unit of protection
+						      */
 
-	vma = data->vma;
-	start = data->addr1;
-	end = data->addr2;
+				tagprot_lsb	: 6, /* Least -do- */
+				tagprot_msb	: 6, /* Most Sig. tag address
+						      * bit that this
+						      * protection covers.
+						      */
+				prot_bits	: 6, /* # of protection bits */
+				method		: 4, /* Protection method */
+				t_d		: 2; /* Indicates which part
+						      * of the cache this
+						      * protection encoding
+						      * applies.
+						      */
+	} pcp_info;
+} pal_cache_protection_element_t;
 
-	sh64_dcache_purge_user_range(vma->vm_mm, start, end);
-	sh64_icache_inv_user_page_range(vma->vm_mm, start, end);
-}
+#define pcpi_cache_prot_part	pcp_info.t_d
+#define pcpi_prot_method	pcp_info.method
+#define pcpi_prot_bits		pcp_info.prot_bits
+#define pcpi_tagprot_msb	pcp_info.tagprot_msb
+#define pcpi_tagprot_lsb	pcp_info.tagprot_lsb
+#define pcpi_data_bits		pcp_info.data_bits
 
-/*
- * Invalidate any entries in either cache for the vma within the user
- * address space vma->vm_mm for the page starting at virtual address
- * 'eaddr'.   This seems to be used primarily in breaking COW.  Note,
- * the I-cache must be searched too in case the page in question is
- * both writable and being executed from (e.g. stack trampolines.)
- *
- * Note, this is called with pte lock held.
- */
-static void sh5_flush_cache_page(void *args)
-{
-	struct flusher_data *data = args;
-	struct vm_area_struct *vma;
-	unsigned long eaddr, pfn;
+/* Processor cache part encodings */
+#define PAL_CACHE_PROT_PART_DATA	0	/* Data protection  */
+#define PAL_CACHE_PROT_PART_TAG		1	/* Tag  protection */
+#define PAL_CACHE_PROT_PART_TAG_DATA	2	/* Tag+data protection (tag is
+						 * more significant )
+						 */
+#define PAL_CACHE_PROT_PART_DATA_TAG	3	/* Data+tag protection (data is
+						 * more significant )
+						 */
+#define PAL_CACHE_PROT_PART_MAX		6
 
-	vma = data->vma;
-	eaddr = data->addr1;
-	pfn = data->addr2;
 
-	sh64_dcache_purge_phy_page(pfn << PAGE_SHIFT);
+typedef struct pal_cache_protection_info_s {
+	pal_status_t			pcpi_status;
+	pal_cache_protection_element_t	pcp_info[PAL_CACHE_PROT_PART_MAX];
+} pal_cache_protection_info_t;
 
-	if (vma->vm_flags & VM_EXEC)
-		sh64_icache_inv_user_page(vma, eaddr);
-}
 
-static void sh5_flush_dcache_page(void *page)
-{
-	sh64_dcache_purge_phy_page(page_to_phys((struct page *)page));
-	wmb();
-}
+/* Processor cache protection method encodings */
+#define PAL_CACHE_PROT_METHOD_NONE		0	/* No protection */
+#define PAL_CACHE_PROT_METHOD_ODD_PARITY	1	/* Odd parity */
+#define PAL_CACHE_PROT_METHOD_EVEN_PARITY	2	/* Even parity */
+#define PAL_CACHE_PROT_METHOD_ECC		3	/* ECC protection */
 
-/*
- * Flush the range [start,end] of kernel virtual address space from
- * the I-cache.  The corresponding range must be purged from the
- * D-cache also because the SH-5 doesn't have cache snooping between
- * the caches.  The addresses will be visible through the superpage
- * mapping, therefore it's guaranteed that there no cache entries for
- * the range in cache sets of the wrong colour.
- */
-static void sh5_flush_icache_range(void *args)
-{
-	struct flusher_data *data = args;
-	unsigned long start, end;
 
-	start = data->addr1;
-	end = data->addr2;
+/* Processor cache line identification in the hierarchy */
+typedef union pal_cache_line_id_u {
+	u64			pclid_data;
+	struct {
+		u64		cache_type	: 8,	/* 7-0 cache type */
+				level		: 8,	/* 15-8 level of the
+							 * cache in the
+							 * hierarchy.
+							 */
+				way		: 8,	/* 23-16 way in the set
+							 */
+				part		: 8,	/* 31-24 part of the
+							 * cache
+							 */
+				reserved	: 32;	/* 63-32 is reserved*/
+	} pclid_info_read;
+	struct {
+		u64		cache_type	: 8,	/* 7-0 cache type */
+				level		: 8,	/* 15-8 level of the
+							 * cache in the
+							 * hierarchy.
+							 */
+				way		: 8,	/* 23-16 way in the set
+							 */
+				part		: 8,	/* 31-24 part of the
+							 * cache
+							 */
+				mesi		: 8,	/* 39-32 cache line
+							 * state
+							 */
+				start		: 8,	/* 47-40 lsb of data to
+							 * invert
+							 */
+				length		: 8,	/* 55-48 #bits to
+							 * invert
+							 */
+				trigger		: 8;	/* 63-56 Trigger error
+							 * by doing a load
+							 * after the write
+							 */
 
-	__flush_purge_region((void *)start, end);
-	wmb();
-	sh64_icache_inv_kernel_range(start, end);
-}
+	} pclid_info_write;
+} pal_cache_line_id_u_t;
 
-/*
- * For the address range [start,end), write back the data from the
- * D-cache and invalidate the corresponding region of the I-cache for the
- * current process.  Used to flush signal trampolines on the stack to
- * make them executable.
- */
-static void sh5_flush_cache_sigtramp(void *vaddr)
-{
-	unsigned long end = (unsigned long)vaddr + L1_CACHE_BYTES;
+#define pclid_read_part		pclid_info_read.part
+#define pclid_read_way		pclid_info_read.way
+#define pclid_read_level	pclid_info_read.level
+#define pclid_read_cache_type	pclid_info_read.cache_type
 
-	__flush_wback_region(vaddr, L1_CACHE_BYTES);
-	wmb();
-	sh64_icache_inv_current_user_range((unsigned long)vaddr, end);
-}
+#define pclid_write_trigger	pclid_info_write.trigger
+#define pclid_write_length	pclid_info_write.length
+#define pclid_write_start	pclid_info_write.start
+#define pclid_write_mesi	pclid_info_write.mesi
+#define pclid_write_part	pclid_info_write.part
+#define pclid_write_way		pclid_info_write.way
+#define pclid_write_level	pclid_info_write.level
+#define pclid_write_cache_type	pclid_info_write.cache_type
 
-void __init sh5_cache_init(void)
-{
-	local_flush_cache_all		= sh5_flush_cache_all;
-	local_flush_cache_mm		= sh5_flush_cache_mm;
-	local_flush_cache_dup_mm	= sh5_flush_cache_mm;
-	local_flush_cache_page		= sh5_flush_cache_page;
-	local_flush_cache_range		= sh5_flush_cache_range;
-	local_flush_dcache_page		= sh5_flush_dcache_page;
-	local_flush_icache_range	= sh5_flush_icache_range;
-	local_flush_cache_sigtramp	= sh5_flush_cache_sigtramp;
+/* Processor cache line part encodings */
+#define PAL_CACHE_LINE_ID_PART_DATA		0	/* Data */
+#define PAL_CACHE_LINE_ID_PART_TAG		1	/* Tag */
+#define PAL_CACHE_LINE_ID_PART_DATA_PROT	2	/* Data protection */
+#define PAL_CACHE_LINE_ID_PART_TAG_PROT		3	/* Tag protection */
+#define PAL_CACHE_LINE_ID_PART_DATA_TAG_PROT	4	/* Data+tag
+							 * protection
+							 */
+typedef struct pal_cache_line_info_s {
+	pal_status_t		pcli_status;		/* Return status of the read cache line
+							 * info call.
+							 */
+	u64			pcli_data;		/* 64-bit data, tag, protection bits .. */
+	u64			pcli_data_len;		/* data length in bits */
+	pal_cache_line_state_t	pcli_cache_line_state;	/* mesi state */
 
-	/* Reserve a slot for dcache colouring in the DTLB */
-	dtlb_cache_slot	= sh64_get_wired_dtlb_entry();
+} pal_cache_line_info_t;
 
-	sh4__flush_region_init();
-}
+
+/* Machine Check related crap */
+
+/* Pending event status bits  */
+typedef u64					pal_mc_pending_events_t;
+
+#define PAL_MC_PENDING_MCA			(1 << 0)
+#define PAL_MC_PENDING_INIT			(1 << 1)
+
+/* Error information type */
+typedef u64					pal_mc_info_index_t;
+
+#define PAL_MC_INFO_PROCESSOR			0	/* Processor */
+#define PAL_MC_INFO_CACHE_CHECK			1	/* Cache check */
+#define PAL_MC_INFO_TLB_CHECK			2	/* Tlb check */
+#define PAL_MC_INFO_BUS_CHECK			3	/* Bus check */
+#define PAL_MC_INFO_REQ_ADDR			4	/* Requestor address */
+#define PAL_MC_INFO_RESP_ADDR			5	/* Responder address */
+#define PAL_MC_INFO_TARGET_ADDR			6	/* Target address */
+#define PAL_MC_INFO_IMPL_DEP			7	/* Implementation
+							 * dependent
+							 */
+
+#define PAL_TLB_CHECK_OP_PURGE			8
+
+typedef struct pal_process_state_info_s {
+	u64		reserved1	: 2,
+			rz		: 1,	/* PAL_CHECK processor
+						 * rendezvous
+						 * successful.
+						 */
+
+			ra		: 1,	/* PAL_CHECK attempted
+						 * a rendezvous.
+						 */
+			me		: 1,	/* Distinct multiple
+						 * errors occurred
+						 */
+
+			mn		: 1,	/* Min. state save
+						 * area has been
+						 * registered with PAL
+						 */
+
+			sy		: 1,	/* Storage integrity
+						 * synched
+						 */
+
+
+			co		: 1,	/* Continuable */
+			ci		: 1,	/* MC isolated */
+			us		: 1,	/* Uncontained storage
+						 * damage.
+						 */
+
+
+			hd		: 1,	/* Non-essential hw
+						 * lost (no loss of
+						 * functionality)
+						 * causing the
+						 * processor to run in
+						 * degraded mode.
+						 */
+
+			tl		: 1,	/* 1 => MC occurred
+						 * after an instr was
+						 * executed but before
+						 * the trap that
+						 * resulted from instr
+						 * execution was
+						 * generated.
+						 * (Trap Lost )
+						 */
+			mi		: 1,	/* More information available
+						 * call PAL_MC_ERROR_INFO
+						 */
+			pi		: 1,	/* Precise instruction pointer */
+			pm		: 1,	/* Precise min-state save area */
+
+			dy		: 1,	/* Processor dynamic
+						 * state valid
+						 */
+
+
+			in		: 1,	/* 0 = MC, 1 = INIT */
+			rs		: 1,	/* RSE valid */
+			cm		: 1,	/* MC corrected */
+			ex		: 1,	/* MC is expected */
+			cr		: 1,	/* Control regs valid*/
+			pc		: 1,	/* Perf cntrs valid */
+			dr		: 1,	/* Debug regs valid */
+			tr		: 1,	/* Translation regs
+						 * valid
+						 */
+			rr		: 1,	/* Region regs valid */
+			ar		: 1,	/* App regs valid */
+			br		: 1,	/* Branch regs valid */
+			pr		: 1,	/* Predicate registers
+						 * valid
+						 */
+
+			fp		: 1,	/* fp registers valid*/
+			b1		: 1,	/* Preserved bank one
+						 * general registers
+						 * are valid
+						 */
+			b0		: 1,	/* Preserved bank zero
+						 * general registers
+						 * are valid
+						 */
+			gr		: 1,	/* General registers
+						 * are valid
+						 * (excl. banked regs)
+						 */
+			dsize		: 16,	/* size of dynamic
+						 * state returned
+						 * by the processor
+						 */
+
+			se		: 1,	/* Shared error.  MCA in a
+						   shared structure */
+			reserved2	: 10,
+			cc		: 1,	/* Cache check */
+			tc		: 1,	/* TLB check */
+			bc		: 1,	/* Bus check */
+			rc		: 1,	/* Register file check */
+			uc		: 1;	/* Uarch check */
+
+} pal_processor_state_info_t;
+
+typedef struct pal_cache_check_info_s {
+	u64		op		: 4,	/* Type of cache
+						 * operation that
+						 * caused the machine
+						 * check.
+						 */
+			level		: 2,	/* Cache level */
+			reserved1	: 2,
+			dl		: 1,	/* Failure in data part
+						 * of cache line
+						 */
+			tl		: 1,	/* Failure in tag part
+						 * of cache line
+						 */
+			dc		: 1,	/* Failure in dcache */
+			ic		: 1,	/* Failure in icache */
+			mesi		: 3,	/* Cache line state */
+			mv		: 1,	/* mesi valid */
+			way		: 5,	/* Way in which the
+						 * error occurred
+						 */
+			wiv		: 1,	/* Way field valid */
+			reserved2	: 1,
+			dp		: 1,	/* Data poisoned on MBE */
+			reserved3	: 6,
+			hlth		: 2,	/* Health indicator */
+
+			index		: 20,	/* Cache line index */
+			reserved4	: 2,
+
+			is		: 1,	/* instruction set (1 == ia32) */
+			iv		: 1,	/* instruction set field valid */
+			pl		: 2,	/* privilege level */
+			pv		: 1,	/* privilege level field valid */
+			mcc		: 1,	/* Machine check corrected */
+			tv		: 1,	/* Target address
+						 * structure is valid
+						 */
+			rq		: 1,	/* Requester identifier
+						 * structure is valid
+						 */
+			rp		: 1,	/* Responder identifier
+						 * structure is valid
+						 */
+			pi		: 1;	/* Precise instruction pointer
+						 * structure is valid
+						 */
+} pal_cache_check_info_t;
+
+typedef struct pal_tlb_check_info_s {
+
+	u64		tr_slot		: 8,	/* Slot# of TR where
+						 * error occurred
+						 */
+			trv		: 1,	/* tr_slot field is valid */
+			reserved1	: 1,
+			level		: 2,	/* TLB level where failure occurred */
+			reserved2	: 4,
+			dtr		: 1,	/* Fail in data TR */
+			itr		: 1,	/* Fail in inst TR */
+			dtc		: 1,	/* Fail in data TC */
+			itc		: 1,	/* Fail in inst. TC */
+			op		: 4,	/* Cache operation */
+			reserved3	: 6,
+			hlth		: 2,	/* Health indicator */
+			reserved4	: 22,
+
+			is		: 1,	/* instruction set (1 == ia32) */
+			iv		: 1,	/* instruction set field valid */
+			pl		: 2,	/* privilege level */
+			pv		: 1,	/* privilege level field valid */
+			mcc		: 1,	/* Machine check corrected */
+			tv		: 1,	/* Target address
+						 * structure is valid
+						 */
+			rq		: 1,	/* Requester identifier
+						 * structure is valid
+						 */
+			rp		: 1,	/* Responder identifier
+						 * structure is valid
+						 */
+			pi		: 1;	/* Precise instruction pointer
+						 * structure is valid
+						 */
+} pal_tlb_check_info_t;
+
+typedef struct pal_bus_check_info_s {
+	u64		size		: 5,	/* Xaction size */
+			ib		: 1,	/* Internal bus error */
+			eb		: 1,	/* External bus error */
+			cc		: 1,	/* Error occurred
+						 * during cache-cache
+						 * transfer.
+						 */
+			type		: 8,	/* Bus xaction type*/
+			sev		: 5,	/* Bus error severity*/
+			hier		: 2,	/* Bus hierarchy level */
+			dp		: 1,	/* Data poisoned on MBE */
+			bsi		: 8,	/* Bus error status
+						 * info
+						 */
+			reserved2	: 22,
+
+			is		: 1,	/* instruction set (1 == ia32) */
+			iv		: 1,	/* instruction set field valid */
+			pl		: 2,	/* privilege level */
+			pv		: 1,	/* privilege level field valid */
+			mcc		: 1,	/* Machine check corrected */
+			tv		: 1,	/* Target address
+						 * structure is valid
+						 */
+			rq		: 1,	/* Requester identifier
+						 * structure is valid
+						 */
+			rp		: 1,	/* Responder identifier
+						 * structure is valid
+						 */
+			pi		: 1;	/* Precise instruction pointer
+						 * structure is valid
+						 */
+} pal_bus_check_info_t;
+
+typedef struct pal_reg_file_check_info_s {
+	u64		id		: 4,	/* Register file identifier */
+			op		: 4,	/* Type of register
+						 * operation that
+						 * caused the machine
+						 * check.
+						 */
+			reg_num		: 7,	/* Register number */
+			rnv		: 1,	/* reg_num valid */
+			reserved2	: 38,
+
+			is		: 1,	/* instruction set (1 == ia32) */
+			iv		: 1,	/* instruction set field valid */
+			pl		: 2,	/* privilege level */
+			pv		: 1,	/* privilege level field valid */
+			mcc		: 1,	/* Machine check corrected */
+			reserved3	: 3,
+			pi		: 1;	/* Precise instruction pointer
+						 * structure is valid
+						 */
+} pal_reg_file_check_info_t;
+
+typedef struct pal_uarch_check_info_s {
+	u64		sid		: 5,	/* Structure identification */
+			level		: 3,	/* Level of failure */
+			array_id	: 4,	/* Array identification */
+			op		: 4,	/* Type of
+						 * operation that
+						 * caused the machine
+						 * check.
+						 */
+			way		: 6,	/* Way of structure */
+			wv		: 1,	/* way valid */
+			xv		: 1,	/* index valid */
+			reserved1	: 6,
+			hlth		: 2,	/* Health indicator */
+			index		: 8,	/* Index or set of the uarch
+						 * structure that failed.
+						 */
+			reserved2	: 24,
+
+			is		: 1,	/* instruction set (1 == ia32) */
+			iv		: 1,	/* instruction set field valid */
+			pl		: 2,	/* privilege level */
+			pv		: 1,	/* privilege level field valid */
+			mcc		: 1,	/* Machine check corrected */
+			tv		: 1,	/* Target address
+						 * structure is valid
+						 */
+			rq		: 1,	/* Requester identifier
+						 * structure is valid
+						 */
+			rp		: 1,	/* Responder identifier
+						 * structure is valid
+						 */
+			pi		: 1;	/* Precise instruction pointer
+						 * structure is valid
+						 */
+} pal_uarch_check_info_t;
+
+typedef union pal_mc_error_info_u {
+	u64				pmei_data;
+	pal_processor_state_info_t	pme_processor;
+	pal_cache_check_info_t		pme_cache;
+	pal_tlb_check_info_t		pme_tlb;
+	pal_bus_check_info_t		pme_bus;
+	pal_reg_file_check_info_t	pme_reg_file;
+	pal_uarch_check_info_t		pme_uarch;
+} pal_mc_error_info_t;
+
+#define pmci_proc_unknown_check			pme_processor.uc
+#define pmci_proc_bus_check			pme_processor.bc
+#define pmci_proc_tlb_check			pme_processor.tc
+#define pmci_proc_cache_check			pme_processor.cc
+#define pmci_proc_dynamic_state_size		pme_processor.dsize
+#define pmci_proc_gpr_valid			pme_processor.gr
+#define pmci_proc_preserved_bank0_gpr_valid	pme_processor.b0
+#define pmci_proc_preserved_bank1_gpr_valid	pme_processor.b1
+#define pmci_proc_fp_valid			pme_processor.fp
+#define pmci_proc_predicate_regs_valid		pme_processor.pr
+#define pmci_proc_branch_regs_valid		pme_processor.br
+#define pmci_proc_app_regs_valid		pme_processor.ar
+#define pmci_proc_region_regs_valid		pme_processor.rr
+#define pmci_proc_translation_regs_valid	pme_processor.tr
+#define pmci_proc_debug_regs_valid		pme_processor.dr
+#define pmci_proc_perf_counters_valid		pme_processor.pc
+#define pmci_proc_control_regs_valid		pme_processor.cr
+#define pmci_proc_machine_check_expected	pme_processor.ex
+#define pmci_proc_machine_check_corrected	pme_processor.cm
+#define pmci_proc_rse_valid			pme_processor.rs
+#define pmci_proc_machine_check_or_init		pme_processor.in
+#define pmci_proc_dynamic_state_valid		pme_processor.dy
+#define pmci_proc_operation			pme_processor.op
+#define pmci_proc_trap_lost			pme_processor.tl
+#define pmci_proc_hardware_damage		pme_processor.hd
+#define pmci_proc_uncontained_storage_damage	pme_processor.us
+#define pmci_proc_machine_check_isolated	pme_processor.ci
+#define pmci_proc_continuable			pme_processor.co
+#define pmci_proc_storage_intergrity_synced	pme_processor.sy
+#define pmci_proc_min_state_save_area_regd	pme_processor.mn
+#define	pmci_proc_distinct_multiple_errors	pme_processor.me
+#def

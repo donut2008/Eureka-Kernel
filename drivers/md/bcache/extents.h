@@ -1,14 +1,8 @@
-#ifndef _BCACHE_EXTENTS_H
-#define _BCACHE_EXTENTS_H
-
-extern const struct btree_keys_ops bch_btree_keys_ops;
-extern const struct btree_keys_ops bch_extent_keys_ops;
-
-struct bkey;
-struct cache_set;
-
-void bch_extent_to_text(char *, size_t, const struct bkey *);
-bool __bch_btree_ptr_invalid(struct cache_set *, const struct bkey *);
-bool __bch_extent_invalid(struct cache_set *, const struct bkey *);
-
-#endif /* _BCACHE_EXTENTS_H */
+PMLTemperatureScaler_5__SHIFT 0x10
+#define PM_FUSES_11__LPMLTemperatureScaler_4_MASK 0xff000000
+#define PM_FUSES_11__LPMLTemperatureScaler_4__SHIFT 0x18
+#define PM_FUSES_12__LPMLTemperatureScaler_11_MASK 0xff
+#define PM_FUSES_12__LPMLTemperatureScaler_11__SHIFT 0x0
+#define PM_FUSES_12__LPMLTemperatureScaler_10_MASK 0xff00
+#define PM_FUSES_12__LPMLTemperatureScaler_10__SHIFT 0x8
+#define PM_FUSES_12__LPMLTemperatureScaler_9_MASK

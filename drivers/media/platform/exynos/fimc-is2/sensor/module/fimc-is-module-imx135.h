@@ -1,21 +1,3 @@
-/*
- * Samsung Exynos5 SoC series Sensor driver
- *
- *
- * Copyright (c) 2011 Samsung Electronics Co., Ltd
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#ifndef FIMC_IS_DEVICE_IMX135_H
-#define FIMC_IS_DEVICE_IMX135_H
-
-#define SENSOR_IMX135_INSTANCE	0
-#define SENSOR_IMX135_NAME	SENSOR_NAME_IMX135
-
-int sensor_imx135_probe(struct i2c_client *client,
-	const struct i2c_device_id *id);
-
-#endif
+WWWÇUW&W7W8WNW;W@WOWiWÀWˆWaWW‰W“W W³W¤WªW°WÃWÆWÔWÒWÓW
+XÖWãWXXXrX!XbXKXpXÀkRX=XyX…X¹XŸX«XºXÞX»X¸X®XÅXÓXÑX×XÙXØXåXÜXäXßXïXúXùXûXüXýXY
+YYY¦h%Y,Y-Y2Y8Y>YÒzUYPYNYZYXYbY`YgYlYiYxYYY^O«O£Y²YÆYèYÜYYÙYÚY%ZZZZ	ZZ@ZlZIZ5Z6ZbZjZšZ¼Z¾ZËZÂZ½ZãZ×ZæZéZÖZúZûZ[[[2[ÐZ*[6[>[C[E[@[Q[U[Z[[[e[i[p[s[u[x[ˆez[€[ƒ[¦[¸[Ã[Ç[É[Ô[Ð[ä[æ[â[Þ[å[ë[ð[ö[ó[\\\\\ \"\(\8\9\A\F\N\S\P\O\q[l\n\bNv\y\Œ\‘\”\›Y«\»\¶\¼\·\Å\¾\Ç\Ù\é\ý\ú\í\Œ]ê\]]]\]]]]]"]]]]L]R]N]K]l]s]v]‡]„]‚]¢]]¬]®]½]]·]¼]É]Í]Ó]Ò]Ö]Û]ë]ò]õ]^^^^^6^7^D^C^@^N^W^T^_^b^d^G^u

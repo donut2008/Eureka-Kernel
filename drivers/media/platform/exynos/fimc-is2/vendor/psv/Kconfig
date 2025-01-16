@@ -1,14 +1,2 @@
-config PSV_SFR_VERIFICATION
-        bool "|-> Enable SFR verfication feature"
-        depends on VENDER_PSV
-        default n
-
-config PSV_VECTOR_VERIFICATION
-		bool "|-> Enable vector verfication feature"
-		depends on VENDER_PSV
-		default n
-
-config PSV_ASB
-		bool "|-> Enable ASB feature"
-		depends on VENDER_PSV
-		default n
+Q=İ<O54TÕ“'Oœí/?¹u–?WwUóĞİ9WÕ×¯7·å—¶kœİmwW=t­Óß}ùìœ^§›U^ì¾¿Ê–»óòûíòûå6
+ƒ—åûòÔùóÍÃÏDs€¾üúËË““'O|÷äääæó×/wüpròİwß¡ÿd›İŸœ4Ÿªûûá/O›—ğg¯NNÇqÚ®w·Oï»Oıó›Û¯Ï»»»/w÷¯Oïînš‡Óg¯Àöğß]÷ğxw‹‡{Ùü\İ}®¾ş„DğsøÛÍíÇŸ>W_Ÿñƒµİÿ÷`èA:üíp°‡ªşÔ=cãÎn›»îswûP}JáïØ$è¿àqÕ	q†ã8ıÍmõéõyõé¾=Ci:^^šæä³?ÎsÕQç‰¿ç)Îåo9Oi&ÅóT¦S8ÓİÃ]W}~wwóĞ

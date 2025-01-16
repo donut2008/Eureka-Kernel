@@ -1,323 +1,130 @@
-/*
- * Support for the Maxtor OneTouch USB hard drive's button
- *
- * Current development and maintenance by:
- *	Copyright (c) 2005 Nick Sillik <n.sillik@temple.edu>
- *
- * Initial work by:
- *	Copyright (c) 2003 Erik Thyren <erth7411@student.uu.se>
- *
- * Based on usbmouse.c (Vojtech Pavlik) and xpad.c (Marko Friedemann)
- *
- */
-
-/*
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/input.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/usb/input.h>
-#include "usb.h"
-#include "debug.h"
-#include "scsiglue.h"
-
-#define DRV_NAME "ums-onetouch"
-
-MODULE_DESCRIPTION("Maxtor USB OneTouch hard drive button driver");
-MODULE_AUTHOR("Nick Sillik <n.sillik@temple.edu>");
-MODULE_LICENSE("GPL");
-
-#define ONETOUCH_PKT_LEN        0x02
-#define ONETOUCH_BUTTON         KEY_PROG1
-
-static int onetouch_connect_input(struct us_data *ss);
-static void onetouch_release_input(void *onetouch_);
-
-struct usb_onetouch {
-	char name[128];
-	char phys[64];
-	struct input_dev *dev;	/* input device interface */
-	struct usb_device *udev;	/* usb device */
-
-	struct urb *irq;	/* urb for interrupt in report */
-	unsigned char *data;	/* input data */
-	dma_addr_t data_dma;
-	unsigned int is_open:1;
-};
-
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-static struct usb_device_id onetouch_usb_ids[] = {
-#	include "unusual_onetouch.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, onetouch_usb_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev onetouch_unusual_dev_list[] = {
-#	include "unusual_onetouch.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-
-static void usb_onetouch_irq(struct urb *urb)
-{
-	struct usb_onetouch *onetouch = urb->context;
-	signed char *data = onetouch->data;
-	struct input_dev *dev = onetouch->dev;
-	int status = urb->status;
-	int retval;
-
-	switch (status) {
-	case 0:			/* success */
-		break;
-	case -ECONNRESET:	/* unlink */
-	case -ENOENT:
-	case -ESHUTDOWN:
-		return;
-	/* -EPIPE:  should clear the halt */
-	default:		/* error */
-		goto resubmit;
-	}
-
-	input_report_key(dev, ONETOUCH_BUTTON, data[0] & 0x02);
-	input_sync(dev);
-
-resubmit:
-	retval = usb_submit_urb (urb, GFP_ATOMIC);
-	if (retval)
-		dev_err(&dev->dev, "can't resubmit intr, %s-%s/input0, "
-			"retval %d\n", onetouch->udev->bus->bus_name,
-			onetouch->udev->devpath, retval);
-}
-
-static int usb_onetouch_open(struct input_dev *dev)
-{
-	struct usb_onetouch *onetouch = input_get_drvdata(dev);
-
-	onetouch->is_open = 1;
-	onetouch->irq->dev = onetouch->udev;
-	if (usb_submit_urb(onetouch->irq, GFP_KERNEL)) {
-		dev_err(&dev->dev, "usb_submit_urb failed\n");
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static void usb_onetouch_close(struct input_dev *dev)
-{
-	struct usb_onetouch *onetouch = input_get_drvdata(dev);
-
-	usb_kill_urb(onetouch->irq);
-	onetouch->is_open = 0;
-}
-
-#ifdef CONFIG_PM
-static void usb_onetouch_pm_hook(struct us_data *us, int action)
-{
-	struct usb_onetouch *onetouch = (struct usb_onetouch *) us->extra;
-
-	if (onetouch->is_open) {
-		switch (action) {
-		case US_SUSPEND:
-			usb_kill_urb(onetouch->irq);
-			break;
-		case US_RESUME:
-			if (usb_submit_urb(onetouch->irq, GFP_NOIO) != 0)
-				dev_err(&onetouch->irq->dev->dev,
-					"usb_submit_urb failed\n");
-			break;
-		default:
-			break;
-		}
-	}
-}
-#endif /* CONFIG_PM */
-
-static int onetouch_connect_input(struct us_data *ss)
-{
-	struct usb_device *udev = ss->pusb_dev;
-	struct usb_host_interface *interface;
-	struct usb_endpoint_descriptor *endpoint;
-	struct usb_onetouch *onetouch;
-	struct input_dev *input_dev;
-	int pipe, maxp;
-	int error = -ENOMEM;
-
-	interface = ss->pusb_intf->cur_altsetting;
-
-	if (interface->desc.bNumEndpoints != 3)
-		return -ENODEV;
-
-	endpoint = &interface->endpoint[2].desc;
-	if (!usb_endpoint_is_int_in(endpoint))
-		return -ENODEV;
-
-	pipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
-	maxp = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
-	maxp = min(maxp, ONETOUCH_PKT_LEN);
-
-	onetouch = kzalloc(sizeof(struct usb_onetouch), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!onetouch || !input_dev)
-		goto fail1;
-
-	onetouch->data = usb_alloc_coherent(udev, ONETOUCH_PKT_LEN,
-					    GFP_KERNEL, &onetouch->data_dma);
-	if (!onetouch->data)
-		goto fail1;
-
-	onetouch->irq = usb_alloc_urb(0, GFP_KERNEL);
-	if (!onetouch->irq)
-		goto fail2;
-
-	onetouch->udev = udev;
-	onetouch->dev = input_dev;
-
-	if (udev->manufacturer)
-		strlcpy(onetouch->name, udev->manufacturer,
-			sizeof(onetouch->name));
-	if (udev->product) {
-		if (udev->manufacturer)
-			strlcat(onetouch->name, " ", sizeof(onetouch->name));
-		strlcat(onetouch->name, udev->product, sizeof(onetouch->name));
-	}
-
-	if (!strlen(onetouch->name))
-		snprintf(onetouch->name, sizeof(onetouch->name),
-			 "Maxtor Onetouch %04x:%04x",
-			 le16_to_cpu(udev->descriptor.idVendor),
-			 le16_to_cpu(udev->descriptor.idProduct));
-
-	usb_make_path(udev, onetouch->phys, sizeof(onetouch->phys));
-	strlcat(onetouch->phys, "/input0", sizeof(onetouch->phys));
-
-	input_dev->name = onetouch->name;
-	input_dev->phys = onetouch->phys;
-	usb_to_input_id(udev, &input_dev->id);
-	input_dev->dev.parent = &udev->dev;
-
-	set_bit(EV_KEY, input_dev->evbit);
-	set_bit(ONETOUCH_BUTTON, input_dev->keybit);
-	clear_bit(0, input_dev->keybit);
-
-	input_set_drvdata(input_dev, onetouch);
-
-	input_dev->open = usb_onetouch_open;
-	input_dev->close = usb_onetouch_close;
-
-	usb_fill_int_urb(onetouch->irq, udev, pipe, onetouch->data, maxp,
-			 usb_onetouch_irq, onetouch, endpoint->bInterval);
-	onetouch->irq->transfer_dma = onetouch->data_dma;
-	onetouch->irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-
-	ss->extra_destructor = onetouch_release_input;
-	ss->extra = onetouch;
-#ifdef CONFIG_PM
-	ss->suspend_resume_hook = usb_onetouch_pm_hook;
-#endif
-
-	error = input_register_device(onetouch->dev);
-	if (error)
-		goto fail3;
-
-	return 0;
-
- fail3:	usb_free_urb(onetouch->irq);
- fail2:	usb_free_coherent(udev, ONETOUCH_PKT_LEN,
-			  onetouch->data, onetouch->data_dma);
- fail1:	kfree(onetouch);
-	input_free_device(input_dev);
-	return error;
-}
-
-static void onetouch_release_input(void *onetouch_)
-{
-	struct usb_onetouch *onetouch = (struct usb_onetouch *) onetouch_;
-
-	if (onetouch) {
-		usb_kill_urb(onetouch->irq);
-		input_unregister_device(onetouch->dev);
-		usb_free_urb(onetouch->irq);
-		usb_free_coherent(onetouch->udev, ONETOUCH_PKT_LEN,
-				  onetouch->data, onetouch->data_dma);
-	}
-}
-
-static struct scsi_host_template onetouch_host_template;
-
-static int onetouch_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-
-	result = usb_stor_probe1(&us, intf, id,
-			(id - onetouch_usb_ids) + onetouch_unusual_dev_list,
-			&onetouch_host_template);
-	if (result)
-		return result;
-
-	/* Use default transport and protocol */
-
-	result = usb_stor_probe2(us);
-	return result;
-}
-
-static struct usb_driver onetouch_driver = {
-	.name =		DRV_NAME,
-	.probe =	onetouch_probe,
-	.disconnect =	usb_stor_disconnect,
-	.suspend =	usb_stor_suspend,
-	.resume =	usb_stor_resume,
-	.reset_resume =	usb_stor_reset_resume,
-	.pre_reset =	usb_stor_pre_reset,
-	.post_reset =	usb_stor_post_reset,
-	.id_table =	onetouch_usb_ids,
-	.soft_unbind =	1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(onetouch_driver, onetouch_host_template, DRV_NAME);
+R_L23_AFTER_PME_ACK__SHIFT 0x17
+#define D2F1_PCIE_LC_CNTL3__LC_HW_VOLTAGE_IF_CONTROL_MASK 0x3000000
+#define D2F1_PCIE_LC_CNTL3__LC_HW_VOLTAGE_IF_CONTROL__SHIFT 0x18
+#define D2F1_PCIE_LC_CNTL3__LC_VOLTAGE_TIMER_SEL_MASK 0x3c000000
+#define D2F1_PCIE_LC_CNTL3__LC_VOLTAGE_TIMER_SEL__SHIFT 0x1a
+#define D2F1_PCIE_LC_CNTL3__LC_GO_TO_RECOVERY_MASK 0x40000000
+#define D2F1_PCIE_LC_CNTL3__LC_GO_TO_RECOVERY__SHIFT 0x1e
+#define D2F1_PCIE_LC_CNTL3__LC_N_EIE_SEL_MASK 0x80000000
+#define D2F1_PCIE_LC_CNTL3__LC_N_EIE_SEL__SHIFT 0x1f
+#define D2F1_PCIE_LC_CNTL4__LC_TX_ENABLE_BEHAVIOUR_MASK 0x3
+#define D2F1_PCIE_LC_CNTL4__LC_TX_ENABLE_BEHAVIOUR__SHIFT 0x0
+#define D2F1_PCIE_LC_CNTL4__LC_DIS_CONTIG_END_SET_CHECK_MASK 0x4
+#define D2F1_PCIE_LC_CNTL4__LC_DIS_CONTIG_END_SET_CHECK__SHIFT 0x2
+#define D2F1_PCIE_LC_CNTL4__LC_DIS_ASPM_L1_IN_SPEED_CHANGE_MASK 0x8
+#define D2F1_PCIE_LC_CNTL4__LC_DIS_ASPM_L1_IN_SPEED_CHANGE__SHIFT 0x3
+#define D2F1_PCIE_LC_CNTL4__LC_BYPASS_EQ_MASK 0x10
+#define D2F1_PCIE_LC_CNTL4__LC_BYPASS_EQ__SHIFT 0x4
+#define D2F1_PCIE_LC_CNTL4__LC_REDO_EQ_MASK 0x20
+#define D2F1_PCIE_LC_CNTL4__LC_REDO_EQ__SHIFT 0x5
+#define D2F1_PCIE_LC_CNTL4__LC_EXTEND_EIEOS_MASK 0x40
+#define D2F1_PCIE_LC_CNTL4__LC_EXTEND_EIEOS__SHIFT 0x6
+#define D2F1_PCIE_LC_CNTL4__LC_IGNORE_PARITY_MASK 0x80
+#define D2F1_PCIE_LC_CNTL4__LC_IGNORE_PARITY__SHIFT 0x7
+#define D2F1_PCIE_LC_CNTL4__LC_EQ_SEARCH_MODE_MASK 0x300
+#define D2F1_PCIE_LC_CNTL4__LC_EQ_SEARCH_MODE__SHIFT 0x8
+#define D2F1_PCIE_LC_CNTL4__LC_DSC_CHECK_COEFFS_IN_RLOCK_MASK 0x400
+#define D2F1_PCIE_LC_CNTL4__LC_DSC_CHECK_COEFFS_IN_RLOCK__SHIFT 0xa
+#define D2F1_PCIE_LC_CNTL4__LC_USC_EQ_NOT_REQD_MASK 0x800
+#define D2F1_PCIE_LC_CNTL4__LC_USC_EQ_NOT_REQD__SHIFT 0xb
+#define D2F1_PCIE_LC_CNTL4__LC_USC_GO_TO_EQ_MASK 0x1000
+#define D2F1_PCIE_LC_CNTL4__LC_USC_GO_TO_EQ__SHIFT 0xc
+#define D2F1_PCIE_LC_CNTL4__LC_SET_QUIESCE_MASK 0x2000
+#define D2F1_PCIE_LC_CNTL4__LC_SET_QUIESCE__SHIFT 0xd
+#define D2F1_PCIE_LC_CNTL4__LC_QUIESCE_RCVD_MASK 0x4000
+#define D2F1_PCIE_LC_CNTL4__LC_QUIESCE_RCVD__SHIFT 0xe
+#define D2F1_PCIE_LC_CNTL4__LC_UNEXPECTED_COEFFS_RCVD_MASK 0x8000
+#define D2F1_PCIE_LC_CNTL4__LC_UNEXPECTED_COEFFS_RCVD__SHIFT 0xf
+#define D2F1_PCIE_LC_CNTL4__LC_BYPASS_EQ_REQ_PHASE_MASK 0x10000
+#define D2F1_PCIE_LC_CNTL4__LC_BYPASS_EQ_REQ_PHASE__SHIFT 0x10
+#define D2F1_PCIE_LC_CNTL4__LC_FORCE_PRESET_IN_EQ_REQ_PHASE_MASK 0x20000
+#define D2F1_PCIE_LC_CNTL4__LC_FORCE_PRESET_IN_EQ_REQ_PHASE__SHIFT 0x11
+#define D2F1_PCIE_LC_CNTL4__LC_FORCE_PRESET_VALUE_MASK 0x3c0000
+#define D2F1_PCIE_LC_CNTL4__LC_FORCE_PRESET_VALUE__SHIFT 0x12
+#define D2F1_PCIE_LC_CNTL4__LC_USC_DELAY_DLLPS_MASK 0x400000
+#define D2F1_PCIE_LC_CNTL4__LC_USC_DELAY_DLLPS__SHIFT 0x16
+#define D2F1_PCIE_LC_CNTL4__LC_PCIE_TX_FULL_SWING_MASK 0x800000
+#define D2F1_PCIE_LC_CNTL4__LC_PCIE_TX_FULL_SWING__SHIFT 0x17
+#define D2F1_PCIE_LC_CNTL4__LC_EQ_WAIT_FOR_EVAL_DONE_MASK 0x1000000
+#define D2F1_PCIE_LC_CNTL4__LC_EQ_WAIT_FOR_EVAL_DONE__SHIFT 0x18
+#define D2F1_PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN_MASK 0x2000000
+#define D2F1_PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN__SHIFT 0x19
+#define D2F1_PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK_MASK 0xfc000000
+#define D2F1_PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK__SHIFT 0x1a
+#define D2F1_PCIE_LC_CNTL5__LC_EQ_FS_0_MASK 0x3f
+#define D2F1_PCIE_LC_CNTL5__LC_EQ_FS_0__SHIFT 0x0
+#define D2F1_PCIE_LC_CNTL5__LC_EQ_FS_8_MASK 0xfc0
+#define D2F1_PCIE_LC_CNTL5__LC_EQ_FS_8__SHIFT 0x6
+#define D2F1_PCIE_LC_CNTL5__LC_EQ_LF_0_MASK 0x3f000
+#define D2F1_PCIE_LC_CNTL5__LC_EQ_LF_0__SHIFT 0xc
+#define D2F1_PCIE_LC_CNTL5__LC_EQ_LF_8_MASK 0xfc0000
+#define D2F1_PCIE_LC_CNTL5__LC_EQ_LF_8__SHIFT 0x12
+#define D2F1_PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS_MASK 0x1000000
+#define D2F1_PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS__SHIFT 0x18
+#define D2F1_PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT_MASK 0x1
+#define D2F1_PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT__SHIFT 0x0
+#define D2F1_PCIE_LC_CNTL6__LC_SPC_MODE_5GT_MASK 0x4
+#define D2F1_PCIE_LC_CNTL6__LC_SPC_MODE_5GT__SHIFT 0x2
+#define D2F1_PCIE_LC_CNTL6__LC_SPC_MODE_8GT_MASK 0x10
+#define D2F1_PCIE_LC_CNTL6__LC_SPC_MODE_8GT__SHIFT 0x4
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN_MASK 0x1
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN__SHIFT 0x0
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE_MASK 0x2
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE__SHIFT 0x1
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE_MASK 0x4
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE__SHIFT 0x2
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE_MASK 0x8
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE__SHIFT 0x3
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE_MASK 0x10
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE__SHIFT 0x4
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_FAILED_SPEED_NEG_MASK 0x20
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_FAILED_SPEED_NEG__SHIFT 0x5
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_LONG_LW_CHANGE_MASK 0x40
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_LONG_LW_CHANGE__SHIFT 0x6
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_SHORT_LW_CHANGE_MASK 0x80
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_SHORT_LW_CHANGE__SHIFT 0x7
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_OTHER_MASK 0x100
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_OTHER__SHIFT 0x8
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED_MASK 0x200
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED__SHIFT 0x9
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE_MASK 0x400
+#define D2F1_PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE__SHIFT 0xa
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL_MASK 0xf
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL__SHIFT 0x0
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE_MASK 0x10
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE__SHIFT 0x4
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1_MASK 0x20
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1__SHIFT 0x5
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN_MASK 0x40
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN__SHIFT 0x6
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN_MASK 0x80
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN__SHIFT 0x7
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_POWER_STATE_MASK 0x700
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_POWER_STATE__SHIFT 0x8
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED_MASK 0x800
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED__SHIFT 0xb
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN_MASK 0x1000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN__SHIFT 0xc
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH_MASK 0x2000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH__SHIFT 0xd
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG_MASK 0x4000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG__SHIFT 0xe
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN_MASK 0x8000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN__SHIFT 0xf
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP_MASK 0x10000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP__SHIFT 0x10
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF_MASK 0x20000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF__SHIFT 0x11
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF_MASK 0x40000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF__SHIFT 0x12
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN_MASK 0x80000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN__SHIFT 0x13
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW_MASK 0x100000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW__SHIFT 0x14
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN_MASK 0x200000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN__SHIFT 0x15
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL_MASK 0xc00000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL__SHIFT 0x16
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED_MASK 0x1000000
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED__SHIFT 0x18
+#define D2F1_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST_MASK 0x2

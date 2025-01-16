@@ -1,11 +1,16 @@
-#
-# Cryptographic API
-#
+/* 
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
+ *
+ * Copyright (C) 2000-2005 Silicon Graphics, Inc. All rights reserved.
+ */
 
-obj-$(CONFIG_CRYPTO_SHA1_S390) += sha1_s390.o sha_common.o
-obj-$(CONFIG_CRYPTO_SHA256_S390) += sha256_s390.o sha_common.o
-obj-$(CONFIG_CRYPTO_SHA512_S390) += sha512_s390.o sha_common.o
-obj-$(CONFIG_CRYPTO_DES_S390) += des_s390.o
-obj-$(CONFIG_CRYPTO_AES_S390) += aes_s390.o
-obj-$(CONFIG_S390_PRNG) += prng.o
-obj-$(CONFIG_CRYPTO_GHASH_S390) += ghash_s390.o
+
+#ifndef _ASM_IA64_SN_SN_CPUID_H
+#define _ASM_IA64_SN_SN_CPUID_H
+
+#include <linux/smp.h>
+#include <asm/sn/addrs.h>
+#inclu

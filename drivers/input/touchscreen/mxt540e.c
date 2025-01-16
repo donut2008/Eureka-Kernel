@@ -1,3055 +1,1742 @@
-/*
- *  Copyright (C) 2010, Samsung Electronics Co. Ltd. All Rights Reserved.
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/input/mt.h>
-#include <linux/interrupt.h>
-#include <linux/i2c.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
-#include <linux/i2c/mxt540e.h>
-#include <asm/unaligned.h>
-#include <linux/firmware.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
-
-#define OBJECT_TABLE_START_ADDRESS	7
-#define OBJECT_TABLE_ELEMENT_SIZE	6
-
-#define CMD_RESET_OFFSET		0
-#define CMD_BACKUP_OFFSET		1
-#define CMD_CALIBRATE_OFFSET		2
-#define CMD_REPORTATLL_OFFSET		3
-#define CMD_DEBUG_CTRL_OFFSET		4
-#define CMD_DIAGNOSTIC_OFFSET		5
-
-#define DETECT_MSG_MASK			0x80
-#define PRESS_MSG_MASK			0x40
-#define RELEASE_MSG_MASK		0x20
-#define MOVE_MSG_MASK			0x10
-#define SUPPRESS_MSG_MASK		0x02
-
-/* Version */
-#define MXT540E_VER_10			0x10
-
-/* Slave addresses */
-#define MXT540E_APP_LOW			0x4C
-#define MXT540E_APP_HIGH		0x4D
-#define MXT540E_BOOT_LOW		0x26
-#define MXT540E_BOOT_HIGH		0x27
-
-/* FIRMWARE NAME */
-#define MXT540E_FW_NAME			"tsp_atmel/mXT540E.fw"
-
-#define MXT540E_BOOT_VALUE		0xa5
-#define MXT540E_BACKUP_VALUE		0x55
-
-/* Bootloader mode status */
-#define MXT540E_WAITING_BOOTLOAD_CMD	0xc0	/* valid 7 6 bit only */
-#define MXT540E_WAITING_FRAME_DATA	0x80	/* valid 7 6 bit only */
-#define MXT540E_FRAME_CRC_CHECK		0x02
-#define MXT540E_FRAME_CRC_FAIL		0x03
-#define MXT540E_FRAME_CRC_PASS		0x04
-#define MXT540E_APP_CRC_FAIL		0x40	/* valid 7 8 bit only */
-#define MXT540E_BOOT_STATUS_MASK	0x3f
-
-/* Command to unlock bootloader */
-#define MXT540E_UNLOCK_CMD_MSB		0xaa
-#define MXT540E_UNLOCK_CMD_LSB		0xdc
-
-#define ID_BLOCK_SIZE			7
-
-#define DRIVER_FILTER
-
-#define MXT540E_STATE_INACTIVE		-1
-#define MXT540E_STATE_RELEASE		0
-#define MXT540E_STATE_PRESS		1
-#define MXT540E_STATE_MOVE		2
-
-#define MAX_FINGER_NUM			10
-
-#define	MEDIANERROR_MAX_BAT		5
-#define	MEDIANERROR_MAX_TA		10
-
-struct object_t {
-	u8 object_type;
-	u16 i2c_address;
-	u8 size;
-	u8 instances;
-	u8 num_report_ids;
-} __packed;
-
-struct finger_info {
-	s16 x;
-	s16 y;
-	s16 z;
-	u16 w;
-	s8 state;
-	int16_t component;
-};
-
-struct median_error_t {
-	u8 err_cnt_bat;
-	u8 err_cnt_ta;
-	u8 setting_flag;
-	u8 table_cnt;
-	u8 table_ta[4];
-	u8 table_bat[4];
-};
-
-struct report_id_map_t {
-	u8 object_type;		/*!< Object type. */
-	u8 instance;		/*!< Instance number. */
-};
-
-u8 max_report_id;
-struct report_id_map_t *rid_map;
-static bool rid_map_alloc;
-
-struct mxt540e_data {
-	struct i2c_client *client;
-	struct input_dev *input_dev;
-	struct median_error_t *median_error;
-	struct object_t *objects;
-	struct delayed_work config_dwork;
-	struct delayed_work resume_check_dwork;
-	struct delayed_work cal_check_dwork;
-	const u8 *power_cfg;
-	const u8 *t48_config_batt_e;
-	const u8 *t48_config_chrg_e;
-	u16 msg_proc;
-	u16 cmd_proc;
-	u16 msg_object_size;
-	u32 x_dropbits:2;
-	u32 y_dropbits:2;
-	u32 finger_mask;
-	u8 irqf_trigger_type;
-	u8 objects_len;
-	u8 tsp_version;
-	u8 tsp_build;
-	u8 family_id;
-	u8 finger_type;
-	u8 chrgtime_batt;
-	u8 chrgtime_charging;
-	u8 atchcalst;
-	u8 atchcalsthr;
-	u8 tchthr_batt;
-	u8 tchthr_charging;
-	u8 actvsyncsperx_batt;
-	u8 actvsyncsperx_charging;
-	u8 calcfg_batt_e;
-	u8 calcfg_charging_e;
-	u8 atchfrccalthr_e;
-	u8 atchfrccalratio_e;
-	void (*power_on) (struct device *);
-	void (*power_off) (struct device *);
-	void (*register_cb) (void *);
-	void (*read_ta_status) (void *);
-	int num_fingers;
-	int gpio_read_done;
-	struct finger_info fingers[];
-};
-
-struct mxt540e_data *copy_data;
-static int mxt540e_enabled;
-static bool g_debug_switch;
-static u8 tsp_version_disp;
-static u8 threshold;
-static int firm_status_data;
-/* static bool deepsleep; */
-static int check_resume_err;
-static int check_resume_err_count;
-static int check_calibrate;
-static int config_dwork_flag;
-int16_t sumsize;
-int touch_is_pressed;
-EXPORT_SYMBOL(touch_is_pressed);
-
-struct class *sec_class;
-struct device *sec_touchscreen;
-
-static u8 firmware_latest = 0x13;
-static u8 build_latest = 0xAA;
-
-struct device *mxt540e_noise_test;
-/*
-	top_left, top_right, center, bottom_left, bottom_right
-*/
-unsigned int test_node[5] = { 443, 53, 253, 422, 32 };
-uint16_t qt_refrence_node[540] = { 0 };
-uint16_t qt_delta_node[540] = { 0 };
-
-static int read_mem(struct mxt540e_data *data, u16 reg, u8 len, u8 *buf)
-{
-	int ret;
-	u16 le_reg = cpu_to_le16(reg);
-	struct i2c_msg msg[2] = {
-		{
-		 .addr = data->client->addr,
-		 .flags = 0,
-		 .len = 2,
-		 .buf = (u8 *) &le_reg,
-		 },
-		{
-		 .addr = data->client->addr,
-		 .flags = I2C_M_RD,
-		 .len = len,
-		 .buf = buf,
-		 },
-	};
-
-	ret = i2c_transfer(data->client->adapter, msg, 2);
-	if (ret < 0) {
-		return ret;
-	}
-
-	return ret == 2 ? 0 : -EIO;
-
-}
-
-static int write_mem(struct mxt540e_data *data, u16 reg, u8 len, const u8 *buf)
-{
-	int ret;
-	u8 tmp[len + 2];
-
-	put_unaligned_le16(cpu_to_le16(reg), tmp);
-	memcpy(tmp + 2, buf, len);
-
-	ret = i2c_master_send(data->client, tmp, sizeof(tmp));
-
-	if (ret < 0)
-		return ret;
-
-	return ret == sizeof(tmp) ? 0 : -EIO;
-}
-
-static int mxt540e_reset(struct mxt540e_data *data)
-{
-	u8 buf = 1u;
-	return write_mem(data, data->cmd_proc + CMD_RESET_OFFSET, 1, &buf);
-}
-
-static int mxt540e_backup(struct mxt540e_data *data)
-{
-	u8 buf = 0x55u;
-	return write_mem(data, data->cmd_proc + CMD_BACKUP_OFFSET, 1, &buf);
-}
-
-static int get_object_info(struct mxt540e_data *data, u8 object_type,
-				u16 *size, u16 *address)
-{
-	int i;
-
-	for (i = 0; i < data->objects_len; i++) {
-		if (data->objects[i].object_type == object_type) {
-			*size = data->objects[i].size + 1;
-			*address = data->objects[i].i2c_address;
-			return 0;
-		}
-	}
-
-	return -ENODEV;
-}
-
-static int write_config(struct mxt540e_data *data, u8 type, const u8 * cfg)
-{
-	int ret;
-	u16 address = 0;
-	u16 size = 0;
-
-	ret = get_object_info(data, type, &size, &address);
-
-	if (size == 0 && address == 0)
-		return 0;
-	else
-		return write_mem(data, address, size, cfg);
-}
-
-static int check_instance(struct mxt540e_data *data, u8 object_type)
-{
-	int i;
-
-	for (i = 0; i < data->objects_len; i++) {
-		if (data->objects[i].object_type == object_type)
-			return data->objects[i].instances;
-	}
-	return 0;
-}
-
-static int init_write_config(struct mxt540e_data *data, u8 type, const u8 * cfg)
-{
-	int ret;
-	u16 address = 0;
-	u16 size = 0;
-	u8 *temp;
-	int instance_num;
-
-	ret = get_object_info(data, type, &size, &address);
-
-	if ((size == 0) || (address == 0))
-		return 0;
-
-	ret = write_mem(data, address, size, cfg);
-	instance_num = check_instance(data, type);
-	if (instance_num > 0) {
-		printk(KERN_DEBUG "[TSP] exist instance%d objects (%d)\n",
-			instance_num, type);
-		temp = kmalloc(size * instance_num * sizeof(u8), GFP_KERNEL);
-		memset(temp, 0, size * instance_num);
-		ret |= write_mem(data, address + size,
-			size * instance_num, temp);
-		if (ret < 0)
-			printk(KERN_ERR "[TSP] %s, %d Error!!\n", __func__,
-				__LINE__);
-		kfree(temp);
-	}
-	return ret;
-}
-
-static u32 crc24(u32 crc, u8 byte1, u8 byte2)
-{
-	static const u32 crcpoly = 0x80001B;
-	u32 res;
-	u16 data_word;
-
-	data_word = (((u16) byte2) << 8) | byte1;
-	res = (crc << 1) ^ (u32) data_word;
-
-	if (res & 0x1000000)
-		res ^= crcpoly;
-
-	return res;
-}
-
-static int calculate_infoblock_crc(struct mxt540e_data *data,
-					u32 *crc_pointer)
-{
-	u32 crc = 0;
-	u8 mem[7 + data->objects_len * 6];
-	int status;
-	int i;
-
-	status = read_mem(data, 0, sizeof(mem), mem);
-
-	if (status)
-		return status;
-
-	for (i = 0; i < sizeof(mem) - 1; i += 2)
-		crc = crc24(crc, mem[i], mem[i + 1]);
-
-	*crc_pointer = crc24(crc, mem[i], 0) & 0x00FFFFFF;
-
-	return 0;
-}
-
-/* mxt540e reconfigration */
-static void mxt_reconfigration_normal(struct work_struct *work)
-{
-	int error, id;
-	u16 size;
-
-	struct mxt540e_data *data =
-		container_of(work, struct mxt540e_data, config_dwork.work);
-	u16 obj_address = 0;
-	if (mxt540e_enabled) {
-		disable_irq(data->client->irq);
-
-		for (id = 0; id < MAX_FINGER_NUM; ++id) {
-			if (data->fingers[id].state == MXT540E_STATE_INACTIVE)
-				continue;
-			schedule_delayed_work(&data->config_dwork, HZ * 5);
-			printk(KERN_DEBUG "[TSP] touch pressed!! %s didn't execute!!\n",
-				__func__);
-			enable_irq(data->client->irq);
-			return;
-		}
-
-		get_object_info(data, GEN_ACQUISITIONCONFIG_T8, &size,
-				&obj_address);
-		error = write_mem(data, obj_address + 8, 1,
-			&data->atchfrccalthr_e);
-		if (error < 0)
-			printk(KERN_ERR "[TSP] %s, %d Error!!\n", __func__,
-				__LINE__);
-		error =
-			write_mem(data, obj_address + 9, 1,
-				&data->atchfrccalratio_e);
-		if (error < 0)
-			printk(KERN_ERR "[TSP] %s, %d Error!!\n", __func__,
-				__LINE__);
-		printk(KERN_DEBUG "[TSP] %s execute!!\n", __func__);
-		enable_irq(data->client->irq);
-	}
-	config_dwork_flag = 0;
-	return;
-}
-
-static void resume_check_dworker(struct work_struct *work)
-{
-	check_resume_err = 0;
-	check_resume_err_count = 0;
-}
-
-static void cal_check_dworker(struct work_struct *work)
-{
-	struct mxt540e_data *data =
-		container_of(work, struct mxt540e_data, cal_check_dwork.work);
-	int error;
-	u16 size;
-	u8 value;
-	u16 obj_address = 0;
-	if (mxt540e_enabled) {
-		check_calibrate = 0;
-		get_object_info(data, GEN_POWERCONFIG_T7, &size, &obj_address);
-		value = 50;
-		error = write_mem(data, obj_address + 2, 1, &value);
-		if (error < 0)
-			printk(KERN_ERR "[TSP] %s, %d Error!!\n", __func__,
-				__LINE__);
-	}
-	return;
-}
-
-uint8_t calibrate_chip(struct mxt540e_data *data)
-{
-	u8 cal_data = 1;
-	int ret = 0;
-	/* send calibration command to the chip */
-	ret = write_mem(data, data->cmd_proc + CMD_CALIBRATE_OFFSET, 1,
-		&cal_data);
-
-	if (!ret) {
-		printk(KERN_DEBUG "[TSP] calibration success!!!\n");
-		if (check_resume_err == 2) {
-			check_resume_err = 1;
-			schedule_delayed_work(&data->resume_check_dwork,
-					msecs_to_jiffies(2500));
-		} else if (check_resume_err == 1) {
-			cancel_delayed_work(&data->resume_check_dwork);
-			schedule_delayed_work(&data->resume_check_dwork,
-					msecs_to_jiffies(2500));
-		}
-	}
-	return ret;
-}
-
-static void mxt540e_ta_probe(int ta_status)
-{
-	u16 obj_address;
-	u16 size;
-	u8 value;
-	int error;
-	struct mxt540e_data *data = copy_data;
-
-	if (!mxt540e_enabled) {
-		printk(KERN_ERR "mxt540e_enabled is 0\n");
-		return;
-	}
-
-	data->median_error->err_cnt_ta = 0;
-	data->median_error->err_cnt_bat = 0;
-	data->median_error->setting_flag = 1;
-	data->median_error->table_cnt = 0;
-
-	error = 0;
-	obj_address = 0;
-	if (ta_status) {
-		get_object_info(data, SPT_CTECONFIG_T46, &size, &obj_address);
-		value = data->actvsyncsperx_charging;
-		error |= write_mem(data, obj_address + 3, 1, &value);
-		get_object_info(data, PROCG_NOISESUPPRESSION_T48, &size,
-				&obj_address);
-		error |=
-			write_config(data, data->t48_config_chrg_e[0],
-				data->t48_config_chrg_e + 1);
-		threshold = data->tchthr_charging;
-	} else {
-		get_object_info(data, TOUCH_MULTITOUCHSCREEN_T9, &size,
-				&obj_address);
-		value = 192;
-		error |= write_mem(data, obj_address + 6, 1, &value);
-		value = 50;
-		error |= write_mem(data, obj_address + 7, 1, &value);
-		value = 80;
-		error |= write_mem(data, obj_address + 13, 1, &value);
-		get_object_info(data, SPT_GENERICDATA_T57, &size, &obj_address);
-		value = 25;
-		error |= write_mem(data, obj_address + 1, 1, &value);
-		get_object_info(data, SPT_CTECONFIG_T46, &size, &obj_address);
-		value = data->actvsyncsperx_batt;
-		error |= write_mem(data, obj_address + 3, 1, &value);
-		get_object_info(data, PROCG_NOISESUPPRESSION_T48, &size,
-				&obj_address);
-		error |=
-			write_config(data, data->t48_config_batt_e[0],
-				data->t48_config_batt_e + 1);
-		threshold = data->tchthr_batt;
-	}
-	if (error < 0)
-		printk(KERN_ERR "[TSP] %s Error!!\n", __func__);
-};
-
-#if defined(DRIVER_FILTER)
-static void equalize_coordinate(bool detect, u8 id, u16 *px, u16 *py)
-{
-	static int tcount[MAX_FINGER_NUM] = { 0, };
-	static u16 pre_x[MAX_FINGER_NUM][4] = { {0}, };
-	static u16 pre_y[MAX_FINGER_NUM][4] = { {0}, };
-	int coff[4] = { 0, };
-	int distance = 0;
-
-	if (detect)
-		tcount[id] = 0;
-
-	pre_x[id][tcount[id] % 4] = *px;
-	pre_y[id][tcount[id] % 4] = *py;
-
-	if (tcount[id] > 3) {
-		distance =
-			abs(pre_x[id][(tcount[id] - 1) % 4] - *px) +
-			abs(pre_y[id][(tcount[id] - 1) % 4] - *py);
-
-		coff[0] = (u8)(2 + distance / 5);
-		if (coff[0] < 8) {
-			coff[0] = max(2, coff[0]);
-			coff[1] = min((8 - coff[0]), (coff[0] >> 1) + 1);
-			coff[2] = min((8 - coff[0] - coff[1]),
-					(coff[1] >> 1) + 1);
-			coff[3] = 8 - coff[0] - coff[1] - coff[2];
-
-			*px = (u16)((*px * (coff[0]) +
-				pre_x[id][(tcount[id] - 1) % 4] * (coff[1]) +
-				pre_x[id][(tcount[id] - 2) % 4] * (coff[2]) +
-				pre_x[id][(tcount[id] - 3) % 4] * (coff[3]))
-				/ 8);
-			*py = (u16)((*py * (coff[0]) +
-				pre_y[id][(tcount[id] - 1) % 4] * (coff[1]) +
-				pre_y[id][(tcount[id] - 2) % 4] * (coff[2]) +
-				pre_y[id][(tcount[id] - 3) % 4] * (coff[3]))
-				/ 8);
-		} else {
-			*px = (u16)((*px * 4 + pre_x[id][(tcount[id] - 1) % 4])
-				/ 5);
-			*py = (u16)((*py * 4 + pre_y[id][(tcount[id] - 1) % 4])
-				/ 5);
-		}
-	}
-	tcount[id]++;
-}
-#endif				/* DRIVER_FILTER */
-
-uint8_t reportid_to_type(struct mxt540e_data *data, u8 report_id, u8 * instance)
-{
-	struct report_id_map_t *report_id_map;
-	report_id_map = rid_map;
-
-	if (report_id <= max_report_id) {
-		*instance = report_id_map[report_id].instance;
-		return report_id_map[report_id].object_type;
-	} else
-		return 0;
-}
-
-static int mxt540e_init_touch_driver(struct mxt540e_data *data)
-{
-	struct object_t *object_table;
-	struct report_id_map_t *report_id_map_t;
-	u32 read_crc = 0;
-	u32 calc_crc;
-	u16 crc_address;
-	u16 dummy;
-	int i, j;
-	u8 id[ID_BLOCK_SIZE];
-	int ret;
-	u8 type_count = 0;
-	u8 tmp;
-	int current_report_id, start_report_id;
-
-	ret = read_mem(data, 0, sizeof(id), id);
-	if (ret) {
-		return ret;
-	}
-	dev_info(&data->client->dev, "family = %#02x, variant = %#02x, version "
-		"= %#02x, build = %d\n", id[0], id[1], id[2], id[3]);
-	printk(KERN_ERR "family = %#02x, variant = %#02x, version "
-		"= %#02x, build = %d\n", id[0], id[1], id[2], id[3]);
-	dev_dbg(&data->client->dev, "matrix X size = %d\n", id[4]);
-	dev_dbg(&data->client->dev, "matrix Y size = %d\n", id[5]);
-
-	data->family_id = id[0];
-	data->tsp_version = id[2];
-	data->tsp_build = id[3];
-	data->objects_len = id[6];
-
-	tsp_version_disp = data->tsp_version;
-
-	object_table = kmalloc(data->objects_len * sizeof(*object_table),
-				GFP_KERNEL);
-	if (!object_table)
-		return -ENOMEM;
-
-	ret = read_mem(data, OBJECT_TABLE_START_ADDRESS,
-			data->objects_len * sizeof(*object_table),
-			(u8 *) object_table);
-	if (ret)
-		goto err;
-
-	max_report_id = 0;
-
-	for (i = 0; i < data->objects_len; i++) {
-		object_table[i].i2c_address =
-			le16_to_cpu(object_table[i].i2c_address);
-		max_report_id +=
-			object_table[i].num_report_ids *
-			(object_table[i].instances + 1);
-		tmp = 0;
-		if (object_table[i].num_report_ids) {
-			tmp = type_count + 1;
-			type_count += object_table[i].num_report_ids *
-				(object_table[i].instances + 1);
-		}
-		switch (object_table[i].object_type) {
-		case TOUCH_MULTITOUCHSCREEN_T9:
-			data->finger_type = tmp;
-			dev_dbg(&data->client->dev, "Finger type = %d\n",
-				data->finger_type);
-			break;
-		case GEN_MESSAGEPROCESSOR_T5:
-			data->msg_object_size = object_table[i].size + 1;
-			dev_dbg(&data->client->dev, "Message object size = "
-				"%d\n", data->msg_object_size);
-			break;
-		}
-	}
-	if (rid_map_alloc) {
-		rid_map_alloc = false;
-		kfree(rid_map);
-	}
-	rid_map = kmalloc((sizeof(*report_id_map_t) * max_report_id + 1),
-			GFP_KERNEL);
-	if (!rid_map) {
-		kfree(object_table);
-		return -ENOMEM;
-	}
-	rid_map_alloc = true;
-	rid_map[0].instance = 0;
-	rid_map[0].object_type = 0;
-	current_report_id = 1;
-
-	for (i = 0; i < data->objects_len; i++) {
-		if (object_table[i].num_report_ids != 0) {
-			for (j = 0; j <= object_table[i].instances; j++) {
-				for (start_report_id = current_report_id;
-					current_report_id <
-					(start_report_id +
-					object_table[i].num_report_ids);
-					current_report_id++) {
-					rid_map[current_report_id].instance = j;
-					rid_map[current_report_id].object_type =
-						object_table[i].object_type;
-				}
-			}
-		}
-	}
-
-	data->objects = object_table;
-
-	/* Verify CRC */
-	crc_address = OBJECT_TABLE_START_ADDRESS +
-		data->objects_len * OBJECT_TABLE_ELEMENT_SIZE;
-
-#ifdef __BIG_ENDIAN
-#error The following code will likely break on a big endian machine
-#endif
-	ret = read_mem(data, crc_address, 3, (u8 *) &read_crc);
-	if (ret)
-		goto err;
-
-	read_crc = le32_to_cpu(read_crc);
-
-	ret = calculate_infoblock_crc(data, &calc_crc);
-	if (ret)
-		goto err;
-
-	if (read_crc != calc_crc) {
-		dev_err(&data->client->dev, "CRC error\n");
-		ret = -EFAULT;
-		goto err;
-	}
-
-	ret = get_object_info(data, GEN_MESSAGEPROCESSOR_T5, &dummy,
-				&data->msg_proc);
-	if (ret)
-		goto err;
-
-	ret = get_object_info(data, GEN_COMMANDPROCESSOR_T6, &dummy,
-				&data->cmd_proc);
-	if (ret)
-		goto err;
-
-	return 0;
-
- err:
-	kfree(object_table);
-	return ret;
-}
-
-static void resume_cal_err_func(struct mxt540e_data *data)
-{
-	int i;
-	bool ta_status;
-	int count;
-	u8 id[ID_BLOCK_SIZE];
-	int ret;
-	int retry;
-
-	printk(KERN_DEBUG "[TSP] %s\n", __func__);
-	cancel_delayed_work(&data->config_dwork);
-	cancel_delayed_work(&data->resume_check_dwork);
-	cancel_delayed_work(&data->cal_check_dwork);
-	data->power_off(&data->client->dev);
-
-	count = 0;
-	for (i = 0; i < data->num_fingers; i++) {
-		if (data->fingers[i].state == MXT540E_STATE_INACTIVE)
-			continue;
-		data->fingers[i].z = 0;
-		data->fingers[i].state = MXT540E_STATE_INACTIVE;
-
-		input_mt_slot(data->input_dev, i);
-		input_mt_report_slot_state(data->input_dev,
-				MT_TOOL_FINGER, false);
-
-#if 0
-#if defined(CONFIG_SHAPE_TOUCH)
-		if (get_sec_debug_level() != 0)
-			printk(KERN_DEBUG
-				"[TSP] id[%d],x=%d,y=%d,z=%d,w=%d,com=%d\n", i,
-				data->fingers[i].x, data->fingers[i].y,
-				data->fingers[i].z, data->fingers[i].w,
-				data->fingers[i].component);
-		else
-			printk(KERN_DEBUG "[TSP] id[%d] status:%d\n", i,
-				data->fingers[i].z);
-#else
-		if (get_sec_debug_level() != 0)
-			printk(KERN_DEBUG "[TSP] id[%d],x=%d,y=%d,z=%d,w=%d\n",
-				i, data->fingers[i].x, data->fingers[i].y,
-				data->fingers[i].z, data->fingers[i].w);
-		else
-			printk(KERN_DEBUG "[TSP] id[%d] status:%d\n", i,
-				data->fingers[i].z);
-#endif
-#else
-		if (data->fingers[i].z == 0)
-			printk(KERN_DEBUG "[TSP] released\n");
-		else
-			printk(KERN_DEBUG "[TSP] pressed\n");
-#endif
-		count++;
-	}
-
-	if (count)
-		input_sync(data->input_dev);
-	touch_is_pressed = 0;
-
-	msleep(50);
-	data->power_on(&data->client->dev);
-
-	ret = 0;
-	retry = 3;
-	ret = read_mem(data, 0, sizeof(id), id);
-	if (ret) {
-		while (retry--) {
-			printk(KERN_DEBUG "[TSP] chip boot failed. retry(%d)\n",
-				retry);
-
-			data->power_off(&data->client->dev);
-			msleep(200);
-			data->power_on(&data->client->dev);
-
-			ret = read_mem(data, 0, sizeof(id), id);
-			if (ret == 0 || retry <= 0)
-				break;
-		}
-	}
-
-	if (data->read_ta_status) {
-		data->read_ta_status(&ta_status);
-		printk(KERN_DEBUG "[TSP] ta_status is %d\n", ta_status);
-		mxt540e_ta_probe(ta_status);
-	}
-	check_resume_err = 2;
-	calibrate_chip(data);
-	check_calibrate = 3;
-	schedule_delayed_work(&data->config_dwork, HZ * 5);
-	config_dwork_flag = 3;
-}
-
-static void median_filter_err_func(struct mxt540e_data *data)
-{
-	struct median_error_t *median_error = data->median_error;
-	u16 obj_address = 0;
-	u16 size;
-	u8 value;
-	int error = 0;
-	bool ta_status = 0;
-
-	if (data->read_ta_status) {
-		data->read_ta_status(&ta_status);
-		printk(KERN_DEBUG "[TSP] ta_status is %d\n", ta_status);
-
-		if (ta_status) {
-			get_object_info(data, PROCG_NOISESUPPRESSION_T48,
-				&size, &obj_address);
-#if 0
-			value = 33;
-			error |= write_mem(data, obj_address + 3, 1, &value);
-#else
-			if (median_error->err_cnt_ta >= MEDIANERROR_MAX_TA) {
-				median_error->err_cnt_ta = 0;
-
-				median_error->table_cnt++;
-				if (median_error->table_cnt > 3)
-					median_error->table_cnt = 0;
-
-				value = median_error->table_ta
-					[median_error->table_cnt];
-				error |= write_mem(data, obj_address + 3,
-					1, &value);
-				printk(KERN_DEBUG "[TSP] median base_Freq_ta %d\n",
-					value);
-			} else {
-				median_error->err_cnt_ta++;
-				printk(KERN_DEBUG "[TSP] median error_cnt_ta %d\n",
-					median_error->err_cnt_ta);
-			}
-
-			if (median_error->setting_flag) {
-				median_error->setting_flag = 0;
-				value = median_error->table_ta[0];
-				error |= write_mem(data, obj_address + 3,
-					1, &value);
-			}
-#endif
-			value = 1;
-			error |= write_mem(data, obj_address + 8, 1, &value);
-
-			value = 2;
-			error |= write_mem(data, obj_address + 9, 1, &value);
-
-			value = 100;
-			error |= write_mem(data, obj_address + 17, 1, &value);
-
-			value = 20;
-			error |= write_mem(data, obj_address + 22, 1, &value);
-
-			value = 2;
-			error |= write_mem(data, obj_address + 23, 1, &value);
-
-			value = 46;
-			error |= write_mem(data, obj_address + 25, 1, &value);
-
-			value = 80;
-			error |= write_mem(data, obj_address + 34, 1, &value);
-
-			value = 35;
-			error |= write_mem(data, obj_address + 35, 1, &value);
-
-			value = 15;
-			error |= write_mem(data, obj_address + 37, 1, &value);
-
-			value = 5;
-			error |= write_mem(data, obj_address + 38, 1, &value);
-
-			value = 65;
-			error |= write_mem(data, obj_address + 39, 1, &value);
-
-			value = 30;
-			error |= write_mem(data, obj_address + 41, 1, &value);
-
-			value = 50;
-			error |= write_mem(data, obj_address + 42, 1, &value);
-
-			value = 7;
-			error |= write_mem(data, obj_address + 45, 1, &value);
-
-			value = 7;
-			error |= write_mem(data, obj_address + 46, 1, &value);
-
-			value = 40;
-			error |= write_mem(data, obj_address + 50, 1, &value);
-
-			value = 32;
-			error |= write_mem(data, obj_address + 51, 1, &value);
-
-			value = 15;
-			error |= write_mem(data, obj_address + 52, 1, &value);
-
-			get_object_info(data, SPT_CTECONFIG_T46,
-				&size, &obj_address);
-			value = 32;
-			error |= write_mem(data, obj_address + 3, 1, &value);
-
-			get_object_info(data, SPT_GENERICDATA_T57,
-					&size, &obj_address);
-			value = 22;
-			error |= write_mem(data, obj_address + 1, 1, &value);
-		} else {
-			get_object_info(data, TOUCH_MULTITOUCHSCREEN_T9,
-					&size, &obj_address);
-			value = 160;
-			error |= write_mem(data, obj_address + 6, 1, &value);
-
-			value = 45;
-			error |= write_mem(data, obj_address + 7, 1, &value);
-
-			value = 80;
-			error |= write_mem(data, obj_address + 13, 1, &value);
-
-			value = 3;
-			error |= write_mem(data, obj_address + 22, 1, &value);
-
-			value = 2;
-			error |= write_mem(data, obj_address + 24, 1, &value);
-
-			get_object_info(data, PROCG_NOISESUPPRESSION_T48,
-				&size, &obj_address);
-			value = 242;
-			error |= write_mem(data, obj_address + 2, 1, &value);
-#if 0
-			value = 20;
-			error |= write_mem(data, obj_address + 3, 1, &value);
-#else
-			if (median_error->err_cnt_bat >= MEDIANERROR_MAX_BAT) {
-				median_error->err_cnt_bat = 0;
-
-				median_error->table_cnt++;
-				if (median_error->table_cnt > 3)
-					median_error->table_cnt = 0;
-
-				value = median_error->table_bat
-					[median_error->table_cnt];
-				error |= write_mem(data, obj_address + 3,
-					1, &value);
-				printk(KERN_DEBUG "[TSP] median base_freq_bat %d\n",
-					value);
-			} else {
-				median_error->err_cnt_bat++;
-				printk(KERN_DEBUG "[TSP] median error_cnt_bat %d\n",
-					median_error->err_cnt_bat);
-			}
-
-			if (median_error->setting_flag) {
-				median_error->setting_flag = 0;
-				value = median_error->table_bat[0];
-				error |= write_mem(data, obj_address + 3,
-					1, &value);
-			}
-#endif
-			value = 100;
-			error |= write_mem(data, obj_address + 17, 1, &value);
-
-			value = 25;
-			error |= write_mem(data, obj_address + 22, 1, &value);
-
-			value = 46;
-			error |= write_mem(data, obj_address + 25, 1, &value);
-
-			value = 112;
-			error |= write_mem(data, obj_address + 34, 1, &value);
-
-			value = 35;
-			error |= write_mem(data, obj_address + 35, 1, &value);
-
-			value = 0;
-			error |= write_mem(data, obj_address + 39, 1, &value);
-
-			value = 40;
-			error |= write_mem(data, obj_address + 42, 1, &value);
-
-			get_object_info(data, SPT_CTECONFIG_T46,
-				&size, &obj_address);
-			value = 32;
-			error |= write_mem(data, obj_address + 3, 1, &value);
-
-			get_object_info(data, SPT_GENERICDATA_T57,
-				&size, &obj_address);
-			value = 15;
-			error |= write_mem(data, obj_address + 1, 1, &value);
-		}
-		if (error)
-			printk(KERN_ERR "[TSP] fail median filter err setting\n");
-		else
-			printk(KERN_DEBUG "[TSP] success median filter err setting\n");
-
-	} else {
-		get_object_info(data, PROCG_NOISESUPPRESSION_T48,
-			&size, &obj_address);
-		value = 0;
-		error |= write_mem(data, obj_address + 2, 1, &value);
-		msleep(20);
-		value = data->calcfg_batt_e;
-		error |= write_mem(data, obj_address + 2, 1, &value);
-		if (error)
-			printk(KERN_ERR "[TSP] failed to reenable CHRGON\n");
-		else
-			printk(KERN_DEBUG "[TSP] success reenable CHRGON\n");
-	}
-
-}
-
-static void calibration_check_func(struct mxt540e_data *data)
-{
-	u16 obj_address = 0;
-	u16 size;
-	u8 value;
-	int error;
-
-	if (check_calibrate == 3)
-		check_calibrate = 0;
-	else if (check_calibrate == 1) {
-		cancel_delayed_work(&data->cal_check_dwork);
-		schedule_delayed_work(&data->cal_check_dwork,
-			msecs_to_jiffies(1400));
-	} else {
-		check_calibrate = 1;
-		value = 6;
-		get_object_info(data, GEN_POWERCONFIG_T7,
-				&size, &obj_address);
-		error = write_mem(data, obj_address + 2, 1, &value);
-		if (error < 0)
-			printk(KERN_ERR "[TSP] %s, %d Error!!\n",
-				__func__, __LINE__);
-		schedule_delayed_work(&data->cal_check_dwork,
-				msecs_to_jiffies(1400));
-	}
-
-	if (config_dwork_flag == 3)
-		config_dwork_flag = 1;
-	else if (config_dwork_flag == 1) {
-		cancel_delayed_work(&data->config_dwork);
-		schedule_delayed_work(&data->config_dwork, HZ * 5);
-	} else {
-		config_dwork_flag = 1;
-		get_object_info(data, GEN_ACQUISITIONCONFIG_T8,
-				&size, &obj_address);
-		value = 8;
-		error = write_mem(data, obj_address + 8, 1, &value);
-		value = 180;
-		error |= write_mem(data, obj_address + 9, 1, &value);
-		if (error < 0)
-			printk(KERN_ERR "[TSP] %s, %d Error!!\n",
-				__func__, __LINE__);
-		schedule_delayed_work(&data->config_dwork, HZ * 5);
-	}
-
-}
-
-static void report_input_data(struct mxt540e_data *data)
-{
-	int i;
-	int count = 0;
-	int report_count = 0;
-	int press_count = 0;
-	int move_count = 0;
-
-	for (i = 0; i < data->num_fingers; i++) {
-		if (data->fingers[i].state == MXT540E_STATE_INACTIVE)
-			continue;
-
-		if (data->fingers[i].state == MXT540E_STATE_RELEASE) {
-			input_mt_slot(data->input_dev, i);
-			input_mt_report_slot_state(data->input_dev,
-						MT_TOOL_FINGER, false);
-		} else {
-			input_mt_slot(data->input_dev, i);
-			input_mt_report_slot_state(data->input_dev,
-						MT_TOOL_FINGER, true);
-			input_report_abs(data->input_dev, ABS_MT_POSITION_X,
-					 data->fingers[i].x);
-			input_report_abs(data->input_dev, ABS_MT_POSITION_Y,
-					 data->fingers[i].y);
-			input_report_abs(data->input_dev, ABS_MT_TOUCH_MAJOR,
-					 data->fingers[i].z);
-			input_report_abs(data->input_dev, ABS_MT_PRESSURE,
-					 data->fingers[i].w);
-			dev_dbg(&data->client->dev, "%s X : %d\n", __func__, data->fingers[i].x);
-			dev_dbg(&data->client->dev, "%s Y: %d\n", __func__, data->fingers[i].y);
-			dev_dbg(&data->client->dev, "%s Z: %d\n", __func__, data->fingers[i].z);
-			dev_dbg(&data->client->dev, "%s W: %d\n", __func__, data->fingers[i].w);
-#if 0
-			input_report_abs(data->input_dev, ABS_MT_COMPONENT,
-					 data->fingers[i].component);
-			input_report_abs(data->input_dev, ABS_MT_SUMSIZE,
-					 sumsize);
-#endif
-		}
-		report_count++;
-
-		if (data->fingers[i].state == MXT540E_STATE_PRESS
-			|| data->fingers[i].state == MXT540E_STATE_RELEASE) {
-#if 0
-			printk(KERN_DEBUG
-				"[TSP] id[%d],x=%d,y=%d,z=%d,w=%d,com=%d\n", i,
-				data->fingers[i].x, data->fingers[i].y,
-				data->fingers[i].z, data->fingers[i].w,
-				data->fingers[i].component);
-#else
-#endif
-		}
-
-		if (check_resume_err != 0) {
-			if (data->fingers[i].state == MXT540E_STATE_MOVE)
-				move_count++;
-			if (data->fingers[i].state == MXT540E_STATE_PRESS)
-				press_count++;
-		}
-
-		if (data->fingers[i].state == MXT540E_STATE_RELEASE) {
-			data->fingers[i].state = MXT540E_STATE_INACTIVE;
-		} else {
-			data->fingers[i].state = MXT540E_STATE_MOVE;
-			count++;
-		}
-	}
-	if (report_count > 0)
-		input_sync(data->input_dev);
-
-	if (count)
-		touch_is_pressed = 1;
-	else
-		touch_is_pressed = 0;
-
-	if (count == 0) {
-		sumsize = 0;
-	}
-	data->finger_mask = 0;
-
-	if (check_resume_err != 0) {
-		if ((press_count > 0) && (move_count > 0)) {
-			check_resume_err_count++;
-			if (check_resume_err_count > 4) {
-				check_resume_err_count = 0;
-				resume_cal_err_func(data);
-			}
-		}
-	}
-
-	if (check_calibrate == 1) {
-		if (touch_is_pressed)
-			cancel_delayed_work(&data->cal_check_dwork);
-		else
-			schedule_delayed_work(&data->cal_check_dwork,
-					msecs_to_jiffies(1400));
-	}
-}
-
-static int mxt540e_irq_state(struct mxt540e_data *data)
-{
-	if (data->irqf_trigger_type == IRQF_TRIGGER_HIGH)
-		return gpio_get_value(data->gpio_read_done);
-	else
-		return !gpio_get_value(data->gpio_read_done);
-}
-
-static irqreturn_t mxt540e_irq_thread(int irq, void *ptr)
-{
-	struct mxt540e_data *data = ptr;
-	int id;
-	u8 msg[data->msg_object_size];
-	u8 touch_message_flag = 0;
-	u8 object_type, instance;
-
-	do {
-		touch_message_flag = 0;
-		if (read_mem(data, data->msg_proc, sizeof(msg), msg)) {
-			return IRQ_HANDLED;
-		}
-
-		object_type = reportid_to_type(data, msg[0], &instance);
-
-		if (object_type == GEN_COMMANDPROCESSOR_T6) {
-			if (msg[1] == 0x00) {	/* normal mode */
-				printk(KERN_DEBUG "[TSP] normal mode\n");
-			}
-			if ((msg[1] & 0x04) == 0x04) {	/* I2C checksum error */
-				printk(KERN_DEBUG "[TSP] I2C checksum error\n");
-			}
-			if ((msg[1] & 0x08) == 0x08) {	/* config error */
-				printk(KERN_DEBUG "[TSP] config error\n");
-			}
-			if ((msg[1] & 0x10) == 0x10) {	/* calibration */
-				printk(KERN_DEBUG "[TSP] calibration is on going\n");
-				calibration_check_func(data);
-			}
-			if ((msg[1] & 0x20) == 0x20) {	/* signal error */
-				printk(KERN_DEBUG "[TSP] signal error\n");
-			}
-			if ((msg[1] & 0x40) == 0x40) {	/* overflow */
-				printk(KERN_DEBUG "[TSP] overflow detected\n");
-			}
-			if ((msg[1] & 0x80) == 0x80) {	/* reset */
-				printk(KERN_DEBUG "[TSP] reset is ongoing\n");
-			}
-		}
-
-		if (object_type == PROCI_TOUCHSUPPRESSION_T42) {
-			if ((msg[1] & 0x01) == 0x00) {	/* Palm release */
-				printk(KERN_DEBUG "[TSP] palm touch released\n");
-				touch_is_pressed = 0;
-			} else if ((msg[1] & 0x01) == 0x01) {	/* Palm Press */
-				printk(KERN_DEBUG "[TSP] palm touch detected\n");
-				touch_is_pressed = 1;
-				touch_message_flag = 1;
-			}
-		}
-
-		if (object_type == SPT_GENERICDATA_T57)
-			sumsize = msg[1] + (msg[2] << 8);
-
-		if (object_type == PROCG_NOISESUPPRESSION_T48) {
-			if (msg[4] == 5) {	/* Median filter error */
-				printk(KERN_DEBUG "[TSP] Median filter Error\n");
-				median_filter_err_func(data);
-			}
-		}
-
-		if (object_type == TOUCH_MULTITOUCHSCREEN_T9) {
-			id = msg[0] - data->finger_type;
-
-			/* If not a touch event, then keep going */
-			if (id < 0 || id >= data->num_fingers)
-				continue;
-
-			if (data->finger_mask & (1U << id))
-				report_input_data(data);
-
-			if (msg[1] & RELEASE_MSG_MASK) {
-				data->fingers[id].z = 0;
-				data->fingers[id].w = msg[5];
-				data->finger_mask |= 1U << id;
-				data->fingers[id].state = MXT540E_STATE_RELEASE;
-			} else if ((msg[1] & DETECT_MSG_MASK) &&
-				(msg[1] & (PRESS_MSG_MASK | MOVE_MSG_MASK))) {
-				touch_message_flag = 1;
-				data->fingers[id].component = msg[7];
-				data->fingers[id].z = msg[6];
-				data->fingers[id].w = msg[5];
-				data->fingers[id].x =
-					((msg[2] << 4) | (msg[4] >> 4)) >>
-					data->x_dropbits;
-				data->fingers[id].y =
-					((msg[3] << 4) | (msg[4] & 0xF)) >>
-					data->y_dropbits;
-				data->finger_mask |= 1U << id;
-#if defined(DRIVER_FILTER)
-				if (msg[1] & PRESS_MSG_MASK) {
-					equalize_coordinate(1, id,
-						&data->fingers[id].x,
-						&data->fingers[id].y);
-					data->fingers[id].state =
-						MXT540E_STATE_PRESS;
-				} else if (msg[1] & MOVE_MSG_MASK) {
-					equalize_coordinate(0, id,
-						&data->fingers[id].x,
-						&data->fingers[id].y);
-				}
-#else
-				if (msg[1] & PRESS_MSG_MASK) {
-					data->fingers[id].state =
-						MXT540E_STATE_PRESS;
-				}
-#endif
-
-				data->fingers[id].component = msg[7];
-
-
-			} else if ((msg[1] & SUPPRESS_MSG_MASK)
-				&& (data->fingers[id].state !=
-					MXT540E_STATE_INACTIVE)) {
-				data->fingers[id].z = 0;
-				data->fingers[id].w = msg[5];
-				data->fingers[id].state = MXT540E_STATE_RELEASE;
-				data->finger_mask |= 1U << id;
-			} else {
-				dev_dbg(&data->client->dev,
-					"Unknown state %#02x %#02x\n", msg[0],
-					msg[1]);
-				continue;
-			}
-		}
-	} while (mxt540e_irq_state(data));
-
-	if (data->finger_mask)
-		report_input_data(data);
-
-	return IRQ_HANDLED;
-}
-
-#if 0
-static void mxt540e_deepsleep(struct mxt540e_data *data)
-{
-	u8 power_cfg[3] = { 0, };
-	write_config(data, GEN_POWERCONFIG_T7, power_cfg);
-	deepsleep = 1;
-}
-#endif
-static void mxt540e_wakeup(struct mxt540e_data *data)
-{
-	write_config(data, GEN_POWERCONFIG_T7, data->power_cfg);
-}
-
-static int mxt540e_internal_suspend(struct mxt540e_data *data)
-{
-	int i;
-	cancel_delayed_work(&data->config_dwork);
-	cancel_delayed_work(&data->resume_check_dwork);
-	cancel_delayed_work(&data->cal_check_dwork);
-
-	for (i = 0; i < data->num_fingers; i++) {
-		if (data->fingers[i].state == MXT540E_STATE_INACTIVE)
-			continue;
-		data->fingers[i].z = 0;
-		data->fingers[i].state = MXT540E_STATE_RELEASE;
-	}
-	report_input_data(data);
-/*
-	if (!deepsleep)
-		data->power_off_with_oleddet();
-*/
-	return 0;
-}
-
-static int mxt540e_internal_resume(struct mxt540e_data *data)
-{
-/*
-	if (!deepsleep)
-		data->power_on_with_oleddet();
-	else
-*/
-		mxt540e_wakeup(data);
-#if 0
-	calibrate_chip(data);
-	schedule_delayed_work(&data->config_dwork, HZ * 5);
-#endif
-	return 0;
-}
-
-void Mxt540e_force_released(void)
-{
-	struct mxt540e_data *data = copy_data;
-	int i;
-
-	if (!mxt540e_enabled) {
-		printk(KERN_ERR "[TSP] mxt540e_enabled is 0\n");
-		return;
-	}
-
-	for (i = 0; i < data->num_fingers; i++) {
-		if (data->fingers[i].state == MXT540E_STATE_INACTIVE)
-			continue;
-		data->fingers[i].z = 0;
-		data->fingers[i].state = MXT540E_STATE_RELEASE;
-	}
-	report_input_data(data);
-	calibrate_chip(data);
-};
-EXPORT_SYMBOL(Mxt540e_force_released);
-
-static ssize_t mxt540e_debug_setting(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	g_debug_switch = !g_debug_switch;
-	return 0;
-}
-
-static ssize_t mxt540e_object_setting(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct mxt540e_data *data = dev_get_drvdata(dev);
-	unsigned int object_type;
-	unsigned int object_register;
-	unsigned int register_value;
-	u8 value;
-	u8 val;
-	int ret;
-	u16 address;
-	u16 size;
-	sscanf(buf, "%u%u%u", &object_type, &object_register, &register_value);
-	printk(KERN_ERR "[TSP] object type T%d", object_type);
-	printk(KERN_ERR "[TSP] object register ->Byte%d\n", object_register);
-	printk(KERN_ERR "[TSP] register value %d\n", register_value);
-	ret = get_object_info(data, (u8) object_type, &size, &address);
-	if (ret) {
-		printk(KERN_ERR "[TSP] fail to get object_info\n");
-		return count;
-	}
-
-	size = 1;
-	value = (u8) register_value;
-	write_mem(data, address + (u16) object_register, size, &value);
-	read_mem(data, address + (u16) object_register, (u8) size, &val);
-
-	printk(KERN_ERR "[TSP] T%d Byte%d is %d\n", object_type,
-		object_register, val);
-	return count;
-}
-
-static ssize_t mxt540e_object_show(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct mxt540e_data *data = dev_get_drvdata(dev);
-	unsigned int object_type;
-	u8 val;
-	int ret;
-	u16 address;
-	u16 size;
-	u16 i;
-	sscanf(buf, "%u", &object_type);
-	printk(KERN_DEBUG "[TSP] object type T%d\n", object_type);
-	ret = get_object_info(data, (u8) object_type, &size, &address);
-	if (ret) {
-		printk(KERN_ERR "[TSP] fail to get object_info\n");
-		return count;
-	}
-	for (i = 0; i < size; i++) {
-		read_mem(data, address + i, 1, &val);
-		printk(KERN_DEBUG "[TSP] Byte %u --> %u\n", i, val);
-	}
-	return count;
-}
-
-int get_tsp_status(void)
-{
-	return touch_is_pressed;
-}
-
-void diagnostic_chip(u8 mode)
-{
-	int error;
-	u16 t6_address = 0;
-	u16 size_one;
-	int ret;
-
-	ret = get_object_info(copy_data, GEN_COMMANDPROCESSOR_T6,
-			&size_one, &t6_address);
-
-	size_one = 1;
-	error = write_mem(copy_data, t6_address + 5, (u8) size_one, &mode);
-
-	if (error < 0)
-		printk(KERN_ERR "[TSP] error %s: write_object\n", __func__);
-}
-
-uint8_t read_uint16_t(struct mxt540e_data *data, uint16_t address,
-		uint16_t *buf)
-{
-	uint8_t status;
-	uint8_t temp[2];
-
-	status = read_mem(data, address, 2, temp);
-	*buf = ((uint16_t) temp[1] << 8) + (uint16_t) temp[0];
-
-	return status;
-}
-
-void read_dbg_data(uint8_t dbg_mode, uint16_t node, uint16_t *dbg_data)
-{
-	u8 read_page, read_point;
-	uint8_t mode, page;
-	u16 size;
-	u16 diagnostic_addr = 0;
-
-	if (!mxt540e_enabled) {
-		printk(KERN_ERR "[TSP ]read_dbg_data. mxt540e_enabled is 0\n");
-		return;
-	}
-
-	get_object_info(copy_data, DEBUG_DIAGNOSTIC_T37, &size,
-			&diagnostic_addr);
-
-	read_page = node / 64;
-	node %= 64;
-	read_point = (node * 2) + 2;
-
-	/* Page Num Clear */
-	diagnostic_chip(MXT_CTE_MODE);
-	msleep(20);
-
-	do {
-		if (read_mem(copy_data, diagnostic_addr, 1, &mode)) {
-			printk(KERN_INFO "[TSP] READ_MEM_FAILED\n");
-			return;
-		}
-	} while (mode != MXT_CTE_MODE);
-
-	diagnostic_chip(dbg_mode);
-	msleep(20);
-
-	do {
-		if (read_mem(copy_data, diagnostic_addr, 1, &mode)) {
-			printk(KERN_INFO "[TSP] READ_MEM_FAILED\n");
-			return;
-		}
-	} while (mode != dbg_mode);
-
-	for (page = 1; page <= read_page; page++) {
-		diagnostic_chip(MXT_PAGE_UP);
-		msleep(20);
-		do {
-			if (read_mem(copy_data, diagnostic_addr + 1, 1,
-				&mode)) {
-				printk(KERN_INFO "[TSP] READ_MEM_FAILED\n");
-				return;
-			}
-		} while (mode != page);
-	}
-
-	if (read_uint16_t(copy_data, diagnostic_addr + read_point, dbg_data)) {
-		printk(KERN_INFO "[TSP] READ_MEM_FAILED\n");
-		return;
-	}
-}
-
-#define MIN_VALUE 19744
-#define MAX_VALUE 28864
-
-int read_all_data(uint16_t dbg_mode)
-{
-	u8 read_page, read_point;
-	u16 max_value = MIN_VALUE, min_value = MAX_VALUE;
-	u16 object_address = 0;
-	u8 data_buffer[2] = { 0 };
-	u8 node = 0;
-	int state = 0;
-	int num = 0;
-	int ret;
-	u16 size;
-
-	/* Page Num Clear */
-	diagnostic_chip(MXT_CTE_MODE);
-	msleep(30);
-
-	diagnostic_chip(dbg_mode);
-	msleep(30);
-
-	ret = get_object_info(copy_data, DEBUG_DIAGNOSTIC_T37,
-			&size, &object_address);
-	msleep(50);
-
-	for (read_page = 0; read_page < 9; read_page++) {
-		for (node = 0; node < 64; node++) {
-			read_point = (node * 2) + 2;
-			read_mem(copy_data, object_address + (u16) read_point,
-				 2, data_buffer);
-			qt_refrence_node[num] =
-				((uint16_t) data_buffer[1] << 8) +
-				(uint16_t) data_buffer[0];
-#ifdef CONFIG_MACH_Q1_BD
-			/* q1 use x=16 line, y=26 line */
-			if ((num % 30 == 26) || (num % 30 == 27)
-				|| (num % 30 == 28) || (num % 30 == 29)) {
-				num++;
-				if (num == 480)
-					break;
-				else
-					continue;
-			}
-#endif
-			if ((qt_refrence_node[num] < MIN_VALUE)
-				|| (qt_refrence_node[num] > MAX_VALUE)) {
-				state = 1;
-				printk(KERN_ERR
-					"[TSP] Mxt540E qt_refrence_node[%3d] = %5d\n",
-					num, qt_refrence_node[num]);
-			}
-
-			if (data_buffer[0] != 0) {
-				if (qt_refrence_node[num] > max_value)
-					max_value = qt_refrence_node[num];
-				if (qt_refrence_node[num] < min_value)
-					min_value = qt_refrence_node[num];
-			}
-			num++;
-#ifdef CONFIG_MACH_Q1_BD
-			if (num == 480)
-				break;
-#endif
-			/* all node => 18 * 30 = 540 => (8page * 64) + 28 */
-			if ((read_page == 8) && (node == 28))
-				break;
-		}
-		diagnostic_chip(MXT_PAGE_UP);
-		msleep(35);
-#ifdef CONFIG_MACH_Q1_BD
-		if (num == 480)
-			break;
-#endif
-	}
-
-	if ((max_value - min_value) > 4500) {
-		printk(KERN_ERR
-			"[TSP] diff = %d, max_value = %d, min_value = %d\n",
-			(max_value - min_value), max_value, min_value);
-		state = 1;
-	}
-
-	return state;
-}
-
-int read_all_delta_data(uint16_t dbg_mode)
-{
-	u8 read_page, read_point;
-	u16 object_address = 0;
-	u8 data_buffer[2] = { 0 };
-	u8 node = 0;
-	int state = 0;
-	int num = 0;
-	int ret;
-	u16 size;
-
-	/* Page Num Clear */
-	diagnostic_chip(MXT_CTE_MODE);
-	msleep(30);
-
-	diagnostic_chip(dbg_mode);
-	msleep(30);
-
-	ret = get_object_info(copy_data, DEBUG_DIAGNOSTIC_T37,
-			&size, &object_address);
-	msleep(50);
-
-	for (read_page = 0; read_page < 9; read_page++) {
-		for (node = 0; node < 64; node++) {
-			read_point = (node * 2) + 2;
-			read_mem(copy_data, object_address + (u16) read_point,
-				 2, data_buffer);
-			qt_delta_node[num] =
-				((uint16_t) data_buffer[1] << 8) +
-				(uint16_t) data_buffer[0];
-
-			num++;
-
-			/* all node => 18 * 30 = 540 => (8page * 64) + 28 */
-			if ((read_page == 8) && (node == 28))
-				break;
-		}
-		diagnostic_chip(MXT_PAGE_UP);
-		msleep(35);
-	}
-
-	return state;
-}
-
-static int mxt540e_check_bootloader(struct i2c_client *client,
-		unsigned int state)
-{
-	u8 val;
-	u8 temp;
-
- recheck:
-	if (i2c_master_recv(client, &val, 1) != 1) {
-		dev_err(&client->dev, "%s: i2c recv failed\n", __func__);
-		return -EIO;
-	}
-
-	if (val & 0x20) {
-
-		if (i2c_master_recv(client, &temp, 1) != 1) {
-			dev_err(&client->dev, "%s: i2c recv failed\n",
-				__func__);
-			return -EIO;
-		}
-
-		if (i2c_master_recv(client, &temp, 1) != 1) {
-			dev_err(&client->dev, "%s: i2c recv failed\n",
-				__func__);
-			return -EIO;
-		}
-
-		val &= ~0x20;
-	}
-
-	if ((val & 0xF0) == MXT540E_APP_CRC_FAIL) {
-		printk(KERN_DEBUG "[TOUCH] MXT540E_APP_CRC_FAIL\n");
-		if (i2c_master_recv(client, &val, 1) != 1) {
-			dev_err(&client->dev, "%s: i2c recv failed\n",
-				__func__);
-			return -EIO;
-		}
-
-		if (val & 0x20) {
-			if (i2c_master_recv(client, &temp, 1) != 1) {
-				dev_err(&client->dev, "%s: i2c recv failed\n",
-					__func__);
-				return -EIO;
-			}
-
-			if (i2c_master_recv(client, &temp, 1) != 1) {
-				dev_err(&client->dev, "%s: i2c recv failed\n",
-					__func__);
-				return -EIO;
-			}
-
-			val &= ~0x20;
-		}
-	}
-
-	switch (state) {
-	case MXT540E_WAITING_BOOTLOAD_CMD:
-	case MXT540E_WAITING_FRAME_DATA:
-		val &= ~MXT540E_BOOT_STATUS_MASK;
-		break;
-	case MXT540E_FRAME_CRC_PASS:
-		if (val == MXT540E_FRAME_CRC_CHECK)
-			goto recheck;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (val != state) {
-		dev_err(&client->dev, "Unvalid bootloader mode state\n");
-		printk(KERN_ERR "[TSP] Unvalid bootloader mode state\n");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int mxt540e_unlock_bootloader(struct i2c_client *client)
-{
-	u8 buf[2];
-
-	buf[0] = MXT540E_UNLOCK_CMD_LSB;
-	buf[1] = MXT540E_UNLOCK_CMD_MSB;
-
-	if (i2c_master_send(client, buf, 2) != 2) {
-		dev_err(&client->dev, "%s: i2c send failed\n", __func__);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int mxt540e_fw_write(struct i2c_client *client,
-		const u8 *data, unsigned int frame_size)
-{
-	if (i2c_master_send(client, data, frame_size) != frame_size) {
-		dev_err(&client->dev, "%s: i2c send failed\n", __func__);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int mxt540e_load_fw(struct device *dev, const char *fn)
-{
-	struct mxt540e_data *data = copy_data;
-	struct i2c_client *client = copy_data->client;
-	const struct firmware *fw = NULL;
-	unsigned int frame_size;
-	unsigned int pos = 0;
-	int ret;
-	u16 obj_address = 0;
-	u16 size_one;
-	u8 value;
-	unsigned int object_register;
-	int check_frame_crc_error = 0;
-	int check_wating_frame_data_error = 0;
-
-	printk(KERN_DEBUG "[TSP] mxt540e_load_fw start!!!\n");
-
-	ret = request_firmware(&fw, fn, &client->dev);
-	if (ret) {
-		dev_err(dev, "Unable to open firmware %s\n", fn);
-		printk(KERN_ERR "[TSP] Unable to open firmware %s\n", fn);
-		return ret;
-	}
-
-	/* Change to the bootloader mode */
-	object_register = 0;
-	value = (u8) MXT540E_BOOT_VALUE;
-	ret = get_object_info(data, GEN_COMMANDPROCESSOR_T6,
-			&size_one, &obj_address);
-	if (ret) {
-		printk(KERN_ERR "[TSP] fail to get object_info\n");
-		release_firmware(fw);
-		return ret;
-	}
-	size_one = 1;
-	write_mem(data, obj_address + (u16) object_register, (u8) size_one,
-			&value);
-	msleep(MXT540E_SW_RESET_TIME);
-
-	/* Change to slave address of bootloader */
-#if 0
-	printk("Client add : 0x%x\n", client->addr);
-	if (client->addr == MXT540E_APP_LOW)
-		client->addr = MXT540E_BOOT_LOW;
-	else
-		client->addr = MXT540E_BOOT_HIGH;
-#endif
-
-	ret = mxt540e_check_bootloader(client, MXT540E_WAITING_BOOTLOAD_CMD);
-	if (ret)
-		goto out;
-
-	/* Unlock bootloader */
-	mxt540e_unlock_bootloader(client);
-
-	while (pos < fw->size) {
-		ret = mxt540e_check_bootloader(client,
-					MXT540E_WAITING_FRAME_DATA);
-		if (ret) {
-			check_wating_frame_data_error++;
-			if (check_wating_frame_data_error > 10) {
-				printk(KERN_ERR
-					"[TSP] firm update fail. wating_frame_data err\n");
-				goto out;
-			} else {
-				printk(KERN_ERR
-					"[TSP]check_wating_frame_data_error = %d, "
-					"retry\n",
-					check_wating_frame_data_error);
-				continue;
-			}
-		}
-
-		frame_size = ((*(fw->data + pos) << 8) | *(fw->data + pos + 1));
-
-		/* We should add 2 at frame size as the the firmware data is not
-		 * included the CRC bytes.
-		 */
-		frame_size += 2;
-
-		/* Write one frame to device */
-		mxt540e_fw_write(client, fw->data + pos, frame_size);
-
-		ret = mxt540e_check_bootloader(client, MXT540E_FRAME_CRC_PASS);
-		if (ret) {
-			check_frame_crc_error++;
-			if (check_frame_crc_error > 10) {
-				printk(KERN_ERR
-					"[TSP] firm update fail. frame_crc err\n");
-				goto out;
-			} else {
-				printk(KERN_ERR
-					"[TSP]check_frame_crc_error = %d, "
-					"retry\n",
-					check_frame_crc_error);
-				continue;
-			}
-		}
-
-		pos += frame_size;
-
-		dev_dbg(dev, "Updated %d bytes / %zd bytes\n", pos, fw->size);
-		printk(KERN_DEBUG "[TSP] Updated %d bytes / %zd bytes\n",
-			pos, fw->size);
-
-		msleep(20);
-	}
-
- out:
-	release_firmware(fw);
-
-	/* Change to slave address of application */
-#if 0
-	if (client->addr == MXT540E_BOOT_LOW)
-		client->addr = MXT540E_APP_LOW;
-	else
-		client->addr = MXT540E_APP_HIGH;
-#endif
-	return ret;
-}
-
-#if 0
-static int mxt540e_load_fw_bootmode(struct device *dev, const char *fn)
-{
-	struct i2c_client *client = copy_data->client;
-	const struct firmware *fw = NULL;
-	unsigned int frame_size;
-	unsigned int pos = 0;
-	int ret;
-	int check_frame_crc_error = 0;
-	int check_wating_frame_data_error = 0;
-
-	printk(KERN_DEBUG "[TSP] mxt540e_load_fw start!!!\n");
-
-	ret = request_firmware(&fw, fn, &client->dev);
-	if (ret) {
-		dev_err(dev, "Unable to open firmware %s\n", fn);
-		printk(KERN_ERR "[TSP] Unable to open firmware %s\n", fn);
-		return ret;
-	}
-
-	/* Unlock bootloader */
-	mxt540e_unlock_bootloader(client);
-
-	while (pos < fw->size) {
-		ret = mxt540e_check_bootloader(client,
-					MXT540E_WAITING_FRAME_DATA);
-		if (ret) {
-			check_wating_frame_data_error++;
-			if (check_wating_frame_data_error > 10) {
-				printk(KERN_ERR
-					"[TSP] firm update fail. wating_frame_data err\n");
-				goto out;
-			} else {
-				printk(KERN_ERR
-					"[TSP]check_wating_frame_data_error = %d, "
-					"retry\n",
-					check_wating_frame_data_error);
-				continue;
-			}
-		}
-
-		frame_size = ((*(fw->data + pos) << 8) | *(fw->data + pos + 1));
-
-		/* We should add 2 at frame size as the the firmware data is not
-		 * included the CRC bytes.
-		 */
-		frame_size += 2;
-
-		/* Write one frame to device */
-		mxt540e_fw_write(client, fw->data + pos, frame_size);
-
-		ret = mxt540e_check_bootloader(client, MXT540E_FRAME_CRC_PASS);
-		if (ret) {
-			check_frame_crc_error++;
-			if (check_frame_crc_error > 10) {
-				printk(KERN_ERR
-					"[TSP] firm update fail. frame_crc err\n");
-				goto out;
-			} else {
-				printk(KERN_ERR
-					"[TSP]check_frame_crc_error = %d, "
-					"retry\n",
-					check_frame_crc_error);
-				continue;
-			}
-		}
-
-		pos += frame_size;
-
-		dev_dbg(dev, "Updated %d bytes / %zd bytes\n", pos, fw->size);
-		printk(KERN_DEBUG "[TSP] Updated %d bytes / %zd bytes\n",
-			pos, fw->size);
-
-		msleep(20);
-	}
-
- out:
-	release_firmware(fw);
-
-	/* Change to slave address of application */
-#if 0
-	if (client->addr == MXT540E_BOOT_LOW)
-		client->addr = MXT540E_APP_LOW;
-	else
-		client->addr = MXT540E_APP_HIGH;
-#endif
-	return ret;
-}
-#endif
-
-static ssize_t set_refer0_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_reference = 0;
-	read_dbg_data(MXT_REFERENCE_MODE, test_node[0], &mxt_reference);
-	return sprintf(buf, "%u\n", mxt_reference);
-}
-
-static ssize_t set_refer1_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_reference = 0;
-	read_dbg_data(MXT_REFERENCE_MODE, test_node[1], &mxt_reference);
-	return sprintf(buf, "%u\n", mxt_reference);
-}
-
-static ssize_t set_refer2_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_reference = 0;
-	read_dbg_data(MXT_REFERENCE_MODE, test_node[2], &mxt_reference);
-	return sprintf(buf, "%u\n", mxt_reference);
-}
-
-static ssize_t set_refer3_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_reference = 0;
-	read_dbg_data(MXT_REFERENCE_MODE, test_node[3], &mxt_reference);
-	return sprintf(buf, "%u\n", mxt_reference);
-}
-
-static ssize_t set_refer4_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_reference = 0;
-	read_dbg_data(MXT_REFERENCE_MODE, test_node[4], &mxt_reference);
-	return sprintf(buf, "%u\n", mxt_reference);
-}
-
-static ssize_t set_delta0_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_delta = 0;
-	read_dbg_data(MXT_DELTA_MODE, test_node[0], &mxt_delta);
-	if (mxt_delta < 32767)
-		return sprintf(buf, "%u\n", mxt_delta);
-	else
-		mxt_delta = 65535 - mxt_delta;
-
-	if (mxt_delta)
-		return sprintf(buf, "-%u\n", mxt_delta);
-	else
-		return sprintf(buf, "%u\n", mxt_delta);
-}
-
-static ssize_t set_delta1_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_delta = 0;
-	read_dbg_data(MXT_DELTA_MODE, test_node[1], &mxt_delta);
-	if (mxt_delta < 32767)
-		return sprintf(buf, "%u\n", mxt_delta);
-	else
-		mxt_delta = 65535 - mxt_delta;
-
-	if (mxt_delta)
-		return sprintf(buf, "-%u\n", mxt_delta);
-	else
-		return sprintf(buf, "%u\n", mxt_delta);
-}
-
-static ssize_t set_delta2_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_delta = 0;
-	read_dbg_data(MXT_DELTA_MODE, test_node[2], &mxt_delta);
-	if (mxt_delta < 32767)
-		return sprintf(buf, "%u\n", mxt_delta);
-	else
-		mxt_delta = 65535 - mxt_delta;
-
-	if (mxt_delta)
-		return sprintf(buf, "-%u\n", mxt_delta);
-	else
-		return sprintf(buf, "%u\n", mxt_delta);
-}
-
-static ssize_t set_delta3_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_delta = 0;
-	read_dbg_data(MXT_DELTA_MODE, test_node[3], &mxt_delta);
-	if (mxt_delta < 32767)
-		return sprintf(buf, "%u\n", mxt_delta);
-	else
-		mxt_delta = 65535 - mxt_delta;
-
-	if (mxt_delta)
-		return sprintf(buf, "-%u\n", mxt_delta);
-	else
-		return sprintf(buf, "%u\n", mxt_delta);
-}
-
-static ssize_t set_delta4_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	uint16_t mxt_delta = 0;
-	read_dbg_data(MXT_DELTA_MODE, test_node[4], &mxt_delta);
-	if (mxt_delta < 32767)
-		return sprintf(buf, "%u\n", mxt_delta);
-	else
-		mxt_delta = 65535 - mxt_delta;
-
-	if (mxt_delta)
-		return sprintf(buf, "-%u\n", mxt_delta);
-	else
-		return sprintf(buf, "%u\n", mxt_delta);
-}
-
-static ssize_t set_threshold_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%u\n", threshold);
-}
-
-static ssize_t set_all_refer_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	int status = 0;
-
-	status = read_all_data(MXT_REFERENCE_MODE);
-
-	return sprintf(buf, "%u\n", status);
-}
-
-static int index_reference;
-
-ssize_t disp_all_refdata_show(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	return sprintf(buf, "%u\n", qt_refrence_node[index_reference]);
-}
-
-ssize_t disp_all_refdata_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t size)
-{
-	int reference;
-
-	sscanf(buf, "%u", &reference);
-	printk(KERN_DEBUG "%u\n", reference);
-	index_reference = reference;
-
-	return size;
-}
-
-static ssize_t set_all_delta_mode_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	int status = 0;
-
-	status = read_all_delta_data(MXT_DELTA_MODE);
-
-	return sprintf(buf, "%u\n", status);
-}
-
-static int index_delta;
-
-ssize_t disp_all_deltadata_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	if (qt_delta_node[index_delta] < 32767)
-		return sprintf(buf, "%u\n", qt_delta_node[index_delta]);
-	else
-		qt_delta_node[index_delta] = 65535 - qt_delta_node[index_delta];
-
-	return sprintf(buf, "-%u\n", qt_delta_node[index_delta]);
-}
-
-ssize_t disp_all_deltadata_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t size)
-{
-	int delta;
-
-	sscanf(buf, "%u", &delta);
-	printk(KERN_DEBUG "%u\n", delta);
-	index_delta = delta;
-
-	return size;
-}
-
-static ssize_t set_firm_version_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-
-	return sprintf(buf, "%#02x\n", tsp_version_disp);
-
-}
-
-static ssize_t set_module_off_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct mxt540e_data *data = copy_data;
-	int count;
-
-	mxt540e_enabled = 0;
-	touch_is_pressed = 0;
-
-	disable_irq(data->client->irq);
-	mxt540e_internal_suspend(data);
-
-	count = sprintf(buf, "tspoff\n");
-
-	return count;
-}
-
-static ssize_t set_module_on_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct mxt540e_data *data = copy_data;
-	int count;
-
-	bool ta_status = 0;
-
-	mxt540e_internal_resume(data);
-	enable_irq(data->client->irq);
-
-	mxt540e_enabled = 1;
-
-	if (data->read_ta_status) {
-		data->read_ta_status(&ta_status);
-		printk(KERN_DEBUG "[TSP] ta_status is %d", ta_status);
-		mxt540e_ta_probe(ta_status);
-	}
-	calibrate_chip(data);
-
-	count = sprintf(buf, "tspon\n");
-
-	return count;
-}
-
-static ssize_t set_mxt_firm_update_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t size)
-{
-	struct mxt540e_data *data = dev_get_drvdata(dev);
-	int error = 0;
-	printk(KERN_DEBUG "[TSP] set_mxt_update_show start!!\n");
-	if (*buf != 'S' && *buf != 'F') {
-		printk(KERN_ERR "Invalid values\n");
-		dev_err(dev, "Invalid values\n");
-		return -EINVAL;
-	}
-
-	disable_irq(data->client->irq);
-	firm_status_data = 1;
-	if (*buf != 'F' && data->tsp_version >= firmware_latest
-		&& data->tsp_build != build_latest) {
-		printk(KERN_ERR "[TSP] mxt540E has latest firmware\n");
-		firm_status_data = 2;
-		enable_irq(data->client->irq);
-		return size;
-	}
-	printk(KERN_DEBUG "[TSP] mxt540E_fm_update\n");
-	error = mxt540e_load_fw(dev, MXT540E_FW_NAME);
-
-	if (error) {
-		dev_err(dev, "The firmware update failed(%d)\n", error);
-		firm_status_data = 3;
-		printk(KERN_ERR "[TSP]The firmware update failed(%d)\n", error);
-		return error;
-	} else {
-		dev_dbg(dev, "The firmware update succeeded\n");
-		firm_status_data = 2;
-		printk(KERN_DEBUG "[TSP] The firmware update succeeded\n");
-
-		/* Wait for reset */
-		msleep(MXT540E_SW_RESET_TIME);
-
-		mxt540e_init_touch_driver(data);
-	}
-
-	enable_irq(data->client->irq);
-	error = mxt540e_backup(data);
-	if (error) {
-		printk(KERN_ERR "[TSP]mxt540e_backup fail!!!\n");
-		return error;
-	}
-
-	/* reset the touch IC. */
-	error = mxt540e_reset(data);
-	if (error) {
-		printk(KERN_ERR "[TSP]mxt540e_reset fail!!!\n");
-		return error;
-	}
-
-	msleep(MXT540E_SW_RESET_TIME);
-	return size;
-}
-
-static ssize_t set_mxt_firm_status_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-
-	int count;
-	printk(KERN_DEBUG "Enter firmware_status_show by Factory command\n");
-
-	if (firm_status_data == 1)
-		count = sprintf(buf, "DOWNLOADING\n");
-	else if (firm_status_data == 2)
-		count = sprintf(buf, "PASS\n");
-	else if (firm_status_data == 3)
-		count = sprintf(buf, "FAIL\n");
-	else
-		count = sprintf(buf, "PASS\n");
-
-	return count;
-}
-
-static ssize_t key_threshold_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	return sprintf(buf, "%u\n", threshold);
-}
-
-static ssize_t key_threshold_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t size)
-{
-	/*TO DO IT */
-	unsigned int object_register = 7;
-	u8 value;
-	u8 val;
-	int ret;
-	u16 address = 0;
-	u16 size_one;
-	int num;
-	if (sscanf(buf, "%d", &num) == 1) {
-		threshold = num;
-		printk(KERN_DEBUG "threshold value %d\n", threshold);
-		ret = get_object_info(copy_data, TOUCH_MULTITOUCHSCREEN_T9,
-				&size_one, &address);
-		size_one = 1;
-		value = (u8) threshold;
-		write_mem(copy_data, address + (u16) object_register, size_one,
-			&value);
-		read_mem(copy_data, address + (u16) object_register,
-			(u8) size_one, &val);
-		printk(KERN_ERR "T9 Byte%d is %d\n", object_register, val);
-	}
-	return size;
-}
-
-static ssize_t set_mxt_firm_version_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	pr_info("Atmel Latest firmware version is %d\n", firmware_latest);
-	return sprintf(buf, "%#02x\n", firmware_latest);
-}
-
-static ssize_t set_mxt_firm_version_read_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct mxt540e_data *data = dev_get_drvdata(dev);
-	return sprintf(buf, "%#02x\n", data->tsp_version);
-}
-
-static ssize_t mxt_touchtype_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	char temp[15];
-
-	sprintf(temp, "ATMEL,MXT540E\n");
-	strcat(buf, temp);
-
-	return strlen(buf);
-}
-
-static DEVICE_ATTR(set_refer0, S_IRUGO, set_refer0_mode_show, NULL);
-static DEVICE_ATTR(set_delta0, S_IRUGO, set_delta0_mode_show, NULL);
-static DEVICE_ATTR(set_refer1, S_IRUGO, set_refer1_mode_show, NULL);
-static DEVICE_ATTR(set_delta1, S_IRUGO, set_delta1_mode_show, NULL);
-static DEVICE_ATTR(set_refer2, S_IRUGO, set_refer2_mode_show, NULL);
-static DEVICE_ATTR(set_delta2, S_IRUGO, set_delta2_mode_show, NULL);
-static DEVICE_ATTR(set_refer3, S_IRUGO, set_refer3_mode_show, NULL);
-static DEVICE_ATTR(set_delta3, S_IRUGO, set_delta3_mode_show, NULL);
-static DEVICE_ATTR(set_refer4, S_IRUGO, set_refer4_mode_show, NULL);
-static DEVICE_ATTR(set_delta4, S_IRUGO, set_delta4_mode_show, NULL);
-static DEVICE_ATTR(set_all_refer, S_IRUGO, set_all_refer_mode_show, NULL);
-static DEVICE_ATTR(disp_all_refdata, S_IRUGO | S_IWUSR | S_IWGRP,
-			disp_all_refdata_show, disp_all_refdata_store);
-static DEVICE_ATTR(set_all_delta, S_IRUGO, set_all_delta_mode_show, NULL);
-static DEVICE_ATTR(disp_all_deltadata, S_IRUGO | S_IWUSR | S_IWGRP,
-			disp_all_deltadata_show, disp_all_deltadata_store);
-static DEVICE_ATTR(set_threshold, S_IRUGO, set_threshold_mode_show, NULL);
-static DEVICE_ATTR(set_firm_version, S_IRUGO,
-			set_firm_version_show, NULL);
-static DEVICE_ATTR(set_module_off, S_IRUGO,
-			set_module_off_show, NULL);
-static DEVICE_ATTR(set_module_on, S_IRUGO,
-			set_module_on_show, NULL);
-static DEVICE_ATTR(tsp_firm_update, S_IWUSR | S_IWGRP, NULL,
-			set_mxt_firm_update_store);	/* firmware update */
-static DEVICE_ATTR(tsp_firm_update_status, S_IRUGO,
-			set_mxt_firm_status_show, NULL);
-static DEVICE_ATTR(tsp_threshold, S_IRUGO | S_IWUSR | S_IWGRP,
-			key_threshold_show, key_threshold_store);
-static DEVICE_ATTR(tsp_firm_version_phone, S_IRUGO,
-			set_mxt_firm_version_show, NULL);	/* PHONE */
-static DEVICE_ATTR(tsp_firm_version_panel, S_IRUGO,
-			set_mxt_firm_version_read_show, NULL);
-static DEVICE_ATTR(mxt_touchtype, S_IRUGO,
-			mxt_touchtype_show, NULL);
-static DEVICE_ATTR(object_show, S_IWUSR | S_IWGRP, NULL, mxt540e_object_show);
-static DEVICE_ATTR(object_write, S_IWUSR | S_IWGRP, NULL,
-			mxt540e_object_setting);
-static DEVICE_ATTR(dbg_switch, S_IWUSR | S_IWGRP, NULL, mxt540e_debug_setting);
-
-static struct attribute *mxt540e_attrs[] = {
-	&dev_attr_object_show.attr,
-	&dev_attr_object_write.attr,
-	&dev_attr_dbg_switch.attr,
-	NULL
-};
-
-static const struct attribute_group mxt540e_attr_group = {
-	.attrs = mxt540e_attrs,
-};
-
-static const struct of_device_id mxt540e_i2c_dt_ids[];
-
-static int mxt540e_get_platdata(struct i2c_client *client)
-{
-	struct device *dev = &client->dev;
-	struct mxt540e_platform_data *pdata;
-	struct device_node *np = dev->of_node;
-	const struct of_device_id *match;
-
-	if (!np)
-		return -ENOENT;
-
-	match = of_match_node(mxt540e_i2c_dt_ids, dev->of_node);
-	client->dev.platform_data = (struct mxt540e_platform_data *)match->data;
-	pdata = client->dev.platform_data;
-
-	if (of_property_read_u32(np, "max_finger_touches", &pdata->max_finger_touches)) {
-		dev_err(dev, "failed to get min_x property\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(np, "min_x", &pdata->min_x)) {
-		dev_err(dev, "failed to get min_x property\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(np, "max_x", &pdata->max_x)) {
-		dev_err(dev, "failed to get max_x property\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(np, "min_y", &pdata->min_y)) {
-		dev_err(dev, "failed to get min_y property\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(np, "max_y", &pdata->max_y)) {
-		dev_err(dev, "failed to get max_y property\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(np, "min_z", &pdata->min_z)) {
-		dev_err(dev, "failed to get min_z property\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(np, "max_z", &pdata->max_z)) {
-		dev_err(dev, "failed to get max_z property\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(np, "min_w", &pdata->min_w)) {
-		dev_err(dev, "failed to get min_w property\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(np, "max_w", &pdata->max_w)) {
-		dev_err(dev, "failed to get max_w property\n");
-		return -EINVAL;
-	}
-
-	pdata->gpio_read_done = of_get_gpio(np, 0);
-	if (!gpio_is_valid(pdata->gpio_read_done)) {
-		dev_err(dev, "invalid gpio: %d\n", pdata->gpio_read_done);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int mxt540e_probe(struct i2c_client *client,
-		const struct i2c_device_id *id)
-{
-	struct mxt540e_platform_data *pdata;
-	struct mxt540e_data *data;
-	struct input_dev *input_dev;
-	struct median_error_t *median_error;
-	int ret;
-	int i;
-	bool ta_status = 0;
-	u8 **tsp_config;
-	int retry = 3;
-
-	touch_is_pressed = 0;
-
-	if (mxt540e_get_platdata(client)) {
-		dev_err(&client->dev, "failed to get platdata\n");
-		return -ENODEV;
-	}
-
-	pdata = dev_get_platdata(&client->dev);
-	if (!pdata) {
-		dev_err(&client->dev, "missing platform data\n");
-		return -ENODEV;
-	}
-
-	if (pdata->max_finger_touches <= 0)
-		return -EINVAL;
-
-	data = kzalloc(sizeof(*data) + pdata->max_finger_touches *
-			sizeof(*data->fingers), GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-
-	data->num_fingers = pdata->max_finger_touches;
-	data->power_on = pdata->power_on;
-	data->power_off = pdata->power_off;
-	data->register_cb = pdata->register_cb;
-	data->read_ta_status = pdata->read_ta_status;
-
-	data->client = client;
-	i2c_set_clientdata(client, data);
-
-	input_dev = input_allocate_device();
-	if (!input_dev) {
-		ret = -ENOMEM;
-		dev_err(&client->dev, "input device allocation failed\n");
-		goto err_alloc_dev;
-	}
-	data->input_dev = input_dev;
-	input_set_drvdata(input_dev, data);
-	input_dev->name = "mxt540e_i2c";
-
-	set_bit(EV_SYN, input_dev->evbit);
-	set_bit(EV_ABS, input_dev->evbit);
-	set_bit(EV_KEY, input_dev->evbit);
-	set_bit(MT_TOOL_FINGER, input_dev->keybit);
-	set_bit(INPUT_PROP_DIRECT, input_dev->propbit);
-
-	input_mt_init_slots(input_dev, MAX_FINGER_NUM, 0);
-
-	input_set_abs_params(input_dev, ABS_MT_POSITION_X, pdata->min_x,
-				pdata->max_x, 0, 0);
-	input_set_abs_params(input_dev, ABS_MT_POSITION_Y, pdata->min_y,
-				pdata->max_y, 0, 0);
-	input_set_abs_params(input_dev, ABS_MT_TOUCH_MAJOR, pdata->min_z,
-				pdata->max_z, 0, 0);
-	input_set_abs_params(input_dev, ABS_MT_PRESSURE, pdata->min_w,
-				pdata->max_w, 0, 0);
-/*
-	input_set_abs_params(input_dev, ABS_MT_COMPONENT, 0, 255, 0, 0);
-	input_set_abs_params(input_dev, ABS_MT_SUMSIZE, 0, 16 * 26, 0, 0);
-*/
-	ret = input_register_device(input_dev);
-	if (ret) {
-		input_free_device(input_dev);
-		goto err_reg_dev;
-	}
-
-	data->gpio_read_done = pdata->gpio_read_done;
-
-	data->power_on(&data->client->dev);
-
-	copy_data = data;
-#if 0
-	if (client->addr == MXT540E_APP_LOW)
-		client->addr = MXT540E_BOOT_LOW;
-	else
-		client->addr = MXT540E_BOOT_HIGH;
-
-	printk("Client add : 0x%x\n", client->addr);
-#endif
-#if 0
-	ret = mxt540e_check_bootloader(client, MXT540E_WAITING_BOOTLOAD_CMD);
-	if (ret >= 0) {
-		printk(KERN_DEBUG "[TSP] boot mode. firm update excute\n");
-		mxt540e_load_fw_bootmode(NULL, MXT540E_FW_NAME);
-		msleep(MXT540E_SW_RESET_TIME);
-	}
-#endif
-#if 0
-	else {
-		if (client->addr == MXT540E_BOOT_LOW)
-			client->addr = MXT540E_APP_LOW;
-		else
-			client->addr = MXT540E_APP_HIGH;
-	}
-#endif
-
-	data->register_cb(mxt540e_ta_probe);
-
-	while (retry--) {
-		ret = mxt540e_init_touch_driver(data);
-
-		if (ret == 0 || retry <= 0)
-			break;
-
-		printk(KERN_DEBUG
-			"[TSP] chip initialization failed. retry(%d)\n", retry);
-
-		data->power_off(&data->client->dev);
-		msleep(300);
-		data->power_on(&data->client->dev);
-	}
-
-	if (ret) {
-		dev_err(&client->dev, "chip initialization failed\n");
-		goto err_init_drv;
-	}
-
-	/* median filter error tunning */
-	median_error = kmalloc(sizeof(*median_error), GFP_KERNEL);
-	median_error->err_cnt_bat = 0;
-	median_error->err_cnt_ta = 0;
-	median_error->setting_flag = 0;
-	median_error->table_cnt = 0;
-	median_error->table_ta[0] = 33;
-	median_error->table_ta[1] = 20;
-	median_error->table_ta[2] = 15;
-	median_error->table_ta[3] = 0;
-	median_error->table_bat[0] = 20;
-	median_error->table_bat[1] = 10;
-	median_error->table_bat[2] = 30;
-	median_error->table_bat[3] = 10;
-	data->median_error = median_error;
-
-	if (data->family_id == 0xA1) {	/* tsp_family_id - 0xA1 : MXT-540E */
-		tsp_config = (u8 **) pdata->config_e;
-		data->t48_config_batt_e = pdata->t48_config_batt_e;
-		data->t48_config_chrg_e = pdata->t48_config_chrg_e;
-		data->irqf_trigger_type = pdata->irqf_trigger_type;
-		data->chrgtime_batt = pdata->chrgtime_batt;
-		data->chrgtime_charging = pdata->chrgtime_charging;
-		data->tchthr_batt = pdata->tchthr_batt;
-		data->tchthr_charging = pdata->tchthr_charging;
-		data->calcfg_batt_e = pdata->calcfg_batt_e;
-		data->calcfg_charging_e = pdata->calcfg_charging_e;
-		data->atchfrccalthr_e = pdata->atchfrccalthr_e;
-		data->atchfrccalratio_e = pdata->atchfrccalratio_e;
-		data->actvsyncsperx_batt = pdata->actvsyncsperx_batt;
-		data->actvsyncsperx_charging = pdata->actvsyncsperx_charging;
-
-		printk(KERN_DEBUG "[TSP] TSP chip is MXT540E\n");
-#if 0
-		if ((data->tsp_version < firmware_latest)
-			|| (data->tsp_build != build_latest)) {
-			printk(KERN_DEBUG "[TSP] mxt540E force firmware update\n");
-			if (mxt540e_load_fw(NULL, MXT540E_FW_NAME)) {
-				printk(KERN_ERR "[TSP] firm update fail\n");
-				goto err_config;
-			} else {
-				msleep(MXT540E_SW_RESET_TIME);
-				mxt540e_init_touch_driver(data);
-			}
-		}
-#endif
-		INIT_DELAYED_WORK(&data->config_dwork,
-				mxt_reconfigration_normal);
-		INIT_DELAYED_WORK(&data->resume_check_dwork,
-				resume_check_dworker);
-		INIT_DELAYED_WORK(&data->cal_check_dwork, cal_check_dworker);
-	} else {
-		printk(KERN_ERR "ERROR : There is no valid TSP ID\n");
-		goto err_config;
-	}
-
-	for (i = 0; tsp_config[i][0] != RESERVED_T255; i++) {
-		ret = init_write_config(data, tsp_config[i][0],
-					tsp_config[i] + 1);
-		if (ret)
-			goto err_config;
-
-		if (tsp_config[i][0] == GEN_POWERCONFIG_T7)
-			data->power_cfg = tsp_config[i] + 1;
-
-		if (tsp_config[i][0] == TOUCH_MULTITOUCHSCREEN_T9) {
-			/* Are x and y inverted? */
-			if (tsp_config[i][10] & 0x1) {
-				data->x_dropbits =
-					(!(tsp_config[i][22] & 0xC)) << 1;
-				data->y_dropbits =
-					(!(tsp_config[i][20] & 0xC)) << 1;
-			} else {
-				data->x_dropbits =
-					(!(tsp_config[i][20] & 0xC)) << 1;
-				data->y_dropbits =
-					(!(tsp_config[i][22] & 0xC)) << 1;
-			}
-		}
-	}
-
-	ret = mxt540e_backup(data);
-	if (ret)
-		goto err_backup;
-
-	/* reset the touch IC. */
-	ret = mxt540e_reset(data);
-	if (ret)
-		goto err_reset;
-
-	msleep(MXT540E_SW_RESET_TIME);
-
-	mxt540e_enabled = 1;
-
-	if (data->read_ta_status) {
-		data->read_ta_status(&ta_status);
-		printk(KERN_DEBUG "[TSP] ta_status is %d\n", ta_status);
-		mxt540e_ta_probe(ta_status);
-	}
-	check_resume_err = 2;
-	calibrate_chip(data);
-	schedule_delayed_work(&data->config_dwork, HZ * 30);
-
-	for (i = 0; i < data->num_fingers; i++)
-		data->fingers[i].state = MXT540E_STATE_INACTIVE;
-
-	ret = request_threaded_irq(client->irq, NULL, mxt540e_irq_thread,
-			data->irqf_trigger_type | IRQF_ONESHOT,
-			"mxt540e_ts", data);
-	if (ret < 0)
-		goto err_irq;
-
-	sec_class = class_create(THIS_MODULE, "sec");
-
-	ret = sysfs_create_group(&client->dev.kobj, &mxt540e_attr_group);
-	if (ret)
-		printk(KERN_ERR "[TSP] sysfs_create_group()is falled\n");
-
-	sec_touchscreen =
-		device_create(sec_class, NULL, 0, NULL, "sec_touchscreen");
-
-	dev_set_drvdata(sec_touchscreen, data);
-
-	if (IS_ERR(sec_touchscreen))
-		printk(KERN_ERR
-			"[TSP] Failed to create device(sec_touchscreen)!\n");
-
-	if (device_create_file(sec_touchscreen, &dev_attr_tsp_firm_update) < 0)
-		printk(KERN_ERR "[TSP] Failed to create device file(%s)!\n",
-			dev_attr_tsp_firm_update.attr.name);
-
-	if (device_create_file
-		(sec_touchscreen, &dev_attr_tsp_firm_update_status) < 0)
-		printk(KERN_ERR "[TSP] Failed to create device file(%s)!\n",
-			dev_attr_tsp_firm_update_status.attr.name);
-
-	if (device_create_file(sec_touchscreen, &dev_attr_tsp_threshold) < 0)
-		printk(KERN_ERR "[TSP] Failed to create device file(%s)!\n",
-			dev_attr_tsp_threshold.attr.name);
-
-	if (device_create_file
-		(sec_touchscreen, &dev_attr_tsp_firm_version_phone) < 0)
-		printk(KERN_ERR "[TSP] Failed to create device file(%s)!\n",
-			dev_attr_tsp_firm_version_phone.attr.name);
-
-	if (device_create_file
-		(sec_touchscreen, &dev_attr_tsp_firm_version_panel) < 0)
-		printk(KERN_ERR "[TSP] Failed to create device file(%s)!\n",
-			dev_attr_tsp_firm_version_panel.attr.name);
-
-	if (device_create_file(sec_touchscreen, &dev_attr_mxt_touchtype) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_mxt_touchtype.attr.name);
-
-	mxt540e_noise_test =
-		device_create(sec_class, NULL, 0, NULL, "tsp_noise_test");
-
-	if (IS_ERR(mxt540e_noise_test))
-		printk(KERN_ERR
-			"Failed to create device(mxt540e_noise_test)!\n");
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_refer0) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_refer0.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_delta0) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_delta0.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_refer1) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_refer1.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_delta1) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_delta1.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_refer2) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_refer2.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_delta2) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_delta2.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_refer3) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_refer3.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_delta3) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_delta3.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_refer4) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_refer4.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_delta4) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_delta4.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_all_refer) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_all_refer.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_disp_all_refdata) <
-		0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_disp_all_refdata.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_all_delta) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_all_delta.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_disp_all_deltadata)
-		< 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_disp_all_deltadata.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_threshold) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_threshold.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_firm_version) <
-		0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_firm_version.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_module_off) <
-		0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_module_off.attr.name);
-
-	if (device_create_file(mxt540e_noise_test, &dev_attr_set_module_on) < 0)
-		printk(KERN_ERR "Failed to create device file(%s)!\n",
-			dev_attr_set_module_on.attr.name);
-
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	data->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
-	data->early_suspend.suspend = mxt540e_early_suspend;
-	data->early_suspend.resume = mxt540e_late_resume;
-	register_early_suspend(&data->early_suspend);
-#endif
-
-	return 0;
-
- err_irq:
- err_reset:
- err_backup:
- err_config:
-	kfree(data->objects);
- err_init_drv:
-	gpio_free(data->gpio_read_done);
-/* err_gpio_req:
-	data->power_off();
-	input_unregister_device(input_dev); */
- err_reg_dev:
- err_alloc_dev:
-	kfree(data);
-	return ret;
-}
-
-static int mxt540e_remove(struct i2c_client *client)
-{
-	struct mxt540e_data *data = i2c_get_clientdata(client);
-
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	unregister_early_suspend(&data->early_suspend);
-#endif
-	free_irq(client->irq, data);
-	kfree(data->objects);
-	gpio_free(data->gpio_read_done);
-	data->power_off(&data->client->dev);
-	input_unregister_device(data->input_dev);
-	kfree(data);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM
-#ifdef CONFIG_HAS_EARLYSUSPEND
-#define mxt540e_suspend	NULL
-#define mxt540e_resume	NULL
-
-static void mxt540e_early_suspend(struct early_suspend *h)
-{
-	struct mxt540e_data *data = container_of(h, struct mxt540e_data,
-						early_suspend);
-	if (mxt540e_enabled) {
-		printk(KERN_DEBUG "[TSP] %s\n", __func__);
-		mxt540e_enabled = 0;
-		touch_is_pressed = 0;
-
-		disable_irq(data->client->irq);
-		mxt540e_internal_suspend(data);
-	} else {
-		printk(KERN_DEBUG "[TSP] %s, but already off\n", __func__);
-	}
-}
-
-static void mxt540e_late_resume(struct early_suspend *h)
-{
-	struct mxt540e_data *data = container_of(h, struct mxt540e_data,
-						early_suspend);
-	bool ta_status = 0;
-	u8 id[ID_BLOCK_SIZE];
-	int ret = 0;
-	int retry = 3;
-
-	if (mxt540e_enabled == 0) {
-		printk(KERN_DEBUG "[TSP] %s\n", __func__);
-		mxt540e_internal_resume(data);
-
-		mxt540e_enabled = 1;
-
-		ret = read_mem(data, 0, sizeof(id), id);
-		if (ret) {
-			while (retry--) {
-				printk(KERN_DEBUG "[TSP] chip boot failed."
-					"retry(%d)\n", retry);
-
-				data->power_off(&data->client->dev);
-				msleep(200);
-				data->power_on(&data->client->dev);
-
-				ret = read_mem(data, 0, sizeof(id), id);
-				if (ret == 0 || retry <= 0)
-					break;
-			}
-		}
-
-		if (data->read_ta_status) {
-			data->read_ta_status(&ta_status);
-			printk(KERN_DEBUG "[TSP] ta_status is %d\n", ta_status);
-			mxt540e_ta_probe(ta_status);
-		}
-		if (deepsleep)
-			deepsleep = 0;
-
-		check_resume_err = 2;
-		calibrate_chip(data);
-		check_calibrate = 3;
-		schedule_delayed_work(&data->config_dwork, HZ * 5);
-		config_dwork_flag = 3;
-		enable_irq(data->client->irq);
-	} else {
-		printk(KERN_DEBUG "[TSP] %s, but already on\n", __func__);
-	}
-}
-#else
-static int mxt540e_suspend(struct device *dev)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-	struct mxt540e_data *data = i2c_get_clientdata(client);
-
-	mxt540e_enabled = 0;
-	touch_is_pressed = 0;
-	disable_irq(data->client->irq);
-	return mxt540e_internal_suspend(data);
-}
-
-static int mxt540e_resume(struct device *dev)
-{
-	int ret = 0;
-	bool ta_status = 0;
-	struct i2c_client *client = to_i2c_client(dev);
-	struct mxt540e_data *data = i2c_get_clientdata(client);
-
-	ret = mxt540e_internal_resume(data);
-
-	mxt540e_enabled = 1;
-
-	if (data->read_ta_status) {
-		data->read_ta_status(&ta_status);
-		printk(KERN_DEBUG "[TSP] ta_status is %d\n", ta_status);
-		mxt540e_ta_probe(ta_status);
-	}
-	enable_irq(data->client->irq);
-	return ret;
-}
-#endif
-
-static const struct dev_pm_ops mxt540e_pm_ops = {
-	.suspend = mxt540e_suspend,
-	.resume = mxt540e_resume,
-};
-#endif
-
-static struct i2c_device_id mxt540e_idtable[] = {
-	{MXT540E_DEV_NAME, 0},
-	{},
-};
-MODULE_DEVICE_TABLE(i2c, mxt540e_idtable);
-
-#ifdef CONFIG_OF
-static struct mxt540e_platform_data sec_mxt540e_data = {
-	.config_e = mxt540e_config,
-	.irqf_trigger_type = IRQF_TRIGGER_HIGH,
-	.chrgtime_batt = MXT540E_CHRGTIME_BATT,
-	.chrgtime_charging = MXT540E_CHRGTIME_CHRG,
-	.tchthr_batt = MXT540E_THRESHOLD_BATT,
-	.tchthr_charging = MXT540E_THRESHOLD_CHRG,
-	.actvsyncsperx_batt = MXT540E_ACTVSYNCSPERX_BATT,
-	.actvsyncsperx_charging = MXT540E_ACTVSYNCSPERX_CHRG,
-	.calcfg_batt_e = MXT540E_CALCFG_BATT,
-	.calcfg_charging_e = MXT540E_CALCFG_CHRG,
-	.atchfrccalthr_e = MXT540E_ATCHFRCCALTHR_NORMAL,
-	.atchfrccalratio_e = MXT540E_ATCHFRCCALRATIO_NORMAL,
-	.t48_config_batt_e = t48_config_e,
-	.t48_config_chrg_e = t48_config_chrg_e,
-	.power_on = mxt540e_power_on,
-	.power_off = mxt540e_power_off,
-	.register_cb = tsp_register_callback,
-	.read_ta_status = tsp_read_ta_status,
-};
-
-static const struct of_device_id mxt540e_i2c_dt_ids[] = {
-	{ .compatible = "atmel,mxt540e",
-	  .data = &sec_mxt540e_data,
-	},
-	{},
-};
-MODULE_DEVICE_TABLE(of, mxt540e_i2c_dt_ids);
-#endif
-
-static struct i2c_driver mxt540e_i2c_driver = {
-	.id_table = mxt540e_idtable,
-	.driver = {
-		.owner = THIS_MODULE,
-		.name = MXT540E_DEV_NAME,
-#ifdef CONFIG_PM
-		.pm = &mxt540e_pm_ops,
-#endif
-#ifdef CONFIG_OF
-		.of_match_table = of_match_ptr(mxt540e_i2c_dt_ids),
-#endif
-	},
-	.probe = mxt540e_probe,
-	.remove = mxt540e_remove,
-};
-
-static int __init mxt540e_init(void)
-{
-	return i2c_add_driver(&mxt540e_i2c_driver);
-}
-
-static void __exit mxt540e_exit(void)
-{
-	i2c_del_driver(&mxt540e_i2c_driver);
-}
-
-module_init(mxt540e_init);
-module_exit(mxt540e_exit);
-
-MODULE_DESCRIPTION("Atmel MaXTouch 540E driver");
-MODULE_AUTHOR("Heetae Ahn <heetae82.ahn@samsung.com>");
-MODULE_LICENSE("GPL");
+3035343430309D
+:102D4000303334333633343336333433363333334A
+:102D50003733333338333333373333333133333338
+:102D60003031380D0A3A3130353435303030333384
+:102D7000333233333330333333303333333033342C
+:102D800033333434343630443041334133313442D8
+:102D90000D0A3A3130353436303030333033383450
+:102DA0003133313330333033303333333333333300
+:102DB000303333333633333334333330360D0A3A2A
+:102DC00031303534373030303330333333303333E0
+:102DD00033323333333733303434333034313333C5
+:102DE000343133333331333344410D0A3A313035E2
+:102DF00034383030303330333333383334333333A3
+:102E0000333332333633313044304133413331336D
+:102E1000303338343132330D0A3A313035343930C9
+:102E20003030333233303330333033333330333385
+:102E30003330333333303333333033333336333368
+:102E4000333246300D0A3A31303534413030303388
+:102E50003333373333333533333337333333323339
+:102E60003333323333333333333336333333324321
+:102E7000320D0A3A31303534423030303333333763
+:102E800033333334333133313044304133413331F0
+:102E900033303338343133333330333046420D0A34
+:102EA0003A313035344330303033303334333233E9
+:102EB00033333333333331333333303333333133E9
+:102EC00033333033333330333442420D0A3A313006
+:102ED00035344430303033333333333433343335B3
+:102EE00033333330333333343333333333333332B5
+:102EF00033333332333339430D0A3A3130353445C5
+:102F00003030303339343434363044304133413367
+:102F1000313330333834313334333033303330338A
+:102F200033333241350D0A3A3130353446303030A2
+:102F30003333333033343334333333313334333363
+:102F40003330343433303431333334313333333159
+:102F500035390D0A3A31303535303030303333338E
+:102F6000303333333833343333333333333333332E
+:102F70003033333330333333303331343336330D4E
+:102F80000A3A313035353130303030443041334118
+:102F90003331333033383431333533303330333009
+:102FA0003333333733333338333339330D0A3A312C
+:102FB00030353532303030333733333331333333E8
+:102FC00030333333343333333033333330333433D8
+:102FD0003333333336333334440D0A3A31303535F5
+:102FE00033303030333733333332333333313334B8
+:102FF0003331333333313334333634323330304496
+:103000003041334137350D0A3A31303535343030BF
+:103010003033313330333834313336333033303387
+:103020003033343336333433363334333633343366
+:103030003631330D0A3A31303535353030303333AF
+:103040003330333333343333333733333331333350
+:103050003330333433333333333333333330323049
+:103060000D0A3A3130353536303030333333313381
+:10307000333338333333303334333133373332301F
+:10308000443041334133313330333835310D0A3A2E
+:103090003130353537303030343133373330333009
+:1030A00033303333333033333335333034343330F8
+:1030B000343133333431333343430D0A3A3130350D
+:1030C00035383030303331333333303333333833D2
+:1030D00034333333333334333333303333333033C4
+:1030E000333330333346320D0A3A313035353930E7
+:1030F000303033393333333933333337343633378E
+:103100003044304133413331333033383431333864
+:10311000333045430D0A3A313035354130303033A4
+:103120003033303333333333333339333333303372
+:103130003333313333333133333330333333344454
+:10314000340D0A3A31303535423030303333333292
+:103150003333333133343336333333323333333041
+:1031600033333339333433333333333442360D0A64
+:103170003A3130353543303030333433353338330A
+:1031800034304430413341333133303338343133E8
+:1031900039333033303330333444450D0A3A31302B
+:1031A00035354430303033343333333833333332DE
+:1031B00033333330333333353333333733333338D7
+:1031C00033333337333338410D0A3A3130353545EF
+:1031D00030303033313333333033333334333333CC
+:1031E00030333333303333333333333332333034B8
+:1031F00034343237390D0A3A3130353546303030D3
+:103200003336304430413341333133303338343165
+:10321000343133303330333033303431333334318D
+:1032200039340D0A3A3130353630303030333333BB
+:10323000313333333033333338333433333333335D
+:103240003533333330333333303333333037300D7A
+:103250000A3A31303536313030303334333333336A
+:10326000333633333337333333323333333033332B
+:103270003332333934343044304138460D0A3A3130
+:103280003035363230303033413331333033383407
+:103290003134323330333033303334333633333305
+:1032A0003433333337333332360D0A3A313035362F
+:1032B00033303030333033333337333333313334E7
+:1032C00033363333333233343335333433363333C5
+:1032D0003335333332460D0A3A31303536343030F7
+:1032E00030333833343333333333313333333433AC
+:1032F0003333383331343430443041334133313374
+:103300003035450D0A3A31303536353030303338C6
+:103310003431343333303330333033333330333389
+:103320003330333333353333333833333338464143
+:103330000D0A3A31303536363030303333333133AD
+:10334000333333333333383333333033333330334E
+:10335000343332333333323330343430300D0A3A8D
+:103360003130353637303030333034313333343137
+:1033700033333331343134363044304133413331F7
+:10338000333033383431343445420D0A3A31303534
+:10339000363830303033303330333033333330330A
+:1033A00033333833343333333333363333333033E7
+:1033B000333330333346330D0A3A31303536393012
+:1033C00030303330333333323334333333333331D8
+:1033D00033333330333333353333333833333330BC
+:1033E000333344450D0A3A313035364130303033CD
+:1033F0003033343335333334343044304133413374
+:103400003133303338343134353330333033304581
+:10341000410D0A3A313035364230303033333331B2
+:103420003334333633333330333333303333333071
+:1034300033333330333333303333333343370D0A9D
+:103440003A3130353643303030333433333333333D
+:10345000313333333033343336333333343333333C
+:1034600030333333323333333042300D0A3A313074
+:1034700035364430303033333433304430413341E7
+:103480003331333033383431343633303330333012
+:1034900033333336333342370D0A3A31303536451C
+:1034A00030303033323333333133333330333433FA
+:1034B00033333333333333333033343336333433DA
+:1034C00031333039320D0A3A31303536463030300A
+:1034D00034343330343133333431333333313333C1
+:1034E0003330333333383334333333353333304499
+:1034F00037330D0A3A3130353730303030304133E0
+:103500004133313330333834323330333033303386
+:103510003033333337333333303333333038410D93
+:103520000A3A31303537313030303333333033339A
+:10353000333533333333333333303333333233345C
+:103540003334333333393334333335350D0A3A3189
+:103550003035373230303033333331333433353341
+:10356000333334333333303333333233303338302F
+:103570004430413341333139330D0A3A3130353734
+:10358000333030303330333834323331333033301A
+:1035900033303334333433333339333333383333F1
+:1035A0003331333432370D0A3A3130353734303035
+:1035B00030333433333334333333303333333233E0
+:1035C00033333833343332333333353333333033C7
+:1035D0003332370D0A3A3130353735303030333009
+:1035E00033333332333333303333333034363334AD
+:1035F000304430413341333133303338343234386E
+:103600000D0A3A31303537363030303332333033DB
+:10361000303330333333303334333333343335337F
+:10362000333330333333323333333631330D0A3AB5
+:103630003130353737303030333034343330343163
+:10364000333334313333333133333330333333384B
+:10365000333433333333333843430D0A3A3130355F
+:103660003738303030333333303333333033333330
+:1036700030304430413341333133303338343233F6
+:10368000333330333033310D0A3A31303537393056
+:103690003030333033333330333333313333333803
+:1036A00033333330333433313333333033343333F0
+:1036B000333345320D0A3A3130353741303030330B
+:1036C00037333333303334333633343336333333C1
+:1036D00030333433363334333133333339333342A5
+:1036E000410D0A3A313035374230303033373339D3
+:1036F0003435304430413341333133303338343270
+:1037000033343330333033303334333544420D0ABD
+:103710003A31303537433030303333333933333364
+:10372000343333333033333334333333303334336C
+:1037300033333333373333333041350D0A3A313095
+:103740003537443030303333333633333334333337
+:103750003330333433323334333233333339333336
+:1037600033373431333737430D0A3A313035374543
+:1037700030303030443041334133313330333834FA
+:103780003233353330333033303333333133333313
+:1037900036333343380D0A3A31303537463030301E
+:1037A00033343330343433303431333334313333EE
+:1037B00033313333333033333338333433333333D8
+:1037C00035300D0A3A313035383030303033393316
+:1037D00033333033333330333333303334333233C2
+:1037E0003433333436343630443041334138430D8A
+:1037F0000A3A3130353831303030333133303338C4
+:103800003432333633303330333033333330333391
+:103810003332333333303333333435350D0A3A31C1
+:10382000303538323030303333333733333330336D
+:103830003433313333333933333330333433353353
+:103840003333393333333633390D0A3A313035387F
+:10385000333030303333333033333334333333393D
+:1038600033333339343133343044304133413331FD
+:103870003330333836370D0A3A313035383430305A
+:103880003034323337333033303330333333303313
+:1038900034333533333339333333303333333133F4
+:1038A0003331440D0A3A3130353835303030333128
+:1038B00033343332333333393333333733333331D0
+:1038C00033343332333333383333333033333130CB
+:1038D0000D0A3A3130353836303030333233333305
+:1038E0003233333335333834363044304133413377
+:1038F000313330333834323338333032370D0A3ADB
+:103900003130353837303030333033303330343491
+:103910003330343133333431333333313333333081
+:10392000333333383334333344360D0A3A31303598
+:10393000383830303033343331333333303333335A
+:10394000303333333033333330333333363334334C
+:10395000313333333745460D0A3A31303538393053
+:103960003030333333323434333730443041334101
+:10397000333133303338343233393330333033301A
+:10398000333446460D0A3A31303538413030303321
+:1039900036333333373334333133333330333433F3
+:1039A00035333333303333333033333339333343D5
+:1039B000320D0A3A31303538423030303338333313
+:1039C00033373333333733333337333333333333BB
+:1039D00033303333333433333331333641380D0AF4
+:1039E0003A3130353843303030333430443041337D
+:1039F0004133313330333834323431333033303390
+:103A000030333333333333333844360D0A3A3130BD
+:103A10003538443030303334333133333339333362
+:103A2000333233333331333333323333333333336A
+:103A300033383333333738450D0A3A31303538456A
+:103A40003030303333333133343336333333303350
+:103A50003034343330343133333431343233313041
+:103A600044304141340D0A3A313035384630303037
+:103A7000334133313330333834323432333033300E
+:103A80003330333333313333333033333338333408
+:103A900035420D0A3A313035393030303033333336
+:103AA00034333233333330333333303333333033EF
+:103AB0003433323333333833333330333336450DE5
+:103AC0000A3A3130353931303030333233333333F1
+:103AD00033333338333333393333333133353336A8
+:103AE0003044304133413331333039370D0A3A31C4
+:103AF0003035393230303033383432343333303398
+:103B0000303330333433323334333333333330338D
+:103B10003333323333333233300D0A3A31303539BF
+:103B20003330303033333334333433313333333170
+:103B30003333333233343333333333373333333054
+:103B40003333333133410D0A3A3130353934303083
+:103B5000303334333533333330333333303333333B
+:103B600034304430413341333133303338343234FC
+:103B70003435310D0A3A3130353935303030333063
+:103B8000333033303334333333333334333433310A
+:103B900033343335333333323333333333333144E4
+:103BA0000D0A3A313035393630303033373333332C
+:103BB00037333433353333333833303434333034CC
+:103BC000313333343133333331333344320D0A3A02
+:103BD00031303539373030303330333333383335B3
+:103BE000343530443041334133313330333834327B
+:103BF000343533303330333031310D0A3A313035EA
+:103C00003938303030333433333334333333333380
+:103C1000303333333033333330333333323333337E
+:103C2000343333333945380D0A3A31303539393088
+:103C30003030333333343334333233333339333353
+:103C4000333733333331333433323333333833333D
+:103C5000333043430D0A3A31303539413030303357
+:103C600030343630443041334133313330333834FB
+:103C70003234363330333033303333333233344508
+:103C8000360D0A3A31303539423030303332333341
+:103C900033393333333933333331333433323334E9
+:103CA00033333333333033333332333342310D0A2A
+:103CB0003A313035394330303033393333333233BE
+:103CC00034333533343333333433363334333133BD
+:103CD00034333134323433304441330D0A3A3130E5
+:103CE000353944303030304133413331333033387B
+:103CF000343333303330333033303333333833339A
+:103D000033303333333142350D0A3A3130353945AA
+:103D10003030303333333033333330333433343380
+:103D20003433363330343433303431333334313365
+:103D300033333136320D0A3A31303539463030308E
+:103D4000333333303333333833343333333433343E
+:103D50003333333033343330304430413341333113
+:103D600043310D0A3A313035413030303033303361
+:103D7000383433333133303330333033333330331B
+:103D80003333303333333033343333333336370D27
+:103D90000A3A313035413130303033373333333014
+:103DA00033343334333333383333333033343331E0
+:103DB0003334333233333339333334430D0A3A3106
+:103DC00030354132303030333733333331333433BD
+:103DD0003333333330343433373044304133413389
+:103DE0003133303338343336390D0A3A31303541D6
+:103DF00033303030333233303330333033333330A9
+:103E00003333333233333330333333343334333384
+:103E10003333333034380D0A3A31303541343030B1
+:103E2000303333333233343336333333373334335D
+:103E30003333333330333433353333333033333355
+:103E40003032340D0A3A3130354135303030333389
+:103E500033393333333834343333304430413341FE
+:103E60003331333033383433333333303330333822
+:103E70000D0A3A3130354136303030333033333358
+:103E800037333333373334333233343335333034F9
+:103E9000343330343133333431333344370D0A3A29
+:103EA00031303541373030303331333333303333E1
+:103EB00033383334333333343335333333303333CC
+:103EC000333033333330333346420D0A3A313035F1
+:103ED000413830303033353330333830443041338B
+:103EE0004133313330333834333334333033303398
+:103EF000303333333032350D0A3A313035413930D1
+:103F0000303033333330333333343333333133338B
+:103F1000333333343332333433333333333933336A
+:103F2000333244340D0A3A31303541413030303388
+:103F3000333330333433323333333333333338334F
+:103F4000333337333333313334333334323334422E
+:103F5000310D0A3A31303541423030303044304151
+:103F60003341333133303338343333353330333016
+:103F700033303333333033333330333346420D0A47
+:103F80003A313035414330303033323333333233EA
+:103F900033333433343333333333313334333333F0
+:103FA00034333333343333333341350D0A3A31301C
+:103FB00035414430303033303333333133343335BB
+:103FC00033333330333333303334333333393336BD
+:103FD00030443041334144430D0A3A313035414594
+:103FE00030303033313330333834333336333033A9
+:103FF000303330333433313330343433303431339D
+:1040000033343135360D0A3A3130354146303030AF
+:10401000333333313333333033333338333433336F
+:104020003334333633333330333333303333333065
+:1040300037410D0A3A313035423030303033333386
+:104040003233333334333333373333333434353437
+:104050003630443041334133313330333838330D27
+:104060000A3A31303542313030303433333733303F
+:10407000333033303334333233333339333333370C
+:104080003333333133343333333334310D0A3A314C
+:1040900030354232303030333033333330333333F2
+:1040A00032333333393333333233343336333333D8
+:1040B0003233343336333334300D0A3A313035420B
+:1040C00033303030333233343334333433323335C6
+:1040D0003432304430413341333133303338343388
+:1040E0003338333035390D0A3A31303542343030D7
+:1040F0003033303330333333333333333833343393
+:10410000343333333133343332333333383333337B
+:104110003032340D0A3A31303542353030303333B5
+:10412000333233333332333333363334333433345B
+:104130003333333433343334333133303434303253
+:104140000D0A3A3130354236303030333034313385
+:1041500039343430443041334133313330333834FF
+:10416000333339333033303330333331450D0A3A5A
+:10417000313035423730303034313333333133330B
+:1041800033303333333833343334333333303333FE
+:10419000333033333330333345450D0A3A3130351C
+:1041A00042383030303330333333323333333333D8
+:1041B00034333433343334333333303333333633CB
+:1041C000333339333744420D0A3A313035423930CE
+:1041D0003030333130443041334133313330333890
+:1041E00034333431333033303330333433343333A6
+:1041F000333230390D0A3A313035424130303033C4
+:104200003333363333333933343334333333303376
+:10421000343333333333373333333033343334425B
+:10422000390D0A3A31303542423030303333333091
+:10423000333333303333333333333332333333364F
+:1042400033333337333434323044304146340D0A5B
+:104250003A3130354243303030334133313330330B
+:10426000383433343233303330333033333339331B
+:1042700033333733333330333338310D0A3A313057
+:1042800035424430303033363333333733333337DA
+:1042900033333338333333373334333533333334E1
+:1042A00033333332333038310D0A3A313035424509
+:1042B00030303034343330343133333431333333DA
+:1042C000313333333034313334304430413341339C
+:1042D00031333039450D0A3A3130354246303030CD
+:1042E000333834333433333033303330333333389B
+:1042F0003334333433333331333333303333333094
+:1043000035410D0A3A3130354330303030333333B4
+:10431000303333333833333336333333303333336B
+:104320003433343332333333393333333935350D72
+:104330000A3A31303543313030303333333133346E
+:10434000333333333334333333393044304133410F
+:104350003331333033383433343437350D0A3A316E
+:104360003035433230303033303330333033333321
+:10437000303333333233343333333333363333330D
+:104380003633333337333334360D0A3A313035432D
+:1043900033303030333233333332333433353333F5
+:1043A00033373333333233343336333333393334CF
+:1043B0003334333332340D0A3A313035433430300C
+:1043C00030333033333331333133363044304133AB
+:1043D00041333133303338343334353330333033A1
+:1043E0003035370D0A3A31303543353030303333DC
+:1043F0003330333333303333333933333330333390
+:104400003337333333393334333133343334304364
+:104410000D0A3A31303543363030303330343433AE
+:104420003034313333343133333331333333303366
+:10443000333338333433343333333244430D0A3A6D
+:104440003130354337303030333633363044304115
+:10445000334133313330333834333436333033301F
+:10446000333033333330333331460D0A3A3130355C
+:104470004338303030333033333330333333393300
+:1044800033333233343335333333333333333033FD
+:10449000343333333345340D0A3A31303543393010
+:1044A00030303332333333303334333233333330E9
+:1044B00033333330333333323333333233323336CF
+:1044C000304430340D0A3A313035434130303030E9
+:1044D0004133413331333033383434333033303394
+:1044E0003033303333333633333332333333314590
+:1044F000310D0A3A313035434230303033333330C6
+:10450000333433333333333333333330333433347B
+:1045100033333330333333303333333342440D0AA0
+:104520003A3130354343303030333333343333333F
+:10453000333333333433343333333333343330344A
+:1045400032304430413341333144450D0A3A313041
+:104550003543443030303330333834343331333012
+:104560003330333033333333333333353334333120
+:1045700033333336333438370D0A3A313035434527
+:104580003030303335333034343330343133333406
+:1045900031333333313333333033333338333433EC
+:1045A00034333335390D0A3A313035434630303003
+:1045B00033333333333033333330333333303333D4
+:1045C000343530443041334133313330333834348F
+:1045D00041320D0A3A3130354430303030333233E5
+:1045E000303330333033343331333333393333339F
+:1045F0003033333331333433323333333037300DB8
+:104600000A3A31303544313030303333333033339C
+:10461000333233343333333433323333333333336A
+:104620003338333333303333333435330D0A3A319F
+:104630003035443230303033333330333333303449
+:104640003533303044304133413331333033383413
+:104650003433333330333037370D0A3A3130354461
+:104660003330303033303334333333333334333324
+:104670003332333333303333333833333332333409
+:104680003334333333320D0A3A3130354434303039
+:1046900030333633333330333333363333333233EB
+:1046A00033333833333330333333363333333333D5
+:1046B0003431420D0A3A31303544353030303332FE
+:1046C0003433343230443041334133313330333892
+:1046D00034343334333033303330333333323335AF
+:1046E0000D0A3A31303544363030303333333533D8
+:1046F0003034343330343133333431333333313392
+:10470000333330333333383334333444380D0A3AA7
+:104710003130354437303030333333343333333062
+:104720003333333033333330333333323334333260
+:10473000333333353332333146440D0A3A31303571
+:10474000443830303030443041334133313330330A
+:10475000383434333533303330333033333331332B
+:10476000333330333332360D0A3A31303544393051
+:104770003030333433333330333333303334333313
+:1047800033333334333333323333333033333339F6
+:10479000333344340D0A3A3130354441303030330C
+:1047A00032333433343333333033343333333433D9
+:1047B0003333343332333934353044304133414686
+:1047C000330D0A3A313035444230303033313330F2
+:1047D00033383434333633303330333033333330AB
+:1047E00033333331333433343333333041450D0ACB
+:1047F0003A31303544433030303333333033333370
+:104800003033333334333333373333333133333378
+:1048100039333333313333333739450D0A3A313095
+:104820003544443030303333333933333334333336
+:10483000333533303434343533323044304133411E
+:1048400033313330333842330D0A3A313035444551
+:104850003030303434333733303330333033303436
+:104860003133333431333333313333333033333320
+:1048700038333435440D0A3A31303544463030301F
+:1048800033343333333533333330333333303333FB
+:1048900033303333333833333332333333303333EA
+:1048A00037380D0A3A313035453030303033353312
+:1048B00033333233343336343333363044304133A8
+:1048C0004133313330333834343338333037460DB5
+:1048D0000A3A3130354531303030333033303333CC
+:1048E0003336333433343333333033333331333398
+:1048F0003330333333303333333935380D0A3A31CB
+:104900003035453230303033333339333333373366
+:10491000333336333333303333333133333330336C
+:104920003333303334333333460D0A3A313035457F
+:104930003330303033333334333933313044304132
+:104940003341333133303338343433393330333027
+:104950003330333336370D0A3A3130354534303061
+:10496000303338333433343333333833333332330F
+:104970003333313333333533343333333333343305
+:104980003431340D0A3A3130354535303030333238
+:1049900033333330333333383333333333303434E6
+:1049A00033303431333334313333333134324444BC
+:1049B0000D0A3A31303545363030303331304430FD
+:1049C000413341333133303338343434313330339D
+:1049D000303330333333303333333833340D0A3AF2
+:1049E0003130354537303030333433343333333688
+:1049F0003333333033333330333333303333333093
+:104A0000333333343333333746340D0A3A313035A8
+:104A1000453830303033333331333333323334335A
+:104A2000363333333633343334333333303336334E
+:104A3000333044304132420D0A3A31303545393055
+:104A4000303033413331333033383434343233302F
+:104A50003330333033333331333333303333333034
+:104A6000333342430D0A3A3130354541303030332B
+:104A700039333333393333333733333336333333F3
+:104A800031333433353333333033333330333342EC
+:104A9000340D0A3A31303545423030303339333312
+:104AA00033323333333033333337333333303336D6
+:104AB00034323044304133413331333045410D0AD3
+:104AC0003A31303545433030303338343434333391
+:104AD00030333033303333333433333336333333AB
+:104AE00031333333323334333638300D0A3A3130E0
+:104AF0003545443030303333333733343334333364
+:104B0000333133343331333034343330343133337D
+:104B100034313333333136410D0A3A31303545457E
+:104B2000303030333333303333333833343334335A
+:104B30003733353044304133413331333033383417
+:104B400034343439450D0A3A313035454630303049
+:104B5000333033303330333333373333333033332D
+:104B60003330333333303333333033333331333320
+:104B700038350D0A3A313035463030303033303345
+:104B800033333033333339333333393333333633E9
+:104B90003333373333333133343336333335320D04
+:104BA0000A3A3130354631303030333033333330F8
+:104BB000333533353044304133413331333033389A
+:104BC0003434343533303330333038310D0A3A3100
+:104BD000303546323030303334333633333332339A
+:104BE0003333303333333833343333333433333391
+:104BF0003433323333333033440D0A3A31303546AF
+:104C00003330303033333331333433343333333080
+:104C10003333333033333332333433363333333661
+:104C20003334333432460D0A3A313035463430307D
+:104C30003034353334304430413341333133303321
+:104C40003834343436333033303330333333303335
+:104C50003333450D0A3A3130354635303030333153
+:104C6000333333303333333033343331333333331B
+:104C700033303434333034313333343133334633F7
+:104C80000D0A3A3130354636303030333133333334
+:104C900030333333383334333433333338333333DB
+:104CA000303333333033373338304431440D0A3AFC
+:104CB00031303546373030303041334133313330A5
+:104CC00033383435333033303330333033333330BB
+:104CD000333333393333333930340D0A3A313035E5
+:104CE000463830303033333337333333363333337E
+:104CF000313334333433333330333333303333338A
+:104D0000393333333244420D0A3A31303546393083
+:104D10003030333433363333333433333333333364
+:104D2000333833333339343633353044304133411B
+:104D3000333146360D0A3A31303546413030303362
+:104D40003033383435333133303330333033333339
+:104D50003133343333333333343333333033334217
+:104D6000420D0A3A31303546423030303332333337
+:104D700033333333333833333337333333303333FD
+:104D800033333333333433333331333441430D0A24
+:104D90003A313035464330303033353333333033C6
+:104DA00034333333333336343633303044304133B5
+:104DB00041333133303338343543340D0A3A3130EE
+:104DC00035464430303033323330333033303333A0
+:104DD00033303333333333343333333034343330A9
+:104DE00034313333343137360D0A3A3130354645B4
+:104DF000303030333333313333333033333338338C
+:104E00003433343333333933333330333333303370
+:104E100033333038320D0A3A31303546463030308F
+:104E2000333433343333333033333331304430413C
+:104E30003341333133303338343533333330333037
+:104E400042300D0A3A313036303030303033303382
+:104E50003333303333333333333332333333363323
+:104E60003333363333333933333332333335430D1E
+:104E70000A3A31303630313030303338333333332F
+:104E800033333337333333323333333033333330F5
+:104E90003333333033333337333334440D0A3A3119
+:104EA00030363032303030333034363432304430D3
+:104EB00041334133313330333834353334333033A5
+:104EC0003033303333333236300D0A3A3130363006
+:104ED00033303030333333363333333033343332AB
+:104EE0003333333233343335333333303333333195
+:104EF0003333333033360D0A3A31303630343030D4
+:104F00003033333330333333303334333333333379
+:104F1000333333333033343335333333363432345D
+:104F20003630300D0A3A313036303530303030449A
+:104F30003041334133313330333834353335333026
+:104F4000333033303330343433303431333333343B
+:104F50000D0A3A3130363036303030343133333375
+:104F6000313333333033333338333433343334330E
+:104F7000313333333033333330333346370D0A3A3A
+:104F800031303630373030303330333333363333FB
+:104F900033343333333033333330333333343331E7
+:104FA000333530443041334133430D0A3A313036E2
+:104FB00030383030303331333033383435333633C2
+:104FC00030333033303334333233333333333333BA
+:104FD000313333333044390D0A3A313036303930D9
+:104FE000303033333331333333303333333033339F
+:104FF0003333333333383334333633343335333375
+:10500000333043460D0A3A31303630413030303398
+:105010003333343333333033333330333333303467
+:10502000323331304430413341333133303338302F
+:10503000330D0A3A31303630423030303435333780
+:105040003330333033303333333833333337333330
+:1050500033303333333033333330333341330D0A6A
+:105060003A3130363043303030333033333332330B
+:105070003333303334333333333333333333303305
+:1050800034333633333332333041390D0A3A313029
+:1050900036304430303034343330343133333431DB
+:1050A00034363332304430413341333133303338A6
+:1050B00034353338333038380D0A3A3130363045EC
+:1050C00030303033303330333333313333333033C4
+:1050D000333338333433343334333233333330339C
+:1050E00033333038410D0A3A3130363046303030C3
+:1050F0003333333033333335333333343333333083
+:105100003333333233333332333333333333333272
+:1051100037360D0A3A3130363130303030333333B0
+:105120003233393436304430413341333133303324
+:105130003834353339333033303330333338300D5E
+:105140000A3A31303631313030303335333333365B
+:105150003334333633333337333333323333333615
+:105160003333333333333331333334320D0A3A315B
+:10517000303631323030303330333333343333330D
+:1051800037333333303333333133333334333333EF
+:105190003633333332333833410D0A3A3130363116
+:1051A00033303030333630443041334133313330B3
+:1051B00033383435343133303330333033343332C1
+:1051C0003333333935370D0A3A31303631343030F4
+:1051D00030333333323333333133343333333433A3
+:1051E0003333333330333333323334333533333390
+:1051F0003232320D0A3A31303631353030303330D8
+:105200003434333034313333343133333331333373
+:10521000333033333338333934323044304132323F
+:105220000D0A3A3130363136303030334133313394
+:105230003033383435343233303330333033343341
+:10524000343334333333333330333345300D0A3A68
+:10525000313036313730303033303333333033332D
+:105260003332333433363333333933333336333302
+:10527000333033333338333345370D0A3A31303630
+:1052800031383030303330333333303333333133FC
+:1052900033333333333339333434363044304133BA
+:1052A000413331333031410D0A3A31303631393002
+:1052B00030303338343534333330333033303333C4
+:1052C00033393333333333333333333333353333A6
+:1052D000333941330D0A3A313036314130303033D1
+:1052E0003333323333333633333335333333353388
+:1052F000333330333333363333333433333335426C
+:10530000360D0A3A313036314230303033333335AE
+:10531000333333373333333433353334304430413C
+:1053200033413331333033383435343443410D0A6B
+:105330003A3130363143303030333033303330333C
+:105340003333323333333333343336333333353328
+:1053500033333533343331333441310D0A3A31305C
+:10536000363144303030333233303434333034310A
+:1053700033333431333333313333333033333338FE
+:1053800033343334333436360D0A3A31303631451E
+:1053900030303033343333333033353338304430D6
+:1053A00041334133313330333834353435333033AE
+:1053B00030333041370D0A3A3130363146303030F3
+:1053C00033333330333333303333333033333334B5
+:1053D00033333330333333303333333233333333A4
+:1053E00037450D0A3A3130363230303030333333CE
+:1053F0003533333335333433323333333933333373
+:105400003533333331333433333333333834450D79
+:105410000A3A31303632313030303333333330447E
+:10542000304133413331333033383435343633302F
+:105430003330333033333330333337440D0A3A317A
+:105440003036323230303033323334333233333338
+:105450003933333339333333313334333433333310
+:105460003033333330333333390D0A3A3130363257
+:105470003330303033323333333033333336333306
+:1054800033343333333333333331333333343332ED
+:105490003333304435360D0A3A3130363234303019
+:1054A00030304133413331333033383436333033B5
+:1054B00030333033303333333533333332333333C4
+:1054C0003733340D0A3A31303632353030303333F9
+:1054D000333833303434333034313333343133339D
+:1054E000333133333330333333383334333445307B
+:1054F0000D0A3A31303632363030303334333533CA
+:105500003333303333333033333330333333333374
+:10551000353335304430413341333134410D0A3A6B
+:10552000313036323730303033303338343633314F
+:105530003330333033303333333833333332333340
+:10554000333133343334333345300D0A3A31303666
+:105550003238303030333033333330333333323327
+:105560003433333333333433333332333433343308
+:10557000343334333345300D0A3A31303632393032
+:1055800030303332333333303333333733333332F2
+:1055900034353334304430413341333133303338B0
+:1055A000343646310D0A3A313036324130303033FC
+:1055B00032333033303330333433363333333233C2
+:1055C000333335333333303334333233333330439F
+:1055D000390D0A3A313036324230303033333330DD
+:1055E000333333313333333333333332333333328F
+:1055F00033343333333433333333333242340D0AB9
+:105600003A31303632433030303333333033333362
+:105610003034353332304430413341333133303339
+:1056200038343633333330333043450D0A3A313072
+:105630003632443030303330333433353330343431
+:105640003330343133333431333333313333333034
+:1056500033333338333436360D0A3A313036324547
+:105660003030303334333433363333333033333311
+:105670003033333330333333313334333433333300
+:1056800030333338350D0A3A313036324630303027
+:1056900033303331333330443041334133313330BD
+:1056A00033383436333433303330333033343333C8
+:1056B00041460D0A3A3130363330303030333333EF
+:1056C00032333333303333333333343331333333AF
+:1056D0003133333330333333343334333636320DBE
+:1056E0000A3A3130363331303030333333323333BA
+:1056F0003333333333353333333333333333333378
+:105700003339333333323433333233380D0A3A31A9
+:10571000303633323030303044304133413331333E
+:10572000303338343633353330333033303333334A
+:105730003333333338333337340D0A3A3130363379
+:105740003330303033323333333133343333333334
+:105750003338333333303333333233333332333319
+:105760003336333332430D0A3A3130363334303046
+:1057700030333933333332333333323333333533F6
+:1057800030343433303431333133353044304133D5
+:105790004134360D0A3A313036333530303033311A
+:1057A00033303338343633363330333033303333C9
+:1057B00034313333333133333330333333384632A8
+:1057C0000D0A3A31303633363030303334333533F6
+:1057D00033333033333330333333303333333033A5
+:1057E000333334333333333333333230360D0A3AD1
+:1057F000313036333730303033333339333333327B
+:105800003334333633333339343133363044304143
+:10581000334133313330333831350D0A3A31303694
+:10582000333830303034363337333033303330334D
+:105830003333323333333033333332333333303340
+:10584000333330333344410D0A3A31303633393053
+:105850003030333033343333333333323333333024
+:10586000333433343333333033333330333333330C
+:10587000333344370D0A3A31303633413030303328
+:1058800032333333363333333934323330304430D8
+:1058900041334133313330333834363338333044A5
+:1058A000430D0A3A31303633423030303330333002
+:1058B00033333332333433363333333033333332B9
+:1058C00033333339333433313333333941390D0AD8
+:1058D0003A3130363343303030333333323333338D
+:1058E0003133333339333333393330343433303481
+:1058F00031333334313333333136460D0A3A3130B4
+:10590000363344303030333333303433343430444E
+:105910003041334133313330333834363339333037
+:1059200033303330333341370D0A3A313036334573
+:10593000303030333833343335333333313333333A
+:105940003033333330333333303334333233333330
+:1059500034333337460D0A3A31303633463030303F
+:10596000333033333332333333333333333233330C
+:1059700033303333333433333330333333343338F6
+:1059800037310D0A3A31303634303030303435303A
+:1059900044304133413331333033383436343133AA
+:1059A0003033303330333333393333333037370DEB
+:1059B0000A3A3130363431303030333433313333E6
+:1059C000333933333339333333313334333233339D
+:1059D0003334333333303333333234360D0A3A31E0
+:1059E000303634323030303333333233333338338C
+:1059F0003333393333333133343332333333343372
+:105A00003533323044304138310D0A3A3130363492
+:105A1000333030303341333133303338343634324D
+:105A20003330333033303333333033333332333452
+:105A30003333333330460D0A3A3130363434303074
+:105A40003033343334333633333330333433323327
+:105A50003433363330343433303431333334313318
+:105A60003345460D0A3A3130363435303030333133
+:105A700033333330333333383334333533333332F2
+:105A800033373339304430413341333133303444A8
+:105A90000D0A3A313036343630303033383436341B
+:105AA00033333033303330333333303333333033D5
+:105AB000333330333433313333333145390D0A3AEC
+:105AC00031303634373030303333333933333334A5
+:105AD000333333393333333233333331333433368F
+:105AE000333333313333333444460D0A3A313036AD
+:105AF0003438303030333333393333333233343373
+:105B00003333333434304430413341333133303341
+:105B1000383436343445390D0A3A31303634393078
+:105B2000303033303330333033333336333333364E
+:105B3000333333393333333833333332333333312D
+:105B4000333443360D0A3A31303634413030303355
+:105B50003333343333333333343333333633333310
+:105B600032333333383333333233333331333442F4
+:105B7000350D0A3A31303634423030303331333437
+:105B800033333331333030443041334133313330C8
+:105B900033383436343533303330333044450D0AFE
+:105BA0003A313036344330303033333336333333B5
+:105BB00035333333393333333033333338333034AD
+:105BC00034333034313333343136380D0A3A3130EE
+:105BD000363444303030333333313333333033338E
+:105BE0003338333433353333333333333330333380
+:105BF00033303333333039320D0A3A3130363445AD
+:105C00003030303338333330443041334133313343
+:105C10003033383436343633303330333033333353
+:105C200038333339440D0A3A313036344630303067
+:105C30003332333333313333333833343333333331
+:105C4000333433333335333333323333333833331D
+:105C500036320D0A3A313036353030303033323367
+:105C600033333133333336333333333333333833FE
+:105C70003333393333333133313431304436430DF8
+:105C80000A3A3130363531303030304133413331FA
+:105C900033303339333033303330333033303334DF
+:105CA0003333333433333333333037430D0A3A31FC
+:105CB00030363532303030333333323334333333BC
+:105CC000333336333333323333333933333330339F
+:105CD0003333323333333133390D0A3A31303635D9
+:105CE000333030303333333233333331333333348F
+:105CF000333333323333333133303337304430415D
+:105D00003341333137390D0A3A313036353430309A
+:105D10003033303339333033313330333033303361
+:105D2000333331333433323330343433303431334A
+:105D30003330460D0A3A3130363535303030343173
+:105D40003333333133333330333333383334333520
+:105D500033333334333333303333333033334646F2
+:105D60000D0A3A3130363536303030333033343353
+:105D700033333333363333333633333432304430E2
+:105D8000413341333133303339333033320D0A3A12
+:105D900031303635373030303332333033303330E2
+:105DA00033333332333333393333333233333330C2
+:105DB000333333333333333646310D0A3A313036E9
+:105DC00035383030303333333433333337333333A0
+:105DD0003233343336333333323333333033333394
+:105DE000343334333344350D0A3A313036353930B3
+:105DF0003030333333343333333634353334304463
+:105E0000304133413331333033393330333333304E
+:105E1000333030340D0A3A3130363541303030339A
+:105E20003033333331333333393333333233333342
+:105E30003033333332333333363333333433334223
+:105E4000420D0A3A31303635423030303337333351
+:105E5000333433333331333333343333333933330C
+:105E600033313333333633333333333041330D0A45
+:105E70003A313036354330303034343331333830E2
+:105E800044304133413331333033393330333433B9
+:105E900030333033303330343143450D0A3A31300A
+:105EA00036354430303033333431333333313333B8
+:105EB00033303333333833343335333333353333AB
+:105EC00033303333333037450D0A3A3130363545C8
+:105ED000303030333333303334333333333336339A
+:105EE0003333353333333933333339333333323474
+:105EF00035333735370D0A3A3130363546303030A4
+:105F0000304430413341333133303339333033353A
+:105F1000333033303330333333303333333333335D
+:105F200042460D0A3A31303636303030303336336F
+:105F30003333343333333733333338333433363323
+:105F40003333323333333033333335333434410D39
+:105F50000A3A31303636313030303333333333343C
+:105F600033333335333333313333333933333332FC
+:105F70003431343630443041334136420D0A3A31FF
+:105F800030363632303030333133303339333033EA
+:105F900036333033303330333333303333333333DA
+:105FA0003333363334333334310D0A3A3130363605
+:105FB00033303030333333373333333033333331BB
+:105FC00033333330333333303333333033343336A6
+:105FD0003333333532450D0A3A31303636343030CA
+:105FE000303330343433303431333334313333338A
+:105FF0003134363436304430413341333133303349
+:106000003931360D0A3A31303636353030303330AA
+:106010003337333033303330333333303333333853
+:10602000333433353333333633333330333330442F
+:106030000D0A3A3130363636303030333033333380
+:106040003033333332333333343333333533333321
+:10605000313333333433333333333346460D0A3A33
+:1060600031303636373030303335333333353334FF
+:1060700033333339343430443041334133313330C6
+:10608000333933303338333031360D0A3A31303624
+:1060900036383030303330333033333334333333D6
+:1060A00035333333333333333233333334333333BE
+:1060B000343333333244440D0A3A313036363930D2
+:1060C00030303333333933333332333433323334A0
+:1060D000333333333332333333343333333633338D
+:1060E000333143330D0A3A313036364130303033B4
+:1060F0003333343338333730443041334133313341
+:10610000303339333033393330333033303333464F
+:10611000440D0A3A3130363642303030333333337F
+:106120003336333333363334333333333334333337
+:1061300033363333333333343334333339440D0A62
+:106140003A3130363643303030333533303434330F
+:106150003034313333343133333331333333303319
+:1061600033333833343335343136300D0A3A313045
+:1061700036364430303033393044304133413331B6
+:1061800033303339333034313330333033303333E9
+:1061900033373333333043380D0A3A3130363645EE
+:1061A00030303033333330333333303333333233CF
+:1061B00033333433333333333433313333333933A9
+:1061C00033333237430D0A3A3130363646303030C9
+:1061D0003334333133333337333333373333333883
+:1061E000333333363333333133363336304430415F
+:1061F00041360D0A3A3130363730303030334133A2
+:106200003133303339333034323330333033303369
+:106210003333363334333333333330333334440D61
+:106220000A3A31303637313030303332333333326B
+:10623000333333383333333533343335333333391E
+:106240003333333433333330333333440D0A3A3159
+:106250003036373230303033343334333133333314
+:1062600039333333363333333133333436304430E8
+:106270004133413331333036430D0A3A313036370A
+:1062800033303030333933303433333033303330EC
+:1062900033343332333333303333333033333332D5
+:1062A0003333333332360D0A3A3130363734303007
+:1062B00030333433313330343433303431333334B6
+:1062C000313333333133333330333333383334339F
+:1062D0003546300D0A3A31303637353030303333C9
+:1062E000333833333330333333303339333130446D
+:1062F0003041334133313330333933303434334642
+:106300000D0A3A31303637363030303330333033AF
+:10631000303333333033343333333333363333334F
+:10632000353333333633333330333346460D0A3A5D
+:106330003130363737303030333233333330333334
+:106340003333333433313333333933333336333414
+:10635000333533333339333344430D0A3A3130362E
+:106360003738303030333433333330333233353001
+:1063700044304133413331333033393330343533C2
+:10638000303330333031420D0A3A3130363739301C
+:1063900030303333333433333332333333383333CE
+:1063A00033353334333533333339333333363333AF
+:1063B000333042390D0A3A313036374130303033DC
+:1063C0003333343334333333333336333333353396
+:1063D000333336333333333333333233333330427F
+:1063E000330D0A3A313036374230303033313433BE
+:1063F0003044304133413331333033393330343644
+:1064000033303330333033333333333444410D0A94
+:106410003A31303637433030303331333333313340
+:106420003034343330343133333431333333313344
+:1064300033333033333338333437350D0A3A313070
+:106440003637443030303335333333393333333008
+:10645000333333303333333033343331333333390D
+:1064600033353339304441330D0A3A31303637450C
+:1064700030303030413341333133303339333133DD
+:1064800030333033303330333333363334333533E2
+:1064900033333939430D0A3A3130363746303030EC
+:1064A00033333336333333303333333433333330BE
+:1064B00033343333333333363333333033333335A9
+:1064C00036380D0A3A3130363830303030333333E5
+:1064D0003433333330333333323333333033333392
+:1064E0003433303339304430413341333141340D6A
+:1064F0000A3A313036383130303033303339333195
+:106500003331333033303330333333323333333268
+:106510003333333033333334333435350D0A3A3192
+:10652000303638323030303336333333343333333C
+:106530003033333334333333393333333833333322
+:106540003233333336333332390D0A3A3130363859
+:106550003330303033363333333133333331333414
+:1065600033353436333330443041334133313330D3
+:106570003339333135430D0A3A313036383430301F
+:1065800030333233303330333033303434333034EB
+:1065900031333334313333333133333330333333D3
+:1065A0003846420D0A3A31303638353030303334DF
+:1065B00033353334333133333330333333303333B0
+:1065C000333033333335333333363333333230428E
+:1065D0000D0A3A31303638363030303333333733D2
+:1065E0003333353333333630443041334133313351
+:1065F000303339333133333330333033450D0A3AA6
+:10660000313036383730303033303333333633345B
+:10661000333633333337333333353333333633333E
+:10662000333933333337333344310D0A3A3130366B
+:10663000383830303033303334333333333333332B
+:106640003333303333333833333336333333303318
+:10665000333332333344390D0A3A31303638393036
+:1066600030303335343333363044304133413331D5
+:1066700033303339333133343330333033303334F0
+:10668000333330330D0A3A3130363841303030331D
+:1066900033333733333330333333313333333033CE
+:1066A00033333033333330333333323333333643AE
+:1066B000300D0A3A313036384230303033333333EC
+:1066C000333333313333333133333334333034349E
+:1066D00033303431333334313333333238350D0AD8
+:1066E0003A31303638433030303044304133413342
+:1066F0003133303339333133353330333033303372
+:1067000033333133333330333345440D0A3A313088
+:106710003638443030303338333433353334333231
+:106720003333333033333330333333303333333045
+:1067300033333336333338390D0A3A31303638454E
+:106740003030303335333333363333333033333320
+:1067500036333333343333333634323435304430F4
+:1067600041334139360D0A3A31303638463030300F
+:1067700033313330333933313336333033303330F0
+:1067800033333331333333333333333233333332DD
+:1067900037330D0A3A313036393030303033333315
+:1067A00031333333333334333633343336333333B3
+:1067B0003133333333333333393333333934370DC0
+:1067C0000A3A3130363931303030333333313333C4
+:1067D0003333333333373333333733393436304469
+:1067E0003041334133313330333936460D0A3A3193
+:1067F0003036393230303033313337333033303371
+:10680000303334333333333334333333323333335A
+:106810003033333339333333410D0A3A313036397B
+:106820003330303033323333333033333332333346
+:10683000333133333335333034343330343133332D
+:106840003431333330350D0A3A3130363934303063
+:106850003033313333333033333338343633393004
+:1068600044304133413331333033393331333833CA
+:106870003034350D0A3A3130363935303030333036
+:1068800033303334333533343333333333303333DA
+:1068900033303333333033343331333333313135D1
+:1068A0000D0A3A3130363936303030333333303305
+:1068B00033333533343333333333343334333633A0
+:1068C000333330333333393333333246300D0A3ACE
+:1068D0003130363937303030333333303336333884
+:1068E000304430413341333133303339333133394C
+:1068F000333033303330333332450D0A3A313036AA
+:106900003938303030333333343331333333393350
+:106910003333303333333533333332333333383344
+:10692000333330333344320D0A3A3130363939306B
+:106930003030333033343333333333343333333928
+:106940003333333033333339333333323333333018
+:10695000333742460D0A3A31303639413030303320
+:1069600038304430413341333133303339333134CB
+:1069700031333033303330333333323334333146E1
+:10698000380D0A3A31303639423030303333333112
+:1069900033333330333333363333333433343335C3
+:1069A00033303434333034313333343137450D0AF6
+:1069B0003A31303639433030303333333133333397
+:1069C0003033333338333433353334333433333390
+:1069D00030333933393044304144380D0A3A31309C
+:1069E0003639443030303341333133303339333159
+:1069F0003432333033303330333333303333333076
+:106A000033343333333338300D0A3A313036394585
+:106A1000303030333433333337333333303333334D
+:106A20003933333332333333303333333333343333
+:106A300031333337340D0A3A31303639463030305D
+:106A40003339333333303333333633333330333313
+:106A500033383335343230443041334133313330DD
+:106A600039420D0A3A313036413030303033393323
+:106A700031343333303330333033333330333333F3
+:106A80003033333332333333343333333634450DE9
+:106A90000A3A3130364131303030333433313334E7
+:106AA00033333333333633333336333333333333B0
+:106AB0003332333333343333333533450D0A3A31DC
+:106AC000303641323030303333333233333339338D
+:106AD000333332333433383044304133413331335C
+:106AE0003033393331343436340D0A3A31303641AB
+:106AF0003330303033303330333033343335333474
+:106B00003336333333363333333433303434333052
+:106B10003431333330420D0A3A313036413430307B
+:106B20003034313333333133333330333333383339
+:106B30003433353334333533333330333333303325
+:106B40003330380D0A3A3130364135303030333059
+:106B500033333330333633363044304133413331DD
+:106B600033303339333134353330333033303436F6
+:106B70000D0A3A3130364136303030333333363324
+:106B800033333733333334333333303333333433D2
+:106B9000333336333333303333333745430D0A3AE7
+:106BA00031303641373030303333333033333332B2
+:106BB000333333343333333733333338333333339B
+:106BC000333333343333333045320D0A3A313036D0
+:106BD0004138303030333433313044304133413355
+:106BE000313330333933313436333033303330337B
+:106BF000343331333331370D0A3A3130364139309D
+:106C00003030333033333330333333303334333362
+:106C1000333333353333333033333339333433333E
+:106C2000333343380D0A3A31303641413030303356
+:106C30003033333332333333323333333633333326
+:106C400033333333323333333033313432304444FB
+:106C5000350D0A3A3130364142303030304133411F
+:106C60003331333033393332333033303330333000
+:106C700033333338333034343330343142360D0A21
+:106C80003A313036414330303033333431333333BB
+:106C900031333333303333333833343335333433C0
+:106CA00036333333303333333038370D0A3A3130FB
+:106CB000364144303030333333303333333733338A
+:106CC000333833333332333333343334343330447F
+:106CD00030413341333142390D0A3A313036414582
+:106CE0003030303330333933323331333033303383
+:106CF000303333333133333334333333303333336B
+:106D000030333338360D0A3A313036414630303080
+:106D10003332333333363333333533333331333341
+:106D20003332333333363333333333333332333332
+:106D300036330D0A3A313036423030303033373363
+:106D4000333338333333323333333433313339300D
+:106D50004430413341333133303339333239300DFC
+:106D60000A3A31303642313030303332333033301A
+:106D700033303333333133343335333333303333E8
+:106D80003330333333323333333635320D0A3A311D
+:106D900030364232303030333333353333333633B9
+:106DA00033333233333336333333333333333233B2
+:106DB0003333363333333532410D0A3A31303642CC
+:106DC000333030303330343433303431333433369D
+:106DD000304430413341333133303339333233335C
+:106DE0003330333035360D0A3A31303642343030B4
+:106DF000303330333334313333333133333330336F
+:106E0000333338333433363333333033333330334F
+:106E10003330430D0A3A313036423530303033307A
+:106E2000333333303333333733333338333333322D
+:106E300033333334333333323333333833334645F8
+:106E40000D0A3A3130364236303030333034353353
+:106E500036304430413341333133303339333233D8
+:106E6000343330333033303333333033360D0A3A42
+:106E700031303642373030303333333233333334DA
+:106E800033333334333333323333333233333336D0
+:106E9000333333333333333245340D0A3A313036FA
+:106EA00042383030303334333233333331333333A9
+:106EB000333333333533333337333333303333339F
+:106EC000323435333143350D0A3A313036423930B8
+:106ED0003030304430413341333133303339333261
+:106EE0003335333033303330333333373333333771
+:106EF000333330430D0A3A3130364241303030338B
+:106F0000383333333333333337333333303333334B
+:106F10003233333330333333303334333233334239
+:106F2000360D0A3A31303642423030303331333068
+:106F30003434333034313333343133333331333326
+:106F400033303331333730443041334143420D0A1B
+:106F50003A313036424330303033313330333933E5
+:106F600032333633303330333033333338333433F2
+:106F700036333333313333333039370D0A3A313026
+:106F800036424430303033333330333333303333BD
+:106F900033303334333333333335333333303333C4
+:106FA00033383333333838340D0A3A3130364245CA
+:106FB00030303033333330333333323333333233AF
+:106FC0003333363431343430443041334133313368
+:106FD00030333939460D0A3A313036424630303096
+:106FE0003332333733303330333033333333333377
+:106FF000333233333337333333383333333233335A
+:1070000036340D0A3A31303643303030303337338E
+:107010003333303333333433333330333333303348
+:107020003333323333333633333335333335340D4F
+:107030000A3A313036433130303033313333333242
+:1070400033333336343233373044304133413331E4
+:107050003330333933323338333037370D0A3A313E
+:1070600030364332303030333033303333333333F0
+:1070700033333233333337333333383333333233D9
+:107080003333373333333033320D0A3A313036430A
+:1070900033303030333333323330343433303431CF
+:1070A00033333431333333313333333033333338B1
+:1070B0003334333646410D0A3A31303643343030BA
+:1070C0003033333332343434343044304133413369
+:1070D0003133303339333233393330333033303383
+:1070E0003333450D0A3A31303643353030303330A2
+:1070F0003333333033333330333333303333333666
+:107100003333333033333330333333323333313457
+:107110000D0A3A313036433630303033363333337C
+:107120003533333336333333323333333633333328
+:10713000333333333233333337343144390D0A3A4E
+:1071400031303643373030303331304430413341E1
+:107150003331333033393332343133303330333009
+:10716000333333383333333232350D0A3A31303634
+:1071700043383030303333333733333330333333D2
+:1071800038333333303333333033333332333333D1
+:10719000343333333644310D0A3A313036433930E3
+:1071A00030303333333433343333333433333333B2
+:1071B000333633333330333333313336333830448B
+:1071C000304130410D0A3A313036434130303033AE
+:1071D0004133313330333933323432333033303377
+:1071E0003033333334333333303333333033344168
+:1071F000420D0A3A31303643423030303336333381
+:10720000333833303434333034313333343133334F
+:1072100033313333333033333338333437340D0A87
+:107220003A3130364343303030333633333333330F
+:107230003333303333333033333330343133393025
+:1072400044304133413331333044330D0A3A313025
+:1072500036434430303033393332343333303330E3
+:1072600033303333333233333336333333333333EF
+:1072700033323334333237370D0A3A3130364345FF
+:1072800030303033333331333333333333333533D7
+:1072900033333233333334333333373334333133BB
+:1072A00033333936420D0A3A3130364346303030C6
+:1072B000333333323334333433333337333333329A
+:1072C0003044304133413331333033393332343465
+:1072D00039370D0A3A3130364430303030333033BC
+:1072E000303330333333313333333833333337336D
+:1072F0003433353333333933343332333334430D6A
+:107300000A3A31303644313030303330333333346D
+:107310003333333333333338333333353333333138
+:107320003334333233343333333333460D0A3A3163
+:10733000303644323030303330333333323331331C
+:1073400032304430413341333133303339333234E6
+:107350003533303330333037390D0A3A3130364433
+:1073600033303030333333373333333033303434F6
+:1073700033303431333334313333333133333330E7
+:107380003333333846420D0A3A31303644343030E4
+:1073900030333433363333333433333330333333BE
+:1073A00030333333303333333233343336333333B0
+:1073B0003631310D0A3A31303644353030303337DA
+:1073C0003335304430413341333133303339333264
+:1073D000343633303330333033333337333333377A
+:1073E0000D0A3A31303644363030303330333333AF
+:1073F0003733333330333333303333333233333360
+:10740000363333333633333337333345460D0A3A65
+:10741000313036443730303033353333333733332C
+:107420003336333333313333333333343336333327
+:10743000333733313338304446370D0A3A3130363A
+:1074400044383030303041334133313330333933E5
+:107450003333303330333033303333333733333304
+:10746000303333333646430D0A3A313036443930FF
+:1074700030303333333033333330333333353333E6
+:1074800033373333333733333331333333323334C6
+:10749000333642450D0A3A313036444130303033CC
+:1074A00033333233333337333333363333333533A4
+:1074B0003034343333333330443041334133314566
+:1074C000370D0A3A313036444230303033303339B8
+:1074D000333333313330333033303330343133338B
+:1074E00034313333333133333330333339370D0AB7
+:1074F0003A31303644433030303338333433363336
+:107500003333353333333033333330333333303352
+:1075100033333033343335333339310D0A3A313084
+:107520003644443030303330333333303333333018
+:1075300033343333333134343044304133413331F5
+:1075400033303339333343330D0A3A31303644451F
+:10755000303030333233303330333033333334330D
+:1075600033333033333338333333383333333033E7
+:1075700033333237390D0A3A313036444630303001
+:1075800033333332333433333333333233333330CF
+:1075900033333331333333343333333033333332C0
+:1075A00036430D0A3A3130364530303030333333DC
+:1075B0003033333334333033353044304133413377
+:1075C0003133303339333333333330333041320DA9
+:1075D0000A3A31303645313030303330333333339B
+:1075E000333333313333333233333336333333346A
+:1075F0003333333133333330333334390D0A3A31A3
+:10760000303645323030303334333333363333333E
+:10761000303334333333343332333034343330343F
+:107620003133333431333330390D0A3A3130364562
+:1076300033303030333133323432304430413341FF
+:107640003331333033393333333433303330333011
+:107650003333333036380D0A3A3130364534303032
+:1076600030333333383334333633333336333333E1
+:1076700030333333303333333033343335333433DF
+:107680003230430D0A3A31303645353030303333FD
+:1076900033333334333333333330333333343333BB
+:1076A0003330333333303333333134323337463896
+:1076B0000D0A3A31303645363030303044304133BF
+:1076C000413331333033393333333533303330337F
+:1076D000303333333833333337333433360D0A3AB8
+:1076E0003130364537303030333533333339333456
+:1076F000333233333330333333343333333333335D
+:10770000333833333335333344350D0A3A31303679
+:10771000453830303033313334333333333330332F
+:107720003333303333333233333332343133323033
+:10773000443041334131360D0A3A31303645393023
+:107740003030333133303339333333363330333011
+:1077500033303334333633333336333333373333F1
+:10776000333042460D0A3A313036454130303033FD
+:1077700033333733333330333333303334333233DB
+:1077800033333933303434333034313333343138C4
+:10779000370D0A3A313036454230303033333331E9
+:1077A000333333303333333833343336343433389C
+:1077B00030443041334133313330333943460D0A9D
+:1077C0003A3130364543303030333333373330336A
+:1077D0003033303333333733333330333333303381
+:1077E00033333033333332333339440D0A3A3130A3
+:1077F0003645443030303336333333363333333732
+:107800003333333533333337333333363333333141
+:1078100033333333333437300D0A3A31303645455C
+:107820003030303336333333373333333733393320
+:1078300037304430413341333133303339333333EC
+:1078400038333041320D0A3A313036454630303027
+:107850003330333033333330333333363333333001
+:1078600033333330333333353333333733333337E1
+:1078700036340D0A3A313036463030303033333317
+:1078800031333333323334333633333332333333C8
+:107890003733333330333433353333333035300DDE
+:1078A0000A3A3130364631303030333333303338C2
+:1078B000343430443041334133313330333933336E
+:1078C0003339333033303330333337380D0A3A31CC
+:1078D0003036463230303033303333333433333371
+:1078E000333333333033333339333333303330346A
+:1078F0003433303431333331410D0A3A3130364686
+:107900003330303034313333333133333330333356
+:10791000333833343336333333383333333033332C
+:107920003330343446460D0A3A313036463430303E
+:1079300030333530443041334133313330333933F0
+:107940003334313330333033303333333033333314
+:107950003035370D0A3A3130364635303030333431
+:1079600033333333333433333330333333393334E2
+:1079700033333333333033333332333333303032E2
+:107980000D0A3A3130364636303030333333363301
+:1079900033333633333333333333323334333333B4
+:1079A000333332333633323044304133390D0A3ACF
+:1079B000313036463730303033413331333033397C
+:1079C0003333343233303330333033333330333393
+:1079D000333133333334333344370D0A3A313036AD
+:1079E000463830303033303333333233333332335D
+:1079F0003333363333333433333331333433353352
+:107A0000343332333344310D0A3A3130364639306B
+:107A1000303033333334333333333330333333343D
+:107A200033333330333533383044304133413331FD
+:107A3000333030420D0A3A3130364641303030333F
+:107A4000393333343333303330333033333330330B
+:107A500033333933343331333034343330343138F1
+:107A6000390D0A3A31303646423030303333343112
+:107A700033333331333333303333333833343336D2
+:107A800033333339333333303333333038460D0AFD
+:107A90003A3130364643303030333333303333339A
+:107AA0003133333338333933313044304133413378
+:107AB00031333033393333343443330D0A3A3130D0
+:107AC000364644303030333033303330333333376D
+:107AD0003334333533333339333433323333333070
+:107AE00033333334333337460D0A3A313036464573
+:107AF0003030303332333433363333333633333359
+:107B00003733333330333333373333333033333343
+:107B100030333336430D0A3A313036464630303052
+:107B200033323333333633313435304430413341FB
+:107B3000333133303339333334353330333033301A
+:107B400038440D0A3A313037303030303033333347
+:107B500036333333373333333533333337333333E8
+:107B60003633333331333333333334333633450DF4
+:107B70000A3A313037303130303033333337333302
+:107B800033373333333033333336333333303333C4
+:107B90003330333433363334333533370D0A3A31F7
+:107BA0003037303230303033303335304430413399
+:107BB0004133313330333933333436333033303388
+:107BC0003033303434333036330D0A3A31303730D5
+:107BD0003330303034313333343133333331333382
+:107BE0003330333333383334333633343331333360
+:107BF0003330333330340D0A3A31303730343030AB
+:107C00003033303333333033333335333333373347
+:107C10003333373333333133333332333633363030
+:107C20004432460D0A3A3130373035303030304149
+:107C3000334133313330333933343330333033300D
+:107C400033303333333633333337333433353232FF
+:107C50000D0A3A3130373036303030333333333346
+:107C600033333833333332333333373333333333DC
+:107C7000333334333333303333333245420D0A3AFE
+:107C800031303730373030303333333833343332C8
+:107C900033333330333333323333333033303331C0
+:107CA000304430413341333133310D0A3A313037CA
+:107CB000303830303033303339333433313330339C
+:107CC0003033303333333333333330333333303390
+:107CD000343333333344430D0A3A3130373039309B
+:107CE0003030333433333332333333303333333967
+:107CF0003334333133333339333433333333333150
+:107D0000333342390D0A3A31303730413030303375
+:107D10003633303434333034313333343133333336
+:107D200032304430413341333133303339333443EB
+:107D3000440D0A3A3130373042303030333233304C
+:107D40003330333033333331333333303333333809
+:107D500033343336333433323333333041390D0A2D
+:107D60003A313037304330303033333330333333DC
+:107D700030333433363334333533343336333433CA
+:107D800036333333313333333838340D0A3A313004
+:107D9000373044303030333333373334333533389E
+:107DA0003436304430413341333133303339333476
+:107DB00033333330333041440D0A3A3130373045B4
+:107DC0003030303330333333393334333233333389
+:107DD0003033333334333333333333333833333370
+:107DE00032333336420D0A3A313037304630303094
+:107DF0003331333433333333333433333330333356
+:107E0000333233333332333433363333333933333A
+:107E100035420D0A3A313037313030303033373473
+:107E200032343530443041334133313330333933F8
+:107E30003433343330333033303333333037420D2F
+:107E40000A3A31303731313030303333333733332E
+:107E500033303333333033333332333333363333F6
+:107E60003339333333373334333433330D0A3A3120
+:107E700030373132303030333333363330343433DB
+:107E800030343133333431333333313333333033CC
+:107E90003333383331333930310D0A3A31303731F9
+:107EA0003330303030443041334133313330333983
+:107EB0003334333533303330333033343336333493
+:107EC0003333333336370D0A3A31303731343030CB
+:107ED000303330333333303333333033333335337C
+:107EE000333337333333393333333133333333335A
+:107EF0003330450D0A3A3130373135303030333692
+:107F00003333333933333337333333303334333339
+:107F10003333333733393431304430413341323401
+:107F20000D0A3A3130373136303030333133303377
+:107F30003933343336333033303330333333303313
+:107F4000343334333333303333333046410D0A3A2C
+:107F500031303731373030303333333333333332FA
+:107F600033333336333333373333333233333332DC
+:107F7000333333303333333744410D0A3A313037FA
+:107F800031383030303333333733333331333333C5
+:107F90003833333332343233393044304133413380
+:107FA000313330333946420D0A3A313037313930C6
+:107FB0003030333433373330333033303334333598
+:107FC000333333393334333333333330333333347C
+:107FD000333342420D0A3A31303731413030303399
+:107FE000383333333833303434333034313333345B
+:107FF000313333333133333330333333383334374E
+:10800000440D0A3A31303731423030303336333470
+:10801000333433333330343233333044304133410B
+:1080200033313330333933343338333044320D0A5B
+:108030003A3130373143303030333033303333330B
+:108040003033333330333333353333333733333300
+:1080500039333333313333333239320D0A3A313035
+:1080600037314430303033333336333333393334CC
+:1080700033353334333133333339333333373333C5
+:1080800033393333333136360D0A3A3130373145EF
+:10809000303030333433333336333230443041339D
+:1080A0004133313330333933343339333033303390
+:1080B00030333342350D0A3A3130373146303030C3
+:1080C0003330333333323333333933333339333477
+:1080D000333233333339333333313333333633336A
+:1080E00035300D0A3A3130373230303030333033BA
+:1080F0003333323333333933333339333333383340
+:108100003333393333333133333337333633360D57
+:108110000A3A31303732313030303339304430413F
+:108120003341333133303339333434313330333016
+:108130003330333333303333333237440D0A3A314B
+:10814000303732323030303333333033333330330F
+:1081500030343433303431333334313333333133F7
+:108160003333303333333830440D0A3A3130373219
+:1081700033303030333433363334333533333330D4
+:1081800033333330333333303334333134323334C5
+:108190003044304136300D0A3A31303732343030E5
+:1081A0003033413331333033393334343233303395
+:1081B0003033303333333933343334333333393387
+:1081C0003346310D0A3A31303732353030303331C1
+:1081D0003333333433333330333333323334333272
+:1081E0003333333933333330333333393333464135
+:1081F0000D0A3A31303732363030303331333333A1
+:10820000383333333033333332333333303335333E
+:10821000303044304133413331333034300D0A3A59
+:108220003130373237303030333933343433333020
+:108230003330333033333334333333333333333115
+:10824000333333323334333244320D0A3A31303738
+:1082500032383030303333333433343332333333F2
+:1082600030333333323333333033333330333333E8
+:10827000313333333844340D0A3A31303732393000
+:1082800030303333333733343335333433333333BC
+:108290003330304430413341333133303339333488
+:1082A000343445450D0A3A313037324130303033BD
+:1082B000303330333033343331333034343330349B
+:1082C0003133333431333333313333333033333980
+:1082D000360D0A3A313037324230303033383334A9
+:1082E000333633343336333333303333333033335D
+:1082F00033303333333933343332333339340D0A93
+:108300003A31303732433030303330333333343333
+:1083100036333630443041334133313330333933FF
+:1083200034343533303330333043370D0A3A31305B
+:1083300037324430303033343331333333393333FD
+:1083400033323333333933333333333433333333F7
+:1083500033303333333237370D0A3A313037324521
+:1083600030303033333330333333343333333533E6
+:1083700033333133333332333433363333333633C9
+:1083800033333736360D0A3A3130373246303030F3
+:10839000333133303044304133413331333033398A
+:1083A00033343436333033303330333333303333A4
+:1083B00041320D0A3A3130373330303030333733D1
+:1083C0003333303333333033333332333333363381
+:1083D0003333363333333733333335333334340D88
+:1083E0000A3A313037333130303033373333333684
+:1083F000333333313333333833343332333034344B
+:108400003330343133363433304432440D0A3A3168
+:108410003037333230303030413341333133303321
+:108420003933353330333033303330333334313321
+:108430003333313333333034460D0A3A3130373346
+:108440003330303033333339333333303333333005
+:1084500033333330333333303333333033333333F5
+:108460003333333632330D0A3A3130373334303028
+:1084700030333333363333333733333332333333C9
+:108480003433333337333233343044304133413390
+:108490003134430D0A3A31303733353030303330F0
+:1084A00033393335333133303330333033333331A1
+:1084B000333333313333333333333337333330338D
+:1084C0000D0A3A31303733363030303337333333C7
+:1084D0003533333337333333363333333133343364
+:1084E000333333333433333337333444420D0A3A7E
+:1084F0003130373337303030333433333332333352
+:108500003336333333363435333530443041334109
+:10851000333133303339333530380D0A3A3130376F
+:108520003338303030333233303330333033343328
+:1085300035333333393333333933333335333333FB
+:10854000363333333343330D0A3A3130373339302E
+:1085500030303334333533333330333333323334F1
+:1085600033353333333833303434333034313333D9
+:10857000343138460D0A3A313037334130303033F8
+:1085800033333133333330333133303044304133AC
+:1085900041333133303339333533333330333030A3
+:1085A000320D0A3A313037334230303033303333E2
+:1085B000333933333330333333313333333033338D
+:1085C00033303333333033333339333341320D0ABD
+:1085D0003A31303733433030303339333333353356
+:1085E0003333363333333333343336333333303357
+:1085F00033333233333339333337430D0A3A31307F
+:108600003733443030303339343433373044304109
+:10861000334133313330333933353334333033301E
+:1086200033303333333741420D0A3A313037334533
+:10863000303030333433353333333933343332330A
+:1086400033333033333334333333393334333133F7
+:1086500033333635450D0A3A313037334630303012
+:1086600033333337333433363334333533343336CB
+:1086700033343336333333313333333833353339BB
+:1086800033460D0A3A3130373430303030304430F0
+:10869000413341333133303339333533353330338C
+:1086A0003033303333333633343335333339320DBB
+:1086B0000A3A3130373431303030333933343332B1
+:1086C0003333333033333334333333343333333777
+:1086D0003330343433303431333331410D0A3A31AD
+:1086E0003037343230303034313333333133333365
+:1086F0003033333339333333303333333234363347
+:108700003930443041334135300D0A3A3130373455
+:10871000333030303331333033393335333633302F
+:108720003330333033333330333333303333333028
+:108730003333333932320D0A3A3130373434303052
+:1087400030333333383333333733343335333333F0
+:1087500039333433343333333033333331333333E6
+:108760003946370D0A3A313037343530303033330B
+:1087700033393333333633343335333333393337B3
+:108780003431304430413341333133303339314681
+:108790000D0A3A31303734363030303335333733F1
+:1087A000303330333033333339333333303333339F
+:1087B000343333333833333332333345370D0A3AB6
+:1087C000313037343730303033303333333633347D
+:1087D0003333333433333333333733333330333466
+:1087E000333633333339333343460D0A3A31303776
+:1087F0003438303030333033333330333433343350
+:10880000363435304430413341333133303339330A
+:10881000353338333046450D0A3A31303734393044
+:108820003030333033303333333233333330333328
+:108830003338333333353333333133303434333007
+:10884000343141380D0A3A31303734413030303329
+:1088500033343133333331333333303333333933E8
+:1088600033333033333333333333303333333041D3
+:10887000360D0A3A3130373442303030333333300A
+:10888000343634343044304133413331333033398A
+:1088900033353339333033303330333343330D0AE8
+:1088A0003A3130373443303030333233333334338A
+:1088B0003333373333333133343336333333323383
+:1088C00033333033333334333438380D0A3A3130BC
+:1088D0003734443030303333333333343333333657
+:1088E000333333303333333833333332333333305A
+:1088F00033333334333737350D0A3A313037344573
+:10890000303030333630443041334133313330331B
+:10891000393335343133303330333033333330332C
+:1089200033333441420D0A3A313037344630303037
+:1089300033333337333333313333333933333339F9
+:1089400033333337333433353333333933343334E8
+:1089500033460D0A3A313037353030303033333327
+:1089600030333333313333333533333338333433D4
+:108970003333333331333433323044304139390DCA
+:108980000A3A3130373531303030334133313330DA
+:1089900033393335343233303330333033343332A8
+:1089A0003333333833303434333031420D0A3A31D3
+:1089B0003037353230303034313333343133333390
+:1089C0003133333330333333393333333033333379
+:1089D0003433333330333331330D0A3A31303735B2
+:1089E0003330303033303333333033343335333363
+:1089F000333433333330343133393044304133411D
+:108A00003331333035390D0A3A313037353430307F
+:108A10003033393335343333303330333033333329
+:108A2000323333333533333338333333383333330B
+:108A30003146330D0A3A3130373535303030333442
+:108A400033343333333433333330333333323333F8
+:108A500033323334333333333331333333303031F0
+:108A60000D0A3A313037353630303033343336331F
+:108A700033333433333330333333393044304133A9
+:108A8000413331333033393335343431370D0A3AE9
+:108A900031303735373030303330333033303333B3
+:108AA0003332333433353333333133343336333392
+:108AB000333033333333333345330D0A3A313037C0
+:108AC0003538303030333433333331333333383374
+:108AD0003433333333333133343335333333313366
+:108AE000333339333443300D0A3A31303735393086
+:108AF0003030333133303434333234333044304136
+:108B00003341333133303339333534353330333027
+:108B1000333044430D0A3A31303735413030303349
+:108B2000303431333334313333333133333330331F
+:108B300033333933333330333333353333333039FD
+:108B4000350D0A3A31303735423030303333333037
+:108B500033333330333333343334333233333336E4
+:108B600033333333333333303333333439460D0A0D
+:108B70003A313037354330303033363335304430A6
+:108B80004133413331333033393335343633303395
+:108B900030333033333330333343340D0A3A3130EA
+:108BA000373544303030333033333330333433338C
+:108BB0003334333533333330333333313333333882
+:108BC00033333330333437460D0A3A313037354595
+:108BD000303030333133333331333333383333336D
+:108BE0003733343335333333393334333234353345
+:108BF00039304436420D0A3A31303735463030305C
+:108C0000304133413331333033393336333033301D
+:108C10003330333033333330333333343333333926
+:108C200038310D0A3A313037363030303033333363
+:108C300039333333373334333533333339333333F1
+:108C40003833333330333333343333333633310D16
+:108C50000A3A31303736313030303333333833300D
+:108C600034343330343133333431333333313334D8
+:108C70003333304430413341333135390D0A3A31E1
+:108C800030373632303030333033393336333133B6
+:108C900030333033303333333033333339333333AA
+:108CA0003033333336333332430D0A3A31303736CB
+:108CB0003330303033303333333033333330333396
+:108CC0003339333333393333333733343335333361
+:108CD0003339333330410D0A3A313037363430309E
+:108CE0003033393333333033333334333333323453
+:108CF0003633353044304133413331333033393317
+:108D00003633360D0A3A313037363530303033327B
+:108D1000333033303330333433323333333133342D
+:108D2000333233333330333333343333333030420D
+:108D30000D0A3A3130373636303030333333303352
+:108D400033333133333338333333373334333533E9
+:108D5000333339333333383333333044420D0A3A03
+:108D600031303736373030303333333433333339CF
+:108D70003433343530443041334133313330333997
+:108D8000333633333330333046420D0A3A313037DD
+:108D9000363830303033303333333933333337339D
+:108DA000343335333333393334333133333330338E
+:108DB000333334333342440D0A3A313037363930A5
+:108DC0003030333133343332333034343330343180
+:108DD0003333343133333331333333303333333963
+:108DE000333339340D0A3A3130373641303030338D
+:108DF0003033303339304430413341333133303321
+:108E0000393336333433303330333033333337461A
+:108E1000320D0A3A31303736423030303333333066
+:108E20003333333033333330333333383334333213
+:108E300033333332333433353333333039460D0A39
+:108E40003A313037364330303033333334333333E1
+:108E500030333333303333333433333330333433E9
+:108E600035333333313433333437460D0A3A313006
+:108E70003736443030303044304133413331333091
+:108E800033393336333533303330333033333332B1
+:108E900033333334333343350D0A3A3130373645C3
+:108EA0003030303331333333383334333533333395
+:108EB0003133343336333333303333333033333386
+:108EC00030333336420D0A3A31303736463030309F
+:108ED0003330333333303334333533333331333466
+:108EE000333633333330343133333044304133412C
+:108EF00039380D0A3A31303737303030303331338A
+:108F00003033393336333633303330333033333331
+:108F10003033333330333333303333333035370D4D
+:108F20000A3A31303737313030303333333333333B
+:108F30003334333034343330343133333431333306
+:108F40003331333333303333333931300D0A3A313F
+:108F500030373732303030333333303333333833E4
+:108F600033333033333330333233303044304133C2
+:108F70004133313330333937380D0A3A31303737EE
+:108F800033303030333633373330333033303333BC
+:108F900033303333333333333330333333373333A3
+:108FA0003332333331450D0A3A31303737343030CC
+:108FB0003033303334333333333336333333303386
+:108FC000333331333333373333333033333336336F
+:108FD0003330390D0A3A31303737353030303333AA
+:108FE0003334333633333337333933373044304126
+:108FF0003341333133303339333633383330323928
+:109000000D0A3A3130373736303030333033303381
+:10901000333337333333303333333633333330331F
+:10902000333330333333333333333845430D0A3A34
+:109030003130373737303030333333363333333200
+:1090400033333330333333343333333033333330F8
+:10905000333433323333333944390D0A3A3130370C
+:1090600037383030303333333733393334304430BA
+:10907000413341333133303339333633393330339D
+:10908000303330333330350D0A3A313037373930F9
+:1090900030303332333333333333333033303434AB
+:1090A000333034313333343133333331333333309A
+:1090B000333339420D0A3A313037374130303033AB
+:1090C000393333333033333339333333303333336A
+:1090D000303333333033333330333333343435395F
+:1090E000390D0A3A31303737423030303434304479
+:1090F0003041334133313330333933363431333027
+:1091000033303330333333303333333043440D0A69
+:109110003A31303737433030303333333033343310
+:10912000333333333533333330333433333334330E
+:1091300036333333303333333238420D0A3A313039
+:1091400037374430303033333333333433363333DB
+:1091500033363333333633333330333333353334D9
+:1091600034343044304141440D0A3A3130373745C8
+:1091700030303033413331333033393336343233B6
+:1091800030333033303333333033333330333433BD
+:1091900032333335450D0A3A3130373746303030C7
+:1091A000333133333336333333323334333533338C
+:1091B0003331333433363333333033333330333383
+:1091C00035410D0A3A3130373830303030333033B2
+:1091D0003333303333333033333331333333313369
+:1091E0003633313044304133413331333041310D46
+:1091F0000A3A31303738313030303339333634335E
+:10920000333033303330333034343330343133333C
+:109210003431333333313333333030360D0A3A316E
+:10922000303738323030303333333933333330330F
+:109230003433313333333033333330333333303308
+:109240003333333333333432450D0A3A3130373820
+:1092500033303030333333313333333433343332E8
+:1092600034313330304430413341333133303339AA
+:109270003336343434310D0A3A3130373834303003
+:1092800030333033303330333333313334333633B8
+:109290003333313333333833343332333333373397
+:1092A0003330380D0A3A31303738353030303332D8
+:1092B0003333333033333331333333303333333089
+:1092C0003333333133333336333333373333464643
+:1092D0000D0A3A31303738363030303332333333A9
+:1092E000333333343230443041334133313330332C
+:1092F000393336343533303330333031350D0A3A83
+:10930000313037383730303033333330333433362D
+:109310003333333133333336333333363333333715
+:10932000333333323333333044330D0A3A31303749
+:1093300038383030303333333633333332333333FA
+:1093400037333333323334333133303434333034EE
+:10935000313333343139440D0A3A3130373839300A
+:1093600030303336343230443041334133313330AE
+:1093700033393336343633303330333033333331BB
+:10938000333345320D0A3A313037384130303033DB
+:10939000303333333933333330333433323333339D
+:1093A0003033333330333333303334333633334184
+:1093B000440D0A3A313037384230303033373333A6
+:1093C000333233343336333333323333333433336A
+:1093D00033313333333433303435304441390D0A8B
+:1093E0003A31303738433030303041334133313324
+:1093F0003033393337333033303330333033343341
+:1094000035333333313334333641430D0A3A313057
+:109410003738443030303333333033333330333311
+:109420003330333333303333333033333333333414
+:1094300033333333333138380D0A3A313037384526
+:1094400030303033333330333333323333333433F8
+:1094500033333033333330333133303044304133CE
+:1094600041333143300D0A3A3130373846303030ED
+:1094700033303339333733313330333033303334BF
+:1094800033343333333933343333333333313333A6
+:1094900035350D0A3A3130373930303030333133E9
+:1094A000333334333333303333333033333336338E
+:1094B0003333333330343433303431333333320DA8
+:1094C0000A3A313037393130303034313333333197
+:1094D000333333303333333933333436304430413C
+:1094E0003341333133303339333735380D0A3A317C
+:1094F0003037393230303033323330333033303349
+:109500003333303334333333333330333333303333
+:109510003333303333333333430D0A3A3130373951
+:10952000333030303333333833343335333333300F
+:1095300033333333333333343333333133343335F9
+:109540003334333430450D0A3A3130373934303022
+:1095500030333333393333333834333334304430C6
+:1095600041334133313330333933373333333033AD
+:109570003033340D0A3A313037393530303033300A
+:1095800033333331333333303333333433333330B2
+:1095900033333330333333303333333633343033A0
+:1095A0000D0A3A31303739363030303333333333D4
+:1095B000323333333033343333333333333333337E
+:1095C000303333333633343331333345420D0A3A93
+:1095D000313037393730303033303434343330444D
+:1095E000304133413331333033393337333433302F
+:1095F000333033303333333030370D0A3A3130378C
+:109600003938303030333333303333333633333328
+:109610003233343334333333333333333733303417
+:10962000343330343141390D0A3A31303739393039
+:109630003030333334313333333133333330333306
+:1096400033393333333033343334333333303331EA
+:10965000333441440D0A3A313037394130303030FB
+:109660004430413341333133303339333733353399
+:1096700030333033303333333033333330333346B6
+:10968000370D0A3A313037394230303033303334E5
+:10969000333333333332333333303334333333339D
+:1096A00033303333333033343332333341320D0AD2
+:1096B0003A31303739433030303338333433323362
+:1096C000333335333333303333333033333332346E
+:1096D00031343530443041334141460D0A3A31305E
+:1096E0003739443030303331333033393337333630
+:1096F0003330333033303333333033333330333349
+:1097000033303334333338300D0A3A31303739455A
+:109710003030303333333933333330333333313321
+:10972000333338333333303334333133333330330B
+:1097300034333336370D0A3A31303739463030302A
+:1097400033333336333333303334333533333334E5
+:1097500033393331304430413341333133303339AD
+:1097600039360D0A3A313037413030303033373303
+:1097700037333033303330333333303333333133C3
+:109780003433313334333433303434333034300DD4
+:109790000A3A3130374131303030343133333431BB
+:1097A000333333313333333033333339333333308B
+:1097B0003334333533333330333331430D0A3A31B5
+:1097C000303741323030303330333333303333336A
+:1097D0003034353333304430413341333133303337
+:1097E0003933373338333035450D0A3A3130374164
+:1097F0003330303033303330333433333334333445
+:109800003333333033343333333333303333333030
+:109810003334333232310D0A3A313037413430305B
+:109820003033333332333333363333333633333306
+:1098300039333333303333333633333338333433EC
+:109840003346350D0A3A3130374135303030333315
+:1098500033303335333530443041334133313330B5
+:1098600033393337333933303330333033333342B2
+:109870000D0A3A31303741363030303336333433F5
+:10988000323334333333333339333333383334339C
+:10989000313334333233343334333344360D0A3ACC
+:1098A0003130374137303030333433333330333382
+:1098B0003330333333393333333233333330333379
+:1098C000333333333334333444370D0A3A3130379A
+:1098D000413830303033303044304133413331332C
+:1098E000303339333734313330333033303334334A
+:1098F000313330343446410D0A3A31303741393052
+:109900003030333034313333343133333331333334
+:109910003330333333393333333033343336333313
+:10992000333039450D0A3A31303741413030303328
+:109930003333303333333033343331333333313300
+:1099400033333033343334343133313044304146BF
+:10995000330D0A3A31303741423030303341333100
+:1099600033303339333734323330333033303334C8
+:1099700033363333333233333332333338320D0A01
+:109980003A3130374143303030333033333333338F
+:109990003333303333333333333338333333313397
+:1099A00033333833333332333438340D0A3A3130C9
+:1099B000374144303030333533333330333333325F
+:1099C000333333303333333033353436304430414E
+:1099D00033413331333042360D0A3A313037414565
+:1099E000303030333933373433333033303330334E
+:1099F0003433323333333133333336333333313338
+:109A000033333035390D0A3A313037

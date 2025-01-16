@@ -1,650 +1,289 @@
-/*
- * Elan I2C/SMBus Touchpad driver - I2C interface
- *
- * Copyright (c) 2013 ELAN Microelectronics Corp.
- *
- * Author: 林政維 (Duson Lin) <dusonlin@emc.com.tw>
- *
- * Based on cyapa driver:
- * copyright (c) 2011-2012 Cypress Semiconductor, Inc.
- * copyright (c) 2011-2012 Google, Inc.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published
- * by the Free Software Foundation.
- *
- * Trademarks are the property of their respective owners.
- */
-
-#include <linux/completion.h>
-#include <linux/delay.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/jiffies.h>
-#include <linux/kernel.h>
-#include <linux/sched.h>
-#include <asm/unaligned.h>
-
-#include "elan_i2c.h"
-
-/* Elan i2c commands */
-#define ETP_I2C_RESET			0x0100
-#define ETP_I2C_WAKE_UP			0x0800
-#define ETP_I2C_SLEEP			0x0801
-#define ETP_I2C_DESC_CMD		0x0001
-#define ETP_I2C_REPORT_DESC_CMD		0x0002
-#define ETP_I2C_STAND_CMD		0x0005
-#define ETP_I2C_UNIQUEID_CMD		0x0101
-#define ETP_I2C_FW_VERSION_CMD		0x0102
-#define ETP_I2C_SM_VERSION_CMD		0x0103
-#define ETP_I2C_XY_TRACENUM_CMD		0x0105
-#define ETP_I2C_MAX_X_AXIS_CMD		0x0106
-#define ETP_I2C_MAX_Y_AXIS_CMD		0x0107
-#define ETP_I2C_RESOLUTION_CMD		0x0108
-#define ETP_I2C_PRESSURE_CMD		0x010A
-#define ETP_I2C_IAP_VERSION_CMD		0x0110
-#define ETP_I2C_SET_CMD			0x0300
-#define ETP_I2C_POWER_CMD		0x0307
-#define ETP_I2C_FW_CHECKSUM_CMD		0x030F
-#define ETP_I2C_IAP_CTRL_CMD		0x0310
-#define ETP_I2C_IAP_CMD			0x0311
-#define ETP_I2C_IAP_RESET_CMD		0x0314
-#define ETP_I2C_IAP_CHECKSUM_CMD	0x0315
-#define ETP_I2C_CALIBRATE_CMD		0x0316
-#define ETP_I2C_MAX_BASELINE_CMD	0x0317
-#define ETP_I2C_MIN_BASELINE_CMD	0x0318
-
-#define ETP_I2C_REPORT_LEN		34
-#define ETP_I2C_DESC_LENGTH		30
-#define ETP_I2C_REPORT_DESC_LENGTH	158
-#define ETP_I2C_INF_LENGTH		2
-#define ETP_I2C_IAP_PASSWORD		0x1EA5
-#define ETP_I2C_IAP_RESET		0xF0F0
-#define ETP_I2C_MAIN_MODE_ON		(1 << 9)
-#define ETP_I2C_IAP_REG_L		0x01
-#define ETP_I2C_IAP_REG_H		0x06
-
-static int elan_i2c_read_block(struct i2c_client *client,
-			       u16 reg, u8 *val, u16 len)
-{
-	__le16 buf[] = {
-		cpu_to_le16(reg),
-	};
-	struct i2c_msg msgs[] = {
-		{
-			.addr = client->addr,
-			.flags = client->flags & I2C_M_TEN,
-			.len = sizeof(buf),
-			.buf = (u8 *)buf,
-		},
-		{
-			.addr = client->addr,
-			.flags = (client->flags & I2C_M_TEN) | I2C_M_RD,
-			.len = len,
-			.buf = val,
-		}
-	};
-	int ret;
-
-	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
-	return ret == ARRAY_SIZE(msgs) ? 0 : (ret < 0 ? ret : -EIO);
-}
-
-static int elan_i2c_read_cmd(struct i2c_client *client, u16 reg, u8 *val)
-{
-	int retval;
-
-	retval = elan_i2c_read_block(client, reg, val, ETP_I2C_INF_LENGTH);
-	if (retval < 0) {
-		dev_err(&client->dev, "reading cmd (0x%04x) fail.\n", reg);
-		return retval;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_write_cmd(struct i2c_client *client, u16 reg, u16 cmd)
-{
-	__le16 buf[] = {
-		cpu_to_le16(reg),
-		cpu_to_le16(cmd),
-	};
-	struct i2c_msg msg = {
-		.addr = client->addr,
-		.flags = client->flags & I2C_M_TEN,
-		.len = sizeof(buf),
-		.buf = (u8 *)buf,
-	};
-	int ret;
-
-	ret = i2c_transfer(client->adapter, &msg, 1);
-	if (ret != 1) {
-		if (ret >= 0)
-			ret = -EIO;
-		dev_err(&client->dev, "writing cmd (0x%04x) failed: %d\n",
-			reg, ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_initialize(struct i2c_client *client)
-{
-	struct device *dev = &client->dev;
-	int error;
-	u8 val[256];
-
-	error = elan_i2c_write_cmd(client, ETP_I2C_STAND_CMD, ETP_I2C_RESET);
-	if (error) {
-		dev_err(dev, "device reset failed: %d\n", error);
-		return error;
-	}
-
-	/* Wait for the device to reset */
-	msleep(100);
-
-	/* get reset acknowledgement 0000 */
-	error = i2c_master_recv(client, val, ETP_I2C_INF_LENGTH);
-	if (error < 0) {
-		dev_err(dev, "failed to read reset response: %d\n", error);
-		return error;
-	}
-
-	error = elan_i2c_read_block(client, ETP_I2C_DESC_CMD,
-				    val, ETP_I2C_DESC_LENGTH);
-	if (error) {
-		dev_err(dev, "cannot get device descriptor: %d\n", error);
-		return error;
-	}
-
-	error = elan_i2c_read_block(client, ETP_I2C_REPORT_DESC_CMD,
-				    val, ETP_I2C_REPORT_DESC_LENGTH);
-	if (error) {
-		dev_err(dev, "fetching report descriptor failed.: %d\n", error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_sleep_control(struct i2c_client *client, bool sleep)
-{
-	return elan_i2c_write_cmd(client, ETP_I2C_STAND_CMD,
-				  sleep ? ETP_I2C_SLEEP : ETP_I2C_WAKE_UP);
-}
-
-static int elan_i2c_power_control(struct i2c_client *client, bool enable)
-{
-	u8 val[2];
-	u16 reg;
-	int error;
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_POWER_CMD, val);
-	if (error) {
-		dev_err(&client->dev,
-			"failed to read current power state: %d\n",
-			error);
-		return error;
-	}
-
-	reg = le16_to_cpup((__le16 *)val);
-	if (enable)
-		reg &= ~ETP_DISABLE_POWER;
-	else
-		reg |= ETP_DISABLE_POWER;
-
-	error = elan_i2c_write_cmd(client, ETP_I2C_POWER_CMD, reg);
-	if (error) {
-		dev_err(&client->dev,
-			"failed to write current power state: %d\n",
-			error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_set_mode(struct i2c_client *client, u8 mode)
-{
-	return elan_i2c_write_cmd(client, ETP_I2C_SET_CMD, mode);
-}
-
-
-static int elan_i2c_calibrate(struct i2c_client *client)
-{
-	return elan_i2c_write_cmd(client, ETP_I2C_CALIBRATE_CMD, 1);
-}
-
-static int elan_i2c_calibrate_result(struct i2c_client *client, u8 *val)
-{
-	return elan_i2c_read_block(client, ETP_I2C_CALIBRATE_CMD, val, 1);
-}
-
-static int elan_i2c_get_baseline_data(struct i2c_client *client,
-				      bool max_baseline, u8 *value)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client,
-				  max_baseline ? ETP_I2C_MAX_BASELINE_CMD :
-						 ETP_I2C_MIN_BASELINE_CMD,
-				  val);
-	if (error)
-		return error;
-
-	*value = le16_to_cpup((__le16 *)val);
-
-	return 0;
-}
-
-static int elan_i2c_get_version(struct i2c_client *client,
-				bool iap, u8 *version)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client,
-				  iap ? ETP_I2C_IAP_VERSION_CMD :
-					ETP_I2C_FW_VERSION_CMD,
-				  val);
-	if (error) {
-		dev_err(&client->dev, "failed to get %s version: %d\n",
-			iap ? "IAP" : "FW", error);
-		return error;
-	}
-
-	*version = val[0];
-	return 0;
-}
-
-static int elan_i2c_get_sm_version(struct i2c_client *client,
-				   u8 *ic_type, u8 *version)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_SM_VERSION_CMD, val);
-	if (error) {
-		dev_err(&client->dev, "failed to get SM version: %d\n", error);
-		return error;
-	}
-
-	*version = val[0];
-	*ic_type = val[1];
-	return 0;
-}
-
-static int elan_i2c_get_product_id(struct i2c_client *client, u16 *id)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_UNIQUEID_CMD, val);
-	if (error) {
-		dev_err(&client->dev, "failed to get product ID: %d\n", error);
-		return error;
-	}
-
-	*id = le16_to_cpup((__le16 *)val);
-	return 0;
-}
-
-static int elan_i2c_get_checksum(struct i2c_client *client,
-				 bool iap, u16 *csum)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client,
-				  iap ? ETP_I2C_IAP_CHECKSUM_CMD :
-					ETP_I2C_FW_CHECKSUM_CMD,
-				  val);
-	if (error) {
-		dev_err(&client->dev, "failed to get %s checksum: %d\n",
-			iap ? "IAP" : "FW", error);
-		return error;
-	}
-
-	*csum = le16_to_cpup((__le16 *)val);
-	return 0;
-}
-
-static int elan_i2c_get_max(struct i2c_client *client,
-			    unsigned int *max_x, unsigned int *max_y)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_MAX_X_AXIS_CMD, val);
-	if (error) {
-		dev_err(&client->dev, "failed to get X dimension: %d\n", error);
-		return error;
-	}
-
-	*max_x = le16_to_cpup((__le16 *)val) & 0x0fff;
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_MAX_Y_AXIS_CMD, val);
-	if (error) {
-		dev_err(&client->dev, "failed to get Y dimension: %d\n", error);
-		return error;
-	}
-
-	*max_y = le16_to_cpup((__le16 *)val) & 0x0fff;
-
-	return 0;
-}
-
-static int elan_i2c_get_resolution(struct i2c_client *client,
-				   u8 *hw_res_x, u8 *hw_res_y)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_RESOLUTION_CMD, val);
-	if (error) {
-		dev_err(&client->dev, "failed to get resolution: %d\n", error);
-		return error;
-	}
-
-	*hw_res_x = val[0];
-	*hw_res_y = val[1];
-
-	return 0;
-}
-
-static int elan_i2c_get_num_traces(struct i2c_client *client,
-				   unsigned int *x_traces,
-				   unsigned int *y_traces)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_XY_TRACENUM_CMD, val);
-	if (error) {
-		dev_err(&client->dev, "failed to get trace info: %d\n", error);
-		return error;
-	}
-
-	*x_traces = val[0];
-	*y_traces = val[1];
-
-	return 0;
-}
-
-static int elan_i2c_get_pressure_adjustment(struct i2c_client *client,
-					    int *adjustment)
-{
-	int error;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_PRESSURE_CMD, val);
-	if (error) {
-		dev_err(&client->dev, "failed to get pressure format: %d\n",
-			error);
-		return error;
-	}
-
-	if ((val[0] >> 4) & 0x1)
-		*adjustment = 0;
-	else
-		*adjustment = ETP_PRESSURE_OFFSET;
-
-	return 0;
-}
-
-static int elan_i2c_iap_get_mode(struct i2c_client *client, enum tp_mode *mode)
-{
-	int error;
-	u16 constant;
-	u8 val[3];
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_IAP_CTRL_CMD, val);
-	if (error) {
-		dev_err(&client->dev,
-			"failed to read iap control register: %d\n",
-			error);
-		return error;
-	}
-
-	constant = le16_to_cpup((__le16 *)val);
-	dev_dbg(&client->dev, "iap control reg: 0x%04x.\n", constant);
-
-	*mode = (constant & ETP_I2C_MAIN_MODE_ON) ? MAIN_MODE : IAP_MODE;
-
-	return 0;
-}
-
-static int elan_i2c_iap_reset(struct i2c_client *client)
-{
-	int error;
-
-	error = elan_i2c_write_cmd(client, ETP_I2C_IAP_RESET_CMD,
-				   ETP_I2C_IAP_RESET);
-	if (error) {
-		dev_err(&client->dev, "cannot reset IC: %d\n", error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_set_flash_key(struct i2c_client *client)
-{
-	int error;
-
-	error = elan_i2c_write_cmd(client, ETP_I2C_IAP_CMD,
-				   ETP_I2C_IAP_PASSWORD);
-	if (error) {
-		dev_err(&client->dev, "cannot set flash key: %d\n", error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_prepare_fw_update(struct i2c_client *client)
-{
-	struct device *dev = &client->dev;
-	int error;
-	enum tp_mode mode;
-	u8 val[3];
-	u16 password;
-
-	/* Get FW in which mode	(IAP_MODE/MAIN_MODE)  */
-	error = elan_i2c_iap_get_mode(client, &mode);
-	if (error)
-		return error;
-
-	if (mode == IAP_MODE) {
-		/* Reset IC */
-		error = elan_i2c_iap_reset(client);
-		if (error)
-			return error;
-
-		msleep(30);
-	}
-
-	/* Set flash key*/
-	error = elan_i2c_set_flash_key(client);
-	if (error)
-		return error;
-
-	/* Wait for F/W IAP initialization */
-	msleep(mode == MAIN_MODE ? 100 : 30);
-
-	/* Check if we are in IAP mode or not */
-	error = elan_i2c_iap_get_mode(client, &mode);
-	if (error)
-		return error;
-
-	if (mode == MAIN_MODE) {
-		dev_err(dev, "wrong mode: %d\n", mode);
-		return -EIO;
-	}
-
-	/* Set flash key again */
-	error = elan_i2c_set_flash_key(client);
-	if (error)
-		return error;
-
-	/* Wait for F/W IAP initialization */
-	msleep(30);
-
-	/* read back to check we actually enabled successfully. */
-	error = elan_i2c_read_cmd(client, ETP_I2C_IAP_CMD, val);
-	if (error) {
-		dev_err(dev, "cannot read iap password: %d\n",
-			error);
-		return error;
-	}
-
-	password = le16_to_cpup((__le16 *)val);
-	if (password != ETP_I2C_IAP_PASSWORD) {
-		dev_err(dev, "wrong iap password: 0x%X\n", password);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_write_fw_block(struct i2c_client *client,
-				   const u8 *page, u16 checksum, int idx)
-{
-	struct device *dev = &client->dev;
-	u8 page_store[ETP_FW_PAGE_SIZE + 4];
-	u8 val[3];
-	u16 result;
-	int ret, error;
-
-	page_store[0] = ETP_I2C_IAP_REG_L;
-	page_store[1] = ETP_I2C_IAP_REG_H;
-	memcpy(&page_store[2], page, ETP_FW_PAGE_SIZE);
-	/* recode checksum at last two bytes */
-	put_unaligned_le16(checksum, &page_store[ETP_FW_PAGE_SIZE + 2]);
-
-	ret = i2c_master_send(client, page_store, sizeof(page_store));
-	if (ret != sizeof(page_store)) {
-		error = ret < 0 ? ret : -EIO;
-		dev_err(dev, "Failed to write page %d: %d\n", idx, error);
-		return error;
-	}
-
-	/* Wait for F/W to update one page ROM data. */
-	msleep(20);
-
-	error = elan_i2c_read_cmd(client, ETP_I2C_IAP_CTRL_CMD, val);
-	if (error) {
-		dev_err(dev, "Failed to read IAP write result: %d\n", error);
-		return error;
-	}
-
-	result = le16_to_cpup((__le16 *)val);
-	if (result & (ETP_FW_IAP_PAGE_ERR | ETP_FW_IAP_INTF_ERR)) {
-		dev_err(dev, "IAP reports failed write: %04hx\n",
-			result);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_finish_fw_update(struct i2c_client *client,
-				     struct completion *completion)
-{
-	struct device *dev = &client->dev;
-	long ret;
-	int error;
-	int len;
-	u8 buffer[ETP_I2C_REPORT_LEN];
-
-	len = i2c_master_recv(client, buffer, ETP_I2C_REPORT_LEN);
-	if (len != ETP_I2C_REPORT_LEN) {
-		error = len < 0 ? len : -EIO;
-		dev_warn(dev, "failed to read I2C data after FW WDT reset: %d (%d)\n",
-			error, len);
-	}
-
-	reinit_completion(completion);
-	enable_irq(client->irq);
-
-	error = elan_i2c_write_cmd(client, ETP_I2C_STAND_CMD, ETP_I2C_RESET);
-	if (!error)
-		ret = wait_for_completion_interruptible_timeout(completion,
-							msecs_to_jiffies(300));
-	disable_irq(client->irq);
-
-	if (error) {
-		dev_err(dev, "device reset failed: %d\n", error);
-		return error;
-	} else if (ret == 0) {
-		dev_err(dev, "timeout waiting for device reset\n");
-		return -ETIMEDOUT;
-	} else if (ret < 0) {
-		error = ret;
-		dev_err(dev, "error waiting for device reset: %d\n", error);
-		return error;
-	}
-
-	len = i2c_master_recv(client, buffer, ETP_I2C_INF_LENGTH);
-	if (len != ETP_I2C_INF_LENGTH) {
-		error = len < 0 ? len : -EIO;
-		dev_err(dev, "failed to read INT signal: %d (%d)\n",
-			error, len);
-		return error;
-	}
-
-	return 0;
-}
-
-static int elan_i2c_get_report(struct i2c_client *client, u8 *report)
-{
-	int len;
-
-	len = i2c_master_recv(client, report, ETP_I2C_REPORT_LEN);
-	if (len < 0) {
-		dev_err(&client->dev, "failed to read report data: %d\n", len);
-		return len;
-	}
-
-	if (len != ETP_I2C_REPORT_LEN) {
-		dev_err(&client->dev,
-			"wrong report length (%d vs %d expected)\n",
-			len, ETP_I2C_REPORT_LEN);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-const struct elan_transport_ops elan_i2c_ops = {
-	.initialize		= elan_i2c_initialize,
-	.sleep_control		= elan_i2c_sleep_control,
-	.power_control		= elan_i2c_power_control,
-	.set_mode		= elan_i2c_set_mode,
-
-	.calibrate		= elan_i2c_calibrate,
-	.calibrate_result	= elan_i2c_calibrate_result,
-
-	.get_baseline_data	= elan_i2c_get_baseline_data,
-
-	.get_version		= elan_i2c_get_version,
-	.get_sm_version		= elan_i2c_get_sm_version,
-	.get_product_id		= elan_i2c_get_product_id,
-	.get_checksum		= elan_i2c_get_checksum,
-	.get_pressure_adjustment = elan_i2c_get_pressure_adjustment,
-
-	.get_max		= elan_i2c_get_max,
-	.get_resolution		= elan_i2c_get_resolution,
-	.get_num_traces		= elan_i2c_get_num_traces,
-
-	.iap_get_mode		= elan_i2c_iap_get_mode,
-	.iap_reset		= elan_i2c_iap_reset,
-
-	.prepare_fw_update	= elan_i2c_prepare_fw_update,
-	.write_fw_block		= elan_i2c_write_fw_block,
-	.finish_fw_update	= elan_i2c_finish_fw_update,
-
-	.get_report		= elan_i2c_get_report,
-};
+TR_MASK 0xffff0000
+#define GDS_PS5_CTXSW_CNT3__PTR__SHIFT 0x10
+#define GDS_PS6_CTXSW_CNT3__UPDN_MASK 0xffff
+#define GDS_PS6_CTXSW_CNT3__UPDN__SHIFT 0x0
+#define GDS_PS6_CTXSW_CNT3__PTR_MASK 0xffff0000
+#define GDS_PS6_CTXSW_CNT3__PTR__SHIFT 0x10
+#define GDS_PS7_CTXSW_CNT3__UPDN_MASK 0xffff
+#define GDS_PS7_CTXSW_CNT3__UPDN__SHIFT 0x0
+#define GDS_PS7_CTXSW_CNT3__PTR_MASK 0xffff0000
+#define GDS_PS7_CTXSW_CNT3__PTR__SHIFT 0x10
+#define CS_COPY_STATE__SRC_STATE_ID_MASK 0x7
+#define CS_COPY_STATE__SRC_STATE_ID__SHIFT 0x0
+#define GFX_COPY_STATE__SRC_STATE_ID_MASK 0x7
+#define GFX_COPY_STATE__SRC_STATE_ID__SHIFT 0x0
+#define VGT_DRAW_INITIATOR__SOURCE_SELECT_MASK 0x3
+#define VGT_DRAW_INITIATOR__SOURCE_SELECT__SHIFT 0x0
+#define VGT_DRAW_INITIATOR__MAJOR_MODE_MASK 0xc
+#define VGT_DRAW_INITIATOR__MAJOR_MODE__SHIFT 0x2
+#define VGT_DRAW_INITIATOR__SPRITE_EN_R6XX_MASK 0x10
+#define VGT_DRAW_INITIATOR__SPRITE_EN_R6XX__SHIFT 0x4
+#define VGT_DRAW_INITIATOR__NOT_EOP_MASK 0x20
+#define VGT_DRAW_INITIATOR__NOT_EOP__SHIFT 0x5
+#define VGT_DRAW_INITIATOR__USE_OPAQUE_MASK 0x40
+#define VGT_DRAW_INITIATOR__USE_OPAQUE__SHIFT 0x6
+#define VGT_EVENT_INITIATOR__EVENT_TYPE_MASK 0x3f
+#define VGT_EVENT_INITIATOR__EVENT_TYPE__SHIFT 0x0
+#define VGT_EVENT_INITIATOR__ADDRESS_HI_MASK 0x7fc0000
+#define VGT_EVENT_INITIATOR__ADDRESS_HI__SHIFT 0x12
+#define VGT_EVENT_INITIATOR__EXTENDED_EVENT_MASK 0x8000000
+#define VGT_EVENT_INITIATOR__EXTENDED_EVENT__SHIFT 0x1b
+#define VGT_EVENT_ADDRESS_REG__ADDRESS_LOW_MASK 0xfffffff
+#define VGT_EVENT_ADDRESS_REG__ADDRESS_LOW__SHIFT 0x0
+#define VGT_DMA_BASE_HI__BASE_ADDR_MASK 0xff
+#define VGT_DMA_BASE_HI__BASE_ADDR__SHIFT 0x0
+#define VGT_DMA_BASE__BASE_ADDR_MASK 0xffffffff
+#define VGT_DMA_BASE__BASE_ADDR__SHIFT 0x0
+#define VGT_DMA_INDEX_TYPE__INDEX_TYPE_MASK 0x3
+#define VGT_DMA_INDEX_TYPE__INDEX_TYPE__SHIFT 0x0
+#define VGT_DMA_INDEX_TYPE__SWAP_MODE_MASK 0xc
+#define VGT_DMA_INDEX_TYPE__SWAP_MODE__SHIFT 0x2
+#define VGT_DMA_INDEX_TYPE__BUF_TYPE_MASK 0x30
+#define VGT_DMA_INDEX_TYPE__BUF_TYPE__SHIFT 0x4
+#define VGT_DMA_INDEX_TYPE__RDREQ_POLICY_MASK 0x40
+#define VGT_DMA_INDEX_TYPE__RDREQ_POLICY__SHIFT 0x6
+#define VGT_DMA_INDEX_TYPE__NOT_EOP_MASK 0x200
+#define VGT_DMA_INDEX_TYPE__NOT_EOP__SHIFT 0x9
+#define VGT_DMA_INDEX_TYPE__REQ_PATH_MASK 0x400
+#define VGT_DMA_INDEX_TYPE__REQ_PATH__SHIFT 0xa
+#define VGT_DMA_INDEX_TYPE__MTYPE_MASK 0x1800
+#define VGT_DMA_INDEX_TYPE__MTYPE__SHIFT 0xb
+#define VGT_DMA_NUM_INSTANCES__NUM_INSTANCES_MASK 0xffffffff
+#define VGT_DMA_NUM_INSTANCES__NUM_INSTANCES__SHIFT 0x0
+#define IA_ENHANCE__MISC_MASK 0xffffffff
+#define IA_ENHANCE__MISC__SHIFT 0x0
+#define VGT_DMA_SIZE__NUM_INDICES_MASK 0xffffffff
+#define VGT_DMA_SIZE__NUM_INDICES__SHIFT 0x0
+#define VGT_DMA_MAX_SIZE__MAX_SIZE_MASK 0xffffffff
+#define VGT_DMA_MAX_SIZE__MAX_SIZE__SHIFT 0x0
+#define VGT_DMA_PRIMITIVE_TYPE__PRIM_TYPE_MASK 0x3f
+#define VGT_DMA_PRIMITIVE_TYPE__PRIM_TYPE__SHIFT 0x0
+#define VGT_DMA_CONTROL__PRIMGROUP_SIZE_MASK 0xffff
+#define VGT_DMA_CONTROL__PRIMGROUP_SIZE__SHIFT 0x0
+#define VGT_DMA_CONTROL__IA_SWITCH_ON_EOP_MASK 0x20000
+#define VGT_DMA_CONTROL__IA_SWITCH_ON_EOP__SHIFT 0x11
+#define VGT_DMA_CONTROL__WD_SWITCH_ON_EOP_MASK 0x100000
+#define VGT_DMA_CONTROL__WD_SWITCH_ON_EOP__SHIFT 0x14
+#define VGT_IMMED_DATA__DATA_MASK 0xffffffff
+#define VGT_IMMED_DATA__DATA__SHIFT 0x0
+#define VGT_INDEX_TYPE__INDEX_TYPE_MASK 0x3
+#define VGT_INDEX_TYPE__INDEX_TYPE__SHIFT 0x0
+#define VGT_NUM_INDICES__NUM_INDICES_MASK 0xffffffff
+#define VGT_NUM_INDICES__NUM_INDICES__SHIFT 0x0
+#define VGT_NUM_INSTANCES__NUM_INSTANCES_MASK 0xffffffff
+#define VGT_NUM_INSTANCES__NUM_INSTANCES__SHIFT 0x0
+#define VGT_PRIMITIVE_TYPE__PRIM_TYPE_MASK 0x3f
+#define VGT_PRIMITIVE_TYPE__PRIM_TYPE__SHIFT 0x0
+#define VGT_PRIMITIVEID_EN__PRIMITIVEID_EN_MASK 0x1
+#define VGT_PRIMITIVEID_EN__PRIMITIVEID_EN__SHIFT 0x0
+#define VGT_PRIMITIVEID_EN__DISABLE_RESET_ON_EOI_MASK 0x2
+#define VGT_PRIMITIVEID_EN__DISABLE_RESET_ON_EOI__SHIFT 0x1
+#define VGT_PRIMITIVEID_RESET__VALUE_MASK 0xffffffff
+#define VGT_PRIMITIVEID_RESET__VALUE__SHIFT 0x0
+#define VGT_VTX_CNT_EN__VTX_CNT_EN_MASK 0x1
+#define VGT_VTX_CNT_EN__VTX_CNT_EN__SHIFT 0x0
+#define VGT_REUSE_OFF__REUSE_OFF_MASK 0x1
+#define VGT_REUSE_OFF__REUSE_OFF__SHIFT 0x0
+#define VGT_INSTANCE_STEP_RATE_0__STEP_RATE_MASK 0xffffffff
+#define VGT_INSTANCE_STEP_RATE_0__STEP_RATE__SHIFT 0x0
+#define VGT_INSTANCE_STEP_RATE_1__STEP_RATE_MASK 0xffffffff
+#define VGT_INSTANCE_STEP_RATE_1__STEP_RATE__SHIFT 0x0
+#define VGT_MAX_VTX_INDX__MAX_INDX_MASK 0xffffffff
+#define VGT_MAX_VTX_INDX__MAX_INDX__SHIFT 0x0
+#define VGT_MIN_VTX_INDX__MIN_INDX_MASK 0xffffffff
+#define VGT_MIN_VTX_INDX__MIN_INDX__SHIFT 0x0
+#define VGT_INDX_OFFSET__INDX_OFFSET_MASK 0xffffffff
+#define VGT_INDX_OFFSET__INDX_OFFSET__SHIFT 0x0
+#define VGT_VERTEX_REUSE_BLOCK_CNTL__VTX_REUSE_DEPTH_MASK 0xff
+#define VGT_VERTEX_REUSE_BLOCK_CNTL__VTX_REUSE_DEPTH__SHIFT 0x0
+#define VGT_OUT_DEALLOC_CNTL__DEALLOC_DIST_MASK 0x7f
+#define VGT_OUT_DEALLOC_CNTL__DEALLOC_DIST__SHIFT 0x0
+#define VGT_MULTI_PRIM_IB_RESET_INDX__RESET_INDX_MASK 0xffffffff
+#define VGT_MULTI_PRIM_IB_RESET_INDX__RESET_INDX__SHIFT 0x0
+#define VGT_MULTI_PRIM_IB_RESET_EN__RESET_EN_MASK 0x1
+#define VGT_MULTI_PRIM_IB_RESET_EN__RESET_EN__SHIFT 0x0
+#define VGT_ENHANCE__MISC_MASK 0xffffffff
+#define VGT_ENHANCE__MISC__SHIFT 0x0
+#define VGT_OUTPUT_PATH_CNTL__PATH_SELECT_MASK 0x7
+#define VGT_OUTPUT_PATH_CNTL__PATH_SELECT__SHIFT 0x0
+#define VGT_HOS_CNTL__TESS_MODE_MASK 0x3
+#define VGT_HOS_CNTL__TESS_MODE__SHIFT 0x0
+#define VGT_HOS_MAX_TESS_LEVEL__MAX_TESS_MASK 0xffffffff
+#define VGT_HOS_MAX_TESS_LEVEL__MAX_TESS__SHIFT 0x0
+#define VGT_HOS_MIN_TESS_LEVEL__MIN_TESS_MASK 0xffffffff
+#define VGT_HOS_MIN_TESS_LEVEL__MIN_TESS__SHIFT 0x0
+#define VGT_HOS_REUSE_DEPTH__REUSE_DEPTH_MASK 0xff
+#define VGT_HOS_REUSE_DEPTH__REUSE_DEPTH__SHIFT 0x0
+#define VGT_GROUP_PRIM_TYPE__PRIM_TYPE_MASK 0x1f
+#define VGT_GROUP_PRIM_TYPE__PRIM_TYPE__SHIFT 0x0
+#define VGT_GROUP_PRIM_TYPE__RETAIN_ORDER_MASK 0x4000
+#define VGT_GROUP_PRIM_TYPE__RETAIN_ORDER__SHIFT 0xe
+#define VGT_GROUP_PRIM_TYPE__RETAIN_QUADS_MASK 0x8000
+#define VGT_GROUP_PRIM_TYPE__RETAIN_QUADS__SHIFT 0xf
+#define VGT_GROUP_PRIM_TYPE__PRIM_ORDER_MASK 0x70000
+#define VGT_GROUP_PRIM_TYPE__PRIM_ORDER__SHIFT 0x10
+#define VGT_GROUP_FIRST_DECR__FIRST_DECR_MASK 0xf
+#define VGT_GROUP_FIRST_DECR__FIRST_DECR__SHIFT 0x0
+#define VGT_GROUP_DECR__DECR_MASK 0xf
+#define VGT_GROUP_DECR__DECR__SHIFT 0x0
+#define VGT_GROUP_VECT_0_CNTL__COMP_X_EN_MASK 0x1
+#define VGT_GROUP_VECT_0_CNTL__COMP_X_EN__SHIFT 0x0
+#define VGT_GROUP_VECT_0_CNTL__COMP_Y_EN_MASK 0x2
+#define VGT_GROUP_VECT_0_CNTL__COMP_Y_EN__SHIFT 0x1
+#define VGT_GROUP_VECT_0_CNTL__COMP_Z_EN_MASK 0x4
+#define VGT_GROUP_VECT_0_CNTL__COMP_Z_EN__SHIFT 0x2
+#define VGT_GROUP_VECT_0_CNTL__COMP_W_EN_MASK 0x8
+#define VGT_GROUP_VECT_0_CNTL__COMP_W_EN__SHIFT 0x3
+#define VGT_GROUP_VECT_0_CNTL__STRIDE_MASK 0xff00
+#define VGT_GROUP_VECT_0_CNTL__STRIDE__SHIFT 0x8
+#define VGT_GROUP_VECT_0_CNTL__SHIFT_MASK 0xff0000
+#define VGT_GROUP_VECT_0_CNTL__SHIFT__SHIFT 0x10
+#define VGT_GROUP_VECT_1_CNTL__COMP_X_EN_MASK 0x1
+#define VGT_GROUP_VECT_1_CNTL__COMP_X_EN__SHIFT 0x0
+#define VGT_GROUP_VECT_1_CNTL__COMP_Y_EN_MASK 0x2
+#define VGT_GROUP_VECT_1_CNTL__COMP_Y_EN__SHIFT 0x1
+#define VGT_GROUP_VECT_1_CNTL__COMP_Z_EN_MASK 0x4
+#define VGT_GROUP_VECT_1_CNTL__COMP_Z_EN__SHIFT 0x2
+#define VGT_GROUP_VECT_1_CNTL__COMP_W_EN_MASK 0x8
+#define VGT_GROUP_VECT_1_CNTL__COMP_W_EN__SHIFT 0x3
+#define VGT_GROUP_VECT_1_CNTL__STRIDE_MASK 0xff00
+#define VGT_GROUP_VECT_1_CNTL__STRIDE__SHIFT 0x8
+#define VGT_GROUP_VECT_1_CNTL__SHIFT_MASK 0xff0000
+#define VGT_GROUP_VECT_1_CNTL__SHIFT__SHIFT 0x10
+#define VGT_GROUP_VECT_0_FMT_CNTL__X_CONV_MASK 0xf
+#define VGT_GROUP_VECT_0_FMT_CNTL__X_CONV__SHIFT 0x0
+#define VGT_GROUP_VECT_0_FMT_CNTL__X_OFFSET_MASK 0xf0
+#define VGT_GROUP_VECT_0_FMT_CNTL__X_OFFSET__SHIFT 0x4
+#define VGT_GROUP_VECT_0_FMT_CNTL__Y_CONV_MASK 0xf00
+#define VGT_GROUP_VECT_0_FMT_CNTL__Y_CONV__SHIFT 0x8
+#define VGT_GROUP_VECT_0_FMT_CNTL__Y_OFFSET_MASK 0xf000
+#define VGT_GROUP_VECT_0_FMT_CNTL__Y_OFFSET__SHIFT 0xc
+#define VGT_GROUP_VECT_0_FMT_CNTL__Z_CONV_MASK 0xf0000
+#define VGT_GROUP_VECT_0_FMT_CNTL__Z_CONV__SHIFT 0x10
+#define VGT_GROUP_VECT_0_FMT_CNTL__Z_OFFSET_MASK 0xf00000
+#define VGT_GROUP_VECT_0_FMT_CNTL__Z_OFFSET__SHIFT 0x14
+#define VGT_GROUP_VECT_0_FMT_CNTL__W_CONV_MASK 0xf000000
+#define VGT_GROUP_VECT_0_FMT_CNTL__W_CONV__SHIFT 0x18
+#define VGT_GROUP_VECT_0_FMT_CNTL__W_OFFSET_MASK 0xf0000000
+#define VGT_GROUP_VECT_0_FMT_CNTL__W_OFFSET__SHIFT 0x1c
+#define VGT_GROUP_VECT_1_FMT_CNTL__X_CONV_MASK 0xf
+#define VGT_GROUP_VECT_1_FMT_CNTL__X_CONV__SHIFT 0x0
+#define VGT_GROUP_VECT_1_FMT_CNTL__X_OFFSET_MASK 0xf0
+#define VGT_GROUP_VECT_1_FMT_CNTL__X_OFFSET__SHIFT 0x4
+#define VGT_GROUP_VECT_1_FMT_CNTL__Y_CONV_MASK 0xf00
+#define VGT_GROUP_VECT_1_FMT_CNTL__Y_CONV__SHIFT 0x8
+#define VGT_GROUP_VECT_1_FMT_CNTL__Y_OFFSET_MASK 0xf000
+#define VGT_GROUP_VECT_1_FMT_CNTL__Y_OFFSET__SHIFT 0xc
+#define VGT_GROUP_VECT_1_FMT_CNTL__Z_CONV_MASK 0xf0000
+#define VGT_GROUP_VECT_1_FMT_CNTL__Z_CONV__SHIFT 0x10
+#define VGT_GROUP_VECT_1_FMT_CNTL__Z_OFFSET_MASK 0xf00000
+#define VGT_GROUP_VECT_1_FMT_CNTL__Z_OFFSET__SHIFT 0x14
+#define VGT_GROUP_VECT_1_FMT_CNTL__W_CONV_MASK 0xf000000
+#define VGT_GROUP_VECT_1_FMT_CNTL__W_CONV__SHIFT 0x18
+#define VGT_GROUP_VECT_1_FMT_CNTL__W_OFFSET_MASK 0xf0000000
+#define VGT_GROUP_VECT_1_FMT_CNTL__W_OFFSET__SHIFT 0x1c
+#define VGT_VTX_VECT_EJECT_REG__PRIM_COUNT_MASK 0x3ff
+#define VGT_VTX_VECT_EJECT_REG__PRIM_COUNT__SHIFT 0x0
+#define VGT_DMA_DATA_FIFO_DEPTH__DMA_DATA_FIFO_DEPTH_MASK 0x1ff
+#define VGT_DMA_DATA_FIFO_DEPTH__DMA_DATA_FIFO_DEPTH__SHIFT 0x0
+#define VGT_DMA_DATA_FIFO_DEPTH__DMA2DRAW_FIFO_DEPTH_MASK 0x7fe00
+#define VGT_DMA_DATA_FIFO_DEPTH__DMA2DRAW_FIFO_DEPTH__SHIFT 0x9
+#define VGT_DMA_REQ_FIFO_DEPTH__DMA_REQ_FIFO_DEPTH_MASK 0x3f
+#define VGT_DMA_REQ_FIFO_DEPTH__DMA_REQ_FIFO_DEPTH__SHIFT 0x0
+#define VGT_DRAW_INIT_FIFO_DEPTH__DRAW_INIT_FIFO_DEPTH_MASK 0x3f
+#define VGT_DRAW_INIT_FIFO_DEPTH__DRAW_INIT_FIFO_DEPTH__SHIFT 0x0
+#define VGT_LAST_COPY_STATE__SRC_STATE_ID_MASK 0x7
+#define VGT_LAST_COPY_STATE__SRC_STATE_ID__SHIFT 0x0
+#define VGT_LAST_COPY_STATE__DST_STATE_ID_MASK 0x70000
+#define VGT_LAST_COPY_STATE__DST_STATE_ID__SHIFT 0x10
+#define CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_CUS_MASK 0xffff0000
+#define CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_CUS__SHIFT 0x10
+#define GC_USER_SHADER_ARRAY_CONFIG__INACTIVE_CUS_MASK 0xffff0000
+#define GC_USER_SHADER_ARRAY_CONFIG__INACTIVE_CUS__SHIFT 0x10
+#define VGT_GS_MODE__MODE_MASK 0x7
+#define VGT_GS_MODE__MODE__SHIFT 0x0
+#define VGT_GS_MODE__RESERVED_0_MASK 0x8
+#define VGT_GS_MODE__RESERVED_0__SHIFT 0x3
+#define VGT_GS_MODE__CUT_MODE_MASK 0x30
+#define VGT_GS_MODE__CUT_MODE__SHIFT 0x4
+#define VGT_GS_MODE__RESERVED_1_MASK 0x7c0
+#define VGT_GS_MODE__RESERVED_1__SHIFT 0x6
+#define VGT_GS_MODE__GS_C_PACK_EN_MASK 0x800
+#define VGT_GS_MODE__GS_C_PACK_EN__SHIFT 0xb
+#define VGT_GS_MODE__RESERVED_2_MASK 0x1000
+#define VGT_GS_MODE__RESERVED_2__SHIFT 0xc
+#define VGT_GS_MODE__ES_PASSTHRU_MASK 0x2000
+#define VGT_GS_MODE__ES_PASSTHRU__SHIFT 0xd
+#define VGT_GS_MODE__RESERVED_3_MASK 0x4000
+#define VGT_GS_MODE__RESERVED_3__SHIFT 0xe
+#define VGT_GS_MODE__RESERVED_4_MASK 0x8000
+#define VGT_GS_MODE__RESERVED_4__SHIFT 0xf
+#define VGT_GS_MODE__RESERVED_5_MASK 0x10000
+#define VGT_GS_MODE__RESERVED_5__SHIFT 0x10
+#define VGT_GS_MODE__PARTIAL_THD_AT_EOI_MASK 0x20000
+#define VGT_GS_MODE__PARTIAL_THD_AT_EOI__SHIFT 0x11
+#define VGT_GS_MODE__SUPPRESS_CUTS_MASK 0x40000
+#define VGT_GS_MODE__SUPPRESS_CUTS__SHIFT 0x12
+#define VGT_GS_MODE__ES_WRITE_OPTIMIZE_MASK 0x80000
+#define VGT_GS_MODE__ES_WRITE_OPTIMIZE__SHIFT 0x13
+#define VGT_GS_MODE__GS_WRITE_OPTIMIZE_MASK 0x100000
+#define VGT_GS_MODE__GS_WRITE_OPTIMIZE__SHIFT 0x14
+#define VGT_GS_MODE__ONCHIP_MASK 0x600000
+#define VGT_GS_MODE__ONCHIP__SHIFT 0x15
+#define VGT_GS_ONCHIP_CNTL__ES_VERTS_PER_SUBGRP_MASK 0x7ff
+#define VGT_GS_ONCHIP_CNTL__ES_VERTS_PER_SUBGRP__SHIFT 0x0
+#define VGT_GS_ONCHIP_CNTL__GS_PRIMS_PER_SUBGRP_MASK 0x3ff800
+#define VGT_GS_ONCHIP_CNTL__GS_PRIMS_PER_SUBGRP__SHIFT 0xb
+#define VGT_GS_OUT_PRIM_TYPE__OUTPRIM_TYPE_MASK 0x3f
+#define VGT_GS_OUT_PRIM_TYPE__OUTPRIM_TYPE__SHIFT 0x0
+#define VGT_GS_OUT_PRIM_TYPE__OUTPRIM_TYPE_1_MASK 0x3f00
+#define VGT_GS_OUT_PRIM_TYPE__OUTPRIM_TYPE_1__SHIFT 0x8
+#define VGT_GS_OUT_PRIM_TYPE__OUTPRIM_TYPE_2_MASK 0x3f0000
+#define VGT_GS_OUT_PRIM_TYPE__OUTPRIM_TYPE_2__SHIFT 0x10
+#define VGT_GS_OUT_PRIM_TYPE__OUTPRIM_TYPE_3_MASK 0xfc00000
+#define VGT_GS_OUT_PRIM_TYPE__OUTPRIM_TYPE_3__SHIFT 0x16
+#define VGT_GS_OUT_PRIM_TYPE__UNIQUE_TYPE_PER_STREAM_MASK 0x80000000
+#define VGT_GS_OUT_PRIM_TYPE__UNIQUE_TYPE_PER_STREAM__SHIFT 0x1f
+#define VGT_CACHE_INVALIDATION__CACHE_INVALIDATION_MASK 0x3
+#define VGT_CACHE_INVALIDATION__CACHE_INVALIDATION__SHIFT 0x0
+#define VGT_CACHE_INVALIDATION__DIS_INSTANCING_OPT_MASK 0x10
+#define VGT_CACHE_INVALIDATION__DIS_INSTANCING_OPT__SHIFT 0x4
+#define VGT_CACHE_INVALIDATION__VS_NO_EXTRA_BUFFER_MASK 0x20
+#define VGT_CACHE_INVALIDATION__VS_NO_EXTRA_BUFFER__SHIFT 0x5
+#define VGT_CACHE_INVALIDATION__AUTO_INVLD_EN_MASK 0xc0
+#define VGT_CACHE_INVALIDATION__AUTO_INVLD_EN__SHIFT 0x6
+#define VGT_CACHE_INVALIDATION__USE_GS_DONE_MASK 0x200
+#define VGT_CACHE_INVALIDATION__USE_GS_DONE__SHIFT 0x9
+#define VGT_CACHE_INVALIDATION__DIS_RANGE_FULL_INVLD_MASK 0x800
+#define VGT_CACHE_INVALIDATION__DIS_RANGE_FULL_INVLD__SHIFT 0xb
+#define VGT_CACHE_INVALIDATION__GS_LATE_ALLOC_EN_MASK 0x1000
+#define VGT_CACHE_INVALIDATION__GS_LATE_ALLOC_EN__SHIFT 0xc
+#define VGT_CACHE_INVALIDATION__STREAMOUT_FULL_FLUSH_MASK 0x2000
+#define VGT_CACHE_INVALIDATION__STREAMOUT_FULL_FLUSH__SHIFT 0xd
+#define VGT_CACHE_INVALIDATION__ES_LIMIT_MASK 0x1f0000
+#define VGT_CACHE_INVALIDATION__ES_LIMIT__SHIFT 0x10
+#define VGT_RESET_DEBUG__GS_DISABLE_MASK 0x1
+#define VGT_RESET_DEBUG__GS_DISABLE__SHIFT 0x0
+#define VGT_RESET_DEBUG__TESS_DISABLE_MASK 0x2
+#define VGT_RESET_DEBUG__TESS_DISABLE__SHIFT 0x1
+#define VGT_RESET_DEBUG__WD_DISABLE_MASK 0x4
+#define VGT_RESET_DEBUG__WD_DISABLE__SHIFT 0x2
+#define VGT_STRMOUT_DELAY__SKIP_DELAY_MASK 0xff
+#define VGT_STRMOUT_DELAY__SKIP_DELAY__SHIFT 0x0
+#define VGT_STRMOUT_DELAY__SE0_WD_DELAY_MASK 0x700
+#define VGT_STRMOUT_DELAY__SE0_WD_DELAY__SHIFT 0x8
+#define VGT_STRMOUT_DELAY__SE1_WD_DELAY_MASK 0x3800
+#define VGT_STRMOUT_DELAY__SE1_WD_DELAY__SHIFT 0xb
+#define VGT_STRMOUT_DELAY__SE2_WD_DELAY_MASK 0x1c000
+#define VGT_STRMOUT_DELAY__SE2_WD_DELAY__SHIFT 0xe
+#define VGT_STRMOUT_DELAY__SE3_WD_DELAY_MASK 0xe0000
+#define VGT_STRMOUT_DELAY__SE3_WD_DELAY__SHIFT 0x11
+#define VGT_FIFO_DEPTHS__VS_DEALLOC_TBL_DEPTH_MASK 0x7f
+#define VGT_FIFO_DEPTHS__VS_DEALLOC_TBL_DEPTH__SHIFT 0x0
+#define VGT_FIFO_DEPTHS__RESERVED_0_MASK 0x80
+#define VGT_FIFO_DEPTHS__RESERVED_0__SHIFT 0x7
+#define VGT_FIFO_DEPTHS__CLIPP_FIFO_DEPTH_MASK 0x3fff00
+#define VGT_FIFO_DEPTHS__CLIPP_FIFO_DEPTH__SHIFT 0x8
+#define VGT_FIFO_DEPTHS__HSINPUT_FIFO_DEPTH_MASK 0xfc00000
+#define VGT_FIFO_DEPTHS__HSINPUT_FIFO_DEPTH__SHIFT 0x16
+#define VGT_GS_PER_ES__GS_PER_ES_MASK 0x7f

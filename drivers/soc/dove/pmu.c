@@ -1,411 +1,170 @@
-/*
- * Marvell Dove PMU support
- */
-#include <linux/io.h>
-#include <linux/irq.h>
-#include <linux/irqdomain.h>
-#include <linux/of.h>
-#include <linux/of_irq.h>
-#include <linux/of_address.h>
-#include <linux/platform_device.h>
-#include <linux/pm_domain.h>
-#include <linux/reset.h>
-#include <linux/reset-controller.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
-#include <linux/soc/dove/pmu.h>
-#include <linux/spinlock.h>
-
-#define NR_PMU_IRQS		7
-
-#define PMC_SW_RST		0x30
-#define PMC_IRQ_CAUSE		0x50
-#define PMC_IRQ_MASK		0x54
-
-#define PMU_PWR			0x10
-#define PMU_ISO			0x58
-
-struct pmu_data {
-	spinlock_t lock;
-	struct device_node *of_node;
-	void __iomem *pmc_base;
-	void __iomem *pmu_base;
-	struct irq_chip_generic *irq_gc;
-	struct irq_domain *irq_domain;
-#ifdef CONFIG_RESET_CONTROLLER
-	struct reset_controller_dev reset;
-#endif
-};
-
-/*
- * The PMU contains a register to reset various subsystems within the
- * SoC.  Export this as a reset controller.
- */
-#ifdef CONFIG_RESET_CONTROLLER
-#define rcdev_to_pmu(rcdev) container_of(rcdev, struct pmu_data, reset)
-
-static int pmu_reset_reset(struct reset_controller_dev *rc, unsigned long id)
-{
-	struct pmu_data *pmu = rcdev_to_pmu(rc);
-	unsigned long flags;
-	u32 val;
-
-	spin_lock_irqsave(&pmu->lock, flags);
-	val = readl_relaxed(pmu->pmc_base + PMC_SW_RST);
-	writel_relaxed(val & ~BIT(id), pmu->pmc_base + PMC_SW_RST);
-	writel_relaxed(val | BIT(id), pmu->pmc_base + PMC_SW_RST);
-	spin_unlock_irqrestore(&pmu->lock, flags);
-
-	return 0;
-}
-
-static int pmu_reset_assert(struct reset_controller_dev *rc, unsigned long id)
-{
-	struct pmu_data *pmu = rcdev_to_pmu(rc);
-	unsigned long flags;
-	u32 val = ~BIT(id);
-
-	spin_lock_irqsave(&pmu->lock, flags);
-	val &= readl_relaxed(pmu->pmc_base + PMC_SW_RST);
-	writel_relaxed(val, pmu->pmc_base + PMC_SW_RST);
-	spin_unlock_irqrestore(&pmu->lock, flags);
-
-	return 0;
-}
-
-static int pmu_reset_deassert(struct reset_controller_dev *rc, unsigned long id)
-{
-	struct pmu_data *pmu = rcdev_to_pmu(rc);
-	unsigned long flags;
-	u32 val = BIT(id);
-
-	spin_lock_irqsave(&pmu->lock, flags);
-	val |= readl_relaxed(pmu->pmc_base + PMC_SW_RST);
-	writel_relaxed(val, pmu->pmc_base + PMC_SW_RST);
-	spin_unlock_irqrestore(&pmu->lock, flags);
-
-	return 0;
-}
-
-static struct reset_control_ops pmu_reset_ops = {
-	.reset = pmu_reset_reset,
-	.assert = pmu_reset_assert,
-	.deassert = pmu_reset_deassert,
-};
-
-static struct reset_controller_dev pmu_reset __initdata = {
-	.ops = &pmu_reset_ops,
-	.owner = THIS_MODULE,
-	.nr_resets = 32,
-};
-
-static void __init pmu_reset_init(struct pmu_data *pmu)
-{
-	int ret;
-
-	pmu->reset = pmu_reset;
-	pmu->reset.of_node = pmu->of_node;
-
-	ret = reset_controller_register(&pmu->reset);
-	if (ret)
-		pr_err("pmu: %s failed: %d\n", "reset_controller_register", ret);
-}
-#else
-static void __init pmu_reset_init(struct pmu_data *pmu)
-{
-}
-#endif
-
-struct pmu_domain {
-	struct pmu_data *pmu;
-	u32 pwr_mask;
-	u32 rst_mask;
-	u32 iso_mask;
-	struct generic_pm_domain base;
-};
-
-#define to_pmu_domain(dom) container_of(dom, struct pmu_domain, base)
-
-/*
- * This deals with the "old" Marvell sequence of bringing a power domain
- * down/up, which is: apply power, release reset, disable isolators.
- *
- * Later devices apparantly use a different sequence: power up, disable
- * isolators, assert repair signal, enable SRMA clock, enable AXI clock,
- * enable module clock, deassert reset.
- *
- * Note: reading the assembly, it seems that the IO accessors have an
- * unfortunate side-effect - they cause memory already read into registers
- * for the if () to be re-read for the bit-set or bit-clear operation.
- * The code is written to avoid this.
- */
-static int pmu_domain_power_off(struct generic_pm_domain *domain)
-{
-	struct pmu_domain *pmu_dom = to_pmu_domain(domain);
-	struct pmu_data *pmu = pmu_dom->pmu;
-	unsigned long flags;
-	unsigned int val;
-	void __iomem *pmu_base = pmu->pmu_base;
-	void __iomem *pmc_base = pmu->pmc_base;
-
-	spin_lock_irqsave(&pmu->lock, flags);
-
-	/* Enable isolators */
-	if (pmu_dom->iso_mask) {
-		val = ~pmu_dom->iso_mask;
-		val &= readl_relaxed(pmu_base + PMU_ISO);
-		writel_relaxed(val, pmu_base + PMU_ISO);
-	}
-
-	/* Reset unit */
-	if (pmu_dom->rst_mask) {
-		val = ~pmu_dom->rst_mask;
-		val &= readl_relaxed(pmc_base + PMC_SW_RST);
-		writel_relaxed(val, pmc_base + PMC_SW_RST);
-	}
-
-	/* Power down */
-	val = readl_relaxed(pmu_base + PMU_PWR) | pmu_dom->pwr_mask;
-	writel_relaxed(val, pmu_base + PMU_PWR);
-
-	spin_unlock_irqrestore(&pmu->lock, flags);
-
-	return 0;
-}
-
-static int pmu_domain_power_on(struct generic_pm_domain *domain)
-{
-	struct pmu_domain *pmu_dom = to_pmu_domain(domain);
-	struct pmu_data *pmu = pmu_dom->pmu;
-	unsigned long flags;
-	unsigned int val;
-	void __iomem *pmu_base = pmu->pmu_base;
-	void __iomem *pmc_base = pmu->pmc_base;
-
-	spin_lock_irqsave(&pmu->lock, flags);
-
-	/* Power on */
-	val = ~pmu_dom->pwr_mask & readl_relaxed(pmu_base + PMU_PWR);
-	writel_relaxed(val, pmu_base + PMU_PWR);
-
-	/* Release reset */
-	if (pmu_dom->rst_mask) {
-		val = pmu_dom->rst_mask;
-		val |= readl_relaxed(pmc_base + PMC_SW_RST);
-		writel_relaxed(val, pmc_base + PMC_SW_RST);
-	}
-
-	/* Disable isolators */
-	if (pmu_dom->iso_mask) {
-		val = pmu_dom->iso_mask;
-		val |= readl_relaxed(pmu_base + PMU_ISO);
-		writel_relaxed(val, pmu_base + PMU_ISO);
-	}
-
-	spin_unlock_irqrestore(&pmu->lock, flags);
-
-	return 0;
-}
-
-static void __pmu_domain_register(struct pmu_domain *domain,
-	struct device_node *np)
-{
-	unsigned int val = readl_relaxed(domain->pmu->pmu_base + PMU_PWR);
-
-	domain->base.power_off = pmu_domain_power_off;
-	domain->base.power_on = pmu_domain_power_on;
-
-	pm_genpd_init(&domain->base, NULL, !(val & domain->pwr_mask));
-
-	if (np)
-		of_genpd_add_provider_simple(np, &domain->base);
-}
-
-/* PMU IRQ controller */
-static void pmu_irq_handler(struct irq_desc *desc)
-{
-	struct pmu_data *pmu = irq_desc_get_handler_data(desc);
-	struct irq_chip_generic *gc = pmu->irq_gc;
-	struct irq_domain *domain = pmu->irq_domain;
-	void __iomem *base = gc->reg_base;
-	u32 stat = readl_relaxed(base + PMC_IRQ_CAUSE) & gc->mask_cache;
-	u32 done = ~0;
-
-	if (stat == 0) {
-		handle_bad_irq(desc);
-		return;
-	}
-
-	while (stat) {
-		u32 hwirq = fls(stat) - 1;
-
-		stat &= ~(1 << hwirq);
-		done &= ~(1 << hwirq);
-
-		generic_handle_irq(irq_find_mapping(domain, hwirq));
-	}
-
-	/*
-	 * The PMU mask register is not RW0C: it is RW.  This means that
-	 * the bits take whatever value is written to them; if you write
-	 * a '1', you will set the interrupt.
-	 *
-	 * Unfortunately this means there is NO race free way to clear
-	 * these interrupts.
-	 *
-	 * So, let's structure the code so that the window is as small as
-	 * possible.
-	 */
-	irq_gc_lock(gc);
-	done &= readl_relaxed(base + PMC_IRQ_CAUSE);
-	writel_relaxed(done, base + PMC_IRQ_CAUSE);
-	irq_gc_unlock(gc);
-}
-
-static int __init dove_init_pmu_irq(struct pmu_data *pmu, int irq)
-{
-	const char *name = "pmu_irq";
-	struct irq_chip_generic *gc;
-	struct irq_domain *domain;
-	int ret;
-
-	/* mask and clear all interrupts */
-	writel(0, pmu->pmc_base + PMC_IRQ_MASK);
-	writel(0, pmu->pmc_base + PMC_IRQ_CAUSE);
-
-	domain = irq_domain_add_linear(pmu->of_node, NR_PMU_IRQS,
-				       &irq_generic_chip_ops, NULL);
-	if (!domain) {
-		pr_err("%s: unable to add irq domain\n", name);
-		return -ENOMEM;
-	}
-
-	ret = irq_alloc_domain_generic_chips(domain, NR_PMU_IRQS, 1, name,
-					     handle_level_irq,
-					     IRQ_NOREQUEST | IRQ_NOPROBE, 0,
-					     IRQ_GC_INIT_MASK_CACHE);
-	if (ret) {
-		pr_err("%s: unable to alloc irq domain gc: %d\n", name, ret);
-		irq_domain_remove(domain);
-		return ret;
-	}
-
-	gc = irq_get_domain_generic_chip(domain, 0);
-	gc->reg_base = pmu->pmc_base;
-	gc->chip_types[0].regs.mask = PMC_IRQ_MASK;
-	gc->chip_types[0].chip.irq_mask = irq_gc_mask_clr_bit;
-	gc->chip_types[0].chip.irq_unmask = irq_gc_mask_set_bit;
-
-	pmu->irq_domain = domain;
-	pmu->irq_gc = gc;
-
-	irq_set_handler_data(irq, pmu);
-	irq_set_chained_handler(irq, pmu_irq_handler);
-
-	return 0;
-}
-
-/*
- * pmu: power-manager@d0000 {
- *	compatible = "marvell,dove-pmu";
- *	reg = <0xd0000 0x8000> <0xd8000 0x8000>;
- *	interrupts = <33>;
- *	interrupt-controller;
- *	#reset-cells = 1;
- *	vpu_domain: vpu-domain {
- *		#power-domain-cells = <0>;
- *		marvell,pmu_pwr_mask = <0x00000008>;
- *		marvell,pmu_iso_mask = <0x00000001>;
- *		resets = <&pmu 16>;
- *	};
- *	gpu_domain: gpu-domain {
- *		#power-domain-cells = <0>;
- *		marvell,pmu_pwr_mask = <0x00000004>;
- *		marvell,pmu_iso_mask = <0x00000002>;
- *		resets = <&pmu 18>;
- *	};
- * };
- */
-int __init dove_init_pmu(void)
-{
-	struct device_node *np_pmu, *domains_node, *np;
-	struct pmu_data *pmu;
-	int ret, parent_irq;
-
-	/* Lookup the PMU node */
-	np_pmu = of_find_compatible_node(NULL, NULL, "marvell,dove-pmu");
-	if (!np_pmu)
-		return 0;
-
-	domains_node = of_get_child_by_name(np_pmu, "domains");
-	if (!domains_node) {
-		pr_err("%s: failed to find domains sub-node\n", np_pmu->name);
-		return 0;
-	}
-
-	pmu = kzalloc(sizeof(*pmu), GFP_KERNEL);
-	if (!pmu)
-		return -ENOMEM;
-
-	spin_lock_init(&pmu->lock);
-	pmu->of_node = np_pmu;
-	pmu->pmc_base = of_iomap(pmu->of_node, 0);
-	pmu->pmu_base = of_iomap(pmu->of_node, 1);
-	if (!pmu->pmc_base || !pmu->pmu_base) {
-		pr_err("%s: failed to map PMU\n", np_pmu->name);
-		iounmap(pmu->pmu_base);
-		iounmap(pmu->pmc_base);
-		kfree(pmu);
-		return -ENOMEM;
-	}
-
-	pmu_reset_init(pmu);
-
-	for_each_available_child_of_node(domains_node, np) {
-		struct of_phandle_args args;
-		struct pmu_domain *domain;
-
-		domain = kzalloc(sizeof(*domain), GFP_KERNEL);
-		if (!domain)
-			break;
-
-		domain->pmu = pmu;
-		domain->base.name = kstrdup(np->name, GFP_KERNEL);
-		if (!domain->base.name) {
-			kfree(domain);
-			break;
-		}
-
-		of_property_read_u32(np, "marvell,pmu_pwr_mask",
-				     &domain->pwr_mask);
-		of_property_read_u32(np, "marvell,pmu_iso_mask",
-				     &domain->iso_mask);
-
-		/*
-		 * We parse the reset controller property directly here
-		 * to ensure that we can operate when the reset controller
-		 * support is not configured into the kernel.
-		 */
-		ret = of_parse_phandle_with_args(np, "resets", "#reset-cells",
-						 0, &args);
-		if (ret == 0) {
-			if (args.np == pmu->of_node)
-				domain->rst_mask = BIT(args.args[0]);
-			of_node_put(args.np);
-		}
-
-		__pmu_domain_register(domain, np);
-	}
-
-	/* Loss of the interrupt controller is not a fatal error. */
-	parent_irq = irq_of_parse_and_map(pmu->of_node, 0);
-	if (!parent_irq) {
-		pr_err("%s: no interrupt specified\n", np_pmu->name);
-	} else {
-		ret = dove_init_pmu_irq(pmu, parent_irq);
-		if (ret)
-			pr_err("dove_init_pmu_irq() failed: %d\n", ret);
-	}
-
-	return 0;
-}
+_278__MemoryLevel_4_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_278__MemoryLevel_4_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_279__MemoryLevel_4_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_279__MemoryLevel_4_MinVddci__SHIFT 0x0
+#define DPM_TABLE_280__MemoryLevel_4_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_280__MemoryLevel_4_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_281__MemoryLevel_4_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_281__MemoryLevel_4_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_282__MemoryLevel_4_StutterEnable_MASK 0xff
+#define DPM_TABLE_282__MemoryLevel_4_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_282__MemoryLevel_4_RttEnable_MASK 0xff00
+#define DPM_TABLE_282__MemoryLevel_4_RttEnable__SHIFT 0x8
+#define DPM_TABLE_282__MemoryLevel_4_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_282__MemoryLevel_4_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_282__MemoryLevel_4_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_282__MemoryLevel_4_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_283__MemoryLevel_4_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_283__MemoryLevel_4_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_283__MemoryLevel_4_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_283__MemoryLevel_4_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_283__MemoryLevel_4_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_283__MemoryLevel_4_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_283__MemoryLevel_4_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_283__MemoryLevel_4_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_284__MemoryLevel_4_padding_MASK 0xff
+#define DPM_TABLE_284__MemoryLevel_4_padding__SHIFT 0x0
+#define DPM_TABLE_284__MemoryLevel_4_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_284__MemoryLevel_4_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_284__MemoryLevel_4_DownHyst_MASK 0xff0000
+#define DPM_TABLE_284__MemoryLevel_4_DownHyst__SHIFT 0x10
+#define DPM_TABLE_284__MemoryLevel_4_UpHyst_MASK 0xff000000
+#define DPM_TABLE_284__MemoryLevel_4_UpHyst__SHIFT 0x18
+#define DPM_TABLE_285__MemoryLevel_4_padding1_MASK 0xff
+#define DPM_TABLE_285__MemoryLevel_4_padding1__SHIFT 0x0
+#define DPM_TABLE_285__MemoryLevel_4_DisplayWatermark_MASK 0xff00
+#define DPM_TABLE_285__MemoryLevel_4_DisplayWatermark__SHIFT 0x8
+#define DPM_TABLE_285__MemoryLevel_4_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_285__MemoryLevel_4_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_286__MemoryLevel_4_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_286__MemoryLevel_4_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_287__MemoryLevel_4_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_287__MemoryLevel_4_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_288__MemoryLevel_4_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_288__MemoryLevel_4_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_289__MemoryLevel_4_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_289__MemoryLevel_4_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_290__MemoryLevel_4_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_290__MemoryLevel_4_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_291__MemoryLevel_4_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_291__MemoryLevel_4_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_292__MemoryLevel_4_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_292__MemoryLevel_4_DllCntl__SHIFT 0x0
+#define DPM_TABLE_293__MemoryLevel_4_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_293__MemoryLevel_4_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_294__MemoryLevel_4_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_294__MemoryLevel_4_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_295__MemoryLevel_5_MinVddc_MASK 0xffffffff
+#define DPM_TABLE_295__MemoryLevel_5_MinVddc__SHIFT 0x0
+#define DPM_TABLE_296__MemoryLevel_5_MinVddcPhases_MASK 0xffffffff
+#define DPM_TABLE_296__MemoryLevel_5_MinVddcPhases__SHIFT 0x0
+#define DPM_TABLE_297__MemoryLevel_5_MinVddci_MASK 0xffffffff
+#define DPM_TABLE_297__MemoryLevel_5_MinVddci__SHIFT 0x0
+#define DPM_TABLE_298__MemoryLevel_5_MinMvdd_MASK 0xffffffff
+#define DPM_TABLE_298__MemoryLevel_5_MinMvdd__SHIFT 0x0
+#define DPM_TABLE_299__MemoryLevel_5_MclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_299__MemoryLevel_5_MclkFrequency__SHIFT 0x0
+#define DPM_TABLE_300__MemoryLevel_5_StutterEnable_MASK 0xff
+#define DPM_TABLE_300__MemoryLevel_5_StutterEnable__SHIFT 0x0
+#define DPM_TABLE_300__MemoryLevel_5_RttEnable_MASK 0xff00
+#define DPM_TABLE_300__MemoryLevel_5_RttEnable__SHIFT 0x8
+#define DPM_TABLE_300__MemoryLevel_5_EdcWriteEnable_MASK 0xff0000
+#define DPM_TABLE_300__MemoryLevel_5_EdcWriteEnable__SHIFT 0x10
+#define DPM_TABLE_300__MemoryLevel_5_EdcReadEnable_MASK 0xff000000
+#define DPM_TABLE_300__MemoryLevel_5_EdcReadEnable__SHIFT 0x18
+#define DPM_TABLE_301__MemoryLevel_5_EnabledForActivity_MASK 0xff
+#define DPM_TABLE_301__MemoryLevel_5_EnabledForActivity__SHIFT 0x0
+#define DPM_TABLE_301__MemoryLevel_5_EnabledForThrottle_MASK 0xff00
+#define DPM_TABLE_301__MemoryLevel_5_EnabledForThrottle__SHIFT 0x8
+#define DPM_TABLE_301__MemoryLevel_5_StrobeRatio_MASK 0xff0000
+#define DPM_TABLE_301__MemoryLevel_5_StrobeRatio__SHIFT 0x10
+#define DPM_TABLE_301__MemoryLevel_5_StrobeEnable_MASK 0xff000000
+#define DPM_TABLE_301__MemoryLevel_5_StrobeEnable__SHIFT 0x18
+#define DPM_TABLE_302__MemoryLevel_5_padding_MASK 0xff
+#define DPM_TABLE_302__MemoryLevel_5_padding__SHIFT 0x0
+#define DPM_TABLE_302__MemoryLevel_5_VoltageDownHyst_MASK 0xff00
+#define DPM_TABLE_302__MemoryLevel_5_VoltageDownHyst__SHIFT 0x8
+#define DPM_TABLE_302__MemoryLevel_5_DownHyst_MASK 0xff0000
+#define DPM_TABLE_302__MemoryLevel_5_DownHyst__SHIFT 0x10
+#define DPM_TABLE_302__MemoryLevel_5_UpHyst_MASK 0xff000000
+#define DPM_TABLE_302__MemoryLevel_5_UpHyst__SHIFT 0x18
+#define DPM_TABLE_303__MemoryLevel_5_padding1_MASK 0xff
+#define DPM_TABLE_303__MemoryLevel_5_padding1__SHIFT 0x0
+#define DPM_TABLE_303__MemoryLevel_5_DisplayWatermark_MASK 0xff00
+#define DPM_TABLE_303__MemoryLevel_5_DisplayWatermark__SHIFT 0x8
+#define DPM_TABLE_303__MemoryLevel_5_ActivityLevel_MASK 0xffff0000
+#define DPM_TABLE_303__MemoryLevel_5_ActivityLevel__SHIFT 0x10
+#define DPM_TABLE_304__MemoryLevel_5_MpllFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_304__MemoryLevel_5_MpllFuncCntl__SHIFT 0x0
+#define DPM_TABLE_305__MemoryLevel_5_MpllFuncCntl_1_MASK 0xffffffff
+#define DPM_TABLE_305__MemoryLevel_5_MpllFuncCntl_1__SHIFT 0x0
+#define DPM_TABLE_306__MemoryLevel_5_MpllFuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_306__MemoryLevel_5_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TABLE_307__MemoryLevel_5_MpllAdFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_307__MemoryLevel_5_MpllAdFuncCntl__SHIFT 0x0
+#define DPM_TABLE_308__MemoryLevel_5_MpllDqFuncCntl_MASK 0xffffffff
+#define DPM_TABLE_308__MemoryLevel_5_MpllDqFuncCntl__SHIFT 0x0
+#define DPM_TABLE_309__MemoryLevel_5_MclkPwrmgtCntl_MASK 0xffffffff
+#define DPM_TABLE_309__MemoryLevel_5_MclkPwrmgtCntl__SHIFT 0x0
+#define DPM_TABLE_310__MemoryLevel_5_DllCntl_MASK 0xffffffff
+#define DPM_TABLE_310__MemoryLevel_5_DllCntl__SHIFT 0x0
+#define DPM_TABLE_311__MemoryLevel_5_MpllSs1_MASK 0xffffffff
+#define DPM_TABLE_311__MemoryLevel_5_MpllSs1__SHIFT 0x0
+#define DPM_TABLE_312__MemoryLevel_5_MpllSs2_MASK 0xffffffff
+#define DPM_TABLE_312__MemoryLevel_5_MpllSs2__SHIFT 0x0
+#define DPM_TABLE_313__LinkLevel_0_Padding_MASK 0xff
+#define DPM_TABLE_313__LinkLevel_0_Padding__SHIFT 0x0
+#define DPM_TABLE_313__LinkLevel_0_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_313__LinkLevel_0_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_313__LinkLevel_0_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_313__LinkLevel_0_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_313__LinkLevel_0_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_313__LinkLevel_0_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_314__LinkLevel_0_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_314__LinkLevel_0_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_315__LinkLevel_0_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_315__LinkLevel_0_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_316__LinkLevel_0_Reserved_MASK 0xffffffff
+#define DPM_TABLE_316__LinkLevel_0_Reserved__SHIFT 0x0
+#define DPM_TABLE_317__LinkLevel_1_Padding_MASK 0xff
+#define DPM_TABLE_317__LinkLevel_1_Padding__SHIFT 0x0
+#define DPM_TABLE_317__LinkLevel_1_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_317__LinkLevel_1_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_317__LinkLevel_1_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_317__LinkLevel_1_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_317__LinkLevel_1_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_317__LinkLevel_1_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_318__LinkLevel_1_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_318__LinkLevel_1_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_319__LinkLevel_1_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_319__LinkLevel_1_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_320__LinkLevel_1_Reserved_MASK 0xffffffff
+#define DPM_TABLE_320__LinkLevel_1_Reserved__SHIFT 0x0
+#define DPM_TABLE_321__LinkLevel_2_Padding_MASK 0xff
+#define DPM_TABLE_321__LinkLevel_2_Padding__SHIFT 0x0
+#define DPM_TABLE_321__LinkLevel_2_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_321__LinkLevel_2_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_321__LinkLevel_2_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_321__LinkLevel_2_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_321__LinkLevel_2_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_321__LinkLevel_2_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_322__LinkLevel_2_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_322__LinkLevel_2_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_323__LinkLevel_2_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_323__LinkLevel_2_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_324__LinkLevel_2_Reserved_MASK 0xffffffff
+#define DPM_TABLE_324__LinkLevel_2_Reserved__SHIFT 0x0
+#define DPM_TABLE_325__LinkLevel_3_Padding_MASK 0xff
+#define DPM_TABLE_325__LinkLevel_3_Padding__SHIFT 0x0
+#define DPM_TABLE_325__LinkLevel_3_EnabledForActivity_MASK 0xff00
+#define DPM_TABLE_325__LinkLevel_3_EnabledForActivity__SHIFT 0x8
+#define DPM_TABLE_325__LinkLevel_3_PcieLaneCount_MASK 0xff0000
+#define DPM_TABLE_325__LinkLevel_3_PcieLaneCount__SHIFT 0x10
+#define DPM_TABLE_325__LinkLevel_3_PcieGenSpeed_MASK 0xff000000
+#define DPM_TABLE_325__LinkLevel_3_PcieGenSpeed__SHIFT 0x18
+#define DPM_TABLE_326__LinkLevel_3_DownThreshold_MASK 0xffffffff
+#define DPM_TABLE_326__LinkLevel_3_DownThreshold__SHIFT 0x0
+#define DPM_TABLE_327__LinkLevel_3_UpThreshold_MASK 0xffffffff
+#define DPM_TABLE_327__LinkLevel_3_UpThreshold__SHIFT 0x0
+#define DPM_TABLE_328__LinkLevel_3_Reserved_MASK 0xffffffff
+#define DPM_TABLE_328__LinkLevel_3_Reserved_

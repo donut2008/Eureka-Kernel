@@ -1,131 +1,104 @@
-/*
- *  Input driver for PCAP events:
- *   * Power key
- *   * Headphone button
- *
- *  Copyright (c) 2008,2009 Ilya Petrov <ilya.muromec@gmail.com>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License version 2 as
- *  published by the Free Software Foundation.
- *
- */
+data->lock);
 
-#include <linux/module.h>
-#include <linux/interrupt.h>
-#include <linux/platform_device.h>
-#include <linux/input.h>
-#include <linux/mfd/ezx-pcap.h>
-#include <linux/slab.h>
+	ist40xx_print_info(data);
 
-struct pcap_keys {
-	struct pcap_chip *pcap;
-	struct input_dev *input;
-};
+	ret = ist40xx_set_input_device(data);
+	if (ret)
+		goto err_get_info;
 
-/* PCAP2 interrupts us on keypress */
-static irqreturn_t pcap_keys_handler(int irq, void *_pcap_keys)
-{
-	struct pcap_keys *pcap_keys = _pcap_keys;
-	int pirq = irq_to_pcap(pcap_keys->pcap, irq);
-	u32 pstat;
+	ist40xx_read_cmd(data, eHCOM_GET_CAL_RESULT_S, &calib_msg);
+	input_info(true, &data->client->dev, "SLF calib result: 0x%08X\n", calib_msg);
+	ist40xx_read_cmd(data, eHCOM_GET_CAL_RESULT_M, &calib_msg);
+	input_info(true, &data->client->dev, "MTL calib result: 0x%08X\n", calib_msg);
+	ist40xx_read_cmd(data, eHCOM_GET_CAL_RESULT_P, &calib_msg);
+	input_info(true, &data->client->dev, "PROX calib result: 0x%08X\n", calib_msg);
 
-	ezx_pcap_read(pcap_keys->pcap, PCAP_REG_PSTAT, &pstat);
-	pstat &= 1 << pirq;
-
-	switch (pirq) {
-	case PCAP_IRQ_ONOFF:
-		input_report_key(pcap_keys->input, KEY_POWER, !pstat);
-		break;
-	case PCAP_IRQ_MIC:
-		input_report_key(pcap_keys->input, KEY_HP, !pstat);
-		break;
+	ret = ist40xx_write_cmd(data, IST40XX_HIB_CMD,
+			(eHCOM_FW_HOLD << 16) | (IST40XX_DISABLE & 0xFFFF));
+	if (ret) {
+		input_err(true, &data->client->dev, "%s: fail to disable hold\n",
+			   __func__);
+		mutex_lock(&data->lock);
+		ist40xx_reset(data, false);
+		mutex_unlock(&data->lock);
 	}
 
-	input_sync(pcap_keys->input);
+	ist40xx_enable_irq(data);
 
-	return IRQ_HANDLED;
-}
+	if (data->dt_data->support_fod) {
+		ist40xx_read_sponge_reg(data, IST40XX_SPONGE_FOD_INFO,
+						(u16*)&fod_info, 2, true);
 
-static int pcap_keys_probe(struct platform_device *pdev)
-{
-	int err = -ENOMEM;
-	struct pcap_keys *pcap_keys;
-	struct input_dev *input_dev;
+		data->fod_tx = fod_info[0];
+		data->fod_rx = fod_info[1];
+		data->fod_vi_size = fod_info[2];
 
-	pcap_keys = kmalloc(sizeof(struct pcap_keys), GFP_KERNEL);
-	if (!pcap_keys)
-		return err;
-
-	pcap_keys->pcap = dev_get_drvdata(pdev->dev.parent);
-
-	input_dev = input_allocate_device();
-	if (!input_dev)
-		goto fail;
-
-	pcap_keys->input = input_dev;
-
-	platform_set_drvdata(pdev, pcap_keys);
-	input_dev->name = pdev->name;
-	input_dev->phys = "pcap-keys/input0";
-	input_dev->id.bustype = BUS_HOST;
-	input_dev->dev.parent = &pdev->dev;
-
-	__set_bit(EV_KEY, input_dev->evbit);
-	__set_bit(KEY_POWER, input_dev->keybit);
-	__set_bit(KEY_HP, input_dev->keybit);
-
-	err = input_register_device(input_dev);
-	if (err)
-		goto fail_allocate;
-
-	err = request_irq(pcap_to_irq(pcap_keys->pcap, PCAP_IRQ_ONOFF),
-			pcap_keys_handler, 0, "Power key", pcap_keys);
-	if (err)
-		goto fail_register;
-
-	err = request_irq(pcap_to_irq(pcap_keys->pcap, PCAP_IRQ_MIC),
-			pcap_keys_handler, 0, "Headphone button", pcap_keys);
-	if (err)
-		goto fail_pwrkey;
-
-	return 0;
-
-fail_pwrkey:
-	free_irq(pcap_to_irq(pcap_keys->pcap, PCAP_IRQ_ONOFF), pcap_keys);
-fail_register:
-	input_unregister_device(input_dev);
-	goto fail;
-fail_allocate:
-	input_free_device(input_dev);
-fail:
-	kfree(pcap_keys);
-	return err;
-}
-
-static int pcap_keys_remove(struct platform_device *pdev)
-{
-	struct pcap_keys *pcap_keys = platform_get_drvdata(pdev);
-
-	free_irq(pcap_to_irq(pcap_keys->pcap, PCAP_IRQ_ONOFF), pcap_keys);
-	free_irq(pcap_to_irq(pcap_keys->pcap, PCAP_IRQ_MIC), pcap_keys);
-
-	input_unregister_device(pcap_keys->input);
-	kfree(pcap_keys);
-
-	return 0;
-}
-
-static struct platform_driver pcap_keys_device_driver = {
-	.probe		= pcap_keys_probe,
-	.remove		= pcap_keys_remove,
-	.driver		= {
-		.name	= "pcap-keys",
+		input_info(true, &data->client->dev, "%s fod_tx[%d] fod_rx[%d] fod_vi_size[%d]\n",
+					__func__, data->fod_tx, data->fod_rx, data->fod_vi_size); 
 	}
-};
-module_platform_driver(pcap_keys_device_driver);
+	
+	return 0;
 
-MODULE_DESCRIPTION("Motorola PCAP2 input events driver");
-MODULE_AUTHOR("Ilya Petrov <ilya.muromec@gmail.com>");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:pcap_keys");
+err_get_info:
+
+	return ret;
+}
+
+#define SPECIAL_MAGIC_STRING		(0x4170CF00)
+#define SPECIAL_MAGIC_MASK		(0xFFFFFF00)
+#define SPECIAL_MESSAGE_MASK		(~SPECIAL_MAGIC_MASK)
+#define PARSE_SPECIAL_MESSAGE(n)	((n & SPECIAL_MAGIC_MASK) == SPECIAL_MAGIC_STRING ? \
+						(n & SPECIAL_MESSAGE_MASK) : -EINVAL)
+#define SPECIAL_START_MASK		(0x80)
+#define SPECIAL_SUCCESS_MASK		(0x0F)
+void ist40xx_special_cmd(struct ist40xx_data *data, int cmd)
+{
+	gesture_msg g_msg;
+
+	if (cmd == 0) {
+		ist40xx_burst_read(data->client, IST40XX_HIB_GESTURE_MSG, g_msg.full,
+				sizeof(g_msg.full) / IST40XX_DATA_LEN, true);
+
+		input_info(true, &data->client->dev, "g_msg %d, %d, %d\n",
+					g_msg.b.eid, g_msg.b.gtype, g_msg.b.gid);
+
+		if (g_msg.b.eid == EID_GESTURE) {
+			switch (g_msg.b.gtype) {
+			case G_TYPE_SWIPE:
+				if (g_msg.b.gid == G_ID_SWIPE_UP) {
+					data->scrub_id = SPONGE_EVENT_TYPE_SPAY;
+					data->scrub_x = 0;
+					data->scrub_y = 0;
+					data->all_spay_count++;
+
+					input_info(true, &data->client->dev, "Swipe Up Trigger\n");
+
+					input_report_key(data->input_dev,
+							 KEY_BLACK_UI_GESTURE,
+							 true);
+					input_sync(data->input_dev);
+					input_report_key(data->input_dev,
+							 KEY_BLACK_UI_GESTURE,
+							 false);
+					input_sync(data->input_dev);
+				}
+				break;
+			case G_TYPE_DOUBLETAP:
+				if (g_msg.b.gid == G_ID_AOD_DOUBLETAP) {
+					data->scrub_id = SPONGE_EVENT_TYPE_AOD_DOUBLETAB;
+					data->scrub_x = (g_msg.b.gdata[0] << 4) |
+									((g_msg.b.gdata[2] >> 4) & 0xF);
+					data->scrub_y = (g_msg.b.gdata[1] << 4) |
+									(g_msg.b.gdata[2] & 0xF);
+					data->all_aod_tsp_count++;
+
+					input_info(true, &data->client->dev,
+						   "Double Tap Trigger (%d, %d)\n",
+						   data->scrub_x, data->scrub_y);
+
+					input_report_key(data->input_dev,
+							 KEY_BLACK_UI_GESTURE,
+							 true);
+					input_sync(data->input_dev);
+					input_report_key(data->input_dev,
+							 KEY_BLACK_U

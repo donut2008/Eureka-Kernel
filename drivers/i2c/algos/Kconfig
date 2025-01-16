@@ -1,17 +1,9 @@
-#
-# I2C algorithm drivers configuration
-#
-
-menu "I2C Algorithms"
-	visible if !I2C_HELPER_AUTO
-
-config I2C_ALGOBIT
-	tristate "I2C bit-banging interfaces"
-
-config I2C_ALGOPCF
-	tristate "I2C PCF 8584 interfaces"
-
-config I2C_ALGOPCA
-	tristate "I2C PCA 9564 interfaces"
-
-endmenu
+eturn
+ * @entry: pointer to array where work completions are placed
+ *
+ * Returns the number of completion entries polled.
+ *
+ * This may be called from interrupt context.  Also called by ib_poll_cq()
+ * in the generic verbs code.
+ */
+int qib_poll_cq(struct ib_cq *ibcq, int

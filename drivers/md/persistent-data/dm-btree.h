@@ -1,179 +1,99 @@
-/*
- * Copyright (C) 2011 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-#ifndef _LINUX_DM_BTREE_H
-#define _LINUX_DM_BTREE_H
-
-#include "dm-block-manager.h"
-
-struct dm_transaction_manager;
-
-/*----------------------------------------------------------------*/
-
-/*
- * Annotations used to check on-disk metadata is handled as little-endian.
- */
-#ifdef __CHECKER__
-#  define __dm_written_to_disk(x) __releases(x)
-#  define __dm_reads_from_disk(x) __acquires(x)
-#  define __dm_bless_for_disk(x) __acquire(x)
-#  define __dm_unbless_for_disk(x) __release(x)
-#else
-#  define __dm_written_to_disk(x)
-#  define __dm_reads_from_disk(x)
-#  define __dm_bless_for_disk(x)
-#  define __dm_unbless_for_disk(x)
-#endif
-
-/*----------------------------------------------------------------*/
-
-/*
- * Manipulates hierarchical B+ trees with 64-bit keys and arbitrary-sized
- * values.
- */
-
-/*
- * Information about the values stored within the btree.
- */
-struct dm_btree_value_type {
-	void *context;
-
-	/*
-	 * The size in bytes of each value.
-	 */
-	uint32_t size;
-
-	/*
-	 * Any of these methods can be safely set to NULL if you do not
-	 * need the corresponding feature.
-	 */
-
-	/*
-	 * The btree is making a duplicate of the value, for instance
-	 * because previously-shared btree nodes have now diverged.
-	 * @value argument is the new copy that the copy function may modify.
-	 * (Probably it just wants to increment a reference count
-	 * somewhere.) This method is _not_ called for insertion of a new
-	 * value: It is assumed the ref count is already 1.
-	 */
-	void (*inc)(void *context, const void *value);
-
-	/*
-	 * This value is being deleted.  The btree takes care of freeing
-	 * the memory pointed to by @value.  Often the del function just
-	 * needs to decrement a reference count somewhere.
-	 */
-	void (*dec)(void *context, const void *value);
-
-	/*
-	 * A test for equality between two values.  When a value is
-	 * overwritten with a new one, the old one has the dec method
-	 * called _unless_ the new and old value are deemed equal.
-	 */
-	int (*equal)(void *context, const void *value1, const void *value2);
-};
-
-/*
- * The shape and contents of a btree.
- */
-struct dm_btree_info {
-	struct dm_transaction_manager *tm;
-
-	/*
-	 * Number of nested btrees. (Not the depth of a single tree.)
-	 */
-	unsigned levels;
-	struct dm_btree_value_type value_type;
-};
-
-/*
- * Set up an empty tree.  O(1).
- */
-int dm_btree_empty(struct dm_btree_info *info, dm_block_t *root);
-
-/*
- * Delete a tree.  O(n) - this is the slow one!  It can also block, so
- * please don't call it on an IO path.
- */
-int dm_btree_del(struct dm_btree_info *info, dm_block_t root);
-
-/*
- * All the lookup functions return -ENODATA if the key cannot be found.
- */
-
-/*
- * Tries to find a key that matches exactly.  O(ln(n))
- */
-int dm_btree_lookup(struct dm_btree_info *info, dm_block_t root,
-		    uint64_t *keys, void *value_le);
-
-/*
- * Tries to find the first key where the bottom level key is >= to that
- * given.  Useful for skipping empty sections of the btree.
- */
-int dm_btree_lookup_next(struct dm_btree_info *info, dm_block_t root,
-			 uint64_t *keys, uint64_t *rkey, void *value_le);
-
-/*
- * Insertion (or overwrite an existing value).  O(ln(n))
- */
-int dm_btree_insert(struct dm_btree_info *info, dm_block_t root,
-		    uint64_t *keys, void *value, dm_block_t *new_root)
-		    __dm_written_to_disk(value);
-
-/*
- * A variant of insert that indicates whether it actually inserted or just
- * overwrote.  Useful if you're keeping track of the number of entries in a
- * tree.
- */
-int dm_btree_insert_notify(struct dm_btree_info *info, dm_block_t root,
-			   uint64_t *keys, void *value, dm_block_t *new_root,
-			   int *inserted)
-			   __dm_written_to_disk(value);
-
-/*
- * Remove a key if present.  This doesn't remove empty sub trees.  Normally
- * subtrees represent a separate entity, like a snapshot map, so this is
- * correct behaviour.  O(ln(n)).
- */
-int dm_btree_remove(struct dm_btree_info *info, dm_block_t root,
-		    uint64_t *keys, dm_block_t *new_root);
-
-/*
- * Removes a _contiguous_ run of values starting from 'keys' and not
- * reaching keys2 (where keys2 is keys with the final key replaced with
- * 'end_key').  'end_key' is the one-past-the-end value.  'keys' may be
- * altered.
- */
-int dm_btree_remove_leaves(struct dm_btree_info *info, dm_block_t root,
-			   uint64_t *keys, uint64_t end_key,
-			   dm_block_t *new_root, unsigned *nr_removed);
-
-/*
- * Returns < 0 on failure.  Otherwise the number of key entries that have
- * been filled out.  Remember trees can have zero entries, and as such have
- * no lowest key.
- */
-int dm_btree_find_lowest_key(struct dm_btree_info *info, dm_block_t root,
-			     uint64_t *result_keys);
-
-/*
- * Returns < 0 on failure.  Otherwise the number of key entries that have
- * been filled out.  Remember trees can have zero entries, and as such have
- * no highest key.
- */
-int dm_btree_find_highest_key(struct dm_btree_info *info, dm_block_t root,
-			      uint64_t *result_keys);
-
-/*
- * Iterate through the a btree, calling fn() on each entry.
- * It only works for single level trees and is internally recursive, so
- * monitor stack usage carefully.
- */
-int dm_btree_walk(struct dm_btree_info *info, dm_block_t root,
-		  int (*fn)(void *context, uint64_t *keys, void *leaf),
-		  void *context);
-
-#endif	/* _LINUX_DM_BTREE_H */
+CNTL_4__SPLL_SSAMP_EN__SHIFT 0x9
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SPARE_MASK 0x7fc00
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SPARE__SHIFT 0xa
+#define CG_SPLL_FUNC_CNTL_4__TEST_FRAC_BYPASS_MASK 0x200000
+#define CG_SPLL_FUNC_CNTL_4__TEST_FRAC_BYPASS__SHIFT 0x15
+#define CG_SPLL_FUNC_CNTL_4__SPLL_ILOCK_MASK 0x800000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_ILOCK__SHIFT 0x17
+#define CG_SPLL_FUNC_CNTL_4__SPLL_FBCLK_SEL_MASK 0x1000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_FBCLK_SEL__SHIFT 0x18
+#define CG_SPLL_FUNC_CNTL_4__SPLL_VCTRLADC_EN_MASK 0x2000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_VCTRLADC_EN__SHIFT 0x19
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SCLK_EXT_MASK 0xc000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SCLK_EXT__SHIFT 0x1a
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SPARE_EXT_MASK 0x70000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SPARE_EXT__SHIFT 0x1c
+#define CG_SPLL_FUNC_CNTL_4__SPLL_VTOI_BIAS_CNTL_MASK 0x80000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_VTOI_BIAS_CNTL__SHIFT 0x1f
+#define CG_SPLL_FUNC_CNTL_5__FBDIV_SSC_BYPASS_MASK 0x1
+#define CG_SPLL_FUNC_CNTL_5__FBDIV_SSC_BYPASS__SHIFT 0x0
+#define CG_SPLL_FUNC_CNTL_5__RISEFBVCO_EN_MASK 0x2
+#define CG_SPLL_FUNC_CNTL_5__RISEFBVCO_EN__SHIFT 0x1
+#define CG_SPLL_FUNC_CNTL_5__PFD_RESET_CNTRL_MASK 0xc
+#define CG_SPLL_FUNC_CNTL_5__PFD_RESET_CNTRL__SHIFT 0x2
+#define CG_SPLL_FUNC_CNTL_5__RESET_TIMER_MASK 0x30
+#define CG_SPLL_FUNC_CNTL_5__RESET_TIMER__SHIFT 0x4
+#define CG_SPLL_FUNC_CNTL_5__FAST_LOCK_CNTRL_MASK 0xc0
+#define CG_SPLL_FUNC_CNTL_5__FAST_LOCK_CNTRL__SHIFT 0x6
+#define CG_SPLL_FUNC_CNTL_5__FAST_LOCK_EN_MASK 0x100
+#define CG_SPLL_FUNC_CNTL_5__FAST_LOCK_EN__SHIFT 0x8
+#define CG_SPLL_FUNC_CNTL_5__RESET_ANTI_MUX_MASK 0x200
+#define CG_SPLL_FUNC_CNTL_5__RESET_ANTI_MUX__SHIFT 0x9
+#define CG_SPLL_FUNC_CNTL_5__REFCLK_BYPASS_EN_MASK 0x400
+#define CG_SPLL_FUNC_CNTL_5__REFCLK_BYPASS_EN__SHIFT 0xa
+#define CG_SPLL_FUNC_CNTL_5__PLLBYPASS_MASK 0x800
+#define CG_SPLL_FUNC_CNTL_5__PLLBYPASS__SHIFT 0xb
+#define CG_SPLL_FUNC_CNTL_6__SCLKMUX0_CLKOFF_CNT_MASK 0xff
+#define CG_SPLL_FUNC_CNTL_6__SCLKMUX0_CLKOFF_CNT__SHIFT 0x0
+#define CG_SPLL_FUNC_CNTL_6__SCLKMUX1_CLKOFF_CNT_MASK 0xff00
+#define CG_SPLL_FUNC_CNTL_6__SCLKMUX1_CLKOFF_CNT__SHIFT 0x8
+#define CG_SPLL_FUNC_CNTL_6__SPLL_VCTL_EN_MASK 0x10000
+#define CG_SPLL_FUNC_CNTL_6__SPLL_VCTL_EN__SHIFT 0x10
+#define CG_SPLL_FUNC_CNTL_6__SPLL_VCTL_CNTRL_IN_MASK 0x1e0000
+#define CG_SPLL_FUNC_CNTL_6__SPLL_VCTL_CNTRL_IN__SHIFT 0x11
+#define CG_SPLL_FUNC_CNTL_6__SPLL_VCTL_CNTRL_OUT_MASK 0x1e00000
+#define CG_SPLL_FUNC_CNTL_6__SPLL_VCTL_CNTRL_OUT__SHIFT 0x15
+#define CG_SPLL_FUNC_CNTL_6__SPLL_LF_CNTR_MASK 0xfe000000
+#define CG_SPLL_FUNC_CNTL_6__SPLL_LF_CNTR__SHIFT 0x19
+#define CG_SPLL_FUNC_CNTL_7__SPLL_BW_CNTRL_MASK 0xfff
+#define CG_SPLL_FUNC_CNTL_7__SPLL_BW_CNTRL__SHIFT 0x0
+#define SPLL_CNTL_MODE__SPLL_SW_DIR_CONTROL_MASK 0x1
+#define SPLL_CNTL_MODE__SPLL_SW_DIR_CONTROL__SHIFT 0x0
+#define SPLL_CNTL_MODE__SPLL_LEGACY_PDIV_MASK 0x2
+#define SPLL_CNTL_MODE__SPLL_LEGACY_PDIV__SHIFT 0x1
+#define SPLL_CNTL_MODE__SPLL_TEST_MASK 0x4
+#define SPLL_CNTL_MODE__SPLL_TEST__SHIFT 0x2
+#define SPLL_CNTL_MODE__SPLL_FASTEN_MASK 0x8
+#define SPLL_CNTL_MODE__SPLL_FASTEN__SHIFT 0x3
+#define SPLL_CNTL_MODE__SPLL_ENSAT_MASK 0x10
+#define SPLL_CNTL_MODE__SPLL_ENSAT__SHIFT 0x4
+#define SPLL_CNTL_MODE__SPLL_TEST_CLK_EXT_DIV_MASK 0xc00
+#define SPLL_CNTL_MODE__SPLL_TEST_CLK_EXT_DIV__SHIFT 0xa
+#define SPLL_CNTL_MODE__SPLL_CTLREQ_DLY_CNT_MASK 0xff000
+#define SPLL_CNTL_MODE__SPLL_CTLREQ_DLY_CNT__SHIFT 0xc
+#define SPLL_CNTL_MODE__SPLL_RESET_EN_MASK 0x10000000
+#define SPLL_CNTL_MODE__SPLL_RESET_EN__SHIFT 0x1c
+#define SPLL_CNTL_MODE__SPLL_VCO_MODE_MASK 0x60000000
+#define SPLL_CNTL_MODE__SPLL_VCO_MODE__SHIFT 0x1d
+#define CG_SPLL_SPREAD_SPECTRUM__SSEN_MASK 0x1
+#define CG_SPLL_SPREAD_SPECTRUM__SSEN__SHIFT 0x0
+#define CG_SPLL_SPREAD_SPECTRUM__CLKS_MASK 0xfff0
+#define CG_SPLL_SPREAD_SPECTRUM__CLKS__SHIFT 0x4
+#define CG_SPLL_SPREAD_SPECTRUM_2__CLKV_MASK 0x3ffffff
+#define CG_SPLL_SPREAD_SPECTRUM_2__CLKV__SHIFT 0x0
+#define MPLL_BYPASSCLK_SEL__MPLL_CLKOUT_SEL_MASK 0xff00
+#define MPLL_BYPASSCLK_SEL__MPLL_CLKOUT_SEL__SHIFT 0x8
+#define CG_CLKPIN_CNTL__XTALIN_DIVIDE_MASK 0x2
+#define CG_CLKPIN_CNTL__XTALIN_DIVIDE__SHIFT 0x1
+#define CG_CLKPIN_CNTL__BCLK_AS_XCLK_MASK 0x4
+#define CG_CLKPIN_CNTL__BCLK_AS_XCLK__SHIFT 0x2
+#define CG_CLKPIN_CNTL_2__ENABLE_XCLK_MASK 0x1
+#define CG_CLKPIN_CNTL_2__ENABLE_XCLK__SHIFT 0x0
+#define CG_CLKPIN_CNTL_2__FORCE_BIF_REFCLK_EN_MASK 0x8
+#define CG_CLKPIN_CNTL_2__FORCE_BIF_REFCLK_EN__SHIFT 0x3
+#define CG_CLKPIN_CNTL_2__MUX_TCLK_TO_XCLK_MASK 0x100
+#define CG_CLKPIN_CNTL_2__MUX_TCLK_TO_XCLK__SHIFT 0x8
+#define CG_CLKPIN_CNTL_2__XO_IN_OSCIN_EN_MASK 0x4000
+#define CG_CLKPIN_CNTL_2__XO_IN_OSCIN_EN__SHIFT 0xe
+#define CG_CLKPIN_CNTL_2__XO_IN_ICORE_CLK_OE_MASK 0x8000
+#define CG_CLKPIN_CNTL_2__XO_IN_ICORE_CLK_OE__SHIFT 0xf
+#define CG_CLKPIN_CNTL_2__XO_IN_CML_RXEN_MASK 0x10000
+#define CG_CLKPIN_CNTL_2__XO_IN_CML_RXEN__SHIFT 0x10
+#define CG_CLKPIN_CNTL_2__XO_IN_BIDIR_CML_OE_MASK 0x20000
+#define CG_CLKPIN_CNTL_2__XO_IN_BIDIR_CML_OE__SHIFT 0x11
+#define CG_CLKPIN_CNTL_2__XO_IN2_OSCIN_EN_MASK 0x40000
+#define CG_CLKPIN_CNTL_2__XO_IN2_OSCIN_EN__SHIFT 0x12
+#define CG_CLKPIN_CNTL_2__XO_IN2_ICORE_CLK_OE_MASK 0x80000
+#define CG_CLKPIN_CNTL_2__XO_IN2_ICORE_CLK_OE__SHIFT 0x13
+#define CG_CLKPIN_CNTL_2__XO_IN2_CML_RXEN_MASK 0x100000
+#define CG_CLKPIN_CNTL_2__XO_I

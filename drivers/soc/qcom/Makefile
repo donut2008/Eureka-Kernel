@@ -1,5 +1,4 @@
-obj-$(CONFIG_QCOM_GSBI)	+=	qcom_gsbi.o
-obj-$(CONFIG_QCOM_PM)	+=	spm.o
-obj-$(CONFIG_QCOM_SMD) +=	smd.o
-obj-$(CONFIG_QCOM_SMD_RPM)	+= smd-rpm.o
-obj-$(CONFIG_QCOM_SMEM) +=	smem.o
+e SMU_PM_STATUS_109__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_109__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_110__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_110__DATA__SHIFT 0x0

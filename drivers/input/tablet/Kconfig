@@ -1,86 +1,52 @@
-#
-# Tablet driver configuration
-#
-menuconfig INPUT_TABLET
-	bool "Tablets"
-	help
-	  Say Y here, and a list of supported tablets will be displayed.
-	  This option doesn't affect the kernel.
+out_LSB 0x1E
+#define QIB_6120_HwErrStatus_PcieCplTimeout_RMASK 0x1
+#define QIB_6120_HwErrStatus_PoisenedTLP_LSB 0x1D
+#define QIB_6120_HwErrStatus_PoisenedTLP_RMASK 0x1
+#define QIB_6120_HwErrStatus_Reserved4_LSB 0x6
+#define QIB_6120_HwErrStatus_Reserved4_RMASK 0x7FFFFF
+#define QIB_6120_HwErrStatus_PCIeMemParity_LSB 0x0
+#define QIB_6120_HwErrStatus_PCIeMemParity_RMASK 0x3F
 
-	  If unsure, say Y.
+#define QIB_6120_HwErrClear_OFFS 0xA8
+#define QIB_6120_HwErrClear_IBCBusFromSPCParityErrClear_LSB 0x3F
+#define QIB_6120_HwErrClear_IBCBusFromSPCParityErrClear_RMASK 0x1
+#define QIB_6120_HwErrClear_IBCBusToSPCparityErrClear_LSB 0x3E
+#define QIB_6120_HwErrClear_IBCBusToSPCparityErrClear_RMASK 0x1
+#define QIB_6120_HwErrClear_Reserved_LSB 0x3D
+#define QIB_6120_HwErrClear_Reserved_RMASK 0x1
+#define QIB_6120_HwErrClear_IBSerdesPClkNotDetectClear_LSB 0x3C
+#define QIB_6120_HwErrClear_IBSerdesPClkNotDetectClear_RMASK 0x1
+#define QIB_6120_HwErrClear_PCIESerdesQ0PClkNotDetectClear_LSB 0x3B
+#define QIB_6120_HwErrClear_PCIESerdesQ0PClkNotDetectClear_RMASK 0x1
+#define QIB_6120_HwErrClear_PCIESerdesQ1PClkNotDetectClear_LSB 0x3A
+#define QIB_6120_HwErrClear_PCIESerdesQ1PClkNotDetectClear_RMASK 0x1
+#define QIB_6120_HwErrClear_Reserved1_LSB 0x39
+#define QIB_6120_HwErrClear_Reserved1_RMASK 0x1
+#define QIB_6120_HwErrClear_IBPLLrfSlipClear_LSB 0x38
+#define QIB_6120_HwErrClear_IBPLLrfSlipClear_RMASK 0x1
+#define QIB_6120_HwErrClear_IBPLLfbSlipClear_LSB 0x37
+#define QIB_6120_HwErrClear_IBPLLfbSlipClear_RMASK 0x1
+#define QIB_6120_HwErrClear_PowerOnBISTFailedClear_LSB 0x36
+#define QIB_6120_HwErrClear_PowerOnBISTFailedClear_RMASK 0x1
+#define QIB_6120_HwErrClear_Reserved2_LSB 0x33
+#define QIB_6120_HwErrClear_Reserved2_RMASK 0x7
+#define QIB_6120_HwErrClear_RXEMemParityClear_LSB 0x2C
+#define QIB_6120_HwErrClear_RXEMemParityClear_RMASK 0x7F
+#define QIB_6120_HwErrClear_TXEMemParityClear_LSB 0x28
+#define QIB_6120_HwErrClear_TXEMemParityClear_RMASK 0xF
+#define QIB_6120_HwErrClear_Reserved3_LSB 0x22
+#define QIB_6120_HwErrClear_Reserved3_RMASK 0x3F
+#define QIB_6120_HwErrClear_PCIeBusParityClr_LSB 0x1F
+#define QIB_6120_HwErrClear_PCIeBusParityClr_RMASK 0x7
+#define QIB_6120_HwErrClear_PcieCplTimeoutClear_LSB 0x1E
+#define QIB_6120_HwErrClear_PcieCplTimeoutClear_RMASK 0x1
+#define QIB_6120_HwErrClear_PoisonedTLPClear_LSB 0x1D
+#define QIB_6120_HwErrClear_PoisonedTLPClear_RMASK 0x1
+#define QIB_6120_HwErrClear_Reserved4_LSB 0x6
+#define QIB_6120_HwErrClear_Reserved4_RMASK 0x7FFFFF
+#define QIB_6120_HwErrClear_PCIeMemParityClr_LSB 0x0
+#define QIB_6120_HwErrClear_PCIeMemParityClr_RMASK 0x3F
 
-if INPUT_TABLET
-
-config TABLET_USB_ACECAD
-	tristate "Acecad Flair tablet support (USB)"
-	depends on USB_ARCH_HAS_HCD
-	select USB
-	help
-	  Say Y here if you want to use the USB version of the Acecad Flair
-	  tablet.  Make sure to say Y to "Mouse support"
-	  (CONFIG_INPUT_MOUSEDEV) and/or "Event interface support"
-	  (CONFIG_INPUT_EVDEV) as well.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called acecad.
-
-config TABLET_USB_AIPTEK
-	tristate "Aiptek 6000U/8000U and Genius G_PEN tablet support (USB)"
-	depends on USB_ARCH_HAS_HCD
-	select USB
-	help
-	  Say Y here if you want to use the USB version of the Aiptek 6000U,
-	  Aiptek 8000U or Genius G-PEN 560 tablet.  Make sure to say Y to
-	  "Mouse support" (CONFIG_INPUT_MOUSEDEV) and/or "Event interface
-	  support" (CONFIG_INPUT_EVDEV) as well.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called aiptek.
-
-config TABLET_USB_GTCO
-        tristate "GTCO CalComp/InterWrite USB Support"
-        depends on USB && INPUT
-        help
-          Say Y here if you want to use the USB version of the GTCO
-          CalComp/InterWrite Tablet.  Make sure to say Y to "Mouse support"
-          (CONFIG_INPUT_MOUSEDEV) and/or "Event interface support"
-          (CONFIG_INPUT_EVDEV) as well.
-
-          To compile this driver as a module, choose M here: the
-          module will be called gtco.
-
-config TABLET_USB_HANWANG
-	tristate "Hanwang Art Master III tablet support (USB)"
-	depends on USB_ARCH_HAS_HCD
-	select USB
-	help
-	  Say Y here if you want to use the USB version of the Hanwang Art
-	  Master III tablet.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called hanwang.
-
-config TABLET_USB_KBTAB
-	tristate "KB Gear JamStudio tablet support (USB)"
-	depends on USB_ARCH_HAS_HCD
-	select USB
-	help
-	  Say Y here if you want to use the USB version of the KB Gear
-	  JamStudio tablet.  Make sure to say Y to "Mouse support"
-	  (CONFIG_INPUT_MOUSEDEV) and/or "Event interface support"
-	  (CONFIG_INPUT_EVDEV) as well.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called kbtab.
-
-config TABLET_SERIAL_WACOM4
-	tristate "Wacom protocol 4 serial tablet support"
-	select SERIO
-	help
-	  Say Y here if you want to use Wacom protocol 4 serial tablets.
-	  E.g. serial versions of the Cintiq, Graphire or Penpartner.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called wacom_serial4.
-
-endif
+#define QIB_6120_HwDiagCtrl_OFFS 0xB0
+#define QIB_6120_HwDiagCtrl_ForceIBCBusFromSPCParityErr_LSB 0x3F
+#define QIB_6120_HwDiagCtrl_

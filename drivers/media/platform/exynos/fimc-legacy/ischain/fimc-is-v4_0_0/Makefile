@@ -1,11 +1,1 @@
-obj-$(CONFIG_FIMC_IS_V4_0_0) += setup-fimc-is.o
-obj-$(CONFIG_FIMC_IS_V4_0_0) += setup-fimc-is-sensor.o
-obj-$(CONFIG_FIMC_IS_V4_0_0) += setup-fimc-is-preprocessor.o
-obj-$(CONFIG_FIMC_IS_V4_0_0) += fimc-is-hw-pwr.o
-obj-$(CONFIG_FIMC_IS_V4_0_0) += fimc-is-hw-chain.o
-ifeq ($(CONFIG_PM_DEVFREQ),y)
-obj-$(CONFIG_FIMC_IS_V4_0_0) += fimc-is-hw-dvfs.o
-endif
-
-EXTRA_CFLAGS += -Idrivers/media/platform/exynos/fimc-legacy
-EXTRA_CFLAGS += -Idrivers/media/platform/exynos/fimc-legacy/include
+ÿÿÿÿyejlV]Bmÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ%xÿÿÿÿÿÿÿÿÿÿ:eX[ÿÿÿÿ"JÿÿÿÿMQÿÿÿÿÿÿmnÿÿÿÿÿÿklE^ÿÿ`cÿÿIJirÿÿNUÿÿ6vÿÿBNGVÿÿ4cÿÿ-qÿÿbjÿÿÿÿÿÿÿÿBWÿÿ'sÿÿÿÿjMÿÿnkÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ2Y%}ÿÿÿÿÿÿÿÿÿÿUvbUÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ5xÿÿÿÿuL5u-dÿÿÿÿÿÿÿÿkgUqÿÿÿÿÿÿ;pÿÿÿÿ5iÿÿILUzÿÿÿÿTaÿÿÿÿVWÿÿÿÿA\ÿÿF^ozacÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿsav\ÿÿ|NÿÿD[ÿÿqxÿÿÿÿd\ÿÿoe1\ÿÿÿÿÿÿVUÿÿÿÿZsÿÿAKÿÿC[ÿÿÿÿÿÿzYnSÿÿÿÿÿÿ8zÿÿÿÿ&}okÿÿ&tÿÿJL(sÿÿ[sÿÿ'[7vÿÿfOrpZKÿÿRgCWpv^hÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ&eÿÿÿÿÿÿÿÿÿÿÿÿÿÿgeÿÿÿÿÿÿ#J'LIjÿÿÿÿÿÿÿ

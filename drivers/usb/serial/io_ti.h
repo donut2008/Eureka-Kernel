@@ -1,186 +1,104 @@
-/*****************************************************************************
- *
- *	Copyright (C) 1997-2002 Inside Out Networks, Inc.
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License as published by
- *	the Free Software Foundation; either version 2 of the License, or
- *	(at your option) any later version.
- *
- *
- *	Feb-16-2001	DMI	Added I2C structure definitions
- *	May-29-2002	gkh	Ported to Linux
- *
- *
- ******************************************************************************/
-
-#ifndef _IO_TI_H_
-#define _IO_TI_H_
-
-/* Address Space */
-#define DTK_ADDR_SPACE_XDATA		0x03	/* Addr is placed in XDATA space */
-#define DTK_ADDR_SPACE_I2C_TYPE_II	0x82	/* Addr is placed in I2C area */
-#define DTK_ADDR_SPACE_I2C_TYPE_III	0x83	/* Addr is placed in I2C area */
-
-/* UART Defines */
-#define UMPMEM_BASE_UART1		0xFFA0	/* UMP UART1 base address */
-#define UMPMEM_BASE_UART2		0xFFB0	/* UMP UART2 base address */
-#define UMPMEM_OFFS_UART_LSR		0x05	/* UMP UART LSR register offset */
-
-/* Bits per character */
-#define UMP_UART_CHAR5BITS		0x00
-#define UMP_UART_CHAR6BITS		0x01
-#define UMP_UART_CHAR7BITS		0x02
-#define UMP_UART_CHAR8BITS		0x03
-
-/* Parity */
-#define UMP_UART_NOPARITY		0x00
-#define UMP_UART_ODDPARITY		0x01
-#define UMP_UART_EVENPARITY		0x02
-#define UMP_UART_MARKPARITY		0x03
-#define UMP_UART_SPACEPARITY		0x04
-
-/* Stop bits */
-#define UMP_UART_STOPBIT1		0x00
-#define UMP_UART_STOPBIT15		0x01
-#define UMP_UART_STOPBIT2		0x02
-
-/* Line status register masks */
-#define UMP_UART_LSR_OV_MASK		0x01
-#define UMP_UART_LSR_PE_MASK		0x02
-#define UMP_UART_LSR_FE_MASK		0x04
-#define UMP_UART_LSR_BR_MASK		0x08
-#define UMP_UART_LSR_ER_MASK		0x0F
-#define UMP_UART_LSR_RX_MASK		0x10
-#define UMP_UART_LSR_TX_MASK		0x20
-
-#define UMP_UART_LSR_DATA_MASK		(LSR_PAR_ERR | LSR_FRM_ERR | LSR_BREAK)
-
-/* Port Settings Constants) */
-#define UMP_MASK_UART_FLAGS_RTS_FLOW		0x0001
-#define UMP_MASK_UART_FLAGS_RTS_DISABLE		0x0002
-#define UMP_MASK_UART_FLAGS_PARITY		0x0008
-#define UMP_MASK_UART_FLAGS_OUT_X_DSR_FLOW	0x0010
-#define UMP_MASK_UART_FLAGS_OUT_X_CTS_FLOW	0x0020
-#define UMP_MASK_UART_FLAGS_OUT_X		0x0040
-#define UMP_MASK_UART_FLAGS_OUT_XA		0x0080
-#define UMP_MASK_UART_FLAGS_IN_X		0x0100
-#define UMP_MASK_UART_FLAGS_DTR_FLOW		0x0800
-#define UMP_MASK_UART_FLAGS_DTR_DISABLE		0x1000
-#define UMP_MASK_UART_FLAGS_RECEIVE_MS_INT	0x2000
-#define UMP_MASK_UART_FLAGS_AUTO_START_ON_ERR	0x4000
-
-#define UMP_DMA_MODE_CONTINOUS			0x01
-#define UMP_PIPE_TRANS_TIMEOUT_ENA		0x80
-#define UMP_PIPE_TRANSFER_MODE_MASK		0x03
-#define UMP_PIPE_TRANS_TIMEOUT_MASK		0x7C
-
-/* Purge port Direction Mask Bits */
-#define UMP_PORT_DIR_OUT			0x01
-#define UMP_PORT_DIR_IN				0x02
-
-/* Address of Port 0 */
-#define UMPM_UART1_PORT				0x03
-
-/* Commands */
-#define	UMPC_SET_CONFIG			0x05
-#define	UMPC_OPEN_PORT			0x06
-#define	UMPC_CLOSE_PORT			0x07
-#define	UMPC_START_PORT			0x08
-#define	UMPC_STOP_PORT			0x09
-#define	UMPC_TEST_PORT			0x0A
-#define	UMPC_PURGE_PORT			0x0B
-
-/* Force the Firmware to complete the current Read */
-#define	UMPC_COMPLETE_READ		0x80
-/* Force UMP back into BOOT Mode */
-#define	UMPC_HARDWARE_RESET		0x81
-/*
- * Copy current download image to type 0xf2 record in 16k I2C
- * firmware will change 0xff record to type 2 record when complete
- */
-#define	UMPC_COPY_DNLD_TO_I2C		0x82
-
-/*
- * Special function register commands
- * wIndex is register address
- * wValue is MSB/LSB mask/data
- */
-#define	UMPC_WRITE_SFR			0x83	/* Write SFR Register */
-
-/* wIndex is register address */
-#define	UMPC_READ_SFR			0x84	/* Read SRF Register */
-
-/* Set or Clear DTR (wValue bit 0 Set/Clear)	wIndex ModuleID (port) */
-#define	UMPC_SET_CLR_DTR		0x85
-
-/* Set or Clear RTS (wValue bit 0 Set/Clear)	wIndex ModuleID (port) */
-#define	UMPC_SET_CLR_RTS		0x86
-
-/* Set or Clear LOOPBACK (wValue bit 0 Set/Clear) wIndex ModuleID (port) */
-#define	UMPC_SET_CLR_LOOPBACK		0x87
-
-/* Set or Clear BREAK (wValue bit 0 Set/Clear)	wIndex ModuleID (port) */
-#define	UMPC_SET_CLR_BREAK		0x88
-
-/* Read MSR wIndex ModuleID (port) */
-#define	UMPC_READ_MSR			0x89
-
-/* Toolkit commands */
-/* Read-write group */
-#define	UMPC_MEMORY_READ		0x92
-#define	UMPC_MEMORY_WRITE		0x93
-
-/*
- *	UMP DMA Definitions
- */
-#define UMPD_OEDB1_ADDRESS		0xFF08
-#define UMPD_OEDB2_ADDRESS		0xFF10
-
-struct out_endpoint_desc_block {
-	__u8 Configuration;
-	__u8 XBufAddr;
-	__u8 XByteCount;
-	__u8 Unused1;
-	__u8 Unused2;
-	__u8 YBufAddr;
-	__u8 YByteCount;
-	__u8 BufferSize;
-} __attribute__((packed));
-
-
-/*
- * TYPE DEFINITIONS
- * Structures for Firmware commands
- */
-/* UART settings */
-struct ump_uart_config {
-	__u16 wBaudRate;	/* Baud rate                        */
-	__u16 wFlags;		/* Bitmap mask of flags             */
-	__u8 bDataBits;		/* 5..8 - data bits per character   */
-	__u8 bParity;		/* Parity settings                  */
-	__u8 bStopBits;		/* Stop bits settings               */
-	char cXon;		/* XON character                    */
-	char cXoff;		/* XOFF character                   */
-	__u8 bUartMode;		/* Will be updated when a user      */
-				/* interface is defined             */
-} __attribute__((packed));
-
-
-/*
- * TYPE DEFINITIONS
- * Structures for USB interrupts
- */
-/* Interrupt packet structure */
-struct ump_interrupt {
-	__u8 bICode;			/* Interrupt code (interrupt num)   */
-	__u8 bIInfo;			/* Interrupt information            */
-}  __attribute__((packed));
-
-
-#define TIUMP_GET_PORT_FROM_CODE(c)	(((c) >> 6) & 0x01)
-#define TIUMP_GET_FUNC_FROM_CODE(c)	((c) & 0x0f)
-#define TIUMP_INTERRUPT_CODE_LSR	0x03
-#define TIUMP_INTERRUPT_CODE_MSR	0x04
-
-#endif
+RIVATE__PRESENCE_DETECT_STATE_PRIVATE_MASK 0x40
+#define D3F2_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE__SHIFT 0x6
+#define D3F2_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN_MASK 0x1
+#define D3F2_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN__SHIFT 0x0
+#define D3F2_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN_MASK 0x2
+#define D3F2_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN__SHIFT 0x1
+#define D3F2_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN_MASK 0x4
+#define D3F2_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN__SHIFT 0x2
+#define D3F2_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN_MASK 0x8
+#define D3F2_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN__SHIFT 0x3
+#define D3F2_PCIEP_HPGI__REG_HPGI_HOOK_MASK 0x80
+#define D3F2_PCIEP_HPGI__REG_HPGI_HOOK__SHIFT 0x7
+#define D3F2_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS_MASK 0x100
+#define D3F2_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS__SHIFT 0x8
+#define D3F2_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS_MASK 0x200
+#define D3F2_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS__SHIFT 0x9
+#define D3F2_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS_MASK 0x400
+#define D3F2_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS__SHIFT 0xa
+#define D3F2_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS_MASK 0x800
+#define D3F2_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS__SHIFT 0xb
+#define D3F2_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS_MASK 0x8000
+#define D3F2_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS__SHIFT 0xf
+#define D3F2_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN_MASK 0x10000
+#define D3F2_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN__SHIFT 0x10
+#define D3F2_VENDOR_ID__VENDOR_ID_MASK 0xffff
+#define D3F2_VENDOR_ID__VENDOR_ID__SHIFT 0x0
+#define D3F2_DEVICE_ID__DEVICE_ID_MASK 0xffff0000
+#define D3F2_DEVICE_ID__DEVICE_ID__SHIFT 0x10
+#define D3F2_COMMAND__IO_ACCESS_EN_MASK 0x1
+#define D3F2_COMMAND__IO_ACCESS_EN__SHIFT 0x0
+#define D3F2_COMMAND__MEM_ACCESS_EN_MASK 0x2
+#define D3F2_COMMAND__MEM_ACCESS_EN__SHIFT 0x1
+#define D3F2_COMMAND__BUS_MASTER_EN_MASK 0x4
+#define D3F2_COMMAND__BUS_MASTER_EN__SHIFT 0x2
+#define D3F2_COMMAND__SPECIAL_CYCLE_EN_MASK 0x8
+#define D3F2_COMMAND__SPECIAL_CYCLE_EN__SHIFT 0x3
+#define D3F2_COMMAND__MEM_WRITE_INVALIDATE_EN_MASK 0x10
+#define D3F2_COMMAND__MEM_WRITE_INVALIDATE_EN__SHIFT 0x4
+#define D3F2_COMMAND__PAL_SNOOP_EN_MASK 0x20
+#define D3F2_COMMAND__PAL_SNOOP_EN__SHIFT 0x5
+#define D3F2_COMMAND__PARITY_ERROR_RESPONSE_MASK 0x40
+#define D3F2_COMMAND__PARITY_ERROR_RESPONSE__SHIFT 0x6
+#define D3F2_COMMAND__AD_STEPPING_MASK 0x80
+#define D3F2_COMMAND__AD_STEPPING__SHIFT 0x7
+#define D3F2_COMMAND__SERR_EN_MASK 0x100
+#define D3F2_COMMAND__SERR_EN__SHIFT 0x8
+#define D3F2_COMMAND__FAST_B2B_EN_MASK 0x200
+#define D3F2_COMMAND__FAST_B2B_EN__SHIFT 0x9
+#define D3F2_COMMAND__INT_DIS_MASK 0x400
+#define D3F2_COMMAND__INT_DIS__SHIFT 0xa
+#define D3F2_STATUS__INT_STATUS_MASK 0x80000
+#define D3F2_STATUS__INT_STATUS__SHIFT 0x13
+#define D3F2_STATUS__CAP_LIST_MASK 0x100000
+#define D3F2_STATUS__CAP_LIST__SHIFT 0x14
+#define D3F2_STATUS__PCI_66_EN_MASK 0x200000
+#define D3F2_STATUS__PCI_66_EN__SHIFT 0x15
+#define D3F2_STATUS__FAST_BACK_CAPABLE_MASK 0x800000
+#define D3F2_STATUS__FAST_BACK_CAPABLE__SHIFT 0x17
+#define D3F2_STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x1000000
+#define D3F2_STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x18
+#define D3F2_STATUS__DEVSEL_TIMING_MASK 0x6000000
+#define D3F2_STATUS__DEVSEL_TIMING__SHIFT 0x19
+#define D3F2_STATUS__SIGNAL_TARGET_ABORT_MASK 0x8000000
+#define D3F2_STATUS__SIGNAL_TARGET_ABORT__SHIFT 0x1b
+#define D3F2_STATUS__RECEIVED_TARGET_ABORT_MASK 0x10000000
+#define D3F2_STATUS__RECEIVED_TARGET_ABORT__SHIFT 0x1c
+#define D3F2_STATUS__RECEIVED_MASTER_ABORT_MASK 0x20000000
+#define D3F2_STATUS__RECEIVED_MASTER_ABORT__SHIFT 0x1d
+#define D3F2_STATUS__SIGNALED_SYSTEM_ERROR_MASK 0x40000000
+#define D3F2_STATUS__SIGNALED_SYSTEM_ERROR__SHIFT 0x1e
+#define D3F2_STATUS__PARITY_ERROR_DETECTED_MASK 0x80000000
+#define D3F2_STATUS__PARITY_ERROR_DETECTED__SHIFT 0x1f
+#define D3F2_REVISION_ID__MINOR_REV_ID_MASK 0xf
+#define D3F2_REVISION_ID__MINOR_REV_ID__SHIFT 0x0
+#define D3F2_REVISION_ID__MAJOR_REV_ID_MASK 0xf0
+#define D3F2_REVISION_ID__MAJOR_REV_ID__SHIFT 0x4
+#define D3F2_PROG_INTERFACE__PROG_INTERFACE_MASK 0xff00
+#define D3F2_PROG_INTERFACE__PROG_INTERFACE__SHIFT 0x8
+#define D3F2_SUB_CLASS__SUB_CLASS_MASK 0xff0000
+#define D3F2_SUB_CLASS__SUB_CLASS__SHIFT 0x10
+#define D3F2_BASE_CLASS__BASE_CLASS_MASK 0xff000000
+#define D3F2_BASE_CLASS__BASE_CLASS__SHIFT 0x18
+#define D3F2_CACHE_LINE__CACHE_LINE_SIZE_MASK 0xff
+#define D3F2_CACHE_LINE__CACHE_LINE_SIZE__SHIFT 0x0
+#define D3F2_LATENCY__LATENCY_TIMER_MASK 0xff00
+#define D3F2_LATENCY__LATENCY_TIMER__SHIFT 0x8
+#define D3F2_HEADER__HEADER_TYPE_MASK 0x7f0000
+#define D3F2_HEADER__HEADER_TYPE__SHIFT 0x10
+#define D3F2_HEADER__DEVICE_TYPE_MASK 0x800000
+#define D3F2_HEADER__DEVICE_TYPE__SHIFT 0x17
+#define D3F2_BIST__BIST_COMP_MASK 0xf000000
+#define D3F2_BIST__BIST_COMP__SHIFT 0x18
+#define D3F2_BIST__BIST_STRT_MASK 0x40000000
+#define D3F2_BIST__BIST_STRT__SHIFT 0x1e
+#define D3F2_BIST__BIST_CAP_MASK 0x80000000
+#define D3F2_BIST__BIST_CAP__SHIFT 0x1f
+#define D3F2_SUB_BUS_NUMBER_LATENCY__PRIMARY_BUS_MASK 0xff
+#define D3F2_SUB_BUS_NUMBER_LATENCY__PRIMARY_BUS__SHIFT 0x0
+#define D3F2_SUB_BUS_NUMBER_LATENCY__SECONDARY_BUS_MASK 0xff00
+#define D3F2_SUB_BUS_NUMBER_LATENCY__SECONDARY_BUS__SHIFT 0x8
+#define D3F2_SUB_BUS_NUMBER_LATENCY__SUB_BUS_NUM_MASK 0xff0000
+#define D3F2_SUB_BUS_NUMBER_LATENCY__SUB_BUS_NUM__SHIFT 0x10
+#define D3F2_SUB_BUS_NUMBER_LATENCY__SECONDARY_LATENCY_TIMER_MASK 0xff000000
+#define D3F2_SUB_BUS_NUMBER_LATENCY__SECON

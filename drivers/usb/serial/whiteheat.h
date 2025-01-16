@@ -1,302 +1,169 @@
-/*
- * USB ConnectTech WhiteHEAT driver
- *
- *      Copyright (C) 2002
- *          Connect Tech Inc.
- *
- *      Copyright (C) 1999, 2000
- *          Greg Kroah-Hartman (greg@kroah.com)
- *
- *      This program is free software; you can redistribute it and/or modify
- *      it under the terms of the GNU General Public License as published by
- *      the Free Software Foundation; either version 2 of the License, or
- *      (at your option) any later version.
- *
- * See Documentation/usb/usb-serial.txt for more information on using this
- * driver
- *
- */
-
-#ifndef __LINUX_USB_SERIAL_WHITEHEAT_H
-#define __LINUX_USB_SERIAL_WHITEHEAT_H
-
-
-/* WhiteHEAT commands */
-#define WHITEHEAT_OPEN			1	/* open the port */
-#define WHITEHEAT_CLOSE			2	/* close the port */
-#define WHITEHEAT_SETUP_PORT		3	/* change port settings */
-#define WHITEHEAT_SET_RTS		4	/* turn RTS on or off */
-#define WHITEHEAT_SET_DTR		5	/* turn DTR on or off */
-#define WHITEHEAT_SET_BREAK		6	/* turn BREAK on or off */
-#define WHITEHEAT_DUMP			7	/* dump memory */
-#define WHITEHEAT_STATUS		8	/* get status */
-#define WHITEHEAT_PURGE			9	/* clear the UART fifos */
-#define WHITEHEAT_GET_DTR_RTS		10	/* get the state of DTR and RTS
-							for a port */
-#define WHITEHEAT_GET_HW_INFO		11	/* get EEPROM info and
-							hardware ID */
-#define WHITEHEAT_REPORT_TX_DONE	12	/* get the next TX done */
-#define WHITEHEAT_EVENT			13	/* unsolicited status events */
-#define WHITEHEAT_ECHO			14	/* send data to the indicated
-						   IN endpoint */
-#define WHITEHEAT_DO_TEST		15	/* perform specified test */
-#define WHITEHEAT_CMD_COMPLETE		16	/* reply for some commands */
-#define WHITEHEAT_CMD_FAILURE		17	/* reply for failed commands */
-
-
-/*
- * Commands to the firmware
- */
-
-
-/*
- * WHITEHEAT_OPEN
- * WHITEHEAT_CLOSE
- * WHITEHEAT_STATUS
- * WHITEHEAT_GET_DTR_RTS
- * WHITEHEAT_REPORT_TX_DONE
-*/
-struct whiteheat_simple {
-	__u8	port;	/* port number (1 to N) */
-};
-
-
-/*
- * WHITEHEAT_SETUP_PORT
- */
-#define WHITEHEAT_PAR_NONE	'n'	/* no parity */
-#define WHITEHEAT_PAR_EVEN	'e'	/* even parity */
-#define WHITEHEAT_PAR_ODD	'o'	/* odd parity */
-#define WHITEHEAT_PAR_SPACE	'0'	/* space (force 0) parity */
-#define WHITEHEAT_PAR_MARK	'1'	/* mark (force 1) parity */
-
-#define WHITEHEAT_SFLOW_NONE	'n'	/* no software flow control */
-#define WHITEHEAT_SFLOW_RX	'r'	/* XOFF/ON is sent when RX
-					   fills/empties */
-#define WHITEHEAT_SFLOW_TX	't'	/* when received XOFF/ON will
-					   stop/start TX */
-#define WHITEHEAT_SFLOW_RXTX	'b'	/* both SFLOW_RX and SFLOW_TX */
-
-#define WHITEHEAT_HFLOW_NONE		0x00	/* no hardware flow control */
-#define WHITEHEAT_HFLOW_RTS_TOGGLE	0x01	/* RTS is on during transmit,
-						   off otherwise */
-#define WHITEHEAT_HFLOW_DTR		0x02	/* DTR is off/on when RX
-						   fills/empties */
-#define WHITEHEAT_HFLOW_CTS		0x08	/* when received CTS off/on
-						   will stop/start TX */
-#define WHITEHEAT_HFLOW_DSR		0x10	/* when received DSR off/on
-						   will stop/start TX */
-#define WHITEHEAT_HFLOW_RTS		0x80	/* RTS is off/on when RX
-						   fills/empties */
-
-struct whiteheat_port_settings {
-	__u8	port;		/* port number (1 to N) */
-	__le32	baud;		/* any value 7 - 460800, firmware calculates
-				   best fit; arrives little endian */
-	__u8	bits;		/* 5, 6, 7, or 8 */
-	__u8	stop;		/* 1 or 2, default 1 (2 = 1.5 if bits = 5) */
-	__u8	parity;		/* see WHITEHEAT_PAR_* above */
-	__u8	sflow;		/* see WHITEHEAT_SFLOW_* above */
-	__u8	xoff;		/* XOFF byte value */
-	__u8	xon;		/* XON byte value */
-	__u8	hflow;		/* see WHITEHEAT_HFLOW_* above */
-	__u8	lloop;		/* 0/1 turns local loopback mode off/on */
-} __attribute__ ((packed));
-
-
-/*
- * WHITEHEAT_SET_RTS
- * WHITEHEAT_SET_DTR
- * WHITEHEAT_SET_BREAK
- */
-#define WHITEHEAT_RTS_OFF	0x00
-#define WHITEHEAT_RTS_ON	0x01
-#define WHITEHEAT_DTR_OFF	0x00
-#define WHITEHEAT_DTR_ON	0x01
-#define WHITEHEAT_BREAK_OFF	0x00
-#define WHITEHEAT_BREAK_ON	0x01
-
-struct whiteheat_set_rdb {
-	__u8	port;		/* port number (1 to N) */
-	__u8	state;		/* 0/1 turns signal off/on */
-};
-
-
-/*
- * WHITEHEAT_DUMP
- */
-#define WHITEHEAT_DUMP_MEM_DATA		'd'  /* data */
-#define WHITEHEAT_DUMP_MEM_IDATA	'i'  /* idata */
-#define WHITEHEAT_DUMP_MEM_BDATA	'b'  /* bdata */
-#define WHITEHEAT_DUMP_MEM_XDATA	'x'  /* xdata */
-
-/*
- * Allowable address ranges (firmware checks address):
- * Type DATA:  0x00 - 0xff
- * Type IDATA: 0x80 - 0xff
- * Type BDATA: 0x20 - 0x2f
- * Type XDATA: 0x0000 - 0xffff
- *
- * B/I/DATA all read the local memory space
- * XDATA reads the external memory space
- * BDATA returns bits as bytes
- *
- * NOTE: 0x80 - 0xff (local space) are the Special Function Registers
- *       of the 8051, and some have on-read side-effects.
- */
-
-struct whiteheat_dump {
-	__u8	mem_type;	/* see WHITEHEAT_DUMP_* above */
-	__u16	addr;		/* address, see restrictions above */
-	__u16	length;		/* number of bytes to dump, max 63 bytes */
-};
-
-
-/*
- * WHITEHEAT_PURGE
- */
-#define WHITEHEAT_PURGE_RX	0x01	/* purge rx fifos */
-#define WHITEHEAT_PURGE_TX	0x02	/* purge tx fifos */
-
-struct whiteheat_purge {
-	__u8	port;		/* port number (1 to N) */
-	__u8	what;		/* bit pattern of what to purge */
-};
-
-
-/*
- * WHITEHEAT_ECHO
- */
-struct whiteheat_echo {
-	__u8	port;		/* port number (1 to N) */
-	__u8	length;		/* length of message to echo, max 61 bytes */
-	__u8	echo_data[61];	/* data to echo */
-};
-
-
-/*
- * WHITEHEAT_DO_TEST
- */
-#define WHITEHEAT_TEST_UART_RW		0x01  /* read/write uart registers */
-#define WHITEHEAT_TEST_UART_INTR	0x02  /* uart interrupt */
-#define WHITEHEAT_TEST_SETUP_CONT	0x03  /* setup for
-						PORT_CONT/PORT_DISCONT */
-#define WHITEHEAT_TEST_PORT_CONT	0x04  /* port connect */
-#define WHITEHEAT_TEST_PORT_DISCONT	0x05  /* port disconnect */
-#define WHITEHEAT_TEST_UART_CLK_START	0x06  /* uart clock test start */
-#define WHITEHEAT_TEST_UART_CLK_STOP	0x07  /* uart clock test stop */
-#define WHITEHEAT_TEST_MODEM_FT		0x08  /* modem signals, requires a
-						loopback cable/connector */
-#define WHITEHEAT_TEST_ERASE_EEPROM	0x09  /* erase eeprom */
-#define WHITEHEAT_TEST_READ_EEPROM	0x0a  /* read eeprom */
-#define WHITEHEAT_TEST_PROGRAM_EEPROM	0x0b  /* program eeprom */
-
-struct whiteheat_test {
-	__u8	port;		/* port number (1 to n) */
-	__u8	test;		/* see WHITEHEAT_TEST_* above*/
-	__u8	info[32];	/* additional info */
-};
-
-
-/*
- * Replies from the firmware
- */
-
-
-/*
- * WHITEHEAT_STATUS
- */
-#define WHITEHEAT_EVENT_MODEM		0x01	/* modem field is valid */
-#define WHITEHEAT_EVENT_ERROR		0x02	/* error field is valid */
-#define WHITEHEAT_EVENT_FLOW		0x04	/* flow field is valid */
-#define WHITEHEAT_EVENT_CONNECT		0x08	/* connect field is valid */
-
-#define WHITEHEAT_FLOW_NONE		0x00	/* no flow control active */
-#define WHITEHEAT_FLOW_HARD_OUT		0x01	/* TX is stopped by CTS
-						  (waiting for CTS to go on) */
-#define WHITEHEAT_FLOW_HARD_IN		0x02	/* remote TX is stopped
-						  by RTS */
-#define WHITEHEAT_FLOW_SOFT_OUT		0x04	/* TX is stopped by XOFF
-						  received (waiting for XON) */
-#define WHITEHEAT_FLOW_SOFT_IN		0x08	/* remote TX is stopped by XOFF
-						  transmitted */
-#define WHITEHEAT_FLOW_TX_DONE		0x80	/* TX has completed */
-
-struct whiteheat_status_info {
-	__u8	port;		/* port number (1 to N) */
-	__u8	event;		/* indicates what the current event is,
-					see WHITEHEAT_EVENT_* above */
-	__u8	modem;		/* modem signal status (copy of uart's
-					MSR register) */
-	__u8	error;		/* line status (copy of uart's LSR register) */
-	__u8	flow;		/* flow control state, see WHITEHEAT_FLOW_*
-					above */
-	__u8	connect;	/* 0 means not connected, non-zero means
-					connected */
-};
-
-
-/*
- * WHITEHEAT_GET_DTR_RTS
- */
-struct whiteheat_dr_info {
-	__u8	mcr;		/* copy of uart's MCR register */
-};
-
-
-/*
- * WHITEHEAT_GET_HW_INFO
- */
-struct whiteheat_hw_info {
-	__u8	hw_id;		/* hardware id number, WhiteHEAT = 0 */
-	__u8	sw_major_rev;	/* major version number */
-	__u8	sw_minor_rev;	/* minor version number */
-	struct whiteheat_hw_eeprom_info {
-		__u8	b0;			/* B0 */
-		__u8	vendor_id_low;		/* vendor id (low byte) */
-		__u8	vendor_id_high;		/* vendor id (high byte) */
-		__u8	product_id_low;		/* product id (low byte) */
-		__u8	product_id_high;	/* product id (high byte) */
-		__u8	device_id_low;		/* device id (low byte) */
-		__u8	device_id_high;		/* device id (high byte) */
-		__u8	not_used_1;
-		__u8	serial_number_0;	/* serial number (low byte) */
-		__u8	serial_number_1;	/* serial number */
-		__u8	serial_number_2;	/* serial number */
-		__u8	serial_number_3;	/* serial number (high byte) */
-		__u8	not_used_2;
-		__u8	not_used_3;
-		__u8	checksum_low;		/* checksum (low byte) */
-		__u8	checksum_high;		/* checksum (high byte */
-	} hw_eeprom_info;	/* EEPROM contents */
-};
-
-
-/*
- * WHITEHEAT_EVENT
- */
-struct whiteheat_event_info {
-	__u8	port;		/* port number (1 to N) */
-	__u8	event;		/* see whiteheat_status_info.event */
-	__u8	info;		/* see whiteheat_status_info.modem, .error,
-					.flow, .connect */
-};
-
-
-/*
- * WHITEHEAT_DO_TEST
- */
-#define WHITEHEAT_TEST_FAIL	0x00  /* test failed */
-#define WHITEHEAT_TEST_UNKNOWN	0x01  /* unknown test requested */
-#define WHITEHEAT_TEST_PASS	0xff  /* test passed */
-
-struct whiteheat_test_info {
-	__u8	port;		/* port number (1 to N) */
-	__u8	test;		/* indicates which test this is a response for,
-				   see WHITEHEAT_DO_TEST above */
-	__u8	status;		/* see WHITEHEAT_TEST_* above */
-	__u8	results[32];	/* test-dependent results */
-};
-
-
-#endif
+T 0x1a
+#define D2F5_DEVICE_CAP__FLR_CAPABLE_MASK 0x10000000
+#define D2F5_DEVICE_CAP__FLR_CAPABLE__SHIFT 0x1c
+#define D2F5_DEVICE_CNTL__CORR_ERR_EN_MASK 0x1
+#define D2F5_DEVICE_CNTL__CORR_ERR_EN__SHIFT 0x0
+#define D2F5_DEVICE_CNTL__NON_FATAL_ERR_EN_MASK 0x2
+#define D2F5_DEVICE_CNTL__NON_FATAL_ERR_EN__SHIFT 0x1
+#define D2F5_DEVICE_CNTL__FATAL_ERR_EN_MASK 0x4
+#define D2F5_DEVICE_CNTL__FATAL_ERR_EN__SHIFT 0x2
+#define D2F5_DEVICE_CNTL__USR_REPORT_EN_MASK 0x8
+#define D2F5_DEVICE_CNTL__USR_REPORT_EN__SHIFT 0x3
+#define D2F5_DEVICE_CNTL__RELAXED_ORD_EN_MASK 0x10
+#define D2F5_DEVICE_CNTL__RELAXED_ORD_EN__SHIFT 0x4
+#define D2F5_DEVICE_CNTL__MAX_PAYLOAD_SIZE_MASK 0xe0
+#define D2F5_DEVICE_CNTL__MAX_PAYLOAD_SIZE__SHIFT 0x5
+#define D2F5_DEVICE_CNTL__EXTENDED_TAG_EN_MASK 0x100
+#define D2F5_DEVICE_CNTL__EXTENDED_TAG_EN__SHIFT 0x8
+#define D2F5_DEVICE_CNTL__PHANTOM_FUNC_EN_MASK 0x200
+#define D2F5_DEVICE_CNTL__PHANTOM_FUNC_EN__SHIFT 0x9
+#define D2F5_DEVICE_CNTL__AUX_POWER_PM_EN_MASK 0x400
+#define D2F5_DEVICE_CNTL__AUX_POWER_PM_EN__SHIFT 0xa
+#define D2F5_DEVICE_CNTL__NO_SNOOP_EN_MASK 0x800
+#define D2F5_DEVICE_CNTL__NO_SNOOP_EN__SHIFT 0xb
+#define D2F5_DEVICE_CNTL__MAX_READ_REQUEST_SIZE_MASK 0x7000
+#define D2F5_DEVICE_CNTL__MAX_READ_REQUEST_SIZE__SHIFT 0xc
+#define D2F5_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN_MASK 0x8000
+#define D2F5_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN__SHIFT 0xf
+#define D2F5_DEVICE_STATUS__CORR_ERR_MASK 0x10000
+#define D2F5_DEVICE_STATUS__CORR_ERR__SHIFT 0x10
+#define D2F5_DEVICE_STATUS__NON_FATAL_ERR_MASK 0x20000
+#define D2F5_DEVICE_STATUS__NON_FATAL_ERR__SHIFT 0x11
+#define D2F5_DEVICE_STATUS__FATAL_ERR_MASK 0x40000
+#define D2F5_DEVICE_STATUS__FATAL_ERR__SHIFT 0x12
+#define D2F5_DEVICE_STATUS__USR_DETECTED_MASK 0x80000
+#define D2F5_DEVICE_STATUS__USR_DETECTED__SHIFT 0x13
+#define D2F5_DEVICE_STATUS__AUX_PWR_MASK 0x100000
+#define D2F5_DEVICE_STATUS__AUX_PWR__SHIFT 0x14
+#define D2F5_DEVICE_STATUS__TRANSACTIONS_PEND_MASK 0x200000
+#define D2F5_DEVICE_STATUS__TRANSACTIONS_PEND__SHIFT 0x15
+#define D2F5_LINK_CAP__LINK_SPEED_MASK 0xf
+#define D2F5_LINK_CAP__LINK_SPEED__SHIFT 0x0
+#define D2F5_LINK_CAP__LINK_WIDTH_MASK 0x3f0
+#define D2F5_LINK_CAP__LINK_WIDTH__SHIFT 0x4
+#define D2F5_LINK_CAP__PM_SUPPORT_MASK 0xc00
+#define D2F5_LINK_CAP__PM_SUPPORT__SHIFT 0xa
+#define D2F5_LINK_CAP__L0S_EXIT_LATENCY_MASK 0x7000
+#define D2F5_LINK_CAP__L0S_EXIT_LATENCY__SHIFT 0xc
+#define D2F5_LINK_CAP__L1_EXIT_LATENCY_MASK 0x38000
+#define D2F5_LINK_CAP__L1_EXIT_LATENCY__SHIFT 0xf
+#define D2F5_LINK_CAP__CLOCK_POWER_MANAGEMENT_MASK 0x40000
+#define D2F5_LINK_CAP__CLOCK_POWER_MANAGEMENT__SHIFT 0x12
+#define D2F5_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING_MASK 0x80000
+#define D2F5_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING__SHIFT 0x13
+#define D2F5_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE_MASK 0x100000
+#define D2F5_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE__SHIFT 0x14
+#define D2F5_LINK_CAP__LINK_BW_NOTIFICATION_CAP_MASK 0x200000
+#define D2F5_LINK_CAP__LINK_BW_NOTIFICATION_CAP__SHIFT 0x15
+#define D2F5_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE_MASK 0x400000
+#define D2F5_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE__SHIFT 0x16
+#define D2F5_LINK_CAP__PORT_NUMBER_MASK 0xff000000
+#define D2F5_LINK_CAP__PORT_NUMBER__SHIFT 0x18
+#define D2F5_LINK_CNTL__PM_CONTROL_MASK 0x3
+#define D2F5_LINK_CNTL__PM_CONTROL__SHIFT 0x0
+#define D2F5_LINK_CNTL__READ_CPL_BOUNDARY_MASK 0x8
+#define D2F5_LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define D2F5_LINK_CNTL__LINK_DIS_MASK 0x10
+#define D2F5_LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define D2F5_LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define D2F5_LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define D2F5_LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define D2F5_LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define D2F5_LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define D2F5_LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define D2F5_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define D2F5_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define D2F5_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define D2F5_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0x9
+#define D2F5_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN_MASK 0x400
+#define D2F5_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN__SHIFT 0xa
+#define D2F5_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN_MASK 0x800
+#define D2F5_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN__SHIFT 0xb
+#define D2F5_LINK_STATUS__CURRENT_LINK_SPEED_MASK 0xf0000
+#define D2F5_LINK_STATUS__CURRENT_LINK_SPEED__SHIFT 0x10
+#define D2F5_LINK_STATUS__NEGOTIATED_LINK_WIDTH_MASK 0x3f00000
+#define D2F5_LINK_STATUS__NEGOTIATED_LINK_WIDTH__SHIFT 0x14
+#define D2F5_LINK_STATUS__LINK_TRAINING_MASK 0x8000000
+#define D2F5_LINK_STATUS__LINK_TRAINING__SHIFT 0x1b
+#define D2F5_LINK_STATUS__SLOT_CLOCK_CFG_MASK 0x10000000
+#define D2F5_LINK_STATUS__SLOT_CLOCK_CFG__SHIFT 0x1c
+#define D2F5_LINK_STATUS__DL_ACTIVE_MASK 0x20000000
+#define D2F5_LINK_STATUS__DL_ACTIVE__SHIFT 0x1d
+#define D2F5_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS_MASK 0x40000000
+#define D2F5_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS__SHIFT 0x1e
+#define D2F5_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS_MASK 0x80000000
+#define D2F5_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS__SHIFT 0x1f
+#define D2F5_SLOT_CAP__ATTN_BUTTON_PRESENT_MASK 0x1
+#define D2F5_SLOT_CAP__ATTN_BUTTON_PRESENT__SHIFT 0x0
+#define D2F5_SLOT_CAP__PWR_CONTROLLER_PRESENT_MASK 0x2
+#define D2F5_SLOT_CAP__PWR_CONTROLLER_PRESENT__SHIFT 0x1
+#define D2F5_SLOT_CAP__MRL_SENSOR_PRESENT_MASK 0x4
+#define D2F5_SLOT_CAP__MRL_SENSOR_PRESENT__SHIFT 0x2
+#define D2F5_SLOT_CAP__ATTN_INDICATOR_PRESENT_MASK 0x8
+#define D2F5_SLOT_CAP__ATTN_INDICATOR_PRESENT__SHIFT 0x3
+#define D2F5_SLOT_CAP__PWR_INDICATOR_PRESENT_MASK 0x10
+#define D2F5_SLOT_CAP__PWR_INDICATOR_PRESENT__SHIFT 0x4
+#define D2F5_SLOT_CAP__HOTPLUG_SURPRISE_MASK 0x20
+#define D2F5_SLOT_CAP__HOTPLUG_SURPRISE__SHIFT 0x5
+#define D2F5_SLOT_CAP__HOTPLUG_CAPABLE_MASK 0x40
+#define D2F5_SLOT_CAP__HOTPLUG_CAPABLE__SHIFT 0x6
+#define D2F5_SLOT_CAP__SLOT_PWR_LIMIT_VALUE_MASK 0x7f80
+#define D2F5_SLOT_CAP__SLOT_PWR_LIMIT_VALUE__SHIFT 0x7
+#define D2F5_SLOT_CAP__SLOT_PWR_LIMIT_SCALE_MASK 0x18000
+#define D2F5_SLOT_CAP__SLOT_PWR_LIMIT_SCALE__SHIFT 0xf
+#define D2F5_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT_MASK 0x20000
+#define D2F5_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT__SHIFT 0x11
+#define D2F5_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED_MASK 0x40000
+#define D2F5_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED__SHIFT 0x12
+#define D2F5_SLOT_CAP__PHYSICAL_SLOT_NUM_MASK 0xfff80000
+#define D2F5_SLOT_CAP__PHYSICAL_SLOT_NUM__SHIFT 0x13
+#define D2F5_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN_MASK 0x1
+#define D2F5_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN__SHIFT 0x0
+#define D2F5_SLOT_CNTL__PWR_FAULT_DETECTED_EN_MASK 0x2
+#define D2F5_SLOT_CNTL__PWR_FAULT_DETECTED_EN__SHIFT 0x1
+#define D2F5_SLOT_CNTL__MRL_SENSOR_CHANGED_EN_MASK 0x4
+#define D2F5_SLOT_CNTL__MRL_SENSOR_CHANGED_EN__SHIFT 0x2
+#define D2F5_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN_MASK 0x8
+#define D2F5_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN__SHIFT 0x3
+#define D2F5_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN_MASK 0x10
+#define D2F5_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN__SHIFT 0x4
+#define D2F5_SLOT_CNTL__HOTPLUG_INTR_EN_MASK 0x20
+#define D2F5_SLOT_CNTL__HOTPLUG_INTR_EN__SHIFT 0x5
+#define D2F5_SLOT_CNTL__ATTN_INDICATOR_CNTL_MASK 0xc0
+#define D2F5_SLOT_CNTL__ATTN_INDICATOR_CNTL__SHIFT 0x6
+#define D2F5_SLOT_CNTL__PWR_INDICATOR_CNTL_MASK 0x300
+#define D2F5_SLOT_CNTL__PWR_INDICATOR_CNTL__SHIFT 0x8
+#define D2F5_SLOT_CNTL__PWR_CONTROLLER_CNTL_MASK 0x400
+#define D2F5_SLOT_CNTL__PWR_CONTROLLER_CNTL__SHIFT 0xa
+#define D2F5_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL_MASK 0x800
+#define D2F5_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL__SHIFT 0xb
+#define D2F5_SLOT_CNTL__DL_STATE_CHANGED_EN_MASK 0x1000
+#define D2F5_SLOT_CNTL__DL_STATE_CHANGED_EN__SHIFT 0xc
+#define D2F5_SLOT_STATUS__ATTN_BUTTON_PRESSED_MASK 0x10000
+#define D2F5_SLOT_STATUS__ATTN_BUTTON_PRESSED__SHIFT 0x10
+#define D2F5_SLOT_STATUS__PWR_FAULT_DETECTED_MASK 0x20000
+#define D2F5_SLOT_STATUS__PWR_FAULT_DETECTED__SHIFT 0x11
+#define D2F5_SLOT_STATUS__MRL_SENSOR_CHANGED_MASK 0x40000
+#define D2F5_SLOT_STATUS__MRL_SENSOR_CHANGED__SHIFT 0x12
+#define D2F5_SLOT_STATUS__PRESENCE_DETECT_CHANGED_MASK 0x80000
+#define D2F5_SLOT_STATUS__PRESENCE_DETECT_CHANGED__SHIFT 0x13
+#define D2F5_SLOT_STATUS__COMMAND_COMPLETED_MASK 0x100000
+#define D2F5_SLOT_STATUS__COMMAND_COMPLETED__SHIFT 0x14
+#define D2F5_SLOT_STATUS__MRL_SENSOR_STATE_MASK 0x200000
+#define D2F5_SLOT_STATUS__MRL_SENSOR_STATE__SHIFT 0x15
+#define D2F5_SLOT_STATUS__PRESENCE_DETECT_STATE_MASK 0x400000
+#define D2F5_SLOT_STATUS__PRESENCE_DETECT_STATE__SHIFT 0x16
+#define D2F5_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS_MASK 0x800000
+#define D2F5_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS__SHIFT 0x17
+#define D2F5_SLOT_STATUS__DL_STATE_CHANGED_MASK 0x1000000
+#define D2F5_SLOT_STATUS__DL_STATE_CHANGED__SHIFT 0x18
+#define D2F5_ROOT_CNTL__SERR_ON_CORR_ERR_EN_MASK 0x1
+#define D2F5_ROOT_CNTL__SERR_ON_CORR_ERR_EN__SHIFT 0x0
+#define D2F5_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN_MASK 0x2
+#define D2F5_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN__SHIFT 0x1
+#define D2F5_ROOT_CNTL__SERR_ON_FATAL_ERR_EN_MASK 0x4
+#define D2F5_ROOT_CNTL__SERR_ON_FATAL_ERR_EN__SHIFT 0x2
+#define D2F5_ROOT_CNTL__PM_INTERRUPT_EN_MASK 0x8
+#define D2F5_ROOT_CNTL__PM_INTERRUPT_EN__SHIFT 0x3
+#define D2F5_ROOT_CNTL__CRS_SOFTWARE_VISIBILITY_EN_MASK 0x10
+#define D2F5_ROOT_CNTL__

@@ -1,179 +1,424 @@
-/*
- *  Compat system call wrappers.
- *
- *    Copyright IBM Corp. 2014
- */
+apic_lock;
+	}
 
-#include <linux/syscalls.h>
-#include <linux/compat.h>
-#include "entry.h"
+	desc = irq_to_desc(irq);
+	raw_spin_lock(&desc->lock);
+	dest = get_target_cpu(gsi, irq);
+	dmode = choose_dmode();
+	err = register_intr(gsi, irq, dmode, polarity, trigger);
+	if (err < 0) {
+		raw_spin_unlock(&desc->lock);
+		irq = err;
+		goto unlock_iosapic_lock;
+	}
 
-#define COMPAT_SYSCALL_WRAP1(name, ...) \
-	COMPAT_SYSCALL_WRAPx(1, _##name, __VA_ARGS__)
-#define COMPAT_SYSCALL_WRAP2(name, ...) \
-	COMPAT_SYSCALL_WRAPx(2, _##name, __VA_ARGS__)
-#define COMPAT_SYSCALL_WRAP3(name, ...) \
-	COMPAT_SYSCALL_WRAPx(3, _##name, __VA_ARGS__)
-#define COMPAT_SYSCALL_WRAP4(name, ...) \
-	COMPAT_SYSCALL_WRAPx(4, _##name, __VA_ARGS__)
-#define COMPAT_SYSCALL_WRAP5(name, ...) \
-	COMPAT_SYSCALL_WRAPx(5, _##name, __VA_ARGS__)
-#define COMPAT_SYSCALL_WRAP6(name, ...) \
-	COMPAT_SYSCALL_WRAPx(6, _##name, __VA_ARGS__)
+	/*
+	 * If the vector is shared and already unmasked for other
+	 * interrupt sources, don't mask it.
+	 */
+	low32 = iosapic_intr_info[irq].low32;
+	if (irq_is_shared(irq) && !(low32 & IOSAPIC_MASK))
+		mask = 0;
+	set_rte(gsi, irq, dest, mask);
 
-#define __SC_COMPAT_TYPE(t, a) \
-	__typeof(__builtin_choose_expr(sizeof(t) > 4, 0L, (t)0)) a
+	printk(KERN_INFO "GSI %u (%s, %s) -> CPU %d (0x%04x) vector %d\n",
+	       gsi, (trigger == IOSAPIC_EDGE ? "edge" : "level"),
+	       (polarity == IOSAPIC_POL_HIGH ? "high" : "low"),
+	       cpu_logical_id(dest), dest, irq_to_vector(irq));
 
-#define __SC_COMPAT_CAST(t, a)						\
-({									\
-	long __ReS = a;							\
-									\
-	BUILD_BUG_ON((sizeof(t) > 4) && !__TYPE_IS_L(t) &&		\
-		     !__TYPE_IS_UL(t) && !__TYPE_IS_PTR(t));		\
-	if (__TYPE_IS_L(t))						\
-		__ReS = (s32)a;						\
-	if (__TYPE_IS_UL(t))						\
-		__ReS = (u32)a;						\
-	if (__TYPE_IS_PTR(t))						\
-		__ReS = a & 0x7fffffff;					\
-	(t)__ReS;							\
-})
-
-/*
- * The COMPAT_SYSCALL_WRAP macro generates system call wrappers to be used by
- * compat tasks. These wrappers will only be used for system calls where only
- * the system call arguments need sign or zero extension or zeroing of the upper
- * 33 bits of pointers.
- * Note: since the wrapper function will afterwards call a system call which
- * again performs zero and sign extension for all system call arguments with
- * a size of less than eight bytes, these compat wrappers only touch those
- * system call arguments with a size of eight bytes ((unsigned) long and
- * pointers). Zero and sign extension for e.g. int parameters will be done by
- * the regular system call wrappers.
- */
-#define COMPAT_SYSCALL_WRAPx(x, name, ...)					\
-asmlinkage long sys##name(__MAP(x,__SC_DECL,__VA_ARGS__));			\
-asmlinkage long notrace compat_sys##name(__MAP(x,__SC_COMPAT_TYPE,__VA_ARGS__));\
-asmlinkage long notrace compat_sys##name(__MAP(x,__SC_COMPAT_TYPE,__VA_ARGS__))	\
-{										\
-	return sys##name(__MAP(x,__SC_COMPAT_CAST,__VA_ARGS__));		\
+	raw_spin_unlock(&desc->lock);
+ unlock_iosapic_lock:
+	spin_unlock_irqrestore(&iosapic_lock, flags);
+	return irq;
 }
 
-COMPAT_SYSCALL_WRAP2(creat, const char __user *, pathname, umode_t, mode);
-COMPAT_SYSCALL_WRAP2(link, const char __user *, oldname, const char __user *, newname);
-COMPAT_SYSCALL_WRAP1(unlink, const char __user *, pathname);
-COMPAT_SYSCALL_WRAP1(chdir, const char __user *, filename);
-COMPAT_SYSCALL_WRAP3(mknod, const char __user *, filename, umode_t, mode, unsigned, dev);
-COMPAT_SYSCALL_WRAP2(chmod, const char __user *, filename, umode_t, mode);
-COMPAT_SYSCALL_WRAP1(oldumount, char __user *, name);
-COMPAT_SYSCALL_WRAP2(access, const char __user *, filename, int, mode);
-COMPAT_SYSCALL_WRAP2(rename, const char __user *, oldname, const char __user *, newname);
-COMPAT_SYSCALL_WRAP2(mkdir, const char __user *, pathname, umode_t, mode);
-COMPAT_SYSCALL_WRAP1(rmdir, const char __user *, pathname);
-COMPAT_SYSCALL_WRAP1(pipe, int __user *, fildes);
-COMPAT_SYSCALL_WRAP1(brk, unsigned long, brk);
-COMPAT_SYSCALL_WRAP2(signal, int, sig, __sighandler_t, handler);
-COMPAT_SYSCALL_WRAP1(acct, const char __user *, name);
-COMPAT_SYSCALL_WRAP2(umount, char __user *, name, int, flags);
-COMPAT_SYSCALL_WRAP1(chroot, const char __user *, filename);
-COMPAT_SYSCALL_WRAP3(sigsuspend, int, unused1, int, unused2, old_sigset_t, mask);
-COMPAT_SYSCALL_WRAP2(sethostname, char __user *, name, int, len);
-COMPAT_SYSCALL_WRAP2(symlink, const char __user *, old, const char __user *, new);
-COMPAT_SYSCALL_WRAP3(readlink, const char __user *, path, char __user *, buf, int, bufsiz);
-COMPAT_SYSCALL_WRAP1(uselib, const char __user *, library);
-COMPAT_SYSCALL_WRAP2(swapon, const char __user *, specialfile, int, swap_flags);
-COMPAT_SYSCALL_WRAP4(reboot, int, magic1, int, magic2, unsigned int, cmd, void __user *, arg);
-COMPAT_SYSCALL_WRAP2(munmap, unsigned long, addr, size_t, len);
-COMPAT_SYSCALL_WRAP3(syslog, int, type, char __user *, buf, int, len);
-COMPAT_SYSCALL_WRAP1(swapoff, const char __user *, specialfile);
-COMPAT_SYSCALL_WRAP2(setdomainname, char __user *, name, int, len);
-COMPAT_SYSCALL_WRAP1(newuname, struct new_utsname __user *, name);
-COMPAT_SYSCALL_WRAP3(mprotect, unsigned long, start, size_t, len, unsigned long, prot);
-COMPAT_SYSCALL_WRAP3(init_module, void __user *, umod, unsigned long, len, const char __user *, uargs);
-COMPAT_SYSCALL_WRAP2(delete_module, const char __user *, name_user, unsigned int, flags);
-COMPAT_SYSCALL_WRAP4(quotactl, unsigned int, cmd, const char __user *, special, qid_t, id, void __user *, addr);
-COMPAT_SYSCALL_WRAP2(bdflush, int, func, long, data);
-COMPAT_SYSCALL_WRAP3(sysfs, int, option, unsigned long, arg1, unsigned long, arg2);
-COMPAT_SYSCALL_WRAP5(llseek, unsigned int, fd, unsigned long, high, unsigned long, low, loff_t __user *, result, unsigned int, whence);
-COMPAT_SYSCALL_WRAP3(msync, unsigned long, start, size_t, len, int, flags);
-COMPAT_SYSCALL_WRAP2(mlock, unsigned long, start, size_t, len);
-COMPAT_SYSCALL_WRAP2(munlock, unsigned long, start, size_t, len);
-COMPAT_SYSCALL_WRAP2(sched_setparam, pid_t, pid, struct sched_param __user *, param);
-COMPAT_SYSCALL_WRAP2(sched_getparam, pid_t, pid, struct sched_param __user *, param);
-COMPAT_SYSCALL_WRAP3(sched_setscheduler, pid_t, pid, int, policy, struct sched_param __user *, param);
-COMPAT_SYSCALL_WRAP5(mremap, unsigned long, addr, unsigned long, old_len, unsigned long, new_len, unsigned long, flags, unsigned long, new_addr);
-COMPAT_SYSCALL_WRAP3(poll, struct pollfd __user *, ufds, unsigned int, nfds, int, timeout);
-COMPAT_SYSCALL_WRAP5(prctl, int, option, unsigned long, arg2, unsigned long, arg3, unsigned long, arg4, unsigned long, arg5);
-COMPAT_SYSCALL_WRAP2(getcwd, char __user *, buf, unsigned long, size);
-COMPAT_SYSCALL_WRAP2(capget, cap_user_header_t, header, cap_user_data_t, dataptr);
-COMPAT_SYSCALL_WRAP2(capset, cap_user_header_t, header, const cap_user_data_t, data);
-COMPAT_SYSCALL_WRAP3(lchown, const char __user *, filename, uid_t, user, gid_t, group);
-COMPAT_SYSCALL_WRAP2(getgroups, int, gidsetsize, gid_t __user *, grouplist);
-COMPAT_SYSCALL_WRAP2(setgroups, int, gidsetsize, gid_t __user *, grouplist);
-COMPAT_SYSCALL_WRAP3(getresuid, uid_t __user *, ruid, uid_t __user *, euid, uid_t __user *, suid);
-COMPAT_SYSCALL_WRAP3(getresgid, gid_t __user *, rgid, gid_t __user *, egid, gid_t __user *, sgid);
-COMPAT_SYSCALL_WRAP3(chown, const char __user *, filename, uid_t, user, gid_t, group);
-COMPAT_SYSCALL_WRAP2(pivot_root, const char __user *, new_root, const char __user *, put_old);
-COMPAT_SYSCALL_WRAP3(mincore, unsigned long, start, size_t, len, unsigned char __user *, vec);
-COMPAT_SYSCALL_WRAP3(madvise, unsigned long, start, size_t, len, int, behavior);
-COMPAT_SYSCALL_WRAP5(setxattr, const char __user *, path, const char __user *, name, const void __user *, value, size_t, size, int, flags);
-COMPAT_SYSCALL_WRAP5(lsetxattr, const char __user *, path, const char __user *, name, const void __user *, value, size_t, size, int, flags);
-COMPAT_SYSCALL_WRAP5(fsetxattr, int, fd, const char __user *, name, const void __user *, value, size_t, size, int, flags);
-COMPAT_SYSCALL_WRAP3(getdents64, unsigned int, fd, struct linux_dirent64 __user *, dirent, unsigned int, count);
-COMPAT_SYSCALL_WRAP4(getxattr, const char __user *, path, const char __user *, name, void __user *, value, size_t, size);
-COMPAT_SYSCALL_WRAP4(lgetxattr, const char __user *, path, const char __user *, name, void __user *, value, size_t, size);
-COMPAT_SYSCALL_WRAP4(fgetxattr, int, fd, const char __user *, name, void __user *, value, size_t, size);
-COMPAT_SYSCALL_WRAP3(listxattr, const char __user *, path, char __user *, list, size_t, size);
-COMPAT_SYSCALL_WRAP3(llistxattr, const char __user *, path, char __user *, list, size_t, size);
-COMPAT_SYSCALL_WRAP3(flistxattr, int, fd, char __user *, list, size_t, size);
-COMPAT_SYSCALL_WRAP2(removexattr, const char __user *, path, const char __user *, name);
-COMPAT_SYSCALL_WRAP2(lremovexattr, const char __user *, path, const char __user *, name);
-COMPAT_SYSCALL_WRAP2(fremovexattr, int, fd, const char __user *, name);
-COMPAT_SYSCALL_WRAP1(set_tid_address, int __user *, tidptr);
-COMPAT_SYSCALL_WRAP4(epoll_ctl, int, epfd, int, op, int, fd, struct epoll_event __user *, event);
-COMPAT_SYSCALL_WRAP4(epoll_wait, int, epfd, struct epoll_event __user *, events, int, maxevents, int, timeout);
-COMPAT_SYSCALL_WRAP1(io_destroy, aio_context_t, ctx);
-COMPAT_SYSCALL_WRAP3(io_cancel, aio_context_t, ctx_id, struct iocb __user *, iocb, struct io_event __user *, result);
-COMPAT_SYSCALL_WRAP1(mq_unlink, const char __user *, name);
-COMPAT_SYSCALL_WRAP5(add_key, const char __user *, tp, const char __user *, dsc, const void __user *, pld, size_t, len, key_serial_t, id);
-COMPAT_SYSCALL_WRAP4(request_key, const char __user *, tp, const char __user *, dsc, const char __user *, info, key_serial_t, id);
-COMPAT_SYSCALL_WRAP5(remap_file_pages, unsigned long, start, unsigned long, size, unsigned long, prot, unsigned long, pgoff, unsigned long, flags);
-COMPAT_SYSCALL_WRAP3(inotify_add_watch, int, fd, const char __user *, path, u32, mask);
-COMPAT_SYSCALL_WRAP3(mkdirat, int, dfd, const char __user *, pathname, umode_t, mode);
-COMPAT_SYSCALL_WRAP4(mknodat, int, dfd, const char __user *, filename, umode_t, mode, unsigned, dev);
-COMPAT_SYSCALL_WRAP5(fchownat, int, dfd, const char __user *, filename, uid_t, user, gid_t, group, int, flag);
-COMPAT_SYSCALL_WRAP3(unlinkat, int, dfd, const char __user *, pathname, int, flag);
-COMPAT_SYSCALL_WRAP4(renameat, int, olddfd, const char __user *, oldname, int, newdfd, const char __user *, newname);
-COMPAT_SYSCALL_WRAP5(linkat, int, olddfd, const char __user *, oldname, int, newdfd, const char __user *, newname, int, flags);
-COMPAT_SYSCALL_WRAP3(symlinkat, const char __user *, oldname, int, newdfd, const char __user *, newname);
-COMPAT_SYSCALL_WRAP4(readlinkat, int, dfd, const char __user *, path, char __user *, buf, int, bufsiz);
-COMPAT_SYSCALL_WRAP3(fchmodat, int, dfd, const char __user *, filename, umode_t, mode);
-COMPAT_SYSCALL_WRAP3(faccessat, int, dfd, const char __user *, filename, int, mode);
-COMPAT_SYSCALL_WRAP1(unshare, unsigned long, unshare_flags);
-COMPAT_SYSCALL_WRAP6(splice, int, fd_in, loff_t __user *, off_in, int, fd_out, loff_t __user *, off_out, size_t, len, unsigned int, flags);
-COMPAT_SYSCALL_WRAP4(tee, int, fdin, int, fdout, size_t, len, unsigned int, flags);
-COMPAT_SYSCALL_WRAP3(getcpu, unsigned __user *, cpu, unsigned __user *, node, struct getcpu_cache __user *, cache);
-COMPAT_SYSCALL_WRAP2(pipe2, int __user *, fildes, int, flags);
-COMPAT_SYSCALL_WRAP5(perf_event_open, struct perf_event_attr __user *, attr_uptr, pid_t, pid, int, cpu, int, group_fd, unsigned long, flags);
-COMPAT_SYSCALL_WRAP5(clone, unsigned long, newsp, unsigned long, clone_flags, int __user *, parent_tidptr, int __user *, child_tidptr, unsigned long, tls);
-COMPAT_SYSCALL_WRAP4(prlimit64, pid_t, pid, unsigned int, resource, const struct rlimit64 __user *, new_rlim, struct rlimit64 __user *, old_rlim);
-COMPAT_SYSCALL_WRAP5(name_to_handle_at, int, dfd, const char __user *, name, struct file_handle __user *, handle, int __user *, mnt_id, int, flag);
-COMPAT_SYSCALL_WRAP5(kcmp, pid_t, pid1, pid_t, pid2, int, type, unsigned long, idx1, unsigned long, idx2);
-COMPAT_SYSCALL_WRAP3(finit_module, int, fd, const char __user *, uargs, int, flags);
-COMPAT_SYSCALL_WRAP3(sched_setattr, pid_t, pid, struct sched_attr __user *, attr, unsigned int, flags);
-COMPAT_SYSCALL_WRAP4(sched_getattr, pid_t, pid, struct sched_attr __user *, attr, unsigned int, size, unsigned int, flags);
-COMPAT_SYSCALL_WRAP5(renameat2, int, olddfd, const char __user *, oldname, int, newdfd, const char __user *, newname, unsigned int, flags);
-COMPAT_SYSCALL_WRAP3(seccomp, unsigned int, op, unsigned int, flags, const char __user *, uargs)
-COMPAT_SYSCALL_WRAP3(getrandom, char __user *, buf, size_t, count, unsigned int, flags)
-COMPAT_SYSCALL_WRAP2(memfd_create, const char __user *, uname, unsigned int, flags)
-COMPAT_SYSCALL_WRAP3(bpf, int, cmd, union bpf_attr *, attr, unsigned int, size);
-COMPAT_SYSCALL_WRAP3(s390_pci_mmio_write, const unsigned long, mmio_addr, const void __user *, user_buffer, const size_t, length);
-COMPAT_SYSCALL_WRAP3(s390_pci_mmio_read, const unsigned long, mmio_addr, void __user *, user_buffer, const size_t, length);
-COMPAT_SYSCALL_WRAP4(socketpair, int, family, int, type, int, protocol, int __user *, usockvec);
-COMPAT_SYSCALL_WRAP3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen);
-COMPAT_SYSCALL_WRAP3(connect, int, fd, struct sockaddr __user *, uservaddr, int, addrlen);
-COMPAT_SYSCALL_WRAP4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr, int __user *, upeer_addrlen, int, flags);
-COMPAT_SYSCALL_WRAP3(getsockname, int, fd, struct sockaddr __user *, usockaddr, int __user *, usockaddr_len);
-COMPAT_SYSCALL_WRAP3(getpeername, int, fd, struct sockaddr __user *, usockaddr, int __user *, usockaddr_len);
-COMPAT_SYSCALL_WRAP6(sendto, int, fd, void __user *, buff, size_t, len, unsigned int, flags, struct sockaddr __user *, addr, int, addr_len);
-COMPAT_SYSCALL_WRAP3(mlock2, unsigned long, start, size_t, len, int, flags);
+void
+iosapic_unregister_intr (unsigned int gsi)
+{
+	unsigned long flags;
+	int irq, index;
+	u32 low32;
+	unsigned long trigger, polarity;
+	unsigned int dest;
+	struct iosapic_rte_info *rte;
+
+	/*
+	 * If the irq associated with the gsi is not found,
+	 * iosapic_unregister_intr() is unbalanced. We need to check
+	 * this again after getting locks.
+	 */
+	irq = gsi_to_irq(gsi);
+	if (irq < 0) {
+		printk(KERN_ERR "iosapic_unregister_intr(%u) unbalanced\n",
+		       gsi);
+		WARN_ON(1);
+		return;
+	}
+
+	spin_lock_irqsave(&iosapic_lock, flags);
+	if ((rte = find_rte(irq, gsi)) == NULL) {
+		printk(KERN_ERR "iosapic_unregister_intr(%u) unbalanced\n",
+		       gsi);
+		WARN_ON(1);
+		goto out;
+	}
+
+	if (--rte->refcnt > 0)
+		goto out;
+
+	rte->refcnt = NO_REF_RTE;
+
+	/* Mask the interrupt */
+	low32 = iosapic_intr_info[irq].low32 | IOSAPIC_MASK;
+	iosapic_write(rte->iosapic, IOSAPIC_RTE_LOW(rte->rte_index), low32);
+
+	iosapic_intr_info[irq].count--;
+	index = find_iosapic(gsi);
+	iosapic_lists[index].rtes_inuse--;
+	WARN_ON(iosapic_lists[index].rtes_inuse < 0);
+
+	trigger  = iosapic_intr_info[irq].trigger;
+	polarity = iosapic_intr_info[irq].polarity;
+	dest     = iosapic_intr_info[irq].dest;
+	printk(KERN_INFO
+	       "GSI %u (%s, %s) -> CPU %d (0x%04x) vector %d unregistered\n",
+	       gsi, (trigger == IOSAPIC_EDGE ? "edge" : "level"),
+	       (polarity == IOSAPIC_POL_HIGH ? "high" : "low"),
+	       cpu_logical_id(dest), dest, irq_to_vector(irq));
+
+	if (iosapic_intr_info[irq].count == 0) {
+#ifdef CONFIG_SMP
+		/* Clear affinity */
+		cpumask_setall(irq_get_affinity_mask(irq));
+#endif
+		/* Clear the interrupt information */
+		iosapic_intr_info[irq].dest = 0;
+		iosapic_intr_info[irq].dmode = 0;
+		iosapic_intr_info[irq].polarity = 0;
+		iosapic_intr_info[irq].trigger = 0;
+		iosapic_intr_info[irq].low32 |= IOSAPIC_MASK;
+
+		/* Destroy and reserve IRQ */
+		destroy_and_reserve_irq(irq);
+	}
+ out:
+	spin_unlock_irqrestore(&iosapic_lock, flags);
+}
+
+/*
+ * ACPI calls this when it finds an entry for a platform interrupt.
+ */
+int __init
+iosapic_register_platform_intr (u32 int_type, unsigned int gsi,
+				int iosapic_vector, u16 eid, u16 id,
+				unsigned long polarity, unsigned long trigger)
+{
+	static const char * const name[] = {"unknown", "PMI", "INIT", "CPEI"};
+	unsigned char delivery;
+	int irq, vector, mask = 0;
+	unsigned int dest = ((id << 8) | eid) & 0xffff;
+
+	switch (int_type) {
+	      case ACPI_INTERRUPT_PMI:
+		irq = vector = iosapic_vector;
+		bind_irq_vector(irq, vector, CPU_MASK_ALL);
+		/*
+		 * since PMI vector is alloc'd by FW(ACPI) not by kernel,
+		 * we need to make sure the vector is available
+		 */
+		iosapic_reassign_vector(irq);
+		delivery = IOSAPIC_PMI;
+		break;
+	      case ACPI_INTERRUPT_INIT:
+		irq = create_irq();
+		if (irq < 0)
+			panic("%s: out of interrupt vectors!\n", __func__);
+		vector = irq_to_vector(irq);
+		delivery = IOSAPIC_INIT;
+		break;
+	      case ACPI_INTERRUPT_CPEI:
+		irq = vector = IA64_CPE_VECTOR;
+		BUG_ON(bind_irq_vector(irq, vector, CPU_MASK_ALL));
+		delivery = IOSAPIC_FIXED;
+		mask = 1;
+		break;
+	      default:
+		printk(KERN_ERR "%s: invalid int type 0x%x\n", __func__,
+		       int_type);
+		return -1;
+	}
+
+	register_intr(gsi, irq, delivery, polarity, trigger);
+
+	printk(KERN_INFO
+	       "PLATFORM int %s (0x%x): GSI %u (%s, %s) -> CPU %d (0x%04x)"
+	       " vector %d\n",
+	       int_type < ARRAY_SIZE(name) ? name[int_type] : "unknown",
+	       int_type, gsi, (trigger == IOSAPIC_EDGE ? "edge" : "level"),
+	       (polarity == IOSAPIC_POL_HIGH ? "high" : "low"),
+	       cpu_logical_id(dest), dest, vector);
+
+	set_rte(gsi, irq, dest, mask);
+	return vector;
+}
+
+/*
+ * ACPI calls this when it finds an entry for a legacy ISA IRQ override.
+ */
+void iosapic_override_isa_irq(unsigned int isa_irq, unsigned int gsi,
+			      unsigned long polarity, unsigned long trigger)
+{
+	int vector, irq;
+	unsigned int dest = cpu_physical_id(smp_processor_id());
+	unsigned char dmode;
+
+	irq = vector = isa_irq_to_vector(isa_irq);
+	BUG_ON(bind_irq_vector(irq, vector, CPU_MASK_ALL));
+	dmode = choose_dmode();
+	register_intr(gsi, irq, dmode, polarity, trigger);
+
+	DBG("ISA: IRQ %u -> GSI %u (%s,%s) -> CPU %d (0x%04x) vector %d\n",
+	    isa_irq, gsi, trigger == IOSAPIC_EDGE ? "edge" : "level",
+	    polarity == IOSAPIC_POL_HIGH ? "high" : "low",
+	    cpu_logical_id(dest), dest, vector);
+
+	set_rte(gsi, irq, dest, 1);
+}
+
+void __init
+ia64_native_iosapic_pcat_compat_init(void)
+{
+	if (pcat_compat) {
+		/*
+		 * Disable the compatibility mode interrupts (8259 style),
+		 * needs IN/OUT support enabled.
+		 */
+		printk(KERN_INFO
+		       "%s: Disabling PC-AT compatible 8259 interrupts\n",
+		       __func__);
+		outb(0xff, 0xA1);
+		outb(0xff, 0x21);
+	}
+}
+
+void __init
+iosapic_system_init (int system_pcat_compat)
+{
+	int irq;
+
+	for (irq = 0; irq < NR_IRQS; ++irq) {
+		iosapic_intr_info[irq].low32 = IOSAPIC_MASK;
+		/* mark as unused */
+		INIT_LIST_HEAD(&iosapic_intr_info[irq].rtes);
+
+		iosapic_intr_info[irq].count = 0;
+	}
+
+	pcat_compat = system_pcat_compat;
+	if (pcat_compat)
+		iosapic_pcat_compat_init();
+}
+
+static inline int
+iosapic_alloc (void)
+{
+	int index;
+
+	for (index = 0; index < NR_IOSAPICS; index++)
+		if (!iosapic_lists[index].addr)
+			return index;
+
+	printk(KERN_WARNING "%s: failed to allocate iosapic\n", __func__);
+	return -1;
+}
+
+static inline void
+iosapic_free (int index)
+{
+	memset(&iosapic_lists[index], 0, sizeof(iosapic_lists[0]));
+}
+
+static inline int
+iosapic_check_gsi_range (unsigned int gsi_base, unsigned int ver)
+{
+	int index;
+	unsigned int gsi_end, base, end;
+
+	/* check gsi range */
+	gsi_end = gsi_base + ((ver >> 16) & 0xff);
+	for (index = 0; index < NR_IOSAPICS; index++) {
+		if (!iosapic_lists[index].addr)
+			continue;
+
+		base = iosapic_lists[index].gsi_base;
+		end  = base + iosapic_lists[index].num_rte - 1;
+
+		if (gsi_end < base || end < gsi_base)
+			continue; /* OK */
+
+		return -EBUSY;
+	}
+	return 0;
+}
+
+static int
+iosapic_delete_rte(unsigned int irq, unsigned int gsi)
+{
+	struct iosapic_rte_info *rte, *temp;
+
+	list_for_each_entry_safe(rte, temp, &iosapic_intr_info[irq].rtes,
+								rte_list) {
+		if (rte->iosapic->gsi_base + rte->rte_index == gsi) {
+			if (rte->refcnt)
+				return -EBUSY;
+
+			list_del(&rte->rte_list);
+			kfree(rte);
+			return 0;
+		}
+	}
+
+	return -EINVAL;
+}
+
+int iosapic_init(unsigned long phys_addr, unsigned int gsi_base)
+{
+	int num_rte, err, index;
+	unsigned int isa_irq, ver;
+	char __iomem *addr;
+	unsigned long flags;
+
+	spin_lock_irqsave(&iosapic_lock, flags);
+	index = find_iosapic(gsi_base);
+	if (index >= 0) {
+		spin_unlock_irqrestore(&iosapic_lock, flags);
+		return -EBUSY;
+	}
+
+	addr = ioremap(phys_addr, 0);
+	if (addr == NULL) {
+		spin_unlock_irqrestore(&iosapic_lock, flags);
+		return -ENOMEM;
+	}
+	ver = iosapic_version(addr);
+	if ((err = iosapic_check_gsi_range(gsi_base, ver))) {
+		iounmap(addr);
+		spin_unlock_irqrestore(&iosapic_lock, flags);
+		return err;
+	}
+
+	/*
+	 * The MAX_REDIR register holds the highest input pin number
+	 * (starting from 0).  We add 1 so that we can use it for
+	 * number of pins (= RTEs)
+	 */
+	num_rte = ((ver >> 16) & 0xff) + 1;
+
+	index = iosapic_alloc();
+	iosapic_lists[index].addr = addr;
+	iosapic_lists[index].gsi_base = gsi_base;
+	iosapic_lists[index].num_rte = num_rte;
+#ifdef CONFIG_NUMA
+	iosapic_lists[index].node = MAX_NUMNODES;
+#endif
+	spin_lock_init(&iosapic_lists[index].lock);
+	spin_unlock_irqrestore(&iosapic_lock, flags);
+
+	if ((gsi_base == 0) && pcat_compat) {
+		/*
+		 * Map the legacy ISA devices into the IOSAPIC data.  Some of
+		 * these may get reprogrammed later on with data from the ACPI
+		 * Interrupt Source Override table.
+		 */
+		for (isa_irq = 0; isa_irq < 16; ++isa_irq)
+			iosapic_override_isa_irq(isa_irq, isa_irq,
+						 IOSAPIC_POL_HIGH,
+						 IOSAPIC_EDGE);
+	}
+	return 0;
+}
+
+int iosapic_remove(unsigned int gsi_base)
+{
+	int i, irq, index, err = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&iosapic_lock, flags);
+	index = find_iosapic(gsi_base);
+	if (index < 0) {
+		printk(KERN_WARNING "%s: No IOSAPIC for GSI base %u\n",
+		       __func__, gsi_base);
+		goto out;
+	}
+
+	if (iosapic_lists[index].rtes_inuse) {
+		err = -EBUSY;
+		printk(KERN_WARNING "%s: IOSAPIC for GSI base %u is busy\n",
+		       __func__, gsi_base);
+		goto out;
+	}
+
+	for (i = gsi_base; i < gsi_base + iosapic_lists[index].num_rte; i++) {
+		irq = __gsi_to_irq(i);
+		if (irq < 0)
+			continue;
+
+		err = iosapic_delete_rte(irq, i);
+		if (err)
+			goto out;
+	}
+
+	iounmap(iosapic_lists[index].addr);
+	iosapic_free(index);
+ out:
+	spin_unlock_irqrestore(&iosapic_lock, flags);
+	return err;
+}
+
+#ifdef CONFIG_NUMA
+void map_iosapic_to_node(unsigned int gsi_base, int node)
+{
+	int index;
+
+	index = find_iosapic(gsi_base);
+	if (index < 0) {
+		printk(KERN_WARNING "%s: No IOSAPIC for GSI %u\n",
+		       __func__, gsi_base);
+		return;
+	}
+	iosapic_lists[index].node = node;
+	return;
+}
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /*
+ *	linux/arch/ia64/kernel/irq.c
+ *
+ *	Copyright (C) 1992, 1998 Linus Torvalds, Ingo Molnar
+ *
+ * This file contains the code used by various IRQ handling routines:
+ * asking for different IRQs should be done through these routines
+ * instead of just grabbing them. Thus setups with different IRQ numbers
+ * shouldn't result in any weird surprises, and installing new handlers
+ * should be easier.
+ *
+ * Copyright (C) Ashok Raj<ashok.raj@intel.com>, Intel Corporation 2004
+ *
+ * 4/14/2004: Added code to handle cpu migration and do safe irq
+ *			migration without losing interrupts for iosapic
+ *			architecture.
+ */
+
+#include <asm/delay.h>
+#include <asm/uaccess.h>
+#include <linux/module.h>
+#include <linux/seq_file.h>
+#include <linux/interrupt.h>
+#include <linux/kernel_stat.h>
+
+#include <asm/mca.h>
+
+/*
+ * 'what should we do if we get a hw irq event on an illegal vector'.
+ * each architecture has to answer this themselves.
+ */
+void ack_bad_irq(unsigned int i

@@ -1,654 +1,260 @@
-/*
- * Copyright 2014 IBM Corp.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
- */
-
-#include <linux/kernel.h>
-#include <linux/device.h>
-#include <linux/sysfs.h>
-#include <linux/pci_regs.h>
-
-#include "cxl.h"
-
-#define to_afu_chardev_m(d) dev_get_drvdata(d)
-
-/*********  Adapter attributes  **********************************************/
-
-static ssize_t caia_version_show(struct device *device,
-				 struct device_attribute *attr,
-				 char *buf)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%i.%i\n", adapter->caia_major,
-			 adapter->caia_minor);
-}
-
-static ssize_t psl_revision_show(struct device *device,
-				 struct device_attribute *attr,
-				 char *buf)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%i\n", adapter->psl_rev);
-}
-
-static ssize_t base_image_show(struct device *device,
-			       struct device_attribute *attr,
-			       char *buf)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%i\n", adapter->base_image);
-}
-
-static ssize_t image_loaded_show(struct device *device,
-				 struct device_attribute *attr,
-				 char *buf)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-
-	if (adapter->user_image_loaded)
-		return scnprintf(buf, PAGE_SIZE, "user\n");
-	return scnprintf(buf, PAGE_SIZE, "factory\n");
-}
-
-static ssize_t reset_adapter_store(struct device *device,
-				   struct device_attribute *attr,
-				   const char *buf, size_t count)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-	int rc;
-	int val;
-
-	rc = sscanf(buf, "%i", &val);
-	if ((rc != 1) || (val != 1))
-		return -EINVAL;
-
-	if ((rc = cxl_reset(adapter)))
-		return rc;
-	return count;
-}
-
-static ssize_t load_image_on_perst_show(struct device *device,
-				 struct device_attribute *attr,
-				 char *buf)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-
-	if (!adapter->perst_loads_image)
-		return scnprintf(buf, PAGE_SIZE, "none\n");
-
-	if (adapter->perst_select_user)
-		return scnprintf(buf, PAGE_SIZE, "user\n");
-	return scnprintf(buf, PAGE_SIZE, "factory\n");
-}
-
-static ssize_t load_image_on_perst_store(struct device *device,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-	int rc;
-
-	if (!strncmp(buf, "none", 4))
-		adapter->perst_loads_image = false;
-	else if (!strncmp(buf, "user", 4)) {
-		adapter->perst_select_user = true;
-		adapter->perst_loads_image = true;
-	} else if (!strncmp(buf, "factory", 7)) {
-		adapter->perst_select_user = false;
-		adapter->perst_loads_image = true;
-	} else
-		return -EINVAL;
-
-	if ((rc = cxl_update_image_control(adapter)))
-		return rc;
-
-	return count;
-}
-
-static ssize_t perst_reloads_same_image_show(struct device *device,
-				 struct device_attribute *attr,
-				 char *buf)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%i\n", adapter->perst_same_image);
-}
-
-static ssize_t perst_reloads_same_image_store(struct device *device,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
-{
-	struct cxl *adapter = to_cxl_adapter(device);
-	int rc;
-	int val;
-
-	rc = sscanf(buf, "%i", &val);
-	if ((rc != 1) || !(val == 1 || val == 0))
-		return -EINVAL;
-
-	adapter->perst_same_image = (val == 1 ? true : false);
-	return count;
-}
-
-static struct device_attribute adapter_attrs[] = {
-	__ATTR_RO(caia_version),
-	__ATTR_RO(psl_revision),
-	__ATTR_RO(base_image),
-	__ATTR_RO(image_loaded),
-	__ATTR_RW(load_image_on_perst),
-	__ATTR_RW(perst_reloads_same_image),
-	__ATTR(reset, S_IWUSR, NULL, reset_adapter_store),
-};
-
-
-/*********  AFU master specific attributes  **********************************/
-
-static ssize_t mmio_size_show_master(struct device *device,
-				     struct device_attribute *attr,
-				     char *buf)
-{
-	struct cxl_afu *afu = to_afu_chardev_m(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", afu->adapter->ps_size);
-}
-
-static ssize_t pp_mmio_off_show(struct device *device,
-				struct device_attribute *attr,
-				char *buf)
-{
-	struct cxl_afu *afu = to_afu_chardev_m(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", afu->pp_offset);
-}
-
-static ssize_t pp_mmio_len_show(struct device *device,
-				struct device_attribute *attr,
-				char *buf)
-{
-	struct cxl_afu *afu = to_afu_chardev_m(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", afu->pp_size);
-}
-
-static struct device_attribute afu_master_attrs[] = {
-	__ATTR(mmio_size, S_IRUGO, mmio_size_show_master, NULL),
-	__ATTR_RO(pp_mmio_off),
-	__ATTR_RO(pp_mmio_len),
-};
-
-
-/*********  AFU attributes  **************************************************/
-
-static ssize_t mmio_size_show(struct device *device,
-			      struct device_attribute *attr,
-			      char *buf)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-
-	if (afu->pp_size)
-		return scnprintf(buf, PAGE_SIZE, "%llu\n", afu->pp_size);
-	return scnprintf(buf, PAGE_SIZE, "%llu\n", afu->adapter->ps_size);
-}
-
-static ssize_t reset_store_afu(struct device *device,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-	int rc;
-
-	/* Not safe to reset if it is currently in use */
-	mutex_lock(&afu->contexts_lock);
-	if (!idr_is_empty(&afu->contexts_idr)) {
-		rc = -EBUSY;
-		goto err;
-	}
-
-	if ((rc = __cxl_afu_reset(afu)))
-		goto err;
-
-	rc = count;
-err:
-	mutex_unlock(&afu->contexts_lock);
-	return rc;
-}
-
-static ssize_t irqs_min_show(struct device *device,
-			     struct device_attribute *attr,
-			     char *buf)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%i\n", afu->pp_irqs);
-}
-
-static ssize_t irqs_max_show(struct device *device,
-				  struct device_attribute *attr,
-				  char *buf)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-
-	return scnprintf(buf, PAGE_SIZE, "%i\n", afu->irqs_max);
-}
-
-static ssize_t irqs_max_store(struct device *device,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-	ssize_t ret;
-	int irqs_max;
-
-	ret = sscanf(buf, "%i", &irqs_max);
-	if (ret != 1)
-		return -EINVAL;
-
-	if (irqs_max < afu->pp_irqs)
-		return -EINVAL;
-
-	if (irqs_max > afu->adapter->user_irqs)
-		return -EINVAL;
-
-	afu->irqs_max = irqs_max;
-	return count;
-}
-
-static ssize_t modes_supported_show(struct device *device,
-				    struct device_attribute *attr, char *buf)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-	char *p = buf, *end = buf + PAGE_SIZE;
-
-	if (afu->modes_supported & CXL_MODE_DEDICATED)
-		p += scnprintf(p, end - p, "dedicated_process\n");
-	if (afu->modes_supported & CXL_MODE_DIRECTED)
-		p += scnprintf(p, end - p, "afu_directed\n");
-	return (p - buf);
-}
-
-static ssize_t prefault_mode_show(struct device *device,
-				  struct device_attribute *attr,
-				  char *buf)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-
-	switch (afu->prefault_mode) {
-	case CXL_PREFAULT_WED:
-		return scnprintf(buf, PAGE_SIZE, "work_element_descriptor\n");
-	case CXL_PREFAULT_ALL:
-		return scnprintf(buf, PAGE_SIZE, "all\n");
-	default:
-		return scnprintf(buf, PAGE_SIZE, "none\n");
-	}
-}
-
-static ssize_t prefault_mode_store(struct device *device,
-			  struct device_attribute *attr,
-			  const char *buf, size_t count)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-	enum prefault_modes mode = -1;
-
-	if (!strncmp(buf, "work_element_descriptor", 23))
-		mode = CXL_PREFAULT_WED;
-	if (!strncmp(buf, "all", 3))
-		mode = CXL_PREFAULT_ALL;
-	if (!strncmp(buf, "none", 4))
-		mode = CXL_PREFAULT_NONE;
-
-	if (mode == -1)
-		return -EINVAL;
-
-	afu->prefault_mode = mode;
-	return count;
-}
-
-static ssize_t mode_show(struct device *device,
-			 struct device_attribute *attr,
-			 char *buf)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-
-	if (afu->current_mode == CXL_MODE_DEDICATED)
-		return scnprintf(buf, PAGE_SIZE, "dedicated_process\n");
-	if (afu->current_mode == CXL_MODE_DIRECTED)
-		return scnprintf(buf, PAGE_SIZE, "afu_directed\n");
-	return scnprintf(buf, PAGE_SIZE, "none\n");
-}
-
-static ssize_t mode_store(struct device *device, struct device_attribute *attr,
-			  const char *buf, size_t count)
-{
-	struct cxl_afu *afu = to_cxl_afu(device);
-	int old_mode, mode = -1;
-	int rc = -EBUSY;
-
-	/* can't change this if we have a user */
-	mutex_lock(&afu->contexts_lock);
-	if (!idr_is_empty(&afu->contexts_idr))
-		goto err;
-
-	if (!strncmp(buf, "dedicated_process", 17))
-		mode = CXL_MODE_DEDICATED;
-	if (!strncmp(buf, "afu_directed", 12))
-		mode = CXL_MODE_DIRECTED;
-	if (!strncmp(buf, "none", 4))
-		mode = 0;
-
-	if (mode == -1) {
-		rc = -EINVAL;
-		goto err;
-	}
-
-	/*
-	 * cxl_afu_deactivate_mode needs to be done outside the lock, prevent
-	 * other contexts coming in before we are ready:
-	 */
-	old_mode = afu->current_mode;
-	afu->current_mode = 0;
-	afu->num_procs = 0;
-
-	mutex_unlock(&afu->contexts_lock);
-
-	if ((rc = _cxl_afu_deactivate_mode(afu, old_mode)))
-		return rc;
-	if ((rc = cxl_afu_activate_mode(afu, mode)))
-		return rc;
-
-	return count;
-err:
-	mutex_unlock(&afu->contexts_lock);
-	return rc;
-}
-
-static ssize_t api_version_show(struct device *device,
-				struct device_attribute *attr,
-				char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%i\n", CXL_API_VERSION);
-}
-
-static ssize_t api_version_compatible_show(struct device *device,
-					   struct device_attribute *attr,
-					   char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%i\n", CXL_API_VERSION_COMPATIBLE);
-}
-
-static ssize_t afu_eb_read(struct file *filp, struct kobject *kobj,
-			       struct bin_attribute *bin_attr, char *buf,
-			       loff_t off, size_t count)
-{
-	struct cxl_afu *afu = to_cxl_afu(container_of(kobj,
-						      struct device, kobj));
-
-	return cxl_afu_read_err_buffer(afu, buf, off, count);
-}
-
-static struct device_attribute afu_attrs[] = {
-	__ATTR_RO(mmio_size),
-	__ATTR_RO(irqs_min),
-	__ATTR_RW(irqs_max),
-	__ATTR_RO(modes_supported),
-	__ATTR_RW(mode),
-	__ATTR_RW(prefault_mode),
-	__ATTR_RO(api_version),
-	__ATTR_RO(api_version_compatible),
-	__ATTR(reset, S_IWUSR, NULL, reset_store_afu),
-};
-
-int cxl_sysfs_adapter_add(struct cxl *adapter)
-{
-	int i, rc;
-
-	for (i = 0; i < ARRAY_SIZE(adapter_attrs); i++) {
-		if ((rc = device_create_file(&adapter->dev, &adapter_attrs[i])))
-			goto err;
-	}
-	return 0;
-err:
-	for (i--; i >= 0; i--)
-		device_remove_file(&adapter->dev, &adapter_attrs[i]);
-	return rc;
-}
-void cxl_sysfs_adapter_remove(struct cxl *adapter)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(adapter_attrs); i++)
-		device_remove_file(&adapter->dev, &adapter_attrs[i]);
-}
-
-struct afu_config_record {
-	struct kobject kobj;
-	struct bin_attribute config_attr;
-	struct list_head list;
-	int cr;
-	u16 device;
-	u16 vendor;
-	u32 class;
-};
-
-#define to_cr(obj) container_of(obj, struct afu_config_record, kobj)
-
-static ssize_t vendor_show(struct kobject *kobj,
-			   struct kobj_attribute *attr, char *buf)
-{
-	struct afu_config_record *cr = to_cr(kobj);
-
-	return scnprintf(buf, PAGE_SIZE, "0x%.4x\n", cr->vendor);
-}
-
-static ssize_t device_show(struct kobject *kobj,
-			   struct kobj_attribute *attr, char *buf)
-{
-	struct afu_config_record *cr = to_cr(kobj);
-
-	return scnprintf(buf, PAGE_SIZE, "0x%.4x\n", cr->device);
-}
-
-static ssize_t class_show(struct kobject *kobj,
-			  struct kobj_attribute *attr, char *buf)
-{
-	struct afu_config_record *cr = to_cr(kobj);
-
-	return scnprintf(buf, PAGE_SIZE, "0x%.6x\n", cr->class);
-}
-
-static ssize_t afu_read_config(struct file *filp, struct kobject *kobj,
-			       struct bin_attribute *bin_attr, char *buf,
-			       loff_t off, size_t count)
-{
-	struct afu_config_record *cr = to_cr(kobj);
-	struct cxl_afu *afu = to_cxl_afu(container_of(kobj->parent, struct device, kobj));
-
-	u64 i, j, val;
-
-	for (i = 0; i < count;) {
-		val = cxl_afu_cr_read64(afu, cr->cr, off & ~0x7);
-		for (j = off & 0x7; j < 8 && i < count; i++, j++, off++)
-			buf[i] = (val >> (j * 8)) & 0xff;
-	}
-
-	return count;
-}
-
-static struct kobj_attribute vendor_attribute =
-	__ATTR_RO(vendor);
-static struct kobj_attribute device_attribute =
-	__ATTR_RO(device);
-static struct kobj_attribute class_attribute =
-	__ATTR_RO(class);
-
-static struct attribute *afu_cr_attrs[] = {
-	&vendor_attribute.attr,
-	&device_attribute.attr,
-	&class_attribute.attr,
-	NULL,
-};
-
-static void release_afu_config_record(struct kobject *kobj)
-{
-	struct afu_config_record *cr = to_cr(kobj);
-
-	kfree(cr);
-}
-
-static struct kobj_type afu_config_record_type = {
-	.sysfs_ops = &kobj_sysfs_ops,
-	.release = release_afu_config_record,
-	.default_attrs = afu_cr_attrs,
-};
-
-static struct afu_config_record *cxl_sysfs_afu_new_cr(struct cxl_afu *afu, int cr_idx)
-{
-	struct afu_config_record *cr;
-	int rc;
-
-	cr = kzalloc(sizeof(struct afu_config_record), GFP_KERNEL);
-	if (!cr)
-		return ERR_PTR(-ENOMEM);
-
-	cr->cr = cr_idx;
-	cr->device = cxl_afu_cr_read16(afu, cr_idx, PCI_DEVICE_ID);
-	cr->vendor = cxl_afu_cr_read16(afu, cr_idx, PCI_VENDOR_ID);
-	cr->class = cxl_afu_cr_read32(afu, cr_idx, PCI_CLASS_REVISION) >> 8;
-
-	/*
-	 * Export raw AFU PCIe like config record. For now this is read only by
-	 * root - we can expand that later to be readable by non-root and maybe
-	 * even writable provided we have a good use-case. Once we suport
-	 * exposing AFUs through a virtual PHB they will get that for free from
-	 * Linux' PCI infrastructure, but until then it's not clear that we
-	 * need it for anything since the main use case is just identifying
-	 * AFUs, which can be done via the vendor, device and class attributes.
-	 */
-	sysfs_bin_attr_init(&cr->config_attr);
-	cr->config_attr.attr.name = "config";
-	cr->config_attr.attr.mode = S_IRUSR;
-	cr->config_attr.size = afu->crs_len;
-	cr->config_attr.read = afu_read_config;
-
-	rc = kobject_init_and_add(&cr->kobj, &afu_config_record_type,
-				  &afu->dev.kobj, "cr%i", cr->cr);
-	if (rc)
-		goto err1;
-
-	rc = sysfs_create_bin_file(&cr->kobj, &cr->config_attr);
-	if (rc)
-		goto err1;
-
-	rc = kobject_uevent(&cr->kobj, KOBJ_ADD);
-	if (rc)
-		goto err2;
-
-	return cr;
-err2:
-	sysfs_remove_bin_file(&cr->kobj, &cr->config_attr);
-err1:
-	kobject_put(&cr->kobj);
-	return ERR_PTR(rc);
-}
-
-void cxl_sysfs_afu_remove(struct cxl_afu *afu)
-{
-	struct afu_config_record *cr, *tmp;
-	int i;
-
-	/* remove the err buffer bin attribute */
-	if (afu->eb_len)
-		device_remove_bin_file(&afu->dev, &afu->attr_eb);
-
-	for (i = 0; i < ARRAY_SIZE(afu_attrs); i++)
-		device_remove_file(&afu->dev, &afu_attrs[i]);
-
-	list_for_each_entry_safe(cr, tmp, &afu->crs, list) {
-		sysfs_remove_bin_file(&cr->kobj, &cr->config_attr);
-		kobject_put(&cr->kobj);
-	}
-}
-
-int cxl_sysfs_afu_add(struct cxl_afu *afu)
-{
-	struct afu_config_record *cr;
-	int i, rc;
-
-	INIT_LIST_HEAD(&afu->crs);
-
-	for (i = 0; i < ARRAY_SIZE(afu_attrs); i++) {
-		if ((rc = device_create_file(&afu->dev, &afu_attrs[i])))
-			goto err;
-	}
-
-	/* conditionally create the add the binary file for error info buffer */
-	if (afu->eb_len) {
-		sysfs_attr_init(&afu->attr_eb.attr);
-
-		afu->attr_eb.attr.name = "afu_err_buff";
-		afu->attr_eb.attr.mode = S_IRUGO;
-		afu->attr_eb.size = afu->eb_len;
-		afu->attr_eb.read = afu_eb_read;
-
-		rc = device_create_bin_file(&afu->dev, &afu->attr_eb);
-		if (rc) {
-			dev_err(&afu->dev,
-				"Unable to create eb attr for the afu. Err(%d)\n",
-				rc);
-			goto err;
-		}
-	}
-
-	for (i = 0; i < afu->crs_num; i++) {
-		cr = cxl_sysfs_afu_new_cr(afu, i);
-		if (IS_ERR(cr)) {
-			rc = PTR_ERR(cr);
-			goto err1;
-		}
-		list_add(&cr->list, &afu->crs);
-	}
-
-	return 0;
-
-err1:
-	cxl_sysfs_afu_remove(afu);
-	return rc;
-err:
-	/* reset the eb_len as we havent created the bin attr */
-	afu->eb_len = 0;
-
-	for (i--; i >= 0; i--)
-		device_remove_file(&afu->dev, &afu_attrs[i]);
-	return rc;
-}
-
-int cxl_sysfs_afu_m_add(struct cxl_afu *afu)
-{
-	int i, rc;
-
-	for (i = 0; i < ARRAY_SIZE(afu_master_attrs); i++) {
-		if ((rc = device_create_file(afu->chardev_m, &afu_master_attrs[i])))
-			goto err;
-	}
-
-	return 0;
-
-err:
-	for (i--; i >= 0; i--)
-		device_remove_file(afu->chardev_m, &afu_master_attrs[i]);
-	return rc;
-}
-
-void cxl_sysfs_afu_m_remove(struct cxl_afu *afu)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(afu_master_attrs); i++)
-		device_remove_file(afu->chardev_m, &afu_master_attrs[i]);
-}
+ne PB1_PIF_PDNB_OVERRIDE_15__RXEN_OVERRIDE_EN_15__SHIFT 0x8
+#define PB1_PIF_PDNB_OVERRIDE_15__RXEN_OVERRIDE_VAL_15_MASK 0x200
+#define PB1_PIF_PDNB_OVERRIDE_15__RXEN_OVERRIDE_VAL_15__SHIFT 0x9
+#define PB1_PIF_PDNB_OVERRIDE_15__TXPWR_OVERRIDE_EN_15_MASK 0x400
+#define PB1_PIF_PDNB_OVERRIDE_15__TXPWR_OVERRIDE_EN_15__SHIFT 0xa
+#define PB1_PIF_PDNB_OVERRIDE_15__TXPWR_OVERRIDE_VAL_15_MASK 0x3800
+#define PB1_PIF_PDNB_OVERRIDE_15__TXPWR_OVERRIDE_VAL_15__SHIFT 0xb
+#define PB1_PIF_PDNB_OVERRIDE_15__RXPWR_OVERRIDE_EN_15_MASK 0x4000
+#define PB1_PIF_PDNB_OVERRIDE_15__RXPWR_OVERRIDE_EN_15__SHIFT 0xe
+#define PB1_PIF_PDNB_OVERRIDE_15__RXPWR_OVERRIDE_VAL_15_MASK 0x38000
+#define PB1_PIF_PDNB_OVERRIDE_15__RXPWR_OVERRIDE_VAL_15__SHIFT 0xf
+#define PB1_PIF_SEQ_STATUS_8__SEQ_CALIBRATION_8_MASK 0x1
+#define PB1_PIF_SEQ_STATUS_8__SEQ_CALIBRATION_8__SHIFT 0x0
+#define PB1_PIF_SEQ_STATUS_8__SEQ_RXDETECT_8_MASK 0x2
+#define PB1_PIF_SEQ_STATUS_8__SEQ_RXDETECT_8__SHIFT 0x1
+#define PB1_PIF_SEQ_STATUS_8__SEQ_EXIT_L1_TO_L0S_8_MASK 0x4
+#define PB1_PIF_SEQ_STATUS_8__SEQ_EXIT_L1_TO_L0S_8__SHIFT 0x2
+#define PB1_PIF_SEQ_STATUS_8__SEQ_EXIT_L1_TO_L0_8_MASK 0x8
+#define PB1_PIF_SEQ_STATUS_8__SEQ_EXIT_L1_TO_L0_8__SHIFT 0x3
+#define PB1_PIF_SEQ_STATUS_8__SEQ_ENTER_L1_FROM_L0S_8_MASK 0x10
+#define PB1_PIF_SEQ_STATUS_8__SEQ_ENTER_L1_FROM_L0S_8__SHIFT 0x4
+#define PB1_PIF_SEQ_STATUS_8__SEQ_ENTER_L1_FROM_L0_8_MASK 0x20
+#define PB1_PIF_SEQ_STATUS_8__SEQ_ENTER_L1_FROM_L0_8__SHIFT 0x5
+#define PB1_PIF_SEQ_STATUS_8__SEQ_SPEED_CHANGE_8_MASK 0x40
+#define PB1_PIF_SEQ_STATUS_8__SEQ_SPEED_CHANGE_8__SHIFT 0x6
+#define PB1_PIF_SEQ_STATUS_8__SEQ_PHASE_8_MASK 0x700
+#define PB1_PIF_SEQ_STATUS_8__SEQ_PHASE_8__SHIFT 0x8
+#define PB1_PIF_SEQ_STATUS_9__SEQ_CALIBRATION_9_MASK 0x1
+#define PB1_PIF_SEQ_STATUS_9__SEQ_CALIBRATION_9__SHIFT 0x0
+#define PB1_PIF_SEQ_STATUS_9__SEQ_RXDETECT_9_MASK 0x2
+#define PB1_PIF_SEQ_STATUS_9__SEQ_RXDETECT_9__SHIFT 0x1
+#define PB1_PIF_SEQ_STATUS_9__SEQ_EXIT_L1_TO_L0S_9_MASK 0x4
+#define PB1_PIF_SEQ_STATUS_9__SEQ_EXIT_L1_TO_L0S_9__SHIFT 0x2
+#define PB1_PIF_SEQ_STATUS_9__SEQ_EXIT_L1_TO_L0_9_MASK 0x8
+#define PB1_PIF_SEQ_STATUS_9__SEQ_EXIT_L1_TO_L0_9__SHIFT 0x3
+#define PB1_PIF_SEQ_STATUS_9__SEQ_ENTER_L1_FROM_L0S_9_MASK 0x10
+#define PB1_PIF_SEQ_STATUS_9__SEQ_ENTER_L1_FROM_L0S_9__SHIFT 0x4
+#define PB1_PIF_SEQ_STATUS_9__SEQ_ENTER_L1_FROM_L0_9_MASK 0x20
+#define PB1_PIF_SEQ_STATUS_9__SEQ_ENTER_L1_FROM_L0_9__SHIFT 0x5
+#define PB1_PIF_SEQ_STATUS_9__SEQ_SPEED_CHANGE_9_MASK 0x40
+#define PB1_PIF_SEQ_STATUS_9__SEQ_SPEED_CHANGE_9__SHIFT 0x6
+#define PB1_PIF_SEQ_STATUS_9__SEQ_PHASE_9_MASK 0x700
+#define PB1_PIF_SEQ_STATUS_9__SEQ_PHASE_9__SHIFT 0x8
+#define PB1_PIF_SEQ_STATUS_10__SEQ_CALIBRATION_10_MASK 0x1
+#define PB1_PIF_SEQ_STATUS_10__SEQ_CALIBRATION_10__SHIFT 0x0
+#define PB1_PIF_SEQ_STATUS_10__SEQ_RXDETECT_10_MASK 0x2
+#define PB1_PIF_SEQ_STATUS_10__SEQ_RXDETECT_10__SHIFT 0x1
+#define PB1_PIF_SEQ_STATUS_10__SEQ_EXIT_L1_TO_L0S_10_MASK 0x4
+#define PB1_PIF_SEQ_STATUS_10__SEQ_EXIT_L1_TO_L0S_10__SHIFT 0x2
+#define PB1_PIF_SEQ_STATUS_10__SEQ_EXIT_L1_TO_L0_10_MASK 0x8
+#define PB1_PIF_SEQ_STATUS_10__SEQ_EXIT_L1_TO_L0_10__SHIFT 0x3
+#define PB1_PIF_SEQ_STATUS_10__SEQ_ENTER_L1_FROM_L0S_10_MASK 0x10
+#define PB1_PIF_SEQ_STATUS_10__SEQ_ENTER_L1_FROM_L0S_10__SHIFT 0x4
+#define PB1_PIF_SEQ_STATUS_10__SEQ_ENTER_L1_FROM_L0_10_MASK 0x20
+#define PB1_PIF_SEQ_STATUS_10__SEQ_ENTER_L1_FROM_L0_10__SHIFT 0x5
+#define PB1_PIF_SEQ_STATUS_10__SEQ_SPEED_CHANGE_10_MASK 0x40
+#define PB1_PIF_SEQ_STATUS_10__SEQ_SPEED_CHANGE_10__SHIFT 0x6
+#define PB1_PIF_SEQ_STATUS_10__SEQ_PHASE_10_MASK 0x700
+#define PB1_PIF_SEQ_STATUS_10__SEQ_PHASE_10__SHIFT 0x8
+#define PB1_PIF_SEQ_STATUS_11__SEQ_CALIBRATION_11_MASK 0x1
+#define PB1_PIF_SEQ_STATUS_11__SEQ_CALIBRATION_11__SHIFT 0x0
+#define PB1_PIF_SEQ_STATUS_11__SEQ_RXDETECT_11_MASK 0x2
+#define PB1_PIF_SEQ_STATUS_11__SEQ_RXDETECT_11__SHIFT 0x1
+#define PB1_PIF_SEQ_STATUS_11__SEQ_EXIT_L1_TO_L0S_11_MASK 0x4
+#define PB1_PIF_SEQ_STATUS_11__SEQ_EXIT_L1_TO_L0S_11__SHIFT 0x2
+#define PB1_PIF_SEQ_STATUS_11__SEQ_EXIT_L1_TO_L0_11_MASK 0x8
+#define PB1_PIF_SEQ_STATUS_11__SEQ_EXIT_L1_TO_L0_11__SHIFT 0x3
+#define PB1_PIF_SEQ_STATUS_11__SEQ_ENTER_L1_FROM_L0S_11_MASK 0x10
+#define PB1_PIF_SEQ_STATUS_11__SEQ_ENTER_L1_FROM_L0S_11__SHIFT 0x4
+#define PB1_PIF_SEQ_STATUS_11__SEQ_ENTER_L1_FROM_L0_11_MASK 0x20
+#define PB1_PIF_SEQ_STATUS_11__SEQ_ENTER_L1_FROM_L0_11__SHIFT 0x5
+#define PB1_PIF_SEQ_STATUS_11__SEQ_SPEED_CHANGE_11_MASK 0x40
+#define PB1_PIF_SEQ_STATUS_11__SEQ_SPEED_CHANGE_11__SHIFT 0x6
+#define PB1_PIF_SEQ_STATUS_11__SEQ_PHASE_11_MASK 0x700
+#define PB1_PIF_SEQ_STATUS_11__SEQ_PHASE_11__SHIFT 0x8
+#define PB1_PIF_SEQ_STATUS_12__SEQ_CALIBRATION_12_MASK 0x1
+#define PB1_PIF_SEQ_STATUS_12__SEQ_CALIBRATION_12__SHIFT 0x0
+#define PB1_PIF_SEQ_STATUS_12__SEQ_RXDETECT_12_MASK 0x2
+#define PB1_PIF_SEQ_STATUS_12__SEQ_RXDETECT_12__SHIFT 0x1
+#define PB1_PIF_SEQ_STATUS_12__SEQ_EXIT_L1_TO_L0S_12_MASK 0x4
+#define PB1_PIF_SEQ_STATUS_12__SEQ_EXIT_L1_TO_L0S_12__SHIFT 0x2
+#define PB1_PIF_SEQ_STATUS_12__SEQ_EXIT_L1_TO_L0_12_MASK 0x8
+#define PB1_PIF_SEQ_STATUS_12__SEQ_EXIT_L1_TO_L0_12__SHIFT 0x3
+#define PB1_PIF_SEQ_STATUS_12__SEQ_ENTER_L1_FROM_L0S_12_MASK 0x10
+#define PB1_PIF_SEQ_STATUS_12__SEQ_ENTER_L1_FROM_L0S_12__SHIFT 0x4
+#define PB1_PIF_SEQ_STATUS_12__SEQ_ENTER_L1_FROM_L0_12_MASK 0x20
+#define PB1_PIF_SEQ_STATUS_12__SEQ_ENTER_L1_FROM_L0_12__SHIFT 0x5
+#define PB1_PIF_SEQ_STATUS_12__SEQ_SPEED_CHANGE_12_MASK 0x40
+#define PB1_PIF_SEQ_STATUS_12__SEQ_SPEED_CHANGE_12__SHIFT 0x6
+#define PB1_PIF_SEQ_STATUS_12__SEQ_PHASE_12_MASK 0x700
+#define PB1_PIF_SEQ_STATUS_12__SEQ_PHASE_12__SHIFT 0x8
+#define PB1_PIF_SEQ_STATUS_13__SEQ_CALIBRATION_13_MASK 0x1
+#define PB1_PIF_SEQ_STATUS_13__SEQ_CALIBRATION_13__SHIFT 0x0
+#define PB1_PIF_SEQ_STATUS_13__SEQ_RXDETECT_13_MASK 0x2
+#define PB1_PIF_SEQ_STATUS_13__SEQ_RXDETECT_13__SHIFT 0x1
+#define PB1_PIF_SEQ_STATUS_13__SEQ_EXIT_L1_TO_L0S_13_MASK 0x4
+#define PB1_PIF_SEQ_STATUS_13__SEQ_EXIT_L1_TO_L0S_13__SHIFT 0x2
+#define PB1_PIF_SEQ_STATUS_13__SEQ_EXIT_L1_TO_L0_13_MASK 0x8
+#define PB1_PIF_SEQ_STATUS_13__SEQ_EXIT_L1_TO_L0_13__SHIFT 0x3
+#define PB1_PIF_SEQ_STATUS_13__SEQ_ENTER_L1_FROM_L0S_13_MASK 0x10
+#define PB1_PIF_SEQ_STATUS_13__SEQ_ENTER_L1_FROM_L0S_13__SHIFT 0x4
+#define PB1_PIF_SEQ_STATUS_13__SEQ_ENTER_L1_FROM_L0_13_MASK 0x20
+#define PB1_PIF_SEQ_STATUS_13__SEQ_ENTER_L1_FROM_L0_13__SHIFT 0x5
+#define PB1_PIF_SEQ_STATUS_13__SEQ_SPEED_CHANGE_13_MASK 0x40
+#define PB1_PIF_SEQ_STATUS_13__SEQ_SPEED_CHANGE_13__SHIFT 0x6
+#define PB1_PIF_SEQ_STATUS_13__SEQ_PHASE_13_MASK 0x700
+#define PB1_PIF_SEQ_STATUS_13__SEQ_PHASE_13__SHIFT 0x8
+#define PB1_PIF_SEQ_STATUS_14__SEQ_CALIBRATION_14_MASK 0x1
+#define PB1_PIF_SEQ_STATUS_14__SEQ_CALIBRATION_14__SHIFT 0x0
+#define PB1_PIF_SEQ_STATUS_14__SEQ_RXDETECT_14_MASK 0x2
+#define PB1_PIF_SEQ_STATUS_14__SEQ_RXDETECT_14__SHIFT 0x1
+#define PB1_PIF_SEQ_STATUS_14__SEQ_EXIT_L1_TO_L0S_14_MASK 0x4
+#define PB1_PIF_SEQ_STATUS_14__SEQ_EXIT_L1_TO_L0S_14__SHIFT 0x2
+#define PB1_PIF_SEQ_STATUS_14__SEQ_EXIT_L1_TO_L0_14_MASK 0x8
+#define PB1_PIF_SEQ_STATUS_14__SEQ_EXIT_L1_TO_L0_14__SHIFT 0x3
+#define PB1_PIF_SEQ_STATUS_14__SEQ_ENTER_L1_FROM_L0S_14_MASK 0x10
+#define PB1_PIF_SEQ_STATUS_14__SEQ_ENTER_L1_FROM_L0S_14__SHIFT 0x4
+#define PB1_PIF_SEQ_STATUS_14__SEQ_ENTER_L1_FROM_L0_14_MASK 0x20
+#define PB1_PIF_SEQ_STATUS_14__SEQ_ENTER_L1_FROM_L0_14__SHIFT 0x5
+#define PB1_PIF_SEQ_STATUS_14__SEQ_SPEED_CHANGE_14_MASK 0x40
+#define PB1_PIF_SEQ_STATUS_14__SEQ_SPEED_CHANGE_14__SHIFT 0x6
+#define PB1_PIF_SEQ_STATUS_14__SEQ_PHASE_14_MASK 0x700
+#define PB1_PIF_SEQ_STATUS_14__SEQ_PHASE_14__SHIFT 0x8
+#define PB1_PIF_SEQ_STATUS_15__SEQ_CALIBRATION_15_MASK 0x1
+#define PB1_PIF_SEQ_STATUS_15__SEQ_CALIBRATION_15__SHIFT 0x0
+#define PB1_PIF_SEQ_STATUS_15__SEQ_RXDETECT_15_MASK 0x2
+#define PB1_PIF_SEQ_STATUS_15__SEQ_RXDETECT_15__SHIFT 0x1
+#define PB1_PIF_SEQ_STATUS_15__SEQ_EXIT_L1_TO_L0S_15_MASK 0x4
+#define PB1_PIF_SEQ_STATUS_15__SEQ_EXIT_L1_TO_L0S_15__SHIFT 0x2
+#define PB1_PIF_SEQ_STATUS_15__SEQ_EXIT_L1_TO_L0_15_MASK 0x8
+#define PB1_PIF_SEQ_STATUS_15__SEQ_EXIT_L1_TO_L0_15__SHIFT 0x3
+#define PB1_PIF_SEQ_STATUS_15__SEQ_ENTER_L1_FROM_L0S_15_MASK 0x10
+#define PB1_PIF_SEQ_STATUS_15__SEQ_ENTER_L1_FROM_L0S_15__SHIFT 0x4
+#define PB1_PIF_SEQ_STATUS_15__SEQ_ENTER_L1_FROM_L0_15_MASK 0x20
+#define PB1_PIF_SEQ_STATUS_15__SEQ_ENTER_L1_FROM_L0_15__SHIFT 0x5
+#define PB1_PIF_SEQ_STATUS_15__SEQ_SPEED_CHANGE_15_MASK 0x40
+#define PB1_PIF_SEQ_STATUS_15__SEQ_SPEED_CHANGE_15__SHIFT 0x6
+#define PB1_PIF_SEQ_STATUS_15__SEQ_PHASE_15_MASK 0x700
+#define PB1_PIF_SEQ_STATUS_15__SEQ_PHASE_15__SHIFT 0x8
+#define BIF_RFE_SNOOP_REG__REG_SNOOP_ARBITER_MASK 0x1
+#define BIF_RFE_SNOOP_REG__REG_SNOOP_ARBITER__SHIFT 0x0
+#define BIF_RFE_SNOOP_REG__REG_SNOOP_ALLMASTER_MASK 0x2
+#define BIF_RFE_SNOOP_REG__REG_SNOOP_ALLMASTER__SHIFT 0x1
+#define BIF_RFE_WARMRST_CNTL__REG_RST_warmRstRfeEn_MASK 0x1
+#define BIF_RFE_WARMRST_CNTL__REG_RST_warmRstRfeEn__SHIFT 0x0
+#define BIF_RFE_WARMRST_CNTL__REG_RST_warmRstImpEn_MASK 0x2
+#define BIF_RFE_WARMRST_CNTL__REG_RST_warmRstImpEn__SHIFT 0x1
+#define BIF_RFE_SOFTRST_CNTL__REG_RST_rstTimer_MASK 0xffff
+#define BIF_RFE_SOFTRST_CNTL__REG_RST_rstTimer__SHIFT 0x0
+#define BIF_RFE_SOFTRST_CNTL__REG_RST_softRstPropEn_MASK 0x40000000
+#define BIF_RFE_SOFTRST_CNTL__REG_RST_softRstPropEn__SHIFT 0x1e
+#define BIF_RFE_SOFTRST_CNTL__SoftRstReg_MASK 0x80000000
+#define BIF_RFE_SOFTRST_CNTL__SoftRstReg__SHIFT 0x1f
+#define BIF_RFE_IMPRST_CNTL__REG_RST_impEn_MASK 0x1
+#define BIF_RFE_IMPRST_CNTL__REG_RST_impEn__SHIFT 0x0
+#define BIF_RFE_CLIENT_SOFTRST_TRIGGER__CLIENT0_RFE_RFEWDBIF_rst_MASK 0x1
+#define BIF_RFE_CLIENT_SOFTRST_TRIGGER__CLIENT0_RFE_RFEWDBIF_rst__SHIFT 0x0
+#define BIF_RFE_CLIENT_SOFTRST_TRIGGER__CLIENT1_RFE_RFEWDBIF_rst_MASK 0x2
+#define BIF_RFE_CLIENT_SOFTRST_TRIGGER__CLIENT1_RFE_RFEWDBIF_rst__SHIFT 0x1
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__BU_rst_MASK 0x1
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__BU_rst__SHIFT 0x0
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__RWREG_RFEWDBIF_rst_MASK 0x2
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__RWREG_RFEWDBIF_rst__SHIFT 0x1
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__BX_rst_MASK 0x4
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__BX_rst__SHIFT 0x2
+#define BIF_PWDN_COMMAND__REG_BU_pw_cmd_MASK 0x1
+#define BIF_PWDN_COMMAND__REG_BU_pw_cmd__SHIFT 0x0
+#define BIF_PWDN_COMMAND__REG_RWREG_RFEWDBIF_pw_cmd_MASK 0x2
+#define BIF_PWDN_COMMAND__REG_RWREG_RFEWDBIF_pw_cmd__SHIFT 0x1
+#define BIF_PWDN_COMMAND__REG_BX_pw_cmd_MASK 0x4
+#define BIF_PWDN_COMMAND__REG_BX_pw_cmd__SHIFT 0x2
+#define BIF_PWDN_STATUS__BU_REG_pw_status_MASK 0x1
+#define BIF_PWDN_STATUS__BU_REG_pw_status__SHIFT 0x0
+#define BIF_PWDN_STATUS__RWREG_RFEWDBIF_REG_pw_status_MASK 0x2
+#define BIF_PWDN_STATUS__RWREG_RFEWDBIF_REG_pw_status__SHIFT 0x1
+#define BIF_PWDN_STATUS__BX_REG_pw_status_MASK 0x4
+#define BIF_PWDN_STATUS__BX_REG_pw_status__SHIFT 0x2
+#define BIF_RFE_MST_BU_CMDSTATUS__REG_BU_clkGate_timer_MASK 0xff
+#define BIF_RFE_MST_BU_CMDSTATUS__REG_BU_clkGate_timer__SHIFT 0x0
+#define BIF_RFE_MST_BU_CMDSTATUS__REG_BU_clkSetup_timer_MASK 0xf00
+#define BIF_RFE_MST_BU_CMDSTATUS__REG_BU_clkSetup_timer__SHIFT 0x8
+#define BIF_RFE_MST_BU_CMDSTATUS__REG_BU_timeout_timer_MASK 0xff0000
+#define BIF_RFE_MST_BU_CMDSTATUS__REG_BU_timeout_timer__SHIFT 0x10
+#define BIF_RFE_MST_BU_CMDSTATUS__BU_RFE_mstTimeout_MASK 0x1000000
+#define BIF_RFE_MST_BU_CMDSTATUS__BU_RFE_mstTimeout__SHIFT 0x18
+#define BIF_RFE_MST_RWREG_RFEWDBIF_CMDSTATUS__REG_RWREG_RFEWDBIF_clkGate_timer_MASK 0xff
+#define BIF_RFE_MST_RWREG_RFEWDBIF_CMDSTATUS__REG_RWREG_RFEWDBIF_clkGate_timer__SHIFT 0x0
+#define BIF_RFE_MST_RWREG_RFEWDBIF_CMDSTATUS__REG_RWREG_RFEWDBIF_clkSetup_timer_MASK 0xf00
+#define BIF_RFE_MST_RWREG_RFEWDBIF_CMDSTATUS__REG_RWREG_RFEWDBIF_clkSetup_timer__SHIFT 0x8
+#define BIF_RFE_MST_RWREG_RFEWDBIF_CMDSTATUS__REG_RWREG_RFEWDBIF_timeout_timer_MASK 0xff0000
+#define BIF_RFE_MST_RWREG_RFEWDBIF_CMDSTATUS__REG_RWREG_RFEWDBIF_timeout_timer__SHIFT 0x10
+#define BIF_RFE_MST_RWREG_RFEWDBIF_CMDSTATUS__RWREG_RFEWDBIF_RFE_mstTimeout_MASK 0x1000000
+#define BIF_RFE_MST_RWREG_RFEWDBIF_CMDSTATUS__RWREG_RFEWDBIF_RFE_mstTimeout__SHIFT 0x18
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_clkGate_timer_MASK 0xff
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_clkGate_timer__SHIFT 0x0
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_clkSetup_timer_MASK 0xf00
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_clkSetup_timer__SHIFT 0x8
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_timeout_timer_MASK 0xff0000
+#define BIF_RFE_MST_BX_CMDSTATUS__REG_BX_timeout_timer__SHIFT 0x10
+#define BIF_RFE_MST_BX_CMDSTATUS__BX_RFE_mstTimeout_MASK 0x1000000
+#define BIF_RFE_MST_BX_CMDSTATUS__BX_RFE_mstTimeout__SHIFT 0x18
+#define BIF_RFE_MST_TMOUT_STATUS__MstTmoutStatus_MASK 0x1
+#define BIF_RFE_MST_TMOUT_STATUS__MstTmoutStatus__SHIFT 0x0
+#define BIF_RFE_MMCFG_CNTL__CLIENT0_RFE_RFEWDBIF_MM_WR_TO_CFG_EN_MASK 0x1
+#define BIF_RFE_MMCFG_CNTL__CLIENT0_RFE_RFEWDBIF_MM_WR_TO_CFG_EN__SHIFT 0x0
+#define BIF_RFE_MMCFG_CNTL__CLIENT0_RFE_RFEWDBIF_MM_CFG_FUNC_SEL_MASK 0xe
+#define BIF_RFE_MMCFG_CNTL__CLIENT0_RFE_RFEWDBIF_MM_CFG_FUNC_SEL__SHIFT 0x1
+#define BIF_RFE_MMCFG_CNTL__CLIENT1_RFE_RFEWDBIF_MM_WR_TO_CFG_EN_MASK 0x10
+#define BIF_RFE_MMCFG_CNTL__CLIENT1_RFE_RFEWDBIF_MM_WR_TO_CFG_EN__SHIFT 0x4
+#define BIF_RFE_MMCFG_CNTL__CLIENT1_RFE_RFEWDBIF_MM_CFG_FUNC_SEL_MASK 0xe0
+#define BIF_RFE_MMCFG_CNTL__CLIENT1_RFE_RFEWDBIF_MM_CFG_FUNC_SEL__SHIFT 0x5
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_RX_IMPVAL_MASK 0x1e
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_RX_IMPVAL__SHIFT 0x1
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_RX_IMPVAL_EN_MASK 0x20
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_RX_IMPVAL_EN__SHIFT 0x5
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_PD_MASK 0x3c0
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_PD__SHIFT 0x6
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_EN_PD_MASK 0x400
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_EN_PD__SHIFT 0xa
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_PU_MASK 0x7800
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_PU__SHIFT 0xb
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_EN_PU_MASK 0x8000
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_TX_IMPVAL_EN_PU__SHIFT 0xf
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_IMP_DBG_ANALOG_EN_MASK 0x10000
+#define BIF_CC_RFE_IMP_OVERRIDECNTL__STRAP_PLL_IMP_DBG_ANALOG_EN__SHIFT 0x10
+#define BIF_IMPCTL_SMPLCNTL__FORCE_DONE_MASK 0x1
+#define BIF_IMPCTL_SMPLCNTL__FORCE_DONE__SHIFT 0x0
+#define BIF_IMPCTL_SMPLCNTL__RxPDNB_MASK 0x2
+#define BIF_IMPCTL_SMPLCNTL__RxPDNB__SHIFT 0x1
+#define BIF_IMPCTL_SMPLCNTL__TxPDNB_pd_MASK 0x4
+#define BIF_IMPCTL_SMPLCNTL__TxPDNB_pd__SHIFT 0x2
+#define BIF_IMPCTL_SMPLCNTL__TxPDNB_pu_MASK 0x8
+#define BIF_IMPCTL_SMPLCNTL__TxPDNB_pu__SHIFT 0x3
+#define BIF_IMPCTL_SMPLCNTL__SAMPLE_PERIOD_MASK 0x1f00
+#define BIF_IMPCTL_SMPLCNTL__SAMPLE_PERIOD__SHIFT 0x8
+#define BIF_IMPCTL_SMPLCNTL__EXTEND_SAMPLES_MASK 0x2000
+#define BIF_IMPCTL_SMPLCNTL__EXTEND_SAMPLES__SHIFT 0xd
+#define BIF_IMPCTL_SMPLCNTL__FORCE_ENABLE_MASK 0x4000
+#define BIF_IMPCTL_SMPLCNTL__FORCE_ENABLE__SHIFT 0xe
+#define BIF_IMPCTL_SMPLCNTL__SETUP_TIME_MASK 0xf8000
+#define BIF_IMPCTL_SMPLCNTL__SETUP_TIME__SHIFT 0xf
+#define BIF_IMPCTL_SMPLCNTL__LOWER_SAMPLE_THRESH_MASK 0x3f00000
+#define BIF_IMPCTL_SMPLCNTL__LOWER_SAMPLE_THRESH__SHIFT 0x14
+#define BIF_IMPCTL_SMPLCNTL__UPPER_SAMPLE_THRESH_MASK 0xfc000000
+#define BIF_IMPCTL_SMPLCNTL__UPPER_SAMPLE_THRESH__SHIFT 0x1a
+#define BIF_IMPCTL_RXCNTL__RX_ADJUST_MASK 0x7
+#define BIF_IMPCTL_RXCNTL__RX_ADJUST__SHIFT 0x0
+#define BIF_IMPCTL_RXCNTL__RX_BIAS_HIGH_MASK 0x8
+#define BIF_IMPCTL_RXCNTL__RX_BIAS_HIGH__SHIFT 0x3
+#define BIF_IMPCTL_RXCNTL__CONT_AFTER_RX_DECT_MASK 0x10
+#define BIF_IMPCTL_RXCNTL__CONT_AFTER_RX_DECT__SHIFT 0x4
+#define BIF_IMPCTL_RXCNTL__SUSPEND_MASK 0x40
+#define BIF_IMPCTL_RXCNTL__SUSPEND__SHIFT 0x6
+#define BIF_IMPCTL_RXCNTL__FORCE_RST_MASK 0x80
+#define BIF_IMPCTL_RXCNTL__FORCE_RST__SHIFT 0x7
+#define BIF_IMPCTL_RXCNTL__LOWER_RX_ADJ_THRESH_MASK 0xf00
+#define BIF_IMPCTL_RXCNTL__LOWER_RX_ADJ_THRESH__SHIFT 0x8
+#define BIF_IMPCTL_RXCNTL__LOWER_RX_ADJ_MASK 0x1000
+#define BIF_IMPCTL_RXCNTL__LOWER_RX_ADJ__SHIFT 0xc
+#define BIF_IMPCTL_RXCNTL__UPPER_RX_

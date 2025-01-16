@@ -1,94 +1,82 @@
-/*
- * String handling functions.
+SIGNALED	= (1<<1),
+	IB_SEND_SOLICITED	= (1<<2),
+	IB_SEND_INLINE		= (1<<3),
+	IB_SEND_IP_CSUM		= (1<<4),
+
+	/* reserve bits 26-31 for low level drivers' internal use */
+	IB_SEND_RESERVED_START	= (1 << 26),
+	IB_SEND_RESERVED_END	= (1 << 31),
+};
+
+struct ib_sge {
+	u64	addr;
+	u32	length;
+	u32	lkey;
+};
+
+/**
+ * struct ib_mw_bind_info - Parameters for a memory window bind operation.
+ * @mr: A memory region to bind the memory window to.
+ * @addr: The address where the memory window should begin.
+ * @length: The length of the memory window, in bytes.
+ * @mw_access_flags: Access flags from enum ib_access_flags for the window.
  *
- * Copyright IBM Corp. 2012
+ * This struct contains the shared parameters for type 1 and type 2
+ * memory window bind operations.
  */
+struct ib_mw_bind_info {
+	struct ib_mr   *mr;
+	u64		addr;
+	u64		length;
+	int		mw_access_flags;
+};
 
-#include <linux/linkage.h>
-#include <asm/nospec-insn.h>
+struct ib_send_wr {
+	struct ib_send_wr      *next;
+	u64			wr_id;
+	struct ib_sge	       *sg_list;
+	int			num_sge;
+	enum ib_wr_opcode	opcode;
+	int			send_flags;
+	union {
+		__be32		imm_data;
+		u32		invalidate_rkey;
+	} ex;
+};
 
-	GEN_BR_THUNK %r14
+struct ib_rdma_wr {
+	struct ib_send_wr	wr;
+	u64			remote_addr;
+	u32			rkey;
+};
 
-/*
- * memset implementation
- *
- * This code corresponds to the C construct below. We do distinguish
- * between clearing (c == 0) and setting a memory array (c != 0) simply
- * because nearly all memset invocations in the kernel clear memory and
- * the xc instruction is preferred in such cases.
- *
- * void *memset(void *s, int c, size_t n)
- * {
- *	if (likely(c == 0))
- *		return __builtin_memset(s, 0, n);
- *	return __builtin_memset(s, c, n);
- * }
- */
-ENTRY(memset)
-	ltgr	%r4,%r4
-	jz	.Lmemset_exit
-	ltgr	%r3,%r3
-	jnz	.Lmemset_fill
-	aghi	%r4,-1
-	srlg	%r3,%r4,8
-	ltgr	%r3,%r3
-	lgr	%r1,%r2
-	jz	.Lmemset_clear_rest
-.Lmemset_clear_loop:
-	xc	0(256,%r1),0(%r1)
-	la	%r1,256(%r1)
-	brctg	%r3,.Lmemset_clear_loop
-.Lmemset_clear_rest:
-	larl	%r3,.Lmemset_xc
-	ex	%r4,0(%r3)
-.Lmemset_exit:
-	BR_EX	%r14
-.Lmemset_fill:
-	stc	%r3,0(%r2)
-	cghi	%r4,1
-	lgr	%r1,%r2
-	je	.Lmemset_fill_exit
-	aghi	%r4,-2
-	srlg	%r3,%r4,8
-	ltgr	%r3,%r3
-	jz	.Lmemset_fill_rest
-.Lmemset_fill_loop:
-	mvc	1(256,%r1),0(%r1)
-	la	%r1,256(%r1)
-	brctg	%r3,.Lmemset_fill_loop
-.Lmemset_fill_rest:
-	larl	%r3,.Lmemset_mvc
-	ex	%r4,0(%r3)
-.Lmemset_fill_exit:
-	BR_EX	%r14
-.Lmemset_xc:
-	xc	0(1,%r1),0(%r1)
-.Lmemset_mvc:
-	mvc	1(1,%r1),0(%r1)
+static inline struct ib_rdma_wr *rdma_wr(struct ib_send_wr *wr)
+{
+	return container_of(wr, struct ib_rdma_wr, wr);
+}
 
-/*
- * memcpy implementation
- *
- * void *memcpy(void *dest, const void *src, size_t n)
- */
-ENTRY(memcpy)
-	ltgr	%r4,%r4
-	jz	.Lmemcpy_exit
-	aghi	%r4,-1
-	srlg	%r5,%r4,8
-	ltgr	%r5,%r5
-	lgr	%r1,%r2
-	jnz	.Lmemcpy_loop
-.Lmemcpy_rest:
-	larl	%r5,.Lmemcpy_mvc
-	ex	%r4,0(%r5)
-.Lmemcpy_exit:
-	BR_EX	%r14
-.Lmemcpy_loop:
-	mvc	0(256,%r1),0(%r3)
-	la	%r1,256(%r1)
-	la	%r3,256(%r3)
-	brctg	%r5,.Lmemcpy_loop
-	j	.Lmemcpy_rest
-.Lmemcpy_mvc:
-	mvc	0(1,%r1),0(%r3)
+struct ib_atomic_wr {
+	struct ib_send_wr	wr;
+	u64			remote_addr;
+	u64			compare_add;
+	u64			swap;
+	u64			compare_add_mask;
+	u64			swap_mask;
+	u32			rkey;
+};
+
+static inline struct ib_atomic_wr *atomic_wr(struct ib_send_wr *wr)
+{
+	return container_of(wr, struct ib_atomic_wr, wr);
+}
+
+struct ib_ud_wr {
+	struct ib_send_wr	wr;
+	struct ib_ah		*ah;
+	void			*header;
+	int			hlen;
+	int			mss;
+	u32			remote_qpn;
+	u32			remote_qkey;
+	u16			pkey_index; /* valid for GSI only */
+	u8			port_num;   /* valid for DR SMPs on switch

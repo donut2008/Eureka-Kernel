@@ -1,6 +1,4 @@
-#ifndef _MUIC_USB_
-#define _MUIC_USB_
-
-extern void muic_register_usb_notifier(muic_data_t *pmuic);
-extern void muic_unregister_usb_notifier(muic_data_t *pmuic);
-#endif
+fine MC_HUB_RDREQ_VCEU0__STALL_OVERRIDE__SHIFT 0x6
+#define MC_HUB_RDREQ_VCEU0__MAXBURST_MASK 0x780
+#define MC_HUB_RDREQ_VCEU0__MAXBURST__SHIFT 0x7
+#define MC_HUB_RDREQ_

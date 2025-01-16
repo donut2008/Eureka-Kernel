@@ -1,148 +1,54 @@
-/*
- * linux/driver/usb/host/ehci-w90x900.c
- *
- * Copyright (c) 2008 Nuvoton technology corporation.
- *
- * Wan ZongShun <mcuos.com@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation;version 2 of the License.
- *
- */
-
-#include <linux/dma-mapping.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/usb.h>
-#include <linux/usb/hcd.h>
-
-#include "ehci.h"
-
-/* enable phy0 and phy1 for w90p910 */
-#define	ENPHY		(0x01<<8)
-#define PHY0_CTR	(0xA4)
-#define PHY1_CTR	(0xA8)
-
-#define DRIVER_DESC "EHCI w90x900 driver"
-
-static const char hcd_name[] = "ehci-w90x900 ";
-
-static struct hc_driver __read_mostly ehci_w90x900_hc_driver;
-
-static int usb_w90x900_probe(const struct hc_driver *driver,
-		      struct platform_device *pdev)
-{
-	struct usb_hcd *hcd;
-	struct ehci_hcd *ehci;
-	struct resource *res;
-	int retval = 0, irq;
-	unsigned long val;
-
-	hcd = usb_create_hcd(driver, &pdev->dev, "w90x900 EHCI");
-	if (!hcd) {
-		retval = -ENOMEM;
-		goto err1;
-	}
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(hcd->regs)) {
-		retval = PTR_ERR(hcd->regs);
-		goto err2;
-	}
-	hcd->rsrc_start = res->start;
-	hcd->rsrc_len = resource_size(res);
-
-	ehci = hcd_to_ehci(hcd);
-	ehci->caps = hcd->regs;
-	ehci->regs = hcd->regs +
-		HC_LENGTH(ehci, ehci_readl(ehci, &ehci->caps->hc_capbase));
-
-	/* enable PHY 0,1,the regs only apply to w90p910
-	*  0xA4,0xA8 were offsets of PHY0 and PHY1 controller of
-	*  w90p910 IC relative to ehci->regs.
-	*/
-	val = __raw_readl(ehci->regs+PHY0_CTR);
-	val |= ENPHY;
-	__raw_writel(val, ehci->regs+PHY0_CTR);
-
-	val = __raw_readl(ehci->regs+PHY1_CTR);
-	val |= ENPHY;
-	__raw_writel(val, ehci->regs+PHY1_CTR);
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		retval = irq;
-		goto err2;
-	}
-
-	retval = usb_add_hcd(hcd, irq, IRQF_SHARED);
-	if (retval != 0)
-		goto err2;
-
-	device_wakeup_enable(hcd->self.controller);
-	return retval;
-err2:
-	usb_put_hcd(hcd);
-err1:
-	return retval;
-}
-
-static void usb_w90x900_remove(struct usb_hcd *hcd,
-			struct platform_device *pdev)
-{
-	usb_remove_hcd(hcd);
-	usb_put_hcd(hcd);
-}
-
-static int ehci_w90x900_probe(struct platform_device *pdev)
-{
-	if (usb_disabled())
-		return -ENODEV;
-
-	return usb_w90x900_probe(&ehci_w90x900_hc_driver, pdev);
-}
-
-static int ehci_w90x900_remove(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-
-	usb_w90x900_remove(hcd, pdev);
-
-	return 0;
-}
-
-static struct platform_driver ehci_hcd_w90x900_driver = {
-	.probe  = ehci_w90x900_probe,
-	.remove = ehci_w90x900_remove,
-	.driver = {
-		.name = "w90x900-ehci",
-	},
-};
-
-static int __init ehci_w90X900_init(void)
-{
-	if (usb_disabled())
-		return -ENODEV;
-
-	pr_info("%s: " DRIVER_DESC "\n", hcd_name);
-
-	ehci_init_driver(&ehci_w90x900_hc_driver, NULL);
-	return platform_driver_register(&ehci_hcd_w90x900_driver);
-}
-module_init(ehci_w90X900_init);
-
-static void __exit ehci_w90X900_cleanup(void)
-{
-	platform_driver_unregister(&ehci_hcd_w90x900_driver);
-}
-module_exit(ehci_w90X900_cleanup);
-
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_AUTHOR("Wan ZongShun <mcuos.com@gmail.com>");
-MODULE_ALIAS("platform:w90p910-ehci");
-MODULE_LICENSE("GPL v2");
+ATUS__TXPHYSTATUS_3__SHIFT 0x3
+#define PSX80_PIF0_BIF_CMD_STATUS__TXPHYSTATUS_4_MASK 0x10
+#define PSX80_PIF0_BIF_CMD_STATUS__TXPHYSTATUS_4__SHIFT 0x4
+#define PSX80_PIF0_BIF_CMD_STATUS__TXPHYSTATUS_5_MASK 0x20
+#define PSX80_PIF0_BIF_CMD_STATUS__TXPHYSTATUS_5__SHIFT 0x5
+#define PSX80_PIF0_BIF_CMD_STATUS__TXPHYSTATUS_6_MASK 0x40
+#define PSX80_PIF0_BIF_CMD_STATUS__TXPHYSTATUS_6__SHIFT 0x6
+#define PSX80_PIF0_BIF_CMD_STATUS__TXPHYSTATUS_7_MASK 0x80
+#define PSX80_PIF0_BIF_CMD_STATUS__TXPHYSTATUS_7__SHIFT 0x7
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_0_MASK 0x100
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_0__SHIFT 0x8
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_1_MASK 0x200
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_1__SHIFT 0x9
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_2_MASK 0x400
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_2__SHIFT 0xa
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_3_MASK 0x800
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_3__SHIFT 0xb
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_4_MASK 0x1000
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_4__SHIFT 0xc
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_5_MASK 0x2000
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_5__SHIFT 0xd
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_6_MASK 0x4000
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_6__SHIFT 0xe
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_7_MASK 0x8000
+#define PSX80_PIF0_BIF_CMD_STATUS__RXPHYSTATUS_7__SHIFT 0xf
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_0_MASK 0x10000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_0__SHIFT 0x10
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_1_MASK 0x20000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_1__SHIFT 0x11
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_2_MASK 0x40000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_2__SHIFT 0x12
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_3_MASK 0x80000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_3__SHIFT 0x13
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_4_MASK 0x100000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_4__SHIFT 0x14
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_5_MASK 0x200000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_5__SHIFT 0x15
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_6_MASK 0x400000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_6__SHIFT 0x16
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_7_MASK 0x800000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_TX_RDY_7__SHIFT 0x17
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_0_MASK 0x1000000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_0__SHIFT 0x18
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_1_MASK 0x2000000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_1__SHIFT 0x19
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_2_MASK 0x4000000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_2__SHIFT 0x1a
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_3_MASK 0x8000000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_3__SHIFT 0x1b
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_4_MASK 0x10000000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_4__SHIFT 0x1c
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_5_MASK 0x20000000
+#define PSX80_PIF0_BIF_CMD_STATUS__BPHY_CORE_RX_RDY_5__SHIFT 0x1d
+#define PSX80_PIF0_BIF_CM

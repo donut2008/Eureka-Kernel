@@ -1,77 +1,34 @@
-#ifndef __GENWQE_DRIVER_H__
-#define __GENWQE_DRIVER_H__
-
-/**
- * IBM Accelerator Family 'GenWQE'
- *
- * (C) Copyright IBM Corp. 2013
- *
- * Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
- * Author: Joerg-Stephan Vogt <jsvogt@de.ibm.com>
- * Author: Michael Jung <mijung@gmx.net>
- * Author: Michael Ruettger <michael@ibmra.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License (version 2 only)
- * as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
-
-#include <linux/types.h>
-#include <linux/stddef.h>
-#include <linux/cdev.h>
-#include <linux/list.h>
-#include <linux/kthread.h>
-#include <linux/scatterlist.h>
-#include <linux/iommu.h>
-#include <linux/spinlock.h>
-#include <linux/mutex.h>
-#include <linux/platform_device.h>
-#include <linux/printk.h>
-
-#include <asm/byteorder.h>
-#include <linux/genwqe/genwqe_card.h>
-
-#define DRV_VERSION		"2.0.25"
-
-/*
- * Static minor number assignement, until we decide/implement
- * something dynamic.
- */
-#define GENWQE_MAX_MINOR	128 /* up to 128 possible genwqe devices */
-
-/**
- * genwqe_requ_alloc() - Allocate a new DDCB execution request
- *
- * This data structure contains the user visiable fields of the DDCB
- * to be executed.
- *
- * Return: ptr to genwqe_ddcb_cmd data structure
- */
-struct genwqe_ddcb_cmd *ddcb_requ_alloc(void);
-
-/**
- * ddcb_requ_free() - Free DDCB execution request.
- * @req:       ptr to genwqe_ddcb_cmd data structure.
- */
-void ddcb_requ_free(struct genwqe_ddcb_cmd *req);
-
-u32  genwqe_crc32(u8 *buff, size_t len, u32 init);
-
-static inline void genwqe_hexdump(struct pci_dev *pci_dev,
-				  const void *buff, unsigned int size)
-{
-	char prefix[32];
-
-	scnprintf(prefix, sizeof(prefix), "%s %s: ",
-		  GENWQE_DEVNAME, pci_name(pci_dev));
-
-	print_hex_dump_debug(prefix, DUMP_PREFIX_OFFSET, 16, 1, buff,
-			     size, true);
-}
-
-#endif	/* __GENWQE_DRIVER_H__ */
+SETHINT_11_MASK 0x70
+#define PB0_RX_LANE11_SCI_STAT_OVRD_REG0__RXPRESETHINT_11__SHIFT 0x4
+#define PB0_RX_LANE11_SCI_STAT_OVRD_REG0__ENABLEFOM_11_MASK 0x80
+#define PB0_RX_LANE11_SCI_STAT_OVRD_REG0__ENABLEFOM_11__SHIFT 0x7
+#define PB0_RX_LANE11_SCI_STAT_OVRD_REG0__REQUESTFOM_11_MASK 0x100
+#define PB0_RX_LANE11_SCI_STAT_OVRD_REG0__REQUESTFOM_11__SHIFT 0x8
+#define PB0_RX_LANE11_SCI_STAT_OVRD_REG0__RESPONSEMODE_11_MASK 0x200
+#define PB0_RX_LANE11_SCI_STAT_OVRD_REG0__RESPONSEMODE_11__SHIFT 0x9
+#define PB0_RX_LANE12_CTRL_REG0__RX_BACKUP_12_MASK 0xff
+#define PB0_RX_LANE12_CTRL_REG0__RX_BACKUP_12__SHIFT 0x0
+#define PB0_RX_LANE12_CTRL_REG0__RX_DBG_ANALOG_SEL_12_MASK 0xc00
+#define PB0_RX_LANE12_CTRL_REG0__RX_DBG_ANALOG_SEL_12__SHIFT 0xa
+#define PB0_RX_LANE12_CTRL_REG0__RX_TST_BSCAN_EN_12_MASK 0x1000
+#define PB0_RX_LANE12_CTRL_REG0__RX_TST_BSCAN_EN_12__SHIFT 0xc
+#define PB0_RX_LANE12_CTRL_REG0__RX_CFG_OVR_PWRSF_12_MASK 0x2000
+#define PB0_RX_LANE12_CTRL_REG0__RX_CFG_OVR_PWRSF_12__SHIFT 0xd
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__RXPWR_12_MASK 0x7
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__RXPWR_12__SHIFT 0x0
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__ELECIDLEDETEN_12_MASK 0x8
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__ELECIDLEDETEN_12__SHIFT 0x3
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__RXPRESETHINT_12_MASK 0x70
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__RXPRESETHINT_12__SHIFT 0x4
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__ENABLEFOM_12_MASK 0x80
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__ENABLEFOM_12__SHIFT 0x7
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__REQUESTFOM_12_MASK 0x100
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__REQUESTFOM_12__SHIFT 0x8
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__RESPONSEMODE_12_MASK 0x200
+#define PB0_RX_LANE12_SCI_STAT_OVRD_REG0__RESPONSEMODE_12__SHIFT 0x9
+#define PB0_RX_LANE13_CTRL_REG0__RX_BACKUP_13_MASK 0xff
+#define PB0_RX_LANE13_CTRL_REG0__RX_BACKUP_13__SHIFT 0x0
+#define PB0_RX_LANE13_CTRL_REG0__RX_DBG_ANALOG_SEL_13_MASK 0xc00
+#define PB0_RX_LANE13_CTRL_REG0__RX_DBG_ANALOG_SEL_13__SHIFT 0xa
+#define PB0_RX_LANE13_CTRL_REG0__RX_TST_BSCAN_EN_13_MASK 0x1000
+#define PB0_RX_LANE13_CTRL_REG0__RX_TST_

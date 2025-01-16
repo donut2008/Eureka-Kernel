@@ -1,930 +1,329 @@
-#ifndef _BCACHE_H
-#define _BCACHE_H
-
-/*
- * SOME HIGH LEVEL CODE DOCUMENTATION:
- *
- * Bcache mostly works with cache sets, cache devices, and backing devices.
- *
- * Support for multiple cache devices hasn't quite been finished off yet, but
- * it's about 95% plumbed through. A cache set and its cache devices is sort of
- * like a md raid array and its component devices. Most of the code doesn't care
- * about individual cache devices, the main abstraction is the cache set.
- *
- * Multiple cache devices is intended to give us the ability to mirror dirty
- * cached data and metadata, without mirroring clean cached data.
- *
- * Backing devices are different, in that they have a lifetime independent of a
- * cache set. When you register a newly formatted backing device it'll come up
- * in passthrough mode, and then you can attach and detach a backing device from
- * a cache set at runtime - while it's mounted and in use. Detaching implicitly
- * invalidates any cached data for that backing device.
- *
- * A cache set can have multiple (many) backing devices attached to it.
- *
- * There's also flash only volumes - this is the reason for the distinction
- * between struct cached_dev and struct bcache_device. A flash only volume
- * works much like a bcache device that has a backing device, except the
- * "cached" data is always dirty. The end result is that we get thin
- * provisioning with very little additional code.
- *
- * Flash only volumes work but they're not production ready because the moving
- * garbage collector needs more work. More on that later.
- *
- * BUCKETS/ALLOCATION:
- *
- * Bcache is primarily designed for caching, which means that in normal
- * operation all of our available space will be allocated. Thus, we need an
- * efficient way of deleting things from the cache so we can write new things to
- * it.
- *
- * To do this, we first divide the cache device up into buckets. A bucket is the
- * unit of allocation; they're typically around 1 mb - anywhere from 128k to 2M+
- * works efficiently.
- *
- * Each bucket has a 16 bit priority, and an 8 bit generation associated with
- * it. The gens and priorities for all the buckets are stored contiguously and
- * packed on disk (in a linked list of buckets - aside from the superblock, all
- * of bcache's metadata is stored in buckets).
- *
- * The priority is used to implement an LRU. We reset a bucket's priority when
- * we allocate it or on cache it, and every so often we decrement the priority
- * of each bucket. It could be used to implement something more sophisticated,
- * if anyone ever gets around to it.
- *
- * The generation is used for invalidating buckets. Each pointer also has an 8
- * bit generation embedded in it; for a pointer to be considered valid, its gen
- * must match the gen of the bucket it points into.  Thus, to reuse a bucket all
- * we have to do is increment its gen (and write its new gen to disk; we batch
- * this up).
- *
- * Bcache is entirely COW - we never write twice to a bucket, even buckets that
- * contain metadata (including btree nodes).
- *
- * THE BTREE:
- *
- * Bcache is in large part design around the btree.
- *
- * At a high level, the btree is just an index of key -> ptr tuples.
- *
- * Keys represent extents, and thus have a size field. Keys also have a variable
- * number of pointers attached to them (potentially zero, which is handy for
- * invalidating the cache).
- *
- * The key itself is an inode:offset pair. The inode number corresponds to a
- * backing device or a flash only volume. The offset is the ending offset of the
- * extent within the inode - not the starting offset; this makes lookups
- * slightly more convenient.
- *
- * Pointers contain the cache device id, the offset on that device, and an 8 bit
- * generation number. More on the gen later.
- *
- * Index lookups are not fully abstracted - cache lookups in particular are
- * still somewhat mixed in with the btree code, but things are headed in that
- * direction.
- *
- * Updates are fairly well abstracted, though. There are two different ways of
- * updating the btree; insert and replace.
- *
- * BTREE_INSERT will just take a list of keys and insert them into the btree -
- * overwriting (possibly only partially) any extents they overlap with. This is
- * used to update the index after a write.
- *
- * BTREE_REPLACE is really cmpxchg(); it inserts a key into the btree iff it is
- * overwriting a key that matches another given key. This is used for inserting
- * data into the cache after a cache miss, and for background writeback, and for
- * the moving garbage collector.
- *
- * There is no "delete" operation; deleting things from the index is
- * accomplished by either by invalidating pointers (by incrementing a bucket's
- * gen) or by inserting a key with 0 pointers - which will overwrite anything
- * previously present at that location in the index.
- *
- * This means that there are always stale/invalid keys in the btree. They're
- * filtered out by the code that iterates through a btree node, and removed when
- * a btree node is rewritten.
- *
- * BTREE NODES:
- *
- * Our unit of allocation is a bucket, and we we can't arbitrarily allocate and
- * free smaller than a bucket - so, that's how big our btree nodes are.
- *
- * (If buckets are really big we'll only use part of the bucket for a btree node
- * - no less than 1/4th - but a bucket still contains no more than a single
- * btree node. I'd actually like to change this, but for now we rely on the
- * bucket's gen for deleting btree nodes when we rewrite/split a node.)
- *
- * Anyways, btree nodes are big - big enough to be inefficient with a textbook
- * btree implementation.
- *
- * The way this is solved is that btree nodes are internally log structured; we
- * can append new keys to an existing btree node without rewriting it. This
- * means each set of keys we write is sorted, but the node is not.
- *
- * We maintain this log structure in memory - keeping 1Mb of keys sorted would
- * be expensive, and we have to distinguish between the keys we have written and
- * the keys we haven't. So to do a lookup in a btree node, we have to search
- * each sorted set. But we do merge written sets together lazily, so the cost of
- * these extra searches is quite low (normally most of the keys in a btree node
- * will be in one big set, and then there'll be one or two sets that are much
- * smaller).
- *
- * This log structure makes bcache's btree more of a hybrid between a
- * conventional btree and a compacting data structure, with some of the
- * advantages of both.
- *
- * GARBAGE COLLECTION:
- *
- * We can't just invalidate any bucket - it might contain dirty data or
- * metadata. If it once contained dirty data, other writes might overwrite it
- * later, leaving no valid pointers into that bucket in the index.
- *
- * Thus, the primary purpose of garbage collection is to find buckets to reuse.
- * It also counts how much valid data it each bucket currently contains, so that
- * allocation can reuse buckets sooner when they've been mostly overwritten.
- *
- * It also does some things that are really internal to the btree
- * implementation. If a btree node contains pointers that are stale by more than
- * some threshold, it rewrites the btree node to avoid the bucket's generation
- * wrapping around. It also merges adjacent btree nodes if they're empty enough.
- *
- * THE JOURNAL:
- *
- * Bcache's journal is not necessary for consistency; we always strictly
- * order metadata writes so that the btree and everything else is consistent on
- * disk in the event of an unclean shutdown, and in fact bcache had writeback
- * caching (with recovery from unclean shutdown) before journalling was
- * implemented.
- *
- * Rather, the journal is purely a performance optimization; we can't complete a
- * write until we've updated the index on disk, otherwise the cache would be
- * inconsistent in the event of an unclean shutdown. This means that without the
- * journal, on random write workloads we constantly have to update all the leaf
- * nodes in the btree, and those writes will be mostly empty (appending at most
- * a few keys each) - highly inefficient in terms of amount of metadata writes,
- * and it puts more strain on the various btree resorting/compacting code.
- *
- * The journal is just a log of keys we've inserted; on startup we just reinsert
- * all the keys in the open journal entries. That means that when we're updating
- * a node in the btree, we can wait until a 4k block of keys fills up before
- * writing them out.
- *
- * For simplicity, we only journal updates to leaf nodes; updates to parent
- * nodes are rare enough (since our leaf nodes are huge) that it wasn't worth
- * the complexity to deal with journalling them (in particular, journal replay)
- * - updates to non leaf nodes just happen synchronously (see btree_split()).
- */
-
-#define pr_fmt(fmt) "bcache: %s() " fmt "\n", __func__
-
-#include <linux/bcache.h>
-#include <linux/bio.h>
-#include <linux/kobject.h>
-#include <linux/list.h>
-#include <linux/mutex.h>
-#include <linux/rbtree.h>
-#include <linux/rwsem.h>
-#include <linux/types.h>
-#include <linux/workqueue.h>
-
-#include "bset.h"
-#include "util.h"
-#include "closure.h"
-
-struct bucket {
-	atomic_t	pin;
-	uint16_t	prio;
-	uint8_t		gen;
-	uint8_t		last_gc; /* Most out of date gen in the btree */
-	uint16_t	gc_mark; /* Bitfield used by GC. See below for field */
-};
-
-/*
- * I'd use bitfields for these, but I don't trust the compiler not to screw me
- * as multiple threads touch struct bucket without locking
- */
-
-BITMASK(GC_MARK,	 struct bucket, gc_mark, 0, 2);
-#define GC_MARK_RECLAIMABLE	1
-#define GC_MARK_DIRTY		2
-#define GC_MARK_METADATA	3
-#define GC_SECTORS_USED_SIZE	13
-#define MAX_GC_SECTORS_USED	(~(~0ULL << GC_SECTORS_USED_SIZE))
-BITMASK(GC_SECTORS_USED, struct bucket, gc_mark, 2, GC_SECTORS_USED_SIZE);
-BITMASK(GC_MOVE, struct bucket, gc_mark, 15, 1);
-
-#include "journal.h"
-#include "stats.h"
-struct search;
-struct btree;
-struct keybuf;
-
-struct keybuf_key {
-	struct rb_node		node;
-	BKEY_PADDED(key);
-	void			*private;
-};
-
-struct keybuf {
-	struct bkey		last_scanned;
-	spinlock_t		lock;
-
-	/*
-	 * Beginning and end of range in rb tree - so that we can skip taking
-	 * lock and checking the rb tree when we need to check for overlapping
-	 * keys.
-	 */
-	struct bkey		start;
-	struct bkey		end;
-
-	struct rb_root		keys;
-
-#define KEYBUF_NR		500
-	DECLARE_ARRAY_ALLOCATOR(struct keybuf_key, freelist, KEYBUF_NR);
-};
-
-struct bcache_device {
-	struct closure		cl;
-
-	struct kobject		kobj;
-
-	struct cache_set	*c;
-	unsigned		id;
-#define BCACHEDEVNAME_SIZE	12
-	char			name[BCACHEDEVNAME_SIZE];
-
-	struct gendisk		*disk;
-
-	unsigned long		flags;
-#define BCACHE_DEV_CLOSING	0
-#define BCACHE_DEV_DETACHING	1
-#define BCACHE_DEV_UNLINK_DONE	2
-
-	unsigned		nr_stripes;
-	unsigned		stripe_size;
-	atomic_t		*stripe_sectors_dirty;
-	unsigned long		*full_dirty_stripes;
-
-	unsigned long		sectors_dirty_last;
-	long			sectors_dirty_derivative;
-
-	struct bio_set		*bio_split;
-
-	unsigned		data_csum:1;
-
-	int (*cache_miss)(struct btree *, struct search *,
-			  struct bio *, unsigned);
-	int (*ioctl) (struct bcache_device *, fmode_t, unsigned, unsigned long);
-};
-
-struct io {
-	/* Used to track sequential IO so it can be skipped */
-	struct hlist_node	hash;
-	struct list_head	lru;
-
-	unsigned long		jiffies;
-	unsigned		sequential;
-	sector_t		last;
-};
-
-struct cached_dev {
-	struct list_head	list;
-	struct bcache_device	disk;
-	struct block_device	*bdev;
-
-	struct cache_sb		sb;
-	struct bio		sb_bio;
-	struct bio_vec		sb_bv[1];
-	struct closure		sb_write;
-	struct semaphore	sb_write_mutex;
-
-	/* Refcount on the cache set. Always nonzero when we're caching. */
-	atomic_t		count;
-	struct work_struct	detach;
-
-	/*
-	 * Device might not be running if it's dirty and the cache set hasn't
-	 * showed up yet.
-	 */
-	atomic_t		running;
-
-	/*
-	 * Writes take a shared lock from start to finish; scanning for dirty
-	 * data to refill the rb tree requires an exclusive lock.
-	 */
-	struct rw_semaphore	writeback_lock;
-
-	/*
-	 * Nonzero, and writeback has a refcount (d->count), iff there is dirty
-	 * data in the cache. Protected by writeback_lock; must have an
-	 * shared lock to set and exclusive lock to clear.
-	 */
-	atomic_t		has_dirty;
-
-	struct bch_ratelimit	writeback_rate;
-	struct delayed_work	writeback_rate_update;
-
-	/*
-	 * Internal to the writeback code, so read_dirty() can keep track of
-	 * where it's at.
-	 */
-	sector_t		last_read;
-
-	/* Limit number of writeback bios in flight */
-	struct semaphore	in_flight;
-	struct task_struct	*writeback_thread;
-	struct workqueue_struct	*writeback_write_wq;
-
-	struct keybuf		writeback_keys;
-
-	/* For tracking sequential IO */
-#define RECENT_IO_BITS	7
-#define RECENT_IO	(1 << RECENT_IO_BITS)
-	struct io		io[RECENT_IO];
-	struct hlist_head	io_hash[RECENT_IO + 1];
-	struct list_head	io_lru;
-	spinlock_t		io_lock;
-
-	struct cache_accounting	accounting;
-
-	/* The rest of this all shows up in sysfs */
-	unsigned		sequential_cutoff;
-	unsigned		readahead;
-
-	unsigned		verify:1;
-	unsigned		bypass_torture_test:1;
-
-	unsigned		partial_stripes_expensive:1;
-	unsigned		writeback_metadata:1;
-	unsigned		writeback_running:1;
-	unsigned char		writeback_percent;
-	unsigned		writeback_delay;
-
-	uint64_t		writeback_rate_target;
-	int64_t			writeback_rate_proportional;
-	int64_t			writeback_rate_derivative;
-	int64_t			writeback_rate_change;
-
-	unsigned		writeback_rate_update_seconds;
-	unsigned		writeback_rate_d_term;
-	unsigned		writeback_rate_p_term_inverse;
-};
-
-enum alloc_reserve {
-	RESERVE_BTREE,
-	RESERVE_PRIO,
-	RESERVE_MOVINGGC,
-	RESERVE_NONE,
-	RESERVE_NR,
-};
-
-struct cache {
-	struct cache_set	*set;
-	struct cache_sb		sb;
-	struct bio		sb_bio;
-	struct bio_vec		sb_bv[1];
-
-	struct kobject		kobj;
-	struct block_device	*bdev;
-
-	struct task_struct	*alloc_thread;
-
-	struct closure		prio;
-	struct prio_set		*disk_buckets;
-
-	/*
-	 * When allocating new buckets, prio_write() gets first dibs - since we
-	 * may not be allocate at all without writing priorities and gens.
-	 * prio_buckets[] contains the last buckets we wrote priorities to (so
-	 * gc can mark them as metadata), prio_next[] contains the buckets
-	 * allocated for the next prio write.
-	 */
-	uint64_t		*prio_buckets;
-	uint64_t		*prio_last_buckets;
-
-	/*
-	 * free: Buckets that are ready to be used
-	 *
-	 * free_inc: Incoming buckets - these are buckets that currently have
-	 * cached data in them, and we can't reuse them until after we write
-	 * their new gen to disk. After prio_write() finishes writing the new
-	 * gens/prios, they'll be moved to the free list (and possibly discarded
-	 * in the process)
-	 */
-	DECLARE_FIFO(long, free)[RESERVE_NR];
-	DECLARE_FIFO(long, free_inc);
-
-	size_t			fifo_last_bucket;
-
-	/* Allocation stuff: */
-	struct bucket		*buckets;
-
-	DECLARE_HEAP(struct bucket *, heap);
-
-	/*
-	 * If nonzero, we know we aren't going to find any buckets to invalidate
-	 * until a gc finishes - otherwise we could pointlessly burn a ton of
-	 * cpu
-	 */
-	unsigned		invalidate_needs_gc;
-
-	bool			discard; /* Get rid of? */
-
-	struct journal_device	journal;
-
-	/* The rest of this all shows up in sysfs */
-#define IO_ERROR_SHIFT		20
-	atomic_t		io_errors;
-	atomic_t		io_count;
-
-	atomic_long_t		meta_sectors_written;
-	atomic_long_t		btree_sectors_written;
-	atomic_long_t		sectors_written;
-};
-
-struct gc_stat {
-	size_t			nodes;
-	size_t			key_bytes;
-
-	size_t			nkeys;
-	uint64_t		data;	/* sectors */
-	unsigned		in_use; /* percent */
-};
-
-/*
- * Flag bits, for how the cache set is shutting down, and what phase it's at:
- *
- * CACHE_SET_UNREGISTERING means we're not just shutting down, we're detaching
- * all the backing devices first (their cached data gets invalidated, and they
- * won't automatically reattach).
- *
- * CACHE_SET_STOPPING always gets set first when we're closing down a cache set;
- * we'll continue to run normally for awhile with CACHE_SET_STOPPING set (i.e.
- * flushing dirty data).
- *
- * CACHE_SET_RUNNING means all cache devices have been registered and journal
- * replay is complete.
- */
-#define CACHE_SET_UNREGISTERING		0
-#define	CACHE_SET_STOPPING		1
-#define	CACHE_SET_RUNNING		2
-
-struct cache_set {
-	struct closure		cl;
-
-	struct list_head	list;
-	struct kobject		kobj;
-	struct kobject		internal;
-	struct dentry		*debug;
-	struct cache_accounting accounting;
-
-	unsigned long		flags;
-
-	struct cache_sb		sb;
-
-	struct cache		*cache[MAX_CACHES_PER_SET];
-	struct cache		*cache_by_alloc[MAX_CACHES_PER_SET];
-	int			caches_loaded;
-
-	struct bcache_device	**devices;
-	struct list_head	cached_devs;
-	uint64_t		cached_dev_sectors;
-	struct closure		caching;
-
-	struct closure		sb_write;
-	struct semaphore	sb_write_mutex;
-
-	mempool_t		*search;
-	mempool_t		*bio_meta;
-	struct bio_set		*bio_split;
-
-	/* For the btree cache */
-	struct shrinker		shrink;
-
-	/* For the btree cache and anything allocation related */
-	struct mutex		bucket_lock;
-
-	/* log2(bucket_size), in sectors */
-	unsigned short		bucket_bits;
-
-	/* log2(block_size), in sectors */
-	unsigned short		block_bits;
-
-	/*
-	 * Default number of pages for a new btree node - may be less than a
-	 * full bucket
-	 */
-	unsigned		btree_pages;
-
-	/*
-	 * Lists of struct btrees; lru is the list for structs that have memory
-	 * allocated for actual btree node, freed is for structs that do not.
-	 *
-	 * We never free a struct btree, except on shutdown - we just put it on
-	 * the btree_cache_freed list and reuse it later. This simplifies the
-	 * code, and it doesn't cost us much memory as the memory usage is
-	 * dominated by buffers that hold the actual btree node data and those
-	 * can be freed - and the number of struct btrees allocated is
-	 * effectively bounded.
-	 *
-	 * btree_cache_freeable effectively is a small cache - we use it because
-	 * high order page allocations can be rather expensive, and it's quite
-	 * common to delete and allocate btree nodes in quick succession. It
-	 * should never grow past ~2-3 nodes in practice.
-	 */
-	struct list_head	btree_cache;
-	struct list_head	btree_cache_freeable;
-	struct list_head	btree_cache_freed;
-
-	/* Number of elements in btree_cache + btree_cache_freeable lists */
-	unsigned		btree_cache_used;
-
-	/*
-	 * If we need to allocate memory for a new btree node and that
-	 * allocation fails, we can cannibalize another node in the btree cache
-	 * to satisfy the allocation - lock to guarantee only one thread does
-	 * this at a time:
-	 */
-	wait_queue_head_t	btree_cache_wait;
-	struct task_struct	*btree_cache_alloc_lock;
-	spinlock_t		btree_cannibalize_lock;
-
-	/*
-	 * When we free a btree node, we increment the gen of the bucket the
-	 * node is in - but we can't rewrite the prios and gens until we
-	 * finished whatever it is we were doing, otherwise after a crash the
-	 * btree node would be freed but for say a split, we might not have the
-	 * pointers to the new nodes inserted into the btree yet.
-	 *
-	 * This is a refcount that blocks prio_write() until the new keys are
-	 * written.
-	 */
-	atomic_t		prio_blocked;
-	wait_queue_head_t	bucket_wait;
-
-	/*
-	 * For any bio we don't skip we subtract the number of sectors from
-	 * rescale; when it hits 0 we rescale all the bucket priorities.
-	 */
-	atomic_t		rescale;
-	/*
-	 * When we invalidate buckets, we use both the priority and the amount
-	 * of good data to determine which buckets to reuse first - to weight
-	 * those together consistently we keep track of the smallest nonzero
-	 * priority of any bucket.
-	 */
-	uint16_t		min_prio;
-
-	/*
-	 * max(gen - last_gc) for all buckets. When it gets too big we have to gc
-	 * to keep gens from wrapping around.
-	 */
-	uint8_t			need_gc;
-	struct gc_stat		gc_stats;
-	size_t			nbuckets;
-
-	struct task_struct	*gc_thread;
-	/* Where in the btree gc currently is */
-	struct bkey		gc_done;
-
-	/*
-	 * The allocation code needs gc_mark in struct bucket to be correct, but
-	 * it's not while a gc is in progress. Protected by bucket_lock.
-	 */
-	int			gc_mark_valid;
-
-	/* Counts how many sectors bio_insert has added to the cache */
-	atomic_t		sectors_to_gc;
-	wait_queue_head_t	gc_wait;
-
-	struct keybuf		moving_gc_keys;
-	/* Number of moving GC bios in flight */
-	struct semaphore	moving_in_flight;
-
-	struct workqueue_struct	*moving_gc_wq;
-
-	struct btree		*root;
-
-#ifdef CONFIG_BCACHE_DEBUG
-	struct btree		*verify_data;
-	struct bset		*verify_ondisk;
-	struct mutex		verify_lock;
-#endif
-
-	unsigned		nr_uuids;
-	struct uuid_entry	*uuids;
-	BKEY_PADDED(uuid_bucket);
-	struct closure		uuid_write;
-	struct semaphore	uuid_write_mutex;
-
-	/*
-	 * A btree node on disk could have too many bsets for an iterator to fit
-	 * on the stack - have to dynamically allocate them
-	 */
-	mempool_t		*fill_iter;
-
-	struct bset_sort_state	sort;
-
-	/* List of buckets we're currently writing data to */
-	struct list_head	data_buckets;
-	spinlock_t		data_bucket_lock;
-
-	struct journal		journal;
-
-#define CONGESTED_MAX		1024
-	unsigned		congested_last_us;
-	atomic_t		congested;
-
-	/* The rest of this all shows up in sysfs */
-	unsigned		congested_read_threshold_us;
-	unsigned		congested_write_threshold_us;
-
-	struct time_stats	btree_gc_time;
-	struct time_stats	btree_split_time;
-	struct time_stats	btree_read_time;
-
-	atomic_long_t		cache_read_races;
-	atomic_long_t		writeback_keys_done;
-	atomic_long_t		writeback_keys_failed;
-
-	enum			{
-		ON_ERROR_UNREGISTER,
-		ON_ERROR_PANIC,
-	}			on_error;
-	unsigned		error_limit;
-	unsigned		error_decay;
-
-	unsigned short		journal_delay_ms;
-	bool			expensive_debug_checks;
-	unsigned		verify:1;
-	unsigned		key_merging_disabled:1;
-	unsigned		gc_always_rewrite:1;
-	unsigned		shrinker_disabled:1;
-	unsigned		copy_gc_enabled:1;
-
-#define BUCKET_HASH_BITS	12
-	struct hlist_head	bucket_hash[1 << BUCKET_HASH_BITS];
-};
-
-struct bbio {
-	unsigned		submit_time_us;
-	union {
-		struct bkey	key;
-		uint64_t	_pad[3];
-		/*
-		 * We only need pad = 3 here because we only ever carry around a
-		 * single pointer - i.e. the pointer we're doing io to/from.
-		 */
-	};
-	struct bio		bio;
-};
-
-#define BTREE_PRIO		USHRT_MAX
-#define INITIAL_PRIO		32768U
-
-#define btree_bytes(c)		((c)->btree_pages * PAGE_SIZE)
-#define btree_blocks(b)							\
-	((unsigned) (KEY_SIZE(&b->key) >> (b)->c->block_bits))
-
-#define btree_default_blocks(c)						\
-	((unsigned) ((PAGE_SECTORS * (c)->btree_pages) >> (c)->block_bits))
-
-#define bucket_pages(c)		((c)->sb.bucket_size / PAGE_SECTORS)
-#define bucket_bytes(c)		((c)->sb.bucket_size << 9)
-#define block_bytes(c)		((c)->sb.block_size << 9)
-
-#define prios_per_bucket(c)				\
-	((bucket_bytes(c) - sizeof(struct prio_set)) /	\
-	 sizeof(struct bucket_disk))
-#define prio_buckets(c)					\
-	DIV_ROUND_UP((size_t) (c)->sb.nbuckets, prios_per_bucket(c))
-
-static inline size_t sector_to_bucket(struct cache_set *c, sector_t s)
-{
-	return s >> c->bucket_bits;
-}
-
-static inline sector_t bucket_to_sector(struct cache_set *c, size_t b)
-{
-	return ((sector_t) b) << c->bucket_bits;
-}
-
-static inline sector_t bucket_remainder(struct cache_set *c, sector_t s)
-{
-	return s & (c->sb.bucket_size - 1);
-}
-
-static inline struct cache *PTR_CACHE(struct cache_set *c,
-				      const struct bkey *k,
-				      unsigned ptr)
-{
-	return c->cache[PTR_DEV(k, ptr)];
-}
-
-static inline size_t PTR_BUCKET_NR(struct cache_set *c,
-				   const struct bkey *k,
-				   unsigned ptr)
-{
-	return sector_to_bucket(c, PTR_OFFSET(k, ptr));
-}
-
-static inline struct bucket *PTR_BUCKET(struct cache_set *c,
-					const struct bkey *k,
-					unsigned ptr)
-{
-	return PTR_CACHE(c, k, ptr)->buckets + PTR_BUCKET_NR(c, k, ptr);
-}
-
-static inline uint8_t gen_after(uint8_t a, uint8_t b)
-{
-	uint8_t r = a - b;
-	return r > 128U ? 0 : r;
-}
-
-static inline uint8_t ptr_stale(struct cache_set *c, const struct bkey *k,
-				unsigned i)
-{
-	return gen_after(PTR_BUCKET(c, k, i)->gen, PTR_GEN(k, i));
-}
-
-static inline bool ptr_available(struct cache_set *c, const struct bkey *k,
-				 unsigned i)
-{
-	return (PTR_DEV(k, i) < MAX_CACHES_PER_SET) && PTR_CACHE(c, k, i);
-}
-
-/* Btree key macros */
-
-/*
- * This is used for various on disk data structures - cache_sb, prio_set, bset,
- * jset: The checksum is _always_ the first 8 bytes of these structs
- */
-#define csum_set(i)							\
-	bch_crc64(((void *) (i)) + sizeof(uint64_t),			\
-		  ((void *) bset_bkey_last(i)) -			\
-		  (((void *) (i)) + sizeof(uint64_t)))
-
-/* Error handling macros */
-
-#define btree_bug(b, ...)						\
-do {									\
-	if (bch_cache_set_error((b)->c, __VA_ARGS__))			\
-		dump_stack();						\
-} while (0)
-
-#define cache_bug(c, ...)						\
-do {									\
-	if (bch_cache_set_error(c, __VA_ARGS__))			\
-		dump_stack();						\
-} while (0)
-
-#define btree_bug_on(cond, b, ...)					\
-do {									\
-	if (cond)							\
-		btree_bug(b, __VA_ARGS__);				\
-} while (0)
-
-#define cache_bug_on(cond, c, ...)					\
-do {									\
-	if (cond)							\
-		cache_bug(c, __VA_ARGS__);				\
-} while (0)
-
-#define cache_set_err_on(cond, c, ...)					\
-do {									\
-	if (cond)							\
-		bch_cache_set_error(c, __VA_ARGS__);			\
-} while (0)
-
-/* Looping macros */
-
-#define for_each_cache(ca, cs, iter)					\
-	for (iter = 0; ca = cs->cache[iter], iter < (cs)->sb.nr_in_set; iter++)
-
-#define for_each_bucket(b, ca)						\
-	for (b = (ca)->buckets + (ca)->sb.first_bucket;			\
-	     b < (ca)->buckets + (ca)->sb.nbuckets; b++)
-
-static inline void cached_dev_put(struct cached_dev *dc)
-{
-	if (atomic_dec_and_test(&dc->count))
-		schedule_work(&dc->detach);
-}
-
-static inline bool cached_dev_get(struct cached_dev *dc)
-{
-	if (!atomic_inc_not_zero(&dc->count))
-		return false;
-
-	/* Paired with the mb in cached_dev_attach */
-	smp_mb__after_atomic();
-	return true;
-}
-
-/*
- * bucket_gc_gen() returns the difference between the bucket's current gen and
- * the oldest gen of any pointer into that bucket in the btree (last_gc).
- */
-
-static inline uint8_t bucket_gc_gen(struct bucket *b)
-{
-	return b->gen - b->last_gc;
-}
-
-#define BUCKET_GC_GEN_MAX	96U
-
-#define kobj_attribute_write(n, fn)					\
-	static struct kobj_attribute ksysfs_##n = __ATTR(n, S_IWUSR, NULL, fn)
-
-#define kobj_attribute_rw(n, show, store)				\
-	static struct kobj_attribute ksysfs_##n =			\
-		__ATTR(n, S_IWUSR|S_IRUSR, show, store)
-
-static inline void wake_up_allocators(struct cache_set *c)
-{
-	struct cache *ca;
-	unsigned i;
-
-	for_each_cache(ca, c, i)
-		wake_up_process(ca->alloc_thread);
-}
-
-/* Forward declarations */
-
-void bch_count_io_errors(struct cache *, int, const char *);
-void bch_bbio_count_io_errors(struct cache_set *, struct bio *,
-			      int, const char *);
-void bch_bbio_endio(struct cache_set *, struct bio *, int, const char *);
-void bch_bbio_free(struct bio *, struct cache_set *);
-struct bio *bch_bbio_alloc(struct cache_set *);
-
-void __bch_submit_bbio(struct bio *, struct cache_set *);
-void bch_submit_bbio(struct bio *, struct cache_set *, struct bkey *, unsigned);
-
-uint8_t bch_inc_gen(struct cache *, struct bucket *);
-void bch_rescale_priorities(struct cache_set *, int);
-
-bool bch_can_invalidate_bucket(struct cache *, struct bucket *);
-void __bch_invalidate_one_bucket(struct cache *, struct bucket *);
-
-void __bch_bucket_free(struct cache *, struct bucket *);
-void bch_bucket_free(struct cache_set *, struct bkey *);
-
-long bch_bucket_alloc(struct cache *, unsigned, bool);
-int __bch_bucket_alloc_set(struct cache_set *, unsigned,
-			   struct bkey *, int, bool);
-int bch_bucket_alloc_set(struct cache_set *, unsigned,
-			 struct bkey *, int, bool);
-bool bch_alloc_sectors(struct cache_set *, struct bkey *, unsigned,
-		       unsigned, unsigned, bool);
-
-__printf(2, 3)
-bool bch_cache_set_error(struct cache_set *, const char *, ...);
-
-void bch_prio_write(struct cache *);
-void bch_write_bdev_super(struct cached_dev *, struct closure *);
-
-extern struct workqueue_struct *bcache_wq;
-extern const char * const bch_cache_modes[];
-extern struct mutex bch_register_lock;
-extern struct list_head bch_cache_sets;
-
-extern struct kobj_type bch_cached_dev_ktype;
-extern struct kobj_type bch_flash_dev_ktype;
-extern struct kobj_type bch_cache_set_ktype;
-extern struct kobj_type bch_cache_set_internal_ktype;
-extern struct kobj_type bch_cache_ktype;
-
-void bch_cached_dev_release(struct kobject *);
-void bch_flash_dev_release(struct kobject *);
-void bch_cache_set_release(struct kobject *);
-void bch_cache_release(struct kobject *);
-
-int bch_uuid_write(struct cache_set *);
-void bcache_write_super(struct cache_set *);
-
-int bch_flash_dev_create(struct cache_set *c, uint64_t size);
-
-int bch_cached_dev_attach(struct cached_dev *, struct cache_set *, uint8_t *);
-void bch_cached_dev_detach(struct cached_dev *);
-void bch_cached_dev_run(struct cached_dev *);
-void bcache_device_stop(struct bcache_device *);
-
-void bch_cache_set_unregister(struct cache_set *);
-void bch_cache_set_stop(struct cache_set *);
-
-struct cache_set *bch_cache_set_alloc(struct cache_sb *);
-void bch_btree_cache_free(struct cache_set *);
-int bch_btree_cache_alloc(struct cache_set *);
-void bch_moving_init_cache_set(struct cache_set *);
-int bch_open_buckets_alloc(struct cache_set *);
-void bch_open_buckets_free(struct cache_set *);
-
-int bch_cache_allocator_start(struct cache *ca);
-
-void bch_debug_exit(void);
-int bch_debug_init(struct kobject *);
-void bch_request_exit(void);
-int bch_request_init(void);
-
-#endif /* _BCACHE_H */
+                                                         0x3f4b8
+#define ixDPM_TABLE_304                                                         0x3f4bc
+#define ixDPM_TABLE_305                                                         0x3f4c0
+#define ixDPM_TABLE_306                                                         0x3f4c4
+#define ixDPM_TABLE_307                                                         0x3f4c8
+#define ixDPM_TABLE_308                                                         0x3f4cc
+#define ixDPM_TABLE_309                                                         0x3f4d0
+#define ixDPM_TABLE_310                                                         0x3f4d4
+#define ixDPM_TABLE_311                                                         0x3f4d8
+#define ixDPM_TABLE_312                                                         0x3f4dc
+#define ixDPM_TABLE_313                                                         0x3f4e0
+#define ixDPM_TABLE_314                                                         0x3f4e4
+#define ixDPM_TABLE_315                                                         0x3f4e8
+#define ixDPM_TABLE_316                                                         0x3f4ec
+#define ixDPM_TABLE_317                                                         0x3f4f0
+#define ixDPM_TABLE_318                                                         0x3f4f4
+#define ixDPM_TABLE_319                                                         0x3f4f8
+#define ixDPM_TABLE_320                                                         0x3f4fc
+#define ixDPM_TABLE_321                                                         0x3f500
+#define ixDPM_TABLE_322                                                         0x3f504
+#define ixDPM_TABLE_323                                                         0x3f508
+#define ixDPM_TABLE_324                                                         0x3f50c
+#define ixDPM_TABLE_325                                                         0x3f510
+#define ixDPM_TABLE_326                                                         0x3f514
+#define ixDPM_TABLE_327                                                         0x3f518
+#define ixDPM_TABLE_328                                                         0x3f51c
+#define ixDPM_TABLE_329                                                         0x3f520
+#define ixDPM_TABLE_330                                                         0x3f524
+#define ixDPM_TABLE_331                                                         0x3f528
+#define ixDPM_TABLE_332                                                         0x3f52c
+#define ixDPM_TABLE_333                                                         0x3f530
+#define ixDPM_TABLE_334                                                         0x3f534
+#define ixDPM_TABLE_335                                                         0x3f538
+#define ixDPM_TABLE_336                                                         0x3f53c
+#define ixDPM_TABLE_337                                                         0x3f540
+#define ixDPM_TABLE_338                                                         0x3f544
+#define ixDPM_TABLE_339                                                         0x3f548
+#define ixDPM_TABLE_340                                                         0x3f54c
+#define ixDPM_TABLE_341                                                         0x3f550
+#define ixDPM_TABLE_342                                                         0x3f554
+#define ixDPM_TABLE_343                                                         0x3f558
+#define ixDPM_TABLE_344                                                         0x3f55c
+#define ixDPM_TABLE_345                                                         0x3f560
+#define ixDPM_TABLE_346                                                         0x3f564
+#define ixDPM_TABLE_347                                                         0x3f568
+#define ixDPM_TABLE_348                                                         0x3f56c
+#define ixDPM_TABLE_349                                                         0x3f570
+#define ixDPM_TABLE_350                                                         0x3f574
+#define ixDPM_TABLE_351                                                         0x3f578
+#define ixDPM_TABLE_352                                                         0x3f57c
+#define ixDPM_TABLE_353                                                         0x3f580
+#define ixDPM_TABLE_354                                                         0x3f584
+#define ixDPM_TABLE_355                                                         0x3f588
+#define ixDPM_TABLE_356                                                         0x3f58c
+#define ixDPM_TABLE_357                                                         0x3f590
+#define ixDPM_TABLE_358                                                         0x3f594
+#define ixDPM_TABLE_359                                                         0x3f598
+#define ixDPM_TABLE_360                                                         0x3f59c
+#define ixDPM_TABLE_361                                                         0x3f5a0
+#define ixDPM_TABLE_362                                                         0x3f5a4
+#define ixDPM_TABLE_363                                                         0x3f5a8
+#define ixDPM_TABLE_364                                                         0x3f5ac
+#define ixDPM_TABLE_365                                                         0x3f5b0
+#define ixDPM_TABLE_366                                                         0x3f5b4
+#define ixDPM_TABLE_367                                                         0x3f5b8
+#define ixDPM_TABLE_368                                                         0x3f5bc
+#define ixDPM_TABLE_369                                                         0x3f5c0
+#define ixDPM_TABLE_370                                                         0x3f5c4
+#define ixDPM_TABLE_371                                                         0x3f5c8
+#define ixDPM_TABLE_372                                                         0x3f5cc
+#define ixDPM_TABLE_373                                                         0x3f5d0
+#define ixDPM_TABLE_374                                                         0x3f5d4
+#define ixDPM_TABLE_375                                                         0x3f5d8
+#define ixDPM_TABLE_376                                                         0x3f5dc
+#define ixDPM_TABLE_377                                                         0x3f5e0
+#define ixDPM_TABLE_378                                                         0x3f5e4
+#define ixDPM_TABLE_379                                                         0x3f5e8
+#define ixDPM_TABLE_380                                                         0x3f5ec
+#define ixDPM_TABLE_381                                                         0x3f5f0
+#define ixDPM_TABLE_382                                                         0x3f5f4
+#define ixDPM_TABLE_383                                                         0x3f5f8
+#define ixDPM_TABLE_384                                                         0x3f5fc
+#define ixDPM_TABLE_385                                                         0x3f600
+#define ixDPM_TABLE_386                                                         0x3f604
+#define ixDPM_TABLE_387                                                         0x3f608
+#define ixDPM_TABLE_388                                                         0x3f60c
+#define ixDPM_TABLE_389                                                         0x3f610
+#define ixDPM_TABLE_390                                                         0x3f614
+#define ixDPM_TABLE_391                                                         0x3f618
+#define ixDPM_TABLE_392                                                         0x3f61c
+#define ixDPM_TABLE_393                                                         0x3f620
+#define ixDPM_TABLE_394                                                         0x3f624
+#define ixDPM_TABLE_395                                                         0x3f628
+#define ixDPM_TABLE_396                                                         0x3f62c
+#define ixDPM_TABLE_397                                                         0x3f630
+#define ixDPM_TABLE_398                                                         0x3f634
+#define ixDPM_TABLE_399                                                         0x3f638
+#define ixDPM_TABLE_400                                                         0x3f63c
+#define ixDPM_TABLE_401                                                         0x3f640
+#define ixDPM_TABLE_402                                                         0x3f644
+#define ixDPM_TABLE_403                                                         0x3f648
+#define ixDPM_TABLE_404                                                         0x3f64c
+#define ixDPM_TABLE_405                                                         0x3f650
+#define ixDPM_TABLE_406                                                         0x3f654
+#define ixDPM_TABLE_407                                                         0x3f658
+#define ixDPM_TABLE_408                                                         0x3f65c
+#define ixDPM_TABLE_409                                                         0x3f660
+#define ixDPM_TABLE_410                                                         0x3f664
+#define ixDPM_TABLE_411                                                         0x3f668
+#define ixDPM_TABLE_412                                                         0x3f66c
+#define ixDPM_TABLE_413                                                         0x3f670
+#define ixDPM_TABLE_414                                                         0x3f674
+#define ixDPM_TABLE_415                                                         0x3f678
+#define ixDPM_TABLE_416                                                         0x3f67c
+#define ixDPM_TABLE_417                                                         0x3f680
+#define ixDPM_TABLE_418                                                         0x3f684
+#define ixDPM_TABLE_419                                                         0x3f688
+#define ixDPM_TABLE_420                                                         0x3f68c
+#define ixDPM_TABLE_421                                                         0x3f690
+#define ixDPM_TABLE_422                                                         0x3f694
+#define ixDPM_TABLE_423                                                         0x3f698
+#define ixDPM_TABLE_424                                                         0x3f69c
+#define ixDPM_TABLE_425                                                         0x3f6a0
+#define ixDPM_TABLE_426                                                         0x3f6a4
+#define ixDPM_TABLE_427                                                         0x3f6a8
+#define ixDPM_TABLE_428                                                         0x3f6ac
+#define ixDPM_TABLE_429                                                         0x3f6b0
+#define ixDPM_TABLE_430                                                         0x3f6b4
+#define ixDPM_TABLE_431                                                         0x3f6b8
+#define ixDPM_TABLE_432                                                         0x3f6bc
+#define ixDPM_TABLE_433                                                         0x3f6c0
+#define ixDPM_TABLE_434                                                         0x3f6c4
+#define ixDPM_TABLE_435                                                         0x3f6c8
+#define ixDPM_TABLE_436                                                         0x3f6cc
+#define ixDPM_TABLE_437                                                         0x3f6d0
+#define ixDPM_TABLE_438                                                         0x3f6d4
+#define ixDPM_TABLE_439                                                         0x3f6d8
+#define ixDPM_TABLE_440                                                         0x3f6dc
+#define ixDPM_TABLE_441                                                         0x3f6e0
+#define ixDPM_TABLE_442                                                         0x3f6e4
+#define ixDPM_TABLE_443                                                         0x3f6e8
+#define ixDPM_TABLE_444                                                         0x3f6ec
+#define ixDPM_TABLE_445                                                         0x3f6f0
+#define ixDPM_TABLE_446                                                         0x3f6f4
+#define ixDPM_TABLE_447                                                         0x3f6f8
+#define ixDPM_TABLE_448                                                         0x3f6fc
+#define ixDPM_TABLE_449                                                         0x3f700
+#define ixDPM_TABLE_450                                                         0x3f704
+#define ixDPM_TABLE_451                                                         0x3f708
+#define ixDPM_TABLE_452                                                         0x3f70c
+#define ixDPM_TABLE_453                                                         0x3f710
+#define ixDPM_TABLE_454                                                         0x3f714
+#define ixDPM_TABLE_455                                                         0x3f718
+#define ixDPM_TABLE_456                                                         0x3f71c
+#define ixDPM_TABLE_457                                                         0x3f720
+#define ixDPM_TABLE_458                                                         0x3f724
+#define ixDPM_TABLE_459                                                         0x3f728
+#define ixDPM_TABLE_460                                                         0x3f72c
+#define ixDPM_TABLE_461                                                         0x3f730
+#define ixDPM_TABLE_462                                                         0x3f734
+#define ixDPM_TABLE_463                                                         0x3f738
+#define ixDPM_TABLE_464                                                         0x3f73c
+#define ixDPM_TABLE_465                                                         0x3f740
+#define ixDPM_TABLE_466                                                         0x3f744
+#define ixDPM_TABLE_467                                                         0x3f748
+#define ixDPM_TABLE_468                                                         0x3f74c
+#define ixDPM_TABLE_469                                                         0x3f750
+#define ixDPM_TABLE_470                                                         0x3f754
+#define ixDPM_TABLE_471                                                         0x3f758
+#define ixDPM_TABLE_472                                                         0x3f75c
+#define ixDPM_TABLE_473                                                         0x3f760
+#define ixDPM_TABLE_474                                                         0x3f764
+#define ixDPM_TABLE_475                                                         0x3f768
+#define ixDPM_TABLE_476                                                         0x3f76c
+#define ixDPM_TABLE_477                                                         0x3f770
+#define ixDPM_TABLE_478                                                         0x3f774
+#define ixDPM_TABLE_479                                                         0x3f778
+#define ixDPM_TABLE_480                                                         0x3f77c
+#define ixDPM_TABLE_481                                                         0x3f780
+#define ixDPM_TABLE_482                                                         0x3f784
+#define ixDPM_TABLE_483                                                         0x3f788
+#define ixDPM_TABLE_484                                                         0x3f78c
+#define ixDPM_TABLE_485                                                         0x3f790
+#define ixDPM_TABLE_486                                                         0x3f794
+#define ixDPM_TABLE_487                                                         0x3f798
+#define ixDPM_TABLE_488                                                         0x3f79c
+#define ixDPM_TABLE_489                                                         0x3f7a0
+#define ixDPM_TABLE_490                                                         0x3f7a4
+#define ixDPM_TABLE_491                                                         0x3f7a8
+#define ixDPM_TABLE_492                                                         0x3f7ac
+#define ixDPM_TABLE_493                                                         0x3f7b0
+#define ixDPM_TABLE_494                                                         0x3f7b4
+#define ixDPM_TABLE_495                                                         0x3f7b8
+#define ixDPM_TABLE_496                                                         0x3f7bc
+#define ixDPM_TABLE_497                                                         0x3f7c0
+#define ixDPM_TABLE_498                                                         0x3f7c4
+#define ixDPM_TABLE_499                                                         0x3f7c8
+#define ixDPM_TABLE_500                                                         0x3f7cc
+#define ixDPM_TABLE_501                                                         0x3f7d0
+#define ixDPM_TABLE_502                                                         0x3f7d4
+#define ixDPM_TABLE_503                                                         0x3f7d8
+#define ixDPM_TABLE_504                                                         0x3f7dc
+#define ixDPM_TABLE_505                                                         0x3f7e0
+#define ixDPM_TABLE_506                                                         0x3f7e4
+#define ixFIRMWARE_FLAGS                                                        0x3f800
+#define ixTDC_STATUS                                                            0x3f808
+#define ixTDC_MV_AVERAGE                                                        0x3f80c
+#define ixTDC_VRM_LIMIT                                                         0x3f810
+#define ixFEATURE_STATUS                                                        0x3f818
+#define ixENTITY_TEMPERATURES_1                                                 0x3f81c
+#define ixMCARB_DRAM_TIMING_TABLE_1                                             0x3f900
+#define ixMCARB_DRAM_TIMING_TABLE_2                                             0x3f904
+#define ixMCARB_DRAM_TIMING_TABLE_3                                             0x3f908
+#define ixMCARB_DRAM_TIMING_TABLE_4                                             0x3f90c
+#define ixMCARB_DRAM_TIMING_TABLE_5                                             0x3f910
+#define ixMCARB_DRAM_TIMING_TABLE_6                                             0x3f914
+#define ixMCARB_DRAM_TIMING_TABLE_7                                             0x3f918
+#define ixMCARB_DRAM_TIMING_TABLE_8                                             0x3f91c
+#define ixMCARB_DRAM_TIMING_TABLE_9                                             0x3f920
+#define ixMCARB_DRAM_TIMING_TABLE_10                                            0x3f924
+#define ixMCARB_DRAM_TIMING_TABLE_11                                            0x3f928
+#define ixMCARB_DRAM_TIMING_TABLE_12                                            0x3f92c
+#define ixMCARB_DRAM_TIMING_TABLE_13                                            0x3f930
+#define ixMCARB_DRAM_TIMING_TABLE_14                                            0x3f934
+#define ixMCARB_DRAM_TIMING_TABLE_15                                            0x3f938
+#define ixMCARB_DRAM_TIMING_TABLE_16                                            0x3f93c
+#define ixMCARB_DRAM_TIMING_TABLE_17                                            0x3f940
+#define ixMCARB_DRAM_TIMING_TABLE_18                                            0x3f944
+#define ixMCARB_DRAM_TIMING_TABLE_19                                            0x3f948
+#define ixMCARB_DRAM_TIMING_TABLE_20                                            0x3f94c
+#define ixMCARB_DRAM_TIMING_TABLE_21                                            0x3f950
+#define ixMCARB_DRAM_TIMING_TABLE_22                                            0x3f954
+#define ixMCARB_DRAM_TIMING_TABLE_23                                            0x3f958
+#define ixMCARB_DRAM_TIMING_TABLE_24                                            0x3f95c
+#define ixMCARB_DRAM_TIMING_TABLE_25                                            0x3f960
+#define ixMCARB_DRAM_TIMING_TABLE_26                                            0x3f964
+#define ixMCARB_DRAM_TIMING_TABLE_27                                            0x3f968
+#define ixMCARB_DRAM_TIMING_TABLE_28                                            0x3f96c
+#define ixMCARB_DRAM_TIMING_TABLE_29                                            0x3f970
+#define ixMCARB_DRAM_TIMING_TABLE_30                                            0x3f974
+#define ixMCARB_DRAM_TIMING_TABLE_31                                            0x3f978
+#define ixMCARB_DRAM_TIMING_TABLE_32                                            0x3f97c
+#define ixMCARB_DRAM_TIMING_TABLE_33                                            0x3f980
+#define ixMCARB_DRAM_TIMING_TABLE_34                                            0x3f984
+#define ixMCARB_DRAM_TIMING_TABLE_35                                            0x3f988
+#define ixMCARB_DRAM_TIMING_TABLE_36                                            0x3f98c
+#define ixMCARB_DRAM_TIMING_TABLE_37                                            0x3f990
+#define ixMCARB_DRAM_TIMING_TABLE_38                                            0x3f994
+#define ixMCARB_DRAM_TIMING_TABLE_39                                            0x3f998
+#define ixMCARB_DRAM_TIMING_TABLE_40                                            0x3f99c
+#define ixMCARB_DRAM_TIMING_TABLE_41                                            0x3f9a0
+#define ixMCARB_DRAM_TIMING_TABLE_42                                            0x3f9a4
+#define ixMCARB_DRAM_TIMING_TABLE_43                                            0x3f9a8
+#define ixMCARB_DRAM_TIMING_TABLE_44                                            0x3f9ac
+#define ixMCARB_DRAM_TIMING_TABLE_45                                            0x3f9b0
+#define ixMCARB_DRAM_TIMING_TABLE_46                                            0x3f9b4
+#define ixMCARB_DRAM_TIMING_TABLE_47                                            0x3f9b8
+#define ixMCARB_DRAM_TIMING_TABLE_48                                            0x3f9bc
+#define ixMCARB_DRAM_TIMING_TABLE_49                                            0x3f9c0
+#define ixMCARB_DRAM_TIMING_TABLE_50                                            0x3f9c4
+#define ixMCARB_DRAM_TIMING_TABLE_51                                            0x3f9c8
+#define ixMCARB_DRAM_TIMING_TABLE_52                                            0x3f9cc
+#define ixMCARB_DRAM_TIMING_TABLE_53                                            0x3f9d0
+#define ixMCARB_DRAM_TIMING_TABLE_54                                            0x3f9d4
+#define ixMCARB_DRAM_TIMING_TABLE_55                                            0x3f9d8
+#define ixMCARB_DRAM_TIMING_TABLE_56                                            0x3f9dc
+#define ixMCARB_DRAM_TIMING_TABLE_57                                            0x3f9e0
+#define ixMCARB_DRAM_TIMING_TABLE_58                                            0x3f9e4
+#define ixMCARB_DRAM_TIMING_TABLE_59                                            0x3f9e8
+#define ixMCARB_DRAM_TIMING_TABLE_60                                            0x3f9ec
+#define ixMCARB_DRAM_TIMING_TABLE_61                                            0x3f9f0
+#define ixMCARB_DRAM_TIMING_TABLE_62                                            0x3f9f4
+#define ixMCARB_DRAM_TIMING_TABLE_63                                            0x3f9f8
+#define ixMCARB_DRAM_TIMING_TABLE_64                                            0x3f9fc
+#define ixMCARB_DRAM_TIMING_TABLE_65                                            0x3fa00
+#define ixMCARB_DRAM_TIMING_TABLE_66                                            0x3fa04
+#define ixMCARB_DRAM_TIMING_TABLE_67                                            0x3fa08
+#define ixMCARB_DRAM_TIMING_TABLE_68                                            0x3fa0c
+#define ixMCARB_DRAM_TIMING_TABLE_69                                            0x3fa10
+#define ixMCARB_DRAM_TIMING_TABLE_70                                            0x3fa14
+#define ixMCARB_DRAM_TIMING_TABLE_71                                            0x3fa18
+#define ixMCARB_DRAM_TIMING_TABLE_72                                            0x3fa1c
+#define ixMCARB_DRAM_TIMING_TABLE_73                                            0x3fa20
+#define ixMCARB_DRAM_TIMING_TABLE_74                                            0x3fa24
+#define ixMCARB_DRAM_TIMING_TABLE_75                                            0x3fa28
+#define ixMCARB_DRAM_TIMING_TABLE_76                                            0x3fa2c
+#define ixMCARB_DRAM_TIMING_TABLE_77                                            0x3fa30
+#define ixMCARB_DRAM_TIMING_TABLE_78                                            0x3fa34
+#define ixMCARB_DRAM_TIMING_TABLE_79                                            0x3fa38
+#define ixMCARB_DRAM_TIMING_TABLE_80                                            0x3fa3c
+#define ixMCARB_DRAM_TIMING_TABLE_81                                            0x3fa40
+#define ixMCARB_DRAM_TIMING_TABLE_82                                            0x3fa44
+#define ixMCARB_DRAM_TIMING_TABLE_83                                            0x3fa48
+#define ixMCARB_DRAM_TIMING_TABLE_84                                            0x3fa4c
+#define ixMCARB_DRAM_TIMING_TABLE_85                                            0x3fa50
+#define ixMCARB_DRAM_TIMING_TABLE_86                                            0x3fa54
+#define ixMCARB_DRAM_TIMING_TABLE_87                                            0x3fa58
+#define ixMCARB_DRAM_TIMING_TABLE_88                                            0x3fa5c
+#define ixMCARB_DRAM_TIMING_TABLE_89                                            0x3fa60
+#define ixMCARB_DRAM_TIMING_TABLE_90                                            0x3fa64
+#define ixMCARB_DRAM_TIMING_TABLE_91                                            0x3fa68
+#define ixMCARB_DRAM_TIMING_TABLE_92                                            0x3fa6c
+#define ixMCARB_DRAM_TIMING_TABLE_93                                            0x3fa70
+#define ixMCARB_DRAM_TIMING_TABLE_94                                            0x3fa74
+#define ixMCARB_DRAM_TIMING_TABLE_95                                            0x3fa78
+#define ixMCARB_DRAM_TIMING_TABLE_96                                            0x3fa7c
+#define ixMCARB_DRAM_TIMING_TABLE_97                                            0x3fa80
+#define ixMCARB_DRAM_TIMING_TABLE_98                                            0x3fa84
+#define ixMCARB_DRAM_TIMING_TABLE_99                                            0x3fa88
+#define ixMCARB_DRAM_TIMING_TABLE_100                                           0x3fa8c
+#define ixMCARB_DRAM_TIMING_TABLE_101                                           0x3fa90
+#define ixMCARB_DRAM_TIMING_TABLE_102                                           0x3fa94
+#define ixMCARB_DRAM_TIMING_TABLE_103                                           0x3fa98
+#define ixMCARB_DRAM_TIMING_TABLE_104                                           0x3fa9c
+#define ixMCARB_DRAM_TIMING_TABLE_105                                           0x3faa0
+#define ixMCARB_DRAM_TIMING_TABLE_106                                           0x3faa4
+#define ixMCARB_DRAM_TIMING_TABLE_107                                           0x3faa8
+#define ixMCARB_DRAM_TIMING_TABLE_108                                           0x3faac
+#define ixMCARB_DRAM_TIMING_TABLE_109                                           0x3fab0
+#define ixMCARB_DRAM_TIMING_TABLE_110                                           0x3fab4
+#define ixMCARB_DRAM_TIMING_TABLE_111                                           0x3fab8
+#define ixMCARB_DRAM_TIMING_TABLE_112                                           0x3fabc
+#define ixMCARB_DRAM_TIMING_TABLE_113                                           0x3fac0
+#define ixMCARB_DRAM_TIMING_TABLE_114                                           0x3fac4
+#define ixMCARB_DRAM_TIMING_TABLE_115                                           0x3fac8
+#define ixMCARB_DRAM_TIMING_TABLE_116                                           0x3facc
+#define ixMCARB_DRAM_TIMING_TABLE_117                                           0x3fad0
+#define ixMCARB_DRAM_TIMING_TABLE_118                                           0x3fad4
+#define ixMCARB_DRAM_TIMING_TABLE_119                                        

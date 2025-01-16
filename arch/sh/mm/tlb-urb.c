@@ -1,93 +1,50 @@
-/*
- * arch/sh/mm/tlb-urb.c
- *
- * TLB entry wiring helpers for URB-equipped parts.
- *
- * Copyright (C) 2010  Matt Fleming
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- */
-#include <linux/mm.h>
-#include <linux/io.h>
-#include <asm/tlb.h>
-#include <asm/mmu_context.h>
+ CONFIG_VIRTUAL_MEM_MAP
+# define VMALLOC_END_INIT	(RGN_BASE(RGN_GATE) + (1UL << (4*PAGE_SHIFT - 9)))
+extern unsigned long VMALLOC_END;
+#else
+#if defined(CONFIG_SPARSEMEM) && defined(CONFIG_SPARSEMEM_VMEMMAP)
+/* SPARSEMEM_VMEMMAP uses half of vmalloc... */
+# define VMALLOC_END		(RGN_BASE(RGN_GATE) + (1UL << (4*PAGE_SHIFT - 10)))
+# define vmemmap		((struct page *)VMALLOC_END)
+#else
+# define VMALLOC_END		(RGN_BASE(RGN_GATE) + (1UL << (4*PAGE_SHIFT - 9)))
+#endif
+#endif
+
+/* fs/proc/kcore.c */
+#define	kc_vaddr_to_offset(v) ((v) - RGN_BASE(RGN_GATE))
+#define	kc_offset_to_vaddr(o) ((o) + RGN_BASE(RGN_GATE))
+
+#define RGN_MAP_SHIFT (PGDIR_SHIFT + PTRS_PER_PGD_SHIFT - 3)
+#define RGN_MAP_LIMIT	((1UL << RGN_MAP_SHIFT) - PAGE_SIZE)	/* per region addr limit */
 
 /*
- * Load the entry for 'addr' into the TLB and wire the entry.
+ * Conversion functions: convert page frame number (pfn) and a protection value to a page
+ * table entry (pte).
  */
-void tlb_wire_entry(struct vm_area_struct *vma, unsigned long addr, pte_t pte)
-{
-	unsigned long status, flags;
-	int urb;
+#define pfn_pte(pfn, pgprot) \
+({ pte_t __pte; pte_val(__pte) = ((pfn) << PAGE_SHIFT) | pgprot_val(pgprot); __pte; })
 
-	local_irq_save(flags);
+/* Extract pfn from pte.  */
+#define pte_pfn(_pte)		((pte_val(_pte) & _PFN_MASK) >> PAGE_SHIFT)
 
-	status = __raw_readl(MMUCR);
-	urb = (status & MMUCR_URB) >> MMUCR_URB_SHIFT;
-	status &= ~MMUCR_URC;
+#define mk_pte(page, pgprot)	pfn_pte(page_to_pfn(page), (pgprot))
 
-	/*
-	 * Make sure we're not trying to wire the last TLB entry slot.
-	 */
-	BUG_ON(!--urb);
+/* This takes a physical page address that is used by the remapping functions */
+#define mk_pte_phys(physpage, pgprot) \
+({ pte_t __pte; pte_val(__pte) = physpage + pgprot_val(pgprot); __pte; })
 
-	urb = urb % MMUCR_URB_NENTRIES;
+#define pte_modify(_pte, newprot) \
+	(__pte((pte_val(_pte) & ~_PAGE_CHG_MASK) | (pgprot_val(newprot) & _PAGE_CHG_MASK)))
 
-	/*
-	 * Insert this entry into the highest non-wired TLB slot (via
-	 * the URC field).
-	 */
-	status |= (urb << MMUCR_URC_SHIFT);
-	__raw_writel(status, MMUCR);
-	ctrl_barrier();
+#define pte_none(pte) 			(!pte_val(pte))
+#define pte_present(pte)		(pte_val(pte) & (_PAGE_P | _PAGE_PROTNONE))
+#define pte_clear(mm,addr,pte)		(pte_val(*(pte)) = 0UL)
+/* pte_page() returns the "struct page *" corresponding to the PTE: */
+#define pte_page(pte)			virt_to_page(((pte_val(pte) & _PFN_MASK) + PAGE_OFFSET))
 
-	/* Load the entry into the TLB */
-	__update_tlb(vma, addr, pte);
-
-	/* ... and wire it up. */
-	status = __raw_readl(MMUCR);
-
-	status &= ~MMUCR_URB;
-	status |= (urb << MMUCR_URB_SHIFT);
-
-	__raw_writel(status, MMUCR);
-	ctrl_barrier();
-
-	local_irq_restore(flags);
-}
-
-/*
- * Unwire the last wired TLB entry.
- *
- * It should also be noted that it is not possible to wire and unwire
- * TLB entries in an arbitrary order. If you wire TLB entry N, followed
- * by entry N+1, you must unwire entry N+1 first, then entry N. In this
- * respect, it works like a stack or LIFO queue.
- */
-void tlb_unwire_entry(void)
-{
-	unsigned long status, flags;
-	int urb;
-
-	local_irq_save(flags);
-
-	status = __raw_readl(MMUCR);
-	urb = (status & MMUCR_URB) >> MMUCR_URB_SHIFT;
-	status &= ~MMUCR_URB;
-
-	/*
-	 * Make sure we're not trying to unwire a TLB entry when none
-	 * have been wired.
-	 */
-	BUG_ON(urb++ == MMUCR_URB_NENTRIES);
-
-	urb = urb % MMUCR_URB_NENTRIES;
-
-	status |= (urb << MMUCR_URB_SHIFT);
-	__raw_writel(status, MMUCR);
-	ctrl_barrier();
-
-	local_irq_restore(flags);
-}
+#define pmd_none(pmd)			(!pmd_val(pmd))
+#define pmd_bad(pmd)			(!ia64_phys_addr_valid(pmd_val(pmd)))
+#define pmd_present(pmd)		(pmd_val(pmd) != 0UL)
+#define pmd_clear(pmdp)			(pmd_val(*(pmdp)) = 0UL)
+#define pmd_page_vaddr(pmd)		((unsigned long) __va(pmd_val(pmd) & _PFN

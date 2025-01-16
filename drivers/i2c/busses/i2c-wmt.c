@@ -1,476 +1,425 @@
-/*
- *  Wondermedia I2C Master Mode Driver
- *
- *  Copyright (C) 2012 Tony Prisk <linux@prisktech.co.nz>
- *
- *  Derived from GPLv2+ licensed source:
- *  - Copyright (C) 2008 WonderMedia Technologies, Inc.
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License version 2, or
- *  (at your option) any later version. as published by the Free Software
- *  Foundation
- */
-
-#include <linux/clk.h>
-#include <linux/delay.h>
-#include <linux/err.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_irq.h>
-#include <linux/platform_device.h>
-
-#define REG_CR		0x00
-#define REG_TCR		0x02
-#define REG_CSR		0x04
-#define REG_ISR		0x06
-#define REG_IMR		0x08
-#define REG_CDR		0x0A
-#define REG_TR		0x0C
-#define REG_MCR		0x0E
-#define REG_SLAVE_CR	0x10
-#define REG_SLAVE_SR	0x12
-#define REG_SLAVE_ISR	0x14
-#define REG_SLAVE_IMR	0x16
-#define REG_SLAVE_DR	0x18
-#define REG_SLAVE_TR	0x1A
-
-/* REG_CR Bit fields */
-#define CR_TX_NEXT_ACK		0x0000
-#define CR_ENABLE		0x0001
-#define CR_TX_NEXT_NO_ACK	0x0002
-#define CR_TX_END		0x0004
-#define CR_CPU_RDY		0x0008
-#define SLAV_MODE_SEL		0x8000
-
-/* REG_TCR Bit fields */
-#define TCR_STANDARD_MODE	0x0000
-#define TCR_MASTER_WRITE	0x0000
-#define TCR_HS_MODE		0x2000
-#define TCR_MASTER_READ		0x4000
-#define TCR_FAST_MODE		0x8000
-#define TCR_SLAVE_ADDR_MASK	0x007F
-
-/* REG_ISR Bit fields */
-#define ISR_NACK_ADDR		0x0001
-#define ISR_BYTE_END		0x0002
-#define ISR_SCL_TIMEOUT		0x0004
-#define ISR_WRITE_ALL		0x0007
-
-/* REG_IMR Bit fields */
-#define IMR_ENABLE_ALL		0x0007
-
-/* REG_CSR Bit fields */
-#define CSR_RCV_NOT_ACK		0x0001
-#define CSR_RCV_ACK_MASK	0x0001
-#define CSR_READY_MASK		0x0002
-
-/* REG_TR */
-#define SCL_TIMEOUT(x)		(((x) & 0xFF) << 8)
-#define TR_STD			0x0064
-#define TR_HS			0x0019
-
-/* REG_MCR */
-#define MCR_APB_96M		7
-#define MCR_APB_166M		12
-
-#define I2C_MODE_STANDARD	0
-#define I2C_MODE_FAST		1
-
-#define WMT_I2C_TIMEOUT		(msecs_to_jiffies(1000))
-
-struct wmt_i2c_dev {
-	struct i2c_adapter	adapter;
-	struct completion	complete;
-	struct device		*dev;
-	void __iomem		*base;
-	struct clk		*clk;
-	int			mode;
-	int			irq;
-	u16			cmd_status;
-};
-
-static int wmt_i2c_wait_bus_not_busy(struct wmt_i2c_dev *i2c_dev)
+	  __le32 *rhf_addr, struct qib_message_header *rhdr)
 {
-	unsigned long timeout;
+	u32 ret = 0;
 
-	timeout = jiffies + WMT_I2C_TIMEOUT;
-	while (!(readw(i2c_dev->base + REG_CSR) & CSR_READY_MASK)) {
-		if (time_after(jiffies, timeout)) {
-			dev_warn(i2c_dev->dev, "timeout waiting for bus ready\n");
-			return -EBUSY;
+	if (eflags & (QLOGIC_IB_RHF_H_ICRCERR | QLOGIC_IB_RHF_H_VCRCERR))
+		ret = 1;
+	else if (eflags == QLOGIC_IB_RHF_H_TIDERR) {
+		/* For TIDERR and RC QPs premptively schedule a NAK */
+		struct qib_ib_header *hdr = (struct qib_ib_header *) rhdr;
+		struct qib_other_headers *ohdr = NULL;
+		struct qib_ibport *ibp = &ppd->ibport_data;
+		struct qib_qp *qp = NULL;
+		u32 tlen = qib_hdrget_length_in_bytes(rhf_addr);
+		u16 lid  = be16_to_cpu(hdr->lrh[1]);
+		int lnh = be16_to_cpu(hdr->lrh[0]) & 3;
+		u32 qp_num;
+		u32 opcode;
+		u32 psn;
+		int diff;
+
+		/* Sanity check packet */
+		if (tlen < 24)
+			goto drop;
+
+		if (lid < QIB_MULTICAST_LID_BASE) {
+			lid &= ~((1 << ppd->lmc) - 1);
+			if (unlikely(lid != ppd->lid))
+				goto drop;
 		}
-		msleep(20);
-	}
 
-	return 0;
-}
+		/* Check for GRH */
+		if (lnh == QIB_LRH_BTH)
+			ohdr = &hdr->u.oth;
+		else if (lnh == QIB_LRH_GRH) {
+			u32 vtf;
 
-static int wmt_check_status(struct wmt_i2c_dev *i2c_dev)
-{
-	int ret = 0;
+			ohdr = &hdr->u.l.oth;
+			if (hdr->u.l.grh.next_hdr != IB_GRH_NEXT_HDR)
+				goto drop;
+			vtf = be32_to_cpu(hdr->u.l.grh.version_tclass_flow);
+			if ((vtf >> IB_GRH_VERSION_SHIFT) != IB_GRH_VERSION)
+				goto drop;
+		} else
+			goto drop;
 
-	if (i2c_dev->cmd_status & ISR_NACK_ADDR)
-		ret = -EIO;
+		/* Get opcode and PSN from packet */
+		opcode = be32_to_cpu(ohdr->bth[0]);
+		opcode >>= 24;
+		psn = be32_to_cpu(ohdr->bth[2]);
 
-	if (i2c_dev->cmd_status & ISR_SCL_TIMEOUT)
-		ret = -ETIMEDOUT;
+		/* Get the destination QP number. */
+		qp_num = be32_to_cpu(ohdr->bth[1]) & QIB_QPN_MASK;
+		if (qp_num != QIB_MULTICAST_QPN) {
+			int ruc_res;
 
+			qp = qib_lookup_qpn(ibp, qp_num);
+			if (!qp)
+				goto drop;
+
+			/*
+			 * Handle only RC QPs - for other QP types drop error
+			 * packet.
+			 */
+			spin_lock(&qp->r_lock);
+
+			/* Check for valid receive state. */
+			if (!(ib_qib_state_ops[qp->state] &
+			      QIB_PROCESS_RECV_OK)) {
+				ibp->n_pkt_drops++;
+				goto unlock;
+			}
+
+			switch (qp->ibqp.qp_type) {
+			case IB_QPT_RC:
+				ruc_res =
+					qib_ruc_check_hdr(
+						ibp, hdr,
+						lnh == QIB_LRH_GRH,
+						qp,
+						be32_to_cpu(ohdr->bth[0]));
+				if (ruc_res)
+					goto unlock;
+
+				/* Only deal with RDMA Writes for now */
+				if (opcode <
+				    IB_OPCODE_RC_RDMA_READ_RESPONSE_FIRST) {
+					diff = qib_cmp24(psn, qp->r_psn);
+					if (!qp->r_nak_state && diff >= 0) {
+						ibp->n_rc_seqnak++;
+						qp->r_nak_state =
+							IB_NAK_PSN_ERROR;
+						/* Use the expected PSN. */
+						qp->r_ack_psn = qp->r_psn;
+						/*
+						 * Wait to send the sequence
+						 * NAK until all packets
+						 * in the receive queue have
+						 * been processed.
+						 * Otherwise, we end up
+						 * propagating congestion.
+						 */
+						if (list_empty(&qp->rspwait)) {
+							qp->r_flags |=
+								QIB_R_RSP_NAK;
+							atomic_inc(
+								&qp->refcount);
+							list_add_tail(
+							 &qp->rspwait,
+							 &rcd->qp_wait_list);
+						}
+					} /* Out of sequence NAK */
+				} /* QP Request NAKs */
+				break;
+			case IB_QPT_SMI:
+			case IB_QPT_GSI:
+			case IB_QPT_UD:
+			case IB_QPT_UC:
+			default:
+				/* For now don't handle any other QP types */
+				break;
+			}
+
+unlock:
+			spin_unlock(&qp->r_lock);
+			/*
+			 * Notify qib_destroy_qp() if it is waiting
+			 * for us to finish.
+			 */
+			if (atomic_dec_and_test(&qp->refcount))
+				wake_up(&qp->wait);
+		} /* Unicast QP */
+	} /* Valid packet with TIDErr */
+
+drop:
 	return ret;
 }
 
-static int wmt_i2c_write(struct i2c_adapter *adap, struct i2c_msg *pmsg,
-			 int last)
+/*
+ * qib_kreceive - receive a packet
+ * @rcd: the qlogic_ib context
+ * @llic: gets count of good packets needed to clear lli,
+ *          (used with chips that need need to track crcs for lli)
+ *
+ * called from interrupt handler for errors or receive interrupt
+ * Returns number of CRC error packets, needed by some chips for
+ * local link integrity tracking.   crcs are adjusted down by following
+ * good packets, if any, and count of good packets is also tracked.
+ */
+u32 qib_kreceive(struct qib_ctxtdata *rcd, u32 *llic, u32 *npkts)
 {
-	struct wmt_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
-	u16 val, tcr_val;
-	int ret;
-	unsigned long wait_result;
-	int xfer_len = 0;
+	struct qib_devdata *dd = rcd->dd;
+	struct qib_pportdata *ppd = rcd->ppd;
+	__le32 *rhf_addr;
+	void *ebuf;
+	const u32 rsize = dd->rcvhdrentsize;        /* words */
+	const u32 maxcnt = dd->rcvhdrcnt * rsize;   /* words */
+	u32 etail = -1, l, hdrqtail;
+	struct qib_message_header *hdr;
+	u32 eflags, etype, tlen, i = 0, updegr = 0, crcs = 0;
+	int last;
+	u64 lval;
+	struct qib_qp *qp, *nqp;
 
-	if (!(pmsg->flags & I2C_M_NOSTART)) {
-		ret = wmt_i2c_wait_bus_not_busy(i2c_dev);
-		if (ret < 0)
-			return ret;
-	}
+	l = rcd->head;
+	rhf_addr = (__le32 *) rcd->rcvhdrq + l + dd->rhf_offset;
+	if (dd->flags & QIB_NODMA_RTAIL) {
+		u32 seq = qib_hdrget_seq(rhf_addr);
 
-	if (pmsg->len == 0) {
-		/*
-		 * We still need to run through the while (..) once, so
-		 * start at -1 and break out early from the loop
-		 */
-		xfer_len = -1;
-		writew(0, i2c_dev->base + REG_CDR);
+		if (seq != rcd->seq_cnt)
+			goto bail;
+		hdrqtail = 0;
 	} else {
-		writew(pmsg->buf[0] & 0xFF, i2c_dev->base + REG_CDR);
+		hdrqtail = qib_get_rcvhdrtail(rcd);
+		if (l == hdrqtail)
+			goto bail;
+		smp_rmb();  /* prevent speculative reads of dma'ed hdrq */
 	}
 
-	if (!(pmsg->flags & I2C_M_NOSTART)) {
-		val = readw(i2c_dev->base + REG_CR);
-		val &= ~CR_TX_END;
-		writew(val, i2c_dev->base + REG_CR);
+	for (last = 0, i = 1; !last; i += !last) {
+		hdr = dd->f_get_msgheader(dd, rhf_addr);
+		eflags = qib_hdrget_err_flags(rhf_addr);
+		etype = qib_hdrget_rcv_type(rhf_addr);
+		/* total length */
+		tlen = qib_hdrget_length_in_bytes(rhf_addr);
+		ebuf = NULL;
+		if ((dd->flags & QIB_NODMA_RTAIL) ?
+		    qib_hdrget_use_egr_buf(rhf_addr) :
+		    (etype != RCVHQ_RCV_TYPE_EXPECTED)) {
+			etail = qib_hdrget_index(rhf_addr);
+			updegr = 1;
+			if (tlen > sizeof(*hdr) ||
+			    etype >= RCVHQ_RCV_TYPE_NON_KD) {
+				ebuf = qib_get_egrbuf(rcd, etail);
+				prefetch_range(ebuf, tlen - sizeof(*hdr));
+			}
+		}
+		if (!eflags) {
+			u16 lrh_len = be16_to_cpu(hdr->lrh[2]) << 2;
 
-		val = readw(i2c_dev->base + REG_CR);
-		val |= CR_CPU_RDY;
-		writew(val, i2c_dev->base + REG_CR);
-	}
-
-	reinit_completion(&i2c_dev->complete);
-
-	if (i2c_dev->mode == I2C_MODE_STANDARD)
-		tcr_val = TCR_STANDARD_MODE;
-	else
-		tcr_val = TCR_FAST_MODE;
-
-	tcr_val |= (TCR_MASTER_WRITE | (pmsg->addr & TCR_SLAVE_ADDR_MASK));
-
-	writew(tcr_val, i2c_dev->base + REG_TCR);
-
-	if (pmsg->flags & I2C_M_NOSTART) {
-		val = readw(i2c_dev->base + REG_CR);
-		val |= CR_CPU_RDY;
-		writew(val, i2c_dev->base + REG_CR);
-	}
-
-	while (xfer_len < pmsg->len) {
-		wait_result = wait_for_completion_timeout(&i2c_dev->complete,
-							msecs_to_jiffies(500));
-
-		if (wait_result == 0)
-			return -ETIMEDOUT;
-
-		ret = wmt_check_status(i2c_dev);
-		if (ret)
-			return ret;
-
-		xfer_len++;
-
-		val = readw(i2c_dev->base + REG_CSR);
-		if ((val & CSR_RCV_ACK_MASK) == CSR_RCV_NOT_ACK) {
-			dev_dbg(i2c_dev->dev, "write RCV NACK error\n");
-			return -EIO;
+			if (lrh_len != tlen) {
+				qib_stats.sps_lenerrs++;
+				goto move_along;
+			}
+		}
+		if (etype == RCVHQ_RCV_TYPE_NON_KD && !eflags &&
+		    ebuf == NULL &&
+		    tlen > (dd->rcvhdrentsize - 2 + 1 -
+				qib_hdrget_offset(rhf_addr)) << 2) {
+			goto move_along;
 		}
 
-		if (pmsg->len == 0) {
-			val = CR_TX_END | CR_CPU_RDY | CR_ENABLE;
-			writew(val, i2c_dev->base + REG_CR);
-			break;
+		/*
+		 * Both tiderr and qibhdrerr are set for all plain IB
+		 * packets; only qibhdrerr should be set.
+		 */
+		if (unlikely(eflags))
+			crcs += qib_rcv_hdrerr(rcd, ppd, rcd->ctxt, eflags, l,
+					       etail, rhf_addr, hdr);
+		else if (etype == RCVHQ_RCV_TYPE_NON_KD) {
+			qib_ib_rcv(rcd, hdr, ebuf, tlen);
+			if (crcs)
+				crcs--;
+			else if (llic && *llic)
+				--*llic;
 		}
+move_along:
+		l += rsize;
+		if (l >= maxcnt)
+			l = 0;
+		if (i == QIB_MAX_PKT_RECV)
+			last = 1;
 
-		if (xfer_len == pmsg->len) {
-			if (last != 1)
-				writew(CR_ENABLE, i2c_dev->base + REG_CR);
-		} else {
-			writew(pmsg->buf[xfer_len] & 0xFF, i2c_dev->base +
-								REG_CDR);
-			writew(CR_CPU_RDY | CR_ENABLE, i2c_dev->base + REG_CR);
-		}
-	}
+		rhf_addr = (__le32 *) rcd->rcvhdrq + l + dd->rhf_offset;
+		if (dd->flags & QIB_NODMA_RTAIL) {
+			u32 seq = qib_hdrget_seq(rhf_addr);
 
-	return 0;
-}
-
-static int wmt_i2c_read(struct i2c_adapter *adap, struct i2c_msg *pmsg,
-			int last)
-{
-	struct wmt_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
-	u16 val, tcr_val;
-	int ret;
-	unsigned long wait_result;
-	u32 xfer_len = 0;
-
-	if (!(pmsg->flags & I2C_M_NOSTART)) {
-		ret = wmt_i2c_wait_bus_not_busy(i2c_dev);
-		if (ret < 0)
-			return ret;
-	}
-
-	val = readw(i2c_dev->base + REG_CR);
-	val &= ~CR_TX_END;
-	writew(val, i2c_dev->base + REG_CR);
-
-	val = readw(i2c_dev->base + REG_CR);
-	val &= ~CR_TX_NEXT_NO_ACK;
-	writew(val, i2c_dev->base + REG_CR);
-
-	if (!(pmsg->flags & I2C_M_NOSTART)) {
-		val = readw(i2c_dev->base + REG_CR);
-		val |= CR_CPU_RDY;
-		writew(val, i2c_dev->base + REG_CR);
-	}
-
-	if (pmsg->len == 1) {
-		val = readw(i2c_dev->base + REG_CR);
-		val |= CR_TX_NEXT_NO_ACK;
-		writew(val, i2c_dev->base + REG_CR);
-	}
-
-	reinit_completion(&i2c_dev->complete);
-
-	if (i2c_dev->mode == I2C_MODE_STANDARD)
-		tcr_val = TCR_STANDARD_MODE;
-	else
-		tcr_val = TCR_FAST_MODE;
-
-	tcr_val |= TCR_MASTER_READ | (pmsg->addr & TCR_SLAVE_ADDR_MASK);
-
-	writew(tcr_val, i2c_dev->base + REG_TCR);
-
-	if (pmsg->flags & I2C_M_NOSTART) {
-		val = readw(i2c_dev->base + REG_CR);
-		val |= CR_CPU_RDY;
-		writew(val, i2c_dev->base + REG_CR);
-	}
-
-	while (xfer_len < pmsg->len) {
-		wait_result = wait_for_completion_timeout(&i2c_dev->complete,
-							msecs_to_jiffies(500));
-
-		if (!wait_result)
-			return -ETIMEDOUT;
-
-		ret = wmt_check_status(i2c_dev);
-		if (ret)
-			return ret;
-
-		pmsg->buf[xfer_len] = readw(i2c_dev->base + REG_CDR) >> 8;
-		xfer_len++;
-
-		if (xfer_len == pmsg->len - 1) {
-			val = readw(i2c_dev->base + REG_CR);
-			val |= (CR_TX_NEXT_NO_ACK | CR_CPU_RDY);
-			writew(val, i2c_dev->base + REG_CR);
-		} else {
-			val = readw(i2c_dev->base + REG_CR);
-			val |= CR_CPU_RDY;
-			writew(val, i2c_dev->base + REG_CR);
+			if (++rcd->seq_cnt > 13)
+				rcd->seq_cnt = 1;
+			if (seq != rcd->seq_cnt)
+				last = 1;
+		} else if (l == hdrqtail)
+			last = 1;
+		/*
+		 * Update head regs etc., every 16 packets, if not last pkt,
+		 * to help prevent rcvhdrq overflows, when many packets
+		 * are processed and queue is nearly full.
+		 * Don't request an interrupt for intermediate updates.
+		 */
+		lval = l;
+		if (!last && !(i & 0xf)) {
+			dd->f_update_usrhead(rcd, lval, updegr, etail, i);
+			updegr = 0;
 		}
 	}
+	/*
+	 * Notify qib_destroy_qp() if it is waiting
+	 * for lookaside_qp to finish.
+	 */
+	if (rcd->lookaside_qp) {
+		if (atomic_dec_and_test(&rcd->lookaside_qp->refcount))
+			wake_up(&rcd->lookaside_qp->wait);
+		rcd->lookaside_qp = NULL;
+	}
+
+	rcd->head = l;
+
+	/*
+	 * Iterate over all QPs waiting to respond.
+	 * The list won't change since the IRQ is only run on one CPU.
+	 */
+	list_for_each_entry_safe(qp, nqp, &rcd->qp_wait_list, rspwait) {
+		list_del_init(&qp->rspwait);
+		if (qp->r_flags & QIB_R_RSP_NAK) {
+			qp->r_flags &= ~QIB_R_RSP_NAK;
+			qib_send_rc_ack(qp);
+		}
+		if (qp->r_flags & QIB_R_RSP_SEND) {
+			unsigned long flags;
+
+			qp->r_flags &= ~QIB_R_RSP_SEND;
+			spin_lock_irqsave(&qp->s_lock, flags);
+			if (ib_qib_state_ops[qp->state] &
+					QIB_PROCESS_OR_FLUSH_SEND)
+				qib_schedule_send(qp);
+			spin_unlock_irqrestore(&qp->s_lock, flags);
+		}
+		if (atomic_dec_and_test(&qp->refcount))
+			wake_up(&qp->wait);
+	}
+
+bail:
+	/* Report number of packets consumed */
+	if (npkts)
+		*npkts = i;
+
+	/*
+	 * Always write head at end, and setup rcv interrupt, even
+	 * if no packets were processed.
+	 */
+	lval = (u64)rcd->head | dd->rhdrhead_intr_off;
+	dd->f_update_usrhead(rcd, lval, updegr, etail, i);
+	return crcs;
+}
+
+/**
+ * qib_set_mtu - set the MTU
+ * @ppd: the perport data
+ * @arg: the new MTU
+ *
+ * We can handle "any" incoming size, the issue here is whether we
+ * need to restrict our outgoing size.   For now, we don't do any
+ * sanity checking on this, and we don't deal with what happens to
+ * programs that are already running when the size changes.
+ * NOTE: changing the MTU will usually cause the IBC to go back to
+ * link INIT state...
+ */
+int qib_set_mtu(struct qib_pportdata *ppd, u16 arg)
+{
+	u32 piosize;
+	int ret, chk;
+
+	if (arg != 256 && arg != 512 && arg != 1024 && arg != 2048 &&
+	    arg != 4096) {
+		ret = -EINVAL;
+		goto bail;
+	}
+	chk = ib_mtu_enum_to_int(qib_ibmtu);
+	if (chk > 0 && arg > chk) {
+		ret = -EINVAL;
+		goto bail;
+	}
+
+	piosize = ppd->ibmaxlen;
+	ppd->ibmtu = arg;
+
+	if (arg >= (piosize - QIB_PIO_MAXIBHDR)) {
+		/* Only if it's not the initial value (or reset to it) */
+		if (piosize != ppd->init_ibmaxlen) {
+			if (arg > piosize && arg <= ppd->init_ibmaxlen)
+				piosize = ppd->init_ibmaxlen - 2 * sizeof(u32);
+			ppd->ibmaxlen = piosize;
+		}
+	} else if ((arg + QIB_PIO_MAXIBHDR) != ppd->ibmaxlen) {
+		piosize = arg + QIB_PIO_MAXIBHDR - 2 * sizeof(u32);
+		ppd->ibmaxlen = piosize;
+	}
+
+	ppd->dd->f_set_ib_cfg(ppd, QIB_IB_CFG_MTU, 0);
+
+	ret = 0;
+
+bail:
+	return ret;
+}
+
+int qib_set_lid(struct qib_pportdata *ppd, u32 lid, u8 lmc)
+{
+	struct qib_devdata *dd = ppd->dd;
+
+	ppd->lid = lid;
+	ppd->lmc = lmc;
+
+	dd->f_set_ib_cfg(ppd, QIB_IB_CFG_LIDLMC,
+			 lid | (~((1U << lmc) - 1)) << 16);
+
+	qib_devinfo(dd->pcidev, "IB%u:%u got a lid: 0x%x\n",
+		    dd->unit, ppd->port, lid);
 
 	return 0;
 }
 
-static int wmt_i2c_xfer(struct i2c_adapter *adap,
-			struct i2c_msg msgs[],
-			int num)
+/*
+ * Following deal with the "obviously simple" task of overriding the state
+ * of the LEDS, which normally indicate link physical and logical status.
+ * The complications arise in dealing with different hardware mappings
+ * and the board-dependent routine being called from interrupts.
+ * and then there's the requirement to _flash_ them.
+ */
+#define LED_OVER_FREQ_SHIFT 8
+#define LED_OVER_FREQ_MASK (0xFF<<LED_OVER_FREQ_SHIFT)
+/* Below is "non-zero" to force override, but both actual LEDs are off */
+#define LED_OVER_BOTH_OFF (8)
+
+static void qib_run_led_override(unsigned long opaque)
 {
-	struct i2c_msg *pmsg;
-	int i, is_last;
-	int ret = 0;
+	struct qib_pportdata *ppd = (struct qib_pportdata *)opaque;
+	struct qib_devdata *dd = ppd->dd;
+	int timeoff;
+	int ph_idx;
 
-	for (i = 0; ret >= 0 && i < num; i++) {
-		is_last = ((i + 1) == num);
+	if (!(dd->flags & QIB_INITTED))
+		return;
 
-		pmsg = &msgs[i];
-		if (pmsg->flags & I2C_M_RD)
-			ret = wmt_i2c_read(adap, pmsg, is_last);
-		else
-			ret = wmt_i2c_write(adap, pmsg, is_last);
-	}
+	ph_idx = ppd->led_override_phase++ & 1;
+	ppd->led_override = ppd->led_override_vals[ph_idx];
+	timeoff = ppd->led_override_timeoff;
 
-	return (ret < 0) ? ret : i;
+	dd->f_setextled(ppd, 1);
+	/*
+	 * don't re-fire the timer if user asked for it to be off; we let
+	 * it fire one more time after they turn it off to simplify
+	 */
+	if (ppd->led_override_vals[0] || ppd->led_override_vals[1])
+		mod_timer(&ppd->led_override_timer, jiffies + timeoff);
 }
 
-static u32 wmt_i2c_func(struct i2c_adapter *adap)
+void qib_set_led_override(struct qib_pportdata *ppd, unsigned int val)
 {
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL | I2C_FUNC_NOSTART;
-}
+	struct qib_devdata *dd = ppd->dd;
+	int timeoff, freq;
 
-static const struct i2c_algorithm wmt_i2c_algo = {
-	.master_xfer	= wmt_i2c_xfer,
-	.functionality	= wmt_i2c_func,
-};
+	if (!(dd->flags & QIB_INITTED))
+		return;
 
-static irqreturn_t wmt_i2c_isr(int irq, void *data)
-{
-	struct wmt_i2c_dev *i2c_dev = data;
+	/* First check if we are blinking. If not, use 1HZ polling */
+	timeoff = HZ;
+	freq = (val & LED_OVER_FREQ_MASK) >> LED_OVER_FREQ_SHIFT;
 
-	/* save the status and write-clear it */
-	i2c_dev->cmd_status = readw(i2c_dev->base + REG_ISR);
-	writew(i2c_dev->cmd_status, i2c_dev->base + REG_ISR);
-
-	complete(&i2c_dev->complete);
-
-	return IRQ_HANDLED;
-}
-
-static int wmt_i2c_reset_hardware(struct wmt_i2c_dev *i2c_dev)
-{
-	int err;
-
-	err = clk_prepare_enable(i2c_dev->clk);
-	if (err) {
-		dev_err(i2c_dev->dev, "failed to enable clock\n");
-		return err;
-	}
-
-	err = clk_set_rate(i2c_dev->clk, 20000000);
-	if (err) {
-		dev_err(i2c_dev->dev, "failed to set clock = 20Mhz\n");
-		clk_disable_unprepare(i2c_dev->clk);
-		return err;
-	}
-
-	writew(0, i2c_dev->base + REG_CR);
-	writew(MCR_APB_166M, i2c_dev->base + REG_MCR);
-	writew(ISR_WRITE_ALL, i2c_dev->base + REG_ISR);
-	writew(IMR_ENABLE_ALL, i2c_dev->base + REG_IMR);
-	writew(CR_ENABLE, i2c_dev->base + REG_CR);
-	readw(i2c_dev->base + REG_CSR);		/* read clear */
-	writew(ISR_WRITE_ALL, i2c_dev->base + REG_ISR);
-
-	if (i2c_dev->mode == I2C_MODE_STANDARD)
-		writew(SCL_TIMEOUT(128) | TR_STD, i2c_dev->base + REG_TR);
-	else
-		writew(SCL_TIMEOUT(128) | TR_HS, i2c_dev->base + REG_TR);
-
-	return 0;
-}
-
-static int wmt_i2c_probe(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct wmt_i2c_dev *i2c_dev;
-	struct i2c_adapter *adap;
-	struct resource *res;
-	int err;
-	u32 clk_rate;
-
-	i2c_dev = devm_kzalloc(&pdev->dev, sizeof(*i2c_dev), GFP_KERNEL);
-	if (!i2c_dev)
-		return -ENOMEM;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	i2c_dev->base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(i2c_dev->base))
-		return PTR_ERR(i2c_dev->base);
-
-	i2c_dev->irq = irq_of_parse_and_map(np, 0);
-	if (!i2c_dev->irq) {
-		dev_err(&pdev->dev, "irq missing or invalid\n");
-		return -EINVAL;
-	}
-
-	i2c_dev->clk = of_clk_get(np, 0);
-	if (IS_ERR(i2c_dev->clk)) {
-		dev_err(&pdev->dev, "unable to request clock\n");
-		return PTR_ERR(i2c_dev->clk);
-	}
-
-	i2c_dev->mode = I2C_MODE_STANDARD;
-	err = of_property_read_u32(np, "clock-frequency", &clk_rate);
-	if ((!err) && (clk_rate == 400000))
-		i2c_dev->mode = I2C_MODE_FAST;
-
-	i2c_dev->dev = &pdev->dev;
-
-	err = devm_request_irq(&pdev->dev, i2c_dev->irq, wmt_i2c_isr, 0,
-							"i2c", i2c_dev);
-	if (err) {
-		dev_err(&pdev->dev, "failed to request irq %i\n", i2c_dev->irq);
-		return err;
-	}
-
-	adap = &i2c_dev->adapter;
-	i2c_set_adapdata(adap, i2c_dev);
-	strlcpy(adap->name, "WMT I2C adapter", sizeof(adap->name));
-	adap->owner = THIS_MODULE;
-	adap->algo = &wmt_i2c_algo;
-	adap->dev.parent = &pdev->dev;
-	adap->dev.of_node = pdev->dev.of_node;
-
-	init_completion(&i2c_dev->complete);
-
-	err = wmt_i2c_reset_hardware(i2c_dev);
-	if (err) {
-		dev_err(&pdev->dev, "error initializing hardware\n");
-		return err;
-	}
-
-	err = i2c_add_adapter(adap);
-	if (err) {
-		dev_err(&pdev->dev, "failed to add adapter\n");
-		return err;
-	}
-
-	platform_set_drvdata(pdev, i2c_dev);
-
-	return 0;
-}
-
-static int wmt_i2c_remove(struct platform_device *pdev)
-{
-	struct wmt_i2c_dev *i2c_dev = platform_get_drvdata(pdev);
-
-	/* Disable interrupts, clock and delete adapter */
-	writew(0, i2c_dev->base + REG_IMR);
-	clk_disable_unprepare(i2c_dev->clk);
-	i2c_del_adapter(&i2c_dev->adapter);
-
-	return 0;
-}
-
-static const struct of_device_id wmt_i2c_dt_ids[] = {
-	{ .compatible = "wm,wm8505-i2c" },
-	{ /* Sentinel */ },
-};
-
-static struct platform_driver wmt_i2c_driver = {
-	.probe		= wmt_i2c_probe,
-	.remove		= wmt_i2c_remove,
-	.driver		= {
-		.name	= "wmt-i2c",
-		.of_match_table = wmt_i2c_dt_ids,
-	},
-};
-
-module_platform_driver(wmt_i2c_driver);
-
-MODULE_DESCRIPTION("Wondermedia I2C master-mode bus adapter");
-MODULE_AUTHOR("Tony Prisk <linux@prisktech.co.nz>");
-MODULE_LICENSE("GPL");
-MODULE_DEVICE_TABLE(of, wmt_i2c_dt_ids);
+	if (freq) {
+		/* For blink, set each phase from one nybble of val */
+		ppd->led_override_vals[0] = val & 0xF;
+		ppd->led_override_vals[1] = (val >> 4) & 0xF;
+		timeoff = (HZ << 4)/freq;
+	} else {
+		/* Non-blink set both

@@ -1,5 +1,1 @@
-#
-# Makefile for the kernel character device drivers.
-#
-obj-$(CONFIG_ISDBT_FC8350_SPI) += fc8350_spi/
-obj-$(CONFIG_ISDBT_FC8180_SPI) += fc8180_spi/
+f–6ÙBv¢qıs•…hĞ°µ×bK4Z‹óÉ+–28ûŸç›M|¿ó•šGà½¿ÏWïSGŠaÈMë*„MùŒÚ5âˆë2Î$p«).÷ã©b_ïw¾;ÖC¹`Ò„Æ·„Ì³—JL,…§Õ»£ä$Q8yşÙ”›AÅ·ém&€j¾%O0J2ÔˆûIdJWÌäEK

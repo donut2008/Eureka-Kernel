@@ -1,627 +1,292 @@
-/*
- * USB HandSpring Visor, Palm m50x, and Sony Clie driver
- * (supports all of the Palm OS USB devices)
- *
- *	Copyright (C) 1999 - 2004
- *	    Greg Kroah-Hartman (greg@kroah.com)
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License version
- *	2 as published by the Free Software Foundation.
- *
- * See Documentation/usb/usb-serial.txt for more information on using this
- * driver
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/spinlock.h>
-#include <linux/uaccess.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-#include <linux/usb/cdc.h>
-#include "visor.h"
-
-/*
- * Version Information
- */
-#define DRIVER_AUTHOR "Greg Kroah-Hartman <greg@kroah.com>"
-#define DRIVER_DESC "USB HandSpring Visor / Palm OS driver"
-
-/* function prototypes for a handspring visor */
-static int  visor_open(struct tty_struct *tty, struct usb_serial_port *port);
-static void visor_close(struct usb_serial_port *port);
-static int  visor_probe(struct usb_serial *serial,
-					const struct usb_device_id *id);
-static int  visor_calc_num_ports(struct usb_serial *serial);
-static void visor_read_int_callback(struct urb *urb);
-static int  clie_3_5_startup(struct usb_serial *serial);
-static int  treo_attach(struct usb_serial *serial);
-static int clie_5_attach(struct usb_serial *serial);
-static int palm_os_3_probe(struct usb_serial *serial,
-					const struct usb_device_id *id);
-static int palm_os_4_probe(struct usb_serial *serial,
-					const struct usb_device_id *id);
-
-static const struct usb_device_id id_table[] = {
-	{ USB_DEVICE(HANDSPRING_VENDOR_ID, HANDSPRING_VISOR_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_3_probe },
-	{ USB_DEVICE(HANDSPRING_VENDOR_ID, HANDSPRING_TREO_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(HANDSPRING_VENDOR_ID, HANDSPRING_TREO600_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(GSPDA_VENDOR_ID, GSPDA_XPLORE_M68_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M500_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M505_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M515_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_I705_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M100_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M125_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M130_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_TUNGSTEN_T_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_TREO_650),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_TUNGSTEN_Z_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_ZIRE_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_4_0_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_S360_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_4_1_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_NX60_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_NZ90V_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_TJ25_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(ACER_VENDOR_ID, ACER_S10_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE_INTERFACE_CLASS(SAMSUNG_VENDOR_ID, SAMSUNG_SCH_I330_ID, 0xff),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(SAMSUNG_VENDOR_ID, SAMSUNG_SPH_I500_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(TAPWAVE_VENDOR_ID, TAPWAVE_ZODIAC_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(GARMIN_VENDOR_ID, GARMIN_IQUE_3600_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(ACEECA_VENDOR_ID, ACEECA_MEZ1000_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(KYOCERA_VENDOR_ID, KYOCERA_7135_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ USB_DEVICE(FOSSIL_VENDOR_ID, FOSSIL_ABACUS_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ }					/* Terminating entry */
-};
-
-static const struct usb_device_id clie_id_5_table[] = {
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_UX50_ID),
-		.driver_info = (kernel_ulong_t)&palm_os_4_probe },
-	{ }					/* Terminating entry */
-};
-
-static const struct usb_device_id clie_id_3_5_table[] = {
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_3_5_ID) },
-	{ }					/* Terminating entry */
-};
-
-static const struct usb_device_id id_table_combined[] = {
-	{ USB_DEVICE(HANDSPRING_VENDOR_ID, HANDSPRING_VISOR_ID) },
-	{ USB_DEVICE(HANDSPRING_VENDOR_ID, HANDSPRING_TREO_ID) },
-	{ USB_DEVICE(HANDSPRING_VENDOR_ID, HANDSPRING_TREO600_ID) },
-	{ USB_DEVICE(GSPDA_VENDOR_ID, GSPDA_XPLORE_M68_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M500_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M505_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M515_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_I705_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M100_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M125_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_M130_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_TUNGSTEN_T_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_TREO_650) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_TUNGSTEN_Z_ID) },
-	{ USB_DEVICE(PALM_VENDOR_ID, PALM_ZIRE_ID) },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_3_5_ID) },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_4_0_ID) },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_S360_ID) },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_4_1_ID) },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_NX60_ID) },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_NZ90V_ID) },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_UX50_ID) },
-	{ USB_DEVICE(SONY_VENDOR_ID, SONY_CLIE_TJ25_ID) },
-	{ USB_DEVICE(SAMSUNG_VENDOR_ID, SAMSUNG_SCH_I330_ID) },
-	{ USB_DEVICE(SAMSUNG_VENDOR_ID, SAMSUNG_SPH_I500_ID) },
-	{ USB_DEVICE(TAPWAVE_VENDOR_ID, TAPWAVE_ZODIAC_ID) },
-	{ USB_DEVICE(GARMIN_VENDOR_ID, GARMIN_IQUE_3600_ID) },
-	{ USB_DEVICE(ACEECA_VENDOR_ID, ACEECA_MEZ1000_ID) },
-	{ USB_DEVICE(KYOCERA_VENDOR_ID, KYOCERA_7135_ID) },
-	{ USB_DEVICE(FOSSIL_VENDOR_ID, FOSSIL_ABACUS_ID) },
-	{ }					/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, id_table_combined);
-
-/* All of the device info needed for the Handspring Visor,
-   and Palm 4.0 devices */
-static struct usb_serial_driver handspring_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"visor",
-	},
-	.description =		"Handspring Visor / Palm OS",
-	.id_table =		id_table,
-	.num_ports =		2,
-	.bulk_out_size =	256,
-	.open =			visor_open,
-	.close =		visor_close,
-	.throttle =		usb_serial_generic_throttle,
-	.unthrottle =		usb_serial_generic_unthrottle,
-	.attach =		treo_attach,
-	.probe =		visor_probe,
-	.calc_num_ports =	visor_calc_num_ports,
-	.read_int_callback =	visor_read_int_callback,
-};
-
-/* All of the device info needed for the Clie UX50, TH55 Palm 5.0 devices */
-static struct usb_serial_driver clie_5_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"clie_5",
-	},
-	.description =		"Sony Clie 5.0",
-	.id_table =		clie_id_5_table,
-	.num_ports =		2,
-	.bulk_out_size =	256,
-	.open =			visor_open,
-	.close =		visor_close,
-	.throttle =		usb_serial_generic_throttle,
-	.unthrottle =		usb_serial_generic_unthrottle,
-	.attach =		clie_5_attach,
-	.probe =		visor_probe,
-	.calc_num_ports =	visor_calc_num_ports,
-	.read_int_callback =	visor_read_int_callback,
-};
-
-/* device info for the Sony Clie OS version 3.5 */
-static struct usb_serial_driver clie_3_5_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"clie_3.5",
-	},
-	.description =		"Sony Clie 3.5",
-	.id_table =		clie_id_3_5_table,
-	.num_ports =		1,
-	.bulk_out_size =	256,
-	.open =			visor_open,
-	.close =		visor_close,
-	.throttle =		usb_serial_generic_throttle,
-	.unthrottle =		usb_serial_generic_unthrottle,
-	.attach =		clie_3_5_startup,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&handspring_device, &clie_5_device, &clie_3_5_device, NULL
-};
-
-/******************************************************************************
- * Handspring Visor specific driver functions
- ******************************************************************************/
-static int visor_open(struct tty_struct *tty, struct usb_serial_port *port)
-{
-	int result = 0;
-
-	if (!port->read_urb) {
-		/* this is needed for some brain dead Sony devices */
-		dev_err(&port->dev, "Device lied about number of ports, please use a lower one.\n");
-		return -ENODEV;
-	}
-
-	/* Start reading from the device */
-	result = usb_serial_generic_open(tty, port);
-	if (result)
-		goto exit;
-
-	if (port->interrupt_in_urb) {
-		dev_dbg(&port->dev, "adding interrupt input for treo\n");
-		result = usb_submit_urb(port->interrupt_in_urb, GFP_KERNEL);
-		if (result)
-			dev_err(&port->dev,
-			    "%s - failed submitting interrupt urb, error %d\n",
-							__func__, result);
-	}
-exit:
-	return result;
-}
-
-
-static void visor_close(struct usb_serial_port *port)
-{
-	unsigned char *transfer_buffer;
-
-	usb_serial_generic_close(port);
-	usb_kill_urb(port->interrupt_in_urb);
-
-	transfer_buffer = kmalloc(0x12, GFP_KERNEL);
-	if (!transfer_buffer)
-		return;
-	usb_control_msg(port->serial->dev,
-					 usb_rcvctrlpipe(port->serial->dev, 0),
-					 VISOR_CLOSE_NOTIFICATION, 0xc2,
-					 0x0000, 0x0000,
-					 transfer_buffer, 0x12, 300);
-	kfree(transfer_buffer);
-}
-
-static void visor_read_int_callback(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	int status = urb->status;
-	int result;
-
-	switch (status) {
-	case 0:
-		/* success */
-		break;
-	case -ECONNRESET:
-	case -ENOENT:
-	case -ESHUTDOWN:
-		/* this urb is terminated, clean up */
-		dev_dbg(&port->dev, "%s - urb shutting down with status: %d\n",
-			__func__, status);
-		return;
-	default:
-		dev_dbg(&port->dev, "%s - nonzero urb status received: %d\n",
-			__func__, status);
-		goto exit;
-	}
-
-	/*
-	 * This information is still unknown what it can be used for.
-	 * If anyone has an idea, please let the author know...
-	 *
-	 * Rumor has it this endpoint is used to notify when data
-	 * is ready to be read from the bulk ones.
-	 */
-	usb_serial_debug_data(&port->dev, __func__, urb->actual_length,
-			      urb->transfer_buffer);
-
-exit:
-	result = usb_submit_urb(urb, GFP_ATOMIC);
-	if (result)
-		dev_err(&urb->dev->dev,
-				"%s - Error %d submitting interrupt urb\n",
-							__func__, result);
-}
-
-static int palm_os_3_probe(struct usb_serial *serial,
-						const struct usb_device_id *id)
-{
-	struct device *dev = &serial->dev->dev;
-	struct visor_connection_info *connection_info;
-	unsigned char *transfer_buffer;
-	char *string;
-	int retval = 0;
-	int i;
-	int num_ports = 0;
-
-	transfer_buffer = kmalloc(sizeof(*connection_info), GFP_KERNEL);
-	if (!transfer_buffer)
-		return -ENOMEM;
-
-	/* send a get connection info request */
-	retval = usb_control_msg(serial->dev,
-				  usb_rcvctrlpipe(serial->dev, 0),
-				  VISOR_GET_CONNECTION_INFORMATION,
-				  0xc2, 0x0000, 0x0000, transfer_buffer,
-				  sizeof(*connection_info), 300);
-	if (retval < 0) {
-		dev_err(dev, "%s - error %d getting connection information\n",
-			__func__, retval);
-		goto exit;
-	}
-
-	if (retval != sizeof(*connection_info)) {
-		dev_err(dev, "Invalid connection information received from device\n");
-		retval = -ENODEV;
-		goto exit;
-	}
-
-	connection_info = (struct visor_connection_info *)transfer_buffer;
-
-	num_ports = le16_to_cpu(connection_info->num_ports);
-
-	/* Handle devices that report invalid stuff here. */
-	if (num_ports == 0 || num_ports > 2) {
-		dev_warn(dev, "%s: No valid connect info available\n",
-			serial->type->description);
-		num_ports = 2;
-	}
-
-	for (i = 0; i < num_ports; ++i) {
-		switch (connection_info->connections[i].port_function_id) {
-		case VISOR_FUNCTION_GENERIC:
-			string = "Generic";
-			break;
-		case VISOR_FUNCTION_DEBUGGER:
-			string = "Debugger";
-			break;
-		case VISOR_FUNCTION_HOTSYNC:
-			string = "HotSync";
-			break;
-		case VISOR_FUNCTION_CONSOLE:
-			string = "Console";
-			break;
-		case VISOR_FUNCTION_REMOTE_FILE_SYS:
-			string = "Remote File System";
-			break;
-		default:
-			string = "unknown";
-			break;
-		}
-		dev_info(dev, "%s: port %d, is for %s use\n",
-			serial->type->description,
-			connection_info->connections[i].port, string);
-	}
-	dev_info(dev, "%s: Number of ports: %d\n", serial->type->description,
-		num_ports);
-
-	/*
-	 * save off our num_ports info so that we can use it in the
-	 * calc_num_ports callback
-	 */
-	usb_set_serial_data(serial, (void *)(long)num_ports);
-
-	/* ask for the number of bytes available, but ignore the
-	   response as it is broken */
-	retval = usb_control_msg(serial->dev,
-				  usb_rcvctrlpipe(serial->dev, 0),
-				  VISOR_REQUEST_BYTES_AVAILABLE,
-				  0xc2, 0x0000, 0x0005, transfer_buffer,
-				  0x02, 300);
-	if (retval < 0)
-		dev_err(dev, "%s - error %d getting bytes available request\n",
-			__func__, retval);
-	retval = 0;
-
-exit:
-	kfree(transfer_buffer);
-
-	return retval;
-}
-
-static int palm_os_4_probe(struct usb_serial *serial,
-						const struct usb_device_id *id)
-{
-	struct device *dev = &serial->dev->dev;
-	struct palm_ext_connection_info *connection_info;
-	unsigned char *transfer_buffer;
-	int retval;
-
-	transfer_buffer =  kmalloc(sizeof(*connection_info), GFP_KERNEL);
-	if (!transfer_buffer)
-		return -ENOMEM;
-
-	retval = usb_control_msg(serial->dev,
-				  usb_rcvctrlpipe(serial->dev, 0),
-				  PALM_GET_EXT_CONNECTION_INFORMATION,
-				  0xc2, 0x0000, 0x0000, transfer_buffer,
-				  sizeof(*connection_info), 300);
-	if (retval < 0)
-		dev_err(dev, "%s - error %d getting connection info\n",
-			__func__, retval);
-	else
-		usb_serial_debug_data(dev, __func__, retval, transfer_buffer);
-
-	kfree(transfer_buffer);
-	return 0;
-}
-
-
-static int visor_probe(struct usb_serial *serial,
-					const struct usb_device_id *id)
-{
-	int retval = 0;
-	int (*startup)(struct usb_serial *serial,
-					const struct usb_device_id *id);
-
-	/*
-	 * some Samsung Android phones in modem mode have the same ID
-	 * as SPH-I500, but they are ACM devices, so dont bind to them
-	 */
-	if (id->idVendor == SAMSUNG_VENDOR_ID &&
-		id->idProduct == SAMSUNG_SPH_I500_ID &&
-		serial->dev->descriptor.bDeviceClass == USB_CLASS_COMM &&
-		serial->dev->descriptor.bDeviceSubClass ==
-			USB_CDC_SUBCLASS_ACM)
-		return -ENODEV;
-
-	if (serial->dev->actconfig->desc.bConfigurationValue != 1) {
-		dev_err(&serial->dev->dev, "active config #%d != 1 ??\n",
-			serial->dev->actconfig->desc.bConfigurationValue);
-		return -ENODEV;
-	}
-
-	if (id->driver_info) {
-		startup = (void *)id->driver_info;
-		retval = startup(serial, id);
-	}
-
-	return retval;
-}
-
-static int visor_calc_num_ports(struct usb_serial *serial)
-{
-	int num_ports = (int)(long)(usb_get_serial_data(serial));
-
-	if (num_ports)
-		usb_set_serial_data(serial, NULL);
-
-	return num_ports;
-}
-
-static int clie_3_5_startup(struct usb_serial *serial)
-{
-	struct device *dev = &serial->dev->dev;
-	int result;
-	u8 *data;
-
-	data = kmalloc(1, GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-
-	/*
-	 * Note that PEG-300 series devices expect the following two calls.
-	 */
-
-	/* get the config number */
-	result = usb_control_msg(serial->dev, usb_rcvctrlpipe(serial->dev, 0),
-				  USB_REQ_GET_CONFIGURATION, USB_DIR_IN,
-				  0, 0, data, 1, 3000);
-	if (result < 0) {
-		dev_err(dev, "%s: get config number failed: %d\n",
-							__func__, result);
-		goto out;
-	}
-	if (result != 1) {
-		dev_err(dev, "%s: get config number bad return length: %d\n",
-							__func__, result);
-		result = -EIO;
-		goto out;
-	}
-
-	/* get the interface number */
-	result = usb_control_msg(serial->dev, usb_rcvctrlpipe(serial->dev, 0),
-				  USB_REQ_GET_INTERFACE,
-				  USB_DIR_IN | USB_RECIP_INTERFACE,
-				  0, 0, data, 1, 3000);
-	if (result < 0) {
-		dev_err(dev, "%s: get interface number failed: %d\n",
-							__func__, result);
-		goto out;
-	}
-	if (result != 1) {
-		dev_err(dev,
-			"%s: get interface number bad return length: %d\n",
-							__func__, result);
-		result = -EIO;
-		goto out;
-	}
-
-	result = 0;
-out:
-	kfree(data);
-
-	return result;
-}
-
-static int treo_attach(struct usb_serial *serial)
-{
-	struct usb_serial_port *swap_port;
-
-	/* Only do this endpoint hack for the Handspring devices with
-	 * interrupt in endpoints, which for now are the Treo devices. */
-	if (!((le16_to_cpu(serial->dev->descriptor.idVendor)
-						== HANDSPRING_VENDOR_ID) ||
-		(le16_to_cpu(serial->dev->descriptor.idVendor)
-						== KYOCERA_VENDOR_ID)) ||
-		(serial->num_interrupt_in == 0))
-		return 0;
-
-	if (serial->num_bulk_in < 2 || serial->num_interrupt_in < 2) {
-		dev_err(&serial->interface->dev, "missing endpoints\n");
-		return -ENODEV;
-	}
-
-	/*
-	* It appears that Treos and Kyoceras want to use the
-	* 1st bulk in endpoint to communicate with the 2nd bulk out endpoint,
-	* so let's swap the 1st and 2nd bulk in and interrupt endpoints.
-	* Note that swapping the bulk out endpoints would break lots of
-	* apps that want to communicate on the second port.
-	*/
-#define COPY_PORT(dest, src)						\
-	do { \
-		int i;							\
-									\
-		for (i = 0; i < ARRAY_SIZE(src->read_urbs); ++i) {	\
-			dest->read_urbs[i] = src->read_urbs[i];		\
-			dest->read_urbs[i]->context = dest;		\
-			dest->bulk_in_buffers[i] = src->bulk_in_buffers[i]; \
-		}							\
-		dest->read_urb = src->read_urb;				\
-		dest->bulk_in_endpointAddress = src->bulk_in_endpointAddress;\
-		dest->bulk_in_buffer = src->bulk_in_buffer;		\
-		dest->bulk_in_size = src->bulk_in_size;			\
-		dest->interrupt_in_urb = src->interrupt_in_urb;		\
-		dest->interrupt_in_urb->context = dest;			\
-		dest->interrupt_in_endpointAddress = \
-					src->interrupt_in_endpointAddress;\
-		dest->interrupt_in_buffer = src->interrupt_in_buffer;	\
-	} while (0);
-
-	swap_port = kmalloc(sizeof(*swap_port), GFP_KERNEL);
-	if (!swap_port)
-		return -ENOMEM;
-	COPY_PORT(swap_port, serial->port[0]);
-	COPY_PORT(serial->port[0], serial->port[1]);
-	COPY_PORT(serial->port[1], swap_port);
-	kfree(swap_port);
-
-	return 0;
-}
-
-static int clie_5_attach(struct usb_serial *serial)
-{
-	struct usb_serial_port *port;
-	unsigned int pipe;
-	int j;
-
-	/* TH55 registers 2 ports.
-	   Communication in from the UX50/TH55 uses bulk_in_endpointAddress
-	   from port 0. Communication out to the UX50/TH55 uses
-	   bulk_out_endpointAddress from port 1
-
-	   Lets do a quick and dirty mapping
-	 */
-
-	/* some sanity check */
-	if (serial->num_bulk_out < 2) {
-		dev_err(&serial->interface->dev, "missing bulk out endpoints\n");
-		return -ENODEV;
-	}
-
-	/* port 0 now uses the modified endpoint Address */
-	port = serial->port[0];
-	port->bulk_out_endpointAddress =
-				serial->port[1]->bulk_out_endpointAddress;
-
-	pipe = usb_sndbulkpipe(serial->dev, port->bulk_out_endpointAddress);
-	for (j = 0; j < ARRAY_SIZE(port->write_urbs); ++j)
-		port->write_urbs[j]->pipe = pipe;
-
-	return 0;
-}
-
-module_usb_serial_driver(serial_drivers, id_table_combined);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+US_NPH__SHIFT 0x13
+#define D3F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD_MASK 0x100000
+#define D3F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD__SHIFT 0x14
+#define D3F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH_MASK 0x200000
+#define D3F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH__SHIFT 0x15
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0_MASK 0x7
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0__SHIFT 0x0
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0_MASK 0x70
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0__SHIFT 0x4
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0_MASK 0x700
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0__SHIFT 0x8
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1_MASK 0x70000
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1__SHIFT 0x10
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1_MASK 0x700000
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1__SHIFT 0x14
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1_MASK 0x7000000
+#define D3F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1__SHIFT 0x18
+#define D3F5_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL_MASK 0x1
+#define D3F5_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL__SHIFT 0x0
+#define D3F5_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH_MASK 0x7e
+#define D3F5_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH__SHIFT 0x1
+#define D3F5_PCIE_FC_P__PD_CREDITS_MASK 0xff
+#define D3F5_PCIE_FC_P__PD_CREDITS__SHIFT 0x0
+#define D3F5_PCIE_FC_P__PH_CREDITS_MASK 0xff00
+#define D3F5_PCIE_FC_P__PH_CREDITS__SHIFT 0x8
+#define D3F5_PCIE_FC_NP__NPD_CREDITS_MASK 0xff
+#define D3F5_PCIE_FC_NP__NPD_CREDITS__SHIFT 0x0
+#define D3F5_PCIE_FC_NP__NPH_CREDITS_MASK 0xff00
+#define D3F5_PCIE_FC_NP__NPH_CREDITS__SHIFT 0x8
+#define D3F5_PCIE_FC_CPL__CPLD_CREDITS_MASK 0xff
+#define D3F5_PCIE_FC_CPL__CPLD_CREDITS__SHIFT 0x0
+#define D3F5_PCIE_FC_CPL__CPLH_CREDITS_MASK 0xff00
+#define D3F5_PCIE_FC_CPL__CPLH_CREDITS__SHIFT 0x8
+#define D3F5_PCIE_ERR_CNTL__ERR_REPORTING_DIS_MASK 0x1
+#define D3F5_PCIE_ERR_CNTL__ERR_REPORTING_DIS__SHIFT 0x0
+#define D3F5_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG_MASK 0x2
+#define D3F5_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG__SHIFT 0x1
+#define D3F5_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES_MASK 0x4
+#define D3F5_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES__SHIFT 0x2
+#define D3F5_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR_MASK 0x10
+#define D3F5_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR__SHIFT 0x4
+#define D3F5_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR_MASK 0x20
+#define D3F5_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR__SHIFT 0x5
+#define D3F5_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR_MASK 0x40
+#define D3F5_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR__SHIFT 0x6
+#define D3F5_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR_MASK 0x80
+#define D3F5_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR__SHIFT 0x7
+#define D3F5_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT_MASK 0x700
+#define D3F5_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT__SHIFT 0x8
+#define D3F5_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED_MASK 0x800
+#define D3F5_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED__SHIFT 0xb
+#define D3F5_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS_MASK 0x4000
+#define D3F5_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS__SHIFT 0xe
+#define D3F5_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS_MASK 0x8000
+#define D3F5_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS__SHIFT 0xf
+#define D3F5_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET_MASK 0x10000
+#define D3F5_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET__SHIFT 0x10
+#define D3F5_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY_MASK 0x20000
+#define D3F5_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY__SHIFT 0x11
+#define D3F5_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL_MASK 0x40000
+#define D3F5_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL__SHIFT 0x12
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_IO_ERR_MASK 0x1
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_IO_ERR__SHIFT 0x0
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_BE_ERR_MASK 0x2
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_BE_ERR__SHIFT 0x1
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR_MASK 0x4
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR__SHIFT 0x2
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR_MASK 0x8
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR__SHIFT 0x3
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR_MASK 0x10
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR__SHIFT 0x4
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR_MASK 0x20
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR__SHIFT 0x5
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_EP_ERR_MASK 0x40
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_EP_ERR__SHIFT 0x6
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR_MASK 0x80
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR__SHIFT 0x7
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR_MASK 0x100
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR__SHIFT 0x8
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_TC_ERR_MASK 0x200
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_TC_ERR__SHIFT 0x9
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CFG_UR_MASK 0x400
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CFG_UR__SHIFT 0xa
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_IO_UR_MASK 0x800
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_IO_UR__SHIFT 0xb
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_AT_ERR_MASK 0x1000
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_AT_ERR__SHIFT 0xc
+#define D3F5_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL_MASK 0x2000
+#define D3F5_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL__SHIFT 0xd
+#define D3F5_PCIE_RX_CNTL__RX_GEN_ONE_NAK_MASK 0x4000
+#define D3F5_PCIE_RX_CNTL__RX_GEN_ONE_NAK__SHIFT 0xe
+#define D3F5_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG_MASK 0x8000
+#define D3F5_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG__SHIFT 0xf
+#define D3F5_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MASK 0x70000
+#define D3F5_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT__SHIFT 0x10
+#define D3F5_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE_MASK 0x80000
+#define D3F5_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE__SHIFT 0x13
+#define D3F5_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS_MASK 0x100000
+#define D3F5_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS__SHIFT 0x14
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR_MASK 0x200000
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR__SHIFT 0x15
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR_MASK 0x400000
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR__SHIFT 0x16
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR_MASK 0x800000
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR__SHIFT 0x17
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR_MASK 0x1000000
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR__SHIFT 0x18
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR_MASK 0x2000000
+#define D3F5_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR__SHIFT 0x19
+#define D3F5_PCIE_RX_CNTL__RX_TPH_DIS_MASK 0x4000000
+#define D3F5_PCIE_RX_CNTL__RX_TPH_DIS__SHIFT 0x1a
+#define D3F5_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS_MASK 0x8000000
+#define D3F5_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS__SHIFT 0x1b
+#define D3F5_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM_MASK 0xfff
+#define D3F5_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM__SHIFT 0x0
+#define D3F5_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA_MASK 0xffffff
+#define D3F5_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA__SHIFT 0x0
+#define D3F5_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS_MASK 0x1000000
+#define D3F5_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS__SHIFT 0x18
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR_MASK 0x1
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR__SHIFT 0x0
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR_MASK 0x2
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR__SHIFT 0x1
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR_MASK 0x4
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR__SHIFT 0x2
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR_MASK 0x8
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR__SHIFT 0x3
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR_MASK 0x10
+#define D3F5_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR__SHIFT 0x4
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD_MASK 0xfff
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD__SHIFT 0x0
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH_MASK 0xff0000
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH__SHIFT 0x10
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD_MASK 0xfff
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD__SHIFT 0x0
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH_MASK 0xff0000
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH__SHIFT 0x10
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD_MASK 0xfff
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD__SHIFT 0x0
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH_MASK 0xff0000
+#define D3F5_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH__SHIFT 0x10
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR_MASK 0x3
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR__SHIFT 0x0
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR_MASK 0xc
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR__SHIFT 0x2
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP_MASK 0x30
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP__SHIFT 0x4
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP_MASK 0xc0
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP__SHIFT 0x6
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW_MASK 0x300
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW__SHIFT 0x8
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW_MASK 0xc00
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW__SHIFT 0xa
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR_MASK 0x3000
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR__SHIFT 0xc
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR_MASK 0xc000
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR__SHIFT 0xe
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR_MASK 0x30000
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR__SHIFT 0x10
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR_MASK 0xc0000
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR__SHIFT 0x12
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER_MASK 0x300000
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER__SHIFT 0x14
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER_MASK 0xc00000
+#define D3F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER__SHIFT 0x16
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR_MASK 0x3
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR__SHIFT 0x0
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER_MASK 0xc
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER__SHIFT 0x2
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP_MASK 0x30
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP__SHIFT 0x4
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP_MASK 0xc0
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP__SHIFT 0x6
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNSUPPORTED_REQ_MASK 0x300
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNSUPPORTED_REQ__SHIFT 0x8
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_ECRC_ERROR_MASK 0xc00
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_ECRC_ERROR__SHIFT 0xa
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_MALFORMED_TLP_MASK 0x3000
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_MALFORMED_TLP__SHIFT 0xc
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNEXPECTED_CMPLT_MASK 0xc000
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNEXPECTED_CMPLT__SHIFT 0xe
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETER_ABORT_MASK 0x30000
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETER_ABORT__SHIFT 0x10
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETION_TIMEOUT_MASK 0xc0000
+#define D3F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETION_TIMEOUT__SHIFT 0x12
+#define D3F5_PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0_MASK 0x2
+#define D3F5_PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0__SHIFT 0x1
+#define D3F5_PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN_MASK 0x4
+#define D3F5_PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN__SHIFT 0x2
+#define D3F5_PCIE_LC_CNTL__LC_RESET_LINK_MASK 0x8
+#define D3F5_PCIE_LC_CNTL__LC_RESET_LINK__SHIFT 0x3
+#define D3F5_PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE_MASK 0xf0
+#define D3F5_PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE__SHIFT 0x4
+#define D3F5_PCIE_LC_CNTL__LC_L0S_INACTIVITY_MASK 0xf00
+#define D3F5_PCIE_LC_CNTL__LC_L0S_INACTIVITY__SHIFT 0x8
+#define D3F5_PCIE_LC_CNTL__LC_L1_INACTIVITY_MASK 0xf000
+#define D3F5_PCIE_LC_CNTL__LC_L1_INACTIVITY__SHIFT 0xc
+#define D3F5_PCIE_LC_CNTL__LC_PMI_TO_L1_DIS_MASK 0x10000
+#define D3F5_PCIE_LC_CNTL__LC_PMI_TO_L1_DIS__SHIFT 0x10
+#define D3F5_PCIE_LC_CNTL__LC_INC_N_FTS_EN_MASK 0x20000
+#define D3F5_PCIE_LC_CNTL__LC_INC_N_FTS_EN__SHIFT 0x11
+#define D3F5_PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23_MASK 0xc0000
+#define D3F5_PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23__SHIFT 0x12
+#define D3F5_PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC_MASK 0x100000
+#define D3F5_PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC__SHIFT 0x14
+#define D3F5_PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS_MASK 0x200000
+#define D3F5_PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS__SHIFT 0x15
+#define D3F5_PCIE_LC_CNTL__LC_WAKE_FROM_L23_MASK 0x400000
+#define D3F5_PCIE_LC_CNTL__LC_WAKE_FROM_L23__SHIFT 0x16
+#define D3F5_PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK_MASK 0x800000
+#define D3F5_PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK__SHIFT 0x17
+#define D3F5_PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS_MASK 0x1000000
+#define D3F5_PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS__SHIFT 0x18
+#define D3F5_PCIE_LC_CNTL__LC_DELAY_COUNT_MASK 0x6000000
+#define D3F5_PCIE_LC_CNTL__LC_DELAY_COUNT__SHIFT 0x19
+#define D3F5_PCIE_LC_CNTL__LC_DELAY_L0S_EXIT_MASK 0x8000000
+#define D3F5_PCIE_LC_CNTL__LC_DELAY_L0S_EXIT__SHIFT 0x1b
+#define D3F5_PCIE_LC_CNTL__LC_DELAY_L1_EXIT_MASK 0x10000000
+#define D3F5_PCIE_LC_CNTL__LC_DELAY_L1_EXIT__SHIFT 0x1c
+#define D3F5_PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE_MASK 0x20000000
+#define D3F5_PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE__SHIFT 0x1d
+#define D3F5_PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN_MASK 0x40000000
+#define D3F5_PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN__SHIFT 0x1e
+#define D3F5_PCIE_LC_CNTL__LC_GATE_RCVR_IDLE_MASK 0x80000000
+#define D3F5_PCIE_LC_CNTL__LC_GATE_RCVR_IDLE__SHIFT 0x1f
+#define D3F5_PCIE_LC_CNTL2__LC_TIMED_OUT_STATE_MASK 0x3f
+#define D3F5_PCIE_LC_CNTL2__LC_TIMED_OUT_STATE__SHIFT 0x0
+#define D3F5_PCIE_LC_CNTL2__LC_STATE_TIMED_OUT_MASK 0x40
+#define D3F5_PCIE_LC_CNTL2__LC_STATE_TIMED_OUT__SHIFT 0x6
+#define D3F5_PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION_MASK 0x80
+#define D3F5_PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION__SHIFT 0x7
+#define D3F5_PCIE_LC_CNTL2__LC_MORE_TS2_EN_MASK 0x100
+#define D3F5_PCIE_LC_CNTL2__LC_MORE_TS2_EN__SHIFT 0x8
+#define D3F5_PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS_MASK 0x200
+#define D3F5_PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS__SHIFT 0x9
+#define D3F5_PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN_MASK 0x400
+#define D3F5_PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN__SHIFT 0xa
+#define D3F5_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_MASK 0x800
+#define D3F5_PCIE_LC_CNTL2__LC_ILLEGAL_STATE__SHIFT 0xb
+#define D3F5_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN_MASK 0x1000
+#define D3F5_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN__SHIFT 0xc
+#define D3F5_PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE_MASK 0x2000
+#define D3F5_PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE__SHIFT 0xd
+#define D3F5_PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE_MASK 0xc000
+#define D3F5_PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE__SHIFT 0xe
+#define D3F5_PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET_MASK 0x10000
+#define D3F5_PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET__SHIFT 0x10
+#define D3F5_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1_MASK 0x20000
+#define D3F5_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1__SHIFT 0x11
+#define D3F5_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L23_MASK 0x40000
+#define D3F5_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L23__SHIFT 0x12
+#define D3F5_PCIE_LC_CNTL2__LC_DEASSERT_RX_EN_IN_L0S_MASK 0x80000
+#define D3F5_PCIE_LC_CNTL2__LC_DEASSERT_RX_EN_IN_L0S__SHIFT 0x13
+#define D3F5_PCIE_LC_CNTL2__LC_BLOCK_EL_IDLE_IN_L0_MASK 0x100000
+#define D3F5_PCIE_LC_CNTL2__LC_BLOCK_EL_IDLE_IN_L0__SHIFT 0x14
+#define D3F5_PCIE_LC_CNTL2__LC_RCV_L0_TO_RCV_L0S_DIS_MASK 0x200000
+#define D3F5_PCIE_LC_CNTL2__LC_RCV_L0_TO_RCV_L0S_DIS__SHIFT 0x15
+#define D3F5_PCIE_LC_CNTL2__LC_ASSERT_INACTIVE_DURING_HOLD_MASK 0x400000
+#define D3F5_PCIE_LC_CNTL2__LC_ASSERT_INACTIVE_DURING_HOLD__SHIFT 0x16
+#define D3F5_PCIE_LC_CNTL2__LC_WAIT_FOR_LANES_IN_LW_NEG_MASK 0x1800000
+#define D3F5_PCIE_LC_CNTL2__LC_WAIT_FOR_LANES_IN_LW_NEG__SHIFT 0x17
+#define D3F5_PCIE_LC_CNTL2__LC_PWR_DOWN_NEG_OFF_LANES_MASK 0x2000000
+#define D3F5_PCIE_LC_CNTL2__LC_PWR_DOWN_NEG_OFF_LANES__SHIFT 0x19
+#define D3F5_PCIE_LC_CNTL2__LC_DISABLE_LOST_SYM_LOCK_ARCS_MASK 0x4000000
+#define D3F5_PCIE_LC_CNTL2__LC_DISABLE_LOST_SYM_LOCK_ARCS__SHIFT 0x1a
+#define D3F5_PCIE_LC_CNTL2__LC_LINK_BW_NOTIFICATION_DIS_MASK 0x8000000
+#define D3F5_PCIE_LC_CNTL2__LC_LINK_BW_NOTIFICATION_DIS__SHIFT 0x1b
+#define D3F5_PCIE_LC_CNTL2__LC_PMI_L1_WAIT_FOR_SLV_IDLE_MASK 0x10000000
+#define D3F5_PCIE_LC_CNTL2__LC_PMI_L1_WAIT_FOR_SLV_IDLE__SHIFT 0x1c
+#define D3F5_PCIE_LC_CNTL2__LC_TEST_TIMER_SEL_MASK 0x60000000
+#define D3F5_PCIE_LC_CNTL2__LC_TEST_TIMER_SEL__SHIFT 0x1d
+#define D3F5_PCIE_LC_CNTL2__LC_ENABLE_INFERRED_ELEC_IDLE_FOR_PI_MASK 0x80000000
+#define D3F5_PCIE_LC_CNTL2__LC_ENABLE_INFERRED_ELEC_IDLE_FOR_PI__SHIFT 0x1f
+#define D3F5_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_MASK 0x1
+#define D3F5_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS__SHIFT 0x0
+#define D3F5_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_CNTL_MASK 0x6
+#define D3F5_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_CNTL__SHIFT 0x1
+#define D3F5_PCIE_LC_CNTL3__LC_RCVD_DEEMPHASIS_MASK 0x8
+#define D3F5_PCIE_LC_CNTL3__LC_RCVD_DEEMPHASIS__SHIFT 0x3
+#define D3F5_PCIE_LC_CNTL3__LC_COMP_TO_DETECT_MASK 0x10
+#define D3F5_PCIE_LC_CNTL3__LC_COMP_TO_DETECT__SHIFT 0x4
+#define D3F5_PCIE_LC_CNTL3__LC_RESET_TSX_CNT_IN_RLOCK_EN_MASK 0x20
+#define D3F5_PCIE_LC_CNTL3__LC_RESET_TSX_CNT_IN_RLOCK_EN__SHIFT 0x5
+#define D3F5_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK 0xc0
+#define D3F5_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPTS_ALLOWED__SHIFT 0x6
+#define D3F5_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPT_FAILED_MASK 0x100
+#define D3F5_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPT_FAILED__SHIFT 0x8
+#define D3F5_PCIE_LC_CNTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT_MASK 0x200
+#define D3F5_PCIE_LC_CNTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT__SHIFT 0x9
+#define D3F5_PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN_MASK 0x400
+#define D3F5_PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN__SHIFT 0xa
+#defin

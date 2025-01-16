@@ -1,931 +1,994 @@
-/*
- * Driver for the VoIP USB phones with CM109 chipsets.
- *
- * Copyright (C) 2007 - 2008 Alfred E. Heggestad <aeh@db.org>
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License as
- *	published by the Free Software Foundation, version 2.
- */
+inter(dev->grab, handle);
 
-/*
- *   Tested devices:
- *	- Komunikate KIP1000
- *	- Genius G-talk
- *	- Allied-Telesis Corega USBPH01
- *	- ...
- *
- * This driver is based on the yealink.c driver
- *
- * Thanks to:
- *   - Authors of yealink.c
- *   - Thomas Reitmayr
- *   - Oliver Neukum for good review comments and code
- *   - Shaun Jackman <sjackman@gmail.com> for Genius G-talk keymap
- *   - Dmitry Torokhov for valuable input and review
- *
- * Todo:
- *   - Read/write EEPROM
- */
-
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/rwsem.h>
-#include <linux/usb/input.h>
-
-#define DRIVER_VERSION "20080805"
-#define DRIVER_AUTHOR  "Alfred E. Heggestad"
-#define DRIVER_DESC    "CM109 phone driver"
-
-static char *phone = "kip1000";
-module_param(phone, charp, S_IRUSR);
-MODULE_PARM_DESC(phone, "Phone name {kip1000, gtalk, usbph01, atcom}");
-
-enum {
-	/* HID Registers */
-	HID_IR0 = 0x00, /* Record/Playback-mute button, Volume up/down  */
-	HID_IR1 = 0x01, /* GPI, generic registers or EEPROM_DATA0       */
-	HID_IR2 = 0x02, /* Generic registers or EEPROM_DATA1            */
-	HID_IR3 = 0x03, /* Generic registers or EEPROM_CTRL             */
-	HID_OR0 = 0x00, /* Mapping control, buzzer, SPDIF (offset 0x04) */
-	HID_OR1 = 0x01, /* GPO - General Purpose Output                 */
-	HID_OR2 = 0x02, /* Set GPIO to input/output mode                */
-	HID_OR3 = 0x03, /* SPDIF status channel or EEPROM_CTRL          */
-
-	/* HID_IR0 */
-	RECORD_MUTE   = 1 << 3,
-	PLAYBACK_MUTE = 1 << 2,
-	VOLUME_DOWN   = 1 << 1,
-	VOLUME_UP     = 1 << 0,
-
-	/* HID_OR0 */
-	/* bits 7-6
-	   0: HID_OR1-2 are used for GPO; HID_OR0, 3 are used for buzzer
-	      and SPDIF
-	   1: HID_OR0-3 are used as generic HID registers
-	   2: Values written to HID_OR0-3 are also mapped to MCU_CTRL,
-	      EEPROM_DATA0-1, EEPROM_CTRL (see Note)
-	   3: Reserved
-	 */
-	HID_OR_GPO_BUZ_SPDIF   = 0 << 6,
-	HID_OR_GENERIC_HID_REG = 1 << 6,
-	HID_OR_MAP_MCU_EEPROM  = 2 << 6,
-
-	BUZZER_ON = 1 << 5,
-
-	/* up to 256 normal keys, up to 16 special keys */
-	KEYMAP_SIZE = 256 + 16,
-};
-
-/* CM109 protocol packet */
-struct cm109_ctl_packet {
-	u8 byte[4];
-} __attribute__ ((packed));
-
-enum { USB_PKT_LEN = sizeof(struct cm109_ctl_packet) };
-
-/* CM109 device structure */
-struct cm109_dev {
-	struct input_dev *idev;	 /* input device */
-	struct usb_device *udev; /* usb device */
-	struct usb_interface *intf;
-
-	/* irq input channel */
-	struct cm109_ctl_packet *irq_data;
-	dma_addr_t irq_dma;
-	struct urb *urb_irq;
-
-	/* control output channel */
-	struct cm109_ctl_packet *ctl_data;
-	dma_addr_t ctl_dma;
-	struct usb_ctrlrequest *ctl_req;
-	struct urb *urb_ctl;
-	/*
-	 * The 3 bitfields below are protected by ctl_submit_lock.
-	 * They have to be separate since they are accessed from IRQ
-	 * context.
-	 */
-	unsigned irq_urb_pending:1;	/* irq_urb is in flight */
-	unsigned ctl_urb_pending:1;	/* ctl_urb is in flight */
-	unsigned buzzer_pending:1;	/* need to issue buzz command */
-	spinlock_t ctl_submit_lock;
-
-	unsigned char buzzer_state;	/* on/off */
-
-	/* flags */
-	unsigned open:1;
-	unsigned resetting:1;
-	unsigned shutdown:1;
-
-	/* This mutex protects writes to the above flags */
-	struct mutex pm_mutex;
-
-	unsigned short keymap[KEYMAP_SIZE];
-
-	char phys[64];		/* physical device path */
-	int key_code;		/* last reported key */
-	int keybit;		/* 0=new scan  1,2,4,8=scan columns  */
-	u8 gpi;			/* Cached value of GPI (high nibble) */
-};
-
-/******************************************************************************
- * CM109 key interface
- *****************************************************************************/
-
-static unsigned short special_keymap(int code)
-{
-	if (code > 0xff) {
-		switch (code - 0xff) {
-		case RECORD_MUTE:	return KEY_MUTE;
-		case PLAYBACK_MUTE:	return KEY_MUTE;
-		case VOLUME_DOWN:	return KEY_VOLUMEDOWN;
-		case VOLUME_UP:		return KEY_VOLUMEUP;
-		}
-	}
-	return KEY_RESERVED;
+ out:
+	mutex_unlock(&dev->mutex);
+	return retval;
 }
+EXPORT_SYMBOL(input_grab_device);
 
-/* Map device buttons to internal key events.
- *
- * The "up" and "down" keys, are symbolised by arrows on the button.
- * The "pickup" and "hangup" keys are symbolised by a green and red phone
- * on the button.
-
- Komunikate KIP1000 Keyboard Matrix
-
-     -> -- 1 -- 2 -- 3  --> GPI pin 4 (0x10)
-      |    |    |    |
-     <- -- 4 -- 5 -- 6  --> GPI pin 5 (0x20)
-      |    |    |    |
-     END - 7 -- 8 -- 9  --> GPI pin 6 (0x40)
-      |    |    |    |
-     OK -- * -- 0 -- #  --> GPI pin 7 (0x80)
-      |    |    |    |
-
-     /|\  /|\  /|\  /|\
-      |    |    |    |
-GPO
-pin:  3    2    1    0
-     0x8  0x4  0x2  0x1
-
- */
-static unsigned short keymap_kip1000(int scancode)
+static void __input_release_device(struct input_handle *handle)
 {
-	switch (scancode) {				/* phone key:   */
-	case 0x82: return KEY_NUMERIC_0;		/*   0          */
-	case 0x14: return KEY_NUMERIC_1;		/*   1          */
-	case 0x12: return KEY_NUMERIC_2;		/*   2          */
-	case 0x11: return KEY_NUMERIC_3;		/*   3          */
-	case 0x24: return KEY_NUMERIC_4;		/*   4          */
-	case 0x22: return KEY_NUMERIC_5;		/*   5          */
-	case 0x21: return KEY_NUMERIC_6;		/*   6          */
-	case 0x44: return KEY_NUMERIC_7;		/*   7          */
-	case 0x42: return KEY_NUMERIC_8;		/*   8          */
-	case 0x41: return KEY_NUMERIC_9;		/*   9          */
-	case 0x81: return KEY_NUMERIC_POUND;		/*   #          */
-	case 0x84: return KEY_NUMERIC_STAR;		/*   *          */
-	case 0x88: return KEY_ENTER;			/*   pickup     */
-	case 0x48: return KEY_ESC;			/*   hangup     */
-	case 0x28: return KEY_LEFT;			/*   IN         */
-	case 0x18: return KEY_RIGHT;			/*   OUT        */
-	default:   return special_keymap(scancode);
+	struct input_dev *dev = handle->dev;
+	struct input_handle *grabber;
+
+	grabber = rcu_dereference_protected(dev->grab,
+					    lockdep_is_held(&dev->mutex));
+	if (grabber == handle) {
+		rcu_assign_pointer(dev->grab, NULL);
+		/* Make sure input_pass_event() notices that grab is gone */
+		synchronize_rcu();
+
+		list_for_each_entry(handle, &dev->h_list, d_node)
+			if (handle->open && handle->handler->start)
+				handle->handler->start(handle);
 	}
 }
 
-/*
-  Contributed by Shaun Jackman <sjackman@gmail.com>
-
-  Genius G-Talk keyboard matrix
-     0 1 2 3
-  4: 0 4 8 Talk
-  5: 1 5 9 End
-  6: 2 6 # Up
-  7: 3 7 * Down
-*/
-static unsigned short keymap_gtalk(int scancode)
-{
-	switch (scancode) {
-	case 0x11: return KEY_NUMERIC_0;
-	case 0x21: return KEY_NUMERIC_1;
-	case 0x41: return KEY_NUMERIC_2;
-	case 0x81: return KEY_NUMERIC_3;
-	case 0x12: return KEY_NUMERIC_4;
-	case 0x22: return KEY_NUMERIC_5;
-	case 0x42: return KEY_NUMERIC_6;
-	case 0x82: return KEY_NUMERIC_7;
-	case 0x14: return KEY_NUMERIC_8;
-	case 0x24: return KEY_NUMERIC_9;
-	case 0x44: return KEY_NUMERIC_POUND;	/* # */
-	case 0x84: return KEY_NUMERIC_STAR;	/* * */
-	case 0x18: return KEY_ENTER;		/* Talk (green handset) */
-	case 0x28: return KEY_ESC;		/* End (red handset) */
-	case 0x48: return KEY_UP;		/* Menu up (rocker switch) */
-	case 0x88: return KEY_DOWN;		/* Menu down (rocker switch) */
-	default:   return special_keymap(scancode);
-	}
-}
-
-/*
- * Keymap for Allied-Telesis Corega USBPH01
- * http://www.alliedtelesis-corega.com/2/1344/1437/1360/chprd.html
+/**
+ * input_release_device - release previously grabbed device
+ * @handle: input handle that owns the device
  *
- * Contributed by july@nat.bg
+ * Releases previously grabbed device so that other input handles can
+ * start receiving input events. Upon release all handlers attached
+ * to the device have their start() method called so they have a change
+ * to synchronize device state with the rest of the system.
  */
-static unsigned short keymap_usbph01(int scancode)
+void input_release_device(struct input_handle *handle)
 {
-	switch (scancode) {
-	case 0x11: return KEY_NUMERIC_0;		/*   0          */
-	case 0x21: return KEY_NUMERIC_1;		/*   1          */
-	case 0x41: return KEY_NUMERIC_2;		/*   2          */
-	case 0x81: return KEY_NUMERIC_3;		/*   3          */
-	case 0x12: return KEY_NUMERIC_4;		/*   4          */
-	case 0x22: return KEY_NUMERIC_5;		/*   5          */
-	case 0x42: return KEY_NUMERIC_6;		/*   6          */
-	case 0x82: return KEY_NUMERIC_7;		/*   7          */
-	case 0x14: return KEY_NUMERIC_8;		/*   8          */
-	case 0x24: return KEY_NUMERIC_9;		/*   9          */
-	case 0x44: return KEY_NUMERIC_POUND;		/*   #          */
-	case 0x84: return KEY_NUMERIC_STAR;		/*   *          */
-	case 0x18: return KEY_ENTER;			/*   pickup     */
-	case 0x28: return KEY_ESC;			/*   hangup     */
-	case 0x48: return KEY_LEFT;			/*   IN         */
-	case 0x88: return KEY_RIGHT;			/*   OUT        */
-	default:   return special_keymap(scancode);
-	}
-}
+	struct input_dev *dev = handle->dev;
 
-/*
- * Keymap for ATCom AU-100
- * http://www.atcom.cn/products.html 
- * http://www.packetizer.com/products/au100/
- * http://www.voip-info.org/wiki/view/AU-100
+	mutex_lock(&dev->mutex);
+	__input_release_device(handle);
+	mutex_unlock(&dev->mutex);
+}
+EXPORT_SYMBOL(input_release_device);
+
+/**
+ * input_open_device - open input device
+ * @handle: handle through which device is being accessed
  *
- * Contributed by daniel@gimpelevich.san-francisco.ca.us
+ * This function should be called by input handlers when they
+ * want to start receive events from given input device.
  */
-static unsigned short keymap_atcom(int scancode)
+int input_open_device(struct input_handle *handle)
 {
-	switch (scancode) {				/* phone key:   */
-	case 0x82: return KEY_NUMERIC_0;		/*   0          */
-	case 0x11: return KEY_NUMERIC_1;		/*   1          */
-	case 0x12: return KEY_NUMERIC_2;		/*   2          */
-	case 0x14: return KEY_NUMERIC_3;		/*   3          */
-	case 0x21: return KEY_NUMERIC_4;		/*   4          */
-	case 0x22: return KEY_NUMERIC_5;		/*   5          */
-	case 0x24: return KEY_NUMERIC_6;		/*   6          */
-	case 0x41: return KEY_NUMERIC_7;		/*   7          */
-	case 0x42: return KEY_NUMERIC_8;		/*   8          */
-	case 0x44: return KEY_NUMERIC_9;		/*   9          */
-	case 0x84: return KEY_NUMERIC_POUND;		/*   #          */
-	case 0x81: return KEY_NUMERIC_STAR;		/*   *          */
-	case 0x18: return KEY_ENTER;			/*   pickup     */
-	case 0x28: return KEY_ESC;			/*   hangup     */
-	case 0x48: return KEY_LEFT;			/* left arrow   */
-	case 0x88: return KEY_RIGHT;			/* right arrow  */
-	default:   return special_keymap(scancode);
-	}
-}
+	struct input_dev *dev = handle->dev;
+	int retval;
 
-static unsigned short (*keymap)(int) = keymap_kip1000;
+	retval = mutex_lock_interruptible(&dev->mutex);
+	if (retval)
+		return retval;
 
-/*
- * Completes a request by converting the data into events for the
- * input subsystem.
- */
-static void report_key(struct cm109_dev *dev, int key)
-{
-	struct input_dev *idev = dev->idev;
-
-	if (dev->key_code >= 0) {
-		/* old key up */
-		input_report_key(idev, dev->key_code, 0);
-	}
-
-	dev->key_code = key;
-	if (key >= 0) {
-		/* new valid key */
-		input_report_key(idev, key, 1);
-	}
-
-	input_sync(idev);
-}
-
-/******************************************************************************
- * CM109 usb communication interface
- *****************************************************************************/
-
-static void cm109_submit_buzz_toggle(struct cm109_dev *dev)
-{
-	int error;
-
-	if (dev->buzzer_state)
-		dev->ctl_data->byte[HID_OR0] |= BUZZER_ON;
-	else
-		dev->ctl_data->byte[HID_OR0] &= ~BUZZER_ON;
-
-	error = usb_submit_urb(dev->urb_ctl, GFP_ATOMIC);
-	if (error)
-		dev_err(&dev->intf->dev,
-			"%s: usb_submit_urb (urb_ctl) failed %d\n",
-			__func__, error);
-}
-
-/*
- * IRQ handler
- */
-static void cm109_urb_irq_callback(struct urb *urb)
-{
-	struct cm109_dev *dev = urb->context;
-	const int status = urb->status;
-	int error;
-
-	dev_dbg(&dev->intf->dev, "### URB IRQ: [0x%02x 0x%02x 0x%02x 0x%02x] keybit=0x%02x\n",
-	     dev->irq_data->byte[0],
-	     dev->irq_data->byte[1],
-	     dev->irq_data->byte[2],
-	     dev->irq_data->byte[3],
-	     dev->keybit);
-
-	if (status) {
-		if (status == -ESHUTDOWN)
-			return;
-		dev_err_ratelimited(&dev->intf->dev, "%s: urb status %d\n",
-				    __func__, status);
+	if (dev->going_away) {
+		retval = -ENODEV;
 		goto out;
 	}
 
-	/* Special keys */
-	if (dev->irq_data->byte[HID_IR0] & 0x0f) {
-		const int code = (dev->irq_data->byte[HID_IR0] & 0x0f);
-		report_key(dev, dev->keymap[0xff + code]);
-	}
+	handle->open++;
 
-	/* Scan key column */
-	if (dev->keybit == 0xf) {
+	dev->users_private++;
+	if (!dev->disabled && !dev->users++ && dev->open)
+		retval = dev->open(dev);
 
-		/* Any changes ? */
-		if ((dev->gpi & 0xf0) == (dev->irq_data->byte[HID_IR1] & 0xf0))
-			goto out;
-
-		dev->gpi = dev->irq_data->byte[HID_IR1] & 0xf0;
-		dev->keybit = 0x1;
-	} else {
-		report_key(dev, dev->keymap[dev->irq_data->byte[HID_IR1]]);
-
-		dev->keybit <<= 1;
-		if (dev->keybit > 0x8)
-			dev->keybit = 0xf;
-	}
-
- out:
-
-	spin_lock(&dev->ctl_submit_lock);
-
-	dev->irq_urb_pending = 0;
-
-	if (likely(!dev->shutdown)) {
-
-		if (dev->buzzer_state)
-			dev->ctl_data->byte[HID_OR0] |= BUZZER_ON;
-		else
-			dev->ctl_data->byte[HID_OR0] &= ~BUZZER_ON;
-
-		dev->ctl_data->byte[HID_OR1] = dev->keybit;
-		dev->ctl_data->byte[HID_OR2] = dev->keybit;
-
-		dev->buzzer_pending = 0;
-		dev->ctl_urb_pending = 1;
-
-		error = usb_submit_urb(dev->urb_ctl, GFP_ATOMIC);
-		if (error)
-			dev_err(&dev->intf->dev,
-				"%s: usb_submit_urb (urb_ctl) failed %d\n",
-				__func__, error);
-	}
-
-	spin_unlock(&dev->ctl_submit_lock);
-}
-
-static void cm109_urb_ctl_callback(struct urb *urb)
-{
-	struct cm109_dev *dev = urb->context;
-	const int status = urb->status;
-	int error;
-
-	dev_dbg(&dev->intf->dev, "### URB CTL: [0x%02x 0x%02x 0x%02x 0x%02x]\n",
-	     dev->ctl_data->byte[0],
-	     dev->ctl_data->byte[1],
-	     dev->ctl_data->byte[2],
-	     dev->ctl_data->byte[3]);
-
-	if (status) {
-		if (status == -ESHUTDOWN)
-			return;
-		dev_err_ratelimited(&dev->intf->dev, "%s: urb status %d\n",
-				    __func__, status);
-	}
-
-	spin_lock(&dev->ctl_submit_lock);
-
-	dev->ctl_urb_pending = 0;
-
-	if (likely(!dev->shutdown)) {
-
-		if (dev->buzzer_pending || status) {
-			dev->buzzer_pending = 0;
-			dev->ctl_urb_pending = 1;
-			cm109_submit_buzz_toggle(dev);
-		} else if (likely(!dev->irq_urb_pending)) {
-			/* ask for key data */
-			dev->irq_urb_pending = 1;
-			error = usb_submit_urb(dev->urb_irq, GFP_ATOMIC);
-			if (error)
-				dev_err(&dev->intf->dev,
-					"%s: usb_submit_urb (urb_irq) failed %d\n",
-					__func__, error);
+	if (retval) {
+		dev->users_private--;
+		if (!dev->disabled)
+		dev->users--;
+		if (!--handle->open) {
+			/*
+			 * Make sure we are not delivering any more events
+			 * through this handle
+			 */
+			synchronize_rcu();
 		}
 	}
 
-	spin_unlock(&dev->ctl_submit_lock);
+ out:
+	mutex_unlock(&dev->mutex);
+	return retval;
 }
+EXPORT_SYMBOL(input_open_device);
 
-static void cm109_toggle_buzzer_async(struct cm109_dev *dev)
+int input_flush_device(struct input_handle *handle, struct file *file)
 {
-	unsigned long flags;
+	struct input_dev *dev = handle->dev;
+	int retval;
 
-	spin_lock_irqsave(&dev->ctl_submit_lock, flags);
+	retval = mutex_lock_interruptible(&dev->mutex);
+	if (retval)
+		return retval;
 
-	if (dev->ctl_urb_pending) {
-		/* URB completion will resubmit */
-		dev->buzzer_pending = 1;
-	} else {
-		dev->ctl_urb_pending = 1;
-		cm109_submit_buzz_toggle(dev);
-	}
+	if (dev->flush)
+		retval = dev->flush(dev, file);
 
-	spin_unlock_irqrestore(&dev->ctl_submit_lock, flags);
+	mutex_unlock(&dev->mutex);
+	return retval;
 }
+EXPORT_SYMBOL(input_flush_device);
 
-static void cm109_toggle_buzzer_sync(struct cm109_dev *dev, int on)
+/**
+ * input_close_device - close input device
+ * @handle: handle through which device is being accessed
+ *
+ * This function should be called by input handlers when they
+ * want to stop receive events from given input device.
+ */
+void input_close_device(struct input_handle *handle)
 {
-	int error;
+	struct input_dev *dev = handle->dev;
 
-	if (on)
-		dev->ctl_data->byte[HID_OR0] |= BUZZER_ON;
-	else
-		dev->ctl_data->byte[HID_OR0] &= ~BUZZER_ON;
+	mutex_lock(&dev->mutex);
 
-	error = usb_control_msg(dev->udev,
-				usb_sndctrlpipe(dev->udev, 0),
-				dev->ctl_req->bRequest,
-				dev->ctl_req->bRequestType,
-				le16_to_cpu(dev->ctl_req->wValue),
-				le16_to_cpu(dev->ctl_req->wIndex),
-				dev->ctl_data,
-				USB_PKT_LEN, USB_CTRL_SET_TIMEOUT);
-	if (error < 0 && error != -EINTR)
-		dev_err(&dev->intf->dev, "%s: usb_control_msg() failed %d\n",
-			__func__, error);
-}
+	__input_release_device(handle);
 
-static void cm109_stop_traffic(struct cm109_dev *dev)
-{
-	dev->shutdown = 1;
-	/*
-	 * Make sure other CPUs see this
-	 */
-	smp_wmb();
+	--dev->users_private;
+	if (!dev->disabled && !--dev->users && dev->close)
+		dev->close(dev);
 
-	usb_kill_urb(dev->urb_ctl);
-	usb_kill_urb(dev->urb_irq);
-
-	cm109_toggle_buzzer_sync(dev, 0);
-
-	dev->shutdown = 0;
-	smp_wmb();
-}
-
-static void cm109_restore_state(struct cm109_dev *dev)
-{
-	if (dev->open) {
+	if (!--handle->open) {
 		/*
-		 * Restore buzzer state.
-		 * This will also kick regular URB submission
+		 * synchronize_rcu() makes sure that input_pass_event()
+		 * completed and that no more input events are delivered
+		 * through this handle
 		 */
-		cm109_toggle_buzzer_async(dev);
+		synchronize_rcu();
+	}
+
+	mutex_unlock(&dev->mutex);
+}
+EXPORT_SYMBOL(input_close_device);
+int input_enable_device(struct input_dev *dev)
+{
+	int retval;
+
+	retval = mutex_lock_interruptible(&dev->mutex);
+	if (retval)
+		return retval;
+
+	if (!dev->disabled)
+		goto out;
+
+	if (dev->users_private && dev->open) {
+		retval = dev->open(dev);
+		if (retval)
+			goto out;
+	}
+	dev->users = dev->users_private;
+	dev->disabled = false;
+
+out:
+	mutex_unlock(&dev->mutex);
+
+	return retval;
+}
+
+int input_disable_device(struct input_dev *dev)
+{
+	int retval;
+
+	retval = mutex_lock_interruptible(&dev->mutex);
+	if (retval)
+		return retval;
+
+	if (!dev->disabled) {
+		dev->disabled = true;
+		if (dev->users && dev->close)
+			dev->close(dev);
+		dev->users = 0;
+	}
+
+	mutex_unlock(&dev->mutex);
+	return 0;
+}
+
+/*
+ * Simulate keyup events for all keys that are marked as pressed.
+ * The function must be called with dev->event_lock held.
+ */
+static void input_dev_release_keys(struct input_dev *dev)
+{
+	bool need_sync = false;
+	int code;
+
+	if (is_event_supported(EV_KEY, dev->evbit, EV_MAX)) {
+		for_each_set_bit(code, dev->key, KEY_CNT) {
+			input_pass_event(dev, EV_KEY, code, 0);
+			need_sync = true;
+		}
+
+		if (need_sync)
+			input_pass_event(dev, EV_SYN, SYN_REPORT, 1);
+
+		memset(dev->key, 0, sizeof(dev->key));
 	}
 }
 
-/******************************************************************************
- * input event interface
- *****************************************************************************/
-
-static int cm109_input_open(struct input_dev *idev)
+/*
+ * Prepare device for unregistering
+ */
+static void input_disconnect_device(struct input_dev *dev)
 {
-	struct cm109_dev *dev = input_get_drvdata(idev);
-	int error;
-
-	error = usb_autopm_get_interface(dev->intf);
-	if (error < 0) {
-		dev_err(&idev->dev, "%s - cannot autoresume, result %d\n",
-			__func__, error);
-		return error;
-	}
-
-	mutex_lock(&dev->pm_mutex);
-
-	dev->buzzer_state = 0;
-	dev->key_code = -1;	/* no keys pressed */
-	dev->keybit = 0xf;
-
-	/* issue INIT */
-	dev->ctl_data->byte[HID_OR0] = HID_OR_GPO_BUZ_SPDIF;
-	dev->ctl_data->byte[HID_OR1] = dev->keybit;
-	dev->ctl_data->byte[HID_OR2] = dev->keybit;
-	dev->ctl_data->byte[HID_OR3] = 0x00;
-
-	dev->ctl_urb_pending = 1;
-	error = usb_submit_urb(dev->urb_ctl, GFP_KERNEL);
-	if (error) {
-		dev->ctl_urb_pending = 0;
-		dev_err(&dev->intf->dev, "%s: usb_submit_urb (urb_ctl) failed %d\n",
-			__func__, error);
-	} else {
-		dev->open = 1;
-	}
-
-	mutex_unlock(&dev->pm_mutex);
-
-	if (error)
-		usb_autopm_put_interface(dev->intf);
-
-	return error;
-}
-
-static void cm109_input_close(struct input_dev *idev)
-{
-	struct cm109_dev *dev = input_get_drvdata(idev);
-
-	mutex_lock(&dev->pm_mutex);
+	struct input_handle *handle;
 
 	/*
-	 * Once we are here event delivery is stopped so we
-	 * don't need to worry about someone starting buzzer
-	 * again
+	 * Mark device as going away. Note that we take dev->mutex here
+	 * not to protect access to dev->going_away but rather to ensure
+	 * that there are no threads in the middle of input_open_device()
 	 */
-	cm109_stop_traffic(dev);
-	dev->open = 0;
+	mutex_lock(&dev->mutex);
+	dev->going_away = true;
+	mutex_unlock(&dev->mutex);
 
-	mutex_unlock(&dev->pm_mutex);
+	spin_lock_irq(&dev->event_lock);
 
-	usb_autopm_put_interface(dev->intf);
+	/*
+	 * Simulate keyup events for all pressed keys so that handlers
+	 * are not left with "stuck" keys. The driver may continue
+	 * generate events even after we done here but they will not
+	 * reach any handlers.
+	 */
+	input_dev_release_keys(dev);
+
+	list_for_each_entry(handle, &dev->h_list, d_node)
+		handle->open = 0;
+
+	spin_unlock_irq(&dev->event_lock);
 }
 
-static int cm109_input_ev(struct input_dev *idev, unsigned int type,
-			  unsigned int code, int value)
+/**
+ * input_scancode_to_scalar() - converts scancode in &struct input_keymap_entry
+ * @ke: keymap entry containing scancode to be converted.
+ * @scancode: pointer to the location where converted scancode should
+ *	be stored.
+ *
+ * This function is used to convert scancode stored in &struct keymap_entry
+ * into scalar form understood by legacy keymap handling methods. These
+ * methods expect scancodes to be represented as 'unsigned int'.
+ */
+int input_scancode_to_scalar(const struct input_keymap_entry *ke,
+			     unsigned int *scancode)
 {
-	struct cm109_dev *dev = input_get_drvdata(idev);
+	switch (ke->len) {
+	case 1:
+		*scancode = *((u8 *)ke->scancode);
+		break;
 
-	dev_dbg(&dev->intf->dev,
-		"input_ev: type=%u code=%u value=%d\n", type, code, value);
+	case 2:
+		*scancode = *((u16 *)ke->scancode);
+		break;
 
-	if (type != EV_SND)
-		return -EINVAL;
-
-	switch (code) {
-	case SND_TONE:
-	case SND_BELL:
-		dev->buzzer_state = !!value;
-		if (!dev->resetting)
-			cm109_toggle_buzzer_async(dev);
-		return 0;
+	case 4:
+		*scancode = *((u32 *)ke->scancode);
+		break;
 
 	default:
 		return -EINVAL;
 	}
-}
-
-
-/******************************************************************************
- * Linux interface and usb initialisation
- *****************************************************************************/
-
-struct driver_info {
-	char *name;
-};
-
-static const struct driver_info info_cm109 = {
-	.name = "CM109 USB driver",
-};
-
-enum {
-	VENDOR_ID        = 0x0d8c, /* C-Media Electronics */
-	PRODUCT_ID_CM109 = 0x000e, /* CM109 defines range 0x0008 - 0x000f */
-};
-
-/* table of devices that work with this driver */
-static const struct usb_device_id cm109_usb_table[] = {
-	{
-		.match_flags = USB_DEVICE_ID_MATCH_DEVICE |
-				USB_DEVICE_ID_MATCH_INT_INFO,
-		.idVendor = VENDOR_ID,
-		.idProduct = PRODUCT_ID_CM109,
-		.bInterfaceClass = USB_CLASS_HID,
-		.bInterfaceSubClass = 0,
-		.bInterfaceProtocol = 0,
-		.driver_info = (kernel_ulong_t) &info_cm109
-	},
-	/* you can add more devices here with product ID 0x0008 - 0x000f */
-	{ }
-};
-
-static void cm109_usb_cleanup(struct cm109_dev *dev)
-{
-	kfree(dev->ctl_req);
-	if (dev->ctl_data)
-		usb_free_coherent(dev->udev, USB_PKT_LEN,
-				  dev->ctl_data, dev->ctl_dma);
-	if (dev->irq_data)
-		usb_free_coherent(dev->udev, USB_PKT_LEN,
-				  dev->irq_data, dev->irq_dma);
-
-	usb_free_urb(dev->urb_irq);	/* parameter validation in core/urb */
-	usb_free_urb(dev->urb_ctl);	/* parameter validation in core/urb */
-	kfree(dev);
-}
-
-static void cm109_usb_disconnect(struct usb_interface *interface)
-{
-	struct cm109_dev *dev = usb_get_intfdata(interface);
-
-	usb_set_intfdata(interface, NULL);
-	input_unregister_device(dev->idev);
-	cm109_usb_cleanup(dev);
-}
-
-static int cm109_usb_probe(struct usb_interface *intf,
-			   const struct usb_device_id *id)
-{
-	struct usb_device *udev = interface_to_usbdev(intf);
-	struct driver_info *nfo = (struct driver_info *)id->driver_info;
-	struct usb_host_interface *interface;
-	struct usb_endpoint_descriptor *endpoint;
-	struct cm109_dev *dev;
-	struct input_dev *input_dev = NULL;
-	int ret, pipe, i;
-	int error = -ENOMEM;
-
-	interface = intf->cur_altsetting;
-
-	if (interface->desc.bNumEndpoints < 1)
-		return -ENODEV;
-
-	endpoint = &interface->endpoint[0].desc;
-
-	if (!usb_endpoint_is_int_in(endpoint))
-		return -ENODEV;
-
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (!dev)
-		return -ENOMEM;
-
-	spin_lock_init(&dev->ctl_submit_lock);
-	mutex_init(&dev->pm_mutex);
-
-	dev->udev = udev;
-	dev->intf = intf;
-
-	dev->idev = input_dev = input_allocate_device();
-	if (!input_dev)
-		goto err_out;
-
-	/* allocate usb buffers */
-	dev->irq_data = usb_alloc_coherent(udev, USB_PKT_LEN,
-					   GFP_KERNEL, &dev->irq_dma);
-	if (!dev->irq_data)
-		goto err_out;
-
-	dev->ctl_data = usb_alloc_coherent(udev, USB_PKT_LEN,
-					   GFP_KERNEL, &dev->ctl_dma);
-	if (!dev->ctl_data)
-		goto err_out;
-
-	dev->ctl_req = kmalloc(sizeof(*(dev->ctl_req)), GFP_KERNEL);
-	if (!dev->ctl_req)
-		goto err_out;
-
-	/* allocate urb structures */
-	dev->urb_irq = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dev->urb_irq)
-		goto err_out;
-
-	dev->urb_ctl = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dev->urb_ctl)
-		goto err_out;
-
-	/* get a handle to the interrupt data pipe */
-	pipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
-	ret = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
-	if (ret != USB_PKT_LEN)
-		dev_err(&intf->dev, "invalid payload size %d, expected %d\n",
-			ret, USB_PKT_LEN);
-
-	/* initialise irq urb */
-	usb_fill_int_urb(dev->urb_irq, udev, pipe, dev->irq_data,
-			 USB_PKT_LEN,
-			 cm109_urb_irq_callback, dev, endpoint->bInterval);
-	dev->urb_irq->transfer_dma = dev->irq_dma;
-	dev->urb_irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	dev->urb_irq->dev = udev;
-
-	/* initialise ctl urb */
-	dev->ctl_req->bRequestType = USB_TYPE_CLASS | USB_RECIP_INTERFACE |
-					USB_DIR_OUT;
-	dev->ctl_req->bRequest = USB_REQ_SET_CONFIGURATION;
-	dev->ctl_req->wValue = cpu_to_le16(0x200);
-	dev->ctl_req->wIndex = cpu_to_le16(interface->desc.bInterfaceNumber);
-	dev->ctl_req->wLength = cpu_to_le16(USB_PKT_LEN);
-
-	usb_fill_control_urb(dev->urb_ctl, udev, usb_sndctrlpipe(udev, 0),
-			     (void *)dev->ctl_req, dev->ctl_data, USB_PKT_LEN,
-			     cm109_urb_ctl_callback, dev);
-	dev->urb_ctl->transfer_dma = dev->ctl_dma;
-	dev->urb_ctl->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	dev->urb_ctl->dev = udev;
-
-	/* find out the physical bus location */
-	usb_make_path(udev, dev->phys, sizeof(dev->phys));
-	strlcat(dev->phys, "/input0", sizeof(dev->phys));
-
-	/* register settings for the input device */
-	input_dev->name = nfo->name;
-	input_dev->phys = dev->phys;
-	usb_to_input_id(udev, &input_dev->id);
-	input_dev->dev.parent = &intf->dev;
-
-	input_set_drvdata(input_dev, dev);
-	input_dev->open = cm109_input_open;
-	input_dev->close = cm109_input_close;
-	input_dev->event = cm109_input_ev;
-
-	input_dev->keycode = dev->keymap;
-	input_dev->keycodesize = sizeof(unsigned char);
-	input_dev->keycodemax = ARRAY_SIZE(dev->keymap);
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_SND);
-	input_dev->sndbit[0] = BIT_MASK(SND_BELL) | BIT_MASK(SND_TONE);
-
-	/* register available key events */
-	for (i = 0; i < KEYMAP_SIZE; i++) {
-		unsigned short k = keymap(i);
-		dev->keymap[i] = k;
-		__set_bit(k, input_dev->keybit);
-	}
-	__clear_bit(KEY_RESERVED, input_dev->keybit);
-
-	error = input_register_device(dev->idev);
-	if (error)
-		goto err_out;
-
-	usb_set_intfdata(intf, dev);
 
 	return 0;
+}
+EXPORT_SYMBOL(input_scancode_to_scalar);
 
- err_out:
-	input_free_device(input_dev);
-	cm109_usb_cleanup(dev);
+/*
+ * Those routines handle the default case where no [gs]etkeycode() is
+ * defined. In this case, an array indexed by the scancode is used.
+ */
+
+static unsigned int input_fetch_keycode(struct input_dev *dev,
+					unsigned int index)
+{
+	switch (dev->keycodesize) {
+	case 1:
+		return ((u8 *)dev->keycode)[index];
+
+	case 2:
+		return ((u16 *)dev->keycode)[index];
+
+	default:
+		return ((u32 *)dev->keycode)[index];
+	}
+}
+
+static int input_default_getkeycode(struct input_dev *dev,
+				    struct input_keymap_entry *ke)
+{
+	unsigned int index;
+	int error;
+
+	if (!dev->keycodesize)
+		return -EINVAL;
+
+	if (ke->flags & INPUT_KEYMAP_BY_INDEX)
+		index = ke->index;
+	else {
+		error = input_scancode_to_scalar(ke, &index);
+		if (error)
+			return error;
+	}
+
+	if (index >= dev->keycodemax)
+		return -EINVAL;
+
+	ke->keycode = input_fetch_keycode(dev, index);
+	ke->index = index;
+	ke->len = sizeof(index);
+	memcpy(ke->scancode, &index, sizeof(index));
+
+	return 0;
+}
+
+static int input_default_setkeycode(struct input_dev *dev,
+				    const struct input_keymap_entry *ke,
+				    unsigned int *old_keycode)
+{
+	unsigned int index;
+	int error;
+	int i;
+
+	if (!dev->keycodesize)
+		return -EINVAL;
+
+	if (ke->flags & INPUT_KEYMAP_BY_INDEX) {
+		index = ke->index;
+	} else {
+		error = input_scancode_to_scalar(ke, &index);
+		if (error)
+			return error;
+	}
+
+	if (index >= dev->keycodemax)
+		return -EINVAL;
+
+	if (dev->keycodesize < sizeof(ke->keycode) &&
+			(ke->keycode >> (dev->keycodesize * 8)))
+		return -EINVAL;
+
+	switch (dev->keycodesize) {
+		case 1: {
+			u8 *k = (u8 *)dev->keycode;
+			*old_keycode = k[index];
+			k[index] = ke->keycode;
+			break;
+		}
+		case 2: {
+			u16 *k = (u16 *)dev->keycode;
+			*old_keycode = k[index];
+			k[index] = ke->keycode;
+			break;
+		}
+		default: {
+			u32 *k = (u32 *)dev->keycode;
+			*old_keycode = k[index];
+			k[index] = ke->keycode;
+			break;
+		}
+	}
+
+	if (*old_keycode <= KEY_MAX) {
+		__clear_bit(*old_keycode, dev->keybit);
+		for (i = 0; i < dev->keycodemax; i++) {
+			if (input_fetch_keycode(dev, i) == *old_keycode) {
+				__set_bit(*old_keycode, dev->keybit);
+				/* Setting the bit twice is useless, so break */
+				break;
+			}
+		}
+	}
+
+	__set_bit(ke->keycode, dev->keybit);
+	return 0;
+}
+
+/**
+ * input_get_keycode - retrieve keycode currently mapped to a given scancode
+ * @dev: input device which keymap is being queried
+ * @ke: keymap entry
+ *
+ * This function should be called by anyone interested in retrieving current
+ * keymap. Presently evdev handlers use it.
+ */
+int input_get_keycode(struct input_dev *dev, struct input_keymap_entry *ke)
+{
+	unsigned long flags;
+	int retval;
+
+	spin_lock_irqsave(&dev->event_lock, flags);
+	retval = dev->getkeycode(dev, ke);
+	spin_unlock_irqrestore(&dev->event_lock, flags);
+
+	return retval;
+}
+EXPORT_SYMBOL(input_get_keycode);
+
+/**
+ * input_set_keycode - attribute a keycode to a given scancode
+ * @dev: input device which keymap is being updated
+ * @ke: new keymap entry
+ *
+ * This function should be called by anyone needing to update current
+ * keymap. Presently keyboard and evdev handlers use it.
+ */
+int input_set_keycode(struct input_dev *dev,
+		      const struct input_keymap_entry *ke)
+{
+	unsigned long flags;
+	unsigned int old_keycode;
+	int retval;
+
+	if (ke->keycode > KEY_MAX)
+		return -EINVAL;
+
+	spin_lock_irqsave(&dev->event_lock, flags);
+
+	retval = dev->setkeycode(dev, ke, &old_keycode);
+	if (retval)
+		goto out;
+
+	/* Make sure KEY_RESERVED did not get enabled. */
+	__clear_bit(KEY_RESERVED, dev->keybit);
+
+	/*
+	 * Simulate keyup event if keycode is not present
+	 * in the keymap anymore
+	 */
+	if (old_keycode > KEY_MAX) {
+		dev_warn(dev->dev.parent ?: &dev->dev,
+			 "%s: got too big old keycode %#x\n",
+			 __func__, old_keycode);
+	} else if (test_bit(EV_KEY, dev->evbit) &&
+		   !is_event_supported(old_keycode, dev->keybit, KEY_MAX) &&
+		   __test_and_clear_bit(old_keycode, dev->key)) {
+		struct input_value vals[] =  {
+			{ EV_KEY, old_keycode, 0 },
+			input_value_sync
+		};
+
+		input_pass_values(dev, vals, ARRAY_SIZE(vals));
+	}
+
+ out:
+	spin_unlock_irqrestore(&dev->event_lock, flags);
+
+	return retval;
+}
+EXPORT_SYMBOL(input_set_keycode);
+
+static const struct input_device_id *input_match_device(struct input_handler *handler,
+							struct input_dev *dev)
+{
+	const struct input_device_id *id;
+
+	for (id = handler->id_table; id->flags || id->driver_info; id++) {
+
+		if (id->flags & INPUT_DEVICE_ID_MATCH_BUS)
+			if (id->bustype != dev->id.bustype)
+				continue;
+
+		if (id->flags & INPUT_DEVICE_ID_MATCH_VENDOR)
+			if (id->vendor != dev->id.vendor)
+				continue;
+
+		if (id->flags & INPUT_DEVICE_ID_MATCH_PRODUCT)
+			if (id->product != dev->id.product)
+				continue;
+
+		if (id->flags & INPUT_DEVICE_ID_MATCH_VERSION)
+			if (id->version != dev->id.version)
+				continue;
+
+		if (!bitmap_subset(id->evbit, dev->evbit, EV_MAX))
+			continue;
+
+		if (!bitmap_subset(id->keybit, dev->keybit, KEY_MAX))
+			continue;
+
+		if (!bitmap_subset(id->relbit, dev->relbit, REL_MAX))
+			continue;
+
+		if (!bitmap_subset(id->absbit, dev->absbit, ABS_MAX))
+			continue;
+
+		if (!bitmap_subset(id->mscbit, dev->mscbit, MSC_MAX))
+			continue;
+
+		if (!bitmap_subset(id->ledbit, dev->ledbit, LED_MAX))
+			continue;
+
+		if (!bitmap_subset(id->sndbit, dev->sndbit, SND_MAX))
+			continue;
+
+		if (!bitmap_subset(id->ffbit, dev->ffbit, FF_MAX))
+			continue;
+
+		if (!bitmap_subset(id->swbit, dev->swbit, SW_MAX))
+			continue;
+
+		if (!handler->match || handler->match(handler, dev))
+			return id;
+	}
+
+	return NULL;
+}
+
+static int input_attach_handler(struct input_dev *dev, struct input_handler *handler)
+{
+	const struct input_device_id *id;
+	int error;
+
+	id = input_match_device(handler, dev);
+	if (!id)
+		return -ENODEV;
+
+	error = handler->connect(handler, dev, id);
+	if (error && error != -ENODEV)
+		pr_err("failed to attach handler %s to device %s, error: %d\n",
+		       handler->name, kobject_name(&dev->dev.kobj), error);
+
 	return error;
 }
 
-static int cm109_usb_suspend(struct usb_interface *intf, pm_message_t message)
+#ifdef CONFIG_COMPAT
+
+static int input_bits_to_string(char *buf, int buf_size,
+				unsigned long bits, bool skip_empty)
 {
-	struct cm109_dev *dev = usb_get_intfdata(intf);
+	int len = 0;
 
-	dev_info(&intf->dev, "cm109: usb_suspend (event=%d)\n", message.event);
+	if (INPUT_COMPAT_TEST) {
+		u32 dword = bits >> 32;
+		if (dword || !skip_empty)
+			len += snprintf(buf, buf_size, "%x ", dword);
 
-	mutex_lock(&dev->pm_mutex);
-	cm109_stop_traffic(dev);
-	mutex_unlock(&dev->pm_mutex);
-
-	return 0;
-}
-
-static int cm109_usb_resume(struct usb_interface *intf)
-{
-	struct cm109_dev *dev = usb_get_intfdata(intf);
-
-	dev_info(&intf->dev, "cm109: usb_resume\n");
-
-	mutex_lock(&dev->pm_mutex);
-	cm109_restore_state(dev);
-	mutex_unlock(&dev->pm_mutex);
-
-	return 0;
-}
-
-static int cm109_usb_pre_reset(struct usb_interface *intf)
-{
-	struct cm109_dev *dev = usb_get_intfdata(intf);
-
-	mutex_lock(&dev->pm_mutex);
-
-	/*
-	 * Make sure input events don't try to toggle buzzer
-	 * while we are resetting
-	 */
-	dev->resetting = 1;
-	smp_wmb();
-
-	cm109_stop_traffic(dev);
-
-	return 0;
-}
-
-static int cm109_usb_post_reset(struct usb_interface *intf)
-{
-	struct cm109_dev *dev = usb_get_intfdata(intf);
-
-	dev->resetting = 0;
-	smp_wmb();
-
-	cm109_restore_state(dev);
-
-	mutex_unlock(&dev->pm_mutex);
-
-	return 0;
-}
-
-static struct usb_driver cm109_driver = {
-	.name		= "cm109",
-	.probe		= cm109_usb_probe,
-	.disconnect	= cm109_usb_disconnect,
-	.suspend	= cm109_usb_suspend,
-	.resume		= cm109_usb_resume,
-	.reset_resume	= cm109_usb_resume,
-	.pre_reset	= cm109_usb_pre_reset,
-	.post_reset	= cm109_usb_post_reset,
-	.id_table	= cm109_usb_table,
-	.supports_autosuspend = 1,
-};
-
-static int __init cm109_select_keymap(void)
-{
-	/* Load the phone keymap */
-	if (!strcasecmp(phone, "kip1000")) {
-		keymap = keymap_kip1000;
-		printk(KERN_INFO KBUILD_MODNAME ": "
-			"Keymap for Komunikate KIP1000 phone loaded\n");
-	} else if (!strcasecmp(phone, "gtalk")) {
-		keymap = keymap_gtalk;
-		printk(KERN_INFO KBUILD_MODNAME ": "
-			"Keymap for Genius G-talk phone loaded\n");
-	} else if (!strcasecmp(phone, "usbph01")) {
-		keymap = keymap_usbph01;
-		printk(KERN_INFO KBUILD_MODNAME ": "
-			"Keymap for Allied-Telesis Corega USBPH01 phone loaded\n");
-	} else if (!strcasecmp(phone, "atcom")) {
-		keymap = keymap_atcom;
-		printk(KERN_INFO KBUILD_MODNAME ": "
-			"Keymap for ATCom AU-100 phone loaded\n");
+		dword = bits & 0xffffffffUL;
+		if (dword || !skip_empty || len)
+			len += snprintf(buf + len, max(buf_size - len, 0),
+					"%x", dword);
 	} else {
-		printk(KERN_ERR KBUILD_MODNAME ": "
-			"Unsupported phone: %s\n", phone);
-		return -EINVAL;
+		if (bits || !skip_empty)
+			len += snprintf(buf, buf_size, "%lx", bits);
+	}
+
+	return len;
+}
+
+#else /* !CONFIG_COMPAT */
+
+static int input_bits_to_string(char *buf, int buf_size,
+				unsigned long bits, bool skip_empty)
+{
+	return bits || !skip_empty ?
+		snprintf(buf, buf_size, "%lx", bits) : 0;
+}
+
+#endif
+
+#ifdef CONFIG_PROC_FS
+
+static struct proc_dir_entry *proc_bus_input_dir;
+static DECLARE_WAIT_QUEUE_HEAD(input_devices_poll_wait);
+static int input_devices_state;
+
+static inline void input_wakeup_procfs_readers(void)
+{
+	input_devices_state++;
+	wake_up(&input_devices_poll_wait);
+}
+
+static unsigned int input_proc_devices_poll(struct file *file, poll_table *wait)
+{
+	poll_wait(file, &input_devices_poll_wait, wait);
+	if (file->f_version != input_devices_state) {
+		file->f_version = input_devices_state;
+		return POLLIN | POLLRDNORM;
 	}
 
 	return 0;
 }
 
-static int __init cm109_init(void)
+union input_seq_state {
+	struct {
+		unsigned short pos;
+		bool mutex_acquired;
+	};
+	void *p;
+};
+
+static void *input_devices_seq_start(struct seq_file *seq, loff_t *pos)
 {
-	int err;
+	union input_seq_state *state = (union input_seq_state *)&seq->private;
+	int error;
 
-	err = cm109_select_keymap();
-	if (err)
-		return err;
+	/* We need to fit into seq->private pointer */
+	BUILD_BUG_ON(sizeof(union input_seq_state) != sizeof(seq->private));
 
-	err = usb_register(&cm109_driver);
-	if (err)
-		return err;
+	error = mutex_lock_interruptible(&input_mutex);
+	if (error) {
+		state->mutex_acquired = false;
+		return ERR_PTR(error);
+	}
 
-	printk(KERN_INFO KBUILD_MODNAME ": "
-		DRIVER_DESC ": " DRIVER_VERSION " (C) " DRIVER_AUTHOR "\n");
+	state->mutex_acquired = true;
+
+	return seq_list_start(&input_dev_list, *pos);
+}
+
+static void *input_devices_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	return seq_list_next(v, &input_dev_list, pos);
+}
+
+static void input_seq_stop(struct seq_file *seq, void *v)
+{
+	union input_seq_state *state = (union input_seq_state *)&seq->private;
+
+	if (state->mutex_acquired)
+		mutex_unlock(&input_mutex);
+}
+
+static void input_seq_print_bitmap(struct seq_file *seq, const char *name,
+				   unsigned long *bitmap, int max)
+{
+	int i;
+	bool skip_empty = true;
+	char buf[18];
+
+	seq_printf(seq, "B: %s=", name);
+
+	for (i = BITS_TO_LONGS(max) - 1; i >= 0; i--) {
+		if (input_bits_to_string(buf, sizeof(buf),
+					 bitmap[i], skip_empty)) {
+			skip_empty = false;
+			seq_printf(seq, "%s%s", buf, i > 0 ? " " : "");
+		}
+	}
+
+	/*
+	 * If no output was produced print a single 0.
+	 */
+	if (skip_empty)
+		seq_puts(seq, "0");
+
+	seq_putc(seq, '\n');
+}
+
+static int input_devices_seq_show(struct seq_file *seq, void *v)
+{
+	struct input_dev *dev = container_of(v, struct input_dev, node);
+	const char *path = kobject_get_path(&dev->dev.kobj, GFP_KERNEL);
+	struct input_handle *handle;
+
+	seq_printf(seq, "I: Bus=%04x Vendor=%04x Product=%04x Version=%04x\n",
+		   dev->id.bustype, dev->id.vendor, dev->id.product, dev->id.version);
+
+	seq_printf(seq, "N: Name=\"%s\"\n", dev->name ? dev->name : "");
+	seq_printf(seq, "P: Phys=%s\n", dev->phys ? dev->phys : "");
+	seq_printf(seq, "S: Sysfs=%s\n", path ? path : "");
+	seq_printf(seq, "U: Uniq=%s\n", dev->uniq ? dev->uniq : "");
+	seq_printf(seq, "H: Handlers=");
+
+	list_for_each_entry(handle, &dev->h_list, d_node)
+		seq_printf(seq, "%s ", handle->name);
+	seq_putc(seq, '\n');
+
+	input_seq_print_bitmap(seq, "PROP", dev->propbit, INPUT_PROP_MAX);
+
+	input_seq_print_bitmap(seq, "EV", dev->evbit, EV_MAX);
+	if (test_bit(EV_KEY, dev->evbit))
+		input_seq_print_bitmap(seq, "KEY", dev->keybit, KEY_MAX);
+	if (test_bit(EV_REL, dev->evbit))
+		input_seq_print_bitmap(seq, "REL", dev->relbit, REL_MAX);
+	if (test_bit(EV_ABS, dev->evbit))
+		input_seq_print_bitmap(seq, "ABS", dev->absbit, ABS_MAX);
+	if (test_bit(EV_MSC, dev->evbit))
+		input_seq_print_bitmap(seq, "MSC", dev->mscbit, MSC_MAX);
+	if (test_bit(EV_LED, dev->evbit))
+		input_seq_print_bitmap(seq, "LED", dev->ledbit, LED_MAX);
+	if (test_bit(EV_SND, dev->evbit))
+		input_seq_print_bitmap(seq, "SND", dev->sndbit, SND_MAX);
+	if (test_bit(EV_FF, dev->evbit))
+		input_seq_print_bitmap(seq, "FF", dev->ffbit, FF_MAX);
+	if (test_bit(EV_SW, dev->evbit))
+		input_seq_print_bitmap(seq, "SW", dev->swbit, SW_MAX);
+
+	seq_putc(seq, '\n');
+
+	kfree(path);
+	return 0;
+}
+
+static const struct seq_operations input_devices_seq_ops = {
+	.start	= input_devices_seq_start,
+	.next	= input_devices_seq_next,
+	.stop	= input_seq_stop,
+	.show	= input_devices_seq_show,
+};
+
+static int input_proc_devices_open(struct inode *inode, struct file *file)
+{
+	return seq_open(file, &input_devices_seq_ops);
+}
+
+static const struct file_operations input_devices_fileops = {
+	.owner		= THIS_MODULE,
+	.open		= input_proc_devices_open,
+	.poll		= input_proc_devices_poll,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
+
+static void *input_handlers_seq_start(struct seq_file *seq, loff_t *pos)
+{
+	union input_seq_state *state = (union input_seq_state *)&seq->private;
+	int error;
+
+	/* We need to fit into seq->private pointer */
+	BUILD_BUG_ON(sizeof(union input_seq_state) != sizeof(seq->private));
+
+	error = mutex_lock_interruptible(&input_mutex);
+	if (error) {
+		state->mutex_acquired = false;
+		return ERR_PTR(error);
+	}
+
+	state->mutex_acquired = true;
+	state->pos = *pos;
+
+	return seq_list_start(&input_handler_list, *pos);
+}
+
+static void *input_handlers_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	union input_seq_state *state = (union input_seq_state *)&seq->private;
+
+	state->pos = *pos + 1;
+	return seq_list_next(v, &input_handler_list, pos);
+}
+
+static int input_handlers_seq_show(struct seq_file *seq, void *v)
+{
+	struct input_handler *handler = container_of(v, struct input_handler, node);
+	union input_seq_state *state = (union input_seq_state *)&seq->private;
+
+	seq_printf(seq, "N: Number=%u Name=%s", state->pos, handler->name);
+	if (handler->filter)
+		seq_puts(seq, " (filter)");
+	if (handler->legacy_minors)
+		seq_printf(seq, " Minor=%d", handler->minor);
+	seq_putc(seq, '\n');
 
 	return 0;
 }
 
-static void __exit cm109_exit(void)
+static const struct seq_operations input_handlers_seq_ops = {
+	.start	= input_handlers_seq_start,
+	.next	= input_handlers_seq_next,
+	.stop	= input_seq_stop,
+	.show	= input_handlers_seq_show,
+};
+
+static int input_proc_handlers_open(struct inode *inode, struct file *file)
 {
-	usb_deregister(&cm109_driver);
+	return seq_open(file, &input_handlers_seq_ops);
 }
 
-module_init(cm109_init);
-module_exit(cm109_exit);
+static const struct file_operations input_handlers_fileops = {
+	.owner		= THIS_MODULE,
+	.open		= input_proc_handlers_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
 
-MODULE_DEVICE_TABLE(usb, cm109_usb_table);
+static int __init input_proc_init(void)
+{
+	struct proc_dir_entry *entry;
 
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+	proc_bus_input_dir = proc_mkdir("bus/input", NULL);
+	if (!proc_bus_input_dir)
+		return -ENOMEM;
+
+	entry = proc_create("devices", 0, proc_bus_input_dir,
+			    &input_devices_fileops);
+	if (!entry)
+		goto fail1;
+
+	entry = proc_create("handlers", 0, proc_bus_input_dir,
+			    &input_handlers_fileops);
+	if (!entry)
+		goto fail2;
+
+	return 0;
+
+ fail2:	remove_proc_entry("devices", proc_bus_input_dir);
+ fail1: remove_proc_entry("bus/input", NULL);
+	return -ENOMEM;
+}
+
+static void input_proc_exit(void)
+{
+	remove_proc_entry("devices", proc_bus_input_dir);
+	remove_proc_entry("handlers", proc_bus_input_dir);
+	remove_proc_entry("bus/input", NULL);
+}
+
+#else /* !CONFIG_PROC_FS */
+static inline void input_wakeup_procfs_readers(void) { }
+static inline int input_proc_init(void) { return 0; }
+static inline void input_proc_exit(void) { }
+#endif
+
+#define INPUT_DEV_STRING_ATTR_SHOW(name)				\
+static ssize_t input_dev_show_##name(struct device *dev,		\
+				     struct device_attribute *attr,	\
+				     char *buf)				\
+{									\
+	struct input_dev *input_dev = to_input_dev(dev);		\
+									\
+	return scnprintf(buf, PAGE_SIZE, "%s\n",			\
+			 input_dev->name ? input_dev->name : "");	\
+}									\
+static DEVICE_ATTR(name, S_IRUGO, input_dev_show_##name, NULL)
+
+INPUT_DEV_STRING_ATTR_SHOW(name);
+INPUT_DEV_STRING_ATTR_SHOW(phys);
+INPUT_DEV_STRING_ATTR_SHOW(uniq);
+
+static int input_print_modalias_bits(char *buf, int size,
+				     char name, unsigned long *bm,
+				     unsigned int min_bit, unsigned int max_bit)
+{
+	int len = 0, i;
+
+	len += snprintf(buf, max(size, 0), "%c", name);
+	for (i = min_bit; i < max_bit; i++)
+		if (bm[BIT_WORD(i)] & BIT_MASK(i))
+			len += snprintf(buf + len, max(size - len, 0), "%X,", i);
+	return len;
+}
+
+static int input_print_modalias(char *buf, int size, struct input_dev *id,
+				int add_cr)
+{
+	int len;
+
+	len = snprintf(buf, max(size, 0),
+		       "input:b%04Xv%04Xp%04Xe%04X-",
+		       id->id.bustype, id->id.vendor,
+		       id->id.product, id->id.version);
+
+	len += input_print_modalias_bits(buf + len, size - len,
+				'e', id->evbit, 0, EV_MAX);
+	len += input_print_modalias_bits(buf + len, size - len,
+				'k', id->keybit, KEY_MIN_INTERESTING, KEY_MAX);
+	len += input_print_modalias_bits(buf + len, size - len,
+				'r', id->relbit, 0, REL_MAX);
+	len += input_print_modalias_bits(buf + len, size - len,
+				'a', id->absbit, 0, ABS_MAX);
+	len += input_print_modalias_bits(buf + len, size - len,
+				'm', id->mscbit, 0, MSC_MAX);
+	len += input_print_modalias_bits(buf + len, size - len,
+				'l', id->ledbit, 0, LED_MAX);
+	len += input_print_modalias_bits(buf + len, size - len,
+				's', id->sndbit, 0, SND_MAX);
+	len += input_print_modalias_bits(buf + len, size - len,
+				'f', id->ffbit, 0, FF_MAX);
+	len += input_print_modalias_bits(buf + len, size - len,
+				'w', id->swbit, 0, SW_MAX);
+
+	if (add_cr)
+		len += snprintf(buf + len, max(size - len, 0), "\n");
+
+	return len;
+}
+
+static ssize_t input_dev_show_modalias(struct device *dev,
+				       struct device_attribute *attr,
+				       char *buf)
+{
+	struct input_dev *id = to_input_dev(dev);
+	ssize_t len;
+
+	len = input_print_modalias(buf, PAGE_SIZE, id, 1);
+
+	return min_t(int, len, PAGE_SIZE);
+}
+static DEVICE_ATTR(modalias, S_IRUGO, input_dev_show_modalias, NULL);
+
+static int input_print_bitmap(char *buf, int buf_size, unsigned long *bitmap,
+			      int max, int add_cr);
+
+static ssize_t input_dev_show_properties(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct input_dev *input_dev = to_input_dev(dev);
+	int len = input_print_bitmap(buf, PAGE_SIZE, input_dev->propbit,
+				     INPUT_PROP_MAX, true);
+	return min_t(int, len, PAGE_SIZE);
+}
+static DEVICE_ATTR(properties, S_IRUGO, input_dev_show_properties, NULL);
+
+static ssize_t input_dev_show_enabled(struct device *dev,
+					 struct device_attribute *attr,
+					 char *buf)
+{
+	struct input_dev *input_dev = to_input_dev(dev);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", !input_dev->disabled);
+}
+
+static ssize_t input_dev_store_enabled(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t size)
+{
+	int ret;
+	bool enable;
+	struct input_dev *input_dev = to_input_dev(dev);
+
+	ret = strtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	if (enable)
+		ret = input_enable_device(input_dev);
+	else
+		ret = input_disable_device(input_dev);
+	if (ret)
+		return ret;
+
+	return size;
+}
+
+static DEVICE_ATTR(enabled, S_IRUGO | S_IWUSR,
+		   input_dev_show_enabled, input_dev_store_enabled);
+
+static struct attribute *input_dev_attrs[] = {
+	&dev_attr_name.attr,
+	&dev_attr_phys.attr,
+	&dev_attr_uniq.attr,
+	&dev_attr_modalias.attr,
+	&dev_attr_properties.attr,
+	&dev_attr_enabled.attr,
+	NULL
+};
+
+static struct attribute_group input_dev_attr_group = {
+	.attrs	= input_dev_attrs,
+};
+
+#define INPUT_DEV_ID_ATTR(name)						\
+static ssize_t input_dev_show_id_##name(struct device *dev,		\
+					struct device_attribute *attr,	\
+					char *buf)			\
+{									\
+	struct input_dev *input_dev = to_input_dev(dev);		\
+	return scnprintf(buf, PAGE_SIZE, "%04x\n", input_dev->id.name);	\
+}									\
+static DEVICE_ATTR(name, S_IRUGO, input_dev_show_id_##name, NULL)
+
+INPUT_DEV_ID_ATTR(bustype);
+INPUT_DEV_ID_ATTR(vendor);
+INPUT_DEV_ID_ATTR(product);
+INPUT_DEV_ID_ATTR(version);
+
+static struct attribute *input_dev_id_attrs[] = {
+	&dev_attr_bustype.attr,
+	&dev_attr_vendor.attr,
+	&dev_attr_product.attr,
+	&dev_attr_version.attr,
+	NULL
+};
+
+static struct attribute_group input_dev_id_attr_group = {
+	.name	= "id",
+	.attrs	= input_dev_id_attrs,
+};
+
+static int input_print_bitmap(char *buf, int buf_size, unsigned long *bitmap,
+			      int max, int add_cr)
+{
+	int i;
+	int len = 0;
+	bool skip_empty = true;
+
+	for (i = BITS_T

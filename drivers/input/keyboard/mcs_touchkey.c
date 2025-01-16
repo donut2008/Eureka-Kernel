@@ -1,282 +1,119 @@
-/*
- * Touchkey driver for MELFAS MCS5000/5080 controller
- *
- * Copyright (C) 2010 Samsung Electronics Co.Ltd
- * Author: HeungJun Kim <riverful.kim@samsung.com>
- * Author: Joonyoung Shim <jy0922.shim@samsung.com>
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
- */
-
-#include <linux/module.h>
-#include <linux/i2c.h>
-#include <linux/i2c/mcs.h>
-#include <linux/interrupt.h>
-#include <linux/input.h>
-#include <linux/irq.h>
-#include <linux/slab.h>
-#include <linux/pm.h>
-
-/* MCS5000 Touchkey */
-#define MCS5000_TOUCHKEY_STATUS		0x04
-#define MCS5000_TOUCHKEY_STATUS_PRESS	7
-#define MCS5000_TOUCHKEY_FW		0x0a
-#define MCS5000_TOUCHKEY_BASE_VAL	0x61
-
-/* MCS5080 Touchkey */
-#define MCS5080_TOUCHKEY_STATUS		0x00
-#define MCS5080_TOUCHKEY_STATUS_PRESS	3
-#define MCS5080_TOUCHKEY_FW		0x01
-#define MCS5080_TOUCHKEY_BASE_VAL	0x1
-
-enum mcs_touchkey_type {
-	MCS5000_TOUCHKEY,
-	MCS5080_TOUCHKEY,
-};
-
-struct mcs_touchkey_chip {
-	unsigned int status_reg;
-	unsigned int pressbit;
-	unsigned int press_invert;
-	unsigned int baseval;
-};
-
-struct mcs_touchkey_data {
-	void (*poweron)(bool);
-
-	struct i2c_client *client;
-	struct input_dev *input_dev;
-	struct mcs_touchkey_chip chip;
-	unsigned int key_code;
-	unsigned int key_val;
-	unsigned short keycodes[];
-};
-
-static irqreturn_t mcs_touchkey_interrupt(int irq, void *dev_id)
-{
-	struct mcs_touchkey_data *data = dev_id;
-	struct mcs_touchkey_chip *chip = &data->chip;
-	struct i2c_client *client = data->client;
-	struct input_dev *input = data->input_dev;
-	unsigned int key_val;
-	unsigned int pressed;
-	int val;
-
-	val = i2c_smbus_read_byte_data(client, chip->status_reg);
-	if (val < 0) {
-		dev_err(&client->dev, "i2c read error [%d]\n", val);
-		goto out;
-	}
-
-	pressed = (val & (1 << chip->pressbit)) >> chip->pressbit;
-	if (chip->press_invert)
-		pressed ^= chip->press_invert;
-
-	/* key_val is 0 when released, so we should use key_val of press. */
-	if (pressed) {
-		key_val = val & (0xff >> (8 - chip->pressbit));
-		if (!key_val)
-			goto out;
-		key_val -= chip->baseval;
-		data->key_code = data->keycodes[key_val];
-		data->key_val = key_val;
-	}
-
-	input_event(input, EV_MSC, MSC_SCAN, data->key_val);
-	input_report_key(input, data->key_code, pressed);
-	input_sync(input);
-
-	dev_dbg(&client->dev, "key %d %d %s\n", data->key_val, data->key_code,
-		pressed ? "pressed" : "released");
-
- out:
-	return IRQ_HANDLED;
-}
-
-static int mcs_touchkey_probe(struct i2c_client *client,
-		const struct i2c_device_id *id)
-{
-	const struct mcs_platform_data *pdata;
-	struct mcs_touchkey_data *data;
-	struct input_dev *input_dev;
-	unsigned int fw_reg;
-	int fw_ver;
-	int error;
-	int i;
-
-	pdata = dev_get_platdata(&client->dev);
-	if (!pdata) {
-		dev_err(&client->dev, "no platform data defined\n");
-		return -EINVAL;
-	}
-
-	data = kzalloc(sizeof(struct mcs_touchkey_data) +
-			sizeof(data->keycodes[0]) * (pdata->key_maxval + 1),
-			GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!data || !input_dev) {
-		dev_err(&client->dev, "Failed to allocate memory\n");
-		error = -ENOMEM;
-		goto err_free_mem;
-	}
-
-	data->client = client;
-	data->input_dev = input_dev;
-
-	if (id->driver_data == MCS5000_TOUCHKEY) {
-		data->chip.status_reg = MCS5000_TOUCHKEY_STATUS;
-		data->chip.pressbit = MCS5000_TOUCHKEY_STATUS_PRESS;
-		data->chip.baseval = MCS5000_TOUCHKEY_BASE_VAL;
-		fw_reg = MCS5000_TOUCHKEY_FW;
-	} else {
-		data->chip.status_reg = MCS5080_TOUCHKEY_STATUS;
-		data->chip.pressbit = MCS5080_TOUCHKEY_STATUS_PRESS;
-		data->chip.press_invert = 1;
-		data->chip.baseval = MCS5080_TOUCHKEY_BASE_VAL;
-		fw_reg = MCS5080_TOUCHKEY_FW;
-	}
-
-	fw_ver = i2c_smbus_read_byte_data(client, fw_reg);
-	if (fw_ver < 0) {
-		error = fw_ver;
-		dev_err(&client->dev, "i2c read error[%d]\n", error);
-		goto err_free_mem;
-	}
-	dev_info(&client->dev, "Firmware version: %d\n", fw_ver);
-
-	input_dev->name = "MELFAS MCS Touchkey";
-	input_dev->id.bustype = BUS_I2C;
-	input_dev->dev.parent = &client->dev;
-	input_dev->evbit[0] = BIT_MASK(EV_KEY);
-	if (!pdata->no_autorepeat)
-		input_dev->evbit[0] |= BIT_MASK(EV_REP);
-	input_dev->keycode = data->keycodes;
-	input_dev->keycodesize = sizeof(data->keycodes[0]);
-	input_dev->keycodemax = pdata->key_maxval + 1;
-
-	for (i = 0; i < pdata->keymap_size; i++) {
-		unsigned int val = MCS_KEY_VAL(pdata->keymap[i]);
-		unsigned int code = MCS_KEY_CODE(pdata->keymap[i]);
-
-		data->keycodes[val] = code;
-		__set_bit(code, input_dev->keybit);
-	}
-
-	input_set_capability(input_dev, EV_MSC, MSC_SCAN);
-	input_set_drvdata(input_dev, data);
-
-	if (pdata->cfg_pin)
-		pdata->cfg_pin();
-
-	if (pdata->poweron) {
-		data->poweron = pdata->poweron;
-		data->poweron(true);
-	}
-
-	error = request_threaded_irq(client->irq, NULL, mcs_touchkey_interrupt,
-				     IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
-				     client->dev.driver->name, data);
-	if (error) {
-		dev_err(&client->dev, "Failed to register interrupt\n");
-		goto err_free_mem;
-	}
-
-	error = input_register_device(input_dev);
-	if (error)
-		goto err_free_irq;
-
-	i2c_set_clientdata(client, data);
-	return 0;
-
-err_free_irq:
-	free_irq(client->irq, data);
-err_free_mem:
-	input_free_device(input_dev);
-	kfree(data);
-	return error;
-}
-
-static int mcs_touchkey_remove(struct i2c_client *client)
-{
-	struct mcs_touchkey_data *data = i2c_get_clientdata(client);
-
-	free_irq(client->irq, data);
-	if (data->poweron)
-		data->poweron(false);
-	input_unregister_device(data->input_dev);
-	kfree(data);
-
-	return 0;
-}
-
-static void mcs_touchkey_shutdown(struct i2c_client *client)
-{
-	struct mcs_touchkey_data *data = i2c_get_clientdata(client);
-
-	if (data->poweron)
-		data->poweron(false);
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int mcs_touchkey_suspend(struct device *dev)
-{
-	struct mcs_touchkey_data *data = dev_get_drvdata(dev);
-	struct i2c_client *client = data->client;
-
-	/* Disable the work */
-	disable_irq(client->irq);
-
-	/* Finally turn off the power */
-	if (data->poweron)
-		data->poweron(false);
-
-	return 0;
-}
-
-static int mcs_touchkey_resume(struct device *dev)
-{
-	struct mcs_touchkey_data *data = dev_get_drvdata(dev);
-	struct i2c_client *client = data->client;
-
-	/* Enable the device first */
-	if (data->poweron)
-		data->poweron(true);
-
-	/* Enable irq again */
-	enable_irq(client->irq);
-
-	return 0;
-}
-#endif
-
-static SIMPLE_DEV_PM_OPS(mcs_touchkey_pm_ops,
-			 mcs_touchkey_suspend, mcs_touchkey_resume);
-
-static const struct i2c_device_id mcs_touchkey_id[] = {
-	{ "mcs5000_touchkey", MCS5000_TOUCHKEY },
-	{ "mcs5080_touchkey", MCS5080_TOUCHKEY },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, mcs_touchkey_id);
-
-static struct i2c_driver mcs_touchkey_driver = {
-	.driver = {
-		.name	= "mcs_touchkey",
-		.pm	= &mcs_touchkey_pm_ops,
-	},
-	.probe		= mcs_touchkey_probe,
-	.remove		= mcs_touchkey_remove,
-	.shutdown       = mcs_touchkey_shutdown,
-	.id_table	= mcs_touchkey_id,
-};
-
-module_i2c_driver(mcs_touchkey_driver);
-
-/* Module information */
-MODULE_AUTHOR("Joonyoung Shim <jy0922.shim@samsung.com>");
-MODULE_AUTHOR("HeungJun Kim <riverful.kim@samsung.com>");
-MODULE_DESCRIPTION("Touchkey driver for MELFAS MCS5000/5080 controller");
-MODULE_LICENSE("GPL");
+VM_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL_MASK 0x2000000
+#define MC_MCDVM_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL__SHIFT 0x19
+#define MC_MCDVM_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE_MASK 0x4000000
+#define MC_MCDVM_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE__SHIFT 0x1a
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__PERF_COUNTER_SELECT_MASK 0xf
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__PERF_COUNTER_SELECT__SHIFT 0x0
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__START_TRIGGER_MASK 0xff00
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__START_TRIGGER__SHIFT 0x8
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__STOP_TRIGGER_MASK 0xff0000
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__STOP_TRIGGER__SHIFT 0x10
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__ENABLE_ANY_MASK 0x1000000
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__ENABLE_ANY__SHIFT 0x18
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL_MASK 0x2000000
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL__SHIFT 0x19
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE_MASK 0x4000000
+#define MC_VM_L2_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE__SHIFT 0x1a
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__PERF_COUNTER_SELECT_MASK 0xf
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__PERF_COUNTER_SELECT__SHIFT 0x0
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__START_TRIGGER_MASK 0xff00
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__START_TRIGGER__SHIFT 0x8
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__STOP_TRIGGER_MASK 0xff0000
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__STOP_TRIGGER__SHIFT 0x10
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__ENABLE_ANY_MASK 0x1000000
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__ENABLE_ANY__SHIFT 0x18
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL_MASK 0x2000000
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL__SHIFT 0x19
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE_MASK 0x4000000
+#define MC_ARB_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE__SHIFT 0x1a
+#define ATC_PERFCOUNTER_RSLT_CNTL__PERF_COUNTER_SELECT_MASK 0xf
+#define ATC_PERFCOUNTER_RSLT_CNTL__PERF_COUNTER_SELECT__SHIFT 0x0
+#define ATC_PERFCOUNTER_RSLT_CNTL__START_TRIGGER_MASK 0xff00
+#define ATC_PERFCOUNTER_RSLT_CNTL__START_TRIGGER__SHIFT 0x8
+#define ATC_PERFCOUNTER_RSLT_CNTL__STOP_TRIGGER_MASK 0xff0000
+#define ATC_PERFCOUNTER_RSLT_CNTL__STOP_TRIGGER__SHIFT 0x10
+#define ATC_PERFCOUNTER_RSLT_CNTL__ENABLE_ANY_MASK 0x1000000
+#define ATC_PERFCOUNTER_RSLT_CNTL__ENABLE_ANY__SHIFT 0x18
+#define ATC_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL_MASK 0x2000000
+#define ATC_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL__SHIFT 0x19
+#define ATC_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE_MASK 0x4000000
+#define ATC_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE__SHIFT 0x1a
+#define CHUB_ATC_PERFCOUNTER_LO__COUNTER_LO_MASK 0xffffffff
+#define CHUB_ATC_PERFCOUNTER_LO__COUNTER_LO__SHIFT 0x0
+#define CHUB_ATC_PERFCOUNTER_HI__COUNTER_HI_MASK 0xffff
+#define CHUB_ATC_PERFCOUNTER_HI__COUNTER_HI__SHIFT 0x0
+#define CHUB_ATC_PERFCOUNTER_HI__COMPARE_VALUE_MASK 0xffff0000
+#define CHUB_ATC_PERFCOUNTER_HI__COMPARE_VALUE__SHIFT 0x10
+#define CHUB_ATC_PERFCOUNTER0_CFG__PERF_SEL_MASK 0xff
+#define CHUB_ATC_PERFCOUNTER0_CFG__PERF_SEL__SHIFT 0x0
+#define CHUB_ATC_PERFCOUNTER0_CFG__PERF_SEL_END_MASK 0xff00
+#define CHUB_ATC_PERFCOUNTER0_CFG__PERF_SEL_END__SHIFT 0x8
+#define CHUB_ATC_PERFCOUNTER0_CFG__PERF_MODE_MASK 0xf000000
+#define CHUB_ATC_PERFCOUNTER0_CFG__PERF_MODE__SHIFT 0x18
+#define CHUB_ATC_PERFCOUNTER0_CFG__ENABLE_MASK 0x10000000
+#define CHUB_ATC_PERFCOUNTER0_CFG__ENABLE__SHIFT 0x1c
+#define CHUB_ATC_PERFCOUNTER0_CFG__CLEAR_MASK 0x20000000
+#define CHUB_ATC_PERFCOUNTER0_CFG__CLEAR__SHIFT 0x1d
+#define CHUB_ATC_PERFCOUNTER1_CFG__PERF_SEL_MASK 0xff
+#define CHUB_ATC_PERFCOUNTER1_CFG__PERF_SEL__SHIFT 0x0
+#define CHUB_ATC_PERFCOUNTER1_CFG__PERF_SEL_END_MASK 0xff00
+#define CHUB_ATC_PERFCOUNTER1_CFG__PERF_SEL_END__SHIFT 0x8
+#define CHUB_ATC_PERFCOUNTER1_CFG__PERF_MODE_MASK 0xf000000
+#define CHUB_ATC_PERFCOUNTER1_CFG__PERF_MODE__SHIFT 0x18
+#define CHUB_ATC_PERFCOUNTER1_CFG__ENABLE_MASK 0x10000000
+#define CHUB_ATC_PERFCOUNTER1_CFG__ENABLE__SHIFT 0x1c
+#define CHUB_ATC_PERFCOUNTER1_CFG__CLEAR_MASK 0x20000000
+#define CHUB_ATC_PERFCOUNTER1_CFG__CLEAR__SHIFT 0x1d
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__PERF_COUNTER_SELECT_MASK 0xf
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__PERF_COUNTER_SELECT__SHIFT 0x0
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__START_TRIGGER_MASK 0xff00
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__START_TRIGGER__SHIFT 0x8
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__STOP_TRIGGER_MASK 0xff0000
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__STOP_TRIGGER__SHIFT 0x10
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__ENABLE_ANY_MASK 0x1000000
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__ENABLE_ANY__SHIFT 0x18
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL_MASK 0x2000000
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__CLEAR_ALL__SHIFT 0x19
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE_MASK 0x4000000
+#define CHUB_ATC_PERFCOUNTER_RSLT_CNTL__STOP_ALL_ON_SATURATE__SHIFT 0x1a
+#define MC_ARB_PERF_MON_CNTL0_ECC__ALLOW_WRAP_MASK 0x1
+#define MC_ARB_PERF_MON_CNTL0_ECC__ALLOW_WRAP__SHIFT 0x0
+#define ATC_VM_APERTURE0_LOW_ADDR__VIRTUAL_PAGE_NUMBER_MASK 0xfffffff
+#define ATC_VM_APERTURE0_LOW_ADDR__VIRTUAL_PAGE_NUMBER__SHIFT 0x0
+#define ATC_VM_APERTURE1_LOW_ADDR__VIRTUAL_PAGE_NUMBER_MASK 0xfffffff
+#define ATC_VM_APERTURE1_LOW_ADDR__VIRTUAL_PAGE_NUMBER__SHIFT 0x0
+#define ATC_VM_APERTURE0_HIGH_ADDR__VIRTUAL_PAGE_NUMBER_MASK 0xfffffff
+#define ATC_VM_APERTURE0_HIGH_ADDR__VIRTUAL_PAGE_NUMBER__SHIFT 0x0
+#define ATC_VM_APERTURE1_HIGH_ADDR__VIRTUAL_PAGE_NUMBER_MASK 0xfffffff
+#define ATC_VM_APERTURE1_HIGH_ADDR__VIRTUAL_PAGE_NUMBER__SHIFT 0x0
+#define ATC_VM_APERTURE0_CNTL__ATS_ACCESS_MODE_MASK 0x3
+#define ATC_VM_APERTURE0_CNTL__ATS_ACCESS_MODE__SHIFT 0x0
+#define ATC_VM_APERTURE1_CNTL__ATS_ACCESS_MODE_MASK 0x3
+#define ATC_VM_APERTURE1_CNTL__ATS_ACCESS_MODE__SHIFT 0x0
+#define ATC_VM_APERTURE0_CNTL2__VMIDS_USING_RANGE_MASK 0xffff
+#define ATC_VM_APERTURE0_CNTL2__VMIDS_USING_RANGE__SHIFT 0x0
+#define ATC_VM_APERTURE1_CNTL2__VMIDS_USING_RANGE_MASK 0xffff
+#define ATC_VM_APERTURE1_CNTL2__VMIDS_USING_RANGE__SHIFT 0x0
+#define ATC_ATS_CNTL__DISABLE_ATC_MASK 0x1
+#define ATC_ATS_CNTL__DISABLE_ATC__SHIFT 0x0
+#define ATC_ATS_CNTL__DISABLE_PRI_MASK 0x2
+#define ATC_ATS_CNTL__DISABLE_PRI__SHIFT 0x1
+#define ATC_ATS_CNTL__DISABLE_PASID_MASK 0x4
+#define ATC_ATS_CNTL__DISABLE_PASID__SHIFT 0x2
+#define ATC_ATS_CNTL__CREDITS_ATS_RPB_MASK 0x3f00
+#define ATC_ATS_CNTL__CREDITS_ATS_RPB__SHIFT 0x8
+#define ATC_ATS_CNTL__DEBUG_ECO_MASK 0xf0000
+#define ATC_ATS_CNTL__DEBUG_ECO__SHIFT 0x10
+#define ATC_ATS_DEBUG__INVALIDATE_ALL_MASK 0x1
+#define ATC_ATS_DEBUG__INVALIDATE_ALL__SHIFT 0x0
+#define ATC_ATS_DEBUG__IDENT_RETURN_MASK 0x2
+#define ATC_ATS_DEBUG__IDENT_RETURN__SHIFT 0x1
+#define ATC_ATS_DEBUG__ADDRESS_TRANSLATION_REQUEST_WRITE_PERMS_MASK 0x4
+#define ATC_ATS_DEBUG__ADDRESS_TRANSLATION_REQUEST_WRITE_PERMS__SHIFT 0x2
+#define ATC_ATS_DEBUG__PAGE_REQUESTS_USE_RELAXED_ORDERING_MASK 0x20
+#define ATC_ATS_DEBUG__PAGE_REQUESTS_USE_RELAXED_ORDERING__SHIFT 0x5
+#define ATC_ATS_DEBUG__PRIV_BIT_MASK 0x40
+#define ATC_ATS_DEBUG__PRIV_BIT__SHIFT 0x6
+#define ATC_ATS_DEBUG__EXE_BIT_MASK 0x80
+#define ATC_ATS_DEBUG__EXE_BIT__SHIFT 0x7
+#define ATC_ATS_DEBUG__PAGE_REQUEST_PERMS_MASK 0x100

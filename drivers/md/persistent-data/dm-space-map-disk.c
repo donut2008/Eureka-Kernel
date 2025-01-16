@@ -1,327 +1,134 @@
-/*
- * Copyright (C) 2011 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-
-#include "dm-space-map-common.h"
-#include "dm-space-map-disk.h"
-#include "dm-space-map.h"
-#include "dm-transaction-manager.h"
-
-#include <linux/list.h>
-#include <linux/slab.h>
-#include <linux/export.h>
-#include <linux/device-mapper.h>
-
-#define DM_MSG_PREFIX "space map disk"
-
-/*----------------------------------------------------------------*/
-
-/*
- * Space map interface.
- */
-struct sm_disk {
-	struct dm_space_map sm;
-
-	struct ll_disk ll;
-	struct ll_disk old_ll;
-
-	dm_block_t begin;
-	dm_block_t nr_allocated_this_transaction;
-};
-
-static void sm_disk_destroy(struct dm_space_map *sm)
-{
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-
-	kfree(smd);
-}
-
-static int sm_disk_extend(struct dm_space_map *sm, dm_block_t extra_blocks)
-{
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-
-	return sm_ll_extend(&smd->ll, extra_blocks);
-}
-
-static int sm_disk_get_nr_blocks(struct dm_space_map *sm, dm_block_t *count)
-{
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-	*count = smd->old_ll.nr_blocks;
-
-	return 0;
-}
-
-static int sm_disk_get_nr_free(struct dm_space_map *sm, dm_block_t *count)
-{
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-	*count = (smd->old_ll.nr_blocks - smd->old_ll.nr_allocated) - smd->nr_allocated_this_transaction;
-
-	return 0;
-}
-
-static int sm_disk_get_count(struct dm_space_map *sm, dm_block_t b,
-			     uint32_t *result)
-{
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-	return sm_ll_lookup(&smd->ll, b, result);
-}
-
-static int sm_disk_count_is_more_than_one(struct dm_space_map *sm, dm_block_t b,
-					  int *result)
-{
-	int r;
-	uint32_t count;
-
-	r = sm_disk_get_count(sm, b, &count);
-	if (r)
-		return r;
-
-	*result = count > 1;
-
-	return 0;
-}
-
-static int sm_disk_set_count(struct dm_space_map *sm, dm_block_t b,
-			     uint32_t count)
-{
-	int r;
-	uint32_t old_count;
-	enum allocation_event ev;
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-
-	r = sm_ll_insert(&smd->ll, b, count, &ev);
-	if (!r) {
-		switch (ev) {
-		case SM_NONE:
-			break;
-
-		case SM_ALLOC:
-			/*
-			 * This _must_ be free in the prior transaction
-			 * otherwise we've lost atomicity.
-			 */
-			smd->nr_allocated_this_transaction++;
-			break;
-
-		case SM_FREE:
-			/*
-			 * It's only free if it's also free in the last
-			 * transaction.
-			 */
-			r = sm_ll_lookup(&smd->old_ll, b, &old_count);
-			if (r)
-				return r;
-
-			if (!old_count)
-				smd->nr_allocated_this_transaction--;
-			break;
-		}
-	}
-
-	return r;
-}
-
-static int sm_disk_inc_block(struct dm_space_map *sm, dm_block_t b)
-{
-	int r;
-	enum allocation_event ev;
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-
-	r = sm_ll_inc(&smd->ll, b, &ev);
-	if (!r && (ev == SM_ALLOC))
-		/*
-		 * This _must_ be free in the prior transaction
-		 * otherwise we've lost atomicity.
-		 */
-		smd->nr_allocated_this_transaction++;
-
-	return r;
-}
-
-static int sm_disk_dec_block(struct dm_space_map *sm, dm_block_t b)
-{
-	int r;
-	uint32_t old_count;
-	enum allocation_event ev;
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-
-	r = sm_ll_dec(&smd->ll, b, &ev);
-	if (!r && (ev == SM_FREE)) {
-		/*
-		 * It's only free if it's also free in the last
-		 * transaction.
-		 */
-		r = sm_ll_lookup(&smd->old_ll, b, &old_count);
-		if (!r && !old_count)
-			smd->nr_allocated_this_transaction--;
-	}
-
-	return r;
-}
-
-static int sm_disk_new_block(struct dm_space_map *sm, dm_block_t *b)
-{
-	int r;
-	enum allocation_event ev;
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-
-	/*
-	 * Any block we allocate has to be free in both the old and current ll.
-	 */
-	r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, smd->begin, smd->ll.nr_blocks, b);
-	if (r == -ENOSPC) {
-		/*
-		 * There's no free block between smd->begin and the end of the metadata device.
-		 * We search before smd->begin in case something has been freed.
-		 */
-		r = sm_ll_find_common_free_block(&smd->old_ll, &smd->ll, 0, smd->begin, b);
-	}
-
-	if (r)
-		return r;
-
-	smd->begin = *b + 1;
-	r = sm_ll_inc(&smd->ll, *b, &ev);
-	if (!r) {
-		BUG_ON(ev != SM_ALLOC);
-		smd->nr_allocated_this_transaction++;
-	}
-
-	return r;
-}
-
-static int sm_disk_commit(struct dm_space_map *sm)
-{
-	int r;
-	dm_block_t nr_free;
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-
-	r = sm_disk_get_nr_free(sm, &nr_free);
-	if (r)
-		return r;
-
-	r = sm_ll_commit(&smd->ll);
-	if (r)
-		return r;
-
-	memcpy(&smd->old_ll, &smd->ll, sizeof(smd->old_ll));
-	smd->nr_allocated_this_transaction = 0;
-
-	r = sm_disk_get_nr_free(sm, &nr_free);
-	if (r)
-		return r;
-
-	return 0;
-}
-
-static int sm_disk_root_size(struct dm_space_map *sm, size_t *result)
-{
-	*result = sizeof(struct disk_sm_root);
-
-	return 0;
-}
-
-static int sm_disk_copy_root(struct dm_space_map *sm, void *where_le, size_t max)
-{
-	struct sm_disk *smd = container_of(sm, struct sm_disk, sm);
-	struct disk_sm_root root_le;
-
-	root_le.nr_blocks = cpu_to_le64(smd->ll.nr_blocks);
-	root_le.nr_allocated = cpu_to_le64(smd->ll.nr_allocated);
-	root_le.bitmap_root = cpu_to_le64(smd->ll.bitmap_root);
-	root_le.ref_count_root = cpu_to_le64(smd->ll.ref_count_root);
-
-	if (max < sizeof(root_le))
-		return -ENOSPC;
-
-	memcpy(where_le, &root_le, sizeof(root_le));
-
-	return 0;
-}
-
-/*----------------------------------------------------------------*/
-
-static struct dm_space_map ops = {
-	.destroy = sm_disk_destroy,
-	.extend = sm_disk_extend,
-	.get_nr_blocks = sm_disk_get_nr_blocks,
-	.get_nr_free = sm_disk_get_nr_free,
-	.get_count = sm_disk_get_count,
-	.count_is_more_than_one = sm_disk_count_is_more_than_one,
-	.set_count = sm_disk_set_count,
-	.inc_block = sm_disk_inc_block,
-	.dec_block = sm_disk_dec_block,
-	.new_block = sm_disk_new_block,
-	.commit = sm_disk_commit,
-	.root_size = sm_disk_root_size,
-	.copy_root = sm_disk_copy_root,
-	.register_threshold_callback = NULL
-};
-
-struct dm_space_map *dm_sm_disk_create(struct dm_transaction_manager *tm,
-				       dm_block_t nr_blocks)
-{
-	int r;
-	struct sm_disk *smd;
-
-	smd = kmalloc(sizeof(*smd), GFP_KERNEL);
-	if (!smd)
-		return ERR_PTR(-ENOMEM);
-
-	smd->begin = 0;
-	smd->nr_allocated_this_transaction = 0;
-	memcpy(&smd->sm, &ops, sizeof(smd->sm));
-
-	r = sm_ll_new_disk(&smd->ll, tm);
-	if (r)
-		goto bad;
-
-	r = sm_ll_extend(&smd->ll, nr_blocks);
-	if (r)
-		goto bad;
-
-	r = sm_disk_commit(&smd->sm);
-	if (r)
-		goto bad;
-
-	return &smd->sm;
-
-bad:
-	kfree(smd);
-	return ERR_PTR(r);
-}
-EXPORT_SYMBOL_GPL(dm_sm_disk_create);
-
-struct dm_space_map *dm_sm_disk_open(struct dm_transaction_manager *tm,
-				     void *root_le, size_t len)
-{
-	int r;
-	struct sm_disk *smd;
-
-	smd = kmalloc(sizeof(*smd), GFP_KERNEL);
-	if (!smd)
-		return ERR_PTR(-ENOMEM);
-
-	smd->begin = 0;
-	smd->nr_allocated_this_transaction = 0;
-	memcpy(&smd->sm, &ops, sizeof(smd->sm));
-
-	r = sm_ll_open_disk(&smd->ll, tm, root_le, len);
-	if (r)
-		goto bad;
-
-	r = sm_disk_commit(&smd->sm);
-	if (r)
-		goto bad;
-
-	return &smd->sm;
-
-bad:
-	kfree(smd);
-	return ERR_PTR(r);
-}
-EXPORT_SYMBOL_GPL(dm_sm_disk_open);
-
-/*----------------------------------------------------------------*/
+e SDMA1_GFX_CONTEXT_STATUS__CTXSW_ABLE__SHIFT 0x7
+#define SDMA1_GFX_CONTEXT_STATUS__CTXSW_READY_MASK 0x100
+#define SDMA1_GFX_CONTEXT_STATUS__CTXSW_READY__SHIFT 0x8
+#define SDMA1_GFX_CONTEXT_STATUS__PREEMPTED_MASK 0x200
+#define SDMA1_GFX_CONTEXT_STATUS__PREEMPTED__SHIFT 0x9
+#define SDMA1_GFX_CONTEXT_STATUS__PREEMPT_DISABLE_MASK 0x400
+#define SDMA1_GFX_CONTEXT_STATUS__PREEMPT_DISABLE__SHIFT 0xa
+#define SDMA1_GFX_DOORBELL__OFFSET_MASK 0x1fffff
+#define SDMA1_GFX_DOORBELL__OFFSET__SHIFT 0x0
+#define SDMA1_GFX_DOORBELL__ENABLE_MASK 0x10000000
+#define SDMA1_GFX_DOORBELL__ENABLE__SHIFT 0x1c
+#define SDMA1_GFX_DOORBELL__CAPTURED_MASK 0x40000000
+#define SDMA1_GFX_DOORBELL__CAPTURED__SHIFT 0x1e
+#define SDMA1_GFX_CONTEXT_CNTL__RESUME_CTX_MASK 0x10000
+#define SDMA1_GFX_CONTEXT_CNTL__RESUME_CTX__SHIFT 0x10
+#define SDMA1_GFX_CONTEXT_CNTL__SESSION_SEL_MASK 0xf000000
+#define SDMA1_GFX_CONTEXT_CNTL__SESSION_SEL__SHIFT 0x18
+#define SDMA1_GFX_VIRTUAL_ADDR__ATC_MASK 0x1
+#define SDMA1_GFX_VIRTUAL_ADDR__ATC__SHIFT 0x0
+#define SDMA1_GFX_VIRTUAL_ADDR__INVAL_MASK 0x2
+#define SDMA1_GFX_VIRTUAL_ADDR__INVAL__SHIFT 0x1
+#define SDMA1_GFX_VIRTUAL_ADDR__PTR32_MASK 0x10
+#define SDMA1_GFX_VIRTUAL_ADDR__PTR32__SHIFT 0x4
+#define SDMA1_GFX_VIRTUAL_ADDR__SHARED_BASE_MASK 0x700
+#define SDMA1_GFX_VIRTUAL_ADDR__SHARED_BASE__SHIFT 0x8
+#define SDMA1_GFX_VIRTUAL_ADDR__VM_HOLE_MASK 0x40000000
+#define SDMA1_GFX_VIRTUAL_ADDR__VM_HOLE__SHIFT 0x1e
+#define SDMA1_GFX_APE1_CNTL__BASE_MASK 0xffff
+#define SDMA1_GFX_APE1_CNTL__BASE__SHIFT 0x0
+#define SDMA1_GFX_APE1_CNTL__LIMIT_MASK 0xffff0000
+#define SDMA1_GFX_APE1_CNTL__LIMIT__SHIFT 0x10
+#define SDMA1_GFX_DOORBELL_LOG__BE_ERROR_MASK 0x1
+#define SDMA1_GFX_DOORBELL_LOG__BE_ERROR__SHIFT 0x0
+#define SDMA1_GFX_DOORBELL_LOG__DATA_MASK 0xfffffffc
+#define SDMA1_GFX_DOORBELL_LOG__DATA__SHIFT 0x2
+#define SDMA1_GFX_WATERMARK__RD_OUTSTANDING_MASK 0xfff
+#define SDMA1_GFX_WATERMARK__RD_OUTSTANDING__SHIFT 0x0
+#define SDMA1_GFX_WATERMARK__WR_OUTSTANDING_MASK 0x1ff0000
+#define SDMA1_GFX_WATERMARK__WR_OUTSTANDING__SHIFT 0x10
+#define SDMA1_GFX_CSA_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA1_GFX_CSA_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA1_GFX_CSA_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA1_GFX_CSA_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA1_GFX_IB_SUB_REMAIN__SIZE_MASK 0x3fff
+#define SDMA1_GFX_IB_SUB_REMAIN__SIZE__SHIFT 0x0
+#define SDMA1_GFX_PREEMPT__IB_PREEMPT_MASK 0x1
+#define SDMA1_GFX_PREEMPT__IB_PREEMPT__SHIFT 0x0
+#define SDMA1_GFX_DUMMY_REG__DUMMY_MASK 0xffffffff
+#define SDMA1_GFX_DUMMY_REG__DUMMY__SHIFT 0x0
+#define SDMA1_GFX_MIDCMD_DATA0__DATA0_MASK 0xffffffff
+#define SDMA1_GFX_MIDCMD_DATA0__DATA0__SHIFT 0x0
+#define SDMA1_GFX_MIDCMD_DATA1__DATA1_MASK 0xffffffff
+#define SDMA1_GFX_MIDCMD_DATA1__DATA1__SHIFT 0x0
+#define SDMA1_GFX_MIDCMD_DATA2__DATA2_MASK 0xffffffff
+#define SDMA1_GFX_MIDCMD_DATA2__DATA2__SHIFT 0x0
+#define SDMA1_GFX_MIDCMD_DATA3__DATA3_MASK 0xffffffff
+#define SDMA1_GFX_MIDCMD_DATA3__DATA3__SHIFT 0x0
+#define SDMA1_GFX_MIDCMD_DATA4__DATA4_MASK 0xffffffff
+#define SDMA1_GFX_MIDCMD_DATA4__DATA4__SHIFT 0x0
+#define SDMA1_GFX_MIDCMD_DATA5__DATA5_MASK 0xffffffff
+#define SDMA1_GFX_MIDCMD_DATA5__DATA5__SHIFT 0x0
+#define SDMA1_GFX_MIDCMD_CNTL__DATA_VALID_MASK 0x1
+#define SDMA1_GFX_MIDCMD_CNTL__DATA_VALID__SHIFT 0x0
+#define SDMA1_GFX_MIDCMD_CNTL__COPY_MODE_MASK 0x2
+#define SDMA1_GFX_MIDCMD_CNTL__COPY_MODE__SHIFT 0x1
+#define SDMA1_GFX_MIDCMD_CNTL__SPLIT_STATE_MASK 0xf0
+#define SDMA1_GFX_MIDCMD_CNTL__SPLIT_STATE__SHIFT 0x4
+#define SDMA1_GFX_MIDCMD_CNTL__ALLOW_PREEMPT_MASK 0x100
+#define SDMA1_GFX_MIDCMD_CNTL__ALLOW_PREEMPT__SHIFT 0x8
+#define SDMA1_RLC0_RB_CNTL__RB_ENABLE_MASK 0x1
+#define SDMA1_RLC0_RB_CNTL__RB_ENABLE__SHIFT 0x0
+#define SDMA1_RLC0_RB_CNTL__RB_SIZE_MASK 0x3e
+#define SDMA1_RLC0_RB_CNTL__RB_SIZE__SHIFT 0x1
+#define SDMA1_RLC0_RB_CNTL__RB_SWAP_ENABLE_MASK 0x200
+#define SDMA1_RLC0_RB_CNTL__RB_SWAP_ENABLE__SHIFT 0x9
+#define SDMA1_RLC0_RB_CNTL__RPTR_WRITEBACK_ENABLE_MASK 0x1000
+#define SDMA1_RLC0_RB_CNTL__RPTR_WRITEBACK_ENABLE__SHIFT 0xc
+#define SDMA1_RLC0_RB_CNTL__RPTR_WRITEBACK_SWAP_ENABLE_MASK 0x2000
+#define SDMA1_RLC0_RB_CNTL__RPTR_WRITEBACK_SWAP_ENABLE__SHIFT 0xd
+#define SDMA1_RLC0_RB_CNTL__RPTR_WRITEBACK_TIMER_MASK 0x1f0000
+#define SDMA1_RLC0_RB_CNTL__RPTR_WRITEBACK_TIMER__SHIFT 0x10
+#define SDMA1_RLC0_RB_CNTL__RB_PRIV_MASK 0x800000
+#define SDMA1_RLC0_RB_CNTL__RB_PRIV__SHIFT 0x17
+#define SDMA1_RLC0_RB_CNTL__RB_VMID_MASK 0xf000000
+#define SDMA1_RLC0_RB_CNTL__RB_VMID__SHIFT 0x18
+#define SDMA1_RLC0_RB_BASE__ADDR_MASK 0xffffffff
+#define SDMA1_RLC0_RB_BASE__ADDR__SHIFT 0x0
+#define SDMA1_RLC0_RB_BASE_HI__ADDR_MASK 0xffffff
+#define SDMA1_RLC0_RB_BASE_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC0_RB_RPTR__OFFSET_MASK 0xfffffffc
+#define SDMA1_RLC0_RB_RPTR__OFFSET__SHIFT 0x2
+#define SDMA1_RLC0_RB_WPTR__OFFSET_MASK 0xfffffffc
+#define SDMA1_RLC0_RB_WPTR__OFFSET__SHIFT 0x2
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__ENABLE_MASK 0x1
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__ENABLE__SHIFT 0x0
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__SWAP_ENABLE_MASK 0x2
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__SWAP_ENABLE__SHIFT 0x1
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE_MASK 0x4
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE__SHIFT 0x2
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__FREQUENCY_MASK 0xfff0
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__FREQUENCY__SHIFT 0x4
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT_MASK 0xffff0000
+#define SDMA1_RLC0_RB_WPTR_POLL_CNTL__IDLE_POLL_COUNT__SHIFT 0x10
+#define SDMA1_RLC0_RB_WPTR_POLL_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC0_RB_WPTR_POLL_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC0_RB_WPTR_POLL_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA1_RLC0_RB_WPTR_POLL_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA1_RLC0_RB_RPTR_ADDR_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC0_RB_RPTR_ADDR_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC0_RB_RPTR_ADDR_LO__ADDR_MASK 0xfffffffc
+#define SDMA1_RLC0_RB_RPTR_ADDR_LO__ADDR__SHIFT 0x2
+#define SDMA1_RLC0_IB_CNTL__IB_ENABLE_MASK 0x1
+#define SDMA1_RLC0_IB_CNTL__IB_ENABLE__SHIFT 0x0
+#define SDMA1_RLC0_IB_CNTL__IB_SWAP_ENABLE_MASK 0x10
+#define SDMA1_RLC0_IB_CNTL__IB_SWAP_ENABLE__SHIFT 0x4
+#define SDMA1_RLC0_IB_CNTL__SWITCH_INSIDE_IB_MASK 0x100
+#define SDMA1_RLC0_IB_CNTL__SWITCH_INSIDE_IB__SHIFT 0x8
+#define SDMA1_RLC0_IB_CNTL__CMD_VMID_MASK 0xf0000
+#define SDMA1_RLC0_IB_CNTL__CMD_VMID__SHIFT 0x10
+#define SDMA1_RLC0_IB_RPTR__OFFSET_MASK 0x3ffffc
+#define SDMA1_RLC0_IB_RPTR__OFFSET__SHIFT 0x2
+#define SDMA1_RLC0_IB_OFFSET__OFFSET_MASK 0x3ffffc
+#define SDMA1_RLC0_IB_OFFSET__OFFSET__SHIFT 0x2
+#define SDMA1_RLC0_IB_BASE_LO__ADDR_MASK 0xffffffe0
+#define SDMA1_RLC0_IB_BASE_LO__ADDR__SHIFT 0x5
+#define SDMA1_RLC0_IB_BASE_HI__ADDR_MASK 0xffffffff
+#define SDMA1_RLC0_IB_BASE_HI__ADDR__SHIFT 0x0
+#define SDMA1_RLC0_IB_SIZE__SIZE_MASK 0xfffff
+#define SDMA1_RLC0_IB_SIZE__SIZE__SHIFT 0x0
+#define SDMA1_RLC0_SKIP_CNTL__SKIP_COUNT_MASK 0x3fff
+#define SDMA1_RLC0_SKIP_CNTL__SKIP_COUNT__SHIFT 0x0
+#define SDMA1_RLC0_CONTEXT_STATUS__SELECTED_MASK 0x1
+#define SDMA1_RLC0_CONTEXT_STATUS__SELECTED__SHIFT 0x0
+#define SDMA1_RLC0_CONTEXT_STATUS__IDLE_MA

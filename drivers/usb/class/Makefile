@@ -1,9 +1,4 @@
-#
-# Makefile for USB Class drivers
-# (one step up from the misc category)
-#
-
-obj-$(CONFIG_USB_ACM)		+= cdc-acm.o
-obj-$(CONFIG_USB_PRINTER)	+= usblp.o
-obj-$(CONFIG_USB_WDM)		+= cdc-wdm.o
-obj-$(CONFIG_USB_TMC)		+= usbtmc.o
+STER_ID_FUNCTION__SHIFT 0x0
+#define D2F3_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE_MASK 0xf8
+#define D2F3_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE__SHIFT 0x3
+#define D2F3_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS_M

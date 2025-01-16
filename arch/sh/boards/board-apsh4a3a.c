@@ -1,185 +1,114 @@
 /*
- * ALPHAPROJECT AP-SH4A-3A Support.
+ *  Video for Linux Two header file
  *
- * Copyright (C) 2010 ALPHAPROJECT Co.,Ltd.
- * Copyright (C) 2008  Yoshihiro Shimoda
- * Copyright (C) 2009  Paul Mundt
+ *  Copyright (C) 1999-2012 the contributors
  *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  Alternatively you can redistribute this file under the terms of the
+ *  BSD license as stated below:
+ *
+ *  Redistribution and use in source and binary forms, with or without
+ *  modification, are permitted provided that the following conditions
+ *  are met:
+ *  1. Redistributions of source code must retain the above copyright
+ *     notice, this list of conditions and the following disclaimer.
+ *  2. Redistributions in binary form must reproduce the above copyright
+ *     notice, this list of conditions and the following disclaimer in
+ *     the documentation and/or other materials provided with the
+ *     distribution.
+ *  3. The names of its contributors may not be used to endorse or promote
+ *     products derived from this software without specific prior written
+ *     permission.
+ *
+ *  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ *  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ *  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ *  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ *  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ *  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+ *  TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ *  PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+ *  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+ *  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ *	Header file for v4l or V4L2 drivers and applications
+ * with public API.
+ * All kernel-specific stuff were moved to media/v4l2-dev.h, so
+ * no #if __KERNEL tests are allowed here
+ *
+ *	See http://linuxtv.org for more info
+ *
+ *	Author: Bill Dirks <bill@thedirks.org>
+ *		Justin Schoeman
+ *              Hans Verkuil <hverkuil@xs4all.nl>
+ *		et al.
  */
-#include <linux/init.h>
-#include <linux/platform_device.h>
-#include <linux/io.h>
-#include <linux/mtd/physmap.h>
-#include <linux/regulator/fixed.h>
-#include <linux/regulator/machine.h>
-#include <linux/smsc911x.h>
-#include <linux/irq.h>
-#include <linux/clk.h>
-#include <asm/machvec.h>
-#include <asm/sizes.h>
-#include <asm/clock.h>
+#ifndef _UAPI__LINUX_VIDEODEV2_H
+#define _UAPI__LINUX_VIDEODEV2_H
 
-static struct mtd_partition nor_flash_partitions[] = {
-	{
-		.name		= "loader",
-		.offset		= 0x00000000,
-		.size		= 512 * 1024,
-	},
-	{
-		.name		= "bootenv",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= 512 * 1024,
-	},
-	{
-		.name		= "kernel",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= 4 * 1024 * 1024,
-	},
-	{
-		.name		= "data",
-		.offset		= MTDPART_OFS_APPEND,
-		.size		= MTDPART_SIZ_FULL,
-	},
-};
-
-static struct physmap_flash_data nor_flash_data = {
-	.width		= 4,
-	.parts		= nor_flash_partitions,
-	.nr_parts	= ARRAY_SIZE(nor_flash_partitions),
-};
-
-static struct resource nor_flash_resources[] = {
-	[0]	= {
-		.start	= 0x00000000,
-		.end	= 0x01000000 - 1,
-		.flags	= IORESOURCE_MEM,
-	}
-};
-
-static struct platform_device nor_flash_device = {
-	.name		= "physmap-flash",
-	.dev		= {
-		.platform_data	= &nor_flash_data,
-	},
-	.num_resources	= ARRAY_SIZE(nor_flash_resources),
-	.resource	= nor_flash_resources,
-};
-
-/* Dummy supplies, where voltage doesn't matter */
-static struct regulator_consumer_supply dummy_supplies[] = {
-	REGULATOR_SUPPLY("vddvario", "smsc911x"),
-	REGULATOR_SUPPLY("vdd33a", "smsc911x"),
-};
-
-static struct resource smsc911x_resources[] = {
-	[0] = {
-		.name		= "smsc911x-memory",
-		.start		= 0xA4000000,
-		.end		= 0xA4000000 + SZ_256 - 1,
-		.flags		= IORESOURCE_MEM,
-	},
-	[1] = {
-		.name		= "smsc911x-irq",
-		.start		= evt2irq(0x200),
-		.end		= evt2irq(0x200),
-		.flags		= IORESOURCE_IRQ,
-	},
-};
-
-static struct smsc911x_platform_config smsc911x_config = {
-	.irq_polarity	= SMSC911X_IRQ_POLARITY_ACTIVE_LOW,
-	.irq_type	= SMSC911X_IRQ_TYPE_OPEN_DRAIN,
-	.flags		= SMSC911X_USE_16BIT,
-	.phy_interface	= PHY_INTERFACE_MODE_MII,
-};
-
-static struct platform_device smsc911x_device = {
-	.name		= "smsc911x",
-	.id		= -1,
-	.num_resources	= ARRAY_SIZE(smsc911x_resources),
-	.resource	= smsc911x_resources,
-	.dev = {
-		.platform_data = &smsc911x_config,
-	},
-};
-
-static struct platform_device *apsh4a3a_devices[] __initdata = {
-	&nor_flash_device,
-	&smsc911x_device,
-};
-
-static int __init apsh4a3a_devices_setup(void)
-{
-	regulator_register_fixed(0, dummy_supplies, ARRAY_SIZE(dummy_supplies));
-
-	return platform_add_devices(apsh4a3a_devices,
-				    ARRAY_SIZE(apsh4a3a_devices));
-}
-device_initcall(apsh4a3a_devices_setup);
-
-static int apsh4a3a_clk_init(void)
-{
-	struct clk *clk;
-	int ret;
-
-	clk = clk_get(NULL, "extal");
-	if (IS_ERR(clk))
-		return PTR_ERR(clk);
-	ret = clk_set_rate(clk, 33333000);
-	clk_put(clk);
-
-	return ret;
-}
-
-/* Initialize the board */
-static void __init apsh4a3a_setup(char **cmdline_p)
-{
-	printk(KERN_INFO "Alpha Project AP-SH4A-3A support:\n");
-}
-
-static void __init apsh4a3a_init_irq(void)
-{
-	plat_irq_setup_pins(IRQ_MODE_IRQ7654);
-}
-
-/* Return the board specific boot mode pin configuration */
-static int apsh4a3a_mode_pins(void)
-{
-	int value = 0;
-
-	/* These are the factory default settings of SW1 and SW2.
-	 * If you change these dip switches then you will need to
-	 * adjust the values below as well.
-	 */
-	value &= ~MODE_PIN0;  /* Clock Mode 16 */
-	value &= ~MODE_PIN1;
-	value &= ~MODE_PIN2;
-	value &= ~MODE_PIN3;
-	value |=  MODE_PIN4;
-	value &= ~MODE_PIN5;  /* 16-bit Area0 bus width */
-	value |=  MODE_PIN6;  /* Area 0 SRAM interface */
-	value |=  MODE_PIN7;
-	value |=  MODE_PIN8;  /* Little Endian */
-	value |=  MODE_PIN9;  /* Master Mode */
-	value |=  MODE_PIN10; /* Crystal resonator */
-	value |=  MODE_PIN11; /* Display Unit */
-	value |=  MODE_PIN12;
-	value &= ~MODE_PIN13; /* 29-bit address mode */
-	value |=  MODE_PIN14; /* No PLL step-up */
-
-	return value;
-}
+#ifndef __KERNEL__
+#include <sys/time.h>
+#endif
+#include <linux/compiler.h>
+#include <linux/ioctl.h>
+#include <linux/types.h>
+#include <linux/v4l2-common.h>
+#include <linux/v4l2-controls.h>
 
 /*
- * The Machine Vector
+ * Common stuff for both V4L1 and V4L2
+ * Moved from videodev.h
  */
-static struct sh_machine_vector mv_apsh4a3a __initmv = {
-	.mv_name		= "AP-SH4A-3A",
-	.mv_setup		= apsh4a3a_setup,
-	.mv_clk_init		= apsh4a3a_clk_init,
-	.mv_init_irq		= apsh4a3a_init_irq,
-	.mv_mode_pins		= apsh4a3a_mode_pins,
+#define VIDEO_MAX_FRAME               32
+#define VIDEO_MAX_PLANES              17
+
+/*
+ *	M I S C E L L A N E O U S
+ */
+
+/*  Four-character-code (FOURCC) */
+#define v4l2_fourcc(a, b, c, d)\
+	((__u32)(a) | ((__u32)(b) << 8) | ((__u32)(c) << 16) | ((__u32)(d) << 24))
+#define v4l2_fourcc_be(a, b, c, d)	(v4l2_fourcc(a, b, c, d) | (1 << 31))
+
+/*
+ *	E N U M S
+ */
+enum v4l2_field {
+	V4L2_FIELD_ANY           = 0, /* driver can choose from none,
+					 top, bottom, interlaced
+					 depending on whatever it thinks
+					 is approximate ... */
+	V4L2_FIELD_NONE          = 1, /* this device has no fields ... */
+	V4L2_FIELD_TOP           = 2, /* top field only */
+	V4L2_FIELD_BOTTOM        = 3, /* bottom field only */
+	V4L2_FIELD_INTERLACED    = 4, /* both fields interlaced */
+	V4L2_FIELD_SEQ_TB        = 5, /* both fields sequential into one
+					 buffer, top-bottom order */
+	V4L2_FIELD_SEQ_BT        = 6, /* same as above + bottom-top order */
+	V4L2_FIELD_ALTERNATE     = 7, /* both fields alternating into
+					 separate buffers */
+	V4L2_FIELD_INTERLACED_TB = 8, /* both fields interlaced, top field
+					 first and the top field is
+					 transmitted first */
+	V4L2_FIELD_INTERLACED_BT = 9, /* both fields interlaced, top field
+					 first and the bottom field is
+					 transmitted first */
 };
+#define V4L2_FIELD_HAS_TOP(field)	\
+	((field) == V4L2_FIELD_TOP 	||\
+	 (field) == V4L2_FIELD_INTERLACED ||\
+	 (field) == V4L2_FIELD_INTERLACED_TB ||\
+	 (field) == V4L2_FIELD_INTERLACED_BT ||\
+	 (field) == V4L2_FIELD_SEQ_TB	||\
+	 (field) == V4

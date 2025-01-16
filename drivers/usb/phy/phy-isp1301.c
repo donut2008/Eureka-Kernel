@@ -1,171 +1,69 @@
-/*
- * NXP ISP1301 USB transceiver driver
- *
- * Copyright (C) 2012 Roland Stigge
- *
- * Author: Roland Stigge <stigge@antcom.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/module.h>
-#include <linux/mutex.h>
-#include <linux/i2c.h>
-#include <linux/usb/phy.h>
-#include <linux/usb/isp1301.h>
-
-#define DRV_NAME		"isp1301"
-
-struct isp1301 {
-	struct usb_phy		phy;
-	struct mutex		mutex;
-
-	struct i2c_client	*client;
-};
-
-#define phy_to_isp(p)		(container_of((p), struct isp1301, phy))
-
-static const struct i2c_device_id isp1301_id[] = {
-	{ "isp1301", 0 },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, isp1301_id);
-
-static const struct of_device_id isp1301_of_match[] = {
-	{.compatible = "nxp,isp1301" },
-	{ },
-};
-MODULE_DEVICE_TABLE(of, isp1301_of_match);
-
-static struct i2c_client *isp1301_i2c_client;
-
-static int __isp1301_write(struct isp1301 *isp, u8 reg, u8 value, u8 clear)
-{
-	return i2c_smbus_write_byte_data(isp->client, reg | clear, value);
-}
-
-static int isp1301_write(struct isp1301 *isp, u8 reg, u8 value)
-{
-	return __isp1301_write(isp, reg, value, 0);
-}
-
-static int isp1301_clear(struct isp1301 *isp, u8 reg, u8 value)
-{
-	return __isp1301_write(isp, reg, value, ISP1301_I2C_REG_CLEAR_ADDR);
-}
-
-static int isp1301_phy_init(struct usb_phy *phy)
-{
-	struct isp1301 *isp = phy_to_isp(phy);
-
-	/* Disable transparent UART mode first */
-	isp1301_clear(isp, ISP1301_I2C_MODE_CONTROL_1, MC1_UART_EN);
-	isp1301_clear(isp, ISP1301_I2C_MODE_CONTROL_1, ~MC1_SPEED_REG);
-	isp1301_write(isp, ISP1301_I2C_MODE_CONTROL_1, MC1_SPEED_REG);
-	isp1301_clear(isp, ISP1301_I2C_MODE_CONTROL_2, ~0);
-	isp1301_write(isp, ISP1301_I2C_MODE_CONTROL_2, (MC2_BI_DI | MC2_PSW_EN
-				| MC2_SPD_SUSP_CTRL));
-
-	isp1301_clear(isp, ISP1301_I2C_OTG_CONTROL_1, ~0);
-	isp1301_write(isp, ISP1301_I2C_MODE_CONTROL_1, MC1_DAT_SE0);
-	isp1301_write(isp, ISP1301_I2C_OTG_CONTROL_1, (OTG1_DM_PULLDOWN
-				| OTG1_DP_PULLDOWN));
-	isp1301_clear(isp, ISP1301_I2C_OTG_CONTROL_1, (OTG1_DM_PULLUP
-				| OTG1_DP_PULLUP));
-
-	/* mask all interrupts */
-	isp1301_clear(isp, ISP1301_I2C_INTERRUPT_LATCH, ~0);
-	isp1301_clear(isp, ISP1301_I2C_INTERRUPT_FALLING, ~0);
-	isp1301_clear(isp, ISP1301_I2C_INTERRUPT_RISING, ~0);
-
-	return 0;
-}
-
-static int isp1301_phy_set_vbus(struct usb_phy *phy, int on)
-{
-	struct isp1301 *isp = phy_to_isp(phy);
-
-	if (on)
-		isp1301_write(isp, ISP1301_I2C_OTG_CONTROL_1, OTG1_VBUS_DRV);
-	else
-		isp1301_clear(isp, ISP1301_I2C_OTG_CONTROL_1, OTG1_VBUS_DRV);
-
-	return 0;
-}
-
-static int isp1301_probe(struct i2c_client *client,
-			 const struct i2c_device_id *i2c_id)
-{
-	struct isp1301 *isp;
-	struct usb_phy *phy;
-
-	isp = devm_kzalloc(&client->dev, sizeof(*isp), GFP_KERNEL);
-	if (!isp)
-		return -ENOMEM;
-
-	isp->client = client;
-	mutex_init(&isp->mutex);
-
-	phy = &isp->phy;
-	phy->dev = &client->dev;
-	phy->label = DRV_NAME;
-	phy->init = isp1301_phy_init;
-	phy->set_vbus = isp1301_phy_set_vbus;
-	phy->type = USB_PHY_TYPE_USB2;
-
-	i2c_set_clientdata(client, isp);
-	usb_add_phy_dev(phy);
-
-	isp1301_i2c_client = client;
-
-	return 0;
-}
-
-static int isp1301_remove(struct i2c_client *client)
-{
-	struct isp1301 *isp = i2c_get_clientdata(client);
-
-	usb_remove_phy(&isp->phy);
-	isp1301_i2c_client = NULL;
-
-	return 0;
-}
-
-static struct i2c_driver isp1301_driver = {
-	.driver = {
-		.name = DRV_NAME,
-		.of_match_table = isp1301_of_match,
-	},
-	.probe = isp1301_probe,
-	.remove = isp1301_remove,
-	.id_table = isp1301_id,
-};
-
-module_i2c_driver(isp1301_driver);
-
-static int match(struct device *dev, void *data)
-{
-	struct device_node *node = (struct device_node *)data;
-	return (dev->of_node == node) &&
-		(dev->driver == &isp1301_driver.driver);
-}
-
-struct i2c_client *isp1301_get_client(struct device_node *node)
-{
-	if (node) { /* reference of ISP1301 I2C node via DT */
-		struct device *dev = bus_find_device(&i2c_bus_type, NULL,
-						     node, match);
-		if (!dev)
-			return NULL;
-		return to_i2c_client(dev);
-	} else { /* non-DT: only one ISP1301 chip supported */
-		return isp1301_i2c_client;
-	}
-}
-EXPORT_SYMBOL_GPL(isp1301_get_client);
-
-MODULE_AUTHOR("Roland Stigge <stigge@antcom.de>");
-MODULE_DESCRIPTION("NXP ISP1301 USB transceiver driver");
-MODULE_LICENSE("GPL");
+G_17__IDCD_MVP_ASYNC_FIFO_PHASE__SHIFT 0x1
+#define MVP_DEBUG_17__IDCD_MVP_ASYNC_FIFO_READ_DATA_MASK 0xfffffffc
+#define MVP_DEBUG_17__IDCD_MVP_ASYNC_FIFO_READ_DATA__SHIFT 0x2
+#define SCL_COEF_RAM_SELECT__SCL_C_RAM_TAP_PAIR_IDX_MASK 0xf
+#define SCL_COEF_RAM_SELECT__SCL_C_RAM_TAP_PAIR_IDX__SHIFT 0x0
+#define SCL_COEF_RAM_SELECT__SCL_C_RAM_PHASE_MASK 0xf00
+#define SCL_COEF_RAM_SELECT__SCL_C_RAM_PHASE__SHIFT 0x8
+#define SCL_COEF_RAM_SELECT__SCL_C_RAM_FILTER_TYPE_MASK 0x70000
+#define SCL_COEF_RAM_SELECT__SCL_C_RAM_FILTER_TYPE__SHIFT 0x10
+#define SCL_COEF_RAM_TAP_DATA__SCL_C_RAM_EVEN_TAP_COEF_MASK 0x3fff
+#define SCL_COEF_RAM_TAP_DATA__SCL_C_RAM_EVEN_TAP_COEF__SHIFT 0x0
+#define SCL_COEF_RAM_TAP_DATA__SCL_C_RAM_EVEN_TAP_COEF_EN_MASK 0x8000
+#define SCL_COEF_RAM_TAP_DATA__SCL_C_RAM_EVEN_TAP_COEF_EN__SHIFT 0xf
+#define SCL_COEF_RAM_TAP_DATA__SCL_C_RAM_ODD_TAP_COEF_MASK 0x3fff0000
+#define SCL_COEF_RAM_TAP_DATA__SCL_C_RAM_ODD_TAP_COEF__SHIFT 0x10
+#define SCL_COEF_RAM_TAP_DATA__SCL_C_RAM_ODD_TAP_COEF_EN_MASK 0x80000000
+#define SCL_COEF_RAM_TAP_DATA__SCL_C_RAM_ODD_TAP_COEF_EN__SHIFT 0x1f
+#define SCL_MODE__SCL_MODE_MASK 0x3
+#define SCL_MODE__SCL_MODE__SHIFT 0x0
+#define SCL_MODE__SCL_PSCL_EN_MASK 0x10
+#define SCL_MODE__SCL_PSCL_EN__SHIFT 0x4
+#define SCL_TAP_CONTROL__SCL_V_NUM_OF_TAPS_MASK 0x7
+#define SCL_TAP_CONTROL__SCL_V_NUM_OF_TAPS__SHIFT 0x0
+#define SCL_TAP_CONTROL__SCL_H_NUM_OF_TAPS_MASK 0xf00
+#define SCL_TAP_CONTROL__SCL_H_NUM_OF_TAPS__SHIFT 0x8
+#define SCL_CONTROL__SCL_BOUNDARY_MODE_MASK 0x1
+#define SCL_CONTROL__SCL_BOUNDARY_MODE__SHIFT 0x0
+#define SCL_CONTROL__SCL_EARLY_EOL_MODE_MASK 0x10
+#define SCL_CONTROL__SCL_EARLY_EOL_MODE__SHIFT 0x4
+#define SCL_BYPASS_CONTROL__SCL_BYPASS_MODE_MASK 0x3
+#define SCL_BYPASS_CONTROL__SCL_BYPASS_MODE__SHIFT 0x0
+#define SCL_MANUAL_REPLICATE_CONTROL__SCL_V_MANUAL_REPLICATE_FACTOR_MASK 0xf
+#define SCL_MANUAL_REPLICATE_CONTROL__SCL_V_MANUAL_REPLICATE_FACTOR__SHIFT 0x0
+#define SCL_MANUAL_REPLICATE_CONTROL__SCL_H_MANUAL_REPLICATE_FACTOR_MASK 0xf00
+#define SCL_MANUAL_REPLICATE_CONTROL__SCL_H_MANUAL_REPLICATE_FACTOR__SHIFT 0x8
+#define SCL_AUTOMATIC_MODE_CONTROL__SCL_V_CALC_AUTO_RATIO_EN_MASK 0x1
+#define SCL_AUTOMATIC_MODE_CONTROL__SCL_V_CALC_AUTO_RATIO_EN__SHIFT 0x0
+#define SCL_AUTOMATIC_MODE_CONTROL__SCL_H_CALC_AUTO_RATIO_EN_MASK 0x10000
+#define SCL_AUTOMATIC_MODE_CONTROL__SCL_H_CALC_AUTO_RATIO_EN__SHIFT 0x10
+#define SCL_HORZ_FILTER_CONTROL__SCL_H_FILTER_PICK_NEAREST_MASK 0x1
+#define SCL_HORZ_FILTER_CONTROL__SCL_H_FILTER_PICK_NEAREST__SHIFT 0x0
+#define SCL_HORZ_FILTER_CONTROL__SCL_H_2TAP_HARDCODE_COEF_EN_MASK 0x100
+#define SCL_HORZ_FILTER_CONTROL__SCL_H_2TAP_HARDCODE_COEF_EN__SHIFT 0x8
+#define SCL_HORZ_FILTER_SCALE_RATIO__SCL_H_SCALE_RATIO_MASK 0x3ffffff
+#define SCL_HORZ_FILTER_SCALE_RATIO__SCL_H_SCALE_RATIO__SHIFT 0x0
+#define SCL_HORZ_FILTER_INIT__SCL_H_INIT_FRAC_MASK 0xffffff
+#define SCL_HORZ_FILTER_INIT__SCL_H_INIT_FRAC__SHIFT 0x0
+#define SCL_HORZ_FILTER_INIT__SCL_H_INIT_INT_MASK 0xf000000
+#define SCL_HORZ_FILTER_INIT__SCL_H_INIT_INT__SHIFT 0x18
+#define SCL_VERT_FILTER_CONTROL__SCL_V_FILTER_PICK_NEAREST_MASK 0x1
+#define SCL_VERT_FILTER_CONTROL__SCL_V_FILTER_PICK_NEAREST__SHIFT 0x0
+#define SCL_VERT_FILTER_CONTROL__SCL_V_2TAP_HARDCODE_COEF_EN_MASK 0x100
+#define SCL_VERT_FILTER_CONTROL__SCL_V_2TAP_HARDCODE_COEF_EN__SHIFT 0x8
+#define SCL_VERT_FILTER_SCALE_RATIO__SCL_V_SCALE_RATIO_MASK 0x3ffffff
+#define SCL_VERT_FILTER_SCALE_RATIO__SCL_V_SCALE_RATIO__SHIFT 0x0
+#define SCL_VERT_FILTER_INIT__SCL_V_INIT_FRAC_MASK 0xffffff
+#define SCL_VERT_FILTER_INIT__SCL_V_INIT_FRAC__SHIFT 0x0
+#define SCL_VERT_FILTER_INIT__SCL_V_INIT_INT_MASK 0x7000000
+#define SCL_VERT_FILTER_INIT__SCL_V_INIT_INT__SHIFT 0x18
+#define SCL_VERT_FILTER_INIT_BOT__SCL_V_INIT_FRAC_BOT_MASK 0xffffff
+#define SCL_VERT_FILTER_INIT_BOT__SCL_V_INIT_FRAC_BOT__SHIFT 0x0
+#define SCL_VERT_FILTER_INIT_BOT__SCL_V_INIT_INT_BOT_MASK 0x7000000
+#define SCL_VERT_FILTER_INIT_BOT__SCL_V_INIT_INT_BOT__SHIFT 0x18
+#define SCL_ROUND_OFFSET__SCL_ROUND_OFFSET_RGB_Y_MASK 0xffff
+#define SCL_ROUND_OFFSET__SCL_ROUND_OFFSET_RGB_Y__SHIFT 0x0
+#define SCL_ROUND_OFFSET__SCL_ROUND_OFFSET_CBCR_MASK 0xffff0000
+#define SCL_ROUND_OFFSET__SCL_ROUND_OFFSET_CBCR__SHIFT 0x10
+#define SCL_UPDATE__SCL_UPDATE_PENDING_MASK 0x1
+#define SCL_UPDATE__SCL_UPDATE_PENDING__SHIF

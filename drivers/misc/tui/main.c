@@ -1,156 +1,65 @@
-/* tui/main.c
- *
- * Samsung TUI HW Handler driver.
- *
- * Copyright (c) 2015 Samsung Electronics
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/cdev.h>
-#include <linux/delay.h>
-#include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/init.h>
-#include <linux/ioctl.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
-#include <linux/workqueue.h>
-
-#include "stui_core.h"
-#include "stui_hal.h"
-#include "stui_inf.h"
-#include "stui_ioctl.h"
-
-static struct device *stui_device;
-static struct cdev stui_cdev;
-static struct class *tui_class;
-static DEFINE_MUTEX(stui_mode_mutex);
-
-struct device *get_stui_device(void)
-{
-	return stui_device;
-}
-
-static void stui_wq_func(struct work_struct *param)
-{
-	struct delayed_work *wq = container_of(param, struct delayed_work, work);
-	long ret;
-	mutex_lock(&stui_mode_mutex);
-	ret = stui_process_cmd(NULL, STUI_HW_IOCTL_FINISH_TUI, 0);
-	if (ret != STUI_RET_OK)
-		pr_err("[STUI] STUI_HW_IOCTL_FINISH_TUI in wq fail: %ld\n", ret);
-	kfree(wq);
-	mutex_unlock(&stui_mode_mutex);
-}
-
-static int stui_open(struct inode *inode, struct file *filp)
-{
-	int ret = 0;
-	mutex_lock(&stui_mode_mutex);
-	filp->private_data = NULL;
-	if (stui_get_mode() & STUI_MODE_ALL) {
-		ret = -EBUSY;
-		pr_err("[STUI] Device is busy\n");
-	}
-	mutex_unlock(&stui_mode_mutex);
-	return ret;
-}
-
-static int stui_release(struct inode *inode, struct file *filp)
-{
-	struct delayed_work *work;
-	mutex_lock(&stui_mode_mutex);
-	if ((stui_get_mode() & STUI_MODE_ALL) && filp->private_data) {
-		pr_err("[STUI] Device close while TUI session is active\n");
-		work = kmalloc(sizeof(struct delayed_work), GFP_KERNEL);
-		if (!work) {
-			mutex_unlock(&stui_mode_mutex);
-			return -ENOMEM;
-		}
-		INIT_DELAYED_WORK(work, stui_wq_func);
-		schedule_delayed_work(work, msecs_to_jiffies(4000));
-	}
-	mutex_unlock(&stui_mode_mutex);
-	return 0;
-}
-
-static long stui_handler_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
-{
-	long ret;
-	mutex_lock(&stui_mode_mutex);
-	ret = stui_process_cmd(f, cmd, arg);
-	if (stui_get_mode() & STUI_MODE_ALL) {
-		f->private_data = (void *)1UL;
-	} else {
-		f->private_data = (void *)0UL;
-	}
-	mutex_unlock(&stui_mode_mutex);
-	return ret;
-}
-
-static const struct file_operations tui_fops = {
-	.owner = THIS_MODULE,
-	.open = stui_open,
-	.release = stui_release,
-	.unlocked_ioctl = stui_handler_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl = stui_handler_ioctl,
-#endif /* CONFIG_COMPAT */
-};
-
-static int stui_handler_init(void)
-{
-	int err = 0;
-	dev_t devno;
-
-	pr_debug("[STUI] stui_handler_init\n");
-	err = alloc_chrdev_region(&devno, 0, 1, STUI_DEV_NAME);
-	if (err) {
-		pr_err("[STUI] Unable to allocate TUI device number(%d)\n", err);
-		return err;
-	}
-	tui_class = class_create(THIS_MODULE, STUI_DEV_NAME);
-	if (IS_ERR(tui_class)) {
-		pr_err("[STUI] Failed to create TUI class\n");
-		err = PTR_ERR(tui_class);
-		goto err_class_create;
-	}
-	cdev_init(&stui_cdev, &tui_fops);
-	err = cdev_add(&stui_cdev, devno, 1);
-	if (err) {
-		pr_err("[STUI] Unable to add TUI char device(%d)\n", err);
-		goto err_cdev_add;
-	}
-	wake_lock_init(&tui_wakelock, WAKE_LOCK_SUSPEND, "TUI_WAKELOCK");
-	stui_device = device_create(tui_class, NULL, devno, NULL, STUI_DEV_NAME);
-	if (!IS_ERR(stui_device))
-		return 0;
-
-	err = PTR_ERR(stui_device);
-	wake_lock_destroy(&tui_wakelock);
-
-err_cdev_add:
-	class_destroy(tui_class);
-
-err_class_create:
-	unregister_chrdev_region(devno, 1);
-	return err;
-}
-
-static void stui_handler_exit(void)
-{
-	pr_debug("[STUI] stui_handler_exit\n");
-	wake_lock_destroy(&tui_wakelock);
-	unregister_chrdev_region(stui_cdev.dev, 1);
-	cdev_del(&stui_cdev);
-	device_destroy(tui_class, stui_cdev.dev);
-	class_destroy(tui_class);
-}
-
-module_init(stui_handler_init);
-module_exit(stui_handler_exit);
+G_MUX_BLK2_MASK 0x3f00
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK2__SHIFT 0x8
+#define BIF_DEBUG_OUT__DEBUG_OUTPUT_MASK 0x1ffff
+#define BIF_DEBUG_OUT__DEBUG_OUTPUT__SHIFT 0x0
+#define HDP_REG_COHERENCY_FLUSH_CNTL__HDP_REG_FLUSH_ADDR_MASK 0x1
+#define HDP_REG_COHERENCY_FLUSH_CNTL__HDP_REG_FLUSH_ADDR__SHIFT 0x0
+#define HDP_MEM_COHERENCY_FLUSH_CNTL__HDP_MEM_FLUSH_ADDR_MASK 0x1
+#define HDP_MEM_COHERENCY_FLUSH_CNTL__HDP_MEM_FLUSH_ADDR__SHIFT 0x0
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_A_MASK 0x1
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_A__SHIFT 0x0
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SEL_MASK 0x2
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SEL__SHIFT 0x1
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_MODE_MASK 0x4
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_MODE__SHIFT 0x2
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SPARE_MASK 0x18
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SPARE__SHIFT 0x3
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN0_MASK 0x20
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN0__SHIFT 0x5
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN1_MASK 0x40
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN1__SHIFT 0x6
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN2_MASK 0x80
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN2__SHIFT 0x7
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN3_MASK 0x100
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN3__SHIFT 0x8
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SLEWN_MASK 0x200
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SLEWN__SHIFT 0x9
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_WAKE_MASK 0x400
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_WAKE__SHIFT 0xa
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SCHMEN_MASK 0x800
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SCHMEN__SHIFT 0xb
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_CNTL_EN_MASK 0x1000
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_CNTL_EN__SHIFT 0xc
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_Y_MASK 0x2000
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_Y__SHIFT 0xd
+#define CLKREQB_PAD_CNTL__CLKREQB_PERF_COUNTER_UPPER_MASK 0xff000000
+#define CLKREQB_PAD_CNTL__CLKREQB_PERF_COUNTER_UPPER__SHIFT 0x18
+#define CLKREQB_PERF_COUNTER__CLKREQB_PERF_COUNTER_LOWER_MASK 0xffffffff
+#define CLKREQB_PERF_COUNTER__CLKREQB_PERF_COUNTER_LOWER__SHIFT 0x0
+#define BIF_XDMA_LO__BIF_XDMA_LOWER_BOUND_MASK 0x1fffffff
+#define BIF_XDMA_LO__BIF_XDMA_LOWER_BOUND__SHIFT 0x0
+#define BIF_XDMA_LO__BIF_XDMA_APER_EN_MASK 0x80000000
+#define BIF_XDMA_LO__BIF_XDMA_APER_EN__SHIFT 0x1f
+#define BIF_XDMA_HI__BIF_XDMA_UPPER_BOUND_MASK 0x1fffffff
+#define BIF_XDMA_HI__BIF_XDMA_UPPER_BOUND__SHIFT 0x0
+#define BIF_FEATURES_CONTROL_MISC__MST_BIF_REQ_EP_DIS_MASK 0x1
+#define BIF_FEATURES_CONTROL_MISC__MST_BIF_REQ_EP_DIS__SHIFT 0x0
+#define BIF_FEATURES_CONTROL_MISC__SLV_BIF_CPL_EP_DIS_MASK 0x2
+#define BIF_FEATURES_CONTROL_MISC__SLV_BIF_CPL_EP_DIS__SHIFT 0x1
+#define BIF_FEATURES_CONTROL_MISC__BIF_SLV_REQ_EP_DIS_MASK 0x4
+#define BIF_FEATURES_CONTROL_MISC__BIF_SLV_REQ_EP_DIS__SHIFT 0x2
+#define BIF_FEATURES_CONTROL_MISC__BIF_MST_CPL_EP_DIS_MASK 0x8
+#define BIF_FEATURES_CONTROL_MISC__BIF_MST_CPL_EP_DIS__SHIFT 0x3
+#define BIF_FEATURES_CONTROL_MISC__UR_PSN_PKT_REPORT_POISON_DIS_MASK 0x10
+#define BIF_FEATURES_CONTROL_MISC__UR_PSN_PKT_REPORT_POISON_DIS__SHIFT 0x4
+#define BIF_FEATURES_CONTROL_MISC__POST_PSN_ONLY_PKT_REPORT_UR_ALL_DIS_MASK 0x20
+#define BIF_FEATURES_CONTROL_MISC__POST_PSN_ONLY_PKT_REPORT_UR_ALL_DIS__SHIFT 0x5
+#define BIF_FEATURES_CONTROL_MISC__POST_PSN_ONLY_PKT_REPORT_UR_PART_DIS_MASK 0x40
+#define BIF_FEATURES_CONTROL_MISC__POST_PSN_ONLY_PKT_REPORT_UR_PART_DIS__SHIFT 0x6
+#define BIF_FEATURES_CONTROL_MISC__PLL_SWITCH_IMPCTL_CAL_DONE_DIS_MASK 0x80
+#define BIF_FEATURES_CONTROL_MISC__PLL_SWITCH_IMPCTL_CAL_DONE_DIS__SHIFT 0x7
+#define BIF_FEATURES_CONTROL_MISC__IGNORE_BE_CHECK_GASKET_COMB_DIS_MASK 0x100
+#define BIF_FEATURES_CONTROL_MISC__IGNORE_BE_CHECK_GASKET_COMB_DIS__SHIFT 0x8
+#define BIF_FEATURES_CONTROL_MISC__MC_BIF_REQ_ID_ROUTING_DIS_MASK 0x200
+#define BIF_FEATURES_CONTROL_MISC__MC_BIF_REQ_ID_ROUTING_DIS__SHIFT 0x9
+#define BIF_FEATURES_CONTROL_MISC__AZ_BIF_REQ_ID_ROUTING_DI

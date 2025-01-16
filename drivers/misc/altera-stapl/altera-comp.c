@@ -1,142 +1,132 @@
-/*
- * altera-comp.c
- *
- * altera FPGA driver
- *
- * Copyright (C) Altera Corporation 1998-2001
- * Copyright (C) 2010 NetUP Inc.
- * Copyright (C) 2010 Igor M. Liplianin <liplianin@netup.ru>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
+ta conrruption occasionally due to a firmware bug.
+	 */
+	MMC_FIXUP("V10008", CID_MANFID_KINGSTON, CID_OEMID_ANY, add_quirk_mmc,
+		  MMC_QUIRK_TRIM_BROKEN),
+	MMC_FIXUP("V10016", CID_MANFID_KINGSTON, CID_OEMID_ANY, add_quirk_mmc,
+		  MMC_QUIRK_TRIM_BROKEN),
 
-#include <linux/kernel.h>
-#include "altera-exprt.h"
+	END_FIXUP
+};
 
-#define	SHORT_BITS		16
-#define	CHAR_BITS		8
-#define	DATA_BLOB_LENGTH	3
-#define	MATCH_DATA_LENGTH	8192
-#define ALTERA_REQUEST_SIZE	1024
-#define ALTERA_BUFFER_SIZE	(MATCH_DATA_LENGTH + ALTERA_REQUEST_SIZE)
-
-static u32 altera_bits_req(u32 n)
+static int mmc_blk_probe(struct mmc_card *card)
 {
-	u32 result = SHORT_BITS;
+	struct mmc_blk_data *md, *part_md;
+	char cap_str[10];
 
-	if (n == 0)
-		result = 1;
-	else {
-		/* Look for the highest non-zero bit position */
-		while ((n & (1 << (SHORT_BITS - 1))) == 0) {
-			n <<= 1;
-			--result;
-		}
+	/*
+	 * Check that the card supports the command class(es) we need.
+	 */
+	if (!(card->csd.cmdclass & CCC_BLOCK_READ))
+		return -ENODEV;
+
+	mmc_fixup_device(card, blk_fixups);
+
+	md = mmc_blk_alloc(card);
+	if (IS_ERR(md))
+		return PTR_ERR(md);
+
+	string_get_size((u64)get_capacity(md->disk), 512, STRING_UNITS_2,
+			cap_str, sizeof(cap_str));
+	pr_info("%s: %s %s %s %s\n",
+		md->disk->disk_name, mmc_card_id(card), mmc_card_name(card),
+		cap_str, md->read_only ? "(ro)" : "");
+	ST_LOG("%s: %s %s %s %s\n",
+		md->disk->disk_name, mmc_card_id(card), mmc_card_name(card),
+		cap_str, md->read_only ? "(ro)" : "");
+
+	if (mmc_blk_alloc_parts(card, md))
+		goto out;
+
+	dev_set_drvdata(&card->dev, md);
+
+#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
+	if (card && mmc_card_sd(card))
+		mmc_set_bus_resume_policy(card->host, 1);
+#endif
+
+	if (mmc_add_disk(md))
+		goto out;
+
+	list_for_each_entry(part_md, &md->part, part) {
+		if (mmc_add_disk(part_md))
+			goto out;
 	}
 
-	return result;
-}
+	pm_runtime_set_autosuspend_delay(&card->dev, 3000);
+	pm_runtime_use_autosuspend(&card->dev);
 
-static u32 altera_read_packed(u8 *buffer, u32 bits, u32 *bits_avail,
-							u32 *in_index)
-{
-	u32 result = 0;
-	u32 shift = 0;
-	u32 databyte = 0;
-
-	while (bits > 0) {
-		databyte = buffer[*in_index];
-		result |= (((databyte >> (CHAR_BITS - *bits_avail))
-			& (0xff >> (CHAR_BITS - *bits_avail))) << shift);
-
-		if (bits <= *bits_avail) {
-			result &= (0xffff >> (SHORT_BITS - (bits + shift)));
-			*bits_avail -= bits;
-			bits = 0;
-		} else {
-			++(*in_index);
-			shift += *bits_avail;
-			bits -= *bits_avail;
-			*bits_avail = CHAR_BITS;
-		}
+	/*
+	 * Don't enable runtime PM for SD-combo cards here. Leave that
+	 * decision to be taken during the SDIO init sequence instead.
+	 */
+	if (card->type != MMC_TYPE_SD_COMBO) {
+		pm_runtime_set_active(&card->dev);
+		pm_runtime_enable(&card->dev);
 	}
 
-	return result;
-}
+	if (card)
+		mmc_card_debug_log_sysfs_init(card);
 
-u32 altera_shrink(u8 *in, u32 in_length, u8 *out, u32 out_length, s32 version)
-{
-	u32 i, j, data_length = 0L;
-	u32 offset, length;
-	u32 match_data_length = MATCH_DATA_LENGTH;
-	u32 bits_avail = CHAR_BITS;
-	u32 in_index = 0L;
+#if defined(CONFIG_MMC_CQ_HCI) && defined(CONFIG_MMC_DATA_LOG)
+	if (mmc_card_mmc(card)) {
+		struct hd_struct *part;
+		int i;
+		md->mmc_system_start = 0;
+		md->mmc_system_end = 0;
+		md->mmc_sys_log_en = false;
 
-	if (version > 0)
-		--match_data_length;
-
-	for (i = 0; i < out_length; ++i)
-		out[i] = 0;
-
-	/* Read number of bytes in data. */
-	for (i = 0; i < sizeof(in_length); ++i) {
-		data_length = data_length | (
-			altera_read_packed(in,
-					CHAR_BITS,
-					&bits_avail,
-					&in_index) << (i * CHAR_BITS));
-	}
-
-	if (data_length > out_length) {
-		data_length = 0L;
-		return data_length;
-	}
-
-	i = 0;
-	while (i < data_length) {
-		/* A 0 bit indicates literal data. */
-		if (altera_read_packed(in, 1, &bits_avail,
-						&in_index) == 0) {
-			for (j = 0; j < DATA_BLOB_LENGTH; ++j) {
-				if (i < data_length) {
-					out[i] = (u8)altera_read_packed(in,
-							CHAR_BITS,
-							&bits_avail,
-							&in_index);
-					i++;
-				}
-			}
-		} else {
-			/* A 1 bit indicates offset/length to follow. */
-			offset = altera_read_packed(in, altera_bits_req((s16)
-					(i > match_data_length ?
-						match_data_length : i)),
-					&bits_avail,
-					&in_index);
-			length = altera_read_packed(in, CHAR_BITS,
-					&bits_avail,
-					&in_index);
-			for (j = 0; j < length; ++j) {
-				if (i < data_length) {
-					out[i] = out[i - offset];
-					i++;
-				}
+		for (i = 1; i < 30 ; i++) {
+			if (!md->disk->part_tbl)
+				break;
+			part = md->disk->part_tbl->part[i];
+			if (!part)
+				break;
+			if (!strncmp(part->info->volname, "SYSTEM", 6) ||
+					!strncmp(part->info->volname, "system", 6) ||
+					!strncmp(part->info->volname, "SUPER", 5) ||
+					!strncmp(part->info->volname, "super", 5)) {
+				md->mmc_system_start = part->start_sect;
+				md->mmc_system_end = part->start_sect + part->nr_sects;
+				md->mmc_sys_log_en = true;
+				printk("MMC data logging enabled\n");
+				printk("MMC %s partition, from : %lu, to %lu\n",
+					part->info->volname, md->mmc_system_start, md->mmc_system_end);
+				break;
 			}
 		}
 	}
+#endif
+	return 0;
 
-	return data_length;
+ out:
+	mmc_blk_remove_parts(card, md);
+	mmc_blk_remove_req(md);
+	return 0;
 }
+
+static void mmc_blk_remove(struct mmc_card *card)
+{
+	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
+
+	mmc_blk_remove_parts(card, md);
+	pm_runtime_get_sync(&card->dev);
+	mmc_claim_host(card->host);
+	mmc_blk_part_switch(card, md);
+	mmc_release_host(card->host);
+	if (card->type != MMC_TYPE_SD_COMBO)
+		pm_runtime_disable(&card->dev);
+	pm_runtime_put_noidle(&card->dev);
+	mmc_blk_remove_req(md);
+	dev_set_drvdata(&card->dev, NULL);
+}
+
+static void mmc_blk_shutdown(struct mmc_card *card)
+{
+	struct mmc_blk_data *part_md;
+	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
+	int rc;
+
+	if (md) {
+		rc = mmc_queue_suspend(&md->queue, 1);
+		if (rc)
+			got

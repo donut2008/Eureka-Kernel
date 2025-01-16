@@ -1,26 +1,17 @@
-/* Unusual Devices File for the Rio Karma
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if defined(CONFIG_USB_STORAGE_KARMA) || \
-		defined(CONFIG_USB_STORAGE_KARMA_MODULE)
-
-UNUSUAL_DEV(  0x045a, 0x5210, 0x0101, 0x0101,
-		"Rio",
-		"Rio Karma",
-		USB_SC_SCSI, USB_PR_KARMA, rio_karma_init, 0),
-
-#endif /* defined(CONFIG_USB_STORAGE_KARMA) || ... */
+C_COMP_TO_DETECT_MASK 0x10
+#define PCIE_LC_CNTL3__LC_COMP_TO_DETECT__SHIFT 0x4
+#define PCIE_LC_CNTL3__LC_RESET_TSX_CNT_IN_RLOCK_EN_MASK 0x20
+#define PCIE_LC_CNTL3__LC_RESET_TSX_CNT_IN_RLOCK_EN__SHIFT 0x5
+#define PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK 0xc0
+#define PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPTS_ALLOWED__SHIFT 0x6
+#define PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPT_FAILED_MASK 0x100
+#define PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPT_FAILED__SHIFT 0x8
+#define PCIE_LC_CNTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT_MASK 0x200
+#define PCIE_LC_CNTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT__SHIFT 0x9
+#define PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN_MASK 0x400
+#define PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN__SHIFT 0xa
+#define PCIE_LC_CNTL3__LC_RCVR_DET_EN_OVERRIDE_MASK 0x800
+#define PCIE_LC_CNTL3__LC_RCVR_DET_EN_OVERRIDE__SHIFT 0xb
+#define PCIE_LC_CNTL3__LC_EHP_RX_PHY_CMD_MASK 0x3000
+#define PCIE_LC_CNTL3__LC_EHP_RX_PHY_CMD__SHIFT 0xc
+#define PCIE_LC_CNTL3__LC_EHP_TX_

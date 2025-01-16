@@ -1,4 +1,3 @@
-
-obj-$(CONFIG_INPUT_WACOM)	+= wacom_i2c.o wacom_i2c_sec.o
-obj-$(CONFIG_EPEN_WACOM_W9018)	+= w9018_flash.o
-obj-$(CONFIG_EPEN_WACOM_W9019)	+= w9019_flash.o
+/* This file is part of the Emulex RoCE Device Driver for
+ * RoCE (RDMA over Converged Ethernet) adapters.
+ * Copyright (C) 2012-2015 Emulex. All rights r

@@ -1,1576 +1,707 @@
-/* Transport & Protocol Driver for In-System Design, Inc. ISD200 ASIC
+                      0x1210505
+#define ixPSX81_PHY0_RX_ELECIDLE_DEBUG_LANE6                                    0x1210605
+#define ixPSX81_PHY0_RX_ELECIDLE_DEBUG_LANE7                                    0x1210705
+#define ixPSX81_PHY0_RX_ADAPTCTL_BROADCAST                                      0x121fe0a
+#define ixPSX81_PHY0_RX_ADAPTCTL_LANE0                                          0x121000a
+#define ixPSX81_PHY0_RX_ADAPTCTL_LANE1                                          0x121010a
+#define ixPSX81_PHY0_RX_ADAPTCTL_LANE2                                          0x121020a
+#define ixPSX81_PHY0_RX_ADAPTCTL_LANE3                                          0x121030a
+#define ixPSX81_PHY0_RX_ADAPTCTL_LANE4                                          0x121040a
+#define ixPSX81_PHY0_RX_ADAPTCTL_LANE5                                          0x121050a
+#define ixPSX81_PHY0_RX_ADAPTCTL_LANE6                                          0x121060a
+#define ixPSX81_PHY0_RX_ADAPTCTL_LANE7                                          0x121070a
+#define ixPSX81_PHY0_RX_FOMCALCCTL_BROADCAST                                    0x121fe0b
+#define ixPSX81_PHY0_RX_FOMCALCCTL_LANE0                                        0x121000b
+#define ixPSX81_PHY0_RX_FOMCALCCTL_LANE1                                        0x121010b
+#define ixPSX81_PHY0_RX_FOMCALCCTL_LANE2                                        0x121020b
+#define ixPSX81_PHY0_RX_FOMCALCCTL_LANE3                                        0x121030b
+#define ixPSX81_PHY0_RX_FOMCALCCTL_LANE4                                        0x121040b
+#define ixPSX81_PHY0_RX_FOMCALCCTL_LANE5                                        0x121050b
+#define ixPSX81_PHY0_RX_FOMCALCCTL_LANE6                                        0x121060b
+#define ixPSX81_PHY0_RX_FOMCALCCTL_LANE7                                        0x121070b
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_BROADCAST                              0x121fe0c
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_LANE0                                  0x121000c
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_LANE1                                  0x121010c
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_LANE2                                  0x121020c
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_LANE3                                  0x121030c
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_LANE4                                  0x121040c
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_LANE5                                  0x121050c
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_LANE6                                  0x121060c
+#define ixPSX81_PHY0_RX_ADAPT_CFG_BYP_EN_LANE7                                  0x121070c
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_BROADCAST                                    0x121fe0d
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_LANE0                                        0x121000d
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_LANE1                                        0x121010d
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_LANE2                                        0x121020d
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_LANE3                                        0x121030d
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_LANE4                                        0x121040d
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_LANE5                                        0x121050d
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_LANE6                                        0x121060d
+#define ixPSX81_PHY0_RX_DBG_BYP_EN_LANE7                                        0x121070d
+#define ixPSX81_PHY0_RX_ADAPTDBG1_BROADCAST                                     0x121fe0e
+#define ixPSX81_PHY0_RX_ADAPTDBG1_LANE0                                         0x121000e
+#define ixPSX81_PHY0_RX_ADAPTDBG1_LANE1                                         0x121010e
+#define ixPSX81_PHY0_RX_ADAPTDBG1_LANE2                                         0x121020e
+#define ixPSX81_PHY0_RX_ADAPTDBG1_LANE3                                         0x121030e
+#define ixPSX81_PHY0_RX_ADAPTDBG1_LANE4                                         0x121040e
+#define ixPSX81_PHY0_RX_ADAPTDBG1_LANE5                                         0x121050e
+#define ixPSX81_PHY0_RX_ADAPTDBG1_LANE6                                         0x121060e
+#define ixPSX81_PHY0_RX_ADAPTDBG1_LANE7                                         0x121070e
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_BROADCAST                            0x121ff00
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_LANE0                                0x1212000
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_LANE1                                0x1212100
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_LANE2                                0x1212200
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_LANE3                                0x1212300
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_LANE4                                0x1212400
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_LANE5                                0x1212500
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_LANE6                                0x1212600
+#define ixPSX81_PHY0_TX_CMD_BUS_TX_CONTROL_LANE7                                0x1212700
+#define ixPSX81_PHY0_TX_DFX_BROADCAST                                           0x121ff01
+#define ixPSX81_PHY0_TX_DFX_LANE0                                               0x1212001
+#define ixPSX81_PHY0_TX_DFX_LANE1                                               0x1212101
+#define ixPSX81_PHY0_TX_DFX_LANE2                                               0x1212201
+#define ixPSX81_PHY0_TX_DFX_LANE3                                               0x1212301
+#define ixPSX81_PHY0_TX_DFX_LANE4                                               0x1212401
+#define ixPSX81_PHY0_TX_DFX_LANE5                                               0x1212501
+#define ixPSX81_PHY0_TX_DFX_LANE6                                               0x1212601
+#define ixPSX81_PHY0_TX_DFX_LANE7                                               0x1212701
+#define ixPSX81_PHY0_TX_DEEMPH_BROADCAST                                        0x121ff02
+#define ixPSX81_PHY0_TX_DEEMPH_LANE0                                            0x1212002
+#define ixPSX81_PHY0_TX_DEEMPH_LANE1                                            0x1212102
+#define ixPSX81_PHY0_TX_DEEMPH_LANE2                                            0x1212202
+#define ixPSX81_PHY0_TX_DEEMPH_LANE3                                            0x1212302
+#define ixPSX81_PHY0_TX_DEEMPH_LANE4                                            0x1212402
+#define ixPSX81_PHY0_TX_DEEMPH_LANE5                                            0x1212502
+#define ixPSX81_PHY0_TX_DEEMPH_LANE6                                            0x1212602
+#define ixPSX81_PHY0_TX_DEEMPH_LANE7                                            0x1212702
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_BROADCAST                                 0x121ff03
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_LANE0                                     0x1212003
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_LANE1                                     0x1212103
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_LANE2                                     0x1212203
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_LANE3                                     0x1212303
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_LANE4                                     0x1212403
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_LANE5                                     0x1212503
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_LANE6                                     0x1212603
+#define ixPSX81_PHY0_TX_TSTMARGDEEMPH_LANE7                                     0x1212703
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_BROADCAST                              0x121ff04
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_LANE0                                  0x1212004
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_LANE1                                  0x1212104
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_LANE2                                  0x1212204
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_LANE3                                  0x1212304
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_LANE4                                  0x1212404
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_LANE5                                  0x1212504
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_LANE6                                  0x1212604
+#define ixPSX81_PHY0_TX_MARGDEEMPHSTATUS_LANE7                                  0x1212704
+#define ixPSX81_PHY0_TX_TXCNTRL_BROADCAST                                       0x121ff06
+#define ixPSX81_PHY0_TX_TXCNTRL_LANE0                                           0x1212006
+#define ixPSX81_PHY0_TX_TXCNTRL_LANE1                                           0x1212106
+#define ixPSX81_PHY0_TX_TXCNTRL_LANE2                                           0x1212206
+#define ixPSX81_PHY0_TX_TXCNTRL_LANE3                                           0x1212306
+#define ixPSX81_PHY0_TX_TXCNTRL_LANE4                                           0x1212406
+#define ixPSX81_PHY0_TX_TXCNTRL_LANE5                                           0x1212506
+#define ixPSX81_PHY0_TX_TXCNTRL_LANE6                                           0x1212606
+#define ixPSX81_PHY0_TX_TXCNTRL_LANE7                                           0x1212706
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_BROADCAST                         0x121ff07
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_LANE0                             0x1212007
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_LANE1                             0x1212107
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_LANE2                             0x1212207
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_LANE3                             0x1212307
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_LANE4                             0x1212407
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_LANE5                             0x1212507
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_LANE6                             0x1212607
+#define ixPSX81_PHY0_TX_CMD_BUS_GLOBAL_FOR_TX_LANE7                             0x1212707
+#define ixPSX81_PHY0_HTPLL_ROPLL_PowerDownEn                                    0x1214180
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllControlExt                               0x1214101
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllControl                                  0x1214102
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllTestDebug1                               0x1214103
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllTestDebug2                               0x1214104
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllFreqMode                                 0x1214105
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllUpdateCtrl                               0x1214108
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllTestDebug3                               0x1214109
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciFuseProcess                                 0x121410a
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllTestDebug4                               0x121410b
+#define ixPSX81_PHY0_HTPLL_ROPLL_PciPllTestDebug5                               0x121410c
+#define ixPSX81_PHY0_LCPLL_LCPLL_PowerDownEn                                    0x1214080
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllControlExt                               0x1214001
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllControl                                  0x1214002
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllTestDebug1                               0x1214003
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllTestDebug2                               0x1214004
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllFreqMode                                 0x1214005
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciLcVcoCtrl                                   0x1214007
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllUpdateCtrl                               0x1214008
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllTestDebug3                               0x1214009
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllTestDebug4                               0x121400b
+#define ixPSX81_PHY0_LCPLL_LCPLL_PciPllTestDebug5                               0x121400c
+#define ixPSX80_PIF0_SCRATCH                                                    0x1100001
+#define ixPSX80_PIF0_HW_DEBUG                                                   0x1100002
+#define ixPSX80_PIF0_STRAP_0                                                    0x1100003
+#define ixPSX80_PIF0_CTRL                                                       0x1100004
+#define ixPSX80_PIF0_TX_CTRL                                                    0x1100008
+#define ixPSX80_PIF0_TX_CTRL2                                                   0x1100009
+#define ixPSX80_PIF0_RX_CTRL                                                    0x110000a
+#define ixPSX80_PIF0_RX_CTRL2                                                   0x110000b
+#define ixPSX80_PIF0_GLB_OVRD                                                   0x110000c
+#define ixPSX80_PIF0_GLB_OVRD2                                                  0x110000d
+#define ixPSX80_PIF0_BIF_CMD_STATUS                                             0x1100010
+#define ixPSX80_PIF0_CMD_BUS_CTRL                                               0x1100011
+#define ixPSX80_PIF0_CMD_BUS_GLB_OVRD                                           0x1100013
+#define ixPSX80_PIF0_LANE0_OVRD                                                 0x1100014
+#define ixPSX80_PIF0_LANE0_OVRD2                                                0x1100015
+#define ixPSX80_PIF0_LANE1_OVRD                                                 0x1100016
+#define ixPSX80_PIF0_LANE1_OVRD2                                                0x1100017
+#define ixPSX80_PIF0_LANE2_OVRD                                                 0x1100018
+#define ixPSX80_PIF0_LANE2_OVRD2                                                0x1100019
+#define ixPSX80_PIF0_LANE3_OVRD                                                 0x110001a
+#define ixPSX80_PIF0_LANE3_OVRD2                                                0x110001b
+#define ixPSX80_PIF0_LANE4_OVRD                                                 0x110001c
+#define ixPSX80_PIF0_LANE4_OVRD2                                                0x110001d
+#define ixPSX80_PIF0_LANE5_OVRD                                                 0x110001e
+#define ixPSX80_PIF0_LANE5_OVRD2                                                0x110001f
+#define ixPSX80_PIF0_LANE6_OVRD                                                 0x1100020
+#define ixPSX80_PIF0_LANE6_OVRD2                                                0x1100021
+#define ixPSX80_PIF0_LANE7_OVRD                                                 0x1100022
+#define ixPSX80_PIF0_LANE7_OVRD2                                                0x1100023
+#define ixPSX81_PIF0_SCRATCH                                                    0x1110001
+#define ixPSX81_PIF0_HW_DEBUG                                                   0x1110002
+#define ixPSX81_PIF0_STRAP_0                                                    0x1110003
+#define ixPSX81_PIF0_CTRL                                                       0x1110004
+#define ixPSX81_PIF0_TX_CTRL                                                    0x1110008
+#define ixPSX81_PIF0_TX_CTRL2                                                   0x1110009
+#define ixPSX81_PIF0_RX_CTRL                                                    0x111000a
+#define ixPSX81_PIF0_RX_CTRL2                                                   0x111000b
+#define ixPSX81_PIF0_GLB_OVRD                                                   0x111000c
+#define ixPSX81_PIF0_GLB_OVRD2                                                  0x111000d
+#define ixPSX81_PIF0_BIF_CMD_STATUS                                             0x1110010
+#define ixPSX81_PIF0_CMD_BUS_CTRL                                               0x1110011
+#define ixPSX81_PIF0_CMD_BUS_GLB_OVRD                                           0x1110013
+#define ixPSX81_PIF0_LANE0_OVRD                                                 0x1110014
+#define ixPSX81_PIF0_LANE0_OVRD2                                                0x1110015
+#define ixPSX81_PIF0_LANE1_OVRD                                                 0x1110016
+#define ixPSX81_PIF0_LANE1_OVRD2                                                0x1110017
+#define ixPSX81_PIF0_LANE2_OVRD                                                 0x1110018
+#define ixPSX81_PIF0_LANE2_OVRD2                                                0x1110019
+#define ixPSX81_PIF0_LANE3_OVRD                                                 0x111001a
+#define ixPSX81_PIF0_LANE3_OVRD2                                                0x111001b
+#define ixPSX81_PIF0_LANE4_OVRD                                                 0x111001c
+#define ixPSX81_PIF0_LANE4_OVRD2                                                0x111001d
+#define ixPSX81_PIF0_LANE5_OVRD                                                 0x111001e
+#define ixPSX81_PIF0_LANE5_OVRD2                                                0x111001f
+#define ixPSX81_PIF0_LANE6_OVRD                                                 0x1110020
+#define ixPSX81_PIF0_LANE6_OVRD2                                                0x1110021
+#define ixPSX81_PIF0_LANE7_OVRD                                                 0x1110022
+#define ixPSX81_PIF0_LANE7_OVRD2                                                0x1110023
+
+#endif /* BIF_5_1_D_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*
+ * BIF_5_1 Register documentation
  *
- * Current development and maintenance:
- *   (C) 2001-2002 Björn Stenberg (bjorn@haxx.se)
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
  *
- * Developed with the assistance of:
- *   (C) 2002 Alan Stern <stern@rowland.org>
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * Initial work:
- *   (C) 2000 In-System Design, Inc. (support@in-system.com)
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
  *
- * The ISD200 ASIC does not natively support ATA devices.  The chip
- * does implement an interface, the ATA Command Block (ATACB) which provides
- * a means of passing ATA commands and ATA register accesses to a device.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- *
- * History:
- *
- *  2002-10-19: Removed the specialized transfer routines.
- *		(Alan Stern <stern@rowland.harvard.edu>)
- *  2001-02-24: Removed lots of duplicate code and simplified the structure.
- *	      (bjorn@haxx.se)
- *  2002-01-16: Fixed endianness bug so it works on the ppc arch.
- *	      (Luc Saillard <luc@saillard.org>)
- *  2002-01-17: All bitfields removed.
- *	      (bjorn@haxx.se)
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-
-/* Include files */
-
-#include <linux/jiffies.h>
-#include <linux/errno.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/ata.h>
-#include <linux/hdreg.h>
-#include <linux/scatterlist.h>
-
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-#include <scsi/scsi_device.h>
-
-#include "usb.h"
-#include "transport.h"
-#include "protocol.h"
-#include "debug.h"
-#include "scsiglue.h"
-
-#define DRV_NAME "ums-isd200"
-
-MODULE_DESCRIPTION("Driver for In-System Design, Inc. ISD200 ASIC");
-MODULE_AUTHOR("Björn Stenberg <bjorn@haxx.se>");
-MODULE_LICENSE("GPL");
-
-static int isd200_Initialization(struct us_data *us);
-
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-static struct usb_device_id isd200_usb_ids[] = {
-#	include "unusual_isd200.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, isd200_usb_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev isd200_unusual_dev_list[] = {
-#	include "unusual_isd200.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-/* Timeout defines (in Seconds) */
-
-#define ISD200_ENUM_BSY_TIMEOUT		35
-#define ISD200_ENUM_DETECT_TIMEOUT      30
-#define ISD200_DEFAULT_TIMEOUT		30
-
-/* device flags */
-#define DF_ATA_DEVICE		0x0001
-#define DF_MEDIA_STATUS_ENABLED	0x0002
-#define DF_REMOVABLE_MEDIA	0x0004
-
-/* capability bit definitions */
-#define CAPABILITY_DMA		0x01
-#define CAPABILITY_LBA		0x02
-
-/* command_setX bit definitions */
-#define COMMANDSET_REMOVABLE	0x02
-#define COMMANDSET_MEDIA_STATUS 0x10
-
-/* ATA Vendor Specific defines */
-#define ATA_ADDRESS_DEVHEAD_STD      0xa0
-#define ATA_ADDRESS_DEVHEAD_LBA_MODE 0x40    
-#define ATA_ADDRESS_DEVHEAD_SLAVE    0x10
-
-/* Action Select bits */
-#define ACTION_SELECT_0	     0x01
-#define ACTION_SELECT_1	     0x02
-#define ACTION_SELECT_2	     0x04
-#define ACTION_SELECT_3	     0x08
-#define ACTION_SELECT_4	     0x10
-#define ACTION_SELECT_5	     0x20
-#define ACTION_SELECT_6	     0x40
-#define ACTION_SELECT_7	     0x80
-
-/* Register Select bits */
-#define REG_ALTERNATE_STATUS	0x01
-#define REG_DEVICE_CONTROL	0x01
-#define REG_ERROR		0x02
-#define REG_FEATURES		0x02
-#define REG_SECTOR_COUNT	0x04
-#define REG_SECTOR_NUMBER	0x08
-#define REG_CYLINDER_LOW	0x10
-#define REG_CYLINDER_HIGH	0x20
-#define REG_DEVICE_HEAD		0x40
-#define REG_STATUS		0x80
-#define REG_COMMAND		0x80
-
-/* ATA registers offset definitions */
-#define ATA_REG_ERROR_OFFSET		1
-#define ATA_REG_LCYL_OFFSET		4
-#define ATA_REG_HCYL_OFFSET		5
-#define ATA_REG_STATUS_OFFSET		7
-
-/* ATA error definitions not in <linux/hdreg.h> */
-#define ATA_ERROR_MEDIA_CHANGE		0x20
-
-/* ATA command definitions not in <linux/hdreg.h> */
-#define ATA_COMMAND_GET_MEDIA_STATUS	0xDA
-#define ATA_COMMAND_MEDIA_EJECT		0xED
-
-/* ATA drive control definitions */
-#define ATA_DC_DISABLE_INTERRUPTS	0x02
-#define ATA_DC_RESET_CONTROLLER		0x04
-#define ATA_DC_REENABLE_CONTROLLER	0x00
-
-/*
- *  General purpose return codes
- */ 
-
-#define ISD200_ERROR		-1
-#define ISD200_GOOD		 0
-
-/*
- * Transport return codes
- */
-
-#define ISD200_TRANSPORT_GOOD       0   /* Transport good, command good     */
-#define ISD200_TRANSPORT_FAILED     1   /* Transport good, command failed   */
-#define ISD200_TRANSPORT_ERROR      2   /* Transport bad (i.e. device dead) */
-
-/* driver action codes */
-#define	ACTION_READ_STATUS	0
-#define	ACTION_RESET		1
-#define	ACTION_REENABLE		2
-#define	ACTION_SOFT_RESET	3
-#define	ACTION_ENUM		4
-#define	ACTION_IDENTIFY		5
-
-
-/*
- * ata_cdb struct
- */
-
-
-union ata_cdb {
-	struct {
-		unsigned char SignatureByte0;
-		unsigned char SignatureByte1;
-		unsigned char ActionSelect;
-		unsigned char RegisterSelect;
-		unsigned char TransferBlockSize;
-		unsigned char WriteData3F6;
-		unsigned char WriteData1F1;
-		unsigned char WriteData1F2;
-		unsigned char WriteData1F3;
-		unsigned char WriteData1F4;
-		unsigned char WriteData1F5;
-		unsigned char WriteData1F6;
-		unsigned char WriteData1F7;
-		unsigned char Reserved[3];
-	} generic;
-
-	struct {
-		unsigned char SignatureByte0;
-		unsigned char SignatureByte1;
-		unsigned char ActionSelect;
-		unsigned char RegisterSelect;
-		unsigned char TransferBlockSize;
-		unsigned char AlternateStatusByte;
-		unsigned char ErrorByte;
-		unsigned char SectorCountByte;
-		unsigned char SectorNumberByte;
-		unsigned char CylinderLowByte;
-		unsigned char CylinderHighByte;
-		unsigned char DeviceHeadByte;
-		unsigned char StatusByte;
-		unsigned char Reserved[3];
-	} read;
-
-	struct {
-		unsigned char SignatureByte0;
-		unsigned char SignatureByte1;
-		unsigned char ActionSelect;
-		unsigned char RegisterSelect;
-		unsigned char TransferBlockSize;
-		unsigned char DeviceControlByte;
-		unsigned char FeaturesByte;
-		unsigned char SectorCountByte;
-		unsigned char SectorNumberByte;
-		unsigned char CylinderLowByte;
-		unsigned char CylinderHighByte;
-		unsigned char DeviceHeadByte;
-		unsigned char CommandByte;
-		unsigned char Reserved[3];
-	} write;
-};
-
-
-/*
- * Inquiry data structure. This is the data returned from the target
- * after it receives an inquiry.
- *
- * This structure may be extended by the number of bytes specified
- * in the field AdditionalLength. The defined size constant only
- * includes fields through ProductRevisionLevel.
- */
-
-/*
- * DeviceType field
- */
-#define DIRECT_ACCESS_DEVICE	    0x00    /* disks */
-#define DEVICE_REMOVABLE		0x80
-
-struct inquiry_data {
-   	unsigned char DeviceType;
-	unsigned char DeviceTypeModifier;
-	unsigned char Versions;
-	unsigned char Format; 
-	unsigned char AdditionalLength;
-	unsigned char Reserved[2];
-	unsigned char Capability;
-	unsigned char VendorId[8];
-	unsigned char ProductId[16];
-	unsigned char ProductRevisionLevel[4];
-	unsigned char VendorSpecific[20];
-	unsigned char Reserved3[40];
-} __attribute__ ((packed));
-
-/*
- * INQUIRY data buffer size
- */
-
-#define INQUIRYDATABUFFERSIZE 36
-
-
-/*
- * ISD200 CONFIG data struct
- */
-
-#define ATACFG_TIMING	  0x0f
-#define ATACFG_ATAPI_RESET     0x10
-#define ATACFG_MASTER	  0x20
-#define ATACFG_BLOCKSIZE       0xa0
-
-#define ATACFGE_LAST_LUN       0x07
-#define ATACFGE_DESC_OVERRIDE  0x08
-#define ATACFGE_STATE_SUSPEND  0x10
-#define ATACFGE_SKIP_BOOT      0x20
-#define ATACFGE_CONF_DESC2     0x40
-#define ATACFGE_INIT_STATUS    0x80
-
-#define CFG_CAPABILITY_SRST    0x01
-
-struct isd200_config {
-	unsigned char EventNotification;
-	unsigned char ExternalClock;
-	unsigned char ATAInitTimeout;
-	unsigned char ATAConfig;
-	unsigned char ATAMajorCommand;
-	unsigned char ATAMinorCommand;
-	unsigned char ATAExtraConfig;
-	unsigned char Capability;
-}__attribute__ ((packed));
-
-
-/*
- * ISD200 driver information struct
- */
-
-struct isd200_info {
-	struct inquiry_data InquiryData;
-	u16 *id;
-	struct isd200_config ConfigData;
-	unsigned char *RegsBuf;
-	unsigned char ATARegs[8];
-	unsigned char DeviceHead;
-	unsigned char DeviceFlags;
-
-	/* maximum number of LUNs supported */
-	unsigned char MaxLUNs;
-	unsigned char cmnd[BLK_MAX_CDB];
-	struct scsi_cmnd srb;
-	struct scatterlist sg;
-};
-
-
-/*
- * Read Capacity Data - returned in Big Endian format
- */
-
-struct read_capacity_data {
-	__be32 LogicalBlockAddress;
-	__be32 BytesPerBlock;
-};
-
-/*
- * Read Block Limits Data - returned in Big Endian format
- * This structure returns the maximum and minimum block
- * size for a TAPE device.
- */
-
-struct read_block_limits {
-	unsigned char Reserved;
-	unsigned char BlockMaximumSize[3];
-	unsigned char BlockMinimumSize[2];
-};
-
-
-/*
- * Sense Data Format
- */
-
-#define SENSE_ERRCODE	   0x7f
-#define SENSE_ERRCODE_VALID     0x80
-#define SENSE_FLAG_SENSE_KEY    0x0f
-#define SENSE_FLAG_BAD_LENGTH   0x20
-#define SENSE_FLAG_END_OF_MEDIA 0x40
-#define SENSE_FLAG_FILE_MARK    0x80
-struct sense_data {
-	unsigned char ErrorCode;
-	unsigned char SegmentNumber;
-	unsigned char Flags;
-	unsigned char Information[4];
-	unsigned char AdditionalSenseLength;
-	unsigned char CommandSpecificInformation[4];
-	unsigned char AdditionalSenseCode;
-	unsigned char AdditionalSenseCodeQualifier;
-	unsigned char FieldReplaceableUnitCode;
-	unsigned char SenseKeySpecific[3];
-} __attribute__ ((packed));
-
-/*
- * Default request sense buffer size
- */
-
-#define SENSE_BUFFER_SIZE 18
-
-/***********************************************************************
- * Helper routines
- ***********************************************************************/
-
-/**************************************************************************
- * isd200_build_sense
- *									 
- *  Builds an artificial sense buffer to report the results of a 
- *  failed command.
- *								       
- * RETURNS:
- *    void
- */
-static void isd200_build_sense(struct us_data *us, struct scsi_cmnd *srb)
-{
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	struct sense_data *buf = (struct sense_data *) &srb->sense_buffer[0];
-	unsigned char error = info->ATARegs[ATA_REG_ERROR_OFFSET];
-
-	if(error & ATA_ERROR_MEDIA_CHANGE) {
-		buf->ErrorCode = 0x70 | SENSE_ERRCODE_VALID;
-		buf->AdditionalSenseLength = 0xb;
-		buf->Flags = UNIT_ATTENTION;
-		buf->AdditionalSenseCode = 0;
-		buf->AdditionalSenseCodeQualifier = 0;
-	} else if (error & ATA_MCR) {
-		buf->ErrorCode = 0x70 | SENSE_ERRCODE_VALID;
-		buf->AdditionalSenseLength = 0xb;
-		buf->Flags =  UNIT_ATTENTION;
-		buf->AdditionalSenseCode = 0;
-		buf->AdditionalSenseCodeQualifier = 0;
-	} else if (error & ATA_TRK0NF) {
-		buf->ErrorCode = 0x70 | SENSE_ERRCODE_VALID;
-		buf->AdditionalSenseLength = 0xb;
-		buf->Flags =  NOT_READY;
-		buf->AdditionalSenseCode = 0;
-		buf->AdditionalSenseCodeQualifier = 0;
-	} else if (error & ATA_UNC) {
-		buf->ErrorCode = 0x70 | SENSE_ERRCODE_VALID;
-		buf->AdditionalSenseLength = 0xb;
-		buf->Flags =  DATA_PROTECT;
-		buf->AdditionalSenseCode = 0;
-		buf->AdditionalSenseCodeQualifier = 0;
-	} else {
-		buf->ErrorCode = 0;
-		buf->AdditionalSenseLength = 0;
-		buf->Flags =  0;
-		buf->AdditionalSenseCode = 0;
-		buf->AdditionalSenseCodeQualifier = 0;
-	}
-}
-
-
-/***********************************************************************
- * Transport routines
- ***********************************************************************/
-
-/**************************************************************************
- *  isd200_set_srb(), isd200_srb_set_bufflen()
- *
- * Two helpers to facilitate in initialization of scsi_cmnd structure
- * Will need to change when struct scsi_cmnd changes
- */
-static void isd200_set_srb(struct isd200_info *info,
-	enum dma_data_direction dir, void* buff, unsigned bufflen)
-{
-	struct scsi_cmnd *srb = &info->srb;
-
-	if (buff)
-		sg_init_one(&info->sg, buff, bufflen);
-
-	srb->sc_data_direction = dir;
-	srb->sdb.table.sgl = buff ? &info->sg : NULL;
-	srb->sdb.length = bufflen;
-	srb->sdb.table.nents = buff ? 1 : 0;
-}
-
-static void isd200_srb_set_bufflen(struct scsi_cmnd *srb, unsigned bufflen)
-{
-	srb->sdb.length = bufflen;
-}
-
-
-/**************************************************************************
- *  isd200_action
- *
- * Routine for sending commands to the isd200
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_action( struct us_data *us, int action, 
-			  void* pointer, int value )
-{
-	union ata_cdb ata;
-	/* static to prevent this large struct being placed on the valuable stack */
-	static struct scsi_device srb_dev;
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	struct scsi_cmnd *srb = &info->srb;
-	int status;
-
-	memset(&ata, 0, sizeof(ata));
-	srb->cmnd = info->cmnd;
-	srb->device = &srb_dev;
-
-	ata.generic.SignatureByte0 = info->ConfigData.ATAMajorCommand;
-	ata.generic.SignatureByte1 = info->ConfigData.ATAMinorCommand;
-	ata.generic.TransferBlockSize = 1;
-
-	switch ( action ) {
-	case ACTION_READ_STATUS:
-		usb_stor_dbg(us, "   isd200_action(READ_STATUS)\n");
-		ata.generic.ActionSelect = ACTION_SELECT_0|ACTION_SELECT_2;
-		ata.generic.RegisterSelect =
-		  REG_CYLINDER_LOW | REG_CYLINDER_HIGH |
-		  REG_STATUS | REG_ERROR;
-		isd200_set_srb(info, DMA_FROM_DEVICE, pointer, value);
-		break;
-
-	case ACTION_ENUM:
-		usb_stor_dbg(us, "   isd200_action(ENUM,0x%02x)\n", value);
-		ata.generic.ActionSelect = ACTION_SELECT_1|ACTION_SELECT_2|
-					   ACTION_SELECT_3|ACTION_SELECT_4|
-					   ACTION_SELECT_5;
-		ata.generic.RegisterSelect = REG_DEVICE_HEAD;
-		ata.write.DeviceHeadByte = value;
-		isd200_set_srb(info, DMA_NONE, NULL, 0);
-		break;
-
-	case ACTION_RESET:
-		usb_stor_dbg(us, "   isd200_action(RESET)\n");
-		ata.generic.ActionSelect = ACTION_SELECT_1|ACTION_SELECT_2|
-					   ACTION_SELECT_3|ACTION_SELECT_4;
-		ata.generic.RegisterSelect = REG_DEVICE_CONTROL;
-		ata.write.DeviceControlByte = ATA_DC_RESET_CONTROLLER;
-		isd200_set_srb(info, DMA_NONE, NULL, 0);
-		break;
-
-	case ACTION_REENABLE:
-		usb_stor_dbg(us, "   isd200_action(REENABLE)\n");
-		ata.generic.ActionSelect = ACTION_SELECT_1|ACTION_SELECT_2|
-					   ACTION_SELECT_3|ACTION_SELECT_4;
-		ata.generic.RegisterSelect = REG_DEVICE_CONTROL;
-		ata.write.DeviceControlByte = ATA_DC_REENABLE_CONTROLLER;
-		isd200_set_srb(info, DMA_NONE, NULL, 0);
-		break;
-
-	case ACTION_SOFT_RESET:
-		usb_stor_dbg(us, "   isd200_action(SOFT_RESET)\n");
-		ata.generic.ActionSelect = ACTION_SELECT_1|ACTION_SELECT_5;
-		ata.generic.RegisterSelect = REG_DEVICE_HEAD | REG_COMMAND;
-		ata.write.DeviceHeadByte = info->DeviceHead;
-		ata.write.CommandByte = ATA_CMD_DEV_RESET;
-		isd200_set_srb(info, DMA_NONE, NULL, 0);
-		break;
-
-	case ACTION_IDENTIFY:
-		usb_stor_dbg(us, "   isd200_action(IDENTIFY)\n");
-		ata.generic.RegisterSelect = REG_COMMAND;
-		ata.write.CommandByte = ATA_CMD_ID_ATA;
-		isd200_set_srb(info, DMA_FROM_DEVICE, info->id,
-				ATA_ID_WORDS * 2);
-		break;
-
-	default:
-		usb_stor_dbg(us, "Error: Undefined action %d\n", action);
-		return ISD200_ERROR;
-	}
-
-	memcpy(srb->cmnd, &ata, sizeof(ata.generic));
-	srb->cmd_len = sizeof(ata.generic);
-	status = usb_stor_Bulk_transport(srb, us);
-	if (status == USB_STOR_TRANSPORT_GOOD)
-		status = ISD200_GOOD;
-	else {
-		usb_stor_dbg(us, "   isd200_action(0x%02x) error: %d\n",
-			     action, status);
-		status = ISD200_ERROR;
-		/* need to reset device here */
-	}
-
-	return status;
-}
-
-/**************************************************************************
- * isd200_read_regs
- *									 
- * Read ATA Registers
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_read_regs( struct us_data *us )
-{
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	int retStatus = ISD200_GOOD;
-	int transferStatus;
-
-	usb_stor_dbg(us, "Entering isd200_IssueATAReadRegs\n");
-
-	transferStatus = isd200_action( us, ACTION_READ_STATUS,
-				    info->RegsBuf, sizeof(info->ATARegs) );
-	if (transferStatus != ISD200_TRANSPORT_GOOD) {
-		usb_stor_dbg(us, "   Error reading ATA registers\n");
-		retStatus = ISD200_ERROR;
-	} else {
-		memcpy(info->ATARegs, info->RegsBuf, sizeof(info->ATARegs));
-		usb_stor_dbg(us, "   Got ATA Register[ATA_REG_ERROR_OFFSET] = 0x%x\n",
-			     info->ATARegs[ATA_REG_ERROR_OFFSET]);
-	}
-
-	return retStatus;
-}
-
-
-/**************************************************************************
- * Invoke the transport and basic error-handling/recovery methods
- *
- * This is used by the protocol layers to actually send the message to
- * the device and receive the response.
- */
-static void isd200_invoke_transport( struct us_data *us, 
-			      struct scsi_cmnd *srb, 
-			      union ata_cdb *ataCdb )
-{
-	int need_auto_sense = 0;
-	int transferStatus;
-	int result;
-
-	/* send the command to the transport layer */
-	memcpy(srb->cmnd, ataCdb, sizeof(ataCdb->generic));
-	srb->cmd_len = sizeof(ataCdb->generic);
-	transferStatus = usb_stor_Bulk_transport(srb, us);
-
-	/* if the command gets aborted by the higher layers, we need to
-	 * short-circuit all other processing
-	 */
-	if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
-		usb_stor_dbg(us, "-- command was aborted\n");
-		goto Handle_Abort;
-	}
-
-	switch (transferStatus) {
-
-	case USB_STOR_TRANSPORT_GOOD:
-		/* Indicate a good result */
-		srb->result = SAM_STAT_GOOD;
-		break;
-
-	case USB_STOR_TRANSPORT_NO_SENSE:
-		usb_stor_dbg(us, "-- transport indicates protocol failure\n");
-		srb->result = SAM_STAT_CHECK_CONDITION;
-		return;
-
-	case USB_STOR_TRANSPORT_FAILED:
-		usb_stor_dbg(us, "-- transport indicates command failure\n");
-		need_auto_sense = 1;
-		break;
-
-	case USB_STOR_TRANSPORT_ERROR:
-		usb_stor_dbg(us, "-- transport indicates transport error\n");
-		srb->result = DID_ERROR << 16;
-		/* Need reset here */
-		return;
-    
-	default:
-		usb_stor_dbg(us, "-- transport indicates unknown error\n");
-		srb->result = DID_ERROR << 16;
-		/* Need reset here */
-		return;
-	}
-
-	if ((scsi_get_resid(srb) > 0) &&
-	    !((srb->cmnd[0] == REQUEST_SENSE) ||
-	      (srb->cmnd[0] == INQUIRY) ||
-	      (srb->cmnd[0] == MODE_SENSE) ||
-	      (srb->cmnd[0] == LOG_SENSE) ||
-	      (srb->cmnd[0] == MODE_SENSE_10))) {
-		usb_stor_dbg(us, "-- unexpectedly short transfer\n");
-		need_auto_sense = 1;
-	}
-
-	if (need_auto_sense) {
-		result = isd200_read_regs(us);
-		if (test_bit(US_FLIDX_TIMED_OUT, &us->dflags)) {
-			usb_stor_dbg(us, "-- auto-sense aborted\n");
-			goto Handle_Abort;
-		}
-		if (result == ISD200_GOOD) {
-			isd200_build_sense(us, srb);
-			srb->result = SAM_STAT_CHECK_CONDITION;
-
-			/* If things are really okay, then let's show that */
-			if ((srb->sense_buffer[2] & 0xf) == 0x0)
-				srb->result = SAM_STAT_GOOD;
-		} else {
-			srb->result = DID_ERROR << 16;
-			/* Need reset here */
-		}
-	}
-
-	/* Regardless of auto-sense, if we _know_ we have an error
-	 * condition, show that in the result code
-	 */
-	if (transferStatus == USB_STOR_TRANSPORT_FAILED)
-		srb->result = SAM_STAT_CHECK_CONDITION;
-	return;
-
-	/* abort processing: the bulk-only transport requires a reset
-	 * following an abort */
-	Handle_Abort:
-	srb->result = DID_ABORT << 16;
-
-	/* permit the reset transfer to take place */
-	clear_bit(US_FLIDX_ABORTING, &us->dflags);
-	/* Need reset here */
-}
-
-#ifdef CONFIG_USB_STORAGE_DEBUG
-static void isd200_log_config(struct us_data *us, struct isd200_info *info)
-{
-	usb_stor_dbg(us, "      Event Notification: 0x%x\n",
-		     info->ConfigData.EventNotification);
-	usb_stor_dbg(us, "      External Clock: 0x%x\n",
-		     info->ConfigData.ExternalClock);
-	usb_stor_dbg(us, "      ATA Init Timeout: 0x%x\n",
-		     info->ConfigData.ATAInitTimeout);
-	usb_stor_dbg(us, "      ATAPI Command Block Size: 0x%x\n",
-		     (info->ConfigData.ATAConfig & ATACFG_BLOCKSIZE) >> 6);
-	usb_stor_dbg(us, "      Master/Slave Selection: 0x%x\n",
-		     info->ConfigData.ATAConfig & ATACFG_MASTER);
-	usb_stor_dbg(us, "      ATAPI Reset: 0x%x\n",
-		     info->ConfigData.ATAConfig & ATACFG_ATAPI_RESET);
-	usb_stor_dbg(us, "      ATA Timing: 0x%x\n",
-		     info->ConfigData.ATAConfig & ATACFG_TIMING);
-	usb_stor_dbg(us, "      ATA Major Command: 0x%x\n",
-		     info->ConfigData.ATAMajorCommand);
-	usb_stor_dbg(us, "      ATA Minor Command: 0x%x\n",
-		     info->ConfigData.ATAMinorCommand);
-	usb_stor_dbg(us, "      Init Status: 0x%x\n",
-		     info->ConfigData.ATAExtraConfig & ATACFGE_INIT_STATUS);
-	usb_stor_dbg(us, "      Config Descriptor 2: 0x%x\n",
-		     info->ConfigData.ATAExtraConfig & ATACFGE_CONF_DESC2);
-	usb_stor_dbg(us, "      Skip Device Boot: 0x%x\n",
-		     info->ConfigData.ATAExtraConfig & ATACFGE_SKIP_BOOT);
-	usb_stor_dbg(us, "      ATA 3 State Suspend: 0x%x\n",
-		     info->ConfigData.ATAExtraConfig & ATACFGE_STATE_SUSPEND);
-	usb_stor_dbg(us, "      Descriptor Override: 0x%x\n",
-		     info->ConfigData.ATAExtraConfig & ATACFGE_DESC_OVERRIDE);
-	usb_stor_dbg(us, "      Last LUN Identifier: 0x%x\n",
-		     info->ConfigData.ATAExtraConfig & ATACFGE_LAST_LUN);
-	usb_stor_dbg(us, "      SRST Enable: 0x%x\n",
-		     info->ConfigData.ATAExtraConfig & CFG_CAPABILITY_SRST);
-}
-#endif
-
-/**************************************************************************
- * isd200_write_config
- *									 
- * Write the ISD200 Configuration data
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_write_config( struct us_data *us ) 
-{
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	int retStatus = ISD200_GOOD;
-	int result;
-
-#ifdef CONFIG_USB_STORAGE_DEBUG
-	usb_stor_dbg(us, "Entering isd200_write_config\n");
-	usb_stor_dbg(us, "   Writing the following ISD200 Config Data:\n");
-	isd200_log_config(us, info);
-#endif
-
-	/* let's send the command via the control pipe */
-	result = usb_stor_ctrl_transfer(
-		us, 
-		us->send_ctrl_pipe,
-		0x01, 
-		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
-		0x0000, 
-		0x0002, 
-		(void *) &info->ConfigData, 
-		sizeof(info->ConfigData));
-
-	if (result >= 0) {
-		usb_stor_dbg(us, "   ISD200 Config Data was written successfully\n");
-	} else {
-		usb_stor_dbg(us, "   Request to write ISD200 Config Data failed!\n");
-		retStatus = ISD200_ERROR;
-	}
-
-	usb_stor_dbg(us, "Leaving isd200_write_config %08X\n", retStatus);
-	return retStatus;
-}
-
-
-/**************************************************************************
- * isd200_read_config
- *									 
- * Reads the ISD200 Configuration data
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_read_config( struct us_data *us ) 
-{
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	int retStatus = ISD200_GOOD;
-	int result;
-
-	usb_stor_dbg(us, "Entering isd200_read_config\n");
-
-	/* read the configuration information from ISD200.  Use this to */
-	/* determine what the special ATA CDB bytes are.		*/
-
-	result = usb_stor_ctrl_transfer(
-		us, 
-		us->recv_ctrl_pipe,
-		0x02, 
-		USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
-		0x0000, 
-		0x0002, 
-		(void *) &info->ConfigData, 
-		sizeof(info->ConfigData));
-
-
-	if (result >= 0) {
-		usb_stor_dbg(us, "   Retrieved the following ISD200 Config Data:\n");
-#ifdef CONFIG_USB_STORAGE_DEBUG
-		isd200_log_config(us, info);
-#endif
-	} else {
-		usb_stor_dbg(us, "   Request to get ISD200 Config Data failed!\n");
-		retStatus = ISD200_ERROR;
-	}
-
-	usb_stor_dbg(us, "Leaving isd200_read_config %08X\n", retStatus);
-	return retStatus;
-}
-
-
-/**************************************************************************
- * isd200_atapi_soft_reset
- *									 
- * Perform an Atapi Soft Reset on the device
- *
- * RETURNS:
- *    NT status code
- */
-static int isd200_atapi_soft_reset( struct us_data *us ) 
-{
-	int retStatus = ISD200_GOOD;
-	int transferStatus;
-
-	usb_stor_dbg(us, "Entering isd200_atapi_soft_reset\n");
-
-	transferStatus = isd200_action( us, ACTION_SOFT_RESET, NULL, 0 );
-	if (transferStatus != ISD200_TRANSPORT_GOOD) {
-		usb_stor_dbg(us, "   Error issuing Atapi Soft Reset\n");
-		retStatus = ISD200_ERROR;
-	}
-
-	usb_stor_dbg(us, "Leaving isd200_atapi_soft_reset %08X\n", retStatus);
-	return retStatus;
-}
-
-
-/**************************************************************************
- * isd200_srst
- *									 
- * Perform an SRST on the device
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_srst( struct us_data *us ) 
-{
-	int retStatus = ISD200_GOOD;
-	int transferStatus;
-
-	usb_stor_dbg(us, "Entering isd200_SRST\n");
-
-	transferStatus = isd200_action( us, ACTION_RESET, NULL, 0 );
-
-	/* check to see if this request failed */
-	if (transferStatus != ISD200_TRANSPORT_GOOD) {
-		usb_stor_dbg(us, "   Error issuing SRST\n");
-		retStatus = ISD200_ERROR;
-	} else {
-		/* delay 10ms to give the drive a chance to see it */
-		msleep(10);
-
-		transferStatus = isd200_action( us, ACTION_REENABLE, NULL, 0 );
-		if (transferStatus != ISD200_TRANSPORT_GOOD) {
-			usb_stor_dbg(us, "   Error taking drive out of reset\n");
-			retStatus = ISD200_ERROR;
-		} else {
-			/* delay 50ms to give the drive a chance to recover after SRST */
-			msleep(50);
-		}
-	}
-
-	usb_stor_dbg(us, "Leaving isd200_srst %08X\n", retStatus);
-	return retStatus;
-}
-
-
-/**************************************************************************
- * isd200_try_enum
- *									 
- * Helper function for isd200_manual_enum(). Does ENUM and READ_STATUS
- * and tries to analyze the status registers
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_try_enum(struct us_data *us, unsigned char master_slave,
-			   int detect )
-{
-	int status = ISD200_GOOD;
-	unsigned long endTime;
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	unsigned char *regs = info->RegsBuf;
-	int recheckAsMaster = 0;
-
-	if ( detect )
-		endTime = jiffies + ISD200_ENUM_DETECT_TIMEOUT * HZ;
-	else
-		endTime = jiffies + ISD200_ENUM_BSY_TIMEOUT * HZ;
-
-	/* loop until we detect !BSY or timeout */
-	while(1) {
-
-		status = isd200_action( us, ACTION_ENUM, NULL, master_slave );
-		if ( status != ISD200_GOOD )
-			break;
-
-		status = isd200_action( us, ACTION_READ_STATUS, 
-					regs, 8 );
-		if ( status != ISD200_GOOD )
-			break;
-
-		if (!detect) {
-			if (regs[ATA_REG_STATUS_OFFSET] & ATA_BUSY) {
-				usb_stor_dbg(us, "   %s status is still BSY, try again...\n",
-					     master_slave == ATA_ADDRESS_DEVHEAD_STD ?
-					     "Master" : "Slave");
-			} else {
-				usb_stor_dbg(us, "   %s status !BSY, continue with next operation\n",
-					     master_slave == ATA_ADDRESS_DEVHEAD_STD ?
-					     "Master" : "Slave");
-				break;
-			}
-		}
-		/* check for ATA_BUSY and */
-		/* ATA_DF (workaround ATA Zip drive) and */
-		/* ATA_ERR (workaround for Archos CD-ROM) */
-		else if (regs[ATA_REG_STATUS_OFFSET] &
-			 (ATA_BUSY | ATA_DF | ATA_ERR)) {
-			usb_stor_dbg(us, "   Status indicates it is not ready, try again...\n");
-		}
-		/* check for DRDY, ATA devices set DRDY after SRST */
-		else if (regs[ATA_REG_STATUS_OFFSET] & ATA_DRDY) {
-			usb_stor_dbg(us, "   Identified ATA device\n");
-			info->DeviceFlags |= DF_ATA_DEVICE;
-			info->DeviceHead = master_slave;
-			break;
-		} 
-		/* check Cylinder High/Low to
-		   determine if it is an ATAPI device
-		*/
-		else if (regs[ATA_REG_HCYL_OFFSET] == 0xEB &&
-			 regs[ATA_REG_LCYL_OFFSET] == 0x14) {
-			/* It seems that the RICOH 
-			   MP6200A CD/RW drive will 
-			   report itself okay as a
-			   slave when it is really a
-			   master. So this check again
-			   as a master device just to
-			   make sure it doesn't report
-			   itself okay as a master also
-			*/
-			if ((master_slave & ATA_ADDRESS_DEVHEAD_SLAVE) &&
-			    !recheckAsMaster) {
-				usb_stor_dbg(us, "   Identified ATAPI device as slave.  Rechecking again as master\n");
-				recheckAsMaster = 1;
-				master_slave = ATA_ADDRESS_DEVHEAD_STD;
-			} else {
-				usb_stor_dbg(us, "   Identified ATAPI device\n");
-				info->DeviceHead = master_slave;
-			      
-				status = isd200_atapi_soft_reset(us);
-				break;
-			}
-		} else {
-			usb_stor_dbg(us, "   Not ATA, not ATAPI - Weird\n");
-			break;
-		}
-
-		/* check for timeout on this request */
-		if (time_after_eq(jiffies, endTime)) {
-			if (!detect)
-				usb_stor_dbg(us, "   BSY check timeout, just continue with next operation...\n");
-			else
-				usb_stor_dbg(us, "   Device detect timeout!\n");
-			break;
-		}
-	}
-
-	return status;
-}
-
-/**************************************************************************
- * isd200_manual_enum
- *									 
- * Determines if the drive attached is an ATA or ATAPI and if it is a
- * master or slave.
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_manual_enum(struct us_data *us)
-{
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	int retStatus = ISD200_GOOD;
-
-	usb_stor_dbg(us, "Entering isd200_manual_enum\n");
-
-	retStatus = isd200_read_config(us);
-	if (retStatus == ISD200_GOOD) {
-		int isslave;
-		/* master or slave? */
-		retStatus = isd200_try_enum( us, ATA_ADDRESS_DEVHEAD_STD, 0);
-		if (retStatus == ISD200_GOOD)
-			retStatus = isd200_try_enum( us, ATA_ADDRESS_DEVHEAD_SLAVE, 0);
-
-		if (retStatus == ISD200_GOOD) {
-			retStatus = isd200_srst(us);
-			if (retStatus == ISD200_GOOD)
-				/* ata or atapi? */
-				retStatus = isd200_try_enum( us, ATA_ADDRESS_DEVHEAD_STD, 1);
-		}
-
-		isslave = (info->DeviceHead & ATA_ADDRESS_DEVHEAD_SLAVE) ? 1 : 0;
-		if (!(info->ConfigData.ATAConfig & ATACFG_MASTER)) {
-			usb_stor_dbg(us, "   Setting Master/Slave selection to %d\n",
-				     isslave);
-			info->ConfigData.ATAConfig &= 0x3f;
-			info->ConfigData.ATAConfig |= (isslave<<6);
-			retStatus = isd200_write_config(us);
-		}
-	}
-
-	usb_stor_dbg(us, "Leaving isd200_manual_enum %08X\n", retStatus);
-	return(retStatus);
-}
-
-static void isd200_fix_driveid(u16 *id)
-{
-#ifndef __LITTLE_ENDIAN
-# ifdef __BIG_ENDIAN
-	int i;
-
-	for (i = 0; i < ATA_ID_WORDS; i++)
-		id[i] = __le16_to_cpu(id[i]);
-# else
-#  error "Please fix <asm/byteorder.h>"
-# endif
-#endif
-}
-
-static void isd200_dump_driveid(struct us_data *us, u16 *id)
-{
-	usb_stor_dbg(us, "   Identify Data Structure:\n");
-	usb_stor_dbg(us, "      config = 0x%x\n",	id[ATA_ID_CONFIG]);
-	usb_stor_dbg(us, "      cyls = 0x%x\n",		id[ATA_ID_CYLS]);
-	usb_stor_dbg(us, "      heads = 0x%x\n",	id[ATA_ID_HEADS]);
-	usb_stor_dbg(us, "      track_bytes = 0x%x\n",	id[4]);
-	usb_stor_dbg(us, "      sector_bytes = 0x%x\n", id[5]);
-	usb_stor_dbg(us, "      sectors = 0x%x\n",	id[ATA_ID_SECTORS]);
-	usb_stor_dbg(us, "      serial_no[0] = 0x%x\n", *(char *)&id[ATA_ID_SERNO]);
-	usb_stor_dbg(us, "      buf_type = 0x%x\n",	id[20]);
-	usb_stor_dbg(us, "      buf_size = 0x%x\n",	id[ATA_ID_BUF_SIZE]);
-	usb_stor_dbg(us, "      ecc_bytes = 0x%x\n",	id[22]);
-	usb_stor_dbg(us, "      fw_rev[0] = 0x%x\n",	*(char *)&id[ATA_ID_FW_REV]);
-	usb_stor_dbg(us, "      model[0] = 0x%x\n",	*(char *)&id[ATA_ID_PROD]);
-	usb_stor_dbg(us, "      max_multsect = 0x%x\n", id[ATA_ID_MAX_MULTSECT] & 0xff);
-	usb_stor_dbg(us, "      dword_io = 0x%x\n",	id[ATA_ID_DWORD_IO]);
-	usb_stor_dbg(us, "      capability = 0x%x\n",	id[ATA_ID_CAPABILITY] >> 8);
-	usb_stor_dbg(us, "      tPIO = 0x%x\n",	  id[ATA_ID_OLD_PIO_MODES] >> 8);
-	usb_stor_dbg(us, "      tDMA = 0x%x\n",	  id[ATA_ID_OLD_DMA_MODES] >> 8);
-	usb_stor_dbg(us, "      field_valid = 0x%x\n",	id[ATA_ID_FIELD_VALID]);
-	usb_stor_dbg(us, "      cur_cyls = 0x%x\n",	id[ATA_ID_CUR_CYLS]);
-	usb_stor_dbg(us, "      cur_heads = 0x%x\n",	id[ATA_ID_CUR_HEADS]);
-	usb_stor_dbg(us, "      cur_sectors = 0x%x\n",	id[ATA_ID_CUR_SECTORS]);
-	usb_stor_dbg(us, "      cur_capacity = 0x%x\n", ata_id_u32(id, 57));
-	usb_stor_dbg(us, "      multsect = 0x%x\n",	id[ATA_ID_MULTSECT] & 0xff);
-	usb_stor_dbg(us, "      lba_capacity = 0x%x\n", ata_id_u32(id, ATA_ID_LBA_CAPACITY));
-	usb_stor_dbg(us, "      command_set_1 = 0x%x\n", id[ATA_ID_COMMAND_SET_1]);
-	usb_stor_dbg(us, "      command_set_2 = 0x%x\n", id[ATA_ID_COMMAND_SET_2]);
-}
-
-/**************************************************************************
- * isd200_get_inquiry_data
- *
- * Get inquiry data
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_get_inquiry_data( struct us_data *us )
-{
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	int retStatus = ISD200_GOOD;
-	u16 *id = info->id;
-
-	usb_stor_dbg(us, "Entering isd200_get_inquiry_data\n");
-
-	/* set default to Master */
-	info->DeviceHead = ATA_ADDRESS_DEVHEAD_STD;
-
-	/* attempt to manually enumerate this device */
-	retStatus = isd200_manual_enum(us);
-	if (retStatus == ISD200_GOOD) {
-		int transferStatus;
-
-		/* check for an ATA device */
-		if (info->DeviceFlags & DF_ATA_DEVICE) {
-			/* this must be an ATA device */
-			/* perform an ATA Command Identify */
-			transferStatus = isd200_action( us, ACTION_IDENTIFY,
-							id, ATA_ID_WORDS * 2);
-			if (transferStatus != ISD200_TRANSPORT_GOOD) {
-				/* Error issuing ATA Command Identify */
-				usb_stor_dbg(us, "   Error issuing ATA Command Identify\n");
-				retStatus = ISD200_ERROR;
-			} else {
-				/* ATA Command Identify successful */
-				int i;
-				__be16 *src;
-				__u16 *dest;
-
-				isd200_fix_driveid(id);
-				isd200_dump_driveid(us, id);
-
-				memset(&info->InquiryData, 0, sizeof(info->InquiryData));
-
-				/* Standard IDE interface only supports disks */
-				info->InquiryData.DeviceType = DIRECT_ACCESS_DEVICE;
-
-				/* The length must be at least 36 (5 + 31) */
-				info->InquiryData.AdditionalLength = 0x1F;
-
-				if (id[ATA_ID_COMMAND_SET_1] & COMMANDSET_MEDIA_STATUS) {
-					/* set the removable bit */
-					info->InquiryData.DeviceTypeModifier = DEVICE_REMOVABLE;
-					info->DeviceFlags |= DF_REMOVABLE_MEDIA;
-				}
-
-				/* Fill in vendor identification fields */
-				src = (__be16 *)&id[ATA_ID_PROD];
-				dest = (__u16*)info->InquiryData.VendorId;
-				for (i=0;i<4;i++)
-					dest[i] = be16_to_cpu(src[i]);
-
-				src = (__be16 *)&id[ATA_ID_PROD + 8/2];
-				dest = (__u16*)info->InquiryData.ProductId;
-				for (i=0;i<8;i++)
-					dest[i] = be16_to_cpu(src[i]);
-
-				src = (__be16 *)&id[ATA_ID_FW_REV];
-				dest = (__u16*)info->InquiryData.ProductRevisionLevel;
-				for (i=0;i<2;i++)
-					dest[i] = be16_to_cpu(src[i]);
-
-				/* determine if it supports Media Status Notification */
-				if (id[ATA_ID_COMMAND_SET_2] & COMMANDSET_MEDIA_STATUS) {
-					usb_stor_dbg(us, "   Device supports Media Status Notification\n");
-
-					/* Indicate that it is enabled, even though it is not
-					 * This allows the lock/unlock of the media to work
-					 * correctly.
-					 */
-					info->DeviceFlags |= DF_MEDIA_STATUS_ENABLED;
-				}
-				else
-					info->DeviceFlags &= ~DF_MEDIA_STATUS_ENABLED;
-
-			}
-		} else {
-			/* 
-			 * this must be an ATAPI device 
-			 * use an ATAPI protocol (Transparent SCSI)
-			 */
-			us->protocol_name = "Transparent SCSI";
-			us->proto_handler = usb_stor_transparent_scsi_command;
-
-			usb_stor_dbg(us, "Protocol changed to: %s\n",
-				     us->protocol_name);
-	    
-			/* Free driver structure */	    
-			us->extra_destructor(info);
-			kfree(info);
-			us->extra = NULL;
-			us->extra_destructor = NULL;
-		}
-	}
-
-	usb_stor_dbg(us, "Leaving isd200_get_inquiry_data %08X\n", retStatus);
-
-	return(retStatus);
-}
-
-/**************************************************************************
- * isd200_scsi_to_ata
- *									 
- * Translate SCSI commands to ATA commands.
- *
- * RETURNS:
- *    1 if the command needs to be sent to the transport layer
- *    0 otherwise
- */
-static int isd200_scsi_to_ata(struct scsi_cmnd *srb, struct us_data *us,
-			      union ata_cdb * ataCdb)
-{
-	struct isd200_info *info = (struct isd200_info *)us->extra;
-	u16 *id = info->id;
-	int sendToTransport = 1;
-	unsigned char sectnum, head;
-	unsigned short cylinder;
-	unsigned long lba;
-	unsigned long blockCount;
-	unsigned char senseData[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-
-	memset(ataCdb, 0, sizeof(union ata_cdb));
-
-	/* SCSI Command */
-	switch (srb->cmnd[0]) {
-	case INQUIRY:
-		usb_stor_dbg(us, "   ATA OUT - INQUIRY\n");
-
-		/* copy InquiryData */
-		usb_stor_set_xfer_buf((unsigned char *) &info->InquiryData,
-				sizeof(info->InquiryData), srb);
-		srb->result = SAM_STAT_GOOD;
-		sendToTransport = 0;
-		break;
-
-	case MODE_SENSE:
-		usb_stor_dbg(us, "   ATA OUT - SCSIOP_MODE_SENSE\n");
-
-		/* Initialize the return buffer */
-		usb_stor_set_xfer_buf(senseData, sizeof(senseData), srb);
-
-		if (info->DeviceFlags & DF_MEDIA_STATUS_ENABLED)
-		{
-			ataCdb->generic.SignatureByte0 = info->ConfigData.ATAMajorCommand;
-			ataCdb->generic.SignatureByte1 = info->ConfigData.ATAMinorCommand;
-			ataCdb->generic.TransferBlockSize = 1;
-			ataCdb->generic.RegisterSelect = REG_COMMAND;
-			ataCdb->write.CommandByte = ATA_COMMAND_GET_MEDIA_STATUS;
-			isd200_srb_set_bufflen(srb, 0);
-		} else {
-			usb_stor_dbg(us, "   Media Status not supported, just report okay\n");
-			srb->result = SAM_STAT_GOOD;
-			sendToTransport = 0;
-		}
-		break;
-
-	case TEST_UNIT_READY:
-		usb_stor_dbg(us, "   ATA OUT - SCSIOP_TEST_UNIT_READY\n");
-
-		if (info->DeviceFlags & DF_MEDIA_STATUS_ENABLED)
-		{
-			ataCdb->generic.SignatureByte0 = info->ConfigData.ATAMajorCommand;
-			ataCdb->generic.SignatureByte1 = info->ConfigData.ATAMinorCommand;
-			ataCdb->generic.TransferBlockSize = 1;
-			ataCdb->generic.RegisterSelect = REG_COMMAND;
-			ataCdb->write.CommandByte = ATA_COMMAND_GET_MEDIA_STATUS;
-			isd200_srb_set_bufflen(srb, 0);
-		} else {
-			usb_stor_dbg(us, "   Media Status not supported, just report okay\n");
-			srb->result = SAM_STAT_GOOD;
-			sendToTransport = 0;
-		}
-		break;
-
-	case READ_CAPACITY:
-	{
-		unsigned long capacity;
-		struct read_capacity_data readCapacityData;
-
-		usb_stor_dbg(us, "   ATA OUT - SCSIOP_READ_CAPACITY\n");
-
-		if (ata_id_has_lba(id))
-			capacity = ata_id_u32(id, ATA_ID_LBA_CAPACITY) - 1;
-		else
-			capacity = (id[ATA_ID_HEADS] * id[ATA_ID_CYLS] *
-				    id[ATA_ID_SECTORS]) - 1;
-
-		readCapacityData.LogicalBlockAddress = cpu_to_be32(capacity);
-		readCapacityData.BytesPerBlock = cpu_to_be32(0x200);
-
-		usb_stor_set_xfer_buf((unsigned char *) &readCapacityData,
-				sizeof(readCapacityData), srb);
-		srb->result = SAM_STAT_GOOD;
-		sendToTransport = 0;
-	}
-	break;
-
-	case READ_10:
-		usb_stor_dbg(us, "   ATA OUT - SCSIOP_READ\n");
-
-		lba = be32_to_cpu(*(__be32 *)&srb->cmnd[2]);
-		blockCount = (unsigned long)srb->cmnd[7]<<8 | (unsigned long)srb->cmnd[8];
-
-		if (ata_id_has_lba(id)) {
-			sectnum = (unsigned char)(lba);
-			cylinder = (unsigned short)(lba>>8);
-			head = ATA_ADDRESS_DEVHEAD_LBA_MODE | (unsigned char)(lba>>24 & 0x0F);
-		} else {
-			sectnum = (u8)((lba % id[ATA_ID_SECTORS]) + 1);
-			cylinder = (u16)(lba / (id[ATA_ID_SECTORS] *
-					id[ATA_ID_HEADS]));
-			head = (u8)((lba / id[ATA_ID_SECTORS]) %
-					id[ATA_ID_HEADS]);
-		}
-		ataCdb->generic.SignatureByte0 = info->ConfigData.ATAMajorCommand;
-		ataCdb->generic.SignatureByte1 = info->ConfigData.ATAMinorCommand;
-		ataCdb->generic.TransferBlockSize = 1;
-		ataCdb->generic.RegisterSelect =
-		  REG_SECTOR_COUNT | REG_SECTOR_NUMBER |
-		  REG_CYLINDER_LOW | REG_CYLINDER_HIGH |
-		  REG_DEVICE_HEAD  | REG_COMMAND;
-		ataCdb->write.SectorCountByte = (unsigned char)blockCount;
-		ataCdb->write.SectorNumberByte = sectnum;
-		ataCdb->write.CylinderHighByte = (unsigned char)(cylinder>>8);
-		ataCdb->write.CylinderLowByte = (unsigned char)cylinder;
-		ataCdb->write.DeviceHeadByte = (head | ATA_ADDRESS_DEVHEAD_STD);
-		ataCdb->write.CommandByte = ATA_CMD_PIO_READ;
-		break;
-
-	case WRITE_10:
-		usb_stor_dbg(us, "   ATA OUT - SCSIOP_WRITE\n");
-
-		lba = be32_to_cpu(*(__be32 *)&srb->cmnd[2]);
-		blockCount = (unsigned long)srb->cmnd[7]<<8 | (unsigned long)srb->cmnd[8];
-
-		if (ata_id_has_lba(id)) {
-			sectnum = (unsigned char)(lba);
-			cylinder = (unsigned short)(lba>>8);
-			head = ATA_ADDRESS_DEVHEAD_LBA_MODE | (unsigned char)(lba>>24 & 0x0F);
-		} else {
-			sectnum = (u8)((lba % id[ATA_ID_SECTORS]) + 1);
-			cylinder = (u16)(lba / (id[ATA_ID_SECTORS] *
-					id[ATA_ID_HEADS]));
-			head = (u8)((lba / id[ATA_ID_SECTORS]) %
-					id[ATA_ID_HEADS]);
-		}
-		ataCdb->generic.SignatureByte0 = info->ConfigData.ATAMajorCommand;
-		ataCdb->generic.SignatureByte1 = info->ConfigData.ATAMinorCommand;
-		ataCdb->generic.TransferBlockSize = 1;
-		ataCdb->generic.RegisterSelect =
-		  REG_SECTOR_COUNT | REG_SECTOR_NUMBER |
-		  REG_CYLINDER_LOW | REG_CYLINDER_HIGH |
-		  REG_DEVICE_HEAD  | REG_COMMAND;
-		ataCdb->write.SectorCountByte = (unsigned char)blockCount;
-		ataCdb->write.SectorNumberByte = sectnum;
-		ataCdb->write.CylinderHighByte = (unsigned char)(cylinder>>8);
-		ataCdb->write.CylinderLowByte = (unsigned char)cylinder;
-		ataCdb->write.DeviceHeadByte = (head | ATA_ADDRESS_DEVHEAD_STD);
-		ataCdb->write.CommandByte = ATA_CMD_PIO_WRITE;
-		break;
-
-	case ALLOW_MEDIUM_REMOVAL:
-		usb_stor_dbg(us, "   ATA OUT - SCSIOP_MEDIUM_REMOVAL\n");
-
-		if (info->DeviceFlags & DF_REMOVABLE_MEDIA) {
-			usb_stor_dbg(us, "   srb->cmnd[4] = 0x%X\n",
-				     srb->cmnd[4]);
-	    
-			ataCdb->generic.SignatureByte0 = info->ConfigData.ATAMajorCommand;
-			ataCdb->generic.SignatureByte1 = info->ConfigData.ATAMinorCommand;
-			ataCdb->generic.TransferBlockSize = 1;
-			ataCdb->generic.RegisterSelect = REG_COMMAND;
-			ataCdb->write.CommandByte = (srb->cmnd[4] & 0x1) ?
-				ATA_CMD_MEDIA_LOCK : ATA_CMD_MEDIA_UNLOCK;
-			isd200_srb_set_bufflen(srb, 0);
-		} else {
-			usb_stor_dbg(us, "   Not removeable media, just report okay\n");
-			srb->result = SAM_STAT_GOOD;
-			sendToTransport = 0;
-		}
-		break;
-
-	case START_STOP:    
-		usb_stor_dbg(us, "   ATA OUT - SCSIOP_START_STOP_UNIT\n");
-		usb_stor_dbg(us, "   srb->cmnd[4] = 0x%X\n", srb->cmnd[4]);
-
-		if ((srb->cmnd[4] & 0x3) == 0x2) {
-			usb_stor_dbg(us, "   Media Eject\n");
-			ataCdb->generic.SignatureByte0 = info->ConfigData.ATAMajorCommand;
-			ataCdb->generic.SignatureByte1 = info->ConfigData.ATAMinorCommand;
-			ataCdb->generic.TransferBlockSize = 0;
-			ataCdb->generic.RegisterSelect = REG_COMMAND;
-			ataCdb->write.CommandByte = ATA_COMMAND_MEDIA_EJECT;
-		} else if ((srb->cmnd[4] & 0x3) == 0x1) {
-			usb_stor_dbg(us, "   Get Media Status\n");
-			ataCdb->generic.SignatureByte0 = info->ConfigData.ATAMajorCommand;
-			ataCdb->generic.SignatureByte1 = info->ConfigData.ATAMinorCommand;
-			ataCdb->generic.TransferBlockSize = 1;
-			ataCdb->generic.RegisterSelect = REG_COMMAND;
-			ataCdb->write.CommandByte = ATA_COMMAND_GET_MEDIA_STATUS;
-			isd200_srb_set_bufflen(srb, 0);
-		} else {
-			usb_stor_dbg(us, "   Nothing to do, just report okay\n");
-			srb->result = SAM_STAT_GOOD;
-			sendToTransport = 0;
-		}
-		break;
-
-	default:
-		usb_stor_dbg(us, "Unsupported SCSI command - 0x%X\n",
-			     srb->cmnd[0]);
-		srb->result = DID_ERROR << 16;
-		sendToTransport = 0;
-		break;
-	}
-
-	return(sendToTransport);
-}
-
-
-/**************************************************************************
- * isd200_free_info
- *
- * Frees the driver structure.
- */
-static void isd200_free_info_ptrs(void *info_)
-{
-	struct isd200_info *info = (struct isd200_info *) info_;
-
-	if (info) {
-		kfree(info->id);
-		kfree(info->RegsBuf);
-		kfree(info->srb.sense_buffer);
-	}
-}
-
-/**************************************************************************
- * isd200_init_info
- *									 
- * Allocates (if necessary) and initializes the driver structure.
- *
- * RETURNS:
- *    ISD status code
- */
-static int isd200_init_info(struct us_data *us)
-{
-	struct isd200_info *info;
-
-	info = kzalloc(sizeof(struct isd200_info), GFP_KERNEL);
-	if (!info)
-		return ISD200_ERROR;
-
-	info->id = kzalloc(ATA_ID_WORDS * 2, GFP_KERNEL);
-	info->RegsBuf = kmalloc(sizeof(info->ATARegs), GFP_KERNEL);
-	info->srb.sense_buffer = kmalloc(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL);
-
-	if (!info->id || !info->RegsBuf || !info->srb.sense_buffer) {
-		isd200_free_info_ptrs(info);
-		kfree(info);
-		return ISD200_ERROR;
-	}
-
-	us->extra = info;
-	us->extra_destructor = isd200_free_info_ptrs;
-
-	return ISD200_GOOD;
-}
-
-/**************************************************************************
- * Initialization for the ISD200 
- */
-
-static int isd200_Initialization(struct us_data *us)
-{
-	usb_stor_dbg(us, "ISD200 Initialization...\n");
-
-	/* Initialize ISD200 info struct */
-
-	if (isd200_init_info(us) == ISD200_ERROR) {
-		usb_stor_dbg(us, "ERROR Initializing ISD200 Info struct\n");
-	} else {
-		/* Get device specific data */
-
-		if (isd200_get_inquiry_data(us) != ISD200_GOOD)
-			usb_stor_dbg(us, "ISD200 Initialization Failure\n");
-		else
-			usb_stor_dbg(us, "ISD200 Initialization complete\n");
-	}
-
-	return 0;
-}
-
-
-/**************************************************************************
- * Protocol and Transport for the ISD200 ASIC
- *
- * This protocol and transport are for ATA devices connected to an ISD200
- * ASIC.  An ATAPI device that is connected as a slave device will be
- * detected in the driver initialization function and the protocol will
- * be changed to an ATAPI protocol (Transparent SCSI).
- *
- */
-
-static void isd200_ata_command(struct scsi_cmnd *srb, struct us_data *us)
-{
-	int sendToTransport = 1, orig_bufflen;
-	union ata_cdb ataCdb;
-
-	/* Make sure driver was initialized */
-
-	if (us->extra == NULL) {
-		usb_stor_dbg(us, "ERROR Driver not initialized\n");
-		srb->result = DID_ERROR << 16;
-		return;
-	}
-
-	scsi_set_resid(srb, 0);
-	/* scsi_bufflen might change in protocol translation to ata */
-	orig_bufflen = scsi_bufflen(srb);
-	sendToTransport = isd200_scsi_to_ata(srb, us, &ataCdb);
-
-	/* send the command to the transport layer */
-	if (sendToTransport)
-		isd200_invoke_transport(us, srb, &ataCdb);
-
-	isd200_srb_set_bufflen(srb, orig_bufflen);
-}
-
-static struct scsi_host_template isd200_host_template;
-
-static int isd200_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-
-	result = usb_stor_probe1(&us, intf, id,
-			(id - isd200_usb_ids) + isd200_unusual_dev_list,
-			&isd200_host_template);
-	if (result)
-		return result;
-
-	us->protocol_name = "ISD200 ATA/ATAPI";
-	us->proto_handler = isd200_ata_command;
-
-	result = usb_stor_probe2(us);
-	return result;
-}
-
-static struct usb_driver isd200_driver = {
-	.name =		DRV_NAME,
-	.probe =	isd200_probe,
-	.disconnect =	usb_stor_disconnect,
-	.suspend =	usb_stor_suspend,
-	.resume =	usb_stor_resume,
-	.reset_resume =	usb_stor_reset_resume,
-	.pre_reset =	usb_stor_pre_reset,
-	.post_reset =	usb_stor_post_reset,
-	.id_table =	isd200_usb_ids,
-	.soft_unbind =	1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(isd200_driver, isd200_host_template, DRV_NAME);
+#ifndef BIF_5_1_SH_MASK_H
+#define BIF_5_1_SH_MASK_H
+
+#define MM_INDEX__MM_OFFSET_MASK 0x7fffffff
+#define MM_INDEX__MM_OFFSET__SHIFT 0x0
+#define MM_INDEX__MM_APER_MASK 0x80000000
+#define MM_INDEX__MM_APER__SHIFT 0x1f
+#define MM_INDEX_HI__MM_OFFSET_HI_MASK 0xffffffff
+#define MM_INDEX_HI__MM_OFFSET_HI__SHIFT 0x0
+#define MM_DATA__MM_DATA_MASK 0xffffffff
+#define MM_DATA__MM_DATA__SHIFT 0x0
+#define BIF_MM_INDACCESS_CNTL__MM_INDACCESS_DIS_MASK 0x2
+#define BIF_MM_INDACCESS_CNTL__MM_INDACCESS_DIS__SHIFT 0x1
+#define BUS_CNTL__BIOS_ROM_WRT_EN_MASK 0x1
+#define BUS_CNTL__BIOS_ROM_WRT_EN__SHIFT 0x0
+#define BUS_CNTL__BIOS_ROM_DIS_MASK 0x2
+#define BUS_CNTL__BIOS_ROM_DIS__SHIFT 0x1
+#define BUS_CNTL__PMI_IO_DIS_MASK 0x4
+#define BUS_CNTL__PMI_IO_DIS__SHIFT 0x2
+#define BUS_CNTL__PMI_MEM_DIS_MASK 0x8
+#define BUS_CNTL__PMI_MEM_DIS__SHIFT 0x3
+#define BUS_CNTL__PMI_BM_DIS_MASK 0x10
+#define BUS_CNTL__PMI_BM_DIS__SHIFT 0x4
+#define BUS_CNTL__PMI_INT_DIS_MASK 0x20
+#define BUS_CNTL__PMI_INT_DIS__SHIFT 0x5
+#define BUS_CNTL__VGA_REG_COHERENCY_DIS_MASK 0x40
+#define BUS_CNTL__VGA_REG_COHERENCY_DIS__SHIFT 0x6
+#define BUS_CNTL__VGA_MEM_COHERENCY_DIS_MASK 0x80
+#define BUS_CNTL__VGA_MEM_COHERENCY_DIS__SHIFT 0x7
+#define BUS_CNTL__BIF_ERR_RTR_BKPRESSURE_EN_MASK 0x100
+#define BUS_CNTL__BIF_ERR_RTR_BKPRESSURE_EN__SHIFT 0x8
+#define BUS_CNTL__SET_AZ_TC_MASK 0x1c00
+#define BUS_CNTL__SET_AZ_TC__SHIFT 0xa
+#define BUS_CNTL__SET_MC_TC_MASK 0xe000
+#define BUS_CNTL__SET_MC_TC__SHIFT 0xd
+#define BUS_CNTL__ZERO_BE_WR_EN_MASK 0x10000
+#define BUS_CNTL__ZERO_BE_WR_EN__SHIFT 0x10
+#define BUS_CNTL__ZERO_BE_RD_EN_MASK 0x20000
+#define BUS_CNTL__ZERO_BE_RD_EN__SHIFT 0x11
+#define BUS_CNTL__RD_STALL_IO_WR_MASK 0x40000
+#define BUS_CNTL__RD_STALL_IO_WR__SHIFT 0x12
+#define CONFIG_CNTL__CFG_VGA_RAM_EN_MASK 0x1
+#define CONFIG_CNTL__CFG_VGA_RAM_EN__SHIFT 0x0
+#define CONFIG_CNTL__VGA_DIS_MASK 0x2
+#define CONFIG_CNTL__VGA_DIS__SHIFT 0x1
+#define CONFIG_CNTL__GENMO_MONO_ADDRESS_B_MASK 0x4
+#define CONFIG_CNTL__GENMO_MONO_ADDRESS_B__SHIFT 0x2
+#define CONFIG_CNTL__GRPH_ADRSEL_MASK 0x18
+#define CONFIG_CNTL__GRPH_ADRSEL__SHIFT 0x3
+#define CONFIG_MEMSIZE__CONFIG_MEMSIZE_MASK 0xffffffff
+#define CONFIG_MEMSIZE__CONFIG_MEMSIZE__SHIFT 0x0
+#define CONFIG_F0_BASE__F0_BASE_MASK 0xffffffff
+#define CONFIG_F0_BASE__F0_BASE__SHIFT 0x0
+#define CONFIG_APER_SIZE__APER_SIZE_MASK 0xffffffff
+#define CONFIG_APER_SIZE__APER_SIZE__SHIFT 0x0
+#define CONFIG_REG_APER_SIZE__REG_APER_SIZE_MASK 0xfffff
+#define CONFIG_REG_APER_SIZE__REG_APER_SIZE__SHIFT 0x0
+#define BIF_SCRATCH0__BIF_SCRATCH0_MASK 0xffffffff
+#define BIF_SCRATCH0__BIF_SCRATCH0__SHIFT 0x0
+#define BIF_SCRATCH1__BIF_SCRATCH1_MASK 0xffffffff
+#define BIF_SCRATCH1__BIF_SCRATCH1__SHIFT 0x0
+#define BX_RESET_EN__COR_RESET_EN_MASK 0x1
+#define BX_RESET_EN__COR_RESET_EN__SHIFT 0x0
+#define BX_RESET_EN__REG_RESET_EN_MASK 0x2
+#define BX_RESET_EN__REG_RESET_EN__SHIFT 0x1
+#define BX_RESET_EN__STY_RESET_EN_MASK 0x4
+#define BX_RESET_EN__STY_RESET_EN__SHIFT 0x2
+#define MM_CFGREGS_CNTL__MM_CFG_FUNC_SEL_MASK 0x7
+#define MM_CFGREGS_CNTL__MM_CFG_FUNC_SEL__SHIFT 0x0
+#define MM_CFGREGS_CNTL__MM_WR_TO_CFG_EN_MASK 0x8
+#define MM_CFGREGS_CNTL__MM_WR_TO_CFG_EN__SHIFT 0x3
+#define HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define HW_DEBUG__HW_12_DEBUG_MASK 0x1000
+#define HW_DEBUG__HW_12_DEBUG__SHIFT 0xc
+#define HW_DEBUG__HW_13_DEBUG_MASK 0x2000
+#define HW_DEBUG__HW_13_DEBUG__SHIFT 0xd
+#define HW_DEBUG__HW_14_DEBUG_MASK 0x4000
+#define HW_DEBUG__HW_14_DEBUG__SHIFT 0xe
+#define HW_DEBUG__HW_15_DEBUG_MASK 0x8000
+#define HW_DEBUG__HW_15_DEBUG__SHIFT 0xf
+#define HW_DEBUG__HW_16_DEBUG_MASK 0x10000
+#define HW_DEBUG__HW_16_DEBUG__SHIFT 0x10
+#define HW_DEBUG__HW_17_DEBUG_MASK 0x20000
+#define HW_DEBUG__HW_17_DEBUG__SHIFT 0x11
+#define HW_DEBUG__HW_18_DEBUG_MASK 0x40000
+#define HW_DEBUG__HW_18_DEBUG__SHIFT 0x12
+#define HW_DEBUG__HW_19_DEBUG_MASK 0x80000
+#define HW_DEBUG__HW_19_DEBUG__SHIFT 0x13
+#define HW_DEBUG__HW_20_DEBUG_MASK 0x100000
+#define HW_DEBUG__HW_20_DEBUG__SHIFT 0x14
+#define HW_DEBUG__HW_21_DEBUG_MASK 0x200000
+#define HW_DEBUG__HW_21_DEBUG__SHIFT 0x15
+#define HW_DEBUG__HW_22_DEBUG_MASK 0x400000
+#define HW_DEBUG__HW_22_DEBUG__SHIFT 0x16
+#define HW_DEBUG__HW_23_DEBUG_MASK 0x800000
+#define HW_DEBUG__HW_23_DEBUG__SHIFT 0x17
+#define HW_DEBUG__HW_24_DEBUG_MASK 0x1000000
+#define HW_DEBUG__HW_24_DEBUG__SHIFT 0x18
+#define HW_DEBUG__HW_25_DEBUG_MASK 0x2000000
+#define HW_DEBUG__HW_25_DEBUG__SHIFT 0x19
+#define HW_DEBUG__HW_26_DEBUG_MASK 0x4000000
+#define HW_DEBUG__HW_26_DEBUG__SHIFT 0x1a
+#define HW_DEBUG__HW_27_DEBUG_MASK 0x8000000
+#define HW_DEBUG__HW_27_DEBUG__SHIFT 0x1b
+#define HW_DEBUG__HW_28_DEBUG_MASK 0x10000000
+#define HW_DEBUG__HW_28_DEBUG__SHIFT 0x1c
+#define HW_DEBUG__HW_29_DEBUG_MASK 0x20000000
+#define HW_DEBUG__HW_29_DEBUG__SHIFT 0x1d
+#define HW_DEBUG__HW_30_DEBUG_MASK 0x40000000
+#define HW_DEBUG__HW_30_DEBUG__SHIFT 0x1e
+#define HW_DEBUG__HW_31_DEBUG_MASK 0x80000000
+#define HW_DEBUG__HW_31_DEBUG__SHIFT 0x1f
+#define MASTER_CREDIT_CNTL__BIF_MC_RDRET_CREDIT_MASK 0x7f
+#define MASTER_CREDIT_CNTL__BIF_MC_RDRET_CREDIT__SHIFT 0x0
+#define MASTER_CREDIT_CNTL__BIF_AZ_RDRET_CREDIT_MASK 0x3f0000
+#define MASTER_CREDIT_CNTL__BIF_AZ_RDRET_CREDIT__SHIFT 0x10
+#define SLAVE_REQ_CREDIT_CNTL__BIF_SRBM_REQ_CREDIT_MASK 0x1f
+#define SLAVE_REQ_CREDIT_CNTL__BIF_SRBM_REQ_CREDIT__SHIFT 0x0
+#define SLAVE_REQ_CREDIT_CNTL__BIF_VGA_REQ_CREDIT_MASK 0x1e0
+#define SLAVE_REQ_CREDIT_CNTL__BIF_VGA_REQ_CREDIT__SHIFT 0x5
+#define SLAVE_REQ_CREDIT_CNTL__BIF_HDP_REQ_CREDIT_MASK 0x7c00
+#define SLAVE_REQ_CREDIT_CNTL__BIF_HDP_REQ_CREDIT__SHIFT 0xa
+#define SLAVE_REQ_CREDIT_CNTL__BIF_ROM_REQ_CREDIT_MASK 0x8000
+#define SLAVE_REQ_CREDIT_CNTL__BIF_ROM_REQ_CREDIT__SHIFT 0xf
+#define SLAVE_REQ_CREDIT_CNTL__BIF_AZ_REQ_CREDIT_MASK 0x100000
+#define SLAVE_REQ_CREDIT_CNTL__BIF_AZ_REQ_CREDIT__SHIFT 0x14
+#define SLAVE_REQ_CREDIT_CNTL__BIF_XDMA_REQ_CREDIT_MASK 0x7e000000
+#define SLAVE_REQ_CREDIT_CNTL__BIF_XDMA_REQ_CREDIT__SHIFT 0x19
+#define BX_RESET_CNTL__LINK_TRAIN_EN_MASK 0x1
+#define BX_RESET_CNTL__LINK_TRAIN_EN__SHIFT 0x0
+#define INTERRUPT_CNTL__IH_DUMMY_RD_OVERRIDE_MASK 0x1
+#define INTERRUPT_CNTL__IH_DUMMY_RD_OVERRIDE__SHIFT 0x0
+#define INTERRUPT_CNTL__IH_DUMMY_RD_EN_MASK 0x2
+#define INTERRUPT_CNTL__IH_DUMMY_RD_EN__SHIFT 0x1
+#define INTERRUPT_CNTL__IH_REQ_NONSNOOP_EN_MASK 0x8
+#define INTERRUPT_CNTL__IH_REQ_NONSNOOP_EN__SHIFT 0x3
+#define INTERRUPT_CNTL__IH_INTR_DLY_CNTR_MASK 0xf0
+#define INTERRUPT_CNTL__IH_INTR_DLY_CNTR__SHIFT 0x4
+#define INTERRUPT_CNTL__GEN_IH_INT_EN_MASK 0x100
+#define INTERRUPT_CNTL__GEN_IH_INT_EN__SHIFT 0x8
+#define INTERRUPT_CNTL__GEN_GPIO_INT_EN_MASK 0x1e00
+#define INTERRUPT_CNTL__GEN_GPIO_INT_EN__SHIFT 0x9
+#define INTERRUPT_CNTL__SELECT_INT_GPIO_OUTPUT_MASK 0x6000
+#define INTERRUPT_CNTL__SELECT_INT_GPIO_OUTPUT__SHIFT 0xd
+#define INTERRUPT_CNTL__BIF_RB_REQ_NONSNOOP_EN_MASK 0x8000
+#define INTERRUPT_CNTL__BIF_RB_REQ_NONSNOOP_EN__SHIFT 0xf
+#define INTERRUPT_CNTL2__IH_DUMMY_RD_ADDR_MASK 0xffffffff
+#define INTERRUPT_CNTL2__IH_DUMMY_RD_ADDR__SHIFT 0x0
+#define BIF_DEBUG_CNTL__DEBUG_EN_MASK 0x1
+#define BIF_DEBUG_CNTL__DEBUG_EN__SHIFT 0x0
+#define BIF_DEBUG_CNTL__DEBUG_MULTIBLOCKEN_MASK 0x2
+#define BIF_DEBUG_CNTL__DEBUG_MULTIBLOCKEN__SHIFT 0x1
+#define BIF_DEBUG_CNTL__DEBUG_OUT_EN_MASK 0x4
+#define BIF_DEBUG_CNTL__DEBUG_OUT_EN__SHIFT 0x2
+#define BIF_DEBUG_CNTL__DEBUG_PAD_SEL_MASK 0x8
+#define BIF_DEBUG_CNTL__DEBUG_PAD_SEL__SHIFT 0x3
+#define BIF_DEBUG_CNTL__DEBUG_BYTESEL_BLK1_MASK 0x10
+#define BIF_DEBUG_CNTL__DEBUG_BYTESEL_BLK1__SHIFT 0x4
+#define BIF_DEBUG_CNTL__DEBUG_BYTESEL_BLK2_MASK 0x20
+#define BIF_DEBUG_CNTL__DEBUG_BYTESEL_BLK2__SHIFT 0x5
+#define BIF_DEBUG_CNTL__DEBUG_SYNC_EN_MASK 0x40
+#define BIF_DEBUG_CNTL__DEBUG_SYNC_EN__SHIFT 0x6
+#define BIF_DEBUG_CNTL__DEBUG_SWAP_MASK 0x80
+#define BIF_DEBUG_CNTL__DEBUG_SWAP__SHIFT 0x7
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_BLK1_MASK 0x1f00
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_BLK1__SHIFT 0x8
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_BLK2_MASK 0x1f0000
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_BLK2__SHIFT 0x10
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_XSP_MASK 0x1000000
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_XSP__SHIFT 0x18
+#define BIF_DEBUG_CNTL__DEBUG_SYNC_CLKSEL_MASK 0xc0000000
+#define BIF_DEBUG_CNTL__DEBUG_SYNC_CLKSEL__SHIFT 0x1e
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK1_MASK 0x3f
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK1__SHIFT 0x0
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK2_MASK 0x3f00
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK2__SHIFT 0x8
+#define BIF_DEBUG_OUT__DEBUG_OUTPUT_MASK 0x1ffff
+#define BIF_DEBUG_OUT__DEBUG_OUTPUT__SHIFT 0x0
+#define HDP_REG_COHERENCY_FLUSH_CNTL__HDP_REG_FLUSH_ADDR_MASK 0x1
+#define HDP_REG_COHERENCY_FLUSH_CNTL__HDP_REG_FLUSH_ADDR__SHIFT 0x0
+#define HDP_MEM_COHERENCY_FLUSH_CNTL__HDP_MEM_FLUSH_ADDR_MASK 0x1
+#define HDP_MEM_COHERENCY_FLUSH_CNTL__HDP_MEM_FLUSH_ADDR__SHIFT 0x0
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_A_MASK 0x1
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_A__SHIFT 0x0
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SEL_MASK 0x2
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SEL__SHIFT 0x1
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_MODE_MASK 0x4
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_MODE__SHIFT 0x2
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SPARE_MASK 0x18
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SPARE__SHIFT 0x3
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN0_MASK 0x20
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN0__SHIFT 0x5
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN1_MASK 0x40
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN1__SHIFT 0x6
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN2_MASK 0x80
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN2__SHIFT 0x7
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN3_MASK 0x100
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SN3__SHIFT 0x8
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SLEWN_MASK 0x200
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SLEWN__SHIFT 0x9
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_WAKE_MASK 0x400
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_WAKE__SHIFT 0xa
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SCHMEN_MASK 0x800
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SCHMEN__SHIFT 0xb
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_CNTL_EN_MASK 0x1000
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_CNTL_EN__SHIFT 0xc
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_A_MASK 0x1
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_A__SHIFT 0x0
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SEL_MASK 0x2
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SEL__SHIFT 0x1
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_MODE_MASK 0x4
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_MODE__SHIFT 0x2
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SPARE_MASK 0x18
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SPARE__SHIFT 0x3
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SN0_MASK 0x20
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SN0__SHIFT 0x5
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SN1_MASK 0x40
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SN1__SHIFT 0x6
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SN2_MASK 0x80
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SN2__SHIFT 0x7
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SN3_MASK 0x100
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SN3__SHIFT 0x8
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SLEWN_MASK 0x200
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SLEWN__SHIFT 0x9
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_WAKE_MASK 0x400
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_WAKE__SHIFT 0xa
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SCHMEN_MASK 0x800
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_SCHMEN__SHIFT 0xb
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_CNTL_EN_MASK 0x1000
+#define SMBDAT_PAD_CNTL__SMBDAT_PAD_CNTL_EN__SHIFT 0xc
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_A_MASK 0x1
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_A__SHIFT 0x0
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SEL_MASK 0x2
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SEL__SHIFT 0x1
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_MODE_MASK 0x4
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_MODE__SHIFT 0x2
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SPARE_MASK 0x18
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SPARE__SHIFT 0x3
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SN0_MASK 0x20
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SN0__SHIFT 0x5
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SN1_MASK 0x40
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SN1__SHIFT 0x6
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SN2_MASK 0x80
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SN2__SHIFT 0x7
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SN3_MASK 0x100
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SN3__SHIFT 0x8
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SLEWN_MASK 0x200
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SLEWN__SHIFT 0x9
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_WAKE_MASK 0x400
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_WAKE__SHIFT 0xa
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SCHMEN_MASK 0x800
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_SCHMEN__SHIFT 0xb
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_CNTL_EN_MASK 0x1000
+#define SMBCLK_PAD_CNTL__SMBCLK_PAD_CNTL_EN__SHIFT 0xc
+#define BIF_XDMA_LO__BIF_XDMA_LOWER_BOUND_MASK 0x1fffffff
+#define BIF_XDMA_LO__BIF_XDMA_LOWER_BOUND__SHIFT 0x0
+#define BIF_XDMA_LO__BIF_XDMA_APER_EN_MASK 0x80000000
+#define BIF_XDMA_LO__BIF_XDMA_APER_EN__SHIFT 0x1f
+#define BIF_XDMA_HI__BIF_XDMA_UPPER_BOUND_MASK 0x1fffffff
+#define BIF_XDMA_HI__BIF_XDMA_UPPER_BOUND__SHIFT 0x0
+#define BIF_FEATURES_CONTROL_MISC__MST_BIF_REQ_EP_DIS_MASK 0x1
+#define BIF_FEATURES_CONTROL_MISC__MST_BIF_REQ_EP_DIS__SHIFT 0x0
+#define BIF_FEATURES_CONTROL_MISC__SLV_BIF_CPL_EP_DIS_MASK 0x2
+#define BIF_FEATURES_CONTROL_MISC__SLV_BIF_CPL_EP_DIS__SHIFT 0x1
+#define BIF_FEATURES_CONTROL_MISC__BIF_SLV_REQ_EP_DIS_MASK 0x4
+#define BIF_FEATURES_CONTROL_MISC__BIF_SLV_REQ_EP_DIS__SHIFT 0x2
+#define BIF_FEATURES_CONTROL_MISC__BIF_MST_CPL_EP_DIS_MASK 0x8
+#define BIF_FEATURES_CONTROL_MISC__BIF_MST_CPL_EP_DIS__SHIFT 0x3
+#define BIF_FEATURES_CONTROL_MISC__UR_PSN_PKT_REPORT_POISON_DIS_MASK 0x10
+#define BIF_FEATURES_CONTROL_MISC__UR_PSN_PKT_REPORT_POISON_DIS__SHIFT 0x4
+#define BIF_FEATURES_CONTROL_MISC__POST_PSN_ONLY_PKT_REPORT_UR_ALL_DIS_MASK 0x20
+#define BIF_FEATURES_CONTROL_MISC__POST_PSN_ONLY_PKT_REPORT_UR_ALL_DIS__SHIFT 0x5
+#define BIF_FEATURES_CONTROL_MISC__POST_PSN_ONLY_PKT_REPORT_UR_PART_DIS_MASK 0x40
+#define BIF_FEATURES_CONTROL_MISC__POST_PSN_ONLY_PKT_REPORT_UR_PART_DIS__SHIFT 0x6
+#define BIF_FEATURES_CONTROL_MISC__PLL_SWITCH_IMPCTL_CAL_DONE_DIS_MASK 0x80
+#define BIF_FEATURES_CONTROL_MISC__PLL_SWITCH_IMPCTL_CAL_DONE_DIS__SHIFT 0x7
+#define BIF_FEATURES_CONTROL_MISC__IGNORE_BE_CHECK_GASKET_COMB_DIS_MASK 0x100
+#define BIF_FEATURES_CONTROL_MISC__IGNORE_BE_CHECK_GASKET_COMB_DIS__SHIFT 0x8
+#define BIF_FEATURES_CONTROL_MISC__MC_BIF_REQ_ID_ROUTING_DIS_MASK 0x200
+#define BIF_FEATURES_CONTROL_MISC__MC_BIF_REQ_ID_ROUTING_DIS__SHIFT 0x9
+#define BIF_FEATURES_CONTROL_MISC__AZ_BIF_REQ_ID_ROUTING_DIS_MASK 0x400
+#define BIF_FEATURES_CONTROL_MISC__AZ_BIF_REQ_ID_ROUTING_DIS__SHIFT 0xa
+#define BIF_FEATURES_CONTROL_MISC__ATC_PRG_RESP_PASID_UR_EN_MASK 0x800
+#define BIF_FEATURES_CONTROL_MISC__ATC_PRG_RESP_PASID_UR_EN__SHIFT 0xb
+#define BIF_FEATURES_CONTROL_MISC__BIF_RB_SET_OVERFLOW_EN_MASK 0x1000
+#define BIF_FEATURES_CONTROL_MISC__BIF_RB_SET_OVERFLOW_EN__SHIFT 0xc
+#define BIF_DOORBELL_CNTL__SELF_RING_DIS_MASK 0x1
+#define BIF_DOORBELL_CNTL__SELF_RING_DIS__SHIFT 0x0
+#define BIF_DOORBELL_CNTL__TRANS_CHECK_DIS_MASK 0x2
+#define BIF_DOORBELL_CNTL__TRANS_CHECK_DIS__SHIFT 0x1
+#define BIF_DOORBELL_CNTL__UNTRANS_LBACK_EN_MASK 0x4
+#define BIF_DOORBELL_CNTL__UNTRANS_LBACK_EN__SHIFT 0x2
+#define BIF_DOORBELL_CNTL__NON_CONSECUTIVE_BE_ZERO_DIS_MASK 0x8
+#define BIF_DOORBELL_CNTL__NON_CONSECUTIVE_BE_ZERO_DIS__SHIFT 0x3
+#define BIF_DOORBELL_CNTL__DOORBELL_MONITOR_EN_MASK 0x10
+#define BIF_DOORBELL_CNTL__DOORBELL_MONITOR_EN__SHIFT 0x4
+#define BIF_DOORBELL_CNTL__DOORBELL_INTERRUPT_STATUS_MASK 0x20
+#define BIF_DOORBELL_CNTL__DOORBELL_INTERRUPT_STATUS__SHIFT 0x5
+#define BIF_DOORBELL_CNTL__DOORBELL_INTERRUPT_CLEAR_MASK 0x10000
+#define BIF_DOORBELL_CNTL__DOORBELL_INTERRUPT_CLEAR__SHIFT 0x10
+#define BIF_SLVARB_MODE__SLVARB_MODE_MASK 0x3
+#define BIF_SLVARB_MODE__SLVARB_MODE__SHIFT 0x0
+#define BIF_FB_EN__FB_READ_EN_MASK 0x1
+#define BIF_FB_EN__FB_READ_EN__SHIFT 0x0
+#define BIF_FB_EN__FB_WRITE_EN_MASK 0x2
+#define BIF_FB_EN__FB_WRITE_EN__SHIFT 0x1
+#define BIF_BUSNUM_CNTL1__ID_MASK_MASK 0xff
+#define BIF_BUSNUM_CNTL1__ID_MASK__SHIFT 0x0
+#define BIF_BUSNUM_LIST0__ID0_MASK 0xff
+#define BIF_BUSNUM_LIST0__ID0__SHIFT 0x0
+#define BIF_BUSNUM_LIST0__ID1_MASK 0xff00
+#define BIF_BUSNUM_LIST0__ID1__SHIFT 0x8
+#define BIF_BUSNUM_LIST0__ID2_MASK 0xff0000
+#define BIF_BUSNUM_LIST0__ID2__SHIFT 0x10
+#define BIF_BUSNUM_LIST0__ID3_MASK 0xff000000
+#define BIF_BUSNUM_LIST0__ID3__SHIFT 0x18
+#define BIF_BUSNUM_LIST1__ID4_MASK 0xff
+#define BIF_BUSNUM_LIST1__ID4__SHIFT 0x0
+#define BIF_BUSNUM_LIST1__ID5_MASK 0xff00
+#define BIF_BUSNUM_LIST1__ID5__SHIFT 0x8
+#define BIF_BUSNUM_LIST1__ID6_MASK 0xff0000
+#define BIF_BUSNUM_LIST1__ID6__SHIFT 0x10
+#define BIF_BUSNUM_LIST1__ID7_MASK 0xff000000
+#define BIF_BUSNUM_LIST1__ID7__SHIFT 0x18
+#define BIF_BUSNUM_CNTL2__AUTOUPDATE_SEL_MASK 0xff
+#define BIF_BUSNUM_CNTL2__AUTOUPDATE_SEL__SHIFT 0x0
+#define BIF_BUSNUM_CNTL2__AUTOUPDATE_EN_MASK 0x100
+#define BIF_BUSNUM_CNTL2__AUTOUPDATE_EN__SHIFT 0x8
+#define BIF_BUSNUM_CNTL2__HDPREG_CNTL_MASK 0x10000
+#define BIF_BUSNUM_CNTL2__HDPREG_CNTL__SHIFT 0x10
+#define BIF_BUSNUM_CNTL2__ERROR_MULTIPLE_ID_MATCH_MASK 0x20000
+#define BIF_BUSNUM_CNTL2__ERROR_MULTIPLE_ID_MATCH__SHIFT 0x11
+#define BIF_BUSY_DELAY_CNTR__DELAY_CNT_MASK 0x3f
+#define BIF_BUSY_DELAY_CNTR__DELAY_CNT__SHIFT 0x0
+#define BIF_PERFMON_CNTL__PERFCOUNTER_EN_MASK 0x1
+#define BIF_PERFMON_CNTL__PERFCOUNTER_EN__SHIFT 0x0
+#define BIF_PERFMON_CNTL__PERFCOUNTER_RESET0_MASK 0x2
+#define BIF_PERFMON_CNTL__PERFCOUNTER_RESET0__SHIFT 0x1
+#define BIF_PERFMON_CNTL__PERFCOUNTER_RESET1_MASK 0x4
+#define BIF_PERFMON_CNTL__PERFCOUNTER_RESET1__SHIFT 0x2
+#define BIF_PERFMON_CNTL__PERF_SEL0_MASK 0x1f00
+#define BIF_PERFMON_CNTL__PERF_SEL0__SHIFT 0x8
+#define BIF_PERFMON_CNTL__PERF_SEL1_MASK 0x3e000
+#define BIF_PERFMON_CNTL__PERF_SEL1__SHIFT 0xd
+#define BIF_PERFCOUNTER0_RESULT__PERFCOUNTER_RESULT_MASK 0xffffffff
+#define BIF_PERFCOUNTER0_RESULT__PERFCOUNTER_RESULT__SHIFT 0x0
+#define BIF_PERFCOUNTER1_RESULT__PERFCOUNTER_RESULT_MASK 0xffffffff
+#define BIF_PERFCOUNTER1_RESULT__PERFCOUNTER_RESULT__SHIFT 0x0
+#define SLAVE_HANG_PROTECTION_CNTL__HANG_PROTECTION_TIMER_SEL_MASK 0xe
+#define SLAVE_HANG_PROTECTION_CNTL__HANG_PROTECTION_TIMER_SEL__SHIFT 0x1
+#define GPU_HDP_FLUSH_REQ__CP0_MASK 0x1
+#define GPU_HDP_FLUSH_REQ__CP0__SHIFT 0x0
+#define GPU_HDP_FLUSH_REQ__CP1_MASK 0x2
+#define GPU_HDP_FLUSH_REQ__CP1__SHIFT 0x1
+#define GPU_HDP_FLUSH_REQ__CP2_MASK 0x4
+#define GPU_HDP_FLUSH_REQ__CP2__SHIFT 0x2
+#define GPU_HDP_FLUSH_REQ__CP3_MASK 0x8
+#define GPU_HDP_FLUSH_REQ__CP3__SHIFT 0x3
+#define GPU_HDP_FLUSH_REQ__CP4_MASK 0x10
+#define GPU_HDP_FLUSH_REQ__CP4__SHIFT 0x4
+#define GPU_HDP_FLUSH_REQ__CP5_MASK 0x20
+#define GPU_HDP_FLUSH_REQ__CP5__SHIFT 0x5
+#define GPU_HDP_FLUSH_REQ__CP6_MASK 0x40
+#define GPU_HDP_FLUSH_REQ__CP6__SHIFT 0x6
+#define GPU_HDP_FLUSH_REQ__CP7_MASK 0x80
+#define GPU_HDP_FLUSH_REQ__CP7__SHIFT 0x7
+#define GPU_HDP_FLUSH_REQ__CP8_MASK 0x100
+#define GPU_HDP_FLUSH_REQ__CP8__SHIFT 0x8
+#define GPU_HDP_FLUSH_REQ__CP9_MASK 0x200
+#define GPU_HDP_FLUSH_REQ__CP9__SHIFT 0x9
+#define GPU_HDP_FLUSH_REQ__SDMA0_MASK 0x400
+#define GPU_HDP_FLUSH_REQ__SDMA0__SHIFT 0xa
+#define GPU_HDP_FLUSH_REQ__SDMA1_MASK 0x800
+#define GPU_HDP_FLUSH_REQ__SDMA1__SHIFT 0xb
+#define GPU_HDP_FLUSH_DONE__CP0_MASK 0x1
+#define GPU_HDP_FLUSH_DONE__CP0__SHIFT 0x0
+#define GPU_HDP_FLUSH_DONE__CP1_MASK 0x2
+#define GPU_HDP_FLUSH_DONE__CP1__SHIFT 0x1
+#define GPU_HDP_FLUSH_DONE__CP2_MASK 0x4
+#define GPU_HDP_FLUSH_DONE__CP2__SHIFT 0x2
+#define GPU_HDP_FLUSH_DONE__CP3_MASK 0x8
+#define GPU_HDP_FLUSH_DONE__CP3__SHIFT 0x3
+#define GPU_HDP_FLUSH_DONE__CP4_MASK 0x10
+#define GPU_HDP_FLUSH_DONE__CP4__SHIFT 0x4
+#define GPU_HDP_FLUSH_DONE__CP5_MASK 0x20
+#define GPU_HDP_FLUSH_DONE__CP5__SHIFT 0x5
+#define GPU_HDP_FLUSH_DONE__CP6_MASK 0x40
+#define GPU_HDP_FLUSH_DONE__CP6__SHIFT 0x6
+#define GPU_HDP_FLUSH_DONE__CP7_MASK 0x80
+#define GPU_HDP_FLUSH_DONE__CP7__SHIFT 0x7
+#define GPU_HDP_FLUSH_DONE__CP8_MASK 0x100
+#define GPU_HDP_FLUSH_DONE__CP8__SHIFT 0x8
+#define GPU_HDP_FLUSH_DONE__CP9_MASK 0x200
+#define GPU_HDP_FLUSH_DONE__CP9__SHIFT 0x9
+#define GPU_HDP_FLUSH_DONE__SDMA0_MASK 0x400
+#define GPU_HDP_FLUSH_DONE__SDMA0__SHIFT 0xa
+#define GPU_HDP_FLUSH_DONE__SDMA1_MASK 0x800
+#define GPU_HDP_FLUSH_DONE__SDMA1__SHIFT 0xb
+#define SLAVE_HANG_ERROR__SRBM_HANG_ERROR_MASK 0x1
+#define SLAVE_HANG_ERROR__SRBM_HANG_ERROR__SHIFT 0x0
+#define SLAVE_HANG_ERROR__HDP_HANG_ERROR_MASK 0x2
+#define SLAVE_HANG_ERROR__HDP_HANG_ERROR__SHIFT 0x1
+#define SLAVE_HANG_ERROR__VGA_HANG_ERROR_MASK 0x4
+#define SLAVE_HANG_ERROR__VGA_HANG_ERROR__SHIFT 0x2
+#define SLAVE_HANG_ERROR__ROM_HANG_ERROR_MASK 0x8
+#define SLAVE_HANG_ERROR__ROM_HANG_ERROR__SHIFT 0x3
+#define SLAVE_HANG_ERROR__AUDIO_HANG_ERROR_MASK 0x10
+#define SLAVE_HANG_ERROR__AUDIO_HANG_ERROR__SHIFT 0x4
+#define SLAVE_HANG_ERROR__CEC_HANG_ERROR_MASK 0x20
+#define SLAVE_HANG_ERROR__CEC_HANG_ERROR__SHIFT 0x5
+#define SLAVE_HANG_ERROR__XDMA_HANG_ERROR_MASK 0x80
+#define SLAVE_HANG_ERROR__XDMA_HANG_ERROR__SHIFT 0x7
+#define SLAVE_HANG_ERROR__DOORBELL_HANG_ERROR_MASK 0x100
+#define SLAVE_HANG_ERROR__DOORBELL_HANG_ERROR__SHIFT 0x8
+#define SLAVE_HANG_ERROR__GARLIC_HANG_ERROR_MASK 0x200
+#define SLAVE_HANG_ERROR__GARLIC_HANG_ERROR__SHIFT 0x9
+#define CAPTURE_HOST_BUSNUM__CHECK_EN_MASK 0x1
+#define CAPTURE_HOST_BUSNUM__CHECK_EN__SHIFT 0x0
+#define HOST_BUSNUM__HOST_ID_MASK 0xffff
+#define HOST_BUSNUM__HOST_ID__SHIFT 0x0
+#define PEER_REG_RANGE0__START_ADDR_MASK 0xffff
+#define PEER_REG_RANGE0__START_ADDR__SHIFT 0x0
+#define PEER_REG_RANGE0__END_ADDR_MASK 0xffff0000
+#define PEER_REG_RANGE0__END_ADDR__SHIFT 0x10
+#define PEER_REG_RANGE1__START_ADDR_MASK 0xffff
+#define PEER_REG_RANGE1__START_ADDR__SHIFT 0x0
+#define PEER_REG_RANGE1__END_ADDR_MASK 0xffff0000
+#define PEER_REG_RANGE1__END_ADDR__SHIFT 0x10
+#define PEER0_FB_OFFSET_HI__PEER0_FB_OFFSET_HI_MASK 0xfffff
+#define PEER0_FB_OFFSET_HI__PEER0_FB_OFFSET_HI__SHIFT 0x0
+#define PEER0_FB_OFFSET_LO__PEER0_FB_OFFSET_LO_MASK 0xfffff
+#define PEER0_FB_OFFSET_LO__PEER0_FB_OFFSET_LO__SHIFT 0x0
+#define PEER0_FB_OFFSET_LO__PEER0_FB_EN_MASK 0x80000000
+#define PEER0_FB_OFFSET_LO__PEER0_FB_EN__SHIFT 0x1f
+#define PEER1_FB_OFFSET_HI__PEER1_FB_OFFSET_HI_MASK 0xfffff
+#define PEER1_FB_OFFSET_HI__PEER1_FB_OFFSET_HI__SHIFT 0x0
+#define PEER1_FB_OFFSET_LO__PEER1_FB_OFFSET_LO_MASK 0xfffff
+#define PEER1_FB_OFFSET_LO__PEER1_FB_OFFSET_LO__SHIFT 0x0
+#define PEER1_FB_OFFSET_LO__PEER1_FB_EN_MASK 0x80000000
+#define PEER1_FB_OFFSET_LO__PEER1_FB_EN__SHIFT 0x1f
+#define PEER2_FB_OFFSET_HI__PEER2_FB_OFFSET_HI_MASK 0xfffff
+#define PEER2_FB_OFFSET_HI__PEER2_FB_OFFSET_HI__SHIFT 0x0
+#define PEER2_FB_OFFSET_LO__PEER2_FB_OFFSET_LO_MASK 0xfffff
+#define PEER2_FB_OFFSET_LO__PEER2_FB_OFFSET_LO__SHIFT 0x0
+#define PEER2_FB_OFFSET_LO__PEER2_FB_EN_MASK 0x80000000
+#define PEER2_FB_OFFSET_LO__PEER2_FB_EN__SHIFT 0x1f
+#define PEER3_FB_OFFSET_HI__PEER3_FB_OFFSET_HI_MASK 0xfffff
+#define PEER3_FB_OFFSET_HI__PEER3_FB_OFFSET_HI__SHIFT 0x0
+#define PEER3_FB_OFFSET_LO__PEER3_FB_OFFSET_LO_MASK 0xfffff
+#define PEER3_FB_OFFSET_LO__PEER3_FB_OFFSET_LO__SHIFT 0x0
+#define PEER3_FB_OFFSET_LO__PEER3_FB_EN_MASK 0x80000000
+#define PEER3_FB_OFFSET_LO__PEER3_FB_EN__SHIFT 0x1f
+#define DBG_BYPASS_SRBM_ACCESS__DBG_BYPASS_SRBM_ACCESS_EN_MASK 0x1
+#define DBG_BYPASS_SRBM_ACCESS__DBG_BYPASS_SRBM_ACCESS_EN__SHIFT 0x0
+#define DBG_BYPASS_SRBM_ACCESS__DBG_APER_AD_MASK 0x1e
+#define DBG_BYPASS_SRBM_ACCESS__DBG_APER_AD__SHIFT 0x1
+#define SMBUS_BACO_DUMMY__SMBUS_BACO_DUMMY_DATA_MASK 0xffffffff
+#define SMBUS_BACO_DUMMY__SMBUS_BACO_DUMMY_DATA__SHIFT 0x0
+#define BIF_DEVFUNCNUM_LIST0__DEVFUNC_ID0_MASK 0xff
+#define BIF_DEVFUNCNUM_LIST0__DEVFUNC_ID0__SHIFT 0x0
+#define BIF_DEVFUNCNUM_LIST0__DEVFUNC_ID1_MASK 0xff00
+#define BIF_DEVFUNCNUM_LIST0__DEVFUNC_ID1__SHIFT 0x8
+#define BIF_DEVFUNCNUM_LIST0__DEVFUNC_ID2_MASK 0xff0000
+#define BIF_DEVFUNCNUM_LIST0__DEVFUNC_ID2__SHIFT 0x10
+#define BIF_DEVFUNCNUM_LIST0__DEVFUNC_ID3_MASK 0xff000000
+#define BIF_DEVFUNCNUM_LIST0__DEVFUNC_ID3__SHIFT 0x18
+#define BIF_DEVFUNCNUM_LIST1__DEVFUNC_ID4_MASK 0xff
+#define BIF_DEV

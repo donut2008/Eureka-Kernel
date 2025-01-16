@@ -1,158 +1,131 @@
-/*
- *  atlas_btns.c - Atlas Wallmount Touchscreen ACPI Extras
- *
- *  Copyright (C) 2006 Jaya Kumar
- *  Based on Toshiba ACPI by John Belmonte and ASUS ACPI
- *  This work was sponsored by CIS(M) Sdn Bhd.
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- *
- */
-
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/input.h>
-#include <linux/types.h>
-#include <linux/acpi.h>
-#include <asm/uaccess.h>
-
-#define ACPI_ATLAS_NAME		"Atlas ACPI"
-#define ACPI_ATLAS_CLASS	"Atlas"
-
-static unsigned short atlas_keymap[16];
-static struct input_dev *input_dev;
-
-/* button handling code */
-static acpi_status acpi_atlas_button_setup(acpi_handle region_handle,
-		    u32 function, void *handler_context, void **return_context)
-{
-	*return_context =
-		(function != ACPI_REGION_DEACTIVATE) ? handler_context : NULL;
-
-	return AE_OK;
-}
-
-static acpi_status acpi_atlas_button_handler(u32 function,
-		      acpi_physical_address address,
-		      u32 bit_width, u64 *value,
-		      void *handler_context, void *region_context)
-{
-	acpi_status status;
-
-	if (function == ACPI_WRITE) {
-		int code = address & 0x0f;
-		int key_down = !(address & 0x10);
-
-		input_event(input_dev, EV_MSC, MSC_SCAN, code);
-		input_report_key(input_dev, atlas_keymap[code], key_down);
-		input_sync(input_dev);
-
-		status = AE_OK;
-	} else {
-		pr_warn("shrugged on unexpected function: function=%x,address=%lx,value=%x\n",
-			function, (unsigned long)address, (u32)*value);
-		status = AE_BAD_PARAMETER;
+eak;
+	case IB_PMA_PORT_RCV_PKTS:
+		ret = ppd->cong_stats.counter_cache.psrcvpkts;
+		break;
+	case IB_PMA_PORT_XMIT_WAIT:
+		ret = ppd->cong_stats.counter_cache.psxmitwait;
+		break;
+	default:
+		ret = 0;
 	}
 
-	return status;
+	return ret;
 }
 
-static int atlas_acpi_button_add(struct acpi_device *device)
+static int pma_get_portsamplesresult(struct ib_pma_mad *pmp,
+				     struct ib_device *ibdev, u8 port)
 {
-	acpi_status status;
+	struct ib_pma_portsamplesresult *p =
+		(struct ib_pma_portsamplesresult *)pmp->data;
+	struct qib_ibdev *dev = to_idev(ibdev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	unsigned long flags;
+	u8 status;
 	int i;
-	int err;
 
-	input_dev = input_allocate_device();
-	if (!input_dev) {
-		pr_err("unable to allocate input device\n");
-		return -ENOMEM;
+	memset(pmp->data, 0, sizeof(pmp->data));
+	spin_lock_irqsave(&ibp->lock, flags);
+	p->tag = cpu_to_be16(ibp->pma_tag);
+	if (ppd->cong_stats.flags == IB_PMA_CONG_HW_CONTROL_TIMER)
+		p->sample_status = IB_PMA_SAMPLE_STATUS_DONE;
+	else {
+		status = dd->f_portcntr(ppd, QIBPORTCNTR_PSSTAT);
+		p->sample_status = cpu_to_be16(status);
+		if (status == IB_PMA_SAMPLE_STATUS_DONE) {
+			cache_hw_sample_counters(ppd);
+			ppd->cong_stats.counter =
+				xmit_wait_get_value_delta(ppd);
+			dd->f_set_cntr_sample(ppd,
+					      QIB_CONG_TIMER_PSINTERVAL, 0);
+			ppd->cong_stats.flags = IB_PMA_CONG_HW_CONTROL_TIMER;
+		}
 	}
+	for (i = 0; i < ARRAY_SIZE(ibp->pma_counter_select); i++)
+		p->counter[i] = cpu_to_be32(
+			get_cache_hw_sample_counters(
+				ppd, ibp->pma_counter_select[i]));
+	spin_unlock_irqrestore(&ibp->lock, flags);
 
-	input_dev->name = "Atlas ACPI button driver";
-	input_dev->phys = "ASIM0000/atlas/input0";
-	input_dev->id.bustype = BUS_HOST;
-	input_dev->keycode = atlas_keymap;
-	input_dev->keycodesize = sizeof(unsigned short);
-	input_dev->keycodemax = ARRAY_SIZE(atlas_keymap);
-
-	input_set_capability(input_dev, EV_MSC, MSC_SCAN);
-	__set_bit(EV_KEY, input_dev->evbit);
-	for (i = 0; i < ARRAY_SIZE(atlas_keymap); i++) {
-		if (i < 9) {
-			atlas_keymap[i] = KEY_F1 + i;
-			__set_bit(KEY_F1 + i, input_dev->keybit);
-		} else
-			atlas_keymap[i] = KEY_RESERVED;
-	}
-
-	err = input_register_device(input_dev);
-	if (err) {
-		pr_err("couldn't register input device\n");
-		input_free_device(input_dev);
-		return err;
-	}
-
-	/* hookup button handler */
-	status = acpi_install_address_space_handler(device->handle,
-				0x81, &acpi_atlas_button_handler,
-				&acpi_atlas_button_setup, device);
-	if (ACPI_FAILURE(status)) {
-		pr_err("error installing addr spc handler\n");
-		input_unregister_device(input_dev);
-		err = -EINVAL;
-	}
-
-	return err;
+	return reply((struct ib_smp *) pmp);
 }
 
-static int atlas_acpi_button_remove(struct acpi_device *device)
+static int pma_get_portsamplesresult_ext(struct ib_pma_mad *pmp,
+					 struct ib_device *ibdev, u8 port)
 {
-	acpi_status status;
+	struct ib_pma_portsamplesresult_ext *p =
+		(struct ib_pma_portsamplesresult_ext *)pmp->data;
+	struct qib_ibdev *dev = to_idev(ibdev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	unsigned long flags;
+	u8 status;
+	int i;
 
-	status = acpi_remove_address_space_handler(device->handle,
-				0x81, &acpi_atlas_button_handler);
-	if (ACPI_FAILURE(status))
-		pr_err("error removing addr spc handler\n");
+	/* Port Sampling code owns the PS* HW counters */
+	memset(pmp->data, 0, sizeof(pmp->data));
+	spin_lock_irqsave(&ibp->lock, flags);
+	p->tag = cpu_to_be16(ibp->pma_tag);
+	if (ppd->cong_stats.flags == IB_PMA_CONG_HW_CONTROL_TIMER)
+		p->sample_status = IB_PMA_SAMPLE_STATUS_DONE;
+	else {
+		status = dd->f_portcntr(ppd, QIBPORTCNTR_PSSTAT);
+		p->sample_status = cpu_to_be16(status);
+		/* 64 bits */
+		p->extended_width = cpu_to_be32(0x80000000);
+		if (status == IB_PMA_SAMPLE_STATUS_DONE) {
+			cache_hw_sample_counters(ppd);
+			ppd->cong_stats.counter =
+				xmit_wait_get_value_delta(ppd);
+			dd->f_set_cntr_sample(ppd,
+					      QIB_CONG_TIMER_PSINTERVAL, 0);
+			ppd->cong_stats.flags = IB_PMA_CONG_HW_CONTROL_TIMER;
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(ibp->pma_counter_select); i++)
+		p->counter[i] = cpu_to_be64(
+			get_cache_hw_sample_counters(
+				ppd, ibp->pma_counter_select[i]));
+	spin_unlock_irqrestore(&ibp->lock, flags);
 
-	input_unregister_device(input_dev);
-
-	return 0;
+	return reply((struct ib_smp *) pmp);
 }
 
-static const struct acpi_device_id atlas_device_ids[] = {
-	{"ASIM0000", 0},
-	{"", 0},
-};
-MODULE_DEVICE_TABLE(acpi, atlas_device_ids);
+static int pma_get_portcounters(struct ib_pma_mad *pmp,
+				struct ib_device *ibdev, u8 port)
+{
+	struct ib_pma_portcounters *p = (struct ib_pma_portcounters *)
+		pmp->data;
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	struct qib_verbs_counters cntrs;
+	u8 port_select = p->port_select;
 
-static struct acpi_driver atlas_acpi_driver = {
-	.name	= ACPI_ATLAS_NAME,
-	.class	= ACPI_ATLAS_CLASS,
-	.owner	= THIS_MODULE,
-	.ids	= atlas_device_ids,
-	.ops	= {
-		.add	= atlas_acpi_button_add,
-		.remove	= atlas_acpi_button_remove,
-	},
-};
-module_acpi_driver(atlas_acpi_driver);
+	qib_get_counters(ppd, &cntrs);
 
-MODULE_AUTHOR("Jaya Kumar");
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Atlas button driver");
+	/* Adjust counters for any resets done. */
+	cntrs.symbol_error_counter -= ibp->z_symbol_error_counter;
+	cntrs.link_error_recovery_counter -=
+		ibp->z_link_error_recovery_counter;
+	cntrs.link_downed_counter -= ibp->z_link_downed_counter;
+	cntrs.port_rcv_errors -= ibp->z_port_rcv_errors;
+	cntrs.port_rcv_remphys_errors -= ibp->z_port_rcv_remphys_errors;
+	cntrs.port_xmit_discards -= ibp->z_port_xmit_discards;
+	cntrs.port_xmit_data -= ibp->z_port_xmit_data;
+	cntrs.port_rcv_data -= ibp->z_port_rcv_data;
+	cntrs.port_xmit_packets -= ibp->z_port_xmit_packets;
+	cntrs.port_rcv_packets -= ibp->z_port_rcv_packets;
+	cntrs.local_link_integrity_errors -=
+		ibp->z_local_link_integrity_errors;
+	cntrs.excessive_buffer_overrun_errors -=
+		ibp->z_excessive_buffer_overrun_errors;
+	cntrs.vl15_dropped -= ibp->z_vl15_dropped;
+	cntrs.vl15_dropped += ibp->n_vl15_dropped;
 
+	memset(pmp->data, 0, sizeof(pmp->data));
+
+	p->port_select = port_select;
+	if (pmp->mad_hdr.attr_mod != 0 || port_select != port)
+		pmp->mad_hdr.status |=

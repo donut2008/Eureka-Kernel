@@ -1,405 +1,456 @@
-/* -*- mode: c; c-basic-offset: 8 -*- */
-
-/* NCR Dual 700 MCA SCSI Driver
- *
- * Copyright (C) 2001 by James.Bottomley@HansenPartnership.com
-**-----------------------------------------------------------------------------
-**  
-**  This program is free software; you can redistribute it and/or modify
-**  it under the terms of the GNU General Public License as published by
-**  the Free Software Foundation; either version 2 of the License, or
-**  (at your option) any later version.
-**
-**  This program is distributed in the hope that it will be useful,
-**  but WITHOUT ANY WARRANTY; without even the implied warranty of
-**  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-**  GNU General Public License for more details.
-**
-**  You should have received a copy of the GNU General Public License
-**  along with this program; if not, write to the Free Software
-**  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
-**
-**-----------------------------------------------------------------------------
- */
-
-/* Notes:
- *
- * Most of the work is done in the chip specific module, 53c700.o
- *
- * TODO List:
- *
- * 1. Extract the SCSI ID from the voyager CMOS table (necessary to
- *    support multi-host environments.
- *
- * */
-
-
-/* CHANGELOG 
- *
- * Version 2.2
- *
- * Added mca_set_adapter_name().
- *
- * Version 2.1
- *
- * Modularise the driver into a Board piece (this file) and a chip
- * piece 53c700.[ch] and 53c700.scr, added module options.  You can
- * now specify the scsi id by the parameters
- *
- * NCR_D700=slot:<n> [siop:<n>] id:<n> ....
- *
- * They need to be comma separated if compiled into the kernel
- *
- * Version 2.0
- *
- * Initial implementation of TCQ (Tag Command Queueing).  TCQ is full
- * featured and uses the clock algorithm to keep track of outstanding
- * tags and guard against individual tag starvation.  Also fixed a bug
- * in all of the 1.x versions where the D700_data_residue() function
- * was returning results off by 32 bytes (and thus causing the same 32
- * bytes to be written twice corrupting the data block).  It turns out
- * the 53c700 only has a 6 bit DBC and DFIFO registers not 7 bit ones
- * like the 53c710 (The 710 is the only data manual still available,
- * which I'd been using to program the 700).
- *
- * Version 1.2
- *
- * Much improved message handling engine
- *
- * Version 1.1
- *
- * Add code to handle selection reasonably correctly.  By the time we
- * get the selection interrupt, we've already responded, but drop off the
- * bus and hope the selector will go away.
- *
- * Version 1.0:
- *
- *   Initial release.  Fully functional except for procfs and tag
- * command queueing.  Has only been tested on cards with 53c700-66
- * chips and only single ended. Features are
- *
- * 1. Synchronous data transfers to offset 8 (limit of 700-66) and
- *    100ns (10MHz) limit of SCSI-2
- *
- * 2. Disconnection and reselection
- *
- * Testing:
- * 
- *  I've only really tested this with the 700-66 chip, but have done
- * soak tests in multi-device environments to verify that
- * disconnections and reselections are being processed correctly.
- * */
-
-#define NCR_D700_VERSION "2.2"
-
-#include <linux/blkdev.h>
-#include <linux/interrupt.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/mca.h>
-#include <linux/slab.h>
-#include <asm/io.h>
-#include <scsi/scsi_host.h>
-#include <scsi/scsi_device.h>
-#include <scsi/scsi_transport.h>
-#include <scsi/scsi_transport_spi.h>
-
-#include "53c700.h"
-#include "NCR_D700.h"
-
-static char *NCR_D700;		/* command line from insmod */
-
-MODULE_AUTHOR("James Bottomley");
-MODULE_DESCRIPTION("NCR Dual700 SCSI Driver");
-MODULE_LICENSE("GPL");
-module_param(NCR_D700, charp, 0);
-
-static __u8 id_array[2*(MCA_MAX_SLOT_NR + 1)] =
-	{ [0 ... 2*(MCA_MAX_SLOT_NR + 1)-1] = 7 };
-
-#ifdef MODULE
-#define ARG_SEP ' '
-#else
-#define ARG_SEP ','
-#endif
-
-static int __init
-param_setup(char *string)
-{
-	char *pos = string, *next;
-	int slot = -1, siop = -1;
-
-	while(pos != NULL && (next = strchr(pos, ':')) != NULL) {
-		int val = (int)simple_strtoul(++next, NULL, 0);
-
-		if(!strncmp(pos, "slot:", 5))
-			slot = val;
-		else if(!strncmp(pos, "siop:", 5))
-			siop = val;
-		else if(!strncmp(pos, "id:", 3)) {
-			if(slot == -1) {
-				printk(KERN_WARNING "NCR D700: Must specify slot for id parameter\n");
-			} else if(slot > MCA_MAX_SLOT_NR) {
-				printk(KERN_WARNING "NCR D700: Illegal slot %d for id %d\n", slot, val);
-			} else {
-				if(siop != 0 && siop != 1) {
-					id_array[slot*2] = val;
-					id_array[slot*2 + 1] =val;
-				} else {
-					id_array[slot*2 + siop] = val;
-				}
-			}
+sc_node) {
+		i++;
+		if (async_tx_test_ack(&desc->txd)) {
+			list_del(&desc->desc_node);
+			ret = desc;
+			break;
 		}
-		if((pos = strchr(pos, ARG_SEP)) != NULL)
-			pos++;
+		dev_dbg(chan2dev(&pd_chan->chan), "desc %p not ACKed\n", desc);
 	}
-	return 1;
-}
+	spin_unlock(&pd_chan->lock);
+	dev_dbg(chan2dev(&pd_chan->chan), "scanned %d descriptors\n", i);
 
-/* Host template.  The 53c700 routine NCR_700_detect will
- * fill in all of the missing routines */
-static struct scsi_host_template NCR_D700_driver_template = {
-	.module			= THIS_MODULE,
-	.name			= "NCR Dual 700 MCA",
-	.proc_name		= "NCR_D700",
-	.this_id		= 7,
-};
-
-/* We needs this helper because we have two hosts per struct device */
-struct NCR_D700_private {
-	struct device		*dev;
-	struct Scsi_Host	*hosts[2];
-	char			name[30];
-	char			pad;
-};
-
-static int
-NCR_D700_probe_one(struct NCR_D700_private *p, int siop, int irq,
-		   int slot, u32 region, int differential)
-{
-	struct NCR_700_Host_Parameters *hostdata;
-	struct Scsi_Host *host;
-	int ret;
-
-	hostdata = kzalloc(sizeof(*hostdata), GFP_KERNEL);
-	if (!hostdata) {
-		printk(KERN_ERR "NCR D700: SIOP%d: Failed to allocate host"
-		       "data, detatching\n", siop);
-		return -ENOMEM;
+	if (!ret) {
+		ret = pdc_alloc_desc(&pd_chan->chan, GFP_ATOMIC);
+		if (ret) {
+			spin_lock(&pd_chan->lock);
+			pd_chan->descs_allocated++;
+			spin_unlock(&pd_chan->lock);
+		} else {
+			dev_err(chan2dev(&pd_chan->chan),
+				"failed to alloc desc\n");
+		}
 	}
-
-	if (!request_region(region, 64, "NCR_D700")) {
-		printk(KERN_ERR "NCR D700: Failed to reserve IO region 0x%x\n",
-				region);
-		ret = -ENODEV;
-		goto region_failed;
-	}
-		
-	/* Fill in the three required pieces of hostdata */
-	hostdata->base = ioport_map(region, 64);
-	hostdata->differential = (((1<<siop) & differential) != 0);
-	hostdata->clock = NCR_D700_CLOCK_MHZ;
-	hostdata->burst_length = 8;
-
-	/* and register the siop */
-	host = NCR_700_detect(&NCR_D700_driver_template, hostdata, p->dev);
-	if (!host) {
-		ret = -ENOMEM;
-		goto detect_failed;
-	}
-
-	p->hosts[siop] = host;
-	/* FIXME: read this from SUS */
-	host->this_id = id_array[slot * 2 + siop];
-	host->irq = irq;
-	host->base = region;
-	scsi_scan_host(host);
-
-	return 0;
-
- detect_failed:
-	release_region(region, 64);
- region_failed:
-	kfree(hostdata);
 
 	return ret;
 }
 
-static irqreturn_t
-NCR_D700_intr(int irq, void *data)
+static void pdc_desc_put(struct pch_dma_chan *pd_chan,
+			 struct pch_dma_desc *desc)
 {
-	struct NCR_D700_private *p = (struct NCR_D700_private *)data;
-	int i, found = 0;
-
-	for (i = 0; i < 2; i++)
-		if (p->hosts[i] &&
-		    NCR_700_intr(irq, p->hosts[i]) == IRQ_HANDLED)
-			found++;
-
-	return found ? IRQ_HANDLED : IRQ_NONE;
+	if (desc) {
+		spin_lock(&pd_chan->lock);
+		list_splice_init(&desc->tx_list, &pd_chan->free_list);
+		list_add(&desc->desc_node, &pd_chan->free_list);
+		spin_unlock(&pd_chan->lock);
+	}
 }
 
-/* Detect a D700 card.  Note, because of the setup --- the chips are
- * essentially connectecd to the MCA bus independently, it is easier
- * to set them up as two separate host adapters, rather than one
- * adapter with two channels */
-static int
-NCR_D700_probe(struct device *dev)
+static int pd_alloc_chan_resources(struct dma_chan *chan)
 {
-	struct NCR_D700_private *p;
-	int differential;
-	static int banner = 1;
-	struct mca_device *mca_dev = to_mca_device(dev);
-	int slot = mca_dev->slot;
-	int found = 0;
-	int irq, i;
-	int pos3j, pos3k, pos3a, pos3b, pos4;
-	__u32 base_addr, offset_addr;
-
-	/* enable board interrupt */
-	pos4 = mca_device_read_pos(mca_dev, 4);
-	pos4 |= 0x4;
-	mca_device_write_pos(mca_dev, 4, pos4);
-
-	mca_device_write_pos(mca_dev, 6, 9);
-	pos3j = mca_device_read_pos(mca_dev, 3);
-	mca_device_write_pos(mca_dev, 6, 10);
-	pos3k = mca_device_read_pos(mca_dev, 3);
-	mca_device_write_pos(mca_dev, 6, 0);
-	pos3a = mca_device_read_pos(mca_dev, 3);
-	mca_device_write_pos(mca_dev, 6, 1);
-	pos3b = mca_device_read_pos(mca_dev, 3);
-
-	base_addr = ((pos3j << 8) | pos3k) & 0xfffffff0;
-	offset_addr = ((pos3a << 8) | pos3b) & 0xffffff70;
-
-	irq = (pos4 & 0x3) + 11;
-	if(irq >= 13)
-		irq++;
-	if(banner) {
-		printk(KERN_NOTICE "NCR D700: Driver Version " NCR_D700_VERSION "\n"
-		       "NCR D700:  Copyright (c) 2001 by James.Bottomley@HansenPartnership.com\n"
-		       "NCR D700:\n");
-		banner = 0;
-	}
-	/* now do the bus related transforms */
-	irq = mca_device_transform_irq(mca_dev, irq);
-	base_addr = mca_device_transform_ioport(mca_dev, base_addr);
-	offset_addr = mca_device_transform_ioport(mca_dev, offset_addr);
-
-	printk(KERN_NOTICE "NCR D700: found in slot %d  irq = %d  I/O base = 0x%x\n", slot, irq, offset_addr);
-
-	/*outb(BOARD_RESET, base_addr);*/
-
-	/* clear any pending interrupts */
-	(void)inb(base_addr + 0x08);
-	/* get modctl, used later for setting diff bits */
-	switch(differential = (inb(base_addr + 0x08) >> 6)) {
-	case 0x00:
-		/* only SIOP1 differential */
-		differential = 0x02;
-		break;
-	case 0x01:
-		/* Both SIOPs differential */
-		differential = 0x03;
-		break;
-	case 0x03:
-		/* No SIOPs differential */
-		differential = 0x00;
-		break;
-	default:
-		printk(KERN_ERR "D700: UNEXPECTED DIFFERENTIAL RESULT 0x%02x\n",
-		       differential);
-		differential = 0x00;
-		break;
-	}
-
-	p = kzalloc(sizeof(*p), GFP_KERNEL);
-	if (!p)
-		return -ENOMEM;
-
-	p->dev = dev;
-	snprintf(p->name, sizeof(p->name), "D700(%s)", dev_name(dev));
-	if (request_irq(irq, NCR_D700_intr, IRQF_SHARED, p->name, p)) {
-		printk(KERN_ERR "D700: request_irq failed\n");
-		kfree(p);
-		return -EBUSY;
-	}
-	/* plumb in both 700 chips */
-	for (i = 0; i < 2; i++) {
-		int err;
-
-		if ((err = NCR_D700_probe_one(p, i, irq, slot,
-					      offset_addr + (0x80 * i),
-					      differential)) != 0)
-			printk("D700: SIOP%d: probe failed, error = %d\n",
-			       i, err);
-		else
-			found++;
-	}
-
-	if (!found) {
-		kfree(p);
-		return -ENODEV;
-	}
-
-	mca_device_set_claim(mca_dev, 1);
-	mca_device_set_name(mca_dev, "NCR_D700");
-	dev_set_drvdata(dev, p);
-	return 0;
-}
-
-static void
-NCR_D700_remove_one(struct Scsi_Host *host)
-{
-	scsi_remove_host(host);
-	NCR_700_release(host);
-	kfree((struct NCR_700_Host_Parameters *)host->hostdata[0]);
-	free_irq(host->irq, host);
-	release_region(host->base, 64);
-}
-
-static int
-NCR_D700_remove(struct device *dev)
-{
-	struct NCR_D700_private *p = dev_get_drvdata(dev);
+	struct pch_dma_chan *pd_chan = to_pd_chan(chan);
+	struct pch_dma_desc *desc;
+	LIST_HEAD(tmp_list);
 	int i;
 
-	for (i = 0; i < 2; i++)
-		NCR_D700_remove_one(p->hosts[i]);
+	if (!pdc_is_idle(pd_chan)) {
+		dev_dbg(chan2dev(chan), "DMA channel not idle ?\n");
+		return -EIO;
+	}
 
-	kfree(p);
+	if (!list_empty(&pd_chan->free_list))
+		return pd_chan->descs_allocated;
+
+	for (i = 0; i < init_nr_desc_per_channel; i++) {
+		desc = pdc_alloc_desc(chan, GFP_KERNEL);
+
+		if (!desc) {
+			dev_warn(chan2dev(chan),
+				"Only allocated %d initial descriptors\n", i);
+			break;
+		}
+
+		list_add_tail(&desc->desc_node, &tmp_list);
+	}
+
+	spin_lock_irq(&pd_chan->lock);
+	list_splice(&tmp_list, &pd_chan->free_list);
+	pd_chan->descs_allocated = i;
+	dma_cookie_init(chan);
+	spin_unlock_irq(&pd_chan->lock);
+
+	pdc_enable_irq(chan, 1);
+
+	return pd_chan->descs_allocated;
+}
+
+static void pd_free_chan_resources(struct dma_chan *chan)
+{
+	struct pch_dma_chan *pd_chan = to_pd_chan(chan);
+	struct pch_dma *pd = to_pd(chan->device);
+	struct pch_dma_desc *desc, *_d;
+	LIST_HEAD(tmp_list);
+
+	BUG_ON(!pdc_is_idle(pd_chan));
+	BUG_ON(!list_empty(&pd_chan->active_list));
+	BUG_ON(!list_empty(&pd_chan->queue));
+
+	spin_lock_irq(&pd_chan->lock);
+	list_splice_init(&pd_chan->free_list, &tmp_list);
+	pd_chan->descs_allocated = 0;
+	spin_unlock_irq(&pd_chan->lock);
+
+	list_for_each_entry_safe(desc, _d, &tmp_list, desc_node)
+		pci_pool_free(pd->pool, desc, desc->txd.phys);
+
+	pdc_enable_irq(chan, 0);
+}
+
+static enum dma_status pd_tx_status(struct dma_chan *chan, dma_cookie_t cookie,
+				    struct dma_tx_state *txstate)
+{
+	return dma_cookie_status(chan, cookie, txstate);
+}
+
+static void pd_issue_pending(struct dma_chan *chan)
+{
+	struct pch_dma_chan *pd_chan = to_pd_chan(chan);
+
+	if (pdc_is_idle(pd_chan)) {
+		spin_lock(&pd_chan->lock);
+		pdc_advance_work(pd_chan);
+		spin_unlock(&pd_chan->lock);
+	}
+}
+
+static struct dma_async_tx_descriptor *pd_prep_slave_sg(struct dma_chan *chan,
+			struct scatterlist *sgl, unsigned int sg_len,
+			enum dma_transfer_direction direction, unsigned long flags,
+			void *context)
+{
+	struct pch_dma_chan *pd_chan = to_pd_chan(chan);
+	struct pch_dma_slave *pd_slave = chan->private;
+	struct pch_dma_desc *first = NULL;
+	struct pch_dma_desc *prev = NULL;
+	struct pch_dma_desc *desc = NULL;
+	struct scatterlist *sg;
+	dma_addr_t reg;
+	int i;
+
+	if (unlikely(!sg_len)) {
+		dev_info(chan2dev(chan), "prep_slave_sg: length is zero!\n");
+		return NULL;
+	}
+
+	if (direction == DMA_DEV_TO_MEM)
+		reg = pd_slave->rx_reg;
+	else if (direction == DMA_MEM_TO_DEV)
+		reg = pd_slave->tx_reg;
+	else
+		return NULL;
+
+	pd_chan->dir = direction;
+	pdc_set_dir(chan);
+
+	for_each_sg(sgl, sg, sg_len, i) {
+		desc = pdc_desc_get(pd_chan);
+
+		if (!desc)
+			goto err_desc_get;
+
+		desc->regs.dev_addr = reg;
+		desc->regs.mem_addr = sg_dma_address(sg);
+		desc->regs.size = sg_dma_len(sg);
+		desc->regs.next = DMA_DESC_FOLLOW_WITHOUT_IRQ;
+
+		switch (pd_slave->width) {
+		case PCH_DMA_WIDTH_1_BYTE:
+			if (desc->regs.size > DMA_DESC_MAX_COUNT_1_BYTE)
+				goto err_desc_get;
+			desc->regs.size |= DMA_DESC_WIDTH_1_BYTE;
+			break;
+		case PCH_DMA_WIDTH_2_BYTES:
+			if (desc->regs.size > DMA_DESC_MAX_COUNT_2_BYTES)
+				goto err_desc_get;
+			desc->regs.size |= DMA_DESC_WIDTH_2_BYTES;
+			break;
+		case PCH_DMA_WIDTH_4_BYTES:
+			if (desc->regs.size > DMA_DESC_MAX_COUNT_4_BYTES)
+				goto err_desc_get;
+			desc->regs.size |= DMA_DESC_WIDTH_4_BYTES;
+			break;
+		default:
+			goto err_desc_get;
+		}
+
+		if (!first) {
+			first = desc;
+		} else {
+			prev->regs.next |= desc->txd.phys;
+			list_add_tail(&desc->desc_node, &first->tx_list);
+		}
+
+		prev = desc;
+	}
+
+	if (flags & DMA_PREP_INTERRUPT)
+		desc->regs.next = DMA_DESC_END_WITH_IRQ;
+	else
+		desc->regs.next = DMA_DESC_END_WITHOUT_IRQ;
+
+	first->txd.cookie = -EBUSY;
+	desc->txd.flags = flags;
+
+	return &first->txd;
+
+err_desc_get:
+	dev_err(chan2dev(chan), "failed to get desc or wrong parameters\n");
+	pdc_desc_put(pd_chan, first);
+	return NULL;
+}
+
+static int pd_device_terminate_all(struct dma_chan *chan)
+{
+	struct pch_dma_chan *pd_chan = to_pd_chan(chan);
+	struct pch_dma_desc *desc, *_d;
+	LIST_HEAD(list);
+
+	spin_lock_irq(&pd_chan->lock);
+
+	pdc_set_mode(&pd_chan->chan, DMA_CTL0_DISABLE);
+
+	list_splice_init(&pd_chan->active_list, &list);
+	list_splice_init(&pd_chan->queue, &list);
+
+	list_for_each_entry_safe(desc, _d, &list, desc_node)
+		pdc_chain_complete(pd_chan, desc);
+
+	spin_unlock_irq(&pd_chan->lock);
+
 	return 0;
 }
 
-static short NCR_D700_id_table[] = { NCR_D700_MCA_ID, 0 };
-
-static struct mca_driver NCR_D700_driver = {
-	.id_table = NCR_D700_id_table,
-	.driver = {
-		.name		= "NCR_D700",
-		.bus		= &mca_bus_type,
-		.probe		= NCR_D700_probe,
-		.remove		= NCR_D700_remove,
-	},
-};
-
-static int __init NCR_D700_init(void)
+static void pdc_tasklet(unsigned long data)
 {
-#ifdef MODULE
-	if (NCR_D700)
-		param_setup(NCR_D700);
+	struct pch_dma_chan *pd_chan = (struct pch_dma_chan *)data;
+	unsigned long flags;
+
+	if (!pdc_is_idle(pd_chan)) {
+		dev_err(chan2dev(&pd_chan->chan),
+			"BUG: handle non-idle channel in tasklet\n");
+		return;
+	}
+
+	spin_lock_irqsave(&pd_chan->lock, flags);
+	if (test_and_clear_bit(0, &pd_chan->err_status))
+		pdc_handle_error(pd_chan);
+	else
+		pdc_advance_work(pd_chan);
+	spin_unlock_irqrestore(&pd_chan->lock, flags);
+}
+
+static irqreturn_t pd_irq(int irq, void *devid)
+{
+	struct pch_dma *pd = (struct pch_dma *)devid;
+	struct pch_dma_chan *pd_chan;
+	u32 sts0;
+	u32 sts2;
+	int i;
+	int ret0 = IRQ_NONE;
+	int ret2 = IRQ_NONE;
+
+	sts0 = dma_readl(pd, STS0);
+	sts2 = dma_readl(pd, STS2);
+
+	dev_dbg(pd->dma.dev, "pd_irq sts0: %x\n", sts0);
+
+	for (i = 0; i < pd->dma.chancnt; i++) {
+		pd_chan = &pd->channels[i];
+
+		if (i < 8) {
+			if (sts0 & DMA_STATUS_IRQ(i)) {
+				if (sts0 & DMA_STATUS0_ERR(i))
+					set_bit(0, &pd_chan->err_status);
+
+				tasklet_schedule(&pd_chan->tasklet);
+				ret0 = IRQ_HANDLED;
+			}
+		} else {
+			if (sts2 & DMA_STATUS_IRQ(i - 8)) {
+				if (sts2 & DMA_STATUS2_ERR(i))
+					set_bit(0, &pd_chan->err_status);
+
+				tasklet_schedule(&pd_chan->tasklet);
+				ret2 = IRQ_HANDLED;
+			}
+		}
+	}
+
+	/* clear interrupt bits in status register */
+	if (ret0)
+		dma_writel(pd, STS0, sts0);
+	if (ret2)
+		dma_writel(pd, STS2, sts2);
+
+	return ret0 | ret2;
+}
+
+#ifdef	CONFIG_PM
+static void pch_dma_save_regs(struct pch_dma *pd)
+{
+	struct pch_dma_chan *pd_chan;
+	struct dma_chan *chan, *_c;
+	int i = 0;
+
+	pd->regs.dma_ctl0 = dma_readl(pd, CTL0);
+	pd->regs.dma_ctl1 = dma_readl(pd, CTL1);
+	pd->regs.dma_ctl2 = dma_readl(pd, CTL2);
+	pd->regs.dma_ctl3 = dma_readl(pd, CTL3);
+
+	list_for_each_entry_safe(chan, _c, &pd->dma.channels, device_node) {
+		pd_chan = to_pd_chan(chan);
+
+		pd->ch_regs[i].dev_addr = channel_readl(pd_chan, DEV_ADDR);
+		pd->ch_regs[i].mem_addr = channel_readl(pd_chan, MEM_ADDR);
+		pd->ch_regs[i].size = channel_readl(pd_chan, SIZE);
+		pd->ch_regs[i].next = channel_readl(pd_chan, NEXT);
+
+		i++;
+	}
+}
+
+static void pch_dma_restore_regs(struct pch_dma *pd)
+{
+	struct pch_dma_chan *pd_chan;
+	struct dma_chan *chan, *_c;
+	int i = 0;
+
+	dma_writel(pd, CTL0, pd->regs.dma_ctl0);
+	dma_writel(pd, CTL1, pd->regs.dma_ctl1);
+	dma_writel(pd, CTL2, pd->regs.dma_ctl2);
+	dma_writel(pd, CTL3, pd->regs.dma_ctl3);
+
+	list_for_each_entry_safe(chan, _c, &pd->dma.channels, device_node) {
+		pd_chan = to_pd_chan(chan);
+
+		channel_writel(pd_chan, DEV_ADDR, pd->ch_regs[i].dev_addr);
+		channel_writel(pd_chan, MEM_ADDR, pd->ch_regs[i].mem_addr);
+		channel_writel(pd_chan, SIZE, pd->ch_regs[i].size);
+		channel_writel(pd_chan, NEXT, pd->ch_regs[i].next);
+
+		i++;
+	}
+}
+
+static int pch_dma_suspend(struct pci_dev *pdev, pm_message_t state)
+{
+	struct pch_dma *pd = pci_get_drvdata(pdev);
+
+	if (pd)
+		pch_dma_save_regs(pd);
+
+	pci_save_state(pdev);
+	pci_disable_device(pdev);
+	pci_set_power_state(pdev, pci_choose_state(pdev, state));
+
+	return 0;
+}
+
+static int pch_dma_resume(struct pci_dev *pdev)
+{
+	struct pch_dma *pd = pci_get_drvdata(pdev);
+	int err;
+
+	pci_set_power_state(pdev, PCI_D0);
+	pci_restore_state(pdev);
+
+	err = pci_enable_device(pdev);
+	if (err) {
+		dev_dbg(&pdev->dev, "failed to enable device\n");
+		return err;
+	}
+
+	if (pd)
+		pch_dma_restore_regs(pd);
+
+	return 0;
+}
 #endif
 
-	return mca_register_driver(&NCR_D700_driver);
-}
-
-static void __exit NCR_D700_exit(void)
+static int pch_dma_probe(struct pci_dev *pdev,
+				   const struct pci_device_id *id)
 {
-	mca_unregister_driver(&NCR_D700_driver);
-}
+	struct pch_dma *pd;
+	struct pch_dma_regs *regs;
+	unsigned int nr_channels;
+	int err;
+	int i;
 
-module_init(NCR_D700_init);
-module_exit(NCR_D700_exit);
+	nr_channels = id->driver_data;
+	pd = kzalloc(sizeof(*pd), GFP_KERNEL);
+	if (!pd)
+		return -ENOMEM;
 
-__setup("NCR_D700=", param_setup);
+	pci_set_drvdata(pdev, pd);
+
+	err = pci_enable_device(pdev);
+	if (err) {
+		dev_err(&pdev->dev, "Cannot enable PCI device\n");
+		goto err_free_mem;
+	}
+
+	if (!(pci_resource_flags(pdev, 1) & IORESOURCE_MEM)) {
+		dev_err(&pdev->dev, "Cannot find proper base address\n");
+		err = -ENODEV;
+		goto err_disable_pdev;
+	}
+
+	err = pci_request_regions(pdev, DRV_NAME);
+	if (err) {
+		dev_err(&pdev->dev, "Cannot obtain PCI resources\n");
+		goto err_disable_pdev;
+	}
+
+	err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+	if (err) {
+		dev_err(&pdev->dev, "Cannot set proper DMA config\n");
+		goto err_free_res;
+	}
+
+	regs = pd->membase = pci_iomap(pdev, 1, 0);
+	if (!pd->membase) {
+		dev_err(&pdev->dev, "Cannot map MMIO registers\n");
+		err = -ENOMEM;
+		goto err_free_res;
+	}
+
+	pci_set_master(pdev);
+	pd->dma.dev = &pdev->dev;
+
+	err = request_irq(pdev->irq, pd_irq, IRQF_SHARED, DRV_NAME, pd);
+	if (err) {
+		dev_err(&pdev->dev, "Failed to request IRQ\n");
+		goto err_iounmap;
+	}
+
+	pd->pool = pci_pool_create("pch_dma_desc_pool", pdev,
+				   sizeof(struct pch_dma_desc), 4, 0);
+	if (!pd->pool) {
+		dev_err(&pdev->dev, "Failed to alloc DMA descriptors\n");
+		err = -ENOMEM;
+		goto err_free_irq;
+	}
+
+
+	INIT_LIST_HEAD(&pd->dma.channels);
+
+	for (i = 0; i < nr_channels; i++) {
+		struct pch_dma_chan *pd_chan = &pd->channels[i];
+
+		pd_chan->chan.device = &pd->dma;
+		dma_cookie_init(&pd_chan->chan);
+
+		pd_chan->membase = &regs->desc[i];
+
+		spin_lock_init(&pd_chan->lock);
+
+		INIT_LIST_HEAD(&pd_chan->active_list);
+		INIT_LIST_HEAD(&pd_chan->queue);
+		INIT_LIST_HEAD(&pd_chan->free_list);
+
+		tasklet_init(&pd_chan->tasklet, pdc_tasklet,
+			     (unsigned long)pd_chan);
+		list_add_tail(&pd_chan->chan.device_node, &pd->dma.channels);
+	}
+
+	dma_cap_zero(pd-

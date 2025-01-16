@@ -1,220 +1,69 @@
-/*
- * Asynchronous refcounty things
- *
- * Copyright 2010, 2011 Kent Overstreet <kent.overstreet@gmail.com>
- * Copyright 2012 Google, Inc.
- */
-
-#include <linux/debugfs.h>
-#include <linux/module.h>
-#include <linux/seq_file.h>
-
-#include "closure.h"
-
-static inline void closure_put_after_sub(struct closure *cl, int flags)
-{
-	int r = flags & CLOSURE_REMAINING_MASK;
-
-	BUG_ON(flags & CLOSURE_GUARD_MASK);
-	BUG_ON(!r && (flags & ~CLOSURE_DESTRUCTOR));
-
-	/* Must deliver precisely one wakeup */
-	if (r == 1 && (flags & CLOSURE_SLEEPING))
-		wake_up_process(cl->task);
-
-	if (!r) {
-		if (cl->fn && !(flags & CLOSURE_DESTRUCTOR)) {
-			atomic_set(&cl->remaining,
-				   CLOSURE_REMAINING_INITIALIZER);
-			closure_queue(cl);
-		} else {
-			struct closure *parent = cl->parent;
-			closure_fn *destructor = cl->fn;
-
-			closure_debug_destroy(cl);
-
-			if (destructor)
-				destructor(cl);
-
-			if (parent)
-				closure_put(parent);
-		}
-	}
-}
-
-/* For clearing flags with the same atomic op as a put */
-void closure_sub(struct closure *cl, int v)
-{
-	closure_put_after_sub(cl, atomic_sub_return(v, &cl->remaining));
-}
-EXPORT_SYMBOL(closure_sub);
-
-/**
- * closure_put - decrement a closure's refcount
- */
-void closure_put(struct closure *cl)
-{
-	closure_put_after_sub(cl, atomic_dec_return(&cl->remaining));
-}
-EXPORT_SYMBOL(closure_put);
-
-/**
- * closure_wake_up - wake up all closures on a wait list, without memory barrier
- */
-void __closure_wake_up(struct closure_waitlist *wait_list)
-{
-	struct llist_node *list;
-	struct closure *cl;
-	struct llist_node *reverse = NULL;
-
-	list = llist_del_all(&wait_list->list);
-
-	/* We first reverse the list to preserve FIFO ordering and fairness */
-
-	while (list) {
-		struct llist_node *t = list;
-		list = llist_next(list);
-
-		t->next = reverse;
-		reverse = t;
-	}
-
-	/* Then do the wakeups */
-
-	while (reverse) {
-		cl = container_of(reverse, struct closure, list);
-		reverse = llist_next(reverse);
-
-		closure_set_waiting(cl, 0);
-		closure_sub(cl, CLOSURE_WAITING + 1);
-	}
-}
-EXPORT_SYMBOL(__closure_wake_up);
-
-/**
- * closure_wait - add a closure to a waitlist
- *
- * @waitlist will own a ref on @cl, which will be released when
- * closure_wake_up() is called on @waitlist.
- *
- */
-bool closure_wait(struct closure_waitlist *waitlist, struct closure *cl)
-{
-	if (atomic_read(&cl->remaining) & CLOSURE_WAITING)
-		return false;
-
-	closure_set_waiting(cl, _RET_IP_);
-	atomic_add(CLOSURE_WAITING + 1, &cl->remaining);
-	llist_add(&cl->list, &waitlist->list);
-
-	return true;
-}
-EXPORT_SYMBOL(closure_wait);
-
-/**
- * closure_sync - sleep until a closure a closure has nothing left to wait on
- *
- * Sleeps until the refcount hits 1 - the thread that's running the closure owns
- * the last refcount.
- */
-void closure_sync(struct closure *cl)
-{
-	while (1) {
-		__closure_start_sleep(cl);
-		closure_set_ret_ip(cl);
-
-		if ((atomic_read(&cl->remaining) &
-		     CLOSURE_REMAINING_MASK) == 1)
-			break;
-
-		schedule();
-	}
-
-	__closure_end_sleep(cl);
-}
-EXPORT_SYMBOL(closure_sync);
-
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
-
-static LIST_HEAD(closure_list);
-static DEFINE_SPINLOCK(closure_list_lock);
-
-void closure_debug_create(struct closure *cl)
-{
-	unsigned long flags;
-
-	BUG_ON(cl->magic == CLOSURE_MAGIC_ALIVE);
-	cl->magic = CLOSURE_MAGIC_ALIVE;
-
-	spin_lock_irqsave(&closure_list_lock, flags);
-	list_add(&cl->all, &closure_list);
-	spin_unlock_irqrestore(&closure_list_lock, flags);
-}
-EXPORT_SYMBOL(closure_debug_create);
-
-void closure_debug_destroy(struct closure *cl)
-{
-	unsigned long flags;
-
-	BUG_ON(cl->magic != CLOSURE_MAGIC_ALIVE);
-	cl->magic = CLOSURE_MAGIC_DEAD;
-
-	spin_lock_irqsave(&closure_list_lock, flags);
-	list_del(&cl->all);
-	spin_unlock_irqrestore(&closure_list_lock, flags);
-}
-EXPORT_SYMBOL(closure_debug_destroy);
-
-static struct dentry *debug;
-
-static int debug_seq_show(struct seq_file *f, void *data)
-{
-	struct closure *cl;
-	spin_lock_irq(&closure_list_lock);
-
-	list_for_each_entry(cl, &closure_list, all) {
-		int r = atomic_read(&cl->remaining);
-
-		seq_printf(f, "%p: %pF -> %pf p %p r %i ",
-			   cl, (void *) cl->ip, cl->fn, cl->parent,
-			   r & CLOSURE_REMAINING_MASK);
-
-		seq_printf(f, "%s%s%s%s\n",
-			   test_bit(WORK_STRUCT_PENDING_BIT,
-				    work_data_bits(&cl->work)) ? "Q" : "",
-			   r & CLOSURE_RUNNING	? "R" : "",
-			   r & CLOSURE_STACK	? "S" : "",
-			   r & CLOSURE_SLEEPING	? "Sl" : "");
-
-		if (r & CLOSURE_WAITING)
-			seq_printf(f, " W %pF\n",
-				   (void *) cl->waiting_on);
-
-		seq_printf(f, "\n");
-	}
-
-	spin_unlock_irq(&closure_list_lock);
-	return 0;
-}
-
-static int debug_seq_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, debug_seq_show, NULL);
-}
-
-static const struct file_operations debug_ops = {
-	.owner		= THIS_MODULE,
-	.open		= debug_seq_open,
-	.read		= seq_read,
-	.release	= single_release
-};
-
-void __init closure_debug_init(void)
-{
-	debug = debugfs_create_file("closures", 0400, NULL, NULL, &debug_ops);
-}
-
-#endif
-
-MODULE_AUTHOR("Kent Overstreet <koverstreet@google.com>");
-MODULE_LICENSE("GPL");
+THROTTLING_VOTE_EN_MASK 0x2
+#define CG_FREQ_TRAN_VOTING_0__HDP_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1
+#define CG_FREQ_TRAN_VOTING_0__ROM_FREQ_THROTTLING_VOTE_EN_MASK 0x4
+#define CG_FREQ_TRAN_VOTING_0__ROM_FREQ_THROTTLING_VOTE_EN__SHIFT 0x2
+#define CG_FREQ_TRAN_VOTING_0__IH_SEM_FREQ_THROTTLING_VOTE_EN_MASK 0x8
+#define CG_FREQ_TRAN_VOTING_0__IH_SEM_FREQ_THROTTLING_VOTE_EN__SHIFT 0x3
+#define CG_FREQ_TRAN_VOTING_0__PDMA_FREQ_THROTTLING_VOTE_EN_MASK 0x10
+#define CG_FREQ_TRAN_VOTING_0__PDMA_FREQ_THROTTLING_VOTE_EN__SHIFT 0x4
+#define CG_FREQ_TRAN_VOTING_0__DRM_FREQ_THROTTLING_VOTE_EN_MASK 0x20
+#define CG_FREQ_TRAN_VOTING_0__DRM_FREQ_THROTTLING_VOTE_EN__SHIFT 0x5
+#define CG_FREQ_TRAN_VOTING_0__IDCT_FREQ_THROTTLING_VOTE_EN_MASK 0x40
+#define CG_FREQ_TRAN_VOTING_0__IDCT_FREQ_THROTTLING_VOTE_EN__SHIFT 0x6
+#define CG_FREQ_TRAN_VOTING_0__ACP_FREQ_THROTTLING_VOTE_EN_MASK 0x80
+#define CG_FREQ_TRAN_VOTING_0__ACP_FREQ_THROTTLING_VOTE_EN__SHIFT 0x7
+#define CG_FREQ_TRAN_VOTING_0__SDMA_FREQ_THROTTLING_VOTE_EN_MASK 0x100
+#define CG_FREQ_TRAN_VOTING_0__SDMA_FREQ_THROTTLING_VOTE_EN__SHIFT 0x8
+#define CG_FREQ_TRAN_VOTING_0__UVD_FREQ_THROTTLING_VOTE_EN_MASK 0x200
+#define CG_FREQ_TRAN_VOTING_0__UVD_FREQ_THROTTLING_VOTE_EN__SHIFT 0x9
+#define CG_FREQ_TRAN_VOTING_0__VCE_FREQ_THROTTLING_VOTE_EN_MASK 0x400
+#define CG_FREQ_TRAN_VOTING_0__VCE_FREQ_THROTTLING_VOTE_EN__SHIFT 0xa
+#define CG_FREQ_TRAN_VOTING_0__DC_AZ_FREQ_THROTTLING_VOTE_EN_MASK 0x800
+#define CG_FREQ_TRAN_VOTING_0__DC_AZ_FREQ_THROTTLING_VOTE_EN__SHIFT 0xb
+#define CG_FREQ_TRAN_VOTING_0__SAM_FREQ_THROTTLING_VOTE_EN_MASK 0x1000
+#define CG_FREQ_TRAN_VOTING_0__SAM_FREQ_THROTTLING_VOTE_EN__SHIFT 0xc
+#define CG_FREQ_TRAN_VOTING_0__AVP_FREQ_THROTTLING_VOTE_EN_MASK 0x2000
+#define CG_FREQ_TRAN_VOTING_0__AVP_FREQ_THROTTLING_VOTE_EN__SHIFT 0xd
+#define CG_FREQ_TRAN_VOTING_0__GRBM_0_FREQ_THROTTLING_VOTE_EN_MASK 0x4000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_0_FREQ_THROTTLING_VOTE_EN__SHIFT 0xe
+#define CG_FREQ_TRAN_VOTING_0__GRBM_1_FREQ_THROTTLING_VOTE_EN_MASK 0x8000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_1_FREQ_THROTTLING_VOTE_EN__SHIFT 0xf
+#define CG_FREQ_TRAN_VOTING_0__GRBM_2_FREQ_THROTTLING_VOTE_EN_MASK 0x10000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_2_FREQ_THROTTLING_VOTE_EN__SHIFT 0x10
+#define CG_FREQ_TRAN_VOTING_0__GRBM_3_FREQ_THROTTLING_VOTE_EN_MASK 0x20000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_3_FREQ_THROTTLING_VOTE_EN__SHIFT 0x11
+#define CG_FREQ_TRAN_VOTING_0__GRBM_4_FREQ_THROTTLING_VOTE_EN_MASK 0x40000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_4_FREQ_THROTTLING_VOTE_EN__SHIFT 0x12
+#define CG_FREQ_TRAN_VOTING_0__GRBM_5_FREQ_THROTTLING_VOTE_EN_MASK 0x80000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_5_FREQ_THROTTLING_VOTE_EN__SHIFT 0x13
+#define CG_FREQ_TRAN_VOTING_0__GRBM_6_FREQ_THROTTLING_VOTE_EN_MASK 0x100000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_6_FREQ_THROTTLING_VOTE_EN__SHIFT 0x14
+#define CG_FREQ_TRAN_VOTING_0__GRBM_7_FREQ_THROTTLING_VOTE_EN_MASK 0x200000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_7_FREQ_THROTTLING_VOTE_EN__SHIFT 0x15
+#define CG_FREQ_TRAN_VOTING_0__GRBM_8_FREQ_THROTTLING_VOTE_EN_MASK 0x400000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_8_FREQ_THROTTLING_VOTE_EN__SHIFT 0x16
+#define CG_FREQ_TRAN_VOTING_0__GRBM_9_FREQ_THROTTLING_VOTE_EN_MASK 0x800000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_9_FREQ_THROTTLING_VOTE_EN__SHIFT 0x17
+#define CG_FREQ_TRAN_VOTING_0__GRBM_10_FREQ_THROTTLING_VOTE_EN_MASK 0x1000000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_10_FREQ_THROTTLING_VOTE_EN__SHIFT 0x18
+#define CG_FREQ_TRAN_VOTING_0__GRBM_11_FREQ_THROTTLING_VOTE_EN_MASK 0x2000000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_11_FREQ_THROTTLING_VOTE_EN__SHIFT 0x19
+#define CG_FREQ_TRAN_VOTING_0__GRBM_12_FREQ_THROTTLING_VOTE_EN_MASK 0x4000000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_12_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1a
+#define CG_FREQ_TRAN_VOTING_0__GRBM_13_FREQ_THROTTLING_VOTE_EN_MASK 0x8000000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_13_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1b
+#define CG_FREQ_TRAN_VOTING_0__GRBM_14_FREQ_THROTTLING_VOTE_EN_MASK 0x10000000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_14_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1c
+#define CG_FREQ_TRAN_VOTING_0__GRBM_15_FREQ_THROTTLING_VOTE_EN_MASK 0x20000000
+#define CG_FREQ_TRAN_VOTING_0__GRBM_15_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1d
+#define CG_FREQ_TRAN_VOTING_0__RLC_FREQ_THROTTLING_VOTE_EN_MASK 0x40000000
+#define CG_FREQ_TRAN_VOTING_0__RLC_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1e
+#define CG_FREQ_TRAN_VOTING_1__BIF_FREQ_THROTTLING_VOTE_EN_MASK 0x1
+#define CG_FREQ_TRAN_VOTING_1__BIF_FREQ_THROTTLING_VOTE_EN__SHIFT 0x0
+#define CG_FREQ_TRAN_VOTING_1__HDP_FREQ_THROTTLING_VOTE_EN_MASK 0x2
+#define CG_FREQ_TRAN_VOTING_1__HDP_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1
+#define CG_FREQ_TRAN_VOTING_1__ROM_FREQ_THROTTLING_VOTE_EN_MASK 0x4
+#define CG_FREQ_TRAN_VOTING_1__ROM_FREQ_THROTTLING_VOTE_EN__SHIFT 0x2
+#define CG_FREQ_TRAN_VOTING_1__IH_SEM_FREQ_THROTTLING_VOTE_EN_MASK 0x8
+#define CG_FREQ_TRAN_VOTING_1__IH_SEM_FREQ_THROTTLING_VOTE_EN__SHIFT 0x3
+#define CG_FREQ_TRAN_VOTING_1__PDMA_FREQ_THROTTLING

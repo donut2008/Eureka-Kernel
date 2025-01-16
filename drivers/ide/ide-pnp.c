@@ -1,100 +1,115 @@
-/*
- * This file provides autodetection for ISA PnP IDE interfaces.
- * It was tested with "ESS ES1868 Plug and Play AudioDrive" IDE interface.
- *
- * Copyright (C) 2000 Andrey Panin <pazke@donpac.ru>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
- *
- * You should have received a copy of the GNU General Public License
- * (for example /usr/src/linux/COPYING); if not, write to the Free
- * Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/init.h>
-#include <linux/pnp.h>
-#include <linux/ide.h>
-#include <linux/module.h>
-
-#define DRV_NAME "ide-pnp"
-
-/* Add your devices here :)) */
-static struct pnp_device_id idepnp_devices[] = {
-	/* Generic ESDI/IDE/ATA compatible hard disk controller */
-	{.id = "PNP0600", .driver_data = 0},
-	{.id = ""}
-};
-
-static const struct ide_port_info ide_pnp_port_info = {
-	.host_flags		= IDE_HFLAG_NO_DMA,
-	.chipset		= ide_generic,
-};
-
-static int idepnp_probe(struct pnp_dev *dev, const struct pnp_device_id *dev_id)
-{
-	struct ide_host *host;
-	unsigned long base, ctl;
-	int rc;
-	struct ide_hw hw, *hws[] = { &hw };
-
-	printk(KERN_INFO DRV_NAME ": generic PnP IDE interface\n");
-
-	if (!(pnp_port_valid(dev, 0) && pnp_port_valid(dev, 1) && pnp_irq_valid(dev, 0)))
-		return -1;
-
-	base = pnp_port_start(dev, 0);
-	ctl = pnp_port_start(dev, 1);
-
-	if (!request_region(base, 8, DRV_NAME)) {
-		printk(KERN_ERR "%s: I/O resource 0x%lX-0x%lX not free.\n",
-				DRV_NAME, base, base + 7);
-		return -EBUSY;
-	}
-
-	if (!request_region(ctl, 1, DRV_NAME)) {
-		printk(KERN_ERR "%s: I/O resource 0x%lX not free.\n",
-				DRV_NAME, ctl);
-		release_region(base, 8);
-		return -EBUSY;
-	}
-
-	memset(&hw, 0, sizeof(hw));
-	ide_std_init_ports(&hw, base, ctl);
-	hw.irq = pnp_irq(dev, 0);
-
-	rc = ide_host_add(&ide_pnp_port_info, hws, 1, &host);
-	if (rc)
-		goto out;
-
-	pnp_set_drvdata(dev, host);
+ : 0,
+		((*resize_coeff & 0x1FFF) * 10000L) / 8192L, *resize_coeff);
 
 	return 0;
-out:
-	release_region(ctl, 1);
-	release_region(base, 8);
-
-	return rc;
 }
 
-static void idepnp_remove(struct pnp_dev *dev)
+static enum ipu_color_space format_to_colorspace(enum pixel_fmt fmt)
 {
-	struct ide_host *host = pnp_get_drvdata(dev);
-
-	ide_host_remove(host);
-
-	release_region(pnp_port_start(dev, 1), 1);
-	release_region(pnp_port_start(dev, 0), 8);
+	switch (fmt) {
+	case IPU_PIX_FMT_RGB565:
+	case IPU_PIX_FMT_BGR24:
+	case IPU_PIX_FMT_RGB24:
+	case IPU_PIX_FMT_BGR32:
+	case IPU_PIX_FMT_RGB32:
+		return IPU_COLORSPACE_RGB;
+	default:
+		return IPU_COLORSPACE_YCBCR;
+	}
 }
 
-static struct pnp_driver idepnp_driver = {
-	.name		= "ide",
-	.id_table	= idepnp_devices,
-	.probe		= idepnp_probe,
-	.remove		= idepnp_remove,
-};
+static int ipu_ic_init_prpenc(struct ipu *ipu,
+			      union ipu_channel_param *params, bool src_is_csi)
+{
+	uint32_t reg, ic_conf;
+	uint32_t downsize_coeff, resize_coeff;
+	enum ipu_color_space in_fmt, out_fmt;
 
-module_pnp_driver(idepnp_driver);
-MODULE_LICENSE("GPL");
+	/* Setup vertical resizing */
+	calc_resize_coeffs(params->video.in_height,
+			    params->video.out_height,
+			    &resize_coeff, &downsize_coeff);
+	reg = (downsize_coeff << 30) | (resize_coeff << 16);
+
+	/* Setup horizontal resizing */
+	calc_resize_coeffs(params->video.in_width,
+			    params->video.out_width,
+			    &resize_coeff, &downsize_coeff);
+	reg |= (downsize_coeff << 14) | resize_coeff;
+
+	/* Setup color space conversion */
+	in_fmt = format_to_colorspace(params->video.in_pixel_fmt);
+	out_fmt = format_to_colorspace(params->video.out_pixel_fmt);
+
+	/*
+	 * Colourspace conversion unsupported yet - see _init_csc() in
+	 * Freescale sources
+	 */
+	if (in_fmt != out_fmt) {
+		dev_err(ipu->dev, "Colourspace conversion unsupported!\n");
+		return -EOPNOTSUPP;
+	}
+
+	idmac_write_icreg(ipu, reg, IC_PRP_ENC_RSC);
+
+	ic_conf = idmac_read_icreg(ipu, IC_CONF);
+
+	if (src_is_csi)
+		ic_conf &= ~IC_CONF_RWS_EN;
+	else
+		ic_conf |= IC_CONF_RWS_EN;
+
+	idmac_write_icreg(ipu, ic_conf, IC_CONF);
+
+	return 0;
+}
+
+static uint32_t dma_param_addr(uint32_t dma_ch)
+{
+	/* Channel Parameter Memory */
+	return 0x10000 | (dma_ch << 4);
+}
+
+static void ipu_channel_set_priority(struct ipu *ipu, enum ipu_channel channel,
+				     bool prio)
+{
+	u32 reg = idmac_read_icreg(ipu, IDMAC_CHA_PRI);
+
+	if (prio)
+		reg |= 1UL << channel;
+	else
+		reg &= ~(1UL << channel);
+
+	idmac_write_icreg(ipu, reg, IDMAC_CHA_PRI);
+
+	dump_idmac_reg(ipu);
+}
+
+static uint32_t ipu_channel_conf_mask(enum ipu_channel channel)
+{
+	uint32_t mask;
+
+	switch (channel) {
+	case IDMAC_IC_0:
+	case IDMAC_IC_7:
+		mask = IPU_CONF_CSI_EN | IPU_CONF_IC_EN;
+		break;
+	case IDMAC_SDC_0:
+	case IDMAC_SDC_1:
+		mask = IPU_CONF_SDC_EN | IPU_CONF_DI_EN;
+		break;
+	default:
+		mask = 0;
+		break;
+	}
+
+	return mask;
+}
+
+/**
+ * ipu_enable_channel() - enable an IPU channel.
+ * @idmac:	IPU DMAC context.
+ * @ichan:	IDMAC channel.
+ * @return:	0 on success or negative error code on failure.
+ */
+static int ipu

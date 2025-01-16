@@ -1,182 +1,77 @@
-/*
- * Driver for simulating a mouse on GPIO lines.
- *
- * Copyright (C) 2007 Atmel Corporation
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/input-polldev.h>
-#include <linux/gpio.h>
-#include <linux/gpio_mouse.h>
-
-
-/*
- * Timer function which is run every scan_ms ms when the device is opened.
- * The dev input variable is set to the the input_dev pointer.
- */
-static void gpio_mouse_scan(struct input_polled_dev *dev)
-{
-	struct gpio_mouse_platform_data *gpio = dev->private;
-	struct input_dev *input = dev->input;
-	int x, y;
-
-	if (gpio->bleft >= 0)
-		input_report_key(input, BTN_LEFT,
-				gpio_get_value(gpio->bleft) ^ gpio->polarity);
-	if (gpio->bmiddle >= 0)
-		input_report_key(input, BTN_MIDDLE,
-				gpio_get_value(gpio->bmiddle) ^ gpio->polarity);
-	if (gpio->bright >= 0)
-		input_report_key(input, BTN_RIGHT,
-				gpio_get_value(gpio->bright) ^ gpio->polarity);
-
-	x = (gpio_get_value(gpio->right) ^ gpio->polarity)
-		- (gpio_get_value(gpio->left) ^ gpio->polarity);
-	y = (gpio_get_value(gpio->down) ^ gpio->polarity)
-		- (gpio_get_value(gpio->up) ^ gpio->polarity);
-
-	input_report_rel(input, REL_X, x);
-	input_report_rel(input, REL_Y, y);
-	input_sync(input);
-}
-
-static int gpio_mouse_probe(struct platform_device *pdev)
-{
-	struct gpio_mouse_platform_data *pdata = dev_get_platdata(&pdev->dev);
-	struct input_polled_dev *input_poll;
-	struct input_dev *input;
-	int pin, i;
-	int error;
-
-	if (!pdata) {
-		dev_err(&pdev->dev, "no platform data\n");
-		error = -ENXIO;
-		goto out;
-	}
-
-	if (pdata->scan_ms < 0) {
-		dev_err(&pdev->dev, "invalid scan time\n");
-		error = -EINVAL;
-		goto out;
-	}
-
-	for (i = 0; i < GPIO_MOUSE_PIN_MAX; i++) {
-		pin = pdata->pins[i];
-
-		if (pin < 0) {
-
-			if (i <= GPIO_MOUSE_PIN_RIGHT) {
-				/* Mouse direction is required. */
-				dev_err(&pdev->dev,
-					"missing GPIO for directions\n");
-				error = -EINVAL;
-				goto out_free_gpios;
-			}
-
-			if (i == GPIO_MOUSE_PIN_BLEFT)
-				dev_dbg(&pdev->dev, "no left button defined\n");
-
-		} else {
-			error = gpio_request(pin, "gpio_mouse");
-			if (error) {
-				dev_err(&pdev->dev, "fail %d pin (%d idx)\n",
-					pin, i);
-				goto out_free_gpios;
-			}
-
-			gpio_direction_input(pin);
-		}
-	}
-
-	input_poll = input_allocate_polled_device();
-	if (!input_poll) {
-		dev_err(&pdev->dev, "not enough memory for input device\n");
-		error = -ENOMEM;
-		goto out_free_gpios;
-	}
-
-	platform_set_drvdata(pdev, input_poll);
-
-	/* set input-polldev handlers */
-	input_poll->private = pdata;
-	input_poll->poll = gpio_mouse_scan;
-	input_poll->poll_interval = pdata->scan_ms;
-
-	input = input_poll->input;
-	input->name = pdev->name;
-	input->id.bustype = BUS_HOST;
-	input->dev.parent = &pdev->dev;
-
-	input_set_capability(input, EV_REL, REL_X);
-	input_set_capability(input, EV_REL, REL_Y);
-	if (pdata->bleft >= 0)
-		input_set_capability(input, EV_KEY, BTN_LEFT);
-	if (pdata->bmiddle >= 0)
-		input_set_capability(input, EV_KEY, BTN_MIDDLE);
-	if (pdata->bright >= 0)
-		input_set_capability(input, EV_KEY, BTN_RIGHT);
-
-	error = input_register_polled_device(input_poll);
-	if (error) {
-		dev_err(&pdev->dev, "could not register input device\n");
-		goto out_free_polldev;
-	}
-
-	dev_dbg(&pdev->dev, "%d ms scan time, buttons: %s%s%s\n",
-			pdata->scan_ms,
-			pdata->bleft < 0 ? "" : "left ",
-			pdata->bmiddle < 0 ? "" : "middle ",
-			pdata->bright < 0 ? "" : "right");
-
-	return 0;
-
- out_free_polldev:
-	input_free_polled_device(input_poll);
-
- out_free_gpios:
-	while (--i >= 0) {
-		pin = pdata->pins[i];
-		if (pin)
-			gpio_free(pin);
-	}
- out:
-	return error;
-}
-
-static int gpio_mouse_remove(struct platform_device *pdev)
-{
-	struct input_polled_dev *input = platform_get_drvdata(pdev);
-	struct gpio_mouse_platform_data *pdata = input->private;
-	int pin, i;
-
-	input_unregister_polled_device(input);
-	input_free_polled_device(input);
-
-	for (i = 0; i < GPIO_MOUSE_PIN_MAX; i++) {
-		pin = pdata->pins[i];
-		if (pin >= 0)
-			gpio_free(pin);
-	}
-
-	return 0;
-}
-
-static struct platform_driver gpio_mouse_device_driver = {
-	.probe		= gpio_mouse_probe,
-	.remove		= gpio_mouse_remove,
-	.driver		= {
-		.name	= "gpio_mouse",
-	}
-};
-module_platform_driver(gpio_mouse_device_driver);
-
-MODULE_AUTHOR("Hans-Christian Egtvedt <egtvedt@samfundet.no>");
-MODULE_DESCRIPTION("GPIO mouse driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:gpio_mouse"); /* work with hotplug and coldplug */
-
+_CTRL_REG__SP01_BUSY_OVERRIDE__SHIFT 0x18
+#define CGTS_CU0_SP0_CTRL_REG__SP01_LS_OVERRIDE_MASK 0x4000000
+#define CGTS_CU0_SP0_CTRL_REG__SP01_LS_OVERRIDE__SHIFT 0x1a
+#define CGTS_CU0_SP0_CTRL_REG__SP01_SIMDBUSY_OVERRIDE_MASK 0x8000000
+#define CGTS_CU0_SP0_CTRL_REG__SP01_SIMDBUSY_OVERRIDE__SHIFT 0x1b
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_MASK 0x7f
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS__SHIFT 0x0
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_OVERRIDE_MASK 0x80
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_OVERRIDE__SHIFT 0x7
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_BUSY_OVERRIDE_MASK 0x300
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_BUSY_OVERRIDE__SHIFT 0x8
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_LS_OVERRIDE_MASK 0x400
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_LS_OVERRIDE__SHIFT 0xa
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_SIMDBUSY_OVERRIDE_MASK 0x800
+#define CGTS_CU0_LDS_SQ_CTRL_REG__LDS_SIMDBUSY_OVERRIDE__SHIFT 0xb
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_MASK 0x7f0000
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ__SHIFT 0x10
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_OVERRIDE_MASK 0x800000
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_OVERRIDE__SHIFT 0x17
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_BUSY_OVERRIDE_MASK 0x3000000
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_BUSY_OVERRIDE__SHIFT 0x18
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_LS_OVERRIDE_MASK 0x4000000
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_LS_OVERRIDE__SHIFT 0x1a
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_SIMDBUSY_OVERRIDE_MASK 0x8000000
+#define CGTS_CU0_LDS_SQ_CTRL_REG__SQ_SIMDBUSY_OVERRIDE__SHIFT 0x1b
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_MASK 0x7f
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA__SHIFT 0x0
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_OVERRIDE_MASK 0x80
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_OVERRIDE__SHIFT 0x7
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_BUSY_OVERRIDE_MASK 0x300
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_BUSY_OVERRIDE__SHIFT 0x8
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_LS_OVERRIDE_MASK 0x400
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_LS_OVERRIDE__SHIFT 0xa
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_SIMDBUSY_OVERRIDE_MASK 0x800
+#define CGTS_CU0_TA_SQC_CTRL_REG__TA_SIMDBUSY_OVERRIDE__SHIFT 0xb
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_MASK 0x7f0000
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC__SHIFT 0x10
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_OVERRIDE_MASK 0x800000
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_OVERRIDE__SHIFT 0x17
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_BUSY_OVERRIDE_MASK 0x3000000
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_BUSY_OVERRIDE__SHIFT 0x18
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_LS_OVERRIDE_MASK 0x4000000
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_LS_OVERRIDE__SHIFT 0x1a
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_SIMDBUSY_OVERRIDE_MASK 0x8000000
+#define CGTS_CU0_TA_SQC_CTRL_REG__SQC_SIMDBUSY_OVERRIDE__SHIFT 0x1b
+#define CGTS_CU0_SP1_CTRL_REG__SP10_MASK 0x7f
+#define CGTS_CU0_SP1_CTRL_REG__SP10__SHIFT 0x0
+#define CGTS_CU0_SP1_CTRL_REG__SP10_OVERRIDE_MASK 0x80
+#define CGTS_CU0_SP1_CTRL_REG__SP10_OVERRIDE__SHIFT 0x7
+#define CGTS_CU0_SP1_CTRL_REG__SP10_BUSY_OVERRIDE_MASK 0x300
+#define CGTS_CU0_SP1_CTRL_REG__SP10_BUSY_OVERRIDE__SHIFT 0x8
+#define CGTS_CU0_SP1_CTRL_REG__SP10_LS_OVERRIDE_MASK 0x400
+#define CGTS_CU0_SP1_CTRL_REG__SP10_LS_OVERRIDE__SHIFT 0xa
+#define CGTS_CU0_SP1_CTRL_REG__SP10_SIMDBUSY_OVERRIDE_MASK 0x800
+#define CGTS_CU0_SP1_CTRL_REG__SP10_SIMDBUSY_OVERRIDE__SHIFT 0xb
+#define CGTS_CU0_SP1_CTRL_REG__SP11_MASK 0x7f0000
+#define CGTS_CU0_SP1_CTRL_REG__SP11__SHIFT 0x10
+#define CGTS_CU0_SP1_CTRL_REG__SP11_OVERRIDE_MASK 0x800000
+#define CGTS_CU0_SP1_CTRL_REG__SP11_OVERRIDE__SHIFT 0x17
+#define CGTS_CU0_SP1_CTRL_REG__SP11_BUSY_OVERRIDE_MASK 0x3000000
+#define CGTS_CU0_SP1_CTRL_REG__SP11_BUSY_OVERRIDE__SHIFT 0x18
+#define CGTS_CU0_SP1_CTRL_REG__SP11_LS_OVERRIDE_MASK 0x4000000
+#define CGTS_CU0_SP1_CTRL_REG__SP11_LS_OVERRIDE__SHIFT 0x1a
+#define CGTS_CU0_SP1_CTRL_REG__SP11_SIMDBUSY_OVERRIDE_MASK 0x8000000
+#define CGTS_CU0_SP1_CTRL_REG__SP11_SIMDBUSY_OVERRIDE__SHIFT 0x1b
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_MASK 0x7f
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD__SHIFT 0x0
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_OVERRIDE_MASK 0x80
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_OVERRIDE__SHIFT 0x7
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_BUSY_OVERRIDE_MASK 0x300
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_BUSY_OVERRIDE__SHIFT 0x8
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_LS_OVERRIDE_MASK 0x400
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_LS_OVERRIDE__SHIFT 0xa
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_SIMDBUSY_OVERRIDE_MASK 0x800
+#define CGTS_CU0_TD_TCP_CTRL_REG__TD_SIMDBUSY_OVERRIDE__SHIFT 0xb
+#define CGTS_CU0_TD_TCP_CTRL_REG__TCP_MASK 0x7f0000
+#define CGT

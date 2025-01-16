@@ -1,712 +1,22 @@
-/*
- *  PowerPC version
- *    Copyright (C) 1995-1996 Gary Thomas (gdt@linuxppc.org)
- *  Rewritten by Cort Dougan (cort@cs.nmt.edu) for PReP
- *    Copyright (C) 1996 Cort Dougan <cort@cs.nmt.edu>
- *  Adapted for Power Macintosh by Paul Mackerras.
- *  Low-level exception handlers and MMU support
- *  rewritten by Paul Mackerras.
- *    Copyright (C) 1996 Paul Mackerras.
- *
- *  This file contains low-level assembler routines for managing
- *  the PowerPC MMU hash table.  (PPC 8xx processors don't use a
- *  hash table, so this file is not used on them.)
- *
- *  This program is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU General Public License
- *  as published by the Free Software Foundation; either version
- *  2 of the License, or (at your option) any later version.
- *
- */
-
-#include <asm/reg.h>
-#include <asm/page.h>
-#include <asm/pgtable.h>
-#include <asm/cputable.h>
-#include <asm/ppc_asm.h>
-#include <asm/thread_info.h>
-#include <asm/asm-offsets.h>
-
-#ifdef CONFIG_SMP
-	.section .bss
-	.align	2
-	.globl mmu_hash_lock
-mmu_hash_lock:
-	.space	4
-#endif /* CONFIG_SMP */
-
-/*
- * Load a PTE into the hash table, if possible.
- * The address is in r4, and r3 contains an access flag:
- * _PAGE_RW (0x400) if a write.
- * r9 contains the SRR1 value, from which we use the MSR_PR bit.
- * SPRG_THREAD contains the physical address of the current task's thread.
- *
- * Returns to the caller if the access is illegal or there is no
- * mapping for the address.  Otherwise it places an appropriate PTE
- * in the hash table and returns from the exception.
- * Uses r0, r3 - r8, r10, ctr, lr.
- */
-	.text
-_GLOBAL(hash_page)
-	tophys(r7,0)			/* gets -KERNELBASE into r7 */
-#ifdef CONFIG_SMP
-	addis	r8,r7,mmu_hash_lock@h
-	ori	r8,r8,mmu_hash_lock@l
-	lis	r0,0x0fff
-	b	10f
-11:	lwz	r6,0(r8)
-	cmpwi	0,r6,0
-	bne	11b
-10:	lwarx	r6,0,r8
-	cmpwi	0,r6,0
-	bne-	11b
-	stwcx.	r0,0,r8
-	bne-	10b
-	isync
-#endif
-	/* Get PTE (linux-style) and check access */
-	lis	r0,KERNELBASE@h		/* check if kernel address */
-	cmplw	0,r4,r0
-	mfspr	r8,SPRN_SPRG_THREAD	/* current task's THREAD (phys) */
-	ori	r3,r3,_PAGE_USER|_PAGE_PRESENT /* test low addresses as user */
-	lwz	r5,PGDIR(r8)		/* virt page-table root */
-	blt+	112f			/* assume user more likely */
-	lis	r5,swapper_pg_dir@ha	/* if kernel address, use */
-	addi	r5,r5,swapper_pg_dir@l	/* kernel page table */
-	rlwimi	r3,r9,32-12,29,29	/* MSR_PR -> _PAGE_USER */
-112:	add	r5,r5,r7		/* convert to phys addr */
-#ifndef CONFIG_PTE_64BIT
-	rlwimi	r5,r4,12,20,29		/* insert top 10 bits of address */
-	lwz	r8,0(r5)		/* get pmd entry */
-	rlwinm.	r8,r8,0,0,19		/* extract address of pte page */
-#else
-	rlwinm	r8,r4,13,19,29		/* Compute pgdir/pmd offset */
-	lwzx	r8,r8,r5		/* Get L1 entry */
-	rlwinm.	r8,r8,0,0,20		/* extract pt base address */
-#endif
-#ifdef CONFIG_SMP
-	beq-	hash_page_out		/* return if no mapping */
-#else
-	/* XXX it seems like the 601 will give a machine fault on the
-	   rfi if its alignment is wrong (bottom 4 bits of address are
-	   8 or 0xc) and we have had a not-taken conditional branch
-	   to the address following the rfi. */
-	beqlr-
-#endif
-#ifndef CONFIG_PTE_64BIT
-	rlwimi	r8,r4,22,20,29		/* insert next 10 bits of address */
-#else
-	rlwimi	r8,r4,23,20,28		/* compute pte address */
-#endif
-	rlwinm	r0,r3,32-3,24,24	/* _PAGE_RW access -> _PAGE_DIRTY */
-	ori	r0,r0,_PAGE_ACCESSED|_PAGE_HASHPTE
-
-	/*
-	 * Update the linux PTE atomically.  We do the lwarx up-front
-	 * because almost always, there won't be a permission violation
-	 * and there won't already be an HPTE, and thus we will have
-	 * to update the PTE to set _PAGE_HASHPTE.  -- paulus.
-	 *
-	 * If PTE_64BIT is set, the low word is the flags word; use that
-	 * word for locking since it contains all the interesting bits.
-	 */
-#if (PTE_FLAGS_OFFSET != 0)
-	addi	r8,r8,PTE_FLAGS_OFFSET
-#endif
-retry:
-	lwarx	r6,0,r8			/* get linux-style pte, flag word */
-	andc.	r5,r3,r6		/* check access & ~permission */
-#ifdef CONFIG_SMP
-	bne-	hash_page_out		/* return if access not permitted */
-#else
-	bnelr-
-#endif
-	or	r5,r0,r6		/* set accessed/dirty bits */
-#ifdef CONFIG_PTE_64BIT
-#ifdef CONFIG_SMP
-	subf	r10,r6,r8		/* create false data dependency */
-	subi	r10,r10,PTE_FLAGS_OFFSET
-	lwzx	r10,r6,r10		/* Get upper PTE word */
-#else
-	lwz	r10,-PTE_FLAGS_OFFSET(r8)
-#endif /* CONFIG_SMP */
-#endif /* CONFIG_PTE_64BIT */
-	stwcx.	r5,0,r8			/* attempt to update PTE */
-	bne-	retry			/* retry if someone got there first */
-
-	mfsrin	r3,r4			/* get segment reg for segment */
-	mfctr	r0
-	stw	r0,_CTR(r11)
-	bl	create_hpte		/* add the hash table entry */
-
-#ifdef CONFIG_SMP
-	eieio
-	addis	r8,r7,mmu_hash_lock@ha
-	li	r0,0
-	stw	r0,mmu_hash_lock@l(r8)
-#endif
-
-	/* Return from the exception */
-	lwz	r5,_CTR(r11)
-	mtctr	r5
-	lwz	r0,GPR0(r11)
-	lwz	r7,GPR7(r11)
-	lwz	r8,GPR8(r11)
-	b	fast_exception_return
-
-#ifdef CONFIG_SMP
-hash_page_out:
-	eieio
-	addis	r8,r7,mmu_hash_lock@ha
-	li	r0,0
-	stw	r0,mmu_hash_lock@l(r8)
-	blr
-#endif /* CONFIG_SMP */
-
-/*
- * Add an entry for a particular page to the hash table.
- *
- * add_hash_page(unsigned context, unsigned long va, unsigned long pmdval)
- *
- * We assume any necessary modifications to the pte (e.g. setting
- * the accessed bit) have already been done and that there is actually
- * a hash table in use (i.e. we're not on a 603).
- */
-_GLOBAL(add_hash_page)
-	mflr	r0
-	stw	r0,4(r1)
-
-	/* Convert context and va to VSID */
-	mulli	r3,r3,897*16		/* multiply context by context skew */
-	rlwinm	r0,r4,4,28,31		/* get ESID (top 4 bits of va) */
-	mulli	r0,r0,0x111		/* multiply by ESID skew */
-	add	r3,r3,r0		/* note create_hpte trims to 24 bits */
-
-#ifdef CONFIG_SMP
-	CURRENT_THREAD_INFO(r8, r1)	/* use cpu number to make tag */
-	lwz	r8,TI_CPU(r8)		/* to go in mmu_hash_lock */
-	oris	r8,r8,12
-#endif /* CONFIG_SMP */
-
-	/*
-	 * We disable interrupts here, even on UP, because we don't
-	 * want to race with hash_page, and because we want the
-	 * _PAGE_HASHPTE bit to be a reliable indication of whether
-	 * the HPTE exists (or at least whether one did once).
-	 * We also turn off the MMU for data accesses so that we
-	 * we can't take a hash table miss (assuming the code is
-	 * covered by a BAT).  -- paulus
-	 */
-	mfmsr	r9
-	SYNC
-	rlwinm	r0,r9,0,17,15		/* clear bit 16 (MSR_EE) */
-	rlwinm	r0,r0,0,28,26		/* clear MSR_DR */
-	mtmsr	r0
-	SYNC_601
-	isync
-
-	tophys(r7,0)
-
-#ifdef CONFIG_SMP
-	addis	r6,r7,mmu_hash_lock@ha
-	addi	r6,r6,mmu_hash_lock@l
-10:	lwarx	r0,0,r6			/* take the mmu_hash_lock */
-	cmpi	0,r0,0
-	bne-	11f
-	stwcx.	r8,0,r6
-	beq+	12f
-11:	lwz	r0,0(r6)
-	cmpi	0,r0,0
-	beq	10b
-	b	11b
-12:	isync
-#endif
-
-	/*
-	 * Fetch the linux pte and test and set _PAGE_HASHPTE atomically.
-	 * If _PAGE_HASHPTE was already set, we don't replace the existing
-	 * HPTE, so we just unlock and return.
-	 */
-	mr	r8,r5
-#ifndef CONFIG_PTE_64BIT
-	rlwimi	r8,r4,22,20,29
-#else
-	rlwimi	r8,r4,23,20,28
-	addi	r8,r8,PTE_FLAGS_OFFSET
-#endif
-1:	lwarx	r6,0,r8
-	andi.	r0,r6,_PAGE_HASHPTE
-	bne	9f			/* if HASHPTE already set, done */
-#ifdef CONFIG_PTE_64BIT
-#ifdef CONFIG_SMP
-	subf	r10,r6,r8		/* create false data dependency */
-	subi	r10,r10,PTE_FLAGS_OFFSET
-	lwzx	r10,r6,r10		/* Get upper PTE word */
-#else
-	lwz	r10,-PTE_FLAGS_OFFSET(r8)
-#endif /* CONFIG_SMP */
-#endif /* CONFIG_PTE_64BIT */
-	ori	r5,r6,_PAGE_HASHPTE
-	stwcx.	r5,0,r8
-	bne-	1b
-
-	bl	create_hpte
-
-9:
-#ifdef CONFIG_SMP
-	addis	r6,r7,mmu_hash_lock@ha
-	addi	r6,r6,mmu_hash_lock@l
-	eieio
-	li	r0,0
-	stw	r0,0(r6)		/* clear mmu_hash_lock */
-#endif
-
-	/* reenable interrupts and DR */
-	mtmsr	r9
-	SYNC_601
-	isync
-
-	lwz	r0,4(r1)
-	mtlr	r0
-	blr
-
-/*
- * This routine adds a hardware PTE to the hash table.
- * It is designed to be called with the MMU either on or off.
- * r3 contains the VSID, r4 contains the virtual address,
- * r5 contains the linux PTE, r6 contains the old value of the
- * linux PTE (before setting _PAGE_HASHPTE) and r7 contains the
- * offset to be added to addresses (0 if the MMU is on,
- * -KERNELBASE if it is off).  r10 contains the upper half of
- * the PTE if CONFIG_PTE_64BIT.
- * On SMP, the caller should have the mmu_hash_lock held.
- * We assume that the caller has (or will) set the _PAGE_HASHPTE
- * bit in the linux PTE in memory.  The value passed in r6 should
- * be the old linux PTE value; if it doesn't have _PAGE_HASHPTE set
- * this routine will skip the search for an existing HPTE.
- * This procedure modifies r0, r3 - r6, r8, cr0.
- *  -- paulus.
- *
- * For speed, 4 of the instructions get patched once the size and
- * physical address of the hash table are known.  These definitions
- * of Hash_base and Hash_bits below are just an example.
- */
-Hash_base = 0xc0180000
-Hash_bits = 12				/* e.g. 256kB hash table */
-Hash_msk = (((1 << Hash_bits) - 1) * 64)
-
-/* defines for the PTE format for 32-bit PPCs */
-#define HPTE_SIZE	8
-#define PTEG_SIZE	64
-#define LG_PTEG_SIZE	6
-#define LDPTEu		lwzu
-#define LDPTE		lwz
-#define STPTE		stw
-#define CMPPTE		cmpw
-#define PTE_H		0x40
-#define PTE_V		0x80000000
-#define TST_V(r)	rlwinm. r,r,0,0,0
-#define SET_V(r)	oris r,r,PTE_V@h
-#define CLR_V(r,t)	rlwinm r,r,0,1,31
-
-#define HASH_LEFT	31-(LG_PTEG_SIZE+Hash_bits-1)
-#define HASH_RIGHT	31-LG_PTEG_SIZE
-
-_GLOBAL(create_hpte)
-	/* Convert linux-style PTE (r5) to low word of PPC-style PTE (r8) */
-	rlwinm	r8,r5,32-10,31,31	/* _PAGE_RW -> PP lsb */
-	rlwinm	r0,r5,32-7,31,31	/* _PAGE_DIRTY -> PP lsb */
-	and	r8,r8,r0		/* writable if _RW & _DIRTY */
-	rlwimi	r5,r5,32-1,30,30	/* _PAGE_USER -> PP msb */
-	rlwimi	r5,r5,32-2,31,31	/* _PAGE_USER -> PP lsb */
-	ori	r8,r8,0xe04		/* clear out reserved bits */
-	andc	r8,r5,r8		/* PP = user? (rw&dirty? 2: 3): 0 */
-BEGIN_FTR_SECTION
-	rlwinm	r8,r8,0,~_PAGE_COHERENT	/* clear M (coherence not required) */
-END_FTR_SECTION_IFCLR(CPU_FTR_NEED_COHERENT)
-#ifdef CONFIG_PTE_64BIT
-	/* Put the XPN bits into the PTE */
-	rlwimi	r8,r10,8,20,22
-	rlwimi	r8,r10,2,29,29
-#endif
-
-	/* Construct the high word of the PPC-style PTE (r5) */
-	rlwinm	r5,r3,7,1,24		/* put VSID in 0x7fffff80 bits */
-	rlwimi	r5,r4,10,26,31		/* put in API (abbrev page index) */
-	SET_V(r5)			/* set V (valid) bit */
-
-	/* Get the address of the primary PTE group in the hash table (r3) */
-_GLOBAL(hash_page_patch_A)
-	addis	r0,r7,Hash_base@h	/* base address of hash table */
-	rlwimi	r0,r3,LG_PTEG_SIZE,HASH_LEFT,HASH_RIGHT    /* VSID -> hash */
-	rlwinm	r3,r4,20+LG_PTEG_SIZE,HASH_LEFT,HASH_RIGHT /* PI -> hash */
-	xor	r3,r3,r0		/* make primary hash */
-	li	r0,8			/* PTEs/group */
-
-	/*
-	 * Test the _PAGE_HASHPTE bit in the old linux PTE, and skip the search
-	 * if it is clear, meaning that the HPTE isn't there already...
-	 */
-	andi.	r6,r6,_PAGE_HASHPTE
-	beq+	10f			/* no PTE: go look for an empty slot */
-	tlbie	r4
-
-	addis	r4,r7,htab_hash_searches@ha
-	lwz	r6,htab_hash_searches@l(r4)
-	addi	r6,r6,1			/* count how many searches we do */
-	stw	r6,htab_hash_searches@l(r4)
-
-	/* Search the primary PTEG for a PTE whose 1st (d)word matches r5 */
-	mtctr	r0
-	addi	r4,r3,-HPTE_SIZE
-1:	LDPTEu	r6,HPTE_SIZE(r4)	/* get next PTE */
-	CMPPTE	0,r6,r5
-	bdnzf	2,1b			/* loop while ctr != 0 && !cr0.eq */
-	beq+	found_slot
-
-	/* Search the secondary PTEG for a matching PTE */
-	ori	r5,r5,PTE_H		/* set H (secondary hash) bit */
-_GLOBAL(hash_page_patch_B)
-	xoris	r4,r3,Hash_msk>>16	/* compute secondary hash */
-	xori	r4,r4,(-PTEG_SIZE & 0xffff)
-	addi	r4,r4,-HPTE_SIZE
-	mtctr	r0
-2:	LDPTEu	r6,HPTE_SIZE(r4)
-	CMPPTE	0,r6,r5
-	bdnzf	2,2b
-	beq+	found_slot
-	xori	r5,r5,PTE_H		/* clear H bit again */
-
-	/* Search the primary PTEG for an empty slot */
-10:	mtctr	r0
-	addi	r4,r3,-HPTE_SIZE	/* search primary PTEG */
-1:	LDPTEu	r6,HPTE_SIZE(r4)	/* get next PTE */
-	TST_V(r6)			/* test valid bit */
-	bdnzf	2,1b			/* loop while ctr != 0 && !cr0.eq */
-	beq+	found_empty
-
-	/* update counter of times that the primary PTEG is full */
-	addis	r4,r7,primary_pteg_full@ha
-	lwz	r6,primary_pteg_full@l(r4)
-	addi	r6,r6,1
-	stw	r6,primary_pteg_full@l(r4)
-
-	/* Search the secondary PTEG for an empty slot */
-	ori	r5,r5,PTE_H		/* set H (secondary hash) bit */
-_GLOBAL(hash_page_patch_C)
-	xoris	r4,r3,Hash_msk>>16	/* compute secondary hash */
-	xori	r4,r4,(-PTEG_SIZE & 0xffff)
-	addi	r4,r4,-HPTE_SIZE
-	mtctr	r0
-2:	LDPTEu	r6,HPTE_SIZE(r4)
-	TST_V(r6)
-	bdnzf	2,2b
-	beq+	found_empty
-	xori	r5,r5,PTE_H		/* clear H bit again */
-
-	/*
-	 * Choose an arbitrary slot in the primary PTEG to overwrite.
-	 * Since both the primary and secondary PTEGs are full, and we
-	 * have no information that the PTEs in the primary PTEG are
-	 * more important or useful than those in the secondary PTEG,
-	 * and we know there is a definite (although small) speed
-	 * advantage to putting the PTE in the primary PTEG, we always
-	 * put the PTE in the primary PTEG.
-	 *
-	 * In addition, we skip any slot that is mapping kernel text in
-	 * order to avoid a deadlock when not using BAT mappings if
-	 * trying to hash in the kernel hash code itself after it has
-	 * already taken the hash table lock. This works in conjunction
-	 * with pre-faulting of the kernel text.
-	 *
-	 * If the hash table bucket is full of kernel text entries, we'll
-	 * lockup here but that shouldn't happen
-	 */
-
-1:	addis	r4,r7,next_slot@ha		/* get next evict slot */
-	lwz	r6,next_slot@l(r4)
-	addi	r6,r6,HPTE_SIZE			/* search for candidate */
-	andi.	r6,r6,7*HPTE_SIZE
-	stw	r6,next_slot@l(r4)
-	add	r4,r3,r6
-	LDPTE	r0,HPTE_SIZE/2(r4)		/* get PTE second word */
-	clrrwi	r0,r0,12
-	lis	r6,etext@h
-	ori	r6,r6,etext@l			/* get etext */
-	tophys(r6,r6)
-	cmpl	cr0,r0,r6			/* compare and try again */
-	blt	1b
-
-#ifndef CONFIG_SMP
-	/* Store PTE in PTEG */
-found_empty:
-	STPTE	r5,0(r4)
-found_slot:
-	STPTE	r8,HPTE_SIZE/2(r4)
-
-#else /* CONFIG_SMP */
-/*
- * Between the tlbie above and updating the hash table entry below,
- * another CPU could read the hash table entry and put it in its TLB.
- * There are 3 cases:
- * 1. using an empty slot
- * 2. updating an earlier entry to change permissions (i.e. enable write)
- * 3. taking over the PTE for an unrelated address
- *
- * In each case it doesn't really matter if the other CPUs have the old
- * PTE in their TLB.  So we don't need to bother with another tlbie here,
- * which is convenient as we've overwritten the register that had the
- * address. :-)  The tlbie above is mainly to make sure that this CPU comes
- * and gets the new PTE from the hash table.
- *
- * We do however have to make sure that the PTE is never in an invalid
- * state with the V bit set.
- */
-found_empty:
-found_slot:
-	CLR_V(r5,r0)		/* clear V (valid) bit in PTE */
-	STPTE	r5,0(r4)
-	sync
-	TLBSYNC
-	STPTE	r8,HPTE_SIZE/2(r4) /* put in correct RPN, WIMG, PP bits */
-	sync
-	SET_V(r5)
-	STPTE	r5,0(r4)	/* finally set V bit in PTE */
-#endif /* CONFIG_SMP */
-
-	sync		/* make sure pte updates get to memory */
-	blr
-
-	.section .bss
-	.align	2
-next_slot:
-	.space	4
-primary_pteg_full:
-	.space	4
-htab_hash_searches:
-	.space	4
-	.previous
-
-/*
- * Flush the entry for a particular page from the hash table.
- *
- * flush_hash_pages(unsigned context, unsigned long va, unsigned long pmdval,
- *		    int count)
- *
- * We assume that there is a hash table in use (Hash != 0).
- */
-_GLOBAL(flush_hash_pages)
-	tophys(r7,0)
-
-	/*
-	 * We disable interrupts here, even on UP, because we want
-	 * the _PAGE_HASHPTE bit to be a reliable indication of
-	 * whether the HPTE exists (or at least whether one did once).
-	 * We also turn off the MMU for data accesses so that we
-	 * we can't take a hash table miss (assuming the code is
-	 * covered by a BAT).  -- paulus
-	 */
-	mfmsr	r10
-	SYNC
-	rlwinm	r0,r10,0,17,15		/* clear bit 16 (MSR_EE) */
-	rlwinm	r0,r0,0,28,26		/* clear MSR_DR */
-	mtmsr	r0
-	SYNC_601
-	isync
-
-	/* First find a PTE in the range that has _PAGE_HASHPTE set */
-#ifndef CONFIG_PTE_64BIT
-	rlwimi	r5,r4,22,20,29
-#else
-	rlwimi	r5,r4,23,20,28
-#endif
-1:	lwz	r0,PTE_FLAGS_OFFSET(r5)
-	cmpwi	cr1,r6,1
-	andi.	r0,r0,_PAGE_HASHPTE
-	bne	2f
-	ble	cr1,19f
-	addi	r4,r4,0x1000
-	addi	r5,r5,PTE_SIZE
-	addi	r6,r6,-1
-	b	1b
-
-	/* Convert context and va to VSID */
-2:	mulli	r3,r3,897*16		/* multiply context by context skew */
-	rlwinm	r0,r4,4,28,31		/* get ESID (top 4 bits of va) */
-	mulli	r0,r0,0x111		/* multiply by ESID skew */
-	add	r3,r3,r0		/* note code below trims to 24 bits */
-
-	/* Construct the high word of the PPC-style PTE (r11) */
-	rlwinm	r11,r3,7,1,24		/* put VSID in 0x7fffff80 bits */
-	rlwimi	r11,r4,10,26,31		/* put in API (abbrev page index) */
-	SET_V(r11)			/* set V (valid) bit */
-
-#ifdef CONFIG_SMP
-	addis	r9,r7,mmu_hash_lock@ha
-	addi	r9,r9,mmu_hash_lock@l
-	CURRENT_THREAD_INFO(r8, r1)
-	add	r8,r8,r7
-	lwz	r8,TI_CPU(r8)
-	oris	r8,r8,9
-10:	lwarx	r0,0,r9
-	cmpi	0,r0,0
-	bne-	11f
-	stwcx.	r8,0,r9
-	beq+	12f
-11:	lwz	r0,0(r9)
-	cmpi	0,r0,0
-	beq	10b
-	b	11b
-12:	isync
-#endif
-
-	/*
-	 * Check the _PAGE_HASHPTE bit in the linux PTE.  If it is
-	 * already clear, we're done (for this pte).  If not,
-	 * clear it (atomically) and proceed.  -- paulus.
-	 */
-#if (PTE_FLAGS_OFFSET != 0)
-	addi	r5,r5,PTE_FLAGS_OFFSET
-#endif
-33:	lwarx	r8,0,r5			/* fetch the pte flags word */
-	andi.	r0,r8,_PAGE_HASHPTE
-	beq	8f			/* done if HASHPTE is already clear */
-	rlwinm	r8,r8,0,31,29		/* clear HASHPTE bit */
-	stwcx.	r8,0,r5			/* update the pte */
-	bne-	33b
-
-	/* Get the address of the primary PTE group in the hash table (r3) */
-_GLOBAL(flush_hash_patch_A)
-	addis	r8,r7,Hash_base@h	/* base address of hash table */
-	rlwimi	r8,r3,LG_PTEG_SIZE,HASH_LEFT,HASH_RIGHT    /* VSID -> hash */
-	rlwinm	r0,r4,20+LG_PTEG_SIZE,HASH_LEFT,HASH_RIGHT /* PI -> hash */
-	xor	r8,r0,r8		/* make primary hash */
-
-	/* Search the primary PTEG for a PTE whose 1st (d)word matches r5 */
-	li	r0,8			/* PTEs/group */
-	mtctr	r0
-	addi	r12,r8,-HPTE_SIZE
-1:	LDPTEu	r0,HPTE_SIZE(r12)	/* get next PTE */
-	CMPPTE	0,r0,r11
-	bdnzf	2,1b			/* loop while ctr != 0 && !cr0.eq */
-	beq+	3f
-
-	/* Search the secondary PTEG for a matching PTE */
-	ori	r11,r11,PTE_H		/* set H (secondary hash) bit */
-	li	r0,8			/* PTEs/group */
-_GLOBAL(flush_hash_patch_B)
-	xoris	r12,r8,Hash_msk>>16	/* compute secondary hash */
-	xori	r12,r12,(-PTEG_SIZE & 0xffff)
-	addi	r12,r12,-HPTE_SIZE
-	mtctr	r0
-2:	LDPTEu	r0,HPTE_SIZE(r12)
-	CMPPTE	0,r0,r11
-	bdnzf	2,2b
-	xori	r11,r11,PTE_H		/* clear H again */
-	bne-	4f			/* should rarely fail to find it */
-
-3:	li	r0,0
-	STPTE	r0,0(r12)		/* invalidate entry */
-4:	sync
-	tlbie	r4			/* in hw tlb too */
-	sync
-
-8:	ble	cr1,9f			/* if all ptes checked */
-81:	addi	r6,r6,-1
-	addi	r5,r5,PTE_SIZE
-	addi	r4,r4,0x1000
-	lwz	r0,0(r5)		/* check next pte */
-	cmpwi	cr1,r6,1
-	andi.	r0,r0,_PAGE_HASHPTE
-	bne	33b
-	bgt	cr1,81b
-
-9:
-#ifdef CONFIG_SMP
-	TLBSYNC
-	li	r0,0
-	stw	r0,0(r9)		/* clear mmu_hash_lock */
-#endif
-
-19:	mtmsr	r10
-	SYNC_601
-	isync
-	blr
-
-/*
- * Flush an entry from the TLB
- */
-_GLOBAL(_tlbie)
-#ifdef CONFIG_SMP
-	CURRENT_THREAD_INFO(r8, r1)
-	lwz	r8,TI_CPU(r8)
-	oris	r8,r8,11
-	mfmsr	r10
-	SYNC
-	rlwinm	r0,r10,0,17,15		/* clear bit 16 (MSR_EE) */
-	rlwinm	r0,r0,0,28,26		/* clear DR */
-	mtmsr	r0
-	SYNC_601
-	isync
-	lis	r9,mmu_hash_lock@h
-	ori	r9,r9,mmu_hash_lock@l
-	tophys(r9,r9)
-10:	lwarx	r7,0,r9
-	cmpwi	0,r7,0
-	bne-	10b
-	stwcx.	r8,0,r9
-	bne-	10b
-	eieio
-	tlbie	r3
-	sync
-	TLBSYNC
-	li	r0,0
-	stw	r0,0(r9)		/* clear mmu_hash_lock */
-	mtmsr	r10
-	SYNC_601
-	isync
-#else /* CONFIG_SMP */
-	tlbie	r3
-	sync
-#endif /* CONFIG_SMP */
-	blr
-
-/*
- * Flush the entire TLB. 603/603e only
- */
-_GLOBAL(_tlbia)
-#if defined(CONFIG_SMP)
-	CURRENT_THREAD_INFO(r8, r1)
-	lwz	r8,TI_CPU(r8)
-	oris	r8,r8,10
-	mfmsr	r10
-	SYNC
-	rlwinm	r0,r10,0,17,15		/* clear bit 16 (MSR_EE) */
-	rlwinm	r0,r0,0,28,26		/* clear DR */
-	mtmsr	r0
-	SYNC_601
-	isync
-	lis	r9,mmu_hash_lock@h
-	ori	r9,r9,mmu_hash_lock@l
-	tophys(r9,r9)
-10:	lwarx	r7,0,r9
-	cmpwi	0,r7,0
-	bne-	10b
-	stwcx.	r8,0,r9
-	bne-	10b
-	sync
-	tlbia
-	sync
-	TLBSYNC
-	li	r0,0
-	stw	r0,0(r9)		/* clear mmu_hash_lock */
-	mtmsr	r10
-	SYNC_601
-	isync
-#else /* CONFIG_SMP */
-	sync
-	tlbia
-	sync
-#endif /* CONFIG_SMP */
-	blr
+ÿEøÿÿBÆÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿª¨ÿÿj³i³\à]àÿÿ®»¹ëê½ºë¹î«¨ÿÿ²Ğv­u­ÿÿãÓ_°äÓÕ×ÿÿÔ×ÿÿÓ×ÿÿÿÿîÛX¶ÿÿÿÿíÛW¶ÿÿÿÿÿÿïÛV¶ÿÿ_àbà`àaàeà^àfàcàdà°»Väÿÿÿÿ¯»ÿÿòçğçÿÿÿÿë½ïçñçÿÿì½ÿÿ»ëÿÿ¼ëÍÁÿÿLóNóKóMóÖôTöÿÿÿÿoù¬¨w­åÓçÓæÓÿÿØ×l³ÿÿÖ×ÿÿk³Ù×ÿÿÚ×××ÿÿÿÿûÛ`¶óÛùÛÿÿÿÿ[¶^¶òÛY¶öÛlà]¶ÿÿñÛÿÿ÷ÛôÛúÛğÛøÛ\¶_¶õÛZ¶ÿÿò¸hàñ¸oànàø¸ÿÿù¸pàó¸mà÷¸ràiàÿÿkàô¸gàjàqàõ¸sàÿÿÿÿÿÿÿÿÿÿö¸ÿÿ±»[äaäYäbäÿÿXä]äcä`ä_ä^äÿÿWä\äÿÿÿÿZäÿÿñ½î½ûçAèCè@èøçúçEèBèüçFèùçDèï½õ½ó½óçô½ğ½ôçöçõçıçşçÿÿò½ÿÿí½ÿÿÿÿ÷çÿÿÆëâ¿ÿÿ½ëã¿æ¿Âëÿÿ¿ëå¿ÿÿÿÿÃëÄë¾ëÇëÀëÅëä¿ÿÿá¿Áëÿÿ¿îĞÁÎÁÑÁÏÁ¾î»îºîÿÿ½îÿÿÿÿ¼îEñŞÂûğúğÿÿÙÂAñ@ñ÷ğCñüğİÂùğBñøğÚÂÜÂığÛÂşğÿÿDñRóÿÿŞÃOóÿÿSóÿÿÿÿÛÃQóàÃÿÿİÃÿÿPóÿÿßÃTóÚÃÿÿÿÿÿÿÿÿ¼Ä¾ÄÿÿÙô½Ä×ôÜÃØô»ÄCÅEÅVöDÅUöÿÿa÷­Å`÷®Å^÷]÷b÷c÷Føÿÿ_÷ÿÿÿÿÆøÃøÄøÅø\ÆÿÿQùPùOùpùÿÿ¾ù«ùnÆ­¨`°ÿÿÿÿÿÿÿÿÿÿú¸ÿÿÿÿÿÿÿÿÿÿÿÿÿÿö½ÿÿÿÿÈëÿÿÿÿßÂÿÿUóÿÿÿÿÿÿÿÿÿÿÿÿ¬ù®¨îªy­x­ÿÿc°ÿÿèÓa°éÓb°ÿÿÿÿß×Û×ÿÿÿÿm³Ş×İ×Ü×n³à×á×ÿÿÿÿÿÿCÜAÜEÜFÜLÜÿÿHÜJÜÿÿBÜüÛÿÿIÜÿÿÿÿKÜDÜGÜıÛb¶@ÜşÛa¶c¶ÿÿı¸uàwàvà{àû¸ÿÿxàtàyàzàü¸ş¸|àÿÿgäfäÿÿdäeä³»µ»²»´»MèNèIèÿÿJèø½ı½÷½ş½ù½KèÿÿÿÿLèHè@¾û½ÿÿÿÿú½ü½ÿÿGèÿÿÊëè¿ÿÿÿÿÌëê¿ÏëËëÉëÎëé¿Íëÿÿç¿ÿÿÿÿÓÁÖÁÁîÿÿÔÁÀîÒÁÕÁFñGñHñàÂÿÿIñÿÿáÂâÃXóYóWóVóZóáÃİôÛôÜôŞôÚôßôXöÿÿYöWöFÅd÷¯Åe÷HøGøÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ¯¨d¶ÿÿÿÿ@¹ÿÿÿÿÿÿ¶»ÿÿÿÿì¿ÿÿë¿ÿÿÿÿÿÿÿÿãÃ|ÄGÅ°¨d°A¹ÿÿ[óÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ¦Ëÿÿÿÿ±¨ÿÿ´¨³¨²¨ÿÿÿÿ¥ËÿÿÍÍÿÿÏÍïªÿÿÿÿñªÌÍÎÍğªÑÍĞÍÒÍÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ¶Ğ´Ğ|­³Ğ£­~­{­ÿÿ¤­ÿÿ}­¢­ÿÿ¡­µĞÿÿz­ÿÿÿÿÿÿj°ëÓñÓg°n°ÿÿi°îÓğÓl°êÓíÓh°e°ìÓk°ïÓm°f°ÿÿÿÿÿÿÿÿã×æ×p³ÿÿz³v³ä×ÿÿÿÿ~³w³|³r³ÿÿo³q³}³å×u³x³t³y³ç×{³s³â×ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿMÜe¶OÜÿÿg¶i¶ÿÿNÜf¶j¶ÿÿh¶ÿÿÿÿÿÿG¹£àO¹~àÿÿP¹E¹ÿÿ¡àÿÿÿÿJ¹ÿÿ¢àC¹B¹ÿÿM¹L¹K¹I¹N¹}àD¹F¹H¹ÿÿÿÿ¸»»»ÿÿ¿»¹»¾»¼»ÿÿ·»ÿÿ½»º»ÿÿÿÿÿÿRèC¾A¾ÿÿSèÿÿD¾B¾QèPèÿÿğ¿Oèî¿í¿ĞëE¾ï¿Ñëò¿Òëñ¿ØÁÃî×ÁÜÁÚÁÛÁãÂÙÁÂîÓëâÂäÂÿÿäÃåÃÿÿàôÿÿŞÅİÅ¶¨ÿÿÿÿUÊo°ÿÿRÊSÊQÊÿÿTÊÿÿÿÿªË§Ë¬Ë¨Ë·¨º¨ÿÿ©Ë¹¨«Ëÿÿÿÿ¸¨ÿÿÿÿÿÿÿÿÕÍ×ÍôªÓÍÖÍÔÍòªõªÿÿóªÿÿÿÿÿÿÿÿ¸Ğ¼Ğ¹Ğÿÿ§­ÿÿ¨­ÿÿ»Ğÿÿ½Ğ¿Ğÿÿ¥­¾Ğÿÿÿÿ¦­ÿÿÿÿÿÿÿÿÿÿî×ºĞòÓûÓùÓôÓõÓúÓüÓq°ÿÿ÷ÓóÓp°r°öÓıÓøÓÿÿÿÿ¡³ñ×é×ï×ğ×¢³ÿÿè×ê×·Ğì×í×ë×l¶ÿÿÿÿÿÿVÜÔëWÜTÜ£³n¶SÜYÜXÜk¶\ÜRÜ[ÜPÜZÜUÜm¶ÿÿªàÿÿ¥à«à¦à¤à§àQ¹ÿÿ©àÿÿ¨àR¹Á»À»näqäiämäÂ»läjäpäkähäoäÿÿYèH¾JñVèWèUèQÜG¾ZèTèF¾I¾XèÕëó¿Öë×ëÿÿÄîİÁKñLñÿÿÿÿMñ]ó\óâôÿÿáô[ö\öZöf÷°Å»¨ª­©­u°t°@ÔAÔşÓÿÿs°õ×ÿÿö×ò×¤³ó×ÿÿô×ÿÿÿÿÿÿÿÿ_ÜaÜ]Ü`Üo¶^Üp¶ÿÿÿÿsİU¹T¹ÿÿS¹ÿÿ¬à­àÿÿÿÿsäuäÆ»Ã»ÿÿÅ»Ä»täräÿÿÿÿÿÿÿÿÿÿaè^è_èM¾`è[è\èJ¾ÿÿK¾]èL¾ÿÿÛëÿÿÜëÙëÚëô¿ØëÿÿÿÿÿÿÿÿÿÿÈîÅîÇîàÁËîßÁÉîÌîÊîÆîŞÁÿÿOñÿÿPñNñÿÿRñåÂæÂ_óçÃQñ^óæÃåôæô¿Ääôÿÿãôÿÿ]öHÅÿÿIøÈøÇøÿÿCÆ]ÆÉøqùÿÿoÆ¼¨öªÿÿV¹ÿÿÀÄ½¨«­¥³q¶çÂ÷ªÿÿÁĞÀĞBÔÿÿx°v°z°DÔÿÿy°w°ÿÿÿÿÿÿÿÿCÔ¨³ü×ÿÿ§³©³BØ«³ş×@Ø÷×ª³CØÿÿÿÿù×ÿÿú×ø×¦³ÿÿAØû×ı×ÿÿÿÿÿÿmÜÿÿlÜjÜbÜqÜeÜoÜvÜnÜy¶ÿÿu¶cÜÿÿiÜw¶ÿÿhÜx¶z¶kÜÿÿr¶s¶wÜuÜÿÿtÜfÜÿÿrÜÿÿv¶ÿÿÿÿÿÿÿÿt¶sÜdÜgÜpÜÿÿÿÿÿÿÿÿÿÿºä·àÿÿ°àÃàÌà³àa¹ÿÿÀàW¹Y¹e¹±àÿÿÿÿZ¹\¹f¹[¹ÿÿÿÿÿÿÿÿd¹¹àÿÿ®àb¹¸à^¹Êàc¹Èà¼àÆà`¹¯àÉàÄàÿÿËàX¹ÿÿÿÿg¹]¹ÿÿÿÿµàÿÿ½àÁàÿÿÅà_¹´à²à¾àÿÿÿÿÿÿÿÿ»àºàÿÿ¿àÂàÿÿÇàÿÿÿÿÿÿxäÿÿÇ»¤äzäÌ»Ğ»­äµä¦äÈ»ÿÿªä¶àÿÿÉ»±ä¶ä®äÿÿ°ä¹ä²ä~ä©äÿÿÿÿÑ»ÿÿÍ»|ä«äË»¥äÊ»³ä¢äyäÎ»¸äÿÿÿÿ{ä¯ä¬ä§äwävä¡ä´äÏ»·ä}ä£äR¾ÿÿÿÿÿÿÿÿÿÿZ¾U¾¤è¡ègèP¾ÿÿÿÿÿÿO¾V¾ÿÿÿÿÿÿeèT¾qècèdèN¾£èX¾tèyèsèîëoèwèuèhèbè}èW¾~èÿÿxèÿÿmèkèfèÿÿÿÿÿÿnè{èjèzè¢èÿÿÿÿS¾ÿÿvè|èrèlèQ¾ÿÿÿÿÿÿ¨äpèY¾ièÿÿÿÿÿÿÿÿÿÿôë÷¿óëğëDìû¿ÿÿAìøëCìéëöëÿÿı¿ÿÿáëÿÿßëBìÿÿ@ìşëíëìëâë@ÀÿÿèëòëıëCÀEìÿÿèÁEÀş¿æëÿÿïëŞëàëõ¿BÀú¿çë÷ëñëAÀİëãÁùëüëü¿ÿÿëëDÀù¿ÿÿÿÿÿÿø¿õëûëö¿ÿÿäëúëÿÿÿÿåëÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿêëÒîÿÿ×îåÁçÁİîáÁìîãîØîÙîâîÿÿîÁáîÑîàîÔîíîíÁëÁÕîÿÿèîÿÿÚîçîÿÿéîĞîæÁÿÿêîÿÿÿÿŞîÿÿêÁÛîÿÿÿÿìÁäîÿÿÿÿÿÿäÁÖîåîÿÿßîãëæîÓîÿÿéÁÿÿëîÿÿâÁÎîÿÿÿÿÿÿÿÿ`ñYñéÂÿÿTñcñ[ñÜîÿÿeñUñÿÿèÂ_ñêÂòÂğÂaññÂWñÿÿXñ]ñbñÿÿÍîëÂjñgñkñ^ñZñhñjó\ñÿÿîÂÿÿíÂÏîïÂdñfñìÂiñSñÿÿVñÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿsóÿÿcóëÃqóÿÿÿÿaóìÃÿÿlóÿÿhóñÃróbóeóéÃtóÿÿmópóïÃôÃòÃiódóÿÿíÃîÃ`óêÃÿÿèÃğÃoóóÃÿÿkóuóõÃÿÿÿÿÿÿgóÿÿnóÿÿÿÿÿÿÿÿÿÿÿÿóôBõõôüôfóúôéô@õÃÄíôşôôôÿÿÿÿÂÄÿÿÿÿDõöôÿÿûôıôçôAõòô÷ôëôïôCõùôèôìôîôøôÿÿÁÄñôÿÿÿÿÿÿÿÿÿÿÿÿêôÿÿÿÿÿÿÿÿÿÿÿÿÿÿğôaöföOÅhöÿÿIÅÿÿdöjöNÅJÅÿÿKÅ`ögöMÅeöLÅ_öcöböÿÿ^öiöÿÿÿÿÿÿ±Åm÷p÷l÷n÷o÷i÷j÷g÷ÿÿÿÿk÷h÷²Å³ÅÿÿÿÿKøÿÿMøÿÿÿÿÿÿÿÿÿÿLøNøÿÿàÅÿÿJøßÅáÅÿÿÿÿÿÿËøÌøDÆÊøÿÿSùRùTù_ÆUù^ÆVùrùuùtùhÆsùÿÿÿÿÿÿrÆpÆqÆwÆÀùÁù¿ùÉùøªÿÿÿÿDØxÜ¥èvóÿÿÿÿùªÿÿ¬­{°ÿÿÿÿEØÿÿFØ¬³ÿÿ}¶zÜyÜ£¶|¶{Ü~¶¢¶¡¶{¶ÿÿÿÿÿÿh¹ÿÿÿÿĞàÎàÿÿÏàÍàÿÿÒ»ÿÿÕ»×»Ö»ÿÿÿÿÓ»Ô»ÿÿ§è¦è[¾¨èÿÿ©è\¾ÿÿÿÿÿÿMìKìóîÿÿIìJìFÀFìNìHìLìïîÿÿÿÿñîÿÿòîóÁîîòÁğîïÁğÁñÁGìÿÿÿÿõÂnñlñmñóÂöÂôÂÿÿÿÿÿÿwóxóöÃÿÿEõGõFõÄÄPÅmölököúªÿÿªÉÿÿXÊé¦VÊYÊWÊÿÿÿÿÿÿ®ËÿÿÁ¨ÿÿÂ¨°Ë¿¨¯Ë­ËÀ¨¾¨ÿÿÿÿÿÿÿÿÿÿÿÿØÍÛÍıªÚÍÙÍÿÿüªûªÿÿ@«ÜÍşªÿÿÿÿÿÿÿÿÿÿÆĞ®­¯­°­ÇĞÃĞ­­ÄĞÿÿÅĞÂĞÿÿÿÿÿÿ¤°ÿÿÿÿ¡°EÔ¢°¥°FÔÿÿ~°|°}°£°ÿÿÿÿÿÿÿÿÿÿ­³IØµ³HØÿÿKØ±³JØ«¶¯³²³®³³³´³°³ÿÿÿÿÿÿGØ§¶}Üÿÿ£Üÿÿÿÿ¢Ü¬¶¨¶©¶|Ü~Ü¡Ü¤¶¦¶ÿÿª¶¥¶ÿÿÿÿÓàÑàÒàj¹k¹ÿÿÔài¹Ø»ÿÿÚ»Ù»ÿÿ»äÿÿÿÿ¼ä«èÿÿªèÿÿÿÿGÀHÀOìIÀÿÿöîÿÿôîÿÿõîôÁÿÿoñ÷ÃÿÿÿÿÿÿõÁA«ÿÿ¦°GÔÿÿÿÿLØ¶³­¶¤Ü¦Ü¯¶®¶°¶±¶¥Ün¹o¹m¹Û»l¹ÕàÿÿÿÿÿÿÜ»¬èPìJÀöÁpñtñùÂqñúÂøÂuñûÂsñÿÿyó÷ÂøÃÿÿÍøÿÿÿÿB«¸³·³ÿÿÿÿÿÿÿÿ²¶¨Ü§Ü³¶ÿÿÿÿÙàs¹p¹Øàr¹Öàq¹ÿÿ×àÿÿ½äİ»ÿÿ¯èÿÿ]¾­è^¾_¾®è`¾ÿÿQìÿÿNÀKÀPÀSìLÀRìOÀÿÿÿÿMÀÿÿùîûîÿÿÿÿ÷ÁúîøÁøî÷îÿÿwñvñüÂxñ~óúÃ}ózóùÃ{ó|óÿÿHõIõÅÄÿÿSÅÿÿÿÿnöÿÿÿÿQÅRÅoöÿÿÿÿ´ÅµÅq÷ÿÿÿÿEÆÏøGÆÿÿÎøĞøFÆWùÿÿ­ùÿÿÿÿÿÿÿÿÿÿÿÿC«ÿÿÿÿÿÿt¹ÿÿ¾äÿÿ°èQÀRÀÿÿD«ÿÿa¾ûÃ±­ÿÿÿÿÿÿSÀÿÿâÅ²­MØÿÿ©Üÿÿ«ÜÿÿªÜÿÿİàÚàu¹ÿÿv¹ÛàÜàÿÿÀäÅäŞ»¿äÁäÈäÃäÇäÄäÂäÆäß»ÿÿÿÿ³èÿÿ±èc¾ÿÿb¾²èd¾ÿÿÿÿÿÿÿÿVìÿÿÿÿUìTÀTìüîÿÿşîAï@ïÿÿùÁıî¡ñıÂ}ñ¢ñşÂÿÿ{ñÿÿ~ñ|ñyñ@Ãzñÿÿÿÿÿÿÿÿ¡óÿÿÿÿ£ó¢óÿÿJõÿÿKõÿÿÿÿÿÿpöÿÿ·Åÿÿ¶ÅOøPøHÆÑøÿÿiÆÿÿ³­´¶ÊäÉäµè´èÿÿÿÿúÁCïBï¥ñ£ñ¦ñ¤ñÿÿÿÿüÃ¤ó¥ó¦óÿÿqöÿÿr÷ÿÿÒøÿÿÿÿÿÿÿÿÿÿÿÿÿÿ´­ÿÿÿÿWìDïÿÿµ­ÿÿÿÿà»ÿÿXìAÃ§ñıÃÿÿLõMõTÅQø¶­»³¼³NØµ¶¶¶¬Ü·¶ÿÿz¹ÿÿ|¹ßàààŞàw¹x¹{¹y¹ÿÿÿÿËäá»â»ÿÿÿÿ¼èg¾·è¶èÿÿ»èe¾ÿÿÿÿ[Àÿÿ¸è½èºè¹èÿÿf¾ÿÿYÀÿÿZìUÀÿÿ[ìÿÿÿÿYìÿÿXÀVÀZÀÿÿWÀÿÿÿÿÿÿÿÿÿÿEïÿÿJïFïIïûÁÿÿÔíHïGïÿÿDÃBÃEÃCÃ¨ñ©ñªñFÃÿÿÿÿÿÿªó@Ä¨óÿÿAÄ§ó©óşÃQõNõÿÿOõPõröVÅÿÿUÅÿÿt÷s÷¸ÅÿÿÿÿÿÿãÅIÆ`ÆXù®ù¯ùÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ·­­ÜÿÿÿÿáàÌäÍäã»ÿÿä»¾èh¾ÿÿÿÿüÁÿÿ«ñÿÿGÃ­óBÄ¬ó®ó«óuöRõSõÿÿÆÄÿÿtöÿÿÿÿsöÿÿu÷°ùÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ¸­ÿÿÿÿÿÿ¹­ÿÿÿÿ§°HÔÿÿOØÿÿ¸¶ÿÿ»¶¹¶®Üÿÿ½¶ÿÿº¶ÿÿÿÿ¼¶ÿÿ~¹ÿÿâàÿÿÿÿãàÀèÿÿ}¹¡¹¢¹ÏäÿÿÎäå»ÿÿæ»ÿÿĞä¿èè»i¾ÿÿç»ÿÿÿÿÿÿ\ÀÁèk¾j¾ÂèÅèÃèÄèl¾ÿÿaÀ_Àÿÿÿÿ^À]ìÿÿ`Àÿÿÿÿ\ìKïÿÿ^ì]À_ìNïLïMïRïKÃQïTïSïPïOïÿÿıÁÿÿÿÿÿÿÿÿ®ñÿÿ­ñJÃHÃIÃÿÿ¬ñÿÿ±óÿÿCÄÿÿ°ó¯óDÄÿÿXõWõÿÿUõÿÿTõÈÄÇÄYõv÷¹ÅwöWÅvöVõÿÿw÷äÅÿÿaÆYùÿÿ±ùÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿº­PØUï»­ÿÿÿÿÒäÑä`ìÿÿÿÿWïÿÿVïÿÿLÃ²ó³óÉÄÿÿÿÿ²ù¨°¿¶¾¶äàæà¤¹åà£¹¥¹çàÿÿÿÿÿÿÔäÖäÕäÿÿØäÿÿÿÿÿÿé»×äÓäÿÿÿÿÿÿÙäÿÿÌèÿÿÏèÑèÇèËèÈèn¾q¾s¾ÉèÊèr¾ÍèĞèÎèt¾ÿÿp¾Æèm¾ÿÿo¾ÿÿÿÿcÀfìdìcìÿÿiìÿÿhìgìÿÿbìbÀaìÿÿeìdÀÿÿÿÿZïÿÿ^ï[ï]ï\ïYï_ïbï`ïaï@ÂşÁXïcï³ñ¶ñ¸ñ·ñÿÿ±ñµñ°ñÿÿ²ñMÃ¯ñÿÿ´ñÿÿÿÿÀóµóEÄÿÿÿÿFÄ´ó¹ó¿ó·ó¾óÿÿ»óÿÿºó½ó¸ó¶óÿÿ¼óÿÿ`õ^õÊÄ]õcõaõÿÿËÄ\õZõÿÿ[õÍÄ_õÌÄbõxö~öÿÿÿÿyö[Å¡öZÅ}ö|öYÅ{öXÅzöÿÿ}÷¡÷~÷ÿÿ{÷»Åx÷|÷£÷ÿÿ¢÷y÷z÷ºÅRøçÅÿÿSøåÅæÅÿÿÿÿÓøJÆvùÿÿjÆÿÿ³ùkÆ´ùµùÃùÂùzÆÍùÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ©°ÿÿÿÿéàÿÿèàÿÿê»ë»ÚäÿÿÒèlìÿÿÿÿu¾eÀjìÿÿmìfÀÿÿdïkì¹ñNÃÁóÿÿÿÿÿÿfõdõÿÿÿÿeõÿÿÿÿ¢öÿÿ\Å¤÷êÅ¼ÅèÅéÅÔøbÆÿÿª°ÿÿÿÿÿÿºñÿÿÿÿIÔÿÿ¦¹ÿÿÛäÿÿÿÿì»ÜäÿÿÿÿÿÿÔèÓèhÀv¾w¾ÿÿ×èÖèÕèÿÿÿÿnìqìÿÿpìoìgÀhïfïeïgïÿÿOÃ¼ñ½ñPÃÿÿ»ñÿÿÃóÂóÅóGÄÄóÿÿgõiõhõÿÿÿÿ£ö¦ö¤ö¥ö¥÷½ÅÿÿÿÿÿÿTøUøVøÿÿKÆcÆ¶ù«°ÿÿx¾iÀ¾ñÿÿ¦÷ÿÿÿÿÄùJÔÿÿ{Æ¬°rìÿÿ¿ñÿÿÆóÿÿÿÿ§ö§÷­°ÿÿİäŞäÿÿí»î»Ùèz¾y¾ØèÿÿiïÿÿÀñÂñÁñSÃRÃQÃÿÿ^Å¨öÿÿ]Å©÷¨÷ÿÿLÆÕø½³êàÿÿÿÿÿÿáäßäàäÿÿÿÿâèÿÿİèÚèáèÿÿÿÿÿÿãèÿÿÿÿ|¾àèÜèÿÿÿÿÛèßèŞè{¾ÿÿÿÿ}ìxìvì¡ìwìÿÿsìÿÿyìÿÿÿÿtìrïuì¢ìÿÿÿÿÿÿÿÿÿÿÿÿÿÿ|ìjÀ{ìzìÿÿ~ìÿÿÿÿÿÿÿÿjïmïÿÿÿÿlïÿÿtïoïsïÿÿqïpïnïÿÿkïÿÿCÂBÂÿÿDÂAÂuïÿÿÿÿÿÿÿÿÿÿÈñËñÿÿÉñÍñÿÿÿÿÿÿÎñÿÿÆñXÃÇñÿÿÅñÌñÿÿÄñÃñWÃUÃTÃÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÊñÏóÕóJÄĞóÿÿÓó×óKÄÒóÿÿÊóÿÿÉóÖóÍóÿÿËóÔóÌóIÄHÄÿÿÇóÈóÑóÿÿÿÿÿÿÎóÿÿÿÿÿÿÿÿÿÿÿÿlõoõÿÿÿÿÿÿÿÿVÃmõsõqõkõvõÿÿjõÿÿÏÄrõÿÿÿÿÿÿnõÎÄuõÿÿÿÿtõÿÿÿÿÿÿÿÿ«öªöÿÿÿÿÿÿ±öÿÿ­ö°ö`Åÿÿÿÿ®ö¯öÿÿ©ö¬ö_Åÿÿÿÿÿÿ¿Å´÷¯÷³÷ÿÿ¶÷²÷ÿÿ®÷ÿÿÁÅ±÷µ÷ÀÅ¬÷põ°÷ÿÿÿÿ­÷ÿÿª÷ÿÿ«÷¾ÅZø\ø_ø[ø`øÿÿYøÿÿWøÿÿëÅ]øíÅìÅXø^øÿÿÿÿÿÿÿÿÚøMÆÛøÿÿÙøÖøÿÿÿÿØø×øZùÿÿÿÿÿÿÿÿ\ù[ùÿÿÿÿyùÿÿxùwùzùÿÿsÆtÆÊùÎùÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ¾³¯Üíàÿÿ§¹ëàÿÿÿÿìàÿÿÿÿÿÿâäãäñ»ï»ääğ»èèÿÿëèåèìèäèæèÿÿçèêèÿÿÿÿ¡¾ïèîè}¾éèíè~¾ÿÿÿÿÿÿÿÿÿÿÿÿ¬ìÿÿoÀÿÿ§ìkÀÿÿ¤ìªì­ìÿÿpÀÿÿ©ì¦ì®ì¥ìÿÿ«ìlÀÿÿ£ìmÀÿÿnÀ¨ìÿÿÿÿÿÿ©ïzï{ï~ï|ïÿÿvïÿÿÿÿyï¥ï}ïÿÿÿÿEÂÿÿ§ï¤ïFÂ¦ïwï¢ï£ïÿÿ¡ïÿÿÿÿÿÿÿÿÒñÔñ×ñÿÿÿÿÑñÿÿYÃÙñĞñÚñÿÿÖñØñÜñÕñİñÓñÏñZÃÿÿÛñ[ÃMÄÿÿÿÿÿÿÿÿÿÿxïñóèóOÄäóPÄÿÿÿÿíóçóİóNÄêóåóæóÿÿØóßóîóÿÿëóÿÿãóÿÿïóŞóÙóìóÿÿÛóéóàóğóÜóLÄÚóáóâóÿÿÿÿÿÿ}õÿÿ{õÿÿ¢õÿÿ®õ¥õ|õxõ§õ~õ£õzõªõwõ¡õ¦õ¨õ«õyõÿÿ¯õ°õ©õ­õ¤õÿÿÁöÄöÿÿaÅÿÿÃöÈöÆöbÅ½ö³ö²ödÅ¿öÀö¼ö´öÿÿ¹ö¬õÿÿµöcÅ»öÿÿºöÿÿ¶öÂöÿÿ·ö»÷ÅöÇö¾ö¸ö¼÷¾÷¸÷ÂÅÿÿÅ÷Ã÷ÃÅÂ÷Á÷º÷·÷½÷Æ÷¹÷¿÷ÿÿiønødøgøîÅkøÿÿrøÀ÷ÿÿeøoøsøjøcømøÿÿløqøpøÄ÷høbøføNÆOÆaøÿÿæøİøåøâøãøÜøßøçøáøàøŞøÿÿäøÿÿ]ùÿÿ^ùÿÿ`ù_ùbùaù|ù{ù·ùÿÿ¸ùÿÿÅùxÆ|ÆÿÿÏù}Æÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ¿³ÿÿÿÿÿÿĞÄÉöÿÿPÆQÆÿÿÀ³îàÿÿ¨¹ğèÿÿÿÿ°ì±ì¯ì«ïªïGÂßñ¬ïŞñÿÿÿÿóóQÄSÄòóÿÿÿÿRÄÿÿ±õ³õ²õÊöeÅÿÿïÅèøcùÿÿÿÿÒùÁ³ÿÿåäÿÿ¢¾ÿÿÿÿÿÿ³ì²ìÿÿ­ïÿÿÿÿÿÿTÄÑÄÇ÷ËùÿÿÿÿÿÿÂ³ò»ÿÿ£¾ÿÿôóÿÿtøÀ¶ÿÿÿÿÿÿÿÿ®ïÿÿÿÿÿÿdÆÁ¶¤¾HÂuøÂ¶ÿÿñèrÀ´ìµìÿÿqÀÿÿ¯ïLÂJÂKÂIÂàñ\Ãÿÿÿÿÿÿµõ´õ·õ¶õÒÄÿÿÿÿËöÿÿÍöÌöfÅÈ÷ÿÿvøwøğÅdù}ùuÆÿÿ°Ü¶ì°ïõóïàÿÿ±ïâñáñÿÿÿÿÿÿÿÿxøRÆÿÿeù~ùÿÿÿÿÿÿ©¹òèóèÿÿ·ìª¹ÿÿ]ÃãñÿÿÏögÅĞöÎöyøÿÿéøÿÿ«¹ÿÿ´ï³ï²ïäñÿÿÿÿèñçñæñåñ^Ãöó¹õÓÄ¸õÑöË÷Ê÷ÄÅÉ÷|ø{øzøÿÿÿÿó»ÿÿ¸ìMÂÿÿ÷óøóÌ÷}øÿÿÿÿêøfù¹ùÔùô»NÂéñùóÒö~øÿÿÿÿ¦¾ÿÿµïêñúóûóüó¾õÿÿºõhÅ½õ¼õÔÄ»õÖÄÿÿÕÄÔöÓöiÅjÅÿÿÿÿÆÅÍ÷ÅÅÿÿ£ø¤ø¢ø¡øTÆÿÿëøìøíøSÆgùjùiùhùÿÿÿÿÓùÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿsÀÿÿÿÿeÃ¿õÕöÿÿÇÅÎ÷ÿÿÿÿÕùÿÿÿÿÿÿtÀÿÿÿÿÿÿ¶ïÿÿÏ÷ÿÿ¡ùJÉüİJ¡W¡ÿÿY¡[¡_¡`¡c¡d¡g¡h¡k¡l¡o¡p¡s¡t¡w¡x¡{¡|¡ÿÿÿÿÿÿÿÿÆ¡Ç¡Ê¡Ë¡È¡É¡\¡M¡ÿÿO¡ÿÿQ¡R¡S¡T¡ÿÿ}¡~¡¡¡¢¡£¡¤¡Ì¡Í¡Î¡Ş¡ß¡à¡á¡â¡ÿÿÿÿL¢M¢N¢I¡ÿÿ­¡C¢H¢®¡ÿÿ]¡^¡¯¡Ï¡A¡Ğ¡D¡A¢¯¢°¢±¢²¢³¢´¢µ¢¶¢·¢¸¢G¡F¡Õ¡×¡Ö¡H¡I¢Ï¢Ğ¢Ñ¢Ò¢Ó¢Ô¢Õ¢Ö¢×¢Ø¢Ù¢Ú¢Û¢Ü¢İ¢Ş¢ß¢à¢á¢â¢ã¢ä¢å¢æ¢ç¢è¢ÿÿB¢ÿÿÿÿÄ¡ÿÿé¢ê¢ë¢ì¢í¢î¢ï¢ğ¢ñ¢ò¢ó¢ô¢õ¢ö¢÷¢ø¢ù¢ú¢û¢ü¢ı¢ş¢@£A£B£C£a¡U¡b¡ÿÿÿÿÿÿÿÿÿÿÿÿN¡ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÃ¡         0ÿ00ÿ" ÿÿÿÿ0ş& % PşdÿRş· TşUşVşWş\ÿ 1ş 3şt%4şOşÿ	ÿ5ş6ş[ÿ]ÿ7ş8ş009ş:ş00;ş<ş
+00=ş>ş0	0?ş@ş00AşBş00CşDşYşZşşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ[ş\ş]ş^ş    005 2 ÿÿ
+ÿ; § 0Ë%Ï%³%²%Î%&&Ç%Æ%¡% %½%¼%£2!> ãÿ?ÿÍIşJşMşNşKşLş_ş`şaşÿÿ× ÷ ± "ÿÿÿf"g"`""R"a"bşcşdşeşfş<")"*"¥" ""¿"Ò3Ñ3+"."5"4"@&B&A&	&‘!“!!’!–!—!™!˜!%"#"ÿ<ÿÿ<ÿÿ¥ 0¢ £ ÿ ÿ!	!işjşkşÕ3œ333Î3¡333Ä3° YQ[Q^Q]QaQcQçUétÎ|%‚%ƒ%„%…%†%‡%ˆ%%%%Œ%‹%Š%‰%<%4%,%$%%”% %%•%%%%%m%şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿn%p%o%P%^%j%a%â%ã%å%ä%q%r%s%ÿÿÿÿÿÿÿÿÿÿ`!a!b!c!d!e!f!g!h!i!!0"0#0$0%0&0'0(0)0ASDSES!ÿ"ÿ#ÿ$ÿ%ÿ&ÿ'ÿ(ÿ)ÿ*ÿ+ÿ,ÿ-ÿ.ÿ/ÿ0ÿ1ÿ2ÿ3ÿ4ÿ5ÿ6ÿ7ÿ8ÿ9ÿ:ÿAÿBÿCÿDÿEÿFÿGÿHÿIÿJÿKÿLÿMÿNÿOÿPÿQÿRÿSÿTÿUÿVÿWÿXÿYÿZÿ‘’“”•–—˜™š›œŸ ¡£¤¥¦§¨©±²³´µ¶·¸¹º»¼½¾¿ÀÁÃÄÅÆÇÈÉ1111	1
+111111şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ1111111111111111 1!1"1#1$1%1&1'1(1)1ÙÉÊÇË NYNNNCN]N†NŒNºN?QeQkQàQ RR›RSAS\SÈS	NNN
+N+N8NáQENHN_N^NN¡N@QRúRCSÉSãSWëXY'YsYP[Q[S[ø[\"\8\q\İ]å]ñ]ò]ó]ş]r^ş^__MbşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿNNN-N0N9NKN9\ˆN‘N•N’N”N¢NÁNÀNÃNÆNÇNÍNÊNËNÄNCQAQgQmQnQlQ—QöQRRRûRşRÿRS9SHSGSES^S„SËSÊSÍSìX)Y+Y*Y-YT[\$\:\o\ô]{^ÿ^__Ã_b6bKbNb/e‡e—e¤e¹eåeğfg(g kbkykËkÔkÛkl4lkp*r6r;rGrYr[r¬r‹sNNNNN;NMNONNNåNØNÔNÕNÖN×NãNäNÙNŞNEQDQ‰QŠQ¬QùQúQøQ
+R RŸRSSSSßNJSISaS`SoSnS»SïSäSóSìSîSéSèSüSøSõSëSæSêSòSñSğSåSíSûSÛVÚVYşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ.Y1YtYvYU[ƒ[<\è]ç]æ]^^s^|^___Å_
+bSbTbRbQb¥eæe.g,g*g+g-gckÍkll8lAl@l>l¯r„s‰sÜtætuu(u)u0u1u2u3u‹u}v®v¿vîvÛwâwów:y¾ytzËzNNRNSNiN™N¤N¦N¥NÿN	OO
+OOOOOOòNöNûNğNóNıNOOIQGQFQHQhQqQQ°QRRRRR£RS!S SpSqS	TTT
+TTTTTTTTTTTTàVŞVİV3W0W(W-W,W/W)WYY7Y8Y„YxYƒY}YyY‚YYW[X[‡[ˆ[…[‰[ú[\y\Ş]^v^t^şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ__Ù_Ö_bbbbcb[bXb6eéeèeìeíeòfóf	g=g4g1g5g!kdk{kl]lWlYl_l`lPlUlal[lMlNlpp_r]r~vùzs|ø|6Š½€€€€3€€‰€‹€Œ€ãêóü‚‚‚n‚r‚~‚k†@ˆLˆcˆ‰!–2N¨NMOOOGOWO^O4O[OUO0OPOQO=O:O8OCOTO<OFOcO\O`O/ONO6OYO]OHOZOLQKQMQuQ¶Q·Q%R$R)R*R(R«R©RªR¬R#SsSuST-TT>T&TNT'TFTCT3THTBTT)TJT9T;T8T.T5T6T T<T@T1T+TT,TêVğVäVëVJWQW@WMWşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿGWNW>WPWOW;WïX>YY’Y¨YY£Y™Y–YY¤Y“YŠY¥Y][\[Z[[[Œ[‹[[,\@\A\?\>\\‘\”\Œ\ë]^^‡^Š^÷^__d_b_w_y_Ø_Ì_×_Í_ñ_ë_ø_ê_bb„b—b–b€bvb‰bmbŠb|b~bybsb’bob˜bnb•b“b‘b†b9e;e8eñeôf_gNgOgPgQg\gVg^gIgFg`gSgWgekÏkBl^l™llˆl‰l…l›ljlzllplŒlhl–l’l}lƒlrl~ltl†lvll”l˜l‚lvp|p}pxpbrar`rÄrÂr–s,u+u7u8u‚vïvãwÁyÀy¿yvzû|U–€“€€˜€›€š€²€o‚’‚şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ‹‚‚‹‰Ò‰ Š7ŒFŒUŒŒdp³«Ê›°ÂÆÅÄá]‘¢ª¦£I‘Æ‘Ì‘2–.–1–*–,–&NVNsN‹N›NN«N¬NoOOOsOOlO›O‹O†OƒOpOuOˆOiO{O–O~OO‘OzOTQRQUQiQwQvQxQ½QıQ;R8R7R:R0R.R6RAR¾R»RRSTSSSQSfSwSxSySÖSÔS×SsTuT–TxT•T€T{TwT„T’T†T|TTqTvTŒTšTbThT‹T}TTúVƒWwWjWiWaWfWdW|WYIYGYHYDYTY¾Y»YÔY¹Y®YÑYÆYĞYÍYËYÓYÊY¯Y³YÒYÅY_[d[c[—[š[˜[œ[™[›[\H\E\şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿF\·\¡\¸\©\«\±\³\^^^^^^x^š^—^œ^•^–^ö^&_'_)_€___|_İ_à_ı_õ_ÿ_``/`5``*``!`'`)`+``bb?b>b@bbÉbÌbÄb¿bÂb¹bÒbÛb«bÓbÔbËbÈb¨b½b¼bĞbÙbÇbÍbµbÚb±bØbÖb×bÆb¬bÎb>e§e¼eúeffffff fff
+ffggmg‹g•gqgœgsgwg‡gg—gogpgg‰g~ggugšg“g|gjgrg#kfkgkkllãlèlól±lÌlål³l½l¾l¼lâl«lÕlÓl¸lÄl¹lÁl®l×lÅlñl¿l»lálÛlÊl¬lïlÜlÖlàlşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ•pp’pŠp™p,r-r8rHrgrirÀrÎrÙr×rĞr©s¨sŸs«s¥s=uu™ušu„vÂvòvôvåwıw>y@yAyÉyÈyzzyzúzş|TŒ‹€º€¥€¢€±€¡€«€©€´€ª€¯€åş‚³‚‚™‚­‚½‚Ÿ‚¹‚±‚¬‚¥‚¯‚¸‚£‚°‚¾‚·‚N†q†RhˆËÎÔÑµ¸±¶Ç‘Ñ‘w•€•–@–?–;–D–B–¹–è–R—^—ŸN­N®NáOµO¯O¿OàOÑOÏOİOÃO¶OØOßOÊO×O®OĞOÄOÂOÚOÎOŞO·OWQ’Q‘Q QNRCRJRMRLRKRGRÇRÉRÃRÁRSWS{SšSÛS¬TÀT¨TÎTÉT¸T¦T³TÇTÂT½TªTÁTşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿÄTÈT¯T«T±T»T©T§T¿TÿV‚W‹W W£W¢WÎW®W“WUYQYOYNYPYÜYØYÿYãYèYZåYêYÚYæYZûYi[£[¦[¤[¢[¥[\N\O\M\K\Ù\Ò\÷]^%^^}^ ^¦^ú^_-_e_ˆ_…_Š_‹_‡_Œ_‰_`` `%``(`M`p`h`b`F`C`l`k`j`d`AbÜbc	cübíbcîbıbcñb÷bïbìbşbôbcc?eEe«e½eâe%f-f f'f/ff(f1f$f÷fÿgÓgñgÔgĞgìg¶g¯gõgégïgÄgÑg´gÚgåg¸gÏgŞgóg°gÙgâgİgÒgjkƒk†kµkÒk×klÉlm2m*mAm%mm1mmmşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ;m=m>m6mmõl9m'm8m)m.m5mm+m«pºp³p¬p¯p­p¸p®p¤p0rrrortréràrár·sÊs»s²sÍsÀs³su-uOuLuNuKu«u¤u¥u¢u£uxv†v‡vˆvÈvÆvÃvÅvwùvøv	wwşvüvwÜwxxxxFyIyHyGy¹yºyÑyÒyËyzzÿzız}|}} }	}}}}8¿€€€€6€Ö€å€Ú€Ã€Ä€Ì€á€Û€Î€Ş€ä€İ€ô"‚ç‚ƒƒã‚Û‚æ‚ƒå‚ƒ	ƒÒ‚×‚ñ‚ƒÜ‚Ô‚Ñ‚Ş‚Ó‚ß‚ï‚ƒP†y†{†z†Mˆkˆ‰Ô‰ŠŠŠŒ Œts´ÍÌğæâêåşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿíëäèÊÎÁÃK‘J‘Í‘‚•P–K–L–M–b—i—Ë—í—ó—˜¨˜Û˜ß˜–™™™XN³NPP#PïO&P%PøO)PPP<PPPPPúO PP(PñO!PPPPóOîO-P*PşO+P	P|Q¤Q¥Q¢QÍQÌQÆQËQVR\RTR[R]R*SSŸSSßSèTUU7UüTåTòTUúTUéTíTáT	UîTêTæT'UUıTUWWÂWÔWËWÃW	XYWYXYZYZZZZZZìY Z#Z)Z%ZZ	Zk[X\°[³[¶[´[®[µ[¹[¸[\Q\U\P\í\ı\û\ê\è\ğ\ö\]ô\î]-^+^«^­^§^1_’_‘__Y`şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿc`e`P`U`m`i`o`„`Ÿ`š``”`Œ`…`–`GbóbcÿbNc>c/cUcBcFcOcIc:cPc=c*c+c(cMcLcHeIe™eÁeÅeBfIfOfCfRfLfEfAføfggg!h8hHhFhSh9hBhTh)h³hhLhQh=hôgPh@h<hCh*hEhhhAhŠk‰k·k#l'l(l&l$lğljm•mˆm‡mfmxmwmYm“mlm‰mnmZmtmimŒmŠmym…mem”mÊpØpäpÙpÈpÏp9ryrürùrırør÷r†sís	tîsàsêsŞsTu]u\uZuYu¾uÅuÇu²u³u½u¼u¹uÂu¸u‹v°vÊvÍvÎv)ww w(wéw0x'x8xx4x7xşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ%x-x xx2xUyPy`y_yVy^y]yWyZyäyãyçyßyæyéyØy„zˆzÙz{{‰|!}}}
+} }"}}}}}}}}}:_”ÅÁ€€€€€=€?€ñ€ğ€í€ô€ø€ó€ı€
+ü€ï€íì ‚‚*‚+‚(‚,‚»‚+ƒRƒTƒJƒ8ƒPƒIƒ5ƒ4ƒOƒ2ƒ9ƒ6ƒƒ@ƒ1ƒ(ƒCƒT†Š†ª†“†¤†©†Œ†£†œ†pˆwˆˆ‚ˆ}ˆyˆŠŠŠŠŠ
+ŠŠŠŠŠŠHŒzŒyŒ¡Œ¢Œw¬ÒÔÏ±÷ úôıø•áİâR‘M‘L‘Ø‘İ‘×‘Ü‘Ù‘ƒ•b–c–a–şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ[–]–d–X–^–»–â˜¬™¨šØš%›2›<›~NzP}P\PGPCPLPZPIPePvPNPUPuPtPwPOPPoPmP\Q•QğQjRoRÒRÙRØRÕRSSS?S@S>SÃSüfFUjUfUDU^UaUCUJU1UVUOUUU/UdU8U.U\U,UcU3UAUWUWW	WßWX
+XXàWäWúWX5X÷WùW YbY6ZAZIZfZjZ@Z<ZbZZZFZJZp[Ç[Å[Ä[Â[¿[Æ[	\\\`\\\]\]]]]]"]])]]]$]']]â]8^6^3^7^·^¸^¶^µ^¾^5_7_W_l_i_k_—_™__˜_¡_ _œ_`£`‰` `¨`Ë`´`æ`½`şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿÅ`»`µ`Ü`¼`Ø`Õ`Æ`ß`¸`Ú`Ç`bbHb c§crc–c¢c¥cwcgc˜cªcqc©c‰cƒc›ckc¨c„cˆc™c¡c¬c’cc€c{cichczc]eVeQeYeWe_UOeXeUeTeœe›e¬eÏeËeÌeÎe]fZfdfhfff^fùf×Rgh¯h¢h“hµhhvh±h§h—h°hƒhÄh­h†h…h”hh¨hŸh¡h‚h2kºkëkìk+lm¼mómÙm²mámÌmämûmúmnÇmËm¯mÑm®mŞmùm¸m÷mõmÅmÒmnµmÚmëmØmêmñmîmèmÆmÄmªmìm¿mæmùp	q
+qıpïp=r}rrsssss‡st
+tttşstàtötşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ÷tu"ueufubupuuÔuÕuµuÊuÍuvÔvÒvÛv7w>w<w6w8w:wkxCxNxeyhymyûy’z•z {({{,{&{{{.{’|—|•|F}C}q}.}9}<}@}0}3}D}/}B}2}1}=šÌÎÒ€J€F€/#+)0$‚5‚7‚6‚9‚ƒƒ˜ƒxƒ¢ƒ–ƒ½ƒ«ƒ’ƒŠƒ“ƒ‰ƒ ƒwƒ{ƒ|ƒ†ƒ§ƒU†j_Ç†À†¶†Ä†µ†Æ†Ë†±†¯†É†Sˆˆˆˆ«ˆ’ˆ–ˆˆ‹ˆ“‰‰*ŠŠ#Š%Š1Š-ŠŠŠ"ŠIŒZŒ©Œ¬Œ«Œ¨ŒªŒ§Œgf¾ºÛß# "şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿèíıW‘Î‘õ‘æ‘ã‘ç‘í‘é‘‰•j–u–s–x–p–t–v–w–l–À–ê–é–àzßz˜˜Z›åœu¥»¢PP…P™P‘P€P–P˜PšP gñQrRtRuRiRŞRİRÛRZS¥S{U€U§U|UŠUU˜U‚UœUªU”U‡U‹UƒU³U®UŸU>U²UšU»U¬U±U~U‰U«U™UW/X*X4X$X0X1X!XX XùXúX`YwZšZZ’Z›Z§Zs[q[Ò[Ì[Ó[Ğ[
+\\1\L]P]4]G]ı]E^=^@^C^~^Ê^Á^Â^Ä^<_m_©_ª_¨_Ñ`á`²`¶`à`a#aú`ağ`û`ô`hañ`aö`	a aabIb£cŒcÏcÀcécÉcÆcÍcşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿÒcãcĞcácÖcícîcvcôcêcÛcRdÚcùc^efebece‘ee¯enfpftfvfof‘fzf~fwfşfÿfggúhÕhàhØh×hißhõhîhçhùhÒhòhãhËhÍhiiiÉhÚhniûh>k:k=k˜k–k¼kïk.l/l,l/n8nTn!n2ngnJn n%n#nn[nXn$nVnnn-n&non4nMn:n,nCnn>nËn‰nnNncnDnrnin_nqq&q0q!q6qnqqLr„r€r6s%s4s)s:t*t3t"t%t5t6t4t/tt&t(t%u&ukujuâuÛuãuÙuØuŞuàu{v|v–v“v´vÜvOwíw]xlxoxzzzz z˜zşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ—z–zåzãzI{V{F{P{R{T{M{K{O{Q{Ÿ|¥|^}P}h}U}+}n}r}a}f}b}p}s}„UÔÕ€R€…€UTKQN9F>LSt‚‚éƒ„øƒ„àƒÅƒ„ÁƒïƒñƒôƒW„
+„ğƒ„ÌƒıƒòƒÊƒ8„„„Üƒ„Ôƒßƒ[†ß†Ù†í†Ô†Û†ä†Ğ†Ş†WˆÁˆÂˆ±ˆƒ‰–‰;Š`ŠUŠ^Š<ŠAŠTŠ[ŠPŠFŠ4Š:Š6ŠVŠaŒ‚Œ¯Œ¼Œ³Œ½ŒÁŒ»ŒÀŒ´Œ·Œ¶Œ¿Œ¸ŒŠ…ÎİËÚÑÌÛÆûøüœ.51826‘õ	‘şc‘e‘Ï‘’’#’	’’’’’’”••‹•‘•şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿ“•’••Š––‹–}–…–†––r–„–Á–Å–Ä–Æ–Ç–ï–ò–Ì—˜˜˜ç˜ê˜ï˜é˜ò˜í˜®™­™ÃÍÑ‚N­PµP²P³PÅP¾P¬P·P»P¯PÇPRwR}RßRæRäRâRãR/SßUèUÓUæUÎUÜUÇUÑUãUäUïUÚUáUÅUÆUåUÉUWW^XQXXXWXZXTXkXLXmXJXbXRXKXgYÁZÉZÌZ¾Z½Z¼Z³ZÂZ²Zi]o]L^y^É^È^_Y_¬_®_aaHaaó`aù`aaNaLaDaMa>a4a'aaa7a!b"bd>dd*d-d=d,ddddd6ddddleŸe°e—f‰f‡fˆf–f„f˜ffg”imişÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿZiwi`iTiui0i‚iJihiki^iSiyi†i]ici[iGkrkÀk¿kÓkık¢n¯nÓn¶nÂnnnÇnÅn¥n˜n¼nºn«nÑn–nœnÄnÔnªn§n´nNqYqiqdqIqgq\qlqfqLqeq^qFqhqVq:rRr7sEs?s>sotZtUt_t^tAt?tYt[t\tvuxu vğuvòuñuúuÿuôuóuŞvßv[wkwfw^wcwywjwlw\wewhwbwîwx°x—x˜xŒx‰x|x‘x“xxzyyy,„½yzz zzzzŸz zw{À{`{n{g{±|³|µ|“}y}‘}}}[}nijr©¨¤V€X€†€„€qpxenskşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿyzf‚G‚‚„w„=„1„u„f„k„I„l„[„<„5„a„c„i„m„F„^†\†_†ù†‡‡‡ ‡ş†û†‡‡‡
+‡YˆßˆÔˆÙˆÜˆØˆİˆáˆÊˆÕˆÒˆœ‰ã‰kŠrŠsŠfŠiŠpŠ‡Š|ŠcŠ ŠqŠ…ŠmŠbŠnŠlŠyŠ{Š>ŠhŠbŒŠŒ‰ŒÊŒÇŒÈŒÄŒ²ŒÃŒÂŒÅŒáßèïóúêäæ²	ş
+Ÿ²KJSBT<UPGONMQ>A‘‘l‘j‘i‘É‘7’W’8’=’@’>’[’K’d’Q’4’I’M’E’9’?’Z’˜•˜–”–•–Í–Ë–É–Ê–÷–û–ù–ö–V—t—v—˜˜˜
+˜˜˜ü˜ô˜şÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿı˜ş˜³™±™´™ášéœ‚ŸŸ ŸçPîPåPÖPíPÚPÕPÏPÑPñPÎPéPbQóQƒR‚R1S­SşU VVVıUVV	VVV÷UVVVVöUWWuX~XƒX“XŠXyX…X}XıX%Y"Y$YjYiYáZæZéZ×ZÖZØZãZu[Ş[ç[á[å[æ[è[â[ä[ß[\b\„]‡][^c^U^W^T^Ó^Ö^
+_F_p_¹_Ga?aKawabaca_aZaXaua*b‡dXdTd¤dxd_dzdQdgd4dmd{dre¡e×eÖe¢f¨ffœi¨i•iÁi®iÓiËi›i·i»i«i´iĞiÍi­iÌi¦iÃi£iIkLk3l3ooşnoôn)o>o o,ooo"oşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿÿnïno1o8o2o#oo+o/oˆo*oìnoònÌn÷n”q™q}qŠq„q’q>r’r–rDsPsdtctjtptmtu‘u'vvv	vvávãv„w}wwawÁxŸx§x³x©x£xyyy.z1zªz©zízïz¡{•{‹{u{—{{”{{¸{‡{„{¹|½|¾|»}°}œ}½}¾} }Ê}´}²}±}º}¢}¿}µ}¸}­}Ò}Ç}¬}pàáß^€Z€‡€P€ˆŠ‚çú‚‚‚K‚É„¿„Æ„Ä„™„„²„œ„Ë„¸„À„Ó„„¼„Ñ„Ê„?‡‡;‡"‡%‡4‡‡U‡7‡)‡óˆ‰ôˆùˆøˆıˆèˆ‰ïˆ¦ŠŒŠŠ£ŠŠ¡Š“Š¤ŠşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿşÿªŠ¥Š¨Š˜Š‘ŠšŠ§ŠjŒŒŒŒÓŒÑŒÒŒk™•ü£`X\cY^b][‘‘‘u‘x‘w‘t‘x’€’…’˜’–’{’“’œ’¨’

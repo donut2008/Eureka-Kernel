@@ -1,8 +1,1 @@
-obj-$(CONFIG_SUNRPC_XPRT_RDMA) += rpcrdma.o
-
-rpcrdma-y := transport.o rpc_rdma.o verbs.o \
-	fmr_ops.o frwr_ops.o physical_ops.o \
-	svc_rdma.o svc_rdma_transport.o \
-	svc_rdma_marshal.o svc_rdma_sendto.o svc_rdma_recvfrom.o \
-	module.o
-rpcrdma-$(CONFIG_SUNRPC_BACKCHANNEL) += backchannel.o
+DEOGRAPH-F92A€IDEOGRAPH-F929€IDEOGRAPH-F928€IDEOGRAPH-F927€IDEOGRAPH-F926€IDEOGRAPH-F925€IDEOGRAPH-F924€IDEOGRAPH-F923€IDEOGRAPH-F922€IDEOGRAPH-F921€IDEOGRAPH-F920€IDEOGRAPH-F91F€IDEOGRAPH-F91E€IDEOGRAPH-F91D€IDEOGRAPH-F91C€IDEOGRAPH-F91B€IDEOGRAPH-F91A€IDEOGRAPH-F919€IDEOGRAPH-F918€IDEOG

@@ -1,2 +1,3 @@
-/* At the time of this writing, there's no equivalent ld option. */
-OUTPUT_ARCH (crisv32)
+.Şv‚-ÀX€näƒJ.
+ìu‚-#ğ	¬1y‚#Jv‚B
+åt‚1IÖ	X-	¡

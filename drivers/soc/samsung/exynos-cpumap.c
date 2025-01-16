@@ -1,85 +1,35 @@
-/*
- * Copyright (c) 2016 Samsung Electronics Co., Ltd.
- *	      http://www.samsung.com/
- *
- * EXYNOS - mapping cpu onto physical core
- * Author: Park Bumgyu <bumgyu.park@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/io.h>
-#include <linux/smc.h>
-#include <asm/cputype.h>
-
-#ifndef CONFIG_SOC_EXYNOS7885
-static char lot_id[6];
-
-static u32 CHIPID_ReverseValue(u32 uValue, u32 nBitCnt)
-{
-	u32 uTemp, uRetValue = 0;
-	u32 i;
-
-	for (i = 0; i < nBitCnt; i++) {
-		uTemp = (uValue >> i) & 0x1;
-		uRetValue += uTemp << ((nBitCnt - 1) - i);
-	}
-
-	return uRetValue;
-}
-
-static void CHIPID_DecTo36(u32 in, char *p)
-{
-	u32 nMod;
-	u32 i;
-
-	for (i = 4; i >= 1; i--) {
-		nMod = in % 36;
-		in /= 36;
-		p[i] = (nMod < 10) ? (nMod + '0') : (nMod - 10 + 'A');
-	}
-
-	p[0] = 'N';
-	p[5] = 0;
-}
-
-void __init get_lot_id(void)
-{
-	void __iomem *reg;
-	int value;
-
-	reg = early_ioremap(0x10000004, SZ_4K);
-	value = __raw_readl(reg);
-	early_iounmap(reg, SZ_4K);
-
-	value = CHIPID_ReverseValue(value, 32);
-	value = (value >> 11) & 0x1fffff;
-	CHIPID_DecTo36(value, lot_id);
-
-	pr_info("Lot ID = %s\n", lot_id);
-}
-#else
-void __init get_lot_id(void) { }
-#endif
-
-u64 get_auto_cpu_hwid(u32 cpu)
-{
-	int ret = exynos_smc(SMC_CMD_CPUMAP, cpu, 0, 0);
-
-	if (ret < 0)
-		return INVALID_HWID;
-#ifndef CONFIG_SOC_EXYNOS7885
-	if (cpu >= 4) {
-		if (strcmp(lot_id, "NZNP4") == 0 ||
-				strcmp(lot_id, "NZNP5") == 0 ||
-				strcmp(lot_id, "NZNP7") == 0 ||
-				strcmp(lot_id, "NZNRH") == 0 ||
-				strcmp(lot_id, "NZNVK") == 0 ||
-				strcmp(lot_id, "NZNV2") == 0)
-			return INVALID_HWID;
-	}
-#endif
-	return ret;
-}
+_STAT__SW_INT_STAT__SHIFT 0x0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SN_MASK 0xf
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SN__SHIFT 0x0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SP_MASK 0xf0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SP__SHIFT 0x4
+#define GPIOPAD_MASK__GPIO_MASK_MASK 0x7fffffff
+#define GPIOPAD_MASK__GPIO_MASK__SHIFT 0x0
+#define GPIOPAD_A__GPIO_A_MASK 0x7fffffff
+#define GPIOPAD_A__GPIO_A__SHIFT 0x0
+#define GPIOPAD_EN__GPIO_EN_MASK 0x7fffffff
+#define GPIOPAD_EN__GPIO_EN__SHIFT 0x0
+#define GPIOPAD_Y__GPIO_Y_MASK 0x7fffffff
+#define GPIOPAD_Y__GPIO_Y__SHIFT 0x0
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_0_MASK 0x1
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_0__SHIFT 0x0
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_1_MASK 0x2
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_1__SHIFT 0x1
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_2_MASK 0x4
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_2__SHIFT 0x2
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_3_MASK 0x8
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_3__SHIFT 0x3
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_4_MASK 0x10
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_4__SHIFT 0x4
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_5_MASK 0x20
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_5__SHIFT 0x5
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_6_MASK 0x40
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_6__SHIFT 0x6
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_7_MASK 0x80
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_7__SHIFT 0x7
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_8_MASK 0x100
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_8__SHIFT 0x8
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_9_MASK 0x200
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_9__SHIFT 0x9
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_10_MASK 0x400
+#define GPIOPAD_PINSTRAPS__GPIO_P

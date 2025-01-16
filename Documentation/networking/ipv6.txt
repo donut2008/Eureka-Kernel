@@ -1,72 +1,106 @@
+lx\n", m->status);
 
-Options for the ipv6 module are supplied as parameters at load time.
+	if (m->status & MCI_STATUS_ADDRV)
+		pr_emerg(HW_ERR "MC%d Error Address: 0x%016llx\n", m->bank, m->addr);
 
-Module options may be given as command line arguments to the insmod
-or modprobe command, but are usually specified in either
-/etc/modules.d/*.conf configuration files, or in a distro-specific
-configuration file.
+	if (!fam_ops)
+		goto err_code;
 
-The available ipv6 module parameters are listed below.  If a parameter
-is not specified the default value is used.
+	switch (m->bank) {
+	case 0:
+		decode_mc0_mce(m);
+		break;
 
-The parameters are as follows:
+	case 1:
+		decode_mc1_mce(m);
+		break;
 
-disable
+	case 2:
+		decode_mc2_mce(m);
+		break;
 
-	Specifies whether to load the IPv6 module, but disable all
-	its functionality.  This might be used when another module
-	has a dependency on the IPv6 module being loaded, but no
-	IPv6 addresses or operations are desired.
+	case 3:
+		decode_mc3_mce(m);
+		break;
 
-	The possible values and their effects are:
+	case 4:
+		decode_mc4_mce(m);
+		break;
 
-	0
-		IPv6 is enabled.
+	case 5:
+		decode_mc5_mce(m);
+		break;
 
-		This is the default value.
+	case 6:
+		decode_mc6_mce(m);
+		break;
 
-	1
-		IPv6 is disabled.
+	default:
+		break;
+	}
 
-		No IPv6 addresses will be added to interfaces, and
-		it will not be possible to open an IPv6 socket.
+ err_code:
+	amd_decode_err_code(m->status & 0xffff);
 
-		A reboot is required to enable IPv6.
+	return NOTIFY_STOP;
+}
+EXPORT_SYMBOL_GPL(amd_decode_mce);
 
-autoconf
+static struct notifier_block amd_mce_dec_nb = {
+	.notifier_call	= amd_decode_mce,
+};
 
-	Specifies whether to enable IPv6 address autoconfiguration
-	on all interfaces.  This might be used when one does not wish
-	for addresses to be automatically generated from prefixes
-	received in Router Advertisements.
+static int __init mce_amd_init(void)
+{
+	struct cpuinfo_x86 *c = &boot_cpu_data;
 
-	The possible values and their effects are:
+	if (c->x86_vendor != X86_VENDOR_AMD)
+		return -ENODEV;
 
-	0
-		IPv6 address autoconfiguration is disabled on all interfaces.
+	fam_ops = kzalloc(sizeof(struct amd_decoder_ops), GFP_KERNEL);
+	if (!fam_ops)
+		return -ENOMEM;
 
-		Only the IPv6 loopback address (::1) and link-local addresses
-		will be added to interfaces.
+	switch (c->x86) {
+	case 0xf:
+		fam_ops->mc0_mce = k8_mc0_mce;
+		fam_ops->mc1_mce = k8_mc1_mce;
+		fam_ops->mc2_mce = k8_mc2_mce;
+		break;
 
-	1
-		IPv6 address autoconfiguration is enabled on all interfaces.
+	case 0x10:
+		fam_ops->mc0_mce = f10h_mc0_mce;
+		fam_ops->mc1_mce = k8_mc1_mce;
+		fam_ops->mc2_mce = k8_mc2_mce;
+		break;
 
-		This is the default value.
+	case 0x11:
+		fam_ops->mc0_mce = k8_mc0_mce;
+		fam_ops->mc1_mce = k8_mc1_mce;
+		fam_ops->mc2_mce = k8_mc2_mce;
+		break;
 
-disable_ipv6
+	case 0x12:
+		fam_ops->mc0_mce = f12h_mc0_mce;
+		fam_ops->mc1_mce = k8_mc1_mce;
+		fam_ops->mc2_mce = k8_mc2_mce;
+		break;
 
-	Specifies whether to disable IPv6 on all interfaces.
-	This might be used when no IPv6 addresses are desired.
+	case 0x14:
+		fam_ops->mc0_mce = cat_mc0_mce;
+		fam_ops->mc1_mce = cat_mc1_mce;
+		fam_ops->mc2_mce = k8_mc2_mce;
+		break;
 
-	The possible values and their effects are:
+	case 0x15:
+		xec_mask = c->x86_model == 0x60 ? 0x3f : 0x1f;
 
-	0
-		IPv6 is enabled on all interfaces.
+		fam_ops->mc0_mce = f15h_mc0_mce;
+		fam_ops->mc1_mce = f15h_mc1_mce;
+		fam_ops->mc2_mce = f15h_mc2_mce;
+		break;
 
-		This is the default value.
-
-	1
-		IPv6 is disabled on all interfaces.
-
-		No IPv6 addresses will be added to interfaces.
-
+	case 0x16:
+		xec_mask = 0x1f;
+		fam_ops->mc0_mce = cat_mc0_mce;
+		fam_o

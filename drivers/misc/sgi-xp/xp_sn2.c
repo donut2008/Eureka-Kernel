@@ -1,190 +1,159 @@
-/*
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- *
- * Copyright (c) 2008 Silicon Graphics, Inc.  All Rights Reserved.
- */
+_REG];
+	u32 eir = I915_READ(EIR);
+	int pipe, i;
 
-/*
- * Cross Partition (XP) sn2-based functions.
- *
- *      Architecture specific implementation of common functions.
- */
+	if (!eir)
+		return;
 
-#include <linux/module.h>
-#include <linux/device.h>
-#include <asm/sn/bte.h>
-#include <asm/sn/sn_sal.h>
-#include "xp.h"
+	pr_err("render error detected, EIR: 0x%08x\n", eir);
 
-/*
- * The export of xp_nofault_PIOR needs to happen here since it is defined
- * in drivers/misc/sgi-xp/xp_nofault.S. The target of the nofault read is
- * defined here.
- */
-EXPORT_SYMBOL_GPL(xp_nofault_PIOR);
+	i915_get_extra_instdone(dev, instdone);
 
-u64 xp_nofault_PIOR_target;
-EXPORT_SYMBOL_GPL(xp_nofault_PIOR_target);
+	if (IS_G4X(dev)) {
+		if (eir & (GM45_ERROR_MEM_PRIV | GM45_ERROR_CP_PRIV)) {
+			u32 ipeir = I915_READ(IPEIR_I965);
 
-/*
- * Register a nofault code region which performs a cross-partition PIO read.
- * If the PIO read times out, the MCA handler will consume the error and
- * return to a kernel-provided instruction to indicate an error. This PIO read
- * exists because it is guaranteed to timeout if the destination is down
- * (amo operations do not timeout on at least some CPUs on Shubs <= v1.2,
- * which unfortunately we have to work around).
- */
-static enum xp_retval
-xp_register_nofault_code_sn2(void)
-{
-	int ret;
-	u64 func_addr;
-	u64 err_func_addr;
-
-	func_addr = *(u64 *)xp_nofault_PIOR;
-	err_func_addr = *(u64 *)xp_error_PIOR;
-	ret = sn_register_nofault_code(func_addr, err_func_addr, err_func_addr,
-				       1, 1);
-	if (ret != 0) {
-		dev_err(xp, "can't register nofault code, error=%d\n", ret);
-		return xpSalError;
-	}
-	/*
-	 * Setup the nofault PIO read target. (There is no special reason why
-	 * SH_IPI_ACCESS was selected.)
-	 */
-	if (is_shub1())
-		xp_nofault_PIOR_target = SH1_IPI_ACCESS;
-	else if (is_shub2())
-		xp_nofault_PIOR_target = SH2_IPI_ACCESS0;
-
-	return xpSuccess;
-}
-
-static void
-xp_unregister_nofault_code_sn2(void)
-{
-	u64 func_addr = *(u64 *)xp_nofault_PIOR;
-	u64 err_func_addr = *(u64 *)xp_error_PIOR;
-
-	/* unregister the PIO read nofault code region */
-	(void)sn_register_nofault_code(func_addr, err_func_addr,
-				       err_func_addr, 1, 0);
-}
-
-/*
- * Convert a virtual memory address to a physical memory address.
- */
-static unsigned long
-xp_pa_sn2(void *addr)
-{
-	return __pa(addr);
-}
-
-/*
- * Convert a global physical to a socket physical address.
- */
-static unsigned long
-xp_socket_pa_sn2(unsigned long gpa)
-{
-	return gpa;
-}
-
-/*
- * Wrapper for bte_copy().
- *
- *	dst_pa - physical address of the destination of the transfer.
- *	src_pa - physical address of the source of the transfer.
- *	len - number of bytes to transfer from source to destination.
- *
- * Note: xp_remote_memcpy_sn2() should never be called while holding a spinlock.
- */
-static enum xp_retval
-xp_remote_memcpy_sn2(unsigned long dst_pa, const unsigned long src_pa,
-		     size_t len)
-{
-	bte_result_t ret;
-
-	ret = bte_copy(src_pa, dst_pa, len, (BTE_NOTIFY | BTE_WACQUIRE), NULL);
-	if (ret == BTE_SUCCESS)
-		return xpSuccess;
-
-	if (is_shub2()) {
-		dev_err(xp, "bte_copy() on shub2 failed, error=0x%x dst_pa="
-			"0x%016lx src_pa=0x%016lx len=%ld\\n", ret, dst_pa,
-			src_pa, len);
-	} else {
-		dev_err(xp, "bte_copy() failed, error=%d dst_pa=0x%016lx "
-			"src_pa=0x%016lx len=%ld\\n", ret, dst_pa, src_pa, len);
+			pr_err("  IPEIR: 0x%08x\n", I915_READ(IPEIR_I965));
+			pr_err("  IPEHR: 0x%08x\n", I915_READ(IPEHR_I965));
+			for (i = 0; i < ARRAY_SIZE(instdone); i++)
+				pr_err("  INSTDONE_%d: 0x%08x\n", i, instdone[i]);
+			pr_err("  INSTPS: 0x%08x\n", I915_READ(INSTPS));
+			pr_err("  ACTHD: 0x%08x\n", I915_READ(ACTHD_I965));
+			I915_WRITE(IPEIR_I965, ipeir);
+			POSTING_READ(IPEIR_I965);
+		}
+		if (eir & GM45_ERROR_PAGE_TABLE) {
+			u32 pgtbl_err = I915_READ(PGTBL_ER);
+			pr_err("page table error\n");
+			pr_err("  PGTBL_ER: 0x%08x\n", pgtbl_err);
+			I915_WRITE(PGTBL_ER, pgtbl_err);
+			POSTING_READ(PGTBL_ER);
+		}
 	}
 
-	return xpBteCopyError;
-}
-
-static int
-xp_cpu_to_nasid_sn2(int cpuid)
-{
-	return cpuid_to_nasid(cpuid);
-}
-
-static enum xp_retval
-xp_expand_memprotect_sn2(unsigned long phys_addr, unsigned long size)
-{
-	u64 nasid_array = 0;
-	int ret;
-
-	ret = sn_change_memprotect(phys_addr, size, SN_MEMPROT_ACCESS_CLASS_1,
-				   &nasid_array);
-	if (ret != 0) {
-		dev_err(xp, "sn_change_memprotect(,, "
-			"SN_MEMPROT_ACCESS_CLASS_1,) failed ret=%d\n", ret);
-		return xpSalError;
+	if (!IS_GEN2(dev)) {
+		if (eir & I915_ERROR_PAGE_TABLE) {
+			u32 pgtbl_err = I915_READ(PGTBL_ER);
+			pr_err("page table error\n");
+			pr_err("  PGTBL_ER: 0x%08x\n", pgtbl_err);
+			I915_WRITE(PGTBL_ER, pgtbl_err);
+			POSTING_READ(PGTBL_ER);
+		}
 	}
-	return xpSuccess;
-}
 
-static enum xp_retval
-xp_restrict_memprotect_sn2(unsigned long phys_addr, unsigned long size)
-{
-	u64 nasid_array = 0;
-	int ret;
-
-	ret = sn_change_memprotect(phys_addr, size, SN_MEMPROT_ACCESS_CLASS_0,
-				   &nasid_array);
-	if (ret != 0) {
-		dev_err(xp, "sn_change_memprotect(,, "
-			"SN_MEMPROT_ACCESS_CLASS_0,) failed ret=%d\n", ret);
-		return xpSalError;
+	if (eir & I915_ERROR_MEMORY_REFRESH) {
+		pr_err("memory refresh error:\n");
+		for_each_pipe(dev_priv, pipe)
+			pr_err("pipe %c stat: 0x%08x\n",
+			       pipe_name(pipe), I915_READ(PIPESTAT(pipe)));
+		/* pipestat has already been acked */
 	}
-	return xpSuccess;
+	if (eir & I915_ERROR_INSTRUCTION) {
+		pr_err("instruction error\n");
+		pr_err("  INSTPM: 0x%08x\n", I915_READ(INSTPM));
+		for (i = 0; i < ARRAY_SIZE(instdone); i++)
+			pr_err("  INSTDONE_%d: 0x%08x\n", i, instdone[i]);
+		if (INTEL_INFO(dev)->gen < 4) {
+			u32 ipeir = I915_READ(IPEIR);
+
+			pr_err("  IPEIR: 0x%08x\n", I915_READ(IPEIR));
+			pr_err("  IPEHR: 0x%08x\n", I915_READ(IPEHR));
+			pr_err("  ACTHD: 0x%08x\n", I915_READ(ACTHD));
+			I915_WRITE(IPEIR, ipeir);
+			POSTING_READ(IPEIR);
+		} else {
+			u32 ipeir = I915_READ(IPEIR_I965);
+
+			pr_err("  IPEIR: 0x%08x\n", I915_READ(IPEIR_I965));
+			pr_err("  IPEHR: 0x%08x\n", I915_READ(IPEHR_I965));
+			pr_err("  INSTPS: 0x%08x\n", I915_READ(INSTPS));
+			pr_err("  ACTHD: 0x%08x\n", I915_READ(ACTHD_I965));
+			I915_WRITE(IPEIR_I965, ipeir);
+			POSTING_READ(IPEIR_I965);
+		}
+	}
+
+	I915_WRITE(EIR, eir);
+	POSTING_READ(EIR);
+	eir = I915_READ(EIR);
+	if (eir) {
+		/*
+		 * some errors might have become stuck,
+		 * mask them.
+		 */
+		DRM_ERROR("EIR stuck: 0x%08x, masking\n", eir);
+		I915_WRITE(EMR, I915_READ(EMR) | eir);
+		I915_WRITE(IIR, I915_RENDER_COMMAND_PARSER_ERROR_INTERRUPT);
+	}
 }
 
-enum xp_retval
-xp_init_sn2(void)
+/**
+ * i915_handle_error - handle a gpu error
+ * @dev: drm device
+ *
+ * Do some basic checking of register state at error time and
+ * dump it to the syslog.  Also call i915_capture_error_state() to make
+ * sure we get a record and make it available in debugfs.  Fire a uevent
+ * so userspace knows something bad happened (should trigger collection
+ * of a ring dump etc.).
+ */
+void i915_handle_error(struct drm_device *dev, bool wedged,
+		       const char *fmt, ...)
 {
-	BUG_ON(!is_shub());
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	va_list args;
+	char error_msg[80];
 
-	xp_max_npartitions = XP_MAX_NPARTITIONS_SN2;
-	xp_partition_id = sn_partition_id;
-	xp_region_size = sn_region_size;
+	va_start(args, fmt);
+	vscnprintf(error_msg, sizeof(error_msg), fmt, args);
+	va_end(args);
 
-	xp_pa = xp_pa_sn2;
-	xp_socket_pa = xp_socket_pa_sn2;
-	xp_remote_memcpy = xp_remote_memcpy_sn2;
-	xp_cpu_to_nasid = xp_cpu_to_nasid_sn2;
-	xp_expand_memprotect = xp_expand_memprotect_sn2;
-	xp_restrict_memprotect = xp_restrict_memprotect_sn2;
+	i915_capture_error_state(dev, wedged, error_msg);
+	i915_report_and_clear_eir(dev);
 
-	return xp_register_nofault_code_sn2();
+	if (wedged) {
+		atomic_or(I915_RESET_IN_PROGRESS_FLAG,
+				&dev_priv->gpu_error.reset_counter);
+
+		/*
+		 * Wakeup waiting processes so that the reset function
+		 * i915_reset_and_wakeup doesn't deadlock trying to grab
+		 * various locks. By bumping the reset counter first, the woken
+		 * processes will see a reset in progress and back off,
+		 * releasing their locks and then wait for the reset completion.
+		 * We must do this for _all_ gpu waiters that might hold locks
+		 * that the reset work needs to acquire.
+		 *
+		 * Note: The wake_up serves as the required memory barrier to
+		 * ensure that the waiters see the updated value of the reset
+		 * counter atomic_t.
+		 */
+		i915_error_wake_up(dev_priv, false);
+	}
+
+	i915_reset_and_wakeup(dev);
 }
 
-void
-xp_exit_sn2(void)
+/* Called from drm generic code, passed 'crtc' which
+ * we use as a pipe index
+ */
+static int i915_enable_vblank(struct drm_device *dev, unsigned int pipe)
 {
-	BUG_ON(!is_shub());
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	unsigned long irqflags;
 
-	xp_unregister_nofault_code_sn2();
+	spin_lock_irqsave(&dev_priv->irq_lock, irqflags);
+	if (INTEL_INFO(dev)->gen >= 4)
+		i915_enable_pipestat(dev_priv, pipe,
+				     PIPE_START_VBLANK_INTERRUPT_STATUS);
+	else
+		i915_enable_pipestat(dev_priv, pipe,
+				     PIPE_VBLANK_INTERRUPT_STATUS);
+	spin_unlock_irqrestore(&dev_priv->irq_lock, irqflags);
+
+	return 0;
 }
 
+static int ironlake_enable_vblank(struct drm_device *dev, unsigned int pipe)
+{
+	struct drm_i91

@@ -1,4 +1,3 @@
-#
-# Rockchip Soc drivers
-#
-obj-$(CONFIG_ROCKCHIP_PM_DOMAINS) += pm_domains.o
+fff
+#define DPM_TABLE_410__AcpLevel_2_Frequency__SHIFT 0x0
+#define DPM_TABLE_

@@ -1,877 +1,468 @@
-/*
- * USB ConnectTech WhiteHEAT driver
- *
- *	Copyright (C) 2002
- *	    Connect Tech Inc.
- *
- *	Copyright (C) 1999 - 2001
- *	    Greg Kroah-Hartman (greg@kroah.com)
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License as published by
- *	the Free Software Foundation; either version 2 of the License, or
- *	(at your option) any later version.
- *
- * See Documentation/usb/usb-serial.txt for more information on using this
- * driver
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/spinlock.h>
-#include <linux/mutex.h>
-#include <linux/uaccess.h>
-#include <asm/termbits.h>
-#include <linux/usb.h>
-#include <linux/serial_reg.h>
-#include <linux/serial.h>
-#include <linux/usb/serial.h>
-#include <linux/usb/ezusb.h>
-#include "whiteheat.h"			/* WhiteHEAT specific commands */
-
-#ifndef CMSPAR
-#define CMSPAR 0
-#endif
-
-/*
- * Version Information
- */
-#define DRIVER_AUTHOR "Greg Kroah-Hartman <greg@kroah.com>, Stuart MacDonald <stuartm@connecttech.com>"
-#define DRIVER_DESC "USB ConnectTech WhiteHEAT driver"
-
-#define CONNECT_TECH_VENDOR_ID		0x0710
-#define CONNECT_TECH_FAKE_WHITE_HEAT_ID	0x0001
-#define CONNECT_TECH_WHITE_HEAT_ID	0x8001
-
-/*
-   ID tables for whiteheat are unusual, because we want to different
-   things for different versions of the device.  Eventually, this
-   will be doable from a single table.  But, for now, we define two
-   separate ID tables, and then a third table that combines them
-   just for the purpose of exporting the autoloading information.
-*/
-static const struct usb_device_id id_table_std[] = {
-	{ USB_DEVICE(CONNECT_TECH_VENDOR_ID, CONNECT_TECH_WHITE_HEAT_ID) },
-	{ }						/* Terminating entry */
-};
-
-static const struct usb_device_id id_table_prerenumeration[] = {
-	{ USB_DEVICE(CONNECT_TECH_VENDOR_ID, CONNECT_TECH_FAKE_WHITE_HEAT_ID) },
-	{ }						/* Terminating entry */
-};
-
-static const struct usb_device_id id_table_combined[] = {
-	{ USB_DEVICE(CONNECT_TECH_VENDOR_ID, CONNECT_TECH_WHITE_HEAT_ID) },
-	{ USB_DEVICE(CONNECT_TECH_VENDOR_ID, CONNECT_TECH_FAKE_WHITE_HEAT_ID) },
-	{ }						/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, id_table_combined);
-
-
-/* function prototypes for the Connect Tech WhiteHEAT prerenumeration device */
-static int  whiteheat_firmware_download(struct usb_serial *serial,
-					const struct usb_device_id *id);
-static int  whiteheat_firmware_attach(struct usb_serial *serial);
-
-/* function prototypes for the Connect Tech WhiteHEAT serial converter */
-static int whiteheat_probe(struct usb_serial *serial,
-				const struct usb_device_id *id);
-static int  whiteheat_attach(struct usb_serial *serial);
-static void whiteheat_release(struct usb_serial *serial);
-static int  whiteheat_port_probe(struct usb_serial_port *port);
-static int  whiteheat_port_remove(struct usb_serial_port *port);
-static int  whiteheat_open(struct tty_struct *tty,
-			struct usb_serial_port *port);
-static void whiteheat_close(struct usb_serial_port *port);
-static int  whiteheat_ioctl(struct tty_struct *tty,
-			unsigned int cmd, unsigned long arg);
-static void whiteheat_set_termios(struct tty_struct *tty,
-			struct usb_serial_port *port, struct ktermios *old);
-static int  whiteheat_tiocmget(struct tty_struct *tty);
-static int  whiteheat_tiocmset(struct tty_struct *tty,
-			unsigned int set, unsigned int clear);
-static void whiteheat_break_ctl(struct tty_struct *tty, int break_state);
-
-static struct usb_serial_driver whiteheat_fake_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"whiteheatnofirm",
-	},
-	.description =		"Connect Tech - WhiteHEAT - (prerenumeration)",
-	.id_table =		id_table_prerenumeration,
-	.num_ports =		1,
-	.probe =		whiteheat_firmware_download,
-	.attach =		whiteheat_firmware_attach,
-};
-
-static struct usb_serial_driver whiteheat_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"whiteheat",
-	},
-	.description =		"Connect Tech - WhiteHEAT",
-	.id_table =		id_table_std,
-	.num_ports =		4,
-	.probe =		whiteheat_probe,
-	.attach =		whiteheat_attach,
-	.release =		whiteheat_release,
-	.port_probe =		whiteheat_port_probe,
-	.port_remove =		whiteheat_port_remove,
-	.open =			whiteheat_open,
-	.close =		whiteheat_close,
-	.ioctl =		whiteheat_ioctl,
-	.set_termios =		whiteheat_set_termios,
-	.break_ctl =		whiteheat_break_ctl,
-	.tiocmget =		whiteheat_tiocmget,
-	.tiocmset =		whiteheat_tiocmset,
-	.throttle =		usb_serial_generic_throttle,
-	.unthrottle =		usb_serial_generic_unthrottle,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&whiteheat_fake_device, &whiteheat_device, NULL
-};
-
-struct whiteheat_command_private {
-	struct mutex		mutex;
-	__u8			port_running;
-	__u8			command_finished;
-	wait_queue_head_t	wait_command; /* for handling sleeping whilst
-						 waiting for a command to
-						 finish */
-	__u8			result_buffer[64];
-};
-
-struct whiteheat_private {
-	__u8			mcr;		/* FIXME: no locking on mcr */
-};
-
-
-/* local function prototypes */
-static int start_command_port(struct usb_serial *serial);
-static void stop_command_port(struct usb_serial *serial);
-static void command_port_write_callback(struct urb *urb);
-static void command_port_read_callback(struct urb *urb);
-
-static int firm_send_command(struct usb_serial_port *port, __u8 command,
-						__u8 *data, __u8 datasize);
-static int firm_open(struct usb_serial_port *port);
-static int firm_close(struct usb_serial_port *port);
-static void firm_setup_port(struct tty_struct *tty);
-static int firm_set_rts(struct usb_serial_port *port, __u8 onoff);
-static int firm_set_dtr(struct usb_serial_port *port, __u8 onoff);
-static int firm_set_break(struct usb_serial_port *port, __u8 onoff);
-static int firm_purge(struct usb_serial_port *port, __u8 rxtx);
-static int firm_get_dtr_rts(struct usb_serial_port *port);
-static int firm_report_tx_done(struct usb_serial_port *port);
-
-
-#define COMMAND_PORT		4
-#define COMMAND_TIMEOUT		(2*HZ)	/* 2 second timeout for a command */
-#define	COMMAND_TIMEOUT_MS	2000
-#define CLOSING_DELAY		(30 * HZ)
-
-
-/*****************************************************************************
- * Connect Tech's White Heat prerenumeration driver functions
- *****************************************************************************/
-
-/* steps to download the firmware to the WhiteHEAT device:
- - hold the reset (by writing to the reset bit of the CPUCS register)
- - download the VEND_AX.HEX file to the chip using VENDOR_REQUEST-ANCHOR_LOAD
- - release the reset (by writing to the CPUCS register)
- - download the WH.HEX file for all addresses greater than 0x1b3f using
-   VENDOR_REQUEST-ANCHOR_EXTERNAL_RAM_LOAD
- - hold the reset
- - download the WH.HEX file for all addresses less than 0x1b40 using
-   VENDOR_REQUEST_ANCHOR_LOAD
- - release the reset
- - device renumerated itself and comes up as new device id with all
-   firmware download completed.
-*/
-static int whiteheat_firmware_download(struct usb_serial *serial,
-					const struct usb_device_id *id)
-{
-	int response;
-
-	response = ezusb_fx1_ihex_firmware_download(serial->dev, "whiteheat_loader.fw");
-	if (response >= 0) {
-		response = ezusb_fx1_ihex_firmware_download(serial->dev, "whiteheat.fw");
-		if (response >= 0)
-			return 0;
-	}
-	return -ENOENT;
-}
-
-
-static int whiteheat_firmware_attach(struct usb_serial *serial)
-{
-	/* We want this device to fail to have a driver assigned to it */
-	return 1;
-}
-
-
-/*****************************************************************************
- * Connect Tech's White Heat serial driver functions
- *****************************************************************************/
-
-static int whiteheat_probe(struct usb_serial *serial,
-				const struct usb_device_id *id)
-{
-	struct usb_host_interface *iface_desc;
-	struct usb_endpoint_descriptor *endpoint;
-	size_t num_bulk_in = 0;
-	size_t num_bulk_out = 0;
-	size_t min_num_bulk;
-	unsigned int i;
-
-	iface_desc = serial->interface->cur_altsetting;
-
-	for (i = 0; i < iface_desc->desc.bNumEndpoints; i++) {
-		endpoint = &iface_desc->endpoint[i].desc;
-		if (usb_endpoint_is_bulk_in(endpoint))
-			++num_bulk_in;
-		if (usb_endpoint_is_bulk_out(endpoint))
-			++num_bulk_out;
-	}
-
-	min_num_bulk = COMMAND_PORT + 1;
-	if (num_bulk_in < min_num_bulk || num_bulk_out < min_num_bulk)
-		return -ENODEV;
-
-	return 0;
-}
-
-static int whiteheat_attach(struct usb_serial *serial)
-{
-	struct usb_serial_port *command_port;
-	struct whiteheat_command_private *command_info;
-	struct whiteheat_hw_info *hw_info;
-	int pipe;
-	int ret;
-	int alen;
-	__u8 *command;
-	__u8 *result;
-
-	command_port = serial->port[COMMAND_PORT];
-
-	pipe = usb_sndbulkpipe(serial->dev,
-			command_port->bulk_out_endpointAddress);
-	command = kmalloc(2, GFP_KERNEL);
-	if (!command)
-		goto no_command_buffer;
-	command[0] = WHITEHEAT_GET_HW_INFO;
-	command[1] = 0;
-
-	result = kmalloc(sizeof(*hw_info) + 1, GFP_KERNEL);
-	if (!result)
-		goto no_result_buffer;
-	/*
-	 * When the module is reloaded the firmware is still there and
-	 * the endpoints are still in the usb core unchanged. This is the
-	 * unlinking bug in disguise. Same for the call below.
-	 */
-	usb_clear_halt(serial->dev, pipe);
-	ret = usb_bulk_msg(serial->dev, pipe, command, 2,
-						&alen, COMMAND_TIMEOUT_MS);
-	if (ret) {
-		dev_err(&serial->dev->dev, "%s: Couldn't send command [%d]\n",
-			serial->type->description, ret);
-		goto no_firmware;
-	} else if (alen != 2) {
-		dev_err(&serial->dev->dev, "%s: Send command incomplete [%d]\n",
-			serial->type->description, alen);
-		goto no_firmware;
-	}
-
-	pipe = usb_rcvbulkpipe(serial->dev,
-				command_port->bulk_in_endpointAddress);
-	/* See the comment on the usb_clear_halt() above */
-	usb_clear_halt(serial->dev, pipe);
-	ret = usb_bulk_msg(serial->dev, pipe, result,
-			sizeof(*hw_info) + 1, &alen, COMMAND_TIMEOUT_MS);
-	if (ret) {
-		dev_err(&serial->dev->dev, "%s: Couldn't get results [%d]\n",
-			serial->type->description, ret);
-		goto no_firmware;
-	} else if (alen != sizeof(*hw_info) + 1) {
-		dev_err(&serial->dev->dev, "%s: Get results incomplete [%d]\n",
-			serial->type->description, alen);
-		goto no_firmware;
-	} else if (result[0] != command[0]) {
-		dev_err(&serial->dev->dev, "%s: Command failed [%d]\n",
-			serial->type->description, result[0]);
-		goto no_firmware;
-	}
-
-	hw_info = (struct whiteheat_hw_info *)&result[1];
-
-	dev_info(&serial->dev->dev, "%s: Firmware v%d.%02d\n",
-		 serial->type->description,
-		 hw_info->sw_major_rev, hw_info->sw_minor_rev);
-
-	command_info = kmalloc(sizeof(struct whiteheat_command_private),
-								GFP_KERNEL);
-	if (!command_info)
-		goto no_command_private;
-
-	mutex_init(&command_info->mutex);
-	command_info->port_running = 0;
-	init_waitqueue_head(&command_info->wait_command);
-	usb_set_serial_port_data(command_port, command_info);
-	command_port->write_urb->complete = command_port_write_callback;
-	command_port->read_urb->complete = command_port_read_callback;
-	kfree(result);
-	kfree(command);
-
-	return 0;
-
-no_firmware:
-	/* Firmware likely not running */
-	dev_err(&serial->dev->dev,
-		"%s: Unable to retrieve firmware version, try replugging\n",
-		serial->type->description);
-	dev_err(&serial->dev->dev,
-		"%s: If the firmware is not running (status led not blinking)\n",
-		serial->type->description);
-	dev_err(&serial->dev->dev,
-		"%s: please contact support@connecttech.com\n",
-		serial->type->description);
-	kfree(result);
-	kfree(command);
-	return -ENODEV;
-
-no_command_private:
-	kfree(result);
-no_result_buffer:
-	kfree(command);
-no_command_buffer:
-	return -ENOMEM;
-}
-
-static void whiteheat_release(struct usb_serial *serial)
-{
-	struct usb_serial_port *command_port;
-
-	/* free up our private data for our command port */
-	command_port = serial->port[COMMAND_PORT];
-	kfree(usb_get_serial_port_data(command_port));
-}
-
-static int whiteheat_port_probe(struct usb_serial_port *port)
-{
-	struct whiteheat_private *info;
-
-	info = kzalloc(sizeof(*info), GFP_KERNEL);
-	if (!info)
-		return -ENOMEM;
-
-	usb_set_serial_port_data(port, info);
-
-	return 0;
-}
-
-static int whiteheat_port_remove(struct usb_serial_port *port)
-{
-	struct whiteheat_private *info;
-
-	info = usb_get_serial_port_data(port);
-	kfree(info);
-
-	return 0;
-}
-
-static int whiteheat_open(struct tty_struct *tty, struct usb_serial_port *port)
-{
-	int retval;
-
-	retval = start_command_port(port->serial);
-	if (retval)
-		goto exit;
-
-	/* send an open port command */
-	retval = firm_open(port);
-	if (retval) {
-		stop_command_port(port->serial);
-		goto exit;
-	}
-
-	retval = firm_purge(port, WHITEHEAT_PURGE_RX | WHITEHEAT_PURGE_TX);
-	if (retval) {
-		firm_close(port);
-		stop_command_port(port->serial);
-		goto exit;
-	}
-
-	if (tty)
-		firm_setup_port(tty);
-
-	/* Work around HCD bugs */
-	usb_clear_halt(port->serial->dev, port->read_urb->pipe);
-	usb_clear_halt(port->serial->dev, port->write_urb->pipe);
-
-	retval = usb_serial_generic_open(tty, port);
-	if (retval) {
-		firm_close(port);
-		stop_command_port(port->serial);
-		goto exit;
-	}
-exit:
-	return retval;
-}
-
-
-static void whiteheat_close(struct usb_serial_port *port)
-{
-	firm_report_tx_done(port);
-	firm_close(port);
-
-	usb_serial_generic_close(port);
-
-	stop_command_port(port->serial);
-}
-
-static int whiteheat_tiocmget(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct whiteheat_private *info = usb_get_serial_port_data(port);
-	unsigned int modem_signals = 0;
-
-	firm_get_dtr_rts(port);
-	if (info->mcr & UART_MCR_DTR)
-		modem_signals |= TIOCM_DTR;
-	if (info->mcr & UART_MCR_RTS)
-		modem_signals |= TIOCM_RTS;
-
-	return modem_signals;
-}
-
-static int whiteheat_tiocmset(struct tty_struct *tty,
-			       unsigned int set, unsigned int clear)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct whiteheat_private *info = usb_get_serial_port_data(port);
-
-	if (set & TIOCM_RTS)
-		info->mcr |= UART_MCR_RTS;
-	if (set & TIOCM_DTR)
-		info->mcr |= UART_MCR_DTR;
-
-	if (clear & TIOCM_RTS)
-		info->mcr &= ~UART_MCR_RTS;
-	if (clear & TIOCM_DTR)
-		info->mcr &= ~UART_MCR_DTR;
-
-	firm_set_dtr(port, info->mcr & UART_MCR_DTR);
-	firm_set_rts(port, info->mcr & UART_MCR_RTS);
-	return 0;
-}
-
-
-static int whiteheat_ioctl(struct tty_struct *tty,
-					unsigned int cmd, unsigned long arg)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct serial_struct serstruct;
-	void __user *user_arg = (void __user *)arg;
-
-	switch (cmd) {
-	case TIOCGSERIAL:
-		memset(&serstruct, 0, sizeof(serstruct));
-		serstruct.type = PORT_16654;
-		serstruct.line = port->minor;
-		serstruct.port = port->port_number;
-		serstruct.flags = ASYNC_SKIP_TEST | ASYNC_AUTO_IRQ;
-		serstruct.xmit_fifo_size = kfifo_size(&port->write_fifo);
-		serstruct.custom_divisor = 0;
-		serstruct.baud_base = 460800;
-		serstruct.close_delay = CLOSING_DELAY;
-		serstruct.closing_wait = CLOSING_DELAY;
-
-		if (copy_to_user(user_arg, &serstruct, sizeof(serstruct)))
-			return -EFAULT;
-		break;
-	default:
-		break;
-	}
-
-	return -ENOIOCTLCMD;
-}
-
-
-static void whiteheat_set_termios(struct tty_struct *tty,
-	struct usb_serial_port *port, struct ktermios *old_termios)
-{
-	firm_setup_port(tty);
-}
-
-static void whiteheat_break_ctl(struct tty_struct *tty, int break_state)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	firm_set_break(port, break_state);
-}
-
-
-/*****************************************************************************
- * Connect Tech's White Heat callback routines
- *****************************************************************************/
-static void command_port_write_callback(struct urb *urb)
-{
-	int status = urb->status;
-
-	if (status) {
-		dev_dbg(&urb->dev->dev, "nonzero urb status: %d\n", status);
-		return;
-	}
-}
-
-
-static void command_port_read_callback(struct urb *urb)
-{
-	struct usb_serial_port *command_port = urb->context;
-	struct whiteheat_command_private *command_info;
-	int status = urb->status;
-	unsigned char *data = urb->transfer_buffer;
-	int result;
-
-	command_info = usb_get_serial_port_data(command_port);
-	if (!command_info) {
-		dev_dbg(&urb->dev->dev, "%s - command_info is NULL, exiting.\n", __func__);
-		return;
-	}
-	if (!urb->actual_length) {
-		dev_dbg(&urb->dev->dev, "%s - empty response, exiting.\n", __func__);
-		return;
-	}
-	if (status) {
-		dev_dbg(&urb->dev->dev, "%s - nonzero urb status: %d\n", __func__, status);
-		if (status != -ENOENT)
-			command_info->command_finished = WHITEHEAT_CMD_FAILURE;
-		wake_up(&command_info->wait_command);
-		return;
-	}
-
-	usb_serial_debug_data(&command_port->dev, __func__, urb->actual_length, data);
-
-	if (data[0] == WHITEHEAT_CMD_COMPLETE) {
-		command_info->command_finished = WHITEHEAT_CMD_COMPLETE;
-		wake_up(&command_info->wait_command);
-	} else if (data[0] == WHITEHEAT_CMD_FAILURE) {
-		command_info->command_finished = WHITEHEAT_CMD_FAILURE;
-		wake_up(&command_info->wait_command);
-	} else if (data[0] == WHITEHEAT_EVENT) {
-		/* These are unsolicited reports from the firmware, hence no
-		   waiting command to wakeup */
-		dev_dbg(&urb->dev->dev, "%s - event received\n", __func__);
-	} else if ((data[0] == WHITEHEAT_GET_DTR_RTS) &&
-		(urb->actual_length - 1 <= sizeof(command_info->result_buffer))) {
-		memcpy(command_info->result_buffer, &data[1],
-						urb->actual_length - 1);
-		command_info->command_finished = WHITEHEAT_CMD_COMPLETE;
-		wake_up(&command_info->wait_command);
-	} else
-		dev_dbg(&urb->dev->dev, "%s - bad reply from firmware\n", __func__);
-
-	/* Continue trying to always read */
-	result = usb_submit_urb(command_port->read_urb, GFP_ATOMIC);
-	if (result)
-		dev_dbg(&urb->dev->dev, "%s - failed resubmitting read urb, error %d\n",
-			__func__, result);
-}
-
-
-/*****************************************************************************
- * Connect Tech's White Heat firmware interface
- *****************************************************************************/
-static int firm_send_command(struct usb_serial_port *port, __u8 command,
-						__u8 *data, __u8 datasize)
-{
-	struct usb_serial_port *command_port;
-	struct whiteheat_command_private *command_info;
-	struct whiteheat_private *info;
-	struct device *dev = &port->dev;
-	__u8 *transfer_buffer;
-	int retval = 0;
-	int t;
-
-	dev_dbg(dev, "%s - command %d\n", __func__, command);
-
-	command_port = port->serial->port[COMMAND_PORT];
-	command_info = usb_get_serial_port_data(command_port);
-
-	if (command_port->bulk_out_size < datasize + 1)
-		return -EIO;
-
-	mutex_lock(&command_info->mutex);
-	command_info->command_finished = false;
-
-	transfer_buffer = (__u8 *)command_port->write_urb->transfer_buffer;
-	transfer_buffer[0] = command;
-	memcpy(&transfer_buffer[1], data, datasize);
-	command_port->write_urb->transfer_buffer_length = datasize + 1;
-	retval = usb_submit_urb(command_port->write_urb, GFP_NOIO);
-	if (retval) {
-		dev_dbg(dev, "%s - submit urb failed\n", __func__);
-		goto exit;
-	}
-
-	/* wait for the command to complete */
-	t = wait_event_timeout(command_info->wait_command,
-		(bool)command_info->command_finished, COMMAND_TIMEOUT);
-	if (!t)
-		usb_kill_urb(command_port->write_urb);
-
-	if (command_info->command_finished == false) {
-		dev_dbg(dev, "%s - command timed out.\n", __func__);
-		retval = -ETIMEDOUT;
-		goto exit;
-	}
-
-	if (command_info->command_finished == WHITEHEAT_CMD_FAILURE) {
-		dev_dbg(dev, "%s - command failed.\n", __func__);
-		retval = -EIO;
-		goto exit;
-	}
-
-	if (command_info->command_finished == WHITEHEAT_CMD_COMPLETE) {
-		dev_dbg(dev, "%s - command completed.\n", __func__);
-		switch (command) {
-		case WHITEHEAT_GET_DTR_RTS:
-			info = usb_get_serial_port_data(port);
-			info->mcr = command_info->result_buffer[0];
-			break;
-		}
-	}
-exit:
-	mutex_unlock(&command_info->mutex);
-	return retval;
-}
-
-
-static int firm_open(struct usb_serial_port *port)
-{
-	struct whiteheat_simple open_command;
-
-	open_command.port = port->port_number + 1;
-	return firm_send_command(port, WHITEHEAT_OPEN,
-		(__u8 *)&open_command, sizeof(open_command));
-}
-
-
-static int firm_close(struct usb_serial_port *port)
-{
-	struct whiteheat_simple close_command;
-
-	close_command.port = port->port_number + 1;
-	return firm_send_command(port, WHITEHEAT_CLOSE,
-			(__u8 *)&close_command, sizeof(close_command));
-}
-
-
-static void firm_setup_port(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct device *dev = &port->dev;
-	struct whiteheat_port_settings port_settings;
-	unsigned int cflag = tty->termios.c_cflag;
-	speed_t baud;
-
-	port_settings.port = port->port_number + 1;
-
-	/* get the byte size */
-	switch (cflag & CSIZE) {
-	case CS5:	port_settings.bits = 5;   break;
-	case CS6:	port_settings.bits = 6;   break;
-	case CS7:	port_settings.bits = 7;   break;
-	default:
-	case CS8:	port_settings.bits = 8;   break;
-	}
-	dev_dbg(dev, "%s - data bits = %d\n", __func__, port_settings.bits);
-
-	/* determine the parity */
-	if (cflag & PARENB)
-		if (cflag & CMSPAR)
-			if (cflag & PARODD)
-				port_settings.parity = WHITEHEAT_PAR_MARK;
-			else
-				port_settings.parity = WHITEHEAT_PAR_SPACE;
-		else
-			if (cflag & PARODD)
-				port_settings.parity = WHITEHEAT_PAR_ODD;
-			else
-				port_settings.parity = WHITEHEAT_PAR_EVEN;
-	else
-		port_settings.parity = WHITEHEAT_PAR_NONE;
-	dev_dbg(dev, "%s - parity = %c\n", __func__, port_settings.parity);
-
-	/* figure out the stop bits requested */
-	if (cflag & CSTOPB)
-		port_settings.stop = 2;
-	else
-		port_settings.stop = 1;
-	dev_dbg(dev, "%s - stop bits = %d\n", __func__, port_settings.stop);
-
-	/* figure out the flow control settings */
-	if (cflag & CRTSCTS)
-		port_settings.hflow = (WHITEHEAT_HFLOW_CTS |
-						WHITEHEAT_HFLOW_RTS);
-	else
-		port_settings.hflow = WHITEHEAT_HFLOW_NONE;
-	dev_dbg(dev, "%s - hardware flow control = %s %s %s %s\n", __func__,
-	    (port_settings.hflow & WHITEHEAT_HFLOW_CTS) ? "CTS" : "",
-	    (port_settings.hflow & WHITEHEAT_HFLOW_RTS) ? "RTS" : "",
-	    (port_settings.hflow & WHITEHEAT_HFLOW_DSR) ? "DSR" : "",
-	    (port_settings.hflow & WHITEHEAT_HFLOW_DTR) ? "DTR" : "");
-
-	/* determine software flow control */
-	if (I_IXOFF(tty))
-		port_settings.sflow = WHITEHEAT_SFLOW_RXTX;
-	else
-		port_settings.sflow = WHITEHEAT_SFLOW_NONE;
-	dev_dbg(dev, "%s - software flow control = %c\n", __func__, port_settings.sflow);
-
-	port_settings.xon = START_CHAR(tty);
-	port_settings.xoff = STOP_CHAR(tty);
-	dev_dbg(dev, "%s - XON = %2x, XOFF = %2x\n", __func__, port_settings.xon, port_settings.xoff);
-
-	/* get the baud rate wanted */
-	baud = tty_get_baud_rate(tty);
-	port_settings.baud = cpu_to_le32(baud);
-	dev_dbg(dev, "%s - baud rate = %u\n", __func__, baud);
-
-	/* fixme: should set validated settings */
-	tty_encode_baud_rate(tty, baud, baud);
-
-	/* handle any settings that aren't specified in the tty structure */
-	port_settings.lloop = 0;
-
-	/* now send the message to the device */
-	firm_send_command(port, WHITEHEAT_SETUP_PORT,
-			(__u8 *)&port_settings, sizeof(port_settings));
-}
-
-
-static int firm_set_rts(struct usb_serial_port *port, __u8 onoff)
-{
-	struct whiteheat_set_rdb rts_command;
-
-	rts_command.port = port->port_number + 1;
-	rts_command.state = onoff;
-	return firm_send_command(port, WHITEHEAT_SET_RTS,
-			(__u8 *)&rts_command, sizeof(rts_command));
-}
-
-
-static int firm_set_dtr(struct usb_serial_port *port, __u8 onoff)
-{
-	struct whiteheat_set_rdb dtr_command;
-
-	dtr_command.port = port->port_number + 1;
-	dtr_command.state = onoff;
-	return firm_send_command(port, WHITEHEAT_SET_DTR,
-			(__u8 *)&dtr_command, sizeof(dtr_command));
-}
-
-
-static int firm_set_break(struct usb_serial_port *port, __u8 onoff)
-{
-	struct whiteheat_set_rdb break_command;
-
-	break_command.port = port->port_number + 1;
-	break_command.state = onoff;
-	return firm_send_command(port, WHITEHEAT_SET_BREAK,
-			(__u8 *)&break_command, sizeof(break_command));
-}
-
-
-static int firm_purge(struct usb_serial_port *port, __u8 rxtx)
-{
-	struct whiteheat_purge purge_command;
-
-	purge_command.port = port->port_number + 1;
-	purge_command.what = rxtx;
-	return firm_send_command(port, WHITEHEAT_PURGE,
-			(__u8 *)&purge_command, sizeof(purge_command));
-}
-
-
-static int firm_get_dtr_rts(struct usb_serial_port *port)
-{
-	struct whiteheat_simple get_dr_command;
-
-	get_dr_command.port = port->port_number + 1;
-	return firm_send_command(port, WHITEHEAT_GET_DTR_RTS,
-			(__u8 *)&get_dr_command, sizeof(get_dr_command));
-}
-
-
-static int firm_report_tx_done(struct usb_serial_port *port)
-{
-	struct whiteheat_simple close_command;
-
-	close_command.port = port->port_number + 1;
-	return firm_send_command(port, WHITEHEAT_REPORT_TX_DONE,
-			(__u8 *)&close_command, sizeof(close_command));
-}
-
-
-/*****************************************************************************
- * Connect Tech's White Heat utility functions
- *****************************************************************************/
-static int start_command_port(struct usb_serial *serial)
-{
-	struct usb_serial_port *command_port;
-	struct whiteheat_command_private *command_info;
-	int retval = 0;
-
-	command_port = serial->port[COMMAND_PORT];
-	command_info = usb_get_serial_port_data(command_port);
-	mutex_lock(&command_info->mutex);
-	if (!command_info->port_running) {
-		/* Work around HCD bugs */
-		usb_clear_halt(serial->dev, command_port->read_urb->pipe);
-
-		retval = usb_submit_urb(command_port->read_urb, GFP_KERNEL);
-		if (retval) {
-			dev_err(&serial->dev->dev,
-				"%s - failed submitting read urb, error %d\n",
-				__func__, retval);
-			goto exit;
-		}
-	}
-	command_info->port_running++;
-
-exit:
-	mutex_unlock(&command_info->mutex);
-	return retval;
-}
-
-
-static void stop_command_port(struct usb_serial *serial)
-{
-	struct usb_serial_port *command_port;
-	struct whiteheat_command_private *command_info;
-
-	command_port = serial->port[COMMAND_PORT];
-	command_info = usb_get_serial_port_data(command_port);
-	mutex_lock(&command_info->mutex);
-	command_info->port_running--;
-	if (!command_info->port_running)
-		usb_kill_urb(command_port->read_urb);
-	mutex_unlock(&command_info->mutex);
-}
-
-module_usb_serial_driver(serial_drivers, id_table_combined);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-
-MODULE_FIRMWARE("whiteheat.fw");
-MODULE_FIRMWARE("whiteheat_loader.fw");
+L__STRAP_BCH_ECC_EN__SHIFT 0x0
+#define D3F3_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD_MASK 0xff00
+#define D3F3_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD__SHIFT 0x8
+#define D3F3_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS_MASK 0xffff0000
+#define D3F3_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS__SHIFT 0x10
+#define D3F3_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE_MASK 0x8
+#define D3F3_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE__SHIFT 0x3
+#define D3F3_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE_MASK 0x40
+#define D3F3_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE__SHIFT 0x6
+#define D3F3_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN_MASK 0x1
+#define D3F3_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN__SHIFT 0x0
+#define D3F3_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN_MASK 0x2
+#define D3F3_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN__SHIFT 0x1
+#define D3F3_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN_MASK 0x4
+#define D3F3_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN__SHIFT 0x2
+#define D3F3_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN_MASK 0x8
+#define D3F3_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN__SHIFT 0x3
+#define D3F3_PCIEP_HPGI__REG_HPGI_HOOK_MASK 0x80
+#define D3F3_PCIEP_HPGI__REG_HPGI_HOOK__SHIFT 0x7
+#define D3F3_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS_MASK 0x100
+#define D3F3_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS__SHIFT 0x8
+#define D3F3_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS_MASK 0x200
+#define D3F3_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS__SHIFT 0x9
+#define D3F3_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS_MASK 0x400
+#define D3F3_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS__SHIFT 0xa
+#define D3F3_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS_MASK 0x800
+#define D3F3_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS__SHIFT 0xb
+#define D3F3_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS_MASK 0x8000
+#define D3F3_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS__SHIFT 0xf
+#define D3F3_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN_MASK 0x10000
+#define D3F3_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN__SHIFT 0x10
+#define D3F3_VENDOR_ID__VENDOR_ID_MASK 0xffff
+#define D3F3_VENDOR_ID__VENDOR_ID__SHIFT 0x0
+#define D3F3_DEVICE_ID__DEVICE_ID_MASK 0xffff0000
+#define D3F3_DEVICE_ID__DEVICE_ID__SHIFT 0x10
+#define D3F3_COMMAND__IO_ACCESS_EN_MASK 0x1
+#define D3F3_COMMAND__IO_ACCESS_EN__SHIFT 0x0
+#define D3F3_COMMAND__MEM_ACCESS_EN_MASK 0x2
+#define D3F3_COMMAND__MEM_ACCESS_EN__SHIFT 0x1
+#define D3F3_COMMAND__BUS_MASTER_EN_MASK 0x4
+#define D3F3_COMMAND__BUS_MASTER_EN__SHIFT 0x2
+#define D3F3_COMMAND__SPECIAL_CYCLE_EN_MASK 0x8
+#define D3F3_COMMAND__SPECIAL_CYCLE_EN__SHIFT 0x3
+#define D3F3_COMMAND__MEM_WRITE_INVALIDATE_EN_MASK 0x10
+#define D3F3_COMMAND__MEM_WRITE_INVALIDATE_EN__SHIFT 0x4
+#define D3F3_COMMAND__PAL_SNOOP_EN_MASK 0x20
+#define D3F3_COMMAND__PAL_SNOOP_EN__SHIFT 0x5
+#define D3F3_COMMAND__PARITY_ERROR_RESPONSE_MASK 0x40
+#define D3F3_COMMAND__PARITY_ERROR_RESPONSE__SHIFT 0x6
+#define D3F3_COMMAND__AD_STEPPING_MASK 0x80
+#define D3F3_COMMAND__AD_STEPPING__SHIFT 0x7
+#define D3F3_COMMAND__SERR_EN_MASK 0x100
+#define D3F3_COMMAND__SERR_EN__SHIFT 0x8
+#define D3F3_COMMAND__FAST_B2B_EN_MASK 0x200
+#define D3F3_COMMAND__FAST_B2B_EN__SHIFT 0x9
+#define D3F3_COMMAND__INT_DIS_MASK 0x400
+#define D3F3_COMMAND__INT_DIS__SHIFT 0xa
+#define D3F3_STATUS__INT_STATUS_MASK 0x80000
+#define D3F3_STATUS__INT_STATUS__SHIFT 0x13
+#define D3F3_STATUS__CAP_LIST_MASK 0x100000
+#define D3F3_STATUS__CAP_LIST__SHIFT 0x14
+#define D3F3_STATUS__PCI_66_EN_MASK 0x200000
+#define D3F3_STATUS__PCI_66_EN__SHIFT 0x15
+#define D3F3_STATUS__FAST_BACK_CAPABLE_MASK 0x800000
+#define D3F3_STATUS__FAST_BACK_CAPABLE__SHIFT 0x17
+#define D3F3_STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x1000000
+#define D3F3_STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x18
+#define D3F3_STATUS__DEVSEL_TIMING_MASK 0x6000000
+#define D3F3_STATUS__DEVSEL_TIMING__SHIFT 0x19
+#define D3F3_STATUS__SIGNAL_TARGET_ABORT_MASK 0x8000000
+#define D3F3_STATUS__SIGNAL_TARGET_ABORT__SHIFT 0x1b
+#define D3F3_STATUS__RECEIVED_TARGET_ABORT_MASK 0x10000000
+#define D3F3_STATUS__RECEIVED_TARGET_ABORT__SHIFT 0x1c
+#define D3F3_STATUS__RECEIVED_MASTER_ABORT_MASK 0x20000000
+#define D3F3_STATUS__RECEIVED_MASTER_ABORT__SHIFT 0x1d
+#define D3F3_STATUS__SIGNALED_SYSTEM_ERROR_MASK 0x40000000
+#define D3F3_STATUS__SIGNALED_SYSTEM_ERROR__SHIFT 0x1e
+#define D3F3_STATUS__PARITY_ERROR_DETECTED_MASK 0x80000000
+#define D3F3_STATUS__PARITY_ERROR_DETECTED__SHIFT 0x1f
+#define D3F3_REVISION_ID__MINOR_REV_ID_MASK 0xf
+#define D3F3_REVISION_ID__MINOR_REV_ID__SHIFT 0x0
+#define D3F3_REVISION_ID__MAJOR_REV_ID_MASK 0xf0
+#define D3F3_REVISION_ID__MAJOR_REV_ID__SHIFT 0x4
+#define D3F3_PROG_INTERFACE__PROG_INTERFACE_MASK 0xff00
+#define D3F3_PROG_INTERFACE__PROG_INTERFACE__SHIFT 0x8
+#define D3F3_SUB_CLASS__SUB_CLASS_MASK 0xff0000
+#define D3F3_SUB_CLASS__SUB_CLASS__SHIFT 0x10
+#define D3F3_BASE_CLASS__BASE_CLASS_MASK 0xff000000
+#define D3F3_BASE_CLASS__BASE_CLASS__SHIFT 0x18
+#define D3F3_CACHE_LINE__CACHE_LINE_SIZE_MASK 0xff
+#define D3F3_CACHE_LINE__CACHE_LINE_SIZE__SHIFT 0x0
+#define D3F3_LATENCY__LATENCY_TIMER_MASK 0xff00
+#define D3F3_LATENCY__LATENCY_TIMER__SHIFT 0x8
+#define D3F3_HEADER__HEADER_TYPE_MASK 0x7f0000
+#define D3F3_HEADER__HEADER_TYPE__SHIFT 0x10
+#define D3F3_HEADER__DEVICE_TYPE_MASK 0x800000
+#define D3F3_HEADER__DEVICE_TYPE__SHIFT 0x17
+#define D3F3_BIST__BIST_COMP_MASK 0xf000000
+#define D3F3_BIST__BIST_COMP__SHIFT 0x18
+#define D3F3_BIST__BIST_STRT_MASK 0x40000000
+#define D3F3_BIST__BIST_STRT__SHIFT 0x1e
+#define D3F3_BIST__BIST_CAP_MASK 0x80000000
+#define D3F3_BIST__BIST_CAP__SHIFT 0x1f
+#define D3F3_SUB_BUS_NUMBER_LATENCY__PRIMARY_BUS_MASK 0xff
+#define D3F3_SUB_BUS_NUMBER_LATENCY__PRIMARY_BUS__SHIFT 0x0
+#define D3F3_SUB_BUS_NUMBER_LATENCY__SECONDARY_BUS_MASK 0xff00
+#define D3F3_SUB_BUS_NUMBER_LATENCY__SECONDARY_BUS__SHIFT 0x8
+#define D3F3_SUB_BUS_NUMBER_LATENCY__SUB_BUS_NUM_MASK 0xff0000
+#define D3F3_SUB_BUS_NUMBER_LATENCY__SUB_BUS_NUM__SHIFT 0x10
+#define D3F3_SUB_BUS_NUMBER_LATENCY__SECONDARY_LATENCY_TIMER_MASK 0xff000000
+#define D3F3_SUB_BUS_NUMBER_LATENCY__SECONDARY_LATENCY_TIMER__SHIFT 0x18
+#define D3F3_IO_BASE_LIMIT__IO_BASE_TYPE_MASK 0xf
+#define D3F3_IO_BASE_LIMIT__IO_BASE_TYPE__SHIFT 0x0
+#define D3F3_IO_BASE_LIMIT__IO_BASE_MASK 0xf0
+#define D3F3_IO_BASE_LIMIT__IO_BASE__SHIFT 0x4
+#define D3F3_IO_BASE_LIMIT__IO_LIMIT_TYPE_MASK 0xf00
+#define D3F3_IO_BASE_LIMIT__IO_LIMIT_TYPE__SHIFT 0x8
+#define D3F3_IO_BASE_LIMIT__IO_LIMIT_MASK 0xf000
+#define D3F3_IO_BASE_LIMIT__IO_LIMIT__SHIFT 0xc
+#define D3F3_SECONDARY_STATUS__CAP_LIST_MASK 0x100000
+#define D3F3_SECONDARY_STATUS__CAP_LIST__SHIFT 0x14
+#define D3F3_SECONDARY_STATUS__PCI_66_EN_MASK 0x200000
+#define D3F3_SECONDARY_STATUS__PCI_66_EN__SHIFT 0x15
+#define D3F3_SECONDARY_STATUS__FAST_BACK_CAPABLE_MASK 0x800000
+#define D3F3_SECONDARY_STATUS__FAST_BACK_CAPABLE__SHIFT 0x17
+#define D3F3_SECONDARY_STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x1000000
+#define D3F3_SECONDARY_STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x18
+#define D3F3_SECONDARY_STATUS__DEVSEL_TIMING_MASK 0x6000000
+#define D3F3_SECONDARY_STATUS__DEVSEL_TIMING__SHIFT 0x19
+#define D3F3_SECONDARY_STATUS__SIGNAL_TARGET_ABORT_MASK 0x8000000
+#define D3F3_SECONDARY_STATUS__SIGNAL_TARGET_ABORT__SHIFT 0x1b
+#define D3F3_SECONDARY_STATUS__RECEIVED_TARGET_ABORT_MASK 0x10000000
+#define D3F3_SECONDARY_STATUS__RECEIVED_TARGET_ABORT__SHIFT 0x1c
+#define D3F3_SECONDARY_STATUS__RECEIVED_MASTER_ABORT_MASK 0x20000000
+#define D3F3_SECONDARY_STATUS__RECEIVED_MASTER_ABORT__SHIFT 0x1d
+#define D3F3_SECONDARY_STATUS__RECEIVED_SYSTEM_ERROR_MASK 0x40000000
+#define D3F3_SECONDARY_STATUS__RECEIVED_SYSTEM_ERROR__SHIFT 0x1e
+#define D3F3_SECONDARY_STATUS__PARITY_ERROR_DETECTED_MASK 0x80000000
+#define D3F3_SECONDARY_STATUS__PARITY_ERROR_DETECTED__SHIFT 0x1f
+#define D3F3_MEM_BASE_LIMIT__MEM_BASE_TYPE_MASK 0xf
+#define D3F3_MEM_BASE_LIMIT__MEM_BASE_TYPE__SHIFT 0x0
+#define D3F3_MEM_BASE_LIMIT__MEM_BASE_31_20_MASK 0xfff0
+#define D3F3_MEM_BASE_LIMIT__MEM_BASE_31_20__SHIFT 0x4
+#define D3F3_MEM_BASE_LIMIT__MEM_LIMIT_TYPE_MASK 0xf0000
+#define D3F3_MEM_BASE_LIMIT__MEM_LIMIT_TYPE__SHIFT 0x10
+#define D3F3_MEM_BASE_LIMIT__MEM_LIMIT_31_20_MASK 0xfff00000
+#define D3F3_MEM_BASE_LIMIT__MEM_LIMIT_31_20__SHIFT 0x14
+#define D3F3_PREF_BASE_LIMIT__PREF_MEM_BASE_TYPE_MASK 0xf
+#define D3F3_PREF_BASE_LIMIT__PREF_MEM_BASE_TYPE__SHIFT 0x0
+#define D3F3_PREF_BASE_LIMIT__PREF_MEM_BASE_31_20_MASK 0xfff0
+#define D3F3_PREF_BASE_LIMIT__PREF_MEM_BASE_31_20__SHIFT 0x4
+#define D3F3_PREF_BASE_LIMIT__PREF_MEM_LIMIT_TYPE_MASK 0xf0000
+#define D3F3_PREF_BASE_LIMIT__PREF_MEM_LIMIT_TYPE__SHIFT 0x10
+#define D3F3_PREF_BASE_LIMIT__PREF_MEM_LIMIT_31_20_MASK 0xfff00000
+#define D3F3_PREF_BASE_LIMIT__PREF_MEM_LIMIT_31_20__SHIFT 0x14
+#define D3F3_PREF_BASE_UPPER__PREF_BASE_UPPER_MASK 0xffffffff
+#define D3F3_PREF_BASE_UPPER__PREF_BASE_UPPER__SHIFT 0x0
+#define D3F3_PREF_LIMIT_UPPER__PREF_LIMIT_UPPER_MASK 0xffffffff
+#define D3F3_PREF_LIMIT_UPPER__PREF_LIMIT_UPPER__SHIFT 0x0
+#define D3F3_IO_BASE_LIMIT_HI__IO_BASE_31_16_MASK 0xffff
+#define D3F3_IO_BASE_LIMIT_HI__IO_BASE_31_16__SHIFT 0x0
+#define D3F3_IO_BASE_LIMIT_HI__IO_LIMIT_31_16_MASK 0xffff0000
+#define D3F3_IO_BASE_LIMIT_HI__IO_LIMIT_31_16__SHIFT 0x10
+#define D3F3_IRQ_BRIDGE_CNTL__PARITY_RESPONSE_EN_MASK 0x10000
+#define D3F3_IRQ_BRIDGE_CNTL__PARITY_RESPONSE_EN__SHIFT 0x10
+#define D3F3_IRQ_BRIDGE_CNTL__SERR_EN_MASK 0x20000
+#define D3F3_IRQ_BRIDGE_CNTL__SERR_EN__SHIFT 0x11
+#define D3F3_IRQ_BRIDGE_CNTL__ISA_EN_MASK 0x40000
+#define D3F3_IRQ_BRIDGE_CNTL__ISA_EN__SHIFT 0x12
+#define D3F3_IRQ_BRIDGE_CNTL__VGA_EN_MASK 0x80000
+#define D3F3_IRQ_BRIDGE_CNTL__VGA_EN__SHIFT 0x13
+#define D3F3_IRQ_BRIDGE_CNTL__VGA_DEC_MASK 0x100000
+#define D3F3_IRQ_BRIDGE_CNTL__VGA_DEC__SHIFT 0x14
+#define D3F3_IRQ_BRIDGE_CNTL__MASTER_ABORT_MODE_MASK 0x200000
+#define D3F3_IRQ_BRIDGE_CNTL__MASTER_ABORT_MODE__SHIFT 0x15
+#define D3F3_IRQ_BRIDGE_CNTL__SECONDARY_BUS_RESET_MASK 0x400000
+#define D3F3_IRQ_BRIDGE_CNTL__SECONDARY_BUS_RESET__SHIFT 0x16
+#define D3F3_IRQ_BRIDGE_CNTL__FAST_B2B_EN_MASK 0x800000
+#define D3F3_IRQ_BRIDGE_CNTL__FAST_B2B_EN__SHIFT 0x17
+#define D3F3_CAP_PTR__CAP_PTR_MASK 0xff
+#define D3F3_CAP_PTR__CAP_PTR__SHIFT 0x0
+#define D3F3_INTERRUPT_LINE__INTERRUPT_LINE_MASK 0xff
+#define D3F3_INTERRUPT_LINE__INTERRUPT_LINE__SHIFT 0x0
+#define D3F3_INTERRUPT_PIN__INTERRUPT_PIN_MASK 0xff00
+#define D3F3_INTERRUPT_PIN__INTERRUPT_PIN__SHIFT 0x8
+#define D3F3_EXT_BRIDGE_CNTL__IO_PORT_80_EN_MASK 0x1
+#define D3F3_EXT_BRIDGE_CNTL__IO_PORT_80_EN__SHIFT 0x0
+#define D3F3_PMI_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F3_PMI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F3_PMI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F3_PMI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F3_PMI_CAP__VERSION_MASK 0x70000
+#define D3F3_PMI_CAP__VERSION__SHIFT 0x10
+#define D3F3_PMI_CAP__PME_CLOCK_MASK 0x80000
+#define D3F3_PMI_CAP__PME_CLOCK__SHIFT 0x13
+#define D3F3_PMI_CAP__DEV_SPECIFIC_INIT_MASK 0x200000
+#define D3F3_PMI_CAP__DEV_SPECIFIC_INIT__SHIFT 0x15
+#define D3F3_PMI_CAP__AUX_CURRENT_MASK 0x1c00000
+#define D3F3_PMI_CAP__AUX_CURRENT__SHIFT 0x16
+#define D3F3_PMI_CAP__D1_SUPPORT_MASK 0x2000000
+#define D3F3_PMI_CAP__D1_SUPPORT__SHIFT 0x19
+#define D3F3_PMI_CAP__D2_SUPPORT_MASK 0x4000000
+#define D3F3_PMI_CAP__D2_SUPPORT__SHIFT 0x1a
+#define D3F3_PMI_CAP__PME_SUPPORT_MASK 0xf8000000
+#define D3F3_PMI_CAP__PME_SUPPORT__SHIFT 0x1b
+#define D3F3_PMI_STATUS_CNTL__POWER_STATE_MASK 0x3
+#define D3F3_PMI_STATUS_CNTL__POWER_STATE__SHIFT 0x0
+#define D3F3_PMI_STATUS_CNTL__NO_SOFT_RESET_MASK 0x8
+#define D3F3_PMI_STATUS_CNTL__NO_SOFT_RESET__SHIFT 0x3
+#define D3F3_PMI_STATUS_CNTL__PME_EN_MASK 0x100
+#define D3F3_PMI_STATUS_CNTL__PME_EN__SHIFT 0x8
+#define D3F3_PMI_STATUS_CNTL__DATA_SELECT_MASK 0x1e00
+#define D3F3_PMI_STATUS_CNTL__DATA_SELECT__SHIFT 0x9
+#define D3F3_PMI_STATUS_CNTL__DATA_SCALE_MASK 0x6000
+#define D3F3_PMI_STATUS_CNTL__DATA_SCALE__SHIFT 0xd
+#define D3F3_PMI_STATUS_CNTL__PME_STATUS_MASK 0x8000
+#define D3F3_PMI_STATUS_CNTL__PME_STATUS__SHIFT 0xf
+#define D3F3_PMI_STATUS_CNTL__B2_B3_SUPPORT_MASK 0x400000
+#define D3F3_PMI_STATUS_CNTL__B2_B3_SUPPORT__SHIFT 0x16
+#define D3F3_PMI_STATUS_CNTL__BUS_PWR_EN_MASK 0x800000
+#define D3F3_PMI_STATUS_CNTL__BUS_PWR_EN__SHIFT 0x17
+#define D3F3_PMI_STATUS_CNTL__PMI_DATA_MASK 0xff000000
+#define D3F3_PMI_STATUS_CNTL__PMI_DATA__SHIFT 0x18
+#define D3F3_PCIE_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F3_PCIE_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F3_PCIE_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F3_PCIE_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F3_PCIE_CAP__VERSION_MASK 0xf0000
+#define D3F3_PCIE_CAP__VERSION__SHIFT 0x10
+#define D3F3_PCIE_CAP__DEVICE_TYPE_MASK 0xf00000
+#define D3F3_PCIE_CAP__DEVICE_TYPE__SHIFT 0x14
+#define D3F3_PCIE_CAP__SLOT_IMPLEMENTED_MASK 0x1000000
+#define D3F3_PCIE_CAP__SLOT_IMPLEMENTED__SHIFT 0x18
+#define D3F3_PCIE_CAP__INT_MESSAGE_NUM_MASK 0x3e000000
+#define D3F3_PCIE_CAP__INT_MESSAGE_NUM__SHIFT 0x19
+#define D3F3_DEVICE_CAP__MAX_PAYLOAD_SUPPORT_MASK 0x7
+#define D3F3_DEVICE_CAP__MAX_PAYLOAD_SUPPORT__SHIFT 0x0
+#define D3F3_DEVICE_CAP__PHANTOM_FUNC_MASK 0x18
+#define D3F3_DEVICE_CAP__PHANTOM_FUNC__SHIFT 0x3
+#define D3F3_DEVICE_CAP__EXTENDED_TAG_MASK 0x20
+#define D3F3_DEVICE_CAP__EXTENDED_TAG__SHIFT 0x5
+#define D3F3_DEVICE_CAP__L0S_ACCEPTABLE_LATENCY_MASK 0x1c0
+#define D3F3_DEVICE_CAP__L0S_ACCEPTABLE_LATENCY__SHIFT 0x6
+#define D3F3_DEVICE_CAP__L1_ACCEPTABLE_LATENCY_MASK 0xe00
+#define D3F3_DEVICE_CAP__L1_ACCEPTABLE_LATENCY__SHIFT 0x9
+#define D3F3_DEVICE_CAP__ROLE_BASED_ERR_REPORTING_MASK 0x8000
+#define D3F3_DEVICE_CAP__ROLE_BASED_ERR_REPORTING__SHIFT 0xf
+#define D3F3_DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT_MASK 0x3fc0000
+#define D3F3_DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT__SHIFT 0x12
+#define D3F3_DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE_MASK 0xc000000
+#define D3F3_DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE__SHIFT 0x1a
+#define D3F3_DEVICE_CAP__FLR_CAPABLE_MASK 0x10000000
+#define D3F3_DEVICE_CAP__FLR_CAPABLE__SHIFT 0x1c
+#define D3F3_DEVICE_CNTL__CORR_ERR_EN_MASK 0x1
+#define D3F3_DEVICE_CNTL__CORR_ERR_EN__SHIFT 0x0
+#define D3F3_DEVICE_CNTL__NON_FATAL_ERR_EN_MASK 0x2
+#define D3F3_DEVICE_CNTL__NON_FATAL_ERR_EN__SHIFT 0x1
+#define D3F3_DEVICE_CNTL__FATAL_ERR_EN_MASK 0x4
+#define D3F3_DEVICE_CNTL__FATAL_ERR_EN__SHIFT 0x2
+#define D3F3_DEVICE_CNTL__USR_REPORT_EN_MASK 0x8
+#define D3F3_DEVICE_CNTL__USR_REPORT_EN__SHIFT 0x3
+#define D3F3_DEVICE_CNTL__RELAXED_ORD_EN_MASK 0x10
+#define D3F3_DEVICE_CNTL__RELAXED_ORD_EN__SHIFT 0x4
+#define D3F3_DEVICE_CNTL__MAX_PAYLOAD_SIZE_MASK 0xe0
+#define D3F3_DEVICE_CNTL__MAX_PAYLOAD_SIZE__SHIFT 0x5
+#define D3F3_DEVICE_CNTL__EXTENDED_TAG_EN_MASK 0x100
+#define D3F3_DEVICE_CNTL__EXTENDED_TAG_EN__SHIFT 0x8
+#define D3F3_DEVICE_CNTL__PHANTOM_FUNC_EN_MASK 0x200
+#define D3F3_DEVICE_CNTL__PHANTOM_FUNC_EN__SHIFT 0x9
+#define D3F3_DEVICE_CNTL__AUX_POWER_PM_EN_MASK 0x400
+#define D3F3_DEVICE_CNTL__AUX_POWER_PM_EN__SHIFT 0xa
+#define D3F3_DEVICE_CNTL__NO_SNOOP_EN_MASK 0x800
+#define D3F3_DEVICE_CNTL__NO_SNOOP_EN__SHIFT 0xb
+#define D3F3_DEVICE_CNTL__MAX_READ_REQUEST_SIZE_MASK 0x7000
+#define D3F3_DEVICE_CNTL__MAX_READ_REQUEST_SIZE__SHIFT 0xc
+#define D3F3_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN_MASK 0x8000
+#define D3F3_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN__SHIFT 0xf
+#define D3F3_DEVICE_STATUS__CORR_ERR_MASK 0x10000
+#define D3F3_DEVICE_STATUS__CORR_ERR__SHIFT 0x10
+#define D3F3_DEVICE_STATUS__NON_FATAL_ERR_MASK 0x20000
+#define D3F3_DEVICE_STATUS__NON_FATAL_ERR__SHIFT 0x11
+#define D3F3_DEVICE_STATUS__FATAL_ERR_MASK 0x40000
+#define D3F3_DEVICE_STATUS__FATAL_ERR__SHIFT 0x12
+#define D3F3_DEVICE_STATUS__USR_DETECTED_MASK 0x80000
+#define D3F3_DEVICE_STATUS__USR_DETECTED__SHIFT 0x13
+#define D3F3_DEVICE_STATUS__AUX_PWR_MASK 0x100000
+#define D3F3_DEVICE_STATUS__AUX_PWR__SHIFT 0x14
+#define D3F3_DEVICE_STATUS__TRANSACTIONS_PEND_MASK 0x200000
+#define D3F3_DEVICE_STATUS__TRANSACTIONS_PEND__SHIFT 0x15
+#define D3F3_LINK_CAP__LINK_SPEED_MASK 0xf
+#define D3F3_LINK_CAP__LINK_SPEED__SHIFT 0x0
+#define D3F3_LINK_CAP__LINK_WIDTH_MASK 0x3f0
+#define D3F3_LINK_CAP__LINK_WIDTH__SHIFT 0x4
+#define D3F3_LINK_CAP__PM_SUPPORT_MASK 0xc00
+#define D3F3_LINK_CAP__PM_SUPPORT__SHIFT 0xa
+#define D3F3_LINK_CAP__L0S_EXIT_LATENCY_MASK 0x7000
+#define D3F3_LINK_CAP__L0S_EXIT_LATENCY__SHIFT 0xc
+#define D3F3_LINK_CAP__L1_EXIT_LATENCY_MASK 0x38000
+#define D3F3_LINK_CAP__L1_EXIT_LATENCY__SHIFT 0xf
+#define D3F3_LINK_CAP__CLOCK_POWER_MANAGEMENT_MASK 0x40000
+#define D3F3_LINK_CAP__CLOCK_POWER_MANAGEMENT__SHIFT 0x12
+#define D3F3_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING_MASK 0x80000
+#define D3F3_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING__SHIFT 0x13
+#define D3F3_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE_MASK 0x100000
+#define D3F3_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE__SHIFT 0x14
+#define D3F3_LINK_CAP__LINK_BW_NOTIFICATION_CAP_MASK 0x200000
+#define D3F3_LINK_CAP__LINK_BW_NOTIFICATION_CAP__SHIFT 0x15
+#define D3F3_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE_MASK 0x400000
+#define D3F3_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE__SHIFT 0x16
+#define D3F3_LINK_CAP__PORT_NUMBER_MASK 0xff000000
+#define D3F3_LINK_CAP__PORT_NUMBER__SHIFT 0x18
+#define D3F3_LINK_CNTL__PM_CONTROL_MASK 0x3
+#define D3F3_LINK_CNTL__PM_CONTROL__SHIFT 0x0
+#define D3F3_LINK_CNTL__READ_CPL_BOUNDARY_MASK 0x8
+#define D3F3_LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define D3F3_LINK_CNTL__LINK_DIS_MASK 0x10
+#define D3F3_LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define D3F3_LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define D3F3_LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define D3F3_LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define D3F3_LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define D3F3_LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define D3F3_LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define D3F3_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define D3F3_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define D3F3_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define D3F3_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0x9
+#define D3F3_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN_MASK 0x400
+#define D3F3_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN__SHIFT 0xa
+#define D3F3_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN_MASK 0x800
+#define D3F3_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN__SHIFT 0xb
+#define D3F3_LINK_STATUS__CURRENT_LINK_SPEED_MASK 0xf0000
+#define D3F3_LINK_STATUS__CURRENT_LINK_SPEED__SHIFT 0x10
+#define D3F3_LINK_STATUS__NEGOTIATED_LINK_WIDTH_MASK 0x3f00000
+#define D3F3_LINK_STATUS__NEGOTIATED_LINK_WIDTH__SHIFT 0x14
+#define D3F3_LINK_STATUS__LINK_TRAINING_MASK 0x8000000
+#define D3F3_LINK_STATUS__LINK_TRAINING__SHIFT 0x1b
+#define D3F3_LINK_STATUS__SLOT_CLOCK_CFG_MASK 0x10000000
+#define D3F3_LINK_STATUS__SLOT_CLOCK_CFG__SHIFT 0x1c
+#define D3F3_LINK_STATUS__DL_ACTIVE_MASK 0x20000000
+#define D3F3_LINK_STATUS__DL_ACTIVE__SHIFT 0x1d
+#define D3F3_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS_MASK 0x40000000
+#define D3F3_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS__SHIFT 0x1e
+#define D3F3_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS_MASK 0x80000000
+#define D3F3_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS__SHIFT 0x1f
+#define D3F3_SLOT_CAP__ATTN_BUTTON_PRESENT_MASK 0x1
+#define D3F3_SLOT_CAP__ATTN_BUTTON_PRESENT__SHIFT 0x0
+#define D3F3_SLOT_CAP__PWR_CONTROLLER_PRESENT_MASK 0x2
+#define D3F3_SLOT_CAP__PWR_CONTROLLER_PRESENT__SHIFT 0x1
+#define D3F3_SLOT_CAP__MRL_SENSOR_PRESENT_MASK 0x4
+#define D3F3_SLOT_CAP__MRL_SENSOR_PRESENT__SHIFT 0x2
+#define D3F3_SLOT_CAP__ATTN_INDICATOR_PRESENT_MASK 0x8
+#define D3F3_SLOT_CAP__ATTN_INDICATOR_PRESENT__SHIFT 0x3
+#define D3F3_SLOT_CAP__PWR_INDICATOR_PRESENT_MASK 0x10
+#define D3F3_SLOT_CAP__PWR_INDICATOR_PRESENT__SHIFT 0x4
+#define D3F3_SLOT_CAP__HOTPLUG_SURPRISE_MASK 0x20
+#define D3F3_SLOT_CAP__HOTPLUG_SURPRISE__SHIFT 0x5
+#define D3F3_SLOT_CAP__HOTPLUG_CAPABLE_MASK 0x40
+#define D3F3_SLOT_CAP__HOTPLUG_CAPABLE__SHIFT 0x6
+#define D3F3_SLOT_CAP__SLOT_PWR_LIMIT_VALUE_MASK 0x7f80
+#define D3F3_SLOT_CAP__SLOT_PWR_LIMIT_VALUE__SHIFT 0x7
+#define D3F3_SLOT_CAP__SLOT_PWR_LIMIT_SCALE_MASK 0x18000
+#define D3F3_SLOT_CAP__SLOT_PWR_LIMIT_SCALE__SHIFT 0xf
+#define D3F3_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT_MASK 0x20000
+#define D3F3_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT__SHIFT 0x11
+#define D3F3_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED_MASK 0x40000
+#define D3F3_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED__SHIFT 0x12
+#define D3F3_SLOT_CAP__PHYSICAL_SLOT_NUM_MASK 0xfff80000
+#define D3F3_SLOT_CAP__PHYSICAL_SLOT_NUM__SHIFT 0x13
+#define D3F3_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN_MASK 0x1
+#define D3F3_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN__SHIFT 0x0
+#define D3F3_SLOT_CNTL__PWR_FAULT_DETECTED_EN_MASK 0x2
+#define D3F3_SLOT_CNTL__PWR_FAULT_DETECTED_EN__SHIFT 0x1
+#define D3F3_SLOT_CNTL__MRL_SENSOR_CHANGED_EN_MASK 0x4
+#define D3F3_SLOT_CNTL__MRL_SENSOR_CHANGED_EN__SHIFT 0x2
+#define D3F3_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN_MASK 0x8
+#define D3F3_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN__SHIFT 0x3
+#define D3F3_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN_MASK 0x10
+#define D3F3_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN__SHIFT 0x4
+#define D3F3_SLOT_CNTL__HOTPLUG_INTR_EN_MASK 0x20
+#define D3F3_SLOT_CNTL__HOTPLUG_INTR_EN__SHIFT 0x5
+#define D3F3_SLOT_CNTL__ATTN_INDICATOR_CNTL_MASK 0xc0
+#define D3F3_SLOT_CNTL__ATTN_INDICATOR_CNTL__SHIFT 0x6
+#define D3F3_SLOT_CNTL__PWR_INDICATOR_CNTL_MASK 0x300
+#define D3F3_SLOT_CNTL__PWR_INDICATOR_CNTL__SHIFT 0x8
+#define D3F3_SLOT_CNTL__PWR_CONTROLLER_CNTL_MASK 0x400
+#define D3F3_SLOT_CNTL__PWR_CONTROLLER_CNTL__SHIFT 0xa
+#define D3F3_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL_MASK 0x800
+#define D3F3_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL__SHIFT 0xb
+#define D3F3_SLOT_CNTL__DL_STATE_CHANGED_EN_MASK 0x1000
+#define D3F3_SLOT_CNTL__DL_STATE_CHANGED_EN__SHIFT 0xc
+#define D3F3_SLOT_STATUS__ATTN_BUTTON_PRESSED_MASK 0x10000
+#define D3F3_SLOT_STATUS__ATTN_BUTTON_PRESSED__SHIFT 0x10
+#define D3F3_SLOT_STATUS__PWR_FAULT_DETECTED_MASK 0x20000
+#define D3F3_SLOT_STATUS__PWR_FAULT_DETECTED__SHIFT 0x11
+#define D3F3_SLOT_STATUS__MRL_SENSOR_CHANGED_MASK 0x40000
+#define D3F3_SLOT_STATUS__MRL_SENSOR_CHANGED__SHIFT 0x12
+#define D3F3_SLOT_STATUS__PRESENCE_DETECT_CHANGED_MASK 0x80000
+#define D3F3_SLOT_STATUS__PRESENCE_DETECT_CHANGED__SHIFT 0x13
+#define D3F3_SLOT_STATUS__COMMAND_COMPLETED_MASK 0x100000
+#define D3F3_SLOT_STATUS__COMMAND_COMPLETED__SHIFT 0x14
+#define D3F3_SLOT_STATUS__MRL_SENSOR_STATE_MASK 0x200000
+#define D3F3_SLOT_STATUS__MRL_SENSOR_STATE__SHIFT 0x15
+#define D3F3_SLOT_STATUS__PRESENCE_DETECT_STATE_MASK 0x400000
+#define D3F3_SLOT_STATUS__PRESENCE_DETECT_STATE__SHIFT 0x16
+#define D3F3_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS_MASK 0x800000
+#define D3F3_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS__SHIFT 0x17
+#define D3F3_SLOT_STATUS__DL_STATE_CHANGED_MASK 0x1000000
+#define D3F3_SLOT_STATUS__DL_STATE_CHANGED__SHIFT 0x18
+#define D3F3_ROOT_CNTL__SERR_ON_CORR_ERR_EN_MASK 0x1
+#define D3F3_ROOT_CNTL__SERR_ON_CORR_ERR_EN__SHIFT 0x0
+#define D3F3_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN_MASK 0x2
+#define D3F3_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN__SHIFT 0x1
+#define D3F3_ROOT_CNTL__SERR_ON_FATAL_ERR_EN_MASK 0x4
+#define D3F3_ROOT_CNTL__SERR_ON_FATAL_ERR_EN__SHIFT 0x2
+#define D3F3_ROOT_CNTL__PM_INTERRUPT_EN_MASK 0x8
+#define D3F3_ROOT_CNTL__PM_INTERRUPT_EN__SHIFT 0x3
+#define D3F3_ROOT_CNTL__CRS_SOFTWARE_VISIBILITY_EN_MASK 0x10
+#define D3F3_ROOT_CNTL__CRS_SOFTWARE_VISIBILITY_EN__SHIFT 0x4
+#define D3F3_ROOT_CAP__CRS_SOFTWARE_VISIBILITY_MASK 0x10000
+#define D3F3_ROOT_CAP__CRS_SOFTWARE_VISIBILITY__SHIFT 0x10
+#define D3F3_ROOT_STATUS__PME_REQUESTOR_ID_MASK 0xffff
+#define D3F3_ROOT_STATUS__PME_REQUESTOR_ID__SHIFT 0x0
+#define D3F3_ROOT_STATUS__PME_STATUS_MASK 0x10000
+#define D3F3_ROOT_STATUS__PME_STATUS__SHIFT 0x10
+#define D3F3_ROOT_STATUS__PME_PENDING_MASK 0x20000
+#define D3F3_ROOT_STATUS__PME_PENDING__SHIFT 0x11
+#define D3F3_DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED_MASK 0xf
+#define D3F3_DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED__SHIFT 0x0
+#define D3F3_DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED_MASK 0x10
+#define D3F3_DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED__SHIFT 0x4
+#define D3F3_DEVICE_CAP2__ARI_FORWARDING_SUPPORTED_MASK 0x20
+#define D3F3_DEVICE_CAP2__ARI_FORWARDING_SUPPORTED__SHIFT 0x5
+#define D3F3_DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED_MASK 0x40
+#define D3F3_DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED__SHIFT 0x6
+#define D3F3_DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED_MASK 0x80
+#define D3F3_DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED__SHIFT 0x7
+#define D3F3_DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED_MASK 0x100
+#define D3F3_DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED__SHIFT 0x8
+#define D3F3_DEVICE_CAP2__CAS128_CMPLT_SUPPORTED_MASK 0x200
+#define D3F3_DEVICE_CAP2__CAS128_CMPLT_SUPPORTED__SHIFT 0x9
+#define D3F3_DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING_MASK 0x400
+#define D3F3_DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING__SHIFT 0xa
+#define D3F3_DEVICE_CAP2__LTR_SUPPORTED_MASK 0x800
+#define D3F3_DEVICE_CAP2__LTR_SUPPORTED__SHIFT 0xb
+#define D3F3_DEVICE_CAP2__TPH_CPLR_SUPPORTED_MASK 0x3000
+#define D3F3_DEVICE_CAP2__TPH_CPLR_SUPPORTED__SHIFT 0xc
+#define D3F3_DEVICE_CAP2__OBFF_SUPPORTED_MASK 0xc0000
+#define D3F3_DEVICE_CAP2__OBFF_SUPPORTED__SHIFT 0x12
+#define D3F3_DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED_MASK 0x100000
+#define D3F3_DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED__SHIFT 0x14
+#define D3F3_DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED_MASK 0x200000
+#define D3F3_DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED__SHIFT 0x15
+#define D3F3_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES_MASK 0xc00000
+#define D3F3_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES__SHIFT 0x16
+#define D3F3_DEVICE_CNTL2__CPL_TIMEOUT_VALUE_MASK 0xf
+#define D3F3_DEVICE_CNTL2__CPL_TIMEOUT_VALUE__SHIFT 0x0
+#define D3F3_DEVICE_CNTL2__CPL_TIMEOUT_DIS_MASK 0x10
+#define D3F3_DEVICE_CNTL2__CPL_TIMEOUT_DIS__SHIFT 0x4
+#define D3F3_DEVICE_CNTL2__ARI_FORWARDING_EN_MASK 0x20
+#define D3F3_DEVICE_CNTL2__ARI_FORWARDING_EN__SHIFT 0x5
+#define D3F3_DEVICE_CNTL2__ATOMICOP_REQUEST_EN_MASK 0x40
+#define D3F3_DEVICE_CNTL2__ATOMICOP_REQUEST_EN__SHIFT 0x6
+#define D3F3_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING_MASK 0x80
+#define D3F3_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING__SHIFT 0x7
+#define D3F3_DEVICE_CNTL2__IDO_REQUEST_ENABLE_MASK 0x100
+#define D3F3_DEVICE_CNTL2__IDO_REQUEST_ENABLE__SHIFT 0x8
+#define D3F3_DEV

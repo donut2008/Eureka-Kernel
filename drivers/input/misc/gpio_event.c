@@ -1,228 +1,157 @@
-/* drivers/input/misc/gpio_event.c
+/*
+ * Copyright (c) 2005 Cisco Systems.  All rights reserved.
  *
- * Copyright (C) 2007 Google, Inc.
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
  *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/module.h>
-#include <linux/input.h>
-#include <linux/gpio_event.h>
-#include <linux/hrtimer.h>
-#include <linux/platform_device.h>
+#include <linux/init.h>
 #include <linux/slab.h>
+#include <linux/err.h>
+#include <linux/string.h>
+#include <linux/parser.h>
+#include <linux/random.h>
+#include <linux/jiffies.h>
+#include <rdma/ib_cache.h>
 
-struct gpio_event {
-	struct gpio_event_input_devs *input_devs;
-	const struct gpio_event_platform_data *info;
-	void *state[0];
+#include <linux/atomic.h>
+
+#include <scsi/scsi.h>
+#include <scsi/scsi_device.h>
+#include <scsi/scsi_dbg.h>
+#include <scsi/scsi_tcq.h>
+#include <scsi/srp.h>
+#include <scsi/scsi_transport_srp.h>
+
+#include "ib_srp.h"
+
+#define DRV_NAME	"ib_srp"
+#define PFX		DRV_NAME ": "
+#define DRV_VERSION	"2.0"
+#define DRV_RELDATE	"July 26, 2015"
+
+MODULE_AUTHOR("Roland Dreier");
+MODULE_DESCRIPTION("InfiniBand SCSI RDMA Protocol initiator");
+MODULE_LICENSE("Dual BSD/GPL");
+MODULE_VERSION(DRV_VERSION);
+MODULE_INFO(release_date, DRV_RELDATE);
+
+static unsigned int srp_sg_tablesize;
+static unsigned int cmd_sg_entries;
+static unsigned int indirect_sg_entries;
+static bool allow_ext_sg;
+static bool prefer_fr = true;
+static bool register_always = true;
+static int topspin_workarounds = 1;
+
+module_param(srp_sg_tablesize, uint, 0444);
+MODULE_PARM_DESC(srp_sg_tablesize, "Deprecated name for cmd_sg_entries");
+
+module_param(cmd_sg_entries, uint, 0444);
+MODULE_PARM_DESC(cmd_sg_entries,
+		 "Default number of gather/scatter entries in the SRP command (default is 12, max 255)");
+
+module_param(indirect_sg_entries, uint, 0444);
+MODULE_PARM_DESC(indirect_sg_entries,
+		 "Default max number of gather/scatter entries (default is 12, max is " __stringify(SCSI_MAX_SG_CHAIN_SEGMENTS) ")");
+
+module_param(allow_ext_sg, bool, 0444);
+MODULE_PARM_DESC(allow_ext_sg,
+		  "Default behavior when there are more than cmd_sg_entries S/G entries after mapping; fails the request when false (default false)");
+
+module_param(topspin_workarounds, int, 0444);
+MODULE_PARM_DESC(topspin_workarounds,
+		 "Enable workarounds for Topspin/Cisco SRP target bugs if != 0");
+
+module_param(prefer_fr, bool, 0444);
+MODULE_PARM_DESC(prefer_fr,
+"Whether to use fast registration if both FMR and fast registration are supported");
+
+module_param(register_always, bool, 0444);
+MODULE_PARM_DESC(register_always,
+		 "Use memory registration even for contiguous memory regions");
+
+static const struct kernel_param_ops srp_tmo_ops;
+
+static int srp_reconnect_delay = 10;
+module_param_cb(reconnect_delay, &srp_tmo_ops, &srp_reconnect_delay,
+		S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(reconnect_delay, "Time between successive reconnect attempts");
+
+static int srp_fast_io_fail_tmo = 15;
+module_param_cb(fast_io_fail_tmo, &srp_tmo_ops, &srp_fast_io_fail_tmo,
+		S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(fast_io_fail_tmo,
+		 "Number of seconds between the observation of a transport"
+		 " layer error and failing all I/O. \"off\" means that this"
+		 " functionality is disabled.");
+
+static int srp_dev_loss_tmo = 600;
+module_param_cb(dev_loss_tmo, &srp_tmo_ops, &srp_dev_loss_tmo,
+		S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(dev_loss_tmo,
+		 "Maximum number of seconds that the SRP transport should"
+		 " insulate transport layer errors. After this time has been"
+		 " exceeded the SCSI host is removed. Should be"
+		 " between 1 and " __stringify(SCSI_DEVICE_BLOCK_MAX_TIMEOUT)
+		 " if fast_io_fail_tmo has not been set. \"off\" means that"
+		 " this functionality is disabled.");
+
+static unsigned ch_count;
+module_param(ch_count, uint, 0444);
+MODULE_PARM_DESC(ch_count,
+		 "Number of RDMA channels to use for communication with an SRP target. Using more than one channel improves performance if the HCA supports multiple completion vectors. The default value is the minimum of four times the number of online CPU sockets and the number of completion vectors supported by the HCA.");
+
+static void srp_add_one(struct ib_device *device);
+static void srp_remove_one(struct ib_device *device, void *client_data);
+static void srp_recv_completion(struct ib_cq *cq, void *ch_ptr);
+static void srp_send_completion(struct ib_cq *cq, void *ch_ptr);
+static int srp_cm_handler(struct ib_cm_id *cm_id, struct ib_cm_event *event);
+
+static struct scsi_transport_template *ib_srp_transport_template;
+static struct workqueue_struct *srp_remove_wq;
+
+static struct ib_client srp_client = {
+	.name   = "srp",
+	.add    = srp_add_one,
+	.remove = srp_remove_one
 };
 
-static int gpio_input_event(
-	struct input_dev *dev, unsigned int type, unsigned int code, int value)
+static struct ib_sa_client srp_sa_client;
+
+static int srp_tmo_get(char *buffer, const struct kernel_param *kp)
 {
-	int i;
-	int devnr;
-	int ret = 0;
-	int tmp_ret;
-	struct gpio_event_info **ii;
-	struct gpio_event *ip = input_get_drvdata(dev);
+	int tmo = *(int *)kp->arg;
 
-	for (devnr = 0; devnr < ip->input_devs->count; devnr++)
-		if (ip->input_devs->dev[devnr] == dev)
-			break;
-	if (devnr == ip->input_devs->count) {
-		pr_err("gpio_input_event: unknown device %p\n", dev);
-		return -EIO;
-	}
-
-	for (i = 0, ii = ip->info->info; i < ip->info->info_count; i++, ii++) {
-		if ((*ii)->event) {
-			tmp_ret = (*ii)->event(ip->input_devs, *ii,
-						&ip->state[i],
-						devnr, type, code, value);
-			if (tmp_ret)
-				ret = tmp_ret;
-		}
-	}
-	return ret;
-}
-
-static int gpio_event_call_all_func(struct gpio_event *ip, int func)
-{
-	int i;
-	int ret;
-	struct gpio_event_info **ii;
-
-	if (func == GPIO_EVENT_FUNC_INIT || func == GPIO_EVENT_FUNC_RESUME) {
-		ii = ip->info->info;
-		for (i = 0; i < ip->info->info_count; i++, ii++) {
-			if ((*ii)->func == NULL) {
-				ret = -ENODEV;
-				pr_err("gpio_event_probe: Incomplete pdata, "
-					"no function\n");
-				goto err_no_func;
-			}
-			if (func == GPIO_EVENT_FUNC_RESUME && (*ii)->no_suspend)
-				continue;
-			ret = (*ii)->func(ip->input_devs, *ii, &ip->state[i],
-					  func);
-			if (ret) {
-				pr_err("gpio_event_probe: function failed\n");
-				goto err_func_failed;
-			}
-		}
-		return 0;
-	}
-
-	ret = 0;
-	i = ip->info->info_count;
-	ii = ip->info->info + i;
-	while (i > 0) {
-		i--;
-		ii--;
-		if ((func & ~1) == GPIO_EVENT_FUNC_SUSPEND && (*ii)->no_suspend)
-			continue;
-		(*ii)->func(ip->input_devs, *ii, &ip->state[i], func & ~1);
-err_func_failed:
-err_no_func:
-		;
-	}
-	return ret;
-}
-
-static void __maybe_unused gpio_event_suspend(struct gpio_event *ip)
-{
-	gpio_event_call_all_func(ip, GPIO_EVENT_FUNC_SUSPEND);
-	if (ip->info->power)
-		ip->info->power(ip->info, 0);
-}
-
-static void __maybe_unused gpio_event_resume(struct gpio_event *ip)
-{
-	if (ip->info->power)
-		ip->info->power(ip->info, 1);
-	gpio_event_call_all_func(ip, GPIO_EVENT_FUNC_RESUME);
-}
-
-static int gpio_event_probe(struct platform_device *pdev)
-{
-	int err;
-	struct gpio_event *ip;
-	struct gpio_event_platform_data *event_info;
-	int dev_count = 1;
-	int i;
-	int registered = 0;
-
-	event_info = pdev->dev.platform_data;
-	if (event_info == NULL) {
-		pr_err("gpio_event_probe: No pdata\n");
-		return -ENODEV;
-	}
-	if ((!event_info->name && !event_info->names[0]) ||
-	    !event_info->info || !event_info->info_count) {
-		pr_err("gpio_event_probe: Incomplete pdata\n");
-		return -ENODEV;
-	}
-	if (!event_info->name)
-		while (event_info->names[dev_count])
-			dev_count++;
-	ip = kzalloc(sizeof(*ip) +
-		     sizeof(ip->state[0]) * event_info->info_count +
-		     sizeof(*ip->input_devs) +
-		     sizeof(ip->input_devs->dev[0]) * dev_count, GFP_KERNEL);
-	if (ip == NULL) {
-		err = -ENOMEM;
-		pr_err("gpio_event_probe: Failed to allocate private data\n");
-		goto err_kp_alloc_failed;
-	}
-	ip->input_devs = (void*)&ip->state[event_info->info_count];
-	platform_set_drvdata(pdev, ip);
-
-	for (i = 0; i < dev_count; i++) {
-		struct input_dev *input_dev = input_allocate_device();
-		if (input_dev == NULL) {
-			err = -ENOMEM;
-			pr_err("gpio_event_probe: "
-				"Failed to allocate input device\n");
-			goto err_input_dev_alloc_failed;
-		}
-		input_set_drvdata(input_dev, ip);
-		input_dev->name = event_info->name ?
-					event_info->name : event_info->names[i];
-		input_dev->event = gpio_input_event;
-		ip->input_devs->dev[i] = input_dev;
-	}
-	ip->input_devs->count = dev_count;
-	ip->info = event_info;
-	if (event_info->power)
-		ip->info->power(ip->info, 1);
-
-	err = gpio_event_call_all_func(ip, GPIO_EVENT_FUNC_INIT);
-	if (err)
-		goto err_call_all_func_failed;
-
-	for (i = 0; i < dev_count; i++) {
-		err = input_register_device(ip->input_devs->dev[i]);
-		if (err) {
-			pr_err("gpio_event_probe: Unable to register %s "
-				"input device\n", ip->input_devs->dev[i]->name);
-			goto err_input_register_device_failed;
-		}
-		registered++;
-	}
-
-	return 0;
-
-err_input_register_device_failed:
-	gpio_event_call_all_func(ip, GPIO_EVENT_FUNC_UNINIT);
-err_call_all_func_failed:
-	if (event_info->power)
-		ip->info->power(ip->info, 0);
-	for (i = 0; i < registered; i++)
-		input_unregister_device(ip->input_devs->dev[i]);
-	for (i = dev_count - 1; i >= registered; i--) {
-		input_free_device(ip->input_devs->dev[i]);
-err_input_dev_alloc_failed:
-		;
-	}
-	kfree(ip);
-err_kp_alloc_failed:
-	return err;
-}
-
-static int gpio_event_remove(struct platform_device *pdev)
-{
-	struct gpio_event *ip = platform_get_drvdata(pdev);
-	int i;
-
-	gpio_event_call_all_func(ip, GPIO_EVENT_FUNC_UNINIT);
-	if (ip->info->power)
-		ip->info->power(ip->info, 0);
-	for (i = 0; i < ip->input_devs->count; i++)
-		input_unregister_device(ip->input_devs->dev[i]);
-	kfree(ip);
-	return 0;
-}
-
-static struct platform_driver gpio_event_driver = {
-	.probe		= gpio_event_probe,
-	.remove		= gpio_event_remove,
-	.driver		= {
-		.name	= GPIO_EVENT_DEV_NAME,
-	},
-};
-
-module_platform_driver(gpio_event_driver);
-
-MODULE_DESCRIPTION("GPIO Event Driver");
-MODULE_LICENSE("GPL");
-
+	if (tmo >= 0)
+		return sprintf(buffer, "%d", tmo);
+	else
+		return spr

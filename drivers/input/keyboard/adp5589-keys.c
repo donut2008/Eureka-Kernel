@@ -1,1111 +1,621 @@
-/*
- * Description:  keypad driver for ADP5589, ADP5585
- *		 I2C QWERTY Keypad and IO Expander
- * Bugs: Enter bugs at http://blackfin.uclinux.org/
- *
- * Copyright (C) 2010-2011 Analog Devices Inc.
- * Licensed under the GPL-2.
- */
-
-#include <linux/module.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/workqueue.h>
-#include <linux/errno.h>
-#include <linux/pm.h>
-#include <linux/platform_device.h>
-#include <linux/input.h>
-#include <linux/i2c.h>
-#include <linux/gpio.h>
-#include <linux/slab.h>
-
-#include <linux/input/adp5589.h>
-
-/* ADP5589/ADP5585 Common Registers */
-#define ADP5589_5_ID			0x00
-#define ADP5589_5_INT_STATUS		0x01
-#define ADP5589_5_STATUS		0x02
-#define ADP5589_5_FIFO_1		0x03
-#define ADP5589_5_FIFO_2		0x04
-#define ADP5589_5_FIFO_3		0x05
-#define ADP5589_5_FIFO_4		0x06
-#define ADP5589_5_FIFO_5		0x07
-#define ADP5589_5_FIFO_6		0x08
-#define ADP5589_5_FIFO_7		0x09
-#define ADP5589_5_FIFO_8		0x0A
-#define ADP5589_5_FIFO_9		0x0B
-#define ADP5589_5_FIFO_10		0x0C
-#define ADP5589_5_FIFO_11		0x0D
-#define ADP5589_5_FIFO_12		0x0E
-#define ADP5589_5_FIFO_13		0x0F
-#define ADP5589_5_FIFO_14		0x10
-#define ADP5589_5_FIFO_15		0x11
-#define ADP5589_5_FIFO_16		0x12
-#define ADP5589_5_GPI_INT_STAT_A	0x13
-#define ADP5589_5_GPI_INT_STAT_B	0x14
-
-/* ADP5589 Registers */
-#define ADP5589_GPI_INT_STAT_C		0x15
-#define ADP5589_GPI_STATUS_A		0x16
-#define ADP5589_GPI_STATUS_B		0x17
-#define ADP5589_GPI_STATUS_C		0x18
-#define ADP5589_RPULL_CONFIG_A		0x19
-#define ADP5589_RPULL_CONFIG_B		0x1A
-#define ADP5589_RPULL_CONFIG_C		0x1B
-#define ADP5589_RPULL_CONFIG_D		0x1C
-#define ADP5589_RPULL_CONFIG_E		0x1D
-#define ADP5589_GPI_INT_LEVEL_A		0x1E
-#define ADP5589_GPI_INT_LEVEL_B		0x1F
-#define ADP5589_GPI_INT_LEVEL_C		0x20
-#define ADP5589_GPI_EVENT_EN_A		0x21
-#define ADP5589_GPI_EVENT_EN_B		0x22
-#define ADP5589_GPI_EVENT_EN_C		0x23
-#define ADP5589_GPI_INTERRUPT_EN_A	0x24
-#define ADP5589_GPI_INTERRUPT_EN_B	0x25
-#define ADP5589_GPI_INTERRUPT_EN_C	0x26
-#define ADP5589_DEBOUNCE_DIS_A		0x27
-#define ADP5589_DEBOUNCE_DIS_B		0x28
-#define ADP5589_DEBOUNCE_DIS_C		0x29
-#define ADP5589_GPO_DATA_OUT_A		0x2A
-#define ADP5589_GPO_DATA_OUT_B		0x2B
-#define ADP5589_GPO_DATA_OUT_C		0x2C
-#define ADP5589_GPO_OUT_MODE_A		0x2D
-#define ADP5589_GPO_OUT_MODE_B		0x2E
-#define ADP5589_GPO_OUT_MODE_C		0x2F
-#define ADP5589_GPIO_DIRECTION_A	0x30
-#define ADP5589_GPIO_DIRECTION_B	0x31
-#define ADP5589_GPIO_DIRECTION_C	0x32
-#define ADP5589_UNLOCK1			0x33
-#define ADP5589_UNLOCK2			0x34
-#define ADP5589_EXT_LOCK_EVENT		0x35
-#define ADP5589_UNLOCK_TIMERS		0x36
-#define ADP5589_LOCK_CFG		0x37
-#define ADP5589_RESET1_EVENT_A		0x38
-#define ADP5589_RESET1_EVENT_B		0x39
-#define ADP5589_RESET1_EVENT_C		0x3A
-#define ADP5589_RESET2_EVENT_A		0x3B
-#define ADP5589_RESET2_EVENT_B		0x3C
-#define ADP5589_RESET_CFG		0x3D
-#define ADP5589_PWM_OFFT_LOW		0x3E
-#define ADP5589_PWM_OFFT_HIGH		0x3F
-#define ADP5589_PWM_ONT_LOW		0x40
-#define ADP5589_PWM_ONT_HIGH		0x41
-#define ADP5589_PWM_CFG			0x42
-#define ADP5589_CLOCK_DIV_CFG		0x43
-#define ADP5589_LOGIC_1_CFG		0x44
-#define ADP5589_LOGIC_2_CFG		0x45
-#define ADP5589_LOGIC_FF_CFG		0x46
-#define ADP5589_LOGIC_INT_EVENT_EN	0x47
-#define ADP5589_POLL_PTIME_CFG		0x48
-#define ADP5589_PIN_CONFIG_A		0x49
-#define ADP5589_PIN_CONFIG_B		0x4A
-#define ADP5589_PIN_CONFIG_C		0x4B
-#define ADP5589_PIN_CONFIG_D		0x4C
-#define ADP5589_GENERAL_CFG		0x4D
-#define ADP5589_INT_EN			0x4E
-
-/* ADP5585 Registers */
-#define ADP5585_GPI_STATUS_A		0x15
-#define ADP5585_GPI_STATUS_B		0x16
-#define ADP5585_RPULL_CONFIG_A		0x17
-#define ADP5585_RPULL_CONFIG_B		0x18
-#define ADP5585_RPULL_CONFIG_C		0x19
-#define ADP5585_RPULL_CONFIG_D		0x1A
-#define ADP5585_GPI_INT_LEVEL_A		0x1B
-#define ADP5585_GPI_INT_LEVEL_B		0x1C
-#define ADP5585_GPI_EVENT_EN_A		0x1D
-#define ADP5585_GPI_EVENT_EN_B		0x1E
-#define ADP5585_GPI_INTERRUPT_EN_A	0x1F
-#define ADP5585_GPI_INTERRUPT_EN_B	0x20
-#define ADP5585_DEBOUNCE_DIS_A		0x21
-#define ADP5585_DEBOUNCE_DIS_B		0x22
-#define ADP5585_GPO_DATA_OUT_A		0x23
-#define ADP5585_GPO_DATA_OUT_B		0x24
-#define ADP5585_GPO_OUT_MODE_A		0x25
-#define ADP5585_GPO_OUT_MODE_B		0x26
-#define ADP5585_GPIO_DIRECTION_A	0x27
-#define ADP5585_GPIO_DIRECTION_B	0x28
-#define ADP5585_RESET1_EVENT_A		0x29
-#define ADP5585_RESET1_EVENT_B		0x2A
-#define ADP5585_RESET1_EVENT_C		0x2B
-#define ADP5585_RESET2_EVENT_A		0x2C
-#define ADP5585_RESET2_EVENT_B		0x2D
-#define ADP5585_RESET_CFG		0x2E
-#define ADP5585_PWM_OFFT_LOW		0x2F
-#define ADP5585_PWM_OFFT_HIGH		0x30
-#define ADP5585_PWM_ONT_LOW		0x31
-#define ADP5585_PWM_ONT_HIGH		0x32
-#define ADP5585_PWM_CFG			0x33
-#define ADP5585_LOGIC_CFG		0x34
-#define ADP5585_LOGIC_FF_CFG		0x35
-#define ADP5585_LOGIC_INT_EVENT_EN	0x36
-#define ADP5585_POLL_PTIME_CFG		0x37
-#define ADP5585_PIN_CONFIG_A		0x38
-#define ADP5585_PIN_CONFIG_B		0x39
-#define ADP5585_PIN_CONFIG_D		0x3A
-#define ADP5585_GENERAL_CFG		0x3B
-#define ADP5585_INT_EN			0x3C
-
-/* ID Register */
-#define ADP5589_5_DEVICE_ID_MASK	0xF
-#define ADP5589_5_MAN_ID_MASK		0xF
-#define ADP5589_5_MAN_ID_SHIFT		4
-#define ADP5589_5_MAN_ID		0x02
-
-/* GENERAL_CFG Register */
-#define OSC_EN		(1 << 7)
-#define CORE_CLK(x)	(((x) & 0x3) << 5)
-#define LCK_TRK_LOGIC	(1 << 4)	/* ADP5589 only */
-#define LCK_TRK_GPI	(1 << 3)	/* ADP5589 only */
-#define INT_CFG		(1 << 1)
-#define RST_CFG		(1 << 0)
-
-/* INT_EN Register */
-#define LOGIC2_IEN	(1 << 5)	/* ADP5589 only */
-#define LOGIC1_IEN	(1 << 4)
-#define LOCK_IEN	(1 << 3)	/* ADP5589 only */
-#define OVRFLOW_IEN	(1 << 2)
-#define GPI_IEN		(1 << 1)
-#define EVENT_IEN	(1 << 0)
-
-/* Interrupt Status Register */
-#define LOGIC2_INT	(1 << 5)	/* ADP5589 only */
-#define LOGIC1_INT	(1 << 4)
-#define LOCK_INT	(1 << 3)	/* ADP5589 only */
-#define OVRFLOW_INT	(1 << 2)
-#define GPI_INT		(1 << 1)
-#define EVENT_INT	(1 << 0)
-
-/* STATUS Register */
-#define LOGIC2_STAT	(1 << 7)	/* ADP5589 only */
-#define LOGIC1_STAT	(1 << 6)
-#define LOCK_STAT	(1 << 5)	/* ADP5589 only */
-#define KEC		0x1F
-
-/* PIN_CONFIG_D Register */
-#define C4_EXTEND_CFG	(1 << 6)	/* RESET2 */
-#define R4_EXTEND_CFG	(1 << 5)	/* RESET1 */
-
-/* LOCK_CFG */
-#define LOCK_EN		(1 << 0)
-
-#define PTIME_MASK	0x3
-#define LTIME_MASK	0x3		/* ADP5589 only */
-
-/* Key Event Register xy */
-#define KEY_EV_PRESSED		(1 << 7)
-#define KEY_EV_MASK		(0x7F)
-
-#define KEYP_MAX_EVENT		16
-#define ADP5589_MAXGPIO		19
-#define ADP5585_MAXGPIO		11 /* 10 on the ADP5585-01, 11 on ADP5585-02 */
-
-enum {
-	ADP5589,
-	ADP5585_01,
-	ADP5585_02
-};
-
-struct adp_constants {
-	u8 maxgpio;
-	u8 keymapsize;
-	u8 gpi_pin_row_base;
-	u8 gpi_pin_row_end;
-	u8 gpi_pin_col_base;
-	u8 gpi_pin_base;
-	u8 gpi_pin_end;
-	u8 gpimapsize_max;
-	u8 max_row_num;
-	u8 max_col_num;
-	u8 row_mask;
-	u8 col_mask;
-	u8 col_shift;
-	u8 c4_extend_cfg;
-	u8 (*bank) (u8 offset);
-	u8 (*bit) (u8 offset);
-	u8 (*reg) (u8 reg);
-};
-
-struct adp5589_kpad {
-	struct i2c_client *client;
-	struct input_dev *input;
-	const struct adp_constants *var;
-	unsigned short keycode[ADP5589_KEYMAPSIZE];
-	const struct adp5589_gpi_map *gpimap;
-	unsigned short gpimapsize;
-	unsigned extend_cfg;
-	bool is_adp5585;
-	bool adp5585_support_row5;
-#ifdef CONFIG_GPIOLIB
-	unsigned char gpiomap[ADP5589_MAXGPIO];
-	bool export_gpio;
-	struct gpio_chip gc;
-	struct mutex gpio_lock;	/* Protect cached dir, dat_out */
-	u8 dat_out[3];
-	u8 dir[3];
-#endif
-};
-
-/*
- *  ADP5589 / ADP5585 derivative / variant handling
- */
-
-
-/* ADP5589 */
-
-static unsigned char adp5589_bank(unsigned char offset)
-{
-	return offset >> 3;
-}
-
-static unsigned char adp5589_bit(unsigned char offset)
-{
-	return 1u << (offset & 0x7);
-}
-
-static unsigned char adp5589_reg(unsigned char reg)
-{
-	return reg;
-}
-
-static const struct adp_constants const_adp5589 = {
-	.maxgpio		= ADP5589_MAXGPIO,
-	.keymapsize		= ADP5589_KEYMAPSIZE,
-	.gpi_pin_row_base	= ADP5589_GPI_PIN_ROW_BASE,
-	.gpi_pin_row_end	= ADP5589_GPI_PIN_ROW_END,
-	.gpi_pin_col_base	= ADP5589_GPI_PIN_COL_BASE,
-	.gpi_pin_base		= ADP5589_GPI_PIN_BASE,
-	.gpi_pin_end		= ADP5589_GPI_PIN_END,
-	.gpimapsize_max		= ADP5589_GPIMAPSIZE_MAX,
-	.c4_extend_cfg		= 12,
-	.max_row_num		= ADP5589_MAX_ROW_NUM,
-	.max_col_num		= ADP5589_MAX_COL_NUM,
-	.row_mask		= ADP5589_ROW_MASK,
-	.col_mask		= ADP5589_COL_MASK,
-	.col_shift		= ADP5589_COL_SHIFT,
-	.bank			= adp5589_bank,
-	.bit			= adp5589_bit,
-	.reg			= adp5589_reg,
-};
-
-/* ADP5585 */
-
-static unsigned char adp5585_bank(unsigned char offset)
-{
-	return offset > ADP5585_MAX_ROW_NUM;
-}
-
-static unsigned char adp5585_bit(unsigned char offset)
-{
-	return (offset > ADP5585_MAX_ROW_NUM) ?
-		1u << (offset - ADP5585_COL_SHIFT) : 1u << offset;
-}
-
-static const unsigned char adp5585_reg_lut[] = {
-	[ADP5589_GPI_STATUS_A]		= ADP5585_GPI_STATUS_A,
-	[ADP5589_GPI_STATUS_B]		= ADP5585_GPI_STATUS_B,
-	[ADP5589_RPULL_CONFIG_A]	= ADP5585_RPULL_CONFIG_A,
-	[ADP5589_RPULL_CONFIG_B]	= ADP5585_RPULL_CONFIG_B,
-	[ADP5589_RPULL_CONFIG_C]	= ADP5585_RPULL_CONFIG_C,
-	[ADP5589_RPULL_CONFIG_D]	= ADP5585_RPULL_CONFIG_D,
-	[ADP5589_GPI_INT_LEVEL_A]	= ADP5585_GPI_INT_LEVEL_A,
-	[ADP5589_GPI_INT_LEVEL_B]	= ADP5585_GPI_INT_LEVEL_B,
-	[ADP5589_GPI_EVENT_EN_A]	= ADP5585_GPI_EVENT_EN_A,
-	[ADP5589_GPI_EVENT_EN_B]	= ADP5585_GPI_EVENT_EN_B,
-	[ADP5589_GPI_INTERRUPT_EN_A]	= ADP5585_GPI_INTERRUPT_EN_A,
-	[ADP5589_GPI_INTERRUPT_EN_B]	= ADP5585_GPI_INTERRUPT_EN_B,
-	[ADP5589_DEBOUNCE_DIS_A]	= ADP5585_DEBOUNCE_DIS_A,
-	[ADP5589_DEBOUNCE_DIS_B]	= ADP5585_DEBOUNCE_DIS_B,
-	[ADP5589_GPO_DATA_OUT_A]	= ADP5585_GPO_DATA_OUT_A,
-	[ADP5589_GPO_DATA_OUT_B]	= ADP5585_GPO_DATA_OUT_B,
-	[ADP5589_GPO_OUT_MODE_A]	= ADP5585_GPO_OUT_MODE_A,
-	[ADP5589_GPO_OUT_MODE_B]	= ADP5585_GPO_OUT_MODE_B,
-	[ADP5589_GPIO_DIRECTION_A]	= ADP5585_GPIO_DIRECTION_A,
-	[ADP5589_GPIO_DIRECTION_B]	= ADP5585_GPIO_DIRECTION_B,
-	[ADP5589_RESET1_EVENT_A]	= ADP5585_RESET1_EVENT_A,
-	[ADP5589_RESET1_EVENT_B]	= ADP5585_RESET1_EVENT_B,
-	[ADP5589_RESET1_EVENT_C]	= ADP5585_RESET1_EVENT_C,
-	[ADP5589_RESET2_EVENT_A]	= ADP5585_RESET2_EVENT_A,
-	[ADP5589_RESET2_EVENT_B]	= ADP5585_RESET2_EVENT_B,
-	[ADP5589_RESET_CFG]		= ADP5585_RESET_CFG,
-	[ADP5589_PWM_OFFT_LOW]		= ADP5585_PWM_OFFT_LOW,
-	[ADP5589_PWM_OFFT_HIGH]		= ADP5585_PWM_OFFT_HIGH,
-	[ADP5589_PWM_ONT_LOW]		= ADP5585_PWM_ONT_LOW,
-	[ADP5589_PWM_ONT_HIGH]		= ADP5585_PWM_ONT_HIGH,
-	[ADP5589_PWM_CFG]		= ADP5585_PWM_CFG,
-	[ADP5589_LOGIC_1_CFG]		= ADP5585_LOGIC_CFG,
-	[ADP5589_LOGIC_FF_CFG]		= ADP5585_LOGIC_FF_CFG,
-	[ADP5589_LOGIC_INT_EVENT_EN]	= ADP5585_LOGIC_INT_EVENT_EN,
-	[ADP5589_POLL_PTIME_CFG]	= ADP5585_POLL_PTIME_CFG,
-	[ADP5589_PIN_CONFIG_A]		= ADP5585_PIN_CONFIG_A,
-	[ADP5589_PIN_CONFIG_B]		= ADP5585_PIN_CONFIG_B,
-	[ADP5589_PIN_CONFIG_D]		= ADP5585_PIN_CONFIG_D,
-	[ADP5589_GENERAL_CFG]		= ADP5585_GENERAL_CFG,
-	[ADP5589_INT_EN]		= ADP5585_INT_EN,
-};
-
-static unsigned char adp5585_reg(unsigned char reg)
-{
-	return adp5585_reg_lut[reg];
-}
-
-static const struct adp_constants const_adp5585 = {
-	.maxgpio		= ADP5585_MAXGPIO,
-	.keymapsize		= ADP5585_KEYMAPSIZE,
-	.gpi_pin_row_base	= ADP5585_GPI_PIN_ROW_BASE,
-	.gpi_pin_row_end	= ADP5585_GPI_PIN_ROW_END,
-	.gpi_pin_col_base	= ADP5585_GPI_PIN_COL_BASE,
-	.gpi_pin_base		= ADP5585_GPI_PIN_BASE,
-	.gpi_pin_end		= ADP5585_GPI_PIN_END,
-	.gpimapsize_max		= ADP5585_GPIMAPSIZE_MAX,
-	.c4_extend_cfg		= 10,
-	.max_row_num		= ADP5585_MAX_ROW_NUM,
-	.max_col_num		= ADP5585_MAX_COL_NUM,
-	.row_mask		= ADP5585_ROW_MASK,
-	.col_mask		= ADP5585_COL_MASK,
-	.col_shift		= ADP5585_COL_SHIFT,
-	.bank			= adp5585_bank,
-	.bit			= adp5585_bit,
-	.reg			= adp5585_reg,
-};
-
-static int adp5589_read(struct i2c_client *client, u8 reg)
-{
-	int ret = i2c_smbus_read_byte_data(client, reg);
-
-	if (ret < 0)
-		dev_err(&client->dev, "Read Error\n");
-
-	return ret;
-}
-
-static int adp5589_write(struct i2c_client *client, u8 reg, u8 val)
-{
-	return i2c_smbus_write_byte_data(client, reg, val);
-}
-
-#ifdef CONFIG_GPIOLIB
-static int adp5589_gpio_get_value(struct gpio_chip *chip, unsigned off)
-{
-	struct adp5589_kpad *kpad = container_of(chip, struct adp5589_kpad, gc);
-	unsigned int bank = kpad->var->bank(kpad->gpiomap[off]);
-	unsigned int bit = kpad->var->bit(kpad->gpiomap[off]);
-
-	return !!(adp5589_read(kpad->client,
-			       kpad->var->reg(ADP5589_GPI_STATUS_A) + bank) &
-			       bit);
-}
-
-static void adp5589_gpio_set_value(struct gpio_chip *chip,
-				   unsigned off, int val)
-{
-	struct adp5589_kpad *kpad = container_of(chip, struct adp5589_kpad, gc);
-	unsigned int bank = kpad->var->bank(kpad->gpiomap[off]);
-	unsigned int bit = kpad->var->bit(kpad->gpiomap[off]);
-
-	mutex_lock(&kpad->gpio_lock);
-
-	if (val)
-		kpad->dat_out[bank] |= bit;
-	else
-		kpad->dat_out[bank] &= ~bit;
-
-	adp5589_write(kpad->client, kpad->var->reg(ADP5589_GPO_DATA_OUT_A) +
-		      bank, kpad->dat_out[bank]);
-
-	mutex_unlock(&kpad->gpio_lock);
-}
-
-static int adp5589_gpio_direction_input(struct gpio_chip *chip, unsigned off)
-{
-	struct adp5589_kpad *kpad = container_of(chip, struct adp5589_kpad, gc);
-	unsigned int bank = kpad->var->bank(kpad->gpiomap[off]);
-	unsigned int bit = kpad->var->bit(kpad->gpiomap[off]);
-	int ret;
-
-	mutex_lock(&kpad->gpio_lock);
-
-	kpad->dir[bank] &= ~bit;
-	ret = adp5589_write(kpad->client,
-			    kpad->var->reg(ADP5589_GPIO_DIRECTION_A) + bank,
-			    kpad->dir[bank]);
-
-	mutex_unlock(&kpad->gpio_lock);
-
-	return ret;
-}
-
-static int adp5589_gpio_direction_output(struct gpio_chip *chip,
-					 unsigned off, int val)
-{
-	struct adp5589_kpad *kpad = container_of(chip, struct adp5589_kpad, gc);
-	unsigned int bank = kpad->var->bank(kpad->gpiomap[off]);
-	unsigned int bit = kpad->var->bit(kpad->gpiomap[off]);
-	int ret;
-
-	mutex_lock(&kpad->gpio_lock);
-
-	kpad->dir[bank] |= bit;
-
-	if (val)
-		kpad->dat_out[bank] |= bit;
-	else
-		kpad->dat_out[bank] &= ~bit;
-
-	ret = adp5589_write(kpad->client, kpad->var->reg(ADP5589_GPO_DATA_OUT_A)
-			    + bank, kpad->dat_out[bank]);
-	ret |= adp5589_write(kpad->client,
-			     kpad->var->reg(ADP5589_GPIO_DIRECTION_A) + bank,
-			     kpad->dir[bank]);
-
-	mutex_unlock(&kpad->gpio_lock);
-
-	return ret;
-}
-
-static int adp5589_build_gpiomap(struct adp5589_kpad *kpad,
-				const struct adp5589_kpad_platform_data *pdata)
-{
-	bool pin_used[ADP5589_MAXGPIO];
-	int n_unused = 0;
-	int i;
-
-	memset(pin_used, false, sizeof(pin_used));
-
-	for (i = 0; i < kpad->var->maxgpio; i++)
-		if (pdata->keypad_en_mask & (1 << i))
-			pin_used[i] = true;
-
-	for (i = 0; i < kpad->gpimapsize; i++)
-		pin_used[kpad->gpimap[i].pin - kpad->var->gpi_pin_base] = true;
-
-	if (kpad->extend_cfg & R4_EXTEND_CFG)
-		pin_used[4] = true;
-
-	if (kpad->extend_cfg & C4_EXTEND_CFG)
-		pin_used[kpad->var->c4_extend_cfg] = true;
-
-	if (!kpad->adp5585_support_row5)
-		pin_used[5] = true;
-
-	for (i = 0; i < kpad->var->maxgpio; i++)
-		if (!pin_used[i])
-			kpad->gpiomap[n_unused++] = i;
-
-	return n_unused;
-}
-
-static int adp5589_gpio_add(struct adp5589_kpad *kpad)
-{
-	struct device *dev = &kpad->client->dev;
-	const struct adp5589_kpad_platform_data *pdata = dev_get_platdata(dev);
-	const struct adp5589_gpio_platform_data *gpio_data = pdata->gpio_data;
-	int i, error;
-
-	if (!gpio_data)
-		return 0;
-
-	kpad->gc.ngpio = adp5589_build_gpiomap(kpad, pdata);
-	if (kpad->gc.ngpio == 0) {
-		dev_info(dev, "No unused gpios left to export\n");
-		return 0;
-	}
-
-	kpad->export_gpio = true;
-
-	kpad->gc.direction_input = adp5589_gpio_direction_input;
-	kpad->gc.direction_output = adp5589_gpio_direction_output;
-	kpad->gc.get = adp5589_gpio_get_value;
-	kpad->gc.set = adp5589_gpio_set_value;
-	kpad->gc.can_sleep = 1;
-
-	kpad->gc.base = gpio_data->gpio_start;
-	kpad->gc.label = kpad->client->name;
-	kpad->gc.owner = THIS_MODULE;
-
-	mutex_init(&kpad->gpio_lock);
-
-	error = gpiochip_add(&kpad->gc);
-	if (error) {
-		dev_err(dev, "gpiochip_add failed, err: %d\n", error);
-		return error;
-	}
-
-	for (i = 0; i <= kpad->var->bank(kpad->var->maxgpio); i++) {
-		kpad->dat_out[i] = adp5589_read(kpad->client, kpad->var->reg(
-						ADP5589_GPO_DATA_OUT_A) + i);
-		kpad->dir[i] = adp5589_read(kpad->client, kpad->var->reg(
-					    ADP5589_GPIO_DIRECTION_A) + i);
-	}
-
-	if (gpio_data->setup) {
-		error = gpio_data->setup(kpad->client,
-					 kpad->gc.base, kpad->gc.ngpio,
-					 gpio_data->context);
-		if (error)
-			dev_warn(dev, "setup failed, %d\n", error);
-	}
-
-	return 0;
-}
-
-static void adp5589_gpio_remove(struct adp5589_kpad *kpad)
-{
-	struct device *dev = &kpad->client->dev;
-	const struct adp5589_kpad_platform_data *pdata = dev_get_platdata(dev);
-	const struct adp5589_gpio_platform_data *gpio_data = pdata->gpio_data;
-	int error;
-
-	if (!kpad->export_gpio)
-		return;
-
-	if (gpio_data->teardown) {
-		error = gpio_data->teardown(kpad->client,
-					    kpad->gc.base, kpad->gc.ngpio,
-					    gpio_data->context);
-		if (error)
-			dev_warn(dev, "teardown failed %d\n", error);
-	}
-
-	gpiochip_remove(&kpad->gc);
-}
-#else
-static inline int adp5589_gpio_add(struct adp5589_kpad *kpad)
-{
-	return 0;
-}
-
-static inline void adp5589_gpio_remove(struct adp5589_kpad *kpad)
-{
-}
-#endif
-
-static void adp5589_report_switches(struct adp5589_kpad *kpad,
-				    int key, int key_val)
-{
-	int i;
-
-	for (i = 0; i < kpad->gpimapsize; i++) {
-		if (key_val == kpad->gpimap[i].pin) {
-			input_report_switch(kpad->input,
-					    kpad->gpimap[i].sw_evt,
-					    key & KEY_EV_PRESSED);
-			break;
-		}
-	}
-}
-
-static void adp5589_report_events(struct adp5589_kpad *kpad, int ev_cnt)
-{
-	int i;
-
-	for (i = 0; i < ev_cnt; i++) {
-		int key = adp5589_read(kpad->client, ADP5589_5_FIFO_1 + i);
-		int key_val = key & KEY_EV_MASK;
-
-		if (key_val >= kpad->var->gpi_pin_base &&
-		    key_val <= kpad->var->gpi_pin_end) {
-			adp5589_report_switches(kpad, key, key_val);
-		} else {
-			input_report_key(kpad->input,
-					 kpad->keycode[key_val - 1],
-					 key & KEY_EV_PRESSED);
-		}
-	}
-}
-
-static irqreturn_t adp5589_irq(int irq, void *handle)
-{
-	struct adp5589_kpad *kpad = handle;
-	struct i2c_client *client = kpad->client;
-	int status, ev_cnt;
-
-	status = adp5589_read(client, ADP5589_5_INT_STATUS);
-
-	if (status & OVRFLOW_INT)	/* Unlikely and should never happen */
-		dev_err(&client->dev, "Event Overflow Error\n");
-
-	if (status & EVENT_INT) {
-		ev_cnt = adp5589_read(client, ADP5589_5_STATUS) & KEC;
-		if (ev_cnt) {
-			adp5589_report_events(kpad, ev_cnt);
-			input_sync(kpad->input);
-		}
-	}
-
-	adp5589_write(client, ADP5589_5_INT_STATUS, status); /* Status is W1C */
-
-	return IRQ_HANDLED;
-}
-
-static int adp5589_get_evcode(struct adp5589_kpad *kpad, unsigned short key)
-{
-	int i;
-
-	for (i = 0; i < kpad->var->keymapsize; i++)
-		if (key == kpad->keycode[i])
-			return (i + 1) | KEY_EV_PRESSED;
-
-	dev_err(&kpad->client->dev, "RESET/UNLOCK key not in keycode map\n");
-
-	return -EINVAL;
-}
-
-static int adp5589_setup(struct adp5589_kpad *kpad)
-{
-	struct i2c_client *client = kpad->client;
-	const struct adp5589_kpad_platform_data *pdata =
-		dev_get_platdata(&client->dev);
-	u8 (*reg) (u8) = kpad->var->reg;
-	unsigned char evt_mode1 = 0, evt_mode2 = 0, evt_mode3 = 0;
-	unsigned char pull_mask = 0;
-	int i, ret;
-
-	ret = adp5589_write(client, reg(ADP5589_PIN_CONFIG_A),
-			    pdata->keypad_en_mask & kpad->var->row_mask);
-	ret |= adp5589_write(client, reg(ADP5589_PIN_CONFIG_B),
-			     (pdata->keypad_en_mask >> kpad->var->col_shift) &
-			     kpad->var->col_mask);
-
-	if (!kpad->is_adp5585)
-		ret |= adp5589_write(client, ADP5589_PIN_CONFIG_C,
-				     (pdata->keypad_en_mask >> 16) & 0xFF);
-
-	if (!kpad->is_adp5585 && pdata->en_keylock) {
-		ret |= adp5589_write(client, ADP5589_UNLOCK1,
-				     pdata->unlock_key1);
-		ret |= adp5589_write(client, ADP5589_UNLOCK2,
-				     pdata->unlock_key2);
-		ret |= adp5589_write(client, ADP5589_UNLOCK_TIMERS,
-				     pdata->unlock_timer & LTIME_MASK);
-		ret |= adp5589_write(client, ADP5589_LOCK_CFG, LOCK_EN);
-	}
-
-	for (i = 0; i < KEYP_MAX_EVENT; i++)
-		ret |= adp5589_read(client, ADP5589_5_FIFO_1 + i);
-
-	for (i = 0; i < pdata->gpimapsize; i++) {
-		unsigned short pin = pdata->gpimap[i].pin;
-
-		if (pin <= kpad->var->gpi_pin_row_end) {
-			evt_mode1 |= (1 << (pin - kpad->var->gpi_pin_row_base));
-		} else {
-			evt_mode2 |=
-			    ((1 << (pin - kpad->var->gpi_pin_col_base)) & 0xFF);
-			if (!kpad->is_adp5585)
-				evt_mode3 |= ((1 << (pin -
-					kpad->var->gpi_pin_col_base)) >> 8);
-		}
-	}
-
-	if (pdata->gpimapsize) {
-		ret |= adp5589_write(client, reg(ADP5589_GPI_EVENT_EN_A),
-				     evt_mode1);
-		ret |= adp5589_write(client, reg(ADP5589_GPI_EVENT_EN_B),
-				     evt_mode2);
-		if (!kpad->is_adp5585)
-			ret |= adp5589_write(client,
-					     reg(ADP5589_GPI_EVENT_EN_C),
-					     evt_mode3);
-	}
-
-	if (pdata->pull_dis_mask & pdata->pullup_en_100k &
-		pdata->pullup_en_300k & pdata->pulldown_en_300k)
-		dev_warn(&client->dev, "Conflicting pull resistor config\n");
-
-	for (i = 0; i <= kpad->var->max_row_num; i++) {
-		unsigned val = 0, bit = (1 << i);
-		if (pdata->pullup_en_300k & bit)
-			val = 0;
-		else if (pdata->pulldown_en_300k & bit)
-			val = 1;
-		else if (pdata->pullup_en_100k & bit)
-			val = 2;
-		else if (pdata->pull_dis_mask & bit)
-			val = 3;
-
-		pull_mask |= val << (2 * (i & 0x3));
-
-		if (i % 4 == 3 || i == kpad->var->max_row_num) {
-			ret |= adp5589_write(client, reg(ADP5585_RPULL_CONFIG_A)
-					     + (i >> 2), pull_mask);
-			pull_mask = 0;
-		}
-	}
-
-	for (i = 0; i <= kpad->var->max_col_num; i++) {
-		unsigned val = 0, bit = 1 << (i + kpad->var->col_shift);
-		if (pdata->pullup_en_300k & bit)
-			val = 0;
-		else if (pdata->pulldown_en_300k & bit)
-			val = 1;
-		else if (pdata->pullup_en_100k & bit)
-			val = 2;
-		else if (pdata->pull_dis_mask & bit)
-			val = 3;
-
-		pull_mask |= val << (2 * (i & 0x3));
-
-		if (i % 4 == 3 || i == kpad->var->max_col_num) {
-			ret |= adp5589_write(client,
-					     reg(ADP5585_RPULL_CONFIG_C) +
-					     (i >> 2), pull_mask);
-			pull_mask = 0;
-		}
-	}
-
-	if (pdata->reset1_key_1 && pdata->reset1_key_2 && pdata->reset1_key_3) {
-		ret |= adp5589_write(client, reg(ADP5589_RESET1_EVENT_A),
-				     adp5589_get_evcode(kpad,
-							pdata->reset1_key_1));
-		ret |= adp5589_write(client, reg(ADP5589_RESET1_EVENT_B),
-				     adp5589_get_evcode(kpad,
-							pdata->reset1_key_2));
-		ret |= adp5589_write(client, reg(ADP5589_RESET1_EVENT_C),
-				     adp5589_get_evcode(kpad,
-							pdata->reset1_key_3));
-		kpad->extend_cfg |= R4_EXTEND_CFG;
-	}
-
-	if (pdata->reset2_key_1 && pdata->reset2_key_2) {
-		ret |= adp5589_write(client, reg(ADP5589_RESET2_EVENT_A),
-				     adp5589_get_evcode(kpad,
-							pdata->reset2_key_1));
-		ret |= adp5589_write(client, reg(ADP5589_RESET2_EVENT_B),
-				     adp5589_get_evcode(kpad,
-							pdata->reset2_key_2));
-		kpad->extend_cfg |= C4_EXTEND_CFG;
-	}
-
-	if (kpad->extend_cfg) {
-		ret |= adp5589_write(client, reg(ADP5589_RESET_CFG),
-				     pdata->reset_cfg);
-		ret |= adp5589_write(client, reg(ADP5589_PIN_CONFIG_D),
-				     kpad->extend_cfg);
-	}
-
-	ret |= adp5589_write(client, reg(ADP5589_DEBOUNCE_DIS_A),
-			    pdata->debounce_dis_mask & kpad->var->row_mask);
-
-	ret |= adp5589_write(client, reg(ADP5589_DEBOUNCE_DIS_B),
-			     (pdata->debounce_dis_mask >> kpad->var->col_shift)
-			     & kpad->var->col_mask);
-
-	if (!kpad->is_adp5585)
-		ret |= adp5589_write(client, reg(ADP5589_DEBOUNCE_DIS_C),
-				     (pdata->debounce_dis_mask >> 16) & 0xFF);
-
-	ret |= adp5589_write(client, reg(ADP5589_POLL_PTIME_CFG),
-			     pdata->scan_cycle_time & PTIME_MASK);
-	ret |= adp5589_write(client, ADP5589_5_INT_STATUS,
-			     (kpad->is_adp5585 ? 0 : LOGIC2_INT) |
-			     LOGIC1_INT | OVRFLOW_INT |
-			     (kpad->is_adp5585 ? 0 : LOCK_INT) |
-			     GPI_INT | EVENT_INT);	/* Status is W1C */
-
-	ret |= adp5589_write(client, reg(ADP5589_GENERAL_CFG),
-			     INT_CFG | OSC_EN | CORE_CLK(3));
-	ret |= adp5589_write(client, reg(ADP5589_INT_EN),
-			     OVRFLOW_IEN | GPI_IEN | EVENT_IEN);
-
-	if (ret < 0) {
-		dev_err(&client->dev, "Write Error\n");
-		return ret;
-	}
-
-	return 0;
-}
-
-static void adp5589_report_switch_state(struct adp5589_kpad *kpad)
-{
-	int gpi_stat_tmp, pin_loc;
-	int i;
-	int gpi_stat1 = adp5589_read(kpad->client,
-				     kpad->var->reg(ADP5589_GPI_STATUS_A));
-	int gpi_stat2 = adp5589_read(kpad->client,
-				     kpad->var->reg(ADP5589_GPI_STATUS_B));
-	int gpi_stat3 = !kpad->is_adp5585 ?
-			adp5589_read(kpad->client, ADP5589_GPI_STATUS_C) : 0;
-
-	for (i = 0; i < kpad->gpimapsize; i++) {
-		unsigned short pin = kpad->gpimap[i].pin;
-
-		if (pin <= kpad->var->gpi_pin_row_end) {
-			gpi_stat_tmp = gpi_stat1;
-			pin_loc = pin - kpad->var->gpi_pin_row_base;
-		} else if ((pin - kpad->var->gpi_pin_col_base) < 8) {
-			gpi_stat_tmp = gpi_stat2;
-			pin_loc = pin - kpad->var->gpi_pin_col_base;
-		} else {
-			gpi_stat_tmp = gpi_stat3;
-			pin_loc = pin - kpad->var->gpi_pin_col_base - 8;
-		}
-
-		if (gpi_stat_tmp < 0) {
-			dev_err(&kpad->client->dev,
-				"Can't read GPIO_DAT_STAT switch %d, default to OFF\n",
-				pin);
-			gpi_stat_tmp = 0;
-		}
-
-		input_report_switch(kpad->input,
-				    kpad->gpimap[i].sw_evt,
-				    !(gpi_stat_tmp & (1 << pin_loc)));
-	}
-
-	input_sync(kpad->input);
-}
-
-static int adp5589_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
-{
-	struct adp5589_kpad *kpad;
-	const struct adp5589_kpad_platform_data *pdata =
-		dev_get_platdata(&client->dev);
-	struct input_dev *input;
-	unsigned int revid;
-	int ret, i;
-	int error;
-
-	if (!i2c_check_functionality(client->adapter,
-				     I2C_FUNC_SMBUS_BYTE_DATA)) {
-		dev_err(&client->dev, "SMBUS Byte Data not Supported\n");
-		return -EIO;
-	}
-
-	if (!pdata) {
-		dev_err(&client->dev, "no platform data?\n");
-		return -EINVAL;
-	}
-
-	kpad = kzalloc(sizeof(*kpad), GFP_KERNEL);
-	if (!kpad)
-		return -ENOMEM;
-
-	switch (id->driver_data) {
-	case ADP5585_02:
-		kpad->adp5585_support_row5 = true;
-	case ADP5585_01:
-		kpad->is_adp5585 = true;
-		kpad->var = &const_adp5585;
-		break;
-	case ADP5589:
-		kpad->var = &const_adp5589;
-		break;
-	}
-
-	if (!((pdata->keypad_en_mask & kpad->var->row_mask) &&
-			(pdata->keypad_en_mask >> kpad->var->col_shift)) ||
-			!pdata->keymap) {
-		dev_err(&client->dev, "no rows, cols or keymap from pdata\n");
-		error = -EINVAL;
-		goto err_free_mem;
-	}
-
-	if (pdata->keymapsize != kpad->var->keymapsize) {
-		dev_err(&client->dev, "invalid keymapsize\n");
-		error = -EINVAL;
-		goto err_free_mem;
-	}
-
-	if (!pdata->gpimap && pdata->gpimapsize) {
-		dev_err(&client->dev, "invalid gpimap from pdata\n");
-		error = -EINVAL;
-		goto err_free_mem;
-	}
-
-	if (pdata->gpimapsize > kpad->var->gpimapsize_max) {
-		dev_err(&client->dev, "invalid gpimapsize\n");
-		error = -EINVAL;
-		goto err_free_mem;
-	}
-
-	for (i = 0; i < pdata->gpimapsize; i++) {
-		unsigned short pin = pdata->gpimap[i].pin;
-
-		if (pin < kpad->var->gpi_pin_base ||
-				pin > kpad->var->gpi_pin_end) {
-			dev_err(&client->dev, "invalid gpi pin data\n");
-			error = -EINVAL;
-			goto err_free_mem;
-		}
-
-		if ((1 << (pin - kpad->var->gpi_pin_row_base)) &
-				pdata->keypad_en_mask) {
-			dev_err(&client->dev, "invalid gpi row/col data\n");
-			error = -EINVAL;
-			goto err_free_mem;
-		}
-	}
-
-	if (!client->irq) {
-		dev_err(&client->dev, "no IRQ?\n");
-		error = -EINVAL;
-		goto err_free_mem;
-	}
-
-	input = input_allocate_device();
-	if (!input) {
-		error = -ENOMEM;
-		goto err_free_mem;
-	}
-
-	kpad->client = client;
-	kpad->input = input;
-
-	ret = adp5589_read(client, ADP5589_5_ID);
-	if (ret < 0) {
-		error = ret;
-		goto err_free_input;
-	}
-
-	revid = (u8) ret & ADP5589_5_DEVICE_ID_MASK;
-
-	input->name = client->name;
-	input->phys = "adp5589-keys/input0";
-	input->dev.parent = &client->dev;
-
-	input_set_drvdata(input, kpad);
-
-	input->id.bustype = BUS_I2C;
-	input->id.vendor = 0x0001;
-	input->id.product = 0x0001;
-	input->id.version = revid;
-
-	input->keycodesize = sizeof(kpad->keycode[0]);
-	input->keycodemax = pdata->keymapsize;
-	input->keycode = kpad->keycode;
-
-	memcpy(kpad->keycode, pdata->keymap,
-	       pdata->keymapsize * input->keycodesize);
-
-	kpad->gpimap = pdata->gpimap;
-	kpad->gpimapsize = pdata->gpimapsize;
-
-	/* setup input device */
-	__set_bit(EV_KEY, input->evbit);
-
-	if (pdata->repeat)
-		__set_bit(EV_REP, input->evbit);
-
-	for (i = 0; i < input->keycodemax; i++)
-		if (kpad->keycode[i] <= KEY_MAX)
-			__set_bit(kpad->keycode[i], input->keybit);
-	__clear_bit(KEY_RESERVED, input->keybit);
-
-	if (kpad->gpimapsize)
-		__set_bit(EV_SW, input->evbit);
-	for (i = 0; i < kpad->gpimapsize; i++)
-		__set_bit(kpad->gpimap[i].sw_evt, input->swbit);
-
-	error = input_register_device(input);
-	if (error) {
-		dev_err(&client->dev, "unable to register input device\n");
-		goto err_free_input;
-	}
-
-	error = request_threaded_irq(client->irq, NULL, adp5589_irq,
-				     IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
-				     client->dev.driver->name, kpad);
-	if (error) {
-		dev_err(&client->dev, "irq %d busy?\n", client->irq);
-		goto err_unreg_dev;
-	}
-
-	error = adp5589_setup(kpad);
-	if (error)
-		goto err_free_irq;
-
-	if (kpad->gpimapsize)
-		adp5589_report_switch_state(kpad);
-
-	error = adp5589_gpio_add(kpad);
-	if (error)
-		goto err_free_irq;
-
-	device_init_wakeup(&client->dev, 1);
-	i2c_set_clientdata(client, kpad);
-
-	dev_info(&client->dev, "Rev.%d keypad, irq %d\n", revid, client->irq);
-	return 0;
-
-err_free_irq:
-	free_irq(client->irq, kpad);
-err_unreg_dev:
-	input_unregister_device(input);
-	input = NULL;
-err_free_input:
-	input_free_device(input);
-err_free_mem:
-	kfree(kpad);
-
-	return error;
-}
-
-static int adp5589_remove(struct i2c_client *client)
-{
-	struct adp5589_kpad *kpad = i2c_get_clientdata(client);
-
-	adp5589_write(client, kpad->var->reg(ADP5589_GENERAL_CFG), 0);
-	free_irq(client->irq, kpad);
-	input_unregister_device(kpad->input);
-	adp5589_gpio_remove(kpad);
-	kfree(kpad);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int adp5589_suspend(struct device *dev)
-{
-	struct adp5589_kpad *kpad = dev_get_drvdata(dev);
-	struct i2c_client *client = kpad->client;
-
-	disable_irq(client->irq);
-
-	if (device_may_wakeup(&client->dev))
-		enable_irq_wake(client->irq);
-
-	return 0;
-}
-
-static int adp5589_resume(struct device *dev)
-{
-	struct adp5589_kpad *kpad = dev_get_drvdata(dev);
-	struct i2c_client *client = kpad->client;
-
-	if (device_may_wakeup(&client->dev))
-		disable_irq_wake(client->irq);
-
-	enable_irq(client->irq);
-
-	return 0;
-}
-#endif
-
-static SIMPLE_DEV_PM_OPS(adp5589_dev_pm_ops, adp5589_suspend, adp5589_resume);
-
-static const struct i2c_device_id adp5589_id[] = {
-	{"adp5589-keys", ADP5589},
-	{"adp5585-keys", ADP5585_01},
-	{"adp5585-02-keys", ADP5585_02}, /* Adds ROW5 to ADP5585 */
-	{}
-};
-
-MODULE_DEVICE_TABLE(i2c, adp5589_id);
-
-static struct i2c_driver adp5589_driver = {
-	.driver = {
-		.name = KBUILD_MODNAME,
-		.pm = &adp5589_dev_pm_ops,
-	},
-	.probe = adp5589_probe,
-	.remove = adp5589_remove,
-	.id_table = adp5589_id,
-};
-
-module_i2c_driver(adp5589_driver);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
-MODULE_DESCRIPTION("ADP5589/ADP5585 Keypad driver");
+efine MC_ARB_GECC2_STATUS__RMWRD_UNCORR_CLEAR0_MASK 0x2000000
+#define MC_ARB_GECC2_STATUS__RMWRD_UNCORR_CLEAR0__SHIFT 0x19
+#define MC_ARB_GECC2_STATUS__RSVD6_MASK 0xc000000
+#define MC_ARB_GECC2_STATUS__RSVD6__SHIFT 0x1a
+#define MC_ARB_GECC2_STATUS__RMWRD_CORR_CLEAR1_MASK 0x10000000
+#define MC_ARB_GECC2_STATUS__RMWRD_CORR_CLEAR1__SHIFT 0x1c
+#define MC_ARB_GECC2_STATUS__RMWRD_UNCORR_CLEAR1_MASK 0x20000000
+#define MC_ARB_GECC2_STATUS__RMWRD_UNCORR_CLEAR1__SHIFT 0x1d
+#define MC_ARB_GECC2_MISC__STREAK_BREAK_MASK 0xf
+#define MC_ARB_GECC2_MISC__STREAK_BREAK__SHIFT 0x0
+#define MC_ARB_GECC2_MISC__COL10_HACK_MASK 0x10
+#define MC_ARB_GECC2_MISC__COL10_HACK__SHIFT 0x4
+#define MC_ARB_GECC2_MISC__CWRD_IN_REPLAY_MASK 0x20
+#define MC_ARB_GECC2_MISC__CWRD_IN_REPLAY__SHIFT 0x5
+#define MC_ARB_GECC2_MISC__NO_EOB_ALL_WR_IN_REPLAY_MASK 0x40
+#define MC_ARB_GECC2_MISC__NO_EOB_ALL_WR_IN_REPLAY__SHIFT 0x6
+#define MC_ARB_GECC2_MISC__RMW_LM_WR_STALL_MASK 0x80
+#define MC_ARB_GECC2_MISC__RMW_LM_WR_STALL__SHIFT 0x7
+#define MC_ARB_GECC2_MISC__RMW_STALL_RELEASE_MASK 0x100
+#define MC_ARB_GECC2_MISC__RMW_STALL_RELEASE__SHIFT 0x8
+#define MC_ARB_GECC2_MISC__WR_EDC_MASK_REPLAY_MASK 0x200
+#define MC_ARB_GECC2_MISC__WR_EDC_MASK_REPLAY__SHIFT 0x9
+#define MC_ARB_GECC2_MISC__CWRD_REPLAY_AGAIN_MASK 0x400
+#define MC_ARB_GECC2_MISC__CWRD_REPLAY_AGAIN__SHIFT 0xa
+#define MC_ARB_GECC2_MISC__WRRDWR_REPLAY_AGAIN_MASK 0x800
+#define MC_ARB_GECC2_MISC__WRRDWR_REPLAY_AGAIN__SHIFT 0xb
+#define MC_ARB_GECC2_MISC__ALLOW_RMW_ERR_AFTER_REPLAY_MASK 0x1000
+#define MC_ARB_GECC2_MISC__ALLOW_RMW_ERR_AFTER_REPLAY__SHIFT 0xc
+#define MC_ARB_GECC2_MISC__DEBUG_RSV_MASK 0xffffe000
+#define MC_ARB_GECC2_MISC__DEBUG_RSV__SHIFT 0xd
+#define MC_ARB_GECC2_DEBUG__NUM_ERR_BITS_MASK 0x3
+#define MC_ARB_GECC2_DEBUG__NUM_ERR_BITS__SHIFT 0x0
+#define MC_ARB_GECC2_DEBUG__DIRECTION_MASK 0x4
+#define MC_ARB_GECC2_DEBUG__DIRECTION__SHIFT 0x2
+#define MC_ARB_GECC2_DEBUG__DATA_FIELD_MASK 0x18
+#define MC_ARB_GECC2_DEBUG__DATA_FIELD__SHIFT 0x3
+#define MC_ARB_GECC2_DEBUG__SW_INJECTION_MASK 0x20
+#define MC_ARB_GECC2_DEBUG__SW_INJECTION__SHIFT 0x5
+#define MC_ARB_GECC2_DEBUG2__PERIOD_MASK 0xff
+#define MC_ARB_GECC2_DEBUG2__PERIOD__SHIFT 0x0
+#define MC_ARB_GECC2_DEBUG2__ERR0_START_MASK 0xff00
+#define MC_ARB_GECC2_DEBUG2__ERR0_START__SHIFT 0x8
+#define MC_ARB_GECC2_DEBUG2__ERR1_START_MASK 0xff0000
+#define MC_ARB_GECC2_DEBUG2__ERR1_START__SHIFT 0x10
+#define MC_ARB_GECC2_DEBUG2__ERR2_START_MASK 0xff000000
+#define MC_ARB_GECC2_DEBUG2__ERR2_START__SHIFT 0x18
+#define MC_ARB_PERF_CID__CH0_MASK 0xff
+#define MC_ARB_PERF_CID__CH0__SHIFT 0x0
+#define MC_ARB_PERF_CID__CH1_MASK 0xff00
+#define MC_ARB_PERF_CID__CH1__SHIFT 0x8
+#define MC_ARB_PERF_CID__CH0_EN_MASK 0x10000
+#define MC_ARB_PERF_CID__CH0_EN__SHIFT 0x10
+#define MC_ARB_PERF_CID__CH1_EN_MASK 0x20000
+#define MC_ARB_PERF_CID__CH1_EN__SHIFT 0x11
+#define MC_ARB_GECC2__ENABLE_MASK 0x1
+#define MC_ARB_GECC2__ENABLE__SHIFT 0x0
+#define MC_ARB_GECC2__ECC_MODE_MASK 0x6
+#define MC_ARB_GECC2__ECC_MODE__SHIFT 0x1
+#define MC_ARB_GECC2__PAGE_BIT0_MASK 0x18
+#define MC_ARB_GECC2__PAGE_BIT0__SHIFT 0x3
+#define MC_ARB_GECC2__EXOR_BANK_SEL_MASK 0x60
+#define MC_ARB_GECC2__EXOR_BANK_SEL__SHIFT 0x5
+#define MC_ARB_GECC2__NO_GECC_CLI_MASK 0x780
+#define MC_ARB_GECC2__NO_GECC_CLI__SHIFT 0x7
+#define MC_ARB_GECC2__READ_ERR_MASK 0x3800
+#define MC_ARB_GECC2__READ_ERR__SHIFT 0xb
+#define MC_ARB_GECC2__CLOSE_BANK_RMW_MASK 0x4000
+#define MC_ARB_GECC2__CLOSE_BANK_RMW__SHIFT 0xe
+#define MC_ARB_GECC2__COLFIFO_WATER_MASK 0x1f8000
+#define MC_ARB_GECC2__COLFIFO_WATER__SHIFT 0xf
+#define MC_ARB_GECC2__WRADDR_CONV_MASK 0x200000
+#define MC_ARB_GECC2__WRADDR_CONV__SHIFT 0x15
+#define MC_ARB_GECC2__RMWRD_UNCOR_POISON_MASK 0x400000
+#define MC_ARB_GECC2__RMWRD_UNCOR_POISON__SHIFT 0x16
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI0_MASK 0xff
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI0__SHIFT 0x0
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI1_MASK 0xff00
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI1__SHIFT 0x8
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI2_MASK 0xff0000
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI2__SHIFT 0x10
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI3_MASK 0xff000000
+#define MC_ARB_GECC2_CLI__NO_GECC_CLI3__SHIFT 0x18
+#define MC_ARB_ADDR_SWIZ0__A8_MASK 0xf
+#define MC_ARB_ADDR_SWIZ0__A8__SHIFT 0x0
+#define MC_ARB_ADDR_SWIZ0__A9_MASK 0xf0
+#define MC_ARB_ADDR_SWIZ0__A9__SHIFT 0x4
+#define MC_ARB_ADDR_SWIZ0__A10_MASK 0xf00
+#define MC_ARB_ADDR_SWIZ0__A10__SHIFT 0x8
+#define MC_ARB_ADDR_SWIZ0__A11_MASK 0xf000
+#define MC_ARB_ADDR_SWIZ0__A11__SHIFT 0xc
+#define MC_ARB_ADDR_SWIZ0__A12_MASK 0xf0000
+#define MC_ARB_ADDR_SWIZ0__A12__SHIFT 0x10
+#define MC_ARB_ADDR_SWIZ0__A13_MASK 0xf00000
+#define MC_ARB_ADDR_SWIZ0__A13__SHIFT 0x14
+#define MC_ARB_ADDR_SWIZ0__A14_MASK 0xf000000
+#define MC_ARB_ADDR_SWIZ0__A14__SHIFT 0x18
+#define MC_ARB_ADDR_SWIZ0__A15_MASK 0xf0000000
+#define MC_ARB_ADDR_SWIZ0__A15__SHIFT 0x1c
+#define MC_ARB_ADDR_SWIZ1__A16_MASK 0xf
+#define MC_ARB_ADDR_SWIZ1__A16__SHIFT 0x0
+#define MC_ARB_ADDR_SWIZ1__A17_MASK 0xf0
+#define MC_ARB_ADDR_SWIZ1__A17__SHIFT 0x4
+#define MC_ARB_ADDR_SWIZ1__A18_MASK 0xf00
+#define MC_ARB_ADDR_SWIZ1__A18__SHIFT 0x8
+#define MC_ARB_ADDR_SWIZ1__A19_MASK 0xf000
+#define MC_ARB_ADDR_SWIZ1__A19__SHIFT 0xc
+#define MC_ARB_MISC3__NO_GECC_EXT_EOB_MASK 0x1
+#define MC_ARB_MISC3__NO_GECC_EXT_EOB__SHIFT 0x0
+#define MC_ARB_MISC3__CHAN4_EN_MASK 0x2
+#define MC_ARB_MISC3__CHAN4_EN__SHIFT 0x1
+#define MC_ARB_MISC3__CHAN4_ARB_SEL_MASK 0x4
+#define MC_ARB_MISC3__CHAN4_ARB_SEL__SHIFT 0x2
+#define MC_ARB_MISC3__TBD_FIELD_MASK 0xfffffff8
+#define MC_ARB_MISC3__TBD_FIELD__SHIFT 0x3
+#define MC_ARB_WCDR_2__WPRE_INC_STEP_MASK 0xf
+#define MC_ARB_WCDR_2__WPRE_INC_STEP__SHIFT 0x0
+#define MC_ARB_WCDR_2__WPRE_MIN_THRESHOLD_MASK 0x1f0
+#define MC_ARB_WCDR_2__WPRE_MIN_THRESHOLD__SHIFT 0x4
+#define MC_ARB_WCDR_2__DEBUG_0_MASK 0x200
+#define MC_ARB_WCDR_2__DEBUG_0__SHIFT 0x9
+#define MC_ARB_WCDR_2__DEBUG_1_MASK 0x400
+#define MC_ARB_WCDR_2__DEBUG_1__SHIFT 0xa
+#define MC_ARB_WCDR_2__DEBUG_2_MASK 0x800
+#define MC_ARB_WCDR_2__DEBUG_2__SHIFT 0xb
+#define MC_ARB_WCDR_2__DEBUG_3_MASK 0x1000
+#define MC_ARB_WCDR_2__DEBUG_3__SHIFT 0xc
+#define MC_ARB_WCDR_2__DEBUG_4_MASK 0x2000
+#define MC_ARB_WCDR_2__DEBUG_4__SHIFT 0xd
+#define MC_ARB_WCDR_2__DEBUG_5_MASK 0x4000
+#define MC_ARB_WCDR_2__DEBUG_5__SHIFT 0xe
+#define MC_ARB_RTT_DATA__PATTERN_MASK 0xff
+#define MC_ARB_RTT_DATA__PATTERN__SHIFT 0x0
+#define MC_ARB_RTT_CNTL0__ENABLE_MASK 0x1
+#define MC_ARB_RTT_CNTL0__ENABLE__SHIFT 0x0
+#define MC_ARB_RTT_CNTL0__START_IDLE_MASK 0x2
+#define MC_ARB_RTT_CNTL0__START_IDLE__SHIFT 0x1
+#define MC_ARB_RTT_CNTL0__START_R2W_MASK 0xc
+#define MC_ARB_RTT_CNTL0__START_R2W__SHIFT 0x2
+#define MC_ARB_RTT_CNTL0__FLUSH_ON_ENTER_MASK 0x10
+#define MC_ARB_RTT_CNTL0__FLUSH_ON_ENTER__SHIFT 0x4
+#define MC_ARB_RTT_CNTL0__HARSH_START_MASK 0x20
+#define MC_ARB_RTT_CNTL0__HARSH_START__SHIFT 0x5
+#define MC_ARB_RTT_CNTL0__TPS_HARSH_PRIORITY_MASK 0x40
+#define MC_ARB_RTT_CNTL0__TPS_HARSH_PRIORITY__SHIFT 0x6
+#define MC_ARB_RTT_CNTL0__TWRT_HARSH_PRIORITY_MASK 0x80
+#define MC_ARB_RTT_CNTL0__TWRT_HARSH_PRIORITY__SHIFT 0x7
+#define MC_ARB_RTT_CNTL0__BREAK_ON_HARSH_MASK 0x100
+#define MC_ARB_RTT_CNTL0__BREAK_ON_HARSH__SHIFT 0x8
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTRD_MASK 0x200
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTRD__SHIFT 0x9
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTWR_MASK 0x400
+#define MC_ARB_RTT_CNTL0__BREAK_ON_URGENTWR__SHIFT 0xa
+#define MC_ARB_RTT_CNTL0__TRAIN_PERIOD_MASK 0x3800
+#define MC_ARB_RTT_CNTL0__TRAIN_PERIOD__SHIFT 0xb
+#define MC_ARB_RTT_CNTL0__START_R2W_RFSH_MASK 0x4000
+#define MC_ARB_RTT_CNTL0__START_R2W_RFSH__SHIFT 0xe
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_0_MASK 0x8000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_0__SHIFT 0xf
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_1_MASK 0x10000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_1__SHIFT 0x10
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_2_MASK 0x20000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_2__SHIFT 0x11
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_3_MASK 0x40000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_3__SHIFT 0x12
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_4_MASK 0x80000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_4__SHIFT 0x13
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_5_MASK 0x100000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_5__SHIFT 0x14
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_6_MASK 0x200000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_6__SHIFT 0x15
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_7_MASK 0x400000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_7__SHIFT 0x16
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_8_MASK 0x800000
+#define MC_ARB_RTT_CNTL0__DEBUG_RSV_8__SHIFT 0x17
+#define MC_ARB_RTT_CNTL0__DATA_CNTL_MASK 0x1000000
+#define MC_ARB_RTT_CNTL0__DATA_CNTL__SHIFT 0x18
+#define MC_ARB_RTT_CNTL0__NEIGHBOR_BIT_MASK 0x2000000
+#define MC_ARB_RTT_CNTL0__NEIGHBOR_BIT__SHIFT 0x19
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MASK 0x1f
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE__SHIFT 0x0
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_MASK 0x20
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE__SHIFT 0x5
+#define MC_ARB_RTT_CNTL1__WINDOW_INC_THRESHOLD_MASK 0x1fc0
+#define MC_ARB_RTT_CNTL1__WINDOW_INC_THRESHOLD__SHIFT 0x6
+#define MC_ARB_RTT_CNTL1__WINDOW_DEC_THRESHOLD_MASK 0xfe000
+#define MC_ARB_RTT_CNTL1__WINDOW_DEC_THRESHOLD__SHIFT 0xd
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MAX_MASK 0x1f00000
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MAX__SHIFT 0x14
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MIN_MASK 0x3e000000
+#define MC_ARB_RTT_CNTL1__WINDOW_SIZE_MIN__SHIFT 0x19
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_COUNT_MASK 0xc0000000
+#define MC_ARB_RTT_CNTL1__WINDOW_UPDATE_COUNT__SHIFT 0x1e
+#define MC_ARB_RTT_CNTL2__SAMPLE_CNT_MASK 0x3f
+#define MC_ARB_RTT_CNTL2__SAMPLE_CNT__SHIFT 0x0
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_THRESHOLD_MASK 0xfc0
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_THRESHOLD__SHIFT 0x6
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_SIZE_MASK 0x1000
+#define MC_ARB_RTT_CNTL2__PHASE_ADJUST_SIZE__SHIFT 0xc
+#define MC_ARB_RTT_CNTL2__FILTER_CNTL_MASK 0x2000
+#define MC_ARB_RTT_CNTL2__FILTER_CNTL__SHIFT 0xd
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH0_MASK 0x3
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH0__SHIFT 0x0
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH1_MASK 0xc
+#define MC_ARB_RTT_DEBUG__DEBUG_BYTE_CH1__SHIFT 0x2
+#define MC_ARB_RTT_DEBUG__SHIFTED_PHASE_CH0_MASK 0xff0
+#define MC_ARB_RTT_DEBUG__SHIFTED_PHASE_CH0__SHIFT 0x4
+#define MC_ARB_RTT_DEBUG__WINDOW_SIZE_CH0_MASK 0x1f000
+#define MC_ARB_RTT_DEBUG__WINDOW_SIZE_CH0__SHIFT 0xc
+#define MC_ARB_RTT_DEBUG__SHIFTED_PHASE_CH1_MASK 0x1fe0000
+#define MC_ARB_RTT_DEBUG__SHIFTED_PHASE_CH1__SHIFT 0x11
+#define MC_ARB_RTT_DEBUG__WINDOW_SIZE_CH1_MASK 0x3e000000
+#define MC_ARB_RTT_DEBUG__WINDOW_SIZE_CH1__SHIFT 0x19
+#define MC_ARB_CAC_CNTL__ENABLE_MASK 0x1
+#define MC_ARB_CAC_CNTL__ENABLE__SHIFT 0x0
+#define MC_ARB_CAC_CNTL__READ_WEIGHT_MASK 0x7e
+#define MC_ARB_CAC_CNTL__READ_WEIGHT__SHIFT 0x1
+#define MC_ARB_CAC_CNTL__WRITE_WEIGHT_MASK 0x1f80
+#define MC_ARB_CAC_CNTL__WRITE_WEIGHT__SHIFT 0x7
+#define MC_ARB_CAC_CNTL__ALLOW_OVERFLOW_MASK 0x2000
+#define MC_ARB_CAC_CNTL__ALLOW_OVERFLOW__SHIFT 0xd
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_ENABLE_MASK 0x20
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_ENABLE__SHIFT 0x5
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT4_MASK 0x40
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT4__SHIFT 0x6
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT5_MASK 0x80
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT5__SHIFT 0x7
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT6_MASK 0x100
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT6__SHIFT 0x8
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT7_MASK 0x200
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT7__SHIFT 0x9
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT8_MASK 0x400
+#define MC_ARB_MISC2__TCCDL4_BANKBIT3_XOR_COLBIT8__SHIFT 0xa
+#define MC_ARB_MISC2__POP_IDLE_REPLAY_MASK 0x800
+#define MC_ARB_MISC2__POP_IDLE_REPLAY__SHIFT 0xb
+#define MC_ARB_MISC2__RDRET_NO_REORDERING_MASK 0x1000
+#define MC_ARB_MISC2__RDRET_NO_REORDERING__SHIFT 0xc
+#define MC_ARB_MISC2__RDRET_NO_BP_MASK 0x2000
+#define MC_ARB_MISC2__RDRET_NO_BP__SHIFT 0xd
+#define MC_ARB_MISC2__RDRET_SEQ_SKID_MASK 0x3c000
+#define MC_ARB_MISC2__RDRET_SEQ_SKID__SHIFT 0xe
+#define MC_ARB_MISC2__GECC_MASK 0x40000
+#define MC_ARB_MISC2__GECC__SHIFT 0x12
+#define MC_ARB_MISC2__GECC_RST_MASK 0x80000
+#define MC_ARB_MISC2__GECC_RST__SHIFT 0x13
+#define MC_ARB_MISC2__GECC_STATUS_MASK 0x100000
+#define MC_ARB_MISC2__GECC_STATUS__SHIFT 0x14
+#define MC_ARB_MISC2__TAGFIFO_THRESHOLD_MASK 0x1e00000
+#define MC_ARB_MISC2__TAGFIFO_THRESHOLD__SHIFT 0x15
+#define MC_ARB_MISC2__WCDR_REPLAY_MASKCNT_MASK 0xe000000
+#define MC_ARB_MISC2__WCDR_REPLAY_MASKCNT__SHIFT 0x19
+#define MC_ARB_MISC2__REPLAY_DEBUG_MASK 0x10000000
+#define MC_ARB_MISC2__REPLAY_DEBUG__SHIFT 0x1c
+#define MC_ARB_MISC2__ARB_DEBUG29_MASK 0x20000000
+#define MC_ARB_MISC2__ARB_DEBUG29__SHIFT 0x1d
+#define MC_ARB_MISC2__SEQ_RDY_POP_IDLE_MASK 0x40000000
+#define MC_ARB_MISC2__SEQ_RDY_POP_IDLE__SHIFT 0x1e
+#define MC_ARB_MISC2__TCCDL4_REPLAY_EOB_MASK 0x80000000
+#define MC_ARB_MISC2__TCCDL4_REPLAY_EOB__SHIFT 0x1f
+#define MC_ARB_MISC__STICKY_RFSH_MASK 0x1
+#define MC_ARB_MISC__STICKY_RFSH__SHIFT 0x0
+#define MC_ARB_MISC__IDLE_RFSH_MASK 0x2
+#define MC_ARB_MISC__IDLE_RFSH__SHIFT 0x1
+#define MC_ARB_MISC__STUTTER_RFSH_MASK 0x4
+#define MC_ARB_MISC__STUTTER_RFSH__SHIFT 0x2
+#define MC_ARB_MISC__CHAN_COUPLE_MASK 0x7f8
+#define MC_ARB_MISC__CHAN_COUPLE__SHIFT 0x3
+#define MC_ARB_MISC__HARSHNESS_MASK 0x7f800
+#define MC_ARB_MISC__HARSHNESS__SHIFT 0xb
+#define MC_ARB_MISC__SMART_RDWR_SW_MASK 0x80000
+#define MC_ARB_MISC__SMART_RDWR_SW__SHIFT 0x13
+#define MC_ARB_MISC__CALI_ENABLE_MASK 0x100000
+#define MC_ARB_MISC__CALI_ENABLE__SHIFT 0x14
+#define MC_ARB_MISC__CALI_RATES_MASK 0x600000
+#define MC_ARB_MISC__CALI_RATES__SHIFT 0x15
+#define MC_ARB_MISC__DISPURGVLD_NOWRT_MASK 0x800000
+#define MC_ARB_MISC__DISPURGVLD_NOWRT__SHIFT 0x17
+#define MC_ARB_MISC__DISPURG_NOSW2WR_MASK 0x1000000
+#define MC_ARB_MISC__DISPURG_NOSW2WR__SHIFT 0x18
+#define MC_ARB_MISC__DISPURG_STALL_MASK 0x2000000
+#define MC_ARB_MISC__DISPURG_STALL__SHIFT 0x19
+#define MC_ARB_MISC__DISPURG_THROTTLE_MASK 0x3c000000
+#define MC_ARB_MISC__DISPURG_THROTTLE__SHIFT 0x1a
+#define MC_ARB_MISC__EXTEND_WEIGHT_MASK 0x40000000
+#define MC_ARB_MISC__EXTEND_WEIGHT__SHIFT 0x1e
+#define MC_ARB_MISC__ACPURG_STALL_MASK 0x80000000
+#define MC_ARB_MISC__ACPURG_STALL__SHIFT 0x1f
+#define MC_ARB_BANKMAP__BANK0_MASK 0xf
+#define MC_ARB_BANKMAP__BANK0__SHIFT 0x0
+#define MC_ARB_BANKMAP__BANK1_MASK 0xf0
+#define MC_ARB_BANKMAP__BANK1__SHIFT 0x4
+#define MC_ARB_BANKMAP__BANK2_MASK 0xf00
+#define MC_ARB_BANKMAP__BANK2__SHIFT 0x8
+#define MC_ARB_BANKMAP__BANK3_MASK 0xf000
+#define MC_ARB_BANKMAP__BANK3__SHIFT 0xc
+#define MC_ARB_BANKMAP__RANK_MASK 0xf0000
+#define MC_ARB_BANKMAP__RANK__SHIFT 0x10
+#define MC_ARB_RAMCFG__NOOFBANK_MASK 0x3
+#define MC_ARB_RAMCFG__NOOFBANK__SHIFT 0x0
+#define MC_ARB_RAMCFG__NOOFRANKS_MASK 0x4
+#define MC_ARB_RAMCFG__NOOFRANKS__SHIFT 0x2
+#define MC_ARB_RAMCFG__NOOFROWS_MASK 0x38
+#define MC_ARB_RAMCFG__NOOFROWS__SHIFT 0x3
+#define MC_ARB_RAMCFG__NOOFCOLS_MASK 0xc0
+#define MC_ARB_RAMCFG__NOOFCOLS__SHIFT 0x6
+#define MC_ARB_RAMCFG__CHANSIZE_MASK 0x100
+#define MC_ARB_RAMCFG__CHANSIZE__SHIFT 0x8
+#define MC_ARB_RAMCFG__RSV_1_MASK 0x200
+#define MC_ARB_RAMCFG__RSV_1__SHIFT 0x9
+#define MC_ARB_RAMCFG__RSV_2_MASK 0x400
+#define MC_ARB_RAMCFG__RSV_2__SHIFT 0xa
+#define MC_ARB_RAMCFG__RSV_3_MASK 0x800
+#define MC_ARB_RAMCFG__RSV_3__SHIFT 0xb
+#define MC_ARB_RAMCFG__NOOFGROUPS_MASK 0x1000
+#define MC_ARB_RAMCFG__NOOFGROUPS__SHIFT 0xc
+#define MC_ARB_RAMCFG__RSV_4_MASK 0x3e000
+#define MC_ARB_RAMCFG__RSV_4__SHIFT 0xd
+#define MC_ARB_POP__ENABLE_ARB_MASK 0x1
+#define MC_ARB_POP__ENABLE_ARB__SHIFT 0x0
+#define MC_ARB_POP__SPEC_OPEN_MASK 0x2
+#define MC_ARB_POP__SPEC_OPEN__SHIFT 0x1
+#define MC_ARB_POP__POP_DEPTH_MASK 0x3c
+#define MC_ARB_POP__POP_DEPTH__SHIFT 0x2
+#define MC_ARB_POP__WRDATAINDEX_DEPTH_MASK 0xfc0
+#define MC_ARB_POP__WRDATAINDEX_DEPTH__SHIFT 0x6
+#define MC_ARB_POP__SKID_DEPTH_MASK 0x7000
+#define MC_ARB_POP__SKID_DEPTH__SHIFT 0xc
+#define MC_ARB_POP__WAIT_AFTER_RFSH_MASK 0x18000
+#define MC_ARB_POP__WAIT_AFTER_RFSH__SHIFT 0xf
+#define MC_ARB_POP__QUICK_STOP_MASK 0x20000
+#define MC_ARB_POP__QUICK_STOP__SHIFT 0x11
+#define MC_ARB_POP__ENABLE_TWO_PAGE_MASK 0x40000
+#define MC_ARB_POP__ENABLE_TWO_PAGE__SHIFT 0x12
+#define MC_ARB_POP__ALLOW_EOB_BY_WRRET_STALL_MASK 0x80000
+#define MC_ARB_POP__ALLOW_EOB_BY_WRRET_STALL__SHIFT 0x13
+#define MC_ARB_MINCLKS__READ_CLKS_MASK 0xff
+#define MC_ARB_MINCLKS__READ_CLKS__SHIFT 0x0
+#define MC_ARB_MINCLKS__WRITE_CLKS_MASK 0xff00
+#define MC_ARB_MINCLKS__WRITE_CLKS__SHIFT 0x8
+#define MC_ARB_MINCLKS__ARB_RW_SWITCH_MASK 0x10000
+#define MC_ARB_MINCLKS__ARB_RW_SWITCH__SHIFT 0x10
+#define MC_ARB_MINCLKS__RW_SWITCH_HARSH_MASK 0x60000
+#define MC_ARB_MINCLKS__RW_SWITCH_HARSH__SHIFT 0x11
+#define MC_ARB_SQM_CNTL__MIN_PENAL_MASK 0xff
+#define MC_ARB_SQM_CNTL__MIN_PENAL__SHIFT 0x0
+#define MC_ARB_SQM_CNTL__DYN_SQM_ENABLE_MASK 0x100
+#define MC_ARB_SQM_CNTL__DYN_SQM_ENABLE__SHIFT 0x8
+#define MC_ARB_SQM_CNTL__SQM_RDY16_MASK 0x200
+#define MC_ARB_SQM_CNTL__SQM_RDY16__SHIFT 0x9
+#define MC_ARB_SQM_CNTL__SQM_RESERVE_MASK 0xfc00
+#define MC_ARB_SQM_CNTL__SQM_RESERVE__SHIFT 0xa
+#define MC_ARB_SQM_CNTL__RATIO_MASK 0xff0000
+#define MC_ARB_SQM_CNTL__RATIO__SHIFT 0x10
+#define MC_ARB_SQM_CNTL__RATIO_DEBUG_MASK 0xff000000
+#define MC_ARB_SQM_CNTL__RATIO_DEBUG__SHIFT 0x18
+#define MC_ARB_ADDR_HASH__BANK_XOR_ENABLE_MASK 0xf
+#define MC_ARB_ADDR_HASH__BANK_XOR_ENABLE__SHIFT 0x0
+#define MC_ARB_ADDR_HASH__COL_XOR_MASK 0xff0
+#define MC_ARB_ADDR_HASH__COL_XOR__SHIFT 0x4
+#define MC_ARB_ADDR_HASH__ROW_XOR_MASK 0xffff000
+#define MC_ARB_ADDR_HASH__ROW_XOR__SHIFT 0xc
+#define MC_ARB_DRAM_TIMING__ACTRD_MASK 0xff
+#define MC_ARB_DRAM_TIMING__ACTRD__SHIFT 0x0
+#define MC_ARB_DRAM_TIMING__ACTWR_MASK 0xff00
+#define MC_ARB_DRAM_TIMING__ACTWR__SHIFT 0x8
+#define MC_ARB_DRAM_TIMING__RASMACTRD_MASK 0xff0000
+#define MC_ARB_DRAM_TIMING__RASMACTRD__SHIFT 0x10
+#define MC_ARB_DRAM_TIMING__RASMACTWR_MASK 0xff000000
+#define MC_ARB_DRAM_TIMING__RASMACTWR__SHIFT 0x18
+#define MC_ARB_DRAM_TIMING2__RAS2RAS_MASK 0xff
+#define MC_ARB_DRAM_TIMING2__RAS2RAS__SHIFT 0x0
+#define MC_ARB_DRAM_TIMING2__RP_MASK 0xff00
+#define MC_ARB_DRAM_TIMING2__RP__SHIFT 0x8
+#define MC_ARB_DRAM_TIMING2__WRPLUSRP_MASK 0xff0000
+#define MC_ARB_DRAM_TIMING2__WRPLUSRP__SHIFT 0x10
+#define MC_ARB_DRAM_TIMING2__BUS_TURN_MASK 0x1f000000
+#define MC_ARB_DRAM_TIMING2__BUS_TURN__SHIFT 0x18
+#define MC_ARB_WTM_CNTL_RD__WTMODE_MASK 0x3
+#define MC_ARB_WTM_CNTL_RD__WTMODE__SHIFT 0x0
+#define MC_ARB_WTM_CNTL_RD__HARSH_PRI_MASK 0x4
+#define MC_ARB_WTM_CNTL_RD__HARSH_PRI__SHIFT 0x2
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP0_MASK 0x8
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP0__SHIFT 0x3
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP1_MASK 0x10
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP1__SHIFT 0x4
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP2_MASK 0x20
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP2__SHIFT 0x5
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP3_MASK 0x40
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP3__SHIFT 0x6
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP4_MASK 0x80
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP4__SHIFT 0x7
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP5_MASK 0x100
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP5__SHIFT 0x8
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP6_MASK 0x200
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP6__SHIFT 0x9
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP7_MASK 0x400
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP7__SHIFT 0xa
+#define MC_ARB_WTM_CNTL_RD__ACP_HARSH_PRI_MASK 0x800
+#define MC_ARB_WTM_CNTL_RD__ACP_HARSH_PRI__SHIFT 0xb
+#define MC_ARB_WTM_CNTL_RD__ACP_OVER_DISP_MASK 0x1000
+#define MC_ARB_WTM_CNTL_RD__ACP_OVER_DISP__SHIFT 0xc
+#define MC_ARB_WTM_CNTL_RD__FORCE_ACP_URG_MASK 0x2000
+#define MC_ARB_WTM_CNTL_RD__FORCE_ACP_URG__SHIFT 0xd
+#define MC_ARB_WTM_CNTL_WR__WTMODE_MASK 0x3
+#define MC_ARB_WTM_CNTL_WR__WTMODE__SHIFT 0x0
+#define MC_ARB_WTM_CNTL_WR__HARSH_PRI_MASK 0x4
+#define MC_ARB_WTM_CNTL_WR__HARSH_PRI__SHIFT 0x2
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP0_MASK 0x8
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP0__SHIFT 0x3
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP1_MASK 0x10
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP1__SHIFT 0x4
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP2_MASK 0x20
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP2__SHIFT 0x5
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP3_MASK 0x40
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP3__SHIFT 0x6
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP4_MASK 0x80
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP4__SHIFT 0x7
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP5_MASK 0x100
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP5__SHIFT 0x8
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP6_MASK 0x200
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP6__SHIFT 0x9
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP7_MASK 0x400
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP7__SHIFT 0xa
+#define MC_ARB_WTM_CNTL_WR__ACP_HARSH_PRI_MASK 0x800
+#define MC_ARB_WTM_CNTL_WR__ACP_HARSH_PRI__SHIFT 0xb
+#define MC_ARB_WTM_CNTL_WR__ACP_OVER_DISP_MASK 0x1000
+#define MC_ARB_WTM_CNTL_WR__ACP_OVER_DISP__SHIFT 0xc
+#define MC_ARB_WTM_CNTL_WR__FORCE_ACP_URG_MASK 0x2000
+#define MC_ARB_WTM_CNTL_WR__FORCE_ACP_URG__SHIFT 0xd
+#define MC_ARB_WTM_GRPWT_RD__GRP0_MASK 0x3
+#define MC_ARB_WTM_GRPWT_RD__GRP0__SHIFT 0x0
+#define MC_ARB_WTM_GRPWT_RD__GRP1_MASK 0xc
+#define MC_ARB_WTM_GRPWT_RD__GRP1__SHIFT 0x2
+#define MC_ARB_WTM_GRPWT_RD__GRP2_MASK 0x30
+#define MC_ARB_WTM_GRPWT_RD__GRP2__SHIFT 0x4
+#define MC_ARB_WTM_GRPWT_RD__GRP3_MASK 0xc0
+#define MC_ARB_WTM_GRPWT_RD__GRP3__SHIFT 0x6
+#define MC_ARB_WTM_GRPWT_RD__GRP4_MASK 0x300
+#define MC_ARB_WTM_GRPWT_RD__GRP4__SHIFT 0x8
+#define MC_ARB_WTM_GRPWT_RD__GRP5_MASK 0xc00
+#define MC_ARB_WTM_GRPWT_RD__GRP5__SHIFT 0xa
+#define MC_ARB_WTM_GRPWT_RD__GRP6_MASK 0x3000
+#define MC_ARB_WTM_GRPWT_RD__GRP6__SHIFT 0xc
+#define MC_ARB_WTM_GRPWT_RD__GRP7_MASK 0xc000
+#define MC_ARB_WTM_GRPWT_RD__GRP7__SHIFT 0xe
+#define MC_ARB_WTM_GRPWT_RD__GRP_EXT_MASK 0xff0000
+#define MC_ARB_WTM_GRPWT_RD__GRP_EXT__SHIFT 0x10
+#define MC_ARB_WTM_GRPWT_WR__GRP0_MASK 0x3
+#define MC_ARB_WTM_GRPWT_WR__GRP0__SHIFT 0x0
+#define MC_ARB_WTM_GRPWT_WR__GRP1_MASK 0xc
+#define MC_ARB_WTM_GRPWT_WR__GRP1__SHIFT 0x2
+#define MC_ARB_WTM_GRPWT_WR__GRP2_MASK 0x30
+#define MC_ARB_WTM_GRPWT_WR__GRP2__SHIFT 0x4
+#define MC_ARB_WTM_GRPWT_WR__GRP3_MASK 0xc0
+#define MC_ARB_WTM_GRPWT_WR__GRP3__SHIFT 0x6
+#define MC_ARB_WTM_GRPWT_WR__GRP4_MASK 0x300
+#define MC_ARB_WTM_GRPWT_WR__GRP4__SHIFT 0x8
+#define MC_ARB_WTM_GRPWT_WR__GRP5_MASK 0xc00
+#define MC_ARB_WTM_GRPWT_WR__GRP5__SHIFT 0xa
+#define MC_ARB_WTM_GRPWT_WR__GRP6_MASK 0x3000
+#define MC_ARB_WTM_GRPWT_WR__GRP6__SHIFT 0xc
+#define MC_ARB_WTM_GRPWT_WR__GRP7_MASK 0xc000
+#define MC_ARB_WTM_GRPWT_WR__GRP7__SHIFT 0xe
+#define MC_ARB_WTM_GRPWT_WR__GRP_EXT_MASK 0xff0000
+#define MC_ARB_WTM_GRPWT_WR__GRP_EXT__SHIFT 0x10
+#define MC_ARB_TM_CNTL_RD__GROUPBY_RANK_MASK 0x1
+#define MC_ARB_TM_CNTL_RD__GROUPBY_RANK__SHIFT 0x0
+#define MC_ARB_TM_CNTL_RD__BANK_SELECT_MASK 0x6
+#define MC_ARB_TM_CNTL_RD__BANK_SELECT__SHIFT 0x1
+#define MC_ARB_TM_CNTL_RD__MATCH_RANK_MASK 0x8
+#define MC_ARB_TM_CNTL_RD__MATCH_RANK__SHIFT 0x3
+#define MC_ARB_TM_CNTL_RD__MATCH_BANK_MASK 0x10
+#define MC_ARB_TM_CNTL_RD__MATCH_BANK__SHIFT 0x4
+#define MC_ARB_TM_CNTL_WR__GROUPBY_RANK_MASK 0x1
+#define MC_ARB_TM_CNTL_WR__GROUPBY_RANK__SHIFT 0x0
+#define MC_ARB_TM_CNTL_WR__BANK_SELECT_MASK 0x6
+#define MC_ARB_TM_CNTL_WR__BANK_SELECT__SHIFT 0x1
+#define MC_ARB_TM_CNTL_WR__MATCH_RANK_MASK 0x8
+#define MC_ARB_TM_CNTL_WR__MATCH_RANK__SHIFT 0x3
+#define MC_ARB_TM_CNTL_WR__MATCH_BANK_MASK 0x10
+#define MC_ARB_TM_CNTL_WR__MATCH_BANK__SHIFT 0x4
+#define MC_ARB_LAZY0_RD__GROUP0_MASK 0xff
+#define MC_ARB_LAZY0_RD__GROUP0__SHIFT 0x0
+#define MC_ARB_LAZY0_RD__GROUP1_MASK 0xff00
+#define MC_ARB_LAZY0_RD__GROUP1__SHIFT 0x8
+#define MC_ARB_LAZY0_RD__GROUP2_MASK 0xff0000
+#define MC_ARB_LAZY0_RD__GROUP2__SHIFT 0x10
+#define MC_ARB_LAZY0_RD__GROUP3_MASK 0xff000000
+#define MC_ARB_LAZY0_RD__GROUP3__SHIFT 0x18
+#define MC_ARB_LAZY0_WR__GROUP0_MASK 0xff
+#define MC_ARB_LAZY0_WR__GROUP0__SHIFT 0x0
+#define MC_ARB_LAZY0_WR__GROUP1_MASK 0xff00
+#define MC_ARB_LAZY0_WR__GROUP1__SHIFT 0x8
+#define MC_ARB_LAZY0_WR__GROUP2_MASK 0xff0000
+#define MC_ARB_LAZY0_WR__GROUP2__SHIFT 0x10
+#define MC_ARB_LAZY0_WR__GROUP3_MASK 0xff000000
+#define MC_ARB_LAZY0_WR__GROUP3__SHIFT 0x18
+#define MC_ARB_LAZY1_RD__GROUP4_MASK 0xff
+#define MC_ARB_LAZY1_RD__GROUP4__SHIFT 0x0
+#define MC_ARB_LAZY1_RD__GROUP5_MASK 0xff00
+#define MC_ARB_LAZY1_RD__GROUP5__SHIFT 0x8
+#define MC_ARB_LAZY1_RD__GROUP6_MASK 0xff0000
+#define MC_ARB_LAZY1_RD__GROUP6__SHIFT 0x10
+#define MC_ARB_LAZY1_RD__GROUP7_MASK 0xff000000
+#define MC_ARB_LAZY1_RD__GROUP7__SHIFT 0x18
+#define MC_ARB_LAZY1_WR__GROUP4_MASK 0xff
+#define MC_ARB_LAZY1_WR__GROUP4__SHIFT 0x0
+#define MC_ARB_LAZY1_WR__GROUP5_MASK 0xff00
+#define MC_ARB_LAZY1_WR__GROUP5__SHIFT 0x8
+#define MC_ARB_LAZY1_WR__GROUP6_MASK 0xff0000
+#define MC_ARB_LAZY1_WR__GROUP6__SHIFT 0x10
+#define MC_ARB_LAZY1_WR__GROUP7_MASK 0xff000000
+#define MC_ARB_LAZY1_WR__GROUP7__SHIFT 0x18
+#define MC_ARB_AGE_RD__RATE_GROUP0_MASK 0x3
+#define MC_ARB_AGE_RD__RATE_GROUP0__SHIFT 0x0
+#define MC_ARB_AGE_RD__RATE_GROUP1_MASK 0xc
+#define MC_ARB_AGE_RD__RATE_GROUP1__SHIFT 0x2
+#define MC_ARB_AGE_RD__RATE_GROUP2_MASK 0x30
+#define MC_ARB_AGE_RD__RATE_GROUP2__SHIFT 0x4
+#define MC_ARB_AGE_RD__RATE_GROUP3_MASK 0xc0
+#define MC_ARB_AGE_RD__RATE_GROUP3__SHIFT 0x6
+#define MC_ARB_AGE_RD__RATE_GROUP4_MASK 0x300
+#define MC_ARB_AGE_RD__RATE_GROUP4__SHIFT 0x8
+#define MC_ARB_AGE_RD__RATE_GROUP5_MASK 0xc00
+#define MC_ARB_AGE_RD__RATE_GROUP5__SHIFT 0xa
+#define MC_ARB_AGE_RD__RATE_GROUP6_MASK 0x3000
+#define MC_ARB_AGE_RD__RATE_GROUP6__SHIFT 0xc
+#define MC_ARB_AGE_RD__RATE_GROUP7_MASK 0xc000
+#define MC_ARB_AGE_RD__RATE_GROUP7__SHIFT 0xe
+#define MC_ARB_AGE_RD__ENABLE_GROUP0_MASK 0x10000
+#define MC_ARB_AGE_RD__ENABLE_GROUP0__SHIFT 0x10
+#define MC_ARB_AGE_RD__ENABLE_GROUP1_MASK 0x20000
+#define MC_ARB_AGE_RD__ENABLE_GROUP1__SHIFT 0x11
+#define MC_ARB_AGE_RD__ENABLE_GROUP2_MASK 0x40000
+#define MC_ARB_AGE_RD__ENABLE_GROUP2__SHIFT 0x12
+#define MC_ARB_AGE_RD__ENABLE_GROUP3_MASK 0x80000
+#define MC_ARB_AGE_RD__ENABLE_GROUP3__SHIFT 0x13
+#define MC_ARB_AGE_RD__ENABLE_GROUP4_MASK 0x100000
+#define MC_ARB_AGE_RD__ENABLE_GROUP4__SHIFT 0x14
+#define MC_ARB_AGE_RD__ENABLE_GROUP5_MASK 0x200000
+#define MC_ARB_AGE_RD__ENABLE_GROUP5__SHIFT 0x15
+#define MC_ARB_AGE_RD__ENABLE_GROUP6_MASK 0x400000
+#define MC_ARB_AGE_RD__ENABLE_GROUP6__SHIFT 0x16
+#define MC_ARB_AGE_RD__ENABLE_GROUP7_MASK 0x800000
+#define MC_ARB_AGE_RD__ENABLE_GROUP7__SHIFT 0x17
+#define MC_ARB_AGE_RD__DIVIDE_GROUP0_MASK 0x1000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP0__SHIFT 0x18
+#define MC_ARB_AGE_RD__DIVIDE_GROUP1_MASK 0x2000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP1__SHIFT 0x19
+#define MC_ARB_AGE_RD__DIVIDE_GROUP2_MASK 0x4000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP2__SHIFT 0x1a
+#define MC_ARB_AGE_RD__DIVIDE_GROUP3_MASK 0x8000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP3__SHIFT 0x1b
+#define MC_ARB_AGE_RD__DIVIDE_GROUP4_MASK 0x10000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP4__SHIFT 0x1c
+#define MC_ARB_AGE_RD__DIVIDE_GROUP5_MASK 0x20000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP5__SHIFT 0x1d
+#define MC_ARB_AGE_RD__DIVIDE_GROUP6_MASK 0x40000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP6__SHIFT 0x1e
+#define MC_ARB_AGE_RD__DIVIDE_GROUP7_MASK 0x80000000
+#define MC_ARB_AGE_RD__DIVIDE_GROUP7__SHIFT 0x1f
+#define MC_ARB_AGE_WR__RATE_GROUP0_MASK 0x3
+#define MC_ARB_AGE_WR__RATE_GROUP0__SHIFT 0x0
+#define MC_ARB_AGE_WR__RATE_GROUP1_MASK 0xc
+#define MC_ARB_AGE_WR__RATE_GROUP1__SHIFT 0x2
+#define MC_ARB_AGE_WR__RATE_GROUP2_MASK 0x30
+#define MC_ARB_AGE_WR__RATE_GROUP2__SHIFT 0x4
+#define MC_ARB_AGE_WR__RATE_GROUP3_MASK 0xc0
+#define MC_ARB_AGE_WR__RATE_GROUP3__SHIFT 0x6
+#define MC_ARB_AGE_WR__RATE_GROUP4_MASK 0x300
+#define MC_ARB_AGE_WR__RATE_GROUP4__SHIFT 0x8
+#define MC_ARB_AGE_WR__RATE_GROUP5_MASK 0xc00
+#define MC_ARB_AGE_WR__RATE_GROUP5__SHIFT 0xa
+#define MC_ARB_AGE_WR__RATE_GROUP6_MASK 0x3000
+#define MC_ARB_AGE_WR__RATE_GROUP6__SHIFT 0xc
+#define MC_ARB_AGE_WR__RATE_GROUP7_MASK 0xc000
+#define MC_ARB_AGE_WR__RATE_GROUP7__SHIFT 0xe
+#define MC_ARB_AGE_WR__ENABLE_GROUP0_MASK 0x10000
+#define MC_ARB_AGE_WR__ENABLE_GROUP0__SHIFT 0x10
+#define MC_ARB_AGE_WR__ENABLE_GROUP1_MASK 0x20000
+#define MC_ARB_AGE_WR__ENABLE_GROUP1__SHIFT 0x11
+#define MC_ARB_AGE_WR__ENABLE_GROUP2_MASK 0x40000
+#define MC_ARB_AGE_WR__ENABLE_GROUP2__SHIFT 0x12
+#define MC_ARB_AGE_WR__ENABLE_GROUP3_MASK 0x80000
+#define MC_ARB_AGE_WR__ENABLE_GROUP3__SHIFT 0x13
+#define MC_ARB_AGE_WR__ENABLE_GROUP4_MASK 0x100000
+#define MC_ARB_AGE_WR__ENABLE_GROUP4__SHIFT 0x14
+#define MC_ARB_AGE_WR__ENABLE_GROUP5_MASK 0x200000
+#define MC_ARB_AGE_WR__ENABLE_GROUP5__SHIFT 0x15
+#define MC_ARB_AGE_WR__ENABLE_GROUP6_MASK 0x400000
+#define MC_ARB_AGE_WR__ENABLE_GROUP6__SHIFT 0x16
+#define MC_ARB_AGE_WR__ENABLE_GROUP7_MASK 0x800000
+#define MC_ARB_AGE_WR__ENABLE_GROUP7__SHIFT 0x17
+#define MC_ARB_AGE_WR__DIVIDE_GROUP0_MASK 0x1000000
+#define MC_ARB_AGE_WR__DIVIDE_GROUP0__SHIFT 0x18
+#define MC_ARB_AGE_WR__DIVIDE_GROUP1_MASK 0x2000000
+#define MC_ARB_AGE_WR__DIVIDE_GROUP1__SHIFT 0x19
+#define MC_ARB_AGE_WR__DIVIDE_GROUP2_MASK 0x4000000
+#define MC_ARB_AGE_WR__DIVIDE_GROUP2__SHIFT 0x1a
+#define MC_ARB_AGE_WR__DIVIDE_GROUP3_MASK 0x8000000
+#define MC_ARB_AGE_WR__DIVIDE_GROUP3__SHIFT 0x1b
+#define MC_ARB_AGE_WR__DIVIDE_GROUP4_MASK 0x10000000
+#define MC_ARB_AGE_WR__DIVIDE_GROUP4__SHIFT 0x1c
+#define MC_ARB_AGE_WR__DIVIDE_GROUP5_MASK 0x20000000
+#define MC_ARB_AGE_WR__DIVIDE_GROUP5__SHIFT 0x1d
+#define MC_ARB_AGE_WR__DIVIDE_GROUP6_MASK 0x40000000
+#define MC_ARB_AGE_WR__DIVIDE_GROUP6__SHIFT 0x1e
+#define MC_ARB_AGE_WR__DIVIDE_GROUP7_MASK 0x80000000
+#define MC_ARB_AGE_WR__DIVIDE_GROUP7__SHIFT 0x1f
+#define MC_ARB_RFSH_CNTL__ENABLE_MASK 0x1
+#define MC_ARB_RFSH_CNTL__ENABLE__SHIFT 0x0
+#define MC_ARB_RFSH_CNTL__URG0_MASK 0x3e
+#define MC_ARB_RFSH_CNTL__URG0__SHIFT 0x1
+#define MC_ARB_RFSH_CNTL__URG1_MASK 0x7c0
+#define MC_ARB_RFSH_CNTL__URG1__SHIFT 0x6
+#define MC_ARB_RFSH_CNTL__ACCUM_MASK 0x800
+#define MC_ARB_RFSH_CNTL__ACCUM__SHIFT 0xb
+#define MC_ARB_RFSH_CNTL__SINGLE_BANK_MASK 0x1000
+#define MC_ARB_RFSH_CNTL__SINGLE_BANK__SHIFT 0xc
+#define MC_ARB_RFSH_CNTL__PUSH_SINGLE_BANK_REFRESH_MASK 0x2000
+#define MC_ARB_RFSH_CNTL__PUSH_SINGLE_BANK_REFRESH__SHIFT 0xd
+#define MC_ARB_RFSH_CNTL__PENDING

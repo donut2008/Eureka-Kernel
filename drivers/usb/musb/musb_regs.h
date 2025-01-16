@@ -1,624 +1,235 @@
-/*
- * MUSB OTG driver register defines
- *
- * Copyright 2005 Mentor Graphics Corporation
- * Copyright (C) 2005-2006 by Texas Instruments
- * Copyright (C) 2006-2007 Nokia Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- */
+et;
+  USHORT usCRC_BlockOffset;
+  USHORT usBIOS_BootupMessageOffset;
+  USHORT usInt10Offset;
+  USHORT usPciBusDevInitCode;
+  USHORT usIoBaseAddress;
+  USHORT usSubsystemVendorID;
+  USHORT usSubsystemID;
+  USHORT usPCI_InfoOffset;
+  USHORT usMasterCommandTableOffset;//Offest for SW to get all command table offsets, Don't change the position
+  USHORT usMasterDataTableOffset;   //Offest for SW to get all data table offsets, Don't change the position
+  UCHAR  ucExtendedFunctionCode;
+  UCHAR  ucReserved;
+}ATOM_ROM_HEADER;
 
-#ifndef __MUSB_REGS_H__
-#define __MUSB_REGS_H__
-
-#define MUSB_EP0_FIFOSIZE	64	/* This is non-configurable */
-
-/*
- * MUSB Register bits
- */
-
-/* POWER */
-#define MUSB_POWER_ISOUPDATE	0x80
-#define MUSB_POWER_SOFTCONN	0x40
-#define MUSB_POWER_HSENAB	0x20
-#define MUSB_POWER_HSMODE	0x10
-#define MUSB_POWER_RESET	0x08
-#define MUSB_POWER_RESUME	0x04
-#define MUSB_POWER_SUSPENDM	0x02
-#define MUSB_POWER_ENSUSPEND	0x01
-
-/* INTRUSB */
-#define MUSB_INTR_SUSPEND	0x01
-#define MUSB_INTR_RESUME	0x02
-#define MUSB_INTR_RESET		0x04
-#define MUSB_INTR_BABBLE	0x04
-#define MUSB_INTR_SOF		0x08
-#define MUSB_INTR_CONNECT	0x10
-#define MUSB_INTR_DISCONNECT	0x20
-#define MUSB_INTR_SESSREQ	0x40
-#define MUSB_INTR_VBUSERROR	0x80	/* For SESSION end */
-
-/* DEVCTL */
-#define MUSB_DEVCTL_BDEVICE	0x80
-#define MUSB_DEVCTL_FSDEV	0x40
-#define MUSB_DEVCTL_LSDEV	0x20
-#define MUSB_DEVCTL_VBUS	0x18
-#define MUSB_DEVCTL_VBUS_SHIFT	3
-#define MUSB_DEVCTL_HM		0x04
-#define MUSB_DEVCTL_HR		0x02
-#define MUSB_DEVCTL_SESSION	0x01
-
-/* BABBLE_CTL */
-#define MUSB_BABBLE_FORCE_TXIDLE	0x80
-#define MUSB_BABBLE_SW_SESSION_CTRL	0x40
-#define MUSB_BABBLE_STUCK_J		0x20
-#define MUSB_BABBLE_RCV_DISABLE		0x04
-
-/* MUSB ULPI VBUSCONTROL */
-#define MUSB_ULPI_USE_EXTVBUS	0x01
-#define MUSB_ULPI_USE_EXTVBUSIND 0x02
-/* ULPI_REG_CONTROL */
-#define MUSB_ULPI_REG_REQ	(1 << 0)
-#define MUSB_ULPI_REG_CMPLT	(1 << 1)
-#define MUSB_ULPI_RDN_WR	(1 << 2)
-
-/* TESTMODE */
-#define MUSB_TEST_FORCE_HOST	0x80
-#define MUSB_TEST_FIFO_ACCESS	0x40
-#define MUSB_TEST_FORCE_FS	0x20
-#define MUSB_TEST_FORCE_HS	0x10
-#define MUSB_TEST_PACKET	0x08
-#define MUSB_TEST_K		0x04
-#define MUSB_TEST_J		0x02
-#define MUSB_TEST_SE0_NAK	0x01
-
-/* Allocate for double-packet buffering (effectively doubles assigned _SIZE) */
-#define MUSB_FIFOSZ_DPB	0x10
-/* Allocation size (8, 16, 32, ... 4096) */
-#define MUSB_FIFOSZ_SIZE	0x0f
-
-/* CSR0 */
-#define MUSB_CSR0_FLUSHFIFO	0x0100
-#define MUSB_CSR0_TXPKTRDY	0x0002
-#define MUSB_CSR0_RXPKTRDY	0x0001
-
-/* CSR0 in Peripheral mode */
-#define MUSB_CSR0_P_SVDSETUPEND	0x0080
-#define MUSB_CSR0_P_SVDRXPKTRDY	0x0040
-#define MUSB_CSR0_P_SENDSTALL	0x0020
-#define MUSB_CSR0_P_SETUPEND	0x0010
-#define MUSB_CSR0_P_DATAEND	0x0008
-#define MUSB_CSR0_P_SENTSTALL	0x0004
-
-/* CSR0 in Host mode */
-#define MUSB_CSR0_H_DIS_PING		0x0800
-#define MUSB_CSR0_H_WR_DATATOGGLE	0x0400	/* Set to allow setting: */
-#define MUSB_CSR0_H_DATATOGGLE		0x0200	/* Data toggle control */
-#define MUSB_CSR0_H_NAKTIMEOUT		0x0080
-#define MUSB_CSR0_H_STATUSPKT		0x0040
-#define MUSB_CSR0_H_REQPKT		0x0020
-#define MUSB_CSR0_H_ERROR		0x0010
-#define MUSB_CSR0_H_SETUPPKT		0x0008
-#define MUSB_CSR0_H_RXSTALL		0x0004
-
-/* CSR0 bits to avoid zeroing (write zero clears, write 1 ignored) */
-#define MUSB_CSR0_P_WZC_BITS	\
-	(MUSB_CSR0_P_SENTSTALL)
-#define MUSB_CSR0_H_WZC_BITS	\
-	(MUSB_CSR0_H_NAKTIMEOUT | MUSB_CSR0_H_RXSTALL \
-	| MUSB_CSR0_RXPKTRDY)
-
-/* TxType/RxType */
-#define MUSB_TYPE_SPEED		0xc0
-#define MUSB_TYPE_SPEED_SHIFT	6
-#define MUSB_TYPE_PROTO		0x30	/* Implicitly zero for ep0 */
-#define MUSB_TYPE_PROTO_SHIFT	4
-#define MUSB_TYPE_REMOTE_END	0xf	/* Implicitly zero for ep0 */
-
-/* CONFIGDATA */
-#define MUSB_CONFIGDATA_MPRXE		0x80	/* Auto bulk pkt combining */
-#define MUSB_CONFIGDATA_MPTXE		0x40	/* Auto bulk pkt splitting */
-#define MUSB_CONFIGDATA_BIGENDIAN	0x20
-#define MUSB_CONFIGDATA_HBRXE		0x10	/* HB-ISO for RX */
-#define MUSB_CONFIGDATA_HBTXE		0x08	/* HB-ISO for TX */
-#define MUSB_CONFIGDATA_DYNFIFO		0x04	/* Dynamic FIFO sizing */
-#define MUSB_CONFIGDATA_SOFTCONE	0x02	/* SoftConnect */
-#define MUSB_CONFIGDATA_UTMIDW		0x01	/* Data width 0/1 => 8/16bits */
-
-/* TXCSR in Peripheral and Host mode */
-#define MUSB_TXCSR_AUTOSET		0x8000
-#define MUSB_TXCSR_DMAENAB		0x1000
-#define MUSB_TXCSR_FRCDATATOG		0x0800
-#define MUSB_TXCSR_DMAMODE		0x0400
-#define MUSB_TXCSR_CLRDATATOG		0x0040
-#define MUSB_TXCSR_FLUSHFIFO		0x0008
-#define MUSB_TXCSR_FIFONOTEMPTY		0x0002
-#define MUSB_TXCSR_TXPKTRDY		0x0001
-
-/* TXCSR in Peripheral mode */
-#define MUSB_TXCSR_P_ISO		0x4000
-#define MUSB_TXCSR_P_INCOMPTX		0x0080
-#define MUSB_TXCSR_P_SENTSTALL		0x0020
-#define MUSB_TXCSR_P_SENDSTALL		0x0010
-#define MUSB_TXCSR_P_UNDERRUN		0x0004
-
-/* TXCSR in Host mode */
-#define MUSB_TXCSR_H_WR_DATATOGGLE	0x0200
-#define MUSB_TXCSR_H_DATATOGGLE		0x0100
-#define MUSB_TXCSR_H_NAKTIMEOUT		0x0080
-#define MUSB_TXCSR_H_RXSTALL		0x0020
-#define MUSB_TXCSR_H_ERROR		0x0004
-
-/* TXCSR bits to avoid zeroing (write zero clears, write 1 ignored) */
-#define MUSB_TXCSR_P_WZC_BITS	\
-	(MUSB_TXCSR_P_INCOMPTX | MUSB_TXCSR_P_SENTSTALL \
-	| MUSB_TXCSR_P_UNDERRUN | MUSB_TXCSR_FIFONOTEMPTY)
-#define MUSB_TXCSR_H_WZC_BITS	\
-	(MUSB_TXCSR_H_NAKTIMEOUT | MUSB_TXCSR_H_RXSTALL \
-	| MUSB_TXCSR_H_ERROR | MUSB_TXCSR_FIFONOTEMPTY)
-
-/* RXCSR in Peripheral and Host mode */
-#define MUSB_RXCSR_AUTOCLEAR		0x8000
-#define MUSB_RXCSR_DMAENAB		0x2000
-#define MUSB_RXCSR_DISNYET		0x1000
-#define MUSB_RXCSR_PID_ERR		0x1000
-#define MUSB_RXCSR_DMAMODE		0x0800
-#define MUSB_RXCSR_INCOMPRX		0x0100
-#define MUSB_RXCSR_CLRDATATOG		0x0080
-#define MUSB_RXCSR_FLUSHFIFO		0x0010
-#define MUSB_RXCSR_DATAERROR		0x0008
-#define MUSB_RXCSR_FIFOFULL		0x0002
-#define MUSB_RXCSR_RXPKTRDY		0x0001
-
-/* RXCSR in Peripheral mode */
-#define MUSB_RXCSR_P_ISO		0x4000
-#define MUSB_RXCSR_P_SENTSTALL		0x0040
-#define MUSB_RXCSR_P_SENDSTALL		0x0020
-#define MUSB_RXCSR_P_OVERRUN		0x0004
-
-/* RXCSR in Host mode */
-#define MUSB_RXCSR_H_AUTOREQ		0x4000
-#define MUSB_RXCSR_H_WR_DATATOGGLE	0x0400
-#define MUSB_RXCSR_H_DATATOGGLE		0x0200
-#define MUSB_RXCSR_H_RXSTALL		0x0040
-#define MUSB_RXCSR_H_REQPKT		0x0020
-#define MUSB_RXCSR_H_ERROR		0x0004
-
-/* RXCSR bits to avoid zeroing (write zero clears, write 1 ignored) */
-#define MUSB_RXCSR_P_WZC_BITS	\
-	(MUSB_RXCSR_P_SENTSTALL | MUSB_RXCSR_P_OVERRUN \
-	| MUSB_RXCSR_RXPKTRDY)
-#define MUSB_RXCSR_H_WZC_BITS	\
-	(MUSB_RXCSR_H_RXSTALL | MUSB_RXCSR_H_ERROR \
-	| MUSB_RXCSR_DATAERROR | MUSB_RXCSR_RXPKTRDY)
-
-/* HUBADDR */
-#define MUSB_HUBADDR_MULTI_TT		0x80
+//==============================Command Table Portion====================================
 
 
-#ifndef CONFIG_BLACKFIN
+/****************************************************************************/
+// Structures used in Command.mtb
+/****************************************************************************/
+typedef struct _ATOM_MASTER_LIST_OF_COMMAND_TABLES{
+  USHORT ASIC_Init;                              //Function Table, used by various SW components,latest version 1.1
+  USHORT GetDisplaySurfaceSize;                  //Atomic Table,  Used by Bios when enabling HW ICON
+  USHORT ASIC_RegistersInit;                     //Atomic Table,  indirectly used by various SW components,called from ASIC_Init
+  USHORT VRAM_BlockVenderDetection;              //Atomic Table,  used only by Bios
+  USHORT DIGxEncoderControl;                     //Only used by Bios
+  USHORT MemoryControllerInit;                   //Atomic Table,  indirectly used by various SW components,called from ASIC_Init
+  USHORT EnableCRTCMemReq;                       //Function Table,directly used by various SW components,latest version 2.1
+  USHORT MemoryParamAdjust;                      //Atomic Table,  indirectly used by various SW components,called from SetMemoryClock if needed
+  USHORT DVOEncoderControl;                      //Function Table,directly used by various SW components,latest version 1.2
+  USHORT GPIOPinControl;                         //Atomic Table,  only used by Bios
+  USHORT SetEngineClock;                         //Function Table,directly used by various SW components,latest version 1.1
+  USHORT SetMemoryClock;                         //Function Table,directly used by various SW components,latest version 1.1
+  USHORT SetPixelClock;                          //Function Table,directly used by various SW components,latest version 1.2
+  USHORT EnableDispPowerGating;                  //Atomic Table,  indirectly used by various SW components,called from ASIC_Init
+  USHORT ResetMemoryDLL;                         //Atomic Table,  indirectly used by various SW components,called from SetMemoryClock
+  USHORT ResetMemoryDevice;                      //Atomic Table,  indirectly used by various SW components,called from SetMemoryClock
+  USHORT MemoryPLLInit;                          //Atomic Table,  used only by Bios
+  USHORT AdjustDisplayPll;                       //Atomic Table,  used by various SW componentes.
+  USHORT AdjustMemoryController;                 //Atomic Table,  indirectly used by various SW components,called from SetMemoryClock
+  USHORT EnableASIC_StaticPwrMgt;                //Atomic Table,  only used by Bios
+  USHORT SetUniphyInstance;                      //Atomic Table,  only used by Bios
+  USHORT DAC_LoadDetection;                      //Atomic Table,  directly used by various SW components,latest version 1.2
+  USHORT LVTMAEncoderControl;                    //Atomic Table,directly used by various SW components,latest version 1.3
+  USHORT HW_Misc_Operation;                      //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT DAC1EncoderControl;                     //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT DAC2EncoderControl;                     //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT DVOOutputControl;                       //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT CV1OutputControl;                       //Atomic Table,  Atomic Table,  Obsolete from Ry6xx, use DAC2 Output instead
+  USHORT GetConditionalGoldenSetting;            //Only used by Bios
+  USHORT SMC_Init;                               //Function Table,directly used by various SW components,latest version 1.1
+  USHORT PatchMCSetting;                         //only used by BIOS
+  USHORT MC_SEQ_Control;                         //only used by BIOS
+  USHORT Gfx_Harvesting;                         //Atomic Table,  Obsolete from Ry6xx, Now only used by BIOS for GFX harvesting
+  USHORT EnableScaler;                           //Atomic Table,  used only by Bios
+  USHORT BlankCRTC;                              //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT EnableCRTC;                             //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT GetPixelClock;                          //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT EnableVGA_Render;                       //Function Table,directly used by various SW components,latest version 1.1
+  USHORT GetSCLKOverMCLKRatio;                   //Atomic Table,  only used by Bios
+  USHORT SetCRTC_Timing;                         //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT SetCRTC_OverScan;                       //Atomic Table,  used by various SW components,latest version 1.1
+  USHORT SetCRTC_Replication;                    //Atomic Table,  used only by Bios
+  USHORT SelectCRTC_Source;                      //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT EnableGraphSurfaces;                    //Atomic Table,  used only by Bios
+  USHORT UpdateCRTC_DoubleBufferRegisters;       //Atomic Table,  used only by Bios
+  USHORT LUT_AutoFill;                           //Atomic Table,  only used by Bios
+  USHORT EnableHW_IconCursor;                    //Atomic Table,  only used by Bios
+  USHORT GetMemoryClock;                         //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT GetEngineClock;                         //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT SetCRTC_UsingDTDTiming;                 //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT ExternalEncoderControl;                 //Atomic Table,  directly used by various SW components,latest version 2.1
+  USHORT LVTMAOutputControl;                     //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT VRAM_BlockDetectionByStrap;             //Atomic Table,  used only by Bios
+  USHORT MemoryCleanUp;                          //Atomic Table,  only used by Bios
+  USHORT ProcessI2cChannelTransaction;           //Function Table,only used by Bios
+  USHORT WriteOneByteToHWAssistedI2C;            //Function Table,indirectly used by various SW components
+  USHORT ReadHWAssistedI2CStatus;                //Atomic Table,  indirectly used by various SW components
+  USHORT SpeedFanControl;                        //Function Table,indirectly used by various SW components,called from ASIC_Init
+  USHORT PowerConnectorDetection;                //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT MC_Synchronization;                     //Atomic Table,  indirectly used by various SW components,called from SetMemoryClock
+  USHORT ComputeMemoryEnginePLL;                 //Atomic Table,  indirectly used by various SW components,called from SetMemory/EngineClock
+  USHORT MemoryRefreshConversion;                //Atomic Table,  indirectly used by various SW components,called from SetMemory or SetEngineClock
+  USHORT VRAM_GetCurrentInfoBlock;               //Atomic Table,  used only by Bios
+  USHORT DynamicMemorySettings;                  //Atomic Table,  indirectly used by various SW components,called from SetMemoryClock
+  USHORT MemoryTraining;                         //Atomic Table,  used only by Bios
+  USHORT EnableSpreadSpectrumOnPPLL;             //Atomic Table,  directly used by various SW components,latest version 1.2
+  USHORT TMDSAOutputControl;                     //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT SetVoltage;                             //Function Table,directly and/or indirectly used by various SW components,latest version 1.1
+  USHORT DAC1OutputControl;                      //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT ReadEfuseValue;                         //Atomic Table,  directly used by various SW components,latest version 1.1
+  USHORT ComputeMemoryClockParam;                //Function Table,only used by Bios, obsolete soon.Switch to use "ReadEDIDFromHWAssistedI2C"
+  USHORT ClockSource;                            //Atomic Table,  indirectly used by various SW components,called from ASIC_Init
+  USHORT MemoryDeviceInit;                       //Atomic Table,  indirectly used by various SW components,called from SetMemoryClock
+  USHORT GetDispObjectInfo;                      //Atomic Table,  indirectly used by various SW components,called from EnableVGARender
+  USHORT DIG1EncoderControl;                     //Atomic Table,directly used by various SW components,latest version 1.1
+  USHORT DIG2EncoderControl;                     //Atomic Table,directly used by various SW components,latest version 1.1
+  USHORT DIG1TransmitterControl;                 //Atomic Table,directly used by various SW components,latest version 1.1
+  USHORT DIG2TransmitterControl;                 //Atomic Table,directly used by various SW components,latest version 1.1
+  USHORT ProcessAuxChannelTransaction;           //Function Table,only used by Bios
+  USHORT DPEncoderService;                       //Function Table,only used by Bios
+  USHORT GetVoltageInfo;                         //Function Table,only used by Bios since SI
+}ATOM_MASTER_LIST_OF_COMMAND_TABLES;
 
-/*
- * Common USB registers
- */
+// For backward compatible
+#define ReadEDIDFromHWAssistedI2C                ProcessI2cChannelTransaction
+#define DPTranslatorControl                      DIG2EncoderControl
+#define UNIPHYTransmitterControl                 DIG1TransmitterControl
+#define LVTMATransmitterControl                  DIG2TransmitterControl
+#define SetCRTC_DPM_State                        GetConditionalGoldenSetting
+#define ASIC_StaticPwrMgtStatusChange            SetUniphyInstance
+#define HPDInterruptService                      ReadHWAssistedI2CStatus
+#define EnableVGA_Access                         GetSCLKOverMCLKRatio
+#define EnableYUV                                GetDispObjectInfo
+#define DynamicClockGating                       EnableDispPowerGating
+#define SetupHWAssistedI2CStatus                 ComputeMemoryClockParam
+#define DAC2OutputControl                        ReadEfuseValue
 
-#define MUSB_FADDR		0x00	/* 8-bit */
-#define MUSB_POWER		0x01	/* 8-bit */
+#define TMDSAEncoderControl                      PatchMCSetting
+#define LVDSEncoderControl                       MC_SEQ_Control
+#define LCD1OutputControl                        HW_Misc_Operation
+#define TV1OutputControl                         Gfx_Harvesting
+#define TVEncoderControl                         SMC_Init
 
-#define MUSB_INTRTX		0x02	/* 16-bit */
-#define MUSB_INTRRX		0x04
-#define MUSB_INTRTXE		0x06
-#define MUSB_INTRRXE		0x08
-#define MUSB_INTRUSB		0x0A	/* 8 bit */
-#define MUSB_INTRUSBE		0x0B	/* 8 bit */
-#define MUSB_FRAME		0x0C
-#define MUSB_INDEX		0x0E	/* 8 bit */
-#define MUSB_TESTMODE		0x0F	/* 8 bit */
-
-/*
- * Additional Control Registers
- */
-
-#define MUSB_DEVCTL		0x60	/* 8 bit */
-#define MUSB_BABBLE_CTL		0x61	/* 8 bit */
-
-/* These are always controlled through the INDEX register */
-#define MUSB_TXFIFOSZ		0x62	/* 8-bit (see masks) */
-#define MUSB_RXFIFOSZ		0x63	/* 8-bit (see masks) */
-#define MUSB_TXFIFOADD		0x64	/* 16-bit offset shifted right 3 */
-#define MUSB_RXFIFOADD		0x66	/* 16-bit offset shifted right 3 */
-
-/* REVISIT: vctrl/vstatus: optional vendor utmi+phy register at 0x68 */
-#define MUSB_HWVERS		0x6C	/* 8 bit */
-#define MUSB_ULPI_BUSCONTROL	0x70	/* 8 bit */
-#define MUSB_ULPI_INT_MASK	0x72	/* 8 bit */
-#define MUSB_ULPI_INT_SRC	0x73	/* 8 bit */
-#define MUSB_ULPI_REG_DATA	0x74	/* 8 bit */
-#define MUSB_ULPI_REG_ADDR	0x75	/* 8 bit */
-#define MUSB_ULPI_REG_CONTROL	0x76	/* 8 bit */
-#define MUSB_ULPI_RAW_DATA	0x77	/* 8 bit */
-
-#define MUSB_EPINFO		0x78	/* 8 bit */
-#define MUSB_RAMINFO		0x79	/* 8 bit */
-#define MUSB_LINKINFO		0x7a	/* 8 bit */
-#define MUSB_VPLEN		0x7b	/* 8 bit */
-#define MUSB_HS_EOF1		0x7c	/* 8 bit */
-#define MUSB_FS_EOF1		0x7d	/* 8 bit */
-#define MUSB_LS_EOF1		0x7e	/* 8 bit */
-
-/* Offsets to endpoint registers */
-#define MUSB_TXMAXP		0x00
-#define MUSB_TXCSR		0x02
-#define MUSB_CSR0		MUSB_TXCSR	/* Re-used for EP0 */
-#define MUSB_RXMAXP		0x04
-#define MUSB_RXCSR		0x06
-#define MUSB_RXCOUNT		0x08
-#define MUSB_COUNT0		MUSB_RXCOUNT	/* Re-used for EP0 */
-#define MUSB_TXTYPE		0x0A
-#define MUSB_TYPE0		MUSB_TXTYPE	/* Re-used for EP0 */
-#define MUSB_TXINTERVAL		0x0B
-#define MUSB_NAKLIMIT0		MUSB_TXINTERVAL	/* Re-used for EP0 */
-#define MUSB_RXTYPE		0x0C
-#define MUSB_RXINTERVAL		0x0D
-#define MUSB_FIFOSIZE		0x0F
-#define MUSB_CONFIGDATA		MUSB_FIFOSIZE	/* Re-used for EP0 */
-
-#include "tusb6010.h"		/* Needed "only" for TUSB_EP0_CONF */
-
-#define MUSB_TXCSR_MODE			0x2000
-
-/* "bus control"/target registers, for host side multipoint (external hubs) */
-#define MUSB_TXFUNCADDR		0x00
-#define MUSB_TXHUBADDR		0x02
-#define MUSB_TXHUBPORT		0x03
-
-#define MUSB_RXFUNCADDR		0x04
-#define MUSB_RXHUBADDR		0x06
-#define MUSB_RXHUBPORT		0x07
-
-static inline void musb_write_txfifosz(void __iomem *mbase, u8 c_size)
+typedef struct _ATOM_MASTER_COMMAND_TABLE
 {
-	musb_writeb(mbase, MUSB_TXFIFOSZ, c_size);
-}
+  ATOM_COMMON_TABLE_HEADER           sHeader;
+  ATOM_MASTER_LIST_OF_COMMAND_TABLES ListOfCommandTables;
+}ATOM_MASTER_COMMAND_TABLE;
 
-static inline void musb_write_txfifoadd(void __iomem *mbase, u16 c_off)
+/****************************************************************************/
+// Structures used in every command table
+/****************************************************************************/
+typedef struct _ATOM_TABLE_ATTRIBUTE
 {
-	musb_writew(mbase, MUSB_TXFIFOADD, c_off);
-}
+#if ATOM_BIG_ENDIAN
+  USHORT  UpdatedByUtility:1;         //[15]=Table updated by utility flag
+  USHORT  PS_SizeInBytes:7;           //[14:8]=Size of parameter space in Bytes (multiple of a dword),
+  USHORT  WS_SizeInBytes:8;           //[7:0]=Size of workspace in Bytes (in multiple of a dword),
+#else
+  USHORT  WS_SizeInBytes:8;           //[7:0]=Size of workspace in Bytes (in multiple of a dword),
+  USHORT  PS_SizeInBytes:7;           //[14:8]=Size of parameter space in Bytes (multiple of a dword),
+  USHORT  UpdatedByUtility:1;         //[15]=Table updated by utility flag
+#endif
+}ATOM_TABLE_ATTRIBUTE;
 
-static inline void musb_write_rxfifosz(void __iomem *mbase, u8 c_size)
+/****************************************************************************/
+// Common header for all command tables.
+// Every table pointed by _ATOM_MASTER_COMMAND_TABLE has this common header.
+// And the pointer actually points to this header.
+/****************************************************************************/
+typedef struct _ATOM_COMMON_ROM_COMMAND_TABLE_HEADER
 {
-	musb_writeb(mbase, MUSB_RXFIFOSZ, c_size);
-}
+  ATOM_COMMON_TABLE_HEADER CommonHeader;
+  ATOM_TABLE_ATTRIBUTE     TableAttribute;
+}ATOM_COMMON_ROM_COMMAND_TABLE_HEADER;
 
-static inline void  musb_write_rxfifoadd(void __iomem *mbase, u16 c_off)
+/****************************************************************************/
+// Structures used by ComputeMemoryEnginePLLTable
+/****************************************************************************/
+
+#define COMPUTE_MEMORY_PLL_PARAM        1
+#define COMPUTE_ENGINE_PLL_PARAM        2
+#define ADJUST_MC_SETTING_PARAM         3
+
+/****************************************************************************/
+// Structures used by AdjustMemoryControllerTable
+/****************************************************************************/
+typedef struct _ATOM_ADJUST_MEMORY_CLOCK_FREQ
 {
-	musb_writew(mbase, MUSB_RXFIFOADD, c_off);
-}
+#if ATOM_BIG_ENDIAN
+  ULONG ulPointerReturnFlag:1;      // BYTE_3[7]=1 - Return the pointer to the right Data Block; BYTE_3[7]=0 - Program the right Data Block
+  ULONG ulMemoryModuleNumber:7;     // BYTE_3[6:0]
+  ULONG ulClockFreq:24;
+#else
+  ULONG ulClockFreq:24;
+  ULONG ulMemoryModuleNumber:7;     // BYTE_3[6:0]
+  ULONG ulPointerReturnFlag:1;      // BYTE_3[7]=1 - Return the pointer to the right Data Block; BYTE_3[7]=0 - Program the right Data Block
+#endif
+}ATOM_ADJUST_MEMORY_CLOCK_FREQ;
+#define POINTER_RETURN_FLAG             0x80
 
-static inline void musb_write_ulpi_buscontrol(void __iomem *mbase, u8 val)
+typedef struct _COMPUTE_MEMORY_ENGINE_PLL_PARAMETERS
 {
-	musb_writeb(mbase, MUSB_ULPI_BUSCONTROL, val);
-}
+  ULONG   ulClock;        //When returen, it's the re-calculated clock based on given Fb_div Post_Div and ref_div
+  UCHAR   ucAction;       //0:reserved //1:Memory //2:Engine
+  UCHAR   ucReserved;     //may expand to return larger Fbdiv later
+  UCHAR   ucFbDiv;        //return value
+  UCHAR   ucPostDiv;      //return value
+}COMPUTE_MEMORY_ENGINE_PLL_PARAMETERS;
 
-static inline u8 musb_read_txfifosz(void __iomem *mbase)
+typedef struct _COMPUTE_MEMORY_ENGINE_PLL_PARAMETERS_V2
 {
-	return musb_readb(mbase, MUSB_TXFIFOSZ);
-}
+  ULONG   ulClock;        //When return, [23:0] return real clock
+  UCHAR   ucAction;       //0:reserved;COMPUTE_MEMORY_PLL_PARAM:Memory;COMPUTE_ENGINE_PLL_PARAM:Engine. it return ref_div to be written to register
+  USHORT  usFbDiv;          //return Feedback value to be written to register
+  UCHAR   ucPostDiv;      //return post div to be written to register
+}COMPUTE_MEMORY_ENGINE_PLL_PARAMETERS_V2;
 
-static inline u16 musb_read_txfifoadd(void __iomem *mbase)
+#define COMPUTE_MEMORY_ENGINE_PLL_PARAMETERS_PS_ALLOCATION   COMPUTE_MEMORY_ENGINE_PLL_PARAMETERS
+
+#define SET_CLOCK_FREQ_MASK                       0x00FFFFFF  //Clock change tables only take bit [23:0] as the requested clock value
+#define USE_NON_BUS_CLOCK_MASK                    0x01000000  //Applicable to both memory and engine clock change, when set, it uses another clock as the temporary clock (engine uses memory and vice versa)
+#define USE_MEMORY_SELF_REFRESH_MASK              0x02000000   //Only applicable to memory clock change, when set, using memory self refresh during clock transition
+#define SKIP_INTERNAL_MEMORY_PARAMETER_CHANGE     0x04000000  //Only applicable to memory clock change, when set, the table will skip predefined internal memory parameter change
+#define FIRST_TIME_CHANGE_CLOCK                   0x08000000   //Applicable to both memory and engine clock change,when set, it means this is 1st time to change clock after ASIC bootup
+#define SKIP_SW_PROGRAM_PLL                       0x10000000   //Applicable to both memory and engine clock change, when set, it means the table will not program SPLL/MPLL
+#define USE_SS_ENABLED_PIXEL_CLOCK                USE_NON_BUS_CLOCK_MASK
+
+#define b3USE_NON_BUS_CLOCK_MASK                  0x01       //Applicable to both memory and engine clock change, when set, it uses another clock as the temporary clock (engine uses memory and vice versa)
+#define b3USE_MEMORY_SELF_REFRESH                 0x02        //Only applicable to memory clock change, when set, using memory self refresh during clock transition
+#define b3SKIP_INTERNAL_MEMORY_PARAMETER_CHANGE   0x04       //Only applicable to memory clock change, when set, the table will skip predefined internal memory parameter change
+#define b3FIRST_TIME_CHANGE_CLOCK                 0x08       //Applicable to both memory and engine clock change,when set, it means this is 1st time to change clock after ASIC bootup
+#define b3SKIP_SW_PROGRAM_PLL                     0x10       //Applicable to both memory and engine clock change, when set, it means the table will not program SPLL/MPLL
+#define b3DRAM_SELF_REFRESH_EXIT                  0x20       //Applicable to DRAM self refresh exit only. when set, it means it will go to program DRAM self refresh exit path
+
+typedef struct _ATOM_COMPUTE_CLOCK_FREQ
 {
-	return musb_readw(mbase, MUSB_TXFIFOADD);
-}
+#if ATOM_BIG_ENDIAN
+  ULONG ulComputeClockFlag:8;                 // =1: COMPUTE_MEMORY_PLL_PARAM, =2: COMPUTE_ENGINE_PLL_PARAM
+  ULONG ulClockFreq:24;                       // in unit of 10kHz
+#else
+  ULONG ulClockFreq:24;                       // in unit of 10kHz
+  ULONG ulComputeClockFlag:8;                 // =1: COMPUTE_MEMORY_PLL_PARAM, =2: COMPUTE_ENGINE_PLL_PARAM
+#endif
+}ATOM_COMPUTE_CLOCK_FREQ;
 
-static inline u8 musb_read_rxfifosz(void __iomem *mbase)
+typedef struct _ATOM_S_MPLL_FB_DIVIDER
 {
-	return musb_readb(mbase, MUSB_RXFIFOSZ);
-}
+  USHORT usFbDivFrac;
+  USHORT usFbDiv;
+}ATOM_S_MPLL_FB_DIVIDER;
 
-static inline u16  musb_read_rxfifoadd(void __iomem *mbase)
-{
-	return musb_readw(mbase, MUSB_RXFIFOADD);
-}
-
-static inline u8 musb_read_ulpi_buscontrol(void __iomem *mbase)
-{
-	return musb_readb(mbase, MUSB_ULPI_BUSCONTROL);
-}
-
-static inline u8 musb_read_configdata(void __iomem *mbase)
-{
-	musb_writeb(mbase, MUSB_INDEX, 0);
-	return musb_readb(mbase, 0x10 + MUSB_CONFIGDATA);
-}
-
-static inline u16 musb_read_hwvers(void __iomem *mbase)
-{
-	return musb_readw(mbase, MUSB_HWVERS);
-}
-
-static inline void musb_write_rxfunaddr(struct musb *musb, u8 epnum,
-		u8 qh_addr_reg)
-{
-	musb_writeb(musb->mregs,
-		    musb->io.busctl_offset(epnum, MUSB_RXFUNCADDR),
-		    qh_addr_reg);
-}
-
-static inline void musb_write_rxhubaddr(struct musb *musb, u8 epnum,
-		u8 qh_h_addr_reg)
-{
-	musb_writeb(musb->mregs, musb->io.busctl_offset(epnum, MUSB_RXHUBADDR),
-			qh_h_addr_reg);
-}
-
-static inline void musb_write_rxhubport(struct musb *musb, u8 epnum,
-		u8 qh_h_port_reg)
-{
-	musb_writeb(musb->mregs, musb->io.busctl_offset(epnum, MUSB_RXHUBPORT),
-			qh_h_port_reg);
-}
-
-static inline void musb_write_txfunaddr(struct musb *musb, u8 epnum,
-		u8 qh_addr_reg)
-{
-	musb_writeb(musb->mregs,
-		    musb->io.busctl_offset(epnum, MUSB_TXFUNCADDR),
-		    qh_addr_reg);
-}
-
-static inline void musb_write_txhubaddr(struct musb *musb, u8 epnum,
-		u8 qh_addr_reg)
-{
-	musb_writeb(musb->mregs, musb->io.busctl_offset(epnum, MUSB_TXHUBADDR),
-			qh_addr_reg);
-}
-
-static inline void musb_write_txhubport(struct musb *musb, u8 epnum,
-		u8 qh_h_port_reg)
-{
-	musb_writeb(musb->mregs, musb->io.busctl_offset(epnum, MUSB_TXHUBPORT),
-			qh_h_port_reg);
-}
-
-static inline u8 musb_read_rxfunaddr(struct musb *musb, u8 epnum)
-{
-	return musb_readb(musb->mregs,
-			  musb->io.busctl_offset(epnum, MUSB_RXFUNCADDR));
-}
-
-static inline u8 musb_read_rxhubaddr(struct musb *musb, u8 epnum)
-{
-	return musb_readb(musb->mregs,
-			  musb->io.busctl_offset(epnum, MUSB_RXHUBADDR));
-}
-
-static inline u8 musb_read_rxhubport(struct musb *musb, u8 epnum)
-{
-	return musb_readb(musb->mregs,
-			  musb->io.busctl_offset(epnum, MUSB_RXHUBPORT));
-}
-
-static inline u8 musb_read_txfunaddr(struct musb *musb, u8 epnum)
-{
-	return musb_readb(musb->mregs,
-			  musb->io.busctl_offset(epnum, MUSB_TXFUNCADDR));
-}
-
-static inline u8 musb_read_txhubaddr(struct musb *musb, u8 epnum)
-{
-	return musb_readb(musb->mregs,
-			  musb->io.busctl_offset(epnum, MUSB_TXHUBADDR));
-}
-
-static inline u8 musb_read_txhubport(struct musb *musb, u8 epnum)
-{
-	return musb_readb(musb->mregs,
-			  musb->io.busctl_offset(epnum, MUSB_TXHUBPORT));
-}
-
-#else /* CONFIG_BLACKFIN */
-
-#define USB_BASE		USB_FADDR
-#define USB_OFFSET(reg)		(reg - USB_BASE)
-
-/*
- * Common USB registers
- */
-#define MUSB_FADDR		USB_OFFSET(USB_FADDR)	/* 8-bit */
-#define MUSB_POWER		USB_OFFSET(USB_POWER)	/* 8-bit */
-#define MUSB_INTRTX		USB_OFFSET(USB_INTRTX)	/* 16-bit */
-#define MUSB_INTRRX		USB_OFFSET(USB_INTRRX)
-#define MUSB_INTRTXE		USB_OFFSET(USB_INTRTXE)
-#define MUSB_INTRRXE		USB_OFFSET(USB_INTRRXE)
-#define MUSB_INTRUSB		USB_OFFSET(USB_INTRUSB)	/* 8 bit */
-#define MUSB_INTRUSBE		USB_OFFSET(USB_INTRUSBE)/* 8 bit */
-#define MUSB_FRAME		USB_OFFSET(USB_FRAME)
-#define MUSB_INDEX		USB_OFFSET(USB_INDEX)	/* 8 bit */
-#define MUSB_TESTMODE		USB_OFFSET(USB_TESTMODE)/* 8 bit */
-
-/*
- * Additional Control Registers
- */
-
-#define MUSB_DEVCTL		USB_OFFSET(USB_OTG_DEV_CTL)	/* 8 bit */
-
-#define MUSB_LINKINFO		USB_OFFSET(USB_LINKINFO)/* 8 bit */
-#define MUSB_VPLEN		USB_OFFSET(USB_VPLEN)	/* 8 bit */
-#define MUSB_HS_EOF1		USB_OFFSET(USB_HS_EOF1)	/* 8 bit */
-#define MUSB_FS_EOF1		USB_OFFSET(USB_FS_EOF1)	/* 8 bit */
-#define MUSB_LS_EOF1		USB_OFFSET(USB_LS_EOF1)	/* 8 bit */
-
-/* Offsets to endpoint registers */
-#define MUSB_TXMAXP		0x00
-#define MUSB_TXCSR		0x04
-#define MUSB_CSR0		MUSB_TXCSR	/* Re-used for EP0 */
-#define MUSB_RXMAXP		0x08
-#define MUSB_RXCSR		0x0C
-#define MUSB_RXCOUNT		0x10
-#define MUSB_COUNT0		MUSB_RXCOUNT	/* Re-used for EP0 */
-#define MUSB_TXTYPE		0x14
-#define MUSB_TYPE0		MUSB_TXTYPE	/* Re-used for EP0 */
-#define MUSB_TXINTERVAL		0x18
-#define MUSB_NAKLIMIT0		MUSB_TXINTERVAL	/* Re-used for EP0 */
-#define MUSB_RXTYPE		0x1C
-#define MUSB_RXINTERVAL		0x20
-#define MUSB_TXCOUNT		0x28
-
-/* Offsets to endpoint registers in indexed model (using INDEX register) */
-#define MUSB_INDEXED_OFFSET(_epnum, _offset)	\
-	(0x40 + (_offset))
-
-/* Offsets to endpoint registers in flat models */
-#define MUSB_FLAT_OFFSET(_epnum, _offset)	\
-	(USB_OFFSET(USB_EP_NI0_TXMAXP) + (0x40 * (_epnum)) + (_offset))
-
-/* Not implemented - HW has separate Tx/Rx FIFO */
-#define MUSB_TXCSR_MODE			0x0000
-
-static inline void musb_write_txfifosz(void __iomem *mbase, u8 c_size)
-{
-}
-
-static inline void musb_write_txfifoadd(void __iomem *mbase, u16 c_off)
-{
-}
-
-static inline void musb_write_rxfifosz(void __iomem *mbase, u8 c_size)
-{
-}
-
-static inline void  musb_write_rxfifoadd(void __iomem *mbase, u16 c_off)
-{
-}
-
-static inline void musb_write_ulpi_buscontrol(void __iomem *mbase, u8 val)
-{
-}
-
-static inline u8 musb_read_txfifosz(void __iomem *mbase)
-{
-	return 0;
-}
-
-static inline u16 musb_read_txfifoadd(void __iomem *mbase)
-{
-	return 0;
-}
-
-static inline u8 musb_read_rxfifosz(void __iomem *mbase)
-{
-	return 0;
-}
-
-static inline u16  musb_read_rxfifoadd(void __iomem *mbase)
-{
-	return 0;
-}
-
-static inline u8 musb_read_ulpi_buscontrol(void __iomem *mbase)
-{
-	return 0;
-}
-
-static inline u8 musb_read_configdata(void __iomem *mbase)
-{
-	return 0;
-}
-
-static inline u16 musb_read_hwvers(void __iomem *mbase)
-{
-	/*
-	 * This register is invisible on Blackfin, actually the MUSB
-	 * RTL version of Blackfin is 1.9, so just hardcode its value.
-	 */
-	return MUSB_HWVERS_1900;
-}
-
-static inline void musb_write_rxfunaddr(void __iomem *mbase, u8 epnum,
-		u8 qh_addr_req)
-{
-}
-
-static inline void musb_write_rxhubaddr(void __iomem *mbase, u8 epnum,
-		u8 qh_h_addr_reg)
-{
-}
-
-static inline void musb_write_rxhubport(void __iomem *mbase, u8 epnum,
-		u8 qh_h_port_reg)
-{
-}
-
-static inline void  musb_write_txfunaddr(void __iomem *mbase, u8 epnum,
-		u8 qh_addr_reg)
-{
-}
-
-static inline void  musb_write_txhubaddr(void __iomem *mbase, u8 epnum,
-		u8 qh_addr_reg)
-{
-}
-
-static inline void  musb_write_txhubport(void __iomem *mbase, u8 epnum,
-		u8 qh_h_port_reg)
-{
-}
-
-static inline u8 musb_read_rxfunaddr(void __iomem *mbase, u8 epnum)
-{
-	return 0;
-}
-
-static inline u8 musb_read_rxhubaddr(void __iomem *mbase, u8 epnum)
-{
-	return 0;
-}
-
-static inline u8 musb_read_rxhubport(void __iomem *mbase, u8 epnum)
-{
-	return 0;
-}
-
-static inline u8  musb_read_txfunaddr(void __iomem *mbase, u8 epnum)
-{
-	return 0;
-}
-
-static inline u8  musb_read_txhubaddr(void __iomem *mbase, u8 epnum)
-{
-	return 0;
-}
-
-static inline u8 musb_read_txhubport(void __iomem *mbase, u8 epnum)
-{
-	return 0;
-}
-
-#endif /* CONFIG_BLACKFIN */
-
-#endif	/* __MUSB_REGS_H__ */
+typedef struct _COMPUTE_MEMORY_ENGINE_P

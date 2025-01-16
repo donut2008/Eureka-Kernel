@@ -1,1038 +1,1081 @@
-/*
- * iSCSI Initiator over TCP/IP Data-Path
- *
- * Copyright (C) 2004 Dmitry Yusupov
- * Copyright (C) 2004 Alex Aizman
- * Copyright (C) 2005 - 2006 Mike Christie
- * Copyright (C) 2006 Red Hat, Inc.  All rights reserved.
- * maintained by open-iscsi@googlegroups.com
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published
- * by the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
- * General Public License for more details.
- *
- * See the file COPYING included with this distribution for more details.
- *
- * Credits:
- *	Christoph Hellwig
- *	FUJITA Tomonori
- *	Arne Redlich
- *	Zhenyu Wang
- */
+ far).  Return the programmed destination start address in
+		 * this case.
+		 */
+		if (addr == 0)
+			addr = omap_dma_chan_read(c, CDSA);
+	}
 
-#include <linux/types.h>
-#include <linux/inet.h>
-#include <linux/slab.h>
-#include <linux/file.h>
-#include <linux/blkdev.h>
-#include <linux/crypto.h>
-#include <linux/delay.h>
-#include <linux/kfifo.h>
-#include <linux/scatterlist.h>
-#include <linux/module.h>
-#include <net/tcp.h>
-#include <scsi/scsi_cmnd.h>
-#include <scsi/scsi_device.h>
-#include <scsi/scsi_host.h>
-#include <scsi/scsi.h>
-#include <scsi/scsi_transport_iscsi.h>
+	if (dma_omap1())
+		addr |= omap_dma_chan_read(c, CDSA) & 0xffff0000;
 
-#include "iscsi_tcp.h"
-
-MODULE_AUTHOR("Mike Christie <michaelc@cs.wisc.edu>, "
-	      "Dmitry Yusupov <dmitry_yus@yahoo.com>, "
-	      "Alex Aizman <itn780@yahoo.com>");
-MODULE_DESCRIPTION("iSCSI/TCP data-path");
-MODULE_LICENSE("GPL");
-
-static struct scsi_transport_template *iscsi_sw_tcp_scsi_transport;
-static struct scsi_host_template iscsi_sw_tcp_sht;
-static struct iscsi_transport iscsi_sw_tcp_transport;
-
-static unsigned int iscsi_max_lun = ~0;
-module_param_named(max_lun, iscsi_max_lun, uint, S_IRUGO);
-
-static int iscsi_sw_tcp_dbg;
-module_param_named(debug_iscsi_tcp, iscsi_sw_tcp_dbg, int,
-		   S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(debug_iscsi_tcp, "Turn on debugging for iscsi_tcp module "
-		 "Set to 1 to turn on, and zero to turn off. Default is off.");
-
-#define ISCSI_SW_TCP_DBG(_conn, dbg_fmt, arg...)		\
-	do {							\
-		if (iscsi_sw_tcp_dbg)				\
-			iscsi_conn_printk(KERN_INFO, _conn,	\
-					     "%s " dbg_fmt,	\
-					     __func__, ##arg);	\
-	} while (0);
-
-
-/**
- * iscsi_sw_tcp_recv - TCP receive in sendfile fashion
- * @rd_desc: read descriptor
- * @skb: socket buffer
- * @offset: offset in skb
- * @len: skb->len - offset
- */
-static int iscsi_sw_tcp_recv(read_descriptor_t *rd_desc, struct sk_buff *skb,
-			     unsigned int offset, size_t len)
-{
-	struct iscsi_conn *conn = rd_desc->arg.data;
-	unsigned int consumed, total_consumed = 0;
-	int status;
-
-	ISCSI_SW_TCP_DBG(conn, "in %d bytes\n", skb->len - offset);
-
-	do {
-		status = 0;
-		consumed = iscsi_tcp_recv_skb(conn, skb, offset, 0, &status);
-		offset += consumed;
-		total_consumed += consumed;
-	} while (consumed != 0 && status != ISCSI_TCP_SKB_DONE);
-
-	ISCSI_SW_TCP_DBG(conn, "read %d bytes status %d\n",
-			 skb->len - offset, status);
-	return total_consumed;
+	return addr;
 }
 
-/**
- * iscsi_sw_sk_state_check - check socket state
- * @sk: socket
- *
- * If the socket is in CLOSE or CLOSE_WAIT we should
- * not close the connection if there is still some
- * data pending.
- *
- * Must be called with sk_callback_lock.
- */
-static inline int iscsi_sw_sk_state_check(struct sock *sk)
+static enum dma_status omap_dma_tx_status(struct dma_chan *chan,
+	dma_cookie_t cookie, struct dma_tx_state *txstate)
 {
-	struct iscsi_conn *conn = sk->sk_user_data;
+	struct omap_chan *c = to_omap_dma_chan(chan);
+	struct virt_dma_desc *vd;
+	enum dma_status ret;
+	unsigned long flags;
 
-	if ((sk->sk_state == TCP_CLOSE_WAIT || sk->sk_state == TCP_CLOSE) &&
-	    (conn->session->state != ISCSI_STATE_LOGGING_OUT) &&
-	    !atomic_read(&sk->sk_rmem_alloc)) {
-		ISCSI_SW_TCP_DBG(conn, "TCP_CLOSE|TCP_CLOSE_WAIT\n");
-		iscsi_conn_failure(conn, ISCSI_ERR_TCP_CONN_CLOSE);
-		return -ECONNRESET;
+	ret = dma_cookie_status(chan, cookie, txstate);
+	if (ret == DMA_COMPLETE || !txstate)
+		return ret;
+
+	spin_lock_irqsave(&c->vc.lock, flags);
+	vd = vchan_find_desc(&c->vc, cookie);
+	if (vd) {
+		txstate->residue = omap_dma_desc_size(to_omap_dma_desc(&vd->tx));
+	} else if (c->desc && c->desc->vd.tx.cookie == cookie) {
+		struct omap_desc *d = c->desc;
+		dma_addr_t pos;
+
+		if (d->dir == DMA_MEM_TO_DEV)
+			pos = omap_dma_get_src_pos(c);
+		else if (d->dir == DMA_DEV_TO_MEM)
+			pos = omap_dma_get_dst_pos(c);
+		else
+			pos = 0;
+
+		txstate->residue = omap_dma_desc_size_pos(d, pos);
+	} else {
+		txstate->residue = 0;
 	}
+	spin_unlock_irqrestore(&c->vc.lock, flags);
+
+	return ret;
+}
+
+static void omap_dma_issue_pending(struct dma_chan *chan)
+{
+	struct omap_chan *c = to_omap_dma_chan(chan);
+	unsigned long flags;
+
+	spin_lock_irqsave(&c->vc.lock, flags);
+	if (vchan_issue_pending(&c->vc) && !c->desc) {
+		/*
+		 * c->cyclic is used only by audio and in this case the DMA need
+		 * to be started without delay.
+		 */
+		if (!c->cyclic) {
+			struct omap_dmadev *d = to_omap_dma_dev(chan->device);
+			spin_lock(&d->lock);
+			if (list_empty(&c->node))
+				list_add_tail(&c->node, &d->pending);
+			spin_unlock(&d->lock);
+			tasklet_schedule(&d->task);
+		} else {
+			omap_dma_start_desc(c);
+		}
+	}
+	spin_unlock_irqrestore(&c->vc.lock, flags);
+}
+
+static struct dma_async_tx_descriptor *omap_dma_prep_slave_sg(
+	struct dma_chan *chan, struct scatterlist *sgl, unsigned sglen,
+	enum dma_transfer_direction dir, unsigned long tx_flags, void *context)
+{
+	struct omap_dmadev *od = to_omap_dma_dev(chan->device);
+	struct omap_chan *c = to_omap_dma_chan(chan);
+	enum dma_slave_buswidth dev_width;
+	struct scatterlist *sgent;
+	struct omap_desc *d;
+	dma_addr_t dev_addr;
+	unsigned i, j = 0, es, en, frame_bytes;
+	u32 burst;
+
+	if (dir == DMA_DEV_TO_MEM) {
+		dev_addr = c->cfg.src_addr;
+		dev_width = c->cfg.src_addr_width;
+		burst = c->cfg.src_maxburst;
+	} else if (dir == DMA_MEM_TO_DEV) {
+		dev_addr = c->cfg.dst_addr;
+		dev_width = c->cfg.dst_addr_width;
+		burst = c->cfg.dst_maxburst;
+	} else {
+		dev_err(chan->device->dev, "%s: bad direction?\n", __func__);
+		return NULL;
+	}
+
+	/* Bus width translates to the element size (ES) */
+	switch (dev_width) {
+	case DMA_SLAVE_BUSWIDTH_1_BYTE:
+		es = CSDP_DATA_TYPE_8;
+		break;
+	case DMA_SLAVE_BUSWIDTH_2_BYTES:
+		es = CSDP_DATA_TYPE_16;
+		break;
+	case DMA_SLAVE_BUSWIDTH_4_BYTES:
+		es = CSDP_DATA_TYPE_32;
+		break;
+	default: /* not reached */
+		return NULL;
+	}
+
+	/* Now allocate and setup the descriptor. */
+	d = kzalloc(sizeof(*d) + sglen * sizeof(d->sg[0]), GFP_ATOMIC);
+	if (!d)
+		return NULL;
+
+	d->dir = dir;
+	d->dev_addr = dev_addr;
+	d->es = es;
+
+	d->ccr = c->ccr | CCR_SYNC_FRAME;
+	if (dir == DMA_DEV_TO_MEM)
+		d->ccr |= CCR_DST_AMODE_POSTINC | CCR_SRC_AMODE_CONSTANT;
+	else
+		d->ccr |= CCR_DST_AMODE_CONSTANT | CCR_SRC_AMODE_POSTINC;
+
+	d->cicr = CICR_DROP_IE | CICR_BLOCK_IE;
+	d->csdp = es;
+
+	if (dma_omap1()) {
+		d->cicr |= CICR_TOUT_IE;
+
+		if (dir == DMA_DEV_TO_MEM)
+			d->csdp |= CSDP_DST_PORT_EMIFF | CSDP_SRC_PORT_TIPB;
+		else
+			d->csdp |= CSDP_DST_PORT_TIPB | CSDP_SRC_PORT_EMIFF;
+	} else {
+		if (dir == DMA_DEV_TO_MEM)
+			d->ccr |= CCR_TRIGGER_SRC;
+
+		d->cicr |= CICR_MISALIGNED_ERR_IE | CICR_TRANS_ERR_IE;
+	}
+	if (od->plat->errata & DMA_ERRATA_PARALLEL_CHANNELS)
+		d->clnk_ctrl = c->dma_ch;
+
+	/*
+	 * Build our scatterlist entries: each contains the address,
+	 * the number of elements (EN) in each frame, and the number of
+	 * frames (FN).  Number of bytes for this entry = ES * EN * FN.
+	 *
+	 * Burst size translates to number of elements with frame sync.
+	 * Note: DMA engine defines burst to be the number of dev-width
+	 * transfers.
+	 */
+	en = burst;
+	frame_bytes = es_bytes[es] * en;
+	for_each_sg(sgl, sgent, sglen, i) {
+		d->sg[j].addr = sg_dma_address(sgent);
+		d->sg[j].en = en;
+		d->sg[j].fn = sg_dma_len(sgent) / frame_bytes;
+		j++;
+	}
+
+	d->sglen = j;
+
+	return vchan_tx_prep(&c->vc, &d->vd, tx_flags);
+}
+
+static struct dma_async_tx_descriptor *omap_dma_prep_dma_cyclic(
+	struct dma_chan *chan, dma_addr_t buf_addr, size_t buf_len,
+	size_t period_len, enum dma_transfer_direction dir, unsigned long flags,
+	void *context)
+{
+	struct omap_dmadev *od = to_omap_dma_dev(chan->device);
+	struct omap_chan *c = to_omap_dma_chan(chan);
+	enum dma_slave_buswidth dev_width;
+	struct omap_desc *d;
+	dma_addr_t dev_addr;
+	unsigned es;
+	u32 burst;
+
+	if (dir == DMA_DEV_TO_MEM) {
+		dev_addr = c->cfg.src_addr;
+		dev_width = c->cfg.src_addr_width;
+		burst = c->cfg.src_maxburst;
+	} else if (dir == DMA_MEM_TO_DEV) {
+		dev_addr = c->cfg.dst_addr;
+		dev_width = c->cfg.dst_addr_width;
+		burst = c->cfg.dst_maxburst;
+	} else {
+		dev_err(chan->device->dev, "%s: bad direction?\n", __func__);
+		return NULL;
+	}
+
+	/* Bus width translates to the element size (ES) */
+	switch (dev_width) {
+	case DMA_SLAVE_BUSWIDTH_1_BYTE:
+		es = CSDP_DATA_TYPE_8;
+		break;
+	case DMA_SLAVE_BUSWIDTH_2_BYTES:
+		es = CSDP_DATA_TYPE_16;
+		break;
+	case DMA_SLAVE_BUSWIDTH_4_BYTES:
+		es = CSDP_DATA_TYPE_32;
+		break;
+	default: /* not reached */
+		return NULL;
+	}
+
+	/* Now allocate and setup the descriptor. */
+	d = kzalloc(sizeof(*d) + sizeof(d->sg[0]), GFP_ATOMIC);
+	if (!d)
+		return NULL;
+
+	d->dir = dir;
+	d->dev_addr = dev_addr;
+	d->fi = burst;
+	d->es = es;
+	d->sg[0].addr = buf_addr;
+	d->sg[0].en = period_len / es_bytes[es];
+	d->sg[0].fn = buf_len / period_len;
+	d->sglen = 1;
+
+	d->ccr = c->ccr;
+	if (dir == DMA_DEV_TO_MEM)
+		d->ccr |= CCR_DST_AMODE_POSTINC | CCR_SRC_AMODE_CONSTANT;
+	else
+		d->ccr |= CCR_DST_AMODE_CONSTANT | CCR_SRC_AMODE_POSTINC;
+
+	d->cicr = CICR_DROP_IE;
+	if (flags & DMA_PREP_INTERRUPT)
+		d->cicr |= CICR_FRAME_IE;
+
+	d->csdp = es;
+
+	if (dma_omap1()) {
+		d->cicr |= CICR_TOUT_IE;
+
+		if (dir == DMA_DEV_TO_MEM)
+			d->csdp |= CSDP_DST_PORT_EMIFF | CSDP_SRC_PORT_MPUI;
+		else
+			d->csdp |= CSDP_DST_PORT_MPUI | CSDP_SRC_PORT_EMIFF;
+	} else {
+		if (burst)
+			d->ccr |= CCR_SYNC_PACKET;
+		else
+			d->ccr |= CCR_SYNC_ELEMENT;
+
+		if (dir == DMA_DEV_TO_MEM) {
+			d->ccr |= CCR_TRIGGER_SRC;
+			d->csdp |= CSDP_DST_PACKED;
+		} else {
+			d->csdp |= CSDP_SRC_PACKED;
+		}
+
+		d->cicr |= CICR_MISALIGNED_ERR_IE | CICR_TRANS_ERR_IE;
+
+		d->csdp |= CSDP_DST_BURST_64 | CSDP_SRC_BURST_64;
+	}
+
+	if (__dma_omap15xx(od->plat->dma_attr))
+		d->ccr |= CCR_AUTO_INIT | CCR_REPEAT;
+	else
+		d->clnk_ctrl = c->dma_ch | CLNK_CTRL_ENABLE_LNK;
+
+	c->cyclic = true;
+
+	return vchan_tx_prep(&c->vc, &d->vd, flags);
+}
+
+static struct dma_async_tx_descriptor *omap_dma_prep_dma_memcpy(
+	struct dma_chan *chan, dma_addr_t dest, dma_addr_t src,
+	size_t len, unsigned long tx_flags)
+{
+	struct omap_chan *c = to_omap_dma_chan(chan);
+	struct omap_desc *d;
+	uint8_t data_type;
+
+	d = kzalloc(sizeof(*d) + sizeof(d->sg[0]), GFP_ATOMIC);
+	if (!d)
+		return NULL;
+
+	data_type = __ffs((src | dest | len));
+	if (data_type > CSDP_DATA_TYPE_32)
+		data_type = CSDP_DATA_TYPE_32;
+
+	d->dir = DMA_MEM_TO_MEM;
+	d->dev_addr = src;
+	d->fi = 0;
+	d->es = data_type;
+	d->sg[0].en = len / BIT(data_type);
+	d->sg[0].fn = 1;
+	d->sg[0].addr = dest;
+	d->sglen = 1;
+	d->ccr = c->ccr;
+	d->ccr |= CCR_DST_AMODE_POSTINC | CCR_SRC_AMODE_POSTINC;
+
+	d->cicr = CICR_DROP_IE;
+	if (tx_flags & DMA_PREP_INTERRUPT)
+		d->cicr |= CICR_FRAME_IE;
+
+	d->csdp = data_type;
+
+	if (dma_omap1()) {
+		d->cicr |= CICR_TOUT_IE;
+		d->csdp |= CSDP_DST_PORT_EMIFF | CSDP_SRC_PORT_EMIFF;
+	} else {
+		d->csdp |= CSDP_DST_PACKED | CSDP_SRC_PACKED;
+		d->cicr |= CICR_MISALIGNED_ERR_IE | CICR_TRANS_ERR_IE;
+		d->csdp |= CSDP_DST_BURST_64 | CSDP_SRC_BURST_64;
+	}
+
+	return vchan_tx_prep(&c->vc, &d->vd, tx_flags);
+}
+
+static int omap_dma_slave_config(struct dma_chan *chan, struct dma_slave_config *cfg)
+{
+	struct omap_chan *c = to_omap_dma_chan(chan);
+
+	if (cfg->src_addr_width == DMA_SLAVE_BUSWIDTH_8_BYTES ||
+	    cfg->dst_addr_width == DMA_SLAVE_BUSWIDTH_8_BYTES)
+		return -EINVAL;
+
+	memcpy(&c->cfg, cfg, sizeof(c->cfg));
+
 	return 0;
 }
 
-static void iscsi_sw_tcp_data_ready(struct sock *sk)
+static int omap_dma_terminate_all(struct dma_chan *chan)
 {
-	struct iscsi_conn *conn;
-	struct iscsi_tcp_conn *tcp_conn;
-	read_descriptor_t rd_desc;
+	struct omap_chan *c = to_omap_dma_chan(chan);
+	struct omap_dmadev *d = to_omap_dma_dev(c->vc.chan.device);
+	unsigned long flags;
+	LIST_HEAD(head);
 
-	read_lock(&sk->sk_callback_lock);
-	conn = sk->sk_user_data;
-	if (!conn) {
-		read_unlock(&sk->sk_callback_lock);
-		return;
-	}
-	tcp_conn = conn->dd_data;
+	spin_lock_irqsave(&c->vc.lock, flags);
+
+	/* Prevent this channel being scheduled */
+	spin_lock(&d->lock);
+	list_del_init(&c->node);
+	spin_unlock(&d->lock);
 
 	/*
-	 * Use rd_desc to pass 'conn' to iscsi_tcp_recv.
-	 * We set count to 1 because we want the network layer to
-	 * hand us all the skbs that are available. iscsi_tcp_recv
-	 * handled pdus that cross buffers or pdus that still need data.
+	 * Stop DMA activity: we assume the callback will not be called
+	 * after omap_dma_stop() returns (even if it does, it will see
+	 * c->desc is NULL and exit.)
 	 */
-	rd_desc.arg.data = conn;
-	rd_desc.count = 1;
-	tcp_read_sock(sk, &rd_desc, iscsi_sw_tcp_recv);
-
-	iscsi_sw_sk_state_check(sk);
-
-	/* If we had to (atomically) map a highmem page,
-	 * unmap it now. */
-	iscsi_tcp_segment_unmap(&tcp_conn->in.segment);
-	read_unlock(&sk->sk_callback_lock);
-}
-
-static void iscsi_sw_tcp_state_change(struct sock *sk)
-{
-	struct iscsi_tcp_conn *tcp_conn;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn;
-	struct iscsi_conn *conn;
-	struct iscsi_session *session;
-	void (*old_state_change)(struct sock *);
-
-	read_lock(&sk->sk_callback_lock);
-	conn = sk->sk_user_data;
-	if (!conn) {
-		read_unlock(&sk->sk_callback_lock);
-		return;
-	}
-	session = conn->session;
-
-	iscsi_sw_sk_state_check(sk);
-
-	tcp_conn = conn->dd_data;
-	tcp_sw_conn = tcp_conn->dd_data;
-	old_state_change = tcp_sw_conn->old_state_change;
-
-	read_unlock(&sk->sk_callback_lock);
-
-	old_state_change(sk);
-}
-
-/**
- * iscsi_write_space - Called when more output buffer space is available
- * @sk: socket space is available for
- **/
-static void iscsi_sw_tcp_write_space(struct sock *sk)
-{
-	struct iscsi_conn *conn;
-	struct iscsi_tcp_conn *tcp_conn;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn;
-	void (*old_write_space)(struct sock *);
-
-	read_lock_bh(&sk->sk_callback_lock);
-	conn = sk->sk_user_data;
-	if (!conn) {
-		read_unlock_bh(&sk->sk_callback_lock);
-		return;
+	if (c->desc) {
+		omap_dma_desc_free(&c->desc->vd);
+		c->desc = NULL;
+		/* Avoid stopping the dma twice */
+		if (!c->paused)
+			omap_dma_stop(c);
 	}
 
-	tcp_conn = conn->dd_data;
-	tcp_sw_conn = tcp_conn->dd_data;
-	old_write_space = tcp_sw_conn->old_write_space;
-	read_unlock_bh(&sk->sk_callback_lock);
-
-	old_write_space(sk);
-
-	ISCSI_SW_TCP_DBG(conn, "iscsi_write_space\n");
-	iscsi_conn_queue_work(conn);
-}
-
-static void iscsi_sw_tcp_conn_set_callbacks(struct iscsi_conn *conn)
-{
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct sock *sk = tcp_sw_conn->sock->sk;
-
-	/* assign new callbacks */
-	write_lock_bh(&sk->sk_callback_lock);
-	sk->sk_user_data = conn;
-	tcp_sw_conn->old_data_ready = sk->sk_data_ready;
-	tcp_sw_conn->old_state_change = sk->sk_state_change;
-	tcp_sw_conn->old_write_space = sk->sk_write_space;
-	sk->sk_data_ready = iscsi_sw_tcp_data_ready;
-	sk->sk_state_change = iscsi_sw_tcp_state_change;
-	sk->sk_write_space = iscsi_sw_tcp_write_space;
-	write_unlock_bh(&sk->sk_callback_lock);
-}
-
-static void
-iscsi_sw_tcp_conn_restore_callbacks(struct iscsi_conn *conn)
-{
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct sock *sk = tcp_sw_conn->sock->sk;
-
-	/* restore socket callbacks, see also: iscsi_conn_set_callbacks() */
-	write_lock_bh(&sk->sk_callback_lock);
-	sk->sk_user_data    = NULL;
-	sk->sk_data_ready   = tcp_sw_conn->old_data_ready;
-	sk->sk_state_change = tcp_sw_conn->old_state_change;
-	sk->sk_write_space  = tcp_sw_conn->old_write_space;
-	sk->sk_no_check_tx = 0;
-	write_unlock_bh(&sk->sk_callback_lock);
-}
-
-/**
- * iscsi_sw_tcp_xmit_segment - transmit segment
- * @tcp_conn: the iSCSI TCP connection
- * @segment: the buffer to transmnit
- *
- * This function transmits as much of the buffer as
- * the network layer will accept, and returns the number of
- * bytes transmitted.
- *
- * If CRC hashing is enabled, the function will compute the
- * hash as it goes. When the entire segment has been transmitted,
- * it will retrieve the hash value and send it as well.
- */
-static int iscsi_sw_tcp_xmit_segment(struct iscsi_tcp_conn *tcp_conn,
-				     struct iscsi_segment *segment)
-{
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct socket *sk = tcp_sw_conn->sock;
-	unsigned int copied = 0;
-	int r = 0;
-
-	while (!iscsi_tcp_segment_done(tcp_conn, segment, 0, r)) {
-		struct scatterlist *sg;
-		unsigned int offset, copy;
-		int flags = 0;
-
-		r = 0;
-		offset = segment->copied;
-		copy = segment->size - offset;
-
-		if (segment->total_copied + segment->size < segment->total_size)
-			flags |= MSG_MORE;
-
-		/* Use sendpage if we can; else fall back to sendmsg */
-		if (!segment->data) {
-			sg = segment->sg;
-			offset += segment->sg_offset + sg->offset;
-			r = tcp_sw_conn->sendpage(sk, sg_page(sg), offset,
-						  copy, flags);
-		} else {
-			struct msghdr msg = { .msg_flags = flags };
-			struct kvec iov = {
-				.iov_base = segment->data + offset,
-				.iov_len = copy
-			};
-
-			r = kernel_sendmsg(sk, &msg, &iov, 1, copy);
-		}
-
-		if (r < 0) {
-			iscsi_tcp_segment_unmap(segment);
-			return r;
-		}
-		copied += r;
+	if (c->cyclic) {
+		c->cyclic = false;
+		c->paused = false;
 	}
-	return copied;
+
+	vchan_get_all_descriptors(&c->vc, &head);
+	spin_unlock_irqrestore(&c->vc.lock, flags);
+	vchan_dma_desc_free_list(&c->vc, &head);
+
+	return 0;
 }
 
-/**
- * iscsi_sw_tcp_xmit - TCP transmit
- **/
-static int iscsi_sw_tcp_xmit(struct iscsi_conn *conn)
+static int omap_dma_pause(struct dma_chan *chan)
 {
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct iscsi_segment *segment = &tcp_sw_conn->out.segment;
-	unsigned int consumed = 0;
-	int rc = 0;
+	struct omap_chan *c = to_omap_dma_chan(chan);
 
-	while (1) {
-		rc = iscsi_sw_tcp_xmit_segment(tcp_conn, segment);
-		/*
-		 * We may not have been able to send data because the conn
-		 * is getting stopped. libiscsi will know so propagate err
-		 * for it to do the right thing.
-		 */
-		if (rc == -EAGAIN)
+	/* Pause/Resume only allowed with cyclic mode */
+	if (!c->cyclic)
+		return -EINVAL;
+
+	if (!c->paused) {
+		omap_dma_stop(c);
+		c->paused = true;
+	}
+
+	return 0;
+}
+
+static int omap_dma_resume(struct dma_chan *chan)
+{
+	struct omap_chan *c = to_omap_dma_chan(chan);
+
+	/* Pause/Resume only allowed with cyclic mode */
+	if (!c->cyclic)
+		return -EINVAL;
+
+	if (c->paused) {
+		mb();
+
+		/* Restore channel link register */
+		omap_dma_chan_write(c, CLNK_CTRL, c->desc->clnk_ctrl);
+
+		omap_dma_start(c, c->desc);
+		c->paused = false;
+	}
+
+	return 0;
+}
+
+static int omap_dma_chan_init(struct omap_dmadev *od)
+{
+	struct omap_chan *c;
+
+	c = kzalloc(sizeof(*c), GFP_KERNEL);
+	if (!c)
+		return -ENOMEM;
+
+	c->reg_map = od->reg_map;
+	c->vc.desc_free = omap_dma_desc_free;
+	vchan_init(&c->vc, &od->ddev);
+	INIT_LIST_HEAD(&c->node);
+
+	return 0;
+}
+
+static void omap_dma_free(struct omap_dmadev *od)
+{
+	tasklet_kill(&od->task);
+	while (!list_empty(&od->ddev.channels)) {
+		struct omap_chan *c = list_first_entry(&od->ddev.channels,
+			struct omap_chan, vc.chan.device_node);
+
+		list_del(&c->vc.chan.device_node);
+		tasklet_kill(&c->vc.task);
+		kfree(c);
+	}
+}
+
+#define OMAP_DMA_BUSWIDTHS	(BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) | \
+				 BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) | \
+				 BIT(DMA_SLAVE_BUSWIDTH_4_BYTES))
+
+static int omap_dma_probe(struct platform_device *pdev)
+{
+	struct omap_dmadev *od;
+	struct resource *res;
+	int rc, i, irq;
+
+	od = devm_kzalloc(&pdev->dev, sizeof(*od), GFP_KERNEL);
+	if (!od)
+		return -ENOMEM;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	od->base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(od->base))
+		return PTR_ERR(od->base);
+
+	od->plat = omap_get_plat_info();
+	if (!od->plat)
+		return -EPROBE_DEFER;
+
+	od->reg_map = od->plat->reg_map;
+
+	dma_cap_set(DMA_SLAVE, od->ddev.cap_mask);
+	dma_cap_set(DMA_CYCLIC, od->ddev.cap_mask);
+	dma_cap_set(DMA_MEMCPY, od->ddev.cap_mask);
+	od->ddev.device_alloc_chan_resources = omap_dma_alloc_chan_resources;
+	od->ddev.device_free_chan_resources = omap_dma_free_chan_resources;
+	od->ddev.device_tx_status = omap_dma_tx_status;
+	od->ddev.device_issue_pending = omap_dma_issue_pending;
+	od->ddev.device_prep_slave_sg = omap_dma_prep_slave_sg;
+	od->ddev.device_prep_dma_cyclic = omap_dma_prep_dma_cyclic;
+	od->ddev.device_prep_dma_memcpy = omap_dma_prep_dma_memcpy;
+	od->ddev.device_config = omap_dma_slave_config;
+	od->ddev.device_pause = omap_dma_pause;
+	od->ddev.device_resume = omap_dma_resume;
+	od->ddev.device_terminate_all = omap_dma_terminate_all;
+	od->ddev.src_addr_widths = OMAP_DMA_BUSWIDTHS;
+	od->ddev.dst_addr_widths = OMAP_DMA_BUSWIDTHS;
+	od->ddev.directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
+	od->ddev.residue_granularity = DMA_RESIDUE_GRANULARITY_BURST;
+	od->ddev.dev = &pdev->dev;
+	INIT_LIST_HEAD(&od->ddev.channels);
+	INIT_LIST_HEAD(&od->pending);
+	spin_lock_init(&od->lock);
+	spin_lock_init(&od->irq_lock);
+
+	tasklet_init(&od->task, omap_dma_sched, (unsigned long)od);
+
+	od->dma_requests = OMAP_SDMA_REQUESTS;
+	if (pdev->dev.of_node && of_property_read_u32(pdev->dev.of_node,
+						      "dma-requests",
+						      &od->dma_requests)) {
+		dev_info(&pdev->dev,
+			 "Missing dma-requests property, using %u.\n",
+			 OMAP_SDMA_REQUESTS);
+	}
+
+	for (i = 0; i < OMAP_SDMA_CHANNELS; i++) {
+		rc = omap_dma_chan_init(od);
+		if (rc) {
+			omap_dma_free(od);
 			return rc;
-		else if (rc < 0) {
-			rc = ISCSI_ERR_XMIT_FAILED;
-			goto error;
-		} else if (rc == 0)
-			break;
-
-		consumed += rc;
-
-		if (segment->total_copied >= segment->total_size) {
-			if (segment->done != NULL) {
-				rc = segment->done(tcp_conn, segment);
-				if (rc != 0)
-					goto error;
-			}
 		}
 	}
 
-	ISCSI_SW_TCP_DBG(conn, "xmit %d bytes\n", consumed);
+	irq = platform_get_irq(pdev, 1);
+	if (irq <= 0) {
+		dev_info(&pdev->dev, "failed to get L1 IRQ: %d\n", irq);
+		od->legacy = true;
+	} else {
+		/* Disable all interrupts */
+		od->irq_enable_mask = 0;
+		omap_dma_glbl_write(od, IRQENABLE_L1, 0);
 
-	conn->txdata_octets += consumed;
-	return consumed;
-
-error:
-	/* Transmit error. We could initiate error recovery
-	 * here. */
-	ISCSI_SW_TCP_DBG(conn, "Error sending PDU, errno=%d\n", rc);
-	iscsi_conn_failure(conn, rc);
-	return -EIO;
-}
-
-/**
- * iscsi_tcp_xmit_qlen - return the number of bytes queued for xmit
- */
-static inline int iscsi_sw_tcp_xmit_qlen(struct iscsi_conn *conn)
-{
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct iscsi_segment *segment = &tcp_sw_conn->out.segment;
-
-	return segment->total_copied - segment->total_size;
-}
-
-static int iscsi_sw_tcp_pdu_xmit(struct iscsi_task *task)
-{
-	struct iscsi_conn *conn = task->conn;
-	unsigned long pflags = current->flags;
-	int rc = 0;
-
-	current->flags |= PF_MEMALLOC;
-
-	while (iscsi_sw_tcp_xmit_qlen(conn)) {
-		rc = iscsi_sw_tcp_xmit(conn);
-		if (rc == 0) {
-			rc = -EAGAIN;
-			break;
+		rc = devm_request_irq(&pdev->dev, irq, omap_dma_irq,
+				      IRQF_SHARED, "omap-dma-engine", od);
+		if (rc) {
+			omap_dma_free(od);
+			return rc;
 		}
-		if (rc < 0)
-			break;
-		rc = 0;
 	}
 
-	tsk_restore_flags(current, pflags, PF_MEMALLOC);
+	rc = dma_async_device_register(&od->ddev);
+	if (rc) {
+		pr_warn("OMAP-DMA: failed to register slave DMA engine device: %d\n",
+			rc);
+		omap_dma_free(od);
+		return rc;
+	}
+
+	platform_set_drvdata(pdev, od);
+
+	if (pdev->dev.of_node) {
+		omap_dma_info.dma_cap = od->ddev.cap_mask;
+
+		/* Device-tree DMA controller registration */
+		rc = of_dma_controller_register(pdev->dev.of_node,
+				of_dma_simple_xlate, &omap_dma_info);
+		if (rc) {
+			pr_warn("OMAP-DMA: failed to register DMA controller\n");
+			dma_async_device_unregister(&od->ddev);
+			omap_dma_free(od);
+		}
+	}
+
+	dev_info(&pdev->dev, "OMAP DMA engine driver\n");
+
 	return rc;
 }
 
-/*
- * This is called when we're done sending the header.
- * Simply copy the data_segment to the send segment, and return.
- */
-static int iscsi_sw_tcp_send_hdr_done(struct iscsi_tcp_conn *tcp_conn,
-				      struct iscsi_segment *segment)
+static int omap_dma_remove(struct platform_device *pdev)
 {
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
+	struct omap_dmadev *od = platform_get_drvdata(pdev);
 
-	tcp_sw_conn->out.segment = tcp_sw_conn->out.data_segment;
-	ISCSI_SW_TCP_DBG(tcp_conn->iscsi_conn,
-			 "Header done. Next segment size %u total_size %u\n",
-			 tcp_sw_conn->out.segment.size,
-			 tcp_sw_conn->out.segment.total_size);
-	return 0;
-}
+	if (pdev->dev.of_node)
+		of_dma_controller_free(pdev->dev.of_node);
 
-static void iscsi_sw_tcp_send_hdr_prep(struct iscsi_conn *conn, void *hdr,
-				       size_t hdrlen)
-{
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
+	dma_async_device_unregister(&od->ddev);
 
-	ISCSI_SW_TCP_DBG(conn, "%s\n", conn->hdrdgst_en ?
-			 "digest enabled" : "digest disabled");
-
-	/* Clear the data segment - needs to be filled in by the
-	 * caller using iscsi_tcp_send_data_prep() */
-	memset(&tcp_sw_conn->out.data_segment, 0,
-	       sizeof(struct iscsi_segment));
-
-	/* If header digest is enabled, compute the CRC and
-	 * place the digest into the same buffer. We make
-	 * sure that both iscsi_tcp_task and mtask have
-	 * sufficient room.
-	 */
-	if (conn->hdrdgst_en) {
-		iscsi_tcp_dgst_header(&tcp_sw_conn->tx_hash, hdr, hdrlen,
-				      hdr + hdrlen);
-		hdrlen += ISCSI_DIGEST_SIZE;
+	if (!od->legacy) {
+		/* Disable all interrupts */
+		omap_dma_glbl_write(od, IRQENABLE_L0, 0);
 	}
 
-	/* Remember header pointer for later, when we need
-	 * to decide whether there's a payload to go along
-	 * with the header. */
-	tcp_sw_conn->out.hdr = hdr;
-
-	iscsi_segment_init_linear(&tcp_sw_conn->out.segment, hdr, hdrlen,
-				  iscsi_sw_tcp_send_hdr_done, NULL);
-}
-
-/*
- * Prepare the send buffer for the payload data.
- * Padding and checksumming will all be taken care
- * of by the iscsi_segment routines.
- */
-static int
-iscsi_sw_tcp_send_data_prep(struct iscsi_conn *conn, struct scatterlist *sg,
-			    unsigned int count, unsigned int offset,
-			    unsigned int len)
-{
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct hash_desc *tx_hash = NULL;
-	unsigned int hdr_spec_len;
-
-	ISCSI_SW_TCP_DBG(conn, "offset=%d, datalen=%d %s\n", offset, len,
-			 conn->datadgst_en ?
-			 "digest enabled" : "digest disabled");
-
-	/* Make sure the datalen matches what the caller
-	   said he would send. */
-	hdr_spec_len = ntoh24(tcp_sw_conn->out.hdr->dlength);
-	WARN_ON(iscsi_padded(len) != iscsi_padded(hdr_spec_len));
-
-	if (conn->datadgst_en)
-		tx_hash = &tcp_sw_conn->tx_hash;
-
-	return iscsi_segment_seek_sg(&tcp_sw_conn->out.data_segment,
-				     sg, count, offset, len,
-				     NULL, tx_hash);
-}
-
-static void
-iscsi_sw_tcp_send_linear_data_prep(struct iscsi_conn *conn, void *data,
-				   size_t len)
-{
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct hash_desc *tx_hash = NULL;
-	unsigned int hdr_spec_len;
-
-	ISCSI_SW_TCP_DBG(conn, "datalen=%zd %s\n", len, conn->datadgst_en ?
-			 "digest enabled" : "digest disabled");
-
-	/* Make sure the datalen matches what the caller
-	   said he would send. */
-	hdr_spec_len = ntoh24(tcp_sw_conn->out.hdr->dlength);
-	WARN_ON(iscsi_padded(len) != iscsi_padded(hdr_spec_len));
-
-	if (conn->datadgst_en)
-		tx_hash = &tcp_sw_conn->tx_hash;
-
-	iscsi_segment_init_linear(&tcp_sw_conn->out.data_segment,
-				data, len, NULL, tx_hash);
-}
-
-static int iscsi_sw_tcp_pdu_init(struct iscsi_task *task,
-				 unsigned int offset, unsigned int count)
-{
-	struct iscsi_conn *conn = task->conn;
-	int err = 0;
-
-	iscsi_sw_tcp_send_hdr_prep(conn, task->hdr, task->hdr_len);
-
-	if (!count)
-		return 0;
-
-	if (!task->sc)
-		iscsi_sw_tcp_send_linear_data_prep(conn, task->data, count);
-	else {
-		struct scsi_data_buffer *sdb = scsi_out(task->sc);
-
-		err = iscsi_sw_tcp_send_data_prep(conn, sdb->table.sgl,
-						  sdb->table.nents, offset,
-						  count);
-	}
-
-	if (err) {
-		/* got invalid offset/len */
-		return -EIO;
-	}
-	return 0;
-}
-
-static int iscsi_sw_tcp_pdu_alloc(struct iscsi_task *task, uint8_t opcode)
-{
-	struct iscsi_tcp_task *tcp_task = task->dd_data;
-
-	task->hdr = task->dd_data + sizeof(*tcp_task);
-	task->hdr_max = sizeof(struct iscsi_sw_tcp_hdrbuf) - ISCSI_DIGEST_SIZE;
-	return 0;
-}
-
-static struct iscsi_cls_conn *
-iscsi_sw_tcp_conn_create(struct iscsi_cls_session *cls_session,
-			 uint32_t conn_idx)
-{
-	struct iscsi_conn *conn;
-	struct iscsi_cls_conn *cls_conn;
-	struct iscsi_tcp_conn *tcp_conn;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn;
-
-	cls_conn = iscsi_tcp_conn_setup(cls_session, sizeof(*tcp_sw_conn),
-					conn_idx);
-	if (!cls_conn)
-		return NULL;
-	conn = cls_conn->dd_data;
-	tcp_conn = conn->dd_data;
-	tcp_sw_conn = tcp_conn->dd_data;
-
-	tcp_sw_conn->tx_hash.tfm = crypto_alloc_hash("crc32c", 0,
-						     CRYPTO_ALG_ASYNC);
-	tcp_sw_conn->tx_hash.flags = 0;
-	if (IS_ERR(tcp_sw_conn->tx_hash.tfm))
-		goto free_conn;
-
-	tcp_sw_conn->rx_hash.tfm = crypto_alloc_hash("crc32c", 0,
-						     CRYPTO_ALG_ASYNC);
-	tcp_sw_conn->rx_hash.flags = 0;
-	if (IS_ERR(tcp_sw_conn->rx_hash.tfm))
-		goto free_tx_tfm;
-	tcp_conn->rx_hash = &tcp_sw_conn->rx_hash;
-
-	return cls_conn;
-
-free_tx_tfm:
-	crypto_free_hash(tcp_sw_conn->tx_hash.tfm);
-free_conn:
-	iscsi_conn_printk(KERN_ERR, conn,
-			  "Could not create connection due to crc32c "
-			  "loading error. Make sure the crc32c "
-			  "module is built as a module or into the "
-			  "kernel\n");
-	iscsi_tcp_conn_teardown(cls_conn);
-	return NULL;
-}
-
-static void iscsi_sw_tcp_release_conn(struct iscsi_conn *conn)
-{
-	struct iscsi_session *session = conn->session;
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct socket *sock = tcp_sw_conn->sock;
-
-	if (!sock)
-		return;
-
-	sock_hold(sock->sk);
-	iscsi_sw_tcp_conn_restore_callbacks(conn);
-	sock_put(sock->sk);
-
-	spin_lock_bh(&session->frwd_lock);
-	tcp_sw_conn->sock = NULL;
-	spin_unlock_bh(&session->frwd_lock);
-	sockfd_put(sock);
-}
-
-static void iscsi_sw_tcp_conn_destroy(struct iscsi_cls_conn *cls_conn)
-{
-	struct iscsi_conn *conn = cls_conn->dd_data;
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-
-	iscsi_sw_tcp_release_conn(conn);
-
-	if (tcp_sw_conn->tx_hash.tfm)
-		crypto_free_hash(tcp_sw_conn->tx_hash.tfm);
-	if (tcp_sw_conn->rx_hash.tfm)
-		crypto_free_hash(tcp_sw_conn->rx_hash.tfm);
-
-	iscsi_tcp_conn_teardown(cls_conn);
-}
-
-static void iscsi_sw_tcp_conn_stop(struct iscsi_cls_conn *cls_conn, int flag)
-{
-	struct iscsi_conn *conn = cls_conn->dd_data;
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct socket *sock = tcp_sw_conn->sock;
-
-	/* userspace may have goofed up and not bound us */
-	if (!sock)
-		return;
-
-	sock->sk->sk_err = EIO;
-	wake_up_interruptible(sk_sleep(sock->sk));
-
-	/* stop xmit side */
-	iscsi_suspend_tx(conn);
-
-	/* stop recv side and release socket */
-	iscsi_sw_tcp_release_conn(conn);
-
-	iscsi_conn_stop(cls_conn, flag);
-}
-
-static int
-iscsi_sw_tcp_conn_bind(struct iscsi_cls_session *cls_session,
-		       struct iscsi_cls_conn *cls_conn, uint64_t transport_eph,
-		       int is_leading)
-{
-	struct iscsi_session *session = cls_session->dd_data;
-	struct iscsi_conn *conn = cls_conn->dd_data;
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct sock *sk;
-	struct socket *sock;
-	int err;
-
-	/* lookup for existing socket */
-	sock = sockfd_lookup((int)transport_eph, &err);
-	if (!sock) {
-		iscsi_conn_printk(KERN_ERR, conn,
-				  "sockfd_lookup failed %d\n", err);
-		return -EEXIST;
-	}
-
-	err = iscsi_conn_bind(cls_session, cls_conn, is_leading);
-	if (err)
-		goto free_socket;
-
-	spin_lock_bh(&session->frwd_lock);
-	/* bind iSCSI connection and socket */
-	tcp_sw_conn->sock = sock;
-	spin_unlock_bh(&session->frwd_lock);
-
-	/* setup Socket parameters */
-	sk = sock->sk;
-	sk->sk_reuse = SK_CAN_REUSE;
-	sk->sk_sndtimeo = 15 * HZ; /* FIXME: make it configurable */
-	sk->sk_allocation = GFP_ATOMIC;
-	sk_set_memalloc(sk);
-
-	iscsi_sw_tcp_conn_set_callbacks(conn);
-	tcp_sw_conn->sendpage = tcp_sw_conn->sock->ops->sendpage;
-	/*
-	 * set receive state machine into initial state
-	 */
-	iscsi_tcp_hdr_recv_prep(tcp_conn);
-	return 0;
-
-free_socket:
-	sockfd_put(sock);
-	return err;
-}
-
-static int iscsi_sw_tcp_conn_set_param(struct iscsi_cls_conn *cls_conn,
-				       enum iscsi_param param, char *buf,
-				       int buflen)
-{
-	struct iscsi_conn *conn = cls_conn->dd_data;
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-
-	switch(param) {
-	case ISCSI_PARAM_HDRDGST_EN:
-		iscsi_set_param(cls_conn, param, buf, buflen);
-		break;
-	case ISCSI_PARAM_DATADGST_EN:
-		iscsi_set_param(cls_conn, param, buf, buflen);
-		tcp_sw_conn->sendpage = conn->datadgst_en ?
-			sock_no_sendpage : tcp_sw_conn->sock->ops->sendpage;
-		break;
-	case ISCSI_PARAM_MAX_R2T:
-		return iscsi_tcp_set_max_r2t(conn, buf);
-	default:
-		return iscsi_set_param(cls_conn, param, buf, buflen);
-	}
+	omap_dma_free(od);
 
 	return 0;
 }
 
-static int iscsi_sw_tcp_conn_get_param(struct iscsi_cls_conn *cls_conn,
-				       enum iscsi_param param, char *buf)
-{
-	struct iscsi_conn *conn = cls_conn->dd_data;
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
-	struct sockaddr_in6 addr;
-	int rc, len;
+static const struct of_device_id omap_dma_match[] = {
+	{ .compatible = "ti,omap2420-sdma", },
+	{ .compatible = "ti,omap2430-sdma", },
+	{ .compatible = "ti,omap3430-sdma", },
+	{ .compatible = "ti,omap3630-sdma", },
+	{ .compatible = "ti,omap4430-sdma", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, omap_dma_match);
 
-	switch(param) {
-	case ISCSI_PARAM_CONN_PORT:
-	case ISCSI_PARAM_CONN_ADDRESS:
-	case ISCSI_PARAM_LOCAL_PORT:
-		spin_lock_bh(&conn->session->frwd_lock);
-		if (!tcp_sw_conn || !tcp_sw_conn->sock) {
-			spin_unlock_bh(&conn->session->frwd_lock);
-			return -ENOTCONN;
+static struct platform_driver omap_dma_driver = {
+	.probe	= omap_dma_probe,
+	.remove	= omap_dma_remove,
+	.driver = {
+		.name = "omap-dma-engine",
+		.of_match_table = of_match_ptr(omap_dma_match),
+	},
+};
+
+bool omap_dma_filter_fn(struct dma_chan *chan, void *param)
+{
+	if (chan->device->dev->driver == &omap_dma_driver.driver) {
+		struct omap_dmadev *od = to_omap_dma_dev(chan->device);
+		struct omap_chan *c = to_omap_dma_chan(chan);
+		unsigned req = *(unsigned *)param;
+
+		if (req <= od->dma_requests) {
+			c->dma_sig = req;
+			return true;
 		}
-		if (param == ISCSI_PARAM_LOCAL_PORT)
-			rc = kernel_getsockname(tcp_sw_conn->sock,
-						(struct sockaddr *)&addr, &len);
+	}
+	return false;
+}
+EXPORT_SYMBOL_GPL(omap_dma_filter_fn);
+
+static int omap_dma_init(void)
+{
+	return platform_driver_register(&omap_dma_driver);
+}
+subsys_initcall(omap_dma_init);
+
+static void __exit omap_dma_exit(void)
+{
+	platform_driver_unregister(&omap_dma_driver);
+}
+module_exit(omap_dma_exit);
+
+MODULE_AUTHOR("Russell King");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ * Topcliff PCH DMA controller driver
+ * Copyright (c) 2010 Intel Corporation
+ * Copyright (C) 2011 LAPIS Semiconductor Co., Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+#include <linux/dmaengine.h>
+#include <linux/dma-mapping.h>
+#include <linux/init.h>
+#include <linux/pci.h>
+#include <linux/slab.h>
+#include <linux/interrupt.h>
+#include <linux/module.h>
+#include <linux/pch_dma.h>
+
+#include "dmaengine.h"
+
+#define DRV_NAME "pch-dma"
+
+#define DMA_CTL0_DISABLE		0x0
+#define DMA_CTL0_SG			0x1
+#define DMA_CTL0_ONESHOT		0x2
+#define DMA_CTL0_MODE_MASK_BITS		0x3
+#define DMA_CTL0_DIR_SHIFT_BITS		2
+#define DMA_CTL0_BITS_PER_CH		4
+
+#define DMA_CTL2_START_SHIFT_BITS	8
+#define DMA_CTL2_IRQ_ENABLE_MASK	((1UL << DMA_CTL2_START_SHIFT_BITS) - 1)
+
+#define DMA_STATUS_IDLE			0x0
+#define DMA_STATUS_DESC_READ		0x1
+#define DMA_STATUS_WAIT			0x2
+#define DMA_STATUS_ACCESS		0x3
+#define DMA_STATUS_BITS_PER_CH		2
+#define DMA_STATUS_MASK_BITS		0x3
+#define DMA_STATUS_SHIFT_BITS		16
+#define DMA_STATUS_IRQ(x)		(0x1 << (x))
+#define DMA_STATUS0_ERR(x)		(0x1 << ((x) + 8))
+#define DMA_STATUS2_ERR(x)		(0x1 << (x))
+
+#define DMA_DESC_WIDTH_SHIFT_BITS	12
+#define DMA_DESC_WIDTH_1_BYTE		(0x3 << DMA_DESC_WIDTH_SHIFT_BITS)
+#define DMA_DESC_WIDTH_2_BYTES		(0x2 << DMA_DESC_WIDTH_SHIFT_BITS)
+#define DMA_DESC_WIDTH_4_BYTES		(0x0 << DMA_DESC_WIDTH_SHIFT_BITS)
+#define DMA_DESC_MAX_COUNT_1_BYTE	0x3FF
+#define DMA_DESC_MAX_COUNT_2_BYTES	0x3FF
+#define DMA_DESC_MAX_COUNT_4_BYTES	0x7FF
+#define DMA_DESC_END_WITHOUT_IRQ	0x0
+#define DMA_DESC_END_WITH_IRQ		0x1
+#define DMA_DESC_FOLLOW_WITHOUT_IRQ	0x2
+#define DMA_DESC_FOLLOW_WITH_IRQ	0x3
+
+#define MAX_CHAN_NR			12
+
+#define DMA_MASK_CTL0_MODE	0x33333333
+#define DMA_MASK_CTL2_MODE	0x00003333
+
+static unsigned int init_nr_desc_per_channel = 64;
+module_param(init_nr_desc_per_channel, uint, 0644);
+MODULE_PARM_DESC(init_nr_desc_per_channel,
+		 "initial descriptors per channel (default: 64)");
+
+struct pch_dma_desc_regs {
+	u32	dev_addr;
+	u32	mem_addr;
+	u32	size;
+	u32	next;
+};
+
+struct pch_dma_regs {
+	u32	dma_ctl0;
+	u32	dma_ctl1;
+	u32	dma_ctl2;
+	u32	dma_ctl3;
+	u32	dma_sts0;
+	u32	dma_sts1;
+	u32	dma_sts2;
+	u32	reserved3;
+	struct pch_dma_desc_regs desc[MAX_CHAN_NR];
+};
+
+struct pch_dma_desc {
+	struct pch_dma_desc_regs regs;
+	struct dma_async_tx_descriptor txd;
+	struct list_head	desc_node;
+	struct list_head	tx_list;
+};
+
+struct pch_dma_chan {
+	struct dma_chan		chan;
+	void __iomem *membase;
+	enum dma_transfer_direction dir;
+	struct tasklet_struct	tasklet;
+	unsigned long		err_status;
+
+	spinlock_t		lock;
+
+	struct list_head	active_list;
+	struct list_head	queue;
+	struct list_head	free_list;
+	unsigned int		descs_allocated;
+};
+
+#define PDC_DEV_ADDR	0x00
+#define PDC_MEM_ADDR	0x04
+#define PDC_SIZE	0x08
+#define PDC_NEXT	0x0C
+
+#define channel_readl(pdc, name) \
+	readl((pdc)->membase + PDC_##name)
+#define channel_writel(pdc, name, val) \
+	writel((val), (pdc)->membase + PDC_##name)
+
+struct pch_dma {
+	struct dma_device	dma;
+	void __iomem *membase;
+	struct pci_pool		*pool;
+	struct pch_dma_regs	regs;
+	struct pch_dma_desc_regs ch_regs[MAX_CHAN_NR];
+	struct pch_dma_chan	channels[MAX_CHAN_NR];
+};
+
+#define PCH_DMA_CTL0	0x00
+#define PCH_DMA_CTL1	0x04
+#define PCH_DMA_CTL2	0x08
+#define PCH_DMA_CTL3	0x0C
+#define PCH_DMA_STS0	0x10
+#define PCH_DMA_STS1	0x14
+#define PCH_DMA_STS2	0x18
+
+#define dma_readl(pd, name) \
+	readl((pd)->membase + PCH_DMA_##name)
+#define dma_writel(pd, name, val) \
+	writel((val), (pd)->membase + PCH_DMA_##name)
+
+static inline
+struct pch_dma_desc *to_pd_desc(struct dma_async_tx_descriptor *txd)
+{
+	return container_of(txd, struct pch_dma_desc, txd);
+}
+
+static inline struct pch_dma_chan *to_pd_chan(struct dma_chan *chan)
+{
+	return container_of(chan, struct pch_dma_chan, chan);
+}
+
+static inline struct pch_dma *to_pd(struct dma_device *ddev)
+{
+	return container_of(ddev, struct pch_dma, dma);
+}
+
+static inline struct device *chan2dev(struct dma_chan *chan)
+{
+	return &chan->dev->device;
+}
+
+static inline struct device *chan2parent(struct dma_chan *chan)
+{
+	return chan->dev->device.parent;
+}
+
+static inline
+struct pch_dma_desc *pdc_first_active(struct pch_dma_chan *pd_chan)
+{
+	return list_first_entry(&pd_chan->active_list,
+				struct pch_dma_desc, desc_node);
+}
+
+static inline
+struct pch_dma_desc *pdc_first_queued(struct pch_dma_chan *pd_chan)
+{
+	return list_first_entry(&pd_chan->queue,
+				struct pch_dma_desc, desc_node);
+}
+
+static void pdc_enable_irq(struct dma_chan *chan, int enable)
+{
+	struct pch_dma *pd = to_pd(chan->device);
+	u32 val;
+	int pos;
+
+	if (chan->chan_id < 8)
+		pos = chan->chan_id;
+	else
+		pos = chan->chan_id + 8;
+
+	val = dma_readl(pd, CTL2);
+
+	if (enable)
+		val |= 0x1 << pos;
+	else
+		val &= ~(0x1 << pos);
+
+	dma_writel(pd, CTL2, val);
+
+	dev_dbg(chan2dev(chan), "pdc_enable_irq: chan %d -> %x\n",
+		chan->chan_id, val);
+}
+
+static void pdc_set_dir(struct dma_chan *chan)
+{
+	struct pch_dma_chan *pd_chan = to_pd_chan(chan);
+	struct pch_dma *pd = to_pd(chan->device);
+	u32 val;
+	u32 mask_mode;
+	u32 mask_ctl;
+
+	if (chan->chan_id < 8) {
+		val = dma_readl(pd, CTL0);
+
+		mask_mode = DMA_CTL0_MODE_MASK_BITS <<
+					(DMA_CTL0_BITS_PER_CH * chan->chan_id);
+		mask_ctl = DMA_MASK_CTL0_MODE & ~(DMA_CTL0_MODE_MASK_BITS <<
+				       (DMA_CTL0_BITS_PER_CH * chan->chan_id));
+		val &= mask_mode;
+		if (pd_chan->dir == DMA_MEM_TO_DEV)
+			val |= 0x1 << (DMA_CTL0_BITS_PER_CH * chan->chan_id +
+				       DMA_CTL0_DIR_SHIFT_BITS);
 		else
-			rc = kernel_getpeername(tcp_sw_conn->sock,
-						(struct sockaddr *)&addr, &len);
-		spin_unlock_bh(&conn->session->frwd_lock);
-		if (rc)
-			return rc;
+			val &= ~(0x1 << (DMA_CTL0_BITS_PER_CH * chan->chan_id +
+					 DMA_CTL0_DIR_SHIFT_BITS));
 
-		return iscsi_conn_get_addr_param((struct sockaddr_storage *)
-						 &addr, param, buf);
-	default:
-		return iscsi_conn_get_param(cls_conn, param, buf);
+		val |= mask_ctl;
+		dma_writel(pd, CTL0, val);
+	} else {
+		int ch = chan->chan_id - 8; /* ch8-->0 ch9-->1 ... ch11->3 */
+		val = dma_readl(pd, CTL3);
+
+		mask_mode = DMA_CTL0_MODE_MASK_BITS <<
+						(DMA_CTL0_BITS_PER_CH * ch);
+		mask_ctl = DMA_MASK_CTL2_MODE & ~(DMA_CTL0_MODE_MASK_BITS <<
+						 (DMA_CTL0_BITS_PER_CH * ch));
+		val &= mask_mode;
+		if (pd_chan->dir == DMA_MEM_TO_DEV)
+			val |= 0x1 << (DMA_CTL0_BITS_PER_CH * ch +
+				       DMA_CTL0_DIR_SHIFT_BITS);
+		else
+			val &= ~(0x1 << (DMA_CTL0_BITS_PER_CH * ch +
+					 DMA_CTL0_DIR_SHIFT_BITS));
+		val |= mask_ctl;
+		dma_writel(pd, CTL3, val);
 	}
 
-	return 0;
+	dev_dbg(chan2dev(chan), "pdc_set_dir: chan %d -> %x\n",
+		chan->chan_id, val);
 }
 
-static int iscsi_sw_tcp_host_get_param(struct Scsi_Host *shost,
-				       enum iscsi_host_param param, char *buf)
+static void pdc_set_mode(struct dma_chan *chan, u32 mode)
 {
-	struct iscsi_sw_tcp_host *tcp_sw_host = iscsi_host_priv(shost);
-	struct iscsi_session *session;
-	struct iscsi_conn *conn;
-	struct iscsi_tcp_conn *tcp_conn;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn;
-	struct sockaddr_in6 addr;
-	int rc, len;
+	struct pch_dma *pd = to_pd(chan->device);
+	u32 val;
+	u32 mask_ctl;
+	u32 mask_dir;
 
-	switch (param) {
-	case ISCSI_HOST_PARAM_IPADDRESS:
-		session = tcp_sw_host->session;
-		if (!session)
-			return -ENOTCONN;
-
-		spin_lock_bh(&session->frwd_lock);
-		conn = session->leadconn;
-		if (!conn) {
-			spin_unlock_bh(&session->frwd_lock);
-			return -ENOTCONN;
-		}
-		tcp_conn = conn->dd_data;
-
-		tcp_sw_conn = tcp_conn->dd_data;
-		if (!tcp_sw_conn->sock) {
-			spin_unlock_bh(&session->frwd_lock);
-			return -ENOTCONN;
-		}
-
-		rc = kernel_getsockname(tcp_sw_conn->sock,
-					(struct sockaddr *)&addr, &len);
-		spin_unlock_bh(&session->frwd_lock);
-		if (rc)
-			return rc;
-
-		return iscsi_conn_get_addr_param((struct sockaddr_storage *)
-						 &addr,
-						 (enum iscsi_param)param, buf);
-	default:
-		return iscsi_host_get_param(shost, param, buf);
+	if (chan->chan_id < 8) {
+		mask_ctl = DMA_MASK_CTL0_MODE & ~(DMA_CTL0_MODE_MASK_BITS <<
+			   (DMA_CTL0_BITS_PER_CH * chan->chan_id));
+		mask_dir = 1 << (DMA_CTL0_BITS_PER_CH * chan->chan_id +\
+				 DMA_CTL0_DIR_SHIFT_BITS);
+		val = dma_readl(pd, CTL0);
+		val &= mask_dir;
+		val |= mode << (DMA_CTL0_BITS_PER_CH * chan->chan_id);
+		val |= mask_ctl;
+		dma_writel(pd, CTL0, val);
+	} else {
+		int ch = chan->chan_id - 8; /* ch8-->0 ch9-->1 ... ch11->3 */
+		mask_ctl = DMA_MASK_CTL2_MODE & ~(DMA_CTL0_MODE_MASK_BITS <<
+						 (DMA_CTL0_BITS_PER_CH * ch));
+		mask_dir = 1 << (DMA_CTL0_BITS_PER_CH * ch +\
+				 DMA_CTL0_DIR_SHIFT_BITS);
+		val = dma_readl(pd, CTL3);
+		val &= mask_dir;
+		val |= mode << (DMA_CTL0_BITS_PER_CH * ch);
+		val |= mask_ctl;
+		dma_writel(pd, CTL3, val);
 	}
 
-	return 0;
+	dev_dbg(chan2dev(chan), "pdc_set_mode: chan %d -> %x\n",
+		chan->chan_id, val);
 }
 
-static void
-iscsi_sw_tcp_conn_get_stats(struct iscsi_cls_conn *cls_conn,
-			    struct iscsi_stats *stats)
+static u32 pdc_get_status0(struct pch_dma_chan *pd_chan)
 {
-	struct iscsi_conn *conn = cls_conn->dd_data;
-	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
-	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
+	struct pch_dma *pd = to_pd(pd_chan->chan.device);
+	u32 val;
 
-	stats->custom_length = 3;
-	strcpy(stats->custom[0].desc, "tx_sendpage_failures");
-	stats->custom[0].value = tcp_sw_conn->sendpage_failures_cnt;
-	strcpy(stats->custom[1].desc, "rx_discontiguous_hdr");
-	stats->custom[1].value = tcp_sw_conn->discontiguous_hdr_cnt;
-	strcpy(stats->custom[2].desc, "eh_abort_cnt");
-	stats->custom[2].value = conn->eh_abort_cnt;
-
-	iscsi_tcp_conn_get_stats(cls_conn, stats);
+	val = dma_readl(pd, STS0);
+	return DMA_STATUS_MASK_BITS & (val >> (DMA_STATUS_SHIFT_BITS +
+			DMA_STATUS_BITS_PER_CH * pd_chan->chan.chan_id));
 }
 
-static struct iscsi_cls_session *
-iscsi_sw_tcp_session_create(struct iscsi_endpoint *ep, uint16_t cmds_max,
-			    uint16_t qdepth, uint32_t initial_cmdsn)
+static u32 pdc_get_status2(struct pch_dma_chan *pd_chan)
 {
-	struct iscsi_cls_session *cls_session;
-	struct iscsi_session *session;
-	struct iscsi_sw_tcp_host *tcp_sw_host;
-	struct Scsi_Host *shost;
+	struct pch_dma *pd = to_pd(pd_chan->chan.device);
+	u32 val;
 
-	if (ep) {
-		printk(KERN_ERR "iscsi_tcp: invalid ep %p.\n", ep);
-		return NULL;
-	}
-
-	shost = iscsi_host_alloc(&iscsi_sw_tcp_sht,
-				 sizeof(struct iscsi_sw_tcp_host), 1);
-	if (!shost)
-		return NULL;
-	shost->transportt = iscsi_sw_tcp_scsi_transport;
-	shost->cmd_per_lun = qdepth;
-	shost->max_lun = iscsi_max_lun;
-	shost->max_id = 0;
-	shost->max_channel = 0;
-	shost->max_cmd_len = SCSI_MAX_VARLEN_CDB_SIZE;
-
-	if (iscsi_host_add(shost, NULL))
-		goto free_host;
-
-	cls_session = iscsi_session_setup(&iscsi_sw_tcp_transport, shost,
-					  cmds_max, 0,
-					  sizeof(struct iscsi_tcp_task) +
-					  sizeof(struct iscsi_sw_tcp_hdrbuf),
-					  initial_cmdsn, 0);
-	if (!cls_session)
-		goto remove_host;
-	session = cls_session->dd_data;
-
-	shost->can_queue = session->scsi_cmds_max;
-	if (iscsi_tcp_r2tpool_alloc(session))
-		goto remove_session;
-
-	/* We are now fully setup so expose the session to sysfs. */
-	tcp_sw_host = iscsi_host_priv(shost);
-	tcp_sw_host->session = session;
-	return cls_session;
-
-remove_session:
-	iscsi_session_teardown(cls_session);
-remove_host:
-	iscsi_host_remove(shost);
-free_host:
-	iscsi_host_free(shost);
-	return NULL;
+	val = dma_readl(pd, STS2);
+	return DMA_STATUS_MASK_BITS & (val >> (DMA_STATUS_SHIFT_BITS +
+			DMA_STATUS_BITS_PER_CH * (pd_chan->chan.chan_id - 8)));
 }
 
-static void iscsi_sw_tcp_session_destroy(struct iscsi_cls_session *cls_session)
+static bool pdc_is_idle(struct pch_dma_chan *pd_chan)
 {
-	struct Scsi_Host *shost = iscsi_session_to_shost(cls_session);
-	struct iscsi_session *session = cls_session->dd_data;
+	u32 sts;
 
-	if (WARN_ON_ONCE(session->leadconn))
+	if (pd_chan->chan.chan_id < 8)
+		sts = pdc_get_status0(pd_chan);
+	else
+		sts = pdc_get_status2(pd_chan);
+
+
+	if (sts == DMA_STATUS_IDLE)
+		return true;
+	else
+		return false;
+}
+
+static void pdc_dostart(struct pch_dma_chan *pd_chan, struct pch_dma_desc* desc)
+{
+	if (!pdc_is_idle(pd_chan)) {
+		dev_err(chan2dev(&pd_chan->chan),
+			"BUG: Attempt to start non-idle channel\n");
 		return;
-
-	iscsi_tcp_r2tpool_free(cls_session->dd_data);
-	iscsi_session_teardown(cls_session);
-
-	iscsi_host_remove(shost);
-	iscsi_host_free(shost);
-}
-
-static umode_t iscsi_sw_tcp_attr_is_visible(int param_type, int param)
-{
-	switch (param_type) {
-	case ISCSI_HOST_PARAM:
-		switch (param) {
-		case ISCSI_HOST_PARAM_NETDEV_NAME:
-		case ISCSI_HOST_PARAM_HWADDRESS:
-		case ISCSI_HOST_PARAM_IPADDRESS:
-		case ISCSI_HOST_PARAM_INITIATOR_NAME:
-			return S_IRUGO;
-		default:
-			return 0;
-		}
-	case ISCSI_PARAM:
-		switch (param) {
-		case ISCSI_PARAM_MAX_RECV_DLENGTH:
-		case ISCSI_PARAM_MAX_XMIT_DLENGTH:
-		case ISCSI_PARAM_HDRDGST_EN:
-		case ISCSI_PARAM_DATADGST_EN:
-		case ISCSI_PARAM_CONN_ADDRESS:
-		case ISCSI_PARAM_CONN_PORT:
-		case ISCSI_PARAM_LOCAL_PORT:
-		case ISCSI_PARAM_EXP_STATSN:
-		case ISCSI_PARAM_PERSISTENT_ADDRESS:
-		case ISCSI_PARAM_PERSISTENT_PORT:
-		case ISCSI_PARAM_PING_TMO:
-		case ISCSI_PARAM_RECV_TMO:
-		case ISCSI_PARAM_INITIAL_R2T_EN:
-		case ISCSI_PARAM_MAX_R2T:
-		case ISCSI_PARAM_IMM_DATA_EN:
-		case ISCSI_PARAM_FIRST_BURST:
-		case ISCSI_PARAM_MAX_BURST:
-		case ISCSI_PARAM_PDU_INORDER_EN:
-		case ISCSI_PARAM_DATASEQ_INORDER_EN:
-		case ISCSI_PARAM_ERL:
-		case ISCSI_PARAM_TARGET_NAME:
-		case ISCSI_PARAM_TPGT:
-		case ISCSI_PARAM_USERNAME:
-		case ISCSI_PARAM_PASSWORD:
-		case ISCSI_PARAM_USERNAME_IN:
-		case ISCSI_PARAM_PASSWORD_IN:
-		case ISCSI_PARAM_FAST_ABORT:
-		case ISCSI_PARAM_ABORT_TMO:
-		case ISCSI_PARAM_LU_RESET_TMO:
-		case ISCSI_PARAM_TGT_RESET_TMO:
-		case ISCSI_PARAM_IFACE_NAME:
-		case ISCSI_PARAM_INITIATOR_NAME:
-			return S_IRUGO;
-		default:
-			return 0;
-		}
 	}
 
-	return 0;
+	dev_dbg(chan2dev(&pd_chan->chan), "chan %d -> dev_addr: %x\n",
+		pd_chan->chan.chan_id, desc->regs.dev_addr);
+	dev_dbg(chan2dev(&pd_chan->chan), "chan %d -> mem_addr: %x\n",
+		pd_chan->chan.chan_id, desc->regs.mem_addr);
+	dev_dbg(chan2dev(&pd_chan->chan), "chan %d -> size: %x\n",
+		pd_chan->chan.chan_id, desc->regs.size);
+	dev_dbg(chan2dev(&pd_chan->chan), "chan %d -> next: %x\n",
+		pd_chan->chan.chan_id, desc->regs.next);
+
+	if (list_empty(&desc->tx_list)) {
+		channel_writel(pd_chan, DEV_ADDR, desc->regs.dev_addr);
+		channel_writel(pd_chan, MEM_ADDR, desc->regs.mem_addr);
+		channel_writel(pd_chan, SIZE, desc->regs.size);
+		channel_writel(pd_chan, NEXT, desc->regs.next);
+		pdc_set_mode(&pd_chan->chan, DMA_CTL0_ONESHOT);
+	} else {
+		channel_writel(pd_chan, NEXT, desc->txd.phys);
+		pdc_set_mode(&pd_chan->chan, DMA_CTL0_SG);
+	}
 }
 
-static int iscsi_sw_tcp_slave_alloc(struct scsi_device *sdev)
+static void pdc_chain_complete(struct pch_dma_chan *pd_chan,
+			       struct pch_dma_desc *desc)
 {
-	set_bit(QUEUE_FLAG_BIDI, &sdev->request_queue->queue_flags);
-	return 0;
+	struct dma_async_tx_descriptor *txd = &desc->txd;
+	dma_async_tx_callback callback = txd->callback;
+	void *param = txd->callback_param;
+
+	list_splice_init(&desc->tx_list, &pd_chan->free_list);
+	list_move(&desc->desc_node, &pd_chan->free_list);
+
+	if (callback)
+		callback(param);
 }
 
-static int iscsi_sw_tcp_slave_configure(struct scsi_device *sdev)
+static void pdc_complete_all(struct pch_dma_chan *pd_chan)
 {
-	blk_queue_bounce_limit(sdev->request_queue, BLK_BOUNCE_ANY);
-	blk_queue_dma_alignment(sdev->request_queue, 0);
-	return 0;
+	struct pch_dma_desc *desc, *_d;
+	LIST_HEAD(list);
+
+	BUG_ON(!pdc_is_idle(pd_chan));
+
+	if (!list_empty(&pd_chan->queue))
+		pdc_dostart(pd_chan, pdc_first_queued(pd_chan));
+
+	list_splice_init(&pd_chan->active_list, &list);
+	list_splice_init(&pd_chan->queue, &pd_chan->active_list);
+
+	list_for_each_entry_safe(desc, _d, &list, desc_node)
+		pdc_chain_complete(pd_chan, desc);
 }
 
-static struct scsi_host_template iscsi_sw_tcp_sht = {
-	.module			= THIS_MODULE,
-	.name			= "iSCSI Initiator over TCP/IP",
-	.queuecommand           = iscsi_queuecommand,
-	.change_queue_depth	= scsi_change_queue_depth,
-	.can_queue		= ISCSI_DEF_XMIT_CMDS_MAX - 1,
-	.sg_tablesize		= 4096,
-	.max_sectors		= 0xFFFF,
-	.cmd_per_lun		= ISCSI_DEF_CMD_PER_LUN,
-	.eh_abort_handler       = iscsi_eh_abort,
-	.eh_device_reset_handler= iscsi_eh_device_reset,
-	.eh_target_reset_handler = iscsi_eh_recover_target,
-	.use_clustering         = DISABLE_CLUSTERING,
-	.slave_alloc            = iscsi_sw_tcp_slave_alloc,
-	.slave_configure        = iscsi_sw_tcp_slave_configure,
-	.target_alloc		= iscsi_target_alloc,
-	.proc_name		= "iscsi_tcp",
-	.this_id		= -1,
-	.track_queue_depth	= 1,
-};
-
-static struct iscsi_transport iscsi_sw_tcp_transport = {
-	.owner			= THIS_MODULE,
-	.name			= "tcp",
-	.caps			= CAP_RECOVERY_L0 | CAP_MULTI_R2T | CAP_HDRDGST
-				  | CAP_DATADGST,
-	/* session management */
-	.create_session		= iscsi_sw_tcp_session_create,
-	.destroy_session	= iscsi_sw_tcp_session_destroy,
-	/* connection management */
-	.create_conn		= iscsi_sw_tcp_conn_create,
-	.bind_conn		= iscsi_sw_tcp_conn_bind,
-	.destroy_conn		= iscsi_sw_tcp_conn_destroy,
-	.attr_is_visible	= iscsi_sw_tcp_attr_is_visible,
-	.set_param		= iscsi_sw_tcp_conn_set_param,
-	.get_conn_param		= iscsi_sw_tcp_conn_get_param,
-	.get_session_param	= iscsi_session_get_param,
-	.start_conn		= iscsi_conn_start,
-	.stop_conn		= iscsi_sw_tcp_conn_stop,
-	/* iscsi host params */
-	.get_host_param		= iscsi_sw_tcp_host_get_param,
-	.set_host_param		= iscsi_host_set_param,
-	/* IO */
-	.send_pdu		= iscsi_conn_send_pdu,
-	.get_stats		= iscsi_sw_tcp_conn_get_stats,
-	/* iscsi task/cmd helpers */
-	.init_task		= iscsi_tcp_task_init,
-	.xmit_task		= iscsi_tcp_task_xmit,
-	.cleanup_task		= iscsi_tcp_cleanup_task,
-	/* low level pdu helpers */
-	.xmit_pdu		= iscsi_sw_tcp_pdu_xmit,
-	.init_pdu		= iscsi_sw_tcp_pdu_init,
-	.alloc_pdu		= iscsi_sw_tcp_pdu_alloc,
-	/* recovery */
-	.session_recovery_timedout = iscsi_session_recovery_timedout,
-};
-
-static int __init iscsi_sw_tcp_init(void)
+static void pdc_handle_error(struct pch_dma_chan *pd_chan)
 {
-	if (iscsi_max_lun < 1) {
-		printk(KERN_ERR "iscsi_tcp: Invalid max_lun value of %u\n",
-		       iscsi_max_lun);
-		return -EINVAL;
+	struct pch_dma_desc *bad_desc;
+
+	bad_desc = pdc_first_active(pd_chan);
+	list_del(&bad_desc->desc_node);
+
+	list_splice_init(&pd_chan->queue, pd_chan->active_list.prev);
+
+	if (!list_empty(&pd_chan->active_list))
+		pdc_dostart(pd_chan, pdc_first_active(pd_chan));
+
+	dev_crit(chan2dev(&pd_chan->chan), "Bad descriptor submitted\n");
+	dev_crit(chan2dev(&pd_chan->chan), "descriptor cookie: %d\n",
+		 bad_desc->txd.cookie);
+
+	pdc_chain_complete(pd_chan, bad_desc);
+}
+
+static void pdc_advance_work(struct pch_dma_chan *pd_chan)
+{
+	if (list_empty(&pd_chan->active_list) ||
+		list_is_singular(&pd_chan->active_list)) {
+		pdc_complete_all(pd_chan);
+	} else {
+		pdc_chain_complete(pd_chan, pdc_first_active(pd_chan));
+		pdc_dostart(pd_chan, pdc_first_active(pd_chan));
+	}
+}
+
+static dma_cookie_t pd_tx_submit(struct dma_async_tx_descriptor *txd)
+{
+	struct pch_dma_desc *desc = to_pd_desc(txd);
+	struct pch_dma_chan *pd_chan = to_pd_chan(txd->chan);
+	dma_cookie_t cookie;
+
+	spin_lock(&pd_chan->lock);
+	cookie = dma_cookie_assign(txd);
+
+	if (list_empty(&pd_chan->active_list)) {
+		list_add_tail(&desc->desc_node, &pd_chan->active_list);
+		pdc_dostart(pd_chan, desc);
+	} else {
+		list_add_tail(&desc->desc_node, &pd_chan->queue);
 	}
 
-	iscsi_sw_tcp_scsi_transport = iscsi_register_transport(
-						&iscsi_sw_tcp_transport);
-	if (!iscsi_sw_tcp_scsi_transport)
-		return -ENODEV;
-
+	spin_unlock(&pd_chan->lock);
 	return 0;
 }
 
-static void __exit iscsi_sw_tcp_exit(void)
+static struct pch_dma_desc *pdc_alloc_desc(struct dma_chan *chan, gfp_t flags)
 {
-	iscsi_unregister_transport(&iscsi_sw_tcp_transport);
+	struct pch_dma_desc *desc = NULL;
+	struct pch_dma *pd = to_pd(chan->device);
+	dma_addr_t addr;
+
+	desc = pci_pool_alloc(pd->pool, flags, &addr);
+	if (desc) {
+		memset(desc, 0, sizeof(struct pch_dma_desc));
+		INIT_LIST_HEAD(&desc->tx_list);
+		dma_async_tx_descriptor_init(&desc->txd, chan);
+		desc->txd.tx_submit = pd_tx_submit;
+		desc->txd.flags = DMA_CTRL_ACK;
+		desc->txd.phys = addr;
+	}
+
+	return desc;
 }
 
-module_init(iscsi_sw_tcp_init);
-module_exit(iscsi_sw_tcp_exit);
+static struct pch_dma_desc *pdc_desc_get(struct pch_dma_chan *pd_chan)
+{
+	struct pch_dma_desc *desc, *_d;
+	struct pch_dma_desc *ret = NULL;
+	int i = 0;
+
+	spin_lock(&pd_chan->lock);
+	list_for_each_entry_safe(desc, _d, 

@@ -1,9 +1,6 @@
-#
-# Makefile for the Kinibi core and trusted UI drivers
-#
-
-obj-$(CONFIG_TRUSTONIC_TEE) := MobiCoreDriver/
-obj-$(CONFIG_TRUSTONIC_TRUSTED_UI) += TlcTui/
-
-obj-$(CONFIG_SECURE_OS_CONTROL) += sec-os-ctrl/
-obj-$(CONFIG_SECURE_OS_BOOSTER_API) += sec-os-booster/
+E_D1__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_CK_TXPHASE_D1__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_CK_TXPHASE_D1__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_CK_TXPHASE_D1__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_CK_TXPHASE_D1__VALUE2__SHIFT 0x10
+#define MC_IO_D

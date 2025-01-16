@@ -1,3622 +1,2597 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+
 /*
- *  linux/drivers/net/ethernet/ibm/ehea/ehea_main.c
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
  *
- *  eHEA ethernet device driver for IBM eServer System p
- *
- *  (C) Copyright IBM Corp. 2006
- *
- *  Authors:
- *	 Christoph Raisch <raisch@de.ibm.com>
- *	 Jan-Bernd Themann <themann@de.ibm.com>
- *	 Thomas Klein <tklein@de.ibm.com>
- *
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
  */
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#include <linux/suspend.h>
+#include <linux/pm_runtime.h>
 
-#include <linux/device.h>
-#include <linux/in.h>
-#include <linux/ip.h>
-#include <linux/tcp.h>
-#include <linux/udp.h>
-#include <linux/if.h>
-#include <linux/list.h>
-#include <linux/slab.h>
-#include <linux/if_ether.h>
-#include <linux/notifier.h>
-#include <linux/reboot.h>
-#include <linux/memory.h>
-#include <asm/kexec.h>
-#include <linux/mutex.h>
-#include <linux/prefetch.h>
+#if IS_ENABLED(CONFIG_EXYNOS_PMU)
+#include <soc/samsung/exynos-pmu.h>
+#endif
+#if IS_ENABLED(CONFIG_EXYNOS_PMU_IF)
+#include <soc/samsung/exynos-pmu-if.h>
+#endif
 
-#include <net/ip.h>
+#include <gpex_ifpo.h>
+#include <gpex_dvfs.h>
+#include <gpex_clock.h>
+#include <gpex_qos.h>
+#include <gpex_utils.h>
+#include <gpex_debug.h>
+#include <gpexbe_devicetree.h>
+#include <gpexbe_pm.h>
+#include <gpex_pm.h>
 
-#include "ehea.h"
-#include "ehea_qmr.h"
-#include "ehea_phyp.h"
+#include <gpexbe_secure.h>
+#include <gpexbe_smc.h>
 
+#include <gpex_tsg.h>
+#include <gpex_clboost.h>
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Christoph Raisch <raisch@de.ibm.com>");
-MODULE_DESCRIPTION("IBM eServer HEA Driver");
-MODULE_VERSION(DRV_VERSION);
+#include <gpexwa_wakeup_clock.h>
 
+#if IS_ENABLED(CONFIG_MALI_EXYNOS_SECURE_RENDERING_ARM) && IS_ENABLED(CONFIG_SOC_S5E8825)
+#include <soc/samsung/exynos-smc.h>
+#endif
 
-static int msg_level = -1;
-static int rq1_entries = EHEA_DEF_ENTRIES_RQ1;
-static int rq2_entries = EHEA_DEF_ENTRIES_RQ2;
-static int rq3_entries = EHEA_DEF_ENTRIES_RQ3;
-static int sq_entries = EHEA_DEF_ENTRIES_SQ;
-static int use_mcs = 1;
-static int prop_carrier_state;
-
-module_param(msg_level, int, 0);
-module_param(rq1_entries, int, 0);
-module_param(rq2_entries, int, 0);
-module_param(rq3_entries, int, 0);
-module_param(sq_entries, int, 0);
-module_param(prop_carrier_state, int, 0);
-module_param(use_mcs, int, 0);
-
-MODULE_PARM_DESC(msg_level, "msg_level");
-MODULE_PARM_DESC(prop_carrier_state, "Propagate carrier state of physical "
-		 "port to stack. 1:yes, 0:no.  Default = 0 ");
-MODULE_PARM_DESC(rq3_entries, "Number of entries for Receive Queue 3 "
-		 "[2^x - 1], x = [7..14]. Default = "
-		 __MODULE_STRING(EHEA_DEF_ENTRIES_RQ3) ")");
-MODULE_PARM_DESC(rq2_entries, "Number of entries for Receive Queue 2 "
-		 "[2^x - 1], x = [7..14]. Default = "
-		 __MODULE_STRING(EHEA_DEF_ENTRIES_RQ2) ")");
-MODULE_PARM_DESC(rq1_entries, "Number of entries for Receive Queue 1 "
-		 "[2^x - 1], x = [7..14]. Default = "
-		 __MODULE_STRING(EHEA_DEF_ENTRIES_RQ1) ")");
-MODULE_PARM_DESC(sq_entries, " Number of entries for the Send Queue  "
-		 "[2^x - 1], x = [7..14]. Default = "
-		 __MODULE_STRING(EHEA_DEF_ENTRIES_SQ) ")");
-MODULE_PARM_DESC(use_mcs, " Multiple receive queues, 1: enable, 0: disable, "
-		 "Default = 1");
-
-static int port_name_cnt;
-static LIST_HEAD(adapter_list);
-static unsigned long ehea_driver_flags;
-static DEFINE_MUTEX(dlpar_mem_lock);
-static struct ehea_fw_handle_array ehea_fw_handles;
-static struct ehea_bcmc_reg_array ehea_bcmc_regs;
-
-
-static int ehea_probe_adapter(struct platform_device *dev);
-
-static int ehea_remove(struct platform_device *dev);
-
-static const struct of_device_id ehea_module_device_table[] = {
-	{
-		.name = "lhea",
-		.compatible = "IBM,lhea",
-	},
-	{
-		.type = "network",
-		.compatible = "IBM,lhea-ethernet",
-	},
-	{},
-};
-MODULE_DEVICE_TABLE(of, ehea_module_device_table);
-
-static const struct of_device_id ehea_device_table[] = {
-	{
-		.name = "lhea",
-		.compatible = "IBM,lhea",
-	},
-	{},
+struct pm_info {
+	int runtime_pm_delay_time;
+	bool power_status;
+	int state;
+	bool skip_auto_suspend;
+	struct device *dev;
 };
 
-static struct platform_driver ehea_driver = {
-	.driver = {
-		.name = "ehea",
-		.owner = THIS_MODULE,
-		.of_match_table = ehea_device_table,
-	},
-	.probe = ehea_probe_adapter,
-	.remove = ehea_remove,
-};
+static struct pm_info pm;
 
-void ehea_dump(void *adr, int len, char *msg)
+int gpex_pm_set_state(int state)
 {
-	int x;
-	unsigned char *deb = adr;
-	for (x = 0; x < len; x += 16) {
-		pr_info("%s adr=%p ofs=%04x %016llx %016llx\n",
-			msg, deb, x, *((u64 *)&deb[0]), *((u64 *)&deb[8]));
-		deb += 16;
+	if (GPEX_PM_STATE_START <= state && state <= GPEX_PM_STATE_END) {
+		pm.state = state;
+		GPU_LOG(MALI_EXYNOS_INFO, "gpex_pm: gpex_pm state is set as 0x%X", pm.state);
+		return 0;
 	}
+
+	GPU_LOG(MALI_EXYNOS_WARNING,
+		"gpex_pm: Attempted to set gpex_pm state with invalid value 0x%x", state);
+	return -1;
 }
 
-static void ehea_schedule_port_reset(struct ehea_port *port)
+int gpex_pm_get_state(int *state)
 {
-	if (!test_bit(__EHEA_DISABLE_PORT_RESET, &port->flags))
-		schedule_work(&port->reset_task);
+	if (GPEX_PM_STATE_START <= pm.state && pm.state <= GPEX_PM_STATE_END) {
+		*state = pm.state;
+		return 0;
+	}
+
+	GPU_LOG(MALI_EXYNOS_WARNING, "gpex_pm: gpex_pm has invalid state now 0x%x", pm.state);
+	return -1;
 }
 
-static void ehea_update_firmware_handles(void)
+int gpex_pm_get_status(bool clock_lock)
 {
-	struct ehea_fw_handle_entry *arr = NULL;
-	struct ehea_adapter *adapter;
-	int num_adapters = 0;
-	int num_ports = 0;
-	int num_portres = 0;
-	int i = 0;
-	int num_fw_handles, k, l;
-
-	/* Determine number of handles */
-	mutex_lock(&ehea_fw_handles.lock);
-
-	list_for_each_entry(adapter, &adapter_list, list) {
-		num_adapters++;
-
-		for (k = 0; k < EHEA_MAX_PORTS; k++) {
-			struct ehea_port *port = adapter->port[k];
-
-			if (!port || (port->state != EHEA_PORT_UP))
-				continue;
-
-			num_ports++;
-			num_portres += port->num_def_qps;
-		}
-	}
-
-	num_fw_handles = num_adapters * EHEA_NUM_ADAPTER_FW_HANDLES +
-			 num_ports * EHEA_NUM_PORT_FW_HANDLES +
-			 num_portres * EHEA_NUM_PORTRES_FW_HANDLES;
-
-	if (num_fw_handles) {
-		arr = kcalloc(num_fw_handles, sizeof(*arr), GFP_KERNEL);
-		if (!arr)
-			goto out;  /* Keep the existing array */
-	} else
-		goto out_update;
-
-	list_for_each_entry(adapter, &adapter_list, list) {
-		if (num_adapters == 0)
-			break;
-
-		for (k = 0; k < EHEA_MAX_PORTS; k++) {
-			struct ehea_port *port = adapter->port[k];
-
-			if (!port || (port->state != EHEA_PORT_UP) ||
-			    (num_ports == 0))
-				continue;
-
-			for (l = 0; l < port->num_def_qps; l++) {
-				struct ehea_port_res *pr = &port->port_res[l];
-
-				arr[i].adh = adapter->handle;
-				arr[i++].fwh = pr->qp->fw_handle;
-				arr[i].adh = adapter->handle;
-				arr[i++].fwh = pr->send_cq->fw_handle;
-				arr[i].adh = adapter->handle;
-				arr[i++].fwh = pr->recv_cq->fw_handle;
-				arr[i].adh = adapter->handle;
-				arr[i++].fwh = pr->eq->fw_handle;
-				arr[i].adh = adapter->handle;
-				arr[i++].fwh = pr->send_mr.handle;
-				arr[i].adh = adapter->handle;
-				arr[i++].fwh = pr->recv_mr.handle;
-			}
-			arr[i].adh = adapter->handle;
-			arr[i++].fwh = port->qp_eq->fw_handle;
-			num_ports--;
-		}
-
-		arr[i].adh = adapter->handle;
-		arr[i++].fwh = adapter->neq->fw_handle;
-
-		if (adapter->mr.handle) {
-			arr[i].adh = adapter->handle;
-			arr[i++].fwh = adapter->mr.handle;
-		}
-		num_adapters--;
-	}
-
-out_update:
-	kfree(ehea_fw_handles.arr);
-	ehea_fw_handles.arr = arr;
-	ehea_fw_handles.num_entries = i;
-out:
-	mutex_unlock(&ehea_fw_handles.lock);
-}
-
-static void ehea_update_bcmc_registrations(void)
-{
-	unsigned long flags;
-	struct ehea_bcmc_reg_entry *arr = NULL;
-	struct ehea_adapter *adapter;
-	struct ehea_mc_list *mc_entry;
-	int num_registrations = 0;
-	int i = 0;
-	int k;
-
-	spin_lock_irqsave(&ehea_bcmc_regs.lock, flags);
-
-	/* Determine number of registrations */
-	list_for_each_entry(adapter, &adapter_list, list)
-		for (k = 0; k < EHEA_MAX_PORTS; k++) {
-			struct ehea_port *port = adapter->port[k];
-
-			if (!port || (port->state != EHEA_PORT_UP))
-				continue;
-
-			num_registrations += 2;	/* Broadcast registrations */
-
-			list_for_each_entry(mc_entry, &port->mc_list->list,list)
-				num_registrations += 2;
-		}
-
-	if (num_registrations) {
-		arr = kcalloc(num_registrations, sizeof(*arr), GFP_ATOMIC);
-		if (!arr)
-			goto out;  /* Keep the existing array */
-	} else
-		goto out_update;
-
-	list_for_each_entry(adapter, &adapter_list, list) {
-		for (k = 0; k < EHEA_MAX_PORTS; k++) {
-			struct ehea_port *port = adapter->port[k];
-
-			if (!port || (port->state != EHEA_PORT_UP))
-				continue;
-
-			if (num_registrations == 0)
-				goto out_update;
-
-			arr[i].adh = adapter->handle;
-			arr[i].port_id = port->logical_port_id;
-			arr[i].reg_type = EHEA_BCMC_BROADCAST |
-					  EHEA_BCMC_UNTAGGED;
-			arr[i++].macaddr = port->mac_addr;
-
-			arr[i].adh = adapter->handle;
-			arr[i].port_id = port->logical_port_id;
-			arr[i].reg_type = EHEA_BCMC_BROADCAST |
-					  EHEA_BCMC_VLANID_ALL;
-			arr[i++].macaddr = port->mac_addr;
-			num_registrations -= 2;
-
-			list_for_each_entry(mc_entry,
-					    &port->mc_list->list, list) {
-				if (num_registrations == 0)
-					goto out_update;
-
-				arr[i].adh = adapter->handle;
-				arr[i].port_id = port->logical_port_id;
-				arr[i].reg_type = EHEA_BCMC_MULTICAST |
-						  EHEA_BCMC_UNTAGGED;
-				if (mc_entry->macaddr == 0)
-					arr[i].reg_type |= EHEA_BCMC_SCOPE_ALL;
-				arr[i++].macaddr = mc_entry->macaddr;
-
-				arr[i].adh = adapter->handle;
-				arr[i].port_id = port->logical_port_id;
-				arr[i].reg_type = EHEA_BCMC_MULTICAST |
-						  EHEA_BCMC_VLANID_ALL;
-				if (mc_entry->macaddr == 0)
-					arr[i].reg_type |= EHEA_BCMC_SCOPE_ALL;
-				arr[i++].macaddr = mc_entry->macaddr;
-				num_registrations -= 2;
-			}
-		}
-	}
-
-out_update:
-	kfree(ehea_bcmc_regs.arr);
-	ehea_bcmc_regs.arr = arr;
-	ehea_bcmc_regs.num_entries = i;
-out:
-	spin_unlock_irqrestore(&ehea_bcmc_regs.lock, flags);
-}
-
-static struct rtnl_link_stats64 *ehea_get_stats64(struct net_device *dev,
-					struct rtnl_link_stats64 *stats)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	u64 rx_packets = 0, tx_packets = 0, rx_bytes = 0, tx_bytes = 0;
-	int i;
-
-	for (i = 0; i < port->num_def_qps; i++) {
-		rx_packets += port->port_res[i].rx_packets;
-		rx_bytes   += port->port_res[i].rx_bytes;
-	}
-
-	for (i = 0; i < port->num_def_qps; i++) {
-		tx_packets += port->port_res[i].tx_packets;
-		tx_bytes   += port->port_res[i].tx_bytes;
-	}
-
-	stats->tx_packets = tx_packets;
-	stats->rx_bytes = rx_bytes;
-	stats->tx_bytes = tx_bytes;
-	stats->rx_packets = rx_packets;
-
-	stats->multicast = port->stats.multicast;
-	stats->rx_errors = port->stats.rx_errors;
-	return stats;
-}
-
-static void ehea_update_stats(struct work_struct *work)
-{
-	struct ehea_port *port =
-		container_of(work, struct ehea_port, stats_work.work);
-	struct net_device *dev = port->netdev;
-	struct rtnl_link_stats64 *stats = &port->stats;
-	struct hcp_ehea_port_cb2 *cb2;
-	u64 hret;
-
-	cb2 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb2) {
-		netdev_err(dev, "No mem for cb2. Some interface statistics were not updated\n");
-		goto resched;
-	}
-
-	hret = ehea_h_query_ehea_port(port->adapter->handle,
-				      port->logical_port_id,
-				      H_PORT_CB2, H_PORT_CB2_ALL, cb2);
-	if (hret != H_SUCCESS) {
-		netdev_err(dev, "query_ehea_port failed\n");
-		goto out_herr;
-	}
-
-	if (netif_msg_hw(port))
-		ehea_dump(cb2, sizeof(*cb2), "net_device_stats");
-
-	stats->multicast = cb2->rxmcp;
-	stats->rx_errors = cb2->rxuerr;
-
-out_herr:
-	free_page((unsigned long)cb2);
-resched:
-	schedule_delayed_work(&port->stats_work,
-			      round_jiffies_relative(msecs_to_jiffies(1000)));
-}
-
-static void ehea_refill_rq1(struct ehea_port_res *pr, int index, int nr_of_wqes)
-{
-	struct sk_buff **skb_arr_rq1 = pr->rq1_skba.arr;
-	struct net_device *dev = pr->port->netdev;
-	int max_index_mask = pr->rq1_skba.len - 1;
-	int fill_wqes = pr->rq1_skba.os_skbs + nr_of_wqes;
-	int adder = 0;
-	int i;
-
-	pr->rq1_skba.os_skbs = 0;
-
-	if (unlikely(test_bit(__EHEA_STOP_XFER, &ehea_driver_flags))) {
-		if (nr_of_wqes > 0)
-			pr->rq1_skba.index = index;
-		pr->rq1_skba.os_skbs = fill_wqes;
-		return;
-	}
-
-	for (i = 0; i < fill_wqes; i++) {
-		if (!skb_arr_rq1[index]) {
-			skb_arr_rq1[index] = netdev_alloc_skb(dev,
-							      EHEA_L_PKT_SIZE);
-			if (!skb_arr_rq1[index]) {
-				pr->rq1_skba.os_skbs = fill_wqes - i;
-				break;
-			}
-		}
-		index--;
-		index &= max_index_mask;
-		adder++;
-	}
-
-	if (adder == 0)
-		return;
-
-	/* Ring doorbell */
-	ehea_update_rq1a(pr->qp, adder);
-}
-
-static void ehea_init_fill_rq1(struct ehea_port_res *pr, int nr_rq1a)
-{
-	struct sk_buff **skb_arr_rq1 = pr->rq1_skba.arr;
-	struct net_device *dev = pr->port->netdev;
-	int i;
-
-	if (nr_rq1a > pr->rq1_skba.len) {
-		netdev_err(dev, "NR_RQ1A bigger than skb array len\n");
-		return;
-	}
-
-	for (i = 0; i < nr_rq1a; i++) {
-		skb_arr_rq1[i] = netdev_alloc_skb(dev, EHEA_L_PKT_SIZE);
-		if (!skb_arr_rq1[i])
-			break;
-	}
-	/* Ring doorbell */
-	ehea_update_rq1a(pr->qp, i - 1);
-}
-
-static int ehea_refill_rq_def(struct ehea_port_res *pr,
-			      struct ehea_q_skb_arr *q_skba, int rq_nr,
-			      int num_wqes, int wqe_type, int packet_size)
-{
-	struct net_device *dev = pr->port->netdev;
-	struct ehea_qp *qp = pr->qp;
-	struct sk_buff **skb_arr = q_skba->arr;
-	struct ehea_rwqe *rwqe;
-	int i, index, max_index_mask, fill_wqes;
-	int adder = 0;
 	int ret = 0;
+	//unsigned int val = 0;
 
-	fill_wqes = q_skba->os_skbs + num_wqes;
-	q_skba->os_skbs = 0;
+	if (clock_lock)
+		gpex_clock_mutex_lock();
 
-	if (unlikely(test_bit(__EHEA_STOP_XFER, &ehea_driver_flags))) {
-		q_skba->os_skbs = fill_wqes;
-		return ret;
-	}
+	ret = gpexbe_pm_get_status();
 
-	index = q_skba->index;
-	max_index_mask = q_skba->len - 1;
-	for (i = 0; i < fill_wqes; i++) {
-		u64 tmp_addr;
-		struct sk_buff *skb;
+	if (clock_lock)
+		gpex_clock_mutex_unlock();
 
-		skb = netdev_alloc_skb_ip_align(dev, packet_size);
-		if (!skb) {
-			q_skba->os_skbs = fill_wqes - i;
-			if (q_skba->os_skbs == q_skba->len - 2) {
-				netdev_info(pr->port->netdev,
-					    "rq%i ran dry - no mem for skb\n",
-					    rq_nr);
-				ret = -ENOMEM;
-			}
-			break;
-		}
-
-		skb_arr[index] = skb;
-		tmp_addr = ehea_map_vaddr(skb->data);
-		if (tmp_addr == -1) {
-			dev_consume_skb_any(skb);
-			q_skba->os_skbs = fill_wqes - i;
-			ret = 0;
-			break;
-		}
-
-		rwqe = ehea_get_next_rwqe(qp, rq_nr);
-		rwqe->wr_id = EHEA_BMASK_SET(EHEA_WR_ID_TYPE, wqe_type)
-			    | EHEA_BMASK_SET(EHEA_WR_ID_INDEX, index);
-		rwqe->sg_list[0].l_key = pr->recv_mr.lkey;
-		rwqe->sg_list[0].vaddr = tmp_addr;
-		rwqe->sg_list[0].len = packet_size;
-		rwqe->data_segments = 1;
-
-		index++;
-		index &= max_index_mask;
-		adder++;
-	}
-
-	q_skba->index = index;
-	if (adder == 0)
-		goto out;
-
-	/* Ring doorbell */
-	iosync();
-	if (rq_nr == 2)
-		ehea_update_rq2a(pr->qp, adder);
-	else
-		ehea_update_rq3a(pr->qp, adder);
-out:
 	return ret;
 }
 
-
-static int ehea_refill_rq2(struct ehea_port_res *pr, int nr_of_wqes)
+/* Read the power_status value set by gpex_pm module */
+int gpex_pm_get_power_status(void)
 {
-	return ehea_refill_rq_def(pr, &pr->rq2_skba, 2,
-				  nr_of_wqes, EHEA_RWQE2_TYPE,
-				  EHEA_RQ2_PKT_SIZE);
+	return pm.power_status;
 }
 
-
-static int ehea_refill_rq3(struct ehea_port_res *pr, int nr_of_wqes)
+void gpex_pm_lock(void)
 {
-	return ehea_refill_rq_def(pr, &pr->rq3_skba, 3,
-				  nr_of_wqes, EHEA_RWQE3_TYPE,
-				  EHEA_MAX_PACKET_SIZE);
+	gpexbe_pm_access_lock();
 }
 
-static inline int ehea_check_cqe(struct ehea_cqe *cqe, int *rq_num)
+void gpex_pm_unlock(void)
 {
-	*rq_num = (cqe->type & EHEA_CQE_TYPE_RQ) >> 5;
-	if ((cqe->status & EHEA_CQE_STAT_ERR_MASK) == 0)
-		return 0;
-	if (((cqe->status & EHEA_CQE_STAT_ERR_TCP) != 0) &&
-	    (cqe->header_length == 0))
-		return 0;
+	gpexbe_pm_access_unlock();
+}
+
+static ssize_t show_power_state(char *buf)
+{
+	ssize_t ret = 0;
+
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_pm_get_status(true));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_power_state);
+
+/******************************
+ * RTPM callback functions
+ * ***************************/
+int gpex_pm_power_on(struct device *dev)
+{
+	int ret = 0;
+
+	pm.skip_auto_suspend = false;
+
+#if IS_ENABLED(CONFIG_MALI_EXYNOS_BLOCK_RPM_WHILE_SUSPEND_RESUME)
+	if (pm.state == GPEX_PM_STATE_RESUME_BEGIN && gpex_pm_get_status(false) > 0) {
+		pm.skip_auto_suspend = true;
+	} else {
+		gpex_debug_new_record(HIST_RTPM);
+		ret = pm_runtime_get_sync(dev);
+		gpex_debug_record(HIST_RTPM, 0, PM_RUNTIME_GET_SYNC, ret);
+	}
+#else
+	gpex_debug_new_record(HIST_RTPM);
+	ret = pm_runtime_get_sync(dev);
+	gpex_debug_record(HIST_RTPM, 0, PM_RUNTIME_GET_SYNC, ret);
+#endif
+
+	if (ret >= 0) {
+		gpex_ifpo_power_up();
+		GPU_LOG_DETAILED(MALI_EXYNOS_INFO, LSI_GPU_RPM_RESUME_API, ret, 0u, "power on\n");
+	} else {
+		GPU_LOG(MALI_EXYNOS_ERROR, "runtime pm returned %d\n", ret);
+		gpex_debug_incr_error_cnt(HIST_RTPM);
+	}
+
+	gpex_dvfs_start();
+
+	return ret;
+}
+
+void gpex_pm_power_autosuspend(struct device *dev)
+{
+	int ret = 0;
+
+	gpex_ifpo_power_down();
+
+	if (!pm.skip_auto_suspend) {
+		pm_runtime_mark_last_busy(dev);
+		ret = pm_runtime_put_autosuspend(dev);
+	}
+
+	GPU_LOG_DETAILED(MALI_EXYNOS_INFO, LSI_GPU_RPM_SUSPEND_API, ret, 0u,
+			 "power autosuspend prepare\n");
+}
+
+void gpex_pm_suspend(struct device *dev)
+{
+	int ret = 0;
+
+	gpexwa_wakeup_clock_suspend();
+	gpex_qos_set_from_clock(0);
+
+	gpex_debug_new_record(HIST_SUSPEND);
+	ret = pm_runtime_suspend(dev);
+	gpex_debug_record(HIST_SUSPEND, 0, PM_RUNTIME_SUSPEND, ret);
+
+	if (ret < 0)
+		gpex_debug_incr_error_cnt(HIST_SUSPEND);
+
+	GPU_LOG_DETAILED(MALI_EXYNOS_INFO, LSI_SUSPEND_CALLBACK, ret, 0u, "power suspend\n");
+}
+
+static struct delayed_work gpu_poweroff_delay_set_work;
+
+static void gpu_poweroff_delay_recovery_callback(struct work_struct *data)
+{
+	if (!pm.dev->power.use_autosuspend)
+		return;
+
+	device_lock(pm.dev);
+	pm_runtime_set_autosuspend_delay(pm.dev, pm.runtime_pm_delay_time);
+	device_unlock(pm.dev);
+
+	gpex_clock_set_user_min_lock_input(0);
+	gpex_clock_lock_clock(GPU_CLOCK_MIN_UNLOCK, SYSFS_LOCK, 0);
+	GPU_LOG(MALI_EXYNOS_DEBUG, "gpu poweroff delay recovery done & clock min unlock\n");
+
+	gpex_clboost_set_state(CLBOOST_ENABLE);
+}
+
+static int gpu_poweroff_delay_recovery(unsigned int period)
+{
+#define POWEROFF_DELAY_MAX_PERIOD 1500
+#define POWEROFF_DELAY_MIN_PERIOD 50
+
+	/* boundary */
+	if (period > POWEROFF_DELAY_MAX_PERIOD)
+		period = POWEROFF_DELAY_MAX_PERIOD;
+	else if (period < POWEROFF_DELAY_MIN_PERIOD)
+		period = POWEROFF_DELAY_MIN_PERIOD;
+
+	GPU_LOG(MALI_EXYNOS_DEBUG, "gpu poweroff delay set wq start(%u)\n", period);
+
+	cancel_delayed_work_sync(&gpu_poweroff_delay_set_work);
+	schedule_delayed_work(&gpu_poweroff_delay_set_work, msecs_to_jiffies(period));
+
+	return 0;
+}
+
+static ssize_t set_sysfs_poweroff_delay(const char *buf, size_t count)
+{
+	long delay;
+
+	if (!pm.dev->power.use_autosuspend)
+		return -EIO;
+
+	if (kstrtol(buf, 10, &delay) != 0 || delay != (int)delay)
+		return -EINVAL;
+
+	if (delay < pm.runtime_pm_delay_time)
+		delay = pm.runtime_pm_delay_time;
+
+	device_lock(pm.dev);
+	pm_runtime_set_autosuspend_delay(pm.dev, delay);
+	device_unlock(pm.dev);
+
+	gpu_poweroff_delay_recovery((unsigned int)delay);
+
+	return count;
+}
+CREATE_SYSFS_KOBJECT_WRITE_FUNCTION(set_sysfs_poweroff_delay)
+
+static ssize_t show_sysfs_poweroff_delay(char *buf)
+{
+	ssize_t ret = 0;
+
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", pm.runtime_pm_delay_time);
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_KOBJECT_READ_FUNCTION(show_sysfs_poweroff_delay)
+
+static void gpu_poweroff_delay_wq_init(void)
+{
+	INIT_DELAYED_WORK(&gpu_poweroff_delay_set_work, gpu_poweroff_delay_recovery_callback);
+}
+
+static void gpu_poweroff_delay_wq_deinit(void)
+{
+	cancel_delayed_work_sync(&gpu_poweroff_delay_set_work);
+}
+
+int gpex_pm_runtime_init(struct device *dev)
+{
+	int ret = 0;
+
+	pm_runtime_set_autosuspend_delay(dev, pm.runtime_pm_delay_time);
+	pm_runtime_use_autosuspend(dev);
+
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+
+	gpu_poweroff_delay_wq_init();
+
+	if (!pm_runtime_enabled(dev)) {
+		dev_warn(dev, "pm_runtime not enabled");
+		ret = -ENOSYS;
+	}
+
+	return ret;
+}
+
+void gpex_pm_runtime_term(struct device *dev)
+{
+	pm_runtime_disable(dev);
+
+	gpu_poweroff_delay_wq_deinit();
+}
+
+int gpex_pm_runtime_on_prepare(struct device *dev)
+{
+	GPU_LOG_DETAILED(MALI_EXYNOS_DEBUG, LSI_GPU_ON, 0u, 0u, "runtime on callback\n");
+
+	pm.power_status = true;
+
+	gpexbe_smc_notify_power_on();
+
+	gpexwa_wakeup_clock_restore();
+
+	return 0;
+}
+
+/* TODO: 9830 need to store and restore clock before and after power off/on */
+#if 0
+int pm_callback_runtime_on(struct kbase_device *kbdev)
+{
+	struct exynos_context *platform = (struct exynos_context *) kbdev->platform_context;
+	if (!platform)
+		return -ENODEV;
+
+	GPU_LOG(MALI_EXYNOS_DEBUG, LSI_GPU_ON, 0u, 0u, "runtime on callback\n");
+
+	platform->power_status = true;
+
+	/* Set clock - restore previous g3d clock, after g3d runtime on */
+	if (gpex_dvfs_get_status() && platform->wakeup_lock) {
+		if (platform->restore_clock > G3D_DVFS_MIDDLE_CLOCK) {
+			gpex_clock_set(platform->restore_clock);
+			GPU_LOG(MALI_EXYNOS_DEBUG, LSI_GPU_ON, platform->restore_clock, gpex_clock_get_cur_clock(), "runtime on callback - restore clock = %d, cur clock = %d\n", platform->restore_clock, gpex_clock_get_cur_clock());
+			platform->restore_clock = 0;
+		}
+	}
+	return 0;
+}
+#endif
+
+void gpex_pm_runtime_off_prepare(struct device *dev)
+{
+	CSTD_UNUSED(dev);
+	GPU_LOG_DETAILED(MALI_EXYNOS_DEBUG, LSI_GPU_OFF, 0u, 0u, "runtime off callback\n");
+
+	gpexbe_smc_notify_power_off();
+
+	/* power up from ifpo down state before going to full rtpm power off */
+	gpex_ifpo_power_up();
+	gpex_tsg_reset_count(0);
+	gpex_dvfs_stop();
+
+	gpex_clock_prepare_runtime_off();
+	gpexwa_wakeup_clock_set();
+	gpex_qos_set_from_clock(0);
+
+	pm.power_status = false;
+}
+
+int gpex_pm_init(void)
+{
+	pm.power_status = true;
+
+	pm.runtime_pm_delay_time = gpexbe_devicetree_get_int(gpu_runtime_pm_delay_time);
+
+	GPEX_UTILS_SYSFS_DEVICE_FILE_ADD_RO(power_state, show_power_state);
+	GPEX_UTILS_SYSFS_KOBJECT_FILE_ADD(gpu_poweroff_delay, show_sysfs_poweroff_delay,
+					  set_sysfs_poweroff_delay);
+
+	pm.state = GPEX_PM_STATE_START;
+	pm.skip_auto_suspend = false;
+
+	pm.dev = gpex_utils_get_device();
+
+	gpex_utils_get_exynos_context()->pm = &pm;
+
+	return 0;
+}
+
+void gpex_pm_term(void)
+{
+	memset(&pm, 0, sizeof(struct pm_info));
+
+	return;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /* SPDX-License-Identifier: GPL-2.0 */
+
+/*
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ */
+
+#include <linux/version.h>
+#include <linux/device.h>
+#include <linux/spinlock.h>
+#include <linux/slab.h>
+
+#include <gpexbe_devicetree.h>
+#include <gpex_utils.h>
+#include <gpex_debug.h>
+#include <gpex_qos.h>
+#include <gpex_clock.h>
+#include <gpex_tsg.h>
+#include <gpexbe_qos.h>
+#include <gpexbe_bts.h>
+#include <gpex_clboost.h>
+#include <gpex_gts.h>
+#include <gpexbe_llc_coherency.h>
+
+#include <gpexwa_peak_notify.h>
+
+#define HCM_MODE_A (1 << 0)
+#define HCM_MODE_B (1 << 1)
+#define HCM_MODE_C (1 << 2)
+
+struct _qos_info {
+	bool is_pm_qos_init;
+	int mo_min_clock;
+	unsigned int is_set_bts; // Check the pair of bts scenario.
+	bool gpu_bts_support;
+	spinlock_t bts_spinlock;
+
+	int cpu_cluster_count; // is this worth keeping after init?
+
+	int qos_table_size;
+	int clqos_table_size;
+
+	/* HCM Stuff */
+	int gpu_heavy_compute_cpu0_min_clock;
+	int gpu_heavy_compute_vk_cpu0_min_clock;
+};
+
+struct _qos_table {
+	int gpu_clock;
+	int mem_freq;
+	int cpu_little_min_freq;
+	int cpu_middle_min_freq;
+	int cpu_big_max_freq;
+	int llc_ways;
+};
+
+struct _clqos_table {
+	int gpu_clock;
+	int mif_min;
+	int little_min;
+	int middle_min;
+	int big_max;
+};
+
+static struct _qos_info qos_info;
+static struct _qos_table *qos_table;
+static struct _clqos_table *clqos_table;
+
+static int gpex_qos_get_table_idx(int clock)
+{
+	int idx;
+
+	for (idx = 0; idx < qos_info.qos_table_size; idx++) {
+		if (qos_table[idx].gpu_clock == clock)
+			return idx;
+	}
+
 	return -EINVAL;
 }
 
-static inline void ehea_fill_skb(struct net_device *dev,
-				 struct sk_buff *skb, struct ehea_cqe *cqe,
-				 struct ehea_port_res *pr)
+int gpex_qos_set(gpex_qos_flag flags, int val)
 {
-	int length = cqe->num_bytes_transfered - 4;	/*remove CRC */
-
-	skb_put(skb, length);
-	skb->protocol = eth_type_trans(skb, dev);
-
-	/* The packet was not an IPV4 packet so a complemented checksum was
-	   calculated. The value is found in the Internet Checksum field. */
-	if (cqe->status & EHEA_CQE_BLIND_CKSUM) {
-		skb->ip_summed = CHECKSUM_COMPLETE;
-		skb->csum = csum_unfold(~cqe->inet_checksum_value);
-	} else
-		skb->ip_summed = CHECKSUM_UNNECESSARY;
-
-	skb_record_rx_queue(skb, pr - &pr->port->port_res[0]);
-}
-
-static inline struct sk_buff *get_skb_by_index(struct sk_buff **skb_array,
-					       int arr_len,
-					       struct ehea_cqe *cqe)
-{
-	int skb_index = EHEA_BMASK_GET(EHEA_WR_ID_INDEX, cqe->wr_id);
-	struct sk_buff *skb;
-	void *pref;
-	int x;
-
-	x = skb_index + 1;
-	x &= (arr_len - 1);
-
-	pref = skb_array[x];
-	if (pref) {
-		prefetchw(pref);
-		prefetchw(pref + EHEA_CACHE_LINE);
-
-		pref = (skb_array[x]->data);
-		prefetch(pref);
-		prefetch(pref + EHEA_CACHE_LINE);
-		prefetch(pref + EHEA_CACHE_LINE * 2);
-		prefetch(pref + EHEA_CACHE_LINE * 3);
+	if (!qos_info.is_pm_qos_init) {
+		GPU_LOG(MALI_EXYNOS_ERROR, "%s: PM QOS ERROR : pm_qos not initialized\n", __func__);
+		return -ENOENT;
 	}
 
-	skb = skb_array[skb_index];
-	skb_array[skb_index] = NULL;
-	return skb;
-}
+	gpexbe_qos_request_update((mali_pmqos_flags)flags, val);
 
-static inline struct sk_buff *get_skb_by_index_ll(struct sk_buff **skb_array,
-						  int arr_len, int wqe_index)
-{
-	struct sk_buff *skb;
-	void *pref;
-	int x;
-
-	x = wqe_index + 1;
-	x &= (arr_len - 1);
-
-	pref = skb_array[x];
-	if (pref) {
-		prefetchw(pref);
-		prefetchw(pref + EHEA_CACHE_LINE);
-
-		pref = (skb_array[x]->data);
-		prefetchw(pref);
-		prefetchw(pref + EHEA_CACHE_LINE);
-	}
-
-	skb = skb_array[wqe_index];
-	skb_array[wqe_index] = NULL;
-	return skb;
-}
-
-static int ehea_treat_poll_error(struct ehea_port_res *pr, int rq,
-				 struct ehea_cqe *cqe, int *processed_rq2,
-				 int *processed_rq3)
-{
-	struct sk_buff *skb;
-
-	if (cqe->status & EHEA_CQE_STAT_ERR_TCP)
-		pr->p_stats.err_tcp_cksum++;
-	if (cqe->status & EHEA_CQE_STAT_ERR_IP)
-		pr->p_stats.err_ip_cksum++;
-	if (cqe->status & EHEA_CQE_STAT_ERR_CRC)
-		pr->p_stats.err_frame_crc++;
-
-	if (rq == 2) {
-		*processed_rq2 += 1;
-		skb = get_skb_by_index(pr->rq2_skba.arr, pr->rq2_skba.len, cqe);
-		dev_kfree_skb(skb);
-	} else if (rq == 3) {
-		*processed_rq3 += 1;
-		skb = get_skb_by_index(pr->rq3_skba.arr, pr->rq3_skba.len, cqe);
-		dev_kfree_skb(skb);
-	}
-
-	if (cqe->status & EHEA_CQE_STAT_FAT_ERR_MASK) {
-		if (netif_msg_rx_err(pr->port)) {
-			pr_err("Critical receive error for QP %d. Resetting port.\n",
-			       pr->qp->init_attr.qp_nr);
-			ehea_dump(cqe, sizeof(*cqe), "CQE");
-		}
-		ehea_schedule_port_reset(pr->port);
-		return 1;
-	}
+	/* TODO: record PMQOS state somewhere */
 
 	return 0;
 }
 
-static int ehea_proc_rwqes(struct net_device *dev,
-			   struct ehea_port_res *pr,
-			   int budget)
+int gpex_qos_unset(gpex_qos_flag flags)
 {
-	struct ehea_port *port = pr->port;
-	struct ehea_qp *qp = pr->qp;
-	struct ehea_cqe *cqe;
-	struct sk_buff *skb;
-	struct sk_buff **skb_arr_rq1 = pr->rq1_skba.arr;
-	struct sk_buff **skb_arr_rq2 = pr->rq2_skba.arr;
-	struct sk_buff **skb_arr_rq3 = pr->rq3_skba.arr;
-	int skb_arr_rq1_len = pr->rq1_skba.len;
-	int skb_arr_rq2_len = pr->rq2_skba.len;
-	int skb_arr_rq3_len = pr->rq3_skba.len;
-	int processed, processed_rq1, processed_rq2, processed_rq3;
-	u64 processed_bytes = 0;
-	int wqe_index, last_wqe_index, rq, port_reset;
-
-	processed = processed_rq1 = processed_rq2 = processed_rq3 = 0;
-	last_wqe_index = 0;
-
-	cqe = ehea_poll_rq1(qp, &wqe_index);
-	while ((processed < budget) && cqe) {
-		ehea_inc_rq1(qp);
-		processed_rq1++;
-		processed++;
-		if (netif_msg_rx_status(port))
-			ehea_dump(cqe, sizeof(*cqe), "CQE");
-
-		last_wqe_index = wqe_index;
-		rmb();
-		if (!ehea_check_cqe(cqe, &rq)) {
-			if (rq == 1) {
-				/* LL RQ1 */
-				skb = get_skb_by_index_ll(skb_arr_rq1,
-							  skb_arr_rq1_len,
-							  wqe_index);
-				if (unlikely(!skb)) {
-					netif_info(port, rx_err, dev,
-						  "LL rq1: skb=NULL\n");
-
-					skb = netdev_alloc_skb(dev,
-							       EHEA_L_PKT_SIZE);
-					if (!skb)
-						break;
-				}
-				skb_copy_to_linear_data(skb, ((char *)cqe) + 64,
-						 cqe->num_bytes_transfered - 4);
-				ehea_fill_skb(dev, skb, cqe, pr);
-			} else if (rq == 2) {
-				/* RQ2 */
-				skb = get_skb_by_index(skb_arr_rq2,
-						       skb_arr_rq2_len, cqe);
-				if (unlikely(!skb)) {
-					netif_err(port, rx_err, dev,
-						  "rq2: skb=NULL\n");
-					break;
-				}
-				ehea_fill_skb(dev, skb, cqe, pr);
-				processed_rq2++;
-			} else {
-				/* RQ3 */
-				skb = get_skb_by_index(skb_arr_rq3,
-						       skb_arr_rq3_len, cqe);
-				if (unlikely(!skb)) {
-					netif_err(port, rx_err, dev,
-						  "rq3: skb=NULL\n");
-					break;
-				}
-				ehea_fill_skb(dev, skb, cqe, pr);
-				processed_rq3++;
-			}
-
-			processed_bytes += skb->len;
-
-			if (cqe->status & EHEA_CQE_VLAN_TAG_XTRACT)
-				__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
-						       cqe->vlan_tag);
-
-			napi_gro_receive(&pr->napi, skb);
-		} else {
-			pr->p_stats.poll_receive_errors++;
-			port_reset = ehea_treat_poll_error(pr, rq, cqe,
-							   &processed_rq2,
-							   &processed_rq3);
-			if (port_reset)
-				break;
-		}
-		cqe = ehea_poll_rq1(qp, &wqe_index);
+	if (!qos_info.is_pm_qos_init) {
+		GPU_LOG(MALI_EXYNOS_ERROR, "%s: PM QOS ERROR : pm_qos not initialized\n", __func__);
+		return -ENOENT;
 	}
+	gpexbe_qos_request_unset((mali_pmqos_flags)flags);
 
-	pr->rx_packets += processed;
-	pr->rx_bytes += processed_bytes;
+	/* TODO: record PMQOS state somewhere */
 
-	ehea_refill_rq1(pr, last_wqe_index, processed_rq1);
-	ehea_refill_rq2(pr, processed_rq2);
-	ehea_refill_rq3(pr, processed_rq3);
-
-	return processed;
+	return 0;
 }
 
-#define SWQE_RESTART_CHECK 0xdeadbeaff00d0000ull
-
-static void reset_sq_restart_flag(struct ehea_port *port)
+int gpex_qos_init(void)
 {
-	int i;
+	int i = 0;
+	gpu_dt *dt = gpexbe_devicetree_get_gpu_dt();
 
-	for (i = 0; i < port->num_def_qps; i++) {
-		struct ehea_port_res *pr = &port->port_res[i];
-		pr->sq_restart_flag = 0;
-	}
-	wake_up(&port->restart_wq);
-}
+	/* TODO: check dependent backends are initializaed */
 
-static void check_sqs(struct ehea_port *port)
-{
-	struct ehea_swqe *swqe;
-	int swqe_index;
-	int i, k;
+	spin_lock_init(&qos_info.bts_spinlock);
 
-	for (i = 0; i < port->num_def_qps; i++) {
-		struct ehea_port_res *pr = &port->port_res[i];
-		int ret;
-		k = 0;
-		swqe = ehea_get_swqe(pr->qp, &swqe_index);
-		memset(swqe, 0, SWQE_HEADER_SIZE);
-		atomic_dec(&pr->swqe_avail);
+	qos_info.gpu_bts_support = (bool)gpexbe_devicetree_get_int(gpu_bts_support);
+	qos_info.mo_min_clock = gpexbe_devicetree_get_int(gpu_mo_min_clock);
 
-		swqe->tx_control |= EHEA_SWQE_PURGE;
-		swqe->wr_id = SWQE_RESTART_CHECK;
-		swqe->tx_control |= EHEA_SWQE_SIGNALLED_COMPLETION;
-		swqe->tx_control |= EHEA_SWQE_IMM_DATA_PRESENT;
-		swqe->immediate_data_length = 80;
+	qos_info.qos_table_size = dt->gpu_dvfs_table_size.row;
+	qos_table = kcalloc(qos_info.qos_table_size, sizeof(*qos_table), GFP_KERNEL);
 
-		ehea_post_swqe(pr->qp, swqe);
-
-		ret = wait_event_timeout(port->restart_wq,
-					 pr->sq_restart_flag == 0,
-					 msecs_to_jiffies(100));
-
-		if (!ret) {
-			pr_err("HW/SW queues out of sync\n");
-			ehea_schedule_port_reset(pr->port);
-			return;
-		}
-	}
-}
-
-
-static struct ehea_cqe *ehea_proc_cqes(struct ehea_port_res *pr, int my_quota)
-{
-	struct sk_buff *skb;
-	struct ehea_cq *send_cq = pr->send_cq;
-	struct ehea_cqe *cqe;
-	int quota = my_quota;
-	int cqe_counter = 0;
-	int swqe_av = 0;
-	int index;
-	struct netdev_queue *txq = netdev_get_tx_queue(pr->port->netdev,
-						pr - &pr->port->port_res[0]);
-
-	cqe = ehea_poll_cq(send_cq);
-	while (cqe && (quota > 0)) {
-		ehea_inc_cq(send_cq);
-
-		cqe_counter++;
-		rmb();
-
-		if (cqe->wr_id == SWQE_RESTART_CHECK) {
-			pr->sq_restart_flag = 1;
-			swqe_av++;
-			break;
-		}
-
-		if (cqe->status & EHEA_CQE_STAT_ERR_MASK) {
-			pr_err("Bad send completion status=0x%04X\n",
-			       cqe->status);
-
-			if (netif_msg_tx_err(pr->port))
-				ehea_dump(cqe, sizeof(*cqe), "Send CQE");
-
-			if (cqe->status & EHEA_CQE_STAT_RESET_MASK) {
-				pr_err("Resetting port\n");
-				ehea_schedule_port_reset(pr->port);
-				break;
-			}
-		}
-
-		if (netif_msg_tx_done(pr->port))
-			ehea_dump(cqe, sizeof(*cqe), "CQE");
-
-		if (likely(EHEA_BMASK_GET(EHEA_WR_ID_TYPE, cqe->wr_id)
-			   == EHEA_SWQE2_TYPE)) {
-
-			index = EHEA_BMASK_GET(EHEA_WR_ID_INDEX, cqe->wr_id);
-			skb = pr->sq_skba.arr[index];
-			dev_consume_skb_any(skb);
-			pr->sq_skba.arr[index] = NULL;
-		}
-
-		swqe_av += EHEA_BMASK_GET(EHEA_WR_ID_REFILL, cqe->wr_id);
-		quota--;
-
-		cqe = ehea_poll_cq(send_cq);
+	for (i = 0; i < qos_info.qos_table_size; i++) {
+		qos_table[i].gpu_clock = dt->gpu_dvfs_table[i].clock;
+		qos_table[i].mem_freq = dt->gpu_dvfs_table[i].mem_freq;
+		qos_table[i].cpu_little_min_freq = dt->gpu_dvfs_table[i].cpu_little_min_freq;
+		qos_table[i].cpu_middle_min_freq = dt->gpu_dvfs_table[i].cpu_middle_min_freq;
+		qos_table[i].cpu_big_max_freq = dt->gpu_dvfs_table[i].cpu_big_max_freq;
+		qos_table[i].llc_ways = dt->gpu_dvfs_table[i].llc_ways;
 	}
 
-	ehea_update_feca(send_cq, cqe_counter);
-	atomic_add(swqe_av, &pr->swqe_avail);
-
-	if (unlikely(netif_tx_queue_stopped(txq) &&
-		     (atomic_read(&pr->swqe_avail) >= pr->swqe_refill_th))) {
-		__netif_tx_lock(txq, smp_processor_id());
-		if (netif_tx_queue_stopped(txq) &&
-		    (atomic_read(&pr->swqe_avail) >= pr->swqe_refill_th))
-			netif_tx_wake_queue(txq);
-		__netif_tx_unlock(txq);
+#if 0
+	if (gpex_qos_get_table_idx(qos_info.mo_min_clock) < 0) {
+		/* TODO: print error msg */
+		BUG();
+		return -1;
 	}
-
-	wake_up(&pr->port->swqe_avail_wq);
-
-	return cqe;
-}
-
-#define EHEA_POLL_MAX_CQES 65535
-
-static int ehea_poll(struct napi_struct *napi, int budget)
-{
-	struct ehea_port_res *pr = container_of(napi, struct ehea_port_res,
-						napi);
-	struct net_device *dev = pr->port->netdev;
-	struct ehea_cqe *cqe;
-	struct ehea_cqe *cqe_skb = NULL;
-	int wqe_index;
-	int rx = 0;
-
-	cqe_skb = ehea_proc_cqes(pr, EHEA_POLL_MAX_CQES);
-	rx += ehea_proc_rwqes(dev, pr, budget - rx);
-
-	while (rx != budget) {
-		napi_complete(napi);
-		ehea_reset_cq_ep(pr->recv_cq);
-		ehea_reset_cq_ep(pr->send_cq);
-		ehea_reset_cq_n1(pr->recv_cq);
-		ehea_reset_cq_n1(pr->send_cq);
-		rmb();
-		cqe = ehea_poll_rq1(pr->qp, &wqe_index);
-		cqe_skb = ehea_poll_cq(pr->send_cq);
-
-		if (!cqe && !cqe_skb)
-			return rx;
-
-		if (!napi_reschedule(napi))
-			return rx;
-
-		cqe_skb = ehea_proc_cqes(pr, EHEA_POLL_MAX_CQES);
-		rx += ehea_proc_rwqes(dev, pr, budget - rx);
-	}
-
-	return rx;
-}
-
-#ifdef CONFIG_NET_POLL_CONTROLLER
-static void ehea_netpoll(struct net_device *dev)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	int i;
-
-	for (i = 0; i < port->num_def_qps; i++)
-		napi_schedule(&port->port_res[i].napi);
-}
 #endif
 
-static irqreturn_t ehea_recv_irq_handler(int irq, void *param)
-{
-	struct ehea_port_res *pr = param;
+	qos_info.clqos_table_size = dt->gpu_cl_pmqos_table_size.row;
+	clqos_table = kcalloc(qos_info.clqos_table_size, sizeof(*clqos_table), GFP_KERNEL);
 
-	napi_schedule(&pr->napi);
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t ehea_qp_aff_irq_handler(int irq, void *param)
-{
-	struct ehea_port *port = param;
-	struct ehea_eqe *eqe;
-	struct ehea_qp *qp;
-	u32 qp_token;
-	u64 resource_type, aer, aerr;
-	int reset_port = 0;
-
-	eqe = ehea_poll_eq(port->qp_eq);
-
-	while (eqe) {
-		qp_token = EHEA_BMASK_GET(EHEA_EQE_QP_TOKEN, eqe->entry);
-		pr_err("QP aff_err: entry=0x%llx, token=0x%x\n",
-		       eqe->entry, qp_token);
-
-		qp = port->port_res[qp_token].qp;
-
-		resource_type = ehea_error_data(port->adapter, qp->fw_handle,
-						&aer, &aerr);
-
-		if (resource_type == EHEA_AER_RESTYPE_QP) {
-			if ((aer & EHEA_AER_RESET_MASK) ||
-			    (aerr & EHEA_AERR_RESET_MASK))
-				 reset_port = 1;
-		} else
-			reset_port = 1;   /* Reset in case of CQ or EQ error */
-
-		eqe = ehea_poll_eq(port->qp_eq);
+	for (i = 0; i < qos_info.clqos_table_size; i++) {
+		clqos_table[i].gpu_clock = dt->gpu_cl_pmqos_table[i].clock;
+		clqos_table[i].mif_min = dt->gpu_cl_pmqos_table[i].mif_min;
+		clqos_table[i].little_min = dt->gpu_cl_pmqos_table[i].little_min;
+		clqos_table[i].middle_min = dt->gpu_cl_pmqos_table[i].middle_min;
+		clqos_table[i].big_max = dt->gpu_cl_pmqos_table[i].big_max;
 	}
 
-	if (reset_port) {
-		pr_err("Resetting port\n");
-		ehea_schedule_port_reset(port);
-	}
-
-	return IRQ_HANDLED;
-}
-
-static struct ehea_port *ehea_get_port(struct ehea_adapter *adapter,
-				       int logical_port)
-{
-	int i;
-
-	for (i = 0; i < EHEA_MAX_PORTS; i++)
-		if (adapter->port[i])
-			if (adapter->port[i]->logical_port_id == logical_port)
-				return adapter->port[i];
-	return NULL;
-}
-
-int ehea_sense_port_attr(struct ehea_port *port)
-{
-	int ret;
-	u64 hret;
-	struct hcp_ehea_port_cb0 *cb0;
-
-	/* may be called via ehea_neq_tasklet() */
-	cb0 = (void *)get_zeroed_page(GFP_ATOMIC);
-	if (!cb0) {
-		pr_err("no mem for cb0\n");
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	hret = ehea_h_query_ehea_port(port->adapter->handle,
-				      port->logical_port_id, H_PORT_CB0,
-				      EHEA_BMASK_SET(H_PORT_CB0_ALL, 0xFFFF),
-				      cb0);
-	if (hret != H_SUCCESS) {
-		ret = -EIO;
-		goto out_free;
-	}
-
-	/* MAC address */
-	port->mac_addr = cb0->port_mac_addr << 16;
-
-	if (!is_valid_ether_addr((u8 *)&port->mac_addr)) {
-		ret = -EADDRNOTAVAIL;
-		goto out_free;
-	}
-
-	/* Port speed */
-	switch (cb0->port_speed) {
-	case H_SPEED_10M_H:
-		port->port_speed = EHEA_SPEED_10M;
-		port->full_duplex = 0;
-		break;
-	case H_SPEED_10M_F:
-		port->port_speed = EHEA_SPEED_10M;
-		port->full_duplex = 1;
-		break;
-	case H_SPEED_100M_H:
-		port->port_speed = EHEA_SPEED_100M;
-		port->full_duplex = 0;
-		break;
-	case H_SPEED_100M_F:
-		port->port_speed = EHEA_SPEED_100M;
-		port->full_duplex = 1;
-		break;
-	case H_SPEED_1G_F:
-		port->port_speed = EHEA_SPEED_1G;
-		port->full_duplex = 1;
-		break;
-	case H_SPEED_10G_F:
-		port->port_speed = EHEA_SPEED_10G;
-		port->full_duplex = 1;
-		break;
-	default:
-		port->port_speed = 0;
-		port->full_duplex = 0;
-		break;
-	}
-
-	port->autoneg = 1;
-	port->num_mcs = cb0->num_default_qps;
-
-	/* Number of default QPs */
-	if (use_mcs)
-		port->num_def_qps = cb0->num_default_qps;
-	else
-		port->num_def_qps = 1;
-
-	if (!port->num_def_qps) {
-		ret = -EINVAL;
-		goto out_free;
-	}
-
-	ret = 0;
-out_free:
-	if (ret || netif_msg_probe(port))
-		ehea_dump(cb0, sizeof(*cb0), "ehea_sense_port_attr");
-	free_page((unsigned long)cb0);
-out:
-	return ret;
-}
-
-int ehea_set_portspeed(struct ehea_port *port, u32 port_speed)
-{
-	struct hcp_ehea_port_cb4 *cb4;
-	u64 hret;
-	int ret = 0;
-
-	cb4 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb4) {
-		pr_err("no mem for cb4\n");
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	cb4->port_speed = port_speed;
-
-	netif_carrier_off(port->netdev);
-
-	hret = ehea_h_modify_ehea_port(port->adapter->handle,
-				       port->logical_port_id,
-				       H_PORT_CB4, H_PORT_CB4_SPEED, cb4);
-	if (hret == H_SUCCESS) {
-		port->autoneg = port_speed == EHEA_SPEED_AUTONEG ? 1 : 0;
-
-		hret = ehea_h_query_ehea_port(port->adapter->handle,
-					      port->logical_port_id,
-					      H_PORT_CB4, H_PORT_CB4_SPEED,
-					      cb4);
-		if (hret == H_SUCCESS) {
-			switch (cb4->port_speed) {
-			case H_SPEED_10M_H:
-				port->port_speed = EHEA_SPEED_10M;
-				port->full_duplex = 0;
-				break;
-			case H_SPEED_10M_F:
-				port->port_speed = EHEA_SPEED_10M;
-				port->full_duplex = 1;
-				break;
-			case H_SPEED_100M_H:
-				port->port_speed = EHEA_SPEED_100M;
-				port->full_duplex = 0;
-				break;
-			case H_SPEED_100M_F:
-				port->port_speed = EHEA_SPEED_100M;
-				port->full_duplex = 1;
-				break;
-			case H_SPEED_1G_F:
-				port->port_speed = EHEA_SPEED_1G;
-				port->full_duplex = 1;
-				break;
-			case H_SPEED_10G_F:
-				port->port_speed = EHEA_SPEED_10G;
-				port->full_duplex = 1;
-				break;
-			default:
-				port->port_speed = 0;
-				port->full_duplex = 0;
-				break;
-			}
-		} else {
-			pr_err("Failed sensing port speed\n");
-			ret = -EIO;
-		}
-	} else {
-		if (hret == H_AUTHORITY) {
-			pr_info("Hypervisor denied setting port speed\n");
-			ret = -EPERM;
-		} else {
-			ret = -EIO;
-			pr_err("Failed setting port speed\n");
-		}
-	}
-	if (!prop_carrier_state || (port->phy_link == EHEA_PHY_LINK_UP))
-		netif_carrier_on(port->netdev);
-
-	free_page((unsigned long)cb4);
-out:
-	return ret;
-}
-
-static void ehea_parse_eqe(struct ehea_adapter *adapter, u64 eqe)
-{
-	int ret;
-	u8 ec;
-	u8 portnum;
-	struct ehea_port *port;
-	struct net_device *dev;
-
-	ec = EHEA_BMASK_GET(NEQE_EVENT_CODE, eqe);
-	portnum = EHEA_BMASK_GET(NEQE_PORTNUM, eqe);
-	port = ehea_get_port(adapter, portnum);
-	if (!port) {
-		netdev_err(NULL, "unknown portnum %x\n", portnum);
-		return;
-	}
-	dev = port->netdev;
-
-	switch (ec) {
-	case EHEA_EC_PORTSTATE_CHG:	/* port state change */
-
-		if (EHEA_BMASK_GET(NEQE_PORT_UP, eqe)) {
-			if (!netif_carrier_ok(dev)) {
-				ret = ehea_sense_port_attr(port);
-				if (ret) {
-					netdev_err(dev, "failed resensing port attributes\n");
-					break;
-				}
-
-				netif_info(port, link, dev,
-					   "Logical port up: %dMbps %s Duplex\n",
-					   port->port_speed,
-					   port->full_duplex == 1 ?
-					   "Full" : "Half");
-
-				netif_carrier_on(dev);
-				netif_wake_queue(dev);
-			}
-		} else
-			if (netif_carrier_ok(dev)) {
-				netif_info(port, link, dev,
-					   "Logical port down\n");
-				netif_carrier_off(dev);
-				netif_tx_disable(dev);
-			}
-
-		if (EHEA_BMASK_GET(NEQE_EXTSWITCH_PORT_UP, eqe)) {
-			port->phy_link = EHEA_PHY_LINK_UP;
-			netif_info(port, link, dev,
-				   "Physical port up\n");
-			if (prop_carrier_state)
-				netif_carrier_on(dev);
-		} else {
-			port->phy_link = EHEA_PHY_LINK_DOWN;
-			netif_info(port, link, dev,
-				   "Physical port down\n");
-			if (prop_carrier_state)
-				netif_carrier_off(dev);
-		}
-
-		if (EHEA_BMASK_GET(NEQE_EXTSWITCH_PRIMARY, eqe))
-			netdev_info(dev,
-				    "External switch port is primary port\n");
-		else
-			netdev_info(dev,
-				    "External switch port is backup port\n");
-
-		break;
-	case EHEA_EC_ADAPTER_MALFUNC:
-		netdev_err(dev, "Adapter malfunction\n");
-		break;
-	case EHEA_EC_PORT_MALFUNC:
-		netdev_info(dev, "Port malfunction\n");
-		netif_carrier_off(dev);
-		netif_tx_disable(dev);
-		break;
-	default:
-		netdev_err(dev, "unknown event code %x, eqe=0x%llX\n", ec, eqe);
-		break;
-	}
-}
-
-static void ehea_neq_tasklet(unsigned long data)
-{
-	struct ehea_adapter *adapter = (struct ehea_adapter *)data;
-	struct ehea_eqe *eqe;
-	u64 event_mask;
-
-	eqe = ehea_poll_eq(adapter->neq);
-	pr_debug("eqe=%p\n", eqe);
-
-	while (eqe) {
-		pr_debug("*eqe=%lx\n", (unsigned long) eqe->entry);
-		ehea_parse_eqe(adapter, eqe->entry);
-		eqe = ehea_poll_eq(adapter->neq);
-		pr_debug("next eqe=%p\n", eqe);
-	}
-
-	event_mask = EHEA_BMASK_SET(NELR_PORTSTATE_CHG, 1)
-		   | EHEA_BMASK_SET(NELR_ADAPTER_MALFUNC, 1)
-		   | EHEA_BMASK_SET(NELR_PORT_MALFUNC, 1);
-
-	ehea_h_reset_events(adapter->handle,
-			    adapter->neq->fw_handle, event_mask);
-}
-
-static irqreturn_t ehea_interrupt_neq(int irq, void *param)
-{
-	struct ehea_adapter *adapter = param;
-	tasklet_hi_schedule(&adapter->neq_tasklet);
-	return IRQ_HANDLED;
-}
-
-
-static int ehea_fill_port_res(struct ehea_port_res *pr)
-{
-	int ret;
-	struct ehea_qp_init_attr *init_attr = &pr->qp->init_attr;
-
-	ehea_init_fill_rq1(pr, pr->rq1_skba.len);
-
-	ret = ehea_refill_rq2(pr, init_attr->act_nr_rwqes_rq2 - 1);
-
-	ret |= ehea_refill_rq3(pr, init_attr->act_nr_rwqes_rq3 - 1);
-
-	return ret;
-}
-
-static int ehea_reg_interrupts(struct net_device *dev)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct ehea_port_res *pr;
-	int i, ret;
-
-
-	snprintf(port->int_aff_name, EHEA_IRQ_NAME_SIZE - 1, "%s-aff",
-		 dev->name);
-
-	ret = ibmebus_request_irq(port->qp_eq->attr.ist1,
-				  ehea_qp_aff_irq_handler,
-				  0, port->int_aff_name, port);
-	if (ret) {
-		netdev_err(dev, "failed registering irq for qp_aff_irq_handler:ist=%X\n",
-			   port->qp_eq->attr.ist1);
-		goto out_free_qpeq;
-	}
-
-	netif_info(port, ifup, dev,
-		   "irq_handle 0x%X for function qp_aff_irq_handler registered\n",
-		   port->qp_eq->attr.ist1);
-
-
-	for (i = 0; i < port->num_def_qps; i++) {
-		pr = &port->port_res[i];
-		snprintf(pr->int_send_name, EHEA_IRQ_NAME_SIZE - 1,
-			 "%s-queue%d", dev->name, i);
-		ret = ibmebus_request_irq(pr->eq->attr.ist1,
-					  ehea_recv_irq_handler,
-					  0, pr->int_send_name, pr);
-		if (ret) {
-			netdev_err(dev, "failed registering irq for ehea_queue port_res_nr:%d, ist=%X\n",
-				   i, pr->eq->attr.ist1);
-			goto out_free_req;
-		}
-		netif_info(port, ifup, dev,
-			   "irq_handle 0x%X for function ehea_queue_int %d registered\n",
-			   pr->eq->attr.ist1, i);
-	}
-out:
-	return ret;
-
-
-out_free_req:
-	while (--i >= 0) {
-		u32 ist = port->port_res[i].eq->attr.ist1;
-		ibmebus_free_irq(ist, &port->port_res[i]);
-	}
-
-out_free_qpeq:
-	ibmebus_free_irq(port->qp_eq->attr.ist1, port);
-	i = port->num_def_qps;
-
-	goto out;
-
-}
-
-static void ehea_free_interrupts(struct net_device *dev)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct ehea_port_res *pr;
-	int i;
-
-	/* send */
-
-	for (i = 0; i < port->num_def_qps; i++) {
-		pr = &port->port_res[i];
-		ibmebus_free_irq(pr->eq->attr.ist1, pr);
-		netif_info(port, intr, dev,
-			   "free send irq for res %d with handle 0x%X\n",
-			   i, pr->eq->attr.ist1);
-	}
-
-	/* associated events */
-	ibmebus_free_irq(port->qp_eq->attr.ist1, port);
-	netif_info(port, intr, dev,
-		   "associated event interrupt for handle 0x%X freed\n",
-		   port->qp_eq->attr.ist1);
-}
-
-static int ehea_configure_port(struct ehea_port *port)
-{
-	int ret, i;
-	u64 hret, mask;
-	struct hcp_ehea_port_cb0 *cb0;
-
-	ret = -ENOMEM;
-	cb0 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb0)
-		goto out;
-
-	cb0->port_rc = EHEA_BMASK_SET(PXLY_RC_VALID, 1)
-		     | EHEA_BMASK_SET(PXLY_RC_IP_CHKSUM, 1)
-		     | EHEA_BMASK_SET(PXLY_RC_TCP_UDP_CHKSUM, 1)
-		     | EHEA_BMASK_SET(PXLY_RC_VLAN_XTRACT, 1)
-		     | EHEA_BMASK_SET(PXLY_RC_VLAN_TAG_FILTER,
-				      PXLY_RC_VLAN_FILTER)
-		     | EHEA_BMASK_SET(PXLY_RC_JUMBO_FRAME, 1);
-
-	for (i = 0; i < port->num_mcs; i++)
-		if (use_mcs)
-			cb0->default_qpn_arr[i] =
-				port->port_res[i].qp->init_attr.qp_nr;
-		else
-			cb0->default_qpn_arr[i] =
-				port->port_res[0].qp->init_attr.qp_nr;
-
-	if (netif_msg_ifup(port))
-		ehea_dump(cb0, sizeof(*cb0), "ehea_configure_port");
-
-	mask = EHEA_BMASK_SET(H_PORT_CB0_PRC, 1)
-	     | EHEA_BMASK_SET(H_PORT_CB0_DEFQPNARRAY, 1);
-
-	hret = ehea_h_modify_ehea_port(port->adapter->handle,
-				       port->logical_port_id,
-				       H_PORT_CB0, mask, cb0);
-	ret = -EIO;
-	if (hret != H_SUCCESS)
-		goto out_free;
-
-	ret = 0;
-
-out_free:
-	free_page((unsigned long)cb0);
-out:
-	return ret;
-}
-
-static int ehea_gen_smrs(struct ehea_port_res *pr)
-{
-	int ret;
-	struct ehea_adapter *adapter = pr->port->adapter;
-
-	ret = ehea_gen_smr(adapter, &adapter->mr, &pr->send_mr);
-	if (ret)
-		goto out;
-
-	ret = ehea_gen_smr(adapter, &adapter->mr, &pr->recv_mr);
-	if (ret)
-		goto out_free;
+	qos_info.gpu_heavy_compute_cpu0_min_clock =
+		gpexbe_devicetree_get_int(gpu_heavy_compute_cpu0_min_clock);
+	qos_info.gpu_heavy_compute_vk_cpu0_min_clock =
+		gpexbe_devicetree_get_int(gpu_heavy_compute_vk_cpu0_min_clock);
+
+	/* Request to set QOS of other IPs */
+	gpexbe_qos_request_add(PMQOS_MIF | PMQOS_LITTLE | PMQOS_MIDDLE | PMQOS_BIG | PMQOS_MIN |
+			       PMQOS_MAX);
+
+	qos_info.is_pm_qos_init = true;
+
+	gpex_utils_get_exynos_context()->qos_info = &qos_info;
+	gpex_utils_get_exynos_context()->qos_table = qos_table;
+	gpex_utils_get_exynos_context()->clqos_table = clqos_table;
 
 	return 0;
-
-out_free:
-	ehea_rem_mr(&pr->send_mr);
-out:
-	pr_err("Generating SMRS failed\n");
-	return -EIO;
 }
 
-static int ehea_rem_smrs(struct ehea_port_res *pr)
+void gpex_qos_term(void)
 {
-	if ((ehea_rem_mr(&pr->send_mr)) ||
-	    (ehea_rem_mr(&pr->recv_mr)))
-		return -EIO;
-	else
+	gpexbe_qos_request_remove(PMQOS_MIF | PMQOS_LITTLE | PMQOS_MIDDLE | PMQOS_BIG | PMQOS_MIN |
+				  PMQOS_MAX);
+	kfree(qos_table);
+	kfree(clqos_table);
+	qos_info.is_pm_qos_init = false;
+}
+
+int gpex_qos_set_bts_mo(int clock)
+{
+	int ret = 0;
+	unsigned long flags;
+
+	if (!qos_info.gpu_bts_support) {
+		if (qos_info.is_set_bts) {
+			/* TODO: print error */
+			return -1;
+		}
 		return 0;
-}
-
-static int ehea_init_q_skba(struct ehea_q_skb_arr *q_skba, int max_q_entries)
-{
-	int arr_size = sizeof(void *) * max_q_entries;
-
-	q_skba->arr = vzalloc(arr_size);
-	if (!q_skba->arr)
-		return -ENOMEM;
-
-	q_skba->len = max_q_entries;
-	q_skba->index = 0;
-	q_skba->os_skbs = 0;
-
-	return 0;
-}
-
-static int ehea_init_port_res(struct ehea_port *port, struct ehea_port_res *pr,
-			      struct port_res_cfg *pr_cfg, int queue_token)
-{
-	struct ehea_adapter *adapter = port->adapter;
-	enum ehea_eq_type eq_type = EHEA_EQ;
-	struct ehea_qp_init_attr *init_attr = NULL;
-	int ret = -EIO;
-	u64 tx_bytes, rx_bytes, tx_packets, rx_packets;
-
-	tx_bytes = pr->tx_bytes;
-	tx_packets = pr->tx_packets;
-	rx_bytes = pr->rx_bytes;
-	rx_packets = pr->rx_packets;
-
-	memset(pr, 0, sizeof(struct ehea_port_res));
-
-	pr->tx_bytes = tx_bytes;
-	pr->tx_packets = tx_packets;
-	pr->rx_bytes = rx_bytes;
-	pr->rx_packets = rx_packets;
-
-	pr->port = port;
-
-	pr->eq = ehea_create_eq(adapter, eq_type, EHEA_MAX_ENTRIES_EQ, 0);
-	if (!pr->eq) {
-		pr_err("create_eq failed (eq)\n");
-		goto out_free;
 	}
 
-	pr->recv_cq = ehea_create_cq(adapter, pr_cfg->max_entries_rcq,
-				     pr->eq->fw_handle,
-				     port->logical_port_id);
-	if (!pr->recv_cq) {
-		pr_err("create_cq failed (cq_recv)\n");
-		goto out_free;
-	}
+	spin_lock_irqsave(&qos_info.bts_spinlock, flags);
 
-	pr->send_cq = ehea_create_cq(adapter, pr_cfg->max_entries_scq,
-				     pr->eq->fw_handle,
-				     port->logical_port_id);
-	if (!pr->send_cq) {
-		pr_err("create_cq failed (cq_send)\n");
-		goto out_free;
-	}
+	if (clock >= qos_info.mo_min_clock && !qos_info.is_set_bts) {
+		gpex_debug_new_record(HIST_BTS);
 
-	if (netif_msg_ifup(port))
-		pr_info("Send CQ: act_nr_cqes=%d, Recv CQ: act_nr_cqes=%d\n",
-			pr->send_cq->attr.act_nr_of_cqes,
-			pr->recv_cq->attr.act_nr_of_cqes);
+		ret = gpexbe_bts_set_bts_mo(1);
+		gpex_debug_record(HIST_BTS, qos_info.is_set_bts, 1, ret);
 
-	init_attr = kzalloc(sizeof(*init_attr), GFP_KERNEL);
-	if (!init_attr) {
-		ret = -ENOMEM;
-		pr_err("no mem for ehea_qp_init_attr\n");
-		goto out_free;
-	}
-
-	init_attr->low_lat_rq1 = 1;
-	init_attr->signalingtype = 1;	/* generate CQE if specified in WQE */
-	init_attr->rq_count = 3;
-	init_attr->qp_token = queue_token;
-	init_attr->max_nr_send_wqes = pr_cfg->max_entries_sq;
-	init_attr->max_nr_rwqes_rq1 = pr_cfg->max_entries_rq1;
-	init_attr->max_nr_rwqes_rq2 = pr_cfg->max_entries_rq2;
-	init_attr->max_nr_rwqes_rq3 = pr_cfg->max_entries_rq3;
-	init_attr->wqe_size_enc_sq = EHEA_SG_SQ;
-	init_attr->wqe_size_enc_rq1 = EHEA_SG_RQ1;
-	init_attr->wqe_size_enc_rq2 = EHEA_SG_RQ2;
-	init_attr->wqe_size_enc_rq3 = EHEA_SG_RQ3;
-	init_attr->rq2_threshold = EHEA_RQ2_THRESHOLD;
-	init_attr->rq3_threshold = EHEA_RQ3_THRESHOLD;
-	init_attr->port_nr = port->logical_port_id;
-	init_attr->send_cq_handle = pr->send_cq->fw_handle;
-	init_attr->recv_cq_handle = pr->recv_cq->fw_handle;
-	init_attr->aff_eq_handle = port->qp_eq->fw_handle;
-
-	pr->qp = ehea_create_qp(adapter, adapter->pd, init_attr);
-	if (!pr->qp) {
-		pr_err("create_qp failed\n");
-		ret = -EIO;
-		goto out_free;
-	}
-
-	if (netif_msg_ifup(port))
-		pr_info("QP: qp_nr=%d\n act_nr_snd_wqe=%d\n nr_rwqe_rq1=%d\n nr_rwqe_rq2=%d\n nr_rwqe_rq3=%d\n",
-			init_attr->qp_nr,
-			init_attr->act_nr_send_wqes,
-			init_attr->act_nr_rwqes_rq1,
-			init_attr->act_nr_rwqes_rq2,
-			init_attr->act_nr_rwqes_rq3);
-
-	pr->sq_skba_size = init_attr->act_nr_send_wqes + 1;
-
-	ret = ehea_init_q_skba(&pr->sq_skba, pr->sq_skba_size);
-	ret |= ehea_init_q_skba(&pr->rq1_skba, init_attr->act_nr_rwqes_rq1 + 1);
-	ret |= ehea_init_q_skba(&pr->rq2_skba, init_attr->act_nr_rwqes_rq2 + 1);
-	ret |= ehea_init_q_skba(&pr->rq3_skba, init_attr->act_nr_rwqes_rq3 + 1);
-	if (ret)
-		goto out_free;
-
-	pr->swqe_refill_th = init_attr->act_nr_send_wqes / 10;
-	if (ehea_gen_smrs(pr) != 0) {
-		ret = -EIO;
-		goto out_free;
-	}
-
-	atomic_set(&pr->swqe_avail, init_attr->act_nr_send_wqes - 1);
-
-	kfree(init_attr);
-
-	netif_napi_add(pr->port->netdev, &pr->napi, ehea_poll, 64);
-
-	ret = 0;
-	goto out;
-
-out_free:
-	kfree(init_attr);
-	vfree(pr->sq_skba.arr);
-	vfree(pr->rq1_skba.arr);
-	vfree(pr->rq2_skba.arr);
-	vfree(pr->rq3_skba.arr);
-	ehea_destroy_qp(pr->qp);
-	ehea_destroy_cq(pr->send_cq);
-	ehea_destroy_cq(pr->recv_cq);
-	ehea_destroy_eq(pr->eq);
-out:
-	return ret;
-}
-
-static int ehea_clean_portres(struct ehea_port *port, struct ehea_port_res *pr)
-{
-	int ret, i;
-
-	if (pr->qp)
-		netif_napi_del(&pr->napi);
-
-	ret = ehea_destroy_qp(pr->qp);
-
-	if (!ret) {
-		ehea_destroy_cq(pr->send_cq);
-		ehea_destroy_cq(pr->recv_cq);
-		ehea_destroy_eq(pr->eq);
-
-		for (i = 0; i < pr->rq1_skba.len; i++)
-			if (pr->rq1_skba.arr[i])
-				dev_kfree_skb(pr->rq1_skba.arr[i]);
-
-		for (i = 0; i < pr->rq2_skba.len; i++)
-			if (pr->rq2_skba.arr[i])
-				dev_kfree_skb(pr->rq2_skba.arr[i]);
-
-		for (i = 0; i < pr->rq3_skba.len; i++)
-			if (pr->rq3_skba.arr[i])
-				dev_kfree_skb(pr->rq3_skba.arr[i]);
-
-		for (i = 0; i < pr->sq_skba.len; i++)
-			if (pr->sq_skba.arr[i])
-				dev_kfree_skb(pr->sq_skba.arr[i]);
-
-		vfree(pr->rq1_skba.arr);
-		vfree(pr->rq2_skba.arr);
-		vfree(pr->rq3_skba.arr);
-		vfree(pr->sq_skba.arr);
-		ret = ehea_rem_smrs(pr);
-	}
-	return ret;
-}
-
-static void write_swqe2_immediate(struct sk_buff *skb, struct ehea_swqe *swqe,
-				  u32 lkey)
-{
-	int skb_data_size = skb_headlen(skb);
-	u8 *imm_data = &swqe->u.immdata_desc.immediate_data[0];
-	struct ehea_vsgentry *sg1entry = &swqe->u.immdata_desc.sg_entry;
-	unsigned int immediate_len = SWQE2_MAX_IMM;
-
-	swqe->descriptors = 0;
-
-	if (skb_is_gso(skb)) {
-		swqe->tx_control |= EHEA_SWQE_TSO;
-		swqe->mss = skb_shinfo(skb)->gso_size;
-		/*
-		 * For TSO packets we only copy the headers into the
-		 * immediate area.
-		 */
-		immediate_len = ETH_HLEN + ip_hdrlen(skb) + tcp_hdrlen(skb);
-	}
-
-	if (skb_is_gso(skb) || skb_data_size >= SWQE2_MAX_IMM) {
-		skb_copy_from_linear_data(skb, imm_data, immediate_len);
-		swqe->immediate_data_length = immediate_len;
-
-		if (skb_data_size > immediate_len) {
-			sg1entry->l_key = lkey;
-			sg1entry->len = skb_data_size - immediate_len;
-			sg1entry->vaddr =
-				ehea_map_vaddr(skb->data + immediate_len);
-			swqe->descriptors++;
-		}
-	} else {
-		skb_copy_from_linear_data(skb, imm_data, skb_data_size);
-		swqe->immediate_data_length = skb_data_size;
-	}
-}
-
-static inline void write_swqe2_data(struct sk_buff *skb, struct net_device *dev,
-				    struct ehea_swqe *swqe, u32 lkey)
-{
-	struct ehea_vsgentry *sg_list, *sg1entry, *sgentry;
-	skb_frag_t *frag;
-	int nfrags, sg1entry_contains_frag_data, i;
-
-	nfrags = skb_shinfo(skb)->nr_frags;
-	sg1entry = &swqe->u.immdata_desc.sg_entry;
-	sg_list = (struct ehea_vsgentry *)&swqe->u.immdata_desc.sg_list;
-	sg1entry_contains_frag_data = 0;
-
-	write_swqe2_immediate(skb, swqe, lkey);
-
-	/* write descriptors */
-	if (nfrags > 0) {
-		if (swqe->descriptors == 0) {
-			/* sg1entry not yet used */
-			frag = &skb_shinfo(skb)->frags[0];
-
-			/* copy sg1entry data */
-			sg1entry->l_key = lkey;
-			sg1entry->len = skb_frag_size(frag);
-			sg1entry->vaddr =
-				ehea_map_vaddr(skb_frag_address(frag));
-			swqe->descriptors++;
-			sg1entry_contains_frag_data = 1;
-		}
-
-		for (i = sg1entry_contains_frag_data; i < nfrags; i++) {
-
-			frag = &skb_shinfo(skb)->frags[i];
-			sgentry = &sg_list[i - sg1entry_contains_frag_data];
-
-			sgentry->l_key = lkey;
-			sgentry->len = skb_frag_size(frag);
-			sgentry->vaddr = ehea_map_vaddr(skb_frag_address(frag));
-			swqe->descriptors++;
-		}
-	}
-}
-
-static int ehea_broadcast_reg_helper(struct ehea_port *port, u32 hcallid)
-{
-	int ret = 0;
-	u64 hret;
-	u8 reg_type;
-
-	/* De/Register untagged packets */
-	reg_type = EHEA_BCMC_BROADCAST | EHEA_BCMC_UNTAGGED;
-	hret = ehea_h_reg_dereg_bcmc(port->adapter->handle,
-				     port->logical_port_id,
-				     reg_type, port->mac_addr, 0, hcallid);
-	if (hret != H_SUCCESS) {
-		pr_err("%sregistering bc address failed (tagged)\n",
-		       hcallid == H_REG_BCMC ? "" : "de");
-		ret = -EIO;
-		goto out_herr;
-	}
-
-	/* De/Register VLAN packets */
-	reg_type = EHEA_BCMC_BROADCAST | EHEA_BCMC_VLANID_ALL;
-	hret = ehea_h_reg_dereg_bcmc(port->adapter->handle,
-				     port->logical_port_id,
-				     reg_type, port->mac_addr, 0, hcallid);
-	if (hret != H_SUCCESS) {
-		pr_err("%sregistering bc address failed (vlan)\n",
-		       hcallid == H_REG_BCMC ? "" : "de");
-		ret = -EIO;
-	}
-out_herr:
-	return ret;
-}
-
-static int ehea_set_mac_addr(struct net_device *dev, void *sa)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct sockaddr *mac_addr = sa;
-	struct hcp_ehea_port_cb0 *cb0;
-	int ret;
-	u64 hret;
-
-	if (!is_valid_ether_addr(mac_addr->sa_data)) {
-		ret = -EADDRNOTAVAIL;
-		goto out;
-	}
-
-	cb0 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb0) {
-		pr_err("no mem for cb0\n");
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	memcpy(&(cb0->port_mac_addr), &(mac_addr->sa_data[0]), ETH_ALEN);
-
-	cb0->port_mac_addr = cb0->port_mac_addr >> 16;
-
-	hret = ehea_h_modify_ehea_port(port->adapter->handle,
-				       port->logical_port_id, H_PORT_CB0,
-				       EHEA_BMASK_SET(H_PORT_CB0_MAC, 1), cb0);
-	if (hret != H_SUCCESS) {
-		ret = -EIO;
-		goto out_free;
-	}
-
-	memcpy(dev->dev_addr, mac_addr->sa_data, dev->addr_len);
-
-	/* Deregister old MAC in pHYP */
-	if (port->state == EHEA_PORT_UP) {
-		ret = ehea_broadcast_reg_helper(port, H_DEREG_BCMC);
-		if (ret)
-			goto out_upregs;
-	}
-
-	port->mac_addr = cb0->port_mac_addr << 16;
-
-	/* Register new MAC in pHYP */
-	if (port->state == EHEA_PORT_UP) {
-		ret = ehea_broadcast_reg_helper(port, H_REG_BCMC);
-		if (ret)
-			goto out_upregs;
-	}
-
-	ret = 0;
-
-out_upregs:
-	ehea_update_bcmc_registrations();
-out_free:
-	free_page((unsigned long)cb0);
-out:
-	return ret;
-}
-
-static void ehea_promiscuous_error(u64 hret, int enable)
-{
-	if (hret == H_AUTHORITY)
-		pr_info("Hypervisor denied %sabling promiscuous mode\n",
-			enable == 1 ? "en" : "dis");
-	else
-		pr_err("failed %sabling promiscuous mode\n",
-		       enable == 1 ? "en" : "dis");
-}
-
-static void ehea_promiscuous(struct net_device *dev, int enable)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct hcp_ehea_port_cb7 *cb7;
-	u64 hret;
-
-	if (enable == port->promisc)
-		return;
-
-	cb7 = (void *)get_zeroed_page(GFP_ATOMIC);
-	if (!cb7) {
-		pr_err("no mem for cb7\n");
-		goto out;
-	}
-
-	/* Modify Pxs_DUCQPN in CB7 */
-	cb7->def_uc_qpn = enable == 1 ? port->port_res[0].qp->fw_handle : 0;
-
-	hret = ehea_h_modify_ehea_port(port->adapter->handle,
-				       port->logical_port_id,
-				       H_PORT_CB7, H_PORT_CB7_DUCQPN, cb7);
-	if (hret) {
-		ehea_promiscuous_error(hret, enable);
-		goto out;
-	}
-
-	port->promisc = enable;
-out:
-	free_page((unsigned long)cb7);
-}
-
-static u64 ehea_multicast_reg_helper(struct ehea_port *port, u64 mc_mac_addr,
-				     u32 hcallid)
-{
-	u64 hret;
-	u8 reg_type;
-
-	reg_type = EHEA_BCMC_MULTICAST | EHEA_BCMC_UNTAGGED;
-	if (mc_mac_addr == 0)
-		reg_type |= EHEA_BCMC_SCOPE_ALL;
-
-	hret = ehea_h_reg_dereg_bcmc(port->adapter->handle,
-				     port->logical_port_id,
-				     reg_type, mc_mac_addr, 0, hcallid);
-	if (hret)
-		goto out;
-
-	reg_type = EHEA_BCMC_MULTICAST | EHEA_BCMC_VLANID_ALL;
-	if (mc_mac_addr == 0)
-		reg_type |= EHEA_BCMC_SCOPE_ALL;
-
-	hret = ehea_h_reg_dereg_bcmc(port->adapter->handle,
-				     port->logical_port_id,
-				     reg_type, mc_mac_addr, 0, hcallid);
-out:
-	return hret;
-}
-
-static int ehea_drop_multicast_list(struct net_device *dev)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct ehea_mc_list *mc_entry = port->mc_list;
-	struct list_head *pos;
-	struct list_head *temp;
-	int ret = 0;
-	u64 hret;
-
-	list_for_each_safe(pos, temp, &(port->mc_list->list)) {
-		mc_entry = list_entry(pos, struct ehea_mc_list, list);
-
-		hret = ehea_multicast_reg_helper(port, mc_entry->macaddr,
-						 H_DEREG_BCMC);
-		if (hret) {
-			pr_err("failed deregistering mcast MAC\n");
-			ret = -EIO;
-		}
-
-		list_del(pos);
-		kfree(mc_entry);
-	}
-	return ret;
-}
-
-static void ehea_allmulti(struct net_device *dev, int enable)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	u64 hret;
-
-	if (!port->allmulti) {
-		if (enable) {
-			/* Enable ALLMULTI */
-			ehea_drop_multicast_list(dev);
-			hret = ehea_multicast_reg_helper(port, 0, H_REG_BCMC);
-			if (!hret)
-				port->allmulti = 1;
-			else
-				netdev_err(dev,
-					   "failed enabling IFF_ALLMULTI\n");
-		}
-	} else {
-		if (!enable) {
-			/* Disable ALLMULTI */
-			hret = ehea_multicast_reg_helper(port, 0, H_DEREG_BCMC);
-			if (!hret)
-				port->allmulti = 0;
-			else
-				netdev_err(dev,
-					   "failed disabling IFF_ALLMULTI\n");
-		}
-	}
-}
-
-static void ehea_add_multicast_entry(struct ehea_port *port, u8 *mc_mac_addr)
-{
-	struct ehea_mc_list *ehea_mcl_entry;
-	u64 hret;
-
-	ehea_mcl_entry = kzalloc(sizeof(*ehea_mcl_entry), GFP_ATOMIC);
-	if (!ehea_mcl_entry)
-		return;
-
-	INIT_LIST_HEAD(&ehea_mcl_entry->list);
-
-	memcpy(&ehea_mcl_entry->macaddr, mc_mac_addr, ETH_ALEN);
-
-	hret = ehea_multicast_reg_helper(port, ehea_mcl_entry->macaddr,
-					 H_REG_BCMC);
-	if (!hret)
-		list_add(&ehea_mcl_entry->list, &port->mc_list->list);
-	else {
-		pr_err("failed registering mcast MAC\n");
-		kfree(ehea_mcl_entry);
-	}
-}
-
-static void ehea_set_multicast_list(struct net_device *dev)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct netdev_hw_addr *ha;
-	int ret;
-
-	ehea_promiscuous(dev, !!(dev->flags & IFF_PROMISC));
-
-	if (dev->flags & IFF_ALLMULTI) {
-		ehea_allmulti(dev, 1);
-		goto out;
-	}
-	ehea_allmulti(dev, 0);
-
-	if (!netdev_mc_empty(dev)) {
-		ret = ehea_drop_multicast_list(dev);
 		if (ret) {
-			/* Dropping the current multicast list failed.
-			 * Enabling ALL_MULTI is the best we can do.
-			 */
-			ehea_allmulti(dev, 1);
-		}
+			GPU_LOG(MALI_EXYNOS_WARNING, "BTS MO could not be set to gpu performance");
+			gpex_debug_incr_error_cnt(HIST_BTS);
+		} else
+			qos_info.is_set_bts = 1;
 
-		if (netdev_mc_count(dev) > port->adapter->max_mc_mac) {
-			pr_info("Mcast registration limit reached (0x%llx). Use ALLMULTI!\n",
-				port->adapter->max_mc_mac);
-			goto out;
-		}
+	} else if ((clock == 0 || clock < qos_info.mo_min_clock) && qos_info.is_set_bts) {
+		gpex_debug_new_record(HIST_BTS);
 
-		netdev_for_each_mc_addr(ha, dev)
-			ehea_add_multicast_entry(port, ha->addr);
+		ret = gpexbe_bts_set_bts_mo(0);
+		gpex_debug_record(HIST_BTS, qos_info.is_set_bts, 0, ret);
 
+		if (ret) {
+			GPU_LOG(MALI_EXYNOS_WARNING, "BTS MO could not be unset from gpu performance");
+			gpex_debug_incr_error_cnt(HIST_BTS);
+		} else
+			qos_info.is_set_bts = 0;
 	}
-out:
-	ehea_update_bcmc_registrations();
+
+	spin_unlock_irqrestore(&qos_info.bts_spinlock, flags);
+
+	return ret;
 }
 
-static int ehea_change_mtu(struct net_device *dev, int new_mtu)
+int gpex_qos_set_from_clock(int gpu_clock)
 {
-	if ((new_mtu < 68) || (new_mtu > EHEA_MAX_PACKET_SIZE))
+	int idx = 0;
+
+	if (gpu_clock == 0) {
+		gpex_qos_unset(QOS_MIF | QOS_LITTLE | QOS_MIDDLE | QOS_MIN);
+		gpex_qos_set_bts_mo(gpu_clock);
+		gpexbe_llc_coherency_set_ways(0);
+
+		return 0;
+	}
+
+	idx = gpex_qos_get_table_idx(gpu_clock);
+
+	if (idx < 0) {
+		/* TODO: print error msg */
 		return -EINVAL;
-	dev->mtu = new_mtu;
-	return 0;
-}
-
-static void xmit_common(struct sk_buff *skb, struct ehea_swqe *swqe)
-{
-	swqe->tx_control |= EHEA_SWQE_IMM_DATA_PRESENT | EHEA_SWQE_CRC;
-
-	if (vlan_get_protocol(skb) != htons(ETH_P_IP))
-		return;
-
-	if (skb->ip_summed == CHECKSUM_PARTIAL)
-		swqe->tx_control |= EHEA_SWQE_IP_CHECKSUM;
-
-	swqe->ip_start = skb_network_offset(skb);
-	swqe->ip_end = swqe->ip_start + ip_hdrlen(skb) - 1;
-
-	switch (ip_hdr(skb)->protocol) {
-	case IPPROTO_UDP:
-		if (skb->ip_summed == CHECKSUM_PARTIAL)
-			swqe->tx_control |= EHEA_SWQE_TCP_CHECKSUM;
-
-		swqe->tcp_offset = swqe->ip_end + 1 +
-				   offsetof(struct udphdr, check);
-		break;
-
-	case IPPROTO_TCP:
-		if (skb->ip_summed == CHECKSUM_PARTIAL)
-			swqe->tx_control |= EHEA_SWQE_TCP_CHECKSUM;
-
-		swqe->tcp_offset = swqe->ip_end + 1 +
-				   offsetof(struct tcphdr, check);
-		break;
-	}
-}
-
-static void ehea_xmit2(struct sk_buff *skb, struct net_device *dev,
-		       struct ehea_swqe *swqe, u32 lkey)
-{
-	swqe->tx_control |= EHEA_SWQE_DESCRIPTORS_PRESENT;
-
-	xmit_common(skb, swqe);
-
-	write_swqe2_data(skb, dev, swqe, lkey);
-}
-
-static void ehea_xmit3(struct sk_buff *skb, struct net_device *dev,
-		       struct ehea_swqe *swqe)
-{
-	u8 *imm_data = &swqe->u.immdata_nodesc.immediate_data[0];
-
-	xmit_common(skb, swqe);
-
-	if (!skb->data_len)
-		skb_copy_from_linear_data(skb, imm_data, skb->len);
-	else
-		skb_copy_bits(skb, 0, imm_data, skb->len);
-
-	swqe->immediate_data_length = skb->len;
-	dev_consume_skb_any(skb);
-}
-
-static int ehea_start_xmit(struct sk_buff *skb, struct net_device *dev)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct ehea_swqe *swqe;
-	u32 lkey;
-	int swqe_index;
-	struct ehea_port_res *pr;
-	struct netdev_queue *txq;
-
-	pr = &port->port_res[skb_get_queue_mapping(skb)];
-	txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
-
-	swqe = ehea_get_swqe(pr->qp, &swqe_index);
-	memset(swqe, 0, SWQE_HEADER_SIZE);
-	atomic_dec(&pr->swqe_avail);
-
-	if (skb_vlan_tag_present(skb)) {
-		swqe->tx_control |= EHEA_SWQE_VLAN_INSERT;
-		swqe->vlan_tag = skb_vlan_tag_get(skb);
 	}
 
-	pr->tx_packets++;
-	pr->tx_bytes += skb->len;
-
-	if (skb->len <= SWQE3_MAX_IMM) {
-		u32 sig_iv = port->sig_comp_iv;
-		u32 swqe_num = pr->swqe_id_counter;
-		ehea_xmit3(skb, dev, swqe);
-		swqe->wr_id = EHEA_BMASK_SET(EHEA_WR_ID_TYPE, EHEA_SWQE3_TYPE)
-			| EHEA_BMASK_SET(EHEA_WR_ID_COUNT, swqe_num);
-		if (pr->swqe_ll_count >= (sig_iv - 1)) {
-			swqe->wr_id |= EHEA_BMASK_SET(EHEA_WR_ID_REFILL,
-						      sig_iv);
-			swqe->tx_control |= EHEA_SWQE_SIGNALLED_COMPLETION;
-			pr->swqe_ll_count = 0;
-		} else
-			pr->swqe_ll_count += 1;
+	if (gpex_clboost_check_activation_condition()) {
+		gpex_qos_set(QOS_MIF | QOS_MIN, clqos_table[idx].mif_min);
+		gpex_qos_set(QOS_LITTLE | QOS_MIN, clqos_table[idx].little_min);
+		gpex_qos_set(QOS_MIDDLE | QOS_MIN, clqos_table[idx].middle_min);
+		gpex_qos_set(QOS_BIG | QOS_MAX, INT_MAX);
+		/* TODO: revamp the qos interface so default max min can be set without knowing the clock */
+		//gpex_qos_set(QOS_BIG | QOS_MAX, BIG_MAX);
 	} else {
-		swqe->wr_id =
-			EHEA_BMASK_SET(EHEA_WR_ID_TYPE, EHEA_SWQE2_TYPE)
-		      | EHEA_BMASK_SET(EHEA_WR_ID_COUNT, pr->swqe_id_counter)
-		      | EHEA_BMASK_SET(EHEA_WR_ID_REFILL, 1)
-		      | EHEA_BMASK_SET(EHEA_WR_ID_INDEX, pr->sq_skba.index);
-		pr->sq_skba.arr[pr->sq_skba.index] = skb;
+		if (gpex_tsg_get_pmqos() == true) {
+			gpex_qos_set(QOS_MIF | QOS_MIN, 0);
+			gpex_qos_set(QOS_LITTLE | QOS_MIN, 0);
+			gpex_qos_set(QOS_MIDDLE | QOS_MIN, 0);
+			gpex_qos_set(QOS_BIG | QOS_MAX, INT_MAX);
+		} else {
+			gpex_qos_set(QOS_MIF | QOS_MIN, qos_table[idx].mem_freq);
 
-		pr->sq_skba.index++;
-		pr->sq_skba.index &= (pr->sq_skba.len - 1);
+			if (!(gpex_gts_get_hcm_mode() & (HCM_MODE_A | HCM_MODE_C))) {
+				gpex_qos_set(QOS_LITTLE | QOS_MIN,
+					     qos_table[idx].cpu_little_min_freq);
+			} else if (gpex_gts_get_hcm_mode() & HCM_MODE_A) {
+				gpex_qos_set(QOS_LITTLE | QOS_MIN,
+					     qos_info.gpu_heavy_compute_cpu0_min_clock);
+				//pr_info("HCM: mode A QOS");
+			} else if (gpex_gts_get_hcm_mode() & HCM_MODE_C) {
+				gpex_qos_set(QOS_LITTLE | QOS_MIN,
+					     qos_info.gpu_heavy_compute_vk_cpu0_min_clock);
+				//pr_info("HCM: mode B QOS");
+			}
 
-		lkey = pr->send_mr.lkey;
-		ehea_xmit2(skb, dev, swqe, lkey);
-		swqe->tx_control |= EHEA_SWQE_SIGNALLED_COMPLETION;
-	}
-	pr->swqe_id_counter += 1;
+			gpex_qos_set(QOS_MIDDLE | QOS_MIN, qos_table[idx].cpu_middle_min_freq);
+			gpex_qos_set(QOS_BIG | QOS_MAX, qos_table[idx].cpu_big_max_freq);
+		}
 
-	netif_info(port, tx_queued, dev,
-		   "post swqe on QP %d\n", pr->qp->init_attr.qp_nr);
-	if (netif_msg_tx_queued(port))
-		ehea_dump(swqe, 512, "swqe");
-
-	if (unlikely(test_bit(__EHEA_STOP_XFER, &ehea_driver_flags))) {
-		netif_tx_stop_queue(txq);
-		swqe->tx_control |= EHEA_SWQE_PURGE;
-	}
-
-	ehea_post_swqe(pr->qp, swqe);
-
-	if (unlikely(atomic_read(&pr->swqe_avail) <= 1)) {
-		pr->p_stats.queue_stopped++;
-		netif_tx_stop_queue(txq);
+		gpexwa_peak_notify_update();
 	}
 
-	return NETDEV_TX_OK;
-}
-
-static int ehea_vlan_rx_add_vid(struct net_device *dev, __be16 proto, u16 vid)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct ehea_adapter *adapter = port->adapter;
-	struct hcp_ehea_port_cb1 *cb1;
-	int index;
-	u64 hret;
-	int err = 0;
-
-	cb1 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb1) {
-		pr_err("no mem for cb1\n");
-		err = -ENOMEM;
-		goto out;
-	}
-
-	hret = ehea_h_query_ehea_port(adapter->handle, port->logical_port_id,
-				      H_PORT_CB1, H_PORT_CB1_ALL, cb1);
-	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_port failed\n");
-		err = -EINVAL;
-		goto out;
-	}
-
-	index = (vid / 64);
-	cb1->vlan_filter[index] |= ((u64)(0x8000000000000000 >> (vid & 0x3F)));
-
-	hret = ehea_h_modify_ehea_port(adapter->handle, port->logical_port_id,
-				       H_PORT_CB1, H_PORT_CB1_ALL, cb1);
-	if (hret != H_SUCCESS) {
-		pr_err("modify_ehea_port failed\n");
-		err = -EINVAL;
-	}
-out:
-	free_page((unsigned long)cb1);
-	return err;
-}
-
-static int ehea_vlan_rx_kill_vid(struct net_device *dev, __be16 proto, u16 vid)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct ehea_adapter *adapter = port->adapter;
-	struct hcp_ehea_port_cb1 *cb1;
-	int index;
-	u64 hret;
-	int err = 0;
-
-	cb1 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb1) {
-		pr_err("no mem for cb1\n");
-		err = -ENOMEM;
-		goto out;
-	}
-
-	hret = ehea_h_query_ehea_port(adapter->handle, port->logical_port_id,
-				      H_PORT_CB1, H_PORT_CB1_ALL, cb1);
-	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_port failed\n");
-		err = -EINVAL;
-		goto out;
-	}
-
-	index = (vid / 64);
-	cb1->vlan_filter[index] &= ~((u64)(0x8000000000000000 >> (vid & 0x3F)));
-
-	hret = ehea_h_modify_ehea_port(adapter->handle, port->logical_port_id,
-				       H_PORT_CB1, H_PORT_CB1_ALL, cb1);
-	if (hret != H_SUCCESS) {
-		pr_err("modify_ehea_port failed\n");
-		err = -EINVAL;
-	}
-out:
-	free_page((unsigned long)cb1);
-	return err;
-}
-
-static int ehea_activate_qp(struct ehea_adapter *adapter, struct ehea_qp *qp)
-{
-	int ret = -EIO;
-	u64 hret;
-	u16 dummy16 = 0;
-	u64 dummy64 = 0;
-	struct hcp_modify_qp_cb0 *cb0;
-
-	cb0 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb0) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
-				    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF), cb0);
-	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_qp failed (1)\n");
-		goto out;
-	}
-
-	cb0->qp_ctl_reg = H_QP_CR_STATE_INITIALIZED;
-	hret = ehea_h_modify_ehea_qp(adapter->handle, 0, qp->fw_handle,
-				     EHEA_BMASK_SET(H_QPCB0_QP_CTL_REG, 1), cb0,
-				     &dummy64, &dummy64, &dummy16, &dummy16);
-	if (hret != H_SUCCESS) {
-		pr_err("modify_ehea_qp failed (1)\n");
-		goto out;
-	}
-
-	hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
-				    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF), cb0);
-	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_qp failed (2)\n");
-		goto out;
-	}
-
-	cb0->qp_ctl_reg = H_QP_CR_ENABLED | H_QP_CR_STATE_INITIALIZED;
-	hret = ehea_h_modify_ehea_qp(adapter->handle, 0, qp->fw_handle,
-				     EHEA_BMASK_SET(H_QPCB0_QP_CTL_REG, 1), cb0,
-				     &dummy64, &dummy64, &dummy16, &dummy16);
-	if (hret != H_SUCCESS) {
-		pr_err("modify_ehea_qp failed (2)\n");
-		goto out;
-	}
-
-	hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
-				    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF), cb0);
-	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_qp failed (3)\n");
-		goto out;
-	}
-
-	cb0->qp_ctl_reg = H_QP_CR_ENABLED | H_QP_CR_STATE_RDY2SND;
-	hret = ehea_h_modify_ehea_qp(adapter->handle, 0, qp->fw_handle,
-				     EHEA_BMASK_SET(H_QPCB0_QP_CTL_REG, 1), cb0,
-				     &dummy64, &dummy64, &dummy16, &dummy16);
-	if (hret != H_SUCCESS) {
-		pr_err("modify_ehea_qp failed (3)\n");
-		goto out;
-	}
-
-	hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
-				    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF), cb0);
-	if (hret != H_SUCCESS) {
-		pr_err("query_ehea_qp failed (4)\n");
-		goto out;
-	}
-
-	ret = 0;
-out:
-	free_page((unsigned long)cb0);
-	return ret;
-}
-
-static int ehea_port_res_setup(struct ehea_port *port, int def_qps)
-{
-	int ret, i;
-	struct port_res_cfg pr_cfg, pr_cfg_small_rx;
-	enum ehea_eq_type eq_type = EHEA_EQ;
-
-	port->qp_eq = ehea_create_eq(port->adapter, eq_type,
-				   EHEA_MAX_ENTRIES_EQ, 1);
-	if (!port->qp_eq) {
-		ret = -EINVAL;
-		pr_err("ehea_create_eq failed (qp_eq)\n");
-		goto out_kill_eq;
-	}
-
-	pr_cfg.max_entries_rcq = rq1_entries + rq2_entries + rq3_entries;
-	pr_cfg.max_entries_scq = sq_entries * 2;
-	pr_cfg.max_entries_sq = sq_entries;
-	pr_cfg.max_entries_rq1 = rq1_entries;
-	pr_cfg.max_entries_rq2 = rq2_entries;
-	pr_cfg.max_entries_rq3 = rq3_entries;
-
-	pr_cfg_small_rx.max_entries_rcq = 1;
-	pr_cfg_small_rx.max_entries_scq = sq_entries;
-	pr_cfg_small_rx.max_entries_sq = sq_entries;
-	pr_cfg_small_rx.max_entries_rq1 = 1;
-	pr_cfg_small_rx.max_entries_rq2 = 1;
-	pr_cfg_small_rx.max_entries_rq3 = 1;
-
-	for (i = 0; i < def_qps; i++) {
-		ret = ehea_init_port_res(port, &port->port_res[i], &pr_cfg, i);
-		if (ret)
-			goto out_clean_pr;
-	}
-	for (i = def_qps; i < def_qps; i++) {
-		ret = ehea_init_port_res(port, &port->port_res[i],
-					 &pr_cfg_small_rx, i);
-		if (ret)
-			goto out_clean_pr;
-	}
+	gpex_qos_set_bts_mo(gpu_clock);
+	gpexbe_llc_coherency_set_ways(qos_table[idx].llc_ways);
 
 	return 0;
+}
+            /* SPDX-License-Identifier: GPL-2.0 */
 
-out_clean_pr:
-	while (--i >= 0)
-		ehea_clean_portres(port, &port->port_res[i]);
+/*
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ */
 
-out_kill_eq:
-	ehea_destroy_eq(port->qp_eq);
-	return ret;
+#include <linux/notifier.h>
+#include <linux/thermal.h>
+
+#include <gpex_utils.h>
+#include <gpex_thermal.h>
+#include <gpex_clock.h>
+#include <gpexbe_debug.h>
+
+struct _thermal_info {
+	bool tmu_enabled;
+};
+
+static struct _thermal_info thermal;
+
+void gpex_thermal_set_status(bool status)
+{
+	thermal.tmu_enabled = status;
 }
 
-static int ehea_clean_all_portres(struct ehea_port *port)
+int gpex_thermal_gpu_normal(void)
 {
 	int ret = 0;
-	int i;
+	ret = gpex_clock_lock_clock(GPU_CLOCK_MAX_UNLOCK, TMU_LOCK, 0);
 
-	for (i = 0; i < port->num_def_qps; i++)
-		ret |= ehea_clean_portres(port, &port->port_res[i]);
-
-	ret |= ehea_destroy_eq(port->qp_eq);
-
-	return ret;
-}
-
-static void ehea_remove_adapter_mr(struct ehea_adapter *adapter)
-{
-	if (adapter->active_ports)
-		return;
-
-	ehea_rem_mr(&adapter->mr);
-}
-
-static int ehea_add_adapter_mr(struct ehea_adapter *adapter)
-{
-	if (adapter->active_ports)
-		return 0;
-
-	return ehea_reg_kernel_mr(adapter, &adapter->mr);
-}
-
-static int ehea_up(struct net_device *dev)
-{
-	int ret, i;
-	struct ehea_port *port = netdev_priv(dev);
-
-	if (port->state == EHEA_PORT_UP)
-		return 0;
-
-	ret = ehea_port_res_setup(port, port->num_def_qps);
 	if (ret) {
-		netdev_err(dev, "port_res_failed\n");
-		goto out;
+		/* TODO: couldn't handle thermal throttling. print error log */
+		;
 	}
 
-	/* Set default QP for this port */
-	ret = ehea_configure_port(port);
-	if (ret) {
-		netdev_err(dev, "ehea_configure_port failed. ret:%d\n", ret);
-		goto out_clean_pr;
-	}
-
-	ret = ehea_reg_interrupts(dev);
-	if (ret) {
-		netdev_err(dev, "reg_interrupts failed. ret:%d\n", ret);
-		goto out_clean_pr;
-	}
-
-	for (i = 0; i < port->num_def_qps; i++) {
-		ret = ehea_activate_qp(port->adapter, port->port_res[i].qp);
-		if (ret) {
-			netdev_err(dev, "activate_qp failed\n");
-			goto out_free_irqs;
-		}
-	}
-
-	for (i = 0; i < port->num_def_qps; i++) {
-		ret = ehea_fill_port_res(&port->port_res[i]);
-		if (ret) {
-			netdev_err(dev, "out_free_irqs\n");
-			goto out_free_irqs;
-		}
-	}
-
-	ret = ehea_broadcast_reg_helper(port, H_REG_BCMC);
-	if (ret) {
-		ret = -EIO;
-		goto out_free_irqs;
-	}
-
-	port->state = EHEA_PORT_UP;
-
-	ret = 0;
-	goto out;
-
-out_free_irqs:
-	ehea_free_interrupts(dev);
-
-out_clean_pr:
-	ehea_clean_all_portres(port);
-out:
-	if (ret)
-		netdev_info(dev, "Failed starting. ret=%i\n", ret);
-
-	ehea_update_bcmc_registrations();
-	ehea_update_firmware_handles();
+	GPU_LOG_DETAILED(MALI_EXYNOS_DEBUG, LSI_TMU_VALUE, 0u, event,
+			 "tmu event normal, remove gpu max lock\n");
 
 	return ret;
 }
 
-static void port_napi_disable(struct ehea_port *port)
+int gpex_thermal_gpu_throttle(int freq)
 {
-	int i;
-
-	for (i = 0; i < port->num_def_qps; i++)
-		napi_disable(&port->port_res[i].napi);
-}
-
-static void port_napi_enable(struct ehea_port *port)
-{
-	int i;
-
-	for (i = 0; i < port->num_def_qps; i++)
-		napi_enable(&port->port_res[i].napi);
-}
-
-static int ehea_open(struct net_device *dev)
-{
-	int ret;
-	struct ehea_port *port = netdev_priv(dev);
-
-	mutex_lock(&port->port_lock);
-
-	netif_info(port, ifup, dev, "enabling port\n");
-
-	ret = ehea_up(dev);
-	if (!ret) {
-		port_napi_enable(port);
-		netif_tx_start_all_queues(dev);
-	}
-
-	mutex_unlock(&port->port_lock);
-	schedule_delayed_work(&port->stats_work,
-			      round_jiffies_relative(msecs_to_jiffies(1000)));
-
-	return ret;
-}
-
-static int ehea_down(struct net_device *dev)
-{
-	int ret;
-	struct ehea_port *port = netdev_priv(dev);
-
-	if (port->state == EHEA_PORT_DOWN)
-		return 0;
-
-	ehea_drop_multicast_list(dev);
-	ehea_allmulti(dev, 0);
-	ehea_broadcast_reg_helper(port, H_DEREG_BCMC);
-
-	ehea_free_interrupts(dev);
-
-	port->state = EHEA_PORT_DOWN;
-
-	ehea_update_bcmc_registrations();
-
-	ret = ehea_clean_all_portres(port);
-	if (ret)
-		netdev_info(dev, "Failed freeing resources. ret=%i\n", ret);
-
-	ehea_update_firmware_handles();
-
-	return ret;
-}
-
-static int ehea_stop(struct net_device *dev)
-{
-	int ret;
-	struct ehea_port *port = netdev_priv(dev);
-
-	netif_info(port, ifdown, dev, "disabling port\n");
-
-	set_bit(__EHEA_DISABLE_PORT_RESET, &port->flags);
-	cancel_work_sync(&port->reset_task);
-	cancel_delayed_work_sync(&port->stats_work);
-	mutex_lock(&port->port_lock);
-	netif_tx_stop_all_queues(dev);
-	port_napi_disable(port);
-	ret = ehea_down(dev);
-	mutex_unlock(&port->port_lock);
-	clear_bit(__EHEA_DISABLE_PORT_RESET, &port->flags);
-	return ret;
-}
-
-static void ehea_purge_sq(struct ehea_qp *orig_qp)
-{
-	struct ehea_qp qp = *orig_qp;
-	struct ehea_qp_init_attr *init_attr = &qp.init_attr;
-	struct ehea_swqe *swqe;
-	int wqe_index;
-	int i;
-
-	for (i = 0; i < init_attr->act_nr_send_wqes; i++) {
-		swqe = ehea_get_swqe(&qp, &wqe_index);
-		swqe->tx_control |= EHEA_SWQE_PURGE;
-	}
-}
-
-static void ehea_flush_sq(struct ehea_port *port)
-{
-	int i;
-
-	for (i = 0; i < port->num_def_qps; i++) {
-		struct ehea_port_res *pr = &port->port_res[i];
-		int swqe_max = pr->sq_skba_size - 2 - pr->swqe_ll_count;
-		int ret;
-
-		ret = wait_event_timeout(port->swqe_avail_wq,
-			 atomic_read(&pr->swqe_avail) >= swqe_max,
-			 msecs_to_jiffies(100));
-
-		if (!ret) {
-			pr_err("WARNING: sq not flushed completely\n");
-			break;
-		}
-	}
-}
-
-static int ehea_stop_qps(struct net_device *dev)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct ehea_adapter *adapter = port->adapter;
-	struct hcp_modify_qp_cb0 *cb0;
-	int ret = -EIO;
-	int dret;
-	int i;
-	u64 hret;
-	u64 dummy64 = 0;
-	u16 dummy16 = 0;
-
-	cb0 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb0) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	for (i = 0; i < (port->num_def_qps); i++) {
-		struct ehea_port_res *pr =  &port->port_res[i];
-		struct ehea_qp *qp = pr->qp;
-
-		/* Purge send queue */
-		ehea_purge_sq(qp);
-
-		/* Disable queue pair */
-		hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
-					    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF),
-					    cb0);
-		if (hret != H_SUCCESS) {
-			pr_err("query_ehea_qp failed (1)\n");
-			goto out;
-		}
-
-		cb0->qp_ctl_reg = (cb0->qp_ctl_reg & H_QP_CR_RES_STATE) << 8;
-		cb0->qp_ctl_reg &= ~H_QP_CR_ENABLED;
-
-		hret = ehea_h_modify_ehea_qp(adapter->handle, 0, qp->fw_handle,
-					     EHEA_BMASK_SET(H_QPCB0_QP_CTL_REG,
-							    1), cb0, &dummy64,
-					     &dummy64, &dummy16, &dummy16);
-		if (hret != H_SUCCESS) {
-			pr_err("modify_ehea_qp failed (1)\n");
-			goto out;
-		}
-
-		hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
-					    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF),
-					    cb0);
-		if (hret != H_SUCCESS) {
-			pr_err("query_ehea_qp failed (2)\n");
-			goto out;
-		}
-
-		/* deregister shared memory regions */
-		dret = ehea_rem_smrs(pr);
-		if (dret) {
-			pr_err("unreg shared memory region failed\n");
-			goto out;
-		}
-	}
-
-	ret = 0;
-out:
-	free_page((unsigned long)cb0);
-
-	return ret;
-}
-
-static void ehea_update_rqs(struct ehea_qp *orig_qp, struct ehea_port_res *pr)
-{
-	struct ehea_qp qp = *orig_qp;
-	struct ehea_qp_init_attr *init_attr = &qp.init_attr;
-	struct ehea_rwqe *rwqe;
-	struct sk_buff **skba_rq2 = pr->rq2_skba.arr;
-	struct sk_buff **skba_rq3 = pr->rq3_skba.arr;
-	struct sk_buff *skb;
-	u32 lkey = pr->recv_mr.lkey;
-
-
-	int i;
-	int index;
-
-	for (i = 0; i < init_attr->act_nr_rwqes_rq2 + 1; i++) {
-		rwqe = ehea_get_next_rwqe(&qp, 2);
-		rwqe->sg_list[0].l_key = lkey;
-		index = EHEA_BMASK_GET(EHEA_WR_ID_INDEX, rwqe->wr_id);
-		skb = skba_rq2[index];
-		if (skb)
-			rwqe->sg_list[0].vaddr = ehea_map_vaddr(skb->data);
-	}
-
-	for (i = 0; i < init_attr->act_nr_rwqes_rq3 + 1; i++) {
-		rwqe = ehea_get_next_rwqe(&qp, 3);
-		rwqe->sg_list[0].l_key = lkey;
-		index = EHEA_BMASK_GET(EHEA_WR_ID_INDEX, rwqe->wr_id);
-		skb = skba_rq3[index];
-		if (skb)
-			rwqe->sg_list[0].vaddr = ehea_map_vaddr(skb->data);
-	}
-}
-
-static int ehea_restart_qps(struct net_device *dev)
-{
-	struct ehea_port *port = netdev_priv(dev);
-	struct ehea_adapter *adapter = port->adapter;
 	int ret = 0;
-	int i;
 
-	struct hcp_modify_qp_cb0 *cb0;
-	u64 hret;
-	u64 dummy64 = 0;
-	u16 dummy16 = 0;
-
-	cb0 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb0)
-		return -ENOMEM;
-
-	for (i = 0; i < (port->num_def_qps); i++) {
-		struct ehea_port_res *pr =  &port->port_res[i];
-		struct ehea_qp *qp = pr->qp;
-
-		ret = ehea_gen_smrs(pr);
-		if (ret) {
-			netdev_err(dev, "creation of shared memory regions failed\n");
-			goto out;
-		}
-
-		ehea_update_rqs(qp, pr);
-
-		/* Enable queue pair */
-		hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
-					    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF),
-					    cb0);
-		if (hret != H_SUCCESS) {
-			netdev_err(dev, "query_ehea_qp failed (1)\n");
-			ret = -EFAULT;
-			goto out;
-		}
-
-		cb0->qp_ctl_reg = (cb0->qp_ctl_reg & H_QP_CR_RES_STATE) << 8;
-		cb0->qp_ctl_reg |= H_QP_CR_ENABLED;
-
-		hret = ehea_h_modify_ehea_qp(adapter->handle, 0, qp->fw_handle,
-					     EHEA_BMASK_SET(H_QPCB0_QP_CTL_REG,
-							    1), cb0, &dummy64,
-					     &dummy64, &dummy16, &dummy16);
-		if (hret != H_SUCCESS) {
-			netdev_err(dev, "modify_ehea_qp failed (1)\n");
-			ret = -EFAULT;
-			goto out;
-		}
-
-		hret = ehea_h_query_ehea_qp(adapter->handle, 0, qp->fw_handle,
-					    EHEA_BMASK_SET(H_QPCB0_ALL, 0xFFFF),
-					    cb0);
-		if (hret != H_SUCCESS) {
-			netdev_err(dev, "query_ehea_qp failed (2)\n");
-			ret = -EFAULT;
-			goto out;
-		}
-
-		/* refill entire queue */
-		ehea_refill_rq1(pr, pr->rq1_skba.index, 0);
-		ehea_refill_rq2(pr, 0);
-		ehea_refill_rq3(pr, 0);
+	if (!thermal.tmu_enabled) {
+		ret = gpex_clock_lock_clock(GPU_CLOCK_MAX_UNLOCK, TMU_LOCK, 0);
+		/* TODO: print warning that gpu must be throttled, but gpu thermal is disabled */
+		return ret;
 	}
-out:
-	free_page((unsigned long)cb0);
+
+	ret = gpex_clock_lock_clock(GPU_CLOCK_MAX_LOCK, TMU_LOCK, freq);
+
+	if (ret) {
+		/* TODO: couldn't handle thermal throttling. print error log */
+		;
+	}
+
+	GPU_LOG_DETAILED(MALI_EXYNOS_DEBUG, LSI_TMU_VALUE, 0u, event,
+			 "tmu event throttling, frequency %d\n", freq);
+
+	gpexbe_debug_dbg_snapshot_thermal(freq);
 
 	return ret;
 }
 
-static void ehea_reset_port(struct work_struct *work)
+/***********************************************************************
+ * SYSFS FUNCTIONS
+ ***********************************************************************/
+static ssize_t show_tmu(char *buf)
 {
-	int ret;
-	struct ehea_port *port =
-		container_of(work, struct ehea_port, reset_task);
-	struct net_device *dev = port->netdev;
+	ssize_t ret = 0;
 
-	mutex_lock(&dlpar_mem_lock);
-	port->resets++;
-	mutex_lock(&port->port_lock);
-	netif_tx_disable(dev);
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", thermal.tmu_enabled);
 
-	port_napi_disable(port);
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
 
-	ehea_down(dev);
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_tmu);
 
-	ret = ehea_up(dev);
-	if (ret)
-		goto out;
+static ssize_t set_tmu_control(const char *buf, size_t count)
+{
+	if (sysfs_streq("0", buf)) {
+		gpex_clock_lock_clock(GPU_CLOCK_MAX_UNLOCK, TMU_LOCK, 0);
+		thermal.tmu_enabled = false;
+	} else if (sysfs_streq("1", buf))
+		thermal.tmu_enabled = true;
+	else
+		GPU_LOG(MALI_EXYNOS_WARNING, "%s: invalid value - only [0 or 1] is available\n",
+			__func__);
 
-	ehea_set_multicast_list(dev);
+	return count;
+}
+CREATE_SYSFS_DEVICE_WRITE_FUNCTION(set_tmu_control);
 
-	netif_info(port, timer, dev, "reset successful\n");
+static ssize_t show_kernel_sysfs_gpu_temp(char *buf)
+{
+	ssize_t ret = 0;
+	int err = 0;
+	int gpu_temp = 0;
+	int gpu_temp_int = 0;
+	int gpu_temp_point = 0;
+	static struct thermal_zone_device *tz;
 
-	port_napi_enable(port);
+	/* TODO: move thermal_zone related funcs to backend */
+	if (!tz)
+		tz = thermal_zone_get_zone_by_name("G3D");
 
-	netif_tx_wake_all_queues(dev);
-out:
-	mutex_unlock(&port->port_lock);
-	mutex_unlock(&dlpar_mem_lock);
+	err = thermal_zone_get_temp(tz, &gpu_temp);
+	if (err) {
+		GPU_LOG(MALI_EXYNOS_ERROR, "Error reading temp of gpu thermal zone: %d\n", err);
+		return -ENODEV;
+	}
+
+	gpu_temp_int = gpu_temp / 1000;
+	gpu_temp_point = gpu_temp % gpu_temp_int;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d.%d", gpu_temp_int, gpu_temp_point);
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_KOBJECT_READ_FUNCTION(show_kernel_sysfs_gpu_temp);
+
+static void gpex_thermal_create_sysfs_file(void)
+{
+	GPEX_UTILS_SYSFS_DEVICE_FILE_ADD(tmu, show_tmu, set_tmu_control);
+	GPEX_UTILS_SYSFS_KOBJECT_FILE_ADD_RO(gpu_tmu, show_kernel_sysfs_gpu_temp);
 }
 
-static void ehea_rereg_mrs(void)
+/***********************************************************************
+ * INIT, TERM FUNCTIONS
+ ***********************************************************************/
+int gpex_thermal_init(void)
 {
-	int ret, i;
-	struct ehea_adapter *adapter;
+	gpex_thermal_create_sysfs_file();
 
-	pr_info("LPAR memory changed - re-initializing driver\n");
+	gpex_utils_get_exynos_context()->thermal = &thermal;
 
-	list_for_each_entry(adapter, &adapter_list, list)
-		if (adapter->active_ports) {
-			/* Shutdown all ports */
-			for (i = 0; i < EHEA_MAX_PORTS; i++) {
-				struct ehea_port *port = adapter->port[i];
-				struct net_device *dev;
+	return 0;
+}
 
-				if (!port)
-					continue;
+void gpex_thermal_term(void)
+{
+	thermal.tmu_enabled = false;
 
-				dev = port->netdev;
+	/* TODO: unregister tmu notifier */
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /* SPDX-License-Identifier: GPL-2.0 */
 
-				if (dev->flags & IFF_UP) {
-					mutex_lock(&port->port_lock);
-					netif_tx_disable(dev);
-					ehea_flush_sq(port);
-					ret = ehea_stop_qps(dev);
-					if (ret) {
-						mutex_unlock(&port->port_lock);
-						goto out;
-					}
-					port_napi_disable(port);
-					mutex_unlock(&port->port_lock);
-				}
-				reset_sq_restart_flag(port);
-			}
+/*
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ */
 
-			/* Unregister old memory region */
-			ret = ehea_rem_mr(&adapter->mr);
-			if (ret) {
-				pr_err("unregister MR failed - driver inoperable!\n");
-				goto out;
-			}
-		}
+#include <gpex_tsg.h>
 
-	clear_bit(__EHEA_STOP_XFER, &ehea_driver_flags);
+#include <gpex_utils.h>
+#include <gpex_dvfs.h>
+#include <gpex_pm.h>
+#include <gpex_clock.h>
+#include <gpexbe_devicetree.h>
+#include <gpexbe_utilization.h>
 
-	list_for_each_entry(adapter, &adapter_list, list)
-		if (adapter->active_ports) {
-			/* Register new memory region */
-			ret = ehea_reg_kernel_mr(adapter, &adapter->mr);
-			if (ret) {
-				pr_err("register MR failed - driver inoperable!\n");
-				goto out;
-			}
+#include "gpex_tsg_internal.h"
+#include "gpex_dvfs_internal.h"
+#include "gpu_dvfs_governor.h"
 
-			/* Restart all ports */
-			for (i = 0; i < EHEA_MAX_PORTS; i++) {
-				struct ehea_port *port = adapter->port[i];
+static struct _tsg_info tsg;
 
-				if (port) {
-					struct net_device *dev = port->netdev;
+void gpex_tsg_input_nr_acc_cnt(void)
+{
+	tsg.input_job_nr_acc += tsg.input_job_nr;
+}
 
-					if (dev->flags & IFF_UP) {
-						mutex_lock(&port->port_lock);
-						ret = ehea_restart_qps(dev);
-						if (!ret) {
-							check_sqs(port);
-							port_napi_enable(port);
-							netif_tx_wake_all_queues(dev);
-						} else {
-							netdev_err(dev, "Unable to restart QPS\n");
-						}
-						mutex_unlock(&port->port_lock);
-					}
-				}
-			}
-		}
-	pr_info("re-initializing driver complete\n");
-out:
+void gpex_tsg_reset_acc_count(void)
+{
+	tsg.input_job_nr_acc = 0;
+	gpex_tsg_set_queued_time_tick(0, 0);
+	gpex_tsg_set_queued_time_tick(1, 0);
+}
+
+/* SETTER */
+void gpex_tsg_set_migov_mode(int mode)
+{
+	tsg.migov_mode = mode;
 	return;
 }
 
-static void ehea_tx_watchdog(struct net_device *dev)
+void gpex_tsg_set_freq_margin(int margin)
 {
-	struct ehea_port *port = netdev_priv(dev);
-
-	if (netif_carrier_ok(dev) &&
-	    !test_bit(__EHEA_STOP_XFER, &ehea_driver_flags))
-		ehea_schedule_port_reset(port);
+	tsg.freq_margin = margin;
+	return;
 }
 
-static int ehea_sense_adapter_attr(struct ehea_adapter *adapter)
+void gpex_tsg_set_util_history(int idx, int order, int input)
 {
-	struct hcp_query_ehea *cb;
-	u64 hret;
-	int ret;
-
-	cb = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	hret = ehea_h_query_ehea(adapter->handle, cb);
-
-	if (hret != H_SUCCESS) {
-		ret = -EIO;
-		goto out_herr;
-	}
-
-	adapter->max_mc_mac = cb->max_mc_mac - 1;
-	ret = 0;
-
-out_herr:
-	free_page((unsigned long)cb);
-out:
-	return ret;
+	tsg.prediction.util_history[idx][order] = input;
+	return;
 }
 
-static int ehea_get_jumboframe_status(struct ehea_port *port, int *jumbo)
+void gpex_tsg_set_weight_util(int idx, int input)
 {
-	struct hcp_ehea_port_cb4 *cb4;
-	u64 hret;
-	int ret = 0;
-
-	*jumbo = 0;
-
-	/* (Try to) enable *jumbo frames */
-	cb4 = (void *)get_zeroed_page(GFP_KERNEL);
-	if (!cb4) {
-		pr_err("no mem for cb4\n");
-		ret = -ENOMEM;
-		goto out;
-	} else {
-		hret = ehea_h_query_ehea_port(port->adapter->handle,
-					      port->logical_port_id,
-					      H_PORT_CB4,
-					      H_PORT_CB4_JUMBO, cb4);
-		if (hret == H_SUCCESS) {
-			if (cb4->jumbo_frame)
-				*jumbo = 1;
-			else {
-				cb4->jumbo_frame = 1;
-				hret = ehea_h_modify_ehea_port(port->adapter->
-							       handle,
-							       port->
-							       logical_port_id,
-							       H_PORT_CB4,
-							       H_PORT_CB4_JUMBO,
-							       cb4);
-				if (hret == H_SUCCESS)
-					*jumbo = 1;
-			}
-		} else
-			ret = -EINVAL;
-
-		free_page((unsigned long)cb4);
-	}
-out:
-	return ret;
+	tsg.prediction.weight_util[idx] = input;
+	return;
 }
 
-static ssize_t ehea_show_port_id(struct device *dev,
-				 struct device_attribute *attr, char *buf)
+void gpex_tsg_set_weight_freq(int input)
 {
-	struct ehea_port *port = container_of(dev, struct ehea_port, ofdev.dev);
-	return sprintf(buf, "%d", port->logical_port_id);
+	tsg.prediction.weight_freq = input;
+	return;
 }
 
-static DEVICE_ATTR(log_port_id, S_IRUSR | S_IRGRP | S_IROTH, ehea_show_port_id,
-		   NULL);
-
-static void logical_port_release(struct device *dev)
+void gpex_tsg_set_en_signal(bool input)
 {
-	struct ehea_port *port = container_of(dev, struct ehea_port, ofdev.dev);
-	of_node_put(port->ofdev.dev.of_node);
+	tsg.prediction.en_signal = input;
+	return;
 }
 
-static struct device *ehea_register_port(struct ehea_port *port,
-					 struct device_node *dn)
+void gpex_tsg_set_pmqos(bool input)
 {
-	int ret;
-
-	port->ofdev.dev.of_node = of_node_get(dn);
-	port->ofdev.dev.parent = &port->adapter->ofdev->dev;
-	port->ofdev.dev.bus = &ibmebus_bus_type;
-
-	dev_set_name(&port->ofdev.dev, "port%d", port_name_cnt++);
-	port->ofdev.dev.release = logical_port_release;
-
-	ret = of_device_register(&port->ofdev);
-	if (ret) {
-		pr_err("failed to register device. ret=%d\n", ret);
-		put_device(&port->ofdev.dev);
-		goto out;
-	}
-
-	ret = device_create_file(&port->ofdev.dev, &dev_attr_log_port_id);
-	if (ret) {
-		pr_err("failed to register attributes, ret=%d\n", ret);
-		goto out_unreg_of_dev;
-	}
-
-	return &port->ofdev.dev;
-
-out_unreg_of_dev:
-	of_device_unregister(&port->ofdev);
-out:
-	return NULL;
+	tsg.is_pm_qos_tsg = input;
+	return;
 }
 
-static void ehea_unregister_port(struct ehea_port *port)
+void gpex_tsg_set_weight_table_idx(int idx, int input)
 {
-	device_remove_file(&port->ofdev.dev, &dev_attr_log_port_id);
-	of_device_unregister(&port->ofdev);
+	if (idx == 0)
+		tsg.weight_table_idx_0 = input;
+	else
+		tsg.weight_table_idx_1 = input;
+	return;
 }
 
-static const struct net_device_ops ehea_netdev_ops = {
-	.ndo_open		= ehea_open,
-	.ndo_stop		= ehea_stop,
-	.ndo_start_xmit		= ehea_start_xmit,
-#ifdef CONFIG_NET_POLL_CONTROLLER
-	.ndo_poll_controller	= ehea_netpoll,
-#endif
-	.ndo_get_stats64	= ehea_get_stats64,
-	.ndo_set_mac_address	= ehea_set_mac_addr,
-	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_set_rx_mode	= ehea_set_multicast_list,
-	.ndo_change_mtu		= ehea_change_mtu,
-	.ndo_vlan_rx_add_vid	= ehea_vlan_rx_add_vid,
-	.ndo_vlan_rx_kill_vid	= ehea_vlan_rx_kill_vid,
-	.ndo_tx_timeout		= ehea_tx_watchdog,
-};
-
-static struct ehea_port *ehea_setup_single_port(struct ehea_adapter *adapter,
-					 u32 logical_port_id,
-					 struct device_node *dn)
+void gpex_tsg_set_is_gov_set(int input)
 {
-	int ret;
-	struct net_device *dev;
-	struct ehea_port *port;
-	struct device *port_dev;
-	int jumbo;
-
-	/* allocate memory for the port structures */
-	dev = alloc_etherdev_mq(sizeof(struct ehea_port), EHEA_MAX_PORT_RES);
-
-	if (!dev) {
-		ret = -ENOMEM;
-		goto out_err;
-	}
-
-	port = netdev_priv(dev);
-
-	mutex_init(&port->port_lock);
-	port->state = EHEA_PORT_DOWN;
-	port->sig_comp_iv = sq_entries / 10;
-
-	port->adapter = adapter;
-	port->netdev = dev;
-	port->logical_port_id = logical_port_id;
-
-	port->msg_enable = netif_msg_init(msg_level, EHEA_MSG_DEFAULT);
-
-	port->mc_list = kzalloc(sizeof(struct ehea_mc_list), GFP_KERNEL);
-	if (!port->mc_list) {
-		ret = -ENOMEM;
-		goto out_free_ethdev;
-	}
-
-	INIT_LIST_HEAD(&port->mc_list->list);
-
-	ret = ehea_sense_port_attr(port);
-	if (ret)
-		goto out_free_mc_list;
-
-	netif_set_real_num_rx_queues(dev, port->num_def_qps);
-	netif_set_real_num_tx_queues(dev, port->num_def_qps);
-
-	port_dev = ehea_register_port(port, dn);
-	if (!port_dev)
-		goto out_free_mc_list;
-
-	SET_NETDEV_DEV(dev, port_dev);
-
-	/* initialize net_device structure */
-	memcpy(dev->dev_addr, &port->mac_addr, ETH_ALEN);
-
-	dev->netdev_ops = &ehea_netdev_ops;
-	ehea_set_ethtool_ops(dev);
-
-	dev->hw_features = NETIF_F_SG | NETIF_F_TSO |
-		      NETIF_F_IP_CSUM | NETIF_F_HW_VLAN_CTAG_TX;
-	dev->features = NETIF_F_SG | NETIF_F_TSO |
-		      NETIF_F_HIGHDMA | NETIF_F_IP_CSUM |
-		      NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX |
-		      NETIF_F_HW_VLAN_CTAG_FILTER | NETIF_F_RXCSUM;
-	dev->vlan_features = NETIF_F_SG | NETIF_F_TSO | NETIF_F_HIGHDMA |
-			NETIF_F_IP_CSUM;
-	dev->watchdog_timeo = EHEA_WATCH_DOG_TIMEOUT;
-
-	INIT_WORK(&port->reset_task, ehea_reset_port);
-	INIT_DELAYED_WORK(&port->stats_work, ehea_update_stats);
-
-	init_waitqueue_head(&port->swqe_avail_wq);
-	init_waitqueue_head(&port->restart_wq);
-
-	memset(&port->stats, 0, sizeof(struct net_device_stats));
-	ret = register_netdev(dev);
-	if (ret) {
-		pr_err("register_netdev failed. ret=%d\n", ret);
-		goto out_unreg_port;
-	}
-
-	ret = ehea_get_jumboframe_status(port, &jumbo);
-	if (ret)
-		netdev_err(dev, "failed determining jumbo frame status\n");
-
-	netdev_info(dev, "Jumbo frames are %sabled\n",
-		    jumbo == 1 ? "en" : "dis");
-
-	adapter->active_ports++;
-
-	return port;
-
-out_unreg_port:
-	ehea_unregister_port(port);
-
-out_free_mc_list:
-	kfree(port->mc_list);
-
-out_free_ethdev:
-	free_netdev(dev);
-
-out_err:
-	pr_err("setting up logical port with id=%d failed, ret=%d\n",
-	       logical_port_id, ret);
-	return NULL;
+	tsg.is_gov_set = input;
+	return;
 }
 
-static void ehea_shutdown_single_port(struct ehea_port *port)
+void gpex_tsg_set_saved_polling_speed(int input)
 {
-	struct ehea_adapter *adapter = port->adapter;
-
-	cancel_work_sync(&port->reset_task);
-	cancel_delayed_work_sync(&port->stats_work);
-	unregister_netdev(port->netdev);
-	ehea_unregister_port(port);
-	kfree(port->mc_list);
-	free_netdev(port->netdev);
-	adapter->active_ports--;
+	tsg.migov_saved_polling_speed = input;
+	return;
 }
 
-static int ehea_setup_ports(struct ehea_adapter *adapter)
+void gpex_tsg_set_governor_type_init(int input)
 {
-	struct device_node *lhea_dn;
-	struct device_node *eth_dn = NULL;
-
-	const u32 *dn_log_port_id;
-	int i = 0;
-
-	lhea_dn = adapter->ofdev->dev.of_node;
-	while ((eth_dn = of_get_next_child(lhea_dn, eth_dn))) {
-
-		dn_log_port_id = of_get_property(eth_dn, "ibm,hea-port-no",
-						 NULL);
-		if (!dn_log_port_id) {
-			pr_err("bad device node: eth_dn name=%s\n",
-			       eth_dn->full_name);
-			continue;
-		}
-
-		if (ehea_add_adapter_mr(adapter)) {
-			pr_err("creating MR failed\n");
-			of_node_put(eth_dn);
-			return -EIO;
-		}
-
-		adapter->port[i] = ehea_setup_single_port(adapter,
-							  *dn_log_port_id,
-							  eth_dn);
-		if (adapter->port[i])
-			netdev_info(adapter->port[i]->netdev,
-				    "logical port id #%d\n", *dn_log_port_id);
-		else
-			ehea_remove_adapter_mr(adapter);
-
-		i++;
-	}
-	return 0;
+	tsg.governor_type_init = input;
+	return;
 }
 
-static struct device_node *ehea_get_eth_dn(struct ehea_adapter *adapter,
-					   u32 logical_port_id)
+void gpex_tsg_set_amigo_flags(int input)
 {
-	struct device_node *lhea_dn;
-	struct device_node *eth_dn = NULL;
-	const u32 *dn_log_port_id;
-
-	lhea_dn = adapter->ofdev->dev.of_node;
-	while ((eth_dn = of_get_next_child(lhea_dn, eth_dn))) {
-
-		dn_log_port_id = of_get_property(eth_dn, "ibm,hea-port-no",
-						 NULL);
-		if (dn_log_port_id)
-			if (*dn_log_port_id == logical_port_id)
-				return eth_dn;
-	}
-
-	return NULL;
+	tsg.amigo_flags = input;
+	return;
 }
 
-static ssize_t ehea_probe_port(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
+void gpex_tsg_set_queued_threshold(int idx, uint32_t input)
 {
-	struct ehea_adapter *adapter = dev_get_drvdata(dev);
-	struct ehea_port *port;
-	struct device_node *eth_dn = NULL;
-	int i;
-
-	u32 logical_port_id;
-
-	sscanf(buf, "%d", &logical_port_id);
-
-	port = ehea_get_port(adapter, logical_port_id);
-
-	if (port) {
-		netdev_info(port->netdev, "adding port with logical port id=%d failed: port already configured\n",
-			    logical_port_id);
-		return -EINVAL;
-	}
-
-	eth_dn = ehea_get_eth_dn(adapter, logical_port_id);
-
-	if (!eth_dn) {
-		pr_info("no logical port with id %d found\n", logical_port_id);
-		return -EINVAL;
-	}
-
-	if (ehea_add_adapter_mr(adapter)) {
-		pr_err("creating MR failed\n");
-		of_node_put(eth_dn);
-		return -EIO;
-	}
-
-	port = ehea_setup_single_port(adapter, logical_port_id, eth_dn);
-
-	of_node_put(eth_dn);
-
-	if (port) {
-		for (i = 0; i < EHEA_MAX_PORTS; i++)
-			if (!adapter->port[i]) {
-				adapter->port[i] = port;
-				break;
-			}
-
-		netdev_info(port->netdev, "added: (logical port id=%d)\n",
-			    logical_port_id);
-	} else {
-		ehea_remove_adapter_mr(adapter);
-		return -EIO;
-	}
-
-	return (ssize_t) count;
+	tsg.queue.queued_threshold[idx] = input;
+	return;
 }
 
-static ssize_t ehea_remove_port(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
+void gpex_tsg_set_queued_time_tick(int idx, ktime_t input)
 {
-	struct ehea_adapter *adapter = dev_get_drvdata(dev);
-	struct ehea_port *port;
-	int i;
-	u32 logical_port_id;
-
-	sscanf(buf, "%d", &logical_port_id);
-
-	port = ehea_get_port(adapter, logical_port_id);
-
-	if (port) {
-		netdev_info(port->netdev, "removed: (logical port id=%d)\n",
-			    logical_port_id);
-
-		ehea_shutdown_single_port(port);
-
-		for (i = 0; i < EHEA_MAX_PORTS; i++)
-			if (adapter->port[i] == port) {
-				adapter->port[i] = NULL;
-				break;
-			}
-	} else {
-		pr_err("removing port with logical port id=%d failed. port not configured.\n",
-		       logical_port_id);
-		return -EINVAL;
-	}
-
-	ehea_remove_adapter_mr(adapter);
-
-	return (ssize_t) count;
+	tsg.queue.queued_time_tick[idx] = input;
+	return;
 }
 
-static DEVICE_ATTR(probe_port, S_IWUSR, NULL, ehea_probe_port);
-static DEVICE_ATTR(remove_port, S_IWUSR, NULL, ehea_remove_port);
-
-static int ehea_create_device_sysfs(struct platform_device *dev)
+void gpex_tsg_set_queued_time(int idx, ktime_t input)
 {
-	int ret = device_create_file(&dev->dev, &dev_attr_probe_port);
-	if (ret)
-		goto out;
-
-	ret = device_create_file(&dev->dev, &dev_attr_remove_port);
-out:
-	return ret;
+	tsg.queue.queued_time[idx] = input;
 }
 
-static void ehea_remove_device_sysfs(struct platform_device *dev)
+void gpex_tsg_set_queued_last_updated(ktime_t input)
 {
-	device_remove_file(&dev->dev, &dev_attr_probe_port);
-	device_remove_file(&dev->dev, &dev_attr_remove_port);
+	tsg.queue.last_updated = input;
 }
 
-static int ehea_reboot_notifier(struct notifier_block *nb,
-				unsigned long action, void *unused)
+void gpex_tsg_set_queue_nr(int type, int variation)
 {
-	if (action == SYS_RESTART) {
-		pr_info("Reboot: freeing all eHEA resources\n");
-		ibmebus_unregister_driver(&ehea_driver);
-	}
-	return NOTIFY_DONE;
+	/* GPEX_TSG_QUEUE_JOB/IN/OUT: 0, 1, 2*/
+	/* GPEX_TSG_QUEUE_INC/DEC/RST: 3, 4, 5*/
+
+	if (variation == GPEX_TSG_RST)
+		atomic_set(&tsg.queue.nr[type], 0);
+	else
+		(variation == GPEX_TSG_INC) ? atomic_inc(&tsg.queue.nr[type]) :
+						    atomic_dec(&tsg.queue.nr[type]);
 }
 
-static struct notifier_block ehea_reboot_nb = {
-	.notifier_call = ehea_reboot_notifier,
-};
-
-static int ehea_mem_notifier(struct notifier_block *nb,
-			     unsigned long action, void *data)
+/* GETTER */
+int gpex_tsg_get_migov_mode(void)
 {
-	int ret = NOTIFY_BAD;
-	struct memory_notify *arg = data;
-
-	mutex_lock(&dlpar_mem_lock);
-
-	switch (action) {
-	case MEM_CANCEL_OFFLINE:
-		pr_info("memory offlining canceled");
-		/* Fall through: re-add canceled memory block */
-
-	case MEM_ONLINE:
-		pr_info("memory is going online");
-		set_bit(__EHEA_STOP_XFER, &ehea_driver_flags);
-		if (ehea_add_sect_bmap(arg->start_pfn, arg->nr_pages))
-			goto out_unlock;
-		ehea_rereg_mrs();
-		break;
-
-	case MEM_GOING_OFFLINE:
-		pr_info("memory is going offline");
-		set_bit(__EHEA_STOP_XFER, &ehea_driver_flags);
-		if (ehea_rem_sect_bmap(arg->start_pfn, arg->nr_pages))
-			goto out_unlock;
-		ehea_rereg_mrs();
-		break;
-
-	default:
-		break;
-	}
-
-	ehea_update_firmware_handles();
-	ret = NOTIFY_OK;
-
-out_unlock:
-	mutex_unlock(&dlpar_mem_lock);
-	return ret;
+	return tsg.migov_mode;
 }
 
-static struct notifier_block ehea_mem_nb = {
-	.notifier_call = ehea_mem_notifier,
-};
-
-static void ehea_crash_handler(void)
+int gpex_tsg_get_freq_margin(void)
 {
-	int i;
-
-	if (ehea_fw_handles.arr)
-		for (i = 0; i < ehea_fw_handles.num_entries; i++)
-			ehea_h_free_resource(ehea_fw_handles.arr[i].adh,
-					     ehea_fw_handles.arr[i].fwh,
-					     FORCE_FREE);
-
-	if (ehea_bcmc_regs.arr)
-		for (i = 0; i < ehea_bcmc_regs.num_entries; i++)
-			ehea_h_reg_dereg_bcmc(ehea_bcmc_regs.arr[i].adh,
-					      ehea_bcmc_regs.arr[i].port_id,
-					      ehea_bcmc_regs.arr[i].reg_type,
-					      ehea_bcmc_regs.arr[i].macaddr,
-					      0, H_DEREG_BCMC);
+	return tsg.freq_margin;
 }
 
-static atomic_t ehea_memory_hooks_registered;
+int gpex_tsg_get_util_history(int idx, int order)
+{
+	return tsg.prediction.util_history[idx][order];
+}
 
-/* Register memory hooks on probe of first adapter */
-static int ehea_register_memory_hooks(void)
+int gpex_tsg_get_weight_util(int idx)
+{
+	return tsg.prediction.weight_util[idx];
+}
+
+int gpex_tsg_get_weight_freq(void)
+{
+	return tsg.prediction.weight_freq;
+}
+
+bool gpex_tsg_get_en_signal(void)
+{
+	return tsg.prediction.en_signal;
+}
+
+bool gpex_tsg_get_pmqos(void)
+{
+	return tsg.is_pm_qos_tsg;
+}
+
+int gpex_tsg_get_weight_table_idx(int idx)
+{
+	return (idx == 0) ? tsg.weight_table_idx_0 : tsg.weight_table_idx_1;
+}
+
+int gpex_tsg_get_is_gov_set(void)
+{
+	return tsg.is_gov_set;
+}
+
+int gpex_tsg_get_saved_polling_speed(void)
+{
+	return tsg.migov_saved_polling_speed;
+}
+
+int gpex_tsg_get_governor_type_init(void)
+{
+	return tsg.governor_type_init;
+}
+
+int gpex_tsg_get_amigo_flags(void)
+{
+	return tsg.amigo_flags;
+}
+
+uint32_t gpex_tsg_get_queued_threshold(int idx)
+{
+	return tsg.queue.queued_threshold[idx];
+}
+
+ktime_t gpex_tsg_get_queued_time_tick(int idx)
+{
+	return tsg.queue.queued_time_tick[idx];
+}
+
+ktime_t gpex_tsg_get_queued_time(int idx)
+{
+	return tsg.queue.queued_time[idx];
+}
+
+ktime_t *gpex_tsg_get_queued_time_array(void)
+{
+	return tsg.queue.queued_time;
+}
+
+ktime_t gpex_tsg_get_queued_last_updated(void)
+{
+	return tsg.queue.last_updated;
+}
+
+int gpex_tsg_get_queue_nr(int type)
+{
+	return atomic_read(&tsg.queue.nr[type]);
+}
+
+struct atomic_notifier_head *gpex_tsg_get_frag_utils_change_notifier_list(void)
+{
+	return &(tsg.frag_utils_change_notifier_list);
+}
+
+int gpex_tsg_notify_frag_utils_change(u32 js0_utils)
 {
 	int ret = 0;
+	ret = atomic_notifier_call_chain(gpex_tsg_get_frag_utils_change_notifier_list(), js0_utils,
+					 NULL);
+	return ret;
+}
 
-	if (atomic_inc_return(&ehea_memory_hooks_registered) > 1)
+int gpex_tsg_spin_lock(void)
+{
+	return raw_spin_trylock(&tsg.spinlock);
+}
+
+void gpex_tsg_spin_unlock(void)
+{
+	raw_spin_unlock(&tsg.spinlock);
+}
+
+/* Function of Kbase */
+
+static inline bool both_q_active(int in_nr, int out_nr)
+{
+	return in_nr > 0 && out_nr > 0;
+}
+
+static inline bool hw_q_active(int out_nr)
+{
+	return out_nr > 0;
+}
+
+static void accum_queued_time(ktime_t current_time, bool accum0, bool accum1)
+{
+	int time_diff = 0;
+	time_diff = current_time - gpex_tsg_get_queued_last_updated();
+
+	if (accum0 == true)
+		gpex_tsg_set_queued_time_tick(0, gpex_tsg_get_queued_time_tick(0) + time_diff);
+	if (accum1 == true)
+		gpex_tsg_set_queued_time_tick(1, gpex_tsg_get_queued_time_tick(1) + time_diff);
+
+	gpex_tsg_set_queued_last_updated(current_time);
+}
+
+int gpex_tsg_reset_count(int powered)
+{
+	if (powered)
 		return 0;
 
-	ret = ehea_create_busmap();
-	if (ret) {
-		pr_info("ehea_create_busmap failed\n");
-		goto out;
-	}
+	gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_JOB, GPEX_TSG_RST);
+	gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_IN, GPEX_TSG_RST);
+	gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_OUT, GPEX_TSG_RST);
+	gpex_tsg_set_queued_last_updated(0);
 
-	ret = register_reboot_notifier(&ehea_reboot_nb);
-	if (ret) {
-		pr_info("register_reboot_notifier failed\n");
-		goto out;
-	}
+	tsg.input_job_nr = 0;
 
-	ret = register_memory_notifier(&ehea_mem_nb);
-	if (ret) {
-		pr_info("register_memory_notifier failed\n");
-		goto out2;
-	}
-
-	ret = crash_shutdown_register(ehea_crash_handler);
-	if (ret) {
-		pr_info("crash_shutdown_register failed\n");
-		goto out3;
-	}
-
-	return 0;
-
-out3:
-	unregister_memory_notifier(&ehea_mem_nb);
-out2:
-	unregister_reboot_notifier(&ehea_reboot_nb);
-out:
-	atomic_dec(&ehea_memory_hooks_registered);
-	return ret;
+	return !powered;
 }
 
-static void ehea_unregister_memory_hooks(void)
+int gpex_tsg_set_count(u32 status, bool stop)
 {
-	/* Only remove the hooks if we've registered them */
-	if (atomic_read(&ehea_memory_hooks_registered) == 0)
-		return;
+	int prev_out_nr, prev_in_nr;
+	int cur_out_nr, cur_in_nr;
+	bool need_update = false;
+	ktime_t current_time = 0;
 
-	unregister_reboot_notifier(&ehea_reboot_nb);
-	if (crash_shutdown_unregister(ehea_crash_handler))
-		pr_info("failed unregistering crash handler\n");
-	unregister_memory_notifier(&ehea_mem_nb);
-}
+	if (gpex_tsg_get_queued_last_updated() == 0)
+		gpex_tsg_set_queued_last_updated(ktime_get());
 
-static int ehea_probe_adapter(struct platform_device *dev)
-{
-	struct ehea_adapter *adapter;
-	const u64 *adapter_handle;
-	int ret;
-	int i;
+	prev_out_nr = gpex_tsg_get_queue_nr(GPEX_TSG_QUEUE_OUT);
+	prev_in_nr = gpex_tsg_get_queue_nr(GPEX_TSG_QUEUE_IN);
 
-	ret = ehea_register_memory_hooks();
-	if (ret)
-		return ret;
-
-	if (!dev || !dev->dev.of_node) {
-		pr_err("Invalid ibmebus device probed\n");
-		return -EINVAL;
-	}
-
-	adapter = devm_kzalloc(&dev->dev, sizeof(*adapter), GFP_KERNEL);
-	if (!adapter) {
-		ret = -ENOMEM;
-		dev_err(&dev->dev, "no mem for ehea_adapter\n");
-		goto out;
-	}
-
-	list_add(&adapter->list, &adapter_list);
-
-	adapter->ofdev = dev;
-
-	adapter_handle = of_get_property(dev->dev.of_node, "ibm,hea-handle",
-					 NULL);
-	if (adapter_handle)
-		adapter->handle = *adapter_handle;
-
-	if (!adapter->handle) {
-		dev_err(&dev->dev, "failed getting handle for adapter"
-			" '%s'\n", dev->dev.of_node->full_name);
-		ret = -ENODEV;
-		goto out_free_ad;
-	}
-
-	adapter->pd = EHEA_PD_ID;
-
-	platform_set_drvdata(dev, adapter);
-
-
-	/* initialize adapter and ports */
-	/* get adapter properties */
-	ret = ehea_sense_adapter_attr(adapter);
-	if (ret) {
-		dev_err(&dev->dev, "sense_adapter_attr failed: %d\n", ret);
-		goto out_free_ad;
-	}
-
-	adapter->neq = ehea_create_eq(adapter,
-				      EHEA_NEQ, EHEA_MAX_ENTRIES_EQ, 1);
-	if (!adapter->neq) {
-		ret = -EIO;
-		dev_err(&dev->dev, "NEQ creation failed\n");
-		goto out_free_ad;
-	}
-
-	tasklet_init(&adapter->neq_tasklet, ehea_neq_tasklet,
-		     (unsigned long)adapter);
-
-	ret = ehea_create_device_sysfs(dev);
-	if (ret)
-		goto out_kill_eq;
-
-	ret = ehea_setup_ports(adapter);
-	if (ret) {
-		dev_err(&dev->dev, "setup_ports failed\n");
-		goto out_rem_dev_sysfs;
-	}
-
-	ret = ibmebus_request_irq(adapter->neq->attr.ist1,
-				  ehea_interrupt_neq, 0,
-				  "ehea_neq", adapter);
-	if (ret) {
-		dev_err(&dev->dev, "requesting NEQ IRQ failed\n");
-		goto out_shutdown_ports;
-	}
-
-	/* Handle any events that might be pending. */
-	tasklet_hi_schedule(&adapter->neq_tasklet);
-
-	ret = 0;
-	goto out;
-
-out_shutdown_ports:
-	for (i = 0; i < EHEA_MAX_PORTS; i++)
-		if (adapter->port[i]) {
-			ehea_shutdown_single_port(adapter->port[i]);
-			adapter->port[i] = NULL;
+	if (stop) {
+		gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_IN, GPEX_TSG_INC);
+		gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_OUT, GPEX_TSG_DEC);
+		tsg.input_job_nr++;
+	} else {
+		switch (status) {
+		case GPEX_TSG_ATOM_STATE_QUEUED:
+			gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_IN, GPEX_TSG_INC);
+			tsg.input_job_nr++;
+			break;
+		case GPEX_TSG_ATOM_STATE_IN_JS:
+			gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_IN, GPEX_TSG_DEC);
+			gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_OUT, GPEX_TSG_INC);
+			tsg.input_job_nr--;
+			if (tsg.input_job_nr < 0)
+				tsg.input_job_nr = 0;
+			break;
+		case GPEX_TSG_ATOM_STATE_HW_COMPLETED:
+			gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_OUT, GPEX_TSG_DEC);
+			break;
+		default:
+			break;
 		}
+	}
 
-out_rem_dev_sysfs:
-	ehea_remove_device_sysfs(dev);
+	cur_in_nr = gpex_tsg_get_queue_nr(GPEX_TSG_QUEUE_IN);
+	cur_out_nr = gpex_tsg_get_queue_nr(GPEX_TSG_QUEUE_OUT);
 
-out_kill_eq:
-	ehea_destroy_eq(adapter->neq);
+	if ((!both_q_active(prev_in_nr, prev_out_nr) && both_q_active(cur_in_nr, cur_out_nr)) ||
+	    (!hw_q_active(prev_out_nr) && hw_q_active(cur_out_nr)))
+		need_update = true;
+	else if ((both_q_active(prev_in_nr, prev_out_nr) &&
+		  !both_q_active(cur_in_nr, cur_out_nr)) ||
+		 (hw_q_active(prev_out_nr) && !hw_q_active(cur_out_nr)))
+		need_update = true;
+	else if (prev_out_nr > cur_out_nr) {
+		current_time = ktime_get();
+		need_update =
+			current_time - (gpex_tsg_get_queued_last_updated() > 2) * GPEX_TSG_PERIOD;
+	}
 
-out_free_ad:
-	list_del(&adapter->list);
-
-out:
-	ehea_update_firmware_handles();
-
-	return ret;
-}
-
-static int ehea_remove(struct platform_device *dev)
-{
-	struct ehea_adapter *adapter = platform_get_drvdata(dev);
-	int i;
-
-	for (i = 0; i < EHEA_MAX_PORTS; i++)
-		if (adapter->port[i]) {
-			ehea_shutdown_single_port(adapter->port[i]);
-			adapter->port[i] = NULL;
+	if (need_update) {
+		current_time = (current_time == 0) ? ktime_get() : current_time;
+		if (gpex_tsg_spin_lock()) {
+			accum_queued_time(current_time, both_q_active(prev_in_nr, prev_out_nr),
+					  hw_q_active(prev_out_nr));
+			gpex_tsg_spin_unlock();
 		}
+	}
 
-	ehea_remove_device_sysfs(dev);
-
-	ibmebus_free_irq(adapter->neq->attr.ist1, adapter);
-	tasklet_kill(&adapter->neq_tasklet);
-
-	ehea_destroy_eq(adapter->neq);
-	ehea_remove_adapter_mr(adapter);
-	list_del(&adapter->list);
-
-	ehea_update_firmware_handles();
+	if ((cur_in_nr + cur_out_nr) < 0)
+		gpex_tsg_reset_count(0);
 
 	return 0;
 }
 
-static int check_module_parm(void)
+static void gpex_tsg_context_init(void)
+{
+	gpex_tsg_set_weight_table_idx(0, gpexbe_devicetree_get_int(gpu_weight_table_idx_0));
+	gpex_tsg_set_weight_table_idx(1, gpexbe_devicetree_get_int(gpu_weight_table_idx_1));
+	gpex_tsg_set_governor_type_init(gpex_dvfs_get_governor_type());
+	gpex_tsg_set_queued_threshold(0, 0);
+	gpex_tsg_set_queued_threshold(1, 0);
+	gpex_tsg_set_queued_time_tick(0, 0);
+	gpex_tsg_set_queued_time_tick(1, 0);
+	gpex_tsg_set_queued_time(0, 0);
+	gpex_tsg_set_queued_time(1, 0);
+	gpex_tsg_set_queued_last_updated(0);
+	gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_JOB, GPEX_TSG_RST);
+	gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_IN, GPEX_TSG_RST);
+	gpex_tsg_set_queue_nr(GPEX_TSG_QUEUE_OUT, GPEX_TSG_RST);
+
+	tsg.input_job_nr = 0;
+	tsg.input_job_nr_acc = 0;
+}
+
+int gpex_tsg_init(struct device **dev)
+{
+	raw_spin_lock_init(&tsg.spinlock);
+	tsg.kbdev = container_of(dev, struct kbase_device, dev);
+
+	gpex_tsg_context_init();
+	gpex_tsg_external_init(&tsg);
+	gpex_tsg_sysfs_init(&tsg);
+
+	gpex_utils_get_exynos_context()->tsg = &tsg;
+
+	return 0;
+}
+
+int gpex_tsg_term(void)
+{
+	gpex_tsg_sysfs_term();
+	gpex_tsg_external_term();
+	tsg.kbdev = NULL;
+
+	return 0;
+}
+
+void gpex_tsg_update_firstjob_time(void)
+{
+}
+
+void gpex_tsg_update_lastjob_time(int slot_nr)
+{
+	CSTD_UNUSED(slot_nr);
+}
+
+void gpex_tsg_update_jobsubmit_time(void)
+{
+}
+
+void gpex_tsg_sum_jobs_time(int slot_nr)
+{
+	CSTD_UNUSED(slot_nr);
+}
+
+int gpex_tsg_amigo_interframe_sw_update(ktime_t start, ktime_t end)
+{
+	CSTD_UNUSED(start);
+	CSTD_UNUSED(end);
+
+	return 0;
+}
+
+int gpex_tsg_amigo_interframe_hw_update_eof(void)
+{
+	return 0;
+}
+
+int gpex_tsg_amigo_interframe_hw_update(void)
+{
+	return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /* SPDX-License-Identifier: GPL-2.0 */
+
+/*
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ */
+
+#include <linux/notifier.h>
+#include <linux/ktime.h>
+
+#include <gpex_tsg.h>
+#include <gpex_dvfs.h>
+#include <gpex_utils.h>
+#include <gpex_pm.h>
+#include <gpex_ifpo.h>
+#include <gpex_clock.h>
+#include <gpexbe_pm.h>
+
+#include "gpex_tsg_internal.h"
+
+#define DVFS_TABLE_ROW_MAX 20
+
+static struct _tsg_info *tsg_info;
+
+unsigned long exynos_stats_get_job_state_cnt(void)
+{
+	return tsg_info->input_job_nr_acc;
+}
+EXPORT_SYMBOL(exynos_stats_get_job_state_cnt);
+
+int exynos_stats_get_gpu_cur_idx(void)
+{
+	int i;
+	int level = -1;
+	int clock = 0;
+	int idx_max_clk, idx_min_clk;
+
+	if (gpexbe_pm_get_exynos_pm_domain()) {
+		if (gpexbe_pm_get_status() == 1) {
+			clock = gpex_clock_get_cur_clock();
+		} else {
+			GPU_LOG(MALI_EXYNOS_ERROR, "%s: can't get dvfs cur clock\n", __func__);
+			clock = 0;
+		}
+	} else {
+		if (gpex_pm_get_status(true) == 1) {
+			if (gpex_ifpo_get_mode() && !gpex_ifpo_get_status()) {
+				GPU_LOG(MALI_EXYNOS_ERROR, "%s: can't get dvfs cur clock\n",
+					__func__);
+				clock = 0;
+			} else {
+				clock = gpex_clock_get_cur_clock();
+			}
+		}
+	}
+
+	idx_max_clk = gpex_clock_get_table_idx(gpex_clock_get_max_clock());
+	idx_min_clk = gpex_clock_get_table_idx(gpex_clock_get_min_clock());
+
+	if ((idx_max_clk < 0) || (idx_min_clk < 0)) {
+		GPU_LOG(MALI_EXYNOS_ERROR,
+			"%s: mismatch clock table index. max_clock_level : %d, min_clock_level : %d\n",
+			__func__, idx_max_clk, idx_min_clk);
+		return -1;
+	}
+
+	if (clock == 0)
+		return idx_min_clk - idx_max_clk;
+
+	for (i = idx_max_clk; i <= idx_min_clk; i++) {
+		if (gpex_clock_get_clock(i) == clock) {
+			level = i;
+			break;
+		}
+	}
+
+	return (level - idx_max_clk);
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_cur_idx);
+
+int exynos_stats_get_gpu_coeff(void)
+{
+	int coef = 6144;
+
+	return coef;
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_coeff);
+
+uint32_t exynos_stats_get_gpu_table_size(void)
+{
+	return (gpex_clock_get_table_idx(gpex_clock_get_min_clock()) -
+		gpex_clock_get_table_idx(gpex_clock_get_max_clock()) + 1);
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_table_size);
+
+static uint32_t freqs[DVFS_TABLE_ROW_MAX];
+uint32_t *exynos_stats_get_gpu_freq_table(void)
+{
+	int i;
+	int idx_max_clk, idx_min_clk;
+
+	idx_max_clk = gpex_clock_get_table_idx(gpex_clock_get_max_clock());
+	idx_min_clk = gpex_clock_get_table_idx(gpex_clock_get_min_clock());
+
+	if ((idx_max_clk < 0) || (idx_min_clk < 0)) {
+		GPU_LOG(MALI_EXYNOS_ERROR,
+			"%s: mismatch clock table index. idx_max_clk : %d, idx_min_clk : %d\n",
+			__func__, idx_max_clk, idx_min_clk);
+		return freqs;
+	}
+
+	for (i = idx_max_clk; i <= idx_min_clk; i++)
+		freqs[i - idx_max_clk] = (uint32_t)gpex_clock_get_clock(i);
+
+	return freqs;
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_freq_table);
+
+static uint32_t volts[DVFS_TABLE_ROW_MAX];
+uint32_t *exynos_stats_get_gpu_volt_table(void)
+{
+	int i;
+	int idx_max_clk, idx_min_clk;
+
+	idx_max_clk = gpex_clock_get_table_idx(gpex_clock_get_max_clock());
+	idx_min_clk = gpex_clock_get_table_idx(gpex_clock_get_min_clock());
+
+	if ((idx_max_clk < 0) || (idx_min_clk < 0)) {
+		GPU_LOG(MALI_EXYNOS_ERROR,
+			"%s: mismatch clock table index. idx_max_clk : %d, idx_min_clk : %d\n",
+			__func__, idx_max_clk, idx_min_clk);
+		return volts;
+	}
+
+	for (i = idx_max_clk; i <= idx_min_clk; i++)
+		volts[i - idx_max_clk] = (uint32_t)gpex_clock_get_voltage(gpex_clock_get_clock(i));
+
+	return volts;
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_volt_table);
+
+static ktime_t time_in_state[DVFS_TABLE_ROW_MAX];
+ktime_t *exynos_stats_get_gpu_time_in_state(void)
+{
+	int i;
+	int idx_max_clk, idx_min_clk;
+
+	idx_max_clk = gpex_clock_get_table_idx(gpex_clock_get_max_clock());
+	idx_min_clk = gpex_clock_get_table_idx(gpex_clock_get_min_clock());
+
+	if ((idx_max_clk < 0) || (idx_min_clk < 0)) {
+		GPU_LOG(MALI_EXYNOS_ERROR,
+			"%s: mismatch clock table index. idx_max_clk : %d, idx_min_clk : %d\n",
+			__func__, idx_max_clk, idx_min_clk);
+		return time_in_state;
+	}
+
+	for (i = idx_max_clk; i <= idx_min_clk; i++) {
+		time_in_state[i - idx_max_clk] =
+			ms_to_ktime((u64)(gpex_clock_get_time_busy(i) * 4) / 100);
+	}
+
+	return time_in_state;
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_time_in_state);
+
+int exynos_stats_get_gpu_max_lock(void)
+{
+	unsigned long flags;
+	int locked_clock = -1;
+
+	gpex_dvfs_spin_lock(&flags);
+	locked_clock = gpex_clock_get_max_lock();
+	if (locked_clock <= 0)
+		locked_clock = gpex_clock_get_max_clock();
+	gpex_dvfs_spin_unlock(&flags);
+
+	return locked_clock;
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_max_lock);
+
+int exynos_stats_get_gpu_min_lock(void)
+{
+	unsigned long flags;
+	int locked_clock = -1;
+
+	gpex_dvfs_spin_lock(&flags);
+	locked_clock = gpex_clock_get_min_lock();
+	if (locked_clock <= 0)
+		locked_clock = gpex_clock_get_min_clock();
+	gpex_dvfs_spin_unlock(&flags);
+
+	return locked_clock;
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_min_lock);
+
+int exynos_stats_set_queued_threshold_0(uint32_t threshold)
+{
+	gpex_tsg_set_queued_threshold(0, threshold);
+	return gpex_tsg_get_queued_threshold(0);
+}
+EXPORT_SYMBOL(exynos_stats_set_queued_threshold_0);
+
+int exynos_stats_set_queued_threshold_1(uint32_t threshold)
+{
+	gpex_tsg_set_queued_threshold(1, threshold);
+	return gpex_tsg_get_queued_threshold(1);
+}
+EXPORT_SYMBOL(exynos_stats_set_queued_threshold_1);
+
+ktime_t *exynos_stats_get_gpu_queued_job_time(void)
+{
+	int i;
+	for (i = 0; i < 2; i++) {
+		gpex_tsg_set_queued_time(i, gpex_tsg_get_queued_time_tick(i));
+	}
+	return gpex_tsg_get_queued_time_array();
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_queued_job_time);
+
+ktime_t exynos_stats_get_gpu_queued_last_updated(void)
+{
+	return gpex_tsg_get_queued_last_updated();
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_queued_last_updated);
+
+void exynos_stats_set_gpu_polling_speed(int polling_speed)
+{
+	gpex_dvfs_set_polling_speed(polling_speed);
+}
+EXPORT_SYMBOL(exynos_stats_set_gpu_polling_speed);
+
+int exynos_stats_get_gpu_polling_speed(void)
+{
+	return gpex_dvfs_get_polling_speed();
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_polling_speed);
+
+void exynos_migov_set_mode(int mode)
+{
+	gpex_tsg_set_migov_mode(mode);
+}
+EXPORT_SYMBOL(exynos_migov_set_mode);
+
+void exynos_migov_set_gpu_margin(int margin)
+{
+	gpex_tsg_set_freq_margin(margin);
+}
+EXPORT_SYMBOL(exynos_migov_set_gpu_margin);
+
+int register_frag_utils_change_notifier(struct notifier_block *nb)
 {
 	int ret = 0;
+	ret = atomic_notifier_chain_register(gpex_tsg_get_frag_utils_change_notifier_list(), nb);
+	return ret;
+}
+EXPORT_SYMBOL(register_frag_utils_change_notifier);
 
-	if ((rq1_entries < EHEA_MIN_ENTRIES_QP) ||
-	    (rq1_entries > EHEA_MAX_ENTRIES_RQ1)) {
-		pr_info("Bad parameter: rq1_entries\n");
-		ret = -EINVAL;
+int unregister_frag_utils_change_notifier(struct notifier_block *nb)
+{
+	int ret = 0;
+	ret = atomic_notifier_chain_unregister(gpex_tsg_get_frag_utils_change_notifier_list(), nb);
+	return ret;
+}
+EXPORT_SYMBOL(unregister_frag_utils_change_notifier);
+
+/* TODO: this sysfs function use external fucntion. */
+/* Actually, Using external function in internal module is not ideal with the Refactoring rules */
+/* So, if we can modify outer modules such as 'migov, cooling, ...' in the future, */
+/* fix it following the rules*/
+static ssize_t show_feedback_governor_impl(char *buf)
+{
+	ssize_t ret = 0;
+	int i;
+	uint32_t *freqs;
+	uint32_t *volts;
+	ktime_t *time_in_state;
+
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "feedback governer implementation\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int exynos_stats_get_gpu_table_size(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "     +- int gpu_dvfs_get_step(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %u\n",
+			exynos_stats_get_gpu_table_size());
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int exynos_stats_get_gpu_cur_idx(void)\n");
+
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "     +- int gpu_dvfs_get_cur_level(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- clock=%u\n",
+			gpex_clock_get_cur_clock());
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- level=%d\n",
+			exynos_stats_get_gpu_cur_idx());
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int exynos_stats_get_gpu_coeff(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			"     +- int gpu_dvfs_get_coefficient_value(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %u\n",
+			exynos_stats_get_gpu_coeff());
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int *exynos_stats_get_gpu_freq_table(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			"     +- unsigned int *gpu_dvfs_get_freqs(void)\n");
+	freqs = exynos_stats_get_gpu_freq_table();
+	for (i = 0; i < exynos_stats_get_gpu_table_size(); i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %u\n", freqs[i]);
 	}
-	if ((rq2_entries < EHEA_MIN_ENTRIES_QP) ||
-	    (rq2_entries > EHEA_MAX_ENTRIES_RQ2)) {
-		pr_info("Bad parameter: rq2_entries\n");
-		ret = -EINVAL;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int *exynos_stats_get_gpu_volt_table(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			"     +- unsigned int *gpu_dvfs_get_volts(void)\n");
+	volts = exynos_stats_get_gpu_volt_table();
+	for (i = 0; i < exynos_stats_get_gpu_table_size(); i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %u\n", volts[i]);
 	}
-	if ((rq3_entries < EHEA_MIN_ENTRIES_QP) ||
-	    (rq3_entries > EHEA_MAX_ENTRIES_RQ3)) {
-		pr_info("Bad parameter: rq3_entries\n");
-		ret = -EINVAL;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- ktime_t *exynos_stats_get_gpu_time_in_state(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			"     +- ktime_t *gpu_dvfs_get_time_in_state(void)\n");
+	time_in_state = exynos_stats_get_gpu_time_in_state();
+	for (i = 0; i < exynos_stats_get_gpu_table_size(); i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %lld\n", time_in_state[i]);
 	}
-	if ((sq_entries < EHEA_MIN_ENTRIES_QP) ||
-	    (sq_entries > EHEA_MAX_ENTRIES_SQ)) {
-		pr_info("Bad parameter: sq_entries\n");
-		ret = -EINVAL;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- ktime_t *exynos_stats_get_gpu_queued_job_time(void)\n");
+	time_in_state = exynos_stats_get_gpu_queued_job_time();
+	for (i = 0; i < 2; i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %lld\n", time_in_state[i]);
+	}
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, " +- queued_threshold_check\n");
+	for (i = 0; i < 2; i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %lld\n",
+				gpex_tsg_get_queued_threshold(i));
+	}
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- int exynos_stats_get_gpu_polling_speed(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %d\n",
+			exynos_stats_get_gpu_polling_speed());
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_feedback_governor_impl);
+
+int gpex_tsg_external_init(struct _tsg_info *_tsg_info)
+{
+	tsg_info = _tsg_info;
+	GPEX_UTILS_SYSFS_DEVICE_FILE_ADD_RO(feedback_governor_impl, show_feedback_governor_impl);
+	return 0;
+}
+
+int gpex_tsg_external_term(void)
+{
+	tsg_info = (void *)0;
+
+	return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /* SPDX-License-Identifier: GPL-2.0 */
+
+/*
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ */
+
+#include <linux/notifier.h>
+#include <linux/ktime.h>
+
+#include <gpex_tsg.h>
+#include <gpex_dvfs.h>
+#include <gpex_utils.h>
+#include <gpex_pm.h>
+#include <gpex_ifpo.h>
+#include <gpex_clock.h>
+#include <gpexbe_pm.h>
+#include <gpex_cmar_sched.h>
+
+#include <soc/samsung/exynos-migov.h>
+#include <soc/samsung/exynos-profiler.h>
+
+#include "gpex_tsg_internal.h"
+
+#define DVFS_TABLE_ROW_MAX 20
+
+static struct _tsg_info *tsg_info;
+
+unsigned long exynos_stats_get_job_state_cnt(void)
+{
+	return tsg_info->input_job_nr_acc;
+}
+EXPORT_SYMBOL(exynos_stats_get_job_state_cnt);
+
+int exynos_stats_get_gpu_cur_idx(void)
+{
+	int i;
+	int level = -1;
+	int clock = 0;
+	int idx_max_clk, idx_min_clk;
+
+	if (gpexbe_pm_get_exynos_pm_domain()) {
+		if (gpexbe_pm_get_status() == 1) {
+			clock = gpex_clock_get_cur_clock();
+		} else {
+			GPU_LOG(MALI_EXYNOS_ERROR, "%s: can't get dvfs cur clock\n", __func__);
+			clock = 0;
+		}
+	} else {
+		if (gpex_pm_get_status(true) == 1) {
+			if (gpex_ifpo_get_mode() && !gpex_ifpo_get_status()) {
+				GPU_LOG(MALI_EXYNOS_ERROR, "%s: can't get dvfs cur clock\n",
+					__func__);
+				clock = 0;
+			} else {
+				clock = gpex_clock_get_cur_clock();
+			}
+		}
+	}
+
+	idx_max_clk = gpex_clock_get_table_idx(gpex_clock_get_max_clock());
+	idx_min_clk = gpex_clock_get_table_idx(gpex_clock_get_min_clock());
+
+	if ((idx_max_clk < 0) || (idx_min_clk < 0)) {
+		GPU_LOG(MALI_EXYNOS_ERROR,
+			"%s: mismatch clock table index. max_clock_level : %d, min_clock_level : %d\n",
+			__func__, idx_max_clk, idx_min_clk);
+		return -1;
+	}
+
+	if (clock == 0)
+		return idx_min_clk - idx_max_clk;
+
+	for (i = idx_max_clk; i <= idx_min_clk; i++) {
+		if (gpex_clock_get_clock(i) == clock) {
+			level = i;
+			break;
+		}
+	}
+
+	return (level - idx_max_clk);
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_cur_idx);
+
+int exynos_stats_get_gpu_coeff(void)
+{
+	int coef = 6144;
+
+	return coef;
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_coeff);
+
+uint32_t exynos_stats_get_gpu_table_size(void)
+{
+	return (gpex_clock_get_table_idx(gpex_clock_get_min_clock()) -
+		gpex_clock_get_table_idx(gpex_clock_get_max_clock()) + 1);
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_table_size);
+
+static uint32_t freqs[DVFS_TABLE_ROW_MAX];
+uint32_t *gpu_dvfs_get_freq_table(void)
+{
+	int i;
+	int idx_max_clk, idx_min_clk;
+
+	idx_max_clk = gpex_clock_get_table_idx(gpex_clock_get_max_clock());
+	idx_min_clk = gpex_clock_get_table_idx(gpex_clock_get_min_clock());
+
+	if ((idx_max_clk < 0) || (idx_min_clk < 0)) {
+		GPU_LOG(MALI_EXYNOS_ERROR,
+			"%s: mismatch clock table index. idx_max_clk : %d, idx_min_clk : %d\n",
+			__func__, idx_max_clk, idx_min_clk);
+		return freqs;
+	}
+
+	for (i = idx_max_clk; i <= idx_min_clk; i++)
+		freqs[i - idx_max_clk] = (uint32_t)gpex_clock_get_clock(i);
+
+	return freqs;
+}
+EXPORT_SYMBOL(gpu_dvfs_get_freq_table);
+
+static uint32_t volts[DVFS_TABLE_ROW_MAX];
+uint32_t *exynos_stats_get_gpu_volt_table(void)
+{
+	int i;
+	int idx_max_clk, idx_min_clk;
+
+	idx_max_clk = gpex_clock_get_table_idx(gpex_clock_get_max_clock());
+	idx_min_clk = gpex_clock_get_table_idx(gpex_clock_get_min_clock());
+
+	if ((idx_max_clk < 0) || (idx_min_clk < 0)) {
+		GPU_LOG(MALI_EXYNOS_ERROR,
+			"%s: mismatch clock table index. idx_max_clk : %d, idx_min_clk : %d\n",
+			__func__, idx_max_clk, idx_min_clk);
+		return volts;
+	}
+
+	for (i = idx_max_clk; i <= idx_min_clk; i++)
+		volts[i - idx_max_clk] = (uint32_t)gpex_clock_get_voltage(gpex_clock_get_clock(i));
+
+	return volts;
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_volt_table);
+
+static ktime_t time_in_state[DVFS_TABLE_ROW_MAX];
+ktime_t tis_last_update;
+ktime_t *gpu_dvfs_get_time_in_state(void)
+{
+	int i;
+	int idx_max_clk, idx_min_clk;
+
+	idx_max_clk = gpex_clock_get_table_idx(gpex_clock_get_max_clock());
+	idx_min_clk = gpex_clock_get_table_idx(gpex_clock_get_min_clock());
+
+	if ((idx_max_clk < 0) || (idx_min_clk < 0)) {
+		GPU_LOG(MALI_EXYNOS_ERROR,
+			"%s: mismatch clock table index. idx_max_clk : %d, idx_min_clk : %d\n",
+			__func__, idx_max_clk, idx_min_clk);
+		return time_in_state;
+	}
+
+	for (i = idx_max_clk; i <= idx_min_clk; i++) {
+		time_in_state[i - idx_max_clk] =
+			ms_to_ktime((u64)(gpex_clock_get_time_busy(i) * 4) / 100);
+	}
+
+	return time_in_state;
+}
+EXPORT_SYMBOL(gpu_dvfs_get_time_in_state);
+
+ktime_t gpu_dvfs_get_tis_last_update(void)
+{
+	return (ktime_t)(gpex_clock_get_time_in_state_last_update());
+}
+EXPORT_SYMBOL(gpu_dvfs_get_tis_last_update);
+
+int exynos_stats_set_queued_threshold_0(uint32_t threshold)
+{
+	gpex_tsg_set_queued_threshold(0, threshold);
+	return gpex_tsg_get_queued_threshold(0);
+}
+EXPORT_SYMBOL(exynos_stats_set_queued_threshold_0);
+
+int exynos_stats_set_queued_threshold_1(uint32_t threshold)
+{
+	gpex_tsg_set_queued_threshold(1, threshold);
+
+	return gpex_tsg_get_queued_threshold(1);
+}
+EXPORT_SYMBOL(exynos_stats_set_queued_threshold_1);
+
+ktime_t *gpu_dvfs_get_job_queue_count(void)
+{
+	int i;
+	for (i = 0; i < 2; i++) {
+		gpex_tsg_set_queued_time(i, gpex_tsg_get_queued_time_tick(i));
+	}
+	return gpex_tsg_get_queued_time_array();
+}
+EXPORT_SYMBOL(gpu_dvfs_get_job_queue_count);
+
+ktime_t gpu_dvfs_get_job_queue_last_updated(void)
+{
+	return gpex_tsg_get_queued_last_updated();
+}
+EXPORT_SYMBOL(gpu_dvfs_get_job_queue_last_updated);
+
+void exynos_stats_set_gpu_polling_speed(int polling_speed)
+{
+	gpex_dvfs_set_polling_speed(polling_speed);
+}
+EXPORT_SYMBOL(exynos_stats_set_gpu_polling_speed);
+
+int exynos_stats_get_gpu_polling_speed(void)
+{
+	return gpex_dvfs_get_polling_speed();
+}
+EXPORT_SYMBOL(exynos_stats_get_gpu_polling_speed);
+
+void gpu_dvfs_set_amigo_governor(int mode)
+{
+	gpex_tsg_set_migov_mode(mode);
+
+	if (mode)
+		gpex_cmar_sched_set_forced_sched(1);
+	else
+		gpex_cmar_sched_set_forced_sched(0);
+}
+EXPORT_SYMBOL(gpu_dvfs_set_amigo_governor);
+
+void gpu_dvfs_set_freq_margin(int margin)
+{
+	gpex_tsg_set_freq_margin(margin);
+}
+EXPORT_SYMBOL(gpu_dvfs_set_freq_margin);
+
+void exynos_stats_get_run_times(u64 *times)
+{
+	gpex_tsg_stats_get_run_times(times);
+}
+EXPORT_SYMBOL(exynos_stats_get_run_times);
+
+void exynos_stats_get_pid_list(u16 *pidlist)
+{
+	gpex_tsg_stats_get_pid_list(pidlist);
+}
+EXPORT_SYMBOL(exynos_stats_get_pid_list);
+
+void exynos_stats_set_vsync(ktime_t ktime_us)
+{
+	gpex_tsg_stats_set_vsync(ktime_us);
+}
+EXPORT_SYMBOL(exynos_stats_set_vsync);
+
+void exynos_stats_get_frame_info(s32 *nrframe, u64 *nrvsync, u64 *delta_ms)
+{
+	gpex_tsg_stats_get_frame_info(nrframe, nrvsync, delta_ms);
+}
+EXPORT_SYMBOL(exynos_stats_get_frame_info);
+
+void exynos_migov_set_targetframetime(int us)
+{
+	gpex_tsg_migov_set_targetframetime(us);
+}
+EXPORT_SYMBOL(exynos_migov_set_targetframetime);
+
+void exynos_migov_set_targettime_margin(int us)
+{
+	gpex_tsg_migov_set_targettime_margin(us);
+}
+EXPORT_SYMBOL(exynos_migov_set_targettime_margin);
+
+void exynos_migov_set_util_margin(int percentage)
+{
+	gpex_tsg_migov_set_util_margin(percentage);
+}
+EXPORT_SYMBOL(exynos_migov_set_util_margin);
+
+void exynos_migov_set_decon_time(int us)
+{
+	gpex_tsg_migov_set_decon_time(us);
+}
+EXPORT_SYMBOL(exynos_migov_set_decon_time);
+
+void exynos_migov_set_comb_ctrl(int val)
+{
+	gpex_tsg_migov_set_comb_ctrl(val);
+}
+EXPORT_SYMBOL(exynos_migov_set_comb_ctrl);
+
+void exynos_sdp_set_powertable(int id, int cnt, struct freq_table *table)
+{
+	gpex_tsg_sdp_set_powertable(id, cnt, table);
+}
+EXPORT_SYMBOL(exynos_sdp_set_powertable);
+
+void exynos_sdp_set_busy_domain(int id)
+{
+	gpex_tsg_sdp_set_busy_domain(id);
+}
+EXPORT_SYMBOL(exynos_sdp_set_busy_domain);
+
+void exynos_sdp_set_cur_freqlv(int id, int idx)
+{
+	gpex_tsg_sdp_set_cur_freqlv(id, idx);
+}
+EXPORT_SYMBOL(exynos_sdp_set_cur_freqlv);
+
+int exynos_gpu_stc_config_show(int page_size, char *buf)
+{
+	return gpex_tsg_stc_config_show(page_size, buf);
+}
+EXPORT_SYMBOL(exynos_gpu_stc_config_show);
+
+int exynos_gpu_stc_config_store(const char *buf)
+{
+	return gpex_tsg_stc_config_store(buf);
+}
+EXPORT_SYMBOL(exynos_gpu_stc_config_store);
+
+int gpu_dvfs_register_utilization_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_register(gpex_tsg_get_frag_utils_change_notifier_list(), nb);
+}
+EXPORT_SYMBOL(gpu_dvfs_register_utilization_notifier);
+
+int gpu_dvfs_unregister_utilization_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_unregister(gpex_tsg_get_frag_utils_change_notifier_list(), nb);
+}
+EXPORT_SYMBOL(gpu_dvfs_unregister_utilization_notifier);
+
+/* TODO: this sysfs function use external fucntion. */
+/* Actually, Using external function in internal module is not ideal with the Refactoring rules */
+/* So, if we can modify outer modules such as 'migov, cooling, ...' in the future, */
+/* fix it following the rules*/
+static ssize_t show_feedback_governor_impl(char *buf)
+{
+	ssize_t ret = 0;
+	int i;
+	uint32_t *freqs;
+	uint32_t *volts;
+	ktime_t *time_in_state;
+
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "feedback governer implementation\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int exynos_stats_get_gpu_table_size(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "     +- int gpu_dvfs_get_step(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %u\n",
+			exynos_stats_get_gpu_table_size());
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int exynos_stats_get_gpu_cur_idx(void)\n");
+
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "     +- int gpu_dvfs_get_cur_level(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- clock=%u\n",
+			gpex_clock_get_cur_clock());
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- level=%d\n",
+			exynos_stats_get_gpu_cur_idx());
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int exynos_stats_get_gpu_coeff(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			"     +- int gpu_dvfs_get_coefficient_value(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %u\n",
+			exynos_stats_get_gpu_coeff());
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int *gpu_dvfs_get_freq_table(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			"     +- uint32_t *gpu_dvfs_get_freqs(void)\n");
+	freqs = gpu_dvfs_get_freq_table();
+	for (i = 0; i < exynos_stats_get_gpu_table_size(); i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %u\n", freqs[i]);
+	}
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- unsigned int *exynos_stats_get_gpu_volt_table(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			"     +- unsigned int *gpu_dvfs_get_volts(void)\n");
+	volts = exynos_stats_get_gpu_volt_table();
+	for (i = 0; i < exynos_stats_get_gpu_table_size(); i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %u\n", volts[i]);
+	}
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- ktime_t *gpu_dvfs_get_time_in_state(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			"     +- ktime_t *gpu_dvfs_get_time_in_state(void)\n");
+	time_in_state = gpu_dvfs_get_time_in_state();
+	for (i = 0; i < exynos_stats_get_gpu_table_size(); i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %lld\n", time_in_state[i]);
+	}
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- ktime_t *gpu_dvfs_get_job_queue_count(void)\n");
+	time_in_state = gpu_dvfs_get_job_queue_count();
+	for (i = 0; i < 2; i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %lld\n", time_in_state[i]);
+	}
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, " +- queued_threshold_check\n");
+	for (i = 0; i < 2; i++) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %lld\n",
+				gpex_tsg_get_queued_threshold(i));
+	}
+	ret += snprintf(buf + ret, PAGE_SIZE - ret,
+			" +- int exynos_stats_get_gpu_polling_speed(void)\n");
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "         +- %d\n",
+			exynos_stats_get_gpu_polling_speed());
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_feedback_governor_impl);
+
+int gpex_tsg_external_init(struct _tsg_info *_tsg_info)
+{
+	tsg_info = _tsg_info;
+	GPEX_UTILS_SYSFS_DEVICE_FILE_ADD_RO(feedback_governor_impl, show_feedback_governor_impl);
+	return 0;
+}
+
+int gpex_tsg_external_term(void)
+{
+	tsg_info = (void *)0;
+
+	return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /* SPDX-License-Identifier: GPL-2.0 */
+
+/*
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ */
+
+#ifndef _GPEX_TSG_INTERNAL_H_
+#define _GPEX_TSG_INTERNAL_H_
+#include <linux/ktime.h>
+
+struct _tsg_info {
+	struct kbase_device *kbdev;
+	struct {
+		int util_history[2][WINDOW];
+		int freq_history[WINDOW];
+		int average_util;
+		int average_freq;
+		int diff_util;
+		int diff_freq;
+		int weight_util[2];
+		int weight_freq;
+		int next_util;
+		int next_freq;
+		int pre_util;
+		int pre_freq;
+		bool en_signal;
+	} prediction;
+
+	struct {
+		/* job queued time, index represents queued_time each threshold */
+		uint32_t queued_threshold[2];
+		ktime_t queued_time_tick[2];
+		ktime_t queued_time[2];
+		ktime_t last_updated;
+		atomic_t nr[3]; /* Legacy: job_nr, in_nr, out_nr */
+	} queue;
+
+	uint64_t input_job_nr_acc;
+	int input_job_nr;
+
+	int freq_margin;
+	int migov_mode;
+	int weight_table_idx_0;
+	int weight_table_idx_1;
+	int migov_saved_polling_speed;
+	bool is_pm_qos_tsg;
+	int amigo_flags;
+
+	int governor_type_init;
+	int is_gov_set;
+
+	/* GPU Profiler */
+	int nr_q;
+	int lastshowidx;
+	ktime_t prev_swap_timestamp;
+	ktime_t first_job_timestamp;
+	ktime_t gpu_timestamps[3];
+	u32 js_occupy;
+	ktime_t lastjob_starttimestamp;
+	ktime_t sum_jobs_time;
+	ktime_t last_jobs_time;
+
+	int vsync_interval;
+	/* End for GPU Profiler */
+
+	raw_spinlock_t spinlock;
+	struct atomic_notifier_head frag_utils_change_notifier_list;
+};
+
+struct amigo_freq_estpower {
+	int freq;
+	int power;
+};
+
+int gpex_tsg_external_init(struct _tsg_info *_tsg_info);
+int gpex_tsg_sysfs_init(struct _tsg_info *_tsg_info);
+
+int gpex_tsg_external_term(void);
+int gpex_tsg_sysfs_term(void);
+
+void gpex_tsg_inc_rtp_vsync_swapcall_counter(void);
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      /* SPDX-License-Identifier: GPL-2.0 */
+
+/*
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ */
+
+#include <gpex_tsg.h>
+#include <gpex_utils.h>
+
+#include "gpex_tsg_internal.h"
+
+static struct _tsg_info *tsg_info;
+
+static ssize_t show_weight_table_idx_0(char *buf)
+{
+	ssize_t ret = 0;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_tsg_get_weight_table_idx(0));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
 	}
 
 	return ret;
 }
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_weight_table_idx_0);
 
-static ssize_t ehea_show_capabilities(struct device_driver *drv,
-				      char *buf)
+static ssize_t show_weight_table_idx_1(char *buf)
 {
-	return sprintf(buf, "%d", EHEA_CAPABILITIES);
+	ssize_t ret = 0;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_tsg_get_weight_table_idx(1));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
 }
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_weight_table_idx_1);
 
-static DRIVER_ATTR(capabilities, S_IRUSR | S_IRGRP | S_IROTH,
-		   ehea_show_capabilities, NULL);
-
-static int __init ehea_module_init(void)
+static ssize_t show_queued_threshold_0(char *buf)
 {
+	ssize_t ret = 0;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_tsg_get_queued_threshold(0));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_queued_threshold_0);
+
+static ssize_t show_queued_threshold_1(char *buf)
+{
+	ssize_t ret = 0;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_tsg_get_queued_threshold(1));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_queued_threshold_1);
+
+static ssize_t set_weight_table_idx_0(const char *buf, size_t count)
+{
+	int ret, table_idx_0;
+	ret = kstrtoint(buf, 0, &table_idx_0);
+
+	if (ret) {
+		GPU_LOG(MALI_EXYNOS_WARNING, "%s: invalid value\n", __func__);
+		return -ENOENT;
+	}
+
+	gpex_tsg_set_weight_table_idx(0, table_idx_0);
+
+	return count;
+}
+CREATE_SYSFS_DEVICE_WRITE_FUNCTION(set_weight_table_idx_0);
+
+static ssize_t set_weight_table_idx_1(const char *buf, size_t count)
+{
+	int ret, table_idx_1;
+	ret = kstrtoint(buf, 0, &table_idx_1);
+
+	if (ret) {
+		GPU_LOG(MALI_EXYNOS_WARNING, "%s: invalid value\n", __func__);
+		return -ENOENT;
+	}
+
+	gpex_tsg_set_weight_table_idx(1, table_idx_1);
+
+	return count;
+}
+CREATE_SYSFS_DEVICE_WRITE_FUNCTION(set_weight_table_idx_1);
+
+static ssize_t set_queued_threshold_0(const char *buf, size_t count)
+{
+	unsigned int threshold = 0;
 	int ret;
 
-	pr_info("IBM eHEA ethernet device driver (Release %s)\n", DRV_VERSION);
-
-	memset(&ehea_fw_handles, 0, sizeof(ehea_fw_handles));
-	memset(&ehea_bcmc_regs, 0, sizeof(ehea_bcmc_regs));
-
-	mutex_init(&ehea_fw_handles.lock);
-	spin_lock_init(&ehea_bcmc_regs.lock);
-
-	ret = check_module_parm();
-	if (ret)
-		goto out;
-
-	ret = ibmebus_register_driver(&ehea_driver);
+	ret = kstrtoint(buf, 0, &threshold);
 	if (ret) {
-		pr_err("failed registering eHEA device driver on ebus\n");
-		goto out;
+		GPU_LOG(MALI_EXYNOS_WARNING, "%s: invalid value\n", __func__);
+		return -ENOENT;
 	}
+	gpex_tsg_set_queued_threshold(0, threshold);
 
-	ret = driver_create_file(&ehea_driver.driver,
-				 &driver_attr_capabilities);
-	if (ret) {
-		pr_err("failed to register capabilities attribute, ret=%d\n",
-		       ret);
-		goto out2;
-	}
+	GPU_LOG(MALI_EXYNOS_ERROR, "%s: queued_threshold_0 = %d\n", __func__,
+		gpex_tsg_get_queued_threshold(0));
 
-	return ret;
-
-out2:
-	ibmebus_unregister_driver(&ehea_driver);
-out:
-	return ret;
+	return count;
 }
+CREATE_SYSFS_DEVICE_WRITE_FUNCTION(set_queued_threshold_0);
 
-static void __exit ehea_module_exit(void)
+static ssize_t set_queued_threshold_1(const char *buf, size_t count)
 {
-	driver_remove_file(&ehea_driver.driver, &driver_attr_capabilities);
-	ibmebus_unregister_driver(&ehea_driver);
-	ehea_unregister_memory_hooks();
-	kfree(ehea_fw_handles.arr);
-	kfree(ehea_bcmc_regs.arr);
-	ehea_destroy_busmap();
+	unsigned int threshold = 0;
+	int ret;
+
+	ret = kstrtoint(buf, 0, &threshold);
+	if (ret) {
+		GPU_LOG(MALI_EXYNOS_WARNING, "%s: invalid value\n", __func__);
+		return -ENOENT;
+	}
+
+	gpex_tsg_set_queued_threshold(1, threshold);
+
+	GPU_LOG(MALI_EXYNOS_ERROR, "%s: queued_threshold_1 = %d\n", __func__,
+		gpex_tsg_get_queued_threshold(1));
+
+	return count;
+}
+CREATE_SYSFS_DEVICE_WRITE_FUNCTION(set_queued_threshold_1);
+
+int gpex_tsg_sysfs_init(struct _tsg_info *_tsg_info)
+{
+	tsg_info = _tsg_info;
+
+	GPEX_UTILS_SYSFS_DEVICE_FILE_ADD(weight_table_idx_0, show_weight_table_idx_0,
+					 set_weight_table_idx_0);
+	GPEX_UTILS_SYSFS_DEVICE_FILE_ADD(weight_table_idx_1, show_weight_table_idx_1,
+					 set_weight_table_idx_1);
+	GPEX_UTILS_SYSFS_DEVICE_FILE_ADD(queued_threshold_0, show_queued_threshold_0,
+					 set_queued_threshold_0);
+	GPEX_UTILS_SYSFS_DEVICE_FILE_ADD(queued_threshold_1, show_queued_threshold_1,
+					 set_queued_threshold_1);
+
+	return 0;
 }
 
-module_init(ehea_module_init);
-module_exit(ehea_module_exit);
+int gpex_tsg_sysfs_term(void)
+{
+	tsg_info = (void *)0;
+
+	return 0;
+}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /* SPDX-License-Identifier: GPL-2.0 */
+
+/*
+ * (C) COPYRIGHT 2021 Samsung Electronics Inc. All rights reserved.
+ *
+ * This program is free software and is provided to you under the terms of the
+ * GNU General Public License version 2 as published by the Free Software
+ * Foundation, and any use by you of this program is subject to the terms
+ * of such GNU licence.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, you can access it online at
+ * http://www.gnu.org/licenses/gpl-2.0.html.
+ */
+
+#include <gpex_tsg.h>
+#include <gpex_utils.h>
+
+#include "gpex_tsg_internal.h"
+
+static struct _tsg_info *tsg_info;
+
+static ssize_t show_weight_table_idx_0(char *buf)
+{
+	ssize_t ret = 0;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_tsg_get_weight_table_idx(0));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_weight_table_idx_0);
+
+static ssize_t show_weight_table_idx_1(char *buf)
+{
+	ssize_t ret = 0;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_tsg_get_weight_table_idx(1));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_weight_table_idx_1);
+
+static ssize_t show_queued_threshold_0(char *buf)
+{
+	ssize_t ret = 0;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_tsg_get_queued_threshold(0));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_queued_threshold_0);
+
+static ssize_t show_queued_threshold_1(char *buf)
+{
+	ssize_t ret = 0;
+	ret += snprintf(buf + ret, PAGE_SIZE - ret, "%d", gpex_tsg_get_queued_threshold(1));
+
+	if (ret < PAGE_SIZE - 1) {
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "\n");
+	} else {
+		buf[PAGE_SIZE - 2] = '\n';
+		buf[PAGE_SIZE - 1] = '\0';
+		ret = PAGE_SIZE - 1;
+	}
+
+	return ret;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_queued_threshold_1);
+
+static ssize_t show_egp_profile(char *buf)
+{
+	struct amigo_interframe_data *dst;
+	ssize_t count = 0;
+	int id = 0;
+	int target_frametime = gpex_tsg_amigo_get_target_frametime();
+
+	while ((dst = gpex_tsg_amigo_get_next_frameinfo()) != NULL) {
+		if (dst->nrq > 0) {
+			ktime_t avg_pre = dst->sum_pre / dst->nrq;
+			ktime_t avg_cpu = dst->sum_cpu / dst->nrq;
+			ktime_t avg_v2s = dst->sum_v2s / dst->nrq;
+			ktime_t avg_gpu = dst->sum_gpu / dst->nrq;
+			ktime_t avg_v2f = dst->sum_v2f / dst->nrq;
+
+			count += scnprintf(buf + count, PAGE_SIZE - count,
+				"%4d, %6llu, %3u, %6lu,%6lu, %6lu,%6lu, %6lu,%6lu, %6lu,%6lu, %6lu,%6lu, %6lu,%6lu, %6d, %d, %7d,%7d, %7d,%7d\n",
+				id++, dst->vsync_interval, dst->nrq,
+				avg_pre, dst->max_pre,
+				avg_cpu, dst->max_cpu,
+				avg_v2s, dst->max_v2s,
+				avg_gpu, dst->max_gpu,
+				avg_v2f, dst->max_v2f,
+				dst->cputime, dst->gputime,
+				target_frametime, dst->sdp_next_cpuid,
+				dst->sdp_cur_fcpu, dst->sdp_cur_fgpu,
+				dst->sdp_next_fcpu, dst->sdp_next_fgpu);
+		}
+	}
+
+	return count;
+}
+CREATE_SYSFS_DEVICE_READ_FUNCTION(show_egp_profile);
+
+static ssize_t set_weight_table_idx_0(const char *buf, size_t count)
+{
+	int ret, table_idx_0;
+	ret = kstrtoint(buf, 0, &table_idx_0);
+
+	if (ret) {
+		GPU_LOG(MALI_EXYNOS_WARNING, "%s: invalid value\n", __func__);
+		return -ENOENT;
+	}
+
+	gpex_tsg_set_weight_table_idx(0, table_idx_0);
+
+	return count;
+}
+CREATE_SYSFS_DEVICE_WRITE_FUNCTION(set_weight_table_idx_0);
+
+static ssize_t set_weight_table_idx_1(const char *buf, size_t count)
+{
+	int ret, table_idx_1;
+	ret = kstrtoint(buf, 0, &table_idx_1);
+
+	if (ret) {
+		GPU_LOG(MALI_EXYNOS_WARNING, "%s: invalid value\n", __func__);
+		return -ENOENT;
+	}
+
+	gpex_tsg_set_weight_table_idx(1, table_idx_1);
+
+	return count;
+}
+CREATE_SYSFS_DEVICE_WRITE_FUNCTION(set_weight_table_idx_1);
+
+static ssize_t set_queued_threshold_0(const char *buf, size_t count)
+{
+	unsigned int threshold = 0;
+	int ret;
+
+	ret = kstrtoint(buf, 0, &threshold);
+	if (ret) {
+		GPU_LOG(MALI_EXYNOS_WARNING, "%s: invalid value\n", __func__);
+		return -ENOENT;
+	}
+	gpex_tsg_set_queued_threshold(0, threshold);
+
+	GPU_LOG(MALI_EXYNOS_ERROR, "%s: queued_threshold_0 = %d\n", __func__,
+		gpex_tsg_get_queued_threshold(0));
+
+	return count;
+}
+CREATE_SYSFS_DEVICE_WRITE_FUNCTION(set_queued_threshold_0);
+
+static ssize_t set_queued_threshold_1(const char *buf, siz

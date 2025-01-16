@@ -1,4078 +1,2877 @@
-/******************************************************************************
- *
- * Copyright(c) 2015 - 2017 Realtek Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of version 2 of the GNU General Public License as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
- * more details.
- *
- *****************************************************************************/
-#ifdef CONFIG_MCC_MODE
-#define _HAL_MCC_C_
-
-#include <drv_types.h> /* PADAPTER */
-#include <rtw_mcc.h> /* mcc structure */
-#include <hal_data.h> /* HAL_DATA */
-#include <rtw_pwrctrl.h> /* power control */
-
-/*  use for AP/GO + STA/GC case */
-#define MCC_DURATION_IDX 0 /* druration for station side */
-#define MCC_TSF_SYNC_OFFSET_IDX 1
-#define MCC_START_TIME_OFFSET_IDX 2
-#define MCC_INTERVAL_IDX 3
-#define MCC_GUARD_OFFSET0_IDX 4
-#define MCC_GUARD_OFFSET1_IDX 5
-#define MCC_STOP_THRESHOLD 6
-#define TU 1024 /* 1 TU equals 1024 microseconds */
-/* druration, TSF sync offset, start time offset, interval (unit:TU (1024 microseconds))*/
-u8 mcc_switch_channel_policy_table[][7]={
-	{20, 50, 40, 100, 0, 0, 30},
-	{80, 50, 10, 100, 0, 0, 30},
-	{36, 50, 32, 100, 0, 0, 30},
-	{30, 50, 35, 100, 0, 0, 30},
-};
-
-const int mcc_max_policy_num = sizeof(mcc_switch_channel_policy_table) /sizeof(u8) /7;
-
-static void dump_iqk_val_table(PADAPTER padapter)
-{
-	HAL_DATA_TYPE *pHalData = GET_HAL_DATA(padapter);
-	struct hal_spec_t *hal_spec = GET_HAL_SPEC(padapter);
-	struct hal_iqk_reg_backup *iqk_reg_backup = pHalData->iqk_reg_backup;
-	u8 total_rf_path = hal_spec->rf_reg_path_num;
-	u8 rf_path_idx = 0;
-	u8 backup_chan_idx = 0;
-	u8 backup_reg_idx = 0;
-
-#ifdef CONFIG_MCC_MODE_V2
-#else
-
-	RTW_INFO("=============dump IQK backup table================\n");
-	for (backup_chan_idx = 0; backup_chan_idx < MAX_IQK_INFO_BACKUP_CHNL_NUM; backup_chan_idx++) {
-		for (rf_path_idx = 0; rf_path_idx < total_rf_path; rf_path_idx++) {
-			for(backup_reg_idx = 0; backup_reg_idx < MAX_IQK_INFO_BACKUP_REG_NUM; backup_reg_idx++) {
-				RTW_INFO("ch:%d. bw:%d. rf path:%d. reg[%d] = 0x%02x \n"
-						, iqk_reg_backup[backup_chan_idx].central_chnl
-						, iqk_reg_backup[backup_chan_idx].bw_mode
-						, rf_path_idx
-						, backup_reg_idx
-						, iqk_reg_backup[backup_chan_idx].reg_backup[rf_path_idx][backup_reg_idx]
-						);
-			}
-		}
-	}	
-	RTW_INFO("=============================================\n");
-
-#endif
-}
-
-static void rtw_hal_mcc_build_p2p_noa_attr(PADAPTER padapter, u8 *ie, u32 *ie_len)
-{
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-	u8 p2p_noa_attr_ie[MAX_P2P_IE_LEN] = {0x00};
-	u32 p2p_noa_attr_len = 0;
-	u8 noa_desc_num = 1;
-	u8 opp_ps = 0; /* Disable OppPS */
-	u8 noa_count = 255;
-	u32 noa_duration;
-	u32 noa_interval;
-	u8 noa_index = 0;
-	u8 mcc_policy_idx = 0;
-
-	mcc_policy_idx = pmccobjpriv->policy_index;
-	noa_duration = mcc_switch_channel_policy_table[mcc_policy_idx][MCC_DURATION_IDX] * TU;
-	noa_interval = mcc_switch_channel_policy_table[mcc_policy_idx][MCC_INTERVAL_IDX] * TU;
-
-	/* P2P OUI(4 bytes) */
-	_rtw_memcpy(p2p_noa_attr_ie, P2P_OUI, 4);
-	p2p_noa_attr_len = p2p_noa_attr_len + 4;
-
-	/* attrute ID(1 byte) */
-	p2p_noa_attr_ie[p2p_noa_attr_len] = P2P_ATTR_NOA;
-	p2p_noa_attr_len = p2p_noa_attr_len + 1;
-	
-	/* attrute length(2 bytes) length = noa_desc_num*13 + 2 */
-	RTW_PUT_LE16(p2p_noa_attr_ie + p2p_noa_attr_len, (noa_desc_num * 13 + 2));
-	p2p_noa_attr_len = p2p_noa_attr_len + 2;
-
-	/* Index (1 byte) */
-	p2p_noa_attr_ie[p2p_noa_attr_len] = noa_index;
-	p2p_noa_attr_len = p2p_noa_attr_len + 1;
-
-	/* CTWindow and OppPS Parameters (1 byte) */
-	p2p_noa_attr_ie[p2p_noa_attr_len] = opp_ps;
-	p2p_noa_attr_len = p2p_noa_attr_len+ 1;
-
-	/* NoA Count (1 byte) */
-	p2p_noa_attr_ie[p2p_noa_attr_len] = noa_count;
-	p2p_noa_attr_len = p2p_noa_attr_len + 1;
-
-	/* NoA Duration (4 bytes) unit: microseconds */
-	RTW_PUT_LE32(p2p_noa_attr_ie + p2p_noa_attr_len, noa_duration);
-	p2p_noa_attr_len = p2p_noa_attr_len + 4;
-
-	/* NoA Interval (4 bytes) unit: microseconds */
-	RTW_PUT_LE32(p2p_noa_attr_ie + p2p_noa_attr_len, noa_interval);
-	p2p_noa_attr_len = p2p_noa_attr_len + 4;
-
-	/* NoA Start Time (4 bytes) unit: microseconds */
-	RTW_PUT_LE32(p2p_noa_attr_ie + p2p_noa_attr_len, pmccadapriv->noa_start_time);
-	if (0)
-		RTW_INFO("indxe:%d, start_time=0x%02x:0x%02x:0x%02x:0x%02x\n"
-		, noa_index
-		, p2p_noa_attr_ie[p2p_noa_attr_len]
-		, p2p_noa_attr_ie[p2p_noa_attr_len + 1]
-		, p2p_noa_attr_ie[p2p_noa_attr_len + 2]
-		, p2p_noa_attr_ie[p2p_noa_attr_len + 3]);
-
-	p2p_noa_attr_len = p2p_noa_attr_len + 4;
-	rtw_set_ie(ie, _VENDOR_SPECIFIC_IE_, p2p_noa_attr_len, (u8 *)p2p_noa_attr_ie, ie_len);
-}
-
-
-/**
- * rtw_hal_mcc_update_go_p2p_ie - update go p2p ie(add NoA attribute)
- * @padapter: the adapter to be update go p2p ie
- */
-static void rtw_hal_mcc_update_go_p2p_ie(PADAPTER padapter)
-{
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-	struct mcc_obj_priv *mccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-	u8 *pos = NULL;
-
-
-	/* no noa attribute, build it */
-	if (pmccadapriv->p2p_go_noa_ie_len == 0)
-		rtw_hal_mcc_build_p2p_noa_attr(padapter, pmccadapriv->p2p_go_noa_ie, &pmccadapriv->p2p_go_noa_ie_len);
-	else {
-		/* has noa attribut, modify it */
-		u32 noa_duration = 0;
-		
-		/* update index */
-		pos = pmccadapriv->p2p_go_noa_ie + pmccadapriv->p2p_go_noa_ie_len - 15;
-		/* 0~255 */
-		(*pos) = ((*pos) + 1) % 256;
-		if (0)
-			RTW_INFO("indxe:%d\n", (*pos));
-
-
-		/* update duration */
-		noa_duration = mcc_switch_channel_policy_table[mccobjpriv->policy_index][MCC_DURATION_IDX] * TU;
-		pos = pmccadapriv->p2p_go_noa_ie + pmccadapriv->p2p_go_noa_ie_len - 12;
-		RTW_PUT_LE32(pos, noa_duration);
-
-		/* update start time */
-		pos = pmccadapriv->p2p_go_noa_ie + pmccadapriv->p2p_go_noa_ie_len - 4;
-		RTW_PUT_LE32(pos, pmccadapriv->noa_start_time);
-		if (0)
-			RTW_INFO("start_time=0x%02x:0x%02x:0x%02x:0x%02x\n"
-			, ((u8*)(pos))[0]
-			, ((u8*)(pos))[1]
-			, ((u8*)(pos))[2]
-			, ((u8*)(pos))[3]);
-
-	}
-
-	if (0) {
-		RTW_INFO("p2p_go_noa_ie_len:%d\n", pmccadapriv->p2p_go_noa_ie_len);
-		RTW_INFO_DUMP("\n", pmccadapriv->p2p_go_noa_ie, pmccadapriv->p2p_go_noa_ie_len);
-	}
-	update_beacon(padapter, _VENDOR_SPECIFIC_IE_, P2P_OUI, _TRUE, 0);
-}
-
-/**
- * rtw_hal_mcc_remove_go_p2p_ie - remove go p2p ie(add NoA attribute)
- * @padapter: the adapter to be update go p2p ie
- */
-static void rtw_hal_mcc_remove_go_p2p_ie(PADAPTER padapter)
-{
-	struct mlme_priv *pmlmepriv = &(padapter->mlmepriv);
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-
-	/* chech has noa ie or not */
-	if (pmccadapriv->p2p_go_noa_ie_len == 0)
-		return;
-
-	pmccadapriv->p2p_go_noa_ie_len = 0;
-	update_beacon(padapter, _VENDOR_SPECIFIC_IE_, P2P_OUI, _TRUE, 0);
-}
-
-/* restore IQK value for all interface */
-void rtw_hal_mcc_restore_iqk_val(PADAPTER padapter)
-{
-	u8 take_care_iqk = _FALSE;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	_adapter *iface = NULL;
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	u8 i = 0;
-
-	rtw_hal_get_hwreg(padapter, HW_VAR_CH_SW_NEED_TO_TAKE_CARE_IQK_INFO, &take_care_iqk);
-	if (take_care_iqk == _TRUE && MCC_EN(padapter)) {
-		for (i = 0; i < dvobj->iface_nums; i++) {
-			iface = dvobj->padapters[i];
-			if (iface == NULL)
-				continue;
-
-			mccadapriv = &iface->mcc_adapterpriv;
-			if (mccadapriv->role == MCC_ROLE_MAX)
-				continue;
-
-			rtw_hal_ch_sw_iqk_info_restore(iface, CH_SW_USE_CASE_MCC);
-		}
-	}
-
-	if (0)
-		dump_iqk_val_table(padapter);
-}
-
-u8 rtw_hal_check_mcc_status(PADAPTER padapter, u8 mcc_status)
-{
-	struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-
-	if (pmccobjpriv->mcc_status & (mcc_status))
-		return _TRUE;
-	else
-		return _FALSE;
-}
-
-void rtw_hal_set_mcc_status(PADAPTER padapter, u8 mcc_status)
-{
-	struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-
-	pmccobjpriv->mcc_status |= (mcc_status);
-}
-
-void rtw_hal_clear_mcc_status(PADAPTER padapter, u8 mcc_status)
-{
-	struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-
-	pmccobjpriv->mcc_status &= (~mcc_status);
-}
-
-static void rtw_hal_mcc_update_policy_table(PADAPTER adapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(adapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	u8 mcc_duration = mccobjpriv->duration;
-	s8 mcc_policy_idx = mccobjpriv->policy_index;
-	u8 interval = mcc_switch_channel_policy_table[mcc_policy_idx][MCC_INTERVAL_IDX];
-	u8 new_mcc_duration_time = 0;
-	u8 new_starttime_offset = 0;
-
-	/* convert % to ms */
-	new_mcc_duration_time = mcc_duration * interval / 100;
-
-	/* start time offset = (interval - duration time)/2 */
-	new_starttime_offset = (interval - new_mcc_duration_time) >> 1;
-
-	/* update modified parameters */
-	mcc_switch_channel_policy_table[mcc_policy_idx][MCC_DURATION_IDX]
-		= new_mcc_duration_time;
-
-	mcc_switch_channel_policy_table[mcc_policy_idx][MCC_START_TIME_OFFSET_IDX]
-		= new_starttime_offset;
-	
-
-}
-
-static void rtw_hal_config_mcc_switch_channel_setting(PADAPTER padapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	struct registry_priv *registry_par = &padapter->registrypriv;
-	u8 mcc_duration = 0;
-	s8 mcc_policy_idx = 0;
-
-	mcc_policy_idx = registry_par->rtw_mcc_policy_table_idx;
-	mcc_duration = mccobjpriv->duration;
-
-	if (mcc_policy_idx < 0 || mcc_policy_idx >= mcc_max_policy_num) {
-		mccobjpriv->policy_index = 0;
-		RTW_INFO("[MCC] can't find table(%d), use default policy(%d)\n",
-			mcc_policy_idx, mccobjpriv->policy_index);
-	} else
-		mccobjpriv->policy_index = mcc_policy_idx;
-
-	/* convert % to time */
-	if (mcc_duration != 0)
-		rtw_hal_mcc_update_policy_table(padapter);
-
-	RTW_INFO("[MCC] policy(%d): %d,%d,%d,%d,%d,%d\n"
-		, mccobjpriv->policy_index
-		, mcc_switch_channel_policy_table[mccobjpriv->policy_index][MCC_DURATION_IDX]
-		, mcc_switch_channel_policy_table[mccobjpriv->policy_index][MCC_TSF_SYNC_OFFSET_IDX]
-		, mcc_switch_channel_policy_table[mccobjpriv->policy_index][MCC_START_TIME_OFFSET_IDX]
-		, mcc_switch_channel_policy_table[mccobjpriv->policy_index][MCC_INTERVAL_IDX]
-		, mcc_switch_channel_policy_table[mccobjpriv->policy_index][MCC_GUARD_OFFSET0_IDX]
-		, mcc_switch_channel_policy_table[mccobjpriv->policy_index][MCC_GUARD_OFFSET1_IDX]);
-
-}
-
-static void rtw_hal_mcc_assign_tx_threshold(PADAPTER padapter) 
-{
-	struct registry_priv *preg = &padapter->registrypriv;
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-	struct mlme_ext_priv *pmlmeext = &padapter->mlmeextpriv;
-
-	switch (pmccadapriv->role) {
-	case MCC_ROLE_STA:
-	case MCC_ROLE_GC:
-		switch (pmlmeext->cur_bwmode) {
-		case CHANNEL_WIDTH_20:
-			/*
-			* target tx byte(bytes) = target tx tp(Mbits/sec) * 1024 * 1024 / 8 * (duration(ms) / 1024)
-			*					= target tx tp(Mbits/sec) * 128 * duration(ms)
-			* note:
-			* target tx tp(Mbits/sec) * 1024 * 1024 / 8 ==> Mbits to bytes
-			* duration(ms) / 1024 ==> msec to sec
-			*/
-			pmccadapriv->mcc_target_tx_bytes_to_port = preg->rtw_mcc_sta_bw20_target_tx_tp * 128 * pmccadapriv->mcc_duration;
-			break;
-		case CHANNEL_WIDTH_40:
-			pmccadapriv->mcc_target_tx_bytes_to_port = preg->rtw_mcc_sta_bw40_target_tx_tp * 128 * pmccadapriv->mcc_duration;
-			break;
-		case CHANNEL_WIDTH_80:
-			pmccadapriv->mcc_target_tx_bytes_to_port = preg->rtw_mcc_sta_bw80_target_tx_tp * 128 * pmccadapriv->mcc_duration;
-			break;
-		case CHANNEL_WIDTH_160:
-		case CHANNEL_WIDTH_80_80:
-			RTW_INFO(FUNC_ADPT_FMT": not support bwmode = %d\n"
-				, FUNC_ADPT_ARG(padapter), pmlmeext->cur_bwmode);
-			break;
-		}
-		break;
-	case MCC_ROLE_AP:
-	case MCC_ROLE_GO:
-		switch (pmlmeext->cur_bwmode) {
-		case CHANNEL_WIDTH_20:
-			pmccadapriv->mcc_target_tx_bytes_to_port = preg->rtw_mcc_ap_bw20_target_tx_tp * 128 * pmccadapriv->mcc_duration;
-			break;
-		case CHANNEL_WIDTH_40:
-			pmccadapriv->mcc_target_tx_bytes_to_port = preg->rtw_mcc_ap_bw40_target_tx_tp * 128 * pmccadapriv->mcc_duration;
-			break;
-		case CHANNEL_WIDTH_80:
-			pmccadapriv->mcc_target_tx_bytes_to_port = preg->rtw_mcc_ap_bw80_target_tx_tp * 128 * pmccadapriv->mcc_duration;
-			break;
-		case CHANNEL_WIDTH_160:
-		case CHANNEL_WIDTH_80_80:
-			RTW_INFO(FUNC_ADPT_FMT": not support bwmode = %d\n"
-				, FUNC_ADPT_ARG(padapter), pmlmeext->cur_bwmode);
-			break;
-		}
-		break;
-	default:
-		RTW_INFO(FUNC_ADPT_FMT": unknown role = %d\n"
-			, FUNC_ADPT_ARG(padapter), pmccadapriv->role);
-		break;
-	}
-}
-
-#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-static void mcc_cfg_phdym_rf_ch (_adapter *adapter)
-{
-		struct mcc_adapter_priv *mccadapriv = &adapter->mcc_adapterpriv;
-		struct mlme_ext_priv *mlmeext = &adapter->mlmeextpriv;
-		HAL_DATA_TYPE *hal = GET_HAL_DATA(adapter);
-		struct dm_struct *dm = &hal->odmpriv;
-		struct _phydm_mcc_dm_ *mcc_dm = &dm->mcc_dm;
-		u8 order = 0;
-
-		set_channel_bwmode(adapter, mlmeext->cur_channel, mlmeext->cur_ch_offset, mlmeext->cur_bwmode);
-		order = mccadapriv->order;
-		mcc_dm->mcc_rf_ch[order] = phy_query_rf_reg(adapter, RF_PATH_A, 0x18, 0x03ff);
-}
-
-static void mcc_cfg_phdym_update_macid (_adapter *adapter, u8 add, u8 mac_id)
-{
-		struct mcc_adapter_priv *mccadapriv = &adapter->mcc_adapterpriv;
-		struct mlme_ext_priv *mlmeext = &adapter->mlmeextpriv;
-		HAL_DATA_TYPE *hal = GET_HAL_DATA(adapter);
-		struct dm_struct *dm = &hal->odmpriv;
-		struct _phydm_mcc_dm_ *mcc_dm = &dm->mcc_dm;
-		u8 order = 0, i = 0;
-
-		order = mccadapriv->order;
-		if (add) {
-			for (i = 0; i < NUM_STA; i++) {
-				if (mcc_dm->sta_macid[order][i] == 0xff) {
-					mcc_dm->sta_macid[order][i] = mac_id;
-					break;
-				}
-			}
-		} else {
-			for (i = 0; i < NUM_STA; i++) {
-				if (mcc_dm->sta_macid[order][i] == mac_id) {
-					mcc_dm->sta_macid[order][i] = 0xff;
-					break;
-				}
-			}
-		}
-
-		
-}
-
-static void mcc_cfg_phdym_start(_adapter *adapter, u8 start)
-{
-	struct dvobj_priv *dvobj;
-	struct mcc_obj_priv *mccobjpriv;
-	HAL_DATA_TYPE *hal;
-	struct dm_struct *dm;
-	struct _phydm_mcc_dm_ *mcc_dm;
-	u8 rfk_forbidden = _TRUE;
-	u8 i = 0, j = 0;
-
-	dvobj = adapter_to_dvobj(adapter);
-	mccobjpriv = adapter_to_mccobjpriv(adapter);
-	hal = GET_HAL_DATA(adapter);
-	dm = &hal->odmpriv;
-	mcc_dm = &dm->mcc_dm;
-
-	if (start) {
-		#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-		mcc_dm->mcc_status = mccobjpriv->mcc_phydm_offload;
-		#endif
-
-		rfk_forbidden = _TRUE;
-		halrf_cmn_info_set(dm, HALRF_CMNINFO_RFK_FORBIDDEN, rfk_forbidden);
-	} else {
-		rfk_forbidden = _FALSE;
-		halrf_cmn_info_set(dm, HALRF_CMNINFO_RFK_FORBIDDEN, rfk_forbidden);
-
-		#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-		for(i = 0; i < MAX_MCC_NUM; i ++) {
-			for(j = 0; j < NUM_STA; j ++) {
-				if (mcc_dm->sta_macid[i][j] != 0xff)
-					/* clear all used value for mcc stop */
-					/* do nothing for mcc start due to phydm will init to 0xff */
-					mcc_dm->sta_macid[i][j] = 0xff;
-			}
-			mcc_dm->mcc_rf_ch[i] = 0xff;
-		}
-		mcc_dm->mcc_status = 0;
-		#endif
-	}
-}
-
-static void mcc_cfg_phdym_dump(_adapter *adapter, void *sel)
-{
-	HAL_DATA_TYPE *hal;
-	struct dm_struct *dm;
-	struct _phydm_mcc_dm_ *mcc_dm;
-	u8 rfk_forbidden = _TRUE;
-	u8 i = 0, j = 0;
-
-
-	hal = GET_HAL_DATA(adapter);
-	dm = &hal->odmpriv;
-	mcc_dm = &dm->mcc_dm;
-
-	rfk_forbidden = halrf_cmn_info_get(dm, HALRF_CMNINFO_RFK_FORBIDDEN);
-	RTW_PRINT_SEL(sel, "dump mcc dm info\n");
-	RTW_PRINT_SEL(sel, "mcc_status=%d\n", mcc_dm->mcc_status);
-	RTW_PRINT_SEL(sel, "rfk_forbidden=%d\n", rfk_forbidden);
-	for(i = 0; i < MAX_MCC_NUM; i ++) {
-
-		if (mcc_dm->mcc_rf_ch[i] != 0xff)
-			RTW_PRINT_SEL(sel, "mcc_dm->mcc_rf_ch[%d] = 0x%02x\n", i, mcc_dm->mcc_rf_ch[i]);
-		
-		for(j = 0; j < NUM_STA; j ++) {
-			if (mcc_dm->sta_macid[i][j] != 0xff)
-				RTW_PRINT_SEL(sel, "mcc_dm->sta_macid[%d][%d] = %d\n", i, j, mcc_dm->sta_macid[i][j]);
-		}
-	}
-}
-
-static void mcc_cfg_phdym_offload(_adapter *adapter, u8 enable)
-{
-	struct mcc_obj_priv *mccobjpriv = adapter_to_mccobjpriv(adapter);
-	_adapter *iface = NULL;
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	HAL_DATA_TYPE *hal = NULL;
-	struct dm_struct *dm = NULL;
-	struct _phydm_mcc_dm_ *mcc_dm = NULL;
-	struct sta_priv *stapriv = NULL;
-	struct sta_info *sta = NULL;
-	struct wlan_network *cur_network = NULL;
-	_irqL irqL;
-	_list	*head = NULL, *list = NULL;
-	u8 i = 0;
-
-
-	hal = GET_HAL_DATA(adapter);
-	dm = &hal->odmpriv;
-	mcc_dm = &dm->mcc_dm;
-
-	/* due to phydm will rst related date, driver must set related data */
-	if (enable) {
-		for (i = 0; i < MAX_MCC_NUM; i++) {
-			iface = mccobjpriv->iface[i];
-			if (!iface)
-				continue;
-			stapriv = &iface->stapriv;
-			mccadapriv = &iface->mcc_adapterpriv;
-			switch (mccadapriv->role) {
-			case MCC_ROLE_STA:
-			case MCC_ROLE_GC:
-				cur_network = &iface->mlmepriv.cur_network;
-				sta = rtw_get_stainfo(stapriv, cur_network->network.MacAddress);
-				if (sta)
-					mcc_cfg_phdym_update_macid(iface, _TRUE, sta->cmn.mac_id);
-				break;
-			case MCC_ROLE_AP:
-			case MCC_ROLE_GO:
-				_enter_critical_bh(&stapriv->asoc_list_lock, &irqL);
-
-				head = &stapriv->asoc_list;
-				list = get_next(head);
-		
-				while ((rtw_end_of_queue_search(head, list)) == _FALSE) {
-					sta = LIST_CONTAINOR(list, struct sta_info, asoc_list);
-					list = get_next(list);
-					mcc_cfg_phdym_update_macid(iface, _TRUE, sta->cmn.mac_id);
-				}
-
-				_exit_critical_bh(&stapriv->asoc_list_lock, &irqL);
-				break;
-			default:
-				RTW_INFO("Unknown role\n");
-				rtw_warn_on(1);
-				break;
-			}
-			
-		}
-	}
-
-	mcc_dm->mcc_status = enable;
-}
-
-static void rtw_hal_mcc_cfg_phydm (_adapter *adapter, enum mcc_cfg_phydm_ops ops, void *data)
-{
-	switch (ops) {
-	case MCC_CFG_PHYDM_OFFLOAD:
-		mcc_cfg_phdym_offload(adapter, *(u8 *)data);
-		break;
-	case MCC_CFG_PHYDM_RF_CH:
-		mcc_cfg_phdym_rf_ch(adapter);
-		break;
-	case MCC_CFG_PHYDM_ADD_CLIENT:
-		mcc_cfg_phdym_update_macid(adapter, _TRUE, *(u8 *)data);
-		break;
-	case MCC_CFG_PHYDM_REMOVE_CLIENT:
-		mcc_cfg_phdym_update_macid(adapter, _FALSE, *(u8 *)data);
-		break;
-	case MCC_CFG_PHYDM_START:
-		mcc_cfg_phdym_start(adapter, _TRUE);
-		break;
-	case MCC_CFG_PHYDM_STOP:
-		mcc_cfg_phdym_start(adapter, _FALSE);
-		break;
-	case MCC_CFG_PHYDM_DUMP:
-		mcc_cfg_phdym_dump(adapter, data);
-		break;
-	case MCC_CFG_PHYDM_MAX:
-	default:
-		RTW_ERR("[MCC] rtw_hal_mcc_cfg_phydm ops error (%d)\n", ops);
-		break;
-
-	}
-}
-#endif
-
-static void rtw_hal_config_mcc_role_setting(PADAPTER padapter, u8 order)
-{
-	struct dvobj_priv	*pdvobjpriv = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(pdvobjpriv->mcc_objpriv);
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-	struct mlme_priv *pmlmepriv = &(padapter->mlmepriv);
-	struct wlan_network *cur_network = &(pmlmepriv->cur_network);
-	struct sta_priv *pstapriv = &padapter->stapriv;
-	struct sta_info *psta = NULL;
-	struct registry_priv *preg = &padapter->registrypriv;
-	_irqL irqL;
-	_list	*phead =NULL, *plist = NULL;
-	u8 policy_index = 0;
-	u8 mcc_duration = 0;
-	u8 mcc_interval = 0;
-	u8 starting_ap_num = DEV_AP_STARTING_NUM(pdvobjpriv);
-	u8 ap_num = DEV_AP_NUM(pdvobjpriv);
-
-	policy_index = pmccobjpriv->policy_index;
-	mcc_duration = mcc_switch_channel_policy_table[pmccobjpriv->policy_index][MCC_DURATION_IDX]
-		- mcc_switch_channel_policy_table[pmccobjpriv->policy_index][MCC_GUARD_OFFSET0_IDX]
-			- mcc_switch_channel_policy_table[pmccobjpriv->policy_index][MCC_GUARD_OFFSET1_IDX];
-	mcc_interval = mcc_switch_channel_policy_table[pmccobjpriv->policy_index][MCC_INTERVAL_IDX];
-
-	if (starting_ap_num == 0 && ap_num == 0) {
-		pmccadapriv->order = order;
-
-		if (pmccadapriv->order == 0) {
-			/* setting is smiliar to GO/AP */
-			/* pmccadapriv->mcc_duration = mcc_interval - mcc_duration;*/
-			pmccadapriv->mgmt_queue_macid = MCC_ROLE_SOFTAP_GO_MGMT_QUEUE_MACID;
-		} else if (pmccadapriv->order == 1) {
-			/* pmccadapriv->mcc_duration = mcc_duration; */
-			pmccadapriv->mgmt_queue_macid = MCC_ROLE_STA_GC_MGMT_QUEUE_MACID;
-		} else {
-			RTW_INFO("[MCC] not support >= 3 interface\n");
-			rtw_warn_on(1);
-		}
-
-		rtw_hal_mcc_assign_tx_threshold(padapter);
-
-		psta = rtw_get_stainfo(pstapriv, cur_network->network.MacAddress);
-		if (psta) {
-			/* combine AP/GO macid and mgmt queue macid to bitmap */
-			pmccadapriv->mcc_macid_bitmap = BIT(psta->cmn.mac_id) | BIT(pmccadapriv->mgmt_queue_macid);
-			#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-			rtw_hal_mcc_cfg_phydm(padapter, MCC_CFG_PHYDM_ADD_CLIENT, &psta->cmn.mac_id);
-			#endif
-		} else {
-			RTW_INFO(FUNC_ADPT_FMT":AP/GO station info is NULL\n", FUNC_ADPT_ARG(padapter));
-			rtw_warn_on(1);
-		}
-	} else {
-		/* GO/AP is 1nd order  GC/STA is 2nd order */
-		switch (pmccadapriv->role) {
-		case MCC_ROLE_STA:
-		case MCC_ROLE_GC:
-			pmccadapriv->order = 1;
-			pmccadapriv->mcc_duration = mcc_duration;
-
-			rtw_hal_mcc_assign_tx_threshold(padapter);
-			/* assign used mac to avoid affecting RA */
-			pmccadapriv->mgmt_queue_macid = MCC_ROLE_STA_GC_MGMT_QUEUE_MACID;
-
-			psta = rtw_get_stainfo(pstapriv, cur_network->network.MacAddress);
-			if (psta) {
-				/* combine AP/GO macid and mgmt queue macid to bitmap */
-				pmccadapriv->mcc_macid_bitmap = BIT(psta->cmn.mac_id) | BIT(pmccadapriv->mgmt_queue_macid);
-				#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-				rtw_hal_mcc_cfg_phydm(padapter, MCC_CFG_PHYDM_ADD_CLIENT, &psta->cmn.mac_id);
-				#endif
-			} else {
-				RTW_INFO(FUNC_ADPT_FMT":AP/GO station info is NULL\n", FUNC_ADPT_ARG(padapter));
-				rtw_warn_on(1);
-			}
-			break;
-		case MCC_ROLE_AP:
-		case MCC_ROLE_GO:
-			pmccadapriv->order = 0;
-			/* total druation value equals interval */
-			pmccadapriv->mcc_duration = mcc_interval - mcc_duration;
-			pmccadapriv->p2p_go_noa_ie_len = 0; /* not NoA attribute at init time */
-
-			rtw_hal_mcc_assign_tx_threshold(padapter);
-
-			_enter_critical_bh(&pstapriv->asoc_list_lock, &irqL);
-
-			phead = &pstapriv->asoc_list;
-			plist = get_next(phead);
-			pmccadapriv->mcc_macid_bitmap = 0;
-	
-			while ((rtw_end_of_queue_search(phead, plist)) == _FALSE) {
-				psta = LIST_CONTAINOR(plist, struct sta_info, asoc_list);
-				plist = get_next(plist);
-				pmccadapriv->mcc_macid_bitmap |= BIT(psta->cmn.mac_id);
-				#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-				rtw_hal_mcc_cfg_phydm(padapter, MCC_CFG_PHYDM_ADD_CLIENT, &psta->cmn.mac_id);
-				#endif
-			}
-
-			_exit_critical_bh(&pstapriv->asoc_list_lock, &irqL);
-
-			psta = rtw_get_bcmc_stainfo(padapter);
-
-			if (psta != NULL)
-				pmccadapriv->mgmt_queue_macid = psta->cmn.mac_id;
-			else {
-				pmccadapriv->mgmt_queue_macid = MCC_ROLE_SOFTAP_GO_MGMT_QUEUE_MACID;
-				RTW_INFO(FUNC_ADPT_FMT":bcmc station is NULL, use macid %d\n"
-					, FUNC_ADPT_ARG(padapter), pmccadapriv->mgmt_queue_macid);
-			}
-
-			/* combine client macid and mgmt queue macid to bitmap */
-			pmccadapriv->mcc_macid_bitmap |= BIT(pmccadapriv->mgmt_queue_macid);
-			break;
-		default:
-			RTW_INFO("Unknown role\n");
-			rtw_warn_on(1);
-			break;
-		}
-
-	}
-
-	/* setting Null data parameters */
-	if (pmccadapriv->role == MCC_ROLE_STA) {
-			pmccadapriv->null_early = 3;
-			pmccadapriv->null_rty_num= 5;
-	} else if (pmccadapriv->role == MCC_ROLE_GC) {
-			pmccadapriv->null_early = 2;
-			pmccadapriv->null_rty_num= 5;
-	} else {
-			pmccadapriv->null_early = 0;
-			pmccadapriv->null_rty_num= 0;
-	}
-
-	RTW_INFO("********* "FUNC_ADPT_FMT" *********\n", FUNC_ADPT_ARG(padapter));
-	RTW_INFO("order:%d\n", pmccadapriv->order);
-	RTW_INFO("role:%d\n", pmccadapriv->role);
-	RTW_INFO("mcc duration:%d\n", pmccadapriv->mcc_duration);
-	RTW_INFO("null_early:%d\n", pmccadapriv->null_early);
-	RTW_INFO("null_rty_num:%d\n", pmccadapriv->null_rty_num);
-	RTW_INFO("mgmt queue macid:%d\n", pmccadapriv->mgmt_queue_macid);
-	RTW_INFO("bitmap:0x%02x\n", pmccadapriv->mcc_macid_bitmap);
-	RTW_INFO("target tx bytes:%d\n", pmccadapriv->mcc_target_tx_bytes_to_port);
-	RTW_INFO("**********************************\n");
-
-	pmccobjpriv->iface[pmccadapriv->order] = padapter;
-	#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-	rtw_hal_mcc_cfg_phydm(padapter, MCC_CFG_PHYDM_RF_CH, NULL);
-	#endif
-
-}
-
-static void rtw_hal_mcc_rqt_tsf(PADAPTER padapter, u64 *out_tsf)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	PADAPTER order0_iface = NULL;
-	PADAPTER order1_iface = NULL;
-	struct submit_ctx *tsf_req_sctx = NULL;
-	enum _hw_port tsfx = MAX_HW_PORT;
-	enum _hw_port tsfy = MAX_HW_PORT;
-	u8 cmd[H2C_MCC_RQT_TSF_LEN] = {0};
-
-	_enter_critical_mutex(&mccobjpriv->mcc_tsf_req_mutex, NULL);
-
-	order0_iface = mccobjpriv->iface[0];
-	order1_iface = mccobjpriv->iface[1];
-
-	tsf_req_sctx = &mccobjpriv->mcc_tsf_req_sctx;
-	rtw_sctx_init(tsf_req_sctx, MCC_EXPIRE_TIME);
-	mccobjpriv->mcc_tsf_req_sctx_order = 0;
-	tsfx = rtw_hal_get_port(order0_iface);
-	tsfy = rtw_hal_get_port(order1_iface);
-
-	SET_H2CCMD_MCC_RQT_TSFX(cmd, tsfx);
-	SET_H2CCMD_MCC_RQT_TSFY(cmd, tsfy);
-
-	rtw_hal_fill_h2c_cmd(padapter, H2C_MCC_RQT_TSF, H2C_MCC_RQT_TSF_LEN, cmd);
-
-	if (!rtw_sctx_wait(tsf_req_sctx, __func__))
-		RTW_INFO(FUNC_ADPT_FMT": wait for mcc tsf req C2H time out\n", FUNC_ADPT_ARG(padapter));
-
-	if (tsf_req_sctx->status  == RTW_SCTX_DONE_SUCCESS && out_tsf != NULL) {
-		out_tsf[0] = order0_iface->mcc_adapterpriv.tsf;
-		out_tsf[1] = order1_iface->mcc_adapterpriv.tsf;
-	}
-
-
-	_exit_critical_mutex(&mccobjpriv->mcc_tsf_req_mutex, NULL);
-}
-
-static u8 rtw_hal_mcc_check_start_time_is_valid(PADAPTER padapter, u8 case_num,
-	u32 tsfdiff, s8 *upper_bound_0, s8 *lower_bound_0, s8 *upper_bound_1, s8 *lower_bound_1)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	u8 duration_0 = 0, duration_1 = 0;
-	s8 final_upper_bound = 0, final_lower_bound = 0;
-	u8 intersection =  _FALSE;
-	u8 min_start_time = 5;
-	u8 max_start_time = 95;
-	
-	duration_0 = mccobjpriv->iface[0]->mcc_adapterpriv.mcc_duration;
-	duration_1 = mccobjpriv->iface[1]->mcc_adapterpriv.mcc_duration;
-
-	switch(case_num) {
-	case 1:
-		*upper_bound_0 = tsfdiff;
-		*lower_bound_0 = tsfdiff - duration_1;
-		*upper_bound_1 = 150 - duration_1;
-		*lower_bound_1= 0;
-		break;
-	case 2:
-		*upper_bound_0 = tsfdiff + 100;
-		*lower_bound_0 = tsfdiff + 100 - duration_1;
-		*upper_bound_1 = 150 - duration_1;
-		*lower_bound_1= 0;
-		break;
-	case 3:
-		*upper_bound_0 = tsfdiff + 50;
-		*lower_bound_0 = tsfdiff + 50 - duration_1;
-		*upper_bound_1 = 150 - duration_1;
-		*lower_bound_1= 0;
-		break;
-	case 4:
-		*upper_bound_0 = tsfdiff;
-		*lower_bound_0 = tsfdiff - duration_1;
-		*upper_bound_1 = 150 - duration_1;
-		*lower_bound_1= 0;
-		break;
-	case 5:
-		*upper_bound_0 = 200 - tsfdiff;
-		*lower_bound_0 = 200 - tsfdiff - duration_1;
-		*upper_bound_1 = 150 - duration_1;
-		*lower_bound_1= 0;
-		break;
-	case 6:
-		*upper_bound_0 = tsfdiff - 50;
-		*lower_bound_0 = tsfdiff - 50 - duration_1;
-		*upper_bound_1 = 150 - duration_1;
-		*lower_bound_1= 0;
-		break;
-	default:
-		RTW_ERR("[MCC] %s: error case number(%d\n)", __func__, case_num);
-	}
-
-
-	/* check Intersection or not */
-	if ((*lower_bound_1 >= *upper_bound_0) ||
-		(*lower_bound_0 >= *upper_bound_1))
-		intersection = _FALSE;
-	else
-		intersection = _TRUE;
-
-	if (intersection) {
-		if (*upper_bound_0 > *upper_bound_1)
-			final_upper_bound = *upper_bound_1;
-		else
-			final_upper_bound = *upper_bound_0;
-
-		if (*lower_bound_0 > *lower_bound_1)
-			final_lower_bound = *lower_bound_0;
-		else
-			final_lower_bound = *lower_bound_1;
-
-		mccobjpriv->start_time = (final_lower_bound + final_upper_bound) / 2;
-
-		/* check start time less than 5ms, request by Pablo@SD1 */
-		if (mccobjpriv->start_time <= min_start_time) {
-			mccobjpriv->start_time = 6;
-			if (mccobjpriv->start_time < final_lower_bound && mccobjpriv->start_time > final_upper_bound) {
-				intersection = _FALSE;
-				goto exit;
-			}
-		}
-
-		/* check start time less than 95ms */
-		if (mccobjpriv->start_time >= max_start_time) {
-			mccobjpriv->start_time = 90;
-			if (mccobjpriv->start_time < final_lower_bound && mccobjpriv->start_time > final_upper_bound) {
-				intersection = _FALSE;
-				goto exit;
-			}
-		}
-	}
-
-exit:
-	return intersection;
-}
-
-static void rtw_hal_mcc_decide_duration(PADAPTER padapter)
-{
-	struct registry_priv *registry_par = &padapter->registrypriv;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	struct mcc_adapter_priv *mccadapriv = NULL, *mccadapriv_order0 = NULL, *mccadapriv_order1 = NULL;
-	_adapter *iface = NULL, *iface_order0 = NULL,  *iface_order1 = NULL;
-	u8 duration = 0, i = 0, duration_time;
-	u8 mcc_interval = 150;
-
-	iface_order0 = mccobjpriv->iface[0];
-	iface_order1 = mccobjpriv->iface[1];
-	mccadapriv_order0 = &iface_order0->mcc_adapterpriv;
-	mccadapriv_order1 = &iface_order1->mcc_adapterpriv;
-	
-	if (mccobjpriv->duration == 0) {
-		/* default */
-		duration = 30;/*(%)*/
-		RTW_INFO("%s: mccobjpriv->duration=0, use default value(%d)\n",
-			__FUNCTION__, duration);
-	} else {
-		duration = mccobjpriv->duration;/*(%)*/
-		RTW_INFO("%s: mccobjpriv->duration=%d\n",
-			__FUNCTION__, duration);
-	}
-
-	mccobjpriv->interval = mcc_interval;
-	mccobjpriv->mcc_stop_threshold = 2000 * 4 / 300 - 6;
-	/* convert % to ms, for primary adapter */
-	duration_time = mccobjpriv->interval * duration / 100;
-
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-
-		if (!iface)
-			continue;
-
-		mccadapriv = &iface->mcc_adapterpriv;
-		if (mccadapriv->role == MCC_ROLE_MAX)
-			continue;
-
-		if (is_primary_adapter(iface))
-			mccadapriv->mcc_duration = duration_time;
-		else
-			mccadapriv->mcc_duration = mccobjpriv->interval - duration_time;
-	}
-
-	RTW_INFO("[MCC]"  FUNC_ADPT_FMT " order 0 duration=%d\n", FUNC_ADPT_ARG(iface_order0), mccadapriv_order0->mcc_duration);
-	RTW_INFO("[MCC]"  FUNC_ADPT_FMT " order 1 duration=%d\n", FUNC_ADPT_ARG(iface_order1), mccadapriv_order1->mcc_duration);
-}
-
-static u8 rtw_hal_mcc_update_timing_parameters(PADAPTER padapter, u8 force_update)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	u8 need_update = _FALSE;
-	u8 starting_ap_num = DEV_AP_STARTING_NUM(dvobj);
-	u8 ap_num = DEV_AP_NUM(dvobj);
-
-
-	/* for STA+STA, modify policy table */
-	if (starting_ap_num == 0 && ap_num == 0) {
-		struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-		struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-		struct mcc_adapter_priv *pmccadapriv = NULL;
-		_adapter *iface = NULL;
-		u64 tsf[MAX_MCC_NUM] = {0};
-		u64 tsf0 = 0, tsf1 = 0;
-		u32 beaconperiod_0 = 0, beaconperiod_1 = 0, tsfdiff = 0;
-		s8 upper_bound_0 = 0, lower_bound_0 = 0;
-		s8 upper_bound_1 = 0, lower_bound_1 = 0;
-		u8 valid = _FALSE;
-		u8 case_num = 1;
-		u8 i = 0;
-		
-		/* query TSF */
-		rtw_hal_mcc_rqt_tsf(padapter, tsf);
-
-		/* selecet policy table according TSF diff */
-		tsf0 = tsf[0];
-		beaconperiod_0 = pmccobjpriv->iface[0]->mlmepriv.cur_network.network.Configuration.BeaconPeriod;
-		tsf0 = rtw_modular64(tsf0, (beaconperiod_0 * TU));
-
-		tsf1 = tsf[1];
-		beaconperiod_1 = pmccobjpriv->iface[1]->mlmepriv.cur_network.network.Configuration.BeaconPeriod;
-		tsf1 = rtw_modular64(tsf1, (beaconperiod_1 * TU));
-
-		if (tsf0 > tsf1)
-			tsfdiff = tsf0- tsf1;
-		else
-			tsfdiff = (tsf0 +  beaconperiod_0 * TU) - tsf1;
-
-		/* convert to ms */
-		tsfdiff = (tsfdiff / TU);
-
-		/* force update*/
-		if (force_update) {
-			RTW_INFO("orig TSF0:%lld, orig TSF1:%lld\n",
-				pmccobjpriv->iface[0]->mcc_adapterpriv.tsf, pmccobjpriv->iface[1]->mcc_adapterpriv.tsf);
-			RTW_INFO("tsf0:%lld, tsf1:%lld\n", tsf0, tsf1);
-			RTW_INFO("%s: force=%d, last_tsfdiff=%d, tsfdiff=%d, THRESHOLD=%d\n",
-				__func__, force_update, pmccobjpriv->last_tsfdiff, tsfdiff, MCC_UPDATE_PARAMETER_THRESHOLD);
-			pmccobjpriv->last_tsfdiff = tsfdiff;
-			need_update = _TRUE;
-		} else {
-			if (pmccobjpriv->last_tsfdiff > tsfdiff) {
-				/* last tsfdiff - current tsfdiff > THRESHOLD, update parameters */
-				if (pmccobjpriv->last_tsfdiff > (tsfdiff + MCC_UPDATE_PARAMETER_THRESHOLD)) {
-					RTW_INFO("orig TSF0:%lld, orig TSF1:%lld\n",
-						pmccobjpriv->iface[0]->mcc_adapterpriv.tsf, pmccobjpriv->iface[1]->mcc_adapterpriv.tsf);
-					RTW_INFO("tsf0:%lld, tsf1:%lld\n", tsf0, tsf1);
-					RTW_INFO("%s: force=%d, last_tsfdiff=%d, tsfdiff=%d, THRESHOLD=%d\n",
-						__func__, force_update, pmccobjpriv->last_tsfdiff, tsfdiff, MCC_UPDATE_PARAMETER_THRESHOLD);
-
-					pmccobjpriv->last_tsfdiff = tsfdiff;
-					need_update = _TRUE;
-				} else {
-					need_update = _FALSE;
-				}
-			} else if (tsfdiff > pmccobjpriv->last_tsfdiff){
-				/* current tsfdiff - last tsfdiff > THRESHOLD, update parameters */
-				if (tsfdiff > (pmccobjpriv->last_tsfdiff + MCC_UPDATE_PARAMETER_THRESHOLD)) {
-					RTW_INFO("orig TSF0:%lld, orig TSF1:%lld\n",
-						pmccobjpriv->iface[0]->mcc_adapterpriv.tsf, pmccobjpriv->iface[1]->mcc_adapterpriv.tsf);
-					RTW_INFO("tsf0:%lld, tsf1:%lld\n", tsf0, tsf1);
-					RTW_INFO("%s: force=%d, last_tsfdiff=%d, tsfdiff=%d, THRESHOLD=%d\n",
-						__func__, force_update, pmccobjpriv->last_tsfdiff, tsfdiff, MCC_UPDATE_PARAMETER_THRESHOLD);
-
-					pmccobjpriv->last_tsfdiff = tsfdiff;
-					need_update = _TRUE;
-				} else {
-					need_update = _FALSE;
-				}
-			} else {
-				need_update = _FALSE;
-			}
-		}
-
-		if (need_update == _FALSE)
-			goto exit;
-
-		rtw_hal_mcc_decide_duration(padapter);
-
-		if (tsfdiff <= 50) {
-	
-			/* RX TBTT 0 */
-			case_num = 1;
-			valid = rtw_hal_mcc_check_start_time_is_valid(padapter, case_num, tsfdiff,
-				&upper_bound_0, &lower_bound_0, &upper_bound_1, &lower_bound_1);
-
-			if (valid)
-				goto valid_result;
-	
-			/* RX TBTT 1 */
-			case_num = 2;
-			valid = rtw_hal_mcc_check_start_time_is_valid(padapter, case_num, tsfdiff,
-				&upper_bound_0, &lower_bound_0, &upper_bound_1, &lower_bound_1);
-
-			if (valid)
-				goto valid_result;
-			
-			/* RX TBTT 2 */
-			case_num = 3;
-			valid = rtw_hal_mcc_check_start_time_is_valid(padapter, case_num, tsfdiff,
-				&upper_bound_0, &lower_bound_0, &upper_bound_1, &lower_bound_1);
-
-			if (valid)
-				goto valid_result;
-
-			if (valid == _FALSE) {
-				RTW_INFO("[MCC] do not find fit start time\n");
-				RTW_INFO("[MCC] tsfdiff:%d, duration:%d(%c), interval:%d\n",
-					tsfdiff, pmccobjpriv->duration, 37, pmccobjpriv->interval);
-
-			}
-
-		} else {
-
-			/* RX TBTT 0 */
-			case_num = 4;
-			valid = rtw_hal_mcc_check_start_time_is_valid(padapter, case_num, tsfdiff,
-				&upper_bound_0, &lower_bound_0, &upper_bound_1, &lower_bound_1);
-
-			if (valid)
-				goto valid_result;
-			
-			
-			/* RX TBTT 1 */
-			case_num = 5;
-			valid = rtw_hal_mcc_check_start_time_is_valid(padapter, case_num, tsfdiff,
-				&upper_bound_0, &lower_bound_0, &upper_bound_1, &lower_bound_1);
-
-			if (valid)
-				goto valid_result;
-
-			
-			/* RX TBTT 2 */
-			case_num = 6;
-			valid = rtw_hal_mcc_check_start_time_is_valid(padapter, case_num, tsfdiff,
-				&upper_bound_0, &lower_bound_0, &upper_bound_1, &lower_bound_1);
-
-			if (valid)
-				goto valid_result;
-
-			if (valid == _FALSE) {
-				RTW_INFO("[MCC] do not find fit start time\n");
-				RTW_INFO("[MCC] tsfdiff:%d, duration:%d(%c), interval:%d\n",
-					tsfdiff, pmccobjpriv->duration, 37, pmccobjpriv->interval);
-			}
-		}
-
-		
-
-	valid_result:
-		RTW_INFO("********************\n");
-		RTW_INFO("%s: case_num:%d, start time:%d\n",
-				__func__, case_num, pmccobjpriv->start_time);
-		RTW_INFO("%s: upper_bound_0:%d, lower_bound_0:%d\n",
-				__func__, upper_bound_0, lower_bound_0);
-		RTW_INFO("%s: upper_bound_1:%d, lower_bound_1:%d\n",
-				__func__, upper_bound_1, lower_bound_1);
-		
-		for (i = 0; i < dvobj->iface_nums; i++) {
-			iface = dvobj->padapters[i];
-			if (iface == NULL)
-				continue;
-
-			pmccadapriv = &iface->mcc_adapterpriv;
-			pmccadapriv = &iface->mcc_adapterpriv;
-			if (pmccadapriv->role == MCC_ROLE_MAX)
-				continue;
-#if 0
-			if (pmccadapriv->order == 0) {
-				pmccadapriv->mcc_duration = mcc_duration;
-			} else if (pmccadapriv->order == 1) {
-				pmccadapriv->mcc_duration = mcc_interval - mcc_duration;
-			} else {
-				RTW_INFO("[MCC] not support >= 3 interface\n");
-				rtw_warn_on(1);
-			}
-#endif
-			RTW_INFO("********************\n");
-			RTW_INFO(FUNC_ADPT_FMT": order:%d, role:%d\n",
-				FUNC_ADPT_ARG(iface), pmccadapriv->order, pmccadapriv->role);
-			RTW_INFO(FUNC_ADPT_FMT": mcc duration:%d, target tx bytes:%d\n",
-				FUNC_ADPT_ARG(iface), pmccadapriv->mcc_duration, pmccadapriv->mcc_target_tx_bytes_to_port);
-			RTW_INFO(FUNC_ADPT_FMT": mgmt queue macid:%d, bitmap:0x%02x\n",
-				FUNC_ADPT_ARG(iface), pmccadapriv->mgmt_queue_macid, pmccadapriv->mcc_macid_bitmap);
-			RTW_INFO("********************\n");
-		}
-		
-	}
-exit:
-	return need_update;
-}
-
-static u8 rtw_hal_decide_mcc_role(PADAPTER padapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	_adapter *iface = NULL;
-	struct mcc_adapter_priv *pmccadapriv = NULL;
-	struct wifidirect_info *pwdinfo = NULL;
-	struct mlme_priv *pmlmepriv = NULL;
-	u8 ret = _SUCCESS, i = 0;
-	u8 order = 1;
-
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-		if (iface == NULL)
-			continue;
-
-		pmccadapriv = &iface->mcc_adapterpriv;
-		pwdinfo = &iface->wdinfo;
-
-		if (MLME_IS_GO(iface))
-			pmccadapriv->role = MCC_ROLE_GO;
-		else if (MLME_IS_AP(iface))
-			pmccadapriv->role = MCC_ROLE_AP;
-		else if (MLME_IS_GC(iface))
-			pmccadapriv->role = MCC_ROLE_GC;
-		else if (MLME_IS_STA(iface)) {
-			if (MLME_IS_LINKING(iface) || MLME_IS_ASOC(iface))
-				pmccadapriv->role = MCC_ROLE_STA;
-			else {
-				/* bypass non-linked/non-linking interface */
-				RTW_INFO(FUNC_ADPT_FMT" mlme state:0x%2x\n",
-					FUNC_ADPT_ARG(iface), MLME_STATE(iface));
-				continue;
-			}
-		} else {
-			/* bypass non-linked/non-linking interface */
-			RTW_INFO(FUNC_ADPT_FMT" P2P Role:%d, mlme state:0x%2x\n",
-				FUNC_ADPT_ARG(iface), pwdinfo->role, MLME_STATE(iface));
-			continue;
-		}
-
-		if (padapter == iface) {
-			/* current adapter is order 0 */
-			rtw_hal_config_mcc_role_setting(iface, 0);
-		} else {
-			rtw_hal_config_mcc_role_setting(iface, order);
-			order ++;
-		}
-	}
-
-	rtw_hal_mcc_update_timing_parameters(padapter, _TRUE);
-
-	return ret;
-}
-
-static void rtw_hal_construct_CTS(PADAPTER padapter, u8 *pframe, u32 *pLength)
-{
-	u8 broadcast_addr[ETH_ALEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-
-	/* frame type, length = 1*/
-	set_frame_sub_type(pframe, WIFI_RTS);
-
-	/* frame control flag, length = 1 */
-	*(pframe + 1) = 0;
-
-	/* frame duration, length = 2 */
-	*(pframe + 2) = 0x00;
-	*(pframe + 3) = 0x78;
-
-	/* frame recvaddr, length = 6 */
-	_rtw_memcpy((pframe + 4), broadcast_addr, ETH_ALEN);
-	_rtw_memcpy((pframe + 4 + ETH_ALEN), adapter_mac_addr(padapter), ETH_ALEN);
-	_rtw_memcpy((pframe + 4 + ETH_ALEN*2), adapter_mac_addr(padapter), ETH_ALEN);
-	*pLength = 22;
-}
-
-/* avoid wrong information for power limit */
-void rtw_hal_mcc_upadate_chnl_bw(_adapter *padapter, u8 ch, u8 ch_offset, u8 bw, u8 print)
-{
-
-	u8 center_ch, chnl_offset80 = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
-	struct mlme_ext_priv *pmlmeext = &padapter->mlmeextpriv;
-	PHAL_DATA_TYPE	hal = GET_HAL_DATA(padapter);
-	u8 cch_160, cch_80, cch_40, cch_20;
-
-	center_ch = rtw_get_center_ch(ch, bw, ch_offset);
-
-	if (bw == CHANNEL_WIDTH_80) {
-		if (center_ch > ch)
-			chnl_offset80 = HAL_PRIME_CHNL_OFFSET_LOWER;
-		else if (center_ch < ch)
-			chnl_offset80 = HAL_PRIME_CHNL_OFFSET_UPPER;
-		else
-			chnl_offset80 = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
-	}
-
-	/* set Channel */
-	/* saved channel/bw info */
-	rtw_set_oper_ch(padapter, ch);
-	rtw_set_oper_bw(padapter, bw);
-	rtw_set_oper_choffset(padapter, ch_offset);
-
-	cch_80 = bw == CHANNEL_WIDTH_80 ? center_ch : 0;
-	cch_40 = bw == CHANNEL_WIDTH_40 ? center_ch : 0;
-	cch_20 = bw == CHANNEL_WIDTH_20 ? center_ch : 0;
-
-	if (cch_80 != 0)
-		cch_40 = rtw_get_scch_by_cch_offset(cch_80, CHANNEL_WIDTH_80, chnl_offset80);
-	if (cch_40 != 0)
-		cch_20 = rtw_get_scch_by_cch_offset(cch_40, CHANNEL_WIDTH_40, ch_offset);
-
-
-	hal->cch_80 = cch_80;
-	hal->cch_40 = cch_40;
-	hal->cch_20 = cch_20;
-	hal->current_channel = center_ch;
-	hal->CurrentCenterFrequencyIndex1 = center_ch;
-	hal->current_channel_bw = bw;
-	hal->nCur40MhzPrimeSC = ch_offset;
-	hal->nCur80MhzPrimeSC = chnl_offset80;
-	hal->current_band_type = ch > 14 ? BAND_ON_5G:BAND_ON_2_4G;
-
-	if (print) {
-		RTW_INFO(FUNC_ADPT_FMT" cch:%u, %s, offset40:%u, offset80:%u (%u, %u, %u), band:%s\n"
-			, FUNC_ADPT_ARG(padapter), center_ch, ch_width_str(bw)
-			, ch_offset, chnl_offset80
-			, hal->cch_80, hal->cch_40, hal->cch_20
-			, band_str(hal->current_band_type));
-	}
-}
-
-u8 rtw_hal_dl_mcc_fw_rsvd_page(_adapter *adapter, u8 *pframe, u16 *index,
-	u8 tx_desc, u32 page_size, u8 *total_page_num, RSVDPAGE_LOC *rsvd_page_loc, u8 *page_num)
-{
-	u32 len = 0;
-	_adapter *iface = NULL;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(adapter);
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-	struct mlme_ext_info *pmlmeinfo = NULL;
-	struct mlme_ext_priv *pmlmeext = NULL;
-	struct hal_com_data *hal = GET_HAL_DATA(adapter);
-	struct hal_spec_t *hal_spec = GET_HAL_SPEC(adapter);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-#if defined(CONFIG_RTL8822C)
-	struct dm_struct *phydm = adapter_to_phydm(adapter);
-	struct txagc_table_8822c tab;
-	u8 agc_buff[2][NUM_RATE_AC_2SS]; /* tatol 0x40 rate index for PATH A/B */
-#endif
-	
-	u8 ret = _SUCCESS, i = 0, j  =0, order = 0, CurtPktPageNum = 0;
-	u8 *start = NULL;
-	u8 path = RF_PATH_A;
-
-	if (page_num) {
-#ifdef CONFIG_MCC_MODE_V2
-		if (!hal->RegIQKFWOffload)
-			RTW_WARN("[MCC] must enable FW IQK for New IC\n");
-#endif /* CONFIG_MCC_MODE_V2 */
-		*total_page_num += (2 * MAX_MCC_NUM+ 1);
-		RTW_INFO("[MCC] allocate mcc rsvd page num = %d\n", *total_page_num);
-		goto exit;
-	}
-
-	/* check proccess mcc start setting */
-	if (!rtw_hal_check_mcc_status(adapter, MCC_STATUS_PROCESS_MCC_START_SETTING)) {
-		ret = _FAIL;
-		goto exit;
-	}
-
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-		if (iface == NULL)
-			continue;
-
-		mccadapriv = &iface->mcc_adapterpriv;
-		if (mccadapriv->role == MCC_ROLE_MAX)
-			continue;
-
-		order = mccadapriv->order;
-		pmccobjpriv->mcc_loc_rsvd_paga[order] = *total_page_num;
-
-		switch (mccadapriv->role) {
-		case MCC_ROLE_STA:
-		case MCC_ROLE_GC:
-			/* Build NULL DATA */
-			RTW_INFO("LocNull(order:%d): %d\n"
-				, order, pmccobjpriv->mcc_loc_rsvd_paga[order]);
-			len = 0;
-
-			rtw_hal_construct_NullFunctionData(iface
-				, &pframe[*index], &len, _FALSE, 0, 0, _FALSE);
-			rtw_hal_fill_fake_txdesc(iface, &pframe[*index-tx_desc],
-				len, _FALSE, _FALSE, _FALSE);
-
-			CurtPktPageNum = (u8)PageNum(tx_desc + len, page_size);
-			*total_page_num += CurtPktPageNum;
-			*index += (CurtPktPageNum * page_size);
-			RSVD_PAGE_CFG("LocNull", CurtPktPageNum, *total_page_num, *index);
-			break;
-		case MCC_ROLE_AP:
-			/* Bulid CTS */
-			RTW_INFO("LocCTS(order:%d): %d\n"
-				, order, pmccobjpriv->mcc_loc_rsvd_paga[order]);
-
-			len = 0;
-			rtw_hal_construct_CTS(iface, &pframe[*index], &len);
-			rtw_hal_fill_fake_txdesc(iface, &pframe[*index-tx_desc],
-				len, _FALSE, _FALSE, _FALSE);
-
-			CurtPktPageNum = (u8)PageNum(tx_desc + len, page_size);
-			*total_page_num += CurtPktPageNum;
-			*index += (CurtPktPageNum * page_size);
-			RSVD_PAGE_CFG("LocCTS", CurtPktPageNum, *total_page_num, *index);
-			break;
-		case MCC_ROLE_GO:
-		/* To DO */
-			break;
-		default:
-			RTW_INFO(FUNC_ADPT_FMT": unknown role = %d\n"
-				, FUNC_ADPT_ARG(iface), mccadapriv->role);
-			break;
-		}
-	}
-
-	for (i = 0; i < MAX_MCC_NUM; i++) {
-		u8 center_ch = 0, ch = 0, bw = 0, bw_offset = 0;
-		BAND_TYPE band = BAND_MAX;
-		u8 power_index = 0;
-		u8 rate_array_sz = 0;
-		u8 *rates = NULL;
-		u8 rate = 0;
-		u8 shift = 0;
-		u32 power_index_4bytes = 0;
-		u8 total_rate = 0;
-		u8 *total_rate_offset = NULL;
-
-		iface = pmccobjpriv->iface[i];
-		pmlmeext = &iface->mlmeextpriv;
-		ch = pmlmeext->cur_channel;
-		bw = pmlmeext->cur_bwmode;
-		bw_offset = pmlmeext->cur_ch_offset;
-		center_ch = rtw_get_center_ch(ch, bw, bw_offset);
-		band = center_ch <= 14 ? BAND_ON_2_4G : BAND_ON_5G;
-		rtw_hal_mcc_upadate_chnl_bw(iface, ch, bw_offset, bw, _TRUE);
-
-		start = &pframe[*index - tx_desc];
-		_rtw_memset(start, 0, page_size);
-		pmccobjpriv->mcc_pwr_idx_rsvd_page[i] = *total_page_num;
-		RTW_INFO(ADPT_FMT" order:%d, pwr_idx_rsvd_page location[%d]: %d\n",
-			ADPT_ARG(iface), mccadapriv->order,
-			i, pmccobjpriv->mcc_pwr_idx_rsvd_page[i]);
-
-		total_rate_offset = start;
-#if !defined(CONFIG_RTL8822C)			
-		for (path = RF_PATH_A; path < hal_spec->rf_reg_path_num; ++path) {
-			total_rate = 0;
-			/* PATH A for 0~63 byte, PATH B for 64~127 byte*/
-			if (path == RF_PATH_A)
-				start = total_rate_offset + 1;
-			else if (path == RF_PATH_B)
-				start = total_rate_offset + 64;
-			else {
-				RTW_INFO("[MCC] %s: unknow RF PATH(%d)\n", __func__, path);
-				break;
-			}
-
-			/* CCK */
-			if (ch <= 14) {
-				rate_array_sz = rates_by_sections[CCK].rate_num;
-				rates = rates_by_sections[CCK].rates;
-				for (j = 0; j < rate_array_sz; ++j) {
-					power_index = phy_get_tx_power_index_ex(iface, path, CCK, rates[j], bw, band, center_ch, ch);
-					rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-
-					shift = rate % 4;
-					if (shift == 0) {
-						*start = rate;
-						start++;
-						total_rate++;
-
-						#ifdef DBG_PWR_IDX_RSVD_PAGE
-						RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-							ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-							center_ch, MGN_RATE_STR(rates[j]), power_index);
-						#endif
-					}
-
-					*start = power_index;
-					start++;
-
-					#ifdef DBG_PWR_IDX_RSVD_PAGE
-					RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-						ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-						center_ch, MGN_RATE_STR(rates[j]), power_index);
-
-					
-					shift = rate % 4;
-					power_index_4bytes |= ((power_index & 0xff) << (shift * 8));
-					if (shift == 3) {
-						rate = rate - 3;
-						RTW_INFO("(index:0x%02x, rfpath:%d, rate:0x%02x)\n", index, path, rate);
-						power_index_4bytes = 0;
-						total_rate++;
-					}
-					#endif
-						
-				}
-			}
-
-			/* OFDM */
-			rate_array_sz = rates_by_sections[OFDM].rate_num;
-			rates = rates_by_sections[OFDM].rates;
-			for (j = 0; j < rate_array_sz; ++j) {
-				power_index = phy_get_tx_power_index_ex(iface, path, OFDM, rates[j], bw, band, center_ch, ch);
-				rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-
-				shift = rate % 4;
-				if (shift == 0) {
-					*start = rate;
-					start++;
-					total_rate++;
-
-					#ifdef DBG_PWR_IDX_RSVD_PAGE
-					RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-						ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-						center_ch, MGN_RATE_STR(rates[j]), power_index);
-					#endif
-
-				}
-
-				*start = power_index;
-				start++;
-
-				#ifdef DBG_PWR_IDX_RSVD_PAGE
-				RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-					ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-					center_ch, MGN_RATE_STR(rates[j]), power_index);
-
-				shift = rate % 4;
-				power_index_4bytes |= ((power_index & 0xff) << (shift * 8));
-				if (shift == 3) {
-					rate = rate - 3;
-					RTW_INFO("(index:0x%02x, rfpath:%d, rate:0x%02x)\n", index, path, rate);
-					power_index_4bytes = 0;
-					total_rate++;
-				}
-				#endif
-			}
-
-			/* HT_MCS0_MCS7 */
-			rate_array_sz = rates_by_sections[HT_MCS0_MCS7].rate_num;
-			rates = rates_by_sections[HT_MCS0_MCS7].rates;
-			for (j = 0; j < rate_array_sz; ++j) {
-				power_index = phy_get_tx_power_index_ex(iface, path, HT_1SS, rates[j], bw, band, center_ch, ch);
-				rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-
-				shift = rate % 4;
-				if (shift == 0) {
-					*start = rate;
-					start++;
-					total_rate++;
-
-					#ifdef DBG_PWR_IDX_RSVD_PAGE
-					RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-						ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-						center_ch, MGN_RATE_STR(rates[j]), power_index);
-					#endif
-
-				}
-
-				*start = power_index;
-				start++;
-
-				#ifdef DBG_PWR_IDX_RSVD_PAGE
-				RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-					ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-					center_ch, MGN_RATE_STR(rates[j]), power_index);
-
-				shift = rate % 4;
-				power_index_4bytes |= ((power_index & 0xff) << (shift * 8));
-				if (shift == 3) {
-					rate = rate - 3;
-					RTW_INFO("(index:0x%02x, rfpath:%d, rate:0x%02x)\n", index, path, rate);
-					power_index_4bytes = 0;
-					total_rate++;
-				}
-				#endif
-			}
-
-			/* HT_MCS8_MCS15 */
-			rate_array_sz = rates_by_sections[HT_MCS8_MCS15].rate_num;
-			rates = rates_by_sections[HT_MCS8_MCS15].rates;
-			for (j = 0; j < rate_array_sz; ++j) {
-				power_index = phy_get_tx_power_index_ex(iface, path, HT_2SS, rates[j], bw, band, center_ch, ch);
-				rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-
-				shift = rate % 4;
-				if (shift == 0) {
-					*start = rate;
-					start++;
-					total_rate++;
-
-					#ifdef DBG_PWR_IDX_RSVD_PAGE
-					RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-						ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-						center_ch, MGN_RATE_STR(rates[j]), power_index);
-					#endif
-				}
-
-				*start = power_index;
-				start++;
-
-				#ifdef DBG_PWR_IDX_RSVD_PAGE
-				RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-					ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-					center_ch, MGN_RATE_STR(rates[j]), power_index);
-				
-				shift = rate % 4;
-				power_index_4bytes |= ((power_index & 0xff) << (shift * 8));
-				if (shift == 3) {
-					rate = rate - 3;
-					RTW_INFO("(index:0x%02x, rfpath:%d, rate:0x%02x)\n", index, path, rate);
-					power_index_4bytes = 0;
-					total_rate++;
-				}
-				#endif
-			}
-
-			/* VHT_1SSMCS0_1SSMCS9 */
-			rate_array_sz = rates_by_sections[VHT_1SSMCS0_1SSMCS9].rate_num;
-			rates = rates_by_sections[VHT_1SSMCS0_1SSMCS9].rates;
-			for (j = 0; j < rate_array_sz; ++j) {
-				power_index = phy_get_tx_power_index_ex(iface, path, VHT_1SS, rates[j], bw, band, center_ch, ch);
-				rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-
-				shift = rate % 4;
-				if (shift == 0) {
-					*start = rate;
-					start++;
-					total_rate++;
-					#ifdef DBG_PWR_IDX_RSVD_PAGE
-					RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:0x%02x\n",
-						ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-						center_ch, MGN_RATE_STR(rates[j]), power_index);
-					#endif
-				}
-				*start = power_index;
-				start++;
-				#ifdef DBG_PWR_IDX_RSVD_PAGE
-				RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-					ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-					center_ch, MGN_RATE_STR(rates[j]), power_index);
-
-				shift = rate % 4;
-				power_index_4bytes |= ((power_index & 0xff) << (shift * 8));
-				if (shift == 3) {
-					rate = rate - 3;
-					RTW_INFO("(index:0x%02x, rfpath:%d, rate:0x%02x)\n", index, path, rate);
-					power_index_4bytes = 0;
-					total_rate++;
-				}
-				#endif
-			}
-
-			/* VHT_2SSMCS0_2SSMCS9 */
-			rate_array_sz = rates_by_sections[VHT_2SSMCS0_2SSMCS9].rate_num;
-			rates = rates_by_sections[VHT_2SSMCS0_2SSMCS9].rates;
-			for (j = 0; j < rate_array_sz; ++j) {
-				power_index = phy_get_tx_power_index_ex(iface, path, VHT_2SS, rates[j], bw, band, center_ch, ch);
-				rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-
-				shift = rate % 4;
-				if (shift == 0) {
-					*start = rate;
-					start++;
-					total_rate++;
-					#ifdef DBG_PWR_IDX_RSVD_PAGE
-					RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-						ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-						center_ch, MGN_RATE_STR(rates[j]), power_index);
-					#endif
-				}
-				*start = power_index;
-				start++;
-				#ifdef DBG_PWR_IDX_RSVD_PAGE
-				RTW_INFO("TXPWR("ADPT_FMT"): [%c][%s]ch:%u, %s, pwr_idx:%u\n",
-					ADPT_ARG(iface), rf_path_char(path), ch_width_str(bw),
-					center_ch, MGN_RATE_STR(rates[j]), power_index);
-
-				shift = rate % 4;
-				power_index_4bytes |= ((power_index & 0xff) << (shift * 8));
-				if (shift == 3) {
-					rate = rate - 3;
-					RTW_INFO("(index:0x%02x, rfpath:%d, rate:0x%02x)\n", index, path, rate);
-					power_index_4bytes = 0;
-						total_rate++;
-				}
-				#endif
-			}
-				
-		}
-		/*  total rate store in offset 0 */
-		*total_rate_offset = total_rate;
-
-#ifdef DBG_PWR_IDX_RSVD_PAGE
-			RTW_INFO("total_rate=%d\n", total_rate);
-			RTW_INFO(" ======================="ADPT_FMT"===========================\n", ADPT_ARG(iface));
-			RTW_INFO_DUMP("\n", total_rate_offset, 128);
-			RTW_INFO(" ==================================================\n");
-#endif
-
-			CurtPktPageNum = 1;
-			*total_page_num += CurtPktPageNum;
-			*index += (CurtPktPageNum * page_size);
-			RSVD_PAGE_CFG("mcc_pwr_idx_rsvd_page", CurtPktPageNum, *total_page_num, *index);
-#else /* 8822C */
-			for (path = RF_PATH_A; path < hal_spec->rf_reg_path_num; ++path) {
-				/* CCK */
-				if (ch <= 14) {
-					rate_array_sz = rates_by_sections[CCK].rate_num;
-					rates = rates_by_sections[CCK].rates;
-					for (j = 0; j < rate_array_sz; ++j) {
-						power_index = phy_get_tx_power_index_ex(iface, path, CCK, rates[j], bw, band, center_ch, ch);
-						rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-						agc_buff[path][rate] = power_index;
-					}
-				}
-
-				/* OFDM */
-				rate_array_sz = rates_by_sections[OFDM].rate_num;
-				rates = rates_by_sections[OFDM].rates;
-				for (j = 0; j < rate_array_sz; ++j) {
-					power_index = phy_get_tx_power_index_ex(iface, path, OFDM, rates[j], bw, band, center_ch, ch);
-					rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-					agc_buff[path][rate] = power_index;
-				}
-				/* HT */
-				rate_array_sz = rates_by_sections[HT_MCS0_MCS7].rate_num;
-				rates = rates_by_sections[HT_MCS0_MCS7].rates;
-				for (j = 0; j < rate_array_sz; ++j) {
-					power_index = phy_get_tx_power_index_ex(iface, path, HT_1SS, rates[j], bw, band, center_ch, ch);
-					rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-					agc_buff[path][rate] = power_index;
-				}
-
-				rate_array_sz = rates_by_sections[HT_MCS8_MCS15].rate_num;
-				rates = rates_by_sections[HT_MCS8_MCS15].rates;
-				for (j = 0; j < rate_array_sz; ++j) {
-					power_index = phy_get_tx_power_index_ex(iface, path, HT_2SS, rates[j], bw, band, center_ch, ch);
-					rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-					agc_buff[path][rate] = power_index;
-				}
-				/* VHT */
-				rate_array_sz = rates_by_sections[VHT_1SSMCS0_1SSMCS9].rate_num;
-				rates = rates_by_sections[VHT_1SSMCS0_1SSMCS9].rates;
-				for (j = 0; j < rate_array_sz; ++j) {
-					power_index = phy_get_tx_power_index_ex(iface, path, VHT_1SS, rates[j], bw, band, center_ch, ch);
-					rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-					agc_buff[path][rate] = power_index;
-				}
-
-				rate_array_sz = rates_by_sections[VHT_2SSMCS0_2SSMCS9].rate_num;
-				rates = rates_by_sections[VHT_2SSMCS0_2SSMCS9].rates;
-				for (j = 0; j < rate_array_sz; ++j) {
-					power_index = phy_get_tx_power_index_ex(iface, path, VHT_2SS, rates[j], bw, band, center_ch, ch);
-					rate = phy_get_rate_idx_of_txpwr_by_rate(rates[j]);
-					agc_buff[path][rate] = power_index;
-				}
-			}
-			phydm_get_txagc_ref_and_diff_8822c(phydm, agc_buff, NUM_RATE_AC_2SS, &tab);
-			*start = tab.ref_pow_cck[0];
-			start++;
-			*start = tab.ref_pow_cck[1];
-			start++;
-			*start = tab.ref_pow_ofdm[0];
-			start++;
-			*start = tab.ref_pow_ofdm[1];
-			start++;
-			_rtw_memcpy(start, tab.diff_t, sizeof(tab.diff_t));
-			CurtPktPageNum = 1;
-			*total_page_num += CurtPktPageNum;
-			*index += (CurtPktPageNum * page_size);
-			RSVD_PAGE_CFG("mcc_pwr_idx_rsvd_page", CurtPktPageNum, *total_page_num, *index);
-			#ifdef DBG_PWR_IDX_RSVD_PAGE
-			if (1) {
-				u8 path_idx;
-				for (path_idx = 0; path_idx < 2; path_idx++) {
-					for (j = 0; j < NUM_RATE_AC_2SS; j++) 
-						RTW_INFO("agc_buff[%d][%d]=%x\n", i, j, agc_buff[i][j]);
-				}
-				RTW_INFO("tab->ref_pow_cck[0]=%x\n", tab.ref_pow_cck[0]);
-				RTW_INFO("tab->ref_pow_cck[1]=%x\n", tab.ref_pow_cck[1]);
-				RTW_INFO("tab->ref_pow_ofdm[0]=%x\n", tab.ref_pow_ofdm[0]);
-				RTW_INFO("tab->ref_pow_ofdm[1]=%x\n", tab.ref_pow_ofdm[1]);
-				RTW_INFO_DUMP("diff_t ", tab.diff_t, NUM_RATE_AC_2SS);
-				RTW_INFO_DUMP("tab ", (u8 *)&tab, sizeof(tab));
-			}
-			#endif
-			
-#endif
-		}
-
-exit:
-	return ret;
-}
-
-/*
-* 1. Download MCC rsvd page
-* 2. Re-Download beacon after download rsvd page
-*/
-static void rtw_hal_set_fw_mcc_rsvd_page(PADAPTER padapter)
-{
-	HAL_DATA_TYPE *pHalData = GET_HAL_DATA(padapter);
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	PADAPTER port0_iface = dvobj_get_port0_adapter(dvobj);
-	PADAPTER iface = NULL;
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-	u8 mstatus = RT_MEDIA_CONNECT, i = 0;
-
-	RTW_INFO(FUNC_ADPT_FMT"\n", FUNC_ADPT_ARG(padapter));
-
-	rtw_hal_set_hwreg(port0_iface, HW_VAR_H2C_FW_JOINBSSRPT, (u8 *)(&mstatus));
-
-#ifdef CONFIG_AP_MODE
-	/* Re-Download beacon */
-	for (i = 0; i < MAX_MCC_NUM; i++) {
-		iface = pmccobjpriv->iface[i];
-		if (iface == NULL)
-			continue;
-
-		pmccadapriv = &iface->mcc_adapterpriv;
-
-		if (pmccadapriv->role == MCC_ROLE_AP
-			|| pmccadapriv->role == MCC_ROLE_GO) {
-			tx_beacon_hdl(iface, NULL);
-		}
-	}
-#endif
-}
-
-static void rtw_hal_set_mcc_rsvdpage_cmd(_adapter *padapter)
-{
-	u8 cmd[H2C_MCC_LOCATION_LEN] = {0}, i = 0, order = 0;
-	_adapter *iface = NULL;
-	struct hal_spec_t *hal_spec = GET_HAL_SPEC(padapter);
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-
-	SET_H2CCMD_MCC_PWRIDX_OFFLOAD_EN(cmd, _TRUE);
-	SET_H2CCMD_MCC_PWRIDX_OFFLOAD_RFNUM(cmd, hal_spec->rf_reg_path_num);
-	for (order = 0; order < MAX_MCC_NUM; order++) {
-		iface = pmccobjpriv->iface[i];
-
-		SET_H2CCMD_MCC_RSVDPAGE_LOC((cmd + order), pmccobjpriv->mcc_loc_rsvd_paga[order]);
-		SET_H2CCMD_MCC_PWRIDX_RSVDPAGE_LOC ((cmd + order), pmccobjpriv->mcc_pwr_idx_rsvd_page[order]);
-	}
-
-#ifdef CONFIG_MCC_MODE_DEBUG
-	RTW_INFO("=========================\n");
-	RTW_INFO("MCC RSVD PAGE LOC:\n");
-	for (i = 0; i < H2C_MCC_LOCATION_LEN; i++)
-		pr_dbg("0x%x ", cmd[i]);
-	pr_dbg("\n");
-	RTW_INFO("=========================\n");
-#endif /* CONFIG_MCC_MODE_DEBUG */
-
-	rtw_hal_fill_h2c_cmd(padapter, H2C_MCC_LOCATION, H2C_MCC_LOCATION_LEN, cmd);
-}
-
-static void rtw_hal_set_mcc_time_setting_cmd(PADAPTER padapter)
-{
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-	struct mlme_priv *pmlmepriv = &(padapter->mlmepriv);
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	u8 cmd[H2C_MCC_TIME_SETTING_LEN] = {0};
-	u8 fw_eable = 1;
-	u8 swchannel_early_time = MCC_SWCH_FW_EARLY_TIME;
-	u8 starting_ap_num = DEV_AP_STARTING_NUM(dvobj);
-	u8 ap_num = DEV_AP_NUM(dvobj);	
-
-	if (starting_ap_num == 0 && ap_num == 0)
-		/* For STA+GC/STA+STA, TSF of GC/STA does not need to sync from TSF of other STA/GC */
-		fw_eable = 0;
-	else
-		/* Only for STA+GO/STA+AP, TSF of AP/GO need to sync from TSF of STA */
-		fw_eable = 1;
-
-	if (fw_eable == 1) {
-		PADAPTER order0_iface = NULL;
-		PADAPTER order1_iface = NULL;
-		u8 policy_idx = mccobjpriv->policy_index;
-		u8 tsf_sync_offset = mcc_switch_channel_policy_table[policy_idx][MCC_TSF_SYNC_OFFSET_IDX];
-		u8 start_time_offset = mcc_switch_channel_policy_table[policy_idx][MCC_START_TIME_OFFSET_IDX];
-		u8 interval = mcc_switch_channel_policy_table[policy_idx][MCC_INTERVAL_IDX];
-		u8 guard_offset0 = mcc_switch_channel_policy_table[policy_idx][MCC_GUARD_OFFSET0_IDX];
-		u8 guard_offset1 = mcc_switch_channel_policy_table[policy_idx][MCC_GUARD_OFFSET1_IDX];
-		enum _hw_port tsf_bsae_port = MAX_HW_PORT;
-		enum _hw_port tsf_sync_port = MAX_HW_PORT;
-		order0_iface = mccobjpriv->iface[0];
-		order1_iface = mccobjpriv->iface[1];
-
-		tsf_bsae_port = rtw_hal_get_port(order1_iface);
-		tsf_sync_port = rtw_hal_get_port(order0_iface);
-		
-		/* FW set enable */
-		SET_H2CCMD_MCC_TIME_SETTING_FW_EN(cmd, fw_eable);
-		/* TSF Sync offset */
-		SET_H2CCMD_MCC_TIME_SETTING_TSF_SYNC_OFFSET(cmd, tsf_sync_offset);
-		/* start time offset */
-		SET_H2CCMD_MCC_TIME_SETTING_START_TIME(cmd, (start_time_offset + guard_offset0));
-		/* interval */
-		SET_H2CCMD_MCC_TIME_SETTING_INTERVAL(cmd, interval);
-		/* Early time to inform driver by C2H before switch channel */
-		SET_H2CCMD_MCC_TIME_SETTING_EARLY_SWITCH_RPT(cmd, swchannel_early_time);
-		/* Port0 sync from Port1, not support multi-port */
-		SET_H2CCMD_MCC_TIME_SETTING_ORDER_BASE(cmd, tsf_bsae_port);
-		SET_H2CCMD_MCC_TIME_SETTING_ORDER_SYNC(cmd, tsf_sync_port);
-	} else {
-		/* start time offset */
-		SET_H2CCMD_MCC_TIME_SETTING_START_TIME(cmd, mccobjpriv->start_time);
-		/* interval */
-		SET_H2CCMD_MCC_TIME_SETTING_INTERVAL(cmd, mccobjpriv->interval);
-		/* Early time to inform driver by C2H before switch channel */
-		SET_H2CCMD_MCC_TIME_SETTING_EARLY_SWITCH_RPT(cmd, swchannel_early_time);
-	}
-
-#ifdef CONFIG_MCC_MODE_DEBUG
-	{
-		u8 i = 0;
-
-		RTW_INFO("=========================\n");
-		RTW_INFO("NoA:\n");
-		for (i = 0; i < H2C_MCC_TIME_SETTING_LEN; i++)
-			pr_dbg("0x%x ", cmd[i]);
-		pr_dbg("\n");
-		RTW_INFO("=========================\n");
-	}
-#endif /* CONFIG_MCC_MODE_DEBUG */
-
-	rtw_hal_fill_h2c_cmd(padapter, H2C_MCC_TIME_SETTING, H2C_MCC_TIME_SETTING_LEN, cmd);
-}
-
-#ifndef CONFIG_MCC_MODE_V2
-static void rtw_hal_set_mcc_IQK_offload_cmd(PADAPTER padapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-	struct mcc_adapter_priv *pmccadapriv = NULL;
-	_adapter *iface = NULL;
-	u8 cmd[H2C_MCC_IQK_PARAM_LEN] = {0}, bready = 0, i = 0, order = 0;
-	u16 TX_X = 0, TX_Y = 0, RX_X = 0, RX_Y = 0;
-	u8 total_rf_path = GET_HAL_SPEC(padapter)->rf_reg_path_num;
-	u8 rf_path_idx = 0, last_order = MAX_MCC_NUM - 1, last_rf_path_index = total_rf_path - 1;
-
-	/* by order, last order & last_rf_path_index must set ready bit = 1 */
-	for (i = 0; i < MAX_MCC_NUM; i++) {
-		iface = pmccobjpriv->iface[i];
-		if (iface == NULL)
-			continue;
-
-		pmccadapriv = &iface->mcc_adapterpriv;
-		order = pmccadapriv->order;
-
-		for (rf_path_idx = 0; rf_path_idx < total_rf_path; rf_path_idx ++) {
-
-			_rtw_memset(cmd, 0, H2C_MCC_IQK_PARAM_LEN);
-			TX_X = pmccadapriv->mcc_iqk_arr[rf_path_idx].TX_X & 0x7ff;/* [10:0]  */
-			TX_Y = pmccadapriv->mcc_iqk_arr[rf_path_idx].TX_Y & 0x7ff;/* [10:0]  */
-			RX_X = pmccadapriv->mcc_iqk_arr[rf_path_idx].RX_X & 0x3ff;/* [9:0]  */
-			RX_Y = pmccadapriv->mcc_iqk_arr[rf_path_idx].RX_Y & 0x3ff;/* [9:0]  */
-
-			/* ready or not */
-			if (order == last_order && rf_path_idx == last_rf_path_index)
-				bready = 1;
-			else
-				bready = 0;
-
-			SET_H2CCMD_MCC_IQK_READY(cmd, bready);
-			SET_H2CCMD_MCC_IQK_ORDER(cmd, order);
-			SET_H2CCMD_MCC_IQK_PATH(cmd, rf_path_idx);
-
-			/* fill RX_X[7:0] to (cmd+1)[7:0] bitlen=8 */
-			SET_H2CCMD_MCC_IQK_RX_L(cmd, (u8)(RX_X & 0xff));
-			/* fill RX_X[9:8] to (cmd+2)[1:0] bitlen=2 */
-			SET_H2CCMD_MCC_IQK_RX_M1(cmd, (u8)((RX_X >> 8) & 0x03));
-			/* fill RX_Y[5:0] to (cmd+2)[7:2] bitlen=6 */
-			SET_H2CCMD_MCC_IQK_RX_M2(cmd, (u8)(RX_Y & 0x3f));
-			/* fill RX_Y[9:6] to (cmd+3)[3:0] bitlen=4 */
-			SET_H2CCMD_MCC_IQK_RX_H(cmd, (u8)((RX_Y >> 6) & 0x0f));
-
-
-			/* fill TX_X[7:0] to (cmd+4)[7:0] bitlen=8 */
-			SET_H2CCMD_MCC_IQK_TX_L(cmd, (u8)(TX_X & 0xff));
-			/* fill TX_X[10:8] to (cmd+5)[2:0] bitlen=3 */
-			SET_H2CCMD_MCC_IQK_TX_M1(cmd, (u8)((TX_X >> 8) & 0x07));
-			/* fill TX_Y[4:0] to (cmd+5)[7:3] bitlen=5 */
-			SET_H2CCMD_MCC_IQK_TX_M2(cmd, (u8)(TX_Y & 0x1f));
-			/* fill TX_Y[10:5] to (cmd+6)[5:0] bitlen=6 */
-			SET_H2CCMD_MCC_IQK_TX_H(cmd, (u8)((TX_Y >> 5) & 0x3f));
-
-#ifdef CONFIG_MCC_MODE_DEBUG
-			RTW_INFO("=========================\n");
-			RTW_INFO(FUNC_ADPT_FMT" IQK:\n", FUNC_ADPT_ARG(iface));
-			RTW_INFO("TX_X: 0x%02x\n", TX_X);
-			RTW_INFO("TX_Y: 0x%02x\n", TX_Y);
-			RTW_INFO("RX_X: 0x%02x\n", RX_X);
-			RTW_INFO("RX_Y: 0x%02x\n", RX_Y);
-			RTW_INFO("cmd[0]:0x%02x\n", cmd[0]);
-			RTW_INFO("cmd[1]:0x%02x\n", cmd[1]);
-			RTW_INFO("cmd[2]:0x%02x\n", cmd[2]);
-			RTW_INFO("cmd[3]:0x%02x\n", cmd[3]);
-			RTW_INFO("cmd[4]:0x%02x\n", cmd[4]);
-			RTW_INFO("cmd[5]:0x%02x\n", cmd[5]);
-			RTW_INFO("cmd[6]:0x%02x\n", cmd[6]);
-			RTW_INFO("=========================\n");
-#endif /* CONFIG_MCC_MODE_DEBUG */
-
-			rtw_hal_fill_h2c_cmd(padapter, H2C_MCC_IQK_PARAM, H2C_MCC_IQK_PARAM_LEN, cmd);
-		}
-	}
-}
-#endif
-
-
-static void rtw_hal_set_mcc_macid_cmd(PADAPTER padapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_adapter_priv *pmccadapriv = NULL;
-	_adapter *iface = NULL;
-	u8 cmd[H2C_MCC_MACID_BITMAP_LEN] = {0}, i = 0, order = 0;
-	u16 bitmap = 0;
-
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-		if (iface == NULL)
-			continue;
-
-		pmccadapriv = &iface->mcc_adapterpriv;
-		if (pmccadapriv->role == MCC_ROLE_MAX)
-			continue;
-		
-		order = pmccadapriv->order;
-		bitmap = pmccadapriv->mcc_macid_bitmap;
-
-		if (order >= (H2C_MCC_MACID_BITMAP_LEN/2)) {
-			RTW_INFO(FUNC_ADPT_FMT" only support 3 interface at most(%d)\n"
-				, FUNC_ADPT_ARG(padapter), order);
-			continue;
-		}
-		SET_H2CCMD_MCC_MACID_BITMAP_L((cmd + order * 2), (u8)(bitmap & 0xff));
-		SET_H2CCMD_MCC_MACID_BITMAP_H((cmd + order * 2), (u8)((bitmap >> 8) & 0xff));
-	}
-
-#ifdef CONFIG_MCC_MODE_DEBUG
-	RTW_INFO("=========================\n");
-	RTW_INFO("MACID BITMAP: ");
-	for (i = 0; i < H2C_MCC_MACID_BITMAP_LEN; i++)
-		printk("0x%x ", cmd[i]);
-	printk("\n");
-	RTW_INFO("=========================\n");
-#endif /* CONFIG_MCC_MODE_DEBUG */
-	rtw_hal_fill_h2c_cmd(padapter, H2C_MCC_MACID_BITMAP, H2C_MCC_MACID_BITMAP_LEN, cmd);
-}
-
-#ifdef CONFIG_MCC_MODE_V2
-static u8 get_pri_ch_idx_by_adapter(u8 center_ch, u8 channel, u8 bw, u8 ch_offset40)
-{
-	u8 pri_ch_idx = 0, chnl_offset80 = 0;
-
-	if (bw == CHANNEL_WIDTH_80) {
-		if (center_ch > channel)
-			chnl_offset80 = HAL_PRIME_CHNL_OFFSET_LOWER;
-		else if (center_ch < channel)
-			chnl_offset80 = HAL_PRIME_CHNL_OFFSET_UPPER;
-		else
-			chnl_offset80 = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
-	}
-
-	if (bw == CHANNEL_WIDTH_80) {
-		/* primary channel is at lower subband of 80MHz & 40MHz */
-		if ((ch_offset40 == HAL_PRIME_CHNL_OFFSET_LOWER) && (chnl_offset80 == HAL_PRIME_CHNL_OFFSET_LOWER))
-			pri_ch_idx = VHT_DATA_SC_20_LOWEST_OF_80MHZ;
-		/* primary channel is at lower subband of 80MHz & upper subband of 40MHz */
-		else if ((ch_offset40 == HAL_PRIME_CHNL_OFFSET_UPPER) && (chnl_offset80 == HAL_PRIME_CHNL_OFFSET_LOWER))
-			pri_ch_idx = VHT_DATA_SC_20_LOWER_OF_80MHZ;
-		/* primary channel is at upper subband of 80MHz & lower subband of 40MHz */
-		else if ((ch_offset40 == HAL_PRIME_CHNL_OFFSET_LOWER) && (chnl_offset80 == HAL_PRIME_CHNL_OFFSET_UPPER))
-			pri_ch_idx = VHT_DATA_SC_20_UPPER_OF_80MHZ;
-		/* primary channel is at upper subband of 80MHz & upper subband of 40MHz */
-		else if ((ch_offset40 == HAL_PRIME_CHNL_OFFSET_UPPER) && (chnl_offset80 == HAL_PRIME_CHNL_OFFSET_UPPER))
-			pri_ch_idx = VHT_DATA_SC_20_UPPERST_OF_80MHZ;
-		else {
-			if (chnl_offset80 == HAL_PRIME_CHNL_OFFSET_LOWER)
-				pri_ch_idx = VHT_DATA_SC_40_LOWER_OF_80MHZ;
-			else if (chnl_offset80 == HAL_PRIME_CHNL_OFFSET_UPPER)
-				pri_ch_idx = VHT_DATA_SC_40_UPPER_OF_80MHZ;
-			else
-				RTW_INFO("SCMapping: DONOT CARE Mode Setting\n");
-		}
-	} else if (bw == CHANNEL_WIDTH_40) {
-		/* primary channel is at upper subband of 40MHz */
-		if (ch_offset40== HAL_PRIME_CHNL_OFFSET_UPPER)
-			pri_ch_idx = VHT_DATA_SC_20_UPPER_OF_80MHZ;
-		/* primary channel is at lower subband of 40MHz */
-		else if (ch_offset40 == HAL_PRIME_CHNL_OFFSET_LOWER)
-			pri_ch_idx = VHT_DATA_SC_20_LOWER_OF_80MHZ;
-		else
-			RTW_INFO("SCMapping: DONOT CARE Mode Setting\n");
-	}
-
-	return  pri_ch_idx;
-}
-
-static void rtw_hal_set_mcc_ctrl_cmd_v2(PADAPTER padapter, u8 stop)
-{
-	u8 cmd[H2C_MCC_CTRL_LEN] = {0}, i = 0;
-	u8 order = 0, totalnum = 0;
-	u8 center_ch = 0, pri_ch_idx = 0, bw = 0;
-	u8 duration = 0, role = 0, incurch = 0, rfetype = 0, distxnull = 0, c2hrpt = 0;
-	u8 dis_sw_retry = 0, null_early_time=2, tsfx = 0, update_parm = 0;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	struct mlme_ext_priv *pmlmeext = NULL;
-	struct mlme_ext_info *pmlmeinfo = NULL;
-	_adapter *iface = NULL;
-
-	RTW_INFO(FUNC_ADPT_FMT": stop=%d\n", FUNC_ADPT_ARG(padapter), stop);
-
-	for (i = 0; i < MAX_MCC_NUM; i++) {
-		iface = pmccobjpriv->iface[i];
-		if (iface == NULL)
-			continue;
-
-		if (stop) {
-			if (iface != padapter)
-				continue;
-		}
-
-		mccadapriv = &iface->mcc_adapterpriv;
-		order = mccadapriv->order;
-
-		if (!stop)
-			totalnum = MAX_MCC_NUM;
-		else
-			totalnum = 0xff; /* 0xff means stop */
-
-		pmlmeext = &iface->mlmeextpriv;
-		center_ch = rtw_get_center_ch(pmlmeext->cur_channel, pmlmeext->cur_bwmode, pmlmeext->cur_ch_offset);
-		pri_ch_idx = get_pri_ch_idx_by_adapter(center_ch, pmlmeext->cur_channel, pmlmeext->cur_bwmode, pmlmeext->cur_ch_offset);
-		bw = pmlmeext->cur_bwmode;
-		duration = mccadapriv->mcc_duration;
-		role = mccadapriv->role;
-
-		incurch = _FALSE;
-		dis_sw_retry = _TRUE;
-
-		/* STA/GC TX NULL data to inform AP/GC for ps mode */
-		switch (role) {
-		case MCC_ROLE_GO:
-		case MCC_ROLE_AP:
-			distxnull = MCC_DISABLE_TX_NULL;
-			break;
-		case MCC_ROLE_GC:
-			set_channel_bwmode(iface, pmlmeext->cur_channel, pmlmeext->cur_ch_offset, pmlmeext->cur_bwmode);
-			distxnull = MCC_ENABLE_TX_NULL;
-			break;
-		case MCC_ROLE_STA:
-			distxnull = MCC_ENABLE_TX_NULL;
-			break;
-		}
-
-		null_early_time = mccadapriv->null_early;
-
-		c2hrpt = MCC_C2H_REPORT_ALL_STATUS;
-		tsfx = rtw_hal_get_port(iface);
-		update_parm = 0;
-
-		SET_H2CCMD_MCC_CTRL_V2_ORDER(cmd, order);
-		SET_H2CCMD_MCC_CTRL_V2_TOTALNUM(cmd, totalnum);
-		SET_H2CCMD_MCC_CTRL_V2_CENTRAL_CH(cmd, center_ch);
-		SET_H2CCMD_MCC_CTRL_V2_PRIMARY_CH(cmd, pri_ch_idx);
-		SET_H2CCMD_MCC_CTRL_V2_BW(cmd, bw);
-		SET_H2CCMD_MCC_CTRL_V2_DURATION(cmd, duration);
-		SET_H2CCMD_MCC_CTRL_V2_ROLE(cmd, role);
-		SET_H2CCMD_MCC_CTRL_V2_INCURCH(cmd, incurch);
-		SET_H2CCMD_MCC_CTRL_V2_DIS_SW_RETRY(cmd, dis_sw_retry);
-		SET_H2CCMD_MCC_CTRL_V2_DISTXNULL(cmd, distxnull);
-		SET_H2CCMD_MCC_CTRL_V2_C2HRPT(cmd, c2hrpt);
-		SET_H2CCMD_MCC_CTRL_V2_TSFX(cmd, tsfx);
-		SET_H2CCMD_MCC_CTRL_V2_NULL_EARLY(cmd, null_early_time);
-		SET_H2CCMD_MCC_CTRL_V2_UPDATE_PARM(cmd, update_parm);
-
-#ifdef CONFIG_MCC_MODE_DEBUG
-		RTW_INFO("=========================\n");
-		RTW_INFO(FUNC_ADPT_FMT" MCC INFO:\n", FUNC_ADPT_ARG(iface));
-		RTW_INFO("cmd[0]:0x%02x\n", cmd[0]);
-		RTW_INFO("cmd[1]:0x%02x\n", cmd[1]);
-		RTW_INFO("cmd[2]:0x%02x\n", cmd[2]);
-		RTW_INFO("cmd[3]:0x%02x\n", cmd[3]);
-		RTW_INFO("cmd[4]:0x%02x\n", cmd[4]);
-		RTW_INFO("cmd[5]:0x%02x\n", cmd[5]);
-		RTW_INFO("cmd[6]:0x%02x\n", cmd[6]);
-		RTW_INFO("=========================\n");
-#endif /* CONFIG_MCC_MODE_DEBUG */
-
-		rtw_hal_fill_h2c_cmd(padapter, H2C_MCC_CTRL_V2, H2C_MCC_CTRL_LEN, cmd);
-	}
-}
-
-#else
-static void rtw_hal_set_mcc_ctrl_cmd_v1(PADAPTER padapter, u8 stop)
-{
-	u8 cmd[H2C_MCC_CTRL_LEN] = {0}, i = 0;
-	u8 order = 0, totalnum = 0, chidx = 0, bw = 0, bw40sc = 0, bw80sc = 0;
-	u8 duration = 0, role = 0, incurch = 0, rfetype = 0, distxnull = 0, c2hrpt = 0, chscan = 0;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	struct mlme_ext_priv *pmlmeext = NULL;
-	struct mlme_ext_info *pmlmeinfo = NULL;
-	HAL_DATA_TYPE *pHalData = GET_HAL_DATA(padapter);
-	_adapter *iface = NULL;
-
-	RTW_INFO(FUNC_ADPT_FMT": stop=%d\n", FUNC_ADPT_ARG(padapter), stop);
-
-	for (i = 0; i < MAX_MCC_NUM; i++) {
-		iface = pmccobjpriv->iface[i];
-		if (iface == NULL)
-			continue;
-
-		if (stop) {
-			if (iface != padapter)
-				continue;
-		}
-
-		mccadapriv = &iface->mcc_adapterpriv;
-		order = mccadapriv->order;
-
-		if (!stop)
-			totalnum = MAX_MCC_NUM;
-		else
-			totalnum = 0xff; /* 0xff means stop */
-
-		pmlmeext = &iface->mlmeextpriv;
-		chidx = pmlmeext->cur_channel;
-		bw = pmlmeext->cur_bwmode;
-		bw40sc = pmlmeext->cur_ch_offset;
-
-		/* decide 80 band width offset */
-		if (bw == CHANNEL_WIDTH_80) {
-			u8 center_ch = rtw_get_center_ch(chidx, bw, bw40sc);
-
-			if (center_ch > chidx)
-				bw80sc = HAL_PRIME_CHNL_OFFSET_LOWER;
-			else if (center_ch < chidx)
-				bw80sc = HAL_PRIME_CHNL_OFFSET_UPPER;
-			else
-				bw80sc = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
-		} else
-			bw80sc = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
-
-		duration = mccadapriv->mcc_duration;
-		role = mccadapriv->role;
-
-		incurch = _FALSE;
-
-		if (IS_HARDWARE_TYPE_8812(padapter))
-			rfetype = pHalData->rfe_type; /* RFETYPE (only for 8812)*/
-		else
-			rfetype = 0;
-
-		/* STA/GC TX NULL data to inform AP/GC for ps mode */
-		switch (role) {
-		case MCC_ROLE_GO:
-		case MCC_ROLE_AP:
-			distxnull = MCC_DISABLE_TX_NULL;
-			break;
-		case MCC_ROLE_GC:
-		case MCC_ROLE_STA:
-			distxnull = MCC_ENABLE_TX_NULL;
-			break;
-		}
-
-		c2hrpt = MCC_C2H_REPORT_ALL_STATUS;
-		chscan = MCC_CHIDX;
-
-		SET_H2CCMD_MCC_CTRL_ORDER(cmd, order);
-		SET_H2CCMD_MCC_CTRL_TOTALNUM(cmd, totalnum);
-		SET_H2CCMD_MCC_CTRL_CHIDX(cmd, chidx);
-		SET_H2CCMD_MCC_CTRL_BW(cmd, bw);
-		SET_H2CCMD_MCC_CTRL_BW40SC(cmd, bw40sc);
-		SET_H2CCMD_MCC_CTRL_BW80SC(cmd, bw80sc);
-		SET_H2CCMD_MCC_CTRL_DURATION(cmd, duration);
-		SET_H2CCMD_MCC_CTRL_ROLE(cmd, role);
-		SET_H2CCMD_MCC_CTRL_INCURCH(cmd, incurch);
-		SET_H2CCMD_MCC_CTRL_RFETYPE(cmd, rfetype);
-		SET_H2CCMD_MCC_CTRL_DISTXNULL(cmd, distxnull);
-		SET_H2CCMD_MCC_CTRL_C2HRPT(cmd, c2hrpt);
-		SET_H2CCMD_MCC_CTRL_CHSCAN(cmd, chscan);
-
-#ifdef CONFIG_MCC_MODE_DEBUG
-		RTW_INFO("=========================\n");
-		RTW_INFO(FUNC_ADPT_FMT" MCC INFO:\n", FUNC_ADPT_ARG(iface));
-		RTW_INFO("cmd[0]:0x%02x\n", cmd[0]);
-		RTW_INFO("cmd[1]:0x%02x\n", cmd[1]);
-		RTW_INFO("cmd[2]:0x%02x\n", cmd[2]);
-		RTW_INFO("cmd[3]:0x%02x\n", cmd[3]);
-		RTW_INFO("cmd[4]:0x%02x\n", cmd[4]);
-		RTW_INFO("cmd[5]:0x%02x\n", cmd[5]);
-		RTW_INFO("cmd[6]:0x%02x\n", cmd[6]);
-		RTW_INFO("=========================\n");
-#endif /* CONFIG_MCC_MODE_DEBUG */
-
-		rtw_hal_fill_h2c_cmd(padapter, H2C_MCC_CTRL, H2C_MCC_CTRL_LEN, cmd);
-	}
-}
-#endif
-
-static void rtw_hal_set_mcc_ctrl_cmd(PADAPTER padapter, u8 stop)
-{
-	#ifdef CONFIG_MCC_MODE_V2
-		/* new cmd 0x17 */
-		rtw_hal_set_mcc_ctrl_cmd_v2(padapter, stop);
-	#else
-		/* old cmd 0x18 */
-		rtw_hal_set_mcc_ctrl_cmd_v1(padapter, stop);
-	#endif
-}
-
-static u8 check_mcc_support(PADAPTER adapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(adapter);
-	u8 sta_linked_num = DEV_STA_LD_NUM(dvobj);
-	u8 starting_ap_num = DEV_AP_STARTING_NUM(dvobj);
-	u8 ap_num = DEV_AP_NUM(dvobj);
-	u8 ret = _FAIL;
-
-	RTW_INFO("[MCC] sta_linked_num=%d, starting_ap_num=%d,ap_num=%d\n",
-		sta_linked_num, starting_ap_num, ap_num);
-
-	/* case for sta + sta case  */
-	if (sta_linked_num == MAX_MCC_NUM) {
-		ret = _SUCCESS;
-		goto exit;
-	}
-
-	/* case for starting AP + linked sta */
-	if ((starting_ap_num + sta_linked_num) == MAX_MCC_NUM) {
-		ret = _SUCCESS;
-		goto exit;
-	}
-
-	/* case for started AP + linked sta */
-	if ((ap_num + sta_linked_num) == MAX_MCC_NUM) {
-		ret = _SUCCESS;
-		goto exit;
-	}
-
-exit:
-		return ret;
-}
-
-static void rtw_hal_mcc_start_prehdl(PADAPTER padapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	_adapter *iface = NULL;
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	u8 i = 1;
-
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-		if (iface == NULL)
-			continue;
-
-		mccadapriv = &iface->mcc_adapterpriv;
-		mccadapriv->role = MCC_ROLE_MAX;
-	}
-
-#ifdef CONFIG_RTL8822C
-	if (IS_HARDWARE_TYPE_8822C(padapter)) {
-		HAL_DATA_TYPE *hal = GET_HAL_DATA(padapter);
-		struct dm_struct *dm = &hal->odmpriv;
-		
-		odm_cmn_info_update(dm, ODM_CMNINFO_IS_DOWNLOAD_FW, hal->bFWReady);
-	}
-#endif
-}
-
-static u8 rtw_hal_set_mcc_start_setting(PADAPTER padapter, u8 status)
-{
-	u8 ret = _SUCCESS, enable_tsf_auto_sync = _FALSE;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct pwrctrl_priv *pwrpriv = dvobj_to_pwrctl(dvobj);
-
-	if (pwrpriv->pwr_mode != PS_MODE_ACTIVE) {
-		rtw_warn_on(1);
-		RTW_INFO("PS mode is not active before start mcc, force exit ps mode\n");
-		LeaveAllPowerSaveModeDirect(padapter);
-	}
-
-	if (check_mcc_support(padapter) == _FAIL) {
-		ret = _FAIL;
-		goto exit;
-	}
-
-	rtw_hal_mcc_start_prehdl(padapter);
-
-	/* configure mcc switch channel setting */
-	rtw_hal_config_mcc_switch_channel_setting(padapter);
-
-	if (rtw_hal_decide_mcc_role(padapter) == _FAIL) {
-		ret = _FAIL;
-		goto exit;
-	}
-
-	/* set mcc status to indicate process mcc start setting */
-	rtw_hal_set_mcc_status(padapter, MCC_STATUS_PROCESS_MCC_START_SETTING);
-
-	/* only download rsvd page for connect */
-	if (status == MCC_SETCMD_STATUS_START_CONNECT) {
-		/* download mcc rsvd page */
-		rtw_hal_set_fw_mcc_rsvd_page(padapter);
-		rtw_hal_set_mcc_rsvdpage_cmd(padapter);
-	}
-
-	/* configure time setting */
-	rtw_hal_set_mcc_time_setting_cmd(padapter);
-
-#ifndef CONFIG_MCC_MODE_V2
-	/* IQK value offload */
-	rtw_hal_set_mcc_IQK_offload_cmd(padapter);
-#endif
-
-	/* set mac id to fw */
-	rtw_hal_set_mcc_macid_cmd(padapter);
-#ifdef CONFIG_HW_P0_TSF_SYNC
-	if (dvobj->p0_tsf.sync_port != MAX_HW_PORT ) {
-		/* disable tsf auto sync */
-		RTW_INFO("[MCC] disable HW TSF sync\n");
-		rtw_hal_set_hwreg(padapter, HW_VAR_TSF_AUTO_SYNC, &enable_tsf_auto_sync);
-	} else {
-		RTW_INFO("[MCC] already disable HW TSF sync\n");
-	}
-#endif
-	/* set mcc parameter  */
-	rtw_hal_set_mcc_ctrl_cmd(padapter, _FALSE);
-
-exit:
-	return ret;
-}
-
-static void rtw_hal_set_mcc_stop_setting(PADAPTER padapter, u8 status)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &dvobj->mcc_objpriv;
-	_adapter *iface = NULL;
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	u8 i = 0;
-	/*
-	 * when adapter disconnect, stop mcc mod
-	 * total=0xf means stop mcc mode
-	 */
-
-	switch (status) {
-	default:
-		/* let fw switch to other interface channel */
-		for (i = 0; i < MAX_MCC_NUM; i++) {
-			iface = mccobjpriv->iface[i];
-			if (iface == NULL)
-				continue;
-
-			mccadapriv = &iface->mcc_adapterpriv;
-
-			/* use other interface to set cmd */
-			if (iface != padapter) {
-				rtw_hal_set_mcc_ctrl_cmd(iface, _TRUE);
-				break;
-			}
-		}
-		break;
-	}
-}
-
-static void rtw_hal_mcc_status_hdl(PADAPTER padapter, u8 status)
-{
-	switch (status) {
-	case MCC_SETCMD_STATUS_STOP_DISCONNECT:
-		rtw_hal_clear_mcc_status(padapter, MCC_STATUS_NEED_MCC | MCC_STATUS_DOING_MCC);
-		break;
-	case MCC_SETCMD_STATUS_STOP_SCAN_START:
-		rtw_hal_set_mcc_status(padapter, MCC_STATUS_NEED_MCC);
-		rtw_hal_clear_mcc_status(padapter, MCC_STATUS_DOING_MCC);
-		break;
-
-	case MCC_SETCMD_STATUS_START_CONNECT:
-	case MCC_SETCMD_STATUS_START_SCAN_DONE:
-		rtw_hal_set_mcc_status(padapter, MCC_STATUS_NEED_MCC | MCC_STATUS_DOING_MCC);
-		break;
-	default:
-		RTW_INFO(FUNC_ADPT_FMT" error status(%d)\n", FUNC_ADPT_ARG(padapter), status);
-		break;
-	}
-}
-
-static void rtw_hal_mcc_stop_posthdl(PADAPTER padapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	_adapter *iface = NULL;
-	PHAL_DATA_TYPE hal;
-	u8 i = 0;
-	u8 enable_rx_bar = _FALSE;
-
-	hal = GET_HAL_DATA(padapter);
-
-	for (i = 0; i < MAX_MCC_NUM; i++) {
-		iface = mccobjpriv->iface[i];
-		if (iface == NULL)
-			continue;
-
-		/* release network queue */
-		rtw_netif_wake_queue(iface->pnetdev);
-		mccadapriv = &iface->mcc_adapterpriv;
-		mccadapriv->mcc_tx_bytes_from_kernel = 0;
-		mccadapriv->mcc_last_tx_bytes_from_kernel = 0;
-		mccadapriv->mcc_tx_bytes_to_port = 0;
-
-		if (mccadapriv->role == MCC_ROLE_GO)
-			rtw_hal_mcc_remove_go_p2p_ie(iface);
-
-#ifdef CONFIG_TDLS
-		if (MLME_IS_STA(iface)) {
-			if (mccadapriv->backup_tdls_en) {
-				rtw_enable_tdls_func(iface);
-				RTW_INFO("%s: Disable MCC, Enable TDLS\n", __func__);
-				mccadapriv->backup_tdls_en = _FALSE;
-			}
-		}
-#endif /* CONFIG_TDLS */
-
-		mccadapriv->role = MCC_ROLE_MAX;
-		mccobjpriv->iface[i] = NULL;
-	}
-
-	/* force switch channel */
-	hal->current_channel = 0;
-	hal->current_channel_bw = CHANNEL_WIDTH_MAX;
-	#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-	rtw_hal_mcc_cfg_phydm(padapter, MCC_CFG_PHYDM_STOP, NULL);
-	#endif
-
-#ifdef CONFIG_RTL8822C
-	if (IS_HARDWARE_TYPE_8822C(padapter)) {
-		HAL_DATA_TYPE *hal = GET_HAL_DATA(padapter);
-		struct dm_struct *dm = &hal->odmpriv;
-		
-		odm_cmn_info_update(dm, ODM_CMNINFO_IS_DOWNLOAD_FW, _FALSE);
-	}
-#endif
-}
-
-static void rtw_hal_mcc_start_posthdl(PADAPTER padapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	struct pwrctrl_priv	*pwrpriv = adapter_to_pwrctl(padapter);
-	_adapter *iface = NULL;
-	u8 i = 0, order = 0;
-	u8 enable_rx_bar = _TRUE;
-
-	for (i = 0; i < MAX_MCC_NUM; i++) {
-		iface = mccobjpriv->iface[i];
-		if (iface == NULL)
-			continue;
-
-		mccadapriv = &iface->mcc_adapterpriv;
-		if (mccadapriv->role == MCC_ROLE_MAX)
-			continue;
-		
-		mccadapriv->mcc_tx_bytes_from_kernel = 0;
-		mccadapriv->mcc_last_tx_bytes_from_kernel = 0;
-		mccadapriv->mcc_tx_bytes_to_port = 0;
-
-#ifdef CONFIG_TDLS
-		if (MLME_IS_STA(iface)) {
-			if (rtw_is_tdls_enabled(iface)) {
-				mccadapriv->backup_tdls_en = _TRUE;
-				rtw_disable_tdls_func(iface, _TRUE);
-				RTW_INFO("%s: Enable MCC, Disable TDLS\n", __func__);
-			}
-		}
-#endif /* CONFIG_TDLS */
-	}
-	#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-	rtw_hal_mcc_cfg_phydm(padapter, MCC_CFG_PHYDM_START, NULL);
-	#endif
-}
-
-/*
- * rtw_hal_set_mcc_setting - set mcc setting
- * @padapter: currnet padapter to stop/start MCC
- * @stop: stop mcc or not
- * @return val: 1 for SUCCESS, 0 for fail
- */
-static u8 rtw_hal_set_mcc_setting(PADAPTER padapter, u8 status)
-{
-	u8 ret = _FAIL;
-	struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-	u8 stop = (status < MCC_SETCMD_STATUS_START_CONNECT) ? _TRUE : _FALSE;
-	systime start_time = rtw_get_current_time();
-
-	RTW_INFO("===> "FUNC_ADPT_FMT"\n", FUNC_ADPT_ARG(padapter));
-
-	rtw_sctx_init(&pmccobjpriv->mcc_sctx, MCC_EXPIRE_TIME);
-	pmccobjpriv->mcc_c2h_status = MCC_RPT_MAX;
-
-	if (stop == _FALSE) {
-		/* handle mcc start */
-		if (rtw_hal_set_mcc_start_setting(padapter, status) == _FAIL)
-			goto exit;
-
-		/* wait for C2H */
-		if (!rtw_sctx_wait(&pmccobjpriv->mcc_sctx, __func__))
-			RTW_INFO(FUNC_ADPT_FMT": wait for mcc start C2H time out\n", FUNC_ADPT_ARG(padapter));
-		else
-			ret = _SUCCESS;
-
-		if (ret == _SUCCESS) {
-			RTW_INFO(FUNC_ADPT_FMT": mcc start sucecssfully\n", FUNC_ADPT_ARG(padapter));
-			rtw_hal_mcc_status_hdl(padapter, status);
-			rtw_hal_mcc_start_posthdl(padapter);
-		}
-	} else {
-
-		/* set mcc status to indicate process mcc start setting */
-		rtw_hal_set_mcc_status(padapter, MCC_STATUS_PROCESS_MCC_STOP_SETTING);
-
-		/* handle mcc stop */
-		rtw_hal_set_mcc_stop_setting(padapter, status);
-
-		/* wait for C2H */
-		if (!rtw_sctx_wait(&pmccobjpriv->mcc_sctx, __func__))
-			RTW_INFO(FUNC_ADPT_FMT": wait for mcc stop C2H time out\n", FUNC_ADPT_ARG(padapter));
-		else {
-			ret = _SUCCESS;
-			rtw_hal_mcc_status_hdl(padapter, status);
-			rtw_hal_mcc_stop_posthdl(padapter);
-		}
-	}
-
-exit:
-	/* clear mcc status */
-	rtw_hal_clear_mcc_status(padapter
-		, MCC_STATUS_PROCESS_MCC_START_SETTING | MCC_STATUS_PROCESS_MCC_STOP_SETTING);
-
-	RTW_INFO(FUNC_ADPT_FMT" in %dms <===\n"
-		, FUNC_ADPT_ARG(padapter), rtw_get_passing_time_ms(start_time));
-	return ret;
-}
-
-/**
- * rtw_hal_mcc_check_case_not_limit_traffic - handler flow ctrl for special case
- * @cur_iface: fw stay channel setting of this iface
- * @next_iface: fw will swich channel setting of this iface
- */
-static void rtw_hal_mcc_check_case_not_limit_traffic(PADAPTER cur_iface, PADAPTER next_iface)
-{
-	u8 cur_bw = cur_iface->mlmeextpriv.cur_bwmode;
-	u8 next_bw = next_iface->mlmeextpriv.cur_bwmode;
-
-	/* for both interface are VHT80, doesn't limit_traffic according to iperf results */
-	if (cur_bw == CHANNEL_WIDTH_80 && next_bw == CHANNEL_WIDTH_80) {
-		cur_iface->mcc_adapterpriv.mcc_tp_limit = _FALSE;
-		next_iface->mcc_adapterpriv.mcc_tp_limit = _FALSE;
-	}
-}
-
-
-/**
- * rtw_hal_mcc_sw_ch_fw_notify_hdl - handler flow ctrl
- */
-static void rtw_hal_mcc_sw_ch_fw_notify_hdl(PADAPTER padapter)
-{
-	struct dvobj_priv *pdvobjpriv = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(pdvobjpriv->mcc_objpriv);
-	struct mcc_adapter_priv *cur_mccadapriv = NULL, *next_mccadapriv = NULL;
-	_adapter *iface = NULL, *cur_iface = NULL, *next_iface = NULL;
-	struct registry_priv *preg = &padapter->registrypriv;
-	u8 cur_op_ch = pdvobjpriv->oper_channel;
-	u8 i = 0, iface_num = pdvobjpriv->iface_nums, cur_order = 0, next_order = 0;
-	static u8 cnt = 1;
-	u32 single_tx_cri = preg->rtw_mcc_single_tx_cri;
-
-	for (i = 0; i < iface_num; i++) {
-		iface = pdvobjpriv->padapters[i];
-		if (iface == NULL)
-			continue;
-
-		if (cur_op_ch == iface->mlmeextpriv.cur_channel) {
-			cur_iface = iface;
-			cur_mccadapriv = &cur_iface->mcc_adapterpriv;
-			cur_order = cur_mccadapriv->order;
-			next_order = (cur_order + 1) % iface_num;
-			next_iface = pmccobjpriv->iface[next_order];
-			next_mccadapriv = &next_iface->mcc_adapterpriv;
-			break;
-		}
-	}
-
-	if (cur_iface == NULL || next_iface == NULL) {
-		RTW_ERR("cur_iface=%p,next_iface=%p\n", cur_iface, next_iface);
-		rtw_warn_on(1);
-		return;
-	}
-
-	/* check other interface tx busy traffic or not under every 2 switch channel notify(Mbits/100ms) */
-	if (cnt == 2) {
-		cur_mccadapriv->mcc_tp = (cur_mccadapriv->mcc_tx_bytes_from_kernel
-			- cur_mccadapriv->mcc_last_tx_bytes_from_kernel) * 10 * 8 / 1024 / 1024;
-		cur_mccadapriv->mcc_last_tx_bytes_from_kernel = cur_mccadapriv->mcc_tx_bytes_from_kernel;
-
-		next_mccadapriv->mcc_tp = (next_mccadapriv->mcc_tx_bytes_from_kernel
-			- next_mccadapriv->mcc_last_tx_bytes_from_kernel) * 10 * 8 / 1024 / 1024;
-		next_mccadapriv->mcc_last_tx_bytes_from_kernel = next_mccadapriv->mcc_tx_bytes_from_kernel;
-
-		cnt = 1;
-	} else
-		cnt = 2;
-
-	/* check single TX or cuncurrnet TX */
-	if (next_mccadapriv->mcc_tp < single_tx_cri) {
-		/* single TX, does not stop */
-		cur_mccadapriv->mcc_tx_stop = _FALSE;
-		cur_mccadapriv->mcc_tp_limit = _FALSE;
-	} else {
-		/* concurrent TX, stop */
-		cur_mccadapriv->mcc_tx_stop = _TRUE;
-		cur_mccadapriv->mcc_tp_limit = _TRUE;
-	}
-
-	if (cur_mccadapriv->mcc_tp < single_tx_cri) {
-		next_mccadapriv->mcc_tx_stop  = _FALSE;
-		next_mccadapriv->mcc_tp_limit = _FALSE;
-	} else {
-		next_mccadapriv->mcc_tx_stop = _FALSE;
-		next_mccadapriv->mcc_tp_limit = _TRUE;
-		next_mccadapriv->mcc_tx_bytes_to_port = 0;
-	}
-
-	/* stop current iface kernel queue or not */
-	if (cur_mccadapriv->mcc_tx_stop)
-		rtw_netif_stop_queue(cur_iface->pnetdev);
-	else
-		rtw_netif_wake_queue(cur_iface->pnetdev);
-
-	/* stop next iface kernel queue or not */
-	if (next_mccadapriv->mcc_tx_stop)
-		rtw_netif_stop_queue(next_iface->pnetdev);
-	else
-		rtw_netif_wake_queue(next_iface->pnetdev);
-
-	/* start xmit tasklet */
-	rtw_os_xmit_schedule(next_iface);
-
-	rtw_hal_mcc_check_case_not_limit_traffic(cur_iface, next_iface);
-
-	if (0) {
-		RTW_INFO("order:%d, mcc_tx_stop:%d, mcc_tp:%d\n",
-			cur_mccadapriv->order, cur_mccadapriv->mcc_tx_stop, cur_mccadapriv->mcc_tp);
-		dump_os_queue(0, cur_iface);
-		RTW_INFO("order:%d, mcc_tx_stop:%d, mcc_tp:%d\n",
-			next_mccadapriv->order, next_mccadapriv->mcc_tx_stop, next_mccadapriv->mcc_tp);
-		dump_os_queue(0, next_iface);
-	}
-}
-
-static void rtw_hal_mcc_update_noa_start_time_hdl(PADAPTER padapter, u8 buflen, u8 *tmpBuf)
-{
-	struct dvobj_priv *pdvobjpriv = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(pdvobjpriv->mcc_objpriv);
-	struct mcc_adapter_priv *pmccadapriv = NULL;
-	PADAPTER iface = NULL;
-	u8 i = 0;
-	u8 policy_idx = pmccobjpriv->policy_index;
-	u8 noa_tsf_sync_offset = mcc_switch_channel_policy_table[policy_idx][MCC_TSF_SYNC_OFFSET_IDX];
-	u8 noa_start_time_offset = mcc_switch_channel_policy_table[policy_idx][MCC_START_TIME_OFFSET_IDX];
-	
-	for (i = 0; i < pdvobjpriv->iface_nums; i++) {
-		iface = pdvobjpriv->padapters[i];
-		if (iface == NULL)
-			continue;
-		
-		pmccadapriv = &iface->mcc_adapterpriv;
-		if (pmccadapriv->role == MCC_ROLE_MAX)
-			continue;
-
-		/* GO & channel match */
-		if (pmccadapriv->role == MCC_ROLE_GO) {
-			/* convert GO TBTT from FW to noa_start_time(TU convert to mircosecond) */
-			pmccadapriv->noa_start_time = RTW_GET_LE32(tmpBuf + 2) + noa_start_time_offset * TU;
-
-			if (0) {
-				RTW_INFO("TBTT:0x%02x\n", RTW_GET_LE32(tmpBuf + 2));
-				RTW_INFO("noa_tsf_sync_offset:%d, noa_start_time_offset:%d\n", noa_tsf_sync_offset, noa_start_time_offset);
-				RTW_INFO(FUNC_ADPT_FMT"buf=0x%02x:0x%02x:0x%02x:0x%02x, noa_start_time=0x%02x\n"
-					, FUNC_ADPT_ARG(iface)
-					, tmpBuf[2]
-					, tmpBuf[3]
-					, tmpBuf[4]
-					, tmpBuf[5]
-					,pmccadapriv->noa_start_time);
-				}
-
-			rtw_hal_mcc_update_go_p2p_ie(iface);
-
-			break;
-		}
-	}
-
-}
-
-static u8 mcc_get_reg_hdl(PADAPTER adapter, const u8 *val)
-{
-	struct hal_spec_t *hal_spec = GET_HAL_SPEC(adapter);
-	struct dvobj_priv *dvobj = adapter_to_dvobj(adapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	_adapter *cur_iface = NULL;
-	u8 ret = _SUCCESS;
-	u8 cur_order = 0;
-	#ifdef CONFIG_RTL8822C
-	u16 dbg_reg[DBG_MCC_REG_NUM] = {0x4d4,0x522,0x1d70};
-	#else
-	u16 dbg_reg[DBG_MCC_REG_NUM] = {0x4d4,0x522,0xc50,0xe50};
-	#endif
-	u16 dbg_rf_reg[DBG_MCC_RF_REG_NUM] = {0x18};
-	u8 i;
-	u32 reg_val;
-	u8 path = 0, path_nums = 0;
-
-	if (!rtw_hal_check_mcc_status(adapter, MCC_STATUS_DOING_MCC)) {
-		ret = _FAIL;
-		goto exit;
-	}
-
-	if (!val)
-		cur_order = 0xff;
-	else
-		cur_order = *val;
-
-	if (cur_order >= MAX_MCC_NUM && cur_order != 0xff) {
-		RTW_ERR("%s: cur_order=%d\n", __func__, cur_order);
-		ret = _FAIL;
-		goto exit;
-	}
-
-	path_nums = hal_spec->rf_reg_path_num;
-	if (cur_order == 0xff)
-		cur_iface = adapter;
-	else
-		cur_iface = mccobjpriv->iface[cur_order];
-
-	if (!cur_iface) {
-		RTW_ERR("%s: cur_iface = NULL,  cur_order=%d\n", __func__, cur_order);
-		ret = _FAIL;
-		goto exit;
-	}
-
-	_enter_critical_mutex(&mccobjpriv->mcc_dbg_reg_mutex, NULL);
-	if (!RTW_CANNOT_IO(adapter)) {
-		/* RTW_INFO("=================================\n");
-		RTW_INFO(ADPT_FMT": cur_order:%d\n", ADPT_ARG(cur_iface), cur_order); */
-		
-		for (i = 0; i < ARRAY_SIZE(dbg_reg); i++) {
-			reg_val = rtw_read32(adapter, dbg_reg[i]);
-			mccobjpriv->dbg_reg[i] = dbg_reg[i];
-			mccobjpriv->dbg_reg_val[i] = reg_val;
-			/* RTW_PRINT("REG_%X:0x%08x\n", dbg_reg[i], reg_val); */
-		}
-		for (i = 0; i < ARRAY_SIZE(dbg_rf_reg); i++) {
-			for (path = 0; path < path_nums; path++) {
-				reg_val = rtw_hal_read_rfreg(adapter, path, dbg_rf_reg[i], 0xffffffff);
-				/* RTW_PRINT("RF_PATH_%d_REG_%X:0x%08x\n",
-					path, dbg_rf_reg[i], reg_val); */
-				mccobjpriv->dbg_rf_reg[i] = dbg_rf_reg[i];
-				mccobjpriv->dbg_rf_reg_val[i][path] = reg_val;
-			}
-		}
-	}
-	_exit_critical_mutex(&mccobjpriv->mcc_dbg_reg_mutex, NULL);
-
-exit:
-	return ret;
-}
-
-static u8 mcc_get_reg_cmd(_adapter *adapter, u8 cur_order)
-{
-	struct cmd_obj *cmdobj;
-	struct drvextra_cmd_parm *pdrvextra_cmd_parm;
-	struct cmd_priv *pcmdpriv = &adapter->cmdpriv;
-	u8 *mcc_cur_order = NULL;
-	u8 res = _SUCCESS;
-
-	
-	cmdobj = (struct cmd_obj *)rtw_zmalloc(sizeof(struct cmd_obj));
-	if (cmdobj == NULL) {
-		res = _FAIL;
-		goto exit;
-	}
-
-	pdrvextra_cmd_parm = (struct drvextra_cmd_parm *)rtw_zmalloc(sizeof(struct drvextra_cmd_parm));
-	if (pdrvextra_cmd_parm == NULL) {
-		rtw_mfree((u8 *)cmdobj, sizeof(struct cmd_obj));
-		res = _FAIL;
-		goto exit;
-	}
-
-	mcc_cur_order = rtw_zmalloc(sizeof(u8));
-	if (mcc_cur_order == NULL) {
-		rtw_mfree((u8 *)cmdobj, sizeof(struct cmd_obj));
-		rtw_mfree((u8 *)pdrvextra_cmd_parm, sizeof(struct drvextra_cmd_parm));
-		res = _FAIL;
-		goto exit;
-	}
-
-	pdrvextra_cmd_parm->ec_id = MCC_CMD_WK_CID;
-	pdrvextra_cmd_parm->type = MCC_GET_DBG_REG_WK_CID;
-	pdrvextra_cmd_parm->size = 1;
-	pdrvextra_cmd_parm->pbuf = mcc_cur_order;
-
-	_rtw_memcpy(mcc_cur_order, &cur_order, 1);
-
-	init_h2fwcmd_w_parm_no_rsp(cmdobj, pdrvextra_cmd_parm, CMD_SET_DRV_EXTRA);
-	res = rtw_enqueue_cmd(pcmdpriv, cmdobj);
-
-exit:
-	return res;
-}
-
-static void rtw_hal_mcc_rpt_tsf_hdl(PADAPTER padapter, u8 buflen, u8 *tmpBuf)
-{
-	struct dvobj_priv *dvobjpriv = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-	struct submit_ctx *mcc_tsf_req_sctx = &mccobjpriv->mcc_tsf_req_sctx;
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	_adapter *iface = NULL;
-	u8 order = 0;
-
-	order = mccobjpriv->mcc_tsf_req_sctx_order;
-	iface = mccobjpriv->iface[order];
-	mccadapriv = &iface->mcc_adapterpriv;
-	mccadapriv->tsf = RTW_GET_LE64(tmpBuf + 2);
-
-
-	if (0)
-		RTW_INFO(FUNC_ADPT_FMT" TSF(order:%d):0x%02llx\n", FUNC_ADPT_ARG(iface), mccadapriv->order, mccadapriv->tsf);
-
-	if (mccadapriv->order == (MAX_MCC_NUM - 1))
-		rtw_sctx_done(&mcc_tsf_req_sctx);
-	else
-		mccobjpriv->mcc_tsf_req_sctx_order ++;
-
-}
-
-/**
- * rtw_hal_mcc_c2h_handler - mcc c2h handler
- */
-void rtw_hal_mcc_c2h_handler(PADAPTER padapter, u8 buflen, u8 *tmpBuf)
-{
-	struct dvobj_priv *pdvobjpriv = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-	struct submit_ctx *mcc_sctx = &pmccobjpriv->mcc_sctx;
-	_adapter *cur_adapter = NULL;
-	u8 cur_ch = 0, cur_bw = 0, cur_ch_offset = 0;
-	_irqL irqL;
-
-	/* RTW_INFO("[length]=%d, [C2H data]="MAC_FMT"\n", buflen, MAC_ARG(tmpBuf)); */
-	/* To avoid reg is set, but driver recive c2h to set wrong oper_channel */
-	if (MCC_RPT_STOPMCC == pmccobjpriv->mcc_c2h_status) {
-		RTW_INFO(FUNC_ADPT_FMT" MCC alread stops return\n", FUNC_ADPT_ARG(padapter));
-		return;
-	}
-
-	_enter_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-	pmccobjpriv->mcc_c2h_status = tmpBuf[0];
-	pmccobjpriv->current_order = tmpBuf[1];
-	cur_adapter = pmccobjpriv->iface[pmccobjpriv->current_order];
-	cur_ch = cur_adapter->mlmeextpriv.cur_channel;
-	cur_bw = cur_adapter->mlmeextpriv.cur_bwmode;
-	cur_ch_offset = cur_adapter->mlmeextpriv.cur_ch_offset;
-	rtw_set_oper_ch(cur_adapter, cur_ch);
-	rtw_set_oper_bw(cur_adapter, cur_bw);
-	rtw_set_oper_choffset(cur_adapter, cur_ch_offset);
-	_exit_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-
-	if (0)
-		RTW_INFO("%d,order:%d,TSF:0x%llx\n", tmpBuf[0], tmpBuf[1], RTW_GET_LE64(tmpBuf + 2));
-	
-	switch (pmccobjpriv->mcc_c2h_status) {
-	case MCC_RPT_SUCCESS:
-		_enter_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-		pmccobjpriv->cur_mcc_success_cnt++;
-		rtw_hal_mcc_upadate_chnl_bw(cur_adapter, cur_ch, cur_ch_offset, cur_bw, _FALSE);
-		mcc_get_reg_cmd(padapter, pmccobjpriv->current_order);
-		_exit_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-		break;
-	case MCC_RPT_TXNULL_FAIL:
-		RTW_INFO("[MCC] TXNULL FAIL\n");
-		break;
-	case MCC_RPT_STOPMCC:
-		RTW_INFO("[MCC] MCC stop\n");
-		pmccobjpriv->mcc_c2h_status = MCC_RPT_STOPMCC;
-		rtw_hal_mcc_upadate_chnl_bw(cur_adapter, cur_ch, cur_ch_offset, cur_bw, _TRUE);
-		rtw_sctx_done(&mcc_sctx);
-		break;
-	case MCC_RPT_READY:
-		_enter_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-		/* initialize counter & time */
-		pmccobjpriv->mcc_launch_time = rtw_get_current_time();
-		pmccobjpriv->mcc_c2h_status = MCC_RPT_READY;
-		pmccobjpriv->cur_mcc_success_cnt = 0;
-		pmccobjpriv->prev_mcc_success_cnt = 0;
-		pmccobjpriv->mcc_tolerance_time = MCC_TOLERANCE_TIME;
-		_exit_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-
-		RTW_INFO("[MCC] MCC ready\n");
-		rtw_sctx_done(&mcc_sctx);
-		break;
-	case MCC_RPT_SWICH_CHANNEL_NOTIFY:
-		rtw_hal_mcc_sw_ch_fw_notify_hdl(padapter);
-		break;
-	case MCC_RPT_UPDATE_NOA_START_TIME:
-		rtw_hal_mcc_update_noa_start_time_hdl(padapter, buflen, tmpBuf);
-		break;
-	case MCC_RPT_TSF:
-		_enter_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-		rtw_hal_mcc_rpt_tsf_hdl(padapter, buflen, tmpBuf);
-		_exit_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-		break;
-	default:
-		/* RTW_INFO("[MCC] Other MCC status(%d)\n", pmccobjpriv->mcc_c2h_status); */
-		break;
-	}
-}
-
-void rtw_hal_mcc_update_parameter(PADAPTER padapter, u8 force_update)
-{	
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	u8 cmd[H2C_MCC_TIME_SETTING_LEN] = {0};
-	u8 swchannel_early_time = MCC_SWCH_FW_EARLY_TIME;
-	u8 ap_num = DEV_AP_NUM(dvobj);	
-
-	if (ap_num == 0) {
-		u8 need_update = _FALSE;
-		u8 start_time_offset = 0, interval = 0, duration = 0;
-
-		need_update = rtw_hal_mcc_update_timing_parameters(padapter, force_update);
-
-		if (need_update == _FALSE)
-			return;
-		
-		start_time_offset = mccobjpriv->start_time;
-		interval = mccobjpriv->interval;
-		duration = mccobjpriv->iface[0]->mcc_adapterpriv.mcc_duration;
-
-		SET_H2CCMD_MCC_TIME_SETTING_START_TIME(cmd, start_time_offset);
-		SET_H2CCMD_MCC_TIME_SETTING_INTERVAL(cmd, interval);
-		SET_H2CCMD_MCC_TIME_SETTING_EARLY_SWITCH_RPT(cmd, swchannel_early_time);
-		SET_H2CCMD_MCC_TIME_SETTING_UPDATE(cmd, _TRUE);
-		SET_H2CCMD_MCC_TIME_SETTING_ORDER0_DURATION(cmd, duration);
-	} else {
-		PADAPTER order0_iface = NULL;
-		PADAPTER order1_iface = NULL;
-		u8 policy_idx = mccobjpriv->policy_index;
-		u8 duration = mcc_switch_channel_policy_table[policy_idx][MCC_DURATION_IDX];
-		u8 tsf_sync_offset = mcc_switch_channel_policy_table[policy_idx][MCC_TSF_SYNC_OFFSET_IDX];
-		u8 start_time_offset = mcc_switch_channel_policy_table[policy_idx][MCC_START_TIME_OFFSET_IDX];
-		u8 interval = mcc_switch_channel_policy_table[policy_idx][MCC_INTERVAL_IDX];
-		u8 guard_offset0 = mcc_switch_channel_policy_table[policy_idx][MCC_GUARD_OFFSET0_IDX];
-		u8 guard_offset1 = mcc_switch_channel_policy_table[policy_idx][MCC_GUARD_OFFSET1_IDX];
-		u8 order0_duration = 0;
-		u8 i = 0;
-		enum _hw_port tsf_bsae_port = MAX_HW_PORT;
-		enum _hw_port tsf_sync_port = MAX_HW_PORT;
-
-		RTW_INFO("%s: policy_idx=%d\n", __func__, policy_idx);
-
-		order0_iface = mccobjpriv->iface[0];
-		order1_iface = mccobjpriv->iface[1];
-
-		/* GO/AP is order 0, GC/STA is order 1 */
-		order0_duration = order0_iface->mcc_adapterpriv.mcc_duration = interval - duration;
-		order0_iface->mcc_adapterpriv.mcc_duration = duration;
-
-		tsf_bsae_port = rtw_hal_get_port(order1_iface);
-		tsf_sync_port = rtw_hal_get_port(order0_iface);
-
-		/* update IE */
-		for (i = 0; i < dvobj->iface_nums; i++) {
-			PADAPTER iface = NULL;
-			struct mcc_adapter_priv *mccadapriv = NULL;
-
-			iface = dvobj->padapters[i];
-			if (iface == NULL)
-				continue;
-		
-			mccadapriv = &iface->mcc_adapterpriv;
-			if (mccadapriv->role == MCC_ROLE_MAX)
-				continue;
-			
-			if (mccadapriv->role == MCC_ROLE_GO)
-				rtw_hal_mcc_update_go_p2p_ie(iface);
-		}
-
-		/* update H2C cmd */
-		/* FW set enable */
-		SET_H2CCMD_MCC_TIME_SETTING_FW_EN(cmd, _TRUE);
-		/* TSF Sync offset */
-		SET_H2CCMD_MCC_TIME_SETTING_TSF_SYNC_OFFSET(cmd, tsf_sync_offset);
-		/* start time offset */
-		SET_H2CCMD_MCC_TIME_SETTING_START_TIME(cmd, (start_time_offset + guard_offset0));
-		/* interval */
-		SET_H2CCMD_MCC_TIME_SETTING_INTERVAL(cmd, interval);
-		/* Early time to inform driver by C2H before switch channel */
-		SET_H2CCMD_MCC_TIME_SETTING_EARLY_SWITCH_RPT(cmd, swchannel_early_time);
-		/* Port0 sync from Port1, not support multi-port */
-		SET_H2CCMD_MCC_TIME_SETTING_ORDER_BASE(cmd, tsf_bsae_port);
-		SET_H2CCMD_MCC_TIME_SETTING_ORDER_SYNC(cmd, tsf_sync_port);
-		SET_H2CCMD_MCC_TIME_SETTING_UPDATE(cmd, _TRUE);
-		SET_H2CCMD_MCC_TIME_SETTING_ORDER0_DURATION(cmd, order0_duration);
-	}
-
-	rtw_hal_fill_h2c_cmd(padapter, H2C_MCC_TIME_SETTING, H2C_MCC_TIME_SETTING_LEN, cmd);
-}
-
-/**
- * rtw_hal_mcc_sw_status_check - check mcc swich channel status
- * @padapter: primary adapter
- */
-void rtw_hal_mcc_sw_status_check(PADAPTER padapter)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-	struct pwrctrl_priv	*pwrpriv = dvobj_to_pwrctl(dvobj);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	_adapter *iface = NULL;
-	u8 cur_cnt = 0, prev_cnt = 0, diff_cnt = 0, check_ret = _FAIL, threshold = 0;
-	u8 policy_idx = pmccobjpriv->policy_index;
-	u8 noa_enable = _FALSE;
-	u8 i = 0;
-	_irqL irqL;
-	u8 ap_num = DEV_AP_NUM(dvobj);	
-
-/* #define MCC_RESTART 1 */
-
-	if (!MCC_EN(padapter))
-		return;
-
-	_enter_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-
-	if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC)) {
-
-		/* check noa enable or not */
-		for (i = 0; i < dvobj->iface_nums; i++) {
-			iface = dvobj->padapters[i];
-			if (iface == NULL)
-				continue;
-
-			mccadapriv = &iface->mcc_adapterpriv;
-			if (mccadapriv->role == MCC_ROLE_MAX)
-				continue;
-			
-			if (iface->wdinfo.p2p_ps_mode == P2P_PS_NOA) {
-				noa_enable = _TRUE;
-				break;
-			}
-		}		
-
-		if (!noa_enable && ap_num == 0)
-			rtw_hal_mcc_update_parameter(padapter, _FALSE);
-
-		threshold = pmccobjpriv->mcc_stop_threshold;
-
-		if (pwrpriv->pwr_mode != PS_MODE_ACTIVE) {
-			rtw_warn_on(1);
-			RTW_INFO("PS mode is not active under mcc, force exit ps mode\n");
-			LeaveAllPowerSaveModeDirect(padapter);
-		}
-
-		if (rtw_get_passing_time_ms(pmccobjpriv->mcc_launch_time) > 2000) {
-			_enter_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-
-			cur_cnt = pmccobjpriv->cur_mcc_success_cnt;
-			prev_cnt = pmccobjpriv->prev_mcc_success_cnt;
-			if (cur_cnt < prev_cnt)
-				diff_cnt = (cur_cnt + 255) - prev_cnt;
-			else
-				diff_cnt = cur_cnt - prev_cnt;
-
-			if (diff_cnt < threshold) {
-				pmccobjpriv->mcc_tolerance_time--;
-				RTW_INFO("%s: diff_cnt:%d, tolerance_time:%d\n",
-					__func__, diff_cnt, pmccobjpriv->mcc_tolerance_time);
-			} else
-				pmccobjpriv->mcc_tolerance_time = MCC_TOLERANCE_TIME;
-
-			pmccobjpriv->prev_mcc_success_cnt = pmccobjpriv->cur_mcc_success_cnt;
-
-			if (pmccobjpriv->mcc_tolerance_time != 0)
-				check_ret = _SUCCESS;
-
-			_exit_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-
-			if (check_ret != _SUCCESS) {
-				RTW_INFO("============ MCC swich channel check fail (%d)=============\n", diff_cnt);
-				/* restart MCC */
-				#ifdef MCC_RESTART
-					rtw_hal_set_mcc_setting(padapter, MCC_SETCMD_STATUS_STOP_DISCONNECT);
-					rtw_hal_set_mcc_setting(padapter, MCC_SETCMD_STATUS_START_CONNECT);
-				#endif /* MCC_RESTART */
-			}
-		} else {
-			_enter_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-			pmccobjpriv->prev_mcc_success_cnt = pmccobjpriv->cur_mcc_success_cnt;
-			_exit_critical_bh(&pmccobjpriv->mcc_lock, &irqL);
-		}
-
-	}
-	_exit_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-}
-
-/**
- * rtw_hal_mcc_change_scan_flag - change scan flag under mcc
- *
- * MCC mode under sitesurvey goto AP channel to tx bcn & data
- * MCC mode under sitesurvey doesn't support TX data for station mode (FW not support)
- *
- * @padapter: the adapter to be change scan flag
- * @ch: pointer to rerurn ch
- * @bw: pointer to rerurn bw
- * @offset: pointer to rerurn offset
- */
-u8 rtw_hal_mcc_change_scan_flag(PADAPTER padapter, u8 *ch, u8 *bw, u8 *offset)
-{
-	u8 need_ch_setting_union = _TRUE, i = 0, flags = 0, back_op = _FALSE;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	struct mlme_ext_priv *mlmeext = NULL;
-	_adapter *iface = NULL;
-
-	if (!MCC_EN(padapter))
-		goto exit;
-
-	if (!rtw_hal_check_mcc_status(padapter, MCC_STATUS_NEED_MCC))
-		goto exit;
-
-	/* disable PS_ANNC & TX_RESUME for all interface */
-	/* ToDo: TX_RESUME by interface in SCAN_BACKING_OP */
-	mlmeext = &padapter->mlmeextpriv;
-	
-	flags = mlmeext_scan_backop_flags(mlmeext);
-	if (mlmeext_chk_scan_backop_flags(mlmeext, SS_BACKOP_PS_ANNC))
-		flags &= ~SS_BACKOP_PS_ANNC;
-
-	if (mlmeext_chk_scan_backop_flags(mlmeext, SS_BACKOP_TX_RESUME))
-		flags &= ~SS_BACKOP_TX_RESUME;
-
-	mlmeext_assign_scan_backop_flags(mlmeext, flags);
-
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-		if (!iface)
-			continue;
-
-		mlmeext = &iface->mlmeextpriv;
-
-		if (MLME_IS_GO(iface) || MLME_IS_AP(iface))
-			back_op = _TRUE;
-		else if (MLME_IS_GC(iface) && (iface != padapter))
-			/* switch to another linked interface(GO) to receive beacon to avoid no beacon disconnect */
-			back_op = _TRUE;
-		else if (MLME_IS_STA(iface) && MLME_IS_ASOC(iface) && (iface != padapter))
-			/* switch to another linked interface(STA) to receive beacon to avoid no beacon disconnect  */
-			back_op = _TRUE;
-		else {
-			/* bypass non-linked/non-linking interface/scan interface */
-			continue;
-		}
-		
-		if (back_op) {
-			*ch = mlmeext->cur_channel;
-			*bw = mlmeext->cur_bwmode;
-			*offset = mlmeext->cur_ch_offset;
-			need_ch_setting_union = _FALSE;
-		}
-	}
-exit:
-	return need_ch_setting_union;
-}
-
-/**
- * rtw_hal_mcc_calc_tx_bytes_from_kernel - calculte tx bytes from kernel to check concurrent tx or not
- * @padapter: the adapter to be record tx bytes
- * @len: data len
- */
-inline void rtw_hal_mcc_calc_tx_bytes_from_kernel(PADAPTER padapter, u32 len)
-{
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-
-	if (MCC_EN(padapter)) {
-		if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC)) {
-			pmccadapriv->mcc_tx_bytes_from_kernel += len;
-			if (0)
-				RTW_INFO("%s(order:%d): mcc tx bytes from kernel:%lld\n"
-					, __func__, pmccadapriv->order, pmccadapriv->mcc_tx_bytes_from_kernel);
-		}
-	}
-}
-
-/**
- * rtw_hal_mcc_calc_tx_bytes_to_port - calculte tx bytes to write port in order to flow crtl
- * @padapter: the adapter to be record tx bytes
- * @len: data len
- */
-inline void rtw_hal_mcc_calc_tx_bytes_to_port(PADAPTER padapter, u32 len)
-{
-	if (MCC_EN(padapter)) {
-		struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-		struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-
-		if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC)) {
-			pmccadapriv->mcc_tx_bytes_to_port += len;
-			if (0)
-				RTW_INFO("%s(order:%d): mcc tx bytes to port:%d, mcc target tx bytes to port:%d\n"
-					, __func__, pmccadapriv->order, pmccadapriv->mcc_tx_bytes_to_port
-					, pmccadapriv->mcc_target_tx_bytes_to_port);
-		}
-	}
-}
-
-/**
- * rtw_hal_mcc_stop_tx_bytes_to_port - stop write port to hw or not
- * @padapter: the adapter to be stopped
- */
-inline u8 rtw_hal_mcc_stop_tx_bytes_to_port(PADAPTER padapter)
-{
-	if (MCC_EN(padapter)) {
-		struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-		struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-
-		if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC)) {
-			if (pmccadapriv->mcc_tp_limit) {
-				if (pmccadapriv->mcc_tx_bytes_to_port >= pmccadapriv->mcc_target_tx_bytes_to_port) {
-					pmccadapriv->mcc_tx_stop = _TRUE;
-					rtw_netif_stop_queue(padapter->pnetdev);
-					return _TRUE;
-				}
-			}
-		}
-	}
-
-	return _FALSE;
-}
-
-static void rtw_hal_mcc_assign_scan_flag(PADAPTER padapter, u8 scan_done)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	_adapter *iface = NULL;
-	struct mlme_ext_priv *pmlmeext = NULL;
-	u8 i = 0, flags;
-
-	if (!MCC_EN(padapter))
-		return;
-
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-		if (iface == NULL)
-			continue;
-
-		mccadapriv = &iface->mcc_adapterpriv;
-		if (mccadapriv->role == MCC_ROLE_MAX)
-			continue;
-
-		pmlmeext = &iface->mlmeextpriv;
-		if (is_client_associated_to_ap(iface)) {
-			flags = mlmeext_scan_backop_flags_sta(pmlmeext);
-			if (scan_done) {
-				if (mlmeext_chk_scan_backop_flags_sta(pmlmeext, SS_BACKOP_EN)) {
-					flags &= ~SS_BACKOP_EN;
-					mlmeext_assign_scan_backop_flags_sta(pmlmeext, flags);
-				}
-			} else {
-				if (!mlmeext_chk_scan_backop_flags_sta(pmlmeext, SS_BACKOP_EN)) {
-					flags |= SS_BACKOP_EN;
-					mlmeext_assign_scan_backop_flags_sta(pmlmeext, flags);
-				}
-			}
-
-		}
-	}
-}
-
-/**
- * rtw_hal_set_mcc_setting_scan_start - setting mcc under scan start
- * @padapter: the adapter to be setted
- * @ch_setting_changed: softap channel setting to be changed or not
- */
-u8 rtw_hal_set_mcc_setting_scan_start(PADAPTER padapter)
-{
-	u8 ret = _FAIL;
-
-	if (MCC_EN(padapter)) {
-		struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-
-		_enter_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-		if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_NEED_MCC)) {
-			if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC)) {
-				ret = rtw_hal_set_mcc_setting(padapter,  MCC_SETCMD_STATUS_STOP_SCAN_START);
-				rtw_hal_mcc_assign_scan_flag(padapter, 0);
-			}
-		}
-		_exit_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-	}
-
-	return ret;
-}
-
-/**
- * rtw_hal_set_mcc_setting_scan_complete - setting mcc after scan commplete
- * @padapter: the adapter to be setted
- * @ch_setting_changed: softap channel setting to be changed or not
- */
-u8 rtw_hal_set_mcc_setting_scan_complete(PADAPTER padapter)
-{
-	u8 ret = _FAIL;
-
-	if (MCC_EN(padapter)) {
-		struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-
-		_enter_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-
-		if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_NEED_MCC)) {
-				rtw_hal_mcc_assign_scan_flag(padapter, 1);
-				ret = rtw_hal_set_mcc_setting(padapter,  MCC_SETCMD_STATUS_START_SCAN_DONE);	
-		}
-		_exit_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-	}
-
-	return ret;
-}
-
-
-/**
- * rtw_hal_set_mcc_setting_start_bss_network - setting mcc under softap start
- * @padapter: the adapter to be setted
- * @chbw_grouped: channel bw offset can not be allowed or not
- */
-u8 rtw_hal_set_mcc_setting_start_bss_network(PADAPTER padapter, u8 chbw_allow)
-{
-	u8 ret = _FAIL;
-
-	if (MCC_EN(padapter)) {
-		/* channel bw offset can not be allowed, start MCC */
-		if (chbw_allow == _FALSE) {
-			struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-
-			//rtw_hal_mcc_restore_iqk_val(padapter);
-			_enter_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-			ret = rtw_hal_set_mcc_setting(padapter, MCC_SETCMD_STATUS_START_CONNECT);
-			_exit_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-
-			if (ret == _FAIL) { /* MCC Start fail, AP/GO switch to buddy's channel */
-				u8 ch_to_set = 0, bw_to_set, offset_to_set;
-
-				rtw_hal_set_mcc_status(padapter, MCC_STATUS_NEED_MCC | MCC_STATUS_DOING_MCC);
-				rtw_hal_set_mcc_setting_disconnect(padapter);
-				if (rtw_mi_get_ch_setting_union_no_self(
-						padapter, &ch_to_set, &bw_to_set,
-						&offset_to_set) != 0) {
-					PHAL_DATA_TYPE  hal = GET_HAL_DATA(padapter);
-					u8 doiqk = _TRUE;
-
-					rtw_hal_set_hwreg(padapter, HW_VAR_DO_IQK, &doiqk);
-					hal->current_channel = 0;
-					hal->current_channel_bw = CHANNEL_WIDTH_MAX;
-					set_channel_bwmode(padapter, ch_to_set, offset_to_set, bw_to_set);
-					doiqk = _FALSE;
-					rtw_hal_set_hwreg(padapter, HW_VAR_DO_IQK, &doiqk);
-				}
-			}
-		}
-	}
-
-	return ret;
-}
-
-/**
- * rtw_hal_set_mcc_setting_disconnect - setting mcc under mlme disconnect(stop softap/disconnect from AP)
- * @padapter: the adapter to be setted
- */
-u8 rtw_hal_set_mcc_setting_disconnect(PADAPTER padapter)
-{
-	u8 ret = _FAIL;
-
-	if (MCC_EN(padapter)) {
-		struct mcc_obj_priv *pmccobjpriv = &(adapter_to_dvobj(padapter)->mcc_objpriv);
-
-		_enter_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-		if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_NEED_MCC)) {
-			if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC))
-				ret = rtw_hal_set_mcc_setting(padapter,  MCC_SETCMD_STATUS_STOP_DISCONNECT);
-		}
-		_exit_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-	}
-
-	return ret;
-}
-
-/**
- * rtw_hal_set_mcc_setting_join_done_chk_ch - setting mcc under join done
- * @padapter: the adapter to be checked
- */
-u8 rtw_hal_set_mcc_setting_join_done_chk_ch(PADAPTER padapter)
-{
-	u8 ret = _FAIL;
-
-	if (MCC_EN(padapter)) {
-		struct mi_state mstate;
-
-		rtw_mi_status_no_self(padapter, &mstate);
-
-		if (MSTATE_STA_LD_NUM(&mstate) || MSTATE_STA_LG_NUM(&mstate) || MSTATE_AP_NUM(&mstate)) {
-			bool chbw_allow = _TRUE;
-			u8 u_ch, u_offset, u_bw;
-			struct mlme_ext_priv *cur_mlmeext = &padapter->mlmeextpriv;
-			struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-
-			if (rtw_mi_get_ch_setting_union_no_self(padapter, &u_ch, &u_bw, &u_offset) <= 0) {
-				dump_adapters_status(RTW_DBGDUMP , dvobj);
-				rtw_warn_on(1);
-			}
-
-			RTW_INFO(FUNC_ADPT_FMT" union no self: %u,%u,%u\n"
-				, FUNC_ADPT_ARG(padapter), u_ch, u_bw, u_offset);
-
-			/* chbw_allow? */
-			chbw_allow = rtw_is_chbw_grouped(cur_mlmeext->cur_channel
-				, cur_mlmeext->cur_bwmode, cur_mlmeext->cur_ch_offset
-					, u_ch, u_bw, u_offset);
-
-			RTW_INFO(FUNC_ADPT_FMT" chbw_allow:%d\n"
-				, FUNC_ADPT_ARG(padapter), chbw_allow);
-
-			/* if chbw_allow = false, start MCC setting */
-			if (chbw_allow == _FALSE) {
-				struct mcc_obj_priv *pmccobjpriv = &dvobj->mcc_objpriv;
-
-				rtw_hal_mcc_restore_iqk_val(padapter);
-				_enter_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-				ret = rtw_hal_set_mcc_setting(padapter, MCC_SETCMD_STATUS_START_CONNECT);
-				_exit_critical_mutex(&pmccobjpriv->mcc_mutex, NULL);
-
-				if (ret == _FAIL) { /* MCC Start Fail, then disconenct client join */
-					rtw_hal_set_mcc_status(padapter, MCC_STATUS_NEED_MCC | MCC_STATUS_DOING_MCC);
-					rtw_disassoc_cmd(padapter, 0, RTW_CMDF_DIRECTLY);
-					rtw_indicate_disconnect(padapter, 0, _FALSE);
-					rtw_free_assoc_resources(padapter, _TRUE);
-					rtw_free_network_queue(padapter, _TRUE);
-				}
-			}
-		}
-	}
-
-	return ret;
-}
-
-/**
- * rtw_hal_set_mcc_setting_chk_start_clnt_join - check change channel under start clnt join
- * @padapter: the adapter to be checked
- * @ch: pointer to rerurn ch
- * @bw: pointer to rerurn bw
- * @offset: pointer to rerurn offset
- * @chbw_allow: allow to use adapter's channel setting
- */
-u8 rtw_hal_set_mcc_setting_chk_start_clnt_join(PADAPTER padapter, u8 *ch, u8 *bw, u8 *offset, u8 chbw_allow)
-{
-	u8 ret = _FAIL;
-
-	/* if chbw_allow = false under en_mcc = TRUE, we do not change channel related setting  */
-	if (MCC_EN(padapter)) {
-		/* restore union channel related setting to current channel related setting */
-		if (chbw_allow == _FALSE) {
-			struct mlme_ext_priv *pmlmeext = &padapter->mlmeextpriv;
-
-			/* issue null data to other interface connected to AP */
-			rtw_hal_mcc_issue_null_data(padapter, chbw_allow, _TRUE);
-
-			*ch = pmlmeext->cur_channel;
-			*bw = pmlmeext->cur_bwmode;
-			*offset = pmlmeext->cur_ch_offset;
-
-			RTW_INFO(FUNC_ADPT_FMT" en_mcc:%d(%d,%d,%d,)\n"
-				, FUNC_ADPT_ARG(padapter), MCC_EN(padapter)
-				, *ch, *bw, *offset);
-			ret = _SUCCESS;
-		}
-	}
-
-	return ret;
-}
-
-static void rtw_hal_mcc_dump_noa_content(void *sel, PADAPTER padapter)
-{
-	struct mcc_adapter_priv *pmccadapriv = NULL;
-	u8 *pos = NULL;
-	pmccadapriv = &padapter->mcc_adapterpriv;
-	/* last position for NoA attribute */
-	pos = pmccadapriv->p2p_go_noa_ie + pmccadapriv->p2p_go_noa_ie_len;
-
-
-	RTW_PRINT_SEL(sel, "\nStart to dump NoA Content\n");
-	RTW_PRINT_SEL(sel, "NoA Counts:%d\n", *(pos - 13));
-	RTW_PRINT_SEL(sel, "NoA Duration(TU):%d\n", (RTW_GET_LE32(pos - 12))/TU);
-	RTW_PRINT_SEL(sel, "NoA Interval(TU):%d\n", (RTW_GET_LE32(pos - 8))/TU);
-	RTW_PRINT_SEL(sel, "NoA Start time(microseconds):0x%02x\n", RTW_GET_LE32(pos - 4));
-	RTW_PRINT_SEL(sel, "End to dump NoA Content\n");
-}
-
-static void mcc_dump_dbg_reg(void *sel, _adapter *adapter)
-{
-	struct mcc_obj_priv *mccobjpriv = adapter_to_mccobjpriv(adapter);
-	struct hal_spec_t *hal_spec = GET_HAL_SPEC(adapter);
-	u8 i,j;
-	_irqL irqL;
-
-	_enter_critical_bh(&mccobjpriv->mcc_lock, &irqL);
-	RTW_PRINT_SEL(sel, "current order=%d\n", mccobjpriv->current_order);
-	_exit_critical_bh(&mccobjpriv->mcc_lock, &irqL);
-
-	_enter_critical_mutex(&mccobjpriv->mcc_dbg_reg_mutex, NULL);
-	for (i = 0; i < ARRAY_SIZE(mccobjpriv->dbg_reg); i++)
-			RTW_PRINT_SEL(sel, "REG_0x%X:0x%08x\n", mccobjpriv->dbg_reg[i], mccobjpriv->dbg_reg_val[i]);
-
-	for (i = 0; i < ARRAY_SIZE(mccobjpriv->dbg_rf_reg); i++) {
-		for (j = 0; j < hal_spec->rf_reg_path_num; j++)
-			RTW_PRINT_SEL(sel, "RF_PATH_%d_REG_0x%X:0x%08x\n",
-				j, mccobjpriv->dbg_rf_reg[i], mccobjpriv->dbg_rf_reg_val[i][j]);
-	}
-	_exit_critical_mutex(&mccobjpriv->mcc_dbg_reg_mutex, NULL);
-}
-
-
-void rtw_hal_dump_mcc_info(void *sel, struct dvobj_priv *dvobj)
-{
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	struct mcc_adapter_priv *mccadapriv = NULL;
-	_adapter *iface = NULL, *pri_adapter = NULL;
-	struct registry_priv *regpriv = NULL;
-	HAL_DATA_TYPE *hal = NULL;
-	u8 i = 0, j = 0;
-	u64 tsf[MAX_MCC_NUM] = {0};
-
-	/* regpriv is common for all adapter */
-	pri_adapter = dvobj_get_primary_adapter(dvobj);
-	hal = GET_HAL_DATA(pri_adapter);
-
-	RTW_PRINT_SEL(sel, "**********************************************\n");
-	RTW_PRINT_SEL(sel, "en_mcc:%d\n", MCC_EN(pri_adapter));
-	RTW_PRINT_SEL(sel, "primary adapter("ADPT_FMT") duration:%d%c\n",
-		ADPT_ARG(dvobj_get_primary_adapter(dvobj)), mccobjpriv->duration, 37);
-	RTW_PRINT_SEL(sel, "runtime duration:%s\n", mccobjpriv->enable_runtime_duration ? "enable":"disable");
-	RTW_PRINT_SEL(sel, "phydm offload:%s\n", mccobjpriv->mcc_phydm_offload ? "enable":"disable");
-
-	if (rtw_hal_check_mcc_status(pri_adapter, MCC_STATUS_DOING_MCC)) {
-		rtw_hal_mcc_rqt_tsf(pri_adapter, tsf);
-
-		for (i = 0; i < MAX_MCC_NUM; i++) {
-			iface = mccobjpriv->iface[i];
-			if (!iface)
-				continue;
-
-			regpriv = &iface->registrypriv;
-			mccadapriv = &iface->mcc_adapterpriv;
-
-			if (mccadapriv) {
-				u8 p2p_ps_mode = iface->wdinfo.p2p_ps_mode;
-
-				RTW_PRINT_SEL(sel, "adapter mcc info:\n");
-				RTW_PRINT_SEL(sel, "ifname:%s\n", ADPT_ARG(iface));
-				RTW_PRINT_SEL(sel, "order:%d\n", mccadapriv->order);
-				RTW_PRINT_SEL(sel, "duration:%d\n", mccadapriv->mcc_duration);
-				RTW_PRINT_SEL(sel, "target tx bytes:%d\n", mccadapriv->mcc_target_tx_bytes_to_port);
-				RTW_PRINT_SEL(sel, "current TP:%d\n", mccadapriv->mcc_tp);
-				RTW_PRINT_SEL(sel, "mgmt queue macid:%d\n", mccadapriv->mgmt_queue_macid);
-				RTW_PRINT_SEL(sel, "macid bitmap:0x%02x\n", mccadapriv->mcc_macid_bitmap);
-				RTW_PRINT_SEL(sel, "P2P NoA:%s\n\n", p2p_ps_mode == P2P_PS_NOA ? "enable":"disable");
-				RTW_PRINT_SEL(sel, "registry data:\n");
-				RTW_PRINT_SEL(sel, "ap target tx TP(BW:20M):%d Mbps\n", regpriv->rtw_mcc_ap_bw20_target_tx_tp);
-				RTW_PRINT_SEL(sel, "ap target tx TP(BW:40M):%d Mbps\n", regpriv->rtw_mcc_ap_bw40_target_tx_tp);
-				RTW_PRINT_SEL(sel, "ap target tx TP(BW:80M):%d Mbps\n", regpriv->rtw_mcc_ap_bw80_target_tx_tp);
-				RTW_PRINT_SEL(sel, "sta target tx TP(BW:20M):%d Mbps\n", regpriv->rtw_mcc_sta_bw20_target_tx_tp);
-				RTW_PRINT_SEL(sel, "sta target tx TP(BW:40M ):%d Mbps\n", regpriv->rtw_mcc_sta_bw40_target_tx_tp);
-				RTW_PRINT_SEL(sel, "sta target tx TP(BW:80M):%d Mbps\n", regpriv->rtw_mcc_sta_bw80_target_tx_tp);
-				RTW_PRINT_SEL(sel, "single tx criteria:%d Mbps\n", regpriv->rtw_mcc_single_tx_cri);
-				RTW_PRINT_SEL(sel, "HW TSF=0x%llx\n", tsf[mccadapriv->order]);
-				if (MLME_IS_GO(iface))
-					rtw_hal_mcc_dump_noa_content(sel, iface);
-				RTW_PRINT_SEL(sel, "**********************************************\n");
-			}
-		}
-
-		mcc_dump_dbg_reg(sel, pri_adapter);
-	}
-
-	#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-	RTW_PRINT_SEL(sel, "@@@@@@@@@@@@@@@@@@@@\n");
-	rtw_hal_mcc_cfg_phydm(pri_adapter, MCC_CFG_PHYDM_DUMP, sel);
-	RTW_PRINT_SEL(sel, "@@@@@@@@@@@@@@@@@@@@\n");
-	#endif
-	
-	RTW_PRINT_SEL(sel, "------------------------------------------\n");
-	RTW_PRINT_SEL(sel, "policy index:%d\n", mccobjpriv->policy_index);	
-	RTW_PRINT_SEL(sel, "------------------------------------------\n");
-	RTW_PRINT_SEL(sel, "define data:\n");
-	RTW_PRINT_SEL(sel, "ap target tx TP(BW:20M):%d Mbps\n", MCC_AP_BW20_TARGET_TX_TP);
-	RTW_PRINT_SEL(sel, "ap target tx TP(BW:40M):%d Mbps\n", MCC_AP_BW40_TARGET_TX_TP);
-	RTW_PRINT_SEL(sel, "ap target tx TP(BW:80M):%d Mbps\n", MCC_AP_BW80_TARGET_TX_TP);
-	RTW_PRINT_SEL(sel, "sta target tx TP(BW:20M):%d Mbps\n", MCC_STA_BW20_TARGET_TX_TP);
-	RTW_PRINT_SEL(sel, "sta target tx TP(BW:40M):%d Mbps\n", MCC_STA_BW40_TARGET_TX_TP);
-	RTW_PRINT_SEL(sel, "sta target tx TP(BW:80M):%d Mbps\n", MCC_STA_BW80_TARGET_TX_TP);
-	RTW_PRINT_SEL(sel, "single tx criteria:%d Mbps\n", MCC_SINGLE_TX_CRITERIA);
-	RTW_PRINT_SEL(sel, "------------------------------------------\n");
-}
-
-inline void update_mcc_mgntframe_attrib(_adapter *padapter, struct pkt_attrib *pattrib)
-{
-	if (MCC_EN(padapter)) {
-		if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC)) {
-			/* use QSLT_MGNT to check mgnt queue or bcn queue */
-			if (pattrib->qsel == QSLT_MGNT) {
-				pattrib->mac_id = padapter->mcc_adapterpriv.mgmt_queue_macid;
-				pattrib->qsel = QSLT_VO;
-			}
-		}
-	}
-}
-
-inline u8 rtw_hal_mcc_link_status_chk(_adapter *padapter, const char *msg)
-{
-	u8 ret = _TRUE, i = 0;
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	_adapter *iface;
-	struct mlme_ext_priv *mlmeext;
-
-	if (MCC_EN(padapter)) {
-		if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_NEED_MCC)) {
-			for (i = 0; i < dvobj->iface_nums; i++) {
-				iface = dvobj->padapters[i];
-				mlmeext = &iface->mlmeextpriv;
-				if (mlmeext_scan_state(mlmeext) != SCAN_DISABLE) {
-					#ifdef DBG_EXPIRATION_CHK
-						RTW_INFO(FUNC_ADPT_FMT" don't enter %s under scan for MCC mode\n", FUNC_ADPT_ARG(padapter), msg);
-					#endif
-					ret = _FALSE;
-					goto exit;
-				}
-			}
-		}
-	}
-
-exit:
-	return ret;
-}
-
-void rtw_hal_mcc_issue_null_data(_adapter *padapter, u8 chbw_allow, u8 ps_mode)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	_adapter *iface = NULL;
-	systime start = rtw_get_current_time();
-	u8 i = 0;
-
-	if (!MCC_EN(padapter))
-		return;
-
-	if (rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC))
-		return;
-
-	if (chbw_allow == _TRUE)
-		return;
-
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-		/* issue null data to inform ap station will leave */
-		if (is_client_associated_to_ap(iface)) {
-			struct mlme_ext_priv *mlmeext = &iface->mlmeextpriv;
-			struct mlme_ext_info *mlmeextinfo = &mlmeext->mlmext_info;
-			u8 ch = mlmeext->cur_channel;
-			u8 bw = mlmeext->cur_bwmode;
-			u8 offset = mlmeext->cur_ch_offset;
-			struct sta_info *sta = rtw_get_stainfo(&iface->stapriv, get_my_bssid(&(mlmeextinfo->network)));
-
-			if (!sta)
-				continue;
-
-			set_channel_bwmode(iface, ch, offset, bw);
-
-			if (ps_mode)
-				rtw_hal_macid_sleep(iface, sta->cmn.mac_id);
-			else
-				rtw_hal_macid_wakeup(iface, sta->cmn.mac_id);
-
-			issue_nulldata(iface, NULL, ps_mode, 3, 50);
-		}
-	}
-	RTW_INFO("%s(%d ms)\n", __func__, rtw_get_passing_time_ms(start));
-}
-
-u8 *rtw_hal_mcc_append_go_p2p_ie(PADAPTER padapter, u8 *pframe, u32 *len)
-{
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-
-	if (!MCC_EN(padapter))
-		return pframe;
-	
-	if (!rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC))
-		return pframe;
-
-	if (pmccadapriv->p2p_go_noa_ie_len == 0)
-		return pframe;
-
-	_rtw_memcpy(pframe, pmccadapriv->p2p_go_noa_ie, pmccadapriv->p2p_go_noa_ie_len);
-	*len = *len + pmccadapriv->p2p_go_noa_ie_len;
-
-	return pframe + pmccadapriv->p2p_go_noa_ie_len;
-}
-
-void rtw_hal_dump_mcc_policy_table(void *sel)
-{
-	u8 idx = 0;
-	RTW_PRINT_SEL(sel, "duration\t,tsf sync offset\t,start time offset\t,interval\t,guard offset0\t,guard offset1\n");
-
-	for (idx = 0; idx < mcc_max_policy_num; idx ++) {
-		RTW_PRINT_SEL(sel, "%d\t\t,%d\t\t\t,%d\t\t\t,%d\t\t,%d\t\t,%d\n"
-			, mcc_switch_channel_policy_table[idx][MCC_DURATION_IDX]
-			, mcc_switch_channel_policy_table[idx][MCC_TSF_SYNC_OFFSET_IDX]
-			, mcc_switch_channel_policy_table[idx][MCC_START_TIME_OFFSET_IDX]
-			, mcc_switch_channel_policy_table[idx][MCC_INTERVAL_IDX]
-			, mcc_switch_channel_policy_table[idx][MCC_GUARD_OFFSET0_IDX]
-			, mcc_switch_channel_policy_table[idx][MCC_GUARD_OFFSET1_IDX]);
-	}
-}
-
-void rtw_hal_mcc_update_macid_bitmap(PADAPTER padapter, int mac_id, u8 add)
-{
-	struct mcc_adapter_priv *pmccadapriv = &padapter->mcc_adapterpriv;
-
-	if (!MCC_EN(padapter))
-		return;
-
-	if (!rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC))
-		return;
-
-	if (pmccadapriv->role == MCC_ROLE_GC || pmccadapriv->role == MCC_ROLE_STA)
-		return;
-
-	if (mac_id < 0) {
-		RTW_WARN("%s: mac_id < 0(%d)\n", __func__, mac_id);
-		return;
-	}
-
-	RTW_INFO(ADPT_FMT" %s macid=%d, ori mcc_macid_bitmap=0x%08x\n"
-		, ADPT_ARG(padapter), add ? "add" : "clear"
-		, mac_id, pmccadapriv->mcc_macid_bitmap);
-
-	if (add) {
-		#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-		rtw_hal_mcc_cfg_phydm(padapter, MCC_CFG_PHYDM_ADD_CLIENT, &mac_id);
-		#endif
-		pmccadapriv->mcc_macid_bitmap |= BIT(mac_id);
-	} else {
-		#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-		rtw_hal_mcc_cfg_phydm(padapter, MCC_CFG_PHYDM_REMOVE_CLIENT, &mac_id);
-		#endif
-		pmccadapriv->mcc_macid_bitmap &= ~(BIT(mac_id));
-	}
-	rtw_hal_set_mcc_macid_cmd(padapter);
-}
-
-void rtw_hal_mcc_process_noa(PADAPTER padapter)
-{
-	struct wifidirect_info *pwdinfo = &(padapter->wdinfo);
-	struct dvobj_priv *dvobj = adapter_to_dvobj(padapter);
-	struct mcc_obj_priv *pmccobjpriv = &(dvobj->mcc_objpriv);
-
-	if (!MCC_EN(padapter))
-		return;
-
-	if (!rtw_hal_check_mcc_status(padapter, MCC_STATUS_DOING_MCC))
-		return;
-
-	if (!MLME_IS_GC(padapter))
-		return;
-
-	switch(pwdinfo->p2p_ps_mode) {
-	case P2P_PS_NONE:
-		RTW_INFO("[MCC] Disable NoA under MCC\n");
-		rtw_hal_mcc_update_parameter(padapter, _TRUE);
-		break;
-	case P2P_PS_NOA:
-		RTW_INFO("[MCC] Enable NoA under MCC\n");
-		break;
-	default:
-		break;
-
-	}
-}
-
-void rtw_hal_mcc_parameter_init(PADAPTER padapter)
-{
-	if (!padapter->registrypriv.en_mcc)
-		return;
-
-	if (is_primary_adapter(padapter)) {
-		SET_MCC_EN_FLAG(padapter, padapter->registrypriv.en_mcc);
-		SET_MCC_DURATION(padapter, padapter->registrypriv.rtw_mcc_duration);
-		SET_MCC_RUNTIME_DURATION(padapter, padapter->registrypriv.rtw_mcc_enable_runtime_duration);
-		SET_MCC_PHYDM_OFFLOAD(padapter, padapter->registrypriv.rtw_mcc_phydm_offload);
-	}
-}
-
-
-static u8 set_mcc_duration_hdl(PADAPTER adapter, const u8 *val)
-{
-	struct dvobj_priv *dvobj = adapter_to_dvobj(adapter);
-	struct mcc_obj_priv *mccobjpriv = &(dvobj->mcc_objpriv);
-	_adapter *iface = NULL;
-	u8 duration = 50;
-	u8 ret = _SUCCESS, noa_enable = _FALSE, i = 0;
-	enum mcc_duration_setting type;
-
-	if (!mccobjpriv->enable_runtime_duration)
-		goto exit;
-
-#ifdef CONFIG_P2P_PS
-	/* check noa enable or not */
-	for (i = 0; i < dvobj->iface_nums; i++) {
-		iface = dvobj->padapters[i];
-		if (iface->wdinfo.p2p_ps_mode == P2P_PS_NOA) {
-			noa_enable = _TRUE;
-			break;
-		}
-	}
-#endif /* CONFIG_P2P_PS */
-
-	type = val[0];
-	duration = val[1];
-
-	if (type == MCC_DURATION_MAPPING) {
-		switch (duration) {
-			/* 0 = fair scheduling */
-			case 0:
-				mccobjpriv->duration= 40;
-				mccobjpriv->policy_index = 2;
-				mccobjpriv->mchan_sched_mode = MCC_FAIR_SCHEDULE;
-				break;
-			/* 1 = favor STA */
-			case 1:
-				mccobjpriv->duration= 70;
-				mccobjpriv->policy_index = 1;
-				mccobjpriv->mchan_sched_mode = MCC_FAVOR_STA;
-				break;
-			/* 2 = favor P2P*/
-			case 2:
-			default:
-				mccobjpriv->duration= 30;
-				mccobjpriv->policy_index = 0;
-				mccobjpriv->mchan_sched_mode = MCC_FAVOR_P2P;
-				break;
-		}
-	} else {
-		mccobjpriv->duration = duration;
-		rtw_hal_mcc_update_policy_table(adapter);
-	}
-
-	/* only update sw parameter under MCC 
-	    it will be force update during */
-	if (noa_enable)
-		goto exit;
-
-	if (rtw_hal_check_mcc_status(adapter, MCC_STATUS_DOING_MCC))
-		rtw_hal_mcc_update_parameter(adapter, _TRUE);
-exit:
-	return ret;
-}
-
-u8 rtw_set_mcc_duration_cmd(_adapter *adapter, u8 type, u8 val)
-{
-	struct cmd_obj *cmdobj;
-	struct drvextra_cmd_parm *pdrvextra_cmd_parm;
-	struct cmd_priv *pcmdpriv = &adapter->cmdpriv;
-	u8 *buf = NULL;
-	u8 sz = 2;
-	u8 res = _SUCCESS;
-
-	
-	cmdobj = (struct cmd_obj *)rtw_zmalloc(sizeof(struct cmd_obj));
-	if (cmdobj == NULL) {
-		res = _FAIL;
-		goto exit;
-	}
-
-	pdrvextra_cmd_parm = (struct drvextra_cmd_parm *)rtw_zmalloc(sizeof(struct drvextra_cmd_parm));
-	if (pdrvextra_cmd_parm == NULL) {
-		rtw_mfree((u8 *)cmdobj, sizeof(struct cmd_obj));
-		res = _FAIL;
-		goto exit;
-	}
-
-	buf = rtw_zmalloc(sizeof(u8) * sz);
-	if (buf == NULL) {
-		rtw_mfree((u8 *)cmdobj, sizeof(struct cmd_obj));
-		rtw_mfree((u8 *)pdrvextra_cmd_parm, sizeof(struct drvextra_cmd_parm));
-		res = _FAIL;
-		goto exit;
-	}
-
-	pdrvextra_cmd_parm->ec_id = MCC_CMD_WK_CID;
-	pdrvextra_cmd_parm->type = MCC_SET_DURATION_WK_CID;
-	pdrvextra_cmd_parm->size = sz;
-	pdrvextra_cmd_parm->pbuf = buf;
-
-	_rtw_memcpy(buf, &type, 1);
-	_rtw_memcpy(buf + 1, &val, 1);
-
-	init_h2fwcmd_w_parm_no_rsp(cmdobj, pdrvextra_cmd_parm, CMD_SET_DRV_EXTRA);
-	res = rtw_enqueue_cmd(pcmdpriv, cmdobj);
-
-exit:
-	return res;
-}
-
-#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-static u8 mcc_phydm_offload_enable_hdl(_adapter *adapter, const u8 *val)
-{
-	struct mcc_obj_priv *mccobjpriv =  adapter_to_mccobjpriv(adapter);
-	u8 ret = _SUCCESS;
-	u8 enable = *val;
-
-	/*only modify driver parameter during non-mcc status */
-	if (!rtw_hal_check_mcc_status(adapter, MCC_STATUS_DOING_MCC)) {
-		mccobjpriv->mcc_phydm_offload = enable;
-	} else {
-		/*modify both driver & phydm parameter during mcc status */
-		mccobjpriv->mcc_phydm_offload = enable;
-		rtw_hal_mcc_cfg_phydm(adapter, MCC_CFG_PHYDM_OFFLOAD, &mccobjpriv->mcc_phydm_offload);
-	}
-
-	RTW_INFO("[MCC] phydm offload enable hdl(%d)\n", mccobjpriv->mcc_phydm_offload);
-
-	return ret;
-}
-
-u8 rtw_set_mcc_phydm_offload_enable_cmd(_adapter *adapter, u8 enable, u8 enqueue)
-{
-	u8 res = _SUCCESS;
-
-	if (enqueue) {
-		struct cmd_obj *cmdobj;
-		struct drvextra_cmd_parm *pdrvextra_cmd_parm;
-		struct cmd_priv *pcmdpriv = &adapter->cmdpriv;
-		u8 *mcc_phydm_offload_enable = NULL;
-
-		
-		cmdobj = (struct cmd_obj *)rtw_zmalloc(sizeof(struct cmd_obj));
-		if (cmdobj == NULL) {
-			res = _FAIL;
-			goto exit;
-		}
-
-		pdrvextra_cmd_parm = (struct drvextra_cmd_parm *)rtw_zmalloc(sizeof(struct drvextra_cmd_parm));
-		if (pdrvextra_cmd_parm == NULL) {
-			rtw_mfree((u8 *)cmdobj, sizeof(struct cmd_obj));
-			res = _FAIL;
-			goto exit;
-		}
-
-		mcc_phydm_offload_enable = rtw_zmalloc(sizeof(u8));
-		if (mcc_phydm_offload_enable == NULL) {
-			rtw_mfree((u8 *)cmdobj, sizeof(struct cmd_obj));
-			rtw_mfree((u8 *)pdrvextra_cmd_parm, sizeof(struct drvextra_cmd_parm));
-			res = _FAIL;
-			goto exit;
-		}
-
-		pdrvextra_cmd_parm->ec_id = MCC_CMD_WK_CID;
-		pdrvextra_cmd_parm->type = MCC_SET_PHYDM_OFFLOAD_WK_CID;
-		pdrvextra_cmd_parm->size = 1;
-		pdrvextra_cmd_parm->pbuf = mcc_phydm_offload_enable;
-
-		_rtw_memcpy(mcc_phydm_offload_enable, &enable, 1);
-		init_h2fwcmd_w_parm_no_rsp(cmdobj, pdrvextra_cmd_parm, CMD_SET_DRV_EXTRA);
-		res = rtw_enqueue_cmd(pcmdpriv, cmdobj);
-	} else {
-		mcc_phydm_offload_enable_hdl(adapter, &enable);
-	}
-
-exit:
-	return res;
-}
-#endif
-
-u8 rtw_mcc_cmd_hdl(_adapter *adapter, u8 type, const u8 *val)
-{
-	struct mcc_obj_priv *mccobjpriv =  adapter_to_mccobjpriv(adapter);
-	u8 ret = _SUCCESS;
-
-	switch (type) {
-	case MCC_SET_DURATION_WK_CID:
-		set_mcc_duration_hdl(adapter, val);
-		break;
-	case MCC_GET_DBG_REG_WK_CID:
-		mcc_get_reg_hdl(adapter, val);
-		break;
-	#ifdef CONFIG_MCC_PHYDM_OFFLOAD
-	case MCC_SET_PHYDM_OFFLOAD_WK_CID:
-		mcc_phydm_offload_enable_hdl(adapter, val);
-		break;
-	#endif
-	default:
-		RTW_ERR("[MCC] rtw_mcc_cmd_hdl fail(%d)\n", type);
-		break;
-	}
-
-
-
-	return ret;
-}
-
-#endif /* CONFIG_MCC_MODE */
+104F5000333333383334333333333331333333331D
+:104F600033313335304430413341333138450D0A24
+:104F70003A31303136373030303330343334363301
+:104F80003133303330333033333330333333303302
+:104F900033333033333335333332430D0A3A313020
+:104FA00031363830303033383333333833333331CC
+:104FB00033333332333333303333333033333330CB
+:104FC00033333332333432430D0A3A3130313639E8
+:104FD00030303033333333333133333330333333AF
+:104FE0003434343436304430413341333133303467
+:104FF00033343632340D0A3A3130313641303030C4
+:105000003332333033303330333333303333333080
+:10501000333333303334333533333331333433365E
+:1050200031380D0A3A313031364230303033333393
+:10503000303333333033333330333333303333334C
+:105040003033333331333433343330343446420D38
+:105050000A3A313031364330303033303431333343
+:1050600034313436343630443041334133313330E7
+:105070003433343633333330333044420D0A3A312B
+:1050800030313644303030333033333331333333EF
+:1050900030333433313333333433343332333333E3
+:1050A0003033333330333345380D0A3A313031360B
+:1050B00045303030333033333333333433333333B9
+:1050C00033313333333033333332333333303333B9
+:1050D0003330333344380D0A3A31303136463030CC
+:1050E0003033303432333030443041334133313374
+:1050F0003034333436333433303330333033343385
+:105100003445310D0A3A31303137303030303333B5
+:10511000333933343333333333313333333133335C
+:10512000333033333330333333303333333042324D
+:105130000D0A3A3130313731303030333333343394
+:10514000343336333333303334333433333331332E
+:10515000333338333333313337333738430D0A3A47
+:1051600031303137323030303044304133413331F7
+:105170003330343334363335333033303330333304
+:10518000333033343333333442420D0A3A31303121
+:1051900037333030303334333333303333333233E7
+:1051A00033333233333330333333303333333433D5
+:1051B000333332333038360D0A3A31303137343008
+:1051C00030303434333034313333343133333331BA
+:1051D0003333333033343331343334343044304187
+:1051E000334136430D0A3A313031373530303033C0
+:1051F0003133303433343633363330333033303385
+:105200003333343334333333333330333333303471
+:10521000350D0A3A313031373630303033333330B0
+:10522000333333303333333633343332333433364A
+:1052300033333330333333363334333334370D0A87
+:105240003A3130313737303030333433363333332B
+:105250003033333334333433313333333830443011
+:1052600041334133313330343337300D0A3A313042
+:105270003137383030303436333733303330333001
+:1052800033333332333433333333333433343333EC
+:1052900033333330333331430D0A3A313031373918
+:1052A00030303033313333333333333339333433D2
+:1052B00036333333393333333233333331333333B8
+:1052C00032333430450D0A3A3130313741303030E5
+:1052D0003333333433333333333933323335304488
+:1052E0003041334133313330343334363338333073
+:1052F00032390D0A3A3130313742303030333033C1
+:105300003033333330333333313334333633333371
+:105310003033333330333433363333333746450D5C
+:105320000A3A31303137433030303330343433306F
+:105330003431333334313333333133333330333443
+:105340003331333333343334333443350D0A3A3164
+:105350003031374430303033333330333833323018
+:1053600044304133413331333034333436333933DD
+:105370003033303330333330350D0A3A3130313752
+:1053800045303030333033333330333333303333ED
+:1053900033343334333533333331333333353333D9
+:1053A0003333333443440D0A3A31303137463030E9
+:1053B00030333533343336333433333333333233BA
+:1053C00033333033333334333333333333333833AA
+:1053D0003242310D0A3A31303138303030303330EA
+:1053E0003044304133413331333034333436343167
+:1053F0003330333033303333333733333332434462
+:105400000D0A3A31303138313030303333333133C3
+:105410003333303333333033333330333433363361
+:10542000333332333333303333333341330D0A3A8A
+:105430003130313832303030333333333333333843
+:10544000333333373333333233333331333333342A
+:10545000333433333044304143460D0A3A3130312E
+:105460003833303030334133313330343334363401
+:10547000323330333033303333333033333330330C
+:10548000333332333335340D0A3A31303138343036
+:1054900030303332333034343330343133333431E9
+:1054A00033333331333333303334333133333334D1
+:1054B000333434360D0A3A31303138353030303308
+:1054C00035333333303333333033333330333333B3
+:1054D000353337343330443041334133313330396D
+:1054E000360D0A3A313031383630303034333436D4
+:1054F000343333303330333033333336333433357E
+:1055000033333337333333313333333631330D0AB7
+:105510003A31303138373030303333333733343356
+:10552000353333333633333336333333373334333E
+:1055300035333433363333333731430D0A3A313070
+:105540003138383030303333333733343336333423
+:1055500033333431333730443041334133313330F6
+:1055600034333436343432360D0A3A313031383946
+:10557000303030333033303330333333343333330C
+:1055800037333333303333333833333332333333E6
+:1055900030333331450D0A3A313031384130303013
+:1055A00033333333333933333331333333393333C1
+:1055B00033333333333033333334333433333333BC
+:1055C00046460D0A3A3130313842303030333133CB
+:1055D0003333393330333230443041334133313374
+:1055E0003034333436343533303330333031390DB1
+:1055F0000A3A313031384330303033343336333097
+:10560000343433303431333334313333333133336F
+:105610003330333433313333333443320D0A3A3198
+:105620003031384430303033343336333333303341
+:10563000333330333333303334333333333334333E
+:105640003433323333333044450D0A3A3130313854
+:1056500045303030333133353044304133413331EC
+:10566000333034333436343633303330333033330D
+:105670003339333345320D0A3A3130313846303020
+:1056800030333233333331333333363334333333EC
+:1056900034333333343334333333303333333133DC
+:1056A0003442380D0A3A3130313930303030333607
+:1056B00033333330333333303333333033333332C4
+:1056C000333333303333333834333334304443318A
+:1056D0000D0A3A31303139313030303041334133D5
+:1056E000313330343433303330333033303330339C
+:1056F000333333333433363333333742340D0A3AAA
+:105700003130313932303030333433363333333073
+:105710003334333133333330333333303333333063
+:10572000333333343334333538430D0A3A3130317F
+:10573000393330303033333331333433333334333C
+:105740003533303434333034313435333030443021
+:10575000413341333139370D0A3A31303139343040
+:10576000303033303434333033313330333033301E
+:105770003333343133333331333333303334333100
+:10578000333335460D0A3A31303139353030303324
+:1057900035333333303333333033333330333333E0
+:1057A00030333333353333333333343335333335C5
+:1057B000430D0A3A313031393630303033373333F4
+:1057C000333333333338333333373432333930448C
+:1057D00030413341333133303434333036340D0AD1
+:1057E0003A3130313937303030333233303330338F
+:1057F0003033333332333333313333333033333382
+:1058000030333333303334333634390D0A3A3130B0
+:10581000313938303030333333323333333033335C
+:10582000333533333333333333383333333733333D
+:1058300033323333333132330D0A3A31303139397F
+:105840003030303333333433333330343333373031
+:1058500044304133413331333034343330333333F4
+:1058600030333034410D0A3A313031394130303043
+:1058700033303333333033333330333333343334FF
+:1058800033353333333133333335333333333334E5
+:1058900030420D0A3A31303139423030303335330D
+:1058A00034333433333337333433343330343433C1
+:1058B0003034313333343133333331333343380DD0
+:1058C0000A3A3130313943303030333034333338C1
+:1058D0003044304133413331333034343330333476
+:1058E0003330333033303334333131440D0A3A31CD
+:1058F000303139443030303333333533333331336F
+:10590000333330333333303333333033333335336E
+:105910003333363334333544380D0A3A3130313984
+:105920004530303033333337333333313333333639
+:10593000333333373334333533333336333333362A
+:105940003337333342310D0A3A3130313946303052
+:1059500030304430413341333133303434333033F9
+:105960003533303330333033333337333433353307
+:105970003446350D0A3A313031413030303033362B
+:1059800033333337333333373334333633343333DA
+:1059900033333334333333373333333033333934CE
+:1059A0000D0A3A313031413130303033383333330E
+:1059B00032333333303333333333333339333333B5
+:1059C000313334333530443041334144360D0A3AB3
+:1059D00031303141323030303331333034343330A0
+:1059E0003336333033303330333433343333333589
+:1059F000333333303333333438310D0A3A313031C5
+:105A00004133303030333433323333333133333363
+:105A10003333343333333034343330343133333459
+:105A2000313333333135320D0A3A3130314134308C
+:105A3000303033333330333433313333333533333E
+:105A40003332343133303044304133413331333009
+:105A5000343439410D0A3A31303141353030303348
+:105A60003033373330333033303333333033333311
+:105A700030333333303333333233333334333436F8
+:105A8000360D0A3A31303141363030303336333327
+:105A900033313334333333343333333433363333D2
+:105AA00033303333333233333333333334330D0A18
+:105AB0003A313031413730303033303333333033B3
+:105AC000333333333434363044304133413331337C
+:105AD00030343433303338333036350D0A3A3130E0
+:105AE0003141383030303330333033333334333482
+:105AF0003334333333313333333933333332333471
+:105B000033333334333632310D0A3A31303141399F
+:105B1000303030333333303333333433333337335C
+:105B20003333303333333033343333333333353348
+:105B300033333031410D0A3A313031414130303068
+:105B400033333331333234363044304133413331FF
+:105B5000333034343330333933303330333033331C
+:105B600033380D0A3A31303141423030303330333E
+:105B700033333033333330333433363333333133F9
+:105B80003034343330343133333431333344360DFD
+:105B90000A3A3130314143303030333133333330EE
+:105BA00033343331333333353333333333333330C7
+:105BB0003333333033333330333945440D0A3A31DC
+:105BC000303141443030303435304430413341336A
+:105BD00031333034343330343133303330333033A5
+:105BE0003333303333333646450D0A3A31303141A1
+:105BF0004530303033343336333333373333333067
+:105C00003333333633333333333333373333333060
+:105C10003333333442430D0A3A3130314146303068
+:105C20003033343334333333313334333333333346
+:105C3000343333333333333330333134313044302E
+:105C40004146410D0A3A3130314230303030334133
+:105C50003331333034343330343233303330333023
+:105C60003333333133333333333433323333393102
+:105C70000D0A3A313031423130303033373333333B
+:105C800039333333323333333033333338333333DD
+:105C9000333333333833343333333338340D0A3A10
+:105CA00031303142323030303332333333313334C8
+:105CB00033333333333033333330333034333044AE
+:105CC000304133413331333043440D0A3A313031BE
+:105CD0004233303030343433303433333033303394
+:105CE0003033333339333433353330343433303481
+:105CF000313333343133300D0A3A313031423430BC
+:105D0000303033333331333333303334333133336F
+:105D10003335333333343333333033333330333356
+:105D2000333037310D0A3A3130314235303030338B
+:105D30003333303333333633343335333434323032
+:105D400044304133413331333034343330343437F9
+:105D5000300D0A3A31303142363030303330333062
+:105D60003330333433343333333533333333333401
+:105D700033353333333733343334333334310D0A3B
+:105D80003A313031423730303033363334333533D3
+:105D900034333333333338333333323333333033D1
+:105DA00033333333333339333332370D0A3A313007
+:105DB00031423830303033313334333234313434AB
+:105DC000304430413341333133303434333034357F
+:105DD00033303330333033450D0A3A3130314239C4
+:105DE000303030333333343333333033333334338D
+:105DF0003333333333333133343333333333343373
+:105E000034333631320D0A3A31303142413030309C
+:105E10003333333033333339333333323333333053
+:105E20003333333833343333333433363330343439
+:105E300045450D0A3A313031424230303034353444
+:105E400035304430413341333133303434333034FE
+:105E50003633303330333033303431333346420D20
+:105E60000A3A313031424330303034313333333118
+:105E700033333330333433313333333533333335F2
+:105E80003333333033333330333344460D0A3A310E
+:105E900030314244303030333033333333333333C3
+:105EA00038333433333333333233333331333433BE
+:105EB0003334363433304444370D0A3A31303142CA
+:105EC0004530303030413341333133303434333185
+:105ED00033303330333033303333333033333330A4
+:105EE0003333333046320D0A3A31303142463030A6
+:105EF000303333333633343335333433343333336D
+:105F00003533333333333433353333333533343359
+:105F10003441340D0A3A313031433030303033338C
+:105F20003336333433353334333333333338333335
+:105F300033323338333230443041334133314446E5
+:105F40000D0A3A313031433130303033303434336C
+:105F50003133313330333033303333333033333321
+:105F6000333333333933333331333339320D0A3A40
+:105F700031303143323030303335333333363333ED
+:105F800033303333333433343336333333313333E1
+:105F9000333933333337333037380D0A3A31303110
+:105FA00043333030303434333034313333343133BD
+:105FB0003333313330343130443041334133313392
+:105FC000303434333137460D0A3A313031433430CE
+:105FD00030303332333033303330333333303334A3
+:105FE0003331333333353333333633333330333381
+:105FF000333037330D0A3A313031433530303033B6
+:10600000333330333333323333333433333337335F
+:10601000333331333433333334333333333337344B
+:10602000460D0A3A31303143363030303333333075
+:10603000333333313431333730443041334133310A
+:1060400033303434333133333330333037420D0A65
+:106050003A3130314337303030333033333331330A
+:106060003333303333333033333333333333343305
+:1060700033333533333331333333450D0A3A31302B
+:1060800031433830303033393333333233343335CE
+:1060900033333337333333353333333833343333C4
+:1060A00033333331333331320D0A3A3130314339FE
+:1060B0003030303331333933383044304133413389
+:1060C00031333034343331333433303330333033AD
+:1060D00033333035340D0A3A3130314341303030CA
+:1060E0003333333033333330333333353333333087
+:1060F0003333333833333331333333313333333171
+:1061000030430D0A3A31303143423030303330348D
+:106110003433303431333334313333333133333355
+:106120003033343331333333353436333742410D42
+:106130000A3A31303143433030303044304133411A
+:10614000333133303434333133353330333033302B
+:106150003333333733333330333332380D0A3A3154
+:1061600030314344303030333033333330333333F2
+:1061700032333433333333333133333330333333F4
+:106180003233333330333345330D0A3A3130314310
+:1061900045303030333033333330333433353333C9
+:1061A00033313334333633333330333833343044AC
+:1061B0003041334130410D0A3A31303143463030BD
+:1061C00030333133303434333133363330333033AA
+:1061D000303333333033333330333333303333339B
+:1061E0003042430D0A3A31303144303030303333AD
+:1061F0003333333433333333333133333330333373
+:106200003332333433333333333033333330414445
+:106210000D0A3A3130314431303030333433343395
+:10622000333339333433333333333133363332303A
+:10623000443041334133313330343443360D0A3A3C
+:106240003130314432303030333133373330333022
+:106250003330333333313334333333333330333315
+:10626000333033333338333338430D0A3A31303136
+:1062700044333030303330333034343330343133EE
+:1062800033343133333331333333303334333133E5
+:10629000333335333335330D0A3A3130314434300A
+:1062A00030303338333333303333333034323333C5
+:1062B0003044304133413331333034343331333887
+:1062C000333039310D0A3A313031443530303033E2
+:1062D0003033303333333033333330333433333399
+:1062E000343334333333303333333133333338357A
+:1062F000430D0A3A313031443630303033333330A5
+:106300003334333133333333333333383333333656
+:1063100033343334333333303333333433460D0A89
+:106320003A31303144373030303333333033333334
+:106330003530443041334133313330343433313309
+:1063400039333033303330333337350D0A3A313067
+:1063500031443830303033303334333433333339FD
+:1063600033333338333333313333333033343333FC
+:1063700033333330333332300D0A3A31303144392C
+:1063800030303033303334333433343333333333E6
+:1063900036333333303333333833333330333333CB
+:1063A00030333231350D0A3A3130314441303030FA
+:1063B000333130443041334133313330343433318D
+:1063C00034313330333033303333333033333330AD
+:1063D00034340D0A3A3130314442303030333333C3
+:1063E0003233303434333034313333343133333384
+:1063F0003133333330333433313333333544310D88
+:106400000A3A313031444330303033333339333367
+:106410003330333333303333333033333330333457
+:106420003333333833393044304132430D0A3A3153
+:10643000303144443030303341333133303434330D
+:106440003134323330333033303333333733333323
+:106450003033333335333342390D0A3A3130314436
+:1064600045303030333033333331333433333333F7
+:1064700033333333333833333338333333373333DE
+:106480003330333342430D0A3A31303144463030F1
+:1064900030333833333330333333303333333333D0
+:1064A0003333383332333230443041334133313394
+:1064B0003046450D0A3A31303145303030303434D1
+:1064C00033313433333033303330333333373333A2
+:1064D0003337333333343333333033333330383982
+:1064E0000D0A3A31303145313030303333333033C7
+:1064F000333330333333363334333133333332336E
+:10650000333330333333363334333339360D0A3A99
+:10651000313031453230303033333333333433314B
+:106520003334333334363334304430413341333110
+:10653000333034343331343439420D0A3A31303166
+:10654000453330303033303330333033303434331C
+:106550003034313333343133333331333333303315
+:10656000343331333335410D0A3A3130314534302B
+:1065700030303335333433313333333033333330F6
+:1065800033333330333333303333333633343332DE
+:10659000333336410D0A3A313031453530303033FE
+:1065A0003433333330333434313044304133413396
+:1065B00031333034343331343533303330333037B2
+:1065C000410D0A3A313031453630303033333336CD
+:1065D0003333333933333335333333303334333385
+:1065E00033343335333333303333333233410D0ABD
+:1065F0003A31303145373030303333333833333359
+:10660000303333333033333339333333323333335B
+:1066100030333333333333333033340D0A3A31309C
+:106620003145383030303435343230443041334104
+:106630003331333034343331343633303330333034
+:1066400033343333333433330D0A3A31303145394F
+:106650003030303335333333303333333633333311
+:106660003433333330333333303333333033333302
+:1066700034333331370D0A3A31303145413030301F
+:1066800033333333333133333332333333383330DB
+:1066900034343330343133333431333234313044C1
+:1066A00046320D0A3A3130314542303030304133D4
+:1066B00041333133303434333233303330333033A9
+:1066C0003033333331333333303334333131420DBC
+:1066D0000A3A313031454330303033333335333497
+:1066E0003332333333303333333033333330333384
+:1066F0003330333333343333333445410D0A3A3195
+:106700003031454430303033333333333333303347
+:106710003333343333333633333332343434353044
+:106720004430413341333146390D0A3A3130314535
+:10673000453030303330343433323331333033302A
+:10674000333033333332333333363333333333331A
+:106750003331333343300D0A3A313031454630302E
+:1067600030333233333336333333343333333133FB
+:1067700033333033333336333333353333333133E9
+:106780003342310D0A3A3130314630303030333215
+:1067900033333336333333363333333134343431C4
+:1067A0003044304133413331333034343332424377
+:1067B0000D0A3A31303146313030303332333033F4
+:1067C00030333033333330333333363333333233A0
+:1067D000343332333433323333333939360D0A3AC2
+:1067E0003130314632303030333333373333333175
+:1067F0003334333633333337333034343330343166
+:10680000333334313333333135320D0A3A313031A9
+:106810004633303030333333303334333134343340
+:106820003130443041334133313330343433323317
+:10683000333330333041390D0A3A31303146343058
+:106840003030333033333335333433333333333021
+:10685000333333303333333033333330333333380C
+:10686000333336380D0A3A31303146353030303333
+:1068700030333333303333333933333331333333EA
+:1068800030333333313333333933333339333334D0
+:10689000430D0A3A313031463630303033303432FD
+:1068A0003331304430413341333133303434333297
+:1068B00033343330333033303333333137450D0AEB
+:1068C0003A3130314637303030333333303333338D
+:1068D000313333333033333330333333393333338A
+:1068E00039333333303333333133350D0A3A3130C2
+:1068F000314638303030333333303333333233335F
+:106900003330333333303333333933333339333351
+:1069100033303432333531310D0A3A313031463982
+:10692000303030304430413341333133303434331C
+:106930003233353330333033303333333133333331
+:1069400030333335410D0A3A313031464130303041
+:10695000333333333330333333303333333133340E
+:1069600033343330343433303431333334313333FC
+:1069700045300D0A3A313031464230303033313310
+:1069800033333033343331333333353334333433D7
+:106990003333303433333930443041334132380DBE
+:1069A0000A3A3130314643303030333133303434C9
+:1069B00033323336333033303330333333303333B1
+:1069C0003330333333383334333244440D0A3A31BD
+:1069D0003031464430303033333332333333353370
+:1069E000333330333333353333333033333330337E
+:1069F0003333333333333844320D0A3A313031468E
+:106A0000453030303333333733333331333333304E
+:106A10003333333833373434304430413341333116
+:106A20003330343445340D0A3A3130314646303053
+:106A30003033323337333033303330333333303332
+:106A40003333303333333133333334333333363317
+:106A50003342420D0A3A3130323030303030333147
+:106A600033333330333333343333333533333330F9
+:106A700033333330333333363333333433334134D6
+:106A80000D0A3A313032303130303033363333332F
+:106A9000303333333633383333304430413341339A
+:106AA000313330343433323338333043330D0A3AF0
+:106AB00031303230323030303330333033333333BF
+:106AC0003333333633343333333333343330343492
+:106AD000333034313333343135410D0A3A313032C9
+:106AE0003033303030333333313333333033343386
+:106AF0003133333335333433353333333033333366
+:106B0000303333333037410D0A3A3130323034309C
+:106B1000303033333332333834363044304133411C
+:106B2000333133303434333233393330333033303C
+:106B3000333438380D0A3A31303230353030303372
+:106B40003633333332333333353333333033333314
+:106B50003533333330333333303333333233333508
+:106B6000340D0A3A31303230363030303336333348
+:106B700033323333333833333337333333303333E0
+:106B800033323333333233343333333333390D0A1F
+:106B90003A313032303730303034333044304133B2
+:106BA00041333133303434333234313330333033B2
+:106BB00030333333363333333235360D0A3A3130EE
+:106BC000323038303030333433353333333033339D
+:106BD0003332333333303333333533343333333386
+:106BE00033363333333431440D0A3A3130323039AD
+:106BF000303030333333333333333333333333336E
+:106C00003333363333333533333339333233303050
+:106C100044304135380D0A3A31303230413030306D
+:106C20003341333133303434333234323330333030
+:106C30003330333333363330343433303431333329
+:106C400043430D0A3A313032304230303034313340
+:106C50003333313333333033343331333333353308
+:106C60003433363333333033333330333345380D05
+:106C70000A3A313032304330303033303333333905
+:106C800033333332333333303333333233363434D4
+:106C90003044304133413331333031420D0A3A31DF
+:106CA00030323044303030343433323433333033B4
+:106CB00030333033333330333333363333333433A9
+:106CC0003333363333333242360D0A3A31303230D1
+:106CD000453030303333333433333335333333317A
+:106CE000333433333333333433333335333433356D
+:106CF0003333333942320D0A3A3130323046303094
+:106D0000303333333233343336333333343435344E
+:106D1000333044304133413331333034343332341F
+:106D20003442360D0A3A313032313030303033307F
+:106D30003330333033333331333333343333333528
+:106D40003333333133343333333333363333413501
+:106D50000D0A3A313032313130303033343333335D
+:106D600035333333383333333233333330333333F0
+:106D7000373333333633333335333038350D0A3A1E
+:106D800031303231323030303434333034313334E6
+:106D9000343530443041334133313330343433329D
+:106DA000343533303330333038340D0A3A31303201
+:106DB00031333030303333343133333331333333B1
+:106DC0003033343331333333363333333033333397
+:106DD000303333333036440D0A3A313032313430C7
+:106DE0003030333333303333333133333338333379
+:106DF0003335333333313333333033333333333366
+:106E0000333036350D0A3A313032313530303033A7
+:106E10003034313044304133413331333034343322
+:106E20003234363330333033303333333033343736
+:106E3000390D0A3A31303231363030303333333372
+:106E4000333633333335333333343333333333330C
+:106E500033323333333033333333333333440D0A44
+:106E60003A313032313730303033393333333933EC
+:106E700033333433333331333333303333333333E6
+:106E800033333034353431304433300D0A3A313015
+:106E900032313830303030413341333133303434B3
+:106EA00033333330333033303330333333303333C1
+:106EB00033313333333434350D0A3A3130323139EA
+:106EC000303030333333353333333133343333339A
+:106ED000333336333333363333333533333332337B
+:106EE00033333230380D0A3A3130323141303030BC
+:106EF000333034343330343133333431333333316A
+:106F0000333333303332333830443041334133312B
+:106F100032330D0A3A31303231423030303330348E
+:106F2000343333333133303330333033343331333C
+:106F30003333363333333133333330333345460D24
+:106F40000A3A31303231433030303330333333303A
+:106F500033333338333333323333333033333337FC
+:106F60003333333133333338333344440D0A3A3116
+:106F700030323144303030333533333331333333DF
+:106F800030333333323434333330443041334133AC
+:106F90003133303434333346450D0A3A31303231EF
+:106FA00045303030333233303330333033333330B5
+:106FB000333333303334333333333336333333359E
+:106FC0003333333643360D0A3A31303231463030BE
+:106FD000303333333033333332333333303333338B
+:106FE0003333333339333333393333333633333362
+:106FF0003141390D0A3A31303232303030303333AA
+:107000003330333333323432333930443041334127
+:107010003331333034343333333333303330434626
+:107020000D0A3A313032323130303033303333338D
+:107030003033333330333333303333333433333328
+:10704000363333333233343333333339360D0A3A4C
+:107050003130323232303030333333303434333015
+:1070600034313333343133333331333333303334F6
+:10707000333133333336333335410D0A3A3130321D
+:1070800032333030303332343633303044304133C1
+:1070900041333133303434333333343330333033BA
+:1070A000303333333041360D0A3A313032323430F6
+:1070B00030303333333033333330333333323333AD
+:1070C000333633333336333333313333333133338E
+:1070D000333036360D0A3A313032323530303033D3
+:1070E0003333363333333633333331333333383367
+:1070F000333338333333313333333034313436325E
+:10710000340D0A3A3130323236303030304430418A
+:107110003341333133303434333333353330333038
+:1071200033303333333333333330333338340D0A7E
+:107130003A31303232373030303330333333313329
+:10714000333334333333353333333133343332330E
+:1071500033333933333336333332390D0A3A31303E
+:1071600032323830303033313333333033333334F9
+:1071700033333330333333303333333033393339DC
+:1071800030443041334136370D0A3A3130323239EA
+:1071900030303033313330343433333336333033CB
+:1071A00030333033333334333333343333333033B6
+:1071B00034333330380D0A3A3130323241303030E6
+:1071C0003334333133303434333034313333343196
+:1071D0003333333133333330333433313333333682
+:1071E00044420D0A3A313032324230303033333398
+:1071F0003333333330333333303333333034323368
+:107200003530443041334133313330343432320D50
+:107210000A3A31303232433030303333333733305F
+:107220003330333033333330333333363333333334
+:107230003333333533333330333345340D0A3A3156
+:107240003032324430303033363333333233333309
+:1072500035333333323334333633343336333333F5
+:107260003433333330333343350D0A3A313032322D
+:1072700045303030333433333330333333303335D8
+:1072800034333044304133413331333034343333A9
+:107290003338333045420D0A3A31303232463030DD
+:1072A00030333033303333333233333336333433B4
+:1072B0003633333337333333373333333033343395
+:1072C0003641350D0A3A31303233303030303334D4
+:1072D0003336333433333333333633343336333472
+:1072E000333533333330333333323333333039356B
+:1072F0000D0A3A31303233313030303333333534B4
+:107300003634313044304133413331333034343327
+:10731000333339333033303330333341390D0A3A74
+:10732000313032333230303033333333333633303D
+:107330003434333034313333343133333331333322
+:10734000333033343331333335390D0A3A31303257
+:107350003333303030333633333334333333303305
+:1073600033333033333330333433333333333633EF
+:10737000333333333836390D0A3A3130323334301F
+:1073800030303432304430413341333133303434AF
+:1073900033333431333033303330333333323333C8
+:1073A000333338360D0A3A313032333530303033FA
+:1073B0003333333333333533333334333333393394
+:1073C0003333323333333033333332333333303494
+:1073D000430D0A3A313032333630303033333336BE
+:1073E000333333333333333533333332333333346B
+:1073F00033333334333433373044304138310D0A8A
+:107400003A31303233373030303341333133303446
+:107410003433333432333033303330333333313346
+:1074200034333333343333333331340D0A3A313078
+:107430003233383030303334333333303333333125
+:107440003334333533333330333333303333333909
+:1074500033333332333431450D0A3A313032333934
+:1074600030303033363333333333343331333333F3
+:1074700038333034343331333230443041334133B4
+:1074800031333034380D0A3A313032334130303014
+:1074900034343333343333303330333033303431C6
+:1074A00033333431333333313333333033343331B3
+:1074B00044320D0A3A3130323342303030333333D4
+:1074C000363333333533333330333333303333338D
+:1074D0003033333331333333343333333745450D7E
+:1074E0000A3A31303233433030303333333133348E
+:1074F000333333333336333333363044304133412F
+:107500003331333034343333343430330D0A3A3199
+:107510003032334430303033303330333033333340
+:107520003333333337333333383333333233333323
+:107530003033333337333343440D0A3A3130323347
+:1075400045303030333133333338333333373333FB
+:107550003331333333303333333133333330333305
+:107560003330333443320D0A3A313032334630301F
+:1075700030333333333336333033373044304133C1
+:1075800041333133303434333334353330333033C3
+:107590003044430D0A3A31303234303030303333F6
+:1075A00033373333333333333333333333323333A8
+:1075B000333033333333333333393333333939308F
+:1075C0000D0A3A31303234313030303333333333E3
+:1075D000333331333333323334333433303434337D
+:1075E000303431333334313333333136380D0A3AB2
+:1075F000313032343230303033333434304430414F
+:107600003341333133303434333334363330333041
+:10761000333033333330333439460D0A3A31303274
+:10762000343330303033313333333633333336332E
+:107630003333303333333033333330333333303326
+:10764000333331333337360D0A3A31303234343054
+:107650003030333033333330333333313333333407
+:1076600033333337333333313334333334353436E0
+:10767000304436310D0A3A31303234353030303022
+:1076800041334133313330343433343330333033B6
+:1076900030333033333336333333353333333736B4
+:1076A000340D0A3A313032343630303033333338F7
+:1076B000333333323333333033333335333333319E
+:1076C00033333330333333373333333133430D0ACA
+:1076D0003A3130323437303030333433333333337C
+:1076E0003633333337333333353333333034333462
+:1076F00034304430413341333134450D0A3A31306E
+:107700003234383030303330343433343331333052
+:107710003330333033333332333333303333333244
+:1077200033333339333331370D0A3A313032343968
+:107730003030303331333333353333333133333324
+:10774000313334333533303434333034313333340C
+:1077500031333345360D0A3A31303234413030302E
+:1077600033313333333033343331333333363330EF
+:1077700033393044304133413331333034343334AE
+:1077800033370D0A3A31303234423030303332330D
+:1077900030333033303333333733333330333333C1
+:1077A0003033333330333333313333333030300DE0
+:1077B0000A3A3130323443303030333333333333B9
+:1077C0003331333333313333333833333334333387
+:1077D0003331333333303333333145310D0A3A31BA
+:1077E0003032344430303033333330333333303469
+:1077F0003533313044304133413331333034343335
+:107800003433333330333030330D0A3A313032349D
+:107810004530303033303333333033333336333332
+:107820003337333333383333333033333334333420
+:107830003335333342350D0A3A3130323446303045
+:107840003033303333333333333338333333363306
+:1078500033333133333330333333343333333033FF
+:107860003341450D0A3A3130323530303030333023
+:1078700034313338304430413341333133303434B0
+:1078800033343334333033303330333433334344AD
+:107890000D0A3A313032353130303033333336330C
+:1078A00033333733333336333333303333333433A3
+:1078B000303434333034313333343135430D0A3AD4
+:1078C000313032353230303033333331333333309B
+:1078D0003334333133333336333333383333333074
+:1078E000333333303434333137300D0A3A313032B8
+:1078F000353330303030443041334133313330343C
+:10790000343334333533303330333033333330334F
+:10791000343334333341450D0A3A31303235343063
+:10792000303033323333333133343336333333322D
+:107930003334333633333335333333373333333010
+:10794000333335340D0A3A31303235353030303357
+:1079500037333333303333333033333330333333FC
+:1079600036333333323336343330443041334138B5
+:10797000330D0A3A3130323536303030333133302E
+:1079800034343334333633303330333033333335C8
+:1079900033333335333333373333333232440D0AF1
+:1079A0003A313032353730303033333332333333AA
+:1079B000333334333633333335333333353333338F
+:1079C00030333333323333333032420D0A3A3130CD
+:1079D000323538303030333333303333333233337E
+:1079E0003333333333363337333730443041334135
+:1079F00033313330343435300D0A3A3130323539A1
+:107A00003030303334333733303330333033333353
+:107A10003533333338333433313330343433303433
+:107A200031333346300D0A3A31303235413030305F
+:107A3000343133333331333333303334333133331D
+:107A40003336333333393333333033333330333303
+:107A500046300D0A3A31303235423030303330332F
+:107A600033333033333336343133363044304133CB
+:107A70004133313330343433343338333031360DED
+:107A80000A3A3130323543303030333033303333EB
+:107A900033353333333433343333333333363333AF
+:107AA0003335333333333334333444360D0A3A31D8
+:107AB0003032354430303033333332333333313393
+:107AC0003333323333333233343336333333323385
+:107AD0003333363333333043440D0A3A31303235A1
+:107AE0004530303033333335333333343044304141
+:107AF000334133313330343433343339333033304A
+:107B00003330333346360D0A3A3130323546303071
+:107B1000303330333333303333333233333333333F
+:107B20003333323333333233333332333333363325
+:107B30003342320D0A3A313032363030303033325F
+:107B400033333339333333393333333033333332FD
+:107B500033333332333433333333333333343932EF
+:107B60000D0A3A313032363130303034343044302E
+:107B700041334133313330343433343431333033BF
+:107B8000303330333034343330343139360D0A3A0F
+:107B900031303236323030303333343133333331C5
+:107BA00033333330333433313333333633343331A7
+:107BB000333333303333333037360D0A3A313032E2
+:107BC0003633303030333333303333333833333389
+:107BD000323333333033333339333433333336346E
+:107BE000333044304141310D0A3A3130323634308D
+:107BF0003030334133313330343433343432333052
+:107C00003330333033333336333433313333333249
+:107C1000333333460D0A3A31303236353030303373
+:107C20003833333332333333303333333533333321
+:107C30003633333338333433363334333233333308
+:107C4000420D0A3A31303236363030303330333448
+:107C500033353333333033333330333433333435F4
+:107C600033363044304133413331333037370D0A06
+:107C70003A313032363730303034343334343333D1
+:107C800030333033303333333633343336333333C6
+:107C900032333333393333333230360D0A3A3130FD
+:107CA00032363830303033333330333333333333A9
+:107CB0003332333333343334333533333331333393
+:107CC00033363334333431370D0A3A3130323639C2
+:107CD0003030303330343433303431333334313383
+:107CE000333339304430413341333133303434333A
+:107CF00034343430370D0A3A313032364130303096
+:107D00003330333033303333333133333330333450
+:107D10003331333333363334333233333330333335
+:107D200030390D0A3A313032364230303033303368
+:107D30003333303333333233333333333433353314
+:107D40003433353333333233333334333345420D05
+:107D50000A3A313032364330303033353333333111
+:107D600034353337304430413341333133303434B8
+:107D70003334343533303330333046360D0A3A310C
+:107D800030323644303030333333313333333333BE
+:107D900033333533333335333433363333333233AC
+:107DA0003433353334333542460D0A3A31303236C6
+:107DB0004530303033333332333333343333333786
+:107DC0003333333133333331333333333333333783
+:107DD0003333333742320D0A3A313032364630309F
+:107DE0003034333433304430413341333133303441
+:107DF0003433343436333033303330333433363352
+:107E00003342370D0A3A3130323730303030333286
+:107E1000333433343334333633343333333333342A
+:107E2000333433353333333033333333333339321D
+:107E30000D0A3A3130323731303030333833303464
+:107E40003433303431333334313333333133333308
+:107E5000303334333134353330304437410D0A3A1E
+:107E600031303237323030303041334133313330DA
+:107E700034343335333033303330333033333336D7
+:107E8000333433333333333039380D0A3A31303207
+:107E900037333030303333333033333330333333BD
+:107EA000383333333233333332333333343333339E
+:107EB000323333333436420D0A3A313032373430CC
+:107EC000303033333333333333313333333333338A
+:107ED0003336333333333434343330443041334145
+:107EE000333138310D0A3A313032373530303033B2
+:107EF000303434333533313330333033303333335C
+:107F0000343333333933333333333333333333333A
+:107F1000440D0A3A31303237363030303333333370
+:107F20003330333333343334333233333331333325
+:107F300033383333333233333330333433420D0A4F
+:107F40003A31303237373030303331333333303306
+:107F500033333633333332343234323044304133D6
+:107F600041333133303434333534380D0A3A31301B
+:107F700032373830303033323330333033303334DB
+:107F800033353333333433343332333333333333BE
+:107F900033313333333631450D0A3A3130323739E4
+:107FA00030303033343335333034343330343133AC
+:107FB0003334313333333133333330333433313398
+:107FC00033333645320D0A3A3130323741303030B2
+:107FD0003334333433333330343333343044304157
+:107FE000334133313330343433353333333033305A
+:107FF00032390D0A3A313032374230303033303393
+:10800000333330333333303333333033333331334B
+:108010003333303333333033333334333346430D38
+:108020000A3A31303237433030303333333333323E
+:108030003333333233333330333433333333333313
+:108040003333333033343336333444420D0A3A3128
+:1080500030323744303030333633393434304430D2
+:1080600041334133313330343433353334333033C7
+:108070003033303333333046340D0A3A313032370F
+:1080800045303030333333303333333233343332BB
+:1080900033333334333433313333333033333332B4
+:1080A0003333333043340D0A3A31303237463030CF
+:1080B0003033333330333333313333333333343397
+:1080C0003233333332333333333333333833383477
+:1080D0003439340D0A3A31303238303030303044AF
+:1080E0003041334133313330343433353335333049
+:1080F000333033303333333633333331333344383F
+:108100000D0A3A3130323831303030333033333396
+:108110003433303434333034313333343133333334
+:10812000313333333033343331333336390D0A3A64
+:108130003130323832303030333633343335333314
+:108140003330333333303333333033333330343409
+:10815000333230443041334142360D0A3A31303205
+:1081600038333030303331333034343335333633E1
+:1081700030333033303333333433333330333333DA
+:10818000303333333036380D0A3A31303238343008
+:1081900030303333333433343331333333313333B7
+:1081A000333233333334333333363333333133339E
+:1081B000333335390D0A3A313032383530303033D7
+:1081C0003433363333333833333338333333303374
+:1081D0003634323044304133413331333034343645
+:1081E000370D0A3A313032383630303033353337A4
+:1081F0003330333033303333333633333330333358
+:1082000033303333333933333333333333380D0A85
+:108210003A31303238373030303333333333383328
+:10822000333338333333323333333033343331331E
+:1082300033333033333336333332330D0A3A31305C
+:1082400032383830303033323334333533343335F9
+:1082500033343331304430413341333133303434CB
+:1082600033353338333034430D0A3A31303238390C
+:1082700030303033303330333333343330343433DD
+:1082800030343133333431333333313333333033C8
+:1082900034333145430D0A3A3130323841303030D1
+:1082A000333333363334333633333330333333309D
+:1082B0003333333033333334333433323333333390
+:1082C00046390D0A3A3130323842303030333333A8
+:1082D0003133383435304430413341333133303445
+:1082E0003433353339333033303330333331300D89
+:1082F0000A3A31303238433030303330333333316F
+:108300003333333033333330333333343333333342
+:108310003333333233333332333345340D0A3A3166
+:108320003032384430303033303334333333333316
+:108330003333333330333433363334333633333308
+:108340003033333330333343420D0A3A313032382D
+:1083500045303030343430443041334133313330C0
+:1083600034343335343133303330333033333332E4
+:108370003334333244440D0A3A31303238463030E7
+:1083800030333333343334333133333330333333C3
+:1083900032333333303333333033333331333333B6
+:1083A0003342340D0A3A31303239303030303334E0
+:1083B0003331333333323333333133333331333097
+:1083C0003434333034313338333030443041443155
+:1083D0000D0A3A31303239313030303341333133B4
+:1083E0003034343335343233303330333033333464
+:1083F000313333333133333330333436320D0A3A99
+:108400003130323932303030333133333337333344
+:108410003330333333303333333033333330333437
+:10842000333333333334333437450D0A3A31303252
+:10843000393330303033323333333033333339330D
+:1084400033333233333330333133343044304133E8
+:10845000413331333042370D0A3A3130323934301A
+:1084600030303434333534333330333033303333E6
+:1084700033363333333033333334333433323333CB
+:10848000333133450D0A3A313032393530303033FB
+:1084900034333633333332333333303333333433AB
+:1084A000333330333333343334333233333331349F
+:1084B000410D0A3A313032393630303033333330CF
+:1084C000333333363334333134363334304430415C
+:1084D00033413331333034343335343434440D0A9A
+:1084E0003A31303239373030303330333033303363
+:1084F000343332333433363333333233333330334C
+:1085000033333433343333333332450D0A3A313075
+:10851000323938303030333433343331333333302D
+:10852000333433343333333233303434333034311F
+:1085300033333431333346320D0A3A31303239393C
+:1085400030303033313333333033313434304430FE
+:1085500041334133313330343433353435333033D0
+:1085600030333032450D0A3A313032394130303013
+:1085700033343331333333373333333133333330CD
+:1085800033333330333333303333333933333332BC
+:1085900046410D0A3A3130323942303030333333CC
+:1085A00030333333323333333033333334333433A0
+:1085B0003133333331333333343333333345460D8F
+:1085C0000A3A31303239433030303436333830447F
+:1085D0003041334133313330343433353436333052
+:1085E0003330333033343335333445420D0A3A3186
+:1085F0003032394430303033323333333433333341
+:108600003333333339333433313333333033333338
+:108610003633333333333443310D0A3A3130323960
+:10862000453030303335333333303333333633330F
+:108630003332333333393333333233343332343107
+:108640003330304443430D0A3A313032394630300A
+:1086500030304133413331333034343336333033D7
+:1086600030333033303333333433343332333333E2
+:108670003043380D0A3A3130324130303030333304
+:1086800033323333333033333330333333303334C3
+:1086900033313330343433303431333334313741A0
+:1086A0000D0A3A31303241313030303333333133E7
+:1086B000333330333433313333333733333332338B
+:1086C000313335304430413341333144330D0A3A8C
+:1086D000313032413230303033303434333633316C
+:1086E0003330333033303333333033333330333369
+:1086F000333033333339333337330D0A3A31303291
+:10870000413330303033393333333233343333332E
+:108710003333323334333133333330333333303331
+:10872000333330333336420D0A3A3130324134304C
+:10873000303033363333333333343335333333300C
+:1087400034323332304430413341333133303434D6
+:10875000333637450D0A3A31303241353030303317
+:1087600032333033303330333333363333333233E1
+:1087700033333933333332333433323333333434C2
+:10878000380D0A3A313032413630303033343331FB
+:1087900033333330333333323333333033333330B3
+:1087A00033333339333333393333333233360D0ADA
+:1087B0003A3130324137303030333433333333337E
+:1087C000323339333530443041334133313330344F
+:1087D00034333633333330333035440D0A3A3130A5
+:1087E0003241383030303330333433323333333056
+:1087F000333333303333333633333330333034344D
+:1088000033303431333330360D0A3A313032413976
+:108810003030303431333333313333333033343336
+:108820003133333337333333333333333033333319
+:1088300030333330300D0A3A31303241413030304C
+:1088400033303436333530443041334133313330D3
+:1088500034343336333433303330333033333332EC
+:1088600032360D0A3A313032414230303033333310
+:1088700038333333373334333433333339333433B6
+:108880003533333330333333343333333244350DCC
+:108890000A3A3130324143303030333333363334B7
+:1088A0003332333333373333333233333338333391
+:1088B0003337333433343334343442330D0A3A31BA
+:1088C0003032414430303030443041334133313341
+:1088D000303434333633353330333033303334336C
+:1088E0003133333330333330410D0A3A3130324192
+:1088F0004530303033303333333433343331333342
+:108900003339333433323334333433333339333428
+:108910003335333341380D0A3A3130324146303045
+:10892000303330333333343333333233333336331A
+:1089300034333133333337333333333044304133EB
+:108940004145420D0A3A3130324230303030333115
+:1089500033303434333633363330333033303334EA
+:1089600033343333333733303434333034313644C3
+:108970000D0A3A3130324231303030333334313312
+:1089800033333133333330333433313333333733B9
+:10899000333334333333303333333037450D0A3ADE
+:1089A000313032423230303033333330333433319C
+:1089B0003333333933343331333933363044304160
+:1089C000334133313330343441370D0A3A313032A8
+:1089D0004233303030333633373330333033303363
+:1089E000343334333433313333333033333330335C
+:1089F000333334333336420D0A3A31303242343075
+:108A00003030333533333338333433333333333136
+:108A1000333333313334333333333330333333302D
+:108A2000333335360D0A3A31303242353030303357
+:108A300035333333383333333833333337304430EB
+:108A400041334133313330343433363338333036D5
+:108A5000430D0A3A31303242363030303330333021
+:108A600033333331333333303334333333333330DD
+:108A700033333330333333323334333334350D0A15
+:108A80003A313032423730303033333331333333AD
+:108A900030333333323334333333333330333333AC
+:108AA00030333333383334333432390D0A3A3130DA
+:108AB000324238303030333034343336333230446D
+:108AC000304133413331333034343336333933305A
+:108AD00033303330333034340D0A3A3130324239A6
+:108AE0003030303431333334313333333133333363
+:108AF0003033343331333333373333333533333344
+:108B000030333345430D0A3A313032424130303050
+:108B10003330333333303334333533333331333429
+:108B20003336333333303333333033333330333519
+:108B300046440D0A3A31303242423030303433301C
+:108B400044304133413331333034343336343133CC
+:108B50003033303330333333303333333030460D0A
+:108B60000A3A3130324243303030333433313333E8
+:108B700033393333333033333332333333323333C4
+:108B80003330333333303333333044450D0A3A31E5
+:108B9000303242443030303334333133333339338D
+:108BA000333330333333323333333033333334339B
+:108BB0003334333044304130350D0A3A31303242AB
+:108BC000453030303341333133303434333634325E
+:108BD0003330333033303333333033333330333473
+:108BE0003331333341300D0A3A313032424630307E
+:108BF0003033393333333033333332333333303349
+:108C00003333363333333033333330333433363333
+:108C10003441340D0A3A313032433030303033345D
+:108C2000333034343330343133333431333333311C
+:108C300033353433304430413341333133304139CB
+:108C40000D0A3A3130324331303030343433363437
+:108C500033333033303330333333303334333133F1
+:108C6000333337333333363333333036390D0A3A0F
+:108C700031303243323030303333333033333330CA
+:108C800033343332333333393333333033333332B2
+:108C9000333333303333333837360D0A3A313032E9
+:108CA0004333303030333333303333333033343392
+:108CB0003233303335304430413341333133303463
+:108CC000343336343439330D0A3A313032433430A8
+:108CD0003030333033303330333333393333333070
+:108CE000333333323333333033343333333333305A
+:108CF000333336300D0A3A31303243353030303389
+:108D00003033343332333333393333333033333333
+:108D1000323333333133333330333333303333342B
+:108D2000440D0A3A31303243363030303330333448
+:108D300033323436343330443041334133313330DD
+:108D400034343336343533303330333034340D0A41
+:108D50003A313032433730303033333339333333D1
+:108D600030333333323333333133333334333333D8
+:108D700030333333303334333332380D0A3A313011
+:108D800032433830303033333335333034343330AA
+:108D900034313333343133333331333333303334A9
+:108DA00033313333333745440D0A3A3130324339A6
+:108DB0003030303333333830443041334133313362
+:108DC0003034343336343633303330333033333376
+:108DD00037333332410D0A3A31303243413030308B
+:108DE000333033333330333333303334333233335C
+:108DF0003339333333303333333233333331333343
+:108E000046440D0A3A313032434230303033383341
+:108E10003333303333333033343335333333313327
+:108E20003433363333333034343331304446410D08
+:108E30000A3A3130324343303030304133413331FC
+:108E400033303434333733303330333033303333FB
+:108E50003330333333303333333046420D0A3A3113
+:108E600030324344303030333333303333333333C1
+:108E700033333433333331333333383334333333BD
+:108E80003333313334333543310D0A3A31303243E1
+:108E90004530303033333331333433313333333897
+:108EA000333333333333333234333331304430417B
+:108EB0003341333145460D0A3A3130324346303082
+:108EC000303330343433373331333033303330337D
+:108ED000333330333333343333333033333330336A
+:108EE0003341350D0A3A3130324430303030333688
+:108EF0003333333933303434333034313333343142
+:108F0000333333313333333033343331333336392E
+:108F10000D0A3A3130324431303030333733333365
+:108F20003833333330333333303331333430443008
+:108F3000413341333133303434333742390D0A3A17
+:108F400031303244323030303332333033303330FA
+:108F500033333330333333303333333633343335E1
+:108F6000333333323333333837390D0A3A31303211
+:108F700044333030303333333233333330333333BD
+:108F800037333333333333333833333332333333A9
+:108F9000323333333036330D0A3A313032443430E1
+:108FA0003030333333383333333034323334304486
+:108FB000304133413331333034343337333333306A
+:108FC000333037460D0A3A313032443530303033A1
+:108FD0003033333330333333343334333233333366
+:108FE0003333333331333333303333333133333457
+:108FF000460D0A3A31303244363030303330333374
+:10900000333033343332333333393333333233342D
+:1090100033353333333033343333333333330D0A6F
+:109020003A313032443730303033303338333930FE
+:1090300044304133413331333034343337333433D4
+:1090400030333033303333333035450D0A3A313035
+:1090500032443830303033333338333333363330CF
+:1090600034343330343133333431333333313333D5
+:1090700033303334333145410D0A3A3130324439DB
+:1090800030303033333337333333393333333033B2
+:1090900033333033333330333433323333333834A0
+:1090A00033343544420D0A3A3130324441303030A5
+:1090B0003044304133413331333034343337333556
+:1090C0003330333033303333333333343335333376
+:1090D00032460D0A3A313032444230303033313387
+:1090E000333338333333303333333033333338334C
+:1090F0003333323333333033333337333345310D56
+:109100000A3A31303244433030303333333333383A
+:109110003333333233343335333333313333333022
+:109120003337333430443041334131340D0A3A312E
+:1091300030324444303030333133303434333733E9
+:1091400036333033303330333333303333333033FB
+:109150003333343334333242450D0A3A31303244FA
+:1091600045303030333333333333333133333330CB
+:1091700033333331333333303333333033343332C7
+:109180003333333942410D0A3A31303244463030BC
+:10919000303333333233343335333333343333339F
+:1091A0003833363330304430413341333133303467
+:1091B0003444370D0A3A31303245303030303337AD
+:1091C0003337333033303330333034343330343179
+:1091D0003333343133333331333333303334373063
+:1091E0000D0A3A3130324531303030333133333398
+:1091F0003733343331333333303333333033333342
+:10920000303333333133333334333338420D0A3A66
+:109210003130324532303030333033333330333322
+:1092200033343432333530443041334133313330E9
+:10923000343433373338333039430D0A3A3130322E
+:1092400045333030303330333033333330333433ED
+:1092500035333333313333333233333334333333DE
+:10926000313333333836370D0A3A31303245343002
+:1092700030303334333533333331333433363333BF
+:1092800033303333333333333334333333313333B2
+:10929000333435300D0A3A313032453530303033E1
+:1092A000333330333334333044304133413331336B
+:1092B000303434333733393330333033303334367A
+:1092C000460D0A3A3130324536303030333333339D
+:1092D000333233333330333433363333333433335D
+:1092E00033313334333133333330333433360D0A9F
+:1092F0003A31303245373030303333333333333330
+:10930000333330333433313333333933303434332C
+:1093100030343133333431333546370D0A3A313056
+:1093200032453830303033373044304133413331D7
+:109330003330343433373431333033303330333304
+:1093400033313333333034360D0A3A313032453924
+:1093500030303033343331333333373334333233E3
+:1093600033333033333330333333303333333633D3
+:1093700034333330340D0A3A3130324541303030F5
+:1093800033333330333333303334333233333331B5
+:109390003334333633333331333034323044304185
+:1093A00033420D0A3A3130324542303030334133A6
+:1093B0003133303434333734323330333033303385
+:1093C0003333383334333233333335333342450D6B
+:1093D0000A3A313032454330303033303333333072
+:1093E0003333333233333330333333303333333057
+:1093F0003334333333333337333344440D0A3A3160
+:10940000303245443030303330333333313333331B
+:109410003833333330333433313331333430443011
+:109420004133413331333031340D0A3A3130324532
+:1094300045303030343433373433333033303330F5
+:1094400033333330333433333333333633333330EE
+:109450003334333139390D0A3A3130324546303000
+:1094600030333333343333333033333331333433D2
+:1094700036333433363330343433303431333334B9
+:109480003137370D0A3A31303246303030303333ED
+:109490003331333333303334333133323432304495
+:1094A0003041334133313330343433373434423064
+:1094B0000D0A3A31303246313030303330333033C8
+:1094C000303333333733343333333333303333336D
+:1094D000303333333033343331333338460D0A3A93
+:1094E0003130324632303030333933333336333340
+:1094F000333733333332333433313333333133333C
+:10950000333133333330333336440D0A3A3130326A
+:109510004633303030333433333336343533393007
+:1095200044304133413331333034343337343533DD
+:10953000303330333037340D0A3A3130324634303C
+:1095400030303333333133333339333333393333E7
+:1095500033363333333733343334333433333333D1
+:10956000333133460D0A3A313032463530303033FC
+:1095700033333033333333333333303334333633BD
+:1095800033333133333339333333393333333033A4
+:10959000430D0A3A313032463630303034333335C9
+:1095A000304430413341333133303434333734365F
+:1095B00033303330333033333337333334390D0AC8
+:1095C0003A31303246373030303332333333383358
+:1095D000333331333333313334333633333333335B
+:1095E00030343433303431333330340D0A3A31309F
+:1095F0003246383030303431333333313333333033
+:109600003334333133333337333433343333333028
+:1096100033303436304431430D0A3A313032463932
+:1096200030303030413341333133303434333833F8
+:10963000303330333033303333333033333330330C
+:1096400033333032370D0A3A313032464130303020
+:1096500033343333333333363333333033333332DA
+:1096600033333338333333303333333033343331CC
+:1096700046330D0A3A3130324642303030333333DC
+:10968000393333333633333337333433343334339A
+:109690003534313335304430413341333130390D95
+:1096A0000A3A313032464330303033303434333894
+:1096B000333133303330333033333331333333308A
+:1096C0003333333033333334333344300D0A3A31A8
+:1096D0003032464430303033363333333233333341
+:1096E0003933333339333333363333333733333337
+:1096F0003033333330333342320D0A3A313032466D
+:109700004530303033313333333133333331333425
+:1097100033333433333630443041334133313330F3
+:109720003434333844410D0A3A3130324646303011
+:109730003033323330333033303333333633333303
+:1097400030333433363333333433303434333034EA
+:109750003138440D0A3A3130333030303030333321
+:1097600034313333333133333330333433313333D0
+:1097700033373334333533333330333333303837AF
+:109780000D0A3A3130333031303030333333303307
+:10979000333332343533373044304133413331336E
+:1097A000303434333833333330333041420D0A3AB6
+:1097B0003130333032303030333033333338333389
+:1097C000333033333330333433313333333933336A
+:1097D000333633333337333336380D0A3A31303397
+:1097E000303330303033303333333233333331335B
+:1097F000333331333333323333333433333331333D
+:10980000333334333436380D0A3A31303330343070
+:1098100030303335333933353044304133413331EF
+:10982000333034343338333433303330333033330C
+:10983000333138370D0A3A31303330353030303348
+:1098400034333633333330333333303333333033ED
+:1098500033333033333330333333333334333334DC
+:10986000410D0A3A31303330363030303333333112
+:1098700033333330333333313333333433333330BF
+:1098800033333330333433323339333333360D0AF1
+:109890003A31303330373030303044304133413377
+:1098A000313330343433383335333033303330338D
+:1098B00033333533303434333035310D0A3A3130C7
+:1098C0003330383030303431333334313333333173
+:1098D0003333333033343331333333373334333654
+:1098E00033333330333346350D0A3A313033303980
+:1098F0003030303330333333303334333433333345
+:109900003933343333333333313431333230443019
+:1099100041334133410D0A3A313033304130303038
+:10992000333133303434333833363330333033300B
+:1099300033333330333333343333333033333330FF
+:1099400045440D0A3A31303330423030303334330D
+:1099500032333333313334333233333331333333DC
+:109960003733333338333433343333333244410DC4
+:109970000A3A3130333043303030333333323333DB
+:10998000333033333330333333303336333730449B
+:109990003041334133313330343430460D0A3A31BB
+:1099A0003033304430303033383337333033303382
+:1099B0003033333337333333383334333333333370
+:1099C0003233333335333342350D0A3A31303330A5
+:1099D0004530303033303333333033333330333456
+:1099E0003331333333393334333433333332333441
+:1099F0003335333441460D0A3A3130333046303056
+:109A00003033313330343433303431333733323030
+:109A100044304133413331333034343338333833E5
+:109A20003042420D0A3A3130333130303030333049
+:109A300033303333343133333331333333303334FE
+:109A400033313333333833333330333333303845D2
+:109A50000D0A3A3130333131303030333333303333
+:109A600033333033333335333333303333333033CD
+:109A7000333330333333303334333338450D0A3AEC
+:109A800031303331323030303334333233343431B7
+:109A90003044304133413331333034343338333967
+:109AA000333033303330333339410D0A3A313033C8
+:109AB0003133303030333033333331333333383381
+:109AC000333330333433313333333933333338335F
+:109AD000333337333435330D0A3A313033313430A0
+:109AE000303033323334333633343331333333304D
+:109AF0003334333233333330333333363334333533
+:109B0000343633410D0A3A31303331353030303369
+:109B100030304430413341333133303434333834EE
+:109B20003133303330333033333332333333383708
+:109B3000300D0A3A3130333136303030333333324E
+:109B400033333331333333313333333333333338E4
+:109B500033333337333333323334333432410D0A12
+:109B60003A313033313730303033343334333034CA
+:109B700034333034313333343133333331333333BB
+:109B800030333634333044304133370D0A3A3130D4
+:109B9000333138303030334133313330343433388B
+:109BA000343233303330333033343331333333388A
+:109BB00033333331333345460D0A3A31303331399B
+:109BC0003030303330333333303333333033333377
+:109BD0003133333338333333303333333033343357
+:109BE00033333430390D0A3A31303331413030308B
+:109BF0003333333333373333333033333331333336
+:109C000033393330343530443041334133313330FC
+:109C100032380D0A3A313033314230303034343357
+:109C2000383433333033303330333333303333330A
+:109C30003033333330333333323333333143450D01
+:109C40000A3A313033314330303033333336333303
+:109C500033323333333833333337333333323333CD
+:109C60003334333333343333333043360D0A3A31FC
+:109C700030333144303030333333303333333233B5
+:109C8000343333333134363044304133413331337C
+:109C90003034343338343444370D0A3A31303331C8
+:109CA0004530303033303330333033333337333380
+:109CB0003330333433363333333333333330333376
+:109CC0003331333342380D0A3A3130333146303094
+:109CD0003033343333333533303434333034313359
+:109CE000333431333333313333333033343331334B
+:109CF0003337420D0A3A3130333230303030333876
+:109D00003333333233343331304430413341333100
+:109D10003330343433383435333033303330423900
+:109D20000D0A3A313033323130303033333330335F
+:109D300033333033333330333333323333333333FA
+:109D4000333337333333373334333337460D0A3A0B
+:109D500031303332323030303334333333333337DE
+:109D600033333330333433353333333633333330C3
+:109D7000333333333334333436370D0A3A313033F7
+:109D80003233303030343333363044304133413382
+:109D90003133303434333834363330333033303396
+:109DA000333332333337390D0A3A313033323430CA
+:109DB0003030333033343335333433333334333377
+:109DC0003334333433333330333433323334333264
+:109DD000333334440D0A3A31303332353030303396
+:109DE000303333333233333331333333323333334A
+:109DF0003033343332333433323338343130443522
+:109E0000420D0A3A3130333236303030304133414E
+:109E1000333133303434333933303330333033301B
+:109E200033333339333333303334333534340D0A49
+:109E30003A313033323730303033333334333433F4
+:109E400033333034343330343133333431333333E8
+:109E500031333333303334333146420D0A3A313003
+:109E600033323830303033333338333333333333C2
+:109E700033303333333033333330333033343044AF
+:109E800030413341333135450D0A3A3130333239BF
+:109E9000303030333034343339333133303330339E
+:109EA0003033333336333333303333333033333388
+:109EB00030333446410D0A3A31303332413030309C
+:109EC000333233333339333333303334333533335D
+:109ED0003335333433333333333033333330333454
+:109EE00045420D0A3A31303332423030303332336A
+:109EF0003333393333333033343335333833393024
+:109F00004430413341333133303434333930340D1C
+:109F10000A3A313033324330303033323330333039
+:109F20003330333333363333333433333330333303
+:109F30003330333433323333333944340D0A3A3126
+:109F400030333244303030333333303334333533DD
+:109F500033333633333338333333303333333033CF
+:109F60003433363334333142390D0A3A31303332F7
+:109F700045303030333433323333333333373333A4
+:109F80003044304133413331333034343339333377
+:109F90003330333045360D0A3A31303332463030C3
+:109FA0003033303333333833343335333034343380
+:109FB000303431333334313333333133333330337B
+:109FC0003437360D0A3A31303333303030303331B4
+:109FD0003333333833333334333333303333333051
+:109FE000333333303333333033333330333339383F
+:109FF0000D0A3A3130333331303030333034353488
+:10A0000032304430413341333133303434333933F7
+:10A01000343330333033303333333041300D0A3A58
+:10A02000313033333230303033333330333333360F
+:10A0300033333332333433353334333333343332ED
+:10A04000333333333334333236410D0A3A3130331C
+:10A0500033333030303333333033333335333333DA
+:10A0600030333333303333333033343333333333C8
+:10A07000323336333636310D0A3A313033333430F9
+:10A08000303030443041334133313330343433397C
+:10A09000333533303330333033333330333333329B
+:10A0A000333338450D0A3A313033333530303033BD
+:10A0B0003433333330333333303333333233333376
+:10A0C0003633333332333433353334333333343359
+:10A0D000430D0A3A31303333363030303332333394
+:10A0E0003333333433323333333133343336333041
+:10A0F00034343337333430443041334136310D0A50
+:10A100003A31303333373030303331333034343325
+:10A110003933363330333033303330343133333412
+:10A1200031333333313333333046440D0A3A31302F
+:10A1300033333830303033343331333333383333EF
+:10A1400033353333333033333330333333303333E6
+:10A1500033303333333531310D0A3A31303333391B
+:10A1600030303033333330333333303333333233CF
+:10A170003333383431333530443041334133313384
+:10A1800030343432420D0A3A3130333341303030DA
+:10A19000333933373330333033303333333633348A
+:10A1A000333533333332333333383333333033337C
+:10A1B00045350D0A3A3130333342303030333033A5
+:10A1C0003333323333333833333337333433353354
+:10A1D0003333303333333433333330333344410D5B
+:10A1E0000A3A313033334330303033303333333065
+:10A1F0003334333333343335304430413341333106
+:10A200003330343433393338333030330D0A3A3164
+:10A21000303333443030303330333033333333330F
+:10A220003333303333333633333334333333303300
+:10A230003333303333333243390D0A3A3130333329
+:10A2400045303030333333363333333733333336CB
+:10A2500033333334333433363330343433303431CE
+:10A260003333343137370D0A3A31303333463030F7
+:10A270003033333331333933393044304133413380
+:10A28000313330343433393339333033303330339E
+:10A290003343430D0A3A31303334303030303330C9
+:10A2A000333433313333333833333336333333307A
+:10A2B0003333333033333330333333323333393270
+:10A2C0000D0A3A31303334313030303333333333B5
+:10A2D0003733333337333333353333333733333340
+:10A2E000373333333433333332333336410D0A3A71
+:10A2F0003130333432303030343330443041334114
+:10A300003331333034343339343133303330333024
+:10A31000333433363333333638360D0A3A3130334B
+:10A320003433303030333333373333333033333304
+:10A3300037333333303333333033333332333333F0
+:10A34000363333333635380D0A3A3130333434301E
+:10A3500030303333333733343334333333373333C9
+:10A3600033363333333133333332333133343044B0
+:10A37000304139320D0A3A313033343530303033F0
+:10A380004133313330343433393432333033303392
+:10A390003033333336333333373333333633333188
+:10A3A000330D0A3A313033343630303033333333CF
+:10A3B000333833333336333433353334333433345F
+:10A3C00033363330343433303431333330320D0AB2
+:10A3D0003A31303334373030303431333333313352
+:10A3E000333330333433313333333833323339303A
+:10A3F00044304133413331333035370D0A3A31304F
+:10A40000333438303030343433393433333033301C
+:10A410003330333333373333333033333330333311
+:10A4200033303333333646300D0A3A313033343932
+:10A4300030303033333330333333303333333033FE
+:10A4400033333233343336333333353333333633D4
+:10A4500033333030300D0A3A31303334413030301C
+:10A4600033333336333333303333333033323331C2
+:10A470003044304133413331333034343339343480
+:10A4800031370D0A3A3130333442303030333033E3
+:10A49000303330333333323333333633333335338E
+:10A4A0003333363334333433333337333344380D83
+:10A4B0000A3A31303334433030303335333333318B
+:10A4C0003333333233333336333333353333333655
+:10A4D0003333333233343336333343320D0A3A3184
+:10A4E0003033344430303033323333333534353332
+:10A4F0003130443041334133313330343433393403
+:10A500003533303330333044380D0A3A3130333458
+:10A510004530303033333330333333373333333004
+:10A5200033333330333333373333333233303434FC
+:10A530003330343139350D0A3A3130333446303026
+:10A5400030333334313333333133333330333433E3
+:10A5500031333333383333333833333330333333C6
+:10A560003039300D0A3A3130333530303030333411
+:10A570003334304430413341333133303434333980
+:10A58000343633303330333033333330333342388F
+:10A590000D0A3A31303335313030303332333333E2
+:10A5A0003633333332333333323333333633343376
+:10A5B000323333333233343336333337350D0A3AAB
+:10A5C000313033353230303033303333333133336D
+:10A5D000333033333330333433323333333933334B
+:10A5E000333234333434304437360D0A3A31303371
+:10A5F000353330303030413341333133303434341B
+:10A600003133303330333033303334333533333325
+:10A61000363333333036430D0A3A31303335343044
+:10A620003030333333303333333033333337333302
+:10A6300033373333333233333334333433313333E7
+:10A64000333934340D0A3A31303335353030303324
+:10A6500033333233343335333333353333333633C3
+:10A660003333303431343230443041334133313696
+:10A67000340D0A3A313033353630303033303434FB
+:10A6800034313331333033303330333333303334A8
+:10A6900033343333333633303434333030440D0ACB
+:10A6A0003A3130333537303030343133333431337D
+:10A6B000333331333333303334333133333338336B
+:10A6C00033333933333330333346440D0A3A313080
+:10A6D0003335383030303330333333303333333253
+:10A6E0003333333333303333304430413341333118
+:10A6F00033303434343134330D0A3A313033353970
+:10A70000303030333233303330333033333332332D
+:10A710003333323333333233343336333333373303
+:10A7200033333230310D0A3A313033354130303045
+:10A7300033333330333333323333333033333330F3
+:10A7400033333332333333363333333733333332D4
+:10A7500046300D0A3A3130333542303030333333FE
+:10A76000303333333634323338304430413341338D
+:10A770003133303434343133333330333046420DB7
+:10A780000A3A3130333543303030333033333336B7
+:10A79000333333373334333433333337333333367C
+:10A7A0003333333233333332333343300D0A3A31B8
+:10A7B000303335443030303338333333333334335C
+:10A7C0003533333334333433353333333033333356
+:10A7D0003033343334333442320D0A3A3130333586
+:10A7E0004530303033353335333230443041334106
+:10A7F0003331333034343431333433303330333035
+:10A800003330343444300D0A3A3130333546303049
+:10A810003033303431333334313333333133333312
+:10A8200030333433313333333833343331333333F8
+:10A830003038370D0A3A3130333630303030333338
+:10A8400033303333333033333332333333363333DC
+:10A8500033373333333633333332343433333737B8
+:10A860000D0A3A31303336313030303044304133F4
+:10A8700041333133303434343133353330333033A2
+:10A88000303333333633333332333341440D0A3AC2
+:10A89000313033363230303033373333333433348E
+:10A8A000333233333333333333313333333033337E
+:10A8B000333133333330333336460D0A3A313033A4
+:10A8C000363330303033303333333233333338335D
+:10A8D0003333363334333533333330333733373040
+:10A8E000443041334139360D0A3A31303336343051
+:10A8F0003030333133303434343133363330333035
+:10A90000333033333336333333303333333033331D
+:10A91000333233410D0A3A3130333635303030334B
+:10A9200033333833333337333433353333333233EC
+:10A9300034333133333330333333303334333433EC
+:10A94000340D0A3A31303336363030303333333623
+:10A9500033303434333034313333343133393433C6
+:10A9600030443041334133313330343432360D0AE0
+:10A970003A313033363730303034313337333033A7
+:10A9800030333033333331333333303334333133A3
+:10A9900033333833343332333331320D0A3A3130D2
+:10A9A0003336383030303330333333303333333081
+:10A9B0003334333133333339333333323334333560
+:10A9C00033333335333330410D0A3A31303336398E
+:10A9D0003030303332333333303333333033343356
+:10A9E0003230443041334133313330343434313315
+:10A9F00038333032440D0A3A31303336413030305A
+:10AA0000333033303333333033343333333333331E
+:10AA10003333333033333336333333343333333008
+:10AA200046340D0A3A313033364230303033333326
+:10AA300030333333333334333633333337333333E1
+:10AA40003733333330333333363333333044340DE9
+:10AA50000A3A3130333643303030333333303334E5
+:10AA6000333930443041334133313330343434318D
+:10AA70003339333033303330333346370D0A3A31DC
+:10AA80003033364430303033333333333833333389
+:10AA9000363334333533333335333433333333337D
+:10AAA0003033333330333342320D0A3A31303336B8
+:10AAB0004530303033313333333133303434333065
+:10AAC000343133333431333333313333333033345C
+:10AAD0003331333738390D0A3A3130333646303076
+:10AAE0003033333044304133413331333034343414
+:10AAF000313431333033303330333333383334332C
+:10AB00003342440D0A3A313033373030303033334A
+:10AB1000333033333330333333303333333233330F
+:10AB200033333333333733333337333333353839E0
+:10AB30000D0A3A3130333731303030333333373335
+:10AB400033333733333334333333323333333633CE
+:10AB5000333337333233323044304142420D0A3AD4
+:10AB600031303337323030303341333133303434B5
+:10AB700034313432333033303330333333363333AC
+:10AB8000333033333336333333460D0A3A313033CF
+:10AB9000373330303033363333333733343336337F
+:10ABA000333337333333363334333633333332336B
+:10ABB000333336333334310D0A3A313033373430AE
+:10ABC0003030333733333336333333303333333654
+:10ABD0003333333634363333304430413341333119
+:10ABE000333037390D0A3A3130333735303030347D
+:10ABF0003434313433333033303330333333373329
+:10AC00003433353333333733333336333333303010
+:10AC1000380D0A3A3130333736303030333333364B
+:10AC200033333334333034343330343133333431F9
+:10AC300033333331333333303334333130340D0A3B
+:10AC40003A313033373730303033333338333433CD
+:10AC5000343333333033333334304430413341339E
+:10AC600031333034343431343433310D0A3A313005
+:10AC700033373830303033303330333033333330B0
+:10AC8000333333303334333533333337333333378C
+:10AC900033333334333430420D0A3A3130333739B9
+:10ACA0003030303332333333393333333633343374
+:10ACB0003533333335333433333333333033333362
+:10ACC00030333446300D0A3A31303337413030308A
+:10ACD0003331333333393432333730443041334115
+:10ACE000333133303434343134353330333033303E
+:10ACF00046370D0A3A313033374230303033333350
+:10AD00003733343335333333353333333433333309
+:10AD10003033333330333333333333333844300D1C
+:10AD20000A3A31303337433030303333333633340B
+:10AD300033353333333033343333333333303333E6
+:10AD40003330333333333333333843360D0A3A3108
+:10AD5000303337443030303433343430443041339E
+:10AD600041333133303434343134363330333033AB
+:10AD70003033333337333442370D0A3A31303337D7
+:10AD80004530303033353334333233333337333087
+:10AD90003434333034313333343133333331333388
+:10ADA0003330333438300D0A3A31303337463030AF
+:10ADB0003033313333333833343335333333303363
+:10ADC0003333303333333033333333343634353055
+:10ADD0004439440D0A3A3130333830303030304164
+:10ADE0003341333133303434343233303330333031
+:10ADF0003330333333303333333033333330413420
+:10AE00000D0A3A3130333831303030333333333365
+:10AE100034333633333337333333373333333033F9
+:10AE2000333336333333303333333037320D0A3A3A
+:10AE300031303338323030303333333233333333ED
+:10AE400033333337333333373333333534343330C9
+:10AE5000304430413341333139420D0A3A313033D5
+:10AE600038333030303330343434323331333033BC
+:10AE7000303330333333373333333733333334339F
+:10AE8000333332333433440D0A3A313033383430CB
+:10AE90003030333633333336333333373333333081
+:10AEA0003333333733333330333333303333333275
+:10AEB000333334340D0A3A313033383530303033AF
+:10AEC000363333333633333337333433353339343E
+:10AED000343044304133413331333034343432341C
+:10AEE000310D0A3A31303338363030303332333086
+:10AEF000333033303334333433303434333034312B
+:10AF000033333431333333313333333030450D0A57
+:10AF10003A31303338373030303334333133333300
+:10AF200038333433363333333033333330333333EE
+:10AF300030333433343333333731330D0A3A31302D
+:10AF400033383830303033333336333333313433CE
+:10AF5000343530443041334133313330343434329A
+:10AF600033333330333031380D0A3A3130333839F6
+:10AF700030303033303333333233333336333333AB
+:10AF80003733333336333333333333333833333385
+:10AF900036333445390D0A3A3130333841303030A8
+:10AFA000333533333336333333343333333033336E
+:10AFB000333033333332333433363333333533335F
+:10AFC00045330D0A3A31303338423030303336337E
+:10AFD0003734343044304133413331333034343416
+:10AFE0003233343330333033303333333046380D4B
+:10AFF0000A3A313033384330303033333336333339
+:10B000003330333333303333333233333336333314
+:10B010003335333333363334333443320D0A3A3134
+:10B0200030333844303030333333373333333533E0
+:10B0300033333133333334333433323330343433E2
+:10B040003034313433343537380D0A3A313033380F
+:10B050004530303030443041334133313330343493
+:10B0600034323335333033303330333334313333B8
+:10B070003331333344300D0A3A31303338463030CF
+:10B080003033303334333133333339333333303394
+:10B09000333330333333303333333033333332338A
+:10B0A0003341330D0A3A31303339303030303336B2
+:10B0B0003333333533333336333333323334333658
+:10B0C0003333333233373333304430413341433118
+:10B0D0000D0A3A3130333931303030333133303496
+:10B0E0003434323336333033303330333333353333
+:10B0F000333330333333373333333036320D0A3A68
+:10B10000313033393230303033333330333333321C
+:10B1100033333336333333323333333233333336FB
+:10B12000333433323333333236380D0A3A31303335
+:10B1300039333030303334333633333330333333E1
+:10B1400031333333303336343330443041334133A9
+:10B15000313330343438340D0A3A31303339343005
+:10B1600030303432333733303330333033333330BD
+:10B170003333333933333338333333373334333290
+:10B18000333333310D0A3A313033393530303033DF
+:10B190003033343331333333303333333033333389
+:10B1A0003733333330333034343330343133333274
+:10B1B000370D0A3A313033393630303034313333A9
+:10B1C0003331333333303431333130443041334130
+:10B1D00033313330343434323338333033440D0A7E
+:10B1E0003A31303339373030303330333033343331
+:10B1F0003133333339333333313333333033333320
+:10B2000030333333303334333232330D0A3A313062
+:10B2100033393830303033333339333333323334F6
+:10B2200033353333333633333334333333303333EB
+:10B2300033303333333746440D0A3A3130333939FA
+:10B2400030303033333337333333303044304133BD
+:10B2500041333133303434343233393330333033B3
+:10B2600030333332360D0A3A3130333941303030F1
+:10B270003332333333343334333133333339333399
+:10B280003332333433353333333533333338333385
+:10B2900044390D0A3A3130333942303030333033AB
+:10B2A000333330333333383333333233333332336E
+:10B2B0003333373333333933333338333143440D56
+:10B2C0000A3A31303339433030303434304430414D
+:10B2D000334133313330343434323431333033303A
+:10B2E0003330333333373334333244410D0A3A3158
+:10B2F0003033394430303033333339333333393307
+:10B300003333303333333433343333333333393308
+:10B310003034343330343138440D0A3A3130333933
+:10B3200045303030333334313333333133333330EA
+:10B3300033343331333333393333333233343433D7
+:10B340003044304144380D0A3A31303339463030D8
+:10B3500030334133313330343434323432333033B8
+:10B3600030333033333330333333303333333033BC
+:10B370003337380D0A3A31303341303030303338DA
+:10B38000333333323333333233333334333333328F
+:10B390003333333833333337333433323333374162
+:10B3A0000D0A3A31303341313030303338333333B2
+:10B3B000383333333033333334333433333330345B
+:10B3C000323044304133413331333041450D0A3A54
+:10B3D000313033413230303034343432343333303E
+:10B3E000333033303333333633343333333333372B
+:10B3F000333333323333333233390D0A3A31303366
+:10B40000413330303033333332333333303334330A
+:10B4100033333333363334333433333337333333F3
+:10B42000323333333235320D0A3A3130334134302E
+:10B4300030303333333133343335333433333433DF
+:10B4400034353044304133413331333034343432A5
+:10B45000343433450D0A3A313033413530303033EE
+:10B4600030333033303333333633343334333433AF
+:10B4700033333333303333333433303434333033A2
+:10B48000300D0A3A313033413630303034313333D5
+:10B490003431333333313333333033343331333383
+:10B4A00033393333333333333330333330440D0AAA
+:10B4B0003A31303341373030303330333333303357
+:10B4C0003333353044304133413331333034343425
+:10B4D00032343533303330333033450D0A3A31307E
+:10B4E0003341383030303333333033333332333326
+:10B4F000333033343332333333323334333633331C
+:10B5000033373334333330350D0A3A313033413940
+:10B510003030303333333033343333333333303309
+:10B5200033333033333332333333363333333733E8
+:10B5300034333346370D0A3A3130334141303030FD
+:10B5400034323431304430413341333133303434A8
+:10B5500034323436333033303330333333303333C3
+:10B5600045460D0A3A3130334142303030333633BC
+:10B57000333336333333373334333433333337338E
+:10B580003333363333333233333332333443340D9E
+:10B590000A3A31303341433030303336333333328B
+:10B5A000333333363333333033333337333333306A
+:10B5B0003333333034333338304444370D0A3A317F
+:10B5C0003033414430303030413341333133303423
+:10B5D0003434333330333033303330333433313346
+:10B5E0003433363330343442370D0A3A3130334154
+:10B5F0004530303033303431333334313333333119
+:10B600003333333033343331333333393333333407
+:10B610003333333038460D0A3A3130334146303017
+:10B6200030333333303333333033333332333333F4
+:10B6300036333333323330333330443041334133B4
+:10B640003145380D0A3A3130334230303030333002
+:10B6500034343433333133303330333033343333C1
+:10B6600033333330333333363333333333343730A8
+:10B670000D0A3A31303342313030303334333433E1
+:10B68000363333333233333330333433313333338C
+:10B69000323334333633333337333436440D0A3AA6
+:10B6A000313033423230303033343333333033346B
+:10B6B0003334333333303336333430443041334131
+:10B6C000333133303434343339300D0A3A31303396
+:10B6D000423330303033323330333033303333333E
+:10B6E0003033333332333333363333333733343326
+:10B6F000343333333035440D0A3A31303342343049
+:10B700003030333333363333333633333337333404
+:10B7100033343333333733333336333333323333F2
+:10B72000333732460D0A3A31303342353030303318
+:10B7300033333433303434343233333044304133C0
+:10B7400041333133303434343333333330333034C2
+:10B75000390D0A3A313033423630303033303330FD
+:10B7600034313333343133333331333333303334AF
+:10B7700033313333333933333335333330440D0AD4
+:10B780003A31303342373030303330333333303383
+:10B79000333330333333323334333633333332337A
+:10B7A00033333633333330333331430D0A3A3130A8
+:10B7B000334238303030333734323339304430412B
+:10B7C0003341333133303434343333343330333042
+:10B7D00033303333333032330D0A3A313033423978
+:10B7E0003030303333333033333332333333363333
+:10B7F0003333323334333433333330333333363318
+:10B8000033333346350D0A3A31303342413030302C
+:10B8100033343333333333343334333233333333F6
+:10B8200033333331333333303333333133373436E7
+:10B8300044330D0A3A3130334242303030304430F4
+:10B8400041334133313330343434333335333033AF
+:10B850003033303333333033333330333330450DDB
+:10B860000A3A3130334243303030333033343333BB
+:10B870003333333733333330333333363333333493
+:10B880003333333033333330333443370D0A3A31C3
+:10B890003033424430303033313333333933303462
+:10B8A000343330343133333431333333313433336D
+:10B8B0003430443041334143330D0A3A313033425E
+:10B8C0004530303033313330343434333336333041
+:10B8D000333033303333333033343331333333393C
+:10B8E0003333333638410D0A3A3130334246303043
+:10B8F0003033333330333333303333333033333324
+:10B900003333343336333333323333333233333305
+:10B910003039460D0A3A313033433030303033332A
+:10B9200033373333333033333330333433313335E8
+:10B93000343630443041334133313330343441458F
+:10B940000D0A3A313033433130303034333337330A
+:10B9500030333033303333333333333332333333C1
+:10B96000323333333933333332333336360D0A3AE5
+:10B970003130334332303030333033333334333497
+:10B980003332333333393333333033343335333382
+:10B99000333633333338333335380D0A3A313033B5
+:10B9A0004333303030333033333330333433363362
+:10B9B0003334313044304133413331333034343433
+:10B9C000333338333037320D0A3A31303343343081
+:10B9D0003030333033303333333233333331333346
+:10B9E000333733343334333333373333333233331E
+:10B9F000333434330D0A3A31303343353030303359
+:10BA00003433363333333133303434333034313309
+:10BA100033343133333331333333303334333131FF
+:10BA2000310D0A3A31303343363030303333333925
+:10BA300033373336304430413341333133303434AB
+:10BA400034333339333033303330333334360D0A13
+:10BA50003A313033433730303033373333333033A8
+:10BA600033333033333330333333303333333633AC
+:10BA700033333733333332333331360D0A3A3130DF
+:10BA80003343383030303335333333373333333770
+:10BA90003333333233333333333433363333333274
+:10BAA00033333332333346390D0A3A313033433985
+:10BAB000303030343330443041334133313330343B
+:10BAC0003434333431333033303330333333303351
+:10BAD00033333730410D0A3A31303343413030305F
+:10BAE0003333333033333330333333333333333827
+:10BAF0003333333733343335333333363333333807
+:10BB000044360D0A3A313033434230303033333328
+:10BB100030333333303333333033343333333333FD
+:10BB20003333333330333233323044304133300DFA
+:10BB30000A3A3130334343303030334133313330DC
+:10BB400034343433343233303330333033333336C8
+:10BB50003333333433333330333339410D0A3A31ED
+:10BB6000303343443030303330333333373333338F
+:10BB7000303330343433303431333334313333339E
+:10BB80003133333330333439330D0A3A31303343C0
+:10BB90004530303033313333333933333338333363
+:10BBA000333033333330333634363044304133413D
+:10BBB0003331333044380D0A3A3130334346303074
+:10BBC000303434343334333330333033303333334D
+:10BBD0003033333332333333363333333733333332
+:10BBE0003736350D0A3A3130334430303030333364
+:10BBF000333033333336333333363333333733330E
+:10BC000033353333333733333336333333313735F7
+:10BC10000D0A3A313033443130303033333332333C
+:10BC200033333633333337333033393044304133C1
+:10BC3000413331333034343433343438350D0A3A07
+:10BC400031303344323030303330333033303333CB
+:10BC500033363333333033333336333333363333AE
+:10BC6000333733343334333336300D0A3A313033EB
+:10BC70004433303030333733333336333333313387
+:10BC80003333333334333633333337333333373378
+:10BC9000333330333334350D0A3A313033443430B2
+:10BCA000303033363333333034343433304430414E
+:10BCB000334133313330343434333435333033304B
+:10BCC000333034350D0A3A31303344353030303387
+:10BCD0003333303333333033333338333034343336
+:10BCE0003034313333343133333331333333303130
+:10BCF000320D0A3A31303344363030303334333158
+:10BD000033333339333333393333333033333330FD
+:10BD100033333330333333323333333631460D0A32
+:10BD20003A313033443730303033333436304430C6
+:10BD300041334133313330343434333436333033B8
+:10BD400030333033333332333332330D0A3A313018
+:10BD5000334438303030333733333336333433329F
+:10BD600033333332333433363333333033333331A5
+:10BD700033333330333330310D0A3A3130334439D1
+:10BD80003030303330333433323333333933333389
+:10BD90003233343335333333363333333834313469
+:10BDA00031304446300D0A3A31303344413030307E
+:10BDB0003041334133313330343434343330333041
+:10BDC000333033303333333033333330333333334F
+:10BDD00046410D0A3A313033444230303033333348
+:10BDE0003833333337333433353333333633333314
+:10BDF0003833333330333333303333333743310D28
+:10BE00000A3A31303344433030303333333733330D
+:10BE100033373333333433333337333333373432E5
+:10BE20003337304430413341333145390D0A3A31EB
+:10BE300030334444303030333034343434333133BD
+:10BE400030333033303330343433303431333334CF
+:10BE50003133333331333337410D0A3A31303344E0
+:10BE60004530303033303334333133333339333496
+:10BE7000333133333330333333303333333033349C
+:10BE80003331333341430D0A3A3130334446303095
+:10BE90003033393333333733343335333333353465
+:10BEA000343432304430413341333133303434343C
+:10BEB0003438460D0A3A3130334530303030333281
+:10BEC000333033303330333433313333333033334F
+:10BED0003330333333353333333833343333384219
+:10BEE0000D0A3A313033453130303033333331336A
+:10BEF000333330333333343333333033333330331A
+:10BF0000333333333333303334333237460D0A3A35
+:10BF100031303345323030303333333133333332F1
+:10BF200034313335304430413341333133303434BC
+:10BF3000343433333330333038360D0A3A3130331A
+:10BF400045333030303330333433333333333133BC
+:10BF500033333033333331333333343333333033B8
+:10BF6000333330333435460D0A3A313033453430CB
+:10BF70003030333533333331333433363333333096
+:10BF80003333333033333337333034343330343185
+:10BF9000333332370D0A3A313033453530303034AF
+:10BFA000313434333630443041334133313330343B
+:10BFB0003434343334333033303330333333313457
+:10BFC000350D0A3A31303345363030303333333083
+:10BFD000333433313333333933343332333333302F
+:10BFE00033333330333333303333333032430D0A6A
+:10BFF0003A31303345373030303334333333333301
+:10C0000036333333303333333133333338333333FD
+:10C0100030333433313337333330450D0A3A31302E
+:10C0200033453830303030443041334133313330B0
+:10C0300034343434333533303330333033333331D5
+:10C0400033333338333333310D0A3A3130334539F2
+:10C0500030303033353333333633343336333433AF
+:10C0600031333333303334333233333330333333A8
+:10C0700036333345440D0A3A3130334541303030A0
+:10C08000333733333332333333303333333433337F
+:10C09000333233333330333633313044304133414C
+:10C0A00032430D0A3A313033454230303033313388
+:10C0B0003034343434333633303330333033343354
+:10C0C0003333333336333333353333333242360D50
+:10C0D0000A3A313033454330303033333338333438
+:10C0E0003331333333383333333733343334333317
+:10C0F0003331333034343330343139430D0A3A314B
+:10C1000030334544303030333334313333333133EB
+:10C1100033333033343331333833333044304133D5
+:10C120004133313330343445310D0A3A31303345FF
+:10C1300045303030343433373330333033303333C9
+:10C1400033393334333333333330333333303333BE
+:10C150003330333339380D0A3A31303345463030D5
+:10C1600030333033333330333333303333333033AE
+:10C170003333333333333833333336333333363384
+:10C180003339330D0A3A31303346303030303330C2
+:10C190003333333433333330333634333044304154
+:10C1A000334133313330343434343338333039433A
+:10C1B0000D0A3A313033463130303033303330339A
+:10C1C0003333303333333033343333333333353342
+:10C1D000333330333333303333333038330D0A3A7B
+:10C1E0003130334632303030333333303333333120
+:10C1F0003333333533333336333333353333333605
+:10C20000333433333333333635380D0A3A31303340
+:10C2100046333030303333333533343336304430D3
+:10C2200041334133313330343434343339333033C0
+:10C23000303330333337390D0A3A31303346343006
+:10C2400030303332333333393333333233333331C2
+:10C2500033343331333333313333333833303434AD
+:10C26000333033320D0A3A313033463530303034E2
+:10C270003133333431333333313333333033343395
+:10C28000313333333933343334333333303336317A
+:10C29000330D0A3A313033463630303034323044A0
+:10C2A000304133413331333034343434343133304A
+:10C2B00033303330333333303333333033450D0A97
+:10C2C0003A3130334637303030333333353333332C
+:10C2D0003433333336333333383334333333333324
+:10C2E00036333333363333333230300D0A3A31306C
+:10C2F0003346383030303333333033343333333301
+:10C3000033353333333033333331333333393331FC
+:10C3100033393044304134420D0A3A3130334639F2
+:10C3200030303033413331333034343434343233D9
+:10C3300030333033303333333033333330333333DC
+:10C3400038333343380D0A3A3130334641303030D8
+:10C3500033323333333033333333333333303334B3
+:10C36000333333333335333333303333333333339E
+:10C3700045380D0A3A3130334642303030333233AB
+:10C38000333330333333303333333333333338337E
+:10C390003234353044304133413331333030460D5F
+:10C3A0000A3A313033464330303034343434343365
+:10C3B0003330333033303333333433333337333351
+:10C3C0003338333433333330343437460D0A3A316B
+:10C3D000303346443030303330343133333431331A
+:10C3E000333331333333303334333133333339331D
+:10C3F0003433353333333039380D0A3A313033463C
+:10C4000045303030333333303333333033333331FB
+:10C4100033333432304430413341333133303434C8
+:10C420003434343442340D0A3A31303346463030F5
+:10C4300030333033303330333333383333333033D6
+:10C4400033333033333331333433333333333633BD
+:10C450003339390D0A3A31303430303030303330FE
+:10C46000333333363333333433333330333333309E
+:10C470003334333333333336333333343333383085
+:10C480000D0A3A31303430313030303335333333D4
+:10C490003134363334304430413341333133303446
+:10C4A000343434343533303330333037450D0A3A91
+:10C4B0003130343032303030333333323333333160
+:10C4C0003333333933333332333333383333333530
+:10C4D000333333373333333535310D0A3A31303472
+:10C4E000303330303033343331333333303333332C
+:10C4F000303333333033333334333333363333330E
+:10C50000303334333635350D0A3A31303430343047
+:10C5100030303434343230443041334133313330CD
+:10C5200034343434343633303330333033343333DB
+:10C53000333034330D0A3A31303430353030303422
+:10C5400034333034313333343133333331333333C1
+:10C5500030333433313333333933343336333330A8
+:10C56000320D0A3A313034303630303033303333F4
+:10C57000333033333330333433333333333633338D
+:10C5800033353333333634363431304432350D0AB3
+:10C590003A31303430373030303041334133313359
+:10C5A0003034343435333033303330333033333365
+:10C5B00039333333323333333131440D0A3A313086
+:10C5C0003430383030303333333433333332333341
+:10C5D0003338333333343333333733333332333322
+:10C5E00033383333333046350D0A3A31303430394D
+:10C5F0003030303333333033333331333333343318
+:10C6000033333633343331343333373044304133DA
+:10C6100041333132380D0A3A313034304130303024
+:10C6200033303434343533313330333033303334E2
+:10C6300033333333333433333334333333303333CB
+:10C6400043420D0A3A3130343042303030333833DF
+:10C6500033333233333330333433363333333033AD
+:10C660003333363333333633333335333343360DA5
+:10C670000A3A3130343043303030333833333330AA
+:10C68000333034343330343134363337304430415E
+:10C690003341333133303434343542380D0A3A3192
+:10C6A0003034304430303033323330333033303361
+:10C6B0003334313333333133333330333433313351
+:10C6C0003433313333333042360D0A3A313034307B
+:10C6D000453030303333333033333330333333302A
+:10C6E0003334333633333332333333303334333418
+:10C6F0003333333241380D0A3A313034304630303A
+:10C7000030333333383333333533383431304430E6
+:10C7100041334133313330343434353333333033D0
+:10C720003041360D0A3A3130343130303030333028
+:10C7300033333337333333353334333133333330C7
+:10C7400033333330333333303333333433333835B7
+:10C750000D0A3A31303431313030303336333333FF
+:10C760003133343333333333343333333533343396
+:10C77000363334333433333332333336350D0A3AC8
+:10C78000313034313230303033303337333230447B
+:10C790003041334133313330343434353334333052
+:10C7A000333033303333333838430D0A3A31303491
+:10C7B0003133303030333333323333333833333350
+:10C7C0003533333337333333353333333233333332
+:10C7D000303333333034410D0A3A31303431343070
+:10C7E0003030333333333334333233303434333023
+:10C7F000343133333431333333313333333034340E
+:10C80000333630390D0A3A3130343135303030304A
+:10C8100044304133413331333034343435333533BC
+:10C8200030333033303334333133343331333336E0
+:10C83000320D0A3A3130343136303030333133331F
+:10C8400033303333333033333330333333313333C3
+:10C8500033343333333633333331333432390D0AEF
+:10C860003A3130343137303030333333343333339B
+:10C870003333353333333033333331333333383386
+:10C8800035343630443041334133460D0A3A313085
+:10C89000343138303030333133303434343533366A
+:10C8A0003330333033303333333033333330333466
+:10C8B00033333333333245440D0A3A31303431396E
+:10C8C0003030303333333033333332333333303348
+:10C8D0003333343333333633333331333333373322
+:10C8E00033333845420D0A3A31303431413030303B
+:10C8F0003333333433333337333333323333333007
+:10C9000033373334304430413341333133303434CE
+:10C9100031350D0A3A31303431423030303435332C
+:10C9200037333033303330333333303333333033E2
+:10C930003433333334333333333334333343350DD8
+:10C940000A3A3130343143303030333033333337D7
+:10C9500033333339333034343330343133333431A7
+:10C960003333333133333330333439350D0A3A31DD
+:10C970003034314430303033313334333133333386
+:10C980003233383332304430413341333133303451
+:10C990003434353338333044370D0A3A313034319A
+:10C9A000453030303330333033333330333333305A
+:10C9B0003333333033333332333333303333333051
+:10C9C0003333333342350D0A3A3130343146303067
+:10C9D0003033333330333333323333333033343330
+:10C9E000343334333633333338333333353333330B
+:10C9F0003738350D0A3A3130343230303030333355
+:10CA000033343334333930443041334133313330CC
+:10CA100034343435333933303330333033334133D6
+:10CA20000D0A3A313034323130303033343333332D
+:10CA300030333333303333333333333332333333CD
+:10CA4000303333333233333331333337410D0A3AF2
+:10CA500031303432323030303336333333353333B0
+:10CA60003335333433333334333333333335333390
+:10CA7000333033333332333335370D0A3A313034D0
+:10CA80003233303030333930443041334133313355
+:10CA9000303434343534313330333033303333336E
+:10CAA000303333333037330D0A3A313034323430A7
+:10CAB000303033333333333333383333333333304A
+:10CAC000343433303431333334313333333133333B
+:10CAD000333031370D0A3A3130343235303030337B
+:10CAE000343331333433313333333333333330331B
+:10CAF00033333033333330333734343044304137E9
+:10CB0000330D0A3A3130343236303030334133313C
+:10CB100033303434343534323330333033303333EC
+:10CB200033303333333233333330333346410D0A0A
+:10CB30003A313034323730303033363334333133C6
+:10CB400033333933333330333333373333333733AA
+:10CB500033333433333330333330330D0A3A3130F7
+:10CB6000343238303030333033333330333433339E
+:10CB7000333333323333333033313339304430416C
+:10CB800033413331333035300D0A3A3130343239B4
+:10CB90003030303434343534333330333033303371
+:10CBA0003333363333333433333330333333303357
+:10CBB00034333643320D0A3A31303432413030307A
+:10CBC000333333323333333433333339333433332E
+:10CBD0003333333433333336333333303333333225
+:10CBE00044370D0A3A313034324230303033333347
+:10CBF00032333333343333333634363338304430EE
+:10CC00004133413331333034343435343443430DDC
+:10CC10000A3A31303432433030303330333033300D
+:10CC200033333339333333333330343433303431D3
+:10CC30003333343133333331333339430D0A3A31FB
+:10CC400030343244303030333033343331333433B2
+:10CC500031333333343333333033333330333333AB
+:10CC60003033333337333342370D0A3A31303432CD
+:10CC70004530303033383333333533333431304467
+:10CC8000304133413331333034343435343533305B
+:10CC90003330333041410D0A3A313034324630308E
+:10CCA0003033333337333333353333333433333350
+:10CCB0003033333330333433333334333333333348
+:10CCC0003538390D0A3A313034333030303033337F
+:10CCD0003330333333393334333633333330333320
+:10CCE000333033333337333333383333333537310A
+:10CCF0000D0A3A313034333130303034333334305C
+:10CD000044304133413331333034343435343633C5
+:10CD1000303330333033333337333337380D0A3A27
+:10CD200031303433323030303334333333343333DF
+:10CD300033303333333033333330333333323333CD
+:10CD4000333233343331333336370D0A3A313034FA
+:10CD500033333030303332333333383333333333A8
+:10CD6000333337333333383334333133303434348B
+:10CD7000363334304434350D0A3A313034333430BC
+:10CD80003030304133413331333034343436333062
+:10CD90003330333033303330343133333431333371
+:10CDA000333133350D0A3A313034333530303033A6
+:10CDB0003333303334333133343331333333353346
+:10CDC000333330333333303333333033333335333A
+:10CDD000370D0A3A3130343336303030333333386C
+:10CDE0003333333033333330333433333334333317
+:10CDF00034343332304430413341333135360D0A27
+:10CE00003A313034333730303033303434343633F1
+:10CE100031333033303330333333333333333033F0
+:10CE200033333733333337333346320D0A3A313005
+:10CE300034333830303033303333333033343333CA
+:10CE400033333332333333323333333533333332B3
+:10CE500033333338333346450D0A3A3130343339BE
+:10CE60003030303333333333373333333533333395
+:10CE7000323432333930443041334133313330345A
+:10CE800034343646430D0A3A313034334130303091
+:10CE90003332333033303330333333303333333072
+:10CEA0003334333333343333333333333333333053
+:10CEB00045450D0A3A313034334230303033333364
+:10CEC0003133333338333333303333333033333335
+:10CED0003733343336333034343330343141460D24
+:10CEE0000A3A313034334330303033333431333332
+:10CEF00033313435333030443041334133313330E2
+:10CF00003434343633333330333044310D0A3A312C
+:10CF100030343344303030333033333330333433E0
+:10CF200031333433313333333633333330333333D4
+:10CF30003033333330333442410D0A3A31303433F5
+:10CF400045303030333333333332333333303333AC
+:10CF5000333633333332333333383333333233339B
+:10CF60003337333339370D0A3A31303433463030C2
+:10CF70003033353338333630443041334133313355
+:10CF80003034343436333433303330333033343375
+:10CF90003142350D0A3A31303434303030303333A9
+:10CFA0003330333333303334333333333334333355
+:10CFB0003332333433353334333433333332374429
+:10CFC0000D0A3A313034343130303033333330338A
+:10CFD000343336333433363333333233333330331D
+:10CFE000333334333433333333333736350D0A3A4E
+:10CFF00031303434323030303044304133413331E9
+:10D0000033303434343633353330333033303334F3
+:10D01000333333333333333338420D0A3A31303418
+:10D0200034333030303330333333313333333333DD
+:10D0300033333033333330333333393334333433BE
+:10D04000303434333034340D0A3A313034343430FF
+:10D0500030303431333334313333333133333330AD
+:10D060003334333133343331343133363044304177
+:10D07000334135450D0A3A313034343530303033B0
+:10D080003133303434343633363330333033303375
+:10D090003333373333333033333330333333303167
+:10D0A000380D0A3A3130343436303030333433339B
+:10D0B000333333323333333133333338333333323F
+:10D0C00033333338333333323333333731320D0A7A
+:10D0D0003A3130343437303030333333353334331E
+:10D0E000313333333033333330333633333044300A
+:10D0F00041334133313330343434410D0A3A313025
+:10D1000034343830303034363337333033303330F2
+:10D1100033343333333433333333333233333330E1
+:10D1200033333331333346320D0A3A313034343904
+:10D1300030303033333333333033333330333433CD
+:10D1400034333333323333333033333336333433AE
+:10D1500033333445460D0A3A3130343441303030BF
+:10D160003333333333333333333033333330304487
+:10D170003041334133313330343434363338333063
+:10D1800030390D0A3A3130343442303030333033B4
+:10D190003033333331333433343333333033333365
+:10D1A0003033333336333333333330343443370D62
+:10D1B0000A3A313034344330303033303431333361
+:10D1C0003431333333313333333033343331333435
+:10D1D0003331333333383333333041380D0A3A3156
+:10D1E0003034344430303033333330333833373005
+:10D1F00044304133413331333034343436333933CE
+:10D200003033303330333344320D0A3A3130343432
+:10D2100045303030333033343333333333323333D8
+:10D2200033313333333033343333333333343333D1
+:10D230003332333341330D0A3A31303434463030EF
+:10D2400030333933343333333333323333333033AE
+:10D250003433353333333333333338333333333396
+:10D260003138330D0A3A31303435303030303331E3
+:10D270003044304133413331333034343436343157
+:10D28000333033303330333333373333333339445C
+:10D290000D0A3A31303435313030303334333333B2
+:10D2A0003333303333333033343333333333343352
+:10D2B000333333333333323333333037320D0A3A87
+:10D2C000313034353230303033333332333333303E
+:10D2D000333433313334333333333334333333351B
+:10D2E000333033393044304141380D0A3A3130342B
+:10D2F00035333030303341333133303434343634F5
+:10D3000032333033303330333333303333333733F6
+:10D31000333336333031450D0A3A31303435343019
+:10D3200030303434333034313333343133333331D8
+:10D3300033333330333433313334333133333339BC
+:10D34000333331320D0A3A31303435353030303301
+:10D3500030333333303333333033333330333333A9
+:10D360003633363331304430413341333133303862
+:10D37000300D0A3A313034353630303034343436CA
+:10D380003433333033303330333333333333333573
+:10D3900033333333333333323333333046320D0A9E
+:10D3A0003A3130343537303030333333323333334E
+:10D3B0003133333336333333333333333533343339
+:10D3C00033333433333333333330370D0A3A313078
+:10D3D000343538303030333333303333333933331B
+:10D3E00033363436343230443041334133313330E4
+:10D3F00034343436343445420D0A3A313034353918
+:10D400003030303330333033303333333033333301
+:10D4100030333333303334333333333332333333E2
+:10D4200030333330300D0A3A31303435413030301A
+:10D4300033363333333433333330333333303333BE
+:10D4400033313333333233333331333333373334AC
+:10D4500044440D0A3A3130343542303030333233BF
+:10D46000333331333033343044304133413331336B
+:10D470003034343436343533303330333046300D95
+:10D480000A3A31303435433030303330343433308D
+:10D490003431333334313333333133333330333462
+:10D4A0003331333433313334333139430D0A3A3184
+:10D4B000303435443030303333333033333330333A
+:10D4C0003333303333333833333336333333353325
+:10D4D0003333353333333341380D0A3A3130343551
+:10D4E00045303030333233313044304133413331E1
+:10D4F00033303434343634363330333033303333FE
+:10D500003332333342450D0A3A3130343546303008
+:10D5100030333033333332333333313333333633E1
+:10D5200033333533333335333433333334333333C5
+:10D530003338380D0A3A3130343630303030333504
+:10D5400033333330333333393333333033333330AE
+:10D550003333333133333330343433373044393188
+:10D560000D0A3A31303436313030303041334133C6
+:10D57000313330343533303330333033303330338C
+:10D58000333332333333303333333738450D0A3A9C
+:10D590003130343632303030333433333334333364
+:10D5A0003333333433333330333333353333333846
+:10D5B000333333303333333235370D0A3A31303485
+:10D5C0003633303030333333313333333033303438
+:10D5D0003433303431333334313330343330443016
+:10D5E000413341333136350D0A3A31303436343037
+:10D5F000303033303435333033313330333033300F
+:10D6000033333331333333303334333133343331F1
+:10D61000333433460D0A3A31303436353030303316
+:10D6200032333333303333333033333330333333D4
+:10D6300031333333323333333033333337333433BB
+:10D64000350D0A3A313034363630303033333334F6
+:10D650003333333333353333333033393336304484
+:10D6600030413341333133303435333034460D0AB1
+:10D670003A31303436373030303332333033303380
+:10D680003033343335333333383333333033333368
+:10D6900033333433363333333230430D0A3A313097
+:10D6A000343638303030333333303333333333344C
+:10D6B000333333343333333333343333333033343A
+:10D6C00033353333333846350D0A3A313034363951
+:10D6D0003030303333333033333333333634323026
+:10D6E00044304133413331333034353330333333E5
+:10D6F00030333031460D0A3A313034364130303033
+:10D7000033303333333033333332333333303333F3
+:10D7100033373333333333333338333333373333CC
+:10D7200044370D0A3A3130343642303030333733F3
+:10D7300034333433333332333034343330343133BD
+:10D740003334313333333133333330333441320DC7
+:10D750000A3A3130343643303030333134343335B3
+:10D760003044304133413331333034353330333466
+:10D770003330333033303334333146300D0A3A31BD
+:10D780003034364430303033343333333333303362
+:10D79000333330333333303333333333343333335E
+:10D7A0003333303333333042370D0A3A3130343685
+:10D7B0004530303033333330333433333333333233
+:10D7C000333333303333333633333334333333302B
+:10D7D0003337333739370D0A3A3130343646303043
+:10D7E00030304430413341333133303435333033EA
+:10D7F0003533303330333033333330333433333302
+:10D800003344310D0A3A313034373030303033342C
+:10D8100033333337333333323333333133333332D8
+:10D8200033333330333333323333333033333746B8
+:10D830000D0A3A3130343731303030333633333308
+:10D8400032333333363334333533333331333433A4
+:10D85000363336333130443041334141360D0A3AA4
+:10D860003130343732303030333133303435333097
+:10D870003336333033303330333333303333333084
+:10D88000333333303333333036310D0A3A313034B9
+:10D89000373330303033333330333333373333335C
+:10D8A000333330343433303431333334313333334E
+:10D8B000313333333032360D0A3A31303437343085
+:10D8C000303033343331333433313334333433332E
+:10D8D00033303431343530443041334133313330F7
+:10D8E000343535370D0A3A3130343735303030334E
+:10D8F0003033373330333033303333333033333303
+:10D9000030333333323333333833333337333332E3
+:10D91000460D0A3A31303437363030303332333313
+:10D9200033373333333433333330333333303333C8
+:10D9300033333333333433333331333331430D0AF9
+:10D940003A313034373730303033343333333333A4
+:10D95000333334333634363044304133413331336A
+:10D9600030343533303338333032440D0A3A3130C5
+:10D970003437383030303330333033333337333378
+:10D980003331333333343333333333333337333364
+:10D9900033373334333346330D0A3A313034373981
+:10D9A000303030333433333333333733333330334E
+:10D9B000333333333333323333333033333330333E
+:10D9C00034333245450D0A3A313034374130303046
+:10D9D00033333331333234353044304133413331F2
+:10D9E000333034353330333933303330333033340C
+:10D9F00030410D0A3A31303437423030303336332B
+:10DA000033333133343332333333313330343433EB
+:10DA10003034313333343133333331333341350DF3
+:10DA20000A3A3130343743303030333033343331E5
+:10DA300033343331333433353333333033333330BA
+:10DA40003333333033333330333543350D0A3A31E2
+:10DA50003034374430303034343044304133413363
+:10DA60003133303435333034313330333033303395
+:10DA70003333323333333044350D0A3A31303437AF
+:10DA80004530303033333334333433313333333957
+:10DA9000333333373333333233333337333333344E
+:10DAA0003333333038450D0A3A313034374630306D
+:10DAB0003033333330333433363333333233333339
+:10DAC0003133333338333433333330333830443015
+:10DAD0004144320D0A3A313034383030303033413D
+:10DAE0003331333034353330343233303330333014
+:10DAF00033343333333333333333333033333633F5
+:10DB00000D0A3A3130343831303030333633333334
+:10DB100034333333303333333033333339333333D4
+:10DB2000323334333633343332333336310D0A3A09
+:10DB300031303438323030303333333333383333B9
+:10DB4000333733333332333333333436333630448D
+:10DB5000304133413331333038370D0A3A313034C4
+:10DB6000383330303034353330343333303330338E
+:10DB7000303333333033303434333034313333347F
+:10DB8000313333333131300D0A3A313034383430B7
+:10DB9000303033333330333433313334333133345F
+:10DBA000333633333330333333303333333033334B
+:10DBB000333633460D0A3A3130343835303030336D
+:10DBC000343333333333303333333033333434302B
+:10DBD00044304133413331333034353330343434ED
+:10DBE000390D0A3A31303438363030303330333052
+:10DBF00033303334333133333339333333303333F6
+:10DC000033323333333733333334333331420D0A22
+:10DC10003A313034383730303033303333333033D7
+:10DC200034333333343333333333373333333033C1
+:10DC300033333533343336333330350D0A3A3130FC
+:10DC400034383830303033303333333034343331A8
+:10DC5000304430413341333133303435333034356F
+:10DC600033303330333032340D0A3A3130343839CE
+:10DC7000303030333333393333333233333330337B
+:10DC80003333343333333033343333333333373361
+:10DC900033333045360D0A3A313034384130303084
+:10DCA0003333333733333333333333303333333046
+:10DCB000333433313334333233303434333034313A
+:10DCC00043320D0A3A313034384230303033323357
+:10DCD00033304430413341333133303435333034F1
+:10DCE0003633303330333033333431333345460D0C
+:10DCF0000A3A313034384330303033313333333013
+:10DD000033343331333433323333333033333330EA
+:10DD10003333333033333330333443390D0A3A310C
+:10DD200030343844303030333633333332333333B6
+:10DD300030333333333333333033343333333333B8
+:10DD40003734323434304441440D0A3A31303438B7
+:10DD50004530303030413341333133303435333175
+:10DD60003330333033303330333333303333333590
+:10DD70003334333642380D0A3A3130343846303095
+:10DD8000303333333033333330333433323333336C
+:10DD90003933333337333333323333333633343346
+:10DDA0003338310D0A3A3130343930303030333392
+:10DDB000333033333330333333303334333333333B
+:10DDC00033373339343430443041334133314145D2
+:10DDD0000D0A3A3130343931303030333034353364
+:10DDE0003133313330333033303333333033333313
+:10DDF000373333333833333330333336320D0A3A33
+:10DE000031303439323030303330333433313333EE
+:10DE100033393333333733333332333433333334C7
+:10DE2000333633303434333034320D0A3A3130340F
+:10DE300039333030303431333334313333333133B9
+:10DE4000333330343533323044304133413331337E
+:10DE5000303435333135430D0A3A313034393430CA
+:10DE60003030333233303330333033343331333492
+:10DE7000333233333331333333303333333033337B
+:10DE8000333034440D0A3A313034393530303033A0
+:10DE90003333373333333433333330333333303353
+:10DEA0003333343334333233333333333433343240
+:10DEB000350D0A3A3130343936303030333333307F
+:10DEC00033333335333834353044304133413331F3
+:10DED00033303435333133333330333034340D0A67
+:10DEE0003A31303439373030303330333333303304
+:10DEF00033333033333333333333303334333633F4
+:10DF000033333133333332333331320D0A3A313034
+:10DF100034393830303033343333333133333334CE
+:10DF200033343335333333313334333633333330BF
+:10DF300033333333333446340D0A3A3130343939DC
+:10DF4000303030333333373338304430413341337A
+:10DF5000313330343533313334333033303330339D
+:10DF600033333132350D0A3A3130343941303030C3
+:10DF7000333333303333333133333330333333307C
+:10DF80003333333033343331333433353330343463
+:10DF900044350D0A3A313034394230303033303480
+:10DFA0003133333431333333313333333033343348
+:10DFB0003133343332333333323433333041380D49
+:10DFC0000A3A313034394330303030443041334113
+:10DFD000333133303435333133353330333033301C
+:10DFE0003333333033333330333330310D0A3A3156
+:10DFF00030343944303030333033343334333333E6
+:10E0000031333433333333333133333330333433E5
+:10E010003333343335333341410D0A3A31303439F7
+:10E0200045303030333033333331333333383333B7
+:10E0300033303334333133333333333533313044A6
+:10E040003041334145330D0A3A31303439463030AE
+:10E05000303331333034353331333633303330339A
+:10E060003033333338333433343334333533333379
+:10E070003437370D0A3A31303441303030303333B1
+:10E080003338333333313333333133333330333461
+:10E090003333333333323333333033333336373848
+:10E0A0000D0A3A313034413130303033333330338C
+:10E0B0003333313334333233333330333433323038
+:10E0C000443041334133313330343541390D0A3A2C
+:10E0D0003130344132303030333133373330333014
+:10E0E0003330333333343333333333343333333301
+:10E0F000333233343336333035420D0A3A3130342B
+:10E1000041333030303434333034313333343133DD
+:10E1100033333133333330333433313334333233D5
+:10E12000333333333332320D0A3A31303441343001
+:10E1300030303330333333303333333033383335B7
+:10E140003044304133413331333034353331333877
+:10E15000333037330D0A3A313034413530303033D3
+:10E16000303330333333383334333233333335337E
+:10E17000333330333333303333333233333330327A
+:10E18000460D0A3A31303441363030303333333093
+:10E19000333433333333333433343334333333304E
+:10E1A00033333339333333323333333031360D0A8B
+:10E1B0003A31303441373030303333333633333320
+:10E1C00032304430413341333133303435333133FD
+:10E1D00039333033303330333334340D0A3A31305D
+:10E1E00034413830303033303334333333333337F2
+:10E1F00033333330333333353334333633333330EF
+:10E2000033333330333446360D0A3A313034413902
+:10E2100030303033323333333933333337333433CD
+:10E2200035333333343333333833333331333333B8
+:10E2300031333044420D0A3A3130344141303030CC
+:10E240003335304430413341333133303435333179
+:10E25000343133303330333033343331333333319B
+:10E2600030460D0A3A3130344142303030333034A8
+:10E270003433303431333334313333333133333374
+:10E280003033343331333433323333333441340D78
+:10E290000A3A313034414330303033333330333362
+:10E2A0003330333333303334333633333332333341
+:10E2B0003330333534333044304146430D0A3A313C
+:10E2C00030344144303030334133313330343533FE
+:10E2D0003134323330333033303333333333343318
+:10E2E0003233333339333438370D0A3A313034412D
+:10E2F00045303030333433343335333333343333E0
+:10E3000033383333333133333331333333343334DA
+:10E310003332333338460D0A3A31303441463030E7
+:10E3200030333333343334333333303333333533BF
+:10E330003333303434333830443041334133313384
+:10E340003042460D0A3A31303442303030303435C4
+:10E35000333134333330333033303333333033339A
+:10E36000333533333330333433333333333136337C
+:10E370000D0A3A31303442313030303333333233B6
+:10E380003433333333333133333330333333313363
+:10E39000333330333333303333333037350D0A3A98
+:10E3A0003130344232303030333333333333333639
+:10E3B0003330343433333339304430413341333103
+:10E3C000333034353331343436410D0A3A31303458
+:10E3D0004233303030333033303330333034313314
+:10E3E0003334313333333133333330333433313304
+:10E3F000343332333333420D0A3A3130344234301D
+:10E4000030303335333333303333333033333330E9
+:10E4100033343335333333313334333633333330CA
+:10E42000333333410D0A3A313034423530303033F2
+:10E43000303333333033303336304430413341338B
+:10E4400031333034353331343533303330333035A4
+:10E45000460D0A3A313034423630303033333330BF
+:10E460003333333033333333333433333333333180
+:10E4700033333330333333313333333032340D0AC3
+:10E480003A31303442373030303333333033333352
+:10E49000303334333433333331333433333333334E
+:10E4A00031333333303333333630430D0A3A31307E
+:10E4B00034423830303034353338304430413341F1
+:10E4C0003331333034353331343633303330333025
+:10E4D00033343335333330450D0A3A313034423931
+:10E4E0003030303332333333383334333233333301
+:10E4F00034333433343333333033333335333333EA
+:10E5000030333345320D0A3A313034424130303005
+:10E5100033303333333733333331333034343330D0
+:10E5200034313333343133333331333033373044B0
+:10E5300044360D0A3A3130344242303030304133C3
+:10E540004133313330343533323330333033303399
+:10E550003033333330333433313334333245420D97
+:10E560000A3A313034424330303033333336333388
+:10E570003330333333303333333033333332333375
+:10E580003338333333373334333542300D0A3A318D
+:10E590003034424430303033333337333333323333
+:10E5A0003333303333333033333332343233343044
+:10E5B0004430413341333145330D0A3A313034422E
+:10E5C000453030303330343533323331333033301B
+:10E5D0003330333333363333333733333332333308
+:10E5E0003334333338420D0A3A3130344246303016
+:10E5F00030333333333337333333373334333333E5
+:10E6000034333333333337333333303333333633D5
+:10E610003337370D0A3A313034433030303033330A
+:10E6200033333330333333303333333034313334C3
+:10E63000304430413341333133303435333241416A
+:10E640000D0A3A31303443313030303332333033E5
+:10E65000303330333333363334333333333332338D
+:10E66000333330333433333334333436420D0A3AB0
+:10E67000313034433230303033333330333333336B
+:10E68000333333383330343433303431333334315B
+:10E69000333333313333333033300D0A3A3130349E
+:10E6A0004333303030333433313334333234323433
+:10E6B0003330443041334133313330343533323306
+:10E6C000333330333036380D0A3A31303443343056
+:10E6D0003030333033333337333333303333333015
+:10E6E00033333330333333313333333833333330FD
+:10E6F000333433420D0A3A3130344335303030331D
+:10E7000031333333303333333233333330333433E1
+:10E7100033333333303334333333333337333332C8
+:10E72000410D0A3A313034433630303033303338EB
+:10E730003435304430413341333133303435333282
+:10E7400033343330333033303333333634310D0AEE
+:10E750003A3130344337303030333333343333337A
+:10E76000303333333033343331333333393333337A
+:10E7700037333433353333333746390D0A3A313092
+:10E780003443383030303333333233333330333350
+:10E790003330333333333333333833333337333442
+:10E7A00033343335343644420D0A3A313034433948
+:10E7B000303030304430413341333133303435330D
+:10E7C0003233353330333033303333333033333324
+:10E7D00034333332390D0A3A31303443413030303A
+:10E7E00033303333333033333337333333333330FE
+:10E7F00034343330343133333431333333313333EE
+:10E8000042310D0A3A313034434230303033303304
+:10E8100034333133343332333333383333333033C7
+:10E820003333303433333330443041334130310DBE
+:10E830000A3A3130344343303030333133303435B9
+:10E8400033323336333033303330333333303333A2
+:10E850003336333433333333333741390D0A3A31B6
+:10E860003034434430303033333330333333303368
+:10E870003333303333333033333331333433323370
+:10E880003333393333333741380D0A3A3130344377
+:10E89000453030303334333433333330333333343F
+:10E8A0003333333033353333304430413341333114
+:10E8B0003330343544300D0A3A3130344346303049
+:10E8C0003033323337333033303330333333303324
+:10E8D0003433363333333233333331333433353304
+:10E8E0003438380D0A3A3130344430303030333334
+:10E8F00033333334333333373333333033333330E9
+:10E9000033333332333333303333333433343736D2
+:10E910000D0A3A313034443130303033313333330F
+:10E920003933333337333234323044304133413387
+:10E93000313330343533323338333038370D0A3AE7
+:10E940003130344432303030333033303334333597
+:10E95000333333333334333433303434333034318A
+:10E96000333334313333333132460D0A3A313034B4
+:10E970004433303030333333303334333133343362
+:10E980003233333339333333303333333033333358
+:10E99000303333333734360D0A3A3130344434307F
+:10E9A0003030333333323336343230443041334114
+:10E9B000333133303435333233393330333033302D
+:10E9C000333336310D0A3A31303444353030303358
+:10E9D000303333333033343336333333323333330A
+:10E9E00031333333393333333333333338333331F0
+:10E9F000440D0A3A31303444363030303337333412
+:10EA000033343333333033333334333333303333DA
+:10EA100033303334333133333339333131320D0A18
+:10EA20003A31303444373030303338304430413389
+:10EA300041333133303435333234313330333033A2
+:10EA400030333333303334333533350D0A3A3130E4
+:10EA50003444383030303333333733333332333375
+:10EA60003330333333303334333433343333333379
+:10EA700033373333333046320D0A3A313034443988
+:10EA80003030303333333033333330333333303368
+:10EA90003333313333333033333339333133383045
+:10EAA00044304133370D0A3A31303444413030304C
+:10EAB0003341333133303435333234323330333021
+:10EAC000333033303434333034313333343133331F
+:10EAD00039330D0A3A313034444230303033313337
+:10EAE00033333033343331333433323334333133FB
+:10EAF0003333303333333033333330333344330D04
+:10EB00000A3A3130344443303030333833333332DF
+:10EB100033333330333333333334333533343336C1
+:10EB20003044304133413331333046380D0A3A31C5
+:10EB3000303444443030303435333234333330338E
+:10EB40003033303334333233333335333333383394
+:10EB50003333303333333538350D0A3A31303444BA
+:10EB60004530303033333330333333303333333372
+:10EB7000333333383333333733343334333333305D
+:10EB80003333333439300D0A3A313034444630307F
+:10EB9000303333333033333330333333313436344B
+:10EBA000363044304133413331333034353332340D
+:10EBB0003439300D0A3A313034453030303033306A
+:10EBC000333033303334333333333336333333301A
+:10EBD0003333333033333331333333303333383209
+:10EBE0000D0A3A313034453130303033313333333C
+:10EBF00035333333363333333733333336333433D8
+:10EC0000343333333533303434333034390D0A3A16
+:10EC100031303445323030303431333334313333C2
+:10EC20003331304430413341333133303435333292
+:10EC3000343533303330333036420D0A3A313034E4
+:10EC4000453330303033333331333333303334338F
+:10EC50003133343332333433323333333033333389
+:10EC6000303333333035310D0A3A313034453430B6
+:10EC7000303033343332333333393333333733345F
+:10EC80003334333333303333333433333330333358
+:10EC9000333032450D0A3A31303445353030303476
+:10ECA000323435304430413341333133303435330D
+:10ECB000323436333033303330333333313334332B
+:10ECC000340D0A3A31303445363030303333333353
+:10ECD00033373333333033333336333333343333FF
+:10ECE00033303333333033343333333331320D0A4B
+:10ECF0003A313034453730303033363334333333D0
+:10ED000033333733333339333333323333333033CD
+:10ED100033333534323336304430410D0A3A3130F2
+:10ED2000344538303030304133413331333034358D
+:10ED300033333330333033303330333333303334B1
+:10ED400033333333333731310D0A3A3130344539C7
+:10ED5000303030333333303333333533343331338E
+:10ED60003333303333333033333337333333313377
+:10ED700030343444410D0A3A31303445413030307A
+:10ED8000333034313333343133333331333333305D
+:10ED90003334333133303332304430413341333123
+:10EDA00030440D0A3A31303445423030303330345B
+:10EDB000353333333133303330333033343332332C
+:10EDC0003433333333333033333330333343330D2E
+:10EDD0000A3A313034454330303033303334333114
+:10EDE00033333339333333373334333533333337E2
+:10EDF0003333333633333330333341350D0A3A311D
+:10EE000030344544303030333033333333333333BD
+:10EE1000383333333733383333304430413341338D
+:10EE20003133303435333344320D0A3A31303445DE
+:10EE300045303030333233303330333033343334A1
+:10EE4000333333303333333433333330333333309A
+:10EE50003334333441300D0A3A31303445463030A2
+:10EE60003033343333333333373333333033333373
+:10EE7000303333333033333330333333313333336D
+:10EE80003838360D0A3A313034463030303033338A
+:10EE90003332333333303339343330443041334118
+:10EEA000333133303435333333333330333041302F
+:10EEB0000D0A3A3130344631303030333033333369
+:10EEC0003533333330333333363333333233343310
+:10EED000353333333233333337333036300D0A3A48
+:10EEE00031303446323030303434333034313333EF
+:10EEF00034313333333133333330333433313334E8
+:10EF0000333233343334333332420D0A3A3130340E
+:10EF1000463330303033303432333930443041339B
+:10EF200041333133303435333333343330333033AA
+:10EF3000303333333037350D0A3A313034463430DC
+:10EF4000303033333330333333313333333333339C
+:10EF5000333333343333333333383334333233337B
+:10EF6000333532450D0A3A3130344635303030339E
+:10EF70003333363333333033333335333333303362
+:10EF80003333303333333533333330333833343250
+:10EF9000300D0A3A3130344636303030304430416A
+:10EFA0003341333133303435333333353330333029
+:10EFB00033303334333333333331333335340D0A71
+:10EFC0003A31303446373030303332333433333300
+:10EFD000333331333333303333333133333330330B
+:10EFE00033333033333330333431300D0A3A313048
+:10EFF00034463830303033353333333133343336CD
+:10F0000033333330333333303333333033363336D3
+:10F0100030443041334133380D0A3A3130344639C7
+:10F0200030303033313330343533333336333033BB
+:10F0300030333033333330333333303333333133AE
+:10F0400033333245330D0A3A3130344641303030B3
+:10F050003330343433303431333334313333333188
+:10F060003333333033343331333433323334333571
+:10F0700041440D0A3A313034464230303033333374
+:10F080003033333330333333303333333334313459
+:10F090003430443041334133313330343545360D2B
+:10F0A0000A3A31303446433030303333333733303B
+:10F0B000333033303334333333333331333333302A
+:10F0C0003333333333333330333342440D0A3A313D
+:10F0D00030344644303030333033333330333433EC
+:10F0E00034333333393334333333333331333333EA
+:10F0F0003233333330333341340D0A3A313034460E
+:10F1000045303030333033333330333433343333CA
+:10F110003436304430413341333133303435333396
+:10F120003338333042420D0A3A31303446463030BB
+:10F13000303330333033333339333333383333339D
+:10F140003133333331333333303333333033333399
+:10F150003038390D0A3A31303530303030303333D1
+:10F160003330333433333334333533333330333371
+:10F17000333133333338333333303334333137335C
+:10F180000D0A3A31303530313030303334333233A8
+:10F190003233363044304133413331333034353318
+:10F1A000333339333033303330333339430D0A3A64
+:10F1B000313035303230303033373330343433302F
+:10F1C0003431333334313333333133333330333415
+:10F1D000333133343332333432410D0A3A3130353E
+:10F1E00030333030303336333333303333333033FE
+:10F1F00033333033343336333333383333333733D5
+:10F20000343335333433350D0A3A31303530343018
+:10F2100030303331304430413341333133303435A1
+:10F2200033333431333033303330333333353333B6
+:10F23000333236370D0A3A313035303530303033ED
+:10F240003333313333333133333330333333323396
+:10F250003333303333333433333333333333343280
+:10F26000390D0A3A313035303630303033333337B8
+:10F270003333333133343331333333393333333757
+:10F2800033343335333133393044304134440D0A6B
+:10F290003A31303530373030303341333133303438
+:10F2A0003533333432333033303330333333353333
+:10F2B00033333233333331333345370D0A3A313058
+:10F2C0003530383030303331333333333333333810
+:10F2D00033333337333433353333333033333334F9
+:10F2E00033333330333345420D0A3A313035303918
+:10F2F00030303033303333333833343334333034E5
+:10F3000034333034313335333630443041334133A4
+:10F3100031333030420D0A3A3130353041303030FF
+:10F3200034353333343333303330333033333431B3
+:10F3300033333331333333303334333133343333A2
+:10F3400041450D0A3A3130353042303030333333B5
+:10F350003033333330333333303333333033333389
+:10F360003033343333333333363333333043450D73
+:10F370000A3A31303530433030303334333333337D
+:10F380003330333333303436333230443041334129
+:10F390003331333034353333343443440D0A3A3166
+:10F3A0003035304430303033303330333033343331
+:10F3B0003333343334333333363333333633333315
+:10F3C0003733333339333339360D0A3A3130353048
+:10F3D00045303030333233333330333333373333F4
+:10F3E00033303333333433333336333333313334ED
+:10F3F0003334333338460D0A3A3130353046303005
+:10F4000030333633333336343333363044304133AC
+:10F4100041333133303435333334353330333033B3
+:10F420003039390D0A3A31303531303030303333FC
+:10F430003337333333383333333233333330333397
+:10F44000333433343336333333383333333635446C
+:10F450000D0A3A31303531313030303334333533D1
+:10F46000343331333333383330343433303431336D
+:10F47000333431333333313333333033360D0A3AA7
+:10F480003130353132303030333033343044304144
+:10F490003341333133303435333334363330333032
+:10F4A000333033343331333438320D0A3A31303576
+:10F4B000313330303033333333333133333330332C
+:10F4C0003333303333333033333335333333323311
+:10F4D000333331333334420D0A3A3130353134303D
+:10F4E00030303331333333303333333233333330FB
+:10F4F00033343336333333303334333334333334D8
+:10F50000304434420D0A3A31303531353030303004
+:10F5100041334133313330343533343330333033A6
+:10F5200030333033333336333333303333333034B3
+:10F53000320D0A3A313035313630303033333330F2
+:10F54000333333303333333133343334333333368B
+:10F5500033333336333333373333333830360D0ABE
+:10F560003A3130353137303030333433313333336F
+:10F570003133333331333333303333333134333363
+:10F5800032304430413341333134340D0A3A313072
+:10F590003531383030303330343533343331333043
+:10F5A0003330333033333330333333303333333139
+:10F5B00033343333333346310D0A3A313035313950
+:10F5C000303030333633333330333433363334330F
+:10F5D00035333034343330343133333431333333FF
+:10F5E00031333342330D0A3A313035314130303026
+:10F5F00033303334333133343333333333323433DE
+:10F6000034363044304133413331333034353334A0
+:10F6100045410D0A3A3130353142303030333233E2
+:10F6200030333033303333333033333330333333B9
+:10F630003033333330333333313333333044410DAC
+:10F640000A3A3130353143303030333333313333AC
+:10F65000333533333336333333373333333633346D
+:10F660003332333333393333333739420D0A3A3196
+:10F670003035314430303033343335333333303355
+:10F68000393432304430413341333133303435331F
+:10F690003433333330333043410D0A3A313035316E
+:10F6A0004530303033303333333433333330333326
+:10F6B000333033333334333433323333333333341B
+:10F6C0003334333339340D0A3A3130353146303042
+:10F6D0003033303333333533333330333333303304
+:10F6E00034333633343331333333303333333833E5
+:10F6F0003338310D0A3A3130353230303030333032
+:10F70000333733373044304133413331333034359C
+:10F7100033343334333033303330333333314144A3
+:10F720000D0A3A3130353231303030333333303303
+:10F730003333303333333833343332333034343398
+:10F74000303431333334313333333133410D0A3ACA
+:10F75000313035323230303033333330333433318B
+:10F76000333433333333333333333330333333306E
+:10F77000333333303433333834350D0A3A3130359E
+:10F780003233303030304430413341333133303430
+:10F790003533343335333033303330333333393337
+:10F7A000333338333337340D0A3A3130353234306D
+:10F7B0003030333733343335333433363334333115
+:10F7C0003333333033343332333333393333333207
+:10F7D000333332320D0A3A3130353235303030334E
+:10F7E00030333333343333333433343332333333EA
+:10F7F00033333433343331343130443041334135B1
+:10F80000390D0A3A31303532363030303331333019
+:10F8100034353334333633303330333033333330BD
+:10F8200033333335333333303333333030440D0AED
+:10F830003A31303532373030303334333633333396
+:10F840003233333330333333393333333033343388
+:10F8500033333333323333333046450D0A3A3130A4
+:10F860003532383030303334333633333334333366
+:10F870003331333433313334333530443041334131
+:10F8800033313330343532340D0A3A313035323990
+:10F890003030303334333733303330333033343344
+:10F8A0003133333331333034343330343133333430
+:10F8B00031333342450D0A3A313035324130303040
+:10F8C000333133333330333433313334333333330D
+:10F8D00033343333333033333330333333303334FF
+:10F8E00044410D0A3A313035324230303033313311
+:10F8F00034333233333333333734313044304133BC
+:10F900004133313330343533343338333045360DC9
+:10F910000A3A3130353243303030333033303334DB
+:10F9200033313333333033333335333333303333AD
+:10F930003330333333303334333342450D0A3A31C5
+:10F940003035324430303033333332333333303385
+:10F950003333313333333833333331333433323376
+:10F960003433313334333241320D0A3A31303532A7
+:10F970004530303033333333333134363044304133
+:10F98000334133313330343533343339333033303A
+:10F990003330333442390D0A3A3130353246303063
+:10F9A0003033313333333033333335333333303330
+:10F9B0003333303333333033343333333333373318
+:10F9C0003338350D0A3A313035333030303033305A
+:10F9D00033333331333433343333333033333330FD
+:10F9E00033333333333333383330343433343632E0
+:10F9F0000D0A3A313035333130303034363044301E
+:10FA000041334133313330343533343431333033AF
+:10FA1000303330333034313333343136360D0A3A03
+:10FA200031303533323030303333333133333330B8
+:10FA30003334333133343333333333353333333097
+:10FA4000333333303333333035390D0A3A313035CF
+:10FA5000333330303033333331333333383333337C
+:10FA60003333343335333333303334333133323467
+:10FA7000333044304137420D0A3A31303533343077
+:10FA80003030334133313330343533343432333042
+:10FA90003330333033333330333333303334333143
+:10FAA000333331390D0A3A31303533353030303374
+:10FAB000393333333733343335333333323333330A
+:10FAC000343333333133333331333333303333310E
+:10FAD000370D0A3A31303533363030303334333342
+:10FAE00033373333333033343331333333393436DC
+:10FAF00033393044304133413331333033410D0AEF
+:10FB00003A313035333730303034353334343333C1
+:10FB100030333033303333333033343335333333BE
+:10FB200032333333363333333145330D0A3A3130E0
+:10FB3000353338303030333333313333333033349B
+:10FB40003333333333323333333033343331333489
+:10FB500033313330343445390D0A3A3130353339A5
+:10FB60003030303330343133333431333333313375
+:10FB7000333334304430413341333133303435332F
+:10FB800034343445450D0A3A313035334130303064
+:10FB90003330333033303333333033343331333441
+:10FBA0003333333333363333333033333330333328
+:10FBB00044430D0A3A31303533423030303330333C
+:10FBC000333331333433343333333033333330330B
+:10FBD0003333303334333333333334333343370D08
+:10FBE0000A3A313035334330303033303334333107
+:10FBF00034343335304430413341333133303435AC
+:10FC00003334343533303330333043460D0A3A31F0
+:10FC100030353344303030333333323333333033B1
+:10FC200034333133333330333333363333333533A3
+:10FC30003333373334333339420D0A3A31303533C5
+:10FC40004530303033333336333333353333333376
+:10FC50003334333233333332333333303334333278
+:10FC60003333333238440D0A3A313035334630308D
+:10FC70003034323435304430413341333133303431
+:10FC80003533343436333033303330333333303349
+:10FC90003338460D0A3A313035343030303033366F
+:10FCA000333333343334333333333336333333361C
+:10FCB0003333333233343336333333303330363413
+:10FCC0000D0A3A3130353431303030343433303459
+:10FCD00031333334313333333133333330333433FB
+:10FCE000313334333334363335304434380D0A3A13
+:10FCF00031303534323030303041334133313330CC
+:10FD000034353335333033303330333033333337C6
+:10FD1000333333303333333036440D0A3A313035F0
+:10FD200034333030303333333033333333333333AE
+:10FD30003233333330333333323333333433333397
+:10FD4000333333333234340D0A3A313035343430CE
+:10FD50003030333333363334333333333336333372
+:10FD6000333633333337343333383044304133412F
+:10FD7000333135330D0A3A313035343530303033A4
+:10FD8000303435333533313330333033303333334C
+:10FD9000303333333233333330333333323333313D
+:10FDA000450D0A3A31303534363030303334333360
+:10FDB000333333333337333333363333333233330D
+:10FDC00033343333333533333331333330340D0A53
+:10FDD0003A313035343730303033323333333433F3
+:10FDE00033333433333332343334323044304133C9
+:10FDF00041333133303435333531360D0A3A313011
+:10FE000035343830303033323330333033303334CC
+:10FE100033363333333233343336333333353333AA
+:10FE200033383334333245380D0A3A3130353439CA
+:10FE300030303033303434333034313333343133A1
+:10FE40003333313333333033343331333433333387
+:10FE500033333842350D0A3A3130353441303030A1
+:10FE60003333333033333330343233303044304152
+:10FE7000334133313330343533353333333033304A
+:10FE800030350D0A3A31303534423030303330338A
+:10FE90003333303334333333333334333333333333
+:10FEA0003333303334333133333339333342450D25
+:10FEB0000A3A31303534433030303332333433352D
+:10FEC0003333333233333334333333313333333106
+:10FED0003334333133333339333341390D0A3A3123
+:10FEE00030353444303030333733363337304430C4
+:10FEF00041334133313330343533353334333033B8
+:10FF00003033303334333543460D0A3A31303534EB
+:10FF100045303030333333323333333633333331A8
+:10FF200033333331333333383333333233333331A1
+:10FF30003334333538390D0A3A31303534463030C0
+:10FF40003033333333333333343333333233333384
+:10FF50003133333330333333343333333333373470
+:10FF60003236440D0A3A3130353530303030304495
+:10FF70003041334133313330343533353335333039
+:10FF8000333033303333333033333333333441442A
+:10FF90000D0A3A3130353531303030333433303486
+:10FFA0003433303431333334313333333133333327
+:10FFB000303334333133343333333333380D0A3A57
+:10FFC0003130353532303030333933333330333309
+:10FFD00033303333333033333334333333333431F7
+:10FFE000343530443041334137350D0A3A313035FC
+:10FFF00035333030303331333034353335333633D5
+:02000002F0000C
+:1000000030333033303333333233333332333333CB
+:10001000323334333233350D0A3A313035353430FA
+:1000200030303333333433343332333333303333A8
+:100030003332333333303333333033343331333398
+:10004000333932460D0A3A313035353530303033B8
+:10005000333332333433353333333233333334336E
+:100060003433343044304133413331333034353537
+:10007000320D0A3A3130353536303030333533379A
+:10008000333033303330333333313333333133334D
+:1000900033323333333833333332333430450D0A6C
+:1000A0003A3130353537303030333533333332331E
+:1000B0003333363333333133333331333333303314
+:1000C00034333333333333333346440D0A3A313028
+:1000D00035353830303033303333333033333332F7
+:1000E00033353336304430413341333133303435B6
+:1000F00033353338333032340D0A3A31303535390F
+:1001000030303033303330333034343330343133D3
+:1001100033343133333331333333303334333133B6
+:1001200034333342460D0A3A3130353541303030C0
+:100130003334333133333330333333303333333099
+:100140003333333133343334333333303333333085
+:1001500044420D0A3A313035354230303033333392
+:100160003233373434304430413341333133303437
+:100170003533353339333033303330333345330D62
+:100180000A3A31303535433030303334333333325B
+:100190003333333133333334333333333333333231
+:1001A0003333333233333332333441450D0A3A314A
+:1001B0003035354430303033323333333433343305
+:1001C0003133333330333333323333333033333308
+:1001D0003033333337333341320D0A3A313035352A
+:1001E00045303030333730443041334133313330B0
+:1001F00034353335343133303330333033333338CF
+:100200003333333742320D0A3A31303535463030E8
+:1002100030333433353333333233333334333333AE
+:10022000313333333133343331333333393333339D
+:100230003237380D0A3A31303536303030303334D9
+:10024000333533333336333333343330343433307C
+:100250003431333334313334333330443041384143
+:100260000D0A3A31303536313030303341333133A5
+:100270003034353335343233303330333033333355
+:10028000313333333033343331333434330D0A3A8A
+:100290003130353632303030333333343332333338
+:1002A0003330333333303333333033333332333328
+:1002B000333633333331333335330D0A3A31303556
+:1002C0003633303030333133333333333333363303
+:1002D00033333233333337333033383044304133D0
+:1002E000413331333038310D0A3A3130353634301C
+:1002F00030303435333534333330333033303333D7
+:10030000333233333334333333323333333

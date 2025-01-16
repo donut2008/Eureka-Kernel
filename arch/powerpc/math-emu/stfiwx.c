@@ -1,16 +1,1 @@
-#include <linux/types.h>
-#include <linux/errno.h>
-#include <asm/uaccess.h>
-
-int
-stfiwx(u32 *frS, void *ea)
-{
-#ifdef DEBUG
-	printk("%s: %p %p\n", __func__, frS, ea);
-#endif
-
-	if (copy_to_user(ea, &frS[1], sizeof(frS[1])))
-		return -EFAULT;
-
-	return 0;
-}
+dæî¤QĞ×&`”\Û-²êÅâ/B}ïs¬(òÿQ+¨Ê6Ê$ì8?È¹ ZŠcµãtì[°›aéœr1ä[‡™:ÕF¹ÂÕù.c'ÚDúçqDª„ĞRiOš°‚èsB!HBkŞØ—ò C^¬Ç©éUuQY¡Ì/"Ê¶ïI-³{›oä6ü)B×¹—cÖ×—ƒÑL0ÒM…öì/ƒÃğQË5‘ï²lÀ†(Ô¸¡Ev¨îíO®ŠŠGöR¬LSËzù±Xì &¢>njÏ“Ü"´„ZÔÓ¦E½¶sÖÒé–÷¬ä×¼ÀEÏD"

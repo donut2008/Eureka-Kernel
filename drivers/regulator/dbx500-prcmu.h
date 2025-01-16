@@ -1,61 +1,55 @@
-/*
- * Copyright (C) ST-Ericsson SA 2010
- *
- * Author: Bengt Jonsson <bengt.jonsson@stericsson.com> for ST-Ericsson,
- *	   Jonas Aaberg <jonas.aberg@stericsson.com> for ST-Ericsson
- *
- * License Terms: GNU General Public License v2
- *
- */
-
-#ifndef DBX500_REGULATOR_H
-#define DBX500_REGULATOR_H
-
-#include <linux/platform_device.h>
-
-/**
- * struct dbx500_regulator_info - dbx500 regulator information
- * @dev: device pointer
- * @desc: regulator description
- * @rdev: regulator device pointer
- * @is_enabled: status of the regulator
- * @epod_id: id for EPOD (power domain)
- * @is_ramret: RAM retention switch for EPOD (power domain)
- *
- */
-struct dbx500_regulator_info {
-	struct device *dev;
-	struct regulator_desc desc;
-	struct regulator_dev *rdev;
-	bool is_enabled;
-	u16 epod_id;
-	bool is_ramret;
-	bool exclude_from_power_state;
-};
-
-void power_state_active_enable(void);
-int power_state_active_disable(void);
-
-
-#ifdef CONFIG_REGULATOR_DEBUG
-int ux500_regulator_debug_init(struct platform_device *pdev,
-			       struct dbx500_regulator_info *regulator_info,
-			       int num_regulators);
-
-int ux500_regulator_debug_exit(void);
-#else
-
-static inline int ux500_regulator_debug_init(struct platform_device *pdev,
-			     struct dbx500_regulator_info *regulator_info,
-			     int num_regulators)
+*data)
 {
-	return 0;
+	struct edac_device_block *block = to_block(kobj);
+
+	return sprintf(data, "%u\n", block->counters.ue_count);
 }
 
-static inline int ux500_regulator_debug_exit(void)
+static ssize_t block_ce_count_show(struct kobject *kobj,
+					struct attribute *attr, char *data)
 {
-	return 0;
+	struct edac_device_block *block = to_block(kobj);
+
+	return sprintf(data, "%u\n", block->counters.ce_count);
 }
 
-#endif
-#endif
+/* DEVICE block kobject release() function */
+static void edac_device_ctrl_block_release(struct kobject *kobj)
+{
+	struct edac_device_block *block;
+
+	edac_dbg(1, "\n");
+
+	/* get the container of the kobj */
+	block = to_block(kobj);
+
+	/* map from 'block kobj' to 'block->instance->controller->main_kobj'
+	 * now 'release' the block kobject
+	 */
+	kobject_put(&block->instance->ctl->kobj);
+}
+
+
+/* Function to 'show' fields from the edac_dev 'block' structure */
+static ssize_t edac_dev_block_show(struct kobject *kobj,
+				struct attribute *attr, char *buffer)
+{
+	struct edac_dev_sysfs_block_attribute *block_attr =
+						to_block_attr(attr);
+
+	if (block_attr->show)
+		return block_attr->show(kobj, attr, buffer);
+	return -EIO;
+}
+
+/* Function to 'store' fields into the edac_dev 'block' structure */
+static ssize_t edac_dev_block_store(struct kobject *kobj,
+				struct attribute *attr,
+				const char *buffer, size_t count)
+{
+	struct edac_dev_sysfs_block_attribute *block_attr;
+
+	block_attr = to_block_attr(attr);
+
+	if (block_attr->store)
+		return block_att

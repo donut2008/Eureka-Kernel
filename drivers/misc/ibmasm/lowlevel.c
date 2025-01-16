@@ -1,85 +1,35 @@
-/*
- * IBM ASM Service Processor Device Driver
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
- *
- * Copyright (C) IBM Corporation, 2004
- *
- * Author: Max Asböck <amax@us.ibm.com>
- *
- */
-
-#include "ibmasm.h"
-#include "lowlevel.h"
-#include "i2o.h"
-#include "dot_command.h"
-#include "remote.h"
-
-static struct i2o_header header = I2O_HEADER_TEMPLATE;
-
-
-int ibmasm_send_i2o_message(struct service_processor *sp)
-{
-	u32 mfa;
-	unsigned int command_size;
-	struct i2o_message *message;
-	struct command *command = sp->current_command;
-
-	mfa = get_mfa_inbound(sp->base_address);
-	if (!mfa)
-		return 1;
-
-	command_size = get_dot_command_size(command->buffer);
-	header.message_size = outgoing_message_size(command_size);
-
-	message = get_i2o_message(sp->base_address, mfa);
-
-	memcpy_toio(&message->header, &header, sizeof(struct i2o_header));
-	memcpy_toio(&message->data, command->buffer, command_size);
-
-	set_mfa_inbound(sp->base_address, mfa);
-
-	return 0;
-}
-
-irqreturn_t ibmasm_interrupt_handler(int irq, void * dev_id)
-{
-	u32	mfa;
-	struct service_processor *sp = (struct service_processor *)dev_id;
-	void __iomem *base_address = sp->base_address;
-	char tsbuf[32];
-
-	if (!sp_interrupt_pending(base_address))
-		return IRQ_NONE;
-
-	dbg("respond to interrupt at %s\n", get_timestamp(tsbuf));
-
-	if (mouse_interrupt_pending(sp)) {
-		ibmasm_handle_mouse_interrupt(sp);
-		clear_mouse_interrupt(sp);
-	}
-
-	mfa = get_mfa_outbound(base_address);
-	if (valid_mfa(mfa)) {
-		struct i2o_message *msg = get_i2o_message(base_address, mfa);
-		ibmasm_receive_message(sp, &msg->data, incoming_data_size(msg));
-	} else
-		dbg("didn't get a valid MFA\n");
-
-	set_mfa_outbound(base_address, mfa);
-	dbg("finished interrupt at   %s\n", get_timestamp(tsbuf));
-
-	return IRQ_HANDLED;
-}
+PT_TABLE_REG3__ACCEPT_ENTRY_98_MASK 0x4
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_98__SHIFT 0x2
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_99_MASK 0x8
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_99__SHIFT 0x3
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_100_MASK 0x10
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_100__SHIFT 0x4
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_101_MASK 0x20
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_101__SHIFT 0x5
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_102_MASK 0x40
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_102__SHIFT 0x6
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_103_MASK 0x80
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_103__SHIFT 0x7
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_104_MASK 0x100
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_104__SHIFT 0x8
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_105_MASK 0x200
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_105__SHIFT 0x9
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_106_MASK 0x400
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_106__SHIFT 0xa
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_107_MASK 0x800
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_107__SHIFT 0xb
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_108_MASK 0x1000
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_108__SHIFT 0xc
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_109_MASK 0x2000
+#define PB0_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_109__SHIFT 0xd
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DCLK_DIV_OVRD_VAL_MASK 0x7
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DCLK_DIV_OVRD_VAL__SHIFT 0x0
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DCLK_DIV_OVRD_EN_MASK 0x8
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DCLK_DIV_OVRD_EN__SHIFT 0x3
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DRV0_EN_GEN1_OVRD_VAL_MASK 0xf0
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DRV0_EN_GEN1_OVRD_VAL__SHIFT 0x4
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DRV0_EN_OVRD_EN_MASK 0x100
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DRV0_EN_OVRD_EN__SHIFT 0x8
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DRV0_TAP_SEL_GEN1_OVRD_VAL_MASK 0x1e00
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DRV0_TAP_SEL_GEN1_OVRD_VAL__SHIFT 0x9
+#define PB0_TX_GLB_OVRD_REG0__TX_CFG_DRV0_TAP_

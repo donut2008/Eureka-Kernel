@@ -1,303 +1,129 @@
-/**
- * IBM Accelerator Family 'GenWQE'
- *
- * (C) Copyright IBM Corp. 2013
- *
- * Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
- * Author: Joerg-Stephan Vogt <jsvogt@de.ibm.com>
- * Author: Michael Jung <mijung@gmx.net>
- * Author: Michael Ruettger <michael@ibmra.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License (version 2 only)
- * as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
-
-/*
- * Sysfs interfaces for the GenWQE card. There are attributes to query
- * the version of the bitstream as well as some for the driver. For
- * debugging, please also see the debugfs interfaces of this driver.
- */
-
-#include <linux/kernel.h>
-#include <linux/types.h>
-#include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/string.h>
-#include <linux/fs.h>
-#include <linux/sysfs.h>
-#include <linux/ctype.h>
-#include <linux/device.h>
-
-#include "card_base.h"
-#include "card_ddcb.h"
-
-static const char * const genwqe_types[] = {
-	[GENWQE_TYPE_ALTERA_230] = "GenWQE4-230",
-	[GENWQE_TYPE_ALTERA_530] = "GenWQE4-530",
-	[GENWQE_TYPE_ALTERA_A4]  = "GenWQE5-A4",
-	[GENWQE_TYPE_ALTERA_A7]  = "GenWQE5-A7",
-};
-
-static ssize_t status_show(struct device *dev, struct device_attribute *attr,
-			   char *buf)
-{
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-	const char *cs[GENWQE_CARD_STATE_MAX] = { "unused", "used", "error" };
-
-	return sprintf(buf, "%s\n", cs[cd->card_state]);
-}
-static DEVICE_ATTR_RO(status);
-
-static ssize_t appid_show(struct device *dev, struct device_attribute *attr,
-			  char *buf)
-{
-	char app_name[5];
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	genwqe_read_app_id(cd, app_name, sizeof(app_name));
-	return sprintf(buf, "%s\n", app_name);
-}
-static DEVICE_ATTR_RO(appid);
-
-static ssize_t version_show(struct device *dev, struct device_attribute *attr,
-			    char *buf)
-{
-	u64 slu_id, app_id;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	slu_id = __genwqe_readq(cd, IO_SLU_UNITCFG);
-	app_id = __genwqe_readq(cd, IO_APP_UNITCFG);
-
-	return sprintf(buf, "%016llx.%016llx\n", slu_id, app_id);
-}
-static DEVICE_ATTR_RO(version);
-
-static ssize_t type_show(struct device *dev, struct device_attribute *attr,
-			 char *buf)
-{
-	u8 card_type;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	card_type = genwqe_card_type(cd);
-	return sprintf(buf, "%s\n", (card_type >= ARRAY_SIZE(genwqe_types)) ?
-		       "invalid" : genwqe_types[card_type]);
-}
-static DEVICE_ATTR_RO(type);
-
-static ssize_t tempsens_show(struct device *dev, struct device_attribute *attr,
-			     char *buf)
-{
-	u64 tempsens;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	tempsens = __genwqe_readq(cd, IO_SLU_TEMPERATURE_SENSOR);
-	return sprintf(buf, "%016llx\n", tempsens);
-}
-static DEVICE_ATTR_RO(tempsens);
-
-static ssize_t freerunning_timer_show(struct device *dev,
-				      struct device_attribute *attr,
-				      char *buf)
-{
-	u64 t;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	t = __genwqe_readq(cd, IO_SLC_FREE_RUNNING_TIMER);
-	return sprintf(buf, "%016llx\n", t);
-}
-static DEVICE_ATTR_RO(freerunning_timer);
-
-static ssize_t queue_working_time_show(struct device *dev,
-				       struct device_attribute *attr,
-				       char *buf)
-{
-	u64 t;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	t = __genwqe_readq(cd, IO_SLC_QUEUE_WTIME);
-	return sprintf(buf, "%016llx\n", t);
-}
-static DEVICE_ATTR_RO(queue_working_time);
-
-static ssize_t base_clock_show(struct device *dev,
-			       struct device_attribute *attr,
-			       char *buf)
-{
-	u64 base_clock;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	base_clock = genwqe_base_clock_frequency(cd);
-	return sprintf(buf, "%lld\n", base_clock);
-}
-static DEVICE_ATTR_RO(base_clock);
-
-/**
- * curr_bitstream_show() - Show the current bitstream id
- *
- * There is a bug in some old versions of the CPLD which selects the
- * bitstream, which causes the IO_SLU_BITSTREAM register to report
- * unreliable data in very rare cases. This makes this sysfs
- * unreliable up to the point were a new CPLD version is being used.
- *
- * Unfortunately there is no automatic way yet to query the CPLD
- * version, such that you need to manually ensure via programming
- * tools that you have a recent version of the CPLD software.
- *
- * The proposed circumvention is to use a special recovery bitstream
- * on the backup partition (0) to identify problems while loading the
- * image.
- */
-static ssize_t curr_bitstream_show(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	int curr_bitstream;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	curr_bitstream = __genwqe_readq(cd, IO_SLU_BITSTREAM) & 0x1;
-	return sprintf(buf, "%d\n", curr_bitstream);
-}
-static DEVICE_ATTR_RO(curr_bitstream);
-
-/**
- * next_bitstream_show() - Show the next activated bitstream
- *
- * IO_SLC_CFGREG_SOFTRESET: This register can only be accessed by the PF.
- */
-static ssize_t next_bitstream_show(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	int next_bitstream;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	switch ((cd->softreset & 0xc) >> 2) {
-	case 0x2:
-		next_bitstream =  0;
-		break;
-	case 0x3:
-		next_bitstream =  1;
-		break;
-	default:
-		next_bitstream = -1;
-		break;		/* error */
-	}
-	return sprintf(buf, "%d\n", next_bitstream);
-}
-
-static ssize_t next_bitstream_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	int partition;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	if (kstrtoint(buf, 0, &partition) < 0)
-		return -EINVAL;
-
-	switch (partition) {
-	case 0x0:
-		cd->softreset = 0x78;
-		break;
-	case 0x1:
-		cd->softreset = 0x7c;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	__genwqe_writeq(cd, IO_SLC_CFGREG_SOFTRESET, cd->softreset);
-	return count;
-}
-static DEVICE_ATTR_RW(next_bitstream);
-
-static ssize_t reload_bitstream_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	int reload;
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-
-	if (kstrtoint(buf, 0, &reload) < 0)
-		return -EINVAL;
-
-	if (reload == 0x1) {
-		if (cd->card_state == GENWQE_CARD_UNUSED ||
-		    cd->card_state == GENWQE_CARD_USED)
-			cd->card_state = GENWQE_CARD_RELOAD_BITSTREAM;
-		else
-			return -EIO;
-	} else {
-		return -EINVAL;
-	}
-
-	return count;
-}
-static DEVICE_ATTR_WO(reload_bitstream);
-
-/*
- * Create device_attribute structures / params: name, mode, show, store
- * additional flag if valid in VF
- */
-static struct attribute *genwqe_attributes[] = {
-	&dev_attr_tempsens.attr,
-	&dev_attr_next_bitstream.attr,
-	&dev_attr_curr_bitstream.attr,
-	&dev_attr_base_clock.attr,
-	&dev_attr_type.attr,
-	&dev_attr_version.attr,
-	&dev_attr_appid.attr,
-	&dev_attr_status.attr,
-	&dev_attr_freerunning_timer.attr,
-	&dev_attr_queue_working_time.attr,
-	&dev_attr_reload_bitstream.attr,
-	NULL,
-};
-
-static struct attribute *genwqe_normal_attributes[] = {
-	&dev_attr_type.attr,
-	&dev_attr_version.attr,
-	&dev_attr_appid.attr,
-	&dev_attr_status.attr,
-	&dev_attr_freerunning_timer.attr,
-	&dev_attr_queue_working_time.attr,
-	NULL,
-};
-
-/**
- * genwqe_is_visible() - Determine if sysfs attribute should be visible or not
- *
- * VFs have restricted mmio capabilities, so not all sysfs entries
- * are allowed in VFs.
- */
-static umode_t genwqe_is_visible(struct kobject *kobj,
-				 struct attribute *attr, int n)
-{
-	unsigned int j;
-	struct device *dev = container_of(kobj, struct device, kobj);
-	struct genwqe_dev *cd = dev_get_drvdata(dev);
-	umode_t mode = attr->mode;
-
-	if (genwqe_is_privileged(cd))
-		return mode;
-
-	for (j = 0; genwqe_normal_attributes[j] != NULL;  j++)
-		if (genwqe_normal_attributes[j] == attr)
-			return mode;
-
-	return 0;
-}
-
-static struct attribute_group genwqe_attribute_group = {
-	.is_visible = genwqe_is_visible,
-	.attrs      = genwqe_attributes,
-};
-
-const struct attribute_group *genwqe_attribute_groups[] = {
-	&genwqe_attribute_group,
-	NULL,
-};
+_STRAP_GLB_REG0__STRAP_DFT_CALIB_BYPASS_MASK 0x8
+#define PB0_STRAP_GLB_REG0__STRAP_DFT_CALIB_BYPASS__SHIFT 0x3
+#define PB0_STRAP_GLB_REG0__STRAP_CFG_IDLEDET_TH_MASK 0x60
+#define PB0_STRAP_GLB_REG0__STRAP_CFG_IDLEDET_TH__SHIFT 0x5
+#define PB0_STRAP_GLB_REG0__STRAP_RX_CFG_LEQ_DCATTN_BYP_VAL_MASK 0xf80
+#define PB0_STRAP_GLB_REG0__STRAP_RX_CFG_LEQ_DCATTN_BYP_VAL__SHIFT 0x7
+#define PB0_STRAP_GLB_REG0__STRAP_RX_CFG_OVR_PWRSF_MASK 0x1000
+#define PB0_STRAP_GLB_REG0__STRAP_RX_CFG_OVR_PWRSF__SHIFT 0xc
+#define PB0_STRAP_GLB_REG0__STRAP_RX_TRK_MODE_0__MASK 0x2000
+#define PB0_STRAP_GLB_REG0__STRAP_RX_TRK_MODE_0___SHIFT 0xd
+#define PB0_STRAP_GLB_REG0__STRAP_PWRGOOD_OVRD_MASK 0x4000
+#define PB0_STRAP_GLB_REG0__STRAP_PWRGOOD_OVRD__SHIFT 0xe
+#define PB0_STRAP_GLB_REG0__STRAP_DBG_RXDLL_VREG_REF_SEL_MASK 0x8000
+#define PB0_STRAP_GLB_REG0__STRAP_DBG_RXDLL_VREG_REF_SEL__SHIFT 0xf
+#define PB0_STRAP_GLB_REG0__STRAP_PLL_CFG_LC_VCO_TUNE_MASK 0xf0000
+#define PB0_STRAP_GLB_REG0__STRAP_PLL_CFG_LC_VCO_TUNE__SHIFT 0x10
+#define PB0_STRAP_GLB_REG0__STRAP_DBG_RXRDATA_GATING_DISABLE_MASK 0x100000
+#define PB0_STRAP_GLB_REG0__STRAP_DBG_RXRDATA_GATING_DISABLE__SHIFT 0x14
+#define PB0_STRAP_GLB_REG0__STRAP_DBG_RXPI_OFFSET_BYP_VAL_MASK 0x1e00000
+#define PB0_STRAP_GLB_REG0__STRAP_DBG_RXPI_OFFSET_BYP_VAL__SHIFT 0x15
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV0_EN_MASK 0x1e
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV0_EN__SHIFT 0x1
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV0_TAP_SEL_MASK 0x1e0
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV0_TAP_SEL__SHIFT 0x5
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV1_EN_MASK 0x3e00
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV1_EN__SHIFT 0x9
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV1_TAP_SEL_MASK 0x7c000
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV1_TAP_SEL__SHIFT 0xe
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV2_EN_MASK 0x780000
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV2_EN__SHIFT 0x13
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV2_TAP_SEL_MASK 0x7800000
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRV2_TAP_SEL__SHIFT 0x17
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRVX_EN_MASK 0x8000000
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRVX_EN__SHIFT 0x1b
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRVX_TAP_SEL_MASK 0x10000000
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_DRVX_TAP_SEL__SHIFT 0x1c
+#define PB0_STRAP_TX_REG0__STRAP_RX_TRK_MODE_1__MASK 0x20000000
+#define PB0_STRAP_TX_REG0__STRAP_RX_TRK_MODE_1___SHIFT 0x1d
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_SWING_BOOST_EN_MASK 0x40000000
+#define PB0_STRAP_TX_REG0__STRAP_TX_CFG_SWING_BOOST_EN__SHIFT 0x1e
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_TH_LOOP_GAIN_MASK 0x1e
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_TH_LOOP_GAIN__SHIFT 0x1
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_DLL_FLOCK_DISABLE_MASK 0x20
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_DLL_FLOCK_DISABLE__SHIFT 0x5
+#define PB0_STRAP_RX_REG0__STRAP_DBG_RXPI_OFFSET_BYP_EN_MASK 0x40
+#define PB0_STRAP_RX_REG0__STRAP_DBG_RXPI_OFFSET_BYP_EN__SHIFT 0x6
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_LEQ_DCATTN_BYP_DIS_MASK 0x80
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_LEQ_DCATTN_BYP_DIS__SHIFT 0x7
+#define PB0_STRAP_RX_REG0__STRAP_BG_CFG_LC_REG_VREF0_SEL_MASK 0x300
+#define PB0_STRAP_RX_REG0__STRAP_BG_CFG_LC_REG_VREF0_SEL__SHIFT 0x8
+#define PB0_STRAP_RX_REG0__STRAP_BG_CFG_LC_REG_VREF1_SEL_MASK 0xc00
+#define PB0_STRAP_RX_REG0__STRAP_BG_CFG_LC_REG_VREF1_SEL__SHIFT 0xa
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_CDR_TIME_MASK 0xf000
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_CDR_TIME__SHIFT 0xc
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_FOM_TIME_MASK 0xf0000
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_FOM_TIME__SHIFT 0x10
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_LEQ_TIME_MASK 0xf00000
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_LEQ_TIME__SHIFT 0x14
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_OC_TIME_MASK 0xf000000
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_OC_TIME__SHIFT 0x18
+#define PB0_STRAP_RX_REG0__STRAP_TX_CFG_RPTR_RST_VAL_MASK 0x70000000
+#define PB0_STRAP_RX_REG0__STRAP_TX_CFG_RPTR_RST_VAL__SHIFT 0x1c
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_TERM_MODE_MASK 0x80000000
+#define PB0_STRAP_RX_REG0__STRAP_RX_CFG_TERM_MODE__SHIFT 0x1f
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_CDR_PI_STPSZ_MASK 0x2
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_CDR_PI_STPSZ__SHIFT 0x1
+#define PB0_STRAP_RX_REG1__STRAP_TX_DEEMPH_PRSHT_STNG_MASK 0x1c
+#define PB0_STRAP_RX_REG1__STRAP_TX_DEEMPH_PRSHT_STNG__SHIFT 0x2
+#define PB0_STRAP_RX_REG1__STRAP_BG_CFG_RO_REG_VREF_SEL_MASK 0x60
+#define PB0_STRAP_RX_REG1__STRAP_BG_CFG_RO_REG_VREF_SEL__SHIFT 0x5
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_LEQ_POLE_BYP_DIS_MASK 0x80
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_LEQ_POLE_BYP_DIS__SHIFT 0x7
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_LEQ_POLE_BYP_VAL_MASK 0x700
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_LEQ_POLE_BYP_VAL__SHIFT 0x8
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_CDR_PH_GAIN_MASK 0x7800
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_CDR_PH_GAIN__SHIFT 0xb
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_ADAPT_MODE_MASK 0x1ff8000
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_ADAPT_MODE__SHIFT 0xf
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_DFE_TIME_MASK 0x1e000000
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_DFE_TIME__SHIFT 0x19
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_LEQ_LOOP_GAIN_MASK 0x60000000
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_LEQ_LOOP_GAIN__SHIFT 0x1d
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_LEQ_SHUNT_DIS_MASK 0x80000000
+#define PB0_STRAP_RX_REG1__STRAP_RX_CFG_LEQ_SHUNT_DIS__SHIFT 0x1f
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_CFG_LC_BW_CNTRL_MASK 0xe
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_CFG_LC_BW_CNTRL__SHIFT 0x1
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_CFG_LC_LF_CNTRL_MASK 0x1ff0
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_CFG_LC_LF_CNTRL__SHIFT 0x4
+#define PB0_STRAP_PLL_REG0__STRAP_TX_RXDET_X1_SSF_MASK 0x2000
+#define PB0_STRAP_PLL_REG0__STRAP_TX_RXDET_X1_SSF__SHIFT 0xd
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_CFG_RO_VTOI_BIAS_CNTRL_DIS_MASK 0x8000
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_CFG_RO_VTOI_BIAS_CNTRL_DIS__SHIFT 0xf
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_CFG_RO_BW_CNTRL_MASK 0xff0000
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_CFG_RO_BW_CNTRL__SHIFT 0x10
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_STRAP_SEL_MASK 0x1000000
+#define PB0_STRAP_PLL_REG0__STRAP_PLL_STRAP_SEL__SHIFT 0x18
+#define PB0_STRAP_PIN_REG0__STRAP_TX_DEEMPH_EN_MASK 0x2
+#define PB0_STRAP_PIN_REG0__STRAP_TX_DEEMPH_EN__SHIFT 0x1
+#define PB0_STRAP_PIN_REG0__STRAP_TX_FULL_SWING_MASK 0x4
+#define PB0_STRAP_PIN_REG0__STRAP_TX_FULL_SWING__SHIFT 0x2
+#define PB0_DFT_JIT_INJ_REG0__DFT_NUM_STEPS_MASK 0x3f
+#define PB0_DFT_JIT_INJ_REG0__DFT_NUM_STEPS__SHIFT 0x0
+#define PB0_DFT_JIT_INJ_REG0__DFT_DISABLE_ERR_MASK 0x80
+#define PB0_DFT_JIT_INJ_REG0__DFT_DISABLE_ERR__SHIFT 0x7
+#define PB0_DFT_JIT_INJ_REG0__DFT_CLK_PER_STEP_MASK 0xf00
+#define PB0_DFT_JIT_INJ_REG0__DFT_CLK_PER_STEP__SHIFT 0x8
+#define PB0_DFT_JIT_INJ_REG0__DFT_MODE_CDR_EN_MASK 0x100000
+#define PB0_DFT_JIT_INJ_REG0__DFT_MODE_CDR_EN__SHIFT 0x14
+#define PB0_DFT_JIT_INJ_REG0__DFT_EN_RECOVERY_MASK 0x200000
+#define PB0_DFT_JIT_INJ_REG0__DFT_EN_RECOVERY__SHIFT 0x15
+#define PB0_DFT_JIT_INJ_REG0__DFT_INCR_SWP_EN_MASK 0x400000
+#define PB0_DFT_JIT_INJ_REG0__DFT_INCR_SWP_EN__SHIFT 0x16
+#define PB0_DFT_JIT_INJ_REG0__DFT_DECR_SWP_EN_MASK 0x800000
+#define PB0_DFT_JIT_INJ_REG0__DFT_DECR_SWP_EN__SHIFT 0x17
+#define PB0_DFT_JIT_INJ_REG0__DFT_RECOVERY_TIME_MASK 0xff000000
+#define PB0_DFT_JIT_INJ_REG0__DFT_RECOVERY_TIME__SHIFT 0x18
+#define PB0_DFT_JIT_INJ_REG1__DFT_BYPASS_VALUE_MASK 0xff
+#define PB0_DFT_JIT_INJ_REG1__DFT_BYPASS_VALUE__SHIFT 0x0
+#define PB0_DFT_JIT_INJ_REG1__DFT_BYPASS_EN_MASK 0x100
+#define PB0_DFT_JIT_INJ_REG1__DFT_BYPASS_EN__SHIFT 0x8
+#define PB0_DFT_JIT_INJ_REG1__DFT_BLOCK_EN_MASK 0x10000
+#define PB0_DFT_JIT_INJ_REG1__DFT_BLOCK_EN__SHIFT 0x10
+#define PB0_DFT_JIT_INJ_REG1__DFT_NUM_OF_TESTS_MASK 0xe0000
+#define PB0_DFT_JIT_INJ_REG1__DFT_NUM_OF_TESTS__SHIFT 0x11
+#define PB0_DFT_JIT_INJ_REG1__DFT_CHECK_TIME_MASK 0xf00000
+#define PB0_DFT_JIT_INJ_REG1__DFT_CHECK_TIME__SHIFT 0x14
+#define PB0_DFT_JIT_INJ_REG2__DFT_LANE_EN_MASK 0xffff
+#define PB0_DFT_JIT_INJ_REG2__DFT_LANE_EN__SHIFT 0x0
+#define PB0_DFT_DEBUG_CTRL_REG

@@ -1,26 +1,14 @@
-# Makefile of modem_if
-
-EXTRA_CFLAGS += -Idrivers/misc/modem_v1
-EXTRA_CFLAGS += -lnet/core/
-
-obj-y += modem_main.o modem_io_device.o
-obj-y += modem_net_flowcontrol_device.o modem_utils.o modem_dump.o
-
-obj-$(CONFIG_LTE_MODEM_S5E7580) += modem_modemctl_device_sh310ap.o
-obj-$(CONFIG_LTE_MODEM_S5E7890) += modem_modemctl_device_sh333ap.o
-obj-$(CONFIG_LTE_MODEM_S5E8890) += modem_modemctl_device_sh333ap.o
-obj-$(CONFIG_LTE_MODEM_S5E7880) += modem_modemctl_device_sh325ap.o
-obj-$(CONFIG_LTE_MODEM_S5E7570) += modem_modemctl_device_sh325ap.o
-obj-$(CONFIG_LTE_MODEM_S5E8895) += modem_modemctl_device_sh325ap.o
-obj-$(CONFIG_LTE_MODEM_S5E7872) += modem_modemctl_device_sh333ap.o
-
-obj-$(CONFIG_LINK_DEVICE_SHMEM)	+= modem_link_device_shmem.o
-
-# Check whether or not memory-type interface
-ifeq ($(CONFIG_LINK_DEVICE_SHMEM),y)
-LINK_DEVICE_MEMORY_INTERFACE=y
-endif
-
-ifdef LINK_DEVICE_MEMORY_INTERFACE
-obj-y += modem_link_device_memory.o
-endif
+x4000
+#define PB1_PLL_RO0_OVRD_REG1__PLL_RO_PWRON_OVRD_EN_0__SHIFT 0xe
+#define PB1_PLL_RO0_OVRD_REG1__PLL_CFG_RO_REFCLK_SRC_OVRD_VAL_0_MASK 0x380000
+#define PB1_PLL_RO0_OVRD_REG1__PLL_CFG_RO_REFCLK_SRC_OVRD_VAL_0__SHIFT 0x13
+#define PB1_PLL_RO0_OVRD_REG1__PLL_CFG_RO_REFCLK_SRC_OVRD_EN_0_MASK 0x400000
+#define PB1_PLL_RO0_OVRD_REG1__PLL_CFG_RO_REFCLK_SRC_OVRD_EN_0__SHIFT 0x16
+#define PB1_PLL_RO0_SCI_STAT_OVRD_REG0__PLL_RO0_IGNR_PLLPWR_CBI_UPDT_MASK 0x1
+#define PB1_PLL_RO0_SCI_STAT_OVRD_REG0__PLL_RO0_IGNR_PLLPWR_CBI_UPDT__SHIFT 0x0
+#define PB1_PLL_RO0_SCI_STAT_OVRD_REG0__PLL_RO0_IGNR_PLLFREQ_CBI_UPDT_MASK 0x2
+#define PB1_PLL_RO0_SCI_STAT_OVRD_REG0__PLL_RO0_IGNR_PLLFREQ_CBI_UPDT__SHIFT 0x1
+#define PB1_PLL_RO0_SCI_STAT_OVRD_REG0__PLL_RO0_PLLPWR_MASK 0x70
+#define PB1_PLL_RO0_SCI_STAT_OVRD_REG0__PLL_RO0_PLLPWR__SHIFT 0x4
+#define PB1_PLL_RO0_SCI_STAT_OVRD_REG0__PLL_RO0_PLLFREQ_MASK 0x300
+#define PB1_PLL_RO0_SCI_STAT_OVRD_REG

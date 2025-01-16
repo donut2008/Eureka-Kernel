@@ -1,518 +1,262 @@
-/*
- * xHCI host controller driver PCI Bus Glue.
- *
- * Copyright (C) 2008 Intel Corp.
- *
- * Author: Sarah Sharp
- * Some code borrowed from the Linux EHCI driver.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software Foundation,
- * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/pci.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/acpi.h>
-
-#include "xhci.h"
-#include "xhci-trace.h"
-
-#define SSIC_PORT_NUM		2
-#define SSIC_PORT_CFG2		0x880c
-#define SSIC_PORT_CFG2_OFFSET	0x30
-#define PROG_DONE		(1 << 30)
-#define SSIC_PORT_UNUSED	(1 << 31)
-
-/* Device for a quirk */
-#define PCI_VENDOR_ID_FRESCO_LOGIC	0x1b73
-#define PCI_DEVICE_ID_FRESCO_LOGIC_PDK	0x1000
-#define PCI_DEVICE_ID_FRESCO_LOGIC_FL1009	0x1009
-#define PCI_DEVICE_ID_FRESCO_LOGIC_FL1100	0x1100
-#define PCI_DEVICE_ID_FRESCO_LOGIC_FL1400	0x1400
-
-#define PCI_VENDOR_ID_ETRON		0x1b6f
-#define PCI_DEVICE_ID_EJ168		0x7023
-
-#define PCI_DEVICE_ID_INTEL_LYNXPOINT_XHCI	0x8c31
-#define PCI_DEVICE_ID_INTEL_LYNXPOINT_LP_XHCI	0x9c31
-#define PCI_DEVICE_ID_INTEL_WILDCATPOINT_LP_XHCI	0x9cb1
-#define PCI_DEVICE_ID_INTEL_CHERRYVIEW_XHCI		0x22b5
-#define PCI_DEVICE_ID_INTEL_SUNRISEPOINT_H_XHCI		0xa12f
-#define PCI_DEVICE_ID_INTEL_SUNRISEPOINT_LP_XHCI	0x9d2f
-#define PCI_DEVICE_ID_INTEL_BROXTON_M_XHCI		0x0aa8
-#define PCI_DEVICE_ID_INTEL_BROXTON_B_XHCI		0x1aa8
-#define PCI_DEVICE_ID_INTEL_APL_XHCI			0x5aa8
-#define PCI_DEVICE_ID_INTEL_DNV_XHCI			0x19d0
-#define PCI_DEVICE_ID_INTEL_CML_XHCI			0xa3af
-
-static const char hcd_name[] = "xhci_hcd";
-
-static struct hc_driver __read_mostly xhci_pci_hc_driver;
-
-static int xhci_pci_setup(struct usb_hcd *hcd);
-
-static const struct xhci_driver_overrides xhci_pci_overrides __initconst = {
-	.extra_priv_size = sizeof(struct xhci_hcd),
-	.reset = xhci_pci_setup,
-};
-
-/* called after powerup, by probe or system-pm "wakeup" */
-static int xhci_pci_reinit(struct xhci_hcd *xhci, struct pci_dev *pdev)
-{
-	/*
-	 * TODO: Implement finding debug ports later.
-	 * TODO: see if there are any quirks that need to be added to handle
-	 * new extended capabilities.
-	 */
-
-	/* PCI Memory-Write-Invalidate cycle support is optional (uncommon) */
-	if (!pci_set_mwi(pdev))
-		xhci_dbg(xhci, "MWI active\n");
-
-	xhci_dbg(xhci, "Finished xhci_pci_reinit\n");
-	return 0;
-}
-
-static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
-{
-	struct pci_dev		*pdev = to_pci_dev(dev);
-
-	/* Look for vendor-specific quirks */
-	if (pdev->vendor == PCI_VENDOR_ID_FRESCO_LOGIC &&
-			(pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK ||
-			 pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_FL1400)) {
-		if (pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK &&
-				pdev->revision == 0x0) {
-			xhci->quirks |= XHCI_RESET_EP_QUIRK;
-			xhci_dbg_trace(xhci, trace_xhci_dbg_quirks,
-				"QUIRK: Fresco Logic xHC needs configure"
-				" endpoint cmd after reset endpoint");
-		}
-		if (pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK &&
-				pdev->revision == 0x4) {
-			xhci->quirks |= XHCI_SLOW_SUSPEND;
-			xhci_dbg_trace(xhci, trace_xhci_dbg_quirks,
-				"QUIRK: Fresco Logic xHC revision %u"
-				"must be suspended extra slowly",
-				pdev->revision);
-		}
-		if (pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK)
-			xhci->quirks |= XHCI_BROKEN_STREAMS;
-		/* Fresco Logic confirms: all revisions of this chip do not
-		 * support MSI, even though some of them claim to in their PCI
-		 * capabilities.
-		 */
-		xhci->quirks |= XHCI_BROKEN_MSI;
-		xhci_dbg_trace(xhci, trace_xhci_dbg_quirks,
-				"QUIRK: Fresco Logic revision %u "
-				"has broken MSI implementation",
-				pdev->revision);
-		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
-	}
-
-	if (pdev->vendor == PCI_VENDOR_ID_FRESCO_LOGIC &&
-			pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_FL1009)
-		xhci->quirks |= XHCI_BROKEN_STREAMS;
-
-	if (pdev->vendor == PCI_VENDOR_ID_FRESCO_LOGIC &&
-			pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_FL1100)
-		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
-
-	if (pdev->vendor == PCI_VENDOR_ID_NEC)
-		xhci->quirks |= XHCI_NEC_HOST;
-
-	if (pdev->vendor == PCI_VENDOR_ID_AMD && xhci->hci_version == 0x96)
-		xhci->quirks |= XHCI_AMD_0x96_HOST;
-
-	/* AMD PLL quirk */
-	if (pdev->vendor == PCI_VENDOR_ID_AMD && usb_amd_find_chipset_info())
-		xhci->quirks |= XHCI_AMD_PLL_FIX;
-
-	if (pdev->vendor == PCI_VENDOR_ID_AMD)
-		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
-
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL) {
-		xhci->quirks |= XHCI_LPM_SUPPORT;
-		xhci->quirks |= XHCI_INTEL_HOST;
-		xhci->quirks |= XHCI_AVOID_BEI;
-	}
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
-			pdev->device == PCI_DEVICE_ID_INTEL_PANTHERPOINT_XHCI) {
-		xhci->quirks |= XHCI_EP_LIMIT_QUIRK;
-		xhci->limit_active_eps = 64;
-		xhci->quirks |= XHCI_SW_BW_CHECKING;
-		/*
-		 * PPT desktop boards DH77EB and DH77DF will power back on after
-		 * a few seconds of being shutdown.  The fix for this is to
-		 * switch the ports from xHCI to EHCI on shutdown.  We can't use
-		 * DMI information to find those particular boards (since each
-		 * vendor will change the board name), so we have to key off all
-		 * PPT chipsets.
-		 */
-		xhci->quirks |= XHCI_SPURIOUS_REBOOT;
-	}
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
-		(pdev->device == PCI_DEVICE_ID_INTEL_LYNXPOINT_LP_XHCI ||
-		 pdev->device == PCI_DEVICE_ID_INTEL_WILDCATPOINT_LP_XHCI)) {
-		xhci->quirks |= XHCI_SPURIOUS_REBOOT;
-		xhci->quirks |= XHCI_SPURIOUS_WAKEUP;
-	}
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
-		(pdev->device == PCI_DEVICE_ID_INTEL_SUNRISEPOINT_LP_XHCI ||
-		 pdev->device == PCI_DEVICE_ID_INTEL_SUNRISEPOINT_H_XHCI ||
-		 pdev->device == PCI_DEVICE_ID_INTEL_CHERRYVIEW_XHCI ||
-		 pdev->device == PCI_DEVICE_ID_INTEL_BROXTON_M_XHCI ||
-		 pdev->device == PCI_DEVICE_ID_INTEL_BROXTON_B_XHCI ||
-		 pdev->device == PCI_DEVICE_ID_INTEL_APL_XHCI ||
-		 pdev->device == PCI_DEVICE_ID_INTEL_DNV_XHCI ||
-		 pdev->device == PCI_DEVICE_ID_INTEL_CML_XHCI)) {
-		xhci->quirks |= XHCI_PME_STUCK_QUIRK;
-	}
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
-	    (pdev->device == PCI_DEVICE_ID_INTEL_CHERRYVIEW_XHCI ||
-	     pdev->device == PCI_DEVICE_ID_INTEL_SUNRISEPOINT_LP_XHCI ||
-	     pdev->device == PCI_DEVICE_ID_INTEL_SUNRISEPOINT_H_XHCI ||
-	     pdev->device == PCI_DEVICE_ID_INTEL_APL_XHCI ||
-	     pdev->device == PCI_DEVICE_ID_INTEL_DNV_XHCI))
-		xhci->quirks |= XHCI_MISSING_CAS;
-
-	if (pdev->vendor == PCI_VENDOR_ID_ETRON &&
-			pdev->device == PCI_DEVICE_ID_EJ168) {
-		xhci->quirks |= XHCI_RESET_ON_RESUME;
-		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
-		xhci->quirks |= XHCI_BROKEN_STREAMS;
-	}
-	if (pdev->vendor == PCI_VENDOR_ID_RENESAS &&
-			pdev->device == 0x0014)
-		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
-	if (pdev->vendor == PCI_VENDOR_ID_RENESAS &&
-			pdev->device == 0x0015)
-		xhci->quirks |= XHCI_RESET_ON_RESUME;
-	if (pdev->vendor == PCI_VENDOR_ID_VIA)
-		xhci->quirks |= XHCI_RESET_ON_RESUME;
-
-	/* See https://bugzilla.kernel.org/show_bug.cgi?id=79511 */
-	if (pdev->vendor == PCI_VENDOR_ID_VIA &&
-			pdev->device == 0x3432)
-		xhci->quirks |= XHCI_BROKEN_STREAMS;
-
-	if (pdev->vendor == PCI_VENDOR_ID_ASMEDIA &&
-			pdev->device == 0x1042)
-		xhci->quirks |= XHCI_BROKEN_STREAMS;
-	if (pdev->vendor == PCI_VENDOR_ID_ASMEDIA &&
-			pdev->device == 0x1142)
-		xhci->quirks |= XHCI_TRUST_TX_LENGTH;
-
-	if (xhci->quirks & XHCI_RESET_ON_RESUME)
-		xhci_dbg_trace(xhci, trace_xhci_dbg_quirks,
-				"QUIRK: Resetting on resume");
-}
-
-#ifdef CONFIG_ACPI
-static void xhci_pme_acpi_rtd3_enable(struct pci_dev *dev)
-{
-	static const u8 intel_dsm_uuid[] = {
-		0xb7, 0x0c, 0x34, 0xac,	0x01, 0xe9, 0xbf, 0x45,
-		0xb7, 0xe6, 0x2b, 0x34, 0xec, 0x93, 0x1e, 0x23,
-	};
-	union acpi_object *obj;
-
-	obj = acpi_evaluate_dsm(ACPI_HANDLE(&dev->dev), intel_dsm_uuid, 3, 1,
-				NULL);
-	ACPI_FREE(obj);
-}
-#else
-static void xhci_pme_acpi_rtd3_enable(struct pci_dev *dev) { }
-#endif /* CONFIG_ACPI */
-
-/* called during probe() after chip reset completes */
-static int xhci_pci_setup(struct usb_hcd *hcd)
-{
-	struct xhci_hcd		*xhci;
-	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
-	int			retval;
-
-	xhci = hcd_to_xhci(hcd);
-	if (!xhci->sbrn)
-		pci_read_config_byte(pdev, XHCI_SBRN_OFFSET, &xhci->sbrn);
-
-	retval = xhci_gen_setup(hcd, xhci_pci_quirks);
-	if (retval)
-		return retval;
-
-	if (!usb_hcd_is_primary_hcd(hcd))
-		return 0;
-
-	xhci_dbg(xhci, "Got SBRN %u\n", (unsigned int) xhci->sbrn);
-
-	/* Find any debug ports */
-	retval = xhci_pci_reinit(xhci, pdev);
-	if (!retval)
-		return retval;
-
-	return retval;
-}
-
-/*
- * We need to register our own PCI probe function (instead of the USB core's
- * function) in order to create a second roothub under xHCI.
- */
-static int xhci_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
-{
-	int retval;
-	struct xhci_hcd *xhci;
-	struct hc_driver *driver;
-	struct usb_hcd *hcd;
-
-	driver = (struct hc_driver *)id->driver_data;
-
-	/* Prevent runtime suspending between USB-2 and USB-3 initialization */
-	pm_runtime_get_noresume(&dev->dev);
-
-	/* Register the USB 2.0 roothub.
-	 * FIXME: USB core must know to register the USB 2.0 roothub first.
-	 * This is sort of silly, because we could just set the HCD driver flags
-	 * to say USB 2.0, but I'm not sure what the implications would be in
-	 * the other parts of the HCD code.
-	 */
-	retval = usb_hcd_pci_probe(dev, id);
-
-	if (retval)
-		goto put_runtime_pm;
-
-	/* USB 2.0 roothub is stored in the PCI device now. */
-	hcd = dev_get_drvdata(&dev->dev);
-	xhci = hcd_to_xhci(hcd);
-	xhci->shared_hcd = usb_create_shared_hcd(driver, &dev->dev,
-				pci_name(dev), hcd);
-	if (!xhci->shared_hcd) {
-		retval = -ENOMEM;
-		goto dealloc_usb2_hcd;
-	}
-
-	retval = usb_add_hcd(xhci->shared_hcd, dev->irq,
-			IRQF_SHARED);
-	if (retval)
-		goto put_usb3_hcd;
-	/* Roothub already marked as USB 3.0 speed */
-
-	if (!(xhci->quirks & XHCI_BROKEN_STREAMS) &&
-			HCC_MAX_PSA(xhci->hcc_params) >= 4)
-		xhci->shared_hcd->can_do_streams = 1;
-
-	if (xhci->quirks & XHCI_PME_STUCK_QUIRK)
-		xhci_pme_acpi_rtd3_enable(dev);
-
-	/* USB-2 and USB-3 roothubs initialized, allow runtime pm suspend */
-	pm_runtime_put_noidle(&dev->dev);
-
-	dma_set_max_seg_size(&dev->dev, UINT_MAX);
-
-	return 0;
-
-put_usb3_hcd:
-	usb_put_hcd(xhci->shared_hcd);
-dealloc_usb2_hcd:
-	usb_hcd_pci_remove(dev);
-put_runtime_pm:
-	pm_runtime_put_noidle(&dev->dev);
-	return retval;
-}
-
-static void xhci_pci_remove(struct pci_dev *dev)
-{
-	struct xhci_hcd *xhci;
-
-	xhci = hcd_to_xhci(pci_get_drvdata(dev));
-	xhci->xhc_state |= XHCI_STATE_REMOVING;
-	if (xhci->shared_hcd) {
-		usb_remove_hcd(xhci->shared_hcd);
-		usb_put_hcd(xhci->shared_hcd);
-	}
-
-	/* Workaround for spurious wakeups at shutdown with HSW */
-	if (xhci->quirks & XHCI_SPURIOUS_WAKEUP)
-		pci_set_power_state(dev, PCI_D3hot);
-
-	usb_hcd_pci_remove(dev);
-}
-
-#ifdef CONFIG_PM
-/*
- * In some Intel xHCI controllers, in order to get D3 working,
- * through a vendor specific SSIC CONFIG register at offset 0x883c,
- * SSIC PORT need to be marked as "unused" before putting xHCI
- * into D3. After D3 exit, the SSIC port need to be marked as "used".
- * Without this change, xHCI might not enter D3 state.
- * Make sure PME works on some Intel xHCI controllers by writing 1 to clear
- * the Internal PME flag bit in vendor specific PMCTRL register at offset 0x80a4
- */
-static void xhci_pme_quirk(struct usb_hcd *hcd, bool suspend)
-{
-	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
-	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
-	u32 val;
-	void __iomem *reg;
-	int i;
-
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
-		 pdev->device == PCI_DEVICE_ID_INTEL_CHERRYVIEW_XHCI) {
-
-		for (i = 0; i < SSIC_PORT_NUM; i++) {
-			reg = (void __iomem *) xhci->cap_regs +
-					SSIC_PORT_CFG2 +
-					i * SSIC_PORT_CFG2_OFFSET;
-
-			/*
-			 * Notify SSIC that SSIC profile programming
-			 * is not done.
-			 */
-			val = readl(reg) & ~PROG_DONE;
-			writel(val, reg);
-
-			/* Mark SSIC port as unused(suspend) or used(resume) */
-			val = readl(reg);
-			if (suspend)
-				val |= SSIC_PORT_UNUSED;
-			else
-				val &= ~SSIC_PORT_UNUSED;
-			writel(val, reg);
-
-			/* Notify SSIC that SSIC profile programming is done */
-			val = readl(reg) | PROG_DONE;
-			writel(val, reg);
-			readl(reg);
-		}
-	}
-
-	reg = (void __iomem *) xhci->cap_regs + 0x80a4;
-	val = readl(reg);
-	writel(val | BIT(28), reg);
-	readl(reg);
-}
-
-static int xhci_pci_suspend(struct usb_hcd *hcd, bool do_wakeup)
-{
-	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
-	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
-
-	/*
-	 * Systems with the TI redriver that loses port status change events
-	 * need to have the registers polled during D3, so avoid D3cold.
-	 */
-	if (xhci->quirks & XHCI_COMP_MODE_QUIRK)
-		pdev->no_d3cold = true;
-
-	if (xhci->quirks & XHCI_PME_STUCK_QUIRK)
-		xhci_pme_quirk(hcd, true);
-
-	return xhci_suspend(xhci, do_wakeup);
-}
-
-static int xhci_pci_resume(struct usb_hcd *hcd, bool hibernated)
-{
-	struct xhci_hcd		*xhci = hcd_to_xhci(hcd);
-	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
-	int			retval = 0;
-
-	/* The BIOS on systems with the Intel Panther Point chipset may or may
-	 * not support xHCI natively.  That means that during system resume, it
-	 * may switch the ports back to EHCI so that users can use their
-	 * keyboard to select a kernel from GRUB after resume from hibernate.
-	 *
-	 * The BIOS is supposed to remember whether the OS had xHCI ports
-	 * enabled before resume, and switch the ports back to xHCI when the
-	 * BIOS/OS semaphore is written, but we all know we can't trust BIOS
-	 * writers.
-	 *
-	 * Unconditionally switch the ports back to xHCI after a system resume.
-	 * It should not matter whether the EHCI or xHCI controller is
-	 * resumed first. It's enough to do the switchover in xHCI because
-	 * USB core won't notice anything as the hub driver doesn't start
-	 * running again until after all the devices (including both EHCI and
-	 * xHCI host controllers) have been resumed.
-	 */
-
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL)
-		usb_enable_intel_xhci_ports(pdev);
-
-	if (xhci->quirks & XHCI_PME_STUCK_QUIRK)
-		xhci_pme_quirk(hcd, false);
-
-	retval = xhci_resume(xhci, hibernated);
-	return retval;
-}
-
-static void xhci_pci_shutdown(struct usb_hcd *hcd)
-{
-	struct xhci_hcd		*xhci = hcd_to_xhci(hcd);
-	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
-
-	xhci_shutdown(hcd);
-
-	/* Yet another workaround for spurious wakeups at shutdown with HSW */
-	if (xhci->quirks & XHCI_SPURIOUS_WAKEUP)
-		pci_set_power_state(pdev, PCI_D3hot);
-}
-#endif /* CONFIG_PM */
-
-/*-------------------------------------------------------------------------*/
-
-/* PCI driver selection metadata; PCI hotplugging uses this */
-static const struct pci_device_id pci_ids[] = { {
-	/* handle any USB 3.0 xHCI controller */
-	PCI_DEVICE_CLASS(PCI_CLASS_SERIAL_USB_XHCI, ~0),
-	.driver_data =	(unsigned long) &xhci_pci_hc_driver,
-	},
-	{ /* end: all zeroes */ }
-};
-MODULE_DEVICE_TABLE(pci, pci_ids);
-
-/* pci driver glue; this is a "new style" PCI driver module */
-static struct pci_driver xhci_pci_driver = {
-	.name =		(char *) hcd_name,
-	.id_table =	pci_ids,
-
-	.probe =	xhci_pci_probe,
-	.remove =	xhci_pci_remove,
-	/* suspend and resume implemented later */
-
-	.shutdown = 	usb_hcd_pci_shutdown,
-#ifdef CONFIG_PM
-	.driver = {
-		.pm = &usb_hcd_pci_pm_ops
-	},
-#endif
-};
-
-static int __init xhci_pci_init(void)
-{
-	xhci_init_driver(&xhci_pci_hc_driver, &xhci_pci_overrides);
-#ifdef CONFIG_PM
-	xhci_pci_hc_driver.pci_suspend = xhci_pci_suspend;
-	xhci_pci_hc_driver.pci_resume = xhci_pci_resume;
-	xhci_pci_hc_driver.shutdown = xhci_pci_shutdown;
-#endif
-	return pci_register_driver(&xhci_pci_driver);
-}
-module_init(xhci_pci_init);
-
-static void __exit xhci_pci_exit(void)
-{
-	pci_unregister_driver(&xhci_pci_driver);
-}
-module_exit(xhci_pci_exit);
-
-MODULE_DESCRIPTION("xHCI PCI Host Controller Driver");
-MODULE_LICENSE("GPL");
+#define DAC_SYNC_TRISTATE_CONTROL__DAC_SYNCA_TRISTATE__SHIFT 0x10
+#define DAC_STEREOSYNC_SELECT__DAC_STEREOSYNC_SELECT_MASK 0x7
+#define DAC_STEREOSYNC_SELECT__DAC_STEREOSYNC_SELECT__SHIFT 0x0
+#define DAC_AUTODETECT_CONTROL__DAC_AUTODETECT_MODE_MASK 0x3
+#define DAC_AUTODETECT_CONTROL__DAC_AUTODETECT_MODE__SHIFT 0x0
+#define DAC_AUTODETECT_CONTROL__DAC_AUTODETECT_FRAME_TIME_COUNTER_MASK 0xff00
+#define DAC_AUTODETECT_CONTROL__DAC_AUTODETECT_FRAME_TIME_COUNTER__SHIFT 0x8
+#define DAC_AUTODETECT_CONTROL__DAC_AUTODETECT_CHECK_MASK_MASK 0x70000
+#define DAC_AUTODETECT_CONTROL__DAC_AUTODETECT_CHECK_MASK__SHIFT 0x10
+#define DAC_AUTODETECT_CONTROL2__DAC_AUTODETECT_POWERUP_COUNTER_MASK 0xff
+#define DAC_AUTODETECT_CONTROL2__DAC_AUTODETECT_POWERUP_COUNTER__SHIFT 0x0
+#define DAC_AUTODETECT_CONTROL2__DAC_AUTODETECT_TESTMODE_MASK 0x100
+#define DAC_AUTODETECT_CONTROL2__DAC_AUTODETECT_TESTMODE__SHIFT 0x8
+#define DAC_AUTODETECT_CONTROL3__DAC_AUTODET_COMPARATOR_IN_DELAY_MASK 0xff
+#define DAC_AUTODETECT_CONTROL3__DAC_AUTODET_COMPARATOR_IN_DELAY__SHIFT 0x0
+#define DAC_AUTODETECT_CONTROL3__DAC_AUTODET_COMPARATOR_OUT_DELAY_MASK 0xff00
+#define DAC_AUTODETECT_CONTROL3__DAC_AUTODET_COMPARATOR_OUT_DELAY__SHIFT 0x8
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_STATUS_MASK 0x1
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_STATUS__SHIFT 0x0
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_CONNECT_MASK 0x10
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_CONNECT__SHIFT 0x4
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_RED_SENSE_MASK 0x300
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_RED_SENSE__SHIFT 0x8
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_GREEN_SENSE_MASK 0x30000
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_GREEN_SENSE__SHIFT 0x10
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_BLUE_SENSE_MASK 0x3000000
+#define DAC_AUTODETECT_STATUS__DAC_AUTODETECT_BLUE_SENSE__SHIFT 0x18
+#define DAC_AUTODETECT_INT_CONTROL__DAC_AUTODETECT_ACK_MASK 0x1
+#define DAC_AUTODETECT_INT_CONTROL__DAC_AUTODETECT_ACK__SHIFT 0x0
+#define DAC_AUTODETECT_INT_CONTROL__DAC_AUTODETECT_INT_ENABLE_MASK 0x10000
+#define DAC_AUTODETECT_INT_CONTROL__DAC_AUTODETECT_INT_ENABLE__SHIFT 0x10
+#define DAC_FORCE_OUTPUT_CNTL__DAC_FORCE_DATA_EN_MASK 0x1
+#define DAC_FORCE_OUTPUT_CNTL__DAC_FORCE_DATA_EN__SHIFT 0x0
+#define DAC_FORCE_OUTPUT_CNTL__DAC_FORCE_DATA_SEL_MASK 0x700
+#define DAC_FORCE_OUTPUT_CNTL__DAC_FORCE_DATA_SEL__SHIFT 0x8
+#define DAC_FORCE_OUTPUT_CNTL__DAC_FORCE_DATA_ON_BLANKB_ONLY_MASK 0x1000000
+#define DAC_FORCE_OUTPUT_CNTL__DAC_FORCE_DATA_ON_BLANKB_ONLY__SHIFT 0x18
+#define DAC_FORCE_DATA__DAC_FORCE_DATA_MASK 0x3ff
+#define DAC_FORCE_DATA__DAC_FORCE_DATA__SHIFT 0x0
+#define DAC_POWERDOWN__DAC_POWERDOWN_MASK 0x1
+#define DAC_POWERDOWN__DAC_POWERDOWN__SHIFT 0x0
+#define DAC_POWERDOWN__DAC_POWERDOWN_BLUE_MASK 0x100
+#define DAC_POWERDOWN__DAC_POWERDOWN_BLUE__SHIFT 0x8
+#define DAC_POWERDOWN__DAC_POWERDOWN_GREEN_MASK 0x10000
+#define DAC_POWERDOWN__DAC_POWERDOWN_GREEN__SHIFT 0x10
+#define DAC_POWERDOWN__DAC_POWERDOWN_RED_MASK 0x1000000
+#define DAC_POWERDOWN__DAC_POWERDOWN_RED__SHIFT 0x18
+#define DAC_CONTROL__DAC_DFORCE_EN_MASK 0x1
+#define DAC_CONTROL__DAC_DFORCE_EN__SHIFT 0x0
+#define DAC_CONTROL__DAC_TV_ENABLE_MASK 0x100
+#define DAC_CONTROL__DAC_TV_ENABLE__SHIFT 0x8
+#define DAC_CONTROL__DAC_ZSCALE_SHIFT_MASK 0x10000
+#define DAC_CONTROL__DAC_ZSCALE_SHIFT__SHIFT 0x10
+#define DAC_COMPARATOR_ENABLE__DAC_COMP_DDET_REF_EN_MASK 0x1
+#define DAC_COMPARATOR_ENABLE__DAC_COMP_DDET_REF_EN__SHIFT 0x0
+#define DAC_COMPARATOR_ENABLE__DAC_COMP_SDET_REF_EN_MASK 0x100
+#define DAC_COMPARATOR_ENABLE__DAC_COMP_SDET_REF_EN__SHIFT 0x8
+#define DAC_COMPARATOR_ENABLE__DAC_R_ASYNC_ENABLE_MASK 0x10000
+#define DAC_COMPARATOR_ENABLE__DAC_R_ASYNC_ENABLE__SHIFT 0x10
+#define DAC_COMPARATOR_ENABLE__DAC_G_ASYNC_ENABLE_MASK 0x20000
+#define DAC_COMPARATOR_ENABLE__DAC_G_ASYNC_ENABLE__SHIFT 0x11
+#define DAC_COMPARATOR_ENABLE__DAC_B_ASYNC_ENABLE_MASK 0x40000
+#define DAC_COMPARATOR_ENABLE__DAC_B_ASYNC_ENABLE__SHIFT 0x12
+#define DAC_COMPARATOR_OUTPUT__DAC_COMPARATOR_OUTPUT_MASK 0x1
+#define DAC_COMPARATOR_OUTPUT__DAC_COMPARATOR_OUTPUT__SHIFT 0x0
+#define DAC_COMPARATOR_OUTPUT__DAC_COMPARATOR_OUTPUT_BLUE_MASK 0x2
+#define DAC_COMPARATOR_OUTPUT__DAC_COMPARATOR_OUTPUT_BLUE__SHIFT 0x1
+#define DAC_COMPARATOR_OUTPUT__DAC_COMPARATOR_OUTPUT_GREEN_MASK 0x4
+#define DAC_COMPARATOR_OUTPUT__DAC_COMPARATOR_OUTPUT_GREEN__SHIFT 0x2
+#define DAC_COMPARATOR_OUTPUT__DAC_COMPARATOR_OUTPUT_RED_MASK 0x8
+#define DAC_COMPARATOR_OUTPUT__DAC_COMPARATOR_OUTPUT_RED__SHIFT 0x3
+#define DAC_PWR_CNTL__DAC_BG_MODE_MASK 0x3
+#define DAC_PWR_CNTL__DAC_BG_MODE__SHIFT 0x0
+#define DAC_PWR_CNTL__DAC_PWRCNTL_MASK 0x30000
+#define DAC_PWR_CNTL__DAC_PWRCNTL__SHIFT 0x10
+#define DAC_DFT_CONFIG__DAC_DFT_CONFIG_MASK 0xffffffff
+#define DAC_DFT_CONFIG__DAC_DFT_CONFIG__SHIFT 0x0
+#define DAC_FIFO_STATUS__DAC_FIFO_USE_OVERWRITE_LEVEL_MASK 0x2
+#define DAC_FIFO_STATUS__DAC_FIFO_USE_OVERWRITE_LEVEL__SHIFT 0x1
+#define DAC_FIFO_STATUS__DAC_FIFO_OVERWRITE_LEVEL_MASK 0xfc
+#define DAC_FIFO_STATUS__DAC_FIFO_OVERWRITE_LEVEL__SHIFT 0x2
+#define DAC_FIFO_STATUS__DAC_FIFO_CAL_AVERAGE_LEVEL_MASK 0xfc00
+#define DAC_FIFO_STATUS__DAC_FIFO_CAL_AVERAGE_LEVEL__SHIFT 0xa
+#define DAC_FIFO_STATUS__DAC_FIFO_MAXIMUM_LEVEL_MASK 0xf0000
+#define DAC_FIFO_STATUS__DAC_FIFO_MAXIMUM_LEVEL__SHIFT 0x10
+#define DAC_FIFO_STATUS__DAC_FIFO_MINIMUM_LEVEL_MASK 0x3c00000
+#define DAC_FIFO_STATUS__DAC_FIFO_MINIMUM_LEVEL__SHIFT 0x16
+#define DAC_FIFO_STATUS__DAC_FIFO_CALIBRATED_MASK 0x20000000
+#define DAC_FIFO_STATUS__DAC_FIFO_CALIBRATED__SHIFT 0x1d
+#define DAC_FIFO_STATUS__DAC_FIFO_FORCE_RECAL_AVERAGE_MASK 0x40000000
+#define DAC_FIFO_STATUS__DAC_FIFO_FORCE_RECAL_AVERAGE__SHIFT 0x1e
+#define DAC_FIFO_STATUS__DAC_FIFO_FORCE_RECOMP_MINMAX_MASK 0x80000000
+#define DAC_FIFO_STATUS__DAC_FIFO_FORCE_RECOMP_MINMAX__SHIFT 0x1f
+#define DAC_TEST_DEBUG_INDEX__DAC_TEST_DEBUG_INDEX_MASK 0xff
+#define DAC_TEST_DEBUG_INDEX__DAC_TEST_DEBUG_INDEX__SHIFT 0x0
+#define DAC_TEST_DEBUG_INDEX__DAC_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define DAC_TEST_DEBUG_INDEX__DAC_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define DAC_TEST_DEBUG_DATA__DAC_TEST_DEBUG_DATA_MASK 0xffffffff
+#define DAC_TEST_DEBUG_DATA__DAC_TEST_DEBUG_DATA__SHIFT 0x0
+#define PERFCOUNTER_CNTL__PERFCOUNTER_EVENT_SEL_MASK 0x1ff
+#define PERFCOUNTER_CNTL__PERFCOUNTER_EVENT_SEL__SHIFT 0x0
+#define PERFCOUNTER_CNTL__PERFCOUNTER_CVALUE_SEL_MASK 0xe00
+#define PERFCOUNTER_CNTL__PERFCOUNTER_CVALUE_SEL__SHIFT 0x9
+#define PERFCOUNTER_CNTL__PERFCOUNTER_INC_MODE_MASK 0x3000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_INC_MODE__SHIFT 0xc
+#define PERFCOUNTER_CNTL__PERFCOUNTER_HW_CNTL_SEL_MASK 0x4000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_HW_CNTL_SEL__SHIFT 0xe
+#define PERFCOUNTER_CNTL__PERFCOUNTER_RUNEN_MODE_MASK 0x8000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_RUNEN_MODE__SHIFT 0xf
+#define PERFCOUNTER_CNTL__PERFCOUNTER_CNTOFF_SEL_MASK 0x1f0000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_CNTOFF_SEL__SHIFT 0x10
+#define PERFCOUNTER_CNTL__PERFCOUNTER_CNTOFF_START_DIS_MASK 0x200000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_CNTOFF_START_DIS__SHIFT 0x15
+#define PERFCOUNTER_CNTL__PERFCOUNTER_RESTART_EN_MASK 0x400000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_RESTART_EN__SHIFT 0x16
+#define PERFCOUNTER_CNTL__PERFCOUNTER_INT_EN_MASK 0x800000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_INT_EN__SHIFT 0x17
+#define PERFCOUNTER_CNTL__PERFCOUNTER_OFF_MASK_MASK 0x1000000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_OFF_MASK__SHIFT 0x18
+#define PERFCOUNTER_CNTL__PERFCOUNTER_ACTIVE_MASK 0x2000000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_ACTIVE__SHIFT 0x19
+#define PERFCOUNTER_CNTL__PERFCOUNTER_INT_TYPE_MASK 0x4000000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_INT_TYPE__SHIFT 0x1a
+#define PERFCOUNTER_CNTL__PERFCOUNTER_COUNTED_VALUE_TYPE_MASK 0x8000000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_COUNTED_VALUE_TYPE__SHIFT 0x1b
+#define PERFCOUNTER_CNTL__PERFCOUNTER_CNTL_SEL_MASK 0xe0000000
+#define PERFCOUNTER_CNTL__PERFCOUNTER_CNTL_SEL__SHIFT 0x1d
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT0_STATE_MASK 0x3
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT0_STATE__SHIFT 0x0
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL0_MASK 0x4
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL0__SHIFT 0x2
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT1_STATE_MASK 0x30
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT1_STATE__SHIFT 0x4
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL1_MASK 0x40
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL1__SHIFT 0x6
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT2_STATE_MASK 0x300
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT2_STATE__SHIFT 0x8
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL2_MASK 0x400
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL2__SHIFT 0xa
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT3_STATE_MASK 0x3000
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT3_STATE__SHIFT 0xc
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL3_MASK 0x4000
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL3__SHIFT 0xe
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT4_STATE_MASK 0x30000
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT4_STATE__SHIFT 0x10
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL4_MASK 0x40000
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL4__SHIFT 0x12
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT5_STATE_MASK 0x300000
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT5_STATE__SHIFT 0x14
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL5_MASK 0x400000
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL5__SHIFT 0x16
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT6_STATE_MASK 0x3000000
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT6_STATE__SHIFT 0x18
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL6_MASK 0x4000000
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL6__SHIFT 0x1a
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT7_STATE_MASK 0x30000000
+#define PERFCOUNTER_STATE__PERFCOUNTER_CNT7_STATE__SHIFT 0x1c
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL7_MASK 0x40000000
+#define PERFCOUNTER_STATE__PERFCOUNTER_STATE_SEL7__SHIFT 0x1e
+#define PERFMON_CNTL__PERFMON_STATE_MASK 0x3
+#define PERFMON_CNTL__PERFMON_STATE__SHIFT 0x0
+#define PERFMON_CNTL__PERFMON_RUN_ENABLE_SEL_MASK 0xfc
+#define PERFMON_CNTL__PERFMON_RUN_ENABLE_SEL__SHIFT 0x2
+#define PERFMON_CNTL__PERFMON_RPT_COUNT_MASK 0xfffff00
+#define PERFMON_CNTL__PERFMON_RPT_COUNT__SHIFT 0x8
+#define PERFMON_CNTL__PERFMON_CNTOFF_AND_OR_MASK 0x10000000
+#define PERFMON_CNTL__PERFMON_CNTOFF_AND_OR__SHIFT 0x1c
+#define PERFMON_CNTL__PERFMON_CNTOFF_INT_EN_MASK 0x20000000
+#define PERFMON_CNTL__PERFMON_CNTOFF_INT_EN__SHIFT 0x1d
+#define PERFMON_CNTL__PERFMON_CNTOFF_INT_STATUS_MASK 0x40000000
+#define PERFMON_CNTL__PERFMON_CNTOFF_INT_STATUS__SHIFT 0x1e
+#define PERFMON_CNTL__PERFMON_CNTOFF_INT_ACK_MASK 0x80000000
+#define PERFMON_CNTL__PERFMON_CNTOFF_INT_ACK__SHIFT 0x1f
+#define PERFMON_CNTL2__PERFMON_CNTOFF_INT_TYPE_MASK 0x1
+#define PERFMON_CNTL2__PERFMON_CNTOFF_INT_TYPE__SHIFT 0x0
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT0_STATUS_MASK 0x1
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT0_STATUS__SHIFT 0x0
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT1_STATUS_MASK 0x2
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT1_STATUS__SHIFT 0x1
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT2_STATUS_MASK 0x4
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT2_STATUS__SHIFT 0x2
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT3_STATUS_MASK 0x8
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT3_STATUS__SHIFT 0x3
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT4_STATUS_MASK 0x10
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT4_STATUS__SHIFT 0x4
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT5_STATUS_MASK 0x20
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT5_STATUS__SHIFT 0x5
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT6_STATUS_MASK 0x40
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT6_STATUS__SHIFT 0x6
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT7_STATUS_MASK 0x80
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT7_STATUS__SHIFT 0x7
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT0_ACK_MASK 0x100
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT0_ACK__SHIFT 0x8
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT1_ACK_MASK 0x200
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT1_ACK__SHIFT 0x9
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT2_ACK_MASK 0x400
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT2_ACK__SHIFT 0xa
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT3_ACK_MASK 0x800
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT3_ACK__SHIFT 0xb
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT4_ACK_MASK 0x1000
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT4_ACK__SHIFT 0xc
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT5_ACK_MASK 0x2000
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT5_ACK__SHIFT 0xd
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT6_ACK_MASK 0x4000
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT6_ACK__SHIFT 0xe
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT7_ACK_MASK 0x8000
+#define PERFMON_CVALUE_INT_MISC__PERFCOUNTER_INT7_ACK__SHIFT 0xf
+#define PERFMON_CVALUE_INT_MISC__PERFMON_CVALUE_HI_MASK 0xffff0000
+#define PERFMON_CVALUE_INT_MISC__PERFMON_CVALUE_HI__SHIFT 0x10
+#define PERFMON_CVALUE_LOW__PERFMON_CVALUE_LOW_MASK 0xffffffff
+#define PERFMON_CVALUE_LOW__PERFMON_CVALUE_LOW__SHIFT 0x0
+#define PERFMON_HI__PERFMON_HI_MASK 0xffff
+#define PERFMON_HI__PERFMON_HI__SHIFT 0x0
+#define PERFMON_HI__PERFMON_READ_SEL_MASK 0xe0000000
+#define PERFMON_HI__PERFMON_READ_SEL__SHIFT 0x1d
+#define PERFMON_LOW__PERFMON_LOW_MASK 0xffffffff
+#define PERFMON_LOW__PERFMON_LOW__SHIFT 0x0
+#define PERFMON_TEST_DEBUG_INDEX__PERFMON_TEST_DEBUG_INDEX_MASK 0xff
+#define PERFMON_TEST_DEBUG_INDEX__PERFMON_TEST_DEBUG_INDEX__SHIFT 0x0
+#define PERFMON_TEST_DEBUG_INDEX__PERFMON_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define PERFMON_TEST_DEBUG_INDEX__PERFMON_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define PERFMON_TEST_DEBUG_DATA__PERFMON_TEST_DEBUG_DATA_MASK 0xffffffff
+#define PERFMON_TEST_DEBUG_DATA__PERFMON_TEST_DEBUG_DATA__SHIFT 0x0
+#define REFCLK_CNTL__REFCLK_CLOCK_EN_MASK 0x1
+#define REFCLK_CNTL__REFCLK_CLOCK_EN__SHIFT 0x0
+#define REFCLK_CNTL__REFCLK_SRC_SEL_MASK 0x2
+#define REFCLK_CNTL__REFCLK_SRC_SEL__SHIFT 0x1
+#define DCCG_CBUS_WRCMD_DELAY__CBUS_PLL_WRCMD_DELAY_MASK 0xf
+#define DCCG_CBUS_WRCMD_DELAY__CBUS_PLL_WRCMD_DELAY__SHIFT 0x0
+#define DPREFCLK_CNTL__DPREFCLK_SRC_SEL_MASK 0x7
+#define DPREFCLK_CNTL__DPREFCLK_SRC_SEL__SHIFT 0x0
+#define DPREFCLK_CNTL__UNB_DB_CLK_ENABLE_MASK 0x100
+#define DPREFCLK_CNTL__UNB_DB_CLK_ENABLE__SHIFT 0x8
+#define AVSYNC_COUNTER_WRITE__AVSYNC_COUNTER_WRVALUE_MASK 0xffffffff
+#define AVSYNC_COUNTER_WRITE__AVSYNC_COUNTER_WRVALUE__SHIFT 0x0
+#define AVSYNC_COUNTER_CONTROL__AVSYNC_COUNTER_ENABLE_MASK 0x1
+#define AVSYNC_COUNTER_CONTROL__AVSYNC_COUNTER_ENABLE__SHIFT 0x0
+#define AVSYNC_COUNTER_READ__AVSYNC_COUNTER_RDVALUE_MASK 0xffffffff
+#define AVSYNC_COUNTER_READ__AVSYNC_COUNTER_RDVALUE__SHIFT 0x0
+#define DCCG_GTC_CNTL__DCCG_GTC_ENABLE_MASK 0x1
+#define DCCG_GTC_CNTL__DCCG_GTC_ENABLE__SHIFT 0x0
+#define DCCG_GTC_DTO_INCR__DCCG_GTC_DTO_INCR_MASK 0xffffffff
+#define DCCG_GTC_DTO_INCR__DCCG_GTC_DTO_INCR__SHIFT 0x0
+#define DCCG_GTC_DTO_MODULO__DCCG_GTC_DTO_MODULO_MASK 0xffffffff
+#define DCCG_GTC_DTO_MODULO__DCCG_GTC_DTO_MODULO__SHIFT 0x0
+#define DCCG_GTC_CURRENT__DCCG_GTC_CURRENT_MASK 0xffffffff
+#define DCCG_GTC_CURRENT__DCCG_GTC_CURRENT__SHIFT 0x0
+#define DCCG_DS_DTO_INCR__DCCG_DS_DTO_INCR_MASK 0xffffffff
+#define DCCG_DS_DTO_INCR__DCCG_DS_DTO_INCR__SHIFT 0x0
+#define DCCG_DS_DTO_MODULO__DCCG_DS_DTO_MODULO_MASK 0xffffffff
+#define DCCG_DS_DTO_MODULO__DCCG_DS_DTO_MODULO__SHIFT 0x0
+#define DCCG_DS_CNTL__DCCG_DS_ENABLE_MASK 0x1
+#define DCCG_DS_CNTL__DCCG_DS_ENABLE__SHIFT 0x0
+#define DCCG_DS_CNTL__DCCG_DS_HW_CAL_ENABLE_MASK 0x100
+#define DCCG_DS_CNTL__DCCG_DS_HW_CAL_ENABLE__SHIFT 0x8
+#define DCCG_DS_CNTL__DCCG_DS_ENABLED_STATUS_MASK 0x200
+#define DCCG_DS_CNTL__DCCG_DS_ENABLED_STATUS__SHIFT 0x9
+#define DCCG_DS_CNTL__DCCG_DS_XTALIN_RATE_DIV_MASK 0x30000
+#define DCCG_DS_CNTL__DCCG_DS_XTALIN_RATE_DIV__SHIFT 0x10
+#define DCCG_DS_CNTL__DCCG_DS_JITTER_REMOVE_DIS_MASK 0x1000000
+#define DCCG_DS_CNTL__DCCG_DS_JITTER_REMOVE_DIS__SHIFT 0x18
+#define DCCG_DS_CNTL__DCCG_DS_DELAY_XTAL_SE

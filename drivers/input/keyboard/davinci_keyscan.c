@@ -1,333 +1,198 @@
-/*
- * DaVinci Key Scan Driver for TI platforms
- *
- * Copyright (C) 2009 Texas Instruments, Inc
- *
- * Author: Miguel Aguilar <miguel.aguilar@ridgerun.com>
- *
- * Initial Code: Sandeep Paulraj <s-paulraj@ti.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- */
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/types.h>
-#include <linux/input.h>
-#include <linux/kernel.h>
-#include <linux/delay.h>
-#include <linux/platform_device.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-
-#include <asm/irq.h>
-
-#include <mach/hardware.h>
-#include <mach/irqs.h>
-#include <linux/platform_data/keyscan-davinci.h>
-
-/* Key scan registers */
-#define DAVINCI_KEYSCAN_KEYCTRL		0x0000
-#define DAVINCI_KEYSCAN_INTENA		0x0004
-#define DAVINCI_KEYSCAN_INTFLAG		0x0008
-#define DAVINCI_KEYSCAN_INTCLR		0x000c
-#define DAVINCI_KEYSCAN_STRBWIDTH	0x0010
-#define DAVINCI_KEYSCAN_INTERVAL	0x0014
-#define DAVINCI_KEYSCAN_CONTTIME	0x0018
-#define DAVINCI_KEYSCAN_CURRENTST	0x001c
-#define DAVINCI_KEYSCAN_PREVSTATE	0x0020
-#define DAVINCI_KEYSCAN_EMUCTRL		0x0024
-#define DAVINCI_KEYSCAN_IODFTCTRL	0x002c
-
-/* Key Control Register (KEYCTRL) */
-#define DAVINCI_KEYSCAN_KEYEN		0x00000001
-#define DAVINCI_KEYSCAN_PREVMODE	0x00000002
-#define DAVINCI_KEYSCAN_CHATOFF		0x00000004
-#define DAVINCI_KEYSCAN_AUTODET		0x00000008
-#define DAVINCI_KEYSCAN_SCANMODE	0x00000010
-#define DAVINCI_KEYSCAN_OUTTYPE		0x00000020
-
-/* Masks for the interrupts */
-#define DAVINCI_KEYSCAN_INT_CONT	0x00000008
-#define DAVINCI_KEYSCAN_INT_OFF		0x00000004
-#define DAVINCI_KEYSCAN_INT_ON		0x00000002
-#define DAVINCI_KEYSCAN_INT_CHANGE	0x00000001
-#define DAVINCI_KEYSCAN_INT_ALL		0x0000000f
-
-struct davinci_ks {
-	struct input_dev		*input;
-	struct davinci_ks_platform_data	*pdata;
-	int				irq;
-	void __iomem			*base;
-	resource_size_t			pbase;
-	size_t				base_size;
-	unsigned short			keymap[];
-};
-
-/* Initializing the kp Module */
-static int __init davinci_ks_initialize(struct davinci_ks *davinci_ks)
-{
-	struct device *dev = &davinci_ks->input->dev;
-	struct davinci_ks_platform_data *pdata = davinci_ks->pdata;
-	u32 matrix_ctrl;
-
-	/* Enable all interrupts */
-	__raw_writel(DAVINCI_KEYSCAN_INT_ALL,
-		     davinci_ks->base + DAVINCI_KEYSCAN_INTENA);
-
-	/* Clear interrupts if any */
-	__raw_writel(DAVINCI_KEYSCAN_INT_ALL,
-		     davinci_ks->base + DAVINCI_KEYSCAN_INTCLR);
-
-	/* Setup the scan period = strobe + interval */
-	__raw_writel(pdata->strobe,
-		     davinci_ks->base + DAVINCI_KEYSCAN_STRBWIDTH);
-	__raw_writel(pdata->interval,
-		     davinci_ks->base + DAVINCI_KEYSCAN_INTERVAL);
-	__raw_writel(0x01,
-		     davinci_ks->base + DAVINCI_KEYSCAN_CONTTIME);
-
-	/* Define matrix type */
-	switch (pdata->matrix_type) {
-	case DAVINCI_KEYSCAN_MATRIX_4X4:
-		matrix_ctrl = 0;
-		break;
-	case DAVINCI_KEYSCAN_MATRIX_5X3:
-		matrix_ctrl = (1 << 6);
-		break;
-	default:
-		dev_err(dev->parent, "wrong matrix type\n");
-		return -EINVAL;
-	}
-
-	/* Enable key scan module and set matrix type */
-	__raw_writel(DAVINCI_KEYSCAN_AUTODET | DAVINCI_KEYSCAN_KEYEN |
-		     matrix_ctrl, davinci_ks->base + DAVINCI_KEYSCAN_KEYCTRL);
-
-	return 0;
-}
-
-static irqreturn_t davinci_ks_interrupt(int irq, void *dev_id)
-{
-	struct davinci_ks *davinci_ks = dev_id;
-	struct device *dev = &davinci_ks->input->dev;
-	unsigned short *keymap = davinci_ks->keymap;
-	int keymapsize = davinci_ks->pdata->keymapsize;
-	u32 prev_status, new_status, changed;
-	bool release;
-	int keycode = KEY_UNKNOWN;
-	int i;
-
-	/* Disable interrupt */
-	__raw_writel(0x0, davinci_ks->base + DAVINCI_KEYSCAN_INTENA);
-
-	/* Reading previous and new status of the key scan */
-	prev_status = __raw_readl(davinci_ks->base + DAVINCI_KEYSCAN_PREVSTATE);
-	new_status = __raw_readl(davinci_ks->base + DAVINCI_KEYSCAN_CURRENTST);
-
-	changed = prev_status ^ new_status;
-
-	if (changed) {
-		/*
-		 * It goes through all bits in 'changed' to ensure
-		 * that no key changes are being missed
-		 */
-		for (i = 0 ; i < keymapsize; i++) {
-			if ((changed>>i) & 0x1) {
-				keycode = keymap[i];
-				release = (new_status >> i) & 0x1;
-				dev_dbg(dev->parent, "key %d %s\n", keycode,
-					release ? "released" : "pressed");
-				input_report_key(davinci_ks->input, keycode,
-						 !release);
-				input_sync(davinci_ks->input);
-			}
-		}
-		/* Clearing interrupt */
-		__raw_writel(DAVINCI_KEYSCAN_INT_ALL,
-			     davinci_ks->base + DAVINCI_KEYSCAN_INTCLR);
-	}
-
-	/* Enable interrupts */
-	__raw_writel(0x1, davinci_ks->base + DAVINCI_KEYSCAN_INTENA);
-
-	return IRQ_HANDLED;
-}
-
-static int __init davinci_ks_probe(struct platform_device *pdev)
-{
-	struct davinci_ks *davinci_ks;
-	struct input_dev *key_dev;
-	struct resource *res, *mem;
-	struct device *dev = &pdev->dev;
-	struct davinci_ks_platform_data *pdata = dev_get_platdata(&pdev->dev);
-	int error, i;
-
-	if (pdata->device_enable) {
-		error = pdata->device_enable(dev);
-		if (error < 0) {
-			dev_dbg(dev, "device enable function failed\n");
-			return error;
-		}
-	}
-
-	if (!pdata->keymap) {
-		dev_dbg(dev, "no keymap from pdata\n");
-		return -EINVAL;
-	}
-
-	davinci_ks = kzalloc(sizeof(struct davinci_ks) +
-		sizeof(unsigned short) * pdata->keymapsize, GFP_KERNEL);
-	if (!davinci_ks) {
-		dev_dbg(dev, "could not allocate memory for private data\n");
-		return -ENOMEM;
-	}
-
-	memcpy(davinci_ks->keymap, pdata->keymap,
-		sizeof(unsigned short) * pdata->keymapsize);
-
-	key_dev = input_allocate_device();
-	if (!key_dev) {
-		dev_dbg(dev, "could not allocate input device\n");
-		error = -ENOMEM;
-		goto fail1;
-	}
-
-	davinci_ks->input = key_dev;
-
-	davinci_ks->irq = platform_get_irq(pdev, 0);
-	if (davinci_ks->irq < 0) {
-		dev_err(dev, "no key scan irq\n");
-		error = davinci_ks->irq;
-		goto fail2;
-	}
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res) {
-		dev_err(dev, "no mem resource\n");
-		error = -EINVAL;
-		goto fail2;
-	}
-
-	davinci_ks->pbase = res->start;
-	davinci_ks->base_size = resource_size(res);
-
-	mem = request_mem_region(davinci_ks->pbase, davinci_ks->base_size,
-				 pdev->name);
-	if (!mem) {
-		dev_err(dev, "key scan registers at %08x are not free\n",
-			davinci_ks->pbase);
-		error = -EBUSY;
-		goto fail2;
-	}
-
-	davinci_ks->base = ioremap(davinci_ks->pbase, davinci_ks->base_size);
-	if (!davinci_ks->base) {
-		dev_err(dev, "can't ioremap MEM resource.\n");
-		error = -ENOMEM;
-		goto fail3;
-	}
-
-	/* Enable auto repeat feature of Linux input subsystem */
-	if (pdata->rep)
-		__set_bit(EV_REP, key_dev->evbit);
-
-	/* Setup input device */
-	__set_bit(EV_KEY, key_dev->evbit);
-
-	/* Setup the platform data */
-	davinci_ks->pdata = pdata;
-
-	for (i = 0; i < davinci_ks->pdata->keymapsize; i++)
-		__set_bit(davinci_ks->pdata->keymap[i], key_dev->keybit);
-
-	key_dev->name = "davinci_keyscan";
-	key_dev->phys = "davinci_keyscan/input0";
-	key_dev->dev.parent = &pdev->dev;
-	key_dev->id.bustype = BUS_HOST;
-	key_dev->id.vendor = 0x0001;
-	key_dev->id.product = 0x0001;
-	key_dev->id.version = 0x0001;
-	key_dev->keycode = davinci_ks->keymap;
-	key_dev->keycodesize = sizeof(davinci_ks->keymap[0]);
-	key_dev->keycodemax = davinci_ks->pdata->keymapsize;
-
-	error = input_register_device(davinci_ks->input);
-	if (error < 0) {
-		dev_err(dev, "unable to register davinci key scan device\n");
-		goto fail4;
-	}
-
-	error = request_irq(davinci_ks->irq, davinci_ks_interrupt,
-			  0, pdev->name, davinci_ks);
-	if (error < 0) {
-		dev_err(dev, "unable to register davinci key scan interrupt\n");
-		goto fail5;
-	}
-
-	error = davinci_ks_initialize(davinci_ks);
-	if (error < 0) {
-		dev_err(dev, "unable to initialize davinci key scan device\n");
-		goto fail6;
-	}
-
-	platform_set_drvdata(pdev, davinci_ks);
-	return 0;
-
-fail6:
-	free_irq(davinci_ks->irq, davinci_ks);
-fail5:
-	input_unregister_device(davinci_ks->input);
-	key_dev = NULL;
-fail4:
-	iounmap(davinci_ks->base);
-fail3:
-	release_mem_region(davinci_ks->pbase, davinci_ks->base_size);
-fail2:
-	input_free_device(key_dev);
-fail1:
-	kfree(davinci_ks);
-
-	return error;
-}
-
-static int davinci_ks_remove(struct platform_device *pdev)
-{
-	struct davinci_ks *davinci_ks = platform_get_drvdata(pdev);
-
-	free_irq(davinci_ks->irq, davinci_ks);
-
-	input_unregister_device(davinci_ks->input);
-
-	iounmap(davinci_ks->base);
-	release_mem_region(davinci_ks->pbase, davinci_ks->base_size);
-
-	kfree(davinci_ks);
-
-	return 0;
-}
-
-static struct platform_driver davinci_ks_driver = {
-	.driver	= {
-		.name = "davinci_keyscan",
-	},
-	.remove	= davinci_ks_remove,
-};
-
-module_platform_driver_probe(davinci_ks_driver, davinci_ks_probe);
-
-MODULE_AUTHOR("Miguel Aguilar");
-MODULE_DESCRIPTION("Texas Instruments DaVinci Key Scan Driver");
-MODULE_LICENSE("GPL");
+C_RD_TC1__MAX_BURST_MASK 0x780
+#define MC_RD_TC1__MAX_BURST__SHIFT 0x7
+#define MC_RD_TC1__LAZY_TIMER_MASK 0x7800
+#define MC_RD_TC1__LAZY_TIMER__SHIFT 0xb
+#define MC_RD_TC1__STALL_OVERRIDE_WTM_MASK 0x8000
+#define MC_RD_TC1__STALL_OVERRIDE_WTM__SHIFT 0xf
+#define MC_RD_HUB__ENABLE_MASK 0x1
+#define MC_RD_HUB__ENABLE__SHIFT 0x0
+#define MC_RD_HUB__PRESCALE_MASK 0x6
+#define MC_RD_HUB__PRESCALE__SHIFT 0x1
+#define MC_RD_HUB__BLACKOUT_EXEMPT_MASK 0x8
+#define MC_RD_HUB__BLACKOUT_EXEMPT__SHIFT 0x3
+#define MC_RD_HUB__STALL_MODE_MASK 0x30
+#define MC_RD_HUB__STALL_MODE__SHIFT 0x4
+#define MC_RD_HUB__STALL_OVERRIDE_MASK 0x40
+#define MC_RD_HUB__STALL_OVERRIDE__SHIFT 0x6
+#define MC_RD_HUB__MAX_BURST_MASK 0x780
+#define MC_RD_HUB__MAX_BURST__SHIFT 0x7
+#define MC_RD_HUB__LAZY_TIMER_MASK 0x7800
+#define MC_RD_HUB__LAZY_TIMER__SHIFT 0xb
+#define MC_RD_HUB__STALL_OVERRIDE_WTM_MASK 0x8000
+#define MC_RD_HUB__STALL_OVERRIDE_WTM__SHIFT 0xf
+#define MC_WR_CB__ENABLE_MASK 0x1
+#define MC_WR_CB__ENABLE__SHIFT 0x0
+#define MC_WR_CB__PRESCALE_MASK 0x6
+#define MC_WR_CB__PRESCALE__SHIFT 0x1
+#define MC_WR_CB__BLACKOUT_EXEMPT_MASK 0x8
+#define MC_WR_CB__BLACKOUT_EXEMPT__SHIFT 0x3
+#define MC_WR_CB__STALL_MODE_MASK 0x30
+#define MC_WR_CB__STALL_MODE__SHIFT 0x4
+#define MC_WR_CB__STALL_OVERRIDE_MASK 0x40
+#define MC_WR_CB__STALL_OVERRIDE__SHIFT 0x6
+#define MC_WR_CB__MAX_BURST_MASK 0x780
+#define MC_WR_CB__MAX_BURST__SHIFT 0x7
+#define MC_WR_CB__LAZY_TIMER_MASK 0x7800
+#define MC_WR_CB__LAZY_TIMER__SHIFT 0xb
+#define MC_WR_CB__STALL_OVERRIDE_WTM_MASK 0x8000
+#define MC_WR_CB__STALL_OVERRIDE_WTM__SHIFT 0xf
+#define MC_WR_DB__ENABLE_MASK 0x1
+#define MC_WR_DB__ENABLE__SHIFT 0x0
+#define MC_WR_DB__PRESCALE_MASK 0x6
+#define MC_WR_DB__PRESCALE__SHIFT 0x1
+#define MC_WR_DB__BLACKOUT_EXEMPT_MASK 0x8
+#define MC_WR_DB__BLACKOUT_EXEMPT__SHIFT 0x3
+#define MC_WR_DB__STALL_MODE_MASK 0x30
+#define MC_WR_DB__STALL_MODE__SHIFT 0x4
+#define MC_WR_DB__STALL_OVERRIDE_MASK 0x40
+#define MC_WR_DB__STALL_OVERRIDE__SHIFT 0x6
+#define MC_WR_DB__MAX_BURST_MASK 0x780
+#define MC_WR_DB__MAX_BURST__SHIFT 0x7
+#define MC_WR_DB__LAZY_TIMER_MASK 0x7800
+#define MC_WR_DB__LAZY_TIMER__SHIFT 0xb
+#define MC_WR_DB__STALL_OVERRIDE_WTM_MASK 0x8000
+#define MC_WR_DB__STALL_OVERRIDE_WTM__SHIFT 0xf
+#define MC_WR_HUB__ENABLE_MASK 0x1
+#define MC_WR_HUB__ENABLE__SHIFT 0x0
+#define MC_WR_HUB__PRESCALE_MASK 0x6
+#define MC_WR_HUB__PRESCALE__SHIFT 0x1
+#define MC_WR_HUB__BLACKOUT_EXEMPT_MASK 0x8
+#define MC_WR_HUB__BLACKOUT_EXEMPT__SHIFT 0x3
+#define MC_WR_HUB__STALL_MODE_MASK 0x30
+#define MC_WR_HUB__STALL_MODE__SHIFT 0x4
+#define MC_WR_HUB__STALL_OVERRIDE_MASK 0x40
+#define MC_WR_HUB__STALL_OVERRIDE__SHIFT 0x6
+#define MC_WR_HUB__MAX_BURST_MASK 0x780
+#define MC_WR_HUB__MAX_BURST__SHIFT 0x7
+#define MC_WR_HUB__LAZY_TIMER_MASK 0x7800
+#define MC_WR_HUB__LAZY_TIMER__SHIFT 0xb
+#define MC_WR_HUB__STALL_OVERRIDE_WTM_MASK 0x8000
+#define MC_WR_HUB__STALL_OVERRIDE_WTM__SHIFT 0xf
+#define MC_CITF_CREDITS_XBAR__READ_LCL_MASK 0xff
+#define MC_CITF_CREDITS_XBAR__READ_LCL__SHIFT 0x0
+#define MC_CITF_CREDITS_XBAR__WRITE_LCL_MASK 0xff00
+#define MC_CITF_CREDITS_XBAR__WRITE_LCL__SHIFT 0x8
+#define MC_RD_GRP_LCL__CB0_MASK 0xf000
+#define MC_RD_GRP_LCL__CB0__SHIFT 0xc
+#define MC_RD_GRP_LCL__CBCMASK0_MASK 0xf0000
+#define MC_RD_GRP_LCL__CBCMASK0__SHIFT 0x10
+#define MC_RD_GRP_LCL__CBFMASK0_MASK 0xf00000
+#define MC_RD_GRP_LCL__CBFMASK0__SHIFT 0x14
+#define MC_RD_GRP_LCL__DB0_MASK 0xf000000
+#define MC_RD_GRP_LCL__DB0__SHIFT 0x18
+#define MC_RD_GRP_LCL__DBHTILE0_MASK 0xf0000000
+#define MC_RD_GRP_LCL__DBHTILE0__SHIFT 0x1c
+#define MC_WR_GRP_LCL__CB0_MASK 0xf
+#define MC_WR_GRP_LCL__CB0__SHIFT 0x0
+#define MC_WR_GRP_LCL__CBCMASK0_MASK 0xf0
+#define MC_WR_GRP_LCL__CBCMASK0__SHIFT 0x4
+#define MC_WR_GRP_LCL__CBFMASK0_MASK 0xf00
+#define MC_WR_GRP_LCL__CBFMASK0__SHIFT 0x8
+#define MC_WR_GRP_LCL__DB0_MASK 0xf000
+#define MC_WR_GRP_LCL__DB0__SHIFT 0xc
+#define MC_WR_GRP_LCL__DBHTILE0_MASK 0xf0000
+#define MC_WR_GRP_LCL__DBHTILE0__SHIFT 0x10
+#define MC_WR_GRP_LCL__SX0_MASK 0xf00000
+#define MC_WR_GRP_LCL__SX0__SHIFT 0x14
+#define MC_WR_GRP_LCL__CBIMMED0_MASK 0xf0000000
+#define MC_WR_GRP_LCL__CBIMMED0__SHIFT 0x1c
+#define MC_CITF_PERF_MON_CNTL2__CID_MASK 0xff
+#define MC_CITF_PERF_MON_CNTL2__CID__SHIFT 0x0
+#define MC_CITF_PERF_MON_RSLT2__CB_RD_BUSY_MASK 0x40
+#define MC_CITF_PERF_MON_RSLT2__CB_RD_BUSY__SHIFT 0x6
+#define MC_CITF_PERF_MON_RSLT2__DB_RD_BUSY_MASK 0x80
+#define MC_CITF_PERF_MON_RSLT2__DB_RD_BUSY__SHIFT 0x7
+#define MC_CITF_PERF_MON_RSLT2__TC0_RD_BUSY_MASK 0x100
+#define MC_CITF_PERF_MON_RSLT2__TC0_RD_BUSY__SHIFT 0x8
+#define MC_CITF_PERF_MON_RSLT2__VC0_RD_BUSY_MASK 0x200
+#define MC_CITF_PERF_MON_RSLT2__VC0_RD_BUSY__SHIFT 0x9
+#define MC_CITF_PERF_MON_RSLT2__TC1_RD_BUSY_MASK 0x400
+#define MC_CITF_PERF_MON_RSLT2__TC1_RD_BUSY__SHIFT 0xa
+#define MC_CITF_PERF_MON_RSLT2__VC1_RD_BUSY_MASK 0x800
+#define MC_CITF_PERF_MON_RSLT2__VC1_RD_BUSY__SHIFT 0xb
+#define MC_CITF_PERF_MON_RSLT2__CB_WR_BUSY_MASK 0x1000
+#define MC_CITF_PERF_MON_RSLT2__CB_WR_BUSY__SHIFT 0xc
+#define MC_CITF_PERF_MON_RSLT2__DB_WR_BUSY_MASK 0x2000
+#define MC_CITF_PERF_MON_RSLT2__DB_WR_BUSY__SHIFT 0xd
+#define MC_CITF_PERF_MON_RSLT2__SX_WR_BUSY_MASK 0x4000
+#define MC_CITF_PERF_MON_RSLT2__SX_WR_BUSY__SHIFT 0xe
+#define MC_CITF_PERF_MON_RSLT2__TC2_RD_BUSY_MASK 0x8000
+#define MC_CITF_PERF_MON_RSLT2__TC2_RD_BUSY__SHIFT 0xf
+#define MC_CITF_PERF_MON_RSLT2__TC0_WR_BUSY_MASK 0x10000
+#define MC_CITF_PERF_MON_RSLT2__TC0_WR_BUSY__SHIFT 0x10
+#define MC_CITF_PERF_MON_RSLT2__TC1_WR_BUSY_MASK 0x20000
+#define MC_CITF_PERF_MON_RSLT2__TC1_WR_BUSY__SHIFT 0x11
+#define MC_CITF_PERF_MON_RSLT2__TC2_WR_BUSY_MASK 0x40000
+#define MC_CITF_PERF_MON_RSLT2__TC2_WR_BUSY__SHIFT 0x12
+#define MC_CITF_MISC_RD_CG__ONDLY_MASK 0x3f
+#define MC_CITF_MISC_RD_CG__ONDLY__SHIFT 0x0
+#define MC_CITF_MISC_RD_CG__OFFDLY_MASK 0xfc0
+#define MC_CITF_MISC_RD_CG__OFFDLY__SHIFT 0x6
+#define MC_CITF_MISC_RD_CG__RDYDLY_MASK 0x3f000
+#define MC_CITF_MISC_RD_CG__RDYDLY__SHIFT 0xc
+#define MC_CITF_MISC_RD_CG__ENABLE_MASK 0x40000
+#define MC_CITF_MISC_RD_CG__ENABLE__SHIFT 0x12
+#define MC_CITF_MISC_RD_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_CITF_MISC_RD_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_CITF_MISC_WR_CG__ONDLY_MASK 0x3f
+#define MC_CITF_MISC_WR_CG__ONDLY__SHIFT 0x0
+#define MC_CITF_MISC_WR_CG__OFFDLY_MASK 0xfc0
+#define MC_CITF_MISC_WR_CG__OFFDLY__SHIFT 0x6
+#define MC_CITF_MISC_WR_CG__RDYDLY_MASK 0x3f000
+#define MC_CITF_MISC_WR_CG__RDYDLY__SHIFT 0xc
+#define MC_CITF_MISC_WR_CG__ENABLE_MASK 0x40000
+#define MC_CITF_MISC_WR_CG__ENABLE__SHIFT 0x12
+#define MC_CITF_MISC_WR_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_CITF_MISC_WR_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_CITF_MISC_VM_CG__ONDLY_MASK 0x3f
+#define MC_CITF_MISC_VM_CG__ONDLY__SHIFT 0x0
+#define MC_CITF_MISC_VM_CG__OFFDLY_MASK 0xfc0
+#define MC_CITF_MISC_VM_CG__OFFDLY__SHIFT 0x6
+#define MC_CITF_MISC_VM_CG__RDYDLY_MASK 0x3f000
+#define MC_CITF_MISC_VM_CG__RDYDLY__SHIFT 0xc
+#define MC_CITF_MISC_VM_CG__ENABLE_MASK 0x40000
+#define MC_CITF_MISC_VM_CG__ENABLE__SHIFT 0x12
+#define MC_CITF_MISC_VM_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_CITF_MISC_VM_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_HUB_MISC_POWER__SRBM_GATE_OVERRIDE_MASK 0x4
+#define MC_HUB_MISC_POWER__SRBM_GATE_OVERRIDE__SHIFT 0x2
+#define MC_HUB_MISC_POWER__PM_BLACKOUT_CNTL_MASK 0x18
+#define MC_HUB_MISC_POWER__PM_BLACKOUT_CNTL__SHIFT 0x3
+#define MC_HUB_MISC_HUB_CG__ONDLY_MASK 0x3f
+#define MC_HUB_MISC_HUB_CG__ONDLY__SHIFT 0x0
+#define MC_HUB_MISC_HUB_CG__OFFDLY_MASK 0xfc0
+#define MC_HUB_MISC_HUB_CG__OFFDLY__SHIFT 0x6
+#define MC_HUB_MISC_HUB_CG__RDYDLY_MASK 0x3f000
+#define MC_HUB_MISC_HUB_CG__RDYDLY__SHIFT 0xc
+#define MC_HUB_MISC_HUB_CG__ENABLE_MASK 0x40000
+#define MC_HUB_MISC_HUB_CG__ENABLE__SHIFT 0x12
+#define MC_HUB_MISC_HUB_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_HUB_MISC_HUB_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_HUB_MISC_VM_CG__ONDLY_MASK 0x3f
+#define MC_HUB_MISC_VM_CG__ONDLY__SHIFT 0x0
+#define MC_HUB_MISC_VM_CG__OFFDLY_MASK 0xfc0
+#define MC_HUB_MISC_VM_CG__OFFDLY__SHIFT 0x6
+#define MC_HUB_MISC_VM_CG__RDYDLY_MASK 0x3f000
+#define MC_HUB_MISC_VM_CG__RDYDLY__SHIFT 0xc
+#define MC_HUB_MISC_VM_CG__ENABLE_MASK 0x40000
+#define MC_HUB_MISC_VM_CG__ENABLE__SHIFT 0x12
+#define MC_HUB_MISC_VM_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_HUB_MISC_VM_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_HUB_MISC_SIP_CG__ONDLY_MASK 0x3f
+#define MC_HUB_MISC_SIP_CG__ONDLY__SHIFT 0x0
+#define MC_HUB_MISC_SIP_CG__OFFDLY_MASK 0xfc0
+#define MC_HUB_MISC_SIP_CG__OFFDLY__SHIFT 0x6
+#define MC_HUB_MISC_SIP_CG__RDYDLY_MASK 0x3f000
+#define MC_HUB_MISC_SIP_CG__RDYDLY__SHIFT 0xc
+#define MC_HUB_MISC_SIP_CG__ENABLE_MASK 0x40000
+#define MC_HUB_MISC_SIP_CG__ENABLE__SHIFT 0x12
+#define MC_HUB_MISC_SIP_CG__MEM_LS_ENABLE_MASK 0x80000
+#define MC_HUB_MISC_SIP_CG__MEM_LS_ENABLE__SHIFT 0x13
+#define MC_HUB_MISC_STATUS__OUTSTANDING_READ_MASK 0x1
+#define MC_HUB_MISC_STATUS__OUTSTANDING_READ__SHIFT 0x0
+#define MC_HUB_MISC_STATUS__OUTSTANDING_WRITE_MASK 0x2
+#define MC_HUB_MISC_STATUS__OUTSTANDING_WRITE__SHIFT 0x1
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_RDREQ_MASK 0x4
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_RDREQ__SHIFT 0x2
+#define MC_HUB_MISC_STATUS__OUTSTANDING_HUB_RDRET_MASK 0x8
+#define MC_HUB_MISC_STATUS__O

@@ -1,12 +1,11 @@
-#
-# Makefile for multiplexer I2C chip drivers.
-
-obj-$(CONFIG_I2C_ARB_GPIO_CHALLENGE)	+= i2c-arb-gpio-challenge.o
-
-obj-$(CONFIG_I2C_MUX_GPIO)	+= i2c-mux-gpio.o
-obj-$(CONFIG_I2C_MUX_PCA9541)	+= i2c-mux-pca9541.o
-obj-$(CONFIG_I2C_MUX_PCA954x)	+= i2c-mux-pca954x.o
-obj-$(CONFIG_I2C_MUX_PINCTRL)	+= i2c-mux-pinctrl.o
-obj-$(CONFIG_I2C_MUX_REG)	+= i2c-mux-reg.o
-
-ccflags-$(CONFIG_I2C_DEBUG_BUS) := -DDEBUG
+#ifdef CONFIG_DEBUG_FS
+/*
+ * Copyright (c) 2013 Intel Corporation.  All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *    

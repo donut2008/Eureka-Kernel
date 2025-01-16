@@ -1,1533 +1,2194 @@
+= gpe_event_info->register_info;
+	if (!gpe_register_info) {
+		return (AE_NOT_EXIST);
+	}
+
+	/* Get current value of the enable register that contains this GPE */
+
+	status = acpi_hw_read(&enable_mask, &gpe_register_info->enable_address);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	/* Set or clear just the bit that corresponds to this GPE */
+
+	register_bit = acpi_hw_get_gpe_register_bit(gpe_event_info);
+	switch (action) {
+	case ACPI_GPE_CONDITIONAL_ENABLE:
+
+		/* Only enable if the corresponding enable_mask bit is set */
+
+		if (!(register_bit & gpe_register_info->enable_mask)) {
+			return (AE_BAD_PARAMETER);
+		}
+
+		/*lint -fallthrough */
+
+	case ACPI_GPE_ENABLE:
+
+		ACPI_SET_BIT(enable_mask, register_bit);
+		break;
+
+	case ACPI_GPE_DISABLE:
+
+		ACPI_CLEAR_BIT(enable_mask, register_bit);
+		break;
+
+	default:
+
+		ACPI_ERROR((AE_INFO, "Invalid GPE Action, %u", action));
+		return (AE_BAD_PARAMETER);
+	}
+
+	/* Write the updated enable mask */
+
+	status = acpi_hw_write(enable_mask, &gpe_register_info->enable_address);
+	return (status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_clear_gpe
+ *
+ * PARAMETERS:  gpe_event_info      - Info block for the GPE to be cleared
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Clear the status bit for a single GPE.
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_clear_gpe(struct acpi_gpe_event_info * gpe_event_info)
+{
+	struct acpi_gpe_register_info *gpe_register_info;
+	acpi_status status;
+	u32 register_bit;
+
+	ACPI_FUNCTION_ENTRY();
+
+	/* Get the info block for the entire GPE register */
+
+	gpe_register_info = gpe_event_info->register_info;
+	if (!gpe_register_info) {
+		return (AE_NOT_EXIST);
+	}
+
+	/*
+	 * Write a one to the appropriate bit in the status register to
+	 * clear this GPE.
+	 */
+	register_bit = acpi_hw_get_gpe_register_bit(gpe_event_info);
+
+	status = acpi_hw_write(register_bit,
+			       &gpe_register_info->status_address);
+
+	return (status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_get_gpe_status
+ *
+ * PARAMETERS:  gpe_event_info      - Info block for the GPE to queried
+ *              event_status        - Where the GPE status is returned
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Return the status of a single GPE.
+ *
+ ******************************************************************************/
+
+acpi_status
+acpi_hw_get_gpe_status(struct acpi_gpe_event_info * gpe_event_info,
+		       acpi_event_status *event_status)
+{
+	u32 in_byte;
+	u32 register_bit;
+	struct acpi_gpe_register_info *gpe_register_info;
+	acpi_event_status local_event_status = 0;
+	acpi_status status;
+
+	ACPI_FUNCTION_ENTRY();
+
+	if (!event_status) {
+		return (AE_BAD_PARAMETER);
+	}
+
+	/* GPE currently handled? */
+
+	if (ACPI_GPE_DISPATCH_TYPE(gpe_event_info->flags) !=
+	    ACPI_GPE_DISPATCH_NONE) {
+		local_event_status |= ACPI_EVENT_FLAG_HAS_HANDLER;
+	}
+
+	/* Get the info block for the entire GPE register */
+
+	gpe_register_info = gpe_event_info->register_info;
+
+	/* Get the register bitmask for this GPE */
+
+	register_bit = acpi_hw_get_gpe_register_bit(gpe_event_info);
+
+	/* GPE currently enabled? (enabled for runtime?) */
+
+	if (register_bit & gpe_register_info->enable_for_run) {
+		local_event_status |= ACPI_EVENT_FLAG_ENABLED;
+	}
+
+	/* GPE enabled for wake? */
+
+	if (register_bit & gpe_register_info->enable_for_wake) {
+		local_event_status |= ACPI_EVENT_FLAG_WAKE_ENABLED;
+	}
+
+	/* GPE currently enabled (enable bit == 1)? */
+
+	status = acpi_hw_read(&in_byte, &gpe_register_info->enable_address);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	if (register_bit & in_byte) {
+		local_event_status |= ACPI_EVENT_FLAG_ENABLE_SET;
+	}
+
+	/* GPE currently active (status bit == 1)? */
+
+	status = acpi_hw_read(&in_byte, &gpe_register_info->status_address);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	if (register_bit & in_byte) {
+		local_event_status |= ACPI_EVENT_FLAG_STATUS_SET;
+	}
+
+	/* Set return value */
+
+	(*event_status) = local_event_status;
+	return (AE_OK);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_gpe_enable_write
+ *
+ * PARAMETERS:  enable_mask         - Bit mask to write to the GPE register
+ *              gpe_register_info   - Gpe Register info
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Write the enable mask byte to the given GPE register.
+ *
+ ******************************************************************************/
+
+static acpi_status
+acpi_hw_gpe_enable_write(u8 enable_mask,
+			 struct acpi_gpe_register_info *gpe_register_info)
+{
+	acpi_status status;
+
+	gpe_register_info->enable_mask = enable_mask;
+	status = acpi_hw_write(enable_mask, &gpe_register_info->enable_address);
+	return (status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_disable_gpe_block
+ *
+ * PARAMETERS:  gpe_xrupt_info      - GPE Interrupt info
+ *              gpe_block           - Gpe Block info
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Disable all GPEs within a single GPE block
+ *
+ ******************************************************************************/
+
+acpi_status
+acpi_hw_disable_gpe_block(struct acpi_gpe_xrupt_info *gpe_xrupt_info,
+			  struct acpi_gpe_block_info *gpe_block, void *context)
+{
+	u32 i;
+	acpi_status status;
+
+	/* Examine each GPE Register within the block */
+
+	for (i = 0; i < gpe_block->register_count; i++) {
+
+		/* Disable all GPEs in this register */
+
+		status =
+		    acpi_hw_gpe_enable_write(0x00,
+					     &gpe_block->register_info[i]);
+		if (ACPI_FAILURE(status)) {
+			return (status);
+		}
+	}
+
+	return (AE_OK);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_clear_gpe_block
+ *
+ * PARAMETERS:  gpe_xrupt_info      - GPE Interrupt info
+ *              gpe_block           - Gpe Block info
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Clear status bits for all GPEs within a single GPE block
+ *
+ ******************************************************************************/
+
+acpi_status
+acpi_hw_clear_gpe_block(struct acpi_gpe_xrupt_info *gpe_xrupt_info,
+			struct acpi_gpe_block_info *gpe_block, void *context)
+{
+	u32 i;
+	acpi_status status;
+
+	/* Examine each GPE Register within the block */
+
+	for (i = 0; i < gpe_block->register_count; i++) {
+
+		/* Clear status on all GPEs in this register */
+
+		status =
+		    acpi_hw_write(0xFF,
+				  &gpe_block->register_info[i].status_address);
+		if (ACPI_FAILURE(status)) {
+			return (status);
+		}
+	}
+
+	return (AE_OK);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_enable_runtime_gpe_block
+ *
+ * PARAMETERS:  gpe_xrupt_info      - GPE Interrupt info
+ *              gpe_block           - Gpe Block info
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Enable all "runtime" GPEs within a single GPE block. Includes
+ *              combination wake/run GPEs.
+ *
+ ******************************************************************************/
+
+acpi_status
+acpi_hw_enable_runtime_gpe_block(struct acpi_gpe_xrupt_info *gpe_xrupt_info,
+				 struct acpi_gpe_block_info * gpe_block,
+				 void *context)
+{
+	u32 i;
+	acpi_status status;
+	struct acpi_gpe_register_info *gpe_register_info;
+
+	/* NOTE: assumes that all GPEs are currently disabled */
+
+	/* Examine each GPE Register within the block */
+
+	for (i = 0; i < gpe_block->register_count; i++) {
+		gpe_register_info = &gpe_block->register_info[i];
+		if (!gpe_register_info->enable_for_run) {
+			continue;
+		}
+
+		/* Enable all "runtime" GPEs in this register */
+
+		status =
+		    acpi_hw_gpe_enable_write(gpe_register_info->enable_for_run,
+					     gpe_register_info);
+		if (ACPI_FAILURE(status)) {
+			return (status);
+		}
+	}
+
+	return (AE_OK);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_enable_wakeup_gpe_block
+ *
+ * PARAMETERS:  gpe_xrupt_info      - GPE Interrupt info
+ *              gpe_block           - Gpe Block info
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Enable all "wake" GPEs within a single GPE block. Includes
+ *              combination wake/run GPEs.
+ *
+ ******************************************************************************/
+
+static acpi_status
+acpi_hw_enable_wakeup_gpe_block(struct acpi_gpe_xrupt_info *gpe_xrupt_info,
+				struct acpi_gpe_block_info *gpe_block,
+				void *context)
+{
+	u32 i;
+	acpi_status status;
+	struct acpi_gpe_register_info *gpe_register_info;
+
+	/* Examine each GPE Register within the block */
+
+	for (i = 0; i < gpe_block->register_count; i++) {
+		gpe_register_info = &gpe_block->register_info[i];
+
+		/*
+		 * Enable all "wake" GPEs in this register and disable the
+		 * remaining ones.
+		 */
+
+		status =
+		    acpi_hw_gpe_enable_write(gpe_register_info->enable_for_wake,
+					     gpe_register_info);
+		if (ACPI_FAILURE(status)) {
+			return (status);
+		}
+	}
+
+	return (AE_OK);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_disable_all_gpes
+ *
+ * PARAMETERS:  None
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Disable and clear all GPEs in all GPE blocks
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_disable_all_gpes(void)
+{
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(hw_disable_all_gpes);
+
+	status = acpi_ev_walk_gpe_list(acpi_hw_disable_gpe_block, NULL);
+	status = acpi_ev_walk_gpe_list(acpi_hw_clear_gpe_block, NULL);
+	return_ACPI_STATUS(status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_enable_all_runtime_gpes
+ *
+ * PARAMETERS:  None
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Enable all "runtime" GPEs, in all GPE blocks
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_enable_all_runtime_gpes(void)
+{
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(hw_enable_all_runtime_gpes);
+
+	status = acpi_ev_walk_gpe_list(acpi_hw_enable_runtime_gpe_block, NULL);
+	return_ACPI_STATUS(status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_enable_all_wakeup_gpes
+ *
+ * PARAMETERS:  None
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Enable all "wakeup" GPEs, in all GPE blocks
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_enable_all_wakeup_gpes(void)
+{
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(hw_enable_all_wakeup_gpes);
+
+	status = acpi_ev_walk_gpe_list(acpi_hw_enable_wakeup_gpe_block, NULL);
+	return_ACPI_STATUS(status);
+}
+
+#endif				/* !ACPI_REDUCED_HARDWARE */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*******************************************************************************
+ *
+ * Module Name: hwpci - Obtain PCI bus, device, and function numbers
+ *
+ ******************************************************************************/
+
 /*
- * Copyright (c) 2010 Broadcom Corporation
+ * Copyright (C) 2000 - 2015, Intel Corp.
+ * All rights reserved.
  *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions, and the following disclaimer,
+ *    without modification.
+ * 2. Redistributions in binary form must reproduce at minimum a disclaimer
+ *    substantially similar to the "NO WARRANTY" disclaimer below
+ *    ("Disclaimer") and any redistribution must be conditioned upon
+ *    including a substantially similar Disclaimer requirement for further
+ *    binary redistribution.
+ * 3. Neither the names of the above-listed copyright holders nor the names
+ *    of any contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
  *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
- * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
- * OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
- * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Alternatively, this software may be distributed under the terms of the
+ * GNU General Public License ("GPL") version 2 as published by the Free
+ * Software Foundation.
+ *
+ * NO WARRANTY
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * HOLDERS OR CONTRIBUTORS BE LIABLE FOR SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGES.
  */
 
-#ifndef	_BRCM_PHY_RADIO_H_
-#define	_BRCM_PHY_RADIO_H_
+#include <acpi/acpi.h>
+#include "accommon.h"
 
-#define	RADIO_IDCODE			0x01
+#define _COMPONENT          ACPI_NAMESPACE
+ACPI_MODULE_NAME("hwpci")
 
-#define RADIO_DEFAULT_CORE		0
+/* PCI configuration space values */
+#define PCI_CFG_HEADER_TYPE_REG             0x0E
+#define PCI_CFG_PRIMARY_BUS_NUMBER_REG      0x18
+#define PCI_CFG_SECONDARY_BUS_NUMBER_REG    0x19
+/* PCI header values */
+#define PCI_HEADER_TYPE_MASK                0x7F
+#define PCI_TYPE_BRIDGE                     0x01
+#define PCI_TYPE_CARDBUS_BRIDGE             0x02
+typedef struct acpi_pci_device {
+	acpi_handle device;
+	struct acpi_pci_device *next;
 
-#define	RXC0_RSSI_RST			0x80
-#define	RXC0_MODE_RSSI			0x40
-#define	RXC0_MODE_OFF			0x20
-#define	RXC0_MODE_CM			0x10
-#define	RXC0_LAN_LOAD			0x08
-#define	RXC0_OFF_ADJ_MASK		0x07
+} acpi_pci_device;
 
-#define	TXC0_MODE_TXLPF			0x04
-#define	TXC0_PA_TSSI_EN			0x02
-#define	TXC0_TSSI_EN			0x01
+/* Local prototypes */
 
-#define	TXC1_PA_GAIN_MASK		0x60
-#define	TXC1_PA_GAIN_3DB		0x40
-#define	TXC1_PA_GAIN_2DB		0x20
-#define	TXC1_TX_MIX_GAIN		0x10
-#define	TXC1_OFF_I_MASK			0x0c
-#define	TXC1_OFF_Q_MASK			0x03
+static acpi_status
+acpi_hw_build_pci_list(acpi_handle root_pci_device,
+		       acpi_handle pci_region,
+		       struct acpi_pci_device **return_list_head);
 
-#define	RADIO_2055_READ_OFF		0x100
-#define	RADIO_2057_READ_OFF		0x200
+static acpi_status
+acpi_hw_process_pci_list(struct acpi_pci_id *pci_id,
+			 struct acpi_pci_device *list_head);
 
-#define RADIO_2055_GEN_SPARE		0x00
-#define RADIO_2055_SP_PIN_PD		0x02
-#define RADIO_2055_SP_RSSI_CORE1	0x03
-#define RADIO_2055_SP_PD_MISC_CORE1	0x04
-#define RADIO_2055_SP_RSSI_CORE2	0x05
-#define RADIO_2055_SP_PD_MISC_CORE2	0x06
-#define RADIO_2055_SP_RX_GC1_CORE1	0x07
-#define RADIO_2055_SP_RX_GC2_CORE1	0x08
-#define RADIO_2055_SP_RX_GC1_CORE2	0x09
-#define RADIO_2055_SP_RX_GC2_CORE2	0x0a
-#define RADIO_2055_SP_LPF_BW_SELECT_CORE1 0x0b
-#define RADIO_2055_SP_LPF_BW_SELECT_CORE2 0x0c
-#define RADIO_2055_SP_TX_GC1_CORE1	0x0d
-#define RADIO_2055_SP_TX_GC2_CORE1	0x0e
-#define RADIO_2055_SP_TX_GC1_CORE2	0x0f
-#define RADIO_2055_SP_TX_GC2_CORE2	0x10
-#define RADIO_2055_MASTER_CNTRL1	0x11
-#define RADIO_2055_MASTER_CNTRL2	0x12
-#define RADIO_2055_PD_LGEN		0x13
-#define RADIO_2055_PD_PLL_TS		0x14
-#define RADIO_2055_PD_CORE1_LGBUF	0x15
-#define RADIO_2055_PD_CORE1_TX		0x16
-#define RADIO_2055_PD_CORE1_RXTX	0x17
-#define RADIO_2055_PD_CORE1_RSSI_MISC	0x18
-#define RADIO_2055_PD_CORE2_LGBUF	0x19
-#define RADIO_2055_PD_CORE2_TX		0x1a
-#define RADIO_2055_PD_CORE2_RXTX	0x1b
-#define RADIO_2055_PD_CORE2_RSSI_MISC	0x1c
-#define RADIO_2055_PWRDET_LGEN		0x1d
-#define RADIO_2055_PWRDET_LGBUF_CORE1	0x1e
-#define RADIO_2055_PWRDET_RXTX_CORE1	0x1f
-#define RADIO_2055_PWRDET_LGBUF_CORE2	0x20
-#define RADIO_2055_PWRDET_RXTX_CORE2	0x21
-#define RADIO_2055_RRCCAL_CNTRL_SPARE	0x22
-#define RADIO_2055_RRCCAL_N_OPT_SEL	0x23
-#define RADIO_2055_CAL_MISC		0x24
-#define RADIO_2055_CAL_COUNTER_OUT	0x25
-#define RADIO_2055_CAL_COUNTER_OUT2	0x26
-#define RADIO_2055_CAL_CVAR_CNTRL	0x27
-#define RADIO_2055_CAL_RVAR_CNTRL	0x28
-#define RADIO_2055_CAL_LPO_CNTRL	0x29
-#define RADIO_2055_CAL_TS		0x2a
-#define RADIO_2055_CAL_RCCAL_READ_TS	0x2b
-#define RADIO_2055_CAL_RCAL_READ_TS	0x2c
-#define RADIO_2055_PAD_DRIVER		0x2d
-#define RADIO_2055_XO_CNTRL1		0x2e
-#define RADIO_2055_XO_CNTRL2		0x2f
-#define RADIO_2055_XO_REGULATOR		0x30
-#define RADIO_2055_XO_MISC		0x31
-#define RADIO_2055_PLL_LF_C1		0x32
-#define RADIO_2055_PLL_CAL_VTH		0x33
-#define RADIO_2055_PLL_LF_C2		0x34
-#define RADIO_2055_PLL_REF		0x35
-#define RADIO_2055_PLL_LF_R1		0x36
-#define RADIO_2055_PLL_PFD_CP		0x37
-#define RADIO_2055_PLL_IDAC_CPOPAMP	0x38
-#define RADIO_2055_PLL_CP_REGULATOR	0x39
-#define RADIO_2055_PLL_RCAL		0x3a
-#define RADIO_2055_RF_PLL_MOD0		0x3b
-#define RADIO_2055_RF_PLL_MOD1		0x3c
-#define RADIO_2055_RF_MMD_IDAC1		0x3d
-#define RADIO_2055_RF_MMD_IDAC0		0x3e
-#define RADIO_2055_RF_MMD_SPARE		0x3f
-#define RADIO_2055_VCO_CAL1		0x40
-#define RADIO_2055_VCO_CAL2		0x41
-#define RADIO_2055_VCO_CAL3		0x42
-#define RADIO_2055_VCO_CAL4		0x43
-#define RADIO_2055_VCO_CAL5		0x44
-#define RADIO_2055_VCO_CAL6		0x45
-#define RADIO_2055_VCO_CAL7		0x46
-#define RADIO_2055_VCO_CAL8		0x47
-#define RADIO_2055_VCO_CAL9		0x48
-#define RADIO_2055_VCO_CAL10		0x49
-#define RADIO_2055_VCO_CAL11		0x4a
-#define RADIO_2055_VCO_CAL12		0x4b
-#define RADIO_2055_VCO_CAL13		0x4c
-#define RADIO_2055_VCO_CAL14		0x4d
-#define RADIO_2055_VCO_CAL15		0x4e
-#define RADIO_2055_VCO_CAL16		0x4f
-#define RADIO_2055_VCO_KVCO		0x50
-#define RADIO_2055_VCO_CAP_TAIL		0x51
-#define RADIO_2055_VCO_IDAC_VCO		0x52
-#define RADIO_2055_VCO_REGULATOR	0x53
-#define RADIO_2055_PLL_RF_VTH		0x54
-#define RADIO_2055_LGBUF_CEN_BUF	0x55
-#define RADIO_2055_LGEN_TUNE1		0x56
-#define RADIO_2055_LGEN_TUNE2		0x57
-#define RADIO_2055_LGEN_IDAC1		0x58
-#define RADIO_2055_LGEN_IDAC2		0x59
-#define RADIO_2055_LGEN_BIAS_CNT	0x5a
-#define RADIO_2055_LGEN_BIAS_IDAC	0x5b
-#define RADIO_2055_LGEN_RCAL		0x5c
-#define RADIO_2055_LGEN_DIV		0x5d
-#define RADIO_2055_LGEN_SPARE2		0x5e
-#define RADIO_2055_CORE1_LGBUF_A_TUNE	0x5f
-#define RADIO_2055_CORE1_LGBUF_G_TUNE	0x60
-#define RADIO_2055_CORE1_LGBUF_DIV	0x61
-#define RADIO_2055_CORE1_LGBUF_A_IDAC	0x62
-#define RADIO_2055_CORE1_LGBUF_G_IDAC	0x63
-#define RADIO_2055_CORE1_LGBUF_IDACFIL_OVR 0x64
-#define RADIO_2055_CORE1_LGBUF_SPARE	0x65
-#define RADIO_2055_CORE1_RXRF_SPC1	0x66
-#define RADIO_2055_CORE1_RXRF_REG1	0x67
-#define RADIO_2055_CORE1_RXRF_REG2	0x68
-#define RADIO_2055_CORE1_RXRF_RCAL	0x69
-#define RADIO_2055_CORE1_RXBB_BUFI_LPFCMP 0x6a
-#define RADIO_2055_CORE1_RXBB_LPF	0x6b
-#define RADIO_2055_CORE1_RXBB_MIDAC_HIPAS 0x6c
-#define RADIO_2055_CORE1_RXBB_VGA1_IDAC	0x6d
-#define RADIO_2055_CORE1_RXBB_VGA2_IDAC	0x6e
-#define RADIO_2055_CORE1_RXBB_VGA3_IDAC	0x6f
-#define RADIO_2055_CORE1_RXBB_BUFO_CTRL	0x70
-#define RADIO_2055_CORE1_RXBB_RCCAL_CTRL 0x71
-#define RADIO_2055_CORE1_RXBB_RSSI_CTRL1 0x72
-#define RADIO_2055_CORE1_RXBB_RSSI_CTRL2 0x73
-#define RADIO_2055_CORE1_RXBB_RSSI_CTRL3 0x74
-#define RADIO_2055_CORE1_RXBB_RSSI_CTRL4 0x75
-#define RADIO_2055_CORE1_RXBB_RSSI_CTRL5 0x76
-#define RADIO_2055_CORE1_RXBB_REGULATOR	0x77
-#define RADIO_2055_CORE1_RXBB_SPARE1	0x78
-#define RADIO_2055_CORE1_RXTXBB_RCAL	0x79
-#define RADIO_2055_CORE1_TXRF_SGM_PGA	0x7a
-#define RADIO_2055_CORE1_TXRF_SGM_PAD	0x7b
-#define RADIO_2055_CORE1_TXRF_CNTR_PGA1	0x7c
-#define RADIO_2055_CORE1_TXRF_CNTR_PAD1	0x7d
-#define RADIO_2055_CORE1_TX_RFPGA_IDAC	0x7e
-#define RADIO_2055_CORE1_TX_PGA_PAD_TN	0x7f
-#define RADIO_2055_CORE1_TX_PAD_IDAC1	0x80
-#define RADIO_2055_CORE1_TX_PAD_IDAC2	0x81
-#define RADIO_2055_CORE1_TX_MX_BGTRIM	0x82
-#define RADIO_2055_CORE1_TXRF_RCAL	0x83
-#define RADIO_2055_CORE1_TXRF_PAD_TSSI1	0x84
-#define RADIO_2055_CORE1_TXRF_PAD_TSSI2	0x85
-#define RADIO_2055_CORE1_TX_RF_SPARE	0x86
-#define RADIO_2055_CORE1_TXRF_IQCAL1	0x87
-#define RADIO_2055_CORE1_TXRF_IQCAL2	0x88
-#define RADIO_2055_CORE1_TXBB_RCCAL_CTRL 0x89
-#define RADIO_2055_CORE1_TXBB_LPF1	0x8a
-#define RADIO_2055_CORE1_TX_VOS_CNCL	0x8b
-#define RADIO_2055_CORE1_TX_LPF_MXGM_IDAC 0x8c
-#define RADIO_2055_CORE1_TX_BB_MXGM	0x8d
-#define RADIO_2055_CORE2_LGBUF_A_TUNE	0x8e
-#define RADIO_2055_CORE2_LGBUF_G_TUNE	0x8f
-#define RADIO_2055_CORE2_LGBUF_DIV	0x90
-#define RADIO_2055_CORE2_LGBUF_A_IDAC	0x91
-#define RADIO_2055_CORE2_LGBUF_G_IDAC	0x92
-#define RADIO_2055_CORE2_LGBUF_IDACFIL_OVR 0x93
-#define RADIO_2055_CORE2_LGBUF_SPARE	0x94
-#define RADIO_2055_CORE2_RXRF_SPC1	0x95
-#define RADIO_2055_CORE2_RXRF_REG1	0x96
-#define RADIO_2055_CORE2_RXRF_REG2	0x97
-#define RADIO_2055_CORE2_RXRF_RCAL	0x98
-#define RADIO_2055_CORE2_RXBB_BUFI_LPFCMP 0x99
-#define RADIO_2055_CORE2_RXBB_LPF	0x9a
-#define RADIO_2055_CORE2_RXBB_MIDAC_HIPAS 0x9b
-#define RADIO_2055_CORE2_RXBB_VGA1_IDAC	0x9c
-#define RADIO_2055_CORE2_RXBB_VGA2_IDAC	0x9d
-#define RADIO_2055_CORE2_RXBB_VGA3_IDAC	0x9e
-#define RADIO_2055_CORE2_RXBB_BUFO_CTRL	0x9f
-#define RADIO_2055_CORE2_RXBB_RCCAL_CTRL 0xa0
-#define RADIO_2055_CORE2_RXBB_RSSI_CTRL1 0xa1
-#define RADIO_2055_CORE2_RXBB_RSSI_CTRL2 0xa2
-#define RADIO_2055_CORE2_RXBB_RSSI_CTRL3 0xa3
-#define RADIO_2055_CORE2_RXBB_RSSI_CTRL4 0xa4
-#define RADIO_2055_CORE2_RXBB_RSSI_CTRL5 0xa5
-#define RADIO_2055_CORE2_RXBB_REGULATOR	0xa6
-#define RADIO_2055_CORE2_RXBB_SPARE1	0xa7
-#define RADIO_2055_CORE2_RXTXBB_RCAL	0xa8
-#define RADIO_2055_CORE2_TXRF_SGM_PGA	0xa9
-#define RADIO_2055_CORE2_TXRF_SGM_PAD	0xaa
-#define RADIO_2055_CORE2_TXRF_CNTR_PGA1	0xab
-#define RADIO_2055_CORE2_TXRF_CNTR_PAD1	0xac
-#define RADIO_2055_CORE2_TX_RFPGA_IDAC	0xad
-#define RADIO_2055_CORE2_TX_PGA_PAD_TN	0xae
-#define RADIO_2055_CORE2_TX_PAD_IDAC1	0xaf
-#define RADIO_2055_CORE2_TX_PAD_IDAC2	0xb0
-#define RADIO_2055_CORE2_TX_MX_BGTRIM	0xb1
-#define RADIO_2055_CORE2_TXRF_RCAL	0xb2
-#define RADIO_2055_CORE2_TXRF_PAD_TSSI1	0xb3
-#define RADIO_2055_CORE2_TXRF_PAD_TSSI2	0xb4
-#define RADIO_2055_CORE2_TX_RF_SPARE	0xb5
-#define RADIO_2055_CORE2_TXRF_IQCAL1	0xb6
-#define RADIO_2055_CORE2_TXRF_IQCAL2	0xb7
-#define RADIO_2055_CORE2_TXBB_RCCAL_CTRL 0xb8
-#define RADIO_2055_CORE2_TXBB_LPF1	0xb9
-#define RADIO_2055_CORE2_TX_VOS_CNCL	0xba
-#define RADIO_2055_CORE2_TX_LPF_MXGM_IDAC 0xbb
-#define RADIO_2055_CORE2_TX_BB_MXGM	0xbc
-#define RADIO_2055_PRG_GC_HPVGA23_21	0xbd
-#define RADIO_2055_PRG_GC_HPVGA23_22	0xbe
-#define RADIO_2055_PRG_GC_HPVGA23_23	0xbf
-#define RADIO_2055_PRG_GC_HPVGA23_24	0xc0
-#define RADIO_2055_PRG_GC_HPVGA23_25	0xc1
-#define RADIO_2055_PRG_GC_HPVGA23_26	0xc2
-#define RADIO_2055_PRG_GC_HPVGA23_27	0xc3
-#define RADIO_2055_PRG_GC_HPVGA23_28	0xc4
-#define RADIO_2055_PRG_GC_HPVGA23_29	0xc5
-#define RADIO_2055_PRG_GC_HPVGA23_30	0xc6
-#define RADIO_2055_CORE1_LNA_GAINBST	0xcd
-#define RADIO_2055_CORE1_B0_NBRSSI_VCM	0xd2
-#define RADIO_2055_CORE1_GEN_SPARE2		0xd6
-#define RADIO_2055_CORE2_LNA_GAINBST	0xd9
-#define RADIO_2055_CORE2_B0_NBRSSI_VCM	0xde
-#define RADIO_2055_CORE2_GEN_SPARE2		0xe2
+static void acpi_hw_delete_pci_list(struct acpi_pci_device *list_head);
 
-#define RADIO_2055_GAINBST_GAIN_DB	6
-#define RADIO_2055_GAINBST_CODE		0x6
+static acpi_status
+acpi_hw_get_pci_device_info(struct acpi_pci_id *pci_id,
+			    acpi_handle pci_device,
+			    u16 *bus_number, u8 *is_bridge);
 
-#define RADIO_2055_JTAGCTRL_MASK	0x04
-#define RADIO_2055_JTAGSYNC_MASK	0x08
-#define RADIO_2055_RRCAL_START		0x40
-#define RADIO_2055_RRCAL_RST_N		0x01
-#define RADIO_2055_CAL_LPO_ENABLE	0x80
-#define RADIO_2055_RCAL_DONE		0x80
-#define RADIO_2055_NBRSSI_VCM_I_MASK	0x03
-#define RADIO_2055_NBRSSI_VCM_I_SHIFT	0x00
-#define RADIO_2055_NBRSSI_VCM_Q_MASK	0x03
-#define RADIO_2055_NBRSSI_VCM_Q_SHIFT	0x00
-#define RADIO_2055_WBRSSI_VCM_IQ_MASK	0x0c
-#define RADIO_2055_WBRSSI_VCM_IQ_SHIFT	0x02
-#define RADIO_2055_NBRSSI_PD		0x01
-#define RADIO_2055_WBRSSI_G1_PD		0x04
-#define RADIO_2055_WBRSSI_G2_PD		0x02
-#define RADIO_2055_NBRSSI_SEL		0x01
-#define RADIO_2055_WBRSSI_G1_SEL	0x04
-#define RADIO_2055_WBRSSI_G2_SEL	0x02
-#define RADIO_2055_COUPLE_RX_MASK	0x01
-#define RADIO_2055_COUPLE_TX_MASK	0x02
-#define RADIO_2055_GAINBST_DISABLE	0x02
-#define RADIO_2055_GAINBST_VAL_MASK	0x07
-#define RADIO_2055_RXMX_GC_MASK		0x0c
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_derive_pci_id
+ *
+ * PARAMETERS:  pci_id              - Initial values for the PCI ID. May be
+ *                                    modified by this function.
+ *              root_pci_device     - A handle to a PCI device object. This
+ *                                    object must be a PCI Root Bridge having a
+ *                                    _HID value of either PNP0A03 or PNP0A08
+ *              pci_region          - A handle to a PCI configuration space
+ *                                    Operation Region being initialized
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: This function derives a full PCI ID for a PCI device,
+ *              consisting of a Segment number, Bus number, Device number,
+ *              and function code.
+ *
+ *              The PCI hardware dynamically configures PCI bus numbers
+ *              depending on the bus topology discovered during system
+ *              initialization. This function is invoked during configuration
+ *              of a PCI_Config Operation Region in order to (possibly) update
+ *              the Bus/Device/Function numbers in the pci_id with the actual
+ *              values as determined by the hardware and operating system
+ *              configuration.
+ *
+ *              The pci_id parameter is initially populated during the Operation
+ *              Region initialization. This function is then called, and is
+ *              will make any necessary modifications to the Bus, Device, or
+ *              Function number PCI ID subfields as appropriate for the
+ *              current hardware and OS configuration.
+ *
+ * NOTE:        Created 08/2010. Replaces the previous OSL acpi_os_derive_pci_id
+ *              interface since this feature is OS-independent. This module
+ *              specifically avoids any use of recursion by building a local
+ *              temporary device list.
+ *
+ ******************************************************************************/
 
-#define RADIO_MIMO_CORESEL_OFF		0x0
-#define RADIO_MIMO_CORESEL_CORE1	0x1
-#define RADIO_MIMO_CORESEL_CORE2	0x2
-#define RADIO_MIMO_CORESEL_CORE3	0x3
-#define RADIO_MIMO_CORESEL_CORE4	0x4
-#define RADIO_MIMO_CORESEL_ALLRX	0x5
-#define RADIO_MIMO_CORESEL_ALLTX	0x6
-#define RADIO_MIMO_CORESEL_ALLRXTX	0x7
+acpi_status
+acpi_hw_derive_pci_id(struct acpi_pci_id *pci_id,
+		      acpi_handle root_pci_device, acpi_handle pci_region)
+{
+	acpi_status status;
+	struct acpi_pci_device *list_head;
 
-#define	RADIO_2064_READ_OFF		0x200
+	ACPI_FUNCTION_TRACE(hw_derive_pci_id);
 
-#define RADIO_2064_REG000               0x0
-#define RADIO_2064_REG001               0x1
-#define RADIO_2064_REG002               0x2
-#define RADIO_2064_REG003               0x3
-#define RADIO_2064_REG004               0x4
-#define RADIO_2064_REG005               0x5
-#define RADIO_2064_REG006               0x6
-#define RADIO_2064_REG007               0x7
-#define RADIO_2064_REG008               0x8
-#define RADIO_2064_REG009               0x9
-#define RADIO_2064_REG00A               0xa
-#define RADIO_2064_REG00B               0xb
-#define RADIO_2064_REG00C               0xc
-#define RADIO_2064_REG00D               0xd
-#define RADIO_2064_REG00E               0xe
-#define RADIO_2064_REG00F               0xf
-#define RADIO_2064_REG010               0x10
-#define RADIO_2064_REG011               0x11
-#define RADIO_2064_REG012               0x12
-#define RADIO_2064_REG013               0x13
-#define RADIO_2064_REG014               0x14
-#define RADIO_2064_REG015               0x15
-#define RADIO_2064_REG016               0x16
-#define RADIO_2064_REG017               0x17
-#define RADIO_2064_REG018               0x18
-#define RADIO_2064_REG019               0x19
-#define RADIO_2064_REG01A               0x1a
-#define RADIO_2064_REG01B               0x1b
-#define RADIO_2064_REG01C               0x1c
-#define RADIO_2064_REG01D               0x1d
-#define RADIO_2064_REG01E               0x1e
-#define RADIO_2064_REG01F               0x1f
-#define RADIO_2064_REG020               0x20
-#define RADIO_2064_REG021               0x21
-#define RADIO_2064_REG022               0x22
-#define RADIO_2064_REG023               0x23
-#define RADIO_2064_REG024               0x24
-#define RADIO_2064_REG025               0x25
-#define RADIO_2064_REG026               0x26
-#define RADIO_2064_REG027               0x27
-#define RADIO_2064_REG028               0x28
-#define RADIO_2064_REG029               0x29
-#define RADIO_2064_REG02A               0x2a
-#define RADIO_2064_REG02B               0x2b
-#define RADIO_2064_REG02C               0x2c
-#define RADIO_2064_REG02D               0x2d
-#define RADIO_2064_REG02E               0x2e
-#define RADIO_2064_REG02F               0x2f
-#define RADIO_2064_REG030               0x30
-#define RADIO_2064_REG031               0x31
-#define RADIO_2064_REG032               0x32
-#define RADIO_2064_REG033               0x33
-#define RADIO_2064_REG034               0x34
-#define RADIO_2064_REG035               0x35
-#define RADIO_2064_REG036               0x36
-#define RADIO_2064_REG037               0x37
-#define RADIO_2064_REG038               0x38
-#define RADIO_2064_REG039               0x39
-#define RADIO_2064_REG03A               0x3a
-#define RADIO_2064_REG03B               0x3b
-#define RADIO_2064_REG03C               0x3c
-#define RADIO_2064_REG03D               0x3d
-#define RADIO_2064_REG03E               0x3e
-#define RADIO_2064_REG03F               0x3f
-#define RADIO_2064_REG040               0x40
-#define RADIO_2064_REG041               0x41
-#define RADIO_2064_REG042               0x42
-#define RADIO_2064_REG043               0x43
-#define RADIO_2064_REG044               0x44
-#define RADIO_2064_REG045               0x45
-#define RADIO_2064_REG046               0x46
-#define RADIO_2064_REG047               0x47
-#define RADIO_2064_REG048               0x48
-#define RADIO_2064_REG049               0x49
-#define RADIO_2064_REG04A               0x4a
-#define RADIO_2064_REG04B               0x4b
-#define RADIO_2064_REG04C               0x4c
-#define RADIO_2064_REG04D               0x4d
-#define RADIO_2064_REG04E               0x4e
-#define RADIO_2064_REG04F               0x4f
-#define RADIO_2064_REG050               0x50
-#define RADIO_2064_REG051               0x51
-#define RADIO_2064_REG052               0x52
-#define RADIO_2064_REG053               0x53
-#define RADIO_2064_REG054               0x54
-#define RADIO_2064_REG055               0x55
-#define RADIO_2064_REG056               0x56
-#define RADIO_2064_REG057               0x57
-#define RADIO_2064_REG058               0x58
-#define RADIO_2064_REG059               0x59
-#define RADIO_2064_REG05A               0x5a
-#define RADIO_2064_REG05B               0x5b
-#define RADIO_2064_REG05C               0x5c
-#define RADIO_2064_REG05D               0x5d
-#define RADIO_2064_REG05E               0x5e
-#define RADIO_2064_REG05F               0x5f
-#define RADIO_2064_REG060               0x60
-#define RADIO_2064_REG061               0x61
-#define RADIO_2064_REG062               0x62
-#define RADIO_2064_REG063               0x63
-#define RADIO_2064_REG064               0x64
-#define RADIO_2064_REG065               0x65
-#define RADIO_2064_REG066               0x66
-#define RADIO_2064_REG067               0x67
-#define RADIO_2064_REG068               0x68
-#define RADIO_2064_REG069               0x69
-#define RADIO_2064_REG06A               0x6a
-#define RADIO_2064_REG06B               0x6b
-#define RADIO_2064_REG06C               0x6c
-#define RADIO_2064_REG06D               0x6d
-#define RADIO_2064_REG06E               0x6e
-#define RADIO_2064_REG06F               0x6f
-#define RADIO_2064_REG070               0x70
-#define RADIO_2064_REG071               0x71
-#define RADIO_2064_REG072               0x72
-#define RADIO_2064_REG073               0x73
-#define RADIO_2064_REG074               0x74
-#define RADIO_2064_REG075               0x75
-#define RADIO_2064_REG076               0x76
-#define RADIO_2064_REG077               0x77
-#define RADIO_2064_REG078               0x78
-#define RADIO_2064_REG079               0x79
-#define RADIO_2064_REG07A               0x7a
-#define RADIO_2064_REG07B               0x7b
-#define RADIO_2064_REG07C               0x7c
-#define RADIO_2064_REG07D               0x7d
-#define RADIO_2064_REG07E               0x7e
-#define RADIO_2064_REG07F               0x7f
-#define RADIO_2064_REG080               0x80
-#define RADIO_2064_REG081               0x81
-#define RADIO_2064_REG082               0x82
-#define RADIO_2064_REG083               0x83
-#define RADIO_2064_REG084               0x84
-#define RADIO_2064_REG085               0x85
-#define RADIO_2064_REG086               0x86
-#define RADIO_2064_REG087               0x87
-#define RADIO_2064_REG088               0x88
-#define RADIO_2064_REG089               0x89
-#define RADIO_2064_REG08A               0x8a
-#define RADIO_2064_REG08B               0x8b
-#define RADIO_2064_REG08C               0x8c
-#define RADIO_2064_REG08D               0x8d
-#define RADIO_2064_REG08E               0x8e
-#define RADIO_2064_REG08F               0x8f
-#define RADIO_2064_REG090               0x90
-#define RADIO_2064_REG091               0x91
-#define RADIO_2064_REG092               0x92
-#define RADIO_2064_REG093               0x93
-#define RADIO_2064_REG094               0x94
-#define RADIO_2064_REG095               0x95
-#define RADIO_2064_REG096               0x96
-#define RADIO_2064_REG097               0x97
-#define RADIO_2064_REG098               0x98
-#define RADIO_2064_REG099               0x99
-#define RADIO_2064_REG09A               0x9a
-#define RADIO_2064_REG09B               0x9b
-#define RADIO_2064_REG09C               0x9c
-#define RADIO_2064_REG09D               0x9d
-#define RADIO_2064_REG09E               0x9e
-#define RADIO_2064_REG09F               0x9f
-#define RADIO_2064_REG0A0               0xa0
-#define RADIO_2064_REG0A1               0xa1
-#define RADIO_2064_REG0A2               0xa2
-#define RADIO_2064_REG0A3               0xa3
-#define RADIO_2064_REG0A4               0xa4
-#define RADIO_2064_REG0A5               0xa5
-#define RADIO_2064_REG0A6               0xa6
-#define RADIO_2064_REG0A7               0xa7
-#define RADIO_2064_REG0A8               0xa8
-#define RADIO_2064_REG0A9               0xa9
-#define RADIO_2064_REG0AA               0xaa
-#define RADIO_2064_REG0AB               0xab
-#define RADIO_2064_REG0AC               0xac
-#define RADIO_2064_REG0AD               0xad
-#define RADIO_2064_REG0AE               0xae
-#define RADIO_2064_REG0AF               0xaf
-#define RADIO_2064_REG0B0               0xb0
-#define RADIO_2064_REG0B1               0xb1
-#define RADIO_2064_REG0B2               0xb2
-#define RADIO_2064_REG0B3               0xb3
-#define RADIO_2064_REG0B4               0xb4
-#define RADIO_2064_REG0B5               0xb5
-#define RADIO_2064_REG0B6               0xb6
-#define RADIO_2064_REG0B7               0xb7
-#define RADIO_2064_REG0B8               0xb8
-#define RADIO_2064_REG0B9               0xb9
-#define RADIO_2064_REG0BA               0xba
-#define RADIO_2064_REG0BB               0xbb
-#define RADIO_2064_REG0BC               0xbc
-#define RADIO_2064_REG0BD               0xbd
-#define RADIO_2064_REG0BE               0xbe
-#define RADIO_2064_REG0BF               0xbf
-#define RADIO_2064_REG0C0               0xc0
-#define RADIO_2064_REG0C1               0xc1
-#define RADIO_2064_REG0C2               0xc2
-#define RADIO_2064_REG0C3               0xc3
-#define RADIO_2064_REG0C4               0xc4
-#define RADIO_2064_REG0C5               0xc5
-#define RADIO_2064_REG0C6               0xc6
-#define RADIO_2064_REG0C7               0xc7
-#define RADIO_2064_REG0C8               0xc8
-#define RADIO_2064_REG0C9               0xc9
-#define RADIO_2064_REG0CA               0xca
-#define RADIO_2064_REG0CB               0xcb
-#define RADIO_2064_REG0CC               0xcc
-#define RADIO_2064_REG0CD               0xcd
-#define RADIO_2064_REG0CE               0xce
-#define RADIO_2064_REG0CF               0xcf
-#define RADIO_2064_REG0D0               0xd0
-#define RADIO_2064_REG0D1               0xd1
-#define RADIO_2064_REG0D2               0xd2
-#define RADIO_2064_REG0D3               0xd3
-#define RADIO_2064_REG0D4               0xd4
-#define RADIO_2064_REG0D5               0xd5
-#define RADIO_2064_REG0D6               0xd6
-#define RADIO_2064_REG0D7               0xd7
-#define RADIO_2064_REG0D8               0xd8
-#define RADIO_2064_REG0D9               0xd9
-#define RADIO_2064_REG0DA               0xda
-#define RADIO_2064_REG0DB               0xdb
-#define RADIO_2064_REG0DC               0xdc
-#define RADIO_2064_REG0DD               0xdd
-#define RADIO_2064_REG0DE               0xde
-#define RADIO_2064_REG0DF               0xdf
-#define RADIO_2064_REG0E0               0xe0
-#define RADIO_2064_REG0E1               0xe1
-#define RADIO_2064_REG0E2               0xe2
-#define RADIO_2064_REG0E3               0xe3
-#define RADIO_2064_REG0E4               0xe4
-#define RADIO_2064_REG0E5               0xe5
-#define RADIO_2064_REG0E6               0xe6
-#define RADIO_2064_REG0E7               0xe7
-#define RADIO_2064_REG0E8               0xe8
-#define RADIO_2064_REG0E9               0xe9
-#define RADIO_2064_REG0EA               0xea
-#define RADIO_2064_REG0EB               0xeb
-#define RADIO_2064_REG0EC               0xec
-#define RADIO_2064_REG0ED               0xed
-#define RADIO_2064_REG0EE               0xee
-#define RADIO_2064_REG0EF               0xef
-#define RADIO_2064_REG0F0               0xf0
-#define RADIO_2064_REG0F1               0xf1
-#define RADIO_2064_REG0F2               0xf2
-#define RADIO_2064_REG0F3               0xf3
-#define RADIO_2064_REG0F4               0xf4
-#define RADIO_2064_REG0F5               0xf5
-#define RADIO_2064_REG0F6               0xf6
-#define RADIO_2064_REG0F7               0xf7
-#define RADIO_2064_REG0F8               0xf8
-#define RADIO_2064_REG0F9               0xf9
-#define RADIO_2064_REG0FA               0xfa
-#define RADIO_2064_REG0FB               0xfb
-#define RADIO_2064_REG0FC               0xfc
-#define RADIO_2064_REG0FD               0xfd
-#define RADIO_2064_REG0FE               0xfe
-#define RADIO_2064_REG0FF               0xff
-#define RADIO_2064_REG100               0x100
-#define RADIO_2064_REG101               0x101
-#define RADIO_2064_REG102               0x102
-#define RADIO_2064_REG103               0x103
-#define RADIO_2064_REG104               0x104
-#define RADIO_2064_REG105               0x105
-#define RADIO_2064_REG106               0x106
-#define RADIO_2064_REG107               0x107
-#define RADIO_2064_REG108               0x108
-#define RADIO_2064_REG109               0x109
-#define RADIO_2064_REG10A               0x10a
-#define RADIO_2064_REG10B               0x10b
-#define RADIO_2064_REG10C               0x10c
-#define RADIO_2064_REG10D               0x10d
-#define RADIO_2064_REG10E               0x10e
-#define RADIO_2064_REG10F               0x10f
-#define RADIO_2064_REG110               0x110
-#define RADIO_2064_REG111               0x111
-#define RADIO_2064_REG112               0x112
-#define RADIO_2064_REG113               0x113
-#define RADIO_2064_REG114               0x114
-#define RADIO_2064_REG115               0x115
-#define RADIO_2064_REG116               0x116
-#define RADIO_2064_REG117               0x117
-#define RADIO_2064_REG118               0x118
-#define RADIO_2064_REG119               0x119
-#define RADIO_2064_REG11A               0x11a
-#define RADIO_2064_REG11B               0x11b
-#define RADIO_2064_REG11C               0x11c
-#define RADIO_2064_REG11D               0x11d
-#define RADIO_2064_REG11E               0x11e
-#define RADIO_2064_REG11F               0x11f
-#define RADIO_2064_REG120               0x120
-#define RADIO_2064_REG121               0x121
-#define RADIO_2064_REG122               0x122
-#define RADIO_2064_REG123               0x123
-#define RADIO_2064_REG124               0x124
-#define RADIO_2064_REG125               0x125
-#define RADIO_2064_REG126               0x126
-#define RADIO_2064_REG127               0x127
-#define RADIO_2064_REG128               0x128
-#define RADIO_2064_REG129               0x129
-#define RADIO_2064_REG12A               0x12a
-#define RADIO_2064_REG12B               0x12b
-#define RADIO_2064_REG12C               0x12c
-#define RADIO_2064_REG12D               0x12d
-#define RADIO_2064_REG12E               0x12e
-#define RADIO_2064_REG12F               0x12f
-#define RADIO_2064_REG130               0x130
+	if (!pci_id) {
+		return_ACPI_STATUS(AE_BAD_PARAMETER);
+	}
 
-#define RADIO_2056_SYN                           (0x0 << 12)
-#define RADIO_2056_TX0                           (0x2 << 12)
-#define RADIO_2056_TX1                           (0x3 << 12)
-#define RADIO_2056_RX0                           (0x6 << 12)
-#define RADIO_2056_RX1                           (0x7 << 12)
-#define RADIO_2056_ALLTX                         (0xe << 12)
-#define RADIO_2056_ALLRX                         (0xf << 12)
+	/* Build a list of PCI devices, from pci_region up to root_pci_device */
 
-#define RADIO_2056_SYN_RESERVED_ADDR0            0x0
-#define RADIO_2056_SYN_IDCODE                    0x1
-#define RADIO_2056_SYN_RESERVED_ADDR2            0x2
-#define RADIO_2056_SYN_RESERVED_ADDR3            0x3
-#define RADIO_2056_SYN_RESERVED_ADDR4            0x4
-#define RADIO_2056_SYN_RESERVED_ADDR5            0x5
-#define RADIO_2056_SYN_RESERVED_ADDR6            0x6
-#define RADIO_2056_SYN_RESERVED_ADDR7            0x7
-#define RADIO_2056_SYN_COM_CTRL                  0x8
-#define RADIO_2056_SYN_COM_PU                    0x9
-#define RADIO_2056_SYN_COM_OVR                   0xa
-#define RADIO_2056_SYN_COM_RESET                 0xb
-#define RADIO_2056_SYN_COM_RCAL                  0xc
-#define RADIO_2056_SYN_COM_RC_RXLPF              0xd
-#define RADIO_2056_SYN_COM_RC_TXLPF              0xe
-#define RADIO_2056_SYN_COM_RC_RXHPF              0xf
-#define RADIO_2056_SYN_RESERVED_ADDR16           0x10
-#define RADIO_2056_SYN_RESERVED_ADDR17           0x11
-#define RADIO_2056_SYN_RESERVED_ADDR18           0x12
-#define RADIO_2056_SYN_RESERVED_ADDR19           0x13
-#define RADIO_2056_SYN_RESERVED_ADDR20           0x14
-#define RADIO_2056_SYN_RESERVED_ADDR21           0x15
-#define RADIO_2056_SYN_RESERVED_ADDR22           0x16
-#define RADIO_2056_SYN_RESERVED_ADDR23           0x17
-#define RADIO_2056_SYN_RESERVED_ADDR24           0x18
-#define RADIO_2056_SYN_RESERVED_ADDR25           0x19
-#define RADIO_2056_SYN_RESERVED_ADDR26           0x1a
-#define RADIO_2056_SYN_RESERVED_ADDR27           0x1b
-#define RADIO_2056_SYN_RESERVED_ADDR28           0x1c
-#define RADIO_2056_SYN_RESERVED_ADDR29           0x1d
-#define RADIO_2056_SYN_RESERVED_ADDR30           0x1e
-#define RADIO_2056_SYN_RESERVED_ADDR31           0x1f
-#define RADIO_2056_SYN_GPIO_MASTER1              0x20
-#define RADIO_2056_SYN_GPIO_MASTER2              0x21
-#define RADIO_2056_SYN_TOPBIAS_MASTER            0x22
-#define RADIO_2056_SYN_TOPBIAS_RCAL              0x23
-#define RADIO_2056_SYN_AFEREG                    0x24
-#define RADIO_2056_SYN_TEMPPROCSENSE             0x25
-#define RADIO_2056_SYN_TEMPPROCSENSEIDAC         0x26
-#define RADIO_2056_SYN_TEMPPROCSENSERCAL         0x27
-#define RADIO_2056_SYN_LPO                       0x28
-#define RADIO_2056_SYN_VDDCAL_MASTER             0x29
-#define RADIO_2056_SYN_VDDCAL_IDAC               0x2a
-#define RADIO_2056_SYN_VDDCAL_STATUS             0x2b
-#define RADIO_2056_SYN_RCAL_MASTER               0x2c
-#define RADIO_2056_SYN_RCAL_CODE_OUT             0x2d
-#define RADIO_2056_SYN_RCCAL_CTRL0               0x2e
-#define RADIO_2056_SYN_RCCAL_CTRL1               0x2f
-#define RADIO_2056_SYN_RCCAL_CTRL2               0x30
-#define RADIO_2056_SYN_RCCAL_CTRL3               0x31
-#define RADIO_2056_SYN_RCCAL_CTRL4               0x32
-#define RADIO_2056_SYN_RCCAL_CTRL5               0x33
-#define RADIO_2056_SYN_RCCAL_CTRL6               0x34
-#define RADIO_2056_SYN_RCCAL_CTRL7               0x35
-#define RADIO_2056_SYN_RCCAL_CTRL8               0x36
-#define RADIO_2056_SYN_RCCAL_CTRL9               0x37
-#define RADIO_2056_SYN_RCCAL_CTRL10              0x38
-#define RADIO_2056_SYN_RCCAL_CTRL11              0x39
-#define RADIO_2056_SYN_ZCAL_SPARE1               0x3a
-#define RADIO_2056_SYN_ZCAL_SPARE2               0x3b
-#define RADIO_2056_SYN_PLL_MAST1                 0x3c
-#define RADIO_2056_SYN_PLL_MAST2                 0x3d
-#define RADIO_2056_SYN_PLL_MAST3                 0x3e
-#define RADIO_2056_SYN_PLL_BIAS_RESET            0x3f
-#define RADIO_2056_SYN_PLL_XTAL0                 0x40
-#define RADIO_2056_SYN_PLL_XTAL1                 0x41
-#define RADIO_2056_SYN_PLL_XTAL3                 0x42
-#define RADIO_2056_SYN_PLL_XTAL4                 0x43
-#define RADIO_2056_SYN_PLL_XTAL5                 0x44
-#define RADIO_2056_SYN_PLL_XTAL6                 0x45
-#define RADIO_2056_SYN_PLL_REFDIV                0x46
-#define RADIO_2056_SYN_PLL_PFD                   0x47
-#define RADIO_2056_SYN_PLL_CP1                   0x48
-#define RADIO_2056_SYN_PLL_CP2                   0x49
-#define RADIO_2056_SYN_PLL_CP3                   0x4a
-#define RADIO_2056_SYN_PLL_LOOPFILTER1           0x4b
-#define RADIO_2056_SYN_PLL_LOOPFILTER2           0x4c
-#define RADIO_2056_SYN_PLL_LOOPFILTER3           0x4d
-#define RADIO_2056_SYN_PLL_LOOPFILTER4           0x4e
-#define RADIO_2056_SYN_PLL_LOOPFILTER5           0x4f
-#define RADIO_2056_SYN_PLL_MMD1                  0x50
-#define RADIO_2056_SYN_PLL_MMD2                  0x51
-#define RADIO_2056_SYN_PLL_VCO1                  0x52
-#define RADIO_2056_SYN_PLL_VCO2                  0x53
-#define RADIO_2056_SYN_PLL_MONITOR1              0x54
-#define RADIO_2056_SYN_PLL_MONITOR2              0x55
-#define RADIO_2056_SYN_PLL_VCOCAL1               0x56
-#define RADIO_2056_SYN_PLL_VCOCAL2               0x57
-#define RADIO_2056_SYN_PLL_VCOCAL4               0x58
-#define RADIO_2056_SYN_PLL_VCOCAL5               0x59
-#define RADIO_2056_SYN_PLL_VCOCAL6               0x5a
-#define RADIO_2056_SYN_PLL_VCOCAL7               0x5b
-#define RADIO_2056_SYN_PLL_VCOCAL8               0x5c
-#define RADIO_2056_SYN_PLL_VCOCAL9               0x5d
-#define RADIO_2056_SYN_PLL_VCOCAL10              0x5e
-#define RADIO_2056_SYN_PLL_VCOCAL11              0x5f
-#define RADIO_2056_SYN_PLL_VCOCAL12              0x60
-#define RADIO_2056_SYN_PLL_VCOCAL13              0x61
-#define RADIO_2056_SYN_PLL_VREG                  0x62
-#define RADIO_2056_SYN_PLL_STATUS1               0x63
-#define RADIO_2056_SYN_PLL_STATUS2               0x64
-#define RADIO_2056_SYN_PLL_STATUS3               0x65
-#define RADIO_2056_SYN_LOGEN_PU0                 0x66
-#define RADIO_2056_SYN_LOGEN_PU1                 0x67
-#define RADIO_2056_SYN_LOGEN_PU2                 0x68
-#define RADIO_2056_SYN_LOGEN_PU3                 0x69
-#define RADIO_2056_SYN_LOGEN_PU5                 0x6a
-#define RADIO_2056_SYN_LOGEN_PU6                 0x6b
-#define RADIO_2056_SYN_LOGEN_PU7                 0x6c
-#define RADIO_2056_SYN_LOGEN_PU8                 0x6d
-#define RADIO_2056_SYN_LOGEN_BIAS_RESET          0x6e
-#define RADIO_2056_SYN_LOGEN_RCCR1               0x6f
-#define RADIO_2056_SYN_LOGEN_VCOBUF1             0x70
-#define RADIO_2056_SYN_LOGEN_MIXER1              0x71
-#define RADIO_2056_SYN_LOGEN_MIXER2              0x72
-#define RADIO_2056_SYN_LOGEN_BUF1                0x73
-#define RADIO_2056_SYN_LOGENBUF2                 0x74
-#define RADIO_2056_SYN_LOGEN_BUF3                0x75
-#define RADIO_2056_SYN_LOGEN_BUF4                0x76
-#define RADIO_2056_SYN_LOGEN_DIV1                0x77
-#define RADIO_2056_SYN_LOGEN_DIV2                0x78
-#define RADIO_2056_SYN_LOGEN_DIV3                0x79
-#define RADIO_2056_SYN_LOGEN_ACL1                0x7a
-#define RADIO_2056_SYN_LOGEN_ACL2                0x7b
-#define RADIO_2056_SYN_LOGEN_ACL3                0x7c
-#define RADIO_2056_SYN_LOGEN_ACL4                0x7d
-#define RADIO_2056_SYN_LOGEN_ACL5                0x7e
-#define RADIO_2056_SYN_LOGEN_ACL6                0x7f
-#define RADIO_2056_SYN_LOGEN_ACLOUT              0x80
-#define RADIO_2056_SYN_LOGEN_ACLCAL1             0x81
-#define RADIO_2056_SYN_LOGEN_ACLCAL2             0x82
-#define RADIO_2056_SYN_LOGEN_ACLCAL3             0x83
-#define RADIO_2056_SYN_CALEN                     0x84
-#define RADIO_2056_SYN_LOGEN_PEAKDET1            0x85
-#define RADIO_2056_SYN_LOGEN_CORE_ACL_OVR        0x86
-#define RADIO_2056_SYN_LOGEN_RX_DIFF_ACL_OVR     0x87
-#define RADIO_2056_SYN_LOGEN_TX_DIFF_ACL_OVR     0x88
-#define RADIO_2056_SYN_LOGEN_RX_CMOS_ACL_OVR     0x89
-#define RADIO_2056_SYN_LOGEN_TX_CMOS_ACL_OVR     0x8a
-#define RADIO_2056_SYN_LOGEN_VCOBUF2             0x8b
-#define RADIO_2056_SYN_LOGEN_MIXER3              0x8c
-#define RADIO_2056_SYN_LOGEN_BUF5                0x8d
-#define RADIO_2056_SYN_LOGEN_BUF6                0x8e
-#define RADIO_2056_SYN_LOGEN_CBUFRX1             0x8f
-#define RADIO_2056_SYN_LOGEN_CBUFRX2             0x90
-#define RADIO_2056_SYN_LOGEN_CBUFRX3             0x91
-#define RADIO_2056_SYN_LOGEN_CBUFRX4             0x92
-#define RADIO_2056_SYN_LOGEN_CBUFTX1             0x93
-#define RADIO_2056_SYN_LOGEN_CBUFTX2             0x94
-#define RADIO_2056_SYN_LOGEN_CBUFTX3             0x95
-#define RADIO_2056_SYN_LOGEN_CBUFTX4             0x96
-#define RADIO_2056_SYN_LOGEN_CMOSRX1             0x97
-#define RADIO_2056_SYN_LOGEN_CMOSRX2             0x98
-#define RADIO_2056_SYN_LOGEN_CMOSRX3             0x99
-#define RADIO_2056_SYN_LOGEN_CMOSRX4             0x9a
-#define RADIO_2056_SYN_LOGEN_CMOSTX1             0x9b
-#define RADIO_2056_SYN_LOGEN_CMOSTX2             0x9c
-#define RADIO_2056_SYN_LOGEN_CMOSTX3             0x9d
-#define RADIO_2056_SYN_LOGEN_CMOSTX4             0x9e
-#define RADIO_2056_SYN_LOGEN_VCOBUF2_OVRVAL      0x9f
-#define RADIO_2056_SYN_LOGEN_MIXER3_OVRVAL       0xa0
-#define RADIO_2056_SYN_LOGEN_BUF5_OVRVAL         0xa1
-#define RADIO_2056_SYN_LOGEN_BUF6_OVRVAL         0xa2
-#define RADIO_2056_SYN_LOGEN_CBUFRX1_OVRVAL      0xa3
-#define RADIO_2056_SYN_LOGEN_CBUFRX2_OVRVAL      0xa4
-#define RADIO_2056_SYN_LOGEN_CBUFRX3_OVRVAL      0xa5
-#define RADIO_2056_SYN_LOGEN_CBUFRX4_OVRVAL      0xa6
-#define RADIO_2056_SYN_LOGEN_CBUFTX1_OVRVAL      0xa7
-#define RADIO_2056_SYN_LOGEN_CBUFTX2_OVRVAL      0xa8
-#define RADIO_2056_SYN_LOGEN_CBUFTX3_OVRVAL      0xa9
-#define RADIO_2056_SYN_LOGEN_CBUFTX4_OVRVAL      0xaa
-#define RADIO_2056_SYN_LOGEN_CMOSRX1_OVRVAL      0xab
-#define RADIO_2056_SYN_LOGEN_CMOSRX2_OVRVAL      0xac
-#define RADIO_2056_SYN_LOGEN_CMOSRX3_OVRVAL      0xad
-#define RADIO_2056_SYN_LOGEN_CMOSRX4_OVRVAL      0xae
-#define RADIO_2056_SYN_LOGEN_CMOSTX1_OVRVAL      0xaf
-#define RADIO_2056_SYN_LOGEN_CMOSTX2_OVRVAL      0xb0
-#define RADIO_2056_SYN_LOGEN_CMOSTX3_OVRVAL      0xb1
-#define RADIO_2056_SYN_LOGEN_CMOSTX4_OVRVAL      0xb2
-#define RADIO_2056_SYN_LOGEN_ACL_WAITCNT         0xb3
-#define RADIO_2056_SYN_LOGEN_CORE_CALVALID       0xb4
-#define RADIO_2056_SYN_LOGEN_RX_CMOS_CALVALID    0xb5
-#define RADIO_2056_SYN_LOGEN_TX_CMOS_VALID       0xb6
+	status =
+	    acpi_hw_build_pci_list(root_pci_device, pci_region, &list_head);
+	if (ACPI_SUCCESS(status)) {
 
-#define RADIO_2056_TX_RESERVED_ADDR0             0x0
-#define RADIO_2056_TX_IDCODE                     0x1
-#define RADIO_2056_TX_RESERVED_ADDR2             0x2
-#define RADIO_2056_TX_RESERVED_ADDR3             0x3
-#define RADIO_2056_TX_RESERVED_ADDR4             0x4
-#define RADIO_2056_TX_RESERVED_ADDR5             0x5
-#define RADIO_2056_TX_RESERVED_ADDR6             0x6
-#define RADIO_2056_TX_RESERVED_ADDR7             0x7
-#define RADIO_2056_TX_COM_CTRL                   0x8
-#define RADIO_2056_TX_COM_PU                     0x9
-#define RADIO_2056_TX_COM_OVR                    0xa
-#define RADIO_2056_TX_COM_RESET                  0xb
-#define RADIO_2056_TX_COM_RCAL                   0xc
-#define RADIO_2056_TX_COM_RC_RXLPF               0xd
-#define RADIO_2056_TX_COM_RC_TXLPF               0xe
-#define RADIO_2056_TX_COM_RC_RXHPF               0xf
-#define RADIO_2056_TX_RESERVED_ADDR16            0x10
-#define RADIO_2056_TX_RESERVED_ADDR17            0x11
-#define RADIO_2056_TX_RESERVED_ADDR18            0x12
-#define RADIO_2056_TX_RESERVED_ADDR19            0x13
-#define RADIO_2056_TX_RESERVED_ADDR20            0x14
-#define RADIO_2056_TX_RESERVED_ADDR21            0x15
-#define RADIO_2056_TX_RESERVED_ADDR22            0x16
-#define RADIO_2056_TX_RESERVED_ADDR23            0x17
-#define RADIO_2056_TX_RESERVED_ADDR24            0x18
-#define RADIO_2056_TX_RESERVED_ADDR25            0x19
-#define RADIO_2056_TX_RESERVED_ADDR26            0x1a
-#define RADIO_2056_TX_RESERVED_ADDR27            0x1b
-#define RADIO_2056_TX_RESERVED_ADDR28            0x1c
-#define RADIO_2056_TX_RESERVED_ADDR29            0x1d
-#define RADIO_2056_TX_RESERVED_ADDR30            0x1e
-#define RADIO_2056_TX_RESERVED_ADDR31            0x1f
-#define RADIO_2056_TX_IQCAL_GAIN_BW              0x20
-#define RADIO_2056_TX_LOFT_FINE_I                0x21
-#define RADIO_2056_TX_LOFT_FINE_Q                0x22
-#define RADIO_2056_TX_LOFT_COARSE_I              0x23
-#define RADIO_2056_TX_LOFT_COARSE_Q              0x24
-#define RADIO_2056_TX_TX_COM_MASTER1             0x25
-#define RADIO_2056_TX_TX_COM_MASTER2             0x26
-#define RADIO_2056_TX_RXIQCAL_TXMUX              0x27
-#define RADIO_2056_TX_TX_SSI_MASTER              0x28
-#define RADIO_2056_TX_IQCAL_VCM_HG               0x29
-#define RADIO_2056_TX_IQCAL_IDAC                 0x2a
-#define RADIO_2056_TX_TSSI_VCM                   0x2b
-#define RADIO_2056_TX_TX_AMP_DET                 0x2c
-#define RADIO_2056_TX_TX_SSI_MUX                 0x2d
-#define RADIO_2056_TX_TSSIA                      0x2e
-#define RADIO_2056_TX_TSSIG                      0x2f
-#define RADIO_2056_TX_TSSI_MISC1                 0x30
-#define RADIO_2056_TX_TSSI_MISC2                 0x31
-#define RADIO_2056_TX_TSSI_MISC3                 0x32
-#define RADIO_2056_TX_PA_SPARE1                  0x33
-#define RADIO_2056_TX_PA_SPARE2                  0x34
-#define RADIO_2056_TX_INTPAA_MASTER              0x35
-#define RADIO_2056_TX_INTPAA_GAIN                0x36
-#define RADIO_2056_TX_INTPAA_BOOST_TUNE          0x37
-#define RADIO_2056_TX_INTPAA_IAUX_STAT           0x38
-#define RADIO_2056_TX_INTPAA_IAUX_DYN            0x39
-#define RADIO_2056_TX_INTPAA_IMAIN_STAT          0x3a
-#define RADIO_2056_TX_INTPAA_IMAIN_DYN           0x3b
-#define RADIO_2056_TX_INTPAA_CASCBIAS            0x3c
-#define RADIO_2056_TX_INTPAA_PASLOPE             0x3d
-#define RADIO_2056_TX_INTPAA_PA_MISC             0x3e
-#define RADIO_2056_TX_INTPAG_MASTER              0x3f
-#define RADIO_2056_TX_INTPAG_GAIN                0x40
-#define RADIO_2056_TX_INTPAG_BOOST_TUNE          0x41
-#define RADIO_2056_TX_INTPAG_IAUX_STAT           0x42
-#define RADIO_2056_TX_INTPAG_IAUX_DYN            0x43
-#define RADIO_2056_TX_INTPAG_IMAIN_STAT          0x44
-#define RADIO_2056_TX_INTPAG_IMAIN_DYN           0x45
-#define RADIO_2056_TX_INTPAG_CASCBIAS            0x46
-#define RADIO_2056_TX_INTPAG_PASLOPE             0x47
-#define RADIO_2056_TX_INTPAG_PA_MISC             0x48
-#define RADIO_2056_TX_PADA_MASTER                0x49
-#define RADIO_2056_TX_PADA_IDAC                  0x4a
-#define RADIO_2056_TX_PADA_CASCBIAS              0x4b
-#define RADIO_2056_TX_PADA_GAIN                  0x4c
-#define RADIO_2056_TX_PADA_BOOST_TUNE            0x4d
-#define RADIO_2056_TX_PADA_SLOPE                 0x4e
-#define RADIO_2056_TX_PADG_MASTER                0x4f
-#define RADIO_2056_TX_PADG_IDAC                  0x50
-#define RADIO_2056_TX_PADG_CASCBIAS              0x51
-#define RADIO_2056_TX_PADG_GAIN                  0x52
-#define RADIO_2056_TX_PADG_BOOST_TUNE            0x53
-#define RADIO_2056_TX_PADG_SLOPE                 0x54
-#define RADIO_2056_TX_PGAA_MASTER                0x55
-#define RADIO_2056_TX_PGAA_IDAC                  0x56
-#define RADIO_2056_TX_PGAA_GAIN                  0x57
-#define RADIO_2056_TX_PGAA_BOOST_TUNE            0x58
-#define RADIO_2056_TX_PGAA_SLOPE                 0x59
-#define RADIO_2056_TX_PGAA_MISC                  0x5a
-#define RADIO_2056_TX_PGAG_MASTER                0x5b
-#define RADIO_2056_TX_PGAG_IDAC                  0x5c
-#define RADIO_2056_TX_PGAG_GAIN                  0x5d
-#define RADIO_2056_TX_PGAG_BOOST_TUNE            0x5e
-#define RADIO_2056_TX_PGAG_SLOPE                 0x5f
-#define RADIO_2056_TX_PGAG_MISC                  0x60
-#define RADIO_2056_TX_MIXA_MASTER                0x61
-#define RADIO_2056_TX_MIXA_BOOST_TUNE            0x62
-#define RADIO_2056_TX_MIXG                       0x63
-#define RADIO_2056_TX_MIXG_BOOST_TUNE            0x64
-#define RADIO_2056_TX_BB_GM_MASTER               0x65
-#define RADIO_2056_TX_GMBB_GM                    0x66
-#define RADIO_2056_TX_GMBB_IDAC                  0x67
-#define RADIO_2056_TX_TXLPF_MASTER               0x68
-#define RADIO_2056_TX_TXLPF_RCCAL                0x69
-#define RADIO_2056_TX_TXLPF_RCCAL_OFF0           0x6a
-#define RADIO_2056_TX_TXLPF_RCCAL_OFF1           0x6b
-#define RADIO_2056_TX_TXLPF_RCCAL_OFF2           0x6c
-#define RADIO_2056_TX_TXLPF_RCCAL_OFF3           0x6d
-#define RADIO_2056_TX_TXLPF_RCCAL_OFF4           0x6e
-#define RADIO_2056_TX_TXLPF_RCCAL_OFF5           0x6f
-#define RADIO_2056_TX_TXLPF_RCCAL_OFF6           0x70
-#define RADIO_2056_TX_TXLPF_BW                   0x71
-#define RADIO_2056_TX_TXLPF_GAIN                 0x72
-#define RADIO_2056_TX_TXLPF_IDAC                 0x73
-#define RADIO_2056_TX_TXLPF_IDAC_0               0x74
-#define RADIO_2056_TX_TXLPF_IDAC_1               0x75
-#define RADIO_2056_TX_TXLPF_IDAC_2               0x76
-#define RADIO_2056_TX_TXLPF_IDAC_3               0x77
-#define RADIO_2056_TX_TXLPF_IDAC_4               0x78
-#define RADIO_2056_TX_TXLPF_IDAC_5               0x79
-#define RADIO_2056_TX_TXLPF_IDAC_6               0x7a
-#define RADIO_2056_TX_TXLPF_OPAMP_IDAC           0x7b
-#define RADIO_2056_TX_TXLPF_MISC                 0x7c
-#define RADIO_2056_TX_TXSPARE1                   0x7d
-#define RADIO_2056_TX_TXSPARE2                   0x7e
-#define RADIO_2056_TX_TXSPARE3                   0x7f
-#define RADIO_2056_TX_TXSPARE4                   0x80
-#define RADIO_2056_TX_TXSPARE5                   0x81
-#define RADIO_2056_TX_TXSPARE6                   0x82
-#define RADIO_2056_TX_TXSPARE7                   0x83
-#define RADIO_2056_TX_TXSPARE8                   0x84
-#define RADIO_2056_TX_TXSPARE9                   0x85
-#define RADIO_2056_TX_TXSPARE10                  0x86
-#define RADIO_2056_TX_TXSPARE11                  0x87
-#define RADIO_2056_TX_TXSPARE12                  0x88
-#define RADIO_2056_TX_TXSPARE13                  0x89
-#define RADIO_2056_TX_TXSPARE14                  0x8a
-#define RADIO_2056_TX_TXSPARE15                  0x8b
-#define RADIO_2056_TX_TXSPARE16                  0x8c
-#define RADIO_2056_TX_STATUS_INTPA_GAIN          0x8d
-#define RADIO_2056_TX_STATUS_PAD_GAIN            0x8e
-#define RADIO_2056_TX_STATUS_PGA_GAIN            0x8f
-#define RADIO_2056_TX_STATUS_GM_TXLPF_GAIN       0x90
-#define RADIO_2056_TX_STATUS_TXLPF_BW            0x91
-#define RADIO_2056_TX_STATUS_TXLPF_RC            0x92
-#define RADIO_2056_TX_GMBB_IDAC0                 0x93
-#define RADIO_2056_TX_GMBB_IDAC1                 0x94
-#define RADIO_2056_TX_GMBB_IDAC2                 0x95
-#define RADIO_2056_TX_GMBB_IDAC3                 0x96
-#define RADIO_2056_TX_GMBB_IDAC4                 0x97
-#define RADIO_2056_TX_GMBB_IDAC5                 0x98
-#define RADIO_2056_TX_GMBB_IDAC6                 0x99
-#define RADIO_2056_TX_GMBB_IDAC7                 0x9a
+		/* Walk the list, updating the PCI device/function/bus numbers */
 
-#define RADIO_2056_RX_RESERVED_ADDR0             0x0
-#define RADIO_2056_RX_IDCODE                     0x1
-#define RADIO_2056_RX_RESERVED_ADDR2             0x2
-#define RADIO_2056_RX_RESERVED_ADDR3             0x3
-#define RADIO_2056_RX_RESERVED_ADDR4             0x4
-#define RADIO_2056_RX_RESERVED_ADDR5             0x5
-#define RADIO_2056_RX_RESERVED_ADDR6             0x6
-#define RADIO_2056_RX_RESERVED_ADDR7             0x7
-#define RADIO_2056_RX_COM_CTRL                   0x8
-#define RADIO_2056_RX_COM_PU                     0x9
-#define RADIO_2056_RX_COM_OVR                    0xa
-#define RADIO_2056_RX_COM_RESET                  0xb
-#define RADIO_2056_RX_COM_RCAL                   0xc
-#define RADIO_2056_RX_COM_RC_RXLPF               0xd
-#define RADIO_2056_RX_COM_RC_TXLPF               0xe
-#define RADIO_2056_RX_COM_RC_RXHPF               0xf
-#define RADIO_2056_RX_RESERVED_ADDR16            0x10
-#define RADIO_2056_RX_RESERVED_ADDR17            0x11
-#define RADIO_2056_RX_RESERVED_ADDR18            0x12
-#define RADIO_2056_RX_RESERVED_ADDR19            0x13
-#define RADIO_2056_RX_RESERVED_ADDR20            0x14
-#define RADIO_2056_RX_RESERVED_ADDR21            0x15
-#define RADIO_2056_RX_RESERVED_ADDR22            0x16
-#define RADIO_2056_RX_RESERVED_ADDR23            0x17
-#define RADIO_2056_RX_RESERVED_ADDR24            0x18
-#define RADIO_2056_RX_RESERVED_ADDR25            0x19
-#define RADIO_2056_RX_RESERVED_ADDR26            0x1a
-#define RADIO_2056_RX_RESERVED_ADDR27            0x1b
-#define RADIO_2056_RX_RESERVED_ADDR28            0x1c
-#define RADIO_2056_RX_RESERVED_ADDR29            0x1d
-#define RADIO_2056_RX_RESERVED_ADDR30            0x1e
-#define RADIO_2056_RX_RESERVED_ADDR31            0x1f
-#define RADIO_2056_RX_RXIQCAL_RXMUX              0x20
-#define RADIO_2056_RX_RSSI_PU                    0x21
-#define RADIO_2056_RX_RSSI_SEL                   0x22
-#define RADIO_2056_RX_RSSI_GAIN                  0x23
-#define RADIO_2056_RX_RSSI_NB_IDAC               0x24
-#define RADIO_2056_RX_RSSI_WB2I_IDAC_1           0x25
-#define RADIO_2056_RX_RSSI_WB2I_IDAC_2           0x26
-#define RADIO_2056_RX_RSSI_WB2Q_IDAC_1           0x27
-#define RADIO_2056_RX_RSSI_WB2Q_IDAC_2           0x28
-#define RADIO_2056_RX_RSSI_POLE                  0x29
-#define RADIO_2056_RX_RSSI_WB1_IDAC              0x2a
-#define RADIO_2056_RX_RSSI_MISC                  0x2b
-#define RADIO_2056_RX_LNAA_MASTER                0x2c
-#define RADIO_2056_RX_LNAA_TUNE                  0x2d
-#define RADIO_2056_RX_LNAA_GAIN                  0x2e
-#define RADIO_2056_RX_LNA_A_SLOPE                0x2f
-#define RADIO_2056_RX_BIASPOLE_LNAA1_IDAC        0x30
-#define RADIO_2056_RX_LNAA2_IDAC                 0x31
-#define RADIO_2056_RX_LNA1A_MISC                 0x32
-#define RADIO_2056_RX_LNAG_MASTER                0x33
-#define RADIO_2056_RX_LNAG_TUNE                  0x34
-#define RADIO_2056_RX_LNAG_GAIN                  0x35
-#define RADIO_2056_RX_LNA_G_SLOPE                0x36
-#define RADIO_2056_RX_BIASPOLE_LNAG1_IDAC        0x37
-#define RADIO_2056_RX_LNAG2_IDAC                 0x38
-#define RADIO_2056_RX_LNA1G_MISC                 0x39
-#define RADIO_2056_RX_MIXA_MASTER                0x3a
-#define RADIO_2056_RX_MIXA_VCM                   0x3b
-#define RADIO_2056_RX_MIXA_CTRLPTAT              0x3c
-#define RADIO_2056_RX_MIXA_LOB_BIAS              0x3d
-#define RADIO_2056_RX_MIXA_CORE_IDAC             0x3e
-#define RADIO_2056_RX_MIXA_CMFB_IDAC             0x3f
-#define RADIO_2056_RX_MIXA_BIAS_AUX              0x40
-#define RADIO_2056_RX_MIXA_BIAS_MAIN             0x41
-#define RADIO_2056_RX_MIXA_BIAS_MISC             0x42
-#define RADIO_2056_RX_MIXA_MAST_BIAS             0x43
-#define RADIO_2056_RX_MIXG_MASTER                0x44
-#define RADIO_2056_RX_MIXG_VCM                   0x45
-#define RADIO_2056_RX_MIXG_CTRLPTAT              0x46
-#define RADIO_2056_RX_MIXG_LOB_BIAS              0x47
-#define RADIO_2056_RX_MIXG_CORE_IDAC             0x48
-#define RADIO_2056_RX_MIXG_CMFB_IDAC             0x49
-#define RADIO_2056_RX_MIXG_BIAS_AUX              0x4a
-#define RADIO_2056_RX_MIXG_BIAS_MAIN             0x4b
-#define RADIO_2056_RX_MIXG_BIAS_MISC             0x4c
-#define RADIO_2056_RX_MIXG_MAST_BIAS             0x4d
-#define RADIO_2056_RX_TIA_MASTER                 0x4e
-#define RADIO_2056_RX_TIA_IOPAMP                 0x4f
-#define RADIO_2056_RX_TIA_QOPAMP                 0x50
-#define RADIO_2056_RX_TIA_IMISC                  0x51
-#define RADIO_2056_RX_TIA_QMISC                  0x52
-#define RADIO_2056_RX_TIA_GAIN                   0x53
-#define RADIO_2056_RX_TIA_SPARE1                 0x54
-#define RADIO_2056_RX_TIA_SPARE2                 0x55
-#define RADIO_2056_RX_BB_LPF_MASTER              0x56
-#define RADIO_2056_RX_AACI_MASTER                0x57
-#define RADIO_2056_RX_RXLPF_IDAC                 0x58
-#define RADIO_2056_RX_RXLPF_OPAMPBIAS_LOWQ       0x59
-#define RADIO_2056_RX_RXLPF_OPAMPBIAS_HIGHQ      0x5a
-#define RADIO_2056_RX_RXLPF_BIAS_DCCANCEL        0x5b
-#define RADIO_2056_RX_RXLPF_OUTVCM               0x5c
-#define RADIO_2056_RX_RXLPF_INVCM_BODY           0x5d
-#define RADIO_2056_RX_RXLPF_CC_OP                0x5e
-#define RADIO_2056_RX_RXLPF_GAIN                 0x5f
-#define RADIO_2056_RX_RXLPF_Q_BW                 0x60
-#define RADIO_2056_RX_RXLPF_HP_CORNER_BW         0x61
-#define RADIO_2056_RX_RXLPF_RCCAL_HPC            0x62
-#define RADIO_2056_RX_RXHPF_OFF0                 0x63
-#define RADIO_2056_RX_RXHPF_OFF1                 0x64
-#define RADIO_2056_RX_RXHPF_OFF2                 0x65
-#define RADIO_2056_RX_RXHPF_OFF3                 0x66
-#define RADIO_2056_RX_RXHPF_OFF4                 0x67
-#define RADIO_2056_RX_RXHPF_OFF5                 0x68
-#define RADIO_2056_RX_RXHPF_OFF6                 0x69
-#define RADIO_2056_RX_RXHPF_OFF7                 0x6a
-#define RADIO_2056_RX_RXLPF_RCCAL_LPC            0x6b
-#define RADIO_2056_RX_RXLPF_OFF_0                0x6c
-#define RADIO_2056_RX_RXLPF_OFF_1                0x6d
-#define RADIO_2056_RX_RXLPF_OFF_2                0x6e
-#define RADIO_2056_RX_RXLPF_OFF_3                0x6f
-#define RADIO_2056_RX_RXLPF_OFF_4                0x70
-#define RADIO_2056_RX_UNUSED                     0x71
-#define RADIO_2056_RX_VGA_MASTER                 0x72
-#define RADIO_2056_RX_VGA_BIAS                   0x73
-#define RADIO_2056_RX_VGA_BIAS_DCCANCEL          0x74
-#define RADIO_2056_RX_VGA_GAIN                   0x75
-#define RADIO_2056_RX_VGA_HP_CORNER_BW           0x76
-#define RADIO_2056_RX_VGABUF_BIAS                0x77
-#define RADIO_2056_RX_VGABUF_GAIN_BW             0x78
-#define RADIO_2056_RX_TXFBMIX_A                  0x79
-#define RADIO_2056_RX_TXFBMIX_G                  0x7a
-#define RADIO_2056_RX_RXSPARE1                   0x7b
-#define RADIO_2056_RX_RXSPARE2                   0x7c
-#define RADIO_2056_RX_RXSPARE3                   0x7d
-#define RADIO_2056_RX_RXSPARE4                   0x7e
-#define RADIO_2056_RX_RXSPARE5                   0x7f
-#define RADIO_2056_RX_RXSPARE6                   0x80
-#define RADIO_2056_RX_RXSPARE7                   0x81
-#define RADIO_2056_RX_RXSPARE8                   0x82
-#define RADIO_2056_RX_RXSPARE9                   0x83
-#define RADIO_2056_RX_RXSPARE10                  0x84
-#define RADIO_2056_RX_RXSPARE11                  0x85
-#define RADIO_2056_RX_RXSPARE12                  0x86
-#define RADIO_2056_RX_RXSPARE13                  0x87
-#define RADIO_2056_RX_RXSPARE14                  0x88
-#define RADIO_2056_RX_RXSPARE15                  0x89
-#define RADIO_2056_RX_RXSPARE16                  0x8a
-#define RADIO_2056_RX_STATUS_LNAA_GAIN           0x8b
-#define RADIO_2056_RX_STATUS_LNAG_GAIN           0x8c
-#define RADIO_2056_RX_STATUS_MIXTIA_GAIN         0x8d
-#define RADIO_2056_RX_STATUS_RXLPF_GAIN          0x8e
-#define RADIO_2056_RX_STATUS_VGA_BUF_GAIN        0x8f
-#define RADIO_2056_RX_STATUS_RXLPF_Q             0x90
-#define RADIO_2056_RX_STATUS_RXLPF_BUF_BW        0x91
-#define RADIO_2056_RX_STATUS_RXLPF_VGA_HPC       0x92
-#define RADIO_2056_RX_STATUS_RXLPF_RC            0x93
-#define RADIO_2056_RX_STATUS_HPC_RC              0x94
+		status = acpi_hw_process_pci_list(pci_id, list_head);
 
-#define RADIO_2056_LNA1_A_PU		0x01
-#define RADIO_2056_LNA2_A_PU		0x02
-#define RADIO_2056_LNA1_G_PU		0x01
-#define RADIO_2056_LNA2_G_PU		0x02
-#define RADIO_2056_MIXA_PU_I		0x01
-#define RADIO_2056_MIXA_PU_Q		0x02
-#define RADIO_2056_MIXA_PU_GM		0x10
-#define RADIO_2056_MIXG_PU_I		0x01
-#define RADIO_2056_MIXG_PU_Q		0x02
-#define RADIO_2056_MIXG_PU_GM		0x10
-#define RADIO_2056_TIA_PU			0x01
-#define RADIO_2056_BB_LPF_PU		0x20
-#define RADIO_2056_W1_PU			0x02
-#define RADIO_2056_W2_PU			0x04
-#define RADIO_2056_NB_PU			0x08
-#define RADIO_2056_RSSI_W1_SEL		0x02
-#define RADIO_2056_RSSI_W2_SEL		0x04
-#define RADIO_2056_RSSI_NB_SEL		0x08
-#define RADIO_2056_VCM_MASK			0x1c
-#define RADIO_2056_RSSI_VCM_SHIFT	0x02
+		/* Delete the list */
 
-#define RADIO_2057_DACBUF_VINCM_CORE0            0x0
-#define RADIO_2057_IDCODE                        0x1
-#define RADIO_2057_RCCAL_MASTER                  0x2
-#define RADIO_2057_RCCAL_CAP_SIZE                0x3
-#define RADIO_2057_RCAL_CONFIG                   0x4
-#define RADIO_2057_GPAIO_CONFIG                  0x5
-#define RADIO_2057_GPAIO_SEL1                    0x6
-#define RADIO_2057_GPAIO_SEL0                    0x7
-#define RADIO_2057_CLPO_CONFIG                   0x8
-#define RADIO_2057_BANDGAP_CONFIG                0x9
-#define RADIO_2057_BANDGAP_RCAL_TRIM             0xa
-#define RADIO_2057_AFEREG_CONFIG                 0xb
-#define RADIO_2057_TEMPSENSE_CONFIG              0xc
-#define RADIO_2057_XTAL_CONFIG1                  0xd
-#define RADIO_2057_XTAL_ICORE_SIZE               0xe
-#define RADIO_2057_XTAL_BUF_SIZE                 0xf
-#define RADIO_2057_XTAL_PULLCAP_SIZE             0x10
-#define RADIO_2057_RFPLL_MASTER                  0x11
-#define RADIO_2057_VCOMONITOR_VTH_L              0x12
-#define RADIO_2057_VCOMONITOR_VTH_H              0x13
-#define RADIO_2057_VCOCAL_BIASRESET_RFPLLREG_VOUT 0x14
-#define RADIO_2057_VCO_VARCSIZE_IDAC             0x15
-#define RADIO_2057_VCOCAL_COUNTVAL0              0x16
-#define RADIO_2057_VCOCAL_COUNTVAL1              0x17
-#define RADIO_2057_VCOCAL_INTCLK_COUNT           0x18
-#define RADIO_2057_VCOCAL_MASTER                 0x19
-#define RADIO_2057_VCOCAL_NUMCAPCHANGE           0x1a
-#define RADIO_2057_VCOCAL_WINSIZE                0x1b
-#define RADIO_2057_VCOCAL_DELAY_AFTER_REFRESH    0x1c
-#define RADIO_2057_VCOCAL_DELAY_AFTER_CLOSELOOP  0x1d
-#define RADIO_2057_VCOCAL_DELAY_AFTER_OPENLOOP   0x1e
-#define RADIO_2057_VCOCAL_DELAY_BEFORE_OPENLOOP  0x1f
-#define RADIO_2057_VCO_FORCECAPEN_FORCECAP1      0x20
-#define RADIO_2057_VCO_FORCECAP0                 0x21
-#define RADIO_2057_RFPLL_REFMASTER_SPAREXTALSIZE 0x22
-#define RADIO_2057_RFPLL_PFD_RESET_PW            0x23
-#define RADIO_2057_RFPLL_LOOPFILTER_R2           0x24
-#define RADIO_2057_RFPLL_LOOPFILTER_R1           0x25
-#define RADIO_2057_RFPLL_LOOPFILTER_C3           0x26
-#define RADIO_2057_RFPLL_LOOPFILTER_C2           0x27
-#define RADIO_2057_RFPLL_LOOPFILTER_C1           0x28
-#define RADIO_2057_CP_KPD_IDAC                   0x29
-#define RADIO_2057_RFPLL_IDACS                   0x2a
-#define RADIO_2057_RFPLL_MISC_EN                 0x2b
-#define RADIO_2057_RFPLL_MMD0                    0x2c
-#define RADIO_2057_RFPLL_MMD1                    0x2d
-#define RADIO_2057_RFPLL_MISC_CAL_RESETN         0x2e
-#define RADIO_2057_JTAGXTAL_SIZE_CPBIAS_FILTRES  0x2f
-#define RADIO_2057_VCO_ALCREF_BBPLLXTAL_SIZE     0x30
-#define RADIO_2057_VCOCAL_READCAP0               0x31
-#define RADIO_2057_VCOCAL_READCAP1               0x32
-#define RADIO_2057_VCOCAL_STATUS                 0x33
-#define RADIO_2057_LOGEN_PUS                     0x34
-#define RADIO_2057_LOGEN_PTAT_RESETS             0x35
-#define RADIO_2057_VCOBUF_IDACS                  0x36
-#define RADIO_2057_VCOBUF_TUNE                   0x37
-#define RADIO_2057_CMOSBUF_TX2GQ_IDACS           0x38
-#define RADIO_2057_CMOSBUF_TX2GI_IDACS           0x39
-#define RADIO_2057_CMOSBUF_TX5GQ_IDACS           0x3a
-#define RADIO_2057_CMOSBUF_TX5GI_IDACS           0x3b
-#define RADIO_2057_CMOSBUF_RX2GQ_IDACS           0x3c
-#define RADIO_2057_CMOSBUF_RX2GI_IDACS           0x3d
-#define RADIO_2057_CMOSBUF_RX5GQ_IDACS           0x3e
-#define RADIO_2057_CMOSBUF_RX5GI_IDACS           0x3f
-#define RADIO_2057_LOGEN_MX2G_IDACS              0x40
-#define RADIO_2057_LOGEN_MX2G_TUNE               0x41
-#define RADIO_2057_LOGEN_MX5G_IDACS              0x42
-#define RADIO_2057_LOGEN_MX5G_TUNE               0x43
-#define RADIO_2057_LOGEN_MX5G_RCCR               0x44
-#define RADIO_2057_LOGEN_INDBUF2G_IDAC           0x45
-#define RADIO_2057_LOGEN_INDBUF2G_IBOOST         0x46
-#define RADIO_2057_LOGEN_INDBUF2G_TUNE           0x47
-#define RADIO_2057_LOGEN_INDBUF5G_IDAC           0x48
-#define RADIO_2057_LOGEN_INDBUF5G_IBOOST         0x49
-#define RADIO_2057_LOGEN_INDBUF5G_TUNE           0x4a
-#define RADIO_2057_CMOSBUF_TX_RCCR               0x4b
-#define RADIO_2057_CMOSBUF_RX_RCCR               0x4c
-#define RADIO_2057_LOGEN_SEL_PKDET               0x4d
-#define RADIO_2057_CMOSBUF_SHAREIQ_PTAT          0x4e
-#define RADIO_2057_RXTXBIAS_CONFIG_CORE0         0x4f
-#define RADIO_2057_TXGM_TXRF_PUS_CORE0           0x50
-#define RADIO_2057_TXGM_IDAC_BLEED_CORE0         0x51
-#define RADIO_2057_TXGM_GAIN_CORE0               0x56
-#define RADIO_2057_TXGM2G_PKDET_PUS_CORE0        0x57
-#define RADIO_2057_PAD2G_PTATS_CORE0             0x58
-#define RADIO_2057_PAD2G_IDACS_CORE0             0x59
-#define RADIO_2057_PAD2G_BOOST_PU_CORE0          0x5a
-#define RADIO_2057_PAD2G_CASCV_GAIN_CORE0        0x5b
-#define RADIO_2057_TXMIX2G_TUNE_BOOST_PU_CORE0   0x5c
-#define RADIO_2057_TXMIX2G_LODC_CORE0            0x5d
-#define RADIO_2057_PAD2G_TUNE_PUS_CORE0          0x5e
-#define RADIO_2057_IPA2G_GAIN_CORE0              0x5f
-#define RADIO_2057_TSSI2G_SPARE1_CORE0           0x60
-#define RADIO_2057_TSSI2G_SPARE2_CORE0           0x61
-#define RADIO_2057_IPA2G_TUNEV_CASCV_PTAT_CORE0  0x62
-#define RADIO_2057_IPA2G_IMAIN_CORE0             0x63
-#define RADIO_2057_IPA2G_CASCONV_CORE0           0x64
-#define RADIO_2057_IPA2G_CASCOFFV_CORE0          0x65
-#define RADIO_2057_IPA2G_BIAS_FILTER_CORE0       0x66
-#define RADIO_2057_TX5G_PKDET_CORE0              0x69
-#define RADIO_2057_PGA_PTAT_TXGM5G_PU_CORE0      0x6a
-#define RADIO_2057_PAD5G_PTATS1_CORE0            0x6b
-#define RADIO_2057_PAD5G_CLASS_PTATS2_CORE0      0x6c
-#define RADIO_2057_PGA_BOOSTPTAT_IMAIN_CORE0     0x6d
-#define RADIO_2057_PAD5G_CASCV_IMAIN_CORE0       0x6e
-#define RADIO_2057_TXMIX5G_IBOOST_PAD_IAUX_CORE0 0x6f
-#define RADIO_2057_PGA_BOOST_TUNE_CORE0          0x70
-#define RADIO_2057_PGA_GAIN_CORE0                0x71
-#define RADIO_2057_PAD5G_CASCOFFV_GAIN_PUS_CORE0 0x72
-#define RADIO_2057_TXMIX5G_BOOST_TUNE_CORE0      0x73
-#define RADIO_2057_PAD5G_TUNE_MISC_PUS_CORE0     0x74
-#define RADIO_2057_IPA5G_IAUX_CORE0              0x75
-#define RADIO_2057_IPA5G_GAIN_CORE0              0x76
-#define RADIO_2057_TSSI5G_SPARE1_CORE0           0x77
-#define RADIO_2057_TSSI5G_SPARE2_CORE0           0x78
-#define RADIO_2057_IPA5G_CASCOFFV_PU_CORE0       0x79
-#define RADIO_2057_IPA5G_PTAT_CORE0              0x7a
-#define RADIO_2057_IPA5G_IMAIN_CORE0             0x7b
-#define RADIO_2057_IPA5G_CASCONV_CORE0           0x7c
-#define RADIO_2057_IPA5G_BIAS_FILTER_CORE0       0x7d
-#define RADIO_2057_PAD_BIAS_FILTER_BWS_CORE0     0x80
-#define RADIO_2057_TR2G_CONFIG1_CORE0_NU         0x81
-#define RADIO_2057_TR2G_CONFIG2_CORE0_NU         0x82
-#define RADIO_2057_LNA5G_RFEN_CORE0              0x83
-#define RADIO_2057_TR5G_CONFIG2_CORE0_NU         0x84
-#define RADIO_2057_RXRFBIAS_IBOOST_PU_CORE0      0x85
-#define RADIO_2057_RXRF_IABAND_RXGM_IMAIN_PTAT_CORE0 0x86
-#define RADIO_2057_RXGM_CMFBITAIL_AUXPTAT_CORE0  0x87
-#define RADIO_2057_RXMIX_ICORE_RXGM_IAUX_CORE0   0x88
-#define RADIO_2057_RXMIX_CMFBITAIL_PU_CORE0      0x89
-#define RADIO_2057_LNA2_IMAIN_PTAT_PU_CORE0      0x8a
-#define RADIO_2057_LNA2_IAUX_PTAT_CORE0          0x8b
-#define RADIO_2057_LNA1_IMAIN_PTAT_PU_CORE0      0x8c
-#define RADIO_2057_LNA15G_INPUT_MATCH_TUNE_CORE0 0x8d
-#define RADIO_2057_RXRFBIAS_BANDSEL_CORE0        0x8e
-#define RADIO_2057_TIA_CONFIG_CORE0              0x8f
-#define RADIO_2057_TIA_IQGAIN_CORE0              0x90
-#define RADIO_2057_TIA_IBIAS2_CORE0              0x91
-#define RADIO_2057_TIA_IBIAS1_CORE0              0x92
-#define RADIO_2057_TIA_SPARE_Q_CORE0             0x93
-#define RADIO_2057_TIA_SPARE_I_CORE0             0x94
-#define RADIO_2057_RXMIX2G_PUS_CORE0             0x95
-#define RADIO_2057_RXMIX2G_VCMREFS_CORE0         0x96
-#define RADIO_2057_RXMIX2G_LODC_QI_CORE0         0x97
-#define RADIO_2057_W12G_BW_LNA2G_PUS_CORE0       0x98
-#define RADIO_2057_LNA2G_GAIN_CORE0              0x99
-#define RADIO_2057_LNA2G_TUNE_CORE0              0x9a
-#define RADIO_2057_RXMIX5G_PUS_CORE0             0x9b
-#define RADIO_2057_RXMIX5G_VCMREFS_CORE0         0x9c
-#define RADIO_2057_RXMIX5G_LODC_QI_CORE0         0x9d
-#define RADIO_2057_W15G_BW_LNA5G_PUS_CORE0       0x9e
-#define RADIO_2057_LNA5G_GAIN_CORE0              0x9f
-#define RADIO_2057_LNA5G_TUNE_CORE0              0xa0
-#define RADIO_2057_LPFSEL_TXRX_RXBB_PUS_CORE0    0xa1
-#define RADIO_2057_RXBB_BIAS_MASTER_CORE0        0xa2
-#define RADIO_2057_RXBB_VGABUF_IDACS_CORE0       0xa3
-#define RADIO_2057_LPF_VCMREF_TXBUF_VCMREF_CORE0 0xa4
-#define RADIO_2057_TXBUF_VINCM_CORE0             0xa5
-#define RADIO_2057_TXBUF_IDACS_CORE0             0xa6
-#define RADIO_2057_LPF_RESP_RXBUF_BW_CORE0       0xa7
-#define RADIO_2057_RXBB_CC_CORE0                 0xa8
-#define RADIO_2057_RXBB_SPARE3_CORE0             0xa9
-#define RADIO_2057_RXBB_RCCAL_HPC_CORE0          0xaa
-#define RADIO_2057_LPF_IDACS_CORE0               0xab
-#define RADIO_2057_LPFBYP_DCLOOP_BYP_IDAC_CORE0  0xac
-#define RADIO_2057_TXBUF_GAIN_CORE0              0xad
-#define RADIO_2057_AFELOOPBACK_AACI_RESP_CORE0   0xae
-#define RADIO_2057_RXBUF_DEGEN_CORE0             0xaf
-#define RADIO_2057_RXBB_SPARE2_CORE0             0xb0
-#define RADIO_2057_RXBB_SPARE1_CORE0             0xb1
-#define RADIO_2057_RSSI_MASTER_CORE0             0xb2
-#define RADIO_2057_W2_MASTER_CORE0               0xb3
-#define RADIO_2057_NB_MASTER_CORE0               0xb4
-#define RADIO_2057_W2_IDACS0_Q_CORE0             0xb5
-#define RADIO_2057_W2_IDACS1_Q_CORE0             0xb6
-#define RADIO_2057_W2_IDACS0_I_CORE0             0xb7
-#define RADIO_2057_W2_IDACS1_I_CORE0             0xb8
-#define RADIO_2057_RSSI_GPAIOSEL_W1_IDACS_CORE0  0xb9
-#define RADIO_2057_NB_IDACS_Q_CORE0              0xba
-#define RADIO_2057_NB_IDACS_I_CORE0              0xbb
-#define RADIO_2057_BACKUP4_CORE0                 0xc1
-#define RADIO_2057_BACKUP3_CORE0                 0xc2
-#define RADIO_2057_BACKUP2_CORE0                 0xc3
-#define RADIO_2057_BACKUP1_CORE0                 0xc4
-#define RADIO_2057_SPARE16_CORE0                 0xc5
-#define RADIO_2057_SPARE15_CORE0                 0xc6
-#define RADIO_2057_SPARE14_CORE0                 0xc7
-#define RADIO_2057_SPARE13_CORE0                 0xc8
-#define RADIO_2057_SPARE12_CORE0                 0xc9
-#define RADIO_2057_SPARE11_CORE0                 0xca
-#define RADIO_2057_TX2G_BIAS_RESETS_CORE0        0xcb
-#define RADIO_2057_TX5G_BIAS_RESETS_CORE0        0xcc
-#define RADIO_2057_IQTEST_SEL_PU                 0xcd
-#define RADIO_2057_XTAL_CONFIG2                  0xce
-#define RADIO_2057_BUFS_MISC_LPFBW_CORE0         0xcf
-#define RADIO_2057_TXLPF_RCCAL_CORE0             0xd0
-#define RADIO_2057_RXBB_GPAIOSEL_RXLPF_RCCAL_CORE0 0xd1
-#define RADIO_2057_LPF_GAIN_CORE0                0xd2
-#define RADIO_2057_DACBUF_IDACS_BW_CORE0         0xd3
-#define RADIO_2057_RXTXBIAS_CONFIG_CORE1         0xd4
-#define RADIO_2057_TXGM_TXRF_PUS_CORE1           0xd5
-#define RADIO_2057_TXGM_IDAC_BLEED_CORE1         0xd6
-#define RADIO_2057_TXGM_GAIN_CORE1               0xdb
-#define RADIO_2057_TXGM2G_PKDET_PUS_CORE1        0xdc
-#define RADIO_2057_PAD2G_PTATS_CORE1             0xdd
-#define RADIO_2057_PAD2G_IDACS_CORE1             0xde
-#define RADIO_2057_PAD2G_BOOST_PU_CORE1          0xdf
-#define RADIO_2057_PAD2G_CASCV_GAIN_CORE1        0xe0
-#define RADIO_2057_TXMIX2G_TUNE_BOOST_PU_CORE1   0xe1
-#define RADIO_2057_TXMIX2G_LODC_CORE1            0xe2
-#define RADIO_2057_PAD2G_TUNE_PUS_CORE1          0xe3
-#define RADIO_2057_IPA2G_GAIN_CORE1              0xe4
-#define RADIO_2057_TSSI2G_SPARE1_CORE1           0xe5
-#define RADIO_2057_TSSI2G_SPARE2_CORE1           0xe6
-#define RADIO_2057_IPA2G_TUNEV_CASCV_PTAT_CORE1  0xe7
-#define RADIO_2057_IPA2G_IMAIN_CORE1             0xe8
-#define RADIO_2057_IPA2G_CASCONV_CORE1           0xe9
-#define RADIO_2057_IPA2G_CASCOFFV_CORE1          0xea
-#define RADIO_2057_IPA2G_BIAS_FILTER_CORE1       0xeb
-#define RADIO_2057_TX5G_PKDET_CORE1              0xee
-#define RADIO_2057_PGA_PTAT_TXGM5G_PU_CORE1      0xef
-#define RADIO_2057_PAD5G_PTATS1_CORE1            0xf0
-#define RADIO_2057_PAD5G_CLASS_PTATS2_CORE1      0xf1
-#define RADIO_2057_PGA_BOOSTPTAT_IMAIN_CORE1     0xf2
-#define RADIO_2057_PAD5G_CASCV_IMAIN_CORE1       0xf3
-#define RADIO_2057_TXMIX5G_IBOOST_PAD_IAUX_CORE1 0xf4
-#define RADIO_2057_PGA_BOOST_TUNE_CORE1          0xf5
-#define RADIO_2057_PGA_GAIN_CORE1                0xf6
-#define RADIO_2057_PAD5G_CASCOFFV_GAIN_PUS_CORE1 0xf7
-#define RADIO_2057_TXMIX5G_BOOST_TUNE_CORE1      0xf8
-#define RADIO_2057_PAD5G_TUNE_MISC_PUS_CORE1     0xf9
-#define RADIO_2057_IPA5G_IAUX_CORE1              0xfa
-#define RADIO_2057_IPA5G_GAIN_CORE1              0xfb
-#define RADIO_2057_TSSI5G_SPARE1_CORE1           0xfc
-#define RADIO_2057_TSSI5G_SPARE2_CORE1           0xfd
-#define RADIO_2057_IPA5G_CASCOFFV_PU_CORE1       0xfe
-#define RADIO_2057_IPA5G_PTAT_CORE1              0xff
-#define RADIO_2057_IPA5G_IMAIN_CORE1             0x100
-#define RADIO_2057_IPA5G_CASCONV_CORE1           0x101
-#define RADIO_2057_IPA5G_BIAS_FILTER_CORE1       0x102
-#define RADIO_2057_PAD_BIAS_FILTER_BWS_CORE1     0x105
-#define RADIO_2057_TR2G_CONFIG1_CORE1_NU         0x106
-#define RADIO_2057_TR2G_CONFIG2_CORE1_NU         0x107
-#define RADIO_2057_LNA5G_RFEN_CORE1              0x108
-#define RADIO_2057_TR5G_CONFIG2_CORE1_NU         0x109
-#define RADIO_2057_RXRFBIAS_IBOOST_PU_CORE1      0x10a
-#define RADIO_2057_RXRF_IABAND_RXGM_IMAIN_PTAT_CORE1 0x10b
-#define RADIO_2057_RXGM_CMFBITAIL_AUXPTAT_CORE1  0x10c
-#define RADIO_2057_RXMIX_ICORE_RXGM_IAUX_CORE1   0x10d
-#define RADIO_2057_RXMIX_CMFBITAIL_PU_CORE1      0x10e
-#define RADIO_2057_LNA2_IMAIN_PTAT_PU_CORE1      0x10f
-#define RADIO_2057_LNA2_IAUX_PTAT_CORE1          0x110
-#define RADIO_2057_LNA1_IMAIN_PTAT_PU_CORE1      0x111
-#define RADIO_2057_LNA15G_INPUT_MATCH_TUNE_CORE1 0x112
-#define RADIO_2057_RXRFBIAS_BANDSEL_CORE1        0x113
-#define RADIO_2057_TIA_CONFIG_CORE1              0x114
-#define RADIO_2057_TIA_IQGAIN_CORE1              0x115
-#define RADIO_2057_TIA_IBIAS2_CORE1              0x116
-#define RADIO_2057_TIA_IBIAS1_CORE1              0x117
-#define RADIO_2057_TIA_SPARE_Q_CORE1             0x118
-#define RADIO_2057_TIA_SPARE_I_CORE1             0x119
-#define RADIO_2057_RXMIX2G_PUS_CORE1             0x11a
-#define RADIO_2057_RXMIX2G_VCMREFS_CORE1         0x11b
-#define RADIO_2057_RXMIX2G_LODC_QI_CORE1         0x11c
-#define RADIO_2057_W12G_BW_LNA2G_PUS_CORE1       0x11d
-#define RADIO_2057_LNA2G_GAIN_CORE1              0x11e
-#define RADIO_2057_LNA2G_TUNE_CORE1              0x11f
-#define RADIO_2057_RXMIX5G_PUS_CORE1             0x120
-#define RADIO_2057_RXMIX5G_VCMREFS_CORE1         0x121
-#define RADIO_2057_RXMIX5G_LODC_QI_CORE1         0x122
-#define RADIO_2057_W15G_BW_LNA5G_PUS_CORE1       0x123
-#define RADIO_2057_LNA5G_GAIN_CORE1              0x124
-#define RADIO_2057_LNA5G_TUNE_CORE1              0x125
-#define RADIO_2057_LPFSEL_TXRX_RXBB_PUS_CORE1    0x126
-#define RADIO_2057_RXBB_BIAS_MASTER_CORE1        0x127
-#define RADIO_2057_RXBB_VGABUF_IDACS_CORE1       0x128
-#define RADIO_2057_LPF_VCMREF_TXBUF_VCMREF_CORE1 0x129
-#define RADIO_2057_TXBUF_VINCM_CORE1             0x12a
-#define RADIO_2057_TXBUF_IDACS_CORE1             0x12b
-#define RADIO_2057_LPF_RESP_RXBUF_BW_CORE1       0x12c
-#define RADIO_2057_RXBB_CC_CORE1                 0x12d
-#define RADIO_2057_RXBB_SPARE3_CORE1             0x12e
-#define RADIO_2057_RXBB_RCCAL_HPC_CORE1          0x12f
-#define RADIO_2057_LPF_IDACS_CORE1               0x130
-#define RADIO_2057_LPFBYP_DCLOOP_BYP_IDAC_CORE1  0x131
-#define RADIO_2057_TXBUF_GAIN_CORE1              0x132
-#define RADIO_2057_AFELOOPBACK_AACI_RESP_CORE1   0x133
-#define RADIO_2057_RXBUF_DEGEN_CORE1             0x134
-#define RADIO_2057_RXBB_SPARE2_CORE1             0x135
-#define RADIO_2057_RXBB_SPARE1_CORE1             0x136
-#define RADIO_2057_RSSI_MASTER_CORE1             0x137
-#define RADIO_2057_W2_MASTER_CORE1               0x138
-#define RADIO_2057_NB_MASTER_CORE1               0x139
-#define RADIO_2057_W2_IDACS0_Q_CORE1             0x13a
-#define RADIO_2057_W2_IDACS1_Q_CORE1             0x13b
-#define RADIO_2057_W2_IDACS0_I_CORE1             0x13c
-#define RADIO_2057_W2_IDACS1_I_CORE1             0x13d
-#define RADIO_2057_RSSI_GPAIOSEL_W1_IDACS_CORE1  0x13e
-#define RADIO_2057_NB_IDACS_Q_CORE1              0x13f
-#define RADIO_2057_NB_IDACS_I_CORE1              0x140
-#define RADIO_2057_BACKUP4_CORE1                 0x146
-#define RADIO_2057_BACKUP3_CORE1                 0x147
-#define RADIO_2057_BACKUP2_CORE1                 0x148
-#define RADIO_2057_BACKUP1_CORE1                 0x149
-#define RADIO_2057_SPARE16_CORE1                 0x14a
-#define RADIO_2057_SPARE15_CORE1                 0x14b
-#define RADIO_2057_SPARE14_CORE1                 0x14c
-#define RADIO_2057_SPARE13_CORE1                 0x14d
-#define RADIO_2057_SPARE12_CORE1                 0x14e
-#define RADIO_2057_SPARE11_CORE1                 0x14f
-#define RADIO_2057_TX2G_BIAS_RESETS_CORE1        0x150
-#define RADIO_2057_TX5G_BIAS_RESETS_CORE1        0x151
-#define RADIO_2057_SPARE8_CORE1                  0x152
-#define RADIO_2057_SPARE7_CORE1                  0x153
-#define RADIO_2057_BUFS_MISC_LPFBW_CORE1         0x154
-#define RADIO_2057_TXLPF_RCCAL_CORE1             0x155
-#define RADIO_2057_RXBB_GPAIOSEL_RXLPF_RCCAL_CORE1 0x156
-#define RADIO_2057_LPF_GAIN_CORE1                0x157
-#define RADIO_2057_DACBUF_IDACS_BW_CORE1         0x158
-#define RADIO_2057_DACBUF_VINCM_CORE1            0x159
-#define RADIO_2057_RCCAL_START_R1_Q1_P1          0x15a
-#define RADIO_2057_RCCAL_X1                      0x15b
-#define RADIO_2057_RCCAL_TRC0                    0x15c
-#define RADIO_2057_RCCAL_TRC1                    0x15d
-#define RADIO_2057_RCCAL_DONE_OSCCAP             0x15e
-#define RADIO_2057_RCCAL_N0_0                    0x15f
-#define RADIO_2057_RCCAL_N0_1                    0x160
-#define RADIO_2057_RCCAL_N1_0                    0x161
-#define RADIO_2057_RCCAL_N1_1                    0x162
-#define RADIO_2057_RCAL_STATUS                   0x163
-#define RADIO_2057_XTALPUOVR_PINCTRL             0x164
-#define RADIO_2057_OVR_REG0                      0x165
-#define RADIO_2057_OVR_REG1                      0x166
-#define RADIO_2057_OVR_REG2                      0x167
-#define RADIO_2057_OVR_REG3                      0x168
-#define RADIO_2057_OVR_REG4                      0x169
-#define RADIO_2057_RCCAL_SCAP_VAL                0x16a
-#define RADIO_2057_RCCAL_BCAP_VAL                0x16b
-#define RADIO_2057_RCCAL_HPC_VAL                 0x16c
-#define RADIO_2057_RCCAL_OVERRIDES               0x16d
-#define RADIO_2057_TX0_IQCAL_GAIN_BW             0x170
-#define RADIO_2057_TX0_LOFT_FINE_I               0x171
-#define RADIO_2057_TX0_LOFT_FINE_Q               0x172
-#define RADIO_2057_TX0_LOFT_COARSE_I             0x173
-#define RADIO_2057_TX0_LOFT_COARSE_Q             0x174
-#define RADIO_2057_TX0_TX_SSI_MASTER             0x175
-#define RADIO_2057_TX0_IQCAL_VCM_HG              0x176
-#define RADIO_2057_TX0_IQCAL_IDAC                0x177
-#define RADIO_2057_TX0_TSSI_VCM                  0x178
-#define RADIO_2057_TX0_TX_SSI_MUX                0x179
-#define RADIO_2057_TX0_TSSIA                     0x17a
-#define RADIO_2057_TX0_TSSIG                     0x17b
-#define RADIO_2057_TX0_TSSI_MISC1                0x17c
-#define RADIO_2057_TX0_TXRXCOUPLE_2G_ATTEN       0x17d
-#define RADIO_2057_TX0_TXRXCOUPLE_2G_PWRUP       0x17e
-#define RADIO_2057_TX0_TXRXCOUPLE_5G_ATTEN       0x17f
-#define RADIO_2057_TX0_TXRXCOUPLE_5G_PWRUP       0x180
-#define RADIO_2057_TX1_IQCAL_GAIN_BW             0x190
-#define RADIO_2057_TX1_LOFT_FINE_I               0x191
-#define RADIO_2057_TX1_LOFT_FINE_Q               0x192
-#define RADIO_2057_TX1_LOFT_COARSE_I             0x193
-#define RADIO_2057_TX1_LOFT_COARSE_Q             0x194
-#define RADIO_2057_TX1_TX_SSI_MASTER             0x195
-#define RADIO_2057_TX1_IQCAL_VCM_HG              0x196
-#define RADIO_2057_TX1_IQCAL_IDAC                0x197
-#define RADIO_2057_TX1_TSSI_VCM                  0x198
-#define RADIO_2057_TX1_TX_SSI_MUX                0x199
-#define RADIO_2057_TX1_TSSIA                     0x19a
-#define RADIO_2057_TX1_TSSIG                     0x19b
-#define RADIO_2057_TX1_TSSI_MISC1                0x19c
-#define RADIO_2057_TX1_TXRXCOUPLE_2G_ATTEN       0x19d
-#define RADIO_2057_TX1_TXRXCOUPLE_2G_PWRUP       0x19e
-#define RADIO_2057_TX1_TXRXCOUPLE_5G_ATTEN       0x19f
-#define RADIO_2057_TX1_TXRXCOUPLE_5G_PWRUP       0x1a0
-#define RADIO_2057_AFE_VCM_CAL_MASTER_CORE0      0x1a1
-#define RADIO_2057_AFE_SET_VCM_I_CORE0           0x1a2
-#define RADIO_2057_AFE_SET_VCM_Q_CORE0           0x1a3
-#define RADIO_2057_AFE_STATUS_VCM_IQADC_CORE0    0x1a4
-#define RADIO_2057_AFE_STATUS_VCM_I_CORE0        0x1a5
-#define RADIO_2057_AFE_STATUS_VCM_Q_CORE0        0x1a6
-#define RADIO_2057_AFE_VCM_CAL_MASTER_CORE1      0x1a7
-#define RADIO_2057_AFE_SET_VCM_I_CORE1           0x1a8
-#define RADIO_2057_AFE_SET_VCM_Q_CORE1           0x1a9
-#define RADIO_2057_AFE_STATUS_VCM_IQADC_CORE1    0x1aa
-#define RADIO_2057_AFE_STATUS_VCM_I_CORE1        0x1ab
-#define RADIO_2057_AFE_STATUS_VCM_Q_CORE1        0x1ac
+		acpi_hw_delete_pci_list(list_head);
+	}
 
-#define RADIO_2057v7_DACBUF_VINCM_CORE0          0x1ad
-#define RADIO_2057v7_RCCAL_MASTER                0x1ae
-#define RADIO_2057v7_TR2G_CONFIG3_CORE0_NU       0x1af
-#define RADIO_2057v7_TR2G_CONFIG3_CORE1_NU       0x1b0
-#define RADIO_2057v7_LOGEN_PUS1                  0x1b1
-#define RADIO_2057v7_OVR_REG5                    0x1b2
-#define RADIO_2057v7_OVR_REG6                    0x1b3
-#define RADIO_2057v7_OVR_REG7                    0x1b4
-#define RADIO_2057v7_OVR_REG8                    0x1b5
-#define RADIO_2057v7_OVR_REG9                    0x1b6
-#define RADIO_2057v7_OVR_REG10                   0x1b7
-#define RADIO_2057v7_OVR_REG11                   0x1b8
-#define RADIO_2057v7_OVR_REG12                   0x1b9
-#define RADIO_2057v7_OVR_REG13                   0x1ba
-#define RADIO_2057v7_OVR_REG14                   0x1bb
-#define RADIO_2057v7_OVR_REG15                   0x1bc
-#define RADIO_2057v7_OVR_REG16                   0x1bd
-#define RADIO_2057v7_OVR_REG1                    0x1be
-#define RADIO_2057v7_OVR_REG18                   0x1bf
-#define RADIO_2057v7_OVR_REG19                   0x1c0
-#define RADIO_2057v7_OVR_REG20                   0x1c1
-#define RADIO_2057v7_OVR_REG21                   0x1c2
-#define RADIO_2057v7_OVR_REG2                    0x1c3
-#define RADIO_2057v7_OVR_REG23                   0x1c4
-#define RADIO_2057v7_OVR_REG24                   0x1c5
-#define RADIO_2057v7_OVR_REG25                   0x1c6
-#define RADIO_2057v7_OVR_REG26                   0x1c7
-#define RADIO_2057v7_OVR_REG27                   0x1c8
-#define RADIO_2057v7_OVR_REG28                   0x1c9
-#define RADIO_2057v7_IQTEST_SEL_PU2              0x1ca
+	return_ACPI_STATUS(status);
+}
 
-#define RADIO_2057_VCM_MASK			 0x7
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_build_pci_list
+ *
+ * PARAMETERS:  root_pci_device     - A handle to a PCI device object. This
+ *                                    object is guaranteed to be a PCI Root
+ *                                    Bridge having a _HID value of either
+ *                                    PNP0A03 or PNP0A08
+ *              pci_region          - A handle to the PCI configuration space
+ *                                    Operation Region
+ *              return_list_head    - Where the PCI device list is returned
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Builds a list of devices from the input PCI region up to the
+ *              Root PCI device for this namespace subtree.
+ *
+ ******************************************************************************/
 
-#endif				/* _BRCM_PHY_RADIO_H_ */
+static acpi_status
+acpi_hw_build_pci_list(acpi_handle root_pci_device,
+		       acpi_handle pci_region,
+		       struct acpi_pci_device **return_list_head)
+{
+	acpi_handle current_device;
+	acpi_handle parent_device;
+	acpi_status status;
+	struct acpi_pci_device *list_element;
+
+	/*
+	 * Ascend namespace branch until the root_pci_device is reached, building
+	 * a list of device nodes. Loop will exit when either the PCI device is
+	 * found, or the root of the namespace is reached.
+	 */
+	*return_list_head = NULL;
+	current_device = pci_region;
+	while (1) {
+		status = acpi_get_parent(current_device, &parent_device);
+		if (ACPI_FAILURE(status)) {
+
+			/* Must delete the list before exit */
+
+			acpi_hw_delete_pci_list(*return_list_head);
+			return (status);
+		}
+
+		/* Finished when we reach the PCI root device (PNP0A03 or PNP0A08) */
+
+		if (parent_device == root_pci_device) {
+			return (AE_OK);
+		}
+
+		list_element = ACPI_ALLOCATE(sizeof(struct acpi_pci_device));
+		if (!list_element) {
+
+			/* Must delete the list before exit */
+
+			acpi_hw_delete_pci_list(*return_list_head);
+			return (AE_NO_MEMORY);
+		}
+
+		/* Put new element at the head of the list */
+
+		list_element->next = *return_list_head;
+		list_element->device = parent_device;
+		*return_list_head = list_element;
+
+		current_device = parent_device;
+	}
+}
+
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_process_pci_list
+ *
+ * PARAMETERS:  pci_id              - Initial values for the PCI ID. May be
+ *                                    modified by this function.
+ *              list_head           - Device list created by
+ *                                    acpi_hw_build_pci_list
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Walk downward through the PCI device list, getting the device
+ *              info for each, via the PCI configuration space and updating
+ *              the PCI ID as necessary. Deletes the list during traversal.
+ *
+ ******************************************************************************/
+
+static acpi_status
+acpi_hw_process_pci_list(struct acpi_pci_id *pci_id,
+			 struct acpi_pci_device *list_head)
+{
+	acpi_status status = AE_OK;
+	struct acpi_pci_device *info;
+	u16 bus_number;
+	u8 is_bridge = TRUE;
+
+	ACPI_FUNCTION_NAME(hw_process_pci_list);
+
+	ACPI_DEBUG_PRINT((ACPI_DB_OPREGION,
+			  "Input PciId:  Seg %4.4X Bus %4.4X Dev %4.4X Func %4.4X\n",
+			  pci_id->segment, pci_id->bus, pci_id->device,
+			  pci_id->function));
+
+	bus_number = pci_id->bus;
+
+	/*
+	 * Descend down the namespace tree, collecting PCI device, function,
+	 * and bus numbers. bus_number is only important for PCI bridges.
+	 * Algorithm: As we descend the tree, use the last valid PCI device,
+	 * function, and bus numbers that are discovered, and assign them
+	 * to the PCI ID for the target device.
+	 */
+	info = list_head;
+	while (info) {
+		status = acpi_hw_get_pci_device_info(pci_id, info->device,
+						     &bus_number, &is_bridge);
+		if (ACPI_FAILURE(status)) {
+			return (status);
+		}
+
+		info = info->next;
+	}
+
+	ACPI_DEBUG_PRINT((ACPI_DB_OPREGION,
+			  "Output PciId: Seg %4.4X Bus %4.4X Dev %4.4X Func %4.4X "
+			  "Status %X BusNumber %X IsBridge %X\n",
+			  pci_id->segment, pci_id->bus, pci_id->device,
+			  pci_id->function, status, bus_number, is_bridge));
+
+	return (AE_OK);
+}
+
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_delete_pci_list
+ *
+ * PARAMETERS:  list_head           - Device list created by
+ *                                    acpi_hw_build_pci_list
+ *
+ * RETURN:      None
+ *
+ * DESCRIPTION: Free the entire PCI list.
+ *
+ ******************************************************************************/
+
+static void acpi_hw_delete_pci_list(struct acpi_pci_device *list_head)
+{
+	struct acpi_pci_device *next;
+	struct acpi_pci_device *previous;
+
+	next = list_head;
+	while (next) {
+		previous = next;
+		next = previous->next;
+		ACPI_FREE(previous);
+	}
+}
+
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_get_pci_device_info
+ *
+ * PARAMETERS:  pci_id              - Initial values for the PCI ID. May be
+ *                                    modified by this function.
+ *              pci_device          - Handle for the PCI device object
+ *              bus_number          - Where a PCI bridge bus number is returned
+ *              is_bridge           - Return value, indicates if this PCI
+ *                                    device is a PCI bridge
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Get the device info for a single PCI device object. Get the
+ *              _ADR (contains PCI device and function numbers), and for PCI
+ *              bridge devices, get the bus number from PCI configuration
+ *              space.
+ *
+ ******************************************************************************/
+
+static acpi_status
+acpi_hw_get_pci_device_info(struct acpi_pci_id *pci_id,
+			    acpi_handle pci_device,
+			    u16 *bus_number, u8 *is_bridge)
+{
+	acpi_status status;
+	acpi_object_type object_type;
+	u64 return_value;
+	u64 pci_value;
+
+	/* We only care about objects of type Device */
+
+	status = acpi_get_type(pci_device, &object_type);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	if (object_type != ACPI_TYPE_DEVICE) {
+		return (AE_OK);
+	}
+
+	/* We need an _ADR. Ignore device if not present */
+
+	status = acpi_ut_evaluate_numeric_object(METHOD_NAME__ADR,
+						 pci_device, &return_value);
+	if (ACPI_FAILURE(status)) {
+		return (AE_OK);
+	}
+
+	/*
+	 * From _ADR, get the PCI Device and Function and
+	 * update the PCI ID.
+	 */
+	pci_id->device = ACPI_HIWORD(ACPI_LODWORD(return_value));
+	pci_id->function = ACPI_LOWORD(ACPI_LODWORD(return_value));
+
+	/*
+	 * If the previous device was a bridge, use the previous
+	 * device bus number
+	 */
+	if (*is_bridge) {
+		pci_id->bus = *bus_number;
+	}
+
+	/*
+	 * Get the bus numbers from PCI Config space:
+	 *
+	 * First, get the PCI header_type
+	 */
+	*is_bridge = FALSE;
+	status = acpi_os_read_pci_configuration(pci_id,
+						PCI_CFG_HEADER_TYPE_REG,
+						&pci_value, 8);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	/* We only care about bridges (1=pci_bridge, 2=card_bus_bridge) */
+
+	pci_value &= PCI_HEADER_TYPE_MASK;
+
+	if ((pci_value != PCI_TYPE_BRIDGE) &&
+	    (pci_value != PCI_TYPE_CARDBUS_BRIDGE)) {
+		return (AE_OK);
+	}
+
+	/* Bridge: Get the Primary bus_number */
+
+	status = acpi_os_read_pci_configuration(pci_id,
+						PCI_CFG_PRIMARY_BUS_NUMBER_REG,
+						&pci_value, 8);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	*is_bridge = TRUE;
+	pci_id->bus = (u16)pci_value;
+
+	/* Bridge: Get the Secondary bus_number */
+
+	status = acpi_os_read_pci_configuration(pci_id,
+						PCI_CFG_SECONDARY_BUS_NUMBER_REG,
+						&pci_value, 8);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	*bus_number = (u16)pci_value;
+	return (AE_OK);
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*******************************************************************************
+ *
+ * Module Name: hwregs - Read/write access functions for the various ACPI
+ *                       control and status registers.
+ *
+ ******************************************************************************/
+
+/*
+ * Copyright (C) 2000 - 2015, Intel Corp.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions, and the following disclaimer,
+ *    without modification.
+ * 2. Redistributions in binary form must reproduce at minimum a disclaimer
+ *    substantially similar to the "NO WARRANTY" disclaimer below
+ *    ("Disclaimer") and any redistribution must be conditioned upon
+ *    including a substantially similar Disclaimer requirement for further
+ *    binary redistribution.
+ * 3. Neither the names of the above-listed copyright holders nor the names
+ *    of any contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * Alternatively, this software may be distributed under the terms of the
+ * GNU General Public License ("GPL") version 2 as published by the Free
+ * Software Foundation.
+ *
+ * NO WARRANTY
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * HOLDERS OR CONTRIBUTORS BE LIABLE FOR SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGES.
+ */
+
+#include <acpi/acpi.h>
+#include "accommon.h"
+#include "acevents.h"
+
+#define _COMPONENT          ACPI_HARDWARE
+ACPI_MODULE_NAME("hwregs")
+
+#if (!ACPI_REDUCED_HARDWARE)
+/* Local Prototypes */
+static acpi_status
+acpi_hw_read_multiple(u32 *value,
+		      struct acpi_generic_address *register_a,
+		      struct acpi_generic_address *register_b);
+
+static acpi_status
+acpi_hw_write_multiple(u32 value,
+		       struct acpi_generic_address *register_a,
+		       struct acpi_generic_address *register_b);
+
+#endif				/* !ACPI_REDUCED_HARDWARE */
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_validate_register
+ *
+ * PARAMETERS:  reg                 - GAS register structure
+ *              max_bit_width       - Max bit_width supported (32 or 64)
+ *              address             - Pointer to where the gas->address
+ *                                    is returned
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Validate the contents of a GAS register. Checks the GAS
+ *              pointer, Address, space_id, bit_width, and bit_offset.
+ *
+ ******************************************************************************/
+
+acpi_status
+acpi_hw_validate_register(struct acpi_generic_address *reg,
+			  u8 max_bit_width, u64 *address)
+{
+
+	/* Must have a valid pointer to a GAS structure */
+
+	if (!reg) {
+		return (AE_BAD_PARAMETER);
+	}
+
+	/*
+	 * Copy the target address. This handles possible alignment issues.
+	 * Address must not be null. A null address also indicates an optional
+	 * ACPI register that is not supported, so no error message.
+	 */
+	ACPI_MOVE_64_TO_64(address, &reg->address);
+	if (!(*address)) {
+		return (AE_BAD_ADDRESS);
+	}
+
+	/* Validate the space_ID */
+
+	if ((reg->space_id != ACPI_ADR_SPACE_SYSTEM_MEMORY) &&
+	    (reg->space_id != ACPI_ADR_SPACE_SYSTEM_IO)) {
+		ACPI_ERROR((AE_INFO,
+			    "Unsupported address space: 0x%X", reg->space_id));
+		return (AE_SUPPORT);
+	}
+
+	/* Validate the bit_width */
+
+	if ((reg->bit_width != 8) &&
+	    (reg->bit_width != 16) &&
+	    (reg->bit_width != 32) && (reg->bit_width != max_bit_width)) {
+		ACPI_ERROR((AE_INFO,
+			    "Unsupported register bit width: 0x%X",
+			    reg->bit_width));
+		return (AE_SUPPORT);
+	}
+
+	/* Validate the bit_offset. Just a warning for now. */
+
+	if (reg->bit_offset != 0) {
+		ACPI_WARNING((AE_INFO,
+			      "Unsupported register bit offset: 0x%X",
+			      reg->bit_offset));
+	}
+
+	return (AE_OK);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_read
+ *
+ * PARAMETERS:  value               - Where the value is returned
+ *              reg                 - GAS register structure
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Read from either memory or IO space. This is a 32-bit max
+ *              version of acpi_read, used internally since the overhead of
+ *              64-bit values is not needed.
+ *
+ * LIMITATIONS: <These limitations also apply to acpi_hw_write>
+ *      bit_width must be exactly 8, 16, or 32.
+ *      space_ID must be system_memory or system_IO.
+ *      bit_offset and access_width are currently ignored, as there has
+ *          not been a need to implement these.
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_read(u32 *value, struct acpi_generic_address *reg)
+{
+	u64 address;
+	u64 value64;
+	acpi_status status;
+
+	ACPI_FUNCTION_NAME(hw_read);
+
+	/* Validate contents of the GAS register */
+
+	status = acpi_hw_validate_register(reg, 32, &address);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	/* Initialize entire 32-bit return value to zero */
+
+	*value = 0;
+
+	/*
+	 * Two address spaces supported: Memory or IO. PCI_Config is
+	 * not supported here because the GAS structure is insufficient
+	 */
+	if (reg->space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY) {
+		status = acpi_os_read_memory((acpi_physical_address)
+					     address, &value64, reg->bit_width);
+
+		*value = (u32)value64;
+	} else {		/* ACPI_ADR_SPACE_SYSTEM_IO, validated earlier */
+
+		status = acpi_hw_read_port((acpi_io_address)
+					   address, value, reg->bit_width);
+	}
+
+	ACPI_DEBUG_PRINT((ACPI_DB_IO,
+			  "Read:  %8.8X width %2d from %8.8X%8.8X (%s)\n",
+			  *value, reg->bit_width, ACPI_FORMAT_UINT64(address),
+			  acpi_ut_get_region_name(reg->space_id)));
+
+	return (status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_write
+ *
+ * PARAMETERS:  value               - Value to be written
+ *              reg                 - GAS register structure
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Write to either memory or IO space. This is a 32-bit max
+ *              version of acpi_write, used internally since the overhead of
+ *              64-bit values is not needed.
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_write(u32 value, struct acpi_generic_address *reg)
+{
+	u64 address;
+	acpi_status status;
+
+	ACPI_FUNCTION_NAME(hw_write);
+
+	/* Validate contents of the GAS register */
+
+	status = acpi_hw_validate_register(reg, 32, &address);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	/*
+	 * Two address spaces supported: Memory or IO. PCI_Config is
+	 * not supported here because the GAS structure is insufficient
+	 */
+	if (reg->space_id == ACPI_ADR_SPACE_SYSTEM_MEMORY) {
+		status = acpi_os_write_memory((acpi_physical_address)
+					      address, (u64)value,
+					      reg->bit_width);
+	} else {		/* ACPI_ADR_SPACE_SYSTEM_IO, validated earlier */
+
+		status = acpi_hw_write_port((acpi_io_address)
+					    address, value, reg->bit_width);
+	}
+
+	ACPI_DEBUG_PRINT((ACPI_DB_IO,
+			  "Wrote: %8.8X width %2d   to %8.8X%8.8X (%s)\n",
+			  value, reg->bit_width, ACPI_FORMAT_UINT64(address),
+			  acpi_ut_get_region_name(reg->space_id)));
+
+	return (status);
+}
+
+#if (!ACPI_REDUCED_HARDWARE)
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_clear_acpi_status
+ *
+ * PARAMETERS:  None
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Clears all fixed and general purpose status bits
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_clear_acpi_status(void)
+{
+	acpi_status status;
+	acpi_cpu_flags lock_flags = 0;
+
+	ACPI_FUNCTION_TRACE(hw_clear_acpi_status);
+
+	ACPI_DEBUG_PRINT((ACPI_DB_IO, "About to write %04X to %8.8X%8.8X\n",
+			  ACPI_BITMASK_ALL_FIXED_STATUS,
+			  ACPI_FORMAT_UINT64(acpi_gbl_xpm1a_status.address)));
+
+	raw_spin_lock_irqsave(acpi_gbl_hardware_lock, lock_flags);
+
+	/* Clear the fixed events in PM1 A/B */
+
+	status = acpi_hw_register_write(ACPI_REGISTER_PM1_STATUS,
+					ACPI_BITMASK_ALL_FIXED_STATUS);
+
+	raw_spin_unlock_irqrestore(acpi_gbl_hardware_lock, lock_flags);
+
+	if (ACPI_FAILURE(status)) {
+		goto exit;
+	}
+
+	/* Clear the GPE Bits in all GPE registers in all GPE blocks */
+
+	status = acpi_ev_walk_gpe_list(acpi_hw_clear_gpe_block, NULL);
+
+exit:
+	return_ACPI_STATUS(status);
+}
+
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_get_bit_register_info
+ *
+ * PARAMETERS:  register_id         - Index of ACPI Register to access
+ *
+ * RETURN:      The bitmask to be used when accessing the register
+ *
+ * DESCRIPTION: Map register_id into a register bitmask.
+ *
+ ******************************************************************************/
+
+struct acpi_bit_register_info *acpi_hw_get_bit_register_info(u32 register_id)
+{
+	ACPI_FUNCTION_ENTRY();
+
+	if (register_id > ACPI_BITREG_MAX) {
+		ACPI_ERROR((AE_INFO, "Invalid BitRegister ID: 0x%X",
+			    register_id));
+		return (NULL);
+	}
+
+	return (&acpi_gbl_bit_register_info[register_id]);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_write_pm1_control
+ *
+ * PARAMETERS:  pm1a_control        - Value to be written to PM1A control
+ *              pm1b_control        - Value to be written to PM1B control
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Write the PM1 A/B control registers. These registers are
+ *              different than than the PM1 A/B status and enable registers
+ *              in that different values can be written to the A/B registers.
+ *              Most notably, the SLP_TYP bits can be different, as per the
+ *              values returned from the _Sx predefined methods.
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_write_pm1_control(u32 pm1a_control, u32 pm1b_control)
+{
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(hw_write_pm1_control);
+
+	status =
+	    acpi_hw_write(pm1a_control, &acpi_gbl_FADT.xpm1a_control_block);
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	if (acpi_gbl_FADT.xpm1b_control_block.address) {
+		status =
+		    acpi_hw_write(pm1b_control,
+				  &acpi_gbl_FADT.xpm1b_control_block);
+	}
+	return_ACPI_STATUS(status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_register_read
+ *
+ * PARAMETERS:  register_id         - ACPI Register ID
+ *              return_value        - Where the register value is returned
+ *
+ * RETURN:      Status and the value read.
+ *
+ * DESCRIPTION: Read from the specified ACPI register
+ *
+ ******************************************************************************/
+acpi_status acpi_hw_register_read(u32 register_id, u32 *return_value)
+{
+	u32 value = 0;
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(hw_register_read);
+
+	switch (register_id) {
+	case ACPI_REGISTER_PM1_STATUS:	/* PM1 A/B: 16-bit access each */
+
+		status = acpi_hw_read_multiple(&value,
+					       &acpi_gbl_xpm1a_status,
+					       &acpi_gbl_xpm1b_status);
+		break;
+
+	case ACPI_REGISTER_PM1_ENABLE:	/* PM1 A/B: 16-bit access each */
+
+		status = acpi_hw_read_multiple(&value,
+					       &acpi_gbl_xpm1a_enable,
+					       &acpi_gbl_xpm1b_enable);
+		break;
+
+	case ACPI_REGISTER_PM1_CONTROL:	/* PM1 A/B: 16-bit access each */
+
+		status = acpi_hw_read_multiple(&value,
+					       &acpi_gbl_FADT.
+					       xpm1a_control_block,
+					       &acpi_gbl_FADT.
+					       xpm1b_control_block);
+
+		/*
+		 * Zero the write-only bits. From the ACPI specification, "Hardware
+		 * Write-Only Bits": "Upon reads to registers with write-only bits,
+		 * software masks out all write-only bits."
+		 */
+		value &= ~ACPI_PM1_CONTROL_WRITEONLY_BITS;
+		break;
+
+	case ACPI_REGISTER_PM2_CONTROL:	/* 8-bit access */
+
+		status =
+		    acpi_hw_read(&value, &acpi_gbl_FADT.xpm2_control_block);
+		break;
+
+	case ACPI_REGISTER_PM_TIMER:	/* 32-bit access */
+
+		status = acpi_hw_read(&value, &acpi_gbl_FADT.xpm_timer_block);
+		break;
+
+	case ACPI_REGISTER_SMI_COMMAND_BLOCK:	/* 8-bit access */
+
+		status =
+		    acpi_hw_read_port(acpi_gbl_FADT.smi_command, &value, 8);
+		break;
+
+	default:
+
+		ACPI_ERROR((AE_INFO, "Unknown Register ID: 0x%X", register_id));
+		status = AE_BAD_PARAMETER;
+		break;
+	}
+
+	if (ACPI_SUCCESS(status)) {
+		*return_value = value;
+	}
+
+	return_ACPI_STATUS(status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_register_write
+ *
+ * PARAMETERS:  register_id         - ACPI Register ID
+ *              value               - The value to write
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Write to the specified ACPI register
+ *
+ * NOTE: In accordance with the ACPI specification, this function automatically
+ * preserves the value of the following bits, meaning that these bits cannot be
+ * changed via this interface:
+ *
+ * PM1_CONTROL[0] = SCI_EN
+ * PM1_CONTROL[9]
+ * PM1_STATUS[11]
+ *
+ * ACPI References:
+ * 1) Hardware Ignored Bits: When software writes to a register with ignored
+ *      bit fields, it preserves the ignored bit fields
+ * 2) SCI_EN: OSPM always preserves this bit position
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_register_write(u32 register_id, u32 value)
+{
+	acpi_status status;
+	u32 read_value;
+
+	ACPI_FUNCTION_TRACE(hw_register_write);
+
+	switch (register_id) {
+	case ACPI_REGISTER_PM1_STATUS:	/* PM1 A/B: 16-bit access each */
+		/*
+		 * Handle the "ignored" bit in PM1 Status. According to the ACPI
+		 * specification, ignored bits are to be preserved when writing.
+		 * Normally, this would mean a read/modify/write sequence. However,
+		 * preserving a bit in the status register is different. Writing a
+		 * one clears the status, and writing a zero preserves the status.
+		 * Therefore, we must always write zero to the ignored bit.
+		 *
+		 * This behavior is clarified in the ACPI 4.0 specification.
+		 */
+		value &= ~ACPI_PM1_STATUS_PRESERVED_BITS;
+
+		status = acpi_hw_write_multiple(value,
+						&acpi_gbl_xpm1a_status,
+						&acpi_gbl_xpm1b_status);
+		break;
+
+	case ACPI_REGISTER_PM1_ENABLE:	/* PM1 A/B: 16-bit access each */
+
+		status = acpi_hw_write_multiple(value,
+						&acpi_gbl_xpm1a_enable,
+						&acpi_gbl_xpm1b_enable);
+		break;
+
+	case ACPI_REGISTER_PM1_CONTROL:	/* PM1 A/B: 16-bit access each */
+		/*
+		 * Perform a read first to preserve certain bits (per ACPI spec)
+		 * Note: This includes SCI_EN, we never want to change this bit
+		 */
+		status = acpi_hw_read_multiple(&read_value,
+					       &acpi_gbl_FADT.
+					       xpm1a_control_block,
+					       &acpi_gbl_FADT.
+					       xpm1b_control_block);
+		if (ACPI_FAILURE(status)) {
+			goto exit;
+		}
+
+		/* Insert the bits to be preserved */
+
+		ACPI_INSERT_BITS(value, ACPI_PM1_CONTROL_PRESERVED_BITS,
+				 read_value);
+
+		/* Now we can write the data */
+
+		status = acpi_hw_write_multiple(value,
+						&acpi_gbl_FADT.
+						xpm1a_control_block,
+						&acpi_gbl_FADT.
+						xpm1b_control_block);
+		break;
+
+	case ACPI_REGISTER_PM2_CONTROL:	/* 8-bit access */
+		/*
+		 * For control registers, all reserved bits must be preserved,
+		 * as per the ACPI spec.
+		 */
+		status =
+		    acpi_hw_read(&read_value,
+				 &acpi_gbl_FADT.xpm2_control_block);
+		if (ACPI_FAILURE(status)) {
+			goto exit;
+		}
+
+		/* Insert the bits to be preserved */
+
+		ACPI_INSERT_BITS(value, ACPI_PM2_CONTROL_PRESERVED_BITS,
+				 read_value);
+
+		status =
+		    acpi_hw_write(value, &acpi_gbl_FADT.xpm2_control_block);
+		break;
+
+	case ACPI_REGISTER_PM_TIMER:	/* 32-bit access */
+
+		status = acpi_hw_write(value, &acpi_gbl_FADT.xpm_timer_block);
+		break;
+
+	case ACPI_REGISTER_SMI_COMMAND_BLOCK:	/* 8-bit access */
+
+		/* SMI_CMD is currently always in IO space */
+
+		status =
+		    acpi_hw_write_port(acpi_gbl_FADT.smi_command, value, 8);
+		break;
+
+	default:
+
+		ACPI_ERROR((AE_INFO, "Unknown Register ID: 0x%X", register_id));
+		status = AE_BAD_PARAMETER;
+		break;
+	}
+
+exit:
+	return_ACPI_STATUS(status);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_read_multiple
+ *
+ * PARAMETERS:  value               - Where the register value is returned
+ *              register_a           - First ACPI register (required)
+ *              register_b           - Second ACPI register (optional)
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Read from the specified two-part ACPI register (such as PM1 A/B)
+ *
+ ******************************************************************************/
+
+static acpi_status
+acpi_hw_read_multiple(u32 *value,
+		      struct acpi_generic_address *register_a,
+		      struct acpi_generic_address *register_b)
+{
+	u32 value_a = 0;
+	u32 value_b = 0;
+	acpi_status status;
+
+	/* The first register is always required */
+
+	status = acpi_hw_read(&value_a, register_a);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	/* Second register is optional */
+
+	if (register_b->address) {
+		status = acpi_hw_read(&value_b, register_b);
+		if (ACPI_FAILURE(status)) {
+			return (status);
+		}
+	}
+
+	/*
+	 * OR the two return values together. No shifting or masking is necessary,
+	 * because of how the PM1 registers are defined in the ACPI specification:
+	 *
+	 * "Although the bits can be split between the two register blocks (each
+	 * register block has a unique pointer within the FADT), the bit positions
+	 * are maintained. The register block with unimplemented bits (that is,
+	 * those implemented in the other register block) always returns zeros,
+	 * and writes have no side effects"
+	 */
+	*value = (value_a | value_b);
+	return (AE_OK);
+}
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_write_multiple
+ *
+ * PARAMETERS:  value               - The value to write
+ *              register_a           - First ACPI register (required)
+ *              register_b           - Second ACPI register (optional)
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Write to the specified two-part ACPI register (such as PM1 A/B)
+ *
+ ******************************************************************************/
+
+static acpi_status
+acpi_hw_write_multiple(u32 value,
+		       struct acpi_generic_address *register_a,
+		       struct acpi_generic_address *register_b)
+{
+	acpi_status status;
+
+	/* The first register is always required */
+
+	status = acpi_hw_write(value, register_a);
+	if (ACPI_FAILURE(status)) {
+		return (status);
+	}
+
+	/*
+	 * Second register is optional
+	 *
+	 * No bit shifting or clearing is necessary, because of how the PM1
+	 * registers are defined in the ACPI specification:
+	 *
+	 * "Although the bits can be split between the two register blocks (each
+	 * register block has a unique pointer within the FADT), the bit positions
+	 * are maintained. The register block with unimplemented bits (that is,
+	 * those implemented in the other register block) always returns zeros,
+	 * and writes have no side effects"
+	 */
+	if (register_b->address) {
+		status = acpi_hw_write(value, register_b);
+	}
+
+	return (status);
+}
+
+#endif				/* !ACPI_REDUCED_HARDWARE */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /******************************************************************************
+ *
+ * Name: hwsleep.c - ACPI Hardware Sleep/Wake Support functions for the
+ *                   original/legacy sleep/PM registers.
+ *
+ *****************************************************************************/
+
+/*
+ * Copyright (C) 2000 - 2015, Intel Corp.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions, and the following disclaimer,
+ *    without modification.
+ * 2. Redistributions in binary form must reproduce at minimum a disclaimer
+ *    substantially similar to the "NO WARRANTY" disclaimer below
+ *    ("Disclaimer") and any redistribution must be conditioned upon
+ *    including a substantially similar Disclaimer requirement for further
+ *    binary redistribution.
+ * 3. Neither the names of the above-listed copyright holders nor the names
+ *    of any contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * Alternatively, this software may be distributed under the terms of the
+ * GNU General Public License ("GPL") version 2 as published by the Free
+ * Software Foundation.
+ *
+ * NO WARRANTY
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * HOLDERS OR CONTRIBUTORS BE LIABLE FOR SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGES.
+ */
+
+#include <acpi/acpi.h>
+#include <linux/acpi.h>
+#include "accommon.h"
+
+#define _COMPONENT          ACPI_HARDWARE
+ACPI_MODULE_NAME("hwsleep")
+
+#if (!ACPI_REDUCED_HARDWARE)	/* Entire module */
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_legacy_sleep
+ *
+ * PARAMETERS:  sleep_state         - Which sleep state to enter
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Enter a system sleep state via the legacy FADT PM registers
+ *              THIS FUNCTION MUST BE CALLED WITH INTERRUPTS DISABLED
+ *
+ ******************************************************************************/
+acpi_status acpi_hw_legacy_sleep(u8 sleep_state)
+{
+	struct acpi_bit_register_info *sleep_type_reg_info;
+	struct acpi_bit_register_info *sleep_enable_reg_info;
+	u32 pm1a_control;
+	u32 pm1b_control;
+	u32 in_value;
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(hw_legacy_sleep);
+
+	sleep_type_reg_info =
+	    acpi_hw_get_bit_register_info(ACPI_BITREG_SLEEP_TYPE);
+	sleep_enable_reg_info =
+	    acpi_hw_get_bit_register_info(ACPI_BITREG_SLEEP_ENABLE);
+
+	/* Clear wake status */
+
+	status =
+	    acpi_write_bit_register(ACPI_BITREG_WAKE_STATUS, ACPI_CLEAR_STATUS);
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	/* Clear all fixed and general purpose status bits */
+
+	status = acpi_hw_clear_acpi_status();
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	/*
+	 * 1) Disable/Clear all GPEs
+	 * 2) Enable all wakeup GPEs
+	 */
+	status = acpi_hw_disable_all_gpes();
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+	acpi_gbl_system_awake_and_running = FALSE;
+
+	status = acpi_hw_enable_all_wakeup_gpes();
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	/* Get current value of PM1A control */
+
+	status = acpi_hw_register_read(ACPI_REGISTER_PM1_CONTROL,
+				       &pm1a_control);
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+	ACPI_DEBUG_PRINT((ACPI_DB_INIT,
+			  "Entering sleep state [S%u]\n", sleep_state));
+
+	/* Clear the SLP_EN and SLP_TYP fields */
+
+	pm1a_control &= ~(sleep_type_reg_info->access_bit_mask |
+			  sleep_enable_reg_info->access_bit_mask);
+	pm1b_control = pm1a_control;
+
+	/* Insert the SLP_TYP bits */
+
+	pm1a_control |=
+	    (acpi_gbl_sleep_type_a << sleep_type_reg_info->bit_position);
+	pm1b_control |=
+	    (acpi_gbl_sleep_type_b << sleep_type_reg_info->bit_position);
+
+	/*
+	 * We split the writes of SLP_TYP and SLP_EN to workaround
+	 * poorly implemented hardware.
+	 */
+
+	/* Write #1: write the SLP_TYP data to the PM1 Control registers */
+
+	status = acpi_hw_write_pm1_control(pm1a_control, pm1b_control);
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	/* Insert the sleep enable (SLP_EN) bit */
+
+	pm1a_control |= sleep_enable_reg_info->access_bit_mask;
+	pm1b_control |= sleep_enable_reg_info->access_bit_mask;
+
+	/* Flush caches, as per ACPI specification */
+
+	ACPI_FLUSH_CPU_CACHE();
+
+	status = acpi_os_prepare_sleep(sleep_state, pm1a_control,
+				       pm1b_control);
+	if (ACPI_SKIP(status))
+		return_ACPI_STATUS(AE_OK);
+	if (ACPI_FAILURE(status))
+		return_ACPI_STATUS(status);
+	/* Write #2: Write both SLP_TYP + SLP_EN */
+
+	status = acpi_hw_write_pm1_control(pm1a_control, pm1b_control);
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	if (sleep_state > ACPI_STATE_S3) {
+		/*
+		 * We wanted to sleep > S3, but it didn't happen (by virtue of the
+		 * fact that we are still executing!)
+		 *
+		 * Wait ten seconds, then try again. This is to get S4/S5 to work on
+		 * all machines.
+		 *
+		 * We wait so long to allow chipsets that poll this reg very slowly
+		 * to still read the right value. Ideally, this block would go
+		 * away entirely.
+		 */
+		acpi_os_stall(10 * ACPI_USEC_PER_SEC);
+
+		status = acpi_hw_register_write(ACPI_REGISTER_PM1_CONTROL,
+						sleep_enable_reg_info->
+						access_bit_mask);
+		if (ACPI_FAILURE(status)) {
+			return_ACPI_STATUS(status);
+		}
+	}
+
+	/* Wait for transition back to Working State */
+
+	do {
+		status =
+		    acpi_read_bit_register(ACPI_BITREG_WAKE_STATUS, &in_value);
+		if (ACPI_FAILURE(status)) {
+			return_ACPI_STATUS(status);
+		}
+
+	} while (!in_value);
+
+	return_ACPI_STATUS(AE_OK);
+}
+
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_legacy_wake_prep
+ *
+ * PARAMETERS:  sleep_state         - Which sleep state we just exited
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Perform the first state of OS-independent ACPI cleanup after a
+ *              sleep.
+ *              Called with interrupts ENABLED.
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_legacy_wake_prep(u8 sleep_state)
+{
+	acpi_status status = AE_OK;
+	struct acpi_bit_register_info *sleep_type_reg_info;
+	struct acpi_bit_register_info *sleep_enable_reg_info;
+	u32 pm1a_control;
+	u32 pm1b_control;
+
+	ACPI_FUNCTION_TRACE(hw_legacy_wake_prep);
+
+	/*
+	 * Set SLP_TYPE and SLP_EN to state S0.
+	 * This is unclear from the ACPI Spec, but it is required
+	 * by some machines.
+	 */
+	if (acpi_gbl_sleep_type_a_s0 != ACPI_SLEEP_TYPE_INVALID) {
+		sleep_type_reg_info =
+		    acpi_hw_get_bit_register_info(ACPI_BITREG_SLEEP_TYPE);
+		sleep_enable_reg_info =
+		    acpi_hw_get_bit_register_info(ACPI_BITREG_SLEEP_ENABLE);
+
+		/* Get current value of PM1A control */
+
+		status = acpi_hw_register_read(ACPI_REGISTER_PM1_CONTROL,
+					       &pm1a_control);
+		if (ACPI_SUCCESS(status)) {
+
+			/* Clear the SLP_EN and SLP_TYP fields */
+
+			pm1a_control &= ~(sleep_type_reg_info->access_bit_mask |
+					  sleep_enable_reg_info->
+					  access_bit_mask);
+			pm1b_control = pm1a_control;
+
+			/* Insert the SLP_TYP bits */
+
+			pm1a_control |= (acpi_gbl_sleep_type_a_s0 <<
+					 sleep_type_reg_info->bit_position);
+			pm1b_control |= (acpi_gbl_sleep_type_b_s0 <<
+					 sleep_type_reg_info->bit_position);
+
+			/* Write the control registers and ignore any errors */
+
+			(void)acpi_hw_write_pm1_control(pm1a_control,
+							pm1b_control);
+		}
+	}
+
+	return_ACPI_STATUS(status);
+}
+
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_legacy_wake
+ *
+ * PARAMETERS:  sleep_state         - Which sleep state we just exited
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Perform OS-independent ACPI cleanup after a sleep
+ *              Called with interrupts ENABLED.
+ *
+ ******************************************************************************/
+
+acpi_status acpi_hw_legacy_wake(u8 sleep_state)
+{
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(hw_legacy_wake);
+
+	/* Ensure enter_sleep_state_prep -> enter_sleep_state ordering */
+
+	acpi_gbl_sleep_type_a = ACPI_SLEEP_TYPE_INVALID;
+	acpi_hw_execute_sleep_method(METHOD_PATHNAME__SST, ACPI_SST_WAKING);
+
+	/*
+	 * GPEs must be enabled before _WAK is called as GPEs
+	 * might get fired there
+	 *
+	 * Restore the GPEs:
+	 * 1) Disable/Clear all GPEs
+	 * 2) Enable all runtime GPEs
+	 */
+	status = acpi_hw_disable_all_gpes();
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	status = acpi_hw_enable_all_runtime_gpes();
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	/*
+	 * Now we can execute _WAK, etc. Some machines require that the GPEs
+	 * are enabled before the wake methods are executed.
+	 */
+	acpi_hw_execute_sleep_method(METHOD_PATHNAME__WAK, sleep_state);
+
+	/*
+	 * Some BIOS code assumes that WAK_STS will be cleared on resume
+	 * and use it to determine whether the system is rebooting or
+	 * resuming. Clear WAK_STS for compatibility.
+	 */
+	(void)acpi_write_bit_register(ACPI_BITREG_WAKE_STATUS,
+				      ACPI_CLEAR_STATUS);
+	acpi_gbl_system_awake_and_running = TRUE;
+
+	/* Enable power button */
+
+	(void)
+	    acpi_write_bit_register(acpi_gbl_fixed_event_info
+				    [ACPI_EVENT_POWER_BUTTON].
+				    enable_register_id, ACPI_ENABLE_EVENT);
+
+	(void)
+	    acpi_write_bit_register(acpi_gbl_fixed_event_info
+				    [ACPI_EVENT_POWER_BUTTON].
+				    status_register_id, ACPI_CLEAR_STATUS);
+
+	acpi_hw_execute_sleep_method(METHOD_PATHNAME__SST, ACPI_SST_WORKING);
+	return_ACPI_STATUS(status);
+}
+
+#endif				/* !ACPI_REDUCED_HARDWARE */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         /******************************************************************************
+ *
+ * Name: hwtimer.c - ACPI Power Management Timer Interface
+ *
+ *****************************************************************************/
+
+/*
+ * Copyright (C) 2000 - 2015, Intel Corp.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions, and the following disclaimer,
+ *    without modification.
+ * 2. Redistributions in binary form must reproduce at minimum a disclaimer
+ *    substantially similar to the "NO WARRANTY" disclaimer below
+ *    ("Disclaimer") and any redistribution must be conditioned upon
+ *    including a substantially similar Disclaimer requirement for further
+ *    binary redistribution.
+ * 3. Neither the names of the above-listed copyright holders nor the names
+ *    of any contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * Alternatively, this software may be distributed under the terms of the
+ * GNU General Public License ("GPL") version 2 as published by the Free
+ * Software Foundation.
+ *
+ * NO WARRANTY
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * HOLDERS OR CONTRIBUTORS BE LIABLE FOR SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGES.
+ */
+
+#define EXPORT_ACPI_INTERFACES
+
+#include <acpi/acpi.h>
+#include "accommon.h"
+
+#define _COMPONENT          ACPI_HARDWARE
+ACPI_MODULE_NAME("hwtimer")
+
+#if (!ACPI_REDUCED_HARDWARE)	/* Entire module */
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_get_timer_resolution
+ *
+ * PARAMETERS:  resolution          - Where the resolution is returned
+ *
+ * RETURN:      Status and timer resolution
+ *
+ * DESCRIPTION: Obtains resolution of the ACPI PM Timer (24 or 32 bits).
+ *
+ ******************************************************************************/
+acpi_status acpi_get_timer_resolution(u32 * resolution)
+{
+	ACPI_FUNCTION_TRACE(acpi_get_timer_resolution);
+
+	if (!resolution) {
+		return_ACPI_STATUS(AE_BAD_PARAMETER);
+	}
+
+	if ((acpi_gbl_FADT.flags & ACPI_FADT_32BIT_TIMER) == 0) {
+		*resolution = 24;
+	} else {
+		*resolution = 32;
+	}
+
+	return_ACPI_STATUS(AE_OK);
+}
+
+ACPI_EXPORT_SYMBOL(acpi_get_timer_resolution)
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_get_timer
+ *
+ * PARAMETERS:  ticks               - Where the timer value is returned
+ *
+ * RETURN:      Status and current timer value (ticks)
+ *
+ * DESCRIPTION: Obtains current value of ACPI PM Timer (in ticks).
+ *
+ ******************************************************************************/
+acpi_status acpi_get_timer(u32 * ticks)
+{
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(acpi_get_timer);
+
+	if (!ticks) {
+		return_ACPI_STATUS(AE_BAD_PARAMETER);
+	}
+
+	/* ACPI 5.0A: PM Timer is optional */
+
+	if (!acpi_gbl_FADT.xpm_timer_block.address) {
+		return_ACPI_STATUS(AE_SUPPORT);
+	}
+
+	status = acpi_hw_read(ticks, &acpi_gbl_FADT.xpm_timer_block);
+	return_ACPI_STATUS(status);
+}
+
+ACPI_EXPORT_SYMBOL(acpi_get_timer)
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_get_timer_duration
+ *
+ * PARAMETERS:  start_ticks         - Starting timestamp
+ *              end_ticks           - End timestamp
+ *              time_elapsed        - Where the elapsed time is returned
+ *
+ * RETURN:      Status and time_elapsed
+ *
+ * DESCRIPTION: Computes the time elapsed (in microseconds) between two
+ *              PM Timer time stamps, taking into account the possibility of
+ *              rollovers, the timer resolution, and timer frequency.
+ *
+ *              The PM Timer's clock ticks at roughly 3.6 times per
+ *              _microsecond_, and its clock continues through Cx state
+ *              transitions (unlike many CPU timestamp counters) -- making it
+ *              a versatile and accurate timer.
+ *
+ *              Note that this function accommodates only a single timer
+ *              rollover. Thus for 24-bit timers, this function should only
+ *              be used for calculating durations less than ~4.6 seconds
+ *              (~20 minutes for 32-bit timers) -- calculations below:
+ *
+ *              2**24 Ticks / 3,600,000 Ticks/Sec = 4.66 sec
+ *              2**32 Ticks / 3,600,000 Ticks/Sec = 1193 sec or 19.88 minutes
+ *
+ ******************************************************************************/
+acpi_status
+acpi_get_timer_duration(u32 start_ticks, u32 end_ticks, u32 * time_elapsed)
+{
+	acpi_status status;
+	u32 delta_ticks;
+	u64 quotient;
+
+	ACPI_FUNCTION_TRACE(acpi_get_timer_duration);
+
+	if (!time_elapsed) {
+		return_ACPI_STATUS(AE_BAD_PARAMETER);
+	}
+
+	/* ACPI 5.0A: PM Timer is optional */
+
+	if (!acpi_gbl_FADT.xpm_timer_block.address) {
+		return_ACPI_STATUS(AE_SUPPORT);
+	}
+
+	/*
+	 * Compute Tick Delta:
+	 * Handle (max one) timer rollovers on 24-bit versus 32-bit timers.
+	 */
+	if (start_ticks < end_ticks) {
+		delta_ticks = end_ticks - start_ticks;
+	} else if (start_ticks > end_ticks) {
+		if ((acpi_gbl_FADT.flags & ACPI_FADT_32BIT_TIMER) == 0) {
+
+			/* 24-bit Timer */
+
+			delta_ticks =
+			    (((0x00FFFFFF - start_ticks) +
+			      end_ticks) & 0x00FFFFFF);
+		} else {
+			/* 32-bit Timer */
+
+			delta_ticks = (0xFFFFFFFF - start_ticks) + end_ticks;
+		}
+	} else {		/* start_ticks == end_ticks */
+
+		*time_elapsed = 0;
+		return_ACPI_STATUS(AE_OK);
+	}
+
+	/*
+	 * Compute Duration (Requires a 64-bit multiply and divide):
+	 *
+	 * time_elapsed (microseconds) =
+	 *  (delta_ticks * ACPI_USEC_PER_SEC) / ACPI_PM_TIMER_FREQUENCY;
+	 */
+	status = acpi_ut_short_divide(((u64)delta_ticks) * ACPI_USEC_PER_SEC,
+				      ACPI_PM_TIMER_FREQUENCY, &quotient, NULL);
+
+	*time_elapsed = (u32) quotient;
+	return_ACPI_STATUS(status);
+}
+
+ACPI_EXPORT_SYMBOL(acpi_get_timer_duration)
+#endif				/* !ACPI_REDUCED_HARDWARE */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /******************************************************************************
+ *
+ * Module Name: hwvalid - I/O request validation
+ *
+ *****************************************************************************/
+
+/*
+ * Copyright (C) 2000 - 2015, Intel Corp.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions, and the following disclaimer,
+ *    without modification.
+ * 2. Redistributions in binary form must reproduce at minimum a disclaimer
+ *    substantially similar to the "NO WARRANTY" disclaimer below
+ *    ("Disclaimer") and any redistribution must be conditioned upon
+ *    including a substantially similar Disclaimer requirement for further
+ *    binary redistribution.
+ * 3. Neither the names of the above-listed copyright holders nor the names
+ *    of any contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * Alternatively, this software may be distributed under the terms of the
+ * GNU General Public License ("GPL") version 2 as published by the Free
+ * Software Foundation.
+ *
+ * NO WARRANTY
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ * HOLDERS OR CONTRIBUTORS BE LIABLE FOR SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
+ * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGES.
+ */
+
+#include <acpi/acpi.h>
+#include "accommon.h"
+
+#define _COMPONENT          ACPI_HARDWARE
+ACPI_MODULE_NAME("hwvalid")
+
+/* Local prototypes */
+static acpi_status
+acpi_hw_validate_io_request(acpi_io_address address, u32 bit_width);
+
+/*
+ * Protected I/O ports. Some ports are always illegal, and some are
+ * conditionally illegal. This table must remain ordered by port address.
+ *
+ * The table is used to implement the Microsoft port access rules that
+ * first appeared in Windows XP. Some ports are always illegal, and some
+ * ports are only illegal if the BIOS calls _OSI with a win_XP string or
+ * later (meaning that the BIOS itelf is post-XP.)
+ *
+ * This provides ACPICA with the desired port protections and
+ * Microsoft compatibility.
+ *
+ * Description of port entries:
+ *  DMA:   DMA controller
+ *  PIC0:  Programmable Interrupt Controller (8259A)
+ *  PIT1:  System Timer 1
+ *  PIT2:  System Timer 2 failsafe
+ *  RTC:   Real-time clock
+ *  CMOS:  Extended CMOS
+ *  DMA1:  DMA 1 page registers
+ *  DMA1L: DMA 1 Ch 0 low page
+ *  DMA2:  DMA 2 page registers
+ *  DMA2L: DMA 2 low page refresh
+ *  ARBC:  Arbitration control
+ *  SETUP: Reserved system board setup
+ *  POS:   POS channel select
+ *  PIC1:  Cascaded PIC
+ *  IDMA:  ISA DMA
+ *  ELCR:  PIC edge/level registers
+ *  PCI:   PCI configuration space
+ */
+static const struct acpi_port_info acpi_protected_ports[] = {
+	{"DMA", 0x0000, 0x000F, ACPI_OSI_WIN_XP},
+	{"PIC0", 0x0020, 0x0021, ACPI_ALWAYS_ILLEGAL},
+	{"PIT1", 0x0040, 0x0043, ACPI_OSI_WIN_XP},
+	{"PIT2", 0x0048, 0x004B, ACPI_OSI_WIN_XP},
+	{"RTC", 0x0070, 0x0071, ACPI_OSI_WIN_XP},
+	{"CMOS", 0x0074, 0x0076, ACPI_OSI_WIN_XP},
+	{"DMA1", 0x0081, 0x0083, ACPI_OSI_WIN_XP},
+	{"DMA1L", 0x0087, 0x0087, ACPI_OSI_WIN_XP},
+	{"DMA2", 0x0089, 0x008B, ACPI_OSI_WIN_XP},
+	{"DMA2L", 0x008F, 0x008F, ACPI_OSI_WIN_XP},
+	{"ARBC", 0x0090, 0x0091, ACPI_OSI_WIN_XP},
+	{"SETUP", 0x0093, 0x0094, ACPI_OSI_WIN_XP},
+	{"POS", 0x0096, 0x0097, ACPI_OSI_WIN_XP},
+	{"PIC1", 0x00A0, 0x00A1, ACPI_ALWAYS_ILLEGAL},
+	{"IDMA", 0x00C0, 0x00DF, ACPI_OSI_WIN_XP},
+	{"ELCR", 0x04D0, 0x04D1, ACPI_ALWAYS_ILLEGAL},
+	{"PCI", 0x0CF8, 0x0CFF, ACPI_OSI_WIN_XP}
+};
+
+#define ACPI_PORT_INFO_ENTRIES  ACPI_ARRAY_LENGTH (acpi_protected_ports)
+
+/******************************************************************************
+ *
+ * FUNCTION:    acpi_hw_validate_io_request
+ *
+ * PARAMETERS:  Address             Address of I/O port/register
+ *              bit_width           Number of bits (8,16,32)
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Validates an I/O request (address/length). Certain ports are
+ *              always illegal and some ports are only illegal depending on
+ *              the requests the BIOS AML code makes to the predefined
+ *              _OSI method.
+ *
+ ******************************************************************************/
+
+static acpi_status
+acpi_hw_validate_io_request(acpi_io_address address, u32 bit_width)
+{
+	u32 i;
+	u32 byte_width;
+	acpi_io_address last_address;
+	const struct acpi_port_info *port_info;
+
+	ACPI_FUNCTION_TRACE(hw_validate_io_request);
+
+	/* Supported widths are 8/16/32 */
+
+	if ((bit_width != 8) && (bit_width != 16) && (bit_width

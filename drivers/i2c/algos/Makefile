@@ -1,9 +1,7 @@
-#
-# Makefile for the i2c algorithms
-#
+_EAGER_TID_ID QLOGIC_IB_I_TID_MASK
+#define QIB_MULTICAST_QPN 0xFFFFFF
 
-obj-$(CONFIG_I2C_ALGOBIT)	+= i2c-algo-bit.o
-obj-$(CONFIG_I2C_ALGOPCF)	+= i2c-algo-pcf.o
-obj-$(CONFIG_I2C_ALGOPCA)	+= i2c-algo-pca.o
-
-ccflags-$(CONFIG_I2C_DEBUG_ALGO) := -DDEBUG
+/* Receive Header Queue: receive type (from qlogic_ib) */
+#define RCVHQ_RCV_TYPE_EXPECTED  0
+#define RCVHQ_RCV_TYPE_EAGER     1
+#define RCVHQ_RCV

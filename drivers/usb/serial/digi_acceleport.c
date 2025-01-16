@@ -1,1552 +1,760 @@
-/*
-*  Digi AccelePort USB-4 and USB-2 Serial Converters
-*
-*  Copyright 2000 by Digi International
-*
-*  This program is free software; you can redistribute it and/or modify
-*  it under the terms of the GNU General Public License as published by
-*  the Free Software Foundation; either version 2 of the License, or
-*  (at your option) any later version.
-*
-*  Shamelessly based on Brian Warner's keyspan_pda.c and Greg Kroah-Hartman's
-*  usb-serial driver.
-*
-*  Peter Berger (pberger@brimson.com)
-*  Al Borchers (borchers@steinerpoint.com)
-*/
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/spinlock.h>
-#include <linux/uaccess.h>
-#include <linux/usb.h>
-#include <linux/wait.h>
-#include <linux/usb/serial.h>
-
-/* Defines */
-
-#define DRIVER_AUTHOR "Peter Berger <pberger@brimson.com>, Al Borchers <borchers@steinerpoint.com>"
-#define DRIVER_DESC "Digi AccelePort USB-2/USB-4 Serial Converter driver"
-
-/* port output buffer length -- must be <= transfer buffer length - 2 */
-/* so we can be sure to send the full buffer in one urb */
-#define DIGI_OUT_BUF_SIZE		8
-
-/* port input buffer length -- must be >= transfer buffer length - 3 */
-/* so we can be sure to hold at least one full buffer from one urb */
-#define DIGI_IN_BUF_SIZE		64
-
-/* retry timeout while sleeping */
-#define DIGI_RETRY_TIMEOUT		(HZ/10)
-
-/* timeout while waiting for tty output to drain in close */
-/* this delay is used twice in close, so the total delay could */
-/* be twice this value */
-#define DIGI_CLOSE_TIMEOUT		(5*HZ)
-
-
-/* AccelePort USB Defines */
-
-/* ids */
-#define DIGI_VENDOR_ID			0x05c5
-#define DIGI_2_ID			0x0002	/* USB-2 */
-#define DIGI_4_ID			0x0004	/* USB-4 */
-
-/* commands
- * "INB": can be used on the in-band endpoint
- * "OOB": can be used on the out-of-band endpoint
- */
-#define DIGI_CMD_SET_BAUD_RATE			0	/* INB, OOB */
-#define DIGI_CMD_SET_WORD_SIZE			1	/* INB, OOB */
-#define DIGI_CMD_SET_PARITY			2	/* INB, OOB */
-#define DIGI_CMD_SET_STOP_BITS			3	/* INB, OOB */
-#define DIGI_CMD_SET_INPUT_FLOW_CONTROL		4	/* INB, OOB */
-#define DIGI_CMD_SET_OUTPUT_FLOW_CONTROL	5	/* INB, OOB */
-#define DIGI_CMD_SET_DTR_SIGNAL			6	/* INB, OOB */
-#define DIGI_CMD_SET_RTS_SIGNAL			7	/* INB, OOB */
-#define DIGI_CMD_READ_INPUT_SIGNALS		8	/*      OOB */
-#define DIGI_CMD_IFLUSH_FIFO			9	/*      OOB */
-#define DIGI_CMD_RECEIVE_ENABLE			10	/* INB, OOB */
-#define DIGI_CMD_BREAK_CONTROL			11	/* INB, OOB */
-#define DIGI_CMD_LOCAL_LOOPBACK			12	/* INB, OOB */
-#define DIGI_CMD_TRANSMIT_IDLE			13	/* INB, OOB */
-#define DIGI_CMD_READ_UART_REGISTER		14	/*      OOB */
-#define DIGI_CMD_WRITE_UART_REGISTER		15	/* INB, OOB */
-#define DIGI_CMD_AND_UART_REGISTER		16	/* INB, OOB */
-#define DIGI_CMD_OR_UART_REGISTER		17	/* INB, OOB */
-#define DIGI_CMD_SEND_DATA			18	/* INB      */
-#define DIGI_CMD_RECEIVE_DATA			19	/* INB      */
-#define DIGI_CMD_RECEIVE_DISABLE		20	/* INB      */
-#define DIGI_CMD_GET_PORT_TYPE			21	/*      OOB */
-
-/* baud rates */
-#define DIGI_BAUD_50				0
-#define DIGI_BAUD_75				1
-#define DIGI_BAUD_110				2
-#define DIGI_BAUD_150				3
-#define DIGI_BAUD_200				4
-#define DIGI_BAUD_300				5
-#define DIGI_BAUD_600				6
-#define DIGI_BAUD_1200				7
-#define DIGI_BAUD_1800				8
-#define DIGI_BAUD_2400				9
-#define DIGI_BAUD_4800				10
-#define DIGI_BAUD_7200				11
-#define DIGI_BAUD_9600				12
-#define DIGI_BAUD_14400				13
-#define DIGI_BAUD_19200				14
-#define DIGI_BAUD_28800				15
-#define DIGI_BAUD_38400				16
-#define DIGI_BAUD_57600				17
-#define DIGI_BAUD_76800				18
-#define DIGI_BAUD_115200			19
-#define DIGI_BAUD_153600			20
-#define DIGI_BAUD_230400			21
-#define DIGI_BAUD_460800			22
-
-/* arguments */
-#define DIGI_WORD_SIZE_5			0
-#define DIGI_WORD_SIZE_6			1
-#define DIGI_WORD_SIZE_7			2
-#define DIGI_WORD_SIZE_8			3
-
-#define DIGI_PARITY_NONE			0
-#define DIGI_PARITY_ODD				1
-#define DIGI_PARITY_EVEN			2
-#define DIGI_PARITY_MARK			3
-#define DIGI_PARITY_SPACE			4
-
-#define DIGI_STOP_BITS_1			0
-#define DIGI_STOP_BITS_2			1
-
-#define DIGI_INPUT_FLOW_CONTROL_XON_XOFF	1
-#define DIGI_INPUT_FLOW_CONTROL_RTS		2
-#define DIGI_INPUT_FLOW_CONTROL_DTR		4
-
-#define DIGI_OUTPUT_FLOW_CONTROL_XON_XOFF	1
-#define DIGI_OUTPUT_FLOW_CONTROL_CTS		2
-#define DIGI_OUTPUT_FLOW_CONTROL_DSR		4
-
-#define DIGI_DTR_INACTIVE			0
-#define DIGI_DTR_ACTIVE				1
-#define DIGI_DTR_INPUT_FLOW_CONTROL		2
-
-#define DIGI_RTS_INACTIVE			0
-#define DIGI_RTS_ACTIVE				1
-#define DIGI_RTS_INPUT_FLOW_CONTROL		2
-#define DIGI_RTS_TOGGLE				3
-
-#define DIGI_FLUSH_TX				1
-#define DIGI_FLUSH_RX				2
-#define DIGI_RESUME_TX				4 /* clears xoff condition */
-
-#define DIGI_TRANSMIT_NOT_IDLE			0
-#define DIGI_TRANSMIT_IDLE			1
-
-#define DIGI_DISABLE				0
-#define DIGI_ENABLE				1
-
-#define DIGI_DEASSERT				0
-#define DIGI_ASSERT				1
-
-/* in band status codes */
-#define DIGI_OVERRUN_ERROR			4
-#define DIGI_PARITY_ERROR			8
-#define DIGI_FRAMING_ERROR			16
-#define DIGI_BREAK_ERROR			32
-
-/* out of band status */
-#define DIGI_NO_ERROR				0
-#define DIGI_BAD_FIRST_PARAMETER		1
-#define DIGI_BAD_SECOND_PARAMETER		2
-#define DIGI_INVALID_LINE			3
-#define DIGI_INVALID_OPCODE			4
-
-/* input signals */
-#define DIGI_READ_INPUT_SIGNALS_SLOT		1
-#define DIGI_READ_INPUT_SIGNALS_ERR		2
-#define DIGI_READ_INPUT_SIGNALS_BUSY		4
-#define DIGI_READ_INPUT_SIGNALS_PE		8
-#define DIGI_READ_INPUT_SIGNALS_CTS		16
-#define DIGI_READ_INPUT_SIGNALS_DSR		32
-#define DIGI_READ_INPUT_SIGNALS_RI		64
-#define DIGI_READ_INPUT_SIGNALS_DCD		128
-
-
-/* Structures */
-
-struct digi_serial {
-	spinlock_t ds_serial_lock;
-	struct usb_serial_port *ds_oob_port;	/* out-of-band port */
-	int ds_oob_port_num;			/* index of out-of-band port */
-	int ds_device_started;
-};
-
-struct digi_port {
-	spinlock_t dp_port_lock;
-	int dp_port_num;
-	int dp_out_buf_len;
-	unsigned char dp_out_buf[DIGI_OUT_BUF_SIZE];
-	int dp_write_urb_in_use;
-	unsigned int dp_modem_signals;
-	int dp_transmit_idle;
-	wait_queue_head_t dp_transmit_idle_wait;
-	int dp_throttled;
-	int dp_throttle_restart;
-	wait_queue_head_t dp_flush_wait;
-	wait_queue_head_t dp_close_wait;	/* wait queue for close */
-	struct usb_serial_port *dp_port;
-};
-
-
-/* Local Function Declarations */
-
-static int digi_write_oob_command(struct usb_serial_port *port,
-	unsigned char *buf, int count, int interruptible);
-static int digi_write_inb_command(struct usb_serial_port *port,
-	unsigned char *buf, int count, unsigned long timeout);
-static int digi_set_modem_signals(struct usb_serial_port *port,
-	unsigned int modem_signals, int interruptible);
-static int digi_transmit_idle(struct usb_serial_port *port,
-	unsigned long timeout);
-static void digi_rx_throttle(struct tty_struct *tty);
-static void digi_rx_unthrottle(struct tty_struct *tty);
-static void digi_set_termios(struct tty_struct *tty,
-		struct usb_serial_port *port, struct ktermios *old_termios);
-static void digi_break_ctl(struct tty_struct *tty, int break_state);
-static int digi_tiocmget(struct tty_struct *tty);
-static int digi_tiocmset(struct tty_struct *tty, unsigned int set,
-		unsigned int clear);
-static int digi_write(struct tty_struct *tty, struct usb_serial_port *port,
-		const unsigned char *buf, int count);
-static void digi_write_bulk_callback(struct urb *urb);
-static int digi_write_room(struct tty_struct *tty);
-static int digi_chars_in_buffer(struct tty_struct *tty);
-static int digi_open(struct tty_struct *tty, struct usb_serial_port *port);
-static void digi_close(struct usb_serial_port *port);
-static void digi_dtr_rts(struct usb_serial_port *port, int on);
-static int digi_startup_device(struct usb_serial *serial);
-static int digi_startup(struct usb_serial *serial);
-static void digi_disconnect(struct usb_serial *serial);
-static void digi_release(struct usb_serial *serial);
-static int digi_port_probe(struct usb_serial_port *port);
-static int digi_port_remove(struct usb_serial_port *port);
-static void digi_read_bulk_callback(struct urb *urb);
-static int digi_read_inb_callback(struct urb *urb);
-static int digi_read_oob_callback(struct urb *urb);
-
-
-static const struct usb_device_id id_table_combined[] = {
-	{ USB_DEVICE(DIGI_VENDOR_ID, DIGI_2_ID) },
-	{ USB_DEVICE(DIGI_VENDOR_ID, DIGI_4_ID) },
-	{ }						/* Terminating entry */
-};
-
-static const struct usb_device_id id_table_2[] = {
-	{ USB_DEVICE(DIGI_VENDOR_ID, DIGI_2_ID) },
-	{ }						/* Terminating entry */
-};
-
-static const struct usb_device_id id_table_4[] = {
-	{ USB_DEVICE(DIGI_VENDOR_ID, DIGI_4_ID) },
-	{ }						/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, id_table_combined);
-
-/* device info needed for the Digi serial converter */
-
-static struct usb_serial_driver digi_acceleport_2_device = {
-	.driver = {
-		.owner =		THIS_MODULE,
-		.name =			"digi_2",
-	},
-	.description =			"Digi 2 port USB adapter",
-	.id_table =			id_table_2,
-	.num_ports =			3,
-	.open =				digi_open,
-	.close =			digi_close,
-	.dtr_rts =			digi_dtr_rts,
-	.write =			digi_write,
-	.write_room =			digi_write_room,
-	.write_bulk_callback = 		digi_write_bulk_callback,
-	.read_bulk_callback =		digi_read_bulk_callback,
-	.chars_in_buffer =		digi_chars_in_buffer,
-	.throttle =			digi_rx_throttle,
-	.unthrottle =			digi_rx_unthrottle,
-	.set_termios =			digi_set_termios,
-	.break_ctl =			digi_break_ctl,
-	.tiocmget =			digi_tiocmget,
-	.tiocmset =			digi_tiocmset,
-	.attach =			digi_startup,
-	.disconnect =			digi_disconnect,
-	.release =			digi_release,
-	.port_probe =			digi_port_probe,
-	.port_remove =			digi_port_remove,
-};
-
-static struct usb_serial_driver digi_acceleport_4_device = {
-	.driver = {
-		.owner =		THIS_MODULE,
-		.name =			"digi_4",
-	},
-	.description =			"Digi 4 port USB adapter",
-	.id_table =			id_table_4,
-	.num_ports =			4,
-	.open =				digi_open,
-	.close =			digi_close,
-	.write =			digi_write,
-	.write_room =			digi_write_room,
-	.write_bulk_callback = 		digi_write_bulk_callback,
-	.read_bulk_callback =		digi_read_bulk_callback,
-	.chars_in_buffer =		digi_chars_in_buffer,
-	.throttle =			digi_rx_throttle,
-	.unthrottle =			digi_rx_unthrottle,
-	.set_termios =			digi_set_termios,
-	.break_ctl =			digi_break_ctl,
-	.tiocmget =			digi_tiocmget,
-	.tiocmset =			digi_tiocmset,
-	.attach =			digi_startup,
-	.disconnect =			digi_disconnect,
-	.release =			digi_release,
-	.port_probe =			digi_port_probe,
-	.port_remove =			digi_port_remove,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&digi_acceleport_2_device, &digi_acceleport_4_device, NULL
-};
-
-/* Functions */
-
-/*
- *  Cond Wait Interruptible Timeout Irqrestore
- *
- *  Do spin_unlock_irqrestore and interruptible_sleep_on_timeout
- *  so that wake ups are not lost if they occur between the unlock
- *  and the sleep.  In other words, spin_unlock_irqrestore and
- *  interruptible_sleep_on_timeout are "atomic" with respect to
- *  wake ups.  This is used to implement condition variables.
- *
- *  interruptible_sleep_on_timeout is deprecated and has been replaced
- *  with the equivalent code.
- */
-
-static long cond_wait_interruptible_timeout_irqrestore(
-	wait_queue_head_t *q, long timeout,
-	spinlock_t *lock, unsigned long flags)
-__releases(lock)
-{
-	DEFINE_WAIT(wait);
-
-	prepare_to_wait(q, &wait, TASK_INTERRUPTIBLE);
-	spin_unlock_irqrestore(lock, flags);
-	timeout = schedule_timeout(timeout);
-	finish_wait(q, &wait);
-
-	return timeout;
-}
-
-/*
- *  Digi Write OOB Command
- *
- *  Write commands on the out of band port.  Commands are 4
- *  bytes each, multiple commands can be sent at once, and
- *  no command will be split across USB packets.  Returns 0
- *  if successful, -EINTR if interrupted while sleeping and
- *  the interruptible flag is true, or a negative error
- *  returned by usb_submit_urb.
- */
-
-static int digi_write_oob_command(struct usb_serial_port *port,
-	unsigned char *buf, int count, int interruptible)
-{
-	int ret = 0;
-	int len;
-	struct usb_serial_port *oob_port = (struct usb_serial_port *)((struct digi_serial *)(usb_get_serial_data(port->serial)))->ds_oob_port;
-	struct digi_port *oob_priv = usb_get_serial_port_data(oob_port);
-	unsigned long flags = 0;
-
-	dev_dbg(&port->dev,
-		"digi_write_oob_command: TOP: port=%d, count=%d\n",
-		oob_priv->dp_port_num, count);
-
-	spin_lock_irqsave(&oob_priv->dp_port_lock, flags);
-	while (count > 0) {
-		while (oob_priv->dp_write_urb_in_use) {
-			cond_wait_interruptible_timeout_irqrestore(
-				&oob_port->write_wait, DIGI_RETRY_TIMEOUT,
-				&oob_priv->dp_port_lock, flags);
-			if (interruptible && signal_pending(current))
-				return -EINTR;
-			spin_lock_irqsave(&oob_priv->dp_port_lock, flags);
-		}
-
-		/* len must be a multiple of 4, so commands are not split */
-		len = min(count, oob_port->bulk_out_size);
-		if (len > 4)
-			len &= ~3;
-		memcpy(oob_port->write_urb->transfer_buffer, buf, len);
-		oob_port->write_urb->transfer_buffer_length = len;
-		ret = usb_submit_urb(oob_port->write_urb, GFP_ATOMIC);
-		if (ret == 0) {
-			oob_priv->dp_write_urb_in_use = 1;
-			count -= len;
-			buf += len;
-		}
-	}
-	spin_unlock_irqrestore(&oob_priv->dp_port_lock, flags);
-	if (ret)
-		dev_err(&port->dev, "%s: usb_submit_urb failed, ret=%d\n",
-			__func__, ret);
-	return ret;
-
-}
-
-
-/*
- *  Digi Write In Band Command
- *
- *  Write commands on the given port.  Commands are 4
- *  bytes each, multiple commands can be sent at once, and
- *  no command will be split across USB packets.  If timeout
- *  is non-zero, write in band command will return after
- *  waiting unsuccessfully for the URB status to clear for
- *  timeout ticks.  Returns 0 if successful, or a negative
- *  error returned by digi_write.
- */
-
-static int digi_write_inb_command(struct usb_serial_port *port,
-	unsigned char *buf, int count, unsigned long timeout)
-{
-	int ret = 0;
-	int len;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	unsigned char *data = port->write_urb->transfer_buffer;
-	unsigned long flags = 0;
-
-	dev_dbg(&port->dev, "digi_write_inb_command: TOP: port=%d, count=%d\n",
-		priv->dp_port_num, count);
-
-	if (timeout)
-		timeout += jiffies;
-	else
-		timeout = ULONG_MAX;
-
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-	while (count > 0 && ret == 0) {
-		while (priv->dp_write_urb_in_use &&
-		       time_before(jiffies, timeout)) {
-			cond_wait_interruptible_timeout_irqrestore(
-				&port->write_wait, DIGI_RETRY_TIMEOUT,
-				&priv->dp_port_lock, flags);
-			if (signal_pending(current))
-				return -EINTR;
-			spin_lock_irqsave(&priv->dp_port_lock, flags);
-		}
-
-		/* len must be a multiple of 4 and small enough to */
-		/* guarantee the write will send buffered data first, */
-		/* so commands are in order with data and not split */
-		len = min(count, port->bulk_out_size-2-priv->dp_out_buf_len);
-		if (len > 4)
-			len &= ~3;
-
-		/* write any buffered data first */
-		if (priv->dp_out_buf_len > 0) {
-			data[0] = DIGI_CMD_SEND_DATA;
-			data[1] = priv->dp_out_buf_len;
-			memcpy(data + 2, priv->dp_out_buf,
-				priv->dp_out_buf_len);
-			memcpy(data + 2 + priv->dp_out_buf_len, buf, len);
-			port->write_urb->transfer_buffer_length
-				= priv->dp_out_buf_len + 2 + len;
-		} else {
-			memcpy(data, buf, len);
-			port->write_urb->transfer_buffer_length = len;
-		}
-
-		ret = usb_submit_urb(port->write_urb, GFP_ATOMIC);
-		if (ret == 0) {
-			priv->dp_write_urb_in_use = 1;
-			priv->dp_out_buf_len = 0;
-			count -= len;
-			buf += len;
-		}
-
-	}
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-
-	if (ret)
-		dev_err(&port->dev,
-			"%s: usb_submit_urb failed, ret=%d, port=%d\n",
-			__func__, ret, priv->dp_port_num);
-	return ret;
-}
-
-
-/*
- *  Digi Set Modem Signals
- *
- *  Sets or clears DTR and RTS on the port, according to the
- *  modem_signals argument.  Use TIOCM_DTR and TIOCM_RTS flags
- *  for the modem_signals argument.  Returns 0 if successful,
- *  -EINTR if interrupted while sleeping, or a non-zero error
- *  returned by usb_submit_urb.
- */
-
-static int digi_set_modem_signals(struct usb_serial_port *port,
-	unsigned int modem_signals, int interruptible)
-{
-
-	int ret;
-	struct digi_port *port_priv = usb_get_serial_port_data(port);
-	struct usb_serial_port *oob_port = (struct usb_serial_port *) ((struct digi_serial *)(usb_get_serial_data(port->serial)))->ds_oob_port;
-	struct digi_port *oob_priv = usb_get_serial_port_data(oob_port);
-	unsigned char *data = oob_port->write_urb->transfer_buffer;
-	unsigned long flags = 0;
-
-
-	dev_dbg(&port->dev,
-		"digi_set_modem_signals: TOP: port=%d, modem_signals=0x%x\n",
-		port_priv->dp_port_num, modem_signals);
-
-	spin_lock_irqsave(&oob_priv->dp_port_lock, flags);
-	spin_lock(&port_priv->dp_port_lock);
-
-	while (oob_priv->dp_write_urb_in_use) {
-		spin_unlock(&port_priv->dp_port_lock);
-		cond_wait_interruptible_timeout_irqrestore(
-			&oob_port->write_wait, DIGI_RETRY_TIMEOUT,
-			&oob_priv->dp_port_lock, flags);
-		if (interruptible && signal_pending(current))
-			return -EINTR;
-		spin_lock_irqsave(&oob_priv->dp_port_lock, flags);
-		spin_lock(&port_priv->dp_port_lock);
-	}
-	data[0] = DIGI_CMD_SET_DTR_SIGNAL;
-	data[1] = port_priv->dp_port_num;
-	data[2] = (modem_signals & TIOCM_DTR) ?
-					DIGI_DTR_ACTIVE : DIGI_DTR_INACTIVE;
-	data[3] = 0;
-	data[4] = DIGI_CMD_SET_RTS_SIGNAL;
-	data[5] = port_priv->dp_port_num;
-	data[6] = (modem_signals & TIOCM_RTS) ?
-					DIGI_RTS_ACTIVE : DIGI_RTS_INACTIVE;
-	data[7] = 0;
-
-	oob_port->write_urb->transfer_buffer_length = 8;
-
-	ret = usb_submit_urb(oob_port->write_urb, GFP_ATOMIC);
-	if (ret == 0) {
-		oob_priv->dp_write_urb_in_use = 1;
-		port_priv->dp_modem_signals =
-			(port_priv->dp_modem_signals&~(TIOCM_DTR|TIOCM_RTS))
-			| (modem_signals&(TIOCM_DTR|TIOCM_RTS));
-	}
-	spin_unlock(&port_priv->dp_port_lock);
-	spin_unlock_irqrestore(&oob_priv->dp_port_lock, flags);
-	if (ret)
-		dev_err(&port->dev, "%s: usb_submit_urb failed, ret=%d\n",
-			__func__, ret);
-	return ret;
-}
-
-/*
- *  Digi Transmit Idle
- *
- *  Digi transmit idle waits, up to timeout ticks, for the transmitter
- *  to go idle.  It returns 0 if successful or a negative error.
- *
- *  There are race conditions here if more than one process is calling
- *  digi_transmit_idle on the same port at the same time.  However, this
- *  is only called from close, and only one process can be in close on a
- *  port at a time, so its ok.
- */
-
-static int digi_transmit_idle(struct usb_serial_port *port,
-	unsigned long timeout)
-{
-	int ret;
-	unsigned char buf[2];
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	unsigned long flags = 0;
-
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-	priv->dp_transmit_idle = 0;
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-
-	buf[0] = DIGI_CMD_TRANSMIT_IDLE;
-	buf[1] = 0;
-
-	timeout += jiffies;
-
-	ret = digi_write_inb_command(port, buf, 2, timeout - jiffies);
-	if (ret != 0)
-		return ret;
-
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-
-	while (time_before(jiffies, timeout) && !priv->dp_transmit_idle) {
-		cond_wait_interruptible_timeout_irqrestore(
-			&priv->dp_transmit_idle_wait, DIGI_RETRY_TIMEOUT,
-			&priv->dp_port_lock, flags);
-		if (signal_pending(current))
-			return -EINTR;
-		spin_lock_irqsave(&priv->dp_port_lock, flags);
-	}
-	priv->dp_transmit_idle = 0;
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-	return 0;
-
-}
-
-
-static void digi_rx_throttle(struct tty_struct *tty)
-{
-	unsigned long flags;
-	struct usb_serial_port *port = tty->driver_data;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-
-	/* stop receiving characters by not resubmitting the read urb */
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-	priv->dp_throttled = 1;
-	priv->dp_throttle_restart = 0;
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-}
-
-
-static void digi_rx_unthrottle(struct tty_struct *tty)
-{
-	int ret = 0;
-	unsigned long flags;
-	struct usb_serial_port *port = tty->driver_data;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-
-	/* restart read chain */
-	if (priv->dp_throttle_restart)
-		ret = usb_submit_urb(port->read_urb, GFP_ATOMIC);
-
-	/* turn throttle off */
-	priv->dp_throttled = 0;
-	priv->dp_throttle_restart = 0;
-
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-
-	if (ret)
-		dev_err(&port->dev,
-			"%s: usb_submit_urb failed, ret=%d, port=%d\n",
-			__func__, ret, priv->dp_port_num);
-}
-
-
-static void digi_set_termios(struct tty_struct *tty,
-		struct usb_serial_port *port, struct ktermios *old_termios)
-{
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	struct device *dev = &port->dev;
-	unsigned int iflag = tty->termios.c_iflag;
-	unsigned int cflag = tty->termios.c_cflag;
-	unsigned int old_iflag = old_termios->c_iflag;
-	unsigned int old_cflag = old_termios->c_cflag;
-	unsigned char buf[32];
-	unsigned int modem_signals;
-	int arg, ret;
-	int i = 0;
-	speed_t baud;
-
-	dev_dbg(dev,
-		"digi_set_termios: TOP: port=%d, iflag=0x%x, old_iflag=0x%x, cflag=0x%x, old_cflag=0x%x\n",
-		priv->dp_port_num, iflag, old_iflag, cflag, old_cflag);
-
-	/* set baud rate */
-	baud = tty_get_baud_rate(tty);
-	if (baud != tty_termios_baud_rate(old_termios)) {
-		arg = -1;
-
-		/* reassert DTR and (maybe) RTS on transition from B0 */
-		if ((old_cflag&CBAUD) == B0) {
-			/* don't set RTS if using hardware flow control */
-			/* and throttling input */
-			modem_signals = TIOCM_DTR;
-			if (!(tty->termios.c_cflag & CRTSCTS) ||
-			    !test_bit(TTY_THROTTLED, &tty->flags))
-				modem_signals |= TIOCM_RTS;
-			digi_set_modem_signals(port, modem_signals, 1);
-		}
-		switch (baud) {
-		/* drop DTR and RTS on transition to B0 */
-		case 0: digi_set_modem_signals(port, 0, 1); break;
-		case 50: arg = DIGI_BAUD_50; break;
-		case 75: arg = DIGI_BAUD_75; break;
-		case 110: arg = DIGI_BAUD_110; break;
-		case 150: arg = DIGI_BAUD_150; break;
-		case 200: arg = DIGI_BAUD_200; break;
-		case 300: arg = DIGI_BAUD_300; break;
-		case 600: arg = DIGI_BAUD_600; break;
-		case 1200: arg = DIGI_BAUD_1200; break;
-		case 1800: arg = DIGI_BAUD_1800; break;
-		case 2400: arg = DIGI_BAUD_2400; break;
-		case 4800: arg = DIGI_BAUD_4800; break;
-		case 9600: arg = DIGI_BAUD_9600; break;
-		case 19200: arg = DIGI_BAUD_19200; break;
-		case 38400: arg = DIGI_BAUD_38400; break;
-		case 57600: arg = DIGI_BAUD_57600; break;
-		case 115200: arg = DIGI_BAUD_115200; break;
-		case 230400: arg = DIGI_BAUD_230400; break;
-		case 460800: arg = DIGI_BAUD_460800; break;
-		default:
-			arg = DIGI_BAUD_9600;
-			baud = 9600;
-			break;
-		}
-		if (arg != -1) {
-			buf[i++] = DIGI_CMD_SET_BAUD_RATE;
-			buf[i++] = priv->dp_port_num;
-			buf[i++] = arg;
-			buf[i++] = 0;
-		}
-	}
-	/* set parity */
-	tty->termios.c_cflag &= ~CMSPAR;
-
-	if ((cflag&(PARENB|PARODD)) != (old_cflag&(PARENB|PARODD))) {
-		if (cflag&PARENB) {
-			if (cflag&PARODD)
-				arg = DIGI_PARITY_ODD;
-			else
-				arg = DIGI_PARITY_EVEN;
-		} else {
-			arg = DIGI_PARITY_NONE;
-		}
-		buf[i++] = DIGI_CMD_SET_PARITY;
-		buf[i++] = priv->dp_port_num;
-		buf[i++] = arg;
-		buf[i++] = 0;
-	}
-	/* set word size */
-	if ((cflag&CSIZE) != (old_cflag&CSIZE)) {
-		arg = -1;
-		switch (cflag&CSIZE) {
-		case CS5: arg = DIGI_WORD_SIZE_5; break;
-		case CS6: arg = DIGI_WORD_SIZE_6; break;
-		case CS7: arg = DIGI_WORD_SIZE_7; break;
-		case CS8: arg = DIGI_WORD_SIZE_8; break;
-		default:
-			dev_dbg(dev,
-				"digi_set_termios: can't handle word size %d\n",
-				(cflag&CSIZE));
-			break;
-		}
-
-		if (arg != -1) {
-			buf[i++] = DIGI_CMD_SET_WORD_SIZE;
-			buf[i++] = priv->dp_port_num;
-			buf[i++] = arg;
-			buf[i++] = 0;
-		}
-
-	}
-
-	/* set stop bits */
-	if ((cflag&CSTOPB) != (old_cflag&CSTOPB)) {
-
-		if ((cflag&CSTOPB))
-			arg = DIGI_STOP_BITS_2;
-		else
-			arg = DIGI_STOP_BITS_1;
-
-		buf[i++] = DIGI_CMD_SET_STOP_BITS;
-		buf[i++] = priv->dp_port_num;
-		buf[i++] = arg;
-		buf[i++] = 0;
-
-	}
-
-	/* set input flow control */
-	if ((iflag&IXOFF) != (old_iflag&IXOFF)
-	    || (cflag&CRTSCTS) != (old_cflag&CRTSCTS)) {
-		arg = 0;
-		if (iflag&IXOFF)
-			arg |= DIGI_INPUT_FLOW_CONTROL_XON_XOFF;
-		else
-			arg &= ~DIGI_INPUT_FLOW_CONTROL_XON_XOFF;
-
-		if (cflag&CRTSCTS) {
-			arg |= DIGI_INPUT_FLOW_CONTROL_RTS;
-
-			/* On USB-4 it is necessary to assert RTS prior */
-			/* to selecting RTS input flow control.  */
-			buf[i++] = DIGI_CMD_SET_RTS_SIGNAL;
-			buf[i++] = priv->dp_port_num;
-			buf[i++] = DIGI_RTS_ACTIVE;
-			buf[i++] = 0;
-
-		} else {
-			arg &= ~DIGI_INPUT_FLOW_CONTROL_RTS;
-		}
-		buf[i++] = DIGI_CMD_SET_INPUT_FLOW_CONTROL;
-		buf[i++] = priv->dp_port_num;
-		buf[i++] = arg;
-		buf[i++] = 0;
-	}
-
-	/* set output flow control */
-	if ((iflag & IXON) != (old_iflag & IXON)
-	    || (cflag & CRTSCTS) != (old_cflag & CRTSCTS)) {
-		arg = 0;
-		if (iflag & IXON)
-			arg |= DIGI_OUTPUT_FLOW_CONTROL_XON_XOFF;
-		else
-			arg &= ~DIGI_OUTPUT_FLOW_CONTROL_XON_XOFF;
-
-		if (cflag & CRTSCTS) {
-			arg |= DIGI_OUTPUT_FLOW_CONTROL_CTS;
-		} else {
-			arg &= ~DIGI_OUTPUT_FLOW_CONTROL_CTS;
-		}
-
-		buf[i++] = DIGI_CMD_SET_OUTPUT_FLOW_CONTROL;
-		buf[i++] = priv->dp_port_num;
-		buf[i++] = arg;
-		buf[i++] = 0;
-	}
-
-	/* set receive enable/disable */
-	if ((cflag & CREAD) != (old_cflag & CREAD)) {
-		if (cflag & CREAD)
-			arg = DIGI_ENABLE;
-		else
-			arg = DIGI_DISABLE;
-
-		buf[i++] = DIGI_CMD_RECEIVE_ENABLE;
-		buf[i++] = priv->dp_port_num;
-		buf[i++] = arg;
-		buf[i++] = 0;
-	}
-	ret = digi_write_oob_command(port, buf, i, 1);
-	if (ret != 0)
-		dev_dbg(dev, "digi_set_termios: write oob failed, ret=%d\n", ret);
-	tty_encode_baud_rate(tty, baud, baud);
-}
-
-
-static void digi_break_ctl(struct tty_struct *tty, int break_state)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	unsigned char buf[4];
-
-	buf[0] = DIGI_CMD_BREAK_CONTROL;
-	buf[1] = 2;				/* length */
-	buf[2] = break_state ? 1 : 0;
-	buf[3] = 0;				/* pad */
-	digi_write_inb_command(port, buf, 4, 0);
-}
-
-
-static int digi_tiocmget(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	unsigned int val;
-	unsigned long flags;
-
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-	val = priv->dp_modem_signals;
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-	return val;
-}
-
-
-static int digi_tiocmset(struct tty_struct *tty,
-					unsigned int set, unsigned int clear)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	unsigned int val;
-	unsigned long flags;
-
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-	val = (priv->dp_modem_signals & ~clear) | set;
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-	return digi_set_modem_signals(port, val, 1);
-}
-
-
-static int digi_write(struct tty_struct *tty, struct usb_serial_port *port,
-					const unsigned char *buf, int count)
-{
-
-	int ret, data_len, new_len;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	unsigned char *data = port->write_urb->transfer_buffer;
-	unsigned long flags = 0;
-
-	dev_dbg(&port->dev,
-		"digi_write: TOP: port=%d, count=%d, in_interrupt=%ld\n",
-		priv->dp_port_num, count, in_interrupt());
-
-	/* copy user data (which can sleep) before getting spin lock */
-	count = min(count, port->bulk_out_size-2);
-	count = min(64, count);
-
-	/* be sure only one write proceeds at a time */
-	/* there are races on the port private buffer */
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-
-	/* wait for urb status clear to submit another urb */
-	if (priv->dp_write_urb_in_use) {
-		/* buffer data if count is 1 (probably put_char) if possible */
-		if (count == 1 && priv->dp_out_buf_len < DIGI_OUT_BUF_SIZE) {
-			priv->dp_out_buf[priv->dp_out_buf_len++] = *buf;
-			new_len = 1;
-		} else {
-			new_len = 0;
-		}
-		spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-		return new_len;
-	}
-
-	/* allow space for any buffered data and for new data, up to */
-	/* transfer buffer size - 2 (for command and length bytes) */
-	new_len = min(count, port->bulk_out_size-2-priv->dp_out_buf_len);
-	data_len = new_len + priv->dp_out_buf_len;
-
-	if (data_len == 0) {
-		spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-		return 0;
-	}
-
-	port->write_urb->transfer_buffer_length = data_len+2;
-
-	*data++ = DIGI_CMD_SEND_DATA;
-	*data++ = data_len;
-
-	/* copy in buffered data first */
-	memcpy(data, priv->dp_out_buf, priv->dp_out_buf_len);
-	data += priv->dp_out_buf_len;
-
-	/* copy in new data */
-	memcpy(data, buf, new_len);
-
-	ret = usb_submit_urb(port->write_urb, GFP_ATOMIC);
-	if (ret == 0) {
-		priv->dp_write_urb_in_use = 1;
-		ret = new_len;
-		priv->dp_out_buf_len = 0;
-	}
-
-	/* return length of new data written, or error */
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-	if (ret < 0)
-		dev_err_console(port,
-			"%s: usb_submit_urb failed, ret=%d, port=%d\n",
-			__func__, ret, priv->dp_port_num);
-	dev_dbg(&port->dev, "digi_write: returning %d\n", ret);
-	return ret;
-
-}
-
-static void digi_write_bulk_callback(struct urb *urb)
-{
-
-	struct usb_serial_port *port = urb->context;
-	struct usb_serial *serial;
-	struct digi_port *priv;
-	struct digi_serial *serial_priv;
-	int ret = 0;
-	int status = urb->status;
-	bool wakeup;
-
-	/* port and serial sanity check */
-	if (port == NULL || (priv = usb_get_serial_port_data(port)) == NULL) {
-		pr_err("%s: port or port->private is NULL, status=%d\n",
-			__func__, status);
-		return;
-	}
-	serial = port->serial;
-	if (serial == NULL || (serial_priv = usb_get_serial_data(serial)) == NULL) {
-		dev_err(&port->dev,
-			"%s: serial or serial->private is NULL, status=%d\n",
-			__func__, status);
-		return;
-	}
-
-	/* handle oob callback */
-	if (priv->dp_port_num == serial_priv->ds_oob_port_num) {
-		dev_dbg(&port->dev, "digi_write_bulk_callback: oob callback\n");
-		spin_lock(&priv->dp_port_lock);
-		priv->dp_write_urb_in_use = 0;
-		wake_up_interruptible(&port->write_wait);
-		spin_unlock(&priv->dp_port_lock);
-		return;
-	}
-
-	/* try to send any buffered data on this port */
-	wakeup = true;
-	spin_lock(&priv->dp_port_lock);
-	priv->dp_write_urb_in_use = 0;
-	if (priv->dp_out_buf_len > 0) {
-		*((unsigned char *)(port->write_urb->transfer_buffer))
-			= (unsigned char)DIGI_CMD_SEND_DATA;
-		*((unsigned char *)(port->write_urb->transfer_buffer) + 1)
-			= (unsigned char)priv->dp_out_buf_len;
-		port->write_urb->transfer_buffer_length =
-						priv->dp_out_buf_len + 2;
-		memcpy(port->write_urb->transfer_buffer + 2, priv->dp_out_buf,
-			priv->dp_out_buf_len);
-		ret = usb_submit_urb(port->write_urb, GFP_ATOMIC);
-		if (ret == 0) {
-			priv->dp_write_urb_in_use = 1;
-			priv->dp_out_buf_len = 0;
-			wakeup = false;
-		}
-	}
-	spin_unlock(&priv->dp_port_lock);
-
-	if (ret && ret != -EPERM)
-		dev_err_console(port,
-			"%s: usb_submit_urb failed, ret=%d, port=%d\n",
-			__func__, ret, priv->dp_port_num);
-
-	if (wakeup)
-		tty_port_tty_wakeup(&port->port);
-}
-
-static int digi_write_room(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	int room;
-	unsigned long flags = 0;
-
-	spin_lock_irqsave(&priv->dp_port_lock, flags);
-
-	if (priv->dp_write_urb_in_use)
-		room = 0;
-	else
-		room = port->bulk_out_size - 2 - priv->dp_out_buf_len;
-
-	spin_unlock_irqrestore(&priv->dp_port_lock, flags);
-	dev_dbg(&port->dev, "digi_write_room: port=%d, room=%d\n", priv->dp_port_num, room);
-	return room;
-
-}
-
-static int digi_chars_in_buffer(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-
-	if (priv->dp_write_urb_in_use) {
-		dev_dbg(&port->dev, "digi_chars_in_buffer: port=%d, chars=%d\n",
-			priv->dp_port_num, port->bulk_out_size - 2);
-		/* return(port->bulk_out_size - 2); */
-		return 256;
-	} else {
-		dev_dbg(&port->dev, "digi_chars_in_buffer: port=%d, chars=%d\n",
-			priv->dp_port_num, priv->dp_out_buf_len);
-		return priv->dp_out_buf_len;
-	}
-
-}
-
-static void digi_dtr_rts(struct usb_serial_port *port, int on)
-{
-	/* Adjust DTR and RTS */
-	digi_set_modem_signals(port, on * (TIOCM_DTR|TIOCM_RTS), 1);
-}
-
-static int digi_open(struct tty_struct *tty, struct usb_serial_port *port)
-{
-	int ret;
-	unsigned char buf[32];
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	struct ktermios not_termios;
-
-	/* be sure the device is started up */
-	if (digi_startup_device(port->serial) != 0)
-		return -ENXIO;
-
-	/* read modem signals automatically whenever they change */
-	buf[0] = DIGI_CMD_READ_INPUT_SIGNALS;
-	buf[1] = priv->dp_port_num;
-	buf[2] = DIGI_ENABLE;
-	buf[3] = 0;
-
-	/* flush fifos */
-	buf[4] = DIGI_CMD_IFLUSH_FIFO;
-	buf[5] = priv->dp_port_num;
-	buf[6] = DIGI_FLUSH_TX | DIGI_FLUSH_RX;
-	buf[7] = 0;
-
-	ret = digi_write_oob_command(port, buf, 8, 1);
-	if (ret != 0)
-		dev_dbg(&port->dev, "digi_open: write oob failed, ret=%d\n", ret);
-
-	/* set termios settings */
-	if (tty) {
-		not_termios.c_cflag = ~tty->termios.c_cflag;
-		not_termios.c_iflag = ~tty->termios.c_iflag;
-		digi_set_termios(tty, port, &not_termios);
-	}
-	return 0;
-}
-
-
-static void digi_close(struct usb_serial_port *port)
-{
-	DEFINE_WAIT(wait);
-	int ret;
-	unsigned char buf[32];
-	struct digi_port *priv = usb_get_serial_port_data(port);
-
-	mutex_lock(&port->serial->disc_mutex);
-	/* if disconnected, just clear flags */
-	if (port->serial->disconnected)
-		goto exit;
-
-	/* FIXME: Transmit idle belongs in the wait_unti_sent path */
-	digi_transmit_idle(port, DIGI_CLOSE_TIMEOUT);
-
-	/* disable input flow control */
-	buf[0] = DIGI_CMD_SET_INPUT_FLOW_CONTROL;
-	buf[1] = priv->dp_port_num;
-	buf[2] = DIGI_DISABLE;
-	buf[3] = 0;
-
-	/* disable output flow control */
-	buf[4] = DIGI_CMD_SET_OUTPUT_FLOW_CONTROL;
-	buf[5] = priv->dp_port_num;
-	buf[6] = DIGI_DISABLE;
-	buf[7] = 0;
-
-	/* disable reading modem signals automatically */
-	buf[8] = DIGI_CMD_READ_INPUT_SIGNALS;
-	buf[9] = priv->dp_port_num;
-	buf[10] = DIGI_DISABLE;
-	buf[11] = 0;
-
-	/* disable receive */
-	buf[12] = DIGI_CMD_RECEIVE_ENABLE;
-	buf[13] = priv->dp_port_num;
-	buf[14] = DIGI_DISABLE;
-	buf[15] = 0;
-
-	/* flush fifos */
-	buf[16] = DIGI_CMD_IFLUSH_FIFO;
-	buf[17] = priv->dp_port_num;
-	buf[18] = DIGI_FLUSH_TX | DIGI_FLUSH_RX;
-	buf[19] = 0;
-
-	ret = digi_write_oob_command(port, buf, 20, 0);
-	if (ret != 0)
-		dev_dbg(&port->dev, "digi_close: write oob failed, ret=%d\n",
-									ret);
-	/* wait for final commands on oob port to complete */
-	prepare_to_wait(&priv->dp_flush_wait, &wait,
-			TASK_INTERRUPTIBLE);
-	schedule_timeout(DIGI_CLOSE_TIMEOUT);
-	finish_wait(&priv->dp_flush_wait, &wait);
-
-	/* shutdown any outstanding bulk writes */
-	usb_kill_urb(port->write_urb);
-exit:
-	spin_lock_irq(&priv->dp_port_lock);
-	priv->dp_write_urb_in_use = 0;
-	wake_up_interruptible(&priv->dp_close_wait);
-	spin_unlock_irq(&priv->dp_port_lock);
-	mutex_unlock(&port->serial->disc_mutex);
-}
-
-
-/*
- *  Digi Startup Device
- *
- *  Starts reads on all ports.  Must be called AFTER startup, with
- *  urbs initialized.  Returns 0 if successful, non-zero error otherwise.
- */
-
-static int digi_startup_device(struct usb_serial *serial)
-{
-	int i, ret = 0;
-	struct digi_serial *serial_priv = usb_get_serial_data(serial);
-	struct usb_serial_port *port;
-
-	/* be sure this happens exactly once */
-	spin_lock(&serial_priv->ds_serial_lock);
-	if (serial_priv->ds_device_started) {
-		spin_unlock(&serial_priv->ds_serial_lock);
-		return 0;
-	}
-	serial_priv->ds_device_started = 1;
-	spin_unlock(&serial_priv->ds_serial_lock);
-
-	/* start reading from each bulk in endpoint for the device */
-	/* set USB_DISABLE_SPD flag for write bulk urbs */
-	for (i = 0; i < serial->type->num_ports + 1; i++) {
-		port = serial->port[i];
-		ret = usb_submit_urb(port->read_urb, GFP_KERNEL);
-		if (ret != 0) {
-			dev_err(&port->dev,
-				"%s: usb_submit_urb failed, ret=%d, port=%d\n",
-				__func__, ret, i);
-			break;
-		}
-	}
-	return ret;
-}
-
-static int digi_port_init(struct usb_serial_port *port, unsigned port_num)
-{
-	struct digi_port *priv;
-
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	spin_lock_init(&priv->dp_port_lock);
-	priv->dp_port_num = port_num;
-	init_waitqueue_head(&priv->dp_transmit_idle_wait);
-	init_waitqueue_head(&priv->dp_flush_wait);
-	init_waitqueue_head(&priv->dp_close_wait);
-	priv->dp_port = port;
-
-	init_waitqueue_head(&port->write_wait);
-
-	usb_set_serial_port_data(port, priv);
-
-	return 0;
-}
-
-static int digi_startup(struct usb_serial *serial)
-{
-	struct device *dev = &serial->interface->dev;
-	struct digi_serial *serial_priv;
-	int ret;
-	int i;
-
-	/* check whether the device has the expected number of endpoints */
-	if (serial->num_port_pointers < serial->type->num_ports + 1) {
-		dev_err(dev, "OOB endpoints missing\n");
-		return -ENODEV;
-	}
-
-	for (i = 0; i < serial->type->num_ports + 1 ; i++) {
-		if (!serial->port[i]->read_urb) {
-			dev_err(dev, "bulk-in endpoint missing\n");
-			return -ENODEV;
-		}
-		if (!serial->port[i]->write_urb) {
-			dev_err(dev, "bulk-out endpoint missing\n");
-			return -ENODEV;
-		}
-	}
-
-	serial_priv = kzalloc(sizeof(*serial_priv), GFP_KERNEL);
-	if (!serial_priv)
-		return -ENOMEM;
-
-	spin_lock_init(&serial_priv->ds_serial_lock);
-	serial_priv->ds_oob_port_num = serial->type->num_ports;
-	serial_priv->ds_oob_port = serial->port[serial_priv->ds_oob_port_num];
-
-	ret = digi_port_init(serial_priv->ds_oob_port,
-						serial_priv->ds_oob_port_num);
-	if (ret) {
-		kfree(serial_priv);
-		return ret;
-	}
-
-	usb_set_serial_data(serial, serial_priv);
-
-	return 0;
-}
-
-
-static void digi_disconnect(struct usb_serial *serial)
-{
-	int i;
-
-	/* stop reads and writes on all ports */
-	for (i = 0; i < serial->type->num_ports + 1; i++) {
-		usb_kill_urb(serial->port[i]->read_urb);
-		usb_kill_urb(serial->port[i]->write_urb);
-	}
-}
-
-
-static void digi_release(struct usb_serial *serial)
-{
-	struct digi_serial *serial_priv;
-	struct digi_port *priv;
-
-	serial_priv = usb_get_serial_data(serial);
-
-	priv = usb_get_serial_port_data(serial_priv->ds_oob_port);
-	kfree(priv);
-
-	kfree(serial_priv);
-}
-
-static int digi_port_probe(struct usb_serial_port *port)
-{
-	return digi_port_init(port, port->port_number);
-}
-
-static int digi_port_remove(struct usb_serial_port *port)
-{
-	struct digi_port *priv;
-
-	priv = usb_get_serial_port_data(port);
-	kfree(priv);
-
-	return 0;
-}
-
-static void digi_read_bulk_callback(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	struct digi_port *priv;
-	struct digi_serial *serial_priv;
-	int ret;
-	int status = urb->status;
-
-	/* port sanity check, do not resubmit if port is not valid */
-	if (port == NULL)
-		return;
-	priv = usb_get_serial_port_data(port);
-	if (priv == NULL) {
-		dev_err(&port->dev, "%s: port->private is NULL, status=%d\n",
-			__func__, status);
-		return;
-	}
-	if (port->serial == NULL ||
-		(serial_priv = usb_get_serial_data(port->serial)) == NULL) {
-		dev_err(&port->dev, "%s: serial is bad or serial->private "
-			"is NULL, status=%d\n", __func__, status);
-		return;
-	}
-
-	/* do not resubmit urb if it has any status error */
-	if (status) {
-		dev_err(&port->dev,
-			"%s: nonzero read bulk status: status=%d, port=%d\n",
-			__func__, status, priv->dp_port_num);
-		return;
-	}
-
-	/* handle oob or inb callback, do not resubmit if error */
-	if (priv->dp_port_num == serial_priv->ds_oob_port_num) {
-		if (digi_read_oob_callback(urb) != 0)
-			return;
-	} else {
-		if (digi_read_inb_callback(urb) != 0)
-			return;
-	}
-
-	/* continue read */
-	ret = usb_submit_urb(urb, GFP_ATOMIC);
-	if (ret != 0 && ret != -EPERM) {
-		dev_err(&port->dev,
-			"%s: failed resubmitting urb, ret=%d, port=%d\n",
-			__func__, ret, priv->dp_port_num);
-	}
-
-}
-
-/*
- *  Digi Read INB Callback
- *
- *  Digi Read INB Callback handles reads on the in band ports, sending
- *  the data on to the tty subsystem.  When called we know port and
- *  port->private are not NULL and port->serial has been validated.
- *  It returns 0 if successful, 1 if successful but the port is
- *  throttled, and -1 if the sanity checks failed.
- */
-
-static int digi_read_inb_callback(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	unsigned char *buf = urb->transfer_buffer;
-	int opcode;
-	int len;
-	int port_status;
-	unsigned char *data;
-	int flag, throttled;
-
-	/* short/multiple packet check */
-	if (urb->actual_length < 2) {
-		dev_warn(&port->dev, "short packet received\n");
-		return -1;
-	}
-
-	opcode = buf[0];
-	len = buf[1];
-
-	if (urb->actual_length != len + 2) {
-		dev_err(&port->dev, "malformed packet received: port=%d, opcode=%d, len=%d, actual_length=%u\n",
-			priv->dp_port_num, opcode, len, urb->actual_length);
-		return -1;
-	}
-
-	if (opcode == DIGI_CMD_RECEIVE_DATA && len < 1) {
-		dev_err(&port->dev, "malformed data packet received\n");
-		return -1;
-	}
-
-	spin_lock(&priv->dp_port_lock);
-
-	/* check for throttle; if set, do not resubmit read urb */
-	/* indicate the read chain needs to be restarted on unthrottle */
-	throttled = priv->dp_throttled;
-	if (throttled)
-		priv->dp_throttle_restart = 1;
-
-	/* receive data */
-	if (opcode == DIGI_CMD_RECEIVE_DATA) {
-		port_status = buf[2];
-		data = &buf[3];
-
-		/* get flag from port_status */
-		flag = 0;
-
-		/* overrun is special, not associated with a char */
-		if (port_status & DIGI_OVERRUN_ERROR)
-			tty_insert_flip_char(&port->port, 0, TTY_OVERRUN);
-
-		/* break takes precedence over parity, */
-		/* which takes precedence over framing errors */
-		if (port_status & DIGI_BREAK_ERROR)
-			flag = TTY_BREAK;
-		else if (port_status & DIGI_PARITY_ERROR)
-			flag = TTY_PARITY;
-		else if (port_status & DIGI_FRAMING_ERROR)
-			flag = TTY_FRAME;
-
-		/* data length is len-1 (one byte of len is port_status) */
-		--len;
-		if (len > 0) {
-			tty_insert_flip_string_fixed_flag(&port->port, data,
-					flag, len);
-			tty_flip_buffer_push(&port->port);
-		}
-	}
-	spin_unlock(&priv->dp_port_lock);
-
-	if (opcode == DIGI_CMD_RECEIVE_DISABLE)
-		dev_dbg(&port->dev, "%s: got RECEIVE_DISABLE\n", __func__);
-	else if (opcode != DIGI_CMD_RECEIVE_DATA)
-		dev_dbg(&port->dev, "%s: unknown opcode: %d\n", __func__, opcode);
-
-	return throttled ? 1 : 0;
-
-}
-
-
-/*
- *  Digi Read OOB Callback
- *
- *  Digi Read OOB Callback handles reads on the out of band port.
- *  When called we know port and port->private are not NULL and
- *  the port->serial is valid.  It returns 0 if successful, and
- *  -1 if the sanity checks failed.
- */
-
-static int digi_read_oob_callback(struct urb *urb)
-{
-
-	struct usb_serial_port *port = urb->context;
-	struct usb_serial *serial = port->serial;
-	struct tty_struct *tty;
-	struct digi_port *priv = usb_get_serial_port_data(port);
-	unsigned char *buf = urb->transfer_buffer;
-	int opcode, line, status, val;
-	int i;
-	unsigned int rts;
-
-	if (urb->actual_length < 4)
-		return -1;
-
-	/* handle each oob command */
-	for (i = 0; i < urb->actual_length - 3; i += 4) {
-		opcode = buf[i];
-		line = buf[i + 1];
-		status = buf[i + 2];
-		val = buf[i + 3];
-
-		dev_dbg(&port->dev, "digi_read_oob_callback: opcode=%d, line=%d, status=%d, val=%d\n",
-			opcode, line, status, val);
-
-		if (status != 0 || line >= serial->type->num_ports)
-			continue;
-
-		port = serial->port[line];
-
-		priv = usb_get_serial_port_data(port);
-		if (priv == NULL)
-			return -1;
-
-		tty = tty_port_tty_get(&port->port);
-
-		rts = 0;
-		if (tty)
-			rts = tty->termios.c_cflag & CRTSCTS;
-		
-		if (tty && opcode == DIGI_CMD_READ_INPUT_SIGNALS) {
-			bool wakeup = false;
-
-			spin_lock(&priv->dp_port_lock);
-			/* convert from digi flags to termiox flags */
-			if (val & DIGI_READ_INPUT_SIGNALS_CTS) {
-				priv->dp_modem_signals |= TIOCM_CTS;
-				if (rts)
-					wakeup = true;
-			} else {
-				priv->dp_modem_signals &= ~TIOCM_CTS;
-				/* port must be open to use tty struct */
-			}
-			if (val & DIGI_READ_INPUT_SIGNALS_DSR)
-				priv->dp_modem_signals |= TIOCM_DSR;
-			else
-				priv->dp_modem_signals &= ~TIOCM_DSR;
-			if (val & DIGI_READ_INPUT_SIGNALS_RI)
-				priv->dp_modem_signals |= TIOCM_RI;
-			else
-				priv->dp_modem_signals &= ~TIOCM_RI;
-			if (val & DIGI_READ_INPUT_SIGNALS_DCD)
-				priv->dp_modem_signals |= TIOCM_CD;
-			else
-				priv->dp_modem_signals &= ~TIOCM_CD;
-
-			spin_unlock(&priv->dp_port_lock);
-
-			if (wakeup)
-				tty_port_tty_wakeup(&port->port);
-		} else if (opcode == DIGI_CMD_TRANSMIT_IDLE) {
-			spin_lock(&priv->dp_port_lock);
-			priv->dp_transmit_idle = 1;
-			wake_up_interruptible(&priv->dp_transmit_idle_wait);
-			spin_unlock(&priv->dp_port_lock);
-		} else if (opcode == DIGI_CMD_IFLUSH_FIFO) {
-			wake_up_interruptible(&priv->dp_flush_wait);
-		}
-		tty_kref_put(tty);
-	}
-	return 0;
-
-}
-
-module_usb_serial_driver(serial_drivers, id_table_combined);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+ARGET_LINK_SPEED_OVERRIDE__SHIFT 0x3
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_SW_SPEED_CHANGE_MASK 0x20
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_SW_SPEED_CHANGE__SHIFT 0x5
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_SW_SPEED_CHANGE_MASK 0x40
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_SW_SPEED_CHANGE__SHIFT 0x6
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_HW_SPEED_CHANGE_MASK 0x80
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_HW_SPEED_CHANGE__SHIFT 0x7
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_HW_SPEED_CHANGE_MASK 0x100
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_HW_SPEED_CHANGE__SHIFT 0x8
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_INITIATE_LINK_SPEED_CHANGE_MASK 0x200
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_INITIATE_LINK_SPEED_CHANGE__SHIFT 0x9
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK 0xc00
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPTS_ALLOWED__SHIFT 0xa
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPT_FAILED_MASK 0x1000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPT_FAILED__SHIFT 0xc
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_CURRENT_DATA_RATE_MASK 0x6000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_CURRENT_DATA_RATE__SHIFT 0xd
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_DONT_CLR_TARGET_SPD_CHANGE_STATUS_MASK 0x8000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_DONT_CLR_TARGET_SPD_CHANGE_STATUS__SHIFT 0xf
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_CLR_FAILED_SPD_CHANGE_CNT_MASK 0x10000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_CLR_FAILED_SPD_CHANGE_CNT__SHIFT 0x10
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_1_OR_MORE_TS2_SPEED_ARC_EN_MASK 0x20000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_1_OR_MORE_TS2_SPEED_ARC_EN__SHIFT 0x11
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN2_MASK 0x40000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN2__SHIFT 0x12
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN2_MASK 0x80000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN2__SHIFT 0x13
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN3_MASK 0x100000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN3__SHIFT 0x14
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3_MASK 0x200000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3__SHIFT 0x15
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS_MASK 0x400000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS__SHIFT 0x16
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS_MASK 0x800000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS__SHIFT 0x17
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED_MASK 0x3000000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED__SHIFT 0x18
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE_MASK 0x4000000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE__SHIFT 0x1a
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN_MASK 0x8000000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN__SHIFT 0x1b
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN_MASK 0x10000000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN__SHIFT 0x1c
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN_MASK 0x20000000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN__SHIFT 0x1d
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG_MASK 0x40000000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG__SHIFT 0x1e
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS_MASK 0x80000000
+#define D3F1_PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS__SHIFT 0x1f
+#define D3F1_PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF_MASK 0xfff
+#define D3F1_PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF__SHIFT 0x0
+#define D3F1_PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS_MASK 0xfff000
+#define D3F1_PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS__SHIFT 0xc
+#define D3F1_PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE_MASK 0x3000000
+#define D3F1_PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE__SHIFT 0x18
+#define D3F1_PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES_MASK 0xffff
+#define D3F1_PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES__SHIFT 0x0
+#define D3F1_PCIE_LC_LANE_CNTL__LC_LANE_DIS_MASK 0xffff0000
+#define D3F1_PCIE_LC_LANE_CNTL__LC_LANE_DIS__SHIFT 0x10
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_FORCE_COEFF_MASK 0x1
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_FORCE_COEFF__SHIFT 0x0
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_FORCE_PRE_CURSOR_MASK 0x7e
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_FORCE_PRE_CURSOR__SHIFT 0x1
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_FORCE_CURSOR_MASK 0x1f80
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_FORCE_CURSOR__SHIFT 0x7
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_FORCE_POST_CURSOR_MASK 0x7e000
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_FORCE_POST_CURSOR__SHIFT 0xd
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_3X3_COEFF_SEARCH_EN_MASK 0x80000
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_3X3_COEFF_SEARCH_EN__SHIFT 0x13
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_PRESET_10_EN_MASK 0x100000
+#define D3F1_PCIE_LC_FORCE_COEFF__LC_PRESET_10_EN__SHIFT 0x14
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRESET_MASK 0xf
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRESET__SHIFT 0x0
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRECURSOR_MASK 0x3f0
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRECURSOR__SHIFT 0x4
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_CURSOR_MASK 0xfc00
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_CURSOR__SHIFT 0xa
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_POSTCURSOR_MASK 0x3f0000
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_POSTCURSOR__SHIFT 0x10
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_FOM_MASK 0x3fc00000
+#define D3F1_PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_FOM__SHIFT 0x16
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_COEFF_IN_EQ_REQ_PHASE_MASK 0x1
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_COEFF_IN_EQ_REQ_PHASE__SHIFT 0x0
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_PRE_CURSOR_REQ_MASK 0x7e
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_PRE_CURSOR_REQ__SHIFT 0x1
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_CURSOR_REQ_MASK 0x1f80
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_CURSOR_REQ__SHIFT 0x7
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_POST_CURSOR_REQ_MASK 0x7e000
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_POST_CURSOR_REQ__SHIFT 0xd
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END_MASK 0x1f80000
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END__SHIFT 0x13
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END_MASK 0x7e000000
+#define D3F1_PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END__SHIFT 0x19
+#define D3F1_PCIE_LC_STATE0__LC_CURRENT_STATE_MASK 0x3f
+#define D3F1_PCIE_LC_STATE0__LC_CURRENT_STATE__SHIFT 0x0
+#define D3F1_PCIE_LC_STATE0__LC_PREV_STATE1_MASK 0x3f00
+#define D3F1_PCIE_LC_STATE0__LC_PREV_STATE1__SHIFT 0x8
+#define D3F1_PCIE_LC_STATE0__LC_PREV_STATE2_MASK 0x3f0000
+#define D3F1_PCIE_LC_STATE0__LC_PREV_STATE2__SHIFT 0x10
+#define D3F1_PCIE_LC_STATE0__LC_PREV_STATE3_MASK 0x3f000000
+#define D3F1_PCIE_LC_STATE0__LC_PREV_STATE3__SHIFT 0x18
+#define D3F1_PCIE_LC_STATE1__LC_PREV_STATE4_MASK 0x3f
+#define D3F1_PCIE_LC_STATE1__LC_PREV_STATE4__SHIFT 0x0
+#define D3F1_PCIE_LC_STATE1__LC_PREV_STATE5_MASK 0x3f00
+#define D3F1_PCIE_LC_STATE1__LC_PREV_STATE5__SHIFT 0x8
+#define D3F1_PCIE_LC_STATE1__LC_PREV_STATE6_MASK 0x3f0000
+#define D3F1_PCIE_LC_STATE1__LC_PREV_STATE6__SHIFT 0x10
+#define D3F1_PCIE_LC_STATE1__LC_PREV_STATE7_MASK 0x3f000000
+#define D3F1_PCIE_LC_STATE1__LC_PREV_STATE7__SHIFT 0x18
+#define D3F1_PCIE_LC_STATE2__LC_PREV_STATE8_MASK 0x3f
+#define D3F1_PCIE_LC_STATE2__LC_PREV_STATE8__SHIFT 0x0
+#define D3F1_PCIE_LC_STATE2__LC_PREV_STATE9_MASK 0x3f00
+#define D3F1_PCIE_LC_STATE2__LC_PREV_STATE9__SHIFT 0x8
+#define D3F1_PCIE_LC_STATE2__LC_PREV_STATE10_MASK 0x3f0000
+#define D3F1_PCIE_LC_STATE2__LC_PREV_STATE10__SHIFT 0x10
+#define D3F1_PCIE_LC_STATE2__LC_PREV_STATE11_MASK 0x3f000000
+#define D3F1_PCIE_LC_STATE2__LC_PREV_STATE11__SHIFT 0x18
+#define D3F1_PCIE_LC_STATE3__LC_PREV_STATE12_MASK 0x3f
+#define D3F1_PCIE_LC_STATE3__LC_PREV_STATE12__SHIFT 0x0
+#define D3F1_PCIE_LC_STATE3__LC_PREV_STATE13_MASK 0x3f00
+#define D3F1_PCIE_LC_STATE3__LC_PREV_STATE13__SHIFT 0x8
+#define D3F1_PCIE_LC_STATE3__LC_PREV_STATE14_MASK 0x3f0000
+#define D3F1_PCIE_LC_STATE3__LC_PREV_STATE14__SHIFT 0x10
+#define D3F1_PCIE_LC_STATE3__LC_PREV_STATE15_MASK 0x3f000000
+#define D3F1_PCIE_LC_STATE3__LC_PREV_STATE15__SHIFT 0x18
+#define D3F1_PCIE_LC_STATE4__LC_PREV_STATE16_MASK 0x3f
+#define D3F1_PCIE_LC_STATE4__LC_PREV_STATE16__SHIFT 0x0
+#define D3F1_PCIE_LC_STATE4__LC_PREV_STATE17_MASK 0x3f00
+#define D3F1_PCIE_LC_STATE4__LC_PREV_STATE17__SHIFT 0x8
+#define D3F1_PCIE_LC_STATE4__LC_PREV_STATE18_MASK 0x3f0000
+#define D3F1_PCIE_LC_STATE4__LC_PREV_STATE18__SHIFT 0x10
+#define D3F1_PCIE_LC_STATE4__LC_PREV_STATE19_MASK 0x3f000000
+#define D3F1_PCIE_LC_STATE4__LC_PREV_STATE19__SHIFT 0x18
+#define D3F1_PCIE_LC_STATE5__LC_PREV_STATE20_MASK 0x3f
+#define D3F1_PCIE_LC_STATE5__LC_PREV_STATE20__SHIFT 0x0
+#define D3F1_PCIE_LC_STATE5__LC_PREV_STATE21_MASK 0x3f00
+#define D3F1_PCIE_LC_STATE5__LC_PREV_STATE21__SHIFT 0x8
+#define D3F1_PCIE_LC_STATE5__LC_PREV_STATE22_MASK 0x3f0000
+#define D3F1_PCIE_LC_STATE5__LC_PREV_STATE22__SHIFT 0x10
+#define D3F1_PCIE_LC_STATE5__LC_PREV_STATE23_MASK 0x3f000000
+#define D3F1_PCIE_LC_STATE5__LC_PREV_STATE23__SHIFT 0x18
+#define D3F1_PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT_MASK 0x3
+#define D3F1_PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT__SHIFT 0x0
+#define D3F1_PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT_MASK 0xc
+#define D3F1_PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT__SHIFT 0x2
+#define D3F1_PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT_MASK 0x30
+#define D3F1_PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT__SHIFT 0x4
+#define D3F1_PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT_MASK 0xc0
+#define D3F1_PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT__SHIFT 0x6
+#define D3F1_PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL_MASK 0x700
+#define D3F1_PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL__SHIFT 0x8
+#define D3F1_PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET_MASK 0x800
+#define D3F1_PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET__SHIFT 0xb
+#define D3F1_PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS_MASK 0x1000
+#define D3F1_PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS__SHIFT 0xc
+#define D3F1_PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE_MASK 0x2000
+#define D3F1_PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE__SHIFT 0xd
+#define D3F1_PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES_MASK 0x4000
+#define D3F1_PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES__SHIFT 0xe
+#define D3F1_PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS_MASK 0x8000
+#define D3F1_PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS__SHIFT 0xf
+#define D3F1_PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION_MASK 0x70000
+#define D3F1_PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION__SHIFT 0x10
+#define D3F1_PCIEP_STRAP_MISC__STRAP_REVERSE_LANES_MASK 0x1
+#define D3F1_PCIEP_STRAP_MISC__STRAP_REVERSE_LANES__SHIFT 0x0
+#define D3F1_PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN_MASK 0x2
+#define D3F1_PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN__SHIFT 0x1
+#define D3F1_PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED_MASK 0x4
+#define D3F1_PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED__SHIFT 0x2
+#define D3F1_PCIEP_STRAP_MISC__STRAP_OBFF_SUPPORTED_MASK 0x18
+#define D3F1_PCIEP_STRAP_MISC__STRAP_OBFF_SUPPORTED__SHIFT 0x3
+#define D3F1_PCIEP_STRAP_MISC__STRAP_LTR_SUPPORTED_MASK 0x20
+#define D3F1_PCIEP_STRAP_MISC__STRAP_LTR_SUPPORTED__SHIFT 0x5
+#define D3F1_PCIEP_BCH_ECC_CNTL__STRAP_BCH_ECC_EN_MASK 0x1
+#define D3F1_PCIEP_BCH_ECC_CNTL__STRAP_BCH_ECC_EN__SHIFT 0x0
+#define D3F1_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD_MASK 0xff00
+#define D3F1_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD__SHIFT 0x8
+#define D3F1_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS_MASK 0xffff0000
+#define D3F1_PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS__SHIFT 0x10
+#define D3F1_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE_MASK 0x8
+#define D3F1_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE__SHIFT 0x3
+#define D3F1_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE_MASK 0x40
+#define D3F1_PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE__SHIFT 0x6
+#define D3F1_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN_MASK 0x1
+#define D3F1_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN__SHIFT 0x0
+#define D3F1_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN_MASK 0x2
+#define D3F1_PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN__SHIFT 0x1
+#define D3F1_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN_MASK 0x4
+#define D3F1_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN__SHIFT 0x2
+#define D3F1_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN_MASK 0x8
+#define D3F1_PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN__SHIFT 0x3
+#define D3F1_PCIEP_HPGI__REG_HPGI_HOOK_MASK 0x80
+#define D3F1_PCIEP_HPGI__REG_HPGI_HOOK__SHIFT 0x7
+#define D3F1_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS_MASK 0x100
+#define D3F1_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS__SHIFT 0x8
+#define D3F1_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS_MASK 0x200
+#define D3F1_PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS__SHIFT 0x9
+#define D3F1_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS_MASK 0x400
+#define D3F1_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS__SHIFT 0xa
+#define D3F1_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS_MASK 0x800
+#define D3F1_PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS__SHIFT 0xb
+#define D3F1_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS_MASK 0x8000
+#define D3F1_PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS__SHIFT 0xf
+#define D3F1_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN_MASK 0x10000
+#define D3F1_PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN__SHIFT 0x10
+#define D3F1_VENDOR_ID__VENDOR_ID_MASK 0xffff
+#define D3F1_VENDOR_ID__VENDOR_ID__SHIFT 0x0
+#define D3F1_DEVICE_ID__DEVICE_ID_MASK 0xffff0000
+#define D3F1_DEVICE_ID__DEVICE_ID__SHIFT 0x10
+#define D3F1_COMMAND__IO_ACCESS_EN_MASK 0x1
+#define D3F1_COMMAND__IO_ACCESS_EN__SHIFT 0x0
+#define D3F1_COMMAND__MEM_ACCESS_EN_MASK 0x2
+#define D3F1_COMMAND__MEM_ACCESS_EN__SHIFT 0x1
+#define D3F1_COMMAND__BUS_MASTER_EN_MASK 0x4
+#define D3F1_COMMAND__BUS_MASTER_EN__SHIFT 0x2
+#define D3F1_COMMAND__SPECIAL_CYCLE_EN_MASK 0x8
+#define D3F1_COMMAND__SPECIAL_CYCLE_EN__SHIFT 0x3
+#define D3F1_COMMAND__MEM_WRITE_INVALIDATE_EN_MASK 0x10
+#define D3F1_COMMAND__MEM_WRITE_INVALIDATE_EN__SHIFT 0x4
+#define D3F1_COMMAND__PAL_SNOOP_EN_MASK 0x20
+#define D3F1_COMMAND__PAL_SNOOP_EN__SHIFT 0x5
+#define D3F1_COMMAND__PARITY_ERROR_RESPONSE_MASK 0x40
+#define D3F1_COMMAND__PARITY_ERROR_RESPONSE__SHIFT 0x6
+#define D3F1_COMMAND__AD_STEPPING_MASK 0x80
+#define D3F1_COMMAND__AD_STEPPING__SHIFT 0x7
+#define D3F1_COMMAND__SERR_EN_MASK 0x100
+#define D3F1_COMMAND__SERR_EN__SHIFT 0x8
+#define D3F1_COMMAND__FAST_B2B_EN_MASK 0x200
+#define D3F1_COMMAND__FAST_B2B_EN__SHIFT 0x9
+#define D3F1_COMMAND__INT_DIS_MASK 0x400
+#define D3F1_COMMAND__INT_DIS__SHIFT 0xa
+#define D3F1_STATUS__INT_STATUS_MASK 0x80000
+#define D3F1_STATUS__INT_STATUS__SHIFT 0x13
+#define D3F1_STATUS__CAP_LIST_MASK 0x100000
+#define D3F1_STATUS__CAP_LIST__SHIFT 0x14
+#define D3F1_STATUS__PCI_66_EN_MASK 0x200000
+#define D3F1_STATUS__PCI_66_EN__SHIFT 0x15
+#define D3F1_STATUS__FAST_BACK_CAPABLE_MASK 0x800000
+#define D3F1_STATUS__FAST_BACK_CAPABLE__SHIFT 0x17
+#define D3F1_STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x1000000
+#define D3F1_STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x18
+#define D3F1_STATUS__DEVSEL_TIMING_MASK 0x6000000
+#define D3F1_STATUS__DEVSEL_TIMING__SHIFT 0x19
+#define D3F1_STATUS__SIGNAL_TARGET_ABORT_MASK 0x8000000
+#define D3F1_STATUS__SIGNAL_TARGET_ABORT__SHIFT 0x1b
+#define D3F1_STATUS__RECEIVED_TARGET_ABORT_MASK 0x10000000
+#define D3F1_STATUS__RECEIVED_TARGET_ABORT__SHIFT 0x1c
+#define D3F1_STATUS__RECEIVED_MASTER_ABORT_MASK 0x20000000
+#define D3F1_STATUS__RECEIVED_MASTER_ABORT__SHIFT 0x1d
+#define D3F1_STATUS__SIGNALED_SYSTEM_ERROR_MASK 0x40000000
+#define D3F1_STATUS__SIGNALED_SYSTEM_ERROR__SHIFT 0x1e
+#define D3F1_STATUS__PARITY_ERROR_DETECTED_MASK 0x80000000
+#define D3F1_STATUS__PARITY_ERROR_DETECTED__SHIFT 0x1f
+#define D3F1_REVISION_ID__MINOR_REV_ID_MASK 0xf
+#define D3F1_REVISION_ID__MINOR_REV_ID__SHIFT 0x0
+#define D3F1_REVISION_ID__MAJOR_REV_ID_MASK 0xf0
+#define D3F1_REVISION_ID__MAJOR_REV_ID__SHIFT 0x4
+#define D3F1_PROG_INTERFACE__PROG_INTERFACE_MASK 0xff00
+#define D3F1_PROG_INTERFACE__PROG_INTERFACE__SHIFT 0x8
+#define D3F1_SUB_CLASS__SUB_CLASS_MASK 0xff0000
+#define D3F1_SUB_CLASS__SUB_CLASS__SHIFT 0x10
+#define D3F1_BASE_CLASS__BASE_CLASS_MASK 0xff000000
+#define D3F1_BASE_CLASS__BASE_CLASS__SHIFT 0x18
+#define D3F1_CACHE_LINE__CACHE_LINE_SIZE_MASK 0xff
+#define D3F1_CACHE_LINE__CACHE_LINE_SIZE__SHIFT 0x0
+#define D3F1_LATENCY__LATENCY_TIMER_MASK 0xff00
+#define D3F1_LATENCY__LATENCY_TIMER__SHIFT 0x8
+#define D3F1_HEADER__HEADER_TYPE_MASK 0x7f0000
+#define D3F1_HEADER__HEADER_TYPE__SHIFT 0x10
+#define D3F1_HEADER__DEVICE_TYPE_MASK 0x800000
+#define D3F1_HEADER__DEVICE_TYPE__SHIFT 0x17
+#define D3F1_BIST__BIST_COMP_MASK 0xf000000
+#define D3F1_BIST__BIST_COMP__SHIFT 0x18
+#define D3F1_BIST__BIST_STRT_MASK 0x40000000
+#define D3F1_BIST__BIST_STRT__SHIFT 0x1e
+#define D3F1_BIST__BIST_CAP_MASK 0x80000000
+#define D3F1_BIST__BIST_CAP__SHIFT 0x1f
+#define D3F1_SUB_BUS_NUMBER_LATENCY__PRIMARY_BUS_MASK 0xff
+#define D3F1_SUB_BUS_NUMBER_LATENCY__PRIMARY_BUS__SHIFT 0x0
+#define D3F1_SUB_BUS_NUMBER_LATENCY__SECONDARY_BUS_MASK 0xff00
+#define D3F1_SUB_BUS_NUMBER_LATENCY__SECONDARY_BUS__SHIFT 0x8
+#define D3F1_SUB_BUS_NUMBER_LATENCY__SUB_BUS_NUM_MASK 0xff0000
+#define D3F1_SUB_BUS_NUMBER_LATENCY__SUB_BUS_NUM__SHIFT 0x10
+#define D3F1_SUB_BUS_NUMBER_LATENCY__SECONDARY_LATENCY_TIMER_MASK 0xff000000
+#define D3F1_SUB_BUS_NUMBER_LATENCY__SECONDARY_LATENCY_TIMER__SHIFT 0x18
+#define D3F1_IO_BASE_LIMIT__IO_BASE_TYPE_MASK 0xf
+#define D3F1_IO_BASE_LIMIT__IO_BASE_TYPE__SHIFT 0x0
+#define D3F1_IO_BASE_LIMIT__IO_BASE_MASK 0xf0
+#define D3F1_IO_BASE_LIMIT__IO_BASE__SHIFT 0x4
+#define D3F1_IO_BASE_LIMIT__IO_LIMIT_TYPE_MASK 0xf00
+#define D3F1_IO_BASE_LIMIT__IO_LIMIT_TYPE__SHIFT 0x8
+#define D3F1_IO_BASE_LIMIT__IO_LIMIT_MASK 0xf000
+#define D3F1_IO_BASE_LIMIT__IO_LIMIT__SHIFT 0xc
+#define D3F1_SECONDARY_STATUS__CAP_LIST_MASK 0x100000
+#define D3F1_SECONDARY_STATUS__CAP_LIST__SHIFT 0x14
+#define D3F1_SECONDARY_STATUS__PCI_66_EN_MASK 0x200000
+#define D3F1_SECONDARY_STATUS__PCI_66_EN__SHIFT 0x15
+#define D3F1_SECONDARY_STATUS__FAST_BACK_CAPABLE_MASK 0x800000
+#define D3F1_SECONDARY_STATUS__FAST_BACK_CAPABLE__SHIFT 0x17
+#define D3F1_SECONDARY_STATUS__MASTER_DATA_PARITY_ERROR_MASK 0x1000000
+#define D3F1_SECONDARY_STATUS__MASTER_DATA_PARITY_ERROR__SHIFT 0x18
+#define D3F1_SECONDARY_STATUS__DEVSEL_TIMING_MASK 0x6000000
+#define D3F1_SECONDARY_STATUS__DEVSEL_TIMING__SHIFT 0x19
+#define D3F1_SECONDARY_STATUS__SIGNAL_TARGET_ABORT_MASK 0x8000000
+#define D3F1_SECONDARY_STATUS__SIGNAL_TARGET_ABORT__SHIFT 0x1b
+#define D3F1_SECONDARY_STATUS__RECEIVED_TARGET_ABORT_MASK 0x10000000
+#define D3F1_SECONDARY_STATUS__RECEIVED_TARGET_ABORT__SHIFT 0x1c
+#define D3F1_SECONDARY_STATUS__RECEIVED_MASTER_ABORT_MASK 0x20000000
+#define D3F1_SECONDARY_STATUS__RECEIVED_MASTER_ABORT__SHIFT 0x1d
+#define D3F1_SECONDARY_STATUS__RECEIVED_SYSTEM_ERROR_MASK 0x40000000
+#define D3F1_SECONDARY_STATUS__RECEIVED_SYSTEM_ERROR__SHIFT 0x1e
+#define D3F1_SECONDARY_STATUS__PARITY_ERROR_DETECTED_MASK 0x80000000
+#define D3F1_SECONDARY_STATUS__PARITY_ERROR_DETECTED__SHIFT 0x1f
+#define D3F1_MEM_BASE_LIMIT__MEM_BASE_TYPE_MASK 0xf
+#define D3F1_MEM_BASE_LIMIT__MEM_BASE_TYPE__SHIFT 0x0
+#define D3F1_MEM_BASE_LIMIT__MEM_BASE_31_20_MASK 0xfff0
+#define D3F1_MEM_BASE_LIMIT__MEM_BASE_31_20__SHIFT 0x4
+#define D3F1_MEM_BASE_LIMIT__MEM_LIMIT_TYPE_MASK 0xf0000
+#define D3F1_MEM_BASE_LIMIT__MEM_LIMIT_TYPE__SHIFT 0x10
+#define D3F1_MEM_BASE_LIMIT__MEM_LIMIT_31_20_MASK 0xfff00000
+#define D3F1_MEM_BASE_LIMIT__MEM_LIMIT_31_20__SHIFT 0x14
+#define D3F1_PREF_BASE_LIMIT__PREF_MEM_BASE_TYPE_MASK 0xf
+#define D3F1_PREF_BASE_LIMIT__PREF_MEM_BASE_TYPE__SHIFT 0x0
+#define D3F1_PREF_BASE_LIMIT__PREF_MEM_BASE_31_20_MASK 0xfff0
+#define D3F1_PREF_BASE_LIMIT__PREF_MEM_BASE_31_20__SHIFT 0x4
+#define D3F1_PREF_BASE_LIMIT__PREF_MEM_LIMIT_TYPE_MASK 0xf0000
+#define D3F1_PREF_BASE_LIMIT__PREF_MEM_LIMIT_TYPE__SHIFT 0x10
+#define D3F1_PREF_BASE_LIMIT__PREF_MEM_LIMIT_31_20_MASK 0xfff00000
+#define D3F1_PREF_BASE_LIMIT__PREF_MEM_LIMIT_31_20__SHIFT 0x14
+#define D3F1_PREF_BASE_UPPER__PREF_BASE_UPPER_MASK 0xffffffff
+#define D3F1_PREF_BASE_UPPER__PREF_BASE_UPPER__SHIFT 0x0
+#define D3F1_PREF_LIMIT_UPPER__PREF_LIMIT_UPPER_MASK 0xffffffff
+#define D3F1_PREF_LIMIT_UPPER__PREF_LIMIT_UPPER__SHIFT 0x0
+#define D3F1_IO_BASE_LIMIT_HI__IO_BASE_31_16_MASK 0xffff
+#define D3F1_IO_BASE_LIMIT_HI__IO_BASE_31_16__SHIFT 0x0
+#define D3F1_IO_BASE_LIMIT_HI__IO_LIMIT_31_16_MASK 0xffff0000
+#define D3F1_IO_BASE_LIMIT_HI__IO_LIMIT_31_16__SHIFT 0x10
+#define D3F1_IRQ_BRIDGE_CNTL__PARITY_RESPONSE_EN_MASK 0x10000
+#define D3F1_IRQ_BRIDGE_CNTL__PARITY_RESPONSE_EN__SHIFT 0x10
+#define D3F1_IRQ_BRIDGE_CNTL__SERR_EN_MASK 0x20000
+#define D3F1_IRQ_BRIDGE_CNTL__SERR_EN__SHIFT 0x11
+#define D3F1_IRQ_BRIDGE_CNTL__ISA_EN_MASK 0x40000
+#define D3F1_IRQ_BRIDGE_CNTL__ISA_EN__SHIFT 0x12
+#define D3F1_IRQ_BRIDGE_CNTL__VGA_EN_MASK 0x80000
+#define D3F1_IRQ_BRIDGE_CNTL__VGA_EN__SHIFT 0x13
+#define D3F1_IRQ_BRIDGE_CNTL__VGA_DEC_MASK 0x100000
+#define D3F1_IRQ_BRIDGE_CNTL__VGA_DEC__SHIFT 0x14
+#define D3F1_IRQ_BRIDGE_CNTL__MASTER_ABORT_MODE_MASK 0x200000
+#define D3F1_IRQ_BRIDGE_CNTL__MASTER_ABORT_MODE__SHIFT 0x15
+#define D3F1_IRQ_BRIDGE_CNTL__SECONDARY_BUS_RESET_MASK 0x400000
+#define D3F1_IRQ_BRIDGE_CNTL__SECONDARY_BUS_RESET__SHIFT 0x16
+#define D3F1_IRQ_BRIDGE_CNTL__FAST_B2B_EN_MASK 0x800000
+#define D3F1_IRQ_BRIDGE_CNTL__FAST_B2B_EN__SHIFT 0x17
+#define D3F1_CAP_PTR__CAP_PTR_MASK 0xff
+#define D3F1_CAP_PTR__CAP_PTR__SHIFT 0x0
+#define D3F1_INTERRUPT_LINE__INTERRUPT_LINE_MASK 0xff
+#define D3F1_INTERRUPT_LINE__INTERRUPT_LINE__SHIFT 0x0
+#define D3F1_INTERRUPT_PIN__INTERRUPT_PIN_MASK 0xff00
+#define D3F1_INTERRUPT_PIN__INTERRUPT_PIN__SHIFT 0x8
+#define D3F1_EXT_BRIDGE_CNTL__IO_PORT_80_EN_MASK 0x1
+#define D3F1_EXT_BRIDGE_CNTL__IO_PORT_80_EN__SHIFT 0x0
+#define D3F1_PMI_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F1_PMI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F1_PMI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F1_PMI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F1_PMI_CAP__VERSION_MASK 0x70000
+#define D3F1_PMI_CAP__VERSION__SHIFT 0x10
+#define D3F1_PMI_CAP__PME_CLOCK_MASK 0x80000
+#define D3F1_PMI_CAP__PME_CLOCK__SHIFT 0x13
+#define D3F1_PMI_CAP__DEV_SPECIFIC_INIT_MASK 0x200000
+#define D3F1_PMI_CAP__DEV_SPECIFIC_INIT__SHIFT 0x15
+#define D3F1_PMI_CAP__AUX_CURRENT_MASK 0x1c00000
+#define D3F1_PMI_CAP__AUX_CURRENT__SHIFT 0x16
+#define D3F1_PMI_CAP__D1_SUPPORT_MASK 0x2000000
+#define D3F1_PMI_CAP__D1_SUPPORT__SHIFT 0x19
+#define D3F1_PMI_CAP__D2_SUPPORT_MASK 0x4000000
+#define D3F1_PMI_CAP__D2_SUPPORT__SHIFT 0x1a
+#define D3F1_PMI_CAP__PME_SUPPORT_MASK 0xf8000000
+#define D3F1_PMI_CAP__PME_SUPPORT__SHIFT 0x1b
+#define D3F1_PMI_STATUS_CNTL__POWER_STATE_MASK 0x3
+#define D3F1_PMI_STATUS_CNTL__POWER_STATE__SHIFT 0x0
+#define D3F1_PMI_STATUS_CNTL__NO_SOFT_RESET_MASK 0x8
+#define D3F1_PMI_STATUS_CNTL__NO_SOFT_RESET__SHIFT 0x3
+#define D3F1_PMI_STATUS_CNTL__PME_EN_MASK 0x100
+#define D3F1_PMI_STATUS_CNTL__PME_EN__SHIFT 0x8
+#define D3F1_PMI_STATUS_CNTL__DATA_SELECT_MASK 0x1e00
+#define D3F1_PMI_STATUS_CNTL__DATA_SELECT__SHIFT 0x9
+#define D3F1_PMI_STATUS_CNTL__DATA_SCALE_MASK 0x6000
+#define D3F1_PMI_STATUS_CNTL__DATA_SCALE__SHIFT 0xd
+#define D3F1_PMI_STATUS_CNTL__PME_STATUS_MASK 0x8000
+#define D3F1_PMI_STATUS_CNTL__PME_STATUS__SHIFT 0xf
+#define D3F1_PMI_STATUS_CNTL__B2_B3_SUPPORT_MASK 0x400000
+#define D3F1_PMI_STATUS_CNTL__B2_B3_SUPPORT__SHIFT 0x16
+#define D3F1_PMI_STATUS_CNTL__BUS_PWR_EN_MASK 0x800000
+#define D3F1_PMI_STATUS_CNTL__BUS_PWR_EN__SHIFT 0x17
+#define D3F1_PMI_STATUS_CNTL__PMI_DATA_MASK 0xff000000
+#define D3F1_PMI_STATUS_CNTL__PMI_DATA__SHIFT 0x18
+#define D3F1_PCIE_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F1_PCIE_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F1_PCIE_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F1_PCIE_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F1_PCIE_CAP__VERSION_MASK 0xf0000
+#define D3F1_PCIE_CAP__VERSION__SHIFT 0x10
+#define D3F1_PCIE_CAP__DEVICE_TYPE_MASK 0xf00000
+#define D3F1_PCIE_CAP__DEVICE_TYPE__SHIFT 0x14
+#define D3F1_PCIE_CAP__SLOT_IMPLEMENTED_MASK 0x1000000
+#define D3F1_PCIE_CAP__SLOT_IMPLEMENTED__SHIFT 0x18
+#define D3F1_PCIE_CAP__INT_MESSAGE_NUM_MASK 0x3e000000
+#define D3F1_PCIE_CAP__INT_MESSAGE_NUM__SHIFT 0x19
+#define D3F1_DEVICE_CAP__MAX_PAYLOAD_SUPPORT_MASK 0x7
+#define D3F1_DEVICE_CAP__MAX_PAYLOAD_SUPPORT__SHIFT 0x0
+#define D3F1_DEVICE_CAP__PHANTOM_FUNC_MASK 0x18
+#define D3F1_DEVICE_CAP__PHANTOM_FUNC__SHIFT 0x3
+#define D3F1_DEVICE_CAP__EXTENDED_TAG_MASK 0x20
+#define D3F1_DEVICE_CAP__EXTENDED_TAG__SHIFT 0x5
+#define D3F1_DEVICE_CAP__L0S_ACCEPTABLE_LATENCY_MASK 0x1c0
+#define D3F1_DEVICE_CAP__L0S_ACCEPTABLE_LATENCY__SHIFT 0x6
+#define D3F1_DEVICE_CAP__L1_ACCEPTABLE_LATENCY_MASK 0xe00
+#define D3F1_DEVICE_CAP__L1_ACCEPTABLE_LATENCY__SHIFT 0x9
+#define D3F1_DEVICE_CAP__ROLE_BASED_ERR_REPORTING_MASK 0x8000
+#define D3F1_DEVICE_CAP__ROLE_BASED_ERR_REPORTING__SHIFT 0xf
+#define D3F1_DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT_MASK 0x3fc0000
+#define D3F1_DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT__SHIFT 0x12
+#define D3F1_DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE_MASK 0xc000000
+#define D3F1_DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE__SHIFT 0x1a
+#define D3F1_DEVICE_CAP__FLR_CAPABLE_MASK 0x10000000
+#define D3F1_DEVICE_CAP__FLR_CAPABLE__SHIFT 0x1c
+#define D3F1_DEVICE_CNTL__CORR_ERR_EN_MASK 0x1
+#define D3F1_DEVICE_CNTL__CORR_ERR_EN__SHIFT 0x0
+#define D3F1_DEVICE_CNTL__NON_FATAL_ERR_EN_MASK 0x2
+#define D3F1_DEVICE_CNTL__NON_FATAL_ERR_EN__SHIFT 0x1
+#define D3F1_DEVICE_CNTL__FATAL_ERR_EN_MASK 0x4
+#define D3F1_DEVICE_CNTL__FATAL_ERR_EN__SHIFT 0x2
+#define D3F1_DEVICE_CNTL__USR_REPORT_EN_MASK 0x8
+#define D3F1_DEVICE_CNTL__USR_REPORT_EN__SHIFT 0x3
+#define D3F1_DEVICE_CNTL__RELAXED_ORD_EN_MASK 0x10
+#define D3F1_DEVICE_CNTL__RELAXED_ORD_EN__SHIFT 0x4
+#define D3F1_DEVICE_CNTL__MAX_PAYLOAD_SIZE_MASK 0xe0
+#define D3F1_DEVICE_CNTL__MAX_PAYLOAD_SIZE__SHIFT 0x5
+#define D3F1_DEVICE_CNTL__EXTENDED_TAG_EN_MASK 0x100
+#define D3F1_DEVICE_CNTL__EXTENDED_TAG_EN__SHIFT 0x8
+#define D3F1_DEVICE_CNTL__PHANTOM_FUNC_EN_MASK 0x200
+#define D3F1_DEVICE_CNTL__PHANTOM_FUNC_EN__SHIFT 0x9
+#define D3F1_DEVICE_CNTL__AUX_POWER_PM_EN_MASK 0x400
+#define D3F1_DEVICE_CNTL__AUX_POWER_PM_EN__SHIFT 0xa
+#define D3F1_DEVICE_CNTL__NO_SNOOP_EN_MASK 0x800
+#define D3F1_DEVICE_CNTL__NO_SNOOP_EN__SHIFT 0xb
+#define D3F1_DEVICE_CNTL__MAX_READ_REQUEST_SIZE_MASK 0x7000
+#define D3F1_DEVICE_CNTL__MAX_READ_REQUEST_SIZE__SHIFT 0xc
+#define D3F1_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN_MASK 0x8000
+#define D3F1_DEVICE_CNTL__BRIDGE_CFG_RETRY_EN__SHIFT 0xf
+#define D3F1_DEVICE_STATUS__CORR_ERR_MASK 0x10000
+#define D3F1_DEVICE_STATUS__CORR_ERR__SHIFT 0x10
+#define D3F1_DEVICE_STATUS__NON_FATAL_ERR_MASK 0x20000
+#define D3F1_DEVICE_STATUS__NON_FATAL_ERR__SHIFT 0x11
+#define D3F1_DEVICE_STATUS__FATAL_ERR_MASK 0x40000
+#define D3F1_DEVICE_STATUS__FATAL_ERR__SHIFT 0x12
+#define D3F1_DEVICE_STATUS__USR_DETECTED_MASK 0x80000
+#define D3F1_DEVICE_STATUS__USR_DETECTED__SHIFT 0x13
+#define D3F1_DEVICE_STATUS__AUX_PWR_MASK 0x100000
+#define D3F1_DEVICE_STATUS__AUX_PWR__SHIFT 0x14
+#define D3F1_DEVICE_STATUS__TRANSACTIONS_PEND_MASK 0x200000
+#define D3F1_DEVICE_STATUS__TRANSACTIONS_PEND__SHIFT 0x15
+#define D3F1_LINK_CAP__LINK_SPEED_MASK 0xf
+#define D3F1_LINK_CAP__LINK_SPEED__SHIFT 0x0
+#define D3F1_LINK_CAP__LINK_WIDTH_MASK 0x3f0
+#define D3F1_LINK_CAP__LINK_WIDTH__SHIFT 0x4
+#define D3F1_LINK_CAP__PM_SUPPORT_MASK 0xc00
+#define D3F1_LINK_CAP__PM_SUPPORT__SHIFT 0xa
+#define D3F1_LINK_CAP__L0S_EXIT_LATENCY_MASK 0x7000
+#define D3F1_LINK_CAP__L0S_EXIT_LATENCY__SHIFT 0xc
+#define D3F1_LINK_CAP__L1_EXIT_LATENCY_MASK 0x38000
+#define D3F1_LINK_CAP__L1_EXIT_LATENCY__SHIFT 0xf
+#define D3F1_LINK_CAP__CLOCK_POWER_MANAGEMENT_MASK 0x40000
+#define D3F1_LINK_CAP__CLOCK_POWER_MANAGEMENT__SHIFT 0x12
+#define D3F1_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING_MASK 0x80000
+#define D3F1_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING__SHIFT 0x13
+#define D3F1_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE_MASK 0x100000
+#define D3F1_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE__SHIFT 0x14
+#define D3F1_LINK_CAP__LINK_BW_NOTIFICATION_CAP_MASK 0x200000
+#define D3F1_LINK_CAP__LINK_BW_NOTIFICATION_CAP__SHIFT 0x15
+#define D3F1_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE_MASK 0x400000
+#define D3F1_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE__SHIFT 0x16
+#define D3F1_LINK_CAP__PORT_NUMBER_MASK 0xff000000
+#define D3F1_LINK_CAP__PORT_NUMBER__SHIFT 0x18
+#define D3F1_LINK_CNTL__PM_CONTROL_MASK 0x3
+#define D3F1_LINK_CNTL__PM_CONTROL__SHIFT 0x0
+#define D3F1_LINK_CNTL__READ_CPL_BOUNDARY_MASK 0x8
+#define D3F1_LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define D3F1_LINK_CNTL__LINK_DIS_MASK 0x10
+#define D3F1_LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define D3F1_LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define D3F1_LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define D3F1_LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define D3F1_LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define D3F1_LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define D3F1_LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define D3F1_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define D3F1_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define D3F1_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define D3F1_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0x9
+#define D3F1_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN_MASK 0x400
+#define D3F1_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN__SHIFT 0xa
+#define D3F1_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN_MASK 0x800
+#define D3F1_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN__SHIFT 0xb
+#define D3F1_LINK_STATUS__CURRENT_LINK_SPEED_MASK 0xf0000
+#define D3F1_LINK_STATUS__CURRENT_LINK_SPEED__SHIFT 0x10
+#define D3F1_LINK_STATUS__NEGOTIATED_LINK_WIDTH_MASK 0x3f00000
+#define D3F1_LINK_STATUS__NEGOTIATED_LINK_WIDTH__SHIFT 0x14
+#define D3F1_LINK_STATUS__LINK_TRAINING_MASK 0x8000000
+#define D3F1_LINK_STATUS__LINK_TRAINING__SHIFT 0x1b
+#define D3F1_LINK_STATUS__SLOT_CLOCK_CFG_MASK 0x10000000
+#define D3F1_LINK_STATUS__SLOT_CLOCK_CFG__SHIFT 0x1c
+#define D3F1_LINK_STATUS__DL_ACTIVE_MASK 0x20000000
+#define D3F1_LINK_STATUS__DL_ACTIVE__SHIFT 0x1d
+#define D3F1_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS_MASK 0x40000000
+#define D3F1_LINK_STATUS__LINK_BW_MANAGEMENT_STATUS__SHIFT 0x1e
+#define D3F1_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS_MASK 0x80000000
+#define D3F1_LINK_STATUS__LINK_AUTONOMOUS_BW_STATUS__SHIFT 0x1f
+#define D3F1_SLOT_CAP__ATTN_BUTTON_PRESENT_MASK 0x1
+#define D3F1_SLOT_CAP__ATTN_BUTTON_PRESENT__SHIFT 0x0
+#define D3F1_SLOT_CAP__PWR_CONTROLLER_PRESENT_MASK 0x2
+#define D3F1_SLOT_CAP__PWR_CONTROLLER_PRESENT__SHIFT 0x1
+#define D3F1_SLOT_CAP__MRL_SENSOR_PRESENT_MASK 0x4
+#define D3F1_SLOT_CAP__MRL_SENSOR_PRESENT__SHIFT 0x2
+#define D3F1_SLOT_CAP__ATTN_INDICATOR_PRESENT_MASK 0x8
+#define D3F1_SLOT_CAP__ATTN_INDICATOR_PRESENT__SHIFT 0x3
+#define D3F1_SLOT_CAP__PWR_INDICATOR_PRESENT_MASK 0x10
+#define D3F1_SLOT_CAP__PWR_INDICATOR_PRESENT__SHIFT 0x4
+#define D3F1_SLOT_CAP__HOTPLUG_SURPRISE_MASK 0x20
+#define D3F1_SLOT_CAP__HOTPLUG_SURPRISE__SHIFT 0x5
+#define D3F1_SLOT_CAP__HOTPLUG_CAPABLE_MASK 0x40
+#define D3F1_SLOT_CAP__HOTPLUG_CAPABLE__SHIFT 0x6
+#define D3F1_SLOT_CAP__SLOT_PWR_LIMIT_VALUE_MASK 0x7f80
+#define D3F1_SLOT_CAP__SLOT_PWR_LIMIT_VALUE__SHIFT 0x7
+#define D3F1_SLOT_CAP__SLOT_PWR_LIMIT_SCALE_MASK 0x18000
+#define D3F1_SLOT_CAP__SLOT_PWR_LIMIT_SCALE__SHIFT 0xf
+#define D3F1_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT_MASK 0x20000
+#define D3F1_SLOT_CAP__ELECTROMECH_INTERLOCK_PRESENT__SHIFT 0x11
+#define D3F1_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED_MASK 0x40000
+#define D3F1_SLOT_CAP__NO_COMMAND_COMPLETED_SUPPORTED__SHIFT 0x12
+#define D3F1_SLOT_CAP__PHYSICAL_SLOT_NUM_MASK 0xfff80000
+#define D3F1_SLOT_CAP__PHYSICAL_SLOT_NUM__SHIFT 0x13
+#define D3F1_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN_MASK 0x1
+#define D3F1_SLOT_CNTL__ATTN_BUTTON_PRESSED_EN__SHIFT 0x0
+#define D3F1_SLOT_CNTL__PWR_FAULT_DETECTED_EN_MASK 0x2
+#define D3F1_SLOT_CNTL__PWR_FAULT_DETECTED_EN__SHIFT 0x1
+#define D3F1_SLOT_CNTL__MRL_SENSOR_CHANGED_EN_MASK 0x4
+#define D3F1_SLOT_CNTL__MRL_SENSOR_CHANGED_EN__SHIFT 0x2
+#define D3F1_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN_MASK 0x8
+#define D3F1_SLOT_CNTL__PRESENCE_DETECT_CHANGED_EN__SHIFT 0x3
+#define D3F1_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN_MASK 0x10
+#define D3F1_SLOT_CNTL__COMMAND_COMPLETED_INTR_EN__SHIFT 0x4
+#define D3F1_SLOT_CNTL__HOTPLUG_INTR_EN_MASK 0x20
+#define D3F1_SLOT_CNTL__HOTPLUG_INTR_EN__SHIFT 0x5
+#define D3F1_SLOT_CNTL__ATTN_INDICATOR_CNTL_MASK 0xc0
+#define D3F1_SLOT_CNTL__ATTN_INDICATOR_CNTL__SHIFT 0x6
+#define D3F1_SLOT_CNTL__PWR_INDICATOR_CNTL_MASK 0x300
+#define D3F1_SLOT_CNTL__PWR_INDICATOR_CNTL__SHIFT 0x8
+#define D3F1_SLOT_CNTL__PWR_CONTROLLER_CNTL_MASK 0x400
+#define D3F1_SLOT_CNTL__PWR_CONTROLLER_CNTL__SHIFT 0xa
+#define D3F1_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL_MASK 0x800
+#define D3F1_SLOT_CNTL__ELECTROMECH_INTERLOCK_CNTL__SHIFT 0xb
+#define D3F1_SLOT_CNTL__DL_STATE_CHANGED_EN_MASK 0x1000
+#define D3F1_SLOT_CNTL__DL_STATE_CHANGED_EN__SHIFT 0xc
+#define D3F1_SLOT_STATUS__ATTN_BUTTON_PRESSED_MASK 0x10000
+#define D3F1_SLOT_STATUS__ATTN_BUTTON_PRESSED__SHIFT 0x10
+#define D3F1_SLOT_STATUS__PWR_FAULT_DETECTED_MASK 0x20000
+#define D3F1_SLOT_STATUS__PWR_FAULT_DETECTED__SHIFT 0x11
+#define D3F1_SLOT_STATUS__MRL_SENSOR_CHANGED_MASK 0x40000
+#define D3F1_SLOT_STATUS__MRL_SENSOR_CHANGED__SHIFT 0x12
+#define D3F1_SLOT_STATUS__PRESENCE_DETECT_CHANGED_MASK 0x80000
+#define D3F1_SLOT_STATUS__PRESENCE_DETECT_CHANGED__SHIFT 0x13
+#define D3F1_SLOT_STATUS__COMMAND_COMPLETED_MASK 0x100000
+#define D3F1_SLOT_STATUS__COMMAND_COMPLETED__SHIFT 0x14
+#define D3F1_SLOT_STATUS__MRL_SENSOR_STATE_MASK 0x200000
+#define D3F1_SLOT_STATUS__MRL_SENSOR_STATE__SHIFT 0x15
+#define D3F1_SLOT_STATUS__PRESENCE_DETECT_STATE_MASK 0x400000
+#define D3F1_SLOT_STATUS__PRESENCE_DETECT_STATE__SHIFT 0x16
+#define D3F1_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS_MASK 0x800000
+#define D3F1_SLOT_STATUS__ELECTROMECH_INTERLOCK_STATUS__SHIFT 0x17
+#define D3F1_SLOT_STATUS__DL_STATE_CHANGED_MASK 0x1000000
+#define D3F1_SLOT_STATUS__DL_STATE_CHANGED__SHIFT 0x18
+#define D3F1_ROOT_CNTL__SERR_ON_CORR_ERR_EN_MASK 0x1
+#define D3F1_ROOT_CNTL__SERR_ON_CORR_ERR_EN__SHIFT 0x0
+#define D3F1_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN_MASK 0x2
+#define D3F1_ROOT_CNTL__SERR_ON_NONFATAL_ERR_EN__SHIFT 0x1
+#define D3F1_ROOT_CNTL__SERR_ON_FATAL_ERR_EN_MASK 0x4
+#define D3F1_ROOT_CNTL__SERR_ON_FATAL_ERR_EN__SHIFT 0x2
+#define D3F1_ROOT_CNTL__PM_INTERRUPT_EN_MASK 0x8
+#define D3F1_ROOT_CNTL__PM_INTERRUPT_EN__SHIFT 0x3
+#define D3F1_ROOT_CNTL__CRS_SOFTWARE_VISIBILITY_EN_MASK 0x10
+#define D3F1_ROOT_CNTL__CRS_SOFTWARE_VISIBILITY_EN__SHIFT 0x4
+#define D3F1_ROOT_CAP__CRS_SOFTWARE_VISIBILITY_MASK 0x10000
+#define D3F1_ROOT_CAP__CRS_SOFTWARE_VISIBILITY__SHIFT 0x10
+#define D3F1_ROOT_STATUS__PME_REQUESTOR_ID_MASK 0xffff
+#define D3F1_ROOT_STATUS__PME_REQUESTOR_ID__SHIFT 0x0
+#define D3F1_ROOT_STATUS__PME_STATUS_MASK 0x10000
+#define D3F1_ROOT_STATUS__PME_STATUS__SHIFT 0x10
+#define D3F1_ROOT_STATUS__PME_PENDING_MASK 0x20000
+#define D3F1_ROOT_STATUS__PME_PENDING__SHIFT 0x11
+#define D3F1_DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED_MASK 0xf
+#define D3F1_DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED__SHIFT 0x0
+#define D3F1_DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED_MASK 0x10
+#define D3F1_DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED__SHIFT 0x4
+#define D3F1_DEVICE_CAP2__ARI_FORWARDING_SUPPORTED_MASK 0x20
+#define D3F1_DEVICE_CAP2__ARI_FORWARDING_SUPPORTED__SHIFT 0x5
+#define D3F1_DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED_MASK 0x40
+#define D3F1_DEVICE_CAP2__ATOMICOP_ROUTING_SUPPORTED__SHIFT 0x6
+#define D3F1_DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED_MASK 0x80
+#define D3F1_DEVICE_CAP2__ATOMICOP_32CMPLT_SUPPORTED__SHIFT 0x7
+#define D3F1_DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED_MASK 0x100
+#define D3F1_DEVICE_CAP2__ATOMICOP_64CMPLT_SUPPORTED__SHIFT 0x8
+#define D3F1_DEVICE_CAP2__CAS128_CMPLT_SUPPORTED_MASK 0x200
+#define D3F1_DEVICE_CAP2__CAS128_CMPLT_SUPPORTED__SHIFT 0x9
+#define D3F1_DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING_MASK 0x400
+#define D3F1_DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING__SHIFT 0xa
+#define D3F1_DEVICE_CAP2__LTR_SUPPORTED_MASK 0x800
+#define D3F1_DEVICE_CAP2__LTR_SUPPORTED__SHIFT 0xb
+#define D3F1_DEVICE_CAP2__TPH_CPLR_SUPPORTED_MASK 0x3000
+#define D3F1_DEVICE_CAP2__TPH_CPLR_SUPPORTED__SHIFT 0xc
+#define D3F1_DEVICE_CAP2__OBFF_SUPPORTED_MASK 0xc0000
+#define D3F1_DEVICE_CAP2__OBFF_SUPPORTED__SHIFT 0x12
+#define D3F1_DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED_MASK 0x100000
+#define D3F1_DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED__SHIFT 0x14
+#define D3F1_DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED_MASK 0x200000
+#define D3F1_DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED__SHIFT 0x15
+#define D3F1_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES_MASK 0xc00000
+#define D3F1_DEVICE_CAP2__MAX_END_END_TLP_PREFIXES__SHIFT 0x16
+#define D3F1_DEVICE_CNTL2__CPL_TIMEOUT_VALUE_MASK 0xf
+#define D3F1_DEVICE_CNTL2__CPL_TIMEOUT_VALUE__SHIFT 0x0
+#define D3F1_DEVICE_CNTL2__CPL_TIMEOUT_DIS_MASK 0x10
+#define D3F1_DEVICE_CNTL2__CPL_TIMEOUT_DIS__SHIFT 0x4
+#define D3F1_DEVICE_CNTL2__ARI_FORWARDING_EN_MASK 0x20
+#define D3F1_DEVICE_CNTL2__ARI_FORWARDING_EN__SHIFT 0x5
+#define D3F1_DEVICE_CNTL2__ATOMICOP_REQUEST_EN_MASK 0x40
+#define D3F1_DEVICE_CNTL2__ATOMICOP_REQUEST_EN__SHIFT 0x6
+#define D3F1_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING_MASK 0x80
+#define D3F1_DEVICE_CNTL2__ATOMICOP_EGRESS_BLOCKING__SHIFT 0x7
+#define D3F1_DEVICE_CNTL2__IDO_REQUEST_ENABLE_MASK 0x100
+#define D3F1_DEVICE_CNTL2__IDO_REQUEST_ENABLE__SHIFT 0x8
+#define D3F1_DEVICE_CNTL2__IDO_COMPLETION_ENABLE_MASK 0x200
+#define D3F1_DEVICE_CNTL2__IDO_COMPLETION_ENABLE__SHIFT 0x9
+#define D3F1_DEVICE_CNTL2__LTR_EN_MASK 0x400
+#define D3F1_DEVICE_CNTL2__LTR_EN__SHIFT 0xa
+#define D3F1_DEVICE_CNTL2__OBFF_EN_MASK 0x6000
+#define D3F1_DEVICE_CNTL2__OBFF_EN__SHIFT 0xd
+#define D3F1_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING_MASK 0x8000
+#define D3F1_DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING__SHIFT 0xf
+#define D3F1_DEVICE_STATUS2__RESERVED_MASK 0xffff0000
+#define D3F1_DEVICE_STATUS2__RESERVED__SHIFT 0x10
+#define D3F1_LINK_CAP2__SUPPORTED_LINK_SPEED_MASK 0xfe
+#define D3F1_LINK_CAP2__SUPPORTED_LINK_SPEED__SHIFT 0x1
+#define D3F1_LINK_CAP2__CROSSLINK_SUPPORTED_MASK 0x100
+#define D3F1_LINK_CAP2__CROSSLINK_SUPPORTED__SHIFT 0x8
+#define D3F1_LINK_CAP2__RESERVED_MASK 0xfffffe00
+#define D3F1_LINK_CAP2__RESERVED__SHIFT 0x9
+#define D3F1_LINK_CNTL2__TARGET_LINK_SPEED_MASK 0xf
+#define D3F1_LINK_CNTL2__TARGET_LINK_SPEED__SHIFT 0x0
+#define D3F1_LINK_CNTL2__ENTER_COMPLIANCE_MASK 0x10
+#define D3F1_LINK_CNTL2__ENTER_COMPLIANCE__SHIFT 0x4
+#define D3F1_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE_MASK 0x20
+#define D3F1_LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define D3F1_LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define D3F1_LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define D3F1_LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define D3F1_LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define D3F1_LINK_CNTL2__ENTER_MOD_COMPLIANCE_MASK 0x400
+#define D3F1_LINK_CNTL2__ENTER_MOD_COMPLIANCE__SHIFT 0xa
+#define D3F1_LINK_CNTL2__COMPLIANCE_SOS_MASK 0x800
+#define D3F1_LINK_CNTL2__COMPLIANCE_SOS__SHIFT 0xb
+#define D3F1_LINK_CNTL2__COMPLIANCE_DEEMPHASIS_MASK 0xf000
+#define D3F1_LINK_CNTL2__COMPLIANCE_DEEMPHASIS__SHIFT 0xc
+#define D3F1_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL_MASK 0x10000
+#define D3F1_LINK_STATUS2__CUR_DEEMPHASIS_LEVEL__SHIFT 0x10
+#define D3F1_LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x20000
+#define D3F1_LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x11
+#define D3F1_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x40000
+#define D3F1_LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x12
+#define D3F1_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS_MASK 0x80000
+#define D3F1_LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS__SHIFT 0x13
+#define D3F1_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS_MASK 0x100000
+#define D3F1_LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS__SHIFT 0x14
+#define D3F1_LINK_STATUS2__LINK_EQUALIZATION_REQUEST_MASK 0x200000
+#define D3F1_LINK_STATUS2__LINK_EQUALIZATION_REQUEST__SHIFT 0x15
+#define D3F1_SLOT_CAP2__RESERVED_MASK 0xffffffff
+#define D3F1_SLOT_CAP2__RESERVED__SHIFT 0x0
+#define D3F1_SLOT_CNTL2__RESERVED_MASK 0xffff
+#define D3F1_SLOT_CNTL2__RESERVED__SHIFT 0x0
+#define D3F1_SLOT_STATUS2__RESERVED_MASK 0xffff0000
+#define D3F1_SLOT_STATUS2__RESERVED__SHIFT 0x10
+#define D3F1_MSI_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F1_MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F1_MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F1_MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F1_MSI_MSG_CNTL__MSI_EN_MASK 0x10000
+#define D3F1_MSI_MSG_CNTL__MSI_EN__SHIFT 0x10
+#define D3F1_MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe0000
+#define D3F1_MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x11
+#define D3F1_MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x700000
+#define D3F1_MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x14
+#define D3F1_MSI_MSG_CNTL__MSI_64BIT_MASK 0x800000
+#define D3F1_MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x17
+#define D3F1_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP_MASK 0x1000000
+#define D3F1_MSI_MSG_CNTL__MSI_PERVECTOR_MASKING_CAP__SHIFT 0x18
+#define D3F1_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define D3F1_MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define D3F1_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define D3F1_MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define D3F1_MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define D3F1_MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define D3F1_MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define D3F1_MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define D3F1_SSID_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F1_SSID_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F1_SSID_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F1_SSID_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F1_SSID_CAP__SUBSYSTEM_VENDOR_ID_MASK 0xffff
+#define D3F1_SSID_CAP__SUBSYSTEM_VENDOR_ID__SHIFT 0x0
+#define D3F1_SSID_CAP__SUBSYSTEM_ID_MASK 0xffff0000
+#define D3F1_SSID_CAP__SUBSYSTEM_ID__SHIFT 0x10
+#define D3F1_MSI_MAP_CAP_LIST__CAP_ID_MASK 0xff
+#define D3F1_MSI_MAP_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F1_MSI_MAP_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define D3F1_MSI_MAP_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define D3F1_MSI_MAP_CAP__EN_MASK 0x10000
+#define D3F1_MSI_MAP_CAP__EN__SHIFT 0x10
+#define D3F1_MSI_MAP_CAP__FIXD_MASK 0x20000
+#define D3F1_MSI_MAP_CAP__FIXD__SHIFT 0x11
+#define D3F1_MSI_MAP_CAP__CAP_TYPE_MASK 0xf8000000
+#define D3F1_MSI_MAP_CAP__CAP_TYPE__SHIFT 0x1b
+#define D3F1_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO_MASK 0xfff00000
+#define D3F1_MSI_MAP_ADDR_LO__MSI_MAP_ADDR_LO__SHIFT 0x14
+#define D3F1_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI_MASK 0xffffffff
+#define D3F1_MSI_MAP_ADDR_HI__MSI_MAP_ADDR_HI__SHIFT 0x0
+#define D3F1_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F1_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F1_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F1_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F1_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F1_PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F1_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID_MASK 0xffff
+#define D3F1_PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID__SHIFT 0x0
+#define D3F1_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV_MASK 0xf0000
+#define D3F1_PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV__SHIFT 0x10
+#define D3F1_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH_MASK 0xfff00000
+#define D3F1_PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH__SHIFT 0x14
+#define D3F1_PCIE_VENDOR_SPECIFIC1__SCRATCH_MASK 0xffffffff
+#define D3F1_PCIE_VENDOR_SPECIFIC1__SCRATCH__SHIFT 0x0
+#define D3F1_PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define D3F1_PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define D3F1_PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F1_PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F1_PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F1_PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F1_PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F1_PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F1_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define D3F1_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define D3F1_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT_MASK 0x70

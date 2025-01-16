@@ -1,44 +1,19 @@
-#
-# Makefile for the USB Mass Storage device drivers.
-#
-# 15 Aug 2000, Christoph Hellwig <hch@infradead.org>
-# Rewritten to use lists instead of if-statements.
-#
 
-ccflags-y := -Idrivers/scsi
-
-obj-$(CONFIG_USB_UAS)		+= uas.o
-obj-$(CONFIG_USB_STORAGE)	+= usb-storage.o
-
-usb-storage-y := scsiglue.o protocol.o transport.o usb.o
-usb-storage-y += initializers.o sierra_ms.o option_ms.o
-usb-storage-y += usual-tables.o
-usb-storage-$(CONFIG_USB_STORAGE_DEBUG) += debug.o
-
-obj-$(CONFIG_USB_STORAGE_ALAUDA)	+= ums-alauda.o
-obj-$(CONFIG_USB_STORAGE_CYPRESS_ATACB) += ums-cypress.o
-obj-$(CONFIG_USB_STORAGE_DATAFAB)	+= ums-datafab.o
-obj-$(CONFIG_USB_STORAGE_ENE_UB6250)	+= ums-eneub6250.o
-obj-$(CONFIG_USB_STORAGE_FREECOM)	+= ums-freecom.o
-obj-$(CONFIG_USB_STORAGE_ISD200)	+= ums-isd200.o
-obj-$(CONFIG_USB_STORAGE_JUMPSHOT)	+= ums-jumpshot.o
-obj-$(CONFIG_USB_STORAGE_KARMA)		+= ums-karma.o
-obj-$(CONFIG_USB_STORAGE_ONETOUCH)	+= ums-onetouch.o
-obj-$(CONFIG_USB_STORAGE_REALTEK)	+= ums-realtek.o
-obj-$(CONFIG_USB_STORAGE_SDDR09)	+= ums-sddr09.o
-obj-$(CONFIG_USB_STORAGE_SDDR55)	+= ums-sddr55.o
-obj-$(CONFIG_USB_STORAGE_USBAT)		+= ums-usbat.o
-
-ums-alauda-y		:= alauda.o
-ums-cypress-y		:= cypress_atacb.o
-ums-datafab-y		:= datafab.o
-ums-eneub6250-y		:= ene_ub6250.o
-ums-freecom-y		:= freecom.o
-ums-isd200-y		:= isd200.o
-ums-jumpshot-y		:= jumpshot.o
-ums-karma-y		:= karma.o
-ums-onetouch-y		:= onetouch.o
-ums-realtek-y		:= realtek_cr.o
-ums-sddr09-y		:= sddr09.o
-ums-sddr55-y		:= sddr55.o
-ums-usbat-y		:= shuttle_usbat.o
+#define ixD3F5_PCIE_LC_STATE1                                                   0xa6
+#define ixD3F5_PCIE_LC_STATE2                                                   0xa7
+#define ixD3F5_PCIE_LC_STATE3                                                   0xa8
+#define ixD3F5_PCIE_LC_STATE4                                                   0xa9
+#define ixD3F5_PCIE_LC_STATE5                                                   0xaa
+#define ixD3F5_PCIEP_STRAP_LC                                                   0xc0
+#define ixD3F5_PCIEP_STRAP_MISC                                                 0xc1
+#define ixD3F5_PCIEP_BCH_ECC_CNTL                                               0xd0
+#define ixD3F5_PCIEP_HPGI_PRIVATE                                               0xd2
+#define ixD3F5_PCIEP_HPGI                                                       0xda
+#define ixD3F5_VENDOR_ID                                                        0xb000000
+#define ixD3F5_DEVICE_ID                                                        0xb000000
+#define ixD3F5_COMMAND                                                          0xb000001
+#define ixD3F5_STATUS                                                           0xb000001
+#define ixD3F5_REVISION_ID                                                      0xb000002
+#define ixD3F5_PROG_INTERFACE                                                   0xb000002
+#define ixD3F5_SUB_CLASS                                                        0xb000002
+#define ixD3F5_BASE_CLA

@@ -1,123 +1,41 @@
-/* Driver for USB Mass Storage devices
- * Usual Tables File for usb-storage and libusual
- *
- * Copyright (C) 2009 Alan Stern (stern@rowland.harvard.edu)
- *
- * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
- * information about this driver.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/usb.h>
-#include <linux/usb_usual.h>
-
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-#define COMPLIANT_DEV	UNUSUAL_DEV
-
-#define USUAL_DEV(useProto, useTrans) \
-{ USB_INTERFACE_INFO(USB_CLASS_MASS_STORAGE, useProto, useTrans) }
-
-/* Define the device is matched with Vendor ID and interface descriptors */
-#define UNUSUAL_VENDOR_INTF(id_vendor, cl, sc, pr, \
-			vendorName, productName, useProtocol, useTransport, \
-			initFunction, flags) \
-{ \
-	.match_flags = USB_DEVICE_ID_MATCH_INT_INFO \
-				| USB_DEVICE_ID_MATCH_VENDOR, \
-	.idVendor    = (id_vendor), \
-	.bInterfaceClass = (cl), \
-	.bInterfaceSubClass = (sc), \
-	.bInterfaceProtocol = (pr), \
-	.driver_info = (flags) \
-}
-
-struct usb_device_id usb_storage_usb_ids[] = {
-#	include "unusual_devs.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, usb_storage_usb_ids);
-
-#undef UNUSUAL_DEV
-#undef COMPLIANT_DEV
-#undef USUAL_DEV
-#undef UNUSUAL_VENDOR_INTF
-
-/*
- * The table of devices to ignore
- */
-struct ignore_entry {
-	u16	vid, pid, bcdmin, bcdmax;
-};
-
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{					\
-	.vid	= id_vendor,		\
-	.pid 	= id_product,		\
-	.bcdmin	= bcdDeviceMin,		\
-	.bcdmax = bcdDeviceMax,		\
-}
-
-static struct ignore_entry ignore_ids[] = {
-#	include "unusual_alauda.h"
-#	include "unusual_cypress.h"
-#	include "unusual_datafab.h"
-#	include "unusual_ene_ub6250.h"
-#	include "unusual_freecom.h"
-#	include "unusual_isd200.h"
-#	include "unusual_jumpshot.h"
-#	include "unusual_karma.h"
-#	include "unusual_onetouch.h"
-#	include "unusual_realtek.h"
-#	include "unusual_sddr09.h"
-#	include "unusual_sddr55.h"
-#	include "unusual_usbat.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-/* Return an error if a device is in the ignore_ids list */
-int usb_usual_ignore_device(struct usb_interface *intf)
-{
-	struct usb_device *udev;
-	unsigned vid, pid, bcd;
-	struct ignore_entry *p;
-
-	udev = interface_to_usbdev(intf);
-	vid = le16_to_cpu(udev->descriptor.idVendor);
-	pid = le16_to_cpu(udev->descriptor.idProduct);
-	bcd = le16_to_cpu(udev->descriptor.bcdDevice);
-
-	for (p = ignore_ids; p->vid; ++p) {
-		if (p->vid == vid && p->pid == pid &&
-				p->bcdmin <= bcd && p->bcdmax >= bcd)
-			return -ENXIO;
-	}
-	return 0;
-}
+                        0x1204103
+#define ixPSX80_PHY0_HTPLL_ROPLL_PciPllTestDebug2                               0x1204104
+#define ixPSX80_PHY0_HTPLL_ROPLL_PciPllFreqMode                                 0x1204105
+#define ixPSX80_PHY0_HTPLL_ROPLL_PciPllUpdateCtrl                               0x1204108
+#define ixPSX80_PHY0_HTPLL_ROPLL_PciPllTestDebug3                               0x1204109
+#define ixPSX80_PHY0_HTPLL_ROPLL_PciFuseProcess                                 0x120410a
+#define ixPSX80_PHY0_HTPLL_ROPLL_PciPllTestDebug4                               0x120410b
+#define ixPSX80_PHY0_HTPLL_ROPLL_PciPllTestDebug5                               0x120410c
+#define ixPSX80_PHY0_LCPLL_LCPLL_PowerDownEn                                    0x1204080
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllControlExt                               0x1204001
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllControl                                  0x1204002
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllTestDebug1                               0x1204003
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllTestDebug2                               0x1204004
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllFreqMode                                 0x1204005
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciLcVcoCtrl                                   0x1204007
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllUpdateCtrl                               0x1204008
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllTestDebug3                               0x1204009
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllTestDebug4                               0x120400b
+#define ixPSX80_PHY0_LCPLL_LCPLL_PciPllTestDebug5                               0x120400c
+#define ixPSX81_PHY0_COM_COMMON_FUSE1                                           0x1216200
+#define ixPSX81_PHY0_COM_COMMON_FUSE2                                           0x1216201
+#define ixPSX81_PHY0_COM_COMMON_FUSE3                                           0x1216202
+#define ixPSX81_PHY0_COM_COMMON_ELECIDLE                                        0x1216204
+#define ixPSX81_PHY0_COM_COMMON_DFX                                             0x1216205
+#define ixPSX81_PHY0_COM_COMMON_MAR_DEEMPH_NOM                                  0x1216206
+#define ixPSX81_PHY0_COM_COMMON_SELDEEMPH35                                     0x1216207
+#define ixPSX81_PHY0_COM_COMMON_SELDEEMPH60                                     0x1216208
+#define ixPSX81_PHY0_COM_COMMON_LANE_PWRMGMT                                    0x1216209
+#define ixPSX81_PHY0_COM_COMMON_ADAPTCTL1                                       0x121620a
+#define ixPSX81_PHY0_COM_COMMON_ADAPTCTL2                                       0x121620b
+#define ixPSX81_PHY0_COM_COMMON_ADAPT_CFG_BYP_VAL                               0x121620c
+#define ixPSX81_PHY0_COM_COMMON_ADAPT_CFG_BYP_VAL1                              0x121620d
+#define ixPSX81_PHY0_COM_COMMON_ADAPT_DBG_BYP_VAL                               0x121620e
+#define ixPSX81_PHY0_COM_COMMON_ADAPT_DBG_BYP_VAL1                              0x121620f
+#define ixPSX81_PHY0_COM_COMMON_ADAPT_DBG1                                      0x1216210
+#define ixPSX81_PHY0_COM_COMMON_LNCNTRL                                         0x1216211
+#define ixPSX81_PHY0_COM_COMMON_TXTESTDEBUG                                     0x1216212
+#define ixPSX81_PHY0_COM_COMMON_RXTESTDEBUG                                     0x1216213
+#define ixPSX81_PHY0_COM_COMMON_CDR_PHCTL                                       0x1216214
+#define ixPSX81_PHY0_COM_COMMON_CDR_FRCTL                                       0x1216215
+#define ixPSX81_PHY0_R

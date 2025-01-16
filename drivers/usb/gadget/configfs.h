@@ -1,19 +1,7 @@
-#ifndef USB__GADGET__CONFIGFS__H
-#define USB__GADGET__CONFIGFS__H
-
-#include <linux/configfs.h>
-
-void unregister_gadget_item(struct config_item *item);
-
-int usb_os_desc_prepare_interf_dir(struct config_group *parent,
-				   int n_interf,
-				   struct usb_os_desc **desc,
-				   char **names,
-				   struct module *owner);
-
-static inline struct usb_os_desc *to_usb_os_desc(struct config_item *item)
-{
-	return container_of(to_config_group(item), struct usb_os_desc, group);
-}
-
-#endif /*  USB__GADGET__CONFIGFS__H */
+EL_NUMBER_6__SHIFT 0x0
+#define AZALIA_F0_PIN_CONTROL_CODEC_CS_OVERRIDE_8__IEC_60958_CS_CHANNEL_NUMBER_7_MASK 0xf0
+#define AZALIA_F0_PIN_CONTROL_CODEC_CS_OVERRIDE_8__IEC_60958_CS_CHANNEL_NUMBER_7__SHIFT 0x4
+#define AZALIA_F0_CODEC_PIN_ASSOCIATION_INFO__ASSOCIATION_INFO_MASK 0xffffffff
+#define AZALIA_F0_CODEC_PIN_ASSOCIATION_INFO__ASSOCIATION_INFO__SHIFT 0x0
+#define AZALIA_F0_CODEC_PIN_CONTROL_DIGITAL_OUTPUT_STATUS__OUTPUT_ACTIVE_MASK 0x1
+#define AZALIA_F0_CODEC_PIN_CONTROL_DIGITAL_OUTPUT_STATUS__OUTPUT_ACTIVE_

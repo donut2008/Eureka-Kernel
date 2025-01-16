@@ -1,31 +1,19 @@
-#
-# TI SOC drivers
-#
-menuconfig SOC_TI
-	bool "TI SOC drivers support"
-
-if SOC_TI
-
-config KEYSTONE_NAVIGATOR_QMSS
-	tristate "Keystone Queue Manager Sub System"
-	depends on ARCH_KEYSTONE
-	help
-	  Say y here to support the Keystone multicore Navigator Queue
-	  Manager support. The Queue Manager is a hardware module that
-	  is responsible for accelerating management of the packet queues.
-	  Packets are queued/de-queued by writing/reading descriptor address
-	  to a particular memory mapped location in the Queue Manager module.
-
-	  If unsure, say N.
-
-config KEYSTONE_NAVIGATOR_DMA
-	tristate "TI Keystone Navigator Packet DMA support"
-	depends on ARCH_KEYSTONE
-	help
-	  Say y tp enable support for the Keystone Navigator Packet DMA on
-	  on Keystone family of devices. It sets up the dma channels for the
-	  Queue Manager Sub System.
-
-	  If unsure, say N.
-
-endif # SOC_TI
+_INT_STAT__SW_INT_STAT__SHIFT 0x0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SN_MASK 0xf
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SN__SHIFT 0x0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SP_MASK 0xf0
+#define GPIOPAD_STRENGTH__GPIO_STRENGTH_SP__SHIFT 0x4
+#define GPIOPAD_MASK__GPIO_MASK_MASK 0x7fffffff
+#define GPIOPAD_MASK__GPIO_MASK__SHIFT 0x0
+#define GPIOPAD_A__GPIO_A_MASK 0x7fffffff
+#define GPIOPAD_A__GPIO_A__SHIFT 0x0
+#define GPIOPAD_EN__GPIO_EN_MASK 0x7fffffff
+#define GPIOPAD_EN__GPIO_EN__SHIFT 0x0
+#define GPIOPAD_Y__GPIO_Y_MASK 0x7fffffff
+#define GPIOPAD_Y__GPIO_Y__SHIFT 0x0
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_0_MASK 0x1
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_0__SHIFT 0x0
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_1_MASK 0x2
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_1__SHIFT 0x1
+#define GPIOPAD_PINSTRAPS__GPIO_PINSTRAP_2_MASK 0x4
+#define GPIOPAD_PINSTRAPS__G

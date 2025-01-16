@@ -1,284 +1,73 @@
-/*
- * Allwinner SoCs SRAM Controller Driver
- *
- * Copyright (C) 2015 Maxime Ripard
- *
- * Author: Maxime Ripard <maxime.ripard@free-electrons.com>
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2.  This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
- */
-
-#include <linux/debugfs.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
-#include <linux/platform_device.h>
-
-#include <linux/soc/sunxi/sunxi_sram.h>
-
-struct sunxi_sram_func {
-	char	*func;
-	u8	val;
-};
-
-struct sunxi_sram_data {
-	char			*name;
-	u8			reg;
-	u8			offset;
-	u8			width;
-	struct sunxi_sram_func	*func;
-	struct list_head	list;
-};
-
-struct sunxi_sram_desc {
-	struct sunxi_sram_data	data;
-	bool			claimed;
-};
-
-#define SUNXI_SRAM_MAP(_val, _func)				\
-	{							\
-		.func = _func,					\
-		.val = _val,					\
-	}
-
-#define SUNXI_SRAM_DATA(_name, _reg, _off, _width, ...)		\
-	{							\
-		.name = _name,					\
-		.reg = _reg,					\
-		.offset = _off,					\
-		.width = _width,				\
-		.func = (struct sunxi_sram_func[]){		\
-			__VA_ARGS__, { } },			\
-	}
-
-static struct sunxi_sram_desc sun4i_a10_sram_a3_a4 = {
-	.data	= SUNXI_SRAM_DATA("A3-A4", 0x4, 0x4, 2,
-				  SUNXI_SRAM_MAP(0, "cpu"),
-				  SUNXI_SRAM_MAP(1, "emac")),
-};
-
-static struct sunxi_sram_desc sun4i_a10_sram_d = {
-	.data	= SUNXI_SRAM_DATA("D", 0x4, 0x0, 1,
-				  SUNXI_SRAM_MAP(0, "cpu"),
-				  SUNXI_SRAM_MAP(1, "usb-otg")),
-};
-
-static const struct of_device_id sunxi_sram_dt_ids[] = {
-	{
-		.compatible	= "allwinner,sun4i-a10-sram-a3-a4",
-		.data		= &sun4i_a10_sram_a3_a4.data,
-	},
-	{
-		.compatible	= "allwinner,sun4i-a10-sram-d",
-		.data		= &sun4i_a10_sram_d.data,
-	},
-	{}
-};
-
-static struct device *sram_dev;
-static LIST_HEAD(claimed_sram);
-static DEFINE_SPINLOCK(sram_lock);
-static void __iomem *base;
-
-static int sunxi_sram_show(struct seq_file *s, void *data)
-{
-	struct device_node *sram_node, *section_node;
-	const struct sunxi_sram_data *sram_data;
-	const struct of_device_id *match;
-	struct sunxi_sram_func *func;
-	const __be32 *sram_addr_p, *section_addr_p;
-	u32 val;
-
-	seq_puts(s, "Allwinner sunXi SRAM\n");
-	seq_puts(s, "--------------------\n\n");
-
-	for_each_child_of_node(sram_dev->of_node, sram_node) {
-		sram_addr_p = of_get_address(sram_node, 0, NULL, NULL);
-
-		seq_printf(s, "sram@%08x\n",
-			   be32_to_cpu(*sram_addr_p));
-
-		for_each_child_of_node(sram_node, section_node) {
-			match = of_match_node(sunxi_sram_dt_ids, section_node);
-			if (!match)
-				continue;
-			sram_data = match->data;
-
-			section_addr_p = of_get_address(section_node, 0,
-							NULL, NULL);
-
-			seq_printf(s, "\tsection@%04x\t(%s)\n",
-				   be32_to_cpu(*section_addr_p),
-				   sram_data->name);
-
-			val = readl(base + sram_data->reg);
-			val >>= sram_data->offset;
-			val &= sram_data->width;
-
-			for (func = sram_data->func; func->func; func++) {
-				seq_printf(s, "\t\t%s%c\n", func->func,
-					   func->val == val ? '*' : ' ');
-			}
-		}
-
-		seq_puts(s, "\n");
-	}
-
-	return 0;
-}
-
-static int sunxi_sram_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, sunxi_sram_show, inode->i_private);
-}
-
-static const struct file_operations sunxi_sram_fops = {
-	.open = sunxi_sram_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-static inline struct sunxi_sram_desc *to_sram_desc(const struct sunxi_sram_data *data)
-{
-	return container_of(data, struct sunxi_sram_desc, data);
-}
-
-static const struct sunxi_sram_data *sunxi_sram_of_parse(struct device_node *node,
-							 unsigned int *value)
-{
-	const struct of_device_id *match;
-	struct of_phandle_args args;
-	int ret;
-
-	ret = of_parse_phandle_with_fixed_args(node, "allwinner,sram", 1, 0,
-					       &args);
-	if (ret)
-		return ERR_PTR(ret);
-
-	if (!of_device_is_available(args.np)) {
-		ret = -EBUSY;
-		goto err;
-	}
-
-	if (value)
-		*value = args.args[0];
-
-	match = of_match_node(sunxi_sram_dt_ids, args.np);
-	if (!match) {
-		ret = -EINVAL;
-		goto err;
-	}
-
-	of_node_put(args.np);
-	return match->data;
-
-err:
-	of_node_put(args.np);
-	return ERR_PTR(ret);
-}
-
-int sunxi_sram_claim(struct device *dev)
-{
-	const struct sunxi_sram_data *sram_data;
-	struct sunxi_sram_desc *sram_desc;
-	unsigned int device;
-	u32 val, mask;
-
-	if (IS_ERR(base))
-		return -EPROBE_DEFER;
-
-	if (!dev || !dev->of_node)
-		return -EINVAL;
-
-	sram_data = sunxi_sram_of_parse(dev->of_node, &device);
-	if (IS_ERR(sram_data))
-		return PTR_ERR(sram_data);
-
-	sram_desc = to_sram_desc(sram_data);
-
-	spin_lock(&sram_lock);
-
-	if (sram_desc->claimed) {
-		spin_unlock(&sram_lock);
-		return -EBUSY;
-	}
-
-	mask = GENMASK(sram_data->offset + sram_data->width, sram_data->offset);
-	val = readl(base + sram_data->reg);
-	val &= ~mask;
-	writel(val | ((device << sram_data->offset) & mask),
-	       base + sram_data->reg);
-
-	spin_unlock(&sram_lock);
-
-	return 0;
-}
-EXPORT_SYMBOL(sunxi_sram_claim);
-
-int sunxi_sram_release(struct device *dev)
-{
-	const struct sunxi_sram_data *sram_data;
-	struct sunxi_sram_desc *sram_desc;
-
-	if (!dev || !dev->of_node)
-		return -EINVAL;
-
-	sram_data = sunxi_sram_of_parse(dev->of_node, NULL);
-	if (IS_ERR(sram_data))
-		return -EINVAL;
-
-	sram_desc = to_sram_desc(sram_data);
-
-	spin_lock(&sram_lock);
-	sram_desc->claimed = false;
-	spin_unlock(&sram_lock);
-
-	return 0;
-}
-EXPORT_SYMBOL(sunxi_sram_release);
-
-static int sunxi_sram_probe(struct platform_device *pdev)
-{
-	struct resource *res;
-	struct dentry *d;
-
-	sram_dev = &pdev->dev;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(base))
-		return PTR_ERR(base);
-
-	of_platform_populate(pdev->dev.of_node, NULL, NULL, &pdev->dev);
-
-	d = debugfs_create_file("sram", S_IRUGO, NULL, NULL,
-				&sunxi_sram_fops);
-	if (!d)
-		return -ENOMEM;
-
-	return 0;
-}
-
-static const struct of_device_id sunxi_sram_dt_match[] = {
-	{ .compatible = "allwinner,sun4i-a10-sram-controller" },
-	{ },
-};
-MODULE_DEVICE_TABLE(of, sunxi_sram_dt_match);
-
-static struct platform_driver sunxi_sram_driver = {
-	.driver = {
-		.name		= "sunxi-sram",
-		.of_match_table	= sunxi_sram_dt_match,
-	},
-	.probe	= sunxi_sram_probe,
-};
-module_platform_driver(sunxi_sram_driver);
-
-MODULE_AUTHOR("Maxime Ripard <maxime.ripard@free-electrons.com>");
-MODULE_DESCRIPTION("Allwinner sunXi SRAM Controller Driver");
-MODULE_LICENSE("GPL");
+URES_1                                                 0x3f814
+#define ixDPM_TABLE_1                                                           0x3f000
+#define ixDPM_TABLE_2                                                           0x3f004
+#define ixDPM_TABLE_3                                                           0x3f008
+#define ixDPM_TABLE_4                                                           0x3f00c
+#define ixDPM_TABLE_5                                                           0x3f010
+#define ixDPM_TABLE_6                                                           0x3f014
+#define ixDPM_TABLE_7                                                           0x3f018
+#define ixDPM_TABLE_8                                                           0x3f01c
+#define ixDPM_TABLE_9                                                           0x3f020
+#define ixDPM_TABLE_10                                                          0x3f024
+#define ixDPM_TABLE_11                                                          0x3f028
+#define ixDPM_TABLE_12                                                          0x3f02c
+#define ixDPM_TABLE_13                                                          0x3f030
+#define ixDPM_TABLE_14                                                          0x3f034
+#define ixDPM_TABLE_15                                                          0x3f038
+#define ixDPM_TABLE_16                                                          0x3f03c
+#define ixDPM_TABLE_17                                                          0x3f040
+#define ixDPM_TABLE_18                                                          0x3f044
+#define ixDPM_TABLE_19                                                          0x3f048
+#define ixDPM_TABLE_20                                                          0x3f04c
+#define ixDPM_TABLE_21                                                          0x3f050
+#define ixDPM_TABLE_22                                                          0x3f054
+#define ixDPM_TABLE_23                                                          0x3f058
+#define ixDPM_TABLE_24                                                          0x3f05c
+#define ixDPM_TABLE_25                                                          0x3f060
+#define ixDPM_TABLE_26                                                          0x3f064
+#define ixDPM_TABLE_27                                                          0x3f068
+#define ixDPM_TABLE_28                                                          0x3f06c
+#define ixDPM_TABLE_29                                                          0x3f070
+#define ixDPM_TABLE_30                                                          0x3f074
+#define ixDPM_TABLE_31                                                          0x3f078
+#define ixDPM_TABLE_32                                                          0x3f07c
+#define ixDPM_TABLE_33                                                          0x3f080
+#define ixDPM_TABLE_34                                                          0x3f084
+#define ixDPM_TABLE_35                                                          0x3f088
+#define ixDPM_TABLE_36                                                          0x3f08c
+#define ixDPM_TABLE_37                                                          0x3f090
+#define ixDPM_TABLE_38                                                          0x3f094
+#define ixDPM_TABLE_39                                                          0x3f098
+#define ixDPM_TABLE_40                                                          0x3f09c
+#define ixDPM_TABLE_41                                                          0x3f0a0
+#define ixDPM_TABLE_42                                                          0x3f0a4
+#define ixDPM_TABLE_43                                                          0x3f0a8
+#define ixDPM_TABLE_44                                                          0x3f0ac
+#define ixDPM_TABLE_45                                                          0x3f0b0
+#define ixDPM_TABLE_46                                                          0x3f0b4
+#define ixDPM_TABLE_47                                                          0x3f0b8
+#define ixDPM_TABLE_48                                                          0x3f0bc
+#define ixDPM_TABLE_49                                                          0x3f0c0
+#define ixDPM_TABLE_50                                                          0x3f0c4
+#define ixDPM_TABLE_51                                                          0x3f0c8
+#define ixDPM_TABLE_52                                                          0x3f0cc
+#define ixDPM_TABLE_53                                                          0x3f0d0
+#define ixDPM_TABLE_54                                                          0x3f0d4
+#define ixDPM_TABLE_55                                                          0x3f0d8
+#define ixDPM_TABLE_56                                                          0x3f0dc
+#define ixDPM_TABLE_57                                                          0x3f0e0
+#define ixDPM_TABLE_58                                                          0x3f0e4
+#define ixDPM_TABLE_59                                                          0x3f0e8
+#define ixDPM_TABLE_60                                                          0x3f0ec
+#define ixDPM_TABLE_61                                                          0x3f0f0
+#define ixDPM_TABLE_62                                                          0x3f0f4
+#define ixDPM_TABLE_63                                                          0x3f0f8
+#define ixDPM_TABLE_64                                                          0x3f0fc
+#define ixDPM_TABLE_65                                                          0x3f100
+#define ixDPM_TABLE_66                                                          0x3f104
+#define ixDPM_TABLE_67                                                          0x3f108
+#define ixDPM_TABLE_68                                                          0x3f10c
+#define ixDPM_TABLE_69                                                          0x3f110
+#define ixDPM_TABLE_70                                                          0x3f114
+#define ixDPM_TABLE_71                                                          0x3f118
+#define ixDPM_TABLE_72     

@@ -1,192 +1,232 @@
-/* drivers/input/misc/gpio_axis.c
- *
- * Copyright (C) 2007 Google, Inc.
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
+_put_tx_iu(ch, iu, SRP_IU_CMD);
 
-#include <linux/kernel.h>
-#include <linux/gpio.h>
-#include <linux/gpio_event.h>
-#include <linux/interrupt.h>
-#include <linux/slab.h>
+	/*
+	 * Avoid that the loops that iterate over the request ring can
+	 * encounter a dangling SCSI command pointer.
+	 */
+	req->scmnd = NULL;
 
-struct gpio_axis_state {
-	struct gpio_event_input_devs *input_devs;
-	struct gpio_event_axis_info *info;
-	uint32_t pos;
-};
-
-uint16_t gpio_axis_4bit_gray_map_table[] = {
-	[0x0] = 0x0, [0x1] = 0x1, /* 0000 0001 */
-	[0x3] = 0x2, [0x2] = 0x3, /* 0011 0010 */
-	[0x6] = 0x4, [0x7] = 0x5, /* 0110 0111 */
-	[0x5] = 0x6, [0x4] = 0x7, /* 0101 0100 */
-	[0xc] = 0x8, [0xd] = 0x9, /* 1100 1101 */
-	[0xf] = 0xa, [0xe] = 0xb, /* 1111 1110 */
-	[0xa] = 0xc, [0xb] = 0xd, /* 1010 1011 */
-	[0x9] = 0xe, [0x8] = 0xf, /* 1001 1000 */
-};
-uint16_t gpio_axis_4bit_gray_map(struct gpio_event_axis_info *info, uint16_t in)
-{
-	return gpio_axis_4bit_gray_map_table[in];
-}
-
-uint16_t gpio_axis_5bit_singletrack_map_table[] = {
-	[0x10] = 0x00, [0x14] = 0x01, [0x1c] = 0x02, /*     10000 10100 11100 */
-	[0x1e] = 0x03, [0x1a] = 0x04, [0x18] = 0x05, /*     11110 11010 11000 */
-	[0x08] = 0x06, [0x0a] = 0x07, [0x0e] = 0x08, /*    01000 01010 01110  */
-	[0x0f] = 0x09, [0x0d] = 0x0a, [0x0c] = 0x0b, /*    01111 01101 01100  */
-	[0x04] = 0x0c, [0x05] = 0x0d, [0x07] = 0x0e, /*   00100 00101 00111   */
-	[0x17] = 0x0f, [0x16] = 0x10, [0x06] = 0x11, /*   10111 10110 00110   */
-	[0x02] = 0x12, [0x12] = 0x13, [0x13] = 0x14, /*  00010 10010 10011    */
-	[0x1b] = 0x15, [0x0b] = 0x16, [0x03] = 0x17, /*  11011 01011 00011    */
-	[0x01] = 0x18, [0x09] = 0x19, [0x19] = 0x1a, /* 00001 01001 11001     */
-	[0x1d] = 0x1b, [0x15] = 0x1c, [0x11] = 0x1d, /* 11101 10101 10001     */
-};
-uint16_t gpio_axis_5bit_singletrack_map(
-	struct gpio_event_axis_info *info, uint16_t in)
-{
-	return gpio_axis_5bit_singletrack_map_table[in];
-}
-
-static void gpio_event_update_axis(struct gpio_axis_state *as, int report)
-{
-	struct gpio_event_axis_info *ai = as->info;
-	int i;
-	int change;
-	uint16_t state = 0;
-	uint16_t pos;
-	uint16_t old_pos = as->pos;
-	for (i = ai->count - 1; i >= 0; i--)
-		state = (state << 1) | gpio_get_value(ai->gpio[i]);
-	pos = ai->map(ai, state);
-	if (ai->flags & GPIOEAF_PRINT_RAW)
-		pr_info("axis %d-%d raw %x, pos %d -> %d\n",
-			ai->type, ai->code, state, old_pos, pos);
-	if (report && pos != old_pos) {
-		if (ai->type == EV_REL) {
-			change = (ai->decoded_size + pos - old_pos) %
-				  ai->decoded_size;
-			if (change > ai->decoded_size / 2)
-				change -= ai->decoded_size;
-			if (change == ai->decoded_size / 2) {
-				if (ai->flags & GPIOEAF_PRINT_EVENT)
-					pr_info("axis %d-%d unknown direction, "
-						"pos %d -> %d\n", ai->type,
-						ai->code, old_pos, pos);
-				change = 0; /* no closest direction */
-			}
-			if (ai->flags & GPIOEAF_PRINT_EVENT)
-				pr_info("axis %d-%d change %d\n",
-					ai->type, ai->code, change);
-			input_report_rel(as->input_devs->dev[ai->dev],
-						ai->code, change);
-		} else {
-			if (ai->flags & GPIOEAF_PRINT_EVENT)
-				pr_info("axis %d-%d now %d\n",
-					ai->type, ai->code, pos);
-			input_event(as->input_devs->dev[ai->dev],
-					ai->type, ai->code, pos);
-		}
-		input_sync(as->input_devs->dev[ai->dev]);
+err:
+	if (scmnd->result) {
+		scmnd->scsi_done(scmnd);
+		ret = 0;
+	} else {
+		ret = SCSI_MLQUEUE_HOST_BUSY;
 	}
-	as->pos = pos;
+
+	goto unlock_rport;
 }
 
-static irqreturn_t gpio_axis_irq_handler(int irq, void *dev_id)
+/*
+ * Note: the resources allocated in this function are freed in
+ * srp_free_ch_ib().
+ */
+static int srp_alloc_iu_bufs(struct srp_rdma_ch *ch)
 {
-	struct gpio_axis_state *as = dev_id;
-	gpio_event_update_axis(as, 1);
-	return IRQ_HANDLED;
+	struct srp_target_port *target = ch->target;
+	int i;
+
+	ch->rx_ring = kcalloc(target->queue_size, sizeof(*ch->rx_ring),
+			      GFP_KERNEL);
+	if (!ch->rx_ring)
+		goto err_no_ring;
+	ch->tx_ring = kcalloc(target->queue_size, sizeof(*ch->tx_ring),
+			      GFP_KERNEL);
+	if (!ch->tx_ring)
+		goto err_no_ring;
+
+	for (i = 0; i < target->queue_size; ++i) {
+		ch->rx_ring[i] = srp_alloc_iu(target->srp_host,
+					      ch->max_ti_iu_len,
+					      GFP_KERNEL, DMA_FROM_DEVICE);
+		if (!ch->rx_ring[i])
+			goto err;
+	}
+
+	for (i = 0; i < target->queue_size; ++i) {
+		ch->tx_ring[i] = srp_alloc_iu(target->srp_host,
+					      target->max_iu_len,
+					      GFP_KERNEL, DMA_TO_DEVICE);
+		if (!ch->tx_ring[i])
+			goto err;
+
+		list_add(&ch->tx_ring[i]->list, &ch->free_tx);
+	}
+
+	return 0;
+
+err:
+	for (i = 0; i < target->queue_size; ++i) {
+		srp_free_iu(target->srp_host, ch->rx_ring[i]);
+		srp_free_iu(target->srp_host, ch->tx_ring[i]);
+	}
+
+
+err_no_ring:
+	kfree(ch->tx_ring);
+	ch->tx_ring = NULL;
+	kfree(ch->rx_ring);
+	ch->rx_ring = NULL;
+
+	return -ENOMEM;
 }
 
-int gpio_event_axis_func(struct gpio_event_input_devs *input_devs,
-			 struct gpio_event_info *info, void **data, int func)
+static uint32_t srp_compute_rq_tmo(struct ib_qp_attr *qp_attr, int attr_mask)
 {
+	uint64_t T_tr_ns, max_compl_time_ms;
+	uint32_t rq_tmo_jiffies;
+
+	/*
+	 * According to section 11.2.4.2 in the IBTA spec (Modify Queue Pair,
+	 * table 91), both the QP timeout and the retry count have to be set
+	 * for RC QP's during the RTR to RTS transition.
+	 */
+	WARN_ON_ONCE((attr_mask & (IB_QP_TIMEOUT | IB_QP_RETRY_CNT)) !=
+		     (IB_QP_TIMEOUT | IB_QP_RETRY_CNT));
+
+	/*
+	 * Set target->rq_tmo_jiffies to one second more than the largest time
+	 * it can take before an error completion is generated. See also
+	 * C9-140..142 in the IBTA spec for more information about how to
+	 * convert the QP Local ACK Timeout value to nanoseconds.
+	 */
+	T_tr_ns = 4096 * (1ULL << qp_attr->timeout);
+	max_compl_time_ms = qp_attr->retry_cnt * 4 * T_tr_ns;
+	do_div(max_compl_time_ms, NSEC_PER_MSEC);
+	rq_tmo_jiffies = msecs_to_jiffies(max_compl_time_ms + 1000);
+
+	return rq_tmo_jiffies;
+}
+
+static void srp_cm_rep_handler(struct ib_cm_id *cm_id,
+			       const struct srp_login_rsp *lrsp,
+			       struct srp_rdma_ch *ch)
+{
+	struct srp_target_port *target = ch->target;
+	struct ib_qp_attr *qp_attr = NULL;
+	int attr_mask = 0;
 	int ret;
 	int i;
-	int irq;
-	struct gpio_event_axis_info *ai;
-	struct gpio_axis_state *as;
 
-	ai = container_of(info, struct gpio_event_axis_info, info);
-	if (func == GPIO_EVENT_FUNC_SUSPEND) {
-		for (i = 0; i < ai->count; i++)
-			disable_irq(gpio_to_irq(ai->gpio[i]));
-		return 0;
-	}
-	if (func == GPIO_EVENT_FUNC_RESUME) {
-		for (i = 0; i < ai->count; i++)
-			enable_irq(gpio_to_irq(ai->gpio[i]));
-		return 0;
-	}
+	if (lrsp->opcode == SRP_LOGIN_RSP) {
+		ch->max_ti_iu_len = be32_to_cpu(lrsp->max_ti_iu_len);
+		ch->req_lim       = be32_to_cpu(lrsp->req_lim_delta);
 
-	if (func == GPIO_EVENT_FUNC_INIT) {
-		*data = as = kmalloc(sizeof(*as), GFP_KERNEL);
-		if (as == NULL) {
-			ret = -ENOMEM;
-			goto err_alloc_axis_state_failed;
-		}
-		as->input_devs = input_devs;
-		as->info = ai;
-		if (ai->dev >= input_devs->count) {
-			pr_err("gpio_event_axis: bad device index %d >= %d "
-				"for %d:%d\n", ai->dev, input_devs->count,
-				ai->type, ai->code);
-			ret = -EINVAL;
-			goto err_bad_device_index;
-		}
-
-		input_set_capability(input_devs->dev[ai->dev],
-				     ai->type, ai->code);
-		if (ai->type == EV_ABS) {
-			input_set_abs_params(input_devs->dev[ai->dev], ai->code,
-					     0, ai->decoded_size - 1, 0, 0);
-		}
-		for (i = 0; i < ai->count; i++) {
-			ret = gpio_request(ai->gpio[i], "gpio_event_axis");
-			if (ret < 0)
-				goto err_request_gpio_failed;
-			ret = gpio_direction_input(ai->gpio[i]);
-			if (ret < 0)
-				goto err_gpio_direction_input_failed;
-			ret = irq = gpio_to_irq(ai->gpio[i]);
-			if (ret < 0)
-				goto err_get_irq_num_failed;
-			ret = request_irq(irq, gpio_axis_irq_handler,
-					  IRQF_TRIGGER_RISING |
-					  IRQF_TRIGGER_FALLING,
-					  "gpio_event_axis", as);
-			if (ret < 0)
-				goto err_request_irq_failed;
-		}
-		gpio_event_update_axis(as, 0);
-		return 0;
+		/*
+		 * Reserve credits for task management so we don't
+		 * bounce requests back to the SCSI mid-layer.
+		 */
+		target->scsi_host->can_queue
+			= min(ch->req_lim - SRP_TSK_MGMT_SQ_SIZE,
+			      target->scsi_host->can_queue);
+		target->scsi_host->cmd_per_lun
+			= min_t(int, target->scsi_host->can_queue,
+				target->scsi_host->cmd_per_lun);
+	} else {
+		shost_printk(KERN_WARNING, target->scsi_host,
+			     PFX "Unhandled RSP opcode %#x\n", lrsp->opcode);
+		ret = -ECONNRESET;
+		goto error;
 	}
 
-	ret = 0;
-	as = *data;
-	for (i = ai->count - 1; i >= 0; i--) {
-		free_irq(gpio_to_irq(ai->gpio[i]), as);
-err_request_irq_failed:
-err_get_irq_num_failed:
-err_gpio_direction_input_failed:
-		gpio_free(ai->gpio[i]);
-err_request_gpio_failed:
-		;
+	if (!ch->rx_ring) {
+		ret = srp_alloc_iu_bufs(ch);
+		if (ret)
+			goto error;
 	}
-err_bad_device_index:
-	kfree(as);
-	*data = NULL;
-err_alloc_axis_state_failed:
-	return ret;
+
+	ret = -ENOMEM;
+	qp_attr = kmalloc(sizeof *qp_attr, GFP_KERNEL);
+	if (!qp_attr)
+		goto error;
+
+	qp_attr->qp_state = IB_QPS_RTR;
+	ret = ib_cm_init_qp_attr(cm_id, qp_attr, &attr_mask);
+	if (ret)
+		goto error_free;
+
+	ret = ib_modify_qp(ch->qp, qp_attr, attr_mask);
+	if (ret)
+		goto error_free;
+
+	for (i = 0; i < target->queue_size; i++) {
+		struct srp_iu *iu = ch->rx_ring[i];
+
+		ret = srp_post_recv(ch, iu);
+		if (ret)
+			goto error_free;
+	}
+
+	qp_attr->qp_state = IB_QPS_RTS;
+	ret = ib_cm_init_qp_attr(cm_id, qp_attr, &attr_mask);
+	if (ret)
+		goto error_free;
+
+	target->rq_tmo_jiffies = srp_compute_rq_tmo(qp_attr, attr_mask);
+
+	ret = ib_modify_qp(ch->qp, qp_attr, attr_mask);
+	if (ret)
+		goto error_free;
+
+	ret = ib_send_cm_rtu(cm_id, NULL, 0);
+
+error_free:
+	kfree(qp_attr);
+
+error:
+	ch->status = ret;
 }
+
+static void srp_cm_rej_handler(struct ib_cm_id *cm_id,
+			       struct ib_cm_event *event,
+			       struct srp_rdma_ch *ch)
+{
+	struct srp_target_port *target = ch->target;
+	struct Scsi_Host *shost = target->scsi_host;
+	struct ib_class_port_info *cpi;
+	int opcode;
+
+	switch (event->param.rej_rcvd.reason) {
+	case IB_CM_REJ_PORT_CM_REDIRECT:
+		cpi = event->param.rej_rcvd.ari;
+		ch->path.dlid = cpi->redirect_lid;
+		ch->path.pkey = cpi->redirect_pkey;
+		cm_id->remote_cm_qpn = be32_to_cpu(cpi->redirect_qp) & 0x00ffffff;
+		memcpy(ch->path.dgid.raw, cpi->redirect_gid, 16);
+
+		ch->status = ch->path.dlid ?
+			SRP_DLID_REDIRECT : SRP_PORT_REDIRECT;
+		break;
+
+	case IB_CM_REJ_PORT_REDIRECT:
+		if (srp_target_is_topspin(target)) {
+			/*
+			 * Topspin/Cisco SRP gateways incorrectly send
+			 * reject reason code 25 when they mean 24
+			 * (port redirect).
+			 */
+			memcpy(ch->path.dgid.raw,
+			       event->param.rej_rcvd.ari, 16);
+
+			shost_printk(KERN_DEBUG, shost,
+				     PFX "Topspin/Cisco redirect to target port GID %016llx%016llx\n",
+				     be64_to_cpu(ch->path.dgid.global.subnet_prefix),
+				     be64_to_cpu(ch->path.dgid.global.interface_id));
+
+			ch->status = SRP_PORT_REDIRECT;
+		} else {
+			shost_printk(KERN_WARNING, shost,
+				     "  REJ reason: IB_CM_REJ_PORT_REDIRECT\n");
+			ch->status = -ECONNRESET;
+		}
+		break;
+
+	case IB_CM_REJ_DUPLICATE_LOCAL_COMM_ID:
+		shost_printk(KERN_WARNING, shost,
+			    "  REJ reason: IB_CM_REJ_DUPLICATE_LOCAL_COMM_ID\n");
+		ch->status = -ECONNRESET;
+		break;
+
+	case IB_CM_REJ_CONSUMER_DEFINED:
+		opcode = *(u8 *) event->private_data;
+		if (opcode == SR

@@ -1,219 +1,161 @@
+truct ia64_mca_cpu);
+	int cpu = smp_processor_id();
+	static int first_time = 1;
+
+	/*
+	 * Structure will already be allocated if cpu has been online,
+	 * then offlined.
+	 */
+	if (__per_cpu_mca[cpu]) {
+		data = __va(__per_cpu_mca[cpu]);
+	} else {
+		if (first_time) {
+			data = mca_bootmem();
+			first_time = 0;
+		} else
+			data = (void *)__get_free_pages(GFP_ATOMIC,
+							get_order(sz));
+		if (!data)
+			panic("Could not allocate MCA memory for cpu %d\n",
+					cpu);
+	}
+	format_mca_init_stack(data, offsetof(struct ia64_mca_cpu, mca_stack),
+		"MCA", cpu);
+	format_mca_init_stack(data, offsetof(struct ia64_mca_cpu, init_stack),
+		"INIT", cpu);
+	__this_cpu_write(ia64_mca_data, (__per_cpu_mca[cpu] = __pa(data)));
+
+	/*
+	 * Stash away a copy of the PTE needed to map the per-CPU page.
+	 * We may need it during MCA recovery.
+	 */
+	__this_cpu_write(ia64_mca_per_cpu_pte,
+		pte_val(mk_pte_phys(__pa(cpu_data), PAGE_KERNEL)));
+
+	/*
+	 * Also, stash away a copy of the PAL address and the PTE
+	 * needed to map it.
+	 */
+	pal_vaddr = efi_get_pal_addr();
+	if (!pal_vaddr)
+		return;
+	__this_cpu_write(ia64_mca_pal_base,
+		GRANULEROUNDDOWN((unsigned long) pal_vaddr));
+	__this_cpu_write(ia64_mca_pal_pte, pte_val(mk_pte_phys(__pa(pal_vaddr),
+							      PAGE_KERNEL)));
+}
+
+static void ia64_mca_cmc_vector_adjust(void *dummy)
+{
+	unsigned long flags;
+
+	local_irq_save(flags);
+	if (!cmc_polling_enabled)
+		ia64_mca_cmc_vector_enable(NULL);
+	local_irq_restore(flags);
+}
+
+static int mca_cpu_callback(struct notifier_block *nfb,
+				      unsigned long action,
+				      void *hcpu)
+{
+	int hotcpu = (unsigned long) hcpu;
+
+	switch (action) {
+	case CPU_ONLINE:
+	case CPU_ONLINE_FROZEN:
+		smp_call_function_single(hotcpu, ia64_mca_cmc_vector_adjust,
+					 NULL, 0);
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block mca_cpu_notifier = {
+	.notifier_call = mca_cpu_callback
+};
+
 /*
- * s390 specific pci instructions
+ * ia64_mca_init
  *
- * Copyright IBM Corp. 2013
+ *  Do all the system level mca specific initialization.
+ *
+ *	1. Register spinloop and wakeup request interrupt vectors
+ *
+ *	2. Register OS_MCA handler entry point
+ *
+ *	3. Register OS_INIT handler entry point
+ *
+ *  4. Initialize MCA/CMC/INIT related log buffers maintained by the OS.
+ *
+ *  Note that this initialization is done very early before some kernel
+ *  services are available.
+ *
+ *  Inputs  :   None
+ *
+ *  Outputs :   None
  */
-
-#include <linux/export.h>
-#include <linux/errno.h>
-#include <linux/delay.h>
-#include <asm/facility.h>
-#include <asm/pci_insn.h>
-#include <asm/pci_debug.h>
-#include <asm/processor.h>
-
-#define ZPCI_INSN_BUSY_DELAY	1	/* 1 microsecond */
-
-static inline void zpci_err_insn(u8 cc, u8 status, u64 req, u64 offset)
+void __init
+ia64_mca_init(void)
 {
-	struct {
-		u64 req;
-		u64 offset;
-		u8 cc;
-		u8 status;
-	} __packed data = {req, offset, cc, status};
+	ia64_fptr_t *init_hldlr_ptr_monarch = (ia64_fptr_t *)ia64_os_init_dispatch_monarch;
+	ia64_fptr_t *init_hldlr_ptr_slave = (ia64_fptr_t *)ia64_os_init_dispatch_slave;
+	ia64_fptr_t *mca_hldlr_ptr = (ia64_fptr_t *)ia64_os_mca_dispatch;
+	int i;
+	long rc;
+	struct ia64_sal_retval isrv;
+	unsigned long timeout = IA64_MCA_RENDEZ_TIMEOUT; /* platform specific */
+	static struct notifier_block default_init_monarch_nb = {
+		.notifier_call = default_monarch_init_process,
+		.priority = 0/* we need to notified last */
+	};
 
-	zpci_err_hex(&data, sizeof(data));
-}
+	IA64_MCA_DEBUG("%s: begin\n", __func__);
 
-/* Modify PCI Function Controls */
-static inline u8 __mpcifc(u64 req, struct zpci_fib *fib, u8 *status)
-{
-	u8 cc;
+	/* Clear the Rendez checkin flag for all cpus */
+	for(i = 0 ; i < NR_CPUS; i++)
+		ia64_mc_info.imi_rendez_checkin[i] = IA64_MCA_RENDEZ_CHECKIN_NOTDONE;
 
-	asm volatile (
-		"	.insn	rxy,0xe300000000d0,%[req],%[fib]\n"
-		"	ipm	%[cc]\n"
-		"	srl	%[cc],28\n"
-		: [cc] "=d" (cc), [req] "+d" (req), [fib] "+Q" (*fib)
-		: : "cc");
-	*status = req >> 24 & 0xff;
-	return cc;
-}
+	/*
+	 * Register the rendezvous spinloop and wakeup mechanism with SAL
+	 */
 
-int zpci_mod_fc(u64 req, struct zpci_fib *fib)
-{
-	u8 cc, status;
+	/* Register the rendezvous interrupt vector with SAL */
+	while (1) {
+		isrv = ia64_sal_mc_set_params(SAL_MC_PARAM_RENDEZ_INT,
+					      SAL_MC_PARAM_MECHANISM_INT,
+					      IA64_MCA_RENDEZ_VECTOR,
+					      timeout,
+					      SAL_MC_PARAM_RZ_ALWAYS);
+		rc = isrv.status;
+		if (rc == 0)
+			break;
+		if (rc == -2) {
+			printk(KERN_INFO "Increasing MCA rendezvous timeout from "
+				"%ld to %ld milliseconds\n", timeout, isrv.v0);
+			timeout = isrv.v0;
+			NOTIFY_MCA(DIE_MCA_NEW_TIMEOUT, NULL, timeout, 0);
+			continue;
+		}
+		printk(KERN_ERR "Failed to register rendezvous interrupt "
+		       "with SAL (status %ld)\n", rc);
+		return;
+	}
 
-	do {
-		cc = __mpcifc(req, fib, &status);
-		if (cc == 2)
-			msleep(ZPCI_INSN_BUSY_DELAY);
-	} while (cc == 2);
+	/* Register the wakeup interrupt vector with SAL */
+	isrv = ia64_sal_mc_set_params(SAL_MC_PARAM_RENDEZ_WAKEUP,
+				      SAL_MC_PARAM_MECHANISM_INT,
+				      IA64_MCA_WAKEUP_VECTOR,
+				      0, 0);
+	rc = isrv.status;
+	if (rc) {
+		printk(KERN_ERR "Failed to register wakeup interrupt with SAL "
+		       "(status %ld)\n", rc);
+		return;
+	}
 
-	if (cc)
-		zpci_err_insn(cc, status, req, 0);
+	IA64_MCA_DEBUG("%s: registered MCA rendezvous spinloop and wakeup mech.\n", __func__);
 
-	return (cc) ? -EIO : 0;
-}
-
-/* Refresh PCI Translations */
-static inline u8 __rpcit(u64 fn, u64 addr, u64 range, u8 *status)
-{
-	register u64 __addr asm("2") = addr;
-	register u64 __range asm("3") = range;
-	u8 cc;
-
-	asm volatile (
-		"	.insn	rre,0xb9d30000,%[fn],%[addr]\n"
-		"	ipm	%[cc]\n"
-		"	srl	%[cc],28\n"
-		: [cc] "=d" (cc), [fn] "+d" (fn)
-		: [addr] "d" (__addr), "d" (__range)
-		: "cc");
-	*status = fn >> 24 & 0xff;
-	return cc;
-}
-
-int zpci_refresh_trans(u64 fn, u64 addr, u64 range)
-{
-	u8 cc, status;
-
-	do {
-		cc = __rpcit(fn, addr, range, &status);
-		if (cc == 2)
-			udelay(ZPCI_INSN_BUSY_DELAY);
-	} while (cc == 2);
-
-	if (cc)
-		zpci_err_insn(cc, status, addr, range);
-
-	return (cc) ? -EIO : 0;
-}
-
-/* Set Interruption Controls */
-int zpci_set_irq_ctrl(u16 ctl, char *unused, u8 isc)
-{
-	if (!test_facility(72))
-		return -EIO;
-	asm volatile (
-		"	.insn	rsy,0xeb00000000d1,%[ctl],%[isc],%[u]\n"
-		: : [ctl] "d" (ctl), [isc] "d" (isc << 27), [u] "Q" (*unused));
-	return 0;
-}
-
-/* PCI Load */
-static inline int __pcilg(u64 *data, u64 req, u64 offset, u8 *status)
-{
-	register u64 __req asm("2") = req;
-	register u64 __offset asm("3") = offset;
-	int cc = -ENXIO;
-	u64 __data;
-
-	asm volatile (
-		"	.insn	rre,0xb9d20000,%[data],%[req]\n"
-		"0:	ipm	%[cc]\n"
-		"	srl	%[cc],28\n"
-		"1:\n"
-		EX_TABLE(0b, 1b)
-		: [cc] "+d" (cc), [data] "=d" (__data), [req] "+d" (__req)
-		:  "d" (__offset)
-		: "cc");
-	*status = __req >> 24 & 0xff;
-	if (!cc)
-		*data = __data;
-
-	return cc;
-}
-
-int zpci_load(u64 *data, u64 req, u64 offset)
-{
-	u8 status;
-	int cc;
-
-	do {
-		cc = __pcilg(data, req, offset, &status);
-		if (cc == 2)
-			udelay(ZPCI_INSN_BUSY_DELAY);
-	} while (cc == 2);
-
-	if (cc)
-		zpci_err_insn(cc, status, req, offset);
-
-	return (cc > 0) ? -EIO : cc;
-}
-EXPORT_SYMBOL_GPL(zpci_load);
-
-/* PCI Store */
-static inline int __pcistg(u64 data, u64 req, u64 offset, u8 *status)
-{
-	register u64 __req asm("2") = req;
-	register u64 __offset asm("3") = offset;
-	int cc = -ENXIO;
-
-	asm volatile (
-		"	.insn	rre,0xb9d00000,%[data],%[req]\n"
-		"0:	ipm	%[cc]\n"
-		"	srl	%[cc],28\n"
-		"1:\n"
-		EX_TABLE(0b, 1b)
-		: [cc] "+d" (cc), [req] "+d" (__req)
-		: "d" (__offset), [data] "d" (data)
-		: "cc");
-	*status = __req >> 24 & 0xff;
-	return cc;
-}
-
-int zpci_store(u64 data, u64 req, u64 offset)
-{
-	u8 status;
-	int cc;
-
-	do {
-		cc = __pcistg(data, req, offset, &status);
-		if (cc == 2)
-			udelay(ZPCI_INSN_BUSY_DELAY);
-	} while (cc == 2);
-
-	if (cc)
-		zpci_err_insn(cc, status, req, offset);
-
-	return (cc > 0) ? -EIO : cc;
-}
-EXPORT_SYMBOL_GPL(zpci_store);
-
-/* PCI Store Block */
-static inline int __pcistb(const u64 *data, u64 req, u64 offset, u8 *status)
-{
-	int cc = -ENXIO;
-
-	asm volatile (
-		"	.insn	rsy,0xeb00000000d0,%[req],%[offset],%[data]\n"
-		"0:	ipm	%[cc]\n"
-		"	srl	%[cc],28\n"
-		"1:\n"
-		EX_TABLE(0b, 1b)
-		: [cc] "+d" (cc), [req] "+d" (req)
-		: [offset] "d" (offset), [data] "Q" (*data)
-		: "cc");
-	*status = req >> 24 & 0xff;
-	return cc;
-}
-
-int zpci_store_block(const u64 *data, u64 req, u64 offset)
-{
-	u8 status;
-	int cc;
-
-	do {
-		cc = __pcistb(data, req, offset, &status);
-		if (cc == 2)
-			udelay(ZPCI_INSN_BUSY_DELAY);
-	} while (cc == 2);
-
-	if (cc)
-		zpci_err_insn(cc, status, req, offset);
-
-	return (cc > 0) ? -EIO : cc;
-}
-EXPORT_SYMBOL_GPL(zpci_store_block);
+	ia64_mc_info.imi_mca_handler        = ia64_tpa(mca_hldlr_ptr->fp);
+	/*
+	 * XXX - disable 

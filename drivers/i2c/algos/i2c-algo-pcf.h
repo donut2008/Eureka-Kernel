@@ -1,72 +1,79 @@
-/* -------------------------------------------------------------------- */
-/* i2c-pcf8584.h: PCF 8584 global defines				*/
-/* -------------------------------------------------------------------- */
-/*   Copyright (C) 1996 Simon G. Vogl
-                   1999 Hans Berglund
+/*
+ * Copyright (c) 2013 Intel Corporation.  All rights reserved.
+ * Copyright (c) 2006, 2007, 2008, 2010 QLogic Corporation. All rights reserved.
+ * Copyright (c) 2005, 2006 PathScale, Inc. All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
+#include <linux/err.h>
+#include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/kthread.h>
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.			*/
-/* --------------------------------------------------------------------	*/
+#include "qib_verbs.h"
+#include "qib.h"
 
-/* With some changes from Frodo Looijaard <frodol@dds.nl> */
+/**
+ * qib_cq_enter - add a new entry to the completion queue
+ * @cq: completion queue
+ * @entry: work completion entry to add
+ * @sig: true if @entry is a solicitated entry
+ *
+ * This may be called with qp->s_lock held.
+ */
+void qib_cq_enter(struct qib_cq *cq, struct ib_wc *entry, int solicited)
+{
+	struct qib_cq_wc *wc;
+	unsigned long flags;
+	u32 head;
+	u32 next;
 
-#ifndef I2C_PCF8584_H
-#define I2C_PCF8584_H 1
+	spin_lock_irqsave(&cq->lock, flags);
 
-/* ----- Control register bits ----------------------------------------	*/
-#define I2C_PCF_PIN	0x80
-#define I2C_PCF_ESO	0x40
-#define I2C_PCF_ES1	0x20
-#define I2C_PCF_ES2	0x10
-#define I2C_PCF_ENI	0x08
-#define I2C_PCF_STA	0x04
-#define I2C_PCF_STO	0x02
-#define I2C_PCF_ACK	0x01
+	/*
+	 * Note that the head pointer might be writable by user processes.
+	 * Take care to verify it is a sane value.
+	 */
+	wc = cq->queue;
+	head = wc->head;
+	if (head >= (unsigned) cq->ibcq.cqe) {
+		head = cq->ibcq.cqe;
+		next = 0;
+	} else
+		next = head + 1;
+	if (unlikely(next == wc->tail)) {
+		spin_unlock_irqrestore(&cq->lock, flags);
+		if (cq->ibcq.event_handler) {
+			struct ib_event ev;
 
-#define I2C_PCF_START    (I2C_PCF_PIN | I2C_PCF_ESO | I2C_PCF_STA | I2C_PCF_ACK)
-#define I2C_PCF_STOP     (I2C_PCF_PIN | I2C_PCF_ESO | I2C_PCF_STO | I2C_PCF_ACK)
-#define I2C_PCF_REPSTART (              I2C_PCF_ESO | I2C_PCF_STA | I2C_PCF_ACK)
-#define I2C_PCF_IDLE     (I2C_PCF_PIN | I2C_PCF_ESO               | I2C_PCF_ACK)
-
-/* ----- Status register bits -----------------------------------------	*/
-/*#define I2C_PCF_PIN  0x80    as above*/
-
-#define I2C_PCF_INI 0x40   /* 1 if not initialized */
-#define I2C_PCF_STS 0x20
-#define I2C_PCF_BER 0x10
-#define I2C_PCF_AD0 0x08
-#define I2C_PCF_LRB 0x08
-#define I2C_PCF_AAS 0x04
-#define I2C_PCF_LAB 0x02
-#define I2C_PCF_BB  0x01
-
-/* ----- Chip clock frequencies ---------------------------------------	*/
-#define I2C_PCF_CLK3	0x00
-#define I2C_PCF_CLK443	0x10
-#define I2C_PCF_CLK6	0x14
-#define I2C_PCF_CLK	0x18
-#define I2C_PCF_CLK12	0x1c
-
-/* ----- transmission frequencies -------------------------------------	*/
-#define I2C_PCF_TRNS90 0x00	/*  90 kHz */
-#define I2C_PCF_TRNS45 0x01	/*  45 kHz */
-#define I2C_PCF_TRNS11 0x02	/*  11 kHz */
-#define I2C_PCF_TRNS15 0x03	/* 1.5 kHz */
-
-
-/* ----- Access to internal registers according to ES1,ES2 ------------	*/
-/* they are mapped to the data port ( a0 = 0 ) 				*/
-/* available when ESO == 0 :						*/
-
-#define I2C_PCF_OWNADR	0
-#define I2C_PCF_INTREG	I2C_PCF_ES2
-#define I2C_PCF_CLKREG	I2C_PCF_ES1
-
-#endif /* I2C_PCF8584_H */
+			ev.device = cq->ibcq.device;
+			ev.element.cq = &cq->ibcq;
+			ev.event = IB_EVENT_CQ_ERR;
+			cq->ibcq.event_handler(&ev, cq->ibcq.cq_context)

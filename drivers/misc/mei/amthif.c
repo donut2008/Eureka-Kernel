@@ -1,590 +1,443 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/fs.h>
-#include <linux/errno.h>
-#include <linux/types.h>
-#include <linux/fcntl.h>
-#include <linux/ioctl.h>
-#include <linux/cdev.h>
-#include <linux/list.h>
-#include <linux/delay.h>
-#include <linux/sched.h>
-#include <linux/uuid.h>
-#include <linux/jiffies.h>
-#include <linux/uaccess.h>
-#include <linux/slab.h>
-
-#include <linux/mei.h>
-
-#include "mei_dev.h"
-#include "hbm.h"
-#include "client.h"
-
-const uuid_le mei_amthif_guid  = UUID_LE(0x12f80028, 0xb4b7, 0x4b2d,
-					 0xac, 0xa8, 0x46, 0xe0,
-					 0xff, 0x65, 0x81, 0x4c);
-
-/**
- * mei_amthif_reset_params - initializes mei device iamthif
- *
- * @dev: the device structure
- */
-void mei_amthif_reset_params(struct mei_device *dev)
-{
-	/* reset iamthif parameters. */
-	dev->iamthif_current_cb = NULL;
-	dev->iamthif_canceled = false;
-	dev->iamthif_state = MEI_IAMTHIF_IDLE;
-	dev->iamthif_timer = 0;
-	dev->iamthif_stall_timer = 0;
-	dev->iamthif_open_count = 0;
-}
-
-/**
- * mei_amthif_host_init - mei initialization amthif client.
- *
- * @dev: the device structure
- * @me_cl: me client
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_amthif_host_init(struct mei_device *dev, struct mei_me_client *me_cl)
-{
-	struct mei_cl *cl = &dev->iamthif_cl;
-	int ret;
-
-	dev->iamthif_state = MEI_IAMTHIF_IDLE;
-
-	mei_cl_init(cl, dev);
-
-	ret = mei_cl_link(cl, MEI_IAMTHIF_HOST_CLIENT_ID);
-	if (ret < 0) {
-		dev_err(dev->dev, "amthif: failed cl_link %d\n", ret);
-		return ret;
-	}
-
-	ret = mei_cl_connect(cl, me_cl, NULL);
-
-	dev->iamthif_state = MEI_IAMTHIF_IDLE;
-
-	return ret;
-}
-
-/**
- * mei_amthif_find_read_list_entry - finds a amthilist entry for current file
- *
- * @dev: the device structure
- * @file: pointer to file object
- *
- * Return:   returned a list entry on success, NULL on failure.
- */
-struct mei_cl_cb *mei_amthif_find_read_list_entry(struct mei_device *dev,
-						struct file *file)
-{
-	struct mei_cl_cb *cb;
-
-	list_for_each_entry(cb, &dev->amthif_rd_complete_list.list, list)
-		if (cb->file_object == file)
-			return cb;
-	return NULL;
-}
-
-
-/**
- * mei_amthif_read - read data from AMTHIF client
- *
- * @dev: the device structure
- * @file: pointer to file object
- * @ubuf: pointer to user data in user space
- * @length: data length to read
- * @offset: data read offset
- *
- * Locking: called under "dev->device_lock" lock
- *
- * Return:
- *  returned data length on success,
- *  zero if no data to read,
- *  negative on failure.
- */
-int mei_amthif_read(struct mei_device *dev, struct file *file,
-	       char __user *ubuf, size_t length, loff_t *offset)
-{
-	struct mei_cl *cl = file->private_data;
-	struct mei_cl_cb *cb;
-	unsigned long timeout;
-	int rets;
-	int wait_ret;
-
-	/* Only possible if we are in timeout */
-	if (!cl) {
-		dev_err(dev->dev, "bad file ext.\n");
-		return -ETIME;
-	}
-
-	dev_dbg(dev->dev, "checking amthif data\n");
-	cb = mei_amthif_find_read_list_entry(dev, file);
-
-	/* Check for if we can block or not*/
-	if (cb == NULL && file->f_flags & O_NONBLOCK)
-		return -EAGAIN;
-
-
-	dev_dbg(dev->dev, "waiting for amthif data\n");
-	while (cb == NULL) {
-		/* unlock the Mutex */
-		mutex_unlock(&dev->device_lock);
-
-		wait_ret = wait_event_interruptible(dev->iamthif_cl.wait,
-			(cb = mei_amthif_find_read_list_entry(dev, file)));
-
-		/* Locking again the Mutex */
-		mutex_lock(&dev->device_lock);
-
-		if (wait_ret)
-			return -ERESTARTSYS;
-
-		dev_dbg(dev->dev, "woke up from sleep\n");
-	}
-
-	if (cb->status) {
-		rets = cb->status;
-		dev_dbg(dev->dev, "read operation failed %d\n", rets);
-		goto free;
-	}
-
-	dev_dbg(dev->dev, "Got amthif data\n");
-	dev->iamthif_timer = 0;
-
-	timeout = cb->read_time +
-		mei_secs_to_jiffies(MEI_IAMTHIF_READ_TIMER);
-	dev_dbg(dev->dev, "amthif timeout = %lud\n",
-			timeout);
-
-	if  (time_after(jiffies, timeout)) {
-		dev_dbg(dev->dev, "amthif Time out\n");
-		/* 15 sec for the message has expired */
-		list_del_init(&cb->list);
-		rets = -ETIME;
-		goto free;
-	}
-	/* if the whole message will fit remove it from the list */
-	if (cb->buf_idx >= *offset && length >= (cb->buf_idx - *offset))
-		list_del_init(&cb->list);
-	else if (cb->buf_idx > 0 && cb->buf_idx <= *offset) {
-		/* end of the message has been reached */
-		list_del_init(&cb->list);
-		rets = 0;
-		goto free;
-	}
-		/* else means that not full buffer will be read and do not
-		 * remove message from deletion list
-		 */
-
-	dev_dbg(dev->dev, "amthif cb->buf size - %d\n",
-	    cb->buf.size);
-	dev_dbg(dev->dev, "amthif cb->buf_idx - %lu\n", cb->buf_idx);
-
-	/* length is being truncated to PAGE_SIZE, however,
-	 * the buf_idx may point beyond */
-	length = min_t(size_t, length, (cb->buf_idx - *offset));
-
-	if (copy_to_user(ubuf, cb->buf.data + *offset, length)) {
-		dev_dbg(dev->dev, "failed to copy data to userland\n");
-		rets = -EFAULT;
-	} else {
-		rets = length;
-		if ((*offset + length) < cb->buf_idx) {
-			*offset += length;
-			goto out;
-		}
-	}
-free:
-	dev_dbg(dev->dev, "free amthif cb memory.\n");
-	*offset = 0;
-	mei_io_cb_free(cb);
-out:
-	return rets;
-}
-
-/**
- * mei_amthif_read_start - queue message for sending read credential
- *
- * @cl: host client
- * @file: file pointer of message recipient
- *
- * Return: 0 on success, <0 on failure.
- */
-static int mei_amthif_read_start(struct mei_cl *cl, struct file *file)
-{
-	struct mei_device *dev = cl->dev;
-	struct mei_cl_cb *cb;
-	int rets;
-
-	cb = mei_io_cb_init(cl, MEI_FOP_READ, file);
-	if (!cb) {
-		rets = -ENOMEM;
-		goto err;
-	}
-
-	rets = mei_io_cb_alloc_buf(cb, mei_cl_mtu(cl));
-	if (rets)
-		goto err;
-
-	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
-
-	dev->iamthif_state = MEI_IAMTHIF_READING;
-	dev->iamthif_file_object = cb->file_object;
-	dev->iamthif_current_cb = cb;
-
-	return 0;
-err:
-	mei_io_cb_free(cb);
-	return rets;
-}
-
-/**
- * mei_amthif_send_cmd - send amthif command to the ME
- *
- * @cl: the host client
- * @cb: mei call back struct
- *
- * Return: 0 on success, <0 on failure.
- */
-static int mei_amthif_send_cmd(struct mei_cl *cl, struct mei_cl_cb *cb)
-{
-	struct mei_device *dev;
-	int ret;
-
-	if (!cl->dev || !cb)
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	dev->iamthif_state = MEI_IAMTHIF_WRITING;
-	dev->iamthif_current_cb = cb;
-	dev->iamthif_file_object = cb->file_object;
-	dev->iamthif_canceled = false;
-
-	ret = mei_cl_write(cl, cb, false);
-	if (ret < 0)
-		return ret;
-
-	if (cb->completed)
-		cb->status = mei_amthif_read_start(cl, cb->file_object);
-
-	return 0;
-}
-
-/**
- * mei_amthif_run_next_cmd - send next amt command from queue
- *
- * @dev: the device structure
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_amthif_run_next_cmd(struct mei_device *dev)
-{
-	struct mei_cl *cl = &dev->iamthif_cl;
-	struct mei_cl_cb *cb;
-
-	dev->iamthif_canceled = false;
-	dev->iamthif_state = MEI_IAMTHIF_IDLE;
-	dev->iamthif_timer = 0;
-	dev->iamthif_file_object = NULL;
-
-	dev_dbg(dev->dev, "complete amthif cmd_list cb.\n");
-
-	cb = list_first_entry_or_null(&dev->amthif_cmd_list.list,
-					typeof(*cb), list);
-	if (!cb)
-		return 0;
-
-	list_del_init(&cb->list);
-	return mei_amthif_send_cmd(cl, cb);
-}
-
-/**
- * mei_amthif_write - write amthif data to amthif client
- *
- * @cl: host client
- * @cb: mei call back struct
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_amthif_write(struct mei_cl *cl, struct mei_cl_cb *cb)
-{
-
-	struct mei_device *dev;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	if (WARN_ON(!cb))
-		return -EINVAL;
-
-	dev = cl->dev;
-
-	list_add_tail(&cb->list, &dev->amthif_cmd_list.list);
-	return mei_amthif_run_next_cmd(dev);
-}
-
-/**
- * mei_amthif_poll - the amthif poll function
- *
- * @dev: the device structure
- * @file: pointer to file structure
- * @wait: pointer to poll_table structure
- *
- * Return: poll mask
- *
- * Locking: called under "dev->device_lock" lock
- */
-
-unsigned int mei_amthif_poll(struct mei_device *dev,
-		struct file *file, poll_table *wait)
-{
-	unsigned int mask = 0;
-
-	poll_wait(file, &dev->iamthif_cl.wait, wait);
-
-	if (dev->iamthif_state == MEI_IAMTHIF_READ_COMPLETE &&
-	    dev->iamthif_file_object == file) {
-
-		mask |= POLLIN | POLLRDNORM;
-		mei_amthif_run_next_cmd(dev);
-	}
-
-	return mask;
-}
-
-
-
-/**
- * mei_amthif_irq_write - write iamthif command in irq thread context.
- *
- * @cl: private data of the file object.
- * @cb: callback block.
- * @cmpl_list: complete list.
- *
- * Return: 0, OK; otherwise, error.
- */
-int mei_amthif_irq_write(struct mei_cl *cl, struct mei_cl_cb *cb,
-			 struct mei_cl_cb *cmpl_list)
-{
-	int ret;
-
-	ret = mei_cl_irq_write(cl, cb, cmpl_list);
-	if (ret)
-		return ret;
-
-	if (cb->completed)
-		cb->status = mei_amthif_read_start(cl, cb->file_object);
-
-	return 0;
-}
-
-/**
- * mei_amthif_irq_read_msg - read routine after ISR to
- *			handle the read amthif message
- *
- * @cl: mei client
- * @mei_hdr: header of amthif message
- * @cmpl_list: completed callbacks list
- *
- * Return: -ENODEV if cb is NULL 0 otherwise; error message is in cb->status
- */
-int mei_amthif_irq_read_msg(struct mei_cl *cl,
-			    struct mei_msg_hdr *mei_hdr,
-			    struct mei_cl_cb *cmpl_list)
-{
-	struct mei_device *dev;
-	int ret;
-
-	dev = cl->dev;
-
-	if (dev->iamthif_state != MEI_IAMTHIF_READING) {
-		mei_irq_discard_msg(dev, mei_hdr);
-		return 0;
-	}
-
-	ret = mei_cl_irq_read_msg(cl, mei_hdr, cmpl_list);
-	if (ret)
-		return ret;
-
-	if (!mei_hdr->msg_complete)
-		return 0;
-
-	dev_dbg(dev->dev, "completed amthif read.\n ");
-	dev->iamthif_current_cb = NULL;
-	dev->iamthif_stall_timer = 0;
-
-	return 0;
-}
-
-/**
- * mei_amthif_complete - complete amthif callback.
- *
- * @dev: the device structure.
- * @cb: callback block.
- */
-void mei_amthif_complete(struct mei_device *dev, struct mei_cl_cb *cb)
-{
-
-	if (cb->fop_type == MEI_FOP_WRITE) {
-		if (!cb->status) {
-			dev->iamthif_stall_timer = MEI_IAMTHIF_STALL_TIMER;
-			mei_io_cb_free(cb);
-			return;
-		}
-		/*
-		 * in case of error enqueue the write cb to complete read list
-		 * so it can be propagated to the reader
-		 */
-		list_add_tail(&cb->list, &dev->amthif_rd_complete_list.list);
-		wake_up_interruptible(&dev->iamthif_cl.wait);
-		return;
-	}
-
-	if (!dev->iamthif_canceled) {
-		dev->iamthif_state = MEI_IAMTHIF_READ_COMPLETE;
-		dev->iamthif_stall_timer = 0;
-		list_add_tail(&cb->list, &dev->amthif_rd_complete_list.list);
-		dev_dbg(dev->dev, "amthif read completed\n");
-		dev->iamthif_timer = jiffies;
-		dev_dbg(dev->dev, "dev->iamthif_timer = %ld\n",
-			dev->iamthif_timer);
-	} else {
-		mei_amthif_run_next_cmd(dev);
-	}
-
-	dev_dbg(dev->dev, "completing amthif call back.\n");
-	wake_up_interruptible(&dev->iamthif_cl.wait);
-}
-
-/**
- * mei_clear_list - removes all callbacks associated with file
- *		from mei_cb_list
- *
- * @dev: device structure.
- * @file: file structure
- * @mei_cb_list: callbacks list
- *
- * mei_clear_list is called to clear resources associated with file
- * when application calls close function or Ctrl-C was pressed
- *
- * Return: true if callback removed from the list, false otherwise
- */
-static bool mei_clear_list(struct mei_device *dev,
-		const struct file *file, struct list_head *mei_cb_list)
-{
-	struct mei_cl *cl = &dev->iamthif_cl;
-	struct mei_cl_cb *cb, *next;
-	bool removed = false;
-
-	/* list all list member */
-	list_for_each_entry_safe(cb, next, mei_cb_list, list) {
-		/* check if list member associated with a file */
-		if (file == cb->file_object) {
-			/* check if cb equal to current iamthif cb */
-			if (dev->iamthif_current_cb == cb) {
-				dev->iamthif_current_cb = NULL;
-				/* send flow control to iamthif client */
-				mei_hbm_cl_flow_control_req(dev, cl);
-			}
-			/* free all allocated buffers */
-			mei_io_cb_free(cb);
-			removed = true;
-		}
-	}
-	return removed;
-}
-
-/**
- * mei_clear_lists - removes all callbacks associated with file
- *
- * @dev: device structure
- * @file: file structure
- *
- * mei_clear_lists is called to clear resources associated with file
- * when application calls close function or Ctrl-C was pressed
- *
- * Return: true if callback removed from the list, false otherwise
- */
-static bool mei_clear_lists(struct mei_device *dev, struct file *file)
-{
-	bool removed = false;
-
-	/* remove callbacks associated with a file */
-	mei_clear_list(dev, file, &dev->amthif_cmd_list.list);
-	if (mei_clear_list(dev, file, &dev->amthif_rd_complete_list.list))
-		removed = true;
-
-	mei_clear_list(dev, file, &dev->ctrl_rd_list.list);
-
-	if (mei_clear_list(dev, file, &dev->ctrl_wr_list.list))
-		removed = true;
-
-	if (mei_clear_list(dev, file, &dev->write_waiting_list.list))
-		removed = true;
-
-	if (mei_clear_list(dev, file, &dev->write_list.list))
-		removed = true;
-
-	/* check if iamthif_current_cb not NULL */
-	if (dev->iamthif_current_cb && !removed) {
-		/* check file and iamthif current cb association */
-		if (dev->iamthif_current_cb->file_object == file) {
-			/* remove cb */
-			mei_io_cb_free(dev->iamthif_current_cb);
-			dev->iamthif_current_cb = NULL;
-			removed = true;
-		}
-	}
-	return removed;
-}
-
-/**
-* mei_amthif_release - the release function
-*
-*  @dev: device structure
-*  @file: pointer to file structure
-*
-*  Return: 0 on success, <0 on error
-*/
-int mei_amthif_release(struct mei_device *dev, struct file *file)
-{
-	if (dev->iamthif_open_count > 0)
-		dev->iamthif_open_count--;
-
-	if (dev->iamthif_file_object == file &&
-	    dev->iamthif_state != MEI_IAMTHIF_IDLE) {
-
-		dev_dbg(dev->dev, "amthif canceled iamthif state %d\n",
-		    dev->iamthif_state);
-		dev->iamthif_canceled = true;
-		if (dev->iamthif_state == MEI_IAMTHIF_READ_COMPLETE) {
-			dev_dbg(dev->dev, "run next amthif iamthif cb\n");
-			mei_amthif_run_next_cmd(dev);
-		}
-	}
-
-	if (mei_clear_lists(dev, file))
-		dev->iamthif_state = MEI_IAMTHIF_IDLE;
-
-	return 0;
-}
+Ctrl[15].bit[2] = 4;
+	state->Init_Ctrl[15].val[2] = 1;
+
+	state->Init_Ctrl[16].Ctrl_Num = I_DRIVER ;
+	state->Init_Ctrl[16].size = 2 ;
+	state->Init_Ctrl[16].addr[0] = 147;
+	state->Init_Ctrl[16].bit[0] = 0;
+	state->Init_Ctrl[16].val[0] = 0;
+	state->Init_Ctrl[16].addr[1] = 147;
+	state->Init_Ctrl[16].bit[1] = 1;
+	state->Init_Ctrl[16].val[1] = 1;
+
+	state->Init_Ctrl[17].Ctrl_Num = EN_AAF ;
+	state->Init_Ctrl[17].size = 1 ;
+	state->Init_Ctrl[17].addr[0] = 147;
+	state->Init_Ctrl[17].bit[0] = 7;
+	state->Init_Ctrl[17].val[0] = 0;
+
+	state->Init_Ctrl[18].Ctrl_Num = EN_3P ;
+	state->Init_Ctrl[18].size = 1 ;
+	state->Init_Ctrl[18].addr[0] = 147;
+	state->Init_Ctrl[18].bit[0] = 6;
+	state->Init_Ctrl[18].val[0] = 0;
+
+	state->Init_Ctrl[19].Ctrl_Num = EN_AUX_3P ;
+	state->Init_Ctrl[19].size = 1 ;
+	state->Init_Ctrl[19].addr[0] = 156;
+	state->Init_Ctrl[19].bit[0] = 0;
+	state->Init_Ctrl[19].val[0] = 0;
+
+	state->Init_Ctrl[20].Ctrl_Num = SEL_AAF_BAND ;
+	state->Init_Ctrl[20].size = 1 ;
+	state->Init_Ctrl[20].addr[0] = 147;
+	state->Init_Ctrl[20].bit[0] = 5;
+	state->Init_Ctrl[20].val[0] = 0;
+
+	state->Init_Ctrl[21].Ctrl_Num = SEQ_ENCLK16_CLK_OUT ;
+	state->Init_Ctrl[21].size = 1 ;
+	state->Init_Ctrl[21].addr[0] = 137;
+	state->Init_Ctrl[21].bit[0] = 4;
+	state->Init_Ctrl[21].val[0] = 0;
+
+	state->Init_Ctrl[22].Ctrl_Num = SEQ_SEL4_16B ;
+	state->Init_Ctrl[22].size = 1 ;
+	state->Init_Ctrl[22].addr[0] = 137;
+	state->Init_Ctrl[22].bit[0] = 7;
+	state->Init_Ctrl[22].val[0] = 0;
+
+	state->Init_Ctrl[23].Ctrl_Num = XTAL_CAPSELECT ;
+	state->Init_Ctrl[23].size = 1 ;
+	state->Init_Ctrl[23].addr[0] = 91;
+	state->Init_Ctrl[23].bit[0] = 5;
+	state->Init_Ctrl[23].val[0] = 1;
+
+	state->Init_Ctrl[24].Ctrl_Num = IF_SEL_DBL ;
+	state->Init_Ctrl[24].size = 1 ;
+	state->Init_Ctrl[24].addr[0] = 43;
+	state->Init_Ctrl[24].bit[0] = 0;
+	state->Init_Ctrl[24].val[0] = 1;
+
+	state->Init_Ctrl[25].Ctrl_Num = RFSYN_R_DIV ;
+	state->Init_Ctrl[25].size = 2 ;
+	state->Init_Ctrl[25].addr[0] = 22;
+	state->Init_Ctrl[25].bit[0] = 0;
+	state->Init_Ctrl[25].val[0] = 1;
+	state->Init_Ctrl[25].addr[1] = 22;
+	state->Init_Ctrl[25].bit[1] = 1;
+	state->Init_Ctrl[25].val[1] = 1;
+
+	state->Init_Ctrl[26].Ctrl_Num = SEQ_EXTSYNTHCALIF ;
+	state->Init_Ctrl[26].size = 1 ;
+	state->Init_Ctrl[26].addr[0] = 134;
+	state->Init_Ctrl[26].bit[0] = 2;
+	state->Init_Ctrl[26].val[0] = 0;
+
+	state->Init_Ctrl[27].Ctrl_Num = SEQ_EXTDCCAL ;
+	state->Init_Ctrl[27].size = 1 ;
+	state->Init_Ctrl[27].addr[0] = 137;
+	state->Init_Ctrl[27].bit[0] = 3;
+	state->Init_Ctrl[27].val[0] = 0;
+
+	state->Init_Ctrl[28].Ctrl_Num = AGC_EN_RSSI ;
+	state->Init_Ctrl[28].size = 1 ;
+	state->Init_Ctrl[28].addr[0] = 77;
+	state->Init_Ctrl[28].bit[0] = 7;
+	state->Init_Ctrl[28].val[0] = 0;
+
+	state->Init_Ctrl[29].Ctrl_Num = RFA_ENCLKRFAGC ;
+	state->Init_Ctrl[29].size = 1 ;
+	state->Init_Ctrl[29].addr[0] = 166;
+	state->Init_Ctrl[29].bit[0] = 7;
+	state->Init_Ctrl[29].val[0] = 1;
+
+	state->Init_Ctrl[30].Ctrl_Num = RFA_RSSI_REFH ;
+	state->Init_Ctrl[30].size = 3 ;
+	state->Init_Ctrl[30].addr[0] = 166;
+	state->Init_Ctrl[30].bit[0] = 0;
+	state->Init_Ctrl[30].val[0] = 0;
+	state->Init_Ctrl[30].addr[1] = 166;
+	state->Init_Ctrl[30].bit[1] = 1;
+	state->Init_Ctrl[30].val[1] = 1;
+	state->Init_Ctrl[30].addr[2] = 166;
+	state->Init_Ctrl[30].bit[2] = 2;
+	state->Init_Ctrl[30].val[2] = 1;
+
+	state->Init_Ctrl[31].Ctrl_Num = RFA_RSSI_REF ;
+	state->Init_Ctrl[31].size = 3 ;
+	state->Init_Ctrl[31].addr[0] = 166;
+	state->Init_Ctrl[31].bit[0] = 3;
+	state->Init_Ctrl[31].val[0] = 1;
+	state->Init_Ctrl[31].addr[1] = 166;
+	state->Init_Ctrl[31].bit[1] = 4;
+	state->Init_Ctrl[31].val[1] = 0;
+	state->Init_Ctrl[31].addr[2] = 166;
+	state->Init_Ctrl[31].bit[2] = 5;
+	state->Init_Ctrl[31].val[2] = 1;
+
+	state->Init_Ctrl[32].Ctrl_Num = RFA_RSSI_REFL ;
+	state->Init_Ctrl[32].size = 3 ;
+	state->Init_Ctrl[32].addr[0] = 167;
+	state->Init_Ctrl[32].bit[0] = 0;
+	state->Init_Ctrl[32].val[0] = 1;
+	state->Init_Ctrl[32].addr[1] = 167;
+	state->Init_Ctrl[32].bit[1] = 1;
+	state->Init_Ctrl[32].val[1] = 1;
+	state->Init_Ctrl[32].addr[2] = 167;
+	state->Init_Ctrl[32].bit[2] = 2;
+	state->Init_Ctrl[32].val[2] = 0;
+
+	state->Init_Ctrl[33].Ctrl_Num = RFA_FLR ;
+	state->Init_Ctrl[33].size = 4 ;
+	state->Init_Ctrl[33].addr[0] = 168;
+	state->Init_Ctrl[33].bit[0] = 0;
+	state->Init_Ctrl[33].val[0] = 0;
+	state->Init_Ctrl[33].addr[1] = 168;
+	state->Init_Ctrl[33].bit[1] = 1;
+	state->Init_Ctrl[33].val[1] = 1;
+	state->Init_Ctrl[33].addr[2] = 168;
+	state->Init_Ctrl[33].bit[2] = 2;
+	state->Init_Ctrl[33].val[2] = 0;
+	state->Init_Ctrl[33].addr[3] = 168;
+	state->Init_Ctrl[33].bit[3] = 3;
+	state->Init_Ctrl[33].val[3] = 0;
+
+	state->Init_Ctrl[34].Ctrl_Num = RFA_CEIL ;
+	state->Init_Ctrl[34].size = 4 ;
+	state->Init_Ctrl[34].addr[0] = 168;
+	state->Init_Ctrl[34].bit[0] = 4;
+	state->Init_Ctrl[34].val[0] = 1;
+	state->Init_Ctrl[34].addr[1] = 168;
+	state->Init_Ctrl[34].bit[1] = 5;
+	state->Init_Ctrl[34].val[1] = 1;
+	state->Init_Ctrl[34].addr[2] = 168;
+	state->Init_Ctrl[34].bit[2] = 6;
+	state->Init_Ctrl[34].val[2] = 1;
+	state->Init_Ctrl[34].addr[3] = 168;
+	state->Init_Ctrl[34].bit[3] = 7;
+	state->Init_Ctrl[34].val[3] = 1;
+
+	state->Init_Ctrl[35].Ctrl_Num = SEQ_EXTIQFSMPULSE ;
+	state->Init_Ctrl[35].size = 1 ;
+	state->Init_Ctrl[35].addr[0] = 135;
+	state->Init_Ctrl[35].bit[0] = 0;
+	state->Init_Ctrl[35].val[0] = 0;
+
+	state->Init_Ctrl[36].Ctrl_Num = OVERRIDE_1 ;
+	state->Init_Ctrl[36].size = 1 ;
+	state->Init_Ctrl[36].addr[0] = 56;
+	state->Init_Ctrl[36].bit[0] = 3;
+	state->Init_Ctrl[36].val[0] = 0;
+
+	state->Init_Ctrl[37].Ctrl_Num = BB_INITSTATE_DLPF_TUNE ;
+	state->Init_Ctrl[37].size = 7 ;
+	state->Init_Ctrl[37].addr[0] = 59;
+	state->Init_Ctrl[37].bit[0] = 1;
+	state->Init_Ctrl[37].val[0] = 0;
+	state->Init_Ctrl[37].addr[1] = 59;
+	state->Init_Ctrl[37].bit[1] = 2;
+	state->Init_Ctrl[37].val[1] = 0;
+	state->Init_Ctrl[37].addr[2] = 59;
+	state->Init_Ctrl[37].bit[2] = 3;
+	state->Init_Ctrl[37].val[2] = 0;
+	state->Init_Ctrl[37].addr[3] = 59;
+	state->Init_Ctrl[37].bit[3] = 4;
+	state->Init_Ctrl[37].val[3] = 0;
+	state->Init_Ctrl[37].addr[4] = 59;
+	state->Init_Ctrl[37].bit[4] = 5;
+	state->Init_Ctrl[37].val[4] = 0;
+	state->Init_Ctrl[37].addr[5] = 59;
+	state->Init_Ctrl[37].bit[5] = 6;
+	state->Init_Ctrl[37].val[5] = 0;
+	state->Init_Ctrl[37].addr[6] = 59;
+	state->Init_Ctrl[37].bit[6] = 7;
+	state->Init_Ctrl[37].val[6] = 0;
+
+	state->Init_Ctrl[38].Ctrl_Num = TG_R_DIV ;
+	state->Init_Ctrl[38].size = 6 ;
+	state->Init_Ctrl[38].addr[0] = 32;
+	state->Init_Ctrl[38].bit[0] = 2;
+	state->Init_Ctrl[38].val[0] = 0;
+	state->Init_Ctrl[38].addr[1] = 32;
+	state->Init_Ctrl[38].bit[1] = 3;
+	state->Init_Ctrl[38].val[1] = 0;
+	state->Init_Ctrl[38].addr[2] = 32;
+	state->Init_Ctrl[38].bit[2] = 4;
+	state->Init_Ctrl[38].val[2] = 0;
+	state->Init_Ctrl[38].addr[3] = 32;
+	state->Init_Ctrl[38].bit[3] = 5;
+	state->Init_Ctrl[38].val[3] = 0;
+	state->Init_Ctrl[38].addr[4] = 32;
+	state->Init_Ctrl[38].bit[4] = 6;
+	state->Init_Ctrl[38].val[4] = 1;
+	state->Init_Ctrl[38].addr[5] = 32;
+	state->Init_Ctrl[38].bit[5] = 7;
+	state->Init_Ctrl[38].val[5] = 0;
+
+	state->Init_Ctrl[39].Ctrl_Num = EN_CHP_LIN_B ;
+	state->Init_Ctrl[39].size = 1 ;
+	state->Init_Ctrl[39].addr[0] = 25;
+	state->Init_Ctrl[39].bit[0] = 3;
+	state->Init_Ctrl[39].val[0] = 1;
+
+
+	state->CH_Ctrl_Num = CHCTRL_NUM ;
+
+	state->CH_Ctrl[0].Ctrl_Num = DN_POLY ;
+	state->CH_Ctrl[0].size = 2 ;
+	state->CH_Ctrl[0].addr[0] = 68;
+	state->CH_Ctrl[0].bit[0] = 6;
+	state->CH_Ctrl[0].val[0] = 1;
+	state->CH_Ctrl[0].addr[1] = 68;
+	state->CH_Ctrl[0].bit[1] = 7;
+	state->CH_Ctrl[0].val[1] = 1;
+
+	state->CH_Ctrl[1].Ctrl_Num = DN_RFGAIN ;
+	state->CH_Ctrl[1].size = 2 ;
+	state->CH_Ctrl[1].addr[0] = 70;
+	state->CH_Ctrl[1].bit[0] = 6;
+	state->CH_Ctrl[1].val[0] = 1;
+	state->CH_Ctrl[1].addr[1] = 70;
+	state->CH_Ctrl[1].bit[1] = 7;
+	state->CH_Ctrl[1].val[1] = 0;
+
+	state->CH_Ctrl[2].Ctrl_Num = DN_CAP_RFLPF ;
+	state->CH_Ctrl[2].size = 9 ;
+	state->CH_Ctrl[2].addr[0] = 69;
+	state->CH_Ctrl[2].bit[0] = 5;
+	state->CH_Ctrl[2].val[0] = 0;
+	state->CH_Ctrl[2].addr[1] = 69;
+	state->CH_Ctrl[2].bit[1] = 6;
+	state->CH_Ctrl[2].val[1] = 0;
+	state->CH_Ctrl[2].addr[2] = 69;
+	state->CH_Ctrl[2].bit[2] = 7;
+	state->CH_Ctrl[2].val[2] = 0;
+	state->CH_Ctrl[2].addr[3] = 68;
+	state->CH_Ctrl[2].bit[3] = 0;
+	state->CH_Ctrl[2].val[3] = 0;
+	state->CH_Ctrl[2].addr[4] = 68;
+	state->CH_Ctrl[2].bit[4] = 1;
+	state->CH_Ctrl[2].val[4] = 0;
+	state->CH_Ctrl[2].addr[5] = 68;
+	state->CH_Ctrl[2].bit[5] = 2;
+	state->CH_Ctrl[2].val[5] = 0;
+	state->CH_Ctrl[2].addr[6] = 68;
+	state->CH_Ctrl[2].bit[6] = 3;
+	state->CH_Ctrl[2].val[6] = 0;
+	state->CH_Ctrl[2].addr[7] = 68;
+	state->CH_Ctrl[2].bit[7] = 4;
+	state->CH_Ctrl[2].val[7] = 0;
+	state->CH_Ctrl[2].addr[8] = 68;
+	state->CH_Ctrl[2].bit[8] = 5;
+	state->CH_Ctrl[2].val[8] = 0;
+
+	state->CH_Ctrl[3].Ctrl_Num = DN_EN_VHFUHFBAR ;
+	state->CH_Ctrl[3].size = 1 ;
+	state->CH_Ctrl[3].addr[0] = 70;
+	state->CH_Ctrl[3].bit[0] = 5;
+	state->CH_Ctrl[3].val[0] = 0;
+
+	state->CH_Ctrl[4].Ctrl_Num = DN_GAIN_ADJUST ;
+	state->CH_Ctrl[4].size = 3 ;
+	state->CH_Ctrl[4].addr[0] = 73;
+	state->CH_Ctrl[4].bit[0] = 4;
+	state->CH_Ctrl[4].val[0] = 0;
+	state->CH_Ctrl[4].addr[1] = 73;
+	state->CH_Ctrl[4].bit[1] = 5;
+	state->CH_Ctrl[4].val[1] = 1;
+	state->CH_Ctrl[4].addr[2] = 73;
+	state->CH_Ctrl[4].bit[2] = 6;
+	state->CH_Ctrl[4].val[2] = 0;
+
+	state->CH_Ctrl[5].Ctrl_Num = DN_IQTNBUF_AMP ;
+	state->CH_Ctrl[5].size = 4 ;
+	state->CH_Ctrl[5].addr[0] = 70;
+	state->CH_Ctrl[5].bit[0] = 0;
+	state->CH_Ctrl[5].val[0] = 0;
+	state->CH_Ctrl[5].addr[1] = 70;
+	state->CH_Ctrl[5].bit[1] = 1;
+	state->CH_Ctrl[5].val[1] = 0;
+	state->CH_Ctrl[5].addr[2] = 70;
+	state->CH_Ctrl[5].bit[2] = 2;
+	state->CH_Ctrl[5].val[2] = 0;
+	state->CH_Ctrl[5].addr[3] = 70;
+	state->CH_Ctrl[5].bit[3] = 3;
+	state->CH_Ctrl[5].val[3] = 0;
+
+	state->CH_Ctrl[6].Ctrl_Num = DN_IQTNGNBFBIAS_BST ;
+	state->CH_Ctrl[6].size = 1 ;
+	state->CH_Ctrl[6].addr[0] = 70;
+	state->CH_Ctrl[6].bit[0] = 4;
+	state->CH_Ctrl[6].val[0] = 1;
+
+	state->CH_Ctrl[7].Ctrl_Num = RFSYN_EN_OUTMUX ;
+	state->CH_Ctrl[7].size = 1 ;
+	state->CH_Ctrl[7].addr[0] = 111;
+	state->CH_Ctrl[7].bit[0] = 4;
+	state->CH_Ctrl[7].val[0] = 0;
+
+	state->CH_Ctrl[8].Ctrl_Num = RFSYN_SEL_VCO_OUT ;
+	state->CH_Ctrl[8].size = 1 ;
+	state->CH_Ctrl[8].addr[0] = 111;
+	state->CH_Ctrl[8].bit[0] = 7;
+	state->CH_Ctrl[8].val[0] = 1;
+
+	state->CH_Ctrl[9].Ctrl_Num = RFSYN_SEL_VCO_HI ;
+	state->CH_Ctrl[9].size = 1 ;
+	state->CH_Ctrl[9].addr[0] = 111;
+	state->CH_Ctrl[9].bit[0] = 6;
+	state->CH_Ctrl[9].val[0] = 1;
+
+	state->CH_Ctrl[10].Ctrl_Num = RFSYN_SEL_DIVM ;
+	state->CH_Ctrl[10].size = 1 ;
+	state->CH_Ctrl[10].addr[0] = 111;
+	state->CH_Ctrl[10].bit[0] = 5;
+	state->CH_Ctrl[10].val[0] = 0;
+
+	state->CH_Ctrl[11].Ctrl_Num = RFSYN_RF_DIV_BIAS ;
+	state->CH_Ctrl[11].size = 2 ;
+	state->CH_Ctrl[11].addr[0] = 110;
+	state->CH_Ctrl[11].bit[0] = 0;
+	state->CH_Ctrl[11].val[0] = 1;
+	state->CH_Ctrl[11].addr[1] = 110;
+	state->CH_Ctrl[11].bit[1] = 1;
+	state->CH_Ctrl[11].val[1] = 0;
+
+	state->CH_Ctrl[12].Ctrl_Num = DN_SEL_FREQ ;
+	state->CH_Ctrl[12].size = 3 ;
+	state->CH_Ctrl[12].addr[0] = 69;
+	state->CH_Ctrl[12].bit[0] = 2;
+	state->CH_Ctrl[12].val[0] = 0;
+	state->CH_Ctrl[12].addr[1] = 69;
+	state->CH_Ctrl[12].bit[1] = 3;
+	state->CH_Ctrl[12].val[1] = 0;
+	state->CH_Ctrl[12].addr[2] = 69;
+	state->CH_Ctrl[12].bit[2] = 4;
+	state->CH_Ctrl[12].val[2] = 0;
+
+	state->CH_Ctrl[13].Ctrl_Num = RFSYN_VCO_BIAS ;
+	state->CH_Ctrl[13].size = 6 ;
+	state->CH_Ctrl[13].addr[0] = 110;
+	state->CH_Ctrl[13].bit[0] = 2;
+	state->CH_Ctrl[13].val[0] = 0;
+	state->CH_Ctrl[13].addr[1] = 110;
+	state->CH_Ctrl[13].bit[1] = 3;
+	state->CH_Ctrl[13].val[1] = 0;
+	state->CH_Ctrl[13].addr[2] = 110;
+	state->CH_Ctrl[13].bit[2] = 4;
+	state->CH_Ctrl[13].val[2] = 0;
+	state->CH_Ctrl[13].addr[3] = 110;
+	state->CH_Ctrl[13].bit[3] = 5;
+	state->CH_Ctrl[13].val[3] = 0;
+	state->CH_Ctrl[13].addr[4] = 110;
+	state->CH_Ctrl[13].bit[4] = 6;
+	state->CH_Ctrl[13].val[4] = 0;
+	state->CH_Ctrl[13].addr[5] = 110;
+	state->CH_Ctrl[13].bit[5] = 7;
+	state->CH_Ctrl[13].val[5] = 1;
+
+	state->CH_Ctrl[14].Ctrl_Num = CHCAL_INT_MOD_RF ;
+	state->CH_Ctrl[14].size = 7 ;
+	state->CH_Ctrl[14].addr[0] = 14;
+	state->CH_Ctrl[14].bit[0] = 0;
+	state->CH_Ctrl[14].val[0] = 0;
+	state->CH_Ctrl[14].addr[1] = 14;
+	state->CH_Ctrl[14].bit[1] = 1;
+	state->CH_Ctrl[14].val[1] = 0;
+	state->CH_Ctrl[14].addr[2] = 14;
+	state->CH_Ctrl[14].bit[2] = 2;
+	state->CH_Ctrl[14].val[2] = 0;
+	state->CH_Ctrl[14].addr[3] = 14;
+	state->CH_Ctrl[14].bit[3] = 3;
+	state->CH_Ctrl[14].val[3] = 0;
+	state->CH_Ctrl[14].addr[4] = 14;
+	state->CH_Ctrl[14].bit[4] = 4;
+	state->CH_Ctrl[14].val[4] = 0;
+	state->CH_Ctrl[14].addr[5] = 14;
+	state->CH_Ctrl[14].bit[5] = 5;
+	state->CH_Ctrl[14].val[5] = 0;
+	state->CH_Ctrl[14].addr[6] = 14;
+	state->CH_Ctrl[14].bit[6] = 6;
+	state->CH_Ctrl[14].val[6] = 0;
+
+	state->CH_Ctrl[15].Ctrl_Num = CHCAL_FRAC_MOD_RF ;
+	state->CH_Ctrl[15].size = 18 ;
+	state->CH_Ctrl[15].addr[0] = 17;
+	state->CH_Ctrl[15].bit[0] = 6;
+	state->CH_Ctrl[15].val[0] = 0;
+	state->CH_Ctrl[15].addr[1] = 17;
+	state->CH_Ctrl[15].bit[1] = 7;
+	state->CH_Ctrl[15].val[1] = 0;
+	state->CH_Ctrl[15].addr[2] = 16;
+	state->CH_Ctrl[15].bit[2] = 0;
+	state->CH_Ctrl[15].val[2] = 0;
+	state->CH_Ctrl[15].addr[3] = 16;
+	state->CH_Ctrl[15].bit[3] = 1;
+	state->CH_Ctrl[15].val[3] = 0;
+	state->CH_Ctrl[15].addr[4] = 16;
+	state->CH_Ctrl[15].bit[4] = 2;
+	state->CH_Ctrl[15].val[4] = 0;
+	state->CH_Ctrl[15].addr[5] = 16;
+	state->CH_Ctrl[15].bit[5] = 3;
+	state->CH_Ctrl[15].val[5] = 0;
+	state->CH_Ctrl[15].addr[6] = 16;
+	state->CH_Ctrl[15].bit[6] = 4;
+	state->CH_Ctrl[15].val[6] = 0;
+	state->CH_Ctrl[15].addr[7] = 16;
+	state->CH_Ctrl[15].bit[7] = 5;
+	state->CH_Ctrl[15].val[7] = 0;
+	state->CH_Ctrl[15].addr[8] = 16;
+	state->CH_Ctrl[15].bit[8] = 6;
+	state->CH_Ctrl[15].val[8] = 0;
+	state->CH_Ctrl[15].addr[9] = 16;
+	state->CH_Ctrl[15].bit[9] = 7;
+	state->CH_Ctrl[15].val[9] = 0;
+	state->CH_Ctrl[15].addr[10] = 15;
+	state->CH_Ctrl[15].bit[10] = 0;
+	state->CH_Ctrl[15].val[10] = 0;
+	state->CH_Ctrl[15].addr[11] = 15;
+	state->CH_Ctrl[15].bit[11] = 1;
+	state->CH_Ctrl[15].val[11] = 0;
+	state->CH_Ctrl[15].addr[12] = 15;
+	state->CH_Ctrl[15].bit[12] = 2;
+	stat

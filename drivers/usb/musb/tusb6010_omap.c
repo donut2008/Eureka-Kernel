@@ -1,715 +1,458 @@
-/*
- * TUSB6010 USB 2.0 OTG Dual Role controller OMAP DMA interface
- *
- * Copyright (C) 2006 Nokia Corporation
- * Tony Lindgren <tony@atomide.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/usb.h>
-#include <linux/platform_device.h>
-#include <linux/dma-mapping.h>
-#include <linux/slab.h>
-#include <linux/omap-dma.h>
-
-#include "musb_core.h"
-#include "tusb6010.h"
-
-#define to_chdat(c)		((struct tusb_omap_dma_ch *)(c)->private_data)
-
-#define MAX_DMAREQ		5	/* REVISIT: Really 6, but req5 not OK */
-
-#define OMAP24XX_DMA_EXT_DMAREQ0	2
-#define OMAP24XX_DMA_EXT_DMAREQ1	3
-#define OMAP242X_DMA_EXT_DMAREQ2	14
-#define OMAP242X_DMA_EXT_DMAREQ3	15
-#define OMAP242X_DMA_EXT_DMAREQ4	16
-#define OMAP242X_DMA_EXT_DMAREQ5	64
-
-struct tusb_omap_dma_ch {
-	struct musb		*musb;
-	void __iomem		*tbase;
-	unsigned long		phys_offset;
-	int			epnum;
-	u8			tx;
-	struct musb_hw_ep	*hw_ep;
-
-	int			ch;
-	s8			dmareq;
-	s8			sync_dev;
-
-	struct tusb_omap_dma	*tusb_dma;
-
-	dma_addr_t		dma_addr;
-
-	u32			len;
-	u16			packet_sz;
-	u16			transfer_packet_sz;
-	u32			transfer_len;
-	u32			completed_len;
-};
-
-struct tusb_omap_dma {
-	struct dma_controller		controller;
-	struct musb			*musb;
-	void __iomem			*tbase;
-
-	int				ch;
-	s8				dmareq;
-	s8				sync_dev;
-	unsigned			multichannel:1;
-};
-
-/*
- * Allocate dmareq0 to the current channel unless it's already taken
- */
-static inline int tusb_omap_use_shared_dmareq(struct tusb_omap_dma_ch *chdat)
+EM_INFO_V2
 {
-	u32		reg = musb_readl(chdat->tbase, TUSB_DMA_EP_MAP);
+  ATOM_INTEGRATED_SYSTEM_INFO_V1_8    sIntegratedSysInfo;       // refer to ATOM_INTEGRATED_SYSTEM_INFO_V1_8 definition
+  ULONG                               ulPowerplayTable[128];    // Update comments here to link new powerplay table definition structure
+}ATOM_FUSION_SYSTEM_INFO_V2;
 
-	if (reg != 0) {
-		dev_dbg(chdat->musb->controller, "ep%i dmareq0 is busy for ep%i\n",
-			chdat->epnum, reg & 0xf);
-		return -EAGAIN;
-	}
 
-	if (chdat->tx)
-		reg = (1 << 4) | chdat->epnum;
-	else
-		reg = chdat->epnum;
-
-	musb_writel(chdat->tbase, TUSB_DMA_EP_MAP, reg);
-
-	return 0;
-}
-
-static inline void tusb_omap_free_shared_dmareq(struct tusb_omap_dma_ch *chdat)
+typedef struct _ATOM_I2C_REG_INFO
 {
-	u32		reg = musb_readl(chdat->tbase, TUSB_DMA_EP_MAP);
+  UCHAR ucI2cRegIndex;
+  UCHAR ucI2cRegVal;
+}ATOM_I2C_REG_INFO;
 
-	if ((reg & 0xf) != chdat->epnum) {
-		printk(KERN_ERR "ep%i trying to release dmareq0 for ep%i\n",
-			chdat->epnum, reg & 0xf);
-		return;
-	}
-	musb_writel(chdat->tbase, TUSB_DMA_EP_MAP, 0);
-}
-
-/*
- * See also musb_dma_completion in plat_uds.c and musb_g_[tx|rx]() in
- * musb_gadget.c.
- */
-static void tusb_omap_dma_cb(int lch, u16 ch_status, void *data)
+// this IntegrateSystemInfoTable is used for Carrizo
+typedef struct _ATOM_INTEGRATED_SYSTEM_INFO_V1_9
 {
-	struct dma_channel	*channel = (struct dma_channel *)data;
-	struct tusb_omap_dma_ch	*chdat = to_chdat(channel);
-	struct tusb_omap_dma	*tusb_dma = chdat->tusb_dma;
-	struct musb		*musb = chdat->musb;
-	struct device		*dev = musb->controller;
-	struct musb_hw_ep	*hw_ep = chdat->hw_ep;
-	void __iomem		*ep_conf = hw_ep->conf;
-	void __iomem		*mbase = musb->mregs;
-	unsigned long		remaining, flags, pio;
-	int			ch;
+  ATOM_COMMON_TABLE_HEADER   sHeader;
+  ULONG  ulBootUpEngineClock;
+  ULONG  ulDentistVCOFreq;
+  ULONG  ulBootUpUMAClock;
+  ATOM_CLK_VOLT_CAPABILITY   sDISPCLK_Voltage[4];       // no longer used, keep it as is to avoid driver compiling error
+  ULONG  ulBootUpReqDisplayVector;
+  ULONG  ulVBIOSMisc;
+  ULONG  ulGPUCapInfo;
+  ULONG  ulDISP_CLK2Freq;
+  USHORT usRequestedPWMFreqInHz;
+  UCHAR  ucHtcTmpLmt;
+  UCHAR  ucHtcHystLmt;
+  ULONG  ulReserved2;
+  ULONG  ulSystemConfig;
+  ULONG  ulCPUCapInfo;
+  ULONG  ulReserved3;
+  USHORT usGPUReservedSysMemSize;
+  USHORT usExtDispConnInfoOffset;
+  USHORT usPanelRefreshRateRange;
+  UCHAR  ucMemoryType;
+  UCHAR  ucUMAChannelNumber;
+  UCHAR  strVBIOSMsg[40];
+  ATOM_TDP_CONFIG  asTdpConfig;
+  UCHAR  ucExtHDMIReDrvSlvAddr;
+  UCHAR  ucExtHDMIReDrvRegNum;
+  ATOM_I2C_REG_INFO asExtHDMIRegSetting[9];
+  ULONG  ulReserved[2];
+  ATOM_CLK_VOLT_CAPABILITY_V2   sDispClkVoltageMapping[8];
+  ATOM_AVAILABLE_SCLK_LIST   sAvail_SCLK[5];            // no longer used, keep it as is to avoid driver compiling error
+  ULONG  ulGMCRestoreResetTime;
+  ULONG  ulReserved4;
+  ULONG  ulIdleNClk;
+  ULONG  ulDDR_DLL_PowerUpTime;
+  ULONG  ulDDR_PLL_PowerUpTime;
+  USHORT usPCIEClkSSPercentage;
+  USHORT usPCIEClkSSType;
+  USHORT usLvdsSSPercentage;
+  USHORT usLvdsSSpreadRateIn10Hz;
+  USHORT usHDMISSPercentage;
+  USHORT usHDMISSpreadRateIn10Hz;
+  USHORT usDVISSPercentage;
+  USHORT usDVISSpreadRateIn10Hz;
+  ULONG  ulGPUReservedSysMemBaseAddrLo;
+  ULONG  ulGPUReservedSysMemBaseAddrHi;
+  ULONG  ulReserved5[3];
+  USHORT usMaxLVDSPclkFreqInSingleLink;
+  UCHAR  ucLvdsMisc;
+  UCHAR  ucTravisLVDSVolAdjust;
+  UCHAR  ucLVDSPwrOnSeqDIGONtoDE_in4Ms;
+  UCHAR  ucLVDSPwrOnSeqDEtoVARY_BL_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqVARY_BLtoDE_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqDEtoDIGON_in4Ms;
+  UCHAR  ucLVDSOffToOnDelay_in4Ms;
+  UCHAR  ucLVDSPwrOnSeqVARY_BLtoBLON_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqBLONtoVARY_BL_in4Ms;
+  UCHAR  ucMinAllowedBL_Level;
+  ULONG  ulLCDBitDepthControlVal;
+  ULONG  ulNbpStateMemclkFreq[4];          // only 2 level is changed.
+  ULONG  ulPSPVersion;
+  ULONG  ulNbpStateNClkFreq[4];
+  USHORT usNBPStateVoltage[4];
+  USHORT usBootUpNBVoltage;
+  UCHAR  ucEDPv1_4VSMode;
+  UCHAR  ucReserved2;
+  ATOM_EXTERNAL_DISPLAY_CONNECTION_INFO sExtDispConnInfo;
+}ATOM_INTEGRATED_SYSTEM_INFO_V1_9;
 
-	spin_lock_irqsave(&musb->lock, flags);
 
-	if (tusb_dma->multichannel)
-		ch = chdat->ch;
-	else
-		ch = tusb_dma->ch;
+// definition for ucEDPv1_4VSMode
+#define EDP_VS_LEGACY_MODE                  0
+#define EDP_VS_LOW_VDIFF_MODE               1
+#define EDP_VS_HIGH_VDIFF_MODE              2
+#define EDP_VS_STRETCH_MODE                 3
+#define EDP_VS_SINGLE_VDIFF_MODE            4
+#define EDP_VS_VARIABLE_PREM_MODE           5
 
-	if (ch_status != OMAP_DMA_BLOCK_IRQ)
-		printk(KERN_ERR "TUSB DMA error status: %i\n", ch_status);
 
-	dev_dbg(musb->controller, "ep%i %s dma callback ch: %i status: %x\n",
-		chdat->epnum, chdat->tx ? "tx" : "rx",
-		ch, ch_status);
-
-	if (chdat->tx)
-		remaining = musb_readl(ep_conf, TUSB_EP_TX_OFFSET);
-	else
-		remaining = musb_readl(ep_conf, TUSB_EP_RX_OFFSET);
-
-	remaining = TUSB_EP_CONFIG_XFR_SIZE(remaining);
-
-	/* HW issue #10: XFR_SIZE may get corrupt on DMA (both async & sync) */
-	if (unlikely(remaining > chdat->transfer_len)) {
-		dev_dbg(musb->controller, "Corrupt %s dma ch%i XFR_SIZE: 0x%08lx\n",
-			chdat->tx ? "tx" : "rx", chdat->ch,
-			remaining);
-		remaining = 0;
-	}
-
-	channel->actual_len = chdat->transfer_len - remaining;
-	pio = chdat->len - channel->actual_len;
-
-	dev_dbg(musb->controller, "DMA remaining %lu/%u\n", remaining, chdat->transfer_len);
-
-	/* Transfer remaining 1 - 31 bytes */
-	if (pio > 0 && pio < 32) {
-		u8	*buf;
-
-		dev_dbg(musb->controller, "Using PIO for remaining %lu bytes\n", pio);
-		buf = phys_to_virt((u32)chdat->dma_addr) + chdat->transfer_len;
-		if (chdat->tx) {
-			dma_unmap_single(dev, chdat->dma_addr,
-						chdat->transfer_len,
-						DMA_TO_DEVICE);
-			musb_write_fifo(hw_ep, pio, buf);
-		} else {
-			dma_unmap_single(dev, chdat->dma_addr,
-						chdat->transfer_len,
-						DMA_FROM_DEVICE);
-			musb_read_fifo(hw_ep, pio, buf);
-		}
-		channel->actual_len += pio;
-	}
-
-	if (!tusb_dma->multichannel)
-		tusb_omap_free_shared_dmareq(chdat);
-
-	channel->status = MUSB_DMA_STATUS_FREE;
-
-	/* Handle only RX callbacks here. TX callbacks must be handled based
-	 * on the TUSB DMA status interrupt.
-	 * REVISIT: Use both TUSB DMA status interrupt and OMAP DMA callback
-	 * interrupt for RX and TX.
-	 */
-	if (!chdat->tx)
-		musb_dma_completion(musb, chdat->epnum, chdat->tx);
-
-	/* We must terminate short tx transfers manually by setting TXPKTRDY.
-	 * REVISIT: This same problem may occur with other MUSB dma as well.
-	 * Easy to test with g_ether by pinging the MUSB board with ping -s54.
-	 */
-	if ((chdat->transfer_len < chdat->packet_sz)
-			|| (chdat->transfer_len % chdat->packet_sz != 0)) {
-		u16	csr;
-
-		if (chdat->tx) {
-			dev_dbg(musb->controller, "terminating short tx packet\n");
-			musb_ep_select(mbase, chdat->epnum);
-			csr = musb_readw(hw_ep->regs, MUSB_TXCSR);
-			csr |= MUSB_TXCSR_MODE | MUSB_TXCSR_TXPKTRDY
-				| MUSB_TXCSR_P_WZC_BITS;
-			musb_writew(hw_ep->regs, MUSB_TXCSR, csr);
-		}
-	}
-
-	spin_unlock_irqrestore(&musb->lock, flags);
-}
-
-static int tusb_omap_dma_program(struct dma_channel *channel, u16 packet_sz,
-				u8 rndis_mode, dma_addr_t dma_addr, u32 len)
+// this IntegrateSystemInfoTable is used for Carrizo
+typedef struct _ATOM_INTEGRATED_SYSTEM_INFO_V1_10
 {
-	struct tusb_omap_dma_ch		*chdat = to_chdat(channel);
-	struct tusb_omap_dma		*tusb_dma = chdat->tusb_dma;
-	struct musb			*musb = chdat->musb;
-	struct device			*dev = musb->controller;
-	struct musb_hw_ep		*hw_ep = chdat->hw_ep;
-	void __iomem			*mbase = musb->mregs;
-	void __iomem			*ep_conf = hw_ep->conf;
-	dma_addr_t			fifo = hw_ep->fifo_sync;
-	struct omap_dma_channel_params	dma_params;
-	u32				dma_remaining;
-	int				src_burst, dst_burst;
-	u16				csr;
-	u32				psize;
-	int				ch;
-	s8				dmareq;
-	s8				sync_dev;
+  ATOM_COMMON_TABLE_HEADER   sHeader;
+  ULONG  ulBootUpEngineClock;
+  ULONG  ulDentistVCOFreq;
+  ULONG  ulBootUpUMAClock;
+  ULONG  ulReserved0[8];
+  ULONG  ulBootUpReqDisplayVector;
+  ULONG  ulVBIOSMisc;
+  ULONG  ulGPUCapInfo;
+  ULONG  ulReserved1;
+  USHORT usRequestedPWMFreqInHz;
+  UCHAR  ucHtcTmpLmt;
+  UCHAR  ucHtcHystLmt;
+  ULONG  ulReserved2;
+  ULONG  ulSystemConfig;
+  ULONG  ulCPUCapInfo;
+  ULONG  ulReserved3;
+  USHORT usGPUReservedSysMemSize;
+  USHORT usExtDispConnInfoOffset;
+  USHORT usPanelRefreshRateRange;
+  UCHAR  ucMemoryType;
+  UCHAR  ucUMAChannelNumber;
+  UCHAR  strVBIOSMsg[40];
+  ATOM_TDP_CONFIG  asTdpConfig;
+  ULONG  ulReserved[7];
+  ATOM_CLK_VOLT_CAPABILITY_V2   sDispClkVoltageMapping[8];
+  ULONG  ulReserved6[10];
+  ULONG  ulGMCRestoreResetTime;
+  ULONG  ulReserved4;
+  ULONG  ulIdleNClk;
+  ULONG  ulDDR_DLL_PowerUpTime;
+  ULONG  ulDDR_PLL_PowerUpTime;
+  USHORT usPCIEClkSSPercentage;
+  USHORT usPCIEClkSSType;
+  USHORT usLvdsSSPercentage;
+  USHORT usLvdsSSpreadRateIn10Hz;
+  USHORT usHDMISSPercentage;
+  USHORT usHDMISSpreadRateIn10Hz;
+  USHORT usDVISSPercentage;
+  USHORT usDVISSpreadRateIn10Hz;
+  ULONG  ulGPUReservedSysMemBaseAddrLo;
+  ULONG  ulGPUReservedSysMemBaseAddrHi;
+  ULONG  ulReserved5[3];
+  USHORT usMaxLVDSPclkFreqInSingleLink;
+  UCHAR  ucLvdsMisc;
+  UCHAR  ucTravisLVDSVolAdjust;
+  UCHAR  ucLVDSPwrOnSeqDIGONtoDE_in4Ms;
+  UCHAR  ucLVDSPwrOnSeqDEtoVARY_BL_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqVARY_BLtoDE_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqDEtoDIGON_in4Ms;
+  UCHAR  ucLVDSOffToOnDelay_in4Ms;
+  UCHAR  ucLVDSPwrOnSeqVARY_BLtoBLON_in4Ms;
+  UCHAR  ucLVDSPwrOffSeqBLONtoVARY_BL_in4Ms;
+  UCHAR  ucMinAllowedBL_Level;
+  ULONG  ulLCDBitDepthControlVal;
+  ULONG  ulNbpStateMemclkFreq[2];
+  ULONG  ulReserved7[2];
+  ULONG  ulPSPVersion;
+  ULONG  ulNbpStateNClkFreq[4];
+  USHORT usNBPStateVoltage[4];
+  USHORT usBootUpNBVoltage;
+  UCHAR  ucEDPv1_4VSMode;
+  UCHAR  ucReserved2;
+  ATOM_EXTERNAL_DISPLAY_CONNECTION_INFO sExtDispConnInfo;
+}ATOM_INTEGRATED_SYSTEM_INFO_V1_10;
 
-	if (unlikely(dma_addr & 0x1) || (len < 32) || (len > packet_sz))
-		return false;
+/**************************************************************************/
+// This portion is only used when ext thermal chip or engine/memory clock SS chip is populated on a design
+//Memory SS Info Table
+//Define Memory Clock SS chip ID
+#define ICS91719  1
+#define ICS91720  2
 
-	/*
-	 * HW issue #10: Async dma will eventually corrupt the XFR_SIZE
-	 * register which will cause missed DMA interrupt. We could try to
-	 * use a timer for the callback, but it is unsafe as the XFR_SIZE
-	 * register is corrupt, and we won't know if the DMA worked.
-	 */
-	if (dma_addr & 0x2)
-		return false;
-
-	/*
-	 * Because of HW issue #10, it seems like mixing sync DMA and async
-	 * PIO access can confuse the DMA. Make sure XFR_SIZE is reset before
-	 * using the channel for DMA.
-	 */
-	if (chdat->tx)
-		dma_remaining = musb_readl(ep_conf, TUSB_EP_TX_OFFSET);
-	else
-		dma_remaining = musb_readl(ep_conf, TUSB_EP_RX_OFFSET);
-
-	dma_remaining = TUSB_EP_CONFIG_XFR_SIZE(dma_remaining);
-	if (dma_remaining) {
-		dev_dbg(musb->controller, "Busy %s dma ch%i, not using: %08x\n",
-			chdat->tx ? "tx" : "rx", chdat->ch,
-			dma_remaining);
-		return false;
-	}
-
-	chdat->transfer_len = len & ~0x1f;
-
-	if (len < packet_sz)
-		chdat->transfer_packet_sz = chdat->transfer_len;
-	else
-		chdat->transfer_packet_sz = packet_sz;
-
-	if (tusb_dma->multichannel) {
-		ch = chdat->ch;
-		dmareq = chdat->dmareq;
-		sync_dev = chdat->sync_dev;
-	} else {
-		if (tusb_omap_use_shared_dmareq(chdat) != 0) {
-			dev_dbg(musb->controller, "could not get dma for ep%i\n", chdat->epnum);
-			return false;
-		}
-		if (tusb_dma->ch < 0) {
-			/* REVISIT: This should get blocked earlier, happens
-			 * with MSC ErrorRecoveryTest
-			 */
-			WARN_ON(1);
-			return false;
-		}
-
-		ch = tusb_dma->ch;
-		dmareq = tusb_dma->dmareq;
-		sync_dev = tusb_dma->sync_dev;
-		omap_set_dma_callback(ch, tusb_omap_dma_cb, channel);
-	}
-
-	chdat->packet_sz = packet_sz;
-	chdat->len = len;
-	channel->actual_len = 0;
-	chdat->dma_addr = dma_addr;
-	channel->status = MUSB_DMA_STATUS_BUSY;
-
-	/* Since we're recycling dma areas, we need to clean or invalidate */
-	if (chdat->tx)
-		dma_map_single(dev, phys_to_virt(dma_addr), len,
-				DMA_TO_DEVICE);
-	else
-		dma_map_single(dev, phys_to_virt(dma_addr), len,
-				DMA_FROM_DEVICE);
-
-	/* Use 16-bit transfer if dma_addr is not 32-bit aligned */
-	if ((dma_addr & 0x3) == 0) {
-		dma_params.data_type = OMAP_DMA_DATA_TYPE_S32;
-		dma_params.elem_count = 8;		/* Elements in frame */
-	} else {
-		dma_params.data_type = OMAP_DMA_DATA_TYPE_S16;
-		dma_params.elem_count = 16;		/* Elements in frame */
-		fifo = hw_ep->fifo_async;
-	}
-
-	dma_params.frame_count	= chdat->transfer_len / 32; /* Burst sz frame */
-
-	dev_dbg(musb->controller, "ep%i %s dma ch%i dma: %08x len: %u(%u) packet_sz: %i(%i)\n",
-		chdat->epnum, chdat->tx ? "tx" : "rx",
-		ch, dma_addr, chdat->transfer_len, len,
-		chdat->transfer_packet_sz, packet_sz);
-
-	/*
-	 * Prepare omap DMA for transfer
-	 */
-	if (chdat->tx) {
-		dma_params.src_amode	= OMAP_DMA_AMODE_POST_INC;
-		dma_params.src_start	= (unsigned long)dma_addr;
-		dma_params.src_ei	= 0;
-		dma_params.src_fi	= 0;
-
-		dma_params.dst_amode	= OMAP_DMA_AMODE_DOUBLE_IDX;
-		dma_params.dst_start	= (unsigned long)fifo;
-		dma_params.dst_ei	= 1;
-		dma_params.dst_fi	= -31;	/* Loop 32 byte window */
-
-		dma_params.trigger	= sync_dev;
-		dma_params.sync_mode	= OMAP_DMA_SYNC_FRAME;
-		dma_params.src_or_dst_synch	= 0;	/* Dest sync */
-
-		src_burst = OMAP_DMA_DATA_BURST_16;	/* 16x32 read */
-		dst_burst = OMAP_DMA_DATA_BURST_8;	/* 8x32 write */
-	} else {
-		dma_params.src_amode	= OMAP_DMA_AMODE_DOUBLE_IDX;
-		dma_params.src_start	= (unsigned long)fifo;
-		dma_params.src_ei	= 1;
-		dma_params.src_fi	= -31;	/* Loop 32 byte window */
-
-		dma_params.dst_amode	= OMAP_DMA_AMODE_POST_INC;
-		dma_params.dst_start	= (unsigned long)dma_addr;
-		dma_params.dst_ei	= 0;
-		dma_params.dst_fi	= 0;
-
-		dma_params.trigger	= sync_dev;
-		dma_params.sync_mode	= OMAP_DMA_SYNC_FRAME;
-		dma_params.src_or_dst_synch	= 1;	/* Source sync */
-
-		src_burst = OMAP_DMA_DATA_BURST_8;	/* 8x32 read */
-		dst_burst = OMAP_DMA_DATA_BURST_16;	/* 16x32 write */
-	}
-
-	dev_dbg(musb->controller, "ep%i %s using %i-bit %s dma from 0x%08lx to 0x%08lx\n",
-		chdat->epnum, chdat->tx ? "tx" : "rx",
-		(dma_params.data_type == OMAP_DMA_DATA_TYPE_S32) ? 32 : 16,
-		((dma_addr & 0x3) == 0) ? "sync" : "async",
-		dma_params.src_start, dma_params.dst_start);
-
-	omap_set_dma_params(ch, &dma_params);
-	omap_set_dma_src_burst_mode(ch, src_burst);
-	omap_set_dma_dest_burst_mode(ch, dst_burst);
-	omap_set_dma_write_mode(ch, OMAP_DMA_WRITE_LAST_NON_POSTED);
-
-	/*
-	 * Prepare MUSB for DMA transfer
-	 */
-	if (chdat->tx) {
-		musb_ep_select(mbase, chdat->epnum);
-		csr = musb_readw(hw_ep->regs, MUSB_TXCSR);
-		csr |= (MUSB_TXCSR_AUTOSET | MUSB_TXCSR_DMAENAB
-			| MUSB_TXCSR_DMAMODE | MUSB_TXCSR_MODE);
-		csr &= ~MUSB_TXCSR_P_UNDERRUN;
-		musb_writew(hw_ep->regs, MUSB_TXCSR, csr);
-	} else {
-		musb_ep_select(mbase, chdat->epnum);
-		csr = musb_readw(hw_ep->regs, MUSB_RXCSR);
-		csr |= MUSB_RXCSR_DMAENAB;
-		csr &= ~(MUSB_RXCSR_AUTOCLEAR | MUSB_RXCSR_DMAMODE);
-		musb_writew(hw_ep->regs, MUSB_RXCSR,
-			csr | MUSB_RXCSR_P_WZC_BITS);
-	}
-
-	/*
-	 * Start DMA transfer
-	 */
-	omap_start_dma(ch);
-
-	if (chdat->tx) {
-		/* Send transfer_packet_sz packets at a time */
-		psize = musb_readl(ep_conf, TUSB_EP_MAX_PACKET_SIZE_OFFSET);
-		psize &= ~0x7ff;
-		psize |= chdat->transfer_packet_sz;
-		musb_writel(ep_conf, TUSB_EP_MAX_PACKET_SIZE_OFFSET, psize);
-
-		musb_writel(ep_conf, TUSB_EP_TX_OFFSET,
-			TUSB_EP_CONFIG_XFR_SIZE(chdat->transfer_len));
-	} else {
-		/* Receive transfer_packet_sz packets at a time */
-		psize = musb_readl(ep_conf, TUSB_EP_MAX_PACKET_SIZE_OFFSET);
-		psize &= ~(0x7ff << 16);
-		psize |= (chdat->transfer_packet_sz << 16);
-		musb_writel(ep_conf, TUSB_EP_MAX_PACKET_SIZE_OFFSET, psize);
-
-		musb_writel(ep_conf, TUSB_EP_RX_OFFSET,
-			TUSB_EP_CONFIG_XFR_SIZE(chdat->transfer_len));
-	}
-
-	return true;
-}
-
-static int tusb_omap_dma_abort(struct dma_channel *channel)
+//Define one structure to inform SW a "block of data" writing to external SS chip via I2C protocol
+typedef struct _ATOM_I2C_DATA_RECORD
 {
-	struct tusb_omap_dma_ch	*chdat = to_chdat(channel);
-	struct tusb_omap_dma	*tusb_dma = chdat->tusb_dma;
+  UCHAR         ucNunberOfBytes;                                              //Indicates how many bytes SW needs to write to the external ASIC for one block, besides to "Start" and "Stop"
+  UCHAR         ucI2CData[1];                                                 //I2C data in bytes, should be less than 16 bytes usually
+}ATOM_I2C_DATA_RECORD;
 
-	if (!tusb_dma->multichannel) {
-		if (tusb_dma->ch >= 0) {
-			omap_stop_dma(tusb_dma->ch);
-			omap_free_dma(tusb_dma->ch);
-			tusb_dma->ch = -1;
-		}
 
-		tusb_dma->dmareq = -1;
-		tusb_dma->sync_dev = -1;
-	}
-
-	channel->status = MUSB_DMA_STATUS_FREE;
-
-	return 0;
-}
-
-static inline int tusb_omap_dma_allocate_dmareq(struct tusb_omap_dma_ch *chdat)
+//Define one structure to inform SW how many blocks of data writing to external SS chip via I2C protocol, in addition to other information
+typedef struct _ATOM_I2C_DEVICE_SETUP_INFO
 {
-	u32		reg = musb_readl(chdat->tbase, TUSB_DMA_EP_MAP);
-	int		i, dmareq_nr = -1;
+  ATOM_I2C_ID_CONFIG_ACCESS       sucI2cId;               //I2C line and HW/SW assisted cap.
+  UCHAR                              ucSSChipID;             //SS chip being used
+  UCHAR                              ucSSChipSlaveAddr;      //Slave Address to set up this SS chip
+  UCHAR                           ucNumOfI2CDataRecords;  //number of data block
+  ATOM_I2C_DATA_RECORD            asI2CData[1];
+}ATOM_I2C_DEVICE_SETUP_INFO;
 
-	const int sync_dev[6] = {
-		OMAP24XX_DMA_EXT_DMAREQ0,
-		OMAP24XX_DMA_EXT_DMAREQ1,
-		OMAP242X_DMA_EXT_DMAREQ2,
-		OMAP242X_DMA_EXT_DMAREQ3,
-		OMAP242X_DMA_EXT_DMAREQ4,
-		OMAP242X_DMA_EXT_DMAREQ5,
-	};
-
-	for (i = 0; i < MAX_DMAREQ; i++) {
-		int cur = (reg & (0xf << (i * 5))) >> (i * 5);
-		if (cur == 0) {
-			dmareq_nr = i;
-			break;
-		}
-	}
-
-	if (dmareq_nr == -1)
-		return -EAGAIN;
-
-	reg |= (chdat->epnum << (dmareq_nr * 5));
-	if (chdat->tx)
-		reg |= ((1 << 4) << (dmareq_nr * 5));
-	musb_writel(chdat->tbase, TUSB_DMA_EP_MAP, reg);
-
-	chdat->dmareq = dmareq_nr;
-	chdat->sync_dev = sync_dev[chdat->dmareq];
-
-	return 0;
-}
-
-static inline void tusb_omap_dma_free_dmareq(struct tusb_omap_dma_ch *chdat)
+//==========================================================================================
+typedef struct  _ATOM_ASIC_MVDD_INFO
 {
-	u32 reg;
+  ATOM_COMMON_TABLE_HEADER         sHeader;
+  ATOM_I2C_DEVICE_SETUP_INFO      asI2CSetup[1];
+}ATOM_ASIC_MVDD_INFO;
 
-	if (!chdat || chdat->dmareq < 0)
-		return;
+//==========================================================================================
+#define ATOM_MCLK_SS_INFO         ATOM_ASIC_MVDD_INFO
 
-	reg = musb_readl(chdat->tbase, TUSB_DMA_EP_MAP);
-	reg &= ~(0x1f << (chdat->dmareq * 5));
-	musb_writel(chdat->tbase, TUSB_DMA_EP_MAP, reg);
+//==========================================================================================
+/**************************************************************************/
 
-	chdat->dmareq = -1;
-	chdat->sync_dev = -1;
-}
-
-static struct dma_channel *dma_channel_pool[MAX_DMAREQ];
-
-static struct dma_channel *
-tusb_omap_dma_allocate(struct dma_controller *c,
-		struct musb_hw_ep *hw_ep,
-		u8 tx)
+typedef struct _ATOM_ASIC_SS_ASSIGNMENT
 {
-	int ret, i;
-	const char		*dev_name;
-	struct tusb_omap_dma	*tusb_dma;
-	struct musb		*musb;
-	void __iomem		*tbase;
-	struct dma_channel	*channel = NULL;
-	struct tusb_omap_dma_ch	*chdat = NULL;
-	u32			reg;
+   ULONG                        ulTargetClockRange;                  //Clock Out frequence (VCO ), in unit of 10Khz
+  USHORT              usSpreadSpectrumPercentage;      //in unit of 0.01%
+   USHORT                     usSpreadRateInKhz;                  //in unit of kHz, modulation freq
+  UCHAR               ucClockIndication;                 //Indicate which clock source needs SS
+   UCHAR                        ucSpreadSpectrumMode;               //Bit1=0 Down Spread,=1 Center Spread.
+   UCHAR                        ucReserved[2];
+}ATOM_ASIC_SS_ASSIGNMENT;
 
-	tusb_dma = container_of(c, struct tusb_omap_dma, controller);
-	musb = tusb_dma->musb;
-	tbase = musb->ctrl_base;
+//Define ucClockIndication, SW uses the IDs below to search if the SS is requried/enabled on a clock branch/signal type.
+//SS is not required or enabled if a match is not found.
+#define ASIC_INTERNAL_MEMORY_SS            1
+#define ASIC_INTERNAL_ENGINE_SS            2
+#define ASIC_INTERNAL_UVD_SS             3
+#define ASIC_INTERNAL_SS_ON_TMDS         4
+#define ASIC_INTERNAL_SS_ON_HDMI         5
+#define ASIC_INTERNAL_SS_ON_LVDS         6
+#define ASIC_INTERNAL_SS_ON_DP           7
+#define ASIC_INTERNAL_SS_ON_DCPLL        8
+#define ASIC_EXTERNAL_SS_ON_DP_CLOCK     9
+#define ASIC_INTERNAL_VCE_SS             10
+#define ASIC_INTERNAL_GPUPLL_SS          11
 
-	reg = musb_readl(tbase, TUSB_DMA_INT_MASK);
-	if (tx)
-		reg &= ~(1 << hw_ep->epnum);
-	else
-		reg &= ~(1 << (hw_ep->epnum + 15));
-	musb_writel(tbase, TUSB_DMA_INT_MASK, reg);
 
-	/* REVISIT: Why does dmareq5 not work? */
-	if (hw_ep->epnum == 0) {
-		dev_dbg(musb->controller, "Not allowing DMA for ep0 %s\n", tx ? "tx" : "rx");
-		return NULL;
-	}
-
-	for (i = 0; i < MAX_DMAREQ; i++) {
-		struct dma_channel *ch = dma_channel_pool[i];
-		if (ch->status == MUSB_DMA_STATUS_UNKNOWN) {
-			ch->status = MUSB_DMA_STATUS_FREE;
-			channel = ch;
-			chdat = ch->private_data;
-			break;
-		}
-	}
-
-	if (!channel)
-		return NULL;
-
-	if (tx) {
-		chdat->tx = 1;
-		dev_name = "TUSB transmit";
-	} else {
-		chdat->tx = 0;
-		dev_name = "TUSB receive";
-	}
-
-	chdat->musb = tusb_dma->musb;
-	chdat->tbase = tusb_dma->tbase;
-	chdat->hw_ep = hw_ep;
-	chdat->epnum = hw_ep->epnum;
-	chdat->dmareq = -1;
-	chdat->completed_len = 0;
-	chdat->tusb_dma = tusb_dma;
-
-	channel->max_len = 0x7fffffff;
-	channel->desired_mode = 0;
-	channel->actual_len = 0;
-
-	if (tusb_dma->multichannel) {
-		ret = tusb_omap_dma_allocate_dmareq(chdat);
-		if (ret != 0)
-			goto free_dmareq;
-
-		ret = omap_request_dma(chdat->sync_dev, dev_name,
-				tusb_omap_dma_cb, channel, &chdat->ch);
-		if (ret != 0)
-			goto free_dmareq;
-	} else if (tusb_dma->ch == -1) {
-		tusb_dma->dmareq = 0;
-		tusb_dma->sync_dev = OMAP24XX_DMA_EXT_DMAREQ0;
-
-		/* Callback data gets set later in the shared dmareq case */
-		ret = omap_request_dma(tusb_dma->sync_dev, "TUSB shared",
-				tusb_omap_dma_cb, NULL, &tusb_dma->ch);
-		if (ret != 0)
-			goto free_dmareq;
-
-		chdat->dmareq = -1;
-		chdat->ch = -1;
-	}
-
-	dev_dbg(musb->controller, "ep%i %s dma: %s dma%i dmareq%i sync%i\n",
-		chdat->epnum,
-		chdat->tx ? "tx" : "rx",
-		chdat->ch >= 0 ? "dedicated" : "shared",
-		chdat->ch >= 0 ? chdat->ch : tusb_dma->ch,
-		chdat->dmareq >= 0 ? chdat->dmareq : tusb_dma->dmareq,
-		chdat->sync_dev >= 0 ? chdat->sync_dev : tusb_dma->sync_dev);
-
-	return channel;
-
-free_dmareq:
-	tusb_omap_dma_free_dmareq(chdat);
-
-	dev_dbg(musb->controller, "ep%i: Could not get a DMA channel\n", chdat->epnum);
-	channel->status = MUSB_DMA_STATUS_UNKNOWN;
-
-	return NULL;
-}
-
-static void tusb_omap_dma_release(struct dma_channel *channel)
+typedef struct _ATOM_ASIC_SS_ASSIGNMENT_V2
 {
-	struct tusb_omap_dma_ch	*chdat = to_chdat(channel);
-	struct musb		*musb = chdat->musb;
-	void __iomem		*tbase = musb->ctrl_base;
-	u32			reg;
+   ULONG                        ulTargetClockRange;                  //For mem/engine/uvd, Clock Out frequence (VCO ), in unit of 10Khz
+                                                    //For TMDS/HDMI/LVDS, it is pixel clock , for DP, it is link clock ( 27000 or 16200 )
+  USHORT              usSpreadSpectrumPercentage;      //in unit of 0.01%
+   USHORT                     usSpreadRateIn10Hz;                  //in unit of 10Hz, modulation freq
+  UCHAR               ucClockIndication;                 //Indicate which clock source needs SS
+   UCHAR                        ucSpreadSpectrumMode;               //Bit0=0 Down Spread,=1 Center Spread, bit1=0: internal SS bit1=1: external SS
+   UCHAR                        ucReserved[2];
+}ATOM_ASIC_SS_ASSIGNMENT_V2;
 
-	dev_dbg(musb->controller, "ep%i ch%i\n", chdat->epnum, chdat->ch);
+//ucSpreadSpectrumMode
+//#define ATOM_SS_DOWN_SPREAD_MODE_MASK          0x00000000
+//#define ATOM_SS_DOWN_SPREAD_MODE               0x00000000
+//#define ATOM_SS_CENTRE_SPREAD_MODE_MASK        0x00000001
+//#define ATOM_SS_CENTRE_SPREAD_MODE             0x00000001
+//#define ATOM_INTERNAL_SS_MASK                  0x00000000
+//#define ATOM_EXTERNAL_SS_MASK                  0x00000002
 
-	reg = musb_readl(tbase, TUSB_DMA_INT_MASK);
-	if (chdat->tx)
-		reg |= (1 << chdat->epnum);
-	else
-		reg |= (1 << (chdat->epnum + 15));
-	musb_writel(tbase, TUSB_DMA_INT_MASK, reg);
-
-	reg = musb_readl(tbase, TUSB_DMA_INT_CLEAR);
-	if (chdat->tx)
-		reg |= (1 << chdat->epnum);
-	else
-		reg |= (1 << (chdat->epnum + 15));
-	musb_writel(tbase, TUSB_DMA_INT_CLEAR, reg);
-
-	channel->status = MUSB_DMA_STATUS_UNKNOWN;
-
-	if (chdat->ch >= 0) {
-		omap_stop_dma(chdat->ch);
-		omap_free_dma(chdat->ch);
-		chdat->ch = -1;
-	}
-
-	if (chdat->dmareq >= 0)
-		tusb_omap_dma_free_dmareq(chdat);
-
-	channel = NULL;
-}
-
-void tusb_dma_controller_destroy(struct dma_controller *c)
+typedef struct _ATOM_ASIC_INTERNAL_SS_INFO
 {
-	struct tusb_omap_dma	*tusb_dma;
-	int			i;
+  ATOM_COMMON_TABLE_HEADER         sHeader;
+  ATOM_ASIC_SS_ASSIGNMENT            asSpreadSpectrum[4];
+}ATOM_ASIC_INTERNAL_SS_INFO;
 
-	tusb_dma = container_of(c, struct tusb_omap_dma, controller);
-	for (i = 0; i < MAX_DMAREQ; i++) {
-		struct dma_channel *ch = dma_channel_pool[i];
-		if (ch) {
-			kfree(ch->private_data);
-			kfree(ch);
-		}
-	}
-
-	if (tusb_dma && !tusb_dma->multichannel && tusb_dma->ch >= 0)
-		omap_free_dma(tusb_dma->ch);
-
-	kfree(tusb_dma);
-}
-EXPORT_SYMBOL_GPL(tusb_dma_controller_destroy);
-
-struct dma_controller *
-tusb_dma_controller_create(struct musb *musb, void __iomem *base)
+typedef struct _ATOM_ASIC_INTERNAL_SS_INFO_V2
 {
-	void __iomem		*tbase = musb->ctrl_base;
-	struct tusb_omap_dma	*tusb_dma;
-	int			i;
+  ATOM_COMMON_TABLE_HEADER         sHeader;
+  ATOM_ASIC_SS_ASSIGNMENT_V2        asSpreadSpectrum[1];      //this is point only.
+}ATOM_ASIC_INTERNAL_SS_INFO_V2;
 
-	/* REVISIT: Get dmareq lines used from board-*.c */
+typedef struct _ATOM_ASIC_SS_ASSIGNMENT_V3
+{
+   ULONG                        ulTargetClockRange;                  //For mem/engine/uvd, Clock Out frequence (VCO ), in unit of 10Khz
+                                                    //For TMDS/HDMI/LVDS, it is pixel clock , for DP, it is link clock ( 27000 or 16200 )
+  USHORT              usSpreadSpectrumPercentage;      //in unit of 0.01% or 0.001%, decided by ucSpreadSpectrumMode bit4
+   USHORT                     usSpreadRateIn10Hz;                  //in unit of 10Hz, modulation freq
+  UCHAR               ucClockIndication;                 //Indicate which clock source needs SS
+   UCHAR                        ucSpreadSpectrumMode;               //Bit0=0 Down Spread,=1 Center Spread, bit1=0: internal SS bit1=1: external SS
+   UCHAR                        ucReserved[2];
+}ATOM_ASIC_SS_ASSIGNMENT_V3;
 
-	musb_writel(musb->ctrl_base, TUSB_DMA_INT_MASK, 0x7fffffff);
-	musb_writel(musb->ctrl_base, TUSB_DMA_EP_MAP, 0);
+//ATOM_ASIC_SS_ASSIGNMENT_V3.ucSpreadSpectrumMode
+#define SS_MODE_V3_CENTRE_SPREAD_MASK             0x01
+#define SS_MODE_V3_EXTERNAL_SS_MASK               0x02
+#define SS_MODE_V3_PERCENTAGE_DIV_BY_1000_MASK    0x10
 
-	musb_writel(tbase, TUSB_DMA_REQ_CONF,
-		TUSB_DMA_REQ_CONF_BURST_SIZE(2)
-		| TUSB_DMA_REQ_CONF_DMA_REQ_EN(0x3f)
-		| TUSB_DMA_REQ_CONF_DMA_REQ_ASSER(2));
+typedef struct _ATOM_ASIC_INTERNAL_SS_INFO_V3
+{
+  ATOM_COMMON_TABLE_HEADER         sHeader;
+  ATOM_ASIC_SS_ASSIGNMENT_V3        asSpreadSpectrum[1];      //this is pointer only.
+}ATOM_ASIC_INTERNAL_SS_INFO_V3;
 
-	tusb_dma = kzalloc(sizeof(struct tusb_omap_dma), GFP_KERNEL);
-	if (!tusb_dma)
-		goto out;
 
-	tusb_dma->musb = musb;
-	tusb_dma->tbase = musb->ctrl_base;
+//==============================Scratch Pad Definition Portion===============================
+#define ATOM_DEVICE_CONNECT_INFO_DEF  0
+#define ATOM_ROM_LOCATION_DEF         1
+#define ATOM_TV_STANDARD_DEF          2
+#define ATOM_ACTIVE_INFO_DEF          3
+#define ATOM_LCD_INFO_DEF             4
+#define ATOM_DOS_REQ_INFO_DEF         5
+#define ATOM_ACC_CHANGE_INFO_DEF      6
+#define ATOM_DOS_MODE_INFO_DEF        7
+#define ATOM_I2C_CHANNEL_STATUS_DEF   8
+#define ATOM_I2C_CHANNEL_STATUS1_DEF  9
+#define ATOM_INTERNAL_TIMER_DEF       10
 
-	tusb_dma->ch = -1;
-	tusb_dma->dmareq = -1;
-	tusb_dma->sync_dev = -1;
+// BIOS_0_SCRATCH Definition
+#define ATOM_S0_CRT1_MONO               0x00000001L
+#define ATOM_S0_CRT1_COLOR              0x00000002L
+#define ATOM_S0_CRT1_MASK               (ATOM_S0_CRT1_MONO+ATOM_S0_CRT1_COLOR)
 
-	tusb_dma->controller.channel_alloc = tusb_omap_dma_allocate;
-	tusb_dma->controller.channel_release = tusb_omap_dma_release;
-	tusb_dma->controller.channel_program = tusb_omap_dma_program;
-	tusb_dma->controller.channel_abort = tusb_omap_dma_abort;
+#define ATOM_S0_TV1_COMPOSITE_A         0x00000004L
+#define ATOM_S0_TV1_SVIDEO_A            0x00000008L
+#define ATOM_S0_TV1_MASK_A              (ATOM_S0_TV1_COMPOSITE_A+ATOM_S0_TV1_SVIDEO_A)
 
-	if (musb->tusb_revision >= TUSB_REV_30)
-		tusb_dma->multichannel = 1;
+#define ATOM_S0_CV_A                    0x00000010L
+#define ATOM_S0_CV_DIN_A                0x00000020L
+#define ATOM_S0_CV_MASK_A               (ATOM_S0_CV_A+ATOM_S0_CV_DIN_A)
 
-	for (i = 0; i < MAX_DMAREQ; i++) {
-		struct dma_channel	*ch;
-		struct tusb_omap_dma_ch	*chdat;
 
-		ch = kzalloc(sizeof(struct dma_channel), GFP_KERNEL);
-		if (!ch)
-			goto cleanup;
+#define ATOM_S0_CRT2_MONO               0x00000100L
+#define ATOM_S0_CRT2_COLOR              0x00000200L
+#define ATOM_S0_CRT2_MASK               (ATOM_S0_CRT2_MONO+ATOM_S0_CRT2_COLOR)
 
-		dma_channel_pool[i] = ch;
+#define ATOM_S0_TV1_COMPOSITE           0x00000400L
+#define ATOM_S0_TV1_SVIDEO              0x00000800L
+#define ATOM_S0_TV1_SCART               0x00004000L
+#define ATOM_S0_TV1_MASK                (ATOM_S0_TV1_COMPOSITE+ATOM_S0_TV1_SVIDEO+ATOM_S0_TV1_SCART)
 
-		chdat = kzalloc(sizeof(struct tusb_omap_dma_ch), GFP_KERNEL);
-		if (!chdat)
-			goto cleanup;
+#define ATOM_S0_CV                      0x00001000L
+#define ATOM_S0_CV_DIN                  0x00002000L
+#define ATOM_S0_CV_MASK                 (ATOM_S0_CV+ATOM_S0_CV_DIN)
 
-		ch->status = MUSB_DMA_STATUS_UNKNOWN;
-		ch->private_data = chdat;
-	}
+#define ATOM_S0_DFP1                    0x00010000L
+#define ATOM_S0_DFP2                    0x00020000L
+#define ATOM_S0_LCD1                    0x00040000L
+#define ATOM_S0_LCD2                    0x00080000L
+#define ATOM_S0_DFP6                    0x00100000L
+#define ATOM_S0_DFP3                    0x00200000L
+#define ATOM_S0_DFP4                    0x00400000L
+#define ATOM_S0_DFP5                    0x00800000L
 
-	return &tusb_dma->controller;
 
-cleanup:
-	musb_dma_controller_destroy(&tusb_dma->controller);
-out:
-	return NULL;
-}
-EXPORT_SYMBOL_GPL(tusb_dma_controller_create);
+#define ATOM_S0_DFP_MASK                ATOM_S0_DFP1 | ATOM_S0_DFP2 | ATOM_S0_DFP3 | ATOM_S0_DFP4 | ATOM_S0_DFP5 | ATOM_S0_DFP6
+
+#define ATOM_S0_FAD_REGISTER_BUG        0x02000000L // If set, indicates we are running a PCIE asic with
+                                                    // the FAD/HDP reg access bug.  Bit is read by DAL, this is obsolete from RV5xx
+
+#define ATOM_S0_THERMAL_STATE_MASK      0x1C000000L
+#define ATOM_S0_THERMAL_STATE_SHIFT     26
+
+#define ATOM_S0_SYSTEM_POWER_STATE_MASK 0xE0000000L
+#define ATOM_S0_SYSTEM_POWER_STATE_SHIFT 29
+
+#define ATOM_S0_SYSTEM_POWER_STATE_VALUE_AC     1
+#define ATOM_S0_SYSTEM_POWER_STATE_VALUE_DC     2
+#define ATOM_S0_SYSTEM_POWER_STATE_VALUE_LITEAC 3
+#define ATOM_S0_SYSTEM_POWER_STATE_VALUE_LIT2AC 4
+
+//Byte aligned defintion for BIOS usage
+#define ATOM_S0_CRT1_MONOb0             0x01
+#define ATOM_S0_CRT1_COLORb0            0x02
+#define ATOM_S0_CRT1_MASKb0             (ATOM_S0_CRT1_MONOb0+ATOM_S0_CRT1_COLORb0)
+
+#define ATOM_S0_TV1_COMPOSITEb0         0x04
+#define ATOM_S0_TV1_SVIDEOb0            0x08
+#define ATOM_S0_TV1_MASKb0              (ATOM_S0_TV1_COMPOSITEb0+ATOM_S0_TV1_SVIDEOb0)
+
+#define ATOM_S0_CVb0                    0x10
+#define ATOM_S0_CV_DINb0                0x20
+#define ATOM_S0_CV_MASKb0               (ATOM_S0_CVb0+ATOM_S0_CV_DINb0)
+
+#define ATOM_S0_CRT2_MONOb1             0x01
+#define ATOM_S0_CRT2_COLORb1            0x02
+#define ATOM_S0_CRT2_MASKb1             (ATOM_S0_CRT2_MONOb1+ATOM_S0_CRT2_COLORb1)
+
+#define ATOM_S0_TV1_COMPOSITEb1         0x04
+#define ATOM_S0_TV1_SVIDEOb1            0x08
+#define ATOM_S0_TV1_SCARTb1             0x40
+#define ATOM_S0_TV1_MASKb1              (ATOM_S0_TV1_COMPOSITEb1+ATOM_S0_TV1_SVIDEOb1+ATOM_S0_TV1_SCARTb1)
+
+#define ATOM_S0_CVb1                    0x10
+#define ATOM_S0_CV_DINb1                0x20
+#define ATOM_S0_CV_MASKb1               (ATOM_S0_CVb1+ATOM_S0_CV_DINb1)
+
+#define ATOM_S0_DFP1b2                  0x01
+#define ATOM_S0_DFP2b2                  0x02
+#define ATOM_S0_LCD1b2                  0x04
+#define ATOM_S0_LCD2b2                  0x08
+#define ATOM_S0_DFP6b2                  0x10
+#define ATOM_S0_DFP3b2                  0x20
+#define ATOM_S0_DFP4b2                  0x40
+#define ATOM_S0_DFP5b2                  0x80
+
+
+#define ATOM_S0_THERMAL_STATE_MASKb3    0x1C
+#define ATOM_S0_THERMAL_STATE_SHIFTb3   2
+
+#define ATOM_S0_SYSTEM_POWER_STATE_MASKb3 0xE0
+#define ATOM_S0_LCD1_SHIFT              18
+
+// BIOS_1_SCRATCH Definition
+#define ATOM_S1_ROM_LOCATION_MASK       0x0000FFFFL
+#define ATOM_S1_PCI_BUS_DEV_MASK        0xFFFF0000L
+
+//   BIOS_2_SCRATCH Definition
+#define ATOM_S2_TV1_STANDARD_MASK       0x0000000FL
+#define ATOM_S2_CURRENT_BL_LEVEL_MASK   0x0000FF00L
+#define ATOM_S2_CURRENT_BL_LEVEL_SHIFT  8
+
+#define ATOM_S2_FORCEDLOWPWRMODE_STATE_MASK       0x0C000000L
+#define ATOM_S2_FORCEDLOWPWRMODE_STATE_MASK_SHIFT 26
+#define ATOM_S2_FORCEDLOWPWRMODE_STATE_CHANGE     0x10000000L
+
+#define ATOM_S2_DEVICE_DPMS_STATE       0x00010000L
+#define ATOM_S2_VRI_BRIGHT_ENABLE       0x20000000L
+
+#define ATOM_S2_DISPLAY_ROTATION_0_DEGREE     0x0
+#define ATOM_S2_DISPLAY_ROTATION_90_DEGREE    0x1
+#define ATOM_S2_DISPLAY_ROTATION_180_DEGREE   0x2
+#define ATOM_S2_DISPLAY_ROTATION_270_DEGREE   0x3
+#define ATOM_S2_DISPLAY_ROTATION_DEGREE_SHIFT 30
+#define ATOM_S2_DISPLAY_ROTATION_ANGLE_MASK   0xC0000000L
+
+
+//Byte aligned defintion for BIOS usage
+#define ATOM_S2_TV1_STANDARD_MASKb0     0x0F
+#define ATOM_S2_CURRENT_BL_LEVEL_MASKb1 0xFF
+#define ATOM_S2_DEVICE_DPMS_STATEb2     0x01
+
+#define ATOM_S2_TMDS_COHERENT_MODEb3    0x10          // used by VBIOS code only, use coherent mode for TMDS/HDMI mode
+#define ATOM_S2_VRI_BRIGHT_ENABLEb3     0x20
+#define ATOM_S2_ROTATION_STATE_MASKb3   0xC0
+
+
+// BIOS_3_SCRATCH Definition
+#define ATOM_S3_CRT1_ACTIVE             0x00000001L
+#define ATOM_S3_LCD1_ACTIVE             0x00000002L
+#define ATOM_S3_TV1_ACTIVE              0x00000004L
+#define ATOM_S3_DFP1_ACTIVE             0x00000008L
+#define ATOM_S3_CRT2_ACTIVE             0x00000010L
+#define ATOM_S3_LCD2_ACTIVE             0x00000020L
+#define ATOM_S3_DFP6_ACTIVE                     0x00000040L
+#define ATOM_S3_DFP2_ACTIVE             0x00000080L
+#define ATOM_S3_CV_ACTIVE               0x00000100L
+#define ATOM_S3_DFP3_ACTIVE                     0x00000200L
+#define ATOM_S3_DFP4_ACTIVE                     0x00000400L
+#define ATOM_S3_DFP5_ACTIVE                     0x00000800L
+
+
+#define ATOM_S3_DEVICE_ACTIVE_MASK      0x00000FFFL
+
+#define ATOM_S3_LCD_FULLEXPANSION_ACTIVE         0x00001000L
+#define ATOM_S3_LCD_EXPANSION_ASPEC_RATIO_ACTIVE 0x00002000L
+
+#define ATOM_S3_CRT1_CRTC_ACTIVE        0x00010000L
+#define ATOM_S3_LCD1_CRTC_ACTIVE        0x00020000L
+#define ATOM_S3_TV1_CRTC_ACTIVE         0x00040000L
+#define ATOM_S3_DFP1_CRTC_ACTIVE        0x00080000L
+#define ATOM_S3_CRT2_CRTC_ACTIVE        0x00100000L
+#define ATOM_S3_LCD2_CRTC_ACTIVE        0x00200000L
+#define ATOM_S3_DFP6_CRTC_ACTIVE        0x00400000L
+#define ATOM_S3_DFP2_CRTC_ACTIVE        0x00800000L
+#define ATOM_S3_CV_CRTC_ACTIVE          0x01000000L
+#define ATOM_S3_DFP3_CRTC_ACTIVE            0x02000000L
+#define ATOM_S3_DFP4_CRTC_ACTIVE            0x04000000L
+#define ATOM_S3_DFP5_CRTC_ACTIVE            0x08000000L
+
+
+#define ATOM_S3_DEVICE_CRTC_ACTIVE_MASK 0x0FFF0000L
+#define ATOM_S3_ASIC_GUI_ENGINE_HUNG    0x20000000L
+//Below two definitions are not supported in pplib, but in the old powerplay in DAL
+#define ATOM_S3_ALLOW_FAST_PWR_S

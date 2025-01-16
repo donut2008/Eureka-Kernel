@@ -1,4 +1,1 @@
-#
-# Makefile for the ia64-specific parts of the pci bus
-#
-obj-y		:= pci.o fixup.o
+, H‹<$öGt	èÏÎ@ÿH‹<$D‰èH4€HÁæHwXH‰ßH‰ê1ÉL‹D$èêBÿIÿÄL9d$ …mÿÿÿH‹|$@HD$PH9Çt

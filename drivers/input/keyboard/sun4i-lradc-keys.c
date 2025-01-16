@@ -1,286 +1,131 @@
-/*
- * Allwinner sun4i low res adc attached tablet keys driver
- *
- * Copyright (C) 2014 Hans de Goede <hdegoede@redhat.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-/*
- * Allwinnner sunxi SoCs have a lradc which is specifically designed to have
- * various (tablet) keys (ie home, back, search, etc). attached to it using
- * a resistor network. This driver is for the keys on such boards.
- *
- * There are 2 channels, currently this driver only supports channel 0 since
- * there are no boards known to use channel 1.
- */
-
-#include <linux/err.h>
-#include <linux/init.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/consumer.h>
-#include <linux/slab.h>
-
-#define LRADC_CTRL		0x00
-#define LRADC_INTC		0x04
-#define LRADC_INTS		0x08
-#define LRADC_DATA0		0x0c
-#define LRADC_DATA1		0x10
-
-/* LRADC_CTRL bits */
-#define FIRST_CONVERT_DLY(x)	((x) << 24) /* 8 bits */
-#define CHAN_SELECT(x)		((x) << 22) /* 2 bits */
-#define CONTINUE_TIME_SEL(x)	((x) << 16) /* 4 bits */
-#define KEY_MODE_SEL(x)		((x) << 12) /* 2 bits */
-#define LEVELA_B_CNT(x)		((x) << 8)  /* 4 bits */
-#define HOLD_EN(x)		((x) << 6)
-#define LEVELB_VOL(x)		((x) << 4)  /* 2 bits */
-#define SAMPLE_RATE(x)		((x) << 2)  /* 2 bits */
-#define ENABLE(x)		((x) << 0)
-
-/* LRADC_INTC and LRADC_INTS bits */
-#define CHAN1_KEYUP_IRQ		BIT(12)
-#define CHAN1_ALRDY_HOLD_IRQ	BIT(11)
-#define CHAN1_HOLD_IRQ		BIT(10)
-#define	CHAN1_KEYDOWN_IRQ	BIT(9)
-#define CHAN1_DATA_IRQ		BIT(8)
-#define CHAN0_KEYUP_IRQ		BIT(4)
-#define CHAN0_ALRDY_HOLD_IRQ	BIT(3)
-#define CHAN0_HOLD_IRQ		BIT(2)
-#define	CHAN0_KEYDOWN_IRQ	BIT(1)
-#define CHAN0_DATA_IRQ		BIT(0)
-
-struct sun4i_lradc_keymap {
-	u32 voltage;
-	u32 keycode;
-};
-
-struct sun4i_lradc_data {
-	struct device *dev;
-	struct input_dev *input;
-	void __iomem *base;
-	struct regulator *vref_supply;
-	struct sun4i_lradc_keymap *chan0_map;
-	u32 chan0_map_count;
-	u32 chan0_keycode;
-	u32 vref;
-};
-
-static irqreturn_t sun4i_lradc_irq(int irq, void *dev_id)
-{
-	struct sun4i_lradc_data *lradc = dev_id;
-	u32 i, ints, val, voltage, diff, keycode = 0, closest = 0xffffffff;
-
-	ints  = readl(lradc->base + LRADC_INTS);
-
-	/*
-	 * lradc supports only one keypress at a time, release does not give
-	 * any info as to which key was released, so we cache the keycode.
-	 */
-
-	if (ints & CHAN0_KEYUP_IRQ) {
-		input_report_key(lradc->input, lradc->chan0_keycode, 0);
-		lradc->chan0_keycode = 0;
-	}
-
-	if ((ints & CHAN0_KEYDOWN_IRQ) && lradc->chan0_keycode == 0) {
-		val = readl(lradc->base + LRADC_DATA0) & 0x3f;
-		voltage = val * lradc->vref / 63;
-
-		for (i = 0; i < lradc->chan0_map_count; i++) {
-			diff = abs(lradc->chan0_map[i].voltage - voltage);
-			if (diff < closest) {
-				closest = diff;
-				keycode = lradc->chan0_map[i].keycode;
-			}
-		}
-
-		lradc->chan0_keycode = keycode;
-		input_report_key(lradc->input, lradc->chan0_keycode, 1);
-	}
-
-	input_sync(lradc->input);
-
-	writel(ints, lradc->base + LRADC_INTS);
-
-	return IRQ_HANDLED;
-}
-
-static int sun4i_lradc_open(struct input_dev *dev)
-{
-	struct sun4i_lradc_data *lradc = input_get_drvdata(dev);
-	int error;
-
-	error = regulator_enable(lradc->vref_supply);
-	if (error)
-		return error;
-
-	/* lradc Vref internally is divided by 2/3 */
-	lradc->vref = regulator_get_voltage(lradc->vref_supply) * 2 / 3;
-
-	/*
-	 * Set sample time to 4 ms / 250 Hz. Wait 2 * 4 ms for key to
-	 * stabilize on press, wait (1 + 1) * 4 ms for key release
-	 */
-	writel(FIRST_CONVERT_DLY(2) | LEVELA_B_CNT(1) | HOLD_EN(1) |
-		SAMPLE_RATE(0) | ENABLE(1), lradc->base + LRADC_CTRL);
-
-	writel(CHAN0_KEYUP_IRQ | CHAN0_KEYDOWN_IRQ, lradc->base + LRADC_INTC);
-
-	return 0;
-}
-
-static void sun4i_lradc_close(struct input_dev *dev)
-{
-	struct sun4i_lradc_data *lradc = input_get_drvdata(dev);
-
-	/* Disable lradc, leave other settings unchanged */
-	writel(FIRST_CONVERT_DLY(2) | LEVELA_B_CNT(1) | HOLD_EN(1) |
-		SAMPLE_RATE(2), lradc->base + LRADC_CTRL);
-	writel(0, lradc->base + LRADC_INTC);
-
-	regulator_disable(lradc->vref_supply);
-}
-
-static int sun4i_lradc_load_dt_keymap(struct device *dev,
-				      struct sun4i_lradc_data *lradc)
-{
-	struct device_node *np, *pp;
-	int i;
-	int error;
-
-	np = dev->of_node;
-	if (!np)
-		return -EINVAL;
-
-	lradc->chan0_map_count = of_get_child_count(np);
-	if (lradc->chan0_map_count == 0) {
-		dev_err(dev, "keymap is missing in device tree\n");
-		return -EINVAL;
-	}
-
-	lradc->chan0_map = devm_kmalloc_array(dev, lradc->chan0_map_count,
-					      sizeof(struct sun4i_lradc_keymap),
-					      GFP_KERNEL);
-	if (!lradc->chan0_map)
-		return -ENOMEM;
-
-	i = 0;
-	for_each_child_of_node(np, pp) {
-		struct sun4i_lradc_keymap *map = &lradc->chan0_map[i];
-		u32 channel;
-
-		error = of_property_read_u32(pp, "channel", &channel);
-		if (error || channel != 0) {
-			dev_err(dev, "%s: Inval channel prop\n", pp->name);
-			return -EINVAL;
-		}
-
-		error = of_property_read_u32(pp, "voltage", &map->voltage);
-		if (error) {
-			dev_err(dev, "%s: Inval voltage prop\n", pp->name);
-			return -EINVAL;
-		}
-
-		error = of_property_read_u32(pp, "linux,code", &map->keycode);
-		if (error) {
-			dev_err(dev, "%s: Inval linux,code prop\n", pp->name);
-			return -EINVAL;
-		}
-
-		i++;
-	}
-
-	return 0;
-}
-
-static int sun4i_lradc_probe(struct platform_device *pdev)
-{
-	struct sun4i_lradc_data *lradc;
-	struct device *dev = &pdev->dev;
-	int i;
-	int error;
-
-	lradc = devm_kzalloc(dev, sizeof(struct sun4i_lradc_data), GFP_KERNEL);
-	if (!lradc)
-		return -ENOMEM;
-
-	error = sun4i_lradc_load_dt_keymap(dev, lradc);
-	if (error)
-		return error;
-
-	lradc->vref_supply = devm_regulator_get(dev, "vref");
-	if (IS_ERR(lradc->vref_supply))
-		return PTR_ERR(lradc->vref_supply);
-
-	lradc->dev = dev;
-	lradc->input = devm_input_allocate_device(dev);
-	if (!lradc->input)
-		return -ENOMEM;
-
-	lradc->input->name = pdev->name;
-	lradc->input->phys = "sun4i_lradc/input0";
-	lradc->input->open = sun4i_lradc_open;
-	lradc->input->close = sun4i_lradc_close;
-	lradc->input->id.bustype = BUS_HOST;
-	lradc->input->id.vendor = 0x0001;
-	lradc->input->id.product = 0x0001;
-	lradc->input->id.version = 0x0100;
-
-	__set_bit(EV_KEY, lradc->input->evbit);
-	for (i = 0; i < lradc->chan0_map_count; i++)
-		__set_bit(lradc->chan0_map[i].keycode, lradc->input->keybit);
-
-	input_set_drvdata(lradc->input, lradc);
-
-	lradc->base = devm_ioremap_resource(dev,
-			      platform_get_resource(pdev, IORESOURCE_MEM, 0));
-	if (IS_ERR(lradc->base))
-		return PTR_ERR(lradc->base);
-
-	error = devm_request_irq(dev, platform_get_irq(pdev, 0),
-				 sun4i_lradc_irq, 0,
-				 "sun4i-a10-lradc-keys", lradc);
-	if (error)
-		return error;
-
-	error = input_register_device(lradc->input);
-	if (error)
-		return error;
-
-	platform_set_drvdata(pdev, lradc);
-	return 0;
-}
-
-static const struct of_device_id sun4i_lradc_of_match[] = {
-	{ .compatible = "allwinner,sun4i-a10-lradc-keys", },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, sun4i_lradc_of_match);
-
-static struct platform_driver sun4i_lradc_driver = {
-	.driver = {
-		.name	= "sun4i-a10-lradc-keys",
-		.of_match_table = of_match_ptr(sun4i_lradc_of_match),
-	},
-	.probe	= sun4i_lradc_probe,
-};
-
-module_platform_driver(sun4i_lradc_driver);
-
-MODULE_DESCRIPTION("Allwinner sun4i low res adc attached tablet keys driver");
-MODULE_AUTHOR("Hans de Goede <hdegoede@redhat.com>");
-MODULE_LICENSE("GPL");
+efine GMCON_RENG_EXECUTE__RENG_EXECUTE_END_PTR__SHIFT 0x16
+#define GMCON_MISC__RENG_EXECUTE_NOW_MODE_MASK 0x400
+#define GMCON_MISC__RENG_EXECUTE_NOW_MODE__SHIFT 0xa
+#define GMCON_MISC__RENG_EXECUTE_ON_REG_UPDATE_MASK 0x800
+#define GMCON_MISC__RENG_EXECUTE_ON_REG_UPDATE__SHIFT 0xb
+#define GMCON_MISC__RENG_SRBM_CREDITS_MCD_MASK 0xf000
+#define GMCON_MISC__RENG_SRBM_CREDITS_MCD__SHIFT 0xc
+#define GMCON_MISC__STCTRL_STUTTER_EN_MASK 0x10000
+#define GMCON_MISC__STCTRL_STUTTER_EN__SHIFT 0x10
+#define GMCON_MISC__STCTRL_GMC_IDLE_THRESHOLD_MASK 0x60000
+#define GMCON_MISC__STCTRL_GMC_IDLE_THRESHOLD__SHIFT 0x11
+#define GMCON_MISC__STCTRL_SRBM_IDLE_THRESHOLD_MASK 0x180000
+#define GMCON_MISC__STCTRL_SRBM_IDLE_THRESHOLD__SHIFT 0x13
+#define GMCON_MISC__STCTRL_IGNORE_PRE_SR_MASK 0x200000
+#define GMCON_MISC__STCTRL_IGNORE_PRE_SR__SHIFT 0x15
+#define GMCON_MISC__STCTRL_IGNORE_ALLOW_STOP_MASK 0x400000
+#define GMCON_MISC__STCTRL_IGNORE_ALLOW_STOP__SHIFT 0x16
+#define GMCON_MISC__STCTRL_IGNORE_SR_COMMIT_MASK 0x800000
+#define GMCON_MISC__STCTRL_IGNORE_SR_COMMIT__SHIFT 0x17
+#define GMCON_MISC__STCTRL_IGNORE_PROTECTION_FAULT_MASK 0x1000000
+#define GMCON_MISC__STCTRL_IGNORE_PROTECTION_FAULT__SHIFT 0x18
+#define GMCON_MISC__STCTRL_DISABLE_ALLOW_SR_MASK 0x2000000
+#define GMCON_MISC__STCTRL_DISABLE_ALLOW_SR__SHIFT 0x19
+#define GMCON_MISC__STCTRL_DISABLE_GMC_OFFLINE_MASK 0x4000000
+#define GMCON_MISC__STCTRL_DISABLE_GMC_OFFLINE__SHIFT 0x1a
+#define GMCON_MISC__CRITICAL_REGS_LOCK_MASK 0x8000000
+#define GMCON_MISC__CRITICAL_REGS_LOCK__SHIFT 0x1b
+#define GMCON_MISC__ALLOW_DEEP_SLEEP_MODE_MASK 0x70000000
+#define GMCON_MISC__ALLOW_DEEP_SLEEP_MODE__SHIFT 0x1c
+#define GMCON_MISC__STCTRL_FORCE_ALLOW_SR_MASK 0x80000000
+#define GMCON_MISC__STCTRL_FORCE_ALLOW_SR__SHIFT 0x1f
+#define GMCON_MISC2__GMCON_MISC2_RESERVED0_MASK 0x3f
+#define GMCON_MISC2__GMCON_MISC2_RESERVED0__SHIFT 0x0
+#define GMCON_MISC2__STCTRL_NONDISP_IDLE_THRESHOLD_MASK 0x7c0
+#define GMCON_MISC2__STCTRL_NONDISP_IDLE_THRESHOLD__SHIFT 0x6
+#define GMCON_MISC2__RENG_SR_HOLD_THRESHOLD_MASK 0x1f800
+#define GMCON_MISC2__RENG_SR_HOLD_THRESHOLD__SHIFT 0xb
+#define GMCON_MISC2__GMCON_MISC2_RESERVED1_MASK 0x1ffe0000
+#define GMCON_MISC2__GMCON_MISC2_RESERVED1__SHIFT 0x11
+#define GMCON_MISC2__STCTRL_IGNORE_ARB_BUSY_MASK 0x20000000
+#define GMCON_MISC2__STCTRL_IGNORE_ARB_BUSY__SHIFT 0x1d
+#define GMCON_MISC2__STCTRL_EXTEND_GMC_OFFLINE_MASK 0x40000000
+#define GMCON_MISC2__STCTRL_EXTEND_GMC_OFFLINE__SHIFT 0x1e
+#define GMCON_MISC2__STCTRL_TIMER_PULSE_OVERRIDE_MASK 0x80000000
+#define GMCON_MISC2__STCTRL_TIMER_PULSE_OVERRIDE__SHIFT 0x1f
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE0__STCTRL_REGISTER_SAVE_BASE0_MASK 0xffff
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE0__STCTRL_REGISTER_SAVE_BASE0__SHIFT 0x0
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE0__STCTRL_REGISTER_SAVE_LIMIT0_MASK 0xffff0000
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE0__STCTRL_REGISTER_SAVE_LIMIT0__SHIFT 0x10
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE1__STCTRL_REGISTER_SAVE_BASE1_MASK 0xffff
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE1__STCTRL_REGISTER_SAVE_BASE1__SHIFT 0x0
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE1__STCTRL_REGISTER_SAVE_LIMIT1_MASK 0xffff0000
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE1__STCTRL_REGISTER_SAVE_LIMIT1__SHIFT 0x10
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE2__STCTRL_REGISTER_SAVE_BASE2_MASK 0xffff
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE2__STCTRL_REGISTER_SAVE_BASE2__SHIFT 0x0
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE2__STCTRL_REGISTER_SAVE_LIMIT2_MASK 0xffff0000
+#define GMCON_STCTRL_REGISTER_SAVE_RANGE2__STCTRL_REGISTER_SAVE_LIMIT2__SHIFT 0x10
+#define GMCON_STCTRL_REGISTER_SAVE_EXCL_SET0__STCTRL_REGISTER_SAVE_EXCL0_MASK 0xffff
+#define GMCON_STCTRL_REGISTER_SAVE_EXCL_SET0__STCTRL_REGISTER_SAVE_EXCL0__SHIFT 0x0
+#define GMCON_STCTRL_REGISTER_SAVE_EXCL_SET0__STCTRL_REGISTER_SAVE_EXCL1_MASK 0xffff0000
+#define GMCON_STCTRL_REGISTER_SAVE_EXCL_SET0__STCTRL_REGISTER_SAVE_EXCL1__SHIFT 0x10
+#define GMCON_STCTRL_REGISTER_SAVE_EXCL_SET1__STCTRL_REGISTER_SAVE_EXCL2_MASK 0xffff
+#define GMCON_STCTRL_REGISTER_SAVE_EXCL_SET1__STCTRL_REGISTER_SAVE_EXCL2__SHIFT 0x0
+#define GMCON_STCTRL_REGISTER_SAVE_EXCL_SET1__STCTRL_REGISTER_SAVE_EXCL3_MASK 0xffff0000
+#define GMCON_STCTRL_REGISTER_SAVE_EXCL_SET1__STCTRL_REGISTER_SAVE_EXCL3__SHIFT 0x10
+#define GMCON_PERF_MON_CNTL0__START_THRESH_MASK 0xfff
+#define GMCON_PERF_MON_CNTL0__START_THRESH__SHIFT 0x0
+#define GMCON_PERF_MON_CNTL0__STOP_THRESH_MASK 0xfff000
+#define GMCON_PERF_MON_CNTL0__STOP_THRESH__SHIFT 0xc
+#define GMCON_PERF_MON_CNTL0__START_MODE_MASK 0x3000000
+#define GMCON_PERF_MON_CNTL0__START_MODE__SHIFT 0x18
+#define GMCON_PERF_MON_CNTL0__STOP_MODE_MASK 0xc000000
+#define GMCON_PERF_MON_CNTL0__STOP_MODE__SHIFT 0x1a
+#define GMCON_PERF_MON_CNTL0__ALLOW_WRAP_MASK 0x10000000
+#define GMCON_PERF_MON_CNTL0__ALLOW_WRAP__SHIFT 0x1c
+#define GMCON_PERF_MON_CNTL0__THRESH_CNTR_ID_EXT_MASK 0x20000000
+#define GMCON_PERF_MON_CNTL0__THRESH_CNTR_ID_EXT__SHIFT 0x1d
+#define GMCON_PERF_MON_CNTL0__START_TRIG_ID_EXT_MASK 0x40000000
+#define GMCON_PERF_MON_CNTL0__START_TRIG_ID_EXT__SHIFT 0x1e
+#define GMCON_PERF_MON_CNTL0__STOP_TRIG_ID_EXT_MASK 0x80000000
+#define GMCON_PERF_MON_CNTL0__STOP_TRIG_ID_EXT__SHIFT 0x1f
+#define GMCON_PERF_MON_CNTL1__THRESH_CNTR_ID_MASK 0x3f
+#define GMCON_PERF_MON_CNTL1__THRESH_CNTR_ID__SHIFT 0x0
+#define GMCON_PERF_MON_CNTL1__START_TRIG_ID_MASK 0xfc0
+#define GMCON_PERF_MON_CNTL1__START_TRIG_ID__SHIFT 0x6
+#define GMCON_PERF_MON_CNTL1__STOP_TRIG_ID_MASK 0x3f000
+#define GMCON_PERF_MON_CNTL1__STOP_TRIG_ID__SHIFT 0xc
+#define GMCON_PERF_MON_CNTL1__MON0_ID_MASK 0x1fc0000
+#define GMCON_PERF_MON_CNTL1__MON0_ID__SHIFT 0x12
+#define GMCON_PERF_MON_CNTL1__MON1_ID_MASK 0xfe000000
+#define GMCON_PERF_MON_CNTL1__MON1_ID__SHIFT 0x19
+#define GMCON_PERF_MON_RSLT0__COUNT_MASK 0xffffffff
+#define GMCON_PERF_MON_RSLT0__COUNT__SHIFT 0x0
+#define GMCON_PERF_MON_RSLT1__COUNT_MASK 0xffffffff
+#define GMCON_PERF_MON_RSLT1__COUNT__SHIFT 0x0
+#define GMCON_PGFSM_CONFIG__FSM_ADDR_MASK 0xff
+#define GMCON_PGFSM_CONFIG__FSM_ADDR__SHIFT 0x0
+#define GMCON_PGFSM_CONFIG__POWER_DOWN_MASK 0x100
+#define GMCON_PGFSM_CONFIG__POWER_DOWN__SHIFT 0x8
+#define GMCON_PGFSM_CONFIG__POWER_UP_MASK 0x200
+#define GMCON_PGFSM_CONFIG__POWER_UP__SHIFT 0x9
+#define GMCON_PGFSM_CONFIG__P1_SELECT_MASK 0x400
+#define GMCON_PGFSM_CONFIG__P1_SELECT__SHIFT 0xa
+#define GMCON_PGFSM_CONFIG__P2_SELECT_MASK 0x800
+#define GMCON_PGFSM_CONFIG__P2_SELECT__SHIFT 0xb
+#define GMCON_PGFSM_CONFIG__WRITE_MASK 0x1000
+#define GMCON_PGFSM_CONFIG__WRITE__SHIFT 0xc
+#define GMCON_PGFSM_CONFIG__READ_MASK 0x2000
+#define GMCON_PGFSM_CONFIG__READ__SHIFT 0xd
+#define GMCON_PGFSM_CONFIG__RSRVD_MASK 0x7ffc000
+#define GMCON_PGFSM_CONFIG__RSRVD__SHIFT 0xe
+#define GMCON_PGFSM_CONFIG__SRBM_OVERRIDE_MASK 0x8000000
+#define GMCON_PGFSM_CONFIG__SRBM_OVERRIDE__SHIFT 0x1b
+#define GMCON_PGFSM_CONFIG__REG_ADDR_MASK 0xf0000000
+#define GMCON_PGFSM_CONFIG__REG_ADDR__SHIFT 0x1c
+#define GMCON_PGFSM_WRITE__WRITE_VALUE_MASK 0xffffffff
+#define GMCON_PGFSM_WRITE__WRITE_VALUE__SHIFT 0x0
+#define GMCON_PGFSM_READ__READ_VALUE_MASK 0xffffff
+#define GMCON_PGFSM_READ__READ_VALUE__SHIFT 0x0
+#define GMCON_PGFSM_READ__PGFSM_SELECT_MASK 0xf000000
+#define GMCON_PGFSM_READ__PGFSM_SELECT__SHIFT 0x18
+#define GMCON_PGFSM_READ__SERDES_MASTER_BUSY_MASK 0x10000000
+#define GMCON_PGFSM_READ__SERDES_MASTER_BUSY__SHIFT 0x1c
+#define GMCON_MISC3__RENG_DISABLE_MCC_MASK 0xff
+#define GMCON_MISC3__RENG_DISABLE_MCC__SHIFT 0x0
+#define GMCON_MISC3__RENG_DISABLE_MCD_MASK 0xff00
+#define GMCON_MISC3__RENG_DISABLE_MCD__SHIFT 0x8
+#define GMCON_MISC3__STCTRL_FORCE_PGFSM_CMD_DONE_MASK 0xfff0000
+#define GMCON_MISC3__STCTRL_FORCE_PGFSM_CMD_DONE__SHIFT 0x10
+#define GMCON_MISC3__STCTRL_IGNORE_ALLOW_STUTTER_MASK 0x10000000
+#define GMCON_MISC3__STCTRL_IGNORE_ALLOW_STUTTER__SHIFT 0x1c

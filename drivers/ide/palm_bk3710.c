@@ -1,398 +1,385 @@
-/*
- * Palmchip bk3710 IDE controller
- *
- * Copyright (C) 2006 Texas Instruments.
- * Copyright (C) 2007 MontaVista Software, Inc., <source@mvista.com>
- *
- * ----------------------------------------------------------------------------
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- * ----------------------------------------------------------------------------
- *
- */
+_has_cap(DMA_XOR_VAL, dma_chan->device->cap_mask))
+		goto free_resources;
 
-#include <linux/types.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/ioport.h>
-#include <linux/ide.h>
-#include <linux/delay.h>
-#include <linux/init.h>
-#include <linux/clk.h>
-#include <linux/platform_device.h>
+	/* zero sum the sources with the destintation page */
+	for (i = 0; i < IOP_ADMA_NUM_SRC_TEST; i++)
+		zero_sum_srcs[i] = xor_srcs[i];
+	zero_sum_srcs[i] = dest;
 
-/* Offset of the primary interface registers */
-#define IDE_PALM_ATA_PRI_REG_OFFSET 0x1F0
+	zero_sum_result = 1;
 
-/* Primary Control Offset */
-#define IDE_PALM_ATA_PRI_CTL_OFFSET 0x3F6
+	for (i = 0; i < IOP_ADMA_NUM_SRC_TEST + 1; i++)
+		dma_srcs[i] = dma_map_page(dma_chan->device->dev,
+					   zero_sum_srcs[i], 0, PAGE_SIZE,
+					   DMA_TO_DEVICE);
+	tx = iop_adma_prep_dma_xor_val(dma_chan, dma_srcs,
+				       IOP_ADMA_NUM_SRC_TEST + 1, PAGE_SIZE,
+				       &zero_sum_result,
+				       DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
 
-#define BK3710_BMICP		0x00
-#define BK3710_BMISP		0x02
-#define BK3710_BMIDTP		0x04
-#define BK3710_IDETIMP		0x40
-#define BK3710_IDESTATUS	0x47
-#define BK3710_UDMACTL		0x48
-#define BK3710_MISCCTL		0x50
-#define BK3710_REGSTB		0x54
-#define BK3710_REGRCVR		0x58
-#define BK3710_DATSTB		0x5C
-#define BK3710_DATRCVR		0x60
-#define BK3710_DMASTB		0x64
-#define BK3710_DMARCVR		0x68
-#define BK3710_UDMASTB		0x6C
-#define BK3710_UDMATRP		0x70
-#define BK3710_UDMAENV		0x74
-#define BK3710_IORDYTMP		0x78
+	cookie = iop_adma_tx_submit(tx);
+	iop_adma_issue_pending(dma_chan);
+	msleep(8);
 
-static unsigned ideclk_period; /* in nanoseconds */
-
-struct palm_bk3710_udmatiming {
-	unsigned int rptime;	/* tRP -- Ready to pause time (nsec) */
-	unsigned int cycletime;	/* tCYCTYP2/2 -- avg Cycle Time (nsec) */
-				/* tENV is always a minimum of 20 nsec */
-};
-
-static const struct palm_bk3710_udmatiming palm_bk3710_udmatimings[6] = {
-	{ 160, 240 / 2 },	/* UDMA Mode 0 */
-	{ 125, 160 / 2 },	/* UDMA Mode 1 */
-	{ 100, 120 / 2 },	/* UDMA Mode 2 */
-	{ 100,  90 / 2 },	/* UDMA Mode 3 */
-	{ 100,  60 / 2 },	/* UDMA Mode 4 */
-	{  85,  40 / 2 },	/* UDMA Mode 5 */
-};
-
-static void palm_bk3710_setudmamode(void __iomem *base, unsigned int dev,
-				    unsigned int mode)
-{
-	u8 tenv, trp, t0;
-	u32 val32;
-	u16 val16;
-
-	/* DMA Data Setup */
-	t0 = DIV_ROUND_UP(palm_bk3710_udmatimings[mode].cycletime,
-			  ideclk_period) - 1;
-	tenv = DIV_ROUND_UP(20, ideclk_period) - 1;
-	trp = DIV_ROUND_UP(palm_bk3710_udmatimings[mode].rptime,
-			   ideclk_period) - 1;
-
-	/* udmastb Ultra DMA Access Strobe Width */
-	val32 = readl(base + BK3710_UDMASTB) & (0xFF << (dev ? 0 : 8));
-	val32 |= (t0 << (dev ? 8 : 0));
-	writel(val32, base + BK3710_UDMASTB);
-
-	/* udmatrp Ultra DMA Ready to Pause Time */
-	val32 = readl(base + BK3710_UDMATRP) & (0xFF << (dev ? 0 : 8));
-	val32 |= (trp << (dev ? 8 : 0));
-	writel(val32, base + BK3710_UDMATRP);
-
-	/* udmaenv Ultra DMA envelop Time */
-	val32 = readl(base + BK3710_UDMAENV) & (0xFF << (dev ? 0 : 8));
-	val32 |= (tenv << (dev ? 8 : 0));
-	writel(val32, base + BK3710_UDMAENV);
-
-	/* Enable UDMA for Device */
-	val16 = readw(base + BK3710_UDMACTL) | (1 << dev);
-	writew(val16, base + BK3710_UDMACTL);
-}
-
-static void palm_bk3710_setdmamode(void __iomem *base, unsigned int dev,
-				   unsigned short min_cycle,
-				   unsigned int mode)
-{
-	u8 td, tkw, t0;
-	u32 val32;
-	u16 val16;
-	struct ide_timing *t;
-	int cycletime;
-
-	t = ide_timing_find_mode(mode);
-	cycletime = max_t(int, t->cycle, min_cycle);
-
-	/* DMA Data Setup */
-	t0 = DIV_ROUND_UP(cycletime, ideclk_period);
-	td = DIV_ROUND_UP(t->active, ideclk_period);
-	tkw = t0 - td - 1;
-	td -= 1;
-
-	val32 = readl(base + BK3710_DMASTB) & (0xFF << (dev ? 0 : 8));
-	val32 |= (td << (dev ? 8 : 0));
-	writel(val32, base + BK3710_DMASTB);
-
-	val32 = readl(base + BK3710_DMARCVR) & (0xFF << (dev ? 0 : 8));
-	val32 |= (tkw << (dev ? 8 : 0));
-	writel(val32, base + BK3710_DMARCVR);
-
-	/* Disable UDMA for Device */
-	val16 = readw(base + BK3710_UDMACTL) & ~(1 << dev);
-	writew(val16, base + BK3710_UDMACTL);
-}
-
-static void palm_bk3710_setpiomode(void __iomem *base, ide_drive_t *mate,
-				   unsigned int dev, unsigned int cycletime,
-				   unsigned int mode)
-{
-	u8 t2, t2i, t0;
-	u32 val32;
-	struct ide_timing *t;
-
-	t = ide_timing_find_mode(XFER_PIO_0 + mode);
-
-	/* PIO Data Setup */
-	t0 = DIV_ROUND_UP(cycletime, ideclk_period);
-	t2 = DIV_ROUND_UP(t->active, ideclk_period);
-
-	t2i = t0 - t2 - 1;
-	t2 -= 1;
-
-	val32 = readl(base + BK3710_DATSTB) & (0xFF << (dev ? 0 : 8));
-	val32 |= (t2 << (dev ? 8 : 0));
-	writel(val32, base + BK3710_DATSTB);
-
-	val32 = readl(base + BK3710_DATRCVR) & (0xFF << (dev ? 0 : 8));
-	val32 |= (t2i << (dev ? 8 : 0));
-	writel(val32, base + BK3710_DATRCVR);
-
-	if (mate) {
-		u8 mode2 = mate->pio_mode - XFER_PIO_0;
-
-		if (mode2 < mode)
-			mode = mode2;
+	if (iop_adma_status(dma_chan, cookie, NULL) != DMA_COMPLETE) {
+		dev_err(dma_chan->device->dev,
+			"Self-test zero sum timed out, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
 	}
 
-	/* TASKFILE Setup */
-	t0 = DIV_ROUND_UP(t->cyc8b, ideclk_period);
-	t2 = DIV_ROUND_UP(t->act8b, ideclk_period);
-
-	t2i = t0 - t2 - 1;
-	t2 -= 1;
-
-	val32 = readl(base + BK3710_REGSTB) & (0xFF << (dev ? 0 : 8));
-	val32 |= (t2 << (dev ? 8 : 0));
-	writel(val32, base + BK3710_REGSTB);
-
-	val32 = readl(base + BK3710_REGRCVR) & (0xFF << (dev ? 0 : 8));
-	val32 |= (t2i << (dev ? 8 : 0));
-	writel(val32, base + BK3710_REGRCVR);
-}
-
-static void palm_bk3710_set_dma_mode(ide_hwif_t *hwif, ide_drive_t *drive)
-{
-	int is_slave = drive->dn & 1;
-	void __iomem *base = (void __iomem *)hwif->dma_base;
-	const u8 xferspeed = drive->dma_mode;
-
-	if (xferspeed >= XFER_UDMA_0) {
-		palm_bk3710_setudmamode(base, is_slave,
-					xferspeed - XFER_UDMA_0);
-	} else {
-		palm_bk3710_setdmamode(base, is_slave,
-				       drive->id[ATA_ID_EIDE_DMA_MIN],
-				       xferspeed);
-	}
-}
-
-static void palm_bk3710_set_pio_mode(ide_hwif_t *hwif, ide_drive_t *drive)
-{
-	unsigned int cycle_time;
-	int is_slave = drive->dn & 1;
-	ide_drive_t *mate;
-	void __iomem *base = (void __iomem *)hwif->dma_base;
-	const u8 pio = drive->pio_mode - XFER_PIO_0;
-
-	/*
-	 * Obtain the drive PIO data for tuning the Palm Chip registers
-	 */
-	cycle_time = ide_pio_cycle_time(drive, pio);
-	mate = ide_get_pair_dev(drive);
-	palm_bk3710_setpiomode(base, mate, is_slave, cycle_time, pio);
-}
-
-static void palm_bk3710_chipinit(void __iomem *base)
-{
-	/*
-	 * REVISIT:  the ATA reset signal needs to be managed through a
-	 * GPIO, which means it should come from platform_data.  Until
-	 * we get and use such information, we have to trust that things
-	 * have been reset before we get here.
-	 */
-
-	/*
-	 * Program the IDETIMP Register Value based on the following assumptions
-	 *
-	 * (ATA_IDETIMP_IDEEN		, ENABLE ) |
-	 * (ATA_IDETIMP_PREPOST1	, DISABLE) |
-	 * (ATA_IDETIMP_PREPOST0	, DISABLE) |
-	 *
-	 * DM6446 silicon rev 2.1 and earlier have no observed net benefit
-	 * from enabling prefetch/postwrite.
-	 */
-	writew(BIT(15), base + BK3710_IDETIMP);
-
-	/*
-	 * UDMACTL Ultra-ATA DMA Control
-	 * (ATA_UDMACTL_UDMAP1	, 0 ) |
-	 * (ATA_UDMACTL_UDMAP0	, 0 )
-	 *
-	 */
-	writew(0, base + BK3710_UDMACTL);
-
-	/*
-	 * MISCCTL Miscellaneous Conrol Register
-	 * (ATA_MISCCTL_HWNHLD1P	, 1 cycle)
-	 * (ATA_MISCCTL_HWNHLD0P	, 1 cycle)
-	 * (ATA_MISCCTL_TIMORIDE	, 1)
-	 */
-	writel(0x001, base + BK3710_MISCCTL);
-
-	/*
-	 * IORDYTMP IORDY Timer for Primary Register
-	 * (ATA_IORDYTMP_IORDYTMP     , 0xffff  )
-	 */
-	writel(0xFFFF, base + BK3710_IORDYTMP);
-
-	/*
-	 * Configure BMISP Register
-	 * (ATA_BMISP_DMAEN1	, DISABLE )	|
-	 * (ATA_BMISP_DMAEN0	, DISABLE )	|
-	 * (ATA_BMISP_IORDYINT	, CLEAR)	|
-	 * (ATA_BMISP_INTRSTAT	, CLEAR)	|
-	 * (ATA_BMISP_DMAERROR	, CLEAR)
-	 */
-	writew(0, base + BK3710_BMISP);
-
-	palm_bk3710_setpiomode(base, NULL, 0, 600, 0);
-	palm_bk3710_setpiomode(base, NULL, 1, 600, 0);
-}
-
-static u8 palm_bk3710_cable_detect(ide_hwif_t *hwif)
-{
-	return ATA_CBL_PATA80;
-}
-
-static int palm_bk3710_init_dma(ide_hwif_t *hwif, const struct ide_port_info *d)
-{
-	printk(KERN_INFO "    %s: MMIO-DMA\n", hwif->name);
-
-	if (ide_allocate_dma_engine(hwif))
-		return -1;
-
-	hwif->dma_base = hwif->io_ports.data_addr - IDE_PALM_ATA_PRI_REG_OFFSET;
-
-	return 0;
-}
-
-static const struct ide_port_ops palm_bk3710_ports_ops = {
-	.set_pio_mode		= palm_bk3710_set_pio_mode,
-	.set_dma_mode		= palm_bk3710_set_dma_mode,
-	.cable_detect		= palm_bk3710_cable_detect,
-};
-
-static struct ide_port_info palm_bk3710_port_info = {
-	.init_dma		= palm_bk3710_init_dma,
-	.port_ops		= &palm_bk3710_ports_ops,
-	.dma_ops		= &sff_dma_ops,
-	.host_flags		= IDE_HFLAG_MMIO,
-	.pio_mask		= ATA_PIO4,
-	.mwdma_mask		= ATA_MWDMA2,
-	.chipset		= ide_palm3710,
-};
-
-static int __init palm_bk3710_probe(struct platform_device *pdev)
-{
-	struct clk *clk;
-	struct resource *mem, *irq;
-	void __iomem *base;
-	unsigned long rate, mem_size;
-	int i, rc;
-	struct ide_hw hw, *hws[] = { &hw };
-
-	clk = clk_get(&pdev->dev, NULL);
-	if (IS_ERR(clk))
-		return -ENODEV;
-
-	clk_enable(clk);
-	rate = clk_get_rate(clk);
-
-	/* NOTE:  round *down* to meet minimum timings; we count in clocks */
-	ideclk_period = 1000000000UL / rate;
-
-	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (mem == NULL) {
-		printk(KERN_ERR "failed to get memory region resource\n");
-		return -ENODEV;
+	if (zero_sum_result != 0) {
+		dev_err(dma_chan->device->dev,
+			"Self-test zero sum failed compare, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
 	}
 
-	irq = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
-	if (irq == NULL) {
-		printk(KERN_ERR "failed to get IRQ resource\n");
-		return -ENODEV;
+	/* test for non-zero parity sum */
+	zero_sum_result = 0;
+	for (i = 0; i < IOP_ADMA_NUM_SRC_TEST + 1; i++)
+		dma_srcs[i] = dma_map_page(dma_chan->device->dev,
+					   zero_sum_srcs[i], 0, PAGE_SIZE,
+					   DMA_TO_DEVICE);
+	tx = iop_adma_prep_dma_xor_val(dma_chan, dma_srcs,
+				       IOP_ADMA_NUM_SRC_TEST + 1, PAGE_SIZE,
+				       &zero_sum_result,
+				       DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+
+	cookie = iop_adma_tx_submit(tx);
+	iop_adma_issue_pending(dma_chan);
+	msleep(8);
+
+	if (iop_adma_status(dma_chan, cookie, NULL) != DMA_COMPLETE) {
+		dev_err(dma_chan->device->dev,
+			"Self-test non-zero sum timed out, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
 	}
 
-	mem_size = resource_size(mem);
-	if (request_mem_region(mem->start, mem_size, "palm_bk3710") == NULL) {
-		printk(KERN_ERR "failed to request memory region\n");
-		return -EBUSY;
+	if (zero_sum_result != 1) {
+		dev_err(dma_chan->device->dev,
+			"Self-test non-zero sum failed compare, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
 	}
 
-	base = ioremap(mem->start, mem_size);
-	if (!base) {
-		printk(KERN_ERR "failed to map IO memory\n");
-		release_mem_region(mem->start, mem_size);
-		return -ENOMEM;
-	}
-
-	/* Configure the Palm Chip controller */
-	palm_bk3710_chipinit(base);
-
-	memset(&hw, 0, sizeof(hw));
-	for (i = 0; i < IDE_NR_PORTS - 2; i++)
-		hw.io_ports_array[i] = (unsigned long)
-				(base + IDE_PALM_ATA_PRI_REG_OFFSET + i);
-	hw.io_ports.ctl_addr = (unsigned long)
-			(base + IDE_PALM_ATA_PRI_CTL_OFFSET);
-	hw.irq = irq->start;
-	hw.dev = &pdev->dev;
-
-	palm_bk3710_port_info.udma_mask = rate < 100000000 ? ATA_UDMA4 :
-							     ATA_UDMA5;
-
-	/* Register the IDE interface with Linux */
-	rc = ide_host_add(&palm_bk3710_port_info, hws, 1, NULL);
-	if (rc)
-		goto out;
-
-	return 0;
+free_resources:
+	iop_adma_free_chan_resources(dma_chan);
 out:
-	printk(KERN_WARNING "Palm Chip BK3710 IDE Register Fail\n");
-	return rc;
+	src_idx = IOP_ADMA_NUM_SRC_TEST;
+	while (src_idx--)
+		__free_page(xor_srcs[src_idx]);
+	__free_page(dest);
+	return err;
 }
 
-/* work with hotplug and coldplug */
-MODULE_ALIAS("platform:palm_bk3710");
-
-static struct platform_driver platform_bk_driver = {
-	.driver = {
-		.name = "palm_bk3710",
-	},
-};
-
-static int __init palm_bk3710_init(void)
+#ifdef CONFIG_RAID6_PQ
+static int
+iop_adma_pq_zero_sum_self_test(struct iop_adma_device *device)
 {
-	return platform_driver_probe(&platform_bk_driver, palm_bk3710_probe);
+	/* combined sources, software pq results, and extra hw pq results */
+	struct page *pq[IOP_ADMA_NUM_SRC_TEST+2+2];
+	/* ptr to the extra hw pq buffers defined above */
+	struct page **pq_hw = &pq[IOP_ADMA_NUM_SRC_TEST+2];
+	/* address conversion buffers (dma_map / page_address) */
+	void *pq_sw[IOP_ADMA_NUM_SRC_TEST+2];
+	dma_addr_t pq_src[IOP_ADMA_NUM_SRC_TEST+2];
+	dma_addr_t *pq_dest = &pq_src[IOP_ADMA_NUM_SRC_TEST];
+
+	int i;
+	struct dma_async_tx_descriptor *tx;
+	struct dma_chan *dma_chan;
+	dma_cookie_t cookie;
+	u32 zero_sum_result;
+	int err = 0;
+	struct device *dev;
+
+	dev_dbg(device->common.dev, "%s\n", __func__);
+
+	for (i = 0; i < ARRAY_SIZE(pq); i++) {
+		pq[i] = alloc_page(GFP_KERNEL);
+		if (!pq[i]) {
+			while (i--)
+				__free_page(pq[i]);
+			return -ENOMEM;
+		}
+	}
+
+	/* Fill in src buffers */
+	for (i = 0; i < IOP_ADMA_NUM_SRC_TEST; i++) {
+		pq_sw[i] = page_address(pq[i]);
+		memset(pq_sw[i], 0x11111111 * (1<<i), PAGE_SIZE);
+	}
+	pq_sw[i] = page_address(pq[i]);
+	pq_sw[i+1] = page_address(pq[i+1]);
+
+	dma_chan = container_of(device->common.channels.next,
+				struct dma_chan,
+				device_node);
+	if (iop_adma_alloc_chan_resources(dma_chan) < 1) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	dev = dma_chan->device->dev;
+
+	/* initialize the dests */
+	memset(page_address(pq_hw[0]), 0 , PAGE_SIZE);
+	memset(page_address(pq_hw[1]), 0 , PAGE_SIZE);
+
+	/* test pq */
+	pq_dest[0] = dma_map_page(dev, pq_hw[0], 0, PAGE_SIZE, DMA_FROM_DEVICE);
+	pq_dest[1] = dma_map_page(dev, pq_hw[1], 0, PAGE_SIZE, DMA_FROM_DEVICE);
+	for (i = 0; i < IOP_ADMA_NUM_SRC_TEST; i++)
+		pq_src[i] = dma_map_page(dev, pq[i], 0, PAGE_SIZE,
+					 DMA_TO_DEVICE);
+
+	tx = iop_adma_prep_dma_pq(dma_chan, pq_dest, pq_src,
+				  IOP_ADMA_NUM_SRC_TEST, (u8 *)raid6_gfexp,
+				  PAGE_SIZE,
+				  DMA_PREP_INTERRUPT |
+				  DMA_CTRL_ACK);
+
+	cookie = iop_adma_tx_submit(tx);
+	iop_adma_issue_pending(dma_chan);
+	msleep(8);
+
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
+		DMA_COMPLETE) {
+		dev_err(dev, "Self-test pq timed out, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	raid6_call.gen_syndrome(IOP_ADMA_NUM_SRC_TEST+2, PAGE_SIZE, pq_sw);
+
+	if (memcmp(pq_sw[IOP_ADMA_NUM_SRC_TEST],
+		   page_address(pq_hw[0]), PAGE_SIZE) != 0) {
+		dev_err(dev, "Self-test p failed compare, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+	if (memcmp(pq_sw[IOP_ADMA_NUM_SRC_TEST+1],
+		   page_address(pq_hw[1]), PAGE_SIZE) != 0) {
+		dev_err(dev, "Self-test q failed compare, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	/* test correct zero sum using the software generated pq values */
+	for (i = 0; i < IOP_ADMA_NUM_SRC_TEST + 2; i++)
+		pq_src[i] = dma_map_page(dev, pq[i], 0, PAGE_SIZE,
+					 DMA_TO_DEVICE);
+
+	zero_sum_result = ~0;
+	tx = iop_adma_prep_dma_pq_val(dma_chan, &pq_src[IOP_ADMA_NUM_SRC_TEST],
+				      pq_src, IOP_ADMA_NUM_SRC_TEST,
+				      raid6_gfexp, PAGE_SIZE, &zero_sum_result,
+				      DMA_PREP_INTERRUPT|DMA_CTRL_ACK);
+
+	cookie = iop_adma_tx_submit(tx);
+	iop_adma_issue_pending(dma_chan);
+	msleep(8);
+
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
+		DMA_COMPLETE) {
+		dev_err(dev, "Self-test pq-zero-sum timed out, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	if (zero_sum_result != 0) {
+		dev_err(dev, "Self-test pq-zero-sum failed to validate: %x\n",
+			zero_sum_result);
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	/* test incorrect zero sum */
+	i = IOP_ADMA_NUM_SRC_TEST;
+	memset(pq_sw[i] + 100, 0, 100);
+	memset(pq_sw[i+1] + 200, 0, 200);
+	for (i = 0; i < IOP_ADMA_NUM_SRC_TEST + 2; i++)
+		pq_src[i] = dma_map_page(dev, pq[i], 0, PAGE_SIZE,
+					 DMA_TO_DEVICE);
+
+	zero_sum_result = 0;
+	tx = iop_adma_prep_dma_pq_val(dma_chan, &pq_src[IOP_ADMA_NUM_SRC_TEST],
+				      pq_src, IOP_ADMA_NUM_SRC_TEST,
+				      raid6_gfexp, PAGE_SIZE, &zero_sum_result,
+				      DMA_PREP_INTERRUPT|DMA_CTRL_ACK);
+
+	cookie = iop_adma_tx_submit(tx);
+	iop_adma_issue_pending(dma_chan);
+	msleep(8);
+
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
+		DMA_COMPLETE) {
+		dev_err(dev, "Self-test !pq-zero-sum timed out, disabling\n");
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+	if (zero_sum_result != (SUM_CHECK_P_RESULT | SUM_CHECK_Q_RESULT)) {
+		dev_err(dev, "Self-test !pq-zero-sum failed to validate: %x\n",
+			zero_sum_result);
+		err = -ENODEV;
+		goto free_resources;
+	}
+
+free_resources:
+	iop_adma_free_chan_resources(dma_chan);
+out:
+	i = ARRAY_SIZE(pq);
+	while (i--)
+		__free_page(pq[i]);
+	return err;
+}
+#endif
+
+static int iop_adma_remove(struct platform_device *dev)
+{
+	struct iop_adma_device *device = platform_get_drvdata(dev);
+	struct dma_chan *chan, *_chan;
+	struct iop_adma_chan *iop_chan;
+	struct iop_adma_platform_data *plat_data = dev_get_platdata(&dev->dev);
+
+	dma_async_device_unregister(&device->common);
+
+	dma_free_coherent(&dev->dev, plat_data->pool_size,
+			device->dma_desc_pool_virt, device->dma_desc_pool);
+
+	list_for_each_entry_safe(chan, _chan, &device->common.channels,
+				device_node) {
+		iop_chan = to_iop_adma_chan(chan);
+		list_del(&chan->device_node);
+		kfree(iop_chan);
+	}
+	kfree(device);
+
+	return 0;
 }
 
-module_init(palm_bk3710_init);
-MODULE_LICENSE("GPL");
+static int iop_adma_probe(struct platform_device *pdev)
+{
+	struct resource *res;
+	int ret = 0, i;
+	struct iop_adma_device *adev;
+	struct iop_adma_chan *iop_chan;
+	struct dma_device *dma_dev;
+	struct iop_adma_platform_data *plat_data = dev_get_platdata(&pdev->dev);
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return -ENODEV;
+
+	if (!devm_request_mem_region(&pdev->dev, res->start,
+				resource_size(res), pdev->name))
+		return -EBUSY;
+
+	adev = kzalloc(sizeof(*adev), GFP_KERNEL);
+	if (!adev)
+		return -ENOMEM;
+	dma_dev = &adev->common;
+
+	/* allocate coherent memory for hardware descriptors
+	 * note: writecombine gives slightly better performance, but
+	 * requires that we explicitly flush the writes
+	 */
+	adev->dma_desc_pool_virt = dma_alloc_writecombine(&pdev->dev,
+							  plat_data->pool_size,
+							  &adev->dma_desc_pool,
+							  GFP_KERNEL);
+	if (!adev->dma_desc_pool_virt) {
+		ret = -ENOMEM;
+		goto err_free_adev;
+	}
+
+	dev_dbg(&pdev->dev, "%s: allocated descriptor pool virt %p phys %p\n",
+		__func__, adev->dma_desc_pool_virt,
+		(void *) adev->dma_desc_pool);
+
+	adev->id = plat_data->hw_id;
+
+	/* discover transaction capabilites from the platform data */
+	dma_dev->cap_mask = plat_data->cap_mask;
+
+	adev->pdev = pdev;
+	platform_set_drvdata(pdev, adev);
+
+	INIT_LIST_HEAD(&dma_dev->channels);
+
+	/* set base routines */
+	dma_dev->device_alloc_chan_resources = iop_adma_alloc_chan_resources;
+	dma_dev->device_free_chan_resources = iop_adma_free_chan_resources;
+	dma_dev->device_tx_status = iop_adma_status;
+	dma_dev->device_issue_pending = iop_adma_issue_pending;
+	dma_dev->dev = &pdev->dev;
+
+	/* set prep routines based on capability */
+	if (dma_has_cap(DMA_MEMCPY, dma_dev->cap_mask))
+		dma_dev->device_prep_dma_memcpy = iop_adma_prep_dma_memcpy;
+	if (dma_has_cap(DMA_XOR, dma_dev->cap_mask)) {
+		dma_dev->max_xor = iop_adma_get_max_xor();
+		dma_dev->device_prep_dma_xor = iop_adma_prep_dma_xor;
+	}
+	if (dma_has_cap(DMA_XOR_VAL, dma_dev->cap_mask))
+		dma_dev->device_prep_dma_xor_val =
+			iop_adma_prep_dma_xor_val;
+	if (dma_has_cap(DMA_PQ, dma_dev->cap_mask)) {
+		dma_set_maxpq(dma_dev, iop_adma_get_max_pq(), 0);
+		dma_dev->device_prep_dma_pq = iop_adma_prep_dma_pq;
+	}
+	if (dma_has_cap(DMA_PQ_VAL, dma_dev->cap_mask))
+		dma_dev->device_prep_dma_pq_val =
+			iop_adma_prep_dma_pq_val;
+	if (dma_has_cap(DMA_INTERRUPT, dma_dev->cap_mask))
+		dma_dev->device_prep_dma_interrupt =
+			iop_adma_prep_dma_interrupt;
+
+	iop_chan = kzalloc(sizeof(*iop_chan), GFP_KERNEL);
+	if (!iop_chan) {
+		ret = -ENOMEM;
+		goto err_free_dma;
+	}
+	iop_chan->device = adev;
+
+	iop_chan->mmr_base = devm_ioremap(&pdev->dev, res->start,
+					resource_size(res));
+	if (!iop_chan->mmr_base) {
+		ret = -ENOMEM;
+		goto err_free_iop_chan;
+	}
+	tasklet_init(&iop_chan->irq_tasklet, iop_adma_tasklet, (unsigned long)
+		iop_chan);
+
+	/* clear errors before enabling interrupts */
+	iop_adma_device_clear_err_status(iop_chan);
+
+	for (i = 0; i < 3; i++) {
+		irq_handler_t handler[] = { iop_adma_eot_handler,
+					iop_adma_eoc_handler,
+					iop_adma_err_handler };
+		int irq = platform_get_irq(pdev, i);
+		if (irq < 0) {
+			ret = -ENXIO;
+			goto err_free_iop_chan;
+		} else {
+			ret = devm_request_irq(&pdev->dev, irq,
+					handler[i], 0, pdev->name, iop_chan);
+			if (ret)
+				goto err_free_iop_chan;
+		}
+	}
+
+	spin_lock_init(&iop_chan->lock);
+	INIT_LIST_HEAD(&iop_chan->chain);
+	INIT_LIST_HEAD(&iop_chan->all_slots);
+	iop_chan->common.device = dma_dev;
+	dma_cookie_init(&iop_chan->common);
+	list_add_tail(&iop_chan->common.device_node, &dma_dev->channels);
+
+	if (dma_has_cap(DMA_MEMCPY, dma_dev->cap_mask)) {
+		ret = iop_adma_memcpy_self_test(adev);
+		dev_dbg(&pdev->dev, "m

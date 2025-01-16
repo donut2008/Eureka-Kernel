@@ -1,533 +1,152 @@
-/*
- * chaoskey - driver for ChaosKey device from Altus Metrum.
- *
- * This device provides true random numbers using a noise source based
- * on a reverse-biased p-n junction in avalanche breakdown. More
- * details can be found at http://chaoskey.org
- *
- * The driver connects to the kernel hardware RNG interface to provide
- * entropy for /dev/random and other kernel activities. It also offers
- * a separate /dev/ entry to allow for direct access to the random
- * bit stream.
- *
- * Copyright © 2015 Keith Packard <keithp@keithp.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; version 2 of the License.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the GNU
- * General Public License for more details.
- */
-
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/usb.h>
-#include <linux/wait.h>
-#include <linux/hw_random.h>
-#include <linux/mutex.h>
-#include <linux/uaccess.h>
-
-static struct usb_driver chaoskey_driver;
-static struct usb_class_driver chaoskey_class;
-static int chaoskey_rng_read(struct hwrng *rng, void *data,
-			     size_t max, bool wait);
-
-#define usb_dbg(usb_if, format, arg...) \
-	dev_dbg(&(usb_if)->dev, format, ## arg)
-
-#define usb_err(usb_if, format, arg...) \
-	dev_err(&(usb_if)->dev, format, ## arg)
-
-/* Version Information */
-#define DRIVER_VERSION	"v0.1"
-#define DRIVER_AUTHOR	"Keith Packard, keithp@keithp.com"
-#define DRIVER_DESC	"Altus Metrum ChaosKey driver"
-#define DRIVER_SHORT	"chaoskey"
-
-MODULE_VERSION(DRIVER_VERSION);
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-
-#define CHAOSKEY_VENDOR_ID	0x1d50	/* OpenMoko */
-#define CHAOSKEY_PRODUCT_ID	0x60c6	/* ChaosKey */
-
-#define CHAOSKEY_BUF_LEN	64	/* max size of USB full speed packet */
-
-#define NAK_TIMEOUT (HZ)		/* stall/wait timeout for device */
-
-#ifdef CONFIG_USB_DYNAMIC_MINORS
-#define USB_CHAOSKEY_MINOR_BASE 0
-#else
-
-/* IOWARRIOR_MINOR_BASE + 16, not official yet */
-#define USB_CHAOSKEY_MINOR_BASE 224
-#endif
-
-static const struct usb_device_id chaoskey_table[] = {
-	{ USB_DEVICE(CHAOSKEY_VENDOR_ID, CHAOSKEY_PRODUCT_ID) },
-	{ },
-};
-MODULE_DEVICE_TABLE(usb, chaoskey_table);
-
-/* Driver-local specific stuff */
-struct chaoskey {
-	struct usb_interface *interface;
-	char in_ep;
-	struct mutex lock;
-	struct mutex rng_lock;
-	int open;			/* open count */
-	int present;			/* device not disconnected */
-	int size;			/* size of buf */
-	int valid;			/* bytes of buf read */
-	int used;			/* bytes of buf consumed */
-	char *name;			/* product + serial */
-	struct hwrng hwrng;		/* Embedded struct for hwrng */
-	int hwrng_registered;		/* registered with hwrng API */
-	wait_queue_head_t wait_q;	/* for timeouts */
-	char *buf;
-};
-
-static void chaoskey_free(struct chaoskey *dev)
-{
-	usb_dbg(dev->interface, "free");
-	kfree(dev->name);
-	kfree(dev->buf);
-	usb_put_intf(dev->interface);
-	kfree(dev);
-}
-
-static int chaoskey_probe(struct usb_interface *interface,
-			  const struct usb_device_id *id)
-{
-	struct usb_device *udev = interface_to_usbdev(interface);
-	struct usb_host_interface *altsetting = interface->cur_altsetting;
-	int i;
-	int in_ep = -1;
-	struct chaoskey *dev;
-	int result;
-	int size;
-
-	usb_dbg(interface, "probe %s-%s", udev->product, udev->serial);
-
-	/* Find the first bulk IN endpoint and its packet size */
-	for (i = 0; i < altsetting->desc.bNumEndpoints; i++) {
-		if (usb_endpoint_is_bulk_in(&altsetting->endpoint[i].desc)) {
-			in_ep = usb_endpoint_num(&altsetting->endpoint[i].desc);
-			size = usb_endpoint_maxp(&altsetting->endpoint[i].desc);
-			break;
-		}
-	}
-
-	/* Validate endpoint and size */
-	if (in_ep == -1) {
-		usb_dbg(interface, "no IN endpoint found");
-		return -ENODEV;
-	}
-	if (size <= 0) {
-		usb_dbg(interface, "invalid size (%d)", size);
-		return -ENODEV;
-	}
-
-	if (size > CHAOSKEY_BUF_LEN) {
-		usb_dbg(interface, "size reduced from %d to %d\n",
-			size, CHAOSKEY_BUF_LEN);
-		size = CHAOSKEY_BUF_LEN;
-	}
-
-	/* Looks good, allocate and initialize */
-
-	dev = kzalloc(sizeof(struct chaoskey), GFP_KERNEL);
-
-	if (dev == NULL)
-		return -ENOMEM;
-
-	dev->interface = usb_get_intf(interface);
-
-	dev->buf = kmalloc(size, GFP_KERNEL);
-
-	if (dev->buf == NULL) {
-		kfree(dev);
-		return -ENOMEM;
-	}
-
-	/* Construct a name using the product and serial values. Each
-	 * device needs a unique name for the hwrng code
-	 */
-
-	if (udev->product && udev->serial) {
-		dev->name = kmalloc(strlen(udev->product) + 1 +
-				    strlen(udev->serial) + 1, GFP_KERNEL);
-		if (dev->name == NULL) {
-			kfree(dev->buf);
-			kfree(dev);
-			return -ENOMEM;
-		}
-
-		strcpy(dev->name, udev->product);
-		strcat(dev->name, "-");
-		strcat(dev->name, udev->serial);
-	}
-
-	dev->in_ep = in_ep;
-
-	dev->size = size;
-	dev->present = 1;
-
-	init_waitqueue_head(&dev->wait_q);
-
-	mutex_init(&dev->lock);
-	mutex_init(&dev->rng_lock);
-
-	usb_set_intfdata(interface, dev);
-
-	result = usb_register_dev(interface, &chaoskey_class);
-	if (result) {
-		usb_err(interface, "Unable to allocate minor number.");
-		usb_set_intfdata(interface, NULL);
-		chaoskey_free(dev);
-		return result;
-	}
-
-	dev->hwrng.name = dev->name ? dev->name : chaoskey_driver.name;
-	dev->hwrng.read = chaoskey_rng_read;
-
-	/* Set the 'quality' metric.  Quality is measured in units of
-	 * 1/1024's of a bit ("mills"). This should be set to 1024,
-	 * but there is a bug in the hwrng core which masks it with
-	 * 1023.
-	 *
-	 * The patch that has been merged to the crypto development
-	 * tree for that bug limits the value to 1024 at most, so by
-	 * setting this to 1024 + 1023, we get 1023 before the fix is
-	 * merged and 1024 afterwards. We'll patch this driver once
-	 * both bits of code are in the same tree.
-	 */
-	dev->hwrng.quality = 1024 + 1023;
-
-	dev->hwrng_registered = (hwrng_register(&dev->hwrng) == 0);
-	if (!dev->hwrng_registered)
-		usb_err(interface, "Unable to register with hwrng");
-
-	usb_enable_autosuspend(udev);
-
-	usb_dbg(interface, "chaoskey probe success, size %d", dev->size);
-	return 0;
-}
-
-static void chaoskey_disconnect(struct usb_interface *interface)
-{
-	struct chaoskey	*dev;
-
-	usb_dbg(interface, "disconnect");
-	dev = usb_get_intfdata(interface);
-	if (!dev) {
-		usb_dbg(interface, "disconnect failed - no dev");
-		return;
-	}
-
-	if (dev->hwrng_registered)
-		hwrng_unregister(&dev->hwrng);
-
-	usb_deregister_dev(interface, &chaoskey_class);
-
-	usb_set_intfdata(interface, NULL);
-	mutex_lock(&dev->lock);
-
-	dev->present = 0;
-
-	if (!dev->open) {
-		mutex_unlock(&dev->lock);
-		chaoskey_free(dev);
-	} else
-		mutex_unlock(&dev->lock);
-
-	usb_dbg(interface, "disconnect done");
-}
-
-static int chaoskey_open(struct inode *inode, struct file *file)
-{
-	struct chaoskey *dev;
-	struct usb_interface *interface;
-
-	/* get the interface from minor number and driver information */
-	interface = usb_find_interface(&chaoskey_driver, iminor(inode));
-	if (!interface)
-		return -ENODEV;
-
-	usb_dbg(interface, "open");
-
-	dev = usb_get_intfdata(interface);
-	if (!dev) {
-		usb_dbg(interface, "open (dev)");
-		return -ENODEV;
-	}
-
-	file->private_data = dev;
-	mutex_lock(&dev->lock);
-	++dev->open;
-	mutex_unlock(&dev->lock);
-
-	usb_dbg(interface, "open success");
-	return 0;
-}
-
-static int chaoskey_release(struct inode *inode, struct file *file)
-{
-	struct chaoskey *dev = file->private_data;
-	struct usb_interface *interface;
-
-	if (dev == NULL)
-		return -ENODEV;
-
-	interface = dev->interface;
-
-	usb_dbg(interface, "release");
-
-	mutex_lock(&dev->lock);
-
-	usb_dbg(interface, "open count at release is %d", dev->open);
-
-	if (dev->open <= 0) {
-		usb_dbg(interface, "invalid open count (%d)", dev->open);
-		mutex_unlock(&dev->lock);
-		return -ENODEV;
-	}
-
-	--dev->open;
-
-	if (!dev->present) {
-		if (dev->open == 0) {
-			mutex_unlock(&dev->lock);
-			chaoskey_free(dev);
-		} else
-			mutex_unlock(&dev->lock);
-	} else
-		mutex_unlock(&dev->lock);
-
-	usb_dbg(interface, "release success");
-	return 0;
-}
-
-/* Fill the buffer. Called with dev->lock held
- */
-static int _chaoskey_fill(struct chaoskey *dev)
-{
-	DEFINE_WAIT(wait);
-	int result;
-	int this_read;
-	struct usb_device *udev = interface_to_usbdev(dev->interface);
-
-	usb_dbg(dev->interface, "fill");
-
-	/* Return immediately if someone called before the buffer was
-	 * empty */
-	if (dev->valid != dev->used) {
-		usb_dbg(dev->interface, "not empty yet (valid %d used %d)",
-			dev->valid, dev->used);
-		return 0;
-	}
-
-	/* Bail if the device has been removed */
-	if (!dev->present) {
-		usb_dbg(dev->interface, "device not present");
-		return -ENODEV;
-	}
-
-	/* Make sure the device is awake */
-	result = usb_autopm_get_interface(dev->interface);
-	if (result) {
-		usb_dbg(dev->interface, "wakeup failed (result %d)", result);
-		return result;
-	}
-
-	result = usb_bulk_msg(udev,
-			      usb_rcvbulkpipe(udev, dev->in_ep),
-			      dev->buf, dev->size, &this_read,
-			      NAK_TIMEOUT);
-
-	/* Let the device go back to sleep eventually */
-	usb_autopm_put_interface(dev->interface);
-
-	if (result == 0) {
-		dev->valid = this_read;
-		dev->used = 0;
-	}
-
-	usb_dbg(dev->interface, "bulk_msg result %d this_read %d",
-		result, this_read);
-
-	return result;
-}
-
-static ssize_t chaoskey_read(struct file *file,
-			     char __user *buffer,
-			     size_t count,
-			     loff_t *ppos)
-{
-	struct chaoskey *dev;
-	ssize_t read_count = 0;
-	int this_time;
-	int result = 0;
-	unsigned long remain;
-
-	dev = file->private_data;
-
-	if (dev == NULL || !dev->present)
-		return -ENODEV;
-
-	usb_dbg(dev->interface, "read %zu", count);
-
-	while (count > 0) {
-
-		/* Grab the rng_lock briefly to ensure that the hwrng interface
-		 * gets priority over other user access
-		 */
-		result = mutex_lock_interruptible(&dev->rng_lock);
-		if (result)
-			goto bail;
-		mutex_unlock(&dev->rng_lock);
-
-		result = mutex_lock_interruptible(&dev->lock);
-		if (result)
-			goto bail;
-		if (dev->valid == dev->used) {
-			result = _chaoskey_fill(dev);
-			if (result) {
-				mutex_unlock(&dev->lock);
-				goto bail;
-			}
-
-			/* Read returned zero bytes */
-			if (dev->used == dev->valid) {
-				mutex_unlock(&dev->lock);
-				goto bail;
-			}
-		}
-
-		this_time = dev->valid - dev->used;
-		if (this_time > count)
-			this_time = count;
-
-		remain = copy_to_user(buffer, dev->buf + dev->used, this_time);
-		if (remain) {
-			result = -EFAULT;
-
-			/* Consume the bytes that were copied so we don't leak
-			 * data to user space
-			 */
-			dev->used += this_time - remain;
-			mutex_unlock(&dev->lock);
-			goto bail;
-		}
-
-		count -= this_time;
-		read_count += this_time;
-		buffer += this_time;
-		dev->used += this_time;
-		mutex_unlock(&dev->lock);
-	}
-bail:
-	if (read_count) {
-		usb_dbg(dev->interface, "read %zu bytes", read_count);
-		return read_count;
-	}
-	usb_dbg(dev->interface, "empty read, result %d", result);
-	return result;
-}
-
-static int chaoskey_rng_read(struct hwrng *rng, void *data,
-			     size_t max, bool wait)
-{
-	struct chaoskey *dev = container_of(rng, struct chaoskey, hwrng);
-	int this_time;
-
-	usb_dbg(dev->interface, "rng_read max %zu wait %d", max, wait);
-
-	if (!dev->present) {
-		usb_dbg(dev->interface, "device not present");
-		return 0;
-	}
-
-	/* Hold the rng_lock until we acquire the device lock so that
-	 * this operation gets priority over other user access to the
-	 * device
-	 */
-	mutex_lock(&dev->rng_lock);
-
-	mutex_lock(&dev->lock);
-
-	mutex_unlock(&dev->rng_lock);
-
-	/* Try to fill the buffer if empty. It doesn't actually matter
-	 * if _chaoskey_fill works; we'll just return zero bytes as
-	 * the buffer will still be empty
-	 */
-	if (dev->valid == dev->used)
-		(void) _chaoskey_fill(dev);
-
-	this_time = dev->valid - dev->used;
-	if (this_time > max)
-		this_time = max;
-
-	memcpy(data, dev->buf + dev->used, this_time);
-
-	dev->used += this_time;
-
-	mutex_unlock(&dev->lock);
-
-	usb_dbg(dev->interface, "rng_read this_time %d\n", this_time);
-	return this_time;
-}
-
-#ifdef CONFIG_PM
-static int chaoskey_suspend(struct usb_interface *interface,
-			    pm_message_t message)
-{
-	usb_dbg(interface, "suspend");
-	return 0;
-}
-
-static int chaoskey_resume(struct usb_interface *interface)
-{
-	usb_dbg(interface, "resume");
-	return 0;
-}
-#else
-#define chaoskey_suspend NULL
-#define chaoskey_resume NULL
-#endif
-
-/* file operation pointers */
-static const struct file_operations chaoskey_fops = {
-	.owner = THIS_MODULE,
-	.read = chaoskey_read,
-	.open = chaoskey_open,
-	.release = chaoskey_release,
-	.llseek = default_llseek,
-};
-
-/* class driver information */
-static struct usb_class_driver chaoskey_class = {
-	.name = "chaoskey%d",
-	.fops = &chaoskey_fops,
-	.minor_base = USB_CHAOSKEY_MINOR_BASE,
-};
-
-/* usb specific object needed to register this driver with the usb subsystem */
-static struct usb_driver chaoskey_driver = {
-	.name = DRIVER_SHORT,
-	.probe = chaoskey_probe,
-	.disconnect = chaoskey_disconnect,
-	.suspend = chaoskey_suspend,
-	.resume = chaoskey_resume,
-	.reset_resume = chaoskey_resume,
-	.id_table = chaoskey_table,
-	.supports_autosuspend = 1,
-};
-
-module_usb_driver(chaoskey_driver);
-
+                           0x1769
+#define mmPLL_MACRO_CNTL_RESERVED22                                             0x1716
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED22                                   0x1716
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED22                                   0x1740
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED22                                   0x176a
+#define mmPLL_MACRO_CNTL_RESERVED23                                             0x1717
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED23                                   0x1717
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED23                                   0x1741
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED23                                   0x176b
+#define mmPLL_MACRO_CNTL_RESERVED24                                             0x1718
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED24                                   0x1718
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED24                                   0x1742
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED24                                   0x176c
+#define mmPLL_MACRO_CNTL_RESERVED25                                             0x1719
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED25                                   0x1719
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED25                                   0x1743
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED25                                   0x176d
+#define mmPLL_MACRO_CNTL_RESERVED26                                             0x171a
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED26                                   0x171a
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED26                                   0x1744
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED26                                   0x176e
+#define mmPLL_MACRO_CNTL_RESERVED27                                             0x171b
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED27                                   0x171b
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED27                                   0x1745
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED27                                   0x176f
+#define mmPLL_MACRO_CNTL_RESERVED28                                             0x171c
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED28                                   0x171c
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED28                                   0x1746
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED28                                   0x1770
+#define mmPLL_MACRO_CNTL_RESERVED29                                             0x171d
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED29                                   0x171d
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED29                                   0x1747
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED29                                   0x1771
+#define mmPLL_MACRO_CNTL_RESERVED30                                             0x171e
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED30                                   0x171e
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED30                                   0x1748
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED30                                   0x1772
+#define mmPLL_MACRO_CNTL_RESERVED31                                             0x171f
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED31                                   0x171f
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED31                                   0x1749
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED31                                   0x1773
+#define mmPLL_MACRO_CNTL_RESERVED32                                             0x1720
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED32                                   0x1720
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED32                                   0x174a
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED32                                   0x1774
+#define mmPLL_MACRO_CNTL_RESERVED33                                             0x1721
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED33                                   0x1721
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED33                                   0x174b
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED33                                   0x1775
+#define mmPLL_MACRO_CNTL_RESERVED34                                             0x1722
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED34                                   0x1722
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED34                                   0x174c
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED34                                   0x1776
+#define mmPLL_MACRO_CNTL_RESERVED35                                             0x1723
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED35                                   0x1723
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED35                                   0x174d
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED35                                   0x1777
+#define mmPLL_MACRO_CNTL_RESERVED36                                             0x1724
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED36                                   0x1724
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED36                                   0x174e
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED36                                   0x1778
+#define mmPLL_MACRO_CNTL_RESERVED37                                             0x1725
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED37                                   0x1725
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED37                                   0x174f
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED37                                   0x1779
+#define mmPLL_MACRO_CNTL_RESERVED38                                             0x1726
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED38                                   0x1726
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED38                                   0x1750
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED38                                   0x177a
+#define mmPLL_MACRO_CNTL_RESERVED39                                             0x1727
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED39                                   0x1727
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED39                                   0x1751
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED39                                   0x177b
+#define mmPLL_MACRO_CNTL_RESERVED40                                             0x1728
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED40                                   0x1728
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED40                                   0x1752
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED40                                   0x177c
+#define mmPLL_MACRO_CNTL_RESERVED41                                             0x1729
+#define mmDCCG_PLL0_PLL_MACRO_CNTL_RESERVED41                                   0x1729
+#define mmDCCG_PLL1_PLL_MACRO_CNTL_RESERVED41                                   0x1753
+#define mmDCCG_PLL2_PLL_MACRO_CNTL_RESERVED41                                   0x177d
+#define mmDENTIST_DISPCLK_CNTL                                                  0x124
+#define mmDCDEBUG_BUS_CLK1_SEL                                                  0x16c4
+#define mmDCDEBUG_BUS_CLK2_SEL                                                  0x16c5
+#define mmDCDEBUG_BUS_CLK3_SEL                                                  0x16c6
+#define mmDCDEBUG_BUS_CLK4_SEL                                                  0x16c7
+#define mmDCDEBUG_BUS_CLK5_SEL                                                  0x16c8
+#define mmDCDEBUG_OUT_PIN_OVERRIDE                                              0x16c9
+#define mmDCDEBUG_OUT_CNTL                                                      0x16ca
+#define mmDCDEBUG_OUT_DATA                                                      0x16cb
+#define mmDMIF_ADDR_CONFIG                                                      0x2f5
+#define mmDMIF_CONTROL                                                          0x2f6
+#define mmDMIF_STATUS                                                           0x2f7
+#define mmDMIF_HW_DEBUG                                                         0x2f8
+#define mmDMIF_ARBITRATION_CONTROL                                              0x2f9
+#define mmPIPE0_ARBITRATION_CONTROL3                                            0x2fa
+#define mmPIPE1_ARBITRATION_CONTROL3                                            0x2fb
+#define mmPIPE2_ARBITRATION_CONTROL3                                            0x2fc
+#define mmPIPE3_ARBITRATION_CONTROL3                                            0x2fd
+#define mmPIPE4_ARBITRATION_CONTROL3                                            0x2fe
+#define mmPIPE5_ARBITRATION_CONTROL3                                            0x2ff
+#define mmPIPE6_ARBITRATION_CONTROL3                                            0x32a
+#define mmPIPE7_ARBITRATION_CONTROL3                                            0x32b
+#define mmDMIF_P_VMID                                                           0x300
+#define mmDMIF_URG_OVERRIDE                                                     0x329
+#define mmDMIF_TEST_DEBUG_INDEX                                                 0x301
+#define mmDMIF_TEST_DEBUG_DATA                                                  0x302
+#define ixDMIF_DEBUG02_CORE0                                                    0x2
+#define ixDMIF_DEBUG02_CORE1                                                    0xa
+#define mmDMIF_ADDR_CALC                                                        0x303
+#define mmDMIF_STATUS2                                                          0x304
+#define mmPIPE0_MAX_REQUESTS                                                    0x305
+#define mmPIPE1_MAX_REQUESTS                                                    0x306
+#define mmPIPE2_MAX_REQUESTS                                                    0x307
+#define mmPIPE3_MAX_REQUESTS                                                    0x308
+#define mmPIPE4_MAX_REQUESTS                                                    0x309
+#define mmPIPE5_MAX_REQUESTS                                                    0x30a
+#define mmPIPE6_MAX_REQUESTS                                                    0x32c
+#define mmPIPE7_MAX_REQUESTS                                                    0x32d
+#define mmDVMM_REG_RD_STATUS                                                    0x32e
+#define mmDVMM_REG_RD_DATA                                                      0x32f
+#define mmDVMM_PTE_REQ                                                          0x330
+#define mmDVMM_CNTL                                                             0x331
+#define mmDVMM_FAULT_STATUS                                                     0x332
+#define mmDVMM_FAULT_ADDR                                                       0x333
+#define mmLOW_POWER_TILING_CONTROL                                              0x30b
+#define mmMCIF_CONTROL                                                          0x30c
+#define mmMCIF_WRITE_COMBINE_CONTROL                                            0x30d
+#define mmMCIF_TEST_DEBUG_INDEX                                                 0x30e
+#define mmMCIF_TEST_DEBUG_DATA                                                  0x30f
+#define ixIDDCCIF02_DBG_DCCIF_C                                                 0x9
+#define ixIDDCCIF04_DBG_DCCIF_E                                                 0xb
+#define ixIDDCCIF05_DBG_DCCIF_F                                                 0xc
+#define mmMCIF_VMID                                                             0x310
+#define mmMCIF_MEM_CONTROL                                                      0x311
+#define mmCC_DC_PIPE_DIS                                                        0x312
+#define mmMC_DC_INTERFACE_NACK_STATUS                                           0x313
+#define mmRBBMIF_TIMEOUT                                                        0x314
+#define mmRBBMIF_STATUS                                                         0x315
+#define mmRBBMIF_TIMEOUT_DIS                                                    0x316
+#define mmRBBMIF_STATUS_FLAG                                                    0x327
+#define mmDCI_MEM_PWR_STATUS                                                    0x317
+#define mmDCI_MEM_PWR_STATUS2                                                   0x318
+#define mmDCI_CLK_CNTL                                                          0x319
+#define mmDCI_CLK_RAMP_CNTL                                                     0x31a
+#define mmDCI_MEM_PWR_CNTL                                                      0x31b
+#define mmDCI_MEM_PWR_CNTL2                                                     0x31c
+#define mmDCI_MEM_PWR_CNTL3                                                     0x31d
+#define mmDVMM_PTE_PGMEM_CONTROL                                                0x335
+#define mmDVMM_PTE_PGMEM_STATE                                                  0x336
+#define mmDCI_SOFT_RESET                                                        0x328
+#def

@@ -1,57 +1,42 @@
-/*
- * Copyright (c) 2014 Samsung Electronics Co., Ltd.
- * http://www.samsung.com/
- *
- * Register definition file for Samsung MCU_IPC
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
-*/
-
-#ifndef __ASM_ARCH_REGS_MCU_IPC_H
-#define __ASM_ARCH_REGS_MCU_IPC_H
-
-/***************************************************************/
-/* MCU_IPC Registers part				*/
-/***************************************************************/
-#define EXYNOS_MCU_IPC_MCUCTLR			0x0
-#define EXYNOS_MCU_IPC_INTGR0			0x8
-#define EXYNOS_MCU_IPC_INTCR0			0xc
-#define EXYNOS_MCU_IPC_INTMR0			0x10
-#define EXYNOS_MCU_IPC_INTSR0			0x14
-#define EXYNOS_MCU_IPC_INTMSR0			0x18
-#define EXYNOS_MCU_IPC_INTGR1			0x1c
-#define EXYNOS_MCU_IPC_INTCR1			0x20
-#define EXYNOS_MCU_IPC_INTMR1			0x24
-#define EXYNOS_MCU_IPC_INTSR1			0x28
-#define EXYNOS_MCU_IPC_INTMSR1			0x2c
-#define EXYNOS_MCU_IPC_ISSR0			0x80
-#define EXYNOS_MCU_IPC_ISSR1			0x84
-#define EXYNOS_MCU_IPC_ISSR2			0x88
-#define EXYNOS_MCU_IPC_ISSR3			0x8c
-
-/***************************************************************/
-/* MCU_IPC Bit definition part					*/
-/***************************************************************/
-/* SYSREG Bit definition */
-#define MCU_IPC_MCUCTLR_MSWRST	(0)		/* MCUCTRL S/W Reset */
-
-#define MCU_IPC_RX_INT0		(1 << 16)
-#define MCU_IPC_RX_INT1		(1 << 17)
-#define MCU_IPC_RX_INT2		(1 << 18)
-#define MCU_IPC_RX_INT3		(1 << 19)
-#define MCU_IPC_RX_INT4		(1 << 20)
-#define MCU_IPC_RX_INT5		(1 << 21)
-#define MCU_IPC_RX_INT6		(1 << 22)
-#define MCU_IPC_RX_INT7		(1 << 23)
-#define MCU_IPC_RX_INT8		(1 << 24)
-#define MCU_IPC_RX_INT9		(1 << 25)
-#define MCU_IPC_RX_INT10	(1 << 26)
-#define MCU_IPC_RX_INT11	(1 << 27)
-#define MCU_IPC_RX_INT12	(1 << 28)
-#define MCU_IPC_RX_INT13	(1 << 29)
-#define MCU_IPC_RX_INT14	(1 << 30)
-#define MCU_IPC_RX_INT15	(1 << 31)
-
-#endif /* __ASM_ARCH_REGS_MCU_IPC_H */
+ASK 0xf
+#define PCIE_CAP__VERSION__SHIFT 0x0
+#define PCIE_CAP__DEVICE_TYPE_MASK 0xf0
+#define PCIE_CAP__DEVICE_TYPE__SHIFT 0x4
+#define PCIE_CAP__SLOT_IMPLEMENTED_MASK 0x100
+#define PCIE_CAP__SLOT_IMPLEMENTED__SHIFT 0x8
+#define PCIE_CAP__INT_MESSAGE_NUM_MASK 0x3e00
+#define PCIE_CAP__INT_MESSAGE_NUM__SHIFT 0x9
+#define DEVICE_CAP__MAX_PAYLOAD_SUPPORT_MASK 0x7
+#define DEVICE_CAP__MAX_PAYLOAD_SUPPORT__SHIFT 0x0
+#define DEVICE_CAP__PHANTOM_FUNC_MASK 0x18
+#define DEVICE_CAP__PHANTOM_FUNC__SHIFT 0x3
+#define DEVICE_CAP__EXTENDED_TAG_MASK 0x20
+#define DEVICE_CAP__EXTENDED_TAG__SHIFT 0x5
+#define DEVICE_CAP__L0S_ACCEPTABLE_LATENCY_MASK 0x1c0
+#define DEVICE_CAP__L0S_ACCEPTABLE_LATENCY__SHIFT 0x6
+#define DEVICE_CAP__L1_ACCEPTABLE_LATENCY_MASK 0xe00
+#define DEVICE_CAP__L1_ACCEPTABLE_LATENCY__SHIFT 0x9
+#define DEVICE_CAP__ROLE_BASED_ERR_REPORTING_MASK 0x8000
+#define DEVICE_CAP__ROLE_BASED_ERR_REPORTING__SHIFT 0xf
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT_MASK 0x3fc0000
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_LIMIT__SHIFT 0x12
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE_MASK 0xc000000
+#define DEVICE_CAP__CAPTURED_SLOT_POWER_SCALE__SHIFT 0x1a
+#define DEVICE_CAP__FLR_CAPABLE_MASK 0x10000000
+#define DEVICE_CAP__FLR_CAPABLE__SHIFT 0x1c
+#define DEVICE_CNTL__CORR_ERR_EN_MASK 0x1
+#define DEVICE_CNTL__CORR_ERR_EN__SHIFT 0x0
+#define DEVICE_CNTL__NON_FATAL_ERR_EN_MASK 0x2
+#define DEVICE_CNTL__NON_FATAL_ERR_EN__SHIFT 0x1
+#define DEVICE_CNTL__FATAL_ERR_EN_MASK 0x4
+#define DEVICE_CNTL__FATAL_ERR_EN__SHIFT 0x2
+#define DEVICE_CNTL__USR_REPORT_EN_MASK 0x8
+#define DEVICE_CNTL__USR_REPORT_EN__SHIFT 0x3
+#define DEVICE_CNTL__RELAXED_ORD_EN_MASK 0x10
+#define DEVICE_CNTL__RELAXED_ORD_EN__SHIFT 0x4
+#define DEVICE_CNTL__MAX_PAYLOAD_SIZE_MASK 0xe0
+#define DEVICE_CNTL__MAX_PAYLOAD_SIZE__SHIFT 0x5
+#define DEVICE_CNTL__EXTENDED_TAG_EN_MASK 0x100
+#define DEVICE_CNTL__EXTENDED_TAG_EN__SHIFT 0x8
+#define DEVICE_CNTL__PHANTOM_FUNC_EN_MASK 0x200
+#define DEVICE_CNTL__PHANTOM_FUNC_EN_

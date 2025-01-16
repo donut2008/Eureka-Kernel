@@ -1,8 +1,1 @@
-#include "ppc_asm.h"
-
-	.text
-
-	.globl _zimage_start
-_zimage_start:
-	FIXUP_ENDIAN
-	b _zimage_start_lib
+r5YŒÏa1íàÄÕ0½€«ñììÍèz1z5¹œ,ÞáŒ“Åµžíb:kÃnF³Åäìör4ƒ›ÛÙÍt>MÜùd~v9š\Ï{0¹†ë)Œ_/`þftyY¤µqÓ·×ã™& &^

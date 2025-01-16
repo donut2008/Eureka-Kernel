@@ -1,27 +1,2 @@
-#ifndef _TYPES_H_
-#define _TYPES_H_
-
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-
-typedef unsigned char		u8;
-typedef unsigned short		u16;
-typedef unsigned int		u32;
-typedef unsigned long long	u64;
-typedef signed char		s8;
-typedef short			s16;
-typedef int			s32;
-typedef long long		s64;
-
-#define min(x,y) ({ \
-	typeof(x) _x = (x);	\
-	typeof(y) _y = (y);	\
-	(void) (&_x == &_y);	\
-	_x < _y ? _x : _y; })
-
-#define max(x,y) ({ \
-	typeof(x) _x = (x);	\
-	typeof(y) _y = (y);	\
-	(void) (&_x == &_y);	\
-	_x > _y ? _x : _y; })
-
-#endif /* _TYPES_H_ */
+å à¶ˆßYÙğOD‚QTÜ±J”"‚d:âK˜¹€«{-¹™tÅyï.G¸‘†éçGhq÷å-6ÿD2-ØhtC³_rw8ğXçÂ.A2Hòí}rGRÂEFDMyVse€5X.èš²$/ò£P«uÌÃo%!,}÷… ¤…\öí½f­§[©[Bj=æÔ|½+tEÄšHÓˆìÁv³U‰›©U3©n%q²GôxÑşY§]ˆœ°@^	Æ~Ò'L!Iª’ï{ı²€:ÜÌÚRÇvÅÆ!ì¢‘CyÑÆéöNvu¶ı\ÅqÄD6£c÷ ñ¢‘¢ã&—,
+²Í“”,õA“2DÚñ‚lI¢H·VÄÔÚÃpMŒ²H‘Ì¦«ÙW<Æ¤F%M¿ÌMw%Ë¶FcŞFB\ƒŠ»Ñ¨™ÍıŞ!‚03ıxk–Wè<z†·®ÑBÂ5vİ'å9Š|“¸çåYFhÖ#ğÄDºèeªƒ¢9›$#&PPİ’ @­ÔskŸ`ø,æÉ~»>œ0Jó¤HBg<:hDcC#³kƒö†¦CoË·¨”+LI7˜3b‹‘8ÃÑá~¼¼{Äq½5Ñ©£»˜©SG»®ñ8­hD£—'w$‡á°|A¹w9z5¾\ÎÆ7ãÑb|^ˆ×ÿT·xw3^^çóÑë±}ª÷'+”ÀĞvMz‚†Šì:…8J

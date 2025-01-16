@@ -1,4974 +1,3926 @@
-/* Linux driver for devices based on the DiBcom DiB0700 USB bridge
- *
- *	This program is free software; you can redistribute it and/or modify it
- *	under the terms of the GNU General Public License as published by the Free
- *	Software Foundation, version 2.
- *
- *  Copyright (C) 2005-9 DiBcom, SA et al
- */
-#include "dib0700.h"
-
-#include "dib3000mc.h"
-#include "dib7000m.h"
-#include "dib7000p.h"
-#include "dib8000.h"
-#include "dib9000.h"
-#include "mt2060.h"
-#include "mt2266.h"
-#include "tuner-xc2028.h"
-#include "xc5000.h"
-#include "xc4000.h"
-#include "s5h1411.h"
-#include "dib0070.h"
-#include "dib0090.h"
-#include "lgdt3305.h"
-#include "mxl5007t.h"
-
-static int force_lna_activation;
-module_param(force_lna_activation, int, 0644);
-MODULE_PARM_DESC(force_lna_activation, "force the activation of Low-Noise-Amplifyer(s) (LNA), "
-		"if applicable for the device (default: 0=automatic/off).");
-
-struct dib0700_adapter_state {
-	int (*set_param_save) (struct dvb_frontend *);
-	const struct firmware *frontend_firmware;
-	struct dib7000p_ops dib7000p_ops;
-	struct dib8000_ops dib8000_ops;
-};
-
-/* Hauppauge Nova-T 500 (aka Bristol)
- *  has a LNA on GPIO0 which is enabled by setting 1 */
-static struct mt2060_config bristol_mt2060_config[2] = {
-	{
-		.i2c_address = 0x60,
-		.clock_out   = 3,
-	}, {
-		.i2c_address = 0x61,
-	}
-};
-
-
-static struct dibx000_agc_config bristol_dib3000p_mt2060_agc_config = {
-	.band_caps = BAND_VHF | BAND_UHF,
-	.setup     = (1 << 8) | (5 << 5) | (0 << 4) | (0 << 3) | (0 << 2) | (2 << 0),
-
-	.agc1_max = 42598,
-	.agc1_min = 17694,
-	.agc2_max = 45875,
-	.agc2_min = 0,
-
-	.agc1_pt1 = 0,
-	.agc1_pt2 = 59,
-
-	.agc1_slope1 = 0,
-	.agc1_slope2 = 69,
-
-	.agc2_pt1 = 0,
-	.agc2_pt2 = 59,
-
-	.agc2_slope1 = 111,
-	.agc2_slope2 = 28,
-};
-
-static struct dib3000mc_config bristol_dib3000mc_config[2] = {
-	{	.agc          = &bristol_dib3000p_mt2060_agc_config,
-		.max_time     = 0x196,
-		.ln_adc_level = 0x1cc7,
-		.output_mpeg2_in_188_bytes = 1,
-	},
-	{	.agc          = &bristol_dib3000p_mt2060_agc_config,
-		.max_time     = 0x196,
-		.ln_adc_level = 0x1cc7,
-		.output_mpeg2_in_188_bytes = 1,
-	}
-};
-
-static int bristol_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_state *st = adap->dev->priv;
-	if (adap->id == 0) {
-		dib0700_set_gpio(adap->dev, GPIO6,  GPIO_OUT, 0); msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO6,  GPIO_OUT, 1); msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0); msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1); msleep(10);
-
-		if (force_lna_activation)
-			dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-		else
-			dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 0);
-
-		if (dib3000mc_i2c_enumeration(&adap->dev->i2c_adap, 2, DEFAULT_DIB3000P_I2C_ADDRESS, bristol_dib3000mc_config) != 0) {
-			dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0); msleep(10);
-			return -ENODEV;
-		}
-	}
-	st->mt2060_if1[adap->id] = 1220;
-	return (adap->fe_adap[0].fe = dvb_attach(dib3000mc_attach, &adap->dev->i2c_adap,
-		(10 + adap->id) << 1, &bristol_dib3000mc_config[adap->id])) == NULL ? -ENODEV : 0;
-}
-
-static int eeprom_read(struct i2c_adapter *adap,u8 adrs,u8 *pval)
-{
-	struct i2c_msg msg[2] = {
-		{ .addr = 0x50, .flags = 0,        .buf = &adrs, .len = 1 },
-		{ .addr = 0x50, .flags = I2C_M_RD, .buf = pval,  .len = 1 },
-	};
-	if (i2c_transfer(adap, msg, 2) != 2) return -EREMOTEIO;
-	return 0;
-}
-
-static int bristol_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct i2c_adapter *prim_i2c = &adap->dev->i2c_adap;
-	struct i2c_adapter *tun_i2c = dib3000mc_get_tuner_i2c_master(adap->fe_adap[0].fe, 1);
-	s8 a;
-	int if1=1220;
-	if (adap->dev->udev->descriptor.idVendor  == cpu_to_le16(USB_VID_HAUPPAUGE) &&
-		adap->dev->udev->descriptor.idProduct == cpu_to_le16(USB_PID_HAUPPAUGE_NOVA_T_500_2)) {
-		if (!eeprom_read(prim_i2c,0x59 + adap->id,&a)) if1=1220+a;
-	}
-	return dvb_attach(mt2060_attach, adap->fe_adap[0].fe, tun_i2c,
-			  &bristol_mt2060_config[adap->id], if1) == NULL ?
-			  -ENODEV : 0;
-}
-
-/* STK7700D: Pinnacle/Terratec/Hauppauge Dual DVB-T Diversity */
-
-/* MT226x */
-static struct dibx000_agc_config stk7700d_7000p_mt2266_agc_config[2] = {
-	{
-		BAND_UHF,
-
-		/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=1, P_agc_inv_pwm1=1, P_agc_inv_pwm2=1,
-		* P_agc_inh_dc_rv_est=0, P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=2, P_agc_write=0 */
-		(0 << 15) | (0 << 14) | (1 << 11) | (1 << 10) | (1 << 9) | (0 << 8)
-	    | (3 << 5) | (0 << 4) | (5 << 1) | (0 << 0),
-
-		1130,
-		21,
-
-		0,
-		118,
-
-		0,
-		3530,
-		1,
-		0,
-
-		65535,
-		33770,
-		65535,
-		23592,
-
-		0,
-		62,
-		255,
-		64,
-		64,
-		132,
-		192,
-		80,
-		80,
-
-		17,
-		27,
-		23,
-		51,
-
-		1,
-	}, {
-		BAND_VHF | BAND_LBAND,
-
-		/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=1, P_agc_inv_pwm1=1, P_agc_inv_pwm2=1,
-		* P_agc_inh_dc_rv_est=0, P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=2, P_agc_write=0 */
-		(0 << 15) | (0 << 14) | (1 << 11) | (1 << 10) | (1 << 9) | (0 << 8)
-	    | (3 << 5) | (0 << 4) | (2 << 1) | (0 << 0),
-
-		2372,
-		21,
-
-		0,
-		118,
-
-		0,
-		3530,
-		1,
-		0,
-
-		65535,
-		0,
-		65535,
-		23592,
-
-		0,
-		128,
-		128,
-		128,
-		0,
-		128,
-		253,
-		81,
-		0,
-
-		17,
-		27,
-		23,
-		51,
-
-		1,
-	}
-};
-
-static struct dibx000_bandwidth_config stk7700d_mt2266_pll_config = {
-	.internal = 60000,
-	.sampling = 30000,
-	.pll_prediv = 1,
-	.pll_ratio = 8,
-	.pll_range = 3,
-	.pll_reset = 1,
-	.pll_bypass = 0,
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 1,
-	.ADClkSrc = 1,
-	.modulo = 2,
-	.sad_cfg = (3 << 14) | (1 << 12) | (524 << 0),
-	.ifreq = 0,
-	.timf = 20452225,
-};
-
-static struct dib7000p_config stk7700d_dib7000p_mt2266_config[] = {
-	{	.output_mpeg2_in_188_bytes = 1,
-		.hostbus_diversity = 1,
-		.tuner_is_baseband = 1,
-
-		.agc_config_count = 2,
-		.agc = stk7700d_7000p_mt2266_agc_config,
-		.bw  = &stk7700d_mt2266_pll_config,
-
-		.gpio_dir = DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-		.gpio_val = DIB7000P_GPIO_DEFAULT_VALUES,
-		.gpio_pwm_pos = DIB7000P_GPIO_DEFAULT_PWM_POS,
-	},
-	{	.output_mpeg2_in_188_bytes = 1,
-		.hostbus_diversity = 1,
-		.tuner_is_baseband = 1,
-
-		.agc_config_count = 2,
-		.agc = stk7700d_7000p_mt2266_agc_config,
-		.bw  = &stk7700d_mt2266_pll_config,
-
-		.gpio_dir = DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-		.gpio_val = DIB7000P_GPIO_DEFAULT_VALUES,
-		.gpio_pwm_pos = DIB7000P_GPIO_DEFAULT_PWM_POS,
-	}
-};
-
-static struct mt2266_config stk7700d_mt2266_config[2] = {
-	{	.i2c_address = 0x60
-	},
-	{	.i2c_address = 0x60
-	}
-};
-
-static int stk7700P2_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	if (adap->id == 0) {
-		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-		msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-		dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-		dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-		dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-		msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-		msleep(10);
-		if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 18,
-					     stk7700d_dib7000p_mt2266_config)
-		    != 0) {
-			err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-			dvb_detach(state->dib7000p_ops.set_wbd_ref);
-			return -ENODEV;
-		}
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap,
-			   0x80 + (adap->id << 1),
-			   &stk7700d_dib7000p_mt2266_config[adap->id]);
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int stk7700d_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	if (adap->id == 0) {
-		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-		msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-		dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-		dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-		dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-		msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-		msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-		if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 2, 18,
-					     stk7700d_dib7000p_mt2266_config)
-		    != 0) {
-			err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-			dvb_detach(state->dib7000p_ops.set_wbd_ref);
-			return -ENODEV;
-		}
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap,
-			   0x80 + (adap->id << 1),
-			   &stk7700d_dib7000p_mt2266_config[adap->id]);
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int stk7700d_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct i2c_adapter *tun_i2c;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	tun_i2c = state->dib7000p_ops.get_i2c_master(adap->fe_adap[0].fe,
-					    DIBX000_I2C_INTERFACE_TUNER, 1);
-	return dvb_attach(mt2266_attach, adap->fe_adap[0].fe, tun_i2c,
-		&stk7700d_mt2266_config[adap->id]) == NULL ? -ENODEV : 0;
-}
-
-/* STK7700-PH: Digital/Analog Hybrid Tuner, e.h. Cinergy HT USB HE */
-static struct dibx000_agc_config xc3028_agc_config = {
-	.band_caps = BAND_VHF | BAND_UHF,
-	/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=0,
-	 * P_agc_inv_pwm1=0, P_agc_inv_pwm2=0, P_agc_inh_dc_rv_est=0,
-	 * P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=2, P_agc_write=0 */
-	.setup = (0 << 15) | (0 << 14) | (0 << 11) | (0 << 10) | (0 << 9) | (0 << 8) | (3 << 5) | (0 << 4) | (2 << 1) | (0 << 0),
-	.inv_gain = 712,
-	.time_stabiliz = 21,
-	.alpha_level = 0,
-	.thlock = 118,
-	.wbd_inv = 0,
-	.wbd_ref = 2867,
-	.wbd_sel = 0,
-	.wbd_alpha = 2,
-	.agc1_max = 0,
-	.agc1_min = 0,
-	.agc2_max = 39718,
-	.agc2_min = 9930,
-	.agc1_pt1 = 0,
-	.agc1_pt2 = 0,
-	.agc1_pt3 = 0,
-	.agc1_slope1 = 0,
-	.agc1_slope2 = 0,
-	.agc2_pt1 = 0,
-	.agc2_pt2 = 128,
-	.agc2_slope1 = 29,
-	.agc2_slope2 = 29,
-	.alpha_mant = 17,
-	.alpha_exp = 27,
-	.beta_mant = 23,
-	.beta_exp = 51,
-	.perform_agc_softsplit = 1,
-};
-
-/* PLL Configuration for COFDM BW_MHz = 8.00 with external clock = 30.00 */
-static struct dibx000_bandwidth_config xc3028_bw_config = {
-	.internal = 60000,
-	.sampling = 30000,
-	.pll_prediv = 1,
-	.pll_ratio = 8,
-	.pll_range = 3,
-	.pll_reset = 1,
-	.pll_bypass = 0,
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 1,
-	.ADClkSrc = 1,
-	.modulo = 0,
-	.sad_cfg = (3 << 14) | (1 << 12) | (524 << 0), /* sad_cfg: refsel, sel, freq_15k */
-	.ifreq = (1 << 25) | 5816102,  /* ifreq = 5.200000 MHz */
-	.timf = 20452225,
-	.xtal_hz = 30000000,
-};
-
-static struct dib7000p_config stk7700ph_dib7700_xc3028_config = {
-	.output_mpeg2_in_188_bytes = 1,
-	.tuner_is_baseband = 1,
-
-	.agc_config_count = 1,
-	.agc = &xc3028_agc_config,
-	.bw  = &xc3028_bw_config,
-
-	.gpio_dir = DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val = DIB7000P_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos = DIB7000P_GPIO_DEFAULT_PWM_POS,
-};
-
-static int stk7700ph_xc3028_callback(void *ptr, int component,
-				     int command, int arg)
-{
-	struct dvb_usb_adapter *adap = ptr;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	switch (command) {
-	case XC2028_TUNER_RESET:
-		/* Send the tuner in then out of reset */
-		state->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 0);
-		msleep(10);
-		state->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 1);
-		break;
-	case XC2028_RESET_CLK:
-	case XC2028_I2C_FLUSH:
-		break;
-	default:
-		err("%s: unknown command %d, arg %d\n", __func__,
-			command, arg);
-		return -EINVAL;
-	}
-	return 0;
-}
-
-static struct xc2028_ctrl stk7700ph_xc3028_ctrl = {
-	.fname = XC2028_DEFAULT_FIRMWARE,
-	.max_len = 64,
-	.demod = XC3028_FE_DIBCOM52,
-};
-
-static struct xc2028_config stk7700ph_xc3028_config = {
-	.i2c_addr = 0x61,
-	.ctrl = &stk7700ph_xc3028_ctrl,
-};
-
-static int stk7700ph_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct usb_device_descriptor *desc = &adap->dev->udev->descriptor;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	if (desc->idVendor  == cpu_to_le16(USB_VID_PINNACLE) &&
-	    desc->idProduct == cpu_to_le16(USB_PID_PINNACLE_EXPRESSCARD_320CX))
-		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
-	else
-		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-	msleep(10);
-
-	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 18,
-				     &stk7700ph_dib7700_xc3028_config) != 0) {
-		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
-		    __func__);
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x80,
-		&stk7700ph_dib7700_xc3028_config);
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int stk7700ph_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct i2c_adapter *tun_i2c;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	tun_i2c = state->dib7000p_ops.get_i2c_master(adap->fe_adap[0].fe,
-		DIBX000_I2C_INTERFACE_TUNER, 1);
-
-	stk7700ph_xc3028_config.i2c_adap = tun_i2c;
-
-	/* FIXME: generalize & move to common area */
-	adap->fe_adap[0].fe->callback = stk7700ph_xc3028_callback;
-
-	return dvb_attach(xc2028_attach, adap->fe_adap[0].fe, &stk7700ph_xc3028_config)
-		== NULL ? -ENODEV : 0;
-}
-
-#define DEFAULT_RC_INTERVAL 50
-
-static u8 rc_request[] = { REQUEST_POLL_RC, 0 };
-
-/*
- * This function is used only when firmware is < 1.20 version. Newer
- * firmwares use bulk mode, with functions implemented at dib0700_core,
- * at dib0700_rc_urb_completion()
- */
-static int dib0700_rc_query_old_firmware(struct dvb_usb_device *d)
-{
-	u8 key[4];
-	enum rc_type protocol;
-	u32 scancode;
-	u8 toggle;
-	int i;
-	struct dib0700_state *st = d->priv;
-
-	if (st->fw_version >= 0x10200) {
-		/* For 1.20 firmware , We need to keep the RC polling
-		   callback so we can reuse the input device setup in
-		   dvb-usb-remote.c.  However, the actual work is being done
-		   in the bulk URB completion handler. */
-		return 0;
-	}
-
-	i = dib0700_ctrl_rd(d, rc_request, 2, key, 4);
-	if (i <= 0) {
-		err("RC Query Failed");
-		return -1;
-	}
-
-	/* losing half of KEY_0 events from Philipps rc5 remotes.. */
-	if (key[0] == 0 && key[1] == 0 && key[2] == 0 && key[3] == 0)
-		return 0;
-
-	/* info("%d: %2X %2X %2X %2X",dvb_usb_dib0700_ir_proto,(int)key[3-2],(int)key[3-3],(int)key[3-1],(int)key[3]);  */
-
-	dib0700_rc_setup(d, NULL); /* reset ir sensor data to prevent false events */
-
-	switch (d->props.rc.core.protocol) {
-	case RC_BIT_NEC:
-		/* NEC protocol sends repeat code as 0 0 0 FF */
-		if ((key[3-2] == 0x00) && (key[3-3] == 0x00) &&
-		    (key[3] == 0xff)) {
-			rc_repeat(d->rc_dev);
-			return 0;
-		}
-
-		protocol = RC_TYPE_NEC;
-		scancode = RC_SCANCODE_NEC(key[3-2], key[3-3]);
-		toggle = 0;
-		break;
-
-	default:
-		/* RC-5 protocol changes toggle bit on new keypress */
-		protocol = RC_TYPE_RC5;
-		scancode = RC_SCANCODE_RC5(key[3-2], key[3-3]);
-		toggle = key[3-1];
-		break;
-	}
-
-	rc_keydown(d->rc_dev, protocol, scancode, toggle);
-	return 0;
-}
-
-/* STK7700P: Hauppauge Nova-T Stick, AVerMedia Volar */
-static struct dibx000_agc_config stk7700p_7000m_mt2060_agc_config = {
-	BAND_UHF | BAND_VHF,
-
-	/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=5, P_agc_inv_pwm1=0, P_agc_inv_pwm2=0,
-	 * P_agc_inh_dc_rv_est=0, P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=2, P_agc_write=0 */
-	(0 << 15) | (0 << 14) | (5 << 11) | (0 << 10) | (0 << 9) | (0 << 8)
-	| (3 << 5) | (0 << 4) | (2 << 1) | (0 << 0),
-
-	712,
-	41,
-
-	0,
-	118,
-
-	0,
-	4095,
-	0,
-	0,
-
-	42598,
-	17694,
-	45875,
-	2621,
-	0,
-	76,
-	139,
-	52,
-	59,
-	107,
-	172,
-	57,
-	70,
-
-	21,
-	25,
-	28,
-	48,
-
-	1,
-	{  0,
-	   107,
-	   51800,
-	   24700
+\x4A\xB3\x1C\xA8\x11\x7A"
+			  "\x06\x6F\xD8\x41\xCD\x36\x9F\x08"
+			  "\x94\xFD\x66\xF2\x5B\xC4\x2D\xB9"
+			  "\x22\x8B\x17\x80\xE9\x52\xDE\x47"
+			  "\xB0\x19\xA5\x0E\x77\x03\x6C\xD5"
+			  "\x3E\xCA\x33\x9C\x05\x91\xFA\x63"
+			  "\xEF\x58\xC1\x2A\xB6\x1F\x88\x14"
+			  "\x7D\xE6\x4F\xDB\x44\xAD\x16\xA2"
+			  "\x0B\x74\x00\x69\xD2\x3B\xC7\x30"
+			  "\x99\x02\x8E\xF7\x60\xEC\x55\xBE"
+			  "\x27\xB3\x1C\x85\x11\x7A\xE3\x4C"
+			  "\xD8\x41\xAA\x13\x9F\x08\x71\xFD"
+			  "\x66\xCF\x38\xC4\x2D\x96\x22\x8B"
+			  "\xF4\x5D\xE9\x52\xBB\x24\xB0\x19"
+			  "\x82\x0E\x77\xE0\x49\xD5\x3E\xA7"
+			  "\x10\x9C\x05\x6E\xFA\x63\xCC\x35"
+			  "\xC1\x2A\x93\x1F\x88\xF1\x5A\xE6"
+			  "\x4F\xB8\x21\xAD\x16\x7F\x0B\x74"
+			  "\xDD\x46\xD2\x3B\xA4\x0D\x99\x02"
+			  "\x6B\xF7\x60\xC9\x32\xBE\x27\x90"
+			  "\x1C\x85\xEE\x57\xE3\x4C\xB5\x1E"
+			  "\xAA\x13\x7C\x08\x71\xDA\x43\xCF"
+			  "\x38\xA1\x0A\x96\xFF\x68\xF4\x5D"
+			  "\xC6\x2F\xBB\x24\x8D\x19\x82\xEB"
+			  "\x54\xE0\x49\xB2\x1B\xA7\x10\x79"
+			  "\x05\x6E\xD7\x40\xCC\x35\x9E\x07"
+			  "\x93\xFC\x65\xF1\x5A\xC3\x2C\xB8"
+			  "\x21\x8A\x16\x7F\xE8\x51\xDD\x46"
+			  "\xAF\x18\xA4\x0D\x76\x02\x6B\xD4"
+			  "\x3D\xC9\x32\x9B\x04\x90\xF9\x62"
+			  "\xEE\x57\xC0\x29\xB5\x1E\x87\x13"
+			  "\x7C\xE5\x4E\xDA\x43\xAC\x15\xA1"
+			  "\x0A\x73\xFF\x68\xD1\x3A\xC6\x2F"
+			  "\x98\x01\x8D\xF6\x5F\xEB\x54\xBD"
+			  "\x26\xB2\x1B\x84\x10\x79\xE2\x4B"
+			  "\xD7\x40\xA9\x12\x9E\x07\x70\xFC"
+			  "\x65\xCE\x37\xC3\x2C\x95\x21\x8A"
+			  "\xF3\x5C\xE8\x51\xBA\x23\xAF\x18"
+			  "\x81\x0D\x76\xDF\x48\xD4\x3D\xA6"
+			  "\x0F\x9B\x04\x6D\xF9\x62\xCB\x34"
+			  "\xC0\x29\x92\x1E\x87\xF0\x59\xE5"
+			  "\x4E\xB7\x20\xAC\x15\x7E\x0A\x73"
+			  "\xDC\x45\xD1\x3A\xA3\x0C\x98\x01"
+			  "\x6A\xF6\x5F\xC8\x31\xBD\x26\x8F"
+			  "\x1B\x84\xED\x56\xE2\x4B\xB4\x1D"
+			  "\xA9\x12\x7B\x07\x70\xD9\x42\xCE"
+			  "\x37\xA0\x09\x95\xFE\x67\xF3\x5C"
+			  "\xC5\x2E\xBA\x23\x8C\x18\x81\xEA"
+			  "\x53\xDF\x48\xB1\x1A\xA6\x0F\x78"
+			  "\x04\x6D\xD6\x3F\xCB\x34\x9D\x06"
+			  "\x92\xFB\x64\xF0\x59\xC2\x2B\xB7"
+			  "\x20\x89\x15\x7E\xE7\x50\xDC\x45"
+			  "\xAE\x17\xA3\x0C\x75\x01\x6A\xD3"
+			  "\x3C\xC8\x31\x9A\x03\x8F\xF8\x61"
+			  "\xED\x56\xBF\x28\xB4\x1D\x86\x12"
+			  "\x7B\xE4\x4D",
+		.ilen	= 499,
+		.result	= "\xDA\x4E\x3F\xBC\xE8\xB6\x3A\xA2"
+			  "\xD5\x4D\x84\x4A\xA9\x0C\xE1\xA5"
+			  "\xB8\x73\xBC\xF9\xBB\x59\x2F\x44"
+			  "\x8B\xAB\x82\x6C\xB4\x32\x9A\xDE"
+			  "\x5A\x0B\xDB\x7A\x6B\xF2\x38\x9F"
+			  "\x06\xF7\xF7\xFF\xFF\xC0\x8A\x2E"
+			  "\x76\xEA\x06\x32\x23\xF3\x59\x2E"
+			  "\x75\xDE\x71\x86\x3C\x98\x23\x44"
+			  "\x5B\xF2\xFA\x6A\x00\xBB\xC1\xAD"
+			  "\x58\xBD\x3E\x6F\x2E\xB4\x19\x04"
+			  "\x70\x8B\x92\x55\x23\xE9\x6A\x3A"
+			  "\x78\x7A\x1B\x10\x85\x52\x9C\x12"
+			  "\xE4\x55\x81\x21\xCE\x53\xD0\x3B"
+			  "\x63\x77\x2C\x74\xD1\xF5\x60\xF3"
+			  "\xA1\xDE\x44\x3C\x8F\x4D\x2F\xDD"
+			  "\x8A\xFE\x3C\x42\x8E\xD3\xF2\x8E"
+			  "\xA8\x28\x69\x65\x31\xE1\x45\x83"
+			  "\xE4\x49\xC4\x9C\xA7\x28\xAA\x21"
+			  "\xCD\x5D\x0F\x15\xB7\x93\x07\x26"
+			  "\xB0\x65\x6D\x91\x90\x23\x7A\xC6"
+			  "\xDB\x68\xB0\xA1\x8E\xA4\x76\x4E"
+			  "\xC6\x91\x83\x20\x92\x4D\x63\x7A"
+			  "\x45\x18\x18\x74\x19\xAD\x71\x01"
+			  "\x6B\x23\xAD\x9D\x4E\xE4\x6E\x46"
+			  "\xC9\x73\x7A\xF9\x02\x95\xF4\x07"
+			  "\x0E\x7A\xA6\xC5\xAE\xFA\x15\x2C"
+			  "\x51\x71\xF1\xDC\x22\xB6\xAC\xD8"
+			  "\x19\x24\x44\xBC\x0C\xFB\x3C\x2D"
+			  "\xB1\x50\x47\x15\x0E\xDB\xB6\xD7"
+			  "\xE8\x61\xE5\x95\x52\x1E\x3E\x49"
+			  "\x70\xE9\x66\x04\x4C\xE1\xAF\xBD"
+			  "\xDD\x15\x3B\x20\x59\x24\xFF\xB0"
+			  "\x39\xAA\xE7\xBF\x23\xA3\x6E\xD5"
+			  "\x15\xF0\x61\x4F\xAE\x89\x10\x58"
+			  "\x5A\x33\x95\x52\x2A\xB5\x77\x9C"
+			  "\xA5\x43\x80\x40\x27\x2D\xAE\xD9"
+			  "\x3F\xE0\x80\x94\x78\x79\xCB\x7E"
+			  "\xAD\x12\x44\x4C\xEC\x27\xB0\xEE"
+			  "\x0B\x05\x2A\x82\x99\x58\xBB\x7A"
+			  "\x8D\x6D\x9D\x8E\xE2\x8E\xE7\x93"
+			  "\x2F\xB3\x09\x8D\x06\xD5\xEE\x70"
+			  "\x16\xAE\x35\xC5\x52\x0F\x46\x1F"
+			  "\x71\xF9\x5E\xF2\x67\xDC\x98\x2F"
+			  "\xA3\x23\xAA\xD5\xD0\x49\xF4\xA6"
+			  "\xF6\xB8\x32\xCD\xD6\x85\x73\x60"
+			  "\x59\x20\xE7\x55\x0E\x91\xE2\x0C"
+			  "\x3F\x1C\xEB\x3D\xDF\x52\x64\xF2"
+			  "\x7D\x8B\x5D\x63\x16\xB9\xB2\x5D"
+			  "\x5E\xAB\xB2\x97\xAB\x78\x44\xE7"
+			  "\xC6\x72\x20\xC5\x90\x9B\xDC\x5D"
+			  "\xB0\xEF\x44\xEF\x87\x31\x8D\xF4"
+			  "\xFB\x81\x5D\xF7\x96\x96\xD4\x50"
+			  "\x89\xA7\xF6\xB9\x67\x76\x40\x9E"
+			  "\x9D\x40\xD5\x2C\x30\xB8\x01\x8F"
+			  "\xE4\x7B\x71\x48\xA9\xA0\xA0\x1D"
+			  "\x87\x52\xA4\x91\xA9\xD7\xA9\x51"
+			  "\xD9\x59\xF7\xCC\x63\x22\xC1\x8D"
+			  "\x84\x7B\xD8\x22\x32\x5C\x6F\x1D"
+			  "\x6E\x9F\xFA\xDD\x49\x40\xDC\x37"
+			  "\x14\x8C\xE1\x80\x1B\xDD\x36\x2A"
+			  "\xD0\xE9\x54\x99\x5D\xBA\x3B\x11"
+			  "\xD8\xFE\xC9\x5B\x5C\x25\xE5\x76"
+			  "\xFB\xF2\x3F",
+		.rlen	= 499,
+		.also_non_np = 1,
+		.np	= 2,
+		.tap	= { 499 - 16, 16 },
 	},
 };
 
-static struct dibx000_agc_config stk7700p_7000p_mt2060_agc_config = {
-	.band_caps = BAND_UHF | BAND_VHF,
-	/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=5, P_agc_inv_pwm1=0, P_agc_inv_pwm2=0,
-	 * P_agc_inh_dc_rv_est=0, P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=2, P_agc_write=0 */
-	.setup = (0 << 15) | (0 << 14) | (5 << 11) | (0 << 10) | (0 << 9) | (0 << 8) | (3 << 5) | (0 << 4) | (2 << 1) | (0 << 0),
-	.inv_gain = 712,
-	.time_stabiliz = 41,
-	.alpha_level = 0,
-	.thlock = 118,
-	.wbd_inv = 0,
-	.wbd_ref = 4095,
-	.wbd_sel = 0,
-	.wbd_alpha = 0,
-	.agc1_max = 42598,
-	.agc1_min = 16384,
-	.agc2_max = 42598,
-	.agc2_min = 0,
-	.agc1_pt1 = 0,
-	.agc1_pt2 = 137,
-	.agc1_pt3 = 255,
-	.agc1_slope1 = 0,
-	.agc1_slope2 = 255,
-	.agc2_pt1 = 0,
-	.agc2_pt2 = 0,
-	.agc2_slope1 = 0,
-	.agc2_slope2 = 41,
-	.alpha_mant = 15,
-	.alpha_exp = 25,
-	.beta_mant = 28,
-	.beta_exp = 48,
-	.perform_agc_softsplit = 0,
-};
-
-static struct dibx000_bandwidth_config stk7700p_pll_config = {
-	.internal = 60000,
-	.sampling = 30000,
-	.pll_prediv = 1,
-	.pll_ratio = 8,
-	.pll_range = 3,
-	.pll_reset = 1,
-	.pll_bypass = 0,
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 1,
-	.ADClkSrc = 1,
-	.modulo = 0,
-	.sad_cfg = (3 << 14) | (1 << 12) | (524 << 0),
-	.ifreq = 60258167,
-	.timf = 20452225,
-	.xtal_hz = 30000000,
-};
-
-static struct dib7000m_config stk7700p_dib7000m_config = {
-	.dvbt_mode = 1,
-	.output_mpeg2_in_188_bytes = 1,
-	.quartz_direct = 1,
-
-	.agc_config_count = 1,
-	.agc = &stk7700p_7000m_mt2060_agc_config,
-	.bw  = &stk7700p_pll_config,
-
-	.gpio_dir = DIB7000M_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val = DIB7000M_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos = DIB7000M_GPIO_DEFAULT_PWM_POS,
-};
-
-static struct dib7000p_config stk7700p_dib7000p_config = {
-	.output_mpeg2_in_188_bytes = 1,
-
-	.agc_config_count = 1,
-	.agc = &stk7700p_7000p_mt2060_agc_config,
-	.bw  = &stk7700p_pll_config,
-
-	.gpio_dir = DIB7000M_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val = DIB7000M_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos = DIB7000M_GPIO_DEFAULT_PWM_POS,
-};
-
-static int stk7700p_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_state *st = adap->dev->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	/* unless there is no real power management in DVB - we leave the device on GPIO6 */
-
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-	dib0700_set_gpio(adap->dev, GPIO6,  GPIO_OUT, 0); msleep(50);
-
-	dib0700_set_gpio(adap->dev, GPIO6,  GPIO_OUT, 1); msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO9,  GPIO_OUT, 1);
-
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0); msleep(10);
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1); msleep(100);
-
-	dib0700_set_gpio(adap->dev,  GPIO0, GPIO_OUT, 1);
-
-	st->mt2060_if1[0] = 1220;
-
-	if (state->dib7000p_ops.dib7000pc_detection(&adap->dev->i2c_adap)) {
-		adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 18, &stk7700p_dib7000p_config);
-		st->is_dib7000pc = 1;
-	} else {
-		memset(&state->dib7000p_ops, 0, sizeof(state->dib7000p_ops));
-		adap->fe_adap[0].fe = dvb_attach(dib7000m_attach, &adap->dev->i2c_adap, 18, &stk7700p_dib7000m_config);
-	}
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static struct mt2060_config stk7700p_mt2060_config = {
-	0x60
-};
-
-static int stk7700p_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct i2c_adapter *prim_i2c = &adap->dev->i2c_adap;
-	struct dib0700_state *st = adap->dev->priv;
-	struct i2c_adapter *tun_i2c;
-	struct dib0700_adapter_state *state = adap->priv;
-	s8 a;
-	int if1=1220;
-
-	if (adap->dev->udev->descriptor.idVendor  == cpu_to_le16(USB_VID_HAUPPAUGE) &&
-		adap->dev->udev->descriptor.idProduct == cpu_to_le16(USB_PID_HAUPPAUGE_NOVA_T_STICK)) {
-		if (!eeprom_read(prim_i2c,0x58,&a)) if1=1220+a;
-	}
-	if (st->is_dib7000pc)
-		tun_i2c = state->dib7000p_ops.get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_TUNER, 1);
-	else
-		tun_i2c = dib7000m_get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_TUNER, 1);
-
-	return dvb_attach(mt2060_attach, adap->fe_adap[0].fe, tun_i2c, &stk7700p_mt2060_config,
-		if1) == NULL ? -ENODEV : 0;
-}
-
-/* DIB7070 generic */
-static struct dibx000_agc_config dib7070_agc_config = {
-	.band_caps = BAND_UHF | BAND_VHF | BAND_LBAND | BAND_SBAND,
-	/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=5, P_agc_inv_pwm1=0, P_agc_inv_pwm2=0,
-	 * P_agc_inh_dc_rv_est=0, P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5, P_agc_write=0 */
-	.setup = (0 << 15) | (0 << 14) | (5 << 11) | (0 << 10) | (0 << 9) | (0 << 8) | (3 << 5) | (0 << 4) | (5 << 1) | (0 << 0),
-	.inv_gain = 600,
-	.time_stabiliz = 10,
-	.alpha_level = 0,
-	.thlock = 118,
-	.wbd_inv = 0,
-	.wbd_ref = 3530,
-	.wbd_sel = 1,
-	.wbd_alpha = 5,
-	.agc1_max = 65535,
-	.agc1_min = 0,
-	.agc2_max = 65535,
-	.agc2_min = 0,
-	.agc1_pt1 = 0,
-	.agc1_pt2 = 40,
-	.agc1_pt3 = 183,
-	.agc1_slope1 = 206,
-	.agc1_slope2 = 255,
-	.agc2_pt1 = 72,
-	.agc2_pt2 = 152,
-	.agc2_slope1 = 88,
-	.agc2_slope2 = 90,
-	.alpha_mant = 17,
-	.alpha_exp = 27,
-	.beta_mant = 23,
-	.beta_exp = 51,
-	.perform_agc_softsplit = 0,
-};
-
-static int dib7070_tuner_reset(struct dvb_frontend *fe, int onoff)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	deb_info("reset: %d", onoff);
-	return state->dib7000p_ops.set_gpio(fe, 8, 0, !onoff);
-}
-
-static int dib7070_tuner_sleep(struct dvb_frontend *fe, int onoff)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	deb_info("sleep: %d", onoff);
-	return state->dib7000p_ops.set_gpio(fe, 9, 0, onoff);
-}
-
-static struct dib0070_config dib7070p_dib0070_config[2] = {
-	{
-		.i2c_address = DEFAULT_DIB0070_I2C_ADDRESS,
-		.reset = dib7070_tuner_reset,
-		.sleep = dib7070_tuner_sleep,
-		.clock_khz = 12000,
-		.clock_pad_drive = 4,
-		.charge_pump = 2,
+static struct cipher_testvec aes_ctr_dec_tv_template[] = {
+	{ /* From NIST Special Publication 800-38A, Appendix F.5 */
+		.key	= "\x2b\x7e\x15\x16\x28\xae\xd2\xa6"
+			  "\xab\xf7\x15\x88\x09\xcf\x4f\x3c",
+		.klen	= 16,
+		.iv	= "\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7"
+			  "\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff",
+		.input	= "\x87\x4d\x61\x91\xb6\x20\xe3\x26"
+			  "\x1b\xef\x68\x64\x99\x0d\xb6\xce"
+			  "\x98\x06\xf6\x6b\x79\x70\xfd\xff"
+			  "\x86\x17\x18\x7b\xb9\xff\xfd\xff"
+			  "\x5a\xe4\xdf\x3e\xdb\xd5\xd3\x5e"
+			  "\x5b\x4f\x09\x02\x0d\xb0\x3e\xab"
+			  "\x1e\x03\x1d\xda\x2f\xbe\x03\xd1"
+			  "\x79\x21\x70\xa0\xf3\x00\x9c\xee",
+		.ilen	= 64,
+		.result	= "\x6b\xc1\xbe\xe2\x2e\x40\x9f\x96"
+			  "\xe9\x3d\x7e\x11\x73\x93\x17\x2a"
+			  "\xae\x2d\x8a\x57\x1e\x03\xac\x9c"
+			  "\x9e\xb7\x6f\xac\x45\xaf\x8e\x51"
+			  "\x30\xc8\x1c\x46\xa3\x5c\xe4\x11"
+			  "\xe5\xfb\xc1\x19\x1a\x0a\x52\xef"
+			  "\xf6\x9f\x24\x45\xdf\x4f\x9b\x17"
+			  "\xad\x2b\x41\x7b\xe6\x6c\x37\x10",
+		.rlen	= 64,
 	}, {
-		.i2c_address = DEFAULT_DIB0070_I2C_ADDRESS,
-		.reset = dib7070_tuner_reset,
-		.sleep = dib7070_tuner_sleep,
-		.clock_khz = 12000,
-		.charge_pump = 2,
-	}
-};
-
-static struct dib0070_config dib7770p_dib0070_config = {
-	 .i2c_address = DEFAULT_DIB0070_I2C_ADDRESS,
-	 .reset = dib7070_tuner_reset,
-	 .sleep = dib7070_tuner_sleep,
-	 .clock_khz = 12000,
-	 .clock_pad_drive = 0,
-	 .flip_chip = 1,
-	 .charge_pump = 2,
-};
-
-static int dib7070_set_param_override(struct dvb_frontend *fe)
-{
-	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	u16 offset;
-	u8 band = BAND_OF_FREQUENCY(p->frequency/1000);
-	switch (band) {
-		case BAND_VHF: offset = 950; break;
-		case BAND_UHF:
-		default: offset = 550; break;
-	}
-	deb_info("WBD for DiB7000P: %d\n", offset + dib0070_wbd_offset(fe));
-	state->dib7000p_ops.set_wbd_ref(fe, offset + dib0070_wbd_offset(fe));
-	return state->set_param_save(fe);
-}
-
-static int dib7770_set_param_override(struct dvb_frontend *fe)
-{
-	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	u16 offset;
-	u8 band = BAND_OF_FREQUENCY(p->frequency/1000);
-	switch (band) {
-	case BAND_VHF:
-		state->dib7000p_ops.set_gpio(fe, 0, 0, 1);
-		offset = 850;
-		break;
-	case BAND_UHF:
-	default:
-		state->dib7000p_ops.set_gpio(fe, 0, 0, 0);
-		offset = 250;
-		break;
-	}
-	deb_info("WBD for DiB7000P: %d\n", offset + dib0070_wbd_offset(fe));
-	state->dib7000p_ops.set_wbd_ref(fe, offset + dib0070_wbd_offset(fe));
-	return state->set_param_save(fe);
-}
-
-static int dib7770p_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c = st->dib7000p_ops.get_i2c_master(adap->fe_adap[0].fe,
-			 DIBX000_I2C_INTERFACE_TUNER, 1);
-
-	if (dvb_attach(dib0070_attach, adap->fe_adap[0].fe, tun_i2c,
-		       &dib7770p_dib0070_config) == NULL)
-		return -ENODEV;
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib7770_set_param_override;
-	return 0;
-}
-
-static int dib7070p_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c = st->dib7000p_ops.get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_TUNER, 1);
-
-	if (adap->id == 0) {
-		if (dvb_attach(dib0070_attach, adap->fe_adap[0].fe, tun_i2c, &dib7070p_dib0070_config[0]) == NULL)
-			return -ENODEV;
-	} else {
-		if (dvb_attach(dib0070_attach, adap->fe_adap[0].fe, tun_i2c, &dib7070p_dib0070_config[1]) == NULL)
-			return -ENODEV;
-	}
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib7070_set_param_override;
-	return 0;
-}
-
-static int stk7700p_pid_filter(struct dvb_usb_adapter *adapter, int index,
-		u16 pid, int onoff)
-{
-	struct dib0700_adapter_state *state = adapter->priv;
-	struct dib0700_state *st = adapter->dev->priv;
-
-	if (st->is_dib7000pc)
-		return state->dib7000p_ops.pid_filter(adapter->fe_adap[0].fe, index, pid, onoff);
-	return dib7000m_pid_filter(adapter->fe_adap[0].fe, index, pid, onoff);
-}
-
-static int stk7700p_pid_filter_ctrl(struct dvb_usb_adapter *adapter, int onoff)
-{
-	struct dib0700_state *st = adapter->dev->priv;
-	struct dib0700_adapter_state *state = adapter->priv;
-	if (st->is_dib7000pc)
-		return state->dib7000p_ops.pid_filter_ctrl(adapter->fe_adap[0].fe, onoff);
-	return dib7000m_pid_filter_ctrl(adapter->fe_adap[0].fe, onoff);
-}
-
-static int stk70x0p_pid_filter(struct dvb_usb_adapter *adapter, int index, u16 pid, int onoff)
-{
-	struct dib0700_adapter_state *state = adapter->priv;
-	return state->dib7000p_ops.pid_filter(adapter->fe_adap[0].fe, index, pid, onoff);
-}
-
-static int stk70x0p_pid_filter_ctrl(struct dvb_usb_adapter *adapter, int onoff)
-{
-	struct dib0700_adapter_state *state = adapter->priv;
-	return state->dib7000p_ops.pid_filter_ctrl(adapter->fe_adap[0].fe, onoff);
-}
-
-static struct dibx000_bandwidth_config dib7070_bw_config_12_mhz = {
-	.internal = 60000,
-	.sampling = 15000,
-	.pll_prediv = 1,
-	.pll_ratio = 20,
-	.pll_range = 3,
-	.pll_reset = 1,
-	.pll_bypass = 0,
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 1,
-	.ADClkSrc = 1,
-	.modulo = 2,
-	.sad_cfg = (3 << 14) | (1 << 12) | (524 << 0),
-	.ifreq = (0 << 25) | 0,
-	.timf = 20452225,
-	.xtal_hz = 12000000,
-};
-
-static struct dib7000p_config dib7070p_dib7000p_config = {
-	.output_mpeg2_in_188_bytes = 1,
-
-	.agc_config_count = 1,
-	.agc = &dib7070_agc_config,
-	.bw  = &dib7070_bw_config_12_mhz,
-	.tuner_is_baseband = 1,
-	.spur_protect = 1,
-
-	.gpio_dir = DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val = DIB7000P_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos = DIB7000P_GPIO_DEFAULT_PWM_POS,
-
-	.hostbus_diversity = 1,
-};
-
-/* STK7070P */
-static int stk7070p_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct usb_device_descriptor *p = &adap->dev->udev->descriptor;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	if (p->idVendor  == cpu_to_le16(USB_VID_PINNACLE) &&
-	    p->idProduct == cpu_to_le16(USB_PID_PINNACLE_PCTV72E))
-		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
-	else
-		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 18,
-				     &dib7070p_dib7000p_config) != 0) {
-		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
-		    __func__);
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x80,
-		&dib7070p_dib7000p_config);
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-/* STK7770P */
-static struct dib7000p_config dib7770p_dib7000p_config = {
-	.output_mpeg2_in_188_bytes = 1,
-
-	.agc_config_count = 1,
-	.agc = &dib7070_agc_config,
-	.bw  = &dib7070_bw_config_12_mhz,
-	.tuner_is_baseband = 1,
-	.spur_protect = 1,
-
-	.gpio_dir = DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val = DIB7000P_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos = DIB7000P_GPIO_DEFAULT_PWM_POS,
-
-	.hostbus_diversity = 1,
-	.enable_current_mirror = 1,
-	.disable_sample_and_hold = 0,
-};
-
-static int stk7770p_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct usb_device_descriptor *p = &adap->dev->udev->descriptor;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	if (p->idVendor  == cpu_to_le16(USB_VID_PINNACLE) &&
-	    p->idProduct == cpu_to_le16(USB_PID_PINNACLE_PCTV72E))
-		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
-	else
-		dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 18,
-				     &dib7770p_dib7000p_config) != 0) {
-		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
-		    __func__);
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x80,
-		&dib7770p_dib7000p_config);
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-/* DIB807x generic */
-static struct dibx000_agc_config dib807x_agc_config[2] = {
-	{
-		BAND_VHF,
-		/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0,
-		 * P_agc_freq_pwm_div=1, P_agc_inv_pwm1=0,
-		 * P_agc_inv_pwm2=0,P_agc_inh_dc_rv_est=0,
-		 * P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5,
-		 * P_agc_write=0 */
-		(0 << 15) | (0 << 14) | (7 << 11) | (0 << 10) | (0 << 9) |
-			(0 << 8) | (3 << 5) | (0 << 4) | (5 << 1) |
-			(0 << 0), /* setup*/
-
-		600, /* inv_gain*/
-		10,  /* time_stabiliz*/
-
-		0,  /* alpha_level*/
-		118,  /* thlock*/
-
-		0,     /* wbd_inv*/
-		3530,  /* wbd_ref*/
-		1,     /* wbd_sel*/
-		5,     /* wbd_alpha*/
-
-		65535,  /* agc1_max*/
-		0,  /* agc1_min*/
-
-		65535,  /* agc2_max*/
-		0,      /* agc2_min*/
-
-		0,      /* agc1_pt1*/
-		40,     /* agc1_pt2*/
-		183,    /* agc1_pt3*/
-		206,    /* agc1_slope1*/
-		255,    /* agc1_slope2*/
-		72,     /* agc2_pt1*/
-		152,    /* agc2_pt2*/
-		88,     /* agc2_slope1*/
-		90,     /* agc2_slope2*/
-
-		17,  /* alpha_mant*/
-		27,  /* alpha_exp*/
-		23,  /* beta_mant*/
-		51,  /* beta_exp*/
-
-		0,  /* perform_agc_softsplit*/
+		.key	= "\x8e\x73\xb0\xf7\xda\x0e\x64\x52"
+			  "\xc8\x10\xf3\x2b\x80\x90\x79\xe5"
+			  "\x62\xf8\xea\xd2\x52\x2c\x6b\x7b",
+		.klen	= 24,
+		.iv	= "\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7"
+			  "\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff",
+		.input	= "\x1a\xbc\x93\x24\x17\x52\x1c\xa2"
+			  "\x4f\x2b\x04\x59\xfe\x7e\x6e\x0b"
+			  "\x09\x03\x39\xec\x0a\xa6\xfa\xef"
+			  "\xd5\xcc\xc2\xc6\xf4\xce\x8e\x94"
+			  "\x1e\x36\xb2\x6b\xd1\xeb\xc6\x70"
+			  "\xd1\xbd\x1d\x66\x56\x20\xab\xf7"
+			  "\x4f\x78\xa7\xf6\xd2\x98\x09\x58"
+			  "\x5a\x97\xda\xec\x58\xc6\xb0\x50",
+		.ilen	= 64,
+		.result	= "\x6b\xc1\xbe\xe2\x2e\x40\x9f\x96"
+			  "\xe9\x3d\x7e\x11\x73\x93\x17\x2a"
+			  "\xae\x2d\x8a\x57\x1e\x03\xac\x9c"
+			  "\x9e\xb7\x6f\xac\x45\xaf\x8e\x51"
+			  "\x30\xc8\x1c\x46\xa3\x5c\xe4\x11"
+			  "\xe5\xfb\xc1\x19\x1a\x0a\x52\xef"
+			  "\xf6\x9f\x24\x45\xdf\x4f\x9b\x17"
+			  "\xad\x2b\x41\x7b\xe6\x6c\x37\x10",
+		.rlen	= 64,
 	}, {
-		BAND_UHF,
-		/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0,
-		 * P_agc_freq_pwm_div=1, P_agc_inv_pwm1=0,
-		 * P_agc_inv_pwm2=0, P_agc_inh_dc_rv_est=0,
-		 * P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5,
-		 * P_agc_write=0 */
-		(0 << 15) | (0 << 14) | (1 << 11) | (0 << 10) | (0 << 9) |
-			(0 << 8) | (3 << 5) | (0 << 4) | (5 << 1) |
-			(0 << 0), /* setup */
-
-		600, /* inv_gain*/
-		10,  /* time_stabiliz*/
-
-		0,  /* alpha_level*/
-		118,  /* thlock*/
-
-		0,     /* wbd_inv*/
-		3530,  /* wbd_ref*/
-		1,     /* wbd_sel*/
-		5,     /* wbd_alpha*/
-
-		65535,  /* agc1_max*/
-		0,  /* agc1_min*/
-
-		65535,  /* agc2_max*/
-		0,      /* agc2_min*/
-
-		0,      /* agc1_pt1*/
-		40,     /* agc1_pt2*/
-		183,    /* agc1_pt3*/
-		206,    /* agc1_slope1*/
-		255,    /* agc1_slope2*/
-		72,     /* agc2_pt1*/
-		152,    /* agc2_pt2*/
-		88,     /* agc2_slope1*/
-		90,     /* agc2_slope2*/
-
-		17,  /* alpha_mant*/
-		27,  /* alpha_exp*/
-		23,  /* beta_mant*/
-		51,  /* beta_exp*/
-
-		0,  /* perform_agc_softsplit*/
-	}
-};
-
-static struct dibx000_bandwidth_config dib807x_bw_config_12_mhz = {
-	.internal = 60000,
-	.sampling = 15000,
-	.pll_prediv = 1,
-	.pll_ratio = 20,
-	.pll_range = 3,
-	.pll_reset = 1,
-	.pll_bypass = 0,
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 1,
-	.ADClkSrc = 1,
-	.modulo = 2,
-	.sad_cfg = (3 << 14) | (1 << 12) | (599 << 0),	/* sad_cfg: refsel, sel, freq_15k*/
-	.ifreq = (0 << 25) | 0,				/* ifreq = 0.000000 MHz*/
-	.timf = 18179755,
-	.xtal_hz = 12000000,
-};
-
-static struct dib8000_config dib807x_dib8000_config[2] = {
-	{
-		.output_mpeg2_in_188_bytes = 1,
-
-		.agc_config_count = 2,
-		.agc = dib807x_agc_config,
-		.pll = &dib807x_bw_config_12_mhz,
-		.tuner_is_baseband = 1,
-
-		.gpio_dir = DIB8000_GPIO_DEFAULT_DIRECTIONS,
-		.gpio_val = DIB8000_GPIO_DEFAULT_VALUES,
-		.gpio_pwm_pos = DIB8000_GPIO_DEFAULT_PWM_POS,
-
-		.hostbus_diversity = 1,
-		.div_cfg = 1,
-		.agc_control = &dib0070_ctrl_agc_filter,
-		.output_mode = OUTMODE_MPEG2_FIFO,
-		.drives = 0x2d98,
-	}, {
-		.output_mpeg2_in_188_bytes = 1,
-
-		.agc_config_count = 2,
-		.agc = dib807x_agc_config,
-		.pll = &dib807x_bw_config_12_mhz,
-		.tuner_is_baseband = 1,
-
-		.gpio_dir = DIB8000_GPIO_DEFAULT_DIRECTIONS,
-		.gpio_val = DIB8000_GPIO_DEFAULT_VALUES,
-		.gpio_pwm_pos = DIB8000_GPIO_DEFAULT_PWM_POS,
-
-		.hostbus_diversity = 1,
-		.agc_control = &dib0070_ctrl_agc_filter,
-		.output_mode = OUTMODE_MPEG2_FIFO,
-		.drives = 0x2d98,
-	}
-};
-
-static int dib80xx_tuner_reset(struct dvb_frontend *fe, int onoff)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	return state->dib8000_ops.set_gpio(fe, 5, 0, !onoff);
-}
-
-static int dib80xx_tuner_sleep(struct dvb_frontend *fe, int onoff)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	return state->dib8000_ops.set_gpio(fe, 0, 0, onoff);
-}
-
-static const struct dib0070_wbd_gain_cfg dib8070_wbd_gain_cfg[] = {
-    { 240,      7},
-    { 0xffff,   6},
-};
-
-static struct dib0070_config dib807x_dib0070_config[2] = {
-	{
-		.i2c_address = DEFAULT_DIB0070_I2C_ADDRESS,
-		.reset = dib80xx_tuner_reset,
-		.sleep = dib80xx_tuner_sleep,
-		.clock_khz = 12000,
-		.clock_pad_drive = 4,
-		.vga_filter = 1,
-		.force_crystal_mode = 1,
-		.enable_third_order_filter = 1,
-		.charge_pump = 0,
-		.wbd_gain = dib8070_wbd_gain_cfg,
-		.osc_buffer_state = 0,
-		.freq_offset_khz_uhf = -100,
-		.freq_offset_khz_vhf = -100,
-	}, {
-		.i2c_address = DEFAULT_DIB0070_I2C_ADDRESS,
-		.reset = dib80xx_tuner_reset,
-		.sleep = dib80xx_tuner_sleep,
-		.clock_khz = 12000,
-		.clock_pad_drive = 2,
-		.vga_filter = 1,
-		.force_crystal_mode = 1,
-		.enable_third_order_filter = 1,
-		.charge_pump = 0,
-		.wbd_gain = dib8070_wbd_gain_cfg,
-		.osc_buffer_state = 0,
-		.freq_offset_khz_uhf = -25,
-		.freq_offset_khz_vhf = -25,
-	}
-};
-
-static int dib807x_set_param_override(struct dvb_frontend *fe)
-{
-	struct dtv_frontend_properties *p = &fe->dtv_property_cache;
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	u16 offset = dib0070_wbd_offset(fe);
-	u8 band = BAND_OF_FREQUENCY(p->frequency/1000);
-	switch (band) {
-	case BAND_VHF:
-		offset += 750;
-		break;
-	case BAND_UHF:  /* fall-thru wanted */
-	default:
-		offset += 250; break;
-	}
-	deb_info("WBD for DiB8000: %d\n", offset);
-	state->dib8000_ops.set_wbd_ref(fe, offset);
-
-	return state->set_param_save(fe);
-}
-
-static int dib807x_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c = st->dib8000_ops.get_i2c_master(adap->fe_adap[0].fe,
-			DIBX000_I2C_INTERFACE_TUNER, 1);
-
-	if (adap->id == 0) {
-		if (dvb_attach(dib0070_attach, adap->fe_adap[0].fe, tun_i2c,
-				&dib807x_dib0070_config[0]) == NULL)
-			return -ENODEV;
-	} else {
-		if (dvb_attach(dib0070_attach, adap->fe_adap[0].fe, tun_i2c,
-				&dib807x_dib0070_config[1]) == NULL)
-			return -ENODEV;
-	}
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib807x_set_param_override;
-	return 0;
-}
-
-static int stk80xx_pid_filter(struct dvb_usb_adapter *adapter, int index,
-	u16 pid, int onoff)
-{
-	struct dib0700_adapter_state *state = adapter->priv;
-
-	return state->dib8000_ops.pid_filter(adapter->fe_adap[0].fe, index, pid, onoff);
-}
-
-static int stk80xx_pid_filter_ctrl(struct dvb_usb_adapter *adapter,
-		int onoff)
-{
-	struct dib0700_adapter_state *state = adapter->priv;
-
-	return state->dib8000_ops.pid_filter_ctrl(adapter->fe_adap[0].fe, onoff);
-}
-
-/* STK807x */
-static int stk807x_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib8000_attach, &state->dib8000_ops))
-		return -ENODEV;
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	state->dib8000_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 18,
-				0x80, 0);
-
-	adap->fe_adap[0].fe = state->dib8000_ops.init(&adap->dev->i2c_adap, 0x80,
-			      &dib807x_dib8000_config[0]);
-
-	return adap->fe_adap[0].fe == NULL ?  -ENODEV : 0;
-}
-
-/* STK807xPVR */
-static int stk807xpvr_frontend_attach0(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib8000_attach, &state->dib8000_ops))
-		return -ENODEV;
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
-	msleep(30);
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(500);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	/* initialize IC 0 */
-	state->dib8000_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 0x22, 0x80, 0);
-
-	adap->fe_adap[0].fe = state->dib8000_ops.init(&adap->dev->i2c_adap, 0x80,
-			      &dib807x_dib8000_config[0]);
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int stk807xpvr_frontend_attach1(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib8000_attach, &state->dib8000_ops))
-		return -ENODEV;
-
-	/* initialize IC 1 */
-	state->dib8000_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 0x12, 0x82, 0);
-
-	adap->fe_adap[0].fe = state->dib8000_ops.init(&adap->dev->i2c_adap, 0x82,
-			      &dib807x_dib8000_config[1]);
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-/* STK8096GP */
-static struct dibx000_agc_config dib8090_agc_config[2] = {
-	{
-	.band_caps = BAND_UHF | BAND_VHF | BAND_LBAND | BAND_SBAND,
-	/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=1,
-	 * P_agc_inv_pwm1=0, P_agc_inv_pwm2=0, P_agc_inh_dc_rv_est=0,
-	 * P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5, P_agc_write=0 */
-	.setup = (0 << 15) | (0 << 14) | (5 << 11) | (0 << 10) | (0 << 9) | (0 << 8)
-	| (3 << 5) | (0 << 4) | (5 << 1) | (0 << 0),
-
-	.inv_gain = 787,
-	.time_stabiliz = 10,
-
-	.alpha_level = 0,
-	.thlock = 118,
-
-	.wbd_inv = 0,
-	.wbd_ref = 3530,
-	.wbd_sel = 1,
-	.wbd_alpha = 5,
-
-	.agc1_max = 65535,
-	.agc1_min = 0,
-
-	.agc2_max = 65535,
-	.agc2_min = 0,
-
-	.agc1_pt1 = 0,
-	.agc1_pt2 = 32,
-	.agc1_pt3 = 114,
-	.agc1_slope1 = 143,
-	.agc1_slope2 = 144,
-	.agc2_pt1 = 114,
-	.agc2_pt2 = 227,
-	.agc2_slope1 = 116,
-	.agc2_slope2 = 117,
-
-	.alpha_mant = 28,
-	.alpha_exp = 26,
-	.beta_mant = 31,
-	.beta_exp = 51,
-
-	.perform_agc_softsplit = 0,
-	},
-	{
-	.band_caps = BAND_CBAND,
-	/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=1,
-	 * P_agc_inv_pwm1=0, P_agc_inv_pwm2=0, P_agc_inh_dc_rv_est=0,
-	 * P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5, P_agc_write=0 */
-	.setup = (0 << 15) | (0 << 14) | (5 << 11) | (0 << 10) | (0 << 9) | (0 << 8)
-	| (3 << 5) | (0 << 4) | (5 << 1) | (0 << 0),
-
-	.inv_gain = 787,
-	.time_stabiliz = 10,
-
-	.alpha_level = 0,
-	.thlock = 118,
-
-	.wbd_inv = 0,
-	.wbd_ref = 3530,
-	.wbd_sel = 1,
-	.wbd_alpha = 5,
-
-	.agc1_max = 0,
-	.agc1_min = 0,
-
-	.agc2_max = 65535,
-	.agc2_min = 0,
-
-	.agc1_pt1 = 0,
-	.agc1_pt2 = 32,
-	.agc1_pt3 = 114,
-	.agc1_slope1 = 143,
-	.agc1_slope2 = 144,
-	.agc2_pt1 = 114,
-	.agc2_pt2 = 227,
-	.agc2_slope1 = 116,
-	.agc2_slope2 = 117,
-
-	.alpha_mant = 28,
-	.alpha_exp = 26,
-	.beta_mant = 31,
-	.beta_exp = 51,
-
-	.perform_agc_softsplit = 0,
-	}
-};
-
-static struct dibx000_bandwidth_config dib8090_pll_config_12mhz = {
-	.internal = 54000,
-	.sampling = 13500,
-
-	.pll_prediv = 1,
-	.pll_ratio = 18,
-	.pll_range = 3,
-	.pll_reset = 1,
-	.pll_bypass = 0,
-
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 1,
-	.ADClkSrc = 1,
-	.modulo = 2,
-
-	.sad_cfg = (3 << 14) | (1 << 12) | (599 << 0),
-
-	.ifreq = (0 << 25) | 0,
-	.timf = 20199727,
-
-	.xtal_hz = 12000000,
-};
-
-static int dib8090_get_adc_power(struct dvb_frontend *fe)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	return state->dib8000_ops.get_adc_power(fe, 1);
-}
-
-static void dib8090_agc_control(struct dvb_frontend *fe, u8 restart)
-{
-	deb_info("AGC control callback: %i\n", restart);
-	dib0090_dcc_freq(fe, restart);
-
-	if (restart == 0) /* before AGC startup */
-		dib0090_set_dc_servo(fe, 1);
-}
-
-static struct dib8000_config dib809x_dib8000_config[2] = {
-	{
-	.output_mpeg2_in_188_bytes = 1,
-
-	.agc_config_count = 2,
-	.agc = dib8090_agc_config,
-	.agc_control = dib8090_agc_control,
-	.pll = &dib8090_pll_config_12mhz,
-	.tuner_is_baseband = 1,
-
-	.gpio_dir = DIB8000_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val = DIB8000_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos = DIB8000_GPIO_DEFAULT_PWM_POS,
-
-	.hostbus_diversity = 1,
-	.div_cfg = 0x31,
-	.output_mode = OUTMODE_MPEG2_FIFO,
-	.drives = 0x2d98,
-	.diversity_delay = 48,
-	.refclksel = 3,
-	}, {
-	.output_mpeg2_in_188_bytes = 1,
-
-	.agc_config_count = 2,
-	.agc = dib8090_agc_config,
-	.agc_control = dib8090_agc_control,
-	.pll = &dib8090_pll_config_12mhz,
-	.tuner_is_baseband = 1,
-
-	.gpio_dir = DIB8000_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val = DIB8000_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos = DIB8000_GPIO_DEFAULT_PWM_POS,
-
-	.hostbus_diversity = 1,
-	.div_cfg = 0x31,
-	.output_mode = OUTMODE_DIVERSITY,
-	.drives = 0x2d08,
-	.diversity_delay = 1,
-	.refclksel = 3,
-	}
-};
-
-static struct dib0090_wbd_slope dib8090_wbd_table[] = {
-	/* max freq ; cold slope ; cold offset ; warm slope ; warm offset ; wbd gain */
-	{ 120,     0, 500,  0,   500, 4 }, /* CBAND */
-	{ 170,     0, 450,  0,   450, 4 }, /* CBAND */
-	{ 380,    48, 373, 28,   259, 6 }, /* VHF */
-	{ 860,    34, 700, 36,   616, 6 }, /* high UHF */
-	{ 0xFFFF, 34, 700, 36,   616, 6 }, /* default */
-};
-
-static struct dib0090_config dib809x_dib0090_config = {
-	.io.pll_bypass = 1,
-	.io.pll_range = 1,
-	.io.pll_prediv = 1,
-	.io.pll_loopdiv = 20,
-	.io.adc_clock_ratio = 8,
-	.io.pll_int_loop_filt = 0,
-	.io.clock_khz = 12000,
-	.reset = dib80xx_tuner_reset,
-	.sleep = dib80xx_tuner_sleep,
-	.clkouttobamse = 1,
-	.analog_output = 1,
-	.i2c_address = DEFAULT_DIB0090_I2C_ADDRESS,
-	.use_pwm_agc = 1,
-	.clkoutdrive = 1,
-	.get_adc_power = dib8090_get_adc_power,
-	.freq_offset_khz_uhf = -63,
-	.freq_offset_khz_vhf = -143,
-	.wbd = dib8090_wbd_table,
-	.fref_clock_ratio = 6,
-};
-
-static u8 dib8090_compute_pll_parameters(struct dvb_frontend *fe)
-{
-	u8 optimal_pll_ratio = 20;
-	u32 freq_adc, ratio, rest, max = 0;
-	u8 pll_ratio;
-
-	for (pll_ratio = 17; pll_ratio <= 20; pll_ratio++) {
-		freq_adc = 12 * pll_ratio * (1 << 8) / 16;
-		ratio = ((fe->dtv_property_cache.frequency / 1000) * (1 << 8) / 1000) / freq_adc;
-		rest = ((fe->dtv_property_cache.frequency / 1000) * (1 << 8) / 1000) - ratio * freq_adc;
-
-		if (rest > freq_adc / 2)
-			rest = freq_adc - rest;
-		deb_info("PLL ratio=%i rest=%i\n", pll_ratio, rest);
-		if ((rest > max) && (rest > 717)) {
-			optimal_pll_ratio = pll_ratio;
-			max = rest;
-		}
-	}
-	deb_info("optimal PLL ratio=%i\n", optimal_pll_ratio);
-
-	return optimal_pll_ratio;
-}
-
-static int dib8096_set_param_override(struct dvb_frontend *fe)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-	u8 pll_ratio, band = BAND_OF_FREQUENCY(fe->dtv_property_cache.frequency / 1000);
-	u16 target, ltgain, rf_gain_limit;
-	u32 timf;
-	int ret = 0;
-	enum frontend_tune_state tune_state = CT_SHUTDOWN;
-
-	switch (band) {
-	default:
-			deb_info("Warning : Rf frequency  (%iHz) is not in the supported range, using VHF switch ", fe->dtv_property_cache.frequency);
-	case BAND_VHF:
-			state->dib8000_ops.set_gpio(fe, 3, 0, 1);
-			break;
-	case BAND_UHF:
-			state->dib8000_ops.set_gpio(fe, 3, 0, 0);
-			break;
-	}
-
-	ret = state->set_param_save(fe);
-	if (ret < 0)
-		return ret;
-
-	if (fe->dtv_property_cache.bandwidth_hz != 6000000) {
-		deb_info("only 6MHz bandwidth is supported\n");
-		return -EINVAL;
-	}
-
-	/** Update PLL if needed ratio **/
-	state->dib8000_ops.update_pll(fe, &dib8090_pll_config_12mhz, fe->dtv_property_cache.bandwidth_hz / 1000, 0);
-
-	/** Get optimize PLL ratio to remove spurious **/
-	pll_ratio = dib8090_compute_pll_parameters(fe);
-	if (pll_ratio == 17)
-		timf = 21387946;
-	else if (pll_ratio == 18)
-		timf = 20199727;
-	else if (pll_ratio == 19)
-		timf = 19136583;
-	else
-		timf = 18179756;
-
-	/** Update ratio **/
-	state->dib8000_ops.update_pll(fe, &dib8090_pll_config_12mhz, fe->dtv_property_cache.bandwidth_hz / 1000, pll_ratio);
-
-	state->dib8000_ops.ctrl_timf(fe, DEMOD_TIMF_SET, timf);
-
-	if (band != BAND_CBAND) {
-		/* dib0090_get_wbd_target is returning any possible temperature compensated wbd-target */
-		target = (dib0090_get_wbd_target(fe) * 8 * 18 / 33 + 1) / 2;
-		state->dib8000_ops.set_wbd_ref(fe, target);
-	}
-
-	if (band == BAND_CBAND) {
-		deb_info("tuning in CBAND - soft-AGC startup\n");
-		dib0090_set_tune_state(fe, CT_AGC_START);
-
-		do {
-			ret = dib0090_gain_control(fe);
-			msleep(ret);
-			tune_state = dib0090_get_tune_state(fe);
-			if (tune_state == CT_AGC_STEP_0)
-				state->dib8000_ops.set_gpio(fe, 6, 0, 1);
-			else if (tune_state == CT_AGC_STEP_1) {
-				dib0090_get_current_gain(fe, NULL, NULL, &rf_gain_limit, &ltgain);
-				if (rf_gain_limit < 2000) /* activate the external attenuator in case of very high input power */
-					state->dib8000_ops.set_gpio(fe, 6, 0, 0);
-			}
-		} while (tune_state < CT_AGC_STOP);
-
-		deb_info("switching to PWM AGC\n");
-		dib0090_pwm_gain_reset(fe);
-		state->dib8000_ops.pwm_agc_reset(fe);
-		state->dib8000_ops.set_tune_state(fe, CT_DEMOD_START);
-	} else {
-		/* for everything else than CBAND we are using standard AGC */
-		deb_info("not tuning in CBAND - standard AGC startup\n");
-		dib0090_pwm_gain_reset(fe);
-	}
-
-	return 0;
-}
-
-static int dib809x_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c = st->dib8000_ops.get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_TUNER, 1);
-
-	if (dvb_attach(dib0090_register, adap->fe_adap[0].fe, tun_i2c, &dib809x_dib0090_config) == NULL)
-		return -ENODEV;
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib8096_set_param_override;
-	return 0;
-}
-
-static int stk809x_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib8000_attach, &state->dib8000_ops))
-		return -ENODEV;
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	state->dib8000_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 18, 0x80, 0);
-
-	adap->fe_adap[0].fe = state->dib8000_ops.init(&adap->dev->i2c_adap, 0x80, &dib809x_dib8000_config[0]);
-
-	return adap->fe_adap[0].fe == NULL ?  -ENODEV : 0;
-}
-
-static int nim8096md_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c;
-	struct dvb_frontend *fe_slave  = st->dib8000_ops.get_slave_frontend(adap->fe_adap[0].fe, 1);
-
-	if (fe_slave) {
-		tun_i2c = st->dib8000_ops.get_i2c_master(fe_slave, DIBX000_I2C_INTERFACE_TUNER, 1);
-		if (dvb_attach(dib0090_register, fe_slave, tun_i2c, &dib809x_dib0090_config) == NULL)
-			return -ENODEV;
-		fe_slave->dvb = adap->fe_adap[0].fe->dvb;
-		fe_slave->ops.tuner_ops.set_params = dib8096_set_param_override;
-	}
-	tun_i2c = st->dib8000_ops.get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_TUNER, 1);
-	if (dvb_attach(dib0090_register, adap->fe_adap[0].fe, tun_i2c, &dib809x_dib0090_config) == NULL)
-		return -ENODEV;
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib8096_set_param_override;
-
-	return 0;
-}
-
-static int nim8096md_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dvb_frontend *fe_slave;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib8000_attach, &state->dib8000_ops))
-		return -ENODEV;
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(1000);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	state->dib8000_ops.i2c_enumeration(&adap->dev->i2c_adap, 2, 18, 0x80, 0);
-
-	adap->fe_adap[0].fe = state->dib8000_ops.init(&adap->dev->i2c_adap, 0x80, &dib809x_dib8000_config[0]);
-	if (adap->fe_adap[0].fe == NULL)
-		return -ENODEV;
-
-	/* Needed to increment refcount */
-	if (!dvb_attach(dib8000_attach, &state->dib8000_ops))
-		return -ENODEV;
-
-	fe_slave = state->dib8000_ops.init(&adap->dev->i2c_adap, 0x82, &dib809x_dib8000_config[1]);
-	state->dib8000_ops.set_slave_frontend(adap->fe_adap[0].fe, fe_slave);
-
-	return fe_slave == NULL ?  -ENODEV : 0;
-}
-
-/* TFE8096P */
-static struct dibx000_agc_config dib8096p_agc_config[2] = {
-	{
-		.band_caps		= BAND_UHF,
-		/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0,
-		   P_agc_freq_pwm_div=1, P_agc_inv_pwm1=0,
-		   P_agc_inv_pwm2=0, P_agc_inh_dc_rv_est=0,
-		   P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5,
-		   P_agc_write=0 */
-		.setup			= (0 << 15) | (0 << 14) | (5 << 11)
-			| (0 << 10) | (0 << 9) | (0 << 8) | (3 << 5)
-			| (0 << 4) | (5 << 1) | (0 << 0),
-
-		.inv_gain		= 684,
-		.time_stabiliz	= 10,
-
-		.alpha_level	= 0,
-		.thlock			= 118,
-
-		.wbd_inv		= 0,
-		.wbd_ref		= 1200,
-		.wbd_sel		= 3,
-		.wbd_alpha		= 5,
-
-		.agc1_max		= 65535,
-		.agc1_min		= 0,
-
-		.agc2_max		= 32767,
-		.agc2_min		= 0,
-
-		.agc1_pt1		= 0,
-		.agc1_pt2		= 0,
-		.agc1_pt3		= 105,
-		.agc1_slope1	= 0,
-		.agc1_slope2	= 156,
-		.agc2_pt1		= 105,
-		.agc2_pt2		= 255,
-		.agc2_slope1	= 54,
-		.agc2_slope2	= 0,
-
-		.alpha_mant		= 28,
-		.alpha_exp		= 26,
-		.beta_mant		= 31,
-		.beta_exp		= 51,
-
-		.perform_agc_softsplit = 0,
-	} , {
-		.band_caps		= BAND_FM | BAND_VHF | BAND_CBAND,
-		/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0,
-		   P_agc_freq_pwm_div=1, P_agc_inv_pwm1=0,
-		   P_agc_inv_pwm2=0, P_agc_inh_dc_rv_est=0,
-		   P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5,
-		   P_agc_write=0 */
-		.setup			= (0 << 15) | (0 << 14) | (5 << 11)
-			| (0 << 10) | (0 << 9) | (0 << 8) | (3 << 5)
-			| (0 << 4) | (5 << 1) | (0 << 0),
-
-		.inv_gain		= 732,
-		.time_stabiliz  = 10,
-
-		.alpha_level	= 0,
-		.thlock			= 118,
-
-		.wbd_inv		= 0,
-		.wbd_ref		= 1200,
-		.wbd_sel		= 3,
-		.wbd_alpha		= 5,
-
-		.agc1_max		= 65535,
-		.agc1_min		= 0,
-
-		.agc2_max		= 32767,
-		.agc2_min		= 0,
-
-		.agc1_pt1		= 0,
-		.agc1_pt2		= 0,
-		.agc1_pt3		= 98,
-		.agc1_slope1	= 0,
-		.agc1_slope2	= 167,
-		.agc2_pt1		= 98,
-		.agc2_pt2		= 255,
-		.agc2_slope1	= 52,
-		.agc2_slope2	= 0,
-
-		.alpha_mant		= 28,
-		.alpha_exp		= 26,
-		.beta_mant		= 31,
-		.beta_exp		= 51,
-
-		.perform_agc_softsplit = 0,
-	}
-};
-
-static struct dibx000_bandwidth_config dib8096p_clock_config_12_mhz = {
-	.internal = 108000,
-	.sampling = 13500,
-	.pll_prediv = 1,
-	.pll_ratio = 9,
-	.pll_range = 1,
-	.pll_reset = 0,
-	.pll_bypass = 0,
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 0,
-	.ADClkSrc = 0,
-	.modulo = 2,
-	.sad_cfg = (3 << 14) | (1 << 12) | (524 << 0),
-	.ifreq = (0 << 25) | 0,
-	.timf = 20199729,
-	.xtal_hz = 12000000,
-};
-
-static struct dib8000_config tfe8096p_dib8000_config = {
-	.output_mpeg2_in_188_bytes	= 1,
-	.hostbus_diversity			= 1,
-	.update_lna					= NULL,
-
-	.agc_config_count			= 2,
-	.agc						= dib8096p_agc_config,
-	.pll						= &dib8096p_clock_config_12_mhz,
-
-	.gpio_dir					= DIB8000_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val					= DIB8000_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos				= DIB8000_GPIO_DEFAULT_PWM_POS,
-
-	.agc_control				= NULL,
-	.diversity_delay			= 48,
-	.output_mode				= OUTMODE_MPEG2_FIFO,
-	.enMpegOutput				= 1,
-};
-
-static struct dib0090_wbd_slope dib8096p_wbd_table[] = {
-	{ 380, 81, 850, 64, 540, 4},
-	{ 860, 51, 866, 21, 375, 4},
-	{1700, 0, 250, 0, 100, 6},
-	{2600, 0, 250, 0, 100, 6},
-	{ 0xFFFF, 0, 0, 0, 0, 0},
-};
-
-static struct dib0090_config tfe8096p_dib0090_config = {
-	.io.clock_khz			= 12000,
-	.io.pll_bypass			= 0,
-	.io.pll_range			= 0,
-	.io.pll_prediv			= 3,
-	.io.pll_loopdiv			= 6,
-	.io.adc_clock_ratio		= 0,
-	.io.pll_int_loop_filt	= 0,
-
-	.freq_offset_khz_uhf	= -143,
-	.freq_offset_khz_vhf	= -143,
-
-	.get_adc_power			= dib8090_get_adc_power,
-
-	.clkouttobamse			= 1,
-	.analog_output			= 0,
-
-	.wbd_vhf_offset			= 0,
-	.wbd_cband_offset		= 0,
-	.use_pwm_agc			= 1,
-	.clkoutdrive			= 0,
-
-	.fref_clock_ratio		= 1,
-
-	.ls_cfg_pad_drv			= 0,
-	.data_tx_drv			= 0,
-	.low_if					= NULL,
-	.in_soc					= 1,
-	.force_cband_input		= 0,
-};
-
-struct dibx090p_adc {
-	u32 freq;			/* RF freq MHz */
-	u32 timf;			/* New Timf */
-	u32 pll_loopdiv;	/* New prediv */
-	u32 pll_prediv;		/* New loopdiv */
-};
-
-struct dibx090p_best_adc {
-	u32 timf;
-	u32 pll_loopdiv;
-	u32 pll_prediv;
-};
-
-static int dib8096p_get_best_sampling(struct dvb_frontend *fe, struct dibx090p_best_adc *adc)
-{
-	u8 spur = 0, prediv = 0, loopdiv = 0, min_prediv = 1, max_prediv = 1;
-	u16 xtal = 12000;
-	u16 fcp_min = 1900;  /* PLL, Minimum Frequency of phase comparator (KHz) */
-	u16 fcp_max = 20000; /* PLL, Maximum Frequency of phase comparator (KHz) */
-	u32 fmem_max = 140000; /* 140MHz max SDRAM freq */
-	u32 fdem_min = 66000;
-	u32 fcp = 0, fs = 0, fdem = 0, fmem = 0;
-	u32 harmonic_id = 0;
-
-	adc->timf = 0;
-	adc->pll_loopdiv = loopdiv;
-	adc->pll_prediv = prediv;
-
-	deb_info("bandwidth = %d", fe->dtv_property_cache.bandwidth_hz);
-
-	/* Find Min and Max prediv */
-	while ((xtal / max_prediv) >= fcp_min)
-		max_prediv++;
-
-	max_prediv--;
-	min_prediv = max_prediv;
-	while ((xtal / min_prediv) <= fcp_max) {
-		min_prediv--;
-		if (min_prediv == 1)
-			break;
-	}
-	deb_info("MIN prediv = %d : MAX prediv = %d", min_prediv, max_prediv);
-
-	min_prediv = 1;
-
-	for (prediv = min_prediv; prediv < max_prediv; prediv++) {
-		fcp = xtal / prediv;
-		if (fcp > fcp_min && fcp < fcp_max) {
-			for (loopdiv = 1; loopdiv < 64; loopdiv++) {
-				fmem = ((xtal/prediv) * loopdiv);
-				fdem = fmem / 2;
-				fs   = fdem / 4;
-
-				/* test min/max system restrictions */
-				if ((fdem >= fdem_min) && (fmem <= fmem_max) && (fs >= fe->dtv_property_cache.bandwidth_hz / 1000)) {
-					spur = 0;
-					/* test fs harmonics positions */
-					for (harmonic_id = (fe->dtv_property_cache.frequency / (1000 * fs));  harmonic_id <= ((fe->dtv_property_cache.frequency / (1000 * fs)) + 1); harmonic_id++) {
-						if (((fs * harmonic_id) >= (fe->dtv_property_cache.frequency / 1000 - (fe->dtv_property_cache.bandwidth_hz / 2000))) &&  ((fs * harmonic_id) <= (fe->dtv_property_cache.frequency / 1000 + (fe->dtv_property_cache.bandwidth_hz / 2000)))) {
-							spur = 1;
-							break;
-						}
-					}
-
-					if (!spur) {
-						adc->pll_loopdiv = loopdiv;
-						adc->pll_prediv = prediv;
-						adc->timf = (4260880253U / fdem) * (1 << 8);
-						adc->timf += ((4260880253U % fdem) << 8) / fdem;
-
-						deb_info("RF %6d; BW %6d; Xtal %6d; Fmem %6d; Fdem %6d; Fs %6d; Prediv %2d; Loopdiv %2d; Timf %8d;", fe->dtv_property_cache.frequency, fe->dtv_property_cache.bandwidth_hz, xtal, fmem, fdem, fs, prediv, loopdiv, adc->timf);
-						break;
-					}
-				}
-			}
-		}
-		if (!spur)
-			break;
-	}
-
-	if (adc->pll_loopdiv == 0 && adc->pll_prediv == 0)
-		return -EINVAL;
-	return 0;
-}
-
-static int dib8096p_agc_startup(struct dvb_frontend *fe)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-	struct dibx000_bandwidth_config pll;
-	struct dibx090p_best_adc adc;
-	u16 target;
-	int ret;
-
-	ret = state->set_param_save(fe);
-	if (ret < 0)
-		return ret;
-	memset(&pll, 0, sizeof(struct dibx000_bandwidth_config));
-
-	dib0090_pwm_gain_reset(fe);
-	/* dib0090_get_wbd_target is returning any possible
-	   temperature compensated wbd-target */
-	target = (dib0090_get_wbd_target(fe) * 8  + 1) / 2;
-	state->dib8000_ops.set_wbd_ref(fe, target);
-
-	if (dib8096p_get_best_sampling(fe, &adc) == 0) {
-		pll.pll_ratio  = adc.pll_loopdiv;
-		pll.pll_prediv = adc.pll_prediv;
-
-		dib0700_set_i2c_speed(adap->dev, 200);
-		state->dib8000_ops.update_pll(fe, &pll, fe->dtv_property_cache.bandwidth_hz / 1000, 0);
-		state->dib8000_ops.ctrl_timf(fe, DEMOD_TIMF_SET, adc.timf);
-		dib0700_set_i2c_speed(adap->dev, 1000);
-	}
-	return 0;
-}
-
-static int tfe8096p_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_state *st = adap->dev->priv;
-	u32 fw_version;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib8000_attach, &state->dib8000_ops))
-		return -ENODEV;
-
-	dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
-	if (fw_version >= 0x10200)
-		st->fw_use_new_i2c_api = 1;
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	state->dib8000_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 0x10, 0x80, 1);
-
-	adap->fe_adap[0].fe = state->dib8000_ops.init(&adap->dev->i2c_adap,
-					     0x80, &tfe8096p_dib8000_config);
-
-	return adap->fe_adap[0].fe == NULL ?  -ENODEV : 0;
-}
-
-static int tfe8096p_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c = st->dib8000_ops.get_i2c_tuner(adap->fe_adap[0].fe);
-
-	tfe8096p_dib0090_config.reset = st->dib8000_ops.tuner_sleep;
-	tfe8096p_dib0090_config.sleep = st->dib8000_ops.tuner_sleep;
-	tfe8096p_dib0090_config.wbd = dib8096p_wbd_table;
-
-	if (dvb_attach(dib0090_register, adap->fe_adap[0].fe, tun_i2c,
-				&tfe8096p_dib0090_config) == NULL)
-		return -ENODEV;
-
-	st->dib8000_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 1);
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib8096p_agc_startup;
-	return 0;
-}
-
-/* STK9090M */
-static int dib90x0_pid_filter(struct dvb_usb_adapter *adapter, int index, u16 pid, int onoff)
-{
-	return dib9000_fw_pid_filter(adapter->fe_adap[0].fe, index, pid, onoff);
-}
-
-static int dib90x0_pid_filter_ctrl(struct dvb_usb_adapter *adapter, int onoff)
-{
-	return dib9000_fw_pid_filter_ctrl(adapter->fe_adap[0].fe, onoff);
-}
-
-static int dib90x0_tuner_reset(struct dvb_frontend *fe, int onoff)
-{
-	return dib9000_set_gpio(fe, 5, 0, !onoff);
-}
-
-static int dib90x0_tuner_sleep(struct dvb_frontend *fe, int onoff)
-{
-	return dib9000_set_gpio(fe, 0, 0, onoff);
-}
-
-static int dib01x0_pmu_update(struct i2c_adapter *i2c, u16 *data, u8 len)
-{
-	u8 wb[4] = { 0xc >> 8, 0xc & 0xff, 0, 0 };
-	u8 rb[2];
-	struct i2c_msg msg[2] = {
-		{.addr = 0x1e >> 1, .flags = 0, .buf = wb, .len = 2},
-		{.addr = 0x1e >> 1, .flags = I2C_M_RD, .buf = rb, .len = 2},
-	};
-	u8 index_data;
-
-	dibx000_i2c_set_speed(i2c, 250);
-
-	if (i2c_transfer(i2c, msg, 2) != 2)
-		return -EIO;
-
-	switch (rb[0] << 8 | rb[1]) {
-	case 0:
-			deb_info("Found DiB0170 rev1: This version of DiB0170 is not supported any longer.\n");
-			return -EIO;
-	case 1:
-			deb_info("Found DiB0170 rev2");
-			break;
-	case 2:
-			deb_info("Found DiB0190 rev2");
-			break;
-	default:
-			deb_info("DiB01x0 not found");
-			return -EIO;
-	}
-
-	for (index_data = 0; index_data < len; index_data += 2) {
-		wb[2] = (data[index_data + 1] >> 8) & 0xff;
-		wb[3] = (data[index_data + 1]) & 0xff;
-
-		if (data[index_data] == 0) {
-			wb[0] = (data[index_data] >> 8) & 0xff;
-			wb[1] = (data[index_data]) & 0xff;
-			msg[0].len = 2;
-			if (i2c_transfer(i2c, msg, 2) != 2)
-				return -EIO;
-			wb[2] |= rb[0];
-			wb[3] |= rb[1] & ~(3 << 4);
-		}
-
-		wb[0] = (data[index_data] >> 8)&0xff;
-		wb[1] = (data[index_data])&0xff;
-		msg[0].len = 4;
-		if (i2c_transfer(i2c, &msg[0], 1) != 1)
-			return -EIO;
-	}
-	return 0;
-}
-
-static struct dib9000_config stk9090m_config = {
-	.output_mpeg2_in_188_bytes = 1,
-	.output_mode = OUTMODE_MPEG2_FIFO,
-	.vcxo_timer = 279620,
-	.timing_frequency = 20452225,
-	.demod_clock_khz = 60000,
-	.xtal_clock_khz = 30000,
-	.if_drives = (0 << 15) | (1 << 13) | (0 << 12) | (3 << 10) | (0 << 9) | (1 << 7) | (0 << 6) | (0 << 4) | (1 << 3) | (1 << 1) | (0),
-	.subband = {
-		2,
-		{
-			{ 240, { BOARD_GPIO_COMPONENT_DEMOD, BOARD_GPIO_FUNCTION_SUBBAND_GPIO, 0x0008, 0x0000, 0x0008 } }, /* GPIO 3 to 1 for VHF */
-			{ 890, { BOARD_GPIO_COMPONENT_DEMOD, BOARD_GPIO_FUNCTION_SUBBAND_GPIO, 0x0008, 0x0000, 0x0000 } }, /* GPIO 3 to 0 for UHF */
-			{ 0 },
-		},
-	},
-	.gpio_function = {
-		{ .component = BOARD_GPIO_COMPONENT_DEMOD, .function = BOARD_GPIO_FUNCTION_COMPONENT_ON, .mask = 0x10 | 0x21, .direction = 0 & ~0x21, .value = (0x10 & ~0x1) | 0x20 },
-		{ .component = BOARD_GPIO_COMPONENT_DEMOD, .function = BOARD_GPIO_FUNCTION_COMPONENT_OFF, .mask = 0x10 | 0x21, .direction = 0 & ~0x21, .value = 0 | 0x21 },
+		.key	= "\x60\x3d\xeb\x10\x15\xca\x71\xbe"
+			  "\x2b\x73\xae\xf0\x85\x7d\x77\x81"
+			  "\x1f\x35\x2c\x07\x3b\x61\x08\xd7"
+			  "\x2d\x98\x10\xa3\x09\x14\xdf\xf4",
+		.klen	= 32,
+		.iv	= "\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7"
+			  "\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff",
+		.input	= "\x60\x1e\xc3\x13\x77\x57\x89\xa5"
+			  "\xb7\xa7\xf5\x04\xbb\xf3\xd2\x28"
+			  "\xf4\x43\xe3\xca\x4d\x62\xb5\x9a"
+			  "\xca\x84\xe9\x90\xca\xca\xf5\xc5"
+			  "\x2b\x09\x30\xda\xa2\x3d\xe9\x4c"
+			  "\xe8\x70\x17\xba\x2d\x84\x98\x8d"
+			  "\xdf\xc9\xc5\x8d\xb6\x7a\xad\xa6"
+			  "\x13\xc2\xdd\x08\x45\x79\x41\xa6",
+		.ilen	= 64,
+		.result	= "\x6b\xc1\xbe\xe2\x2e\x40\x9f\x96"
+			  "\xe9\x3d\x7e\x11\x73\x93\x17\x2a"
+			  "\xae\x2d\x8a\x57\x1e\x03\xac\x9c"
+			  "\x9e\xb7\x6f\xac\x45\xaf\x8e\x51"
+			  "\x30\xc8\x1c\x46\xa3\x5c\xe4\x11"
+			  "\xe5\xfb\xc1\x19\x1a\x0a\x52\xef"
+			  "\xf6\x9f\x24\x45\xdf\x4f\x9b\x17"
+			  "\xad\x2b\x41\x7b\xe6\x6c\x37\x10",
+		.rlen	= 64,
+	}, { /* Generated with Crypto++ */
+		.key	= "\xC9\x83\xA6\xC9\xEC\x0F\x32\x55"
+			  "\x0F\x32\x55\x78\x9B\xBE\x78\x9B"
+			  "\xBE\xE1\x04\x27\xE1\x04\x27\x4A"
+			  "\x6D\x90\x4A\x6D\x90\xB3\xD6\xF9",
+		.klen	= 32,
+		.iv	= "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+			  "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFD",
+		.input	= "\x04\xF3\xD3\x88\x17\xEF\xDC\xEF"
+			  "\x8B\x04\xF8\x3A\x66\x8D\x1A\x53"
+			  "\x57\x1F\x4B\x23\xE4\xA0\xAF\xF9"
+			  "\x69\x95\x35\x98\x8D\x4D\x8C\xC1"
+			  "\xF0\xB2\x7F\x80\xBB\x54\x28\xA2"
+			  "\x7A\x1B\x9F\x77\xEC\x0E\x6E\xDE"
+			  "\xF0\xEC\xB8\xE4\x20\x62\xEE\xDB"
+			  "\x5D\xF5\xDD\xE3\x54\xFC\xDD\xEB"
+			  "\x6A\xEE\x65\xA1\x21\xD6\xD7\x81"
+			  "\x47\x61\x12\x4D\xC2\x8C\xFA\x78"
+			  "\x1F\x28\x02\x01\xC3\xFC\x1F\xEC"
+			  "\x0F\x10\x4F\xB3\x12\x45\xC6\x3B"
+			  "\x7E\x08\xF9\x5A\xD0\x5D\x73\x2D"
+			  "\x58\xA4\xE5\xCB\x1C\xB4\xCE\x74"
+			  "\x32\x41\x1F\x31\x9C\x08\xA2\x5D"
+			  "\x67\xEB\x72\x1D\xF8\xE7\x70\x54"
+			  "\x34\x4B\x31\x69\x84\x66\x96\x44"
+			  "\x56\xCC\x1E\xD9\xE6\x13\x6A\xB9"
+			  "\x2D\x0A\x05\x45\x2D\x90\xCC\xDF"
+			  "\x16\x5C\x5F\x79\x34\x52\x54\xFE"
+			  "\xFE\xCD\xAD\x04\x2E\xAD\x86\x06"
+			  "\x1F\x37\xE8\x28\xBC\xD3\x8F\x5B"
+			  "\x92\x66\x87\x3B\x8A\x0A\x1A\xCC"
+			  "\x6E\xAB\x9F\x0B\xFA\x5C\xE6\xFD"
+			  "\x3C\x98\x08\x12\xEC\xAA\x9E\x11"
+			  "\xCA\xB2\x1F\xCE\x5E\x5B\xB2\x72"
+			  "\x9C\xCC\x5D\xC5\xE0\x32\xC0\x56"
+			  "\xD5\x45\x16\xD2\xAF\x13\x66\xF7"
+			  "\x8C\x67\xAC\x79\xB2\xAF\x56\x27"
+			  "\x3F\xCC\xFE\xCB\x1E\xC0\x75\xF1"
+			  "\xA7\xC9\xC3\x1D\x8E\xDD\xF9\xD4"
+			  "\x42\xC8\x21\x08\x16\xF7\x01\xD7"
+			  "\xAC\x8E\x3F\x1D\x56\xC1\x06\xE4"
+			  "\x9C\x62\xD6\xA5\x6A\x50\x44\xB3"
+			  "\x35\x1C\x82\xB9\x10\xF9\x42\xA1"
+			  "\xFC\x74\x9B\x44\x4F\x25\x02\xE3"
+			  "\x08\xF5\xD4\x32\x39\x08\x11\xE8"
+			  "\xD2\x6B\x50\x53\xD4\x08\xD1\x6B"
+			  "\x3A\x4A\x68\x7B\x7C\xCD\x46\x5E"
+			  "\x0D\x07\x19\xDB\x67\xD7\x98\x91"
+			  "\xD7\x17\x10\x9B\x7B\x8A\x9B\x33"
+			  "\xAE\xF3\x00\xA6\xD4\x15\xD9\xEA"
+			  "\x85\x99\x22\xE8\x91\x38\x70\x83"
+			  "\x93\x01\x24\x6C\xFA\x9A\xB9\x07"
+			  "\xEA\x8D\x3B\xD9\x2A\x43\x59\x16"
+			  "\x2F\x69\xEE\x84\x36\x44\x76\x98"
+			  "\xF3\x04\x2A\x7C\x74\x3D\x29\x2B"
+			  "\x0D\xAD\x8F\x44\x82\x9E\x57\x8D"
+			  "\xAC\xED\x18\x1F\x50\xA4\xF5\x98"
+			  "\x1F\xBD\x92\x91\x1B\x2D\xA6\xD6"
+			  "\xD2\xE3\x02\xAA\x92\x3B\xC6\xB3"
+			  "\x1B\x39\x72\xD5\x26\xCA\x04\xE0"
+			  "\xFC\x58\x78\xBB\xB1\x3F\xA1\x9C"
+			  "\x42\x24\x3E\x2E\x22\xBB\x4B\xBA"
+			  "\xF4\x52\x0A\xE6\xAE\x47\xB4\x7D"
+			  "\x1D\xA8\xBE\x81\x1A\x75\xDA\xAC"
+			  "\xA6\x25\x1E\xEF\x3A\xC0\x6C\x63"
+			  "\xEF\xDC\xC9\x79\x10\x26\xE8\x61"
+			  "\x29\xFC\xA4\x05\xDF\x7D\x5C\x63"
+			  "\x10\x09\x9B\x46\x9B\xF2\x2C\x2B"
+			  "\xFA\x3A\x05\x4C\xFA\xD1\xFF\xFE"
+			  "\xF1\x4C\xE5\xB2\x91\x64\x0C\x51",
+		.ilen	= 496,
+		.result	= "\x50\xB9\x22\xAE\x17\x80\x0C\x75"
+			  "\xDE\x47\xD3\x3C\xA5\x0E\x9A\x03"
+			  "\x6C\xF8\x61\xCA\x33\xBF\x28\x91"
+			  "\x1D\x86\xEF\x58\xE4\x4D\xB6\x1F"
+			  "\xAB\x14\x7D\x09\x72\xDB\x44\xD0"
+			  "\x39\xA2\x0B\x97\x00\x69\xF5\x5E"
+			  "\xC7\x30\xBC\x25\x8E\x1A\x83\xEC"
+			  "\x55\xE1\x4A\xB3\x1C\xA8\x11\x7A"
+			  "\x06\x6F\xD8\x41\xCD\x36\x9F\x08"
+			  "\x94\xFD\x66\xF2\x5B\xC4\x2D\xB9"
+			  "\x22\x8B\x17\x80\xE9\x52\xDE\x47"
+			  "\xB0\x19\xA5\x0E\x77\x03\x6C\xD5"
+			  "\x3E\xCA\x33\x9C\x05\x91\xFA\x63"
+			  "\xEF\x58\xC1\x2A\xB6\x1F\x88\x14"
+			  "\x7D\xE6\x4F\xDB\x44\xAD\x16\xA2"
+			  "\x0B\x74\x00\x69\xD2\x3B\xC7\x30"
+			  "\x99\x02\x8E\xF7\x60\xEC\x55\xBE"
+			  "\x27\xB3\x1C\x85\x11\x7A\xE3\x4C"
+			  "\xD8\x41\xAA\x13\x9F\x08\x71\xFD"
+			  "\x66\xCF\x38\xC4\x2D\x96\x22\x8B"
+			  "\xF4\x5D\xE9\x52\xBB\x24\xB0\x19"
+			  "\x82\x0E\x77\xE0\x49\xD5\x3E\xA7"
+			  "\x10\x9C\x05\x6E\xFA\x63\xCC\x35"
+			  "\xC1\x2A\x93\x1F\x88\xF1\x5A\xE6"
+			  "\x4F\xB8\x21\xAD\x16\x7F\x0B\x74"
+			  "\xDD\x46\xD2\x3B\xA4\x0D\x99\x02"
+			  "\x6B\xF7\x60\xC9\x32\xBE\x27\x90"
+			  "\x1C\x85\xEE\x57\xE3\x4C\xB5\x1E"
+			  "\xAA\x13\x7C\x08\x71\xDA\x43\xCF"
+			  "\x38\xA1\x0A\x96\xFF\x68\xF4\x5D"
+			  "\xC6\x2F\xBB\x24\x8D\x19\x82\xEB"
+			  "\x54\xE0\x49\xB2\x1B\xA7\x10\x79"
+			  "\x05\x6E\xD7\x40\xCC\x35\x9E\x07"
+			  "\x93\xFC\x65\xF1\x5A\xC3\x2C\xB8"
+			  "\x21\x8A\x16\x7F\xE8\x51\xDD\x46"
+			  "\xAF\x18\xA4\x0D\x76\x02\x6B\xD4"
+			  "\x3D\xC9\x32\x9B\x04\x90\xF9\x62"
+			  "\xEE\x57\xC0\x29\xB5\x1E\x87\x13"
+			  "\x7C\xE5\x4E\xDA\x43\xAC\x15\xA1"
+			  "\x0A\x73\xFF\x68\xD1\x3A\xC6\x2F"
+			  "\x98\x01\x8D\xF6\x5F\xEB\x54\xBD"
+			  "\x26\xB2\x1B\x84\x10\x79\xE2\x4B"
+			  "\xD7\x40\xA9\x12\x9E\x07\x70\xFC"
+			  "\x65\xCE\x37\xC3\x2C\x95\x21\x8A"
+			  "\xF3\x5C\xE8\x51\xBA\x23\xAF\x18"
+			  "\x81\x0D\x76\xDF\x48\xD4\x3D\xA6"
+			  "\x0F\x9B\x04\x6D\xF9\x62\xCB\x34"
+			  "\xC0\x29\x92\x1E\x87\xF0\x59\xE5"
+			  "\x4E\xB7\x20\xAC\x15\x7E\x0A\x73"
+			  "\xDC\x45\xD1\x3A\xA3\x0C\x98\x01"
+			  "\x6A\xF6\x5F\xC8\x31\xBD\x26\x8F"
+			  "\x1B\x84\xED\x56\xE2\x4B\xB4\x1D"
+			  "\xA9\x12\x7B\x07\x70\xD9\x42\xCE"
+			  "\x37\xA0\x09\x95\xFE\x67\xF3\x5C"
+			  "\xC5\x2E\xBA\x23\x8C\x18\x81\xEA"
+			  "\x53\xDF\x48\xB1\x1A\xA6\x0F\x78"
+			  "\x04\x6D\xD6\x3F\xCB\x34\x9D\x06"
+			  "\x92\xFB\x64\xF0\x59\xC2\x2B\xB7"
+			  "\x20\x89\x15\x7E\xE7\x50\xDC\x45"
+			  "\xAE\x17\xA3\x0C\x75\x01\x6A\xD3"
+			  "\x3C\xC8\x31\x9A\x03\x8F\xF8\x61"
+			  "\xED\x56\xBF\x28\xB4\x1D\x86\x12",
+		.rlen	= 496,
+		.also_non_np = 1,
+		.np	= 3,
+		.tap	= { 496 - 20, 4, 16 },
+	}, { /* Generated with Crypto++ */
+		.key	= "\xC9\x83\xA6\xC9\xEC\x0F\x32\x55"
+			  "\x0F\x32\x55\x78\x9B\xBE\x78\x9B"
+			  "\xBE\xE1\x04\x27\xE1\x04\x27\x4A"
+			  "\x6D\x90\x4A\x6D\x90\xB3\xD6\xF9",
+		.klen	= 32,
+		.iv	= "\xE7\x82\x1D\xB8\x53\x11\xAC\x47"
+			  "\xE2\x7D\x18\xD6\x71\x0C\xA7\x42",
+		.input	= "\xDA\x4E\x3F\xBC\xE8\xB6\x3A\xA2"
+			  "\xD5\x4D\x84\x4A\xA9\x0C\xE1\xA5"
+			  "\xB8\x73\xBC\xF9\xBB\x59\x2F\x44"
+			  "\x8B\xAB\x82\x6C\xB4\x32\x9A\xDE"
+			  "\x5A\x0B\xDB\x7A\x6B\xF2\x38\x9F"
+			  "\x06\xF7\xF7\xFF\xFF\xC0\x8A\x2E"
+			  "\x76\xEA\x06\x32\x23\xF3\x59\x2E"
+			  "\x75\xDE\x71\x86\x3C\x98\x23\x44"
+			  "\x5B\xF2\xFA\x6A\x00\xBB\xC1\xAD"
+			  "\x58\xBD\x3E\x6F\x2E\xB4\x19\x04"
+			  "\x70\x8B\x92\x55\x23\xE9\x6A\x3A"
+			  "\x78\x7A\x1B\x10\x85\x52\x9C\x12"
+			  "\xE4\x55\x81\x21\xCE\x53\xD0\x3B"
+			  "\x63\x77\x2C\x74\xD1\xF5\x60\xF3"
+			  "\xA1\xDE\x44\x3C\x8F\x4D\x2F\xDD"
+			  "\x8A\xFE\x3C\x42\x8E\xD3\xF2\x8E"
+			  "\xA8\x28\x69\x65\x31\xE1\x45\x83"
+			  "\xE4\x49\xC4\x9C\xA7\x28\xAA\x21"
+			  "\xCD\x5D\x0F\x15\xB7\x93\x07\x26"
+			  "\xB0\x65\x6D\x91\x90\x23\x7A\xC6"
+			  "\xDB\x68\xB0\xA1\x8E\xA4\x76\x4E"
+			  "\xC6\x91\x83\x20\x92\x4D\x63\x7A"
+			  "\x45\x18\x18\x74\x19\xAD\x71\x01"
+			  "\x6B\x23\xAD\x9D\x4E\xE4\x6E\x46"
+			  "\xC9\x73\x7A\xF9\x02\x95\xF4\x07"
+			  "\x0E\x7A\xA6\xC5\xAE\xFA\x15\x2C"
+			  "\x51\x71\xF1\xDC\x22\xB6\xAC\xD8"
+			  "\x19\x24\x44\xBC\x0C\xFB\x3C\x2D"
+			  "\xB1\x50\x47\x15\x0E\xDB\xB6\xD7"
+			  "\xE8\x61\xE5\x95\x52\x1E\x3E\x49"
+			  "\x70\xE9\x66\x04\x4C\xE1\xAF\xBD"
+			  "\xDD\x15\x3B\x20\x59\x24\xFF\xB0"
+			  "\x39\xAA\xE7\xBF\x23\xA3\x6E\xD5"
+			  "\x15\xF0\x61\x4F\xAE\x89\x10\x58"
+			  "\x5A\x33\x95\x52\x2A\xB5\x77\x9C"
+			  "\xA5\x43\x80\x40\x27\x2D\xAE\xD9"
+			  "\x3F\xE0\x80\x94\x78\x79\xCB\x7E"
+			  "\xAD\x12\x44\x4C\xEC\x27\xB0\xEE"
+			  "\x0B\x05\x2A\x82\x99\x58\xBB\x7A"
+			  "\x8D\x6D\x9D\x8E\xE2\x8E\xE7\x93"
+			  "\x2F\xB3\x09\x8D\x06\xD5\xEE\x70"
+			  "\x16\xAE\x35\xC5\x52\x0F\x46\x1F"
+			  "\x71\xF9\x5E\xF2\x67\xDC\x98\x2F"
+			  "\xA3\x23\xAA\xD5\xD0\x49\xF4\xA6"
+			  "\xF6\xB8\x32\xCD\xD6\x85\x73\x60"
+			  "\x59\x20\xE7\x55\x0E\x91\xE2\x0C"
+			  "\x3F\x1C\xEB\x3D\xDF\x52\x64\xF2"
+			  "\x7D\x8B\x5D\x63\x16\xB9\xB2\x5D"
+			  "\x5E\xAB\xB2\x97\xAB\x78\x44\xE7"
+			  "\xC6\x72\x20\xC5\x90\x9B\xDC\x5D"
+			  "\xB0\xEF\x44\xEF\x87\x31\x8D\xF4"
+			  "\xFB\x81\x5D\xF7\x96\x96\xD4\x50"
+			  "\x89\xA7\xF6\xB9\x67\x76\x40\x9E"
+			  "\x9D\x40\xD5\x2C\x30\xB8\x01\x8F"
+			  "\xE4\x7B\x71\x48\xA9\xA0\xA0\x1D"
+			  "\x87\x52\xA4\x91\xA9\xD7\xA9\x51"
+			  "\xD9\x59\xF7\xCC\x63\x22\xC1\x8D"
+			  "\x84\x7B\xD8\x22\x32\x5C\x6F\x1D"
+			  "\x6E\x9F\xFA\xDD\x49\x40\xDC\x37"
+			  "\x14\x8C\xE1\x80\x1B\xDD\x36\x2A"
+			  "\xD0\xE9\x54\x99\x5D\xBA\x3B\x11"
+			  "\xD8\xFE\xC9\x5B\x5C\x25\xE5\x76"
+			  "\xFB\xF2\x3F",
+		.ilen	= 499,
+		.result	= "\x50\xB9\x22\xAE\x17\x80\x0C\x75"
+			  "\xDE\x47\xD3\x3C\xA5\x0E\x9A\x03"
+			  "\x6C\xF8\x61\xCA\x33\xBF\x28\x91"
+			  "\x1D\x86\xEF\x58\xE4\x4D\xB6\x1F"
+			  "\xAB\x14\x7D\x09\x72\xDB\x44\xD0"
+			  "\x39\xA2\x0B\x97\x00\x69\xF5\x5E"
+			  "\xC7\x30\xBC\x25\x8E\x1A\x83\xEC"
+			  "\x55\xE1\x4A\xB3\x1C\xA8\x11\x7A"
+			  "\x06\x6F\xD8\x41\xCD\x36\x9F\x08"
+			  "\x94\xFD\x66\xF2\x5B\xC4\x2D\xB9"
+			  "\x22\x8B\x17\x80\xE9\x52\xDE\x47"
+			  "\xB0\x19\xA5\x0E\x77\x03\x6C\xD5"
+			  "\x3E\xCA\x33\x9C\x05\x91\xFA\x63"
+			  "\xEF\x58\xC1\x2A\xB6\x1F\x88\x14"
+			  "\x7D\xE6\x4F\xDB\x44\xAD\x16\xA2"
+			  "\x0B\x74\x00\x69\xD2\x3B\xC7\x30"
+			  "\x99\x02\x8E\xF7\x60\xEC\x55\xBE"
+			  "\x27\xB3\x1C\x85\x11\x7A\xE3\x4C"
+			  "\xD8\x41\xAA\x13\x9F\x08\x71\xFD"
+			  "\x66\xCF\x38\xC4\x2D\x96\x22\x8B"
+			  "\xF4\x5D\xE9\x52\xBB\x24\xB0\x19"
+			  "\x82\x0E\x77\xE0\x49\xD5\x3E\xA7"
+			  "\x10\x9C\x05\x6E\xFA\x63\xCC\x35"
+			  "\xC1\x2A\x93\x1F\x88\xF1\x5A\xE6"
+			  "\x4F\xB8\x21\xAD\x16\x7F\x0B\x74"
+			  "\xDD\x46\xD2\x3B\xA4\x0D\x99\x02"
+			  "\x6B\xF7\x60\xC9\x32\xBE\x27\x90"
+			  "\x1C\x85\xEE\x57\xE3\x4C\xB5\x1E"
+			  "\xAA\x13\x7C\x08\x71\xDA\x43\xCF"
+			  "\x38\xA1\x0A\x96\xFF\x68\xF4\x5D"
+			  "\xC6\x2F\xBB\x24\x8D\x19\x82\xEB"
+			  "\x54\xE0\x49\xB2\x1B\xA7\x10\x79"
+			  "\x05\x6E\xD7\x40\xCC\x35\x9E\x07"
+			  "\x93\xFC\x65\xF1\x5A\xC3\x2C\xB8"
+			  "\x21\x8A\x16\x7F\xE8\x51\xDD\x46"
+			  "\xAF\x18\xA4\x0D\x76\x02\x6B\xD4"
+			  "\x3D\xC9\x32\x9B\x04\x90\xF9\x62"
+			  "\xEE\x57\xC0\x29\xB5\x1E\x87\x13"
+			  "\x7C\xE5\x4E\xDA\x43\xAC\x15\xA1"
+			  "\x0A\x73\xFF\x68\xD1\x3A\xC6\x2F"
+			  "\x98\x01\x8D\xF6\x5F\xEB\x54\xBD"
+			  "\x26\xB2\x1B\x84\x10\x79\xE2\x4B"
+			  "\xD7\x40\xA9\x12\x9E\x07\x70\xFC"
+			  "\x65\xCE\x37\xC3\x2C\x95\x21\x8A"
+			  "\xF3\x5C\xE8\x51\xBA\x23\xAF\x18"
+			  "\x81\x0D\x76\xDF\x48\xD4\x3D\xA6"
+			  "\x0F\x9B\x04\x6D\xF9\x62\xCB\x34"
+			  "\xC0\x29\x92\x1E\x87\xF0\x59\xE5"
+			  "\x4E\xB7\x20\xAC\x15\x7E\x0A\x73"
+			  "\xDC\x45\xD1\x3A\xA3\x0C\x98\x01"
+			  "\x6A\xF6\x5F\xC8\x31\xBD\x26\x8F"
+			  "\x1B\x84\xED\x56\xE2\x4B\xB4\x1D"
+			  "\xA9\x12\x7B\x07\x70\xD9\x42\xCE"
+			  "\x37\xA0\x09\x95\xFE\x67\xF3\x5C"
+			  "\xC5\x2E\xBA\x23\x8C\x18\x81\xEA"
+			  "\x53\xDF\x48\xB1\x1A\xA6\x0F\x78"
+			  "\x04\x6D\xD6\x3F\xCB\x34\x9D\x06"
+			  "\x92\xFB\x64\xF0\x59\xC2\x2B\xB7"
+			  "\x20\x89\x15\x7E\xE7\x50\xDC\x45"
+			  "\xAE\x17\xA3\x0C\x75\x01\x6A\xD3"
+			  "\x3C\xC8\x31\x9A\x03\x8F\xF8\x61"
+			  "\xED\x56\xBF\x28\xB4\x1D\x86\x12"
+			  "\x7B\xE4\x4D",
+		.rlen	= 499,
+		.also_non_np = 1,
+		.np	= 2,
+		.tap	= { 499 - 16, 16 },
 	},
 };
 
-static struct dib9000_config nim9090md_config[2] = {
-	{
-		.output_mpeg2_in_188_bytes = 1,
-		.output_mode = OUTMODE_MPEG2_FIFO,
-		.vcxo_timer = 279620,
-		.timing_frequency = 20452225,
-		.demod_clock_khz = 60000,
-		.xtal_clock_khz = 30000,
-		.if_drives = (0 << 15) | (1 << 13) | (0 << 12) | (3 << 10) | (0 << 9) | (1 << 7) | (0 << 6) | (0 << 4) | (1 << 3) | (1 << 1) | (0),
+static struct cipher_testvec aes_ctr_rfc3686_enc_tv_template[] = {
+	{ /* From RFC 3686 */
+		.key	= "\xae\x68\x52\xf8\x12\x10\x67\xcc"
+			  "\x4b\xf7\xa5\x76\x55\x77\xf3\x9e"
+			  "\x00\x00\x00\x30",
+		.klen	= 20,
+		.iv	= "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.input	= "Single block msg",
+		.ilen	= 16,
+		.result = "\xe4\x09\x5d\x4f\xb7\xa7\xb3\x79"
+			  "\x2d\x61\x75\xa3\x26\x13\x11\xb8",
+		.rlen	= 16,
 	}, {
-		.output_mpeg2_in_188_bytes = 1,
-		.output_mode = OUTMODE_DIVERSITY,
-		.vcxo_timer = 279620,
-		.timing_frequency = 20452225,
-		.demod_clock_khz = 60000,
-		.xtal_clock_khz = 30000,
-		.if_drives = (0 << 15) | (1 << 13) | (0 << 12) | (3 << 10) | (0 << 9) | (1 << 7) | (0 << 6) | (0 << 4) | (1 << 3) | (1 << 1) | (0),
-		.subband = {
-			2,
-			{
-				{ 240, { BOARD_GPIO_COMPONENT_DEMOD, BOARD_GPIO_FUNCTION_SUBBAND_GPIO, 0x0006, 0x0000, 0x0006 } }, /* GPIO 1 and 2 to 1 for VHF */
-				{ 890, { BOARD_GPIO_COMPONENT_DEMOD, BOARD_GPIO_FUNCTION_SUBBAND_GPIO, 0x0006, 0x0000, 0x0000 } }, /* GPIO 1 and 2 to 0 for UHF */
-				{ 0 },
-			},
-		},
-		.gpio_function = {
-			{ .component = BOARD_GPIO_COMPONENT_DEMOD, .function = BOARD_GPIO_FUNCTION_COMPONENT_ON, .mask = 0x10 | 0x21, .direction = 0 & ~0x21, .value = (0x10 & ~0x1) | 0x20 },
-			{ .component = BOARD_GPIO_COMPONENT_DEMOD, .function = BOARD_GPIO_FUNCTION_COMPONENT_OFF, .mask = 0x10 | 0x21, .direction = 0 & ~0x21, .value = 0 | 0x21 },
-		},
-	}
-};
-
-static struct dib0090_config dib9090_dib0090_config = {
-	.io.pll_bypass = 0,
-	.io.pll_range = 1,
-	.io.pll_prediv = 1,
-	.io.pll_loopdiv = 8,
-	.io.adc_clock_ratio = 8,
-	.io.pll_int_loop_filt = 0,
-	.io.clock_khz = 30000,
-	.reset = dib90x0_tuner_reset,
-	.sleep = dib90x0_tuner_sleep,
-	.clkouttobamse = 0,
-	.analog_output = 0,
-	.use_pwm_agc = 0,
-	.clkoutdrive = 0,
-	.freq_offset_khz_uhf = 0,
-	.freq_offset_khz_vhf = 0,
-};
-
-static struct dib0090_config nim9090md_dib0090_config[2] = {
-	{
-		.io.pll_bypass = 0,
-		.io.pll_range = 1,
-		.io.pll_prediv = 1,
-		.io.pll_loopdiv = 8,
-		.io.adc_clock_ratio = 8,
-		.io.pll_int_loop_filt = 0,
-		.io.clock_khz = 30000,
-		.reset = dib90x0_tuner_reset,
-		.sleep = dib90x0_tuner_sleep,
-		.clkouttobamse = 1,
-		.analog_output = 0,
-		.use_pwm_agc = 0,
-		.clkoutdrive = 0,
-		.freq_offset_khz_uhf = 0,
-		.freq_offset_khz_vhf = 0,
+		.key	= "\x7e\x24\x06\x78\x17\xfa\xe0\xd7"
+			  "\x43\xd6\xce\x1f\x32\x53\x91\x63"
+			  "\x00\x6c\xb6\xdb",
+		.klen	= 20,
+		.iv	= "\xc0\x54\x3b\x59\xda\x48\xd9\x0b",
+		.input	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+		.ilen	= 32,
+		.result = "\x51\x04\xa1\x06\x16\x8a\x72\xd9"
+			  "\x79\x0d\x41\xee\x8e\xda\xd3\x88"
+			  "\xeb\x2e\x1e\xfc\x46\xda\x57\xc8"
+			  "\xfc\xe6\x30\xdf\x91\x41\xbe\x28",
+		.rlen	= 32,
 	}, {
-		.io.pll_bypass = 0,
-		.io.pll_range = 1,
-		.io.pll_prediv = 1,
-		.io.pll_loopdiv = 8,
-		.io.adc_clock_ratio = 8,
-		.io.pll_int_loop_filt = 0,
-		.io.clock_khz = 30000,
-		.reset = dib90x0_tuner_reset,
-		.sleep = dib90x0_tuner_sleep,
-		.clkouttobamse = 0,
-		.analog_output = 0,
-		.use_pwm_agc = 0,
-		.clkoutdrive = 0,
-		.freq_offset_khz_uhf = 0,
-		.freq_offset_khz_vhf = 0,
-	}
-};
-
-
-static int stk9090m_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-	struct dib0700_state *st = adap->dev->priv;
-	u32 fw_version;
-
-	/* Make use of the new i2c functions from FW 1.20 */
-	dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
-	if (fw_version >= 0x10200)
-		st->fw_use_new_i2c_api = 1;
-	dib0700_set_i2c_speed(adap->dev, 340);
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	dib9000_i2c_enumeration(&adap->dev->i2c_adap, 1, 0x10, 0x80);
-
-	if (request_firmware(&state->frontend_firmware, "dib9090.fw", &adap->dev->udev->dev)) {
-		deb_info("%s: Upload failed. (file not found?)\n", __func__);
-		return -ENODEV;
-	} else {
-		deb_info("%s: firmware read %Zu bytes.\n", __func__, state->frontend_firmware->size);
-	}
-	stk9090m_config.microcode_B_fe_size = state->frontend_firmware->size;
-	stk9090m_config.microcode_B_fe_buffer = state->frontend_firmware->data;
-
-	adap->fe_adap[0].fe = dvb_attach(dib9000_attach, &adap->dev->i2c_adap, 0x80, &stk9090m_config);
-
-	return adap->fe_adap[0].fe == NULL ?  -ENODEV : 0;
-}
-
-static int dib9090_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-	struct i2c_adapter *i2c = dib9000_get_tuner_interface(adap->fe_adap[0].fe);
-	u16 data_dib190[10] = {
-		1, 0x1374,
-		2, 0x01a2,
-		7, 0x0020,
-		0, 0x00ef,
-		8, 0x0486,
-	};
-
-	if (!IS_ENABLED(CONFIG_DVB_DIB9000))
-		return -ENODEV;
-	if (dvb_attach(dib0090_fw_register, adap->fe_adap[0].fe, i2c, &dib9090_dib0090_config) == NULL)
-		return -ENODEV;
-	i2c = dib9000_get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_GPIO_1_2, 0);
-	if (!i2c)
-		return -ENODEV;
-	if (dib01x0_pmu_update(i2c, data_dib190, 10) != 0)
-		return -ENODEV;
-	dib0700_set_i2c_speed(adap->dev, 1500);
-	if (dib9000_firmware_post_pll_init(adap->fe_adap[0].fe) < 0)
-		return -ENODEV;
-	release_firmware(state->frontend_firmware);
-	return 0;
-}
-
-static int nim9090md_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-	struct dib0700_state *st = adap->dev->priv;
-	struct i2c_adapter *i2c;
-	struct dvb_frontend *fe_slave;
-	u32 fw_version;
-
-	/* Make use of the new i2c functions from FW 1.20 */
-	dib0700_get_version(adap->dev, NULL, NULL, &fw_version, NULL);
-	if (fw_version >= 0x10200)
-		st->fw_use_new_i2c_api = 1;
-	dib0700_set_i2c_speed(adap->dev, 340);
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	if (request_firmware(&state->frontend_firmware, "dib9090.fw", &adap->dev->udev->dev)) {
-		deb_info("%s: Upload failed. (file not found?)\n", __func__);
-		return -EIO;
-	} else {
-		deb_info("%s: firmware read %Zu bytes.\n", __func__, state->frontend_firmware->size);
-	}
-	nim9090md_config[0].microcode_B_fe_size = state->frontend_firmware->size;
-	nim9090md_config[0].microcode_B_fe_buffer = state->frontend_firmware->data;
-	nim9090md_config[1].microcode_B_fe_size = state->frontend_firmware->size;
-	nim9090md_config[1].microcode_B_fe_buffer = state->frontend_firmware->data;
-
-	dib9000_i2c_enumeration(&adap->dev->i2c_adap, 1, 0x20, 0x80);
-	adap->fe_adap[0].fe = dvb_attach(dib9000_attach, &adap->dev->i2c_adap, 0x80, &nim9090md_config[0]);
-
-	if (adap->fe_adap[0].fe == NULL)
-		return -ENODEV;
-
-	i2c = dib9000_get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_GPIO_3_4, 0);
-	dib9000_i2c_enumeration(i2c, 1, 0x12, 0x82);
-
-	fe_slave = dvb_attach(dib9000_attach, i2c, 0x82, &nim9090md_config[1]);
-	dib9000_set_slave_frontend(adap->fe_adap[0].fe, fe_slave);
-
-	return fe_slave == NULL ?  -ENODEV : 0;
-}
-
-static int nim9090md_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-	struct i2c_adapter *i2c;
-	struct dvb_frontend *fe_slave;
-	u16 data_dib190[10] = {
-		1, 0x5374,
-		2, 0x01ae,
-		7, 0x0020,
-		0, 0x00ef,
-		8, 0x0406,
-	};
-	if (!IS_ENABLED(CONFIG_DVB_DIB9000))
-		return -ENODEV;
-	i2c = dib9000_get_tuner_interface(adap->fe_adap[0].fe);
-	if (dvb_attach(dib0090_fw_register, adap->fe_adap[0].fe, i2c, &nim9090md_dib0090_config[0]) == NULL)
-		return -ENODEV;
-	i2c = dib9000_get_i2c_master(adap->fe_adap[0].fe, DIBX000_I2C_INTERFACE_GPIO_1_2, 0);
-	if (!i2c)
-		return -ENODEV;
-	if (dib01x0_pmu_update(i2c, data_dib190, 10) < 0)
-		return -ENODEV;
-
-	dib0700_set_i2c_speed(adap->dev, 1500);
-	if (dib9000_firmware_post_pll_init(adap->fe_adap[0].fe) < 0)
-		return -ENODEV;
-
-	fe_slave = dib9000_get_slave_frontend(adap->fe_adap[0].fe, 1);
-	if (fe_slave != NULL) {
-		i2c = dib9000_get_component_bus_interface(adap->fe_adap[0].fe);
-		dib9000_set_i2c_adapter(fe_slave, i2c);
-
-		i2c = dib9000_get_tuner_interface(fe_slave);
-		if (dvb_attach(dib0090_fw_register, fe_slave, i2c, &nim9090md_dib0090_config[1]) == NULL)
-			return -ENODEV;
-		fe_slave->dvb = adap->fe_adap[0].fe->dvb;
-		dib9000_fw_set_component_bus_speed(adap->fe_adap[0].fe, 1500);
-		if (dib9000_firmware_post_pll_init(fe_slave) < 0)
-			return -ENODEV;
-	}
-	release_firmware(state->frontend_firmware);
-
-	return 0;
-}
-
-/* NIM7090 */
-static int dib7090p_get_best_sampling(struct dvb_frontend *fe , struct dibx090p_best_adc *adc)
-{
-	u8 spur = 0, prediv = 0, loopdiv = 0, min_prediv = 1, max_prediv = 1;
-
-	u16 xtal = 12000;
-	u32 fcp_min = 1900;  /* PLL Minimum Frequency comparator KHz */
-	u32 fcp_max = 20000; /* PLL Maximum Frequency comparator KHz */
-	u32 fdem_max = 76000;
-	u32 fdem_min = 69500;
-	u32 fcp = 0, fs = 0, fdem = 0;
-	u32 harmonic_id = 0;
-
-	adc->pll_loopdiv = loopdiv;
-	adc->pll_prediv = prediv;
-	adc->timf = 0;
-
-	deb_info("bandwidth = %d fdem_min =%d", fe->dtv_property_cache.bandwidth_hz, fdem_min);
-
-	/* Find Min and Max prediv */
-	while ((xtal/max_prediv) >= fcp_min)
-		max_prediv++;
-
-	max_prediv--;
-	min_prediv = max_prediv;
-	while ((xtal/min_prediv) <= fcp_max) {
-		min_prediv--;
-		if (min_prediv == 1)
-			break;
-	}
-	deb_info("MIN prediv = %d : MAX prediv = %d", min_prediv, max_prediv);
-
-	min_prediv = 2;
-
-	for (prediv = min_prediv ; prediv < max_prediv; prediv++) {
-		fcp = xtal / prediv;
-		if (fcp > fcp_min && fcp < fcp_max) {
-			for (loopdiv = 1 ; loopdiv < 64 ; loopdiv++) {
-				fdem = ((xtal/prediv) * loopdiv);
-				fs   = fdem / 4;
-				/* test min/max system restrictions */
-
-				if ((fdem >= fdem_min) && (fdem <= fdem_max) && (fs >= fe->dtv_property_cache.bandwidth_hz/1000)) {
-					spur = 0;
-					/* test fs harmonics positions */
-					for (harmonic_id = (fe->dtv_property_cache.frequency / (1000*fs)) ;  harmonic_id <= ((fe->dtv_property_cache.frequency / (1000*fs))+1) ; harmonic_id++) {
-						if (((fs*harmonic_id) >= ((fe->dtv_property_cache.frequency/1000) - (fe->dtv_property_cache.bandwidth_hz/2000))) &&  ((fs*harmonic_id) <= ((fe->dtv_property_cache.frequency/1000) + (fe->dtv_property_cache.bandwidth_hz/2000)))) {
-							spur = 1;
-							break;
-						}
-					}
-
-					if (!spur) {
-						adc->pll_loopdiv = loopdiv;
-						adc->pll_prediv = prediv;
-						adc->timf = 2396745143UL/fdem*(1 << 9);
-						adc->timf += ((2396745143UL%fdem) << 9)/fdem;
-						deb_info("loopdiv=%i prediv=%i timf=%i", loopdiv, prediv, adc->timf);
-						break;
-					}
-				}
-			}
-		}
-		if (!spur)
-			break;
-	}
-
-
-	if (adc->pll_loopdiv == 0 && adc->pll_prediv == 0)
-		return -EINVAL;
-	else
-		return 0;
-}
-
-static int dib7090_agc_startup(struct dvb_frontend *fe)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-	struct dibx000_bandwidth_config pll;
-	u16 target;
-	struct dibx090p_best_adc adc;
-	int ret;
-
-	ret = state->set_param_save(fe);
-	if (ret < 0)
-		return ret;
-
-	memset(&pll, 0, sizeof(struct dibx000_bandwidth_config));
-	dib0090_pwm_gain_reset(fe);
-	target = (dib0090_get_wbd_target(fe) * 8 + 1) / 2;
-	state->dib7000p_ops.set_wbd_ref(fe, target);
-
-	if (dib7090p_get_best_sampling(fe, &adc) == 0) {
-		pll.pll_ratio  = adc.pll_loopdiv;
-		pll.pll_prediv = adc.pll_prediv;
-
-		state->dib7000p_ops.update_pll(fe, &pll);
-		state->dib7000p_ops.ctrl_timf(fe, DEMOD_TIMF_SET, adc.timf);
-	}
-	return 0;
-}
-
-static int dib7090_agc_restart(struct dvb_frontend *fe, u8 restart)
-{
-	deb_info("AGC restart callback: %d", restart);
-	if (restart == 0) /* before AGC startup */
-		dib0090_set_dc_servo(fe, 1);
-	return 0;
-}
-
-static int tfe7790p_update_lna(struct dvb_frontend *fe, u16 agc_global)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	deb_info("update LNA: agc global=%i", agc_global);
-
-	if (agc_global < 25000) {
-		state->dib7000p_ops.set_gpio(fe, 8, 0, 0);
-		state->dib7000p_ops.set_agc1_min(fe, 0);
-	} else {
-		state->dib7000p_ops.set_gpio(fe, 8, 0, 1);
-		state->dib7000p_ops.set_agc1_min(fe, 32768);
-	}
-
-	return 0;
-}
-
-static struct dib0090_wbd_slope dib7090_wbd_table[] = {
-	{ 380,   81, 850, 64, 540,  4},
-	{ 860,   51, 866, 21,  375, 4},
-	{1700,    0, 250, 0,   100, 6},
-	{2600,    0, 250, 0,   100, 6},
-	{ 0xFFFF, 0,   0, 0,   0,   0},
-};
-
-static struct dibx000_agc_config dib7090_agc_config[2] = {
-	{
-		.band_caps      = BAND_UHF,
-		/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=1, P_agc_inv_pwm1=0, P_agc_inv_pwm2=0,
-		* P_agc_inh_dc_rv_est=0, P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5, P_agc_write=0 */
-		.setup          = (0 << 15) | (0 << 14) | (5 << 11) | (0 << 10) | (0 << 9) | (0 << 8) | (3 << 5) | (0 << 4) | (5 << 1) | (0 << 0),
-
-		.inv_gain       = 687,
-		.time_stabiliz  = 10,
-
-		.alpha_level    = 0,
-		.thlock         = 118,
-
-		.wbd_inv        = 0,
-		.wbd_ref        = 1200,
-		.wbd_sel        = 3,
-		.wbd_alpha      = 5,
-
-		.agc1_max       = 65535,
-		.agc1_min       = 32768,
-
-		.agc2_max       = 65535,
-		.agc2_min       = 0,
-
-		.agc1_pt1       = 0,
-		.agc1_pt2       = 32,
-		.agc1_pt3       = 114,
-		.agc1_slope1    = 143,
-		.agc1_slope2    = 144,
-		.agc2_pt1       = 114,
-		.agc2_pt2       = 227,
-		.agc2_slope1    = 116,
-		.agc2_slope2    = 117,
-
-		.alpha_mant     = 18,
-		.alpha_exp      = 0,
-		.beta_mant      = 20,
-		.beta_exp       = 59,
-
-		.perform_agc_softsplit = 0,
-	} , {
-		.band_caps      = BAND_FM | BAND_VHF | BAND_CBAND,
-		/* P_agc_use_sd_mod1=0, P_agc_use_sd_mod2=0, P_agc_freq_pwm_div=1, P_agc_inv_pwm1=0, P_agc_inv_pwm2=0,
-		* P_agc_inh_dc_rv_est=0, P_agc_time_est=3, P_agc_freeze=0, P_agc_nb_est=5, P_agc_write=0 */
-		.setup          = (0 << 15) | (0 << 14) | (5 << 11) | (0 << 10) | (0 << 9) | (0 << 8) | (3 << 5) | (0 << 4) | (5 << 1) | (0 << 0),
-
-		.inv_gain       = 732,
-		.time_stabiliz  = 10,
-
-		.alpha_level    = 0,
-		.thlock         = 118,
-
-		.wbd_inv        = 0,
-		.wbd_ref        = 1200,
-		.wbd_sel        = 3,
-		.wbd_alpha      = 5,
-
-		.agc1_max       = 65535,
-		.agc1_min       = 0,
-
-		.agc2_max       = 65535,
-		.agc2_min       = 0,
-
-		.agc1_pt1       = 0,
-		.agc1_pt2       = 0,
-		.agc1_pt3       = 98,
-		.agc1_slope1    = 0,
-		.agc1_slope2    = 167,
-		.agc2_pt1       = 98,
-		.agc2_pt2       = 255,
-		.agc2_slope1    = 104,
-		.agc2_slope2    = 0,
-
-		.alpha_mant     = 18,
-		.alpha_exp      = 0,
-		.beta_mant      = 20,
-		.beta_exp       = 59,
-
-		.perform_agc_softsplit = 0,
-	}
-};
-
-static struct dibx000_bandwidth_config dib7090_clock_config_12_mhz = {
-	.internal = 60000,
-	.sampling = 15000,
-	.pll_prediv = 1,
-	.pll_ratio = 5,
-	.pll_range = 0,
-	.pll_reset = 0,
-	.pll_bypass = 0,
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 1,
-	.ADClkSrc = 1,
-	.modulo = 2,
-	.sad_cfg = (3 << 14) | (1 << 12) | (524 << 0),
-	.ifreq = (0 << 25) | 0,
-	.timf = 20452225,
-	.xtal_hz = 15000000,
-};
-
-static struct dib7000p_config nim7090_dib7000p_config = {
-	.output_mpeg2_in_188_bytes  = 1,
-	.hostbus_diversity			= 1,
-	.tuner_is_baseband			= 1,
-	.update_lna					= tfe7790p_update_lna, /* GPIO used is the same as TFE7790 */
-
-	.agc_config_count			= 2,
-	.agc						= dib7090_agc_config,
-
-	.bw							= &dib7090_clock_config_12_mhz,
-
-	.gpio_dir					= DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val					= DIB7000P_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos				= DIB7000P_GPIO_DEFAULT_PWM_POS,
-
-	.pwm_freq_div				= 0,
-
-	.agc_control				= dib7090_agc_restart,
-
-	.spur_protect				= 0,
-	.disable_sample_and_hold	= 0,
-	.enable_current_mirror		= 0,
-	.diversity_delay			= 0,
-
-	.output_mode				= OUTMODE_MPEG2_FIFO,
-	.enMpegOutput				= 1,
-};
-
-static int tfe7090p_pvr_update_lna(struct dvb_frontend *fe, u16 agc_global)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	deb_info("TFE7090P-PVR update LNA: agc global=%i", agc_global);
-	if (agc_global < 25000) {
-		state->dib7000p_ops.set_gpio(fe, 5, 0, 0);
-		state->dib7000p_ops.set_agc1_min(fe, 0);
-	} else {
-		state->dib7000p_ops.set_gpio(fe, 5, 0, 1);
-		state->dib7000p_ops.set_agc1_min(fe, 32768);
-	}
-
-	return 0;
-}
-
-static struct dib7000p_config tfe7090pvr_dib7000p_config[2] = {
-	{
-		.output_mpeg2_in_188_bytes  = 1,
-		.hostbus_diversity			= 1,
-		.tuner_is_baseband			= 1,
-		.update_lna					= tfe7090p_pvr_update_lna,
-
-		.agc_config_count			= 2,
-		.agc						= dib7090_agc_config,
-
-		.bw							= &dib7090_clock_config_12_mhz,
-
-		.gpio_dir					= DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-		.gpio_val					= DIB7000P_GPIO_DEFAULT_VALUES,
-		.gpio_pwm_pos				= DIB7000P_GPIO_DEFAULT_PWM_POS,
-
-		.pwm_freq_div				= 0,
-
-		.agc_control				= dib7090_agc_restart,
-
-		.spur_protect				= 0,
-		.disable_sample_and_hold	= 0,
-		.enable_current_mirror		= 0,
-		.diversity_delay			= 0,
-
-		.output_mode				= OUTMODE_MPEG2_PAR_GATED_CLK,
-		.default_i2c_addr			= 0x90,
-		.enMpegOutput				= 1,
+		.key	= "\x16\xaf\x5b\x14\x5f\xc9\xf5\x79"
+			  "\xc1\x75\xf9\x3e\x3b\xfb\x0e\xed"
+			  "\x86\x3d\x06\xcc\xfd\xb7\x85\x15"
+			  "\x00\x00\x00\x48",
+		.klen	= 28,
+		.iv	= "\x36\x73\x3c\x14\x7d\x6d\x93\xcb",
+		.input	= "Single block msg",
+		.ilen	= 16,
+		.result	= "\x4b\x55\x38\x4f\xe2\x59\xc9\xc8"
+			  "\x4e\x79\x35\xa0\x03\xcb\xe9\x28",
+		.rlen	= 16,
 	}, {
-		.output_mpeg2_in_188_bytes  = 1,
-		.hostbus_diversity			= 1,
-		.tuner_is_baseband			= 1,
-		.update_lna					= tfe7090p_pvr_update_lna,
-
-		.agc_config_count			= 2,
-		.agc						= dib7090_agc_config,
-
-		.bw							= &dib7090_clock_config_12_mhz,
-
-		.gpio_dir					= DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-		.gpio_val					= DIB7000P_GPIO_DEFAULT_VALUES,
-		.gpio_pwm_pos				= DIB7000P_GPIO_DEFAULT_PWM_POS,
-
-		.pwm_freq_div				= 0,
-
-		.agc_control				= dib7090_agc_restart,
-
-		.spur_protect				= 0,
-		.disable_sample_and_hold	= 0,
-		.enable_current_mirror		= 0,
-		.diversity_delay			= 0,
-
-		.output_mode				= OUTMODE_MPEG2_PAR_GATED_CLK,
-		.default_i2c_addr			= 0x92,
-		.enMpegOutput				= 0,
-	}
-};
-
-static struct dib0090_config nim7090_dib0090_config = {
-	.io.clock_khz = 12000,
-	.io.pll_bypass = 0,
-	.io.pll_range = 0,
-	.io.pll_prediv = 3,
-	.io.pll_loopdiv = 6,
-	.io.adc_clock_ratio = 0,
-	.io.pll_int_loop_filt = 0,
-
-	.freq_offset_khz_uhf = 0,
-	.freq_offset_khz_vhf = 0,
-
-	.clkouttobamse = 1,
-	.analog_output = 0,
-
-	.wbd_vhf_offset = 0,
-	.wbd_cband_offset = 0,
-	.use_pwm_agc = 1,
-	.clkoutdrive = 0,
-
-	.fref_clock_ratio = 0,
-
-	.wbd = dib7090_wbd_table,
-
-	.ls_cfg_pad_drv = 0,
-	.data_tx_drv = 0,
-	.low_if = NULL,
-	.in_soc = 1,
-};
-
-static struct dib7000p_config tfe7790p_dib7000p_config = {
-	.output_mpeg2_in_188_bytes  = 1,
-	.hostbus_diversity			= 1,
-	.tuner_is_baseband			= 1,
-	.update_lna					= tfe7790p_update_lna,
-
-	.agc_config_count			= 2,
-	.agc						= dib7090_agc_config,
-
-	.bw							= &dib7090_clock_config_12_mhz,
-
-	.gpio_dir					= DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val					= DIB7000P_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos				= DIB7000P_GPIO_DEFAULT_PWM_POS,
-
-	.pwm_freq_div				= 0,
-
-	.agc_control				= dib7090_agc_restart,
-
-	.spur_protect				= 0,
-	.disable_sample_and_hold	= 0,
-	.enable_current_mirror		= 0,
-	.diversity_delay			= 0,
-
-	.output_mode				= OUTMODE_MPEG2_PAR_GATED_CLK,
-	.enMpegOutput				= 1,
-};
-
-static struct dib0090_config tfe7790p_dib0090_config = {
-	.io.clock_khz = 12000,
-	.io.pll_bypass = 0,
-	.io.pll_range = 0,
-	.io.pll_prediv = 3,
-	.io.pll_loopdiv = 6,
-	.io.adc_clock_ratio = 0,
-	.io.pll_int_loop_filt = 0,
-
-	.freq_offset_khz_uhf = 0,
-	.freq_offset_khz_vhf = 0,
-
-	.clkouttobamse = 1,
-	.analog_output = 0,
-
-	.wbd_vhf_offset = 0,
-	.wbd_cband_offset = 0,
-	.use_pwm_agc = 1,
-	.clkoutdrive = 0,
-
-	.fref_clock_ratio = 0,
-
-	.wbd = dib7090_wbd_table,
-
-	.ls_cfg_pad_drv = 0,
-	.data_tx_drv = 0,
-	.low_if = NULL,
-	.in_soc = 1,
-	.force_cband_input = 0,
-	.is_dib7090e = 0,
-	.force_crystal_mode = 1,
-};
-
-static struct dib0090_config tfe7090pvr_dib0090_config[2] = {
-	{
-		.io.clock_khz = 12000,
-		.io.pll_bypass = 0,
-		.io.pll_range = 0,
-		.io.pll_prediv = 3,
-		.io.pll_loopdiv = 6,
-		.io.adc_clock_ratio = 0,
-		.io.pll_int_loop_filt = 0,
-
-		.freq_offset_khz_uhf = 50,
-		.freq_offset_khz_vhf = 70,
-
-		.clkouttobamse = 1,
-		.analog_output = 0,
-
-		.wbd_vhf_offset = 0,
-		.wbd_cband_offset = 0,
-		.use_pwm_agc = 1,
-		.clkoutdrive = 0,
-
-		.fref_clock_ratio = 0,
-
-		.wbd = dib7090_wbd_table,
-
-		.ls_cfg_pad_drv = 0,
-		.data_tx_drv = 0,
-		.low_if = NULL,
-		.in_soc = 1,
+		.key	= "\x7c\x5c\xb2\x40\x1b\x3d\xc3\x3c"
+			  "\x19\xe7\x34\x08\x19\xe0\xf6\x9c"
+			  "\x67\x8c\x3d\xb8\xe6\xf6\xa9\x1a"
+			  "\x00\x96\xb0\x3b",
+		.klen	= 28,
+		.iv	= "\x02\x0c\x6e\xad\xc2\xcb\x50\x0d",
+		.input	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+		.ilen	= 32,
+		.result	= "\x45\x32\x43\xfc\x60\x9b\x23\x32"
+			  "\x7e\xdf\xaa\xfa\x71\x31\xcd\x9f"
+			  "\x84\x90\x70\x1c\x5a\xd4\xa7\x9c"
+			  "\xfc\x1f\xe0\xff\x42\xf4\xfb\x00",
+		.rlen	= 32,
 	}, {
-		.io.clock_khz = 12000,
-		.io.pll_bypass = 0,
-		.io.pll_range = 0,
-		.io.pll_prediv = 3,
-		.io.pll_loopdiv = 6,
-		.io.adc_clock_ratio = 0,
-		.io.pll_int_loop_filt = 0,
-
-		.freq_offset_khz_uhf = -50,
-		.freq_offset_khz_vhf = -70,
-
-		.clkouttobamse = 1,
-		.analog_output = 0,
-
-		.wbd_vhf_offset = 0,
-		.wbd_cband_offset = 0,
-		.use_pwm_agc = 1,
-		.clkoutdrive = 0,
-
-		.fref_clock_ratio = 0,
-
-		.wbd = dib7090_wbd_table,
-
-		.ls_cfg_pad_drv = 0,
-		.data_tx_drv = 0,
-		.low_if = NULL,
-		.in_soc = 1,
-	}
-};
-
-static int nim7090_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 0x10, &nim7090_dib7000p_config) != 0) {
-		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x80, &nim7090_dib7000p_config);
-
-	return adap->fe_adap[0].fe == NULL ?  -ENODEV : 0;
-}
-
-static int nim7090_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c = st->dib7000p_ops.get_i2c_tuner(adap->fe_adap[0].fe);
-
-	nim7090_dib0090_config.reset = st->dib7000p_ops.tuner_sleep,
-	nim7090_dib0090_config.sleep = st->dib7000p_ops.tuner_sleep,
-	nim7090_dib0090_config.get_adc_power = st->dib7000p_ops.get_adc_power;
-
-	if (dvb_attach(dib0090_register, adap->fe_adap[0].fe, tun_i2c, &nim7090_dib0090_config) == NULL)
-		return -ENODEV;
-
-	st->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 1);
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib7090_agc_startup;
-	return 0;
-}
-
-static int tfe7090pvr_frontend0_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_state *st = adap->dev->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	/* The TFE7090 requires the dib0700 to not be in master mode */
-	st->disable_streaming_master_mode = 1;
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	/* initialize IC 0 */
-	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 1, 0x20, &tfe7090pvr_dib7000p_config[0]) != 0) {
-		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-
-	dib0700_set_i2c_speed(adap->dev, 340);
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x90, &tfe7090pvr_dib7000p_config[0]);
-	if (adap->fe_adap[0].fe == NULL)
-		return -ENODEV;
-
-	state->dib7000p_ops.slave_reset(adap->fe_adap[0].fe);
-
-	return 0;
-}
-
-static int tfe7090pvr_frontend1_attach(struct dvb_usb_adapter *adap)
-{
-	struct i2c_adapter *i2c;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (adap->dev->adapter[0].fe_adap[0].fe == NULL) {
-		err("the master dib7090 has to be initialized first");
-		return -ENODEV; /* the master device has not been initialized */
-	}
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	i2c = state->dib7000p_ops.get_i2c_master(adap->dev->adapter[0].fe_adap[0].fe, DIBX000_I2C_INTERFACE_GPIO_6_7, 1);
-	if (state->dib7000p_ops.i2c_enumeration(i2c, 1, 0x10, &tfe7090pvr_dib7000p_config[1]) != 0) {
-		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n", __func__);
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(i2c, 0x92, &tfe7090pvr_dib7000p_config[1]);
-	dib0700_set_i2c_speed(adap->dev, 200);
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int tfe7090pvr_tuner0_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c = st->dib7000p_ops.get_i2c_tuner(adap->fe_adap[0].fe);
-
-	tfe7090pvr_dib0090_config[0].reset = st->dib7000p_ops.tuner_sleep;
-	tfe7090pvr_dib0090_config[0].sleep = st->dib7000p_ops.tuner_sleep;
-	tfe7090pvr_dib0090_config[0].get_adc_power = st->dib7000p_ops.get_adc_power;
-
-	if (dvb_attach(dib0090_register, adap->fe_adap[0].fe, tun_i2c, &tfe7090pvr_dib0090_config[0]) == NULL)
-		return -ENODEV;
-
-	st->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 1);
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib7090_agc_startup;
-	return 0;
-}
-
-static int tfe7090pvr_tuner1_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c = st->dib7000p_ops.get_i2c_tuner(adap->fe_adap[0].fe);
-
-	tfe7090pvr_dib0090_config[1].reset = st->dib7000p_ops.tuner_sleep;
-	tfe7090pvr_dib0090_config[1].sleep = st->dib7000p_ops.tuner_sleep;
-	tfe7090pvr_dib0090_config[1].get_adc_power = st->dib7000p_ops.get_adc_power;
-
-	if (dvb_attach(dib0090_register, adap->fe_adap[0].fe, tun_i2c, &tfe7090pvr_dib0090_config[1]) == NULL)
-		return -ENODEV;
-
-	st->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 1);
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib7090_agc_startup;
-	return 0;
-}
-
-static int tfe7790p_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_state *st = adap->dev->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	/* The TFE7790P requires the dib0700 to not be in master mode */
-	st->disable_streaming_master_mode = 1;
-
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-	msleep(20);
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(20);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap,
-				1, 0x10, &tfe7790p_dib7000p_config) != 0) {
-		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
-				__func__);
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap,
-			0x80, &tfe7790p_dib7000p_config);
-
-	return adap->fe_adap[0].fe == NULL ?  -ENODEV : 0;
-}
-
-static int tfe7790p_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *st = adap->priv;
-	struct i2c_adapter *tun_i2c =
-		st->dib7000p_ops.get_i2c_tuner(adap->fe_adap[0].fe);
-
-
-	tfe7790p_dib0090_config.reset = st->dib7000p_ops.tuner_sleep;
-	tfe7790p_dib0090_config.sleep = st->dib7000p_ops.tuner_sleep;
-	tfe7790p_dib0090_config.get_adc_power = st->dib7000p_ops.get_adc_power;
-
-	if (dvb_attach(dib0090_register, adap->fe_adap[0].fe, tun_i2c,
-				&tfe7790p_dib0090_config) == NULL)
-		return -ENODEV;
-
-	st->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 1);
-
-	st->set_param_save = adap->fe_adap[0].fe->ops.tuner_ops.set_params;
-	adap->fe_adap[0].fe->ops.tuner_ops.set_params = dib7090_agc_startup;
-	return 0;
-}
-
-/* STK7070PD */
-static struct dib7000p_config stk7070pd_dib7000p_config[2] = {
-	{
-		.output_mpeg2_in_188_bytes = 1,
-
-		.agc_config_count = 1,
-		.agc = &dib7070_agc_config,
-		.bw  = &dib7070_bw_config_12_mhz,
-		.tuner_is_baseband = 1,
-		.spur_protect = 1,
-
-		.gpio_dir = DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-		.gpio_val = DIB7000P_GPIO_DEFAULT_VALUES,
-		.gpio_pwm_pos = DIB7000P_GPIO_DEFAULT_PWM_POS,
-
-		.hostbus_diversity = 1,
+		.key	= "\x77\x6b\xef\xf2\x85\x1d\xb0\x6f"
+			  "\x4c\x8a\x05\x42\xc8\x69\x6f\x6c"
+			  "\x6a\x81\xaf\x1e\xec\x96\xb4\xd3"
+			  "\x7f\xc1\xd6\x89\xe6\xc1\xc1\x04"
+			  "\x00\x00\x00\x60",
+		.klen	= 36,
+		.iv	= "\xdb\x56\x72\xc9\x7a\xa8\xf0\xb2",
+		.input	= "Single block msg",
+		.ilen	= 16,
+		.result = "\x14\x5a\xd0\x1d\xbf\x82\x4e\xc7"
+			  "\x56\x08\x63\xdc\x71\xe3\xe0\xc0",
+		.rlen	= 16,
 	}, {
-		.output_mpeg2_in_188_bytes = 1,
-
-		.agc_config_count = 1,
-		.agc = &dib7070_agc_config,
-		.bw  = &dib7070_bw_config_12_mhz,
-		.tuner_is_baseband = 1,
-		.spur_protect = 1,
-
-		.gpio_dir = DIB7000P_GPIO_DEFAULT_DIRECTIONS,
-		.gpio_val = DIB7000P_GPIO_DEFAULT_VALUES,
-		.gpio_pwm_pos = DIB7000P_GPIO_DEFAULT_PWM_POS,
-
-		.hostbus_diversity = 1,
-	}
-};
-
-static void stk7070pd_init(struct dvb_usb_device *dev)
-{
-	dib0700_set_gpio(dev, GPIO6, GPIO_OUT, 1);
-	msleep(10);
-	dib0700_set_gpio(dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(dev, GPIO10, GPIO_OUT, 0);
-
-	dib0700_ctrl_clock(dev, 72, 1);
-
-	msleep(10);
-	dib0700_set_gpio(dev, GPIO10, GPIO_OUT, 1);
-}
-
-static int stk7070pd_frontend_attach0(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	stk7070pd_init(adap->dev);
-
-	msleep(10);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-
-	if (state->dib7000p_ops.i2c_enumeration(&adap->dev->i2c_adap, 2, 18,
-				     stk7070pd_dib7000p_config) != 0) {
-		err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
-		    __func__);
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x80, &stk7070pd_dib7000p_config[0]);
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int stk7070pd_frontend_attach1(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x82, &stk7070pd_dib7000p_config[1]);
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int novatd_read_status_override(struct dvb_frontend *fe,
-				       enum fe_status *stat)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dvb_usb_device *dev = adap->dev;
-	struct dib0700_state *state = dev->priv;
-	int ret;
-
-	ret = state->read_status(fe, stat);
-
-	if (!ret)
-		dib0700_set_gpio(dev, adap->id == 0 ? GPIO1 : GPIO0, GPIO_OUT,
-				!!(*stat & FE_HAS_LOCK));
-
-	return ret;
-}
-
-static int novatd_sleep_override(struct dvb_frontend* fe)
-{
-	struct dvb_usb_adapter *adap = fe->dvb->priv;
-	struct dvb_usb_device *dev = adap->dev;
-	struct dib0700_state *state = dev->priv;
-
-	/* turn off LED */
-	dib0700_set_gpio(dev, adap->id == 0 ? GPIO1 : GPIO0, GPIO_OUT, 0);
-
-	return state->sleep(fe);
-}
-
-/**
- * novatd_frontend_attach - Nova-TD specific attach
- *
- * Nova-TD has GPIO0, 1 and 2 for LEDs. So do not fiddle with them except for
- * information purposes.
- */
-static int novatd_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dvb_usb_device *dev = adap->dev;
-	struct dib0700_state *st = dev->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	if (adap->id == 0) {
-		stk7070pd_init(dev);
-
-		/* turn the power LED on, the other two off (just in case) */
-		dib0700_set_gpio(dev, GPIO0, GPIO_OUT, 0);
-		dib0700_set_gpio(dev, GPIO1, GPIO_OUT, 0);
-		dib0700_set_gpio(dev, GPIO2, GPIO_OUT, 1);
-
-		if (state->dib7000p_ops.i2c_enumeration(&dev->i2c_adap, 2, 18,
-					     stk7070pd_dib7000p_config) != 0) {
-			err("%s: state->dib7000p_ops.i2c_enumeration failed.  Cannot continue\n",
-			    __func__);
-			dvb_detach(state->dib7000p_ops.set_wbd_ref);
-			return -ENODEV;
-		}
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&dev->i2c_adap,
-			adap->id == 0 ? 0x80 : 0x82,
-			&stk7070pd_dib7000p_config[adap->id]);
-
-	if (adap->fe_adap[0].fe == NULL)
-		return -ENODEV;
-
-	st->read_status = adap->fe_adap[0].fe->ops.read_status;
-	adap->fe_adap[0].fe->ops.read_status = novatd_read_status_override;
-	st->sleep = adap->fe_adap[0].fe->ops.sleep;
-	adap->fe_adap[0].fe->ops.sleep = novatd_sleep_override;
-
-	return 0;
-}
-
-/* S5H1411 */
-static struct s5h1411_config pinnacle_801e_config = {
-	.output_mode   = S5H1411_PARALLEL_OUTPUT,
-	.gpio          = S5H1411_GPIO_OFF,
-	.mpeg_timing   = S5H1411_MPEGTIMING_NONCONTINOUS_NONINVERTING_CLOCK,
-	.qam_if        = S5H1411_IF_44000,
-	.vsb_if        = S5H1411_IF_44000,
-	.inversion     = S5H1411_INVERSION_OFF,
-	.status_mode   = S5H1411_DEMODLOCKING
-};
-
-/* Pinnacle PCTV HD Pro 801e GPIOs map:
-   GPIO0  - currently unknown
-   GPIO1  - xc5000 tuner reset
-   GPIO2  - CX25843 sleep
-   GPIO3  - currently unknown
-   GPIO4  - currently unknown
-   GPIO6  - currently unknown
-   GPIO7  - currently unknown
-   GPIO9  - currently unknown
-   GPIO10 - CX25843 reset
- */
-static int s5h1411_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_state *st = adap->dev->priv;
-
-	/* Make use of the new i2c functions from FW 1.20 */
-	st->fw_use_new_i2c_api = 1;
-
-	/* The s5h1411 requires the dib0700 to not be in master mode */
-	st->disable_streaming_master_mode = 1;
-
-	/* All msleep values taken from Windows USB trace */
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 0);
-	dib0700_set_gpio(adap->dev, GPIO3, GPIO_OUT, 0);
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(400);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-	msleep(60);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(30);
-	dib0700_set_gpio(adap->dev, GPIO0, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO9, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO4, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO7, GPIO_OUT, 1);
-	dib0700_set_gpio(adap->dev, GPIO2, GPIO_OUT, 0);
-	msleep(30);
-
-	/* Put the CX25843 to sleep for now since we're in digital mode */
-	dib0700_set_gpio(adap->dev, GPIO2, GPIO_OUT, 1);
-
-	/* GPIOs are initialized, do the attach */
-	adap->fe_adap[0].fe = dvb_attach(s5h1411_attach, &pinnacle_801e_config,
-			      &adap->dev->i2c_adap);
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int dib0700_xc5000_tuner_callback(void *priv, int component,
-					 int command, int arg)
-{
-	struct dvb_usb_adapter *adap = priv;
-
-	if (command == XC5000_TUNER_RESET) {
-		/* Reset the tuner */
-		dib0700_set_gpio(adap->dev, GPIO1, GPIO_OUT, 0);
-		msleep(10);
-		dib0700_set_gpio(adap->dev, GPIO1, GPIO_OUT, 1);
-		msleep(10);
-	} else {
-		err("xc5000: unknown tuner callback command: %d\n", command);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static struct xc5000_config s5h1411_xc5000_tunerconfig = {
-	.i2c_address      = 0x64,
-	.if_khz           = 5380,
-};
-
-static int xc5000_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	/* FIXME: generalize & move to common area */
-	adap->fe_adap[0].fe->callback = dib0700_xc5000_tuner_callback;
-
-	return dvb_attach(xc5000_attach, adap->fe_adap[0].fe, &adap->dev->i2c_adap,
-			  &s5h1411_xc5000_tunerconfig)
-		== NULL ? -ENODEV : 0;
-}
-
-static int dib0700_xc4000_tuner_callback(void *priv, int component,
-					 int command, int arg)
-{
-	struct dvb_usb_adapter *adap = priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (command == XC4000_TUNER_RESET) {
-		/* Reset the tuner */
-		state->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 0);
-		msleep(10);
-		state->dib7000p_ops.set_gpio(adap->fe_adap[0].fe, 8, 0, 1);
-	} else {
-		err("xc4000: unknown tuner callback command: %d\n", command);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static struct dibx000_agc_config stk7700p_7000p_xc4000_agc_config = {
-	.band_caps = BAND_UHF | BAND_VHF,
-	.setup = 0x64,
-	.inv_gain = 0x02c8,
-	.time_stabiliz = 0x15,
-	.alpha_level = 0x00,
-	.thlock = 0x76,
-	.wbd_inv = 0x01,
-	.wbd_ref = 0x0b33,
-	.wbd_sel = 0x00,
-	.wbd_alpha = 0x02,
-	.agc1_max = 0x00,
-	.agc1_min = 0x00,
-	.agc2_max = 0x9b26,
-	.agc2_min = 0x26ca,
-	.agc1_pt1 = 0x00,
-	.agc1_pt2 = 0x00,
-	.agc1_pt3 = 0x00,
-	.agc1_slope1 = 0x00,
-	.agc1_slope2 = 0x00,
-	.agc2_pt1 = 0x00,
-	.agc2_pt2 = 0x80,
-	.agc2_slope1 = 0x1d,
-	.agc2_slope2 = 0x1d,
-	.alpha_mant = 0x11,
-	.alpha_exp = 0x1b,
-	.beta_mant = 0x17,
-	.beta_exp = 0x33,
-	.perform_agc_softsplit = 0x00,
-};
-
-static struct dibx000_bandwidth_config stk7700p_xc4000_pll_config = {
-	.internal = 60000,
-	.sampling = 30000,
-	.pll_prediv = 1,
-	.pll_ratio = 8,
-	.pll_range = 3,
-	.pll_reset = 1,
-	.pll_bypass = 0,
-	.enable_refdiv = 0,
-	.bypclk_div = 0,
-	.IO_CLK_en_core = 1,
-	.ADClkSrc = 1,
-	.modulo = 0,
-	.sad_cfg = (3 << 14) | (1 << 12) | 524, /* sad_cfg: refsel, sel, freq_15k */
-	.ifreq = 39370534,
-	.timf = 20452225,
-	.xtal_hz = 30000000
-};
-
-/* FIXME: none of these inputs are validated yet */
-static struct dib7000p_config pctv_340e_config = {
-	.output_mpeg2_in_188_bytes = 1,
-
-	.agc_config_count = 1,
-	.agc = &stk7700p_7000p_xc4000_agc_config,
-	.bw  = &stk7700p_xc4000_pll_config,
-
-	.gpio_dir = DIB7000M_GPIO_DEFAULT_DIRECTIONS,
-	.gpio_val = DIB7000M_GPIO_DEFAULT_VALUES,
-	.gpio_pwm_pos = DIB7000M_GPIO_DEFAULT_PWM_POS,
-};
-
-/* PCTV 340e GPIOs map:
-   dib0700:
-   GPIO2  - CX25843 sleep
-   GPIO3  - CS5340 reset
-   GPIO5  - IRD
-   GPIO6  - Power Supply
-   GPIO8  - LNA (1=off 0=on)
-   GPIO10 - CX25843 reset
-   dib7000:
-   GPIO8  - xc4000 reset
- */
-static int pctv340e_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_state *st = adap->dev->priv;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	if (!dvb_attach(dib7000p_attach, &state->dib7000p_ops))
-		return -ENODEV;
-
-	/* Power Supply on */
-	dib0700_set_gpio(adap->dev, GPIO6,  GPIO_OUT, 0);
-	msleep(50);
-	dib0700_set_gpio(adap->dev, GPIO6,  GPIO_OUT, 1);
-	msleep(100); /* Allow power supply to settle before probing */
-
-	/* cx25843 reset */
-	dib0700_set_gpio(adap->dev, GPIO10,  GPIO_OUT, 0);
-	msleep(1); /* cx25843 datasheet say 350us required */
-	dib0700_set_gpio(adap->dev, GPIO10,  GPIO_OUT, 1);
-
-	/* LNA off for now */
-	dib0700_set_gpio(adap->dev, GPIO8,  GPIO_OUT, 1);
-
-	/* Put the CX25843 to sleep for now since we're in digital mode */
-	dib0700_set_gpio(adap->dev, GPIO2, GPIO_OUT, 1);
-
-	/* FIXME: not verified yet */
-	dib0700_ctrl_clock(adap->dev, 72, 1);
-
-	msleep(500);
-
-	if (state->dib7000p_ops.dib7000pc_detection(&adap->dev->i2c_adap) == 0) {
-		/* Demodulator not found for some reason? */
-		dvb_detach(state->dib7000p_ops.set_wbd_ref);
-		return -ENODEV;
-	}
-
-	adap->fe_adap[0].fe = state->dib7000p_ops.init(&adap->dev->i2c_adap, 0x12,
-			      &pctv_340e_config);
-	st->is_dib7000pc = 1;
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static struct xc4000_config dib7000p_xc4000_tunerconfig = {
-	.i2c_address	  = 0x61,
-	.default_pm	  = 1,
-	.dvb_amplitude	  = 0,
-	.set_smoothedcvbs = 0,
-	.if_khz		  = 5400
-};
-
-static int xc4000_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	struct i2c_adapter *tun_i2c;
-	struct dib0700_adapter_state *state = adap->priv;
-
-	/* The xc4000 is not on the main i2c bus */
-	tun_i2c = state->dib7000p_ops.get_i2c_master(adap->fe_adap[0].fe,
-					  DIBX000_I2C_INTERFACE_TUNER, 1);
-	if (tun_i2c == NULL) {
-		printk(KERN_ERR "Could not reach tuner i2c bus\n");
-		return 0;
-	}
-
-	/* Setup the reset callback */
-	adap->fe_adap[0].fe->callback = dib0700_xc4000_tuner_callback;
-
-	return dvb_attach(xc4000_attach, adap->fe_adap[0].fe, tun_i2c,
-			  &dib7000p_xc4000_tunerconfig)
-		== NULL ? -ENODEV : 0;
-}
-
-static struct lgdt3305_config hcw_lgdt3305_config = {
-	.i2c_addr           = 0x0e,
-	.mpeg_mode          = LGDT3305_MPEG_PARALLEL,
-	.tpclk_edge         = LGDT3305_TPCLK_FALLING_EDGE,
-	.tpvalid_polarity   = LGDT3305_TP_VALID_LOW,
-	.deny_i2c_rptr      = 0,
-	.spectral_inversion = 1,
-	.qam_if_khz         = 6000,
-	.vsb_if_khz         = 6000,
-	.usref_8vsb         = 0x0500,
-};
-
-static struct mxl5007t_config hcw_mxl5007t_config = {
-	.xtal_freq_hz = MxL_XTAL_25_MHZ,
-	.if_freq_hz = MxL_IF_6_MHZ,
-	.invert_if = 1,
-};
-
-/* TIGER-ATSC map:
-   GPIO0  - LNA_CTR  (H: LNA power enabled, L: LNA power disabled)
-   GPIO1  - ANT_SEL  (H: VPA, L: MCX)
-   GPIO4  - SCL2
-   GPIO6  - EN_TUNER
-   GPIO7  - SDA2
-   GPIO10 - DEM_RST
-
-   MXL is behind LG's i2c repeater.  LG is on SCL2/SDA2 gpios on the DIB
- */
-static int lgdt3305_frontend_attach(struct dvb_usb_adapter *adap)
-{
-	struct dib0700_state *st = adap->dev->priv;
-
-	/* Make use of the new i2c functions from FW 1.20 */
-	st->fw_use_new_i2c_api = 1;
-
-	st->disable_streaming_master_mode = 1;
-
-	/* fe power enable */
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 0);
-	msleep(30);
-	dib0700_set_gpio(adap->dev, GPIO6, GPIO_OUT, 1);
-	msleep(30);
-
-	/* demod reset */
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(30);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 0);
-	msleep(30);
-	dib0700_set_gpio(adap->dev, GPIO10, GPIO_OUT, 1);
-	msleep(30);
-
-	adap->fe_adap[0].fe = dvb_attach(lgdt3305_attach,
-			      &hcw_lgdt3305_config,
-			      &adap->dev->i2c_adap);
-
-	return adap->fe_adap[0].fe == NULL ? -ENODEV : 0;
-}
-
-static int mxl5007t_tuner_attach(struct dvb_usb_adapter *adap)
-{
-	return dvb_attach(mxl5007t_attach, adap->fe_adap[0].fe,
-			  &adap->dev->i2c_adap, 0x60,
-			  &hcw_mxl5007t_config) == NULL ? -ENODEV : 0;
-}
-
-
-/* DVB-USB and USB stuff follows */
-struct usb_device_id dib0700_usb_id_table[] = {
-/* 0 */	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK7700P) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK7700P_PC) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_NOVA_T_500) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_NOVA_T_500_2) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_NOVA_T_STICK) },
-/* 5 */	{ USB_DEVICE(USB_VID_AVERMEDIA, USB_PID_AVERMEDIA_VOLAR) },
-	{ USB_DEVICE(USB_VID_COMPRO,    USB_PID_COMPRO_VIDEOMATE_U500) },
-	{ USB_DEVICE(USB_VID_UNIWILL,   USB_PID_UNIWILL_STK7700P) },
-	{ USB_DEVICE(USB_VID_LEADTEK,   USB_PID_WINFAST_DTV_DONGLE_STK7700P) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_NOVA_T_STICK_2) },
-/* 10 */{ USB_DEVICE(USB_VID_AVERMEDIA, USB_PID_AVERMEDIA_VOLAR_2) },
-	{ USB_DEVICE(USB_VID_PINNACLE,  USB_PID_PINNACLE_PCTV2000E) },
-	{ USB_DEVICE(USB_VID_TERRATEC,
-			USB_PID_TERRATEC_CINERGY_DT_XS_DIVERSITY) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_NOVA_TD_STICK) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK7700D) },
-/* 15 */{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK7070P) },
-	{ USB_DEVICE(USB_VID_PINNACLE,  USB_PID_PINNACLE_PCTV_DVB_T_FLASH) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK7070PD) },
-	{ USB_DEVICE(USB_VID_PINNACLE,
-			USB_PID_PINNACLE_PCTV_DUAL_DIVERSITY_DVB_T) },
-	{ USB_DEVICE(USB_VID_COMPRO,    USB_PID_COMPRO_VIDEOMATE_U500_PC) },
-/* 20 */{ USB_DEVICE(USB_VID_AVERMEDIA, USB_PID_AVERMEDIA_EXPRESS) },
-	{ USB_DEVICE(USB_VID_GIGABYTE,  USB_PID_GIGABYTE_U7000) },
-	{ USB_DEVICE(USB_VID_ULTIMA_ELECTRONIC, USB_PID_ARTEC_T14BR) },
-	{ USB_DEVICE(USB_VID_ASUS,      USB_PID_ASUS_U3000) },
-	{ USB_DEVICE(USB_VID_ASUS,      USB_PID_ASUS_U3100) },
-/* 25 */{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_NOVA_T_STICK_3) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_MYTV_T) },
-	{ USB_DEVICE(USB_VID_TERRATEC,  USB_PID_TERRATEC_CINERGY_HT_USB_XE) },
-	{ USB_DEVICE(USB_VID_PINNACLE,	USB_PID_PINNACLE_EXPRESSCARD_320CX) },
-	{ USB_DEVICE(USB_VID_PINNACLE,	USB_PID_PINNACLE_PCTV72E) },
-/* 30 */{ USB_DEVICE(USB_VID_PINNACLE,	USB_PID_PINNACLE_PCTV73E) },
-	{ USB_DEVICE(USB_VID_YUAN,	USB_PID_YUAN_EC372S) },
-	{ USB_DEVICE(USB_VID_TERRATEC,	USB_PID_TERRATEC_CINERGY_HT_EXPRESS) },
-	{ USB_DEVICE(USB_VID_TERRATEC,	USB_PID_TERRATEC_CINERGY_T_XXS) },
-	{ USB_DEVICE(USB_VID_LEADTEK,   USB_PID_WINFAST_DTV_DONGLE_STK7700P_2) },
-/* 35 */{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_NOVA_TD_STICK_52009) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_NOVA_T_500_3) },
-	{ USB_DEVICE(USB_VID_GIGABYTE,  USB_PID_GIGABYTE_U8000) },
-	{ USB_DEVICE(USB_VID_YUAN,      USB_PID_YUAN_STK7700PH) },
-	{ USB_DEVICE(USB_VID_ASUS,	USB_PID_ASUS_U3000H) },
-/* 40 */{ USB_DEVICE(USB_VID_PINNACLE,  USB_PID_PINNACLE_PCTV801E) },
-	{ USB_DEVICE(USB_VID_PINNACLE,  USB_PID_PINNACLE_PCTV801E_SE) },
-	{ USB_DEVICE(USB_VID_TERRATEC,	USB_PID_TERRATEC_CINERGY_T_EXPRESS) },
-	{ USB_DEVICE(USB_VID_TERRATEC,
-			USB_PID_TERRATEC_CINERGY_DT_XS_DIVERSITY_2) },
-	{ USB_DEVICE(USB_VID_SONY,	USB_PID_SONY_PLAYTV) },
-/* 45 */{ USB_DEVICE(USB_VID_YUAN,      USB_PID_YUAN_PD378S) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_TIGER_ATSC) },
-	{ USB_DEVICE(USB_VID_HAUPPAUGE, USB_PID_HAUPPAUGE_TIGER_ATSC_B210) },
-	{ USB_DEVICE(USB_VID_YUAN,	USB_PID_YUAN_MC770) },
-	{ USB_DEVICE(USB_VID_ELGATO,	USB_PID_ELGATO_EYETV_DTT) },
-/* 50 */{ USB_DEVICE(USB_VID_ELGATO,	USB_PID_ELGATO_EYETV_DTT_Dlx) },
-	{ USB_DEVICE(USB_VID_LEADTEK,   USB_PID_WINFAST_DTV_DONGLE_H) },
-	{ USB_DEVICE(USB_VID_TERRATEC,	USB_PID_TERRATEC_T3) },
-	{ USB_DEVICE(USB_VID_TERRATEC,	USB_PID_TERRATEC_T5) },
-	{ USB_DEVICE(USB_VID_YUAN,      USB_PID_YUAN_STK7700D) },
-/* 55 */{ USB_DEVICE(USB_VID_YUAN,	USB_PID_YUAN_STK7700D_2) },
-	{ USB_DEVICE(USB_VID_PINNACLE,	USB_PID_PINNACLE_PCTV73A) },
-	{ USB_DEVICE(USB_VID_PCTV,	USB_PID_PINNACLE_PCTV73ESE) },
-	{ USB_DEVICE(USB_VID_PCTV,	USB_PID_PINNACLE_PCTV282E) },
-	{ USB_DEVICE(USB_VID_DIBCOM,	USB_PID_DIBCOM_STK7770P) },
-/* 60 */{ USB_DEVICE(USB_VID_TERRATEC,	USB_PID_TERRATEC_CINERGY_T_XXS_2) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK807XPVR) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK807XP) },
-	{ USB_DEVICE_VER(USB_VID_PIXELVIEW, USB_PID_PIXELVIEW_SBTVD, 0x000, 0x3f00) },
-	{ USB_DEVICE(USB_VID_EVOLUTEPC, USB_PID_TVWAY_PLUS) },
-/* 65 */{ USB_DEVICE(USB_VID_PINNACLE,	USB_PID_PINNACLE_PCTV73ESE) },
-	{ USB_DEVICE(USB_VID_PINNACLE,	USB_PID_PINNACLE_PCTV282E) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_STK8096GP) },
-	{ USB_DEVICE(USB_VID_ELGATO,    USB_PID_ELGATO_EYETV_DIVERSITY) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_NIM9090M) },
-/* 70 */{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_NIM8096MD) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_NIM9090MD) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_NIM7090) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_TFE7090PVR) },
-	{ USB_DEVICE(USB_VID_TECHNISAT, USB_PID_TECHNISAT_AIRSTAR_TELESTICK_2) },
-/* 75 */{ USB_DEVICE(USB_VID_MEDION,    USB_PID_CREATIX_CTX1921) },
-	{ USB_DEVICE(USB_VID_PINNACLE,  USB_PID_PINNACLE_PCTV340E) },
-	{ USB_DEVICE(USB_VID_PINNACLE,  USB_PID_PINNACLE_PCTV340E_SE) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_TFE7790P) },
-	{ USB_DEVICE(USB_VID_DIBCOM,    USB_PID_DIBCOM_TFE8096P) },
-/* 80 */{ USB_DEVICE(USB_VID_ELGATO,	USB_PID_ELGATO_EYETV_DTT_2) },
-	{ USB_DEVICE(USB_VID_PCTV,      USB_PID_PCTV_2002E) },
-	{ USB_DEVICE(USB_VID_PCTV,      USB_PID_PCTV_2002E_SE) },
-	{ 0 }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, dib0700_usb_id_table);
-
-#define DIB0700_DEFAULT_DEVICE_PROPERTIES \
-	.caps              = DVB_USB_IS_AN_I2C_ADAPTER, \
-	.usb_ctrl          = DEVICE_SPECIFIC, \
-	.firmware          = "dvb-usb-dib0700-1.20.fw", \
-	.download_firmware = dib0700_download_firmware, \
-	.no_reconnect      = 1, \
-	.size_of_priv      = sizeof(struct dib0700_state), \
-	.i2c_algo          = &dib0700_i2c_algo, \
-	.identify_state    = dib0700_identify_state
-
-#define DIB0700_DEFAULT_STREAMING_CONFIG(ep) \
-	.streaming_ctrl   = dib0700_streaming_ctrl, \
-	.stream = { \
-		.type = USB_BULK, \
-		.count = 4, \
-		.endpoint = ep, \
-		.u = { \
-			.bulk = { \
-				.buffersize = 39480, \
-			} \
-		} \
-	}
-
-#define DIB0700_NUM_FRONTENDS(n) \
-	.num_frontends = n, \
-	.size_of_priv     = sizeof(struct dib0700_adapter_state)
-
-struct dvb_usb_device_properties dib0700_devices[] = {
-	{
-		DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk7700p_pid_filter,
-				.pid_filter_ctrl  = stk7700p_pid_filter_ctrl,
-				.frontend_attach  = stk7700p_frontend_attach,
-				.tuner_attach     = stk7700p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 8,
-		.devices = {
-			{   "DiBcom STK7700P reference design",
-				{ &dib0700_usb_id_table[0], &dib0700_usb_id_table[1] },
-				{ NULL },
-			},
-			{   "Hauppauge Nova-T Stick",
-				{ &dib0700_usb_id_table[4], &dib0700_usb_id_table[9], NULL },
-				{ NULL },
-			},
-			{   "AVerMedia AVerTV DVB-T Volar",
-				{ &dib0700_usb_id_table[5], &dib0700_usb_id_table[10] },
-				{ NULL },
-			},
-			{   "Compro Videomate U500",
-				{ &dib0700_usb_id_table[6], &dib0700_usb_id_table[19] },
-				{ NULL },
-			},
-			{   "Uniwill STK7700P based (Hama and others)",
-				{ &dib0700_usb_id_table[7], NULL },
-				{ NULL },
-			},
-			{   "Leadtek Winfast DTV Dongle (STK7700P based)",
-				{ &dib0700_usb_id_table[8], &dib0700_usb_id_table[34] },
-				{ NULL },
-			},
-			{   "AVerMedia AVerTV DVB-T Express",
-				{ &dib0700_usb_id_table[20] },
-				{ NULL },
-			},
-			{   "Gigabyte U7000",
-				{ &dib0700_usb_id_table[21], NULL },
-				{ NULL },
-			}
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 2,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.frontend_attach  = bristol_frontend_attach,
-				.tuner_attach     = bristol_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			}, {
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.frontend_attach  = bristol_frontend_attach,
-				.tuner_attach     = bristol_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x03),
-			}},
-			}
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "Hauppauge Nova-T 500 Dual DVB-T",
-				{ &dib0700_usb_id_table[2], &dib0700_usb_id_table[3], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 2,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7700d_frontend_attach,
-				.tuner_attach     = stk7700d_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			}, {
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7700d_frontend_attach,
-				.tuner_attach     = stk7700d_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x03),
-			}},
-			}
-		},
-
-		.num_device_descs = 5,
-		.devices = {
-			{   "Pinnacle PCTV 2000e",
-				{ &dib0700_usb_id_table[11], NULL },
-				{ NULL },
-			},
-			{   "Terratec Cinergy DT XS Diversity",
-				{ &dib0700_usb_id_table[12], NULL },
-				{ NULL },
-			},
-			{   "Hauppauge Nova-TD Stick/Elgato Eye-TV Diversity",
-				{ &dib0700_usb_id_table[13], NULL },
-				{ NULL },
-			},
-			{   "DiBcom STK7700D reference design",
-				{ &dib0700_usb_id_table[14], NULL },
-				{ NULL },
-			},
-			{   "YUAN High-Tech DiBcom STK7700D",
-				{ &dib0700_usb_id_table[55], NULL },
-				{ NULL },
-			},
-
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7700P2_frontend_attach,
-				.tuner_attach     = stk7700d_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 3,
-		.devices = {
-			{   "ASUS My Cinema U3000 Mini DVBT Tuner",
-				{ &dib0700_usb_id_table[23], NULL },
-				{ NULL },
-			},
-			{   "Yuan EC372S",
-				{ &dib0700_usb_id_table[31], NULL },
-				{ NULL },
-			},
-			{   "Terratec Cinergy T Express",
-				{ &dib0700_usb_id_table[42], NULL },
-				{ NULL },
-			}
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7070p_frontend_attach,
-				.tuner_attach     = dib7070p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 12,
-		.devices = {
-			{   "DiBcom STK7070P reference design",
-				{ &dib0700_usb_id_table[15], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle PCTV DVB-T Flash Stick",
-				{ &dib0700_usb_id_table[16], NULL },
-				{ NULL },
-			},
-			{   "Artec T14BR DVB-T",
-				{ &dib0700_usb_id_table[22], NULL },
-				{ NULL },
-			},
-			{   "ASUS My Cinema U3100 Mini DVBT Tuner",
-				{ &dib0700_usb_id_table[24], NULL },
-				{ NULL },
-			},
-			{   "Hauppauge Nova-T Stick",
-				{ &dib0700_usb_id_table[25], NULL },
-				{ NULL },
-			},
-			{   "Hauppauge Nova-T MyTV.t",
-				{ &dib0700_usb_id_table[26], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle PCTV 72e",
-				{ &dib0700_usb_id_table[29], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle PCTV 73e",
-				{ &dib0700_usb_id_table[30], NULL },
-				{ NULL },
-			},
-			{   "Elgato EyeTV DTT",
-				{ &dib0700_usb_id_table[49], NULL },
-				{ NULL },
-			},
-			{   "Yuan PD378S",
-				{ &dib0700_usb_id_table[45], NULL },
-				{ NULL },
-			},
-			{   "Elgato EyeTV Dtt Dlx PD378S",
-				{ &dib0700_usb_id_table[50], NULL },
-				{ NULL },
-			},
-			{   "Elgato EyeTV DTT rev. 2",
-				{ &dib0700_usb_id_table[80], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7070p_frontend_attach,
-				.tuner_attach     = dib7070p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 3,
-		.devices = {
-			{   "Pinnacle PCTV 73A",
-				{ &dib0700_usb_id_table[56], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle PCTV 73e SE",
-				{ &dib0700_usb_id_table[57], &dib0700_usb_id_table[65], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle PCTV 282e",
-				{ &dib0700_usb_id_table[58], &dib0700_usb_id_table[66], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 2,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = novatd_frontend_attach,
-				.tuner_attach     = dib7070p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			}, {
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = novatd_frontend_attach,
-				.tuner_attach     = dib7070p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x03),
-			}},
-			}
-		},
-
-		.num_device_descs = 3,
-		.devices = {
-			{   "Hauppauge Nova-TD Stick (52009)",
-				{ &dib0700_usb_id_table[35], NULL },
-				{ NULL },
-			},
-			{   "PCTV 2002e",
-				{ &dib0700_usb_id_table[81], NULL },
-				{ NULL },
-			},
-			{   "PCTV 2002e SE",
-				{ &dib0700_usb_id_table[82], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 2,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7070pd_frontend_attach0,
-				.tuner_attach     = dib7070p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			}, {
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7070pd_frontend_attach1,
-				.tuner_attach     = dib7070p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x03),
-			}},
-			}
-		},
-
-		.num_device_descs = 5,
-		.devices = {
-			{   "DiBcom STK7070PD reference design",
-				{ &dib0700_usb_id_table[17], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle PCTV Dual DVB-T Diversity Stick",
-				{ &dib0700_usb_id_table[18], NULL },
-				{ NULL },
-			},
-			{   "Hauppauge Nova-TD-500 (84xxx)",
-				{ &dib0700_usb_id_table[36], NULL },
-				{ NULL },
-			},
-			{  "Terratec Cinergy DT USB XS Diversity/ T5",
-				{ &dib0700_usb_id_table[43],
-					&dib0700_usb_id_table[53], NULL},
-				{ NULL },
-			},
-			{  "Sony PlayTV",
-				{ &dib0700_usb_id_table[44], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 2,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7070pd_frontend_attach0,
-				.tuner_attach     = dib7070p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			}, {
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7070pd_frontend_attach1,
-				.tuner_attach     = dib7070p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x03),
-			}},
-			}
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "Elgato EyeTV Diversity",
-				{ &dib0700_usb_id_table[68], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_NEC_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7700ph_frontend_attach,
-				.tuner_attach     = stk7700ph_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 9,
-		.devices = {
-			{   "Terratec Cinergy HT USB XE",
-				{ &dib0700_usb_id_table[27], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle Expresscard 320cx",
-				{ &dib0700_usb_id_table[28], NULL },
-				{ NULL },
-			},
-			{   "Terratec Cinergy HT Express",
-				{ &dib0700_usb_id_table[32], NULL },
-				{ NULL },
-			},
-			{   "Gigabyte U8000-RH",
-				{ &dib0700_usb_id_table[37], NULL },
-				{ NULL },
-			},
-			{   "YUAN High-Tech STK7700PH",
-				{ &dib0700_usb_id_table[38], NULL },
-				{ NULL },
-			},
-			{   "Asus My Cinema-U3000Hybrid",
-				{ &dib0700_usb_id_table[39], NULL },
-				{ NULL },
-			},
-			{   "YUAN High-Tech MC770",
-				{ &dib0700_usb_id_table[48], NULL },
-				{ NULL },
-			},
-			{   "Leadtek WinFast DTV Dongle H",
-				{ &dib0700_usb_id_table[51], NULL },
-				{ NULL },
-			},
-			{   "YUAN High-Tech STK7700D",
-				{ &dib0700_usb_id_table[54], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.frontend_attach  = s5h1411_frontend_attach,
-				.tuner_attach     = xc5000_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 2,
-		.devices = {
-			{   "Pinnacle PCTV HD Pro USB Stick",
-				{ &dib0700_usb_id_table[40], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle PCTV HD USB Stick",
-				{ &dib0700_usb_id_table[41], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.frontend_attach  = lgdt3305_frontend_attach,
-				.tuner_attach     = mxl5007t_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 2,
-		.devices = {
-			{   "Hauppauge ATSC MiniCard (B200)",
-				{ &dib0700_usb_id_table[46], NULL },
-				{ NULL },
-			},
-			{   "Hauppauge ATSC MiniCard (B210)",
-				{ &dib0700_usb_id_table[47], NULL },
-				{ NULL },
-			},
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter       = stk70x0p_pid_filter,
-				.pid_filter_ctrl  = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = stk7770p_frontend_attach,
-				.tuner_attach     = dib7770p_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 4,
-		.devices = {
-			{   "DiBcom STK7770P reference design",
-				{ &dib0700_usb_id_table[59], NULL },
-				{ NULL },
-			},
-			{   "Terratec Cinergy T USB XXS (HD)/ T3",
-				{ &dib0700_usb_id_table[33],
-					&dib0700_usb_id_table[52],
-					&dib0700_usb_id_table[60], NULL},
-				{ NULL },
-			},
-			{   "TechniSat AirStar TeleStick 2",
-				{ &dib0700_usb_id_table[74], NULL },
-				{ NULL },
-			},
-			{   "Medion CTX1921 DVB-T USB",
-				{ &dib0700_usb_id_table[75], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = stk80xx_pid_filter,
-				.pid_filter_ctrl = stk80xx_pid_filter_ctrl,
-				.frontend_attach  = stk807x_frontend_attach,
-				.tuner_attach     = dib807x_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 3,
-		.devices = {
-			{   "DiBcom STK807xP reference design",
-				{ &dib0700_usb_id_table[62], NULL },
-				{ NULL },
-			},
-			{   "Prolink Pixelview SBTVD",
-				{ &dib0700_usb_id_table[63], NULL },
-				{ NULL },
-			},
-			{   "EvolutePC TVWay+",
-				{ &dib0700_usb_id_table[64], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_NEC_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 2,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = stk80xx_pid_filter,
-				.pid_filter_ctrl = stk80xx_pid_filter_ctrl,
-				.frontend_attach  = stk807xpvr_frontend_attach0,
-				.tuner_attach     = dib807x_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER | DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = stk80xx_pid_filter,
-				.pid_filter_ctrl = stk80xx_pid_filter_ctrl,
-				.frontend_attach  = stk807xpvr_frontend_attach1,
-				.tuner_attach     = dib807x_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x03),
-			}},
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom STK807xPVR reference design",
-				{ &dib0700_usb_id_table[61], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-					DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = stk80xx_pid_filter,
-				.pid_filter_ctrl = stk80xx_pid_filter_ctrl,
-				.frontend_attach  = stk809x_frontend_attach,
-				.tuner_attach     = dib809x_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom STK8096GP reference design",
-				{ &dib0700_usb_id_table[67], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-					DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = dib90x0_pid_filter,
-				.pid_filter_ctrl = dib90x0_pid_filter_ctrl,
-				.frontend_attach  = stk9090m_frontend_attach,
-				.tuner_attach     = dib9090_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom STK9090M reference design",
-				{ &dib0700_usb_id_table[69], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-					DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = stk80xx_pid_filter,
-				.pid_filter_ctrl = stk80xx_pid_filter_ctrl,
-				.frontend_attach  = nim8096md_frontend_attach,
-				.tuner_attach     = nim8096md_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom NIM8096MD reference design",
-				{ &dib0700_usb_id_table[70], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-					DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = dib90x0_pid_filter,
-				.pid_filter_ctrl = dib90x0_pid_filter_ctrl,
-				.frontend_attach  = nim9090md_frontend_attach,
-				.tuner_attach     = nim9090md_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom NIM9090MD reference design",
-				{ &dib0700_usb_id_table[71], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-					DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = stk70x0p_pid_filter,
-				.pid_filter_ctrl = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = nim7090_frontend_attach,
-				.tuner_attach     = nim7090_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom NIM7090 reference design",
-				{ &dib0700_usb_id_table[72], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 2,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-					DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = stk70x0p_pid_filter,
-				.pid_filter_ctrl = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = tfe7090pvr_frontend0_attach,
-				.tuner_attach     = tfe7090pvr_tuner0_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x03),
-			}},
-			},
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-					DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-				.pid_filter_count = 32,
-				.pid_filter = stk70x0p_pid_filter,
-				.pid_filter_ctrl = stk70x0p_pid_filter_ctrl,
-				.frontend_attach  = tfe7090pvr_frontend1_attach,
-				.tuner_attach     = tfe7090pvr_tuner1_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom TFE7090PVR reference design",
-				{ &dib0700_usb_id_table[73], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-			DIB0700_NUM_FRONTENDS(1),
-			.fe = {{
-				.frontend_attach  = pctv340e_frontend_attach,
-				.tuner_attach     = xc4000_tuner_attach,
-
-				DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-			}},
-			},
-		},
-
-		.num_device_descs = 2,
-		.devices = {
-			{   "Pinnacle PCTV 340e HD Pro USB Stick",
-				{ &dib0700_usb_id_table[76], NULL },
-				{ NULL },
-			},
-			{   "Pinnacle PCTV Hybrid Stick Solo",
-				{ &dib0700_usb_id_table[77], NULL },
-				{ NULL },
-			},
-		},
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-				DIB0700_NUM_FRONTENDS(1),
-				.fe = {{
-					.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-						DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-					.pid_filter_count = 32,
-					.pid_filter = stk70x0p_pid_filter,
-					.pid_filter_ctrl = stk70x0p_pid_filter_ctrl,
-					.frontend_attach  = tfe7790p_frontend_attach,
-					.tuner_attach     = tfe7790p_tuner_attach,
-
-					DIB0700_DEFAULT_STREAMING_CONFIG(0x03),
-				} },
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom TFE7790P reference design",
-				{ &dib0700_usb_id_table[78], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
-	}, { DIB0700_DEFAULT_DEVICE_PROPERTIES,
-		.num_adapters = 1,
-		.adapter = {
-			{
-				DIB0700_NUM_FRONTENDS(1),
-				.fe = {{
-					.caps  = DVB_USB_ADAP_HAS_PID_FILTER |
-						DVB_USB_ADAP_PID_FILTER_CAN_BE_TURNED_OFF,
-					.pid_filter_count = 32,
-					.pid_filter = stk80xx_pid_filter,
-					.pid_filter_ctrl = stk80xx_pid_filter_ctrl,
-					.frontend_attach  = tfe8096p_frontend_attach,
-					.tuner_attach     = tfe8096p_tuner_attach,
-
-					DIB0700_DEFAULT_STREAMING_CONFIG(0x02),
-
-				} },
-			},
-		},
-
-		.num_device_descs = 1,
-		.devices = {
-			{   "DiBcom TFE8096P reference design",
-				{ &dib0700_usb_id_table[79], NULL },
-				{ NULL },
-			},
-		},
-
-		.rc.core = {
-			.rc_interval      = DEFAULT_RC_INTERVAL,
-			.rc_codes         = RC_MAP_DIB0700_RC5_TABLE,
-			.module_name	  = "dib0700",
-			.rc_query         = dib0700_rc_query_old_firmware,
-			.allowed_protos   = RC_BIT_RC5 |
-					    RC_BIT_RC6_MCE |
-					    RC_BIT_NEC,
-			.change_protocol  = dib0700_change_protocol,
-		},
+		.key	= "\xf6\xd6\x6d\x6b\xd5\x2d\x59\xbb"
+			  "\x07\x96\x36\x58\x79\xef\xf8\x86"
+			  "\xc6\x6d\xd5\x1a\x5b\x6a\x99\x74"
+			  "\x4b\x50\x59\x0c\x87\xa2\x38\x84"
+			  "\x00\xfa\xac\x24",
+		.klen	= 36,
+		.iv	= "\xc1\x58\x5e\xf1\x5a\x43\xd8\x75",
+		.input	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+		.ilen	= 32,
+		.result = "\xf0\x5e\x23\x1b\x38\x94\x61\x2c"
+			  "\x49\xee\x00\x0b\x80\x4e\xb2\xa9"
+			  "\xb8\x30\x6b\x50\x8f\x83\x9d\x6a"
+			  "\x55\x30\x83\x1d\x93\x44\xaf\x1c",
+		.rlen	= 32,
+	}, {
+	// generated using Crypto++
+		.key = "\x00\x01\x02\x03\x04\x05\x06\x07"
+			"\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			"\x10\x11\x12\x13\x14\x15\x16\x17"
+			"\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+			"\x00\x00\x00\x00",
+		.klen = 32 + 4,
+		.iv = "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.input =
+			"\x00\x01\x02\x03\x04\x05\x06\x07"
+			"\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			"\x10\x11\x12\x13\x14\x15\x16\x17"
+			"\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+			"\x20\x21\x22\x23\x24\x25\x26\x27"
+			"\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f"
+			"\x30\x31\x32\x33\x34\x35\x36\x37"
+			"\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f"
+			"\x40\x41\x42\x43\x44\x45\x46\x47"
+			"\x48\x49\x4a\x4b\x4c\x4d\x4e\x4f"
+			"\x50\x51\x52\x53\x54\x55\x56\x57"
+			"\x58\x59\x5a\x5b\x5c\x5d\x5e\x5f"
+			"\x60\x61\x62\x63\x64\x65\x66\x67"
+			"\x68\x69\x6a\x6b\x6c\x6d\x6e\x6f"
+			"\x70\x71\x72\x73\x74\x75\x76\x77"
+			"\x78\x79\x7a\x7b\x7c\x7d\x7e\x7f"
+			"\x80\x81\x82\x83\x84\x85\x86\x87"
+			"\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f"
+			"\x90\x91\x92\x93\x94\x95\x96\x97"
+			"\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f"
+			"\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7"
+			"\xa8\xa9\xaa\xab\xac\xad\xae\xaf"
+			"\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7"
+			"\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf"
+			"\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			"\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf"
+			"\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7"
+			"\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf"
+			"\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7"
+			"\xe8\xe9\xea\xeb\xec\xed\xee\xef"
+			"\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7"
+			"\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
+			"\x00\x03\x06\x09\x0c\x0f\x12\x15"
+			"\x18\x1b\x1e\x21\x24\x27\x2a\x2d"
+			"\x30\x33\x36\x39\x3c\x3f\x42\x45"
+			"\x48\x4b\x4e\x51\x54\x57\x5a\x5d"
+			"\x60\x63\x66\x69\x6c\x6f\x72\x75"
+			"\x78\x7b\x7e\x81\x84\x87\x8a\x8d"
+			"\x90\x93\x96\x99\x9c\x9f\xa2\xa5"
+			"\xa8\xab\xae\xb1\xb4\xb7\xba\xbd"
+			"\xc0\xc3\xc6\xc9\xcc\xcf\xd2\xd5"
+			"\xd8\xdb\xde\xe1\xe4\xe7\xea\xed"
+			"\xf0\xf3\xf6\xf9\xfc\xff\x02\x05"
+			"\x08\x0b\x0e\x11\x14\x17\x1a\x1d"
+			"\x20\x23\x26\x29\x2c\x2f\x32\x35"
+			"\x38\x3b\x3e\x41\x44\x47\x4a\x4d"
+			"\x50\x53\x56\x59\x5c\x5f\x62\x65"
+			"\x68\x6b\x6e\x71\x74\x77\x7a\x7d"
+			"\x80\x83\x86\x89\x8c\x8f\x92\x95"
+			"\x98\x9b\x9e\xa1\xa4\xa7\xaa\xad"
+			"\xb0\xb3\xb6\xb9\xbc\xbf\xc2\xc5"
+			"\xc8\xcb\xce\xd1\xd4\xd7\xda\xdd"
+			"\xe0\xe3\xe6\xe9\xec\xef\xf2\xf5"
+			"\xf8\xfb\xfe\x01\x04\x07\x0a\x0d"
+			"\x10\x13\x16\x19\x1c\x1f\x22\x25"
+			"\x28\x2b\x2e\x31\x34\x37\x3a\x3d"
+			"\x40\x43\x46\x49\x4c\x4f\x52\x55"
+			"\x58\x5b\x5e\x61\x64\x67\x6a\x6d"
+			"\x70\x73\x76\x79\x7c\x7f\x82\x85"
+			"\x88\x8b\x8e\x91\x94\x97\x9a\x9d"
+			"\xa0\xa3\xa6\xa9\xac\xaf\xb2\xb5"
+			"\xb8\xbb\xbe\xc1\xc4\xc7\xca\xcd"
+			"\xd0\xd3\xd6\xd9\xdc\xdf\xe2\xe5"
+			"\xe8\xeb\xee\xf1\xf4\xf7\xfa\xfd"
+			"\x00\x05\x0a\x0f\x14\x19\x1e\x23"
+			"\x28\x2d\x32\x37\x3c\x41\x46\x4b"
+			"\x50\x55\x5a\x5f\x64\x69\x6e\x73"
+			"\x78\x7d\x82\x87\x8c\x91\x96\x9b"
+			"\xa0\xa5\xaa\xaf\xb4\xb9\xbe\xc3"
+			"\xc8\xcd\xd2\xd7\xdc\xe1\xe6\xeb"
+			"\xf0\xf5\xfa\xff\x04\x09\x0e\x13"
+			"\x18\x1d\x22\x27\x2c\x31\x36\x3b"
+			"\x40\x45\x4a\x4f\x54\x59\x5e\x63"
+			"\x68\x6d\x72\x77\x7c\x81\x86\x8b"
+			"\x90\x95\x9a\x9f\xa4\xa9\xae\xb3"
+			"\xb8\xbd\xc2\xc7\xcc\xd1\xd6\xdb"
+			"\xe0\xe5\xea\xef\xf4\xf9\xfe\x03"
+			"\x08\x0d\x12\x17\x1c\x21\x26\x2b"
+			"\x30\x35\x3a\x3f\x44\x49\x4e\x53"
+			"\x58\x5d\x62\x67\x6c\x71\x76\x7b"
+			"\x80\x85\x8a\x8f\x94\x99\x9e\xa3"
+			"\xa8\xad\xb2\xb7\xbc\xc1\xc6\xcb"
+			"\xd0\xd5\xda\xdf\xe4\xe9\xee\xf3"
+			"\xf8\xfd\x02\x07\x0c\x11\x16\x1b"
+			"\x20\x25\x2a\x2f\x34\x39\x3e\x43"
+			"\x48\x4d\x52\x57\x5c\x61\x66\x6b"
+			"\x70\x75\x7a\x7f\x84\x89\x8e\x93"
+			"\x98\x9d\xa2\xa7\xac\xb1\xb6\xbb"
+			"\xc0\xc5\xca\xcf\xd4\xd9\xde\xe3"
+			"\xe8\xed\xf2\xf7\xfc\x01\x06\x0b"
+			"\x10\x15\x1a\x1f\x24\x29\x2e\x33"
+			"\x38\x3d\x42\x47\x4c\x51\x56\x5b"
+			"\x60\x65\x6a\x6f\x74\x79\x7e\x83"
+			"\x88\x8d\x92\x97\x9c\xa1\xa6\xab"
+			"\xb0\xb5\xba\xbf\xc4\xc9\xce\xd3"
+			"\xd8\xdd\xe2\xe7\xec\xf1\xf6\xfb"
+			"\x00\x07\x0e\x15\x1c\x23\x2a\x31"
+			"\x38\x3f\x46\x4d\x54\x5b\x62\x69"
+			"\x70\x77\x7e\x85\x8c\x93\x9a\xa1"
+			"\xa8\xaf\xb6\xbd\xc4\xcb\xd2\xd9"
+			"\xe0\xe7\xee\xf5\xfc\x03\x0a\x11"
+			"\x18\x1f\x26\x2d\x34\x3b\x42\x49"
+			"\x50\x57\x5e\x65\x6c\x73\x7a\x81"
+			"\x88\x8f\x96\x9d\xa4\xab\xb2\xb9"
+			"\xc0\xc7\xce\xd5\xdc\xe3\xea\xf1"
+			"\xf8\xff\x06\x0d\x14\x1b\x22\x29"
+			"\x30\x37\x3e\x45\x4c\x53\x5a\x61"
+			"\x68\x6f\x76\x7d\x84\x8b\x92\x99"
+			"\xa0\xa7\xae\xb5\xbc\xc3\xca\xd1"
+			"\xd8\xdf\xe6\xed\xf4\xfb\x02\x09"
+			"\x10\x17\x1e\x25\x2c\x33\x3a\x41"
+			"\x48\x4f\x56\x5d\x64\x6b\x72\x79"
+			"\x80\x87\x8e\x95\x9c\xa3\xaa\xb1"
+			"\xb8\xbf\xc6\xcd\xd4\xdb\xe2\xe9"
+			"\xf0\xf7\xfe\x05\x0c\x13\x1a\x21"
+			"\x28\x2f\x36\x3d\x44\x4b\x52\x59"
+			"\x60\x67\x6e\x75\x7c\x83\x8a\x91"
+			"\x98\x9f\xa6\xad\xb4\xbb\xc2\xc9"
+			"\xd0\xd7\xde\xe5\xec\xf3\xfa\x01"
+			"\x08\x0f\x16\x1d\x24\x2b\x32\x39"
+			"\x40\x47\x4e\x55\x5c\x63\x6a\x71"
+			"\x78\x7f\x86\x8d\x94\x9b\xa2\xa9"
+			"\xb0\xb7\xbe\xc5\xcc\xd3\xda\xe1"
+			"\xe8\xef\xf6\xfd\x04\x0b\x12\x19"
+			"\x20\x27\x2e\x35\x3c\x43\x4a\x51"
+			"\x58\x5f\x66\x6d\x74\x7b\x82\x89"
+			"\x90\x97\x9e\xa5\xac\xb3\xba\xc1"
+			"\xc8\xcf\xd6\xdd\xe4\xeb\xf2\xf9"
+			"\x00\x09\x12\x1b\x24\x2d\x36\x3f"
+			"\x48\x51\x5a\x63\x6c\x75\x7e\x87"
+			"\x90\x99\xa2\xab\xb4\xbd\xc6\xcf"
+			"\xd8\xe1\xea\xf3\xfc\x05\x0e\x17"
+			"\x20\x29\x32\x3b\x44\x4d\x56\x5f"
+			"\x68\x71\x7a\x83\x8c\x95\x9e\xa7"
+			"\xb0\xb9\xc2\xcb\xd4\xdd\xe6\xef"
+			"\xf8\x01\x0a\x13\x1c\x25\x2e\x37"
+			"\x40\x49\x52\x5b\x64\x6d\x76\x7f"
+			"\x88\x91\x9a\xa3\xac\xb5\xbe\xc7"
+			"\xd0\xd9\xe2\xeb\xf4\xfd\x06\x0f"
+			"\x18\x21\x2a\x33\x3c\x45\x4e\x57"
+			"\x60\x69\x72\x7b\x84\x8d\x96\x9f"
+			"\xa8\xb1\xba\xc3\xcc\xd5\xde\xe7"
+			"\xf0\xf9\x02\x0b\x14\x1d\x26\x2f"
+			"\x38\x41\x4a\x53\x5c\x65\x6e\x77"
+			"\x80\x89\x92\x9b\xa4\xad\xb6\xbf"
+			"\xc8\xd1\xda\xe3\xec\xf5\xfe\x07"
+			"\x10\x19\x22\x2b\x34\x3d\x46\x4f"
+			"\x58\x61\x6a\x73\x7c\x85\x8e\x97"
+			"\xa0\xa9\xb2\xbb\xc4\xcd\xd6\xdf"
+			"\xe8\xf1\xfa\x03\x0c\x15\x1e\x27"
+			"\x30\x39\x42\x4b\x54\x5d\x66\x6f"
+			"\x78\x81\x8a\x93\x9c\xa5\xae\xb7"
+			"\xc0\xc9\xd2\xdb\xe4\xed\xf6\xff"
+			"\x08\x11\x1a\x23\x2c\x35\x3e\x47"
+			"\x50\x59\x62\x6b\x74\x7d\x86\x8f"
+			"\x98\xa1\xaa\xb3\xbc\xc5\xce\xd7"
+			"\xe0\xe9\xf2\xfb\x04\x0d\x16\x1f"
+			"\x28\x31\x3a\x43\x4c\x55\x5e\x67"
+			"\x70\x79\x82\x8b\x94\x9d\xa6\xaf"
+			"\xb8\xc1\xca\xd3\xdc\xe5\xee\xf7"
+			"\x00\x0b\x16\x21\x2c\x37\x42\x4d"
+			"\x58\x63\x6e\x79\x84\x8f\x9a\xa5"
+			"\xb0\xbb\xc6\xd1\xdc\xe7\xf2\xfd"
+			"\x08\x13\x1e\x29\x34\x3f\x4a\x55"
+			"\x60\x6b\x76\x81\x8c\x97\xa2\xad"
+			"\xb8\xc3\xce\xd9\xe4\xef\xfa\x05"
+			"\x10\x1b\x26\x31\x3c\x47\x52\x5d"
+			"\x68\x73\x7e\x89\x94\x9f\xaa\xb5"
+			"\xc0\xcb\xd6\xe1\xec\xf7\x02\x0d"
+			"\x18\x23\x2e\x39\x44\x4f\x5a\x65"
+			"\x70\x7b\x86\x91\x9c\xa7\xb2\xbd"
+			"\xc8\xd3\xde\xe9\xf4\xff\x0a\x15"
+			"\x20\x2b\x36\x41\x4c\x57\x62\x6d"
+			"\x78\x83\x8e\x99\xa4\xaf\xba\xc5"
+			"\xd0\xdb\xe6\xf1\xfc\x07\x12\x1d"
+			"\x28\x33\x3e\x49\x54\x5f\x6a\x75"
+			"\x80\x8b\x96\xa1\xac\xb7\xc2\xcd"
+			"\xd8\xe3\xee\xf9\x04\x0f\x1a\x25"
+			"\x30\x3b\x46\x51\x5c\x67\x72\x7d"
+			"\x88\x93\x9e\xa9\xb4\xbf\xca\xd5"
+			"\xe0\xeb\xf6\x01\x0c\x17\x22\x2d"
+			"\x38\x43\x4e\x59\x64\x6f\x7a\x85"
+			"\x90\x9b\xa6\xb1\xbc\xc7\xd2\xdd"
+			"\xe8\xf3\xfe\x09\x14\x1f\x2a\x35"
+			"\x40\x4b\x56\x61\x6c\x77\x82\x8d"
+			"\x98\xa3\xae\xb9\xc4\xcf\xda\xe5"
+			"\xf0\xfb\x06\x11\x1c\x27\x32\x3d"
+			"\x48\x53\x5e\x69\x74\x7f\x8a\x95"
+			"\xa0\xab\xb6\xc1\xcc\xd7\xe2\xed"
+			"\xf8\x03\x0e\x19\x24\x2f\x3a\x45"
+			"\x50\x5b\x66\x71\x7c\x87\x92\x9d"
+			"\xa8\xb3\xbe\xc9\xd4\xdf\xea\xf5"
+			"\x00\x0d\x1a\x27\x34\x41\x4e\x5b"
+			"\x68\x75\x82\x8f\x9c\xa9\xb6\xc3"
+			"\xd0\xdd\xea\xf7\x04\x11\x1e\x2b"
+			"\x38\x45\x52\x5f\x6c\x79\x86\x93"
+			"\xa0\xad\xba\xc7\xd4\xe1\xee\xfb"
+			"\x08\x15\x22\x2f\x3c\x49\x56\x63"
+			"\x70\x7d\x8a\x97\xa4\xb1\xbe\xcb"
+			"\xd8\xe5\xf2\xff\x0c\x19\x26\x33"
+			"\x40\x4d\x5a\x67\x74\x81\x8e\x9b"
+			"\xa8\xb5\xc2\xcf\xdc\xe9\xf6\x03"
+			"\x10\x1d\x2a\x37\x44\x51\x5e\x6b"
+			"\x78\x85\x92\x9f\xac\xb9\xc6\xd3"
+			"\xe0\xed\xfa\x07\x14\x21\x2e\x3b"
+			"\x48\x55\x62\x6f\x7c\x89\x96\xa3"
+			"\xb0\xbd\xca\xd7\xe4\xf1\xfe\x0b"
+			"\x18\x25\x32\x3f\x4c\x59\x66\x73"
+			"\x80\x8d\x9a\xa7\xb4\xc1\xce\xdb"
+			"\xe8\xf5\x02\x0f\x1c\x29\x36\x43"
+			"\x50\x5d\x6a\x77\x84\x91\x9e\xab"
+			"\xb8\xc5\xd2\xdf\xec\xf9\x06\x13"
+			"\x20\x2d\x3a\x47\x54\x61\x6e\x7b"
+			"\x88\x95\xa2\xaf\xbc\xc9\xd6\xe3"
+			"\xf0\xfd\x0a\x17\x24\x31\x3e\x4b"
+			"\x58\x65\x72\x7f\x8c\x99\xa6\xb3"
+			"\xc0\xcd\xda\xe7\xf4\x01\x0e\x1b"
+			"\x28\x35\x42\x4f\x5c\x69\x76\x83"
+			"\x90\x9d\xaa\xb7\xc4\xd1\xde\xeb"
+			"\xf8\x05\x12\x1f\x2c\x39\x46\x53"
+			"\x60\x6d\x7a\x87\x94\xa1\xae\xbb"
+			"\xc8\xd5\xe2\xef\xfc\x09\x16\x23"
+			"\x30\x3d\x4a\x57\x64\x71\x7e\x8b"
+			"\x98\xa5\xb2\xbf\xcc\xd9\xe6\xf3"
+			"\x00\x0f\x1e\x2d\x3c\x4b\x5a\x69"
+			"\x78\x87\x96\xa5\xb4\xc3\xd2\xe1"
+			"\xf0\xff\x0e\x1d\x2c\x3b\x4a\x59"
+			"\x68\x77\x86\x95\xa4\xb3\xc2\xd1"
+			"\xe0\xef\xfe\x0d\x1c\x2b\x3a\x49"
+			"\x58\x67\x76\x85\x94\xa3\xb2\xc1"
+			"\xd0\xdf\xee\xfd\x0c\x1b\x2a\x39"
+			"\x48\x57\x66\x75\x84\x93\xa2\xb1"
+			"\xc0\xcf\xde\xed\xfc\x0b\x1a\x29"
+			"\x38\x47\x56\x65\x74\x83\x92\xa1"
+			"\xb0\xbf\xce\xdd\xec\xfb\x0a\x19"
+			"\x28\x37\x46\x55\x64\x73\x82\x91"
+			"\xa0\xaf\xbe\xcd\xdc\xeb\xfa\x09"
+			"\x18\x27\x36\x45\x54\x63\x72\x81"
+			"\x90\x9f\xae\xbd\xcc\xdb\xea\xf9"
+			"\x08\x17\x26\x35\x44\x53\x62\x71"
+			"\x80\x8f\x9e\xad\xbc\xcb\xda\xe9"
+			"\xf8\x07\x16\x25\x34\x43\x52\x61"
+			"\x70\x7f\x8e\x9d\xac\xbb\xca\xd9"
+			"\xe8\xf7\x06\x15\x24\x33\x42\x51"
+			"\x60\x6f\x7e\x8d\x9c\xab\xba\xc9"
+			"\xd8\xe7\xf6\x05\x14\x23\x32\x41"
+			"\x50\x5f\x6e\x7d\x8c\x9b\xaa\xb9"
+			"\xc8\xd7\xe6\xf5\x04\x13\x22\x31"
+			"\x40\x4f\x5e\x6d\x7c\x8b\x9a\xa9"
+			"\xb8\xc7\xd6\xe5\xf4\x03\x12\x21"
+			"\x30\x3f\x4e\x5d\x6c\x7b\x8a\x99"
+			"\xa8\xb7\xc6\xd5\xe4\xf3\x02\x11"
+			"\x20\x2f\x3e\x4d\x5c\x6b\x7a\x89"
+			"\x98\xa7\xb6\xc5\xd4\xe3\xf2\x01"
+			"\x10\x1f\x2e\x3d\x4c\x5b\x6a\x79"
+			"\x88\x97\xa6\xb5\xc4\xd3\xe2\xf1"
+			"\x00\x11\x22\x33\x44\x55\x66\x77"
+			"\x88\x99\xaa\xbb\xcc\xdd\xee\xff"
+			"\x10\x21\x32\x43\x54\x65\x76\x87"
+			"\x98\xa9\xba\xcb\xdc\xed\xfe\x0f"
+			"\x20\x31\x42\x53\x64\x75\x86\x97"
+			"\xa8\xb9\xca\xdb\xec\xfd\x0e\x1f"
+			"\x30\x41\x52\x63\x74\x85\x96\xa7"
+			"\xb8\xc9\xda\xeb\xfc\x0d\x1e\x2f"
+			"\x40\x51\x62\x73\x84\x95\xa6\xb7"
+			"\xc8\xd9\xea\xfb\x0c\x1d\x2e\x3f"
+			"\x50\x61\x72\x83\x94\xa5\xb6\xc7"
+			"\xd8\xe9\xfa\x0b\x1c\x2d\x3e\x4f"
+			"\x60\x71\x82\x93\xa4\xb5\xc6\xd7"
+			"\xe8\xf9\x0a\x1b\x2c\x3d\x4e\x5f"
+			"\x70\x81\x92\xa3\xb4\xc5\xd6\xe7"
+			"\xf8\x09\x1a\x2b\x3c\x4d\x5e\x6f"
+			"\x80\x91\xa2\xb3\xc4\xd5\xe6\xf7"
+			"\x08\x19\x2a\x3b\x4c\x5d\x6e\x7f"
+			"\x90\xa1\xb2\xc3\xd4\xe5\xf6\x07"
+			"\x18\x29\x3a\x4b\x5c\x6d\x7e\x8f"
+			"\xa0\xb1\xc2\xd3\xe4\xf5\x06\x17"
+			"\x28\x39\x4a\x5b\x6c\x7d\x8e\x9f"
+			"\xb0\xc1\xd2\xe3\xf4\x05\x16\x27"
+			"\x38\x49\x5a\x6b\x7c\x8d\x9e\xaf"
+			"\xc0\xd1\xe2\xf3\x04\x15\x26\x37"
+			"\x48\x59\x6a\x7b\x8c\x9d\xae\xbf"
+			"\xd0\xe1\xf2\x03\x14\x25\x36\x47"
+			"\x58\x69\x7a\x8b\x9c\xad\xbe\xcf"
+			"\xe0\xf1\x02\x13\x24\x35\x46\x57"
+			"\x68\x79\x8a\x9b\xac\xbd\xce\xdf"
+			"\xf0\x01\x12\x23\x34\x45\x56\x67"
+			"\x78\x89\x9a\xab\xbc\xcd\xde\xef"
+			"\x00\x13\x26\x39\x4c\x5f\x72\x85"
+			"\x98\xab\xbe\xd1\xe4\xf7\x0a\x1d"
+			"\x30\x43\x56\x69\x7c\x8f\xa2\xb5"
+			"\xc8\xdb\xee\x01\x14\x27\x3a\x4d"
+			"\x60\x73\x86\x99\xac\xbf\xd2\xe5"
+			"\xf8\x0b\x1e\x31\x44\x57\x6a\x7d"
+			"\x90\xa3\xb6\xc9\xdc\xef\x02\x15"
+			"\x28\x3b\x4e\x61\x74\x87\x9a\xad"
+			"\xc0\xd3\xe6\xf9\x0c\x1f\x32\x45"
+			"\x58\x6b\x7e\x91\xa4\xb7\xca\xdd"
+			"\xf0\x03\x16\x29\x3c\x4f\x62\x75"
+			"\x88\x9b\xae\xc1\xd4\xe7\xfa\x0d"
+			"\x20\x33\x46\x59\x6c\x7f\x92\xa5"
+			"\xb8\xcb\xde\xf1\x04\x17\x2a\x3d"
+			"\x50\x63\x76\x89\x9c\xaf\xc2\xd5"
+			"\xe8\xfb\x0e\x21\x34\x47\x5a\x6d"
+			"\x80\x93\xa6\xb9\xcc\xdf\xf2\x05"
+			"\x18\x2b\x3e\x51\x64\x77\x8a\x9d"
+			"\xb0\xc3\xd6\xe9\xfc\x0f\x22\x35"
+			"\x48\x5b\x6e\x81\x94\xa7\xba\xcd"
+			"\xe0\xf3\x06\x19\x2c\x3f\x52\x65"
+			"\x78\x8b\x9e\xb1\xc4\xd7\xea\xfd"
+			"\x10\x23\x36\x49\x5c\x6f\x82\x95"
+			"\xa8\xbb\xce\xe1\xf4\x07\x1a\x2d"
+			"\x40\x53\x66\x79\x8c\x9f\xb2\xc5"
+			"\xd8\xeb\xfe\x11\x24\x37\x4a\x5d"
+			"\x70\x83\x96\xa9\xbc\xcf\xe2\xf5"
+			"\x08\x1b\x2e\x41\x54\x67\x7a\x8d"
+			"\xa0\xb3\xc6\xd9\xec\xff\x12\x25"
+			"\x38\x4b\x5e\x71\x84\x97\xaa\xbd"
+			"\xd0\xe3\xf6\x09\x1c\x2f\x42\x55"
+			"\x68\x7b\x8e\xa1\xb4\xc7\xda\xed"
+			"\x00\x15\x2a\x3f\x54\x69\x7e\x93"
+			"\xa8\xbd\xd2\xe7\xfc\x11\x26\x3b"
+			"\x50\x65\x7a\x8f\xa4\xb9\xce\xe3"
+			"\xf8\x0d\x22\x37\x4c\x61\x76\x8b"
+			"\xa0\xb5\xca\xdf\xf4\x09\x1e\x33"
+			"\x48\x5d\x72\x87\x9c\xb1\xc6\xdb"
+			"\xf0\x05\x1a\x2f\x44\x59\x6e\x83"
+			"\x98\xad\xc2\xd7\xec\x01\x16\x2b"
+			"\x40\x55\x6a\x7f\x94\xa9\xbe\xd3"
+			"\xe8\xfd\x12\x27\x3c\x51\x66\x7b"
+			"\x90\xa5\xba\xcf\xe4\xf9\x0e\x23"
+			"\x38\x4d\x62\x77\x8c\xa1\xb6\xcb"
+			"\xe0\xf5\x0a\x1f\x34\x49\x5e\x73"
+			"\x88\x9d\xb2\xc7\xdc\xf1\x06\x1b"
+			"\x30\x45\x5a\x6f\x84\x99\xae\xc3"
+			"\xd8\xed\x02\x17\x2c\x41\x56\x6b"
+			"\x80\x95\xaa\xbf\xd4\xe9\xfe\x13"
+			"\x28\x3d\x52\x67\x7c\x91\xa6\xbb"
+			"\xd0\xe5\xfa\x0f\x24\x39\x4e\x63"
+			"\x78\x8d\xa2\xb7\xcc\xe1\xf6\x0b"
+			"\x20\x35\x4a\x5f\x74\x89\x9e\xb3"
+			"\xc8\xdd\xf2\x07\x1c\x31\x46\x5b"
+			"\x70\x85\x9a\xaf\xc4\xd9\xee\x03"
+			"\x18\x2d\x42\x57\x6c\x81\x96\xab"
+			"\xc0\xd5\xea\xff\x14\x29\x3e\x53"
+			"\x68\x7d\x92\xa7\xbc\xd1\xe6\xfb"
+			"\x10\x25\x3a\x4f\x64\x79\x8e\xa3"
+			"\xb8\xcd\xe2\xf7\x0c\x21\x36\x4b"
+			"\x60\x75\x8a\x9f\xb4\xc9\xde\xf3"
+			"\x08\x1d\x32\x47\x5c\x71\x86\x9b"
+			"\xb0\xc5\xda\xef\x04\x19\x2e\x43"
+			"\x58\x6d\x82\x97\xac\xc1\xd6\xeb"
+			"\x00\x17\x2e\x45\x5c\x73\x8a\xa1"
+			"\xb8\xcf\xe6\xfd\x14\x2b\x42\x59"
+			"\x70\x87\x9e\xb5\xcc\xe3\xfa\x11"
+			"\x28\x3f\x56\x6d\x84\x9b\xb2\xc9"
+			"\xe0\xf7\x0e\x25\x3c\x53\x6a\x81"
+			"\x98\xaf\xc6\xdd\xf4\x0b\x22\x39"
+			"\x50\x67\x7e\x95\xac\xc3\xda\xf1"
+			"\x08\x1f\x36\x4d\x64\x7b\x92\xa9"
+			"\xc0\xd7\xee\x05\x1c\x33\x4a\x61"
+			"\x78\x8f\xa6\xbd\xd4\xeb\x02\x19"
+			"\x30\x47\x5e\x75\x8c\xa3\xba\xd1"
+			"\xe8\xff\x16\x2d\x44\x5b\x72\x89"
+			"\xa0\xb7\xce\xe5\xfc\x13\x2a\x41"
+			"\x58\x6f\x86\x9d\xb4\xcb\xe2\xf9"
+			"\x10\x27\x3e\x55\x6c\x83\x9a\xb1"
+			"\xc8\xdf\xf6\x0d\x24\x3b\x52\x69"
+			"\x80\x97\xae\xc5\xdc\xf3\x0a\x21"
+			"\x38\x4f\x66\x7d\x94\xab\xc2\xd9"
+			"\xf0\x07\x1e\x35\x4c\x63\x7a\x91"
+			"\xa8\xbf\xd6\xed\x04\x1b\x32\x49"
+			"\x60\x77\x8e\xa5\xbc\xd3\xea\x01"
+			"\x18\x2f\x46\x5d\x74\x8b\xa2\xb9"
+			"\xd0\xe7\xfe\x15\x2c\x43\x5a\x71"
+			"\x88\x9f\xb6\xcd\xe4\xfb\x12\x29"
+			"\x40\x57\x6e\x85\x9c\xb3\xca\xe1"
+			"\xf8\x0f\x26\x3d\x54\x6b\x82\x99"
+			"\xb0\xc7\xde\xf5\x0c\x23\x3a\x51"
+			"\x68\x7f\x96\xad\xc4\xdb\xf2\x09"
+			"\x20\x37\x4e\x65\x7c\x93\xaa\xc1"
+			"\xd8\xef\x06\x1d\x34\x4b\x62\x79"
+			"\x90\xa7\xbe\xd5\xec\x03\x1a\x31"
+			"\x48\x5f\x76\x8d\xa4\xbb\xd2\xe9"
+			"\x00\x19\x32\x4b\x64\x7d\x96\xaf"
+			"\xc8\xe1\xfa\x13\x2c\x45\x5e\x77"
+			"\x90\xa9\xc2\xdb\xf4\x0d\x26\x3f"
+			"\x58\x71\x8a\xa3\xbc\xd5\xee\x07"
+			"\x20\x39\x52\x6b\x84\x9d\xb6\xcf"
+			"\xe8\x01\x1a\x33\x4c\x65\x7e\x97"
+			"\xb0\xc9\xe2\xfb\x14\x2d\x46\x5f"
+			"\x78\x91\xaa\xc3\xdc\xf5\x0e\x27"
+			"\x40\x59\x72\x8b\xa4\xbd\xd6\xef"
+			"\x08\x21\x3a\x53\x6c\x85\x9e\xb7"
+			"\xd0\xe9\x02\x1b\x34\x4d\x66\x7f"
+			"\x98\xb1\xca\xe3\xfc\x15\x2e\x47"
+			"\x60\x79\x92\xab\xc4\xdd\xf6\x0f"
+			"\x28\x41\x5a\x73\x8c\xa5\xbe\xd7"
+			"\xf0\x09\x22\x3b\x54\x6d\x86\x9f"
+			"\xb8\xd1\xea\x03\x1c\x35\x4e\x67"
+			"\x80\x99\xb2\xcb\xe4\xfd\x16\x2f"
+			"\x48\x61\x7a\x93\xac\xc5\xde\xf7"
+			"\x10\x29\x42\x5b\x74\x8d\xa6\xbf"
+			"\xd8\xf1\x0a\x23\x3c\x55\x6e\x87"
+			"\xa0\xb9\xd2\xeb\x04\x1d\x36\x4f"
+			"\x68\x81\x9a\xb3\xcc\xe5\xfe\x17"
+			"\x30\x49\x62\x7b\x94\xad\xc6\xdf"
+			"\xf8\x11\x2a\x43\x5c\x75\x8e\xa7"
+			"\xc0\xd9\xf2\x0b\x24\x3d\x56\x6f"
+			"\x88\xa1\xba\xd3\xec\x05\x1e\x37"
+			"\x50\x69\x82\x9b\xb4\xcd\xe6\xff"
+			"\x18\x31\x4a\x63\x7c\x95\xae\xc7"
+			"\xe0\xf9\x12\x2b\x44\x5d\x76\x8f"
+			"\xa8\xc1\xda\xf3\x0c\x25\x3e\x57"
+			"\x70\x89\xa2\xbb\xd4\xed\x06\x1f"
+			"\x38\x51\x6a\x83\x9c\xb5\xce\xe7"
+			"\x00\x1b\x36\x51\x6c\x87\xa2\xbd"
+			"\xd8\xf3\x0e\x29\x44\x5f\x7a\x95"
+			"\xb0\xcb\xe6\x01\x1c\x37\x52\x6d"
+			"\x88\xa3\xbe\xd9\xf4\x0f\x2a\x45"
+			"\x60\x7b\x96\xb1\xcc\xe7\x02\x1d"
+			"\x38\x53\x6e\x89\xa4\xbf\xda\xf5"
+			"\x10\x2b\x46\x61\x7c\x97\xb2\xcd"
+			"\xe8\x03\x1e\x39\x54\x6f\x8a\xa5"
+			"\xc0\xdb\xf6\x11\x2c\x47\x62\x7d"
+			"\x98\xb3\xce\xe9\x04\x1f\x3a\x55"
+			"\x70\x8b\xa6\xc1\xdc\xf7\x12\x2d"
+			"\x48\x63\x7e\x99\xb4\xcf\xea\x05"
+			"\x20\x3b\x56\x71\x8c\xa7\xc2\xdd"
+			"\xf8\x13\x2e\x49\x64\x7f\x9a\xb5"
+			"\xd0\xeb\x06\x21\x3c\x57\x72\x8d"
+			"\xa8\xc3\xde\xf9\x14\x2f\x4a\x65"
+			"\x80\x9b\xb6\xd1\xec\x07\x22\x3d"
+			"\x58\x73\x8e\xa9\xc4\xdf\xfa\x15"
+			"\x30\x4b\x66\x81\x9c\xb7\xd2\xed"
+			"\x08\x23\x3e\x59\x74\x8f\xaa\xc5"
+			"\xe0\xfb\x16\x31\x4c\x67\x82\x9d"
+			"\xb8\xd3\xee\x09\x24\x3f\x5a\x75"
+			"\x90\xab\xc6\xe1\xfc\x17\x32\x4d"
+			"\x68\x83\x9e\xb9\xd4\xef\x0a\x25"
+			"\x40\x5b\x76\x91\xac\xc7\xe2\xfd"
+			"\x18\x33\x4e\x69\x84\x9f\xba\xd5"
+			"\xf0\x0b\x26\x41\x5c\x77\x92\xad"
+			"\xc8\xe3\xfe\x19\x34\x4f\x6a\x85"
+			"\xa0\xbb\xd6\xf1\x0c\x27\x42\x5d"
+			"\x78\x93\xae\xc9\xe4\xff\x1a\x35"
+			"\x50\x6b\x86\xa1\xbc\xd7\xf2\x0d"
+			"\x28\x43\x5e\x79\x94\xaf\xca\xe5"
+			"\x00\x1d\x3a\x57\x74\x91\xae\xcb"
+			"\xe8\x05\x22\x3f\x5c\x79\x96\xb3"
+			"\xd0\xed\x0a\x27\x44\x61\x7e\x9b"
+			"\xb8\xd5\xf2\x0f\x2c\x49\x66\x83"
+			"\xa0\xbd\xda\xf7\x14\x31\x4e\x6b"
+			"\x88\xa5\xc2\xdf\xfc\x19\x36\x53"
+			"\x70\x8d\xaa\xc7\xe4\x01\x1e\x3b"
+			"\x58\x75\x92\xaf\xcc\xe9\x06\x23"
+			"\x40\x5d\x7a\x97\xb4\xd1\xee\x0b"
+			"\x28\x45\x62\x7f\x9c\xb9\xd6\xf3"
+			"\x10\x2d\x4a\x67\x84\xa1\xbe\xdb"
+			"\xf8\x15\x32\x4f\x6c\x89\xa6\xc3"
+			"\xe0\xfd\x1a\x37\x54\x71\x8e\xab"
+			"\xc8\xe5\x02\x1f\x3c\x59\x76\x93"
+			"\xb0\xcd\xea\x07\x24\x41\x5e\x7b"
+			"\x98\xb5\xd2\xef\x0c\x29\x46\x63"
+			"\x80\x9d\xba\xd7\xf4\x11\x2e\x4b"
+			"\x68\x85\xa2\xbf\xdc\xf9\x16\x33"
+			"\x50\x6d\x8a\xa7\xc4\xe1\xfe\x1b"
+			"\x38\x55\x72\x8f\xac\xc9\xe6\x03"
+			"\x20\x3d\x5a\x77\x94\xb1\xce\xeb"
+			"\x08\x25\x42\x5f\x7c\x99\xb6\xd3"
+			"\xf0\x0d\x2a\x47\x64\x81\x9e\xbb"
+			"\xd8\xf5\x12\x2f\x4c\x69\x86\xa3"
+			"\xc0\xdd\xfa\x17\x34\x51\x6e\x8b"
+			"\xa8\xc5\xe2\xff\x1c\x39\x56\x73"
+			"\x90\xad\xca\xe7\x04\x21\x3e\x5b"
+			"\x78\x95\xb2\xcf\xec\x09\x26\x43"
+			"\x60\x7d\x9a\xb7\xd4\xf1\x0e\x2b"
+			"\x48\x65\x82\x9f\xbc\xd9\xf6\x13"
+			"\x30\x4d\x6a\x87\xa4\xc1\xde\xfb"
+			"\x18\x35\x52\x6f\x8c\xa9\xc6\xe3"
+			"\x00\x1f\x3e\x5d\x7c\x9b\xba\xd9"
+			"\xf8\x17\x36\x55\x74\x93\xb2\xd1"
+			"\xf0\x0f\x2e\x4d\x6c\x8b\xaa\xc9"
+			"\xe8\x07\x26\x45\x64\x83\xa2\xc1"
+			"\xe0\xff\x1e\x3d\x5c\x7b\x9a\xb9"
+			"\xd8\xf7\x16\x35\x54\x73\x92\xb1"
+			"\xd0\xef\x0e\x2d\x4c\x6b\x8a\xa9"
+			"\xc8\xe7\x06\x25\x44\x63\x82\xa1"
+			"\xc0\xdf\xfe\x1d\x3c\x5b\x7a\x99"
+			"\xb8\xd7\xf6\x15\x34\x53\x72\x91"
+			"\xb0\xcf\xee\x0d\x2c\x4b\x6a\x89"
+			"\xa8\xc7\xe6\x05\x24\x43\x62\x81"
+			"\xa0\xbf\xde\xfd\x1c\x3b\x5a\x79"
+			"\x98\xb7\xd6\xf5\x14\x33\x52\x71"
+			"\x90\xaf\xce\xed\x0c\x2b\x4a\x69"
+			"\x88\xa7\xc6\xe5\x04\x23\x42\x61"
+			"\x80\x9f\xbe\xdd\xfc\x1b\x3a\x59"
+			"\x78\x97\xb6\xd5\xf4\x13\x32\x51"
+			"\x70\x8f\xae\xcd\xec\x0b\x2a\x49"
+			"\x68\x87\xa6\xc5\xe4\x03\x22\x41"
+			"\x60\x7f\x9e\xbd\xdc\xfb\x1a\x39"
+			"\x58\x77\x96\xb5\xd4\xf3\x12\x31"
+			"\x50\x6f\x8e\xad\xcc\xeb\x0a\x29"
+			"\x48\x67\x86\xa5\xc4\xe3\x02\x21"
+			"\x40\x5f\x7e\x9d\xbc\xdb\xfa\x19"
+			"\x38\x57\x76\x95\xb4\xd3\xf2\x11"
+			"\x30\x4f\x6e\x8d\xac\xcb\xea\x09"
+			"\x28\x47\x66\x85\xa4\xc3\xe2\x01"
+			"\x20\x3f\x5e\x7d\x9c\xbb\xda\xf9"
+			"\x18\x37\x56\x75\x94\xb3\xd2\xf1"
+			"\x10\x2f\x4e\x6d\x8c\xab\xca\xe9"
+			"\x08\x27\x46\x65\x84\xa3\xc2\xe1"
+			"\x00\x21\x42\x63",
+		.ilen = 4100,
+		.result =
+			"\xf0\x5c\x74\xad\x4e\xbc\x99\xe2"
+			"\xae\xff\x91\x3a\x44\xcf\x38\x32"
+			"\x1e\xad\xa7\xcd\xa1\x39\x95\xaa"
+			"\x10\xb1\xb3\x2e\x04\x31\x8f\x86"
+			"\xf2\x62\x74\x70\x0c\xa4\x46\x08"
+			"\xa8\xb7\x99\xa8\xe9\xd2\x73\x79"
+			"\x7e\x6e\xd4\x8f\x1e\xc7\x8e\x31"
+			"\x0b\xfa\x4b\xce\xfd\xf3\x57\x71"
+			"\xe9\x46\x03\xa5\x3d\x34\x00\xe2"
+			"\x18\xff\x75\x6d\x06\x2d\x00\xab"
+			"\xb9\x3e\x6c\x59\xc5\x84\x06\xb5"
+			"\x8b\xd0\x89\x9c\x4a\x79\x16\xc6"
+			"\x3d\x74\x54\xfa\x44\xcd\x23\x26"
+			"\x5c\xcf\x7e\x28\x92\x32\xbf\xdf"
+			"\xa7\x20\x3c\x74\x58\x2a\x9a\xde"
+			"\x61\x00\x1c\x4f\xff\x59\xc4\x22"
+			"\xac\x3c\xd0\xe8\x6c\xf9\x97\x1b"
+			"\x58\x9b\xad\x71\xe8\xa9\xb5\x0d"
+			"\xee\x2f\x04\x1f\x7f\xbc\x99\xee"
+			"\x84\xff\x42\x60\xdc\x3a\x18\xa5"
+			"\x81\xf9\xef\xdc\x7a\x0f\x65\x41"
+			"\x2f\xa3\xd3\xf9\xc2\xcb\xc0\x4d"
+			"\x8f\xd3\x76\x96\xad\x49\x6d\x38"
+			"\x3d\x39\x0b\x6c\x80\xb7\x54\x69"
+			"\xf0\x2c\x90\x02\x29\x0d\x1c\x12"
+			"\xad\x55\xc3\x8b\x68\xd9\xcc\xb3"
+			"\xb2\x64\x33\x90\x5e\xca\x4b\xe2"
+			"\xfb\x75\xdc\x63\xf7\x9f\x82\x74"
+			"\xf0\xc9\xaa\x7f\xe9\x2a\x9b\x33"
+			"\xbc\x88\x00\x7f\xca\xb2\x1f\x14"
+			"\xdb\xc5\x8e\x7b\x11\x3c\x3e\x08"
+			"\xf3\x83\xe8\xe0\x94\x86\x2e\x92"
+			"\x78\x6b\x01\xc9\xc7\x83\xba\x21"
+			"\x6a\x25\x15\x33\x4e\x45\x08\xec"
+			"\x35\xdb\xe0\x6e\x31\x51\x79\xa9"
+			"\x42\x44\x65\xc1\xa0\xf1\xf9\x2a"
+			"\x70\xd5\xb6\xc6\xc1\x8c\x39\xfc"
+			"\x25\xa6\x55\xd9\xdd\x2d\x4c\xec"
+			"\x49\xc6\xeb\x0e\xa8\x25\x2a\x16"
+			"\x1b\x66\x84\xda\xe2\x92\xe5\xc0"
+			"\xc8\x53\x07\xaf\x80\x84\xec\xfd"
+			"\xcd\xd1\x6e\xcd\x6f\x6a\xf5\x36"
+			"\xc5\x15\xe5\x25\x7d\x77\xd1\x1a"
+			"\x93\x36\xa9\xcf\x7c\xa4\x54\x4a"
+			"\x06\x51\x48\x4e\xf6\x59\x87\xd2"
+			"\x04\x02\xef\xd3\x44\xde\x76\x31"
+			"\xb3\x34\x17\x1b\x9d\x66\x11\x9f"
+			"\x1e\xcc\x17\xe9\xc7\x3c\x1b\xe7"
+			"\xcb\x50\x08\xfc\xdc\x2b\x24\xdb"
+			"\x65\x83\xd0\x3b\xe3\x30\xea\x94"
+			"\x6c\xe7\xe8\x35\x32\xc7\xdb\x64"
+			"\xb4\x01\xab\x36\x2c\x77\x13\xaf"
+			"\xf8\x2b\x88\x3f\x54\x39\xc4\x44"
+			"\xfe\xef\x6f\x68\x34\xbe\x0f\x05"
+			"\x16\x6d\xf6\x0a\x30\xe7\xe3\xed"
+			"\xc4\xde\x3c\x1b\x13\xd8\xdb\xfe"
+			"\x41\x62\xe5\x28\xd4\x8d\xa3\xc7"
+			"\x93\x97\xc6\x48\x45\x1d\x9f\x83"
+			"\xdf\x4b\x40\x3e\x42\x25\x87\x80"
+			"\x4c\x7d\xa8\xd4\x98\x23\x95\x75"
+			"\x41\x8c\xda\x41\x9b\xd4\xa7\x06"
+			"\xb5\xf1\x71\x09\x53\xbe\xca\xbf"
+			"\x32\x03\xed\xf0\x50\x1c\x56\x39"
+			"\x5b\xa4\x75\x18\xf7\x9b\x58\xef"
+			"\x53\xfc\x2a\x38\x23\x15\x75\xcd"
+			"\x45\xe5\x5a\x82\x55\xba\x21\xfa"
+			"\xd4\xbd\xc6\x94\x7c\xc5\x80\x12"
+			"\xf7\x4b\x32\xc4\x9a\x82\xd8\x28"
+			"\x8f\xd9\xc2\x0f\x60\x03\xbe\x5e"
+			"\x21\xd6\x5f\x58\xbf\x5c\xb1\x32"
+			"\x82\x8d\xa9\xe5\xf2\x66\x1a\xc0"
+			"\xa0\xbc\x58\x2f\x71\xf5\x2f\xed"
+			"\xd1\x26\xb9\xd8\x49\x5a\x07\x19"
+			"\x01\x7c\x59\xb0\xf8\xa4\xb7\xd3"
+			"\x7b\x1a\x8c\x38\xf4\x50\xa4\x59"
+			"\xb0\xcc\x41\x0b\x88\x7f\xe5\x31"
+			"\xb3\x42\xba\xa2\x7e\xd4\x32\x71"
+			"\x45\x87\x48\xa9\xc2\xf2\x89\xb3"
+			"\xe4\xa7\x7e\x52\x15\x61\xfa\xfe"
+			"\xc9\xdd\x81\xeb\x13\xab\xab\xc3"
+			"\x98\x59\xd8\x16\x3d\x14\x7a\x1c"
+			"\x3c\x41\x9a\x16\x16\x9b\xd2\xd2"
+			"\x69\x3a\x29\x23\xac\x86\x32\xa5"
+			"\x48\x9c\x9e\xf3\x47\x77\x81\x70"
+			"\x24\xe8\x85\xd2\xf5\xb5\xfa\xff"
+			"\x59\x6a\xd3\x50\x59\x43\x59\xde"
+			"\xd9\xf1\x55\xa5\x0c\xc3\x1a\x1a"
+			"\x18\x34\x0d\x1a\x63\x33\xed\x10"
+			"\xe0\x1d\x2a\x18\xd2\xc0\x54\xa8"
+			"\xca\xb5\x9a\xd3\xdd\xca\x45\x84"
+			"\x50\xe7\x0f\xfe\xa4\x99\x5a\xbe"
+			"\x43\x2d\x9a\xcb\x92\x3f\x5a\x1d"
+			"\x85\xd8\xc9\xdf\x68\xc9\x12\x80"
+			"\x56\x0c\xdc\x00\xdc\x3a\x7d\x9d"
+			"\xa3\xa2\xe8\x4d\xbf\xf9\x70\xa0"
+			"\xa4\x13\x4f\x6b\xaf\x0a\x89\x7f"
+			"\xda\xf0\xbf\x9b\xc8\x1d\xe5\xf8"
+			"\x2e\x8b\x07\xb5\x73\x1b\xcc\xa2"
+			"\xa6\xad\x30\xbc\x78\x3c\x5b\x10"
+			"\xfa\x5e\x62\x2d\x9e\x64\xb3\x33"
+			"\xce\xf9\x1f\x86\xe7\x8b\xa2\xb8"
+			"\xe8\x99\x57\x8c\x11\xed\x66\xd9"
+			"\x3c\x72\xb9\xc3\xe6\x4e\x17\x3a"
+			"\x6a\xcb\x42\x24\x06\xed\x3e\x4e"
+			"\xa3\xe8\x6a\x94\xda\x0d\x4e\xd5"
+			"\x14\x19\xcf\xb6\x26\xd8\x2e\xcc"
+			"\x64\x76\x38\x49\x4d\xfe\x30\x6d"
+			"\xe4\xc8\x8c\x7b\xc4\xe0\x35\xba"
+			"\x22\x6e\x76\xe1\x1a\xf2\x53\xc3"
+			"\x28\xa2\x82\x1f\x61\x69\xad\xc1"
+			"\x7b\x28\x4b\x1e\x6c\x85\x95\x9b"
+			"\x51\xb5\x17\x7f\x12\x69\x8c\x24"
+			"\xd5\xc7\x5a\x5a\x11\x54\xff\x5a"
+			"\xf7\x16\xc3\x91\xa6\xf0\xdc\x0a"
+			"\xb6\xa7\x4a\x0d\x7a\x58\xfe\xa5"
+			"\xf5\xcb\x8f\x7b\x0e\xea\x57\xe7"
+			"\xbd\x79\xd6\x1c\x88\x23\x6c\xf2"
+			"\x4d\x29\x77\x53\x35\x6a\x00\x8d"
+			"\xcd\xa3\x58\xbe\x77\x99\x18\xf8"
+			"\xe6\xe1\x8f\xe9\x37\x8f\xe3\xe2"
+			"\x5a\x8a\x93\x25\xaf\xf3\x78\x80"
+			"\xbe\xa6\x1b\xc6\xac\x8b\x1c\x91"
+			"\x58\xe1\x9f\x89\x35\x9d\x1d\x21"
+			"\x29\x9f\xf4\x99\x02\x27\x0f\xa8"
+			"\x4f\x79\x94\x2b\x33\x2c\xda\xa2"
+			"\x26\x39\x83\x94\xef\x27\xd8\x53"
+			"\x8f\x66\x0d\xe4\x41\x7d\x34\xcd"
+			"\x43\x7c\x95\x0a\x53\xef\x66\xda"
+			"\x7e\x9b\xf3\x93\xaf\xd0\x73\x71"
+			"\xba\x40\x9b\x74\xf8\xd7\xd7\x41"
+			"\x6d\xaf\x72\x9c\x8d\x21\x87\x3c"
+			"\xfd\x0a\x90\xa9\x47\x96\x9e\xd3"
+			"\x88\xee\x73\xcf\x66\x2f\x52\x56"
+			"\x6d\xa9\x80\x4c\xe2\x6f\x62\x88"
+			"\x3f\x0e\x54\x17\x48\x80\x5d\xd3"
+			"\xc3\xda\x25\x3d\xa1\xc8\xcb\x9f"
+			"\x9b\x70\xb3\xa1\xeb\x04\x52\xa1"
+			"\xf2\x22\x0f\xfc\xc8\x18\xfa\xf9"
+			"\x85\x9c\xf1\xac\xeb\x0c\x02\x46"
+			"\x75\xd2\xf5\x2c\xe3\xd2\x59\x94"
+			"\x12\xf3\x3c\xfc\xd7\x92\xfa\x36"
+			"\xba\x61\x34\x38\x7c\xda\x48\x3e"
+			"\x08\xc9\x39\x23\x5e\x02\x2c\x1a"
+			"\x18\x7e\xb4\xd9\xfd\x9e\x40\x02"
+			"\xb1\x33\x37\x32\xe7\xde\xd6\xd0"
+			"\x7c\x58\x65\x4b\xf8\x34\x27\x9c"
+			"\x44\xb4\xbd\xe9\xe9\x4c\x78\x7d"
+			"\x4b\x9f\xce\xb1\xcd\x47\xa5\x37"
+			"\xe5\x6d\xbd\xb9\x43\x94\x0a\xd4"
+			"\xd6\xf9\x04\x5f\xb5\x66\x6c\x1a"
+			"\x35\x12\xe3\x36\x28\x27\x36\x58"
+			"\x01\x2b\x79\xe4\xba\x6d\x10\x7d"
+			"\x65\xdf\x84\x95\xf4\xd5\xb6\x8f"
+			"\x2b\x9f\x96\x00\x86\x60\xf0\x21"
+			"\x76\xa8\x6a\x8c\x28\x1c\xb3\x6b"
+			"\x97\xd7\xb6\x53\x2a\xcc\xab\x40"
+			"\x9d\x62\x79\x58\x52\xe6\x65\xb7"
+			"\xab\x55\x67\x9c\x89\x7c\x03\xb0"
+			"\x73\x59\xc5\x81\xf5\x18\x17\x5c"
+			"\x89\xf3\x78\x35\x44\x62\x78\x72"
+			"\xd0\x96\xeb\x31\xe7\x87\x77\x14"
+			"\x99\x51\xf2\x59\x26\x9e\xb5\xa6"
+			"\x45\xfe\x6e\xbd\x07\x4c\x94\x5a"
+			"\xa5\x7d\xfc\xf1\x2b\x77\xe2\xfe"
+			"\x17\xd4\x84\xa0\xac\xb5\xc7\xda"
+			"\xa9\x1a\xb6\xf3\x74\x11\xb4\x9d"
+			"\xfb\x79\x2e\x04\x2d\x50\x28\x83"
+			"\xbf\xc6\x52\xd3\x34\xd6\xe8\x7a"
+			"\xb6\xea\xe7\xa8\x6c\x15\x1e\x2c"
+			"\x57\xbc\x48\x4e\x5f\x5c\xb6\x92"
+			"\xd2\x49\x77\x81\x6d\x90\x70\xae"
+			"\x98\xa1\x03\x0d\x6b\xb9\x77\x14"
+			"\xf1\x4e\x23\xd3\xf8\x68\xbd\xc2"
+			"\xfe\x04\xb7\x5c\xc5\x17\x60\x8f"
+			"\x65\x54\xa4\x7a\x42\xdc\x18\x0d"
+			"\xb5\xcf\x0f\xd3\xc7\x91\x66\x1b"
+			"\x45\x42\x27\x75\x50\xe5\xee\xb8"
+			"\x7f\x33\x2c\xba\x4a\x92\x4d\x2c"
+			"\x3c\xe3\x0d\x80\x01\xba\x0d\x29"
+			"\xd8\x3c\xe9\x13\x16\x57\xe6\xea"
+			"\x94\x52\xe7\x00\x4d\x30\xb0\x0f"
+			"\x35\xb8\xb8\xa7\xb1\xb5\x3b\x44"
+			"\xe1\x2f\xfd\x88\xed\x43\xe7\x52"
+			"\x10\x93\xb3\x8a\x30\x6b\x0a\xf7"
+			"\x23\xc6\x50\x9d\x4a\xb0\xde\xc3"
+			"\xdc\x9b\x2f\x01\x56\x36\x09\xc5"
+			"\x2f\x6b\xfe\xf1\xd8\x27\x45\x03"
+			"\x30\x5e\x5c\x5b\xb4\x62\x0e\x1a"
+			"\xa9\x21\x2b\x92\x94\x87\x62\x57"
+			"\x4c\x10\x74\x1a\xf1\x0a\xc5\x84"
+			"\x3b\x9e\x72\x02\xd7\xcc\x09\x56"
+			"\xbd\x54\xc1\xf0\xc3\xe3\xb3\xf8"
+			"\xd2\x0d\x61\xcb\xef\xce\x0d\x05"
+			"\xb0\x98\xd9\x8e\x4f\xf9\xbc\x93"
+			"\xa6\xea\xc8\xcf\x10\x53\x4b\xf1"
+			"\xec\xfc\x89\xf9\x64\xb0\x22\xbf"
+			"\x9e\x55\x46\x9f\x7c\x50\x8e\x84"
+			"\x54\x20\x98\xd7\x6c\x40\x1e\xdb"
+			"\x69\x34\x78\x61\x24\x21\x9c\x8a"
+			"\xb3\x62\x31\x8b\x6e\xf5\x2a\x35"
+			"\x86\x13\xb1\x6c\x64\x2e\x41\xa5"
+			"\x05\xf2\x42\xba\xd2\x3a\x0d\x8e"
+			"\x8a\x59\x94\x3c\xcf\x36\x27\x82"
+			"\xc2\x45\xee\x58\xcd\x88\xb4\xec"
+			"\xde\xb2\x96\x0a\xaf\x38\x6f\x88"
+			"\xd7\xd8\xe1\xdf\xb9\x96\xa9\x0a"
+			"\xb1\x95\x28\x86\x20\xe9\x17\x49"
+			"\xa2\x29\x38\xaa\xa5\xe9\x6e\xf1"
+			"\x19\x27\xc0\xd5\x2a\x22\xc3\x0b"
+			"\xdb\x7c\x73\x10\xb9\xba\x89\x76"
+			"\x54\xae\x7d\x71\xb3\x93\xf6\x32"
+			"\xe6\x47\x43\x55\xac\xa0\x0d\xc2"
+			"\x93\x27\x4a\x8e\x0e\x74\x15\xc7"
+			"\x0b\x85\xd9\x0c\xa9\x30\x7a\x3e"
+			"\xea\x8f\x85\x6d\x3a\x12\x4f\x72"
+			"\x69\x58\x7a\x80\xbb\xb5\x97\xf3"
+			"\xcf\x70\xd2\x5d\xdd\x4d\x21\x79"
+			"\x54\x4d\xe4\x05\xe8\xbd\xc2\x62"
+			"\xb1\x3b\x77\x1c\xd6\x5c\xf3\xa0"
+			"\x79\x00\xa8\x6c\x29\xd9\x18\x24"
+			"\x36\xa2\x46\xc0\x96\x65\x7f\xbd"
+			"\x2a\xed\x36\x16\x0c\xaa\x9f\xf4"
+			"\xc5\xb4\xe2\x12\xed\x69\xed\x4f"
+			"\x26\x2c\x39\x52\x89\x98\xe7\x2c"
+			"\x99\xa4\x9e\xa3\x9b\x99\x46\x7a"
+			"\x3a\xdc\xa8\x59\xa3\xdb\xc3\x3b"
+			"\x95\x0d\x3b\x09\x6e\xee\x83\x5d"
+			"\x32\x4d\xed\xab\xfa\x98\x14\x4e"
+			"\xc3\x15\x45\x53\x61\xc4\x93\xbd"
+			"\x90\xf4\x99\x95\x4c\xe6\x76\x92"
+			"\x29\x90\x46\x30\x92\x69\x7d\x13"
+			"\xf2\xa5\xcd\x69\x49\x44\xb2\x0f"
+			"\x63\x40\x36\x5f\x09\xe2\x78\xf8"
+			"\x91\xe3\xe2\xfa\x10\xf7\xc8\x24"
+			"\xa8\x89\x32\x5c\x37\x25\x1d\xb2"
+			"\xea\x17\x8a\x0a\xa9\x64\xc3\x7c"
+			"\x3c\x7c\xbd\xc6\x79\x34\xe7\xe2"
+			"\x85\x8e\xbf\xf8\xde\x92\xa0\xae"
+			"\x20\xc4\xf6\xbb\x1f\x38\x19\x0e"
+			"\xe8\x79\x9c\xa1\x23\xe9\x54\x7e"
+			"\x37\x2f\xe2\x94\x32\xaf\xa0\x23"
+			"\x49\xe4\xc0\xb3\xac\x00\x8f\x36"
+			"\x05\xc4\xa6\x96\xec\x05\x98\x4f"
+			"\x96\x67\x57\x1f\x20\x86\x1b\x2d"
+			"\x69\xe4\x29\x93\x66\x5f\xaf\x6b"
+			"\x88\x26\x2c\x67\x02\x4b\x52\xd0"
+			"\x83\x7a\x43\x1f\xc0\x71\x15\x25"
+			"\x77\x65\x08\x60\x11\x76\x4c\x8d"
+			"\xed\xa9\x27\xc6\xb1\x2a\x2c\x6a"
+			"\x4a\x97\xf5\xc6\xb7\x70\x42\xd3"
+			"\x03\xd1\x24\x95\xec\x6d\xab\x38"
+			"\x72\xce\xe2\x8b\x33\xd7\x51\x09"
+			"\xdc\x45\xe0\x09\x96\x32\xf3\xc4"
+			"\x84\xdc\x73\x73\x2d\x1b\x11\x98"
+			"\xc5\x0e\x69\x28\x94\xc7\xb5\x4d"
+			"\xc8\x8a\xd0\xaa\x13\x2e\x18\x74"
+			"\xdd\xd1\x1e\xf3\x90\xe8\xfc\x9a"
+			"\x72\x4a\x0e\xd1\xe4\xfb\x0d\x96"
+			"\xd1\x0c\x79\x85\x1b\x1c\xfe\xe1"
+			"\x62\x8f\x7a\x73\x32\xab\xc8\x18"
+			"\x69\xe3\x34\x30\xdf\x13\xa6\xe5"
+			"\xe8\x0e\x67\x7f\x81\x11\xb4\x60"
+			"\xc7\xbd\x79\x65\x50\xdc\xc4\x5b"
+			"\xde\x39\xa4\x01\x72\x63\xf3\xd1"
+			"\x64\x4e\xdf\xfc\x27\x92\x37\x0d"
+			"\x57\xcd\x11\x4f\x11\x04\x8e\x1d"
+			"\x16\xf7\xcd\x92\x9a\x99\x30\x14"
+			"\xf1\x7c\x67\x1b\x1f\x41\x0b\xe8"
+			"\x32\xe8\xb8\xc1\x4f\x54\x86\x4f"
+			"\xe5\x79\x81\x73\xcd\x43\x59\x68"
+			"\x73\x02\x3b\x78\x21\x72\x43\x00"
+			"\x49\x17\xf7\x00\xaf\x68\x24\x53"
+			"\x05\x0a\xc3\x33\xe0\x33\x3f\x69"
+			"\xd2\x84\x2f\x0b\xed\xde\x04\xf4"
+			"\x11\x94\x13\x69\x51\x09\x28\xde"
+			"\x57\x5c\xef\xdc\x9a\x49\x1c\x17"
+			"\x97\xf3\x96\xc1\x7f\x5d\x2e\x7d"
+			"\x55\xb8\xb3\x02\x09\xb3\x1f\xe7"
+			"\xc9\x8d\xa3\x36\x34\x8a\x77\x13"
+			"\x30\x63\x4c\xa5\xcd\xc3\xe0\x7e"
+			"\x05\xa1\x7b\x0c\xcb\x74\x47\x31"
+			"\x62\x03\x43\xf1\x87\xb4\xb0\x85"
+			"\x87\x8e\x4b\x25\xc7\xcf\xae\x4b"
+			"\x36\x46\x3e\x62\xbc\x6f\xeb\x5f"
+			"\x73\xac\xe6\x07\xee\xc1\xa1\xd6"
+			"\xc4\xab\xc9\xd6\x89\x45\xe1\xf1"
+			"\x04\x4e\x1a\x6f\xbb\x4f\x3a\xa3"
+			"\xa0\xcb\xa3\x0a\xd8\x71\x35\x55"
+			"\xe4\xbc\x2e\x04\x06\xe6\xff\x5b"
+			"\x1c\xc0\x11\x7c\xc5\x17\xf3\x38"
+			"\xcf\xe9\xba\x0f\x0e\xef\x02\xc2"
+			"\x8d\xc6\xbc\x4b\x67\x20\x95\xd7"
+			"\x2c\x45\x5b\x86\x44\x8c\x6f\x2e"
+			"\x7e\x9f\x1c\x77\xba\x6b\x0e\xa3"
+			"\x69\xdc\xab\x24\x57\x60\x47\xc1"
+			"\xd1\xa5\x9d\x23\xe6\xb1\x37\xfe"
+			"\x93\xd2\x4c\x46\xf9\x0c\xc6\xfb"
+			"\xd6\x9d\x99\x69\xab\x7a\x07\x0c"
+			"\x65\xe7\xc4\x08\x96\xe2\xa5\x01"
+			"\x3f\x46\x07\x05\x7e\xe8\x9a\x90"
+			"\x50\xdc\xe9\x7a\xea\xa1\x39\x6e"
+			"\x66\xe4\x6f\xa5\x5f\xb2\xd9\x5b"
+			"\xf5\xdb\x2a\x32\xf0\x11\x6f\x7c"
+			"\x26\x10\x8f\x3d\x80\xe9\x58\xf7"
+			"\xe0\xa8\x57\xf8\xdb\x0e\xce\x99"
+			"\x63\x19\x3d\xd5\xec\x1b\x77\x69"
+			"\x98\xf6\xe4\x5f\x67\x17\x4b\x09"
+			"\x85\x62\x82\x70\x18\xe2\x9a\x78"
+			"\xe2\x62\xbd\xb4\xf1\x42\xc6\xfb"
+			"\x08\xd0\xbd\xeb\x4e\x09\xf2\xc8"
+			"\x1e\xdc\x3d\x32\x21\x56\x9c\x4f"
+			"\x35\xf3\x61\x06\x72\x84\xc4\x32"
+			"\xf2\xf1\xfa\x0b\x2f\xc3\xdb\x02"
+			"\x04\xc2\xde\x57\x64\x60\x8d\xcf"
+			"\xcb\x86\x5d\x97\x3e\xb1\x9c\x01"
+			"\xd6\x28\x8f\x99\xbc\x46\xeb\x05"
+			"\xaf\x7e\xb8\x21\x2a\x56\x85\x1c"
+			"\xb3\x71\xa0\xde\xca\x96\xf1\x78"
+			"\x49\xa2\x99\x81\x80\x5c\x01\xf5"
+			"\xa0\xa2\x56\x63\xe2\x70\x07\xa5"
+			"\x95\xd6\x85\xeb\x36\x9e\xa9\x51"
+			"\x66\x56\x5f\x1d\x02\x19\xe2\xf6"
+			"\x4f\x73\x38\x09\x75\x64\x48\xe0"
+			"\xf1\x7e\x0e\xe8\x9d\xf9\xed\x94"
+			"\xfe\x16\x26\x62\x49\x74\xf4\xb0"
+			"\xd4\xa9\x6c\xb0\xfd\x53\xe9\x81"
+			"\xe0\x7a\xbf\xcf\xb5\xc4\x01\x81"
+			"\x79\x99\x77\x01\x3b\xe9\xa2\xb6"
+			"\xe6\x6a\x8a\x9e\x56\x1c\x8d\x1e"
+			"\x8f\x06\x55\x2c\x6c\xdc\x92\x87"
+			"\x64\x3b\x4b\x19\xa1\x13\x64\x1d"
+			"\x4a\xe9\xc0\x00\xb8\x95\xef\x6b"
+			"\x1a\x86\x6d\x37\x52\x02\xc2\xe0"
+			"\xc8\xbb\x42\x0c\x02\x21\x4a\xc9"
+			"\xef\xa0\x54\xe4\x5e\x16\x53\x81"
+			"\x70\x62\x10\xaf\xde\xb8\xb5\xd3"
+			"\xe8\x5e\x6c\xc3\x8a\x3e\x18\x07"
+			"\xf2\x2f\x7d\xa7\xe1\x3d\x4e\xb4"
+			"\x26\xa7\xa3\x93\x86\xb2\x04\x1e"
+			"\x53\x5d\x86\xd6\xde\x65\xca\xe3"
+			"\x4e\xc1\xcf\xef\xc8\x70\x1b\x83"
+			"\x13\xdd\x18\x8b\x0d\x76\xd2\xf6"
+			"\x37\x7a\x93\x7a\x50\x11\x9f\x96"
+			"\x86\x25\xfd\xac\xdc\xbe\x18\x93"
+			"\x19\x6b\xec\x58\x4f\xb9\x75\xa7"
+			"\xdd\x3f\x2f\xec\xc8\x5a\x84\xab"
+			"\xd5\xe4\x8a\x07\xf6\x4d\x23\xd6"
+			"\x03\xfb\x03\x6a\xea\x66\xbf\xd4"
+			"\xb1\x34\xfb\x78\xe9\x55\xdc\x7c"
+			"\x3d\x9c\xe5\x9a\xac\xc3\x7a\x80"
+			"\x24\x6d\xa0\xef\x25\x7c\xb7\xea"
+			"\xce\x4d\x5f\x18\x60\xce\x87\x22"
+			"\x66\x2f\xd5\xdd\xdd\x02\x21\x75"
+			"\x82\xa0\x1f\x58\xc6\xd3\x62\xf7"
+			"\x32\xd8\xaf\x1e\x07\x77\x51\x96"
+			"\xd5\x6b\x1e\x7e\x80\x02\xe8\x67"
+			"\xea\x17\x0b\x10\xd2\x3f\x28\x25"
+			"\x4f\x05\x77\x02\x14\x69\xf0\x2c"
+			"\xbe\x0c\xf1\x74\x30\xd1\xb9\x9b"
+			"\xfc\x8c\xbb\x04\x16\xd9\xba\xc3"
+			"\xbc\x91\x8a\xc4\x30\xa4\xb0\x12"
+			"\x4c\x21\x87\xcb\xc9\x1d\x16\x96"
+			"\x07\x6f\x23\x54\xb9\x6f\x79\xe5"
+			"\x64\xc0\x64\xda\xb1\xae\xdd\x60"
+			"\x6c\x1a\x9d\xd3\x04\x8e\x45\xb0"
+			"\x92\x61\xd0\x48\x81\xed\x5e\x1d"
+			"\xa0\xc9\xa4\x33\xc7\x13\x51\x5d"
+			"\x7f\x83\x73\xb6\x70\x18\x65\x3e"
+			"\x2f\x0e\x7a\x12\x39\x98\xab\xd8"
+			"\x7e\x6f\xa3\xd1\xba\x56\xad\xbd"
+			"\xf0\x03\x01\x1c\x85\x35\x9f\xeb"
+			"\x19\x63\xa1\xaf\xfe\x2d\x35\x50"
+			"\x39\xa0\x65\x7c\x95\x7e\x6b\xfe"
+			"\xc1\xac\x07\x7c\x98\x4f\xbe\x57"
+			"\xa7\x22\xec\xe2\x7e\x29\x09\x53"
+			"\xe8\xbf\xb4\x7e\x3f\x8f\xfc\x14"
+			"\xce\x54\xf9\x18\x58\xb5\xff\x44"
+			"\x05\x9d\xce\x1b\xb6\x82\x23\xc8"
+			"\x2e\xbc\x69\xbb\x4a\x29\x0f\x65"
+			"\x94\xf0\x63\x06\x0e\xef\x8c\xbd"
+			"\xff\xfd\xb0\x21\x6e\x57\x05\x75"
+			"\xda\xd5\xc4\xeb\x8d\x32\xf7\x50"
+			"\xd3\x6f\x22\xed\x5f\x8e\xa2\x5b"
+			"\x80\x8c\xc8\x78\x40\x24\x4b\x89"
+			"\x30\xce\x7a\x97\x0e\xc4\xaf\xef"
+			"\x9b\xb4\xcd\x66\x74\x14\x04\x2b"
+			"\xf7\xce\x0b\x1c\x6e\xc2\x78\x8c"
+			"\xca\xc5\xd0\x1c\x95\x4a\x91\x2d"
+			"\xa7\x20\xeb\x86\x52\xb7\x67\xd8"
+			"\x0c\xd6\x04\x14\xde\x51\x74\x75"
+			"\xe7\x11\xb4\x87\xa3\x3d\x2d\xad"
+			"\x4f\xef\xa0\x0f\x70\x00\x6d\x13"
+			"\x19\x1d\x41\x50\xe9\xd8\xf0\x32"
+			"\x71\xbc\xd3\x11\xf2\xac\xbe\xaf"
+			"\x75\x46\x65\x4e\x07\x34\x37\xa3"
+			"\x89\xfe\x75\xd4\x70\x4c\xc6\x3f"
+			"\x69\x24\x0e\x38\x67\x43\x8c\xde"
+			"\x06\xb5\xb8\xe7\xc4\xf0\x41\x8f"
+			"\xf0\xbd\x2f\x0b\xb9\x18\xf8\xde"
+			"\x64\xb1\xdb\xee\x00\x50\x77\xe1"
+			"\xc7\xff\xa6\xfa\xdd\x70\xf4\xe3"
+			"\x93\xe9\x77\x35\x3d\x4b\x2f\x2b"
+			"\x6d\x55\xf0\xfc\x88\x54\x4e\x89"
+			"\xc1\x8a\x23\x31\x2d\x14\x2a\xb8"
+			"\x1b\x15\xdd\x9e\x6e\x7b\xda\x05"
+			"\x91\x7d\x62\x64\x96\x72\xde\xfc"
+			"\xc1\xec\xf0\x23\x51\x6f\xdb\x5b"
+			"\x1d\x08\x57\xce\x09\xb8\xf6\xcd"
+			"\x8d\x95\xf2\x20\xbf\x0f\x20\x57"
+			"\x98\x81\x84\x4f\x15\x5c\x76\xe7"
+			"\x3e\x0a\x3a\x6c\xc4\x8a\xbe\x78"
+			"\x74\x77\xc3\x09\x4b\x5d\x48\xe4"
+			"\xc8\xcb\x0b\xea\x17\x28\xcf\xcf"
+			"\x31\x32\x44\xa4\xe5\x0e\x1a\x98"
+			"\x94\xc4\xf0\xff\xae\x3e\x44\xe8"
+			"\xa5\xb3\xb5\x37\x2f\xe8\xaf\x6f"
+			"\x28\xc1\x37\x5f\x31\xd2\xb9\x33"
+			"\xb1\xb2\x52\x94\x75\x2c\x29\x59"
+			"\x06\xc2\x25\xe8\x71\x65\x4e\xed"
+			"\xc0\x9c\xb1\xbb\x25\xdc\x6c\xe7"
+			"\x4b\xa5\x7a\x54\x7a\x60\xff\x7a"
+			"\xe0\x50\x40\x96\x35\x63\xe4\x0b"
+			"\x76\xbd\xa4\x65\x00\x1b\x57\x88"
+			"\xae\xed\x39\x88\x42\x11\x3c\xed"
+			"\x85\x67\x7d\xb9\x68\x82\xe9\x43"
+			"\x3c\x47\x53\xfa\xe8\xf8\x9f\x1f"
+			"\x9f\xef\x0f\xf7\x30\xd9\x30\x0e"
+			"\xb9\x9f\x69\x18\x2f\x7e\xf8\xf8"
+			"\xf8\x8c\x0f\xd4\x02\x4d\xea\xcd"
+			"\x0a\x9c\x6f\x71\x6d\x5a\x4c\x60"
+			"\xce\x20\x56\x32\xc6\xc5\x99\x1f"
+			"\x09\xe6\x4e\x18\x1a\x15\x13\xa8"
+			"\x7d\xb1\x6b\xc0\xb2\x6d\xf8\x26"
+			"\x66\xf8\x3d\x18\x74\x70\x66\x7a"
+			"\x34\x17\xde\xba\x47\xf1\x06\x18"
+			"\xcb\xaf\xeb\x4a\x1e\x8f\xa7\x77"
+			"\xe0\x3b\x78\x62\x66\xc9\x10\xea"
+			"\x1f\xb7\x29\x0a\x45\xa1\x1d\x1e"
+			"\x1d\xe2\x65\x61\x50\x9c\xd7\x05"
+			"\xf2\x0b\x5b\x12\x61\x02\xc8\xe5"
+			"\x63\x4f\x20\x0c\x07\x17\x33\x5e"
+			"\x03\x9a\x53\x0f\x2e\x55\xfe\x50"
+			"\x43\x7d\xd0\xb6\x7e\x5a\xda\xae"
+			"\x58\xef\x15\xa9\x83\xd9\x46\xb1"
+			"\x42\xaa\xf5\x02\x6c\xce\x92\x06"
+			"\x1b\xdb\x66\x45\x91\x79\xc2\x2d"
+			"\xe6\x53\xd3\x14\xfd\xbb\x44\x63"
+			"\xc6\xd7\x3d\x7a\x0c\x75\x78\x9d"
+			"\x5c\xa6\x39\xb3\xe5\x63\xca\x8b"
+			"\xfe\xd3\xef\x60\x83\xf6\x8e\x70"
+			"\xb6\x67\xc7\x77\xed\x23\xef\x4c"
+			"\xf0\xed\x2d\x07\x59\x6f\xc1\x01"
+			"\x34\x37\x08\xab\xd9\x1f\x09\xb1"
+			"\xce\x5b\x17\xff\x74\xf8\x9c\xd5"
+			"\x2c\x56\x39\x79\x0f\x69\x44\x75"
+			"\x58\x27\x01\xc4\xbf\xa7\xa1\x1d"
+			"\x90\x17\x77\x86\x5a\x3f\xd9\xd1"
+			"\x0e\xa0\x10\xf8\xec\x1e\xa5\x7f"
+			"\x5e\x36\xd1\xe3\x04\x2c\x70\xf7"
+			"\x8e\xc0\x98\x2f\x6c\x94\x2b\x41"
+			"\xb7\x60\x00\xb7\x2e\xb8\x02\x8d"
+			"\xb8\xb0\xd3\x86\xba\x1d\xd7\x90"
+			"\xd6\xb6\xe1\xfc\xd7\xd8\x28\x06"
+			"\x63\x9b\xce\x61\x24\x79\xc0\x70"
+			"\x52\xd0\xb6\xd4\x28\x95\x24\x87"
+			"\x03\x1f\xb7\x9a\xda\xa3\xfb\x52"
+			"\x5b\x68\xe7\x4c\x8c\x24\xe1\x42"
+			"\xf7\xd5\xfd\xad\x06\x32\x9f\xba"
+			"\xc1\xfc\xdd\xc6\xfc\xfc\xb3\x38"
+			"\x74\x56\x58\x40\x02\x37\x52\x2c"
+			"\x55\xcc\xb3\x9e\x7a\xe9\xd4\x38"
+			"\x41\x5e\x0c\x35\xe2\x11\xd1\x13"
+			"\xf8\xb7\x8d\x72\x6b\x22\x2a\xb0"
+			"\xdb\x08\xba\x35\xb9\x3f\xc8\xd3"
+			"\x24\x90\xec\x58\xd2\x09\xc7\x2d"
+			"\xed\x38\x80\x36\x72\x43\x27\x49"
+			"\x4a\x80\x8a\xa2\xe8\xd3\xda\x30"
+			"\x7d\xb6\x82\x37\x86\x92\x86\x3e"
+			"\x08\xb2\x28\x5a\x55\x44\x24\x7d"
+			"\x40\x48\x8a\xb6\x89\x58\x08\xa0"
+			"\xd6\x6d\x3a\x17\xbf\xf6\x54\xa2"
+			"\xf5\xd3\x8c\x0f\x78\x12\x57\x8b"
+			"\xd5\xc2\xfd\x58\x5b\x7f\x38\xe3"
+			"\xcc\xb7\x7c\x48\xb3\x20\xe8\x81"
+			"\x14\x32\x45\x05\xe0\xdb\x9f\x75"
+			"\x85\xb4\x6a\xfc\x95\xe3\x54\x22"
+			"\x12\xee\x30\xfe\xd8\x30\xef\x34"
+			"\x50\xab\x46\x30\x98\x2f\xb7\xc0"
+			"\x15\xa2\x83\xb6\xf2\x06\x21\xa2"
+			"\xc3\x26\x37\x14\xd1\x4d\xb5\x10"
+			"\x52\x76\x4d\x6a\xee\xb5\x2b\x15"
+			"\xb7\xf9\x51\xe8\x2a\xaf\xc7\xfa"
+			"\x77\xaf\xb0\x05\x4d\xd1\x68\x8e"
+			"\x74\x05\x9f\x9d\x93\xa5\x3e\x7f"
+			"\x4e\x5f\x9d\xcb\x09\xc7\x83\xe3"
+			"\x02\x9d\x27\x1f\xef\x85\x05\x8d"
+			"\xec\x55\x88\x0f\x0d\x7c\x4c\xe8"
+			"\xa1\x75\xa0\xd8\x06\x47\x14\xef"
+			"\xaa\x61\xcf\x26\x15\xad\xd8\xa3"
+			"\xaa\x75\xf2\x78\x4a\x5a\x61\xdf"
+			"\x8b\xc7\x04\xbc\xb2\x32\xd2\x7e"
+			"\x42\xee\xb4\x2f\x51\xff\x7b\x2e"
+			"\xd3\x02\xe8\xdc\x5d\x0d\x50\xdc"
+			"\xae\xb7\x46\xf9\xa8\xe6\xd0\x16"
+			"\xcc\xe6\x2c\x81\xc7\xad\xe9\xf0"
+			"\x05\x72\x6d\x3d\x0a\x7a\xa9\x02"
+			"\xac\x82\x93\x6e\xb6\x1c\x28\xfc"
+			"\x44\x12\xfb\x73\x77\xd4\x13\x39"
+			"\x29\x88\x8a\xf3\x5c\xa6\x36\xa0"
+			"\x2a\xed\x7e\xb1\x1d\xd6\x4c\x6b"
+			"\x41\x01\x18\x5d\x5d\x07\x97\xa6"
+			"\x4b\xef\x31\x18\xea\xac\xb1\x84"
+			"\x21\xed\xda\x86",
+		.rlen = 4100,
+		.np	= 2,
+		.tap	= { 4064, 36 },
 	},
 };
 
-int dib0700_device_count = ARRAY_SIZE(dib0700_devices);
+static struct cipher_testvec aes_ctr_rfc3686_dec_tv_template[] = {
+	{ /* From RFC 3686 */
+		.key	= "\xae\x68\x52\xf8\x12\x10\x67\xcc"
+			  "\x4b\xf7\xa5\x76\x55\x77\xf3\x9e"
+			  "\x00\x00\x00\x30",
+		.klen	= 20,
+		.iv	= "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.input	= "\xe4\x09\x5d\x4f\xb7\xa7\xb3\x79"
+			  "\x2d\x61\x75\xa3\x26\x13\x11\xb8",
+		.ilen	= 16,
+		.result	= "Single block msg",
+		.rlen	= 16,
+	}, {
+		.key	= "\x7e\x24\x06\x78\x17\xfa\xe0\xd7"
+			  "\x43\xd6\xce\x1f\x32\x53\x91\x63"
+			  "\x00\x6c\xb6\xdb",
+		.klen	= 20,
+		.iv	= "\xc0\x54\x3b\x59\xda\x48\xd9\x0b",
+		.input	= "\x51\x04\xa1\x06\x16\x8a\x72\xd9"
+			  "\x79\x0d\x41\xee\x8e\xda\xd3\x88"
+			  "\xeb\x2e\x1e\xfc\x46\xda\x57\xc8"
+			  "\xfc\xe6\x30\xdf\x91\x41\xbe\x28",
+		.ilen	= 32,
+		.result	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+		.rlen	= 32,
+	}, {
+		.key	= "\x16\xaf\x5b\x14\x5f\xc9\xf5\x79"
+			  "\xc1\x75\xf9\x3e\x3b\xfb\x0e\xed"
+			  "\x86\x3d\x06\xcc\xfd\xb7\x85\x15"
+			  "\x00\x00\x00\x48",
+		.klen	= 28,
+		.iv	= "\x36\x73\x3c\x14\x7d\x6d\x93\xcb",
+		.input	= "\x4b\x55\x38\x4f\xe2\x59\xc9\xc8"
+			  "\x4e\x79\x35\xa0\x03\xcb\xe9\x28",
+		.ilen	= 16,
+		.result	= "Single block msg",
+		.rlen	= 16,
+	}, {
+		.key	= "\x7c\x5c\xb2\x40\x1b\x3d\xc3\x3c"
+			  "\x19\xe7\x34\x08\x19\xe0\xf6\x9c"
+			  "\x67\x8c\x3d\xb8\xe6\xf6\xa9\x1a"
+			  "\x00\x96\xb0\x3b",
+		.klen	= 28,
+		.iv	= "\x02\x0c\x6e\xad\xc2\xcb\x50\x0d",
+		.input	= "\x45\x32\x43\xfc\x60\x9b\x23\x32"
+			  "\x7e\xdf\xaa\xfa\x71\x31\xcd\x9f"
+			  "\x84\x90\x70\x1c\x5a\xd4\xa7\x9c"
+			  "\xfc\x1f\xe0\xff\x42\xf4\xfb\x00",
+		.ilen	= 32,
+		.result	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+		.rlen	= 32,
+	}, {
+		.key	= "\x77\x6b\xef\xf2\x85\x1d\xb0\x6f"
+			  "\x4c\x8a\x05\x42\xc8\x69\x6f\x6c"
+			  "\x6a\x81\xaf\x1e\xec\x96\xb4\xd3"
+			  "\x7f\xc1\xd6\x89\xe6\xc1\xc1\x04"
+			  "\x00\x00\x00\x60",
+		.klen	= 36,
+		.iv	= "\xdb\x56\x72\xc9\x7a\xa8\xf0\xb2",
+		.input	= "\x14\x5a\xd0\x1d\xbf\x82\x4e\xc7"
+			  "\x56\x08\x63\xdc\x71\xe3\xe0\xc0",
+		.ilen	= 16,
+		.result	= "Single block msg",
+		.rlen	= 16,
+	}, {
+		.key	= "\xf6\xd6\x6d\x6b\xd5\x2d\x59\xbb"
+			  "\x07\x96\x36\x58\x79\xef\xf8\x86"
+			  "\xc6\x6d\xd5\x1a\x5b\x6a\x99\x74"
+			  "\x4b\x50\x59\x0c\x87\xa2\x38\x84"
+			  "\x00\xfa\xac\x24",
+		.klen	= 36,
+		.iv	= "\xc1\x58\x5e\xf1\x5a\x43\xd8\x75",
+		.input	= "\xf0\x5e\x23\x1b\x38\x94\x61\x2c"
+			  "\x49\xee\x00\x0b\x80\x4e\xb2\xa9"
+			  "\xb8\x30\x6b\x50\x8f\x83\x9d\x6a"
+			  "\x55\x30\x83\x1d\x93\x44\xaf\x1c",
+		.ilen	= 32,
+		.result	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+		.rlen	= 32,
+	},
+};
+
+static struct cipher_testvec aes_ofb_enc_tv_template[] = {
+	 /* From NIST Special Publication 800-38A, Appendix F.5 */
+	{
+		.key	= "\x2b\x7e\x15\x16\x28\xae\xd2\xa6"
+			  "\xab\xf7\x15\x88\x09\xcf\x4f\x3c",
+		.klen	= 16,
+		.iv	= "\x00\x01\x02\x03\x04\x05\x06\x07\x08"
+			  "\x09\x0a\x0b\x0c\x0d\x0e\x0f",
+		.input = "\x6b\xc1\xbe\xe2\x2e\x40\x9f\x96"
+			  "\xe9\x3d\x7e\x11\x73\x93\x17\x2a"
+			  "\xae\x2d\x8a\x57\x1e\x03\xac\x9c"
+			  "\x9e\xb7\x6f\xac\x45\xaf\x8e\x51"
+			  "\x30\xc8\x1c\x46\xa3\x5c\xe4\x11"
+			  "\xe5\xfb\xc1\x19\x1a\x0a\x52\xef"
+			  "\xf6\x9f\x24\x45\xdf\x4f\x9b\x17"
+			  "\xad\x2b\x41\x7b\xe6\x6c\x37\x10",
+		.ilen	= 64,
+		.result = "\x3b\x3f\xd9\x2e\xb7\x2d\xad\x20"
+			  "\x33\x34\x49\xf8\xe8\x3c\xfb\x4a"
+			  "\x77\x89\x50\x8d\x16\x91\x8f\x03\xf5"
+			  "\x3c\x52\xda\xc5\x4e\xd8\x25"
+			  "\x97\x40\x05\x1e\x9c\x5f\xec\xf6\x43"
+			  "\x44\xf7\xa8\x22\x60\xed\xcc"
+			  "\x30\x4c\x65\x28\xf6\x59\xc7\x78"
+			  "\x66\xa5\x10\xd9\xc1\xd6\xae\x5e",
+		.rlen	= 64,
+	}
+};
+
+static struct cipher_testvec aes_ofb_dec_tv_template[] = {
+	 /* From NIST Special Publication 800-38A, Appendix F.5 */
+	{
+		.key	= "\x2b\x7e\x15\x16\x28\xae\xd2\xa6"
+			  "\xab\xf7\x15\x88\x09\xcf\x4f\x3c",
+		.klen	= 16,
+		.iv	= "\x00\x01\x02\x03\x04\x05\x06\x07\x08"
+			  "\x09\x0a\x0b\x0c\x0d\x0e\x0f",
+		.input = "\x3b\x3f\xd9\x2e\xb7\x2d\xad\x20"
+			  "\x33\x34\x49\xf8\xe8\x3c\xfb\x4a"
+			  "\x77\x89\x50\x8d\x16\x91\x8f\x03\xf5"
+			  "\x3c\x52\xda\xc5\x4e\xd8\x25"
+			  "\x97\x40\x05\x1e\x9c\x5f\xec\xf6\x43"
+			  "\x44\xf7\xa8\x22\x60\xed\xcc"
+			  "\x30\x4c\x65\x28\xf6\x59\xc7\x78"
+			  "\x66\xa5\x10\xd9\xc1\xd6\xae\x5e",
+		.ilen	= 64,
+		.result = "\x6b\xc1\xbe\xe2\x2e\x40\x9f\x96"
+			  "\xe9\x3d\x7e\x11\x73\x93\x17\x2a"
+			  "\xae\x2d\x8a\x57\x1e\x03\xac\x9c"
+			  "\x9e\xb7\x6f\xac\x45\xaf\x8e\x51"
+			  "\x30\xc8\x1c\x46\xa3\x5c\xe4\x11"
+			  "\xe5\xfb\xc1\x19\x1a\x0a\x52\xef"
+			  "\xf6\x9f\x24\x45\xdf\x4f\x9b\x17"
+			  "\xad\x2b\x41\x7b\xe6\x6c\x37\x10",
+		.rlen	= 64,
+	}
+};
+
+static struct aead_testvec aes_gcm_enc_tv_template[] = {
+	{ /* From McGrew & Viega - http://citeseer.ist.psu.edu/656989.html */
+		.key    = zeroed_string,
+		.klen	= 16,
+		.result	= "\x58\xe2\xfc\xce\xfa\x7e\x30\x61"
+			  "\x36\x7f\x1d\x57\xa4\xe7\x45\x5a",
+		.rlen	= 16,
+	}, {
+		.key    = zeroed_string,
+		.klen	= 16,
+		.input  = zeroed_string,
+		.ilen	= 16,
+		.result = "\x03\x88\xda\xce\x60\xb6\xa3\x92"
+			  "\xf3\x28\xc2\xb9\x71\xb2\xfe\x78"
+			  "\xab\x6e\x47\xd4\x2c\xec\x13\xbd"
+			  "\xf5\x3a\x67\xb2\x12\x57\xbd\xdf",
+		.rlen	= 32,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08",
+		.klen	= 16,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39\x1a\xaf\xd2\x55",
+		.ilen	= 64,
+		.result = "\x42\x83\x1e\xc2\x21\x77\x74\x24"
+			  "\x4b\x72\x21\xb7\x84\xd0\xd4\x9c"
+			  "\xe3\xaa\x21\x2f\x2c\x02\xa4\xe0"
+			  "\x35\xc1\x7e\x23\x29\xac\xa1\x2e"
+			  "\x21\xd5\x14\xb2\x54\x66\x93\x1c"
+			  "\x7d\x8f\x6a\x5a\xac\x84\xaa\x05"
+			  "\x1b\xa3\x0b\x39\x6a\x0a\xac\x97"
+			  "\x3d\x58\xe0\x91\x47\x3f\x59\x85"
+			  "\x4d\x5c\x2a\xf3\x27\xcd\x64\xa6"
+			  "\x2c\xf3\x5a\xbd\x2b\xa6\xfa\xb4",
+		.rlen	= 80,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08",
+		.klen	= 16,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39",
+		.ilen	= 60,
+		.assoc	= "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xab\xad\xda\xd2",
+		.alen	= 20,
+		.result = "\x42\x83\x1e\xc2\x21\x77\x74\x24"
+			  "\x4b\x72\x21\xb7\x84\xd0\xd4\x9c"
+			  "\xe3\xaa\x21\x2f\x2c\x02\xa4\xe0"
+			  "\x35\xc1\x7e\x23\x29\xac\xa1\x2e"
+			  "\x21\xd5\x14\xb2\x54\x66\x93\x1c"
+			  "\x7d\x8f\x6a\x5a\xac\x84\xaa\x05"
+			  "\x1b\xa3\x0b\x39\x6a\x0a\xac\x97"
+			  "\x3d\x58\xe0\x91"
+			  "\x5b\xc9\x4f\xbc\x32\x21\xa5\xdb"
+			  "\x94\xfa\xe9\x5a\xe7\x12\x1a\x47",
+		.rlen	= 76,
+	}, {
+		.key    = zeroed_string,
+		.klen	= 24,
+		.result	= "\xcd\x33\xb2\x8a\xc7\x73\xf7\x4b"
+			  "\xa0\x0e\xd1\xf3\x12\x57\x24\x35",
+		.rlen	= 16,
+	}, {
+		.key    = zeroed_string,
+		.klen	= 24,
+		.input  = zeroed_string,
+		.ilen	= 16,
+		.result = "\x98\xe7\x24\x7c\x07\xf0\xfe\x41"
+			  "\x1c\x26\x7e\x43\x84\xb0\xf6\x00"
+			  "\x2f\xf5\x8d\x80\x03\x39\x27\xab"
+			  "\x8e\xf4\xd4\x58\x75\x14\xf0\xfb",
+		.rlen	= 32,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\xfe\xff\xe9\x92\x86\x65\x73\x1c",
+		.klen	= 24,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39\x1a\xaf\xd2\x55",
+		.ilen	= 64,
+		.result = "\x39\x80\xca\x0b\x3c\x00\xe8\x41"
+			  "\xeb\x06\xfa\xc4\x87\x2a\x27\x57"
+			  "\x85\x9e\x1c\xea\xa6\xef\xd9\x84"
+			  "\x62\x85\x93\xb4\x0c\xa1\xe1\x9c"
+			  "\x7d\x77\x3d\x00\xc1\x44\xc5\x25"
+			  "\xac\x61\x9d\x18\xc8\x4a\x3f\x47"
+			  "\x18\xe2\x44\x8b\x2f\xe3\x24\xd9"
+			  "\xcc\xda\x27\x10\xac\xad\xe2\x56"
+			  "\x99\x24\xa7\xc8\x58\x73\x36\xbf"
+			  "\xb1\x18\x02\x4d\xb8\x67\x4a\x14",
+		.rlen	= 80,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\xfe\xff\xe9\x92\x86\x65\x73\x1c",
+		.klen	= 24,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39",
+		.ilen	= 60,
+		.assoc	= "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xab\xad\xda\xd2",
+		.alen	= 20,
+		.result = "\x39\x80\xca\x0b\x3c\x00\xe8\x41"
+			  "\xeb\x06\xfa\xc4\x87\x2a\x27\x57"
+			  "\x85\x9e\x1c\xea\xa6\xef\xd9\x84"
+			  "\x62\x85\x93\xb4\x0c\xa1\xe1\x9c"
+			  "\x7d\x77\x3d\x00\xc1\x44\xc5\x25"
+			  "\xac\x61\x9d\x18\xc8\x4a\x3f\x47"
+			  "\x18\xe2\x44\x8b\x2f\xe3\x24\xd9"
+			  "\xcc\xda\x27\x10"
+			  "\x25\x19\x49\x8e\x80\xf1\x47\x8f"
+			  "\x37\xba\x55\xbd\x6d\x27\x61\x8c",
+		.rlen	= 76,
+		.np	= 2,
+		.tap	= { 32, 28 },
+		.anp	= 2,
+		.atap	= { 8, 12 }
+	}, {
+		.key    = zeroed_string,
+		.klen	= 32,
+		.result	= "\x53\x0f\x8a\xfb\xc7\x45\x36\xb9"
+			  "\xa9\x63\xb4\xf1\xc4\xcb\x73\x8b",
+		.rlen	= 16,
+	}
+};
+
+static struct aead_testvec aes_gcm_dec_tv_template[] = {
+	{ /* From McGrew & Viega - http://citeseer.ist.psu.edu/656989.html */
+		.key    = zeroed_string,
+		.klen	= 32,
+		.input	= "\xce\xa7\x40\x3d\x4d\x60\x6b\x6e"
+			  "\x07\x4e\xc5\xd3\xba\xf3\x9d\x18"
+			  "\xd0\xd1\xc8\xa7\x99\x99\x6b\xf0"
+			  "\x26\x5b\x98\xb5\xd4\x8a\xb9\x19",
+		.ilen	= 32,
+		.result  = zeroed_string,
+		.rlen	= 16,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08",
+		.klen	= 32,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\x52\x2d\xc1\xf0\x99\x56\x7d\x07"
+			  "\xf4\x7f\x37\xa3\x2a\x84\x42\x7d"
+			  "\x64\x3a\x8c\xdc\xbf\xe5\xc0\xc9"
+			  "\x75\x98\xa2\xbd\x25\x55\xd1\xaa"
+			  "\x8c\xb0\x8e\x48\x59\x0d\xbb\x3d"
+			  "\xa7\xb0\x8b\x10\x56\x82\x88\x38"
+			  "\xc5\xf6\x1e\x63\x93\xba\x7a\x0a"
+			  "\xbc\xc9\xf6\x62\x89\x80\x15\xad"
+			  "\xb0\x94\xda\xc5\xd9\x34\x71\xbd"
+			  "\xec\x1a\x50\x22\x70\xe3\xcc\x6c",
+		.ilen	= 80,
+		.result = "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39\x1a\xaf\xd2\x55",
+		.rlen	= 64,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08",
+		.klen	= 32,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\x52\x2d\xc1\xf0\x99\x56\x7d\x07"
+			  "\xf4\x7f\x37\xa3\x2a\x84\x42\x7d"
+			  "\x64\x3a\x8c\xdc\xbf\xe5\xc0\xc9"
+			  "\x75\x98\xa2\xbd\x25\x55\xd1\xaa"
+			  "\x8c\xb0\x8e\x48\x59\x0d\xbb\x3d"
+			  "\xa7\xb0\x8b\x10\x56\x82\x88\x38"
+			  "\xc5\xf6\x1e\x63\x93\xba\x7a\x0a"
+			  "\xbc\xc9\xf6\x62"
+			  "\x76\xfc\x6e\xce\x0f\x4e\x17\x68"
+			  "\xcd\xdf\x88\x53\xbb\x2d\x55\x1b",
+		.ilen	= 76,
+		.assoc	= "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xab\xad\xda\xd2",
+		.alen	= 20,
+		.result = "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39",
+		.rlen	= 60,
+		.np     = 2,
+		.tap    = { 48, 28 },
+		.anp	= 3,
+		.atap	= { 8, 8, 4 }
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08",
+		.klen	= 16,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\x42\x83\x1e\xc2\x21\x77\x74\x24"
+			  "\x4b\x72\x21\xb7\x84\xd0\xd4\x9c"
+			  "\xe3\xaa\x21\x2f\x2c\x02\xa4\xe0"
+			  "\x35\xc1\x7e\x23\x29\xac\xa1\x2e"
+			  "\x21\xd5\x14\xb2\x54\x66\x93\x1c"
+			  "\x7d\x8f\x6a\x5a\xac\x84\xaa\x05"
+			  "\x1b\xa3\x0b\x39\x6a\x0a\xac\x97"
+			  "\x3d\x58\xe0\x91\x47\x3f\x59\x85"
+			  "\x4d\x5c\x2a\xf3\x27\xcd\x64\xa6"
+			  "\x2c\xf3\x5a\xbd\x2b\xa6\xfa\xb4",
+		.ilen	= 80,
+		.result = "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39\x1a\xaf\xd2\x55",
+		.rlen	= 64,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08",
+		.klen	= 16,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\x42\x83\x1e\xc2\x21\x77\x74\x24"
+			  "\x4b\x72\x21\xb7\x84\xd0\xd4\x9c"
+			  "\xe3\xaa\x21\x2f\x2c\x02\xa4\xe0"
+			  "\x35\xc1\x7e\x23\x29\xac\xa1\x2e"
+			  "\x21\xd5\x14\xb2\x54\x66\x93\x1c"
+			  "\x7d\x8f\x6a\x5a\xac\x84\xaa\x05"
+			  "\x1b\xa3\x0b\x39\x6a\x0a\xac\x97"
+			  "\x3d\x58\xe0\x91"
+			  "\x5b\xc9\x4f\xbc\x32\x21\xa5\xdb"
+			  "\x94\xfa\xe9\x5a\xe7\x12\x1a\x47",
+		.ilen	= 76,
+		.assoc	= "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xab\xad\xda\xd2",
+		.alen	= 20,
+		.result = "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39",
+		.rlen	= 60,
+	}, {
+		.key    = zeroed_string,
+		.klen	= 24,
+		.input	= "\x98\xe7\x24\x7c\x07\xf0\xfe\x41"
+			  "\x1c\x26\x7e\x43\x84\xb0\xf6\x00"
+			  "\x2f\xf5\x8d\x80\x03\x39\x27\xab"
+			  "\x8e\xf4\xd4\x58\x75\x14\xf0\xfb",
+		.ilen	= 32,
+		.result  = zeroed_string,
+		.rlen	= 16,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\xfe\xff\xe9\x92\x86\x65\x73\x1c",
+		.klen	= 24,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\x39\x80\xca\x0b\x3c\x00\xe8\x41"
+			  "\xeb\x06\xfa\xc4\x87\x2a\x27\x57"
+			  "\x85\x9e\x1c\xea\xa6\xef\xd9\x84"
+			  "\x62\x85\x93\xb4\x0c\xa1\xe1\x9c"
+			  "\x7d\x77\x3d\x00\xc1\x44\xc5\x25"
+			  "\xac\x61\x9d\x18\xc8\x4a\x3f\x47"
+			  "\x18\xe2\x44\x8b\x2f\xe3\x24\xd9"
+			  "\xcc\xda\x27\x10\xac\xad\xe2\x56"
+			  "\x99\x24\xa7\xc8\x58\x73\x36\xbf"
+			  "\xb1\x18\x02\x4d\xb8\x67\x4a\x14",
+		.ilen	= 80,
+		.result = "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39\x1a\xaf\xd2\x55",
+		.rlen	= 64,
+	}, {
+		.key	= "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\xfe\xff\xe9\x92\x86\x65\x73\x1c",
+		.klen	= 24,
+		.iv	= "\xca\xfe\xba\xbe\xfa\xce\xdb\xad"
+			  "\xde\xca\xf8\x88",
+		.input	= "\x39\x80\xca\x0b\x3c\x00\xe8\x41"
+			  "\xeb\x06\xfa\xc4\x87\x2a\x27\x57"
+			  "\x85\x9e\x1c\xea\xa6\xef\xd9\x84"
+			  "\x62\x85\x93\xb4\x0c\xa1\xe1\x9c"
+			  "\x7d\x77\x3d\x00\xc1\x44\xc5\x25"
+			  "\xac\x61\x9d\x18\xc8\x4a\x3f\x47"
+			  "\x18\xe2\x44\x8b\x2f\xe3\x24\xd9"
+			  "\xcc\xda\x27\x10"
+			  "\x25\x19\x49\x8e\x80\xf1\x47\x8f"
+			  "\x37\xba\x55\xbd\x6d\x27\x61\x8c",
+		.ilen	= 76,
+		.assoc	= "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xfe\xed\xfa\xce\xde\xad\xbe\xef"
+			  "\xab\xad\xda\xd2",
+		.alen	= 20,
+		.result = "\xd9\x31\x32\x25\xf8\x84\x06\xe5"
+			  "\xa5\x59\x09\xc5\xaf\xf5\x26\x9a"
+			  "\x86\xa7\xa9\x53\x15\x34\xf7\xda"
+			  "\x2e\x4c\x30\x3d\x8a\x31\x8a\x72"
+			  "\x1c\x3c\x0c\x95\x95\x68\x09\x53"
+			  "\x2f\xcf\x0e\x24\x49\xa6\xb5\x25"
+			  "\xb1\x6a\xed\xf5\xaa\x0d\xe6\x57"
+			  "\xba\x63\x7b\x39",
+		.rlen	= 60,
+	}
+};
+
+static struct aead_testvec aes_gcm_rfc4106_enc_tv_template[] = {
+	{ /* Generated using Crypto++ */
+		.key    = zeroed_string,
+		.klen	= 20,
+		.iv	= zeroed_string,
+		.input  = zeroed_string,
+		.ilen   = 16,
+		.assoc  = zeroed_string,
+		.alen   = 16,
+		.result	= "\x03\x88\xDA\xCE\x60\xB6\xA3\x92"
+			  "\xF3\x28\xC2\xB9\x71\xB2\xFE\x78"
+			  "\x97\xFE\x4C\x23\x37\x42\x01\xE0"
+			  "\x81\x9F\x8D\xC5\xD7\x41\xA0\x1B",
+		.rlen	= 32,
+	},{
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.input  = zeroed_string,
+		.ilen   = 16,
+		.assoc  = "\x00\x00\x00\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.alen   = 16,
+		.result	= "\xC0\x0D\x8B\x42\x0F\x8F\x34\x18"
+			  "\x88\xB1\xC5\xBC\xC5\xB6\xD6\x28"
+			  "\x6A\x9D\xDF\x11\x5E\xFE\x5E\x9D"
+			  "\x2F\x70\x44\x92\xF7\xF2\xE3\xEF",
+		.rlen	= 32,
+
+	}, {
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = zeroed_string,
+		.input  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01",
+		.ilen   = 16,
+		.assoc  = zeroed_string,
+		.alen   = 16,
+		.result	= "\x4B\xB1\xB5\xE3\x25\x71\x70\xDE"
+			  "\x7F\xC9\x9C\xA5\x14\x19\xF2\xAC"
+			  "\x0B\x8F\x88\x69\x17\xE6\xB4\x3C"
+			  "\xB1\x68\xFD\x14\x52\x64\x61\xB2",
+		.rlen	= 32,
+	}, {
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = zeroed_string,
+		.input  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01",
+		.ilen   = 16,
+		.assoc  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.alen   = 16,
+		.result	= "\x4B\xB1\xB5\xE3\x25\x71\x70\xDE"
+			  "\x7F\xC9\x9C\xA5\x14\x19\xF2\xAC"
+			  "\x90\x92\xB7\xE3\x5F\xA3\x9A\x63"
+			  "\x7E\xD7\x1F\xD8\xD3\x7C\x4B\xF5",
+		.rlen	= 32,
+	}, {
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.input  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01",
+		.ilen   = 16,
+		.assoc  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.alen   = 16,
+		.result	= "\xC1\x0C\x8A\x43\x0E\x8E\x35\x19"
+			  "\x89\xB0\xC4\xBD\xC4\xB7\xD7\x29"
+			  "\x64\x50\xF9\x32\x13\xFB\x74\x61"
+			  "\xF4\xED\x52\xD3\xC5\x10\x55\x3C",
+		.rlen	= 32,
+	}, {
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.input  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01",
+		.ilen   = 64,
+		.assoc  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.alen   = 16,
+		.result	= "\xC1\x0C\x8A\x43\x0E\x8E\x35\x19"
+			  "\x89\xB0\xC4\xBD\xC4\xB7\xD7\x29"
+			  "\x98\x14\xA1\x42\x37\x80\xFD\x90"
+			  "\x68\x12\x01\xA8\x91\x89\xB9\x83"
+			  "\x5B\x11\x77\x12\x9B\xFF\x24\x89"
+			  "\x94\x5F\x18\x12\xBA\x27\x09\x39"
+			  "\x99\x96\x76\x42\x15\x1C\xCD\xCB"
+			  "\xDC\xD3\xDA\x65\x73\xAF\x80\xCD"
+			  "\xD2\xB6\xC2\x4A\x76\xC2\x92\x85"
+			  "\xBD\xCF\x62\x98\x58\x14\xE5\xBD",
+		.rlen	= 80,
+	}, {
+		.key    = "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = "\x00\x00\x45\x67\x89\xab\xcd\xef",
+		.input  = "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff",
+		.ilen   = 192,
+		.assoc  = "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
+			  "\xaa\xaa\xaa\xaa\x00\x00\x45\x67"
+			  "\x89\xab\xcd\xef",
+		.alen   = 20,
+		.result	= "\xC1\x76\x33\x85\xE2\x9B\x5F\xDE"
+			  "\xDE\x89\x3D\x42\xE7\xC9\x69\x8A"
+			  "\x44\x6D\xC3\x88\x46\x2E\xC2\x01"
+			  "\x5E\xF6\x0C\x39\xF0\xC4\xA5\x82"
+			  "\xCD\xE8\x31\xCC\x0A\x4C\xE4\x44"
+			  "\x41\xA9\x82\x6F\x22\xA1\x23\x1A"
+			  "\xA8\xE3\x16\xFD\x31\x5C\x27\x31"
+			  "\xF1\x7F\x01\x63\xA3\xAF\x70\xA1"
+			  "\xCF\x07\x57\x41\x67\xD0\xC4\x42"
+			  "\xDB\x18\xC6\x4C\x4C\xE0\x3D\x9F"
+			  "\x05\x07\xFB\x13\x7D\x4A\xCA\x5B"
+			  "\xF0\xBF\x64\x7E\x05\xB1\x72\xEE"
+			  "\x7C\x3B\xD4\xCD\x14\x03\xB2\x2C"
+			  "\xD3\xA9\xEE\xFA\x17\xFC\x9C\xDF"
+			  "\xC7\x75\x40\xFF\xAE\xAD\x1E\x59"
+			  "\x2F\x30\x24\xFB\xAD\x6B\x10\xFA"
+			  "\x6C\x9F\x5B\xE7\x25\xD5\xD0\x25"
+			  "\xAC\x4A\x4B\xDA\xFC\x7A\x85\x1B"
+			  "\x7E\x13\x06\x82\x08\x17\xA4\x35"
+			  "\xEC\xC5\x8D\x63\x96\x81\x0A\x8F"
+			  "\xA3\x05\x38\x95\x20\x1A\x47\x04"
+			  "\x6F\x6D\xDA\x8F\xEF\xC1\x76\x35"
+			  "\x6B\xC7\x4D\x0F\x94\x12\xCA\x3E"
+			  "\x2E\xD5\x03\x2E\x86\x7E\xAA\x3B"
+			  "\x37\x08\x1C\xCF\xBA\x5D\x71\x46"
+			  "\x80\x72\xB0\x4C\x82\x0D\x60\x3C",
+		.rlen	= 208,
+	}, { /* From draft-mcgrew-gcm-test-01 */
+		.key	= "\x4C\x80\xCD\xEF\xBB\x5D\x10\xDA"
+			  "\x90\x6A\xC7\x3C\x36\x13\xA6\x34"
+			  "\x2E\x44\x3B\x68",
+		.klen	= 20,
+		.iv	= "\x49\x56\xED\x7E\x3B\x24\x4C\xFE",
+		.input	= "\x45\x00\x00\x48\x69\x9A\x00\x00"
+			  "\x80\x11\x4D\xB7\xC0\xA8\x01\x02"
+			  "\xC0\xA8\x01\x01\x0A\x9B\xF1\x56"
+			  "\x38\xD3\x01\x00\x00\x01\x00\x00"
+			  "\x00\x00\x00\x00\x04\x5F\x73\x69"
+			  "\x70\x04\x5F\x75\x64\x70\x03\x73"
+			  "\x69\x70\x09\x63\x79\x62\x65\x72"
+			  "\x63\x69\x74\x79\x02\x64\x6B\x00"
+			  "\x00\x21\x00\x01\x01\x02\x02\x01",
+		.ilen	= 72,
+		.assoc	= "\x00\x00\x43\x21\x87\x65\x43\x21"
+			  "\x00\x00\x00\x00\x49\x56\xED\x7E"
+			  "\x3B\x24\x4C\xFE",
+		.alen	= 20,
+		.result	= "\xFE\xCF\x53\x7E\x72\x9D\x5B\x07"
+			  "\xDC\x30\xDF\x52\x8D\xD2\x2B\x76"
+			  "\x8D\x1B\x98\x73\x66\x96\xA6\xFD"
+			  "\x34\x85\x09\xFA\x13\xCE\xAC\x34"
+			  "\xCF\xA2\x43\x6F\x14\xA3\xF3\xCF"
+			  "\x65\x92\x5B\xF1\xF4\xA1\x3C\x5D"
+			  "\x15\xB2\x1E\x18\x84\xF5\xFF\x62"
+			  "\x47\xAE\xAB\xB7\x86\xB9\x3B\xCE"
+			  "\x61\xBC\x17\xD7\x68\xFD\x97\x32"
+			  "\x45\x90\x18\x14\x8F\x6C\xBE\x72"
+			  "\x2F\xD0\x47\x96\x56\x2D\xFD\xB4",
+		.rlen	= 88,
+	}, {
+		.key	= "\xFE\xFF\xE9\x92\x86\x65\x73\x1C"
+			  "\x6D\x6A\x8F\x94\x67\x30\x83\x08"
+			  "\xCA\xFE\xBA\xBE",
+		.klen	= 20,
+		.iv	= "\xFA\xCE\xDB\xAD\xDE\xCA\xF8\x88",
+		.input	= "\x45\x00\x00\x3E\x69\x8F\x00\x00"
+			  "\x80\x11\x4D\xCC\xC0\xA8\x01\x02"
+			  "\xC0\xA8\x01\x01\x0A\x98\x00\x35"
+			  "\x00\x2A\x23\x43\xB2\xD0\x01\x00"
+			  "\x00\x01\x00\x00\x00\x00\x00\x00"
+			  "\x03\x73\x69\x70\x09\x63\x79\x62"
+			  "\x65\x72\x63\x69\x74\x79\x02\x64"
+			  "\x6B\x00\x00\x01\x00\x01\x00\x01",
+		.ilen	= 64,
+		.assoc	= "\x00\x00\xA5\xF8\x00\x00\x00\x0A"
+			  "\xFA\xCE\xDB\xAD\xDE\xCA\xF8\x88",
+		.alen	= 16,
+		.result	= "\xDE\xB2\x2C\xD9\xB0\x7C\x72\xC1"
+			  "\x6E\x3A\x65\xBE\xEB\x8D\xF3\x04"
+			  "\xA5\xA5\x89\x7D\x33\xAE\x53\x0F"
+			  "\x1B\xA7\x6D\x5D\x11\x4D\x2A\x5C"
+			  "\x3D\xE8\x18\x27\xC1\x0E\x9A\x4F"
+			  "\x51\x33\x0D\x0E\xEC\x41\x66\x42"
+			  "\xCF\xBB\x85\xA5\xB4\x7E\x48\xA4"
+			  "\xEC\x3B\x9B\xA9\x5D\x91\x8B\xD1"
+			  "\x83\xB7\x0D\x3A\xA8\xBC\x6E\xE4"
+			  "\xC3\x09\xE9\xD8\x5A\x41\xAD\x4A",
+		.rlen	= 80,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\x11\x22\x33\x44",
+		.klen	= 36,
+		.iv	= "\x01\x02\x03\x04\x05\x06\x07\x08",
+		.input	= "\x45\x00\x00\x30\x69\xA6\x40\x00"
+			  "\x80\x06\x26\x90\xC0\xA8\x01\x02"
+			  "\x93\x89\x15\x5E\x0A\x9E\x00\x8B"
+			  "\x2D\xC5\x7E\xE0\x00\x00\x00\x00"
+			  "\x70\x02\x40\x00\x20\xBF\x00\x00"
+			  "\x02\x04\x05\xB4\x01\x01\x04\x02"
+			  "\x01\x02\x02\x01",
+		.ilen	= 52,
+		.assoc	= "\x4A\x2C\xBF\xE3\x00\x00\x00\x02"
+			  "\x01\x02\x03\x04\x05\x06\x07\x08",
+		.alen	= 16,
+		.result	= "\xFF\x42\x5C\x9B\x72\x45\x99\xDF"
+			  "\x7A\x3B\xCD\x51\x01\x94\xE0\x0D"
+			  "\x6A\x78\x10\x7F\x1B\x0B\x1C\xBF"
+			  "\x06\xEF\xAE\x9D\x65\xA5\xD7\x63"
+			  "\x74\x8A\x63\x79\x85\x77\x1D\x34"
+			  "\x7F\x05\x45\x65\x9F\x14\xE9\x9D"
+			  "\xEF\x84\x2D\x8E\xB3\x35\xF4\xEE"
+			  "\xCF\xDB\xF8\x31\x82\x4B\x4C\x49"
+			  "\x15\x95\x6C\x96",
+		.rlen	= 68,
+	}, {
+		.key	= "\x00\x00\x00\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv	= "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.input	= "\x45\x00\x00\x3C\x99\xC5\x00\x00"
+			  "\x80\x01\xCB\x7A\x40\x67\x93\x18"
+			  "\x01\x01\x01\x01\x08\x00\x07\x5C"
+			  "\x02\x00\x44\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6A\x6B\x6C"
+			  "\x6D\x6E\x6F\x70\x71\x72\x73\x74"
+			  "\x75\x76\x77\x61\x62\x63\x64\x65"
+			  "\x66\x67\x68\x69\x01\x02\x02\x01",
+		.ilen	= 64,
+		.assoc	= "\x00\x00\x00\x00\x00\x00\x00\x01"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.alen	= 16,
+		.result	= "\x46\x88\xDA\xF2\xF9\x73\xA3\x92"
+			  "\x73\x29\x09\xC3\x31\xD5\x6D\x60"
+			  "\xF6\x94\xAB\xAA\x41\x4B\x5E\x7F"
+			  "\xF5\xFD\xCD\xFF\xF5\xE9\xA2\x84"
+			  "\x45\x64\x76\x49\x27\x19\xFF\xB6"
+			  "\x4D\xE7\xD9\xDC\xA1\xE1\xD8\x94"
+			  "\xBC\x3B\xD5\x78\x73\xED\x4D\x18"
+			  "\x1D\x19\xD4\xD5\xC8\xC1\x8A\xF3"
+			  "\xF8\x21\xD4\x96\xEE\xB0\x96\xE9"
+			  "\x8A\xD2\xB6\x9E\x47\x99\xC7\x1D",
+		.rlen	= 80,
+	}, {
+		.key	= "\x3D\xE0\x98\x74\xB3\x88\xE6\x49"
+			  "\x19\x88\xD0\xC3\x60\x7E\xAE\x1F"
+			  "\x57\x69\x0E\x43",
+		.klen	= 20,
+		.iv	= "\x4E\x28\x00\x00\xA2\xFC\xA1\xA3",
+		.input	= "\x45\x00\x00\x3C\x99\xC3\x00\x00"
+			  "\x80\x01\xCB\x7C\x40\x67\x93\x18"
+			  "\x01\x01\x01\x01\x08\x00\x08\x5C"
+			  "\x02\x00\x43\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6A\x6B\x6C"
+			  "\x6D\x6E\x6F\x70\x71\x72\x73\x74"
+			  "\x75\x76\x77\x61\x62\x63\x64\x65"
+			  "\x66\x67\x68\x69\x01\x02\x02\x01",
+		.ilen	= 64,
+		.assoc	= "\x42\xF6\x7E\x3F\x10\x10\x10\x10"
+			  "\x10\x10\x10\x10\x4E\x28\x00\x00"
+			  "\xA2\xFC\xA1\xA3",
+		.alen	= 20,
+		.result	= "\xFB\xA2\xCA\xA4\x85\x3C\xF9\xF0"
+			  "\xF2\x2C\xB1\x0D\x86\xDD\x83\xB0"
+			  "\xFE\xC7\x56\x91\xCF\x1A\x04\xB0"
+			  "\x0D\x11\x38\xEC\x9C\x35\x79\x17"
+			  "\x65\xAC\xBD\x87\x01\xAD\x79\x84"
+			  "\x5B\xF9\xFE\x3F\xBA\x48\x7B\xC9"
+			  "\x17\x55\xE6\x66\x2B\x4C\x8D\x0D"
+			  "\x1F\x5E\x22\x73\x95\x30\x32\x0A"
+			  "\xE0\xD7\x31\xCC\x97\x8E\xCA\xFA"
+			  "\xEA\xE8\x8F\x00\xE8\x0D\x6E\x48",
+		.rlen	= 80,
+	}, {
+		.key	= "\x3D\xE0\x98\x74\xB3\x88\xE6\x49"
+			  "\x19\x88\xD0\xC3\x60\x7E\xAE\x1F"
+			  "\x57\x69\x0E\x43",
+		.klen	= 20,
+		.iv	= "\x4E\x28\x00\x00\xA2\xFC\xA1\xA3",
+		.input	= "\x45\x00\x00\x1C\x42\xA2\x00\x00"
+			  "\x80\x01\x44\x1F\x40\x67\x93\xB6"
+			  "\xE0\x00\x00\x02\x0A\x00\xF5\xFF"
+			  "\x01\x02\x02\x01",
+		.ilen	= 28,
+		.assoc	= "\x42\xF6\x7E\x3F\x10\x10\x10\x10"
+			  "\x10\x10\x10\x10\x4E\x28\x00\x00"
+			  "\xA2\xFC\xA1\xA3",
+		.alen	= 20,
+		.result	= "\xFB\xA2\xCA\x84\x5E\x5D\xF9\xF0"
+			  "\xF2\x2C\x3E\x6E\x86\xDD\x83\x1E"
+			  "\x1F\xC6\x57\x92\xCD\x1A\xF9\x13"
+			  "\x0E\x13\x79\xED\x36\x9F\x07\x1F"
+			  "\x35\xE0\x34\xBE\x95\xF1\x12\xE4"
+			  "\xE7\xD0\x5D\x35",
+		.rlen	= 44,
+	}, {
+		.key	= "\xFE\xFF\xE9\x92\x86\x65\x73\x1C"
+			  "\x6D\x6A\x8F\x94\x67\x30\x83\x08"
+			  "\xFE\xFF\xE9\x92\x86\x65\x73\x1C"
+			  "\xCA\xFE\xBA\xBE",
+		.klen	= 28,
+		.iv	= "\xFA\xCE\xDB\xAD\xDE\xCA\xF8\x88",
+		.input	= "\x45\x00\x00\x28\xA4\xAD\x40\x00"
+			  "\x40\x06\x78\x80\x0A\x01\x03\x8F"
+			  "\x0A\x01\x06\x12\x80\x23\x06\xB8"
+			  "\xCB\x71\x26\x02\xDD\x6B\xB0\x3E"
+			  "\x50\x10\x16\xD0\x75\x68\x00\x01",
+		.ilen	= 40,
+		.assoc	= "\x00\x00\xA5\xF8\x00\x00\x00\x0A"
+			  "\xFA\xCE\xDB\xAD\xDE\xCA\xF8\x88",
+		.alen	= 16,
+		.result	= "\xA5\xB1\xF8\x06\x60\x29\xAE\xA4"
+			  "\x0E\x59\x8B\x81\x22\xDE\x02\x42"
+			  "\x09\x38\xB3\xAB\x33\xF8\x28\xE6"
+			  "\x87\xB8\x85\x8B\x5B\xFB\xDB\xD0"
+			  "\x31\x5B\x27\x45\x21\x44\xCC\x77"
+			  "\x95\x45\x7B\x96\x52\x03\x7F\x53"
+			  "\x18\x02\x7B\x5B\x4C\xD7\xA6\x36",
+		.rlen	= 56,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xDE\xCA\xF8\x88",
+		.klen	= 20,
+		.iv	= "\xCA\xFE\xDE\xBA\xCE\xFA\xCE\x74",
+		.input	= "\x45\x00\x00\x49\x33\xBA\x00\x00"
+			  "\x7F\x11\x91\x06\xC3\xFB\x1D\x10"
+			  "\xC2\xB1\xD3\x26\xC0\x28\x31\xCE"
+			  "\x00\x35\xDD\x7B\x80\x03\x02\xD5"
+			  "\x00\x00\x4E\x20\x00\x1E\x8C\x18"
+			  "\xD7\x5B\x81\xDC\x91\xBA\xA0\x47"
+			  "\x6B\x91\xB9\x24\xB2\x80\x38\x9D"
+			  "\x92\xC9\x63\xBA\xC0\x46\xEC\x95"
+			  "\x9B\x62\x66\xC0\x47\x22\xB1\x49"
+			  "\x23\x01\x01\x01",
+		.ilen	= 76,
+		.assoc	= "\x00\x00\x01\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x01\xCA\xFE\xDE\xBA"
+			  "\xCE\xFA\xCE\x74",
+		.alen	= 20,
+		.result	= "\x18\xA6\xFD\x42\xF7\x2C\xBF\x4A"
+			  "\xB2\xA2\xEA\x90\x1F\x73\xD8\x14"
+			  "\xE3\xE7\xF2\x43\xD9\x54\x12\xE1"
+			  "\xC3\x49\xC1\xD2\xFB\xEC\x16\x8F"
+			  "\x91\x90\xFE\xEB\xAF\x2C\xB0\x19"
+			  "\x84\xE6\x58\x63\x96\x5D\x74\x72"
+			  "\xB7\x9D\xA3\x45\xE0\xE7\x80\x19"
+			  "\x1F\x0D\x2F\x0E\x0F\x49\x6C\x22"
+			  "\x6F\x21\x27\xB2\x7D\xB3\x57\x24"
+			  "\xE7\x84\x5D\x68\x65\x1F\x57\xE6"
+			  "\x5F\x35\x4F\x75\xFF\x17\x01\x57"
+			  "\x69\x62\x34\x36",
+		.rlen	= 92,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\x73\x61\x6C\x74",
+		.klen	= 36,
+		.iv	= "\x61\x6E\x64\x01\x69\x76\x65\x63",
+		.input	= "\x45\x08\x00\x28\x73\x2C\x00\x00"
+			  "\x40\x06\xE9\xF9\x0A\x01\x06\x12"
+			  "\x0A\x01\x03\x8F\x06\xB8\x80\x23"
+			  "\xDD\x6B\xAF\xBE\xCB\x71\x26\x02"
+			  "\x50\x10\x1F\x64\x6D\x54\x00\x01",
+		.ilen	= 40,
+		.assoc	= "\x17\x40\x5E\x67\x15\x6F\x31\x26"
+			  "\xDD\x0D\xB9\x9B\x61\x6E\x64\x01"
+			  "\x69\x76\x65\x63",
+		.alen	= 20,
+		.result	= "\xF2\xD6\x9E\xCD\xBD\x5A\x0D\x5B"
+			  "\x8D\x5E\xF3\x8B\xAD\x4D\xA5\x8D"
+			  "\x1F\x27\x8F\xDE\x98\xEF\x67\x54"
+			  "\x9D\x52\x4A\x30\x18\xD9\xA5\x7F"
+			  "\xF4\xD3\xA3\x1C\xE6\x73\x11\x9E"
+			  "\x45\x16\x26\xC2\x41\x57\x71\xE3"
+			  "\xB7\xEE\xBC\xA6\x14\xC8\x9B\x35",
+		.rlen	= 56,
+	}, {
+		.key	= "\x3D\xE0\x98\x74\xB3\x88\xE6\x49"
+			  "\x19\x88\xD0\xC3\x60\x7E\xAE\x1F"
+			  "\x57\x69\x0E\x43",
+		.klen	= 20,
+		.iv	= "\x4E\x28\x00\x00\xA2\xFC\xA1\xA3",
+		.input	= "\x45\x00\x00\x49\x33\x3E\x00\x00"
+			  "\x7F\x11\x91\x82\xC3\xFB\x1D\x10"
+			  "\xC2\xB1\xD3\x26\xC0\x28\x31\xCE"
+			  "\x00\x35\xCB\x45\x80\x03\x02\x5B"
+			  "\x00\x00\x01\xE0\x00\x1E\x8C\x18"
+			  "\xD6\x57\x59\xD5\x22\x84\xA0\x35"
+			  "\x2C\x71\x47\x5C\x88\x80\x39\x1C"
+			  "\x76\x4D\x6E\x5E\xE0\x49\x6B\x32"
+			  "\x5A\xE2\x70\xC0\x38\x99\x49\x39"
+			  "\x15\x01\x01\x01",
+		.ilen	= 76,
+		.assoc	= "\x42\xF6\x7E\x3F\x10\x10\x10\x10"
+			  "\x10\x10\x10\x10\x4E\x28\x00\x00"
+			  "\xA2\xFC\xA1\xA3",
+		.alen	= 20,
+		.result	= "\xFB\xA2\xCA\xD1\x2F\xC1\xF9\xF0"
+			  "\x0D\x3C\xEB\xF3\x05\x41\x0D\xB8"
+			  "\x3D\x77\x84\xB6\x07\x32\x3D\x22"
+			  "\x0F\x24\xB0\xA9\x7D\x54\x18\x28"
+			  "\x00\xCA\xDB\x0F\x68\xD9\x9E\xF0"
+			  "\xE0\xC0\xC8\x9A\xE9\xBE\xA8\x88"
+			  "\x4E\x52\xD6\x5B\xC1\xAF\xD0\x74"
+			  "\x0F\x74\x24\x44\x74\x7B\x5B\x39"
+			  "\xAB\x53\x31\x63\xAA\xD4\x55\x0E"
+			  "\xE5\x16\x09\x75\xCD\xB6\x08\xC5"
+			  "\x76\x91\x89\x60\x97\x63\xB8\xE1"
+			  "\x8C\xAA\x81\xE2",
+		.rlen	= 92,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\x73\x61\x6C\x74",
+		.klen	= 36,
+		.iv	= "\x61\x6E\x64\x01\x69\x76\x65\x63",
+		.input	= "\x63\x69\x73\x63\x6F\x01\x72\x75"
+			  "\x6C\x65\x73\x01\x74\x68\x65\x01"
+			  "\x6E\x65\x74\x77\x65\x01\x64\x65"
+			  "\x66\x69\x6E\x65\x01\x74\x68\x65"
+			  "\x74\x65\x63\x68\x6E\x6F\x6C\x6F"
+			  "\x67\x69\x65\x73\x01\x74\x68\x61"
+			  "\x74\x77\x69\x6C\x6C\x01\x64\x65"
+			  "\x66\x69\x6E\x65\x74\x6F\x6D\x6F"
+			  "\x72\x72\x6F\x77\x01\x02\x02\x01",
+		.ilen	= 72,
+		.assoc	= "\x17\x40\x5E\x67\x15\x6F\x31\x26"
+			  "\xDD\x0D\xB9\x9B\x61\x6E\x64\x01"
+			  "\x69\x76\x65\x63",
+		.alen	= 20,
+		.result	= "\xD4\xB7\xED\x86\xA1\x77\x7F\x2E"
+			  "\xA1\x3D\x69\x73\xD3\x24\xC6\x9E"
+			  "\x7B\x43\xF8\x26\xFB\x56\x83\x12"
+			  "\x26\x50\x8B\xEB\xD2\xDC\xEB\x18"
+			  "\xD0\xA6\xDF\x10\xE5\x48\x7D\xF0"
+			  "\x74\x11\x3E\x14\xC6\x41\x02\x4E"
+			  "\x3E\x67\x73\xD9\x1A\x62\xEE\x42"
+			  "\x9B\x04\x3A\x10\xE3\xEF\xE6\xB0"
+			  "\x12\xA4\x93\x63\x41\x23\x64\xF8"
+			  "\xC0\xCA\xC5\x87\xF2\x49\xE5\x6B"
+			  "\x11\xE2\x4F\x30\xE4\x4C\xCC\x76",
+		.rlen	= 88,
+	}, {
+		.key	= "\x7D\x77\x3D\x00\xC1\x44\xC5\x25"
+			  "\xAC\x61\x9D\x18\xC8\x4A\x3F\x47"
+			  "\xD9\x66\x42\x67",
+		.klen	= 20,
+		.iv	= "\x43\x45\x7E\x91\x82\x44\x3B\xC6",
+		.input	= "\x01\x02\x02\x01",
+		.ilen	= 4,
+		.assoc	= "\x33\x54\x67\xAE\xFF\xFF\xFF\xFF"
+			  "\x43\x45\x7E\x91\x82\x44\x3B\xC6",
+		.alen	= 16,
+		.result	= "\x43\x7F\x86\x6B\xCB\x3F\x69\x9F"
+			  "\xE9\xB0\x82\x2B\xAC\x96\x1C\x45"
+			  "\x04\xBE\xF2\x70",
+		.rlen	= 20,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xDE\xCA\xF8\x88",
+		.klen	= 20,
+		.iv	= "\xCA\xFE\xDE\xBA\xCE\xFA\xCE\x74",
+		.input	= "\x74\x6F\x01\x62\x65\x01\x6F\x72"
+			  "\x01\x6E\x6F\x74\x01\x74\x6F\x01"
+			  "\x62\x65\x00\x01",
+		.ilen	= 20,
+		.assoc	= "\x00\x00\x01\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x01\xCA\xFE\xDE\xBA"
+			  "\xCE\xFA\xCE\x74",
+		.alen	= 20,
+		.result	= "\x29\xC9\xFC\x69\xA1\x97\xD0\x38"
+			  "\xCC\xDD\x14\xE2\xDD\xFC\xAA\x05"
+			  "\x43\x33\x21\x64\x41\x25\x03\x52"
+			  "\x43\x03\xED\x3C\x6C\x5F\x28\x38"
+			  "\x43\xAF\x8C\x3E",
+		.rlen	= 36,
+	}, {
+		.key	= "\x6C\x65\x67\x61\x6C\x69\x7A\x65"
+			  "\x6D\x61\x72\x69\x6A\x75\x61\x6E"
+			  "\x61\x61\x6E\x64\x64\x6F\x69\x74"
+			  "\x62\x65\x66\x6F\x72\x65\x69\x61"
+			  "\x74\x75\x72\x6E",
+		.klen	= 36,
+		.iv	= "\x33\x30\x21\x69\x67\x65\x74\x6D",
+		.input	= "\x45\x00\x00\x30\xDA\x3A\x00\x00"
+			  "\x80\x01\xDF\x3B\xC0\xA8\x00\x05"
+			  "\xC0\xA8\x00\x01\x08\x00\xC6\xCD"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6A\x6B\x6C"
+			  "\x6D\x6E\x6F\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01",
+		.ilen	= 52,
+		.assoc	= "\x79\x6B\x69\x63\xFF\xFF\xFF\xFF"
+			  "\xFF\xFF\xFF\xFF\x33\x30\x21\x69"
+			  "\x67\x65\x74\x6D",
+		.alen	= 20,
+		.result	= "\xF9\x7A\xB2\xAA\x35\x6D\x8E\xDC"
+			  "\xE1\x76\x44\xAC\x8C\x78\xE2\x5D"
+			  "\xD2\x4D\xED\xBB\x29\xEB\xF1\xB6"
+			  "\x4A\x27\x4B\x39\xB4\x9C\x3A\x86"
+			  "\x4C\xD3\xD7\x8C\xA4\xAE\x68\xA3"
+			  "\x2B\x42\x45\x8F\xB5\x7D\xBE\x82"
+			  "\x1D\xCC\x63\xB9\xD0\x93\x7B\xA2"
+			  "\x94\x5F\x66\x93\x68\x66\x1A\x32"
+			  "\x9F\xB4\xC0\x53",
+		.rlen	= 68,
+	}, {
+		.key	= "\x3D\xE0\x98\x74\xB3\x88\xE6\x49"
+			  "\x19\x88\xD0\xC3\x60\x7E\xAE\x1F"
+			  "\x57\x69\x0E\x43",
+		.klen	= 20,
+		.iv	= "\x4E\x28\x00\x00\xA2\xFC\xA1\xA3",
+		.input	= "\x45\x00\x00\x30\xDA\x3A\x00\x00"
+			  "\x80\x01\xDF\x3B\xC0\xA8\x00\x05"
+			  "\xC0\xA8\x00\x01\x08\x00\xC6\xCD"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6A\x6B\x6C"
+			  "\x6D\x6E\x6F\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01",
+		.ilen	= 52,
+		.assoc	= "\x3F\x7E\xF6\x42\x10\x10\x10\x10"
+			  "\x10\x10\x10\x10\x4E\x28\x00\x00"
+			  "\xA2\xFC\xA1\xA3",
+		.alen	= 20,
+		.result	= "\xFB\xA2\xCA\xA8\xC6\xC5\xF9\xF0"
+			  "\xF2\x2C\xA5\x4A\x06\x12\x10\xAD"
+			  "\x3F\x6E\x57\x91\xCF\x1A\xCA\x21"
+			  "\x0D\x11\x7C\xEC\x9C\x35\x79\x17"
+			  "\x65\xAC\xBD\x87\x01\xAD\x79\x84"
+			  "\x5B\xF9\xFE\x3F\xBA\x48\x7B\xC9"
+			  "\x63\x21\x93\x06\x84\xEE\xCA\xDB"
+			  "\x56\x91\x25\x46\xE7\xA9\x5C\x97"
+			  "\x40\xD7\xCB\x05",
+		.rlen	= 68,
+	}, {
+		.key	= "\x4C\x80\xCD\xEF\xBB\x5D\x10\xDA"
+			  "\x90\x6A\xC7\x3C\x36\x13\xA6\x34"
+			  "\x22\x43\x3C\x64",
+		.klen	= 20,
+		.iv	= "\x48\x55\xEC\x7D\x3A\x23\x4B\xFD",
+		.input	= "\x08\x00\xC6\xCD\x02\x00\x07\x00"
+			  "\x61\x62\x63\x64\x65\x66\x67\x68"
+			  "\x69\x6A\x6B\x6C\x6D\x6E\x6F\x70"
+			  "\x71\x72\x73\x74\x01\x02\x02\x01",
+		.ilen	= 32,
+		.assoc	= "\x00\x00\x43\x21\x87\x65\x43\x21"
+			  "\x00\x00\x00\x07\x48\x55\xEC\x7D"
+			  "\x3A\x23\x4B\xFD",
+		.alen	= 20,
+		.result	= "\x74\x75\x2E\x8A\xEB\x5D\x87\x3C"
+			  "\xD7\xC0\xF4\xAC\xC3\x6C\x4B\xFF"
+			  "\x84\xB7\xD7\xB9\x8F\x0C\xA8\xB6"
+			  "\xAC\xDA\x68\x94\xBC\x61\x90\x69"
+			  "\xEF\x9C\xBC\x28\xFE\x1B\x56\xA7"
+			  "\xC4\xE0\xD5\x8C\x86\xCD\x2B\xC0",
+		.rlen	= 48,
+	}
+};
+
+static struct aead_testvec aes_gcm_rfc4106_dec_tv_template[] = {
+	{ /* Generated using Crypto++ */
+		.key    = zeroed_string,
+		.klen	= 20,
+		.iv     = zeroed_string,
+		.input	= "\x03\x88\xDA\xCE\x60\xB6\xA3\x92"
+			  "\xF3\x28\xC2\xB9\x71\xB2\xFE\x78"
+			  "\x97\xFE\x4C\x23\x37\x42\x01\xE0"
+			  "\x81\x9F\x8D\xC5\xD7\x41\xA0\x1B",
+		.ilen	= 32,
+		.assoc  = zeroed_string,
+		.alen   = 16,
+		.result = zeroed_string,
+		.rlen   = 16,
+
+	},{
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.input	= "\xC0\x0D\x8B\x42\x0F\x8F\x34\x18"
+			  "\x88\xB1\xC5\xBC\xC5\xB6\xD6\x28"
+			  "\x6A\x9D\xDF\x11\x5E\xFE\x5E\x9D"
+			  "\x2F\x70\x44\x92\xF7\xF2\xE3\xEF",
+		.ilen	= 32,
+		.assoc  = "\x00\x00\x00\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.alen   = 16,
+		.result = zeroed_string,
+		.rlen   = 16,
+	}, {
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = zeroed_string,
+		.input	= "\x4B\xB1\xB5\xE3\x25\x71\x70\xDE"
+			  "\x7F\xC9\x9C\xA5\x14\x19\xF2\xAC"
+			  "\x0B\x8F\x88\x69\x17\xE6\xB4\x3C"
+			  "\xB1\x68\xFD\x14\x52\x64\x61\xB2",
+		.ilen	= 32,
+		.assoc  = zeroed_string,
+		.alen   = 16,
+		.result = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01",
+		.rlen   = 16,
+	}, {
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = zeroed_string,
+		.input	= "\x4B\xB1\xB5\xE3\x25\x71\x70\xDE"
+			  "\x7F\xC9\x9C\xA5\x14\x19\xF2\xAC"
+			  "\x90\x92\xB7\xE3\x5F\xA3\x9A\x63"
+			  "\x7E\xD7\x1F\xD8\xD3\x7C\x4B\xF5",
+		.ilen	= 32,
+		.assoc  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.alen   = 16,
+		.result = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01",
+		.rlen   = 16,
+
+	}, {
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.input	= "\xC1\x0C\x8A\x43\x0E\x8E\x35\x19"
+			  "\x89\xB0\xC4\xBD\xC4\xB7\xD7\x29"
+			  "\x64\x50\xF9\x32\x13\xFB\x74\x61"
+			  "\xF4\xED\x52\xD3\xC5\x10\x55\x3C",
+		.ilen	= 32,
+		.assoc  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.alen   = 16,
+		.result = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01",
+		.rlen   = 16,
+	}, {
+		.key    = "\xfe\xff\xe9\x92\x86\x65\x73\x1c"
+			  "\x6d\x6a\x8f\x94\x67\x30\x83\x08"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.input	= "\xC1\x0C\x8A\x43\x0E\x8E\x35\x19"
+			  "\x89\xB0\xC4\xBD\xC4\xB7\xD7\x29"
+			  "\x98\x14\xA1\x42\x37\x80\xFD\x90"
+			  "\x68\x12\x01\xA8\x91\x89\xB9\x83"
+			  "\x5B\x11\x77\x12\x9B\xFF\x24\x89"
+			  "\x94\x5F\x18\x12\xBA\x27\x09\x39"
+			  "\x99\x96\x76\x42\x15\x1C\xCD\xCB"
+			  "\xDC\xD3\xDA\x65\x73\xAF\x80\xCD"
+			  "\xD2\xB6\xC2\x4A\x76\xC2\x92\x85"
+			  "\xBD\xCF\x62\x98\x58\x14\xE5\xBD",
+		.ilen	= 80,
+		.assoc  = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x00\x00\x00\x00\x00\x00\x00\x01",
+		.alen   = 16,
+		.result = "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01"
+			  "\x01\x01\x01\x01\x01\x01\x01\x01",
+		.rlen   = 64,
+	}, {
+		.key    = "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv     = "\x00\x00\x45\x67\x89\xab\xcd\xef",
+		.input	= "\xC1\x76\x33\x85\xE2\x9B\x5F\xDE"
+			  "\xDE\x89\x3D\x42\xE7\xC9\x69\x8A"
+			  "\x44\x6D\xC3\x88\x46\x2E\xC2\x01"
+			  "\x5E\xF6\x0C\x39\xF0\xC4\xA5\x82"
+			  "\xCD\xE8\x31\xCC\x0A\x4C\xE4\x44"
+			  "\x41\xA9\x82\x6F\x22\xA1\x23\x1A"
+			  "\xA8\xE3\x16\xFD\x31\x5C\x27\x31"
+			  "\xF1\x7F\x01\x63\xA3\xAF\x70\xA1"
+			  "\xCF\x07\x57\x41\x67\xD0\xC4\x42"
+			  "\xDB\x18\xC6\x4C\x4C\xE0\x3D\x9F"
+			  "\x05\x07\xFB\x13\x7D\x4A\xCA\x5B"
+			  "\xF0\xBF\x64\x7E\x05\xB1\x72\xEE"
+			  "\x7C\x3B\xD4\xCD\x14\x03\xB2\x2C"
+			  "\xD3\xA9\xEE\xFA\x17\xFC\x9C\xDF"
+			  "\xC7\x75\x40\xFF\xAE\xAD\x1E\x59"
+			  "\x2F\x30\x24\xFB\xAD\x6B\x10\xFA"
+			  "\x6C\x9F\x5B\xE7\x25\xD5\xD0\x25"
+			  "\xAC\x4A\x4B\xDA\xFC\x7A\x85\x1B"
+			  "\x7E\x13\x06\x82\x08\x17\xA4\x35"
+			  "\xEC\xC5\x8D\x63\x96\x81\x0A\x8F"
+			  "\xA3\x05\x38\x95\x20\x1A\x47\x04"
+			  "\x6F\x6D\xDA\x8F\xEF\xC1\x76\x35"
+			  "\x6B\xC7\x4D\x0F\x94\x12\xCA\x3E"
+			  "\x2E\xD5\x03\x2E\x86\x7E\xAA\x3B"
+			  "\x37\x08\x1C\xCF\xBA\x5D\x71\x46"
+			  "\x80\x72\xB0\x4C\x82\x0D\x60\x3C",
+		.ilen	= 208,
+		.assoc  = "\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa"
+			  "\xaa\xaa\xaa\xaa\x00\x00\x45\x67"
+			  "\x89\xab\xcd\xef",
+		.alen   = 20,
+		.result = "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff"
+			  "\xff\xff\xff\xff\xff\xff\xff\xff",
+		.rlen   = 192,
+	}, {
+		.key	= "\x4C\x80\xCD\xEF\xBB\x5D\x10\xDA"
+			  "\x90\x6A\xC7\x3C\x36\x13\xA6\x34"
+			  "\x2E\x44\x3B\x68",
+		.klen	= 20,
+		.iv	= "\x49\x56\xED\x7E\x3B\x24\x4C\xFE",
+		.result	= "\x45\x00\x00\x48\x69\x9A\x00\x00"
+			  "\x80\x11\x4D\xB7\xC0\xA8\x01\x02"
+			  "\xC0\xA8\x01\x01\x0A\x9B\xF1\x56"
+			  "\x38\xD3\x01\x00\x00\x01\x00\x00"
+			  "\x00\x00\x00\x00\x04\x5F\x73\x69"
+			  "\x70\x04\x5F\x75\x64\x70\x03\x73"
+			  "\x69\x70\x09\x63\x79\x62\x65\x72"
+			  "\x63\x69\x74\x79\x02\x64\x6B\x00"
+			  "\x00\x21\x00\x01\x01\x02\x02\x01",
+		.rlen	= 72,
+		.assoc	= "\x00\x00\x43\x21\x87\x65\x43\x21"
+			  "\x00\x00\x00\x00\x49\x56\xED\x7E"
+			  "\x3B\x24\x4C\xFE",
+		.alen	= 20,
+		.input	= "\xFE\xCF\x53\x7E\x72\x9D\x5B\x07"
+			  "\xDC\x30\xDF\x52\x8D\xD2\x2B\x76"
+			  "\x8D\x1B\x98\x73\x66\x96\xA6\xFD"
+			  "\x34\x85\x09\xFA\x13\xCE\xAC\x34"
+			  "\xCF\xA2\x43\x6F\x14\xA3\xF3\xCF"
+			  "\x65\x92\x5B\xF1\xF4\xA1\x3C\x5D"
+			  "\x15\xB2\x1E\x18\x84\xF5\xFF\x62"
+			  "\x47\xAE\xAB\xB7\x86\xB9\x3B\xCE"
+			  "\x61\xBC\x17\xD7\x68\xFD\x97\x32"
+			  "\x45\x90\x18\x14\x8F\x6C\xBE\x72"
+			  "\x2F\xD0\x47\x96\x56\x2D\xFD\xB4",
+		.ilen	= 88,
+	}, {
+		.key	= "\xFE\xFF\xE9\x92\x86\x65\x73\x1C"
+			  "\x6D\x6A\x8F\x94\x67\x30\x83\x08"
+			  "\xCA\xFE\xBA\xBE",
+		.klen	= 20,
+		.iv	= "\xFA\xCE\xDB\xAD\xDE\xCA\xF8\x88",
+		.result	= "\x45\x00\x00\x3E\x69\x8F\x00\x00"
+			  "\x80\x11\x4D\xCC\xC0\xA8\x01\x02"
+			  "\xC0\xA8\x01\x01\x0A\x98\x00\x35"
+			  "\x00\x2A\x23\x43\xB2\xD0\x01\x00"
+			  "\x00\x01\x00\x00\x00\x00\x00\x00"
+			  "\x03\x73\x69\x70\x09\x63\x79\x62"
+			  "\x65\x72\x63\x69\x74\x79\x02\x64"
+			  "\x6B\x00\x00\x01\x00\x01\x00\x01",
+		.rlen	= 64,
+		.assoc	= "\x00\x00\xA5\xF8\x00\x00\x00\x0A"
+			  "\xFA\xCE\xDB\xAD\xDE\xCA\xF8\x88",
+		.alen	= 16,
+		.input	= "\xDE\xB2\x2C\xD9\xB0\x7C\x72\xC1"
+			  "\x6E\x3A\x65\xBE\xEB\x8D\xF3\x04"
+			  "\xA5\xA5\x89\x7D\x33\xAE\x53\x0F"
+			  "\x1B\xA7\x6D\x5D\x11\x4D\x2A\x5C"
+			  "\x3D\xE8\x18\x27\xC1\x0E\x9A\x4F"
+			  "\x51\x33\x0D\x0E\xEC\x41\x66\x42"
+			  "\xCF\xBB\x85\xA5\xB4\x7E\x48\xA4"
+			  "\xEC\x3B\x9B\xA9\x5D\x91\x8B\xD1"
+			  "\x83\xB7\x0D\x3A\xA8\xBC\x6E\xE4"
+			  "\xC3\x09\xE9\xD8\x5A\x41\xAD\x4A",
+		.ilen	= 80,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\x11\x22\x33\x44",
+		.klen	= 36,
+		.iv	= "\x01\x02\x03\x04\x05\x06\x07\x08",
+		.result	= "\x45\x00\x00\x30\x69\xA6\x40\x00"
+			  "\x80\x06\x26\x90\xC0\xA8\x01\x02"
+			  "\x93\x89\x15\x5E\x0A\x9E\x00\x8B"
+			  "\x2D\xC5\x7E\xE0\x00\x00\x00\x00"
+			  "\x70\x02\x40\x00\x20\xBF\x00\x00"
+			  "\x02\x04\x05\xB4\x01\x01\x04\x02"
+			  "\x01\x02\x02\x01",
+		.rlen	= 52,
+		.assoc	= "\x4A\x2C\xBF\xE3\x00\x00\x00\x02"
+			  "\x01\x02\x03\x04\x05\x06\x07\x08",
+		.alen	= 16,
+		.input	= "\xFF\x42\x5C\x9B\x72\x45\x99\xDF"
+			  "\x7A\x3B\xCD\x51\x01\x94\xE0\x0D"
+			  "\x6A\x78\x10\x7F\x1B\x0B\x1C\xBF"
+			  "\x06\xEF\xAE\x9D\x65\xA5\xD7\x63"
+			  "\x74\x8A\x63\x79\x85\x77\x1D\x34"
+			  "\x7F\x05\x45\x65\x9F\x14\xE9\x9D"
+			  "\xEF\x84\x2D\x8E\xB3\x35\xF4\xEE"
+			  "\xCF\xDB\xF8\x31\x82\x4B\x4C\x49"
+			  "\x15\x95\x6C\x96",
+		.ilen	= 68,
+	}, {
+		.key	= "\x00\x00\x00\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x00",
+		.klen	= 20,
+		.iv	= "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.result	= "\x45\x00\x00\x3C\x99\xC5\x00\x00"
+			  "\x80\x01\xCB\x7A\x40\x67\x93\x18"
+			  "\x01\x01\x01\x01\x08\x00\x07\x5C"
+			  "\x02\x00\x44\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6A\x6B\x6C"
+			  "\x6D\x6E\x6F\x70\x71\x72\x73\x74"
+			  "\x75\x76\x77\x61\x62\x63\x64\x65"
+			  "\x66\x67\x68\x69\x01\x02\x02\x01",
+		.rlen	= 64,
+		.assoc	= "\x00\x00\x00\x00\x00\x00\x00\x01"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.alen	= 16,
+		.input	= "\x46\x88\xDA\xF2\xF9\x73\xA3\x92"
+			  "\x73\x29\x09\xC3\x31\xD5\x6D\x60"
+			  "\xF6\x94\xAB\xAA\x41\x4B\x5E\x7F"
+			  "\xF5\xFD\xCD\xFF\xF5\xE9\xA2\x84"
+			  "\x45\x64\x76\x49\x27\x19\xFF\xB6"
+			  "\x4D\xE7\xD9\xDC\xA1\xE1\xD8\x94"
+			  "\xBC\x3B\xD5\x78\x73\xED\x4D\x18"
+			  "\x1D\x19\xD4\xD5\xC8\xC1\x8A\xF3"
+			  "\xF8\x21\xD4\x96\xEE\xB0\x96\xE9"
+			  "\x8A\xD2\xB6\x9E\x47\x99\xC7\x1D",
+		.ilen	= 80,
+	}, {
+		.key	= "\x3D\xE0\x98\x74\xB3\x88\xE6\x49"
+			  "\x19\x88\xD0\xC3\x60\x7E\xAE\x1F"
+			  "\x57\x69\x0E\x43",
+		.klen	= 20,
+		.iv	= "\x4E\x28\x00\x00\xA2\xFC\xA1\xA3",
+		.result	= "\x45\x00\x00\x3C\x99\xC3\x00\x00"
+			  "\x80\x01\xCB\x7C\x40\x67\x93\x18"
+			  "\x01\x01\x01\x01\x08\x00\x08\x5C"
+			  "\x02\x00\x43\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6A\x6B\x6C"
+			  "\x6D\x6E\x6F\x70\x71\x72\x73\x74"
+			  "\x75\x76\x77\x61\x62\x63\x64\x65"
+			  "\x66\x67\x68\x69\x01\x02\x02\x01",
+		.rlen	= 64,
+		.assoc	= "\x42\xF6\x7E\x3F\x10\x10\x10\x10"
+			  "\x10\x10\x10\x10\x4E\x28\x00\x00"
+			  "\xA2\xFC\xA1\xA3",
+		.alen	= 20,
+		.input	= "\xFB\xA2\xCA\xA4\x85\x3C\xF9\xF0"
+			  "\xF2\x2C\xB1\x0D\x86\xDD\x83\xB0"
+			  "\xFE\xC7\x56\x91\xCF\x1A\x04\xB0"
+			  "\x0D\x11\x38\xEC\x9C\x35\x79\x17"
+			  "\x65\xAC\xBD\x87\x01\xAD\x79\x84"
+			  "\x5B\xF9\xFE\x3F\xBA\x48\x7B\xC9"
+			  "\x17\x55\xE6\x66\x2B\x4C\x8D\x0D"
+			  "\x1F\x5E\x22\x73\x95\x30\x32\x0A"
+			  "\xE0\xD7\x31\xCC\x97\x8E\xCA\xFA"
+			  "\xEA\xE8\x8F\x00\xE8\x0D\x6E\x48",
+		.ilen	= 80,
+	}, {
+		.key	= "\x3D\xE0\x98\x74\xB3\x88\xE6\x49"
+			  "\x19\x88\xD0\xC3\x60\x7E\xAE\x1F"
+			  "\x57\x69\x0E\x43",
+		.klen	= 20,
+		.iv	= "\x4E\x28\x00\x00\xA2\xFC\xA1\xA3",
+		.result	= "\x45\x00\x00\x1C\x42\xA2\x00\x00"
+			  "\x80\x01\x44\x1F\x40\x67\x93\xB6"
+			  "\xE0\x00\x00\x02\x0A\x00\xF5\xFF"
+			  "\x01\x02\x02\x01",
+		.rlen	= 28,
+		.assoc	= "\x42\xF6\x7E\x3F\x10\x10\x10\x10"
+			  "\x10\x10\x10\x10\x4E\x28\x00\x00"
+			  "\xA2\xFC\xA1\xA3",
+		.alen	= 20,
+		.input	= "\xFB\xA2\xCA\x84\x5E\x5D\xF9\xF0"
+			  "\xF2\x2C\x3E\x6E\x86\xDD\x83\x1E"
+			  "\x1F\xC6\x57\x92\xCD\x1A\xF9\x13"
+			  "\x0E\x13\x79\xED\x36\x9F\x07\x1F"
+			  "\x35\xE0\x34\xBE\x95\xF1\x12\xE4"
+			  "\xE7\xD0\x5D\x35",
+		.ilen	= 44,
+	}, {
+		.key	= "\xFE\xFF\xE9\x92\x86\x65\x73\x1C"
+			  "\x6D\x6A\x8F\x94\x67\x30\x83\x08"
+			  "\xFE\xFF\xE9\x92\x86\x65\x73\x1C"
+			  "\xCA\xFE\xBA\xBE",
+		.klen	= 28,
+		.iv	= "\xFA\xCE\xDB\xAD\xDE\xCA\xF8\x88",
+		.result	= "\x45\x00\x00\x28\xA4\xAD\x40\x00"
+			  "\x40\x06\x78\x80\x0A\x01\x03\x8F"
+			  "\x0A\x01\x06\x12\x80\x23\x06\xB8"
+			  "\xCB\x71\x26\x02\xDD\x6B\xB0\x3E"
+			  "\x50\x10\x16\xD0\x75\x68\x00\x01",
+		.rlen	= 40,
+		.assoc	= "\x00\x00\xA5\xF8\x00\x00\x00\x0A"
+			  "\xFA\xCE\xDB\xAD\xDE\xCA\xF8\x88",
+		.alen	= 16,
+		.input	= "\xA5\xB1\xF8\x06\x60\x29\xAE\xA4"
+			  "\x0E\x59\x8B\x81\x22\xDE\x02\x42"
+			  "\x09\x38\xB3\xAB\x33\xF8\x28\xE6"
+			  "\x87\xB8\x85\x8B\x5B\xFB\xDB\xD0"
+			  "\x31\x5B\x27\x45\x21\x44\xCC\x77"
+			  "\x95\x45\x7B\x96\x52\x03\x7F\x53"
+			  "\x18\x02\x7B\x5B\x4C\xD7\xA6\x36",
+		.ilen	= 56,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xDE\xCA\xF8\x88",
+		.klen	= 20,
+		.iv	= "\xCA\xFE\xDE\xBA\xCE\xFA\xCE\x74",
+		.result	= "\x45\x00\x00\x49\x33\xBA\x00\x00"
+			  "\x7F\x11\x91\x06\xC3\xFB\x1D\x10"
+			  "\xC2\xB1\xD3\x26\xC0\x28\x31\xCE"
+			  "\x00\x35\xDD\x7B\x80\x03\x02\xD5"
+			  "\x00\x00\x4E\x20\x00\x1E\x8C\x18"
+			  "\xD7\x5B\x81\xDC\x91\xBA\xA0\x47"
+			  "\x6B\x91\xB9\x24\xB2\x80\x38\x9D"
+			  "\x92\xC9\x63\xBA\xC0\x46\xEC\x95"
+			  "\x9B\x62\x66\xC0\x47\x22\xB1\x49"
+			  "\x23\x01\x01\x01",
+		.rlen	= 76,
+		.assoc	= "\x00\x00\x01\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x01\xCA\xFE\xDE\xBA"
+			  "\xCE\xFA\xCE\x74",
+		.alen	= 20,
+		.input	= "\x18\xA6\xFD\x42\xF7\x2C\xBF\x4A"
+			  "\xB2\xA2\xEA\x90\x1F\x73\xD8\x14"
+			  "\xE3\xE7\xF2\x43\xD9\x54\x12\xE1"
+			  "\xC3\x49\xC1\xD2\xFB\xEC\x16\x8F"
+			  "\x91\x90\xFE\xEB\xAF\x2C\xB0\x19"
+			  "\x84\xE6\x58\x63\x96\x5D\x74\x72"
+			  "\xB7\x9D\xA3\x45\xE0\xE7\x80\x19"
+			  "\x1F\x0D\x2F\x0E\x0F\x49\x6C\x22"
+			  "\x6F\x21\x27\xB2\x7D\xB3\x57\x24"
+			  "\xE7\x84\x5D\x68\x65\x1F\x57\xE6"
+			  "\x5F\x35\x4F\x75\xFF\x17\x01\x57"
+			  "\x69\x62\x34\x36",
+		.ilen	= 92,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\x73\x61\x6C\x74",
+		.klen	= 36,
+		.iv	= "\x61\x6E\x64\x01\x69\x76\x65\x63",
+		.result	= "\x45\x08\x00\x28\x73\x2C\x00\x00"
+			  "\x40\x06\xE9\xF9\x0A\x01\x06\x12"
+			  "\x0A\x01\x03\x8F\x06\xB8\x80\x23"
+			  "\xDD\x6B\xAF\xBE\xCB\x71\x26\x02"
+			  "\x50\x10\x1F\x64\x6D\x54\x00\x01",
+		.rlen	= 40,
+		.assoc	= "\x17\x40\x5E\x67\x15\x6F\x31\x26"
+			  "\xDD\x0D\xB9\x9B\x61\x6E\x64\x01"
+			  "\x69\x76\x65\x63",
+		.alen	= 20,
+		.input	= "\xF2\xD6\x9E\xCD\xBD\x5A\x0D\x5B"
+			  "\x8D\x5E\xF3\x8B\xAD\x4D\xA5\x8D"
+			  "\x1F\x27\x8F\xDE\x98\xEF\x67\x54"
+			  "\x9D\x52\x4A\x30\x18\xD9\xA5\x7F"
+			  "\xF4\xD3\xA3\x1C\xE6\x73\x11\x9E"
+			  "\x45\x16\x26\xC2\x41\x57\x71\xE3"
+			  "\xB7\xEE\xBC\xA6\x14\xC8\x9B\x35",
+		.ilen	= 56,
+	}, {
+		.key	= "\x3D\xE0\x98\x74\xB3\x88\xE6\x49"
+			  "\x19\x88\xD0\xC3\x60\x7E\xAE\x1F"
+			  "\x57\x69\x0E\x43",
+		.klen	= 20,
+		.iv	= "\x4E\x28\x00\x00\xA2\xFC\xA1\xA3",
+		.result	= "\x45\x00\x00\x49\x33\x3E\x00\x00"
+			  "\x7F\x11\x91\x82\xC3\xFB\x1D\x10"
+			  "\xC2\xB1\xD3\x26\xC0\x28\x31\xCE"
+			  "\x00\x35\xCB\x45\x80\x03\x02\x5B"
+			  "\x00\x00\x01\xE0\x00\x1E\x8C\x18"
+			  "\xD6\x57\x59\xD5\x22\x84\xA0\x35"
+			  "\x2C\x71\x47\x5C\x88\x80\x39\x1C"
+			  "\x76\x4D\x6E\x5E\xE0\x49\x6B\x32"
+			  "\x5A\xE2\x70\xC0\x38\x99\x49\x39"
+			  "\x15\x01\x01\x01",
+		.rlen	= 76,
+		.assoc	= "\x42\xF6\x7E\x3F\x10\x10\x10\x10"
+			  "\x10\x10\x10\x10\x4E\x28\x00\x00"
+			  "\xA2\xFC\xA1\xA3",
+		.alen	= 20,
+		.input	= "\xFB\xA2\xCA\xD1\x2F\xC1\xF9\xF0"
+			  "\x0D\x3C\xEB\xF3\x05\x41\x0D\xB8"
+			  "\x3D\x77\x84\xB6\x07\x32\x3D\x22"
+			  "\x0F\x24\xB0\xA9\x7D\x54\x18\x28"
+			  "\x00\xCA\xDB\x0F\x68\xD9\x9E\xF0"
+			  "\xE0\xC0\xC8\x9A\xE9\xBE\xA8\x88"
+			  "\x4E\x52\xD6\x5B\xC1\xAF\xD0\x74"
+			  "\x0F\x74\x24\x44\x74\x7B\x5B\x39"
+			  "\xAB\x53\x31\x63\xAA\xD4\x55\x0E"
+			  "\xE5\x16\x09\x75\xCD\xB6\x08\xC5"
+			  "\x76\x91\x89\x60\x97\x63\xB8\xE1"
+			  "\x8C\xAA\x81\xE2",
+		.ilen	= 92,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\x73\x61\x6C\x74",
+		.klen	= 36,
+		.iv	= "\x61\x6E\x64\x01\x69\x76\x65\x63",
+		.result	= "\x63\x69\x73\x63\x6F\x01\x72\x75"
+			  "\x6C\x65\x73\x01\x74\x68\x65\x01"
+			  "\x6E\x65\x74\x77\x65\x01\x64\x65"
+			  "\x66\x69\x6E\x65\x01\x74\x68\x65"
+			  "\x74\x65\x63\x68\x6E\x6F\x6C\x6F"
+			  "\x67\x69\x65\x73\x01\x74\x68\x61"
+			  "\x74\x77\x69\x6C\x6C\x01\x64\x65"
+			  "\x66\x69\x6E\x65\x74\x6F\x6D\x6F"
+			  "\x72\x72\x6F\x77\x01\x02\x02\x01",
+		.rlen	= 72,
+		.assoc	= "\x17\x40\x5E\x67\x15\x6F\x31\x26"
+			  "\xDD\x0D\xB9\x9B\x61\x6E\x64\x01"
+			  "\x69\x76\x65\x63",
+		.alen	= 20,
+		.input	= "\xD4\xB7\xED\x86\xA1\x77\x7F\x2E"
+			  "\xA1\x3D\x69\x73\xD3\x24\xC6\x9E"
+			  "\x7B\x43\xF8\x26\xFB\x56\x83\x12"
+			  "\x26\x50\x8B\xEB\xD2\xDC\xEB\x18"
+			  "\xD0\xA6\xDF\x10\xE5\x48\x7D\xF0"
+			  "\x74\x11\x3E\x14\xC6\x41\x02\x4E"
+			  "\x3E\x67\x73\xD9\x1A\x62\xEE\x42"
+			  "\x9B\x04\x3A\x10\xE3\xEF\xE6\xB0"
+			  "\x12\xA4\x93\x63\x41\x23\x64\xF8"
+			  "\xC0\xCA\xC5\x87\xF2\x49\xE5\x6B"
+			  "\x11\xE2\x4F\x30\xE4\x4C\xCC\x76",
+		.ilen	= 88,
+	}, {
+		.key	= "\x7D\x77\x3D\x00\xC1\x44\xC5\x25"
+			  "\xAC\x61\x9D\x18\xC8\x4A\x3F\x47"
+			  "\xD9\x66\x42\x67",
+		.klen	= 20,
+		.iv	= "\x43\x45\x7E\x91\x82\x44\x3B\xC6",
+		.result	= "\x01\x02\x02\x01",
+		.rlen	= 4,
+		.assoc	= "\x33\x54\x67\xAE\xFF\xFF\xFF\xFF"
+			  "\x43\x45\x7E\x91\x82\x44\x3B\xC6",
+		.alen	= 16,
+		.input	= "\x43\x7F\x86\x6B\xCB\x3F\x69\x9F"
+			  "\xE9\xB0\x82\x2B\xAC\x96\x1C\x45"
+			  "\x04\xBE\xF2\x70",
+		.ilen	= 20,
+	}, {
+		.key	= "\xAB\xBC\xCD\xDE\xF0\x01\x12\x23"
+			  "\x34\x45\x56\x67\x78\x89\x9A\xAB"
+			  "\xDE\xCA\xF8\x88",
+		.klen	= 20,
+		.iv	= "\xCA\xFE\xDE\xBA\xCE\xFA\xCE\x74",
+		.result	= "\x74\x6F\x01\x62\x65\x01\x6F\x72"
+			  "\x01\x6E\x6F\x74\x01\x74\x6F\x01"
+			  "\x62\x65\x00\x01",
+		.rlen	= 20,
+		.assoc	= "\x00\x00\x01\x00\x00\x00\x00\x00"
+			  "\x00\x00\x00\x01\xCA\xFE\xDE\xBA"
+			  "\xCE\xFA\xCE\x74",
+		.alen	= 20,
+		.input	= "\x29\xC9\xFC\x69\xA1\x97\xD0\x38"
+			  "\xCC\xDD\x14\xE2\xDD\xFC\xAA\x05"
+			  "\x43\x33\x21\x64\x41\x25\x03\x52"
+			  "\x43\x03\xED\x3C\x6C\x5F\x28\x38"
+			  "\x43\xAF\x8C\x3E",
+		.ilen	= 36,
+	}, {
+		.key	= "\x6C\x65\x67\x61\x6C\x69\x7A\x65"
+			  "\x6D\x61\x72\x69\x6A\x75\x61\x6E"
+			  "\x61\x61\x6E\x64\x64\x6F\x69\x74"
+			  "\x62\x65\x66\x6F\x72\x65\x69\x61"
+			  "\x74\x75\x72\x6E",
+		.klen	= 36,
+		.iv	= "\x33\x30\x21\x69\x67\x65\x74\x6D",
+		.result	= "\x45\x00\x00\x30\xDA\x3A\x00\x00"
+			  "\x80\x01\xDF\x3B\xC0\xA8\x00\x05"
+			  "\xC0\xA8\x00\x01\x08\x00\xC6\xCD"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6A\x6B\x6C"
+			  "\x6D\x6E\x6F\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01",
+		.rlen	= 52,
+		.assoc	= "\x79\x6B\x69\x63\xFF\xFF\xFF\xFF"
+			  "\xFF\xFF\xFF\xFF\x33\x30\x21\x69"
+			  "\x67\x65\x74\x6D",
+		.alen	= 20,
+		.input	= "\xF9\x7A\xB2\xAA\x35\x6D\x8E\xDC"
+			  "\xE1\x76\x44\xAC\x8C\x78\xE2\x5D"
+			  "\xD2\x4D\xED\xBB\x29\xEB\xF1\xB6"
+			  "\x4A\x27\x4B\x39\xB4\x9C\x3A\x86"
+			  "\x4C\xD3\xD7\x8C\xA4\xAE\x68\xA3"
+			  "\x2B\x42\x45\x8F\xB5\x7D\xBE\x82"
+			  "\x1D\xCC\x63\xB9\xD0\x93\x7B\xA2"
+			  "\x94\x5F\x66\x93\x68\x66\x1A\x32"
+			  "\x9F\xB4\xC0\x53",
+		.ilen	= 68,
+	}, {
+		.key	= "\x3D\xE0\x98\x74\xB3\x88\xE6\x49"
+			  "\x19\x88\xD0\xC3\x60\x7E\xAE\x1F"
+			  "\x57\x69\x0E\x43",
+		.klen	= 20,
+		.iv	= "\x4E\x28\x00\x00\xA2\xFC\xA1\xA3",
+		.result	= "\x45\x00\x00\x30\xDA\x3A\x00\x00"
+			  "\x80\x01\xDF\x3B\xC0\xA8\x00\x05"
+			  "\xC0\xA8\x00\x01\x08\x00\xC6\xCD"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6A\x6B\x6C"
+			  "\x6D\x6E\x6F\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01",
+		.rlen	= 52,
+		.assoc	= "\x3F\x7E\xF6\x42\x10\x10\x10\x10"
+			  "\x10\x10\x10\x10\x4E\x28\x00\x00"
+			  "\xA2\xFC\xA1\xA3",
+		.alen	= 20,
+		.input	= "\xFB\xA2\xCA\xA8\xC6\xC5\xF9\xF0"
+			  "\xF2\x2C\xA5\x4A\x06\x12\x10\xAD"
+			  "\x3F\x6E\x57\x91\xCF\x1A\xCA\x21"
+			  "\x0D\x11\x7C\xEC\x9C\x35\x79\x17"
+			  "\x65\xAC\xBD\x87\x01\xAD\x79\x84"
+			  "\x5B\xF9\xFE\x3F\xBA\x48\x7B\xC9"
+			  "\x63\x21\x93\x06\x84\xEE\xCA\xDB"
+			  "\x56\x91\x25\x46\xE7\xA9\x5C\x97"
+			  "\x40\xD7\xCB\x05",
+		.ilen	= 68,
+	}, {
+		.key	= "\x4C\x80\xCD\xEF\xBB\x5D\x10\xDA"
+			  "\x90\x6A\xC7\x3C\x36\x13\xA6\x34"
+			  "\x22\x43\x3C\x64",
+		.klen	= 20,
+		.iv	= "\x48\x55\xEC\x7D\x3A\x23\x4B\xFD",
+		.result	= "\x08\x00\xC6\xCD\x02\x00\x07\x00"
+			  "\x61\x62\x63\x64\x65\x66\x67\x68"
+			  "\x69\x6A\x6B\x6C\x6D\x6E\x6F\x70"
+			  "\x71\x72\x73\x74\x01\x02\x02\x01",
+		.rlen	= 32,
+		.assoc	= "\x00\x00\x43\x21\x87\x65\x43\x21"
+			  "\x00\x00\x00\x07\x48\x55\xEC\x7D"
+			  "\x3A\x23\x4B\xFD",
+		.alen	= 20,
+		.input	= "\x74\x75\x2E\x8A\xEB\x5D\x87\x3C"
+			  "\xD7\xC0\xF4\xAC\xC3\x6C\x4B\xFF"
+			  "\x84\xB7\xD7\xB9\x8F\x0C\xA8\xB6"
+			  "\xAC\xDA\x68\x94\xBC\x61\x90\x69"
+			  "\xEF\x9C\xBC\x28\xFE\x1B\x56\xA7"
+			  "\xC4\xE0\xD5\x8C\x86\xCD\x2B\xC0",
+		.ilen	= 48,
+	}
+};
+
+static struct aead_testvec aes_gcm_rfc4543_enc_tv_template[] = {
+	{ /* From draft-mcgrew-gcm-test-01 */
+		.key	= "\x4c\x80\xcd\xef\xbb\x5d\x10\xda"
+			  "\x90\x6a\xc7\x3c\x36\x13\xa6\x34"
+			  "\x22\x43\x3c\x64",
+		.klen	= 20,
+		.iv	= zeroed_string,
+		.assoc	= "\x00\x00\x43\x21\x00\x00\x00\x07"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.alen	= 16,
+		.input	= "\x45\x00\x00\x30\xda\x3a\x00\x00"
+			  "\x80\x01\xdf\x3b\xc0\xa8\x00\x05"
+			  "\xc0\xa8\x00\x01\x08\x00\xc6\xcd"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6a\x6b\x6c"
+			  "\x6d\x6e\x6f\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01",
+		.ilen	= 52,
+		.result	= "\x45\x00\x00\x30\xda\x3a\x00\x00"
+			  "\x80\x01\xdf\x3b\xc0\xa8\x00\x05"
+			  "\xc0\xa8\x00\x01\x08\x00\xc6\xcd"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6a\x6b\x6c"
+			  "\x6d\x6e\x6f\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01\xf2\xa9\xa8\x36"
+			  "\xe1\x55\x10\x6a\xa8\xdc\xd6\x18"
+			  "\xe4\x09\x9a\xaa",
+		.rlen	= 68,
+	}
+};
+
+static struct aead_testvec aes_gcm_rfc4543_dec_tv_template[] = {
+	{ /* From draft-mcgrew-gcm-test-01 */
+		.key	= "\x4c\x80\xcd\xef\xbb\x5d\x10\xda"
+			  "\x90\x6a\xc7\x3c\x36\x13\xa6\x34"
+			  "\x22\x43\x3c\x64",
+		.klen	= 20,
+		.iv	= zeroed_string,
+		.assoc	= "\x00\x00\x43\x21\x00\x00\x00\x07"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.alen	= 16,
+		.input	= "\x45\x00\x00\x30\xda\x3a\x00\x00"
+			  "\x80\x01\xdf\x3b\xc0\xa8\x00\x05"
+			  "\xc0\xa8\x00\x01\x08\x00\xc6\xcd"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6a\x6b\x6c"
+			  "\x6d\x6e\x6f\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01\xf2\xa9\xa8\x36"
+			  "\xe1\x55\x10\x6a\xa8\xdc\xd6\x18"
+			  "\xe4\x09\x9a\xaa",
+		.ilen	= 68,
+		.result	= "\x45\x00\x00\x30\xda\x3a\x00\x00"
+			  "\x80\x01\xdf\x3b\xc0\xa8\x00\x05"
+			  "\xc0\xa8\x00\x01\x08\x00\xc6\xcd"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6a\x6b\x6c"
+			  "\x6d\x6e\x6f\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01",
+		.rlen	= 52,
+	}, { /* nearly same as previous, but should fail */
+		.key	= "\x4c\x80\xcd\xef\xbb\x5d\x10\xda"
+			  "\x90\x6a\xc7\x3c\x36\x13\xa6\x34"
+			  "\x22\x43\x3c\x64",
+		.klen	= 20,
+		.iv	= zeroed_string,
+		.assoc	= "\x00\x00\x43\x21\x00\x00\x00\x07"
+			  "\x00\x00\x00\x00\x00\x00\x00\x00",
+		.alen	= 16,
+		.input	= "\x45\x00\x00\x30\xda\x3a\x00\x00"
+			  "\x80\x01\xdf\x3b\xc0\xa8\x00\x05"
+			  "\xc0\xa8\x00\x01\x08\x00\xc6\xcd"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6a\x6b\x6c"
+			  "\x6d\x6e\x6f\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01\xf2\xa9\xa8\x36"
+			  "\xe1\x55\x10\x6a\xa8\xdc\xd6\x18"
+			  "\x00\x00\x00\x00",
+		.ilen	= 68,
+		.novrfy = 1,
+		.result	= "\x45\x00\x00\x30\xda\x3a\x00\x00"
+			  "\x80\x01\xdf\x3b\xc0\xa8\x00\x05"
+			  "\xc0\xa8\x00\x01\x08\x00\xc6\xcd"
+			  "\x02\x00\x07\x00\x61\x62\x63\x64"
+			  "\x65\x66\x67\x68\x69\x6a\x6b\x6c"
+			  "\x6d\x6e\x6f\x70\x71\x72\x73\x74"
+			  "\x01\x02\x02\x01",
+		.rlen	= 52,
+	},
+};
+
+static struct aead_testvec aes_ccm_enc_tv_template[] = {
+	{ /* From RFC 3610 */
+		.key	= "\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			  "\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf",
+		.klen	= 16,
+		.iv	= "\x01\x00\x00\x00\x03\x02\x01\x00"
+			  "\xa0\xa1\xa2\xa3\xa4\xa5\x00\x00",
+		.assoc	= "\x00\x01\x02\x03\x04\x05\x06\x07",
+		.alen	= 8,
+		.input	= "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e",
+		.ilen	= 23,
+		.result	= "\x58\x8c\x97\x9a\x61\xc6\x63\xd2"
+			  "\xf0\x66\xd0\xc2\xc0\xf9\x89\x80"
+			  "\x6d\x5f\x6b\x61\xda\xc3\x84\x17"
+			  "\xe8\xd1\x2c\xfd\xf9\x26\xe0",
+		.rlen	= 31,
+	}, {
+		.key	= "\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			  "\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf",
+		.klen	= 16,
+		.iv	= "\x01\x00\x00\x00\x07\x06\x05\x04"
+			  "\xa0\xa1\xa2\xa3\xa4\xa5\x00\x00",
+		.assoc	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b",
+		.alen	= 12,
+		.input	= "\x0c\x0d\x0e\x0f\x10\x11\x12\x13"
+			  "\x14\x15\x16\x17\x18\x19\x1a\x1b"
+			  "\x1c\x1d\x1e\x1f",
+		.ilen	= 20,
+		.result	= "\xdc\xf1\xfb\x7b\x5d\x9e\x23\xfb"
+			  "\x9d\x4e\x13\x12\x53\x65\x8a\xd8"
+			  "\x6e\xbd\xca\x3e\x51\xe8\x3f\x07"
+			  "\x7d\x9c\x2d\x93",
+		.rlen	= 28,
+	}, {
+		.key	= "\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			  "\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf",
+		.klen	= 16,
+		.iv	= "\x01\x00\x00\x00\x0b\x0a\x09\x08"
+			  "\xa0\xa1\xa2\xa3\xa4\xa5\x00\x00",
+		.assoc	= "\x00\x01\x02\x03\x04\x05\x06\x07",
+		.alen	= 8,
+		.input	= "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+			  "\x20",
+		.ilen	= 25,
+		.result	= "\x82\x53\x1a\x60\xcc\x24\x94\x5a"
+			  "\x4b\x82\x79\x18\x1a\xb5\xc8\x4d"
+			  "\xf2\x1c\xe7\xf9\xb7\x3f\x42\xe1"
+			  "\x97\xea\x9c\x07\xe5\x6b\x5e\xb1"
+			  "\x7e\x5f\x4e",
+		.rlen	= 35,
+	}, {
+		.key	= "\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			  "\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf",
+		.klen	= 16,
+		.iv	= "\x01\x00\x00\x00\x0c\x0b\x0a\x09"
+			  "\xa0\xa1\xa2\xa3\xa4\xa5\x00\x00",
+		.assoc	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b",
+		.alen	= 12,
+		.input	= "\x0c\x0d\x0e\x0f\x10\x11\x12\x13"
+			  "\x14\x15\x16\x17\x18\x19\x1a\x1b"
+			  "\x1c\x1d\x1e",
+		.ilen	= 19,
+		.result	= "\x07\x34\x25\x94\x15\x77\x85\x15"
+			  "\x2b\x07\x40\x98\x33\x0a\xbb\x14"
+			  "\x1b\x94\x7b\x56\x6a\xa9\x40\x6b"
+			  "\x4d\x99\x99\x88\xdd",
+		.rlen	= 29,
+	}, {
+		.key	= "\xd7\x82\x8d\x13\xb2\xb0\xbd\xc3"
+			  "\x25\xa7\x62\x36\xdf\x93\xcc\x6b",
+		.klen	= 16,
+		.iv	= "\x01\x00\x33\x56\x8e\xf7\xb2\x63"
+			  "\x3c\x96\x96\x76\x6c\xfa\x00\x00",
+		.assoc	= "\x63\x01\x8f\x76\xdc\x8a\x1b\xcb",
+		.alen	= 8,
+		.input	= "\x90\x20\xea\x6f\x91\xbd\xd8\x5a"
+			  "\xfa\x00\x39\xba\x4b\xaf\xf9\xbf"
+			  "\xb7\x9c\x70\x28\x94\x9c\xd0\xec",
+		.ilen	= 24,
+		.result	= "\x4c\xcb\x1e\x7c\xa9\x81\xbe\xfa"
+			  "\xa0\x72\x6c\x55\xd3\x78\x06\x12"
+			  "\x98\xc8\x5c\x92\x81\x4a\xbc\x33"
+			  "\xc5\x2e\xe8\x1d\x7d\x77\xc0\x8a",
+		.rlen	= 32,
+	}, {
+		.key	= "\xd7\x82\x8d\x13\xb2\xb0\xbd\xc3"
+			  "\x25\xa7\x62\x36\xdf\x93\xcc\x6b",
+		.klen	= 16,
+		.iv	= "\x01\x00\xd5\x60\x91\x2d\x3f\x70"
+			  "\x3c\x96\x96\x76\x6c\xfa\x00\x00",
+		.assoc	= "\xcd\x90\x44\xd2\xb7\x1f\xdb\x81"
+			  "\x20\xea\x60\xc0",
+		.alen	= 12,
+		.input	= "\x64\x35\xac\xba\xfb\x11\xa8\x2e"
+			  "\x2f\x07\x1d\x7c\xa4\xa5\xeb\xd9"
+			  "\x3a\x80\x3b\xa8\x7f",
+		.ilen	= 21,
+		.result	= "\x00\x97\x69\xec\xab\xdf\x48\x62"
+			  "\x55\x94\xc5\x92\x51\xe6\x03\x57"
+			  "\x22\x67\x5e\x04\xc8\x47\x09\x9e"
+			  "\x5a\xe0\x70\x45\x51",
+		.rlen	= 29,
+	}, {
+		.key	= "\xd7\x82\x8d\x13\xb2\xb0\xbd\xc3"
+			  "\x25\xa7\x62\x36\xdf\x93\xcc\x6b",
+		.klen	= 16,
+		.iv	= "\x01\x00\x42\xff\xf8\xf1\x95\x1c"
+			  "\x3c\x96\x96\x76\x6c\xfa\x00\x00",
+		.assoc	= "\xd8\x5b\xc7\xe6\x9f\x94\x4f\xb8",
+		.alen	= 8,
+		.input	= "\x8a\x19\xb9\x50\xbc\xf7\x1a\x01"
+			  "\x8e\x5e\x67\x01\xc9\x17\x87\x65"
+			  "\x98\x09\xd6\x7d\xbe\xdd\x18",
+		.ilen	= 23,
+		.result	= "\xbc\x21\x8d\xaa\x94\x74\x27\xb6"
+			  "\xdb\x38\x6a\x99\xac\x1a\xef\x23"
+			  "\xad\xe0\xb5\x29\x39\xcb\x6a\x63"
+			  "\x7c\xf9\xbe\xc2\x40\x88\x97\xc6"
+			  "\xba",
+		.rlen	= 33,
+	}, {
+		/* This is taken from FIPS CAVS. */
+		.key	= "\x83\xac\x54\x66\xc2\xeb\xe5\x05"
+			  "\x2e\x01\xd1\xfc\x5d\x82\x66\x2e",
+		.klen	= 16,
+		.iv	= "\x03\x96\xac\x59\x30\x07\xa1\xe2\xa2\xc7\x55\x24\0\0\0\0",
+		.alen	= 0,
+		.input	= "\x19\xc8\x81\xf6\xe9\x86\xff\x93"
+			  "\x0b\x78\x67\xe5\xbb\xb7\xfc\x6e"
+			  "\x83\x77\xb3\xa6\x0c\x8c\x9f\x9c"
+			  "\x35\x2e\xad\xe0\x62\xf9\x91\xa1",
+		.ilen	= 32,
+		.result	= "\xab\x6f\xe1\x69\x1d\x19\x99\xa8"
+			  "\x92\xa0\xc4\x6f\x7e\xe2\x8b\xb1"
+			  "\x70\xbb\x8c\xa6\x4c\x6e\x97\x8a"
+			  "\x57\x2b\xbe\x5d\x98\xa6\xb1\x32"
+			  "\xda\x24\xea\xd9\xa1\x39\x98\xfd"
+			  "\xa4\xbe\xd9\xf2\x1a\x6d\x22\xa8",
+		.rlen	= 48,
+	}, {
+		.key	= "\x1e\x2c\x7e\x01\x41\x9a\xef\xc0"
+			  "\x0d\x58\x96\x6e\x5c\xa2\x4b\xd3",
+		.klen	= 16,
+		.iv	= "\x03\x4f\xa3\x19\xd3\x01\x5a\xd8"
+			  "\x30\x60\x15\x56\x00\x00\x00\x00",
+		.assoc	= "\xda\xe6\x28\x9c\x45\x2d\xfd\x63"
+			  "\x5e\xda\x4c\xb6\xe6\xfc\xf9\xb7"
+			  "\x0c\x56\xcb\xe4\xe0\x05\x7a\xe1"
+			  "\x0a\x63\x09\x78\xbc\x2c\x55\xde",
+		.alen	= 32,
+		.input	= "\x87\xa3\x36\xfd\x96\xb3\x93\x78"
+			  "\xa9\x28\x63\xba\x12\xa3\x14\x85"
+			  "\x57\x1e\x06\xc9\x7b\x21\xef\x76"
+			  "\x7f\x38\x7e\x8e\x29\xa4\x3e\x7e",
+		.ilen	= 32,
+		.result	= "\x8a\x1e\x11\xf0\x02\x6b\xe2\x19"
+			  "\xfc\x70\xc4\x6d\x8e\xb7\x99\xab"
+			  "\xc5\x4b\xa2\xac\xd3\xf3\x48\xff"
+			  "\x3b\xb5\xce\x53\xef\xde\xbb\x02"
+			  "\xa9\x86\x15\x6c\x13\xfe\xda\x0a"
+			  "\x22\xb8\x29\x3d\xd8\x39\x9a\x23",
+		.rlen	= 48,
+	}, {
+		.key	= "\xf4\x6b\xc2\x75\x62\xfe\xb4\xe1"
+			  "\xa3\xf0\xff\xdd\x4e\x4b\x12\x75"
+			  "\x53\x14\x73\x66\x8d\x88\xf6\x80",
+		.klen	= 24,
+		.iv	= "\x03\xa0\x20\x35\x26\xf2\x21\x8d"
+			  "\x50\x20\xda\xe2\x00\x00\x00\x00",
+		.assoc	= "\x5b\x9e\x13\x67\x02\x5e\xef\xc1"
+			  "\x6c\xf9\xd7\x1e\x52\x8f\x7a\x47"
+			  "\xe9\xd4\xcf\x20\x14\x6e\xf0\x2d"
+			  "\xd8\x9e\x2b\x56\x10\x23\x56\xe7",
+		.alen	= 32,
+		.result	= "\x36\xea\x7a\x70\x08\xdc\x6a\xbc"
+			  "\xad\x0c\x7a\x63\xf6\x61\xfd\x9b",
+		.rlen	= 16,
+	}, {
+		.key	= "\x56\xdf\x5c\x8f\x26\x3f\x0e\x42"
+			  "\xef\x7a\xd3\xce\xfc\x84\x60\x62"
+			  "\xca\xb4\x40\xaf\x5f\xc9\xc9\x01",
+		.klen	= 24,
+		.iv	= "\x03\xd6\x3c\x8c\x86\x84\xb6\xcd"
+			  "\xef\x09\x2e\x94\x00\x00\x00\x00",
+		.assoc	= "\x02\x65\x78\x3c\xe9\x21\x30\x91"
+			  "\xb1\xb9\xda\x76\x9a\x78\x6d\x95"
+			  "\xf2\x88\x32\xa3\xf2\x50\xcb\x4c"
+			  "\xe3\x00\x73\x69\x84\x69\x87\x79",
+		.alen	= 32,
+		.input	= "\x9f\xd2\x02\x4b\x52\x49\x31\x3c"
+			  "\x43\x69\x3a\x2d\x8e\x70\xad\x7e"
+			  "\xe0\xe5\x46\x09\x80\x89\x13\xb2"
+			  "\x8c\x8b\xd9\x3f\x86\xfb\xb5\x6b",
+		.ilen	= 32,
+		.result	= "\x39\xdf\x7c\x3c\x5a\x29\xb9\x62"
+			  "\x5d\x51\xc2\x16\xd8\xbd\x06\x9f"
+			  "\x9b\x6a\x09\x70\xc1\x51\x83\xc2"
+			  "\x66\x88\x1d\x4f\x9a\xda\xe0\x1e"
+			  "\xc7\x79\x11\x58\xe5\x6b\x20\x40"
+			  "\x7a\xea\x46\x42\x8b\xe4\x6f\xe1",
+		.rlen	= 48,
+	}, {
+		.key	= "\xe0\x8d\x99\x71\x60\xd7\x97\x1a"
+			  "\xbd\x01\x99\xd5\x8a\xdf\x71\x3a"
+			  "\xd3\xdf\x24\x4b\x5e\x3d\x4b\x4e"
+			  "\x30\x7a\xb9\xd8\x53\x0a\x5e\x2b",
+		.klen	= 32,
+		.iv	= "\x03\x1e\x29\x91\xad\x8e\xc1\x53"
+			  "\x0a\xcf\x2d\xbe\x00\x00\x00\x00",
+		.assoc	= "\x19\xb6\x1f\x57\xc4\xf3\xf0\x8b"
+			  "\x78\x2b\x94\x02\x29\x0f\x42\x27"
+			  "\x6b\x75\xcb\x98\x34\x08\x7e\x79"
+			  "\xe4\x3e\x49\x0d\x84\x8b\x22\x87",
+		.alen	= 32,
+		.input	= "\xe1\xd9\xd8\x13\xeb\x3a\x75\x3f"
+			  "\x9d\xbd\x5f\x66\xbe\xdc\xbb\x66"
+			  "\xbf\x17\x99\x62\x4a\x39\x27\x1f"
+			  "\x1d\xdc\x24\xae\x19\x2f\x98\x4c",
+		.ilen	= 32,
+		.result	= "\x19\xb8\x61\x33\x45\x2b\x43\x96"
+			  "\x6f\x51\xd0\x20\x30\x7d\x9b\xc6"
+			  "\x26\x3d\xf8\xc9\x65\x16\xa8\x9f"
+			  "\xf0\x62\x17\x34\xf2\x1e\x8d\x75"
+			  "\x4e\x13\xcc\xc0\xc3\x2a\x54\x2d",
+		.rlen	= 40,
+	}, {
+		.key	= "\x7c\xc8\x18\x3b\x8d\x99\xe0\x7c"
+			  "\x45\x41\xb8\xbd\x5c\xa7\xc2\x32"
+			  "\x8a\xb8\x02\x59\xa4\xfe\xa9\x2c"
+			  "\x09\x75\x9a\x9b\x3c\x9b\x27\x39",
+		.klen	= 32,
+		.iv	= "\x03\xf9\xd9\x4e\x63\xb5\x3d\x9d"
+			  "\x43\xf6\x1e\x50\0\0\0\0",
+		.assoc	= "\x57\xf5\x6b\x8b\x57\x5c\x3d\x3b"
+			  "\x13\x02\x01\x0c\x83\x4c\x96\x35"
+			  "\x8e\xd6\x39\xcf\x7d\x14\x9b\x94"
+			  "\xb0\x39\x36\xe6\x8f\x57\xe0\x13",
+		.alen	= 32,
+		.input	= "\x3b\x6c\x29\x36\xb6\xef\x07\xa6"
+			  "\x83\x72\x07\x4f\xcf\xfa\x66\x89"
+			  "\x5f\xca\xb1\xba\xd5\x8f\x2c\x27"
+			  "\x30\xdb\x75\x09\x93\xd4\x65\xe4",
+		.ilen	= 32,
+		.result	= "\xb0\x88\x5a\x33\xaa\xe5\xc7\x1d"
+			  "\x85\x23\xc7\xc6\x2f\xf4\x1e\x3d"
+			  "\xcc\x63\x44\x25\x07\x78\x4f\x9e"
+			  "\x96\xb8\x88\xeb\xbc\x48\x1f\x06"
+			  "\x39\xaf\x39\xac\xd8\x4a\x80\x39"
+			  "\x7b\x72\x8a\xf7",
+		.rlen	= 44,
+	}, {
+		.key	= "\xab\xd0\xe9\x33\x07\x26\xe5\x83"
+			  "\x8c\x76\x95\xd4\xb6\xdc\xf3\x46"
+			  "\xf9\x8f\xad\xe3\x02\x13\x83\x77"
+			  "\x3f\xb0\xf1\xa1\xa1\x22\x0f\x2b",
+		.klen	= 32,
+		.iv	= "\x03\x24\xa7\x8b\x07\xcb\xcc\x0e"
+			  "\xe6\x33\xbf\xf5\x00\x00\x00\x00",
+		.assoc	= "\xd4\xdb\x30\x1d\x03\xfe\xfd\x5f"
+			  "\x87\xd4\x8c\xb6\xb6\xf1\x7a\x5d"
+			  "\xab\x90\x65\x8d\x8e\xca\x4d\x4f"
+			  "\x16\x0c\x40\x90\x4b\xc7\x36\x73",
+		.alen	= 32,
+		.input	= "\xf5\xc6\x7d\x48\xc1\xb7\xe6\x92"
+			  "\x97\x5a\xca\xc4\xa9\x6d\xf9\x3d"
+			  "\x6c\xde\xbc\xf1\x90\xea\x6a\xb2"
+			  "\x35\x86\x36\xaf\x5c\xfe\x4b\x3a",
+		.ilen	= 32,
+		.result	= "\x83\x6f\x40\x87\x72\xcf\xc1\x13"
+			  "\xef\xbb\x80\x21\x04\x6c\x58\x09"
+			  "\x07\x1b\xfc\xdf\xc0\x3f\x5b\xc7"
+			  "\xe0\x79\xa8\x6e\x71\x7c\x3f\xcf"
+			  "\x5c\xda\xb2\x33\xe5\x13\xe2\x0d"
+			  "\x74\xd1\xef\xb5\x0f\x3a\xb5\xf8",
+		.rlen	= 48,
+	}
+};
+
+static struct aead_testvec aes_ccm_dec_tv_template[] = {
+	{ /* From RFC 3610 */
+		.key	= "\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			  "\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf",
+		.klen	= 16,
+		.iv	= "\x01\x00\x00\x00\x03\x02\x01\x00"
+			  "\xa0\xa1\xa2\xa3\xa4\xa5\x00\x00",
+		.assoc	= "\x00\x01\x02\x03\x04\x05\x06\x07",
+		.alen	= 8,
+		.input	= "\x58\x8c\x97\x9a\x61\xc6\x63\xd2"
+			  "\xf0\x66\xd0\xc2\xc0\xf9\x89\x80"
+			  "\x6d\x5f\x6b\x61\xda\xc3\x84\x17"
+			  "\xe8\xd1\x2c\xfd\xf9\x26\xe0",
+		.ilen	= 31,
+		.result	= "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e",
+		.rlen	= 23,
+	}, {
+		.key	= "\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			  "\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf",
+		.klen	= 16,
+		.iv	= "\x01\x00\x00\x00\x07\x06\x05\x04"
+			  "\xa0\xa1\xa2\xa3\xa4\xa5\x00\x00",
+		.assoc	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b",
+		.alen	= 12,
+		.input	= "\xdc\xf1\xfb\x7b\x5d\x9e\x23\xfb"
+			  "\x9d\x4e\x13\x12\x53\x65\x8a\xd8"
+			  "\x6e\xbd\xca\x3e\x51\xe8\x3f\x07"
+			  "\x7d\x9c\x2d\x93",
+		.ilen	= 28,
+		.result	= "\x0c\x0d\x0e\x0f\x10\x11\x12\x13"
+			  "\x14\x15\x16\x17\x18\x19\x1a\x1b"
+			  "\x1c\x1d\x1e\x1f",
+		.rlen	= 20,
+	}, {
+		.key	= "\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			  "\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf",
+		.klen	= 16,
+		.iv	= "\x01\x00\x00\x00\x0b\x0a\x09\x08"
+			  "\xa0\xa1\xa2\xa3\xa4\xa5\x00\x00",
+		.assoc	= "\x00\x01\x02\x03\x04\x05\x06\x07",
+		.alen	= 8,
+		.input	= "\x82\x53\x1a\x60\xcc\x24\x94\x5a"
+			  "\x4b\x82\x79\x18\x1a\xb5\xc8\x4d"
+			  "\xf2\x1c\xe7\xf9\xb7\x3f\x42\xe1"
+			  "\x97\xea\x9c\x07\xe5\x6b\x5e\xb1"
+			  "\x7e\x5f\x4e",
+		.ilen	= 35,
+		.result	= "\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+			  "\x10\x11\x12\x13\x14\x15\x16\x17"
+			  "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+			  "\x20",
+		.rlen	= 25,
+	}, {
+		.key	= "\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7"
+			  "\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf",
+		.klen	= 16,
+		.iv	= "\x01\x00\x00\x00\x0c\x0b\x0a\x09"
+			  "\xa0\xa1\xa2\xa3\xa4\xa5\x00\x00",
+		.assoc	= "\x00\x01\x02\x03\x04\x05\x06\x07"
+			  "\x08\x09\x0a\x0b",
+		.alen	= 12,
+		.input	= "\x07\x34\x25\x94\x15\x77\x85\x15"
+			  "\x2b\x07\x40\x98\x33\x0a\xbb\x14"
+			  "\x1b\x94\x7b\x56\x6a\xa9\x40\x6b"
+			  "\x4d\x99\x99\x88\xdd",
+		.ilen	= 29,
+		.result	= "\x0c\x0d\x0e\x0f\x10\x11\x12\x13"
+			  "\x14\x15\x16\x17\x18\x19\x1a\x1b"
+			  "\x1c\x1d\x1e",
+		.rlen	= 19,
+	}, {
+		.key	= "\xd7\x82\x8d\x13\xb2\xb0\xbd\xc3"
+			  "\x25\xa7\x62\x36\xdf\x93\xcc\x6b",
+		.klen	= 16,
+		.iv	= "\x01\x00\x33\x56\x8e\xf7\xb2\x63"
+			  "\x3c\x96\x96\x76\x6c\xfa\x00\x00",
+		.assoc	= "\x63\x01\x8f\x76\xdc\x8a\x1b\xcb",
+		.alen	= 8,
+		.input	= "\x4c\xcb\x1e\x7c\xa9\x81\xbe\xfa"
+			  "\xa0\x72\x6c\x55\xd3\x78\x06\x12"
+			  "\x98\xc8\x5c\x92\x81\x4a\xbc\x33"
+			  "\xc5\x2e\xe8\x1d\x7d\x77\xc0\x8a",
+		.ilen	= 32,
+		.result	= "\x90\x20\xea\x6f\x91\xbd\xd8\x5a"
+			  "\xfa\x00\x39\xba\x4b\xaf\xf9\xbf"
+			  "\xb7\x9c\x70\x28\x94\x9c\xd0\xec",
+		.rlen	= 24,
+	}, {
+		.key	= "\xd7\x82\x8d\x13\xb2\xb0\xbd\xc3"
+			  "\x25\xa7\x62\x36\xdf\x93\xcc\x6b",
+		.klen	= 16,
+		.iv	= "\x01\x00\xd5\x60\x91\x2d\x3f\x70"
+			  "\x3c\x96\x96\x76\x6c\xfa\x00\x00",
+		.assoc	= "\xcd\x90\x44\xd2\xb7\x1f\xdb\x81"
+			  "\x20\xea\x60\xc0",
+		.alen	= 12,
+		.input	= "\x00\x97\x69\xec\xab\xdf\x48\x62"
+			  "\x55\x94\xc5\x92\x51\xe6\x03\x57"
+			  "\x22\x67\x5e\x04\xc8\x47\x09\x9e"
+			  "\x5a\xe0\x70\x45\x51",
+		.ilen	= 29,
+		.result	= "\x64\x35\xac\xba\xfb\x11\xa8\x2e"
+			  "\x2f\x07\x1d\x7c\xa4\xa5\xeb\xd9"
+			  "\x3a\x80\x3b\xa8\x7f",
+		.rlen	= 21,
+	}, {
+		.key	= "\xd7\x82\x8d\x13\xb2\xb0\xbd\xc3"
+			  "\x25\xa7\x62\x36\xdf\x93\xcc\x6b",
+		.klen	= 16,
+		.iv	= "\x01\x00\x42\xff\xf8\xf1\x95\x1c"
+			  "\x3c\x96\x96\x76\x6c\xfa\x00\x00",
+		.assoc	= "\xd8\x5b\xc7\xe6\x9f\x94\x4f\xb8",
+		.alen	= 8,
+		.input	= "\xbc\x21\x8d\xaa\x94\x74\x27\xb6"
+			  "\xdb\x38\x6a\x99\xac\x1a\xef\x23"
+			  "\xad\xe0\xb5\x29\x39\xcb\x6a\x63"
+			  "\x7c\xf9\xbe\xc2\x40\x88\x97\xc6"
+			  "\xba",
+		.ilen	= 33,
+		.result	= "\x8a\x19\xb9\x50\xbc\xf7\x1a\x01"
+			  "\x8e\x5e\x67\x01\xc9\x17\x87\x65"
+			  "\x98\x09\xd6\x7d\xbe\xdd\x18",
+		.rlen	= 23,
+	}, {
+		/* This is taken from FIPS CAVS. */
+		.key	= "\xab\x2f\x8a\x74\xb7\x1c\xd2\xb1"
+			  "\xff\x80\x2e\x48\x7d\x82\xf8\xb9",
+		.klen	= 16,
+		.iv	= "\x03\xc6\xfb\x7d\x80\x0d\x13\xab"
+			  "\xd8\xa6\xb2\xd8\x00\x00\x00\x00",
+		.alen	= 0,
+		.input	= "\xd5\xe8\x93\x9f\xc7\x89\x2e\x2b",
+		.ilen	= 8,
+		.result	= "\x00",
+		.rlen	= 0,
+		.novrfy	= 1,
+	}, {
+		.key	= "\xab\x2f\x8a\x74\xb7\x1c\xd2\xb1"
+			  "\xff\x80\x2e\x48\x7d\x82\xf8\xb9",
+		.klen	= 16,
+		.iv	= "\x03\xaf\x94\x87\x78\x35\x82\x81"
+			  "\x7f\x88\x94\x68\x00\x00\x00\x00",
+		.alen	= 0,
+		.input	= "\x41\x3c\xb8\x87\x73\xcb\xf3\xf3",
+		.ilen	= 8,
+		.result	= "\x00",
+		.rlen	= 0,
+	}, {
+		.key	= "\x61\x0e\x8c\xae\xe3\x23\xb6\x38"
+			  "\x76\x1c\xf6\x3a\x67\xa3\x9c\xd8",
+		.klen	= 16,
+		.iv	= "\x03\xc6\xfb\x7d\x80\x0d\x13\xab"
+			  "\xd8\xa6\xb2\xd8\x00\x00\x00\x00",
+		.assoc	= "\xf3\x94\x87\x78\x35\x82\x81\x7f"
+			  "\x88\x94\x68\xb1\x78\x6b\x2b\xd6"
+			  "\x04\x1f\x4e\xed\x78\xd5\x33\x66"
+			  "\xd8\x94\x99\x91\x81\x54\x62\x57",
+		.alen	= 32,
+		.input	= "\xf0\x7c\x29\x02\xae\x1c\x2f\x55"
+			  "\xd0\xd1\x3d\x1a\xa3\x6d\xe4\x0a"
+			  "\x86\xb0\x87\x6b\x62\x33\x8c\x34"
+			  "\xce\xab\x57\xcc\x79\x0b\xe0\x6f"
+			  "\x5c\x3e\x48\x1f\x6c\x46\xf7\x51"
+			  "\x8b\x84\x83\x2a\xc1\x05\xb8\xc5",
+		.ilen	= 48,
+		.result	= "\x50\x82\x3e\x07\xe2\x1e\xb6\xfb"
+			  "\x33\xe4\x73\xce\xd2\xfb\x95\x79"
+			  "\xe8\xb4\xb5\x77\x11\x10\x62\x6f"
+			  "\x6a\x82\xd1\x13\xec\xf5\xd0\x48",
+		.rlen	= 32,
+		.novrfy	= 1,
+	}, {
+		.key	= "\x61\x0e\x8c\xae\xe3\x23\xb6\x38"
+			  "\x76\x1c\xf6\x3a\x67\xa3\x9c\xd8",
+		.klen	= 16,
+		.iv	= "\x03\x05\xe0\xc9\x0f\xed\x34\xea"
+			  "\x97\xd4\x3b\xdf\x00\x00\x00\x00",
+		.assoc	= "\x49\x5c\x50\x1f\x1d\x94\xcc\x81"
+			  "\xba\xb7\xb6\x03\xaf\xa5\xc1\xa1"
+			  "\xd8\x5c\x42\x68\xe0\x6c\xda\x89"
+			  "\x05\xac\x56\xac\x1b\x2a\xd3\x86",
+		.alen	= 32,
+		.input	= "\x39\xbe\x7d\x15\x62\x77\xf3\x3c"
+			  "\xad\x83\x52\x6d\x71\x03\x25\x1c"
+			  "\xed\x81\x3a\x9a\x16\x7d\x19\x80"
+			  "\x72\x04\x72\xd0\xf6\xff\x05\x0f"
+			  "\xb7\x14\x30\x00\x32\x9e\xa0\xa6"
+			  "\x9e\x5a\x18\xa1\xb8\xfe\xdb\xd3",
+		.ilen	= 48,
+		.result	= "\x75\x05\xbe\xc2\xd9\x1e\xde\x60"
+			  "\x47\x3d\x8c\x7d\xbd\xb5\xd9\xb7"
+			  "\xf2\xae\x61\x05\x8f\x82\x24\x3f"
+			  "\x9c\x67\x91\xe1\x38\x4f\xe4\x0c",
+		.rlen	= 32,
+	}, {
+		.key	= "\x39\xbb\xa7\xbe\x59\x97\x9e\x73"
+			  "\xa2\x

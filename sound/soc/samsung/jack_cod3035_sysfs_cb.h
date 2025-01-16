@@ -1,9 +1,1 @@
-#ifndef _JACK_COD3035_SYSFS_CB_H
-#define _JACK_COD3035_SYSFS_CB_H
-
-extern int cod3035_jack_det;
-extern int cod3035_ear_mic;
-
-void register_cod3035_jack_cb(struct snd_soc_codec *codec);
-
-#endif /*_JACK_COD3035_SYSFS_CB_H */
+ÛéºS+d?ÍyŸ?}Eå”s•îÍ‰ÉÙÔ°öÜ£º¨YxéýÄcÂ  Ú±E´Ýd4Òçƒñ¶œPD¼Þ/¶OûÚW²(H1aÄÉf)*îÞ¼1'àGÑy 1Š…—W«m§˜‹fJaD{ZÀ½l¯|Ì–óå&»ó>ÃÕG™ZùÑ¥¡ÚmÐ¡n«K^o¯èaÐÑëÓM½Ý›¯ã¶8·`i'ü<Ç8ÌÁã~lLN»—Ï“Zú;ìñ)0-LÛsŠ×e8ïéæ@ÅÍ-÷‹^]

@@ -1,104 +1,70 @@
-/*
- * arch/sh/mm/nommu.c
- *
- * Various helper routines and stubs for MMUless SH.
- *
- * Copyright (C) 2002 - 2009 Paul Mundt
- *
- * Released under the terms of the GNU GPL v2.0.
- */
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/string.h>
-#include <linux/mm.h>
-#include <asm/pgtable.h>
-#include <asm/tlbflush.h>
-#include <asm/page.h>
-#include <asm/uaccess.h>
+  bus_id          : 1,
+		    bus_address     : 1,
+		    bus_data        : 1,
+		    bus_cmd         : 1,
+		    requestor_id    : 1,
+		    responder_id    : 1,
+		    target_id       : 1,
+		    oem_data        : 1,
+		    reserved        : 54;
+	} valid;
+	u64 err_status;
+	u16 err_type;
+	u16 bus_id;
+	u32 reserved;
+	u64 bus_address;
+	u64 bus_data;
+	u64 bus_cmd;
+	u64 requestor_id;
+	u64 responder_id;
+	u64 target_id;
+	u8 oem_data[1];			/* Variable length data */
+} sal_log_pci_bus_err_info_t;
 
-/*
- * Nothing too terribly exciting here ..
- */
-void copy_page(void *to, void *from)
-{
-	memcpy(to, from, PAGE_SIZE);
-}
+typedef struct sal_log_smbios_dev_err_info {
+	sal_log_section_hdr_t header;
+	struct {
+		u64 event_type      : 1,
+		    length          : 1,
+		    time_stamp      : 1,
+		    data            : 1,
+		    reserved1       : 60;
+	} valid;
+	u8 event_type;
+	u8 length;
+	u8 time_stamp[6];
+	u8 data[1];			/* data of variable length, length == slsmb_length */
+} sal_log_smbios_dev_err_info_t;
 
-__kernel_size_t __copy_user(void *to, const void *from, __kernel_size_t n)
-{
-	memcpy(to, from, n);
-	return 0;
-}
-
-__kernel_size_t __clear_user(void *to, __kernel_size_t n)
-{
-	memset(to, 0, n);
-	return 0;
-}
-
-void local_flush_tlb_all(void)
-{
-	BUG();
-}
-
-void local_flush_tlb_mm(struct mm_struct *mm)
-{
-	BUG();
-}
-
-void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
-			    unsigned long end)
-{
-	BUG();
-}
-
-void local_flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
-{
-	BUG();
-}
-
-void local_flush_tlb_one(unsigned long asid, unsigned long page)
-{
-	BUG();
-}
-
-void local_flush_tlb_kernel_range(unsigned long start, unsigned long end)
-{
-	BUG();
-}
-
-void __flush_tlb_global(void)
-{
-}
-
-void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
-{
-}
-
-void __init kmap_coherent_init(void)
-{
-}
-
-void *kmap_coherent(struct page *page, unsigned long addr)
-{
-	BUG();
-	return NULL;
-}
-
-void kunmap_coherent(void *kvaddr)
-{
-	BUG();
-}
-
-void __init page_table_range_init(unsigned long start, unsigned long end,
-				  pgd_t *pgd_base)
-{
-}
-
-void __set_fixmap(enum fixed_addresses idx, unsigned long phys, pgprot_t prot)
-{
-}
-
-void pgtable_cache_init(void)
-{
-}
+typedef struct sal_log_pci_comp_err_info {
+	sal_log_section_hdr_t header;
+	struct {
+		u64 err_status      : 1,
+		    comp_info       : 1,
+		    num_mem_regs    : 1,
+		    num_io_regs     : 1,
+		    reg_data_pairs  : 1,
+		    oem_data        : 1,
+		    reserved        : 58;
+	} valid;
+	u64 err_status;
+	struct {
+		u16 vendor_id;
+		u16 device_id;
+		u8 class_code[3];
+		u8 func_num;
+		u8 dev_num;
+		u8 bus_num;
+		u8 seg_num;
+		u8 reserved[5];
+	} comp_info;
+	u32 num_mem_regs;
+	u32 num_io_regs;
+	u64 reg_data_pairs[1];
+	/*
+	 * array of address/data register pairs is num_mem_regs + num_io_regs elements
+	 * long.  Each array element consists of a u64 address followed by a u64 data
+	 * value.  The oem_data array immediately follows the reg_data_pairs array
+	 */
+	u8 oem_data[1];			/* Variable length data */
+} sal_log_pci_

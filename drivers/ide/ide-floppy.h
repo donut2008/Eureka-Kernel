@@ -1,39 +1,39 @@
-#ifndef __IDE_FLOPPY_H
-#define __IDE_FLOPPY_H
-
-#include "ide-gd.h"
-
-#ifdef CONFIG_IDE_GD_ATAPI
 /*
- * Pages of the SELECT SENSE / MODE SENSE packet commands.
- * See SFF-8070i spec.
+ * Copyright 2012 Marvell International Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
-#define	IDEFLOPPY_CAPABILITIES_PAGE	0x1b
-#define IDEFLOPPY_FLEXIBLE_DISK_PAGE	0x05
 
-/* IOCTLs used in low-level formatting. */
-#define	IDEFLOPPY_IOCTL_FORMAT_SUPPORTED	0x4600
-#define	IDEFLOPPY_IOCTL_FORMAT_GET_CAPACITY	0x4601
-#define	IDEFLOPPY_IOCTL_FORMAT_START		0x4602
-#define IDEFLOPPY_IOCTL_FORMAT_GET_PROGRESS	0x4603
+#include <linux/err.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/types.h>
+#include <linux/interrupt.h>
+#include <linux/dma-mapping.h>
+#include <linux/slab.h>
+#include <linux/dmaengine.h>
+#include <linux/platform_device.h>
+#include <linux/device.h>
+#include <linux/platform_data/mmp_dma.h>
+#include <linux/dmapool.h>
+#include <linux/of_device.h>
+#include <linux/of_dma.h>
+#include <linux/of.h>
+#include <linux/dma/mmp-pdma.h>
 
-/* ide-floppy.c */
-extern const struct ide_disk_ops ide_atapi_disk_ops;
-void ide_floppy_create_mode_sense_cmd(struct ide_atapi_pc *, u8);
-void ide_floppy_create_read_capacity_cmd(struct ide_atapi_pc *);
+#include "dmaengine.h"
 
-/* ide-floppy_ioctl.c */
-int ide_floppy_ioctl(ide_drive_t *, struct block_device *, fmode_t,
-		     unsigned int, unsigned long);
+#define DCSR		0x0000
+#define DALGN		0x00a0
+#define DINT		0x00f0
+#define DDADR		0x0200
+#define DSADR(n)	(0x0204 + ((n) << 4))
+#define DTADR(n)	(0x0208 + ((n) << 4))
+#define DCMD		0x020c
 
-#ifdef CONFIG_IDE_PROC_FS
-/* ide-floppy_proc.c */
-extern ide_proc_entry_t ide_floppy_proc[];
-extern const struct ide_proc_devset ide_floppy_settings[];
-#endif
-#else
-#define ide_floppy_proc		NULL
-#define ide_floppy_settings	NULL
-#endif
-
-#endif /*__IDE_FLOPPY_H */
+#define DCSR_RUN	BIT(31)	/* Run Bit (read / write) */
+#define DCSR_NODESC	BIT(30)	/* No-Descriptor Fetch (read / write) */
+#define DCSR_STOPIRQEN	BIT(29)	/* Stop Interrupt Enable (read / write) */
+#defi

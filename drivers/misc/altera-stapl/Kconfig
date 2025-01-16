@@ -1,8 +1,6 @@
-comment "Altera FPGA firmware download module"
-
-config ALTERA_STAPL
-	tristate "Altera FPGA firmware download module"
-	depends on I2C
-	default n
-	help
-	  An Altera FPGA module. Say Y when you want to support this tool.
+IFT 0x0
+#define MM_CFGREGS_CNTL__MM_WR_TO_CFG_EN_MASK 0x8
+#define MM_CFGREGS_CNTL__MM_WR_TO_CFG_EN__SHIFT 0x3
+#define HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define HW_DEBUG__HW_01_DEBU

@@ -1,35 +1,27 @@
-#
-# Makefile for the input core drivers.
-#
-
-# Each configuration option enables a list of files.
-
-obj-$(CONFIG_JOYSTICK_A3D)		+= a3d.o
-obj-$(CONFIG_JOYSTICK_ADI)		+= adi.o
-obj-$(CONFIG_JOYSTICK_AMIGA)		+= amijoy.o
-obj-$(CONFIG_JOYSTICK_AS5011)		+= as5011.o
-obj-$(CONFIG_JOYSTICK_ANALOG)		+= analog.o
-obj-$(CONFIG_JOYSTICK_COBRA)		+= cobra.o
-obj-$(CONFIG_JOYSTICK_DB9)		+= db9.o
-obj-$(CONFIG_JOYSTICK_GAMECON)		+= gamecon.o
-obj-$(CONFIG_JOYSTICK_GF2K)		+= gf2k.o
-obj-$(CONFIG_JOYSTICK_GRIP)		+= grip.o
-obj-$(CONFIG_JOYSTICK_GRIP_MP)		+= grip_mp.o
-obj-$(CONFIG_JOYSTICK_GUILLEMOT)	+= guillemot.o
-obj-$(CONFIG_JOYSTICK_IFORCE)		+= iforce/
-obj-$(CONFIG_JOYSTICK_INTERACT)		+= interact.o
-obj-$(CONFIG_JOYSTICK_JOYDUMP)		+= joydump.o
-obj-$(CONFIG_JOYSTICK_MAGELLAN)		+= magellan.o
-obj-$(CONFIG_JOYSTICK_MAPLE)		+= maplecontrol.o
-obj-$(CONFIG_JOYSTICK_SIDEWINDER)	+= sidewinder.o
-obj-$(CONFIG_JOYSTICK_SPACEBALL)	+= spaceball.o
-obj-$(CONFIG_JOYSTICK_SPACEORB)		+= spaceorb.o
-obj-$(CONFIG_JOYSTICK_STINGER)		+= stinger.o
-obj-$(CONFIG_JOYSTICK_TMDC)		+= tmdc.o
-obj-$(CONFIG_JOYSTICK_TURBOGRAFX)	+= turbografx.o
-obj-$(CONFIG_JOYSTICK_TWIDJOY)		+= twidjoy.o
-obj-$(CONFIG_JOYSTICK_WARRIOR)		+= warrior.o
-obj-$(CONFIG_JOYSTICK_XPAD)		+= xpad.o
-obj-$(CONFIG_JOYSTICK_ZHENHUA)		+= zhenhua.o
-obj-$(CONFIG_JOYSTICK_WALKERA0701)	+= walkera0701.o
-
+MC_SEQ_RD_CTL_D1_LP__RCV_DLY__SHIFT 0x0
+#define MC_SEQ_RD_CTL_D1_LP__RCV_EXT_MASK 0xf8
+#define MC_SEQ_RD_CTL_D1_LP__RCV_EXT__SHIFT 0x3
+#define MC_SEQ_RD_CTL_D1_LP__RST_SEL_MASK 0x300
+#define MC_SEQ_RD_CTL_D1_LP__RST_SEL__SHIFT 0x8
+#define MC_SEQ_RD_CTL_D1_LP__RXDPWRON_DLY_MASK 0xc00
+#define MC_SEQ_RD_CTL_D1_LP__RXDPWRON_DLY__SHIFT 0xa
+#define MC_SEQ_RD_CTL_D1_LP__RST_HLD_MASK 0xf000
+#define MC_SEQ_RD_CTL_D1_LP__RST_HLD__SHIFT 0xc
+#define MC_SEQ_RD_CTL_D1_LP__STR_PRE_MASK 0x10000
+#define MC_SEQ_RD_CTL_D1_LP__STR_PRE__SHIFT 0x10
+#define MC_SEQ_RD_CTL_D1_LP__STR_PST_MASK 0x20000
+#define MC_SEQ_RD_CTL_D1_LP__STR_PST__SHIFT 0x11
+#define MC_SEQ_RD_CTL_D1_LP__RBS_DLY_MASK 0x1f00000
+#define MC_SEQ_RD_CTL_D1_LP__RBS_DLY__SHIFT 0x14
+#define MC_SEQ_RD_CTL_D1_LP__RBS_WEDC_DLY_MASK 0x3e000000
+#define MC_SEQ_RD_CTL_D1_LP__RBS_WEDC_DLY__SHIFT 0x19
+#define MC_SEQ_WR_CTL_D0_LP__DAT_DLY_MASK 0xf
+#define MC_SEQ_WR_CTL_D0_LP__DAT_DLY__SHIFT 0x0
+#define MC_SEQ_WR_CTL_D0_LP__DQS_DLY_MASK 0xf0
+#define MC_SEQ_WR_CTL_D0_LP__DQS_DLY__SHIFT 0x4
+#define MC_SEQ_WR_CTL_D0_LP__DQS_XTR_MASK 0x100
+#define MC_SEQ_WR_CTL_D0_LP__DQS_XTR__SHIFT 0x8
+#define MC_SEQ_WR_CTL_D0_LP__DAT_2Y_DLY_MASK 0x200
+#define MC_SEQ_WR_CTL_D0_LP__DAT_2Y_DLY__SHIFT 0x9
+#define MC_SEQ_WR_CTL_D0_LP__ADR_2Y_DLY_MASK 0x400
+#define MC_SEQ_WR_CTL_D0_LP__ADR_2Y_DLY__SHIFT

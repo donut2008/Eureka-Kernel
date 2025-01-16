@@ -1,27 +1,11 @@
-#ifndef _PHY_GENERIC_H_
-#define _PHY_GENERIC_H_
-
-#include <linux/usb/usb_phy_generic.h>
-#include <linux/gpio/consumer.h>
-#include <linux/regulator/consumer.h>
-
-struct usb_phy_generic {
-	struct usb_phy phy;
-	struct device *dev;
-	struct clk *clk;
-	struct regulator *vcc;
-	struct gpio_desc *gpiod_reset;
-	struct gpio_desc *gpiod_vbus;
-	struct regulator *vbus_draw;
-	bool vbus_draw_enabled;
-	unsigned long mA;
-	unsigned int vbus;
-};
-
-int usb_gen_phy_init(struct usb_phy *phy);
-void usb_gen_phy_shutdown(struct usb_phy *phy);
-
-int usb_phy_gen_create_phy(struct device *dev, struct usb_phy_generic *nop,
-		struct usb_phy_generic_platform_data *pdata);
-
-#endif
+EC_DEBUG__DISABLE_FORMAT_COMPARISON_MASK 0x3f
+#define AZALIA_F0_CODEC_DEBUG__DISABLE_FORMAT_COMPARISON__SHIFT 0x0
+#define AZALIA_F0_CODEC_DEBUG__CODEC_DEBUG_MASK 0xffffffc0
+#define AZALIA_F0_CODEC_DEBUG__CODEC_DEBUG__SHIFT 0x6
+#define AZALIA_F0_GTC_GROUP_OFFSET0__GTC_GROUP_OFFSET0_MASK 0xffffffff
+#define AZALIA_F0_GTC_GROUP_OFFSET0__GTC_GROUP_OFFSET0__SHIFT 0x0
+#define AZALIA_F0_GTC_GROUP_OFFSET1__GTC_GROUP_OFFSET1_MASK 0xffffffff
+#define AZALIA_F0_GTC_GROUP_OFFSET1__GTC_GROUP_OFFSET1__SHIFT 0x0
+#define AZALIA_F0_GTC_GROUP_OFFSET2__GTC_GROUP_OFFSET2_MASK 0xffffffff
+#define AZALIA_F0_GTC_GROUP_OFFSET2__GTC_GROUP_OFFSET2__SHIFT 0x0
+#define AZALIA_F

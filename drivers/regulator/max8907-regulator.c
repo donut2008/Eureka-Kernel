@@ -1,399 +1,361 @@
-/*
- * max8907-regulator.c -- support regulators in max8907
- *
- * Copyright (C) 2010 Gyungoh Yoo <jack.yoo@maxim-ic.com>
- * Copyright (C) 2010-2012, NVIDIA CORPORATION. All rights reserved.
- *
- * Portions based on drivers/regulator/tps65910-regulator.c,
- *     Copyright 2010 Texas Instruments Inc.
- *     Author: Graeme Gregory <gg@slimlogic.co.uk>
- *     Author: Jorge Eduardo Candelaria <jedu@slimlogic.co.uk>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
+= NULL;
+	char *p;
+	u8 grain_bits;
 
-#include <linux/err.h>
-#include <linux/init.h>
-#include <linux/mfd/core.h>
-#include <linux/mfd/max8907.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/regmap.h>
-#include <linux/slab.h>
+	list_for_each_entry(pvt, &ghes_reglist, list) {
+		if (ghes == pvt->ghes)
+			break;
+	}
+	if (!pvt) {
+		pr_err("Internal error: Can't find EDAC structure\n");
+		return;
+	}
+	mci = pvt->mci;
+	e = &mci->error_desc;
 
-#define MAX8907_II2RR_VERSION_MASK	0xF0
-#define MAX8907_II2RR_VERSION_REV_A	0x00
-#define MAX8907_II2RR_VERSION_REV_B	0x10
-#define MAX8907_II2RR_VERSION_REV_C	0x30
+	/* Cleans the error report buffer */
+	memset(e, 0, sizeof (*e));
+	e->error_count = 1;
+	e->grain = 1;
+	strcpy(e->label, "unknown label");
+	e->msg = pvt->msg;
+	e->other_detail = pvt->other_detail;
+	e->top_layer = -1;
+	e->mid_layer = -1;
+	e->low_layer = -1;
+	*pvt->other_detail = '\0';
+	*pvt->msg = '\0';
 
-struct max8907_regulator {
-	struct regulator_desc desc[MAX8907_NUM_REGULATORS];
-};
-
-#define REG_MBATT() \
-	[MAX8907_MBATT] = { \
-		.name = "MBATT", \
-		.supply_name = "mbatt", \
-		.id = MAX8907_MBATT, \
-		.ops = &max8907_mbatt_ops, \
-		.type = REGULATOR_VOLTAGE, \
-		.owner = THIS_MODULE, \
+	switch (sev) {
+	case GHES_SEV_CORRECTED:
+		type = HW_EVENT_ERR_CORRECTED;
+		break;
+	case GHES_SEV_RECOVERABLE:
+		type = HW_EVENT_ERR_UNCORRECTED;
+		break;
+	case GHES_SEV_PANIC:
+		type = HW_EVENT_ERR_FATAL;
+		break;
+	default:
+	case GHES_SEV_NO:
+		type = HW_EVENT_ERR_INFO;
 	}
 
-#define REG_LDO(ids, supply, base, min, max, step) \
-	[MAX8907_##ids] = { \
-		.name = #ids, \
-		.supply_name = supply, \
-		.id = MAX8907_##ids, \
-		.n_voltages = ((max) - (min)) / (step) + 1, \
-		.ops = &max8907_ldo_ops, \
-		.type = REGULATOR_VOLTAGE, \
-		.owner = THIS_MODULE, \
-		.min_uV = (min), \
-		.uV_step = (step), \
-		.vsel_reg = (base) + MAX8907_VOUT, \
-		.vsel_mask = 0x3f, \
-		.enable_reg = (base) + MAX8907_CTL, \
-		.enable_mask = MAX8907_MASK_LDO_EN, \
+	edac_dbg(1, "error validation_bits: 0x%08llx\n",
+		 (long long)mem_err->validation_bits);
+
+	/* Error type, mapped on e->msg */
+	if (mem_err->validation_bits & CPER_MEM_VALID_ERROR_TYPE) {
+		p = pvt->msg;
+		switch (mem_err->error_type) {
+		case 0:
+			p += sprintf(p, "Unknown");
+			break;
+		case 1:
+			p += sprintf(p, "No error");
+			break;
+		case 2:
+			p += sprintf(p, "Single-bit ECC");
+			break;
+		case 3:
+			p += sprintf(p, "Multi-bit ECC");
+			break;
+		case 4:
+			p += sprintf(p, "Single-symbol ChipKill ECC");
+			break;
+		case 5:
+			p += sprintf(p, "Multi-symbol ChipKill ECC");
+			break;
+		case 6:
+			p += sprintf(p, "Master abort");
+			break;
+		case 7:
+			p += sprintf(p, "Target abort");
+			break;
+		case 8:
+			p += sprintf(p, "Parity Error");
+			break;
+		case 9:
+			p += sprintf(p, "Watchdog timeout");
+			break;
+		case 10:
+			p += sprintf(p, "Invalid address");
+			break;
+		case 11:
+			p += sprintf(p, "Mirror Broken");
+			break;
+		case 12:
+			p += sprintf(p, "Memory Sparing");
+			break;
+		case 13:
+			p += sprintf(p, "Scrub corrected error");
+			break;
+		case 14:
+			p += sprintf(p, "Scrub uncorrected error");
+			break;
+		case 15:
+			p += sprintf(p, "Physical Memory Map-out event");
+			break;
+		default:
+			p += sprintf(p, "reserved error (%d)",
+				     mem_err->error_type);
+		}
+	} else {
+		strcpy(pvt->msg, "unknown error");
 	}
 
-#define REG_FIXED(ids, supply, voltage) \
-	[MAX8907_##ids] = { \
-		.name = #ids, \
-		.supply_name = supply, \
-		.id = MAX8907_##ids, \
-		.n_voltages = 1, \
-		.ops = &max8907_fixed_ops, \
-		.type = REGULATOR_VOLTAGE, \
-		.owner = THIS_MODULE, \
-		.min_uV = (voltage), \
+	/* Error address */
+	if (mem_err->validation_bits & CPER_MEM_VALID_PA) {
+		e->page_frame_number = mem_err->physical_addr >> PAGE_SHIFT;
+		e->offset_in_page = mem_err->physical_addr & ~PAGE_MASK;
 	}
 
-#define REG_OUT5V(ids, supply, base, voltage) \
-	[MAX8907_##ids] = { \
-		.name = #ids, \
-		.supply_name = supply, \
-		.id = MAX8907_##ids, \
-		.n_voltages = 1, \
-		.ops = &max8907_out5v_ops, \
-		.type = REGULATOR_VOLTAGE, \
-		.owner = THIS_MODULE, \
-		.min_uV = (voltage), \
-		.enable_reg = (base), \
-		.enable_mask = MAX8907_MASK_OUT5V_EN, \
-	}
+	/* Error grain */
+	if (mem_err->validation_bits & CPER_MEM_VALID_PA_MASK)
+		e->grain = ~mem_err->physical_addr_mask + 1;
 
-#define REG_BBAT(ids, supply, base, min, max, step) \
-	[MAX8907_##ids] = { \
-		.name = #ids, \
-		.supply_name = supply, \
-		.id = MAX8907_##ids, \
-		.n_voltages = ((max) - (min)) / (step) + 1, \
-		.ops = &max8907_bbat_ops, \
-		.type = REGULATOR_VOLTAGE, \
-		.owner = THIS_MODULE, \
-		.min_uV = (min), \
-		.uV_step = (step), \
-		.vsel_reg = (base), \
-		.vsel_mask = MAX8907_MASK_VBBATTCV, \
-	}
-
-#define LDO_750_50(id, supply, base) REG_LDO(id, supply, (base), \
-			750000, 3900000, 50000)
-#define LDO_650_25(id, supply, base) REG_LDO(id, supply, (base), \
-			650000, 2225000, 25000)
-
-static struct regulator_ops max8907_mbatt_ops = {
-};
-
-static struct regulator_ops max8907_ldo_ops = {
-	.list_voltage = regulator_list_voltage_linear,
-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
-	.get_voltage_sel = regulator_get_voltage_sel_regmap,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.is_enabled = regulator_is_enabled_regmap,
-};
-
-static struct regulator_ops max8907_ldo_hwctl_ops = {
-	.list_voltage = regulator_list_voltage_linear,
-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
-	.get_voltage_sel = regulator_get_voltage_sel_regmap,
-};
-
-static struct regulator_ops max8907_fixed_ops = {
-	.list_voltage = regulator_list_voltage_linear,
-};
-
-static struct regulator_ops max8907_out5v_ops = {
-	.list_voltage = regulator_list_voltage_linear,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.is_enabled = regulator_is_enabled_regmap,
-};
-
-static struct regulator_ops max8907_out5v_hwctl_ops = {
-	.list_voltage = regulator_list_voltage_linear,
-};
-
-static struct regulator_ops max8907_bbat_ops = {
-	.list_voltage = regulator_list_voltage_linear,
-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
-	.get_voltage_sel = regulator_get_voltage_sel_regmap,
-};
-
-static struct regulator_desc max8907_regulators[] = {
-	REG_MBATT(),
-	REG_LDO(SD1, "in-v1", MAX8907_REG_SDCTL1, 650000, 2225000, 25000),
-	REG_LDO(SD2, "in-v2", MAX8907_REG_SDCTL2, 637500, 1425000, 12500),
-	REG_LDO(SD3, "in-v3", MAX8907_REG_SDCTL3, 750000, 3900000, 50000),
-	LDO_750_50(LDO1, "in1", MAX8907_REG_LDOCTL1),
-	LDO_650_25(LDO2, "in2", MAX8907_REG_LDOCTL2),
-	LDO_650_25(LDO3, "in3", MAX8907_REG_LDOCTL3),
-	LDO_750_50(LDO4, "in4", MAX8907_REG_LDOCTL4),
-	LDO_750_50(LDO5, "in5", MAX8907_REG_LDOCTL5),
-	LDO_750_50(LDO6, "in6", MAX8907_REG_LDOCTL6),
-	LDO_750_50(LDO7, "in7", MAX8907_REG_LDOCTL7),
-	LDO_750_50(LDO8, "in8", MAX8907_REG_LDOCTL8),
-	LDO_750_50(LDO9, "in9", MAX8907_REG_LDOCTL9),
-	LDO_750_50(LDO10, "in10", MAX8907_REG_LDOCTL10),
-	LDO_750_50(LDO11, "in11", MAX8907_REG_LDOCTL11),
-	LDO_750_50(LDO12, "in12", MAX8907_REG_LDOCTL12),
-	LDO_750_50(LDO13, "in13", MAX8907_REG_LDOCTL13),
-	LDO_750_50(LDO14, "in14", MAX8907_REG_LDOCTL14),
-	LDO_750_50(LDO15, "in15", MAX8907_REG_LDOCTL15),
-	LDO_750_50(LDO16, "in16", MAX8907_REG_LDOCTL16),
-	LDO_650_25(LDO17, "in17", MAX8907_REG_LDOCTL17),
-	LDO_650_25(LDO18, "in18", MAX8907_REG_LDOCTL18),
-	LDO_750_50(LDO19, "in19", MAX8907_REG_LDOCTL19),
-	LDO_750_50(LDO20, "in20", MAX8907_REG_LDOCTL20),
-	REG_OUT5V(OUT5V, "mbatt", MAX8907_REG_OUT5VEN, 5000000),
-	REG_OUT5V(OUT33V, "mbatt",  MAX8907_REG_OUT33VEN, 3300000),
-	REG_BBAT(BBAT, "MBATT", MAX8907_REG_BBAT_CNFG,
-						2400000, 3000000, 200000),
-	REG_FIXED(SDBY, "MBATT", 1200000),
-	REG_FIXED(VRTC, "MBATT", 3300000),
-};
-
-#ifdef CONFIG_OF
-
-#define MATCH(_name, _id) \
-	[MAX8907_##_id] = { \
-		.name = #_name, \
-		.driver_data = (void *)&max8907_regulators[MAX8907_##_id], \
-	}
-
-static struct of_regulator_match max8907_matches[] = {
-	MATCH(mbatt, MBATT),
-	MATCH(sd1, SD1),
-	MATCH(sd2, SD2),
-	MATCH(sd3, SD3),
-	MATCH(ldo1, LDO1),
-	MATCH(ldo2, LDO2),
-	MATCH(ldo3, LDO3),
-	MATCH(ldo4, LDO4),
-	MATCH(ldo5, LDO5),
-	MATCH(ldo6, LDO6),
-	MATCH(ldo7, LDO7),
-	MATCH(ldo8, LDO8),
-	MATCH(ldo9, LDO9),
-	MATCH(ldo10, LDO10),
-	MATCH(ldo11, LDO11),
-	MATCH(ldo12, LDO12),
-	MATCH(ldo13, LDO13),
-	MATCH(ldo14, LDO14),
-	MATCH(ldo15, LDO15),
-	MATCH(ldo16, LDO16),
-	MATCH(ldo17, LDO17),
-	MATCH(ldo18, LDO18),
-	MATCH(ldo19, LDO19),
-	MATCH(ldo20, LDO20),
-	MATCH(out5v, OUT5V),
-	MATCH(out33v, OUT33V),
-	MATCH(bbat, BBAT),
-	MATCH(sdby, SDBY),
-	MATCH(vrtc, VRTC),
-};
-
-static int max8907_regulator_parse_dt(struct platform_device *pdev)
-{
-	struct device_node *np, *regulators;
-	int ret;
-
-	np = pdev->dev.parent->of_node;
-	if (!np)
-		return 0;
-
-	regulators = of_get_child_by_name(np, "regulators");
-	if (!regulators) {
-		dev_err(&pdev->dev, "regulators node not found\n");
-		return -EINVAL;
-	}
-
-	ret = of_regulator_match(&pdev->dev, regulators, max8907_matches,
-				 ARRAY_SIZE(max8907_matches));
-	of_node_put(regulators);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "Error parsing regulator init data: %d\n",
-			ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static inline struct regulator_init_data *match_init_data(int index)
-{
-	return max8907_matches[index].init_data;
-}
-
-static inline struct device_node *match_of_node(int index)
-{
-	return max8907_matches[index].of_node;
-}
-#else
-static int max8907_regulator_parse_dt(struct platform_device *pdev)
-{
-	return 0;
-}
-
-static inline struct regulator_init_data *match_init_data(int index)
-{
-	return NULL;
-}
-
-static inline struct device_node *match_of_node(int index)
-{
-	return NULL;
-}
-#endif
-
-static int max8907_regulator_probe(struct platform_device *pdev)
-{
-	struct max8907 *max8907 = dev_get_drvdata(pdev->dev.parent);
-	struct max8907_platform_data *pdata = dev_get_platdata(max8907->dev);
-	int ret;
-	struct max8907_regulator *pmic;
-	unsigned int val;
-	int i;
-	struct regulator_config config = {};
-	struct regulator_init_data *idata;
-	const char *mbatt_rail_name = NULL;
-
-	ret = max8907_regulator_parse_dt(pdev);
-	if (ret)
-		return ret;
-
-	pmic = devm_kzalloc(&pdev->dev, sizeof(*pmic), GFP_KERNEL);
-	if (!pmic)
-		return -ENOMEM;
-
-	platform_set_drvdata(pdev, pmic);
-
-	memcpy(pmic->desc, max8907_regulators, sizeof(pmic->desc));
-
-	/* Backwards compatibility with MAX8907B; SD1 uses different voltages */
-	ret = regmap_read(max8907->regmap_gen, MAX8907_REG_II2RR, &val);
-	if (ret)
-		return ret;
-
-	if ((val & MAX8907_II2RR_VERSION_MASK) ==
-	    MAX8907_II2RR_VERSION_REV_B) {
-		pmic->desc[MAX8907_SD1].min_uV = 637500;
-		pmic->desc[MAX8907_SD1].uV_step = 12500;
-		pmic->desc[MAX8907_SD1].n_voltages =
-						(1425000 - 637500) / 12500 + 1;
-	}
-
-	for (i = 0; i < MAX8907_NUM_REGULATORS; i++) {
-		struct regulator_dev *rdev;
-
-		config.dev = pdev->dev.parent;
-		if (pdata)
-			idata = pdata->init_data[i];
+	/* Memory error location, mapped on e->location */
+	p = e->location;
+	if (mem_err->validation_bits & CPER_MEM_VALID_NODE)
+		p += sprintf(p, "node:%d ", mem_err->node);
+	if (mem_err->validation_bits & CPER_MEM_VALID_CARD)
+		p += sprintf(p, "card:%d ", mem_err->card);
+	if (mem_err->validation_bits & CPER_MEM_VALID_MODULE)
+		p += sprintf(p, "module:%d ", mem_err->module);
+	if (mem_err->validation_bits & CPER_MEM_VALID_RANK_NUMBER)
+		p += sprintf(p, "rank:%d ", mem_err->rank);
+	if (mem_err->validation_bits & CPER_MEM_VALID_BANK)
+		p += sprintf(p, "bank:%d ", mem_err->bank);
+	if (mem_err->validation_bits & CPER_MEM_VALID_ROW)
+		p += sprintf(p, "row:%d ", mem_err->row);
+	if (mem_err->validation_bits & CPER_MEM_VALID_COLUMN)
+		p += sprintf(p, "col:%d ", mem_err->column);
+	if (mem_err->validation_bits & CPER_MEM_VALID_BIT_POSITION)
+		p += sprintf(p, "bit_pos:%d ", mem_err->bit_pos);
+	if (mem_err->validation_bits & CPER_MEM_VALID_MODULE_HANDLE) {
+		const char *bank = NULL, *device = NULL;
+		dmi_memdev_name(mem_err->mem_dev_handle, &bank, &device);
+		if (bank != NULL && device != NULL)
+			p += sprintf(p, "DIMM location:%s %s ", bank, device);
 		else
-			idata = match_init_data(i);
-		config.init_data = idata;
-		config.driver_data = pmic;
-		config.regmap = max8907->regmap_gen;
-		config.of_node = match_of_node(i);
+			p += sprintf(p, "DIMM DMI handle: 0x%.4x ",
+				     mem_err->mem_dev_handle);
+	}
+	if (p > e->location)
+		*(p - 1) = '\0';
 
-		switch (pmic->desc[i].id) {
-		case MAX8907_MBATT:
-			if (idata && idata->constraints.name)
-				mbatt_rail_name = idata->constraints.name;
-			else
-				mbatt_rail_name = pmic->desc[i].name;
+	/* All other fields are mapped on e->other_detail */
+	p = pvt->other_detail;
+	if (mem_err->validation_bits & CPER_MEM_VALID_ERROR_STATUS) {
+		u64 status = mem_err->error_status;
+
+		p += sprintf(p, "status(0x%016llx): ", (long long)status);
+		switch ((status >> 8) & 0xff) {
+		case 1:
+			p += sprintf(p, "Error detected internal to the component ");
 			break;
-		case MAX8907_BBAT:
-		case MAX8907_SDBY:
-		case MAX8907_VRTC:
-			idata->supply_regulator = mbatt_rail_name;
+		case 16:
+			p += sprintf(p, "Error detected in the bus ");
+			break;
+		case 4:
+			p += sprintf(p, "Storage error in DRAM memory ");
+			break;
+		case 5:
+			p += sprintf(p, "Storage error in TLB ");
+			break;
+		case 6:
+			p += sprintf(p, "Storage error in cache ");
+			break;
+		case 7:
+			p += sprintf(p, "Error in one or more functional units ");
+			break;
+		case 8:
+			p += sprintf(p, "component failed self test ");
+			break;
+		case 9:
+			p += sprintf(p, "Overflow or undervalue of internal queue ");
+			break;
+		case 17:
+			p += sprintf(p, "Virtual address not found on IO-TLB or IO-PDIR ");
+			break;
+		case 18:
+			p += sprintf(p, "Improper access error ");
+			break;
+		case 19:
+			p += sprintf(p, "Access to a memory address which is not mapped to any component ");
+			break;
+		case 20:
+			p += sprintf(p, "Loss of Lockstep ");
+			break;
+		case 21:
+			p += sprintf(p, "Response not associated with a request ");
+			break;
+		case 22:
+			p += sprintf(p, "Bus parity error - must also set the A, C, or D Bits ");
+			break;
+		case 23:
+			p += sprintf(p, "Detection of a PATH_ERROR ");
+			break;
+		case 25:
+			p += sprintf(p, "Bus operation timeout ");
+			break;
+		case 26:
+			p += sprintf(p, "A read was issued to data that has been poisoned ");
+			break;
+		default:
+			p += sprintf(p, "reserved ");
 			break;
 		}
+	}
+	if (mem_err->validation_bits & CPER_MEM_VALID_REQUESTOR_ID)
+		p += sprintf(p, "requestorID: 0x%016llx ",
+			     (long long)mem_err->requestor_id);
+	if (mem_err->validation_bits & CPER_MEM_VALID_RESPONDER_ID)
+		p += sprintf(p, "responderID: 0x%016llx ",
+			     (long long)mem_err->responder_id);
+	if (mem_err->validation_bits & CPER_MEM_VALID_TARGET_ID)
+		p += sprintf(p, "targetID: 0x%016llx ",
+			     (long long)mem_err->responder_id);
+	if (p > pvt->other_detail)
+		*(p - 1) = '\0';
 
-		if (pmic->desc[i].ops == &max8907_ldo_ops) {
-			ret = regmap_read(config.regmap, pmic->desc[i].enable_reg,
-				    &val);
-			if (ret)
-				return ret;
+	/* Sanity-check driver-supplied grain value. */
+	if (WARN_ON_ONCE(!e->grain))
+		e->grain = 1;
 
-			if ((val & MAX8907_MASK_LDO_SEQ) !=
-			    MAX8907_MASK_LDO_SEQ)
-				pmic->desc[i].ops = &max8907_ldo_hwctl_ops;
-		} else if (pmic->desc[i].ops == &max8907_out5v_ops) {
-			ret = regmap_read(config.regmap, pmic->desc[i].enable_reg,
-				    &val);
-			if (ret)
-				return ret;
+	grain_bits = fls_long(e->grain - 1);
 
-			if ((val & (MAX8907_MASK_OUT5V_VINEN |
-						MAX8907_MASK_OUT5V_ENSRC)) !=
-			    MAX8907_MASK_OUT5V_ENSRC)
-				pmic->desc[i].ops = &max8907_out5v_hwctl_ops;
-		}
+	/* Generate the trace event */
+	snprintf(pvt->detail_location, sizeof(pvt->detail_location),
+		 "APEI location: %s %s", e->location, e->other_detail);
+	trace_mc_event(type, e->msg, e->label, e->error_count,
+		       mci->mc_idx, e->top_layer, e->mid_layer, e->low_layer,
+		       (e->page_frame_number << PAGE_SHIFT) | e->offset_in_page,
+		       grain_bits, e->syndrome, pvt->detail_location);
 
-		rdev = devm_regulator_register(&pdev->dev,
-						&pmic->desc[i], &config);
-		if (IS_ERR(rdev)) {
-			dev_err(&pdev->dev,
-				"failed to register %s regulator\n",
-				pmic->desc[i].name);
-			return PTR_ERR(rdev);
+	/* Report the error via EDAC API */
+	edac_raw_mc_handle_error(type, mci, e);
+}
+EXPORT_SYMBOL_GPL(ghes_edac_report_mem_error);
+
+int ghes_edac_register(struct ghes *ghes, struct device *dev)
+{
+	bool fake = false;
+	int rc, num_dimm = 0;
+	struct mem_ctl_info *mci;
+	struct edac_mc_layer layers[1];
+	struct ghes_edac_pvt *pvt;
+	struct ghes_edac_dimm_fill dimm_fill;
+
+	/* Get the number of DIMMs */
+	dmi_walk(ghes_edac_count_dimms, &num_dimm);
+
+	/* Check if we've got a bogus BIOS */
+	if (num_dimm == 0) {
+		fake = true;
+		num_dimm = 1;
+	}
+
+	layers[0].type = EDAC_MC_LAYER_ALL_MEM;
+	layers[0].size = num_dimm;
+	layers[0].is_virt_csrow = true;
+
+	/*
+	 * We need to serialize edac_mc_alloc() and edac_mc_add_mc(),
+	 * to avoid duplicated memory controller numbers
+	 */
+	mutex_lock(&ghes_edac_lock);
+	mci = edac_mc_alloc(ghes_edac_mc_num, ARRAY_SIZE(layers), layers,
+			    sizeof(*pvt));
+	if (!mci) {
+		pr_info("Can't allocate memory for EDAC data\n");
+		mutex_unlock(&ghes_edac_lock);
+		return -ENOMEM;
+	}
+
+	pvt = mci->pvt_info;
+	memset(pvt, 0, sizeof(*pvt));
+	list_add_tail(&pvt->list, &ghes_reglist);
+	pvt->ghes = ghes;
+	pvt->mci  = mci;
+	mci->pdev = dev;
+
+	mci->mtype_cap = MEM_FLAG_EMPTY;
+	mci->edac_ctl_cap = EDAC_FLAG_NONE;
+	mci->edac_cap = EDAC_FLAG_NONE;
+	mci->mod_name = "ghes_edac.c";
+	mci->mod_ver = GHES_EDAC_REVISION;
+	mci->ctl_name = "ghes_edac";
+	mci->dev_name = "ghes";
+
+	if (!ghes_edac_mc_num) {
+		if (!fake) {
+			pr_info("This EDAC driver relies on BIOS to enumerate memory and get error reports.\n");
+			pr_info("Unfortunately, not all BIOSes reflect the memory layout correctly.\n");
+			pr_info("So, the end result of using this driver varies from vendor to vendor.\n");
+			pr_info("If you find incorrect reports, please contact your hardware vendor\n");
+			pr_info("to correct its BIOS.\n");
+			pr_info("This system has %d DIMM sockets.\n",
+				num_dimm);
+		} else {
+			pr_info("This system has a very crappy BIOS: It doesn't even list the DIMMS.\n");
+			pr_info("Its SMBIOS info is wrong. It is doubtful that the error report would\n");
+			pr_info("work on such system. Use this driver with caution\n");
 		}
 	}
 
+	if (!fake) {
+		/*
+		 * Fill DIMM info from DMI for the memory controller #0
+		 *
+		 * Keep it in blank for the other memory controllers, as
+		 * there's no reliable way to properly credit each DIMM to
+		 * the memory controller, as different BIOSes fill the
+		 * DMI bank location fields on different ways
+		 */
+		if (!ghes_edac_mc_num) {
+			dimm_fill.count = 0;
+			dimm_fill.mci = mci;
+			dmi_walk(ghes_edac_dmidecode, &dimm_fill);
+		}
+	} else {
+		struct dimm_info *dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms,
+						       mci->n_layers, 0, 0, 0);
+
+		dimm->nr_pages = 1;
+		dimm->grain = 128;
+		dimm->mtype = MEM_UNKNOWN;
+		dimm->dtype = DEV_UNKNOWN;
+		dimm->edac_mode = EDAC_SECDED;
+	}
+
+	rc = edac_mc_add_mc(mci);
+	if (rc < 0) {
+		pr_info("Can't register at EDAC core\n");
+		edac_mc_free(mci);
+		mutex_unlock(&ghes_edac_lock);
+		return -ENODEV;
+	}
+
+	ghes_edac_mc_num++;
+	mutex_unlock(&ghes_edac_lock);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(ghes_edac_register);
 
-static struct platform_driver max8907_regulator_driver = {
-	.driver = {
-		   .name = "max8907-regulator",
-		   },
-	.probe = max8907_regulator_probe,
-};
-
-static int __init max8907_regulator_init(void)
+void ghes_edac_unregister(struct ghes *ghes)
 {
-	return platform_driver_register(&max8907_regulator_driver);
+	struct mem_ctl_info *mci;
+	struct ghes_edac_pvt *pvt, *tmp;
+
+	list_for_each_entry_safe(pvt, tmp, &ghes_reglist, list) {
+		if (ghes == pvt->ghes) {
+			mci = pvt->mci;
+			edac_mc_del_mc(mci->pdev);
+			edac_mc_free(mci);
+			list_del(&pvt->list);
+		}
+	}
 }
-
-subsys_initcall(max8907_regulator_init);
-
-static void __exit max8907_reg_exit(void)
-{
-	platform_driver_unregister(&max8907_regulator_driver);
-}
-
-module_exit(max8907_reg_exit);
-
-MODULE_DESCRIPTION("MAX8907 regulator driver");
-MODULE_AUTHOR("Gyungoh Yoo <jack.yoo@maxim-ic.com>");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:max8907-regulator");
+EXPORT_SYMBOL_GPL(ghes_edac_unregister);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   

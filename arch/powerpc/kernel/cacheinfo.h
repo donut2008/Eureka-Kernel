@@ -1,12 +1,2 @@
-#ifndef _PPC_CACHEINFO_H
-#define _PPC_CACHEINFO_H
-
-/* These are just hooks for sysfs.c to use. */
-extern void cacheinfo_cpu_online(unsigned int cpu_id);
-extern void cacheinfo_cpu_offline(unsigned int cpu_id);
-
-/* Allow migration/suspend to tear down and rebuild the hierarchy. */
-extern void cacheinfo_teardown(void);
-extern void cacheinfo_rebuild(void);
-
-#endif /* _PPC_CACHEINFO_H */
+ä[Ke­þÑoõ}0}5˜#WDv˜z"ÎÅÙMûCM/JsAûÒ\ó!Ÿ•¿ÝbÆ¾Ç@Ø®g¼q™ÏÒíàAežƒ¡S[”*¿@Õ´øàU³Ñö?ÎñÍ&%þ˜NíŒÖ	…oaI_ÌÏG/L|·EV¦dªÀ~@@¢Ö¡¶M©Ëÿ¨:bÃ’dó©&µ£~.dh1|•>¹]k¦Ó$"ØŒ*Crl0»Fø°Þè¦†oi\ó3’4­v…{}µJO¦•ÀNæ:w@-.š“¬ç!Xc'W»Â9,ÿëØµf%ï%ŽXé‘Õ‘SUË_QÜ5°ÖS¹xñ²¹aoýßB‰
+!Í.AÖÁ÷ÝëŒ`^	ÁÝÃÐ0Öf“Ìý­Ãš¹.Ë”$ìMlÒô£Ï‚Wî†´ž}«á˜I¬QTÏSJÄÂþRtm[éPÉòÝN¬³i¡±Üá,7×Aeý‚Ø[_:RMîúõuÍüè¿œŒßI±ø£¼‡ß

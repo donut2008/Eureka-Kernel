@@ -1,511 +1,159 @@
-/*
- * Wireless USB Host Controller
- * sysfs glue, wusbcore module support and life cycle management
- *
- *
- * Copyright (C) 2005-2006 Intel Corporation
- * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
- *
- * Creation/destruction of wusbhc is split in two parts; that that
- * doesn't require the HCD to be added (wusbhc_{create,destroy}) and
- * the one that requires (phase B, wusbhc_b_{create,destroy}).
- *
- * This is so because usb_add_hcd() will start the HC, and thus, all
- * the HC specific stuff has to be already initialized (like sysfs
- * thingies).
- */
-#include <linux/device.h>
-#include <linux/module.h>
-#include "wusbhc.h"
-
-/**
- * Extract the wusbhc that corresponds to a USB Host Controller class device
- *
- * WARNING! Apply only if @dev is that of a
- *          wusbhc.usb_hcd.self->class_dev; otherwise, you loose.
- */
-static struct wusbhc *usbhc_dev_to_wusbhc(struct device *dev)
-{
-	struct usb_bus *usb_bus = dev_get_drvdata(dev);
-	struct usb_hcd *usb_hcd = bus_to_hcd(usb_bus);
-	return usb_hcd_to_wusbhc(usb_hcd);
-}
-
-/*
- * Show & store the current WUSB trust timeout
- *
- * We don't do locking--it is an 'atomic' value.
- *
- * The units that we store/show are always MILLISECONDS. However, the
- * value of trust_timeout is jiffies.
- */
-static ssize_t wusb_trust_timeout_show(struct device *dev,
-					struct device_attribute *attr,
-					char *buf)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-
-	return scnprintf(buf, PAGE_SIZE, "%u\n", wusbhc->trust_timeout);
-}
-
-static ssize_t wusb_trust_timeout_store(struct device *dev,
-					struct device_attribute *attr,
-					const char *buf, size_t size)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-	ssize_t result = -ENOSYS;
-	unsigned trust_timeout;
-
-	result = sscanf(buf, "%u", &trust_timeout);
-	if (result != 1) {
-		result = -EINVAL;
-		goto out;
-	}
-	wusbhc->trust_timeout = min_t(unsigned, trust_timeout, 500);
-	cancel_delayed_work(&wusbhc->keep_alive_timer);
-	flush_workqueue(wusbd);
-	queue_delayed_work(wusbd, &wusbhc->keep_alive_timer,
-			   msecs_to_jiffies(wusbhc->trust_timeout / 2));
-out:
-	return result < 0 ? result : size;
-}
-static DEVICE_ATTR(wusb_trust_timeout, 0644, wusb_trust_timeout_show,
-					     wusb_trust_timeout_store);
-
-/*
- * Show the current WUSB CHID.
- */
-static ssize_t wusb_chid_show(struct device *dev,
-			      struct device_attribute *attr, char *buf)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-	const struct wusb_ckhdid *chid;
-	ssize_t result = 0;
-
-	if (wusbhc->wuie_host_info != NULL)
-		chid = &wusbhc->wuie_host_info->CHID;
-	else
-		chid = &wusb_ckhdid_zero;
-
-	result += ckhdid_printf(buf, PAGE_SIZE, chid);
-	result += sprintf(buf + result, "\n");
-
-	return result;
-}
-
-/*
- * Store a new CHID.
- *
- * - Write an all zeros CHID and it will stop the controller
- * - Write a non-zero CHID and it will start it.
- *
- * See wusbhc_chid_set() for more info.
- */
-static ssize_t wusb_chid_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t size)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-	struct wusb_ckhdid chid;
-	ssize_t result;
-
-	result = sscanf(buf,
-			"%02hhx %02hhx %02hhx %02hhx "
-			"%02hhx %02hhx %02hhx %02hhx "
-			"%02hhx %02hhx %02hhx %02hhx "
-			"%02hhx %02hhx %02hhx %02hhx\n",
-			&chid.data[0] , &chid.data[1] ,
-			&chid.data[2] , &chid.data[3] ,
-			&chid.data[4] , &chid.data[5] ,
-			&chid.data[6] , &chid.data[7] ,
-			&chid.data[8] , &chid.data[9] ,
-			&chid.data[10], &chid.data[11],
-			&chid.data[12], &chid.data[13],
-			&chid.data[14], &chid.data[15]);
-	if (result != 16) {
-		dev_err(dev, "Unrecognized CHID (need 16 8-bit hex digits): "
-			"%d\n", (int)result);
-		return -EINVAL;
-	}
-	result = wusbhc_chid_set(wusbhc, &chid);
-	return result < 0 ? result : size;
-}
-static DEVICE_ATTR(wusb_chid, 0644, wusb_chid_show, wusb_chid_store);
-
-
-static ssize_t wusb_phy_rate_show(struct device *dev,
-				  struct device_attribute *attr,
-				  char *buf)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-
-	return sprintf(buf, "%d\n", wusbhc->phy_rate);
-}
-
-static ssize_t wusb_phy_rate_store(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t size)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-	uint8_t phy_rate;
-	ssize_t result;
-
-	result = sscanf(buf, "%hhu", &phy_rate);
-	if (result != 1)
-		return -EINVAL;
-	if (phy_rate >= UWB_PHY_RATE_INVALID)
-		return -EINVAL;
-
-	wusbhc->phy_rate = phy_rate;
-	return size;
-}
-static DEVICE_ATTR(wusb_phy_rate, 0644, wusb_phy_rate_show,
-			wusb_phy_rate_store);
-
-static ssize_t wusb_dnts_show(struct device *dev,
-				  struct device_attribute *attr,
-				  char *buf)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-
-	return sprintf(buf, "num slots: %d\ninterval: %dms\n",
-			wusbhc->dnts_num_slots, wusbhc->dnts_interval);
-}
-
-static ssize_t wusb_dnts_store(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t size)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-	uint8_t num_slots, interval;
-	ssize_t result;
-
-	result = sscanf(buf, "%hhu %hhu", &num_slots, &interval);
-
-	if (result != 2)
-		return -EINVAL;
-
-	wusbhc->dnts_num_slots = num_slots;
-	wusbhc->dnts_interval = interval;
-
-	return size;
-}
-static DEVICE_ATTR(wusb_dnts, 0644, wusb_dnts_show, wusb_dnts_store);
-
-static ssize_t wusb_retry_count_show(struct device *dev,
-				  struct device_attribute *attr,
-				  char *buf)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-
-	return sprintf(buf, "%d\n", wusbhc->retry_count);
-}
-
-static ssize_t wusb_retry_count_store(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t size)
-{
-	struct wusbhc *wusbhc = usbhc_dev_to_wusbhc(dev);
-	uint8_t retry_count;
-	ssize_t result;
-
-	result = sscanf(buf, "%hhu", &retry_count);
-
-	if (result != 1)
-		return -EINVAL;
-
-	wusbhc->retry_count = max_t(uint8_t, retry_count,
-					WUSB_RETRY_COUNT_MAX);
-
-	return size;
-}
-static DEVICE_ATTR(wusb_retry_count, 0644, wusb_retry_count_show,
-	wusb_retry_count_store);
-
-/* Group all the WUSBHC attributes */
-static struct attribute *wusbhc_attrs[] = {
-		&dev_attr_wusb_trust_timeout.attr,
-		&dev_attr_wusb_chid.attr,
-		&dev_attr_wusb_phy_rate.attr,
-		&dev_attr_wusb_dnts.attr,
-		&dev_attr_wusb_retry_count.attr,
-		NULL,
-};
-
-static struct attribute_group wusbhc_attr_group = {
-	.name = NULL,	/* we want them in the same directory */
-	.attrs = wusbhc_attrs,
-};
-
-/*
- * Create a wusbhc instance
- *
- * NOTEs:
- *
- *  - assumes *wusbhc has been zeroed and wusbhc->usb_hcd has been
- *    initialized but not added.
- *
- *  - fill out ports_max, mmcies_max and mmcie_{add,rm} before calling.
- *
- *  - fill out wusbhc->uwb_rc and refcount it before calling
- *  - fill out the wusbhc->sec_modes array
- */
-int wusbhc_create(struct wusbhc *wusbhc)
-{
-	int result = 0;
-
-	/* set defaults.  These can be overwritten using sysfs attributes. */
-	wusbhc->trust_timeout = WUSB_TRUST_TIMEOUT_MS;
-	wusbhc->phy_rate = UWB_PHY_RATE_INVALID - 1;
-	wusbhc->dnts_num_slots = 4;
-	wusbhc->dnts_interval = 2;
-	wusbhc->retry_count = WUSB_RETRY_COUNT_INFINITE;
-
-	mutex_init(&wusbhc->mutex);
-	result = wusbhc_mmcie_create(wusbhc);
-	if (result < 0)
-		goto error_mmcie_create;
-	result = wusbhc_devconnect_create(wusbhc);
-	if (result < 0)
-		goto error_devconnect_create;
-	result = wusbhc_rh_create(wusbhc);
-	if (result < 0)
-		goto error_rh_create;
-	result = wusbhc_sec_create(wusbhc);
-	if (result < 0)
-		goto error_sec_create;
-	return 0;
-
-error_sec_create:
-	wusbhc_rh_destroy(wusbhc);
-error_rh_create:
-	wusbhc_devconnect_destroy(wusbhc);
-error_devconnect_create:
-	wusbhc_mmcie_destroy(wusbhc);
-error_mmcie_create:
-	return result;
-}
-EXPORT_SYMBOL_GPL(wusbhc_create);
-
-static inline struct kobject *wusbhc_kobj(struct wusbhc *wusbhc)
-{
-	return &wusbhc->usb_hcd.self.controller->kobj;
-}
-
-/*
- * Phase B of a wusbhc instance creation
- *
- * Creates fields that depend on wusbhc->usb_hcd having been
- * added. This is where we create the sysfs files in
- * /sys/class/usb_host/usb_hostX/.
- *
- * NOTE: Assumes wusbhc->usb_hcd has been already added by the upper
- *       layer (hwahc or whci)
- */
-int wusbhc_b_create(struct wusbhc *wusbhc)
-{
-	int result = 0;
-	struct device *dev = wusbhc->usb_hcd.self.controller;
-
-	result = sysfs_create_group(wusbhc_kobj(wusbhc), &wusbhc_attr_group);
-	if (result < 0) {
-		dev_err(dev, "Cannot register WUSBHC attributes: %d\n",
-			result);
-		goto error_create_attr_group;
-	}
-
-	return 0;
-error_create_attr_group:
-	return result;
-}
-EXPORT_SYMBOL_GPL(wusbhc_b_create);
-
-void wusbhc_b_destroy(struct wusbhc *wusbhc)
-{
-	wusbhc_pal_unregister(wusbhc);
-	sysfs_remove_group(wusbhc_kobj(wusbhc), &wusbhc_attr_group);
-}
-EXPORT_SYMBOL_GPL(wusbhc_b_destroy);
-
-void wusbhc_destroy(struct wusbhc *wusbhc)
-{
-	wusbhc_sec_destroy(wusbhc);
-	wusbhc_rh_destroy(wusbhc);
-	wusbhc_devconnect_destroy(wusbhc);
-	wusbhc_mmcie_destroy(wusbhc);
-}
-EXPORT_SYMBOL_GPL(wusbhc_destroy);
-
-struct workqueue_struct *wusbd;
-EXPORT_SYMBOL_GPL(wusbd);
-
-/*
- * WUSB Cluster ID allocation map
- *
- * Each WUSB bus in a channel is identified with a Cluster Id in the
- * unauth address pace (WUSB1.0[4.3]). We take the range 0xe0 to 0xff
- * (that's space for 31 WUSB controllers, as 0xff can't be taken). We
- * start taking from 0xff, 0xfe, 0xfd... (hence the += or -= 0xff).
- *
- * For each one we taken, we pin it in the bitap
- */
-#define CLUSTER_IDS 32
-static DECLARE_BITMAP(wusb_cluster_id_table, CLUSTER_IDS);
-static DEFINE_SPINLOCK(wusb_cluster_ids_lock);
-
-/*
- * Get a WUSB Cluster ID
- *
- * Need to release with wusb_cluster_id_put() when done w/ it.
- */
-/* FIXME: coordinate with the choose_addres() from the USB stack */
-/* we want to leave the top of the 128 range for cluster addresses and
- * the bottom for device addresses (as we map them one on one with
- * ports). */
-u8 wusb_cluster_id_get(void)
-{
-	u8 id;
-	spin_lock(&wusb_cluster_ids_lock);
-	id = find_first_zero_bit(wusb_cluster_id_table, CLUSTER_IDS);
-	if (id >= CLUSTER_IDS) {
-		id = 0;
-		goto out;
-	}
-	set_bit(id, wusb_cluster_id_table);
-	id = (u8) 0xff - id;
-out:
-	spin_unlock(&wusb_cluster_ids_lock);
-	return id;
-
-}
-EXPORT_SYMBOL_GPL(wusb_cluster_id_get);
-
-/*
- * Release a WUSB Cluster ID
- *
- * Obtained it with wusb_cluster_id_get()
- */
-void wusb_cluster_id_put(u8 id)
-{
-	id = 0xff - id;
-	BUG_ON(id >= CLUSTER_IDS);
-	spin_lock(&wusb_cluster_ids_lock);
-	WARN_ON(!test_bit(id, wusb_cluster_id_table));
-	clear_bit(id, wusb_cluster_id_table);
-	spin_unlock(&wusb_cluster_ids_lock);
-}
-EXPORT_SYMBOL_GPL(wusb_cluster_id_put);
-
-/**
- * wusbhc_giveback_urb - return an URB to the USB core
- * @wusbhc: the host controller the URB is from.
- * @urb:    the URB.
- * @status: the URB's status.
- *
- * Return an URB to the USB core doing some additional WUSB specific
- * processing.
- *
- *  - After a successful transfer, update the trust timeout timestamp
- *    for the WUSB device.
- *
- *  - [WUSB] sections 4.13 and 7.5.1 specify the stop retransmission
- *    condition for the WCONNECTACK_IE is that the host has observed
- *    the associated device responding to a control transfer.
- */
-void wusbhc_giveback_urb(struct wusbhc *wusbhc, struct urb *urb, int status)
-{
-	struct wusb_dev *wusb_dev = __wusb_dev_get_by_usb_dev(wusbhc,
-					urb->dev);
-
-	if (status == 0 && wusb_dev) {
-		wusb_dev->entry_ts = jiffies;
-
-		/* wusbhc_devconnect_acked() can't be called from
-		   atomic context so defer it to a work queue. */
-		if (!list_empty(&wusb_dev->cack_node))
-			queue_work(wusbd, &wusb_dev->devconnect_acked_work);
-		else
-			wusb_dev_put(wusb_dev);
-	}
-
-	usb_hcd_giveback_urb(&wusbhc->usb_hcd, urb, status);
-}
-EXPORT_SYMBOL_GPL(wusbhc_giveback_urb);
-
-/**
- * wusbhc_reset_all - reset the HC hardware
- * @wusbhc: the host controller to reset.
- *
- * Request a full hardware reset of the chip.  This will also reset
- * the radio controller and any other PALs.
- */
-void wusbhc_reset_all(struct wusbhc *wusbhc)
-{
-	if (wusbhc->uwb_rc)
-		uwb_rc_reset_all(wusbhc->uwb_rc);
-}
-EXPORT_SYMBOL_GPL(wusbhc_reset_all);
-
-static struct notifier_block wusb_usb_notifier = {
-	.notifier_call = wusb_usb_ncb,
-	.priority = INT_MAX	/* Need to be called first of all */
-};
-
-static int __init wusbcore_init(void)
-{
-	int result;
-	result = wusb_crypto_init();
-	if (result < 0)
-		goto error_crypto_init;
-	/* WQ is singlethread because we need to serialize notifications */
-	wusbd = create_singlethread_workqueue("wusbd");
-	if (wusbd == NULL) {
-		result = -ENOMEM;
-		printk(KERN_ERR "WUSB-core: Cannot create wusbd workqueue\n");
-		goto error_wusbd_create;
-	}
-	usb_register_notify(&wusb_usb_notifier);
-	bitmap_zero(wusb_cluster_id_table, CLUSTER_IDS);
-	set_bit(0, wusb_cluster_id_table);	/* reserve Cluster ID 0xff */
-	return 0;
-
-error_wusbd_create:
-	wusb_crypto_exit();
-error_crypto_init:
-	return result;
-
-}
-module_init(wusbcore_init);
-
-static void __exit wusbcore_exit(void)
-{
-	clear_bit(0, wusb_cluster_id_table);
-	if (!bitmap_empty(wusb_cluster_id_table, CLUSTER_IDS)) {
-		printk(KERN_ERR "BUG: WUSB Cluster IDs not released on exit: %*pb\n",
-		       CLUSTER_IDS, wusb_cluster_id_table);
-		WARN_ON(1);
-	}
-	usb_unregister_notify(&wusb_usb_notifier);
-	destroy_workqueue(wusbd);
-	wusb_crypto_exit();
-}
-module_exit(wusbcore_exit);
-
-MODULE_AUTHOR("Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>");
-MODULE_DESCRIPTION("Wireless USB core");
-MODULE_LICENSE("GPL");
+                                               0x10010030
+#define ixPCIE_TX_CREDITS_ADVT_NP                                               0x10010031
+#define ixPCIE_TX_CREDITS_ADVT_CPL                                              0x10010032
+#define ixPCIE_TX_CREDITS_INIT_P                                                0x10010033
+#define ixPCIE_TX_CREDITS_INIT_NP                                               0x10010034
+#define ixPCIE_TX_CREDITS_INIT_CPL                                              0x10010035
+#define ixPCIE_TX_CREDITS_STATUS                                                0x10010036
+#define ixPCIE_TX_CREDITS_FCU_THRESHOLD                                         0x10010037
+#define ixPCIE_P_PORT_LANE_STATUS                                               0x10010050
+#define ixPCIE_FC_P                                                             0x10010060
+#define ixPCIE_FC_NP                                                            0x10010061
+#define ixPCIE_FC_CPL                                                           0x10010062
+#define ixPCIE_ERR_CNTL                                                         0x1001006a
+#define ixPCIE_RX_CNTL                                                          0x10010070
+#define ixPCIE_RX_EXPECTED_SEQNUM                                               0x10010071
+#define ixPCIE_RX_VENDOR_SPECIFIC                                               0x10010072
+#define ixPCIE_RX_CNTL3                                                         0x10010074
+#define ixPCIE_RX_CREDITS_ALLOCATED_P                                           0x10010080
+#define ixPCIE_RX_CREDITS_ALLOCATED_NP                                          0x10010081
+#define ixPCIE_RX_CREDITS_ALLOCATED_CPL                                         0x10010082
+#define ixPCIE_LC_CNTL                                                          0x100100a0
+#define ixPCIE_LC_CNTL2                                                         0x100100b1
+#define ixPCIE_LC_CNTL3                                                         0x100100b5
+#define ixPCIE_LC_CNTL4                                                         0x100100b6
+#define ixPCIE_LC_CNTL5                                                         0x100100b7
+#define ixPCIE_LC_BW_CHANGE_CNTL                                                0x100100b2
+#define ixPCIE_LC_TRAINING_CNTL                                                 0x100100a1
+#define ixPCIE_LC_LINK_WIDTH_CNTL                                               0x100100a2
+#define ixPCIE_LC_N_FTS_CNTL                                                    0x100100a3
+#define ixPCIE_LC_SPEED_CNTL                                                    0x100100a4
+#define ixPCIE_LC_CDR_CNTL                                                      0x100100b3
+#define ixPCIE_LC_LANE_CNTL                                                     0x100100b4
+#define ixPCIE_LC_FORCE_COEFF                                                   0x100100b8
+#define ixPCIE_LC_BEST_EQ_SETTINGS                                              0x100100b9
+#define ixPCIE_LC_FORCE_EQ_REQ_COEFF                                            0x100100ba
+#define ixPCIE_LC_STATE0                                                        0x100100a5
+#define ixPCIE_LC_STATE1                                                        0x100100a6
+#define ixPCIE_LC_STATE2                                                        0x100100a7
+#define ixPCIE_LC_STATE3                                                        0x100100a8
+#define ixPCIE_LC_STATE4                                                        0x100100a9
+#define ixPCIE_LC_STATE5                                                        0x100100aa
+#define ixPCIEP_STRAP_LC                                                        0x100100c0
+#define ixPCIEP_STRAP_MISC                                                      0x100100c1
+#define ixPCIEP_BCH_ECC_CNTL                                                    0x100100d0
+#define mmBIF_RFE_SNOOP_REG                                                     0x27
+#define mmBIF_RFE_WARMRST_CNTL                                                  0x1459
+#define mmBIF_RFE_SOFTRST_CNTL                                                  0x1441
+#define mmBIF_RFE_CLIENT_SOFTRST_TRIGGER                                        0x1442
+#define mmBIF_RFE_MASTER_SOFTRST_TRIGGER                                        0x1443
+#define mmBIF_PWDN_COMMAND                                                      0x1444
+#define mmBIF_PWDN_STATUS                                                       0x1445
+#define mmBIF_RFE_MST_FBU_CMDSTATUS                                             0x1446
+#define mmBIF_RFE_MST_RWREG_RFEWGBIF_CMDSTATUS                                  0x1447
+#define mmBIF_RFE_MST_BX_CMDSTATUS                                              0x1448
+#define mmBIF_RFE_MST_TMOUT_STATUS                                              0x144b
+#define mmBIF_RFE_MMCFG_CNTL                                                    0x144c
+#define ixBIF_CLOCKS_BITS_IND                                                   0x1301489
+#define ixBIF_LNCNT_RESET_IND                                                   0x1301488
+#define ixLNCNT_CONTROL_IND                                                     0x1301487
+#define ixNEW_REFCLKB_TIMER_IND                                                 0x1301485
+#define ixNEW_REFCLKB_TIMER_1_IND                                               0x1301484
+#define ixBIF_CLK_PDWN_DELAY_TIMER_IND                                          0x1301483
+#define ixBIF_RESET_EN_IND                                                      0x1301482
+#define ixBIF_PIF_TXCLK_SWITCH_TIMER_IND                                        0x1301481
+#define ixBIF_BACO_MSIC_IND                                                     0x1301480
+#define ixBIF_RESET_CNTL_IND                                                    0x1301486
+#define ixBIF_RFE_CNTL_MISC_IND                                                 0x130148c
+#define ixBIF_MEM_PG_CNTL_IND                                                   0x130148a
+#define mmNB_GBIF_INDEX                                                         0x34
+#define mmNB_GBIF_DATA                                                          0x35
+#define mmBIF_CLOCKS_BITS                                                       0x1489
+#define mmBIF_LNCNT_RESET                                                       0x1488
+#define mmLNCNT_CONTROL                                                         0x1487
+#define mmNEW_REFCLKB_TIMER                                                     0x1485
+#define mmNEW_REFCLKB_TIMER_1                                                   0x1484
+#define mmBIF_CLK_PDWN_DELAY_TIMER                                              0x1483
+#define mmBIF_RESET_EN                                                          0x1482
+#define mmBIF_PIF_TXCLK_SWITCH_TIMER                                            0x1481
+#define mmBIF_BACO_MSIC                                                         0x1480
+#define mmBIF_RESET_CNTL                                                        0x1486
+#define mmBIF_RFE_CNTL_MISC                                                     0x148c
+#define mmBIF_MEM_PG_CNTL                                                       0x148a
+#define mmC_PCIE_P_INDEX                                                        0x38
+#define mmC_PCIE_P_DATA                                                         0x39
+#define ixD2F1_PCIE_PORT_INDEX                                                  0x2000038
+#define ixD2F1_PCIE_PORT_DATA                                                   0x2000039
+#define ixD2F1_PCIEP_RESERVED                                                   0x0
+#define ixD2F1_PCIEP_SCRATCH                                                    0x1
+#define ixD2F1_PCIEP_HW_DEBUG                                                   0x2
+#define ixD2F1_PCIEP_PORT_CNTL                                                  0x10
+#define ixD2F1_PCIE_TX_CNTL                                                     0x20
+#define ixD2F1_PCIE_TX_REQUESTER_ID                                             0x21
+#define ixD2F1_PCIE_TX_VENDOR_SPECIFIC                                          0x22
+#define ixD2F1_PCIE_TX_REQUEST_NUM_CNTL                                         0x23
+#define ixD2F1_PCIE_TX_SEQ                                                      0x24
+#define ixD2F1_PCIE_TX_REPLAY                                                   0x25
+#define ixD2F1_PCIE_TX_ACK_LATENCY_LIMIT                                        0x26
+#define ixD2F1_PCIE_TX_CREDITS_ADVT_P                                           0x30
+#define ixD2F1_PCIE_TX_CREDITS_ADVT_NP                                          0x31
+#define ixD2F1_PCIE_TX_CREDITS_ADVT_CPL                                         0x32
+#define ixD2F1_PCIE_TX_CREDITS_INIT_P                                           0x33
+#define ixD2F1_PCIE_TX_CREDITS_INIT_NP                                          0x34
+#define ixD2F1_PCIE_TX_CREDITS_INIT_CPL                                         0x35
+#define ixD2F1_PCIE_TX_CREDITS_STATUS                                           0x36
+#define ixD2F1_PCIE_TX_CREDITS_FCU_THRESHOLD                                    0x37
+#define ixD2F1_PCIE_P_PORT_LANE_STATUS                                          0x50
+#define ixD2F1_PCIE_FC_P                                                        0x60
+#define ixD2F1_PCIE_FC_NP                                                       0x61
+#define ixD2F1_PCIE_FC_CPL                                                      0x62
+#define ixD2F1_PCIE_ERR_CNTL                                                    0x6a
+#define ixD2F1_PCIE_RX_CNTL                                                     0x70
+#define ixD2F1_PCIE_RX_EXPECTED_SEQNUM                                          0x71
+#define ixD2F1_PCIE_RX_VENDOR_SPECIFIC                                          0x72
+#define ixD2F1_PCIE_RX_CNTL3                                                    0x74
+#define ixD2F1_PCIE_RX_CREDITS_ALLOCATED_P                                      0x80
+#define ixD2F1_PCIE_RX_CREDITS_ALLOCATED_NP                                     0x81
+#define ixD2F1_PCIE_RX_CREDITS_ALLOCATED_CPL                                    0x82
+#define ixD2F1_PCIEP_ERROR_INJECT_PHYSICAL                                      0x83
+#define ixD2F1_PCIEP_ERROR_INJECT_TRANSACTION                                   0x84
+#define ixD2F1_PCIE_LC_CNTL                                                     0xa0
+#define ixD2F1_PCIE_LC_CNTL2                                                    0xb1
+#define ixD2F1_PCIE_LC_CNTL3                                                    0xb5
+#define ixD2F1_PCIE_LC_CNTL4                                                    0xb6
+#define ixD2F1_PCIE_LC_CNTL5                                                    0xb7
+#define ixD2F1_PCIE_LC_CNTL6                                                    0xbb
+#define ixD2F1_PCIE_LC_BW_CHANGE_CNTL                                           0xb2
+#define ixD2F1_PCIE_LC_TRAINING_CNTL                                            0xa1
+#define ixD2F1_PCIE_LC_LINK_WIDTH_CNTL                                          0xa2
+#define ixD2F1_PCIE_LC_N_FTS_CNTL                                               0xa3
+#define ixD2F1_PCIE_LC_SPEED_CNTL                                               0xa4
+#define ixD2F1_PCIE_LC_CDR_CNTL                                                 0xb3
+#define ixD2F1_PCIE_LC_LANE_CNTL                                                0xb4
+#define ixD2F1_PCIE_LC_FORCE_COEFF                                              0xb8
+#define ixD2F1_PCIE_LC_BEST_EQ_SETTINGS                                         0xb9
+#define ixD2F1_PCIE_LC_FORCE_EQ_REQ_COEFF                                       0xba
+#define ixD2F1_PCIE_LC_STATE0                                                   0xa5
+#define ixD2F1_PCIE_LC_STATE1                                                   0xa6
+#define ixD2F1_PCIE_LC_STATE2                                                   0xa7
+#define ixD2F1_PCIE_LC_STATE3                                                   0xa8
+#define ixD2F1_PCIE_LC_STATE4                                                   0xa9
+#define ixD2F1_PCIE_LC_STATE5                                                   0xaa
+#define ixD2F1_PCIEP_STRAP_LC                                                   0xc0
+#define ixD2F1_PCIEP_STRAP_MISC                                                 0xc1
+#define ixD2F1_PCIEP_BCH_ECC_CNTL                                               0xd0
+#define ixD2F1_PCIEP_HPGI_PRIVATE                                               0xd2
+#define ixD2F1_PCIEP_HPGI                                                       0xda
+#define ixD2F1_VENDOR_ID                                                        0x2000000
+#define ixD2F1_DEVICE_ID                                                        0x2000000
+#define ixD2F1_COMMAND                                                          0x2000001
+#define ixD2F1_STATUS                                                           0x2000001
+#define ixD2F1_REVISION_ID                                                      0x2000002
+#define ixD2F1_PROG_INTERFACE                                                   0x2000002
+#define ixD2F1_SUB_CLASS                                                        0x2000002
+#define ixD2F1_BASE_CLASS                                                       0x2000002
+#define ixD2F1_CACHE_LINE                                                       0x2000003
+#define ixD2F1_LATENCY                                                          0x2000003
+#define ixD2F1_HEADER                                                           0x2000003
+#define ixD2F1_BIST                                                             0x2000003
+#define ixD2F1_SUB_BUS_NUMBER_LATENCY                                           0x200

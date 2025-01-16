@@ -1,171 +1,131 @@
-/*
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- *
- * Copyright (c) 2008 Silicon Graphics, Inc.  All Rights Reserved.
- */
+we get a low value that's stable across two reads of the high
+	 * register.
+	 */
+	do {
+		high1 = I915_READ(high_frame) & PIPE_FRAME_HIGH_MASK;
+		low   = I915_READ(low_frame);
+		high2 = I915_READ(high_frame) & PIPE_FRAME_HIGH_MASK;
+	} while (high1 != high2);
 
-/*
- * Cross Partition (XP) uv-based functions.
- *
- *      Architecture specific implementation of common functions.
- *
- */
+	high1 >>= PIPE_FRAME_HIGH_SHIFT;
+	pixel = low & PIPE_PIXEL_MASK;
+	low >>= PIPE_FRAME_LOW_SHIFT;
 
-#include <linux/device.h>
-#include <asm/uv/uv_hub.h>
-#if defined CONFIG_X86_64
-#include <asm/uv/bios.h>
-#elif defined CONFIG_IA64_GENERIC || defined CONFIG_IA64_SGI_UV
-#include <asm/sn/sn_sal.h>
-#endif
-#include "../sgi-gru/grukservices.h"
-#include "xp.h"
-
-/*
- * Convert a virtual memory address to a physical memory address.
- */
-static unsigned long
-xp_pa_uv(void *addr)
-{
-	return uv_gpa(addr);
+	/*
+	 * The frame counter increments at beginning of active.
+	 * Cook up a vblank counter by also checking the pixel
+	 * counter against vblank start.
+	 */
+	return (((high1 << 8) | low) + (pixel >= vbl_start)) & 0xffffff;
 }
 
-/*
- * Convert a global physical to socket physical address.
- */
-static unsigned long
-xp_socket_pa_uv(unsigned long gpa)
+static u32 g4x_get_vblank_counter(struct drm_device *dev, unsigned int pipe)
 {
-	return uv_gpa_to_soc_phys_ram(gpa);
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	return I915_READ(PIPE_FRMCOUNT_G4X(pipe));
 }
 
-static enum xp_retval
-xp_remote_mmr_read(unsigned long dst_gpa, const unsigned long src_gpa,
-		   size_t len)
+/* raw reads, only for fast reads of display block, no need for forcewake etc. */
+#define __raw_i915_read32(dev_priv__, reg__) readl((dev_priv__)->regs + (reg__))
+
+static int __intel_get_crtc_scanline(struct intel_crtc *crtc)
 {
-	int ret;
-	unsigned long *dst_va = __va(uv_gpa_to_soc_phys_ram(dst_gpa));
+	struct drm_device *dev = crtc->base.dev;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	const struct drm_display_mode *mode = &crtc->base.hwmode;
+	enum pipe pipe = crtc->pipe;
+	int position, vtotal;
 
-	BUG_ON(!uv_gpa_in_mmr_space(src_gpa));
-	BUG_ON(len != 8);
+	vtotal = mode->crtc_vtotal;
+	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+		vtotal /= 2;
 
-	ret = gru_read_gpa(dst_va, src_gpa);
-	if (ret == 0)
-		return xpSuccess;
+	if (IS_GEN2(dev))
+		position = __raw_i915_read32(dev_priv, PIPEDSL(pipe)) & DSL_LINEMASK_GEN2;
+	else
+		position = __raw_i915_read32(dev_priv, PIPEDSL(pipe)) & DSL_LINEMASK_GEN3;
 
-	dev_err(xp, "gru_read_gpa() failed, dst_gpa=0x%016lx src_gpa=0x%016lx "
-		"len=%ld\n", dst_gpa, src_gpa, len);
-	return xpGruCopyError;
-}
+	/*
+	 * On HSW, the DSL reg (0x70000) appears to return 0 if we
+	 * read it just before the start of vblank.  So try it again
+	 * so we don't accidentally end up spanning a vblank frame
+	 * increment, causing the pipe_update_end() code to squak at us.
+	 *
+	 * The nature of this problem means we can't simply check the ISR
+	 * bit and return the vblank start value; nor can we use the scanline
+	 * debug register in the transcoder as it appears to have the same
+	 * problem.  We may need to extend this to include other platforms,
+	 * but so far testing only shows the problem on HSW.
+	 */
+	if (HAS_DDI(dev) && !position) {
+		int i, temp;
 
-
-static enum xp_retval
-xp_remote_memcpy_uv(unsigned long dst_gpa, const unsigned long src_gpa,
-		    size_t len)
-{
-	int ret;
-
-	if (uv_gpa_in_mmr_space(src_gpa))
-		return xp_remote_mmr_read(dst_gpa, src_gpa, len);
-
-	ret = gru_copy_gpa(dst_gpa, src_gpa, len);
-	if (ret == 0)
-		return xpSuccess;
-
-	dev_err(xp, "gru_copy_gpa() failed, dst_gpa=0x%016lx src_gpa=0x%016lx "
-		"len=%ld\n", dst_gpa, src_gpa, len);
-	return xpGruCopyError;
-}
-
-static int
-xp_cpu_to_nasid_uv(int cpuid)
-{
-	/* ??? Is this same as sn2 nasid in mach/part bitmaps set up by SAL? */
-	return UV_PNODE_TO_NASID(uv_cpu_to_pnode(cpuid));
-}
-
-static enum xp_retval
-xp_expand_memprotect_uv(unsigned long phys_addr, unsigned long size)
-{
-	int ret;
-
-#if defined CONFIG_X86_64
-	ret = uv_bios_change_memprotect(phys_addr, size, UV_MEMPROT_ALLOW_RW);
-	if (ret != BIOS_STATUS_SUCCESS) {
-		dev_err(xp, "uv_bios_change_memprotect(,, "
-			"UV_MEMPROT_ALLOW_RW) failed, ret=%d\n", ret);
-		return xpBiosError;
+		for (i = 0; i < 100; i++) {
+			udelay(1);
+			temp = __raw_i915_read32(dev_priv, PIPEDSL(pipe)) &
+				DSL_LINEMASK_GEN3;
+			if (temp != position) {
+				position = temp;
+				break;
+			}
+		}
 	}
 
-#elif defined CONFIG_IA64_GENERIC || defined CONFIG_IA64_SGI_UV
-	u64 nasid_array;
-
-	ret = sn_change_memprotect(phys_addr, size, SN_MEMPROT_ACCESS_CLASS_1,
-				   &nasid_array);
-	if (ret != 0) {
-		dev_err(xp, "sn_change_memprotect(,, "
-			"SN_MEMPROT_ACCESS_CLASS_1,) failed ret=%d\n", ret);
-		return xpSalError;
-	}
-#else
-	#error not a supported configuration
-#endif
-	return xpSuccess;
+	/*
+	 * See update_scanline_offset() for the details on the
+	 * scanline_offset adjustment.
+	 */
+	return (position + crtc->scanline_offset) % vtotal;
 }
 
-static enum xp_retval
-xp_restrict_memprotect_uv(unsigned long phys_addr, unsigned long size)
+static int i915_get_crtc_scanoutpos(struct drm_device *dev, unsigned int pipe,
+				    unsigned int flags, int *vpos, int *hpos,
+				    ktime_t *stime, ktime_t *etime,
+				    const struct drm_display_mode *mode)
 {
-	int ret;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	struct drm_crtc *crtc = dev_priv->pipe_to_crtc_mapping[pipe];
+	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
+	int position;
+	int vbl_start, vbl_end, hsync_start, htotal, vtotal;
+	bool in_vbl = true;
+	int ret = 0;
+	unsigned long irqflags;
 
-#if defined CONFIG_X86_64
-	ret = uv_bios_change_memprotect(phys_addr, size,
-					UV_MEMPROT_RESTRICT_ACCESS);
-	if (ret != BIOS_STATUS_SUCCESS) {
-		dev_err(xp, "uv_bios_change_memprotect(,, "
-			"UV_MEMPROT_RESTRICT_ACCESS) failed, ret=%d\n", ret);
-		return xpBiosError;
+	if (WARN_ON(!mode->crtc_clock)) {
+		DRM_DEBUG_DRIVER("trying to get scanoutpos for disabled "
+				 "pipe %c\n", pipe_name(pipe));
+		return 0;
 	}
 
-#elif defined CONFIG_IA64_GENERIC || defined CONFIG_IA64_SGI_UV
-	u64 nasid_array;
+	htotal = mode->crtc_htotal;
+	hsync_start = mode->crtc_hsync_start;
+	vtotal = mode->crtc_vtotal;
+	vbl_start = mode->crtc_vblank_start;
+	vbl_end = mode->crtc_vblank_end;
 
-	ret = sn_change_memprotect(phys_addr, size, SN_MEMPROT_ACCESS_CLASS_0,
-				   &nasid_array);
-	if (ret != 0) {
-		dev_err(xp, "sn_change_memprotect(,, "
-			"SN_MEMPROT_ACCESS_CLASS_0,) failed ret=%d\n", ret);
-		return xpSalError;
+	if (mode->flags & DRM_MODE_FLAG_INTERLACE) {
+		vbl_start = DIV_ROUND_UP(vbl_start, 2);
+		vbl_end /= 2;
+		vtotal /= 2;
 	}
-#else
-	#error not a supported configuration
-#endif
-	return xpSuccess;
-}
 
-enum xp_retval
-xp_init_uv(void)
-{
-	BUG_ON(!is_uv());
+	ret |= DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_ACCURATE;
 
-	xp_max_npartitions = XP_MAX_NPARTITIONS_UV;
-	xp_partition_id = sn_partition_id;
-	xp_region_size = sn_region_size;
+	/*
+	 * Lock uncore.lock, as we will do multiple timing critical raw
+	 * register reads, potentially with preemption disabled, so the
+	 * following code must not block on uncore.lock.
+	 */
+	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
 
-	xp_pa = xp_pa_uv;
-	xp_socket_pa = xp_socket_pa_uv;
-	xp_remote_memcpy = xp_remote_memcpy_uv;
-	xp_cpu_to_nasid = xp_cpu_to_nasid_uv;
-	xp_expand_memprotect = xp_expand_memprotect_uv;
-	xp_restrict_memprotect = xp_restrict_memprotect_uv;
+	/* preempt_disable_rt() should go right here in PREEMPT_RT patchset. */
+	preempt_disable_rt();
 
-	return xpSuccess;
-}
+	/* Get optional system timestamp before query. */
+	if (stime)
+		*stime = ktime_get();
 
-void
-xp_exit_uv(void)
-{
-	BUG_ON(!is_uv());
-}
+	if (IS_GEN2(dev) || IS_G4X(dev) || INTEL_INFO(dev)->gen >= 5) {
+		/* No obvious pi

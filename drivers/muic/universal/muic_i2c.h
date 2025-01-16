@@ -1,9 +1,7 @@
-#ifndef _MUIC_I2C_
-#define _MUIC_I2C_
-
-extern int muic_i2c_read_byte(const struct i2c_client *client, u8 command);
-extern int muic_i2c_write_byte(const struct i2c_client *client,
-			u8 command, u8 value);
-extern int muic_i2c_guaranteed_wbyte(const struct i2c_client *client,
-			u8 command, u8 value);
-#endif
+ 0x5
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_6_MASK 0x40
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_6__SHIFT 0x6
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_7_MASK 0x80
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_7__SHIFT 0x7
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_8_MASK 0x100
+#define GP

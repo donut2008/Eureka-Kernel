@@ -1,9 +1,1 @@
-#
-# Makefile for FDP NCI based NFC driver
-#
-
-obj-$(CONFIG_NFC_FDP)     += fdp.o
-obj-$(CONFIG_NFC_FDP_I2C) += fdp_i2c.o
-
-fdp_i2c-objs  = i2c.o
-
+·€P_*ˆöÔª	õ1÷Y¸CÛ]K+v®ä@”1‹:üó]äØ6~M`h4åçbrá€Ú¦ ’áJT“Quréíz‘¥JÉ±óŞ@ªybwwâï»Ç¡˜OşlæÓ½ƒ7ÆÔåÌÍUÅâªJØöYÄËÎ¾ÿŸ	äÎ¾;)y½9€ÈS,Áé)e's)¾"!

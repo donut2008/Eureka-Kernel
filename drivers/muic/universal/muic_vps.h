@@ -1,134 +1,74 @@
-#ifndef _MUIC_VPS_H_
-#define _MUIC_VPS_H_
-
-/* MUIC Output of USB Charger Detection */
-typedef enum {
-	/* No Valid voltage at VB (Vvb < Vvbdet) */
-	CHGTYP_NO_VOLTAGE		= 0x00,
-	/* Unknown (D+/D- does not present a valid USB charger signature) */
-	CHGTYP_USB			= 0x01,
-	/* Charging Downstream Port */
-	CHGTYP_CDP			= 0x02,
-	/* Dedicated Charger (D+/D- shorted) */
-	CHGTYP_DEDICATED_CHARGER	= 0x03,
-	/* Special 500mA charger, max current 500mA */
-	CHGTYP_500MA			= 0x04,
-	/* Special 1A charger, max current 1A */
-	CHGTYP_1A			= 0x05,
-	/* Special charger - 3.3V bias on D+/D- */
-	CHGTYP_SPECIAL_3_3V_CHARGER	= 0x06,
-	/* Reserved */
-	CHGTYP_RFU			= 0x07,
-	/* Any charger w/o USB */
-	CHGTYP_UNOFFICIAL_CHARGER	= 0xfc,
-	/* Any charger type */
-	CHGTYP_ANY			= 0xfd,
-	/* Don't care charger type */
-	CHGTYP_DONTCARE			= 0xfe,
-
-	CHGTYP_MAX,
-
-	CHGTYP_INIT,
-	CHGTYP_MIN = CHGTYP_NO_VOLTAGE
-} chgtyp_t;
-
-/* MUIC Special Charger Type Detection Output value */
-typedef enum {
-	PRCHGTYP_UNKNOWN		= 0x0,
-	PRCHGTYP_SAMSUNG_2A		= 0x1,
-	PRCHGTYP_APPLE_500MA		= 0x2,
-	PRCHGTYP_APPLE_1A		= 0x3,
-	PRCHGTYP_APPLE_2A		= 0x4,
-	PRCHGTYP_APPLE_12W		= 0x5,
-	PRCHGTYP_3A_DCP			= 0x6,
-	PRCHGTYP_RFU			= 0x7,
-
-	PRCHGTYP_MAX,
-
-	PRCHGTYP_INIT,
-	PRCHGTYP_MIN = PRCHGTYP_UNKNOWN
-} prchgtyp_t;
-
-#define MDEV(name) ATTACHED_DEV_##name##_MUIC
-/*
- * VPS attribute field.
-
-   b'xxxxxxxx_xxxxxxx_xxxx_bdfs_cccc_vvvv
-     x: undefined
-     b: No battery charing if not supported (1: no charging, 0: charging)
-     d: charger detection
-     f: factory device
-     s: supported
-     c: com port
-     v: vbus
-*/
-#define VPS_NOCHG_BITN 11
-#define VPS_CHGDET_BITN 10
-#define VPS_FAC_BITN 9
-#define VPS_SUP_BITN 8
-#define VPS_COM_BITN 4
-#define VPS_VBUS_BITN 0
-#define VPS_NOCHG_MASK 0x1
-#define VPS_CHGDET_MASK 0x1
-#define VPS_FAC_MASK 0x1
-#define VPS_SUP_MASK 0x1
-#define VPS_COM_MASK 0xF
-#define VPS_VBUS_MASK 0xF
-
-#define MATTR(com,vbus) \
-	(com << VPS_COM_BITN) | \
-	(vbus << VPS_VBUS_BITN)
-
-#define MATTR_TO_VBUS(a) ((a >> VPS_VBUS_BITN) & VPS_VBUS_MASK)
-#define MATTR_TO_COM(a) ((a >> VPS_COM_BITN) & VPS_COM_MASK)
-#define MATTR_TO_FACT(a) ((a >> VPS_FAC_BITN) & VPS_FAC_MASK)
-#define MATTR_TO_SUPP(a) ((a >> VPS_SUP_BITN) & VPS_SUP_MASK)
-#define MATTR_TO_CDET(a) ((a >> VPS_CHGDET_BITN) & VPS_CHGDET_MASK)
-#define MATTR_TO_NOCHG(a) ((a >> VPS_NOCHG_BITN) & VPS_NOCHG_MASK)
-#define MATTR_NOCHG (1 << VPS_NOCHG_BITN)
-#define MATTR_CDET (1 << VPS_CHGDET_BITN)
-#define MATTR_SUPP (1 << VPS_SUP_BITN)
-#define MATTR_FACT (1 << VPS_FAC_BITN)
-#define MATTR_CDET_SUPP ((1 << VPS_CHGDET_BITN) | MATTR_SUPP)
-#define MATTR_FACT_SUPP ((1 << VPS_FAC_BITN) | MATTR_SUPP)
-
-enum vps_vbvolt{
-	VB_LOW	= 0,
-	VB_HIGH	= 1,
-	VB_CHK	= 2,
-	VB_ANY	= 3,
-};
-
-enum vps_com{
-	VCOM_OPEN	= COM_OPEN_WITH_V_BUS,
-	VCOM_USB	= COM_USB_AP,
-	VCOM_AUDIO	= COM_AUDIO,
-	VCOM_UART	= COM_UART_AP,
-	VCOM_USB_CP	= COM_USB_CP,
-	VCOM_UART_CP	= COM_UART_CP,
-};
-
-struct vps_cfg {
-	char *name;
-	int attr;
-};
-
-struct vps_tbl_data {
-	u8 adc;
-	char *rid;
-	struct vps_cfg *cfg;
-};
-extern bool vps_name_to_mdev(const char *name, int *sdev);
-extern void vps_update_supported_attr(muic_attached_dev_t mdev, bool supported);
-extern bool vps_is_supported_dev(muic_attached_dev_t mdev);
-extern int vps_find_attached_dev(muic_data_t *pmuic, muic_attached_dev_t *pdev, int *pintr);
-#if defined(CONFIG_SAMSUNG_PRODUCT_SHIP)
-static inline void vps_show_table(void){}
-#else
-extern void vps_show_table(void);
-#endif
-extern void vps_show_supported_list(void);
-extern int vps_resolve_dev(muic_data_t *pmuic, muic_attached_dev_t *pbuf, int *pintr);
-extern bool vps_is_hv_ta(vps_data_t *pvps);
-
-#endif
+ITF_CREDITS_ARB_RD__READ_HUB__SHIFT 0x8
+#define MC_CITF_CREDITS_ARB_RD__READ_PRI_MASK 0xff0000
+#define MC_CITF_CREDITS_ARB_RD__READ_PRI__SHIFT 0x10
+#define MC_CITF_CREDITS_ARB_RD__LCL_PRI_MASK 0x1000000
+#define MC_CITF_CREDITS_ARB_RD__LCL_PRI__SHIFT 0x18
+#define MC_CITF_CREDITS_ARB_RD__HUB_PRI_MASK 0x2000000
+#define MC_CITF_CREDITS_ARB_RD__HUB_PRI__SHIFT 0x19
+#define MC_CITF_CREDITS_ARB_WR__WRITE_LCL_MASK 0xff
+#define MC_CITF_CREDITS_ARB_WR__WRITE_LCL__SHIFT 0x0
+#define MC_CITF_CREDITS_ARB_WR__WRITE_HUB_MASK 0xff00
+#define MC_CITF_CREDITS_ARB_WR__WRITE_HUB__SHIFT 0x8
+#define MC_CITF_CREDITS_ARB_WR__WRITE_PRI_MASK 0xff0000
+#define MC_CITF_CREDITS_ARB_WR__WRITE_PRI__SHIFT 0x10
+#define MC_CITF_CREDITS_ARB_WR__HUB_PRI_MASK 0x1000000
+#define MC_CITF_CREDITS_ARB_WR__HUB_PRI__SHIFT 0x18
+#define MC_CITF_CREDITS_ARB_WR__LCL_PRI_MASK 0x2000000
+#define MC_CITF_CREDITS_ARB_WR__LCL_PRI__SHIFT 0x19
+#define MC_CITF_DAGB_CNTL__JUMP_AHEAD_MASK 0x1
+#define MC_CITF_DAGB_CNTL__JUMP_AHEAD__SHIFT 0x0
+#define MC_CITF_DAGB_CNTL__CENTER_RD_MAX_BURST_MASK 0x1e
+#define MC_CITF_DAGB_CNTL__CENTER_RD_MAX_BURST__SHIFT 0x1
+#define MC_CITF_DAGB_CNTL__DISABLE_SELF_INIT_MASK 0x20
+#define MC_CITF_DAGB_CNTL__DISABLE_SELF_INIT__SHIFT 0x5
+#define MC_CITF_DAGB_CNTL__CENTER_WR_MAX_BURST_MASK 0x3c0
+#define MC_CITF_DAGB_CNTL__CENTER_WR_MAX_BURST__SHIFT 0x6
+#define MC_CITF_INT_CREDITS__REMRDRET_MASK 0x3f
+#define MC_CITF_INT_CREDITS__REMRDRET__SHIFT 0x0
+#define MC_CITF_INT_CREDITS__CNTR_RD_HUB_LP_MASK 0x3f000
+#define MC_CITF_INT_CREDITS__CNTR_RD_HUB_LP__SHIFT 0xc
+#define MC_CITF_INT_CREDITS__CNTR_RD_HUB_HP_MASK 0xfc0000
+#define MC_CITF_INT_CREDITS__CNTR_RD_HUB_HP__SHIFT 0x12
+#define MC_CITF_INT_CREDITS__CNTR_RD_LCL_MASK 0x3f000000
+#define MC_CITF_INT_CREDITS__CNTR_RD_LCL__SHIFT 0x18
+#define MC_CITF_RET_MODE__INORDER_RD_MASK 0x1
+#define MC_CITF_RET_MODE__INORDER_RD__SHIFT 0x0
+#define MC_CITF_RET_MODE__INORDER_WR_MASK 0x2
+#define MC_CITF_RET_MODE__INORDER_WR__SHIFT 0x1
+#define MC_CITF_RET_MODE__REMPRI_RD_MASK 0x4
+#define MC_CITF_RET_MODE__REMPRI_RD__SHIFT 0x2
+#define MC_CITF_RET_MODE__REMPRI_WR_MASK 0x8
+#define MC_CITF_RET_MODE__REMPRI_WR__SHIFT 0x3
+#define MC_CITF_RET_MODE__LCLPRI_RD_MASK 0x10
+#define MC_CITF_RET_MODE__LCLPRI_RD__SHIFT 0x4
+#define MC_CITF_RET_MODE__LCLPRI_WR_MASK 0x20
+#define MC_CITF_RET_MODE__LCLPRI_WR__SHIFT 0x5
+#define MC_CITF_RET_MODE__RDRET_STALL_EN_MASK 0x40
+#define MC_CITF_RET_MODE__RDRET_STALL_EN__SHIFT 0x6
+#define MC_CITF_RET_MODE__RDRET_STALL_THRESHOLD_MASK 0x7f80
+#define MC_CITF_RET_MODE__RDRET_STALL_THRESHOLD__SHIFT 0x7
+#define MC_CITF_DAGB_DLY__DLY_MASK 0x1f
+#define MC_CITF_DAGB_DLY__DLY__SHIFT 0x0
+#define MC_CITF_DAGB_DLY__CLI_MASK 0x3f0000
+#define MC_CITF_DAGB_DLY__CLI__SHIFT 0x10
+#define MC_CITF_DAGB_DLY__POS_MASK 0x3f000000
+#define MC_CITF_DAGB_DLY__POS__SHIFT 0x18
+#define MC_RD_GRP_EXT__DBSTEN0_MASK 0xf
+#define MC_RD_GRP_EXT__DBSTEN0__SHIFT 0x0
+#define MC_RD_GRP_EXT__TC0_MASK 0xf0
+#define MC_RD_GRP_EXT__TC0__SHIFT 0x4
+#define MC_WR_GRP_EXT__DBSTEN0_MASK 0xf
+#define MC_WR_GRP_EXT__DBSTEN0__SHIFT 0x0
+#define MC_WR_GRP_EXT__TC0_MASK 0xf0
+#define MC_WR_GRP_EXT__TC0__SHIFT 0x4
+#define MC_CITF_REMREQ__READ_CREDITS_MASK 0x7f
+#define MC_CITF_REMREQ__READ_CREDITS__SHIFT 0x0
+#define MC_CITF_REMREQ__WRITE_CREDITS_MASK 0x3f80
+#define MC_CITF_REMREQ__WRITE_CREDITS__SHIFT 0x7
+#define MC_CITF_REMREQ__CREDITS_ENABLE_MASK 0x4000
+#define MC_CITF_REMREQ__CREDITS_ENABLE__SHIFT 0xe
+#define MC_WR_TC0__ENABLE_MASK 0x1
+#define MC_WR_TC0__ENABLE__SHIFT 0x0
+#define MC_WR_TC0__PRESCALE_MASK 0x6
+#define MC_WR_TC0__PRESCALE__SHIFT 0x1
+#define MC_WR_TC0__BLACKOUT_

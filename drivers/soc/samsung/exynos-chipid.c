@@ -1,394 +1,184 @@
-/*
- * Copyright (c) 2014 Samsung Electronics Co., Ltd.
- *	      http://www.samsung.com/
- *
- * EXYNOS - CHIP ID support
- * Author: Pankaj Dubey <pankaj.dubey@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/io.h>
-#include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_platform.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-#include <linux/sys_soc.h>
-#include <linux/soc/samsung/exynos-soc.h>
-
-struct exynos_chipid_info exynos_soc_info;
-EXPORT_SYMBOL(exynos_soc_info);
-
-static const char *soc_ap_id;
-	
-static const char * __init product_id_to_name(unsigned int product_id)
-{
-	const char *soc_name;
-	unsigned int soc_id = product_id;
-
-	switch (soc_id) {
-	case EXYNOS3250_SOC_ID:
-		soc_name = "EXYNOS3250";
-		break;
-	case EXYNOS4210_SOC_ID:
-		soc_name = "EXYNOS4210";
-		break;
-	case EXYNOS4212_SOC_ID:
-		soc_name = "EXYNOS4212";
-		break;
-	case EXYNOS4412_SOC_ID:
-		soc_name = "EXYNOS4412";
-		break;
-	case EXYNOS4415_SOC_ID:
-		soc_name = "EXYNOS4415";
-		break;
-	case EXYNOS5250_SOC_ID:
-		soc_name = "EXYNOS5250";
-		break;
-	case EXYNOS5260_SOC_ID:
-		soc_name = "EXYNOS5260";
-		break;
-	case EXYNOS5420_SOC_ID:
-		soc_name = "EXYNOS5420";
-		break;
-	case EXYNOS5440_SOC_ID:
-		soc_name = "EXYNOS5440";
-		break;
-	case EXYNOS5800_SOC_ID:
-		soc_name = "EXYNOS5800";
-		break;
-	case EXYNOS7872_SOC_ID:
-		soc_name = "EXYNOS7872";
-		break;
-	case EXYNOS7885_SOC_ID:
-		soc_name = "EXYNOS7885";
-		break;
-	case EXYNOS8890_SOC_ID:
-		soc_name = "EXYNOS8890";
-		break;
-	case EXYNOS8895_SOC_ID:
-		soc_name = "EXYNOS8895";
-		break;
-	default:
-		soc_name = "UNKNOWN";
-	}
-	return soc_name;
-}
-static const struct exynos_chipid_variant drv_data_exynos8890 = {
-	.product_ver	= 1,
-	.unique_id_reg	= 0x14,
-	.rev_reg	= 0x0,
-	.main_rev_bit	= 0,
-	.sub_rev_bit	= 4,
-};
-
-static const struct exynos_chipid_variant drv_data_exynos8895 = {
-	.product_ver	= 1,
-	.unique_id_reg	= 0x04,
-	.rev_reg	= 0x10,
-	.main_rev_bit	= 20,
-	.sub_rev_bit	= 16,
-};
-
-static const struct exynos_chipid_variant drv_data_exynos7872 = {
-	.product_ver	= 2,
-	.unique_id_reg	= 0x04,
-	.rev_reg	= 0x10,
-	.main_rev_bit	= 20,
-	.sub_rev_bit	= 16,
-};
-
-static const struct exynos_chipid_variant drv_data_exynos7885 = {
-	.product_ver	= 1,
-	.unique_id_reg	= 0x04,
-	.rev_reg	= 0x10,
-	.main_rev_bit	= 20,
-	.sub_rev_bit	= 16,
-};
-
-
-static const struct of_device_id of_exynos_chipid_ids[] = {
-	{
-		.compatible	= "samsung,exynos8890-chipid",
-		.data		= &drv_data_exynos8890,
-	},
-	{
-		.compatible	= "samsung,exynos8895-chipid",
-		.data		= &drv_data_exynos8895,
-	},
-	{
-		.compatible	= "samsung,exynos7872-chipid",
-		.data		= &drv_data_exynos7872,
-	},
-	{
-		.compatible	= "samsung,exynos7885-chipid",
-		.data		= &drv_data_exynos7885,
-	},
-	{},
-};
-
-static void __init exynos_chipid_get_chipid_info(void)
-{
-	const struct exynos_chipid_variant *data = exynos_soc_info.drv_data;
-	u64 val;
-
-	val = __raw_readl(exynos_soc_info.reg);
-
-	switch (data->product_ver) {
-	case 2:
-		exynos_soc_info.product_id = val & EXYNOS_SOC_MASK_V2;
-		break;
-	case 1:
-	default:
-		exynos_soc_info.product_id = val & EXYNOS_SOC_MASK;
-		break;
-	}
-
-	val = __raw_readl(exynos_soc_info.reg + data->rev_reg);
-	exynos_soc_info.main_rev = (val >> data->main_rev_bit) & EXYNOS_REV_MASK;
-	exynos_soc_info.sub_rev = (val >> data->sub_rev_bit) & EXYNOS_REV_MASK;
-
-	if (exynos_soc_info.product_id == EXYNOS7885_SOC_ID) {
-		if ((exynos_soc_info.sub_rev == 1) && (val & 0x04000000))
-			exynos_soc_info.sub_rev = 2;
-	}
-
-	exynos_soc_info.revision = (exynos_soc_info.main_rev << 4) | exynos_soc_info.sub_rev;
-
-	val = __raw_readl(exynos_soc_info.reg + data->unique_id_reg);
-	val |= (u64)__raw_readl(exynos_soc_info.reg + data->unique_id_reg + 4) << 32UL;
-	exynos_soc_info.unique_id  = val;
-	exynos_soc_info.lot_id = val & EXYNOS_LOTID_MASK;
-}
-
-/**
- *  exynos_chipid_early_init: Early chipid initialization
- *  @dev: pointer to chipid device
- */
-void __init exynos_chipid_early_init(void)
-{
-	struct device_node *np;
-	const struct of_device_id *match;
-
-	if (exynos_soc_info.reg)
-		return;
-
-	np = of_find_matching_node_and_match(NULL, of_exynos_chipid_ids, &match);
-	if (!np || !match)
-		panic("%s, failed to find chipid node or match\n", __func__);
-
-	exynos_soc_info.drv_data = (struct exynos_chipid_variant *)match->data;
-	exynos_soc_info.reg = of_iomap(np, 0);
-	if (!exynos_soc_info.reg)
-		panic("%s: failed to map registers\n", __func__);
-
-	exynos_chipid_get_chipid_info();
-}
-
-static int __init exynos_chipid_probe(struct platform_device *pdev)
-{
-	struct soc_device_attribute *soc_dev_attr;
-	struct soc_device *soc_dev;
-	struct device_node *root;
-	int ret;
-
-	soc_dev_attr = kzalloc(sizeof(*soc_dev_attr), GFP_KERNEL);
-	if (!soc_dev_attr)
-		return -ENODEV;
-
-	soc_dev_attr->family = "Samsung Exynos";
-
-	root = of_find_node_by_path("/");
-	ret = of_property_read_string(root, "model", &soc_dev_attr->machine);
-	of_node_put(root);
-	if (ret)
-		goto free_soc;
-
-	soc_dev_attr->revision = kasprintf(GFP_KERNEL, "%d",
-					exynos_soc_info.revision);
-	if (!soc_dev_attr->revision)
-		goto free_soc;
-
-	soc_dev_attr->soc_id = product_id_to_name(exynos_soc_info.product_id);
-	soc_ap_id = product_id_to_name(exynos_soc_info.product_id);
-	soc_dev = soc_device_register(soc_dev_attr);
-	if (IS_ERR(soc_dev))
-		goto free_rev;
-
-	soc_device_to_device(soc_dev);
-	dev_info(&pdev->dev, "Exynos: CPU[%s] CPU_REV[0x%x] Detected\n",
-			product_id_to_name(exynos_soc_info.product_id),
-			exynos_soc_info.revision);
-	return 0;
-free_rev:
-	kfree(soc_dev_attr->revision);
-free_soc:
-	kfree(soc_dev_attr);
-	return -EINVAL;
-}
-
-static struct platform_driver exynos_chipid_driver __refdata = {
-	.driver = {
-		.name = "exynos-chipid",
-		.of_match_table = of_exynos_chipid_ids,
-	},
-	.probe = exynos_chipid_probe,
-};
-
-static int __init exynos_chipid_init(void)
-{
-	exynos_chipid_early_init();
-	return platform_driver_register(&exynos_chipid_driver);
-}
-core_initcall(exynos_chipid_init);
-
-/*
- *  sysfs implementation for exynos-snapshot
- *  you can access the sysfs of exynos-snapshot to /sys/devices/system/chip-id
- *  path.
- */
-static struct bus_type chipid_subsys = {
-	.name = "chip-id",
-	.dev_name = "chip-id",
-};
-
-static ssize_t chipid_product_id_show(struct kobject *kobj,
-			         struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, 10, "%08X\n", exynos_soc_info.product_id);
-}
-
-// [BigData] For display of HRM Apk
-static ssize_t chipid_ap_id_show(struct kobject *kobj,
-			         struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, 30, "%s EVT%d.%d\n", soc_ap_id, exynos_soc_info.revision>>4, exynos_soc_info.revision%16);
-}
-
-static ssize_t chipid_unique_id_show(struct kobject *kobj,
-			         struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, 20, "%010LX\n", exynos_soc_info.unique_id);
-}
-
-static ssize_t chipid_lot_id_show(struct kobject *kobj,
-			         struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, 14, "%08X\n", exynos_soc_info.lot_id);
-}
-
-static ssize_t chipid_revision_show(struct kobject *kobj,
-			         struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, 14, "%08X\n", exynos_soc_info.revision);
-}
-
-static ssize_t chipid_evt_ver_show(struct kobject *kobj,
-                                struct kobj_attribute *attr, char *buf)
-{
-	if (exynos_soc_info.revision == 0)
-		return snprintf(buf, 14, "EVT0\n");
-	else
-		return snprintf(buf, 14, "EVT%1X.%1X\n",
-				exynos_soc_info.main_rev,
-				exynos_soc_info.sub_rev);
-}
-
-static struct kobj_attribute chipid_product_id_attr =
-        __ATTR(product_id, 0644, chipid_product_id_show, NULL);
-
-static struct kobj_attribute chipid_ap_id_attr =
-        __ATTR(ap_id, 0644, chipid_ap_id_show, NULL);
-
-static struct kobj_attribute chipid_unique_id_attr =
-        __ATTR(unique_id, 0644, chipid_unique_id_show, NULL);
-
-static struct kobj_attribute chipid_lot_id_attr =
-        __ATTR(lot_id, 0644, chipid_lot_id_show, NULL);
-
-static struct kobj_attribute chipid_revision_attr =
-        __ATTR(revision, 0644, chipid_revision_show, NULL);
-
-static struct kobj_attribute chipid_evt_ver_attr =
-	__ATTR(evt_ver, 0644, chipid_evt_ver_show, NULL);
-
-static struct attribute *chipid_sysfs_attrs[] = {
-	&chipid_product_id_attr.attr,
-	&chipid_ap_id_attr.attr,
-	&chipid_unique_id_attr.attr,
-	&chipid_lot_id_attr.attr,
-	&chipid_revision_attr.attr,
-	&chipid_evt_ver_attr.attr,
-	NULL,
-};
-
-static struct attribute_group chipid_sysfs_group = {
-	.attrs = chipid_sysfs_attrs,
-};
-
-static const struct attribute_group *chipid_sysfs_groups[] = {
-	&chipid_sysfs_group,
-	NULL,
-};
-
-static ssize_t svc_ap_show(struct kobject *kobj,
-			struct kobj_attribute *attr, char *buf)
-{
-	return snprintf(buf, 20, "%010llX\n",
-			(exynos_soc_info.unique_id));
-}
-
-static struct kobj_attribute svc_ap_attr =
-		__ATTR(SVC_AP, 0644, svc_ap_show, NULL);
-
-extern struct kset *devices_kset;
-
-void sysfs_create_svc_ap(void)
-{
-	struct kernfs_node *svc_sd;
-	struct kobject *data;
-	struct kobject *ap;
-
-	/* To find svc kobject */
-	svc_sd = sysfs_get_dirent(devices_kset->kobj.sd, "svc");
-	if (IS_ERR_OR_NULL(svc_sd)) {
-		/* try to create svc kobject */
-		data = kobject_create_and_add("svc", &devices_kset->kobj);
-		if (IS_ERR_OR_NULL(data))
-			pr_info("Existing path sys/devices/svc : 0x%pK\n", data);
-		else
-			pr_info("Created sys/devices/svc svc : 0x%pK\n", data);
-	} else {
-		data = (struct kobject *)svc_sd->priv;
-		pr_info("Found svc_sd : 0x%pK svc : 0x%pK\n", svc_sd, data);
-	}
-
-	ap = kobject_create_and_add("AP", data);
-	if (IS_ERR_OR_NULL(ap))
-		pr_info("Failed to create sys/devices/svc/AP : 0x%pK\n", ap);
-	else
-		pr_info("Success to create sys/devices/svc/AP : 0x%pK\n", ap);
-
-	if (sysfs_create_file(ap, &svc_ap_attr.attr) < 0) {
-		pr_err("failed to create sys/devices/svc/AP/SVC_AP, %s\n",
-		svc_ap_attr.attr.name);
-	}
-}
-
-static int __init chipid_sysfs_init(void)
-{
-	int ret = 0;
-
-	ret = subsys_system_register(&chipid_subsys, chipid_sysfs_groups);
-	if (ret)
-		pr_err("fail to register exynos-snapshop subsys\n");
-
-	sysfs_create_svc_ap();
-
-	return ret;
-}
-late_initcall(chipid_sysfs_init);
-
+OPAD_INT_STAT_EN__GPIO_INT_STAT_EN__SHIFT 0x0
+#define GPIOPAD_INT_STAT_EN__SW_INITIATED_INT_STAT_EN_MASK 0x80000000
+#define GPIOPAD_INT_STAT_EN__SW_INITIATED_INT_STAT_EN__SHIFT 0x1f
+#define GPIOPAD_INT_STAT__GPIO_INT_STAT_MASK 0x1fffffff
+#define GPIOPAD_INT_STAT__GPIO_INT_STAT__SHIFT 0x0
+#define GPIOPAD_INT_STAT__SW_INITIATED_INT_STAT_MASK 0x80000000
+#define GPIOPAD_INT_STAT__SW_INITIATED_INT_STAT__SHIFT 0x1f
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_0_MASK 0x1
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_0__SHIFT 0x0
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_1_MASK 0x2
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_1__SHIFT 0x1
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_2_MASK 0x4
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_2__SHIFT 0x2
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_3_MASK 0x8
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_3__SHIFT 0x3
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_4_MASK 0x10
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_4__SHIFT 0x4
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_5_MASK 0x20
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_5__SHIFT 0x5
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_6_MASK 0x40
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_6__SHIFT 0x6
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_7_MASK 0x80
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_7__SHIFT 0x7
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_8_MASK 0x100
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_8__SHIFT 0x8
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_9_MASK 0x200
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_9__SHIFT 0x9
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_10_MASK 0x400
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_10__SHIFT 0xa
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_11_MASK 0x800
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_11__SHIFT 0xb
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_12_MASK 0x1000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_12__SHIFT 0xc
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_13_MASK 0x2000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_13__SHIFT 0xd
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_14_MASK 0x4000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_14__SHIFT 0xe
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_15_MASK 0x8000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_15__SHIFT 0xf
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_16_MASK 0x10000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_16__SHIFT 0x10
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_17_MASK 0x20000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_17__SHIFT 0x11
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_18_MASK 0x40000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_18__SHIFT 0x12
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_19_MASK 0x80000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_19__SHIFT 0x13
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_20_MASK 0x100000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_20__SHIFT 0x14
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_21_MASK 0x200000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_21__SHIFT 0x15
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_22_MASK 0x400000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_22__SHIFT 0x16
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_23_MASK 0x800000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_23__SHIFT 0x17
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_24_MASK 0x1000000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_24__SHIFT 0x18
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_25_MASK 0x2000000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_25__SHIFT 0x19
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_26_MASK 0x4000000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_26__SHIFT 0x1a
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_27_MASK 0x8000000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_27__SHIFT 0x1b
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_28_MASK 0x10000000
+#define GPIOPAD_INT_STAT_AK__GPIO_INT_STAT_AK_28__SHIFT 0x1c
+#define GPIOPAD_INT_STAT_AK__SW_INITIATED_INT_STAT_AK_MASK 0x80000000
+#define GPIOPAD_INT_STAT_AK__SW_INITIATED_INT_STAT_AK__SHIFT 0x1f
+#define GPIOPAD_INT_EN__GPIO_INT_EN_MASK 0x1fffffff
+#define GPIOPAD_INT_EN__GPIO_INT_EN__SHIFT 0x0
+#define GPIOPAD_INT_EN__SW_INITIATED_INT_EN_MASK 0x80000000
+#define GPIOPAD_INT_EN__SW_INITIATED_INT_EN__SHIFT 0x1f
+#define GPIOPAD_INT_TYPE__GPIO_INT_TYPE_MASK 0x1fffffff
+#define GPIOPAD_INT_TYPE__GPIO_INT_TYPE__SHIFT 0x0
+#define GPIOPAD_INT_TYPE__SW_INITIATED_INT_TYPE_MASK 0x80000000
+#define GPIOPAD_INT_TYPE__SW_INITIATED_INT_TYPE__SHIFT 0x1f
+#define GPIOPAD_INT_POLARITY__GPIO_INT_POLARITY_MASK 0x1fffffff
+#define GPIOPAD_INT_POLARITY__GPIO_INT_POLARITY__SHIFT 0x0
+#define GPIOPAD_INT_POLARITY__SW_INITIATED_INT_POLARITY_MASK 0x80000000
+#define GPIOPAD_INT_POLARITY__SW_INITIATED_INT_POLARITY__SHIFT 0x1f
+#define GPIOPAD_EXTERN_TRIG_CNTL__EXTERN_TRIG_SEL_MASK 0x1f
+#define GPIOPAD_EXTERN_TRIG_CNTL__EXTERN_TRIG_SEL__SHIFT 0x0
+#define GPIOPAD_EXTERN_TRIG_CNTL__EXTERN_TRIG_CLR_MASK 0x20
+#define GPIOPAD_EXTERN_TRIG_CNTL__EXTERN_TRIG_CLR__SHIFT 0x5
+#define GPIOPAD_EXTERN_TRIG_CNTL__EXTERN_TRIG_READ_MASK 0x40
+#define GPIOPAD_EXTERN_TRIG_CNTL__EXTERN_TRIG_READ__SHIFT 0x6
+#define GPIOPAD_RCVR_SEL__GPIO_RCVR_SEL_MASK 0x7fffffff
+#define GPIOPAD_RCVR_SEL__GPIO_RCVR_SEL__SHIFT 0x0
+#define GPIOPAD_PU_EN__GPIO_PU_EN_MASK 0x7fffffff
+#define GPIOPAD_PU_EN__GPIO_PU_EN__SHIFT 0x0
+#define GPIOPAD_PD_EN__GPIO_PD_EN_MASK 0x7fffffff
+#define GPIOPAD_PD_EN__GPIO_PD_EN__SHIFT 0x0
+#define CG_FPS_CNT__FPS_CNT_MASK 0xffffffff
+#define CG_FPS_CNT__FPS_CNT__SHIFT 0x0
+#define SMU_IND_INDEX_0__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_IND_INDEX_0__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_IND_DATA_0__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_IND_DATA_0__SMC_IND_DATA__SHIFT 0x0
+#define SMU_IND_INDEX_1__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_IND_INDEX_1__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_IND_DATA_1__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_IND_DATA_1__SMC_IND_DATA__SHIFT 0x0
+#define SMU_IND_INDEX_2__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_IND_INDEX_2__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_IND_DATA_2__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_IND_DATA_2__SMC_IND_DATA__SHIFT 0x0
+#define SMU_IND_INDEX_3__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_IND_INDEX_3__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_IND_DATA_3__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_IND_DATA_3__SMC_IND_DATA__SHIFT 0x0
+#define SMU_IND_INDEX_4__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_IND_INDEX_4__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_IND_DATA_4__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_IND_DATA_4__SMC_IND_DATA__SHIFT 0x0
+#define SMU_IND_INDEX_5__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_IND_INDEX_5__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_IND_DATA_5__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_IND_DATA_5__SMC_IND_DATA__SHIFT 0x0
+#define SMU_IND_INDEX_6__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_IND_INDEX_6__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_IND_DATA_6__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_IND_DATA_6__SMC_IND_DATA__SHIFT 0x0
+#define SMU_IND_INDEX_7__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_IND_INDEX_7__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_IND_DATA_7__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_IND_DATA_7__SMC_IND_DATA__SHIFT 0x0
+#define SMU_SMC_IND_INDEX__SMC_IND_ADDR_MASK 0xffffffff
+#define SMU_SMC_IND_INDEX__SMC_IND_ADDR__SHIFT 0x0
+#define SMU_SMC_IND_DATA__SMC_IND_DATA_MASK 0xffffffff
+#define SMU_SMC_IND_DATA__SMC_IND_DATA__SHIFT 0x0
+#define RCU_UC_EVENTS__RCU_TST_jpc_rep_req_MASK 0x1
+#define RCU_UC_EVENTS__RCU_TST_jpc_rep_req__SHIFT 0x0
+#define RCU_UC_EVENTS__TST_RCU_jpc_rep_done_MASK 0x2
+#define RCU_UC_EVENTS__TST_RCU_jpc_rep_done__SHIFT 0x1
+#define RCU_UC_EVENTS__drv_rst_mode_MASK 0x4
+#define RCU_UC_EVENTS__drv_rst_mode__SHIFT 0x2
+#define RCU_UC_EVENTS__SMU_DC_efuse_status_invalid_MASK 0x8
+#define RCU_UC_EVENTS__SMU_DC_efuse_status_invalid__SHIFT 0x3
+#define RCU_UC_EVENTS__TP_Tester_MASK 0x40
+#define RCU_UC_EVENTS__TP_Tester__SHIFT 0x6
+#define RCU_UC_EVENTS__boot_seq_done_MASK 0x80
+#define RCU_UC_EVENTS__boot_seq_done__SHIFT 0x7
+#define RCU_UC_EVENTS__sclk_deep_sleep_exit_MASK 0x100
+#define RCU_UC_EVENTS__sclk_deep_sleep_exit__SHIFT 0x8
+#define RCU_UC_EVENTS__BREAK_PT1_ACTIVE_MASK 0x200
+#define RCU_UC_EVENTS__BREAK_PT1_ACTIVE__SHIFT 0x9
+#define RCU_UC_EVENTS__BREAK_PT2_ACTIVE_MASK 0x400
+#define RCU_UC_EVENTS__BREAK_PT2_ACTIVE__SHIFT 0xa
+#define RCU_UC_EVENTS__FCH_HALT_MASK 0x800
+#define RCU_UC_EVENTS__FCH_HALT__SHIFT 0xb
+#define RCU_UC_EVENTS__RCU_GIO_fch_lockdown_MASK 0x2000
+#define RCU_UC_EVENTS__RCU_GIO_fch_lockdown__SHIFT 0xd
+#define RCU_UC_EVENTS__INTERRUPTS_ENABLED_MASK 0x10000
+#define RCU_UC_EVENTS__INTERRUPTS_ENABLED__SHIFT 0x10
+#define RCU_UC_EVENTS__RCU_DtmCnt0_Done_MASK 0x20000
+#define RCU_UC_EVENTS__RCU_DtmCnt0_Done__SHIFT 0x11
+#define RCU_UC_EVENTS__RCU_DtmCnt1_Done_MASK 0x40000
+#define RCU_UC_EVENTS__RCU_DtmCnt1_Done__SHIFT 0x12
+#define RCU_UC_EVENTS__RCU_DtmCnt2_Done_MASK 0x80000
+#define RCU_UC_EVENTS__RCU_DtmCnt2_Done__SHIFT 0x13
+#define RCU_UC_EVENTS__irq31_sel_MASK 0x3000000
+#define RCU_UC_EVENTS__irq31_sel__SHIFT 0x18
+#define RCU_MISC_CTRL__REG_DRV_RST_MODE_MASK 0x2
+#define RCU_MISC_CTRL__REG_DRV_RST_MODE__SHIFT 0x1
+#define RCU_MISC_CTRL__REG_RCU_MEMREP_DIS_MASK 0x8
+#define RCU_MISC_CTRL__REG_RCU_MEMREP_DIS__SHIFT 0x3
+#define RCU_MISC_CTRL__REG_CC_FUSE_DISABLE_MASK 0x10
+#define RCU_MISC_CTRL__REG_CC_FUSE_DISABLE__SHIFT 0x4
+#define RCU_MISC_CTRL__REG_SAMU_FUSE_DISABLE_MASK 0x20
+#define RCU_MISC_CTRL__REG_SAMU_FUSE_DISABLE__SHIFT 0x5
+#define RCU_MISC_CTRL__REG_CC_SRBM_RD_DISABLE_MASK 0x100
+#define RCU_MISC_CTRL__REG_CC_SRBM_RD_DISABLE__SHIFT 0x8
+#define RCU_MISC_CTRL__BREAK_PT1_DONE_MASK 0x10000
+#define RCU_MISC_CTRL__BREAK_PT1_DONE__SHIFT 0x10
+#define RCU_MISC_CTRL__BREAK_PT2_DONE_MASK 0x20000
+#define RCU_MISC_CTRL__BREAK_PT2_DONE__SHIFT 0x11
+#define RCU_MISC_CTRL__SAMU_START_MASK 0x400000
+#define RCU_MISC_CTRL__SAMU_START__SHIFT 0x16
+#define RCU_MISC_CTRL__RST_PULSE_WIDTH_MASK 0xff800000
+#define RCU_MISC_CTRL__RST_PULSE_WIDTH__SHIFT 0x17
+#define CC_RCU_FUSES__GPU_DIS_MASK 0x2
+#define CC_RCU_FUSES__GPU_DIS__SHIFT 0x1
+#define CC_RCU_FUSES__DEBUG_DISABLE_MASK 0x4
+#define CC_RCU_FUSES__DEBUG_DISABLE__SHIFT 0x2
+#define CC_RCU_F

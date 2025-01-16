@@ -1,1091 +1,72 @@
-/*
- * Copyright 2013 Freescale Semiconductor, Inc.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- */
+                            (alle anderen m√∂glichen Einstiegspunkte werden ignoriert) (Kurz-
+                              form: -m).
+-fullpaths                    Der Compiler generiert vollqualifizierte Pfade.
+-filealign:<n>                Gibt die Ausrichtung an, die f√ºr Ausgabedateiabschnitte
+                              verwendet werden soll.
+-pathmap:<K1>=<V1>,<K2>=<V2>,...
+                              Gibt eine Zuordnung f√ºr die Quellpfadnamen an, die vom
+                              Compiler ausgegeben werden.
+-pdb:<Datei>                   Gibt den Namen der Debuginformationsdatei an (Standard:
+                              Ausgabe des Dateinamens mit PDB-Erweiterung).
+-errorendlocation             Gibt f√ºr jeden Fehler die Zeile und Spalte
+                              des Endpunkts aus.
+-preferreduilang              Gibt den Namen der bevorzugten Ausgabesprache an.
+-nosdkpath                    Deaktiviert die Suche nach dem SDK-Standardpfad f√ºr Standardbibliotheksassemblys.
+-nostdlib[+|-]                Kein Verweis auf die Standardbibliothek (mscorlib.dll).
+-subsystemversion:<Zeichenfolge>    Gibt die Subsystemversion dieser Assembly an.
+-lib:<Dateiliste>              Gibt zus√§tzliche Verzeichnisse an, in denen nach Verweisen
+                              gesucht werden soll.
+-errorreport:<Zeichenfolge>         Gibt die Verarbeitung interner Compilerfehler an:
+                              "prompt", "send", "queue" oder "none". Der Standardwert lautet
+                              "queue".
+-appconfig:<Datei>             Gibt eine Anwendungskonfigurationsdatei
+                              mit Assemblybindungseinstellungen an.
+-moduleassemblyname:<Zeichenfolge>  Der Name der Assembly, zu der dieses Modul
+                              geh√∂ren wird.
+-modulename:<Zeichenfolge>          Gibt den Quellmodulnamen an.
+-generatedfilesout:<dir>      Platziert die beim Kompiliervorgang generierten Dateien
+                              im angegebenen Verzeichnis.
+Sammlungcontravariantcontravariant	covariant	covariant%Standardschnittstellenimplementierung$Das Verzeichnis ist nicht vorhanden.$Der Pfad ist zu lang oder ung√ºltig.
+Verwerfbarfixed-Variableforeach-Iterationsvariable5Alternative interpolierte ausf√ºhrliche Zeichenfolgen
+and-MusterAnonyme Methodenanonyme TypenAsync-Funktionasynchrones HauptelementAsynchrone Streamsasynchrone using-Anweisungauto default struct fields(automatisch implementierte Eigenschaften)Automatische Eigenschafteninitialisierungbin√§re Literalechecked user-defined operatorsZusammenf√ºgungszuweisungSammlungsinitialisierer%Konstante interpolierte ZeichenfolgenCovariante R√ºckgabenStandardoperatorStandardliteral+Parametereinschr√§nkungen vom Typ "default"-Generische Typeneinschr√§nkungen f√ºr DelegatW√∂rterbuchinitialisiererZifferntrennzeichenAusschussvariablenMusterbasierte Entsorgung	Dynamisch1Generische Typeneinschr√§nkungen f√ºr EnumerationAusnahmefilter1Eigenschaftszugriffsmethode f√ºr Ausdrucksk√∂rper0Konstruktor und Destruktor f√ºr Ausdrucksk√∂rperAusdrucksk√∂rperindexerAusdrucksk√∂rpermethodeAusdrucksk√∂rpereigenschaftHDeklaration von Ausdrucksvariablen in Memberinitialisierern und AbfragenErweiterte partielle Methoden$Muster f√ºr erweiterte EigenschaftenErweiterbare fixed-Anweisung Erweiterung "GetAsyncEnumerator"Erweiterung "GetEnumerator"Erweiterungsmethodeexterner AliasExterne lokale FunktionenDateibereichsnamespacePuffer fester Gr√∂√üeFunktionszeigerGenerische AttributeGenerikaNamespacealias-Qualifiziererglobale using-Anweisungimplizit typisiertes Array#implizit typisierte lokale VariableObjekterstellung mit Zieltyp)Handler einer interpolierten ZeichenfolgeIndexoperator2Bewegliche Puffer fester Gr√∂√üe werden indiziert.abgeleiteter Delegattypinit-only-SetterInterpolierte Zeichenfolgen
+IteratorenLambdaausdruckLambdaattribute*Parameter zum Verwerfen von LambdafunktionLambda-R√ºckgabetyp(Trennzeichen f√ºr vorangestellte ZiffernZeilenabstand-AnweisungListenmusterAttribute lokaler Funktionenlokale FunktionenMemberNotNull-Attribut<Gemischte Deklarationen und Ausdr√ºcke in der Dekonstruktion#Modul als AttributzielspezifiziererModulinitialisierer,Namensshadowing in geschachtelten Funktionenbenanntes Argumentnameof-OperatorInteger-Werte nativer Gr√∂√üe*"stackalloc" in geschachtelten Ausdr√ºcken"Zeilenumbr√ºche in Interpolationen+notnull-Einschr√§nkung f√ºr generischen Typ
+not-Muster"Muster f√ºr NULL-Zeiger-KonstantenNull-progagierender OperatorTypen, die NULL-Werte zulassenNullable-VerweistypenObjektinitialisierer#veraltet f√ºr Eigenschaftenaccessoroptionaler Parameter	or-Musterout-Variablendeklaration#Parameterlose Strukturkonstruktorenin Klammern gesetztes Musterpartielle Methodepartielle TypenMusterabgleichPositionsfelder in Datens√§tzen#pragmaWarnungsaktion "enable"privat gesch√ºtzt'Zugriffsmodifizierer f√ºr EigenschaftenAbfrageausdruckBereichsoperatorRohzeichenfolgenliteralereadonly-Memberschreibgesch√ºtzte Verweiseschreibgesch√ºtzte Strukturen;Schreibgesch√ºtzte automatisch implementierte EigenschaftenDatensatzstrukturenDatens√§tzeRekursive MusterBedingter ref-AusdruckReferenzerweiterungsmethodenVerweis auf for-loop-Variablen'Verweis auf foreach-Iterationsvariablen$Lokale byref-Elemente und R√ºckgabenref-NeuzuweisungReferenzstrukturenrelationales Muster#versiegelte "ToString" im Datensatz7pattern matching ReadOnly/Span<char> on constant stringstackalloc-Initialisierer,Statische abstrakte Member in SchnittstellenStatische anonyme Funktionstatische KlassenStatische lokale FunktionenStrukturfeldinitialisierer<switch-Ausdruck>Schalter f√ºr booleschen TypBedingter Ausdruck mit Zieltypthrow-AusdruckTupelgleichheitTupel	Typmuster
+TypvarianzUtf8 String Literals?Uneingeschr√§nkte Typparameter in NULL-Zusammenf√ºgungsoperator#nicht verwaltete konstruierte Typen1Nicht verwaltete generische Typeneinschr√§nkungenunsigned right shiftUsing-Deklarationenverwendet statische5Varianzsicherheit f√ºr statische Schnittstellenmember"with" in anonymen Typen"with" in Strukturen<globaler Namespace>	invariantLIB-UmgebungsvariableOption "/LIB"LambdaausdruckUnterst√ºtzte Sprachversionen:{0} Version {1}=Copyright (C) Microsoft Corporation. Alle Rechte vorbehalten.Methodengruppe<NULL><Namespace>.Der Vorgang verursachte einen Stapel√ºberlauf.]Einschr√§nkungen f√ºr Au√üerkraftsetzung und explizite Schnittstellenimplementierungsmethoden	Parameter!NULL-√úberpr√ºfung des Parameters<Pfadliste>/REFERENCEPATH-Option1(Position des Symbols f√ºr den vorherigen Fehler)1(Position des Symbols f√ºr die vorherige Warnung)	R√ºckgabeusing-AliasKonstruktorEreignisexterner AliasFeldBezeichnungMethode	NamespaceEigenschaftTypTypparameterElementVariable<Text>throw-Ausdruck Microsoft (R) Visual C# CompilerAnweisungen der obersten Ebeneusing-Variable'"experimentell" Ung√ºltiges Include-Tag U Der enthaltene XML-Abschnitt konnte nur teilweise oder gar nicht eingef√ºgt werden. :<!-- Badly formed XML comment ignored for member "{0}" -->@ Ung√ºltiger XML-Code. Datei "{0}" kann nicht einbezogen werden.Dateiattribut fehltPfadattribut fehltO F√ºr folgendes Include-Tag wurden keine √ºbereinstimmenden Elemente gefunden. mEinige Typen werden in der Analyzer-Assembly {0} aufgrund von ReflectionTypeLoadException √ºbersprungen: {1}.~Das Laden von Typen in der Analyseassembly √ºberspringen, bei denen durch eine ReflectionTypeLoadException ein Fehler auftrat.ÑGetDeclarationName wurde f√ºr einen Deklarationsknoten aufgerufen, der m√∂glicherweise mehrere Variablendeklaratoren enthalten kann."Elemente: D√ºrfen nicht leer sein.DF√ºr eine minimale Typqualifizierung muss der Pfad angegeben werden.ALookupOptions weist eine ung√ºltige Kombination von Optionen auf.Namenskonflikt f√ºr Name {0}.SearchCriteria wird erwartet.Kein C#-Symbol.yAngegeben wurden {0} Parametertypen und {1} Arten von Parameterverweisen. Diese Arrays m√ºssen dieselbe L√§nge aufweisen.D"RefKind.Out" ist keine g√ºltige Verweisart f√ºr einen R√ºckgabetyp.IDie Position ist nicht innerhalb des Syntaxbaums mit dem Vollbereich {0}.2Die Position muss im Bereich des Syntaxbaums sein.`Der zu analysierende Syntaxknoten kann nicht zum Syntaxbaum der aktuellen Kompilierung geh√∂ren./Es kann nur ein Syntaxbaum √ºbermittelt werden.+Es kann nur Skriptcode √ºbermittelt werden..Der Syntaxknoten geh√∂rt nicht zum Syntaxbaum.%Der Syntaxbaum ist bereits vorhanden.eSyntaxTree ist das Ergebnis einer #load-Direktive und kann nicht direkt entfernt oder ersetzt werden.>Der Syntaxbaum sollte aus einer √úbermittlung erstellt werden.*SyntaxTree ist kein Teil der Kompilierung.OSyntaxTree ist kein Teil der Kompilierung und kann daher nicht entfernt werden.SF√ºr eine minimale Typqualifizierung muss SyntaxTreeSemanticModel angegeben werden.VDiese Methode kann nur zum Erstellen von Token verwendet werden. "{0}" ist kein Token.IDer Baum muss einen Stammknoten mit SyntaxKind.CompilationUnit aufweisen.)Der Baum ist nicht Teil der Kompilierung.%Das Typargument kann nicht NULL sein.oVerwenden Sie "Microsoft.CodeAnalysis.CSharp.SyntaxFactory.Literal" zum Erstellen von numerischen Literaltoken.jVerwenden Sie "Microsoft.CodeAnalysis.CSharp.SyntaxFactory.Literal" zum Erstellen von Zeichenliteraltoken.ØVerwenden Sie "Microsoft.CodeAnalysis.CSharp.SyntaxFactory.Identifier" oder "Microsoft.CodeAnalysis.CSharp.SyntaxFactory.VerbatimIdentifier" zum Erstellen von Bezeichnertoken.oAusrichtungswert {0} hat einen Wert gr√∂√üer {1} und kann eine gro√üe formatierte Zeichenfolge zur Folge haben.kDer Ausrichtungswert weist eine Gr√∂√üe auf, die eine gro√üe formatierte Zeichenfolge zur Folge haben kann.8Das Ergebnis des Ausdrucks ist immer NULL vom Typ "{0}"..Das Ergebnis des Ausdrucks lautet immer 'null'•Mehrdeutiger Verweis in cref-Attribut: "{0}". "{1}" wird angenommen, es sind jedoch auch √úbereinstimmungen mit anderen √úberladungen einschlie√ülich "{2}" m√∂glich.%Zweideutige Referenz im cref-AttributGEine Instanz des {0}-Analyzers kann nicht aus {1} erstellt werden: {2}..Es konnte keine Analyseinstanz erstellt werdencDie Assembly "{0}" mit dem Typ "{1}" verweist auf das .NET Framework. Dies wird nicht unterst√ºtzt.TDie geladene Assembly verweist auf das .NET Framework. Dies wird nicht unterst√ºtzt.iDas Attribut "{0}" aus dem Modul "{1}" wird ignoriert, stattdessen wird die Instanz der Quelle verwendet.YAttribut wird ignoriert, damit die in der Quelle angezeigte Instanz bevorzugt werden kann˜"{0}" (lokal) dient als Argument f√ºr eine using- oder lock-Anweisung, hat jedoch m√∂glicherweise einen falschen Wert zugewiesen bekommen. Der Dispose-Aufruf bzw. das Aufheben der Sperre erfolgt f√ºr den urspr√ºnglichen Wert der lokalen Variablen.rM√∂glicherweise falsche Zuweisung zur lokalen Ressource, die das Argument zu einer using- oder lock-Anweisung ist.QZuweisung zur gleichen Variablen. Wollten Sie eine andere Zuweisung durchf√ºhren?9Die Zuweisung wurde f√ºr dieselbe Variable durchgef√ºhrt.∑In dieser Async-Methode fehlen die "await"-Operatoren, weshalb sie synchron ausgef√ºhrt wird. Sie sollten die Verwendung des "await"-Operators oder von "await Task.Run(...)" in Betracht ziehen, um auf nicht blockierende API-Aufrufe zu warten bzw. CPU-gebundene Aufgaben auf einem Hintergrundthread auszuf√ºhren.]Bei der asynchronen Methode fehlen "await"-Operatoren. Die Methode wird synchron ausgef√ºhrt.nDer Typ "{0}" kann in diesem Kontext nicht verwendet werden, da er nicht in Metadaten dargestellt werden kann.lDer Typ kann in diesem Kontext nicht verwendet werden, da er nicht in den Metadaten dargestellt werden kann.ODas Attribut "{0}" wird ignoriert, wenn √∂ffentliche Signierung angegeben wird.IDas Attribut wird ignoriert, wenn √∂ffentliche Signierung angegeben wird.®"{0}" ist kein g√ºltiger Attributpfad f√ºr diese Deklaration. G√ºltige Attributpfade f√ºr diese Deklaration sind "{1}". Alle Attribute in diesem Block werden ignoriert.HF√ºr diese Deklaration ist kein g√ºltiger Atttributspeicherort vorhandenüAuf Felder ausgerichtete Attribute f√ºr automatische Eigenschaften werden in Sprachversion {0} nicht unterst√ºtzt. Verwenden Sie Sprachversion {1} oder h√∂her.uAuf Felder ausgerichtete Attribute f√ºr automatische Eigenschaften werden in dieser Sprachversion nicht unterst√ºtzt.zUnbeabsichtigter Verweisvergleich. Wandeln Sie die linke Seite in den Typ "{0}" um, um einen Wertvergleich durchzuf√ºhren.SM√∂glicher unbeabsichtigter Referenzvergleich; linke Seite muss umgewandelt werden.{Unbeabsichtigter Verweisvergleich. Wandeln Sie die rechte Seite in den Typ "{0}" um, um einen Wertvergleich durchzuf√ºhren.SM√∂glicher unbeabsichtigter Referenzvergleich; rechte Seite muss umgewandelt werdenYDie Warnung "CS{0}" kann nicht wiederhergestellt werden, da sie global deaktiviert wurde.OWarnung konnte nicht wiederhergestellt werden, da sie global deaktiviert wurde.%Der Sprachenname "{0}" ist ung√ºltig.Der Sprachenname ist ung√ºltig.("{0}" ist keine g√ºltige Warnungsnummer.¬Eine Zahl, die an die Pr√§prozessordirektive der #pragma-Warnung √ºbergeben wurde, war keine g√ºltige Warnungszahl. Vergewissern Sie sich, dass die Zahl eine Warnung und keinen Fehler darstellt.Keine g√ºltige Warnungszahl.WDer XML-Kommentar enth√§lt ein cref-Attribut "{0}", das nicht aufgel√∂st werden konnte:QUng√ºltiger Typ f√ºr den {0}-Parameter im cref-Attribut des XML-Kommentars: "{1}"GUng√ºltiger Typ f√ºr den Parameter im XML-Kommentar des cref-Attributs.=Ung√ºltiger R√ºckgabetyp im cref-Attribut des XML-Kommentars.=Ung√ºltiger R√ºckgabetyp im cref-Attribut des XML-Kommentars.GDer XML-Kommentar enth√§lt ein cref-Attribut "{0}" mit falscher Syntax.?XML-Kommentar weist ein syntaktisch falsches cref-Attribut auf.XDer XML-Kommentar enth√§lt ein cref-Attribut "{0}", das auf einen Typparameter verweist.SXML-Kommentar weist ein cref-Attribut auf, das sich auf einen Typparameter bezieht.NXML-Kommentar weist ein cref-Attribut auf, das nicht aufgel√∂st werden konnte.¨Bitweiser OR-Operator wird f√ºr einen signaturerweiterten Operanden verwendet. Es wird empfohlen, zuerst eine Umwandlung in einen kleineren unsignierten Typ durchzuf√ºhren.«Der Compiler hat eine Variable implizit und signaturerweitert. Anschlie√üend hat er den daraus resultierenden Wert in einem bitweisen OR-Vorgang verwendet. Das kann zu unerwartetem Verhalten f√ºhren.SBitweiser OR-Operator, der bei einem signaturerweiterten Operanden verwendet wurde.¬Das Verwenden von "{0}" als ref- oder out-Wert bzw. das Annehmen der Adresse kann zu einer Laufzeitausnahme f√ºhren, weil es sich hierbei um ein Feld einer "Marshal by Reference"-Klasse handelt.úDas Verwenden eines Felds einer "Marshal by Reference"-Klasse als ref- oder out-Wert bzw. das Annehmen seiner Adresse kann zu einer Laufzeitausnahme f√ºhrenóRufen Sie System.IDisposable.Dispose() f√ºr die zugeordnete Instanz von "{0}" auf, bevor alle Verweise darauf au√üerhalb des g√ºltigen Bereichs liegen.çDer Aufruf System.IDisposable.Dispose() zu der zugeordneten Instanz vor allen Verweisen dazu befinden sich au√üerdem des zul√§ssigen Bereichs≈Die zugeordnete Instanz von "{0}" wird nicht entlang allen Ausnahmepfaden verworfen. Rufen Sie System.IDisposable.Dispose() auf, bevor alle Verweise darauf au√üerhalb des g√ºltigen Bereichs liegen.KZugeordnete Instanz wird nicht zusammen mit allen Ausnahmepfaden zugeordnet4Das Objekt "{0}" kann mehrere Male verworfen werden.&Objekt kann mehrmals zugeordnet werden7Arrays als Attributargumente sind nicht CLS-kompatibel.7Arrays als Attributargumente sind nicht CLS-kompatibel.h"{0}" kann nicht als CLS-kompatibel markiert werden, da die Assembly kein CLSCompliant-Attribut besitzt.`"{0}" erfordert kein CLSCompliant-Attribut, da die Assembly kein CLSCompliant-Attribut aufweist.iTyp oder Element ben√∂tigt kein CLSCompliant-Attribut, da die Assembly kein CLSCompliant-Attribut besitztrTyp oder Element kann nicht als CLS-kompatibel markiert werden, da die Assembly kein CLSCompliant-Attribut besitzt+Argumenttyp "{0}" ist nicht CLS-kompatibel.$Argumenttyp ist nicht CLS-kompatibelS"{0}" hat keine zugreifbaren Konstruktoren, die nur CLS-kompatible Typen verwenden.UTyp besitzt keine zug√§nglichen Konstruktoren, die nur CLS-kompatible Typen verwenden/"{0}": Basistyp "{1}" ist nicht CLS-kompatibel.ÿEin Basistyp wurde so gekennzeichnet, dass er nicht mit der Common Language Specification (CLS) in einer Assembly kompatibel sein muss, die als CLS.kompatibel markiert wurde. Entfernen Sie entweder das Attribut, das angibt, dass die Assembly CLS-kompatibel ist oder entfernen Sie das Attribut, das angibt, dass der Typ nicht CLS-kompatibel ist.!Basistyp ist nicht CLS-kompatibel+Der Typ von "{0}" ist nicht CLS-kompatibel.òEine √∂ffentliche, gesch√ºtzte oder eine interne, gesch√ºtzte Variable muss ein Typ sein, dermit der Common Language Specification (CLS) kompatibel ist.Typ ist nicht CLS-kompatibel.Der Bezeichner "{0}" ist nicht CLS-kompatibel.wDer Bezeichner "{0}", der sich nur hinsichtlich der Gro√ü- und Kleinschreibung unterscheidet, ist nicht CLS-kompatibel.9Bezeichner weist nur ab, wenn er nicht CLS-kompatibel ist#Bezeichner ist nicht CLS-kompatibelY"{0}" ist nicht CLS-kompatibel, da die Basisschnittstelle "{1}" nicht CLS-kompatibel ist.Q"{0}": CLS-kompatible Schnittstellen d√ºrfen nur CLS-kompatible Member aufweisen.JCLS-kompatible Schnittstellen d√ºrfen nur CLS-kompatible Elemente besitzenPTyp ist nicht CLS-kompatibel, da die Basisschnittstelle nicht CLS-kompatibel ist4Der R√ºckgabetyp von "{0}" ist nicht CLS-kompatibel.%R√ºckgabetyp ist nicht CLS-kompatibel2Einschr√§nkungstyp "{0}" ist nicht CLS-kompatibel.+Einschr√§nkungstyp ist nicht CLS-kompatibelr"{0}" ist ein Member des nicht CLS-kompatiblen Typs "{1}" und kann daher nicht als CLS-kompatibel markiert werden.VTyp kann nicht als CLS-kompatibel, da es ein Element des Typs nicht CLS-kompatibel istÉDas CLSCompliant-Attribut hat keine Bedeutung, wenn es auf Parameter angewendet wird. Wenden Sie es stattdessen auf die Methode an.TCLSCompliant-Attribut hat keine Bedeutung, wenn es auf die Parameter angewendet wirdpDie CLS-Kompatibilit√§tspr√ºfung wird nicht f√ºr "{0}" ausgef√ºhrt (ist au√üerhalb der Assembly nicht sichtbar).vDie CLS-Kompatibilit√§ts√ºberpr√ºfung wird nicht ausgef√ºhrt, da sie von au√üerhalb dieser Assembly nicht sichtbar istàDas CLSCompliant-Attribut hat keine Bedeutung, wenn es auf R√ºckgabetypen angewendet wird. Wenden Sie es stattdessen auf die Methode an.]Das CLSCompliant-Attribut hat keine Bedeutung, wenn es auf die R√ºckgabetypen angewendet wirdwHinzugef√ºgte Module m√ºssen mit dem CLSCompliant-Attribut markiert werden, damit sie mit der Assembly √ºbereinstimmen.wHinzugef√ºgte Module m√ºssen mit dem CLSCompliant-Attribut markiert werden, damit sie mit der Assembly √ºbereinstimmen.7"{0}": Nur CLS-kompatible Member k√∂nnen abstrakt sein.1Nur CLS-kompatible Elemente k√∂nnen abstrakt sein;Methoden mit Variablenargumenten sind nicht CLS-kompatibel.;Methoden mit Variablenargumenten sind nicht CLS-kompatibel.ÄSie m√ºssen das CLSCompliant-Attribut in der Assembly statt im Modul angeben, um die CLS-Kompatibilit√§tspr√ºfung zu aktivieren.ÑDas CLSCompliant-Attribut kann nicht f√ºr ein Modul angegeben werden, das sich vom CLSCompliant-Attribut der Assembly unterscheidet.ÑDas CLSCompliant-Attribut kann nicht f√ºr ein Modul angegeben werden, das sich vom CLSCompliant-Attribut der Assembly unterscheidet.ÄSie m√ºssen das CLSCompliant-Attribut in der Assembly statt im Modul angeben, um die CLS-Kompatibilit√§tspr√ºfung zu aktivieren.xDie √ºberladene {0}-Methode, die sich nur nach "ref" , "out" oder dem Arrayrang unterscheidet, ist nicht CLS-kompatibel.ÑDie √ºberladene Methode weicht nur hinsichtlich des Verweises oder der Ausgabe ab, oder des Arrayrangs, und ist nicht CLS-kompatibelnDie √ºberladene {0}-Methode, die sich nur durch unbenannte Arraytypen unterscheidet, ist nicht CLS-kompatibel.∏Dieser Fehler tritt auf, wenn Sie eine √ºberladene Methode besitzen, die ein verzweigtes Array aufnimmt, liegt der einzige Unterschied zwischen den Methodensignaturen im Elementtyp des Arrays. Um diesen Fehler zu vermeiden, sollte ein rechteckiges Array in Betracht gezogen werden, statt eines verzweigten Arrays; verwenden Sie einen zus√§tzlichen Parameter, um den Funktionsaufruf eindeutig zu machen; benennen Sie eine oder mehrere der √ºberladenen Methoden um; oder falls keine CLS-Kompatibilit√§t erforderlich ist, entfernen Sie das CLSCompliantAttribute-Attribut.nDie √ºberladene Methode unterscheidet sich nur darin, dass nicht benannte Arraytypen nicht CLS-kompatibel sind8Das CLS-kompatible Feld "{0}" kann nicht fl√ºchtig sein..CLS-kompatibles Feld kann nicht tempor√§r seinúDas Zugreifen auf einen Member auf "{0}" kann zu einer Laufzeitausnahme f√ºhren, da es sich hierbei um ein Feld einer "Marshal by Reference"-Klasse handelt.îDiese Warnung tritt auf, wenn Sie versuchen eine Methode, Eigenschaft oder einen Indexer eines Elements einer Klasse aufzurufen, die vom MarshalByRefObject abgeleitet wird, und es sich bei dem Element um einen Werttyp handelt. Objekte, die vom MarshalByRefObject vererbt werden, dienen in der Regel dazu, als Verweis in einer Anwendungsdom√§ne gemarshallt zu werden. Wenn √ºber den Code versucht wird, direkt auf das Werttypelement eines solchen Objekts einer Anwendungsdom√§ne zuzugreifen, tritt eine Laufzeitausnahme auf. Um diese Warnung zu beheben, kopieren Sie zun√§chst das Element in eine lokale Variable und rufen Sie dann die Methode der Variable auf.{Beim Zugriff auf ein Element zu einem Feld einer "Marshal by Reference"-Klasse kann eine Laufzeitausnahme ausgel√∂st werden®Das CallerArgumentExpressionAttribute, das auf den Parameter ‚Äû{0}‚Äú angewendet wird, hat keine Auswirkungen. Es wird mit einem ung√ºltigen Parameternamen angewendet.[Das CallerArgumentExpressionAttribute wird mit einem ung√ºltigen Parameternamen angewendet.ùDas auf den Parameter "{0}" angewendete CallerArgumentExpressionAttribute hat keine Auswirkungen, da es sich um einen selbstreferenziellen Parameter handelt.úDas CallerArgumentExpressionAttribute, das auf den Parameter angewendet wird, hat keine Auswirkungen, da es sich um einen selbstreferenziellen Wert handelt.ºDas auf Parameter ‚Äû{0}‚Äú angewendete CallerArgumentExpressionAttribute hat keine Auswirkung, da es auf ein Element in Kontexten angewendet wird, die keine optionalen Argumente zulassen.•Das CallerArgumentExpressionAttribute hat keine Auswirkungen, da es f√ºr einen Element gilt, das in Kontexten verwendet wird, die keine optionalen Argumente zulassenÕDas auf den Parameter "{0}" angewendete "CallerFilePathAttribute" besitzt keine Auswirkungen, weil es f√ºr einen Member gilt, der in Kontexten verwendet wird, in denen optionale Argumente unzul√§ssig sind.©Das "CallerFilePathAttribute" besitzt keine Auswirkungen, weil es f√ºr einen Member gilt, der in Kontexten verwendet wird, in denen optionale Argumente unzul√§ssig sind.ïDas auf den Parameter "{0}" angewendete CallerArgumentExpressionAttribute hat keine Auswirkungen. Es wird vom CallerFilePathAttribute √ºberschrieben.qDas CallerArgumentExpressionAttribute hat keine Auswirkungen. Es wird vom CallerFilePathAttribute √ºberschrieben.áDas auf Parameter "{0}" angewendete CallerMemberNameAttribute hat keine Auswirkung. Es wird vom CallerFilePathAttribute √ºberschrieben.jDas CallerMemberNameAttribute hat keine Auswirkung; es wird von dem CallerFilePathAttribute √ºberschrieben±Das auf Parameter "{0}" angewendete CallerLineNumberAttribute hat keine Auswirkung, da es auf einen Member in Kontexten angewendet wird, die keine optionalen Argumente zulassen.õDas CallerLineNumberAttribute hat keine Auswirkungen, da es f√ºr ein Element gilt, das in Kontexten verwendet wird, die keine optionalen Argumente zulassenïDas auf Parameter ‚Äû{0}‚Äú angewendete CallerArgumentExpressionAttribute hat keine Auswirkung. Es wird vom CallerLineNumberAttribute √ºberschrieben.vDas CallerArgumentExpressionAttribute hat keine Auswirkungen. Es wird von dem CallerLineNumberAttribute √ºberschriebenáDas auf Parameter "{0}" angewendete CallerFilePathAttribute hat keine Auswirkung. Es wird vom CallerLineNumberAttribute √ºberschrieben.lDas CallerFilePathAttribute hat keine Auswirkungen; es wird von dem CallerLineNumberAttribute √ºberschriebenâDas auf Parameter "{0}" angewendete CallerMemberNameAttribute hat keine Auswirkung. Es wird vom CallerLineNumberAttribute √ºberschrieben.nDas CallerMemberNameAttribute hat keine Auswirkungen; es wird von dem CallerLineNumberAttribute √ºberschrieben±Das auf Parameter "{0}" angewendete CallerMemberNameAttribute hat keine Auswirkung, da es auf einen Member in Kontexten angewendet wird, die keine optionalen Argumente zulassen.úDas CallerMemberNameAttribute hat keine Auswirkungen, da es f√ºr einen Member gilt, das in Kontexten verwendet wird, die keine optionalen Argumente zulassenïDas auf Parameter ‚Äû{0}‚Äú angewendete CallerArgumentExpressionAttribute hat keine Auswirkung. Es wird vom CallerMemberNameAttribute √ºberschrieben.vDas CallerArgumentExpressionAttribute hat keine Auswirkungen. Es wird von dem CallerMemberNameAttribute √ºberschriebenK"/win32manifest" gilt nur f√ºr Assemblys und wird f√ºr das Modul ignoriert.K"/win32manifest" gilt nur f√ºr Assemblys und wird f√ºr das Modul ignoriert.±Der Name "_" verweist auf die Konstante, nicht auf das discard-Muster. Verwenden Sie "var _" zum Verwerfen des Werts oder "@_" zum Verweis auf eine Konstante √ºber diesen Namen.1Verwenden Sie "_" nicht f√ºr eine case-Konstante.kDie Option "{0}" √ºberschreibt das {1}-Attribut (in der Quelldatei oder im hinzugef√ºgten Modul angegeben).‚Diese Warnung tritt auf, wenn die in der Quelle gefundenen Assemblyattribute 'AssemblyKeyFileAttribute' oder 'AssemblyKeyNameAttribute' einen Konflikt mit der in den Projekteigenschaften angegebenen /Schl√ºsseldatei- oder /Schl√ºsselcontainer-Befehlszeilenoption, dem Schl√ºsseldateinamen oder Schl√ºsselcontainer in den Projekteigenschaften verursachen.eDie Option √ºberschreibt das in einer Quelldatei oder einem hinzugef√ºgten Modul angegebene Attribut.HBeim Vergleich mit NULL vom Typ "{0}" wird immer "False" zur√ºckgegeben.>Der Vergleich mit dem Strukturtyp Null f√ºhrt immer zu 'false'\'Die {0}-Schnittstelle wurde mit CoClassAttribute und nicht mit ComImportAttribute markiert.MSchnittstelle markiert mit 'CoClassAttribute', nicht mit 'ComImportAttribute'YDer Vergleich erfolgte mit der gleichen Variablen. Wollten Sie etwas anderes vergleichen?)Vergleich erfolgte mit derselben VariableÖDer Vorgang kann zur Laufzeit einen √úberlauf von ‚Äû{0}‚Äú verursachen (verwenden Sie zum √úberschreiben die Syntax ‚Äûunchecked‚Äú)gDer Vorgang kann zur Laufzeit √ºberlaufen (verwenden Sie zum √úberschreiben die Syntax ‚Äûunchecked‚Äú):F√ºr "{0}" wurden verschiedene Pr√ºfsummenwerte angegeben.3Unterschiedliche #pragma-Pr√ºfsummenwerte angegebenLDie Assembly "{0}", auf die verwiesen wird, hat einen anderen Zielprozessor.FDie Assembly, auf die verwiesen wird, hat einen anderen Zielprozessor.âDer konstante Wert "{0}" kann zur Laufzeit einen √úberlauf von "{1}" verursachen (verwenden Sie zum √úberschreiben die unchecked-Syntax).]M√∂glicher √úberlauf zur Laufzeit durch konstanten Wert (unchecked-Syntax zum √úberschreiben)ZDas NULL-Literal oder ein m√∂glicher NULL-Wert wird in einen Non-Nullable-Typ konvertiert.ZDas NULL-Literal oder ein m√∂glicher NULL-Wert wird in einen Non-Nullable-Typ konvertiert.rDer vollqualifizierte Name f√ºr "{0}" ist f√ºr Debuginformationen zu lang. Kompilieren Sie ohne die /debug-Option.<Voll qualifizierter Name ist zu lang f√ºr DebuginformationenªDer f√ºr Parameter "{0}" angegebene Standardwert hat keine Auswirkungen, da er f√ºr einen Member gilt, der in Kontexten verwendet wird, in denen keine optionalen Argumente zul√§ssig sind.ôDer angegebene Standardwert hat keine Auswirkungen, da es f√ºr ein Element gilt, das in Kontexten verwendet wird, die keine optionalen Argumente zulassenVUng√ºltiger Name f√ºr ein Vorverarbeitungssymbol; "{0}" ist kein g√ºltiger Bezeichner.KUng√ºltiger Name f√ºr ein Vorverarbeitungssymbol; kein g√ºltiger BezeichnerãVerz√∂gertes Signieren wurde angegeben und erfordert einen √∂ffentlichen Schl√ºssel, es wurde aber kein √∂ffentlicher Schl√ºssel angegeben.ãVerz√∂gertes Signieren wurde angegeben und erfordert einen √∂ffentlichen Schl√ºssel, es wurde aber kein √∂ffentlicher Schl√ºssel angegeben.]Die beste √ºberladene Add-Methode "{0}" f√ºr das Sammlungsinitialisiererelement ist veraltet.aDie beste √ºberladene Add-Methode "{0}" f√ºr das Sammlungsinitialisiererelement ist veraltet. {1}WDie beste √ºberladene Add-Methode f√ºr das Sammlungsinitialisiererelement ist veraltet.WDie beste √ºberladene Add-Methode f√ºr das Sammlungsinitialisiererelement ist veraltet."{0}" ist veraltet."{0}" ist veraltet: "{1}"Typ oder Element ist veraltetTyp oder Element ist veraltetqEin m√∂glicher NULL-Wert darf nicht f√ºr einen mit [NotNull] oder [DisallowNull] markierten Typ verwendet werden.qEin m√∂glicher NULL-Wert darf nicht f√ºr einen mit [NotNull] oder [DisallowNull] markierten Typ verwendet werden.óDer Vergleich von Funktionszeigern kann zu einem unerwarteten Ergebnis f√ºhren, weil Zeiger auf dieselbe Funktion m√∂glicherweise unterschiedlich sind.&Funktionszeigerwerte nicht vergleichenÇIn der Methode "{0}" fehlt die Anmerkung "[DoesNotReturn]" f√ºr den Abgleich mit dem implementierten oder √ºberschriebenen Member.|In der Methode fehlt die Anmerkung "[DoesNotReturn]" f√ºr den Abgleich mit dem implementierten oder √ºberschriebenen Member.cDer Ausdruck f√ºhrt immer zu System.NullReferenceException, da der Standardwert von "{0}" NULL ist.fAusdruck verursacht immer eine System.NullReferenceException, da der Standardwert des Typs null lautetë"{0}" wird bereits mit einer anderen NULL-Zul√§ssigkeit oder abweichenden Verweistypen in der Schnittstellenliste f√ºr den Typ "{1}" aufgef√ºhrt.äDie Schnittstelle wird bereits mit einer anderen NULL-Zul√§ssigkeit oder abweichenden Verweistypen in der Schnittstellenliste aufgef√ºhrt.>Der XML-Kommentar enth√§lt ein doppeltes param-Tag f√ºr "{0}"..XML-Kommentar enth√§lt ein doppeltes param-TagBDer XML-Kommentar enth√§lt ein doppeltes typeparam-Tag f√ºr "{0}".2XML-Kommentar enth√§lt ein doppeltes typeparam-TagRDie using-Direktive f√ºr "{0}" ist bereits vorher in diesem Namespace aufgetreten.GDirektive wird verwendet, die zuvor in diesem Namespace angezeigt wurde¿Der dynamisch gebundene Aufruf von Methode "{0}" verursacht m√∂glicherweise einen Fehler zur Laufzeit, weil es sich bei mindestens einer geltenden √úberladung um eine bedingte Methode handelt.öEin dynamisch gebundener Aufruf verursacht m√∂glicherweise einen Fehler zur Laufzeit, da mindestens eine anwendbare √úberladung eine bedingte Methode ist.Leerer Schalterblock.Leerer Schalterblock./Einzeiliger Kommentar oder Zeilenende erwartet.EEinzeiliger Kommentar oder Zeilenende erwartet nach #pragma-DirektiveZ"{0}" definiert den Operator == oder !=, aber √ºberschreibt Object.Equals(object o) nicht.^Typ definiert Operator == oder Operator !=, √ºberschreibt jedoch nicht Object.Equals(Objekt o)W"{0}" definiert den Operator == oder !=, aber √ºberschreibt Object.GetHashCode() nicht.[Typ definiert Operator == oder Operator !=, √ºberschreibt jedoch nicht Object.GetHashCode()M"{0}" √ºberschreibt Object.Equals(object o), aber nicht Object.GetHashCode().ZTyp √ºberschreibt Object.Equals(object o), √ºberschreibt jedoch nicht Object.GetHashCode(){0}. Siehe auch Fehler CS{1}.ΩDer Compiler gibt diese Warnung aus, wenn er einen Fehler mit einer Warnung √ºberschreibt. Weitere Informationen zu dem Problem finden Sie, indem Sie nach dem angegebenen Fehlercode suchen."Warnung √ºberschreibt einen Fehlerh"{0}" dient nur zu Testzwecken und kann in zuk√ºnftigen Aktualisierungen ge√§ndert oder entfernt werden.jDer Typ dient nur zu Testzwecken und kann in zuk√ºnftigen Aktualisierungen ge√§ndert oder entfernt werden.ÒDie explizite Schnittstellenimplementierung "{0}" entspricht mehreren Schnittstellenmembern. Es h√§ngt von der Implementierung ab, welcher Schnittstellenmember ausgew√§hlt wird. Verwenden Sie stattdessen eine nicht explizite Implementierung.\Explizite Schnittstellenimplementierung stimmt mit mehreren Schnittstellenelementen √ºberein.Der Konstruktor "{0}" ist als extern markiert.Konstruktor ist extern markiert∫Die Methode, der Operator oder der Accessor "{0}" ist als extern markiert und enth√§lt keine Attribute. F√ºgen Sie ein DllImport-Attribut hinzu, um die externe Implementierung anzugeben.QMethode, Operator oder Accessor ist extern markiert und weist keine Attribute aufHDas XML-Fragment "{1}" der Datei "{0}" kann nicht einbezogen werden: {2}2Das XML-Fragment kann nicht eingeschlossen werden.$Quelldatei "{0}" mehrmals angegeben.,Die Quelldatei wurde mehrere Male angegeben.uUng√ºltiger Dateiname f√ºr Pr√§prozessordirektive angegeben. Der Dateiname ist zu lang oder kein g√ºltiger Dateiname.<Ung√ºltiger Dateiname f√ºr Pr√§prozessordirektive angegeben.fDer Filterausdruck ist eine Konstante "false". Ziehen Sie in Betracht, die catch-Klausel zu entfernen.hDer Filterausdruck ist eine Konstante "false". Ziehen Sie in Betracht, den try-catch-Block zu entfernen.+Filterausdruck ist eine Konstante "false". )Filterausdruck ist eine Konstante "false"^Der Filterausdruck ist eine Konstante "true". Ziehen Sie in Betracht, den Filter zu entfernen.(Filterausdruck ist eine Konstante "true"oEine neue Finalize-Methode kann den Aufruf eines Destruktors st√∂ren. Wollten Sie einen Destruktor deklarieren?”Diese Warnung tritt auf, wenn Sie eine Klasse mit einer Methode erstellen, dessen Signatur eine √∂ffentliche, virtuell virtuelle ung√ºltige Finalize-Methode ist.
 
-#ifndef __DTS_IMX6DL_PINFUNC_H
-#define __DTS_IMX6DL_PINFUNC_H
+Wenn solch eine Klasse als Basisklasse verwendet wird und die ableitende Klasse einen Destruktor definiert, √ºberschreibt der Destruktor die Finalize-Methode der Basisklasse.DEine neue Finalize-Methode kann den Aufruf eines Destruktors st√∂renæFehler beim Generieren der Quelle durch den Generator "{0}". Dieser wird bei der Ausgabe nicht ber√ºcksichtigt, deshalb kann es zu Kompilierungsfehlern kommen. Ausnahmetyp: {1}. Meldung: {2}8Der Generator hat die folgende Ausnahme ausgel√∂st:
+{0}6Fehler beim Generieren der Quelle durch den Generator.ÆFehler beim Initialisieren des Generators "{0}". Er wird bei der Ausgabe nicht ber√ºcksichtigt, deshalb kann es zu Kompilierungsfehlern kommen. Ausnahmetyp: {1}. Meldung: {2}8Der Generator hat die folgende Ausnahme ausgel√∂st:
+{0}*Fehler beim Initialisieren des Generators.LDer angegebene Ausdruck stimmt immer mit der angegebenen Konstante √ºberein.LDer angegebene Ausdruck stimmt immer mit der angegebenen Konstante √ºberein.IDer angegebene Ausdruck stimmt immer mit dem angegebenen Muster √ºberein.IDer angegebene Ausdruck stimmt immer mit dem angegebenen Muster √ºberein.GDer angegebene Ausdruck stimmt nie mit dem angegebenen Muster √ºberein.GDer angegebene Ausdruck stimmt nie mit dem angegebenen Muster √ºberein.óEs sollte kein Alias mit dem Namen "global" definiert werden, da "global::" immer ein Verweis auf den globalen Namespace und nicht auf einen Alias ist.=Es sollte kein Alias mit dem Namen " global" definiert werdenMDer "goto case"-Wert kann nicht implizit in den Typ "{0}" konvertiert werden.NDer 'goto case'-Wert kann nicht implizit in den Schaltertyp konvertiert werden>Es wurde ein Bezeichner oder ein numerisches Literal erwartet.>Es wurde ein Bezeichner oder ein numerisches Literal erwartet.ÄUng√ºltige #pragma checksum-Syntax; muss lauten: #pragma checksum "Dateiname" "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" "XXXX..."$Ung√ºltige #pragma-Pr√ºfsummensyntax""disable" oder "restore" erwartet.7"disable" oder " restore" erwartet nach #pragma-WarnungUnbekannte #pragma-Direktive.Unbekannte #pragma-Direktive.~Der Aufruf eines nicht schreibgesch√ºtzten Members "{0}" aus einem readonly-Member f√ºhrt zu einer impliziten Kopie von "{1}".nDer Aufruf eines nicht schreibgesch√ºtzten Members aus einem readonly-Member f√ºhrt zu einer impliziten Kopie.fDie Zuweisung in einem bedingten Ausdruck ist immer konstant. Wollten Sie == anstelle von = verwenden?2Zuweisung in bedingtem Ausdruck ist immer konstantÑDas InterpolatedStringHandlerArgument hat bei Anwendung auf Lambdaparameter keine Auswirkungen und wird am Aufrufstandort ignoriert.ÑDas InterpolatedStringHandlerArgument hat bei Anwendung auf Lambdaparameter keine Auswirkungen und wird am Aufrufstandort ignoriert.IDer Assemblyverweis "{0}" ist ung√ºltig und kann nicht aufgel√∂st werden.oDiese Warnung gibt an, dass ein Attribut, wie z. B. InternalsVisibleToAttribute, nicht richtig angegeben wurde.CDer Assemblyverweis ist ung√ºltig und kann nicht aufgel√∂st werden.ü"{0}" ist kein bekannter Attributspeicherort. G√ºltige Attributspeicherorte f√ºr diese Deklaration sind "{1}". Alle Attribute in diesem Block werden ignoriert.Kein bekannter Attributpfad$Ung√ºltiges XML-Include-Element: {0}Ung√ºltiges XML-Include-Element>"{0}" hat die falsche Signatur, um ein Einstiegspunkt zu sein.9Methode weist als Einstiegspunkt die falsche Signatur aufUng√ºltige Zahl.Ung√ºltige Zahl.*Ung√ºltiger Suchpfad "{0}" in "{1}": "{2}"Ung√ºltiger Suchpfad angegebenuDie angegebene Versionszeichenfolge entspricht nicht dem empfohlenen Format: Hauptversion.Nebenversion.Build.RevisionuDie angegebene Versionszeichenfolge entspricht nicht dem empfohlenen Format: Hauptversion.Nebenversion.Build.RevisionADer angegebene Ausdruck ist nie vom bereitgestellten ("{0}") Typ.T'Der angegebene Ausdruck f√ºr den 'is'-Ausdruck darf niemals der angegebene Typ seinCDer angegebene Ausdruck ist immer vom bereitgestellten ("{0}") Typ.L'Der angegebene Ausdruck f√ºr den 'is'-Ausdruck ist immer der angegebene Typ¥Die Verwendung von "{0}" zum Testen der Kompatibilit√§t mit "{1}" entspricht grunds√§tzlich dem Testen der Kompatibilit√§t mit "{2}" und ist f√ºr alle Nicht-NULL-Werte erfolgreich.äDas Verwenden von 'is' zum Testen der Kompatibilit√§t mit 'dynamic' entspricht im Wesentlichen dem Testen der Kompatibilit√§t mit 'Object'LEin Ausdruck vom Typ "{0}" stimmt immer mit dem angegebenen Muster √ºberein.=Die Eingabe stimmt immer mit dem angegebenen Muster √ºberein.ÇDer Name "_" verweist auf den Typ "{0}", nicht auf das discard-Muster. Verwenden Sie "@_" f√ºr den Typ oder "var _" zum Verwerfen.JVerwenden Sie "_" nicht zum Verweis auf den Typ in einem is-type-Ausdruck.çDer Typname ‚Äû{0}‚Äú enth√§lt nur ASCII-Zeichen in Kleinbuchstaben. Solche Namen k√∂nnen m√∂glicherweise f√ºr die Sprache reserviert werden.ÉDer Typname enth√§lt nur ASCII-Zeichen in Kleinbuchstaben. Solche Namen k√∂nnen m√∂glicherweise f√ºr die Sprache reserviert werden.nDas l-Suffix kann leicht mit der Zahl 1 verwechselt werden. Verwenden Sie zur deutlichen Unterscheidung das L.@Das Suffix 'l' kann leicht mit der Ziffer '1' verwechselt werden`"{0}": Ein Einstiegspunkt kann nicht generisch sein oder sich in einem generischen Typ befinden.YEin Einstiegspunkt kann nicht generisch sein oder sich in einem generischen Typ befinden.\Der Einstiegspunkt des Programms ist globaler Code. Der Einstiegspunkt "{0}" wird ignoriert.VDer Einstiegspunkt des Programms ist globaler Code. Der Einstiegspunkt wird ignoriert.FDer Member "{0}" muss beim Beenden einen Wert ungleich NULL aufweisen.@Der Member "{0}" kann in diesem Attribut nicht verwendet werden.:Der Member kann in diesem Attribut nicht verwendet werden.PDer Member "{0}" muss beim Beenden mit "{1}" einen Wert ungleich NULL aufweisen._Der Member muss beim Beenden mit einer bestimmten Bedingung einen Wert ungleich NULL aufweisen.@Der Member muss beim Beenden einen Wert ungleich NULL aufweisen.qDie Methodengruppe ‚Äû{0}‚Äú wird in den Nichtdelegattyp ‚Äû{1}‚Äú konvertiert. Wollten Sie die Methode aufrufen?=Die Methodengruppe wird in einen Nichtdelegattyp konvertiert.xDie Anmerkung f√ºr Nullable-Verweistypen darf nur in Code innerhalb eines #nullable-Anmerkungskontexts verwendet werden.›Die Anmerkung f√ºr Nullable-Verweistypen darf nur in Code innerhalb eines #nullable-Anmerkungskontexts verwendet werden. F√ºr automatisch generierten Code ist eine explizite #nullable-Anweisung in der Quelle erforderlich.›Die Anmerkung f√ºr Nullable-Verweistypen darf nur in Code innerhalb eines #nullable-Anmerkungskontexts verwendet werden. F√ºr automatisch generierten Code ist eine explizite #nullable-Anweisung in der Quelle erforderlich.xDie Anmerkung f√ºr Nullable-Verweistypen darf nur in Code innerhalb eines #nullable-Anmerkungskontexts verwendet werden.uDer {0}-Parameter hat (im Gegensatz zu anderen Parametern) kein entsprechendes param-Tag im XML-Kommentar f√ºr "{1}".dParameter besitzt kein √ºbereinstimmendes param-Tag im XML-Kommentar (andere Parameter jedoch schon)Der {0}-Typparameter hat (im Gegensatz zu anderen Typparametern) kein entsprechendes typeparam-Tag im XML-Kommentar f√ºr "{1}".pTypparameter besitzt kein √ºbereinstimmendes typeparam-Tag im XML-Kommentar (andere type-Parameter jedoch schon)NDer XML-Kommentar f√ºr den √∂ffentlich sichtbaren Typ oder Member "{0}" fehlt.eDie /doc-Cmpileroption wurde angegeben, ein oder mehrere Konstrukte besitzen jedoch keine Kommentare.CFehledes XML-Kommentar f√ºr √∂ffentlich sichtbaren Typ oder Element{Der vordefinierte Typ "{0}" ist in mehreren Assemblys im globalen Alias definiert. Die Definition aus "{1}" wird verwendet.ΩDieser Fehler tritt auf, wenn der vordefinierte Systemtyp, wie z. B. System.Int32, in zwei Assemblys gefunden wird. Das kann auftreten, wenn Sie von zwei unterschiedlichen Stellen auf mscorlib oder System.Runtime.dll verweisen, z. B., indem Sie versuchen, zwei Versionen des .NET Framework nebeneinander auszuf√ºhren.JDer vordefinierte Typ is in mehreren Assemblys im globalen Alias definiert—Der Member "{0}" implementiert den Schnittstellenmember "{1}" im Typ "{2}". Zur Laufzeit gibt es mehrere √úbereinstimmungen f√ºr den Schnittstellenmember. Die aufgerufene Methode ist implementierungsabh√§ngig.ÕDiese Warnung kann generiert werden, wenn sich zwei Schnittstellenmethoden nur dain unterscheiden, ob ein bestimmter Parameter mit Verweis oder Ausgabe markiert wird. Am besten √§ndern Sie Ihren Code, um diese Warnung zu vermeiden, da es nicht offensichtlich ist und nicht sichergestellt werden kann, welche Methode zur Laufzeit aufgerufen wird.
 
-/*
- * The pin function ID is a tuple of
- * <mux_reg conf_reg input_reg mux_mode input_val>
- */
-#define MX6QDL_PAD_CSI0_DAT10__IPU1_CSI0_DATA10     0x04c 0x360 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT10__AUD3_RXC             0x04c 0x360 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT10__ECSPI2_MISO          0x04c 0x360 0x7f8 0x2 0x0
-#define MX6QDL_PAD_CSI0_DAT10__UART1_TX_DATA        0x04c 0x360 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT10__UART1_RX_DATA        0x04c 0x360 0x8fc 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT10__GPIO5_IO28           0x04c 0x360 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT10__ARM_TRACE07          0x04c 0x360 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT11__IPU1_CSI0_DATA11     0x050 0x364 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT11__AUD3_RXFS            0x050 0x364 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT11__ECSPI2_SS0           0x050 0x364 0x800 0x2 0x0
-#define MX6QDL_PAD_CSI0_DAT11__UART1_RX_DATA        0x050 0x364 0x8fc 0x3 0x1
-#define MX6QDL_PAD_CSI0_DAT11__UART1_TX_DATA        0x050 0x364 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT11__GPIO5_IO29           0x050 0x364 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT11__ARM_TRACE08          0x050 0x364 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT12__IPU1_CSI0_DATA12     0x054 0x368 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT12__EIM_DATA08           0x054 0x368 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT12__UART4_TX_DATA        0x054 0x368 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT12__UART4_RX_DATA        0x054 0x368 0x914 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT12__GPIO5_IO30           0x054 0x368 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT12__ARM_TRACE09          0x054 0x368 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT13__IPU1_CSI0_DATA13     0x058 0x36c 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT13__EIM_DATA09           0x058 0x36c 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT13__UART4_RX_DATA        0x058 0x36c 0x914 0x3 0x1
-#define MX6QDL_PAD_CSI0_DAT13__UART4_TX_DATA        0x058 0x36c 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT13__GPIO5_IO31           0x058 0x36c 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT13__ARM_TRACE10          0x058 0x36c 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT14__IPU1_CSI0_DATA14     0x05c 0x370 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT14__EIM_DATA10           0x05c 0x370 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT14__UART5_TX_DATA        0x05c 0x370 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT14__UART5_RX_DATA        0x05c 0x370 0x91c 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT14__GPIO6_IO00           0x05c 0x370 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT14__ARM_TRACE11          0x05c 0x370 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT15__IPU1_CSI0_DATA15     0x060 0x374 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT15__EIM_DATA11           0x060 0x374 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT15__UART5_RX_DATA        0x060 0x374 0x91c 0x3 0x1
-#define MX6QDL_PAD_CSI0_DAT15__UART5_TX_DATA        0x060 0x374 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT15__GPIO6_IO01           0x060 0x374 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT15__ARM_TRACE12          0x060 0x374 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT16__IPU1_CSI0_DATA16     0x064 0x378 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT16__EIM_DATA12           0x064 0x378 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT16__UART4_RTS_B          0x064 0x378 0x910 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT16__UART4_CTS_B          0x064 0x378 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT16__GPIO6_IO02           0x064 0x378 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT16__ARM_TRACE13          0x064 0x378 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT17__IPU1_CSI0_DATA17     0x068 0x37c 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT17__EIM_DATA13           0x068 0x37c 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT17__UART4_CTS_B          0x068 0x37c 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT17__UART4_RTS_B          0x068 0x37c 0x910 0x3 0x1
-#define MX6QDL_PAD_CSI0_DAT17__GPIO6_IO03           0x068 0x37c 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT17__ARM_TRACE14          0x068 0x37c 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT18__IPU1_CSI0_DATA18     0x06c 0x380 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT18__EIM_DATA14           0x06c 0x380 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT18__UART5_RTS_B          0x06c 0x380 0x918 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT18__UART5_CTS_B          0x06c 0x380 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT18__GPIO6_IO04           0x06c 0x380 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT18__ARM_TRACE15          0x06c 0x380 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT19__IPU1_CSI0_DATA19     0x070 0x384 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT19__EIM_DATA15           0x070 0x384 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT19__UART5_CTS_B          0x070 0x384 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT19__UART5_RTS_B          0x070 0x384 0x918 0x3 0x1
-#define MX6QDL_PAD_CSI0_DAT19__GPIO6_IO05           0x070 0x384 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT4__IPU1_CSI0_DATA04      0x074 0x388 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT4__EIM_DATA02            0x074 0x388 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT4__ECSPI1_SCLK           0x074 0x388 0x7d8 0x2 0x0
-#define MX6QDL_PAD_CSI0_DAT4__KEY_COL5              0x074 0x388 0x8c0 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT4__AUD3_TXC              0x074 0x388 0x000 0x4 0x0
-#define MX6QDL_PAD_CSI0_DAT4__GPIO5_IO22            0x074 0x388 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT4__ARM_TRACE01           0x074 0x388 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT5__IPU1_CSI0_DATA05      0x078 0x38c 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT5__EIM_DATA03            0x078 0x38c 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT5__ECSPI1_MOSI           0x078 0x38c 0x7e0 0x2 0x0
-#define MX6QDL_PAD_CSI0_DAT5__KEY_ROW5              0x078 0x38c 0x8cc 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT5__AUD3_TXD              0x078 0x38c 0x000 0x4 0x0
-#define MX6QDL_PAD_CSI0_DAT5__GPIO5_IO23            0x078 0x38c 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT5__ARM_TRACE02           0x078 0x38c 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT6__IPU1_CSI0_DATA06      0x07c 0x390 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT6__EIM_DATA04            0x07c 0x390 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT6__ECSPI1_MISO           0x07c 0x390 0x7dc 0x2 0x0
-#define MX6QDL_PAD_CSI0_DAT6__KEY_COL6              0x07c 0x390 0x8c4 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT6__AUD3_TXFS             0x07c 0x390 0x000 0x4 0x0
-#define MX6QDL_PAD_CSI0_DAT6__GPIO5_IO24            0x07c 0x390 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT6__ARM_TRACE03           0x07c 0x390 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT7__IPU1_CSI0_DATA07      0x080 0x394 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT7__EIM_DATA05            0x080 0x394 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT7__ECSPI1_SS0            0x080 0x394 0x7e4 0x2 0x0
-#define MX6QDL_PAD_CSI0_DAT7__KEY_ROW6              0x080 0x394 0x8d0 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT7__AUD3_RXD              0x080 0x394 0x000 0x4 0x0
-#define MX6QDL_PAD_CSI0_DAT7__GPIO5_IO25            0x080 0x394 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT7__ARM_TRACE04           0x080 0x394 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT8__IPU1_CSI0_DATA08      0x084 0x398 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT8__EIM_DATA06            0x084 0x398 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT8__ECSPI2_SCLK           0x084 0x398 0x7f4 0x2 0x0
-#define MX6QDL_PAD_CSI0_DAT8__KEY_COL7              0x084 0x398 0x8c8 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT8__I2C1_SDA              0x084 0x398 0x86c 0x4 0x0
-#define MX6QDL_PAD_CSI0_DAT8__GPIO5_IO26            0x084 0x398 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT8__ARM_TRACE05           0x084 0x398 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DAT9__IPU1_CSI0_DATA09      0x088 0x39c 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DAT9__EIM_DATA07            0x088 0x39c 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DAT9__ECSPI2_MOSI           0x088 0x39c 0x7fc 0x2 0x0
-#define MX6QDL_PAD_CSI0_DAT9__KEY_ROW7              0x088 0x39c 0x8d4 0x3 0x0
-#define MX6QDL_PAD_CSI0_DAT9__I2C1_SCL              0x088 0x39c 0x868 0x4 0x0
-#define MX6QDL_PAD_CSI0_DAT9__GPIO5_IO27            0x088 0x39c 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DAT9__ARM_TRACE06           0x088 0x39c 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_DATA_EN__IPU1_CSI0_DATA_EN  0x08c 0x3a0 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_DATA_EN__EIM_DATA00         0x08c 0x3a0 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_DATA_EN__GPIO5_IO20         0x08c 0x3a0 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_DATA_EN__ARM_TRACE_CLK      0x08c 0x3a0 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_MCLK__IPU1_CSI0_HSYNC       0x090 0x3a4 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_MCLK__CCM_CLKO1             0x090 0x3a4 0x000 0x3 0x0
-#define MX6QDL_PAD_CSI0_MCLK__GPIO5_IO19            0x090 0x3a4 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_MCLK__ARM_TRACE_CTL         0x090 0x3a4 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_PIXCLK__IPU1_CSI0_PIXCLK    0x094 0x3a8 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_PIXCLK__GPIO5_IO18          0x094 0x3a8 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_PIXCLK__ARM_EVENTO          0x094 0x3a8 0x000 0x7 0x0
-#define MX6QDL_PAD_CSI0_VSYNC__IPU1_CSI0_VSYNC      0x098 0x3ac 0x000 0x0 0x0
-#define MX6QDL_PAD_CSI0_VSYNC__EIM_DATA01           0x098 0x3ac 0x000 0x1 0x0
-#define MX6QDL_PAD_CSI0_VSYNC__GPIO5_IO21           0x098 0x3ac 0x000 0x5 0x0
-#define MX6QDL_PAD_CSI0_VSYNC__ARM_TRACE00          0x098 0x3ac 0x000 0x7 0x0
-#define MX6QDL_PAD_DI0_DISP_CLK__IPU1_DI0_DISP_CLK  0x09c 0x3b0 0x000 0x0 0x0
-#define MX6QDL_PAD_DI0_DISP_CLK__LCD_CLK            0x09c 0x3b0 0x000 0x1 0x0
-#define MX6QDL_PAD_DI0_DISP_CLK__GPIO4_IO16         0x09c 0x3b0 0x000 0x5 0x0
-#define MX6QDL_PAD_DI0_DISP_CLK__LCD_WR_RWN         0x09c 0x3b0 0x000 0x8 0x0
-#define MX6QDL_PAD_DI0_PIN15__IPU1_DI0_PIN15        0x0a0 0x3b4 0x000 0x0 0x0
-#define MX6QDL_PAD_DI0_PIN15__LCD_ENABLE            0x0a0 0x3b4 0x000 0x1 0x0
-#define MX6QDL_PAD_DI0_PIN15__AUD6_TXC              0x0a0 0x3b4 0x000 0x2 0x0
-#define MX6QDL_PAD_DI0_PIN15__GPIO4_IO17            0x0a0 0x3b4 0x000 0x5 0x0
-#define MX6QDL_PAD_DI0_PIN15__LCD_RD_E              0x0a0 0x3b4 0x000 0x8 0x0
-#define MX6QDL_PAD_DI0_PIN2__IPU1_DI0_PIN02         0x0a4 0x3b8 0x000 0x0 0x0
-#define MX6QDL_PAD_DI0_PIN2__LCD_HSYNC              0x0a4 0x3b8 0x8d8 0x1 0x0
-#define MX6QDL_PAD_DI0_PIN2__AUD6_TXD               0x0a4 0x3b8 0x000 0x2 0x0
-#define MX6QDL_PAD_DI0_PIN2__GPIO4_IO18             0x0a4 0x3b8 0x000 0x5 0x0
-#define MX6QDL_PAD_DI0_PIN2__LCD_RS                 0x0a4 0x3b8 0x000 0x8 0x0
-#define MX6QDL_PAD_DI0_PIN3__IPU1_DI0_PIN03         0x0a8 0x3bc 0x000 0x0 0x0
-#define MX6QDL_PAD_DI0_PIN3__LCD_VSYNC              0x0a8 0x3bc 0x000 0x1 0x0
-#define MX6QDL_PAD_DI0_PIN3__AUD6_TXFS              0x0a8 0x3bc 0x000 0x2 0x0
-#define MX6QDL_PAD_DI0_PIN3__GPIO4_IO19             0x0a8 0x3bc 0x000 0x5 0x0
-#define MX6QDL_PAD_DI0_PIN3__LCD_CS                 0x0a8 0x3bc 0x000 0x8 0x0
-#define MX6QDL_PAD_DI0_PIN4__IPU1_DI0_PIN04         0x0ac 0x3c0 0x000 0x0 0x0
-#define MX6QDL_PAD_DI0_PIN4__LCD_BUSY               0x0ac 0x3c0 0x8d8 0x1 0x1
-#define MX6QDL_PAD_DI0_PIN4__AUD6_RXD               0x0ac 0x3c0 0x000 0x2 0x0
-#define MX6QDL_PAD_DI0_PIN4__SD1_WP                 0x0ac 0x3c0 0x92c 0x3 0x0
-#define MX6QDL_PAD_DI0_PIN4__GPIO4_IO20             0x0ac 0x3c0 0x000 0x5 0x0
-#define MX6QDL_PAD_DI0_PIN4__LCD_RESET              0x0ac 0x3c0 0x000 0x8 0x0
-#define MX6QDL_PAD_DISP0_DAT0__IPU1_DISP0_DATA00    0x0b0 0x3c4 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT0__LCD_DATA00           0x0b0 0x3c4 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT0__ECSPI3_SCLK          0x0b0 0x3c4 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT0__GPIO4_IO21           0x0b0 0x3c4 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT1__IPU1_DISP0_DATA01    0x0b4 0x3c8 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT1__LCD_DATA01           0x0b4 0x3c8 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT1__ECSPI3_MOSI          0x0b4 0x3c8 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT1__GPIO4_IO22           0x0b4 0x3c8 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT10__IPU1_DISP0_DATA10   0x0b8 0x3cc 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT10__LCD_DATA10          0x0b8 0x3cc 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT10__GPIO4_IO31          0x0b8 0x3cc 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT11__IPU1_DISP0_DATA11   0x0bc 0x3d0 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT11__LCD_DATA11          0x0bc 0x3d0 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT11__GPIO5_IO05          0x0bc 0x3d0 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT12__IPU1_DISP0_DATA12   0x0c0 0x3d4 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT12__LCD_DATA12          0x0c0 0x3d4 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT12__GPIO5_IO06          0x0c0 0x3d4 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT13__IPU1_DISP0_DATA13   0x0c4 0x3d8 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT13__LCD_DATA13          0x0c4 0x3d8 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT13__AUD5_RXFS           0x0c4 0x3d8 0x7bc 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT13__GPIO5_IO07          0x0c4 0x3d8 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT14__IPU1_DISP0_DATA14   0x0c8 0x3dc 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT14__LCD_DATA14          0x0c8 0x3dc 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT14__AUD5_RXC            0x0c8 0x3dc 0x7b8 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT14__GPIO5_IO08          0x0c8 0x3dc 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT15__IPU1_DISP0_DATA15   0x0cc 0x3e0 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT15__LCD_DATA15          0x0cc 0x3e0 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT15__ECSPI1_SS1          0x0cc 0x3e0 0x7e8 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT15__ECSPI2_SS1          0x0cc 0x3e0 0x804 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT15__GPIO5_IO09          0x0cc 0x3e0 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT16__IPU1_DISP0_DATA16   0x0d0 0x3e4 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT16__LCD_DATA16          0x0d0 0x3e4 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT16__ECSPI2_MOSI         0x0d0 0x3e4 0x7fc 0x2 0x1
-#define MX6QDL_PAD_DISP0_DAT16__AUD5_TXC            0x0d0 0x3e4 0x7c0 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT16__SDMA_EXT_EVENT0     0x0d0 0x3e4 0x8e8 0x4 0x0
-#define MX6QDL_PAD_DISP0_DAT16__GPIO5_IO10          0x0d0 0x3e4 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT17__IPU1_DISP0_DATA17   0x0d4 0x3e8 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT17__LCD_DATA17          0x0d4 0x3e8 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT17__ECSPI2_MISO         0x0d4 0x3e8 0x7f8 0x2 0x1
-#define MX6QDL_PAD_DISP0_DAT17__AUD5_TXD            0x0d4 0x3e8 0x7b4 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT17__SDMA_EXT_EVENT1     0x0d4 0x3e8 0x8ec 0x4 0x0
-#define MX6QDL_PAD_DISP0_DAT17__GPIO5_IO11          0x0d4 0x3e8 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT18__IPU1_DISP0_DATA18   0x0d8 0x3ec 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT18__LCD_DATA18          0x0d8 0x3ec 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT18__ECSPI2_SS0          0x0d8 0x3ec 0x800 0x2 0x1
-#define MX6QDL_PAD_DISP0_DAT18__AUD5_TXFS           0x0d8 0x3ec 0x7c4 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT18__AUD4_RXFS           0x0d8 0x3ec 0x7a4 0x4 0x0
-#define MX6QDL_PAD_DISP0_DAT18__GPIO5_IO12          0x0d8 0x3ec 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT18__EIM_CS2_B           0x0d8 0x3ec 0x000 0x7 0x0
-#define MX6QDL_PAD_DISP0_DAT19__IPU1_DISP0_DATA19   0x0dc 0x3f0 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT19__LCD_DATA19          0x0dc 0x3f0 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT19__ECSPI2_SCLK         0x0dc 0x3f0 0x7f4 0x2 0x1
-#define MX6QDL_PAD_DISP0_DAT19__AUD5_RXD            0x0dc 0x3f0 0x7b0 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT19__AUD4_RXC            0x0dc 0x3f0 0x7a0 0x4 0x0
-#define MX6QDL_PAD_DISP0_DAT19__GPIO5_IO13          0x0dc 0x3f0 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT19__EIM_CS3_B           0x0dc 0x3f0 0x000 0x7 0x0
-#define MX6QDL_PAD_DISP0_DAT2__IPU1_DISP0_DATA02    0x0e0 0x3f4 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT2__LCD_DATA02           0x0e0 0x3f4 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT2__ECSPI3_MISO          0x0e0 0x3f4 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT2__GPIO4_IO23           0x0e0 0x3f4 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT20__IPU1_DISP0_DATA20   0x0e4 0x3f8 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT20__LCD_DATA20          0x0e4 0x3f8 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT20__ECSPI1_SCLK         0x0e4 0x3f8 0x7d8 0x2 0x1
-#define MX6QDL_PAD_DISP0_DAT20__AUD4_TXC            0x0e4 0x3f8 0x7a8 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT20__GPIO5_IO14          0x0e4 0x3f8 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT21__IPU1_DISP0_DATA21   0x0e8 0x3fc 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT21__LCD_DATA21          0x0e8 0x3fc 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT21__ECSPI1_MOSI         0x0e8 0x3fc 0x7e0 0x2 0x1
-#define MX6QDL_PAD_DISP0_DAT21__AUD4_TXD            0x0e8 0x3fc 0x79c 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT21__GPIO5_IO15          0x0e8 0x3fc 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT22__IPU1_DISP0_DATA22   0x0ec 0x400 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT22__LCD_DATA22          0x0ec 0x400 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT22__ECSPI1_MISO         0x0ec 0x400 0x7dc 0x2 0x1
-#define MX6QDL_PAD_DISP0_DAT22__AUD4_TXFS           0x0ec 0x400 0x7ac 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT22__GPIO5_IO16          0x0ec 0x400 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT23__IPU1_DISP0_DATA23   0x0f0 0x404 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT23__LCD_DATA23          0x0f0 0x404 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT23__ECSPI1_SS0          0x0f0 0x404 0x7e4 0x2 0x1
-#define MX6QDL_PAD_DISP0_DAT23__AUD4_RXD            0x0f0 0x404 0x798 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT23__GPIO5_IO17          0x0f0 0x404 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT3__IPU1_DISP0_DATA03    0x0f4 0x408 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT3__LCD_DATA03           0x0f4 0x408 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT3__ECSPI3_SS0           0x0f4 0x408 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT3__GPIO4_IO24           0x0f4 0x408 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT4__IPU1_DISP0_DATA04    0x0f8 0x40c 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT4__LCD_DATA04           0x0f8 0x40c 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT4__ECSPI3_SS1           0x0f8 0x40c 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT4__GPIO4_IO25           0x0f8 0x40c 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT5__IPU1_DISP0_DATA05    0x0fc 0x410 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT5__LCD_DATA05           0x0fc 0x410 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT5__ECSPI3_SS2           0x0fc 0x410 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT5__AUD6_RXFS            0x0fc 0x410 0x000 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT5__GPIO4_IO26           0x0fc 0x410 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT6__IPU1_DISP0_DATA06    0x100 0x414 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT6__LCD_DATA06           0x100 0x414 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT6__ECSPI3_SS3           0x100 0x414 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT6__AUD6_RXC             0x100 0x414 0x000 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT6__GPIO4_IO27           0x100 0x414 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT7__IPU1_DISP0_DATA07    0x104 0x418 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT7__LCD_DATA07           0x104 0x418 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT7__ECSPI3_RDY           0x104 0x418 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT7__GPIO4_IO28           0x104 0x418 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT8__IPU1_DISP0_DATA08    0x108 0x41c 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT8__LCD_DATA08           0x108 0x41c 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT8__PWM1_OUT             0x108 0x41c 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT8__WDOG1_B              0x108 0x41c 0x000 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT8__GPIO4_IO29           0x108 0x41c 0x000 0x5 0x0
-#define MX6QDL_PAD_DISP0_DAT9__IPU1_DISP0_DATA09    0x10c 0x420 0x000 0x0 0x0
-#define MX6QDL_PAD_DISP0_DAT9__LCD_DATA09           0x10c 0x420 0x000 0x1 0x0
-#define MX6QDL_PAD_DISP0_DAT9__PWM2_OUT             0x10c 0x420 0x000 0x2 0x0
-#define MX6QDL_PAD_DISP0_DAT9__WDOG2_B              0x10c 0x420 0x000 0x3 0x0
-#define MX6QDL_PAD_DISP0_DAT9__GPIO4_IO30           0x10c 0x420 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A16__EIM_ADDR16              0x110 0x4e0 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A16__IPU1_DI1_DISP_CLK       0x110 0x4e0 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A16__IPU1_CSI1_PIXCLK        0x110 0x4e0 0x8b8 0x2 0x0
-#define MX6QDL_PAD_EIM_A16__GPIO2_IO22              0x110 0x4e0 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A16__SRC_BOOT_CFG16          0x110 0x4e0 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A16__EPDC_DATA00             0x110 0x4e0 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A17__EIM_ADDR17              0x114 0x4e4 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A17__IPU1_DISP1_DATA12       0x114 0x4e4 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A17__IPU1_CSI1_DATA12        0x114 0x4e4 0x890 0x2 0x0
-#define MX6QDL_PAD_EIM_A17__GPIO2_IO21              0x114 0x4e4 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A17__SRC_BOOT_CFG17          0x114 0x4e4 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A17__EPDC_PWR_STAT           0x114 0x4e4 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A18__EIM_ADDR18              0x118 0x4e8 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A18__IPU1_DISP1_DATA13       0x118 0x4e8 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A18__IPU1_CSI1_DATA13        0x118 0x4e8 0x894 0x2 0x0
-#define MX6QDL_PAD_EIM_A18__GPIO2_IO20              0x118 0x4e8 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A18__SRC_BOOT_CFG18          0x118 0x4e8 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A18__EPDC_PWR_CTRL0          0x118 0x4e8 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A19__EIM_ADDR19              0x11c 0x4ec 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A19__IPU1_DISP1_DATA14       0x11c 0x4ec 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A19__IPU1_CSI1_DATA14        0x11c 0x4ec 0x898 0x2 0x0
-#define MX6QDL_PAD_EIM_A19__GPIO2_IO19              0x11c 0x4ec 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A19__SRC_BOOT_CFG19          0x11c 0x4ec 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A19__EPDC_PWR_CTRL1          0x11c 0x4ec 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A20__EIM_ADDR20              0x120 0x4f0 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A20__IPU1_DISP1_DATA15       0x120 0x4f0 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A20__IPU1_CSI1_DATA15        0x120 0x4f0 0x89c 0x2 0x0
-#define MX6QDL_PAD_EIM_A20__GPIO2_IO18              0x120 0x4f0 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A20__SRC_BOOT_CFG20          0x120 0x4f0 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A20__EPDC_PWR_CTRL2          0x120 0x4f0 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A21__EIM_ADDR21              0x124 0x4f4 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A21__IPU1_DISP1_DATA16       0x124 0x4f4 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A21__IPU1_CSI1_DATA16        0x124 0x4f4 0x8a0 0x2 0x0
-#define MX6QDL_PAD_EIM_A21__GPIO2_IO17              0x124 0x4f4 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A21__SRC_BOOT_CFG21          0x124 0x4f4 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A21__EPDC_GDCLK              0x124 0x4f4 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A22__EIM_ADDR22              0x128 0x4f8 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A22__IPU1_DISP1_DATA17       0x128 0x4f8 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A22__IPU1_CSI1_DATA17        0x128 0x4f8 0x8a4 0x2 0x0
-#define MX6QDL_PAD_EIM_A22__GPIO2_IO16              0x128 0x4f8 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A22__SRC_BOOT_CFG22          0x128 0x4f8 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A22__EPDC_GDSP               0x128 0x4f8 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A23__EIM_ADDR23              0x12c 0x4fc 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A23__IPU1_DISP1_DATA18       0x12c 0x4fc 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A23__IPU1_CSI1_DATA18        0x12c 0x4fc 0x8a8 0x2 0x0
-#define MX6QDL_PAD_EIM_A23__IPU1_SISG3              0x12c 0x4fc 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_A23__GPIO6_IO06              0x12c 0x4fc 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A23__SRC_BOOT_CFG23          0x12c 0x4fc 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A23__EPDC_GDOE               0x12c 0x4fc 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A24__EIM_ADDR24              0x130 0x500 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A24__IPU1_DISP1_DATA19       0x130 0x500 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A24__IPU1_CSI1_DATA19        0x130 0x500 0x8ac 0x2 0x0
-#define MX6QDL_PAD_EIM_A24__IPU1_SISG2              0x130 0x500 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_A24__GPIO5_IO04              0x130 0x500 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A24__SRC_BOOT_CFG24          0x130 0x500 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_A24__EPDC_GDRL               0x130 0x500 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A25__EIM_ADDR25              0x134 0x504 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_A25__ECSPI4_SS1              0x134 0x504 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_A25__ECSPI2_RDY              0x134 0x504 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_A25__IPU1_DI1_PIN12          0x134 0x504 0x000 0x3 0x0
-#define MX6QDL_PAD_EIM_A25__IPU1_DI0_D1_CS          0x134 0x504 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_A25__GPIO5_IO02              0x134 0x504 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_A25__HDMI_TX_CEC_LINE        0x134 0x504 0x85c 0x6 0x0
-#define MX6QDL_PAD_EIM_A25__EPDC_DATA15             0x134 0x504 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_A25__EIM_ACLK_FREERUN        0x134 0x504 0x000 0x9 0x0
-#define MX6QDL_PAD_EIM_BCLK__EIM_BCLK               0x138 0x508 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_BCLK__IPU1_DI1_PIN16         0x138 0x508 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_BCLK__GPIO6_IO31             0x138 0x508 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_BCLK__EPDC_SDCE9             0x138 0x508 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_CS0__EIM_CS0_B               0x13c 0x50c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_CS0__IPU1_DI1_PIN05          0x13c 0x50c 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_CS0__ECSPI2_SCLK             0x13c 0x50c 0x7f4 0x2 0x2
-#define MX6QDL_PAD_EIM_CS0__GPIO2_IO23              0x13c 0x50c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_CS0__EPDC_DATA06             0x13c 0x50c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_CS1__EIM_CS1_B               0x140 0x510 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_CS1__IPU1_DI1_PIN06          0x140 0x510 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_CS1__ECSPI2_MOSI             0x140 0x510 0x7fc 0x2 0x2
-#define MX6QDL_PAD_EIM_CS1__GPIO2_IO24              0x140 0x510 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_CS1__EPDC_DATA08             0x140 0x510 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D16__EIM_DATA16              0x144 0x514 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D16__ECSPI1_SCLK             0x144 0x514 0x7d8 0x1 0x2
-#define MX6QDL_PAD_EIM_D16__IPU1_DI0_PIN05          0x144 0x514 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D16__IPU1_CSI1_DATA18        0x144 0x514 0x8a8 0x3 0x1
-#define MX6QDL_PAD_EIM_D16__HDMI_TX_DDC_SDA         0x144 0x514 0x864 0x4 0x0
-#define MX6QDL_PAD_EIM_D16__GPIO3_IO16              0x144 0x514 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D16__I2C2_SDA                0x144 0x514 0x874 0x6 0x0
-#define MX6QDL_PAD_EIM_D16__EPDC_DATA10             0x144 0x514 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D17__EIM_DATA17              0x148 0x518 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D17__ECSPI1_MISO             0x148 0x518 0x7dc 0x1 0x2
-#define MX6QDL_PAD_EIM_D17__IPU1_DI0_PIN06          0x148 0x518 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D17__IPU1_CSI1_PIXCLK        0x148 0x518 0x8b8 0x3 0x1
-#define MX6QDL_PAD_EIM_D17__DCIC1_OUT               0x148 0x518 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D17__GPIO3_IO17              0x148 0x518 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D17__I2C3_SCL                0x148 0x518 0x878 0x6 0x0
-#define MX6QDL_PAD_EIM_D17__EPDC_VCOM0              0x148 0x518 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D18__EIM_DATA18              0x14c 0x51c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D18__ECSPI1_MOSI             0x14c 0x51c 0x7e0 0x1 0x2
-#define MX6QDL_PAD_EIM_D18__IPU1_DI0_PIN07          0x14c 0x51c 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D18__IPU1_CSI1_DATA17        0x14c 0x51c 0x8a4 0x3 0x1
-#define MX6QDL_PAD_EIM_D18__IPU1_DI1_D0_CS          0x14c 0x51c 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D18__GPIO3_IO18              0x14c 0x51c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D18__I2C3_SDA                0x14c 0x51c 0x87c 0x6 0x0
-#define MX6QDL_PAD_EIM_D18__EPDC_VCOM1              0x14c 0x51c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D19__EIM_DATA19              0x150 0x520 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D19__ECSPI1_SS1              0x150 0x520 0x7e8 0x1 0x1
-#define MX6QDL_PAD_EIM_D19__IPU1_DI0_PIN08          0x150 0x520 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D19__IPU1_CSI1_DATA16        0x150 0x520 0x8a0 0x3 0x1
-#define MX6QDL_PAD_EIM_D19__UART1_CTS_B             0x150 0x520 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D19__UART1_RTS_B             0x150 0x520 0x8f8 0x4 0x0
-#define MX6QDL_PAD_EIM_D19__GPIO3_IO19              0x150 0x520 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D19__EPIT1_OUT               0x150 0x520 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_D19__EPDC_DATA12             0x150 0x520 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D20__EIM_DATA20              0x154 0x524 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D20__ECSPI4_SS0              0x154 0x524 0x808 0x1 0x0
-#define MX6QDL_PAD_EIM_D20__IPU1_DI0_PIN16          0x154 0x524 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D20__IPU1_CSI1_DATA15        0x154 0x524 0x89c 0x3 0x1
-#define MX6QDL_PAD_EIM_D20__UART1_RTS_B             0x154 0x524 0x8f8 0x4 0x1
-#define MX6QDL_PAD_EIM_D20__UART1_CTS_B             0x154 0x524 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D20__GPIO3_IO20              0x154 0x524 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D20__EPIT2_OUT               0x154 0x524 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_D21__EIM_DATA21              0x158 0x528 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D21__ECSPI4_SCLK             0x158 0x528 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D21__IPU1_DI0_PIN17          0x158 0x528 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D21__IPU1_CSI1_DATA11        0x158 0x528 0x88c 0x3 0x0
-#define MX6QDL_PAD_EIM_D21__USB_OTG_OC              0x158 0x528 0x920 0x4 0x0
-#define MX6QDL_PAD_EIM_D21__GPIO3_IO21              0x158 0x528 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D21__I2C1_SCL                0x158 0x528 0x868 0x6 0x1
-#define MX6QDL_PAD_EIM_D21__SPDIF_IN                0x158 0x528 0x8f0 0x7 0x0
-#define MX6QDL_PAD_EIM_D22__EIM_DATA22              0x15c 0x52c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D22__ECSPI4_MISO             0x15c 0x52c 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D22__IPU1_DI0_PIN01          0x15c 0x52c 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D22__IPU1_CSI1_DATA10        0x15c 0x52c 0x888 0x3 0x0
-#define MX6QDL_PAD_EIM_D22__USB_OTG_PWR             0x15c 0x52c 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D22__GPIO3_IO22              0x15c 0x52c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D22__SPDIF_OUT               0x15c 0x52c 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_D22__EPDC_SDCE6              0x15c 0x52c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D23__EIM_DATA23              0x160 0x530 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D23__IPU1_DI0_D0_CS          0x160 0x530 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D23__UART3_CTS_B             0x160 0x530 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D23__UART3_RTS_B             0x160 0x530 0x908 0x2 0x0
-#define MX6QDL_PAD_EIM_D23__UART1_DCD_B             0x160 0x530 0x000 0x3 0x0
-#define MX6QDL_PAD_EIM_D23__IPU1_CSI1_DATA_EN       0x160 0x530 0x8b0 0x4 0x0
-#define MX6QDL_PAD_EIM_D23__GPIO3_IO23              0x160 0x530 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D23__IPU1_DI1_PIN02          0x160 0x530 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_D23__IPU1_DI1_PIN14          0x160 0x530 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_D23__EPDC_DATA11             0x160 0x530 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D24__EIM_DATA24              0x164 0x534 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D24__ECSPI4_SS2              0x164 0x534 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D24__UART3_TX_DATA           0x164 0x534 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D24__UART3_RX_DATA           0x164 0x534 0x90c 0x2 0x0
-#define MX6QDL_PAD_EIM_D24__ECSPI1_SS2              0x164 0x534 0x7ec 0x3 0x0
-#define MX6QDL_PAD_EIM_D24__ECSPI2_SS2              0x164 0x534 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D24__GPIO3_IO24              0x164 0x534 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D24__AUD5_RXFS               0x164 0x534 0x7bc 0x6 0x1
-#define MX6QDL_PAD_EIM_D24__UART1_DTR_B             0x164 0x534 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_D24__EPDC_SDCE7              0x164 0x534 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D25__EIM_DATA25              0x168 0x538 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D25__ECSPI4_SS3              0x168 0x538 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D25__UART3_RX_DATA           0x168 0x538 0x90c 0x2 0x1
-#define MX6QDL_PAD_EIM_D25__UART3_TX_DATA           0x168 0x538 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D25__ECSPI1_SS3              0x168 0x538 0x7f0 0x3 0x0
-#define MX6QDL_PAD_EIM_D25__ECSPI2_SS3              0x168 0x538 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D25__GPIO3_IO25              0x168 0x538 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D25__AUD5_RXC                0x168 0x538 0x7b8 0x6 0x1
-#define MX6QDL_PAD_EIM_D25__UART1_DSR_B             0x168 0x538 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_D25__EPDC_SDCE8              0x168 0x538 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D26__EIM_DATA26              0x16c 0x53c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D26__IPU1_DI1_PIN11          0x16c 0x53c 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D26__IPU1_CSI0_DATA01        0x16c 0x53c 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D26__IPU1_CSI1_DATA14        0x16c 0x53c 0x898 0x3 0x1
-#define MX6QDL_PAD_EIM_D26__UART2_TX_DATA           0x16c 0x53c 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D26__UART2_RX_DATA           0x16c 0x53c 0x904 0x4 0x0
-#define MX6QDL_PAD_EIM_D26__GPIO3_IO26              0x16c 0x53c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D26__IPU1_SISG2              0x16c 0x53c 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_D26__IPU1_DISP1_DATA22       0x16c 0x53c 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_D26__EPDC_SDOED              0x16c 0x53c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D27__EIM_DATA27              0x170 0x540 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D27__IPU1_DI1_PIN13          0x170 0x540 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D27__IPU1_CSI0_DATA00        0x170 0x540 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D27__IPU1_CSI1_DATA13        0x170 0x540 0x894 0x3 0x1
-#define MX6QDL_PAD_EIM_D27__UART2_RX_DATA           0x170 0x540 0x904 0x4 0x1
-#define MX6QDL_PAD_EIM_D27__UART2_TX_DATA           0x170 0x540 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D27__GPIO3_IO27              0x170 0x540 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D27__IPU1_SISG3              0x170 0x540 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_D27__IPU1_DISP1_DATA23       0x170 0x540 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_D27__EPDC_SDOE               0x170 0x540 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D28__EIM_DATA28              0x174 0x544 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D28__I2C1_SDA                0x174 0x544 0x86c 0x1 0x1
-#define MX6QDL_PAD_EIM_D28__ECSPI4_MOSI             0x174 0x544 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D28__IPU1_CSI1_DATA12        0x174 0x544 0x890 0x3 0x1
-#define MX6QDL_PAD_EIM_D28__UART2_CTS_B             0x174 0x544 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D28__UART2_RTS_B             0x174 0x544 0x900 0x4 0x0
-#define MX6QDL_PAD_EIM_D28__UART2_DTE_CTS_B         0x174 0x544 0x900 0x4 0x0
-#define MX6QDL_PAD_EIM_D28__UART2_DTE_RTS_B         0x174 0x544 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D28__GPIO3_IO28              0x174 0x544 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D28__IPU1_EXT_TRIG           0x174 0x544 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_D28__IPU1_DI0_PIN13          0x174 0x544 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_D28__EPDC_PWR_CTRL3          0x174 0x544 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D29__EIM_DATA29              0x178 0x548 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D29__IPU1_DI1_PIN15          0x178 0x548 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D29__ECSPI4_SS0              0x178 0x548 0x808 0x2 0x1
-#define MX6QDL_PAD_EIM_D29__UART2_RTS_B             0x178 0x548 0x900 0x4 0x1
-#define MX6QDL_PAD_EIM_D29__UART2_CTS_B             0x178 0x548 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D29__UART2_DTE_RTS_B         0x178 0x548 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D29__UART2_DTE_CTS_B         0x178 0x548 0x900 0x4 0x1
-#define MX6QDL_PAD_EIM_D29__GPIO3_IO29              0x178 0x548 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D29__IPU1_CSI1_VSYNC         0x178 0x548 0x8bc 0x6 0x0
-#define MX6QDL_PAD_EIM_D29__IPU1_DI0_PIN14          0x178 0x548 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_D29__EPDC_PWR_WAKE           0x178 0x548 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D30__EIM_DATA30              0x17c 0x54c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D30__IPU1_DISP1_DATA21       0x17c 0x54c 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D30__IPU1_DI0_PIN11          0x17c 0x54c 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D30__IPU1_CSI0_DATA03        0x17c 0x54c 0x000 0x3 0x0
-#define MX6QDL_PAD_EIM_D30__UART3_CTS_B             0x17c 0x54c 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D30__UART3_RTS_B             0x17c 0x54c 0x908 0x4 0x1
-#define MX6QDL_PAD_EIM_D30__GPIO3_IO30              0x17c 0x54c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D30__USB_H1_OC               0x17c 0x54c 0x924 0x6 0x0
-#define MX6QDL_PAD_EIM_D30__EPDC_SDOEZ              0x17c 0x54c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D31__EIM_DATA31              0x180 0x550 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_D31__IPU1_DISP1_DATA20       0x180 0x550 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_D31__IPU1_DI0_PIN12          0x180 0x550 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_D31__IPU1_CSI0_DATA02        0x180 0x550 0x000 0x3 0x0
-#define MX6QDL_PAD_EIM_D31__UART3_RTS_B             0x180 0x550 0x908 0x4 0x2
-#define MX6QDL_PAD_EIM_D31__UART3_CTS_B             0x180 0x550 0x000 0x4 0x0
-#define MX6QDL_PAD_EIM_D31__GPIO3_IO31              0x180 0x550 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_D31__USB_H1_PWR              0x180 0x550 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_D31__EPDC_SDCLK_P            0x180 0x550 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_D31__EIM_ACLK_FREERUN        0x180 0x550 0x000 0x9 0x0
-#define MX6QDL_PAD_EIM_DA0__EIM_AD00                0x184 0x554 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA0__IPU1_DISP1_DATA09       0x184 0x554 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA0__IPU1_CSI1_DATA09        0x184 0x554 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA0__GPIO3_IO00              0x184 0x554 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA0__SRC_BOOT_CFG00          0x184 0x554 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA0__EPDC_SDCLK_N            0x184 0x554 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA1__EIM_AD01                0x188 0x558 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA1__IPU1_DISP1_DATA08       0x188 0x558 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA1__IPU1_CSI1_DATA08        0x188 0x558 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA1__GPIO3_IO01              0x188 0x558 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA1__SRC_BOOT_CFG01          0x188 0x558 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA1__EPDC_SDLE               0x188 0x558 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA10__EIM_AD10               0x18c 0x55c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA10__IPU1_DI1_PIN15         0x18c 0x55c 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA10__IPU1_CSI1_DATA_EN      0x18c 0x55c 0x8b0 0x2 0x1
-#define MX6QDL_PAD_EIM_DA10__GPIO3_IO10             0x18c 0x55c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA10__SRC_BOOT_CFG10         0x18c 0x55c 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA10__EPDC_DATA01            0x18c 0x55c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA11__EIM_AD11               0x190 0x560 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA11__IPU1_DI1_PIN02         0x190 0x560 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA11__IPU1_CSI1_HSYNC        0x190 0x560 0x8b4 0x2 0x0
-#define MX6QDL_PAD_EIM_DA11__GPIO3_IO11             0x190 0x560 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA11__SRC_BOOT_CFG11         0x190 0x560 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA11__EPDC_DATA03            0x190 0x560 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA12__EIM_AD12               0x194 0x564 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA12__IPU1_DI1_PIN03         0x194 0x564 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA12__IPU1_CSI1_VSYNC        0x194 0x564 0x8bc 0x2 0x1
-#define MX6QDL_PAD_EIM_DA12__GPIO3_IO12             0x194 0x564 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA12__SRC_BOOT_CFG12         0x194 0x564 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA12__EPDC_DATA02            0x194 0x564 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA13__EIM_AD13               0x198 0x568 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA13__IPU1_DI1_D0_CS         0x198 0x568 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA13__GPIO3_IO13             0x198 0x568 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA13__SRC_BOOT_CFG13         0x198 0x568 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA13__EPDC_DATA13            0x198 0x568 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA14__EIM_AD14               0x19c 0x56c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA14__IPU1_DI1_D1_CS         0x19c 0x56c 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA14__GPIO3_IO14             0x19c 0x56c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA14__SRC_BOOT_CFG14         0x19c 0x56c 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA14__EPDC_DATA14            0x19c 0x56c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA15__EIM_AD15               0x1a0 0x570 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA15__IPU1_DI1_PIN01         0x1a0 0x570 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA15__IPU1_DI1_PIN04         0x1a0 0x570 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA15__GPIO3_IO15             0x1a0 0x570 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA15__SRC_BOOT_CFG15         0x1a0 0x570 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA15__EPDC_DATA09            0x1a0 0x570 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA2__EIM_AD02                0x1a4 0x574 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA2__IPU1_DISP1_DATA07       0x1a4 0x574 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA2__IPU1_CSI1_DATA07        0x1a4 0x574 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA2__GPIO3_IO02              0x1a4 0x574 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA2__SRC_BOOT_CFG02          0x1a4 0x574 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA2__EPDC_BDR0               0x1a4 0x574 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA3__EIM_AD03                0x1a8 0x578 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA3__IPU1_DISP1_DATA06       0x1a8 0x578 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA3__IPU1_CSI1_DATA06        0x1a8 0x578 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA3__GPIO3_IO03              0x1a8 0x578 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA3__SRC_BOOT_CFG03          0x1a8 0x578 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA3__EPDC_BDR1               0x1a8 0x578 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA4__EIM_AD04                0x1ac 0x57c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA4__IPU1_DISP1_DATA05       0x1ac 0x57c 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA4__IPU1_CSI1_DATA05        0x1ac 0x57c 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA4__GPIO3_IO04              0x1ac 0x57c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA4__SRC_BOOT_CFG04          0x1ac 0x57c 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA4__EPDC_SDCE0              0x1ac 0x57c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA5__EIM_AD05                0x1b0 0x580 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA5__IPU1_DISP1_DATA04       0x1b0 0x580 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA5__IPU1_CSI1_DATA04        0x1b0 0x580 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA5__GPIO3_IO05              0x1b0 0x580 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA5__SRC_BOOT_CFG05          0x1b0 0x580 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA5__EPDC_SDCE1              0x1b0 0x580 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA6__EIM_AD06                0x1b4 0x584 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA6__IPU1_DISP1_DATA03       0x1b4 0x584 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA6__IPU1_CSI1_DATA03        0x1b4 0x584 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA6__GPIO3_IO06              0x1b4 0x584 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA6__SRC_BOOT_CFG06          0x1b4 0x584 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA6__EPDC_SDCE2              0x1b4 0x584 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA7__EIM_AD07                0x1b8 0x588 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA7__IPU1_DISP1_DATA02       0x1b8 0x588 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA7__IPU1_CSI1_DATA02        0x1b8 0x588 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA7__GPIO3_IO07              0x1b8 0x588 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA7__SRC_BOOT_CFG07          0x1b8 0x588 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA7__EPDC_SDCE3              0x1b8 0x588 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA8__EIM_AD08                0x1bc 0x58c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA8__IPU1_DISP1_DATA01       0x1bc 0x58c 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA8__IPU1_CSI1_DATA01        0x1bc 0x58c 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA8__GPIO3_IO08              0x1bc 0x58c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA8__SRC_BOOT_CFG08          0x1bc 0x58c 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA8__EPDC_SDCE4              0x1bc 0x58c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_DA9__EIM_AD09                0x1c0 0x590 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_DA9__IPU1_DISP1_DATA00       0x1c0 0x590 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_DA9__IPU1_CSI1_DATA00        0x1c0 0x590 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_DA9__GPIO3_IO09              0x1c0 0x590 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_DA9__SRC_BOOT_CFG09          0x1c0 0x590 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_DA9__EPDC_SDCE5              0x1c0 0x590 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_EB0__EIM_EB0_B               0x1c4 0x594 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_EB0__IPU1_DISP1_DATA11       0x1c4 0x594 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_EB0__IPU1_CSI1_DATA11        0x1c4 0x594 0x88c 0x2 0x1
-#define MX6QDL_PAD_EIM_EB0__CCM_PMIC_READY          0x1c4 0x594 0x7d4 0x4 0x0
-#define MX6QDL_PAD_EIM_EB0__GPIO2_IO28              0x1c4 0x594 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_EB0__SRC_BOOT_CFG27          0x1c4 0x594 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_EB0__EPDC_PWR_COM            0x1c4 0x594 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_EB1__EIM_EB1_B               0x1c8 0x598 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_EB1__IPU1_DISP1_DATA10       0x1c8 0x598 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_EB1__IPU1_CSI1_DATA10        0x1c8 0x598 0x888 0x2 0x1
-#define MX6QDL_PAD_EIM_EB1__GPIO2_IO29              0x1c8 0x598 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_EB1__SRC_BOOT_CFG28          0x1c8 0x598 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_EB1__EPDC_SDSHR              0x1c8 0x598 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_EB2__EIM_EB2_B               0x1cc 0x59c 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_EB2__ECSPI1_SS0              0x1cc 0x59c 0x7e4 0x1 0x2
-#define MX6QDL_PAD_EIM_EB2__IPU1_CSI1_DATA19        0x1cc 0x59c 0x8ac 0x3 0x1
-#define MX6QDL_PAD_EIM_EB2__HDMI_TX_DDC_SCL         0x1cc 0x59c 0x860 0x4 0x0
-#define MX6QDL_PAD_EIM_EB2__GPIO2_IO30              0x1cc 0x59c 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_EB2__I2C2_SCL                0x1cc 0x59c 0x870 0x6 0x0
-#define MX6QDL_PAD_EIM_EB2__SRC_BOOT_CFG30          0x1cc 0x59c 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_EB2__EPDC_DATA05             0x1cc 0x59c 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_EB3__EIM_EB3_B               0x1d0 0x5a0 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_EB3__ECSPI4_RDY              0x1d0 0x5a0 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_EB3__UART3_RTS_B             0x1d0 0x5a0 0x908 0x2 0x3
-#define MX6QDL_PAD_EIM_EB3__UART3_CTS_B             0x1d0 0x5a0 0x000 0x2 0x0
-#define MX6QDL_PAD_EIM_EB3__UART1_RI_B              0x1d0 0x5a0 0x000 0x3 0x0
-#define MX6QDL_PAD_EIM_EB3__IPU1_CSI1_HSYNC         0x1d0 0x5a0 0x8b4 0x4 0x1
-#define MX6QDL_PAD_EIM_EB3__GPIO2_IO31              0x1d0 0x5a0 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_EB3__IPU1_DI1_PIN03          0x1d0 0x5a0 0x000 0x6 0x0
-#define MX6QDL_PAD_EIM_EB3__SRC_BOOT_CFG31          0x1d0 0x5a0 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_EB3__EPDC_SDCE0              0x1d0 0x5a0 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_EB3__EIM_ACLK_FREERUN        0x1d0 0x5a0 0x000 0x9 0x0
-#define MX6QDL_PAD_EIM_LBA__EIM_LBA_B               0x1d4 0x5a4 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_LBA__IPU1_DI1_PIN17          0x1d4 0x5a4 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_LBA__ECSPI2_SS1              0x1d4 0x5a4 0x804 0x2 0x1
-#define MX6QDL_PAD_EIM_LBA__GPIO2_IO27              0x1d4 0x5a4 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_LBA__SRC_BOOT_CFG26          0x1d4 0x5a4 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_LBA__EPDC_DATA04             0x1d4 0x5a4 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_OE__EIM_OE_B                 0x1d8 0x5a8 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_OE__IPU1_DI1_PIN07           0x1d8 0x5a8 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_OE__ECSPI2_MISO              0x1d8 0x5a8 0x7f8 0x2 0x2
-#define MX6QDL_PAD_EIM_OE__GPIO2_IO25               0x1d8 0x5a8 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_OE__EPDC_PWR_IRQ             0x1d8 0x5a8 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_RW__EIM_RW                   0x1dc 0x5ac 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_RW__IPU1_DI1_PIN08           0x1dc 0x5ac 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_RW__ECSPI2_SS0               0x1dc 0x5ac 0x800 0x2 0x2
-#define MX6QDL_PAD_EIM_RW__GPIO2_IO26               0x1dc 0x5ac 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_RW__SRC_BOOT_CFG29           0x1dc 0x5ac 0x000 0x7 0x0
-#define MX6QDL_PAD_EIM_RW__EPDC_DATA07              0x1dc 0x5ac 0x000 0x8 0x0
-#define MX6QDL_PAD_EIM_WAIT__EIM_WAIT_B             0x1e0 0x5b0 0x000 0x0 0x0
-#define MX6QDL_PAD_EIM_WAIT__EIM_DTACK_B            0x1e0 0x5b0 0x000 0x1 0x0
-#define MX6QDL_PAD_EIM_WAIT__GPIO5_IO00             0x1e0 0x5b0 0x000 0x5 0x0
-#define MX6QDL_PAD_EIM_WAIT__SRC_BOOT_CFG25         0x1e0 0x5b0 0x000 0x7 0x0
-#define MX6QDL_PAD_ENET_CRS_DV__ENET_RX_EN          0x1e4 0x5b4 0x828 0x1 0x0
-#define MX6QDL_PAD_ENET_CRS_DV__ESAI_TX_CLK         0x1e4 0x5b4 0x840 0x2 0x0
-#define MX6QDL_PAD_ENET_CRS_DV__SPDIF_EXT_CLK       0x1e4 0x5b4 0x8f4 0x3 0x0
-#define MX6QDL_PAD_ENET_CRS_DV__GPIO1_IO25          0x1e4 0x5b4 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_MDC__MLB_DATA               0x1e8 0x5b8 0x8e0 0x0 0x0
-#define MX6QDL_PAD_ENET_MDC__ENET_MDC               0x1e8 0x5b8 0x000 0x1 0x0
-#define MX6QDL_PAD_ENET_MDC__ESAI_TX5_RX0           0x1e8 0x5b8 0x858 0x2 0x0
-#define MX6QDL_PAD_ENET_MDC__ENET_1588_EVENT1_IN    0x1e8 0x5b8 0x000 0x4 0x0
-#define MX6QDL_PAD_ENET_MDC__GPIO1_IO31             0x1e8 0x5b8 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_MDIO__ENET_MDIO             0x1ec 0x5bc 0x810 0x1 0x0
-#define MX6QDL_PAD_ENET_MDIO__ESAI_RX_CLK           0x1ec 0x5bc 0x83c 0x2 0x0
-#define MX6QDL_PAD_ENET_MDIO__ENET_1588_EVENT1_OUT  0x1ec 0x5bc 0x000 0x4 0x0
-#define MX6QDL_PAD_ENET_MDIO__GPIO1_IO22            0x1ec 0x5bc 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_MDIO__SPDIF_LOCK            0x1ec 0x5bc 0x000 0x6 0x0
-#define MX6QDL_PAD_ENET_REF_CLK__ENET_TX_CLK        0x1f0 0x5c0 0x000 0x1 0x0
-#define MX6QDL_PAD_ENET_REF_CLK__ESAI_RX_FS         0x1f0 0x5c0 0x82c 0x2 0x0
-#define MX6QDL_PAD_ENET_REF_CLK__GPIO1_IO23         0x1f0 0x5c0 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_REF_CLK__SPDIF_SR_CLK       0x1f0 0x5c0 0x000 0x6 0x0
-#define MX6QDL_PAD_ENET_RX_ER__USB_OTG_ID           0x1f4 0x5c4 0x790 0x0 0x0
-#define MX6QDL_PAD_ENET_RX_ER__ENET_RX_ER           0x1f4 0x5c4 0x000 0x1 0x0
-#define MX6QDL_PAD_ENET_RX_ER__ESAI_RX_HF_CLK       0x1f4 0x5c4 0x834 0x2 0x0
-#define MX6QDL_PAD_ENET_RX_ER__SPDIF_IN             0x1f4 0x5c4 0x8f0 0x3 0x1
-#define MX6QDL_PAD_ENET_RX_ER__ENET_1588_EVENT2_OUT 0x1f4 0x5c4 0x000 0x4 0x0
-#define MX6QDL_PAD_ENET_RX_ER__GPIO1_IO24           0x1f4 0x5c4 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_RXD0__ENET_RX_DATA0         0x1f8 0x5c8 0x818 0x1 0x0
-#define MX6QDL_PAD_ENET_RXD0__ESAI_TX_HF_CLK        0x1f8 0x5c8 0x838 0x2 0x0
-#define MX6QDL_PAD_ENET_RXD0__SPDIF_OUT             0x1f8 0x5c8 0x000 0x3 0x0
-#define MX6QDL_PAD_ENET_RXD0__GPIO1_IO27            0x1f8 0x5c8 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_RXD1__MLB_SIG               0x1fc 0x5cc 0x8e4 0x0 0x0
-#define MX6QDL_PAD_ENET_RXD1__ENET_RX_DATA1         0x1fc 0x5cc 0x81c 0x1 0x0
-#define MX6QDL_PAD_ENET_RXD1__ESAI_TX_FS            0x1fc 0x5cc 0x830 0x2 0x0
-#define MX6QDL_PAD_ENET_RXD1__ENET_1588_EVENT3_OUT  0x1fc 0x5cc 0x000 0x4 0x0
-#define MX6QDL_PAD_ENET_RXD1__GPIO1_IO26            0x1fc 0x5cc 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_TX_EN__ENET_TX_EN           0x200 0x5d0 0x000 0x1 0x0
-#define MX6QDL_PAD_ENET_TX_EN__ESAI_TX3_RX2         0x200 0x5d0 0x850 0x2 0x0
-#define MX6QDL_PAD_ENET_TX_EN__GPIO1_IO28           0x200 0x5d0 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_TX_EN__I2C4_SCL             0x200 0x5d0 0x880 0x9 0x0
-#define MX6QDL_PAD_ENET_TXD0__ENET_TX_DATA0         0x204 0x5d4 0x000 0x1 0x0
-#define MX6QDL_PAD_ENET_TXD0__ESAI_TX4_RX1          0x204 0x5d4 0x854 0x2 0x0
-#define MX6QDL_PAD_ENET_TXD0__GPIO1_IO30            0x204 0x5d4 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_TXD1__MLB_CLK               0x208 0x5d8 0x8dc 0x0 0x0
-#define MX6QDL_PAD_ENET_TXD1__ENET_TX_DATA1         0x208 0x5d8 0x000 0x1 0x0
-#define MX6QDL_PAD_ENET_TXD1__ESAI_TX2_RX3          0x208 0x5d8 0x84c 0x2 0x0
-#define MX6QDL_PAD_ENET_TXD1__ENET_1588_EVENT0_IN   0x208 0x5d8 0x000 0x4 0x0
-#define MX6QDL_PAD_ENET_TXD1__GPIO1_IO29            0x208 0x5d8 0x000 0x5 0x0
-#define MX6QDL_PAD_ENET_TXD1__I2C4_SDA              0x208 0x5d8 0x884 0x9 0x0
-#define MX6QDL_PAD_GPIO_0__CCM_CLKO1                0x20c 0x5dc 0x000 0x0 0x0
-#define MX6QDL_PAD_GPIO_0__KEY_COL5                 0x20c 0x5dc 0x8c0 0x2 0x1
-#define MX6QDL_PAD_GPIO_0__ASRC_EXT_CLK             0x20c 0x5dc 0x794 0x3 0x0
-#define MX6QDL_PAD_GPIO_0__EPIT1_OUT                0x20c 0x5dc 0x000 0x4 0x0
-#define MX6QDL_PAD_GPIO_0__GPIO1_IO00               0x20c 0x5dc 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_0__USB_H1_PWR               0x20c 0x5dc 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_0__SNVS_VIO_5               0x20c 0x5dc 0x000 0x7 0x0
-#define MX6QDL_PAD_GPIO_1__ESAI_RX_CLK              0x210 0x5e0 0x83c 0x0 0x1
-#define MX6QDL_PAD_GPIO_1__WDOG2_B                  0x210 0x5e0 0x000 0x1 0x0
-#define MX6QDL_PAD_GPIO_1__KEY_ROW5                 0x210 0x5e0 0x8cc 0x2 0x1
-#define MX6QDL_PAD_GPIO_1__USB_OTG_ID               0x210 0x5e0 0x790 0x3 0x1
-#define MX6QDL_PAD_GPIO_1__PWM2_OUT                 0x210 0x5e0 0x000 0x4 0x0
-#define MX6QDL_PAD_GPIO_1__GPIO1_IO01               0x210 0x5e0 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_1__SD1_CD_B                 0x210 0x5e0 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_16__ESAI_TX3_RX2            0x214 0x5e4 0x850 0x0 0x1
-#define MX6QDL_PAD_GPIO_16__ENET_1588_EVENT2_IN     0x214 0x5e4 0x000 0x1 0x0
-#define MX6QDL_PAD_GPIO_16__ENET_REF_CLK            0x214 0x5e4 0x80c 0x2 0x0
-#define MX6QDL_PAD_GPIO_16__SD1_LCTL                0x214 0x5e4 0x000 0x3 0x0
-#define MX6QDL_PAD_GPIO_16__SPDIF_IN                0x214 0x5e4 0x8f0 0x4 0x2
-#define MX6QDL_PAD_GPIO_16__GPIO7_IO11              0x214 0x5e4 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_16__I2C3_SDA                0x214 0x5e4 0x87c 0x6 0x1
-#define MX6QDL_PAD_GPIO_16__JTAG_DE_B               0x214 0x5e4 0x000 0x7 0x0
-#define MX6QDL_PAD_GPIO_17__ESAI_TX0                0x218 0x5e8 0x844 0x0 0x0
-#define MX6QDL_PAD_GPIO_17__ENET_1588_EVENT3_IN     0x218 0x5e8 0x000 0x1 0x0
-#define MX6QDL_PAD_GPIO_17__CCM_PMIC_READY          0x218 0x5e8 0x7d4 0x2 0x1
-#define MX6QDL_PAD_GPIO_17__SDMA_EXT_EVENT0         0x218 0x5e8 0x8e8 0x3 0x1
-#define MX6QDL_PAD_GPIO_17__SPDIF_OUT               0x218 0x5e8 0x000 0x4 0x0
-#define MX6QDL_PAD_GPIO_17__GPIO7_IO12              0x218 0x5e8 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_18__ESAI_TX1                0x21c 0x5ec 0x848 0x0 0x0
-#define MX6QDL_PAD_GPIO_18__ENET_RX_CLK             0x21c 0x5ec 0x814 0x1 0x0
-#define MX6QDL_PAD_GPIO_18__SD3_VSELECT             0x21c 0x5ec 0x000 0x2 0x0
-#define MX6QDL_PAD_GPIO_18__SDMA_EXT_EVENT1         0x21c 0x5ec 0x8ec 0x3 0x1
-#define MX6QDL_PAD_GPIO_18__ASRC_EXT_CLK            0x21c 0x5ec 0x794 0x4 0x1
-#define MX6QDL_PAD_GPIO_18__GPIO7_IO13              0x21c 0x5ec 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_18__SNVS_VIO_5_CTL          0x21c 0x5ec 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_19__KEY_COL5                0x220 0x5f0 0x8c0 0x0 0x2
-#define MX6QDL_PAD_GPIO_19__ENET_1588_EVENT0_OUT    0x220 0x5f0 0x000 0x1 0x0
-#define MX6QDL_PAD_GPIO_19__SPDIF_OUT               0x220 0x5f0 0x000 0x2 0x0
-#define MX6QDL_PAD_GPIO_19__CCM_CLKO1               0x220 0x5f0 0x000 0x3 0x0
-#define MX6QDL_PAD_GPIO_19__ECSPI1_RDY              0x220 0x5f0 0x000 0x4 0x0
-#define MX6QDL_PAD_GPIO_19__GPIO4_IO05              0x220 0x5f0 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_19__ENET_TX_ER              0x220 0x5f0 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_2__ESAI_TX_FS               0x224 0x5f4 0x830 0x0 0x1
-#define MX6QDL_PAD_GPIO_2__KEY_ROW6                 0x224 0x5f4 0x8d0 0x2 0x1
-#define MX6QDL_PAD_GPIO_2__GPIO1_IO02               0x224 0x5f4 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_2__SD2_WP                   0x224 0x5f4 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_2__MLB_DATA                 0x224 0x5f4 0x8e0 0x7 0x1
-#define MX6QDL_PAD_GPIO_3__ESAI_RX_HF_CLK           0x228 0x5f8 0x834 0x0 0x1
-#define MX6QDL_PAD_GPIO_3__I2C3_SCL                 0x228 0x5f8 0x878 0x2 0x1
-#define MX6QDL_PAD_GPIO_3__XTALOSC_REF_CLK_24M      0x228 0x5f8 0x000 0x3 0x0
-#define MX6QDL_PAD_GPIO_3__CCM_CLKO2                0x228 0x5f8 0x000 0x4 0x0
-#define MX6QDL_PAD_GPIO_3__GPIO1_IO03               0x228 0x5f8 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_3__USB_H1_OC                0x228 0x5f8 0x924 0x6 0x1
-#define MX6QDL_PAD_GPIO_3__MLB_CLK                  0x228 0x5f8 0x8dc 0x7 0x1
-#define MX6QDL_PAD_GPIO_4__ESAI_TX_HF_CLK           0x22c 0x5fc 0x838 0x0 0x1
-#define MX6QDL_PAD_GPIO_4__KEY_COL7                 0x22c 0x5fc 0x8c8 0x2 0x1
-#define MX6QDL_PAD_GPIO_4__GPIO1_IO04               0x22c 0x5fc 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_4__SD2_CD_B                 0x22c 0x5fc 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_5__ESAI_TX2_RX3             0x230 0x600 0x84c 0x0 0x1
-#define MX6QDL_PAD_GPIO_5__KEY_ROW7                 0x230 0x600 0x8d4 0x2 0x1
-#define MX6QDL_PAD_GPIO_5__CCM_CLKO1                0x230 0x600 0x000 0x3 0x0
-#define MX6QDL_PAD_GPIO_5__GPIO1_IO05               0x230 0x600 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_5__I2C3_SCL                 0x230 0x600 0x878 0x6 0x2
-#define MX6QDL_PAD_GPIO_5__ARM_EVENTI               0x230 0x600 0x000 0x7 0x0
-#define MX6QDL_PAD_GPIO_6__ESAI_TX_CLK              0x234 0x604 0x840 0x0 0x1
-#define MX6QDL_PAD_GPIO_6__ENET_IRQ		    0x234 0x604 0x03c 0x11 0xff000609
-#define MX6QDL_PAD_GPIO_6__I2C3_SDA                 0x234 0x604 0x87c 0x2 0x2
-#define MX6QDL_PAD_GPIO_6__GPIO1_IO06               0x234 0x604 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_6__SD2_LCTL                 0x234 0x604 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_6__MLB_SIG                  0x234 0x604 0x8e4 0x7 0x1
-#define MX6QDL_PAD_GPIO_7__ESAI_TX4_RX1             0x238 0x608 0x854 0x0 0x1
-#define MX6QDL_PAD_GPIO_7__EPIT1_OUT                0x238 0x608 0x000 0x2 0x0
-#define MX6QDL_PAD_GPIO_7__FLEXCAN1_TX              0x238 0x608 0x000 0x3 0x0
-#define MX6QDL_PAD_GPIO_7__UART2_TX_DATA            0x238 0x608 0x000 0x4 0x0
-#define MX6QDL_PAD_GPIO_7__UART2_RX_DATA            0x238 0x608 0x904 0x4 0x2
-#define MX6QDL_PAD_GPIO_7__GPIO1_IO07               0x238 0x608 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_7__SPDIF_LOCK               0x238 0x608 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_7__USB_OTG_HOST_MODE        0x238 0x608 0x000 0x7 0x0
-#define MX6QDL_PAD_GPIO_7__I2C4_SCL                 0x238 0x608 0x880 0x8 0x1
-#define MX6QDL_PAD_GPIO_8__ESAI_TX5_RX0             0x23c 0x60c 0x858 0x0 0x1
-#define MX6QDL_PAD_GPIO_8__XTALOSC_REF_CLK_32K      0x23c 0x60c 0x000 0x1 0x0
-#define MX6QDL_PAD_GPIO_8__EPIT2_OUT                0x23c 0x60c 0x000 0x2 0x0
-#define MX6QDL_PAD_GPIO_8__FLEXCAN1_RX              0x23c 0x60c 0x7c8 0x3 0x0
-#define MX6QDL_PAD_GPIO_8__UART2_RX_DATA            0x23c 0x60c 0x904 0x4 0x3
-#define MX6QDL_PAD_GPIO_8__UART2_TX_DATA            0x23c 0x60c 0x000 0x4 0x0
-#define MX6QDL_PAD_GPIO_8__GPIO1_IO08               0x23c 0x60c 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_8__SPDIF_SR_CLK             0x23c 0x60c 0x000 0x6 0x0
-#define MX6QDL_PAD_GPIO_8__USB_OTG_PWR_CTL_WAKE     0x23c 0x60c 0x000 0x7 0x0
-#define MX6QDL_PAD_GPIO_8__I2C4_SDA                 0x23c 0x60c 0x884 0x8 0x1
-#define MX6QDL_PAD_GPIO_9__ESAI_RX_FS               0x240 0x610 0x82c 0x0 0x1
-#define MX6QDL_PAD_GPIO_9__WDOG1_B                  0x240 0x610 0x000 0x1 0x0
-#define MX6QDL_PAD_GPIO_9__KEY_COL6                 0x240 0x610 0x8c4 0x2 0x1
-#define MX6QDL_PAD_GPIO_9__CCM_REF_EN_B             0x240 0x610 0x000 0x3 0x0
-#define MX6QDL_PAD_GPIO_9__PWM1_OUT                 0x240 0x610 0x000 0x4 0x0
-#define MX6QDL_PAD_GPIO_9__GPIO1_IO09               0x240 0x610 0x000 0x5 0x0
-#define MX6QDL_PAD_GPIO_9__SD1_WP                   0x240 0x610 0x92c 0x6 0x1
-#define MX6QDL_PAD_KEY_COL0__ECSPI1_SCLK            0x244 0x62c 0x7d8 0x0 0x3
-#define MX6QDL_PAD_KEY_COL0__ENET_RX_DATA3          0x244 0x62c 0x824 0x1 0x0
-#define MX6QDL_PAD_KEY_COL0__AUD5_TXC               0x244 0x62c 0x7c0 0x2 0x1
-#define MX6QDL_PAD_KEY_COL0__KEY_COL0               0x244 0x62c 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_COL0__UART4_TX_DATA          0x244 0x62c 0x000 0x4 0x0
-#define MX6QDL_PAD_KEY_COL0__UART4_RX_DATA          0x244 0x62c 0x914 0x4 0x2
-#define MX6QDL_PAD_KEY_COL0__GPIO4_IO06             0x244 0x62c 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_COL0__DCIC1_OUT              0x244 0x62c 0x000 0x6 0x0
-#define MX6QDL_PAD_KEY_COL1__ECSPI1_MISO            0x248 0x630 0x7dc 0x0 0x3
-#define MX6QDL_PAD_KEY_COL1__ENET_MDIO              0x248 0x630 0x810 0x1 0x1
-#define MX6QDL_PAD_KEY_COL1__AUD5_TXFS              0x248 0x630 0x7c4 0x2 0x1
-#define MX6QDL_PAD_KEY_COL1__KEY_COL1               0x248 0x630 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_COL1__UART5_TX_DATA          0x248 0x630 0x000 0x4 0x0
-#define MX6QDL_PAD_KEY_COL1__UART5_RX_DATA          0x248 0x630 0x91c 0x4 0x2
-#define MX6QDL_PAD_KEY_COL1__GPIO4_IO08             0x248 0x630 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_COL1__SD1_VSELECT            0x248 0x630 0x000 0x6 0x0
-#define MX6QDL_PAD_KEY_COL2__ECSPI1_SS1             0x24c 0x634 0x7e8 0x0 0x2
-#define MX6QDL_PAD_KEY_COL2__ENET_RX_DATA2          0x24c 0x634 0x820 0x1 0x0
-#define MX6QDL_PAD_KEY_COL2__FLEXCAN1_TX            0x24c 0x634 0x000 0x2 0x0
-#define MX6QDL_PAD_KEY_COL2__KEY_COL2               0x24c 0x634 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_COL2__ENET_MDC               0x24c 0x634 0x000 0x4 0x0
-#define MX6QDL_PAD_KEY_COL2__GPIO4_IO10             0x24c 0x634 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_COL2__USB_H1_PWR_CTL_WAKE    0x24c 0x634 0x000 0x6 0x0
-#define MX6QDL_PAD_KEY_COL3__ECSPI1_SS3             0x250 0x638 0x7f0 0x0 0x1
-#define MX6QDL_PAD_KEY_COL3__ENET_CRS               0x250 0x638 0x000 0x1 0x0
-#define MX6QDL_PAD_KEY_COL3__HDMI_TX_DDC_SCL        0x250 0x638 0x860 0x2 0x1
-#define MX6QDL_PAD_KEY_COL3__KEY_COL3               0x250 0x638 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_COL3__I2C2_SCL               0x250 0x638 0x870 0x4 0x1
-#define MX6QDL_PAD_KEY_COL3__GPIO4_IO12             0x250 0x638 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_COL3__SPDIF_IN               0x250 0x638 0x8f0 0x6 0x3
-#define MX6QDL_PAD_KEY_COL4__FLEXCAN2_TX            0x254 0x63c 0x000 0x0 0x0
-#define MX6QDL_PAD_KEY_COL4__IPU1_SISG4             0x254 0x63c 0x000 0x1 0x0
-#define MX6QDL_PAD_KEY_COL4__USB_OTG_OC             0x254 0x63c 0x920 0x2 0x1
-#define MX6QDL_PAD_KEY_COL4__KEY_COL4               0x254 0x63c 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_COL4__UART5_RTS_B            0x254 0x63c 0x918 0x4 0x2
-#define MX6QDL_PAD_KEY_COL4__UART5_CTS_B            0x254 0x63c 0x000 0x4 0x0
-#define MX6QDL_PAD_KEY_COL4__GPIO4_IO14             0x254 0x63c 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_ROW0__ECSPI1_MOSI            0x258 0x640 0x7e0 0x0 0x3
-#define MX6QDL_PAD_KEY_ROW0__ENET_TX_DATA3          0x258 0x640 0x000 0x1 0x0
-#define MX6QDL_PAD_KEY_ROW0__AUD5_TXD               0x258 0x640 0x7b4 0x2 0x1
-#define MX6QDL_PAD_KEY_ROW0__KEY_ROW0               0x258 0x640 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_ROW0__UART4_RX_DATA          0x258 0x640 0x914 0x4 0x3
-#define MX6QDL_PAD_KEY_ROW0__UART4_TX_DATA          0x258 0x640 0x000 0x4 0x0
-#define MX6QDL_PAD_KEY_ROW0__GPIO4_IO07             0x258 0x640 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_ROW0__DCIC2_OUT              0x258 0x640 0x000 0x6 0x0
-#define MX6QDL_PAD_KEY_ROW1__ECSPI1_SS0             0x25c 0x644 0x7e4 0x0 0x3
-#define MX6QDL_PAD_KEY_ROW1__ENET_COL               0x25c 0x644 0x000 0x1 0x0
-#define MX6QDL_PAD_KEY_ROW1__AUD5_RXD               0x25c 0x644 0x7b0 0x2 0x1
-#define MX6QDL_PAD_KEY_ROW1__KEY_ROW1               0x25c 0x644 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_ROW1__UART5_RX_DATA          0x25c 0x644 0x91c 0x4 0x3
-#define MX6QDL_PAD_KEY_ROW1__UART5_TX_DATA          0x25c 0x644 0x000 0x4 0x0
-#define MX6QDL_PAD_KEY_ROW1__GPIO4_IO09             0x25c 0x644 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_ROW1__SD2_VSELECT            0x25c 0x644 0x000 0x6 0x0
-#define MX6QDL_PAD_KEY_ROW2__ECSPI1_SS2             0x260 0x648 0x7ec 0x0 0x1
-#define MX6QDL_PAD_KEY_ROW2__ENET_TX_DATA2          0x260 0x648 0x000 0x1 0x0
-#define MX6QDL_PAD_KEY_ROW2__FLEXCAN1_RX            0x260 0x648 0x7c8 0x2 0x1
-#define MX6QDL_PAD_KEY_ROW2__KEY_ROW2               0x260 0x648 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_ROW2__SD2_VSELECT            0x260 0x648 0x000 0x4 0x0
-#define MX6QDL_PAD_KEY_ROW2__GPIO4_IO11             0x260 0x648 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_ROW2__HDMI_TX_CEC_LINE       0x260 0x648 0x85c 0x6 0x1
-#define MX6QDL_PAD_KEY_ROW3__ASRC_EXT_CLK           0x264 0x64c 0x794 0x1 0x2
-#define MX6QDL_PAD_KEY_ROW3__HDMI_TX_DDC_SDA        0x264 0x64c 0x864 0x2 0x1
-#define MX6QDL_PAD_KEY_ROW3__KEY_ROW3               0x264 0x64c 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_ROW3__I2C2_SDA               0x264 0x64c 0x874 0x4 0x1
-#define MX6QDL_PAD_KEY_ROW3__GPIO4_IO13             0x264 0x64c 0x000 0x5 0x0
-#define MX6QDL_PAD_KEY_ROW3__SD1_VSELECT            0x264 0x64c 0x000 0x6 0x0
-#define MX6QDL_PAD_KEY_ROW4__FLEXCAN2_RX            0x268 0x650 0x7cc 0x0 0x0
-#define MX6QDL_PAD_KEY_ROW4__IPU1_SISG5             0x268 0x650 0x000 0x1 0x0
-#define MX6QDL_PAD_KEY_ROW4__USB_OTG_PWR            0x268 0x650 0x000 0x2 0x0
-#define MX6QDL_PAD_KEY_ROW4__KEY_ROW4               0x268 0x650 0x000 0x3 0x0
-#define MX6QDL_PAD_KEY_ROW4__UART5_CTS_B            0x268 0x650 0x000 0x4 0x0
-#define MX6QDL_PAD_KEY_ROW4__UART5_RTS_B            0x268 0x650 0x918 0x4 0x3
-#define MX6QDL_PAD_KEY_ROW4__GPIO4_IO15             0x268 0x650 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_ALE__NAND_ALE              0x26c 0x654 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_ALE__SD4_RESET             0x26c 0x654 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_ALE__GPIO6_IO08            0x26c 0x654 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_CLE__NAND_CLE              0x270 0x658 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_CLE__GPIO6_IO07            0x270 0x658 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_CS0__NAND_CE0_B            0x274 0x65c 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_CS0__GPIO6_IO11            0x274 0x65c 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_CS1__NAND_CE1_B            0x278 0x660 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_CS1__SD4_VSELECT           0x278 0x660 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_CS1__SD3_VSELECT           0x278 0x660 0x000 0x2 0x0
-#define MX6QDL_PAD_NANDF_CS1__GPIO6_IO14            0x278 0x660 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_CS2__NAND_CE2_B            0x27c 0x664 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_CS2__IPU1_SISG0            0x27c 0x664 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_CS2__ESAI_TX0              0x27c 0x664 0x844 0x2 0x1
-#define MX6QDL_PAD_NANDF_CS2__EIM_CRE               0x27c 0x664 0x000 0x3 0x0
-#define MX6QDL_PAD_NANDF_CS2__CCM_CLKO2             0x27c 0x664 0x000 0x4 0x0
-#define MX6QDL_PAD_NANDF_CS2__GPIO6_IO15            0x27c 0x664 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_CS3__NAND_CE3_B            0x280 0x668 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_CS3__IPU1_SISG1            0x280 0x668 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_CS3__ESAI_TX1              0x280 0x668 0x848 0x2 0x1
-#define MX6QDL_PAD_NANDF_CS3__EIM_ADDR26            0x280 0x668 0x000 0x3 0x0
-#define MX6QDL_PAD_NANDF_CS3__GPIO6_IO16            0x280 0x668 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_CS3__I2C4_SDA              0x280 0x668 0x884 0x9 0x2
-#define MX6QDL_PAD_NANDF_D0__NAND_DATA00            0x284 0x66c 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_D0__SD1_DATA4              0x284 0x66c 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_D0__GPIO2_IO00             0x284 0x66c 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_D1__NAND_DATA01            0x288 0x670 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_D1__SD1_DATA5              0x288 0x670 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_D1__GPIO2_IO01             0x288 0x670 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_D2__NAND_DATA02            0x28c 0x674 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_D2__SD1_DATA6              0x28c 0x674 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_D2__GPIO2_IO02             0x28c 0x674 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_D3__NAND_DATA03            0x290 0x678 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_D3__SD1_DATA7              0x290 0x678 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_D3__GPIO2_IO03             0x290 0x678 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_D4__NAND_DATA04            0x294 0x67c 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_D4__SD2_DATA4              0x294 0x67c 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_D4__GPIO2_IO04             0x294 0x67c 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_D5__NAND_DATA05            0x298 0x680 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_D5__SD2_DATA5              0x298 0x680 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_D5__GPIO2_IO05             0x298 0x680 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_D6__NAND_DATA06            0x29c 0x684 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_D6__SD2_DATA6              0x29c 0x684 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_D6__GPIO2_IO06             0x29c 0x684 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_D7__NAND_DATA07            0x2a0 0x688 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_D7__SD2_DATA7              0x2a0 0x688 0x000 0x1 0x0
-#define MX6QDL_PAD_NANDF_D7__GPIO2_IO07             0x2a0 0x688 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_RB0__NAND_READY_B          0x2a4 0x68c 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_RB0__GPIO6_IO10            0x2a4 0x68c 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_WP_B__NAND_WP_B            0x2a8 0x690 0x000 0x0 0x0
-#define MX6QDL_PAD_NANDF_WP_B__GPIO6_IO09           0x2a8 0x690 0x000 0x5 0x0
-#define MX6QDL_PAD_NANDF_WP_B__I2C4_SCL             0x2a8 0x690 0x880 0x9 0x2
-#define MX6QDL_PAD_RGMII_RD0__HSI_RX_READY          0x2ac 0x694 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_RD0__RGMII_RD0             0x2ac 0x694 0x818 0x1 0x1
-#define MX6QDL_PAD_RGMII_RD0__GPIO6_IO25            0x2ac 0x694 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_RD1__HSI_TX_FLAG           0x2b0 0x698 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_RD1__RGMII_RD1             0x2b0 0x698 0x81c 0x1 0x1
-#define MX6QDL_PAD_RGMII_RD1__GPIO6_IO27            0x2b0 0x698 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_RD2__HSI_TX_DATA           0x2b4 0x69c 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_RD2__RGMII_RD2             0x2b4 0x69c 0x820 0x1 0x1
-#define MX6QDL_PAD_RGMII_RD2__GPIO6_IO28            0x2b4 0x69c 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_RD3__HSI_TX_WAKE           0x2b8 0x6a0 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_RD3__RGMII_RD3             0x2b8 0x6a0 0x824 0x1 0x1
-#define MX6QDL_PAD_RGMII_RD3__GPIO6_IO29            0x2b8 0x6a0 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_RX_CTL__USB_H3_DATA        0x2bc 0x6a4 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_RX_CTL__RGMII_RX_CTL       0x2bc 0x6a4 0x828 0x1 0x1
-#define MX6QDL_PAD_RGMII_RX_CTL__GPIO6_IO24         0x2bc 0x6a4 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_RXC__USB_H3_STROBE         0x2c0 0x6a8 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_RXC__RGMII_RXC             0x2c0 0x6a8 0x814 0x1 0x1
-#define MX6QDL_PAD_RGMII_RXC__GPIO6_IO30            0x2c0 0x6a8 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_TD0__HSI_TX_READY          0x2c4 0x6ac 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_TD0__RGMII_TD0             0x2c4 0x6ac 0x000 0x1 0x0
-#define MX6QDL_PAD_RGMII_TD0__GPIO6_IO20            0x2c4 0x6ac 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_TD1__HSI_RX_FLAG           0x2c8 0x6b0 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_TD1__RGMII_TD1             0x2c8 0x6b0 0x000 0x1 0x0
-#define MX6QDL_PAD_RGMII_TD1__GPIO6_IO21            0x2c8 0x6b0 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_TD2__HSI_RX_DATA           0x2cc 0x6b4 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_TD2__RGMII_TD2             0x2cc 0x6b4 0x000 0x1 0x0
-#define MX6QDL_PAD_RGMII_TD2__GPIO6_IO22            0x2cc 0x6b4 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_TD3__HSI_RX_WAKE           0x2d0 0x6b8 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_TD3__RGMII_TD3             0x2d0 0x6b8 0x000 0x1 0x0
-#define MX6QDL_PAD_RGMII_TD3__GPIO6_IO23            0x2d0 0x6b8 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_TX_CTL__USB_H2_STROBE      0x2d4 0x6bc 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_TX_CTL__RGMII_TX_CTL       0x2d4 0x6bc 0x000 0x1 0x0
-#define MX6QDL_PAD_RGMII_TX_CTL__GPIO6_IO26         0x2d4 0x6bc 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_TX_CTL__ENET_REF_CLK       0x2d4 0x6bc 0x80c 0x7 0x1
-#define MX6QDL_PAD_RGMII_TXC__USB_H2_DATA           0x2d8 0x6c0 0x000 0x0 0x0
-#define MX6QDL_PAD_RGMII_TXC__RGMII_TXC             0x2d8 0x6c0 0x000 0x1 0x0
-#define MX6QDL_PAD_RGMII_TXC__SPDIF_EXT_CLK         0x2d8 0x6c0 0x8f4 0x2 0x1
-#define MX6QDL_PAD_RGMII_TXC__GPIO6_IO19            0x2d8 0x6c0 0x000 0x5 0x0
-#define MX6QDL_PAD_RGMII_TXC__XTALOSC_REF_CLK_24M   0x2d8 0x6c0 0x000 0x7 0x0
-#define MX6QDL_PAD_SD1_CLK__SD1_CLK                 0x2dc 0x6c4 0x928 0x0 0x1
-#define MX6QDL_PAD_SD1_CLK__OSC32K_32K_OUT          0x2dc 0x6c4 0x000 0x2 0x0
-#define MX6QDL_PAD_SD1_CLK__GPT_CLKIN               0x2dc 0x6c4 0x000 0x3 0x0
-#define MX6QDL_PAD_SD1_CLK__GPIO1_IO20              0x2dc 0x6c4 0x000 0x5 0x0
-#define MX6QDL_PAD_SD1_CMD__SD1_CMD                 0x2e0 0x6c8 0x000 0x0 0x0
-#define MX6QDL_PAD_SD1_CMD__PWM4_OUT                0x2e0 0x6c8 0x000 0x2 0x0
-#define MX6QDL_PAD_SD1_CMD__GPT_COMPARE1            0x2e0 0x6c8 0x000 0x3 0x0
-#define MX6QDL_PAD_SD1_CMD__GPIO1_IO18              0x2e0 0x6c8 0x000 0x5 0x0
-#define MX6QDL_PAD_SD1_DAT0__SD1_DATA0              0x2e4 0x6cc 0x000 0x0 0x0
-#define MX6QDL_PAD_SD1_DAT0__GPT_CAPTURE1           0x2e4 0x6cc 0x000 0x3 0x0
-#define MX6QDL_PAD_SD1_DAT0__GPIO1_IO16             0x2e4 0x6cc 0x000 0x5 0x0
-#define MX6QDL_PAD_SD1_DAT1__SD1_DATA1              0x2e8 0x6d0 0x000 0x0 0x0
-#define MX6QDL_PAD_SD1_DAT1__PWM3_OUT               0x2e8 0x6d0 0x000 0x2 0x0
-#define MX6QDL_PAD_SD1_DAT1__GPT_CAPTURE2           0x2e8 0x6d0 0x000 0x3 0x0
-#define MX6QDL_PAD_SD1_DAT1__GPIO1_IO17             0x2e8 0x6d0 0x000 0x5 0x0
-#define MX6QDL_PAD_SD1_DAT2__SD1_DATA2              0x2ec 0x6d4 0x000 0x0 0x0
-#define MX6QDL_PAD_SD1_DAT2__GPT_COMPARE2           0x2ec 0x6d4 0x000 0x2 0x0
-#define MX6QDL_PAD_SD1_DAT2__PWM2_OUT               0x2ec 0x6d4 0x000 0x3 0x0
-#define MX6QDL_PAD_SD1_DAT2__WDOG1_B                0x2ec 0x6d4 0x000 0x4 0x0
-#define MX6QDL_PAD_SD1_DAT2__GPIO1_IO19             0x2ec 0x6d4 0x000 0x5 0x0
-#define MX6QDL_PAD_SD1_DAT2__WDOG1_RESET_B_DEB      0x2ec 0x6d4 0x000 0x6 0x0
-#define MX6QDL_PAD_SD1_DAT3__SD1_DATA3              0x2f0 0x6d8 0x000 0x0 0x0
-#define MX6QDL_PAD_SD1_DAT3__GPT_COMPARE3           0x2f0 0x6d8 0x000 0x2 0x0
-#define MX6QDL_PAD_SD1_DAT3__PWM1_OUT               0x2f0 0x6d8 0x000 0x3 0x0
-#define MX6QDL_PAD_SD1_DAT3__WDOG2_B                0x2f0 0x6d8 0x000 0x4 0x0
-#define MX6QDL_PAD_SD1_DAT3__GPIO1_IO21             0x2f0 0x6d8 0x000 0x5 0x0
-#define MX6QDL_PAD_SD1_DAT3__WDOG2_RESET_B_DEB      0x2f0 0x6d8 0x000 0x6 0x0
-#define MX6QDL_PAD_SD2_CLK__SD2_CLK                 0x2f4 0x6dc 0x930 0x0 0x1
-#define MX6QDL_PAD_SD2_CLK__KEY_COL5                0x2f4 0x6dc 0x8c0 0x2 0x3
-#define MX6QDL_PAD_SD2_CLK__AUD4_RXFS               0x2f4 0x6dc 0x7a4 0x3 0x1
-#define MX6QDL_PAD_SD2_CLK__GPIO1_IO10              0x2f4 0x6dc 0x000 0x5 0x0
-#define MX6QDL_PAD_SD2_CMD__SD2_CMD                 0x2f8 0x6e0 0x000 0x0 0x0
-#define MX6QDL_PAD_SD2_CMD__KEY_ROW5                0x2f8 0x6e0 0x8cc 0x2 0x2
-#define MX6QDL_PAD_SD2_CMD__AUD4_RXC                0x2f8 0x6e0 0x7a0 0x3 0x1
-#define MX6QDL_PAD_SD2_CMD__GPIO1_IO11              0x2f8 0x6e0 0x000 0x5 0x0
-#define MX6QDL_PAD_SD2_DAT0__SD2_DATA0              0x2fc 0x6e4 0x000 0x0 0x0
-#define MX6QDL_PAD_SD2_DAT0__AUD4_RXD               0x2fc 0x6e4 0x798 0x3 0x1
-#define MX6QDL_PAD_SD2_DAT0__KEY_ROW7               0x2fc 0x6e4 0x8d4 0x4 0x2
-#define MX6QDL_PAD_SD2_DAT0__GPIO1_IO15             0x2fc 0x6e4 0x000 0x5 0x0
-#define MX6QDL_PAD_SD2_DAT0__DCIC2_OUT              0x2fc 0x6e4 0x000 0x6 0x0
-#define MX6QDL_PAD_SD2_DAT1__SD2_DATA1              0x300 0x6e8 0x000 0x0 0x0
-#define MX6QDL_PAD_SD2_DAT1__EIM_CS2_B              0x300 0x6e8 0x000 0x2 0x0
-#define MX6QDL_PAD_SD2_DAT1__AUD4_TXFS              0x300 0x6e8 0x7ac 0x3 0x1
-#define MX6QDL_PAD_SD2_DAT1__KEY_COL7               0x300 0x6e8 0x8c8 0x4 0x2
-#define MX6QDL_PAD_SD2_DAT1__GPIO1_IO14             0x300 0x6e8 0x000 0x5 0x0
-#define MX6QDL_PAD_SD2_DAT2__SD2_DATA2              0x304 0x6ec 0x000 0x0 0x0
-#define MX6QDL_PAD_SD2_DAT2__EIM_CS3_B              0x304 0x6ec 0x000 0x2 0x0
-#define MX6QDL_PAD_SD2_DAT2__AUD4_TXD               0x304 0x6ec 0x79c 0x3 0x1
-#define MX6QDL_PAD_SD2_DAT2__KEY_ROW6               0x304 0x6ec 0x8d0 0x4 0x2
-#define MX6QDL_PAD_SD2_DAT2__GPIO1_IO13             0x304 0x6ec 0x000 0x5 0x0
-#define MX6QDL_PAD_SD2_DAT3__SD2_DATA3              0x308 0x6f0 0x000 0x0 0x0
-#define MX6QDL_PAD_SD2_DAT3__KEY_COL6               0x308 0x6f0 0x8c4 0x2 0x2
-#define MX6QDL_PAD_SD2_DAT3__AUD4_TXC               0x308 0x6f0 0x7a8 0x3 0x1
-#define MX6QDL_PAD_SD2_DAT3__GPIO1_IO12             0x308 0x6f0 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_CLK__SD3_CLK                 0x30c 0x6f4 0x934 0x0 0x1
-#define MX6QDL_PAD_SD3_CLK__UART2_RTS_B             0x30c 0x6f4 0x900 0x1 0x2
-#define MX6QDL_PAD_SD3_CLK__UART2_CTS_B             0x30c 0x6f4 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_CLK__FLEXCAN1_RX             0x30c 0x6f4 0x7c8 0x2 0x2
-#define MX6QDL_PAD_SD3_CLK__GPIO7_IO03              0x30c 0x6f4 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_CMD__SD3_CMD                 0x310 0x6f8 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_CMD__UART2_CTS_B             0x310 0x6f8 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_CMD__UART2_RTS_B             0x310 0x6f8 0x900 0x1 0x3
-#define MX6QDL_PAD_SD3_CMD__FLEXCAN1_TX             0x310 0x6f8 0x000 0x2 0x0
-#define MX6QDL_PAD_SD3_CMD__GPIO7_IO02              0x310 0x6f8 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_DAT0__SD3_DATA0              0x314 0x6fc 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_DAT0__UART1_CTS_B            0x314 0x6fc 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_DAT0__UART1_RTS_B            0x314 0x6fc 0x8f8 0x1 0x2
-#define MX6QDL_PAD_SD3_DAT0__FLEXCAN2_TX            0x314 0x6fc 0x000 0x2 0x0
-#define MX6QDL_PAD_SD3_DAT0__GPIO7_IO04             0x314 0x6fc 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_DAT1__SD3_DATA1              0x318 0x700 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_DAT1__UART1_RTS_B            0x318 0x700 0x8f8 0x1 0x3
-#define MX6QDL_PAD_SD3_DAT1__UART1_CTS_B            0x318 0x700 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_DAT1__FLEXCAN2_RX            0x318 0x700 0x7cc 0x2 0x1
-#define MX6QDL_PAD_SD3_DAT1__GPIO7_IO05             0x318 0x700 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_DAT2__SD3_DATA2              0x31c 0x704 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_DAT2__GPIO7_IO06             0x31c 0x704 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_DAT3__SD3_DATA3              0x320 0x708 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_DAT3__UART3_CTS_B            0x320 0x708 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_DAT3__UART3_RTS_B            0x320 0x708 0x908 0x1 0x4
-#define MX6QDL_PAD_SD3_DAT3__GPIO7_IO07             0x320 0x708 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_DAT4__SD3_DATA4              0x324 0x70c 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_DAT4__UART2_RX_DATA          0x324 0x70c 0x904 0x1 0x4
-#define MX6QDL_PAD_SD3_DAT4__UART2_TX_DATA          0x324 0x70c 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_DAT4__GPIO7_IO01             0x324 0x70c 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_DAT5__SD3_DATA5              0x328 0x710 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_DAT5__UART2_TX_DATA          0x328 0x710 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_DAT5__UART2_RX_DATA          0x328 0x710 0x904 0x1 0x5
-#define MX6QDL_PAD_SD3_DAT5__GPIO7_IO00             0x328 0x710 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_DAT6__SD3_DATA6              0x32c 0x714 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_DAT6__UART1_RX_DATA          0x32c 0x714 0x8fc 0x1 0x2
-#define MX6QDL_PAD_SD3_DAT6__UART1_TX_DATA          0x32c 0x714 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_DAT6__GPIO6_IO18             0x32c 0x714 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_DAT7__SD3_DATA7              0x330 0x718 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_DAT7__UART1_TX_DATA          0x330 0x718 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_DAT7__UART1_RX_DATA          0x330 0x718 0x8fc 0x1 0x3
-#define MX6QDL_PAD_SD3_DAT7__GPIO6_IO17             0x330 0x718 0x000 0x5 0x0
-#define MX6QDL_PAD_SD3_RST__SD3_RESET               0x334 0x71c 0x000 0x0 0x0
-#define MX6QDL_PAD_SD3_RST__UART3_RTS_B             0x334 0x71c 0x908 0x1 0x5
-#define MX6QDL_PAD_SD3_RST__UART3_CTS_B             0x334 0x71c 0x000 0x1 0x0
-#define MX6QDL_PAD_SD3_RST__GPIO7_IO08              0x334 0x71c 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_CLK__SD4_CLK                 0x338 0x720 0x938 0x0 0x1
-#define MX6QDL_PAD_SD4_CLK__NAND_WE_B               0x338 0x720 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_CLK__UART3_RX_DATA           0x338 0x720 0x90c 0x2 0x2
-#define MX6QDL_PAD_SD4_CLK__UART3_TX_DATA           0x338 0x720 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_CLK__GPIO7_IO10              0x338 0x720 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_CMD__SD4_CMD                 0x33c 0x724 0x000 0x0 0x0
-#define MX6QDL_PAD_SD4_CMD__NAND_RE_B               0x33c 0x724 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_CMD__UART3_TX_DATA           0x33c 0x724 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_CMD__UART3_RX_DATA           0x33c 0x724 0x90c 0x2 0x3
-#define MX6QDL_PAD_SD4_CMD__GPIO7_IO09              0x33c 0x724 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_DAT0__SD4_DATA0              0x340 0x728 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_DAT0__NAND_DQS               0x340 0x728 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_DAT0__GPIO2_IO08             0x340 0x728 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_DAT1__SD4_DATA1              0x344 0x72c 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_DAT1__PWM3_OUT               0x344 0x72c 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_DAT1__GPIO2_IO09             0x344 0x72c 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_DAT2__SD4_DATA2              0x348 0x730 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_DAT2__PWM4_OUT               0x348 0x730 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_DAT2__GPIO2_IO10             0x348 0x730 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_DAT3__SD4_DATA3              0x34c 0x734 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_DAT3__GPIO2_IO11             0x34c 0x734 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_DAT4__SD4_DATA4              0x350 0x738 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_DAT4__UART2_RX_DATA          0x350 0x738 0x904 0x2 0x6
-#define MX6QDL_PAD_SD4_DAT4__UART2_TX_DATA          0x350 0x738 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_DAT4__GPIO2_IO12             0x350 0x738 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_DAT5__SD4_DATA5              0x354 0x73c 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_DAT5__UART2_RTS_B            0x354 0x73c 0x900 0x2 0x4
-#define MX6QDL_PAD_SD4_DAT5__UART2_CTS_B            0x354 0x73c 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_DAT5__GPIO2_IO13             0x354 0x73c 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_DAT6__SD4_DATA6              0x358 0x740 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_DAT6__UART2_CTS_B            0x358 0x740 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_DAT6__UART2_RTS_B            0x358 0x740 0x900 0x2 0x5
-#define MX6QDL_PAD_SD4_DAT6__GPIO2_IO14             0x358 0x740 0x000 0x5 0x0
-#define MX6QDL_PAD_SD4_DAT7__SD4_DATA7              0x35c 0x744 0x000 0x1 0x0
-#define MX6QDL_PAD_SD4_DAT7__UART2_TX_DATA          0x35c 0x744 0x000 0x2 0x0
-#define MX6QDL_PAD_SD4_DAT7__UART2_RX_DATA          0x35c 0x744 0x904 0x2 0x7
-#define MX6QDL_PAD_SD4_DAT7__GPIO2_IO15             0x35c 0x744 0x000 0x5 0x0
+Obwohl C# zwischen Ausgabe und Verweis unterscheidet, sieht CLR da keinen Unterschied. Bei der Entscheidung welche Methode die Schnittstelle implementiert, w√§hlt CLR nur eine aus.
 
-#endif /* __DTS_IMX6DL_PINFUNC_H */
+Unterst√ºtzen Sie den Compiler bei der Unterscheidung zwischen den Methoden. Dazu k√∂nnen Sie beispielsweise unterschiedliche Namen vergeben oder einen zus√§tzlichen Parameter angeben.XElement implementiert Schnittstellenelement mit mehreren √úbereinstimmungen zur Laufzeit“Der Member "{1}" √ºberschreibt "{0}". Zur Laufzeit sind mehrere Kandidaten zum √úberschreiben verf√ºgbar. Es h√§ngt von der Implementierung ab, welche Methode aufgerufen wird. Verwenden Sie eine neuere Runtime.WElement √ºberschreibt Basiselement mit mehreren √úberschreibungskandidaten zur LaufzeitYIndizierung eines Arrays mit einem negativen Index (Arrayindizes starten immer mit Null)./Indiziert einen Array mit einem negativen IndexjDas Mitglied "{0}" blendet kein verf√ºgbares Mitglied aus. Das neue Schl√ºsselwort ist nicht erforderlich.MElement blendet kein vererbtes Element aus; neues Schl√ºsselwort erforderlichÕ"{0}" blendet den vererbten Member "{1}" aus. Damit der aktuelle Member diese Implementierung √ºberschreibt, f√ºgen Sie das override-Schl√ºsselwort hinzu. Ansonsten f√ºgen Sie das new-Schl√ºsselwort hinzu.OElement blendet vererbtes Element aus; fehlendes √úberschreibungsschl√ºsselwortw"{0}" blendet den vererbten Member "{1}" aus. Verwenden Sie das new-Schl√ºsselwort, wenn das Ausblenden vorgesehen war.´Eine Variable wurde mit demselben Namen deklariert wie eine Variable in einem Basistyp. Das new-Schl√ºsselwort wurde jedoch nicht verwendet. Diese Warnung informiert Sie dar√ºber, dass Sie "new" verwenden m√ºssen; die Variable wird so deklariert, als w√§re "new" in der Deklaration verwendet worden.DElement blendet vererbte Element aus; fehlendes 'new'-Schl√ºsselwort+Die Assembly "{0}" enth√§lt keine Analyzer. Assembly enth√§lt keine AnalysenRDie /noconfig-Option wird ignoriert, da sie in einer Antwortdatei angegeben wurde.RDie /noconfig-Option wird ignoriert, da sie in einer Antwortdatei angegeben wurde.∂F√ºr RuntimeMetadataVersion wurde kein Wert gefunden. Keine Assembly mit System.Object wurde gefunden, und es wurde auch kein Wert f√ºr RuntimeMetadataVersion mit Optionen angegeben.7Es wurde kein Wert f√ºr RuntimeMetadataVersion gefunden'Es wurden keine Quelldateien angegeben.'Es wurden keine Quelldateien angegeben.ëDie Funktion "{0}" ist nicht Teil der C#-Sprachspezifikation nach ISO-Norm und wird daher m√∂glicherweise von anderen Compilern nicht akzeptiert.àFeature ist nicht Teil der standardisierten ISO C#-Sprachspezifikation, und wird m√∂glicherweise von anderen Compilern nicht akzeptiert.lDer Member "{0}" √ºberschreibt den veralteten Member "{1}". F√ºgen Sie das Obsolete-Attribut zu "{0}" hinzu.(Element √ºberschreibt veraltetes ElementeDas Ergebnis des Ausdrucks ist immer "{0}", da ein Wert vom Typ "{1}" niemals NULL vom Typ "{2}" ist.eDas Ergebnis des Ausdrucks ist immer "{0}", da ein Wert vom Typ "{1}" niemals NULL vom Typ "{2}" ist.aDas Ergebnis des Ausdrucks lautet immer gleich, da ein Wert dieses Typs niemals 'null' entsprichtaDas Ergebnis des Ausdrucks lautet immer gleich, da ein Wert dieses Typs niemals 'null' entsprichtPEin NULL-Literal kann nicht in einen Non-Nullable-Verweistyp konvertiert werden.PEin NULL-Literal kann nicht in einen Non-Nullable-Verweistyp konvertiert werden.XDer Parameter ‚Äû{0}‚Äú wurde auf NULL-Werte √ºberpr√ºft, ist aber standardm√§√üig NULL.NDer Parameter wurde auf NULL-Werte √ºberpr√ºft, ist aber standardm√§√üig NULL.YDer Nullable-Typ ‚Äû{0}‚Äú wurde auf NULL-Werte √ºberpr√ºft und wird bei NULL ausgel√∂st.ODer Nullable-Typ wurde auf NULL-Werte √ºberpr√ºft und wird bei NULL ausgel√∂st.AM√∂gliches Nullverweisargument f√ºr den Parameter "{0}" in "{1}".M√∂gliches Nullverweisargument.M√∂gliche Nullverweiszuweisung.M√∂gliche Nullverweiszuweisung.pDer Objekt- oder Sammlungsinitialisierer dereferenziert implizit den Member "{0}", der m√∂glicherweise NULL ist.lDer Objekt- oder Sammlungsinitialisierer dereferenziert implizit einen Member, der m√∂glicherweise NULL ist.0Dereferenzierung eines m√∂glichen Nullverweises.0Dereferenzierung eines m√∂glichen Nullverweises.M√∂gliche Nullverweisr√ºckgabe.M√∂gliche Nullverweisr√ºckgabe.≠Das Argument vom Typ "{0}" kann aufgrund von Unterschieden in der NULL-Zul√§ssigkeit von Verweistypen nicht f√ºr den Parameter "{2}" vom Typ "{1}" in "{3}" verwendet werden.∫Das Argument vom Typ "{0}" kann aufgrund von Unterschieden bei der NULL-Zul√§ssigkeit von Verweistypen nicht als Ausgabe vom Typ "{1}" f√ºr den Parameter "{2}" in "{3}" verwendet werden.èDas Argument kann aufgrund von Unterschieden bei der NULL-Zul√§ssigkeit von Verweistypen nicht als Ausgabe f√ºr den Parameter verwendet werden.ÉDas Argument kann aufgrund von Unterschieden bei der NULL-Zul√§ssigkeit von Verweistypen nicht f√ºr den Parameter verwendet werden.aDie NULL-Zul√§ssigkeit von Verweistypen im Wert vom Typ "{0}" entspricht nicht dem Zieltyp "{1}".MDie NULL-Zul√§ssigkeit von Verweistypen im Wert entspricht nicht dem Zieltyp.ÉDie NULL-Zul√§ssigkeit in Einschr√§nkungen f√ºr den Typparameter "{0}" der Methode "{1}" entspricht nicht den Einschr√§nkungen f√ºr den Typparameter "{2}" der Schnittstellenmethode "{3}". Verwenden Sie stattdessen eine explizite Schnittstellenimplementierung.≥Die NULL-Zul√§ssigkeit in Einschr√§nkungen f√ºr den Typparameter entspricht nicht den Einschr√§nkungen f√ºr den Typparameter in der implizit implementierten Schnittstellenmethode.îPartielle Methodendeklarationen von "{0}" weisen eine inkonsistente NULL-NULL-Zul√§ssigkeit in den Einschr√§nkungen f√ºr den Typparameter "{1}" auf.{Partielle Methodendeklarationen weisen eine inkonsistente NULL-Zul√§ssigkeit in Einschr√§nkungen f√ºr den Typparameter auf.çDie NULL-Zul√§ssigkeit von Verweistypen im expliziten Schnittstellenspezifizierer entspricht nicht der vom Typ implementierten Schnittstelle.çDie NULL-Zul√§ssigkeit von Verweistypen im expliziten Schnittstellenspezifizierer entspricht nicht der vom Typ implementierten Schnittstelle.™"{0}" implementiert den Schnittstellenmember "{1}" nicht. Die NULL-Zul√§ssigkeit von Verweistypen in der vom Basistyp implementierten Schnittstelle stimmt nicht √ºberein.¶Der Typ implementiert den Schnittstellenmember nicht. Die NULL-Zul√§ssigkeit von Verweistypen in der vom Basistyp implementierten Schnittstelle stimmt nicht √ºberein.ΩDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters "{0}" von "{1}" entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem Zieldelegaten "{2}".ßDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem Zieldelegaten.vDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters "{0}" entspricht nicht dem implementierten Member "{1}".jDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters entspricht nicht dem implementierten Member.âDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters "{0}" von "{1}" entspricht nicht dem implizit implementierten Member "{2}".sDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters entspricht nicht dem implizit implementierten Member.wDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters "{0}" entspricht nicht dem au√üer Kraft gesetzten Member.qDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters entspricht nicht dem au√üer Kraft gesetzten Member.|Die NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters "{0}" entspricht nicht der Deklaration der partiellen Methode.vDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters entspricht nicht der Deklaration der partiellen Methode.≠Die NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp "{0}" entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem Zieldelegaten "{1}".°Die NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem Zieldelegaten.jDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht nicht dem implementierten Member "{0}".dDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht nicht dem implementierten Member.}Die NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp von "{0}" entspricht nicht dem implizit implementierten Member "{1}".mDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht nicht dem implizit implementierten Member.kDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht nicht dem au√üer Kraft gesetzten Member.kDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht nicht dem au√üer Kraft gesetzten Member.pDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht nicht der Deklaration der partiellen Methode.pDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht nicht der Deklaration der partiellen Methode.aDie NULL-Zul√§ssigkeit von Verweistypen im Typ entspricht nicht dem implementierten Member "{0}".[Die NULL-Zul√§ssigkeit von Verweistypen im Typ entspricht nicht dem implementierten Member.pDie NULL-Zul√§ssigkeit von Verweistypen im Typ "{0}" entspricht nicht dem implizit implementierten Member "{1}".dDie NULL-Zul√§ssigkeit von Verweistypen im Typ entspricht nicht dem implizit implementierten Member.bDie NULL-Zul√§ssigkeit von Verweistypen im Typ entspricht nicht dem au√üer Kraft gesetzten Member.bDie NULL-Zul√§ssigkeit von Verweistypen im Typ entspricht nicht dem au√üer Kraft gesetzten Member.◊Der Typ "{3}" kann nicht als Typparameter "{2}" im generischen Typ oder in der generischen Methode "{0}" verwendet werden. Die NULL-Zul√§ssigkeit des Typarguments "{3}" entspricht nicht dem Einschr√§nkungstyp "{1}".πDer Typ kann nicht als Typparameter im generischen Typ oder in der generischen Methode verwendet werden. Die NULL-Zul√§ssigkeit des Typarguments entspricht nicht dem Einschr√§nkungstyp.’Der Typ "{2}" kann nicht als Typparameter "{1}" im generischen Typ oder in der generischen Methode "{0}" verwendet werden. Die NULL-Zul√§ssigkeit des Typarguments "{2}" entspricht nicht der notnull-Einschr√§nkung.ΩDer Typ kann nicht als Typparameter im generischen Typ oder in der generischen Methode verwendet werden. Die NULL-Zul√§ssigkeit des Typarguments entspricht nicht der notnull-Einschr√§nkung.”Der Typ "{2}" kann nicht als Typparameter "{1}" im generischen Typ oder in der generischen Methode "{0}" verwendet werden. Die NULL-Zul√§ssigkeit des Typarguments "{2}" entspricht nicht der class-Einschr√§nkung.ªDer Typ kann nicht als Typparameter im generischen Typ oder in der generischen Methode verwendet werden. Die NULL-Zul√§ssigkeit des Typarguments entspricht nicht der class-Einschr√§nkung./Ein Werttyp, der NULL zul√§sst, kann NULL sein./Ein Werttyp, der NULL zul√§sst, kann NULL sein.KDer veraltete Member "{0}" √ºberschreibt den nicht veralteten Member "{1}".9Veraltetes Element √ºberschreibt nicht veraltetes ElementiDer out-Parameter "{0}" muss eine Zuweisung erhalten, bevor die Steuerung die aktuelle Methode verl√§sst.^Zuweisen eines out-Parameters erforderlich, bevor die Steuerung die aktuelle Methode verl√§sstSDer Parameter "{0}" muss beim Beenden mit "{1}" einen Wert ungleich NULL aufweisen.bDer Parameter muss beim Beenden mit einer bestimmten Bedingung einen Wert ungleich NULL aufweisen.IDer Parameter "{0}" muss beim Beenden einen Wert ungleich NULL aufweisen.CDer Parameter muss beim Beenden einen Wert ungleich NULL aufweisen.D"{0}": Statische Typen k√∂nnen nicht als Parameter verwendet werden.<Statische Typen k√∂nnen nicht als Parameter verwendet werdennDer Parameter "{0}" muss beim Beenden einen Wert ungleich NULL aufweisen, weil Parameter "{1}" nicht NULL ist.âDer Parameter muss beim Beenden einen Wert ungleich NULL aufweisen, weil der von NotNullIfNotNull referenzierte Parameter nicht NULL ist.êDer Parameter ‚Äû{0}‚Äú tritt nach ‚Äû{1}‚Äú in der Parameterliste auf, wird jedoch als Argument f√ºr die Handler-Konvertierungen einer interpolierten Zeichenfolge verwendet. Dies erfordert, dass der Aufrufer Parameter mit benannten Argumenten an der Aufrufsite neu anordnen kann. Erw√§gen Sie, den Handler-Parameter einer interpolierten Zeichenfolge hinter alle beteiligten Argumenten zu platzieren.vDie Konvertierung eines Parameters eines Handlers einer interpolierten Zeichenfolgen erfolgt nach dem HandlerparameterUDie partiellen Methodendeklarationen "{0}" und "{1}" weisen Signaturunterschiede auf.EDie partiellen Methodendeklarationen weisen Signaturunterschiede auf.Q"{0}" implementiert das Muster "{1}" nicht. "{2}" weist die falsche Signatur auf.\Der Typ implementiert nicht das Sammlungsmuster. Das Element weist die falsche Signatur auf.P"{0}" implementiert das Muster "{1}" nicht. "{2}" ist mit "{3}" nicht eindeutig.SDer Typ implementiert nicht das Sammlungsmuster. Die Elemente sind nicht eindeutig.k"{0}" implementiert nicht das Muster "{1}". "{2}" ist keine √∂ffentliche Instanz- oder Erweiterungsmethode.uDer Typ implementiert nicht das Sammlungsmuster. Der Member ist keine √∂ffentliche Instanz- oder Erweiterungsmethode.qDer lokale Name "{0}" ist f√ºr PDB zu lang. K√ºrzen Sie ihn, oder f√ºhren Sie die Kompilierung ohne /debug durch.!Lokaler Name ist zu lang f√ºr PDB'M√∂glicherweise falsche leere Anweisung'M√∂glicherweise falsche leere AnweisungÇDer Operator "{0}" kann hier aufgrund der Rangfolge nicht verwendet werden. Verwenden Sie Klammern, um Eindeutigkeit zu erreichen.BOperators kann aufgrund der Rangfolge hier nicht verwendet werden.H{0}: Im versiegelten Typ wurde ein neuer gesch√ºtzter Member deklariert.8Neuer gesch√ºtzter Member in versiegeltem Typ deklariert3"{0}" definiert "Equals", aber nicht "GetHashCode".;Der Datensatz definiert "Equals", aber nicht "GetHashCode".<Typen und Aliase d√ºrfen nicht den Namen "record" aufweisen.<Typen und Aliase d√ºrfen nicht den Namen "record" aufweisen.LDie referenzierte {0}-Assembly besitzt eine andere Kultureinstellung: "{1}".5Referenzierte Assembly hat andere Kultureinstellungen>Die referenzierte Assembly "{0}" besitzt keinen starken Namen./Referenzierte Assembly hat keinen starken Namen¯Es wurde ein Verweis auf die eingebettete Interopassembly "{0}" aufgrund eines indirekten Verweises auf diese Assembly, der von Assembly "{1}" erstellt wurde, erstellt. √Ñndern Sie ggf. f√ºr beide Assemblys die Eigenschaft "Interoptypen einbetten".éSie haben einen Verweis zu einer Assembly hinzugef√ºgt mifhilte von /link (Einbetten der Interoptypen-Eigenschaft auf True festegelegt). Dadurch wird der Compiler angewiesen, die Interoptypeninformationen aus der Assembly einzubetten. Der Compiler kann jedoch keine Interoptypeninformationen aus der Assembly einbetten, da eine andere Assembly, auf die Sie verweisen, auch auf diese Assembly verweist mithilfe von /reference (Einbetten der Interoptypen-Eigenschaft auf False festegelegt.)
+
+Um Interoptypeninformationen f√ºr beide Assemblys einzubetten, verwenden Sie /link f√ºr die Verweise zu den einzelnen Assemblys (Einbetten der Interoptypen-Eigenschaft auf True festlegen).
+
+Um die Warnung zu beheben, k√∂nnen Sie stattdessen /reference verwenden (Einbetten der Interoptypen-Eigenschaft auf False festlegen). In diesem Fall stellt eine prim√§re Interop-Assembly (PIA) Interoptypeninformationen bereit.iAufgrund eines indirekten Assemblyverweises wurde ein Verweis zur eingebetteten Interop-Assembly erstelltSDer R√ºckgabewert muss ungleich NULL sein, weil der Parameter "{0}" nicht NULL ist.MDer R√ºckgabewert muss ungleich NULL sein, weil der Parameter nicht NULL ist.H'{0}: Statische Typen k√∂nnen nicht als R√ºckgabetypen verwendet werden.AStatische Typen k√∂nnen nicht als R√ºckgabetypen verwendet werdenÖDer Typ "{1}" in "{0}" verursacht einen Konflikt mit dem importierten Typ "{3}" in "{2}". Der in "{0}" definierte Typ wird verwendet.#Typenkonflikte mit importiertem TypãDer Typ "{1}" in "{0}" verursacht einen Konflikt mit dem importierten Namespace "{3}" in "{2}". Der in "{0}" definierte Typ wird verwendet.)Typenkonflikte mit importiertem NamespaceëDer Namespace "{1}" in "{0}" verursacht einen Konflikt mit dem importierten Typ "{3}" in "{2}". Der in "{0}" definierte Namespace wird verwendet.'Namespacekonflikte mit importiertem Typ’Es gibt keine festgelegte Reihenfolge f√ºr die Felder in mehreren Deklarationen der partiellen Struktur "{0}". Um eine Reihenfolge anzugeben, m√ºssen sich alle Instanzenfelder in der gleichen Deklaration befinden._Keine definierte Sortierung zwischen Feldern in mehreren Deklarationen der partiellen Struktur.REine mit [DoesNotReturn] gekennzeichnete Methode darf nicht zur√ºckgegeben werden.REine mit [DoesNotReturn] gekennzeichnete Methode darf nicht zur√ºckgegeben werden.]Der zweite Operand eines is- oder as-Operators darf nicht den statischen Typ "{0}" aufweisen.LDer zweite Operand eines is- oder as-Operators darf kein statischer Typ sein¨Der switch-Ausdruck verarbeitet nicht alle m√∂glichen Werte des zugeh√∂rigen Eingabetyps (nicht umfassender Ausdruck). Das Muster "{0}" wird beispielsweise nicht abgedeckt.ïEinige NULL-Eingaben werden vom switch-Ausdruck nicht verarbeitet (nicht umfassender Ausdruck). Das Muster "{0}" wird beispielsweise nicht abgedeckt.⁄Der switch-Ausdruck behandelt einige NULL-Eingaben nicht (er ist nicht umfassend). Das Muster "{0}" ist z.¬†B. nicht abgedeckt. Ein Muster mit einer when-Klausel kann jedoch erfolgreich mit diesem Wert √ºbereinstimmen.;Der switch-Ausdruck verarbeitet einige NULL-Eingaben nicht.;Der switch-Ausdruck verarbeitet einige NULL-Eingaben nicht.◊Der switch-Ausdruck verarbeitet einige Werte des zugeh√∂rigen Eingabetyps einschlie√ülich eines unbenannten Enumerationswerts nicht (nicht umfassender Ausdruck). Das Muster "{0}" wird beispielsweise nicht abgedeckt.°Der switch-Ausdruck verarbeitet einige Werte des zugeh√∂rigen Eingabetyps einschlie√ülich eines unbenannten Enumerationswerts nicht (nicht umfassender Ausdruck).ÓDer switch-Ausdruck behandelt nicht alle m√∂glichen Werte seines Eingabetyps (er ist nicht umfassend). Das Muster "{0}" ist z.¬†B. nicht abgedeckt. Ein Muster mit einer when-Klausel kann jedoch erfolgreich mit diesem Wert √ºbereinstimmen.kDer switch-Ausdruck verarbeitet nicht alle m√∂glichen Werte des zugeh√∂rigen Eingabetyps (nicht umfassend).kDer switch-Ausdruck verarbeitet nicht alle m√∂glichen Werte des zugeh√∂rigen Eingabetyps (nicht umfassend).sDie Methode "{0}" wird nicht als Einstiegspunkt verwendet, weil ein synchroner Einstiegspunkt "{1}" gefunden wurde.$Der ausgel√∂ste Wert darf NULL sein.$Der ausgel√∂ste Wert darf NULL sein.ëDie Quelldatei hat das Limit von 16.707.565 Zeilen √ºberschritten, die in der PDB dargestellt werden k√∂nnen. Die Debuginformationen sind falsch.ëDie Quelldatei hat das Limit von 16.707.565 Zeilen √ºberschritten, die in der PDB dargestellt werden k√∂nnen. Die Debuginformationen sind falsch.ºDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters "{0}" entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem implementierten Member "{1}".∞Die NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem implementierten Member.œDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters "{0}" von "{1}" entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem implizit implementierten Member "{2}".πDie NULL-Zul√§ssigkeit von Verweistypen im Typ des Parameters entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem implizit implementierten Member.®Die NULL-Zul√§ssigkeit des Typs des Parameters "{0}" entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem √ºberschriebenen Member.¢Die NULL-Zul√§ssigkeit des Typs des Parameters entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem √ºberschriebenen Member.ºDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht nicht dem implementierten Member "{0}". Dies wird m√∂glicherweise durch Attribute f√ºr die NULL-Zul√§ssigkeit verursacht.™Die NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem implementierten Member.øDie NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp "{0}" entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem implizit implementierten Member "{1}".≥Die NULL-Zul√§ssigkeit von Verweistypen im R√ºckgabetyp entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem implizit implementierten Member.úDie NULL-Zul√§ssigkeit des R√ºckgabetyps entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem √ºberschriebenen Member.úDie NULL-Zul√§ssigkeit des R√ºckgabetyps entspricht (m√∂glicherweise aufgrund von Attributen f√ºr die NULL-Zul√§ssigkeit) nicht dem √ºberschriebenen Member.îDer Tupelelementname "{0}" wird ignoriert, weil ein anderer oder gar kein Name auf der anderen Seite des ==- oder !=-Tupeloperators angegeben wurde.éDer Tupelelementname wird ignoriert, weil ein anderer oder gar kein Name auf der anderen Seite des ==- oder !=-Tupeloperators angegeben wurde.iDer Tupelelementname "{0}" wird ignoriert, da vom Zieltyp "{1}" ein anderer oder kein Name angegeben ist.dDer Tupelelementname wird ignoriert, da vom Zuweisungsziel ein anderer oder kein Name angegeben ist.kDer Name des Typparameters "{0}" und der Name des Typparameters der √§u√üeren Methode "{1}" sind identisch.UDer Typparameter und der Typparameter der √§u√üeren Methode weisen denselben Typ auf.YDer {0}-Typparameter hat den gleichen Namen wie der Typparameter des √§u√üeren Typs "{1}"HTypparameter hat denselben Namen wie der Typparameter des √§u√üeren Typs0Fehler beim Laden der Analyzer-Assembly {0}: {1}+Analyseassembly konnte nicht geladen werdenYDem Feld "{0}" wird nie etwas zugewiesen, und es hat immer seinen Standardwert von "{1}".<Feld wird niemals zugewiesen, und hat immer den StandardwertíControl is returned to caller before auto-implemented property '{0}' is explicitly assigned, causing a preceding implicit assignment of 'default'.åControl is returned to caller before auto-implemented property is explicitly assigned, causing a preceding implicit assignment of 'default'.™Auto-implemented property '{0}' must be fully assigned before control is returned to the caller. Consider updating to language version '{1}' to auto-default the property.¢An auto-implemented property must be fully assigned before control is returned to the caller. Consider updating the language version to auto-default the property.~Control is returned to caller before field '{0}' is explicitly assigned, causing a preceding implicit assignment of 'default'.xControl is returned to caller before field is explicitly assigned, causing a preceding implicit assignment of 'default'.ìField '{0}' must be fully assigned before control is returned to the caller. Consider updating to language version '{1}' to auto-default the field.¶Fields of a struct must be fully assigned in a constructor before control is returned to the caller. Consider updating the language version to auto-default the field.%Unboxing eines m√∂glichen NULL-Werts.%Unboxing eines m√∂glichen NULL-Werts.Das auf den Parameter "{0}" angewendete EnumeratorCancellationAttribute hat keine Auswirkungen. Das Attribut ist nur f√ºr einen Parameter vom Typ "CancellationToken" in einer async-iterator-Methode g√ºltig, die IAsyncEnumerable zur√ºckgibt.ÃDas EnumeratorCancellationAttribute hat keine Auswirkungen. Das Attribut ist nur f√ºr einen Parameter vom Typ "CancellationToken" in einer async-iterator-Methode g√ºltig, die IAsyncEnumerable zur√ºckgibt.°Der Async-Iterator "{0}" weist mindestens einen Parameter vom Typ "CancellationToken" auf, aber keiner der Parameter umfasst das Attribut "EnumeratorCancellation", deshalb wird der Parameter f√ºr das Abbruchtoken aus dem generierten "IAsyncEnumerable<>.GetAsyncEnumerator" nicht verwendet.¢Der Async-Iterator-Member weist mindestens einen Parameter vom Typ "CancellationToken" auf, aber keiner der Parameter umfasst das Attribut "EnumeratorCancellation", deshalb wird der Parameter f√ºr das Abbruchtoken aus dem generierten "IAsyncEnumerable<>.GetAsyncEnumerator" nicht verwendet.ÆEs wird angenommen, dass der von "{1}" verwendete Assemblyverweis "{0}" mit "{2}" von "{3}" √ºbereinstimmt. M√∂glicherweise m√ºssen Sie eine Laufzeitrichtlinie bereitstellen.àDie zwei Assemblys unterscheiden sich in Release- und/oder Versionsnummer. Damit eine Vereinheitlichung vorgenommen wird, m√ºssen Sie in der Konfigurationsdatei der Anwendung Direktiven angeben. Zudem m√ºssen Sie den korrekten starken Namen einer Assembly angeben.UEs wird davon ausgegangen, dass der Assemblyverweis mit der Identit√§t √ºbereinstimmtÆEs wird angenommen, dass der von "{1}" verwendete Assemblyverweis "{0}" mit "{2}" von "{3}" √ºbereinstimmt. M√∂glicherweise m√ºssen Sie eine Laufzeitrichtlinie bereitstellen.àDie zwei Assemblys unterscheiden sich in Release- und/oder Versionsnummer. Damit eine Vereinheitlichung vorgenommen wird, m√ºssen Sie in der Konfigurationsdatei der Anwendung Direktiven angeben. Zudem m√ºssen Sie den korrekten starken Namen einer Assembly angeben.UEs wird davon ausgegangen, dass der Assemblyverweis mit der Identit√§t √ºbereinstimmtQDer Befehlszeilenschalter '{0}' ist noch nicht implementiert und wurde ignoriert.9Der Befehlszeilenschalter wurde noch nicht implementiert.ìNon-Nullable-{0} "{1}" muss beim Beenden des Konstruktors einen Wert ungleich NULL enthalten. Erw√§gen Sie eine Deklaration von "{0}" als Nullable.áEin Non-Nullable-Feld muss beim Beenden des Konstruktors einen Wert ungleich NULL enthalten. Erw√§gen Sie die Deklaration als Nullable.pDer XML-Kommentar f√ºr "{1}" weist ein paramref-Tag f√ºr "{0}" auf, es gibt aber keinen Parameter mit dem Namen.XXML-Kommentar besitzt ein paramref-Tag, es gibt jedoch keinen Parameter mit diesem NamenbDer XML-Kommentar weist ein param-Tag f√ºr "{0}" auf, es gibt aber keinen Parameter mit dem Namen.UXML-Kommentar besitzt ein param-Tag, es gibt jedoch keinen Parameter mit diesem NamenwDer XML-Kommentar f√ºr "{1}" weist ein typeparamref-Tag f√ºr "{0}" auf, es gibt aber keinen Typparameter mit dem Namen._XML-Kommentar besitzt ein typeparamref-Tag, es gibt jedoch keinen Typparameter mit diesem NameniDer XML-Kommentar weist ein typeparam-Tag f√ºr "{0}" auf, es gibt aber keinen Typparameter mit dem Namen.\XML-Kommentar besitzt ein typeparam-Tag, es gibt jedoch keinen Typparameter mit diesem Namen”Da auf diesen Aufruf nicht gewartet wird, wird die Ausf√ºhrung der aktuellen Methode vor Abschluss des Aufrufs fortgesetzt. Ziehen Sie ein Anwenden des "Await"-Operators auf das Ergebnis des Aufrufs in Betracht.∑Die aktuelle Methode ruft eine asynchrone Methode auf, die ein Task- oder ein Task<TResult>-Objekt zur√ºckgibt und den await-Operator nicht auf das Ergebnis anwendet. Der Aufruf der asynchronen Methode beginnt als asynchroner Task. Da kein await-Operator angewendet wird, wird das Programm jedoch fortgesetzt, ohne dass auf den Abschluss des Tasks gewartet wird. In den meisten F√§llen entspricht dieses Verhalten nicht Ihren Erwartungen. Normalerweise h√§ngen andere Aspekte der aufrufenden Methode von den Ergebnissen des Aufrufs ab, oder es wird mindestens erwartet, dass die aufgerufene Methode abgeschlossen wird, bevor die R√ºckgabe von der Methode erfolgt, die den Aufruf enth√§lt.
+
+Ebenso wichtig ist, was mit Ausnahmen geschieht, die in der aufgerufenen asynchronen Methode ausgel√∂st werden. Eine Ausnahme, die in einer Methode ausgel√∂st wird, die ein Task- oder Task<TResult>-Objekt zur√ºckgibt, wird im zur√ºckgegebenen Task gespeichert. Wenn Sie nicht auf den Abschluss des Tasks warten bzw. keine explizite √úberpr√ºfung auf Ausnahmen ausf√ºhren, geht die Ausnahme verloren. Wenn Sie auf den Abschluss des Tasks warten, wird die Ausnahme erneut ausgel√∂st.
+
+Als bew√§hrte Methode sollten Sie immer auf den Abschluss des Aufrufs warten.
+
+Sie sollten das Unterdr√ºcken der Warnung nur in Betracht ziehen, wenn Sie sicher sind, dass Sie nicht auf den Abschluss des asynchronen Aufrufs warten m√∂chten und die aufgerufene Methode keine Ausnahmen ausl√∂st. In diesem Fall k√∂nnen Sie die Warnung unterdr√ºcken, indem Sie das Taskergebnis des Aufrufs einer Variablen zuweisen.{Da auf diesen Aufruf nicht gewartet wird, wird die Ausf√ºhrung der aktuellen Methode vor Abschluss des Aufrufs fortgesetzt.BDer XML-Kommentar ist auf keinem g√ºltigen Sprachelement abgelegt.BDer XML-Kommentar ist auf keinem g√ºltigen Sprachelement abgelegt.OIn cref-Attributen sollten geschachtelte, generische Typen qualifiziert werden.aInnerhalb von cref-Attributen sollten geschachtelte Typen von generischen Typen qualifiziert sein#Unerreichbarer Code wurde entdeckt.#Unerreichbarer Code wurde entdeckt.ªEine vorherige Catch-Klausel hat bereits alle Ausnahmen abgefangen. Alle ausgel√∂sten Nicht-Ausnahmen werden von einer System.Runtime.CompilerServices.RuntimeWrappedException umschlossen.ñDiese Warnung wird verursacht, wenn bei einem catch()-Block nach einem catch (System.Exception e)-Block kein Ausnahmetyp angegeben ist. Die Warnung empfiehlt, dass der catch()-Block keine Ausnahmen erfasst.
+
+Ein catch()-Block nach einem catch (System.Exception e)-Block kann nicht-CLS-Ausnahmen erfassen, wenn f√ºr das RuntimeCompatibilityAttribute false in der AssemblyInfo.cs-Datei festgelegt wird: [assembly: RuntimeCompatibilityAttribute(WrapNonExceptionThrows = false)]. Wenn f√ºr dieses Attribut nicht explizit false festgelegt wird, werden alle ausgel√∂sten nicht-CLS-Ausnahmen als Ausnahmen gepackt und der catch (System.Exception e)-Block erfasst sie.;Eine vorherige Catch-Klausel erfasst bereits alle AusnahmenáDer Parameter "{0}" wird nicht gelesen. M√∂glicherweise haben Sie ihn nicht zum Initialisieren der gleichnamigen Eigenschaft verwendet?ÅDer Parameter wird nicht gelesen. M√∂glicherweise haben Sie ihn nicht zum Initialisieren der gleichnamigen Eigenschaft verwendet?&Das Ereignis "{0}" wird nie verwendet.Ereignis wird niemals benutzt"Das Feld "{0}" wird nie verwendet.FDem Feld "{0}" wurde ein Wert zugewiesen, der aber nie verwendet wird.;Feld ist zugewiesen, der Wert wird jedoch niemals verwendetFeld wird niemals verwendet,Auf diese Bezeichnung wurde nicht verwiesen.,Auf diese Bezeichnung wurde nicht verwiesen.BDie lokale Funktion "{0}" ist deklariert, wird aber nie verwendet.<Die lokale Funktion ist deklariert, wird aber nie verwendet.;Die Variable "{0}" ist deklariert, wird aber nie verwendet.DDie Variable "{0}" ist zugewiesen, ihr Wert wird aber nie verwendet.?Variable ist zugewiesen, der Wert wird jedoch niemals verwendet6Variable ist deklariert, wird jedoch niemals verwendet:Verwendung der nicht zugewiesenen lokalen Variablen "{0}".>Verwendung des m√∂glicherweise nicht zugewiesenen Felds "{0}".kField '{0}' is read before being explicitly assigned, causing a preceding implicit assignment of 'default'.eField is read before being explicitly assigned, causing a preceding implicit assignment of 'default'.nUse of possibly unassigned field '{0}'. Consider updating to language version '{1}' to auto-default the field.cUse of possibly unassigned field. Consider updating the language version to auto-default the field.9Verwendung eines m√∂glicherweise nicht zugewiesenen Felds7Verwendung des nicht zugewiesenen out-Parameters "{0}".2Verwendung eines nicht zugewiesenen out-ParametersaVerwenden einer m√∂glicherweise nicht zugewiesenen, automatisch implementierten Eigenschaft "{0}"Auto-implemented property '{0}' is read before being explicitly assigned, causing a preceding implicit assignment of 'default'.yAuto-implemented property is read before being explicitly assigned, causing a preceding implicit assignment of 'default'.ÖUse of possibly unassigned auto-implemented property '{0}'. Consider updating to language version '{1}' to auto-default the property.zUse of possibly unassigned auto-implemented property. Consider updating the language version to auto-default the property.[Verwenden einer m√∂glicherweise nicht zugewiesenen, automatisch implementierten EigenschaftùThe 'this' object is read before all of its fields have been assigned, causing preceding implicit assignments of 'default' to non-explicitly assigned fields.ùThe 'this' object is read before all of its fields have been assigned, causing preceding implicit assignments of 'default' to non-explicitly assigned fields.†The 'this' object cannot be used before all of its fields have been assigned. Consider updating to language version '{0}' to auto-default the unassigned fields.¨The 'this' object cannot be used in a constructor before all of its fields have been assigned. Consider updating the language version to auto-default the unassigned fields.5Verwendung einer nicht zugewiesenen lokalen Variablen~Der Vergleich mit einer ganzzahligen Konstante ist nutzlos. Die Konstante befindet sich au√üerhalb des Bereichs vom Typ "{0}".ÖDer Vergleich zu einer integralen Konstante ist nutzlos; die Konstante befindet sich au√üerhalb des zul√§ssigen Bereichs f√ºr den TypO"{0}": Ein Verweis auf ein fl√ºchtiges Feld wird nicht als fl√ºchtig behandelt.œEin tempor√§res Feld sollte in der Regel nicht als ref- oder out-Wert verwendet werden, weil es nicht als tempor√§r behandelt wird. Es gibt jedoch Ausnahmen dazu, wie z. B. beim Aufruf einer Interlocked-API.GEin Verweis auf ein tempor√§res Feld wird nicht als tempor√§r behandelt#warning: "{0}"#Warnungsdirektive6Der XML-Kommentar enth√§lt ung√ºltigen XML-Code: "{0}".XML-Kommentar weist ein ung√ºltiges Format auf=Ung√ºltiger XML-Code in der enthaltenen Kommentardatei: "{0}"PXML-Dokument in der einbezogenen Kommentardatei weist ein ung√ºltiges Format auf!Falsche Anzahl von Typargumenten.SemanticModel "{0}" erwartet.GDie Literalzeichenfolge "]]>" ist in Inhaltselementen nicht zugelassen.Doppeltes Attribut "{0}".>Das Endtag "{0}" stimmt nicht mit dem Starttag "{1}" √ºberein.-Ein Endtag f√ºr Element "{0}" wurde erwartet.,An dieser Stelle wurde kein Endtag erwartet.;">" oder "/>" zum Schlie√üen des Tags "{0}" wurde erwartet.&Unerwartetes Zeichen an dieser Stelle.!Es wurde ein Bezeichner erwartet.1Im Kommentar wurde eine falsche Syntax verwendet.JInnerhalb eines Entit√§tsverweises wurde ein ung√ºltiges Zeichen gefunden.>Zeichen "{0}" k√∂nnen an dieser Stelle nicht verwendet werden.Ung√ºltiges Unicode-Zeichen.3An dieser Stelle sind keine Leerzeichen zugelassen.BDas Zeichen "<" kann in einem Attributwert nicht verwendet werden.@Das Gleichheitszeichen zwischen Attribut und Attributwert fehlt.,Verweis auf nicht definierte Entit√§t "{0}".HF√ºr das Zeichenfolgenliteral fehlt das schlie√üende Anf√ºhrungszeichen.cEin Zeichenfolgenliteral wurde erwartet, es wurde aber kein √∂ffnendes Anf√ºhrungszeichen gefunden.RZeichenfolgenliterale d√ºrfen nur von ASCII-Anf√ºhrungszeichen umschlossen werden.$Das erforderliche Leerzeichen fehlt.    tl¨¥Ê≥Ò&Å:f.∞¢cv ◊,∞üpÓyTE‡‰·'¡≤o∫Ï‰^î∏ dÃI…«≥Çnÿ}§!39oj
+nﬂ-=ØÏﬂ’⁄ÓSÊ"Èm˘7„úbˆÊ“ó÷rêÂé–ögZÙ˘h[ó¬h:≤ôˆ6	3ç                           \         v                         h           _CorDllMain mscoree.dll     ˇ%                                                                                                                                           Ä                  0  Ä                   H   X  p          p4   V S _ V E R S I O N _ I N F O     ΩÔ˛   , ≈T         ?                         D    V a r F i l e I n f o     $    T r a n s l a t i o n       ∞–   S t r i n g F i l e I n f o   ¨   0 0 0 0 0 4 b 0   L   C o m p a n y N a m e     M i c r o s o f t   C o r p o r a t i o n   d   F i l e D e s c r i p t i o n     M i c r o s o f t . C o d e A n a l y s i s . C S h a r p   >   F i l e V e r s i o n     4 . 3 0 0 . 2 2 . 2 1 7 0 1     x ,  I n t e r n a l N a m e   M i c r o s o f t . C o d e A n a l y s i s . C S h a r p . r e s o u r c e s . d l l   Ä .  L e g a l C o p y r i g h t   ©   M i c r o s o f t   C o r p o r a t i o n .   A l l   r i g h t s   r e s e r v e d .   Ä ,  O r i g i n a l F i l e n a m e   M i c r o s o f t . C o d e A n a l y s i s . C S h a r p . r e s o u r c e s . d l l   \   P r o d u c t N a m e     M i c r o s o f t . C o d e A n a l y s i s . C S h a r p   ñ 9  P r o d u c t V e r s i o n   4 . 3 . 0 - 1 . 2 2 2 1 7 . 1 + 3 1 d 7 f 1 f 7 d a 0 0 f f c 8 a 6 a e a f 6 d e 9 7 1 5 9 e e 2 c a a 0 b a e     8   A s s e m b l y   V e r s i o n   4 . 3 . 0 . 0                                                                                                                                                                                                                                                                                                                                à1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      Ä(    0Ç(p	*ÜHÜ˜†Ç(a0Ç(]10	`ÜHe 0\
++Ç7†N0L0
++Ç70	 †¢Ä 010	`ÜHe  YuBgÉä7Ω˝ÏÉ◊òÔÔÔ»≈–˜Êê,ﬁEÖäÈF—m†Ç0Çn0ÇV†3  ç~G√Ç~*    ç0	*ÜHÜ˜ 0~10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1(0&UMicrosoft Code Signing PCA 20110211014184514Z221013184514Z0c10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation10U.NET0Ç¢0	*ÜHÜ˜ Çè 0ÇäÇÅ œßcÒêxE‹$∆€~≠2cÿçôˇØ¶≈Úøñ◊ã)mïòﬁ<√-¥X$VV\4{¸µk)Õ◊ÀˆÛ∞TË…”,àåÕOQ‘äÛy?‹ JS7˜/ˆoºjÁÑóó@Iı∆π∆6•∑¶Õç=›üºåµcˆ "k€ÁGëà˛V9Ñ∂ˇoÓΩ£nŸ%[é∞êµÂßÀÌ]ïØ"“„¸1´>`ñœÉÅÒ∏⁄{D„ÕE/.Ôä¡;Z5®N¥ıKÃìçGç"∑y93ù+^∂x‡Ø‡g–ä8**ì ;q´˘√NE5?97LËıIØç(.àŒ“™xËÂÕ∫áW9x:d¢dí´Û˘⁄£±<·˛œΩ$¸_:ˇ¶Z¿\ÖŸá^¸:ÏØòˆ&è]b˘Lx±¶AÎ¡·¯=Wà¶:˜-·Î]ìÀ¸¬R}ËÌ„Ò-®¢dù©¿{'Óg§ü#ÍU[ÿWío’Xü_2Ón›k»ë £Ç~0Çz0U%0
++Ç7L+0UØ1HE®	‡1Ëö«®†^^Œ0PUI0G§E0C1)0'U Microsoft Operations Puerto Rico10U464223+4686260U#0ÄHndÂP”Ç™77"µm® uï0TUM0K0I†G†EÜChttp://www.microsoft.com/pkiops/crl/MicCodSigPCA2011_2011-07-08.crl0a+U0S0Q+0ÜEhttp://www.microsoft.com/pkiops/certs/MicCodSigPCA2011_2011-07-08.crt0Uˇ0 0	*ÜHÜ˜ Ç *öFÓBä‹ø°ì^ ˇIÑÿ;IïùßÏmìƒÄémUá≥ÍÚo±—£Ö•
+ Æñûù»1abÎÒ>ÛhöFÔπ1pﬁ¬¿<>w°¬sÆìñ"9ˇÆ~êx)˛DÀ^¨Ÿ	:ù4™˝ª Oûˆh)ˆ›ÂeÓí_πßZ~•EdDÖ ÄEÎÖö)9`?°Äñ`£{Õ5ÖQ 8ápÇ5Ã–¨BZ@TW¯3•oz{!h(TVâùR©ˇH˘iìÉ2ΩA+`O…ßû6òÔG¸˝◊*≥IÔ„
+÷oç¸¡=qu‹à≠ÃúÊÿd*õÏêÕL˜—§™_)0ÖÄ$0ÔÛ6is˛˜Sèñ.–U€:rìäqú…Ä≈†]‡v>|–.Ñ0}§˚	qÀæ!%GH~((òÚÄ.lRod°&≈7u›ËMw‰¯ê˚/«yÌ…Í+m¿,ÖCàj¢Zô3ùZC_Â{BÑ√„ÏKkHÃçÊ∫{Ìùxü)2b7¯yG™@¿· 2µê◊ãZH™∫1•Õπ¡ö®,≈√Ú˛‚ùuÊ&[:éΩ¯ÎéÖµMkHf7ä`N–(•>îsÅïs&æ2Jªy›€√¬Ô~\ﬁu7µ|b€≠Ê<oj 5¢m√6ÈüT–Lx'$_)ÔCÃÄ95¨v0Çz0Çb†
+aê“     0	*ÜHÜ˜ 0Åà10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1200U)Microsoft Root Certificate Authority 20110110708205909Z260708210909Z0~10	UUS10U
+Washington10URedmond10U
+Microsoft Corporation1(0&UMicrosoft Code Signing PCA 20110Ç"0	*ÜHÜ˜ Ç 0Ç
+Ç ´˙r.≠ÿn™ÇM4∫Ú∂X!üB*kÈZP™∏8I∫√›7k∆ÿ8¬ô∞»9’1B”âydá~î`$lØûIúÈh^“ﬂõS≤
+,√ØŸ©+Æz	Ø◊ñY `ÈfvË2R&/Á´Pœ≥D∑]ÿƒ.u´hÛÀmÛ:\°ÙF∫‡8d¨nd5x¶†c-”@ì¯„ﬁ’\y•I)Áæ†wæî=Ô˚„+ZMV(¢zr‡:∑I^ÿÌÌCëÉŸ{≤{ÜŸ>±å]ËâOÑÚ°/Y‰ê;-Æ3X≈∑>˛2”≥=±≤Øí8~“ùÄ,ıNVë!5%√9ndS∫ú≠#ÑÀÙ∫Üç˜_–Røåîáº¿!t%_(∂Ã'(8%ò9J6œ|±íÆ#ß©fÏaj·(Iù_à‚%]”!K>RƒµW?$—z[/’#„p]QFw≥¯ ·º¨Ç_€¿≥Ω‘UKÁ9°È#Iº∏D|E‰¡√rz‡rÁ$ﬂøFô≈Ô¬W€ÉçÏMI0ß´éﬂÏ[üØ¸›∞f‚¡óÅ{Ì÷ÌKÁI)ß(¶ß}gÄÊäbx_≤/Ñ◊Wú\øw((ÒÌm√(è,è@7O¡·ÖDâƒ	L≈‘•C/tï˜n¯x X,]`ïö>O3Ñ⁄∞àﬁûNÙñ∞ºF†lò“‡÷àå £ÇÌ0ÇÈ0	+Ç7 0UHndÂP”Ç™77"µm® uï0	+Ç7
+ S u b C A0UÜ0Uˇ0ˇ0U#0Är-:1êCπN·Íß«1—#â40ZUS0Q0O†M†KÜIhttp://crl.microsoft.com/pki/crl/products/MicRooCerAut2011_2011_03_22.crl0^+R0P0N+0ÜBhttp://www.microsoft.com/pki/certs/MicRooCerAut2011_2011_03_22.crt0ÅüU Åó0Åî0Åë	+Ç7.0ÅÉ0?+3http://www.microsoft.com/pkiops/docs/primarycps.htm0@+042  L e g a l _ p o l i c y _ s t a t e m e n t . 0	*ÜHÜ˜ Ç gÚÜ•ò‡Ty.”ÿtg"õñ·cíôBñ}“yê¡e_.

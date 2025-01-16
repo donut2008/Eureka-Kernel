@@ -1,399 +1,445 @@
-/*
- * twl6040-vibra.c - TWL6040 Vibrator driver
- *
- * Author:      Jorge Eduardo Candelaria <jorge.candelaria@ti.com>
- * Author:      Misael Lopez Cruz <misael.lopez@ti.com>
- *
- * Copyright:   (C) 2011 Texas Instruments, Inc.
- *
- * Based on twl4030-vibra.c by Henrik Saari <henrik.saari@nokia.com>
- *				Felipe Balbi <felipe.balbi@nokia.com>
- *				Jari Vanhala <ext-javi.vanhala@nokia.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- */
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/of.h>
-#include <linux/workqueue.h>
-#include <linux/input.h>
-#include <linux/mfd/twl6040.h>
-#include <linux/slab.h>
-#include <linux/delay.h>
-#include <linux/regulator/consumer.h>
+ret != 0) {
+		input_info(true,&info->client->dev, "%s failed to write press_threhold data2", __func__);
+		goto press_threshold_out;
+	}
+press_threshold_out:
+	return count;
+}
 
-#define EFFECT_DIR_180_DEG	0x8000
-
-/* Recommended modulation index 85% */
-#define TWL6040_VIBRA_MOD	85
-
-#define TWL6040_NUM_SUPPLIES 2
-
-struct vibra_info {
-	struct device *dev;
-	struct input_dev *input_dev;
-	struct workqueue_struct *workqueue;
-	struct work_struct play_work;
-	struct mutex mutex;
-	int irq;
-
-	bool enabled;
-	int weak_speed;
-	int strong_speed;
-	int direction;
-
-	unsigned int vibldrv_res;
-	unsigned int vibrdrv_res;
-	unsigned int viblmotor_res;
-	unsigned int vibrmotor_res;
-
-	struct regulator_bulk_data supplies[TWL6040_NUM_SUPPLIES];
-
-	struct twl6040 *twl6040;
-};
-
-static irqreturn_t twl6040_vib_irq_handler(int irq, void *data)
+static ssize_t touchkey_sar_release_threshold_store(struct device *dev,
+		 struct device_attribute *attr, const char *buf,
+		 size_t count)
 {
-	struct vibra_info *info = data;
-	struct twl6040 *twl6040 = info->twl6040;
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+
+	int ret;
+	int threshold;
+	u8 cmd[2];
+
+	ret = sscanf(buf, "%d", &threshold);
+	if (ret != 1) {
+		input_err(true, &info->client->dev, "%s: failed to read thresold, buf is %s\n", __func__,buf);
+		return count;
+	}
+
+	if(threshold > 0xff) {
+		cmd[0] = (threshold >> 8) & 0xff;
+		cmd[1] = 0xff & threshold;
+	}else if(threshold < 0) {
+		cmd[0] = 0x0;
+		cmd[1] = 0x0;
+	}else{
+		cmd[0] = 0x0;
+		cmd[1] = (u8)threshold;
+	}
+
+	input_info(true,&info->client->dev, "%s buf : %d, threshold : %d\n",
+		__func__, threshold,(cmd[0] << 8) | cmd[1]);
+
+	ret = abov_tk_i2c_write(info->client, CMD_SAR_THRESHOLD+0x02, &cmd[0], 1);
+	input_info(true,&info->client->dev, "%s ret : %d\n", __func__,ret);
+
+	if (ret != 0) {
+		input_info(true,&info->client->dev, "%s failed to write release_threshold_data1", __func__);
+		goto release_threshold_out;
+	}
+	ret = abov_tk_i2c_write(info->client, CMD_SAR_THRESHOLD+0x03, &cmd[1], 1);
+	input_info(true,&info->client->dev, "%s ret : %d\n", __func__,ret);
+	if (ret != 0) {
+		input_info(true,&info->client->dev, "%s failed to write release_threshold_data2", __func__);
+		goto release_threshold_out;
+	}
+release_threshold_out:
+	return count;
+}
+
+static ssize_t touchkey_mode_change(struct device *dev,
+		 struct device_attribute *attr, const char *buf,
+		 size_t count)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	int ret, data;
+
+	ret = sscanf(buf, "%d", &data);
+	if (ret != 1) {
+		input_err(true, &client->dev, "%s: cmd read err\n", __func__);
+		return count;
+	}
+
+	if (!(data == 0 || data == 1)) {
+		input_err(true, &client->dev, "%s: wrong command(%d)\n",
+			__func__, data);
+		return count;
+	}
+
+	input_info(true, &info->client->dev, "%s data(%d)\n",__func__,data);
+
+	abov_sar_only_mode(info, data);
+
+	return count;
+}
+#endif
+
+#endif
+
+static ssize_t touchkey_chip_name(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+
+	input_info(true, &client->dev, "%s\n", __func__);
+#ifdef CONFIG_KEYBOARD_ABOV_TOUCH_T316
+	return sprintf(buf, "A96T326\n");
+#else
+	return sprintf(buf, "FT1804\n");
+#endif
+}
+
+static ssize_t bin_fw_ver(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+
+	input_info(true, &client->dev, "fw version bin : 0x%x\n", info->fw_ver_bin);
+
+	return sprintf(buf, "0x%02x\n", info->fw_ver_bin);
+}
+
+static int get_tk_fw_version(struct abov_tk_info *info, bool bootmode)
+{
+	struct i2c_client *client = info->client;
+	u8 buf;
+	int ret;
+	int retry = 3;
+
+	ret = abov_tk_i2c_read(client, ABOV_FW_VER, &buf, 1);
+	if (ret < 0) {
+		while (retry--) {
+			input_err(true, &client->dev, "%s read fail(%d)\n",
+				__func__, retry);
+			if (!bootmode)
+				abov_tk_reset(info);
+			else
+				return -1;
+			ret = abov_tk_i2c_read(client, ABOV_FW_VER, &buf, 1);
+			if (ret == 0)
+				break;
+		}
+		if (retry <= 0)
+			return -1;
+	}
+
+	info->fw_ver = buf;
+	input_info(true, &client->dev, "%s : 0x%x\n", __func__, buf);
+	return 0;
+}
+
+static ssize_t read_fw_ver(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	int ret;
+
+	ret = get_tk_fw_version(info, false);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s read fail\n", __func__);
+		info->fw_ver = 0;
+	}
+
+	return sprintf(buf, "0x%02x\n", info->fw_ver);
+}
+
+static int abov_load_fw(struct abov_tk_info *info, u8 cmd)
+{
+	struct i2c_client *client = info->client;
+	struct file *fp;
+	mm_segment_t old_fs;
+	long fsize, nread;
+	int ret = 0;
+
+	switch(cmd) {
+	case BUILT_IN:
+		ret = request_firmware(&info->firm_data_bin,
+			info->pdata->fw_path, &client->dev);
+		if (ret) {
+			input_err(true, &client->dev,
+				"%s request_firmware fail(%d)\n", __func__, cmd);
+			return ret;
+		}
+		/* Header info
+		* 0x00 0x91 : model info,
+		* 0x00 0x00 : module info (Rev 0.0),
+		* 0x00 0xF3 : F/W
+		* 0x00 0x00 0x17 0x10 : checksum
+		* ~ 22byte 0x00 */
+		info->fw_model_number = info->firm_data_bin->data[1];
+		info->fw_ver_bin = info->firm_data_bin->data[5];
+		info->checksum_h_bin = info->firm_data_bin->data[8];
+		info->checksum_l_bin = info->firm_data_bin->data[9];
+		info->firm_size = info->firm_data_bin->size;
+
+		input_info(true, &client->dev, "%s, bin version:%2X,%2X,%2X   crc:%2X,%2X\n", __func__, \
+			info->firm_data_bin->data[1], info->firm_data_bin->data[3], info->fw_ver_bin, \
+			info->checksum_h_bin, info->checksum_l_bin);
+		break;
+
+	case SDCARD:
+		old_fs = get_fs();
+		set_fs(get_ds());
+		fp = filp_open(TK_FW_PATH_SDCARD, O_RDONLY, S_IRUSR);
+		if (IS_ERR(fp)) {
+			input_err(true, &client->dev,
+				"%s %s open error\n", __func__, TK_FW_PATH_SDCARD);
+			ret = -ENOENT;
+			goto fail_sdcard_open;
+		}
+
+		fsize = fp->f_path.dentry->d_inode->i_size;
+		info->firm_data_ums = kzalloc((size_t)fsize, GFP_KERNEL);
+		if (!info->firm_data_ums) {
+			input_err(true, &client->dev,
+				"%s fail to kzalloc for fw\n", __func__);
+			ret = -ENOMEM;
+			goto fail_sdcard_kzalloc;
+		}
+
+		nread = vfs_read(fp,
+			(char __user *)info->firm_data_ums, fsize, &fp->f_pos);
+		if (nread != fsize) {
+			input_err(true, &client->dev,
+				"%s fail to vfs_read file\n", __func__);
+			ret = -EINVAL;
+			goto fail_sdcard_size;
+		}
+		filp_close(fp, current->files);
+		set_fs(old_fs);
+
+		info->firm_size = nread;
+		info->checksum_h_bin = info->firm_data_ums[8];
+		info->checksum_l_bin = info->firm_data_ums[9];
+
+		input_info(true, &client->dev,"%s, bin version:%2X,%2X,%2X   crc:%2X,%2X\n", __func__, \
+			info->firm_data_ums[1], info->firm_data_ums[3], info->firm_data_ums[5], \
+			info->checksum_h_bin, info->checksum_l_bin);
+		break;
+
+	default:
+		ret = -1;
+		break;
+	}
+	input_info(true, &client->dev, "fw_size : %lu\n", info->firm_size);
+	input_info(true, &client->dev, "%s success\n", __func__);
+	return ret;
+
+fail_sdcard_size:
+	kfree(&info->firm_data_ums);
+fail_sdcard_kzalloc:
+	filp_close(fp, current->files);
+fail_sdcard_open:
+	set_fs(old_fs);
+	return ret;
+}
+
+#if ABOV_ISP_FIRMUP_ROUTINE
+void abov_i2c_start(int scl, int sda)
+{
+	gpio_direction_output(sda, 1);
+	gpio_direction_output(scl, 1);
+	usleep_range(15, 17);
+	gpio_direction_output(sda, 0);
+	usleep_range(10, 12);
+	gpio_direction_output(scl, 0);
+	usleep_range(10, 12);
+}
+
+void abov_i2c_stop(int scl, int sda)
+{
+	gpio_direction_output(scl, 0);
+	usleep_range(10, 12);
+	gpio_direction_output(sda, 0);
+	usleep_range(10, 12);
+	gpio_direction_output(scl, 1);
+	usleep_range(10, 12);
+	gpio_direction_output(sda, 1);
+}
+
+void abov_testdelay(void)
+{
+	u8 i;
+	u8 delay;
+
+	/* 120nms */
+	for (i = 0; i < 15; i++)
+		delay = 0;
+}
+
+
+void abov_byte_send(u8 data, int scl, int sda)
+{
+	u8 i;
+	for (i = 0x80; i != 0; i >>= 1) {
+		gpio_direction_output(scl, 0);
+		usleep_range(1,1);
+
+		if (data & i)
+			gpio_direction_output(sda, 1);
+		else
+			gpio_direction_output(sda, 0);
+
+		usleep_range(1,1);
+		gpio_direction_output(scl, 1);
+		usleep_range(1,1);
+	}
+	usleep_range(1,1);
+
+	gpio_direction_output(scl, 0);
+	gpio_direction_input(sda);
+	usleep_range(1,1);
+
+	gpio_direction_output(scl, 1);
+	usleep_range(1,1);
+
+	gpio_get_value(sda);
+	abov_testdelay();
+
+	gpio_direction_output(scl, 0);
+	gpio_direction_output(sda, 0);
+	usleep_range(20,20);
+}
+
+u8 abov_byte_read(bool type, int scl, int sda)
+{
+	u8 i;
+	u8 data = 0;
+	u8 index = 0x7;
+
+	gpio_direction_output(scl, 0);
+	gpio_direction_input(sda);
+	usleep_range(1,1);
+
+	for (i = 0; i < 8; i++) {
+		gpio_direction_output(scl, 0);
+		usleep_range(1,1);
+		gpio_direction_output(scl, 1);
+		usleep_range(1,1);
+
+		data = data | (u8)(gpio_get_value(sda) << index);
+		index -= 1;
+	}
+		usleep_range(1,1);
+	gpio_direction_output(scl, 0);
+
+	gpio_direction_output(sda, 0);
+		usleep_range(1,1);
+
+	if (type) { /*ACK */
+		gpio_direction_output(sda, 0);
+		usleep_range(1,1);
+		gpio_direction_output(scl, 1);
+		usleep_range(1,1);
+		gpio_direction_output(scl, 0);
+		usleep_range(1,1);
+	} else { /* NAK */
+		gpio_direction_output(sda, 1);
+		usleep_range(1,1);
+		gpio_direction_output(scl, 1);
+		usleep_range(1,1);
+		gpio_direction_output(scl, 0);
+		usleep_range(1,1);
+		gpio_direction_output(sda, 0);
+		usleep_range(1,1);
+	}
+	usleep_range(20,20);
+
+	return data;
+}
+
+void abov_enter_mode(int scl, int sda)
+{
+	abov_i2c_start(scl, sda);
+	abov_testdelay();
+	abov_byte_send(ABOV_ID, scl, sda);
+	abov_byte_send(0xAC, scl, sda);
+	abov_byte_send(0x5B, scl, sda);
+	abov_byte_send(0x2D, scl, sda);
+	abov_i2c_stop(scl, sda);
+}
+
+void abov_firm_write(const u8 *fw_data, int block, int scl, int sda)
+{
+	int i, j;
+	u16 pos = 0x20;
+	u8 addr[2];
+	u8 data[32] = {0, };
+
+	addr[0] = 0x10;
+	addr[1] = 0x00;
+	for (i = 0; i < (block - 0x20); i++) {
+		if (i % 8 == 0) {
+			addr[0] = 0x10 + i/8;
+			addr[1] = 0;
+		} else
+			addr[1] = addr[1] + 0x20;
+		memcpy(data, fw_data + pos, 32);
+		abov_i2c_start(scl, sda);
+		abov_testdelay();
+		abov_byte_send(ABOV_ID, scl, sda);
+		abov_byte_send(0xAC, scl, sda);
+		abov_byte_send(0x7A, scl, sda);
+		abov_byte_send(addr[0], scl, sda);
+		abov_byte_send(addr[1], scl, sda);
+		for (j = 0; j < 32; j++)
+			abov_byte_send(data[j], scl, sda);
+		abov_i2c_stop(scl, sda);
+
+		pos += 0x20;
+
+		abov_delay(3);
+	}
+}
+
+void abov_read_address_set(int scl, int sda)
+{
+		abov_i2c_start(scl, sda);
+		abov_testdelay();
+		abov_byte_send(ABOV_ID, scl, sda);
+		abov_byte_send(0xAC, scl, sda);
+		abov_byte_send(0x9E, scl, sda);
+		abov_byte_send(0x10, scl, sda); /* start addr H */
+		abov_byte_send(0x00, scl, sda); /* start addr L */
+		abov_byte_send(0x3F, scl, sda); /* end addr H  */
+		abov_byte_send(0xFF, scl, sda); /* end addr L  */
+		abov_i2c_stop(scl, sda);
+}
+
+void abov_checksum(struct abov_tk_info *info, int scl, int sda)
+{
+	struct i2c_client *client = info->client;
+
 	u8 status;
-
-	status = twl6040_reg_read(twl6040, TWL6040_REG_STATUS);
-	if (status & TWL6040_VIBLOCDET) {
-		dev_warn(info->dev, "Left Vibrator overcurrent detected\n");
-		twl6040_clear_bits(twl6040, TWL6040_REG_VIBCTLL,
-				   TWL6040_VIBENA);
-	}
-	if (status & TWL6040_VIBROCDET) {
-		dev_warn(info->dev, "Right Vibrator overcurrent detected\n");
-		twl6040_clear_bits(twl6040, TWL6040_REG_VIBCTLR,
-				   TWL6040_VIBENA);
-	}
-
-	return IRQ_HANDLED;
-}
-
-static void twl6040_vibra_enable(struct vibra_info *info)
-{
-	struct twl6040 *twl6040 = info->twl6040;
-	int ret;
-
-	ret = regulator_bulk_enable(ARRAY_SIZE(info->supplies), info->supplies);
-	if (ret) {
-		dev_err(info->dev, "failed to enable regulators %d\n", ret);
-		return;
-	}
-
-	twl6040_power(info->twl6040, 1);
-	if (twl6040_get_revid(twl6040) <= TWL6040_REV_ES1_1) {
-		/*
-		 * ERRATA: Disable overcurrent protection for at least
-		 * 3ms when enabling vibrator drivers to avoid false
-		 * overcurrent detection
-		 */
-		twl6040_reg_write(twl6040, TWL6040_REG_VIBCTLL,
-				  TWL6040_VIBENA | TWL6040_VIBCTRL);
-		twl6040_reg_write(twl6040, TWL6040_REG_VIBCTLR,
-				  TWL6040_VIBENA | TWL6040_VIBCTRL);
-		usleep_range(3000, 3500);
-	}
-
-	twl6040_reg_write(twl6040, TWL6040_REG_VIBCTLL,
-			  TWL6040_VIBENA);
-	twl6040_reg_write(twl6040, TWL6040_REG_VIBCTLR,
-			  TWL6040_VIBENA);
-
-	info->enabled = true;
-}
-
-static void twl6040_vibra_disable(struct vibra_info *info)
-{
-	struct twl6040 *twl6040 = info->twl6040;
-
-	twl6040_reg_write(twl6040, TWL6040_REG_VIBCTLL, 0x00);
-	twl6040_reg_write(twl6040, TWL6040_REG_VIBCTLR, 0x00);
-	twl6040_power(info->twl6040, 0);
-
-	regulator_bulk_disable(ARRAY_SIZE(info->supplies), info->supplies);
-
-	info->enabled = false;
-}
-
-static u8 twl6040_vibra_code(int vddvib, int vibdrv_res, int motor_res,
-			     int speed, int direction)
-{
-	int vpk, max_code;
-	u8 vibdat;
-
-	/* output swing */
-	vpk = (vddvib * motor_res * TWL6040_VIBRA_MOD) /
-		(100 * (vibdrv_res + motor_res));
-
-	/* 50mV per VIBDAT code step */
-	max_code = vpk / 50;
-	if (max_code > TWL6040_VIBDAT_MAX)
-		max_code = TWL6040_VIBDAT_MAX;
-
-	/* scale speed to max allowed code */
-	vibdat = (u8)((speed * max_code) / USHRT_MAX);
-
-	/* 2's complement for direction > 180 degrees */
-	vibdat *= direction;
-
-	return vibdat;
-}
-
-static void twl6040_vibra_set_effect(struct vibra_info *info)
-{
-	struct twl6040 *twl6040 = info->twl6040;
-	u8 vibdatl, vibdatr;
-	int volt;
-
-	/* weak motor */
-	volt = regulator_get_voltage(info->supplies[0].consumer) / 1000;
-	vibdatl = twl6040_vibra_code(volt, info->vibldrv_res,
-				     info->viblmotor_res,
-				     info->weak_speed, info->direction);
-
-	/* strong motor */
-	volt = regulator_get_voltage(info->supplies[1].consumer) / 1000;
-	vibdatr = twl6040_vibra_code(volt, info->vibrdrv_res,
-				     info->vibrmotor_res,
-				     info->strong_speed, info->direction);
-
-	twl6040_reg_write(twl6040, TWL6040_REG_VIBDATL, vibdatl);
-	twl6040_reg_write(twl6040, TWL6040_REG_VIBDATR, vibdatr);
-}
-
-static void vibra_play_work(struct work_struct *work)
-{
-	struct vibra_info *info = container_of(work,
-				struct vibra_info, play_work);
-
-	mutex_lock(&info->mutex);
-
-	if (info->weak_speed || info->strong_speed) {
-		if (!info->enabled)
-			twl6040_vibra_enable(info);
-
-		twl6040_vibra_set_effect(info);
-	} else if (info->enabled)
-		twl6040_vibra_disable(info);
-
-	mutex_unlock(&info->mutex);
-}
-
-static int vibra_play(struct input_dev *input, void *data,
-		      struct ff_effect *effect)
-{
-	struct vibra_info *info = input_get_drvdata(input);
-	int ret;
-
-	/* Do not allow effect, while the routing is set to use audio */
-	ret = twl6040_get_vibralr_status(info->twl6040);
-	if (ret & TWL6040_VIBSEL) {
-		dev_info(&input->dev, "Vibra is configured for audio\n");
-		return -EBUSY;
-	}
-
-	info->weak_speed = effect->u.rumble.weak_magnitude;
-	info->strong_speed = effect->u.rumble.strong_magnitude;
-	info->direction = effect->direction < EFFECT_DIR_180_DEG ? 1 : -1;
-
-	ret = queue_work(info->workqueue, &info->play_work);
-	if (!ret) {
-		dev_info(&input->dev, "work is already on queue\n");
-		return ret;
-	}
-
-	return 0;
-}
-
-static void twl6040_vibra_close(struct input_dev *input)
-{
-	struct vibra_info *info = input_get_drvdata(input);
-
-	cancel_work_sync(&info->play_work);
-
-	mutex_lock(&info->mutex);
-
-	if (info->enabled)
-		twl6040_vibra_disable(info);
-
-	mutex_unlock(&info->mutex);
-}
-
-static int __maybe_unused twl6040_vibra_suspend(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct vibra_info *info = platform_get_drvdata(pdev);
-
-	mutex_lock(&info->mutex);
-
-	if (info->enabled)
-		twl6040_vibra_disable(info);
-
-	mutex_unlock(&info->mutex);
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(twl6040_vibra_pm_ops, twl6040_vibra_suspend, NULL);
-
-static int twl6040_vibra_probe(struct platform_device *pdev)
-{
-	struct device *twl6040_core_dev = pdev->dev.parent;
-	struct device_node *twl6040_core_node;
-	struct vibra_info *info;
-	int vddvibl_uV = 0;
-	int vddvibr_uV = 0;
-	int error;
-
-	twl6040_core_node = of_get_child_by_name(twl6040_core_dev->of_node,
-						 "vibra");
-	if (!twl6040_core_node) {
-		dev_err(&pdev->dev, "parent of node is missing?\n");
-		return -EINVAL;
-	}
-
-	info = devm_kzalloc(&pdev->dev, sizeof(*info), GFP_KERNEL);
-	if (!info) {
-		of_node_put(twl6040_core_node);
-		dev_err(&pdev->dev, "couldn't allocate memory\n");
-		return -ENOMEM;
-	}
-
-	info->dev = &pdev->dev;
-
-	info->twl6040 = dev_get_drvdata(pdev->dev.parent);
-
-	of_property_read_u32(twl6040_core_node, "ti,vibldrv-res",
-			     &info->vibldrv_res);
-	of_property_read_u32(twl6040_core_node, "ti,vibrdrv-res",
-			     &info->vibrdrv_res);
-	of_property_read_u32(twl6040_core_node, "ti,viblmotor-res",
-			     &info->viblmotor_res);
-	of_property_read_u32(twl6040_core_node, "ti,vibrmotor-res",
-			     &info->vibrmotor_res);
-	of_property_read_u32(twl6040_core_node, "ti,vddvibl-uV", &vddvibl_uV);
-	of_property_read_u32(twl6040_core_node, "ti,vddvibr-uV", &vddvibr_uV);
-
-	of_node_put(twl6040_core_node);
-
-	if ((!info->vibldrv_res && !info->viblmotor_res) ||
-	    (!info->vibrdrv_res && !info->vibrmotor_res)) {
-		dev_err(info->dev, "invalid vibra driver/motor resistance\n");
-		return -EINVAL;
-	}
-
-	info->irq = platform_get_irq(pdev, 0);
-	if (info->irq < 0) {
-		dev_err(info->dev, "invalid irq\n");
-		return -EINVAL;
-	}
-
-	mutex_init(&info->mutex);
-
-	error = devm_request_threaded_irq(&pdev->dev, info->irq, NULL,
-					  twl6040_vib_irq_handler,
-					  IRQF_ONESHOT,
-					  "twl6040_irq_vib", info);
-	if (error) {
-		dev_err(info->dev, "VIB IRQ request failed: %d\n", error);
-		return error;
-	}
-
-	info->supplies[0].supply = "vddvibl";
-	info->supplies[1].supply = "vddvibr";
-	/*
-	 * When booted with Device tree the regulators are attached to the
-	 * parent device (twl6040 MFD core)
-	 */
-	error = devm_regulator_bulk_get(twl6040_core_dev,
-					ARRAY_SIZE(info->supplies),
-					info->supplies);
-	if (error) {
-		dev_err(info->dev, "couldn't get regulators %d\n", error);
-		return error;
-	}
-
-	if (vddvibl_uV) {
-		error = regulator_set_voltage(info->supplies[0].consumer,
-					      vddvibl_uV, vddvibl_uV);
-		if (error) {
-			dev_err(info->dev, "failed to set VDDVIBL volt %d\n",
-				error);
-			return error;
-		}
-	}
-
-	if (vddvibr_uV) {
-		error = regulator_set_voltage(info->supplies[1].consumer,
-					      vddvibr_uV, vddvibr_uV);
-		if (error) {
-			dev_err(info->dev, "failed to set VDDVIBR volt %d\n",
-				error);
-			return error;
-		}
-	}
-
-	INIT_WORK(&info->play_work, vibra_play_work);
-
-	info->input_dev = devm_input_allocate_device(&pdev->dev);
-	if (!info->input_dev) {
-		dev_err(info->dev, "couldn't allocate input device\n");
-		return -ENOMEM;
-	}
-
-	input_set_drvdata(info->input_dev, info);
-
-	info->input_dev->name = "twl6040:vibrator";
-	info->input_dev->id.version = 1;
-	info->input_dev->dev.parent = pdev->dev.parent;
-	info->input_dev->close = twl6040_vibra_close;
-	__set_bit(FF_RUMBLE, info->input_dev->ffbit);
-
-	error = input_ff_create_memless(info->input_dev, NULL, vibra_play);
-	if (error) {
-		dev_err(info->dev, "couldn't register vibrator to FF\n");
-		return error;
-	}
-
-	error = input_register_device(info->input_dev);
-	if (error) {
-		dev_err(info->dev, "couldn't register input device\n");
-		return error;
-	}
-
-	platform_set_drvdata(pdev, info);
-
-	return 0;
-}
-
-static struct platform_driver twl6040_vibra_driver = {
-	.probe		= twl6040_vibra_probe,
-	.driver		= {
-		.name	= "twl6040-vibra",
-		.pm	= &twl6040_vibra_pm_ops,
-	},
-};
-module_platform_driver(twl6040_vibra_driver);
-
-MODULE_ALIAS("platform:twl6040-vibra");
-MODULE_DESCRIPTION("TWL6040 Vibra driver");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Jorge Eduardo Candelaria <jorge.candelaria@ti.com>");
-MODULE_AUTHOR("Misael Lopez Cruz <misael.lopez@ti.com>");
+	u8 bootver;
+	u8 firmver;
+	u8 checksumh;
+	u8 checksuml;
+
+	abov_read_address_set(scl, sda);
+	abov_delay(5);
+
+	abov_i2c_start(scl, sda);
+	abov_testdelay();
+	abov_byte_send(ABOV_ID, scl, sda);
+	abov_byte_send(0x00, scl, sda);
+
+	abov_i2c_start(scl, sda); /* restart */
+	abov_testdelay();
+	abov_byte_send(ABOV_ID + 1, scl, sda);
+	status = abov_byte_read(true, scl, sda);
+	bootver = abov_byte_read(true, scl, sda);
+	firmver = abov_byte_read(true, scl, sda);
+	checksumh = abov_byte_read(true, scl, sda);
+	checksuml = abov_byte_read(false, scl, sda);
+	abov_i2c_stop(

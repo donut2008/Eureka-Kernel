@@ -1,7 +1,4 @@
 /*
- * Copyright (c) 2015 MediaTek Inc.
- * Author: Henry Chen <henryc.chen@mediatek.com>
- *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
@@ -10,56 +7,87 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
+ *
+ * Copyright (C) 2015 ARM Limited
  */
 
-#ifndef __MT6311_REGULATOR_H__
-#define __MT6311_REGULATOR_H__
+#define pr_fmt(fmt) "psci: " fmt
 
-#define MT6311_SWCID              0x01
+#include <linux/arm-smccc.h>
+#include <linux/errno.h>
+#include <linux/linkage.h>
+#include <linux/of.h>
+#include <linux/pm.h>
+#include <linux/printk.h>
+#include <linux/psci.h>
+#include <linux/reboot.h>
+#include <linux/suspend.h>
 
-#define MT6311_TOP_INT_CON        0x18
-#define MT6311_TOP_INT_MON        0x19
+#include <uapi/linux/psci.h>
 
-#define MT6311_VDVFS11_CON0       0x87
-#define MT6311_VDVFS11_CON7       0x88
-#define MT6311_VDVFS11_CON8       0x89
-#define MT6311_VDVFS11_CON9       0x8A
-#define MT6311_VDVFS11_CON10      0x8B
-#define MT6311_VDVFS11_CON11      0x8C
-#define MT6311_VDVFS11_CON12      0x8D
-#define MT6311_VDVFS11_CON13      0x8E
-#define MT6311_VDVFS11_CON14      0x8F
-#define MT6311_VDVFS11_CON15      0x90
-#define MT6311_VDVFS11_CON16      0x91
-#define MT6311_VDVFS11_CON17      0x92
-#define MT6311_VDVFS11_CON18      0x93
-#define MT6311_VDVFS11_CON19      0x94
+#include <asm/cputype.h>
+#include <asm/system_misc.h>
+#include <asm/smp_plat.h>
+#include <asm/suspend.h>
 
-#define MT6311_LDO_CON0           0xCC
-#define MT6311_LDO_OCFB0          0xCD
-#define MT6311_LDO_CON2           0xCE
-#define MT6311_LDO_CON3           0xCF
-#define MT6311_LDO_CON4           0xD0
-#define MT6311_FQMTR_CON0         0xD1
-#define MT6311_FQMTR_CON1         0xD2
-#define MT6311_FQMTR_CON2         0xD3
-#define MT6311_FQMTR_CON3         0xD4
-#define MT6311_FQMTR_CON4         0xD5
-
-#define MT6311_PMIC_RG_INT_POL_MASK                      0x1
-#define MT6311_PMIC_RG_INT_EN_MASK                       0x2
-#define MT6311_PMIC_RG_BUCK_OC_INT_STATUS_MASK           0x10
-
-#define MT6311_PMIC_VDVFS11_EN_CTRL_MASK                 0x1
-#define MT6311_PMIC_VDVFS11_VOSEL_CTRL_MASK              0x2
-#define MT6311_PMIC_VDVFS11_EN_SEL_MASK                  0x3
-#define MT6311_PMIC_VDVFS11_VOSEL_SEL_MASK               0xc
-#define MT6311_PMIC_VDVFS11_EN_MASK                      0x1
-#define MT6311_PMIC_VDVFS11_VOSEL_MASK                   0x7F
-#define MT6311_PMIC_VDVFS11_VOSEL_ON_MASK                0x7F
-#define MT6311_PMIC_VDVFS11_VOSEL_SLEEP_MASK             0x7F
-#define MT6311_PMIC_NI_VDVFS11_VOSEL_MASK                0x7F
-
-#define MT6311_PMIC_RG_VBIASN_EN_MASK                    0x1
-
+/*
+ * While a 64-bit OS can make calls with SMC32 calling conventions, for some
+ * calls it is necessary to use SMC64 to pass or return 64-bit values.
+ * For such calls PSCI_FN_NATIVE(version, name) will choose the appropriate
+ * (native-width) function ID.
+ */
+#ifdef CONFIG_64BIT
+#define PSCI_FN_NATIVE(version, name)	PSCI_##version##_FN64_##name
+#else
+#define PSCI_FN_NATIVE(version, name)	PSCI_##version##_FN_##name
 #endif
+
+/*
+ * The CPU any Trusted OS is resident on. The trusted OS may reject CPU_OFF
+ * calls to its resident CPU, so we must avoid issuing those. We never migrate
+ * a Trusted OS even if it claims to be capable of migration -- doing so will
+ * require cooperation with a Trusted OS driver.
+ */
+static int resident_cpu = -1;
+
+bool psci_tos_resident_on(int cpu)
+{
+	return cpu == resident_cpu;
+}
+
+struct psci_operations psci_ops = {
+	.conduit = PSCI_CONDUIT_NONE,
+	.smccc_version = SMCCC_VERSION_1_0,
+};
+
+enum arm_smccc_conduit arm_smccc_1_1_get_conduit(void)
+{
+	if (psci_ops.smccc_version < SMCCC_VERSION_1_1)
+		return SMCCC_CONDUIT_NONE;
+
+	switch (psci_ops.conduit) {
+	case PSCI_CONDUIT_SMC:
+		return SMCCC_CONDUIT_SMC;
+	case PSCI_CONDUIT_HVC:
+		return SMCCC_CONDUIT_HVC;
+	default:
+		return SMCCC_CONDUIT_NONE;
+	}
+}
+
+typedef unsigned long (psci_fn)(unsigned long, unsigned long,
+				unsigned long, unsigned long);
+static psci_fn *invoke_psci_fn;
+
+enum psci_function {
+	PSCI_FN_CPU_SUSPEND,
+	PSCI_FN_CPU_ON,
+	PSCI_FN_CPU_OFF,
+	PSCI_FN_MIGRATE,
+	PSCI_FN_MAX,
+};
+
+static u32 psci_function_id[PSCI_FN_MAX];
+
+#define PSCI_0_2_POWER_STATE_MASK		\
+				(PSCI_0_2_POW

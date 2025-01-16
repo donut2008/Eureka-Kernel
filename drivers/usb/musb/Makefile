@@ -1,37 +1,17 @@
-#
-# for USB OTG silicon based on Mentor Graphics INVENTRA designs
-#
-
-obj-$(CONFIG_USB_MUSB_HDRC) += musb_hdrc.o
-
-musb_hdrc-y := musb_core.o
-
-musb_hdrc-$(CONFIG_USB_MUSB_HOST)$(CONFIG_USB_MUSB_DUAL_ROLE) += musb_virthub.o musb_host.o
-musb_hdrc-$(CONFIG_USB_MUSB_GADGET)$(CONFIG_USB_MUSB_DUAL_ROLE) += musb_gadget_ep0.o musb_gadget.o
-musb_hdrc-$(CONFIG_DEBUG_FS)			+= musb_debugfs.o
-
-# Hardware Glue Layer
-obj-$(CONFIG_USB_MUSB_OMAP2PLUS)		+= omap2430.o
-obj-$(CONFIG_USB_MUSB_AM35X)			+= am35x.o
-obj-$(CONFIG_USB_MUSB_DSPS)			+= musb_dsps.o
-obj-$(CONFIG_USB_MUSB_TUSB6010)			+= tusb6010.o
-obj-$(CONFIG_USB_MUSB_DAVINCI)			+= davinci.o
-obj-$(CONFIG_USB_MUSB_DA8XX)			+= da8xx.o
-obj-$(CONFIG_USB_MUSB_BLACKFIN)			+= blackfin.o
-obj-$(CONFIG_USB_MUSB_UX500)			+= ux500.o
-obj-$(CONFIG_USB_MUSB_JZ4740)			+= jz4740.o
-obj-$(CONFIG_USB_MUSB_SUNXI)			+= sunxi.o
-
-
-obj-$(CONFIG_USB_MUSB_AM335X_CHILD)		+= musb_am335x.o
-
-# the kconfig must guarantee that only one of the
-# possible I/O schemes will be enabled at a time ...
-# PIO only, or DMA (several potential schemes).
-# though PIO is always there to back up DMA, and for ep0
-
-musb_hdrc-$(CONFIG_USB_INVENTRA_DMA)		+= musbhsdma.o
-musb_hdrc-$(CONFIG_USB_TI_CPPI_DMA)		+= cppi_dma.o
-musb_hdrc-$(CONFIG_USB_TUSB_OMAP_DMA)		+= tusb6010_omap.o
-musb_hdrc-$(CONFIG_USB_UX500_DMA)		+= ux500_dma.o
-musb_hdrc-$(CONFIG_USB_TI_CPPI41_DMA)		+= musb_cppi41.o
+ef struct _ATOM_INTEGRATED_SYSTEM_INFO_V5
+{
+  ATOM_COMMON_TABLE_HEADER   sHeader;
+  ULONG                        ulBootUpEngineClock;       //in 10kHz unit
+  ULONG                      ulDentistVCOFreq;          //Dentist VCO clock in 10kHz unit, the source of GPU SCLK, LCLK, UCLK and VCLK.
+  ULONG                      ulLClockFreq;              //GPU Lclk freq in 10kHz unit, have relationship with NCLK in NorthBridge
+  ULONG                        ulBootUpUMAClock;          //in 10kHz unit
+  ULONG                      ulReserved1[8];            //must be 0x0 for the reserved
+  ULONG                      ulBootUpReqDisplayVector;
+  ULONG                      ulOtherDisplayMisc;
+  ULONG                      ulReserved2[4];            //must be 0x0 for the reserved
+  ULONG                      ulSystemConfig;            //TBD
+  ULONG                      ulCPUCapInfo;              //TBD
+  USHORT                     usMaxNBVoltage;            //high NB voltage, calculated using current VDDNB (D24F2xDC) and VDDNB offset fuse;
+  USHORT                     usMinNBVoltage;            //low NB voltage, calculated using current VDDNB (D24F2xDC) and VDDNB offset fuse;
+  USHORT                     usBootUpNBVoltage;         //boot up NB voltage
+  UCHAR                      ucHtcTmpLmt;               //bit [22:16] of D24F3x64 Hardware Thermal Control (HTC) Register, may not 

@@ -1,786 +1,295 @@
-/*
- * Copyright 2014 IBM Corp.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
- */
-
-#include <linux/spinlock.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
-#include <linux/sched.h>
-#include <linux/mutex.h>
-#include <linux/mm.h>
-#include <linux/uaccess.h>
-#include <asm/synch.h>
-#include <misc/cxl-base.h>
-
-#include "cxl.h"
-#include "trace.h"
-
-static int afu_control(struct cxl_afu *afu, u64 command,
-		       u64 result, u64 mask, bool enabled)
-{
-	u64 AFU_Cntl = cxl_p2n_read(afu, CXL_AFU_Cntl_An);
-	unsigned long timeout = jiffies + (HZ * CXL_TIMEOUT);
-	int rc = 0;
-
-	spin_lock(&afu->afu_cntl_lock);
-	pr_devel("AFU command starting: %llx\n", command);
-
-	trace_cxl_afu_ctrl(afu, command);
-
-	cxl_p2n_write(afu, CXL_AFU_Cntl_An, AFU_Cntl | command);
-
-	AFU_Cntl = cxl_p2n_read(afu, CXL_AFU_Cntl_An);
-	while ((AFU_Cntl & mask) != result) {
-		if (time_after_eq(jiffies, timeout)) {
-			dev_warn(&afu->dev, "WARNING: AFU control timed out!\n");
-			rc = -EBUSY;
-			goto out;
-		}
-
-		if (!cxl_adapter_link_ok(afu->adapter)) {
-			afu->enabled = enabled;
-			rc = -EIO;
-			goto out;
-		}
-
-		pr_devel_ratelimited("AFU control... (0x%016llx)\n",
-				     AFU_Cntl | command);
-		cpu_relax();
-		AFU_Cntl = cxl_p2n_read(afu, CXL_AFU_Cntl_An);
-	};
-	pr_devel("AFU command complete: %llx\n", command);
-	afu->enabled = enabled;
-out:
-	trace_cxl_afu_ctrl_done(afu, command, rc);
-	spin_unlock(&afu->afu_cntl_lock);
-
-	return rc;
-}
-
-static int afu_enable(struct cxl_afu *afu)
-{
-	pr_devel("AFU enable request\n");
-
-	return afu_control(afu, CXL_AFU_Cntl_An_E,
-			   CXL_AFU_Cntl_An_ES_Enabled,
-			   CXL_AFU_Cntl_An_ES_MASK, true);
-}
-
-int cxl_afu_disable(struct cxl_afu *afu)
-{
-	pr_devel("AFU disable request\n");
-
-	return afu_control(afu, 0, CXL_AFU_Cntl_An_ES_Disabled,
-			   CXL_AFU_Cntl_An_ES_MASK, false);
-}
-
-/* This will disable as well as reset */
-int __cxl_afu_reset(struct cxl_afu *afu)
-{
-	pr_devel("AFU reset request\n");
-
-	return afu_control(afu, CXL_AFU_Cntl_An_RA,
-			   CXL_AFU_Cntl_An_RS_Complete | CXL_AFU_Cntl_An_ES_Disabled,
-			   CXL_AFU_Cntl_An_RS_MASK | CXL_AFU_Cntl_An_ES_MASK,
-			   false);
-}
-
-int cxl_afu_check_and_enable(struct cxl_afu *afu)
-{
-	if (!cxl_adapter_link_ok(afu->adapter)) {
-		WARN(1, "Refusing to enable afu while link down!\n");
-		return -EIO;
-	}
-	if (afu->enabled)
-		return 0;
-	return afu_enable(afu);
-}
-
-int cxl_psl_purge(struct cxl_afu *afu)
-{
-	u64 PSL_CNTL = cxl_p1n_read(afu, CXL_PSL_SCNTL_An);
-	u64 AFU_Cntl = cxl_p2n_read(afu, CXL_AFU_Cntl_An);
-	u64 dsisr, dar;
-	u64 start, end;
-	unsigned long timeout = jiffies + (HZ * CXL_TIMEOUT);
-	int rc = 0;
-
-	trace_cxl_psl_ctrl(afu, CXL_PSL_SCNTL_An_Pc);
-
-	pr_devel("PSL purge request\n");
-
-	if (!cxl_adapter_link_ok(afu->adapter)) {
-		dev_warn(&afu->dev, "PSL Purge called with link down, ignoring\n");
-		rc = -EIO;
-		goto out;
-	}
-
-	if ((AFU_Cntl & CXL_AFU_Cntl_An_ES_MASK) != CXL_AFU_Cntl_An_ES_Disabled) {
-		WARN(1, "psl_purge request while AFU not disabled!\n");
-		cxl_afu_disable(afu);
-	}
-
-	cxl_p1n_write(afu, CXL_PSL_SCNTL_An,
-		       PSL_CNTL | CXL_PSL_SCNTL_An_Pc);
-	start = local_clock();
-	PSL_CNTL = cxl_p1n_read(afu, CXL_PSL_SCNTL_An);
-	while ((PSL_CNTL &  CXL_PSL_SCNTL_An_Ps_MASK)
-			== CXL_PSL_SCNTL_An_Ps_Pending) {
-		if (time_after_eq(jiffies, timeout)) {
-			dev_warn(&afu->dev, "WARNING: PSL Purge timed out!\n");
-			rc = -EBUSY;
-			goto out;
-		}
-		if (!cxl_adapter_link_ok(afu->adapter)) {
-			rc = -EIO;
-			goto out;
-		}
-
-		dsisr = cxl_p2n_read(afu, CXL_PSL_DSISR_An);
-		pr_devel_ratelimited("PSL purging... PSL_CNTL: 0x%016llx  PSL_DSISR: 0x%016llx\n", PSL_CNTL, dsisr);
-		if (dsisr & CXL_PSL_DSISR_TRANS) {
-			dar = cxl_p2n_read(afu, CXL_PSL_DAR_An);
-			dev_notice(&afu->dev, "PSL purge terminating pending translation, DSISR: 0x%016llx, DAR: 0x%016llx\n", dsisr, dar);
-			cxl_p2n_write(afu, CXL_PSL_TFC_An, CXL_PSL_TFC_An_AE);
-		} else if (dsisr) {
-			dev_notice(&afu->dev, "PSL purge acknowledging pending non-translation fault, DSISR: 0x%016llx\n", dsisr);
-			cxl_p2n_write(afu, CXL_PSL_TFC_An, CXL_PSL_TFC_An_A);
-		} else {
-			cpu_relax();
-		}
-		PSL_CNTL = cxl_p1n_read(afu, CXL_PSL_SCNTL_An);
-	};
-	end = local_clock();
-	pr_devel("PSL purged in %lld ns\n", end - start);
-
-	cxl_p1n_write(afu, CXL_PSL_SCNTL_An,
-		       PSL_CNTL & ~CXL_PSL_SCNTL_An_Pc);
-out:
-	trace_cxl_psl_ctrl_done(afu, CXL_PSL_SCNTL_An_Pc, rc);
-	return rc;
-}
-
-static int spa_max_procs(int spa_size)
-{
-	/*
-	 * From the CAIA:
-	 *    end_of_SPA_area = SPA_Base + ((n+4) * 128) + (( ((n*8) + 127) >> 7) * 128) + 255
-	 * Most of that junk is really just an overly-complicated way of saying
-	 * the last 256 bytes are __aligned(128), so it's really:
-	 *    end_of_SPA_area = end_of_PSL_queue_area + __aligned(128) 255
-	 * and
-	 *    end_of_PSL_queue_area = SPA_Base + ((n+4) * 128) + (n*8) - 1
-	 * so
-	 *    sizeof(SPA) = ((n+4) * 128) + (n*8) + __aligned(128) 256
-	 * Ignore the alignment (which is safe in this case as long as we are
-	 * careful with our rounding) and solve for n:
-	 */
-	return ((spa_size / 8) - 96) / 17;
-}
-
-int cxl_alloc_spa(struct cxl_afu *afu)
-{
-	/* Work out how many pages to allocate */
-	afu->spa_order = 0;
-	do {
-		afu->spa_order++;
-		afu->spa_size = (1 << afu->spa_order) * PAGE_SIZE;
-		afu->spa_max_procs = spa_max_procs(afu->spa_size);
-	} while (afu->spa_max_procs < afu->num_procs);
-
-	WARN_ON(afu->spa_size > 0x100000); /* Max size supported by the hardware */
-
-	if (!(afu->spa = (struct cxl_process_element *)
-	      __get_free_pages(GFP_KERNEL | __GFP_ZERO, afu->spa_order))) {
-		pr_err("cxl_alloc_spa: Unable to allocate scheduled process area\n");
-		return -ENOMEM;
-	}
-	pr_devel("spa pages: %i afu->spa_max_procs: %i   afu->num_procs: %i\n",
-		 1<<afu->spa_order, afu->spa_max_procs, afu->num_procs);
-
-	return 0;
-}
-
-static void attach_spa(struct cxl_afu *afu)
-{
-	u64 spap;
-
-	afu->sw_command_status = (__be64 *)((char *)afu->spa +
-					    ((afu->spa_max_procs + 3) * 128));
-
-	spap = virt_to_phys(afu->spa) & CXL_PSL_SPAP_Addr;
-	spap |= ((afu->spa_size >> (12 - CXL_PSL_SPAP_Size_Shift)) - 1) & CXL_PSL_SPAP_Size;
-	spap |= CXL_PSL_SPAP_V;
-	pr_devel("cxl: SPA allocated at 0x%p. Max processes: %i, sw_command_status: 0x%p CXL_PSL_SPAP_An=0x%016llx\n", afu->spa, afu->spa_max_procs, afu->sw_command_status, spap);
-	cxl_p1n_write(afu, CXL_PSL_SPAP_An, spap);
-}
-
-static inline void detach_spa(struct cxl_afu *afu)
-{
-	cxl_p1n_write(afu, CXL_PSL_SPAP_An, 0);
-}
-
-void cxl_release_spa(struct cxl_afu *afu)
-{
-	if (afu->spa) {
-		free_pages((unsigned long) afu->spa, afu->spa_order);
-		afu->spa = NULL;
-	}
-}
-
-int cxl_tlb_slb_invalidate(struct cxl *adapter)
-{
-	unsigned long timeout = jiffies + (HZ * CXL_TIMEOUT);
-
-	pr_devel("CXL adapter wide TLBIA & SLBIA\n");
-
-	cxl_p1_write(adapter, CXL_PSL_AFUSEL, CXL_PSL_AFUSEL_A);
-
-	cxl_p1_write(adapter, CXL_PSL_TLBIA, CXL_TLB_SLB_IQ_ALL);
-	while (cxl_p1_read(adapter, CXL_PSL_TLBIA) & CXL_TLB_SLB_P) {
-		if (time_after_eq(jiffies, timeout)) {
-			dev_warn(&adapter->dev, "WARNING: CXL adapter wide TLBIA timed out!\n");
-			return -EBUSY;
-		}
-		if (!cxl_adapter_link_ok(adapter))
-			return -EIO;
-		cpu_relax();
-	}
-
-	cxl_p1_write(adapter, CXL_PSL_SLBIA, CXL_TLB_SLB_IQ_ALL);
-	while (cxl_p1_read(adapter, CXL_PSL_SLBIA) & CXL_TLB_SLB_P) {
-		if (time_after_eq(jiffies, timeout)) {
-			dev_warn(&adapter->dev, "WARNING: CXL adapter wide SLBIA timed out!\n");
-			return -EBUSY;
-		}
-		if (!cxl_adapter_link_ok(adapter))
-			return -EIO;
-		cpu_relax();
-	}
-	return 0;
-}
-
-int cxl_afu_slbia(struct cxl_afu *afu)
-{
-	unsigned long timeout = jiffies + (HZ * CXL_TIMEOUT);
-
-	pr_devel("cxl_afu_slbia issuing SLBIA command\n");
-	cxl_p2n_write(afu, CXL_SLBIA_An, CXL_TLB_SLB_IQ_ALL);
-	while (cxl_p2n_read(afu, CXL_SLBIA_An) & CXL_TLB_SLB_P) {
-		if (time_after_eq(jiffies, timeout)) {
-			dev_warn(&afu->dev, "WARNING: CXL AFU SLBIA timed out!\n");
-			return -EBUSY;
-		}
-		/* If the adapter has gone down, we can assume that we
-		 * will PERST it and that will invalidate everything.
-		 */
-		if (!cxl_adapter_link_ok(afu->adapter))
-			return -EIO;
-		cpu_relax();
-	}
-	return 0;
-}
-
-static int cxl_write_sstp(struct cxl_afu *afu, u64 sstp0, u64 sstp1)
-{
-	int rc;
-
-	/* 1. Disable SSTP by writing 0 to SSTP1[V] */
-	cxl_p2n_write(afu, CXL_SSTP1_An, 0);
-
-	/* 2. Invalidate all SLB entries */
-	if ((rc = cxl_afu_slbia(afu)))
-		return rc;
-
-	/* 3. Set SSTP0_An */
-	cxl_p2n_write(afu, CXL_SSTP0_An, sstp0);
-
-	/* 4. Set SSTP1_An */
-	cxl_p2n_write(afu, CXL_SSTP1_An, sstp1);
-
-	return 0;
-}
-
-/* Using per slice version may improve performance here. (ie. SLBIA_An) */
-static void slb_invalid(struct cxl_context *ctx)
-{
-	struct cxl *adapter = ctx->afu->adapter;
-	u64 slbia;
-
-	WARN_ON(!mutex_is_locked(&ctx->afu->spa_mutex));
-
-	cxl_p1_write(adapter, CXL_PSL_LBISEL,
-			((u64)be32_to_cpu(ctx->elem->common.pid) << 32) |
-			be32_to_cpu(ctx->elem->lpid));
-	cxl_p1_write(adapter, CXL_PSL_SLBIA, CXL_TLB_SLB_IQ_LPIDPID);
-
-	while (1) {
-		if (!cxl_adapter_link_ok(adapter))
-			break;
-		slbia = cxl_p1_read(adapter, CXL_PSL_SLBIA);
-		if (!(slbia & CXL_TLB_SLB_P))
-			break;
-		cpu_relax();
-	}
-}
-
-static int do_process_element_cmd(struct cxl_context *ctx,
-				  u64 cmd, u64 pe_state)
-{
-	u64 state;
-	unsigned long timeout = jiffies + (HZ * CXL_TIMEOUT);
-	int rc = 0;
-
-	trace_cxl_llcmd(ctx, cmd);
-
-	WARN_ON(!ctx->afu->enabled);
-
-	ctx->elem->software_state = cpu_to_be32(pe_state);
-	smp_wmb();
-	*(ctx->afu->sw_command_status) = cpu_to_be64(cmd | 0 | ctx->pe);
-	smp_mb();
-	cxl_p1n_write(ctx->afu, CXL_PSL_LLCMD_An, cmd | ctx->pe);
-	while (1) {
-		if (time_after_eq(jiffies, timeout)) {
-			dev_warn(&ctx->afu->dev, "WARNING: Process Element Command timed out!\n");
-			rc = -EBUSY;
-			goto out;
-		}
-		if (!cxl_adapter_link_ok(ctx->afu->adapter)) {
-			dev_warn(&ctx->afu->dev, "WARNING: Device link down, aborting Process Element Command!\n");
-			rc = -EIO;
-			goto out;
-		}
-		state = be64_to_cpup(ctx->afu->sw_command_status);
-		if (state == ~0ULL) {
-			pr_err("cxl: Error adding process element to AFU\n");
-			rc = -1;
-			goto out;
-		}
-		if ((state & (CXL_SPA_SW_CMD_MASK | CXL_SPA_SW_STATE_MASK  | CXL_SPA_SW_LINK_MASK)) ==
-		    (cmd | (cmd >> 16) | ctx->pe))
-			break;
-		/*
-		 * The command won't finish in the PSL if there are
-		 * outstanding DSIs.  Hence we need to yield here in
-		 * case there are outstanding DSIs that we need to
-		 * service.  Tuning possiblity: we could wait for a
-		 * while before sched
-		 */
-		schedule();
-
-	}
-out:
-	trace_cxl_llcmd_done(ctx, cmd, rc);
-	return rc;
-}
-
-static int add_process_element(struct cxl_context *ctx)
-{
-	int rc = 0;
-
-	mutex_lock(&ctx->afu->spa_mutex);
-	pr_devel("%s Adding pe: %i started\n", __func__, ctx->pe);
-	if (!(rc = do_process_element_cmd(ctx, CXL_SPA_SW_CMD_ADD, CXL_PE_SOFTWARE_STATE_V)))
-		ctx->pe_inserted = true;
-	pr_devel("%s Adding pe: %i finished\n", __func__, ctx->pe);
-	mutex_unlock(&ctx->afu->spa_mutex);
-	return rc;
-}
-
-static int terminate_process_element(struct cxl_context *ctx)
-{
-	int rc = 0;
-
-	/* fast path terminate if it's already invalid */
-	if (!(ctx->elem->software_state & cpu_to_be32(CXL_PE_SOFTWARE_STATE_V)))
-		return rc;
-
-	mutex_lock(&ctx->afu->spa_mutex);
-	pr_devel("%s Terminate pe: %i started\n", __func__, ctx->pe);
-	/* We could be asked to terminate when the hw is down. That
-	 * should always succeed: it's not running if the hw has gone
-	 * away and is being reset.
-	 */
-	if (cxl_adapter_link_ok(ctx->afu->adapter))
-		rc = do_process_element_cmd(ctx, CXL_SPA_SW_CMD_TERMINATE,
-					    CXL_PE_SOFTWARE_STATE_V | CXL_PE_SOFTWARE_STATE_T);
-	ctx->elem->software_state = 0;	/* Remove Valid bit */
-	pr_devel("%s Terminate pe: %i finished\n", __func__, ctx->pe);
-	mutex_unlock(&ctx->afu->spa_mutex);
-	return rc;
-}
-
-static int remove_process_element(struct cxl_context *ctx)
-{
-	int rc = 0;
-
-	mutex_lock(&ctx->afu->spa_mutex);
-	pr_devel("%s Remove pe: %i started\n", __func__, ctx->pe);
-
-	/* We could be asked to remove when the hw is down. Again, if
-	 * the hw is down, the PE is gone, so we succeed.
-	 */
-	if (cxl_adapter_link_ok(ctx->afu->adapter))
-		rc = do_process_element_cmd(ctx, CXL_SPA_SW_CMD_REMOVE, 0);
-
-	if (!rc)
-		ctx->pe_inserted = false;
-	slb_invalid(ctx);
-	pr_devel("%s Remove pe: %i finished\n", __func__, ctx->pe);
-	mutex_unlock(&ctx->afu->spa_mutex);
-
-	return rc;
-}
-
-
-void cxl_assign_psn_space(struct cxl_context *ctx)
-{
-	if (!ctx->afu->pp_size || ctx->master) {
-		ctx->psn_phys = ctx->afu->psn_phys;
-		ctx->psn_size = ctx->afu->adapter->ps_size;
-	} else {
-		ctx->psn_phys = ctx->afu->psn_phys +
-			(ctx->afu->pp_offset + ctx->afu->pp_size * ctx->pe);
-		ctx->psn_size = ctx->afu->pp_size;
-	}
-}
-
-static int activate_afu_directed(struct cxl_afu *afu)
-{
-	int rc;
-
-	dev_info(&afu->dev, "Activating AFU directed mode\n");
-
-	afu->num_procs = afu->max_procs_virtualised;
-	if (afu->spa == NULL) {
-		if (cxl_alloc_spa(afu))
-			return -ENOMEM;
-	}
-	attach_spa(afu);
-
-	cxl_p1n_write(afu, CXL_PSL_SCNTL_An, CXL_PSL_SCNTL_An_PM_AFU);
-	cxl_p1n_write(afu, CXL_PSL_AMOR_An, 0xFFFFFFFFFFFFFFFFULL);
-	cxl_p1n_write(afu, CXL_PSL_ID_An, CXL_PSL_ID_An_F | CXL_PSL_ID_An_L);
-
-	afu->current_mode = CXL_MODE_DIRECTED;
-
-	if ((rc = cxl_chardev_m_afu_add(afu)))
-		return rc;
-
-	if ((rc = cxl_sysfs_afu_m_add(afu)))
-		goto err;
-
-	if ((rc = cxl_chardev_s_afu_add(afu)))
-		goto err1;
-
-	return 0;
-err1:
-	cxl_sysfs_afu_m_remove(afu);
-err:
-	cxl_chardev_afu_remove(afu);
-	return rc;
-}
-
-#ifdef CONFIG_CPU_LITTLE_ENDIAN
-#define set_endian(sr) ((sr) |= CXL_PSL_SR_An_LE)
-#else
-#define set_endian(sr) ((sr) &= ~(CXL_PSL_SR_An_LE))
-#endif
-
-static u64 calculate_sr(struct cxl_context *ctx)
-{
-	u64 sr = 0;
-
-	set_endian(sr);
-	if (ctx->master)
-		sr |= CXL_PSL_SR_An_MP;
-	if (mfspr(SPRN_LPCR) & LPCR_TC)
-		sr |= CXL_PSL_SR_An_TC;
-	if (ctx->kernel) {
-		sr |= CXL_PSL_SR_An_R | (mfmsr() & MSR_SF);
-		sr |= CXL_PSL_SR_An_HV;
-	} else {
-		sr |= CXL_PSL_SR_An_PR | CXL_PSL_SR_An_R;
-		sr &= ~(CXL_PSL_SR_An_HV);
-		if (!test_tsk_thread_flag(current, TIF_32BIT))
-			sr |= CXL_PSL_SR_An_SF;
-	}
-	return sr;
-}
-
-static int attach_afu_directed(struct cxl_context *ctx, u64 wed, u64 amr)
-{
-	u32 pid;
-	int r, result;
-
-	cxl_assign_psn_space(ctx);
-
-	ctx->elem->ctxtime = 0; /* disable */
-	ctx->elem->lpid = cpu_to_be32(mfspr(SPRN_LPID));
-	ctx->elem->haurp = 0; /* disable */
-	ctx->elem->sdr = cpu_to_be64(mfspr(SPRN_SDR1));
-
-	pid = current->pid;
-	if (ctx->kernel)
-		pid = 0;
-	ctx->elem->common.tid = 0;
-	ctx->elem->common.pid = cpu_to_be32(pid);
-
-	ctx->elem->sr = cpu_to_be64(calculate_sr(ctx));
-
-	ctx->elem->common.csrp = 0; /* disable */
-	ctx->elem->common.aurp0 = 0; /* disable */
-	ctx->elem->common.aurp1 = 0; /* disable */
-
-	cxl_prefault(ctx, wed);
-
-	ctx->elem->common.sstp0 = cpu_to_be64(ctx->sstp0);
-	ctx->elem->common.sstp1 = cpu_to_be64(ctx->sstp1);
-
-	for (r = 0; r < CXL_IRQ_RANGES; r++) {
-		ctx->elem->ivte_offsets[r] = cpu_to_be16(ctx->irqs.offset[r]);
-		ctx->elem->ivte_ranges[r] = cpu_to_be16(ctx->irqs.range[r]);
-	}
-
-	ctx->elem->common.amr = cpu_to_be64(amr);
-	ctx->elem->common.wed = cpu_to_be64(wed);
-
-	/* first guy needs to enable */
-	if ((result = cxl_afu_check_and_enable(ctx->afu)))
-		return result;
-
-	return add_process_element(ctx);
-}
-
-static int deactivate_afu_directed(struct cxl_afu *afu)
-{
-	dev_info(&afu->dev, "Deactivating AFU directed mode\n");
-
-	afu->current_mode = 0;
-	afu->num_procs = 0;
-
-	cxl_sysfs_afu_m_remove(afu);
-	cxl_chardev_afu_remove(afu);
-
-	__cxl_afu_reset(afu);
-	cxl_afu_disable(afu);
-	cxl_psl_purge(afu);
-
-	return 0;
-}
-
-static int activate_dedicated_process(struct cxl_afu *afu)
-{
-	dev_info(&afu->dev, "Activating dedicated process mode\n");
-
-	cxl_p1n_write(afu, CXL_PSL_SCNTL_An, CXL_PSL_SCNTL_An_PM_Process);
-
-	cxl_p1n_write(afu, CXL_PSL_CtxTime_An, 0); /* disable */
-	cxl_p1n_write(afu, CXL_PSL_SPAP_An, 0);    /* disable */
-	cxl_p1n_write(afu, CXL_PSL_AMOR_An, 0xFFFFFFFFFFFFFFFFULL);
-	cxl_p1n_write(afu, CXL_PSL_LPID_An, mfspr(SPRN_LPID));
-	cxl_p1n_write(afu, CXL_HAURP_An, 0);       /* disable */
-	cxl_p1n_write(afu, CXL_PSL_SDR_An, mfspr(SPRN_SDR1));
-
-	cxl_p2n_write(afu, CXL_CSRP_An, 0);        /* disable */
-	cxl_p2n_write(afu, CXL_AURP0_An, 0);       /* disable */
-	cxl_p2n_write(afu, CXL_AURP1_An, 0);       /* disable */
-
-	afu->current_mode = CXL_MODE_DEDICATED;
-	afu->num_procs = 1;
-
-	return cxl_chardev_d_afu_add(afu);
-}
-
-static int attach_dedicated(struct cxl_context *ctx, u64 wed, u64 amr)
-{
-	struct cxl_afu *afu = ctx->afu;
-	u64 pid;
-	int rc;
-
-	pid = (u64)current->pid << 32;
-	if (ctx->kernel)
-		pid = 0;
-	cxl_p2n_write(afu, CXL_PSL_PID_TID_An, pid);
-
-	cxl_p1n_write(afu, CXL_PSL_SR_An, calculate_sr(ctx));
-
-	if ((rc = cxl_write_sstp(afu, ctx->sstp0, ctx->sstp1)))
-		return rc;
-
-	cxl_prefault(ctx, wed);
-
-	cxl_p1n_write(afu, CXL_PSL_IVTE_Offset_An,
-		       (((u64)ctx->irqs.offset[0] & 0xffff) << 48) |
-		       (((u64)ctx->irqs.offset[1] & 0xffff) << 32) |
-		       (((u64)ctx->irqs.offset[2] & 0xffff) << 16) |
-			((u64)ctx->irqs.offset[3] & 0xffff));
-	cxl_p1n_write(afu, CXL_PSL_IVTE_Limit_An, (u64)
-		       (((u64)ctx->irqs.range[0] & 0xffff) << 48) |
-		       (((u64)ctx->irqs.range[1] & 0xffff) << 32) |
-		       (((u64)ctx->irqs.range[2] & 0xffff) << 16) |
-			((u64)ctx->irqs.range[3] & 0xffff));
-
-	cxl_p2n_write(afu, CXL_PSL_AMR_An, amr);
-
-	/* master only context for dedicated */
-	cxl_assign_psn_space(ctx);
-
-	if ((rc = __cxl_afu_reset(afu)))
-		return rc;
-
-	cxl_p2n_write(afu, CXL_PSL_WED_An, wed);
-
-	return afu_enable(afu);
-}
-
-static int deactivate_dedicated_process(struct cxl_afu *afu)
-{
-	dev_info(&afu->dev, "Deactivating dedicated process mode\n");
-
-	afu->current_mode = 0;
-	afu->num_procs = 0;
-
-	cxl_chardev_afu_remove(afu);
-
-	return 0;
-}
-
-int _cxl_afu_deactivate_mode(struct cxl_afu *afu, int mode)
-{
-	if (mode == CXL_MODE_DIRECTED)
-		return deactivate_afu_directed(afu);
-	if (mode == CXL_MODE_DEDICATED)
-		return deactivate_dedicated_process(afu);
-	return 0;
-}
-
-int cxl_afu_deactivate_mode(struct cxl_afu *afu)
-{
-	return _cxl_afu_deactivate_mode(afu, afu->current_mode);
-}
-
-int cxl_afu_activate_mode(struct cxl_afu *afu, int mode)
-{
-	if (!mode)
-		return 0;
-	if (!(mode & afu->modes_supported))
-		return -EINVAL;
-
-	if (!cxl_adapter_link_ok(afu->adapter)) {
-		WARN(1, "Device link is down, refusing to activate!\n");
-		return -EIO;
-	}
-
-	if (mode == CXL_MODE_DIRECTED)
-		return activate_afu_directed(afu);
-	if (mode == CXL_MODE_DEDICATED)
-		return activate_dedicated_process(afu);
-
-	return -EINVAL;
-}
-
-int cxl_attach_process(struct cxl_context *ctx, bool kernel, u64 wed, u64 amr)
-{
-	if (!cxl_adapter_link_ok(ctx->afu->adapter)) {
-		WARN(1, "Device link is down, refusing to attach process!\n");
-		return -EIO;
-	}
-
-	ctx->kernel = kernel;
-	if (ctx->afu->current_mode == CXL_MODE_DIRECTED)
-		return attach_afu_directed(ctx, wed, amr);
-
-	if (ctx->afu->current_mode == CXL_MODE_DEDICATED)
-		return attach_dedicated(ctx, wed, amr);
-
-	return -EINVAL;
-}
-
-static inline int detach_process_native_dedicated(struct cxl_context *ctx)
-{
-	__cxl_afu_reset(ctx->afu);
-	cxl_afu_disable(ctx->afu);
-	cxl_psl_purge(ctx->afu);
-	return 0;
-}
-
-static inline int detach_process_native_afu_directed(struct cxl_context *ctx)
-{
-	if (!ctx->pe_inserted)
-		return 0;
-	if (terminate_process_element(ctx))
-		return -1;
-	if (remove_process_element(ctx))
-		return -1;
-
-	return 0;
-}
-
-int cxl_detach_process(struct cxl_context *ctx)
-{
-	trace_cxl_detach(ctx);
-
-	if (ctx->afu->current_mode == CXL_MODE_DEDICATED)
-		return detach_process_native_dedicated(ctx);
-
-	return detach_process_native_afu_directed(ctx);
-}
-
-int cxl_get_irq(struct cxl_afu *afu, struct cxl_irq_info *info)
-{
-	u64 pidtid;
-
-	/* If the adapter has gone away, we can't get any meaningful
-	 * information.
-	 */
-	if (!cxl_adapter_link_ok(afu->adapter))
-		return -EIO;
-
-	info->dsisr = cxl_p2n_read(afu, CXL_PSL_DSISR_An);
-	info->dar = cxl_p2n_read(afu, CXL_PSL_DAR_An);
-	info->dsr = cxl_p2n_read(afu, CXL_PSL_DSR_An);
-	pidtid = cxl_p2n_read(afu, CXL_PSL_PID_TID_An);
-	info->pid = pidtid >> 32;
-	info->tid = pidtid & 0xffffffff;
-	info->afu_err = cxl_p2n_read(afu, CXL_AFU_ERR_An);
-	info->errstat = cxl_p2n_read(afu, CXL_PSL_ErrStat_An);
-
-	return 0;
-}
-
-static void recover_psl_err(struct cxl_afu *afu, u64 errstat)
-{
-	u64 dsisr;
-
-	pr_devel("RECOVERING FROM PSL ERROR... (0x%016llx)\n", errstat);
-
-	/* Clear PSL_DSISR[PE] */
-	dsisr = cxl_p2n_read(afu, CXL_PSL_DSISR_An);
-	cxl_p2n_write(afu, CXL_PSL_DSISR_An, dsisr & ~CXL_PSL_DSISR_An_PE);
-
-	/* Write 1s to clear error status bits */
-	cxl_p2n_write(afu, CXL_PSL_ErrStat_An, errstat);
-}
-
-int cxl_ack_irq(struct cxl_context *ctx, u64 tfc, u64 psl_reset_mask)
-{
-	trace_cxl_psl_irq_ack(ctx, tfc);
-	if (tfc)
-		cxl_p2n_write(ctx->afu, CXL_PSL_TFC_An, tfc);
-	if (psl_reset_mask)
-		recover_psl_err(ctx->afu, psl_reset_mask);
-
-	return 0;
-}
-
-int cxl_check_error(struct cxl_afu *afu)
-{
-	return (cxl_p1n_read(afu, CXL_PSL_SCNTL_An) == ~0ULL);
-}
+_REG0__ACCEPT_ENTRY_13_MASK 0x2000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_13__SHIFT 0xd
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_14_MASK 0x4000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_14__SHIFT 0xe
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_15_MASK 0x8000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_15__SHIFT 0xf
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_16_MASK 0x10000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_16__SHIFT 0x10
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_17_MASK 0x20000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_17__SHIFT 0x11
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_18_MASK 0x40000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_18__SHIFT 0x12
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_19_MASK 0x80000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_19__SHIFT 0x13
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_20_MASK 0x100000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_20__SHIFT 0x14
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_21_MASK 0x200000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_21__SHIFT 0x15
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_22_MASK 0x400000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_22__SHIFT 0x16
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_23_MASK 0x800000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_23__SHIFT 0x17
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_24_MASK 0x1000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_24__SHIFT 0x18
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_25_MASK 0x2000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_25__SHIFT 0x19
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_26_MASK 0x4000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_26__SHIFT 0x1a
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_27_MASK 0x8000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_27__SHIFT 0x1b
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_28_MASK 0x10000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_28__SHIFT 0x1c
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_29_MASK 0x20000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_29__SHIFT 0x1d
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_30_MASK 0x40000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_30__SHIFT 0x1e
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_31_MASK 0x80000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG0__ACCEPT_ENTRY_31__SHIFT 0x1f
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_32_MASK 0x1
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_32__SHIFT 0x0
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_33_MASK 0x2
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_33__SHIFT 0x1
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_34_MASK 0x4
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_34__SHIFT 0x2
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_35_MASK 0x8
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_35__SHIFT 0x3
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_36_MASK 0x10
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_36__SHIFT 0x4
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_37_MASK 0x20
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_37__SHIFT 0x5
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_38_MASK 0x40
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_38__SHIFT 0x6
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_39_MASK 0x80
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_39__SHIFT 0x7
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_40_MASK 0x100
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_40__SHIFT 0x8
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_41_MASK 0x200
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_41__SHIFT 0x9
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_42_MASK 0x400
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_42__SHIFT 0xa
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_43_MASK 0x800
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_43__SHIFT 0xb
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_44_MASK 0x1000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_44__SHIFT 0xc
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_45_MASK 0x2000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_45__SHIFT 0xd
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_46_MASK 0x4000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_46__SHIFT 0xe
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_47_MASK 0x8000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_47__SHIFT 0xf
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_48_MASK 0x10000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_48__SHIFT 0x10
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_49_MASK 0x20000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_49__SHIFT 0x11
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_50_MASK 0x40000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_50__SHIFT 0x12
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_51_MASK 0x80000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_51__SHIFT 0x13
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_52_MASK 0x100000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_52__SHIFT 0x14
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_53_MASK 0x200000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_53__SHIFT 0x15
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_54_MASK 0x400000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_54__SHIFT 0x16
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_55_MASK 0x800000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_55__SHIFT 0x17
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_56_MASK 0x1000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_56__SHIFT 0x18
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_57_MASK 0x2000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_57__SHIFT 0x19
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_58_MASK 0x4000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_58__SHIFT 0x1a
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_59_MASK 0x8000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_59__SHIFT 0x1b
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_60_MASK 0x10000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_60__SHIFT 0x1c
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_61_MASK 0x20000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_61__SHIFT 0x1d
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_62_MASK 0x40000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_62__SHIFT 0x1e
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_63_MASK 0x80000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG1__ACCEPT_ENTRY_63__SHIFT 0x1f
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_64_MASK 0x1
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_64__SHIFT 0x0
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_65_MASK 0x2
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_65__SHIFT 0x1
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_66_MASK 0x4
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_66__SHIFT 0x2
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_67_MASK 0x8
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_67__SHIFT 0x3
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_68_MASK 0x10
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_68__SHIFT 0x4
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_69_MASK 0x20
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_69__SHIFT 0x5
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_70_MASK 0x40
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_70__SHIFT 0x6
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_71_MASK 0x80
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_71__SHIFT 0x7
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_72_MASK 0x100
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_72__SHIFT 0x8
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_73_MASK 0x200
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_73__SHIFT 0x9
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_74_MASK 0x400
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_74__SHIFT 0xa
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_75_MASK 0x800
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_75__SHIFT 0xb
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_76_MASK 0x1000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_76__SHIFT 0xc
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_77_MASK 0x2000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_77__SHIFT 0xd
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_78_MASK 0x4000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_78__SHIFT 0xe
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_79_MASK 0x8000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_79__SHIFT 0xf
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_80_MASK 0x10000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_80__SHIFT 0x10
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_81_MASK 0x20000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_81__SHIFT 0x11
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_82_MASK 0x40000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_82__SHIFT 0x12
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_83_MASK 0x80000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_83__SHIFT 0x13
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_84_MASK 0x100000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_84__SHIFT 0x14
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_85_MASK 0x200000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_85__SHIFT 0x15
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_86_MASK 0x400000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_86__SHIFT 0x16
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_87_MASK 0x800000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_87__SHIFT 0x17
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_88_MASK 0x1000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_88__SHIFT 0x18
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_89_MASK 0x2000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_89__SHIFT 0x19
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_90_MASK 0x4000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_90__SHIFT 0x1a
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_91_MASK 0x8000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_91__SHIFT 0x1b
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_92_MASK 0x10000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_92__SHIFT 0x1c
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_93_MASK 0x20000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_93__SHIFT 0x1d
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_94_MASK 0x40000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_94__SHIFT 0x1e
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_95_MASK 0x80000000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG2__ACCEPT_ENTRY_95__SHIFT 0x1f
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_96_MASK 0x1
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_96__SHIFT 0x0
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_97_MASK 0x2
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_97__SHIFT 0x1
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_98_MASK 0x4
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_98__SHIFT 0x2
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_99_MASK 0x8
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_99__SHIFT 0x3
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_100_MASK 0x10
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_100__SHIFT 0x4
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_101_MASK 0x20
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_101__SHIFT 0x5
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_102_MASK 0x40
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_102__SHIFT 0x6
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_103_MASK 0x80
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_103__SHIFT 0x7
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_104_MASK 0x100
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_104__SHIFT 0x8
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_105_MASK 0x200
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_105__SHIFT 0x9
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_106_MASK 0x400
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_106__SHIFT 0xa
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_107_MASK 0x800
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_107__SHIFT 0xb
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_108_MASK 0x1000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_108__SHIFT 0xc
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_109_MASK 0x2000
+#define PB1_TX_GLB_COEFF_ACCEPT_TABLE_REG3__ACCEPT_ENTRY_109__SHIFT 0xd
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DCLK_DIV_OVRD_VAL_MASK 0x7
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DCLK_DIV_OVRD_VAL__SHIFT 0x0
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DCLK_DIV_OVRD_EN_MASK 0x8
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DCLK_DIV_OVRD_EN__SHIFT 0x3
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV0_EN_GEN1_OVRD_VAL_MASK 0xf0
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV0_EN_GEN1_OVRD_VAL__SHIFT 0x4
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV0_EN_OVRD_EN_MASK 0x100
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV0_EN_OVRD_EN__SHIFT 0x8
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV0_TAP_SEL_GEN1_OVRD_VAL_MASK 0x1e00
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV0_TAP_SEL_GEN1_OVRD_VAL__SHIFT 0x9
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV0_TAP_SEL_OVRD_EN_MASK 0x2000
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV0_TAP_SEL_OVRD_EN__SHIFT 0xd
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV1_EN_GEN1_OVRD_VAL_MASK 0x7c000
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV1_EN_GEN1_OVRD_VAL__SHIFT 0xe
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV1_EN_OVRD_EN_MASK 0x80000
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV1_EN_OVRD_EN__SHIFT 0x13
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV1_TAP_SEL_GEN1_OVRD_VAL_MASK 0x1f00000
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV1_TAP_SEL_GEN1_OVRD_VAL__SHIFT 0x14
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV1_TAP_SEL_OVRD_EN_MASK 0x2000000
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV1_TAP_SEL_OVRD_EN__SHIFT 0x19
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV2_EN_GEN1_OVRD_VAL_MASK 0x3c000000
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV2_EN_GEN1_OVRD_VAL__SHIFT 0x1a
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV2_EN_OVRD_EN_MASK 0x40000000
+#define PB1_TX_GLB_OVRD_REG0__TX_CFG_DRV2_EN_OVRD_EN__SHIFT 0x1e
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRV2_TAP_SEL_GEN1_OVRD_VAL_MASK 0xf
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRV2_TAP_SEL_GEN1_OVRD_VAL__SHIFT 0x0
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRV2_TAP_SEL_OVRD_EN_MASK 0x10
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRV2_TAP_SEL_OVRD_EN__SHIFT 0x4
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRVX_EN_GEN1_OVRD_VAL_MASK 0x20
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRVX_EN_GEN1_OVRD_VAL__SHIFT 0x5
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRVX_EN_OVRD_EN_MASK 0x40
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRVX_EN_OVRD_EN__SHIFT 0x6
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRVX_TAP_SEL_GEN1_OVRD_VAL_MASK 0x80
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRVX_TAP_SEL_GEN1_OVRD_VAL__SHIFT 0x7
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRVX_TAP_SEL_OVRD_EN_MASK 0x100
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_DRVX_TAP_SEL_OVRD_EN__SHIFT 0x8
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_PLLCLK_SEL_OVRD_VAL_MASK 0x200
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_PLLCLK_SEL_OVRD_VAL__SHIFT 0x9
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_PLLCLK_SEL_OVRD_EN_MASK 0x400
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_PLLCLK_SEL_OVRD_EN__SHIFT 0xa
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_TCLK_DIV_OVRD_VAL_MASK 0x800
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_TCLK_DIV_OVRD_VAL__SHIFT 0xb
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_TCLK_DIV_OVRD_EN_MASK 0x1000
+#define PB1_TX_GLB_OVRD_REG1__TX_CFG_TCLK_DIV_OVRD_EN__SHIFT 0xc
+#define PB1_TX_GLB_OVRD_REG1__TX_CMDET_EN_OVRD_VAL_MASK 0x2000
+#define PB1_TX_GLB_OVRD_REG1__TX_CMDET_EN_OVRD_VAL__SHIFT 0xd
+#define PB1_TX_GLB_OVRD_REG1__TX_CMDET_EN_OVRD_EN_MASK 0x4000
+#define PB1_TX_GLB_OVRD_REG1__TX_CMDET_EN_OVRD_EN__SHIFT 0xe
+#define PB1_TX_GLB_OVRD_REG1__TX_DATA_IN_OVRD_VAL_MASK 0x1ff8000
+#define PB1_TX_GLB_OVRD_REG1__TX_DATA_IN_OVRD_VAL__SHIFT 0xf
+#define PB1_TX_GLB_OVRD_REG1__TX_DATA_IN_OVRD_EN_MASK 0x2000000
+#define PB1_TX_GLB_OVRD_REG1__TX_DATA_IN_OVRD_EN__SHIFT 0x19
+#define PB1_TX_GLB_OVRD_REG1__TX_RPTR_RSTN_OVRD_VAL_MASK 0x4000000
+#define PB1_TX_GLB_OVRD_REG1__TX_RPTR_RSTN_OVRD_VAL__SHIFT 0x1a
+#define PB1_TX_GLB_OVRD_REG1__TX_RPTR_RSTN_OVRD_EN_MASK 0x8000000
+#define PB1_TX_GLB_OVRD_REG1__TX_RPTR_RSTN_OVRD_EN__SHIFT 0x1b
+#define PB1_TX_GLB_OVRD_REG1__TX_RXDET_EN_OVRD_VAL_MASK 0x10000000
+#define PB1_TX_GLB_OVRD_REG1__TX_RXDET_EN_OVRD_VAL__SHIFT 0x1c
+#define PB1_TX_GLB_OVRD_REG1__TX_RXDET_EN_OVRD_EN_MASK 0x20000000
+#define PB1_TX_GLB_OVRD_REG1__TX_RXDET_EN_OVRD_EN__SHIFT 0x1d
+#define PB1_TX_GLB_OVRD_REG1__TX_WPTR_RSTN_OVRD_VAL_MASK 0x40000000
+#define PB1_TX_GLB_OVRD_REG1__TX_WPTR_RSTN_OVRD_VAL__SHIFT 0x1e
+#define PB1_TX_GLB_OVRD_REG1__TX_WPTR_RSTN_OVRD_EN_MASK 0x80000000
+#define PB1_TX_GLB_OVRD_REG1__TX_WPTR_RSTN_OVRD_EN__SHIFT 0x1f
+#define PB1_TX_GLB_OVRD_REG2__TX_WRITE_EN_OVRD_VAL_MASK 0x1
+#define PB1_TX_GLB_OVRD_REG2__TX_WRITE_EN_OVRD_VAL__SHIFT 0x0
+#define PB1_TX_GLB_OVRD_REG2__TX_WRITE_EN_OVRD_EN_MASK 0x2
+#define PB1_TX_GLB_OVRD_REG2__TX_WRITE_EN_OVRD_EN__SHIFT 0x1
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX1_EN_OVRD_VAL_MASK 0x4
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX1_EN_OVRD_VAL__SHIFT 0x2
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX1_EN_OVRD_EN_MASK 0x8
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX1_EN_OVRD_EN__SHIFT 0x3
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX2_EN_OVRD_VAL_MASK 0x10
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX2_EN_OVRD_VAL__SHIFT 0x4
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX2_EN_OVRD_EN_MASK 0x20
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX2_EN_OVRD_EN__SHIFT 0x5
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX4_EN_OVRD_VAL_MASK 0x40
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX4_EN_OVRD_VAL__SHIFT 0x6
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX4_EN_OVRD_EN_MASK 0x80
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX4_EN_OVRD_EN__SHIFT 0x7
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX8_EN_OVRD_VAL_MASK 0x100
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX8_EN_OVRD_VAL__SHIFT 0x8
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX8_EN_OVRD_EN_MASK 0x200
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX8_EN_OVRD_EN__SHIFT 0x9
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX16_EN_OVRD_VAL_MASK 0x400
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX16_EN_OVRD_VAL__SHIFT 0xa
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX16_EN_OVRD_EN_MASK 0x800
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_GROUPX16_EN_OVRD_EN__SHIFT 0xb
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_DRV0_EN_GEN2_OVRD_VAL_MASK 0xf000
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_DRV0_EN_GEN2_OVRD_VAL__SHIFT 0xc
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_DRV0_TAP_SEL_GEN2_OVRD_VAL_MASK 0xf0000
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_DRV0_TAP_SEL_GEN2_OVRD_VAL__SHIFT 0x10
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_DRV1_EN_GEN2_OVRD_VAL_MASK 0x1f00000
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_DRV1_EN_GEN2_OVRD_VAL__SHIFT 0x14
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_DRV1_TAP_SEL_GEN2_OVRD_VAL_MASK 0x3e000000
+#define PB1_TX_GLB_OVRD_REG2__TX_CFG_DRV1_TAP_SEL_GEN2_OVRD_VAL__SHIFT 0x19
+#define PB1_TX_GLB_OVRD_REG3__TX_CFG_DRV2_EN_GEN2_OVRD_VAL_MASK 0xf
+#define PB1_TX_GLB_OVRD_REG3__TX_CFG_DRV2_EN_GEN2_OVRD_VAL__SHIFT 0x0
+#define PB1_TX_GLB_OVRD_REG3__TX_CFG_DRV2_TAP_SEL_GEN2_OVRD_VAL_MASK 0xf0
+#define PB1_TX_GLB_OVRD_REG3__TX_CFG_DRV2_TAP_SEL_GEN2_OVRD_VAL__SHIFT 0x4
+#define PB1_TX_GLB_OVRD_REG3__TX_CFG_DRVX_EN_GEN2_OVRD

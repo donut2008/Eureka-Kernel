@@ -1,436 +1,357 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2013-2014, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
+PACE_LOCK_ENABLE	0x28
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/errno.h>
-#include <linux/types.h>
-#include <linux/pci.h>
-#include <linux/init.h>
-#include <linux/sched.h>
-#include <linux/uuid.h>
-#include <linux/jiffies.h>
-#include <linux/interrupt.h>
-#include <linux/workqueue.h>
-#include <linux/pm_runtime.h>
+static const u16 NCT6791_REG_WEIGHT_TEMP_SEL[6] = { 0, 0x239 };
+static const u16 NCT6791_REG_WEIGHT_TEMP_STEP[6] = { 0, 0x23a };
+static const u16 NCT6791_REG_WEIGHT_TEMP_STEP_TOL[6] = { 0, 0x23b };
+static const u16 NCT6791_REG_WEIGHT_DUTY_STEP[6] = { 0, 0x23c };
+static const u16 NCT6791_REG_WEIGHT_TEMP_BASE[6] = { 0, 0x23d };
+static const u16 NCT6791_REG_WEIGHT_DUTY_BASE[6] = { 0, 0x23e };
 
-#include <linux/mei.h>
+static const u16 NCT6791_REG_ALARM[NUM_REG_ALARM] = {
+	0x459, 0x45A, 0x45B, 0x568, 0x45D };
 
+static const s8 NCT6791_ALARM_BITS[] = {
+	0, 1, 2, 3, 8, 21, 20, 16,	/* in0.. in7 */
+	17, 24, 25, 26, 27, 28, 29,	/* in8..in14 */
+	-1,				/* unused */
+	6, 7, 11, 10, 23, 33,		/* fan1..fan6 */
+	-1, -1,				/* unused */
+	4, 5, 13, -1, -1, -1,		/* temp1..temp6 */
+	12, 9 };			/* intrusion0, intrusion1 */
 
-#include "mei_dev.h"
-#include "hw-txe.h"
+/* NCT6792/NCT6793 specific data */
 
-static const struct pci_device_id mei_txe_pci_tbl[] = {
-	{PCI_VDEVICE(INTEL, 0x0F18)}, /* Baytrail */
-	{PCI_VDEVICE(INTEL, 0x2298)}, /* Cherrytrail */
+static const u16 NCT6792_REG_TEMP_MON[] = {
+	0x73, 0x75, 0x77, 0x79, 0x7b, 0x7d };
+static const u16 NCT6792_REG_BEEP[NUM_REG_BEEP] = {
+	0xb2, 0xb3, 0xb4, 0xb5, 0xbf };
 
-	{0, }
+static const char *const nct6792_temp_label[] = {
+	"",
+	"SYSTIN",
+	"CPUTIN",
+	"AUXTIN0",
+	"AUXTIN1",
+	"AUXTIN2",
+	"AUXTIN3",
+	"",
+	"SMBUSMASTER 0",
+	"SMBUSMASTER 1",
+	"SMBUSMASTER 2",
+	"SMBUSMASTER 3",
+	"SMBUSMASTER 4",
+	"SMBUSMASTER 5",
+	"SMBUSMASTER 6",
+	"SMBUSMASTER 7",
+	"PECI Agent 0",
+	"PECI Agent 1",
+	"PCH_CHIP_CPU_MAX_TEMP",
+	"PCH_CHIP_TEMP",
+	"PCH_CPU_TEMP",
+	"PCH_MCH_TEMP",
+	"PCH_DIM0_TEMP",
+	"PCH_DIM1_TEMP",
+	"PCH_DIM2_TEMP",
+	"PCH_DIM3_TEMP",
+	"BYTE_TEMP",
+	"PECI Agent 0 Calibration",
+	"PECI Agent 1 Calibration",
+	"",
+	"",
+	"Virtual_TEMP"
 };
-MODULE_DEVICE_TABLE(pci, mei_txe_pci_tbl);
 
-#ifdef CONFIG_PM
-static inline void mei_txe_set_pm_domain(struct mei_device *dev);
-static inline void mei_txe_unset_pm_domain(struct mei_device *dev);
-#else
-static inline void mei_txe_set_pm_domain(struct mei_device *dev) {}
-static inline void mei_txe_unset_pm_domain(struct mei_device *dev) {}
-#endif /* CONFIG_PM */
+static const char *const nct6793_temp_label[] = {
+	"",
+	"SYSTIN",
+	"CPUTIN",
+	"AUXTIN0",
+	"AUXTIN1",
+	"AUXTIN2",
+	"AUXTIN3",
+	"",
+	"SMBUSMASTER 0",
+	"SMBUSMASTER 1",
+	"",
+	"",
+	"",
+	"",
+	"",
+	"",
+	"PECI Agent 0",
+	"PECI Agent 1",
+	"PCH_CHIP_CPU_MAX_TEMP",
+	"PCH_CHIP_TEMP",
+	"PCH_CPU_TEMP",
+	"PCH_MCH_TEMP",
+	"Agent0 Dimm0 ",
+	"Agent0 Dimm1",
+	"Agent1 Dimm0",
+	"Agent1 Dimm1",
+	"BYTE_TEMP0",
+	"BYTE_TEMP1",
+	"PECI Agent 0 Calibration",
+	"PECI Agent 1 Calibration",
+	"",
+	"Virtual_TEMP"
+};
 
-static void mei_txe_pci_iounmap(struct pci_dev *pdev, struct mei_txe_hw *hw)
+/* NCT6102D/NCT6106D specific data */
+
+#define NCT6106_REG_VBAT	0x318
+#define NCT6106_REG_DIODE	0x319
+#define NCT6106_DIODE_MASK	0x01
+
+static const u16 NCT6106_REG_IN_MAX[] = {
+	0x90, 0x92, 0x94, 0x96, 0x98, 0x9a, 0x9e, 0xa0, 0xa2 };
+static const u16 NCT6106_REG_IN_MIN[] = {
+	0x91, 0x93, 0x95, 0x97, 0x99, 0x9b, 0x9f, 0xa1, 0xa3 };
+static const u16 NCT6106_REG_IN[] = {
+	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x07, 0x08, 0x09 };
+
+static const u16 NCT6106_REG_TEMP[] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15 };
+static const u16 NCT6106_REG_TEMP_MON[] = { 0x18, 0x19, 0x1a };
+static const u16 NCT6106_REG_TEMP_HYST[] = {
+	0xc3, 0xc7, 0xcb, 0xcf, 0xd3, 0xd7 };
+static const u16 NCT6106_REG_TEMP_OVER[] = {
+	0xc2, 0xc6, 0xca, 0xce, 0xd2, 0xd6 };
+static const u16 NCT6106_REG_TEMP_CRIT_L[] = {
+	0xc0, 0xc4, 0xc8, 0xcc, 0xd0, 0xd4 };
+static const u16 NCT6106_REG_TEMP_CRIT_H[] = {
+	0xc1, 0xc5, 0xc9, 0xcf, 0xd1, 0xd5 };
+static const u16 NCT6106_REG_TEMP_OFFSET[] = { 0x311, 0x312, 0x313 };
+static const u16 NCT6106_REG_TEMP_CONFIG[] = {
+	0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc };
+
+static const u16 NCT6106_REG_FAN[] = { 0x20, 0x22, 0x24 };
+static const u16 NCT6106_REG_FAN_MIN[] = { 0xe0, 0xe2, 0xe4 };
+static const u16 NCT6106_REG_FAN_PULSES[] = { 0xf6, 0xf6, 0xf6, 0, 0 };
+static const u16 NCT6106_FAN_PULSE_SHIFT[] = { 0, 2, 4, 0, 0 };
+
+static const u8 NCT6106_REG_PWM_MODE[] = { 0xf3, 0xf3, 0xf3 };
+static const u8 NCT6106_PWM_MODE_MASK[] = { 0x01, 0x02, 0x04 };
+static const u16 NCT6106_REG_PWM[] = { 0x119, 0x129, 0x139 };
+static const u16 NCT6106_REG_PWM_READ[] = { 0x4a, 0x4b, 0x4c };
+static const u16 NCT6106_REG_FAN_MODE[] = { 0x113, 0x123, 0x133 };
+static const u16 NCT6106_REG_TEMP_SEL[] = { 0x110, 0x120, 0x130 };
+static const u16 NCT6106_REG_TEMP_SOURCE[] = {
+	0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5 };
+
+static const u16 NCT6106_REG_CRITICAL_TEMP[] = { 0x11a, 0x12a, 0x13a };
+static const u16 NCT6106_REG_CRITICAL_TEMP_TOLERANCE[] = {
+	0x11b, 0x12b, 0x13b };
+
+static const u16 NCT6106_REG_CRITICAL_PWM_ENABLE[] = { 0x11c, 0x12c, 0x13c };
+#define NCT6106_CRITICAL_PWM_ENABLE_MASK	0x10
+static const u16 NCT6106_REG_CRITICAL_PWM[] = { 0x11d, 0x12d, 0x13d };
+
+static const u16 NCT6106_REG_FAN_STEP_UP_TIME[] = { 0x114, 0x124, 0x134 };
+static const u16 NCT6106_REG_FAN_STEP_DOWN_TIME[] = { 0x115, 0x125, 0x135 };
+static const u16 NCT6106_REG_FAN_STOP_OUTPUT[] = { 0x116, 0x126, 0x136 };
+static const u16 NCT6106_REG_FAN_START_OUTPUT[] = { 0x117, 0x127, 0x137 };
+static const u16 NCT6106_REG_FAN_STOP_TIME[] = { 0x118, 0x128, 0x138 };
+static const u16 NCT6106_REG_TOLERANCE_H[] = { 0x112, 0x122, 0x132 };
+
+static const u16 NCT6106_REG_TARGET[] = { 0x111, 0x121, 0x131 };
+
+static const u16 NCT6106_REG_WEIGHT_TEMP_SEL[] = { 0x168, 0x178, 0x188 };
+static const u16 NCT6106_REG_WEIGHT_TEMP_STEP[] = { 0x169, 0x179, 0x189 };
+static const u16 NCT6106_REG_WEIGHT_TEMP_STEP_TOL[] = { 0x16a, 0x17a, 0x18a };
+static const u16 NCT6106_REG_WEIGHT_DUTY_STEP[] = { 0x16b, 0x17b, 0x18b };
+static const u16 NCT6106_REG_WEIGHT_TEMP_BASE[] = { 0x16c, 0x17c, 0x18c };
+static const u16 NCT6106_REG_WEIGHT_DUTY_BASE[] = { 0x16d, 0x17d, 0x18d };
+
+static const u16 NCT6106_REG_AUTO_TEMP[] = { 0x160, 0x170, 0x180 };
+static const u16 NCT6106_REG_AUTO_PWM[] = { 0x164, 0x174, 0x184 };
+
+static const u16 NCT6106_REG_ALARM[NUM_REG_ALARM] = {
+	0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d };
+
+static const s8 NCT6106_ALARM_BITS[] = {
+	0, 1, 2, 3, 4, 5, 7, 8,		/* in0.. in7 */
+	9, -1, -1, -1, -1, -1, -1,	/* in8..in14 */
+	-1,				/* unused */
+	32, 33, 34, -1, -1,		/* fan1..fan5 */
+	-1, -1, -1,			/* unused */
+	16, 17, 18, 19, 20, 21,		/* temp1..temp6 */
+	48, -1				/* intrusion0, intrusion1 */
+};
+
+static const u16 NCT6106_REG_BEEP[NUM_REG_BEEP] = {
+	0x3c0, 0x3c1, 0x3c2, 0x3c3, 0x3c4 };
+
+static const s8 NCT6106_BEEP_BITS[] = {
+	0, 1, 2, 3, 4, 5, 7, 8,		/* in0.. in7 */
+	9, 10, 11, 12, -1, -1, -1,	/* in8..in14 */
+	32,				/* global beep enable */
+	24, 25, 26, 27, 28,		/* fan1..fan5 */
+	-1, -1, -1,			/* unused */
+	16, 17, 18, 19, 20, 21,		/* temp1..temp6 */
+	34, -1				/* intrusion0, intrusion1 */
+};
+
+static const u16 NCT6106_REG_TEMP_ALTERNATE[ARRAY_SIZE(nct6776_temp_label) - 1]
+	= { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x51, 0x52, 0x54 };
+
+static const u16 NCT6106_REG_TEMP_CRIT[ARRAY_SIZE(nct6776_temp_label) - 1]
+	= { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x204, 0x205 };
+
+static enum pwm_enable reg_to_pwm_enable(int pwm, int mode)
 {
-	int i;
-
-	for (i = SEC_BAR; i < NUM_OF_MEM_BARS; i++) {
-		if (hw->mem_addr[i]) {
-			pci_iounmap(pdev, hw->mem_addr[i]);
-			hw->mem_addr[i] = NULL;
-		}
-	}
+	if (mode == 0 && pwm == 255)
+		return off;
+	return mode + 1;
 }
-/**
- * mei_txe_probe - Device Initialization Routine
- *
- * @pdev: PCI device structure
- * @ent: entry in mei_txe_pci_tbl
- *
- * Return: 0 on success, <0 on failure.
- */
-static int mei_txe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+
+static int pwm_enable_to_reg(enum pwm_enable mode)
 {
-	struct mei_device *dev;
-	struct mei_txe_hw *hw;
-	int err;
-	int i;
+	if (mode == off)
+		return 0;
+	return mode - 1;
+}
 
-	/* enable pci dev */
-	err = pci_enable_device(pdev);
-	if (err) {
-		dev_err(&pdev->dev, "failed to enable pci device.\n");
-		goto end;
-	}
-	/* set PCI host mastering  */
-	pci_set_master(pdev);
-	/* pci request regions for mei driver */
-	err = pci_request_regions(pdev, KBUILD_MODNAME);
-	if (err) {
-		dev_err(&pdev->dev, "failed to get pci regions.\n");
-		goto disable_device;
-	}
+/*
+ * Conversions
+ */
 
-	err = pci_set_dma_mask(pdev, DMA_BIT_MASK(36));
-	if (err) {
-		err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
-		if (err) {
-			dev_err(&pdev->dev, "No suitable DMA available.\n");
-			goto release_regions;
-		}
-	}
+/* 1 is DC mode, output in ms */
+static unsigned int step_time_from_reg(u8 reg, u8 mode)
+{
+	return mode ? 400 * reg : 100 * reg;
+}
 
-	/* allocates and initializes the mei dev structure */
-	dev = mei_txe_dev_init(pdev);
-	if (!dev) {
-		err = -ENOMEM;
-		goto release_regions;
-	}
-	hw = to_txe_hw(dev);
+static u8 step_time_to_reg(unsigned int msec, u8 mode)
+{
+	return clamp_val((mode ? (msec + 200) / 400 :
+					(msec + 50) / 100), 1, 255);
+}
 
-	/* mapping  IO device memory */
-	for (i = SEC_BAR; i < NUM_OF_MEM_BARS; i++) {
-		hw->mem_addr[i] = pci_iomap(pdev, i, 0);
-		if (!hw->mem_addr[i]) {
-			dev_err(&pdev->dev, "mapping I/O device memory failure.\n");
-			err = -ENOMEM;
-			goto free_device;
-		}
-	}
+static unsigned int fan_from_reg8(u16 reg, unsigned int divreg)
+{
+	if (reg == 0 || reg == 255)
+		return 0;
+	return 1350000U / (reg << divreg);
+}
 
+static unsigned int fan_from_reg13(u16 reg, unsigned int divreg)
+{
+	if ((reg & 0xff1f) == 0xff1f)
+		return 0;
 
-	pci_enable_msi(pdev);
+	reg = (reg & 0x1f) | ((reg & 0xff00) >> 3);
 
-	/* clear spurious interrupts */
-	mei_clear_interrupts(dev);
+	if (reg == 0)
+		return 0;
 
-	/* request and enable interrupt  */
-	if (pci_dev_msi_enabled(pdev))
-		err = request_threaded_irq(pdev->irq,
-			NULL,
-			mei_txe_irq_thread_handler,
-			IRQF_ONESHOT, KBUILD_MODNAME, dev);
-	else
-		err = request_threaded_irq(pdev->irq,
-			mei_txe_irq_quick_handler,
-			mei_txe_irq_thread_handler,
-			IRQF_SHARED, KBUILD_MODNAME, dev);
-	if (err) {
-		dev_err(&pdev->dev, "mei: request_threaded_irq failure. irq = %d\n",
-			pdev->irq);
-		goto free_device;
-	}
+	return 1350000U / reg;
+}
 
-	if (mei_start(dev)) {
-		dev_err(&pdev->dev, "init hw failure.\n");
-		err = -ENODEV;
-		goto release_irq;
-	}
-
-	pm_runtime_set_autosuspend_delay(&pdev->dev, MEI_TXI_RPM_TIMEOUT);
-	pm_runtime_use_autosuspend(&pdev->dev);
-
-	err = mei_register(dev, &pdev->dev);
-	if (err)
-		goto release_irq;
-
-	pci_set_drvdata(pdev, dev);
+static unsigned int fan_from_reg16(u16 reg, unsigned int divreg)
+{
+	if (reg == 0 || reg == 0xffff)
+		return 0;
 
 	/*
-	* For not wake-able HW runtime pm framework
-	* can't be used on pci device level.
-	* Use domain runtime pm callbacks instead.
-	*/
-	if (!pci_dev_run_wake(pdev))
-		mei_txe_set_pm_domain(dev);
-
-	pm_runtime_put_noidle(&pdev->dev);
-
-	return 0;
-
-release_irq:
-
-	mei_cancel_work(dev);
-
-	/* disable interrupts */
-	mei_disable_interrupts(dev);
-
-	free_irq(pdev->irq, dev);
-	pci_disable_msi(pdev);
-
-free_device:
-	mei_txe_pci_iounmap(pdev, hw);
-
-	kfree(dev);
-release_regions:
-	pci_release_regions(pdev);
-disable_device:
-	pci_disable_device(pdev);
-end:
-	dev_err(&pdev->dev, "initialization failed.\n");
-	return err;
-}
-
-/**
- * mei_txe_remove - Device Removal Routine
- *
- * @pdev: PCI device structure
- *
- * mei_remove is called by the PCI subsystem to alert the driver
- * that it should release a PCI device.
- */
-static void mei_txe_remove(struct pci_dev *pdev)
-{
-	struct mei_device *dev;
-	struct mei_txe_hw *hw;
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev) {
-		dev_err(&pdev->dev, "mei: dev =NULL\n");
-		return;
-	}
-
-	pm_runtime_get_noresume(&pdev->dev);
-
-	hw = to_txe_hw(dev);
-
-	mei_stop(dev);
-
-	if (!pci_dev_run_wake(pdev))
-		mei_txe_unset_pm_domain(dev);
-
-	/* disable interrupts */
-	mei_disable_interrupts(dev);
-	free_irq(pdev->irq, dev);
-	pci_disable_msi(pdev);
-
-	pci_set_drvdata(pdev, NULL);
-
-	mei_txe_pci_iounmap(pdev, hw);
-
-	mei_deregister(dev);
-
-	kfree(dev);
-
-	pci_release_regions(pdev);
-	pci_disable_device(pdev);
-}
-
-
-#ifdef CONFIG_PM_SLEEP
-static int mei_txe_pci_suspend(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev = pci_get_drvdata(pdev);
-
-	if (!dev)
-		return -ENODEV;
-
-	dev_dbg(&pdev->dev, "suspend\n");
-
-	mei_stop(dev);
-
-	mei_disable_interrupts(dev);
-
-	free_irq(pdev->irq, dev);
-	pci_disable_msi(pdev);
-
-	return 0;
-}
-
-static int mei_txe_pci_resume(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
-	int err;
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
-
-	pci_enable_msi(pdev);
-
-	mei_clear_interrupts(dev);
-
-	/* request and enable interrupt */
-	if (pci_dev_msi_enabled(pdev))
-		err = request_threaded_irq(pdev->irq,
-			NULL,
-			mei_txe_irq_thread_handler,
-			IRQF_ONESHOT, KBUILD_MODNAME, dev);
-	else
-		err = request_threaded_irq(pdev->irq,
-			mei_txe_irq_quick_handler,
-			mei_txe_irq_thread_handler,
-			IRQF_SHARED, KBUILD_MODNAME, dev);
-	if (err) {
-		dev_err(&pdev->dev, "request_threaded_irq failed: irq = %d.\n",
-				pdev->irq);
-		return err;
-	}
-
-	err = mei_restart(dev);
-
-	return err;
-}
-#endif /* CONFIG_PM_SLEEP */
-
-#ifdef CONFIG_PM
-static int mei_txe_pm_runtime_idle(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
-
-	dev_dbg(&pdev->dev, "rpm: txe: runtime_idle\n");
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
-	if (mei_write_is_idle(dev))
-		pm_runtime_autosuspend(device);
-
-	return -EBUSY;
-}
-static int mei_txe_pm_runtime_suspend(struct device *device)
-{
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
-	int ret;
-
-	dev_dbg(&pdev->dev, "rpm: txe: runtime suspend\n");
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
-
-	mutex_lock(&dev->device_lock);
-
-	if (mei_write_is_idle(dev))
-		ret = mei_txe_aliveness_set_sync(dev, 0);
-	else
-		ret = -EAGAIN;
-
-	/*
-	 * If everything is okay we're about to enter PCI low
-	 * power state (D3) therefor we need to disable the
-	 * interrupts towards host.
-	 * However if device is not wakeable we do not enter
-	 * D-low state and we need to keep the interrupt kicking
+	 * Even though the registers are 16 bit wide, the fan divisor
+	 * still applies.
 	 */
-	if (!ret && pci_dev_run_wake(pdev))
-		mei_disable_interrupts(dev);
-
-	dev_dbg(&pdev->dev, "rpm: txe: runtime suspend ret=%d\n", ret);
-
-	mutex_unlock(&dev->device_lock);
-	return ret;
+	return 1350000U / (reg << divreg);
 }
 
-static int mei_txe_pm_runtime_resume(struct device *device)
+static u16 fan_to_reg(u32 fan, unsigned int divreg)
 {
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
-	int ret;
+	if (!fan)
+		return 0;
 
-	dev_dbg(&pdev->dev, "rpm: txe: runtime resume\n");
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
-
-	mutex_lock(&dev->device_lock);
-
-	mei_enable_interrupts(dev);
-
-	ret = mei_txe_aliveness_set_sync(dev, 1);
-
-	mutex_unlock(&dev->device_lock);
-
-	dev_dbg(&pdev->dev, "rpm: txe: runtime resume ret = %d\n", ret);
-
-	return ret;
+	return (1350000U / fan) >> divreg;
 }
 
-/**
- * mei_txe_set_pm_domain - fill and set pm domain structure for device
- *
- * @dev: mei_device
- */
-static inline void mei_txe_set_pm_domain(struct mei_device *dev)
+static inline unsigned int
+div_from_reg(u8 reg)
 {
-	struct pci_dev *pdev  = to_pci_dev(dev->dev);
-
-	if (pdev->dev.bus && pdev->dev.bus->pm) {
-		dev->pg_domain.ops = *pdev->dev.bus->pm;
-
-		dev->pg_domain.ops.runtime_suspend = mei_txe_pm_runtime_suspend;
-		dev->pg_domain.ops.runtime_resume = mei_txe_pm_runtime_resume;
-		dev->pg_domain.ops.runtime_idle = mei_txe_pm_runtime_idle;
-
-		pdev->dev.pm_domain = &dev->pg_domain;
-	}
+	return 1 << reg;
 }
-
-/**
- * mei_txe_unset_pm_domain - clean pm domain structure for device
- *
- * @dev: mei_device
- */
-static inline void mei_txe_unset_pm_domain(struct mei_device *dev)
-{
-	/* stop using pm callbacks if any */
-	dev->dev->pm_domain = NULL;
-}
-
-static const struct dev_pm_ops mei_txe_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(mei_txe_pci_suspend,
-				mei_txe_pci_resume)
-	SET_RUNTIME_PM_OPS(
-		mei_txe_pm_runtime_suspend,
-		mei_txe_pm_runtime_resume,
-		mei_txe_pm_runtime_idle)
-};
-
-#define MEI_TXE_PM_OPS	(&mei_txe_pm_ops)
-#else
-#define MEI_TXE_PM_OPS	NULL
-#endif /* CONFIG_PM */
 
 /*
- *  PCI driver structure
+ * Some of the voltage inputs have internal scaling, the tables below
+ * contain 8 (the ADC LSB in mV) * scaling factor * 100
  */
-static struct pci_driver mei_txe_driver = {
-	.name = KBUILD_MODNAME,
-	.id_table = mei_txe_pci_tbl,
-	.probe = mei_txe_probe,
-	.remove = mei_txe_remove,
-	.shutdown = mei_txe_remove,
-	.driver.pm = MEI_TXE_PM_OPS,
+static const u16 scale_in[15] = {
+	800, 800, 1600, 1600, 800, 800, 800, 1600, 1600, 800, 800, 800, 800,
+	800, 800
 };
 
-module_pci_driver(mei_txe_driver);
+static inline long in_from_reg(u8 reg, u8 nr)
+{
+	return DIV_ROUND_CLOSEST(reg * scale_in[nr], 100);
+}
 
-MODULE_AUTHOR("Intel Corporation");
-MODULE_DESCRIPTION("Intel(R) Trusted Execution Environment Interface");
-MODULE_LICENSE("GPL v2");
+static inline u8 in_to_reg(u32 val, u8 nr)
+{
+	return clamp_val(DIV_ROUND_CLOSEST(val * 100, scale_in[nr]), 0, 255);
+}
+
+/*
+ * Data structures and manipulation thereof
+ */
+
+struct nct6775_data {
+	int addr;	/* IO base of hw monitor block */
+	int sioreg;	/* SIO register address */
+	enum kinds kind;
+	const char *name;
+
+	const struct attribute_group *groups[6];
+
+	u16 reg_temp[5][NUM_TEMP]; /* 0=temp, 1=temp_over, 2=temp_hyst,
+				    * 3=temp_crit, 4=temp_lcrit
+				    */
+	u8 temp_src[NUM_TEMP];
+	u16 reg_temp_config[NUM_TEMP];
+	const char * const *temp_label;
+	int temp_label_num;
+
+	u16 REG_CONFIG;
+	u16 REG_VBAT;
+	u16 REG_DIODE;
+	u8 DIODE_MASK;
+
+	const s8 *ALARM_BITS;
+	const s8 *BEEP_BITS;
+
+	const u16 *REG_VIN;
+	const u16 *REG_IN_MINMAX[2];
+
+	const u16 *REG_TARGET;
+	const u16 *REG_FAN;
+	const u16 *REG_FAN_MODE;
+	const u16 *REG_FAN_MIN;
+	const u16 *REG_FAN_PULSES;
+	const u16 *FAN_PULSE_SHIFT;
+	const u16 *REG_FAN_TIME[3];
+
+	const u16 *REG_TOLERANCE_H;
+
+	const u8 *REG_PWM_MODE;
+	const u8 *PWM_MODE_MASK;
+
+	const u16 *REG_PWM[7];	/* [0]=pwm, [1]=pwm_start, [2]=pwm_floor,
+				 * [3]=pwm_max, [4]=pwm_step,
+				 * [5]=weight_duty_step, [6]=weight_duty_base
+				 */
+	const u16 *REG_PWM_READ;
+
+	const u16 *REG_CRITICAL_PWM_ENABLE;
+	u8 CRITICAL_PWM_ENABLE_MASK;
+	const u16 *REG_CRITICAL_PWM;
+
+	const u16 *REG_AUTO_TEMP;
+	const u16 *REG_AUTO_PWM;
+
+	const u16 *REG_CRITICAL_TEMP;
+	const u16 *REG_CRITICAL_TEMP_TOLERANCE;
+
+	const u16 *REG_TEMP_SOURCE;	/* temp register sources */
+	const u16 *REG_TEMP_SEL;
+	const u16 *REG_WEIGHT_TEMP_SEL;
+	const u16 *REG_WEIGHT_TEMP[3];	/* 0=base, 1=toler

@@ -1,30 +1,17 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#ifndef _VMCI_ROUTE_H_
-#define _VMCI_ROUTE_H_
-
-#include <linux/vmw_vmci_defs.h>
-
-enum vmci_route {
-	VMCI_ROUTE_NONE,
-	VMCI_ROUTE_AS_HOST,
-	VMCI_ROUTE_AS_GUEST,
-};
-
-int vmci_route(struct vmci_handle *src, const struct vmci_handle *dst,
-	       bool from_guest, enum vmci_route *route);
-
-#endif /* _VMCI_ROUTE_H_ */
+SK 0x2
+#define PCIE_ARI_CAP__ARI_ACS_FUNC_GROUPS_CAP__SHIFT 0x1
+#define PCIE_ARI_CAP__ARI_NEXT_FUNC_NUM_MASK 0xff00
+#define PCIE_ARI_CAP__ARI_NEXT_FUNC_NUM__SHIFT 0x8
+#define PCIE_ARI_CNTL__ARI_MFVC_FUNC_GROUPS_EN_MASK 0x1
+#define PCIE_ARI_CNTL__ARI_MFVC_FUNC_GROUPS_EN__SHIFT 0x0
+#define PCIE_ARI_CNTL__ARI_ACS_FUNC_GROUPS_EN_MASK 0x2
+#define PCIE_ARI_CNTL__ARI_ACS_FUNC_GROUPS_EN__SHIFT 0x1
+#define PCIE_ARI_CNTL__ARI_FUNCTION_GROUP_MASK 0x70
+#define PCIE_ARI_CNTL__ARI_FUNCTION_GROUP__SHIFT 0x4
+#define PCIE_SRIOV_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_SRIOV_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_SRIOV_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_SRIOV_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_SRIOV_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_SRIOV_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_SRIOV_CAP__SRIOV_VF_MIGRATION_

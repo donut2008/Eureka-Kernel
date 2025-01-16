@@ -1,120 +1,52 @@
-/*
- * Copyright (C) 2014 Samsung Electronics Co.Ltd
- * http://www.samsung.com
- *
- * MCU IPC driver
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
-*/
-
-#ifndef MCU_IPC_H
-#define MCU_IPC_H
-
-/* FIXME: will be removed */
-/* Shared register with 64 * 32 words */
-#define MAX_MBOX_NUM	64
-
-enum mcu_ipc_region {
-	MCU_CP,
-	MCU_GNSS,
-	MCU_MAX,
-};
-
-struct mcu_ipc_ipc_handler {
-	void *data;
-	void (*handler)(void *);
-};
-
-struct mcu_ipc_drv_data {
-	char *name;
-	u32 id;
-
-	void __iomem *ioaddr;
-	u32 registered_irq;
-	unsigned long unmasked_irq;
-
-	/**
-	 * irq affinity cpu mask
-	 */
-	cpumask_var_t dmask;	/* default cpu mask */
-	cpumask_var_t imask;	/* irq affinity cpu mask */
-
-	struct device *mcu_ipc_dev;
-	struct mcu_ipc_ipc_handler hd[16];
-	spinlock_t lock;
-	spinlock_t reg_lock;
-
-};
-
-static struct mcu_ipc_drv_data mcu_dat[MCU_MAX];
-
-static inline void mcu_ipc_writel(enum mcu_ipc_region id, u32 val, long reg)
-{
-	writel(val, mcu_dat[id].ioaddr + reg);
-}
-
-static inline u32 mcu_ipc_readl(enum mcu_ipc_region id, long reg)
-{
-	return readl(mcu_dat[id].ioaddr + reg);
-}
-
-#ifdef CONFIG_ARGOS
-/* kernel team needs to provide argos header file. !!!
- * As of now, there's nothing to use. */
-#ifdef CONFIG_SCHED_HMP
-extern struct cpumask hmp_slow_cpu_mask;
-extern struct cpumask hmp_fast_cpu_mask;
-
-static inline struct cpumask *get_default_cpu_mask(void)
-{
-	return &hmp_slow_cpu_mask;
-}
-#else
-static inline struct cpumask *get_default_cpu_mask(void)
-{
-	return cpu_all_mask;
-}
-#endif
-
-int argos_irq_affinity_setup_label(unsigned int irq, const char *label,
-		struct cpumask *affinity_cpu_mask,
-		struct cpumask *default_cpu_mask);
-int argos_task_affinity_setup_label(struct task_struct *p, const char *label,
-		struct cpumask *affinity_cpu_mask,
-		struct cpumask *default_cpu_mask);
-#endif
-
-#define mcu_dt_read_enum(np, prop, dest) \
-	do { \
-		u32 val; \
-		if (of_property_read_u32(np, prop, &val)) \
-			return -EINVAL; \
-		dest = (__typeof__(dest))(val); \
-	} while (0)
-
-#define mcu_dt_read_bool(np, prop, dest) \
-	do { \
-		u32 val; \
-		if (of_property_read_u32(np, prop, &val)) \
-			return -EINVAL; \
-		dest = val ? true : false; \
-	} while (0)
-
-#define mcu_dt_read_string(np, prop, dest) \
-	do { \
-		if (of_property_read_string(np, prop, \
-				(const char **)&dest)) \
-			return -EINVAL; \
-	} while (0)
-
-#define mcu_dt_read_u32(np, prop, dest) \
-	do { \
-		u32 val; \
-		if (of_property_read_u32(np, prop, &val)) \
-			return -EINVAL; \
-		dest = val; \
-	} while (0)
-#endif
+RRUPT_CNTL__IH_REQ_NONSNOOP_EN_MASK 0x8
+#define INTERRUPT_CNTL__IH_REQ_NONSNOOP_EN__SHIFT 0x3
+#define INTERRUPT_CNTL__IH_INTR_DLY_CNTR_MASK 0xf0
+#define INTERRUPT_CNTL__IH_INTR_DLY_CNTR__SHIFT 0x4
+#define INTERRUPT_CNTL__GEN_IH_INT_EN_MASK 0x100
+#define INTERRUPT_CNTL__GEN_IH_INT_EN__SHIFT 0x8
+#define INTERRUPT_CNTL__GEN_GPIO_INT_EN_MASK 0x1e00
+#define INTERRUPT_CNTL__GEN_GPIO_INT_EN__SHIFT 0x9
+#define INTERRUPT_CNTL__SELECT_INT_GPIO_OUTPUT_MASK 0x6000
+#define INTERRUPT_CNTL__SELECT_INT_GPIO_OUTPUT__SHIFT 0xd
+#define INTERRUPT_CNTL2__IH_DUMMY_RD_ADDR_MASK 0xffffffff
+#define INTERRUPT_CNTL2__IH_DUMMY_RD_ADDR__SHIFT 0x0
+#define BIF_DEBUG_CNTL__DEBUG_EN_MASK 0x1
+#define BIF_DEBUG_CNTL__DEBUG_EN__SHIFT 0x0
+#define BIF_DEBUG_CNTL__DEBUG_MULTIBLOCKEN_MASK 0x2
+#define BIF_DEBUG_CNTL__DEBUG_MULTIBLOCKEN__SHIFT 0x1
+#define BIF_DEBUG_CNTL__DEBUG_OUT_EN_MASK 0x4
+#define BIF_DEBUG_CNTL__DEBUG_OUT_EN__SHIFT 0x2
+#define BIF_DEBUG_CNTL__DEBUG_PAD_SEL_MASK 0x8
+#define BIF_DEBUG_CNTL__DEBUG_PAD_SEL__SHIFT 0x3
+#define BIF_DEBUG_CNTL__DEBUG_BYTESEL_BLK1_MASK 0x10
+#define BIF_DEBUG_CNTL__DEBUG_BYTESEL_BLK1__SHIFT 0x4
+#define BIF_DEBUG_CNTL__DEBUG_BYTESEL_BLK2_MASK 0x20
+#define BIF_DEBUG_CNTL__DEBUG_BYTESEL_BLK2__SHIFT 0x5
+#define BIF_DEBUG_CNTL__DEBUG_SYNC_EN_MASK 0x40
+#define BIF_DEBUG_CNTL__DEBUG_SYNC_EN__SHIFT 0x6
+#define BIF_DEBUG_CNTL__DEBUG_SWAP_MASK 0x80
+#define BIF_DEBUG_CNTL__DEBUG_SWAP__SHIFT 0x7
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_BLK1_MASK 0x1f00
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_BLK1__SHIFT 0x8
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_BLK2_MASK 0x1f0000
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_BLK2__SHIFT 0x10
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_XSP_MASK 0x1000000
+#define BIF_DEBUG_CNTL__DEBUG_IDSEL_XSP__SHIFT 0x18
+#define BIF_DEBUG_CNTL__DEBUG_SYNC_CLKSEL_MASK 0xc0000000
+#define BIF_DEBUG_CNTL__DEBUG_SYNC_CLKSEL__SHIFT 0x1e
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK1_MASK 0x3f
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK1__SHIFT 0x0
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK2_MASK 0x3f00
+#define BIF_DEBUG_MUX__DEBUG_MUX_BLK2__SHIFT 0x8
+#define BIF_DEBUG_OUT__DEBUG_OUTPUT_MASK 0x1ffff
+#define BIF_DEBUG_OUT__DEBUG_OUTPUT__SHIFT 0x0
+#define HDP_REG_COHERENCY_FLUSH_CNTL__HDP_REG_FLUSH_ADDR_MASK 0x1
+#define HDP_REG_COHERENCY_FLUSH_CNTL__HDP_REG_FLUSH_ADDR__SHIFT 0x0
+#define HDP_MEM_COHERENCY_FLUSH_CNTL__HDP_MEM_FLUSH_ADDR_MASK 0x1
+#define HDP_MEM_COHERENCY_FLUSH_CNTL__HDP_MEM_FLUSH_ADDR__SHIFT 0x0
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_A_MASK 0x1
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_A__SHIFT 0x0
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SEL_MASK 0x2
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_SEL__SHIFT 0x1
+#define CLKREQB_PAD_CNTL__CLKREQB_PAD_MODE_MASK 0x4
+#define CLKR

@@ -1,158 +1,105 @@
-/*
- *  Atari mouse driver for Linux/m68k
- *
- *  Copyright (c) 2005 Michael Schmitz
- *
- *  Based on:
- *  Amiga mouse driver for Linux/m68k
- *
- *  Copyright (c) 2000-2002 Vojtech Pavlik
- *
- */
-/*
- * The low level init and interrupt stuff is handled in arch/mm68k/atari/atakeyb.c
- * (the keyboard ACIA also handles the mouse and joystick data, and the keyboard
- * interrupt is shared with the MIDI ACIA so MIDI data also get handled there).
- * This driver only deals with handing key events off to the input layer.
- *
- * Largely based on the old:
- *
- * Atari Mouse Driver for Linux
- * by Robert de Vries (robert@and.nl) 19Jul93
- *
- * 16 Nov 1994 Andreas Schwab
- * Compatibility with busmouse
- * Support for three button mouse (shamelessly stolen from MiNT)
- * third button wired to one of the joystick directions on joystick 1
- *
- * 1996/02/11 Andreas Schwab
- * Module support
- * Allow multiple open's
- *
- * Converted to use new generic busmouse code.  5 Apr 1998
- *   Russell King <rmk@arm.uk.linux.org>
- */
-
-
-/*
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation
- */
-
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-
-#include <asm/irq.h>
-#include <asm/setup.h>
-#include <asm/uaccess.h>
-#include <asm/atarihw.h>
-#include <asm/atarikb.h>
-#include <asm/atariints.h>
-
-MODULE_AUTHOR("Michael Schmitz <schmitz@biophys.uni-duesseldorf.de>");
-MODULE_DESCRIPTION("Atari mouse driver");
-MODULE_LICENSE("GPL");
-
-static int mouse_threshold[2] = {2, 2};
-module_param_array(mouse_threshold, int, NULL, 0);
-
-#ifdef FIXED_ATARI_JOYSTICK
-extern int atari_mouse_buttons;
-#endif
-
-static struct input_dev *atamouse_dev;
-
-static void atamouse_interrupt(char *buf)
-{
-	int buttons, dx, dy;
-
-	buttons = (buf[0] & 1) | ((buf[0] & 2) << 1);
-#ifdef FIXED_ATARI_JOYSTICK
-	buttons |= atari_mouse_buttons & 2;
-	atari_mouse_buttons = buttons;
-#endif
-
-	/* only relative events get here */
-	dx = buf[1];
-	dy = buf[2];
-
-	input_report_rel(atamouse_dev, REL_X, dx);
-	input_report_rel(atamouse_dev, REL_Y, dy);
-
-	input_report_key(atamouse_dev, BTN_LEFT,   buttons & 0x4);
-	input_report_key(atamouse_dev, BTN_MIDDLE, buttons & 0x2);
-	input_report_key(atamouse_dev, BTN_RIGHT,  buttons & 0x1);
-
-	input_sync(atamouse_dev);
-
-	return;
-}
-
-static int atamouse_open(struct input_dev *dev)
-{
-#ifdef FIXED_ATARI_JOYSTICK
-	atari_mouse_buttons = 0;
-#endif
-	ikbd_mouse_y0_top();
-	ikbd_mouse_thresh(mouse_threshold[0], mouse_threshold[1]);
-	ikbd_mouse_rel_pos();
-	atari_input_mouse_interrupt_hook = atamouse_interrupt;
-
-	return 0;
-}
-
-static void atamouse_close(struct input_dev *dev)
-{
-	ikbd_mouse_disable();
-	atari_input_mouse_interrupt_hook = NULL;
-}
-
-static int __init atamouse_init(void)
-{
-	int error;
-
-	if (!MACH_IS_ATARI || !ATARIHW_PRESENT(ST_MFP))
-		return -ENODEV;
-
-	error = atari_keyb_init();
-	if (error)
-		return error;
-
-	atamouse_dev = input_allocate_device();
-	if (!atamouse_dev)
-		return -ENOMEM;
-
-	atamouse_dev->name = "Atari mouse";
-	atamouse_dev->phys = "atamouse/input0";
-	atamouse_dev->id.bustype = BUS_HOST;
-	atamouse_dev->id.vendor = 0x0001;
-	atamouse_dev->id.product = 0x0002;
-	atamouse_dev->id.version = 0x0100;
-
-	atamouse_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REL);
-	atamouse_dev->relbit[0] = BIT_MASK(REL_X) | BIT_MASK(REL_Y);
-	atamouse_dev->keybit[BIT_WORD(BTN_LEFT)] = BIT_MASK(BTN_LEFT) |
-		BIT_MASK(BTN_MIDDLE) | BIT_MASK(BTN_RIGHT);
-
-	atamouse_dev->open = atamouse_open;
-	atamouse_dev->close = atamouse_close;
-
-	error = input_register_device(atamouse_dev);
-	if (error) {
-		input_free_device(atamouse_dev);
-		return error;
-	}
-
-	return 0;
-}
-
-static void __exit atamouse_exit(void)
-{
-	input_unregister_device(atamouse_dev);
-}
-
-module_init(atamouse_init);
-module_exit(atamouse_exit);
+fff
+#define SQ_MTBUF_0__OFFSET__SHIFT 0x0
+#define SQ_MTBUF_0__OFFEN_MASK 0x1000
+#define SQ_MTBUF_0__OFFEN__SHIFT 0xc
+#define SQ_MTBUF_0__IDXEN_MASK 0x2000
+#define SQ_MTBUF_0__IDXEN__SHIFT 0xd
+#define SQ_MTBUF_0__GLC_MASK 0x4000
+#define SQ_MTBUF_0__GLC__SHIFT 0xe
+#define SQ_MTBUF_0__OP_MASK 0x78000
+#define SQ_MTBUF_0__OP__SHIFT 0xf
+#define SQ_MTBUF_0__DFMT_MASK 0x780000
+#define SQ_MTBUF_0__DFMT__SHIFT 0x13
+#define SQ_MTBUF_0__NFMT_MASK 0x3800000
+#define SQ_MTBUF_0__NFMT__SHIFT 0x17
+#define SQ_MTBUF_0__ENCODING_MASK 0xfc000000
+#define SQ_MTBUF_0__ENCODING__SHIFT 0x1a
+#define SQ_SOPP__SIMM16_MASK 0xffff
+#define SQ_SOPP__SIMM16__SHIFT 0x0
+#define SQ_SOPP__OP_MASK 0x7f0000
+#define SQ_SOPP__OP__SHIFT 0x10
+#define SQ_SOPP__ENCODING_MASK 0xff800000
+#define SQ_SOPP__ENCODING__SHIFT 0x17
+#define SQ_FLAT_0__GLC_MASK 0x10000
+#define SQ_FLAT_0__GLC__SHIFT 0x10
+#define SQ_FLAT_0__SLC_MASK 0x20000
+#define SQ_FLAT_0__SLC__SHIFT 0x11
+#define SQ_FLAT_0__OP_MASK 0x1fc0000
+#define SQ_FLAT_0__OP__SHIFT 0x12
+#define SQ_FLAT_0__ENCODING_MASK 0xfc000000
+#define SQ_FLAT_0__ENCODING__SHIFT 0x1a
+#define SQ_VOP3_0_SDST_ENC__VDST_MASK 0xff
+#define SQ_VOP3_0_SDST_ENC__VDST__SHIFT 0x0
+#define SQ_VOP3_0_SDST_ENC__SDST_MASK 0x7f00
+#define SQ_VOP3_0_SDST_ENC__SDST__SHIFT 0x8
+#define SQ_VOP3_0_SDST_ENC__CLAMP_MASK 0x8000
+#define SQ_VOP3_0_SDST_ENC__CLAMP__SHIFT 0xf
+#define SQ_VOP3_0_SDST_ENC__OP_MASK 0x3ff0000
+#define SQ_VOP3_0_SDST_ENC__OP__SHIFT 0x10
+#define SQ_VOP3_0_SDST_ENC__ENCODING_MASK 0xfc000000
+#define SQ_VOP3_0_SDST_ENC__ENCODING__SHIFT 0x1a
+#define SQ_MIMG_1__VADDR_MASK 0xff
+#define SQ_MIMG_1__VADDR__SHIFT 0x0
+#define SQ_MIMG_1__VDATA_MASK 0xff00
+#define SQ_MIMG_1__VDATA__SHIFT 0x8
+#define SQ_MIMG_1__SRSRC_MASK 0x1f0000
+#define SQ_MIMG_1__SRSRC__SHIFT 0x10
+#define SQ_MIMG_1__SSAMP_MASK 0x3e00000
+#define SQ_MIMG_1__SSAMP__SHIFT 0x15
+#define SQ_MIMG_1__D16_MASK 0x80000000
+#define SQ_MIMG_1__D16__SHIFT 0x1f
+#define SQ_SOP1__SSRC0_MASK 0xff
+#define SQ_SOP1__SSRC0__SHIFT 0x0
+#define SQ_SOP1__OP_MASK 0xff00
+#define SQ_SOP1__OP__SHIFT 0x8
+#define SQ_SOP1__SDST_MASK 0x7f0000
+#define SQ_SOP1__SDST__SHIFT 0x10
+#define SQ_SOP1__ENCODING_MASK 0xff800000
+#define SQ_SOP1__ENCODING__SHIFT 0x17
+#define SQ_SOPC__SSRC0_MASK 0xff
+#define SQ_SOPC__SSRC0__SHIFT 0x0
+#define SQ_SOPC__SSRC1_MASK 0xff00
+#define SQ_SOPC__SSRC1__SHIFT 0x8
+#define SQ_SOPC__OP_MASK 0x7f0000
+#define SQ_SOPC__OP__SHIFT 0x10
+#define SQ_SOPC__ENCODING_MASK 0xff800000
+#define SQ_SOPC__ENCODING__SHIFT 0x17
+#define SQ_FLAT_1__ADDR_MASK 0xff
+#define SQ_FLAT_1__ADDR__SHIFT 0x0
+#define SQ_FLAT_1__DATA_MASK 0xff00
+#define SQ_FLAT_1__DATA__SHIFT 0x8
+#define SQ_FLAT_1__TFE_MASK 0x800000
+#define SQ_FLAT_1__TFE__SHIFT 0x17
+#define SQ_FLAT_1__VDST_MASK 0xff000000
+#define SQ_FLAT_1__VDST__SHIFT 0x18
+#define SQ_DS_1__ADDR_MASK 0xff
+#define SQ_DS_1__ADDR__SHIFT 0x0
+#define SQ_DS_1__DATA0_MASK 0xff00
+#define SQ_DS_1__DATA0__SHIFT 0x8
+#define SQ_DS_1__DATA1_MASK 0xff0000
+#define SQ_DS_1__DATA1__SHIFT 0x10
+#define SQ_DS_1__VDST_MASK 0xff000000
+#define SQ_DS_1__VDST__SHIFT 0x18
+#define SQ_VOP3_1__SRC0_MASK 0x1ff
+#define SQ_VOP3_1__SRC0__SHIFT 0x0
+#define SQ_VOP3_1__SRC1_MASK 0x3fe00
+#define SQ_VOP3_1__SRC1__SHIFT 0x9
+#define SQ_VOP3_1__SRC2_MASK 0x7fc0000
+#define SQ_VOP3_1__SRC2__SHIFT 0x12
+#define SQ_VOP3_1__OMOD_MASK 0x18000000
+#define SQ_VOP3_1__OMOD__SHIFT 0x1b
+#define SQ_VOP3_1__NEG_MASK 0xe0000000
+#define SQ_VOP3_1__NEG__SHIFT 0x1d
+#define SQ_SMEM_0__SBASE_MASK 0x3f
+#define SQ_SMEM_0__SBASE__SHIFT 0x0
+#define SQ_SMEM_0__SDATA_MASK 0x1fc0
+#define SQ_SMEM_0__SDATA__SHIFT 0x6
+#define SQ_SMEM_0__GLC_MASK 0x10000
+#define SQ_SMEM_0__GLC__SHIFT 0x10
+#define SQ_SMEM_0__IMM_MASK 0x20000
+#define SQ_SMEM_0__IMM__SHIFT 0x11
+#define SQ_SMEM_0__OP_MASK 0x3fc0000
+#define SQ_SMEM_0__OP__SHIFT 0x12
+#define SQ_SMEM_0__ENCODING_MASK 0xfc000000
+#define SQ_SMEM_0__ENCODING__SHIFT 0x1a
+#define

@@ -1,702 +1,325 @@
-/* Copyright (c) 2009-2011, Code Aurora Forum. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/kernel.h>
-#include <linux/interrupt.h>
-#include <linux/slab.h>
-#include <linux/input.h>
-#include <linux/bitops.h>
-#include <linux/delay.h>
-#include <linux/mutex.h>
-#include <linux/regmap.h>
-#include <linux/of.h>
-#include <linux/input/matrix_keypad.h>
-
-#define PM8XXX_MAX_ROWS		18
-#define PM8XXX_MAX_COLS		8
-#define PM8XXX_ROW_SHIFT	3
-#define PM8XXX_MATRIX_MAX_SIZE	(PM8XXX_MAX_ROWS * PM8XXX_MAX_COLS)
-
-#define PM8XXX_MIN_ROWS		5
-#define PM8XXX_MIN_COLS		5
-
-#define MAX_SCAN_DELAY		128
-#define MIN_SCAN_DELAY		1
-
-/* in nanoseconds */
-#define MAX_ROW_HOLD_DELAY	122000
-#define MIN_ROW_HOLD_DELAY	30500
-
-#define MAX_DEBOUNCE_TIME	20
-#define MIN_DEBOUNCE_TIME	5
-
-#define KEYP_CTRL			0x148
-
-#define KEYP_CTRL_EVNTS			BIT(0)
-#define KEYP_CTRL_EVNTS_MASK		0x3
-
-#define KEYP_CTRL_SCAN_COLS_SHIFT	5
-#define KEYP_CTRL_SCAN_COLS_MIN		5
-#define KEYP_CTRL_SCAN_COLS_BITS	0x3
-
-#define KEYP_CTRL_SCAN_ROWS_SHIFT	2
-#define KEYP_CTRL_SCAN_ROWS_MIN		5
-#define KEYP_CTRL_SCAN_ROWS_BITS	0x7
-
-#define KEYP_CTRL_KEYP_EN		BIT(7)
-
-#define KEYP_SCAN			0x149
-
-#define KEYP_SCAN_READ_STATE		BIT(0)
-#define KEYP_SCAN_DBOUNCE_SHIFT		1
-#define KEYP_SCAN_PAUSE_SHIFT		3
-#define KEYP_SCAN_ROW_HOLD_SHIFT	6
-
-#define KEYP_TEST			0x14A
-
-#define KEYP_TEST_CLEAR_RECENT_SCAN	BIT(6)
-#define KEYP_TEST_CLEAR_OLD_SCAN	BIT(5)
-#define KEYP_TEST_READ_RESET		BIT(4)
-#define KEYP_TEST_DTEST_EN		BIT(3)
-#define KEYP_TEST_ABORT_READ		BIT(0)
-
-#define KEYP_TEST_DBG_SELECT_SHIFT	1
-
-/* bits of these registers represent
- * '0' for key press
- * '1' for key release
- */
-#define KEYP_RECENT_DATA		0x14B
-#define KEYP_OLD_DATA			0x14C
-
-#define KEYP_CLOCK_FREQ			32768
-
-/**
- * struct pmic8xxx_kp - internal keypad data structure
- * @num_cols - number of columns of keypad
- * @num_rows - number of row of keypad
- * @input - input device pointer for keypad
- * @regmap - regmap handle
- * @key_sense_irq - key press/release irq number
- * @key_stuck_irq - key stuck notification irq number
- * @keycodes - array to hold the key codes
- * @dev - parent device pointer
- * @keystate - present key press/release state
- * @stuckstate - present state when key stuck irq
- * @ctrl_reg - control register value
- */
-struct pmic8xxx_kp {
-	unsigned int num_rows;
-	unsigned int num_cols;
-	struct input_dev *input;
-	struct regmap *regmap;
-	int key_sense_irq;
-	int key_stuck_irq;
-
-	unsigned short keycodes[PM8XXX_MATRIX_MAX_SIZE];
-
-	struct device *dev;
-	u16 keystate[PM8XXX_MAX_ROWS];
-	u16 stuckstate[PM8XXX_MAX_ROWS];
-
-	u8 ctrl_reg;
-};
-
-static u8 pmic8xxx_col_state(struct pmic8xxx_kp *kp, u8 col)
-{
-	/* all keys pressed on that particular row? */
-	if (col == 0x00)
-		return 1 << kp->num_cols;
-	else
-		return col & ((1 << kp->num_cols) - 1);
-}
-
-/*
- * Synchronous read protocol for RevB0 onwards:
- *
- * 1. Write '1' to ReadState bit in KEYP_SCAN register
- * 2. Wait 2*32KHz clocks, so that HW can successfully enter read mode
- *    synchronously
- * 3. Read rows in old array first if events are more than one
- * 4. Read rows in recent array
- * 5. Wait 4*32KHz clocks
- * 6. Write '0' to ReadState bit of KEYP_SCAN register so that hw can
- *    synchronously exit read mode.
- */
-static int pmic8xxx_chk_sync_read(struct pmic8xxx_kp *kp)
-{
-	int rc;
-	unsigned int scan_val;
-
-	rc = regmap_read(kp->regmap, KEYP_SCAN, &scan_val);
-	if (rc < 0) {
-		dev_err(kp->dev, "Error reading KEYP_SCAN reg, rc=%d\n", rc);
-		return rc;
-	}
-
-	scan_val |= 0x1;
-
-	rc = regmap_write(kp->regmap, KEYP_SCAN, scan_val);
-	if (rc < 0) {
-		dev_err(kp->dev, "Error writing KEYP_SCAN reg, rc=%d\n", rc);
-		return rc;
-	}
-
-	/* 2 * 32KHz clocks */
-	udelay((2 * DIV_ROUND_UP(USEC_PER_SEC, KEYP_CLOCK_FREQ)) + 1);
-
-	return rc;
-}
-
-static int pmic8xxx_kp_read_data(struct pmic8xxx_kp *kp, u16 *state,
-					u16 data_reg, int read_rows)
-{
-	int rc, row;
-	unsigned int val;
-
-	for (row = 0; row < read_rows; row++) {
-		rc = regmap_read(kp->regmap, data_reg, &val);
-		if (rc)
-			return rc;
-		dev_dbg(kp->dev, "%d = %d\n", row, val);
-		state[row] = pmic8xxx_col_state(kp, val);
-	}
-
-	return 0;
-}
-
-static int pmic8xxx_kp_read_matrix(struct pmic8xxx_kp *kp, u16 *new_state,
-					 u16 *old_state)
-{
-	int rc, read_rows;
-	unsigned int scan_val;
-
-	if (kp->num_rows < PM8XXX_MIN_ROWS)
-		read_rows = PM8XXX_MIN_ROWS;
-	else
-		read_rows = kp->num_rows;
-
-	pmic8xxx_chk_sync_read(kp);
-
-	if (old_state) {
-		rc = pmic8xxx_kp_read_data(kp, old_state, KEYP_OLD_DATA,
-						read_rows);
-		if (rc < 0) {
-			dev_err(kp->dev,
-				"Error reading KEYP_OLD_DATA, rc=%d\n", rc);
-			return rc;
-		}
-	}
-
-	rc = pmic8xxx_kp_read_data(kp, new_state, KEYP_RECENT_DATA,
-					 read_rows);
-	if (rc < 0) {
-		dev_err(kp->dev,
-			"Error reading KEYP_RECENT_DATA, rc=%d\n", rc);
-		return rc;
-	}
-
-	/* 4 * 32KHz clocks */
-	udelay((4 * DIV_ROUND_UP(USEC_PER_SEC, KEYP_CLOCK_FREQ)) + 1);
-
-	rc = regmap_read(kp->regmap, KEYP_SCAN, &scan_val);
-	if (rc < 0) {
-		dev_err(kp->dev, "Error reading KEYP_SCAN reg, rc=%d\n", rc);
-		return rc;
-	}
-
-	scan_val &= 0xFE;
-	rc = regmap_write(kp->regmap, KEYP_SCAN, scan_val);
-	if (rc < 0)
-		dev_err(kp->dev, "Error writing KEYP_SCAN reg, rc=%d\n", rc);
-
-	return rc;
-}
-
-static void __pmic8xxx_kp_scan_matrix(struct pmic8xxx_kp *kp, u16 *new_state,
-					 u16 *old_state)
-{
-	int row, col, code;
-
-	for (row = 0; row < kp->num_rows; row++) {
-		int bits_changed = new_state[row] ^ old_state[row];
-
-		if (!bits_changed)
-			continue;
-
-		for (col = 0; col < kp->num_cols; col++) {
-			if (!(bits_changed & (1 << col)))
-				continue;
-
-			dev_dbg(kp->dev, "key [%d:%d] %s\n", row, col,
-					!(new_state[row] & (1 << col)) ?
-					"pressed" : "released");
-
-			code = MATRIX_SCAN_CODE(row, col, PM8XXX_ROW_SHIFT);
-
-			input_event(kp->input, EV_MSC, MSC_SCAN, code);
-			input_report_key(kp->input,
-					kp->keycodes[code],
-					!(new_state[row] & (1 << col)));
-
-			input_sync(kp->input);
-		}
-	}
-}
-
-static bool pmic8xxx_detect_ghost_keys(struct pmic8xxx_kp *kp, u16 *new_state)
-{
-	int row, found_first = -1;
-	u16 check, row_state;
-
-	check = 0;
-	for (row = 0; row < kp->num_rows; row++) {
-		row_state = (~new_state[row]) &
-				 ((1 << kp->num_cols) - 1);
-
-		if (hweight16(row_state) > 1) {
-			if (found_first == -1)
-				found_first = row;
-			if (check & row_state) {
-				dev_dbg(kp->dev, "detected ghost key on row[%d]"
-					 " and row[%d]\n", found_first, row);
-				return true;
-			}
-		}
-		check |= row_state;
-	}
-	return false;
-}
-
-static int pmic8xxx_kp_scan_matrix(struct pmic8xxx_kp *kp, unsigned int events)
-{
-	u16 new_state[PM8XXX_MAX_ROWS];
-	u16 old_state[PM8XXX_MAX_ROWS];
-	int rc;
-
-	switch (events) {
-	case 0x1:
-		rc = pmic8xxx_kp_read_matrix(kp, new_state, NULL);
-		if (rc < 0)
-			return rc;
-
-		/* detecting ghost key is not an error */
-		if (pmic8xxx_detect_ghost_keys(kp, new_state))
-			return 0;
-		__pmic8xxx_kp_scan_matrix(kp, new_state, kp->keystate);
-		memcpy(kp->keystate, new_state, sizeof(new_state));
-	break;
-	case 0x3: /* two events - eventcounter is gray-coded */
-		rc = pmic8xxx_kp_read_matrix(kp, new_state, old_state);
-		if (rc < 0)
-			return rc;
-
-		__pmic8xxx_kp_scan_matrix(kp, old_state, kp->keystate);
-		__pmic8xxx_kp_scan_matrix(kp, new_state, old_state);
-		memcpy(kp->keystate, new_state, sizeof(new_state));
-	break;
-	case 0x2:
-		dev_dbg(kp->dev, "Some key events were lost\n");
-		rc = pmic8xxx_kp_read_matrix(kp, new_state, old_state);
-		if (rc < 0)
-			return rc;
-		__pmic8xxx_kp_scan_matrix(kp, old_state, kp->keystate);
-		__pmic8xxx_kp_scan_matrix(kp, new_state, old_state);
-		memcpy(kp->keystate, new_state, sizeof(new_state));
-	break;
-	default:
-		rc = -EINVAL;
-	}
-	return rc;
-}
-
-/*
- * NOTE: We are reading recent and old data registers blindly
- * whenever key-stuck interrupt happens, because events counter doesn't
- * get updated when this interrupt happens due to key stuck doesn't get
- * considered as key state change.
- *
- * We are not using old data register contents after they are being read
- * because it might report the key which was pressed before the key being stuck
- * as stuck key because it's pressed status is stored in the old data
- * register.
- */
-static irqreturn_t pmic8xxx_kp_stuck_irq(int irq, void *data)
-{
-	u16 new_state[PM8XXX_MAX_ROWS];
-	u16 old_state[PM8XXX_MAX_ROWS];
-	int rc;
-	struct pmic8xxx_kp *kp = data;
-
-	rc = pmic8xxx_kp_read_matrix(kp, new_state, old_state);
-	if (rc < 0) {
-		dev_err(kp->dev, "failed to read keypad matrix\n");
-		return IRQ_HANDLED;
-	}
-
-	__pmic8xxx_kp_scan_matrix(kp, new_state, kp->stuckstate);
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t pmic8xxx_kp_irq(int irq, void *data)
-{
-	struct pmic8xxx_kp *kp = data;
-	unsigned int ctrl_val, events;
-	int rc;
-
-	rc = regmap_read(kp->regmap, KEYP_CTRL, &ctrl_val);
-	if (rc < 0) {
-		dev_err(kp->dev, "failed to read keyp_ctrl register\n");
-		return IRQ_HANDLED;
-	}
-
-	events = ctrl_val & KEYP_CTRL_EVNTS_MASK;
-
-	rc = pmic8xxx_kp_scan_matrix(kp, events);
-	if (rc < 0)
-		dev_err(kp->dev, "failed to scan matrix\n");
-
-	return IRQ_HANDLED;
-}
-
-static int pmic8xxx_kpd_init(struct pmic8xxx_kp *kp,
-			     struct platform_device *pdev)
-{
-	const struct device_node *of_node = pdev->dev.of_node;
-	unsigned int scan_delay_ms;
-	unsigned int row_hold_ns;
-	unsigned int debounce_ms;
-	int bits, rc, cycles;
-	u8 scan_val = 0, ctrl_val = 0;
-	static const u8 row_bits[] = {
-		0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 7, 7, 7,
-	};
-
-	/* Find column bits */
-	if (kp->num_cols < KEYP_CTRL_SCAN_COLS_MIN)
-		bits = 0;
-	else
-		bits = kp->num_cols - KEYP_CTRL_SCAN_COLS_MIN;
-	ctrl_val = (bits & KEYP_CTRL_SCAN_COLS_BITS) <<
-		KEYP_CTRL_SCAN_COLS_SHIFT;
-
-	/* Find row bits */
-	if (kp->num_rows < KEYP_CTRL_SCAN_ROWS_MIN)
-		bits = 0;
-	else
-		bits = row_bits[kp->num_rows - KEYP_CTRL_SCAN_ROWS_MIN];
-
-	ctrl_val |= (bits << KEYP_CTRL_SCAN_ROWS_SHIFT);
-
-	rc = regmap_write(kp->regmap, KEYP_CTRL, ctrl_val);
-	if (rc < 0) {
-		dev_err(kp->dev, "Error writing KEYP_CTRL reg, rc=%d\n", rc);
-		return rc;
-	}
-
-	if (of_property_read_u32(of_node, "scan-delay", &scan_delay_ms))
-		scan_delay_ms = MIN_SCAN_DELAY;
-
-	if (scan_delay_ms > MAX_SCAN_DELAY || scan_delay_ms < MIN_SCAN_DELAY ||
-	    !is_power_of_2(scan_delay_ms)) {
-		dev_err(&pdev->dev, "invalid keypad scan time supplied\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(of_node, "row-hold", &row_hold_ns))
-		row_hold_ns = MIN_ROW_HOLD_DELAY;
-
-	if (row_hold_ns > MAX_ROW_HOLD_DELAY ||
-	    row_hold_ns < MIN_ROW_HOLD_DELAY ||
-	    ((row_hold_ns % MIN_ROW_HOLD_DELAY) != 0)) {
-		dev_err(&pdev->dev, "invalid keypad row hold time supplied\n");
-		return -EINVAL;
-	}
-
-	if (of_property_read_u32(of_node, "debounce", &debounce_ms))
-		debounce_ms = MIN_DEBOUNCE_TIME;
-
-	if (((debounce_ms % 5) != 0) ||
-	    debounce_ms > MAX_DEBOUNCE_TIME ||
-	    debounce_ms < MIN_DEBOUNCE_TIME) {
-		dev_err(&pdev->dev, "invalid debounce time supplied\n");
-		return -EINVAL;
-	}
-
-	bits = (debounce_ms / 5) - 1;
-
-	scan_val |= (bits << KEYP_SCAN_DBOUNCE_SHIFT);
-
-	bits = fls(scan_delay_ms) - 1;
-	scan_val |= (bits << KEYP_SCAN_PAUSE_SHIFT);
-
-	/* Row hold time is a multiple of 32KHz cycles. */
-	cycles = (row_hold_ns * KEYP_CLOCK_FREQ) / NSEC_PER_SEC;
-
-	scan_val |= (cycles << KEYP_SCAN_ROW_HOLD_SHIFT);
-
-	rc = regmap_write(kp->regmap, KEYP_SCAN, scan_val);
-	if (rc)
-		dev_err(kp->dev, "Error writing KEYP_SCAN reg, rc=%d\n", rc);
-
-	return rc;
-
-}
-
-static int pmic8xxx_kp_enable(struct pmic8xxx_kp *kp)
-{
-	int rc;
-
-	kp->ctrl_reg |= KEYP_CTRL_KEYP_EN;
-
-	rc = regmap_write(kp->regmap, KEYP_CTRL, kp->ctrl_reg);
-	if (rc < 0)
-		dev_err(kp->dev, "Error writing KEYP_CTRL reg, rc=%d\n", rc);
-
-	return rc;
-}
-
-static int pmic8xxx_kp_disable(struct pmic8xxx_kp *kp)
-{
-	int rc;
-
-	kp->ctrl_reg &= ~KEYP_CTRL_KEYP_EN;
-
-	rc = regmap_write(kp->regmap, KEYP_CTRL, kp->ctrl_reg);
-	if (rc < 0)
-		return rc;
-
-	return rc;
-}
-
-static int pmic8xxx_kp_open(struct input_dev *dev)
-{
-	struct pmic8xxx_kp *kp = input_get_drvdata(dev);
-
-	return pmic8xxx_kp_enable(kp);
-}
-
-static void pmic8xxx_kp_close(struct input_dev *dev)
-{
-	struct pmic8xxx_kp *kp = input_get_drvdata(dev);
-
-	pmic8xxx_kp_disable(kp);
-}
-
-/*
- * keypad controller should be initialized in the following sequence
- * only, otherwise it might get into FSM stuck state.
- *
- * - Initialize keypad control parameters, like no. of rows, columns,
- *   timing values etc.,
- * - configure rows and column gpios pull up/down.
- * - set irq edge type.
- * - enable the keypad controller.
- */
-static int pmic8xxx_kp_probe(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	unsigned int rows, cols;
-	bool repeat;
-	bool wakeup;
-	struct pmic8xxx_kp *kp;
-	int rc;
-	unsigned int ctrl_val;
-
-	rc = matrix_keypad_parse_of_params(&pdev->dev, &rows, &cols);
-	if (rc)
-		return rc;
-
-	if (cols > PM8XXX_MAX_COLS || rows > PM8XXX_MAX_ROWS ||
-	    cols < PM8XXX_MIN_COLS) {
-		dev_err(&pdev->dev, "invalid platform data\n");
-		return -EINVAL;
-	}
-
-	repeat = !of_property_read_bool(np, "linux,input-no-autorepeat");
-
-	wakeup = of_property_read_bool(np, "wakeup-source") ||
-		 /* legacy name */
-		 of_property_read_bool(np, "linux,keypad-wakeup");
-
-	kp = devm_kzalloc(&pdev->dev, sizeof(*kp), GFP_KERNEL);
-	if (!kp)
-		return -ENOMEM;
-
-	kp->regmap = dev_get_regmap(pdev->dev.parent, NULL);
-	if (!kp->regmap)
-		return -ENODEV;
-
-	platform_set_drvdata(pdev, kp);
-
-	kp->num_rows	= rows;
-	kp->num_cols	= cols;
-	kp->dev		= &pdev->dev;
-
-	kp->input = devm_input_allocate_device(&pdev->dev);
-	if (!kp->input) {
-		dev_err(&pdev->dev, "unable to allocate input device\n");
-		return -ENOMEM;
-	}
-
-	kp->key_sense_irq = platform_get_irq(pdev, 0);
-	if (kp->key_sense_irq < 0) {
-		dev_err(&pdev->dev, "unable to get keypad sense irq\n");
-		return kp->key_sense_irq;
-	}
-
-	kp->key_stuck_irq = platform_get_irq(pdev, 1);
-	if (kp->key_stuck_irq < 0) {
-		dev_err(&pdev->dev, "unable to get keypad stuck irq\n");
-		return kp->key_stuck_irq;
-	}
-
-	kp->input->name = "PMIC8XXX keypad";
-	kp->input->phys = "pmic8xxx_keypad/input0";
-
-	kp->input->id.bustype	= BUS_I2C;
-	kp->input->id.version	= 0x0001;
-	kp->input->id.product	= 0x0001;
-	kp->input->id.vendor	= 0x0001;
-
-	kp->input->open		= pmic8xxx_kp_open;
-	kp->input->close	= pmic8xxx_kp_close;
-
-	rc = matrix_keypad_build_keymap(NULL, NULL,
-					PM8XXX_MAX_ROWS, PM8XXX_MAX_COLS,
-					kp->keycodes, kp->input);
-	if (rc) {
-		dev_err(&pdev->dev, "failed to build keymap\n");
-		return rc;
-	}
-
-	if (repeat)
-		__set_bit(EV_REP, kp->input->evbit);
-	input_set_capability(kp->input, EV_MSC, MSC_SCAN);
-
-	input_set_drvdata(kp->input, kp);
-
-	/* initialize keypad state */
-	memset(kp->keystate, 0xff, sizeof(kp->keystate));
-	memset(kp->stuckstate, 0xff, sizeof(kp->stuckstate));
-
-	rc = pmic8xxx_kpd_init(kp, pdev);
-	if (rc < 0) {
-		dev_err(&pdev->dev, "unable to initialize keypad controller\n");
-		return rc;
-	}
-
-	rc = devm_request_any_context_irq(&pdev->dev, kp->key_sense_irq,
-			pmic8xxx_kp_irq, IRQF_TRIGGER_RISING, "pmic-keypad",
-			kp);
-	if (rc < 0) {
-		dev_err(&pdev->dev, "failed to request keypad sense irq\n");
-		return rc;
-	}
-
-	rc = devm_request_any_context_irq(&pdev->dev, kp->key_stuck_irq,
-			pmic8xxx_kp_stuck_irq, IRQF_TRIGGER_RISING,
-			"pmic-keypad-stuck", kp);
-	if (rc < 0) {
-		dev_err(&pdev->dev, "failed to request keypad stuck irq\n");
-		return rc;
-	}
-
-	rc = regmap_read(kp->regmap, KEYP_CTRL, &ctrl_val);
-	if (rc < 0) {
-		dev_err(&pdev->dev, "failed to read KEYP_CTRL register\n");
-		return rc;
-	}
-
-	kp->ctrl_reg = ctrl_val;
-
-	rc = input_register_device(kp->input);
-	if (rc < 0) {
-		dev_err(&pdev->dev, "unable to register keypad input device\n");
-		return rc;
-	}
-
-	device_init_wakeup(&pdev->dev, wakeup);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int pmic8xxx_kp_suspend(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct pmic8xxx_kp *kp = platform_get_drvdata(pdev);
-	struct input_dev *input_dev = kp->input;
-
-	if (device_may_wakeup(dev)) {
-		enable_irq_wake(kp->key_sense_irq);
-	} else {
-		mutex_lock(&input_dev->mutex);
-
-		if (input_dev->users)
-			pmic8xxx_kp_disable(kp);
-
-		mutex_unlock(&input_dev->mutex);
-	}
-
-	return 0;
-}
-
-static int pmic8xxx_kp_resume(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct pmic8xxx_kp *kp = platform_get_drvdata(pdev);
-	struct input_dev *input_dev = kp->input;
-
-	if (device_may_wakeup(dev)) {
-		disable_irq_wake(kp->key_sense_irq);
-	} else {
-		mutex_lock(&input_dev->mutex);
-
-		if (input_dev->users)
-			pmic8xxx_kp_enable(kp);
-
-		mutex_unlock(&input_dev->mutex);
-	}
-
-	return 0;
-}
-#endif
-
-static SIMPLE_DEV_PM_OPS(pm8xxx_kp_pm_ops,
-			 pmic8xxx_kp_suspend, pmic8xxx_kp_resume);
-
-static const struct of_device_id pm8xxx_match_table[] = {
-	{ .compatible = "qcom,pm8058-keypad" },
-	{ .compatible = "qcom,pm8921-keypad" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, pm8xxx_match_table);
-
-static struct platform_driver pmic8xxx_kp_driver = {
-	.probe		= pmic8xxx_kp_probe,
-	.driver		= {
-		.name = "pm8xxx-keypad",
-		.pm = &pm8xxx_kp_pm_ops,
-		.of_match_table = pm8xxx_match_table,
-	},
-};
-module_platform_driver(pmic8xxx_kp_driver);
-
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("PMIC8XXX keypad driver");
-MODULE_VERSION("1.0");
-MODULE_ALIAS("platform:pmic8xxx_keypad");
-MODULE_AUTHOR("Trilok Soni <tsoni@codeaurora.org>");
+_DEBUG_REG12__gs_state3_r0_q__SHIFT 0x9
+#define VGT_DEBUG_REG12__gs_state4_r0_q_MASK 0x7000
+#define VGT_DEBUG_REG12__gs_state4_r0_q__SHIFT 0xc
+#define VGT_DEBUG_REG12__gs_state5_r0_q_MASK 0x38000
+#define VGT_DEBUG_REG12__gs_state5_r0_q__SHIFT 0xf
+#define VGT_DEBUG_REG12__gs_state6_r0_q_MASK 0x1c0000
+#define VGT_DEBUG_REG12__gs_state6_r0_q__SHIFT 0x12
+#define VGT_DEBUG_REG12__gs_state7_r0_q_MASK 0xe00000
+#define VGT_DEBUG_REG12__gs_state7_r0_q__SHIFT 0x15
+#define VGT_DEBUG_REG12__gs_state8_r0_q_MASK 0x7000000
+#define VGT_DEBUG_REG12__gs_state8_r0_q__SHIFT 0x18
+#define VGT_DEBUG_REG12__gs_state9_r0_q_MASK 0x38000000
+#define VGT_DEBUG_REG12__gs_state9_r0_q__SHIFT 0x1b
+#define VGT_DEBUG_REG12__hold_eswave_eop_MASK 0x40000000
+#define VGT_DEBUG_REG12__hold_eswave_eop__SHIFT 0x1e
+#define VGT_DEBUG_REG12__SPARE0_MASK 0x80000000
+#define VGT_DEBUG_REG12__SPARE0__SHIFT 0x1f
+#define VGT_DEBUG_REG13__gs_state10_r0_q_MASK 0x7
+#define VGT_DEBUG_REG13__gs_state10_r0_q__SHIFT 0x0
+#define VGT_DEBUG_REG13__gs_state11_r0_q_MASK 0x38
+#define VGT_DEBUG_REG13__gs_state11_r0_q__SHIFT 0x3
+#define VGT_DEBUG_REG13__gs_state12_r0_q_MASK 0x1c0
+#define VGT_DEBUG_REG13__gs_state12_r0_q__SHIFT 0x6
+#define VGT_DEBUG_REG13__gs_state13_r0_q_MASK 0xe00
+#define VGT_DEBUG_REG13__gs_state13_r0_q__SHIFT 0x9
+#define VGT_DEBUG_REG13__gs_state14_r0_q_MASK 0x7000
+#define VGT_DEBUG_REG13__gs_state14_r0_q__SHIFT 0xc
+#define VGT_DEBUG_REG13__gs_state15_r0_q_MASK 0x38000
+#define VGT_DEBUG_REG13__gs_state15_r0_q__SHIFT 0xf
+#define VGT_DEBUG_REG13__gs_tbl_wrptr_r0_q_3_0_MASK 0x3c0000
+#define VGT_DEBUG_REG13__gs_tbl_wrptr_r0_q_3_0__SHIFT 0x12
+#define VGT_DEBUG_REG13__gsfetch_done_fifo_cnt_q_not_0_MASK 0x400000
+#define VGT_DEBUG_REG13__gsfetch_done_fifo_cnt_q_not_0__SHIFT 0x16
+#define VGT_DEBUG_REG13__gsfetch_done_cnt_q_not_0_MASK 0x800000
+#define VGT_DEBUG_REG13__gsfetch_done_cnt_q_not_0__SHIFT 0x17
+#define VGT_DEBUG_REG13__es_tbl_full_MASK 0x1000000
+#define VGT_DEBUG_REG13__es_tbl_full__SHIFT 0x18
+#define VGT_DEBUG_REG13__SPARE1_MASK 0x2000000
+#define VGT_DEBUG_REG13__SPARE1__SHIFT 0x19
+#define VGT_DEBUG_REG13__SPARE0_MASK 0x4000000
+#define VGT_DEBUG_REG13__SPARE0__SHIFT 0x1a
+#define VGT_DEBUG_REG13__active_cm_sm_r0_q_MASK 0xf8000000
+#define VGT_DEBUG_REG13__active_cm_sm_r0_q__SHIFT 0x1b
+#define VGT_DEBUG_REG14__SPARE3_MASK 0xf
+#define VGT_DEBUG_REG14__SPARE3__SHIFT 0x0
+#define VGT_DEBUG_REG14__gsfetch_done_fifo_full_MASK 0x10
+#define VGT_DEBUG_REG14__gsfetch_done_fifo_full__SHIFT 0x4
+#define VGT_DEBUG_REG14__gs_rb_space_avail_r0_MASK 0x20
+#define VGT_DEBUG_REG14__gs_rb_space_avail_r0__SHIFT 0x5
+#define VGT_DEBUG_REG14__smx_es_done_cnt_r0_q_not_0_MASK 0x40
+#define VGT_DEBUG_REG14__smx_es_done_cnt_r0_q_not_0__SHIFT 0x6
+#define VGT_DEBUG_REG14__SPARE8_MASK 0x180
+#define VGT_DEBUG_REG14__SPARE8__SHIFT 0x7
+#define VGT_DEBUG_REG14__vs_done_cnt_q_not_0_MASK 0x200
+#define VGT_DEBUG_REG14__vs_done_cnt_q_not_0__SHIFT 0x9
+#define VGT_DEBUG_REG14__es_flush_cnt_busy_q_MASK 0x400
+#define VGT_DEBUG_REG14__es_flush_cnt_busy_q__SHIFT 0xa
+#define VGT_DEBUG_REG14__gs_tbl_full_r0_MASK 0x800
+#define VGT_DEBUG_REG14__gs_tbl_full_r0__SHIFT 0xb
+#define VGT_DEBUG_REG14__SPARE2_MASK 0x1ff000
+#define VGT_DEBUG_REG14__SPARE2__SHIFT 0xc
+#define VGT_DEBUG_REG14__se1spi_gsthread_fifo_busy_MASK 0x200000
+#define VGT_DEBUG_REG14__se1spi_gsthread_fifo_busy__SHIFT 0x15
+#define VGT_DEBUG_REG14__SPARE_MASK 0x1c00000
+#define VGT_DEBUG_REG14__SPARE__SHIFT 0x16
+#define VGT_DEBUG_REG14__VGT_SE1SPI_gsthread_rtr_q_MASK 0x2000000
+#define VGT_DEBUG_REG14__VGT_SE1SPI_gsthread_rtr_q__SHIFT 0x19
+#define VGT_DEBUG_REG14__smx1_es_done_cnt_r0_q_not_0_MASK 0x4000000
+#define VGT_DEBUG_REG14__smx1_es_done_cnt_r0_q_not_0__SHIFT 0x1a
+#define VGT_DEBUG_REG14__se1spi_esthread_fifo_busy_MASK 0x8000000
+#define VGT_DEBUG_REG14__se1spi_esthread_fifo_busy__SHIFT 0x1b
+#define VGT_DEBUG_REG14__SPARE1_MASK 0x10000000
+#define VGT_DEBUG_REG14__SPARE1__SHIFT 0x1c
+#define VGT_DEBUG_REG14__gsfetch_done_se1_cnt_q_not_0_MASK 0x20000000
+#define VGT_DEBUG_REG14__gsfetch_done_se1_cnt_q_not_0__SHIFT 0x1d
+#define VGT_DEBUG_REG14__SPARE0_MASK 0x40000000
+#define VGT_DEBUG_REG14__SPARE0__SHIFT 0x1e
+#define VGT_DEBUG_REG14__VGT_SE1SPI_esthread_rtr_q_MASK 0x80000000
+#define VGT_DEBUG_REG14__VGT_SE1SPI_esthread_rtr_q__SHIFT 0x1f
+#define VGT_DEBUG_REG15__cm_busy_q_MASK 0x1
+#define VGT_DEBUG_REG15__cm_busy_q__SHIFT 0x0
+#define VGT_DEBUG_REG15__counters_busy_q_MASK 0x2
+#define VGT_DEBUG_REG15__counters_busy_q__SHIFT 0x1
+#define VGT_DEBUG_REG15__output_fifo_empty_MASK 0x4
+#define VGT_DEBUG_REG15__output_fifo_empty__SHIFT 0x2
+#define VGT_DEBUG_REG15__output_fifo_full_MASK 0x8
+#define VGT_DEBUG_REG15__output_fifo_full__SHIFT 0x3
+#define VGT_DEBUG_REG15__counters_full_MASK 0x10
+#define VGT_DEBUG_REG15__counters_full__SHIFT 0x4
+#define VGT_DEBUG_REG15__active_sm_q_MASK 0x3e0
+#define VGT_DEBUG_REG15__active_sm_q__SHIFT 0x5
+#define VGT_DEBUG_REG15__entry_rdptr_q_MASK 0x7c00
+#define VGT_DEBUG_REG15__entry_rdptr_q__SHIFT 0xa
+#define VGT_DEBUG_REG15__cntr_tbl_wrptr_q_MASK 0xf8000
+#define VGT_DEBUG_REG15__cntr_tbl_wrptr_q__SHIFT 0xf
+#define VGT_DEBUG_REG15__SPARE25_MASK 0x3f00000
+#define VGT_DEBUG_REG15__SPARE25__SHIFT 0x14
+#define VGT_DEBUG_REG15__st_cut_mode_q_MASK 0xc000000
+#define VGT_DEBUG_REG15__st_cut_mode_q__SHIFT 0x1a
+#define VGT_DEBUG_REG15__gs_done_array_q_not_0_MASK 0x10000000
+#define VGT_DEBUG_REG15__gs_done_array_q_not_0__SHIFT 0x1c
+#define VGT_DEBUG_REG15__SPARE31_MASK 0xe0000000
+#define VGT_DEBUG_REG15__SPARE31__SHIFT 0x1d
+#define VGT_DEBUG_REG16__gog_busy_MASK 0x1
+#define VGT_DEBUG_REG16__gog_busy__SHIFT 0x0
+#define VGT_DEBUG_REG16__gog_state_q_MASK 0xe
+#define VGT_DEBUG_REG16__gog_state_q__SHIFT 0x1
+#define VGT_DEBUG_REG16__r0_rtr_MASK 0x10
+#define VGT_DEBUG_REG16__r0_rtr__SHIFT 0x4
+#define VGT_DEBUG_REG16__r1_rtr_MASK 0x20
+#define VGT_DEBUG_REG16__r1_rtr__SHIFT 0x5
+#define VGT_DEBUG_REG16__r1_upstream_rtr_MASK 0x40
+#define VGT_DEBUG_REG16__r1_upstream_rtr__SHIFT 0x6
+#define VGT_DEBUG_REG16__r2_vs_tbl_rtr_MASK 0x80
+#define VGT_DEBUG_REG16__r2_vs_tbl_rtr__SHIFT 0x7
+#define VGT_DEBUG_REG16__r2_prim_rtr_MASK 0x100
+#define VGT_DEBUG_REG16__r2_prim_rtr__SHIFT 0x8
+#define VGT_DEBUG_REG16__r2_indx_rtr_MASK 0x200
+#define VGT_DEBUG_REG16__r2_indx_rtr__SHIFT 0x9
+#define VGT_DEBUG_REG16__r2_rtr_MASK 0x400
+#define VGT_DEBUG_REG16__r2_rtr__SHIFT 0xa
+#define VGT_DEBUG_REG16__gog_tm_vs_event_rtr_MASK 0x800
+#define VGT_DEBUG_REG16__gog_tm_vs_event_rtr__SHIFT 0xb
+#define VGT_DEBUG_REG16__r3_force_vs_tbl_we_rtr_MASK 0x1000
+#define VGT_DEBUG_REG16__r3_force_vs_tbl_we_rtr__SHIFT 0xc
+#define VGT_DEBUG_REG16__indx_valid_r2_q_MASK 0x2000
+#define VGT_DEBUG_REG16__indx_valid_r2_q__SHIFT 0xd
+#define VGT_DEBUG_REG16__prim_valid_r2_q_MASK 0x4000
+#define VGT_DEBUG_REG16__prim_valid_r2_q__SHIFT 0xe
+#define VGT_DEBUG_REG16__valid_r2_q_MASK 0x8000
+#define VGT_DEBUG_REG16__valid_r2_q__SHIFT 0xf
+#define VGT_DEBUG_REG16__prim_valid_r1_q_MASK 0x10000
+#define VGT_DEBUG_REG16__prim_valid_r1_q__SHIFT 0x10
+#define VGT_DEBUG_REG16__indx_valid_r1_q_MASK 0x20000
+#define VGT_DEBUG_REG16__indx_valid_r1_q__SHIFT 0x11
+#define VGT_DEBUG_REG16__valid_r1_q_MASK 0x40000
+#define VGT_DEBUG_REG16__valid_r1_q__SHIFT 0x12
+#define VGT_DEBUG_REG16__indx_valid_r0_q_MASK 0x80000
+#define VGT_DEBUG_REG16__indx_valid_r0_q__SHIFT 0x13
+#define VGT_DEBUG_REG16__prim_valid_r0_q_MASK 0x100000
+#define VGT_DEBUG_REG16__prim_valid_r0_q__SHIFT 0x14
+#define VGT_DEBUG_REG16__valid_r0_q_MASK 0x200000
+#define VGT_DEBUG_REG16__valid_r0_q__SHIFT 0x15
+#define VGT_DEBUG_REG16__send_event_q_MASK 0x400000
+#define VGT_DEBUG_REG16__send_event_q__SHIFT 0x16
+#define VGT_DEBUG_REG16__SPARE24_MASK 0x800000
+#define VGT_DEBUG_REG16__SPARE24__SHIFT 0x17
+#define VGT_DEBUG_REG16__vert_seen_since_sopg_r2_q_MASK 0x1000000
+#define VGT_DEBUG_REG16__vert_seen_since_sopg_r2_q__SHIFT 0x18
+#define VGT_DEBUG_REG16__gog_out_prim_state_sel_MASK 0xe000000
+#define VGT_DEBUG_REG16__gog_out_prim_state_sel__SHIFT 0x19
+#define VGT_DEBUG_REG16__multiple_streams_en_r1_q_MASK 0x10000000
+#define VGT_DEBUG_REG16__multiple_streams_en_r1_q__SHIFT 0x1c
+#define VGT_DEBUG_REG16__vs_vert_count_r2_q_not_0_MASK 0x20000000
+#define VGT_DEBUG_REG16__vs_vert_count_r2_q_not_0__SHIFT 0x1d
+#define VGT_DEBUG_REG16__num_gs_r2_q_not_0_MASK 0x40000000
+#define VGT_DEBUG_REG16__num_gs_r2_q_not_0__SHIFT 0x1e
+#define VGT_DEBUG_REG16__new_vs_thread_r2_MASK 0x80000000
+#define VGT_DEBUG_REG16__new_vs_thread_r2__SHIFT 0x1f
+#define VGT_DEBUG_REG17__gog_out_prim_rel_indx2_5_0_MASK 0x3f
+#define VGT_DEBUG_REG17__gog_out_prim_rel_indx2_5_0__SHIFT 0x0
+#define VGT_DEBUG_REG17__gog_out_prim_rel_indx1_5_0_MASK 0xfc0
+#define VGT_DEBUG_REG17__gog_out_prim_rel_indx1_5_0__SHIFT 0x6
+#define VGT_DEBUG_REG17__gog_out_prim_rel_indx0_5_0_MASK 0x3f000
+#define VGT_DEBUG_REG17__gog_out_prim_rel_indx0_5_0__SHIFT 0xc
+#define VGT_DEBUG_REG17__gog_out_indx_13_0_MASK 0xfffc0000
+#define VGT_DEBUG_REG17__gog_out_indx_13_0__SHIFT 0x12
+#define VGT_DEBUG_REG18__grp_vr_valid_MASK 0x1
+#define VGT_DEBUG_REG18__grp_vr_valid__SHIFT 0x0
+#define VGT_DEBUG_REG18__pipe0_dr_MASK 0x2
+#define VGT_DEBUG_REG18__pipe0_dr__SHIFT 0x1
+#define VGT_DEBUG_REG18__pipe1_dr_MASK 0x4
+#define VGT_DEBUG_REG18__pipe1_dr__SHIFT 0x2
+#define VGT_DEBUG_REG18__vr_grp_read_MASK 0x8
+#define VGT_DEBUG_REG18__vr_grp_read__SHIFT 0x3
+#define VGT_DEBUG_REG18__pipe0_rtr_MASK 0x10
+#define VGT_DEBUG_REG18__pipe0_rtr__SHIFT 0x4
+#define VGT_DEBUG_REG18__pipe1_rtr_MASK 0x20
+#define VGT_DEBUG_REG18__pipe1_rtr__SHIFT 0x5
+#define VGT_DEBUG_REG18__out_vr_indx_read_MASK 0x40
+#define VGT_DEBUG_REG18__out_vr_indx_read__SHIFT 0x6
+#define VGT_DEBUG_REG18__out_vr_prim_read_MASK 0x80
+#define VGT_DEBUG_REG18__out_vr_prim_read__SHIFT 0x7
+#define VGT_DEBUG_REG18__indices_to_send_q_MASK 0x700
+#define VGT_DEBUG_REG18__indices_to_send_q__SHIFT 0x8
+#define VGT_DEBUG_REG18__valid_indices_MASK 0x800
+#define VGT_DEBUG_REG18__valid_indices__SHIFT 0xb
+#define VGT_DEBUG_REG18__last_indx_of_prim_MASK 0x1000
+#define VGT_DEBUG_REG18__last_indx_of_prim__SHIFT 0xc
+#define VGT_DEBUG_REG18__indx0_new_d_MASK 0x2000
+#define VGT_DEBUG_REG18__indx0_new_d__SHIFT 0xd
+#define VGT_DEBUG_REG18__indx1_new_d_MASK 0x4000
+#define VGT_DEBUG_REG18__indx1_new_d__SHIFT 0xe
+#define VGT_DEBUG_REG18__indx2_new_d_MASK 0x8000
+#define VGT_DEBUG_REG18__indx2_new_d__SHIFT 0xf
+#define VGT_DEBUG_REG18__indx2_hit_d_MASK 0x10000
+#define VGT_DEBUG_REG18__indx2_hit_d__SHIFT 0x10
+#define VGT_DEBUG_REG18__indx1_hit_d_MASK 0x20000
+#define VGT_DEBUG_REG18__indx1_hit_d__SHIFT 0x11
+#define VGT_DEBUG_REG18__indx0_hit_d_MASK 0x40000
+#define VGT_DEBUG_REG18__indx0_hit_d__SHIFT 0x12
+#define VGT_DEBUG_REG18__st_vertex_reuse_off_r0_q_MASK 0x80000
+#define VGT_DEBUG_REG18__st_vertex_reuse_off_r0_q__SHIFT 0x13
+#define VGT_DEBUG_REG18__last_group_of_instance_r0_q_MASK 0x100000
+#define VGT_DEBUG_REG18__last_group_of_instance_r0_q__SHIFT 0x14
+#define VGT_DEBUG_REG18__null_primitive_r0_q_MASK 0x200000
+#define VGT_DEBUG_REG18__null_primitive_r0_q__SHIFT 0x15
+#define VGT_DEBUG_REG18__eop_r0_q_MASK 0x400000
+#define VGT_DEBUG_REG18__eop_r0_q__SHIFT 0x16
+#define VGT_DEBUG_REG18__eject_vtx_vect_r1_d_MASK 0x800000
+#define VGT_DEBUG_REG18__eject_vtx_vect_r1_d__SHIFT 0x17
+#define VGT_DEBUG_REG18__sub_prim_type_r0_q_MASK 0x7000000
+#define VGT_DEBUG_REG18__sub_prim_type_r0_q__SHIFT 0x18
+#define VGT_DEBUG_REG18__gs_scenario_a_r0_q_MASK 0x8000000
+#define VGT_DEBUG_REG18__gs_scenario_a_r0_q__SHIFT 0x1b
+#define VGT_DEBUG_REG18__gs_scenario_b_r0_q_MASK 0x10000000
+#define VGT_DEBUG_REG18__gs_scenario_b_r0_q__SHIFT 0x1c
+#define VGT_DEBUG_REG18__components_valid_r0_q_MASK 0xe0000000
+#define VGT_DEBUG_REG18__components_valid_r0_q__SHIFT 0x1d
+#define VGT_DEBUG_REG19__separate_out_busy_q_MASK 0x1
+#define VGT_DEBUG_REG19__separate_out_busy_q__SHIFT 0x0
+#define VGT_DEBUG_REG19__separate_out_indx_busy_q_MASK 0x2
+#define VGT_DEBUG_REG19__separate_out_indx_busy_q__SHIFT 0x1
+#define VGT_DEBUG_REG19__prim_buffer_empty_MASK 0x4
+#define VGT_DEBUG_REG19__prim_buffer_empty__SHIFT 0x2
+#define VGT_DEBUG_REG19__prim_buffer_full_MASK 0x8
+#define VGT_DEBUG_REG19__prim_buffer_full__SHIFT 0x3
+#define VGT_DEBUG_REG19__pa_clips_fifo_busy_q_MASK 0x10
+#define VGT_DEBUG_REG19__pa_clips_fifo_busy_q__SHIFT 0x4
+#define VGT_DEBUG_REG19__pa_clipp_fifo_busy_q_MASK 0x20
+#define VGT_DEBUG_REG19__pa_clipp_fifo_busy_q__SHIFT 0x5
+#define VGT_DEBUG_REG19__VGT_PA_clips_rtr_q_MASK 0x40
+#define VGT_DEBUG_REG19__VGT_PA_clips_rtr_q__SHIFT 0x6
+#define VGT_DEBUG_REG19__VGT_PA_clipp_rtr_q_MASK 0x80
+#define VGT_DEBUG_REG19__VGT_PA_clipp_rtr_q__SHIFT 0x7
+#define VGT_DEBUG_REG19__spi_vsthread_fifo_busy_q_MASK 0x100
+#define VGT_DEBUG_REG19__spi_vsthread_fifo_busy_q__SHIFT 0x8
+#define VGT_DEBUG_REG19__spi_vsvert_fifo_busy_q_MASK 0x200
+#define VGT_DEBUG_REG19__spi_vsvert_fifo_busy_q__SHIFT 0x9
+#define VGT_DEBUG_REG19__pa_clipv_fifo_busy_q_MASK 0x400
+#define VGT_DEBUG_REG19__pa_clipv_fifo_busy_q__SHIFT 0xa
+#define VGT_DEBUG_REG19__hold_prim_MASK 0x800
+#define VGT_DEBUG_REG19__hold_prim__SHIFT 0xb
+#define VGT_DEBUG_REG19__VGT_SPI_vsthread_rtr_q_MASK 0x1000
+#define VGT_DEBUG_REG19__VGT_SPI_vsthread_rtr_q__SHIFT 0xc
+#define VGT_DEBUG_REG19__VGT_SPI_vsvert_rtr_q_MASK 0x2000
+#define VGT_DEBUG_REG19__VGT_SPI_vsvert_rtr_q__SHIFT 0xd
+#define VGT_DEBUG_REG19__VGT_PA_clipv_rtr_q_MASK 0x4000
+#define VGT_DEBUG_REG19__VGT_PA_clipv_rtr_q__SHIFT 0xe
+#define VGT_DEBUG_REG19__new_packet_q_MASK 0x8000
+#define VGT_DEBUG_REG19__new_packet_q__SHIFT 0xf
+#define VGT_DEBUG_REG19__buffered_prim_event_MASK 0x10000
+#define VGT_DEBUG_REG19__buffered_prim_event__SHIFT 0x10
+#define VGT_DEBUG_REG19__buffered_prim_null_primitive_MASK 0x20000
+#define VGT_DEBUG_REG19__buffered_prim_null_primitive__SHIFT 0x11
+#define VGT_DEBUG_REG19__buffered_prim_eop_MASK 0x40000
+#define VGT_DEBUG_REG19__buffered_prim_eop__SHIFT 0x12
+#define VGT_DEBUG_REG19__buffered_prim_eject_vtx_vect_MASK 0x80000
+#define VGT_DEBUG_REG19__buffered_prim_eject_vtx_vect__SHIFT 0x13
+#define VGT_DEBUG_REG19__buffered_prim_type_event_MASK 0x3f00000
+#define VGT_DEBUG_REG19__buffered_prim_type_event__SHIFT 0x14
+#define VGT_DEBUG_REG19__VGT_SE1SPI_vswave_rtr_q_MASK 0x4000000
+#define VGT_DEBUG_REG19__VGT_SE1SPI_vswave_rtr_q__SHIFT 0x1a
+#define VGT_DEBUG_REG19__VGT_SE1SPI_vsvert_rtr_q_MASK 0x8000000
+#define VGT_DEBUG_REG19__VGT_SE1SPI_vsvert_rtr_q__SHIFT 0x1b
+#define VGT_DEBUG_REG19__num_new_unique_rel_indx_MASK 0x30000000
+#define VGT_DEBUG_REG19__num_new_unique_rel_indx__SHIFT 0x1c
+#define VGT_DEBUG_REG19__null_terminate_vtx_vector_MASK 0x40000000
+#define VGT_DEBUG_REG19__null_terminate_vtx_vector__SHIFT 0x1e
+#define VGT_DEBUG_REG19__filter_event_MASK 0x80000000
+#define VGT_DEBUG_REG19__filter_event__SHIFT 0x1f
+#define VGT_DEBUG_REG20__dbg_VGT_SPI_vsthread_sovertexindex_MASK 0xffff
+#define VGT_DEBUG_REG20__dbg_VGT_SPI_vsthread_sovertexindex__SHIFT 0x0
+#define VGT_DEBUG_REG20__dbg_VGT_SPI_vsthread_sovertexcount_not_0_MASK 0x10000
+#define VGT_DEBUG_REG20__dbg_VGT_SPI_vsthread_sovertexcount_not_0__SHIFT 0x10
+#define VGT_DEBUG_REG20__SPARE17_MASK 0x20000
+#define VGT_DEBUG_REG20__SPARE17__SHIFT 0x11
+#define VGT_DEBUG_REG20__alloc_counter_q_MASK 0x3c0000
+#define VGT_DEBUG_REG20__alloc_counter_q__SHIFT 0x12
+#define VGT_DEBUG_REG20__curr_dealloc_distance_q_MASK 0x1fc00000
+#define VGT_DEBUG_REG20__curr_dealloc_distance_q__SHIFT 0x16
+#define VGT_DEBUG_REG20__new_allocate_q_MASK 0x20000000
+#define VGT_DEBUG_REG20__new_allocate_q__SHIFT 0x1d
+#define VGT_DEBUG_REG20__curr_slot_in_vtx_vect_q_not_0_MASK 0x40000000
+#define VGT_DEBUG_REG20__curr_slot_in_vtx_vect_q_not_0__SHIFT 0x1e
+#define VGT_DEBUG_REG20__int_vtx_counter_q_not_0_MASK 0x80000000
+#define VGT_DEBUG_REG20__int_vtx_counter_q_not_0__SHIFT 0x1f
+#define VGT_DEBUG_REG21__out_indx_fifo_empty_MASK 0x1
+#define VGT_DEBUG_REG21__out_indx_fifo_empty__SHIFT 0x0
+#define VGT_DEBUG_REG21__indx_side_fifo_empty_MASK 0x2
+#define VGT_DEBUG_REG21__indx_side_fifo_empty__SHIFT 0x1
+#define VGT_DEBUG_REG21__pipe0_dr_MASK 0x4
+#define VGT_DEBUG_REG21__pipe0_dr__SHIFT 0x2
+#define VGT_DEBUG_REG21__pipe1_dr_MASK 0x8
+#define VGT_DEBUG_REG21__pipe1_dr__SHIFT 0x3
+#define VGT_DEBUG_REG21__pipe2_dr_MASK 0x10
+#define VGT_DEBUG_REG21__pipe2_dr__SHIFT 0x4
+#define VGT_DEBUG_REG21__vsthread_buff_empty_MASK 0x20
+#define VGT_DEBUG_REG21__vsthread_buff_empty__SHIFT 0x5
+#define VGT_DEBUG_REG21__out_indx_fifo_full_MASK 0x40
+#define VGT_DEBUG_REG21__out_indx_fifo_full__SHIFT 0x6
+#define VGT_DEBUG_REG21__indx_side_fifo_full_MASK 0x80
+#define VGT_DEBUG_REG21__indx_side_fifo_full__SHIFT 0x7
+#define VGT_DEBUG_REG21__pipe0_rtr_MASK 0x100
+#define VGT_DEBUG_REG21__pipe0_rtr__SHIFT 0x8
+#define VGT_DEBUG_REG21__pipe1_rtr_MASK 0x200
+#define VGT_DEBUG_REG21__pipe1_rtr__SHIFT 0x9
+#define VGT_DEBUG_REG21__pipe2_rtr_MASK 0x400
+#define VGT_DEBUG_REG21__pipe2_rtr__SHIFT 0xa
+#define VGT_DEBUG_REG21__vsthread_buff_full_MASK 0x800
+#define VGT_DEBUG_REG21__vsthread_buff_full__SHIFT 0xb
+#define VGT_DEBUG_REG21__interfaces_rtr_MASK 0x1000
+#define VGT_DEBUG_REG21__interfaces_rtr__SHIFT 0xc
+#define VGT_DEBUG_REG21__indx_count_q_not_0_MASK 0x2000
+#define VGT_DEBUG_REG21__indx_count_q_not_0__SHIFT 0xd
+#define VGT_DEBUG_REG21__wait_for_external_eopg_q_MASK 0x4000
+#define VGT_DEBUG_REG21__wait_for_external_eopg_q__SHIFT 0xe
+#define VGT_DEBUG_REG21__full_state_p1_q_MASK 0x8000
+#define VGT_DEBUG_REG21__full_state_p1_q__SHIFT 0xf
+#define VGT_DEBUG_REG21__indx_side_indx_valid_MASK 0x10000
+#define VGT_DEBUG_REG21__indx_side_indx_valid__SHIFT 0x10
+#define VGT_DEBUG_REG21__stateid_p0_q_MASK 0xe0000
+#define VGT_DEBUG_REG21__stateid_p0_q__SHIFT 0x11
+#define VGT_DEBUG_REG21__is_event_p0_q_MASK 0x100000
+#define VGT_DEBU

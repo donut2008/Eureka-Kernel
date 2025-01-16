@@ -1,102 +1,45 @@
-/*
- * Copyright (C) 2014 Freescale Semiconductor, Inc.
- *
- * Author: Jun Li
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#ifndef __DRIVERS_USB_CHIPIDEA_OTG_FSM_H
-#define __DRIVERS_USB_CHIPIDEA_OTG_FSM_H
-
-#include <linux/usb/otg-fsm.h>
-
-/*
- *  A-DEVICE timing  constants
- */
-
-/* Wait for VBUS Rise  */
-#define TA_WAIT_VRISE        (100)	/* a_wait_vrise: section 7.1.2
-					 * a_wait_vrise_tmr: section 7.4.5.1
-					 * TA_VBUS_RISE <= 100ms, section 4.4
-					 * Table 4-1: Electrical Characteristics
-					 * ->DC Electrical Timing
-					 */
-/* Wait for VBUS Fall  */
-#define TA_WAIT_VFALL        (1000)	/* a_wait_vfall: section 7.1.7
-					 * a_wait_vfall_tmr: section: 7.4.5.2
-					 */
-/* Wait for B-Connect */
-#define TA_WAIT_BCON         (10000)	/* a_wait_bcon: section 7.1.3
-					 * TA_WAIT_BCON: should be between 1100
-					 * and 30000 ms, section 5.5, Table 5-1
-					 */
-/* A-Idle to B-Disconnect */
-#define TA_AIDL_BDIS         (5000)	/* a_suspend min 200 ms, section 5.2.1
-					 * TA_AIDL_BDIS: section 5.5, Table 5-1
-					 */
-/* B-Idle to A-Disconnect */
-#define TA_BIDL_ADIS         (500)	/* TA_BIDL_ADIS: section 5.2.1
-					 * 500ms is used for B switch to host
-					 * for safe
-					 */
-
-/*
- * B-device timing constants
- */
-
-/* Data-Line Pulse Time*/
-#define TB_DATA_PLS          (10)	/* b_srp_init,continue 5~10ms
-					 * section:5.1.3
-					 */
-/* SRP Fail Time  */
-#define TB_SRP_FAIL          (6000)	/* b_srp_init,fail time 5~6s
-					 * section:5.1.6
-					 */
-/* A-SE0 to B-Reset  */
-#define TB_ASE0_BRST         (155)	/* minimum 155 ms, section:5.3.1 */
-/* SE0 Time Before SRP */
-#define TB_SE0_SRP           (1000)	/* b_idle,minimum 1s, section:5.1.2 */
-/* SSEND time before SRP */
-#define TB_SSEND_SRP         (1500)	/* minimum 1.5 sec, section:5.1.2 */
-
-#if IS_ENABLED(CONFIG_USB_OTG_FSM)
-
-int ci_hdrc_otg_fsm_init(struct ci_hdrc *ci);
-int ci_otg_fsm_work(struct ci_hdrc *ci);
-irqreturn_t ci_otg_fsm_irq(struct ci_hdrc *ci);
-void ci_hdrc_otg_fsm_start(struct ci_hdrc *ci);
-void ci_hdrc_otg_fsm_remove(struct ci_hdrc *ci);
-
-#else
-
-static inline int ci_hdrc_otg_fsm_init(struct ci_hdrc *ci)
-{
-	return 0;
-}
-
-static inline int ci_otg_fsm_work(struct ci_hdrc *ci)
-{
-	return -ENXIO;
-}
-
-static inline irqreturn_t ci_otg_fsm_irq(struct ci_hdrc *ci)
-{
-	return IRQ_NONE;
-}
-
-static inline void ci_hdrc_otg_fsm_start(struct ci_hdrc *ci)
-{
-
-}
-
-static inline void ci_hdrc_otg_fsm_remove(struct ci_hdrc *ci)
-{
-
-}
-
-#endif
-
-#endif /* __DRIVERS_USB_CHIPIDEA_OTG_FSM_H */
+_288__UvdLevel_7_padding_0_MASK 0xff00
+#define DPM_TABLE_288__UvdLevel_7_padding_0__SHIFT 0x8
+#define DPM_TABLE_288__UvdLevel_7_DclkDivider_MASK 0xff0000
+#define DPM_TABLE_288__UvdLevel_7_DclkDivider__SHIFT 0x10
+#define DPM_TABLE_288__UvdLevel_7_VclkDivider_MASK 0xff000000
+#define DPM_TABLE_288__UvdLevel_7_VclkDivider__SHIFT 0x18
+#define DPM_TABLE_289__VceLevel_0_Frequency_MASK 0xffffffff
+#define DPM_TABLE_289__VceLevel_0_Frequency__SHIFT 0x0
+#define DPM_TABLE_290__VceLevel_0_MinVoltage_Phases_MASK 0xff
+#define DPM_TABLE_290__VceLevel_0_MinVoltage_Phases__SHIFT 0x0
+#define DPM_TABLE_290__VceLevel_0_MinVoltage_VddGfx_MASK 0xff00
+#define DPM_TABLE_290__VceLevel_0_MinVoltage_VddGfx__SHIFT 0x8
+#define DPM_TABLE_290__VceLevel_0_MinVoltage_Vddci_MASK 0xff0000
+#define DPM_TABLE_290__VceLevel_0_MinVoltage_Vddci__SHIFT 0x10
+#define DPM_TABLE_290__VceLevel_0_MinVoltage_Vddc_MASK 0xff000000
+#define DPM_TABLE_290__VceLevel_0_MinVoltage_Vddc__SHIFT 0x18
+#define DPM_TABLE_291__VceLevel_0_padding_2_MASK 0xff
+#define DPM_TABLE_291__VceLevel_0_padding_2__SHIFT 0x0
+#define DPM_TABLE_291__VceLevel_0_padding_1_MASK 0xff00
+#define DPM_TABLE_291__VceLevel_0_padding_1__SHIFT 0x8
+#define DPM_TABLE_291__VceLevel_0_padding_0_MASK 0xff0000
+#define DPM_TABLE_291__VceLevel_0_padding_0__SHIFT 0x10
+#define DPM_TABLE_291__VceLevel_0_Divider_MASK 0xff000000
+#define DPM_TABLE_291__VceLevel_0_Divider__SHIFT 0x18
+#define DPM_TABLE_292__VceLevel_1_Frequency_MASK 0xffffffff
+#define DPM_TABLE_292__VceLevel_1_Frequency__SHIFT 0x0
+#define DPM_TABLE_293__VceLevel_1_MinVoltage_Phases_MASK 0xff
+#define DPM_TABLE_293__VceLevel_1_MinVoltage_Phases__SHIFT 0x0
+#define DPM_TABLE_293__VceLevel_1_MinVoltage_VddGfx_MASK 0xff00
+#define DPM_TABLE_293__VceLevel_1_MinVoltage_VddGfx__SHIFT 0x8
+#define DPM_TABLE_293__VceLevel_1_MinVoltage_Vddci_MASK 0xff0000
+#define DPM_TABLE_293__VceLevel_1_MinVoltage_Vddci__SHIFT 0x10
+#define DPM_TABLE_293__VceLevel_1_MinVoltage_Vddc_MASK 0xff000000
+#define DPM_TABLE_293__VceLevel_1_MinVoltage_Vddc__SHIFT 0x18
+#define DPM_TABLE_294__VceLevel_1_padding_2_MASK 0xff
+#define DPM_TABLE_294__VceLevel_1_padding_2__SHIFT 0x0
+#define DPM_TABLE_294__VceLevel_1_padding_1_MASK 0xff00
+#define DPM_TABLE_294__VceLevel_1_padding_1__SHIFT 0x8
+#define DPM_TABLE_294__VceLevel_1_padding_0_MASK 0xff0000
+#define DPM_TABLE_294__VceLevel_1_padding_0__SHIFT 0x10
+#define DPM_TABLE_294__VceLevel_1_Divider_MASK 0xff000000
+#define DPM_TABLE_294__VceLevel_1_Divider__SHIFT 0x18
+#define DPM_TABLE_295__VceLevel_2_Frequency_MASK 0xffffffff
+#define DPM_TABLE_295__VceLevel_2_Frequency__SHIFT 0x0
+#define DPM_TABLE_296__VceLevel_2_

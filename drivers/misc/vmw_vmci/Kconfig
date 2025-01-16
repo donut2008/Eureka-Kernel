@@ -1,16 +1,8 @@
-#
-# VMware VMCI device
-#
-
-config VMWARE_VMCI
-	tristate "VMware VMCI Driver"
-	depends on X86 && PCI
-	help
-	  This is VMware's Virtual Machine Communication Interface.  It enables
-	  high-speed communication between host and guest in a virtual
-	  environment via the VMCI virtual device.
-
-	  If unsure, say N.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called vmw_vmci.
+ST_OVRD_EN_MASK 0x4
+#define PB0_GLB_OVRD_REG1__TST_LOSPDTST_RST_OVRD_EN__SHIFT 0x2
+#define PB0_GLB_OVRD_REG1__TST_LOSPDTST_RST_OVRD_VAL_MASK 0x8
+#define PB0_GLB_OVRD_REG1__TST_LOSPDTST_RST_OVRD_VAL__SHIFT 0x3
+#define PB0_GLB_OVRD_REG1__RXTERM_VAL_OVRD_EN_MASK 0x8000
+#define PB0_GLB_OVRD_REG1__RXTERM_VAL_OVRD_EN__SHIFT 0xf
+#define PB0_GLB_OVRD_REG1__RXTERM_VAL_OVRD_VAL_MASK 0xffff0000
+#define PB0_GLB

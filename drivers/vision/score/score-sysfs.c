@@ -1,149 +1,62 @@
-/*
- * Samsung Exynos SoC series SCORE driver
- *
- * Copyright (c) 2016 Samsung Electronics Co., Ltd
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/pm_qos.h>
-#include <linux/gpio.h>
-#include "score-sysfs.h"
-
-#ifdef ENABLE_SYSFS_SYSTEM
-ssize_t show_sysfs_system_dvfs_en(struct device *dev, struct device_attribute *attr,
-		char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n", sysfs_system.en_dvfs);
-}
-
-ssize_t store_sysfs_system_dvfs_en(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-#ifdef ENABLE_DVFS
-	struct score_device *device =
-		(struct score_device *)platform_get_drvdata(to_platform_device(dev));
-	struct score_system *system;
-	int i;
-
-	BUG_ON(!core);
-
-	system = &device->system;
-
-	switch (buf[0]) {
-		case '0':
-			sysfs_system.en_dvfs = false;
-			/* update dvfs lever to max */
-			mutex_lock(&system->dvfs_ctrl.lock);
-			for (i = 0; i < FIMC_IS_STREAM_COUNT; i++) {
-				if (test_bit(SCORE_DEVICE_OPEN, &device.state))
-					score_set_dvfs(system, SCORE_DVFS_MAX);
-			}
-			score_dvfs_init(system);
-			system->dvfs_ctrl.static_ctrl->current_id = SCORE_DVFS_MAX;
-			mutex_unlock(&system->dvfs_ctrl.lock);
-			break;
-		case '1':
-			/* It can not re-define static scenario */
-			sysfs_debug.en_dvfs = true;
-			break;
-		default:
-			pr_debug("%s: %c\n", __func__, buf[0]);
-			break;
-	}
-#endif
-	return count;
-}
-
-ssize_t show_sysfs_system_clk_gate_en(struct device *dev,
-		struct device_attribute *attr,
-		char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n", sysfs_system.en_clk_gate);
-}
-
-ssize_t store_sysfs_system_clk_gate_en(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-#ifdef ENABLE_CLOCK_GATE
-	switch (buf[0]) {
-		case '0':
-			sysfs_system.en_clk_gate = false;
-			sysfs_system.clk_gate_mode = CLOCK_GATE_MODE_HOST;
-			break;
-		case '1':
-			sysfs_system.en_clk_gate = true;
-			sysfs_system.clk_gate_mode = CLOCK_GATE_MODE_HOST;
-			break;
-		default:
-			pr_debug("%s: %c\n", __func__, buf[0]);
-			break;
-	}
-#endif
-	return count;
-}
-
-#endif /* ENABLE_SYSFS_SYSTEM */
-#ifdef ENABLE_SYSFS_STATE
-ssize_t show_sysfs_state_val(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "du(%d) l/s(%d %d) lv/sv(%d %d) lr/sr(%d %d)\n",
-			sysfs_state.frame_duration,
-			sysfs_state.long_time,
-			sysfs_state.short_time,
-			sysfs_state.long_v_rank,
-			sysfs_state.short_v_rank,
-			sysfs_state.long_r_rank,
-			sysfs_state.short_r_rank);
-}
-
-ssize_t store_sysfs_state_val(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-	int ret_count;
-	int input_val[7];
-
-	ret_count = sscanf(buf, "%d %d %d %d %d %d %d", &input_val[0], &input_val[1],
-			&input_val[2], &input_val[3],
-			&input_val[4], &input_val[5], &input_val[6]);
-	if (ret_count != 7) {
-		probe_err("%s: count should be 7 but %d \n", __func__, ret_count);
-		return -EINVAL;
-	}
-
-	sysfs_state.frame_duration = input_val[0];
-	sysfs_state.long_time = input_val[1];
-	sysfs_state.short_time = input_val[2];
-	sysfs_state.long_v_rank = input_val[3];
-	sysfs_state.short_v_rank = input_val[4];
-	sysfs_state.long_r_rank = input_val[5];
-	sysfs_state.short_v_rank = input_val[6];
-
-	return count;
-}
-
-ssize_t show_sysfs_state_en(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	if (sysfs_state.is_en)
-		return snprintf(buf, PAGE_SIZE, "%s\n", "enabled");
-	else
-		return snprintf(buf, PAGE_SIZE, "%s\n", "disabled");
-}
-
-ssize_t store_sysfs_state_en(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf, size_t count)
-{
-	if (buf[0] == '1')
-		sysfs_state.is_en = true;
-	else
-		sysfs_state.is_en = false;
-
-	return count;
-}
-#endif /* ENABLE_SYSFS_STATE */
+IFT 0x0
+#define D3F5_PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define D3F5_PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define D3F5_PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D3F5_PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D3F5_PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D3F5_PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D3F5_PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D3F5_PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D3F5_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define D3F5_PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define D3F5_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT_MASK 0x70
+#define D3F5_PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT__SHIFT 0x4
+#define D3F5_PCIE_PORT_VC_CAP_REG1__REF_CLK_MASK 0x300
+#define D3F5_PCIE_PORT_VC_CAP_REG1__REF_CLK__SHIFT 0x8
+#define D3F5_PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE_MASK 0xc00
+#define D3F5_PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE__SHIFT 0xa
+#define D3F5_PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP_MASK 0xff
+#define D3F5_PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP__SHIFT 0x0
+#define D3F5_PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D3F5_PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D3F5_PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE_MASK 0x1
+#define D3F5_PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE__SHIFT 0x0
+#define D3F5_PCIE_PORT_VC_CNTL__VC_ARB_SELECT_MASK 0xe
+#define D3F5_PCIE_PORT_VC_CNTL__VC_ARB_SELECT__SHIFT 0x1
+#define D3F5_PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS_MASK 0x10000
+#define D3F5_PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS__SHIFT 0x10
+#define D3F5_PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define D3F5_PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define D3F5_PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define D3F5_PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D3F5_PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D3F5_PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D3F5_PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D3F5_PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define D3F5_PCIE_VC0_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define D3F5_PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x10000
+#define D3F5_PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x10
+#define D3F5_PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x20000
+#define D3F5_PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x11
+#define D3F5_PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define D3F5_PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define D3F5_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define D3F5_PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define D3F5_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define D3F5_PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define D3F5_PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define D3F5_PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define D3F5_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define D3F5_PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define D3F5_PCIE_VC1

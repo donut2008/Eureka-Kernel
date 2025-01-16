@@ -1,171 +1,51 @@
-/*
- * Driver for Option High Speed Mobile Devices.
- *
- *   (c) 2008 Dan Williams <dcbw@redhat.com>
- *
- * Inspiration taken from sierra_ms.c by Kevin Lloyd <klloyd@sierrawireless.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/usb.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-
-#include "usb.h"
-#include "transport.h"
-#include "option_ms.h"
-#include "debug.h"
-
-#define ZCD_FORCE_MODEM			0x01
-#define ZCD_ALLOW_MS 			0x02
-
-static unsigned int option_zero_cd = ZCD_FORCE_MODEM;
-module_param(option_zero_cd, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(option_zero_cd, "ZeroCD mode (1=Force Modem (default),"
-		 " 2=Allow CD-Rom");
-
-#define RESPONSE_LEN 1024
-
-static int option_rezero(struct us_data *us)
-{
-	const unsigned char rezero_msg[] = {
-	  0x55, 0x53, 0x42, 0x43, 0x78, 0x56, 0x34, 0x12,
-	  0x01, 0x00, 0x00, 0x00, 0x80, 0x00, 0x06, 0x01,
-	  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-	};
-	char *buffer;
-	int result;
-
-	usb_stor_dbg(us, "Option MS: %s\n", "DEVICE MODE SWITCH");
-
-	buffer = kzalloc(RESPONSE_LEN, GFP_KERNEL);
-	if (buffer == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	memcpy(buffer, rezero_msg, sizeof(rezero_msg));
-	result = usb_stor_bulk_transfer_buf(us,
-			us->send_bulk_pipe,
-			buffer, sizeof(rezero_msg), NULL);
-	if (result != USB_STOR_XFER_GOOD) {
-		result = USB_STOR_XFER_ERROR;
-		goto out;
-	}
-
-	/* Some of the devices need to be asked for a response, but we don't
-	 * care what that response is.
-	 */
-	usb_stor_bulk_transfer_buf(us,
-			us->recv_bulk_pipe,
-			buffer, RESPONSE_LEN, NULL);
-
-	/* Read the CSW */
-	usb_stor_bulk_transfer_buf(us,
-			us->recv_bulk_pipe,
-			buffer, 13, NULL);
-
-	result = USB_STOR_XFER_GOOD;
-
-out:
-	kfree(buffer);
-	return result;
-}
-
-static int option_inquiry(struct us_data *us)
-{
-	const unsigned char inquiry_msg[] = {
-	  0x55, 0x53, 0x42, 0x43, 0x12, 0x34, 0x56, 0x78,
-	  0x24, 0x00, 0x00, 0x00, 0x80, 0x00, 0x06, 0x12,
-	  0x00, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00,
-	  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-	};
-	char *buffer;
-	int result;
-
-	usb_stor_dbg(us, "Option MS: %s\n", "device inquiry for vendor name");
-
-	buffer = kzalloc(0x24, GFP_KERNEL);
-	if (buffer == NULL)
-		return USB_STOR_TRANSPORT_ERROR;
-
-	memcpy(buffer, inquiry_msg, sizeof(inquiry_msg));
-	result = usb_stor_bulk_transfer_buf(us,
-			us->send_bulk_pipe,
-			buffer, sizeof(inquiry_msg), NULL);
-	if (result != USB_STOR_XFER_GOOD) {
-		result = USB_STOR_XFER_ERROR;
-		goto out;
-	}
-
-	result = usb_stor_bulk_transfer_buf(us,
-			us->recv_bulk_pipe,
-			buffer, 0x24, NULL);
-	if (result != USB_STOR_XFER_GOOD) {
-		result = USB_STOR_XFER_ERROR;
-		goto out;
-	}
-
-	result = memcmp(buffer+8, "Option", 6);
-
-	if (result != 0)
-		result = memcmp(buffer+8, "ZCOPTION", 8);
-
-	/* Read the CSW */
-	usb_stor_bulk_transfer_buf(us,
-			us->recv_bulk_pipe,
-			buffer, 13, NULL);
-
-out:
-	kfree(buffer);
-	return result;
-}
-
-
-int option_ms_init(struct us_data *us)
-{
-	int result;
-
-	usb_stor_dbg(us, "Option MS: %s\n", "option_ms_init called");
-
-	/* Additional test for vendor information via INQUIRY,
-	 * because some vendor/product IDs are ambiguous
-	 */
-	result = option_inquiry(us);
-	if (result != 0) {
-		usb_stor_dbg(us, "Option MS: %s\n",
-			     "vendor is not Option or not determinable, no action taken");
-		return 0;
-	} else
-		usb_stor_dbg(us, "Option MS: %s\n",
-			     "this is a genuine Option device, proceeding");
-
-	/* Force Modem mode */
-	if (option_zero_cd == ZCD_FORCE_MODEM) {
-		usb_stor_dbg(us, "Option MS: %s\n", "Forcing Modem Mode");
-		result = option_rezero(us);
-		if (result != USB_STOR_XFER_GOOD)
-			usb_stor_dbg(us, "Option MS: %s\n",
-				     "Failed to switch to modem mode");
-		return -EIO;
-	} else if (option_zero_cd == ZCD_ALLOW_MS) {
-		/* Allow Mass Storage mode (keep CD-Rom) */
-		usb_stor_dbg(us, "Option MS: %s\n",
-			     "Allowing Mass Storage Mode if device requests it");
-	}
-
-	return 0;
-}
-
+efine ixPSX80_BIF_PCIE_LC_STATE10                                             0x1400026
+#define ixPSX80_BIF_PCIE_LC_STATE11                                             0x1400027
+#define ixPSX80_BIF_PCIE_LC_STATUS1                                             0x1400028
+#define ixPSX80_BIF_PCIE_LC_STATUS2                                             0x1400029
+#define ixPSX80_BIF_PCIE_WPR_CNTL                                               0x1400030
+#define ixPSX80_BIF_PCIE_RX_LAST_TLP0                                           0x1400031
+#define ixPSX80_BIF_PCIE_RX_LAST_TLP1                                           0x1400032
+#define ixPSX80_BIF_PCIE_RX_LAST_TLP2                                           0x1400033
+#define ixPSX80_BIF_PCIE_RX_LAST_TLP3                                           0x1400034
+#define ixPSX80_BIF_PCIE_TX_LAST_TLP0                                           0x1400035
+#define ixPSX80_BIF_PCIE_TX_LAST_TLP1                                           0x1400036
+#define ixPSX80_BIF_PCIE_TX_LAST_TLP2                                           0x1400037
+#define ixPSX80_BIF_PCIE_TX_LAST_TLP3                                           0x1400038
+#define ixPSX80_BIF_PCIE_I2C_REG_ADDR_EXPAND                                    0x140003a
+#define ixPSX80_BIF_PCIE_I2C_REG_DATA                                           0x140003b
+#define ixPSX80_BIF_PCIE_CFG_CNTL                                               0x140003c
+#define ixPSX80_BIF_PCIE_LC_PM_CNTL                                             0x140003d
+#define ixPSX80_BIF_PCIE_P_CNTL                                                 0x1400040
+#define ixPSX80_BIF_PCIE_P_BUF_STATUS                                           0x1400041
+#define ixPSX80_BIF_PCIE_P_DECODER_STATUS                                       0x1400042
+#define ixPSX80_BIF_PCIE_P_MISC_STATUS                                          0x1400043
+#define ixPSX80_BIF_PCIE_P_RCV_L0S_FTS_DET                                      0x1400050
+#define ixPSX80_BIF_PCIE_PERF_COUNT_CNTL                                        0x1400080
+#define ixPSX80_BIF_PCIE_PERF_CNTL_TXCLK                                        0x1400081
+#define ixPSX80_BIF_PCIE_PERF_COUNT0_TXCLK                                      0x1400082
+#define ixPSX80_BIF_PCIE_PERF_COUNT1_TXCLK                                      0x1400083
+#define ixPSX80_BIF_PCIE_PERF_CNTL_MST_R_CLK                                    0x1400084
+#define ixPSX80_BIF_PCIE_PERF_COUNT0_MST_R_CLK                                  0x1400085
+#define ixPSX80_BIF_PCIE_PERF_COUNT1_MST_R_CLK                                  0x1400086
+#define ixPSX80_BIF_PCIE_PERF_CNTL_MST_C_CLK                                    0x1400087
+#define ixPSX80_BIF_PCIE_PERF_COUNT0_MST_C_CLK                                  0x1400088
+#define ixPSX80_BIF_PCIE_PERF_COUNT1_MST_C_CLK                                  0x1400089
+#define ixPSX80_BIF_PCIE_PERF_CNTL_SLV_R_CLK                                    0x140008a
+#define ixPSX80_BIF_PCIE_PERF_COUNT0_SLV_R_CLK                                  0x140008b
+#define ixPSX80_BIF_PCIE_PERF_COUNT1_SLV_R_CLK                                  0x140008c
+#define ixPSX80_BIF_PCIE_PERF_CNTL_SLV_S_C_CLK                                  0x140008d
+#define ixPSX80_BIF_PCIE_PERF_COUNT0_SLV_S_C_CLK                                0x140008e
+#define ixPSX80_BIF_PCIE_PERF_COUNT1_SLV_S_C_CLK                                0x140008f
+#define ixPSX80_BIF_PCIE_PERF_CNTL_SLV_NS_C_CLK                                 0x1400090
+#define ixPSX80_BIF_PCIE_PERF_COUNT0_SLV_NS_C_CLK                               0x1400091
+#define ixPSX80_BIF_PCIE_PERF_COUNT1_SLV_NS_C_CLK                               0x1400092
+#define ixPSX80_BIF_PCIE_PERF_CNTL_EVENT0_PORT_SEL                              0x1400093
+#define ixPSX80_BIF_PCIE_PERF_CNTL_EVENT1_PORT_SEL                              0x1400094
+#define ixPSX80_BIF_PCIE_PERF_CNTL_TXCLK2                                       0x1400095
+#define ixPSX80_BIF_PCIE_PERF_COUNT0_TXCLK2                                     0x1400096
+#define ixPSX80_BIF_PCIE_PERF_COUNT1_TXCLK2                                     0x1400097
+#define ixPSX80_BIF_PCIE_STRAP_F0                                               0x14000b0
+#define ixPSX80_BIF_PCIE_STRAP_MISC                                             0x14000c0
+#define ixPSX80_BIF_PCIE_STRAP_MISC2                                            0x14000c1
+#define ixPSX80_BIF_PCIE_STRAP_PI                                               0x14000c2
+#define ixPSX80_BIF_PCIE_STRAP_I2C_BD                         

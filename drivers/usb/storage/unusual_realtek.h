@@ -1,56 +1,31 @@
-/* Driver for Realtek RTS51xx USB card reader
- *
- * Copyright(c) 2009 Realtek Semiconductor Corp. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, see <http://www.gnu.org/licenses/>.
- *
- * Author:
- *   wwang (wei_wang@realsil.com.cn)
- *   No. 450, Shenhu Road, Suzhou Industry Park, Suzhou, China
- */
-
-#if defined(CONFIG_USB_STORAGE_REALTEK) || \
-		defined(CONFIG_USB_STORAGE_REALTEK_MODULE)
-
-UNUSUAL_DEV(0x0bda, 0x0138, 0x0000, 0x9999,
-		"Realtek",
-		"USB Card Reader",
-		USB_SC_DEVICE, USB_PR_DEVICE, init_realtek_cr, 0),
-
-UNUSUAL_DEV(0x0bda, 0x0153, 0x0000, 0x9999,
-		"Realtek",
-		"USB Card Reader",
-		USB_SC_DEVICE, USB_PR_DEVICE, init_realtek_cr, 0),
-
-UNUSUAL_DEV(0x0bda, 0x0158, 0x0000, 0x9999,
-		"Realtek",
-		"USB Card Reader",
-		USB_SC_DEVICE, USB_PR_DEVICE, init_realtek_cr, 0),
-
-UNUSUAL_DEV(0x0bda, 0x0159, 0x0000, 0x9999,
-		"Realtek",
-		"USB Card Reader",
-		USB_SC_DEVICE, USB_PR_DEVICE, init_realtek_cr, 0),
-
-UNUSUAL_DEV(0x0bda, 0x0177, 0x0000, 0x9999,
-		"Realtek",
-		"USB Card Reader",
-		USB_SC_DEVICE, USB_PR_DEVICE, init_realtek_cr, 0),
-
-UNUSUAL_DEV(0x0bda, 0x0184, 0x0000, 0x9999,
-		"Realtek",
-		"USB Card Reader",
-		USB_SC_DEVICE, USB_PR_DEVICE, init_realtek_cr, 0),
-
-#endif  /* defined(CONFIG_USB_STORAGE_REALTEK) || ... */
+TR_TO_ACTIVE__SHIFT 0x10
+#define PCIE_OBFF_CNTL__TX_OBFF_ERR_TO_ACTIVE_MASK 0x20000
+#define PCIE_OBFF_CNTL__TX_OBFF_ERR_TO_ACTIVE__SHIFT 0x11
+#define PCIE_OBFF_CNTL__TX_OBFF_ANY_MSG_TO_ACTIVE_MASK 0x40000
+#define PCIE_OBFF_CNTL__TX_OBFF_ANY_MSG_TO_ACTIVE__SHIFT 0x12
+#define PCIE_OBFF_CNTL__TX_OBFF_PENDING_REQ_TO_ACTIVE_MASK 0xf00000
+#define PCIE_OBFF_CNTL__TX_OBFF_PENDING_REQ_TO_ACTIVE__SHIFT 0x14
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_SHORT_VALUE_MASK 0x7
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_SHORT_VALUE__SHIFT 0x0
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_LONG_VALUE_MASK 0x38
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_LONG_VALUE__SHIFT 0x3
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_REQUIREMENT_MASK 0x40
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_REQUIREMENT__SHIFT 0x6
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_NS_SHORT_VALUE_MASK 0x380
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_NS_SHORT_VALUE__SHIFT 0x7
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_NS_LONG_VALUE_MASK 0x1c00
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_NS_LONG_VALUE__SHIFT 0xa
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_NS_REQUIREMENT_MASK 0x2000
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_NS_REQUIREMENT__SHIFT 0xd
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_MSG_DIS_IN_PM_NON_D0_MASK 0x4000
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_MSG_DIS_IN_PM_NON_D0__SHIFT 0xe
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_RST_LTR_IN_DL_DOWN_MASK 0x8000
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_RST_LTR_IN_DL_DOWN__SHIFT 0xf
+#define PCIE_PERF_COUNT_CNTL__GLOBAL_COUNT_EN_MASK 0x1
+#define PCIE_PERF_COUNT_CNTL__GLOBAL_COUNT_EN__SHIFT 0x0
+#define PCIE_PERF_COUNT_CNTL__GLOBAL_SHADOW_WR_MASK 0x2
+#define PCIE_PERF_COUNT_CNTL__GLOBAL_SHADOW_WR__SHIFT 0x1
+#define PCIE_PERF_COUNT_CNTL__GLOBAL_COUNT_RESET_MASK 0x4
+#define PCIE_PERF_COUNT_CNTL__GLOBAL_COUNT_RESET__SHIFT 0x2
+#define PCIE_PERF_CNTL_TXCLK__EVENT0_SEL_MASK 0xff
+#define PCIE_PERF_CNTL_TXCLK_

@@ -1,51 +1,1 @@
-* Parallel I/O Ports
-
-This node configures Parallel I/O ports for CPUs with QE support.
-The node should reside in the "soc" node of the tree.  For each
-device that using parallel I/O ports, a child node should be created.
-See the definition of the Pin configuration nodes below for more
-information.
-
-Required properties:
-- device_type : should be "par_io".
-- reg : offset to the register set and its length.
-- num-ports : number of Parallel I/O ports
-
-Example:
-par_io@1400 {
-	reg = <1400 100>;
-	#address-cells = <1>;
-	#size-cells = <0>;
-	device_type = "par_io";
-	num-ports = <7>;
-	ucc_pin@01 {
-		......
-	};
-
-Note that "par_io" nodes are obsolete, and should not be used for
-the new device trees. Instead, each Par I/O bank should be represented
-via its own gpio-controller node:
-
-Required properties:
-- #gpio-cells : should be "2".
-- compatible : should be "fsl,<chip>-qe-pario-bank",
-  "fsl,mpc8323-qe-pario-bank".
-- reg : offset to the register set and its length.
-- gpio-controller : node to identify gpio controllers.
-
-Example:
-	qe_pio_a: gpio-controller@1400 {
-		#gpio-cells = <2>;
-		compatible = "fsl,mpc8360-qe-pario-bank",
-		"fsl,mpc8323-qe-pario-bank";
-		reg = <0x1400 0x18>;
-		gpio-controller;
-	  };
-
-	qe_pio_e: gpio-controller@1460 {
-		#gpio-cells = <2>;
-		compatible = "fsl,mpc8360-qe-pario-bank",
-			     "fsl,mpc8323-qe-pario-bank";
-		reg = <0x1460 0x18>;
-		gpio-controller;
-	  };
+$$ÁÈêL$frõ1Æ‰×frÓÁÂñAGàf8ÜÑ1ÇÁÍfëëÑ\$fDpäî1ï‰ÎÁÁû1îÁÊËfAïòD$ 1ÖfDlå‰ßÁÃfï÷ğ1×fAo[ ÁÉfDşíØfAïôl$$AOğf8ÜĞ1Ï‰ÆÁÀfDoæı1ÎfDl$ÁËÅT$(frö1Ş‰ïfArÔÁÅò1ßÁÈfAëôêL$,fDpíî1Ç‰ÖÁÂùAf8ÜÑ1ÆÁÍÑfAïû\$01îfDlî‰ÏÁÁfAïøó1ïfDoãÁÊfşŞËfAïıD$41×‰ŞÁÃfDoïø1Öf\$ ÁÉØl$8AOf8ÜĞfr÷1Î‰ÇfArÕÁÀõ1ÏÁËfAëıÅT$<fpŞî1ß‰îÁÅú1ŞÁÈêfDïÄ$1Æflß‰×ÁÂfEïÁñAG f8ÜÑ1ÇfEoìÁÍfDşçÑfDïÃ\$1ï‰ÎÁÁfAoØû1îfDd$0ÁÊËD$fArğ1Ö‰ßfrÓÁÃğ1×ÁÉfDëÃØl$AO0f8ÜĞfDpçî1Ï‰ÆÁÀı1ÎÁËÅfDïÍT$1ŞfElà‰ïÁÅfEïÊò1ßfAoİÁÈfEşèêfEïÌL$1Ç‰ÖÁÂfEoáùAƒør*AG@f8ÜÑAOPf8ÜĞtAG`f8ÜÑAOpf8ÜĞf8İÑAG 1ÆfD,$ÁÍÑ\$fArñ1î‰ÏfArÔÁÁó1ïÁÊfEëÌËD$fEpèîÁÉ‰Ş1×ÁÃø1Î1ÑØfDïÖl$ Et$ EW÷CT%AWÖAO°f8ÜĞ!Î1ÑÁËfElé‰Ç1ÎfEïÓÁÀõfDoã1ßfAşÙ1ËfEïÕÅT$$!ß1ËÁÈfEoê‰î1ßf\$ÁÅúAGÀf8ÜÑ1ÆfArò1ØêfArÕL$(!Æ1ØfEëÕÁÍ‰×1ÆÁÂfApÙîñ1ï1ÅÑ\$,!ï1ÅÁÊAOĞf8ÜĞ‰Î1ïÁÁû1Ö1êËfDïßD$0!Ö1êÁÉfAlÚ‰ß1ÖfDïÜÁÃğfEok01ÏfEşâ1ÑfDïÛØl$4AGàf8ÜÑ!Ï1ÑÁËfAoÛ‰Æ1ÏfDd$ ÁÀı1ŞfAró1ËÅfrÓT$8!Ş1ËfDëÛÁÈ‰ï1ŞÁÅfEpâîòAOğf8ÜĞ1Ç1ØêL$<!Ç1ØÁÍ‰Ö1ÇÁÂù1î1ÅÑfAïà$!î1ÅÁÊAf8ÜÑfElã‰Ï1îfïåÁÁófAoİ1×fEşë1êfAïäËD$!×1êÁÉfDoä‰Ş1×fDl$0ÁÃø1Îfrô1ÑØfArÔl$AOf8ÜĞ!Î1ÑfAëäÁË‰Ç1ÎÁÀfEpëîõ1ß1ËÅT$!ß1ËÁÈ‰î1ßÁÅúAG f8ÜÑ1Æ1ØêfAïéL$!Æ1ØÁÍfDlì‰×1ÆfïîÁÂñfD

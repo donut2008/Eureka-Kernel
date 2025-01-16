@@ -1,394 +1,275 @@
-/*
- * arch/sh/mm/cache-sh4.c
- *
- * Copyright (C) 1999, 2000, 2002  Niibe Yutaka
- * Copyright (C) 2001 - 2009  Paul Mundt
- * Copyright (C) 2003  Richard Curnow
- * Copyright (c) 2007 STMicroelectronics (R&D) Ltd.
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+he kernel
+ *  flushes icache explicitly if necessary.
  */
-#include <linux/init.h>
-#include <linux/mm.h>
-#include <linux/io.h>
-#include <linux/mutex.h>
-#include <linux/fs.h>
-#include <linux/highmem.h>
-#include <asm/pgtable.h>
-#include <asm/mmu_context.h>
-#include <asm/cache_insns.h>
-#include <asm/cacheflush.h>
+#define pte_present_exec_user(pte)\
+	((pte_val(pte) & (_PAGE_P | _PAGE_PL_MASK | _PAGE_AR_RX)) == \
+		(_PAGE_P | _PAGE_PL_3 | _PAGE_AR_RX))
 
-/*
- * The maximum number of pages we support up to when doing ranged dcache
- * flushing. Anything exceeding this will simply flush the dcache in its
- * entirety.
- */
-#define MAX_ICACHE_PAGES	32
-
-static void __flush_cache_one(unsigned long addr, unsigned long phys,
-			       unsigned long exec_offset);
-
-/*
- * Write back the range of D-cache, and purge the I-cache.
- *
- * Called from kernel/module.c:sys_init_module and routine for a.out format,
- * signal handler code and kprobes code
- */
-static void sh4_flush_icache_range(void *args)
+extern void __ia64_sync_icache_dcache(pte_t pteval);
+static inline void set_pte(pte_t *ptep, pte_t pteval)
 {
-	struct flusher_data *data = args;
-	unsigned long start, end;
-	unsigned long flags, v;
-	int i;
-
-	start = data->addr1;
-	end = data->addr2;
-
-	/* If there are too many pages then just blow away the caches */
-	if (((end - start) >> PAGE_SHIFT) >= MAX_ICACHE_PAGES) {
-		local_flush_cache_all(NULL);
-		return;
-	}
-
-	/*
-	 * Selectively flush d-cache then invalidate the i-cache.
-	 * This is inefficient, so only use this for small ranges.
+	/* page is present && page is user  && page is executable
+	 * && (page swapin or new page or page migraton
+	 *	|| copy_on_write with page copying.)
 	 */
-	start &= ~(L1_CACHE_BYTES-1);
-	end += L1_CACHE_BYTES-1;
-	end &= ~(L1_CACHE_BYTES-1);
-
-	local_irq_save(flags);
-	jump_to_uncached();
-
-	for (v = start; v < end; v += L1_CACHE_BYTES) {
-		unsigned long icacheaddr;
-		int j, n;
-
-		__ocbwb(v);
-
-		icacheaddr = CACHE_IC_ADDRESS_ARRAY | (v &
-				cpu_data->icache.entry_mask);
-
-		/* Clear i-cache line valid-bit */
-		n = boot_cpu_data.icache.n_aliases;
-		for (i = 0; i < cpu_data->icache.ways; i++) {
-			for (j = 0; j < n; j++)
-				__raw_writel(0, icacheaddr + (j * PAGE_SIZE));
-			icacheaddr += cpu_data->icache.way_incr;
-		}
-	}
-
-	back_to_cached();
-	local_irq_restore(flags);
+	if (pte_present_exec_user(pteval) &&
+	    (!pte_present(*ptep) ||
+		pte_pfn(*ptep) != pte_pfn(pteval)))
+		/* load_module() calles flush_icache_range() explicitly*/
+		__ia64_sync_icache_dcache(pteval);
+	*ptep = pteval;
 }
 
-static inline void flush_cache_one(unsigned long start, unsigned long phys)
-{
-	unsigned long flags, exec_offset = 0;
-
-	/*
-	 * All types of SH-4 require PC to be uncached to operate on the I-cache.
-	 * Some types of SH-4 require PC to be uncached to operate on the D-cache.
-	 */
-	if ((boot_cpu_data.flags & CPU_HAS_P2_FLUSH_BUG) ||
-	    (start < CACHE_OC_ADDRESS_ARRAY))
-		exec_offset = cached_to_uncached;
-
-	local_irq_save(flags);
-	__flush_cache_one(start, phys, exec_offset);
-	local_irq_restore(flags);
-}
+#define set_pte_at(mm,addr,ptep,pteval) set_pte(ptep,pteval)
 
 /*
- * Write back & invalidate the D-cache of the page.
- * (To avoid "alias" issues)
+ * Make page protection values cacheable, uncacheable, or write-
+ * combining.  Note that "protection" is really a misnomer here as the
+ * protection value contains the memory attribute bits, dirty bits, and
+ * various other bits as well.
  */
-static void sh4_flush_dcache_page(void *arg)
-{
-	struct page *page = arg;
-	unsigned long addr = (unsigned long)page_address(page);
-#ifndef CONFIG_SMP
-	struct address_space *mapping = page_mapping(page);
+#define pgprot_cacheable(prot)		__pgprot((pgprot_val(prot) & ~_PAGE_MA_MASK) | _PAGE_MA_WB)
+#define pgprot_noncached(prot)		__pgprot((pgprot_val(prot) & ~_PAGE_MA_MASK) | _PAGE_MA_UC)
+#define pgprot_writecombine(prot)	__pgprot((pgprot_val(prot) & ~_PAGE_MA_MASK) | _PAGE_MA_WC)
 
-	if (mapping && !mapping_mapped(mapping))
-		clear_bit(PG_dcache_clean, &page->flags);
-	else
+struct file;
+extern pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
+				     unsigned long size, pgprot_t vma_prot);
+#define __HAVE_PHYS_MEM_ACCESS_PROT
+
+static inline unsigned long
+pgd_index (unsigned long address)
+{
+	unsigned long region = address >> 61;
+	unsigned long l1index = (address >> PGDIR_SHIFT) & ((PTRS_PER_PGD >> 3) - 1);
+
+	return (region << (PAGE_SHIFT - 6)) | l1index;
+}
+
+/* The offset in the 1-level directory is given by the 3 region bits
+   (61..63) and the level-1 bits.  */
+static inline pgd_t*
+pgd_offset (const struct mm_struct *mm, unsigned long address)
+{
+	return mm->pgd + pgd_index(address);
+}
+
+/* In the kernel's mapped region we completely ignore the region number
+   (since we know it's in region number 5). */
+#define pgd_offset_k(addr) \
+	(init_mm.pgd + (((addr) >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1)))
+
+/* Look up a pgd entry in the gate area.  On IA-64, the gate-area
+   resides in the kernel-mapped segment, hence we use pgd_offset_k()
+   here.  */
+#define pgd_offset_gate(mm, addr)	pgd_offset_k(addr)
+
+#if CONFIG_PGTABLE_LEVELS == 4
+/* Find an entry in the second-level page table.. */
+#define pud_offset(dir,addr) \
+	((pud_t *) pgd_page_vaddr(*(dir)) + (((addr) >> PUD_SHIFT) & (PTRS_PER_PUD - 1)))
 #endif
-		flush_cache_one(CACHE_OC_ADDRESS_ARRAY |
-				(addr & shm_align_mask), page_to_phys(page));
 
-	wmb();
-}
-
-/* TODO: Selective icache invalidation through IC address array.. */
-static void flush_icache_all(void)
-{
-	unsigned long flags, ccr;
-
-	local_irq_save(flags);
-	jump_to_uncached();
-
-	/* Flush I-cache */
-	ccr = __raw_readl(SH_CCR);
-	ccr |= CCR_CACHE_ICI;
-	__raw_writel(ccr, SH_CCR);
-
-	/*
-	 * back_to_cached() will take care of the barrier for us, don't add
-	 * another one!
-	 */
-
-	back_to_cached();
-	local_irq_restore(flags);
-}
-
-static void flush_dcache_all(void)
-{
-	unsigned long addr, end_addr, entry_offset;
-
-	end_addr = CACHE_OC_ADDRESS_ARRAY +
-		(current_cpu_data.dcache.sets <<
-		 current_cpu_data.dcache.entry_shift) *
-			current_cpu_data.dcache.ways;
-
-	entry_offset = 1 << current_cpu_data.dcache.entry_shift;
-
-	for (addr = CACHE_OC_ADDRESS_ARRAY; addr < end_addr; ) {
-		__raw_writel(0, addr); addr += entry_offset;
-		__raw_writel(0, addr); addr += entry_offset;
-		__raw_writel(0, addr); addr += entry_offset;
-		__raw_writel(0, addr); addr += entry_offset;
-		__raw_writel(0, addr); addr += entry_offset;
-		__raw_writel(0, addr); addr += entry_offset;
-		__raw_writel(0, addr); addr += entry_offset;
-		__raw_writel(0, addr); addr += entry_offset;
-	}
-}
-
-static void sh4_flush_cache_all(void *unused)
-{
-	flush_dcache_all();
-	flush_icache_all();
-}
+/* Find an entry in the third-level page table.. */
+#define pmd_offset(dir,addr) \
+	((pmd_t *) pud_page_vaddr(*(dir)) + (((addr) >> PMD_SHIFT) & (PTRS_PER_PMD - 1)))
 
 /*
- * Note : (RPC) since the caches are physically tagged, the only point
- * of flush_cache_mm for SH-4 is to get rid of aliases from the
- * D-cache.  The assumption elsewhere, e.g. flush_cache_range, is that
- * lines can stay resident so long as the virtual address they were
- * accessed with (hence cache set) is in accord with the physical
- * address (i.e. tag).  It's no different here.
- *
- * Caller takes mm->mmap_sem.
+ * Find an entry in the third-level page table.  This looks more complicated than it
+ * should be because some platforms place page tables in high memory.
  */
-static void sh4_flush_cache_mm(void *arg)
+#define pte_index(addr)	 	(((addr) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1))
+#define pte_offset_kernel(dir,addr)	((pte_t *) pmd_page_vaddr(*(dir)) + pte_index(addr))
+#define pte_offset_map(dir,addr)	pte_offset_kernel(dir, addr)
+#define pte_unmap(pte)			do { } while (0)
+
+/* atomic versions of the some PTE manipulations: */
+
+static inline int
+ptep_test_and_clear_young (struct vm_area_struct *vma, unsigned long addr, pte_t *ptep)
 {
-	struct mm_struct *mm = arg;
-
-	if (cpu_context(smp_processor_id(), mm) == NO_CONTEXT)
-		return;
-
-	flush_dcache_all();
+#ifdef CONFIG_SMP
+	if (!pte_young(*ptep))
+		return 0;
+	return test_and_clear_bit(_PAGE_A_BIT, ptep);
+#else
+	pte_t pte = *ptep;
+	if (!pte_young(pte))
+		return 0;
+	set_pte_at(vma->vm_mm, addr, ptep, pte_mkold(pte));
+	return 1;
+#endif
 }
 
-/*
- * Write back and invalidate I/D-caches for the page.
- *
- * ADDR: Virtual Address (U0 address)
- * PFN: Physical page number
- */
-static void sh4_flush_cache_page(void *args)
+static inline pte_t
+ptep_get_and_clear(struct mm_struct *mm, unsigned long addr, pte_t *ptep)
 {
-	struct flusher_data *data = args;
-	struct vm_area_struct *vma;
-	struct page *page;
-	unsigned long address, pfn, phys;
-	int map_coherent = 0;
-	pgd_t *pgd;
-	pud_t *pud;
-	pmd_t *pmd;
-	pte_t *pte;
-	void *vaddr;
-
-	vma = data->vma;
-	address = data->addr1 & PAGE_MASK;
-	pfn = data->addr2;
-	phys = pfn << PAGE_SHIFT;
-	page = pfn_to_page(pfn);
-
-	if (cpu_context(smp_processor_id(), vma->vm_mm) == NO_CONTEXT)
-		return;
-
-	pgd = pgd_offset(vma->vm_mm, address);
-	pud = pud_offset(pgd, address);
-	pmd = pmd_offset(pud, address);
-	pte = pte_offset_kernel(pmd, address);
-
-	/* If the page isn't present, there is nothing to do here. */
-	if (!(pte_val(*pte) & _PAGE_PRESENT))
-		return;
-
-	if ((vma->vm_mm == current->active_mm))
-		vaddr = NULL;
-	else {
-		/*
-		 * Use kmap_coherent or kmap_atomic to do flushes for
-		 * another ASID than the current one.
-		 */
-		map_coherent = (current_cpu_data.dcache.n_aliases &&
-			test_bit(PG_dcache_clean, &page->flags) &&
-			page_mapped(page));
-		if (map_coherent)
-			vaddr = kmap_coherent(page, address);
-		else
-			vaddr = kmap_atomic(page);
-
-		address = (unsigned long)vaddr;
-	}
-
-	flush_cache_one(CACHE_OC_ADDRESS_ARRAY |
-			(address & shm_align_mask), phys);
-
-	if (vma->vm_flags & VM_EXEC)
-		flush_icache_all();
-
-	if (vaddr) {
-		if (map_coherent)
-			kunmap_coherent(vaddr);
-		else
-			kunmap_atomic(vaddr);
-	}
+#ifdef CONFIG_SMP
+	return __pte(xchg((long *) ptep, 0));
+#else
+	pte_t pte = *ptep;
+	pte_clear(mm, addr, ptep);
+	return pte;
+#endif
 }
 
-/*
- * Write back and invalidate D-caches.
- *
- * START, END: Virtual Address (U0 address)
- *
- * NOTE: We need to flush the _physical_ page entry.
- * Flushing the cache lines for U0 only isn't enough.
- * We need to flush for P1 too, which may contain aliases.
- */
-static void sh4_flush_cache_range(void *args)
+static inline void
+ptep_set_wrprotect(struct mm_struct *mm, unsigned long addr, pte_t *ptep)
 {
-	struct flusher_data *data = args;
-	struct vm_area_struct *vma;
-	unsigned long start, end;
+#ifdef CONFIG_SMP
+	unsigned long new, old;
 
-	vma = data->vma;
-	start = data->addr1;
-	end = data->addr2;
-
-	if (cpu_context(smp_processor_id(), vma->vm_mm) == NO_CONTEXT)
-		return;
-
-	/*
-	 * If cache is only 4k-per-way, there are never any 'aliases'.  Since
-	 * the cache is physically tagged, the data can just be left in there.
-	 */
-	if (boot_cpu_data.dcache.n_aliases == 0)
-		return;
-
-	flush_dcache_all();
-
-	if (vma->vm_flags & VM_EXEC)
-		flush_icache_all();
-}
-
-/**
- * __flush_cache_one
- *
- * @addr:  address in memory mapped cache array
- * @phys:  P1 address to flush (has to match tags if addr has 'A' bit
- *         set i.e. associative write)
- * @exec_offset: set to 0x20000000 if flush has to be executed from P2
- *               region else 0x0
- *
- * The offset into the cache array implied by 'addr' selects the
- * 'colour' of the virtual address range that will be flushed.  The
- * operation (purge/write-back) is selected by the lower 2 bits of
- * 'phys'.
- */
-static void __flush_cache_one(unsigned long addr, unsigned long phys,
-			       unsigned long exec_offset)
-{
-	int way_count;
-	unsigned long base_addr = addr;
-	struct cache_info *dcache;
-	unsigned long way_incr;
-	unsigned long a, ea, p;
-	unsigned long temp_pc;
-
-	dcache = &boot_cpu_data.dcache;
-	/* Write this way for better assembly. */
-	way_count = dcache->ways;
-	way_incr = dcache->way_incr;
-
-	/*
-	 * Apply exec_offset (i.e. branch to P2 if required.).
-	 *
-	 * FIXME:
-	 *
-	 *	If I write "=r" for the (temp_pc), it puts this in r6 hence
-	 *	trashing exec_offset before it's been added on - why?  Hence
-	 *	"=&r" as a 'workaround'
-	 */
-	asm volatile("mov.l 1f, %0\n\t"
-		     "add   %1, %0\n\t"
-		     "jmp   @%0\n\t"
-		     "nop\n\t"
-		     ".balign 4\n\t"
-		     "1:  .long 2f\n\t"
-		     "2:\n" : "=&r" (temp_pc) : "r" (exec_offset));
-
-	/*
-	 * We know there will be >=1 iteration, so write as do-while to avoid
-	 * pointless nead-of-loop check for 0 iterations.
-	 */
 	do {
-		ea = base_addr + PAGE_SIZE;
-		a = base_addr;
-		p = phys;
-
-		do {
-			*(volatile unsigned long *)a = p;
-			/*
-			 * Next line: intentionally not p+32, saves an add, p
-			 * will do since only the cache tag bits need to
-			 * match.
-			 */
-			*(volatile unsigned long *)(a+32) = p;
-			a += 64;
-			p += 64;
-		} while (a < ea);
-
-		base_addr += way_incr;
-	} while (--way_count != 0);
+		old = pte_val(*ptep);
+		new = pte_val(pte_wrprotect(__pte (old)));
+	} while (cmpxchg((unsigned long *) ptep, old, new) != old);
+#else
+	pte_t old_pte = *ptep;
+	set_pte_at(mm, addr, ptep, pte_wrprotect(old_pte));
+#endif
 }
 
-extern void __weak sh4__flush_region_init(void);
+static inline int
+pte_same (pte_t a, pte_t b)
+{
+	return pte_val(a) == pte_val(b);
+}
+
+#define update_mmu_cache(vma, address, ptep) do { } while (0)
+
+extern pgd_t swapper_pg_dir[PTRS_PER_PGD];
+extern void paging_init (void);
 
 /*
- * SH-4 has virtually indexed and physically tagged cache.
+ * Note: The macros below rely on the fact that MAX_SWAPFILES_SHIFT <= number of
+ *	 bits in the swap-type field of the swap pte.  It would be nice to
+ *	 enforce that, but we can't easily include <linux/swap.h> here.
+ *	 (Of course, better still would be to define MAX_SWAPFILES_SHIFT here...).
+ *
+ * Format of swap pte:
+ *	bit   0   : present bit (must be zero)
+ *	bits  1- 7: swap-type
+ *	bits  8-62: swap offset
+ *	bit  63   : _PAGE_PROTNONE bit
  */
-void __init sh4_cache_init(void)
-{
-	printk("PVR=%08x CVR=%08x PRR=%08x\n",
-		__raw_readl(CCN_PVR),
-		__raw_readl(CCN_CVR),
-		__raw_readl(CCN_PRR));
+#define __swp_type(entry)		(((entry).val >> 1) & 0x7f)
+#define __swp_offset(entry)		(((entry).val << 1) >> 9)
+#define __swp_entry(type,offset)	((swp_entry_t) { ((type) << 1) | ((long) (offset) << 8) })
+#define __pte_to_swp_entry(pte)		((swp_entry_t) { pte_val(pte) })
+#define __swp_entry_to_pte(x)		((pte_t) { (x).val })
 
-	local_flush_icache_range	= sh4_flush_icache_range;
-	local_flush_dcache_page		= sh4_flush_dcache_page;
-	local_flush_cache_all		= sh4_flush_cache_all;
-	local_flush_cache_mm		= sh4_flush_cache_mm;
-	local_flush_cache_dup_mm	= sh4_flush_cache_mm;
-	local_flush_cache_page		= sh4_flush_cache_page;
-	local_flush_cache_range		= sh4_flush_cache_range;
+/*
+ * ZERO_PAGE is a global shared page that is always zero: used
+ * for zero-mapped memory areas etc..
+ */
+extern unsigned long empty_zero_page[PAGE_SIZE/sizeof(unsigned long)];
+extern struct page *zero_page_memmap_ptr;
+#define ZERO_PAGE(vaddr) (zero_page_memmap_ptr)
 
-	sh4__flush_region_init();
-}
+/* We provide our own get_unmapped_area to cope with VA holes for userland */
+#define HAVE_ARCH_UNMAPPED_AREA
+
+#ifdef CONFIG_HUGETLB_PAGE
+#define HUGETLB_PGDIR_SHIFT	(HPAGE_SHIFT + 2*(PAGE_SHIFT-3))
+#define HUGETLB_PGDIR_SIZE	(__IA64_UL(1) << HUGETLB_PGDIR_SHIFT)
+#define HUGETLB_PGDIR_MASK	(~(HUGETLB_PGDIR_SIZE-1))
+#endif
+
+
+#define __HAVE_ARCH_PTEP_SET_ACCESS_FLAGS
+/*
+ * Update PTEP with ENTRY, which is guaranteed to be a less
+ * restrictive PTE.  That is, ENTRY may have the ACCESSED, DIRTY, and
+ * WRITABLE bits turned on, when the value at PTEP did not.  The
+ * WRITABLE bit may only be turned if SAFELY_WRITABLE is TRUE.
+ *
+ * SAFELY_WRITABLE is TRUE if we can update the value at PTEP without
+ * having to worry about races.  On SMP machines, there are only two
+ * cases where this is true:
+ *
+ *	(1) *PTEP has the PRESENT bit turned OFF
+ *	(2) ENTRY has the DIRTY bit turned ON
+ *
+ * On ia64, we could implement this routine with a cmpxchg()-loop
+ * which ORs in the _PAGE_A/_PAGE_D bit if they're set in ENTRY.
+ * However, like on x86, we can get a more streamlined version by
+ * observing that it is OK to drop ACCESSED bit updates when
+ * SAFELY_WRITABLE is FALSE.  Besides being rare, all that would do is
+ * result in an extra Access-bit fault, which would then turn on the
+ * ACCESSED bit in the low-level fault handler (iaccess_bit or
+ * daccess_bit in ivt.S).
+ */
+#ifdef CONFIG_SMP
+# define ptep_set_access_flags(__vma, __addr, __ptep, __entry, __safely_writable) \
+({									\
+	int __changed = !pte_same(*(__ptep), __entry);			\
+	if (__changed && __safely_writable) {				\
+		set_pte(__ptep, __entry);				\
+		flush_tlb_page(__vma, __addr);				\
+	}								\
+	__changed;							\
+})
+#else
+# define ptep_set_access_flags(__vma, __addr, __ptep, __entry, __safely_writable) \
+({									\
+	int __changed = !pte_same(*(__ptep), __entry);			\
+	if (__changed) {						\
+		set_pte_at((__vma)->vm_mm, (__addr), __ptep, __entry);	\
+		flush_tlb_page(__vma, __addr);				\
+	}								\
+	__changed;							\
+})
+#endif
+
+#  ifdef CONFIG_VIRTUAL_MEM_MAP
+  /* arch mem_map init routine is needed due to holes in a virtual mem_map */
+#   define __HAVE_ARCH_MEMMAP_INIT
+    extern void memmap_init (unsigned long size, int nid, unsigned long zone,
+			     unsigned long start_pfn);
+#  endif /* CONFIG_VIRTUAL_MEM_MAP */
+# endif /* !__ASSEMBLY__ */
+
+/*
+ * Identity-mapped regions use a large page size.  We'll call such large pages
+ * "granules".  If you can think of a better name that's unambiguous, let me
+ * know...
+ */
+#if defined(CONFIG_IA64_GRANULE_64MB)
+# define IA64_GRANULE_SHIFT	_PAGE_SIZE_64M
+#elif defined(CONFIG_IA64_GRANULE_16MB)
+# define IA64_GRANULE_SHIFT	_PAGE_SIZE_16M
+#endif
+#define IA64_GRANULE_SIZE	(1 << IA64_GRANULE_SHIFT)
+/*
+ * log2() of the page size we use to map the kernel image (IA64_TR_KERNEL):
+ */
+#define KERNEL_TR_PAGE_SHIFT	_PAGE_SIZE_64M
+#define KERNEL_TR_PAGE_SIZE	(1 << KERNEL_TR_PAGE_SHIFT)
+
+/*
+ * No page table caches to initialise
+ */
+#define pgtable_cache_init()	do { } while (0)
+
+/* These tell get_user_pages() that the first gate page is accessible from user-level.  */
+#define FIXADDR_USER_START	GATE_ADDR
+#ifdef HAVE_BUGGY_SEGREL
+# define FIXADDR_USER_END	(GATE_ADDR + 2*PAGE_SIZE)
+#else
+# define FIXADDR_USER_END	(GATE_ADDR + 2*PERCPU_PAGE_SIZE)
+#endif
+
+#define __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
+#define __HAVE_ARCH_PTEP_GET_AND_CLEAR
+#define __HAVE_ARCH_PTEP_SET_WRPROTECT
+#define __HAVE_ARCH_PTE_SAME
+#define __HAVE_ARCH_PGD_OFFSET_GATE
+
+
+#if CONFIG_PGTABLE_LEVELS == 3
+#include <asm-generic/pgtable-nopud.h>
+#endif
+#include <asm-generic/pgtable.h>
+
+#endif /* _ASM_IA64_PGTABLE_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  

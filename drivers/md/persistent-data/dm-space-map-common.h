@@ -1,129 +1,65 @@
-/*
- * Copyright (C) 2011 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-
-#ifndef DM_SPACE_MAP_COMMON_H
-#define DM_SPACE_MAP_COMMON_H
-
-#include "dm-btree.h"
-
-/*----------------------------------------------------------------*/
-
-/*
- * Low level disk format
- *
- * Bitmap btree
- * ------------
- *
- * Each value stored in the btree is an index_entry.  This points to a
- * block that is used as a bitmap.  Within the bitmap hold 2 bits per
- * entry, which represent UNUSED = 0, REF_COUNT = 1, REF_COUNT = 2 and
- * REF_COUNT = many.
- *
- * Refcount btree
- * --------------
- *
- * Any entry that has a ref count higher than 2 gets entered in the ref
- * count tree.  The leaf values for this tree is the 32-bit ref count.
- */
-
-struct disk_index_entry {
-	__le64 blocknr;
-	__le32 nr_free;
-	__le32 none_free_before;
-} __attribute__ ((packed, aligned(8)));
-
-
-#define MAX_METADATA_BITMAPS 255
-struct disk_metadata_index {
-	__le32 csum;
-	__le32 padding;
-	__le64 blocknr;
-
-	struct disk_index_entry index[MAX_METADATA_BITMAPS];
-} __attribute__ ((packed, aligned(8)));
-
-struct ll_disk;
-
-typedef int (*load_ie_fn)(struct ll_disk *ll, dm_block_t index, struct disk_index_entry *result);
-typedef int (*save_ie_fn)(struct ll_disk *ll, dm_block_t index, struct disk_index_entry *ie);
-typedef int (*init_index_fn)(struct ll_disk *ll);
-typedef int (*open_index_fn)(struct ll_disk *ll);
-typedef dm_block_t (*max_index_entries_fn)(struct ll_disk *ll);
-typedef int (*commit_fn)(struct ll_disk *ll);
-
-struct ll_disk {
-	struct dm_transaction_manager *tm;
-	struct dm_btree_info bitmap_info;
-	struct dm_btree_info ref_count_info;
-
-	uint32_t block_size;
-	uint32_t entries_per_block;
-	dm_block_t nr_blocks;
-	dm_block_t nr_allocated;
-
-	/*
-	 * bitmap_root may be a btree root or a simple index.
-	 */
-	dm_block_t bitmap_root;
-
-	dm_block_t ref_count_root;
-
-	struct disk_metadata_index mi_le;
-	load_ie_fn load_ie;
-	save_ie_fn save_ie;
-	init_index_fn init_index;
-	open_index_fn open_index;
-	max_index_entries_fn max_entries;
-	commit_fn commit;
-	bool bitmap_index_changed:1;
-};
-
-struct disk_sm_root {
-	__le64 nr_blocks;
-	__le64 nr_allocated;
-	__le64 bitmap_root;
-	__le64 ref_count_root;
-} __attribute__ ((packed, aligned(8)));
-
-#define ENTRIES_PER_BYTE 4
-
-struct disk_bitmap_header {
-	__le32 csum;
-	__le32 not_used;
-	__le64 blocknr;
-} __attribute__ ((packed, aligned(8)));
-
-enum allocation_event {
-	SM_NONE,
-	SM_ALLOC,
-	SM_FREE,
-};
-
-/*----------------------------------------------------------------*/
-
-int sm_ll_extend(struct ll_disk *ll, dm_block_t extra_blocks);
-int sm_ll_lookup_bitmap(struct ll_disk *ll, dm_block_t b, uint32_t *result);
-int sm_ll_lookup(struct ll_disk *ll, dm_block_t b, uint32_t *result);
-int sm_ll_find_free_block(struct ll_disk *ll, dm_block_t begin,
-			  dm_block_t end, dm_block_t *result);
-int sm_ll_find_common_free_block(struct ll_disk *old_ll, struct ll_disk *new_ll,
-	                         dm_block_t begin, dm_block_t end, dm_block_t *result);
-int sm_ll_insert(struct ll_disk *ll, dm_block_t b, uint32_t ref_count, enum allocation_event *ev);
-int sm_ll_inc(struct ll_disk *ll, dm_block_t b, enum allocation_event *ev);
-int sm_ll_dec(struct ll_disk *ll, dm_block_t b, enum allocation_event *ev);
-int sm_ll_commit(struct ll_disk *ll);
-
-int sm_ll_new_metadata(struct ll_disk *ll, struct dm_transaction_manager *tm);
-int sm_ll_open_metadata(struct ll_disk *ll, struct dm_transaction_manager *tm,
-			void *root_le, size_t len);
-
-int sm_ll_new_disk(struct ll_disk *ll, struct dm_transaction_manager *tm);
-int sm_ll_open_disk(struct ll_disk *ll, struct dm_transaction_manager *tm,
-		    void *root_le, size_t len);
-
-/*----------------------------------------------------------------*/
-
-#endif	/* DM_SPACE_MAP_COMMON_H */
+efine SMU_STATUS__SMU_DONE__SHIFT 0x0
+#define SMU_STATUS__SMU_PASS_MASK 0x2
+#define SMU_STATUS__SMU_PASS__SHIFT 0x1
+#define SMU_FIRMWARE__SMU_IN_PROG_MASK 0x1
+#define SMU_FIRMWARE__SMU_IN_PROG__SHIFT 0x0
+#define SMU_FIRMWARE__SMU_RD_DONE_MASK 0x6
+#define SMU_FIRMWARE__SMU_RD_DONE__SHIFT 0x1
+#define SMU_FIRMWARE__SMU_SRAM_RD_BLOCK_EN_MASK 0x8
+#define SMU_FIRMWARE__SMU_SRAM_RD_BLOCK_EN__SHIFT 0x3
+#define SMU_FIRMWARE__SMU_SRAM_WR_BLOCK_EN_MASK 0x10
+#define SMU_FIRMWARE__SMU_SRAM_WR_BLOCK_EN__SHIFT 0x4
+#define SMU_FIRMWARE__SMU_counter_MASK 0xf00
+#define SMU_FIRMWARE__SMU_counter__SHIFT 0x8
+#define SMU_FIRMWARE__SMU_MODE_MASK 0x10000
+#define SMU_FIRMWARE__SMU_MODE__SHIFT 0x10
+#define SMU_FIRMWARE__SMU_SEL_MASK 0x20000
+#define SMU_FIRMWARE__SMU_SEL__SHIFT 0x11
+#define SMU_INPUT_DATA__START_ADDR_MASK 0x7fffffff
+#define SMU_INPUT_DATA__START_ADDR__SHIFT 0x0
+#define SMU_INPUT_DATA__AUTO_START_MASK 0x80000000
+#define SMU_INPUT_DATA__AUTO_START__SHIFT 0x1f
+#define SMU_EFUSE_0__EFUSE_DATA_MASK 0xffffffff
+#define SMU_EFUSE_0__EFUSE_DATA__SHIFT 0x0
+#define DPM_TABLE_1__SystemFlags_MASK 0xffffffff
+#define DPM_TABLE_1__SystemFlags__SHIFT 0x0
+#define DPM_TABLE_2__GraphicsPIDController_Ki_MASK 0xffffffff
+#define DPM_TABLE_2__GraphicsPIDController_Ki__SHIFT 0x0
+#define DPM_TABLE_3__GraphicsPIDController_LFWindupUpperLim_MASK 0xffffffff
+#define DPM_TABLE_3__GraphicsPIDController_LFWindupUpperLim__SHIFT 0x0
+#define DPM_TABLE_4__GraphicsPIDController_LFWindupLowerLim_MASK 0xffffffff
+#define DPM_TABLE_4__GraphicsPIDController_LFWindupLowerLim__SHIFT 0x0
+#define DPM_TABLE_5__GraphicsPIDController_StatePrecision_MASK 0xffffffff
+#define DPM_TABLE_5__GraphicsPIDController_StatePrecision__SHIFT 0x0
+#define DPM_TABLE_6__GraphicsPIDController_LfPrecision_MASK 0xffffffff
+#define DPM_TABLE_6__GraphicsPIDController_LfPrecision__SHIFT 0x0
+#define DPM_TABLE_7__GraphicsPIDController_LfOffset_MASK 0xffffffff
+#define DPM_TABLE_7__GraphicsPIDController_LfOffset__SHIFT 0x0
+#define DPM_TABLE_8__GraphicsPIDController_MaxState_MASK 0xffffffff
+#define DPM_TABLE_8__GraphicsPIDController_MaxState__SHIFT 0x0
+#define DPM_TABLE_9__GraphicsPIDController_MaxLfFraction_MASK 0xffffffff
+#define DPM_TABLE_9__GraphicsPIDController_MaxLfFraction__SHIFT 0x0
+#define DPM_TABLE_10__GraphicsPIDController_StateShift_MASK 0xffffffff
+#define DPM_TABLE_10__GraphicsPIDController_StateShift__SHIFT 0x0
+#define DPM_TABLE_11__GioPIDController_Ki_MASK 0xffffffff
+#define DPM_TABLE_11__GioPIDController_Ki__SHIFT 0x0
+#define DPM_TABLE_12__GioPIDController_LFWindupUpperLim_MASK 0xffffffff
+#define DPM_TABLE_12__GioPIDController_LFWindupUpperLim__SHIFT 0x0
+#define DPM_TABLE_13__GioPIDController_LFWindupLowerLim_MASK 0xffffffff
+#define DPM_TABLE_13__GioPIDController_LFWindupLowerLim__SHIFT 0x0
+#define DPM_TABLE_14__GioPIDController_StatePrecision_MASK 0xffffffff
+#define DPM_TABLE_14__GioPIDController_StatePrecision__SHIFT 0x0
+#define DPM_TABLE_15__GioPIDController_LfPrecision_MASK 0xffffffff
+#define DPM_TABLE_15__GioPIDController_LfPrecision__SHIFT 0x0
+#define DPM_TABLE_16__GioPIDController_LfOffset_MASK 0xffffffff
+#define DPM_TABLE_16__GioPIDController_LfOffset__SHIFT 0x0
+#define DPM_TABLE_17__GioPIDController_MaxState_MASK 0xffffffff
+#define DPM_TABLE_17__GioPIDController_MaxState__SHIFT 0x0
+#define DPM_TABLE_18__GioPIDController_MaxLfFraction_MASK 0xffffffff
+#define DPM_TABLE_18__GioPIDController_MaxLfFraction__SHIFT 0x0
+#define DPM_TABLE_19__GioPIDController_StateShift_MASK 0xffffffff
+#define DPM_TABLE_19__GioPIDController_StateShift__SHIFT 0x0
+#define DPM_TABLE_20__VceLevelCount_MASK 0xff
+#define DPM_TABLE_20__VceLevelCount__SHIFT 0x0
+#define DPM_TABLE_20__UvdLevelCount_MASK 0xff00
+#define DPM_TABLE_20__UvdLevelCount__SHIFT 

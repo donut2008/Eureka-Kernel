@@ -1,163 +1,142 @@
+#ifndef _ASM_IA64_PAGE_H
+#define _ASM_IA64_PAGE_H
 /*
- * arch/sh/mm/mmap.c
+ * Pagetable related stuff.
  *
- * Copyright (C) 2008 - 2009  Paul Mundt
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ * Copyright (C) 1998, 1999, 2002 Hewlett-Packard Co
+ *	David Mosberger-Tang <davidm@hpl.hp.com>
  */
-#include <linux/io.h>
-#include <linux/mm.h>
-#include <linux/mman.h>
-#include <linux/module.h>
-#include <asm/page.h>
-#include <asm/processor.h>
 
-unsigned long shm_align_mask = PAGE_SIZE - 1;	/* Sane caches */
-EXPORT_SYMBOL(shm_align_mask);
-
-#ifdef CONFIG_MMU
-/*
- * To avoid cache aliases, we map the shared page with same color.
- */
-static inline unsigned long COLOUR_ALIGN(unsigned long addr,
-					 unsigned long pgoff)
-{
-	unsigned long base = (addr + shm_align_mask) & ~shm_align_mask;
-	unsigned long off = (pgoff << PAGE_SHIFT) & shm_align_mask;
-
-	return base + off;
-}
-
-unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr,
-	unsigned long len, unsigned long pgoff, unsigned long flags)
-{
-	struct mm_struct *mm = current->mm;
-	struct vm_area_struct *vma;
-	int do_colour_align;
-	struct vm_unmapped_area_info info;
-
-	if (flags & MAP_FIXED) {
-		/* We do not accept a shared mapping if it would violate
-		 * cache aliasing constraints.
-		 */
-		if ((flags & MAP_SHARED) &&
-		    ((addr - (pgoff << PAGE_SHIFT)) & shm_align_mask))
-			return -EINVAL;
-		return addr;
-	}
-
-	if (unlikely(len > TASK_SIZE))
-		return -ENOMEM;
-
-	do_colour_align = 0;
-	if (filp || (flags & MAP_SHARED))
-		do_colour_align = 1;
-
-	if (addr) {
-		if (do_colour_align)
-			addr = COLOUR_ALIGN(addr, pgoff);
-		else
-			addr = PAGE_ALIGN(addr);
-
-		vma = find_vma(mm, addr);
-		if (TASK_SIZE - len >= addr &&
-		    (!vma || addr + len <= vm_start_gap(vma)))
-			return addr;
-	}
-
-	info.flags = 0;
-	info.length = len;
-	info.low_limit = TASK_UNMAPPED_BASE;
-	info.high_limit = TASK_SIZE;
-	info.align_mask = do_colour_align ? (PAGE_MASK & shm_align_mask) : 0;
-	info.align_offset = pgoff << PAGE_SHIFT;
-	return vm_unmapped_area(&info);
-}
-
-unsigned long
-arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
-			  const unsigned long len, const unsigned long pgoff,
-			  const unsigned long flags)
-{
-	struct vm_area_struct *vma;
-	struct mm_struct *mm = current->mm;
-	unsigned long addr = addr0;
-	int do_colour_align;
-	struct vm_unmapped_area_info info;
-
-	if (flags & MAP_FIXED) {
-		/* We do not accept a shared mapping if it would violate
-		 * cache aliasing constraints.
-		 */
-		if ((flags & MAP_SHARED) &&
-		    ((addr - (pgoff << PAGE_SHIFT)) & shm_align_mask))
-			return -EINVAL;
-		return addr;
-	}
-
-	if (unlikely(len > TASK_SIZE))
-		return -ENOMEM;
-
-	do_colour_align = 0;
-	if (filp || (flags & MAP_SHARED))
-		do_colour_align = 1;
-
-	/* requesting a specific address */
-	if (addr) {
-		if (do_colour_align)
-			addr = COLOUR_ALIGN(addr, pgoff);
-		else
-			addr = PAGE_ALIGN(addr);
-
-		vma = find_vma(mm, addr);
-		if (TASK_SIZE - len >= addr &&
-		    (!vma || addr + len <= vm_start_gap(vma)))
-			return addr;
-	}
-
-	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
-	info.length = len;
-	info.low_limit = PAGE_SIZE;
-	info.high_limit = mm->mmap_base;
-	info.align_mask = do_colour_align ? (PAGE_MASK & shm_align_mask) : 0;
-	info.align_offset = pgoff << PAGE_SHIFT;
-	addr = vm_unmapped_area(&info);
-
-	/*
-	 * A failed mmap() very likely causes application failure,
-	 * so fall back to the bottom-up function here. This scenario
-	 * can happen with large stack limits and large mmap()
-	 * allocations.
-	 */
-	if (addr & ~PAGE_MASK) {
-		VM_BUG_ON(addr != -ENOMEM);
-		info.flags = 0;
-		info.low_limit = TASK_UNMAPPED_BASE;
-		info.high_limit = TASK_SIZE;
-		addr = vm_unmapped_area(&info);
-	}
-
-	return addr;
-}
-#endif /* CONFIG_MMU */
+#include <asm/intrinsics.h>
+#include <asm/types.h>
 
 /*
- * You really shouldn't be using read() or write() on /dev/mem.  This
- * might go away in the future.
+ * The top three bits of an IA64 address are its Region Number.
+ * Different regions are assigned to different purposes.
  */
-int valid_phys_addr_range(phys_addr_t addr, size_t count)
-{
-	if (addr < __MEMORY_START)
-		return 0;
-	if (addr + count > __pa(high_memory))
-		return 0;
+#define RGN_SHIFT	(61)
+#define RGN_BASE(r)	(__IA64_UL_CONST(r)<<RGN_SHIFT)
+#define RGN_BITS	(RGN_BASE(-1))
 
-	return 1;
-}
+#define RGN_KERNEL	7	/* Identity mapped region */
+#define RGN_UNCACHED    6	/* Identity mapped I/O region */
+#define RGN_GATE	5	/* Gate page, Kernel text, etc */
+#define RGN_HPAGE	4	/* For Huge TLB pages */
 
-int valid_mmap_phys_addr_range(unsigned long pfn, size_t size)
-{
-	return 1;
-}
+/*
+ * PAGE_SHIFT determines the actual kernel page size.
+ */
+#if defined(CONFIG_IA64_PAGE_SIZE_4KB)
+# define PAGE_SHIFT	12
+#elif defined(CONFIG_IA64_PAGE_SIZE_8KB)
+# define PAGE_SHIFT	13
+#elif defined(CONFIG_IA64_PAGE_SIZE_16KB)
+# define PAGE_SHIFT	14
+#elif defined(CONFIG_IA64_PAGE_SIZE_64KB)
+# define PAGE_SHIFT	16
+#else
+# error Unsupported page size!
+#endif
+
+#define PAGE_SIZE		(__IA64_UL_CONST(1) << PAGE_SHIFT)
+#define PAGE_MASK		(~(PAGE_SIZE - 1))
+
+#define PERCPU_PAGE_SHIFT	18	/* log2() of max. size of per-CPU area */
+#define PERCPU_PAGE_SIZE	(__IA64_UL_CONST(1) << PERCPU_PAGE_SHIFT)
+
+
+#ifdef CONFIG_HUGETLB_PAGE
+# define HPAGE_REGION_BASE	RGN_BASE(RGN_HPAGE)
+# define HPAGE_SHIFT		hpage_shift
+# define HPAGE_SHIFT_DEFAULT	28	/* check ia64 SDM for architecture supported size */
+# define HPAGE_SIZE		(__IA64_UL_CONST(1) << HPAGE_SHIFT)
+# define HPAGE_MASK		(~(HPAGE_SIZE - 1))
+
+# define HAVE_ARCH_HUGETLB_UNMAPPED_AREA
+#endif /* CONFIG_HUGETLB_PAGE */
+
+#ifdef __ASSEMBLY__
+# define __pa(x)		((x) - PAGE_OFFSET)
+# define __va(x)		((x) + PAGE_OFFSET)
+#else /* !__ASSEMBLY */
+#  define STRICT_MM_TYPECHECKS
+
+extern void clear_page (void *page);
+extern void copy_page (void *to, void *from);
+
+/*
+ * clear_user_page() and copy_user_page() can't be inline functions because
+ * flush_dcache_page() can't be defined until later...
+ */
+#define clear_user_page(addr, vaddr, page)	\
+do {						\
+	clear_page(addr);			\
+	flush_dcache_page(page);		\
+} while (0)
+
+#define copy_user_page(to, from, vaddr, page)	\
+do {						\
+	copy_page((to), (from));		\
+	flush_dcache_page(page);		\
+} while (0)
+
+
+#define __alloc_zeroed_user_highpage(movableflags, vma, vaddr)		\
+({									\
+	struct page *page = alloc_page_vma(				\
+		GFP_HIGHUSER | __GFP_ZERO | movableflags, vma, vaddr);	\
+	if (page)							\
+ 		flush_dcache_page(page);				\
+	page;								\
+})
+
+#define __HAVE_ARCH_ALLOC_ZEROED_USER_HIGHPAGE
+
+#define virt_addr_valid(kaddr)	pfn_valid(__pa(kaddr) >> PAGE_SHIFT)
+
+#ifdef CONFIG_VIRTUAL_MEM_MAP
+extern int ia64_pfn_valid (unsigned long pfn);
+#else
+# define ia64_pfn_valid(pfn) 1
+#endif
+
+#ifdef CONFIG_VIRTUAL_MEM_MAP
+extern struct page *vmem_map;
+#ifdef CONFIG_DISCONTIGMEM
+# define page_to_pfn(page)	((unsigned long) (page - vmem_map))
+# define pfn_to_page(pfn)	(vmem_map + (pfn))
+#else
+# include <asm-generic/memory_model.h>
+#endif
+#else
+# include <asm-generic/memory_model.h>
+#endif
+
+#ifdef CONFIG_FLATMEM
+# define pfn_valid(pfn)		(((pfn) < max_mapnr) && ia64_pfn_valid(pfn))
+#elif defined(CONFIG_DISCONTIGMEM)
+extern unsigned long min_low_pfn;
+extern unsigned long max_low_pfn;
+# define pfn_valid(pfn)		(((pfn) >= min_low_pfn) && ((pfn) < max_low_pfn) && ia64_pfn_valid(pfn))
+#endif
+
+#define page_to_phys(page)	(page_to_pfn(page) << PAGE_SHIFT)
+#define virt_to_page(kaddr)	pfn_to_page(__pa(kaddr) >> PAGE_SHIFT)
+#define pfn_to_kaddr(pfn)	__va((pfn) << PAGE_SHIFT)
+
+typedef union ia64_va {
+	struct {
+		unsigned long off : 61;		/* intra-region offset */
+		unsigned long reg :  3;		/* region number */
+	} f;
+	unsigned long l;
+	void *p;
+} ia64_va;
+
+/*
+ * Note: These macros depend on the fact that PAGE_OFFSET has all
+ * region bits set to 1 and all other bits set to zero.  They are
+ * expressed in this way to ensure they result in a single "dep"
+ * instruction.
+ */
+#define __pa(x)		({ia64_va _v; _v.l = (long) (x); _v.f.reg

@@ -1,8 +1,4 @@
-
-obj-$(CONFIG_BCACHE)	+= bcache.o
-
-bcache-y		:= alloc.o bset.o btree.o closure.o debug.o extents.o\
-	io.o journal.o movinggc.o request.o stats.o super.o sysfs.o trace.o\
-	util.o writeback.o
-
-CFLAGS_request.o	+= -Iblock
+icsLevel_7_SpllSpreadSpectrum_MASK 0xffffffff
+#define DPM_TABLE_180__GraphicsLevel_7_SpllSpreadSpectrum__SHIFT 0x0
+#define DPM_TABLE_181__GraphicsLevel_7_SpllSpreadSpectrum2_MASK 0xffffffff
+#define DPM_TABLE_181__Graphi

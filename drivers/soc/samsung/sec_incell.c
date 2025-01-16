@@ -1,15 +1,11 @@
-/* Copyright (c) 2016, TSamsung Electronics. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/sec_incell.h>
-
-struct incell_driver_data incell_data;
+ine CG_SPLL_FUNC_CNTL_4__SPLL_ILOCK__SHIFT 0x17
+#define CG_SPLL_FUNC_CNTL_4__SPLL_FBCLK_SEL_MASK 0x1000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_FBCLK_SEL__SHIFT 0x18
+#define CG_SPLL_FUNC_CNTL_4__SPLL_VCTRLADC_EN_MASK 0x2000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_VCTRLADC_EN__SHIFT 0x19
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SCLK_EXT_MASK 0xc000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SCLK_EXT__SHIFT 0x1a
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SPARE_EXT_MASK 0x70000000
+#define CG_SPLL_FUNC_CNTL_4__SPLL_SPARE_EXT__SHIFT 0x1c
+#define CG_SPLL_FUNC_CNTL_4__SPLL_VTOI_BIAS_CNTL_MASK 0x80000000
+#define CG_SPLL_FUNC_CN

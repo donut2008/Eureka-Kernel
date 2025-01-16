@@ -1,5288 +1,3629 @@
-/* cassini.c: Sun Microsystems Cassini(+) ethernet driver.
- *
- * Copyright (C) 2004 Sun Microsystems Inc.
- * Copyright (C) 2003 Adrian Sun (asun@darksunrising.com)
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation; either version 2 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
- *
- * This driver uses the sungem driver (c) David Miller
- * (davem@redhat.com) as its basis.
- *
- * The cassini chip has a number of features that distinguish it from
- * the gem chip:
- *  4 transmit descriptor rings that are used for either QoS (VLAN) or
- *      load balancing (non-VLAN mode)
- *  batching of multiple packets
- *  multiple CPU dispatching
- *  page-based RX descriptor engine with separate completion rings
- *  Gigabit support (GMII and PCS interface)
- *  MIF link up/down detection works
- *
- * RX is handled by page sized buffers that are attached as fragments to
- * the skb. here's what's done:
- *  -- driver allocates pages at a time and keeps reference counts
- *     on them.
- *  -- the upper protocol layers assume that the header is in the skb
- *     itself. as a result, cassini will copy a small amount (64 bytes)
- *     to make them happy.
- *  -- driver appends the rest of the data pages as frags to skbuffs
- *     and increments the reference count
- *  -- on page reclamation, the driver swaps the page with a spare page.
- *     if that page is still in use, it frees its reference to that page,
- *     and allocates a new page for use. otherwise, it just recycles the
- *     the page.
- *
- * NOTE: cassini can parse the header. however, it's not worth it
- *       as long as the network stack requires a header copy.
- *
- * TX has 4 queues. currently these queues are used in a round-robin
- * fashion for load balancing. They can also be used for QoS. for that
- * to work, however, QoS information needs to be exposed down to the driver
- * level so that subqueues get targeted to particular transmit rings.
- * alternatively, the queues can be configured via use of the all-purpose
- * ioctl.
- *
- * RX DATA: the rx completion ring has all the info, but the rx desc
- * ring has all of the data. RX can conceivably come in under multiple
- * interrupts, but the INT# assignment needs to be set up properly by
- * the BIOS and conveyed to the driver. PCI BIOSes don't know how to do
- * that. also, the two descriptor rings are designed to distinguish between
- * encrypted and non-encrypted packets, but we use them for buffering
- * instead.
- *
- * by default, the selective clear mask is set up to process rx packets.
- */
+s-properties"/>
+                for more information about properties.
+              </para>
+            </listitem>
+            <listitem>
+              <synopsis>void (*gamma_set)(struct drm_crtc *crtc, u16 *r, u16 *g, u16 *b,
+                        uint32_t start, uint32_t size);</synopsis>
+              <para>
+                Apply a gamma table to the device. The operation is optional.
+              </para>
+            </listitem>
+            <listitem>
+              <synopsis>void (*destroy)(struct drm_crtc *crtc);</synopsis>
+              <para>
+                Destroy the CRTC when not needed anymore. See
+                <xref linkend="drm-kms-init"/>.
+              </para>
+            </listitem>
+          </itemizedlist>
+        </sect4>
+      </sect3>
+    </sect2>
+    <sect2>
+      <title>Planes (struct <structname>drm_plane</structname>)</title>
+      <para>
+        A plane represents an image source that can be blended with or overlayed
+	on top of a CRTC during the scanout process. Planes are associated with
+	a frame buffer to crop a portion of the image memory (source) and
+	optionally scale it to a destination size. The result is then blended
+	with or overlayed on top of a CRTC.
+      </para>
+      <para>
+      The DRM core recognizes three types of planes:
+      <itemizedlist>
+        <listitem>
+        DRM_PLANE_TYPE_PRIMARY represents a "main" plane for a CRTC.  Primary
+        planes are the planes operated upon by CRTC modesetting and flipping
+        operations described in <xref linkend="drm-kms-crtcops"/>.
+        </listitem>
+        <listitem>
+        DRM_PLANE_TYPE_CURSOR represents a "cursor" plane for a CRTC.  Cursor
+        planes are the planes operated upon by the DRM_IOCTL_MODE_CURSOR and
+        DRM_IOCTL_MODE_CURSOR2 ioctls.
+        </listitem>
+        <listitem>
+        DRM_PLANE_TYPE_OVERLAY represents all non-primary, non-cursor planes.
+        Some drivers refer to these types of planes as "sprites" internally.
+        </listitem>
+      </itemizedlist>
+      For compatibility with legacy userspace, only overlay planes are made
+      available to userspace by default.  Userspace clients may set the
+      DRM_CLIENT_CAP_UNIVERSAL_PLANES client capability bit to indicate that
+      they wish to receive a universal plane list containing all plane types.
+      </para>
+      <sect3>
+        <title>Plane Initialization</title>
+        <para>
+          To create a plane, a KMS drivers allocates and
+          zeroes an instances of struct <structname>drm_plane</structname>
+          (possibly as part of a larger structure) and registers it with a call
+          to <function>drm_universal_plane_init</function>. The function takes a bitmask
+          of the CRTCs that can be associated with the plane, a pointer to the
+          plane functions, a list of format supported formats, and the type of
+          plane (primary, cursor, or overlay) being initialized.
+        </para>
+        <para>
+          Cursor and overlay planes are optional.  All drivers should provide
+          one primary plane per CRTC (although this requirement may change in
+          the future); drivers that do not wish to provide special handling for
+          primary planes may make use of the helper functions described in
+          <xref linkend="drm-kms-planehelpers"/> to create and register a
+          primary plane with standard capabilities.
+        </para>
+      </sect3>
+      <sect3>
+        <title>Plane Operations</title>
+        <itemizedlist>
+          <listitem>
+            <synopsis>int (*update_plane)(struct drm_plane *plane, struct drm_crtc *crtc,
+                        struct drm_framebuffer *fb, int crtc_x, int crtc_y,
+                        unsigned int crtc_w, unsigned int crtc_h,
+                        uint32_t src_x, uint32_t src_y,
+                        uint32_t src_w, uint32_t src_h);</synopsis>
+            <para>
+              Enable and configure the plane to use the given CRTC and frame buffer.
+            </para>
+            <para>
+              The source rectangle in frame buffer memory coordinates is given by
+              the <parameter>src_x</parameter>, <parameter>src_y</parameter>,
+              <parameter>src_w</parameter> and <parameter>src_h</parameter>
+              parameters (as 16.16 fixed point values). Devices that don't support
+              subpixel plane coordinates can ignore the fractional part.
+            </para>
+            <para>
+              The destination rectangle in CRTC coordinates is given by the
+              <parameter>crtc_x</parameter>, <parameter>crtc_y</parameter>,
+              <parameter>crtc_w</parameter> and <parameter>crtc_h</parameter>
+              parameters (as integer values). Devices scale the source rectangle to
+              the destination rectangle. If scaling is not supported, and the source
+              rectangle size doesn't match the destination rectangle size, the
+              driver must return a -<errorname>EINVAL</errorname> error.
+            </para>
+          </listitem>
+          <listitem>
+            <synopsis>int (*disable_plane)(struct drm_plane *plane);</synopsis>
+            <para>
+              Disable the plane. The DRM core calls this method in response to a
+              DRM_IOCTL_MODE_SETPLANE ioctl call with the frame buffer ID set to 0.
+              Disabled planes must not be processed by the CRTC.
+            </para>
+          </listitem>
+          <listitem>
+            <synopsis>void (*destroy)(struct drm_plane *plane);</synopsis>
+            <para>
+              Destroy the plane when not needed anymore. See
+              <xref linkend="drm-kms-init"/>.
+            </para>
+          </listitem>
+        </itemizedlist>
+      </sect3>
+    </sect2>
+    <sect2>
+      <title>Encoders (struct <structname>drm_encoder</structname>)</title>
+      <para>
+        An encoder takes pixel data from a CRTC and converts it to a format
+	suitable for any attached connectors. On some devices, it may be
+	possible to have a CRTC send data to more than one encoder. In that
+	case, both encoders would receive data from the same scanout buffer,
+	resulting in a "cloned" display configuration across the connectors
+	attached to each encoder.
+      </para>
+      <sect3>
+        <title>Encoder Initialization</title>
+        <para>
+          As for CRTCs, a KMS driver must create, initialize and register at
+          least one struct <structname>drm_encoder</structname> instance. The
+          instance is allocated and zeroed by the driver, possibly as part of a
+          larger structure.
+        </para>
+        <para>
+          Drivers must initialize the struct <structname>drm_encoder</structname>
+          <structfield>possible_crtcs</structfield> and
+          <structfield>possible_clones</structfield> fields before registering the
+          encoder. Both fields are bitmasks of respectively the CRTCs that the
+          encoder can be connected to, and sibling encoders candidate for cloning.
+        </para>
+        <para>
+          After being initialized, the encoder must be registered with a call to
+          <function>drm_encoder_init</function>. The function takes a pointer to
+          the encoder functions and an encoder type. Supported types are
+          <itemizedlist>
+            <listitem>
+              DRM_MODE_ENCODER_DAC for VGA and analog on DVI-I/DVI-A
+              </listitem>
+            <listitem>
+              DRM_MODE_ENCODER_TMDS for DVI, HDMI and (embedded) DisplayPort
+            </listitem>
+            <listitem>
+              DRM_MODE_ENCODER_LVDS for display panels
+            </listitem>
+            <listitem>
+              DRM_MODE_ENCODER_TVDAC for TV output (Composite, S-Video, Component,
+              SCART)
+            </listitem>
+            <listitem>
+              DRM_MODE_ENCODER_VIRTUAL for virtual machine displays
+            </listitem>
+          </itemizedlist>
+        </para>
+        <para>
+          Encoders must be attached to a CRTC to be used. DRM drivers leave
+          encoders unattached at initialization time. Applications (or the fbdev
+          compatibility layer when implemented) are responsible for attaching the
+          encoders they want to use to a CRTC.
+        </para>
+      </sect3>
+      <sect3>
+        <title>Encoder Operations</title>
+        <itemizedlist>
+          <listitem>
+            <synopsis>void (*destroy)(struct drm_encoder *encoder);</synopsis>
+            <para>
+              Called to destroy the encoder when not needed anymore. See
+              <xref linkend="drm-kms-init"/>.
+            </para>
+          </listitem>
+          <listitem>
+            <synopsis>void (*set_property)(struct drm_plane *plane,
+                     struct drm_property *property, uint64_t value);</synopsis>
+            <para>
+              Set the value of the given plane property to
+              <parameter>value</parameter>. See <xref linkend="drm-kms-properties"/>
+              for more information about properties.
+            </para>
+          </listitem>
+        </itemizedlist>
+      </sect3>
+    </sect2>
+    <sect2>
+      <title>Connectors (struct <structname>drm_connector</structname>)</title>
+      <para>
+        A connector is the final destination for pixel data on a device, and
+	usually connects directly to an external display device like a monitor
+	or laptop panel. A connector can only be attached to one encoder at a
+	time. The connector is also the structure where information about the
+	attached display is kept, so it contains fields for display data, EDID
+	data, DPMS &amp; connection status, and information about modes
+	supported on the attached displays.
+      </para>
+      <sect3>
+        <title>Connector Initialization</title>
+        <para>
+          Finally a KMS driver must create, initialize, register and attach at
+          least one struct <structname>drm_connector</structname> instance. The
+          instance is created as other KMS objects and initialized by setting the
+          following fields.
+        </para>
+        <variablelist>
+          <varlistentry>
+            <term><structfield>interlace_allowed</structfield></term>
+            <listitem><para>
+              Whether the connector can handle interlaced modes.
+            </para></listitem>
+          </varlistentry>
+          <varlistentry>
+            <term><structfield>doublescan_allowed</structfield></term>
+            <listitem><para>
+              Whether the connector can handle doublescan.
+            </para></listitem>
+          </varlistentry>
+          <varlistentry>
+            <term><structfield>display_info
+            </structfield></term>
+            <listitem><para>
+              Display information is filled from EDID information when a display
+              is detected. For non hot-pluggable displays such as flat panels in
+              embedded systems, the driver should initialize the
+              <structfield>display_info</structfield>.<structfield>width_mm</structfield>
+              and
+              <structfield>display_info</structfield>.<structfield>height_mm</structfield>
+              fields with the physical size of the display.
+            </para></listitem>
+          </varlistentry>
+          <varlistentry>
+            <term id="drm-kms-connector-polled"><structfield>polled</structfield></term>
+            <listitem><para>
+              Connector polling mode, a combination of
+              <variablelist>
+                <varlistentry>
+                  <term>DRM_CONNECTOR_POLL_HPD</term>
+                  <listitem><para>
+                    The connector generates hotplug events and doesn't need to be
+                    periodically polled. The CONNECT and DISCONNECT flags must not
+                    be set together with the HPD flag.
+                  </para></listitem>
+                </varlistentry>
+                <varlistentry>
+                  <term>DRM_CONNECTOR_POLL_CONNECT</term>
+                  <listitem><para>
+                    Periodically poll the connector for connection.
+                  </para></listitem>
+                </varlistentry>
+                <varlistentry>
+                  <term>DRM_CONNECTOR_POLL_DISCONNECT</term>
+                  <listitem><para>
+                    Periodically poll the connector for disconnection.
+                  </para></listitem>
+                </varlistentry>
+              </variablelist>
+              Set to 0 for connectors that don't support connection status
+              discovery.
+            </para></listitem>
+          </varlistentry>
+        </variablelist>
+        <para>
+          The connector is then registered with a call to
+          <function>drm_connector_init</function> with a pointer to the connector
+          functions and a connector type, and exposed through sysfs with a call to
+          <function>drm_connector_register</function>.
+        </para>
+        <para>
+          Supported connector types are
+          <itemizedlist>
+            <listitem>DRM_MODE_CONNECTOR_VGA</listitem>
+            <listitem>DRM_MODE_CONNECTOR_DVII</listitem>
+            <listitem>DRM_MODE_CONNECTOR_DVID</listitem>
+            <listitem>DRM_MODE_CONNECTOR_DVIA</listitem>
+            <listitem>DRM_MODE_CONNECTOR_Composite</listitem>
+            <listitem>DRM_MODE_CONNECTOR_SVIDEO</listitem>
+            <listitem>DRM_MODE_CONNECTOR_LVDS</listitem>
+            <listitem>DRM_MODE_CONNECTOR_Component</listitem>
+            <listitem>DRM_MODE_CONNECTOR_9PinDIN</listitem>
+            <listitem>DRM_MODE_CONNECTOR_DisplayPort</listitem>
+            <listitem>DRM_MODE_CONNECTOR_HDMIA</listitem>
+            <listitem>DRM_MODE_CONNECTOR_HDMIB</listitem>
+            <listitem>DRM_MODE_CONNECTOR_TV</listitem>
+            <listitem>DRM_MODE_CONNECTOR_eDP</listitem>
+            <listitem>DRM_MODE_CONNECTOR_VIRTUAL</listitem>
+          </itemizedlist>
+        </para>
+        <para>
+          Connectors must be attached to an encoder to be used. For devices that
+          map connectors to encoders 1:1, the connector should be attached at
+          initialization time with a call to
+          <function>drm_mode_connector_attach_encoder</function>. The driver must
+          also set the <structname>drm_connector</structname>
+          <structfield>encoder</structfield> field to point to the attached
+          encoder.
+        </para>
+        <para>
+          Finally, drivers must initialize the connectors state change detection
+          with a call to <function>drm_kms_helper_poll_init</function>. If at
+          least one connector is pollable but can't generate hotplug interrupts
+          (indicated by the DRM_CONNECTOR_POLL_CONNECT and
+          DRM_CONNECTOR_POLL_DISCONNECT connector flags), a delayed work will
+          automatically be queued to periodically poll for changes. Connectors
+          that can generate hotplug interrupts must be marked with the
+          DRM_CONNECTOR_POLL_HPD flag instead, and their interrupt handler must
+          call <function>drm_helper_hpd_irq_event</function>. The function will
+          queue a delayed work to check the state of all connectors, but no
+          periodic polling will be done.
+        </para>
+      </sect3>
+      <sect3>
+        <title>Connector Operations</title>
+        <note><para>
+          Unless otherwise state, all operations are mandatory.
+        </para></note>
+        <sect4>
+          <title>DPMS</title>
+          <synopsis>void (*dpms)(struct drm_connector *connector, int mode);</synopsis>
+          <para>
+            The DPMS operation sets the power state of a connector. The mode
+            argument is one of
+            <itemizedlist>
+              <listitem><para>DRM_MODE_DPMS_ON</para></listitem>
+              <listitem><para>DRM_MODE_DPMS_STANDBY</para></listitem>
+              <listitem><para>DRM_MODE_DPMS_SUSPEND</para></listitem>
+              <listitem><para>DRM_MODE_DPMS_OFF</para></listitem>
+            </itemizedlist>
+          </para>
+          <para>
+            In all but DPMS_ON mode the encoder to which the connector is attached
+            should put the display in low-power mode by driving its signals
+            appropriately. If more than one connector is attached to the encoder
+            care should be taken not to change the power state of other displays as
+            a side effect. Low-power mode should be propagated to the encoders and
+            CRTCs when all related connectors are put in low-power mode.
+          </para>
+        </sect4>
+        <sect4>
+          <title>Modes</title>
+          <synopsis>int (*fill_modes)(struct drm_connector *connector, uint32_t max_width,
+                      uint32_t max_height);</synopsis>
+          <para>
+            Fill the mode list with all supported modes for the connector. If the
+            <parameter>max_width</parameter> and <parameter>max_height</parameter>
+            arguments are non-zero, the implementation must ignore all modes wider
+            than <parameter>max_width</parameter> or higher than
+            <parameter>max_height</parameter>.
+          </para>
+          <para>
+            The connector must also fill in this operation its
+            <structfield>display_info</structfield>
+            <structfield>width_mm</structfield> and
+            <structfield>height_mm</structfield> fields with the connected display
+            physical size in millimeters. The fields should be set to 0 if the value
+            isn't known or is not applicable (for instance for projector devices).
+          </para>
+        </sect4>
+        <sect4>
+          <title>Connection Status</title>
+          <para>
+            The connection status is updated through polling or hotplug events when
+            supported (see <xref linkend="drm-kms-connector-polled"/>). The status
+            value is reported to userspace through ioctls and must not be used
+            inside the driver, as it only gets initialized by a call to
+            <function>drm_mode_getconnector</function> from userspace.
+          </para>
+          <synopsis>enum drm_connector_status (*detect)(struct drm_connector *connector,
+                                        bool force);</synopsis>
+          <para>
+            Check to see if anything is attached to the connector. The
+            <parameter>force</parameter> parameter is set to false whilst polling or
+            to true when checking the connector due to user request.
+            <parameter>force</parameter> can be used by the driver to avoid
+            expensive, destructive operations during automated probing.
+          </para>
+          <para>
+            Return connector_status_connected if something is connected to the
+            connector, connector_status_disconnected if nothing is connected and
+            connector_status_unknown if the connection state isn't known.
+          </para>
+          <para>
+            Drivers should only return connector_status_connected if the connection
+            status has really been probed as connected. Connectors that can't detect
+            the connection status, or failed connection status probes, should return
+            connector_status_unknown.
+          </para>
+        </sect4>
+        <sect4>
+          <title>Miscellaneous</title>
+          <itemizedlist>
+            <listitem>
+              <synopsis>void (*set_property)(struct drm_connector *connector,
+                     struct drm_property *property, uint64_t value);</synopsis>
+              <para>
+                Set the value of the given connector property to
+                <parameter>value</parameter>. See <xref linkend="drm-kms-properties"/>
+                for more information about properties.
+              </para>
+            </listitem>
+            <listitem>
+              <synopsis>void (*destroy)(struct drm_connector *connector);</synopsis>
+              <para>
+                Destroy the connector when not needed anymore. See
+                <xref linkend="drm-kms-init"/>.
+              </para>
+            </listitem>
+          </itemizedlist>
+        </sect4>
+      </sect3>
+    </sect2>
+    <sect2>
+      <title>Cleanup</title>
+      <para>
+        The DRM core manages its objects' lifetime. When an object is not needed
+	anymore the core calls its destroy function, which must clean up and
+	free every resource allocated for the object. Every
+	<function>drm_*_init</function> call must be matched with a
+	corresponding <function>drm_*_cleanup</function> call to cleanup CRTCs
+	(<function>drm_crtc_cleanup</function>), planes
+	(<function>drm_plane_cleanup</function>), encoders
+	(<function>drm_encoder_cleanup</function>) and connectors
+	(<function>drm_connector_cleanup</function>). Furthermore, connectors
+	that have been added to sysfs must be removed by a call to
+	<function>drm_connector_unregister</function> before calling
+	<function>drm_connector_cleanup</function>.
+      </para>
+      <para>
+        Connectors state change detection must be cleanup up with a call to
+	<function>drm_kms_helper_poll_fini</function>.
+      </para>
+    </sect2>
+    <sect2>
+      <title>Output discovery and initialization example</title>
+      <programlisting><![CDATA[
+void intel_crt_init(struct drm_device *dev)
+{
+	struct drm_connector *connector;
+	struct intel_output *intel_output;
 
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+	intel_output = kzalloc(sizeof(struct intel_output), GFP_KERNEL);
+	if (!intel_output)
+		return;
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/types.h>
-#include <linux/compiler.h>
-#include <linux/slab.h>
-#include <linux/delay.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/vmalloc.h>
-#include <linux/ioport.h>
-#include <linux/pci.h>
-#include <linux/mm.h>
-#include <linux/highmem.h>
-#include <linux/list.h>
-#include <linux/dma-mapping.h>
+	connector = &intel_output->base;
+	drm_connector_init(dev, &intel_output->base,
+			   &intel_crt_connector_funcs, DRM_MODE_CONNECTOR_VGA);
 
-#include <linux/netdevice.h>
-#include <linux/etherdevice.h>
-#include <linux/skbuff.h>
-#include <linux/ethtool.h>
-#include <linux/crc32.h>
-#include <linux/random.h>
-#include <linux/mii.h>
-#include <linux/ip.h>
-#include <linux/tcp.h>
-#include <linux/mutex.h>
-#include <linux/firmware.h>
+	drm_encoder_init(dev, &intel_output->enc, &intel_crt_enc_funcs,
+			 DRM_MODE_ENCODER_DAC);
 
-#include <net/checksum.h>
+	drm_mode_connector_attach_encoder(&intel_output->base,
+					  &intel_output->enc);
 
-#include <linux/atomic.h>
-#include <asm/io.h>
-#include <asm/byteorder.h>
-#include <asm/uaccess.h>
+	/* Set up the DDC bus. */
+	intel_output->ddc_bus = intel_i2c_create(dev, GPIOA, "CRTDDC_A");
+	if (!intel_output->ddc_bus) {
+		dev_printk(KERN_ERR, &dev->pdev->dev, "DDC bus registration "
+			   "failed.\n");
+		return;
+	}
 
-#define cas_page_map(x)      kmap_atomic((x))
-#define cas_page_unmap(x)    kunmap_atomic((x))
-#define CAS_NCPUS            num_online_cpus()
+	intel_output->type = INTEL_OUTPUT_ANALOG;
+	connector->interlace_allowed = 0;
+	connector->doublescan_allowed = 0;
 
-#define cas_skb_release(x)  netif_rx(x)
+	drm_encoder_helper_add(&intel_output->enc, &intel_crt_helper_funcs);
+	drm_connector_helper_add(connector, &intel_crt_connector_helper_funcs);
 
-/* select which firmware to use */
-#define USE_HP_WORKAROUND
-#define HP_WORKAROUND_DEFAULT /* select which firmware to use as default */
-#define CAS_HP_ALT_FIRMWARE   cas_prog_null /* alternate firmware */
+	drm_connector_register(connector);
+}]]></programlisting>
+      <para>
+        In the example above (taken from the i915 driver), a CRTC, connector and
+        encoder combination is created. A device-specific i2c bus is also
+        created for fetching EDID data and performing monitor detection. Once
+        the process is complete, the new connector is registered with sysfs to
+        make its properties available to applications.
+      </para>
+    </sect2>
+    <sect2>
+      <title>KMS API Functions</title>
+!Edrivers/gpu/drm/drm_crtc.c
+    </sect2>
+    <sect2>
+      <title>KMS Data Structures</title>
+!Iinclude/drm/drm_crtc.h
+    </sect2>
+    <sect2>
+      <title>KMS Locking</title>
+!Pdrivers/gpu/drm/drm_modeset_lock.c kms locking
+!Iinclude/drm/drm_modeset_lock.h
+!Edrivers/gpu/drm/drm_modeset_lock.c
+    </sect2>
+  </sect1>
 
-#include "cassini.h"
+  <!-- Internals: kms helper functions -->
 
-#define USE_TX_COMPWB      /* use completion writeback registers */
-#define USE_CSMA_CD_PROTO  /* standard CSMA/CD */
-#define USE_RX_BLANK       /* hw interrupt mitigation */
-#undef USE_ENTROPY_DEV     /* don't test for entropy device */
+  <sect1>
+    <title>Mode Setting Helper Functions</title>
+    <para>
+      The plane, CRTC, encoder and connector functions provided by the drivers
+      implement the DRM API. They're called by the DRM core and ioctl handlers
+      to handle device state changes and configuration request. As implementing
+      those functions often requires logic not specific to drivers, mid-layer
+      helper functions are available to avoid duplicating boilerplate code.
+    </para>
+    <para>
+      The DRM core contains one mid-layer implementation. The mid-layer provides
+      implementations of several plane, CRTC, encoder and connector functions
+      (called from the top of the mid-layer) that pre-process requests and call
+      lower-level functions provided by the driver (at the bottom of the
+      mid-layer). For instance, the
+      <function>drm_crtc_helper_set_config</function> function can be used to
+      fill the struct <structname>drm_crtc_funcs</structname>
+      <structfield>set_config</structfield> field. When called, it will split
+      the <methodname>set_config</methodname> operation in smaller, simpler
+      operations and call the driver to handle them.
+    </para>
+    <para>
+      To use the mid-layer, drivers call <function>drm_crtc_helper_add</function>,
+      <function>drm_encoder_helper_add</function> and
+      <function>drm_connector_helper_add</function> functions to install their
+      mid-layer bottom operations handlers, and fill the
+      <structname>drm_crtc_funcs</structname>,
+      <structname>drm_encoder_funcs</structname> and
+      <structname>drm_connector_funcs</structname> structures with pointers to
+      the mid-layer top API functions. Installing the mid-layer bottom operation
+      handlers is best done right after registering the corresponding KMS object.
+    </para>
+    <para>
+      The mid-layer is not split between CRTC, encoder and connector operations.
+      To use it, a driver must provide bottom functions for all of the three KMS
+      entities.
+    </para>
+    <sect2>
+      <title>Helper Functions</title>
+      <itemizedlist>
+        <listitem>
+          <synopsis>int drm_crtc_helper_set_config(struct drm_mode_set *set);</synopsis>
+          <para>
+            The <function>drm_crtc_helper_set_config</function> helper function
+            is a CRTC <methodname>set_config</methodname> implementation. It
+            first tries to locate the best encoder for each connector by calling
+            the connector <methodname>best_encoder</methodname> helper
+            operation.
+          </para>
+          <para>
+            After locating the appropriate encoders, the helper function will
+            call the <methodname>mode_fixup</methodname> encoder and CRTC helper
+            operations to adjust the requested mode, or reject it completely in
+            which case an error will be returned to the application. If the new
+            configuration after mode adjustment is identical to the current
+            configuration the helper function will return without performing any
+            other operation.
+          </para>
+          <para>
+            If the adjusted mode is identical to the current mode but changes to
+            the frame buffer need to be applied, the
+            <function>drm_crtc_helper_set_config</function> function will call
+            the CRTC <methodname>mode_set_base</methodname> helper operation. If
+            the adjusted mode differs from the current mode, or if the
+            <methodname>mode_set_base</methodname> helper operation is not
+            provided, the helper function performs a full mode set sequence by
+            calling the <methodname>prepare</methodname>,
+            <methodname>mode_set</methodname> and
+            <methodname>commit</methodname> CRTC and encoder helper operations,
+            in that order.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>void drm_helper_connector_dpms(struct drm_connector *connector, int mode);</synopsis>
+          <para>
+            The <function>drm_helper_connector_dpms</function> helper function
+            is a connector <methodname>dpms</methodname> implementation that
+            tracks power state of connectors. To use the function, drivers must
+            provide <methodname>dpms</methodname> helper operations for CRTCs
+            and encoders to apply the DPMS state to the device.
+          </para>
+          <para>
+            The mid-layer doesn't track the power state of CRTCs and encoders.
+            The <methodname>dpms</methodname> helper operations can thus be
+            called with a mode identical to the currently active mode.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>int drm_helper_probe_single_connector_modes(struct drm_connector *connector,
+                                            uint32_t maxX, uint32_t maxY);</synopsis>
+          <para>
+            The <function>drm_helper_probe_single_connector_modes</function> helper
+            function is a connector <methodname>fill_modes</methodname>
+            implementation that updates the connection status for the connector
+            and then retrieves a list of modes by calling the connector
+            <methodname>get_modes</methodname> helper operation.
+          </para>
+         <para>
+            If the helper operation returns no mode, and if the connector status
+            is connector_status_connected, standard VESA DMT modes up to
+            1024x768 are automatically added to the modes list by a call to
+            <function>drm_add_modes_noedid</function>.
+          </para>
+          <para>
+            The function then filters out modes larger than
+            <parameter>max_width</parameter> and <parameter>max_height</parameter>
+            if specified. It finally calls the optional connector
+            <methodname>mode_valid</methodname> helper operation for each mode in
+            the probed list to check whether the mode is valid for the connector.
+          </para>
+        </listitem>
+      </itemizedlist>
+    </sect2>
+    <sect2>
+      <title>CRTC Helper Operations</title>
+      <itemizedlist>
+        <listitem id="drm-helper-crtc-mode-fixup">
+          <synopsis>bool (*mode_fixup)(struct drm_crtc *crtc,
+                       const struct drm_display_mode *mode,
+                       struct drm_display_mode *adjusted_mode);</synopsis>
+          <para>
+            Let CRTCs adjust the requested mode or reject it completely. This
+            operation returns true if the mode is accepted (possibly after being
+            adjusted) or false if it is rejected.
+          </para>
+          <para>
+            The <methodname>mode_fixup</methodname> operation should reject the
+            mode if it can't reasonably use it. The definition of "reasonable"
+            is currently fuzzy in this context. One possible behaviour would be
+            to set the adjusted mode to the panel timings when a fixed-mode
+            panel is used with hardware capable of scaling. Another behaviour
+            would be to accept any input mode and adjust it to the closest mode
+            supported by the hardware (FIXME: This needs to be clarified).
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>int (*mode_set_base)(struct drm_crtc *crtc, int x, int y,
+                     struct drm_framebuffer *old_fb)</synopsis>
+          <para>
+            Move the CRTC on the current frame buffer (stored in
+            <literal>crtc-&gt;fb</literal>) to position (x,y). Any of the frame
+            buffer, x position or y position may have been modified.
+          </para>
+          <para>
+            This helper operation is optional. If not provided, the
+            <function>drm_crtc_helper_set_config</function> function will fall
+            back to the <methodname>mode_set</methodname> helper operation.
+          </para>
+          <note><para>
+            FIXME: Why are x and y passed as arguments, as they can be accessed
+            through <literal>crtc-&gt;x</literal> and
+            <literal>crtc-&gt;y</literal>?
+          </para></note>
+        </listitem>
+        <listitem>
+          <synopsis>void (*prepare)(struct drm_crtc *crtc);</synopsis>
+          <para>
+            Prepare the CRTC for mode setting. This operation is called after
+            validating the requested mode. Drivers use it to perform
+            device-specific operations required before setting the new mode.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>int (*mode_set)(struct drm_crtc *crtc, struct drm_display_mode *mode,
+                struct drm_display_mode *adjusted_mode, int x, int y,
+                struct drm_framebuffer *old_fb);</synopsis>
+          <para>
+            Set a new mode, position and frame buffer. Depending on the device
+            requirements, the mode can be stored internally by the driver and
+            applied in the <methodname>commit</methodname> operation, or
+            programmed to the hardware immediately.
+          </para>
+          <para>
+            The <methodname>mode_set</methodname> operation returns 0 on success
+	    or a negative error code if an error occurs.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>void (*commit)(struct drm_crtc *crtc);</synopsis>
+          <para>
+            Commit a mode. This operation is called after setting the new mode.
+            Upon return the device must use the new mode and be fully
+            operational.
+          </para>
+        </listitem>
+      </itemizedlist>
+    </sect2>
+    <sect2>
+      <title>Encoder Helper Operations</title>
+      <itemizedlist>
+        <listitem>
+          <synopsis>bool (*mode_fixup)(struct drm_encoder *encoder,
+                       const struct drm_display_mode *mode,
+                       struct drm_display_mode *adjusted_mode);</synopsis>
+          <para>
+            Let encoders adjust the requested mode or reject it completely. This
+            operation returns true if the mode is accepted (possibly after being
+            adjusted) or false if it is rejected. See the
+            <link linkend="drm-helper-crtc-mode-fixup">mode_fixup CRTC helper
+            operation</link> for an explanation of the allowed adjustments.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>void (*prepare)(struct drm_encoder *encoder);</synopsis>
+          <para>
+            Prepare the encoder for mode setting. This operation is called after
+            validating the requested mode. Drivers use it to perform
+            device-specific operations required before setting the new mode.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>void (*mode_set)(struct drm_encoder *encoder,
+                 struct drm_display_mode *mode,
+                 struct drm_display_mode *adjusted_mode);</synopsis>
+          <para>
+            Set a new mode. Depending on the device requirements, the mode can
+            be stored internally by the driver and applied in the
+            <methodname>commit</methodname> operation, or programmed to the
+            hardware immediately.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>void (*commit)(struct drm_encoder *encoder);</synopsis>
+          <para>
+            Commit a mode. This operation is called after setting the new mode.
+            Upon return the device must use the new mode and be fully
+            operational.
+          </para>
+        </listitem>
+      </itemizedlist>
+    </sect2>
+    <sect2>
+      <title>Connector Helper Operations</title>
+      <itemizedlist>
+        <listitem>
+          <synopsis>struct drm_encoder *(*best_encoder)(struct drm_connector *connector);</synopsis>
+          <para>
+            Return a pointer to the best encoder for the connecter. Device that
+            map connectors to encoders 1:1 simply return the pointer to the
+            associated encoder. This operation is mandatory.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>int (*get_modes)(struct drm_connector *connector);</synopsis>
+          <para>
+            Fill the connector's <structfield>probed_modes</structfield> list
+            by parsing EDID data with <function>drm_add_edid_modes</function>,
+            adding standard VESA DMT modes with <function>drm_add_modes_noedid</function>,
+            or calling <function>drm_mode_probed_add</function> directly for every
+            supported mode and return the number of modes it has detected. This
+            operation is mandatory.
+          </para>
+          <para>
+            Note that the caller function will automatically add standard VESA
+            DMT modes up to 1024x768 if the <methodname>get_modes</methodname>
+            helper operation returns no mode and if the connector status is
+            connector_status_connected. There is no need to call
+            <function>drm_add_edid_modes</function> manually in that case.
+          </para>
+          <para>
+            When adding modes manually the driver creates each mode with a call to
+            <function>drm_mode_create</function> and must fill the following fields.
+            <itemizedlist>
+              <listitem>
+                <synopsis>__u32 type;</synopsis>
+                <para>
+                  Mode type bitmask, a combination of
+                  <variablelist>
+                    <varlistentry>
+                      <term>DRM_MODE_TYPE_BUILTIN</term>
+                      <listitem><para>not used?</para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_TYPE_CLOCK_C</term>
+                      <listitem><para>not used?</para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_TYPE_CRTC_C</term>
+                      <listitem><para>not used?</para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>
+        DRM_MODE_TYPE_PREFERRED - The preferred mode for the connector
+                      </term>
+                      <listitem>
+                        <para>not used?</para>
+                      </listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_TYPE_DEFAULT</term>
+                      <listitem><para>not used?</para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_TYPE_USERDEF</term>
+                      <listitem><para>not used?</para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_TYPE_DRIVER</term>
+                      <listitem>
+                        <para>
+                          The mode has been created by the driver (as opposed to
+                          to user-created modes).
+                        </para>
+                      </listitem>
+                    </varlistentry>
+                  </variablelist>
+                  Drivers must set the DRM_MODE_TYPE_DRIVER bit for all modes they
+                  create, and set the DRM_MODE_TYPE_PREFERRED bit for the preferred
+                  mode.
+                </para>
+              </listitem>
+              <listitem>
+                <synopsis>__u32 clock;</synopsis>
+                <para>Pixel clock frequency in kHz unit</para>
+              </listitem>
+              <listitem>
+                <synopsis>__u16 hdisplay, hsync_start, hsync_end, htotal;
+    __u16 vdisplay, vsync_start, vsync_end, vtotal;</synopsis>
+                <para>Horizontal and vertical timing information</para>
+                <screen><![CDATA[
+             Active                 Front           Sync           Back
+             Region                 Porch                          Porch
+    <-----------------------><----------------><-------------><-------------->
 
-/* NOTE: these aren't useable unless PCI interrupts can be assigned.
- * also, we need to make cp->lock finer-grained.
- */
-#undef  USE_PCI_INTB
-#undef  USE_PCI_INTC
-#undef  USE_PCI_INTD
-#undef  USE_QOS
+      //////////////////////|
+     ////////////////////// |
+    //////////////////////  |..................               ................
+                                               _______________
 
-#undef  USE_VPD_DEBUG       /* debug vpd information if defined */
+    <----- [hv]display ----->
+    <------------- [hv]sync_start ------------>
+    <--------------------- [hv]sync_end --------------------->
+    <-------------------------------- [hv]total ----------------------------->
+]]></screen>
+              </listitem>
+              <listitem>
+                <synopsis>__u16 hskew;
+    __u16 vscan;</synopsis>
+                <para>Unknown</para>
+              </listitem>
+              <listitem>
+                <synopsis>__u32 flags;</synopsis>
+                <para>
+                  Mode flags, a combination of
+                  <variablelist>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_PHSYNC</term>
+                      <listitem><para>
+                        Horizontal sync is active high
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_NHSYNC</term>
+                      <listitem><para>
+                        Horizontal sync is active low
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_PVSYNC</term>
+                      <listitem><para>
+                        Vertical sync is active high
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_NVSYNC</term>
+                      <listitem><para>
+                        Vertical sync is active low
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_INTERLACE</term>
+                      <listitem><para>
+                        Mode is interlaced
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_DBLSCAN</term>
+                      <listitem><para>
+                        Mode uses doublescan
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_CSYNC</term>
+                      <listitem><para>
+                        Mode uses composite sync
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_PCSYNC</term>
+                      <listitem><para>
+                        Composite sync is active high
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_NCSYNC</term>
+                      <listitem><para>
+                        Composite sync is active low
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_HSKEW</term>
+                      <listitem><para>
+                        hskew provided (not used?)
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_BCAST</term>
+                      <listitem><para>
+                        not used?
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_PIXMUX</term>
+                      <listitem><para>
+                        not used?
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_DBLCLK</term>
+                      <listitem><para>
+                        not used?
+                      </para></listitem>
+                    </varlistentry>
+                    <varlistentry>
+                      <term>DRM_MODE_FLAG_CLKDIV2</term>
+                      <listitem><para>
+                        ?
+                      </para></listitem>
+                    </varlistentry>
+                  </variablelist>
+                </para>
+                <para>
+                  Note that modes marked with the INTERLACE or DBLSCAN flags will be
+                  filtered out by
+                  <function>drm_helper_probe_single_connector_modes</function> if
+                  the connector's <structfield>interlace_allowed</structfield> or
+                  <structfield>doublescan_allowed</structfield> field is set to 0.
+                </para>
+              </listitem>
+              <listitem>
+                <synopsis>char name[DRM_DISPLAY_MODE_LEN];</synopsis>
+                <para>
+                  Mode name. The driver must call
+                  <function>drm_mode_set_name</function> to fill the mode name from
+                  <structfield>hdisplay</structfield>,
+                  <structfield>vdisplay</structfield> and interlace flag after
+                  filling the corresponding fields.
+                </para>
+              </listitem>
+            </itemizedlist>
+          </para>
+          <para>
+            The <structfield>vrefresh</structfield> value is computed by
+            <function>drm_helper_probe_single_connector_modes</function>.
+          </para>
+          <para>
+            When parsing EDID data, <function>drm_add_edid_modes</function> fills the
+            connector <structfield>display_info</structfield>
+            <structfield>width_mm</structfield> and
+            <structfield>height_mm</structfield> fields. When creating modes
+            manually the <methodname>get_modes</methodname> helper operation must
+            set the <structfield>display_info</structfield>
+            <structfield>width_mm</structfield> and
+            <structfield>height_mm</structfield> fields if they haven't been set
+            already (for instance at initialization time when a fixed-size panel is
+            attached to the connector). The mode <structfield>width_mm</structfield>
+            and <structfield>height_mm</structfield> fields are only used internally
+            during EDID parsing and should not be set when creating modes manually.
+          </para>
+        </listitem>
+        <listitem>
+          <synopsis>int (*mode_valid)(struct drm_connector *connector,
+		  struct drm_display_mode *mode);</synopsis>
+          <para>
+            Verify whether a mode is valid for the connector. Return MODE_OK for
+            supported modes and one of the enum drm_mode_status values (MODE_*)
+            for unsupported modes. This operation is optional.
+          </para>
+          <para>
+            As the mode rejection reason is currently not used beside for
+            immediately removing the unsupported mode, an implementation can
+            return MODE_BAD regardless of the exact reason why the mode is not
+            valid.
+          </para>
+          <note><para>
+            Note that the <methodname>mode_valid</methodname> helper operation is
+            only called for modes detected by the device, and
+            <emphasis>not</emphasis> for modes set by the user through the CRTC
+            <methodname>set_config</methodname> operation.
+          </para></note>
+        </listitem>
+      </itemizedlist>
+    </sect2>
+    <sect2>
+      <title>Atomic Modeset Helper Functions Reference</title>
+      <sect3>
+	<title>Overview</title>
+!Pdrivers/gpu/drm/drm_atomic_helper.c overview
+      </sect3>
+      <sect3>
+	<title>Implementing Asynchronous Atomic Commit</title>
+!Pdrivers/gpu/drm/drm_atomic_helper.c implementing async commit
+      </sect3>
+      <sect3>
+	<title>Atomic State Reset and Initialization</title>
+!Pdrivers/gpu/drm/drm_atomic_helper.c atomic state reset and initialization
+      </sect3>
+!Iinclude/drm/drm_atomic_helper.h
+!Edrivers/gpu/drm/drm_atomic_helper.c
+    </sect2>
+    <sect2>
+      <title>Modeset Helper Functions Reference</title>
+!Iinclude/drm/drm_crtc_helper.h
+!Edrivers/gpu/drm/drm_crtc_helper.c
+!Pdrivers/gpu/drm/drm_crtc_helper.c overview
+    </sect2>
+    <sect2>
+      <title>Output Probing Helper Functions Reference</title>
+!Pdrivers/gpu/drm/drm_probe_helper.c output probing helper overview
+!Edrivers/gpu/drm/drm_probe_helper.c
+    </sect2>
+    <sect2>
+      <title>fbdev Helper Functions Reference</title>
+!Pdrivers/gpu/drm/drm_fb_helper.c fbdev helpers
+!Edrivers/gpu/drm/drm_fb_helper.c
+!Iinclude/drm/drm_fb_helper.h
+    </sect2>
+    <sect2>
+      <title>Display Port Helper Functions Reference</title>
+!Pdrivers/gpu/drm/drm_dp_helper.c dp helpers
+!Iinclude/drm/drm_dp_helper.h
+!Edrivers/gpu/drm/drm_dp_helper.c
+    </sect2>
+    <sect2>
+      <title>Display Port MST Helper Functions Reference</title>
+!Pdrivers/gpu/drm/drm_dp_mst_topology.c dp mst helper
+!Iinclude/drm/drm_dp_mst_helper.h
+!Edrivers/gpu/drm/drm_dp_mst_topology.c
+    </sect2>
+    <sect2>
+      <title>MIPI DSI Helper Functions Reference</title>
+!Pdrivers/gpu/drm/drm_mipi_dsi.c dsi helpers
+!Iinclude/drm/drm_mipi_dsi.h
+!Edrivers/gpu/drm/drm_mipi_dsi.c
+    </sect2>
+    <sect2>
+      <title>EDID Helper Functions Reference</title>
+!Edrivers/gpu/drm/drm_edid.c
+    </sect2>
+    <sect2>
+      <title>Rectangle Utilities Reference</title>
+!Pinclude/drm/drm_rect.h rect utils
+!Iinclude/drm/drm_rect.h
+!Edrivers/gpu/drm/drm_rect.c
+    </sect2>
+    <sect2>
+      <title>Flip-work Helper Reference</title>
+!Pinclude/drm/drm_flip_work.h flip utils
+!Iinclude/drm/drm_flip_work.h
+!Edrivers/gpu/drm/drm_flip_work.c
+    </sect2>
+    <sect2>
+      <title>HDMI Infoframes Helper Reference</title>
+      <para>
+	Strictly speaking this is not a DRM helper library but generally useable
+	by any driver interfacing with HDMI outputs like v4l or alsa drivers.
+	But it nicely fits into the overall topic of mode setting helper
+	libraries and hence is also included here.
+      </para>
+!Iinclude/linux/hdmi.h
+!Edrivers/video/hdmi.c
+    </sect2>
+    <sect2>
+      <title id="drm-kms-planehelpers">Plane Helper Reference</title>
+!Edrivers/gpu/drm/drm_plane_helper.c
+!Pdrivers/gpu/drm/drm_plane_helper.c overview
+    </sect2>
+    <sect2>
+	  <title>Tile group</title>
+!Pdrivers/gpu/drm/drm_crtc.c Tile group
+    </sect2>
+    <sect2>
+	<title>Bridges</title>
+      <sect3>
+	 <title>Overview</title>
+!Pdrivers/gpu/drm/drm_bridge.c overview
+      </sect3>
+      <sect3>
+	 <title>Default bridge callback sequence</title>
+!Pdrivers/gpu/drm/drm_bridge.c bridge callbacks
+      </sect3>
+!Edrivers/gpu/drm/drm_bridge.c
+    </sect2>
+  </sect1>
 
-/* rx processing options */
-#define USE_PAGE_ORDER      /* specify to allocate large rx pages */
-#define RX_DONT_BATCH  0    /* if 1, don't batch flows */
-#define RX_COPY_ALWAYS 0    /* if 0, use frags */
-#define RX_COPY_MIN    64   /* copy a little to make upper layers happy */
-#undef  RX_COUNT_BUFFERS    /* define to calculate RX buffer stats */
+  <!-- Internals: kms properties -->
 
-#define DRV_MODULE_NAME		"cassini"
-#define DRV_MODULE_VERSION	"1.6"
-#define DRV_MODULE_RELDATE	"21 May 2008"
+  <sect1 id="drm-kms-properties">
+    <title>KMS Properties</title>
+    <para>
+      Drivers may need to expose additional parameters to applications than
+      those described in the previous sections. KMS supports attaching
+      properties to CRTCs, connectors and planes and offers a userspace API to
+      list, get and set the property values.
+    </para>
+    <para>
+      Properties are identified by a name that uniquely defines the property
+      purpose, and store an associated value. For all property types except blob
+      properties the value is a 64-bit unsigned integer.
+    </para>
+    <para>
+      KMS differentiates between properties and property instances. Drivers
+      first create properties and then create and associate individual instances
+      of those properties to objects. A property can be instantiated multiple
+      times and associated with different objects. Values are stored in property
+      instances, and all other property information are stored in the property
+      and shared between all instances of the property.
+    </para>
+    <para>
+      Every property is created with a type that influences how the KMS core
+      handles the property. Supported property types are
+      <variablelist>
+        <varlistentry>
+          <term>DRM_MODE_PROP_RANGE</term>
+          <listitem><para>Range properties report their minimum and maximum
+            admissible values. The KMS core verifies that values set by
+            application fit in that range.</para></listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>DRM_MODE_PROP_ENUM</term>
+          <listitem><para>Enumerated properties take a numerical value that
+            ranges from 0 to the number of enumerated values defined by the
+            property minus one, and associate a free-formed string name to each
+            value. Applications can retrieve the list of defined value-name pairs
+            and use the numerical value to get and set property instance values.
+            </para></listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>DRM_MODE_PROP_BITMASK</term>
+          <listitem><para>Bitmask properties are enumeration properties that
+            additionally restrict all enumerated values to the 0..63 range.
+            Bitmask property instance values combine one or more of the
+            enumerated bits defined by the property.</para></listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>DRM_MODE_PROP_BLOB</term>
+          <listitem><para>Blob properties store a binary blob without any format
+            restriction. The binary blobs are created as KMS standalone objects,
+            and blob property instance values store the ID of their associated
+            blob object.</para>
+	    <para>Blob properties are only used for the connector EDID property
+	    and cannot be created by drivers.</para></listitem>
+        </varlistentry>
+      </variablelist>
+    </para>
+    <para>
+      To create a property drivers call one of the following functions depending
+      on the property type. All property creation functions take property flags
+      and name, as well as type-specific arguments.
+      <itemizedlist>
+        <listitem>
+          <synopsis>struct drm_property *drm_property_create_range(struct drm_device *dev, int flags,
+                                               const char *name,
+                                               uint64_t min, uint64_t max);</synopsis>
+          <para>Create a range property with the given minimum and maximum
+            values.</para>
+        </listitem>
+        <listitem>
+          <synopsis>struct drm_property *drm_property_create_enum(struct drm_device *dev, int flags,
+                                              const char *name,
+                                              const struct drm_prop_enum_list *props,
+                                              int num_values);</synopsis>
+          <para>Create an enumerated property. The <parameter>props</parameter>
+            argument points to an array of <parameter>num_values</parameter>
+            value-name pairs.</para>
+        </listitem>
+        <listitem>
+          <synopsis>struct drm_property *drm_property_create_bitmask(struct drm_device *dev,
+                                                 int flags, const char *name,
+                                                 const struct drm_prop_enum_list *props,
+                                                 int num_values);</synopsis>
+          <para>Create a bitmask property. The <parameter>props</parameter>
+            argument points to an array of <parameter>num_values</parameter>
+            value-name pairs.</para>
+        </listitem>
+      </itemizedlist>
+    </para>
+    <para>
+      Properties can additionally be created as immutable, in which case they
+      will be read-only for applications but can be modified by the driver. To
+      create an immutable property drivers must set the DRM_MODE_PROP_IMMUTABLE
+      flag at property creation time.
+    </para>
+    <para>
+      When no array of value-name pairs is readily available at property
+      creation time for enumerated or range properties, drivers can create
+      the property using the <function>drm_property_create</function> function
+      and manually add enumeration value-name pairs by calling the
+      <function>drm_property_add_enum</function> function. Care must be taken to
+      properly specify the property type through the <parameter>flags</parameter>
+      argument.
+    </para>
+    <para>
+      After creating properties drivers can attach property instances to CRTC,
+      connector and plane objects by calling the
+      <function>drm_object_attach_property</function>. The function takes a
+      pointer to the target object, a pointer to the previously created property
+      and an initial instance value.
+    </para>
+    <sect2>
+	<title>Existing KMS Properties</title>
+	<para>
+	The following table gives description of drm properties exposed by various
+	modules/drivers.
+	</para>
+	<table border="1" cellpadding="0" cellspacing="0">
+	<tbody>
+	<tr style="font-weight: bold;">
+	<td valign="top" >Owner Module/Drivers</td>
+	<td valign="top" >Group</td>
+	<td valign="top" >Property Name</td>
+	<td valign="top" >Type</td>
+	<td valign="top" >Property Values</td>
+	<td valign="top" >Object attached</td>
+	<td valign="top" >Description/Restrictions</td>
+	</tr>
+	<tr>
+	<td rowspan="37" valign="top" >DRM</td>
+	<td valign="top" >Generic</td>
+	<td valign="top" >“rotation”</td>
+	<td valign="top" >BITMASK</td>
+	<td valign="top" >{ 0, "rotate-0" },
+	{ 1, "rotate-90" },
+	{ 2, "rotate-180" },
+	{ 3, "rotate-270" },
+	{ 4, "reflect-x" },
+	{ 5, "reflect-y" }</td>
+	<td valign="top" >CRTC, Plane</td>
+	<td valign="top" >rotate-(degrees) rotates the image by the specified amount in degrees
+	in counter clockwise direction. reflect-x and reflect-y reflects the
+	image along the specified axis prior to rotation</td>
+	</tr>
+	<tr>
+	<td rowspan="5" valign="top" >Connector</td>
+	<td valign="top" >“EDID”</td>
+	<td valign="top" >BLOB | IMMUTABLE</td>
+	<td valign="top" >0</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >Contains id of edid blob ptr object.</td>
+	</tr>
+	<tr>
+	<td valign="top" >“DPMS”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ “On”, “Standby”, “Suspend”, “Off” }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >Contains DPMS operation mode value.</td>
+	</tr>
+	<tr>
+	<td valign="top" >“PATH”</td>
+	<td valign="top" >BLOB | IMMUTABLE</td>
+	<td valign="top" >0</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >Contains topology path to a connector.</td>
+	</tr>
+	<tr>
+	<td valign="top" >“TILE”</td>
+	<td valign="top" >BLOB | IMMUTABLE</td>
+	<td valign="top" >0</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >Contains tiling information for a connector.</td>
+	</tr>
+	<tr>
+	<td valign="top" >“CRTC_ID”</td>
+	<td valign="top" >OBJECT</td>
+	<td valign="top" >DRM_MODE_OBJECT_CRTC</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >CRTC that connector is attached to (atomic)</td>
+	</tr>
+	<tr>
+	<td rowspan="11" valign="top" >Plane</td>
+	<td valign="top" >“type”</td>
+	<td valign="top" >ENUM | IMMUTABLE</td>
+	<td valign="top" >{ "Overlay", "Primary", "Cursor" }</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Plane type</td>
+	</tr>
+	<tr>
+	<td valign="top" >“SRC_X”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=UINT_MAX</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout source x coordinate in 16.16 fixed point (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“SRC_Y”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=UINT_MAX</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout source y coordinate in 16.16 fixed point (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“SRC_W”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=UINT_MAX</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout source width in 16.16 fixed point (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“SRC_H”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=UINT_MAX</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout source height in 16.16 fixed point (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“CRTC_X”</td>
+	<td valign="top" >SIGNED_RANGE</td>
+	<td valign="top" >Min=INT_MIN, Max=INT_MAX</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout CRTC (destination) x coordinate (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“CRTC_Y”</td>
+	<td valign="top" >SIGNED_RANGE</td>
+	<td valign="top" >Min=INT_MIN, Max=INT_MAX</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout CRTC (destination) y coordinate (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“CRTC_W”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=UINT_MAX</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout CRTC (destination) width (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“CRTC_H”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=UINT_MAX</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout CRTC (destination) height (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“FB_ID”</td>
+	<td valign="top" >OBJECT</td>
+	<td valign="top" >DRM_MODE_OBJECT_FB</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >Scanout framebuffer (atomic)</td>
+	</tr>
+	<tr>
+	<td valign="top" >“CRTC_ID”</td>
+	<td valign="top" >OBJECT</td>
+	<td valign="top" >DRM_MODE_OBJECT_CRTC</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >CRTC that plane is attached to (atomic)</td>
+	</tr>
+	<tr>
+	<td rowspan="2" valign="top" >DVI-I</td>
+	<td valign="top" >“subconnector”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ “Unknown”, “DVI-D”, “DVI-A” }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“select subconnector”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ “Automatic”, “DVI-D”, “DVI-A” }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="13" valign="top" >TV</td>
+	<td valign="top" >“subconnector”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "Unknown", "Composite", "SVIDEO", "Component", "SCART" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“select subconnector”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "Automatic", "Composite", "SVIDEO", "Component", "SCART" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“mode”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "NTSC_M", "NTSC_J", "NTSC_443", "PAL_B" } etc.</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“left margin”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“right margin”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“top margin”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“bottom margin”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“brightness”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“contrast”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“flicker reduction”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“overscan”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“saturation”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“hue”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="2" valign="top" >Virtual GPU</td>
+	<td valign="top" >“suggested X”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0xffffffff</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >property to suggest an X offset for a connector</td>
+	</tr>
+	<tr>
+	<td valign="top" >“suggested Y”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0xffffffff</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >property to suggest an Y offset for a connector</td>
+	</tr>
+	<tr>
+	<td rowspan="3" valign="top" >Optional</td>
+	<td valign="top" >“scaling mode”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "None", "Full", "Center", "Full aspect" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"aspect ratio"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "None", "4:3", "16:9" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >DRM property to set aspect ratio from user space app.
+		This enum is made generic to allow addition of custom aspect
+		ratios.</td>
+	</tr>
+	<tr>
+	<td valign="top" >“dirty”</td>
+	<td valign="top" >ENUM | IMMUTABLE</td>
+	<td valign="top" >{ "Off", "On", "Annotate" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="20" valign="top" >i915</td>
+	<td rowspan="2" valign="top" >Generic</td>
+	<td valign="top" >"Broadcast RGB"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "Automatic", "Full", "Limited 16:235" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“audio”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "force-dvi", "off", "auto", "on" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="17" valign="top" >SDVO-TV</td>
+	<td valign="top" >“mode”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "NTSC_M", "NTSC_J", "NTSC_443", "PAL_B" } etc.</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"left_margin"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"right_margin"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"top_margin"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"bottom_margin"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“hpos”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“vpos”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“contrast”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“saturation”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“hue”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“sharpness”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“flicker_filter”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“flicker_filter_adaptive”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“flicker_filter_2d”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“tv_chroma_filter”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“tv_luma_filter”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“dot_crawl”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=1</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >SDVO-TV/LVDS</td>
+	<td valign="top" >“brightness”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="2" valign="top" >CDV gma-500</td>
+	<td rowspan="2" valign="top" >Generic</td>
+	<td valign="top" >"Broadcast RGB"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ “Full”, “Limited 16:235” }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"Broadcast RGB"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ “off”, “auto”, “on” }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="19" valign="top" >Poulsbo</td>
+	<td rowspan="1" valign="top" >Generic</td>
+	<td valign="top" >“backlight”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=100</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="17" valign="top" >SDVO-TV</td>
+	<td valign="top" >“mode”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "NTSC_M", "NTSC_J", "NTSC_443", "PAL_B" } etc.</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"left_margin"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"right_margin"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"top_margin"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"bottom_margin"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“hpos”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“vpos”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“contrast”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“saturation”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“hue”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“sharpness”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“flicker_filter”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“flicker_filter_adaptive”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“flicker_filter_2d”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“tv_chroma_filter”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“tv_luma_filter”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“dot_crawl”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=1</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >SDVO-TV/LVDS</td>
+	<td valign="top" >“brightness”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max= SDVO dependent</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="11" valign="top" >armada</td>
+	<td rowspan="2" valign="top" >CRTC</td>
+	<td valign="top" >"CSC_YUV"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "Auto" , "CCIR601", "CCIR709" }</td>
+	<td valign="top" >CRTC</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"CSC_RGB"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "Auto", "Computer system", "Studio" }</td>
+	<td valign="top" >CRTC</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="9" valign="top" >Overlay</td>
+	<td valign="top" >"colorkey"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0xffffff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"colorkey_min"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0xffffff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"colorkey_max"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0xffffff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"colorkey_val"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0xffffff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"colorkey_alpha"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0xffffff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"colorkey_mode"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "disabled", "Y component", "U component"
+	, "V component", "RGB", “R component", "G component", "B component" }</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"brightness"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=256 + 255</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"contrast"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0x7fff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"saturation"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0x7fff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="2" valign="top" >exynos</td>
+	<td valign="top" >CRTC</td>
+	<td valign="top" >“mode”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "normal", "blank" }</td>
+	<td valign="top" >CRTC</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >Overlay</td>
+	<td valign="top" >“zpos”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=MAX_PLANE-1</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="2" valign="top" >i2c/ch7006_drv</td>
+	<td valign="top" >Generic</td>
+	<td valign="top" >“scale”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=2</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="1" valign="top" >TV</td>
+	<td valign="top" >“mode”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "PAL", "PAL-M","PAL-N"}, ”PAL-Nc"
+	, "PAL-60", "NTSC-M", "NTSC-J" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="15" valign="top" >nouveau</td>
+	<td rowspan="6" valign="top" >NV10 Overlay</td>
+	<td valign="top" >"colorkey"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0x01ffffff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“contrast”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=8192-1</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“brightness”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=1024</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“hue”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=359</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“saturation”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=8192-1</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“iturbt_709”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=1</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="2" valign="top" >Nv04 Overlay</td>
+	<td valign="top" >“colorkey”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0x01ffffff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“brightness”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=1024</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="7" valign="top" >Display</td>
+	<td valign="top" >“dithering mode”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "auto", "off", "on" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“dithering depth”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "auto", "off", "on", "static 2x2", "dynamic 2x2", "temporal" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“underscan”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "auto", "6 bpc", "8 bpc" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“underscan hborder”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=128</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“underscan vborder”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=128</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“vibrant hue”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=180</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >“color vibrance”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=200</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >omap</td>
+	<td valign="top" >Generic</td>
+	<td valign="top" >“zorder”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=3</td>
+	<td valign="top" >CRTC, Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >qxl</td>
+	<td valign="top" >Generic</td>
+	<td valign="top" >“hotplug_mode_update"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=1</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="9" valign="top" >radeon</td>
+	<td valign="top" >DVI-I</td>
+	<td valign="top" >“coherent”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=1</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >DAC enable load detect</td>
+	<td valign="top" >“load detection”</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=1</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >TV Standard</td>
+	<td valign="top" >"tv standard"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "ntsc", "pal", "pal-m", "pal-60", "ntsc-j"
+	, "scart-pal", "pal-cn", "secam" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >legacy TMDS PLL detect</td>
+	<td valign="top" >"tmds_pll"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "driver", "bios" }</td>
+	<td valign="top" >-</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="3" valign="top" >Underscan</td>
+	<td valign="top" >"underscan"</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "off", "on", "auto" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"underscan hborder"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=128</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"underscan vborder"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=128</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >Audio</td>
+	<td valign="top" >“audio”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "off", "on", "auto" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >FMT Dithering</td>
+	<td valign="top" >“dither”</td>
+	<td valign="top" >ENUM</td>
+	<td valign="top" >{ "off", "on" }</td>
+	<td valign="top" >Connector</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td rowspan="3" valign="top" >rcar-du</td>
+	<td rowspan="3" valign="top" >Generic</td>
+	<td valign="top" >"alpha"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=255</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"colorkey"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=0, Max=0x01ffffff</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	<tr>
+	<td valign="top" >"zpos"</td>
+	<td valign="top" >RANGE</td>
+	<td valign="top" >Min=1, Max=7</td>
+	<td valign="top" >Plane</td>
+	<td valign="top" >TBD</td>
+	</tr>
+	</tbody>
+	</table>
+    </sect2>
+  </sect1>
 
-#define CAS_DEF_MSG_ENABLE	  \
-	(NETIF_MSG_DRV		| \
-	 NETIF_MSG_PROBE	| \
-	 NETIF_MSG_LINK		| \
-	 NETIF_MSG_TIMER	| \
-	 NETIF_MSG_IFDOWN	| \
-	 NETIF_MSG_IFUP		| \
-	 NETIF_MSG_RX_ERR	| \
-	 NETIF_MSG_TX_ERR)
+  <!-- Internals: vertical blanking -->
 
-/* length of time before we decide the hardware is borked,
- * and dev->tx_timeout() should be called to fix the problem
- */
-#define CAS_TX_TIMEOUT			(HZ)
-#define CAS_LINK_TIMEOUT                (22*HZ/10)
-#define CAS_LINK_FAST_TIMEOUT           (1)
+  <sect1 id="drm-vertical-blank">
+    <title>Vertical Blanking</title>
+    <para>
+      Vertical blanking plays a major role in graphics rendering. To achieve
+      tear-free display, users must synchronize page flips and/or rendering to
+      vertical blanking. The DRM API offers ioctls to perform page flips
+      synchronized to vertical blanking and wait for vertical blanking.
+    </para>
+    <para>
+      The DRM core handles most of the vertical blanking management logic, which
+      involves filtering out spurious interrupts, keeping race-free blanking
+      counters, coping with counter wrap-around and resets and keeping use
+      counts. It relies on the driver to generate vertical blanking interrupts
+      and optionally provide a hardware vertical blanking counter. Drivers must
+      implement the following operations.
+    </para>
+    <itemizedlist>
+      <listitem>
+        <synopsis>int (*enable_vblank) (struct drm_device *dev, int crtc);
+void (*disable_vblank) (struct drm_device *dev, int crtc);</synopsis>
+        <para>
+	  Enable or disable vertical blanking interrupts for the given CRTC.
+	</para>
+      </listitem>
+      <listitem>
+        <synopsis>u32 (*get_vblank_counter) (struct drm_device *dev, int crtc);</synopsis>
+        <para>
+	  Retrieve the value of the vertical blanking counter for the given
+	  CRTC. If the hardware maintains a vertical blanking counter its value
+	  should be returned. Otherwise drivers can use the
+	  <function>drm_vblank_count</function> helper function to handle this
+	  operation.
+	</para>
+      </listitem>
+    </itemizedlist>
+    <para>
+      Drivers must initialize the vertical blanking handling core with a call to
+      <function>drm_vblank_init</function> in their
+      <methodname>load</methodname> operation. The function will set the struct
+      <structname>drm_device</structname>
+      <structfield>vblank_disable_allowed</structfield> field to 0. This will
+      keep vertical blanking interrupts enabled permanently until the first mode
+      set operation, where <structfield>vblank_disable_allowed</structfield> is
+      set to 1. The reason behind this is not clear. Drivers can set the field
+      to 1 after <function>calling drm_vblank_init</function> to make vertical
+      blanking interrupts dynamically managed from the beginning.
+    </para>
+    <para>
+      Vertical blanking interrupts can be enabled by the DRM core or by drivers
+      themselves (for instance to handle page flipping operations). The DRM core
+      maintains a vertical blanking use count to ensure that the interrupts are
+      not disabled while a user still needs them. To increment the use count,
+      drivers call <function>drm_vblank_get</function>. Upon return vertical
+      blanking interrupts are guaranteed to be enabled.
+    </para>
+    <para>
+      To decrement the use count drivers call
+      <function>drm_vblank_put</function>. Only when the use count drops to zero
+      will the DRM core disable the vertical blanking interrupts after a delay
+      by scheduling a timer. The delay is accessible through the vblankoffdelay
+      module parameter or the <varname>drm_vblank_offdelay</varname> global
+      variable and expressed in milliseconds. Its default value is 5000 ms.
+      Zero means never disable, and a negative value means disable immediately.
+      Drivers may override the behaviour by setting the
+      <structname>drm_device</structname>
+      <structfield>vblank_disable_immediate</structfield> flag, which when set
+      causes vblank interrupts to be disabled immediately regardless of the
+      drm_vblank_offdelay value. The flag should only be set if there's a
+      properly working hardware vblank counter present.
+    </para>
+    <para>
+      When a vertical blanking interrupt occurs drivers only need to call the
+      <function>drm_handle_vblank</function> function to account for the
+      interrupt.
+    </para>
+    <para>
+      Resources allocated by <function>drm_vblank_init</function> must be freed
+      with a call to <function>drm_vblank_cleanup</function> in the driver
+      <methodname>unload</methodname> operation handler.
+    </para>
+    <sect2>
+      <title>Vertical Blanking and Interrupt Handling Functions Reference</title>
+!Edrivers/gpu/drm/drm_irq.c
+!Finclude/drm/drmP.h drm_crtc_vblank_waitqueue
+    </sect2>
+  </sect1>
 
-/* timeout values for state changing. these specify the number
- * of 10us delays to be used before giving up.
- */
-#define STOP_TRIES_PHY 1000
-#define STOP_TRIES     5000
+  <!-- Internals: open/close, file operations and ioctls -->
 
-/* specify a minimum frame size to deal with some fifo issues
- * max mtu == 2 * page size - ethernet header - 64 - swivel =
- *            2 * page_size - 0x50
- */
-#define CAS_MIN_FRAME			97
-#define CAS_1000MB_MIN_FRAME            255
-#define CAS_MIN_MTU                     60
-#define CAS_MAX_MTU                     min(((cp->page_size << 1) - 0x50), 9000)
+  <sect1>
+    <title>Open/Close, File Operations and IOCTLs</title>
+    <sect2>
+      <title>Open and Close</title>
+      <synopsis>int (*firstopen) (struct drm_device *);
+void (*lastclose) (struct drm_device *);
+int (*open) (struct drm_device *, struct drm_file *);
+void (*preclose) (struct drm_device *, struct drm_file *);
+void (*postclose) (struct drm_device *, struct drm_file *);</synopsis>
+      <abstract>Open and close handlers. None of those methods are mandatory.
+      </abstract>
+      <para>
+        The <methodname>firstopen</methodname> method is called by the DRM core
+	for legacy UMS (User Mode Setting) drivers only when an application
+	opens a device that has no other opened file handle. UMS drivers can
+	implement it to acquire device resources. KMS drivers can't use the
+	method and must acquire resources in the <methodname>load</methodname>
+	method instead.
+      </para>
+      <para>
+	Similarly the <methodname>lastclose</methodname> method is called when
+	the last application holding a file handle opened on the device closes
+	it, for both UMS and KMS drivers. Additionally, the method is also
+	called at module unload time or, for hot-pluggable devices, when the
+	device is unplugged. The <methodname>firstopen</methodname> and
+	<methodname>lastclose</methodname> calls can thus be unbalanced.
+      </para>
+      <para>
+        The <methodname>open</methodname> method is called every time the device
+	is opened by an application. Drivers can allocate per-file private data
+	in this method and store them in the struct
+	<structname>drm_file</structname> <structfield>driver_priv</structfield>
+	field. Note that the <methodname>open</methodname> method is called
+	before <methodname>firstopen</methodname>.
+      </para>
+      <para>
+        The close operation is split into <methodname>preclose</methodname> and
+	<methodname>postclose</methodname> methods. Drivers must stop and
+	cleanup all per-file operations in the <methodname>preclose</methodname>
+	method. For instance pending vertical blanking and page flip events must
+	be cancelled. No per-file operation is allowed on the file handle after
+	returning from the <methodname>preclose</methodname> method.
+      </para>
+      <para>
+        Finally the <methodname>postclose</methodname> method is called as the
+	last step of the close operation, right before calling the
+	<methodname>lastclose</methodname> method if no other open file handle
+	exists for the device. Drivers that have allocated per-file private data
+	in the <methodname>open</methodname> method should free it here.
+      </para>
+      <para>
+        The <methodname>lastclose</methodname> method should restore CRTC and
+	plane properties to default value, so that a subsequent open of the
+	device will not inherit state from the previous user. It can also be
+	used to execute delayed power switching state changes, e.g. in
+	conjunction with the vga_switcheroo infrastructure (see
+	<xref linkend="vga_switcheroo"/>). Beyond that KMS drivers should not
+	do any further cleanup. Only legacy UMS drivers might need to clean up
+	device state so that the vga console or an independent fbdev driver
+	could take over.
+      </para>
+    </sect2>
+    <sect2>
+      <title>File Operations</title>
+      <synopsis>const struct file_operations *fops</synopsis>
+      <abstract>File operations for the DRM device node.</abstract>
+      <para>
+        Drivers must define the file operations structure that forms the DRM
+	userspace API entry point, even though most of those operations are
+	implemented in the DRM core. The <methodname>open</methodname>,
+	<methodname>release</methodname> and <methodname>ioctl</methodname>
+	operations are handled by
+	<programlisting>
+	.owner = THIS_MODULE,
+	.open = drm_open,
+	.release = drm_release,
+	.unlocked_ioctl = drm_ioctl,
+  #ifdef CONFIG_COMPAT
+	.compat_ioctl = drm_compat_ioctl,
+  #endif
+        </programlisting>
+      </para>
+      <para>
+        Drivers that implement private ioctls that requires 32/64bit
+	compatibility support must provide their own
+	<methodname>compat_ioctl</methodname> handler that processes private
+	ioctls and calls <function>drm_compat_ioctl</function> for core ioctls.
+      </para>
+      <para>
+        The <methodname>read</methodname> and <methodname>poll</methodname>
+	operations provide support for reading DRM events and polling them. They
+	are implemented by
+	<programlisting>
+	.poll = drm_poll,
+	.read = drm_read,
+	.llseek = no_llseek,
+	</programlisting>
+      </para>
+      <para>
+        The memory mapping implementation varies depending on how the driver
+	manages memory. Pre-GEM drivers will use <function>drm_mmap</function>,
+	while GEM-aware drivers will use <function>drm_gem_mmap</function>. See
+	<xref linkend="drm-gem"/>.
+	<programlisting>
+	.mmap = drm_gem_mmap,
+	</programlisting>
+      </para>
+      <para>
+        No other file operation is supported by the DRM API.
+      </para>
+    </sect2>
+    <sect2>
+      <title>IOCTLs</title>
+      <synopsis>struct drm_ioctl_desc *ioctls;
+int num_ioctls;</synopsis>
+      <abstract>Driver-specific ioctls descriptors table.</abstract>
+      <para>
+        Driver-specific ioctls numbers start at DRM_COMMAND_BASE. The ioctls
+	descriptors table is indexed by the ioctl number offset from the base
+	value. Drivers can use the DRM_IOCTL_DEF_DRV() macro to initialize the
+	table entries.
+      </para>
+      <para>
+        <programlisting>DRM_IOCTL_DEF_DRV(ioctl, func, flags)</programlisting>
+	<para>
+	  <parameter>ioctl</parameter> is the ioctl name. Drivers must define
+	  the DRM_##ioctl and DRM_IOCTL_##ioctl macros to the ioctl number
+	  offset from DRM_COMMAND_BASE and the ioctl number respectively. The
+	  first macro is private to the device while the second must be exposed
+	  to userspace in a public header.
+	</para>
+	<para>
+	  <parameter>func</parameter> is a pointer to the ioctl handler function
+	  compatible with the <type>drm_ioctl_t</type> type.
+	  <programlisting>typedef int drm_ioctl_t(struct drm_device *dev, void *data,
+		struct drm_file *file_priv);</programlisting>
+	</para>
+	<para>
+	  <parameter>flags</parameter> is a bitmask combination of the following
+	  values. It restricts how the ioctl is allowed to be called.
+	  <itemizedlist>
+	    <listitem><para>
+	      DRM_AUTH - Only authenticated callers allowed
+	    </para></listitem>
+	    <listitem><para>
+	      DRM_MASTER - The ioctl can only be called on the master file
+	      handle
+	    </para></listitem>
+            <listitem><para>
+	      DRM_ROOT_ONLY - Only callers with the SYSADMIN capability allowed
+	    </para></listitem>
+            <listitem><para>
+	      DRM_CONTROL_ALLOW - The ioctl can only be called on a control
+	      device
+	    </para></listitem>
+            <listitem><para>
+	      DRM_UNLOCKED - The ioctl handler will be called without locking
+	      the DRM global mutex. This is the enforced default for kms drivers
+	      (i.e. using the DRIVER_MODESET flag) and hence shouldn't be used
+	      any more for new drivers.
+	    </para></listitem>
+	  </itemizedlist>
+	</para>
+      </para>
+!Edrivers/gpu/drm/drm_ioctl.c
+    </sect2>
+  </sect1>
+  <sect1>
+    <title>Legacy Support Code</title>
+    <para>
+      The section very briefly covers some of the old legacy support code which
+      is only used by old DRM drivers which have done a so-called shadow-attach
+      to the underlying device instead of registering as a real driver. This
+      also includes some of the old generic buffer management and command
+      submission code. Do not use any of this in new and modern drivers.
+    </para>
 
-#if 1
-/*
- * Eliminate these and use separate atomic counters for each, to
- * avoid a race condition.
- */
-#else
-#define CAS_RESET_MTU                   1
-#define CAS_RESET_ALL                   2
-#define CAS_RESET_SPARE                 3
-#endif
+    <sect2>
+      <title>Legacy Suspend/Resume</title>
+      <para>
+	The DRM core provides some suspend/resume code, but drivers wanting full
+	suspend/resume support should provide save() and restore() functions.
+	These are called at suspend, hibernate, or resume time, and should perform
+	any state save or restore required by your device across suspend or
+	hibernate states.
+      </para>
+      <synopsis>int (*suspend) (struct drm_device *, pm_message_t state);
+  int (*resume) (struct drm_device *);</synopsis>
+      <para>
+	Those are legacy suspend and resume methods which
+	<emphasis>only</emphasis> work with the legacy shadow-attach driver
+	registration functions. New driver should use the power management
+	interface provided by their bus type (usually through
+	the struct <structname>device_driver</structname> dev_pm_ops) and set
+	these methods to NULL.
+      </para>
+    </sect2>
 
-static char version[] =
-	DRV_MODULE_NAME ".c:v" DRV_MODULE_VERSION " (" DRV_MODULE_RELDATE ")\n";
+    <sect2>
+      <title>Legacy DMA Services</title>
+      <para>
+	This should cover how DMA mapping etc. is supported by the core.
+	These functions are deprecated and should not be used.
+      </para>
+    </sect2>
+  </sect1>
+  </chapter>
 
-static int cassini_debug = -1;	/* -1 == use CAS_DEF_MSG_ENABLE as value */
-static int link_mode;
+<!-- TODO
 
-MODULE_AUTHOR("Adrian Sun (asun@darksunrising.com)");
-MODULE_DESCRIPTION("Sun Cassini(+) ethernet driver");
-MODULE_LICENSE("GPL");
-MODULE_FIRMWARE("sun/cassini.bin");
-module_param(cassini_debug, int, 0);
-MODULE_PARM_DESC(cassini_debug, "Cassini bitmapped debugging message enable value");
-module_param(link_mode, int, 0);
-MODULE_PARM_DESC(link_mode, "default link mode");
+- Add a glossary
+- Document the struct_mutex catch-all lock
+- Document connector properties
 
-/*
- * Work around for a PCS bug in which the link goes down due to the chip
- * being confused and never showing a link status of "up."
- */
-#define DEFAULT_LINKDOWN_TIMEOUT 5
-/*
- * Value in seconds, for user input.
- */
-static int linkdown_timeout = DEFAULT_LINKDOWN_TIMEOUT;
-module_param(linkdown_timeout, int, 0);
-MODULE_PARM_DESC(linkdown_timeout,
-"min reset interval in sec. for PCS linkdown issue; disabled if not positive");
+- Why is the load method optional?
+- What are drivers supposed to set the initial display state to, and how?
+  Connector's DPMS states are not initialized and are thus equal to
+  DRM_MODE_DPMS_ON. The fbcon compatibility layer calls
+  drm_helper_disable_unused_functions(), which disables unused encoders and
+  CRTCs, but doesn't touch the connectors' DPMS state, and
+  drm_helper_connector_dpms() in reaction to fbdev blanking events. Do drivers
+  that don't implement (or just don't use) fbcon compatibility need to call
+  those functions themselves?
+- KMS drivers must call drm_vblank_pre_modeset() and drm_vblank_post_modeset()
+  around mode setting. Should this be done in the DRM core?
+- vblank_disable_allowed is set to 1 in the first drm_vblank_post_modeset()
+  call and never set back to 0. It seems to be safe to permanently set it to 1
+  in drm_vblank_init() for KMS driver, and it might be safe for UMS drivers as
+  well. This should be investigated.
+- crtc and connector .save and .restore operations are only used internally in
+  drivers, should they be removed from the core?
+- encoder mid-layer .save and .restore operations are only used internally in
+  drivers, should they be removed from the core?
+- encoder mid-layer .detect operation is only used internally in drivers,
+  should it be removed from the core?
+-->
 
-/*
- * value in 'ticks' (units used by jiffies). Set when we init the
- * module because 'HZ' in actually a function call on some flavors of
- * Linux.  This will default to DEFAULT_LINKDOWN_TIMEOUT * HZ.
- */
-static int link_transition_timeout;
+  <!-- External interfaces -->
 
+  <chapter id="drmExternals">
+    <title>Userland interfaces</title>
+    <para>
+      The DRM core exports several interfaces to applications,
+      generally intended to be used through corresponding libdrm
+      wrapper functions.  In addition, drivers export device-specific
+      interfaces for use by userspace drivers &amp; device-aware
+      applications through ioctls and sysfs files.
+    </para>
+    <para>
+      External interfaces include: memory mapping, context management,
+      DMA operations, AGP management, vblank control, fence
+      management, memory management, and output management.
+    </para>
+    <para>
+      Cover generic ioctls and sysfs layout here.  We only need high-level
+      info, since man pages should cover the rest.
+    </para>
 
+  <!-- External: render nodes -->
 
-static u16 link_modes[] = {
-	BMCR_ANENABLE,			 /* 0 : autoneg */
-	0,				 /* 1 : 10bt half duplex */
-	BMCR_SPEED100,			 /* 2 : 100bt half duplex */
-	BMCR_FULLDPLX,			 /* 3 : 10bt full duplex */
-	BMCR_SPEED100|BMCR_FULLDPLX,	 /* 4 : 100bt full duplex */
-	CAS_BMCR_SPEED1000|BMCR_FULLDPLX /* 5 : 1000bt full duplex */
+    <sect1>
+      <title>Render nodes</title>
+      <para>
+        DRM core provides multiple character-devices for user-space to use.
+        Depending on which device is opened, user-space can perform a different
+        set of operations (mainly ioctls). The primary node is always created
+        and called card&lt;num&gt;. Additionally, a currently
+        unused control node, called controlD&lt;num&gt; is also
+        created. The primary node provides all legacy operations and
+        historically was the only interface used by userspace. With KMS, the
+        control node was introduced. However, the planned KMS control interface
+        has never been written and so the control node stays unused to date.
+      </para>
+      <para>
+        With the increased use of offscreen renderers and GPGPU applications,
+        clients no longer require running compositors or graphics servers to
+        make use of a GPU. But the DRM API required unprivileged clients to
+        authenticate to a DRM-Master prior to getting GPU access. To avoid this
+        step and to grant clients GPU access without authenticating, render
+        nodes were introduced. Render nodes solely serve render clients, that
+        is, no modesetting or privileged ioctls can be issued on render nodes.
+        Only non-global rendering commands are allowed. If a driver supports
+        render nodes, it must advertise it via the DRIVER_RENDER
+        DRM driver capability. If not supported, the primary node must be used
+        for render clients together with the legacy drmAuth authentication
+        procedure.
+      </para>
+      <para>
+        If a driver advertises render node support, DRM core will create a
+        separate render node called renderD&lt;num&gt;. There will
+        be one render node per device. No ioctls except  PRIME-related ioctls
+        will be allowed on this node. Especially GEM_OPEN will be
+        explicitly prohibited. Render nodes are designed to avoid the
+        buffer-leaks, which occur if clients guess the flink names or mmap
+        offsets on the legacy interface. Additionally to this basic interface,
+        drivers must mark their driver-dependent render-only ioctls as
+        DRM_RENDER_ALLOW so render clients can use them. Driver
+        authors must be careful not to allow any privileged ioctls on render
+        nodes.
+      </para>
+      <para>
+        With render nodes, user-space can now control access to the render node
+        via basic file-system access-modes. A running graphics server which
+        authenticates clients on the privileged primary/legacy node is no longer
+        required. Instead, a client can open the render node and is immediately
+        granted GPU access. Communication between clients (or servers) is done
+        via PRIME. FLINK from render node to legacy node is not supported. New
+        clients must not use the insecure FLINK interface.
+      </para>
+      <para>
+        Besides dropping all modeset/global ioctls, render nodes also drop the
+        DRM-Master concept. There is no reason to associate render clients with
+        a DRM-Master as they are independent of any graphics server. Besides,
+        they must work without any running master, anyway.
+        Drivers must be able to run without a master object if they support
+        render nodes. If, on the other hand, a driver requires shared state
+        between clients which is visible to user-space and accessible beyond
+        open-file boundaries, they cannot support render nodes.
+      </para>
+    </sect1>
+
+  <!-- External: vblank handling -->
+
+    <sect1>
+      <title>VBlank event handling</title>
+      <para>
+        The DRM core exposes two vertical blank related ioctls:
+        <variablelist>
+          <varlistentry>
+            <term>DRM_IOCTL_WAIT_VBLANK</term>
+            <listitem>
+              <para>
+                This takes a struct drm_wait_vblank structure as its argument,
+                and it is used to block or request a signal when a specified
+                vblank event occurs.
+              </para>
+            </listitem>
+          </varlistentry>
+          <varlistentry>
+            <term>DRM_IOCTL_MODESET_CTL</term>
+            <listitem>
+              <para>
+		This was only used for user-mode-settind drivers around
+		modesetting changes to allow the kernel to update the vblank
+		interrupt after mode setting, since on many devices the vertical
+		blank counter is reset to 0 at some point during modeset. Modern
+		drivers should not call this any more since with kernel mode
+		setting it is a no-op.
+              </para>
+            </listitem>
+          </varlistentry>
+        </variablelist>
+      </para>
+    </sect1>
+
+  </chapter>
+</part>
+<part id="drmDrivers">
+  <title>DRM Drivers</title>
+
+  <partintro>
+    <para>
+      This second part of the GPU Driver Developer's Guide documents driver
+      code, implementation details and also all the driver-specific userspace
+      interfaces. Especially since all hardware-acceleration interfaces to
+      userspace are driver specific for efficiency and other reasons these
+      interfaces can be rather substantial. Hence every driver has its own
+      chapter.
+    </para>
+  </partintro>
+
+  <chapter id="drmI915">
+    <title>drm/i915 Intel GFX Driver</title>
+    <para>
+      The drm/i915 driver supports all (with the exception of some very early
+      models) integrated GFX chipsets with both Intel display and rendering
+      blocks. This excludes a set of SoC platforms with an SGX rendering unit,
+      those have basic support through the gma500 drm driver.
+    </para>
+    <sect1>
+      <title>Core Driver Infrastructure</title>
+      <para>
+	This section covers core driver infrastructure used by both the display
+	and the GEM parts of the driver.
+      </para>
+      <sect2>
+        <title>Runtime Power Management</title>
+!Pdrivers/gpu/drm/i915/intel_runtime_pm.c runtime pm
+!Idrivers/gpu/drm/i915/intel_runtime_pm.c
+!Idrivers/gpu/drm/i915/intel_uncore.c
+      </sect2>
+      <sect2>
+        <title>Interrupt Handling</title>
+!Pdrivers/gpu/drm/i915/i915_irq.c interrupt handling
+!Fdrivers/gpu/drm/i915/i915_irq.c intel_irq_init intel_irq_init_hw intel_hpd_init
+!Fdrivers/gpu/drm/i915/i915_irq.c intel_runtime_pm_disable_interrupts
+!Fdrivers/gpu/drm/i915/i915_irq.c intel_runtime_pm_enable_interrupts
+      </sect2>
+      <sect2>
+        <title>Intel GVT-g Guest Support(vGPU)</title>
+!Pdrivers/gpu/drm/i915/i915_vgpu.c Intel GVT-g guest support
+!Idrivers/gpu/drm/i915/i915_vgpu.c
+      </sect2>
+    </sect1>
+    <sect1>
+      <title>Display Hardware Handling</title>
+      <para>
+        This section covers everything related to the display hardware including
+        the mode setting infrastructure, plane, sprite and cursor handling and
+        display, output probing and related topics.
+      </para>
+      <sect2>
+        <title>Mode Setting Infrastructure</title>
+        <para>
+          The i915 driver is thus far the only DRM driver which doesn't use the
+          common DRM helper code to implement mode setting sequences. Thus it
+          has its own tailor-made infrastructure for executing a display
+          configuration change.
+        </para>
+      </sect2>
+      <sect2>
+        <title>Frontbuffer Tracking</title>
+!Pdrivers/gpu/drm/i915/intel_frontbuffer.c frontbuffer tracking
+!Idrivers/gpu/drm/i915/intel_frontbuffer.c
+!Fdrivers/gpu/drm/i915/i915_gem.c i915_gem_track_fb
+      </sect2>
+      <sect2>
+        <title>Display FIFO Underrun Reporting</title>
+!Pdrivers/gpu/drm/i915/intel_fifo_underrun.c fifo underrun handling
+!Idrivers/gpu/drm/i915/intel_fifo_underrun.c
+      </sect2>
+      <sect2>
+        <title>Plane Configuration</title>
+        <para>
+	  This section covers plane configuration and composition with the
+	  primary plane, sprites, cursors and overlays. This includes the
+	  infrastructure to do atomic vsync'ed updates of all this state and
+	  also tightly coupled topics like watermark setup and computation,
+	  framebuffer compression and panel self refresh.
+        </para>
+      </sect2>
+      <sect2>
+        <title>Atomic Plane Helpers</title>
+!Pdrivers/gpu/drm/i915/intel_atomic_plane.c atomic plane helpers
+!Idrivers/gpu/drm/i915/intel_atomic_plane.c
+      </sect2>
+      <sect2>
+        <title>Output Probing</title>
+        <para>
+	  This section covers output probing and related infrastructure like the
+	  hotplug interrupt storm detection and mitigation code. Note that the
+	  i915 driver still uses most of the common DRM helper code for output
+	  probing, so those sections fully apply.
+        </para>
+      </sect2>
+      <sect2>
+        <title>Hotplug</title>
+!Pdrivers/gpu/drm/i915/intel_hotplug.c Hotplug
+!Idrivers/gpu/drm/i915/intel_hotplug.c
+      </sect2>
+      <sect2>
+	<title>High Definition Audio</title>
+!Pdrivers/gpu/drm/i915/intel_audio.c High Definition Audio over HDMI and Display Port
+!Idrivers/gpu/drm/i915/intel_audio.c
+!Iinclude/drm/i915_component.h
+      </sect2>
+      <sect2>
+	<title>Panel Self Refresh PSR (PSR/SRD)</title>
+!Pdrivers/gpu/drm/i915/intel_psr.c Panel Self Refresh (PSR/SRD)
+!Idrivers/gpu/drm/i915/intel_psr.c
+      </sect2>
+      <sect2>
+	<title>Frame Buffer Compression (FBC)</title>
+!Pdrivers/gpu/drm/i915/intel_fbc.c Frame Buffer Compression (FBC)
+!Idrivers/gpu/drm/i915/intel_fbc.c
+      </sect2>
+      <sect2>
+        <title>Display Refresh Rate Switching (DRRS)</title>
+!Pdrivers/gpu/drm/i915/intel_dp.c Display Refresh Rate Switching (DRRS)
+!Fdrivers/gpu/drm/i915/intel_dp.c intel_dp_set_drrs_state
+!Fdrivers/gpu/drm/i915/intel_dp.c intel_edp_drrs_enable
+!Fdrivers/gpu/drm/i915/intel_dp.c intel_edp_drrs_disable
+!Fdrivers/gpu/drm/i915/intel_dp.c intel_edp_drrs_invalidate
+!Fdrivers/gpu/drm/i915/intel_dp.c intel_edp_drrs_flush
+!Fdrivers/gpu/drm/i915/intel_dp.c intel_dp_drrs_init
+
+      </sect2>
+      <sect2>
+        <title>DPIO</title>
+!Pdrivers/gpu/drm/i915/i915_reg.h DPIO
+	<table id="dpiox2">
+	  <title>Dual channel PHY (VLV/CHV/BXT)</title>
+	  <tgroup cols="8">
+	    <colspec colname="c0" />
+	    <colspec colname="c1" />
+	    <colspec colname="c2" />
+	    <colspec colname="c3" />
+	    <colspec colname="c4" />
+	    <colspec colname="c5" />
+	    <colspec colname="c6" />
+	    <colspec colname="c7" />
+	    <spanspec spanname="ch0" namest="c0" nameend="c3" />
+	    <spanspec spanname="ch1" namest="c4" nameend="c7" />
+	    <spanspec spanname="ch0pcs01" namest="c0" nameend="c1" />
+	    <spanspec spanname="ch0pcs23" namest="c2" nameend="c3" />
+	    <spanspec spanname="ch1pcs01" namest="c4" nameend="c5" />
+	    <spanspec spanname="ch1pcs23" namest="c6" nameend="c7" />
+	    <thead>
+	      <row>
+		<entry spanname="ch0">CH0</entry>
+		<entry spanname="ch1">CH1</entry>
+	      </row>
+	    </thead>
+	    <tbody valign="top" align="center">
+	      <row>
+		<entry spanname="ch0">CMN/PLL/REF</entry>
+		<entry spanname="ch1">CMN/PLL/REF</entry>
+	      </row>
+	      <row>
+		<entry spanname="ch0pcs01">PCS01</entry>
+		<entry spanname="ch0pcs23">PCS23</entry>
+		<entry spanname="ch1pcs01">PCS01</entry>
+		<entry spanname="ch1pcs23">PCS23</entry>
+	      </row>
+	      <row>
+		<entry>TX0</entry>
+		<entry>TX1</entry>
+		<entry>TX2</entry>
+		<entry>TX3</entry>
+		<entry>TX0</entry>
+		<entry>TX1</entry>
+		<entry>TX2</entry>
+		<entry>TX3</entry>
+	      </row>
+	      <row>
+		<entry spanname="ch0">DDI0</entry>
+		<entry spanname="ch1">DDI1</entry>
+	      </row>
+	    </tbody>
+	  </tgroup>
+	</table>
+	<table id="dpiox1">
+	  <title>Single channel PHY (CHV/BXT)</title>
+	  <tgroup cols="4">
+	    <colspec colname="c0" />
+	    <colspec colname="c1" />
+	    <colspec colname="c2" />
+	    <colspec colname="c3" />
+	    <spanspec spanname="ch0" namest="c0" nameend="c3" />
+	    <spanspec spanname="ch0pcs01" namest="c0" nameend="c1" />
+	    <spanspec spanname="ch0pcs23" namest="c2" nameend="c3" />
+	    <thead>
+	      <row>
+		<entry spanname="ch0">CH0</entry>
+	      </row>
+	    </thead>
+	    <tbody valign="top" align="center">
+	      <row>
+		<entry spanname="ch0">CMN/PLL/REF</entry>
+	      </row>
+	      <row>
+		<entry spanname="ch0pcs01">PCS01</entry>
+		<entry spanname="ch0pcs23">PCS23</entry>
+	      </row>
+	      <row>
+		<entry>TX0</entry>
+		<entry>TX1</entry>
+		<entry>TX2</entry>
+		<entry>TX3</entry>
+	      </row>
+	      <row>
+		<entry spanname="ch0">DDI2</entry>
+	      </row>
+	    </tbody>
+	  </tgroup>
+	</table>
+      </sect2>
+
+      <sect2>
+       <title>CSR firmware support for DMC</title>
+!Pdrivers/gpu/drm/i915/intel_csr.c csr support for dmc
+!Idrivers/gpu/drm/i915/intel_csr.c
+      </sect2>
+    </sect1>
+
+    <sect1>
+      <title>Memory Management and Command Submission</title>
+      <para>
+	This sections covers all things related to the GEM implementation in the
+	i915 driver.
+      </para>
+      <sect2>
+        <title>Batchbuffer Parsing</title>
+!Pdrivers/gpu/drm/i915/i915_cmd_parser.c batch buffer command parser
+!Idrivers/gpu/drm/i915/i915_cmd_parser.c
+      </sect2>
+      <sect2>
+        <title>Batchbuffer Pools</title>
+!Pdrivers/gpu/drm/i915/i915_gem_batch_pool.c batch pool
+!Idrivers/gpu/drm/i915/i915_gem_batch_pool.c
+      </sect2>
+      <sect2>
+        <title>Logical Rings, Logical Ring Contexts and Execlists</title>
+!Pdrivers/gpu/drm/i915/intel_lrc.c Logical Rings, Logical Ring Contexts and Execlists
+!Idrivers/gpu/drm/i915/intel_lrc.c
+      </sect2>
+      <sect2>
+        <title>Global GTT views</title>
+!Pdrivers/gpu/drm/i915/i915_gem_gtt.c Global GTT views
+!Idrivers/gpu/drm/i915/i915_gem_gtt.c
+      </sect2>
+      <sect2>
+        <title>GTT Fences and Swizzling</title>
+!Idrivers/gpu/drm/i915/i915_gem_fence.c
+        <sect3>
+          <title>Global GTT Fence Handling</title>
+!Pdrivers/gpu/drm/i915/i915_gem_fence.c fence register handling
+        </sect3>
+        <sect3>
+          <title>Hardware Tiling and Swizzling Details</title>
+!Pdrivers/gpu/drm/i915/i915_gem_fence.c tiling swizzling details
+        </sect3>
+      </sect2>
+      <sect2>
+        <title>Object Tiling IOCTLs</title>
+!Idrivers/gpu/drm/i915/i915_gem_tiling.c
+!Pdrivers/gpu/drm/i915/i915_gem_tiling.c buffer object tiling
+      </sect2>
+      <sect2>
+        <title>Buffer Object Eviction</title>
+	<para>
+	  This section documents the interface functions for evicting buffer
+	  objects to make space available in the virtual gpu address spaces.
+	  Note that this is mostly orthogonal to shrinking buffer objects
+	  caches, which has the goal to make main memory (shared with the gpu
+	  through the unified memory architecture) available.
+	</para>
+!Idrivers/gpu/drm/i915/i915_gem_evict.c
+      </sect2>
+      <sect2>
+        <title>Buffer Object Memory Shrinking</title>
+	<para>
+	  This section documents the interface function for shrinking memory
+	  usage of buffer object caches. Shrinking is used to make main memory
+	  available.  Note that this is mostly orthogonal to evicting buffer
+	  objects, which has the goal to make space in gpu virtual address
+	  spaces.
+	</para>
+!Idrivers/gpu/drm/i915/i915_gem_shrinker.c
+      </sect2>
+    </sect1>
+    <sect1>
+      <title>GuC-based Command Submission</title>
+      <sect2>
+        <title>GuC</title>
+!Pdrivers/gpu/drm/i915/intel_guc_loader.c GuC-specific firmware loader
+!Idrivers/gpu/drm/i915/intel_guc_loader.c
+      </sect2>
+      <sect2>
+        <title>GuC Client</title>
+!Pdrivers/gpu/drm/i915/i915_guc_submission.c GuC-based command submissison
+!Idrivers/gpu/drm/i915/i915_guc_submission.c
+      </sect2>
+    </sect1>
+
+    <sect1>
+      <title> Tracing </title>
+      <para>
+    This sections covers all things related to the tracepoints implemented in
+    the i915 driver.
+      </para>
+      <sect2>
+        <title> i915_ppgtt_create and i915_ppgtt_release </title>
+!Pdrivers/gpu/drm/i915/i915_trace.h i915_ppgtt_create and i915_ppgtt_release tracepoints
+      </sect2>
+      <sect2>
+        <title> i915_context_create and i915_context_free </title>
+!Pdrivers/gpu/drm/i915/i915_trace.h i915_context_create and i915_context_free tracepoints
+      </sect2>
+      <sect2>
+        <title> switch_mm </title>
+!Pdrivers/gpu/drm/i915/i915_trace.h switch_mm tracepoint
+      </sect2>
+    </sect1>
+
+  </chapter>
+!Cdrivers/gpu/drm/i915/i915_irq.c
+</part>
+
+<part id="vga_switcheroo">
+  <title>vga_switcheroo</title>
+  <partintro>
+!Pdrivers/gpu/vga/vga_switcheroo.c Overview
+  </partintro>
+
+  <chapter id="modes_of_use">
+    <title>Modes of Use</title>
+  <sect1>
+    <title>Manual switching and manual power control</title>
+!Pdrivers/gpu/vga/vga_switcheroo.c Manual switching and manual power control
+  </sect1>
+  <sect1>
+    <title>Driver power control</title>
+!Pdrivers/gpu/vga/vga_switcheroo.c Driver power control
+  </sect1>
+  </chapter>
+
+  <chapter id="pubfunctions">
+    <title>Public functions</title>
+!Edrivers/gpu/vga/vga_switcheroo.c
+  </chapter>
+
+  <chapter id="pubstructures">
+    <title>Public structures</title>
+!Finclude/linux/vga_switcheroo.h vga_switcheroo_handler
+!Finclude/linux/vga_switcheroo.h vga_switcheroo_client_ops
+  </chapter>
+
+  <chapter id="pubconstants">
+    <title>Public constants</title>
+!Finclude/linux/vga_switcheroo.h vga_switcheroo_client_id
+!Finclude/linux/vga_switcheroo.h vga_switcheroo_state
+  </chapter>
+
+  <chapter id="privstructures">
+    <title>Private structures</title>
+!Fdrivers/gpu/vga/vga_switcheroo.c vgasr_priv
+!Fdrivers/gpu/vga/vga_switcheroo.c vga_switcheroo_client
+  </chapter>
+
+!Cdrivers/gpu/vga/vga_switcheroo.c
+!Cinclude/linux/vga_switcheroo.h
+</part>
+
+</book>
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         <section id="frontend-properties">
+<title>DVB Frontend properties</title>
+<para>Tuning into a Digital TV physical channel and starting decoding it
+    requires changing a set of parameters, in order to control the
+    tuner, the demodulator, the Linear Low-noise Amplifier (LNA) and to set the
+    antenna subsystem via Satellite Equipment Control (SEC), on satellite
+    systems. The actual parameters are specific to each particular digital
+    TV standards, and may change as the digital TV specs evolves.</para>
+<para>In the past, the strategy used was to have a union with the parameters
+    needed to tune for DVB-S, DVB-C, DVB-T and ATSC delivery systems grouped
+    there. The problem is that, as the second generation standards appeared,
+    those structs were not big enough to contain the additional parameters.
+    Also, the union didn't have any space left to be expanded without breaking
+    userspace. So, the decision was to deprecate the legacy union/struct based
+    approach, in favor of a properties set approach.</para>
+
+<para>NOTE: on Linux DVB API version 3, setting a frontend were done via
+    <link linkend="dvb-frontend-parameters">struct  <constant>dvb_frontend_parameters</constant></link>.
+    This got replaced on version 5 (also called "S2API", as this API were
+    added originally_enabled to provide support for DVB-S2), because the old
+    API has a very limited support to new standards and new hardware. This
+    section describes the new and recommended way to set the frontend, with
+    suppports all digital TV delivery systems.</para>
+
+<para>Example: with the properties based approach, in order to set the tuner
+    to a DVB-C channel at 651 kHz, modulated with 256-QAM, FEC 3/4 and symbol
+    rate of 5.217 Mbauds, those properties should be sent to
+    <link linkend="FE_GET_PROPERTY"><constant>FE_SET_PROPERTY</constant></link> ioctl:</para>
+    <itemizedlist>
+	<listitem><para>&DTV-DELIVERY-SYSTEM; = SYS_DVBC_ANNEX_A</para></listitem>
+	<listitem><para>&DTV-FREQUENCY; = 651000000</para></listitem>
+	<listitem><para>&DTV-MODULATION; = QAM_256</para></listitem>
+	<listitem><para>&DTV-INVERSION; = INVERSION_AUTO</para></listitem>
+	<listitem><para>&DTV-SYMBOL-RATE; = 5217000</para></listitem>
+	<listitem><para>&DTV-INNER-FEC; = FEC_3_4</para></listitem>
+	<listitem><para>&DTV-TUNE;</para></listitem>
+    </itemizedlist>
+
+<para>The code that would do the above is:</para>
+<programlisting>
+#include &lt;stdio.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/ioctl.h&gt;
+#include &lt;linux/dvb/frontend.h&gt;
+
+static struct dtv_property props[] = {
+	{ .cmd = DTV_DELIVERY_SYSTEM, .u.data = SYS_DVBC_ANNEX_A },
+	{ .cmd = DTV_FREQUENCY,       .u.data = 651000000 },
+	{ .cmd = DTV_MODULATION,      .u.data = QAM_256 },
+	{ .cmd = DTV_INVERSION,       .u.data = INVERSION_AUTO },
+	{ .cmd = DTV_SYMBOL_RATE,     .u.data = 5217000 },
+	{ .cmd = DTV_INNER_FEC,       .u.data = FEC_3_4 },
+	{ .cmd = DTV_TUNE }
 };
 
-static const struct pci_device_id cas_pci_tbl[] = {
-	{ PCI_VENDOR_ID_SUN, PCI_DEVICE_ID_SUN_CASSINI,
-	  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0UL },
-	{ PCI_VENDOR_ID_NS, PCI_DEVICE_ID_NS_SATURN,
-	  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0UL },
-	{ 0, }
+static struct dtv_properties dtv_prop = {
+	.num = 6, .props = props
 };
 
-MODULE_DEVICE_TABLE(pci, cas_pci_tbl);
-
-static void cas_set_link_modes(struct cas *cp);
-
-static inline void cas_lock_tx(struct cas *cp)
+int main(void)
 {
-	int i;
+	int fd = open("/dev/dvb/adapter0/frontend0", O_RDWR);
 
-	for (i = 0; i < N_TX_RINGS; i++)
-		spin_lock_nested(&cp->tx_lock[i], i);
-}
-
-static inline void cas_lock_all(struct cas *cp)
-{
-	spin_lock_irq(&cp->lock);
-	cas_lock_tx(cp);
-}
-
-/* WTZ: QA was finding deadlock problems with the previous
- * versions after long test runs with multiple cards per machine.
- * See if replacing cas_lock_all with safer versions helps. The
- * symptoms QA is reporting match those we'd expect if interrupts
- * aren't being properly restored, and we fixed a previous deadlock
- * with similar symptoms by using save/restore versions in other
- * places.
- */
-#define cas_lock_all_save(cp, flags) \
-do { \
-	struct cas *xxxcp = (cp); \
-	spin_lock_irqsave(&xxxcp->lock, flags); \
-	cas_lock_tx(xxxcp); \
-} while (0)
-
-static inline void cas_unlock_tx(struct cas *cp)
-{
-	int i;
-
-	for (i = N_TX_RINGS; i > 0; i--)
-		spin_unlock(&cp->tx_lock[i - 1]);
-}
-
-static inline void cas_unlock_all(struct cas *cp)
-{
-	cas_unlock_tx(cp);
-	spin_unlock_irq(&cp->lock);
-}
-
-#define cas_unlock_all_restore(cp, flags) \
-do { \
-	struct cas *xxxcp = (cp); \
-	cas_unlock_tx(xxxcp); \
-	spin_unlock_irqrestore(&xxxcp->lock, flags); \
-} while (0)
-
-static void cas_disable_irq(struct cas *cp, const int ring)
-{
-	/* Make sure we won't get any more interrupts */
-	if (ring == 0) {
-		writel(0xFFFFFFFF, cp->regs + REG_INTR_MASK);
-		return;
+	if (!fd) {
+	    perror ("open");
+	    return -1;
 	}
-
-	/* disable completion interrupts and selectively mask */
-	if (cp->cas_flags & CAS_FLAG_REG_PLUS) {
-		switch (ring) {
-#if defined (USE_PCI_INTB) || defined(USE_PCI_INTC) || defined(USE_PCI_INTD)
-#ifdef USE_PCI_INTB
-		case 1:
-#endif
-#ifdef USE_PCI_INTC
-		case 2:
-#endif
-#ifdef USE_PCI_INTD
-		case 3:
-#endif
-			writel(INTRN_MASK_CLEAR_ALL | INTRN_MASK_RX_EN,
-			       cp->regs + REG_PLUS_INTRN_MASK(ring));
-			break;
-#endif
-		default:
-			writel(INTRN_MASK_CLEAR_ALL, cp->regs +
-			       REG_PLUS_INTRN_MASK(ring));
-			break;
-		}
-	}
-}
-
-static inline void cas_mask_intr(struct cas *cp)
-{
-	int i;
-
-	for (i = 0; i < N_RX_COMP_RINGS; i++)
-		cas_disable_irq(cp, i);
-}
-
-static void cas_enable_irq(struct cas *cp, const int ring)
-{
-	if (ring == 0) { /* all but TX_DONE */
-		writel(INTR_TX_DONE, cp->regs + REG_INTR_MASK);
-		return;
-	}
-
-	if (cp->cas_flags & CAS_FLAG_REG_PLUS) {
-		switch (ring) {
-#if defined (USE_PCI_INTB) || defined(USE_PCI_INTC) || defined(USE_PCI_INTD)
-#ifdef USE_PCI_INTB
-		case 1:
-#endif
-#ifdef USE_PCI_INTC
-		case 2:
-#endif
-#ifdef USE_PCI_INTD
-		case 3:
-#endif
-			writel(INTRN_MASK_RX_EN, cp->regs +
-			       REG_PLUS_INTRN_MASK(ring));
-			break;
-#endif
-		default:
-			break;
-		}
-	}
-}
-
-static inline void cas_unmask_intr(struct cas *cp)
-{
-	int i;
-
-	for (i = 0; i < N_RX_COMP_RINGS; i++)
-		cas_enable_irq(cp, i);
-}
-
-static inline void cas_entropy_gather(struct cas *cp)
-{
-#ifdef USE_ENTROPY_DEV
-	if ((cp->cas_flags & CAS_FLAG_ENTROPY_DEV) == 0)
-		return;
-
-	batch_entropy_store(readl(cp->regs + REG_ENTROPY_IV),
-			    readl(cp->regs + REG_ENTROPY_IV),
-			    sizeof(uint64_t)*8);
-#endif
-}
-
-static inline void cas_entropy_reset(struct cas *cp)
-{
-#ifdef USE_ENTROPY_DEV
-	if ((cp->cas_flags & CAS_FLAG_ENTROPY_DEV) == 0)
-		return;
-
-	writel(BIM_LOCAL_DEV_PAD | BIM_LOCAL_DEV_PROM | BIM_LOCAL_DEV_EXT,
-	       cp->regs + REG_BIM_LOCAL_DEV_EN);
-	writeb(ENTROPY_RESET_STC_MODE, cp->regs + REG_ENTROPY_RESET);
-	writeb(0x55, cp->regs + REG_ENTROPY_RAND_REG);
-
-	/* if we read back 0x0, we don't have an entropy device */
-	if (readb(cp->regs + REG_ENTROPY_RAND_REG) == 0)
-		cp->cas_flags &= ~CAS_FLAG_ENTROPY_DEV;
-#endif
-}
-
-/* access to the phy. the following assumes that we've initialized the MIF to
- * be in frame rather than bit-bang mode
- */
-static u16 cas_phy_read(struct cas *cp, int reg)
-{
-	u32 cmd;
-	int limit = STOP_TRIES_PHY;
-
-	cmd = MIF_FRAME_ST | MIF_FRAME_OP_READ;
-	cmd |= CAS_BASE(MIF_FRAME_PHY_ADDR, cp->phy_addr);
-	cmd |= CAS_BASE(MIF_FRAME_REG_ADDR, reg);
-	cmd |= MIF_FRAME_TURN_AROUND_MSB;
-	writel(cmd, cp->regs + REG_MIF_FRAME);
-
-	/* poll for completion */
-	while (limit-- > 0) {
-		udelay(10);
-		cmd = readl(cp->regs + REG_MIF_FRAME);
-		if (cmd & MIF_FRAME_TURN_AROUND_LSB)
-			return cmd & MIF_FRAME_DATA_MASK;
-	}
-	return 0xFFFF; /* -1 */
-}
-
-static int cas_phy_write(struct cas *cp, int reg, u16 val)
-{
-	int limit = STOP_TRIES_PHY;
-	u32 cmd;
-
-	cmd = MIF_FRAME_ST | MIF_FRAME_OP_WRITE;
-	cmd |= CAS_BASE(MIF_FRAME_PHY_ADDR, cp->phy_addr);
-	cmd |= CAS_BASE(MIF_FRAME_REG_ADDR, reg);
-	cmd |= MIF_FRAME_TURN_AROUND_MSB;
-	cmd |= val & MIF_FRAME_DATA_MASK;
-	writel(cmd, cp->regs + REG_MIF_FRAME);
-
-	/* poll for completion */
-	while (limit-- > 0) {
-		udelay(10);
-		cmd = readl(cp->regs + REG_MIF_FRAME);
-		if (cmd & MIF_FRAME_TURN_AROUND_LSB)
-			return 0;
-	}
-	return -1;
-}
-
-static void cas_phy_powerup(struct cas *cp)
-{
-	u16 ctl = cas_phy_read(cp, MII_BMCR);
-
-	if ((ctl & BMCR_PDOWN) == 0)
-		return;
-	ctl &= ~BMCR_PDOWN;
-	cas_phy_write(cp, MII_BMCR, ctl);
-}
-
-static void cas_phy_powerdown(struct cas *cp)
-{
-	u16 ctl = cas_phy_read(cp, MII_BMCR);
-
-	if (ctl & BMCR_PDOWN)
-		return;
-	ctl |= BMCR_PDOWN;
-	cas_phy_write(cp, MII_BMCR, ctl);
-}
-
-/* cp->lock held. note: the last put_page will free the buffer */
-static int cas_page_free(struct cas *cp, cas_page_t *page)
-{
-	pci_unmap_page(cp->pdev, page->dma_addr, cp->page_size,
-		       PCI_DMA_FROMDEVICE);
-	__free_pages(page->buffer, cp->page_order);
-	kfree(page);
-	return 0;
-}
-
-#ifdef RX_COUNT_BUFFERS
-#define RX_USED_ADD(x, y)       ((x)->used += (y))
-#define RX_USED_SET(x, y)       ((x)->used  = (y))
-#else
-#define RX_USED_ADD(x, y)
-#define RX_USED_SET(x, y)
-#endif
-
-/* local page allocation routines for the receive buffers. jumbo pages
- * require at least 8K contiguous and 8K aligned buffers.
- */
-static cas_page_t *cas_page_alloc(struct cas *cp, const gfp_t flags)
-{
-	cas_page_t *page;
-
-	page = kmalloc(sizeof(cas_page_t), flags);
-	if (!page)
-		return NULL;
-
-	INIT_LIST_HEAD(&page->list);
-	RX_USED_SET(page, 0);
-	page->buffer = alloc_pages(flags, cp->page_order);
-	if (!page->buffer)
-		goto page_err;
-	page->dma_addr = pci_map_page(cp->pdev, page->buffer, 0,
-				      cp->page_size, PCI_DMA_FROMDEVICE);
-	return page;
-
-page_err:
-	kfree(page);
-	return NULL;
-}
-
-/* initialize spare pool of rx buffers, but allocate during the open */
-static void cas_spare_init(struct cas *cp)
-{
-  	spin_lock(&cp->rx_inuse_lock);
-	INIT_LIST_HEAD(&cp->rx_inuse_list);
-	spin_unlock(&cp->rx_inuse_lock);
-
-	spin_lock(&cp->rx_spare_lock);
-	INIT_LIST_HEAD(&cp->rx_spare_list);
-	cp->rx_spares_needed = RX_SPARE_COUNT;
-	spin_unlock(&cp->rx_spare_lock);
-}
-
-/* used on close. free all the spare buffers. */
-static void cas_spare_free(struct cas *cp)
-{
-	struct list_head list, *elem, *tmp;
-
-	/* free spare buffers */
-	INIT_LIST_HEAD(&list);
-	spin_lock(&cp->rx_spare_lock);
-	list_splice_init(&cp->rx_spare_list, &list);
-	spin_unlock(&cp->rx_spare_lock);
-	list_for_each_safe(elem, tmp, &list) {
-		cas_page_free(cp, list_entry(elem, cas_page_t, list));
-	}
-
-	INIT_LIST_HEAD(&list);
-#if 1
-	/*
-	 * Looks like Adrian had protected this with a different
-	 * lock than used everywhere else to manipulate this list.
-	 */
-	spin_lock(&cp->rx_inuse_lock);
-	list_splice_init(&cp->rx_inuse_list, &list);
-	spin_unlock(&cp->rx_inuse_lock);
-#else
-	spin_lock(&cp->rx_spare_lock);
-	list_splice_init(&cp->rx_inuse_list, &list);
-	spin_unlock(&cp->rx_spare_lock);
-#endif
-	list_for_each_safe(elem, tmp, &list) {
-		cas_page_free(cp, list_entry(elem, cas_page_t, list));
-	}
-}
-
-/* replenish spares if needed */
-static void cas_spare_recover(struct cas *cp, const gfp_t flags)
-{
-	struct list_head list, *elem, *tmp;
-	int needed, i;
-
-	/* check inuse list. if we don't need any more free buffers,
-	 * just free it
-	 */
-
-	/* make a local copy of the list */
-	INIT_LIST_HEAD(&list);
-	spin_lock(&cp->rx_inuse_lock);
-	list_splice_init(&cp->rx_inuse_list, &list);
-	spin_unlock(&cp->rx_inuse_lock);
-
-	list_for_each_safe(elem, tmp, &list) {
-		cas_page_t *page = list_entry(elem, cas_page_t, list);
-
-		/*
-		 * With the lockless pagecache, cassini buffering scheme gets
-		 * slightly less accurate: we might find that a page has an
-		 * elevated reference count here, due to a speculative ref,
-		 * and skip it as in-use. Ideally we would be able to reclaim
-		 * it. However this would be such a rare case, it doesn't
-		 * matter too much as we should pick it up the next time round.
-		 *
-		 * Importantly, if we find that the page has a refcount of 1
-		 * here (our refcount), then we know it is definitely not inuse
-		 * so we can reuse it.
-		 */
-		if (page_count(page->buffer) > 1)
-			continue;
-
-		list_del(elem);
-		spin_lock(&cp->rx_spare_lock);
-		if (cp->rx_spares_needed > 0) {
-			list_add(elem, &cp->rx_spare_list);
-			cp->rx_spares_needed--;
-			spin_unlock(&cp->rx_spare_lock);
-		} else {
-			spin_unlock(&cp->rx_spare_lock);
-			cas_page_free(cp, page);
-		}
-	}
-
-	/* put any inuse buffers back on the list */
-	if (!list_empty(&list)) {
-		spin_lock(&cp->rx_inuse_lock);
-		list_splice(&list, &cp->rx_inuse_list);
-		spin_unlock(&cp->rx_inuse_lock);
-	}
-
-	spin_lock(&cp->rx_spare_lock);
-	needed = cp->rx_spares_needed;
-	spin_unlock(&cp->rx_spare_lock);
-	if (!needed)
-		return;
-
-	/* we still need spares, so try to allocate some */
-	INIT_LIST_HEAD(&list);
-	i = 0;
-	while (i < needed) {
-		cas_page_t *spare = cas_page_alloc(cp, flags);
-		if (!spare)
-			break;
-		list_add(&spare->list, &list);
-		i++;
-	}
-
-	spin_lock(&cp->rx_spare_lock);
-	list_splice(&list, &cp->rx_spare_list);
-	cp->rx_spares_needed -= i;
-	spin_unlock(&cp->rx_spare_lock);
-}
-
-/* pull a page from the list. */
-static cas_page_t *cas_page_dequeue(struct cas *cp)
-{
-	struct list_head *entry;
-	int recover;
-
-	spin_lock(&cp->rx_spare_lock);
-	if (list_empty(&cp->rx_spare_list)) {
-		/* try to do a quick recovery */
-		spin_unlock(&cp->rx_spare_lock);
-		cas_spare_recover(cp, GFP_ATOMIC);
-		spin_lock(&cp->rx_spare_lock);
-		if (list_empty(&cp->rx_spare_list)) {
-			netif_err(cp, rx_err, cp->dev,
-				  "no spare buffers available\n");
-			spin_unlock(&cp->rx_spare_lock);
-			return NULL;
-		}
-	}
-
-	entry = cp->rx_spare_list.next;
-	list_del(entry);
-	recover = ++cp->rx_spares_needed;
-	spin_unlock(&cp->rx_spare_lock);
-
-	/* trigger the timer to do the recovery */
-	if ((recover & (RX_SPARE_RECOVER_VAL - 1)) == 0) {
-#if 1
-		atomic_inc(&cp->reset_task_pending);
-		atomic_inc(&cp->reset_task_pending_spare);
-		schedule_work(&cp->reset_task);
-#else
-		atomic_set(&cp->reset_task_pending, CAS_RESET_SPARE);
-		schedule_work(&cp->reset_task);
-#endif
-	}
-	return list_entry(entry, cas_page_t, list);
-}
-
-
-static void cas_mif_poll(struct cas *cp, const int enable)
-{
-	u32 cfg;
-
-	cfg  = readl(cp->regs + REG_MIF_CFG);
-	cfg &= (MIF_CFG_MDIO_0 | MIF_CFG_MDIO_1);
-
-	if (cp->phy_type & CAS_PHY_MII_MDIO1)
-		cfg |= MIF_CFG_PHY_SELECT;
-
-	/* poll and interrupt on link status change. */
-	if (enable) {
-		cfg |= MIF_CFG_POLL_EN;
-		cfg |= CAS_BASE(MIF_CFG_POLL_REG, MII_BMSR);
-		cfg |= CAS_BASE(MIF_CFG_POLL_PHY, cp->phy_addr);
-	}
-	writel((enable) ? ~(BMSR_LSTATUS | BMSR_ANEGCOMPLETE) : 0xFFFF,
-	       cp->regs + REG_MIF_MASK);
-	writel(cfg, cp->regs + REG_MIF_CFG);
-}
-
-/* Must be invoked under cp->lock */
-static void cas_begin_auto_negotiation(struct cas *cp, struct ethtool_cmd *ep)
-{
-	u16 ctl;
-#if 1
-	int lcntl;
-	int changed = 0;
-	int oldstate = cp->lstate;
-	int link_was_not_down = !(oldstate == link_down);
-#endif
-	/* Setup link parameters */
-	if (!ep)
-		goto start_aneg;
-	lcntl = cp->link_cntl;
-	if (ep->autoneg == AUTONEG_ENABLE)
-		cp->link_cntl = BMCR_ANENABLE;
-	else {
-		u32 speed = ethtool_cmd_speed(ep);
-		cp->link_cntl = 0;
-		if (speed == SPEED_100)
-			cp->link_cntl |= BMCR_SPEED100;
-		else if (speed == SPEED_1000)
-			cp->link_cntl |= CAS_BMCR_SPEED1000;
-		if (ep->duplex == DUPLEX_FULL)
-			cp->link_cntl |= BMCR_FULLDPLX;
-	}
-#if 1
-	changed = (lcntl != cp->link_cntl);
-#endif
-start_aneg:
-	if (cp->lstate == link_up) {
-		netdev_info(cp->dev, "PCS link down\n");
-	} else {
-		if (changed) {
-			netdev_info(cp->dev, "link configuration changed\n");
-		}
-	}
-	cp->lstate = link_down;
-	cp->link_transition = LINK_TRANSITION_LINK_DOWN;
-	if (!cp->hw_running)
-		return;
-#if 1
-	/*
-	 * WTZ: If the old state was link_up, we turn off the carrier
-	 * to replicate everything we do elsewhere on a link-down
-	 * event when we were already in a link-up state..
-	 */
-	if (oldstate == link_up)
-		netif_carrier_off(cp->dev);
-	if (changed  && link_was_not_down) {
-		/*
-		 * WTZ: This branch will simply schedule a full reset after
-		 * we explicitly changed link modes in an ioctl. See if this
-		 * fixes the link-problems we were having for forced mode.
-		 */
-		atomic_inc(&cp->reset_task_pending);
-		atomic_inc(&cp->reset_task_pending_all);
-		schedule_work(&cp->reset_task);
-		cp->timer_ticks = 0;
-		mod_timer(&cp->link_timer, jiffies + CAS_LINK_TIMEOUT);
-		return;
-	}
-#endif
-	if (cp->phy_type & CAS_PHY_SERDES) {
-		u32 val = readl(cp->regs + REG_PCS_MII_CTRL);
-
-		if (cp->link_cntl & BMCR_ANENABLE) {
-			val |= (PCS_MII_RESTART_AUTONEG | PCS_MII_AUTONEG_EN);
-			cp->lstate = link_aneg;
-		} else {
-			if (cp->link_cntl & BMCR_FULLDPLX)
-				val |= PCS_MII_CTRL_DUPLEX;
-			val &= ~PCS_MII_AUTONEG_EN;
-			cp->lstate = link_force_ok;
-		}
-		cp->link_transition = LINK_TRANSITION_LINK_CONFIG;
-		writel(val, cp->regs + REG_PCS_MII_CTRL);
-
-	} else {
-		cas_mif_poll(cp, 0);
-		ctl = cas_phy_read(cp, MII_BMCR);
-		ctl &= ~(BMCR_FULLDPLX | BMCR_SPEED100 |
-			 CAS_BMCR_SPEED1000 | BMCR_ANENABLE);
-		ctl |= cp->link_cntl;
-		if (ctl & BMCR_ANENABLE) {
-			ctl |= BMCR_ANRESTART;
-			cp->lstate = link_aneg;
-		} else {
-			cp->lstate = link_force_ok;
-		}
-		cp->link_transition = LINK_TRANSITION_LINK_CONFIG;
-		cas_phy_write(cp, MII_BMCR, ctl);
-		cas_mif_poll(cp, 1);
-	}
-
-	cp->timer_ticks = 0;
-	mod_timer(&cp->link_timer, jiffies + CAS_LINK_TIMEOUT);
-}
-
-/* Must be invoked under cp->lock. */
-static int cas_reset_mii_phy(struct cas *cp)
-{
-	int limit = STOP_TRIES_PHY;
-	u16 val;
-
-	cas_phy_write(cp, MII_BMCR, BMCR_RESET);
-	udelay(100);
-	while (--limit) {
-		val = cas_phy_read(cp, MII_BMCR);
-		if ((val & BMCR_RESET) == 0)
-			break;
-		udelay(10);
-	}
-	return limit <= 0;
-}
-
-static void cas_saturn_firmware_init(struct cas *cp)
-{
-	const struct firmware *fw;
-	const char fw_name[] = "sun/cassini.bin";
-	int err;
-
-	if (PHY_NS_DP83065 != cp->phy_id)
-		return;
-
-	err = request_firmware(&fw, fw_name, &cp->pdev->dev);
-	if (err) {
-		pr_err("Failed to load firmware \"%s\"\n",
-		       fw_name);
-		return;
-	}
-	if (fw->size < 2) {
-		pr_err("bogus length %zu in \"%s\"\n",
-		       fw->size, fw_name);
-		goto out;
-	}
-	cp->fw_load_addr= fw->data[1] << 8 | fw->data[0];
-	cp->fw_size = fw->size - 2;
-	cp->fw_data = vmalloc(cp->fw_size);
-	if (!cp->fw_data)
-		goto out;
-	memcpy(cp->fw_data, &fw->data[2], cp->fw_size);
-out:
-	release_firmware(fw);
-}
-
-static void cas_saturn_firmware_load(struct cas *cp)
-{
-	int i;
-
-	if (!cp->fw_data)
-		return;
-
-	cas_phy_powerdown(cp);
-
-	/* expanded memory access mode */
-	cas_phy_write(cp, DP83065_MII_MEM, 0x0);
-
-	/* pointer configuration for new firmware */
-	cas_phy_write(cp, DP83065_MII_REGE, 0x8ff9);
-	cas_phy_write(cp, DP83065_MII_REGD, 0xbd);
-	cas_phy_write(cp, DP83065_MII_REGE, 0x8ffa);
-	cas_phy_write(cp, DP83065_MII_REGD, 0x82);
-	cas_phy_write(cp, DP83065_MII_REGE, 0x8ffb);
-	cas_phy_write(cp, DP83065_MII_REGD, 0x0);
-	cas_phy_write(cp, DP83065_MII_REGE, 0x8ffc);
-	cas_phy_write(cp, DP83065_MII_REGD, 0x39);
-
-	/* download new firmware */
-	cas_phy_write(cp, DP83065_MII_MEM, 0x1);
-	cas_phy_write(cp, DP83065_MII_REGE, cp->fw_load_addr);
-	for (i = 0; i < cp->fw_size; i++)
-		cas_phy_write(cp, DP83065_MII_REGD, cp->fw_data[i]);
-
-	/* enable firmware */
-	cas_phy_write(cp, DP83065_MII_REGE, 0x8ff8);
-	cas_phy_write(cp, DP83065_MII_REGD, 0x1);
-}
-
-
-/* phy initialization */
-static void cas_phy_init(struct cas *cp)
-{
-	u16 val;
-
-	/* if we're in MII/GMII mode, set up phy */
-	if (CAS_PHY_MII(cp->phy_type)) {
-		writel(PCS_DATAPATH_MODE_MII,
-		       cp->regs + REG_PCS_DATAPATH_MODE);
-
-		cas_mif_poll(cp, 0);
-		cas_reset_mii_phy(cp); /* take out of isolate mode */
-
-		if (PHY_LUCENT_B0 == cp->phy_id) {
-			/* workaround link up/down issue with lucent */
-			cas_phy_write(cp, LUCENT_MII_REG, 0x8000);
-			cas_phy_write(cp, MII_BMCR, 0x00f1);
-			cas_phy_write(cp, LUCENT_MII_REG, 0x0);
-
-		} else if (PHY_BROADCOM_B0 == (cp->phy_id & 0xFFFFFFFC)) {
-			/* workarounds for broadcom phy */
-			cas_phy_write(cp, BROADCOM_MII_REG8, 0x0C20);
-			cas_phy_write(cp, BROADCOM_MII_REG7, 0x0012);
-			cas_phy_write(cp, BROADCOM_MII_REG5, 0x1804);
-			cas_phy_write(cp, BROADCOM_MII_REG7, 0x0013);
-			cas_phy_write(cp, BROADCOM_MII_REG5, 0x1204);
-			cas_phy_write(cp, BROADCOM_MII_REG7, 0x8006);
-			cas_phy_write(cp, BROADCOM_MII_REG5, 0x0132);
-			cas_phy_write(cp, BROADCOM_MII_REG7, 0x8006);
-			cas_phy_write(cp, BROADCOM_MII_REG5, 0x0232);
-			cas_phy_write(cp, BROADCOM_MII_REG7, 0x201F);
-			cas_phy_write(cp, BROADCOM_MII_REG5, 0x0A20);
-
-		} else if (PHY_BROADCOM_5411 == cp->phy_id) {
-			val = cas_phy_read(cp, BROADCOM_MII_REG4);
-			val = cas_phy_read(cp, BROADCOM_MII_REG4);
-			if (val & 0x0080) {
-				/* link workaround */
-				cas_phy_write(cp, BROADCOM_MII_REG4,
-					      val & ~0x0080);
-			}
-
-		} else if (cp->cas_flags & CAS_FLAG_SATURN) {
-			writel((cp->phy_type & CAS_PHY_MII_MDIO0) ?
-			       SATURN_PCFG_FSI : 0x0,
-			       cp->regs + REG_SATURN_PCFG);
-
-			/* load firmware to address 10Mbps auto-negotiation
-			 * issue. NOTE: this will need to be changed if the
-			 * default firmware gets fixed.
-			 */
-			if (PHY_NS_DP83065 == cp->phy_id) {
-				cas_saturn_firmware_load(cp);
-			}
-			cas_phy_powerup(cp);
-		}
-
-		/* advertise capabilities */
-		val = cas_phy_read(cp, MII_BMCR);
-		val &= ~BMCR_ANENABLE;
-		cas_phy_write(cp, MII_BMCR, val);
-		udelay(10);
-
-		cas_phy_write(cp, MII_ADVERTISE,
-			      cas_phy_read(cp, MII_ADVERTISE) |
-			      (ADVERTISE_10HALF | ADVERTISE_10FULL |
-			       ADVERTISE_100HALF | ADVERTISE_100FULL |
-			       CAS_ADVERTISE_PAUSE |
-			       CAS_ADVERTISE_ASYM_PAUSE));
-
-		if (cp->cas_flags & CAS_FLAG_1000MB_CAP) {
-			/* make sure that we don't advertise half
-			 * duplex to avoid a chip issue
-			 */
-			val  = cas_phy_read(cp, CAS_MII_1000_CTRL);
-			val &= ~CAS_ADVERTISE_1000HALF;
-			val |= CAS_ADVERTISE_1000FULL;
-			cas_phy_write(cp, CAS_MII_1000_CTRL, val);
-		}
-
-	} else {
-		/* reset pcs for serdes */
-		u32 val;
-		int limit;
-
-		writel(PCS_DATAPATH_MODE_SERDES,
-		       cp->regs + REG_PCS_DATAPATH_MODE);
-
-		/* enable serdes pins on saturn */
-		if (cp->cas_flags & CAS_FLAG_SATURN)
-			writel(0, cp->regs + REG_SATURN_PCFG);
-
-		/* Reset PCS unit. */
-		val = readl(cp->regs + REG_PCS_MII_CTRL);
-		val |= PCS_MII_RESET;
-		writel(val, cp->regs + REG_PCS_MII_CTRL);
-
-		limit = STOP_TRIES;
-		while (--limit > 0) {
-			udelay(10);
-			if ((readl(cp->regs + REG_PCS_MII_CTRL) &
-			     PCS_MII_RESET) == 0)
-				break;
-		}
-		if (limit <= 0)
-			netdev_warn(cp->dev, "PCS reset bit would not clear [%08x]\n",
-				    readl(cp->regs + REG_PCS_STATE_MACHINE));
-
-		/* Make sure PCS is disabled while changing advertisement
-		 * configuration.
-		 */
-		writel(0x0, cp->regs + REG_PCS_CFG);
-
-		/* Advertise all capabilities except half-duplex. */
-		val  = readl(cp->regs + REG_PCS_MII_ADVERT);
-		val &= ~PCS_MII_ADVERT_HD;
-		val |= (PCS_MII_ADVERT_FD | PCS_MII_ADVERT_SYM_PAUSE |
-			PCS_MII_ADVERT_ASYM_PAUSE);
-		writel(val, cp->regs + REG_PCS_MII_ADVERT);
-
-		/* enable PCS */
-		writel(PCS_CFG_EN, cp->regs + REG_PCS_CFG);
-
-		/* pcs workaround: enable sync detect */
-		writel(PCS_SERDES_CTRL_SYNCD_EN,
-		       cp->regs + REG_PCS_SERDES_CTRL);
-	}
-}
-
-
-static int cas_pcs_link_check(struct cas *cp)
-{
-	u32 stat, state_machine;
-	int retval = 0;
-
-	/* The link status bit latches on zero, so you must
-	 * read it twice in such a case to see a transition
-	 * to the link being up.
-	 */
-	stat = readl(cp->regs + REG_PCS_MII_STATUS);
-	if ((stat & PCS_MII_STATUS_LINK_STATUS) == 0)
-		stat = readl(cp->regs + REG_PCS_MII_STATUS);
-
-	/* The remote-fault indication is only valid
-	 * when autoneg has completed.
-	 */
-	if ((stat & (PCS_MII_STATUS_AUTONEG_COMP |
-		     PCS_MII_STATUS_REMOTE_FAULT)) ==
-	    (PCS_MII_STATUS_AUTONEG_COMP | PCS_MII_STATUS_REMOTE_FAULT))
-		netif_info(cp, link, cp->dev, "PCS RemoteFault\n");
-
-	/* work around link detection issue by querying the PCS state
-	 * machine directly.
-	 */
-	state_machine = readl(cp->regs + REG_PCS_STATE_MACHINE);
-	if ((state_machine & PCS_SM_LINK_STATE_MASK) != SM_LINK_STATE_UP) {
-		stat &= ~PCS_MII_STATUS_LINK_STATUS;
-	} else if (state_machine & PCS_SM_WORD_SYNC_STATE_MASK) {
-		stat |= PCS_MII_STATUS_LINK_STATUS;
-	}
-
-	if (stat & PCS_MII_STATUS_LINK_STATUS) {
-		if (cp->lstate != link_up) {
-			if (cp->opened) {
-				cp->lstate = link_up;
-				cp->link_transition = LINK_TRANSITION_LINK_UP;
-
-				cas_set_link_modes(cp);
-				netif_carrier_on(cp->dev);
-			}
-		}
-	} else if (cp->lstate == link_up) {
-		cp->lstate = link_down;
-		if (link_transition_timeout != 0 &&
-		    cp->link_transition != LINK_TRANSITION_REQUESTED_RESET &&
-		    !cp->link_transition_jiffies_valid) {
-			/*
-			 * force a reset, as a workaround for the
-			 * link-failure problem. May want to move this to a
-			 * point a bit earlier in the sequence. If we had
-			 * generated a reset a short time ago, we'll wait for
-			 * the link timer to check the status until a
-			 * timer expires (link_transistion_jiffies_valid is
-			 * true when the timer is running.)  Instead of using
-			 * a system timer, we just do a check whenever the
-			 * link timer is running - this clears the flag after
-			 * a suitable delay.
-			 */
-			retval = 1;
-			cp->link_transition = LINK_TRANSITION_REQUESTED_RESET;
-			cp->link_transition_jiffies = jiffies;
-			cp->link_transition_jiffies_valid = 1;
-		} else {
-			cp->link_transition = LINK_TRANSITION_ON_FAILURE;
-		}
-		netif_carrier_off(cp->dev);
-		if (cp->opened)
-			netif_info(cp, link, cp->dev, "PCS link down\n");
-
-		/* Cassini only: if you force a mode, there can be
-		 * sync problems on link down. to fix that, the following
-		 * things need to be checked:
-		 * 1) read serialink state register
-		 * 2) read pcs status register to verify link down.
-		 * 3) if link down and serial link == 0x03, then you need
-		 *    to global reset the chip.
-		 */
-		if ((cp->cas_flags & CAS_FLAG_REG_PLUS) == 0) {
-			/* should check to see if we're in a forced mode */
-			stat = readl(cp->regs + REG_PCS_SERDES_STATE);
-			if (stat == 0x03)
-				return 1;
-		}
-	} else if (cp->lstate == link_down) {
-		if (link_transition_timeout != 0 &&
-		    cp->link_transition != LINK_TRANSITION_REQUESTED_RESET &&
-		    !cp->link_transition_jiffies_valid) {
-			/* force a reset, as a workaround for the
-			 * link-failure problem.  May want to move
-			 * this to a point a bit earlier in the
-			 * sequence.
-			 */
-			retval = 1;
-			cp->link_transition = LINK_TRANSITION_REQUESTED_RESET;
-			cp->link_transition_jiffies = jiffies;
-			cp->link_transition_jiffies_valid = 1;
-		} else {
-			cp->link_transition = LINK_TRANSITION_STILL_FAILED;
-		}
-	}
-
-	return retval;
-}
-
-static int cas_pcs_interrupt(struct net_device *dev,
-			     struct cas *cp, u32 status)
-{
-	u32 stat = readl(cp->regs + REG_PCS_INTR_STATUS);
-
-	if ((stat & PCS_INTR_STATUS_LINK_CHANGE) == 0)
-		return 0;
-	return cas_pcs_link_check(cp);
-}
-
-static int cas_txmac_interrupt(struct net_device *dev,
-			       struct cas *cp, u32 status)
-{
-	u32 txmac_stat = readl(cp->regs + REG_MAC_TX_STATUS);
-
-	if (!txmac_stat)
-		return 0;
-
-	netif_printk(cp, intr, KERN_DEBUG, cp->dev,
-		     "txmac interrupt, txmac_stat: 0x%x\n", txmac_stat);
-
-	/* Defer timer expiration is quite normal,
-	 * don't even log the event.
-	 */
-	if ((txmac_stat & MAC_TX_DEFER_TIMER) &&
-	    !(txmac_stat & ~MAC_TX_DEFER_TIMER))
-		return 0;
-
-	spin_lock(&cp->stat_lock[0]);
-	if (txmac_stat & MAC_TX_UNDERRUN) {
-		netdev_err(dev, "TX MAC xmit underrun\n");
-		cp->net_stats[0].tx_fifo_errors++;
-	}
-
-	if (txmac_stat & MAC_TX_MAX_PACKET_ERR) {
-		netdev_err(dev, "TX MAC max packet size error\n");
-		cp->net_stats[0].tx_errors++;
-	}
-
-	/* The rest are all cases of one of the 16-bit TX
-	 * counters expiring.
-	 */
-	if (txmac_stat & MAC_TX_COLL_NORMAL)
-		cp->net_stats[0].collisions += 0x10000;
-
-	if (txmac_stat & MAC_TX_COLL_EXCESS) {
-		cp->net_stats[0].tx_aborted_errors += 0x10000;
-		cp->net_stats[0].collisions += 0x10000;
-	}
-
-	if (txmac_stat & MAC_TX_COLL_LATE) {
-		cp->net_stats[0].tx_aborted_errors += 0x10000;
-		cp->net_stats[0].collisions += 0x10000;
-	}
-	spin_unlock(&cp->stat_lock[0]);
-
-	/* We do not keep track of MAC_TX_COLL_FIRST and
-	 * MAC_TX_PEAK_ATTEMPTS events.
-	 */
-	return 0;
-}
-
-static void cas_load_firmware(struct cas *cp, cas_hp_inst_t *firmware)
-{
-	cas_hp_inst_t *inst;
-	u32 val;
-	int i;
-
-	i = 0;
-	while ((inst = firmware) && inst->note) {
-		writel(i, cp->regs + REG_HP_INSTR_RAM_ADDR);
-
-		val = CAS_BASE(HP_INSTR_RAM_HI_VAL, inst->val);
-		val |= CAS_BASE(HP_INSTR_RAM_HI_MASK, inst->mask);
-		writel(val, cp->regs + REG_HP_INSTR_RAM_DATA_HI);
-
-		val = CAS_BASE(HP_INSTR_RAM_MID_OUTARG, inst->outarg >> 10);
-		val |= CAS_BASE(HP_INSTR_RAM_MID_OUTOP, inst->outop);
-		val |= CAS_BASE(HP_INSTR_RAM_MID_FNEXT, inst->fnext);
-		val |= CAS_BASE(HP_INSTR_RAM_MID_FOFF, inst->foff);
-		val |= CAS_BASE(HP_INSTR_RAM_MID_SNEXT, inst->snext);
-		val |= CAS_BASE(HP_INSTR_RAM_MID_SOFF, inst->soff);
-		val |= CAS_BASE(HP_INSTR_RAM_MID_OP, inst->op);
-		writel(val, cp->regs + REG_HP_INSTR_RAM_DATA_MID);
-
-		val = CAS_BASE(HP_INSTR_RAM_LOW_OUTMASK, inst->outmask);
-		val |= CAS_BASE(HP_INSTR_RAM_LOW_OUTSHIFT, inst->outshift);
-		val |= CAS_BASE(HP_INSTR_RAM_LOW_OUTEN, inst->outenab);
-		val |= CAS_BASE(HP_INSTR_RAM_LOW_OUTARG, inst->outarg);
-		writel(val, cp->regs + REG_HP_INSTR_RAM_DATA_LOW);
-		++firmware;
-		++i;
-	}
-}
-
-static void cas_init_rx_dma(struct cas *cp)
-{
-	u64 desc_dma = cp->block_dvma;
-	u32 val;
-	int i, size;
-
-	/* rx free descriptors */
-	val = CAS_BASE(RX_CFG_SWIVEL, RX_SWIVEL_OFF_VAL);
-	val |= CAS_BASE(RX_CFG_DESC_RING, RX_DESC_RINGN_INDEX(0));
-	val |= CAS_BASE(RX_CFG_COMP_RING, RX_COMP_RINGN_INDEX(0));
-	if ((N_RX_DESC_RINGS > 1) &&
-	    (cp->cas_flags & CAS_FLAG_REG_PLUS))  /* do desc 2 */
-		val |= CAS_BASE(RX_CFG_DESC_RING1, RX_DESC_RINGN_INDEX(1));
-	writel(val, cp->regs + REG_RX_CFG);
-
-	val = (unsigned long) cp->init_rxds[0] -
-		(unsigned long) cp->init_block;
-	writel((desc_dma + val) >> 32, cp->regs + REG_RX_DB_HI);
-	writel((desc_dma + val) & 0xffffffff, cp->regs + REG_RX_DB_LOW);
-	writel(RX_DESC_RINGN_SIZE(0) - 4, cp->regs + REG_RX_KICK);
-
-	if (cp->cas_flags & CAS_FLAG_REG_PLUS) {
-		/* rx desc 2 is for IPSEC packets. however,
-		 * we don't it that for that purpose.
-		 */
-		val = (unsigned long) cp->init_rxds[1] -
-			(unsigned long) cp->init_block;
-		writel((desc_dma + val) >> 32, cp->regs + REG_PLUS_RX_DB1_HI);
-		writel((desc_dma + val) & 0xffffffff, cp->regs +
-		       REG_PLUS_RX_DB1_LOW);
-		writel(RX_DESC_RINGN_SIZE(1) - 4, cp->regs +
-		       REG_PLUS_RX_KICK1);
-	}
-
-	/* rx completion registers */
-	val = (unsigned long) cp->init_rxcs[0] -
-		(unsigned long) cp->init_block;
-	writel((desc_dma + val) >> 32, cp->regs + REG_RX_CB_HI);
-	writel((desc_dma + val) & 0xffffffff, cp->regs + REG_RX_CB_LOW);
-
-	if (cp->cas_flags & CAS_FLAG_REG_PLUS) {
-		/* rx comp 2-4 */
-		for (i = 1; i < MAX_RX_COMP_RINGS; i++) {
-			val = (unsigned long) cp->init_rxcs[i] -
-				(unsigned long) cp->init_block;
-			writel((desc_dma + val) >> 32, cp->regs +
-			       REG_PLUS_RX_CBN_HI(i));
-			writel((desc_dma + val) & 0xffffffff, cp->regs +
-			       REG_PLUS_RX_CBN_LOW(i));
-		}
-	}
-
-	/* read selective clear regs to prevent spurious interrupts
-	 * on reset because complete == kick.
-	 * selective clear set up to prevent interrupts on resets
-	 */
-	readl(cp->regs + REG_INTR_STATUS_ALIAS);
-	writel(INTR_RX_DONE | INTR_RX_BUF_UNAVAIL, cp->regs + REG_ALIAS_CLEAR);
-	if (cp->cas_flags & CAS_FLAG_REG_PLUS) {
-		for (i = 1; i < N_RX_COMP_RINGS; i++)
-			readl(cp->regs + REG_PLUS_INTRN_STATUS_ALIAS(i));
-
-		/* 2 is different from 3 and 4 */
-		if (N_RX_COMP_RINGS > 1)
-			writel(INTR_RX_DONE_ALT | INTR_RX_BUF_UNAVAIL_1,
-			       cp->regs + REG_PLUS_ALIASN_CLEAR(1));
-
-		for (i = 2; i < N_RX_COMP_RINGS; i++)
-			writel(INTR_RX_DONE_ALT,
-			       cp->regs + REG_PLUS_ALIASN_CLEAR(i));
-	}
-
-	/* set up pause thresholds */
-	val  = CAS_BASE(RX_PAUSE_THRESH_OFF,
-			cp->rx_pause_off / RX_PAUSE_THRESH_QUANTUM);
-	val |= CAS_BASE(RX_PAUSE_THRESH_ON,
-			cp->rx_pause_on / RX_PAUSE_THRESH_QUANTUM);
-	writel(val, cp->regs + REG_RX_PAUSE_THRESH);
-
-	/* zero out dma reassembly buffers */
-	for (i = 0; i < 64; i++) {
-		writel(i, cp->regs + REG_RX_TABLE_ADDR);
-		writel(0x0, cp->regs + REG_RX_TABLE_DATA_LOW);
-		writel(0x0, cp->regs + REG_RX_TABLE_DATA_MID);
-		writel(0x0, cp->regs + REG_RX_TABLE_DATA_HI);
-	}
-
-	/* make sure address register is 0 for normal operation */
-	writel(0x0, cp->regs + REG_RX_CTRL_FIFO_ADDR);
-	writel(0x0, cp->regs + REG_RX_IPP_FIFO_ADDR);
-
-	/* interrupt mitigation */
-#ifdef USE_RX_BLANK
-	val = CAS_BASE(RX_BLANK_INTR_TIME, RX_BLANK_INTR_TIME_VAL);
-	val |= CAS_BASE(RX_BLANK_INTR_PKT, RX_BLANK_INTR_PKT_VAL);
-	writel(val, cp->regs + REG_RX_BLANK);
-#else
-	writel(0x0, cp->regs + REG_RX_BLANK);
-#endif
-
-	/* interrupt generation as a function of low water marks for
-	 * free desc and completion entries. these are used to trigger
-	 * housekeeping for rx descs. we don't use the free interrupt
-	 * as it's not very useful
-	 */
-	/* val = CAS_BASE(RX_AE_THRESH_FREE, RX_AE_FREEN_VAL(0)); */
-	val = CAS_BASE(RX_AE_THRESH_COMP, RX_AE_COMP_VAL);
-	writel(val, cp->regs + REG_RX_AE_THRESH);
-	if (cp->cas_flags & CAS_FLAG_REG_PLUS) {
-		val = CAS_BASE(RX_AE1_THRESH_FREE, RX_AE_FREEN_VAL(1));
-		writel(val, cp->regs + REG_PLUS_RX_AE1_THRESH);
-	}
-
-	/* Random early detect registers. useful for congestion avoidance.
-	 * this should be tunable.
-	 */
-	writel(0x0, cp->regs + REG_RX_RED);
-
-	/* receive page sizes. default == 2K (0x800) */
-	val = 0;
-	if (cp->page_size == 0x1000)
-		val = 0x1;
-	else if (cp->page_size == 0x2000)
-		val = 0x2;
-	else if (cp->page_size == 0x4000)
-		val = 0x3;
-
-	/* round mtu + offset. constrain to page size. */
-	size = cp->dev->mtu + 64;
-	if (size > cp->page_size)
-		size = cp->page_size;
-
-	if (size <= 0x400)
-		i = 0x0;
-	else if (size <= 0x800)
-		i = 0x1;
-	else if (size <= 0x1000)
-		i = 0x2;
-	else
-		i = 0x3;
-
-	cp->mtu_stride = 1 << (i + 10);
-	val  = CAS_BASE(RX_PAGE_SIZE, val);
-	val |= CAS_BASE(RX_PAGE_SIZE_MTU_STRIDE, i);
-	val |= CAS_BASE(RX_PAGE_SIZE_MTU_COUNT, cp->page_size >> (i + 10));
-	val |= CAS_BASE(RX_PAGE_SIZE_MTU_OFF, 0x1);
-	writel(val, cp->regs + REG_RX_PAGE_SIZE);
-
-	/* enable the header parser if desired */
-	if (&CAS_HP_FIRMWARE[0] == &cas_prog_null[0])
-		return;
-
-	val = CAS_BASE(HP_CFG_NUM_CPU, CAS_NCPUS > 63 ? 0 : CAS_NCPUS);
-	val |= HP_CFG_PARSE_EN | HP_CFG_SYN_INC_MASK;
-	val |= CAS_BASE(HP_CFG_TCP_THRESH, HP_TCP_THRESH_VAL);
-	writel(val, cp->regs + REG_HP_CFG);
-}
-
-static inline void cas_rxc_init(struct cas_rx_comp *rxc)
-{
-	memset(rxc, 0, sizeof(*rxc));
-	rxc->word4 = cpu_to_le64(RX_COMP4_ZERO);
-}
-
-/* NOTE: we use the ENC RX DESC ring for spares. the rx_page[0,1]
- * flipping is protected by the fact that the chip will not
- * hand back the same page index while it's being processed.
- */
-static inline cas_page_t *cas_page_spare(struct cas *cp, const int index)
-{
-	cas_page_t *page = cp->rx_pages[1][index];
-	cas_page_t *new;
-
-	if (page_count(page->buffer) == 1)
-		return page;
-
-	new = cas_page_dequeue(cp);
-	if (new) {
-		spin_lock(&cp->rx_inuse_lock);
-		list_add(&page->list, &cp->rx_inuse_list);
-		spin_unlock(&cp->rx_inuse_lock);
-	}
-	return new;
-}
-
-/* this needs to be changed if we actually use the ENC RX DESC ring */
-static cas_page_t *cas_page_swap(struct cas *cp, const int ring,
-				 const int index)
-{
-	cas_page_t **page0 = cp->rx_pages[0];
-	cas_page_t **page1 = cp->rx_pages[1];
-
-	/* swap if buffer is in use */
-	if (page_count(page0[index]->buffer) > 1) {
-		cas_page_t *new = cas_page_spare(cp, index);
-		if (new) {
-			page1[index] = page0[index];
-			page0[index] = new;
-		}
-	}
-	RX_USED_SET(page0[index], 0);
-	return page0[index];
-}
-
-static void cas_clean_rxds(struct cas *cp)
-{
-	/* only clean ring 0 as ring 1 is used for spare buffers */
-        struct cas_rx_desc *rxd = cp->init_rxds[0];
-	int i, size;
-
-	/* release all rx flows */
-	for (i = 0; i < N_RX_FLOWS; i++) {
-		struct sk_buff *skb;
-		while ((skb = __skb_dequeue(&cp->rx_flows[i]))) {
-			cas_skb_release(skb);
-		}
-	}
-
-	/* initialize descriptors */
-	size = RX_DESC_RINGN_SIZE(0);
-	for (i = 0; i < size; i++) {
-		cas_page_t *page = cas_page_swap(cp, 0, i);
-		rxd[i].buffer = cpu_to_le64(page->dma_addr);
-		rxd[i].index  = cpu_to_le64(CAS_BASE(RX_INDEX_NUM, i) |
-					    CAS_BASE(RX_INDEX_RING, 0));
-	}
-
-	cp->rx_old[0]  = RX_DESC_RINGN_SIZE(0) - 4;
-	cp->rx_last[0] = 0;
-	cp->cas_flags &= ~CAS_FLAG_RXD_POST(0);
-}
-
-static void cas_clean_rxcs(struct cas *cp)
-{
-	int i, j;
-
-	/* take ownership of rx comp descriptors */
-	memset(cp->rx_cur, 0, sizeof(*cp->rx_cur)*N_RX_COMP_RINGS);
-	memset(cp->rx_new, 0, sizeof(*cp->rx_new)*N_RX_COMP_RINGS);
-	for (i = 0; i < N_RX_COMP_RINGS; i++) {
-		struct cas_rx_comp *rxc = cp->init_rxcs[i];
-		for (j = 0; j < RX_COMP_RINGN_SIZE(i); j++) {
-			cas_rxc_init(rxc + j);
-		}
-	}
-}
-
-#if 0
-/* When we get a RX fifo overflow, the RX unit is probably hung
- * so we do the following.
- *
- * If any part of the reset goes wrong, we return 1 and that causes the
- * whole chip to be reset.
- */
-static int cas_rxmac_reset(struct cas *cp)
-{
-	struct net_device *dev = cp->dev;
-	int limit;
-	u32 val;
-
-	/* First, reset MAC RX. */
-	writel(cp->mac_rx_cfg & ~MAC_RX_CFG_EN, cp->regs + REG_MAC_RX_CFG);
-	for (limit = 0; limit < STOP_TRIES; limit++) {
-		if (!(readl(cp->regs + REG_MAC_RX_CFG) & MAC_RX_CFG_EN))
-			break;
-		udelay(10);
-	}
-	if (limit == STOP_TRIES) {
-		netdev_err(dev, "RX MAC will not disable, resetting whole chip\n");
-		return 1;
-	}
-
-	/* Second, disable RX DMA. */
-	writel(0, cp->regs + REG_RX_CFG);
-	for (limit = 0; limit < STOP_TRIES; limit++) {
-		if (!(readl(cp->regs + REG_RX_CFG) & RX_CFG_DMA_EN))
-			break;
-		udelay(10);
-	}
-	if (limit == STOP_TRIES) {
-		netdev_err(dev, "RX DMA will not disable, resetting whole chip\n");
-		return 1;
-	}
-
-	mdelay(5);
-
-	/* Execute RX reset command. */
-	writel(SW_RESET_RX, cp->regs + REG_SW_RESET);
-	for (limit = 0; limit < STOP_TRIES; limit++) {
-		if (!(readl(cp->regs + REG_SW_RESET) & SW_RESET_RX))
-			break;
-		udelay(10);
-	}
-	if (limit == STOP_TRIES) {
-		netdev_err(dev, "RX reset command will not execute, resetting whole chip\n");
-		return 1;
-	}
-
-	/* reset driver rx state */
-	cas_clean_rxds(cp);
-	cas_clean_rxcs(cp);
-
-	/* Now, reprogram the rest of RX unit. */
-	cas_init_rx_dma(cp);
-
-	/* re-enable */
-	val = readl(cp->regs + REG_RX_CFG);
-	writel(val | RX_CFG_DMA_EN, cp->regs + REG_RX_CFG);
-	writel(MAC_RX_FRAME_RECV, cp->regs + REG_MAC_RX_MASK);
-	val = readl(cp->regs + REG_MAC_RX_CFG);
-	writel(val | MAC_RX_CFG_EN, cp->regs + REG_MAC_RX_CFG);
-	return 0;
-}
-#endif
-
-static int cas_rxmac_interrupt(struct net_device *dev, struct cas *cp,
-			       u32 status)
-{
-	u32 stat = readl(cp->regs + REG_MAC_RX_STATUS);
-
-	if (!stat)
-		return 0;
-
-	netif_dbg(cp, intr, cp->dev, "rxmac interrupt, stat: 0x%x\n", stat);
-
-	/* these are all rollovers */
-	spin_lock(&cp->stat_lock[0]);
-	if (stat & MAC_RX_ALIGN_ERR)
-		cp->net_stats[0].rx_frame_errors += 0x10000;
-
-	if (stat & MAC_RX_CRC_ERR)
-		cp->net_stats[0].rx_crc_errors += 0x10000;
-
-	if (stat & MAC_RX_LEN_ERR)
-		cp->net_stats[0].rx_length_errors += 0x10000;
-
-	if (stat & MAC_RX_OVERFLOW) {
-		cp->net_stats[0].rx_over_errors++;
-		cp->net_stats[0].rx_fifo_errors++;
-	}
-
-	/* We do not track MAC_RX_FRAME_COUNT and MAC_RX_VIOL_ERR
-	 * events.
-	 */
-	spin_unlock(&cp->stat_lock[0]);
-	return 0;
-}
-
-static int cas_mac_interrupt(struct net_device *dev, struct cas *cp,
-			     u32 status)
-{
-	u32 stat = readl(cp->regs + REG_MAC_CTRL_STATUS);
-
-	if (!stat)
-		return 0;
-
-	netif_printk(cp, intr, KERN_DEBUG, cp->dev,
-		     "mac interrupt, stat: 0x%x\n", stat);
-
-	/* This interrupt is just for pause frame and pause
-	 * tracking.  It is useful for diagnostics and debug
-	 * but probably by default we will mask these events.
-	 */
-	if (stat & MAC_CTRL_PAUSE_STATE)
-		cp->pause_entered++;
-
-	if (stat & MAC_CTRL_PAUSE_RECEIVED)
-		cp->pause_last_time_recvd = (stat >> 16);
-
-	return 0;
-}
-
-
-/* Must be invoked under cp->lock. */
-static inline int cas_mdio_link_not_up(struct cas *cp)
-{
-	u16 val;
-
-	switch (cp->lstate) {
-	case link_force_ret:
-		netif_info(cp, link, cp->dev, "Autoneg failed again, keeping forced mode\n");
-		cas_phy_write(cp, MII_BMCR, cp->link_fcntl);
-		cp->timer_ticks = 5;
-		cp->lstate = link_force_ok;
-		cp->link_transition = LINK_TRANSITION_LINK_CONFIG;
-		break;
-
-	case link_aneg:
-		val = cas_phy_read(cp, MII_BMCR);
-
-		/* Try forced modes. we try things in the following order:
-		 * 1000 full -> 100 full/half -> 10 half
-		 */
-		val &= ~(BMCR_ANRESTART | BMCR_ANENABLE);
-		val |= BMCR_FULLDPLX;
-		val |= (cp->cas_flags & CAS_FLAG_1000MB_CAP) ?
-			CAS_BMCR_SPEED1000 : BMCR_SPEED100;
-		cas_phy_write(cp, MII_BMCR, val);
-		cp->timer_ticks = 5;
-		cp->lstate = link_force_try;
-		cp->link_transition = LINK_TRANSITION_LINK_CONFIG;
-		break;
-
-	case link_force_try:
-		/* Downgrade from 1000 to 100 to 10 Mbps if necessary. */
-		val = cas_phy_read(cp, MII_BMCR);
-		cp->timer_ticks = 5;
-		if (val & CAS_BMCR_SPEED1000) { /* gigabit */
-			val &= ~CAS_BMCR_SPEED1000;
-			val |= (BMCR_SPEED100 | BMCR_FULLDPLX);
-			cas_phy_write(cp, MII_BMCR, val);
-			break;
-		}
-
-		if (val & BMCR_SPEED100) {
-			if (val & BMCR_FULLDPLX) /* fd failed */
-				val &= ~BMCR_FULLDPLX;
-			else { /* 100Mbps failed */
-				val &= ~BMCR_SPEED100;
-			}
-			cas_phy_write(cp, MII_BMCR, val);
-			break;
-		}
-	default:
-		break;
-	}
-	return 0;
-}
-
-
-/* must be invoked with cp->lock held */
-static int cas_mii_link_check(struct cas *cp, const u16 bmsr)
-{
-	int restart;
-
-	if (bmsr & BMSR_LSTATUS) {
-		/* Ok, here we got a link. If we had it due to a forced
-		 * fallback, and we were configured for autoneg, we
-		 * retry a short autoneg pass. If you know your hub is
-		 * broken, use ethtool ;)
-		 */
-		if ((cp->lstate == link_force_try) &&
-		    (cp->link_cntl & BMCR_ANENABLE)) {
-			cp->lstate = link_force_ret;
-			cp->link_transition = LINK_TRANSITION_LINK_CONFIG;
-			cas_mif_poll(cp, 0);
-			cp->link_fcntl = cas_phy_read(cp, MII_BMCR);
-			cp->timer_ticks = 5;
-			if (cp->opened)
-				netif_info(cp, link, cp->dev,
-					   "Got link after fallback, retrying autoneg once...\n");
-			cas_phy_write(cp, MII_BMCR,
-				      cp->link_fcntl | BMCR_ANENABLE |
-				      BMCR_ANRESTART);
-			cas_mif_poll(cp, 1);
-
-		} else if (cp->lstate != link_up) {
-			cp->lstate = link_up;
-			cp->link_transition = LINK_TRANSITION_LINK_UP;
-
-			if (cp->opened) {
-				cas_set_link_modes(cp);
-				netif_carrier_on(cp->dev);
-			}
-		}
-		return 0;
-	}
-
-	/* link not up. if the link was previously up, we restart the
-	 * whole process
-	 */
-	restart = 0;
-	if (cp->lstate == link_up) {
-		cp->lstate = link_down;
-		cp->link_transition = LINK_TRANSITION_LINK_DOWN;
-
-		netif_carrier_off(cp->dev);
-		if (cp->opened)
-			netif_info(cp, link, cp->dev, "Link down\n");
-		restart = 1;
-
-	} else if (++cp->timer_ticks > 10)
-		cas_mdio_link_not_up(cp);
-
-	return restart;
-}
-
-static int cas_mif_interrupt(struct net_device *dev, struct cas *cp,
-			     u32 status)
-{
-	u32 stat = readl(cp->regs + REG_MIF_STATUS);
-	u16 bmsr;
-
-	/* check for a link change */
-	if (CAS_VAL(MIF_STATUS_POLL_STATUS, stat) == 0)
-		return 0;
-
-	bmsr = CAS_VAL(MIF_STATUS_POLL_DATA, stat);
-	return cas_mii_link_check(cp, bmsr);
-}
-
-static int cas_pci_interrupt(struct net_device *dev, struct cas *cp,
-			     u32 status)
-{
-	u32 stat = readl(cp->regs + REG_PCI_ERR_STATUS);
-
-	if (!stat)
-		return 0;
-
-	netdev_err(dev, "PCI error [%04x:%04x]",
-		   stat, readl(cp->regs + REG_BIM_DIAG));
-
-	/* cassini+ has this reserved */
-	if ((stat & PCI_ERR_BADACK) &&
-	    ((cp->cas_flags & CAS_FLAG_REG_PLUS) == 0))
-		pr_cont(" <No ACK64# during ABS64 cycle>");
-
-	if (stat & PCI_ERR_DTRTO)
-		pr_cont(" <Delayed transaction timeout>");
-	if (stat & PCI_ERR_OTHER)
-		pr_cont(" <other>");
-	if (stat & PCI_ERR_BIM_DMA_WRITE)
-		pr_cont(" <BIM DMA 0 write req>");
-	if (stat & PCI_ERR_BIM_DMA_READ)
-		pr_cont(" <BIM DMA 0 read req>");
-	pr_cont("\n");
-
-	if (stat & PCI_ERR_OTHER) {
-		u16 cfg;
-
-		/* Interrogate PCI config space for the
-		 * true cause.
-		 */
-		pci_read_config_word(cp->pdev, PCI_STATUS, &cfg);
-		netdev_err(dev, "Read PCI cfg space status [%04x]\n", cfg);
-		if (cfg & PCI_STATUS_PARITY)
-			netdev_err(dev, "PCI parity error detected\n");
-		if (cfg & PCI_STATUS_SIG_TARGET_ABORT)
-			netdev_err(dev, "PCI target abort\n");
-		if (cfg & PCI_STATUS_REC_TARGET_ABORT)
-			netdev_err(dev, "PCI master acks target abort\n");
-		if (cfg & PCI_STATUS_REC_MASTER_ABORT)
-			netdev_err(dev, "PCI master abort\n");
-		if (cfg & PCI_STATUS_SIG_SYSTEM_ERROR)
-			netdev_err(dev, "PCI system error SERR#\n");
-		if (cfg & PCI_STATUS_DETECTED_PARITY)
-			netdev_err(dev, "PCI parity error\n");
-
-		/* Write the error bits back to clear them. */
-		cfg &= (PCI_STATUS_PARITY |
-			PCI_STATUS_SIG_TARGET_ABORT |
-			PCI_STATUS_REC_TARGET_ABORT |
-			PCI_STATUS_REC_MASTER_ABORT |
-			PCI_STATUS_SIG_SYSTEM_ERROR |
-			PCI_STATUS_DETECTED_PARITY);
-		pci_write_config_word(cp->pdev, PCI_STATUS, cfg);
-	}
-
-	/* For all PCI errors, we should reset the chip. */
-	return 1;
-}
-
-/* All non-normal interrupt conditions get serviced here.
- * Returns non-zero if we should just exit the interrupt
- * handler right now (ie. if we reset the card which invalidates
- * all of the other original irq status bits).
- */
-static int cas_abnormal_irq(struct net_device *dev, struct cas *cp,
-			    u32 status)
-{
-	if (status & INTR_RX_TAG_ERROR) {
-		/* corrupt RX tag framing */
-		netif_printk(cp, rx_err, KERN_DEBUG, cp->dev,
-			     "corrupt rx tag framing\n");
-		spin_lock(&cp->stat_lock[0]);
-		cp->net_stats[0].rx_errors++;
-		spin_unlock(&cp->stat_lock[0]);
-		goto do_reset;
-	}
-
-	if (status & INTR_RX_LEN_MISMATCH) {
-		/* length mismatch. */
-		netif_printk(cp, rx_err, KERN_DEBUG, cp->dev,
-			     "length mismatch for rx frame\n");
-		spin_lock(&cp->stat_lock[0]);
-		cp->net_stats[0].rx_errors++;
-		spin_unlock(&cp->stat_lock[0]);
-		goto do_reset;
-	}
-
-	if (status & INTR_PCS_STATUS) {
-		if (cas_pcs_interrupt(dev, cp, status))
-			goto do_reset;
-	}
-
-	if (status & INTR_TX_MAC_STATUS) {
-		if (cas_txmac_interrupt(dev, cp, status))
-			goto do_reset;
-	}
-
-	if (status & INTR_RX_MAC_STATUS) {
-		if (cas_rxmac_interrupt(dev, cp, status))
-			goto do_reset;
-	}
-
-	if (status & INTR_MAC_CTRL_STATUS) {
-		if (cas_mac_interrupt(dev, cp, status))
-			goto do_reset;
-	}
-
-	if (status & INTR_MIF_STATUS) {
-		if (cas_mif_interrupt(dev, cp, status))
-			goto do_reset;
-	}
-
-	if (status & INTR_PCI_ERROR_STATUS) {
-		if (cas_pci_interrupt(dev, cp, status))
-			goto do_reset;
-	}
-	return 0;
-
-do_reset:
-#if 1
-	atomic_inc(&cp->reset_task_pending);
-	atomic_inc(&cp->reset_task_pending_all);
-	netdev_err(dev, "reset called in cas_abnormal_irq [0x%x]\n", status);
-	schedule_work(&cp->reset_task);
-#else
-	atomic_set(&cp->reset_task_pending, CAS_RESET_ALL);
-	netdev_err(dev, "reset called in cas_abnormal_irq\n");
-	schedule_work(&cp->reset_task);
-#endif
-	return 1;
-}
-
-/* NOTE: CAS_TABORT returns 1 or 2 so that it can be used when
- *       determining whether to do a netif_stop/wakeup
- */
-#define CAS_TABORT(x)      (((x)->cas_flags & CAS_FLAG_TARGET_ABORT) ? 2 : 1)
-#define CAS_ROUND_PAGE(x)  (((x) + PAGE_SIZE - 1) & PAGE_MASK)
-static inline int cas_calc_tabort(struct cas *cp, const unsigned long addr,
-				  const int len)
-{
-	unsigned long off = addr + len;
-
-	if (CAS_TABORT(cp) == 1)
-		return 0;
-	if ((CAS_ROUND_PAGE(off) - off) > TX_TARGET_ABORT_LEN)
-		return 0;
-	return TX_TARGET_ABORT_LEN;
-}
-
-static inline void cas_tx_ringN(struct cas *cp, int ring, int limit)
-{
-	struct cas_tx_desc *txds;
-	struct sk_buff **skbs;
-	struct net_device *dev = cp->dev;
-	int entry, count;
-
-	spin_lock(&cp->tx_lock[ring]);
-	txds = cp->init_txds[ring];
-	skbs = cp->tx_skbs[ring];
-	entry = cp->tx_old[ring];
-
-	count = TX_BUFF_COUNT(ring, entry, limit);
-	while (entry != limit) {
-		struct sk_buff *skb = skbs[entry];
-		dma_addr_t daddr;
-		u32 dlen;
-		int frag;
-
-		if (!skb) {
-			/* this should never occur */
-			entry = TX_DESC_NEXT(ring, entry);
-			continue;
-		}
-
-		/* however, we might get only a partial skb release. */
-		count -= skb_shinfo(skb)->nr_frags +
-			+ cp->tx_tiny_use[ring][entry].nbufs + 1;
-		if (count < 0)
-			break;
-
-		netif_printk(cp, tx_done, KERN_DEBUG, cp->dev,
-			     "tx[%d] done, slot %d\n", ring, entry);
-
-		skbs[entry] = NULL;
-		cp->tx_tiny_use[ring][entry].nbufs = 0;
-
-		for (frag = 0; frag <= skb_shinfo(skb)->nr_frags; frag++) {
-			struct cas_tx_desc *txd = txds + entry;
-
-			daddr = le64_to_cpu(txd->buffer);
-			dlen = CAS_VAL(TX_DESC_BUFLEN,
-				       le64_to_cpu(txd->control));
-			pci_unmap_page(cp->pdev, daddr, dlen,
-				       PCI_DMA_TODEVICE);
-			entry = TX_DESC_NEXT(ring, entry);
-
-			/* tiny buffer may follow */
-			if (cp->tx_tiny_use[ring][entry].used) {
-				cp->tx_tiny_use[ring][entry].used = 0;
-				entry = TX_DESC_NEXT(ring, entry);
-			}
-		}
-
-		spin_lock(&cp->stat_lock[ring]);
-		cp->net_stats[ring].tx_packets++;
-		cp->net_stats[ring].tx_bytes += skb->len;
-		spin_unlock(&cp->stat_lock[ring]);
-		dev_kfree_skb_irq(skb);
-	}
-	cp->tx_old[ring] = entry;
-
-	/* this is wrong for multiple tx rings. the net device needs
-	 * multiple queues for this to do the right thing.  we wait
-	 * for 2*packets to be available when using tiny buffers
-	 */
-	if (netif_queue_stopped(dev) &&
-	    (TX_BUFFS_AVAIL(cp, ring) > CAS_TABORT(cp)*(MAX_SKB_FRAGS + 1)))
-		netif_wake_queue(dev);
-	spin_unlock(&cp->tx_lock[ring]);
-}
-
-static void cas_tx(struct net_device *dev, struct cas *cp,
-		   u32 status)
-{
-        int limit, ring;
-#ifdef USE_TX_COMPWB
-	u64 compwb = le64_to_cpu(cp->init_block->tx_compwb);
-#endif
-	netif_printk(cp, intr, KERN_DEBUG, cp->dev,
-		     "tx interrupt, status: 0x%x, %llx\n",
-		     status, (unsigned long long)compwb);
-	/* process all the rings */
-	for (ring = 0; ring < N_TX_RINGS; ring++) {
-#ifdef USE_TX_COMPWB
-		/* use the completion writeback registers */
-		limit = (CAS_VAL(TX_COMPWB_MSB, compwb) << 8) |
-			CAS_VAL(TX_COMPWB_LSB, compwb);
-		compwb = TX_COMPWB_NEXT(compwb);
-#else
-		limit = readl(cp->regs + REG_TX_COMPN(ring));
-#endif
-		if (cp->tx_old[ring] != limit)
-			cas_tx_ringN(cp, ring, limit);
-	}
-}
-
-
-static int cas_rx_process_pkt(struct cas *cp, struct cas_rx_comp *rxc,
-			      int entry, const u64 *words,
-			      struct sk_buff **skbref)
-{
-	int dlen, hlen, len, i, alloclen;
-	int off, swivel = RX_SWIVEL_OFF_VAL;
-	struct cas_page *page;
-	struct sk_buff *skb;
-	void *addr, *crcaddr;
-	__sum16 csum;
-	char *p;
-
-	hlen = CAS_VAL(RX_COMP2_HDR_SIZE, words[1]);
-	dlen = CAS_VAL(RX_COMP1_DATA_SIZE, words[0]);
-	len  = hlen + dlen;
-
-	if (RX_COPY_ALWAYS || (words[2] & RX_COMP3_SMALL_PKT))
-		alloclen = len;
-	else
-		alloclen = max(hlen, RX_COPY_MIN);
-
-	skb = netdev_alloc_skb(cp->dev, alloclen + swivel + cp->crc_size);
-	if (skb == NULL)
+	if (ioctl(fd, FE_SET_PROPERTY, &amp;dtv_prop) == -1) {
+		perror("ioctl");
 		return -1;
-
-	*skbref = skb;
-	skb_reserve(skb, swivel);
-
-	p = skb->data;
-	addr = crcaddr = NULL;
-	if (hlen) { /* always copy header pages */
-		i = CAS_VAL(RX_COMP2_HDR_INDEX, words[1]);
-		page = cp->rx_pages[CAS_VAL(RX_INDEX_RING, i)][CAS_VAL(RX_INDEX_NUM, i)];
-		off = CAS_VAL(RX_COMP2_HDR_OFF, words[1]) * 0x100 +
-			swivel;
-
-		i = hlen;
-		if (!dlen) /* attach FCS */
-			i += cp->crc_size;
-		pci_dma_sync_single_for_cpu(cp->pdev, page->dma_addr + off, i,
-				    PCI_DMA_FROMDEVICE);
-		addr = cas_page_map(page->buffer);
-		memcpy(p, addr + off, i);
-		pci_dma_sync_single_for_device(cp->pdev, page->dma_addr + off, i,
-				    PCI_DMA_FROMDEVICE);
-		cas_page_unmap(addr);
-		RX_USED_ADD(page, 0x100);
-		p += hlen;
-		swivel = 0;
 	}
-
-
-	if (alloclen < (hlen + dlen)) {
-		skb_frag_t *frag = skb_shinfo(skb)->frags;
-
-		/* normal or jumbo packets. we use frags */
-		i = CAS_VAL(RX_COMP1_DATA_INDEX, words[0]);
-		page = cp->rx_pages[CAS_VAL(RX_INDEX_RING, i)][CAS_VAL(RX_INDEX_NUM, i)];
-		off = CAS_VAL(RX_COMP1_DATA_OFF, words[0]) + swivel;
-
-		hlen = min(cp->page_size - off, dlen);
-		if (hlen < 0) {
-			netif_printk(cp, rx_err, KERN_DEBUG, cp->dev,
-				     "rx page overflow: %d\n", hlen);
-			dev_kfree_skb_irq(skb);
-			return -1;
-		}
-		i = hlen;
-		if (i == dlen)  /* attach FCS */
-			i += cp->crc_size;
-		pci_dma_sync_single_for_cpu(cp->pdev, page->dma_addr + off, i,
-				    PCI_DMA_FROMDEVICE);
-
-		/* make sure we always copy a header */
-		swivel = 0;
-		if (p == (char *) skb->data) { /* not split */
-			addr = cas_page_map(page->buffer);
-			memcpy(p, addr + off, RX_COPY_MIN);
-			pci_dma_sync_single_for_device(cp->pdev, page->dma_addr + off, i,
-					PCI_DMA_FROMDEVICE);
-			cas_page_unmap(addr);
-			off += RX_COPY_MIN;
-			swivel = RX_COPY_MIN;
-			RX_USED_ADD(page, cp->mtu_stride);
-		} else {
-			RX_USED_ADD(page, hlen);
-		}
-		skb_put(skb, alloclen);
-
-		skb_shinfo(skb)->nr_frags++;
-		skb->data_len += hlen - swivel;
-		skb->truesize += hlen - swivel;
-		skb->len      += hlen - swivel;
-
-		__skb_frag_set_page(frag, page->buffer);
-		__skb_frag_ref(frag);
-		frag->page_offset = off;
-		skb_frag_size_set(frag, hlen - swivel);
-
-		/* any more data? */
-		if ((words[0] & RX_COMP1_SPLIT_PKT) && ((dlen -= hlen) > 0)) {
-			hlen = dlen;
-			off = 0;
-
-			i = CAS_VAL(RX_COMP2_NEXT_INDEX, words[1]);
-			page = cp->rx_pages[CAS_VAL(RX_INDEX_RING, i)][CAS_VAL(RX_INDEX_NUM, i)];
-			pci_dma_sync_single_for_cpu(cp->pdev, page->dma_addr,
-					    hlen + cp->crc_size,
-					    PCI_DMA_FROMDEVICE);
-			pci_dma_sync_single_for_device(cp->pdev, page->dma_addr,
-					    hlen + cp->crc_size,
-					    PCI_DMA_FROMDEVICE);
-
-			skb_shinfo(skb)->nr_frags++;
-			skb->data_len += hlen;
-			skb->len      += hlen;
-			frag++;
-
-			__skb_frag_set_page(frag, page->buffer);
-			__skb_frag_ref(frag);
-			frag->page_offset = 0;
-			skb_frag_size_set(frag, hlen);
-			RX_USED_ADD(page, hlen + cp->crc_size);
-		}
-
-		if (cp->crc_size) {
-			addr = cas_page_map(page->buffer);
-			crcaddr  = addr + off + hlen;
-		}
-
-	} else {
-		/* copying packet */
-		if (!dlen)
-			goto end_copy_pkt;
-
-		i = CAS_VAL(RX_COMP1_DATA_INDEX, words[0]);
-		page = cp->rx_pages[CAS_VAL(RX_INDEX_RING, i)][CAS_VAL(RX_INDEX_NUM, i)];
-		off = CAS_VAL(RX_COMP1_DATA_OFF, words[0]) + swivel;
-		hlen = min(cp->page_size - off, dlen);
-		if (hlen < 0) {
-			netif_printk(cp, rx_err, KERN_DEBUG, cp->dev,
-				     "rx page overflow: %d\n", hlen);
-			dev_kfree_skb_irq(skb);
-			return -1;
-		}
-		i = hlen;
-		if (i == dlen) /* attach FCS */
-			i += cp->crc_size;
-		pci_dma_sync_single_for_cpu(cp->pdev, page->dma_addr + off, i,
-				    PCI_DMA_FROMDEVICE);
-		addr = cas_page_map(page->buffer);
-		memcpy(p, addr + off, i);
-		pci_dma_sync_single_for_device(cp->pdev, page->dma_addr + off, i,
-				    PCI_DMA_FROMDEVICE);
-		cas_page_unmap(addr);
-		if (p == (char *) skb->data) /* not split */
-			RX_USED_ADD(page, cp->mtu_stride);
-		else
-			RX_USED_ADD(page, i);
-
-		/* any more data? */
-		if ((words[0] & RX_COMP1_SPLIT_PKT) && ((dlen -= hlen) > 0)) {
-			p += hlen;
-			i = CAS_VAL(RX_COMP2_NEXT_INDEX, words[1]);
-			page = cp->rx_pages[CAS_VAL(RX_INDEX_RING, i)][CAS_VAL(RX_INDEX_NUM, i)];
-			pci_dma_sync_single_for_cpu(cp->pdev, page->dma_addr,
-					    dlen + cp->crc_size,
-					    PCI_DMA_FROMDEVICE);
-			addr = cas_page_map(page->buffer);
-			memcpy(p, addr, dlen + cp->crc_size);
-			pci_dma_sync_single_for_device(cp->pdev, page->dma_addr,
-					    dlen + cp->crc_size,
-					    PCI_DMA_FROMDEVICE);
-			cas_page_unmap(addr);
-			RX_USED_ADD(page, dlen + cp->crc_size);
-		}
-end_copy_pkt:
-		if (cp->crc_size) {
-			addr    = NULL;
-			crcaddr = skb->data + alloclen;
-		}
-		skb_put(skb, alloclen);
-	}
-
-	csum = (__force __sum16)htons(CAS_VAL(RX_COMP4_TCP_CSUM, words[3]));
-	if (cp->crc_size) {
-		/* checksum includes FCS. strip it out. */
-		csum = csum_fold(csum_partial(crcaddr, cp->crc_size,
-					      csum_unfold(csum)));
-		if (addr)
-			cas_page_unmap(addr);
-	}
-	skb->protocol = eth_type_trans(skb, cp->dev);
-	if (skb->protocol == htons(ETH_P_IP)) {
-		skb->csum = csum_unfold(~csum);
-		skb->ip_summed = CHECKSUM_COMPLETE;
-	} else
-		skb_checksum_none_assert(skb);
-	return len;
-}
-
-
-/* we can handle up to 64 rx flows at a time. we do the same thing
- * as nonreassm except that we batch up the buffers.
- * NOTE: we currently just treat each flow as a bunch of packets that
- *       we pass up. a better way would be to coalesce the packets
- *       into a jumbo packet. to do that, we need to do the following:
- *       1) the first packet will have a clean split between header and
- *          data. save both.
- *       2) each time the next flow packet comes in, extend the
- *          data length and merge the checksums.
- *       3) on flow release, fix up the header.
- *       4) make sure the higher layer doesn't care.
- * because packets get coalesced, we shouldn't run into fragment count
- * issues.
- */
-static inline void cas_rx_flow_pkt(struct cas *cp, const u64 *words,
-				   struct sk_buff *skb)
-{
-	int flowid = CAS_VAL(RX_COMP3_FLOWID, words[2]) & (N_RX_FLOWS - 1);
-	struct sk_buff_head *flow = &cp->rx_flows[flowid];
-
-	/* this is protected at a higher layer, so no need to
-	 * do any additional locking here. stick the buffer
-	 * at the end.
-	 */
-	__skb_queue_tail(flow, skb);
-	if (words[0] & RX_COMP1_RELEASE_FLOW) {
-		while ((skb = __skb_dequeue(flow))) {
-			cas_skb_release(skb);
-		}
-	}
-}
-
-/* put rx descriptor back on ring. if a buffer is in use by a higher
- * layer, this will need to put in a replacement.
- */
-static void cas_post_page(struct cas *cp, const int ring, const int index)
-{
-	cas_page_t *new;
-	int entry;
-
-	entry = cp->rx_old[ring];
-
-	new = cas_page_swap(cp, ring, index);
-	cp->init_rxds[ring][entry].buffer = cpu_to_le64(new->dma_addr);
-	cp->init_rxds[ring][entry].index  =
-		cpu_to_le64(CAS_BASE(RX_INDEX_NUM, index) |
-			    CAS_BASE(RX_INDEX_RING, ring));
-
-	entry = RX_DESC_ENTRY(ring, entry + 1);
-	cp->rx_old[ring] = entry;
-
-	if (entry % 4)
-		return;
-
-	if (ring == 0)
-		writel(entry, cp->regs + REG_RX_KICK);
-	else if ((N_RX_DESC_RINGS > 1) &&
-		 (cp->cas_flags & CAS_FLAG_REG_PLUS))
-		writel(entry, cp->regs + REG_PLUS_RX_KICK1);
-}
-
-
-/* only when things are bad */
-static int cas_post_rxds_ringN(struct cas *cp, int ring, int num)
-{
-	unsigned int entry, last, count, released;
-	int cluster;
-	cas_page_t **page = cp->rx_pages[ring];
-
-	entry = cp->rx_old[ring];
-
-	netif_printk(cp, intr, KERN_DEBUG, cp->dev,
-		     "rxd[%d] interrupt, done: %d\n", ring, entry);
-
-	cluster = -1;
-	count = entry & 0x3;
-	last = RX_DESC_ENTRY(ring, num ? entry + num - 4: entry - 4);
-	released = 0;
-	while (entry != last) {
-		/* make a new buffer if it's still in use */
-		if (page_count(page[entry]->buffer) > 1) {
-			cas_page_t *new = cas_page_dequeue(cp);
-			if (!new) {
-				/* let the timer know that we need to
-				 * do this again
-				 */
-				cp->cas_flags |= CAS_FLAG_RXD_POST(ring);
-				if (!timer_pending(&cp->link_timer))
-					mod_timer(&cp->link_timer, jiffies +
-						  CAS_LINK_FAST_TIMEOUT);
-				cp->rx_old[ring]  = entry;
-				cp->rx_last[ring] = num ? num - released : 0;
-				return -ENOMEM;
-			}
-			spin_lock(&cp->rx_inuse_lock);
-			list_add(&page[entry]->list, &cp->rx_inuse_list);
-			spin_unlock(&cp->rx_inuse_lock);
-			cp->init_rxds[ring][entry].buffer =
-				cpu_to_le64(new->dma_addr);
-			page[entry] = new;
-
-		}
-
-		if (++count == 4) {
-			cluster = entry;
-			count = 0;
-		}
-		released++;
-		entry = RX_DESC_ENTRY(ring, entry + 1);
-	}
-	cp->rx_old[ring] = entry;
-
-	if (cluster < 0)
-		return 0;
-
-	if (ring == 0)
-		writel(cluster, cp->regs + REG_RX_KICK);
-	else if ((N_RX_DESC_RINGS > 1) &&
-		 (cp->cas_flags & CAS_FLAG_REG_PLUS))
-		writel(cluster, cp->regs + REG_PLUS_RX_KICK1);
+	printf("Frontend set\n");
 	return 0;
 }
-
-
-/* process a completion ring. packets are set up in three basic ways:
- * small packets: should be copied header + data in single buffer.
- * large packets: header and data in a single buffer.
- * split packets: header in a separate buffer from data.
- *                data may be in multiple pages. data may be > 256
- *                bytes but in a single page.
- *
- * NOTE: RX page posting is done in this routine as well. while there's
- *       the capability of using multiple RX completion rings, it isn't
- *       really worthwhile due to the fact that the page posting will
- *       force serialization on the single descriptor ring.
- */
-static int cas_rx_ringN(struct cas *cp, int ring, int budget)
-{
-	struct cas_rx_comp *rxcs = cp->init_rxcs[ring];
-	int entry, drops;
-	int npackets = 0;
-
-	netif_printk(cp, intr, KERN_DEBUG, cp->dev,
-		     "rx[%d] interrupt, done: %d/%d\n",
-		     ring,
-		     readl(cp->regs + REG_RX_COMP_HEAD), cp->rx_new[ring]);
-
-	entry = cp->rx_new[ring];
-	drops = 0;
-	while (1) {
-		struct cas_rx_comp *rxc = rxcs + entry;
-		struct sk_buff *uninitialized_var(skb);
-		int type, len;
-		u64 words[4];
-		int i, dring;
-
-		words[0] = le64_to_cpu(rxc->word1);
-		words[1] = le64_to_cpu(rxc->word2);
-		words[2] = le64_to_cpu(rxc->word3);
-		words[3] = le64_to_cpu(rxc->word4);
-
-		/* don't touch if still owned by hw */
-		type = CAS_VAL(RX_COMP1_TYPE, words[0]);
-		if (type == 0)
-			break;
-
-		/* hw hasn't cleared the zero bit yet */
-		if (words[3] & RX_COMP4_ZERO) {
-			break;
-		}
-
-		/* get info on the packet */
-		if (words[3] & (RX_COMP4_LEN_MISMATCH | RX_COMP4_BAD)) {
-			spin_lock(&cp->stat_lock[ring]);
-			cp->net_stats[ring].rx_errors++;
-			if (words[3] & RX_COMP4_LEN_MISMATCH)
-				cp->net_stats[ring].rx_length_errors++;
-			if (words[3] & RX_COMP4_BAD)
-				cp->net_stats[ring].rx_crc_errors++;
-			spin_unlock(&cp->stat_lock[ring]);
-
-			/* We'll just return it to Cassini. */
-		drop_it:
-			spin_lock(&cp->stat_lock[ring]);
-			++cp->net_stats[ring].rx_dropped;
-			spin_unlock(&cp->stat_lock[ring]);
-			goto next;
-		}
-
-		len = cas_rx_process_pkt(cp, rxc, entry, words, &skb);
-		if (len < 0) {
-			++drops;
-			goto drop_it;
-		}
-
-		/* see if it's a flow re-assembly or not. the driver
-		 * itself handles release back up.
-		 */
-		if (RX_DONT_BATCH || (type == 0x2)) {
-			/* non-reassm: these always get released */
-			cas_skb_release(skb);
-		} else {
-			cas_rx_flow_pkt(cp, words, skb);
-		}
-
-		spin_lock(&cp->stat_lock[ring]);
-		cp->net_stats[ring].rx_packets++;
-		cp->net_stats[ring].rx_bytes += len;
-		spin_unlock(&cp->stat_lock[ring]);
-
-	next:
-		npackets++;
-
-		/* should it be released? */
-		if (words[0] & RX_COMP1_RELEASE_HDR) {
-			i = CAS_VAL(RX_COMP2_HDR_INDEX, words[1]);
-			dring = CAS_VAL(RX_INDEX_RING, i);
-			i = CAS_VAL(RX_INDEX_NUM, i);
-			cas_post_page(cp, dring, i);
-		}
-
-		if (words[0] & RX_COMP1_RELEASE_DATA) {
-			i = CAS_VAL(RX_COMP1_DATA_INDEX, words[0]);
-			dring = CAS_VAL(RX_INDEX_RING, i);
-			i = CAS_VAL(RX_INDEX_NUM, i);
-			cas_post_page(cp, dring, i);
-		}
-
-		if (words[0] & RX_COMP1_RELEASE_NEXT) {
-			i = CAS_VAL(RX_COMP2_NEXT_INDEX, words[1]);
-			dring = CAS_VAL(RX_INDEX_RING, i);
-			i = CAS_VAL(RX_INDEX_NUM, i);
-			cas_post_page(cp, dring, i);
-		}
-
-		/* skip to the next entry */
-		entry = RX_COMP_ENTRY(ring, entry + 1 +
-				      CAS_VAL(RX_COMP1_SKIP, words[0]));
-#ifdef USE_NAPI
-		if (budget && (npackets >= budget))
-			break;
-#endif
-	}
-	cp->rx_new[ring] = entry;
-
-	if (drops)
-		netdev_info(cp->dev, "Memory squeeze, deferring packet\n");
-	return npackets;
-}
-
-
-/* put completion entries back on the ring */
-static void cas_post_rxcs_ringN(struct net_device *dev,
-				struct cas *cp, int ring)
-{
-	struct cas_rx_comp *rxc = cp->init_rxcs[ring];
-	int last, entry;
-
-	last = cp->rx_cur[ring];
-	entry = cp->rx_new[ring];
-	netif_printk(cp, intr, KERN_DEBUG, dev,
-		     "rxc[%d] interrupt, done: %d/%d\n",
-		     ring, readl(cp->regs + REG_RX_COMP_HEAD), entry);
-
-	/* zero and re-mark descriptors */
-	while (last != entry) {
-		cas_rxc_init(rxc + last);
-		last = RX_COMP_ENTRY(ring, last + 1);
-	}
-	cp->rx_cur[ring] = last;
-
-	if (ring == 0)
-		writel(last, cp->regs + REG_RX_COMP_TAIL);
-	else if (cp->cas_flags & CAS_FLAG_REG_PLUS)
-		writel(last, cp->regs + REG_PLUS_RX_COMPN_TAIL(ring));
-}
-
-
-
-/* cassini can use all four PCI interrupts for the completion ring.
- * rings 3 and 4 are identical
- */
-#if defined(USE_PCI_INTC) || defined(USE_PCI_INTD)
-static inline void cas_handle_irqN(struct net_device *dev,
-				   struct cas *cp, const u32 status,
-				   const int ring)
-{
-	if (status & (INTR_RX_COMP_FULL_ALT | INTR_RX_COMP_AF_ALT))
-		cas_post_rxcs_ringN(dev, cp, ring);
-}
-
-static irqreturn_t cas_interruptN(int irq, void *dev_id)
-{
-	struct net_device *dev = dev_id;
-	struct cas *cp = netdev_priv(dev);
-	unsigned long flags;
-	int ring = (irq == cp->pci_irq_INTC) ? 2 : 3;
-	u32 status = readl(cp->regs + REG_PLUS_INTRN_STATUS(ring));
-
-	/* check for shared irq */
-	if (status == 0)
-		return IRQ_NONE;
-
-	spin_lock_irqsave(&cp->lock, flags);
-	if (status & INTR_RX_DONE_ALT) { /* handle rx separately */
-#ifdef USE_NAPI
-		cas_mask_intr(cp);
-		napi_schedule(&cp->napi);
-#else
-		cas_rx_ringN(cp, ring, 0);
-#endif
-		status &= ~INTR_RX_DONE_ALT;
-	}
-
-	if (status)
-		cas_handle_irqN(dev, cp, status, ring);
-	spin_unlock_irqrestore(&cp->lock, flags);
-	return IRQ_HANDLED;
-}
-#endif
-
-#ifdef USE_PCI_INTB
-/* everything but rx packets */
-static inline void cas_handle_irq1(struct cas *cp, const u32 status)
-{
-	if (status & INTR_RX_BUF_UNAVAIL_1) {
-		/* Frame arrived, no free RX buffers available.
-		 * NOTE: we can get this on a link transition. */
-		cas_post_rxds_ringN(cp, 1, 0);
-		spin_lock(&cp->stat_lock[1]);
-		cp->net_stats[1].rx_dropped++;
-		spin_unlock(&cp->stat_lock[1]);
-	}
-
-	if (status & INTR_RX_BUF_AE_1)
-		cas_post_rxds_ringN(cp, 1, RX_DESC_RINGN_SIZE(1) -
-				    RX_AE_FREEN_VAL(1));
-
-	if (status & (INTR_RX_COMP_AF | INTR_RX_COMP_FULL))
-		cas_post_rxcs_ringN(cp, 1);
-}
-
-/* ring 2 handles a few more events than 3 and 4 */
-static irqreturn_t cas_interrupt1(int irq, void *dev_id)
-{
-	struct net_device *dev = dev_id;
-	struct cas *cp = netdev_priv(dev);
-	unsigned long flags;
-	u32 status = readl(cp->regs + REG_PLUS_INTRN_STATUS(1));
-
-	/* check for shared interrupt */
-	if (status == 0)
-		return IRQ_NONE;
-
-	spin_lock_irqsave(&cp->lock, flags);
-	if (status & INTR_RX_DONE_ALT) { /* handle rx separately */
-#ifdef USE_NAPI
-		cas_mask_intr(cp);
-		napi_schedule(&cp->napi);
-#else
-		cas_rx_ringN(cp, 1, 0);
-#endif
-		status &= ~INTR_RX_DONE_ALT;
-	}
-	if (status)
-		cas_handle_irq1(cp, status);
-	spin_unlock_irqrestore(&cp->lock, flags);
-	return IRQ_HANDLED;
-}
-#endif
-
-static inline void cas_handle_irq(struct net_device *dev,
-				  struct cas *cp, const u32 status)
-{
-	/* housekeeping interrupts */
-	if (status & INTR_ERROR_MASK)
-		cas_abnormal_irq(dev, cp, status);
-
-	if (status & INTR_RX_BUF_UNAVAIL) {
-		/* Frame arrived, no free RX buffers available.
-		 * NOTE: we can get this on a link transition.
-		 */
-		cas_post_rxds_ringN(cp, 0, 0);
-		spin_lock(&cp->stat_lock[0]);
-		cp->net_stats[0].rx_dropped++;
-		spin_unlock(&cp->stat_lock[0]);
-	} else if (status & INTR_RX_BUF_AE) {
-		cas_post_rxds_ringN(cp, 0, RX_DESC_RINGN_SIZE(0) -
-				    RX_AE_FREEN_VAL(0));
-	}
-
-	if (status & (INTR_RX_COMP_AF | INTR_RX_COMP_FULL))
-		cas_post_rxcs_ringN(dev, cp, 0);
-}
-
-static irqreturn_t cas_interrupt(int irq, void *dev_id)
-{
-	struct net_device *dev = dev_id;
-	struct cas *cp = netdev_priv(dev);
-	unsigned long flags;
-	u32 status = readl(cp->regs + REG_INTR_STATUS);
-
-	if (status == 0)
-		return IRQ_NONE;
-
-	spin_lock_irqsave(&cp->lock, flags);
-	if (status & (INTR_TX_ALL | INTR_TX_INTME)) {
-		cas_tx(dev, cp, status);
-		status &= ~(INTR_TX_ALL | INTR_TX_INTME);
-	}
-
-	if (status & INTR_RX_DONE) {
-#ifdef USE_NAPI
-		cas_mask_intr(cp);
-		napi_schedule(&cp->napi);
-#else
-		cas_rx_ringN(cp, 0, 0);
-#endif
-		status &= ~INTR_RX_DONE;
-	}
-
-	if (status)
-		cas_handle_irq(dev, cp, status);
-	spin_unlock_irqrestore(&cp->lock, flags);
-	return IRQ_HANDLED;
-}
-
-
-#ifdef USE_NAPI
-static int cas_poll(struct napi_struct *napi, int budget)
-{
-	struct cas *cp = container_of(napi, struct cas, napi);
-	struct net_device *dev = cp->dev;
-	int i, enable_intr, credits;
-	u32 status = readl(cp->regs + REG_INTR_STATUS);
-	unsigned long flags;
-
-	spin_lock_irqsave(&cp->lock, flags);
-	cas_tx(dev, cp, status);
-	spin_unlock_irqrestore(&cp->lock, flags);
-
-	/* NAPI rx packets. we spread the credits across all of the
-	 * rxc rings
-	 *
-	 * to make sure we're fair with the work we loop through each
-	 * ring N_RX_COMP_RING times with a request of
-	 * budget / N_RX_COMP_RINGS
-	 */
-	enable_intr = 1;
-	credits = 0;
-	for (i = 0; i < N_RX_COMP_RINGS; i++) {
-		int j;
-		for (j = 0; j < N_RX_COMP_RINGS; j++) {
-			credits += cas_rx_ringN(cp, j, budget / N_RX_COMP_RINGS);
-			if (credits >= budget) {
-				enable_intr = 0;
-				goto rx_comp;
-			}
-		}
-	}
-
-rx_comp:
-	/* final rx completion */
-	spin_lock_irqsave(&cp->lock, flags);
-	if (status)
-		cas_handle_irq(dev, cp, status);
-
-#ifdef USE_PCI_INTB
-	if (N_RX_COMP_RINGS > 1) {
-		status = readl(cp->regs + REG_PLUS_INTRN_STATUS(1));
-		if (status)
-			cas_handle_irq1(dev, cp, status);
-	}
-#endif
-
-#ifdef USE_PCI_INTC
-	if (N_RX_COMP_RINGS > 2) {
-		status = readl(cp->regs + REG_PLUS_INTRN_STATUS(2));
-		if (status)
-			cas_handle_irqN(dev, cp, status, 2);
-	}
-#endif
-
-#ifdef USE_PCI_INTD
-	if (N_RX_COMP_RINGS > 3) {
-		status = readl(cp->regs + REG_PLUS_INTRN_STATUS(3));
-		if (status)
-			cas_handle_irqN(dev, cp, status, 3);
-	}
-#endif
-	spin_unlock_irqrestore(&cp->lock, flags);
-	if (enable_intr) {
-		napi_complete(napi);
-		cas_unmask_intr(cp);
-	}
-	return credits;
-}
-#endif
-
-#ifdef CONFIG_NET_POLL_CONTROLLER
-static void cas_netpoll(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-
-	cas_disable_irq(cp, 0);
-	cas_interrupt(cp->pdev->irq, dev);
-	cas_enable_irq(cp, 0);
-
-#ifdef USE_PCI_INTB
-	if (N_RX_COMP_RINGS > 1) {
-		/* cas_interrupt1(); */
-	}
-#endif
-#ifdef USE_PCI_INTC
-	if (N_RX_COMP_RINGS > 2) {
-		/* cas_interruptN(); */
-	}
-#endif
-#ifdef USE_PCI_INTD
-	if (N_RX_COMP_RINGS > 3) {
-		/* cas_interruptN(); */
-	}
-#endif
-}
-#endif
-
-static void cas_tx_timeout(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-
-	netdev_err(dev, "transmit timed out, resetting\n");
-	if (!cp->hw_running) {
-		netdev_err(dev, "hrm.. hw not running!\n");
-		return;
-	}
-
-	netdev_err(dev, "MIF_STATE[%08x]\n",
-		   readl(cp->regs + REG_MIF_STATE_MACHINE));
-
-	netdev_err(dev, "MAC_STATE[%08x]\n",
-		   readl(cp->regs + REG_MAC_STATE_MACHINE));
-
-	netdev_err(dev, "TX_STATE[%08x:%08x:%08x] FIFO[%08x:%08x:%08x] SM1[%08x] SM2[%08x]\n",
-		   readl(cp->regs + REG_TX_CFG),
-		   readl(cp->regs + REG_MAC_TX_STATUS),
-		   readl(cp->regs + REG_MAC_TX_CFG),
-		   readl(cp->regs + REG_TX_FIFO_PKT_CNT),
-		   readl(cp->regs + REG_TX_FIFO_WRITE_PTR),
-		   readl(cp->regs + REG_TX_FIFO_READ_PTR),
-		   readl(cp->regs + REG_TX_SM_1),
-		   readl(cp->regs + REG_TX_SM_2));
-
-	netdev_err(dev, "RX_STATE[%08x:%08x:%08x]\n",
-		   readl(cp->regs + REG_RX_CFG),
-		   readl(cp->regs + REG_MAC_RX_STATUS),
-		   readl(cp->regs + REG_MAC_RX_CFG));
-
-	netdev_err(dev, "HP_STATE[%08x:%08x:%08x:%08x]\n",
-		   readl(cp->regs + REG_HP_STATE_MACHINE),
-		   readl(cp->regs + REG_HP_STATUS0),
-		   readl(cp->regs + REG_HP_STATUS1),
-		   readl(cp->regs + REG_HP_STATUS2));
-
-#if 1
-	atomic_inc(&cp->reset_task_pending);
-	atomic_inc(&cp->reset_task_pending_all);
-	schedule_work(&cp->reset_task);
-#else
-	atomic_set(&cp->reset_task_pending, CAS_RESET_ALL);
-	schedule_work(&cp->reset_task);
-#endif
-}
-
-static inline int cas_intme(int ring, int entry)
-{
-	/* Algorithm: IRQ every 1/2 of descriptors. */
-	if (!(entry & ((TX_DESC_RINGN_SIZE(ring) >> 1) - 1)))
-		return 1;
-	return 0;
-}
-
-
-static void cas_write_txd(struct cas *cp, int ring, int entry,
-			  dma_addr_t mapping, int len, u64 ctrl, int last)
-{
-	struct cas_tx_desc *txd = cp->init_txds[ring] + entry;
-
-	ctrl |= CAS_BASE(TX_DESC_BUFLEN, len);
-	if (cas_intme(ring, entry))
-		ctrl |= TX_DESC_INTME;
-	if (last)
-		ctrl |= TX_DESC_EOF;
-	txd->control = cpu_to_le64(ctrl);
-	txd->buffer = cpu_to_le64(mapping);
-}
-
-static inline void *tx_tiny_buf(struct cas *cp, const int ring,
-				const int entry)
-{
-	return cp->tx_tiny_bufs[ring] + TX_TINY_BUF_LEN*entry;
-}
-
-static inline dma_addr_t tx_tiny_map(struct cas *cp, const int ring,
-				     const int entry, const int tentry)
-{
-	cp->tx_tiny_use[ring][tentry].nbufs++;
-	cp->tx_tiny_use[ring][entry].used = 1;
-	return cp->tx_tiny_dvma[ring] + TX_TINY_BUF_LEN*entry;
-}
-
-static inline int cas_xmit_tx_ringN(struct cas *cp, int ring,
-				    struct sk_buff *skb)
-{
-	struct net_device *dev = cp->dev;
-	int entry, nr_frags, frag, tabort, tentry;
-	dma_addr_t mapping;
-	unsigned long flags;
-	u64 ctrl;
-	u32 len;
-
-	spin_lock_irqsave(&cp->tx_lock[ring], flags);
-
-	/* This is a hard error, log it. */
-	if (TX_BUFFS_AVAIL(cp, ring) <=
-	    CAS_TABORT(cp)*(skb_shinfo(skb)->nr_frags + 1)) {
-		netif_stop_queue(dev);
-		spin_unlock_irqrestore(&cp->tx_lock[ring], flags);
-		netdev_err(dev, "BUG! Tx Ring full when queue awake!\n");
-		return 1;
-	}
-
-	ctrl = 0;
-	if (skb->ip_summed == CHECKSUM_PARTIAL) {
-		const u64 csum_start_off = skb_checksum_start_offset(skb);
-		const u64 csum_stuff_off = csum_start_off + skb->csum_offset;
-
-		ctrl =  TX_DESC_CSUM_EN |
-			CAS_BASE(TX_DESC_CSUM_START, csum_start_off) |
-			CAS_BASE(TX_DESC_CSUM_STUFF, csum_stuff_off);
-	}
-
-	entry = cp->tx_new[ring];
-	cp->tx_skbs[ring][entry] = skb;
-
-	nr_frags = skb_shinfo(skb)->nr_frags;
-	len = skb_headlen(skb);
-	mapping = pci_map_page(cp->pdev, virt_to_page(skb->data),
-			       offset_in_page(skb->data), len,
-			       PCI_DMA_TODEVICE);
-
-	tentry = entry;
-	tabort = cas_calc_tabort(cp, (unsigned long) skb->data, len);
-	if (unlikely(tabort)) {
-		/* NOTE: len is always >  tabort */
-		cas_write_txd(cp, ring, entry, mapping, len - tabort,
-			      ctrl | TX_DESC_SOF, 0);
-		entry = TX_DESC_NEXT(ring, entry);
-
-		skb_copy_from_linear_data_offset(skb, len - tabort,
-			      tx_tiny_buf(cp, ring, entry), tabort);
-		mapping = tx_tiny_map(cp, ring, entry, tentry);
-		cas_write_txd(cp, ring, entry, mapping, tabort, ctrl,
-			      (nr_frags == 0));
-	} else {
-		cas_write_txd(cp, ring, entry, mapping, len, ctrl |
-			      TX_DESC_SOF, (nr_frags == 0));
-	}
-	entry = TX_DESC_NEXT(ring, entry);
-
-	for (frag = 0; frag < nr_frags; frag++) {
-		const skb_frag_t *fragp = &skb_shinfo(skb)->frags[frag];
-
-		len = skb_frag_size(fragp);
-		mapping = skb_frag_dma_map(&cp->pdev->dev, fragp, 0, len,
-					   DMA_TO_DEVICE);
-
-		tabort = cas_calc_tabort(cp, fragp->page_offset, len);
-		if (unlikely(tabort)) {
-			void *addr;
-
-			/* NOTE: len is always > tabort */
-			cas_write_txd(cp, ring, entry, mapping, len - tabort,
-				      ctrl, 0);
-			entry = TX_DESC_NEXT(ring, entry);
-
-			addr = cas_page_map(skb_frag_page(fragp));
-			memcpy(tx_tiny_buf(cp, ring, entry),
-			       addr + fragp->page_offset + len - tabort,
-			       tabort);
-			cas_page_unmap(addr);
-			mapping = tx_tiny_map(cp, ring, entry, tentry);
-			len     = tabort;
-		}
-
-		cas_write_txd(cp, ring, entry, mapping, len, ctrl,
-			      (frag + 1 == nr_frags));
-		entry = TX_DESC_NEXT(ring, entry);
-	}
-
-	cp->tx_new[ring] = entry;
-	if (TX_BUFFS_AVAIL(cp, ring) <= CAS_TABORT(cp)*(MAX_SKB_FRAGS + 1))
-		netif_stop_queue(dev);
-
-	netif_printk(cp, tx_queued, KERN_DEBUG, dev,
-		     "tx[%d] queued, slot %d, skblen %d, avail %d\n",
-		     ring, entry, skb->len, TX_BUFFS_AVAIL(cp, ring));
-	writel(entry, cp->regs + REG_TX_KICKN(ring));
-	spin_unlock_irqrestore(&cp->tx_lock[ring], flags);
-	return 0;
-}
-
-static netdev_tx_t cas_start_xmit(struct sk_buff *skb, struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-
-	/* this is only used as a load-balancing hint, so it doesn't
-	 * need to be SMP safe
-	 */
-	static int ring;
-
-	if (skb_padto(skb, cp->min_frame_size))
-		return NETDEV_TX_OK;
-
-	/* XXX: we need some higher-level QoS hooks to steer packets to
-	 *      individual queues.
-	 */
-	if (cas_xmit_tx_ringN(cp, ring++ & N_TX_RINGS_MASK, skb))
-		return NETDEV_TX_BUSY;
-	return NETDEV_TX_OK;
-}
-
-static void cas_init_tx_dma(struct cas *cp)
-{
-	u64 desc_dma = cp->block_dvma;
-	unsigned long off;
-	u32 val;
-	int i;
-
-	/* set up tx completion writeback registers. must be 8-byte aligned */
-#ifdef USE_TX_COMPWB
-	off = offsetof(struct cas_init_block, tx_compwb);
-	writel((desc_dma + off) >> 32, cp->regs + REG_TX_COMPWB_DB_HI);
-	writel((desc_dma + off) & 0xffffffff, cp->regs + REG_TX_COMPWB_DB_LOW);
-#endif
-
-	/* enable completion writebacks, enable paced mode,
-	 * disable read pipe, and disable pre-interrupt compwbs
-	 */
-	val =   TX_CFG_COMPWB_Q1 | TX_CFG_COMPWB_Q2 |
-		TX_CFG_COMPWB_Q3 | TX_CFG_COMPWB_Q4 |
-		TX_CFG_DMA_RDPIPE_DIS | TX_CFG_PACED_MODE |
-		TX_CFG_INTR_COMPWB_DIS;
-
-	/* write out tx ring info and tx desc bases */
-	for (i = 0; i < MAX_TX_RINGS; i++) {
-		off = (unsigned long) cp->init_txds[i] -
-			(unsigned long) cp->init_block;
-
-		val |= CAS_TX_RINGN_BASE(i);
-		writel((desc_dma + off) >> 32, cp->regs + REG_TX_DBN_HI(i));
-		writel((desc_dma + off) & 0xffffffff, cp->regs +
-		       REG_TX_DBN_LOW(i));
-		/* don't zero out the kick register here as the system
-		 * will wedge
-		 */
-	}
-	writel(val, cp->regs + REG_TX_CFG);
-
-	/* program max burst sizes. these numbers should be different
-	 * if doing QoS.
-	 */
-#ifdef USE_QOS
-	writel(0x800, cp->regs + REG_TX_MAXBURST_0);
-	writel(0x1600, cp->regs + REG_TX_MAXBURST_1);
-	writel(0x2400, cp->regs + REG_TX_MAXBURST_2);
-	writel(0x4800, cp->regs + REG_TX_MAXBURST_3);
-#else
-	writel(0x800, cp->regs + REG_TX_MAXBURST_0);
-	writel(0x800, cp->regs + REG_TX_MAXBURST_1);
-	writel(0x800, cp->regs + REG_TX_MAXBURST_2);
-	writel(0x800, cp->regs + REG_TX_MAXBURST_3);
-#endif
-}
-
-/* Must be invoked under cp->lock. */
-static inline void cas_init_dma(struct cas *cp)
-{
-	cas_init_tx_dma(cp);
-	cas_init_rx_dma(cp);
-}
-
-static void cas_process_mc_list(struct cas *cp)
-{
-	u16 hash_table[16];
-	u32 crc;
-	struct netdev_hw_addr *ha;
-	int i = 1;
-
-	memset(hash_table, 0, sizeof(hash_table));
-	netdev_for_each_mc_addr(ha, cp->dev) {
-		if (i <= CAS_MC_EXACT_MATCH_SIZE) {
-			/* use the alternate mac address registers for the
-			 * first 15 multicast addresses
-			 */
-			writel((ha->addr[4] << 8) | ha->addr[5],
-			       cp->regs + REG_MAC_ADDRN(i*3 + 0));
-			writel((ha->addr[2] << 8) | ha->addr[3],
-			       cp->regs + REG_MAC_ADDRN(i*3 + 1));
-			writel((ha->addr[0] << 8) | ha->addr[1],
-			       cp->regs + REG_MAC_ADDRN(i*3 + 2));
-			i++;
-		}
-		else {
-			/* use hw hash table for the next series of
-			 * multicast addresses
-			 */
-			crc = ether_crc_le(ETH_ALEN, ha->addr);
-			crc >>= 24;
-			hash_table[crc >> 4] |= 1 << (15 - (crc & 0xf));
-		}
-	}
-	for (i = 0; i < 16; i++)
-		writel(hash_table[i], cp->regs + REG_MAC_HASH_TABLEN(i));
-}
-
-/* Must be invoked under cp->lock. */
-static u32 cas_setup_multicast(struct cas *cp)
-{
-	u32 rxcfg = 0;
-	int i;
-
-	if (cp->dev->flags & IFF_PROMISC) {
-		rxcfg |= MAC_RX_CFG_PROMISC_EN;
-
-	} else if (cp->dev->flags & IFF_ALLMULTI) {
-	    	for (i=0; i < 16; i++)
-			writel(0xFFFF, cp->regs + REG_MAC_HASH_TABLEN(i));
-		rxcfg |= MAC_RX_CFG_HASH_FILTER_EN;
-
-	} else {
-		cas_process_mc_list(cp);
-		rxcfg |= MAC_RX_CFG_HASH_FILTER_EN;
-	}
-
-	return rxcfg;
-}
-
-/* must be invoked under cp->stat_lock[N_TX_RINGS] */
-static void cas_clear_mac_err(struct cas *cp)
-{
-	writel(0, cp->regs + REG_MAC_COLL_NORMAL);
-	writel(0, cp->regs + REG_MAC_COLL_FIRST);
-	writel(0, cp->regs + REG_MAC_COLL_EXCESS);
-	writel(0, cp->regs + REG_MAC_COLL_LATE);
-	writel(0, cp->regs + REG_MAC_TIMER_DEFER);
-	writel(0, cp->regs + REG_MAC_ATTEMPTS_PEAK);
-	writel(0, cp->regs + REG_MAC_RECV_FRAME);
-	writel(0, cp->regs + REG_MAC_LEN_ERR);
-	writel(0, cp->regs + REG_MAC_ALIGN_ERR);
-	writel(0, cp->regs + REG_MAC_FCS_ERR);
-	writel(0, cp->regs + REG_MAC_RX_CODE_ERR);
-}
-
-
-static void cas_mac_reset(struct cas *cp)
-{
-	int i;
-
-	/* do both TX and RX reset */
-	writel(0x1, cp->regs + REG_MAC_TX_RESET);
-	writel(0x1, cp->regs + REG_MAC_RX_RESET);
-
-	/* wait for TX */
-	i = STOP_TRIES;
-	while (i-- > 0) {
-		if (readl(cp->regs + REG_MAC_TX_RESET) == 0)
-			break;
-		udelay(10);
-	}
-
-	/* wait for RX */
-	i = STOP_TRIES;
-	while (i-- > 0) {
-		if (readl(cp->regs + REG_MAC_RX_RESET) == 0)
-			break;
-		udelay(10);
-	}
-
-	if (readl(cp->regs + REG_MAC_TX_RESET) |
-	    readl(cp->regs + REG_MAC_RX_RESET))
-		netdev_err(cp->dev, "mac tx[%d]/rx[%d] reset failed [%08x]\n",
-			   readl(cp->regs + REG_MAC_TX_RESET),
-			   readl(cp->regs + REG_MAC_RX_RESET),
-			   readl(cp->regs + REG_MAC_STATE_MACHINE));
-}
-
-
-/* Must be invoked under cp->lock. */
-static void cas_init_mac(struct cas *cp)
-{
-	unsigned char *e = &cp->dev->dev_addr[0];
-	int i;
-	cas_mac_reset(cp);
-
-	/* setup core arbitration weight register */
-	writel(CAWR_RR_DIS, cp->regs + REG_CAWR);
-
-#if !defined(CONFIG_SPARC64) && !defined(CONFIG_ALPHA)
-	/* set the infinite burst register for chips that don't have
-	 * pci issues.
-	 */
-	if ((cp->cas_flags & CAS_FLAG_TARGET_ABORT) == 0)
-		writel(INF_BURST_EN, cp->regs + REG_INF_BURST);
-#endif
-
-	writel(0x1BF0, cp->regs + REG_MAC_SEND_PAUSE);
-
-	writel(0x00, cp->regs + REG_MAC_IPG0);
-	writel(0x08, cp->regs + REG_MAC_IPG1);
-	writel(0x04, cp->regs + REG_MAC_IPG2);
-
-	/* change later for 802.3z */
-	writel(0x40, cp->regs + REG_MAC_SLOT_TIME);
-
-	/* min frame + FCS */
-	writel(ETH_ZLEN + 4, cp->regs + REG_MAC_FRAMESIZE_MIN);
-
-	/* Ethernet payload + header + FCS + optional VLAN tag. NOTE: we
-	 * specify the maximum frame size to prevent RX tag errors on
-	 * oversized frames.
-	 */
-	writel(CAS_BASE(MAC_FRAMESIZE_MAX_BURST, 0x2000) |
-	       CAS_BASE(MAC_FRAMESIZE_MAX_FRAME,
-			(CAS_MAX_MTU + ETH_HLEN + 4 + 4)),
-	       cp->regs + REG_MAC_FRAMESIZE_MAX);
-
-	/* NOTE: crc_size is used as a surrogate for half-duplex.
-	 * workaround saturn half-duplex issue by increasing preamble
-	 * size to 65 bytes.
-	 */
-	if ((cp->cas_flags & CAS_FLAG_SATURN) && cp->crc_size)
-		writel(0x41, cp->regs + REG_MAC_PA_SIZE);
-	else
-		writel(0x07, cp->regs + REG_MAC_PA_SIZE);
-	writel(0x04, cp->regs + REG_MAC_JAM_SIZE);
-	writel(0x10, cp->regs + REG_MAC_ATTEMPT_LIMIT);
-	writel(0x8808, cp->regs + REG_MAC_CTRL_TYPE);
-
-	writel((e[5] | (e[4] << 8)) & 0x3ff, cp->regs + REG_MAC_RANDOM_SEED);
-
-	writel(0, cp->regs + REG_MAC_ADDR_FILTER0);
-	writel(0, cp->regs + REG_MAC_ADDR_FILTER1);
-	writel(0, cp->regs + REG_MAC_ADDR_FILTER2);
-	writel(0, cp->regs + REG_MAC_ADDR_FILTER2_1_MASK);
-	writel(0, cp->regs + REG_MAC_ADDR_FILTER0_MASK);
-
-	/* setup mac address in perfect filter array */
-	for (i = 0; i < 45; i++)
-		writel(0x0, cp->regs + REG_MAC_ADDRN(i));
-
-	writel((e[4] << 8) | e[5], cp->regs + REG_MAC_ADDRN(0));
-	writel((e[2] << 8) | e[3], cp->regs + REG_MAC_ADDRN(1));
-	writel((e[0] << 8) | e[1], cp->regs + REG_MAC_ADDRN(2));
-
-	writel(0x0001, cp->regs + REG_MAC_ADDRN(42));
-	writel(0xc200, cp->regs + REG_MAC_ADDRN(43));
-	writel(0x0180, cp->regs + REG_MAC_ADDRN(44));
-
-	cp->mac_rx_cfg = cas_setup_multicast(cp);
-
-	spin_lock(&cp->stat_lock[N_TX_RINGS]);
-	cas_clear_mac_err(cp);
-	spin_unlock(&cp->stat_lock[N_TX_RINGS]);
-
-	/* Setup MAC interrupts.  We want to get all of the interesting
-	 * counter expiration events, but we do not want to hear about
-	 * normal rx/tx as the DMA engine tells us that.
-	 */
-	writel(MAC_TX_FRAME_XMIT, cp->regs + REG_MAC_TX_MASK);
-	writel(MAC_RX_FRAME_RECV, cp->regs + REG_MAC_RX_MASK);
-
-	/* Don't enable even the PAUSE interrupts for now, we
-	 * make no use of those events other than to record them.
-	 */
-	writel(0xffffffff, cp->regs + REG_MAC_CTRL_MASK);
-}
-
-/* Must be invoked under cp->lock. */
-static void cas_init_pause_thresholds(struct cas *cp)
-{
-	/* Calculate pause thresholds.  Setting the OFF threshold to the
-	 * full RX fifo size effectively disables PAUSE generation
-	 */
-	if (cp->rx_fifo_size <= (2 * 1024)) {
-		cp->rx_pause_off = cp->rx_pause_on = cp->rx_fifo_size;
-	} else {
-		int max_frame = (cp->dev->mtu + ETH_HLEN + 4 + 4 + 64) & ~63;
-		if (max_frame * 3 > cp->rx_fifo_size) {
-			cp->rx_pause_off = 7104;
-			cp->rx_pause_on  = 960;
-		} else {
-			int off = (cp->rx_fifo_size - (max_frame * 2));
-			int on = off - max_frame;
-			cp->rx_pause_off = off;
-			cp->rx_pause_on = on;
-		}
-	}
-}
-
-static int cas_vpd_match(const void __iomem *p, const char *str)
-{
-	int len = strlen(str) + 1;
-	int i;
-
-	for (i = 0; i < len; i++) {
-		if (readb(p + i) != str[i])
-			return 0;
-	}
-	return 1;
-}
-
-
-/* get the mac address by reading the vpd information in the rom.
- * also get the phy type and determine if there's an entropy generator.
- * NOTE: this is a bit convoluted for the following reasons:
- *  1) vpd info has order-dependent mac addresses for multinic cards
- *  2) the only way to determine the nic order is to use the slot
- *     number.
- *  3) fiber cards don't have bridges, so their slot numbers don't
- *     mean anything.
- *  4) we don't actually know we have a fiber card until after
- *     the mac addresses are parsed.
- */
-static int cas_get_vpd_info(struct cas *cp, unsigned char *dev_addr,
-			    const int offset)
-{
-	void __iomem *p = cp->regs + REG_EXPANSION_ROM_RUN_START;
-	void __iomem *base, *kstart;
-	int i, len;
-	int found = 0;
-#define VPD_FOUND_MAC        0x01
-#define VPD_FOUND_PHY        0x02
-
-	int phy_type = CAS_PHY_MII_MDIO0; /* default phy type */
-	int mac_off  = 0;
-
-#if defined(CONFIG_SPARC)
-	const unsigned char *addr;
-#endif
-
-	/* give us access to the PROM */
-	writel(BIM_LOCAL_DEV_PROM | BIM_LOCAL_DEV_PAD,
-	       cp->regs + REG_BIM_LOCAL_DEV_EN);
-
-	/* check for an expansion rom */
-	if (readb(p) != 0x55 || readb(p + 1) != 0xaa)
-		goto use_random_mac_addr;
-
-	/* search for beginning of vpd */
-	base = NULL;
-	for (i = 2; i < EXPANSION_ROM_SIZE; i++) {
-		/* check for PCIR */
-		if ((readb(p + i + 0) == 0x50) &&
-		    (readb(p + i + 1) == 0x43) &&
-		    (readb(p + i + 2) == 0x49) &&
-		    (readb(p + i + 3) == 0x52)) {
-			base = p + (readb(p + i + 8) |
-				    (readb(p + i + 9) << 8));
-			break;
-		}
-	}
-
-	if (!base || (readb(base) != 0x82))
-		goto use_random_mac_addr;
-
-	i = (readb(base + 1) | (readb(base + 2) << 8)) + 3;
-	while (i < EXPANSION_ROM_SIZE) {
-		if (readb(base + i) != 0x90) /* no vpd found */
-			goto use_random_mac_addr;
-
-		/* found a vpd field */
-		len = readb(base + i + 1) | (readb(base + i + 2) << 8);
-
-		/* extract keywords */
-		kstart = base + i + 3;
-		p = kstart;
-		while ((p - kstart) < len) {
-			int klen = readb(p + 2);
-			int j;
-			char type;
-
-			p += 3;
-
-			/* look for the following things:
-			 * -- correct length == 29
-			 * 3 (type) + 2 (size) +
-			 * 18 (strlen("local-mac-address") + 1) +
-			 * 6 (mac addr)
-			 * -- VPD Instance 'I'
-			 * -- VPD Type Bytes 'B'
-			 * -- VPD data length == 6
-			 * -- property string == local-mac-address
-			 *
-			 * -- correct length == 24
-			 * 3 (type) + 2 (size) +
-			 * 12 (strlen("entropy-dev") + 1) +
-			 * 7 (strlen("vms110") + 1)
-			 * -- VPD Instance 'I'
-			 * -- VPD Type String 'B'
-			 * -- VPD data length == 7
-			 * -- property string == entropy-dev
-			 *
-			 * -- correct length == 18
-			 * 3 (type) + 2 (size) +
-			 * 9 (strlen("phy-type") + 1) +
-			 * 4 (strlen("pcs") + 1)
-			 * -- VPD Instance 'I'
-			 * -- VPD Type String 'S'
-			 * -- VPD data length == 4
-			 * -- property string == phy-type
-			 *
-			 * -- correct length == 23
-			 * 3 (type) + 2 (size) +
-			 * 14 (strlen("phy-interface") + 1) +
-			 * 4 (strlen("pcs") + 1)
-			 * -- VPD Instance 'I'
-			 * -- VPD Type String 'S'
-			 * -- VPD data length == 4
-			 * -- property string == phy-interface
-			 */
-			if (readb(p) != 'I')
-				goto next;
-
-			/* finally, check string and length */
-			type = readb(p + 3);
-			if (type == 'B') {
-				if ((klen == 29) && readb(p + 4) == 6 &&
-				    cas_vpd_match(p + 5,
-						  "local-mac-address")) {
-					if (mac_off++ > offset)
-						goto next;
-
-					/* set mac address */
-					for (j = 0; j < 6; j++)
-						dev_addr[j] =
-							readb(p + 23 + j);
-					goto found_mac;
-				}
-			}
-
-			if (type != 'S')
-				goto next;
-
-#ifdef USE_ENTROPY_DEV
-			if ((klen == 24) &&
-			    cas_vpd_match(p + 5, "entropy-dev") &&
-			    cas_vpd_match(p + 17, "vms110")) {
-				cp->cas_flags |= CAS_FLAG_ENTROPY_DEV;
-				goto next;
-			}
-#endif
-
-			if (found & VPD_FOUND_PHY)
-				goto next;
-
-			if ((klen == 18) && readb(p + 4) == 4 &&
-			    cas_vpd_match(p + 5, "phy-type")) {
-				if (cas_vpd_match(p + 14, "pcs")) {
-					phy_type = CAS_PHY_SERDES;
-					goto found_phy;
-				}
-			}
-
-			if ((klen == 23) && readb(p + 4) == 4 &&
-			    cas_vpd_match(p + 5, "phy-interface")) {
-				if (cas_vpd_match(p + 19, "pcs")) {
-					phy_type = CAS_PHY_SERDES;
-					goto found_phy;
-				}
-			}
-found_mac:
-			found |= VPD_FOUND_MAC;
-			goto next;
-
-found_phy:
-			found |= VPD_FOUND_PHY;
-
-next:
-			p += klen;
-		}
-		i += len + 3;
-	}
-
-use_random_mac_addr:
-	if (found & VPD_FOUND_MAC)
-		goto done;
-
-#if defined(CONFIG_SPARC)
-	addr = of_get_property(cp->of_node, "local-mac-address", NULL);
-	if (addr != NULL) {
-		memcpy(dev_addr, addr, ETH_ALEN);
-		goto done;
-	}
-#endif
-
-	/* Sun MAC prefix then 3 random bytes. */
-	pr_info("MAC address not found in ROM VPD\n");
-	dev_addr[0] = 0x08;
-	dev_addr[1] = 0x00;
-	dev_addr[2] = 0x20;
-	get_random_bytes(dev_addr + 3, 3);
-
-done:
-	writel(0, cp->regs + REG_BIM_LOCAL_DEV_EN);
-	return phy_type;
-}
-
-/* check pci invariants */
-static void cas_check_pci_invariants(struct cas *cp)
-{
-	struct pci_dev *pdev = cp->pdev;
-
-	cp->cas_flags = 0;
-	if ((pdev->vendor == PCI_VENDOR_ID_SUN) &&
-	    (pdev->device == PCI_DEVICE_ID_SUN_CASSINI)) {
-		if (pdev->revision >= CAS_ID_REVPLUS)
-			cp->cas_flags |= CAS_FLAG_REG_PLUS;
-		if (pdev->revision < CAS_ID_REVPLUS02u)
-			cp->cas_flags |= CAS_FLAG_TARGET_ABORT;
-
-		/* Original Cassini supports HW CSUM, but it's not
-		 * enabled by default as it can trigger TX hangs.
-		 */
-		if (pdev->revision < CAS_ID_REV2)
-			cp->cas_flags |= CAS_FLAG_NO_HW_CSUM;
-	} else {
-		/* Only sun has original cassini chips.  */
-		cp->cas_flags |= CAS_FLAG_REG_PLUS;
-
-		/* We use a flag because the same phy might be externally
-		 * connected.
-		 */
-		if ((pdev->vendor == PCI_VENDOR_ID_NS) &&
-		    (pdev->device == PCI_DEVICE_ID_NS_SATURN))
-			cp->cas_flags |= CAS_FLAG_SATURN;
-	}
-}
-
-
-static int cas_check_invariants(struct cas *cp)
-{
-	struct pci_dev *pdev = cp->pdev;
-	u32 cfg;
-	int i;
-
-	/* get page size for rx buffers. */
-	cp->page_order = 0;
-#ifdef USE_PAGE_ORDER
-	if (PAGE_SHIFT < CAS_JUMBO_PAGE_SHIFT) {
-		/* see if we can allocate larger pages */
-		struct page *page = alloc_pages(GFP_ATOMIC,
-						CAS_JUMBO_PAGE_SHIFT -
-						PAGE_SHIFT);
-		if (page) {
-			__free_pages(page, CAS_JUMBO_PAGE_SHIFT - PAGE_SHIFT);
-			cp->page_order = CAS_JUMBO_PAGE_SHIFT - PAGE_SHIFT;
-		} else {
-			printk("MTU limited to %d bytes\n", CAS_MAX_MTU);
-		}
-	}
-#endif
-	cp->page_size = (PAGE_SIZE << cp->page_order);
-
-	/* Fetch the FIFO configurations. */
-	cp->tx_fifo_size = readl(cp->regs + REG_TX_FIFO_SIZE) * 64;
-	cp->rx_fifo_size = RX_FIFO_SIZE;
-
-	/* finish phy determination. MDIO1 takes precedence over MDIO0 if
-	 * they're both connected.
-	 */
-	cp->phy_type = cas_get_vpd_info(cp, cp->dev->dev_addr,
-					PCI_SLOT(pdev->devfn));
-	if (cp->phy_type & CAS_PHY_SERDES) {
-		cp->cas_flags |= CAS_FLAG_1000MB_CAP;
-		return 0; /* no more checking needed */
-	}
-
-	/* MII */
-	cfg = readl(cp->regs + REG_MIF_CFG);
-	if (cfg & MIF_CFG_MDIO_1) {
-		cp->phy_type = CAS_PHY_MII_MDIO1;
-	} else if (cfg & MIF_CFG_MDIO_0) {
-		cp->phy_type = CAS_PHY_MII_MDIO0;
-	}
-
-	cas_mif_poll(cp, 0);
-	writel(PCS_DATAPATH_MODE_MII, cp->regs + REG_PCS_DATAPATH_MODE);
-
-	for (i = 0; i < 32; i++) {
-		u32 phy_id;
-		int j;
-
-		for (j = 0; j < 3; j++) {
-			cp->phy_addr = i;
-			phy_id = cas_phy_read(cp, MII_PHYSID1) << 16;
-			phy_id |= cas_phy_read(cp, MII_PHYSID2);
-			if (phy_id && (phy_id != 0xFFFFFFFF)) {
-				cp->phy_id = phy_id;
-				goto done;
-			}
-		}
-	}
-	pr_err("MII phy did not respond [%08x]\n",
-	       readl(cp->regs + REG_MIF_STATE_MACHINE));
-	return -1;
-
-done:
-	/* see if we can do gigabit */
-	cfg = cas_phy_read(cp, MII_BMSR);
-	if ((cfg & CAS_BMSR_1000_EXTEND) &&
-	    cas_phy_read(cp, CAS_MII_1000_EXTEND))
-		cp->cas_flags |= CAS_FLAG_1000MB_CAP;
-	return 0;
-}
-
-/* Must be invoked under cp->lock. */
-static inline void cas_start_dma(struct cas *cp)
-{
-	int i;
-	u32 val;
-	int txfailed = 0;
-
-	/* enable dma */
-	val = readl(cp->regs + REG_TX_CFG) | TX_CFG_DMA_EN;
-	writel(val, cp->regs + REG_TX_CFG);
-	val = readl(cp->regs + REG_RX_CFG) | RX_CFG_DMA_EN;
-	writel(val, cp->regs + REG_RX_CFG);
-
-	/* enable the mac */
-	val = readl(cp->regs + REG_MAC_TX_CFG) | MAC_TX_CFG_EN;
-	writel(val, cp->regs + REG_MAC_TX_CFG);
-	val = readl(cp->regs + REG_MAC_RX_CFG) | MAC_RX_CFG_EN;
-	writel(val, cp->regs + REG_MAC_RX_CFG);
-
-	i = STOP_TRIES;
-	while (i-- > 0) {
-		val = readl(cp->regs + REG_MAC_TX_CFG);
-		if ((val & MAC_TX_CFG_EN))
-			break;
-		udelay(10);
-	}
-	if (i < 0) txfailed = 1;
-	i = STOP_TRIES;
-	while (i-- > 0) {
-		val = readl(cp->regs + REG_MAC_RX_CFG);
-		if ((val & MAC_RX_CFG_EN)) {
-			if (txfailed) {
-				netdev_err(cp->dev,
-					   "enabling mac failed [tx:%08x:%08x]\n",
-					   readl(cp->regs + REG_MIF_STATE_MACHINE),
-					   readl(cp->regs + REG_MAC_STATE_MACHINE));
-			}
-			goto enable_rx_done;
-		}
-		udelay(10);
-	}
-	netdev_err(cp->dev, "enabling mac failed [%s:%08x:%08x]\n",
-		   (txfailed ? "tx,rx" : "rx"),
-		   readl(cp->regs + REG_MIF_STATE_MACHINE),
-		   readl(cp->regs + REG_MAC_STATE_MACHINE));
-
-enable_rx_done:
-	cas_unmask_intr(cp); /* enable interrupts */
-	writel(RX_DESC_RINGN_SIZE(0) - 4, cp->regs + REG_RX_KICK);
-	writel(0, cp->regs + REG_RX_COMP_TAIL);
-
-	if (cp->cas_flags & CAS_FLAG_REG_PLUS) {
-		if (N_RX_DESC_RINGS > 1)
-			writel(RX_DESC_RINGN_SIZE(1) - 4,
-			       cp->regs + REG_PLUS_RX_KICK1);
-
-		for (i = 1; i < N_RX_COMP_RINGS; i++)
-			writel(0, cp->regs + REG_PLUS_RX_COMPN_TAIL(i));
-	}
-}
-
-/* Must be invoked under cp->lock. */
-static void cas_read_pcs_link_mode(struct cas *cp, int *fd, int *spd,
-				   int *pause)
-{
-	u32 val = readl(cp->regs + REG_PCS_MII_LPA);
-	*fd     = (val & PCS_MII_LPA_FD) ? 1 : 0;
-	*pause  = (val & PCS_MII_LPA_SYM_PAUSE) ? 0x01 : 0x00;
-	if (val & PCS_MII_LPA_ASYM_PAUSE)
-		*pause |= 0x10;
-	*spd = 1000;
-}
-
-/* Must be invoked under cp->lock. */
-static void cas_read_mii_link_mode(struct cas *cp, int *fd, int *spd,
-				   int *pause)
-{
-	u32 val;
-
-	*fd = 0;
-	*spd = 10;
-	*pause = 0;
-
-	/* use GMII registers */
-	val = cas_phy_read(cp, MII_LPA);
-	if (val & CAS_LPA_PAUSE)
-		*pause = 0x01;
-
-	if (val & CAS_LPA_ASYM_PAUSE)
-		*pause |= 0x10;
-
-	if (val & LPA_DUPLEX)
-		*fd = 1;
-	if (val & LPA_100)
-		*spd = 100;
-
-	if (cp->cas_flags & CAS_FLAG_1000MB_CAP) {
-		val = cas_phy_read(cp, CAS_MII_1000_STATUS);
-		if (val & (CAS_LPA_1000FULL | CAS_LPA_1000HALF))
-			*spd = 1000;
-		if (val & CAS_LPA_1000FULL)
-			*fd = 1;
-	}
-}
-
-/* A link-up condition has occurred, initialize and enable the
- * rest of the chip.
- *
- * Must be invoked under cp->lock.
- */
-static void cas_set_link_modes(struct cas *cp)
-{
-	u32 val;
-	int full_duplex, speed, pause;
-
-	full_duplex = 0;
-	speed = 10;
-	pause = 0;
-
-	if (CAS_PHY_MII(cp->phy_type)) {
-		cas_mif_poll(cp, 0);
-		val = cas_phy_read(cp, MII_BMCR);
-		if (val & BMCR_ANENABLE) {
-			cas_read_mii_link_mode(cp, &full_duplex, &speed,
-					       &pause);
-		} else {
-			if (val & BMCR_FULLDPLX)
-				full_duplex = 1;
-
-			if (val & BMCR_SPEED100)
-				speed = 100;
-			else if (val & CAS_BMCR_SPEED1000)
-				speed = (cp->cas_flags & CAS_FLAG_1000MB_CAP) ?
-					1000 : 100;
-		}
-		cas_mif_poll(cp, 1);
-
-	} else {
-		val = readl(cp->regs + REG_PCS_MII_CTRL);
-		cas_read_pcs_link_mode(cp, &full_duplex, &speed, &pause);
-		if ((val & PCS_MII_AUTONEG_EN) == 0) {
-			if (val & PCS_MII_CTRL_DUPLEX)
-				full_duplex = 1;
-		}
-	}
-
-	netif_info(cp, link, cp->dev, "Link up at %d Mbps, %s-duplex\n",
-		   speed, full_duplex ? "full" : "half");
-
-	val = MAC_XIF_TX_MII_OUTPUT_EN | MAC_XIF_LINK_LED;
-	if (CAS_PHY_MII(cp->phy_type)) {
-		val |= MAC_XIF_MII_BUFFER_OUTPUT_EN;
-		if (!full_duplex)
-			val |= MAC_XIF_DISABLE_ECHO;
-	}
-	if (full_duplex)
-		val |= MAC_XIF_FDPLX_LED;
-	if (speed == 1000)
-		val |= MAC_XIF_GMII_MODE;
-	writel(val, cp->regs + REG_MAC_XIF_CFG);
-
-	/* deal with carrier and collision detect. */
-	val = MAC_TX_CFG_IPG_EN;
-	if (full_duplex) {
-		val |= MAC_TX_CFG_IGNORE_CARRIER;
-		val |= MAC_TX_CFG_IGNORE_COLL;
-	} else {
-#ifndef USE_CSMA_CD_PROTO
-		val |= MAC_TX_CFG_NEVER_GIVE_UP_EN;
-		val |= MAC_TX_CFG_NEVER_GIVE_UP_LIM;
-#endif
-	}
-	/* val now set up for REG_MAC_TX_CFG */
-
-	/* If gigabit and half-duplex, enable carrier extension
-	 * mode.  increase slot time to 512 bytes as well.
-	 * else, disable it and make sure slot time is 64 bytes.
-	 * also activate checksum bug workaround
-	 */
-	if ((speed == 1000) && !full_duplex) {
-		writel(val | MAC_TX_CFG_CARRIER_EXTEND,
-		       cp->regs + REG_MAC_TX_CFG);
-
-		val = readl(cp->regs + REG_MAC_RX_CFG);
-		val &= ~MAC_RX_CFG_STRIP_FCS; /* checksum workaround */
-		writel(val | MAC_RX_CFG_CARRIER_EXTEND,
-		       cp->regs + REG_MAC_RX_CFG);
-
-		writel(0x200, cp->regs + REG_MAC_SLOT_TIME);
-
-		cp->crc_size = 4;
-		/* minimum size gigabit frame at half duplex */
-		cp->min_frame_size = CAS_1000MB_MIN_FRAME;
-
-	} else {
-		writel(val, cp->regs + REG_MAC_TX_CFG);
-
-		/* checksum bug workaround. don't strip FCS when in
-		 * half-duplex mode
-		 */
-		val = readl(cp->regs + REG_MAC_RX_CFG);
-		if (full_duplex) {
-			val |= MAC_RX_CFG_STRIP_FCS;
-			cp->crc_size = 0;
-			cp->min_frame_size = CAS_MIN_MTU;
-		} else {
-			val &= ~MAC_RX_CFG_STRIP_FCS;
-			cp->crc_size = 4;
-			cp->min_frame_size = CAS_MIN_FRAME;
-		}
-		writel(val & ~MAC_RX_CFG_CARRIER_EXTEND,
-		       cp->regs + REG_MAC_RX_CFG);
-		writel(0x40, cp->regs + REG_MAC_SLOT_TIME);
-	}
-
-	if (netif_msg_link(cp)) {
-		if (pause & 0x01) {
-			netdev_info(cp->dev, "Pause is enabled (rxfifo: %d off: %d on: %d)\n",
-				    cp->rx_fifo_size,
-				    cp->rx_pause_off,
-				    cp->rx_pause_on);
-		} else if (pause & 0x10) {
-			netdev_info(cp->dev, "TX pause enabled\n");
-		} else {
-			netdev_info(cp->dev, "Pause is disabled\n");
-		}
-	}
-
-	val = readl(cp->regs + REG_MAC_CTRL_CFG);
-	val &= ~(MAC_CTRL_CFG_SEND_PAUSE_EN | MAC_CTRL_CFG_RECV_PAUSE_EN);
-	if (pause) { /* symmetric or asymmetric pause */
-		val |= MAC_CTRL_CFG_SEND_PAUSE_EN;
-		if (pause & 0x01) { /* symmetric pause */
-			val |= MAC_CTRL_CFG_RECV_PAUSE_EN;
-		}
-	}
-	writel(val, cp->regs + REG_MAC_CTRL_CFG);
-	cas_start_dma(cp);
-}
-
-/* Must be invoked under cp->lock. */
-static void cas_init_hw(struct cas *cp, int restart_link)
-{
-	if (restart_link)
-		cas_phy_init(cp);
-
-	cas_init_pause_thresholds(cp);
-	cas_init_mac(cp);
-	cas_init_dma(cp);
-
-	if (restart_link) {
-		/* Default aneg parameters */
-		cp->timer_ticks = 0;
-		cas_begin_auto_negotiation(cp, NULL);
-	} else if (cp->lstate == link_up) {
-		cas_set_link_modes(cp);
-		netif_carrier_on(cp->dev);
-	}
-}
-
-/* Must be invoked under cp->lock. on earlier cassini boards,
- * SOFT_0 is tied to PCI reset. we use this to force a pci reset,
- * let it settle out, and then restore pci state.
- */
-static void cas_hard_reset(struct cas *cp)
-{
-	writel(BIM_LOCAL_DEV_SOFT_0, cp->regs + REG_BIM_LOCAL_DEV_EN);
-	udelay(20);
-	pci_restore_state(cp->pdev);
-}
-
-
-static void cas_global_reset(struct cas *cp, int blkflag)
-{
-	int limit;
-
-	/* issue a global reset. don't use RSTOUT. */
-	if (blkflag && !CAS_PHY_MII(cp->phy_type)) {
-		/* For PCS, when the blkflag is set, we should set the
-		 * SW_REST_BLOCK_PCS_SLINK bit to prevent the results of
-		 * the last autonegotiation from being cleared.  We'll
-		 * need some special handling if the chip is set into a
-		 * loopback mode.
-		 */
-		writel((SW_RESET_TX | SW_RESET_RX | SW_RESET_BLOCK_PCS_SLINK),
-		       cp->regs + REG_SW_RESET);
-	} else {
-		writel(SW_RESET_TX | SW_RESET_RX, cp->regs + REG_SW_RESET);
-	}
-
-	/* need to wait at least 3ms before polling register */
-	mdelay(3);
-
-	limit = STOP_TRIES;
-	while (limit-- > 0) {
-		u32 val = readl(cp->regs + REG_SW_RESET);
-		if ((val & (SW_RESET_TX | SW_RESET_RX)) == 0)
-			goto done;
-		udelay(10);
-	}
-	netdev_err(cp->dev, "sw reset failed\n");
-
-done:
-	/* enable various BIM interrupts */
-	writel(BIM_CFG_DPAR_INTR_ENABLE | BIM_CFG_RMA_INTR_ENABLE |
-	       BIM_CFG_RTA_INTR_ENABLE, cp->regs + REG_BIM_CFG);
-
-	/* clear out pci error status mask for handled errors.
-	 * we don't deal with DMA counter overflows as they happen
-	 * all the time.
-	 */
-	writel(0xFFFFFFFFU & ~(PCI_ERR_BADACK | PCI_ERR_DTRTO |
-			       PCI_ERR_OTHER | PCI_ERR_BIM_DMA_WRITE |
-			       PCI_ERR_BIM_DMA_READ), cp->regs +
-	       REG_PCI_ERR_STATUS_MASK);
-
-	/* set up for MII by default to address mac rx reset timeout
-	 * issue
-	 */
-	writel(PCS_DATAPATH_MODE_MII, cp->regs + REG_PCS_DATAPATH_MODE);
-}
-
-static void cas_reset(struct cas *cp, int blkflag)
-{
-	u32 val;
-
-	cas_mask_intr(cp);
-	cas_global_reset(cp, blkflag);
-	cas_mac_reset(cp);
-	cas_entropy_reset(cp);
-
-	/* disable dma engines. */
-	val = readl(cp->regs + REG_TX_CFG);
-	val &= ~TX_CFG_DMA_EN;
-	writel(val, cp->regs + REG_TX_CFG);
-
-	val = readl(cp->regs + REG_RX_CFG);
-	val &= ~RX_CFG_DMA_EN;
-	writel(val, cp->regs + REG_RX_CFG);
-
-	/* program header parser */
-	if ((cp->cas_flags & CAS_FLAG_TARGET_ABORT) ||
-	    (&CAS_HP_ALT_FIRMWARE[0] == &cas_prog_null[0])) {
-		cas_load_firmware(cp, CAS_HP_FIRMWARE);
-	} else {
-		cas_load_firmware(cp, CAS_HP_ALT_FIRMWARE);
-	}
-
-	/* clear out error registers */
-	spin_lock(&cp->stat_lock[N_TX_RINGS]);
-	cas_clear_mac_err(cp);
-	spin_unlock(&cp->stat_lock[N_TX_RINGS]);
-}
-
-/* Shut down the chip, must be called with pm_mutex held.  */
-static void cas_shutdown(struct cas *cp)
-{
-	unsigned long flags;
-
-	/* Make us not-running to avoid timers respawning */
-	cp->hw_running = 0;
-
-	del_timer_sync(&cp->link_timer);
-
-	/* Stop the reset task */
-#if 0
-	while (atomic_read(&cp->reset_task_pending_mtu) ||
-	       atomic_read(&cp->reset_task_pending_spare) ||
-	       atomic_read(&cp->reset_task_pending_all))
-		schedule();
-
-#else
-	while (atomic_read(&cp->reset_task_pending))
-		schedule();
-#endif
-	/* Actually stop the chip */
-	cas_lock_all_save(cp, flags);
-	cas_reset(cp, 0);
-	if (cp->cas_flags & CAS_FLAG_SATURN)
-		cas_phy_powerdown(cp);
-	cas_unlock_all_restore(cp, flags);
-}
-
-static int cas_change_mtu(struct net_device *dev, int new_mtu)
-{
-	struct cas *cp = netdev_priv(dev);
-
-	if (new_mtu < CAS_MIN_MTU || new_mtu > CAS_MAX_MTU)
-		return -EINVAL;
-
-	dev->mtu = new_mtu;
-	if (!netif_running(dev) || !netif_device_present(dev))
-		return 0;
-
-	/* let the reset task handle it */
-#if 1
-	atomic_inc(&cp->reset_task_pending);
-	if ((cp->phy_type & CAS_PHY_SERDES)) {
-		atomic_inc(&cp->reset_task_pending_all);
-	} else {
-		atomic_inc(&cp->reset_task_pending_mtu);
-	}
-	schedule_work(&cp->reset_task);
-#else
-	atomic_set(&cp->reset_task_pending, (cp->phy_type & CAS_PHY_SERDES) ?
-		   CAS_RESET_ALL : CAS_RESET_MTU);
-	pr_err("reset called in cas_change_mtu\n");
-	schedule_work(&cp->reset_task);
-#endif
-
-	flush_work(&cp->reset_task);
-	return 0;
-}
-
-static void cas_clean_txd(struct cas *cp, int ring)
-{
-	struct cas_tx_desc *txd = cp->init_txds[ring];
-	struct sk_buff *skb, **skbs = cp->tx_skbs[ring];
-	u64 daddr, dlen;
-	int i, size;
-
-	size = TX_DESC_RINGN_SIZE(ring);
-	for (i = 0; i < size; i++) {
-		int frag;
-
-		if (skbs[i] == NULL)
-			continue;
-
-		skb = skbs[i];
-		skbs[i] = NULL;
-
-		for (frag = 0; frag <= skb_shinfo(skb)->nr_frags;  frag++) {
-			int ent = i & (size - 1);
-
-			/* first buffer is never a tiny buffer and so
-			 * needs to be unmapped.
-			 */
-			daddr = le64_to_cpu(txd[ent].buffer);
-			dlen  =  CAS_VAL(TX_DESC_BUFLEN,
-					 le64_to_cpu(txd[ent].control));
-			pci_unmap_page(cp->pdev, daddr, dlen,
-				       PCI_DMA_TODEVICE);
-
-			if (frag != skb_shinfo(skb)->nr_frags) {
-				i++;
-
-				/* next buffer might by a tiny buffer.
-				 * skip past it.
-				 */
-				ent = i & (size - 1);
-				if (cp->tx_tiny_use[ring][ent].used)
-					i++;
-			}
-		}
-		dev_kfree_skb_any(skb);
-	}
-
-	/* zero out tiny buf usage */
-	memset(cp->tx_tiny_use[ring], 0, size*sizeof(*cp->tx_tiny_use[ring]));
-}
-
-/* freed on close */
-static inline void cas_free_rx_desc(struct cas *cp, int ring)
-{
-	cas_page_t **page = cp->rx_pages[ring];
-	int i, size;
-
-	size = RX_DESC_RINGN_SIZE(ring);
-	for (i = 0; i < size; i++) {
-		if (page[i]) {
-			cas_page_free(cp, page[i]);
-			page[i] = NULL;
-		}
-	}
-}
-
-static void cas_free_rxds(struct cas *cp)
-{
-	int i;
-
-	for (i = 0; i < N_RX_DESC_RINGS; i++)
-		cas_free_rx_desc(cp, i);
-}
-
-/* Must be invoked under cp->lock. */
-static void cas_clean_rings(struct cas *cp)
-{
-	int i;
-
-	/* need to clean all tx rings */
-	memset(cp->tx_old, 0, sizeof(*cp->tx_old)*N_TX_RINGS);
-	memset(cp->tx_new, 0, sizeof(*cp->tx_new)*N_TX_RINGS);
-	for (i = 0; i < N_TX_RINGS; i++)
-		cas_clean_txd(cp, i);
-
-	/* zero out init block */
-	memset(cp->init_block, 0, sizeof(struct cas_init_block));
-	cas_clean_rxds(cp);
-	cas_clean_rxcs(cp);
-}
-
-/* allocated on open */
-static inline int cas_alloc_rx_desc(struct cas *cp, int ring)
-{
-	cas_page_t **page = cp->rx_pages[ring];
-	int size, i = 0;
-
-	size = RX_DESC_RINGN_SIZE(ring);
-	for (i = 0; i < size; i++) {
-		if ((page[i] = cas_page_alloc(cp, GFP_KERNEL)) == NULL)
-			return -1;
-	}
-	return 0;
-}
-
-static int cas_alloc_rxds(struct cas *cp)
-{
-	int i;
-
-	for (i = 0; i < N_RX_DESC_RINGS; i++) {
-		if (cas_alloc_rx_desc(cp, i) < 0) {
-			cas_free_rxds(cp);
-			return -1;
-		}
-	}
-	return 0;
-}
-
-static void cas_reset_task(struct work_struct *work)
-{
-	struct cas *cp = container_of(work, struct cas, reset_task);
-#if 0
-	int pending = atomic_read(&cp->reset_task_pending);
-#else
-	int pending_all = atomic_read(&cp->reset_task_pending_all);
-	int pending_spare = atomic_read(&cp->reset_task_pending_spare);
-	int pending_mtu = atomic_read(&cp->reset_task_pending_mtu);
-
-	if (pending_all == 0 && pending_spare == 0 && pending_mtu == 0) {
-		/* We can have more tasks scheduled than actually
-		 * needed.
-		 */
-		atomic_dec(&cp->reset_task_pending);
-		return;
-	}
-#endif
-	/* The link went down, we reset the ring, but keep
-	 * DMA stopped. Use this function for reset
-	 * on error as well.
-	 */
-	if (cp->hw_running) {
-		unsigned long flags;
-
-		/* Make sure we don't get interrupts or tx packets */
-		netif_device_detach(cp->dev);
-		cas_lock_all_save(cp, flags);
-
-		if (cp->opened) {
-			/* We call cas_spare_recover when we call cas_open.
-			 * but we do not initialize the lists cas_spare_recover
-			 * uses until cas_open is called.
-			 */
-			cas_spare_recover(cp, GFP_ATOMIC);
-		}
-#if 1
-		/* test => only pending_spare set */
-		if (!pending_all && !pending_mtu)
-			goto done;
-#else
-		if (pending == CAS_RESET_SPARE)
-			goto done;
-#endif
-		/* when pending == CAS_RESET_ALL, the following
-		 * call to cas_init_hw will restart auto negotiation.
-		 * Setting the second argument of cas_reset to
-		 * !(pending == CAS_RESET_ALL) will set this argument
-		 * to 1 (avoiding reinitializing the PHY for the normal
-		 * PCS case) when auto negotiation is not restarted.
-		 */
-#if 1
-		cas_reset(cp, !(pending_all > 0));
-		if (cp->opened)
-			cas_clean_rings(cp);
-		cas_init_hw(cp, (pending_all > 0));
-#else
-		cas_reset(cp, !(pending == CAS_RESET_ALL));
-		if (cp->opened)
-			cas_clean_rings(cp);
-		cas_init_hw(cp, pending == CAS_RESET_ALL);
-#endif
-
-done:
-		cas_unlock_all_restore(cp, flags);
-		netif_device_attach(cp->dev);
-	}
-#if 1
-	atomic_sub(pending_all, &cp->reset_task_pending_all);
-	atomic_sub(pending_spare, &cp->reset_task_pending_spare);
-	atomic_sub(pending_mtu, &cp->reset_task_pending_mtu);
-	atomic_dec(&cp->reset_task_pending);
-#else
-	atomic_set(&cp->reset_task_pending, 0);
-#endif
-}
-
-static void cas_link_timer(unsigned long data)
-{
-	struct cas *cp = (struct cas *) data;
-	int mask, pending = 0, reset = 0;
-	unsigned long flags;
-
-	if (link_transition_timeout != 0 &&
-	    cp->link_transition_jiffies_valid &&
-	    ((jiffies - cp->link_transition_jiffies) >
-	      (link_transition_timeout))) {
-		/* One-second counter so link-down workaround doesn't
-		 * cause resets to occur so fast as to fool the switch
-		 * into thinking the link is down.
-		 */
-		cp->link_transition_jiffies_valid = 0;
-	}
-
-	if (!cp->hw_running)
-		return;
-
-	spin_lock_irqsave(&cp->lock, flags);
-	cas_lock_tx(cp);
-	cas_entropy_gather(cp);
-
-	/* If the link task is still pending, we just
-	 * reschedule the link timer
-	 */
-#if 1
-	if (atomic_read(&cp->reset_task_pending_all) ||
-	    atomic_read(&cp->reset_task_pending_spare) ||
-	    atomic_read(&cp->reset_task_pending_mtu))
-		goto done;
-#else
-	if (atomic_read(&cp->reset_task_pending))
-		goto done;
-#endif
-
-	/* check for rx cleaning */
-	if ((mask = (cp->cas_flags & CAS_FLAG_RXD_POST_MASK))) {
-		int i, rmask;
-
-		for (i = 0; i < MAX_RX_DESC_RINGS; i++) {
-			rmask = CAS_FLAG_RXD_POST(i);
-			if ((mask & rmask) == 0)
-				continue;
-
-			/* post_rxds will do a mod_timer */
-			if (cas_post_rxds_ringN(cp, i, cp->rx_last[i]) < 0) {
-				pending = 1;
-				continue;
-			}
-			cp->cas_flags &= ~rmask;
-		}
-	}
-
-	if (CAS_PHY_MII(cp->phy_type)) {
-		u16 bmsr;
-		cas_mif_poll(cp, 0);
-		bmsr = cas_phy_read(cp, MII_BMSR);
-		/* WTZ: Solaris driver reads this twice, but that
-		 * may be due to the PCS case and the use of a
-		 * common implementation. Read it twice here to be
-		 * safe.
-		 */
-		bmsr = cas_phy_read(cp, MII_BMSR);
-		cas_mif_poll(cp, 1);
-		readl(cp->regs + REG_MIF_STATUS); /* avoid dups */
-		reset = cas_mii_link_check(cp, bmsr);
-	} else {
-		reset = cas_pcs_link_check(cp);
-	}
-
-	if (reset)
-		goto done;
-
-	/* check for tx state machine confusion */
-	if ((readl(cp->regs + REG_MAC_TX_STATUS) & MAC_TX_FRAME_XMIT) == 0) {
-		u32 val = readl(cp->regs + REG_MAC_STATE_MACHINE);
-		u32 wptr, rptr;
-		int tlm  = CAS_VAL(MAC_SM_TLM, val);
-
-		if (((tlm == 0x5) || (tlm == 0x3)) &&
-		    (CAS_VAL(MAC_SM_ENCAP_SM, val) == 0)) {
-			netif_printk(cp, tx_err, KERN_DEBUG, cp->dev,
-				     "tx err: MAC_STATE[%08x]\n", val);
-			reset = 1;
-			goto done;
-		}
-
-		val  = readl(cp->regs + REG_TX_FIFO_PKT_CNT);
-		wptr = readl(cp->regs + REG_TX_FIFO_WRITE_PTR);
-		rptr = readl(cp->regs + REG_TX_FIFO_READ_PTR);
-		if ((val == 0) && (wptr != rptr)) {
-			netif_printk(cp, tx_err, KERN_DEBUG, cp->dev,
-				     "tx err: TX_FIFO[%08x:%08x:%08x]\n",
-				     val, wptr, rptr);
-			reset = 1;
-		}
-
-		if (reset)
-			cas_hard_reset(cp);
-	}
-
-done:
-	if (reset) {
-#if 1
-		atomic_inc(&cp->reset_task_pending);
-		atomic_inc(&cp->reset_task_pending_all);
-		schedule_work(&cp->reset_task);
-#else
-		atomic_set(&cp->reset_task_pending, CAS_RESET_ALL);
-		pr_err("reset called in cas_link_timer\n");
-		schedule_work(&cp->reset_task);
-#endif
-	}
-
-	if (!pending)
-		mod_timer(&cp->link_timer, jiffies + CAS_LINK_TIMEOUT);
-	cas_unlock_tx(cp);
-	spin_unlock_irqrestore(&cp->lock, flags);
-}
-
-/* tiny buffers are used to avoid target abort issues with
- * older cassini's
- */
-static void cas_tx_tiny_free(struct cas *cp)
-{
-	struct pci_dev *pdev = cp->pdev;
-	int i;
-
-	for (i = 0; i < N_TX_RINGS; i++) {
-		if (!cp->tx_tiny_bufs[i])
-			continue;
-
-		pci_free_consistent(pdev, TX_TINY_BUF_BLOCK,
-				    cp->tx_tiny_bufs[i],
-				    cp->tx_tiny_dvma[i]);
-		cp->tx_tiny_bufs[i] = NULL;
-	}
-}
-
-static int cas_tx_tiny_alloc(struct cas *cp)
-{
-	struct pci_dev *pdev = cp->pdev;
-	int i;
-
-	for (i = 0; i < N_TX_RINGS; i++) {
-		cp->tx_tiny_bufs[i] =
-			pci_alloc_consistent(pdev, TX_TINY_BUF_BLOCK,
-					     &cp->tx_tiny_dvma[i]);
-		if (!cp->tx_tiny_bufs[i]) {
-			cas_tx_tiny_free(cp);
-			return -1;
-		}
-	}
-	return 0;
-}
-
-
-static int cas_open(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-	int hw_was_up, err;
-	unsigned long flags;
-
-	mutex_lock(&cp->pm_mutex);
-
-	hw_was_up = cp->hw_running;
-
-	/* The power-management mutex protects the hw_running
-	 * etc. state so it is safe to do this bit without cp->lock
-	 */
-	if (!cp->hw_running) {
-		/* Reset the chip */
-		cas_lock_all_save(cp, flags);
-		/* We set the second arg to cas_reset to zero
-		 * because cas_init_hw below will have its second
-		 * argument set to non-zero, which will force
-		 * autonegotiation to start.
-		 */
-		cas_reset(cp, 0);
-		cp->hw_running = 1;
-		cas_unlock_all_restore(cp, flags);
-	}
-
-	err = -ENOMEM;
-	if (cas_tx_tiny_alloc(cp) < 0)
-		goto err_unlock;
-
-	/* alloc rx descriptors */
-	if (cas_alloc_rxds(cp) < 0)
-		goto err_tx_tiny;
-
-	/* allocate spares */
-	cas_spare_init(cp);
-	cas_spare_recover(cp, GFP_KERNEL);
-
-	/* We can now request the interrupt as we know it's masked
-	 * on the controller. cassini+ has up to 4 interrupts
-	 * that can be used, but you need to do explicit pci interrupt
-	 * mapping to expose them
-	 */
-	if (request_irq(cp->pdev->irq, cas_interrupt,
-			IRQF_SHARED, dev->name, (void *) dev)) {
-		netdev_err(cp->dev, "failed to request irq !\n");
-		err = -EAGAIN;
-		goto err_spare;
-	}
-
-#ifdef USE_NAPI
-	napi_enable(&cp->napi);
-#endif
-	/* init hw */
-	cas_lock_all_save(cp, flags);
-	cas_clean_rings(cp);
-	cas_init_hw(cp, !hw_was_up);
-	cp->opened = 1;
-	cas_unlock_all_restore(cp, flags);
-
-	netif_start_queue(dev);
-	mutex_unlock(&cp->pm_mutex);
-	return 0;
-
-err_spare:
-	cas_spare_free(cp);
-	cas_free_rxds(cp);
-err_tx_tiny:
-	cas_tx_tiny_free(cp);
-err_unlock:
-	mutex_unlock(&cp->pm_mutex);
-	return err;
-}
-
-static int cas_close(struct net_device *dev)
-{
-	unsigned long flags;
-	struct cas *cp = netdev_priv(dev);
-
-#ifdef USE_NAPI
-	napi_disable(&cp->napi);
-#endif
-	/* Make sure we don't get distracted by suspend/resume */
-	mutex_lock(&cp->pm_mutex);
-
-	netif_stop_queue(dev);
-
-	/* Stop traffic, mark us closed */
-	cas_lock_all_save(cp, flags);
-	cp->opened = 0;
-	cas_reset(cp, 0);
-	cas_phy_init(cp);
-	cas_begin_auto_negotiation(cp, NULL);
-	cas_clean_rings(cp);
-	cas_unlock_all_restore(cp, flags);
-
-	free_irq(cp->pdev->irq, (void *) dev);
-	cas_spare_free(cp);
-	cas_free_rxds(cp);
-	cas_tx_tiny_free(cp);
-	mutex_unlock(&cp->pm_mutex);
-	return 0;
-}
-
-static struct {
-	const char name[ETH_GSTRING_LEN];
-} ethtool_cassini_statnames[] = {
-	{"collisions"},
-	{"rx_bytes"},
-	{"rx_crc_errors"},
-	{"rx_dropped"},
-	{"rx_errors"},
-	{"rx_fifo_errors"},
-	{"rx_frame_errors"},
-	{"rx_length_errors"},
-	{"rx_over_errors"},
-	{"rx_packets"},
-	{"tx_aborted_errors"},
-	{"tx_bytes"},
-	{"tx_dropped"},
-	{"tx_errors"},
-	{"tx_fifo_errors"},
-	{"tx_packets"}
+</programlisting>
+
+<para>NOTE: While it is possible to directly call the Kernel code like the
+    above example, it is strongly recommended to use
+    <ulink url="http://linuxtv.org/docs/libdvbv5/index.html">libdvbv5</ulink>,
+    as it provides abstraction to work with the supported digital TV standards
+    and provides methods for usual operations like program scanning and to
+    read/write channel descriptor files.</para>
+
+<section id="dtv-stats">
+<title>struct <structname>dtv_stats</structname></title>
+<programlisting>
+struct dtv_stats {
+	__u8 scale;	/* enum fecap_scale_params type */
+	union {
+		__u64 uvalue;	/* for counters and relative scales */
+		__s64 svalue;	/* for 1/1000 dB measures */
+	};
+} __packed;
+</programlisting>
+</section>
+<section id="dtv-fe-stats">
+<title>struct <structname>dtv_fe_stats</structname></title>
+<programlisting>
+#define MAX_DTV_STATS   4
+
+struct dtv_fe_stats {
+	__u8 len;
+	&dtv-stats; stat[MAX_DTV_STATS];
+} __packed;
+</programlisting>
+</section>
+
+<section id="dtv-property">
+<title>struct <structname>dtv_property</structname></title>
+<programlisting>
+/* Reserved fields should be set to 0 */
+
+struct dtv_property {
+	__u32 cmd;
+	__u32 reserved[3];
+	union {
+		__u32 data;
+		&dtv-fe-stats; st;
+		struct {
+			__u8 data[32];
+			__u32 len;
+			__u32 reserved1[3];
+			void *reserved2;
+		} buffer;
+	} u;
+	int result;
+} __attribute__ ((packed));
+
+/* num of properties cannot exceed DTV_IOCTL_MAX_MSGS per ioctl */
+#define DTV_IOCTL_MAX_MSGS 64
+</programlisting>
+</section>
+<section id="dtv-properties">
+<title>struct <structname>dtv_properties</structname></title>
+<programlisting>
+struct dtv_properties {
+	__u32 num;
+	&dtv-property; *props;
 };
-#define CAS_NUM_STAT_KEYS ARRAY_SIZE(ethtool_cassini_statnames)
-
-static struct {
-	const int offsets;	/* neg. values for 2nd arg to cas_read_phy */
-} ethtool_register_table[] = {
-	{-MII_BMSR},
-	{-MII_BMCR},
-	{REG_CAWR},
-	{REG_INF_BURST},
-	{REG_BIM_CFG},
-	{REG_RX_CFG},
-	{REG_HP_CFG},
-	{REG_MAC_TX_CFG},
-	{REG_MAC_RX_CFG},
-	{REG_MAC_CTRL_CFG},
-	{REG_MAC_XIF_CFG},
-	{REG_MIF_CFG},
-	{REG_PCS_CFG},
-	{REG_SATURN_PCFG},
-	{REG_PCS_MII_STATUS},
-	{REG_PCS_STATE_MACHINE},
-	{REG_MAC_COLL_EXCESS},
-	{REG_MAC_COLL_LATE}
-};
-#define CAS_REG_LEN 	ARRAY_SIZE(ethtool_register_table)
-#define CAS_MAX_REGS 	(sizeof (u32)*CAS_REG_LEN)
-
-static void cas_read_regs(struct cas *cp, u8 *ptr, int len)
-{
-	u8 *p;
-	int i;
-	unsigned long flags;
-
-	spin_lock_irqsave(&cp->lock, flags);
-	for (i = 0, p = ptr; i < len ; i ++, p += sizeof(u32)) {
-		u16 hval;
-		u32 val;
-		if (ethtool_register_table[i].offsets < 0) {
-			hval = cas_phy_read(cp,
-				    -ethtool_register_table[i].offsets);
-			val = hval;
-		} else {
-			val= readl(cp->regs+ethtool_register_table[i].offsets);
-		}
-		memcpy(p, (u8 *)&val, sizeof(u32));
-	}
-	spin_unlock_irqrestore(&cp->lock, flags);
-}
-
-static struct net_device_stats *cas_get_stats(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-	struct net_device_stats *stats = cp->net_stats;
-	unsigned long flags;
-	int i;
-	unsigned long tmp;
-
-	/* we collate all of the stats into net_stats[N_TX_RING] */
-	if (!cp->hw_running)
-		return stats + N_TX_RINGS;
-
-	/* collect outstanding stats */
-	/* WTZ: the Cassini spec gives these as 16 bit counters but
-	 * stored in 32-bit words.  Added a mask of 0xffff to be safe,
-	 * in case the chip somehow puts any garbage in the other bits.
-	 * Also, counter usage didn't seem to mach what Adrian did
-	 * in the parts of the code that set these quantities. Made
-	 * that consistent.
-	 */
-	spin_lock_irqsave(&cp->stat_lock[N_TX_RINGS], flags);
-	stats[N_TX_RINGS].rx_crc_errors +=
-	  readl(cp->regs + REG_MAC_FCS_ERR) & 0xffff;
-	stats[N_TX_RINGS].rx_frame_errors +=
-		readl(cp->regs + REG_MAC_ALIGN_ERR) &0xffff;
-	stats[N_TX_RINGS].rx_length_errors +=
-		readl(cp->regs + REG_MAC_LEN_ERR) & 0xffff;
-#if 1
-	tmp = (readl(cp->regs + REG_MAC_COLL_EXCESS) & 0xffff) +
-		(readl(cp->regs + REG_MAC_COLL_LATE) & 0xffff);
-	stats[N_TX_RINGS].tx_aborted_errors += tmp;
-	stats[N_TX_RINGS].collisions +=
-	  tmp + (readl(cp->regs + REG_MAC_COLL_NORMAL) & 0xffff);
-#else
-	stats[N_TX_RINGS].tx_aborted_errors +=
-		readl(cp->regs + REG_MAC_COLL_EXCESS);
-	stats[N_TX_RINGS].collisions += readl(cp->regs + REG_MAC_COLL_EXCESS) +
-		readl(cp->regs + REG_MAC_COLL_LATE);
-#endif
-	cas_clear_mac_err(cp);
-
-	/* saved bits that are unique to ring 0 */
-	spin_lock(&cp->stat_lock[0]);
-	stats[N_TX_RINGS].collisions        += stats[0].collisions;
-	stats[N_TX_RINGS].rx_over_errors    += stats[0].rx_over_errors;
-	stats[N_TX_RINGS].rx_frame_errors   += stats[0].rx_frame_errors;
-	stats[N_TX_RINGS].rx_fifo_errors    += stats[0].rx_fifo_errors;
-	stats[N_TX_RINGS].tx_aborted_errors += stats[0].tx_aborted_errors;
-	stats[N_TX_RINGS].tx_fifo_errors    += stats[0].tx_fifo_errors;
-	spin_unlock(&cp->stat_lock[0]);
-
-	for (i = 0; i < N_TX_RINGS; i++) {
-		spin_lock(&cp->stat_lock[i]);
-		stats[N_TX_RINGS].rx_length_errors +=
-			stats[i].rx_length_errors;
-		stats[N_TX_RINGS].rx_crc_errors += stats[i].rx_crc_errors;
-		stats[N_TX_RINGS].rx_packets    += stats[i].rx_packets;
-		stats[N_TX_RINGS].tx_packets    += stats[i].tx_packets;
-		stats[N_TX_RINGS].rx_bytes      += stats[i].rx_bytes;
-		stats[N_TX_RINGS].tx_bytes      += stats[i].tx_bytes;
-		stats[N_TX_RINGS].rx_errors     += stats[i].rx_errors;
-		stats[N_TX_RINGS].tx_errors     += stats[i].tx_errors;
-		stats[N_TX_RINGS].rx_dropped    += stats[i].rx_dropped;
-		stats[N_TX_RINGS].tx_dropped    += stats[i].tx_dropped;
-		memset(stats + i, 0, sizeof(struct net_device_stats));
-		spin_unlock(&cp->stat_lock[i]);
-	}
-	spin_unlock_irqrestore(&cp->stat_lock[N_TX_RINGS], flags);
-	return stats + N_TX_RINGS;
-}
-
-
-static void cas_set_multicast(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-	u32 rxcfg, rxcfg_new;
-	unsigned long flags;
-	int limit = STOP_TRIES;
-
-	if (!cp->hw_running)
-		return;
-
-	spin_lock_irqsave(&cp->lock, flags);
-	rxcfg = readl(cp->regs + REG_MAC_RX_CFG);
-
-	/* disable RX MAC and wait for completion */
-	writel(rxcfg & ~MAC_RX_CFG_EN, cp->regs + REG_MAC_RX_CFG);
-	while (readl(cp->regs + REG_MAC_RX_CFG) & MAC_RX_CFG_EN) {
-		if (!limit--)
-			break;
-		udelay(10);
-	}
-
-	/* disable hash filter and wait for completion */
-	limit = STOP_TRIES;
-	rxcfg &= ~(MAC_RX_CFG_PROMISC_EN | MAC_RX_CFG_HASH_FILTER_EN);
-	writel(rxcfg & ~MAC_RX_CFG_EN, cp->regs + REG_MAC_RX_CFG);
-	while (readl(cp->regs + REG_MAC_RX_CFG) & MAC_RX_CFG_HASH_FILTER_EN) {
-		if (!limit--)
-			break;
-		udelay(10);
-	}
-
-	/* program hash filters */
-	cp->mac_rx_cfg = rxcfg_new = cas_setup_multicast(cp);
-	rxcfg |= rxcfg_new;
-	writel(rxcfg, cp->regs + REG_MAC_RX_CFG);
-	spin_unlock_irqrestore(&cp->lock, flags);
-}
-
-static void cas_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info)
-{
-	struct cas *cp = netdev_priv(dev);
-	strlcpy(info->driver, DRV_MODULE_NAME, sizeof(info->driver));
-	strlcpy(info->version, DRV_MODULE_VERSION, sizeof(info->version));
-	strlcpy(info->bus_info, pci_name(cp->pdev), sizeof(info->bus_info));
-}
-
-static int cas_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
-{
-	struct cas *cp = netdev_priv(dev);
-	u16 bmcr;
-	int full_duplex, speed, pause;
-	unsigned long flags;
-	enum link_state linkstate = link_up;
-
-	cmd->advertising = 0;
-	cmd->supported = SUPPORTED_Autoneg;
-	if (cp->cas_flags & CAS_FLAG_1000MB_CAP) {
-		cmd->supported |= SUPPORTED_1000baseT_Full;
-		cmd->advertising |= ADVERTISED_1000baseT_Full;
-	}
-
-	/* Record PHY settings if HW is on. */
-	spin_lock_irqsave(&cp->lock, flags);
-	bmcr = 0;
-	linkstate = cp->lstate;
-	if (CAS_PHY_MII(cp->phy_type)) {
-		cmd->port = PORT_MII;
-		cmd->transceiver = (cp->cas_flags & CAS_FLAG_SATURN) ?
-			XCVR_INTERNAL : XCVR_EXTERNAL;
-		cmd->phy_address = cp->phy_addr;
-		cmd->advertising |= ADVERTISED_TP | ADVERTISED_MII |
-			ADVERTISED_10baseT_Half |
-			ADVERTISED_10baseT_Full |
-			ADVERTISED_100baseT_Half |
-			ADVERTISED_100baseT_Full;
-
-		cmd->supported |=
-			(SUPPORTED_10baseT_Half |
-			 SUPPORTED_10baseT_Full |
-			 SUPPORTED_100baseT_Half |
-			 SUPPORTED_100baseT_Full |
-			 SUPPORTED_TP | SUPPORTED_MII);
-
-		if (cp->hw_running) {
-			cas_mif_poll(cp, 0);
-			bmcr = cas_phy_read(cp, MII_BMCR);
-			cas_read_mii_link_mode(cp, &full_duplex,
-					       &speed, &pause);
-			cas_mif_poll(cp, 1);
-		}
-
-	} else {
-		cmd->port = PORT_FIBRE;
-		cmd->transceiver = XCVR_INTERNAL;
-		cmd->phy_address = 0;
-		cmd->supported   |= SUPPORTED_FIBRE;
-		cmd->advertising |= ADVERTISED_FIBRE;
-
-		if (cp->hw_running) {
-			/* pcs uses the same bits as mii */
-			bmcr = readl(cp->regs + REG_PCS_MII_CTRL);
-			cas_read_pcs_link_mode(cp, &full_duplex,
-					       &speed, &pause);
-		}
-	}
-	spin_unlock_irqrestore(&cp->lock, flags);
-
-	if (bmcr & BMCR_ANENABLE) {
-		cmd->advertising |= ADVERTISED_Autoneg;
-		cmd->autoneg = AUTONEG_ENABLE;
-		ethtool_cmd_speed_set(cmd, ((speed == 10) ?
-					    SPEED_10 :
-					    ((speed == 1000) ?
-					     SPEED_1000 : SPEED_100)));
-		cmd->duplex = full_duplex ? DUPLEX_FULL : DUPLEX_HALF;
-	} else {
-		cmd->autoneg = AUTONEG_DISABLE;
-		ethtool_cmd_speed_set(cmd, ((bmcr & CAS_BMCR_SPEED1000) ?
-					    SPEED_1000 :
-					    ((bmcr & BMCR_SPEED100) ?
-					     SPEED_100 : SPEED_10)));
-		cmd->duplex =
-			(bmcr & BMCR_FULLDPLX) ?
-			DUPLEX_FULL : DUPLEX_HALF;
-	}
-	if (linkstate != link_up) {
-		/* Force these to "unknown" if the link is not up and
-		 * autonogotiation in enabled. We can set the link
-		 * speed to 0, but not cmd->duplex,
-		 * because its legal values are 0 and 1.  Ethtool will
-		 * print the value reported in parentheses after the
-		 * word "Unknown" for unrecognized values.
-		 *
-		 * If in forced mode, we report the speed and duplex
-		 * settings that we configured.
-		 */
-		if (cp->link_cntl & BMCR_ANENABLE) {
-			ethtool_cmd_speed_set(cmd, 0);
-			cmd->duplex = 0xff;
-		} else {
-			ethtool_cmd_speed_set(cmd, SPEED_10);
-			if (cp->link_cntl & BMCR_SPEED100) {
-				ethtool_cmd_speed_set(cmd, SPEED_100);
-			} else if (cp->link_cntl & CAS_BMCR_SPEED1000) {
-				ethtool_cmd_speed_set(cmd, SPEED_1000);
-			}
-			cmd->duplex = (cp->link_cntl & BMCR_FULLDPLX)?
-				DUPLEX_FULL : DUPLEX_HALF;
-		}
-	}
-	return 0;
-}
-
-static int cas_set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
-{
-	struct cas *cp = netdev_priv(dev);
-	unsigned long flags;
-	u32 speed = ethtool_cmd_speed(cmd);
-
-	/* Verify the settings we care about. */
-	if (cmd->autoneg != AUTONEG_ENABLE &&
-	    cmd->autoneg != AUTONEG_DISABLE)
-		return -EINVAL;
-
-	if (cmd->autoneg == AUTONEG_DISABLE &&
-	    ((speed != SPEED_1000 &&
-	      speed != SPEED_100 &&
-	      speed != SPEED_10) ||
-	     (cmd->duplex != DUPLEX_HALF &&
-	      cmd->duplex != DUPLEX_FULL)))
-		return -EINVAL;
-
-	/* Apply settings and restart link process. */
-	spin_lock_irqsave(&cp->lock, flags);
-	cas_begin_auto_negotiation(cp, cmd);
-	spin_unlock_irqrestore(&cp->lock, flags);
-	return 0;
-}
-
-static int cas_nway_reset(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-	unsigned long flags;
-
-	if ((cp->link_cntl & BMCR_ANENABLE) == 0)
-		return -EINVAL;
-
-	/* Restart link process. */
-	spin_lock_irqsave(&cp->lock, flags);
-	cas_begin_auto_negotiation(cp, NULL);
-	spin_unlock_irqrestore(&cp->lock, flags);
-
-	return 0;
-}
-
-static u32 cas_get_link(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-	return cp->lstate == link_up;
-}
-
-static u32 cas_get_msglevel(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-	return cp->msg_enable;
-}
-
-static void cas_set_msglevel(struct net_device *dev, u32 value)
-{
-	struct cas *cp = netdev_priv(dev);
-	cp->msg_enable = value;
-}
-
-static int cas_get_regs_len(struct net_device *dev)
-{
-	struct cas *cp = netdev_priv(dev);
-	return cp->casreg_len < CAS_MAX_REGS ? cp->casreg_len: CAS_MAX_REGS;
-}
-
-static void cas_get_regs(struct net_device *dev, struct ethtool_regs *regs,
-			     void *p)
-{
-	struct cas *cp = netdev_priv(dev);
-	regs->version = 0;
-	/* cas_read_regs handles locks (cp->lock).  */
-	cas_read_regs(cp, p, regs->len / sizeof(u32));
-}
-
-static int cas_get_sset_count(struct net_device *dev, int sset)
-{
-	switch (sset) {
-	case ETH_SS_STATS:
-		return CAS_NUM_STAT_KEYS;
-	default:
-		return -EOPNOTSUPP;
-	}
-}
-
-static void cas_get_strings(struct net_device *dev, u32 stringset, u8 *data)
-{
-	 memcpy(data, &ethtool_cassini_statnames,
-					 CAS_NUM_STAT_KEYS * ETH_GSTRING_LEN);
-}
-
-static void cas_get_ethtool_stats(struct net_device *dev,
-				      struct ethtool_stats *estats, u64 *data)
-{
-	struct cas *cp = netdev_priv(dev);
-	struct net_device_stats *stats = cas_get_stats(cp->dev);
-	int i = 0;
-	data[i++] = stats->collisions;
-	data[i++] = stats->rx_bytes;
-	data[i++] = stats->rx_crc_errors;
-	data[i++] = stats->rx_dropped;
-	data[i++] = stats->rx_errors;
-	data[i++] = stats->rx_fifo_errors;
-	data[i++] = stats->rx_frame_errors;
-	data[i++] = stats->rx_length_errors;
-	data[i++] = stats->rx_over_errors;
-	data[i++] = stats->rx_packets;
-	data[i++] = stats->tx_aborted_errors;
-	data[i++] = stats->tx_bytes;
-	data[i++] = stats->tx_dropped;
-	data[i++] = stats->tx_errors;
-	data[i++] = stats->tx_fifo_errors;
-	data[i++] = stats->tx_packets;
-	BUG_ON(i != CAS_NUM_STAT_KEYS);
-}
-
-static const struct ethtool_ops cas_ethtool_ops = {
-	.get_drvinfo		= cas_get_drvinfo,
-	.get_settings		= cas_get_settings,
-	.set_settings		= cas_set_settings,
-	.nway_reset		= cas_nway_reset,
-	.get_link		= cas_get_link,
-	.get_msglevel		= cas_get_msglevel,
-	.set_msglevel		= cas_set_msglevel,
-	.get_regs_len		= cas_get_regs_len,
-	.get_regs		= cas_get_regs,
-	.get_sset_count		= cas_get_sset_count,
-	.get_strings		= cas_get_strings,
-	.get_ethtool_stats	= cas_get_ethtool_stats,
-};
-
-static int cas_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
-{
-	struct cas *cp = netdev_priv(dev);
-	struct mii_ioctl_data *data = if_mii(ifr);
-	unsigned long flags;
-	int rc = -EOPNOTSUPP;
-
-	/* Hold the PM mutex while doing ioctl's or we may collide
-	 * with open/close and power management and oops.
-	 */
-	mutex_lock(&cp->pm_mutex);
-	switch (cmd) {
-	case SIOCGMIIPHY:		/* Get address of MII PHY in use. */
-		data->phy_id = cp->phy_addr;
-		/* Fallthrough... */
-
-	case SIOCGMIIREG:		/* Read MII PHY register. */
-		spin_lock_irqsave(&cp->lock, flags);
-		cas_mif_poll(cp, 0);
-		data->val_out = cas_phy_read(cp, data->reg_num & 0x1f);
-		cas_mif_poll(cp, 1);
-		spin_unlock_irqrestore(&cp->lock, flags);
-		rc = 0;
-		break;
-
-	case SIOCSMIIREG:		/* Write MII PHY register. */
-		spin_lock_irqsave(&cp->lock, flags);
-		cas_mif_poll(cp, 0);
-		rc = cas_phy_write(cp, data->reg_num & 0x1f, data->val_in);
-		cas_mif_poll(cp, 1);
-		spin_unlock_irqrestore(&cp->lock, flags);
-		break;
-	default:
-		break;
-	}
-
-	mutex_unlock(&cp->pm_mutex);
-	return rc;
-}
-
-/* When this chip sits underneath an Intel 31154 bridge, it is the
- * only subordinate device and we can tweak the bridge settings to
- * reflect that fact.
- */
-static void cas_program_bridge(struct pci_dev *cas_pdev)
-{
-	struct pci_dev *pdev = cas_pdev->bus->self;
-	u32 val;
-
-	if (!pdev)
-		return;
-
-	if (pdev->vendor != 0x8086 || pdev->device != 0x537c)
-		return;
-
-	/* Clear bit 10 (Bus Parking Control) in the Secondary
-	 * Arbiter Control/Status Register which lives at offset
-	 * 0x41.  Using a 32-bit word read/modify/write at 0x40
-	 * is much simpler so that's how we do this.
-	 */
-	pci_read_config_dword(pdev, 0x40, &val);
-	val &= ~0x00040000;
-	pci_write_config_dword(pdev, 0x40, val);
-
-	/* Max out the Multi-Transaction Timer settings since
-	 * Cassini is the only device present.
-	 *
-	 * The register is 16-bit and lives at 0x50.  When the
-	 * settings are enabled, it extends the GRANT# signal
-	 * for a requestor after a transaction is complete.  This
-	 * allows the next request to run without first needing
-	 * to negotiate the GRANT# signal back.
-	 *
-	 * Bits 12:10 define the grant duration:
-	 *
-	 *	1	--	16 clocks
-	 *	2	--	32 clocks
-	 *	3	--	64 clocks
-	 *	4	--	128 clocks
-	 *	5	--	256 clocks
-	 *
-	 * All other values are illegal.
-	 *
-	 * Bits 09:00 define which REQ/GNT signal pairs get the
-	 * GRANT# signal treatment.  We set them all.
-	 */
-	pci_write_config_word(pdev, 0x50, (5 << 10) | 0x3ff);
-
-	/* The Read Prefecth Policy register is 16-bit and sits at
-	 * offset 0x52.  It enables a "smart" pre-fetch policy.  We
-	 * enable it and max out all of the settings since only one
-	 * device is sitting underneath and thus bandwidth sharing is
-	 * not an issue.
-	 *
-	 * The register has several 3 bit fields, which indicates a
-	 * multiplier applied to the base amount of prefetching the
-	 * chip would do.  These fields are at:
-	 *
-	 *	15:13	---	ReRead Primary Bus
-	 *	12:10	---	FirstRead Primary Bus
-	 *	09:07	---	ReRead Secondary Bus
-	 *	06:04	---	FirstRead Secondary Bus
-	 *
-	 * Bits 03:00 control which REQ/GNT pairs the prefetch settings
-	 * get enabled on.  Bit 3 is a grouped enabler which controls
-	 * all of the REQ/GNT pairs from [8:3].  Bits 2 to 0 control
-	 * the individual REQ/GNT pairs [2:0].
-	 */
-	pci_write_config_word(pdev, 0x52,
-			      (0x7 << 13) |
-			      (0x7 << 10) |
-			      (0x7 <<  7) |
-			      (0x7 <<  4) |
-			      (0xf <<  0));
-
-	/* Force cacheline size to 0x8 */
-	pci_write_config_byte(pdev, PCI_CACHE_LINE_SIZE, 0x08);
-
-	/* Force latency timer to maximum setting so Cassini can
-	 * sit on the bus as long as it likes.
-	 */
-	pci_write_config_byte(pdev, PCI_LATENCY_TIMER, 0xff);
-}
-
-static const struct net_device_ops cas_netdev_ops = {
-	.ndo_open		= cas_open,
-	.ndo_stop		= cas_close,
-	.ndo_start_xmit		= cas_start_xmit,
-	.ndo_get_stats 		= cas_get_stats,
-	.ndo_set_rx_mode	= cas_set_multicast,
-	.ndo_do_ioctl		= cas_ioctl,
-	.ndo_tx_timeout		= cas_tx_timeout,
-	.ndo_change_mtu		= cas_change_mtu,
-	.ndo_set_mac_address	= eth_mac_addr,
-	.ndo_validate_addr	= eth_validate_addr,
-#ifdef CONFIG_NET_POLL_CONTROLLER
-	.ndo_poll_controller	= cas_netpoll,
-#endif
-};
-
-static int cas_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
-{
-	static int cas_version_printed = 0;
-	unsigned long casreg_len;
-	struct net_device *dev;
-	struct cas *cp;
-	int i, err, pci_using_dac;
-	u16 pci_cmd;
-	u8 orig_cacheline_size = 0, cas_cacheline_size = 0;
-
-	if (cas_version_printed++ == 0)
-		pr_info("%s", version);
-
-	err = pci_enable_device(pdev);
-	if (err) {
-		dev_err(&pdev->dev, "Cannot enable PCI device, aborting\n");
-		return err;
-	}
-
-	if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM)) {
-		dev_err(&pdev->dev, "Cannot find proper PCI device "
-		       "base address, aborting\n");
-		err = -ENODEV;
-		goto err_out_disable_pdev;
-	}
-
-	dev = alloc_etherdev(sizeof(*cp));
-	if (!dev) {
-		err = -ENOMEM;
-		goto err_out_disable_pdev;
-	}
-	SET_NETDEV_DEV(dev, &pdev->dev);
-
-	err = pci_request_regions(pdev, dev->name);
-	if (err) {
-		dev_err(&pdev->dev, "Cannot obtain PCI resources, aborting\n");
-		goto err_out_free_netdev;
-	}
-	pci_set_master(pdev);
-
-	/* we must always turn on parity response or else parity
-	 * doesn't get generated properly. disable SERR/PERR as well.
-	 * in addition, we want to turn MWI on.
-	 */
-	pci_read_config_word(pdev, PCI_COMMAND, &pci_cmd);
-	pci_cmd &= ~PCI_COMMAND_SERR;
-	pci_cmd |= PCI_COMMAND_PARITY;
-	pci_write_config_word(pdev, PCI_COMMAND, pci_cmd);
-	if (pci_try_set_mwi(pdev))
-		pr_warn("Could not enable MWI for %s\n", pci_name(pdev));
-
-	cas_program_bridge(pdev);
-
-	/*
-	 * On some architectures, the default cache line size set
-	 * by pci_try_set_mwi reduces perforamnce.  We have to increase
-	 * it for this case.  To start, we'll print some configuration
-	 * data.
-	 */
-#if 1
-	pci_read_config_byte(pdev, PCI_CACHE_LINE_SIZE,
-			     &orig_cacheline_size);
-	if (orig_cacheline_size < CAS_PREF_CACHELINE_SIZE) {
-		cas_cacheline_size =
-			(CAS_PREF_CACHELINE_SIZE < SMP_CACHE_BYTES) ?
-			CAS_PREF_CACHELINE_SIZE : SMP_CACHE_BYTES;
-		if (pci_write_config_byte(pdev,
-					  PCI_CACHE_LINE_SIZE,
-					  cas_cacheline_size)) {
-			dev_err(&pdev->dev, "Could not set PCI cache "
-			       "line size\n");
-			goto err_out_free_res;
-		}
-	}
-#endif
-
-
-	/* Configure DMA attributes. */
-	if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(64))) {
-		pci_using_dac = 1;
-		err = pci_set_consistent_dma_mask(pdev,
-						  DMA_BIT_MASK(64));
-		if (err < 0) {
-			dev_err(&pdev->dev, "Unable to obtain 64-bit DMA "
-			       "for consistent allocations\n");
-			goto err_out_free_res;
-		}
-
-	} else {
-		err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
-		if (err) {
-			dev_err(&pdev->dev, "No usable DMA configuration, "
-			       "aborting\n");
-			goto err_out_free_res;
-		}
-		pci_using_dac = 0;
-	}
-
-	casreg_len = pci_resource_len(pdev, 0);
-
-	cp = netdev_priv(dev);
-	cp->pdev = pdev;
-#if 1
-	/* A value of 0 indicates we never explicitly set it */
-	cp->orig_cacheline_size = cas_cacheline_size ? orig_cacheline_size: 0;
-#endif
-	cp->dev = dev;
-	cp->msg_enable = (cassini_debug < 0) ? CAS_DEF_MSG_ENABLE :
-	  cassini_debug;
-
-#if defined(CONFIG_SPARC)
-	cp->of_node = pci_device_to_OF_node(pdev);
-#endif
-
-	cp->link_transition = LINK_TRANSITION_UNKNOWN;
-	cp->link_transition_jiffies_valid = 0;
-
-	spin_lock_init(&cp->lock);
-	spin_lock_init(&cp->rx_inuse_lock);
-	spin_lock_init(&cp->rx_spare_lock);
-	for (i = 0; i < N_TX_RINGS; i++) {
-		spin_lock_init(&cp->stat_lock[i]);
-		spin_lock_init(&cp->tx_lock[i]);
-	}
-	spin_lock_init(&cp->stat_lock[N_TX_RINGS]);
-	mutex_init(&cp->pm_mutex);
-
-	init_timer(&cp->link_timer);
-	cp->link_timer.function = cas_link_timer;
-	cp->link_timer.data = (unsigned long) cp;
-
-#if 1
-	/* Just in case the implementation of atomic operations
-	 * change so that an explicit initialization is necessary.
-	 */
-	atomic_set(&cp->reset_task_pending, 0);
-	atomic_set(&cp->reset_task_pending_all, 0);
-	atomic_set(&cp->reset_task_pending_spare, 0);
-	atomic_set(&cp->reset_task_pending_mtu, 0);
-#endif
-	INIT_WORK(&cp->reset_task, cas_reset_task);
-
-	/* Default link parameters */
-	if (link_mode >= 0 && link_mode < 6)
-		cp->link_cntl = link_modes[link_mode];
-	else
-		cp->link_cntl = BMCR_ANENABLE;
-	cp->lstate = link_down;
-	cp->link_transition = LINK_TRANSITION_LINK_DOWN;
-	netif_carrier_off(cp->dev);
-	cp->timer_ticks = 0;
-
-	/* give us access to cassini registers */
-	cp->regs = pci_iomap(pdev, 0, casreg_len);
-	if (!cp->regs) {
-		dev_err(&pdev->dev, "Cannot map device registers, aborting\n");
-		goto err_out_free_res;
-	}
-	cp->casreg_len = casreg_len;
-
-	pci_save_state(pdev);
-	cas_check_pci_invariants(cp);
-	cas_hard_reset(cp);
-	cas_reset(cp, 0);
-	if (cas_check_invariants(cp))
-		goto err_out_iounmap;
-	if (cp->cas_flags & CAS_FLAG_SATURN)
-		cas_saturn_firmware_init(cp);
-
-	cp->init_block = (struct cas_init_block *)
-		pci_alloc_consistent(pdev, sizeof(struct cas_init_block),
-				     &cp->block_dvma);
-	if (!cp->init_block) {
-		dev_err(&pdev->dev, "Cannot allocate init block, aborting\n");
-		goto err_out_iounmap;
-	}
-
-	for (i = 0; i < N_TX_RINGS; i++)
-		cp->init_txds[i] = cp->init_block->txds[i];
-
-	for (i = 0; i < N_RX_DESC_RINGS; i++)
-		cp->init_rxds[i] = cp->init_block->rxds[i];
-
-	for (i = 0; i < N_RX_COMP_RINGS; i++)
-		cp->init_rxcs[i] = cp->init_block->rxcs[i];
-
-	for (i = 0; i < N_RX_FLOWS; i++)
-		skb_queue_head_init(&cp->rx_flows[i]);
-
-	dev->netdev_ops = &cas_netdev_ops;
-	dev->ethtool_ops = &cas_ethtool_ops;
-	dev->watchdog_timeo = CAS_TX_TIMEOUT;
-
-#ifdef USE_NAPI
-	netif_napi_add(dev, &cp->napi, cas_poll, 64);
-#endif
-	dev->irq = pdev->irq;
-	dev->dma = 0;
-
-	/* Cassini features. */
-	if ((cp->cas_flags & CAS_FLAG_NO_HW_CSUM) == 0)
-		dev->features |= NETIF_F_HW_CSUM | NETIF_F_SG;
-
-	if (pci_using_dac)
-		dev->features |= NETIF_F_HIGHDMA;
-
-	if (register_netdev(dev)) {
-		dev_err(&pdev->dev, "Cannot register net device, aborting\n");
-		goto err_out_free_consistent;
-	}
-
-	i = readl(cp->regs + REG_BIM_CFG);
-	netdev_info(dev, "Sun Cassini%s (%sbit/%sMHz PCI/%s) Ethernet[%d] %pM\n",
-		    (cp->cas_flags & CAS_FLAG_REG_PLUS) ? "+" : "",
-		    (i & BIM_CFG_32BIT) ? "32" : "64",
-		    (i & BIM_CFG_66MHZ) ? "66" : "33",
-		    (cp->phy_type == CAS_PHY_SERDES) ? "Fi" : "Cu", pdev->irq,
-		    dev->dev_addr);
-
-	pci_set_drvdata(pdev, dev);
-	cp->hw_running = 1;
-	cas_entropy_reset(cp);
-	cas_phy_init(cp);
-	cas_begin_auto_negotiation(cp, NULL);
-	return 0;
-
-err_out_free_consistent:
-	pci_free_consistent(pdev, sizeof(struct cas_init_block),
-			    cp->init_block, cp->block_dvma);
-
-err_out_iounmap:
-	mutex_lock(&cp->pm_mutex);
-	if (cp->hw_running)
-		cas_shutdown(cp);
-	mutex_unlock(&cp->pm_mutex);
-
-	vfree(cp->fw_data);
-
-	pci_iounmap(pdev, cp->regs);
-
-
-err_out_free_res:
-	pci_release_regions(pdev);
-
-	/* Try to restore it in case the error occurred after we
-	 * set it.
-	 */
-	pci_write_config_byte(pdev, PCI_CACHE_LINE_SIZE, orig_cacheline_size);
-
-err_out_free_netdev:
-	free_netdev(dev);
-
-err_out_disable_pdev:
-	pci_disable_device(pdev);
-	return -ENODEV;
-}
-
-static void cas_remove_one(struct pci_dev *pdev)
-{
-	struct net_device *dev = pci_get_drvdata(pdev);
-	struct cas *cp;
-	if (!dev)
-		return;
-
-	cp = netdev_priv(dev);
-	unregister_netdev(dev);
-
-	vfree(cp->fw_data);
-
-	mutex_lock(&cp->pm_mutex);
-	cancel_work_sync(&cp->reset_task);
-	if (cp->hw_running)
-		cas_shutdown(cp);
-	mutex_unlock(&cp->pm_mutex);
-
-#if 1
-	if (cp->orig_cacheline_size) {
-		/* Restore the cache line size if we had modified
-		 * it.
-		 */
-		pci_write_config_byte(pdev, PCI_CACHE_LINE_SIZE,
-				      cp->orig_cacheline_size);
-	}
-#endif
-	pci_free_consistent(pdev, sizeof(struct cas_init_block),
-			    cp->init_block, cp->block_dvma);
-	pci_iounmap(pdev, cp->regs);
-	free_netdev(dev);
-	pci_release_regions(pdev);
-	pci_disable_device(pdev);
-}
-
-#ifdef CONFIG_PM
-static int cas_suspend(struct pci_dev *pdev, pm_message_t state)
-{
-	struct net_device *dev = pci_get_drvdata(pdev);
-	struct cas *cp = netdev_priv(dev);
-	unsigned long flags;
-
-	mutex_lock(&cp->pm_mutex);
-
-	/* If the driver is opened, we stop the DMA */
-	if (cp->opened) {
-		netif_device_detach(dev);
-
-		cas_lock_all_save(cp, flags);
-
-		/* We can set the second arg of cas_reset to 0
-		 * because on resume, we'll call cas_init_hw with
-		 * its second arg set so that autonegotiation is
-		 * restarted.
-		 */
-		cas_reset(cp, 0);
-		cas_clean_rings(cp);
-		cas_unlock_all_restore(cp, flags);
-	}
-
-	if (cp->hw_running)
-		cas_shutdown(cp);
-	mutex_unlock(&cp->pm_mutex);
-
-	return 0;
-}
-
-static int cas_resume(struct pci_dev *pdev)
-{
-	struct net_device *dev = pci_get_drvdata(pdev);
-	struct cas *cp = netdev_priv(dev);
-
-	netdev_info(dev, "resuming\n");
-
-	mutex_lock(&cp->pm_mutex);
-	cas_hard_reset(cp);
-	if (cp->opened) {
-		unsigned long flags;
-		cas_lock_all_save(cp, flags);
-		cas_reset(cp, 0);
-		cp->hw_running = 1;
-		cas_clean_rings(cp);
-		cas_init_hw(cp, 1);
-		cas_unlock_all_restore(cp, flags);
-
-		netif_device_attach(dev);
-	}
-	mutex_unlock(&cp->pm_mutex);
-	return 0;
-}
-#endif /* CONFIG_PM */
-
-static struct pci_driver cas_driver = {
-	.name		= DRV_MODULE_NAME,
-	.id_table	= cas_pci_tbl,
-	.probe		= cas_init_one,
-	.remove		= cas_remove_one,
-#ifdef CONFIG_PM
-	.suspend	= cas_suspend,
-	.resume		= cas_resume
-#endif
-};
-
-static int __init cas_init(void)
-{
-	if (linkdown_timeout > 0)
-		link_transition_timeout = linkdown_timeout * HZ;
-	else
-		link_transition_timeout = 0;
-
-	return pci_register_driver(&cas_driver);
-}
-
-static void __exit cas_cleanup(void)
-{
-	pci_unregister_driver(&cas_driver);
-}
-
-module_init(cas_init);
-module_exit(cas_cleanup);
+</programlisting>
+</section>
+
+<section>
+	<title>Property types</title>
+<para>
+On <link linkend="FE_GET_PROPERTY">FE_GET_PROPERTY and FE_SET_PROPERTY</link>,
+the actual action is determined by the dtv_property cmd/data pairs. With one single ioctl, is possible to
+get/set up to 64 properties. The actual meaning of each property is described on the next sections.
+</para>
+
+<para>The available frontend property types are shown on the next section.</para>
+</section>
+
+<section id="fe_property_parameters">
+	<title>Digital TV property parameters</title>
+	<section id="DTV-UNDEFINED">
+	<title><constant>DTV_UNDEFINED</constant></title>
+	<para>Used internally. A GET/SET operation for it won't change or return anything.</para>
+	</section>
+	<section id="DTV-TUNE">
+	<title><constant>DTV_TUNE</constant></title>
+	<para>Interpret the cache of data, build either a traditional frontend tunerequest so we can pass validation in the <constant>FE_SET_FRONTEND</constant> ioctl.</para>
+	</section>
+	<section id="DTV-CLEAR">
+	<title><constant>DTV_CLEAR</constant></title>
+	<para>Reset a cache of data specific to the frontend here. This does not effect hardware.</para>
+	</section>
+	<section id="DTV-FREQUENCY">
+		<title><constant>DTV_FREQUENCY</constant></title>
+
+		<para>Central frequency of the channel.</para>
+
+		<para>Notes:</para>
+		<para>1)For satellite delivery systems, it is measured in kHz.
+			For the other ones, it is measured in Hz.</para>
+		<para>2)For ISDB-T, the channels are usually transmitted with an offset of 143kHz.
+			E.g. a valid frequency could be 474143 kHz. The stepping is bound to the bandwidth of
+			the channel which is 6MHz.</para>
+
+		<para>3)As in ISDB-Tsb the channel consists of only one or three segments the
+			frequency step is 429kHz, 3*429 respectively. As for ISDB-T the
+			central frequency of the channel is expected.</para>
+	</section>
+	<section id="DTV-MODULATION">
+	<title><constant>DTV_MODULATION</constant></title>
+<para>Specifies the frontend modulation type for delivery systems that supports
+    more than one modulation type. The modulation can be one of the types
+    defined by &fe-modulation;.</para>
+
+
+<section id="fe-modulation-t">
+<title>Modulation property</title>
+
+<para>Most of the digital TV standards currently offers more than one possible
+    modulation (sometimes called as "constellation" on some standards). This
+    enum contains the values used by the Kernel. Please note that not all
+    modulations are supported by a given standard.</para>
+
+<table pgwide="1" frame="none" id="fe-modulation">
+    <title>enum fe_modulation</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="QPSK"><constant>QPSK</constant></entry>
+	    <entry>QPSK modulation</entry>
+	</row><row>
+	    <entry id="QAM-16"><constant>QAM_16</constant></entry>
+	    <entry>16-QAM modulation</entry>
+	</row><row>
+	    <entry id="QAM-32"><constant>QAM_32</constant></entry>
+	    <entry>32-QAM modulation</entry>
+	</row><row>
+	    <entry id="QAM-64"><constant>QAM_64</constant></entry>
+	    <entry>64-QAM modulation</entry>
+	</row><row>
+	    <entry id="QAM-128"><constant>QAM_128</constant></entry>
+	    <entry>128-QAM modulation</entry>
+	</row><row>
+	    <entry id="QAM-256"><constant>QAM_256</constant></entry>
+	    <entry>256-QAM modulation</entry>
+	</row><row>
+	    <entry id="QAM-AUTO"><constant>QAM_AUTO</constant></entry>
+	    <entry>Autodetect QAM modulation</entry>
+	</row><row>
+	    <entry id="VSB-8"><constant>VSB_8</constant></entry>
+	    <entry>8-VSB modulation</entry>
+	</row><row>
+	    <entry id="VSB-16"><constant>VSB_16</constant></entry>
+	    <entry>16-VSB modulation</entry>
+	</row><row>
+	    <entry id="PSK-8"><constant>PSK_8</constant></entry>
+	    <entry>8-PSK modulation</entry>
+	</row><row>
+	    <entry id="APSK-16"><constant>APSK_16</constant></entry>
+	    <entry>16-APSK modulation</entry>
+	</row><row>
+	    <entry id="APSK-32"><constant>APSK_32</constant></entry>
+	    <entry>32-APSK modulation</entry>
+	</row><row>
+	    <entry id="DQPSK"><constant>DQPSK</constant></entry>
+	    <entry>DQPSK modulation</entry>
+	</row><row>
+	    <entry id="QAM-4-NR"><constant>QAM_4_NR</constant></entry>
+	    <entry>4-QAM-NR modulation</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+</section>
+
+	</section>
+	<section id="DTV-BANDWIDTH-HZ">
+		<title><constant>DTV_BANDWIDTH_HZ</constant></title>
+
+		<para>Bandwidth for the channel, in HZ.</para>
+
+		<para>Possible values:
+			<constant>1712000</constant>,
+			<constant>5000000</constant>,
+			<constant>6000000</constant>,
+			<constant>7000000</constant>,
+			<constant>8000000</constant>,
+			<constant>10000000</constant>.
+		</para>
+
+		<para>Notes:</para>
+
+		<para>1) For ISDB-T it should be always 6000000Hz (6MHz)</para>
+		<para>2) For ISDB-Tsb it can vary depending on the number of connected segments</para>
+		<para>3) Bandwidth doesn't apply for DVB-C transmissions, as the bandwidth
+			 for DVB-C depends on the symbol rate</para>
+		<para>4) Bandwidth in ISDB-T is fixed (6MHz) or can be easily derived from
+			other parameters (DTV_ISDBT_SB_SEGMENT_IDX,
+			DTV_ISDBT_SB_SEGMENT_COUNT).</para>
+		<para>5) DVB-T supports 6, 7 and 8MHz.</para>
+		<para>6) In addition, DVB-T2 supports 1.172, 5 and 10MHz.</para>
+	</section>
+	<section id="DTV-INVERSION">
+	<title><constant>DTV_INVERSION</constant></title>
+
+	<para>Specifies if the frontend should do spectral inversion or not.</para>
+
+<section id="fe-spectral-inversion-t">
+<title>enum fe_modulation: Frontend spectral inversion</title>
+
+<para>This parameter indicates if spectral inversion should be presumed or not.
+    In the automatic setting (<constant>INVERSION_AUTO</constant>) the hardware
+    will try to figure out the correct setting by itself. If the hardware
+    doesn't support, the DVB core will try to lock at the carrier first with
+    inversion off. If it fails, it will try to enable inversion.
+</para>
+
+<table pgwide="1" frame="none" id="fe-spectral-inversion">
+    <title>enum fe_modulation</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="INVERSION-OFF"><constant>INVERSION_OFF</constant></entry>
+	    <entry>Don't do spectral band inversion.</entry>
+	</row><row>
+	    <entry id="INVERSION-ON"><constant>INVERSION_ON</constant></entry>
+	    <entry>Do spectral band inversion.</entry>
+	</row><row>
+	    <entry id="INVERSION-AUTO"><constant>INVERSION_AUTO</constant></entry>
+	    <entry>Autodetect spectral band inversion.</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+</section>
+
+	</section>
+	<section id="DTV-DISEQC-MASTER">
+	<title><constant>DTV_DISEQC_MASTER</constant></title>
+	<para>Currently not implemented.</para>
+	</section>
+	<section id="DTV-SYMBOL-RATE">
+	<title><constant>DTV_SYMBOL_RATE</constant></title>
+	<para>Digital TV symbol rate, in bauds (symbols/second). Used on cable standards.</para>
+	</section>
+	<section id="DTV-INNER-FEC">
+	<title><constant>DTV_INNER_FEC</constant></title>
+	<para>Used cable/satellite transmissions. The acceptable values are:
+	</para>
+<section id="fe-code-rate-t">
+<title>enum fe_code_rate: type of the Forward Error Correction.</title>
+
+<table pgwide="1" frame="none" id="fe-code-rate">
+    <title>enum fe_code_rate</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="FEC-NONE"><constant>FEC_NONE</constant></entry>
+	    <entry>No Forward Error Correction Code</entry>
+	</row><row>
+	    <entry id="FEC-AUTO"><constant>FEC_AUTO</constant></entry>
+	    <entry>Autodetect Error Correction Code</entry>
+	</row><row>
+	    <entry id="FEC-1-2"><constant>FEC_1_2</constant></entry>
+	    <entry>Forward Error Correction Code 1/2</entry>
+	</row><row>
+	    <entry id="FEC-2-3"><constant>FEC_2_3</constant></entry>
+	    <entry>Forward Error Correction Code 2/3</entry>
+	</row><row>
+	    <entry id="FEC-3-4"><constant>FEC_3_4</constant></entry>
+	    <entry>Forward Error Correction Code 3/4</entry>
+	</row><row>
+	    <entry id="FEC-4-5"><constant>FEC_4_5</constant></entry>
+	    <entry>Forward Error Correction Code 4/5</entry>
+	</row><row>
+	    <entry id="FEC-5-6"><constant>FEC_5_6</constant></entry>
+	    <entry>Forward Error Correction Code 5/6</entry>
+	</row><row>
+	    <entry id="FEC-6-7"><constant>FEC_6_7</constant></entry>
+	    <entry>Forward Error Correction Code 6/7</entry>
+	</row><row>
+	    <entry id="FEC-7-8"><constant>FEC_7_8</constant></entry>
+	    <entry>Forward Error Correction Code 7/8</entry>
+	</row><row>
+	    <entry id="FEC-8-9"><constant>FEC_8_9</constant></entry>
+	    <entry>Forward Error Correction Code 8/9</entry>
+	</row><row>
+	    <entry id="FEC-9-10"><constant>FEC_9_10</constant></entry>
+	    <entry>Forward Error Correction Code 9/10</entry>
+	</row><row>
+	    <entry id="FEC-2-5"><constant>FEC_2_5</constant></entry>
+	    <entry>Forward Error Correction Code 2/5</entry>
+	</row><row>
+	    <entry id="FEC-3-5"><constant>FEC_3_5</constant></entry>
+	    <entry>Forward Error Correction Code 3/5</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+</section>
+	</section>
+	<section id="DTV-VOLTAGE">
+	<title><constant>DTV_VOLTAGE</constant></title>
+	<para>The voltage is usually used with non-DiSEqC capable LNBs to switch
+	the polarzation (horizontal/vertical). When using DiSEqC epuipment this
+	voltage has to be switched consistently to the DiSEqC commands as
+	described in the DiSEqC spec.</para>
+
+<table pgwide="1" frame="none" id="fe-sec-voltage">
+    <title id="fe-sec-voltage-t">enum fe_sec_voltage</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry align="char" id="SEC-VOLTAGE-13"><constant>SEC_VOLTAGE_13</constant></entry>
+	    <entry align="char">Set DC voltage level to 13V</entry>
+	</row><row>
+	    <entry align="char" id="SEC-VOLTAGE-18"><constant>SEC_VOLTAGE_18</constant></entry>
+	    <entry align="char">Set DC voltage level to 18V</entry>
+	</row><row>
+	    <entry align="char" id="SEC-VOLTAGE-OFF"><constant>SEC_VOLTAGE_OFF</constant></entry>
+	    <entry align="char">Don't send any voltage to the antenna</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+	</section>
+	<section id="DTV-TONE">
+	<title><constant>DTV_TONE</constant></title>
+	<para>Currently not used.</para>
+	</section>
+	<section id="DTV-PILOT">
+	<title><constant>DTV_PILOT</constant></title>
+	<para>Sets DVB-S2 pilot</para>
+	<section id="fe-pilot-t">
+		<title>fe_pilot type</title>
+<table pgwide="1" frame="none" id="fe-pilot">
+    <title>enum fe_pilot</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry align="char" id="PILOT-ON"><constant>PILOT_ON</constant></entry>
+	    <entry align="char">Pilot tones enabled</entry>
+	</row><row>
+	    <entry align="char" id="PILOT-OFF"><constant>PILOT_OFF</constant></entry>
+	    <entry align="char">Pilot tones disabled</entry>
+	</row><row>
+	    <entry align="char" id="PILOT-AUTO"><constant>PILOT_AUTO</constant></entry>
+	    <entry align="char">Autodetect pilot tones</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+		</section>
+	</section>
+	<section id="DTV-ROLLOFF">
+	<title><constant>DTV_ROLLOFF</constant></title>
+		<para>Sets DVB-S2 rolloff</para>
+
+	<section id="fe-rolloff-t">
+		<title>fe_rolloff type</title>
+<table pgwide="1" frame="none" id="fe-rolloff">
+    <title>enum fe_rolloff</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry align="char" id="ROLLOFF-35"><constant>ROLLOFF_35</constant></entry>
+	    <entry align="char">Roloff factor: &alpha;=35%</entry>
+	</row><row>
+	    <entry align="char" id="ROLLOFF-20"><constant>ROLLOFF_20</constant></entry>
+	    <entry align="char">Roloff factor: &alpha;=20%</entry>
+	</row><row>
+	    <entry align="char" id="ROLLOFF-25"><constant>ROLLOFF_25</constant></entry>
+	    <entry align="char">Roloff factor: &alpha;=25%</entry>
+	</row><row>
+	    <entry align="char" id="ROLLOFF-AUTO"><constant>ROLLOFF_AUTO</constant></entry>
+	    <entry align="char">Auto-detect the roloff factor.</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+		</section>
+	</section>
+	<section id="DTV-DISEQC-SLAVE-REPLY">
+	<title><constant>DTV_DISEQC_SLAVE_REPLY</constant></title>
+	<para>Currently not implemented.</para>
+	</section>
+	<section id="DTV-FE-CAPABILITY-COUNT">
+	<title><constant>DTV_FE_CAPABILITY_COUNT</constant></title>
+	<para>Currently not implemented.</para>
+	</section>
+	<section id="DTV-FE-CAPABILITY">
+	<title><constant>DTV_FE_CAPABILITY</constant></title>
+	<para>Currently not implemented.</para>
+	</section>
+	<section id="DTV-DELIVERY-SYSTEM">
+		<title><constant>DTV_DELIVERY_SYSTEM</constant></title>
+		<para>Specifies the type of Delivery system</para>
+		<section id="fe-delivery-system-t">
+		<title>fe_delivery_system type</title>
+		<para>Possible values: </para>
+
+<table pgwide="1" frame="none" id="fe-delivery-system">
+    <title>enum fe_delivery_system</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+		<entry id="SYS-UNDEFINED"><constant>SYS_UNDEFINED</constant></entry>
+		<entry>Undefined standard. Generally, indicates an error</entry>
+	</row><row>
+		<entry id="SYS-DVBC-ANNEX-A"><constant>SYS_DVBC_ANNEX_A</constant></entry>
+		<entry>Cable TV: DVB-C following ITU-T J.83 Annex A spec</entry>
+	</row><row>
+		<entry id="SYS-DVBC-ANNEX-B"><constant>SYS_DVBC_ANNEX_B</constant></entry>
+		<entry>Cable TV: DVB-C following ITU-T J.83 Annex B spec (ClearQAM)</entry>
+	</row><row>
+		<entry id="SYS-DVBC-ANNEX-C"><constant>SYS_DVBC_ANNEX_C</constant></entry>
+		<entry>Cable TV: DVB-C following ITU-T J.83 Annex C spec</entry>
+	</row><row>
+		<entry id="SYS-ISDBC"><constant>SYS_ISDBC</constant></entry>
+		<entry>Cable TV: ISDB-C (no drivers yet)</entry>
+	</row><row>
+		<entry id="SYS-DVBT"><constant>SYS_DVBT</constant></entry>
+		<entry>Terrestral TV: DVB-T</entry>
+	</row><row>
+		<entry id="SYS-DVBT2"><constant>SYS_DVBT2</constant></entry>
+		<entry>Terrestral TV: DVB-T2</entry>
+	</row><row>
+		<entry id="SYS-ISDBT"><constant>SYS_ISDBT</constant></entry>
+		<entry>Terrestral TV: ISDB-T</entry>
+	</row><row>
+		<entry id="SYS-ATSC"><constant>SYS_ATSC</constant></entry>
+		<entry>Terrestral TV: ATSC</entry>
+	</row><row>
+		<entry id="SYS-ATSCMH"><constant>SYS_ATSCMH</constant></entry>
+		<entry>Terrestral TV (mobile): ATSC-M/H</entry>
+	</row><row>
+		<entry id="SYS-DTMB"><constant>SYS_DTMB</constant></entry>
+		<entry>Terrestrial TV: DTMB</entry>
+	</row><row>
+		<entry id="SYS-DVBS"><constant>SYS_DVBS</constant></entry>
+		<entry>Satellite TV: DVB-S</entry>
+	</row><row>
+		<entry id="SYS-DVBS2"><constant>SYS_DVBS2</constant></entry>
+		<entry>Satellite TV: DVB-S2</entry>
+	</row><row>
+		<entry id="SYS-TURBO"><constant>SYS_TURBO</constant></entry>
+		<entry>Satellite TV: DVB-S Turbo</entry>
+	</row><row>
+		<entry id="SYS-ISDBS"><constant>SYS_ISDBS</constant></entry>
+		<entry>Satellite TV: ISDB-S</entry>
+	</row><row>
+		<entry id="SYS-DAB"><constant>SYS_DAB</constant></entry>
+		<entry>Digital audio: DAB (not fully supported)</entry>
+	</row><row>
+		<entry id="SYS-DSS"><constant>SYS_DSS</constant></entry>
+		<entry>Satellite TV:"DSS (not fully supported)</entry>
+	</row><row>
+		<entry id="SYS-CMMB"><constant>SYS_CMMB</constant></entry>
+		<entry>Terrestral TV (mobile):CMMB (not fully supported)</entry>
+	</row><row>
+		<entry id="SYS-DVBH"><constant>SYS_DVBH</constant></entry>
+		<entry>Terrestral TV (mobile): DVB-H (standard deprecated)</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+
+
+</section>
+	</section>
+	<section id="DTV-ISDBT-PARTIAL-RECEPTION">
+		<title><constant>DTV_ISDBT_PARTIAL_RECEPTION</constant></title>
+
+		<para>If <constant>DTV_ISDBT_SOUND_BROADCASTING</constant> is '0' this bit-field represents whether
+			the channel is in partial reception mode or not.</para>
+
+		<para>If '1' <constant>DTV_ISDBT_LAYERA_*</constant> values are assigned to the center segment and
+			<constant>DTV_ISDBT_LAYERA_SEGMENT_COUNT</constant> has to be '1'.</para>
+
+		<para>If in addition <constant>DTV_ISDBT_SOUND_BROADCASTING</constant> is '1'
+			<constant>DTV_ISDBT_PARTIAL_RECEPTION</constant> represents whether this ISDB-Tsb channel
+			is consisting of one segment and layer or three segments and two layers.</para>
+
+		<para>Possible values: 0, 1, -1 (AUTO)</para>
+	</section>
+	<section id="DTV-ISDBT-SOUND-BROADCASTING">
+		<title><constant>DTV_ISDBT_SOUND_BROADCASTING</constant></title>
+
+		<para>This field represents whether the other DTV_ISDBT_*-parameters are
+			referring to an ISDB-T and an ISDB-Tsb channel. (See also
+			<constant>DTV_ISDBT_PARTIAL_RECEPTION</constant>).</para>
+
+		<para>Possible values: 0, 1, -1 (AUTO)</para>
+	</section>
+	<section id="DTV-ISDBT-SB-SUBCHANNEL-ID">
+		<title><constant>DTV_ISDBT_SB_SUBCHANNEL_ID</constant></title>
+
+		<para>This field only applies if <constant>DTV_ISDBT_SOUND_BROADCASTING</constant> is '1'.</para>
+
+		<para>(Note of the author: This might not be the correct description of the
+			<constant>SUBCHANNEL-ID</constant> in all details, but it is my understanding of the technical
+			background needed to program a device)</para>
+
+		<para>An ISDB-Tsb channel (1 or 3 segments) can be broadcasted alone or in a
+			set of connected ISDB-Tsb channels. In this set of channels every
+			channel can be received independently. The number of connected
+			ISDB-Tsb segment can vary, e.g. depending on the frequency spectrum
+			bandwidth available.</para>
+
+		<para>Example: Assume 8 ISDB-Tsb connected segments are broadcasted. The
+			broadcaster has several possibilities to put those channels in the
+			air: Assuming a normal 13-segment ISDB-T spectrum he can align the 8
+			segments from position 1-8 to 5-13 or anything in between.</para>
+
+		<para>The underlying layer of segments are subchannels: each segment is
+			consisting of several subchannels with a predefined IDs. A sub-channel
+			is used to help the demodulator to synchronize on the channel.</para>
+
+		<para>An ISDB-T channel is always centered over all sub-channels. As for
+			the example above, in ISDB-Tsb it is no longer as simple as that.</para>
+
+		<para><constant>The DTV_ISDBT_SB_SUBCHANNEL_ID</constant> parameter is used to give the
+			sub-channel ID of the segment to be demodulated.</para>
+
+		<para>Possible values: 0 .. 41, -1 (AUTO)</para>
+	</section>
+	<section id="DTV-ISDBT-SB-SEGMENT-IDX">
+		<title><constant>DTV_ISDBT_SB_SEGMENT_IDX</constant></titl

@@ -1,27 +1,12 @@
-/* Unusual Devices File for the Lexar "Jumpshot" Compact Flash reader
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#if defined(CONFIG_USB_STORAGE_JUMPSHOT) || \
-		defined(CONFIG_USB_STORAGE_JUMPSHOT_MODULE)
-
-UNUSUAL_DEV(  0x05dc, 0x0001, 0x0000, 0x0001,
-		"Lexar",
-		"Jumpshot USB CF Reader",
-		USB_SC_SCSI, USB_PR_JUMPSHOT, NULL,
-		US_FL_NEED_OVERRIDE),
-
-#endif /* defined(CONFIG_USB_STORAGE_JUMPSHOT) || ... */
+ixPSX80_PHY0_RX_DLL_CTL_LANE1                                           0x1200103
+#define ixPSX80_PHY0_RX_DLL_CTL_LANE2                                           0x1200203
+#define ixPSX80_PHY0_RX_DLL_CTL_LANE3                                           0x1200303
+#define ixPSX80_PHY0_RX_DLL_CTL_LANE4                                           0x1200403
+#define ixPSX80_PHY0_RX_DLL_CTL_LANE5                                           0x1200503
+#define ixPSX80_PHY0_RX_DLL_CTL_LANE6                                           0x1200603
+#define ixPSX80_PHY0_RX_DLL_CTL_LANE7                                           0x1200703
+#define ixPSX80_PHY0_RX_RXTEST_REGS_BROADCAST                                   0x120fe04
+#define ixPSX80_PHY0_RX_RXTEST_REGS_LANE0                                       0x1200004
+#define ixPSX80_PHY0_RX_RXTEST_REGS_LANE1                                       0x1200104
+#define ixPSX80_PHY0_RX_RXTEST_REGS_LANE2                                       0x1200204
+#define ixPSX80_PHY0_RX_RXTEST_REGS_LANE3                                   

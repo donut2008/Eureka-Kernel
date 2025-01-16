@@ -1,966 +1,597 @@
-/*
- * Texas Instruments DSPS platforms "glue layer"
- *
- * Copyright (C) 2012, by Texas Instruments
- *
- * Based on the am35x "glue layer" code.
- *
- * This file is part of the Inventra Controller Driver for Linux.
- *
- * The Inventra Controller Driver for Linux is free software; you
- * can redistribute it and/or modify it under the terms of the GNU
- * General Public License version 2 as published by the Free Software
- * Foundation.
- *
- * The Inventra Controller Driver for Linux is distributed in
- * the hope that it will be useful, but WITHOUT ANY WARRANTY;
- * without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
- * License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with The Inventra Controller Driver for Linux ; if not,
- * write to the Free Software Foundation, Inc., 59 Temple Place,
- * Suite 330, Boston, MA  02111-1307  USA
- *
- * musb_dsps.c will be a common file for all the TI DSPS platforms
- * such as dm64x, dm36x, dm35x, da8x, am35x and ti81x.
- * For now only ti81x is using this and in future davinci.c, am35x.c
- * da8xx.c would be merged to this file after testing.
- */
-
-#include <linux/io.h>
-#include <linux/err.h>
-#include <linux/platform_device.h>
-#include <linux/dma-mapping.h>
-#include <linux/pm_runtime.h>
-#include <linux/module.h>
-#include <linux/usb/usb_phy_generic.h>
-#include <linux/platform_data/usb-omap.h>
-#include <linux/sizes.h>
-
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/of_address.h>
-#include <linux/of_irq.h>
-#include <linux/usb/of.h>
-
-#include <linux/debugfs.h>
-
-#include "musb_core.h"
-
-static const struct of_device_id musb_dsps_of_match[];
-
-/**
- * avoid using musb_readx()/musb_writex() as glue layer should not be
- * dependent on musb core layer symbols.
- */
-static inline u8 dsps_readb(const void __iomem *addr, unsigned offset)
-{
-	return __raw_readb(addr + offset);
-}
-
-static inline u32 dsps_readl(const void __iomem *addr, unsigned offset)
-{
-	return __raw_readl(addr + offset);
-}
-
-static inline void dsps_writeb(void __iomem *addr, unsigned offset, u8 data)
-{
-	__raw_writeb(data, addr + offset);
-}
-
-static inline void dsps_writel(void __iomem *addr, unsigned offset, u32 data)
-{
-	__raw_writel(data, addr + offset);
-}
-
-/**
- * DSPS musb wrapper register offset.
- * FIXME: This should be expanded to have all the wrapper registers from TI DSPS
- * musb ips.
- */
-struct dsps_musb_wrapper {
-	u16	revision;
-	u16	control;
-	u16	status;
-	u16	epintr_set;
-	u16	epintr_clear;
-	u16	epintr_status;
-	u16	coreintr_set;
-	u16	coreintr_clear;
-	u16	coreintr_status;
-	u16	phy_utmi;
-	u16	mode;
-	u16	tx_mode;
-	u16	rx_mode;
-
-	/* bit positions for control */
-	unsigned	reset:5;
-
-	/* bit positions for interrupt */
-	unsigned	usb_shift:5;
-	u32		usb_mask;
-	u32		usb_bitmap;
-	unsigned	drvvbus:5;
-
-	unsigned	txep_shift:5;
-	u32		txep_mask;
-	u32		txep_bitmap;
-
-	unsigned	rxep_shift:5;
-	u32		rxep_mask;
-	u32		rxep_bitmap;
-
-	/* bit positions for phy_utmi */
-	unsigned	otg_disable:5;
-
-	/* bit positions for mode */
-	unsigned	iddig:5;
-	unsigned	iddig_mux:5;
-	/* miscellaneous stuff */
-	unsigned	poll_timeout;
-};
-
-/*
- * register shadow for suspend
- */
-struct dsps_context {
-	u32 control;
-	u32 epintr;
-	u32 coreintr;
-	u32 phy_utmi;
-	u32 mode;
-	u32 tx_mode;
-	u32 rx_mode;
-};
-
-/**
- * DSPS glue structure.
- */
-struct dsps_glue {
-	struct device *dev;
-	struct platform_device *musb;	/* child musb pdev */
-	const struct dsps_musb_wrapper *wrp; /* wrapper register offsets */
-	struct timer_list timer;	/* otg_workaround timer */
-	unsigned long last_timer;    /* last timer data for each instance */
-	bool sw_babble_enabled;
-
-	struct dsps_context context;
-	struct debugfs_regset32 regset;
-	struct dentry *dbgfs_root;
-};
-
-static const struct debugfs_reg32 dsps_musb_regs[] = {
-	{ "revision",		0x00 },
-	{ "control",		0x14 },
-	{ "status",		0x18 },
-	{ "eoi",		0x24 },
-	{ "intr0_stat",		0x30 },
-	{ "intr1_stat",		0x34 },
-	{ "intr0_set",		0x38 },
-	{ "intr1_set",		0x3c },
-	{ "txmode",		0x70 },
-	{ "rxmode",		0x74 },
-	{ "autoreq",		0xd0 },
-	{ "srpfixtime",		0xd4 },
-	{ "tdown",		0xd8 },
-	{ "phy_utmi",		0xe0 },
-	{ "mode",		0xe8 },
-};
-
-static void dsps_musb_try_idle(struct musb *musb, unsigned long timeout)
-{
-	struct device *dev = musb->controller;
-	struct dsps_glue *glue = dev_get_drvdata(dev->parent);
-
-	if (timeout == 0)
-		timeout = jiffies + msecs_to_jiffies(3);
-
-	/* Never idle if active, or when VBUS timeout is not set as host */
-	if (musb->is_active || (musb->a_wait_bcon == 0 &&
-			musb->xceiv->otg->state == OTG_STATE_A_WAIT_BCON)) {
-		dev_dbg(musb->controller, "%s active, deleting timer\n",
-				usb_otg_state_string(musb->xceiv->otg->state));
-		del_timer(&glue->timer);
-		glue->last_timer = jiffies;
-		return;
-	}
-	if (musb->port_mode != MUSB_PORT_MODE_DUAL_ROLE)
-		return;
-
-	if (!musb->g.dev.driver)
-		return;
-
-	if (time_after(glue->last_timer, timeout) &&
-				timer_pending(&glue->timer)) {
-		dev_dbg(musb->controller,
-			"Longer idle timer already pending, ignoring...\n");
-		return;
-	}
-	glue->last_timer = timeout;
-
-	dev_dbg(musb->controller, "%s inactive, starting idle timer for %u ms\n",
-		usb_otg_state_string(musb->xceiv->otg->state),
-			jiffies_to_msecs(timeout - jiffies));
-	mod_timer(&glue->timer, timeout);
-}
-
-/**
- * dsps_musb_enable - enable interrupts
- */
-static void dsps_musb_enable(struct musb *musb)
-{
-	struct device *dev = musb->controller;
-	struct platform_device *pdev = to_platform_device(dev->parent);
-	struct dsps_glue *glue = platform_get_drvdata(pdev);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-	void __iomem *reg_base = musb->ctrl_base;
-	u32 epmask, coremask;
-
-	/* Workaround: setup IRQs through both register sets. */
-	epmask = ((musb->epmask & wrp->txep_mask) << wrp->txep_shift) |
-	       ((musb->epmask & wrp->rxep_mask) << wrp->rxep_shift);
-	coremask = (wrp->usb_bitmap & ~MUSB_INTR_SOF);
-
-	dsps_writel(reg_base, wrp->epintr_set, epmask);
-	dsps_writel(reg_base, wrp->coreintr_set, coremask);
-	/* start polling for ID change in dual-role idle mode */
-	if (musb->xceiv->otg->state == OTG_STATE_B_IDLE &&
-			musb->port_mode == MUSB_PORT_MODE_DUAL_ROLE)
-		mod_timer(&glue->timer, jiffies +
-				msecs_to_jiffies(wrp->poll_timeout));
-	dsps_musb_try_idle(musb, 0);
-}
-
-/**
- * dsps_musb_disable - disable HDRC and flush interrupts
- */
-static void dsps_musb_disable(struct musb *musb)
-{
-	struct device *dev = musb->controller;
-	struct platform_device *pdev = to_platform_device(dev->parent);
-	struct dsps_glue *glue = platform_get_drvdata(pdev);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-	void __iomem *reg_base = musb->ctrl_base;
-
-	dsps_writel(reg_base, wrp->coreintr_clear, wrp->usb_bitmap);
-	dsps_writel(reg_base, wrp->epintr_clear,
-			 wrp->txep_bitmap | wrp->rxep_bitmap);
-	dsps_writeb(musb->mregs, MUSB_DEVCTL, 0);
-}
-
-static void otg_timer(unsigned long _musb)
-{
-	struct musb *musb = (void *)_musb;
-	void __iomem *mregs = musb->mregs;
-	struct device *dev = musb->controller;
-	struct dsps_glue *glue = dev_get_drvdata(dev->parent);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-	u8 devctl;
-	unsigned long flags;
-	int skip_session = 0;
-
-	/*
-	 * We poll because DSPS IP's won't expose several OTG-critical
-	 * status change events (from the transceiver) otherwise.
-	 */
-	devctl = dsps_readb(mregs, MUSB_DEVCTL);
-	dev_dbg(musb->controller, "Poll devctl %02x (%s)\n", devctl,
-				usb_otg_state_string(musb->xceiv->otg->state));
-
-	spin_lock_irqsave(&musb->lock, flags);
-	switch (musb->xceiv->otg->state) {
-	case OTG_STATE_A_WAIT_BCON:
-		dsps_writeb(musb->mregs, MUSB_DEVCTL, 0);
-		skip_session = 1;
-		/* fall */
-
-	case OTG_STATE_A_IDLE:
-	case OTG_STATE_B_IDLE:
-		if (devctl & MUSB_DEVCTL_BDEVICE) {
-			musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-			MUSB_DEV_MODE(musb);
-		} else {
-			musb->xceiv->otg->state = OTG_STATE_A_IDLE;
-			MUSB_HST_MODE(musb);
-		}
-		if (!(devctl & MUSB_DEVCTL_SESSION) && !skip_session)
-			dsps_writeb(mregs, MUSB_DEVCTL, MUSB_DEVCTL_SESSION);
-		mod_timer(&glue->timer, jiffies +
-				msecs_to_jiffies(wrp->poll_timeout));
-		break;
-	case OTG_STATE_A_WAIT_VFALL:
-		musb->xceiv->otg->state = OTG_STATE_A_WAIT_VRISE;
-		dsps_writel(musb->ctrl_base, wrp->coreintr_set,
-			    MUSB_INTR_VBUSERROR << wrp->usb_shift);
-		break;
-	default:
-		break;
-	}
-	spin_unlock_irqrestore(&musb->lock, flags);
-}
-
-void dsps_musb_clear_ep_rxintr(struct musb *musb, int epnum)
-{
-	u32 epintr;
-	struct dsps_glue *glue = dev_get_drvdata(musb->controller->parent);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-
-	/* musb->lock might already been held */
-	epintr = (1 << epnum) << wrp->rxep_shift;
-	musb_writel(musb->ctrl_base, wrp->epintr_status, epintr);
-}
-
-static irqreturn_t dsps_interrupt(int irq, void *hci)
-{
-	struct musb  *musb = hci;
-	void __iomem *reg_base = musb->ctrl_base;
-	struct device *dev = musb->controller;
-	struct dsps_glue *glue = dev_get_drvdata(dev->parent);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-	unsigned long flags;
-	irqreturn_t ret = IRQ_NONE;
-	u32 epintr, usbintr;
-
-	spin_lock_irqsave(&musb->lock, flags);
-
-	/* Get endpoint interrupts */
-	epintr = dsps_readl(reg_base, wrp->epintr_status);
-	musb->int_rx = (epintr & wrp->rxep_bitmap) >> wrp->rxep_shift;
-	musb->int_tx = (epintr & wrp->txep_bitmap) >> wrp->txep_shift;
-
-	if (epintr)
-		dsps_writel(reg_base, wrp->epintr_status, epintr);
-
-	/* Get usb core interrupts */
-	usbintr = dsps_readl(reg_base, wrp->coreintr_status);
-	if (!usbintr && !epintr)
-		goto out;
-
-	musb->int_usb =	(usbintr & wrp->usb_bitmap) >> wrp->usb_shift;
-	if (usbintr)
-		dsps_writel(reg_base, wrp->coreintr_status, usbintr);
-
-	dev_dbg(musb->controller, "usbintr (%x) epintr(%x)\n",
-			usbintr, epintr);
-
-	if (usbintr & ((1 << wrp->drvvbus) << wrp->usb_shift)) {
-		int drvvbus = dsps_readl(reg_base, wrp->status);
-		void __iomem *mregs = musb->mregs;
-		u8 devctl = dsps_readb(mregs, MUSB_DEVCTL);
-		int err;
-
-		err = musb->int_usb & MUSB_INTR_VBUSERROR;
-		if (err) {
-			/*
-			 * The Mentor core doesn't debounce VBUS as needed
-			 * to cope with device connect current spikes. This
-			 * means it's not uncommon for bus-powered devices
-			 * to get VBUS errors during enumeration.
-			 *
-			 * This is a workaround, but newer RTL from Mentor
-			 * seems to allow a better one: "re"-starting sessions
-			 * without waiting for VBUS to stop registering in
-			 * devctl.
-			 */
-			musb->int_usb &= ~MUSB_INTR_VBUSERROR;
-			musb->xceiv->otg->state = OTG_STATE_A_WAIT_VFALL;
-			mod_timer(&glue->timer, jiffies +
-					msecs_to_jiffies(wrp->poll_timeout));
-			WARNING("VBUS error workaround (delay coming)\n");
-		} else if (drvvbus) {
-			MUSB_HST_MODE(musb);
-			musb->xceiv->otg->default_a = 1;
-			musb->xceiv->otg->state = OTG_STATE_A_WAIT_VRISE;
-			del_timer(&glue->timer);
-		} else {
-			musb->is_active = 0;
-			MUSB_DEV_MODE(musb);
-			musb->xceiv->otg->default_a = 0;
-			musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-		}
-
-		/* NOTE: this must complete power-on within 100 ms. */
-		dev_dbg(musb->controller, "VBUS %s (%s)%s, devctl %02x\n",
-				drvvbus ? "on" : "off",
-				usb_otg_state_string(musb->xceiv->otg->state),
-				err ? " ERROR" : "",
-				devctl);
-		ret = IRQ_HANDLED;
-	}
-
-	if (musb->int_tx || musb->int_rx || musb->int_usb)
-		ret |= musb_interrupt(musb);
-
-	/* Poll for ID change in OTG port mode */
-	if (musb->xceiv->otg->state == OTG_STATE_B_IDLE &&
-			musb->port_mode == MUSB_PORT_MODE_DUAL_ROLE)
-		mod_timer(&glue->timer, jiffies +
-				msecs_to_jiffies(wrp->poll_timeout));
-out:
-	spin_unlock_irqrestore(&musb->lock, flags);
-
-	return ret;
-}
-
-static int dsps_musb_dbg_init(struct musb *musb, struct dsps_glue *glue)
-{
-	struct dentry *root;
-	struct dentry *file;
-	char buf[128];
-
-	sprintf(buf, "%s.dsps", dev_name(musb->controller));
-	root = debugfs_create_dir(buf, NULL);
-	if (!root)
-		return -ENOMEM;
-	glue->dbgfs_root = root;
-
-	glue->regset.regs = dsps_musb_regs;
-	glue->regset.nregs = ARRAY_SIZE(dsps_musb_regs);
-	glue->regset.base = musb->ctrl_base;
-
-	file = debugfs_create_regset32("regdump", S_IRUGO, root, &glue->regset);
-	if (!file) {
-		debugfs_remove_recursive(root);
-		return -ENOMEM;
-	}
-	return 0;
-}
-
-static int dsps_musb_init(struct musb *musb)
-{
-	struct device *dev = musb->controller;
-	struct dsps_glue *glue = dev_get_drvdata(dev->parent);
-	struct platform_device *parent = to_platform_device(dev->parent);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-	void __iomem *reg_base;
-	struct resource *r;
-	u32 rev, val;
-	int ret;
-
-	r = platform_get_resource_byname(parent, IORESOURCE_MEM, "control");
-	reg_base = devm_ioremap_resource(dev, r);
-	if (IS_ERR(reg_base))
-		return PTR_ERR(reg_base);
-	musb->ctrl_base = reg_base;
-
-	/* NOP driver needs change if supporting dual instance */
-	musb->xceiv = devm_usb_get_phy_by_phandle(dev->parent, "phys", 0);
-	if (IS_ERR(musb->xceiv))
-		return PTR_ERR(musb->xceiv);
-
-	musb->phy = devm_phy_get(dev->parent, "usb2-phy");
-
-	/* Returns zero if e.g. not clocked */
-	rev = dsps_readl(reg_base, wrp->revision);
-	if (!rev)
-		return -ENODEV;
-
-	usb_phy_init(musb->xceiv);
-	if (IS_ERR(musb->phy))  {
-		musb->phy = NULL;
-	} else {
-		ret = phy_init(musb->phy);
-		if (ret < 0)
-			return ret;
-		ret = phy_power_on(musb->phy);
-		if (ret) {
-			phy_exit(musb->phy);
-			return ret;
-		}
-	}
-
-	setup_timer(&glue->timer, otg_timer, (unsigned long) musb);
-
-	/* Reset the musb */
-	dsps_writel(reg_base, wrp->control, (1 << wrp->reset));
-
-	musb->isr = dsps_interrupt;
-
-	/* reset the otgdisable bit, needed for host mode to work */
-	val = dsps_readl(reg_base, wrp->phy_utmi);
-	val &= ~(1 << wrp->otg_disable);
-	dsps_writel(musb->ctrl_base, wrp->phy_utmi, val);
-
-	/*
-	 *  Check whether the dsps version has babble control enabled.
-	 * In latest silicon revision the babble control logic is enabled.
-	 * If MUSB_BABBLE_CTL returns 0x4 then we have the babble control
-	 * logic enabled.
-	 */
-	val = dsps_readb(musb->mregs, MUSB_BABBLE_CTL);
-	if (val & MUSB_BABBLE_RCV_DISABLE) {
-		glue->sw_babble_enabled = true;
-		val |= MUSB_BABBLE_SW_SESSION_CTRL;
-		dsps_writeb(musb->mregs, MUSB_BABBLE_CTL, val);
-	}
-
-	return dsps_musb_dbg_init(musb, glue);
-}
-
-static int dsps_musb_exit(struct musb *musb)
-{
-	struct device *dev = musb->controller;
-	struct dsps_glue *glue = dev_get_drvdata(dev->parent);
-
-	del_timer_sync(&glue->timer);
-	usb_phy_shutdown(musb->xceiv);
-	phy_power_off(musb->phy);
-	phy_exit(musb->phy);
-	debugfs_remove_recursive(glue->dbgfs_root);
-
-	return 0;
-}
-
-static int dsps_musb_set_mode(struct musb *musb, u8 mode)
-{
-	struct device *dev = musb->controller;
-	struct dsps_glue *glue = dev_get_drvdata(dev->parent);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-	void __iomem *ctrl_base = musb->ctrl_base;
-	u32 reg;
-
-	reg = dsps_readl(ctrl_base, wrp->mode);
-
-	switch (mode) {
-	case MUSB_HOST:
-		reg &= ~(1 << wrp->iddig);
-
-		/*
-		 * if we're setting mode to host-only or device-only, we're
-		 * going to ignore whatever the PHY sends us and just force
-		 * ID pin status by SW
-		 */
-		reg |= (1 << wrp->iddig_mux);
-
-		dsps_writel(ctrl_base, wrp->mode, reg);
-		dsps_writel(ctrl_base, wrp->phy_utmi, 0x02);
-		break;
-	case MUSB_PERIPHERAL:
-		reg |= (1 << wrp->iddig);
-
-		/*
-		 * if we're setting mode to host-only or device-only, we're
-		 * going to ignore whatever the PHY sends us and just force
-		 * ID pin status by SW
-		 */
-		reg |= (1 << wrp->iddig_mux);
-
-		dsps_writel(ctrl_base, wrp->mode, reg);
-		break;
-	case MUSB_OTG:
-		dsps_writel(ctrl_base, wrp->phy_utmi, 0x02);
-		break;
-	default:
-		dev_err(glue->dev, "unsupported mode %d\n", mode);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static bool dsps_sw_babble_control(struct musb *musb)
-{
-	u8 babble_ctl;
-	bool session_restart =  false;
-
-	babble_ctl = dsps_readb(musb->mregs, MUSB_BABBLE_CTL);
-	dev_dbg(musb->controller, "babble: MUSB_BABBLE_CTL value %x\n",
-		babble_ctl);
-	/*
-	 * check line monitor flag to check whether babble is
-	 * due to noise
-	 */
-	dev_dbg(musb->controller, "STUCK_J is %s\n",
-		babble_ctl & MUSB_BABBLE_STUCK_J ? "set" : "reset");
-
-	if (babble_ctl & MUSB_BABBLE_STUCK_J) {
-		int timeout = 10;
-
-		/*
-		 * babble is due to noise, then set transmit idle (d7 bit)
-		 * to resume normal operation
-		 */
-		babble_ctl = dsps_readb(musb->mregs, MUSB_BABBLE_CTL);
-		babble_ctl |= MUSB_BABBLE_FORCE_TXIDLE;
-		dsps_writeb(musb->mregs, MUSB_BABBLE_CTL, babble_ctl);
-
-		/* wait till line monitor flag cleared */
-		dev_dbg(musb->controller, "Set TXIDLE, wait J to clear\n");
-		do {
-			babble_ctl = dsps_readb(musb->mregs, MUSB_BABBLE_CTL);
-			udelay(1);
-		} while ((babble_ctl & MUSB_BABBLE_STUCK_J) && timeout--);
-
-		/* check whether stuck_at_j bit cleared */
-		if (babble_ctl & MUSB_BABBLE_STUCK_J) {
-			/*
-			 * real babble condition has occurred
-			 * restart the controller to start the
-			 * session again
-			 */
-			dev_dbg(musb->controller, "J not cleared, misc (%x)\n",
-				babble_ctl);
-			session_restart = true;
-		}
-	} else {
-		session_restart = true;
-	}
-
-	return session_restart;
-}
-
-static int dsps_musb_recover(struct musb *musb)
-{
-	struct device *dev = musb->controller;
-	struct dsps_glue *glue = dev_get_drvdata(dev->parent);
-	int session_restart = 0;
-
-	if (glue->sw_babble_enabled)
-		session_restart = dsps_sw_babble_control(musb);
-	else
-		session_restart = 1;
-
-	return session_restart ? 0 : -EPIPE;
-}
-
-/* Similar to am35x, dm81xx support only 32-bit read operation */
-static void dsps_read_fifo32(struct musb_hw_ep *hw_ep, u16 len, u8 *dst)
-{
-	void __iomem *fifo = hw_ep->fifo;
-
-	if (len >= 4) {
-		ioread32_rep(fifo, dst, len >> 2);
-		dst += len & ~0x03;
-		len &= 0x03;
-	}
-
-	/* Read any remaining 1 to 3 bytes */
-	if (len > 0) {
-		u32 val = musb_readl(fifo, 0);
-		memcpy(dst, &val, len);
-	}
-}
-
-static struct musb_platform_ops dsps_ops = {
-	.quirks		= MUSB_DMA_CPPI41 | MUSB_INDEXED_EP,
-	.init		= dsps_musb_init,
-	.exit		= dsps_musb_exit,
-
-#ifdef CONFIG_USB_TI_CPPI41_DMA
-	.dma_init	= cppi41_dma_controller_create,
-	.dma_exit	= cppi41_dma_controller_destroy,
+D1_PANEL_ID_MASKb0    0x0FF
+#define ATOM_S4_LCD1_REFRESH_MASKb1     ATOM_S4_LCD1_PANEL_ID_MASKb0
+#define ATOM_S4_VRAM_INFO_MASKb2        ATOM_S4_LCD1_PANEL_ID_MASKb0
+
+// BIOS_5_SCRATCH Definition, BIOS_5_SCRATCH is used by Firmware only !!!!
+#define ATOM_S5_DOS_REQ_CRT1b0          0x01
+#define ATOM_S5_DOS_REQ_LCD1b0          0x02
+#define ATOM_S5_DOS_REQ_TV1b0           0x04
+#define ATOM_S5_DOS_REQ_DFP1b0          0x08
+#define ATOM_S5_DOS_REQ_CRT2b0          0x10
+#define ATOM_S5_DOS_REQ_LCD2b0          0x20
+#define ATOM_S5_DOS_REQ_DFP6b0          0x40
+#define ATOM_S5_DOS_REQ_DFP2b0          0x80
+#define ATOM_S5_DOS_REQ_CVb1            0x01
+#define ATOM_S5_DOS_REQ_DFP3b1          0x02
+#define ATOM_S5_DOS_REQ_DFP4b1          0x04
+#define ATOM_S5_DOS_REQ_DFP5b1          0x08
+
+
+#define ATOM_S5_DOS_REQ_DEVICEw0        0x0FFF
+
+#define ATOM_S5_DOS_REQ_CRT1            0x0001
+#define ATOM_S5_DOS_REQ_LCD1            0x0002
+#define ATOM_S5_DOS_REQ_TV1             0x0004
+#define ATOM_S5_DOS_REQ_DFP1            0x0008
+#define ATOM_S5_DOS_REQ_CRT2            0x0010
+#define ATOM_S5_DOS_REQ_LCD2            0x0020
+#define ATOM_S5_DOS_REQ_DFP6            0x0040
+#define ATOM_S5_DOS_REQ_DFP2            0x0080
+#define ATOM_S5_DOS_REQ_CV              0x0100
+#define ATOM_S5_DOS_REQ_DFP3            0x0200
+#define ATOM_S5_DOS_REQ_DFP4            0x0400
+#define ATOM_S5_DOS_REQ_DFP5            0x0800
+
+#define ATOM_S5_DOS_FORCE_CRT1b2        ATOM_S5_DOS_REQ_CRT1b0
+#define ATOM_S5_DOS_FORCE_TV1b2         ATOM_S5_DOS_REQ_TV1b0
+#define ATOM_S5_DOS_FORCE_CRT2b2        ATOM_S5_DOS_REQ_CRT2b0
+#define ATOM_S5_DOS_FORCE_CVb3          ATOM_S5_DOS_REQ_CVb1
+#define ATOM_S5_DOS_FORCE_DEVICEw1      (ATOM_S5_DOS_FORCE_CRT1b2+ATOM_S5_DOS_FORCE_TV1b2+ATOM_S5_DOS_FORCE_CRT2b2+\
+                                        (ATOM_S5_DOS_FORCE_CVb3<<8))
+// BIOS_6_SCRATCH Definition
+#define ATOM_S6_DEVICE_CHANGE           0x00000001L
+#define ATOM_S6_SCALER_CHANGE           0x00000002L
+#define ATOM_S6_LID_CHANGE              0x00000004L
+#define ATOM_S6_DOCKING_CHANGE          0x00000008L
+#define ATOM_S6_ACC_MODE                0x00000010L
+#define ATOM_S6_EXT_DESKTOP_MODE        0x00000020L
+#define ATOM_S6_LID_STATE               0x00000040L
+#define ATOM_S6_DOCK_STATE              0x00000080L
+#define ATOM_S6_CRITICAL_STATE          0x00000100L
+#define ATOM_S6_HW_I2C_BUSY_STATE       0x00000200L
+#define ATOM_S6_THERMAL_STATE_CHANGE    0x00000400L
+#define ATOM_S6_INTERRUPT_SET_BY_BIOS   0x00000800L
+#define ATOM_S6_REQ_LCD_EXPANSION_FULL         0x00001000L //Normal expansion Request bit for LCD
+#define ATOM_S6_REQ_LCD_EXPANSION_ASPEC_RATIO  0x00002000L //Aspect ratio expansion Request bit for LCD
+
+#define ATOM_S6_DISPLAY_STATE_CHANGE    0x00004000L        //This bit is recycled when ATOM_BIOS_INFO_BIOS_SCRATCH6_SCL2_REDEFINE is set,previously it's SCL2_H_expansion
+#define ATOM_S6_I2C_STATE_CHANGE        0x00008000L        //This bit is recycled,when ATOM_BIOS_INFO_BIOS_SCRATCH6_SCL2_REDEFINE is set,previously it's SCL2_V_expansion
+
+#define ATOM_S6_ACC_REQ_CRT1            0x00010000L
+#define ATOM_S6_ACC_REQ_LCD1            0x00020000L
+#define ATOM_S6_ACC_REQ_TV1             0x00040000L
+#define ATOM_S6_ACC_REQ_DFP1            0x00080000L
+#define ATOM_S6_ACC_REQ_CRT2            0x00100000L
+#define ATOM_S6_ACC_REQ_LCD2            0x00200000L
+#define ATOM_S6_ACC_REQ_DFP6            0x00400000L
+#define ATOM_S6_ACC_REQ_DFP2            0x00800000L
+#define ATOM_S6_ACC_REQ_CV              0x01000000L
+#define ATOM_S6_ACC_REQ_DFP3                  0x02000000L
+#define ATOM_S6_ACC_REQ_DFP4                  0x04000000L
+#define ATOM_S6_ACC_REQ_DFP5                  0x08000000L
+
+#define ATOM_S6_ACC_REQ_MASK                0x0FFF0000L
+#define ATOM_S6_SYSTEM_POWER_MODE_CHANGE    0x10000000L
+#define ATOM_S6_ACC_BLOCK_DISPLAY_SWITCH    0x20000000L
+#define ATOM_S6_VRI_BRIGHTNESS_CHANGE       0x40000000L
+#define ATOM_S6_CONFIG_DISPLAY_CHANGE_MASK  0x80000000L
+
+//Byte aligned defintion for BIOS usage
+#define ATOM_S6_DEVICE_CHANGEb0         0x01
+#define ATOM_S6_SCALER_CHANGEb0         0x02
+#define ATOM_S6_LID_CHANGEb0            0x04
+#define ATOM_S6_DOCKING_CHANGEb0        0x08
+#define ATOM_S6_ACC_MODEb0              0x10
+#define ATOM_S6_EXT_DESKTOP_MODEb0      0x20
+#define ATOM_S6_LID_STATEb0             0x40
+#define ATOM_S6_DOCK_STATEb0            0x80
+#define ATOM_S6_CRITICAL_STATEb1        0x01
+#define ATOM_S6_HW_I2C_BUSY_STATEb1     0x02
+#define ATOM_S6_THERMAL_STATE_CHANGEb1  0x04
+#define ATOM_S6_INTERRUPT_SET_BY_BIOSb1 0x08
+#define ATOM_S6_REQ_LCD_EXPANSION_FULLb1        0x10
+#define ATOM_S6_REQ_LCD_EXPANSION_ASPEC_RATIOb1 0x20
+
+#define ATOM_S6_ACC_REQ_CRT1b2          0x01
+#define ATOM_S6_ACC_REQ_LCD1b2          0x02
+#define ATOM_S6_ACC_REQ_TV1b2           0x04
+#define ATOM_S6_ACC_REQ_DFP1b2          0x08
+#define ATOM_S6_ACC_REQ_CRT2b2          0x10
+#define ATOM_S6_ACC_REQ_LCD2b2          0x20
+#define ATOM_S6_ACC_REQ_DFP6b2          0x40
+#define ATOM_S6_ACC_REQ_DFP2b2          0x80
+#define ATOM_S6_ACC_REQ_CVb3            0x01
+#define ATOM_S6_ACC_REQ_DFP3b3          0x02
+#define ATOM_S6_ACC_REQ_DFP4b3          0x04
+#define ATOM_S6_ACC_REQ_DFP5b3          0x08
+
+#define ATOM_S6_ACC_REQ_DEVICEw1        ATOM_S5_DOS_REQ_DEVICEw0
+#define ATOM_S6_SYSTEM_POWER_MODE_CHANGEb3 0x10
+#define ATOM_S6_ACC_BLOCK_DISPLAY_SWITCHb3 0x20
+#define ATOM_S6_VRI_BRIGHTNESS_CHANGEb3    0x40
+#define ATOM_S6_CONFIG_DISPLAY_CHANGEb3    0x80
+
+#define ATOM_S6_DEVICE_CHANGE_SHIFT             0
+#define ATOM_S6_SCALER_CHANGE_SHIFT             1
+#define ATOM_S6_LID_CHANGE_SHIFT                2
+#define ATOM_S6_DOCKING_CHANGE_SHIFT            3
+#define ATOM_S6_ACC_MODE_SHIFT                  4
+#define ATOM_S6_EXT_DESKTOP_MODE_SHIFT          5
+#define ATOM_S6_LID_STATE_SHIFT                 6
+#define ATOM_S6_DOCK_STATE_SHIFT                7
+#define ATOM_S6_CRITICAL_STATE_SHIFT            8
+#define ATOM_S6_HW_I2C_BUSY_STATE_SHIFT         9
+#define ATOM_S6_THERMAL_STATE_CHANGE_SHIFT      10
+#define ATOM_S6_INTERRUPT_SET_BY_BIOS_SHIFT     11
+#define ATOM_S6_REQ_SCALER_SHIFT                12
+#define ATOM_S6_REQ_SCALER_ARATIO_SHIFT         13
+#define ATOM_S6_DISPLAY_STATE_CHANGE_SHIFT      14
+#define ATOM_S6_I2C_STATE_CHANGE_SHIFT          15
+#define ATOM_S6_SYSTEM_POWER_MODE_CHANGE_SHIFT  28
+#define ATOM_S6_ACC_BLOCK_DISPLAY_SWITCH_SHIFT  29
+#define ATOM_S6_VRI_BRIGHTNESS_CHANGE_SHIFT     30
+#define ATOM_S6_CONFIG_DISPLAY_CHANGE_SHIFT     31
+
+// BIOS_7_SCRATCH Definition, BIOS_7_SCRATCH is used by Firmware only !!!!
+#define ATOM_S7_DOS_MODE_TYPEb0             0x03
+#define ATOM_S7_DOS_MODE_VGAb0              0x00
+#define ATOM_S7_DOS_MODE_VESAb0             0x01
+#define ATOM_S7_DOS_MODE_EXTb0              0x02
+#define ATOM_S7_DOS_MODE_PIXEL_DEPTHb0      0x0C
+#define ATOM_S7_DOS_MODE_PIXEL_FORMATb0     0xF0
+#define ATOM_S7_DOS_8BIT_DAC_ENb1           0x01
+#define ATOM_S7_ASIC_INIT_COMPLETEb1        0x02
+#define ATOM_S7_ASIC_INIT_COMPLETE_MASK     0x00000200
+#define ATOM_S7_DOS_MODE_NUMBERw1           0x0FFFF
+
+#define ATOM_S7_DOS_8BIT_DAC_EN_SHIFT       8
+
+// BIOS_8_SCRATCH Definition
+#define ATOM_S8_I2C_CHANNEL_BUSY_MASK       0x00000FFFF
+#define ATOM_S8_I2C_HW_ENGINE_BUSY_MASK     0x0FFFF0000
+
+#define ATOM_S8_I2C_CHANNEL_BUSY_SHIFT      0
+#define ATOM_S8_I2C_ENGINE_BUSY_SHIFT       16
+
+// BIOS_9_SCRATCH Definition
+#ifndef ATOM_S9_I2C_CHANNEL_COMPLETED_MASK
+#define ATOM_S9_I2C_CHANNEL_COMPLETED_MASK  0x0000FFFF
 #endif
-	.enable		= dsps_musb_enable,
-	.disable	= dsps_musb_disable,
-
-	.try_idle	= dsps_musb_try_idle,
-	.set_mode	= dsps_musb_set_mode,
-	.recover	= dsps_musb_recover,
-	.clear_ep_rxintr = dsps_musb_clear_ep_rxintr,
-};
-
-static u64 musb_dmamask = DMA_BIT_MASK(32);
-
-static int get_int_prop(struct device_node *dn, const char *s)
-{
-	int ret;
-	u32 val;
-
-	ret = of_property_read_u32(dn, s, &val);
-	if (ret)
-		return 0;
-	return val;
-}
-
-static int get_musb_port_mode(struct device *dev)
-{
-	enum usb_dr_mode mode;
-
-	mode = usb_get_dr_mode(dev);
-	switch (mode) {
-	case USB_DR_MODE_HOST:
-		return MUSB_PORT_MODE_HOST;
-
-	case USB_DR_MODE_PERIPHERAL:
-		return MUSB_PORT_MODE_GADGET;
-
-	case USB_DR_MODE_UNKNOWN:
-	case USB_DR_MODE_OTG:
-	default:
-		return MUSB_PORT_MODE_DUAL_ROLE;
-	}
-}
-
-static int dsps_create_musb_pdev(struct dsps_glue *glue,
-		struct platform_device *parent)
-{
-	struct musb_hdrc_platform_data pdata;
-	struct resource	resources[2];
-	struct resource	*res;
-	struct device *dev = &parent->dev;
-	struct musb_hdrc_config	*config;
-	struct platform_device *musb;
-	struct device_node *dn = parent->dev.of_node;
-	int ret, val;
-
-	memset(resources, 0, sizeof(resources));
-	res = platform_get_resource_byname(parent, IORESOURCE_MEM, "mc");
-	if (!res) {
-		dev_err(dev, "failed to get memory.\n");
-		return -EINVAL;
-	}
-	resources[0] = *res;
-
-	res = platform_get_resource_byname(parent, IORESOURCE_IRQ, "mc");
-	if (!res) {
-		dev_err(dev, "failed to get irq.\n");
-		return -EINVAL;
-	}
-	resources[1] = *res;
-
-	/* allocate the child platform device */
-	musb = platform_device_alloc("musb-hdrc", PLATFORM_DEVID_AUTO);
-	if (!musb) {
-		dev_err(dev, "failed to allocate musb device\n");
-		return -ENOMEM;
-	}
-
-	musb->dev.parent		= dev;
-	musb->dev.dma_mask		= &musb_dmamask;
-	musb->dev.coherent_dma_mask	= musb_dmamask;
-
-	glue->musb = musb;
-
-	ret = platform_device_add_resources(musb, resources,
-			ARRAY_SIZE(resources));
-	if (ret) {
-		dev_err(dev, "failed to add resources\n");
-		goto err;
-	}
-
-	config = devm_kzalloc(&parent->dev, sizeof(*config), GFP_KERNEL);
-	if (!config) {
-		ret = -ENOMEM;
-		goto err;
-	}
-	pdata.config = config;
-	pdata.platform_ops = &dsps_ops;
-
-	config->num_eps = get_int_prop(dn, "mentor,num-eps");
-	config->ram_bits = get_int_prop(dn, "mentor,ram-bits");
-	config->host_port_deassert_reset_at_resume = 1;
-	pdata.mode = get_musb_port_mode(dev);
-	/* DT keeps this entry in mA, musb expects it as per USB spec */
-	pdata.power = get_int_prop(dn, "mentor,power") / 2;
-
-	ret = of_property_read_u32(dn, "mentor,multipoint", &val);
-	if (!ret && val)
-		config->multipoint = true;
-
-	config->maximum_speed = usb_get_maximum_speed(&parent->dev);
-	switch (config->maximum_speed) {
-	case USB_SPEED_LOW:
-	case USB_SPEED_FULL:
-		break;
-	case USB_SPEED_SUPER:
-		dev_warn(dev, "ignore incorrect maximum_speed "
-				"(super-speed) setting in dts");
-		/* fall through */
-	default:
-		config->maximum_speed = USB_SPEED_HIGH;
-	}
-
-	ret = platform_device_add_data(musb, &pdata, sizeof(pdata));
-	if (ret) {
-		dev_err(dev, "failed to add platform_data\n");
-		goto err;
-	}
-
-	ret = platform_device_add(musb);
-	if (ret) {
-		dev_err(dev, "failed to register musb device\n");
-		goto err;
-	}
-	return 0;
-
-err:
-	platform_device_put(musb);
-	return ret;
-}
-
-static int dsps_probe(struct platform_device *pdev)
-{
-	const struct of_device_id *match;
-	const struct dsps_musb_wrapper *wrp;
-	struct dsps_glue *glue;
-	int ret;
-
-	if (!strcmp(pdev->name, "musb-hdrc"))
-		return -ENODEV;
-
-	match = of_match_node(musb_dsps_of_match, pdev->dev.of_node);
-	if (!match) {
-		dev_err(&pdev->dev, "fail to get matching of_match struct\n");
-		return -EINVAL;
-	}
-	wrp = match->data;
-
-	if (of_device_is_compatible(pdev->dev.of_node, "ti,musb-dm816"))
-		dsps_ops.read_fifo = dsps_read_fifo32;
-
-	/* allocate glue */
-	glue = devm_kzalloc(&pdev->dev, sizeof(*glue), GFP_KERNEL);
-	if (!glue)
-		return -ENOMEM;
-
-	glue->dev = &pdev->dev;
-	glue->wrp = wrp;
-
-	platform_set_drvdata(pdev, glue);
-	pm_runtime_enable(&pdev->dev);
-
-	ret = pm_runtime_get_sync(&pdev->dev);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "pm_runtime_get_sync FAILED");
-		goto err2;
-	}
-
-	ret = dsps_create_musb_pdev(glue, pdev);
-	if (ret)
-		goto err3;
-
-	return 0;
-
-err3:
-	pm_runtime_put(&pdev->dev);
-err2:
-	pm_runtime_disable(&pdev->dev);
-	return ret;
-}
-
-static int dsps_remove(struct platform_device *pdev)
-{
-	struct dsps_glue *glue = platform_get_drvdata(pdev);
-
-	platform_device_unregister(glue->musb);
-
-	/* disable usbss clocks */
-	pm_runtime_put(&pdev->dev);
-	pm_runtime_disable(&pdev->dev);
-
-	return 0;
-}
-
-static const struct dsps_musb_wrapper am33xx_driver_data = {
-	.revision		= 0x00,
-	.control		= 0x14,
-	.status			= 0x18,
-	.epintr_set		= 0x38,
-	.epintr_clear		= 0x40,
-	.epintr_status		= 0x30,
-	.coreintr_set		= 0x3c,
-	.coreintr_clear		= 0x44,
-	.coreintr_status	= 0x34,
-	.phy_utmi		= 0xe0,
-	.mode			= 0xe8,
-	.tx_mode		= 0x70,
-	.rx_mode		= 0x74,
-	.reset			= 0,
-	.otg_disable		= 21,
-	.iddig			= 8,
-	.iddig_mux		= 7,
-	.usb_shift		= 0,
-	.usb_mask		= 0x1ff,
-	.usb_bitmap		= (0x1ff << 0),
-	.drvvbus		= 8,
-	.txep_shift		= 0,
-	.txep_mask		= 0xffff,
-	.txep_bitmap		= (0xffff << 0),
-	.rxep_shift		= 16,
-	.rxep_mask		= 0xfffe,
-	.rxep_bitmap		= (0xfffe << 16),
-	.poll_timeout		= 2000, /* ms */
-};
-
-static const struct of_device_id musb_dsps_of_match[] = {
-	{ .compatible = "ti,musb-am33xx",
-		.data = &am33xx_driver_data, },
-	{ .compatible = "ti,musb-dm816",
-		.data = &am33xx_driver_data, },
-	{  },
-};
-MODULE_DEVICE_TABLE(of, musb_dsps_of_match);
-
-#ifdef CONFIG_PM_SLEEP
-static int dsps_suspend(struct device *dev)
-{
-	struct dsps_glue *glue = dev_get_drvdata(dev);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-	struct musb *musb = platform_get_drvdata(glue->musb);
-	void __iomem *mbase;
-
-	del_timer_sync(&glue->timer);
-
-	if (!musb)
-		/* This can happen if the musb device is in -EPROBE_DEFER */
-		return 0;
-
-	mbase = musb->ctrl_base;
-	glue->context.control = dsps_readl(mbase, wrp->control);
-	glue->context.epintr = dsps_readl(mbase, wrp->epintr_set);
-	glue->context.coreintr = dsps_readl(mbase, wrp->coreintr_set);
-	glue->context.phy_utmi = dsps_readl(mbase, wrp->phy_utmi);
-	glue->context.mode = dsps_readl(mbase, wrp->mode);
-	glue->context.tx_mode = dsps_readl(mbase, wrp->tx_mode);
-	glue->context.rx_mode = dsps_readl(mbase, wrp->rx_mode);
-
-	return 0;
-}
-
-static int dsps_resume(struct device *dev)
-{
-	struct dsps_glue *glue = dev_get_drvdata(dev);
-	const struct dsps_musb_wrapper *wrp = glue->wrp;
-	struct musb *musb = platform_get_drvdata(glue->musb);
-	void __iomem *mbase;
-
-	if (!musb)
-		return 0;
-
-	mbase = musb->ctrl_base;
-	dsps_writel(mbase, wrp->control, glue->context.control);
-	dsps_writel(mbase, wrp->epintr_set, glue->context.epintr);
-	dsps_writel(mbase, wrp->coreintr_set, glue->context.coreintr);
-	dsps_writel(mbase, wrp->phy_utmi, glue->context.phy_utmi);
-	dsps_writel(mbase, wrp->mode, glue->context.mode);
-	dsps_writel(mbase, wrp->tx_mode, glue->context.tx_mode);
-	dsps_writel(mbase, wrp->rx_mode, glue->context.rx_mode);
-	if (musb->xceiv->otg->state == OTG_STATE_B_IDLE &&
-	    musb->port_mode == MUSB_PORT_MODE_DUAL_ROLE)
-		mod_timer(&glue->timer, jiffies +
-				msecs_to_jiffies(wrp->poll_timeout));
-
-	return 0;
-}
+#ifndef ATOM_S9_I2C_CHANNEL_ABORTED_MASK
+#define ATOM_S9_I2C_CHANNEL_ABORTED_MASK    0xFFFF0000
+#endif
+#ifndef ATOM_S9_I2C_CHANNEL_COMPLETED_SHIFT
+#define ATOM_S9_I2C_CHANNEL_COMPLETED_SHIFT 0
+#endif
+#ifndef ATOM_S9_I2C_CHANNEL_ABORTED_SHIFT
+#define ATOM_S9_I2C_CHANNEL_ABORTED_SHIFT   16
 #endif
 
-static SIMPLE_DEV_PM_OPS(dsps_pm_ops, dsps_suspend, dsps_resume);
 
-static struct platform_driver dsps_usbss_driver = {
-	.probe		= dsps_probe,
-	.remove         = dsps_remove,
-	.driver         = {
-		.name   = "musb-dsps",
-		.pm	= &dsps_pm_ops,
-		.of_match_table	= musb_dsps_of_match,
-	},
-};
+#define ATOM_FLAG_SET                         0x20
+#define ATOM_FLAG_CLEAR                       0
+#define CLEAR_ATOM_S6_ACC_MODE                ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_ACC_MODE_SHIFT | ATOM_FLAG_CLEAR)
+#define SET_ATOM_S6_DEVICE_CHANGE             ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_DEVICE_CHANGE_SHIFT | ATOM_FLAG_SET)
+#define SET_ATOM_S6_VRI_BRIGHTNESS_CHANGE     ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_VRI_BRIGHTNESS_CHANGE_SHIFT | ATOM_FLAG_SET)
+#define SET_ATOM_S6_SCALER_CHANGE             ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_SCALER_CHANGE_SHIFT | ATOM_FLAG_SET)
+#define SET_ATOM_S6_LID_CHANGE                ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_LID_CHANGE_SHIFT | ATOM_FLAG_SET)
 
-MODULE_DESCRIPTION("TI DSPS MUSB Glue Layer");
-MODULE_AUTHOR("Ravi B <ravibabu@ti.com>");
-MODULE_AUTHOR("Ajay Kumar Gupta <ajay.gupta@ti.com>");
-MODULE_LICENSE("GPL v2");
+#define SET_ATOM_S6_LID_STATE                 ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_LID_STATE_SHIFT | ATOM_FLAG_SET)
+#define CLEAR_ATOM_S6_LID_STATE               ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_LID_STATE_SHIFT | ATOM_FLAG_CLEAR)
 
-module_platform_driver(dsps_usbss_driver);
+#define SET_ATOM_S6_DOCK_CHANGE                   ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_DOCKING_CHANGE_SHIFT | ATOM_FLAG_SET)
+#define SET_ATOM_S6_DOCK_STATE                ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_DOCK_STATE_SHIFT | ATOM_FLAG_SET)
+#define CLEAR_ATOM_S6_DOCK_STATE              ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_DOCK_STATE_SHIFT | ATOM_FLAG_CLEAR)
+
+#define SET_ATOM_S6_THERMAL_STATE_CHANGE      ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_THERMAL_STATE_CHANGE_SHIFT | ATOM_FLAG_SET)
+#define SET_ATOM_S6_SYSTEM_POWER_MODE_CHANGE  ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_SYSTEM_POWER_MODE_CHANGE_SHIFT | ATOM_FLAG_SET)
+#define SET_ATOM_S6_INTERRUPT_SET_BY_BIOS     ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_INTERRUPT_SET_BY_BIOS_SHIFT | ATOM_FLAG_SET)
+
+#define SET_ATOM_S6_CRITICAL_STATE            ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_CRITICAL_STATE_SHIFT | ATOM_FLAG_SET)
+#define CLEAR_ATOM_S6_CRITICAL_STATE          ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_CRITICAL_STATE_SHIFT | ATOM_FLAG_CLEAR)
+
+#define SET_ATOM_S6_REQ_SCALER                ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_REQ_SCALER_SHIFT | ATOM_FLAG_SET)
+#define CLEAR_ATOM_S6_REQ_SCALER              ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_REQ_SCALER_SHIFT | ATOM_FLAG_CLEAR )
+
+#define SET_ATOM_S6_REQ_SCALER_ARATIO         ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_REQ_SCALER_ARATIO_SHIFT | ATOM_FLAG_SET )
+#define CLEAR_ATOM_S6_REQ_SCALER_ARATIO       ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_REQ_SCALER_ARATIO_SHIFT | ATOM_FLAG_CLEAR )
+
+#define SET_ATOM_S6_I2C_STATE_CHANGE          ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_I2C_STATE_CHANGE_SHIFT | ATOM_FLAG_SET )
+
+#define SET_ATOM_S6_DISPLAY_STATE_CHANGE      ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_DISPLAY_STATE_CHANGE_SHIFT | ATOM_FLAG_SET )
+
+#define SET_ATOM_S6_DEVICE_RECONFIG           ((ATOM_ACC_CHANGE_INFO_DEF << 8 )|ATOM_S6_CONFIG_DISPLAY_CHANGE_SHIFT | ATOM_FLAG_SET)
+#define CLEAR_ATOM_S0_LCD1                    ((ATOM_DEVICE_CONNECT_INFO_DEF << 8 )|  ATOM_S0_LCD1_SHIFT | ATOM_FLAG_CLEAR )
+#define SET_ATOM_S7_DOS_8BIT_DAC_EN           ((ATOM_DOS_MODE_INFO_DEF << 8 )|ATOM_S7_DOS_8BIT_DAC_EN_SHIFT | ATOM_FLAG_SET )
+#define CLEAR_ATOM_S7_DOS_8BIT_DAC_EN         ((ATOM_DOS_MODE_INFO_DEF << 8 )|ATOM_S7_DOS_8BIT_DAC_EN_SHIFT | ATOM_FLAG_CLEAR )
+
+/****************************************************************************/
+//Portion II: Definitinos only used in Driver
+/****************************************************************************/
+
+// Macros used by driver
+
+#ifdef __cplusplus
+#define GetIndexIntoMasterTable(MasterOrData, FieldName) ((reinterpret_cast<char*>(&(static_cast<ATOM_MASTER_LIST_OF_##MasterOrData##_TABLES*>(0))->FieldName)-static_cast<char*>(0))/sizeof(USHORT))
+
+#define GET_COMMAND_TABLE_COMMANDSET_REVISION(TABLE_HEADER_OFFSET) (((static_cast<ATOM_COMMON_TABLE_HEADER*>(TABLE_HEADER_OFFSET))->ucTableFormatRevision )&0x3F)
+#define GET_COMMAND_TABLE_PARAMETER_REVISION(TABLE_HEADER_OFFSET)  (((static_cast<ATOM_COMMON_TABLE_HEADER*>(TABLE_HEADER_OFFSET))->ucTableContentRevision)&0x3F)
+#else // not __cplusplus
+#define   GetIndexIntoMasterTable(MasterOrData, FieldName) (((char*)(&((ATOM_MASTER_LIST_OF_##MasterOrData##_TABLES*)0)->FieldName)-(char*)0)/sizeof(USHORT))
+
+#define GET_COMMAND_TABLE_COMMANDSET_REVISION(TABLE_HEADER_OFFSET) ((((ATOM_COMMON_TABLE_HEADER*)TABLE_HEADER_OFFSET)->ucTableFormatRevision)&0x3F)
+#define GET_COMMAND_TABLE_PARAMETER_REVISION(TABLE_HEADER_OFFSET)  ((((ATOM_COMMON_TABLE_HEADER*)TABLE_HEADER_OFFSET)->ucTableContentRevision)&0x3F)
+#endif // __cplusplus
+
+#define GET_DATA_TABLE_MAJOR_REVISION GET_COMMAND_TABLE_COMMANDSET_REVISION
+#define GET_DATA_TABLE_MINOR_REVISION GET_COMMAND_TABLE_PARAMETER_REVISION
+
+/****************************************************************************/
+//Portion III: Definitinos only used in VBIOS
+/****************************************************************************/
+#define ATOM_DAC_SRC               0x80
+#define ATOM_SRC_DAC1               0
+#define ATOM_SRC_DAC2               0x80
+
+
+
+typedef struct _MEMORY_PLLINIT_PARAMETERS
+{
+  ULONG ulTargetMemoryClock; //In 10Khz unit
+  UCHAR   ucAction;                //not define yet
+  UCHAR   ucFbDiv_Hi;             //Fbdiv Hi byte
+  UCHAR   ucFbDiv;                //FB value
+  UCHAR   ucPostDiv;             //Post div
+}MEMORY_PLLINIT_PARAMETERS;
+
+#define MEMORY_PLLINIT_PS_ALLOCATION  MEMORY_PLLINIT_PARAMETERS
+
+
+#define   GPIO_PIN_WRITE                                       0x01
+#define   GPIO_PIN_READ                                          0x00
+
+typedef struct  _GPIO_PIN_CONTROL_PARAMETERS
+{
+  UCHAR ucGPIO_ID;           //return value, read from GPIO pins
+  UCHAR ucGPIOBitShift;        //define which bit in uGPIOBitVal need to be update
+   UCHAR ucGPIOBitVal;           //Set/Reset corresponding bit defined in ucGPIOBitMask
+  UCHAR ucAction;                 //=GPIO_PIN_WRITE: Read; =GPIO_PIN_READ: Write
+}GPIO_PIN_CONTROL_PARAMETERS;
+
+typedef struct _ENABLE_SCALER_PARAMETERS
+{
+  UCHAR ucScaler;            // ATOM_SCALER1, ATOM_SCALER2
+  UCHAR ucEnable;            // ATOM_SCALER_DISABLE or ATOM_SCALER_CENTER or ATOM_SCALER_EXPANSION
+  UCHAR ucTVStandard;        //
+  UCHAR ucPadding[1];
+}ENABLE_SCALER_PARAMETERS;
+#define ENABLE_SCALER_PS_ALLOCATION ENABLE_SCALER_PARAMETERS
+
+//ucEnable:
+#define SCALER_BYPASS_AUTO_CENTER_NO_REPLICATION    0
+#define SCALER_BYPASS_AUTO_CENTER_AUTO_REPLICATION  1
+#define SCALER_ENABLE_2TAP_ALPHA_MODE               2
+#define SCALER_ENABLE_MULTITAP_MODE                 3
+
+typedef struct _ENABLE_HARDWARE_ICON_CURSOR_PARAMETERS
+{
+  ULONG  usHWIconHorzVertPosn;        // Hardware Icon Vertical position
+  UCHAR  ucHWIconVertOffset;          // Hardware Icon Vertical offset
+  UCHAR  ucHWIconHorzOffset;          // Hardware Icon Horizontal offset
+  UCHAR  ucSelection;                 // ATOM_CURSOR1 or ATOM_ICON1 or ATOM_CURSOR2 or ATOM_ICON2
+  UCHAR  ucEnable;                    // ATOM_ENABLE or ATOM_DISABLE
+}ENABLE_HARDWARE_ICON_CURSOR_PARAMETERS;
+
+typedef struct _ENABLE_HARDWARE_ICON_CURSOR_PS_ALLOCATION
+{
+  ENABLE_HARDWARE_ICON_CURSOR_PARAMETERS  sEnableIcon;
+  ENABLE_CRTC_PARAMETERS                  sReserved;
+}ENABLE_HARDWARE_ICON_CURSOR_PS_ALLOCATION;
+
+typedef struct _ENABLE_GRAPH_SURFACE_PARAMETERS
+{
+  USHORT usHight;                     // Image Hight
+  USHORT usWidth;                     // Image Width
+  UCHAR  ucSurface;                   // Surface 1 or 2
+  UCHAR  ucPadding[3];
+}ENABLE_GRAPH_SURFACE_PARAMETERS;
+
+typedef struct _ENABLE_GRAPH_SURFACE_PARAMETERS_V1_2
+{
+  USHORT usHight;                     // Image Hight
+  USHORT usWidth;                     // Image Width
+  UCHAR  ucSurface;                   // Surface 1 or 2
+  UCHAR  ucEnable;                    // ATOM_ENABLE or ATOM_DISABLE
+  UCHAR  ucPadding[2];
+}ENABLE_GRAPH_SURFACE_PARAMETERS_V1_2;
+
+typedef struct _ENABLE_GRAPH_SURFACE_PARAMETERS_V1_3
+{
+  USHORT usHight;                     // Image Hight
+  USHORT usWidth;                     // Image Width
+  UCHAR  ucSurface;                   // Surface 1 or 2
+  UCHAR  ucEnable;                    // ATOM_ENABLE or ATOM_DISABLE
+  USHORT usDeviceId;                  // Active Device Id for this surface. If no device, set to 0.
+}ENABLE_GRAPH_SURFACE_PARAMETERS_V1_3;
+
+typedef struct _ENABLE_GRAPH_SURFACE_PARAMETERS_V1_4
+{
+  USHORT usHight;                     // Image Hight
+  USHORT usWidth;                     // Image Width
+  USHORT usGraphPitch;
+  UCHAR  ucColorDepth;
+  UCHAR  ucPixelFormat;
+  UCHAR  ucSurface;                   // Surface 1 or 2
+  UCHAR  ucEnable;                    // ATOM_ENABLE or ATOM_DISABLE
+  UCHAR  ucModeType;
+  UCHAR  ucReserved;
+}ENABLE_GRAPH_SURFACE_PARAMETERS_V1_4;
+
+// ucEnable
+#define ATOM_GRAPH_CONTROL_SET_PITCH             0x0f
+#define ATOM_GRAPH_CONTROL_SET_DISP_START        0x10
+
+typedef struct _ENABLE_GRAPH_SURFACE_PS_ALLOCATION
+{
+  ENABLE_GRAPH_SURFACE_PARAMETERS sSetSurface;
+  ENABLE_YUV_PS_ALLOCATION        sReserved; // Don't set this one
+}ENABLE_GRAPH_SURFACE_PS_ALLOCATION;
+
+typedef struct _MEMORY_CLEAN_UP_PARAMETERS
+{
+  USHORT  usMemoryStart;                //in 8Kb boundry, offset from memory base address
+  USHORT  usMemorySize;                 //8Kb blocks aligned
+}MEMORY_CLEAN_UP_PARAMETERS;
+
+#define MEMORY_CLEAN_UP_PS_ALLOCATION MEMORY_CLEAN_UP_PARAMETERS
+
+typedef struct  _GET_DISPLAY_SURFACE_SIZE_PARAMETERS
+{
+  USHORT  usX_Size;                     //When use as input parameter, usX_Size indicates which CRTC
+  USHORT  usY_Size;
+}GET_DISPLAY_SURFACE_SIZE_PARAMETERS;
+
+typedef struct  _GET_DISPLAY_SURFACE_SIZE_PARAMETERS_V2
+{
+  union{
+    USHORT  usX_Size;                     //When use as input parameter, usX_Size indicates which CRTC
+    USHORT  usSurface;
+  };
+  USHORT usY_Size;
+  USHORT usDispXStart;
+  USHORT usDispYStart;
+}GET_DISPLAY_SURFACE_SIZE_PARAMETERS_V2;
+
+
+typedef struct _PALETTE_DATA_CONTROL_PARAMETERS_V3
+{
+  UCHAR  ucLutId;
+  UCHAR  ucAction;
+  USHORT usLutStartIndex;
+  USHORT usLutLength;
+  USHORT usLutOffsetInVram;
+}PALETTE_DATA_CONTROL_PARAMETERS_V3;
+
+// ucAction:
+#define PALETTE_DATA_AUTO_FILL            1
+#define PALETTE_DATA_READ                 2
+#define PALETTE_DATA_WRITE                3
+
+
+typedef struct _INTERRUPT_SERVICE_PARAMETERS_V2
+{
+  UCHAR  ucInterruptId;
+  UCHAR  ucServiceId;
+  UCHAR  ucStatus;
+  UCHAR  ucReserved;
+}INTERRUPT_SERVICE_PARAMETER_V2;
+
+// ucInterruptId
+#define HDP1_INTERRUPT_ID                 1
+#define HDP2_INTERRUPT_ID                 2
+#define HDP3_INTERRUPT_ID                 3
+#define HDP4_INTERRUPT_ID                 4
+#define HDP5_INTERRUPT_ID                 5
+#define HDP6_INTERRUPT_ID                 6
+#define SW_INTERRUPT_ID                   11
+
+// ucAction
+#define INTERRUPT_SERVICE_GEN_SW_INT      1
+#define INTERRUPT_SERVICE_GET_STATUS      2
+
+ // ucStatus
+#define INTERRUPT_STATUS__INT_TRIGGER     1
+#define INTERRUPT_STATUS__HPD_HIGH        2
+
+typedef struct _EFUSE_INPUT_PARAMETER
+{
+  USHORT usEfuseIndex;
+  UCHAR  ucBitShift;
+  UCHAR  ucBitLength;
+}EFUSE_INPUT_PARAMETER;
+
+// ReadEfuseValue command table input/output parameter
+typedef union _READ_EFUSE_VALUE_PARAMETER
+{
+  EFUSE_INPUT_PARAMETER sEfuse;
+  ULONG                 ulEfuseValue;
+}READ_EFUSE_VALUE_PARAMETER;
+
+typedef struct _INDIRECT_IO_ACCESS
+{
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  UCHAR                    IOAccessSequence[256];
+} INDIRECT_IO_ACCESS;
+
+#define INDIRECT_READ              0x00
+#define INDIRECT_WRITE             0x80
+
+#define INDIRECT_IO_MM             0
+#define INDIRECT_IO_PLL            1
+#define INDIRECT_IO_MC             2
+#define INDIRECT_IO_PCIE           3
+#define INDIRECT_IO_PCIEP          4
+#define INDIRECT_IO_NBMISC         5
+#define INDIRECT_IO_SMU            5
+
+#define INDIRECT_IO_PLL_READ       INDIRECT_IO_PLL   | INDIRECT_READ
+#define INDIRECT_IO_PLL_WRITE      INDIRECT_IO_PLL   | INDIRECT_WRITE
+#define INDIRECT_IO_MC_READ        INDIRECT_IO_MC    | INDIRECT_READ
+#define INDIRECT_IO_MC_WRITE       INDIRECT_IO_MC    | INDIRECT_WRITE
+#define INDIRECT_IO_PCIE_READ      INDIRECT_IO_PCIE  | INDIRECT_READ
+#define INDIRECT_IO_PCIE_WRITE     INDIRECT_IO_PCIE  | INDIRECT_WRITE
+#define INDIRECT_IO_PCIEP_READ     INDIRECT_IO_PCIEP | INDIRECT_READ
+#define INDIRECT_IO_PCIEP_WRITE    INDIRECT_IO_PCIEP | INDIRECT_WRITE
+#define INDIRECT_IO_NBMISC_READ    INDIRECT_IO_NBMISC | INDIRECT_READ
+#define INDIRECT_IO_NBMISC_WRITE   INDIRECT_IO_NBMISC | INDIRECT_WRITE
+#define INDIRECT_IO_SMU_READ       INDIRECT_IO_SMU | INDIRECT_READ
+#define INDIRECT_IO_SMU_WRITE      INDIRECT_IO_SMU | INDIRECT_WRITE
+
+
+typedef struct _ATOM_OEM_INFO
+{
+  ATOM_COMMON_TABLE_HEADER   sHeader;
+  ATOM_I2C_ID_CONFIG_ACCESS sucI2cId;
+}ATOM_OEM_INFO;
+
+typedef struct _ATOM_TV_MODE
+{
+   UCHAR   ucVMode_Num;           //Video mode number
+   UCHAR   ucTV_Mode_Num;         //Internal TV mode number
+}ATOM_TV_MODE;
+
+typedef struct _ATOM_BIOS_INT_TVSTD_MODE
+{
+  ATOM_COMMON_TABLE_HEADER sHeader;
+   USHORT   usTV_Mode_LUT_Offset;   // Pointer to standard to internal number conversion table
+   USHORT   usTV_FIFO_Offset;        // Pointer to FIFO entry table
+   USHORT   usNTSC_Tbl_Offset;      // Pointer to SDTV_Mode_NTSC table
+   USHORT   usPAL_Tbl_Offset;        // Pointer to SDTV_Mode_PAL table
+   USHORT   usCV_Tbl_Offset;        // Pointer to SDTV_Mode_PAL table
+}ATOM_BIOS_INT_TVSTD_MODE;
+
+
+typedef struct _ATOM_TV_MODE_SCALER_PTR
+{
+   USHORT   ucFilter0_Offset;      //Pointer to filter format 0 coefficients
+   USHORT   usFilter1_Offset;      //Pointer to filter format 0 coefficients
+   UCHAR   ucTV_Mode_Num;
+}ATOM_TV_MODE_SCALER_PTR;
+
+typedef struct _ATOM_STANDARD_VESA_TIMING
+{
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  ATOM_DTD_FORMAT              aModeTimings[16];      // 16 is not the real array number, just for initial allocation
+}ATOM_STANDARD_VESA_TIMING;
+
+
+typedef struct _ATOM_STD_FORMAT
+{
+  USHORT    usSTD_HDisp;
+  USHORT    usSTD_VDisp;
+  USHORT    usSTD_RefreshRate;
+  USHORT    usReserved;
+}ATOM_STD_FORMAT;
+
+typedef struct _ATOM_VESA_TO_EXTENDED_MODE
+{
+  USHORT  usVESA_ModeNumber;
+  USHORT  usExtendedModeNumber;
+}ATOM_VESA_TO_EXTENDED_MODE;
+
+typedef struct _ATOM_VESA_TO_INTENAL_MODE_LUT
+{
+  ATOM_COMMON_TABLE_HEADER   sHeader;
+  ATOM_VESA_TO_EXTENDED_MODE asVESA_ToExtendedModeInfo[76];
+}ATOM_VESA_TO_INTENAL_MODE_LUT;
+
+/*************** ATOM Memory Related Data Structure ***********************/
+typedef struct _ATOM_MEMORY_VENDOR_BLOCK{
+   UCHAR                                    ucMemoryType;
+   UCHAR                                    ucMemoryVendor;
+   UCHAR                                    ucAdjMCId;
+   UCHAR                                    ucDynClkId;
+   ULONG                                    ulDllResetClkRange;
+}ATOM_MEMORY_VENDOR_BLOCK;
+
+
+typedef struct _ATOM_MEMORY_SETTING_ID_CONFIG{
+#if ATOM_BIG_ENDIAN
+	ULONG												ucMemBlkId:8;
+	ULONG												ulMemClockRange:24;
+#else
+	ULONG												ulMemClockRange:24;
+	ULONG												ucMemBlkId:8;
+#endif
+}ATOM_MEMORY_SETTING_ID_CONFIG;
+
+typedef union _ATOM_MEMORY_SETTING_ID_CONFIG_ACCESS
+{
+  ATOM_MEMORY_SETTING_ID_CONFIG slAccess;
+  ULONG                         ulAccess;
+}ATOM_MEMORY_SETTING_ID_CONFIG_ACCESS;
+
+
+typedef struct _ATOM_MEMORY_SETTING_DATA_BLOCK{
+   ATOM_MEMORY_SETTING_ID_CONFIG_ACCESS  ulMemoryID;
+   ULONG                                 aulMemData[1];
+}ATOM_MEMORY_SETTING_DATA_BLOCK;
+
+
+typedef struct _ATOM_INIT_REG_INDEX_FORMAT{
+    USHORT usRegIndex;                                     // MC register index
+    UCHAR  ucPreRegDataLength;                             // offset in ATOM_INIT_REG_DATA_BLOCK.saRegDataBuf
+}ATOM_INIT_REG_INDEX_FORMAT;
+
+
+typedef struct _ATOM_INIT_REG_BLOCK{
+   USHORT                           usRegIndexTblSize;          //size of asRegIndexBuf
+   USHORT                           usRegDataBlkSize;           //size of ATOM_MEMORY_SETTING_DATA_BLOCK
+   ATOM_INIT_REG_INDEX_FORMAT       asRegIndexBuf[1];
+   ATOM_MEMORY_SETTING_DATA_BLOCK   asRegDataBuf[1];
+}ATOM_INIT_REG_BLOCK;
+
+#define END_OF_REG_INDEX_BLOCK  0x0ffff
+#define END_OF_REG_DATA_BLOCK   0x00000000
+#define ATOM_INIT_REG_MASK_FLAG 0x80               //Not used in BIOS
+#define CLOCK_RANGE_HIGHEST     0x00ffffff
+
+#define VALUE_DWORD             SIZEOF ULONG
+#define VALUE_SAME_AS_ABOVE     0
+#define VALUE_MASK_DWORD        0x84
+
+#define INDEX_ACCESS_RANGE_BEGIN       (VALUE_DWORD + 1)
+#define INDEX_ACCESS_RANGE_END          (INDEX_ACCESS_RANGE_BEGIN + 1)
+#define VALUE_INDEX_ACCESS_SINGLE       (INDEX_ACCESS_RANGE_END + 1)
+//#define ACCESS_MCIODEBUGIND            0x40       //defined in BIOS code
+#define ACCESS_PLACEHOLDER             0x80
+
+
+typedef struct _ATOM_MC_INIT_PARAM_TABLE
+{
+  ATOM_COMMON_TABLE_HEADER      sHeader;
+  USHORT                        usAdjustARB_SEQDataOffset;
+  USHORT                        usMCInitMemTypeTblOffset;
+  USHORT                        usMCInitCommonTblOffset;
+  USHORT                        usMCInitPowerDownTblOffset;
+  ULONG                         ulARB_SEQDataBuf[32];
+  ATOM_INIT_REG_BLOCK           asMCInitMemType;
+  ATOM_INIT_REG_BLOCK           asMCInitCommon;
+}ATOM_MC_INIT_PARAM_TABLE;
+
+
+typedef struct _ATOM_REG_INIT_SETTING
+{
+  USHORT  usRegIndex;
+  ULONG   ulRegValue;
+}ATOM_REG_INIT_SETTING;
+
+typedef struct _ATOM_MC_INIT_PARAM_TABLE_V2_1
+{
+  ATOM_COMMON_TABLE_HEADER      sHeader;
+  ULONG                         ulMCUcodeVersion;
+  ULONG                         ulMCUcodeRomStartAddr;
+  ULONG                         ulMCUcodeLength;
+  USHORT                        usMcRegInitTableOffset;     // offset of ATOM_REG_INIT_SETTING array for MC core register settings.
+  USHORT                        usReserved;                 // offset of ATOM_INIT_REG_BLOCK for MC SEQ/PHY register setting
+}ATOM_MC_INIT_PARAM_TABLE_V2_1;

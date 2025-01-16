@@ -1,15 +1,9 @@
-#include <linux/module.h>
-#include <linux/kvm_host.h>
-#include <asm/fpu/api.h>
-#include <asm/ftrace.h>
-
-#ifdef CONFIG_FUNCTION_TRACER
-EXPORT_SYMBOL(_mcount);
-#endif
-#if IS_ENABLED(CONFIG_KVM)
-EXPORT_SYMBOL(sie64a);
-EXPORT_SYMBOL(sie_exit);
-EXPORT_SYMBOL(save_fpu_regs);
-#endif
-EXPORT_SYMBOL(memcpy);
-EXPORT_SYMBOL(memset);
+/*
+ *  acpi.c - Architecture-Specific Low-Level ACPI Support
+ *
+ *  Copyright (C) 1999 VA Linux Systems
+ *  Copyright (C) 1999,2000 Walt Drummond <drummond@valinux.com>
+ *  Copyright (C) 2000, 2002-2003 Hewlett-Packard Co.
+ *	David Mosberger-Tang <davidm@hpl.hp.com>
+ *  Copyright (C) 2000 Intel Corp.
+ *  Copyright (C) 200

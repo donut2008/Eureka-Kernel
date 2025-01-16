@@ -1,420 +1,132 @@
-/*
- * Universal Host Controller Interface driver for USB.
- *
- * Maintainer: Alan Stern <stern@rowland.harvard.edu>
- *
- * (C) Copyright 1999 Linus Torvalds
- * (C) Copyright 1999-2002 Johannes Erdfelt, johannes@erdfelt.com
- * (C) Copyright 1999 Randy Dunlap
- * (C) Copyright 1999 Georg Acher, acher@in.tum.de
- * (C) Copyright 1999 Deti Fliegl, deti@fliegl.de
- * (C) Copyright 1999 Thomas Sailer, sailer@ife.ee.ethz.ch
- * (C) Copyright 2004 Alan Stern, stern@rowland.harvard.edu
- */
-
-static const __u8 root_hub_hub_des[] =
-{
-	0x09,			/*  __u8  bLength; */
-	USB_DT_HUB,		/*  __u8  bDescriptorType; Hub-descriptor */
-	0x02,			/*  __u8  bNbrPorts; */
-	HUB_CHAR_NO_LPSM |	/* __u16  wHubCharacteristics; */
-		HUB_CHAR_INDV_PORT_OCPM, /* (per-port OC, no power switching) */
-	0x00,
-	0x01,			/*  __u8  bPwrOn2pwrGood; 2ms */
-	0x00,			/*  __u8  bHubContrCurrent; 0 mA */
-	0x00,			/*  __u8  DeviceRemovable; *** 7 Ports max */
-	0xff			/*  __u8  PortPwrCtrlMask; *** 7 ports max */
-};
-
-#define	UHCI_RH_MAXCHILD	7
-
-/* must write as zeroes */
-#define WZ_BITS		(USBPORTSC_RES2 | USBPORTSC_RES3 | USBPORTSC_RES4)
-
-/* status change bits:  nonzero writes will clear */
-#define RWC_BITS	(USBPORTSC_OCC | USBPORTSC_PEC | USBPORTSC_CSC)
-
-/* suspend/resume bits: port suspended or port resuming */
-#define SUSPEND_BITS	(USBPORTSC_SUSP | USBPORTSC_RD)
-
-/* A port that either is connected or has a changed-bit set will prevent
- * us from AUTO_STOPPING.
- */
-static int any_ports_active(struct uhci_hcd *uhci)
-{
-	int port;
-
-	for (port = 0; port < uhci->rh_numports; ++port) {
-		if ((uhci_readw(uhci, USBPORTSC1 + port * 2) &
-				(USBPORTSC_CCS | RWC_BITS)) ||
-				test_bit(port, &uhci->port_c_suspend))
-			return 1;
-	}
-	return 0;
-}
-
-static inline int get_hub_status_data(struct uhci_hcd *uhci, char *buf)
-{
-	int port;
-	int mask = RWC_BITS;
-
-	/* Some boards (both VIA and Intel apparently) report bogus
-	 * overcurrent indications, causing massive log spam unless
-	 * we completely ignore them.  This doesn't seem to be a problem
-	 * with the chipset so much as with the way it is connected on
-	 * the motherboard; if the overcurrent input is left to float
-	 * then it may constantly register false positives. */
-	if (ignore_oc)
-		mask &= ~USBPORTSC_OCC;
-
-	*buf = 0;
-	for (port = 0; port < uhci->rh_numports; ++port) {
-		if ((uhci_readw(uhci, USBPORTSC1 + port * 2) & mask) ||
-				test_bit(port, &uhci->port_c_suspend))
-			*buf |= (1 << (port + 1));
-	}
-	return !!*buf;
-}
-
-#define CLR_RH_PORTSTAT(x) \
-	status = uhci_readw(uhci, port_addr);	\
-	status &= ~(RWC_BITS|WZ_BITS); \
-	status &= ~(x); \
-	status |= RWC_BITS & (x); \
-	uhci_writew(uhci, status, port_addr)
-
-#define SET_RH_PORTSTAT(x) \
-	status = uhci_readw(uhci, port_addr);	\
-	status |= (x); \
-	status &= ~(RWC_BITS|WZ_BITS); \
-	uhci_writew(uhci, status, port_addr)
-
-/* UHCI controllers don't automatically stop resume signalling after 20 msec,
- * so we have to poll and check timeouts in order to take care of it.
- */
-static void uhci_finish_suspend(struct uhci_hcd *uhci, int port,
-		unsigned long port_addr)
-{
-	int status;
-	int i;
-
-	if (uhci_readw(uhci, port_addr) & SUSPEND_BITS) {
-		CLR_RH_PORTSTAT(SUSPEND_BITS);
-		if (test_bit(port, &uhci->resuming_ports))
-			set_bit(port, &uhci->port_c_suspend);
-
-		/* The controller won't actually turn off the RD bit until
-		 * it has had a chance to send a low-speed EOP sequence,
-		 * which is supposed to take 3 bit times (= 2 microseconds).
-		 * Experiments show that some controllers take longer, so
-		 * we'll poll for completion. */
-		for (i = 0; i < 10; ++i) {
-			if (!(uhci_readw(uhci, port_addr) & SUSPEND_BITS))
-				break;
-			udelay(1);
-		}
-	}
-	clear_bit(port, &uhci->resuming_ports);
-	usb_hcd_end_port_resume(&uhci_to_hcd(uhci)->self, port);
-}
-
-/* Wait for the UHCI controller in HP's iLO2 server management chip.
- * It can take up to 250 us to finish a reset and set the CSC bit.
- */
-static void wait_for_HP(struct uhci_hcd *uhci, unsigned long port_addr)
-{
-	int i;
-
-	for (i = 10; i < 250; i += 10) {
-		if (uhci_readw(uhci, port_addr) & USBPORTSC_CSC)
-			return;
-		udelay(10);
-	}
-	/* Log a warning? */
-}
-
-static void uhci_check_ports(struct uhci_hcd *uhci)
-{
-	unsigned int port;
-	unsigned long port_addr;
-	int status;
-
-	for (port = 0; port < uhci->rh_numports; ++port) {
-		port_addr = USBPORTSC1 + 2 * port;
-		status = uhci_readw(uhci, port_addr);
-		if (unlikely(status & USBPORTSC_PR)) {
-			if (time_after_eq(jiffies, uhci->ports_timeout)) {
-				CLR_RH_PORTSTAT(USBPORTSC_PR);
-				udelay(10);
-
-				/* HP's server management chip requires
-				 * a longer delay. */
-				if (uhci->wait_for_hp)
-					wait_for_HP(uhci, port_addr);
-
-				/* If the port was enabled before, turning
-				 * reset on caused a port enable change.
-				 * Turning reset off causes a port connect
-				 * status change.  Clear these changes. */
-				CLR_RH_PORTSTAT(USBPORTSC_CSC | USBPORTSC_PEC);
-				SET_RH_PORTSTAT(USBPORTSC_PE);
-			}
-		}
-		if (unlikely(status & USBPORTSC_RD)) {
-			if (!test_bit(port, &uhci->resuming_ports)) {
-
-				/* Port received a wakeup request */
-				set_bit(port, &uhci->resuming_ports);
-				uhci->ports_timeout = jiffies +
-					msecs_to_jiffies(USB_RESUME_TIMEOUT);
-				usb_hcd_start_port_resume(
-						&uhci_to_hcd(uhci)->self, port);
-
-				/* Make sure we see the port again
-				 * after the resuming period is over. */
-				mod_timer(&uhci_to_hcd(uhci)->rh_timer,
-						uhci->ports_timeout);
-			} else if (time_after_eq(jiffies,
-						uhci->ports_timeout)) {
-				uhci_finish_suspend(uhci, port, port_addr);
-			}
-		}
-	}
-}
-
-static int uhci_hub_status_data(struct usb_hcd *hcd, char *buf)
-{
-	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
-	unsigned long flags;
-	int status = 0;
-
-	spin_lock_irqsave(&uhci->lock, flags);
-
-	uhci_scan_schedule(uhci);
-	if (!HCD_HW_ACCESSIBLE(hcd) || uhci->dead)
-		goto done;
-	uhci_check_ports(uhci);
-
-	status = get_hub_status_data(uhci, buf);
-
-	switch (uhci->rh_state) {
-	    case UHCI_RH_SUSPENDED:
-		/* if port change, ask to be resumed */
-		if (status || uhci->resuming_ports) {
-			status = 1;
-			usb_hcd_resume_root_hub(hcd);
-		}
-		break;
-
-	    case UHCI_RH_AUTO_STOPPED:
-		/* if port change, auto start */
-		if (status)
-			wakeup_rh(uhci);
-		break;
-
-	    case UHCI_RH_RUNNING:
-		/* are any devices attached? */
-		if (!any_ports_active(uhci)) {
-			uhci->rh_state = UHCI_RH_RUNNING_NODEVS;
-			uhci->auto_stop_time = jiffies + HZ;
-		}
-		break;
-
-	    case UHCI_RH_RUNNING_NODEVS:
-		/* auto-stop if nothing connected for 1 second */
-		if (any_ports_active(uhci))
-			uhci->rh_state = UHCI_RH_RUNNING;
-		else if (time_after_eq(jiffies, uhci->auto_stop_time) &&
-				!uhci->wait_for_hp)
-			suspend_rh(uhci, UHCI_RH_AUTO_STOPPED);
-		break;
-
-	    default:
-		break;
-	}
-
-done:
-	spin_unlock_irqrestore(&uhci->lock, flags);
-	return status;
-}
-
-/* size of returned buffer is part of USB spec */
-static int uhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
-			u16 wIndex, char *buf, u16 wLength)
-{
-	struct uhci_hcd *uhci = hcd_to_uhci(hcd);
-	int status, lstatus, retval = 0;
-	unsigned int port = wIndex - 1;
-	unsigned long port_addr = USBPORTSC1 + 2 * port;
-	u16 wPortChange, wPortStatus;
-	unsigned long flags;
-
-	if (!HCD_HW_ACCESSIBLE(hcd) || uhci->dead)
-		return -ETIMEDOUT;
-
-	spin_lock_irqsave(&uhci->lock, flags);
-	switch (typeReq) {
-
-	case GetHubStatus:
-		*(__le32 *)buf = cpu_to_le32(0);
-		retval = 4; /* hub power */
-		break;
-	case GetPortStatus:
-		if (port >= uhci->rh_numports)
-			goto err;
-
-		uhci_check_ports(uhci);
-		status = uhci_readw(uhci, port_addr);
-
-		/* Intel controllers report the OverCurrent bit active on.
-		 * VIA controllers report it active off, so we'll adjust the
-		 * bit value.  (It's not standardized in the UHCI spec.)
-		 */
-		if (uhci->oc_low)
-			status ^= USBPORTSC_OC;
-
-		/* UHCI doesn't support C_RESET (always false) */
-		wPortChange = lstatus = 0;
-		if (status & USBPORTSC_CSC)
-			wPortChange |= USB_PORT_STAT_C_CONNECTION;
-		if (status & USBPORTSC_PEC)
-			wPortChange |= USB_PORT_STAT_C_ENABLE;
-		if ((status & USBPORTSC_OCC) && !ignore_oc)
-			wPortChange |= USB_PORT_STAT_C_OVERCURRENT;
-
-		if (test_bit(port, &uhci->port_c_suspend)) {
-			wPortChange |= USB_PORT_STAT_C_SUSPEND;
-			lstatus |= 1;
-		}
-		if (test_bit(port, &uhci->resuming_ports))
-			lstatus |= 4;
-
-		/* UHCI has no power switching (always on) */
-		wPortStatus = USB_PORT_STAT_POWER;
-		if (status & USBPORTSC_CCS)
-			wPortStatus |= USB_PORT_STAT_CONNECTION;
-		if (status & USBPORTSC_PE) {
-			wPortStatus |= USB_PORT_STAT_ENABLE;
-			if (status & SUSPEND_BITS)
-				wPortStatus |= USB_PORT_STAT_SUSPEND;
-		}
-		if (status & USBPORTSC_OC)
-			wPortStatus |= USB_PORT_STAT_OVERCURRENT;
-		if (status & USBPORTSC_PR)
-			wPortStatus |= USB_PORT_STAT_RESET;
-		if (status & USBPORTSC_LSDA)
-			wPortStatus |= USB_PORT_STAT_LOW_SPEED;
-
-		if (wPortChange)
-			dev_dbg(uhci_dev(uhci), "port %d portsc %04x,%02x\n",
-					wIndex, status, lstatus);
-
-		*(__le16 *)buf = cpu_to_le16(wPortStatus);
-		*(__le16 *)(buf + 2) = cpu_to_le16(wPortChange);
-		retval = 4;
-		break;
-	case SetHubFeature:		/* We don't implement these */
-	case ClearHubFeature:
-		switch (wValue) {
-		case C_HUB_OVER_CURRENT:
-		case C_HUB_LOCAL_POWER:
-			break;
-		default:
-			goto err;
-		}
-		break;
-	case SetPortFeature:
-		if (port >= uhci->rh_numports)
-			goto err;
-
-		switch (wValue) {
-		case USB_PORT_FEAT_SUSPEND:
-			SET_RH_PORTSTAT(USBPORTSC_SUSP);
-			break;
-		case USB_PORT_FEAT_RESET:
-			SET_RH_PORTSTAT(USBPORTSC_PR);
-
-			/* Reset terminates Resume signalling */
-			uhci_finish_suspend(uhci, port, port_addr);
-
-			/* USB v2.0 7.1.7.5 */
-			uhci->ports_timeout = jiffies +
-				msecs_to_jiffies(USB_RESUME_TIMEOUT);
-			break;
-		case USB_PORT_FEAT_POWER:
-			/* UHCI has no power switching */
-			break;
-		default:
-			goto err;
-		}
-		break;
-	case ClearPortFeature:
-		if (port >= uhci->rh_numports)
-			goto err;
-
-		switch (wValue) {
-		case USB_PORT_FEAT_ENABLE:
-			CLR_RH_PORTSTAT(USBPORTSC_PE);
-
-			/* Disable terminates Resume signalling */
-			uhci_finish_suspend(uhci, port, port_addr);
-			break;
-		case USB_PORT_FEAT_C_ENABLE:
-			CLR_RH_PORTSTAT(USBPORTSC_PEC);
-			break;
-		case USB_PORT_FEAT_SUSPEND:
-			if (!(uhci_readw(uhci, port_addr) & USBPORTSC_SUSP)) {
-
-				/* Make certain the port isn't suspended */
-				uhci_finish_suspend(uhci, port, port_addr);
-			} else if (!test_and_set_bit(port,
-						&uhci->resuming_ports)) {
-				SET_RH_PORTSTAT(USBPORTSC_RD);
-
-				/* The controller won't allow RD to be set
-				 * if the port is disabled.  When this happens
-				 * just skip the Resume signalling.
-				 */
-				if (!(uhci_readw(uhci, port_addr) &
-						USBPORTSC_RD))
-					uhci_finish_suspend(uhci, port,
-							port_addr);
-				else
-					/* USB v2.0 7.1.7.7 */
-					uhci->ports_timeout = jiffies +
-						msecs_to_jiffies(20);
-			}
-			break;
-		case USB_PORT_FEAT_C_SUSPEND:
-			clear_bit(port, &uhci->port_c_suspend);
-			break;
-		case USB_PORT_FEAT_POWER:
-			/* UHCI has no power switching */
-			goto err;
-		case USB_PORT_FEAT_C_CONNECTION:
-			CLR_RH_PORTSTAT(USBPORTSC_CSC);
-			break;
-		case USB_PORT_FEAT_C_OVER_CURRENT:
-			CLR_RH_PORTSTAT(USBPORTSC_OCC);
-			break;
-		case USB_PORT_FEAT_C_RESET:
-			/* this driver won't report these */
-			break;
-		default:
-			goto err;
-		}
-		break;
-	case GetHubDescriptor:
-		retval = min_t(unsigned int, sizeof(root_hub_hub_des), wLength);
-		memcpy(buf, root_hub_hub_des, retval);
-		if (retval > 2)
-			buf[2] = uhci->rh_numports;
-		break;
-	default:
-err:
-		retval = -EPIPE;
-	}
-	spin_unlock_irqrestore(&uhci->lock, flags);
-
-	return retval;
-}
+A_RECOVERY_SURFACE_ADDRESS_HIGH                          0x44be
+#define mmGRPH_XDMA_CACHE_UNDERFLOW_DET_STATUS                                  0x1abf
+#define mmDCP0_GRPH_XDMA_CACHE_UNDERFLOW_DET_STATUS                             0x1abf
+#define mmDCP1_GRPH_XDMA_CACHE_UNDERFLOW_DET_STATUS                             0x1cbf
+#define mmDCP2_GRPH_XDMA_CACHE_UNDERFLOW_DET_STATUS                             0x1ebf
+#define mmDCP3_GRPH_XDMA_CACHE_UNDERFLOW_DET_STATUS                             0x40bf
+#define mmDCP4_GRPH_XDMA_CACHE_UNDERFLOW_DET_STATUS                             0x42bf
+#define mmDCP5_GRPH_XDMA_CACHE_UNDERFLOW_DET_STATUS                             0x44bf
+#define mmDIG_FE_CNTL                                                           0x4a00
+#define mmDIG0_DIG_FE_CNTL                                                      0x4a00
+#define mmDIG1_DIG_FE_CNTL                                                      0x4b00
+#define mmDIG2_DIG_FE_CNTL                                                      0x4c00
+#define mmDIG3_DIG_FE_CNTL                                                      0x4d00
+#define mmDIG4_DIG_FE_CNTL                                                      0x4e00
+#define mmDIG5_DIG_FE_CNTL                                                      0x4f00
+#define mmDIG6_DIG_FE_CNTL                                                      0x5400
+#define mmDIG_OUTPUT_CRC_CNTL                                                   0x4a01
+#define mmDIG0_DIG_OUTPUT_CRC_CNTL                                              0x4a01
+#define mmDIG1_DIG_OUTPUT_CRC_CNTL                                              0x4b01
+#define mmDIG2_DIG_OUTPUT_CRC_CNTL                                              0x4c01
+#define mmDIG3_DIG_OUTPUT_CRC_CNTL                                              0x4d01
+#define mmDIG4_DIG_OUTPUT_CRC_CNTL                                              0x4e01
+#define mmDIG5_DIG_OUTPUT_CRC_CNTL                                              0x4f01
+#define mmDIG6_DIG_OUTPUT_CRC_CNTL                                              0x5401
+#define mmDIG_OUTPUT_CRC_RESULT                                                 0x4a02
+#define mmDIG0_DIG_OUTPUT_CRC_RESULT                                            0x4a02
+#define mmDIG1_DIG_OUTPUT_CRC_RESULT                                            0x4b02
+#define mmDIG2_DIG_OUTPUT_CRC_RESULT                                            0x4c02
+#define mmDIG3_DIG_OUTPUT_CRC_RESULT                                            0x4d02
+#define mmDIG4_DIG_OUTPUT_CRC_RESULT                                            0x4e02
+#define mmDIG5_DIG_OUTPUT_CRC_RESULT                                            0x4f02
+#define mmDIG6_DIG_OUTPUT_CRC_RESULT                                            0x5402
+#define mmDIG_CLOCK_PATTERN                                                     0x4a03
+#define mmDIG0_DIG_CLOCK_PATTERN                                                0x4a03
+#define mmDIG1_DIG_CLOCK_PATTERN                                                0x4b03
+#define mmDIG2_DIG_CLOCK_PATTERN                                                0x4c03
+#define mmDIG3_DIG_CLOCK_PATTERN                                                0x4d03
+#define mmDIG4_DIG_CLOCK_PATTERN                                                0x4e03
+#define mmDIG5_DIG_CLOCK_PATTERN                                                0x4f03
+#define mmDIG6_DIG_CLOCK_PATTERN                                                0x5403
+#define mmDIG_TEST_PATTERN                                                      0x4a04
+#define mmDIG0_DIG_TEST_PATTERN                                                 0x4a04
+#define mmDIG1_DIG_TEST_PATTERN                                                 0x4b04
+#define mmDIG2_DIG_TEST_PATTERN                                                 0x4c04
+#define mmDIG3_DIG_TEST_PATTERN                                                 0x4d04
+#define mmDIG4_DIG_TEST_PATTERN                                                 0x4e04
+#define mmDIG5_DIG_TEST_PATTERN                                                 0x4f04
+#define mmDIG6_DIG_TEST_PATTERN                                                 0x5404
+#define mmDIG_RANDOM_PATTERN_SEED                                               0x4a05
+#define mmDIG0_DIG_RANDOM_PATTERN_SEED                                          0x4a05
+#define mmDIG1_DIG_RANDOM_PATTERN_SEED                                          0x4b05
+#define mmDIG2_DIG_RANDOM_PATTERN_SEED                                          0x4c05
+#define mmDIG3_DIG_RANDOM_PATTERN_SEED                                          0x4d05
+#define mmDIG4_DIG_RANDOM_PATTERN_SEED                                          0x4e05
+#define mmDIG5_DIG_RANDOM_PATTERN_SEED                                          0x4f05
+#define mmDIG6_DIG_RANDOM_PATTERN_SEED                                          0x5405
+#define mmDIG_FIFO_STATUS                                                       0x4a06
+#define mmDIG0_DIG_FIFO_STATUS                                                  0x4a06
+#define mmDIG1_DIG_FIFO_STATUS                                                  0x4b06
+#define mmDIG2_DIG_FIFO_STATUS                                                  0x4c06
+#define mmDIG3_DIG_FIFO_STATUS                                                  0x4d06
+#define mmDIG4_DIG_FIFO_STATUS                                                  0x4e06
+#define mmDIG5_DIG_FIFO_STATUS                                                  0x4f06
+#define mmDIG6_DIG_FIFO_STATUS                                                  0x5406
+#define mmDIG_DISPCLK_SWITCH_CNTL                                               0x4a07
+#define mmDIG0_DIG_DISPCLK_SWITCH_CNTL                                          0x4a07
+#define mmDIG1_DIG_DISPCLK_SWITCH_CNTL                                          0x4b07
+#define mmDIG2_DIG_DISPCLK_SWITCH_CNTL                                          0x4c07
+#define mmDIG3_DIG_DISPCLK_SWITCH_CNTL                                          0x4d07
+#define mmDIG4_DIG_DISPCLK_SWITCH_CNTL                                          0x4e07
+#define mmDIG5_DIG_DISPCLK_SWITCH_CNTL                                          0x4f07
+#define mmDIG6_DIG_DISPCLK_SWITCH_CNTL                                          0x5407
+#define mmDIG_DISPCLK_SWITCH_STATUS                                             0x4a08
+#define mmDIG0_DIG_DISPCLK_SWITCH_STATUS                                        0x4a08
+#define mmDIG1_DIG_DISPCLK_SWITCH_STATUS                                        0x4b08
+#define mmDIG2_DIG_DISPCLK_SWITCH_STATUS                                        0x4c08
+#define mmDIG3_DIG_DISPCLK_SWITCH_STATUS                                        0x4d08
+#define mmDIG4_DIG_DISPCLK_SWITCH_STATUS                                        0x4e08
+#define mmDIG5_DIG_DISPCLK_SWITCH_STATUS                                        0x4f08
+#define mmDIG6_DIG_DISPCLK_SWITCH_STATUS                                        0x5408
+#define mmHDMI_CONTROL                                                          0x4a09
+#define mmDIG0_HDMI_CONTROL                                                     0x4a09
+#define mmDIG1_HDMI_CONTROL                                                     0x4b09
+#define mmDIG2_HDMI_CONTROL                                                     0x4c09
+#define mmDIG3_HDMI_CONTROL                                                     0x4d09
+#define mmDIG4_HDMI_CONTROL                                                     0x4e09
+#define mmDIG5_HDMI_CONTROL                                                     0x4f09
+#define mmDIG6_HDMI_CONTROL                                                     0x5409
+#define mmHDMI_STATUS                                                           0x4a0a
+#define mmDIG0_HDMI_STATUS                                                      0x4a0a
+#define mmDIG1_HDMI_STATUS                                                      0x4b0a
+#define mmDIG2_HDMI_STATUS                                                      0x4c0a
+#define mmDIG3_HDMI_STATUS                                                      0x4d0a
+#define mmDIG4_HDMI_STATUS                                                      0x4e0a
+#define mmDIG5_HDMI_STATUS                                                      0x4f0a
+#define mmDIG6_HDMI_STATUS                                                      0x540a
+#define mmHDMI_AUDIO_PACKET_CONTROL                                             0x4a0b
+#define mmDIG0_HDMI_AUDIO_PACKET_CONTROL                                        0x4a0b
+#define mmDIG1_HDMI_AUDIO_PACKET_CONTROL                                        0x4b0b
+#define mmDIG2_HDMI_AUDIO_PACKET_CONTROL                                        0x4c0b
+#define mmDIG3_HDMI_AUDIO_PACKET_CONTROL                                        0x4d0b
+#define mmDIG4_HDMI_AUDIO_PACKET_CONTROL                                        0x4e0b
+#define mmDIG5_HDMI_AUDIO_PACKET_CONTROL                                        0x4f0b
+#define mmDIG6_HDMI_AUDIO_PACKET_CONTROL                                        0x540b
+#define mmHDMI_ACR_PACKET_CONTROL                                               0x4a0c
+#define mmDIG0_HDMI_ACR_PACKET_CONTROL                                          0x4a0c
+#define mmDIG1_HDMI_ACR_PACKET_CONTROL                                          0x4b0c
+#define mmDIG2_HDMI_ACR_PACKET_CONTROL                                          0x4c0c
+#define mmDIG3_HDMI_ACR_PACKET_CONTROL                                          0x4d0c
+#define mmDIG4_HDMI_ACR_PACKET_CONTROL                                          0x4e0c
+#define mmDIG5_HDMI_ACR_PACKET_CONTROL                                          0x4f0c
+#define mmDIG6_HDMI_ACR_PACKET_CONTROL                                          0x540c
+#define mmHDMI_VBI_PACKET_CONTROL                                               0x4a0d
+#define mmDIG0_HDMI_VBI_PACKET_CONTROL                                          0x4a0d
+#define mmDIG1_HDMI_VBI_PACKET_CONTROL                                          0x4b0d
+#define mmDIG2_HDMI_VBI_PACKET_CONTROL                                          0x4c0d
+#define mmDIG3_HDMI_VBI_PACKET_CONTROL                                          0x4d0d
+#define mmDIG4_HDMI_VBI_PACKET_CONTROL                                          0x4e0d
+#define mmDIG5_HDMI_VBI_PACKET_CONTROL                                          0x4f0d
+#define mmDIG6_HDMI_VBI_PACKET_CONTROL                                          0x540d
+#define mmHDMI_INFOFRAME_CONTROL0                                               0x4a0e
+#define mmDIG0_HDMI_INFOFRAME_CONTROL0                                          0x4a0e
+#define mmDIG1_HDMI_INFOFRAME_CONTROL0                                          0x4b0e
+#define mmDIG2_HDMI_INFOFRAME_CONTROL0                                          0x4c0e
+#define mmDIG3_HDMI_INFOFRAME_CONTROL0                                          0x4d0e
+#define mmDIG4_HDMI_INFOFRAME_CONTROL0                                          0x4e0e
+#define mmDIG5_HDMI_INFOFRAME_CONTROL0                                          0x4f0e
+#define mmDIG6_HDMI_INFOFRAME_CONTROL0                                          0x540e
+#define mmHDMI_INFOFRAME_CONTROL1                                               0x4a0f
+#define mmDIG0_HDMI_INFOFRAME_CONTROL1                                          0x4a0f
+#define mmDIG1_HDMI_INFOFRAME_CONTROL1                                          0x4b0f
+#define mmDIG2_HDMI_INFOFRAME_CONTROL1                        

@@ -1,6 +1,5 @@
-#
-# Makefile for the s390 PCI subsystem.
-#
+eived interrupt vector = %#x on CPU %d\n",
+		       __func__, cmc_irq, smp_processor_id());
 
-obj-$(CONFIG_PCI)	+= pci.o pci_dma.o pci_clp.o pci_sysfs.o \
-			   pci_event.o pci_debug.o pci_insn.o pci_mmio.o
+	/* SAL spec states this should run w/ interrupts enabled */
+	lo

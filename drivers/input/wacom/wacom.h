@@ -1,360 +1,379 @@
-#ifndef _LINUX_WACOM_H_
-#define _LINUX_WACOM_H_
 
-#include <linux/wakelock.h>
-#include <linux/sec_sysfs.h>
-
-
-#include "wacom_i2c.h"
-
-/* wacom features */
-#define USE_OPEN_CLOSE
-#define WACOM_USE_SURVEY_MODE /* SURVEY MODE is LPM mode : Only detect grage(pdct) & aop */
-#define WACOM_USE_SOFTKEY_BLOCK
-
-
-#define WACOM_I2C_MODE_NORMAL		false
-#define WACOM_I2C_MODE_BOOT		true
-
-
-#define PDCT_NOSIGNAL			true
-#define PDCT_DETECT_PEN			false
-
-
-/* wacom command */
-#define COM_QUERY			0x2A
-#define COM_SURVEYSCAN			0x2B
-#define COM_SURVEYEXIT			0x2D
-#define COM_SURVEYREQUESTDATA		0x2E
-
-#define COM_SAMPLERATE_STOP		0x30
-#define COM_SAMPLERATE_133		0x31
-#define COM_SAMPLERATE_80		0x32
-#define COM_SAMPLERATE_40		0x33
-#define COM_SAMPLERATE_START		COM_SAMPLERATE_133
-
-#define COM_SURVEY_TARGET_GARAGE_AOP	0x3A
-#define COM_SURVEY_TARGET_GARAGEONLY	0x3B
-
-#define COM_CHECKSUM			0x63
-
-#define COM_NORMAL_COMPENSATION		0x80
-#define COM_SPECIAL_COMPENSATION	0x81
-
-#define COM_OPEN_CHECK_START		0xC9
-
-#define COM_OPEN_CHECK_STATUS		0xD8
-#define COM_NORMAL_SENSE_MODE		0xDB
-#define COM_LOW_SENSE_MODE		0xDC
-#define COM_REQUEST_SENSE_MODE		0xDD
-
-#define COM_REQUESTGARAGEDATA		0XE5
-#define COM_REQUESTSCANMODE		0xE6
-#define COM_LOW_SENSE_MODE2		0xE7
-
-#define COM_FLASH			0xFF
-
-
-/* wacom data offset */
-#define COM_COORD_NUM			13
-#define COM_RESERVED_NUM		1
-#define COM_QUERY_NUM			15
-#define COM_QUERY_POS			(COM_COORD_NUM+COM_RESERVED_NUM)
-#define COM_QUERY_BUFFER		(COM_QUERY_POS+COM_QUERY_NUM)
-
-
-/* wacom query data format */
-#define EPEN_REG_HEADER			0x00
-#define EPEN_REG_X1			0x01
-#define EPEN_REG_X2			0x02
-#define EPEN_REG_Y1			0x03
-#define EPEN_REG_Y2			0x04
-#define EPEN_REG_PRESSURE1		0x05
-#define EPEN_REG_PRESSURE2		0x06
-#define EPEN_REG_FWVER1			0x07
-#define EPEN_REG_FWVER2			0x08
-#define EPEN_REG_MPUVER			0x09
-#define EPEN_REG_BLVER			0x0A
-#define EPEN_REG_TILT_X			0x0B
-#define EPEN_REG_TILT_Y			0x0C
-#define EPEN_REG_HEIGHT			0x0D
-
-/* wacom status magic nuber */
-#define WACOM_NOISE_HIGH		0x11
-#define WACOM_NOISE_LOW			0x22
-#define AOP_BUTTON_HOVER		0xBB
-#define AOP_DOUBLE_TAB			0xDD
-
-/* skip event for keyboard cover */
-#define KEYBOARD_COVER_BOUNDARY  10400
-enum epen_virtual_event_mode {
-	EPEN_POS_NONE	= 0,
-	EPEN_POS_VIEW	= 1,
-	EPEN_POS_COVER	= 2,
+	OCRDMA_DB_RQ_SHIFT		= 24
 };
 
-/*--------------------------------------------------
- * event
- * wac_i2c->function_result
- * 7. ~ 4. reserved || 3. Garage | 2. Power Save | 1. AOP | 0. Pen In/Out |
- *
- * 0. Pen In/Out ( pen_insert )
- * ( 0: IN / 1: OUT )
- *--------------------------------------------------
- */
-#define EPEN_EVENT_PEN_OUT		(0x1<<0)
-#define EPEN_EVENT_GARAGE		(0x1<<1)
-#define EPEN_EVENT_AOP			(0x1<<2)
-#define EPEN_EVENT_SURVEY		(EPEN_EVENT_GARAGE | EPEN_EVENT_AOP)
+#define OCRDMA_ROUDP_FLAGS_SHIFT	0x03
 
+#define OCRDMA_DB_CQ_RING_ID_MASK       0x3FF	/* bits 0 - 9 */
+#define OCRDMA_DB_CQ_RING_ID_EXT_MASK  0x0C00	/* bits 10-11 of qid at 12-11 */
+/* qid #2 msbits at 12-11 */
+#define OCRDMA_DB_CQ_RING_ID_EXT_MASK_SHIFT  0x1
+#define OCRDMA_DB_CQ_NUM_POPPED_SHIFT	16	/* bits 16 - 28 */
+/* Rearm bit */
+#define OCRDMA_DB_CQ_REARM_SHIFT	29	/* bit 29 */
+/* solicited bit */
+#define OCRDMA_DB_CQ_SOLICIT_SHIFT	31	/* bit 31 */
 
-/*--------------------------------------------------
- * function setting by user or default
- * wac_i2c->function_set
- * 7~3. reserved | 2. AOT | 1. ScreenOffMemo | 0. AOD |
- *
- * 2. AOT - aot_enable sysfs
- * 1. ScreenOffMemo - screen_off_memo_enable sysfs
- * 0. AOD - aod_enable sysfs
- *--------------------------------------------------
- */
-#define EPEN_SETMODE_AOP_OPTION_AOD		(0x1<<0)
-#define EPEN_SETMODE_AOP_OPTION_SCREENOFFMEMO	(0x1<<1)
-#define EPEN_SETMODE_AOP_OPTION_AOT		(0x1<<2)
-#define EPEN_SETMODE_AOP			(EPEN_SETMODE_AOP_OPTION_AOD | EPEN_SETMODE_AOP_OPTION_SCREENOFFMEMO | \
-						 EPEN_SETMODE_AOP_OPTION_AOT)
+#define OCRDMA_EQ_ID_MASK		0x1FF	/* bits 0 - 8 */
+#define OCRDMA_EQ_ID_EXT_MASK		0x3e00	/* bits 9-13 */
+#define OCRDMA_EQ_ID_EXT_MASK_SHIFT	2	/* qid bits 9-13 at 11-15 */
 
+/* Clear the interrupt for this eq */
+#define OCRDMA_EQ_CLR_SHIFT		9	/* bit 9 */
+/* Must be 1 */
+#define OCRDMA_EQ_TYPE_SHIFT		10	/* bit 10 */
+/* Number of event entries processed */
+#define OCRDMA_NUM_EQE_SHIFT		16	/* bits 16 - 28 */
+/* Rearm bit */
+#define OCRDMA_REARM_SHIFT		29	/* bit 29 */
 
-#define EPEN_SURVEY_MODE_NONE		0x0
-#define EPEN_SURVEY_MODE_GARAGE_ONLY	EPEN_EVENT_GARAGE
-#define EPEN_SURVEY_MODE_GARAGE_AOP	EPEN_EVENT_AOP
+#define OCRDMA_MQ_ID_MASK		0x7FF	/* bits 0 - 10 */
+/* Number of entries posted */
+#define OCRDMA_MQ_NUM_MQE_SHIFT	16	/* bits 16 - 29 */
 
+#define OCRDMA_MIN_HPAGE_SIZE	4096
 
-/* DeX mode : param of dex_enable command */
-#define DEX_MODE_STYLUS		(0 << 0) /* absolute coordinate */
-#define DEX_MODE_MOUSE		(1 << 0) /* relative coordinate */
-#define DEX_MODE_EDGE_CROP	(1 << 1) /* crop 10% each of both edge side*/
-#define DEX_MODE_IRIS		(1 << 2) /* Iris mode : only use an half of bottom side of screen */
-#define DEX_MODE_ALL		(DEX_MODE_MOUSE | DEX_MODE_EDGE_CROP | DEX_MODE_IRIS)
+#define OCRDMA_MIN_Q_PAGE_SIZE	4096
+#define OCRDMA_MAX_Q_PAGES	8
 
-
-#ifdef WACOM_USE_SURVEY_MODE
-#define EPEN_RESUME_DELAY		20
-#else
-#define EPEN_RESUME_DELAY		180
-#endif
-#define EPEN_OFF_TIME_LIMIT		10000 // usec
-
-
-#ifdef WACOM_USE_SOFTKEY_BLOCK
-#define SOFTKEY_BLOCK_DURATION		(HZ / 10)
-#endif
-
-/* LCD freq sync */
-#ifdef CONFIG_WACOM_LCD_FREQ_COMPENSATE
-/* NOISE from LDI. read Vsync at wacom firmware. */
-#define LCD_FREQ_SYNC
-#endif
-
-#ifdef LCD_FREQ_SYNC
-#define LCD_FREQ_BOTTOM			60100
-#define LCD_FREQ_TOP			60500
-#endif
-
-
-#define HSYNC_COUNTER_UMAGIC		0x96
-#define HSYNC_COUNTER_LMAGIC		0xCA
-
-#define TABLE_SWAP_DATA			0x05
-
-/*--------------------------------------------------
- * Set/Get S-Pen mode for TSP
- * 1 byte input/output parameter
- * byte[0]: S-pen mode
- * - 0: global scan mode
- * - 1: local scan mode
- * - 2: high noise mode
- * - others: Reserved for future use
- *--------------------------------------------------
- */
-#define EPEN_GLOBAL_SCAN_MODE		0x00
-#define EPEN_LOCAL_SCAN_MODE		0x01
-#define EPEN_HIGH_NOISE_MODE		0x02
-
-#define FW_UPDATE_RUNNING		1
-#define FW_UPDATE_PASS			2
-#define FW_UPDATE_FAIL			-1
-
-/* Parameters for wacom own features */
-struct wacom_features {
-	char comstat;
-	unsigned int fw_version;
-	int update_status;
-};
-
-enum {
-	FW_NONE = 0,
-	FW_BUILT_IN,
-	FW_HEADER,
-	FW_IN_SDCARD,
-	FW_EX_SDCARD,
-#ifdef CONFIG_SEC_FACTORY
-	FW_FACTORY_PROC,
-#endif
-};
-
-
-/* header ver 1 */
-struct fw_image {
-	u8 hdr_ver;
-	u8 hdr_len;
-	u16 fw_ver1;
-	u16 fw_ver2;
-	u16 fw_ver3;
-	u32 fw_len;
-	u8 checksum[5];
-	u8 alignment_dummy[3];
-	u8 data[0];
-} __attribute__ ((packed));
-
-
-enum {
-	EPEN_POS_ID_SCREEN_OF_MEMO = 1,
-};
+#define OCRDMA_SLI_ASIC_ID_OFFSET	0x9C
+#define OCRDMA_SLI_ASIC_REV_MASK	0x000000FF
+#define OCRDMA_SLI_ASIC_GEN_NUM_MASK	0x0000FF00
+#define OCRDMA_SLI_ASIC_GEN_NUM_SHIFT	0x08
 /*
- * struct epen_pos - for using to send coordinate in survey mode
- * @id: for extension of function
- *      0 -> not use
- *      1 -> for Screen off Memo
- *      2 -> for oter app or function
- * @x: x coordinate
- * @y: y coordinate
- */
-struct epen_pos {
-	u8 id;
-	int x;
-	int y;
+# 0: 4K Bytes
+# 1: 8K Bytes
+# 2: 16K Bytes
+# 3: 32K Bytes
+# 4: 64K Bytes
+# 5: 128K Bytes
+# 6: 256K Bytes
+# 7: 512K Bytes
+*/
+#define OCRDMA_MAX_Q_PAGE_SIZE_CNT	8
+#define OCRDMA_Q_PAGE_BASE_SIZE (OCRDMA_MIN_Q_PAGE_SIZE * OCRDMA_MAX_Q_PAGES)
+
+#define MAX_OCRDMA_QP_PAGES		8
+#define OCRDMA_MAX_WQE_MEM_SIZE (MAX_OCRDMA_QP_PAGES * OCRDMA_MIN_HQ_PAGE_SIZE)
+
+#define OCRDMA_CREATE_CQ_MAX_PAGES	4
+#define OCRDMA_DPP_CQE_SIZE		4
+
+#define OCRDMA_GEN2_MAX_CQE 1024
+#define OCRDMA_GEN2_CQ_PAGE_SIZE 4096
+#define OCRDMA_GEN2_WQE_SIZE 256
+#define OCRDMA_MAX_CQE  4095
+#define OCRDMA_CQ_PAGE_SIZE 16384
+#define OCRDMA_WQE_SIZE 128
+#define OCRDMA_WQE_STRIDE 8
+#define OCRDMA_WQE_ALIGN_BYTES 16
+
+#define MAX_OCRDMA_SRQ_PAGES MAX_OCRDMA_QP_PAGES
+
+enum {
+	OCRDMA_MCH_OPCODE_SHIFT	= 0,
+	OCRDMA_MCH_OPCODE_MASK	= 0xFF,
+	OCRDMA_MCH_SUBSYS_SHIFT	= 8,
+	OCRDMA_MCH_SUBSYS_MASK	= 0xFF00
+};
+
+/* mailbox cmd header */
+struct ocrdma_mbx_hdr {
+	u32 subsys_op;
+	u32 timeout;		/* in seconds */
+	u32 cmd_len;
+	u32 rsvd_version;
+};
+
+enum {
+	OCRDMA_MBX_RSP_OPCODE_SHIFT	= 0,
+	OCRDMA_MBX_RSP_OPCODE_MASK	= 0xFF,
+	OCRDMA_MBX_RSP_SUBSYS_SHIFT	= 8,
+	OCRDMA_MBX_RSP_SUBSYS_MASK	= 0xFF << OCRDMA_MBX_RSP_SUBSYS_SHIFT,
+
+	OCRDMA_MBX_RSP_STATUS_SHIFT	= 0,
+	OCRDMA_MBX_RSP_STATUS_MASK	= 0xFF,
+	OCRDMA_MBX_RSP_ASTATUS_SHIFT	= 8,
+	OCRDMA_MBX_RSP_ASTATUS_MASK	= 0xFF << OCRDMA_MBX_RSP_ASTATUS_SHIFT
+};
+
+/* mailbox cmd response */
+struct ocrdma_mbx_rsp {
+	u32 subsys_op;
+	u32 status;
+	u32 rsp_len;
+	u32 add_rsp_len;
+};
+
+enum {
+	OCRDMA_MQE_EMBEDDED	= 1,
+	OCRDMA_MQE_NONEMBEDDED	= 0
+};
+
+struct ocrdma_mqe_sge {
+	u32 pa_lo;
+	u32 pa_hi;
+	u32 len;
+};
+
+enum {
+	OCRDMA_MQE_HDR_EMB_SHIFT	= 0,
+	OCRDMA_MQE_HDR_EMB_MASK		= BIT(0),
+	OCRDMA_MQE_HDR_SGE_CNT_SHIFT	= 3,
+	OCRDMA_MQE_HDR_SGE_CNT_MASK	= 0x1F << OCRDMA_MQE_HDR_SGE_CNT_SHIFT,
+	OCRDMA_MQE_HDR_SPECIAL_SHIFT	= 24,
+	OCRDMA_MQE_HDR_SPECIAL_MASK	= 0xFF << OCRDMA_MQE_HDR_SPECIAL_SHIFT
+};
+
+struct ocrdma_mqe_hdr {
+	u32 spcl_sge_cnt_emb;
+	u32 pyld_len;
+	u32 tag_lo;
+	u32 tag_hi;
+	u32 rsvd3;
+};
+
+struct ocrdma_mqe_emb_cmd {
+	struct ocrdma_mbx_hdr mch;
+	u8 pyld[220];
+};
+
+struct ocrdma_mqe {
+	struct ocrdma_mqe_hdr hdr;
+	union {
+		struct ocrdma_mqe_emb_cmd emb_req;
+		struct {
+			struct ocrdma_mqe_sge sge[19];
+		} nonemb_req;
+		u8 cmd[236];
+		struct ocrdma_mbx_rsp rsp;
+	} u;
+};
+
+#define OCRDMA_EQ_LEN       4096
+#define OCRDMA_MQ_CQ_LEN    256
+#define OCRDMA_MQ_LEN       128
+
+#define PAGE_SHIFT_4K		12
+#define PAGE_SIZE_4K		(1 << PAGE_SHIFT_4K)
+
+/* Returns number of pages spanned by the data starting at the given addr */
+#define PAGES_4K_SPANNED(_address, size) \
+	((u32)((((size_t)(_address) & (PAGE_SIZE_4K - 1)) +	\
+			(size) + (PAGE_SIZE_4K - 1)) >> PAGE_SHIFT_4K))
+
+struct ocrdma_delete_q_req {
+	struct ocrdma_mbx_hdr req;
+	u32 id;
+};
+
+struct ocrdma_pa {
+	u32 lo;
+	u32 hi;
+};
+
+#define MAX_OCRDMA_EQ_PAGES	8
+struct ocrdma_create_eq_req {
+	struct ocrdma_mbx_hdr req;
+	u32 num_pages;
+	u32 valid;
+	u32 cnt;
+	u32 delay;
+	u32 rsvd;
+	struct ocrdma_pa pa[MAX_OCRDMA_EQ_PAGES];
+};
+
+enum {
+	OCRDMA_CREATE_EQ_VALID	= BIT(29),
+	OCRDMA_CREATE_EQ_CNT_SHIFT	= 26,
+	OCRDMA_CREATE_CQ_DELAY_SHIFT	= 13,
+};
+
+struct ocrdma_create_eq_rsp {
+	struct ocrdma_mbx_rsp rsp;
+	u32 vector_eqid;
+};
+
+#define OCRDMA_EQ_MINOR_OTHER	0x1
+
+struct ocrmda_set_eqd {
+	u32 eq_id;
+	u32 phase;
+	u32 delay_multiplier;
+};
+
+struct ocrdma_modify_eqd_cmd {
+	struct ocrdma_mbx_hdr req;
+	u32 num_eq;
+	struct ocrmda_set_eqd set_eqd[8];
+} __packed;
+
+struct ocrdma_modify_eqd_req {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_modify_eqd_cmd cmd;
 };
 
 
-struct wacom_i2c {
-	struct i2c_client *client;
-	struct i2c_client *client_boot;
-	struct input_dev *input_dev;
-	struct input_dev *input_dev_pad;
-	struct input_dev *input_dev_pen;
-	struct input_dev *input_dev_virtual;
-	struct mutex lock;
-	struct mutex update_lock;
-	struct mutex irq_lock;
-	struct wake_lock fw_wakelock;
-	struct device *dev;
-	struct notifier_block typec_nb;
-	struct delayed_work typec_nb_reg_work;
-	struct delayed_work usb_typec_work;
-	u8 dp_connect_state;
-	u8 dp_connect_cmd;
-	int irq;
-	int irq_pdct;
-	int pen_pdct;
-	int pen_prox;
-	int pen_pressed;
-	int side_pressed;
-	bool fullscan_mode;
-	int tsp_noise_mode;
-	int wacom_noise_state;
-	int tool;
-	int soft_key_pressed[2];
-	struct delayed_work pen_insert_dwork;
-	bool checksum_result;
-	struct wacom_features *wac_feature;
-	struct wacom_g5_platform_data *pdata;
-	struct delayed_work resume_work;
-	struct delayed_work fullscan_check_work;
-	bool connection_check;
-	int  fail_channel;
-	int  min_adc_val;
-	bool battery_saving_mode;
-	bool screen_on;
-	bool power_enable;
-	struct completion resume_done;
-	struct wake_lock wakelock;
-	bool pm_suspend;
-	u8 survey_mode;
-	bool epen_blocked;
-	u8 function_set;
-	u8 function_result;
-	volatile bool reset_flag;
-	struct epen_pos survey_pos;
-	bool query_status;
-	int wcharging_mode;
-	u32 i2c_fail_count;
-	u32 abnormal_reset_count;
-#ifdef LCD_FREQ_SYNC
-	int lcd_freq;
-	bool lcd_freq_wait;
-	bool use_lcd_freq_sync;
-	struct work_struct lcd_freq_work;
-	struct delayed_work lcd_freq_done_work;
-	struct mutex freq_write_lock;
-#endif
-#ifdef WACOM_USE_SOFTKEY_BLOCK
-	bool block_softkey;
-	struct delayed_work softkey_block_work;
-#endif
-	struct work_struct update_work;
-	const struct firmware *firm_data;
-	struct fw_image *fw_img;
-	u8 *fw_data;
-	u32 fw_ver_file;
-	char fw_chksum[5];
-	u8 fw_update_way;
-	bool do_crc_check;
-	bool keyboard_cover_mode;
-	bool keyboard_area;
-	int virtual_tracking;
-	u8 dex_mode;
-	u32 mcount;
-#ifdef CONFIG_SEC_FACTORY
-	volatile bool fac_garage_mode;
-	u32 garage_gain0;
-	u32 garage_gain1;
-	u32 garage_freq0;
-	u32 garage_freq1;
-#endif
+struct ocrdma_modify_eq_delay_rsp {
+	struct ocrdma_mbx_rsp hdr;
+	u32 rsvd0;
+} __packed;
+
+enum {
+	OCRDMA_MCQE_STATUS_SHIFT	= 0,
+	OCRDMA_MCQE_STATUS_MASK		= 0xFFFF,
+	OCRDMA_MCQE_ESTATUS_SHIFT	= 16,
+	OCRDMA_MCQE_ESTATUS_MASK	= 0xFFFF << OCRDMA_MCQE_ESTATUS_SHIFT,
+	OCRDMA_MCQE_CONS_SHIFT		= 27,
+	OCRDMA_MCQE_CONS_MASK		= BIT(27),
+	OCRDMA_MCQE_CMPL_SHIFT		= 28,
+	OCRDMA_MCQE_CMPL_MASK		= BIT(28),
+	OCRDMA_MCQE_AE_SHIFT		= 30,
+	OCRDMA_MCQE_AE_MASK		= BIT(30),
+	OCRDMA_MCQE_VALID_SHIFT		= 31,
+	OCRDMA_MCQE_VALID_MASK		= BIT(31)
 };
 
-int wacom_power(struct wacom_i2c *, bool on);
-void wacom_reset_hw(struct wacom_i2c *);
+struct ocrdma_mcqe {
+	u32 status;
+	u32 tag_lo;
+	u32 tag_hi;
+	u32 valid_ae_cmpl_cons;
+};
 
-void wacom_compulsory_flash_mode(struct wacom_i2c *, bool enable);
-int wacom_get_irq_state(struct wacom_i2c *);
+enum {
+	OCRDMA_AE_MCQE_QPVALID		= BIT(31),
+	OCRDMA_AE_MCQE_QPID_MASK	= 0xFFFF,
 
-void wacom_wakeup_sequence(struct wacom_i2c *);
-void wacom_sleep_sequence(struct wacom_i2c *);
+	OCRDMA_AE_MCQE_CQVALID		= BIT(31),
+	OCRDMA_AE_MCQE_CQID_MASK	= 0xFFFF,
+	OCRDMA_AE_MCQE_VALID		= BIT(31),
+	OCRDMA_AE_MCQE_AE		= BIT(30),
+	OCRDMA_AE_MCQE_EVENT_TYPE_SHIFT	= 16,
+	OCRDMA_AE_MCQE_EVENT_TYPE_MASK	=
+					0xFF << OCRDMA_AE_MCQE_EVENT_TYPE_SHIFT,
+	OCRDMA_AE_MCQE_EVENT_CODE_SHIFT	= 8,
+	OCRDMA_AE_MCQE_EVENT_CODE_MASK	=
+					0xFF << OCRDMA_AE_MCQE_EVENT_CODE_SHIFT
+};
+struct ocrdma_ae_mcqe {
+	u32 qpvalid_qpid;
+	u32 cqvalid_cqid;
+	u32 evt_tag;
+	u32 valid_ae_event;
+};
 
-int wacom_fw_update(struct wacom_i2c *, u8 fw_update_way, bool bforced);
-int wacom_i2c_flash(struct wacom_i2c *);
+enum {
+	OCRDMA_AE_PVID_MCQE_ENABLED_SHIFT = 0,
+	OCRDMA_AE_PVID_MCQE_ENABLED_MASK  = 0xFF,
+	OCRDMA_AE_PVID_MCQE_TAG_SHIFT = 16,
+	OCRDMA_AE_PVID_MCQE_TAG_MASK = 0xFFFF << OCRDMA_AE_PVID_MCQE_TAG_SHIFT
+};
 
-void wacom_enable_irq(struct wacom_i2c *, bool enable);
-void wacom_enable_pdct_irq(struct wacom_i2c *, bool enable);
+struct ocrdma_ae_pvid_mcqe {
+	u32 tag_enabled;
+	u32 event_tag;
+	u32 rsvd1;
+	u32 rsvd2;
+};
 
-int wacom_i2c_send(struct wacom_i2c *, const char *buf, int count, bool mode);
-int wacom_i2c_recv(struct wacom_i2c *, char *buf, int count, bool mode);
+enum {
+	OCRDMA_AE_MPA_MCQE_REQ_ID_SHIFT		= 16,
+	OCRDMA_AE_MPA_MCQE_REQ_ID_MASK		= 0xFFFF <<
+					OCRDMA_AE_MPA_MCQE_REQ_ID_SHIFT,
 
-int wacom_i2c_query(struct wacom_i2c *);
-int wacom_checksum(struct wacom_i2c *);
-int wacom_i2c_set_sense_mode(struct wacom_i2c *);
+	OCRDMA_AE_MPA_MCQE_EVENT_CODE_SHIFT	= 8,
+	OCRDMA_AE_MPA_MCQE_EVENT_CODE_MASK	= 0xFF <<
+					OCRDMA_AE_MPA_MCQE_EVENT_CODE_SHIFT,
+	OCRDMA_AE_MPA_MCQE_EVENT_TYPE_SHIFT	= 16,
+	OCRDMA_AE_MPA_MCQE_EVENT_TYPE_MASK	= 0xFF <<
+					OCRDMA_AE_MPA_MCQE_EVENT_TYPE_SHIFT,
+	OCRDMA_AE_MPA_MCQE_EVENT_AE_SHIFT	= 30,
+	OCRDMA_AE_MPA_MCQE_EVENT_AE_MASK	= BIT(30),
+	OCRDMA_AE_MPA_MCQE_EVENT_VALID_SHIFT	= 31,
+	OCRDMA_AE_MPA_MCQE_EVENT_VALID_MASK	= BIT(31)
+};
 
-void forced_release(struct wacom_i2c *);
-void forced_release_key(struct wacom_i2c *);
+struct ocrdma_ae_mpa_mcqe {
+	u32 req_id;
+	u32 w1;
+	u32 w2;
+	u32 valid_ae_event;
+};
 
-void wacom_select_survey_mode(struct wacom_i2c *, bool enable);
-void wacom_i2c_set_survey_mode(struct wacom_i2c *, int mode);
+enum {
+	OCRDMA_AE_QP_MCQE_NEW_QP_STATE_SHIFT	= 0,
+	OCRDMA_AE_QP_MCQE_NEW_QP_STATE_MASK	= 0xFFFF,
+	OCRDMA_AE_QP_MCQE_QP_ID_SHIFT		= 16,
+	OCRDMA_AE_QP_MCQE_QP_ID_MASK		= 0xFFFF <<
+						OCRDMA_AE_QP_MCQE_QP_ID_SHIFT,
 
-int wacom_open_test(struct wacom_i2c *wac_i2c);
+	OCRDMA_AE_QP_MCQE_EVENT_CODE_SHIFT	= 8,
+	OCRDMA_AE_QP_MCQE_EVENT_CODE_MASK	= 0xFF <<
+				OCRDMA_AE_QP_MCQE_EVENT_CODE_SHIFT,
+	OCRDMA_AE_QP_MCQE_EVENT_TYPE_SHIFT	= 16,
+	OCRDMA_AE_QP_MCQE_EVENT_TYPE_MASK	= 0xFF <<
+				OCRDMA_AE_QP_MCQE_EVENT_TYPE_SHIFT,
+	OCRDMA_AE_QP_MCQE_EVENT_AE_SHIFT	= 30,
+	OCRDMA_AE_QP_MCQE_EVENT_AE_MASK		= BIT(30),
+	OCRDMA_AE_QP_MCQE_EVENT_VALID_SHIFT	= 31,
+	OCRDMA_AE_QP_MCQE_EVENT_VALID_MASK	= BIT(31)
+};
 
-int wacom_sec_init(struct wacom_i2c *);
-void wacom_sec_remove(struct wacom_i2c *);
+struct ocrdma_ae_qp_mcqe {
+	u32 qp_id_state;
+	u32 w1;
+	u32 w2;
+	u32 valid_ae_event;
+};
 
-#endif /* _LINUX_WACOM_H_ */
+enum ocrdma_async_event_code {
+	OCRDMA_ASYNC_LINK_EVE_CODE	= 0x01,
+	OCRDMA_ASYNC_GRP5_EVE_CODE	= 0x05,
+	OCRDMA_ASYNC_RDMA_EVE_CODE	= 0x14
+};
+
+enum ocrdma_async_grp5_events {
+	OCRDMA_ASYNC_EVENT_QOS_VALUE	= 0x01,
+	OCRDMA_ASYNC_EVENT_COS_VALUE	= 0x02,
+	OCRDMA_ASYNC_EVENT_PVID_STATE	= 0x03
+};
+
+enum OCRDMA_ASYNC_EVENT_TYPE {
+	OCRDMA_CQ_ERROR			= 0x00,
+	OCRDMA_CQ_OVERRUN_ERROR		= 0x01,
+	OCRDMA_CQ_QPCAT_ERROR		= 0x02,
+	OCRDMA_QP_ACCESS_ERROR		= 0x03,
+	OCRDMA_QP_COMM_EST_EVENT	= 0x04,
+	OCRDMA_SQ_DRAINED_EVENT		= 0x05,
+	OCRDMA_DEVICE_FATAL_EVENT	= 0x08,
+	OCRDMA_SRQCAT_ERROR		= 0x0E,
+	OCRDMA_SRQ_LIMIT_EVENT		= 0x0F,
+	OCRDMA_QP_LAST_WQE_EVENT	= 0x10,
+
+	OCRDMA_MAX_ASYNC_ERRORS
+};
+
+struct ocrdma_ae_lnkst_mcqe {
+	u32 speed_state_ptn;
+	u32 qos_reason_falut;
+	u32 evt_tag;
+	u32 valid_ae_event;
+};
+
+enum {
+	OCRDMA_AE_LSC_PORT_NUM_MASK	= 0x3F,
+	OCRDMA_AE_LSC_PT_SHIFT		= 0x06,
+	OCRDMA_AE_LSC_PT_MASK		= (0x03 <<
+			OCRDMA_AE_LSC_PT_SHIFT),
+	OCRDMA_AE_LSC_LS_SHIFT		= 0x08,
+	OCRDMA_AE_LSC_LS_MASK		= (0xFF <<
+			OCRDMA_AE_LSC_LS_SHIFT),
+	OCRDMA_AE_LSC_LD_SHIFT		= 0x10,
+	OCRDMA_AE_LSC_LD_MASK		= (0xFF <<
+			OCRDMA_AE_LSC_LD_SHIFT),
+	OCRDMA_AE_LSC_PPS_SHIFT		= 0x18,
+	OCRDMA_AE_LSC_PPS_MASK		= (0xFF <<
+			OCRDMA_AE_LSC_PPS_SHIFT),
+	OCRDMA_AE_LSC_PPF_MASK		= 0xFF,
+	OC

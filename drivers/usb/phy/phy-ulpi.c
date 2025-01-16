@@ -1,286 +1,116 @@
-/*
- * Generic ULPI USB transceiver support
- *
- * Copyright (C) 2009 Daniel Mack <daniel@caiaq.de>
- *
- * Based on sources from
- *
- *   Sascha Hauer <s.hauer@pengutronix.de>
- *   Freescale Semiconductors
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/export.h>
-#include <linux/usb.h>
-#include <linux/usb/otg.h>
-#include <linux/usb/ulpi.h>
-
-
-struct ulpi_info {
-	unsigned int	id;
-	char		*name;
-};
-
-#define ULPI_ID(vendor, product) (((vendor) << 16) | (product))
-#define ULPI_INFO(_id, _name)		\
-	{				\
-		.id	= (_id),	\
-		.name	= (_name),	\
-	}
-
-/* ULPI hardcoded IDs, used for probing */
-static struct ulpi_info ulpi_ids[] = {
-	ULPI_INFO(ULPI_ID(0x04cc, 0x1504), "NXP ISP1504"),
-	ULPI_INFO(ULPI_ID(0x0424, 0x0006), "SMSC USB331x"),
-	ULPI_INFO(ULPI_ID(0x0424, 0x0007), "SMSC USB3320"),
-	ULPI_INFO(ULPI_ID(0x0424, 0x0009), "SMSC USB334x"),
-	ULPI_INFO(ULPI_ID(0x0451, 0x1507), "TI TUSB1210"),
-};
-
-static int ulpi_set_otg_flags(struct usb_phy *phy)
-{
-	unsigned int flags = ULPI_OTG_CTRL_DP_PULLDOWN |
-			     ULPI_OTG_CTRL_DM_PULLDOWN;
-
-	if (phy->flags & ULPI_OTG_ID_PULLUP)
-		flags |= ULPI_OTG_CTRL_ID_PULLUP;
-
-	/*
-	 * ULPI Specification rev.1.1 default
-	 * for Dp/DmPulldown is enabled.
-	 */
-	if (phy->flags & ULPI_OTG_DP_PULLDOWN_DIS)
-		flags &= ~ULPI_OTG_CTRL_DP_PULLDOWN;
-
-	if (phy->flags & ULPI_OTG_DM_PULLDOWN_DIS)
-		flags &= ~ULPI_OTG_CTRL_DM_PULLDOWN;
-
-	if (phy->flags & ULPI_OTG_EXTVBUSIND)
-		flags |= ULPI_OTG_CTRL_EXTVBUSIND;
-
-	return usb_phy_io_write(phy, flags, ULPI_OTG_CTRL);
-}
-
-static int ulpi_set_fc_flags(struct usb_phy *phy)
-{
-	unsigned int flags = 0;
-
-	/*
-	 * ULPI Specification rev.1.1 default
-	 * for XcvrSelect is Full Speed.
-	 */
-	if (phy->flags & ULPI_FC_HS)
-		flags |= ULPI_FUNC_CTRL_HIGH_SPEED;
-	else if (phy->flags & ULPI_FC_LS)
-		flags |= ULPI_FUNC_CTRL_LOW_SPEED;
-	else if (phy->flags & ULPI_FC_FS4LS)
-		flags |= ULPI_FUNC_CTRL_FS4LS;
-	else
-		flags |= ULPI_FUNC_CTRL_FULL_SPEED;
-
-	if (phy->flags & ULPI_FC_TERMSEL)
-		flags |= ULPI_FUNC_CTRL_TERMSELECT;
-
-	/*
-	 * ULPI Specification rev.1.1 default
-	 * for OpMode is Normal Operation.
-	 */
-	if (phy->flags & ULPI_FC_OP_NODRV)
-		flags |= ULPI_FUNC_CTRL_OPMODE_NONDRIVING;
-	else if (phy->flags & ULPI_FC_OP_DIS_NRZI)
-		flags |= ULPI_FUNC_CTRL_OPMODE_DISABLE_NRZI;
-	else if (phy->flags & ULPI_FC_OP_NSYNC_NEOP)
-		flags |= ULPI_FUNC_CTRL_OPMODE_NOSYNC_NOEOP;
-	else
-		flags |= ULPI_FUNC_CTRL_OPMODE_NORMAL;
-
-	/*
-	 * ULPI Specification rev.1.1 default
-	 * for SuspendM is Powered.
-	 */
-	flags |= ULPI_FUNC_CTRL_SUSPENDM;
-
-	return usb_phy_io_write(phy, flags, ULPI_FUNC_CTRL);
-}
-
-static int ulpi_set_ic_flags(struct usb_phy *phy)
-{
-	unsigned int flags = 0;
-
-	if (phy->flags & ULPI_IC_AUTORESUME)
-		flags |= ULPI_IFC_CTRL_AUTORESUME;
-
-	if (phy->flags & ULPI_IC_EXTVBUS_INDINV)
-		flags |= ULPI_IFC_CTRL_EXTERNAL_VBUS;
-
-	if (phy->flags & ULPI_IC_IND_PASSTHRU)
-		flags |= ULPI_IFC_CTRL_PASSTHRU;
-
-	if (phy->flags & ULPI_IC_PROTECT_DIS)
-		flags |= ULPI_IFC_CTRL_PROTECT_IFC_DISABLE;
-
-	return usb_phy_io_write(phy, flags, ULPI_IFC_CTRL);
-}
-
-static int ulpi_set_flags(struct usb_phy *phy)
-{
-	int ret;
-
-	ret = ulpi_set_otg_flags(phy);
-	if (ret)
-		return ret;
-
-	ret = ulpi_set_ic_flags(phy);
-	if (ret)
-		return ret;
-
-	return ulpi_set_fc_flags(phy);
-}
-
-static int ulpi_check_integrity(struct usb_phy *phy)
-{
-	int ret, i;
-	unsigned int val = 0x55;
-
-	for (i = 0; i < 2; i++) {
-		ret = usb_phy_io_write(phy, val, ULPI_SCRATCH);
-		if (ret < 0)
-			return ret;
-
-		ret = usb_phy_io_read(phy, ULPI_SCRATCH);
-		if (ret < 0)
-			return ret;
-
-		if (ret != val) {
-			pr_err("ULPI integrity check: failed!");
-			return -ENODEV;
-		}
-		val = val << 1;
-	}
-
-	pr_info("ULPI integrity check: passed.\n");
-
-	return 0;
-}
-
-static int ulpi_init(struct usb_phy *phy)
-{
-	int i, vid, pid, ret;
-	u32 ulpi_id = 0;
-
-	for (i = 0; i < 4; i++) {
-		ret = usb_phy_io_read(phy, ULPI_PRODUCT_ID_HIGH - i);
-		if (ret < 0)
-			return ret;
-		ulpi_id = (ulpi_id << 8) | ret;
-	}
-	vid = ulpi_id & 0xffff;
-	pid = ulpi_id >> 16;
-
-	pr_info("ULPI transceiver vendor/product ID 0x%04x/0x%04x\n", vid, pid);
-
-	for (i = 0; i < ARRAY_SIZE(ulpi_ids); i++) {
-		if (ulpi_ids[i].id == ULPI_ID(vid, pid)) {
-			pr_info("Found %s ULPI transceiver.\n",
-				ulpi_ids[i].name);
-			break;
-		}
-	}
-
-	ret = ulpi_check_integrity(phy);
-	if (ret)
-		return ret;
-
-	return ulpi_set_flags(phy);
-}
-
-static int ulpi_set_host(struct usb_otg *otg, struct usb_bus *host)
-{
-	struct usb_phy *phy = otg->usb_phy;
-	unsigned int flags = usb_phy_io_read(phy, ULPI_IFC_CTRL);
-
-	if (!host) {
-		otg->host = NULL;
-		return 0;
-	}
-
-	otg->host = host;
-
-	flags &= ~(ULPI_IFC_CTRL_6_PIN_SERIAL_MODE |
-		   ULPI_IFC_CTRL_3_PIN_SERIAL_MODE |
-		   ULPI_IFC_CTRL_CARKITMODE);
-
-	if (phy->flags & ULPI_IC_6PIN_SERIAL)
-		flags |= ULPI_IFC_CTRL_6_PIN_SERIAL_MODE;
-	else if (phy->flags & ULPI_IC_3PIN_SERIAL)
-		flags |= ULPI_IFC_CTRL_3_PIN_SERIAL_MODE;
-	else if (phy->flags & ULPI_IC_CARKIT)
-		flags |= ULPI_IFC_CTRL_CARKITMODE;
-
-	return usb_phy_io_write(phy, flags, ULPI_IFC_CTRL);
-}
-
-static int ulpi_set_vbus(struct usb_otg *otg, bool on)
-{
-	struct usb_phy *phy = otg->usb_phy;
-	unsigned int flags = usb_phy_io_read(phy, ULPI_OTG_CTRL);
-
-	flags &= ~(ULPI_OTG_CTRL_DRVVBUS | ULPI_OTG_CTRL_DRVVBUS_EXT);
-
-	if (on) {
-		if (phy->flags & ULPI_OTG_DRVVBUS)
-			flags |= ULPI_OTG_CTRL_DRVVBUS;
-
-		if (phy->flags & ULPI_OTG_DRVVBUS_EXT)
-			flags |= ULPI_OTG_CTRL_DRVVBUS_EXT;
-	}
-
-	return usb_phy_io_write(phy, flags, ULPI_OTG_CTRL);
-}
-
-struct usb_phy *
-otg_ulpi_create(struct usb_phy_io_ops *ops,
-		unsigned int flags)
-{
-	struct usb_phy *phy;
-	struct usb_otg *otg;
-
-	phy = kzalloc(sizeof(*phy), GFP_KERNEL);
-	if (!phy)
-		return NULL;
-
-	otg = kzalloc(sizeof(*otg), GFP_KERNEL);
-	if (!otg) {
-		kfree(phy);
-		return NULL;
-	}
-
-	phy->label	= "ULPI";
-	phy->flags	= flags;
-	phy->io_ops	= ops;
-	phy->otg	= otg;
-	phy->init	= ulpi_init;
-
-	otg->usb_phy	= phy;
-	otg->set_host	= ulpi_set_host;
-	otg->set_vbus	= ulpi_set_vbus;
-
-	return phy;
-}
-EXPORT_SYMBOL_GPL(otg_ulpi_create);
-
+CRC_BLUE_MASK_MASK 0xff
+#define MVP_CRC_CNTL__MVP_CRC_BLUE_MASK__SHIFT 0x0
+#define MVP_CRC_CNTL__MVP_CRC_GREEN_MASK_MASK 0xff00
+#define MVP_CRC_CNTL__MVP_CRC_GREEN_MASK__SHIFT 0x8
+#define MVP_CRC_CNTL__MVP_CRC_RED_MASK_MASK 0xff0000
+#define MVP_CRC_CNTL__MVP_CRC_RED_MASK__SHIFT 0x10
+#define MVP_CRC_CNTL__MVP_CRC_EN_MASK 0x10000000
+#define MVP_CRC_CNTL__MVP_CRC_EN__SHIFT 0x1c
+#define MVP_CRC_CNTL__MVP_CRC_CONT_EN_MASK 0x20000000
+#define MVP_CRC_CNTL__MVP_CRC_CONT_EN__SHIFT 0x1d
+#define MVP_CRC_CNTL__MVP_DC_DDR_CRC_EVEN_ODD_PIX_SEL_MASK 0x40000000
+#define MVP_CRC_CNTL__MVP_DC_DDR_CRC_EVEN_ODD_PIX_SEL__SHIFT 0x1e
+#define MVP_CRC_RESULT_BLUE_GREEN__MVP_CRC_BLUE_RESULT_MASK 0xffff
+#define MVP_CRC_RESULT_BLUE_GREEN__MVP_CRC_BLUE_RESULT__SHIFT 0x0
+#define MVP_CRC_RESULT_BLUE_GREEN__MVP_CRC_GREEN_RESULT_MASK 0xffff0000
+#define MVP_CRC_RESULT_BLUE_GREEN__MVP_CRC_GREEN_RESULT__SHIFT 0x10
+#define MVP_CRC_RESULT_RED__MVP_CRC_RED_RESULT_MASK 0xffff
+#define MVP_CRC_RESULT_RED__MVP_CRC_RED_RESULT__SHIFT 0x0
+#define MVP_CONTROL3__MVP_RESET_IN_BETWEEN_FRAMES_MASK 0x1
+#define MVP_CONTROL3__MVP_RESET_IN_BETWEEN_FRAMES__SHIFT 0x0
+#define MVP_CONTROL3__MVP_DDR_SC_AB_SEL_MASK 0x10
+#define MVP_CONTROL3__MVP_DDR_SC_AB_SEL__SHIFT 0x4
+#define MVP_CONTROL3__MVP_DDR_SC_B_START_MODE_MASK 0x100
+#define MVP_CONTROL3__MVP_DDR_SC_B_START_MODE__SHIFT 0x8
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_OUT_FORCE_ONE_MASK 0x1000
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_OUT_FORCE_ONE__SHIFT 0xc
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_OUT_FORCE_ZERO_MASK 0x10000
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_OUT_FORCE_ZERO__SHIFT 0x10
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_CASCADE_EN_MASK 0x100000
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_CASCADE_EN__SHIFT 0x14
+#define MVP_CONTROL3__MVP_SWAP_48BIT_EN_MASK 0x1000000
+#define MVP_CONTROL3__MVP_SWAP_48BIT_EN__SHIFT 0x18
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_IN_CAP_MASK 0x10000000
+#define MVP_CONTROL3__MVP_FLOW_CONTROL_IN_CAP__SHIFT 0x1c
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_PIXEL_ERROR_CNT_MASK 0x1fff
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_PIXEL_ERROR_CNT__SHIFT 0x0
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_LINE_ERROR_CNT_MASK 0x1fff0000
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_LINE_ERROR_CNT__SHIFT 0x10
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_DATA_CHK_EN_MASK 0x80000000
+#define MVP_RECEIVE_CNT_CNTL1__MVP_SLAVE_DATA_CHK_EN__SHIFT 0x1f
+#define MVP_RECEIVE_CNT_CNTL2__MVP_SLAVE_FRAME_ERROR_CNT_MASK 0x1fff
+#define MVP_RECEIVE_CNT_CNTL2__MVP_SLAVE_FRAME_ERROR_CNT__SHIFT 0x0
+#define MVP_RECEIVE_CNT_CNTL2__MVP_SLAVE_FRAME_ERROR_CNT_RESET_MASK 0x80000000
+#define MVP_RECEIVE_CNT_CNTL2__MVP_SLAVE_FRAME_ERROR_CNT_RESET__SHIFT 0x1f
+#define MVP_DEBUG__MVP_SWAP_LOCK_IN_EN_MASK 0x1
+#define MVP_DEBUG__MVP_SWAP_LOCK_IN_EN__SHIFT 0x0
+#define MVP_DEBUG__MVP_FLOW_CONTROL_IN_EN_MASK 0x2
+#define MVP_DEBUG__MVP_FLOW_CONTROL_IN_EN__SHIFT 0x1
+#define MVP_DEBUG__MVP_SWAP_LOCK_IN_SEL_MASK 0x4
+#define MVP_DEBUG__MVP_SWAP_LOCK_IN_SEL__SHIFT 0x2
+#define MVP_DEBUG__MVP_FLOW_CONTROL_IN_SEL_MASK 0x8
+#define MVP_DEBUG__MVP_FLOW_CONTROL_IN_SEL__SHIFT 0x3
+#define MVP_DEBUG__MVP_DIS_FIX_AFR_MANUAL_HSYNC_FLIP_MASK 0x10
+#define MVP_DEBUG__MVP_DIS_FIX_AFR_MANUAL_HSYNC_FLIP__SHIFT 0x4
+#define MVP_DEBUG__MVP_DIS_FIX_AFR_AUTO_VSYNC_FLIP_MASK 0x20
+#define MVP_DEBUG__MVP_DIS_FIX_AFR_AUTO_VSYNC_FLIP__SHIFT 0x5
+#define MVP_DEBUG__MVP_EN_FIX_AFR_MANUAL_SWITCH_IN_SFR_MASK 0x40
+#define MVP_DEBUG__MVP_EN_FIX_AFR_MANUAL_SWITCH_IN_SFR__SHIFT 0x6
+#define MVP_DEBUG__MVP_DIS_READ_POINTER_RESET_DELAY_MASK 0x80
+#define MVP_DEBUG__MVP_DIS_READ_POINTER_RESET_DELAY__SHIFT 0x7
+#define MVP_DEBUG__MVP_DEBUG_BITS_MASK 0xffffff00
+#define MVP_DEBUG__MVP_DEBUG_BITS__SHIFT 0x8
+#define MVP_TEST_DEBUG_INDEX__MVP_TEST_DEBUG_INDEX_MASK 0xff
+#define MVP_TEST_DEBUG_INDEX__MVP_TEST_DEBUG_INDEX__SHIFT 0x0
+#define MVP_TEST_DEBUG_INDEX__MVP_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define MVP_TEST_DEBUG_INDEX__MVP_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define MVP_TEST_DEBUG_DATA__MVP_TEST_DEBUG_DATA_MASK 0xffffffff
+#define MVP_TEST_DEBUG_DATA__MVP_TEST_DEBUG_DATA__SHIFT 0x0
+#define MVP_DEBUG_05__IDE0_MVP_GPU_CHAIN_LOCATION_MASK 0x6
+#define MVP_DEBUG_05__IDE0_MVP_GPU_CHAIN_LOCATION__SHIFT 0x1
+#define MVP_DEBUG_09__IDE4_CRTC2_MVP_GPU_CHAIN_LOCATION_MASK 0x6
+#define MVP_DEBUG_09__IDE4_CRTC2_MVP_GPU_CHAIN_LOCATION__SHIFT 0x1
+#define MVP_DEBUG_12__IDEC_MVP_DATA_A_H_MASK 0x1
+#define MVP_DEBUG_12__IDEC_MVP_DATA_A_H__SHIFT 0x0
+#define MVP_DEBUG_12__IDEC_MVP_DATA_A_MASK 0x1fffffe
+#define MVP_DEBUG_12__IDEC_MVP_DATA_A__SHIFT 0x1
+#define MVP_DEBUG_13__IDED_MVP_DATA_B_H_MASK 0x1
+#define MVP_DEBUG_13__IDED_MVP_DATA_B_H__SHIFT 0x0
+#define MVP_DEBUG_13__IDED_MVP_DATA_B_MASK 0x1fffffe
+#define MVP_DEBUG_13__IDED_MVP_DATA_B__SHIFT 0x1
+#define MVP_DEBUG_13__IDED_START_READ_B_MASK 0x2000000
+#define MVP_DEBUG_13__IDED_START_READ_B__SHIFT 0x19
+#define MVP_DEBUG_13__IDED_READ_FIFO_ENTRY_DE_B_MASK 0x4000000
+#define MVP_DEBUG_13__IDED_READ_FIFO_ENTRY_DE_B__SHIFT 0x1a
+#define MVP_DEBUG_13__IDED_WRITE_ADD_B_MASK 0x38000000
+#define MVP_DEBUG_13__IDED_WRITE_ADD_B__SHIFT 0x1b
+#define MVP_DEBUG_14__IDEE_READ_ADD_MASK 0x7
+#define MVP_DEBUG_14__IDEE_READ_ADD__SHIFT 0x0
+#define MVP_DEBUG_14__IDEE_WRITE_ADD_A_MASK 0x38
+#define MVP_DEBUG_14__IDEE_WRITE_ADD_A__SHIFT 0x3
+#define MVP_DEBUG_14__IDEE_WRITE_ADD_B_MASK 0x1c0
+#define MVP_DEBUG_14__IDEE_WRITE_ADD_B__SHIFT 0x6
+#define MVP_DEBUG_14__IDEE_START_READ_MASK 0x200
+#define MVP_DEBUG_14__IDEE_START_READ__SHIFT 0x9
+#define MVP_DEBUG_14__IDEE_START_READ_B_MASK 0x400
+#define MVP_DEBUG_14__IDEE_START_READ_B__SHIFT 0xa
+#define MVP_DEBUG_14__IDEE_START_INCR_WR_A_MASK 0x800
+#define MVP_DEBUG_14__IDEE_START_INCR_WR_A__SHIFT 0xb
+#define MVP_DEBUG_14__IDEE_START_INCR_WR_B_MASK 0x1000
+#define MVP_DEBUG_14__IDEE_START_INCR_WR_B__SHIFT 0xc
+#define MVP_DEBUG_14__IDEE_WRITE2FIFO_MASK 0x2000
+#define MVP_DEBUG_14__IDEE_WRITE2FIFO__SHIFT 0xd
+#define MVP_DEBUG_14__IDEE_READ_FIFO_ENTRY_DE_MASK 0x4000
+#define MVP_DEBUG_14__IDEE_READ_FIFO_ENTRY_DE__SHIFT 0xe
+#define MVP_DEBUG_14__IDEE_READ_FIFO_ENTRY_DE_B_MASK 0x8000
+#define MVP_DEBUG_14__IDEE_READ_FIFO_ENTRY_DE_B__SHIFT 0xf
+#define MVP_DEBUG_14__IDEE_READ_FIFO_DE_MASK 0x10000
+#define MVP_DEBUG_14__IDEE_READ_FIFO_DE__SHIFT 0x10
+#define MVP_DEBUG_14__IDEE_READ_FIFO_DE_B_MASK 0x20000
+#define MVP_DEBUG_14__IDEE_READ_FIFO_DE_B__SHIFT 0x11
+#define MVP_DEBUG_14__IDEE_READ_FIFO_ENABLE_MASK 0x40000
+#define MVP_DEBUG_14__IDEE_READ_FIFO_ENABLE__SHIFT 0x12
+#define MVP_DEBUG_14__IDEE_CRTC1_CNTL_CAPTURE_START_A_MASK 0x80000
+#define MVP_DEBUG_14__IDEE_CRTC1_CNTL_CAPTURE_START_A__SHIFT 0x13
+#define MVP_DEBUG_14__IDEE_CRC_PHASE_MASK 0x100000
+#define MVP_DEBUG_14__IDEE_CRC_PHASE__SHIFT 

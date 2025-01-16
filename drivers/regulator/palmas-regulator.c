@@ -1,1647 +1,1534 @@
-/*
- * Driver for Regulator part of Palmas PMIC Chips
+.limit = (u64) i5100_mir_limit(w) << 28;
+	priv->mir[1].way[1] = i5100_mir_way1(w);
+	priv->mir[1].way[0] = i5100_mir_way0(w);
+
+	pci_read_config_word(pdev, I5100_AMIR_0, &w);
+	priv->amir[0] = w;
+	pci_read_config_word(pdev, I5100_AMIR_1, &w);
+	priv->amir[1] = w;
+
+	for (i = 0; i < I5100_CHANNELS; i++) {
+		int j;
+
+		for (j = 0; j < 5; j++) {
+			int k;
+
+			pci_read_config_dword(mms[i], I5100_DMIR + j * 4, &dw);
+
+			priv->dmir[i][j].limit =
+				(u64) i5100_dmir_limit(dw) << 28;
+			for (k = 0; k < I5100_MAX_RANKS_PER_DIMM; k++)
+				priv->dmir[i][j].rank[k] =
+					i5100_dmir_rank(dw, k);
+		}
+	}
+
+	i5100_init_mtr(mci);
+}
+
+static void i5100_init_csrows(struct mem_ctl_info *mci)
+{
+	int i;
+	struct i5100_priv *priv = mci->pvt_info;
+
+	for (i = 0; i < mci->tot_dimms; i++) {
+		struct dimm_info *dimm;
+		const unsigned long npages = i5100_npages(mci, i);
+		const unsigned chan = i5100_csrow_to_chan(mci, i);
+		const unsigned rank = i5100_csrow_to_rank(mci, i);
+
+		if (!npages)
+			continue;
+
+		dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms, mci->n_layers,
+			       chan, rank, 0);
+
+		dimm->nr_pages = npages;
+		dimm->grain = 32;
+		dimm->dtype = (priv->mtr[chan][rank].width == 4) ?
+				DEV_X4 : DEV_X8;
+		dimm->mtype = MEM_RDDR2;
+		dimm->edac_mode = EDAC_SECDED;
+		snprintf(dimm->label, sizeof(dimm->label), "DIMM%u",
+			 i5100_rank_to_slot(mci, chan, rank));
+
+		edac_dbg(2, "dimm channel %d, rank %d, size %ld\n",
+			 chan, rank, (long)PAGES_TO_MiB(npages));
+	}
+}
+
+/****************************************************************************
+ *                       Error injection routines
+ ****************************************************************************/
+
+static void i5100_do_inject(struct mem_ctl_info *mci)
+{
+	struct i5100_priv *priv = mci->pvt_info;
+	u32 mask0;
+	u16 mask1;
+
+	/* MEM[1:0]EINJMSK0
+	 * 31    - ADDRMATCHEN
+	 * 29:28 - HLINESEL
+	 *         00 Reserved
+	 *         01 Lower half of cache line
+	 *         10 Upper half of cache line
+	 *         11 Both upper and lower parts of cache line
+	 * 27    - EINJEN
+	 * 25:19 - XORMASK1 for deviceptr1
+	 * 9:5   - SEC2RAM for deviceptr2
+	 * 4:0   - FIR2RAM for deviceptr1
+	 */
+	mask0 = ((priv->inject_hlinesel & 0x3) << 28) |
+		I5100_MEMXEINJMSK0_EINJEN |
+		((priv->inject_eccmask1 & 0xffff) << 10) |
+		((priv->inject_deviceptr2 & 0x1f) << 5) |
+		(priv->inject_deviceptr1 & 0x1f);
+
+	/* MEM[1:0]EINJMSK1
+	 * 15:0  - XORMASK2 for deviceptr2
+	 */
+	mask1 = priv->inject_eccmask2;
+
+	if (priv->inject_channel == 0) {
+		pci_write_config_dword(priv->mc, I5100_MEM0EINJMSK0, mask0);
+		pci_write_config_word(priv->mc, I5100_MEM0EINJMSK1, mask1);
+	} else {
+		pci_write_config_dword(priv->mc, I5100_MEM1EINJMSK0, mask0);
+		pci_write_config_word(priv->mc, I5100_MEM1EINJMSK1, mask1);
+	}
+
+	/* Error Injection Response Function
+	 * Intel 5100 Memory Controller Hub Chipset (318378) datasheet
+	 * hints about this register but carry no data about them. All
+	 * data regarding device 19 is based on experimentation and the
+	 * Intel 7300 Chipset Memory Controller Hub (318082) datasheet
+	 * which appears to be accurate for the i5100 in this area.
+	 *
+	 * The injection code don't work without setting this register.
+	 * The register needs to be flipped off then on else the hardware
+	 * will only preform the first injection.
+	 *
+	 * Stop condition bits 7:4
+	 * 1010 - Stop after one injection
+	 * 1011 - Never stop injecting faults
+	 *
+	 * Start condition bits 3:0
+	 * 1010 - Never start
+	 * 1011 - Start immediately
+	 */
+	pci_write_config_byte(priv->einj, I5100_DINJ0, 0xaa);
+	pci_write_config_byte(priv->einj, I5100_DINJ0, 0xab);
+}
+
+#define to_mci(k) container_of(k, struct mem_ctl_info, dev)
+static ssize_t inject_enable_write(struct file *file, const char __user *data,
+		size_t count, loff_t *ppos)
+{
+	struct device *dev = file->private_data;
+	struct mem_ctl_info *mci = to_mci(dev);
+
+	i5100_do_inject(mci);
+
+	return count;
+}
+
+static const struct file_operations i5100_inject_enable_fops = {
+	.open = simple_open,
+	.write = inject_enable_write,
+	.llseek = generic_file_llseek,
+};
+
+static int i5100_setup_debugfs(struct mem_ctl_info *mci)
+{
+	struct i5100_priv *priv = mci->pvt_info;
+
+	if (!i5100_debugfs)
+		return -ENODEV;
+
+	priv->debugfs = edac_debugfs_create_dir_at(mci->bus->name, i5100_debugfs);
+
+	if (!priv->debugfs)
+		return -ENOMEM;
+
+	edac_debugfs_create_x8("inject_channel", S_IRUGO | S_IWUSR, priv->debugfs,
+				&priv->inject_channel);
+	edac_debugfs_create_x8("inject_hlinesel", S_IRUGO | S_IWUSR, priv->debugfs,
+				&priv->inject_hlinesel);
+	edac_debugfs_create_x8("inject_deviceptr1", S_IRUGO | S_IWUSR, priv->debugfs,
+				&priv->inject_deviceptr1);
+	edac_debugfs_create_x8("inject_deviceptr2", S_IRUGO | S_IWUSR, priv->debugfs,
+				&priv->inject_deviceptr2);
+	edac_debugfs_create_x16("inject_eccmask1", S_IRUGO | S_IWUSR, priv->debugfs,
+				&priv->inject_eccmask1);
+	edac_debugfs_create_x16("inject_eccmask2", S_IRUGO | S_IWUSR, priv->debugfs,
+				&priv->inject_eccmask2);
+	edac_debugfs_create_file("inject_enable", S_IWUSR, priv->debugfs,
+				&mci->dev, &i5100_inject_enable_fops);
+
+	return 0;
+
+}
+
+static int i5100_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	int rc;
+	struct mem_ctl_info *mci;
+	struct edac_mc_layer layers[2];
+	struct i5100_priv *priv;
+	struct pci_dev *ch0mm, *ch1mm, *einj;
+	int ret = 0;
+	u32 dw;
+	int ranksperch;
+
+	if (PCI_FUNC(pdev->devfn) != 1)
+		return -ENODEV;
+
+	rc = pci_enable_device(pdev);
+	if (rc < 0) {
+		ret = rc;
+		goto bail;
+	}
+
+	/* ECC enabled? */
+	pci_read_config_dword(pdev, I5100_MC, &dw);
+	if (!i5100_mc_errdeten(dw)) {
+		printk(KERN_INFO "i5100_edac: ECC not enabled.\n");
+		ret = -ENODEV;
+		goto bail_pdev;
+	}
+
+	/* figure out how many ranks, from strapped state of 48GB_Mode input */
+	pci_read_config_dword(pdev, I5100_MS, &dw);
+	ranksperch = !!(dw & (1 << 8)) * 2 + 4;
+
+	/* enable error reporting... */
+	pci_read_config_dword(pdev, I5100_EMASK_MEM, &dw);
+	dw &= ~I5100_FERR_NF_MEM_ANY_MASK;
+	pci_write_config_dword(pdev, I5100_EMASK_MEM, dw);
+
+	/* device 21, func 0, Channel 0 Memory Map, Error Flag/Mask, etc... */
+	ch0mm = pci_get_device_func(PCI_VENDOR_ID_INTEL,
+				    PCI_DEVICE_ID_INTEL_5100_21, 0);
+	if (!ch0mm) {
+		ret = -ENODEV;
+		goto bail_pdev;
+	}
+
+	rc = pci_enable_device(ch0mm);
+	if (rc < 0) {
+		ret = rc;
+		goto bail_ch0;
+	}
+
+	/* device 22, func 0, Channel 1 Memory Map, Error Flag/Mask, etc... */
+	ch1mm = pci_get_device_func(PCI_VENDOR_ID_INTEL,
+				    PCI_DEVICE_ID_INTEL_5100_22, 0);
+	if (!ch1mm) {
+		ret = -ENODEV;
+		goto bail_disable_ch0;
+	}
+
+	rc = pci_enable_device(ch1mm);
+	if (rc < 0) {
+		ret = rc;
+		goto bail_ch1;
+	}
+
+	layers[0].type = EDAC_MC_LAYER_CHANNEL;
+	layers[0].size = 2;
+	layers[0].is_virt_csrow = false;
+	layers[1].type = EDAC_MC_LAYER_SLOT;
+	layers[1].size = ranksperch;
+	layers[1].is_virt_csrow = true;
+	mci = edac_mc_alloc(0, ARRAY_SIZE(layers), layers,
+			    sizeof(*priv));
+	if (!mci) {
+		ret = -ENOMEM;
+		goto bail_disable_ch1;
+	}
+
+
+	/* device 19, func 0, Error injection */
+	einj = pci_get_device_func(PCI_VENDOR_ID_INTEL,
+				    PCI_DEVICE_ID_INTEL_5100_19, 0);
+	if (!einj) {
+		ret = -ENODEV;
+		goto bail_mc_free;
+	}
+
+	rc = pci_enable_device(einj);
+	if (rc < 0) {
+		ret = rc;
+		goto bail_einj;
+	}
+
+	mci->pdev = &pdev->dev;
+
+	priv = mci->pvt_info;
+	priv->ranksperchan = ranksperch;
+	priv->mc = pdev;
+	priv->ch0mm = ch0mm;
+	priv->ch1mm = ch1mm;
+	priv->einj = einj;
+
+	INIT_DELAYED_WORK(&(priv->i5100_scrubbing), i5100_refresh_scrubbing);
+
+	/* If scrubbing was already enabled by the bios, start maintaining it */
+	pci_read_config_dword(pdev, I5100_MC, &dw);
+	if (i5100_mc_scrben(dw)) {
+		priv->scrub_enable = 1;
+		schedule_delayed_work(&(priv->i5100_scrubbing),
+				      I5100_SCRUB_REFRESH_RATE);
+	}
+
+	i5100_init_dimm_layout(pdev, mci);
+	i5100_init_interleaving(pdev, mci);
+
+	mci->mtype_cap = MEM_FLAG_FB_DDR2;
+	mci->edac_ctl_cap = EDAC_FLAG_SECDED;
+	mci->edac_cap = EDAC_FLAG_SECDED;
+	mci->mod_name = "i5100_edac.c";
+	mci->mod_ver = "not versioned";
+	mci->ctl_name = "i5100";
+	mci->dev_name = pci_name(pdev);
+	mci->ctl_page_to_phys = NULL;
+
+	mci->edac_check = i5100_check_error;
+	mci->set_sdram_scrub_rate = i5100_set_scrub_rate;
+	mci->get_sdram_scrub_rate = i5100_get_scrub_rate;
+
+	priv->inject_channel = 0;
+	priv->inject_hlinesel = 0;
+	priv->inject_deviceptr1 = 0;
+	priv->inject_deviceptr2 = 0;
+	priv->inject_eccmask1 = 0;
+	priv->inject_eccmask2 = 0;
+
+	i5100_init_csrows(mci);
+
+	/* this strange construction seems to be in every driver, dunno why */
+	switch (edac_op_state) {
+	case EDAC_OPSTATE_POLL:
+	case EDAC_OPSTATE_NMI:
+		break;
+	default:
+		edac_op_state = EDAC_OPSTATE_POLL;
+		break;
+	}
+
+	if (edac_mc_add_mc(mci)) {
+		ret = -ENODEV;
+		goto bail_scrub;
+	}
+
+	i5100_setup_debugfs(mci);
+
+	return ret;
+
+bail_scrub:
+	priv->scrub_enable = 0;
+	cancel_delayed_work_sync(&(priv->i5100_scrubbing));
+	pci_disable_device(einj);
+
+bail_einj:
+	pci_dev_put(einj);
+
+bail_mc_free:
+	edac_mc_free(mci);
+
+bail_disable_ch1:
+	pci_disable_device(ch1mm);
+
+bail_ch1:
+	pci_dev_put(ch1mm);
+
+bail_disable_ch0:
+	pci_disable_device(ch0mm);
+
+bail_ch0:
+	pci_dev_put(ch0mm);
+
+bail_pdev:
+	pci_disable_device(pdev);
+
+bail:
+	return ret;
+}
+
+static void i5100_remove_one(struct pci_dev *pdev)
+{
+	struct mem_ctl_info *mci;
+	struct i5100_priv *priv;
+
+	mci = edac_mc_del_mc(&pdev->dev);
+
+	if (!mci)
+		return;
+
+	priv = mci->pvt_info;
+
+	edac_debugfs_remove_recursive(priv->debugfs);
+
+	priv->scrub_enable = 0;
+	cancel_delayed_work_sync(&(priv->i5100_scrubbing));
+
+	pci_disable_device(pdev);
+	pci_disable_device(priv->ch0mm);
+	pci_disable_device(priv->ch1mm);
+	pci_disable_device(priv->einj);
+	pci_dev_put(priv->ch0mm);
+	pci_dev_put(priv->ch1mm);
+	pci_dev_put(priv->einj);
+
+	edac_mc_free(mci);
+}
+
+static const struct pci_device_id i5100_pci_tbl[] = {
+	/* Device 16, Function 0, Channel 0 Memory Map, Error Flag/Mask, ... */
+	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_5100_16) },
+	{ 0, }
+};
+MODULE_DEVICE_TABLE(pci, i5100_pci_tbl);
+
+static struct pci_driver i5100_driver = {
+	.name = KBUILD_BASENAME,
+	.probe = i5100_init_one,
+	.remove = i5100_remove_one,
+	.id_table = i5100_pci_tbl,
+};
+
+static int __init i5100_init(void)
+{
+	int pci_rc;
+
+	i5100_debugfs = edac_debugfs_create_dir_at("i5100_edac", NULL);
+
+	pci_rc = pci_register_driver(&i5100_driver);
+	return (pci_rc < 0) ? pci_rc : 0;
+}
+
+static void __exit i5100_exit(void)
+{
+	edac_debugfs_remove(i5100_debugfs);
+
+	pci_unregister_driver(&i5100_driver);
+}
+
+module_init(i5100_init);
+module_exit(i5100_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR
+    ("Arthur Jones <ajones@riverbed.com>");
+MODULE_DESCRIPTION("MC Driver for Intel I5100 memory controllers");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    /*
+ * Intel 5400 class Memory Controllers kernel module (Seaburg)
  *
- * Copyright 2011-2013 Texas Instruments Inc.
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
  *
- * Author: Graeme Gregory <gg@slimlogic.co.uk>
- * Author: Ian Lartey <ian@slimlogic.co.uk>
+ * Copyright (c) 2008 by:
+ *	 Ben Woodard <woodard@redhat.com>
+ *	 Mauro Carvalho Chehab
  *
- *  This program is free software; you can redistribute it and/or modify it
- *  under  the terms of the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the License, or (at your
- *  option) any later version.
+ * Red Hat Inc. http://www.redhat.com
+ *
+ * Forked and adapted from the i5000_edac driver which was
+ * written by Douglas Thompson Linux Networx <norsk5@xmission.com>
+ *
+ * This module is based on the following document:
+ *
+ * Intel 5400 Chipset Memory Controller Hub (MCH) - Datasheet
+ * 	http://developer.intel.com/design/chipsets/datashts/313070.htm
+ *
+ * This Memory Controller manages DDR2 FB-DIMMs. It has 2 branches, each with
+ * 2 channels operating in lockstep no-mirror mode. Each channel can have up to
+ * 4 dimm's, each with up to 8GB.
  *
  */
 
-#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/err.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
+#include <linux/pci.h>
+#include <linux/pci_ids.h>
 #include <linux/slab.h>
-#include <linux/regmap.h>
-#include <linux/mfd/palmas.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/regulator/of_regulator.h>
+#include <linux/edac.h>
+#include <linux/mmzone.h>
 
-static const struct regulator_linear_range smps_low_ranges[] = {
-	REGULATOR_LINEAR_RANGE(0, 0x0, 0x0, 0),
-	REGULATOR_LINEAR_RANGE(500000, 0x1, 0x6, 0),
-	REGULATOR_LINEAR_RANGE(510000, 0x7, 0x79, 10000),
-	REGULATOR_LINEAR_RANGE(1650000, 0x7A, 0x7f, 0),
+#include "edac_core.h"
+
+/*
+ * Alter this version for the I5400 module when modifications are made
+ */
+#define I5400_REVISION    " Ver: 1.0.0"
+
+#define EDAC_MOD_STR      "i5400_edac"
+
+#define i5400_printk(level, fmt, arg...) \
+	edac_printk(level, "i5400", fmt, ##arg)
+
+#define i5400_mc_printk(mci, level, fmt, arg...) \
+	edac_mc_chipset_printk(mci, level, "i5400", fmt, ##arg)
+
+/* Limits for i5400 */
+#define MAX_BRANCHES		2
+#define CHANNELS_PER_BRANCH	2
+#define DIMMS_PER_CHANNEL	4
+#define	MAX_CHANNELS		(MAX_BRANCHES * CHANNELS_PER_BRANCH)
+
+/* Device 16,
+ * Function 0: System Address
+ * Function 1: Memory Branch Map, Control, Errors Register
+ * Function 2: FSB Error Registers
+ *
+ * All 3 functions of Device 16 (0,1,2) share the SAME DID and
+ * uses PCI_DEVICE_ID_INTEL_5400_ERR for device 16 (0,1,2),
+ * PCI_DEVICE_ID_INTEL_5400_FBD0 and PCI_DEVICE_ID_INTEL_5400_FBD1
+ * for device 21 (0,1).
+ */
+
+	/* OFFSETS for Function 0 */
+#define		AMBASE			0x48 /* AMB Mem Mapped Reg Region Base */
+#define		MAXCH			0x56 /* Max Channel Number */
+#define		MAXDIMMPERCH		0x57 /* Max DIMM PER Channel Number */
+
+	/* OFFSETS for Function 1 */
+#define		TOLM			0x6C
+#define		REDMEMB			0x7C
+#define			REC_ECC_LOCATOR_ODD(x)	((x) & 0x3fe00) /* bits [17:9] indicate ODD, [8:0]  indicate EVEN */
+#define		MIR0			0x80
+#define		MIR1			0x84
+#define		AMIR0			0x8c
+#define		AMIR1			0x90
+
+	/* Fatal error registers */
+#define		FERR_FAT_FBD		0x98	/* also called as FERR_FAT_FB_DIMM at datasheet */
+#define			FERR_FAT_FBDCHAN (3<<28)	/* channel index where the highest-order error occurred */
+
+#define		NERR_FAT_FBD		0x9c
+#define		FERR_NF_FBD		0xa0	/* also called as FERR_NFAT_FB_DIMM at datasheet */
+
+	/* Non-fatal error register */
+#define		NERR_NF_FBD		0xa4
+
+	/* Enable error mask */
+#define		EMASK_FBD		0xa8
+
+#define		ERR0_FBD		0xac
+#define		ERR1_FBD		0xb0
+#define		ERR2_FBD		0xb4
+#define		MCERR_FBD		0xb8
+
+	/* No OFFSETS for Device 16 Function 2 */
+
+/*
+ * Device 21,
+ * Function 0: Memory Map Branch 0
+ *
+ * Device 22,
+ * Function 0: Memory Map Branch 1
+ */
+
+	/* OFFSETS for Function 0 */
+#define AMBPRESENT_0	0x64
+#define AMBPRESENT_1	0x66
+#define MTR0		0x80
+#define MTR1		0x82
+#define MTR2		0x84
+#define MTR3		0x86
+
+	/* OFFSETS for Function 1 */
+#define NRECFGLOG		0x74
+#define RECFGLOG		0x78
+#define NRECMEMA		0xbe
+#define NRECMEMB		0xc0
+#define NRECFB_DIMMA		0xc4
+#define NRECFB_DIMMB		0xc8
+#define NRECFB_DIMMC		0xcc
+#define NRECFB_DIMMD		0xd0
+#define NRECFB_DIMME		0xd4
+#define NRECFB_DIMMF		0xd8
+#define REDMEMA			0xdC
+#define RECMEMA			0xf0
+#define RECMEMB			0xf4
+#define RECFB_DIMMA		0xf8
+#define RECFB_DIMMB		0xec
+#define RECFB_DIMMC		0xf0
+#define RECFB_DIMMD		0xf4
+#define RECFB_DIMME		0xf8
+#define RECFB_DIMMF		0xfC
+
+/*
+ * Error indicator bits and masks
+ * Error masks are according with Table 5-17 of i5400 datasheet
+ */
+
+enum error_mask {
+	EMASK_M1  = 1<<0,  /* Memory Write error on non-redundant retry */
+	EMASK_M2  = 1<<1,  /* Memory or FB-DIMM configuration CRC read error */
+	EMASK_M3  = 1<<2,  /* Reserved */
+	EMASK_M4  = 1<<3,  /* Uncorrectable Data ECC on Replay */
+	EMASK_M5  = 1<<4,  /* Aliased Uncorrectable Non-Mirrored Demand Data ECC */
+	EMASK_M6  = 1<<5,  /* Unsupported on i5400 */
+	EMASK_M7  = 1<<6,  /* Aliased Uncorrectable Resilver- or Spare-Copy Data ECC */
+	EMASK_M8  = 1<<7,  /* Aliased Uncorrectable Patrol Data ECC */
+	EMASK_M9  = 1<<8,  /* Non-Aliased Uncorrectable Non-Mirrored Demand Data ECC */
+	EMASK_M10 = 1<<9,  /* Unsupported on i5400 */
+	EMASK_M11 = 1<<10, /* Non-Aliased Uncorrectable Resilver- or Spare-Copy Data ECC  */
+	EMASK_M12 = 1<<11, /* Non-Aliased Uncorrectable Patrol Data ECC */
+	EMASK_M13 = 1<<12, /* Memory Write error on first attempt */
+	EMASK_M14 = 1<<13, /* FB-DIMM Configuration Write error on first attempt */
+	EMASK_M15 = 1<<14, /* Memory or FB-DIMM configuration CRC read error */
+	EMASK_M16 = 1<<15, /* Channel Failed-Over Occurred */
+	EMASK_M17 = 1<<16, /* Correctable Non-Mirrored Demand Data ECC */
+	EMASK_M18 = 1<<17, /* Unsupported on i5400 */
+	EMASK_M19 = 1<<18, /* Correctable Resilver- or Spare-Copy Data ECC */
+	EMASK_M20 = 1<<19, /* Correctable Patrol Data ECC */
+	EMASK_M21 = 1<<20, /* FB-DIMM Northbound parity error on FB-DIMM Sync Status */
+	EMASK_M22 = 1<<21, /* SPD protocol Error */
+	EMASK_M23 = 1<<22, /* Non-Redundant Fast Reset Timeout */
+	EMASK_M24 = 1<<23, /* Refresh error */
+	EMASK_M25 = 1<<24, /* Memory Write error on redundant retry */
+	EMASK_M26 = 1<<25, /* Redundant Fast Reset Timeout */
+	EMASK_M27 = 1<<26, /* Correctable Counter Threshold Exceeded */
+	EMASK_M28 = 1<<27, /* DIMM-Spare Copy Completed */
+	EMASK_M29 = 1<<28, /* DIMM-Isolation Completed */
 };
 
-static const struct regulator_linear_range smps_high_ranges[] = {
-	REGULATOR_LINEAR_RANGE(0, 0x0, 0x0, 0),
-	REGULATOR_LINEAR_RANGE(1000000, 0x1, 0x6, 0),
-	REGULATOR_LINEAR_RANGE(1020000, 0x7, 0x79, 20000),
-	REGULATOR_LINEAR_RANGE(3300000, 0x7A, 0x7f, 0),
+/*
+ * Names to translate bit error into something useful
+ */
+static const char *error_name[] = {
+	[0]  = "Memory Write error on non-redundant retry",
+	[1]  = "Memory or FB-DIMM configuration CRC read error",
+	/* Reserved */
+	[3]  = "Uncorrectable Data ECC on Replay",
+	[4]  = "Aliased Uncorrectable Non-Mirrored Demand Data ECC",
+	/* M6 Unsupported on i5400 */
+	[6]  = "Aliased Uncorrectable Resilver- or Spare-Copy Data ECC",
+	[7]  = "Aliased Uncorrectable Patrol Data ECC",
+	[8]  = "Non-Aliased Uncorrectable Non-Mirrored Demand Data ECC",
+	/* M10 Unsupported on i5400 */
+	[10] = "Non-Aliased Uncorrectable Resilver- or Spare-Copy Data ECC",
+	[11] = "Non-Aliased Uncorrectable Patrol Data ECC",
+	[12] = "Memory Write error on first attempt",
+	[13] = "FB-DIMM Configuration Write error on first attempt",
+	[14] = "Memory or FB-DIMM configuration CRC read error",
+	[15] = "Channel Failed-Over Occurred",
+	[16] = "Correctable Non-Mirrored Demand Data ECC",
+	/* M18 Unsupported on i5400 */
+	[18] = "Correctable Resilver- or Spare-Copy Data ECC",
+	[19] = "Correctable Patrol Data ECC",
+	[20] = "FB-DIMM Northbound parity error on FB-DIMM Sync Status",
+	[21] = "SPD protocol Error",
+	[22] = "Non-Redundant Fast Reset Timeout",
+	[23] = "Refresh error",
+	[24] = "Memory Write error on redundant retry",
+	[25] = "Redundant Fast Reset Timeout",
+	[26] = "Correctable Counter Threshold Exceeded",
+	[27] = "DIMM-Spare Copy Completed",
+	[28] = "DIMM-Isolation Completed",
 };
 
-static struct palmas_regs_info palmas_generic_regs_info[] = {
-	{
-		.name		= "SMPS12",
-		.sname		= "smps1-in",
-		.vsel_addr	= PALMAS_SMPS12_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS12_CTRL,
-		.tstep_addr	= PALMAS_SMPS12_TSTEP,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS12,
-	},
-	{
-		.name		= "SMPS123",
-		.sname		= "smps1-in",
-		.vsel_addr	= PALMAS_SMPS12_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS12_CTRL,
-		.tstep_addr	= PALMAS_SMPS12_TSTEP,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS12,
-	},
-	{
-		.name		= "SMPS3",
-		.sname		= "smps3-in",
-		.vsel_addr	= PALMAS_SMPS3_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS3_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS3,
-	},
-	{
-		.name		= "SMPS45",
-		.sname		= "smps4-in",
-		.vsel_addr	= PALMAS_SMPS45_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS45_CTRL,
-		.tstep_addr	= PALMAS_SMPS45_TSTEP,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS45,
-	},
-	{
-		.name		= "SMPS457",
-		.sname		= "smps4-in",
-		.vsel_addr	= PALMAS_SMPS45_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS45_CTRL,
-		.tstep_addr	= PALMAS_SMPS45_TSTEP,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS45,
-	},
-	{
-		.name		= "SMPS6",
-		.sname		= "smps6-in",
-		.vsel_addr	= PALMAS_SMPS6_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS6_CTRL,
-		.tstep_addr	= PALMAS_SMPS6_TSTEP,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS6,
-	},
-	{
-		.name		= "SMPS7",
-		.sname		= "smps7-in",
-		.vsel_addr	= PALMAS_SMPS7_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS7_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS7,
-	},
-	{
-		.name		= "SMPS8",
-		.sname		= "smps8-in",
-		.vsel_addr	= PALMAS_SMPS8_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS8_CTRL,
-		.tstep_addr	= PALMAS_SMPS8_TSTEP,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS8,
-	},
-	{
-		.name		= "SMPS9",
-		.sname		= "smps9-in",
-		.vsel_addr	= PALMAS_SMPS9_VOLTAGE,
-		.ctrl_addr	= PALMAS_SMPS9_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS9,
-	},
-	{
-		.name		= "SMPS10_OUT2",
-		.sname		= "smps10-in",
-		.ctrl_addr	= PALMAS_SMPS10_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS10,
-	},
-	{
-		.name		= "SMPS10_OUT1",
-		.sname		= "smps10-out2",
-		.ctrl_addr	= PALMAS_SMPS10_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SMPS10,
-	},
-	{
-		.name		= "LDO1",
-		.sname		= "ldo1-in",
-		.vsel_addr	= PALMAS_LDO1_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO1_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO1,
-	},
-	{
-		.name		= "LDO2",
-		.sname		= "ldo2-in",
-		.vsel_addr	= PALMAS_LDO2_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO2_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO2,
-	},
-	{
-		.name		= "LDO3",
-		.sname		= "ldo3-in",
-		.vsel_addr	= PALMAS_LDO3_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO3_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO3,
-	},
-	{
-		.name		= "LDO4",
-		.sname		= "ldo4-in",
-		.vsel_addr	= PALMAS_LDO4_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO4_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO4,
-	},
-	{
-		.name		= "LDO5",
-		.sname		= "ldo5-in",
-		.vsel_addr	= PALMAS_LDO5_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO5_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO5,
-	},
-	{
-		.name		= "LDO6",
-		.sname		= "ldo6-in",
-		.vsel_addr	= PALMAS_LDO6_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO6_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO6,
-	},
-	{
-		.name		= "LDO7",
-		.sname		= "ldo7-in",
-		.vsel_addr	= PALMAS_LDO7_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO7_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO7,
-	},
-	{
-		.name		= "LDO8",
-		.sname		= "ldo8-in",
-		.vsel_addr	= PALMAS_LDO8_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO8_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO8,
-	},
-	{
-		.name		= "LDO9",
-		.sname		= "ldo9-in",
-		.vsel_addr	= PALMAS_LDO9_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDO9_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDO9,
-	},
-	{
-		.name		= "LDOLN",
-		.sname		= "ldoln-in",
-		.vsel_addr	= PALMAS_LDOLN_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDOLN_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDOLN,
-	},
-	{
-		.name		= "LDOUSB",
-		.sname		= "ldousb-in",
-		.vsel_addr	= PALMAS_LDOUSB_VOLTAGE,
-		.ctrl_addr	= PALMAS_LDOUSB_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_LDOUSB,
-	},
-	{
-		.name		= "REGEN1",
-		.ctrl_addr	= PALMAS_REGEN1_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_REGEN1,
-	},
-	{
-		.name		= "REGEN2",
-		.ctrl_addr	= PALMAS_REGEN2_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_REGEN2,
-	},
-	{
-		.name		= "REGEN3",
-		.ctrl_addr	= PALMAS_REGEN3_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_REGEN3,
-	},
-	{
-		.name		= "SYSEN1",
-		.ctrl_addr	= PALMAS_SYSEN1_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SYSEN1,
-	},
-	{
-		.name		= "SYSEN2",
-		.ctrl_addr	= PALMAS_SYSEN2_CTRL,
-		.sleep_id	= PALMAS_EXTERNAL_REQSTR_ID_SYSEN2,
-	},
+/* Fatal errors */
+#define ERROR_FAT_MASK		(EMASK_M1 | \
+				 EMASK_M2 | \
+				 EMASK_M23)
+
+/* Correctable errors */
+#define ERROR_NF_CORRECTABLE	(EMASK_M27 | \
+				 EMASK_M20 | \
+				 EMASK_M19 | \
+				 EMASK_M18 | \
+				 EMASK_M17 | \
+				 EMASK_M16)
+#define ERROR_NF_DIMM_SPARE	(EMASK_M29 | \
+				 EMASK_M28)
+#define ERROR_NF_SPD_PROTOCOL	(EMASK_M22)
+#define ERROR_NF_NORTH_CRC	(EMASK_M21)
+
+/* Recoverable errors */
+#define ERROR_NF_RECOVERABLE	(EMASK_M26 | \
+				 EMASK_M25 | \
+				 EMASK_M24 | \
+				 EMASK_M15 | \
+				 EMASK_M14 | \
+				 EMASK_M13 | \
+				 EMASK_M12 | \
+				 EMASK_M11 | \
+				 EMASK_M9  | \
+				 EMASK_M8  | \
+				 EMASK_M7  | \
+				 EMASK_M5)
+
+/* uncorrectable errors */
+#define ERROR_NF_UNCORRECTABLE	(EMASK_M4)
+
+/* mask to all non-fatal errors */
+#define ERROR_NF_MASK		(ERROR_NF_CORRECTABLE   | \
+				 ERROR_NF_UNCORRECTABLE | \
+				 ERROR_NF_RECOVERABLE   | \
+				 ERROR_NF_DIMM_SPARE    | \
+				 ERROR_NF_SPD_PROTOCOL  | \
+				 ERROR_NF_NORTH_CRC)
+
+/*
+ * Define error masks for the several registers
+ */
+
+/* Enable all fatal and non fatal errors */
+#define ENABLE_EMASK_ALL	(ERROR_FAT_MASK | ERROR_NF_MASK)
+
+/* mask for fatal error registers */
+#define FERR_FAT_MASK ERROR_FAT_MASK
+
+/* masks for non-fatal error register */
+static inline int to_nf_mask(unsigned int mask)
+{
+	return (mask & EMASK_M29) | (mask >> 3);
 };
 
-static struct palmas_regs_info tps65917_regs_info[] = {
+static inline int from_nf_ferr(unsigned int mask)
+{
+	return (mask & EMASK_M29) |		/* Bit 28 */
+	       (mask & ((1 << 28) - 1) << 3);	/* Bits 0 to 27 */
+};
+
+#define FERR_NF_MASK		to_nf_mask(ERROR_NF_MASK)
+#define FERR_NF_CORRECTABLE	to_nf_mask(ERROR_NF_CORRECTABLE)
+#define FERR_NF_DIMM_SPARE	to_nf_mask(ERROR_NF_DIMM_SPARE)
+#define FERR_NF_SPD_PROTOCOL	to_nf_mask(ERROR_NF_SPD_PROTOCOL)
+#define FERR_NF_NORTH_CRC	to_nf_mask(ERROR_NF_NORTH_CRC)
+#define FERR_NF_RECOVERABLE	to_nf_mask(ERROR_NF_RECOVERABLE)
+#define FERR_NF_UNCORRECTABLE	to_nf_mask(ERROR_NF_UNCORRECTABLE)
+
+/* Defines to extract the vaious fields from the
+ *	MTRx - Memory Technology Registers
+ */
+#define MTR_DIMMS_PRESENT(mtr)		((mtr) & (1 << 10))
+#define MTR_DIMMS_ETHROTTLE(mtr)	((mtr) & (1 << 9))
+#define MTR_DRAM_WIDTH(mtr)		(((mtr) & (1 << 8)) ? 8 : 4)
+#define MTR_DRAM_BANKS(mtr)		(((mtr) & (1 << 6)) ? 8 : 4)
+#define MTR_DRAM_BANKS_ADDR_BITS(mtr)	((MTR_DRAM_BANKS(mtr) == 8) ? 3 : 2)
+#define MTR_DIMM_RANK(mtr)		(((mtr) >> 5) & 0x1)
+#define MTR_DIMM_RANK_ADDR_BITS(mtr)	(MTR_DIMM_RANK(mtr) ? 2 : 1)
+#define MTR_DIMM_ROWS(mtr)		(((mtr) >> 2) & 0x3)
+#define MTR_DIMM_ROWS_ADDR_BITS(mtr)	(MTR_DIMM_ROWS(mtr) + 13)
+#define MTR_DIMM_COLS(mtr)		((mtr) & 0x3)
+#define MTR_DIMM_COLS_ADDR_BITS(mtr)	(MTR_DIMM_COLS(mtr) + 10)
+
+/* This applies to FERR_NF_FB-DIMM as well as FERR_FAT_FB-DIMM */
+static inline int extract_fbdchan_indx(u32 x)
+{
+	return (x>>28) & 0x3;
+}
+
+/* Device name and register DID (Device ID) */
+struct i5400_dev_info {
+	const char *ctl_name;	/* name for this device */
+	u16 fsb_mapping_errors;	/* DID for the branchmap,control */
+};
+
+/* Table of devices attributes supported by this driver */
+static const struct i5400_dev_info i5400_devs[] = {
 	{
-		.name		= "SMPS1",
-		.sname		= "smps1-in",
-		.vsel_addr	= TPS65917_SMPS1_VOLTAGE,
-		.ctrl_addr	= TPS65917_SMPS1_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_SMPS1,
-	},
-	{
-		.name		= "SMPS2",
-		.sname		= "smps2-in",
-		.vsel_addr	= TPS65917_SMPS2_VOLTAGE,
-		.ctrl_addr	= TPS65917_SMPS2_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_SMPS2,
-	},
-	{
-		.name		= "SMPS3",
-		.sname		= "smps3-in",
-		.vsel_addr	= TPS65917_SMPS3_VOLTAGE,
-		.ctrl_addr	= TPS65917_SMPS3_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_SMPS3,
-	},
-	{
-		.name		= "SMPS4",
-		.sname		= "smps4-in",
-		.vsel_addr	= TPS65917_SMPS4_VOLTAGE,
-		.ctrl_addr	= TPS65917_SMPS4_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_SMPS4,
-	},
-	{
-		.name		= "SMPS5",
-		.sname		= "smps5-in",
-		.vsel_addr	= TPS65917_SMPS5_VOLTAGE,
-		.ctrl_addr	= TPS65917_SMPS5_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_SMPS5,
-	},
-	{
-		.name		= "LDO1",
-		.sname		= "ldo1-in",
-		.vsel_addr	= TPS65917_LDO1_VOLTAGE,
-		.ctrl_addr	= TPS65917_LDO1_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_LDO1,
-	},
-	{
-		.name		= "LDO2",
-		.sname		= "ldo2-in",
-		.vsel_addr	= TPS65917_LDO2_VOLTAGE,
-		.ctrl_addr	= TPS65917_LDO2_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_LDO2,
-	},
-	{
-		.name		= "LDO3",
-		.sname		= "ldo3-in",
-		.vsel_addr	= TPS65917_LDO3_VOLTAGE,
-		.ctrl_addr	= TPS65917_LDO3_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_LDO3,
-	},
-	{
-		.name		= "LDO4",
-		.sname		= "ldo4-in",
-		.vsel_addr	= TPS65917_LDO4_VOLTAGE,
-		.ctrl_addr	= TPS65917_LDO4_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_LDO4,
-	},
-	{
-		.name		= "LDO5",
-		.sname		= "ldo5-in",
-		.vsel_addr	= TPS65917_LDO5_VOLTAGE,
-		.ctrl_addr	= TPS65917_LDO5_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_LDO5,
-	},
-	{
-		.name		= "REGEN1",
-		.ctrl_addr	= TPS65917_REGEN1_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_REGEN1,
-	},
-	{
-		.name		= "REGEN2",
-		.ctrl_addr	= TPS65917_REGEN2_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_REGEN2,
-	},
-	{
-		.name		= "REGEN3",
-		.ctrl_addr	= TPS65917_REGEN3_CTRL,
-		.sleep_id	= TPS65917_EXTERNAL_REQSTR_ID_REGEN3,
+		.ctl_name = "I5400",
+		.fsb_mapping_errors = PCI_DEVICE_ID_INTEL_5400_ERR,
 	},
 };
 
-#define EXTERNAL_REQUESTOR(_id, _offset, _pos)		\
-	[PALMAS_EXTERNAL_REQSTR_ID_##_id] = {		\
-		.id = PALMAS_EXTERNAL_REQSTR_ID_##_id,	\
-		.reg_offset = _offset,			\
-		.bit_pos = _pos,			\
+struct i5400_dimm_info {
+	int megabytes;		/* size, 0 means not present  */
+};
+
+/* driver private data structure */
+struct i5400_pvt {
+	struct pci_dev *system_address;		/* 16.0 */
+	struct pci_dev *branchmap_werrors;	/* 16.1 */
+	struct pci_dev *fsb_error_regs;		/* 16.2 */
+	struct pci_dev *branch_0;		/* 21.0 */
+	struct pci_dev *branch_1;		/* 22.0 */
+
+	u16 tolm;				/* top of low memory */
+	union {
+		u64 ambase;				/* AMB BAR */
+		struct {
+			u32 ambase_bottom;
+			u32 ambase_top;
+		} u __packed;
+	};
+
+	u16 mir0, mir1;
+
+	u16 b0_mtr[DIMMS_PER_CHANNEL];	/* Memory Technlogy Reg */
+	u16 b0_ambpresent0;			/* Branch 0, Channel 0 */
+	u16 b0_ambpresent1;			/* Brnach 0, Channel 1 */
+
+	u16 b1_mtr[DIMMS_PER_CHANNEL];	/* Memory Technlogy Reg */
+	u16 b1_ambpresent0;			/* Branch 1, Channel 8 */
+	u16 b1_ambpresent1;			/* Branch 1, Channel 1 */
+
+	/* DIMM information matrix, allocating architecture maximums */
+	struct i5400_dimm_info dimm_info[DIMMS_PER_CHANNEL][MAX_CHANNELS];
+
+	/* Actual values for this controller */
+	int maxch;				/* Max channels */
+	int maxdimmperch;			/* Max DIMMs per channel */
+};
+
+/* I5400 MCH error information retrieved from Hardware */
+struct i5400_error_info {
+	/* These registers are always read from the MC */
+	u32 ferr_fat_fbd;	/* First Errors Fatal */
+	u32 nerr_fat_fbd;	/* Next Errors Fatal */
+	u32 ferr_nf_fbd;	/* First Errors Non-Fatal */
+	u32 nerr_nf_fbd;	/* Next Errors Non-Fatal */
+
+	/* These registers are input ONLY if there was a Recoverable Error */
+	u32 redmemb;		/* Recoverable Mem Data Error log B */
+	u16 recmema;		/* Recoverable Mem Error log A */
+	u32 recmemb;		/* Recoverable Mem Error log B */
+
+	/* These registers are input ONLY if there was a Non-Rec Error */
+	u16 nrecmema;		/* Non-Recoverable Mem log A */
+	u32 nrecmemb;		/* Non-Recoverable Mem log B */
+
+};
+
+/* note that nrec_rdwr changed from NRECMEMA to NRECMEMB between the 5000 and
+   5400 better to use an inline function than a macro in this case */
+static inline int nrec_bank(struct i5400_error_info *info)
+{
+	return ((info->nrecmema) >> 12) & 0x7;
+}
+static inline int nrec_rank(struct i5400_error_info *info)
+{
+	return ((info->nrecmema) >> 8) & 0xf;
+}
+static inline int nrec_buf_id(struct i5400_error_info *info)
+{
+	return ((info->nrecmema)) & 0xff;
+}
+static inline int nrec_rdwr(struct i5400_error_info *info)
+{
+	return (info->nrecmemb) >> 31;
+}
+/* This applies to both NREC and REC string so it can be used with nrec_rdwr
+   and rec_rdwr */
+static inline const char *rdwr_str(int rdwr)
+{
+	return rdwr ? "Write" : "Read";
+}
+static inline int nrec_cas(struct i5400_error_info *info)
+{
+	return ((info->nrecmemb) >> 16) & 0x1fff;
+}
+static inline int nrec_ras(struct i5400_error_info *info)
+{
+	return (info->nrecmemb) & 0xffff;
+}
+static inline int rec_bank(struct i5400_error_info *info)
+{
+	return ((info->recmema) >> 12) & 0x7;
+}
+static inline int rec_rank(struct i5400_error_info *info)
+{
+	return ((info->recmema) >> 8) & 0xf;
+}
+static inline int rec_rdwr(struct i5400_error_info *info)
+{
+	return (info->recmemb) >> 31;
+}
+static inline int rec_cas(struct i5400_error_info *info)
+{
+	return ((info->recmemb) >> 16) & 0x1fff;
+}
+static inline int rec_ras(struct i5400_error_info *info)
+{
+	return (info->recmemb) & 0xffff;
+}
+
+static struct edac_pci_ctl_info *i5400_pci;
+
+/*
+ *	i5400_get_error_info	Retrieve the hardware error information from
+ *				the hardware and cache it in the 'info'
+ *				structure
+ */
+static void i5400_get_error_info(struct mem_ctl_info *mci,
+				 struct i5400_error_info *info)
+{
+	struct i5400_pvt *pvt;
+	u32 value;
+
+	pvt = mci->pvt_info;
+
+	/* read in the 1st FATAL error register */
+	pci_read_config_dword(pvt->branchmap_werrors, FERR_FAT_FBD, &value);
+
+	/* Mask only the bits that the doc says are valid
+	 */
+	value &= (FERR_FAT_FBDCHAN | FERR_FAT_MASK);
+
+	/* If there is an error, then read in the
+	   NEXT FATAL error register and the Memory Error Log Register A
+	 */
+	if (value & FERR_FAT_MASK) {
+		info->ferr_fat_fbd = value;
+
+		/* harvest the various error data we need */
+		pci_read_config_dword(pvt->branchmap_werrors,
+				NERR_FAT_FBD, &info->nerr_fat_fbd);
+		pci_read_config_word(pvt->branchmap_werrors,
+				NRECMEMA, &info->nrecmema);
+		pci_read_config_dword(pvt->branchmap_werrors,
+				NRECMEMB, &info->nrecmemb);
+
+		/* Clear the error bits, by writing them back */
+		pci_write_config_dword(pvt->branchmap_werrors,
+				FERR_FAT_FBD, value);
+	} else {
+		info->ferr_fat_fbd = 0;
+		info->nerr_fat_fbd = 0;
+		info->nrecmema = 0;
+		info->nrecmemb = 0;
 	}
 
-static struct palmas_sleep_requestor_info palma_sleep_req_info[] = {
-	EXTERNAL_REQUESTOR(REGEN1, 0, 0),
-	EXTERNAL_REQUESTOR(REGEN2, 0, 1),
-	EXTERNAL_REQUESTOR(SYSEN1, 0, 2),
-	EXTERNAL_REQUESTOR(SYSEN2, 0, 3),
-	EXTERNAL_REQUESTOR(CLK32KG, 0, 4),
-	EXTERNAL_REQUESTOR(CLK32KGAUDIO, 0, 5),
-	EXTERNAL_REQUESTOR(REGEN3, 0, 6),
-	EXTERNAL_REQUESTOR(SMPS12, 1, 0),
-	EXTERNAL_REQUESTOR(SMPS3, 1, 1),
-	EXTERNAL_REQUESTOR(SMPS45, 1, 2),
-	EXTERNAL_REQUESTOR(SMPS6, 1, 3),
-	EXTERNAL_REQUESTOR(SMPS7, 1, 4),
-	EXTERNAL_REQUESTOR(SMPS8, 1, 5),
-	EXTERNAL_REQUESTOR(SMPS9, 1, 6),
-	EXTERNAL_REQUESTOR(SMPS10, 1, 7),
-	EXTERNAL_REQUESTOR(LDO1, 2, 0),
-	EXTERNAL_REQUESTOR(LDO2, 2, 1),
-	EXTERNAL_REQUESTOR(LDO3, 2, 2),
-	EXTERNAL_REQUESTOR(LDO4, 2, 3),
-	EXTERNAL_REQUESTOR(LDO5, 2, 4),
-	EXTERNAL_REQUESTOR(LDO6, 2, 5),
-	EXTERNAL_REQUESTOR(LDO7, 2, 6),
-	EXTERNAL_REQUESTOR(LDO8, 2, 7),
-	EXTERNAL_REQUESTOR(LDO9, 3, 0),
-	EXTERNAL_REQUESTOR(LDOLN, 3, 1),
-	EXTERNAL_REQUESTOR(LDOUSB, 3, 2),
-};
+	/* read in the 1st NON-FATAL error register */
+	pci_read_config_dword(pvt->branchmap_werrors, FERR_NF_FBD, &value);
 
-#define EXTERNAL_REQUESTOR_TPS65917(_id, _offset, _pos)		\
-	[TPS65917_EXTERNAL_REQSTR_ID_##_id] = {		\
-		.id = TPS65917_EXTERNAL_REQSTR_ID_##_id,	\
-		.reg_offset = _offset,			\
-		.bit_pos = _pos,			\
+	/* If there is an error, then read in the 1st NON-FATAL error
+	 * register as well */
+	if (value & FERR_NF_MASK) {
+		info->ferr_nf_fbd = value;
+
+		/* harvest the various error data we need */
+		pci_read_config_dword(pvt->branchmap_werrors,
+				NERR_NF_FBD, &info->nerr_nf_fbd);
+		pci_read_config_word(pvt->branchmap_werrors,
+				RECMEMA, &info->recmema);
+		pci_read_config_dword(pvt->branchmap_werrors,
+				RECMEMB, &info->recmemb);
+		pci_read_config_dword(pvt->branchmap_werrors,
+				REDMEMB, &info->redmemb);
+
+		/* Clear the error bits, by writing them back */
+		pci_write_config_dword(pvt->branchmap_werrors,
+				FERR_NF_FBD, value);
+	} else {
+		info->ferr_nf_fbd = 0;
+		info->nerr_nf_fbd = 0;
+		info->recmema = 0;
+		info->recmemb = 0;
+		info->redmemb = 0;
+	}
+}
+
+/*
+ * i5400_proccess_non_recoverable_info(struct mem_ctl_info *mci,
+ * 					struct i5400_error_info *info,
+ * 					int handle_errors);
+ *
+ *	handle the Intel FATAL and unrecoverable errors, if any
+ */
+static void i5400_proccess_non_recoverable_info(struct mem_ctl_info *mci,
+				    struct i5400_error_info *info,
+				    unsigned long allErrors)
+{
+	char msg[EDAC_MC_LABEL_LEN + 1 + 90 + 80];
+	int branch;
+	int channel;
+	int bank;
+	int buf_id;
+	int rank;
+	int rdwr;
+	int ras, cas;
+	int errnum;
+	char *type = NULL;
+	enum hw_event_mc_err_type tp_event = HW_EVENT_ERR_UNCORRECTED;
+
+	if (!allErrors)
+		return;		/* if no error, return now */
+
+	if (allErrors &  ERROR_FAT_MASK) {
+		type = "FATAL";
+		tp_event = HW_EVENT_ERR_FATAL;
+	} else if (allErrors & FERR_NF_UNCORRECTABLE)
+		type = "NON-FATAL uncorrected";
+	else
+		type = "NON-FATAL recoverable";
+
+	/* ONLY ONE of the possible error bits will be set, as per the docs */
+
+	branch = extract_fbdchan_indx(info->ferr_fat_fbd);
+	channel = branch;
+
+	/* Use the NON-Recoverable macros to extract data */
+	bank = nrec_bank(info);
+	rank = nrec_rank(info);
+	buf_id = nrec_buf_id(info);
+	rdwr = nrec_rdwr(info);
+	ras = nrec_ras(info);
+	cas = nrec_cas(info);
+
+	edac_dbg(0, "\t\tDIMM= %d  Channels= %d,%d  (Branch= %d DRAM Bank= %d Buffer ID = %d rdwr= %s ras= %d cas= %d)\n",
+		 rank, channel, channel + 1, branch >> 1, bank,
+		 buf_id, rdwr_str(rdwr), ras, cas);
+
+	/* Only 1 bit will be on */
+	errnum = find_first_bit(&allErrors, ARRAY_SIZE(error_name));
+
+	/* Form out message */
+	snprintf(msg, sizeof(msg),
+		 "Bank=%d Buffer ID = %d RAS=%d CAS=%d Err=0x%lx (%s)",
+		 bank, buf_id, ras, cas, allErrors, error_name[errnum]);
+
+	edac_mc_handle_error(tp_event, mci, 1, 0, 0, 0,
+			     branch >> 1, -1, rank,
+			     rdwr ? "Write error" : "Read error",
+			     msg);
+}
+
+/*
+ * i5400_process_fatal_error_info(struct mem_ctl_info *mci,
+ * 				struct i5400_error_info *info,
+ * 				int handle_errors);
+ *
+ *	handle the Intel NON-FATAL errors, if any
+ */
+static void i5400_process_nonfatal_error_info(struct mem_ctl_info *mci,
+					struct i5400_error_info *info)
+{
+	char msg[EDAC_MC_LABEL_LEN + 1 + 90 + 80];
+	unsigned long allErrors;
+	int branch;
+	int channel;
+	int bank;
+	int rank;
+	int rdwr;
+	int ras, cas;
+	int errnum;
+
+	/* mask off the Error bits that are possible */
+	allErrors = from_nf_ferr(info->ferr_nf_fbd & FERR_NF_MASK);
+	if (!allErrors)
+		return;		/* if no error, return now */
+
+	/* ONLY ONE of the possible error bits will be set, as per the docs */
+
+	if (allErrors & (ERROR_NF_UNCORRECTABLE | ERROR_NF_RECOVERABLE)) {
+		i5400_proccess_non_recoverable_info(mci, info, allErrors);
+		return;
 	}
 
-static struct palmas_sleep_requestor_info tps65917_sleep_req_info[] = {
-	EXTERNAL_REQUESTOR_TPS65917(REGEN1, 0, 0),
-	EXTERNAL_REQUESTOR_TPS65917(REGEN2, 0, 1),
-	EXTERNAL_REQUESTOR_TPS65917(REGEN3, 0, 6),
-	EXTERNAL_REQUESTOR_TPS65917(SMPS1, 1, 0),
-	EXTERNAL_REQUESTOR_TPS65917(SMPS2, 1, 1),
-	EXTERNAL_REQUESTOR_TPS65917(SMPS3, 1, 2),
-	EXTERNAL_REQUESTOR_TPS65917(SMPS4, 1, 3),
-	EXTERNAL_REQUESTOR_TPS65917(SMPS5, 1, 4),
-	EXTERNAL_REQUESTOR_TPS65917(LDO1, 2, 0),
-	EXTERNAL_REQUESTOR_TPS65917(LDO2, 2, 1),
-	EXTERNAL_REQUESTOR_TPS65917(LDO3, 2, 2),
-	EXTERNAL_REQUESTOR_TPS65917(LDO4, 2, 3),
-	EXTERNAL_REQUESTOR_TPS65917(LDO5, 2, 4),
-};
+	/* Correctable errors */
+	if (allErrors & ERROR_NF_CORRECTABLE) {
+		edac_dbg(0, "\tCorrected bits= 0x%lx\n", allErrors);
 
-static unsigned int palmas_smps_ramp_delay[4] = {0, 10000, 5000, 2500};
+		branch = extract_fbdchan_indx(info->ferr_nf_fbd);
 
-#define SMPS_CTRL_MODE_OFF		0x00
-#define SMPS_CTRL_MODE_ON		0x01
-#define SMPS_CTRL_MODE_ECO		0x02
-#define SMPS_CTRL_MODE_PWM		0x03
+		channel = 0;
+		if (REC_ECC_LOCATOR_ODD(info->redmemb))
+			channel = 1;
 
-#define PALMAS_SMPS_NUM_VOLTAGES	122
-#define PALMAS_SMPS10_NUM_VOLTAGES	2
-#define PALMAS_LDO_NUM_VOLTAGES		50
+		/* Convert channel to be based from zero, instead of
+		 * from branch base of 0 */
+		channel += branch;
 
-#define SMPS10_VSEL			(1<<3)
-#define SMPS10_BOOST_EN			(1<<2)
-#define SMPS10_BYPASS_EN		(1<<1)
-#define SMPS10_SWITCH_EN		(1<<0)
+		bank = rec_bank(info);
+		rank = rec_rank(info);
+		rdwr = rec_rdwr(info);
+		ras = rec_ras(info);
+		cas = rec_cas(info);
 
-#define REGULATOR_SLAVE			0
+		/* Only 1 bit will be on */
+		errnum = find_first_bit(&allErrors, ARRAY_SIZE(error_name));
 
-static int palmas_smps_read(struct palmas *palmas, unsigned int reg,
-		unsigned int *dest)
-{
-	unsigned int addr;
+		edac_dbg(0, "\t\tDIMM= %d Channel= %d  (Branch %d DRAM Bank= %d rdwr= %s ras= %d cas= %d)\n",
+			 rank, channel, branch >> 1, bank,
+			 rdwr_str(rdwr), ras, cas);
 
-	addr = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE, reg);
+		/* Form out message */
+		snprintf(msg, sizeof(msg),
+			 "Corrected error (Branch=%d DRAM-Bank=%d RDWR=%s "
+			 "RAS=%d CAS=%d, CE Err=0x%lx (%s))",
+			 branch >> 1, bank, rdwr_str(rdwr), ras, cas,
+			 allErrors, error_name[errnum]);
 
-	return regmap_read(palmas->regmap[REGULATOR_SLAVE], addr, dest);
-}
+		edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1, 0, 0, 0,
+				     branch >> 1, channel % 2, rank,
+				     rdwr ? "Write error" : "Read error",
+				     msg);
 
-static int palmas_smps_write(struct palmas *palmas, unsigned int reg,
-		unsigned int value)
-{
-	unsigned int addr;
-
-	addr = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE, reg);
-
-	return regmap_write(palmas->regmap[REGULATOR_SLAVE], addr, value);
-}
-
-static int palmas_ldo_read(struct palmas *palmas, unsigned int reg,
-		unsigned int *dest)
-{
-	unsigned int addr;
-
-	addr = PALMAS_BASE_TO_REG(PALMAS_LDO_BASE, reg);
-
-	return regmap_read(palmas->regmap[REGULATOR_SLAVE], addr, dest);
-}
-
-static int palmas_ldo_write(struct palmas *palmas, unsigned int reg,
-		unsigned int value)
-{
-	unsigned int addr;
-
-	addr = PALMAS_BASE_TO_REG(PALMAS_LDO_BASE, reg);
-
-	return regmap_write(palmas->regmap[REGULATOR_SLAVE], addr, value);
-}
-
-static int palmas_set_mode_smps(struct regulator_dev *dev, unsigned int mode)
-{
-	int id = rdev_get_id(dev);
-	int ret;
-	struct palmas_pmic *pmic = rdev_get_drvdata(dev);
-	struct palmas_pmic_driver_data *ddata = pmic->palmas->pmic_ddata;
-	struct palmas_regs_info *rinfo = &ddata->palmas_regs_info[id];
-	unsigned int reg;
-	bool rail_enable = true;
-
-	ret = palmas_smps_read(pmic->palmas, rinfo->ctrl_addr, &reg);
-	if (ret)
-		return ret;
-
-	reg &= ~PALMAS_SMPS12_CTRL_MODE_ACTIVE_MASK;
-
-	if (reg == SMPS_CTRL_MODE_OFF)
-		rail_enable = false;
-
-	switch (mode) {
-	case REGULATOR_MODE_NORMAL:
-		reg |= SMPS_CTRL_MODE_ON;
-		break;
-	case REGULATOR_MODE_IDLE:
-		reg |= SMPS_CTRL_MODE_ECO;
-		break;
-	case REGULATOR_MODE_FAST:
-		reg |= SMPS_CTRL_MODE_PWM;
-		break;
-	default:
-		return -EINVAL;
+		return;
 	}
 
-	pmic->current_reg_mode[id] = reg & PALMAS_SMPS12_CTRL_MODE_ACTIVE_MASK;
-	if (rail_enable)
-		palmas_smps_write(pmic->palmas, rinfo->ctrl_addr, reg);
+	/* Miscellaneous errors */
+	errnum = find_first_bit(&allErrors, ARRAY_SIZE(error_name));
 
-	/* Switch the enable value to ensure this is used for enable */
-	pmic->desc[id].enable_val = pmic->current_reg_mode[id];
+	branch = extract_fbdchan_indx(info->ferr_nf_fbd);
+
+	i5400_mc_printk(mci, KERN_EMERG,
+			"Non-Fatal misc error (Branch=%d Err=%#lx (%s))",
+			branch >> 1, allErrors, error_name[errnum]);
+}
+
+/*
+ *	i5400_process_error_info	Process the error info that is
+ *	in the 'info' structure, previously retrieved from hardware
+ */
+static void i5400_process_error_info(struct mem_ctl_info *mci,
+				struct i5400_error_info *info)
+{	u32 allErrors;
+
+	/* First handle any fatal errors that occurred */
+	allErrors = (info->ferr_fat_fbd & FERR_FAT_MASK);
+	i5400_proccess_non_recoverable_info(mci, info, allErrors);
+
+	/* now handle any non-fatal errors that occurred */
+	i5400_process_nonfatal_error_info(mci, info);
+}
+
+/*
+ *	i5400_clear_error	Retrieve any error from the hardware
+ *				but do NOT process that error.
+ *				Used for 'clearing' out of previous errors
+ *				Called by the Core module.
+ */
+static void i5400_clear_error(struct mem_ctl_info *mci)
+{
+	struct i5400_error_info info;
+
+	i5400_get_error_info(mci, &info);
+}
+
+/*
+ *	i5400_check_error	Retrieve and process errors reported by the
+ *				hardware. Called by the Core module.
+ */
+static void i5400_check_error(struct mem_ctl_info *mci)
+{
+	struct i5400_error_info info;
+	edac_dbg(4, "MC%d\n", mci->mc_idx);
+	i5400_get_error_info(mci, &info);
+	i5400_process_error_info(mci, &info);
+}
+
+/*
+ *	i5400_put_devices	'put' all the devices that we have
+ *				reserved via 'get'
+ */
+static void i5400_put_devices(struct mem_ctl_info *mci)
+{
+	struct i5400_pvt *pvt;
+
+	pvt = mci->pvt_info;
+
+	/* Decrement usage count for devices */
+	pci_dev_put(pvt->branch_1);
+	pci_dev_put(pvt->branch_0);
+	pci_dev_put(pvt->fsb_error_regs);
+	pci_dev_put(pvt->branchmap_werrors);
+}
+
+/*
+ *	i5400_get_devices	Find and perform 'get' operation on the MCH's
+ *			device/functions we want to reference for this driver
+ *
+ *			Need to 'get' device 16 func 1 and func 2
+ */
+static int i5400_get_devices(struct mem_ctl_info *mci, int dev_idx)
+{
+	struct i5400_pvt *pvt;
+	struct pci_dev *pdev;
+
+	pvt = mci->pvt_info;
+	pvt->branchmap_werrors = NULL;
+	pvt->fsb_error_regs = NULL;
+	pvt->branch_0 = NULL;
+	pvt->branch_1 = NULL;
+
+	/* Attempt to 'get' the MCH register we want */
+	pdev = NULL;
+	while (1) {
+		pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				      PCI_DEVICE_ID_INTEL_5400_ERR, pdev);
+		if (!pdev) {
+			/* End of list, leave */
+			i5400_printk(KERN_ERR,
+				"'system address,Process Bus' "
+				"device not found:"
+				"vendor 0x%x device 0x%x ERR func 1 "
+				"(broken BIOS?)\n",
+				PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_INTEL_5400_ERR);
+			return -ENODEV;
+		}
+
+		/* Store device 16 func 1 */
+		if (PCI_FUNC(pdev->devfn) == 1)
+			break;
+	}
+	pvt->branchmap_werrors = pdev;
+
+	pdev = NULL;
+	while (1) {
+		pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				      PCI_DEVICE_ID_INTEL_5400_ERR, pdev);
+		if (!pdev) {
+			/* End of list, leave */
+			i5400_printk(KERN_ERR,
+				"'system address,Process Bus' "
+				"device not found:"
+				"vendor 0x%x device 0x%x ERR func 2 "
+				"(broken BIOS?)\n",
+				PCI_VENDOR_ID_INTEL,
+				PCI_DEVICE_ID_INTEL_5400_ERR);
+
+			pci_dev_put(pvt->branchmap_werrors);
+			return -ENODEV;
+		}
+
+		/* Store device 16 func 2 */
+		if (PCI_FUNC(pdev->devfn) == 2)
+			break;
+	}
+	pvt->fsb_error_regs = pdev;
+
+	edac_dbg(1, "System Address, processor bus- PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->system_address),
+		 pvt->system_address->vendor, pvt->system_address->device);
+	edac_dbg(1, "Branchmap, control and errors - PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->branchmap_werrors),
+		 pvt->branchmap_werrors->vendor,
+		 pvt->branchmap_werrors->device);
+	edac_dbg(1, "FSB Error Regs - PCI Bus ID: %s  %x:%x\n",
+		 pci_name(pvt->fsb_error_regs),
+		 pvt->fsb_error_regs->vendor, pvt->fsb_error_regs->device);
+
+	pvt->branch_0 = pci_get_device(PCI_VENDOR_ID_INTEL,
+				       PCI_DEVICE_ID_INTEL_5400_FBD0, NULL);
+	if (!pvt->branch_0) {
+		i5400_printk(KERN_ERR,
+			"MC: 'BRANCH 0' device not found:"
+			"vendor 0x%x device 0x%x Func 0 (broken BIOS?)\n",
+			PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_5400_FBD0);
+
+		pci_dev_put(pvt->fsb_error_regs);
+		pci_dev_put(pvt->branchmap_werrors);
+		return -ENODEV;
+	}
+
+	/* If this device claims to have more than 2 channels then
+	 * fetch Branch 1's information
+	 */
+	if (pvt->maxch < CHANNELS_PER_BRANCH)
+		return 0;
+
+	pvt->branch_1 = pci_get_device(PCI_VENDOR_ID_INTEL,
+				       PCI_DEVICE_ID_INTEL_5400_FBD1, NULL);
+	if (!pvt->branch_1) {
+		i5400_printk(KERN_ERR,
+			"MC: 'BRANCH 1' device not found:"
+			"vendor 0x%x device 0x%x Func 0 "
+			"(broken BIOS?)\n",
+			PCI_VENDOR_ID_INTEL,
+			PCI_DEVICE_ID_INTEL_5400_FBD1);
+
+		pci_dev_put(pvt->branch_0);
+		pci_dev_put(pvt->fsb_error_regs);
+		pci_dev_put(pvt->branchmap_werrors);
+		return -ENODEV;
+	}
 
 	return 0;
 }
 
-static unsigned int palmas_get_mode_smps(struct regulator_dev *dev)
+/*
+ *	determine_amb_present
+ *
+ *		the information is contained in DIMMS_PER_CHANNEL different
+ *		registers determining which of the DIMMS_PER_CHANNEL requires
+ *              knowing which channel is in question
+ *
+ *	2 branches, each with 2 channels
+ *		b0_ambpresent0 for channel '0'
+ *		b0_ambpresent1 for channel '1'
+ *		b1_ambpresent0 for channel '2'
+ *		b1_ambpresent1 for channel '3'
+ */
+static int determine_amb_present_reg(struct i5400_pvt *pvt, int channel)
 {
-	struct palmas_pmic *pmic = rdev_get_drvdata(dev);
-	int id = rdev_get_id(dev);
-	unsigned int reg;
+	int amb_present;
 
-	reg = pmic->current_reg_mode[id] & PALMAS_SMPS12_CTRL_MODE_ACTIVE_MASK;
-
-	switch (reg) {
-	case SMPS_CTRL_MODE_ON:
-		return REGULATOR_MODE_NORMAL;
-	case SMPS_CTRL_MODE_ECO:
-		return REGULATOR_MODE_IDLE;
-	case SMPS_CTRL_MODE_PWM:
-		return REGULATOR_MODE_FAST;
+	if (channel < CHANNELS_PER_BRANCH) {
+		if (channel & 0x1)
+			amb_present = pvt->b0_ambpresent1;
+		else
+			amb_present = pvt->b0_ambpresent0;
+	} else {
+		if (channel & 0x1)
+			amb_present = pvt->b1_ambpresent1;
+		else
+			amb_present = pvt->b1_ambpresent0;
 	}
 
-	return 0;
+	return amb_present;
 }
 
-static int palmas_smps_set_ramp_delay(struct regulator_dev *rdev,
-		 int ramp_delay)
+/*
+ * determine_mtr(pvt, dimm, channel)
+ *
+ * return the proper MTR register as determine by the dimm and desired channel
+ */
+static int determine_mtr(struct i5400_pvt *pvt, int dimm, int channel)
 {
-	int id = rdev_get_id(rdev);
-	struct palmas_pmic *pmic = rdev_get_drvdata(rdev);
-	struct palmas_pmic_driver_data *ddata = pmic->palmas->pmic_ddata;
-	struct palmas_regs_info *rinfo = &ddata->palmas_regs_info[id];
-	unsigned int reg = 0;
-	int ret;
+	int mtr;
+	int n;
 
-	/* SMPS3 and SMPS7 do not have tstep_addr setting */
-	switch (id) {
-	case PALMAS_REG_SMPS3:
-	case PALMAS_REG_SMPS7:
+	/* There is one MTR for each slot pair of FB-DIMMs,
+	   Each slot pair may be at branch 0 or branch 1.
+	 */
+	n = dimm;
+
+	if (n >= DIMMS_PER_CHANNEL) {
+		edac_dbg(0, "ERROR: trying to access an invalid dimm: %d\n",
+			 dimm);
 		return 0;
 	}
 
-	if (ramp_delay <= 0)
-		reg = 0;
-	else if (ramp_delay <= 2500)
-		reg = 3;
-	else if (ramp_delay <= 5000)
-		reg = 2;
+	if (channel < CHANNELS_PER_BRANCH)
+		mtr = pvt->b0_mtr[n];
 	else
-		reg = 1;
+		mtr = pvt->b1_mtr[n];
 
-	ret = palmas_smps_write(pmic->palmas, rinfo->tstep_addr, reg);
-	if (ret < 0) {
-		dev_err(pmic->palmas->dev, "TSTEP write failed: %d\n", ret);
-		return ret;
-	}
-
-	pmic->ramp_delay[id] = palmas_smps_ramp_delay[reg];
-	return ret;
-}
-
-static struct regulator_ops palmas_ops_smps = {
-	.is_enabled		= regulator_is_enabled_regmap,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.set_mode		= palmas_set_mode_smps,
-	.get_mode		= palmas_get_mode_smps,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.map_voltage		= regulator_map_voltage_linear_range,
-	.set_voltage_time_sel	= regulator_set_voltage_time_sel,
-	.set_ramp_delay		= palmas_smps_set_ramp_delay,
-};
-
-static struct regulator_ops palmas_ops_ext_control_smps = {
-	.set_mode		= palmas_set_mode_smps,
-	.get_mode		= palmas_get_mode_smps,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.map_voltage		= regulator_map_voltage_linear_range,
-	.set_voltage_time_sel	= regulator_set_voltage_time_sel,
-	.set_ramp_delay		= palmas_smps_set_ramp_delay,
-};
-
-static struct regulator_ops palmas_ops_smps10 = {
-	.is_enabled		= regulator_is_enabled_regmap,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.map_voltage		= regulator_map_voltage_linear,
-	.set_bypass		= regulator_set_bypass_regmap,
-	.get_bypass		= regulator_get_bypass_regmap,
-};
-
-static struct regulator_ops tps65917_ops_smps = {
-	.is_enabled		= regulator_is_enabled_regmap,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.set_mode		= palmas_set_mode_smps,
-	.get_mode		= palmas_get_mode_smps,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.map_voltage		= regulator_map_voltage_linear_range,
-	.set_voltage_time_sel	= regulator_set_voltage_time_sel,
-};
-
-static struct regulator_ops tps65917_ops_ext_control_smps = {
-	.set_mode		= palmas_set_mode_smps,
-	.get_mode		= palmas_get_mode_smps,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear_range,
-	.map_voltage		= regulator_map_voltage_linear_range,
-};
-
-static int palmas_is_enabled_ldo(struct regulator_dev *dev)
-{
-	int id = rdev_get_id(dev);
-	struct palmas_pmic *pmic = rdev_get_drvdata(dev);
-	struct palmas_pmic_driver_data *ddata = pmic->palmas->pmic_ddata;
-	struct palmas_regs_info *rinfo = &ddata->palmas_regs_info[id];
-	unsigned int reg;
-
-	palmas_ldo_read(pmic->palmas, rinfo->ctrl_addr, &reg);
-
-	reg &= PALMAS_LDO1_CTRL_STATUS;
-
-	return !!(reg);
-}
-
-static struct regulator_ops palmas_ops_ldo = {
-	.is_enabled		= palmas_is_enabled_ldo,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.map_voltage		= regulator_map_voltage_linear,
-};
-
-static struct regulator_ops palmas_ops_ext_control_ldo = {
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.map_voltage		= regulator_map_voltage_linear,
-};
-
-static struct regulator_ops palmas_ops_extreg = {
-	.is_enabled		= regulator_is_enabled_regmap,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-};
-
-static struct regulator_ops palmas_ops_ext_control_extreg = {
-};
-
-static struct regulator_ops tps65917_ops_ldo = {
-	.is_enabled		= palmas_is_enabled_ldo,
-	.enable			= regulator_enable_regmap,
-	.disable		= regulator_disable_regmap,
-	.get_voltage_sel	= regulator_get_voltage_sel_regmap,
-	.set_voltage_sel	= regulator_set_voltage_sel_regmap,
-	.list_voltage		= regulator_list_voltage_linear,
-	.map_voltage		= regulator_map_voltage_linear,
-	.set_voltage_time_sel	= regulator_set_voltage_time_sel,
-};
-
-static int palmas_regulator_config_external(struct palmas *palmas, int id,
-		struct palmas_reg_init *reg_init)
-{
-	struct palmas_pmic_driver_data *ddata = palmas->pmic_ddata;
-	struct palmas_regs_info *rinfo = &ddata->palmas_regs_info[id];
-	int ret;
-
-	ret = palmas_ext_control_req_config(palmas, rinfo->sleep_id,
-					    reg_init->roof_floor, true);
-	if (ret < 0)
-		dev_err(palmas->dev,
-			"Ext control config for regulator %d failed %d\n",
-			id, ret);
-	return ret;
+	return mtr;
 }
 
 /*
- * setup the hardware based sleep configuration of the SMPS/LDO regulators
- * from the platform data. This is different to the software based control
- * supported by the regulator framework as it is controlled by toggling
- * pins on the PMIC such as PREQ, SYSEN, ...
  */
-static int palmas_smps_init(struct palmas *palmas, int id,
-		struct palmas_reg_init *reg_init)
+static void decode_mtr(int slot_row, u16 mtr)
 {
-	unsigned int reg;
-	int ret;
-	struct palmas_pmic_driver_data *ddata = palmas->pmic_ddata;
-	struct palmas_regs_info *rinfo = &ddata->palmas_regs_info[id];
-	unsigned int addr = rinfo->ctrl_addr;
+	int ans;
 
-	ret = palmas_smps_read(palmas, addr, &reg);
-	if (ret)
-		return ret;
+	ans = MTR_DIMMS_PRESENT(mtr);
 
-	switch (id) {
-	case PALMAS_REG_SMPS10_OUT1:
-	case PALMAS_REG_SMPS10_OUT2:
-		reg &= ~PALMAS_SMPS10_CTRL_MODE_SLEEP_MASK;
-		if (reg_init->mode_sleep)
-			reg |= reg_init->mode_sleep <<
-					PALMAS_SMPS10_CTRL_MODE_SLEEP_SHIFT;
-		break;
-	default:
-		if (reg_init->warm_reset)
-			reg |= PALMAS_SMPS12_CTRL_WR_S;
-		else
-			reg &= ~PALMAS_SMPS12_CTRL_WR_S;
+	edac_dbg(2, "\tMTR%d=0x%x:  DIMMs are %sPresent\n",
+		 slot_row, mtr, ans ? "" : "NOT ");
+	if (!ans)
+		return;
 
-		if (reg_init->roof_floor)
-			reg |= PALMAS_SMPS12_CTRL_ROOF_FLOOR_EN;
-		else
-			reg &= ~PALMAS_SMPS12_CTRL_ROOF_FLOOR_EN;
+	edac_dbg(2, "\t\tWIDTH: x%d\n", MTR_DRAM_WIDTH(mtr));
 
-		reg &= ~PALMAS_SMPS12_CTRL_MODE_SLEEP_MASK;
-		if (reg_init->mode_sleep)
-			reg |= reg_init->mode_sleep <<
-					PALMAS_SMPS12_CTRL_MODE_SLEEP_SHIFT;
-	}
+	edac_dbg(2, "\t\tELECTRICAL THROTTLING is %s\n",
+		 MTR_DIMMS_ETHROTTLE(mtr) ? "enabled" : "disabled");
 
-	ret = palmas_smps_write(palmas, addr, reg);
-	if (ret)
-		return ret;
-
-	if (rinfo->vsel_addr && reg_init->vsel) {
-
-		reg = reg_init->vsel;
-
-		ret = palmas_smps_write(palmas, rinfo->vsel_addr, reg);
-		if (ret)
-			return ret;
-	}
-
-	if (reg_init->roof_floor && (id != PALMAS_REG_SMPS10_OUT1) &&
-			(id != PALMAS_REG_SMPS10_OUT2)) {
-		/* Enable externally controlled regulator */
-		ret = palmas_smps_read(palmas, addr, &reg);
-		if (ret < 0)
-			return ret;
-
-		if (!(reg & PALMAS_SMPS12_CTRL_MODE_ACTIVE_MASK)) {
-			reg |= SMPS_CTRL_MODE_ON;
-			ret = palmas_smps_write(palmas, addr, reg);
-			if (ret < 0)
-				return ret;
-		}
-		return palmas_regulator_config_external(palmas, id, reg_init);
-	}
-	return 0;
+	edac_dbg(2, "\t\tNUMBANK: %d bank(s)\n", MTR_DRAM_BANKS(mtr));
+	edac_dbg(2, "\t\tNUMRANK: %s\n",
+		 MTR_DIMM_RANK(mtr) ? "double" : "single");
+	edac_dbg(2, "\t\tNUMROW: %s\n",
+		 MTR_DIMM_ROWS(mtr) == 0 ? "8,192 - 13 rows" :
+		 MTR_DIMM_ROWS(mtr) == 1 ? "16,384 - 14 rows" :
+		 MTR_DIMM_ROWS(mtr) == 2 ? "32,768 - 15 rows" :
+		 "65,536 - 16 rows");
+	edac_dbg(2, "\t\tNUMCOL: %s\n",
+		 MTR_DIMM_COLS(mtr) == 0 ? "1,024 - 10 columns" :
+		 MTR_DIMM_COLS(mtr) == 1 ? "2,048 - 11 columns" :
+		 MTR_DIMM_COLS(mtr) == 2 ? "4,096 - 12 columns" :
+		 "reserved");
 }
 
-static int palmas_ldo_init(struct palmas *palmas, int id,
-		struct palmas_reg_init *reg_init)
+static void handle_channel(struct i5400_pvt *pvt, int dimm, int channel,
+			struct i5400_dimm_info *dinfo)
 {
-	unsigned int reg;
-	unsigned int addr;
-	int ret;
-	struct palmas_pmic_driver_data *ddata = palmas->pmic_ddata;
-	struct palmas_regs_info *rinfo = &ddata->palmas_regs_info[id];
+	int mtr;
+	int amb_present_reg;
+	int addrBits;
 
-	addr = rinfo->ctrl_addr;
+	mtr = determine_mtr(pvt, dimm, channel);
+	if (MTR_DIMMS_PRESENT(mtr)) {
+		amb_present_reg = determine_amb_present_reg(pvt, channel);
 
-	ret = palmas_ldo_read(palmas, addr, &reg);
-	if (ret)
-		return ret;
+		/* Determine if there is a DIMM present in this DIMM slot */
+		if (amb_present_reg & (1 << dimm)) {
+			/* Start with the number of bits for a Bank
+			 * on the DRAM */
+			addrBits = MTR_DRAM_BANKS_ADDR_BITS(mtr);
+			/* Add thenumber of ROW bits */
+			addrBits += MTR_DIMM_ROWS_ADDR_BITS(mtr);
+			/* add the number of COLUMN bits */
+			addrBits += MTR_DIMM_COLS_ADDR_BITS(mtr);
+			/* add the number of RANK bits */
+			addrBits += MTR_DIMM_RANK(mtr);
 
-	if (reg_init->warm_reset)
-		reg |= PALMAS_LDO1_CTRL_WR_S;
-	else
-		reg &= ~PALMAS_LDO1_CTRL_WR_S;
+			addrBits += 6;	/* add 64 bits per DIMM */
+			addrBits -= 20;	/* divide by 2^^20 */
+			addrBits -= 3;	/* 8 bits per bytes */
 
-	if (reg_init->mode_sleep)
-		reg |= PALMAS_LDO1_CTRL_MODE_SLEEP;
-	else
-		reg &= ~PALMAS_LDO1_CTRL_MODE_SLEEP;
-
-	ret = palmas_ldo_write(palmas, addr, reg);
-	if (ret)
-		return ret;
-
-	if (reg_init->roof_floor) {
-		/* Enable externally controlled regulator */
-		ret = palmas_update_bits(palmas, PALMAS_LDO_BASE,
-				addr, PALMAS_LDO1_CTRL_MODE_ACTIVE,
-				PALMAS_LDO1_CTRL_MODE_ACTIVE);
-		if (ret < 0) {
-			dev_err(palmas->dev,
-				"LDO Register 0x%02x update failed %d\n",
-				addr, ret);
-			return ret;
+			dinfo->megabytes = 1 << addrBits;
 		}
-		return palmas_regulator_config_external(palmas, id, reg_init);
 	}
-	return 0;
 }
 
-static int palmas_extreg_init(struct palmas *palmas, int id,
-		struct palmas_reg_init *reg_init)
+/*
+ *	calculate_dimm_size
+ *
+ *	also will output a DIMM matrix map, if debug is enabled, for viewing
+ *	how the DIMMs are populated
+ */
+static void calculate_dimm_size(struct i5400_pvt *pvt)
 {
-	unsigned int addr;
-	int ret;
-	unsigned int val = 0;
-	struct palmas_pmic_driver_data *ddata = palmas->pmic_ddata;
-	struct palmas_regs_info *rinfo = &ddata->palmas_regs_info[id];
+	struct i5400_dimm_info *dinfo;
+	int dimm, max_dimms;
+	char *p, *mem_buffer;
+	int space, n;
+	int channel, branch;
 
-	addr = rinfo->ctrl_addr;
-
-	if (reg_init->mode_sleep)
-		val = PALMAS_REGEN1_CTRL_MODE_SLEEP;
-
-	ret = palmas_update_bits(palmas, PALMAS_RESOURCE_BASE,
-			addr, PALMAS_REGEN1_CTRL_MODE_SLEEP, val);
-	if (ret < 0) {
-		dev_err(palmas->dev, "Resource reg 0x%02x update failed %d\n",
-			addr, ret);
-		return ret;
-	}
-
-	if (reg_init->roof_floor) {
-		/* Enable externally controlled regulator */
-		ret = palmas_update_bits(palmas, PALMAS_RESOURCE_BASE,
-				addr, PALMAS_REGEN1_CTRL_MODE_ACTIVE,
-				PALMAS_REGEN1_CTRL_MODE_ACTIVE);
-		if (ret < 0) {
-			dev_err(palmas->dev,
-				"Resource Register 0x%02x update failed %d\n",
-				addr, ret);
-			return ret;
-		}
-		return palmas_regulator_config_external(palmas, id, reg_init);
-	}
-	return 0;
-}
-
-static void palmas_enable_ldo8_track(struct palmas *palmas)
-{
-	unsigned int reg;
-	unsigned int addr;
-	int ret;
-	struct palmas_pmic_driver_data *ddata = palmas->pmic_ddata;
-	struct palmas_regs_info *rinfo;
-
-	rinfo = &ddata->palmas_regs_info[PALMAS_REG_LDO8];
-	addr = rinfo->ctrl_addr;
-
-	ret = palmas_ldo_read(palmas, addr, &reg);
-	if (ret) {
-		dev_err(palmas->dev, "Error in reading ldo8 control reg\n");
+	/* ================= Generate some debug output ================= */
+	space = PAGE_SIZE;
+	mem_buffer = p = kmalloc(space, GFP_KERNEL);
+	if (p == NULL) {
+		i5400_printk(KERN_ERR, "MC: %s:%s() kmalloc() failed\n",
+			__FILE__, __func__);
 		return;
 	}
 
-	reg |= PALMAS_LDO8_CTRL_LDO_TRACKING_EN;
-	ret = palmas_ldo_write(palmas, addr, reg);
-	if (ret < 0) {
-		dev_err(palmas->dev, "Error in enabling tracking mode\n");
-		return;
-	}
-	/*
-	 * When SMPS45 is set to off and LDO8 tracking is enabled, the LDO8
-	 * output is defined by the LDO8_VOLTAGE.VSEL register divided by two,
-	 * and can be set from 0.45 to 1.65 V.
+	/* Scan all the actual DIMMS
+	 * and calculate the information for each DIMM
+	 * Start with the highest dimm first, to display it first
+	 * and work toward the 0th dimm
 	 */
-	addr = rinfo->vsel_addr;
-	ret = palmas_ldo_read(palmas, addr, &reg);
-	if (ret) {
-		dev_err(palmas->dev, "Error in reading ldo8 voltage reg\n");
-		return;
+	max_dimms = pvt->maxdimmperch;
+	for (dimm = max_dimms - 1; dimm >= 0; dimm--) {
+
+		/* on an odd dimm, first output a 'boundary' marker,
+		 * then reset the message buffer  */
+		if (dimm & 0x1) {
+			n = snprintf(p, space, "---------------------------"
+					"-------------------------------");
+			p += n;
+			space -= n;
+			edac_dbg(2, "%s\n", mem_buffer);
+			p = mem_buffer;
+			space = PAGE_SIZE;
+		}
+		n = snprintf(p, space, "dimm %2d    ", dimm);
+		p += n;
+		space -= n;
+
+		for (channel = 0; channel < pvt->maxch; channel++) {
+			dinfo = &pvt->dimm_info[dimm][channel];
+			handle_channel(pvt, dimm, channel, dinfo);
+			n = snprintf(p, space, "%4d MB   | ", dinfo->megabytes);
+			p += n;
+			space -= n;
+		}
+		edac_dbg(2, "%s\n", mem_buffer);
+		p = mem_buffer;
+		space = PAGE_SIZE;
 	}
 
-	reg = (reg << 1) & PALMAS_LDO8_VOLTAGE_VSEL_MASK;
-	ret = palmas_ldo_write(palmas, addr, reg);
-	if (ret < 0)
-		dev_err(palmas->dev, "Error in setting ldo8 voltage reg\n");
+	/* Output the last bottom 'boundary' marker */
+	n = snprintf(p, space, "---------------------------"
+			"-------------------------------");
+	p += n;
+	space -= n;
+	edac_dbg(2, "%s\n", mem_buffer);
+	p = mem_buffer;
+	space = PAGE_SIZE;
 
-	return;
+	/* now output the 'channel' labels */
+	n = snprintf(p, space, "           ");
+	p += n;
+	space -= n;
+	for (channel = 0; channel < pvt->maxch; channel++) {
+		n = snprintf(p, space, "channel %d | ", channel);
+		p += n;
+		space -= n;
+	}
+
+	space -= n;
+	edac_dbg(2, "%s\n", mem_buffer);
+	p = mem_buffer;
+	space = PAGE_SIZE;
+
+	n = snprintf(p, space, "           ");
+	p += n;
+	for (branch = 0; branch < MAX_BRANCHES; branch++) {
+		n = snprintf(p, space, "       branch %d       | ", branch);
+		p += n;
+		space -= n;
+	}
+
+	/* output the last message and free buffer */
+	edac_dbg(2, "%s\n", mem_buffer);
+	kfree(mem_buffer);
 }
 
-static int palmas_ldo_registration(struct palmas_pmic *pmic,
-				   struct palmas_pmic_driver_data *ddata,
-				   struct palmas_pmic_platform_data *pdata,
-				   const char *pdev_name,
-				   struct regulator_config config)
+/*
+ *	i5400_get_mc_regs	read in the necessary registers and
+ *				cache locally
+ *
+ *			Fills in the private data members
+ */
+static void i5400_get_mc_regs(struct mem_ctl_info *mci)
 {
-	int id, ret;
-	struct regulator_dev *rdev;
-	struct palmas_reg_init *reg_init;
-	struct palmas_regs_info *rinfo;
-	struct regulator_desc *desc;
-
-	for (id = ddata->ldo_begin; id < ddata->max_reg; id++) {
-		if (pdata && pdata->reg_init[id])
-			reg_init = pdata->reg_init[id];
-		else
-			reg_init = NULL;
-
-		rinfo = &ddata->palmas_regs_info[id];
-		/* Miss out regulators which are not available due
-		 * to alternate functions.
-		 */
-
-		/* Register the regulators */
-		desc = &pmic->desc[id];
-		desc->name = rinfo->name;
-		desc->id = id;
-		desc->type = REGULATOR_VOLTAGE;
-		desc->owner = THIS_MODULE;
-
-		if (id < PALMAS_REG_REGEN1) {
-			desc->n_voltages = PALMAS_LDO_NUM_VOLTAGES;
-			if (reg_init && reg_init->roof_floor)
-				desc->ops = &palmas_ops_ext_control_ldo;
-			else
-				desc->ops = &palmas_ops_ldo;
-			desc->min_uV = 900000;
-			desc->uV_step = 50000;
-			desc->linear_min_sel = 1;
-			desc->enable_time = 500;
-			desc->vsel_reg = PALMAS_BASE_TO_REG(PALMAS_LDO_BASE,
-							    rinfo->vsel_addr);
-			desc->vsel_mask = PALMAS_LDO1_VOLTAGE_VSEL_MASK;
-			desc->enable_reg = PALMAS_BASE_TO_REG(PALMAS_LDO_BASE,
-							      rinfo->ctrl_addr);
-			desc->enable_mask = PALMAS_LDO1_CTRL_MODE_ACTIVE;
-
-			/* Check if LDO8 is in tracking mode or not */
-			if (pdata && (id == PALMAS_REG_LDO8) &&
-			    pdata->enable_ldo8_tracking) {
-				palmas_enable_ldo8_track(pmic->palmas);
-				desc->min_uV = 450000;
-				desc->uV_step = 25000;
-			}
-
-			/* LOD6 in vibrator mode will have enable time 2000us */
-			if (pdata && pdata->ldo6_vibrator &&
-			    (id == PALMAS_REG_LDO6))
-				desc->enable_time = 2000;
-		} else {
-			if (!ddata->has_regen3 && id == PALMAS_REG_REGEN3)
-				continue;
-
-			desc->n_voltages = 1;
-			if (reg_init && reg_init->roof_floor)
-				desc->ops = &palmas_ops_ext_control_extreg;
-			else
-				desc->ops = &palmas_ops_extreg;
-			desc->enable_reg =
-					PALMAS_BASE_TO_REG(PALMAS_RESOURCE_BASE,
-							   rinfo->ctrl_addr);
-			desc->enable_mask = PALMAS_REGEN1_CTRL_MODE_ACTIVE;
-		}
-
-		if (pdata)
-			config.init_data = pdata->reg_data[id];
-		else
-			config.init_data = NULL;
-
-		desc->supply_name = rinfo->sname;
-		config.of_node = ddata->palmas_matches[id].of_node;
-
-		rdev = devm_regulator_register(pmic->dev, desc, &config);
-		if (IS_ERR(rdev)) {
-			dev_err(pmic->dev,
-				"failed to register %s regulator\n",
-				pdev_name);
-			return PTR_ERR(rdev);
-		}
-
-		/* Save regulator for cleanup */
-		pmic->rdev[id] = rdev;
-
-		/* Initialise sleep/init values from platform data */
-		if (pdata) {
-			reg_init = pdata->reg_init[id];
-			if (reg_init) {
-				if (id <= ddata->ldo_end)
-					ret = palmas_ldo_init(pmic->palmas, id,
-							      reg_init);
-				else
-					ret = palmas_extreg_init(pmic->palmas,
-								 id, reg_init);
-				if (ret)
-					return ret;
-			}
-		}
-	}
-
-	return 0;
-}
-
-static int tps65917_ldo_registration(struct palmas_pmic *pmic,
-				     struct palmas_pmic_driver_data *ddata,
-				     struct palmas_pmic_platform_data *pdata,
-				     const char *pdev_name,
-				     struct regulator_config config)
-{
-	int id, ret;
-	struct regulator_dev *rdev;
-	struct palmas_reg_init *reg_init;
-	struct palmas_regs_info *rinfo;
-	struct regulator_desc *desc;
-
-	for (id = ddata->ldo_begin; id < ddata->max_reg; id++) {
-		if (pdata && pdata->reg_init[id])
-			reg_init = pdata->reg_init[id];
-		else
-			reg_init = NULL;
-
-		/* Miss out regulators which are not available due
-		 * to alternate functions.
-		 */
-		rinfo = &ddata->palmas_regs_info[id];
-
-		/* Register the regulators */
-		desc = &pmic->desc[id];
-		desc->name = rinfo->name;
-		desc->id = id;
-		desc->type = REGULATOR_VOLTAGE;
-		desc->owner = THIS_MODULE;
-
-		if (id < TPS65917_REG_REGEN1) {
-			desc->n_voltages = PALMAS_LDO_NUM_VOLTAGES;
-			if (reg_init && reg_init->roof_floor)
-				desc->ops = &palmas_ops_ext_control_ldo;
-			else
-				desc->ops = &tps65917_ops_ldo;
-			desc->min_uV = 900000;
-			desc->uV_step = 50000;
-			desc->linear_min_sel = 1;
-			desc->enable_time = 500;
-			desc->vsel_reg = PALMAS_BASE_TO_REG(PALMAS_LDO_BASE,
-							    rinfo->vsel_addr);
-			desc->vsel_mask = PALMAS_LDO1_VOLTAGE_VSEL_MASK;
-			desc->enable_reg = PALMAS_BASE_TO_REG(PALMAS_LDO_BASE,
-							      rinfo->ctrl_addr);
-			desc->enable_mask = PALMAS_LDO1_CTRL_MODE_ACTIVE;
-			/*
-			 * To be confirmed. Discussion on going with PMIC Team.
-			 * It is of the order of ~60mV/uS.
-			 */
-			desc->ramp_delay = 2500;
-		} else {
-			desc->n_voltages = 1;
-			if (reg_init && reg_init->roof_floor)
-				desc->ops = &palmas_ops_ext_control_extreg;
-			else
-				desc->ops = &palmas_ops_extreg;
-			desc->enable_reg =
-					PALMAS_BASE_TO_REG(PALMAS_RESOURCE_BASE,
-							   rinfo->ctrl_addr);
-			desc->enable_mask = PALMAS_REGEN1_CTRL_MODE_ACTIVE;
-		}
-
-		if (pdata)
-			config.init_data = pdata->reg_data[id];
-		else
-			config.init_data = NULL;
-
-		desc->supply_name = rinfo->sname;
-		config.of_node = ddata->palmas_matches[id].of_node;
-
-		rdev = devm_regulator_register(pmic->dev, desc, &config);
-		if (IS_ERR(rdev)) {
-			dev_err(pmic->dev,
-				"failed to register %s regulator\n",
-				pdev_name);
-			return PTR_ERR(rdev);
-		}
-
-		/* Save regulator for cleanup */
-		pmic->rdev[id] = rdev;
-
-		/* Initialise sleep/init values from platform data */
-		if (pdata) {
-			reg_init = pdata->reg_init[id];
-			if (reg_init) {
-				if (id < TPS65917_REG_REGEN1)
-					ret = palmas_ldo_init(pmic->palmas,
-							      id, reg_init);
-				else
-					ret = palmas_extreg_init(pmic->palmas,
-								 id, reg_init);
-				if (ret)
-					return ret;
-			}
-		}
-	}
-
-	return 0;
-}
-
-static int palmas_smps_registration(struct palmas_pmic *pmic,
-				    struct palmas_pmic_driver_data *ddata,
-				    struct palmas_pmic_platform_data *pdata,
-				    const char *pdev_name,
-				    struct regulator_config config)
-{
-	int id, ret;
-	unsigned int addr, reg;
-	struct regulator_dev *rdev;
-	struct palmas_reg_init *reg_init;
-	struct palmas_regs_info *rinfo;
-	struct regulator_desc *desc;
-
-	for (id = ddata->smps_start; id <= ddata->smps_end; id++) {
-		bool ramp_delay_support = false;
-
-		/*
-		 * Miss out regulators which are not available due
-		 * to slaving configurations.
-		 */
-		switch (id) {
-		case PALMAS_REG_SMPS12:
-		case PALMAS_REG_SMPS3:
-			if (pmic->smps123)
-				continue;
-			if (id == PALMAS_REG_SMPS12)
-				ramp_delay_support = true;
-			break;
-		case PALMAS_REG_SMPS123:
-			if (!pmic->smps123)
-				continue;
-			ramp_delay_support = true;
-			break;
-		case PALMAS_REG_SMPS45:
-		case PALMAS_REG_SMPS7:
-			if (pmic->smps457)
-				continue;
-			if (id == PALMAS_REG_SMPS45)
-				ramp_delay_support = true;
-			break;
-		case PALMAS_REG_SMPS457:
-			if (!pmic->smps457)
-				continue;
-			ramp_delay_support = true;
-			break;
-		case PALMAS_REG_SMPS10_OUT1:
-		case PALMAS_REG_SMPS10_OUT2:
-			if (!PALMAS_PMIC_HAS(pmic->palmas, SMPS10_BOOST))
-				continue;
-		}
-		rinfo = &ddata->palmas_regs_info[id];
-		desc = &pmic->desc[id];
-
-		if ((id == PALMAS_REG_SMPS6) || (id == PALMAS_REG_SMPS8))
-			ramp_delay_support = true;
-
-		if (ramp_delay_support) {
-			addr = rinfo->tstep_addr;
-			ret = palmas_smps_read(pmic->palmas, addr, &reg);
-			if (ret < 0) {
-				dev_err(pmic->dev,
-					"reading TSTEP reg failed: %d\n", ret);
-				return ret;
-			}
-			desc->ramp_delay = palmas_smps_ramp_delay[reg & 0x3];
-			pmic->ramp_delay[id] = desc->ramp_delay;
-		}
-
-		/* Initialise sleep/init values from platform data */
-		if (pdata && pdata->reg_init[id]) {
-			reg_init = pdata->reg_init[id];
-			ret = palmas_smps_init(pmic->palmas, id, reg_init);
-			if (ret)
-				return ret;
-		} else {
-			reg_init = NULL;
-		}
-
-		/* Register the regulators */
-		desc->name = rinfo->name;
-		desc->id = id;
-
-		switch (id) {
-		case PALMAS_REG_SMPS10_OUT1:
-		case PALMAS_REG_SMPS10_OUT2:
-			desc->n_voltages = PALMAS_SMPS10_NUM_VOLTAGES;
-			desc->ops = &palmas_ops_smps10;
-			desc->vsel_reg = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE,
-							    PALMAS_SMPS10_CTRL);
-			desc->vsel_mask = SMPS10_VSEL;
-			desc->enable_reg = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE,
-							    PALMAS_SMPS10_CTRL);
-			if (id == PALMAS_REG_SMPS10_OUT1)
-				desc->enable_mask = SMPS10_SWITCH_EN;
-			else
-				desc->enable_mask = SMPS10_BOOST_EN;
-			desc->bypass_reg = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE,
-							    PALMAS_SMPS10_CTRL);
-			desc->bypass_mask = SMPS10_BYPASS_EN;
-			desc->min_uV = 3750000;
-			desc->uV_step = 1250000;
-			break;
-		default:
-			/*
-			 * Read and store the RANGE bit for later use
-			 * This must be done before regulator is probed,
-			 * otherwise we error in probe with unsupportable
-			 * ranges. Read the current smps mode for later use.
-			 */
-			addr = rinfo->vsel_addr;
-			desc->n_linear_ranges = 3;
-
-			ret = palmas_smps_read(pmic->palmas, addr, &reg);
-			if (ret)
-				return ret;
-			if (reg & PALMAS_SMPS12_VOLTAGE_RANGE)
-				pmic->range[id] = 1;
-			if (pmic->range[id])
-				desc->linear_ranges = smps_high_ranges;
-			else
-				desc->linear_ranges = smps_low_ranges;
-
-			if (reg_init && reg_init->roof_floor)
-				desc->ops = &palmas_ops_ext_control_smps;
-			else
-				desc->ops = &palmas_ops_smps;
-			desc->n_voltages = PALMAS_SMPS_NUM_VOLTAGES;
-			desc->vsel_reg = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE,
-							    rinfo->vsel_addr);
-			desc->vsel_mask = PALMAS_SMPS12_VOLTAGE_VSEL_MASK;
-
-			/* Read the smps mode for later use. */
-			addr = rinfo->ctrl_addr;
-			ret = palmas_smps_read(pmic->palmas, addr, &reg);
-			if (ret)
-				return ret;
-			pmic->current_reg_mode[id] = reg &
-					PALMAS_SMPS12_CTRL_MODE_ACTIVE_MASK;
-
-			desc->enable_reg = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE,
-							      rinfo->ctrl_addr);
-			desc->enable_mask = PALMAS_SMPS12_CTRL_MODE_ACTIVE_MASK;
-			/* set_mode overrides this value */
-			desc->enable_val = SMPS_CTRL_MODE_ON;
-		}
-
-		desc->type = REGULATOR_VOLTAGE;
-		desc->owner = THIS_MODULE;
-
-		if (pdata)
-			config.init_data = pdata->reg_data[id];
-		else
-			config.init_data = NULL;
-
-		desc->supply_name = rinfo->sname;
-		config.of_node = ddata->palmas_matches[id].of_node;
-
-		rdev = devm_regulator_register(pmic->dev, desc, &config);
-		if (IS_ERR(rdev)) {
-			dev_err(pmic->dev,
-				"failed to register %s regulator\n",
-				pdev_name);
-			return PTR_ERR(rdev);
-		}
-
-		/* Save regulator for cleanup */
-		pmic->rdev[id] = rdev;
-	}
-
-	return 0;
-}
-
-static int tps65917_smps_registration(struct palmas_pmic *pmic,
-				      struct palmas_pmic_driver_data *ddata,
-				      struct palmas_pmic_platform_data *pdata,
-				      const char *pdev_name,
-				      struct regulator_config config)
-{
-	int id, ret;
-	unsigned int addr, reg;
-	struct regulator_dev *rdev;
-	struct palmas_reg_init *reg_init;
-	struct palmas_regs_info *rinfo;
-	struct regulator_desc *desc;
-
-	for (id = ddata->smps_start; id <= ddata->smps_end; id++) {
-		/*
-		 * Miss out regulators which are not available due
-		 * to slaving configurations.
-		 */
-		desc = &pmic->desc[id];
-		desc->n_linear_ranges = 3;
-		if ((id == TPS65917_REG_SMPS2) && pmic->smps12)
-			continue;
-
-		/* Initialise sleep/init values from platform data */
-		if (pdata && pdata->reg_init[id]) {
-			reg_init = pdata->reg_init[id];
-			ret = palmas_smps_init(pmic->palmas, id, reg_init);
-			if (ret)
-				return ret;
-		} else {
-			reg_init = NULL;
-		}
-		rinfo = &ddata->palmas_regs_info[id];
-
-		/* Register the regulators */
-		desc->name = rinfo->name;
-		desc->id = id;
-
-		/*
-		 * Read and store the RANGE bit for later use
-		 * This must be done before regulator is probed,
-		 * otherwise we error in probe with unsupportable
-		 * ranges. Read the current smps mode for later use.
-		 */
-		addr = rinfo->vsel_addr;
-
-		ret = palmas_smps_read(pmic->palmas, addr, &reg);
-		if (ret)
-			return ret;
-		if (reg & TPS65917_SMPS1_VOLTAGE_RANGE)
-			pmic->range[id] = 1;
-
-		if (pmic->range[id])
-			desc->linear_ranges = smps_high_ranges;
-		else
-			desc->linear_ranges = smps_low_ranges;
-
-		if (reg_init && reg_init->roof_floor)
-			desc->ops = &tps65917_ops_ext_control_smps;
-		else
-			desc->ops = &tps65917_ops_smps;
-		desc->n_voltages = PALMAS_SMPS_NUM_VOLTAGES;
-		desc->vsel_reg = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE,
-						    rinfo->vsel_addr);
-		desc->vsel_mask = PALMAS_SMPS12_VOLTAGE_VSEL_MASK;
-		desc->ramp_delay = 2500;
-
-		/* Read the smps mode for later use. */
-		addr = rinfo->ctrl_addr;
-		ret = palmas_smps_read(pmic->palmas, addr, &reg);
-		if (ret)
-			return ret;
-		pmic->current_reg_mode[id] = reg &
-				PALMAS_SMPS12_CTRL_MODE_ACTIVE_MASK;
-		desc->enable_reg = PALMAS_BASE_TO_REG(PALMAS_SMPS_BASE,
-						      rinfo->ctrl_addr);
-		desc->enable_mask = PALMAS_SMPS12_CTRL_MODE_ACTIVE_MASK;
-		/* set_mode overrides this value */
-		desc->enable_val = SMPS_CTRL_MODE_ON;
-
-		desc->type = REGULATOR_VOLTAGE;
-		desc->owner = THIS_MODULE;
-
-		if (pdata)
-			config.init_data = pdata->reg_data[id];
-		else
-			config.init_data = NULL;
-
-		desc->supply_name = rinfo->sname;
-		config.of_node = ddata->palmas_matches[id].of_node;
-
-		rdev = devm_regulator_register(pmic->dev, desc, &config);
-		if (IS_ERR(rdev)) {
-			dev_err(pmic->dev,
-				"failed to register %s regulator\n",
-				pdev_name);
-			return PTR_ERR(rdev);
-		}
-
-		/* Save regulator for cleanup */
-		pmic->rdev[id] = rdev;
-	}
-
-	return 0;
-}
-
-static struct of_regulator_match palmas_matches[] = {
-	{ .name = "smps12", },
-	{ .name = "smps123", },
-	{ .name = "smps3", },
-	{ .name = "smps45", },
-	{ .name = "smps457", },
-	{ .name = "smps6", },
-	{ .name = "smps7", },
-	{ .name = "smps8", },
-	{ .name = "smps9", },
-	{ .name = "smps10_out2", },
-	{ .name = "smps10_out1", },
-	{ .name = "ldo1", },
-	{ .name = "ldo2", },
-	{ .name = "ldo3", },
-	{ .name = "ldo4", },
-	{ .name = "ldo5", },
-	{ .name = "ldo6", },
-	{ .name = "ldo7", },
-	{ .name = "ldo8", },
-	{ .name = "ldo9", },
-	{ .name = "ldoln", },
-	{ .name = "ldousb", },
-	{ .name = "regen1", },
-	{ .name = "regen2", },
-	{ .name = "regen3", },
-	{ .name = "sysen1", },
-	{ .name = "sysen2", },
-};
-
-static struct of_regulator_match tps65917_matches[] = {
-	{ .name = "smps1", },
-	{ .name = "smps2", },
-	{ .name = "smps3", },
-	{ .name = "smps4", },
-	{ .name = "smps5", },
-	{ .name = "ldo1", },
-	{ .name = "ldo2", },
-	{ .name = "ldo3", },
-	{ .name = "ldo4", },
-	{ .name = "ldo5", },
-	{ .name = "regen1", },
-	{ .name = "regen2", },
-	{ .name = "regen3", },
-	{ .name = "sysen1", },
-	{ .name = "sysen2", },
-};
-
-static struct palmas_pmic_driver_data palmas_ddata = {
-	.smps_start = PALMAS_REG_SMPS12,
-	.smps_end = PALMAS_REG_SMPS10_OUT1,
-	.ldo_begin = PALMAS_REG_LDO1,
-	.ldo_end = PALMAS_REG_LDOUSB,
-	.max_reg = PALMAS_NUM_REGS,
-	.has_regen3 = true,
-	.palmas_regs_info = palmas_generic_regs_info,
-	.palmas_matches = palmas_matches,
-	.sleep_req_info = palma_sleep_req_info,
-	.smps_register = palmas_smps_registration,
-	.ldo_register = palmas_ldo_registration,
-};
-
-static struct palmas_pmic_driver_data tps65917_ddata = {
-	.smps_start = TPS65917_REG_SMPS1,
-	.smps_end = TPS65917_REG_SMPS5,
-	.ldo_begin = TPS65917_REG_LDO1,
-	.ldo_end = TPS65917_REG_LDO5,
-	.max_reg = TPS65917_NUM_REGS,
-	.has_regen3 = true,
-	.palmas_regs_info = tps65917_regs_info,
-	.palmas_matches = tps65917_matches,
-	.sleep_req_info = tps65917_sleep_req_info,
-	.smps_register = tps65917_smps_registration,
-	.ldo_register = tps65917_ldo_registration,
-};
-
-static void palmas_dt_to_pdata(struct device *dev,
-			       struct device_node *node,
-			       struct palmas_pmic_platform_data *pdata,
-			       struct palmas_pmic_driver_data *ddata)
-{
-	struct device_node *regulators;
-	u32 prop;
-	int idx, ret;
-
-	regulators = of_get_child_by_name(node, "regulators");
-	if (!regulators) {
-		dev_info(dev, "regulator node not found\n");
-		return;
-	}
-
-	ret = of_regulator_match(dev, regulators, ddata->palmas_matches,
-				 ddata->max_reg);
-	of_node_put(regulators);
-	if (ret < 0) {
-		dev_err(dev, "Error parsing regulator init data: %d\n", ret);
-		return;
-	}
-
-	for (idx = 0; idx < ddata->max_reg; idx++) {
-		if (!ddata->palmas_matches[idx].init_data ||
-		    !ddata->palmas_matches[idx].of_node)
-			continue;
-
-		pdata->reg_data[idx] = ddata->palmas_matches[idx].init_data;
-
-		pdata->reg_init[idx] = devm_kzalloc(dev,
-				sizeof(struct palmas_reg_init), GFP_KERNEL);
-
-		pdata->reg_init[idx]->warm_reset =
-			of_property_read_bool(ddata->palmas_matches[idx].of_node,
-					      "ti,warm-reset");
-
-		ret = of_property_read_u32(ddata->palmas_matches[idx].of_node,
-					   "ti,roof-floor", &prop);
-		/* EINVAL: Property not found */
-		if (ret != -EINVAL) {
-			int econtrol;
-
-			/* use default value, when no value is specified */
-			econtrol = PALMAS_EXT_CONTROL_NSLEEP;
-			if (!ret) {
-				switch (prop) {
-				case 1:
-					econtrol = PALMAS_EXT_CONTROL_ENABLE1;
-					break;
-				case 2:
-					econtrol = PALMAS_EXT_CONTROL_ENABLE2;
-					break;
-				case 3:
-					econtrol = PALMAS_EXT_CONTROL_NSLEEP;
-					break;
-				default:
-					WARN_ON(1);
-					dev_warn(dev,
-						 "%s: Invalid roof-floor option: %u\n",
-					     palmas_matches[idx].name, prop);
-					break;
-				}
-			}
-			pdata->reg_init[idx]->roof_floor = econtrol;
-		}
-
-		ret = of_property_read_u32(ddata->palmas_matches[idx].of_node,
-					   "ti,mode-sleep", &prop);
-		if (!ret)
-			pdata->reg_init[idx]->mode_sleep = prop;
-
-		ret = of_property_read_bool(ddata->palmas_matches[idx].of_node,
-					    "ti,smps-range");
-		if (ret)
-			pdata->reg_init[idx]->vsel =
-				PALMAS_SMPS12_VOLTAGE_RANGE;
-
-		if (idx == PALMAS_REG_LDO8)
-			pdata->enable_ldo8_tracking = of_property_read_bool(
-						ddata->palmas_matches[idx].of_node,
-						"ti,enable-ldo8-tracking");
-	}
-
-	pdata->ldo6_vibrator = of_property_read_bool(node, "ti,ldo6-vibrator");
-}
-
-static const struct of_device_id of_palmas_match_tbl[] = {
-	{
-		.compatible = "ti,palmas-pmic",
-		.data = &palmas_ddata,
-	},
-	{
-		.compatible = "ti,twl6035-pmic",
-		.data = &palmas_ddata,
-	},
-	{
-		.compatible = "ti,twl6036-pmic",
-		.data = &palmas_ddata,
-	},
-	{
-		.compatible = "ti,twl6037-pmic",
-		.data = &palmas_ddata,
-	},
-	{
-		.compatible = "ti,tps65913-pmic",
-		.data = &palmas_ddata,
-	},
-	{
-		.compatible = "ti,tps65914-pmic",
-		.data = &palmas_ddata,
-	},
-	{
-		.compatible = "ti,tps80036-pmic",
-		.data = &palmas_ddata,
-	},
-	{
-		.compatible = "ti,tps659038-pmic",
-		.data = &palmas_ddata,
-	},
-	 {
-		.compatible = "ti,tps65917-pmic",
-		.data = &tps65917_ddata,
-	},
-	{ /* end */ }
-};
-
-static int palmas_regulators_probe(struct platform_device *pdev)
-{
-	struct palmas *palmas = dev_get_drvdata(pdev->dev.parent);
-	struct palmas_pmic_platform_data *pdata = dev_get_platdata(&pdev->dev);
-	struct device_node *node = pdev->dev.of_node;
-	struct palmas_pmic_driver_data *driver_data;
-	struct regulator_config config = { };
-	struct palmas_pmic *pmic;
-	const char *pdev_name;
-	const struct of_device_id *match;
-	int ret = 0;
-	unsigned int reg;
-
-	match = of_match_device(of_match_ptr(of_palmas_match_tbl), &pdev->dev);
-
-	if (!match)
-		return -ENODATA;
-
-	driver_data = (struct palmas_pmic_driver_data *)match->data;
-	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata)
-		return -ENOMEM;
-
-	pmic = devm_kzalloc(&pdev->dev, sizeof(*pmic), GFP_KERNEL);
-	if (!pmic)
-		return -ENOMEM;
-
-	if (of_device_is_compatible(node, "ti,tps659038-pmic")) {
-		palmas_generic_regs_info[PALMAS_REG_REGEN2].ctrl_addr =
-							TPS659038_REGEN2_CTRL;
-		palmas_ddata.has_regen3 = false;
-	}
-
-	pmic->dev = &pdev->dev;
-	pmic->palmas = palmas;
-	palmas->pmic = pmic;
-	platform_set_drvdata(pdev, pmic);
-	pmic->palmas->pmic_ddata = driver_data;
-
-	palmas_dt_to_pdata(&pdev->dev, node, pdata, driver_data);
-
-	ret = palmas_smps_read(palmas, PALMAS_SMPS_CTRL, &reg);
-	if (ret)
-		return ret;
-
-	if (reg & PALMAS_SMPS_CTRL_SMPS12_SMPS123_EN)
-		pmic->smps123 = 1;
-
-	if (reg & PALMAS_SMPS_CTRL_SMPS45_SMPS457_EN)
-		pmic->smps457 = 1;
-
-	config.regmap = palmas->regmap[REGULATOR_SLAVE];
-	config.dev = &pdev->dev;
-	config.driver_data = pmic;
-	pdev_name = pdev->name;
-
-	ret = driver_data->smps_register(pmic, driver_data, pdata, pdev_name,
-					 config);
-	if (ret)
-		return ret;
-
-	ret = driver_data->ldo_register(pmic, driver_data, pdata, pdev_name,
-					config);
-
-	return ret;
-}
-
-static struct platform_driver palmas_driver = {
-	.driver = {
-		.name = "palmas-pmic",
-		.of_match_table = of_palmas_match_tbl,
-	},
-	.probe = palmas_regulators_probe,
-};
-
-static int __init palmas_init(void)
-{
-	return platform_driver_register(&palmas_driver);
-}
-subsys_initcall(palmas_init);
-
-static void __exit palmas_exit(void)
-{
-	platform_driver_unregister(&palmas_driver);
-}
-module_exit(palmas_exit);
-
-MODULE_AUTHOR("Graeme Gregory <gg@slimlogic.co.uk>");
-MODULE_DESCRIPTION("Palmas voltage regulator driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:palmas-pmic");
-MODULE_DEVICE_TABLE(of, of_palmas_match_tbl);
+	struct i5400_pvt *pvt;
+	u32 actual_tolm;
+	u16 limit;
+	int slot_row;
+	int maxch;
+	int maxdimmperch;
+	int way0, way1;
+
+	pvt = mci->pvt_info;
+
+	pci_read_config_dword(pvt->system_address, AMBASE,
+			&pvt->u.ambase_bottom);
+	pci_read_config_dword(pvt->system_address, AMBASE + sizeof(u32),
+			&pvt->u.ambase_top);
+
+	maxdimmperch = pvt->maxdimmperch;
+	maxch = pvt->maxch;
+
+	edac_dbg(2, "AMBASE= 0x%lx  MAXCH= %d  MAX-DIMM-Per-CH= %d\n",
+		 (long unsigned int)pvt->ambase, pvt->maxch, pvt->maxdimmperch);
+
+	/* Get the Branch Map regs */
+	pci_read_config_word(pvt->branchmap_werrors, TOLM, &pvt->tolm);
+	pvt->tolm >>= 12;
+	edac_dbg(2, "\nTOLM (number of 256M regions) =%u (0x%x)\n",
+		 pvt->tolm, pvt->tolm);
+
+	actual_tolm = (u32) ((1000l * pvt->tolm) >> (30 - 28));
+	edac_dbg(2, "Actual TOLM byte addr=%u.%03u GB (0x%x)\n",
+		 actual_tolm/1000, actual_tolm % 1000, pvt->tolm << 28);
+
+	pci_read_config_word(pvt->branchmap_werrors, MIR0, &pvt->mir0);
+	pci_read_config_word(pvt->branchmap_werrors, MIR1, &pvt->mir1);
+
+	/* Get the MIR[0-1] regs */
+	limit = (pvt->mir0 >> 4) & 0x0fff;
+	way0 = pvt->mir0 & 0x1;
+	way1 = pvt->mir0 & 0x2;
+	edac_dbg(2, "MIR0: limit= 0x%x  WAY1= %u  WAY0= %x\n",
+		 limit, way1, way0);
+	limit = (pvt->mir1 >> 4) & 0xfff;
+	way0 = pvt->mir1 & 0x1;
+	way1 = pvt->mir1 & 0x2;
+	edac_dbg(2, "MIR1: limit= 0x%x  WAY1= %u  WAY0= %x\n",
+		 limit, way1, way0);
+
+	/* Get the set of MTR[0-3] regs by each branch */
+	for (slot_row = 0; slot_row < DIMMS_PER_CHANNEL; slot_row++) {
+		int where = MTR0 + (slot_row * sizeof(u16));
+
+		/* Branch 0 set of MTR registers */
+		pci_read_config_word(pvt->branch_0, where,
+				&pvt->b0_mtr[slot_row]);
+
+		edac_dbg(2, "MTR%d where=0x%x B0 value=0x%x\n",
+			 slot_row, where, pvt->b0_mtr[slot_row]);
+
+		if (pvt->maxch 

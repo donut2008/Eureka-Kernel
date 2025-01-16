@@ -1,733 +1,771 @@
-/*
- * HP i8042 SDC + MSM-58321 BBRTC driver.
- *
- * Copyright (c) 2001 Brian S. Julin
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions, and the following disclaimer,
- *    without modification.
- * 2. The name of the author may not be used to endorse or promote products
- *    derived from this software without specific prior written permission.
- *
- * Alternatively, this software may be distributed under the terms of the
- * GNU General Public License ("GPL").
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- *
- * References:
- * System Device Controller Microprocessor Firmware Theory of Operation
- *      for Part Number 1820-4784 Revision B.  Dwg No. A-1820-4784-2
- * efirtc.c by Stephane Eranian/Hewlett Packard
- *
- */
-
-#include <linux/hp_sdc.h>
-#include <linux/errno.h>
-#include <linux/types.h>
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/time.h>
-#include <linux/miscdevice.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/poll.h>
-#include <linux/rtc.h>
-#include <linux/mutex.h>
-#include <linux/semaphore.h>
-
-MODULE_AUTHOR("Brian S. Julin <bri@calyx.com>");
-MODULE_DESCRIPTION("HP i8042 SDC + MSM-58321 RTC Driver");
-MODULE_LICENSE("Dual BSD/GPL");
-
-#define RTC_VERSION "1.10d"
-
-static DEFINE_MUTEX(hp_sdc_rtc_mutex);
-static unsigned long epoch = 2000;
-
-static struct semaphore i8042tregs;
-
-static hp_sdc_irqhook hp_sdc_rtc_isr;
-
-static struct fasync_struct *hp_sdc_rtc_async_queue;
-
-static DECLARE_WAIT_QUEUE_HEAD(hp_sdc_rtc_wait);
-
-static ssize_t hp_sdc_rtc_read(struct file *file, char __user *buf,
-			       size_t count, loff_t *ppos);
-
-static long hp_sdc_rtc_unlocked_ioctl(struct file *file,
-				      unsigned int cmd, unsigned long arg);
-
-static unsigned int hp_sdc_rtc_poll(struct file *file, poll_table *wait);
-
-static int hp_sdc_rtc_open(struct inode *inode, struct file *file);
-static int hp_sdc_rtc_fasync (int fd, struct file *filp, int on);
-
-static void hp_sdc_rtc_isr (int irq, void *dev_id, 
-			    uint8_t status, uint8_t data) 
+h,
+			   struct srpt_recv_ioctx *recv_ioctx,
+			   struct srpt_send_ioctx *send_ioctx)
 {
+	struct se_cmd *cmd;
+	struct srp_cmd *srp_cmd;
+	uint64_t unpacked_lun;
+	u64 data_len;
+	enum dma_data_direction dir;
+	sense_reason_t ret;
+	int rc;
+
+	BUG_ON(!send_ioctx);
+
+	srp_cmd = recv_ioctx->ioctx.buf;
+	cmd = &send_ioctx->cmd;
+	cmd->tag = srp_cmd->tag;
+
+	switch (srp_cmd->task_attr) {
+	case SRP_CMD_SIMPLE_Q:
+		cmd->sam_task_attr = TCM_SIMPLE_TAG;
+		break;
+	case SRP_CMD_ORDERED_Q:
+	default:
+		cmd->sam_task_attr = TCM_ORDERED_TAG;
+		break;
+	case SRP_CMD_HEAD_OF_Q:
+		cmd->sam_task_attr = TCM_HEAD_TAG;
+		break;
+	case SRP_CMD_ACA:
+		cmd->sam_task_attr = TCM_ACA_TAG;
+		break;
+	}
+
+	if (srpt_get_desc_tbl(send_ioctx, srp_cmd, &dir, &data_len)) {
+		pr_err("0x%llx: parsing SRP descriptor table failed.\n",
+		       srp_cmd->tag);
+		ret = TCM_INVALID_CDB_FIELD;
+		goto send_sense;
+	}
+
+	unpacked_lun = srpt_unpack_lun((uint8_t *)&srp_cmd->lun,
+				       sizeof(srp_cmd->lun));
+	rc = target_submit_cmd(cmd, ch->sess, srp_cmd->cdb,
+			&send_ioctx->sense_data[0], unpacked_lun, data_len,
+			TCM_SIMPLE_TAG, dir, TARGET_SCF_ACK_KREF);
+	if (rc != 0) {
+		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+		goto send_sense;
+	}
+	return 0;
+
+send_sense:
+	transport_send_check_condition_and_sense(cmd, ret, 0);
+	return -1;
+}
+
+static int srp_tmr_to_tcm(int fn)
+{
+	switch (fn) {
+	case SRP_TSK_ABORT_TASK:
+		return TMR_ABORT_TASK;
+	case SRP_TSK_ABORT_TASK_SET:
+		return TMR_ABORT_TASK_SET;
+	case SRP_TSK_CLEAR_TASK_SET:
+		return TMR_CLEAR_TASK_SET;
+	case SRP_TSK_LUN_RESET:
+		return TMR_LUN_RESET;
+	case SRP_TSK_CLEAR_ACA:
+		return TMR_CLEAR_ACA;
+	default:
+		return -1;
+	}
+}
+
+/**
+ * srpt_handle_tsk_mgmt() - Process an SRP_TSK_MGMT information unit.
+ *
+ * Returns 0 if and only if the request will be processed by the target core.
+ *
+ * For more information about SRP_TSK_MGMT information units, see also section
+ * 6.7 in the SRP r16a document.
+ */
+static void srpt_handle_tsk_mgmt(struct srpt_rdma_ch *ch,
+				 struct srpt_recv_ioctx *recv_ioctx,
+				 struct srpt_send_ioctx *send_ioctx)
+{
+	struct srp_tsk_mgmt *srp_tsk;
+	struct se_cmd *cmd;
+	struct se_session *sess = ch->sess;
+	uint64_t unpacked_lun;
+	int tcm_tmr;
+	int rc;
+
+	BUG_ON(!send_ioctx);
+
+	srp_tsk = recv_ioctx->ioctx.buf;
+	cmd = &send_ioctx->cmd;
+
+	pr_debug("recv tsk_mgmt fn %d for task_tag %lld and cmd tag %lld"
+		 " cm_id %p sess %p\n", srp_tsk->tsk_mgmt_func,
+		 srp_tsk->task_tag, srp_tsk->tag, ch->cm_id, ch->sess);
+
+	srpt_set_cmd_state(send_ioctx, SRPT_STATE_MGMT);
+	send_ioctx->cmd.tag = srp_tsk->tag;
+	tcm_tmr = srp_tmr_to_tcm(srp_tsk->tsk_mgmt_func);
+	unpacked_lun = srpt_unpack_lun((uint8_t *)&srp_tsk->lun,
+				       sizeof(srp_tsk->lun));
+	rc = target_submit_tmr(&send_ioctx->cmd, sess, NULL, unpacked_lun,
+				srp_tsk, tcm_tmr, GFP_KERNEL, srp_tsk->task_tag,
+				TARGET_SCF_ACK_KREF);
+	if (rc != 0) {
+		send_ioctx->cmd.se_tmr_req->response = TMR_FUNCTION_REJECTED;
+		goto fail;
+	}
+	return;
+fail:
+	transport_send_check_condition_and_sense(cmd, 0, 0); // XXX:
+}
+
+/**
+ * srpt_handle_new_iu() - Process a newly received information unit.
+ * @ch:    RDMA channel through which the information unit has been received.
+ * @ioctx: SRPT I/O context associated with the information unit.
+ */
+static void srpt_handle_new_iu(struct srpt_rdma_ch *ch,
+			       struct srpt_recv_ioctx *recv_ioctx,
+			       struct srpt_send_ioctx *send_ioctx)
+{
+	struct srp_cmd *srp_cmd;
+	enum rdma_ch_state ch_state;
+
+	BUG_ON(!ch);
+	BUG_ON(!recv_ioctx);
+
+	ib_dma_sync_single_for_cpu(ch->sport->sdev->device,
+				   recv_ioctx->ioctx.dma, srp_max_req_size,
+				   DMA_FROM_DEVICE);
+
+	ch_state = srpt_get_ch_state(ch);
+	if (unlikely(ch_state == CH_CONNECTING)) {
+		list_add_tail(&recv_ioctx->wait_list, &ch->cmd_wait_list);
+		goto out;
+	}
+
+	if (unlikely(ch_state != CH_LIVE))
+		goto out;
+
+	srp_cmd = recv_ioctx->ioctx.buf;
+	if (srp_cmd->opcode == SRP_CMD || srp_cmd->opcode == SRP_TSK_MGMT) {
+		if (!send_ioctx)
+			send_ioctx = srpt_get_send_ioctx(ch);
+		if (unlikely(!send_ioctx)) {
+			list_add_tail(&recv_ioctx->wait_list,
+				      &ch->cmd_wait_list);
+			goto out;
+		}
+	}
+
+	switch (srp_cmd->opcode) {
+	case SRP_CMD:
+		srpt_handle_cmd(ch, recv_ioctx, send_ioctx);
+		break;
+	case SRP_TSK_MGMT:
+		srpt_handle_tsk_mgmt(ch, recv_ioctx, send_ioctx);
+		break;
+	case SRP_I_LOGOUT:
+		pr_err("Not yet implemented: SRP_I_LOGOUT\n");
+		break;
+	case SRP_CRED_RSP:
+		pr_debug("received SRP_CRED_RSP\n");
+		break;
+	case SRP_AER_RSP:
+		pr_debug("received SRP_AER_RSP\n");
+		break;
+	case SRP_RSP:
+		pr_err("Received SRP_RSP\n");
+		break;
+	default:
+		pr_err("received IU with unknown opcode 0x%x\n",
+		       srp_cmd->opcode);
+		break;
+	}
+
+	srpt_post_recv(ch->sport->sdev, recv_ioctx);
+out:
 	return;
 }
 
-static int hp_sdc_rtc_do_read_bbrtc (struct rtc_time *rtctm)
+static void srpt_process_rcv_completion(struct ib_cq *cq,
+					struct srpt_rdma_ch *ch,
+					struct ib_wc *wc)
 {
-	struct semaphore tsem;
-	hp_sdc_transaction t;
-	uint8_t tseq[91];
-	int i;
-	
-	i = 0;
-	while (i < 91) {
-		tseq[i++] = HP_SDC_ACT_DATAREG |
-			HP_SDC_ACT_POSTCMD | HP_SDC_ACT_DATAIN;
-		tseq[i++] = 0x01;			/* write i8042[0x70] */
-	  	tseq[i]   = i / 7;			/* BBRTC reg address */
-		i++;
-		tseq[i++] = HP_SDC_CMD_DO_RTCR;		/* Trigger command   */
-		tseq[i++] = 2;		/* expect 1 stat/dat pair back.   */
-		i++; i++;               /* buffer for stat/dat pair       */
-	}
-	tseq[84] |= HP_SDC_ACT_SEMAPHORE;
-	t.endidx =		91;
-	t.seq =			tseq;
-	t.act.semaphore =	&tsem;
-	sema_init(&tsem, 0);
-	
-	if (hp_sdc_enqueue_transaction(&t)) return -1;
-	
-	/* Put ourselves to sleep for results. */
-	if (WARN_ON(down_interruptible(&tsem)))
-		return -1;
-	
-	/* Check for nonpresence of BBRTC */
-	if (!((tseq[83] | tseq[90] | tseq[69] | tseq[76] |
-	       tseq[55] | tseq[62] | tseq[34] | tseq[41] |
-	       tseq[20] | tseq[27] | tseq[6]  | tseq[13]) & 0x0f))
-		return -1;
-
-	memset(rtctm, 0, sizeof(struct rtc_time));
-	rtctm->tm_year = (tseq[83] & 0x0f) + (tseq[90] & 0x0f) * 10;
-	rtctm->tm_mon  = (tseq[69] & 0x0f) + (tseq[76] & 0x0f) * 10;
-	rtctm->tm_mday = (tseq[55] & 0x0f) + (tseq[62] & 0x0f) * 10;
-	rtctm->tm_wday = (tseq[48] & 0x0f);
-	rtctm->tm_hour = (tseq[34] & 0x0f) + (tseq[41] & 0x0f) * 10;
-	rtctm->tm_min  = (tseq[20] & 0x0f) + (tseq[27] & 0x0f) * 10;
-	rtctm->tm_sec  = (tseq[6]  & 0x0f) + (tseq[13] & 0x0f) * 10;
-	
-	return 0;
-}
-
-static int hp_sdc_rtc_read_bbrtc (struct rtc_time *rtctm)
-{
-	struct rtc_time tm, tm_last;
-	int i = 0;
-
-	/* MSM-58321 has no read latch, so must read twice and compare. */
-
-	if (hp_sdc_rtc_do_read_bbrtc(&tm_last)) return -1;
-	if (hp_sdc_rtc_do_read_bbrtc(&tm)) return -1;
-
-	while (memcmp(&tm, &tm_last, sizeof(struct rtc_time))) {
-		if (i++ > 4) return -1;
-		memcpy(&tm_last, &tm, sizeof(struct rtc_time));
-		if (hp_sdc_rtc_do_read_bbrtc(&tm)) return -1;
-	}
-
-	memcpy(rtctm, &tm, sizeof(struct rtc_time));
-
-	return 0;
-}
-
-
-static int64_t hp_sdc_rtc_read_i8042timer (uint8_t loadcmd, int numreg)
-{
-	hp_sdc_transaction t;
-	uint8_t tseq[26] = {
-		HP_SDC_ACT_PRECMD | HP_SDC_ACT_POSTCMD | HP_SDC_ACT_DATAIN,
-		0,
-		HP_SDC_CMD_READ_T1, 2, 0, 0,
-		HP_SDC_ACT_POSTCMD | HP_SDC_ACT_DATAIN, 
-		HP_SDC_CMD_READ_T2, 2, 0, 0,
-		HP_SDC_ACT_POSTCMD | HP_SDC_ACT_DATAIN, 
-		HP_SDC_CMD_READ_T3, 2, 0, 0,
-		HP_SDC_ACT_POSTCMD | HP_SDC_ACT_DATAIN, 
-		HP_SDC_CMD_READ_T4, 2, 0, 0,
-		HP_SDC_ACT_POSTCMD | HP_SDC_ACT_DATAIN, 
-		HP_SDC_CMD_READ_T5, 2, 0, 0
-	};
-
-	t.endidx = numreg * 5;
-
-	tseq[1] = loadcmd;
-	tseq[t.endidx - 4] |= HP_SDC_ACT_SEMAPHORE; /* numreg assumed > 1 */
-
-	t.seq =			tseq;
-	t.act.semaphore =	&i8042tregs;
-
-	/* Sleep if output regs in use. */
-	if (WARN_ON(down_interruptible(&i8042tregs)))
-		return -1;
-
-	if (hp_sdc_enqueue_transaction(&t)) {
-		up(&i8042tregs);
-		return -1;
-	}
-	
-	/* Sleep until results come back. */
-	if (WARN_ON(down_interruptible(&i8042tregs)))
-		return -1;
-
-	up(&i8042tregs);
-
-	return (tseq[5] | 
-		((uint64_t)(tseq[10]) << 8)  | ((uint64_t)(tseq[15]) << 16) |
-		((uint64_t)(tseq[20]) << 24) | ((uint64_t)(tseq[25]) << 32));
-}
-
-
-/* Read the i8042 real-time clock */
-static inline int hp_sdc_rtc_read_rt(struct timespec64 *res) {
-	int64_t raw;
-	uint32_t tenms; 
-	unsigned int days;
-
-	raw = hp_sdc_rtc_read_i8042timer(HP_SDC_CMD_LOAD_RT, 5);
-	if (raw < 0) return -1;
-
-	tenms = (uint32_t)raw & 0xffffff;
-	days  = (unsigned int)(raw >> 24) & 0xffff;
-
-	res->tv_nsec = (long)(tenms % 100) * 10000 * 1000;
-	res->tv_sec =  (tenms / 100) + (time64_t)days * 86400;
-
-	return 0;
-}
-
-
-/* Read the i8042 fast handshake timer */
-static inline int hp_sdc_rtc_read_fhs(struct timespec64 *res) {
-	int64_t raw;
-	unsigned int tenms;
-
-	raw = hp_sdc_rtc_read_i8042timer(HP_SDC_CMD_LOAD_FHS, 2);
-	if (raw < 0) return -1;
-
-	tenms = (unsigned int)raw & 0xffff;
-
-	res->tv_nsec = (long)(tenms % 100) * 10000 * 1000;
-	res->tv_sec  = (time64_t)(tenms / 100);
-
-	return 0;
-}
-
-
-/* Read the i8042 match timer (a.k.a. alarm) */
-static inline int hp_sdc_rtc_read_mt(struct timespec64 *res) {
-	int64_t raw;	
-	uint32_t tenms; 
-
-	raw = hp_sdc_rtc_read_i8042timer(HP_SDC_CMD_LOAD_MT, 3);
-	if (raw < 0) return -1;
-
-	tenms = (uint32_t)raw & 0xffffff;
-
-	res->tv_nsec = (long)(tenms % 100) * 10000 * 1000;
-	res->tv_sec  = (time64_t)(tenms / 100);
-
-	return 0;
-}
-
-
-/* Read the i8042 delay timer */
-static inline int hp_sdc_rtc_read_dt(struct timespec64 *res) {
-	int64_t raw;
-	uint32_t tenms;
-
-	raw = hp_sdc_rtc_read_i8042timer(HP_SDC_CMD_LOAD_DT, 3);
-	if (raw < 0) return -1;
-
-	tenms = (uint32_t)raw & 0xffffff;
-
-	res->tv_nsec = (long)(tenms % 100) * 10000 * 1000;
-	res->tv_sec  = (time64_t)(tenms / 100);
-
-	return 0;
-}
-
-
-/* Read the i8042 cycle timer (a.k.a. periodic) */
-static inline int hp_sdc_rtc_read_ct(struct timespec64 *res) {
-	int64_t raw;
-	uint32_t tenms;
-
-	raw = hp_sdc_rtc_read_i8042timer(HP_SDC_CMD_LOAD_CT, 3);
-	if (raw < 0) return -1;
-
-	tenms = (uint32_t)raw & 0xffffff;
-
-	res->tv_nsec = (long)(tenms % 100) * 10000 * 1000;
-	res->tv_sec  = (time64_t)(tenms / 100);
-
-	return 0;
-}
-
-
-#if 0 /* not used yet */
-/* Set the i8042 real-time clock */
-static int hp_sdc_rtc_set_rt (struct timeval *setto)
-{
-	uint32_t tenms;
-	unsigned int days;
-	hp_sdc_transaction t;
-	uint8_t tseq[11] = {
-		HP_SDC_ACT_PRECMD | HP_SDC_ACT_DATAOUT,
-		HP_SDC_CMD_SET_RTMS, 3, 0, 0, 0,
-		HP_SDC_ACT_PRECMD | HP_SDC_ACT_DATAOUT,
-		HP_SDC_CMD_SET_RTD, 2, 0, 0 
-	};
-
-	t.endidx = 10;
-
-	if (0xffff < setto->tv_sec / 86400) return -1;
-	days = setto->tv_sec / 86400;
-	if (0xffff < setto->tv_usec / 1000000 / 86400) return -1;
-	days += ((setto->tv_sec % 86400) + setto->tv_usec / 1000000) / 86400;
-	if (days > 0xffff) return -1;
-
-	if (0xffffff < setto->tv_sec) return -1;
-	tenms  = setto->tv_sec * 100;
-	if (0xffffff < setto->tv_usec / 10000) return -1;
-	tenms += setto->tv_usec / 10000;
-	if (tenms > 0xffffff) return -1;
-
-	tseq[3] = (uint8_t)(tenms & 0xff);
-	tseq[4] = (uint8_t)((tenms >> 8)  & 0xff);
-	tseq[5] = (uint8_t)((tenms >> 16) & 0xff);
-
-	tseq[9] = (uint8_t)(days & 0xff);
-	tseq[10] = (uint8_t)((days >> 8) & 0xff);
-
-	t.seq =	tseq;
-
-	if (hp_sdc_enqueue_transaction(&t)) return -1;
-	return 0;
-}
-
-/* Set the i8042 fast handshake timer */
-static int hp_sdc_rtc_set_fhs (struct timeval *setto)
-{
-	uint32_t tenms;
-	hp_sdc_transaction t;
-	uint8_t tseq[5] = {
-		HP_SDC_ACT_PRECMD | HP_SDC_ACT_DATAOUT,
-		HP_SDC_CMD_SET_FHS, 2, 0, 0
-	};
-
-	t.endidx = 4;
-
-	if (0xffff < setto->tv_sec) return -1;
-	tenms  = setto->tv_sec * 100;
-	if (0xffff < setto->tv_usec / 10000) return -1;
-	tenms += setto->tv_usec / 10000;
-	if (tenms > 0xffff) return -1;
-
-	tseq[3] = (uint8_t)(tenms & 0xff);
-	tseq[4] = (uint8_t)((tenms >> 8)  & 0xff);
-
-	t.seq =	tseq;
-
-	if (hp_sdc_enqueue_transaction(&t)) return -1;
-	return 0;
-}
-
-
-/* Set the i8042 match timer (a.k.a. alarm) */
-#define hp_sdc_rtc_set_mt (setto) \
-	hp_sdc_rtc_set_i8042timer(setto, HP_SDC_CMD_SET_MT)
-
-/* Set the i8042 delay timer */
-#define hp_sdc_rtc_set_dt (setto) \
-	hp_sdc_rtc_set_i8042timer(setto, HP_SDC_CMD_SET_DT)
-
-/* Set the i8042 cycle timer (a.k.a. periodic) */
-#define hp_sdc_rtc_set_ct (setto) \
-	hp_sdc_rtc_set_i8042timer(setto, HP_SDC_CMD_SET_CT)
-
-/* Set one of the i8042 3-byte wide timers */
-static int hp_sdc_rtc_set_i8042timer (struct timeval *setto, uint8_t setcmd)
-{
-	uint32_t tenms;
-	hp_sdc_transaction t;
-	uint8_t tseq[6] = {
-		HP_SDC_ACT_PRECMD | HP_SDC_ACT_DATAOUT,
-		0, 3, 0, 0, 0
-	};
-
-	t.endidx = 6;
-
-	if (0xffffff < setto->tv_sec) return -1;
-	tenms  = setto->tv_sec * 100;
-	if (0xffffff < setto->tv_usec / 10000) return -1;
-	tenms += setto->tv_usec / 10000;
-	if (tenms > 0xffffff) return -1;
-
-	tseq[1] = setcmd;
-	tseq[3] = (uint8_t)(tenms & 0xff);
-	tseq[4] = (uint8_t)((tenms >> 8)  & 0xff);
-	tseq[5] = (uint8_t)((tenms >> 16)  & 0xff);
-
-	t.seq =			tseq;
-
-	if (hp_sdc_enqueue_transaction(&t)) { 
-		return -1;
-	}
-	return 0;
-}
-#endif
-
-static ssize_t hp_sdc_rtc_read(struct file *file, char __user *buf,
-			       size_t count, loff_t *ppos) {
-	ssize_t retval;
-
-        if (count < sizeof(unsigned long))
-                return -EINVAL;
-
-	retval = put_user(68, (unsigned long __user *)buf);
-	return retval;
-}
-
-static unsigned int hp_sdc_rtc_poll(struct file *file, poll_table *wait)
-{
-        unsigned long l;
-
-	l = 0;
-        if (l != 0)
-                return POLLIN | POLLRDNORM;
-        return 0;
-}
-
-static int hp_sdc_rtc_open(struct inode *inode, struct file *file)
-{
-        return 0;
-}
-
-static int hp_sdc_rtc_fasync (int fd, struct file *filp, int on)
-{
-        return fasync_helper (fd, filp, on, &hp_sdc_rtc_async_queue);
-}
-
-static int hp_sdc_rtc_proc_show(struct seq_file *m, void *v)
-{
-#define YN(bit) ("no")
-#define NY(bit) ("yes")
-        struct rtc_time tm;
-	struct timespec64 tv;
-
-	memset(&tm, 0, sizeof(struct rtc_time));
-
-	if (hp_sdc_rtc_read_bbrtc(&tm)) {
-		seq_puts(m, "BBRTC\t\t: READ FAILED!\n");
+	struct srpt_device *sdev = ch->sport->sdev;
+	struct srpt_recv_ioctx *ioctx;
+	u32 index;
+
+	index = idx_from_wr_id(wc->wr_id);
+	if (wc->status == IB_WC_SUCCESS) {
+		int req_lim;
+
+		req_lim = atomic_dec_return(&ch->req_lim);
+		if (unlikely(req_lim < 0))
+			pr_err("req_lim = %d < 0\n", req_lim);
+		ioctx = sdev->ioctx_ring[index];
+		srpt_handle_new_iu(ch, ioctx, NULL);
 	} else {
-		seq_printf(m,
-			     "rtc_time\t: %02d:%02d:%02d\n"
-			     "rtc_date\t: %04d-%02d-%02d\n"
-			     "rtc_epoch\t: %04lu\n",
-			     tm.tm_hour, tm.tm_min, tm.tm_sec,
-			     tm.tm_year + 1900, tm.tm_mon + 1, 
-			     tm.tm_mday, epoch);
+		pr_info("receiving failed for idx %u with status %d\n",
+			index, wc->status);
 	}
-
-	if (hp_sdc_rtc_read_rt(&tv)) {
-		seq_puts(m, "i8042 rtc\t: READ FAILED!\n");
-	} else {
-		seq_printf(m, "i8042 rtc\t: %lld.%02ld seconds\n",
-			     (s64)tv.tv_sec, (long)tv.tv_nsec/1000000L);
-	}
-
-	if (hp_sdc_rtc_read_fhs(&tv)) {
-		seq_puts(m, "handshake\t: READ FAILED!\n");
-	} else {
-		seq_printf(m, "handshake\t: %lld.%02ld seconds\n",
-			     (s64)tv.tv_sec, (long)tv.tv_nsec/1000000L);
-	}
-
-	if (hp_sdc_rtc_read_mt(&tv)) {
-		seq_puts(m, "alarm\t\t: READ FAILED!\n");
-	} else {
-		seq_printf(m, "alarm\t\t: %lld.%02ld seconds\n",
-			     (s64)tv.tv_sec, (long)tv.tv_nsec/1000000L);
-	}
-
-	if (hp_sdc_rtc_read_dt(&tv)) {
-		seq_puts(m, "delay\t\t: READ FAILED!\n");
-	} else {
-		seq_printf(m, "delay\t\t: %lld.%02ld seconds\n",
-			     (s64)tv.tv_sec, (long)tv.tv_nsec/1000000L);
-	}
-
-	if (hp_sdc_rtc_read_ct(&tv)) {
-		seq_puts(m, "periodic\t: READ FAILED!\n");
-	} else {
-		seq_printf(m, "periodic\t: %lld.%02ld seconds\n",
-			     (s64)tv.tv_sec, (long)tv.tv_nsec/1000000L);
-	}
-
-        seq_printf(m,
-                     "DST_enable\t: %s\n"
-                     "BCD\t\t: %s\n"
-                     "24hr\t\t: %s\n"
-                     "square_wave\t: %s\n"
-                     "alarm_IRQ\t: %s\n"
-                     "update_IRQ\t: %s\n"
-                     "periodic_IRQ\t: %s\n"
-		     "periodic_freq\t: %ld\n"
-                     "batt_status\t: %s\n",
-                     YN(RTC_DST_EN),
-                     NY(RTC_DM_BINARY),
-                     YN(RTC_24H),
-                     YN(RTC_SQWE),
-                     YN(RTC_AIE),
-                     YN(RTC_UIE),
-                     YN(RTC_PIE),
-                     1UL,
-                     1 ? "okay" : "dead");
-
-        return 0;
-#undef YN
-#undef NY
 }
 
-static int hp_sdc_rtc_proc_open(struct inode *inode, struct file *file)
+/**
+ * srpt_process_send_completion() - Process an IB send completion.
+ *
+ * Note: Although this has not yet been observed during tests, at least in
+ * theory it is possible that the srpt_get_send_ioctx() call invoked by
+ * srpt_handle_new_iu() fails. This is possible because the req_lim_delta
+ * value in each response is set to one, and it is possible that this response
+ * makes the initiator send a new request before the send completion for that
+ * response has been processed. This could e.g. happen if the call to
+ * srpt_put_send_iotcx() is delayed because of a higher priority interrupt or
+ * if IB retransmission causes generation of the send completion to be
+ * delayed. Incoming information units for which srpt_get_send_ioctx() fails
+ * are queued on cmd_wait_list. The code below processes these delayed
+ * requests one at a time.
+ */
+static void srpt_process_send_completion(struct ib_cq *cq,
+					 struct srpt_rdma_ch *ch,
+					 struct ib_wc *wc)
 {
-	return single_open(file, hp_sdc_rtc_proc_show, NULL);
+	struct srpt_send_ioctx *send_ioctx;
+	uint32_t index;
+	enum srpt_opcode opcode;
+
+	index = idx_from_wr_id(wc->wr_id);
+	opcode = opcode_from_wr_id(wc->wr_id);
+	send_ioctx = ch->ioctx_ring[index];
+	if (wc->status == IB_WC_SUCCESS) {
+		if (opcode == SRPT_SEND)
+			srpt_handle_send_comp(ch, send_ioctx);
+		else {
+			WARN_ON(opcode != SRPT_RDMA_ABORT &&
+				wc->opcode != IB_WC_RDMA_READ);
+			srpt_handle_rdma_comp(ch, send_ioctx, opcode);
+		}
+	} else {
+		if (opcode == SRPT_SEND) {
+			pr_info("sending response for idx %u failed"
+				" with status %d\n", index, wc->status);
+			srpt_handle_send_err_comp(ch, wc->wr_id);
+		} else if (opcode != SRPT_RDMA_MID) {
+			pr_info("RDMA t %d for idx %u failed with"
+				" status %d\n", opcode, index, wc->status);
+			srpt_handle_rdma_err_comp(ch, send_ioctx, opcode);
+		}
+	}
+
+	while (unlikely(opcode == SRPT_SEND
+			&& !list_empty(&ch->cmd_wait_list)
+			&& srpt_get_ch_state(ch) == CH_LIVE
+			&& (send_ioctx = srpt_get_send_ioctx(ch)) != NULL)) {
+		struct srpt_recv_ioctx *recv_ioctx;
+
+		recv_ioctx = list_first_entry(&ch->cmd_wait_list,
+					      struct srpt_recv_ioctx,
+					      wait_list);
+		list_del(&recv_ioctx->wait_list);
+		srpt_handle_new_iu(ch, recv_ioctx, send_ioctx);
+	}
 }
 
-static const struct file_operations hp_sdc_rtc_proc_fops = {
-	.open		= hp_sdc_rtc_proc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int hp_sdc_rtc_ioctl(struct file *file, 
-			    unsigned int cmd, unsigned long arg)
+static void srpt_process_completion(struct ib_cq *cq, struct srpt_rdma_ch *ch)
 {
-#if 1
-	return -EINVAL;
-#else
-	
-        struct rtc_time wtime; 
-	struct timeval ttime;
-	int use_wtime = 0;
+	struct ib_wc *const wc = ch->wc;
+	int i, n;
 
-	/* This needs major work. */
+	WARN_ON(cq != ch->cq);
 
-        switch (cmd) {
-
-        case RTC_AIE_OFF:       /* Mask alarm int. enab. bit    */
-        case RTC_AIE_ON:        /* Allow alarm interrupts.      */
-	case RTC_PIE_OFF:       /* Mask periodic int. enab. bit */
-        case RTC_PIE_ON:        /* Allow periodic ints          */
-        case RTC_UIE_ON:        /* Allow ints for RTC updates.  */
-        case RTC_UIE_OFF:       /* Allow ints for RTC updates.  */
-        {
-		/* We cannot mask individual user timers and we
-		   cannot tell them apart when they occur, so it 
-		   would be disingenuous to succeed these IOCTLs */
-		return -EINVAL;
-        }
-        case RTC_ALM_READ:      /* Read the present alarm time */
-        {
-		if (hp_sdc_rtc_read_mt(&ttime)) return -EFAULT;
-		if (hp_sdc_rtc_read_bbrtc(&wtime)) return -EFAULT;
-
-		wtime.tm_hour = ttime.tv_sec / 3600;  ttime.tv_sec %= 3600;
-		wtime.tm_min  = ttime.tv_sec / 60;    ttime.tv_sec %= 60;
-		wtime.tm_sec  = ttime.tv_sec;
-                
-		break;
-        }
-        case RTC_IRQP_READ:     /* Read the periodic IRQ rate.  */
-        {
-                return put_user(hp_sdc_rtc_freq, (unsigned long *)arg);
-        }
-        case RTC_IRQP_SET:      /* Set periodic IRQ rate.       */
-        {
-                /* 
-                 * The max we can do is 100Hz.
-		 */
-
-                if ((arg < 1) || (arg > 100)) return -EINVAL;
-		ttime.tv_sec = 0;
-		ttime.tv_usec = 1000000 / arg;
-		if (hp_sdc_rtc_set_ct(&ttime)) return -EFAULT;
-		hp_sdc_rtc_freq = arg;
-                return 0;
-        }
-        case RTC_ALM_SET:       /* Store a time into the alarm */
-        {
-                /*
-                 * This expects a struct hp_sdc_rtc_time. Writing 0xff means
-                 * "don't care" or "match all" for PC timers.  The HP SDC
-		 * does not support that perk, but it could be emulated fairly
-		 * easily.  Only the tm_hour, tm_min and tm_sec are used.
-		 * We could do it with 10ms accuracy with the HP SDC, if the 
-		 * rtc interface left us a way to do that.
-                 */
-                struct hp_sdc_rtc_time alm_tm;
-
-                if (copy_from_user(&alm_tm, (struct hp_sdc_rtc_time*)arg,
-                                   sizeof(struct hp_sdc_rtc_time)))
-                       return -EFAULT;
-
-                if (alm_tm.tm_hour > 23) return -EINVAL;
-		if (alm_tm.tm_min  > 59) return -EINVAL;
-		if (alm_tm.tm_sec  > 59) return -EINVAL;  
-
-		ttime.sec = alm_tm.tm_hour * 3600 + 
-		  alm_tm.tm_min * 60 + alm_tm.tm_sec;
-		ttime.usec = 0;
-		if (hp_sdc_rtc_set_mt(&ttime)) return -EFAULT;
-                return 0;
-        }
-        case RTC_RD_TIME:       /* Read the time/date from RTC  */
-        {
-		if (hp_sdc_rtc_read_bbrtc(&wtime)) return -EFAULT;
-                break;
-        }
-        case RTC_SET_TIME:      /* Set the RTC */
-        {
-                struct rtc_time hp_sdc_rtc_tm;
-                unsigned char mon, day, hrs, min, sec, leap_yr;
-                unsigned int yrs;
-
-                if (!capable(CAP_SYS_TIME))
-                        return -EACCES;
-		if (copy_from_user(&hp_sdc_rtc_tm, (struct rtc_time *)arg,
-                                   sizeof(struct rtc_time)))
-                        return -EFAULT;
-
-                yrs = hp_sdc_rtc_tm.tm_year + 1900;
-                mon = hp_sdc_rtc_tm.tm_mon + 1;   /* tm_mon starts at zero */
-                day = hp_sdc_rtc_tm.tm_mday;
-                hrs = hp_sdc_rtc_tm.tm_hour;
-                min = hp_sdc_rtc_tm.tm_min;
-                sec = hp_sdc_rtc_tm.tm_sec;
-
-                if (yrs < 1970)
-                        return -EINVAL;
-
-                leap_yr = ((!(yrs % 4) && (yrs % 100)) || !(yrs % 400));
-
-                if ((mon > 12) || (day == 0))
-                        return -EINVAL;
-                if (day > (days_in_mo[mon] + ((mon == 2) && leap_yr)))
-                        return -EINVAL;
-		if ((hrs >= 24) || (min >= 60) || (sec >= 60))
-                        return -EINVAL;
-
-                if ((yrs -= eH) > 255)    /* They are unsigned */
-                        return -EINVAL;
-
-
-                return 0;
-        }
-        case RTC_EPOCH_READ:    /* Read the epoch.      */
-        {
-                return put_user (epoch, (unsigned long *)arg);
-        }
-        case RTC_EPOCH_SET:     /* Set the epoch.       */
-        {
-                /* 
-                 * There were no RTC clocks before 1900.
-                 */
-                if (arg < 1900)
-		  return -EINVAL;
-		if (!capable(CAP_SYS_TIME))
-		  return -EACCES;
-		
-                epoch = arg;
-                return 0;
-        }
-        default:
-                return -EINVAL;
-        }
-        return copy_to_user((void *)arg, &wtime, sizeof wtime) ? -EFAULT : 0;
-#endif
+	ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+	while ((n = ib_poll_cq(cq, ARRAY_SIZE(ch->wc), wc)) > 0) {
+		for (i = 0; i < n; i++) {
+			if (opcode_from_wr_id(wc[i].wr_id) == SRPT_RECV)
+				srpt_process_rcv_completion(cq, ch, &wc[i]);
+			else
+				srpt_process_send_completion(cq, ch, &wc[i]);
+		}
+	}
 }
 
-static long hp_sdc_rtc_unlocked_ioctl(struct file *file,
-				      unsigned int cmd, unsigned long arg)
+/**
+ * srpt_completion() - IB completion queue callback function.
+ *
+ * Notes:
+ * - It is guaranteed that a completion handler will never be invoked
+ *   concurrently on two different CPUs for the same completion queue. See also
+ *   Documentation/infiniband/core_locking.txt and the implementation of
+ *   handle_edge_irq() in kernel/irq/chip.c.
+ * - When threaded IRQs are enabled, completion handlers are invoked in thread
+ *   context instead of interrupt context.
+ */
+static void srpt_completion(struct ib_cq *cq, void *ctx)
 {
+	struct srpt_rdma_ch *ch = ctx;
+
+	wake_up_interruptible(&ch->wait_queue);
+}
+
+static int srpt_compl_thread(void *arg)
+{
+	struct srpt_rdma_ch *ch;
+
+	/* Hibernation / freezing of the SRPT kernel thread is not supported. */
+	current->flags |= PF_NOFREEZE;
+
+	ch = arg;
+	BUG_ON(!ch);
+	pr_info("Session %s: kernel thread %s (PID %d) started\n",
+		ch->sess_name, ch->thread->comm, current->pid);
+	while (!kthread_should_stop()) {
+		wait_event_interruptible(ch->wait_queue,
+			(srpt_process_completion(ch->cq, ch),
+			 kthread_should_stop()));
+	}
+	pr_info("Session %s: kernel thread %s (PID %d) stopped\n",
+		ch->sess_name, ch->thread->comm, current->pid);
+	return 0;
+}
+
+/**
+ * srpt_create_ch_ib() - Create receive and send completion queues.
+ */
+static int srpt_create_ch_ib(struct srpt_rdma_ch *ch)
+{
+	struct ib_qp_init_attr *qp_init;
+	struct srpt_port *sport = ch->sport;
+	struct srpt_device *sdev = sport->sdev;
+	u32 srp_sq_size = sport->port_attrib.srp_sq_size;
+	struct ib_cq_init_attr cq_attr = {};
 	int ret;
 
-	mutex_lock(&hp_sdc_rtc_mutex);
-	ret = hp_sdc_rtc_ioctl(file, cmd, arg);
-	mutex_unlock(&hp_sdc_rtc_mutex);
+	WARN_ON(ch->rq_size < 1);
 
+	ret = -ENOMEM;
+	qp_init = kzalloc(sizeof *qp_init, GFP_KERNEL);
+	if (!qp_init)
+		goto out;
+
+retry:
+	cq_attr.cqe = ch->rq_size + srp_sq_size;
+	ch->cq = ib_create_cq(sdev->device, srpt_completion, NULL, ch,
+			      &cq_attr);
+	if (IS_ERR(ch->cq)) {
+		ret = PTR_ERR(ch->cq);
+		pr_err("failed to create CQ cqe= %d ret= %d\n",
+		       ch->rq_size + srp_sq_size, ret);
+		goto out;
+	}
+
+	qp_init->qp_context = (void *)ch;
+	qp_init->event_handler
+		= (void(*)(struct ib_event *, void*))srpt_qp_event;
+	qp_init->send_cq = ch->cq;
+	qp_init->recv_cq = ch->cq;
+	qp_init->srq = sdev->srq;
+	qp_init->sq_sig_type = IB_SIGNAL_REQ_WR;
+	qp_init->qp_type = IB_QPT_RC;
+	qp_init->cap.max_send_wr = srp_sq_size;
+	qp_init->cap.max_send_sge = SRPT_DEF_SG_PER_WQE;
+
+	ch->qp = ib_create_qp(sdev->pd, qp_init);
+	if (IS_ERR(ch->qp)) {
+		ret = PTR_ERR(ch->qp);
+		if (ret == -ENOMEM) {
+			srp_sq_size /= 2;
+			if (srp_sq_size >= MIN_SRPT_SQ_SIZE) {
+				ib_destroy_cq(ch->cq);
+				goto retry;
+			}
+		}
+		pr_err("failed to create_qp ret= %d\n", ret);
+		goto err_destroy_cq;
+	}
+
+	atomic_set(&ch->sq_wr_avail, qp_init->cap.max_send_wr);
+
+	pr_debug("%s: max_cqe= %d max_sge= %d sq_size = %d cm_id= %p\n",
+		 __func__, ch->cq->cqe, qp_init->cap.max_send_sge,
+		 qp_init->cap.max_send_wr, ch->cm_id);
+
+	ret = srpt_init_ch_qp(ch, ch->qp);
+	if (ret)
+		goto err_destroy_qp;
+
+	init_waitqueue_head(&ch->wait_queue);
+
+	pr_debug("creating thread for session %s\n", ch->sess_name);
+
+	ch->thread = kthread_run(srpt_compl_thread, ch, "ib_srpt_compl");
+	if (IS_ERR(ch->thread)) {
+		pr_err("failed to create kernel thread %ld\n",
+		       PTR_ERR(ch->thread));
+		ch->thread = NULL;
+		goto err_destroy_qp;
+	}
+
+out:
+	kfree(qp_init);
 	return ret;
+
+err_destroy_qp:
+	ib_destroy_qp(ch->qp);
+err_destroy_cq:
+	ib_destroy_cq(ch->cq);
+	goto out;
 }
 
-
-static const struct file_operations hp_sdc_rtc_fops = {
-        .owner =		THIS_MODULE,
-        .llseek =		no_llseek,
-        .read =			hp_sdc_rtc_read,
-        .poll =			hp_sdc_rtc_poll,
-        .unlocked_ioctl =	hp_sdc_rtc_unlocked_ioctl,
-        .open =			hp_sdc_rtc_open,
-        .fasync =		hp_sdc_rtc_fasync,
-};
-
-static struct miscdevice hp_sdc_rtc_dev = {
-        .minor =	RTC_MINOR,
-        .name =		"rtc_HIL",
-        .fops =		&hp_sdc_rtc_fops
-};
-
-static int __init hp_sdc_rtc_init(void)
+static void srpt_destroy_ch_ib(struct srpt_rdma_ch *ch)
 {
+	if (ch->thread)
+		kthread_stop(ch->thread);
+
+	ib_destroy_qp(ch->qp);
+	ib_destroy_cq(ch->cq);
+}
+
+/**
+ * __srpt_close_ch() - Close an RDMA channel by setting the QP error state.
+ *
+ * Reset the QP and make sure all resources associated with the channel will
+ * be deallocated at an appropriate time.
+ *
+ * Note: The caller must hold ch->sport->sdev->spinlock.
+ */
+static void __srpt_close_ch(struct srpt_rdma_ch *ch)
+{
+	enum rdma_ch_state prev_state;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ch->spinlock, flags);
+	prev_state = ch->state;
+	switch (prev_state) {
+	case CH_CONNECTING:
+	case CH_LIVE:
+		ch->state = CH_DISCONNECTING;
+		break;
+	default:
+		break;
+	}
+	spin_unlock_irqrestore(&ch->spinlock, flags);
+
+	switch (prev_state) {
+	case CH_CONNECTING:
+		ib_send_cm_rej(ch->cm_id, IB_CM_REJ_NO_RESOURCES, NULL, 0,
+			       NULL, 0);
+		/* fall through */
+	case CH_LIVE:
+		if (ib_send_cm_dreq(ch->cm_id, NULL, 0) < 0)
+			pr_err("sending CM DREQ failed.\n");
+		break;
+	case CH_DISCONNECTING:
+		break;
+	case CH_DRAINING:
+	case CH_RELEASING:
+		break;
+	}
+}
+
+/**
+ * srpt_close_ch() - Close an RDMA channel.
+ */
+static void srpt_close_ch(struct srpt_rdma_ch *ch)
+{
+	struct srpt_device *sdev;
+
+	sdev = ch->sport->sdev;
+	spin_lock_irq(&sdev->spinlock);
+	__srpt_close_ch(ch);
+	spin_unlock_irq(&sdev->spinlock);
+}
+
+/**
+ * srpt_shutdown_session() - Whether or not a session may be shut down.
+ */
+static int srpt_shutdown_session(struct se_session *se_sess)
+{
+	struct srpt_rdma_ch *ch = se_sess->fabric_sess_ptr;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ch->spinlock, flags);
+	if (ch->in_shutdown) {
+		spin_unlock_irqrestore(&ch->spinlock, flags);
+		return true;
+	}
+
+	ch->in_shutdown = true;
+	target_sess_cmd_list_set_waiting(se_sess);
+	spin_unlock_irqrestore(&ch->spinlock, flags);
+
+	return true;
+}
+
+/**
+ * srpt_drain_channel() - Drain a channel by resetting the IB queue pair.
+ * @cm_id: Pointer to the CM ID of the channel to be drained.
+ *
+ * Note: Must be called from inside srpt_cm_handler to avoid a race between
+ * accessing sdev->spinlock and the call to kfree(sdev) in srpt_remove_one()
+ * (the caller of srpt_cm_handler holds the cm_id spinlock; srpt_remove_one()
+ * waits until all target sessions for the associated IB device have been
+ * unregistered and target session registration involves a call to
+ * ib_destroy_cm_id(), which locks the cm_id spinlock and hence waits until
+ * this function has finished).
+ */
+static void srpt_drain_channel(struct ib_cm_id *cm_id)
+{
+	struct srpt_device *sdev;
+	struct srpt_rdma_ch *ch;
 	int ret;
+	bool do_reset = false;
 
-#ifdef __mc68000__
-	if (!MACH_IS_HP300)
-		return -ENODEV;
-#endif
+	WARN_ON_ONCE(irqs_disabled());
 
-	sema_init(&i8042tregs, 1);
+	sdev = cm_id->context;
+	BUG_ON(!sdev);
+	spin_lock_irq(&sdev->spinlock);
+	list_for_each_entry(ch, &sdev->rch_list, list) {
+		if (ch->cm_id == cm_id) {
+			do_reset = srpt_test_and_set_ch_state(ch,
+					CH_CONNECTING, CH_DRAINING) ||
+				   srpt_test_and_set_ch_state(ch,
+					CH_LIVE, CH_DRAINING) ||
+				   srpt_test_and_set_ch_state(ch,
+					CH_DISCONNECTING, CH_DRAINING);
+			break;
+		}
+	}
+	spin_unlock_irq(&sdev->spinlock);
 
-	if ((ret = hp_sdc_request_timer_irq(&hp_sdc_rtc_isr)))
-		return ret;
-	if (misc_register(&hp_sdc_rtc_dev) != 0)
-		printk(KERN_INFO "Could not register misc. dev for i8042 rtc\n");
+	if (do_reset) {
+		if (ch->sess)
+			srpt_shutdown_session(ch->sess);
 
-        proc_create("driver/rtc", 0, NULL, &hp_sdc_rtc_proc_fops);
-
-	printk(KERN_INFO "HP i8042 SDC + MSM-58321 RTC support loaded "
-			 "(RTC v " RTC_VERSION ")\n");
-
-	return 0;
+		ret = srpt_ch_qp_err(ch);
+		if (ret < 0)
+			pr_err("Setting queue pair in error state"
+			       " failed: %d\n", ret);
+	}
 }
 
-static void __exit hp_sdc_rtc_exit(void)
+/**
+ * srpt_find_channel() - Look up an RDMA channel.
+ * @cm_id: Pointer to the CM ID of the channel to be looked up.
+ *
+ * Return NULL if no matching RDMA channel has been found.
+ */
+static struct srpt_rdma_ch *srpt_find_channel(struct srpt_device *sdev,
+					      struct ib_cm_id *cm_id)
 {
-	remove_proc_entry ("driver/rtc", NULL);
-        misc_deregister(&hp_sdc_rtc_dev);
-	hp_sdc_release_timer_irq(hp_sdc_rtc_isr);
-        printk(KERN_INFO "HP i8042 SDC + MSM-58321 RTC support unloaded\n");
+	struct srpt_rdma_ch *ch;
+	bool found;
+
+	WARN_ON_ONCE(irqs_disabled());
+	BUG_ON(!sdev);
+
+	found = false;
+	spin_lock_irq(&sdev->spinlock);
+	list_for_each_entry(ch, &sdev->rch_list, list) {
+		if (ch->cm_id == cm_id) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irq(&sdev->spinlock);
+
+	return found ? ch : NULL;
 }
 
-module_init(hp_sdc_rtc_init);
-module_exit(hp_sdc_rtc_exit);
+/**
+ * srpt_release_channel() - Release channel resources.
+ *
+ * Schedules the actual release because:
+ * - Calling the ib_destroy_cm_id() call from inside an IB CM callback would
+ *   trigger a deadlock.
+ * - It is not safe to call TCM transport_* functions from interrupt context.
+ */
+static void srpt_release_channel(struct srpt_rdma_ch *ch)
+{
+	schedule_work(&ch->release_work);
+}
+
+static void srpt_release_channel_work(struct work_struct *w)
+{
+	struct srpt_rdma_ch *ch;
+	struct srpt_device *sdev;
+	struct se_session *se_sess;
+
+	ch = container_of(w, struct srpt_rdma_ch, release_work);
+	pr_debug("ch = %p; ch->sess = %p; release_done = %p\n", ch, ch->sess,
+		 ch->release_done);
+
+	sdev = ch->sport->sdev;
+	BUG_ON(!sdev);
+
+	se_sess = ch->sess;
+	BUG_ON(!se_sess);
+
+	target_wait_for_sess_cmds(se_sess);
+
+	transport_deregister_session_configfs(se_sess);
+	transport_deregister_session(se_sess);
+	ch->sess = NULL;
+
+	ib_destroy_cm_id(ch->cm_id);
+
+	srpt_destroy_ch_ib(ch);
+
+	srpt_free_ioctx_ring((struct srpt_ioctx **)ch->ioctx_ring,
+			     ch->sport->sdev, ch->rq_size,
+			     ch->rsp_size, DMA_TO_DEVICE);
+
+	spin_lock_irq(&sdev->spinlock);
+	list_del(&ch->list);
+	spin_unlock_irq(&sdev->spinlock);
+
+	if (ch->release_done)
+		complete(ch->release_done);
+
+	wake_up(&sdev->ch_releaseQ);
+
+	kfree(ch);
+}
+
+static struct srpt_node_acl *__srpt_lookup_acl(struct srpt_port *sport,
+					       u8 i_port_id[16])
+{
+	struct srpt_node_acl *nacl;
+
+	list_for_each_entry(nacl, &sport->port_acl_list, list)
+		if (memcmp(nacl->i_port_id, i_port_id,
+			   sizeof(nacl->i_port_id)) == 0)
+			return nacl;
+
+	return NULL;
+}
+
+static struct srpt_node_acl *srpt_lookup_acl(struct srpt_port *sport,
+					     u8 i_port_id[16])
+{
+	struct srpt_node_acl *nacl;
+
+	spin_lock_irq(&sport->port_acl_lock);
+	nacl = __srpt_lookup_acl(sport, i_port_id);
+	spin_unlock_irq(&sport->port_acl_lock);
+
+	return nacl;
+}
+
+/**
+ * srpt_cm_req_recv() - Process the event IB_CM_REQ_RECEIVED.
+ *
+ * Ownership of the cm_id is transferred to the target session if this
+ * functions returns zero. Otherwise the caller remains the owner of cm_id.
+ */
+static int srpt_cm_req_recv(struct ib_cm_id *cm_id,
+			    struct ib_cm_req_event_param *param,
+			    void *private_data)
+{
+	struct srpt_device *sdev = cm_id->context;
+	struct srpt_port *sport = &sdev->port[param->port - 1];
+	struct srp_login_req *req;
+	struct srp_login_rsp *rsp;
+	struct srp_login_rej *rej;
+	struct ib_cm_rep_param *rep_param;
+	struct srpt_rdma_ch *ch, *tmp_ch;
+	struct srpt_node_acl *nacl;
+	u32 it_iu_len;
+	int i;
+	int ret = 0;
+
+	WARN_ON_ONCE(irqs_disabled());
+
+	if (WARN_ON(!sdev || !private_data))
+		return -EINVAL;
+
+	req = (struct srp_login_req *)private_data;
+
+	it_iu_len = be32_to_cpu(req->req_it_iu_len);
+
+	pr_info("Received SRP_LOGIN_REQ with i_port_id 0x%llx:0x%llx,"
+		" t_port_id 0x%llx:0x%llx and it_iu_len %d on port %d"
+		" (guid=0x%llx:0x%llx)\n",
+		be64_to_cpu(*(__be64 *)&req->initiator_port_id[0]),
+		be64_to_cpu(*(__be64 *)&req->initiator_port_id[8]),
+		be64_to_cpu(*(__be64 *)&req->target_port_id[0]),
+		be64_to_cpu(*(__be64 *)&req->target_port_id[8]),
+		it_iu_len,
+		param->port,
+		be64_to_cpu(*(__be64 *)&sdev->port[param->port - 1].gid.raw[0]),
+		be64_to_cpu(*(__be64 *)&sdev->port[param->port - 1].gid.raw[8]));
+
+	rsp = kzalloc(sizeof *rsp, GFP_KERNEL);
+	rej = kzalloc(sizeof *rej, GFP_KERNEL);
+	rep_param = kzalloc(sizeof *rep_param, GFP_KERNEL);
+
+	if (!rsp || !rej || !rep_param) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (it_iu_len > srp_max_req_size || it_iu_len < 64) {
+		rej->reason = cpu_to_be32(
+			      SRP_LOGIN_REJ_REQ_IT_IU_LENGTH_TOO_LARGE);
+		ret = -EINVAL;
+		pr_err("rejected SRP_LOGIN_REQ because its"
+		       " length (%d bytes) is out of range (%d .. %d)\n",
+		       it_iu_len, 64, srp_max_req_size);
+		goto reject;
+	}
+
+	if (!sport->enabled) {
+		rej->reason = cpu_to_be32(
+			      SRP_LOGIN_REJ_INSUFFICIENT_RESOURCES);
+		ret = -EINVAL;
+		pr_err("rejected SRP_LOGIN_REQ because the target port"
+		       " has not yet been enabled\n");
+		goto reject;
+	}
+
+	if ((req->req_flags & SRP_MTCH_ACTION) == SRP_MULTICHAN_SINGLE) {
+		rsp->rsp_flags = SRP_LOGIN_RSP_MULTICHAN_NO_CHAN;
+
+		spin_lock_irq(&sdev->spinlock);
+
+		list_for_each_entry_safe(ch, tmp_ch, &sdev->rch_list, list) {
+			if (!memcmp(ch->i_port_id, req->initiator_port_id, 16)
+			    && !memcmp(ch->t_port_id, req->target_port_id, 16)
+			    && param->port == ch->sport->port
+			    && param->listen_id == ch->sport->sdev->cm_id
+			    && ch->cm_id) {
+				enum rdma_ch_state ch_state;
+
+				ch_state = srpt_get_ch_state(ch);
+				if (ch_state != CH_CONNECTING
+				    && ch_state != CH_LIVE)
+					continue;
+
+				/* found an existing channel */
+				pr_debug("Found existing channel %s"
+					 " cm_id= %p state= %d\n",
+					 ch->sess_name, ch->cm_id, ch_state);
+
+				__srpt_close_ch(ch);
+
+				rsp->rsp_flags =
+					SRP_LOGIN_RSP_MULTICHAN_TERMINATED;
+			}
+		}
+
+		spin_unlock_irq(&sdev->spinlock);
+
+	} else
+		rsp->rsp_flags = SRP_LOGIN_RSP_MULTICHAN_MAINTAINED;
+
+	if (*(__be64 *)req->target_port_id != cpu_to_be64(srpt_service_guid)
+	    || *(__be64 *)(req->target_port_id + 8) !=
+	       cpu_to_be64(srpt_service_guid)) {
+		rej->reason = cpu_to_be32(
+			      SRP_LOGIN_REJ_UNABLE_ASSOCIATE_CHANNEL);
+		ret = -ENOMEM;
+		pr_err("rejected SRP_LOG

@@ -1,408 +1,174 @@
-/*
- * Allwinner A13 SoCs pinctrl driver.
- *
- * Copyright (C) 2014 Maxime Ripard
- *
- * Maxime Ripard <maxime.ripard@free-electrons.com>
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2.  This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
- */
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/pinctrl/pinctrl.h>
-
-#include "pinctrl-sunxi.h"
-
-static const struct sunxi_desc_pin sun5i_a13_pins[] = {
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c0")),		/* SCK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c0")),		/* SDA */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "pwm"),
-		  SUNXI_FUNCTION_IRQ(0x6, 16)),		/* EINT16 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "ir0"),		/* TX */
-		  SUNXI_FUNCTION_IRQ(0x6, 17)),		/* EINT17 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "ir0"),		/* RX */
-		  SUNXI_FUNCTION_IRQ(0x6, 18)),		/* EINT18 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi2"),		/* CS1 */
-		  SUNXI_FUNCTION_IRQ(0x6, 24)),		/* EINT24 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 15),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c1")),		/* SCK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 16),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c1")),		/* SDA */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 17),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c2")),		/* SCK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 18),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c2")),		/* SDA */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NWE */
-		  SUNXI_FUNCTION(0x3, "spi0")),		/* MOSI */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NALE */
-		  SUNXI_FUNCTION(0x3, "spi0")),		/* MISO */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NCLE */
-		  SUNXI_FUNCTION(0x3, "spi0")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NCE1 */
-		  SUNXI_FUNCTION(0x3, "spi0")),		/* CS0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0")),	/* NCE0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0")),	/* NRE */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NRB0 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* CMD */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NRB1 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 8),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQ0 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 9),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQ1 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQ2 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 11),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQ3 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 12),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQ4 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D4 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 13),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQ5 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D5 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 14),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQ6 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D6 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 15),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQ7 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D7 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 19),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* NDQS */
-		  SUNXI_FUNCTION(0x4, "uart3")),	/* RTS */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D4 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D5 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D6 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D7 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D10 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 11),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D11 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 12),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D12 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 13),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D13 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 14),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D14 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 15),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D15 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 18),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D18 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 19),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D19 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 20),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D20 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 21),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D21 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 22),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D22 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 23),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D23 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 24),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 25),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* DE */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 26),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* HSYNC */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 27),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* VSYNC */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* PCLK */
-		  SUNXI_FUNCTION(0x4, "spi2"),		/* CS0 */
-		  SUNXI_FUNCTION_IRQ(0x6, 14)),		/* EINT14 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* MCLK */
-		  SUNXI_FUNCTION(0x4, "spi2"),		/* CLK */
-		  SUNXI_FUNCTION_IRQ(0x6, 15)),		/* EINT15 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* HSYNC */
-		  SUNXI_FUNCTION(0x4, "spi2")),		/* MOSI */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* VSYNC */
-		  SUNXI_FUNCTION(0x4, "spi2")),		/* MISO */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* D0 */
-		  SUNXI_FUNCTION(0x4, "mmc2")),		/* D0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* D1 */
-		  SUNXI_FUNCTION(0x4, "mmc2")),		/* D1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* D2 */
-		  SUNXI_FUNCTION(0x4, "mmc2")),		/* D2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* D3 */
-		  SUNXI_FUNCTION(0x4, "mmc2")),		/* D3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 8),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* D4 */
-		  SUNXI_FUNCTION(0x4, "mmc2")),		/* CMD */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 9),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* D5 */
-		  SUNXI_FUNCTION(0x4, "mmc2")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* D6 */
-		  SUNXI_FUNCTION(0x4, "uart1")),	/* TX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 11),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "csi0"),		/* D7 */
-		  SUNXI_FUNCTION(0x4, "uart1")),	/* RX */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0")),		/* D1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0")),		/* D0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0")),		/* CMD */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0")),		/* D3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0")),		/* D2 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION_IRQ(0x6, 0)),		/* EINT0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION_IRQ(0x6, 1)),		/* EINT1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION_IRQ(0x6, 2)),		/* EINT2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc1"),		/* CMD */
-		  SUNXI_FUNCTION(0x4, "uart1"),		/* TX */
-		  SUNXI_FUNCTION_IRQ(0x6, 3)),		/* EINT3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc1"),		/* CLK */
-		  SUNXI_FUNCTION(0x4, "uart1"),		/* RX */
-		  SUNXI_FUNCTION_IRQ(0x6, 4)),		/* EINT4 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 9),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi1"),		/* CS0 */
-		  SUNXI_FUNCTION(0x3, "uart3"),		/* TX */
-		  SUNXI_FUNCTION_IRQ(0x6, 9)),		/* EINT9 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi1"),		/* CLK */
-		  SUNXI_FUNCTION(0x3, "uart3"),		/* RX */
-		  SUNXI_FUNCTION_IRQ(0x6, 10)),		/* EINT10 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 11),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi1"),		/* MOSI */
-		  SUNXI_FUNCTION(0x3, "uart3"),		/* CTS */
-		  SUNXI_FUNCTION_IRQ(0x6, 11)),		/* EINT11 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 12),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi1"),		/* MISO */
-		  SUNXI_FUNCTION(0x3, "uart3"),		/* RTS */
-		  SUNXI_FUNCTION_IRQ(0x6, 12)),		/* EINT12 */
-};
-
-static const struct sunxi_pinctrl_desc sun5i_a13_pinctrl_data = {
-	.pins = sun5i_a13_pins,
-	.npins = ARRAY_SIZE(sun5i_a13_pins),
-	.irq_banks = 1,
-};
-
-static int sun5i_a13_pinctrl_probe(struct platform_device *pdev)
-{
-	return sunxi_pinctrl_init(pdev,
-				  &sun5i_a13_pinctrl_data);
-}
-
-static const struct of_device_id sun5i_a13_pinctrl_match[] = {
-	{ .compatible = "allwinner,sun5i-a13-pinctrl", },
-	{}
-};
-MODULE_DEVICE_TABLE(of, sun5i_a13_pinctrl_match);
-
-static struct platform_driver sun5i_a13_pinctrl_driver = {
-	.probe	= sun5i_a13_pinctrl_probe,
-	.driver	= {
-		.name		= "sun5i-a13-pinctrl",
-		.of_match_table	= sun5i_a13_pinctrl_match,
-	},
-};
-module_platform_driver(sun5i_a13_pinctrl_driver);
-
-MODULE_AUTHOR("Maxime Ripard <maxime.ripard@free-electrons.com");
-MODULE_DESCRIPTION("Allwinner A13 pinctrl driver");
-MODULE_LICENSE("GPL");
+                       0x1749
+#define mmBPHYC_PLL2_PPLL_DIV_UPDATE_DEBUG                                      0x1773
+#define mmPPLL_STATUS_DEBUG                                                     0x1720
+#define mmBPHYC_PLL0_PPLL_STATUS_DEBUG                                          0x1720
+#define mmBPHYC_PLL1_PPLL_STATUS_DEBUG                                          0x174a
+#define mmBPHYC_PLL2_PPLL_STATUS_DEBUG                                          0x1774
+#define mmPPLL_DEBUG_MUX_CNTL                                                   0x1721
+#define mmBPHYC_PLL0_PPLL_DEBUG_MUX_CNTL                                        0x1721
+#define mmBPHYC_PLL1_PPLL_DEBUG_MUX_CNTL                                        0x174b
+#define mmBPHYC_PLL2_PPLL_DEBUG_MUX_CNTL                                        0x1775
+#define mmPPLL_SPARE0                                                           0x1722
+#define mmBPHYC_PLL0_PPLL_SPARE0                                                0x1722
+#define mmBPHYC_PLL1_PPLL_SPARE0                                                0x174c
+#define mmBPHYC_PLL2_PPLL_SPARE0                                                0x1776
+#define mmPPLL_SPARE1                                                           0x1723
+#define mmBPHYC_PLL0_PPLL_SPARE1                                                0x1723
+#define mmBPHYC_PLL1_PPLL_SPARE1                                                0x174d
+#define mmBPHYC_PLL2_PPLL_SPARE1                                                0x1777
+#define mmUNIPHY_TX_CONTROL1                                                    0x48c0
+#define mmBPHYC_UNIPHY0_UNIPHY_TX_CONTROL1                                      0x48c0
+#define mmBPHYC_UNIPHY1_UNIPHY_TX_CONTROL1                                      0x48e0
+#define mmBPHYC_UNIPHY2_UNIPHY_TX_CONTROL1                                      0x4900
+#define mmBPHYC_UNIPHY3_UNIPHY_TX_CONTROL1                                      0x4920
+#define mmBPHYC_UNIPHY4_UNIPHY_TX_CONTROL1                                      0x4940
+#define mmBPHYC_UNIPHY5_UNIPHY_TX_CONTROL1                                      0x4960
+#define mmBPHYC_UNIPHY6_UNIPHY_TX_CONTROL1                                      0x4980
+#define mmBPHYC_UNIPHY7_UNIPHY_TX_CONTROL1                                      0x49c0
+#define mmBPHYC_UNIPHY8_UNIPHY_TX_CONTROL1                                      0x49e0
+#define mmUNIPHY_TX_CONTROL2                                                    0x48c1
+#define mmBPHYC_UNIPHY0_UNIPHY_TX_CONTROL2                                      0x48c1
+#define mmBPHYC_UNIPHY1_UNIPHY_TX_CONTROL2                                      0x48e1
+#define mmBPHYC_UNIPHY2_UNIPHY_TX_CONTROL2                                      0x4901
+#define mmBPHYC_UNIPHY3_UNIPHY_TX_CONTROL2                                      0x4921
+#define mmBPHYC_UNIPHY4_UNIPHY_TX_CONTROL2                                      0x4941
+#define mmBPHYC_UNIPHY5_UNIPHY_TX_CONTROL2                                      0x4961
+#define mmBPHYC_UNIPHY6_UNIPHY_TX_CONTROL2                                      0x4981
+#define mmBPHYC_UNIPHY7_UNIPHY_TX_CONTROL2                                      0x49c1
+#define mmBPHYC_UNIPHY8_UNIPHY_TX_CONTROL2                                      0x49e1
+#define mmUNIPHY_TX_CONTROL3                                                    0x48c2
+#define mmBPHYC_UNIPHY0_UNIPHY_TX_CONTROL3                                      0x48c2
+#define mmBPHYC_UNIPHY1_UNIPHY_TX_CONTROL3                                      0x48e2
+#define mmBPHYC_UNIPHY2_UNIPHY_TX_CONTROL3                                      0x4902
+#define mmBPHYC_UNIPHY3_UNIPHY_TX_CONTROL3                                      0x4922
+#define mmBPHYC_UNIPHY4_UNIPHY_TX_CONTROL3                                      0x4942
+#define mmBPHYC_UNIPHY5_UNIPHY_TX_CONTROL3                                      0x4962
+#define mmBPHYC_UNIPHY6_UNIPHY_TX_CONTROL3                                      0x4982
+#define mmBPHYC_UNIPHY7_UNIPHY_TX_CONTROL3                                      0x49c2
+#define mmBPHYC_UNIPHY8_UNIPHY_TX_CONTROL3                                      0x49e2
+#define mmUNIPHY_TX_CONTROL4                                                    0x48c3
+#define mmBPHYC_UNIPHY0_UNIPHY_TX_CONTROL4                                      0x48c3
+#define mmBPHYC_UNIPHY1_UNIPHY_TX_CONTROL4                                      0x48e3
+#define mmBPHYC_UNIPHY2_UNIPHY_TX_CONTROL4                                      0x4903
+#define mmBPHYC_UNIPHY3_UNIPHY_TX_CONTROL4                                      0x4923
+#define mmBPHYC_UNIPHY4_UNIPHY_TX_CONTROL4                                      0x4943
+#define mmBPHYC_UNIPHY5_UNIPHY_TX_CONTROL4                                      0x4963
+#define mmBPHYC_UNIPHY6_UNIPHY_TX_CONTROL4                                      0x4983
+#define mmBPHYC_UNIPHY7_UNIPHY_TX_CONTROL4                                      0x49c3
+#define mmBPHYC_UNIPHY8_UNIPHY_TX_CONTROL4                                      0x49e3
+#define mmUNIPHY_POWER_CONTROL                                                  0x48c4
+#define mmBPHYC_UNIPHY0_UNIPHY_POWER_CONTROL                                    0x48c4
+#define mmBPHYC_UNIPHY1_UNIPHY_POWER_CONTROL                                    0x48e4
+#define mmBPHYC_UNIPHY2_UNIPHY_POWER_CONTROL                                    0x4904
+#define mmBPHYC_UNIPHY3_UNIPHY_POWER_CONTROL                                    0x4924
+#define mmBPHYC_UNIPHY4_UNIPHY_POWER_CONTROL                                    0x4944
+#define mmBPHYC_UNIPHY5_UNIPHY_POWER_CONTROL                                    0x4964
+#define mmBPHYC_UNIPHY6_UNIPHY_POWER_CONTROL                                    0x4984
+#define mmBPHYC_UNIPHY7_UNIPHY_POWER_CONTROL                                    0x49c4
+#define mmBPHYC_UNIPHY8_UNIPHY_POWER_CONTROL                                    0x49e4
+#define mmUNIPHY_PLL_FBDIV                                                      0x48c5
+#define mmBPHYC_UNIPHY0_UNIPHY_PLL_FBDIV                                        0x48c5
+#define mmBPHYC_UNIPHY1_UNIPHY_PLL_FBDIV                                        0x48e5
+#define mmBPHYC_UNIPHY2_UNIPHY_PLL_FBDIV                                        0x4905
+#define mmBPHYC_UNIPHY3_UNIPHY_PLL_FBDIV                                        0x4925
+#define mmBPHYC_UNIPHY4_UNIPHY_PLL_FBDIV                                        0x4945
+#define mmBPHYC_UNIPHY5_UNIPHY_PLL_FBDIV                                        0x4965
+#define mmBPHYC_UNIPHY6_UNIPHY_PLL_FBDIV                                        0x4985
+#define mmBPHYC_UNIPHY7_UNIPHY_PLL_FBDIV                                        0x49c5
+#define mmBPHYC_UNIPHY8_UNIPHY_PLL_FBDIV                                        0x49e5
+#define mmUNIPHY_PLL_CONTROL1                                                   0x48c6
+#define mmBPHYC_UNIPHY0_UNIPHY_PLL_CONTROL1                                     0x48c6
+#define mmBPHYC_UNIPHY1_UNIPHY_PLL_CONTROL1                                     0x48e6
+#define mmBPHYC_UNIPHY2_UNIPHY_PLL_CONTROL1                                     0x4906
+#define mmBPHYC_UNIPHY3_UNIPHY_PLL_CONTROL1                                     0x4926
+#define mmBPHYC_UNIPHY4_UNIPHY_PLL_CONTROL1                                     0x4946
+#define mmBPHYC_UNIPHY5_UNIPHY_PLL_CONTROL1                                     0x4966
+#define mmBPHYC_UNIPHY6_UNIPHY_PLL_CONTROL1                                     0x4986
+#define mmBPHYC_UNIPHY7_UNIPHY_PLL_CONTROL1                                     0x49c6
+#define mmBPHYC_UNIPHY8_UNIPHY_PLL_CONTROL1                                     0x49e6
+#define mmUNIPHY_PLL_CONTROL2                                                   0x48c7
+#define mmBPHYC_UNIPHY0_UNIPHY_PLL_CONTROL2                                     0x48c7
+#define mmBPHYC_UNIPHY1_UNIPHY_PLL_CONTROL2                                     0x48e7
+#define mmBPHYC_UNIPHY2_UNIPHY_PLL_CONTROL2                                     0x4907
+#define mmBPHYC_UNIPHY3_UNIPHY_PLL_CONTROL2                                     0x4927
+#define mmBPHYC_UNIPHY4_UNIPHY_PLL_CONTROL2                                     0x4947
+#define mmBPHYC_UNIPHY5_UNIPHY_PLL_CONTROL2                                     0x4967
+#define mmBPHYC_UNIPHY6_UNIPHY_PLL_CONTROL2                                     0x4987
+#define mmBPHYC_UNIPHY7_UNIPHY_PLL_CONTROL2                                     0x49c7
+#define mmBPHYC_UNIPHY8_UNIPHY_PLL_CONTROL2                                     0x49e7
+#define mmUNIPHY_PLL_SS_STEP_SIZE                                               0x48c8
+#define mmBPHYC_UNIPHY0_UNIPHY_PLL_SS_STEP_SIZE                                 0x48c8
+#define mmBPHYC_UNIPHY1_UNIPHY_PLL_SS_STEP_SIZE                                 0x48e8
+#define mmBPHYC_UNIPHY2_UNIPHY_PLL_SS_STEP_SIZE                                 0x4908
+#define mmBPHYC_UNIPHY3_UNIPHY_PLL_SS_STEP_SIZE                                 0x4928
+#define mmBPHYC_UNIPHY4_UNIPHY_PLL_SS_STEP_SIZE                                 0x4948
+#define mmBPHYC_UNIPHY5_UNIPHY_PLL_SS_STEP_SIZE                                 0x4968
+#define mmBPHYC_UNIPHY6_UNIPHY_PLL_SS_STEP_SIZE                                 0x4988
+#define mmBPHYC_UNIPHY7_UNIPHY_PLL_SS_STEP_SIZE                                 0x49c8
+#define mmBPHYC_UNIPHY8_UNIPHY_PLL_SS_STEP_SIZE                                 0x49e8
+#define mmUNIPHY_PLL_SS_CNTL                                                    0x48c9
+#define mmBPHYC_UNIPHY0_UNIPHY_PLL_SS_CNTL                                      0x48c9
+#define mmBPHYC_UNIPHY1_UNIPHY_PLL_SS_CNTL                                      0x48e9
+#define mmBPHYC_UNIPHY2_UNIPHY_PLL_SS_CNTL                                      0x4909
+#define mmBPHYC_UNIPHY3_UNIPHY_PLL_SS_CNTL                                      0x4929
+#define mmBPHYC_UNIPHY4_UNIPHY_PLL_SS_CNTL                                      0x4949
+#define mmBPHYC_UNIPHY5_UNIPHY_PLL_SS_CNTL                                      0x4969
+#define mmBPHYC_UNIPHY6_UNIPHY_PLL_SS_CNTL                                      0x4989
+#define mmBPHYC_UNIPHY7_UNIPHY_PLL_SS_CNTL                                      0x49c9
+#define mmBPHYC_UNIPHY8_UNIPHY_PLL_SS_CNTL                                      0x49e9
+#define mmUNIPHY_DATA_SYNCHRONIZATION                                           0x48ca
+#define mmBPHYC_UNIPHY0_UNIPHY_DATA_SYNCHRONIZATION                             0x48ca
+#define mmBPHYC_UNIPHY1_UNIPHY_DATA_SYNCHRONIZATION                             0x48ea
+#define mmBPHYC_UNIPHY2_UNIPHY_DATA_SYNCHRONIZATION                             0x490a
+#define mmBPHYC_UNIPHY3_UNIPHY_DATA_SYNCHRONIZATION                             0x492a
+#define mmBPHYC_UNIPHY4_UNIPHY_DATA_SYNCHRONIZATION                             0x494a
+#define mmBPHYC_UNIPHY5_UNIPHY_DATA_SYNCHRONIZATION                             0x496a
+#define mmBPHYC_UNIPHY6_UNIPHY_DATA_SYNCHRONIZATION                             0x498a
+#define mmBPHYC_UNIPHY7_UNIPHY_DATA_SYNCHRONIZATION                             0x49ca
+#define mmBPHYC_UNIPHY8_UNIPHY_DATA_SYNCHRONIZATION                             0x49ea
+#define mmUNIPHY_REG_TEST_OUTPUT                                                0x48cb
+#define mmBPHYC_UNIPHY0_UNIPHY_REG_TEST_OUTPUT                                  0x48cb
+#define mmBPHYC_UNIPHY1_UNIPHY_REG_TEST_OUTPUT                                  0x48eb
+#define mmBPHYC_UNIPHY2_UNIPHY_REG_TEST_OUTPUT                                  0x490b
+#define mmBPHYC_UNIPHY3_UNIPHY_REG_TEST_OUTPUT                                  0x492b
+#define mmBPHYC_UNIPHY4_UNIPHY_REG_TEST_OUTPUT                                  0x494b
+#define mmBPHYC_UNIPHY5_UNIPHY_REG_TEST_OUTPUT                                  0x496b
+#define mmBPHYC_UNIPHY6_UNIPHY_REG_TEST_OUTPUT                                  0x498b
+#define mmBPHYC_UNIPHY7_UNIPHY_REG_TEST_OUTPUT                                  0x49cb
+#define mmBPHYC_UNIPHY8_UNIPHY_REG_TEST_OUTPUT                                  0x49eb
+#define mmUNIPHY_ANG_BIST_CNTL                                                  0x48cc
+#define mmBPHYC_UNIPHY0_UNIPHY_ANG_BIST_CNTL                                    0x48cc
+#define mmBPHYC_UNIPHY1_UNIPHY_ANG_BIST_CNTL                                    0x48ec
+#define mmBPHYC_UNIPHY2_UNIPHY_ANG_BIST_CNTL                                    0x490c
+#define mmBPHYC_UNIPHY3_UNIPHY_ANG_BIST_CNTL                                    0x492c
+#define mmBPHYC_UNIPHY4_UNIPHY_ANG_BIST_CNTL                                    0x494c
+#define mmBPHYC_UNIPHY5_UNIPHY_ANG_BIST_CNTL                                    0x496c
+#define mmBPHYC_UNIPHY6_UNIPHY_ANG_BIST_CNTL                                    0x498c
+#define mmBPHYC_UNIPHY7_UNIPHY_ANG_BIST_CNTL                                    0x49cc
+#define mmBPHYC_UNIPHY8_UNIPHY_ANG_BIST_CNTL                                    0x49ec
+#define mmUNIPHY_REG_TEST_OUTPUT2                                               0x48cd
+#define mmBPHYC_UNIPHY0_UNIPHY_REG_TEST_OUTPUT2                                 0x48cd
+#define mmBPHYC_UNIPHY1_UNIPHY_REG_TEST_OUTPUT2                                 0x48ed
+#define mmBPHYC_UNIPHY2_UNIPHY_REG_TEST_OUTPUT2                                 0x490d
+#define mmBPHYC_UNIPHY3_UNIPHY_REG_TEST_OUTPUT2                                 0x492d
+#define mmBPHYC_UNIPHY4_UNIPHY_REG_TEST_OUTPUT2                                 0x494d
+#define mmBPHYC_UNIPHY5_UNIPHY_REG_TEST_OUTPUT2                                 0x496d
+#define mmBPHYC_UNIPHY6_UNIPHY_REG_TEST_OUTPUT2                                 0x498d
+#define mmBPHYC_UNIPHY7_UNIPHY_REG_TEST_OUTPUT2                                 0x49cd
+#define mmBPHYC_UNIPHY8_UNIPHY_REG_TEST_OUTPUT2                                 0x49ed
+#define mmUNIPHY_TMDP_REG0                                                      0x48ce
+#define mmBPHYC_UNIPHY0_UNIPHY_TMDP_REG0                                        0x48ce
+#define mmBPHYC_UNIPHY1_UNIPHY_TMDP_REG0                                        0x48ee
+#define mmBPHYC_UNIPHY2_UNIPHY_TMDP_REG0                                        0x490e
+#define mmBPHYC_UNIPHY3_UNIPHY_TMDP_REG0                                        0x492e
+#define mmBPHYC_UNIPHY4_UNIPHY_TMDP_REG0                                        0x494e
+#define mmBPHYC_UNIPHY5_UNIPHY_TMDP_REG0                                        0x496e
+#define mmBPHYC_UNIPHY6_UNIPHY_TMDP_REG0                                        0x498e
+#define mmBPHYC_UNIPHY7_UNIPHY_TMDP_REG0                                        0x49ce
+#define mmBPHYC_UNIPHY8_UNIPHY_TMDP_REG0                                        0x49ee
+#define mmUNIPHY_TMDP_REG1                                                      0x48cf
+#define mmBPHYC_UNIPHY0_UNIPHY_TMDP_REG1                                        0x48cf
+#define mmBPHYC_UNIPHY1_UNIPHY_TMDP_REG1                                        0x48ef
+#define mmBPHYC_UNIPHY2_UNIPHY_TMDP_REG1                                        0x490f
+#define mmBPHYC_UNIPHY3_UNIPHY_TMDP_REG1                                        0x492f
+#define mmBPHYC_UNIPHY4_UNIPHY_TMDP_REG1                                        0x49

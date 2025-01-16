@@ -1,185 +1,73 @@
-/*
- * MIPS CI13320A EHCI Host Controller driver
- * Based on "ehci-au1xxx.c" by K.Boge <karsten.boge@amd.com>
- *
- * Copyright (C) 2012 MIPS Technologies, Inc.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2 of the License, or (at your
- * option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software Foundation,
- * Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/err.h>
-#include <linux/platform_device.h>
-
-static int ehci_sead3_setup(struct usb_hcd *hcd)
-{
-	int ret;
-	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
-
-	ehci->caps = hcd->regs + 0x100;
-
-#ifdef __BIG_ENDIAN
-	ehci->big_endian_mmio = 1;
-	ehci->big_endian_desc = 1;
-#endif
-
-	ret = ehci_setup(hcd);
-	if (ret)
-		return ret;
-
-	ehci->need_io_watchdog = 0;
-
-	/* Set burst length to 16 words. */
-	ehci_writel(ehci, 0x1010, &ehci->regs->reserved1[1]);
-
-	return ret;
-}
-
-const struct hc_driver ehci_sead3_hc_driver = {
-	.description		= hcd_name,
-	.product_desc		= "SEAD-3 EHCI",
-	.hcd_priv_size		= sizeof(struct ehci_hcd),
-
-	/*
-	 * generic hardware linkage
-	 */
-	.irq			= ehci_irq,
-	.flags			= HCD_MEMORY | HCD_USB2 | HCD_BH,
-
-	/*
-	 * basic lifecycle operations
-	 *
-	 */
-	.reset			= ehci_sead3_setup,
-	.start			= ehci_run,
-	.stop			= ehci_stop,
-	.shutdown		= ehci_shutdown,
-
-	/*
-	 * managing i/o requests and associated device resources
-	 */
-	.urb_enqueue		= ehci_urb_enqueue,
-	.urb_dequeue		= ehci_urb_dequeue,
-	.endpoint_disable	= ehci_endpoint_disable,
-	.endpoint_reset		= ehci_endpoint_reset,
-
-	/*
-	 * scheduling support
-	 */
-	.get_frame_number	= ehci_get_frame,
-
-	/*
-	 * root hub support
-	 */
-	.hub_status_data	= ehci_hub_status_data,
-	.hub_control		= ehci_hub_control,
-	.bus_suspend		= ehci_bus_suspend,
-	.bus_resume		= ehci_bus_resume,
-	.relinquish_port	= ehci_relinquish_port,
-	.port_handed_over	= ehci_port_handed_over,
-
-	.clear_tt_buffer_complete	= ehci_clear_tt_buffer_complete,
-};
-
-static int ehci_hcd_sead3_drv_probe(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd;
-	struct resource *res;
-	int ret;
-
-	if (usb_disabled())
-		return -ENODEV;
-
-	if (pdev->resource[1].flags != IORESOURCE_IRQ) {
-		pr_debug("resource[1] is not IORESOURCE_IRQ");
-		return -ENOMEM;
-	}
-	hcd = usb_create_hcd(&ehci_sead3_hc_driver, &pdev->dev, "SEAD-3");
-	if (!hcd)
-		return -ENOMEM;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(hcd->regs)) {
-		ret = PTR_ERR(hcd->regs);
-		goto err1;
-	}
-	hcd->rsrc_start = res->start;
-	hcd->rsrc_len = resource_size(res);
-
-	/* Root hub has integrated TT. */
-	hcd->has_tt = 1;
-
-	ret = usb_add_hcd(hcd, pdev->resource[1].start,
-			  IRQF_SHARED);
-	if (ret == 0) {
-		platform_set_drvdata(pdev, hcd);
-		device_wakeup_enable(hcd->self.controller);
-		return ret;
-	}
-
-err1:
-	usb_put_hcd(hcd);
-	return ret;
-}
-
-static int ehci_hcd_sead3_drv_remove(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-
-	usb_remove_hcd(hcd);
-	usb_put_hcd(hcd);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM
-static int ehci_hcd_sead3_drv_suspend(struct device *dev)
-{
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-	bool do_wakeup = device_may_wakeup(dev);
-
-	return ehci_suspend(hcd, do_wakeup);
-}
-
-static int ehci_hcd_sead3_drv_resume(struct device *dev)
-{
-	struct usb_hcd *hcd = dev_get_drvdata(dev);
-
-	ehci_resume(hcd, false);
-	return 0;
-}
-
-static const struct dev_pm_ops sead3_ehci_pmops = {
-	.suspend	= ehci_hcd_sead3_drv_suspend,
-	.resume		= ehci_hcd_sead3_drv_resume,
-};
-
-#define SEAD3_EHCI_PMOPS (&sead3_ehci_pmops)
-
-#else
-#define SEAD3_EHCI_PMOPS NULL
-#endif
-
-static struct platform_driver ehci_hcd_sead3_driver = {
-	.probe		= ehci_hcd_sead3_drv_probe,
-	.remove		= ehci_hcd_sead3_drv_remove,
-	.shutdown	= usb_hcd_platform_shutdown,
-	.driver = {
-		.name	= "sead3-ehci",
-		.pm	= SEAD3_EHCI_PMOPS,
-	}
-};
-
-MODULE_ALIAS("platform:sead3-ehci");
+ RFE_MST_RWREG_RFEWRC_CMDSTATUS__RWREG_RFEWRC_RFE_mstTimeout__SHIFT 0x18
+#define RFE_MST_TMOUT_STATUS__MstTmoutStatus_MASK 0x1
+#define RFE_MST_TMOUT_STATUS__MstTmoutStatus__SHIFT 0x0
+#define RFE_IMPARBH_STATUS__IMPAH_REG_calDone_MASK 0x1
+#define RFE_IMPARBH_STATUS__IMPAH_REG_calDone__SHIFT 0x0
+#define RFE_IMPARBH_CONTROL__REG_IMPA_throttleTimer_MASK 0x3ff
+#define RFE_IMPARBH_CONTROL__REG_IMPA_throttleTimer__SHIFT 0x0
+#define PSX80_BIF_PCIE_RESERVED__PCIE_RESERVED_MASK 0xffffffff
+#define PSX80_BIF_PCIE_RESERVED__PCIE_RESERVED__SHIFT 0x0
+#define PSX80_BIF_PCIE_SCRATCH__PCIE_SCRATCH_MASK 0xffffffff
+#define PSX80_BIF_PCIE_SCRATCH__PCIE_SCRATCH__SHIFT 0x0
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_12_DEBUG_MASK 0x1000
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_12_DEBUG__SHIFT 0xc
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_13_DEBUG_MASK 0x2000
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_13_DEBUG__SHIFT 0xd
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_14_DEBUG_MASK 0x4000
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_14_DEBUG__SHIFT 0xe
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_15_DEBUG_MASK 0x8000
+#define PSX80_BIF_PCIE_HW_DEBUG__HW_15_DEBUG__SHIFT 0xf
+#define PSX80_BIF_PCIE_RX_NUM_NAK__RX_NUM_NAK_MASK 0xffffffff
+#define PSX80_BIF_PCIE_RX_NUM_NAK__RX_NUM_NAK__SHIFT 0x0
+#define PSX80_BIF_PCIE_RX_NUM_NAK_GENERATED__RX_NUM_NAK_GENERATED_MASK 0xffffffff
+#define PSX80_BIF_PCIE_RX_NUM_NAK_GENERATED__RX_NUM_NAK_GENERATED__SHIFT 0x0
+#define PSX80_BIF_PCIE_CNTL__HWINIT_WR_LOCK_MASK 0x1
+#define PSX80_BIF_PCIE_CNTL__HWINIT_WR_LOCK__SHIFT 0x0
+#define PSX80_BIF_PCIE_CNTL__LC_HOT_PLUG_DELAY_SEL_MASK 0xe
+#define PSX80_BIF_PCIE_CNTL__LC_HOT_PLUG_DELAY_SEL__SHIFT 0x1
+#define PSX80_BIF_PCIE_CNTL__UR_ERR_REPORT_DIS_MASK 0x80
+#define PSX80_BIF_PCIE_CNTL__UR_ERR_REPORT_DIS__SHIFT 0x7
+#define PSX80_BIF_PCIE_CNTL__PCIE_MALFORM_ATOMIC_OPS_MASK 0x100
+#define PSX80_BIF_PCIE_CNTL__PCIE_MALFORM_ATOMIC_OPS__SHIFT 0x8
+#define PSX80_BIF_PCIE_CNTL__PCIE_HT_NP_MEM_WRITE_MASK 0x200
+#define PSX80_BIF_PCIE_CNTL__PCIE_HT_NP_MEM_WRITE__SHIFT 0x9
+#define PSX80_BIF_PCIE_CNTL__RX_SB_ADJ_PAYLOAD_SIZE_MASK 0x1c00
+#define PSX80_BIF_PCIE_CNTL__RX_SB_ADJ_PAYLOAD_SIZE__SHIFT 0xa
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_ATS_UC_DIS_MASK 0x8000
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_ATS_UC_DIS__SHIFT 0xf
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_REORDER_EN_MASK 0x10000
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_REORDER_EN__SHIFT 0x10
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS_MASK 0x20000
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS__SHIFT 0x11
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS_MASK 0x40000
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS__SHIFT 0x12
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE_MASK 0x80000
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE__SHIFT 0x13
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_WRONG_PREFIX_DIS_MASK 0x100000
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_WRONG_PREFIX_DIS__SHIFT 0x14
+#define PSX80_BIF_PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS_MASK 0x200000
+#define PSX80_BIF_PCIE_

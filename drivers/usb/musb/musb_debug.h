@@ -1,58 +1,46 @@
-/*
- * MUSB OTG driver debug defines
- *
- * Copyright 2005 Mentor Graphics Corporation
- * Copyright (C) 2005-2006 by Texas Instruments
- * Copyright (C) 2006-2007 Nokia Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- */
+ndicate max Voltage
+    UCHAR      ucReserved[3];
+    VOLTAGE_LUT_ENTRY asVIDAdjustEntries[32];// 32 is for allocation, the actual number of entries is in ucNumOfVoltageEntries
+}ATOM_VOLTAGE_FORMULA_V2;
 
-#ifndef __MUSB_LINUX_DEBUG_H__
-#define __MUSB_LINUX_DEBUG_H__
-
-#define yprintk(facility, format, args...) \
-	do { printk(facility "%s %d: " format , \
-	__func__, __LINE__ , ## args); } while (0)
-#define WARNING(fmt, args...) yprintk(KERN_WARNING, fmt, ## args)
-#define INFO(fmt, args...) yprintk(KERN_INFO, fmt, ## args)
-#define ERR(fmt, args...) yprintk(KERN_ERR, fmt, ## args)
-
-#ifdef CONFIG_DEBUG_FS
-int musb_init_debugfs(struct musb *musb);
-void musb_exit_debugfs(struct musb *musb);
-#else
-static inline int musb_init_debugfs(struct musb *musb)
+typedef struct _ATOM_VOLTAGE_CONTROL
 {
-	return 0;
-}
-static inline void musb_exit_debugfs(struct musb *musb)
-{
-}
-#endif
+  UCHAR    ucVoltageControlId;                     //Indicate it is controlled by I2C or GPIO or HW state machine
+  UCHAR    ucVoltageControlI2cLine;
+  UCHAR    ucVoltageControlAddress;
+  UCHAR    ucVoltageControlOffset;
+  USHORT   usGpioPin_AIndex;                       //GPIO_PAD register index
+  UCHAR    ucGpioPinBitShift[9];                   //at most 8 pin support 255 VIDs, termintate with 0xff
+  UCHAR    ucReserved;
+}ATOM_VOLTAGE_CONTROL;
 
-#endif				/*  __MUSB_LINUX_DEBUG_H__ */
+// Define ucVoltageControlId
+#define VOLTAGE_CONTROLLED_BY_HW              0x00
+#define VOLTAGE_CONTROLLED_BY_I2C_MASK        0x7F
+#define VOLTAGE_CONTROLLED_BY_GPIO            0x80
+#define VOLTAGE_CONTROL_ID_LM64               0x01                           //I2C control, used for R5xx Core Voltage
+#define VOLTAGE_CONTROL_ID_DAC                0x02                           //I2C control, used for R5xx/R6xx MVDDC,MVDDQ or VDDCI
+#define VOLTAGE_CONTROL_ID_VT116xM            0x03                           //I2C control, used for R6xx Core Voltage
+#define VOLTAGE_CONTROL_ID_DS4402             0x04
+#define VOLTAGE_CONTROL_ID_UP6266             0x05
+#define VOLTAGE_CONTROL_ID_SCORPIO            0x06
+#define VOLTAGE_CONTROL_ID_VT1556M            0x07
+#define VOLTAGE_CONTROL_ID_CHL822x            0x08
+#define VOLTAGE_CONTROL_ID_VT1586M            0x09
+#define VOLTAGE_CONTROL_ID_UP1637             0x0A
+#define VOLTAGE_CONTROL_ID_CHL8214            0x0B
+#define VOLTAGE_CONTROL_ID_UP1801             0x0C
+#define VOLTAGE_CONTROL_ID_ST6788A            0x0D
+#define VOLTAGE_CONTROL_ID_CHLIR3564SVI2      0x0E
+#define VOLTAGE_CONTROL_ID_AD527x      	      0x0F
+#define VOLTAGE_CONTROL_ID_NCP81022    	      0x10
+#define VOLTAGE_CONTROL_ID_LTC2635			  0x11
+#define VOLTAGE_CONTROL_ID_NCP4208	          0x12
+#define VOLTAGE_CONTROL_ID_IR35xx             0x13
+#define VOLTAGE_CONTROL_ID_RT9403	          0x14
+
+#define VOLTAGE_CONTROL_ID_GENERIC_I2C        0x40
+
+typedef struct  _ATOM_VOLTAGE_OBJECT
+{
+   UCHAR      ucVoltageType;           

@@ -1,345 +1,333 @@
 /*
- * max8952.c - Voltage and current regulation for the Maxim 8952
+ * file for managing the edac_device subsystem of devices for EDAC
  *
- * Copyright (C) 2010 Samsung Electronics
- * MyungJoo Ham <myungjoo.ham@samsung.com>
+ * (C) 2007 SoftwareBitMaker 
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Written Doug Thompson <norsk5@xmission.com>
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#include <linux/ctype.h>
 #include <linux/module.h>
-#include <linux/init.h>
-#include <linux/i2c.h>
-#include <linux/err.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/max8952.h>
-#include <linux/gpio.h>
-#include <linux/io.h>
-#include <linux/of.h>
-#include <linux/of_gpio.h>
-#include <linux/regulator/of_regulator.h>
 #include <linux/slab.h>
+#include <linux/edac.h>
 
-/* Registers */
-enum {
-	MAX8952_REG_MODE0,
-	MAX8952_REG_MODE1,
-	MAX8952_REG_MODE2,
-	MAX8952_REG_MODE3,
-	MAX8952_REG_CONTROL,
-	MAX8952_REG_SYNC,
-	MAX8952_REG_RAMP,
-	MAX8952_REG_CHIP_ID1,
-	MAX8952_REG_CHIP_ID2,
+#include "edac_core.h"
+#include "edac_module.h"
+
+#define EDAC_DEVICE_SYMLINK	"device"
+
+#define to_edacdev(k) container_of(k, struct edac_device_ctl_info, kobj)
+#define to_edacdev_attr(a) container_of(a, struct edacdev_attribute, attr)
+
+
+/*
+ * Set of edac_device_ctl_info attribute store/show functions
+ */
+
+/* 'log_ue' */
+static ssize_t edac_device_ctl_log_ue_show(struct edac_device_ctl_info
+					*ctl_info, char *data)
+{
+	return sprintf(data, "%u\n", ctl_info->log_ue);
+}
+
+static ssize_t edac_device_ctl_log_ue_store(struct edac_device_ctl_info
+					*ctl_info, const char *data,
+					size_t count)
+{
+	/* if parameter is zero, turn off flag, if non-zero turn on flag */
+	ctl_info->log_ue = (simple_strtoul(data, NULL, 0) != 0);
+
+	return count;
+}
+
+/* 'log_ce' */
+static ssize_t edac_device_ctl_log_ce_show(struct edac_device_ctl_info
+					*ctl_info, char *data)
+{
+	return sprintf(data, "%u\n", ctl_info->log_ce);
+}
+
+static ssize_t edac_device_ctl_log_ce_store(struct edac_device_ctl_info
+					*ctl_info, const char *data,
+					size_t count)
+{
+	/* if parameter is zero, turn off flag, if non-zero turn on flag */
+	ctl_info->log_ce = (simple_strtoul(data, NULL, 0) != 0);
+
+	return count;
+}
+
+/* 'panic_on_ue' */
+static ssize_t edac_device_ctl_panic_on_ue_show(struct edac_device_ctl_info
+						*ctl_info, char *data)
+{
+	return sprintf(data, "%u\n", ctl_info->panic_on_ue);
+}
+
+static ssize_t edac_device_ctl_panic_on_ue_store(struct edac_device_ctl_info
+						 *ctl_info, const char *data,
+						 size_t count)
+{
+	/* if parameter is zero, turn off flag, if non-zero turn on flag */
+	ctl_info->panic_on_ue = (simple_strtoul(data, NULL, 0) != 0);
+
+	return count;
+}
+
+/* 'poll_msec' show and store functions*/
+static ssize_t edac_device_ctl_poll_msec_show(struct edac_device_ctl_info
+					*ctl_info, char *data)
+{
+	return sprintf(data, "%u\n", ctl_info->poll_msec);
+}
+
+static ssize_t edac_device_ctl_poll_msec_store(struct edac_device_ctl_info
+					*ctl_info, const char *data,
+					size_t count)
+{
+	unsigned long value;
+
+	/* get the value and enforce that it is non-zero, must be at least
+	 * one millisecond for the delay period, between scans
+	 * Then cancel last outstanding delay for the work request
+	 * and set a new one.
+	 */
+	value = simple_strtoul(data, NULL, 0);
+	edac_device_reset_delay_period(ctl_info, value);
+
+	return count;
+}
+
+/* edac_device_ctl_info specific attribute structure */
+struct ctl_info_attribute {
+	struct attribute attr;
+	ssize_t(*show) (struct edac_device_ctl_info *, char *);
+	ssize_t(*store) (struct edac_device_ctl_info *, const char *, size_t);
 };
 
-struct max8952_data {
-	struct i2c_client	*client;
-	struct max8952_platform_data *pdata;
+#define to_ctl_info(k) container_of(k, struct edac_device_ctl_info, kobj)
+#define to_ctl_info_attr(a) container_of(a,struct ctl_info_attribute,attr)
 
-	bool vid0;
-	bool vid1;
+/* Function to 'show' fields from the edac_dev 'ctl_info' structure */
+static ssize_t edac_dev_ctl_info_show(struct kobject *kobj,
+				struct attribute *attr, char *buffer)
+{
+	struct edac_device_ctl_info *edac_dev = to_ctl_info(kobj);
+	struct ctl_info_attribute *ctl_info_attr = to_ctl_info_attr(attr);
+
+	if (ctl_info_attr->show)
+		return ctl_info_attr->show(edac_dev, buffer);
+	return -EIO;
+}
+
+/* Function to 'store' fields into the edac_dev 'ctl_info' structure */
+static ssize_t edac_dev_ctl_info_store(struct kobject *kobj,
+				struct attribute *attr,
+				const char *buffer, size_t count)
+{
+	struct edac_device_ctl_info *edac_dev = to_ctl_info(kobj);
+	struct ctl_info_attribute *ctl_info_attr = to_ctl_info_attr(attr);
+
+	if (ctl_info_attr->store)
+		return ctl_info_attr->store(edac_dev, buffer, count);
+	return -EIO;
+}
+
+/* edac_dev file operations for an 'ctl_info' */
+static const struct sysfs_ops device_ctl_info_ops = {
+	.show = edac_dev_ctl_info_show,
+	.store = edac_dev_ctl_info_store
 };
 
-static int max8952_read_reg(struct max8952_data *max8952, u8 reg)
-{
-	int ret = i2c_smbus_read_byte_data(max8952->client, reg);
-
-	if (ret > 0)
-		ret &= 0xff;
-
-	return ret;
-}
-
-static int max8952_write_reg(struct max8952_data *max8952,
-		u8 reg, u8 value)
-{
-	return i2c_smbus_write_byte_data(max8952->client, reg, value);
-}
-
-static int max8952_list_voltage(struct regulator_dev *rdev,
-		unsigned int selector)
-{
-	struct max8952_data *max8952 = rdev_get_drvdata(rdev);
-
-	if (rdev_get_id(rdev) != 0)
-		return -EINVAL;
-
-	return (max8952->pdata->dvs_mode[selector] * 10 + 770) * 1000;
-}
-
-static int max8952_get_voltage_sel(struct regulator_dev *rdev)
-{
-	struct max8952_data *max8952 = rdev_get_drvdata(rdev);
-	u8 vid = 0;
-
-	if (max8952->vid0)
-		vid += 1;
-	if (max8952->vid1)
-		vid += 2;
-
-	return vid;
-}
-
-static int max8952_set_voltage_sel(struct regulator_dev *rdev,
-				   unsigned selector)
-{
-	struct max8952_data *max8952 = rdev_get_drvdata(rdev);
-
-	if (!gpio_is_valid(max8952->pdata->gpio_vid0) ||
-			!gpio_is_valid(max8952->pdata->gpio_vid1)) {
-		/* DVS not supported */
-		return -EPERM;
-	}
-
-	max8952->vid0 = selector & 0x1;
-	max8952->vid1 = (selector >> 1) & 0x1;
-	gpio_set_value(max8952->pdata->gpio_vid0, max8952->vid0);
-	gpio_set_value(max8952->pdata->gpio_vid1, max8952->vid1);
-
-	return 0;
-}
-
-static struct regulator_ops max8952_ops = {
-	.list_voltage		= max8952_list_voltage,
-	.get_voltage_sel	= max8952_get_voltage_sel,
-	.set_voltage_sel	= max8952_set_voltage_sel,
+#define CTL_INFO_ATTR(_name,_mode,_show,_store)        \
+static struct ctl_info_attribute attr_ctl_info_##_name = {      \
+	.attr = {.name = __stringify(_name), .mode = _mode },   \
+	.show   = _show,                                        \
+	.store  = _store,                                       \
 };
 
-static const struct regulator_desc regulator = {
-	.name		= "MAX8952_VOUT",
-	.id		= 0,
-	.n_voltages	= MAX8952_NUM_DVS_MODE,
-	.ops		= &max8952_ops,
-	.type		= REGULATOR_VOLTAGE,
-	.owner		= THIS_MODULE,
+/* Declare the various ctl_info attributes here and their respective ops */
+CTL_INFO_ATTR(log_ue, S_IRUGO | S_IWUSR,
+	edac_device_ctl_log_ue_show, edac_device_ctl_log_ue_store);
+CTL_INFO_ATTR(log_ce, S_IRUGO | S_IWUSR,
+	edac_device_ctl_log_ce_show, edac_device_ctl_log_ce_store);
+CTL_INFO_ATTR(panic_on_ue, S_IRUGO | S_IWUSR,
+	edac_device_ctl_panic_on_ue_show,
+	edac_device_ctl_panic_on_ue_store);
+CTL_INFO_ATTR(poll_msec, S_IRUGO | S_IWUSR,
+	edac_device_ctl_poll_msec_show, edac_device_ctl_poll_msec_store);
+
+/* Base Attributes of the EDAC_DEVICE ECC object */
+static struct ctl_info_attribute *device_ctrl_attr[] = {
+	&attr_ctl_info_panic_on_ue,
+	&attr_ctl_info_log_ue,
+	&attr_ctl_info_log_ce,
+	&attr_ctl_info_poll_msec,
+	NULL,
 };
 
-#ifdef CONFIG_OF
-static const struct of_device_id max8952_dt_match[] = {
-	{ .compatible = "maxim,max8952" },
-	{},
+/*
+ * edac_device_ctrl_master_release
+ *
+ *	called when the reference count for the 'main' kobj
+ *	for a edac_device control struct reaches zero
+ *
+ *	Reference count model:
+ *		One 'main' kobject for each control structure allocated.
+ *		That main kobj is initially set to one AND
+ *		the reference count for the EDAC 'core' module is
+ *		bumped by one, thus added 'keep in memory' dependency.
+ *
+ *		Each new internal kobj (in instances and blocks) then
+ *		bumps the 'main' kobject.
+ *
+ *		When they are released their release functions decrement
+ *		the 'main' kobj.
+ *
+ *		When the main kobj reaches zero (0) then THIS function
+ *		is called which then decrements the EDAC 'core' module.
+ *		When the module reference count reaches zero then the
+ *		module no longer has dependency on keeping the release
+ *		function code in memory and module can be unloaded.
+ *
+ *		This will support several control objects as well, each
+ *		with its own 'main' kobj.
+ */
+static void edac_device_ctrl_master_release(struct kobject *kobj)
+{
+	struct edac_device_ctl_info *edac_dev = to_edacdev(kobj);
+
+	edac_dbg(4, "control index=%d\n", edac_dev->dev_idx);
+
+	/* decrement the EDAC CORE module ref count */
+	module_put(edac_dev->owner);
+
+	/* free the control struct containing the 'main' kobj
+	 * passed in to this routine
+	 */
+	kfree(edac_dev);
+}
+
+/* ktype for the main (master) kobject */
+static struct kobj_type ktype_device_ctrl = {
+	.release = edac_device_ctrl_master_release,
+	.sysfs_ops = &device_ctl_info_ops,
+	.default_attrs = (struct attribute **)device_ctrl_attr,
 };
-MODULE_DEVICE_TABLE(of, max8952_dt_match);
 
-static struct max8952_platform_data *max8952_parse_dt(struct device *dev)
+/*
+ * edac_device_register_sysfs_main_kobj
+ *
+ *	perform the high level setup for the new edac_device instance
+ *
+ * Return:  0 SUCCESS
+ *         !0 FAILURE
+ */
+int edac_device_register_sysfs_main_kobj(struct edac_device_ctl_info *edac_dev)
 {
-	struct max8952_platform_data *pd;
-	struct device_node *np = dev->of_node;
-	int ret;
-	int i;
+	struct bus_type *edac_subsys;
+	int err;
 
-	pd = devm_kzalloc(dev, sizeof(*pd), GFP_KERNEL);
-	if (!pd)
-		return NULL;
+	edac_dbg(1, "\n");
 
-	pd->gpio_vid0 = of_get_named_gpio(np, "max8952,vid-gpios", 0);
-	pd->gpio_vid1 = of_get_named_gpio(np, "max8952,vid-gpios", 1);
-	pd->gpio_en = of_get_named_gpio(np, "max8952,en-gpio", 0);
-
-	if (of_property_read_u32(np, "max8952,default-mode", &pd->default_mode))
-		dev_warn(dev, "Default mode not specified, assuming 0\n");
-
-	ret = of_property_read_u32_array(np, "max8952,dvs-mode-microvolt",
-					pd->dvs_mode, ARRAY_SIZE(pd->dvs_mode));
-	if (ret) {
-		dev_err(dev, "max8952,dvs-mode-microvolt property not specified");
-		return NULL;
+	/* get the /sys/devices/system/edac reference */
+	edac_subsys = edac_get_sysfs_subsys();
+	if (edac_subsys == NULL) {
+		edac_dbg(1, "no edac_subsys error\n");
+		err = -ENODEV;
+		goto err_out;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(pd->dvs_mode); ++i) {
-		if (pd->dvs_mode[i] < 770000 || pd->dvs_mode[i] > 1400000) {
-			dev_err(dev, "DVS voltage %d out of range\n", i);
-			return NULL;
-		}
-		pd->dvs_mode[i] = (pd->dvs_mode[i] - 770000) / 10000;
+	/* Point to the 'edac_subsys' this instance 'reports' to */
+	edac_dev->edac_subsys = edac_subsys;
+
+	/* Init the devices's kobject */
+	memset(&edac_dev->kobj, 0, sizeof(struct kobject));
+
+	/* Record which module 'owns' this control structure
+	 * and bump the ref count of the module
+	 */
+	edac_dev->owner = THIS_MODULE;
+
+	if (!try_module_get(edac_dev->owner)) {
+		err = -ENODEV;
+		goto err_mod_get;
 	}
 
-	if (of_property_read_u32(np, "max8952,sync-freq", &pd->sync_freq))
-		dev_warn(dev, "max8952,sync-freq property not specified, defaulting to 26MHz\n");
-
-	if (of_property_read_u32(np, "max8952,ramp-speed", &pd->ramp_speed))
-		dev_warn(dev, "max8952,ramp-speed property not specified, defaulting to 32mV/us\n");
-
-	pd->reg_data = of_get_regulator_init_data(dev, np, &regulator);
-	if (!pd->reg_data) {
-		dev_err(dev, "Failed to parse regulator init data\n");
-		return NULL;
-	}
-
-	return pd;
-}
-#else
-static struct max8952_platform_data *max8952_parse_dt(struct device *dev)
-{
-	return NULL;
-}
-#endif
-
-static int max8952_pmic_probe(struct i2c_client *client,
-		const struct i2c_device_id *i2c_id)
-{
-	struct i2c_adapter *adapter = to_i2c_adapter(client->dev.parent);
-	struct max8952_platform_data *pdata = dev_get_platdata(&client->dev);
-	struct regulator_config config = { };
-	struct max8952_data *max8952;
-	struct regulator_dev *rdev;
-
-	int ret = 0, err = 0;
-
-	if (client->dev.of_node)
-		pdata = max8952_parse_dt(&client->dev);
-
-	if (!pdata) {
-		dev_err(&client->dev, "Require the platform data\n");
-		return -EINVAL;
-	}
-
-	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE))
-		return -EIO;
-
-	max8952 = devm_kzalloc(&client->dev, sizeof(struct max8952_data),
-			       GFP_KERNEL);
-	if (!max8952)
-		return -ENOMEM;
-
-	max8952->client = client;
-	max8952->pdata = pdata;
-
-	config.dev = &client->dev;
-	config.init_data = pdata->reg_data;
-	config.driver_data = max8952;
-	config.of_node = client->dev.of_node;
-
-	config.ena_gpio = pdata->gpio_en;
-	if (client->dev.of_node)
-		config.ena_gpio_initialized = true;
-	if (pdata->reg_data->constraints.boot_on)
-		config.ena_gpio_flags |= GPIOF_OUT_INIT_HIGH;
-
-	rdev = devm_regulator_register(&client->dev, &regulator, &config);
-	if (IS_ERR(rdev)) {
-		ret = PTR_ERR(rdev);
-		dev_err(&client->dev, "regulator init failed (%d)\n", ret);
-		return ret;
-	}
-
-	max8952->vid0 = pdata->default_mode & 0x1;
-	max8952->vid1 = (pdata->default_mode >> 1) & 0x1;
-
-	if (gpio_is_valid(pdata->gpio_vid0) &&
-			gpio_is_valid(pdata->gpio_vid1)) {
-		unsigned long gpio_flags;
-
-		gpio_flags = max8952->vid0 ?
-			     GPIOF_OUT_INIT_HIGH : GPIOF_OUT_INIT_LOW;
-		if (devm_gpio_request_one(&client->dev, pdata->gpio_vid0,
-					  gpio_flags, "MAX8952 VID0"))
-			err = 1;
-
-		gpio_flags = max8952->vid1 ?
-			     GPIOF_OUT_INIT_HIGH : GPIOF_OUT_INIT_LOW;
-		if (devm_gpio_request_one(&client->dev, pdata->gpio_vid1,
-					  gpio_flags, "MAX8952 VID1"))
-			err = 2;
-	} else
-		err = 3;
-
+	/* register */
+	err = kobject_init_and_add(&edac_dev->kobj, &ktype_device_ctrl,
+				   &edac_subsys->dev_root->kobj,
+				   "%s", edac_dev->name);
 	if (err) {
-		dev_warn(&client->dev, "VID0/1 gpio invalid: "
-				"DVS not available.\n");
-		max8952->vid0 = 0;
-		max8952->vid1 = 0;
-		/* Mark invalid */
-		pdata->gpio_vid0 = -1;
-		pdata->gpio_vid1 = -1;
-
-		/* Disable Pulldown of EN only */
-		max8952_write_reg(max8952, MAX8952_REG_CONTROL, 0x60);
-
-		dev_err(&client->dev, "DVS modes disabled because VID0 and VID1"
-				" do not have proper controls.\n");
-	} else {
-		/*
-		 * Disable Pulldown on EN, VID0, VID1 to reduce
-		 * leakage current of MAX8952 assuming that MAX8952
-		 * is turned on (EN==1). Note that without having VID0/1
-		 * properly connected, turning pulldown off can be
-		 * problematic. Thus, turn this off only when they are
-		 * controllable by GPIO.
-		 */
-		max8952_write_reg(max8952, MAX8952_REG_CONTROL, 0x0);
+		edac_dbg(1, "Failed to register '.../edac/%s'\n",
+			 edac_dev->name);
+		goto err_kobj_reg;
 	}
+	kobject_uevent(&edac_dev->kobj, KOBJ_ADD);
 
-	max8952_write_reg(max8952, MAX8952_REG_MODE0,
-			(max8952_read_reg(max8952,
-					  MAX8952_REG_MODE0) & 0xC0) |
-			(pdata->dvs_mode[0] & 0x3F));
-	max8952_write_reg(max8952, MAX8952_REG_MODE1,
-			(max8952_read_reg(max8952,
-					  MAX8952_REG_MODE1) & 0xC0) |
-			(pdata->dvs_mode[1] & 0x3F));
-	max8952_write_reg(max8952, MAX8952_REG_MODE2,
-			(max8952_read_reg(max8952,
-					  MAX8952_REG_MODE2) & 0xC0) |
-			(pdata->dvs_mode[2] & 0x3F));
-	max8952_write_reg(max8952, MAX8952_REG_MODE3,
-			(max8952_read_reg(max8952,
-					  MAX8952_REG_MODE3) & 0xC0) |
-			(pdata->dvs_mode[3] & 0x3F));
+	/* At this point, to 'free' the control struct,
+	 * edac_device_unregister_sysfs_main_kobj() must be used
+	 */
 
-	max8952_write_reg(max8952, MAX8952_REG_SYNC,
-			(max8952_read_reg(max8952, MAX8952_REG_SYNC) & 0x3F) |
-			((pdata->sync_freq & 0x3) << 6));
-	max8952_write_reg(max8952, MAX8952_REG_RAMP,
-			(max8952_read_reg(max8952, MAX8952_REG_RAMP) & 0x1F) |
-			((pdata->ramp_speed & 0x7) << 5));
-
-	i2c_set_clientdata(client, max8952);
+	edac_dbg(4, "Registered '.../edac/%s' kobject\n", edac_dev->name);
 
 	return 0;
+
+	/* Error exit stack */
+err_kobj_reg:
+	kobject_put(&edac_dev->kobj);
+	module_put(edac_dev->owner);
+
+err_mod_get:
+	edac_put_sysfs_subsys();
+
+err_out:
+	return err;
 }
 
-static const struct i2c_device_id max8952_ids[] = {
-	{ "max8952", 0 },
-	{ },
-};
-MODULE_DEVICE_TABLE(i2c, max8952_ids);
-
-static struct i2c_driver max8952_pmic_driver = {
-	.probe		= max8952_pmic_probe,
-	.driver		= {
-		.name	= "max8952",
-		.of_match_table = of_match_ptr(max8952_dt_match),
-	},
-	.id_table	= max8952_ids,
-};
-
-static int __init max8952_pmic_init(void)
+/*
+ * edac_device_unregister_sysfs_main_kobj:
+ *	the '..../edac/<name>' kobject
+ */
+void edac_device_unregister_sysfs_main_kobj(struct edac_device_ctl_info *dev)
 {
-	return i2c_add_driver(&max8952_pmic_driver);
-}
-subsys_initcall(max8952_pmic_init);
+	edac_dbg(0, "\n");
+	edac_dbg(4, "name of kobject is: %s\n", kobject_name(&dev->kobj));
 
-static void __exit max8952_pmic_exit(void)
+	/*
+	 * Unregister the edac device's kobject and
+	 * allow for reference count to reach 0 at which point
+	 * the callback will be called to:
+	 *   a) module_put() this module
+	 *   b) 'kfree' the memory
+	 */
+	kobject_put(&dev->kobj);
+	edac_put_sysfs_subsys();
+}
+
+/* edac_dev -> instance information */
+
+/*
+ * Set of low-level instance attribute show functions
+ */
+static ssize_t instance_ue_count_show(struct edac_device_instance *instance,
+				char *data)
 {
-	i2c_del_driver(&max8952_pmic_driver);
+	return sprintf(data, "%u\n", instance->counters.ue_count);
 }
-module_exit(max8952_pmic_exit);
 
-MODULE_DESCRIPTION("MAXIM 8952 voltage regulator driver");
-MODULE_AUTHOR("MyungJoo Ham <myungjoo.ham@samsung.com>");
-MODULE_LICENSE("GPL");
+static ssize_t instance_ce_count_show(struct edac_device_instance *instance,
+				char *data)
+{
+	return sprintf(data, "%u\n", instance->counters.ce_count);
+}
+
+#define to_instance(k) container_of(k, struct edac_device_instance, kobj)
+#define to_instance_attr(a) container_of(a,struct instance_attribute,attr)
+
+/* DEVICE instance 

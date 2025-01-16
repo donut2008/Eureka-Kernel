@@ -1,44 +1,22 @@
-#undef __s390x__
-#include <asm/unistd.h>
-#include "audit.h"
-
-unsigned s390_dir_class[] = {
-#include <asm-generic/audit_dir_write.h>
-~0U
-};
-
-unsigned s390_chattr_class[] = {
-#include <asm-generic/audit_change_attr.h>
-~0U
-};
-
-unsigned s390_write_class[] = {
-#include <asm-generic/audit_write.h>
-~0U
-};
-
-unsigned s390_read_class[] = {
-#include <asm-generic/audit_read.h>
-~0U
-};
-
-unsigned s390_signal_class[] = {
-#include <asm-generic/audit_signal.h>
-~0U
-};
-
-int s390_classify_syscall(unsigned syscall)
-{
-	switch(syscall) {
-	case __NR_open:
-		return 2;
-	case __NR_openat:
-		return 3;
-	case __NR_socketcall:
-		return 4;
-	case __NR_execve:
-		return 5;
-	default:
-		return 1;
-	}
-}
+;
+	sub r14=r14,r17		// r14 (bspstore1) <- bsp1 - (sc_loadrs >> 16)
+	shr.u r17=r17,3		// r17 <- (sc_loadrs >> 19)
+	;;
+	loadrs			// restore dirty partition
+	extr.u r14=r14,3,6	// r14 <- rse_slot_num(bspstore1)
+	;;
+	add r14=r14,r17		// r14 <- rse_slot_num(bspstore1) + (sc_loadrs >> 19)
+	;;
+	shr.u r14=r14,6		// r14 <- (rse_slot_num(bspstore1) + (sc_loadrs >> 19))/0x40
+	;;
+	sub r14=r14,r17		// r14 <- -rse_num_regs(bspstore1, bsp1)
+	movl r17=0x8208208208208209
+	;;
+	add r18=r18,r14		// r18 (delta) <- rse_slot_num(bsp0) - rse_num_regs(bspstore1,bsp1)
+	setf.sig f7=r17
+	cmp.lt p7,p0=r14,r0	// p7 <- (r14 < 0)?
+	;;
+(p7)	adds r18=-62,r18	// delta -= 62
+	;;
+	setf.sig f6=r18
+	;;

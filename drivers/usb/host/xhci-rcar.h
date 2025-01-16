@@ -1,27 +1,10 @@
-/*
- * drivers/usb/host/xhci-rcar.h
- *
- * Copyright (C) 2014 Renesas Electronics Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- */
-
-#ifndef _XHCI_RCAR_H
-#define _XHCI_RCAR_H
-
-#if IS_ENABLED(CONFIG_USB_XHCI_RCAR)
-void xhci_rcar_start(struct usb_hcd *hcd);
-int xhci_rcar_init_quirk(struct usb_hcd *hcd);
-#else
-static inline void xhci_rcar_start(struct usb_hcd *hcd)
-{
-}
-
-static inline int xhci_rcar_init_quirk(struct usb_hcd *hcd)
-{
-	return 0;
-}
-#endif
-#endif /* _XHCI_RCAR_H */
+C_GPIO_SWAPLOCK_A_PU_EN_MASK 0x80000
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_A_PU_EN__SHIFT 0x13
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_B_MASK_MASK 0x1000000
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_B_MASK__SHIFT 0x18
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_B_PD_DIS_MASK 0x2000000
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_B_PD_DIS__SHIFT 0x19
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_B_RECV_MASK 0x4000000
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_B_RECV__SHIFT 0x1a
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_B_PU_EN_MASK 0x8000000
+#define DC_GPIO_GENLK_MASK__DC_GPIO_SWAPLOCK_B_PU_EN__SHIFT 0x1b

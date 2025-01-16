@@ -1,59 +1,48 @@
-	.global	__udivsi3
-	.section	.text..SHmedia32,"ax"
-	.align	2
-
-/*
-   inputs: r4,r5
-   clobbered: r18,r19,r20,r21,r22,r25,tr0
-   result in r0.
- */
-__udivsi3:
-	addz.l r5,r63,r22
-	nsb r22,r0
-	shlld r22,r0,r25
-	shlri r25,48,r25
-	movi 0xffffffffffffbb0c,r20 /* shift count eqiv 76 */
-	sub r20,r25,r21
-	mmulfx.w r21,r21,r19
-	mshflo.w r21,r63,r21
-	ptabs r18,tr0
-	mmulfx.w r25,r19,r19
-	sub r20,r0,r0
-	/* bubble */
-	msub.w r21,r19,r19
-
-	/*
-	 * It would be nice for scheduling to do this add to r21 before
-	 * the msub.w, but we need a different value for r19 to keep
-	 * errors under control.
+atagram mode.
 	 */
-	addi r19,-2,r21
-	mulu.l r4,r21,r18
-	mmulfx.w r19,r19,r19
-	shlli r21,15,r21
-	shlrd r18,r0,r18
-	mulu.l r18,r22,r20
-	mmacnfx.wl r25,r19,r21
-	/* bubble */
-	sub r4,r20,r25
+	IB_DEVICE_UD_IP_CSUM		= (1<<18),
+	IB_DEVICE_UD_TSO		= (1<<19),
+	IB_DEVICE_XRC			= (1<<20),
+	IB_DEVICE_MEM_MGT_EXTENSIONS	= (1<<21),
+	IB_DEVICE_BLOCK_MULTICAST_LOOPBACK = (1<<22),
+	IB_DEVICE_MEM_WINDOW_TYPE_2A	= (1<<23),
+	IB_DEVICE_MEM_WINDOW_TYPE_2B	= (1<<24),
+	IB_DEVICE_RC_IP_CSUM		= (1<<25),
+	IB_DEVICE_RAW_IP_CSUM		= (1<<26),
+	IB_DEVICE_MANAGED_FLOW_STEERING = (1<<29),
+	IB_DEVICE_SIGNATURE_HANDOVER	= (1<<30),
+	IB_DEVICE_ON_DEMAND_PAGING	= (1<<31),
+};
 
-	mulu.l r25,r21,r19
-	addi r0,14,r0
-	/* bubble */
-	shlrd r19,r0,r19
-	mulu.l r19,r22,r20
-	add r18,r19,r18
-	/* bubble */
-	sub.l r25,r20,r25
+enum ib_signature_prot_cap {
+	IB_PROT_T10DIF_TYPE_1 = 1,
+	IB_PROT_T10DIF_TYPE_2 = 1 << 1,
+	IB_PROT_T10DIF_TYPE_3 = 1 << 2,
+};
 
-	mulu.l r25,r21,r19
-	addz.l r25,r63,r25
-	sub r25,r22,r25
-	shlrd r19,r0,r19
-	mulu.l r19,r22,r20
-	addi r25,1,r25
-	add r18,r19,r18
+enum ib_signature_guard_cap {
+	IB_GUARD_T10DIF_CRC	= 1,
+	IB_GUARD_T10DIF_CSUM	= 1 << 1,
+};
 
-	cmpgt r25,r20,r25
-	add.l r18,r25,r0
-	blink tr0,r63
+enum ib_atomic_cap {
+	IB_ATOMIC_NONE,
+	IB_ATOMIC_HCA,
+	IB_ATOMIC_GLOB
+};
+
+enum ib_odp_general_cap_bits {
+	IB_ODP_SUPPORT = 1 << 0,
+};
+
+enum ib_odp_transport_cap_bits {
+	IB_ODP_SUPPORT_SEND	= 1 << 0,
+	IB_ODP_SUPPORT_RECV	= 1 << 1,
+	IB_ODP_SUPPORT_WRITE	= 1 << 2,
+	IB_ODP_SUPPORT_READ	= 1 << 3,
+	IB_ODP_SUPPORT_ATOMIC	= 1 << 4,
+};
+
+struct ib_odp_caps {
+	uint64_t general_caps;
+	str

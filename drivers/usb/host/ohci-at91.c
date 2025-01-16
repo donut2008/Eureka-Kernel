@@ -1,702 +1,291 @@
-/*
- * OHCI HCD (Host Controller Driver) for USB.
- *
- *  Copyright (C) 2004 SAN People (Pty) Ltd.
- *  Copyright (C) 2005 Thibaut VARENE <varenet@parisc-linux.org>
- *
- * AT91 Bus Glue
- *
- * Based on fragments of 2.4 driver by Rick Bronson.
- * Based on ohci-omap.c
- *
- * This file is licenced under the GPL.
- */
-
-#include <linux/clk.h>
-#include <linux/dma-mapping.h>
-#include <linux/of_platform.h>
-#include <linux/of_gpio.h>
-#include <linux/platform_device.h>
-#include <linux/platform_data/atmel.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/usb.h>
-#include <linux/usb/hcd.h>
-
-#include <asm/gpio.h>
-
-#include "ohci.h"
-
-#define valid_port(index)	((index) >= 0 && (index) < AT91_MAX_USBH_PORTS)
-#define at91_for_each_port(index)	\
-		for ((index) = 0; (index) < AT91_MAX_USBH_PORTS; (index)++)
-
-/* interface, function and usb clocks; sometimes also an AHB clock */
-#define hcd_to_ohci_at91_priv(h) \
-	((struct ohci_at91_priv *)hcd_to_ohci(h)->priv)
-
-#define AT91_MAX_USBH_PORTS	3
-struct at91_usbh_data {
-	int vbus_pin[AT91_MAX_USBH_PORTS];	/* port power-control pin */
-	int overcurrent_pin[AT91_MAX_USBH_PORTS];
-	u8 ports;				/* number of ports on root hub */
-	u8 overcurrent_supported;
-	u8 vbus_pin_active_low[AT91_MAX_USBH_PORTS];
-	u8 overcurrent_status[AT91_MAX_USBH_PORTS];
-	u8 overcurrent_changed[AT91_MAX_USBH_PORTS];
-};
-
-struct ohci_at91_priv {
-	struct clk *iclk;
-	struct clk *fclk;
-	struct clk *hclk;
-	bool clocked;
-	bool wakeup;		/* Saved wake-up state for resume */
-};
-/* interface and function clocks; sometimes also an AHB clock */
-
-#define DRIVER_DESC "OHCI Atmel driver"
-
-static const char hcd_name[] = "ohci-atmel";
-
-static struct hc_driver __read_mostly ohci_at91_hc_driver;
-
-static const struct ohci_driver_overrides ohci_at91_drv_overrides __initconst = {
-	.extra_priv_size = sizeof(struct ohci_at91_priv),
-};
-
-extern int usb_disabled(void);
-
-/*-------------------------------------------------------------------------*/
-
-static void at91_start_clock(struct ohci_at91_priv *ohci_at91)
-{
-	if (ohci_at91->clocked)
-		return;
-
-	clk_set_rate(ohci_at91->fclk, 48000000);
-	clk_prepare_enable(ohci_at91->hclk);
-	clk_prepare_enable(ohci_at91->iclk);
-	clk_prepare_enable(ohci_at91->fclk);
-	ohci_at91->clocked = true;
-}
-
-static void at91_stop_clock(struct ohci_at91_priv *ohci_at91)
-{
-	if (!ohci_at91->clocked)
-		return;
-
-	clk_disable_unprepare(ohci_at91->fclk);
-	clk_disable_unprepare(ohci_at91->iclk);
-	clk_disable_unprepare(ohci_at91->hclk);
-	ohci_at91->clocked = false;
-}
-
-static void at91_start_hc(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-	struct ohci_regs __iomem *regs = hcd->regs;
-	struct ohci_at91_priv *ohci_at91 = hcd_to_ohci_at91_priv(hcd);
-
-	dev_dbg(&pdev->dev, "start\n");
-
-	/*
-	 * Start the USB clocks.
-	 */
-	at91_start_clock(ohci_at91);
-
-	/*
-	 * The USB host controller must remain in reset.
-	 */
-	writel(0, &regs->control);
-}
-
-static void at91_stop_hc(struct platform_device *pdev)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(pdev);
-	struct ohci_regs __iomem *regs = hcd->regs;
-	struct ohci_at91_priv *ohci_at91 = hcd_to_ohci_at91_priv(hcd);
-
-	dev_dbg(&pdev->dev, "stop\n");
-
-	/*
-	 * Put the USB host controller into reset.
-	 */
-	writel(0, &regs->control);
-
-	/*
-	 * Stop the USB clocks.
-	 */
-	at91_stop_clock(ohci_at91);
-}
-
-
-/*-------------------------------------------------------------------------*/
-
-static void usb_hcd_at91_remove (struct usb_hcd *, struct platform_device *);
-
-/* configure so an HC device and id are always provided */
-/* always called with process context; sleeping is OK */
-
-
-/**
- * usb_hcd_at91_probe - initialize AT91-based HCDs
- * Context: !in_interrupt()
- *
- * Allocates basic resources for this USB host controller, and
- * then invokes the start() method for the HCD associated with it
- * through the hotplug entry's driver_data.
- */
-static int usb_hcd_at91_probe(const struct hc_driver *driver,
-			struct platform_device *pdev)
-{
-	struct at91_usbh_data *board;
-	struct ohci_hcd *ohci;
-	int retval;
-	struct usb_hcd *hcd;
-	struct ohci_at91_priv *ohci_at91;
-	struct device *dev = &pdev->dev;
-	struct resource *res;
-	int irq;
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_dbg(dev, "hcd probe: missing irq resource\n");
-		return irq;
-	}
-
-	hcd = usb_create_hcd(driver, dev, "at91");
-	if (!hcd)
-		return -ENOMEM;
-	ohci_at91 = hcd_to_ohci_at91_priv(hcd);
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hcd->regs = devm_ioremap_resource(dev, res);
-	if (IS_ERR(hcd->regs)) {
-		retval = PTR_ERR(hcd->regs);
-		goto err;
-	}
-	hcd->rsrc_start = res->start;
-	hcd->rsrc_len = resource_size(res);
-
-	ohci_at91->iclk = devm_clk_get(dev, "ohci_clk");
-	if (IS_ERR(ohci_at91->iclk)) {
-		dev_err(dev, "failed to get ohci_clk\n");
-		retval = PTR_ERR(ohci_at91->iclk);
-		goto err;
-	}
-	ohci_at91->fclk = devm_clk_get(dev, "uhpck");
-	if (IS_ERR(ohci_at91->fclk)) {
-		dev_err(dev, "failed to get uhpck\n");
-		retval = PTR_ERR(ohci_at91->fclk);
-		goto err;
-	}
-	ohci_at91->hclk = devm_clk_get(dev, "hclk");
-	if (IS_ERR(ohci_at91->hclk)) {
-		dev_err(dev, "failed to get hclk\n");
-		retval = PTR_ERR(ohci_at91->hclk);
-		goto err;
-	}
-
-	board = hcd->self.controller->platform_data;
-	ohci = hcd_to_ohci(hcd);
-	ohci->num_ports = board->ports;
-	at91_start_hc(pdev);
-
-	retval = usb_add_hcd(hcd, irq, IRQF_SHARED);
-	if (retval == 0) {
-		device_wakeup_enable(hcd->self.controller);
-		return retval;
-	}
-
-	/* Error handling */
-	at91_stop_hc(pdev);
-
- err:
-	usb_put_hcd(hcd);
-	return retval;
-}
-
-
-/* may be called with controller, bus, and devices active */
-
-/**
- * usb_hcd_at91_remove - shutdown processing for AT91-based HCDs
- * @dev: USB Host Controller being removed
- * Context: !in_interrupt()
- *
- * Reverses the effect of usb_hcd_at91_probe(), first invoking
- * the HCD's stop() method.  It is always called from a thread
- * context, "rmmod" or something similar.
- *
- */
-static void usb_hcd_at91_remove(struct usb_hcd *hcd,
-				struct platform_device *pdev)
-{
-	usb_remove_hcd(hcd);
-	at91_stop_hc(pdev);
-	usb_put_hcd(hcd);
-}
-
-/*-------------------------------------------------------------------------*/
-static void ohci_at91_usb_set_power(struct at91_usbh_data *pdata, int port, int enable)
-{
-	if (!valid_port(port))
-		return;
-
-	if (!gpio_is_valid(pdata->vbus_pin[port]))
-		return;
-
-	gpio_set_value(pdata->vbus_pin[port],
-		       pdata->vbus_pin_active_low[port] ^ enable);
-}
-
-static int ohci_at91_usb_get_power(struct at91_usbh_data *pdata, int port)
-{
-	if (!valid_port(port))
-		return -EINVAL;
-
-	if (!gpio_is_valid(pdata->vbus_pin[port]))
-		return -EINVAL;
-
-	return gpio_get_value(pdata->vbus_pin[port]) ^
-		pdata->vbus_pin_active_low[port];
-}
-
-/*
- * Update the status data from the hub with the over-current indicator change.
- */
-static int ohci_at91_hub_status_data(struct usb_hcd *hcd, char *buf)
-{
-	struct at91_usbh_data *pdata = hcd->self.controller->platform_data;
-	int length = ohci_hub_status_data(hcd, buf);
-	int port;
-
-	at91_for_each_port(port) {
-		if (pdata->overcurrent_changed[port]) {
-			if (!length)
-				length = 1;
-			buf[0] |= 1 << (port + 1);
-		}
-	}
-
-	return length;
-}
-
-/*
- * Look at the control requests to the root hub and see if we need to override.
- */
-static int ohci_at91_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
-				 u16 wIndex, char *buf, u16 wLength)
-{
-	struct at91_usbh_data *pdata = dev_get_platdata(hcd->self.controller);
-	struct usb_hub_descriptor *desc;
-	int ret = -EINVAL;
-	u32 *data = (u32 *)buf;
-
-	dev_dbg(hcd->self.controller,
-		"ohci_at91_hub_control(%p,0x%04x,0x%04x,0x%04x,%p,%04x)\n",
-		hcd, typeReq, wValue, wIndex, buf, wLength);
-
-	wIndex--;
-
-	switch (typeReq) {
-	case SetPortFeature:
-		if (wValue == USB_PORT_FEAT_POWER) {
-			dev_dbg(hcd->self.controller, "SetPortFeat: POWER\n");
-			if (valid_port(wIndex)) {
-				ohci_at91_usb_set_power(pdata, wIndex, 1);
-				ret = 0;
-			}
-
-			goto out;
-		}
-		break;
-
-	case ClearPortFeature:
-		switch (wValue) {
-		case USB_PORT_FEAT_C_OVER_CURRENT:
-			dev_dbg(hcd->self.controller,
-				"ClearPortFeature: C_OVER_CURRENT\n");
-
-			if (valid_port(wIndex)) {
-				pdata->overcurrent_changed[wIndex] = 0;
-				pdata->overcurrent_status[wIndex] = 0;
-			}
-
-			goto out;
-
-		case USB_PORT_FEAT_OVER_CURRENT:
-			dev_dbg(hcd->self.controller,
-				"ClearPortFeature: OVER_CURRENT\n");
-
-			if (valid_port(wIndex))
-				pdata->overcurrent_status[wIndex] = 0;
-
-			goto out;
-
-		case USB_PORT_FEAT_POWER:
-			dev_dbg(hcd->self.controller,
-				"ClearPortFeature: POWER\n");
-
-			if (valid_port(wIndex)) {
-				ohci_at91_usb_set_power(pdata, wIndex, 0);
-				return 0;
-			}
-		}
-		break;
-	}
-
-	ret = ohci_hub_control(hcd, typeReq, wValue, wIndex + 1, buf, wLength);
-	if (ret)
-		goto out;
-
-	switch (typeReq) {
-	case GetHubDescriptor:
-
-		/* update the hub's descriptor */
-
-		desc = (struct usb_hub_descriptor *)buf;
-
-		dev_dbg(hcd->self.controller, "wHubCharacteristics 0x%04x\n",
-			desc->wHubCharacteristics);
-
-		/* remove the old configurations for power-switching, and
-		 * over-current protection, and insert our new configuration
-		 */
-
-		desc->wHubCharacteristics &= ~cpu_to_le16(HUB_CHAR_LPSM);
-		desc->wHubCharacteristics |=
-			cpu_to_le16(HUB_CHAR_INDV_PORT_LPSM);
-
-		if (pdata->overcurrent_supported) {
-			desc->wHubCharacteristics &= ~cpu_to_le16(HUB_CHAR_OCPM);
-			desc->wHubCharacteristics |=
-				cpu_to_le16(HUB_CHAR_INDV_PORT_OCPM);
-		}
-
-		dev_dbg(hcd->self.controller, "wHubCharacteristics after 0x%04x\n",
-			desc->wHubCharacteristics);
-
-		return ret;
-
-	case GetPortStatus:
-		/* check port status */
-
-		dev_dbg(hcd->self.controller, "GetPortStatus(%d)\n", wIndex);
-
-		if (valid_port(wIndex)) {
-			if (!ohci_at91_usb_get_power(pdata, wIndex))
-				*data &= ~cpu_to_le32(RH_PS_PPS);
-
-			if (pdata->overcurrent_changed[wIndex])
-				*data |= cpu_to_le32(RH_PS_OCIC);
-
-			if (pdata->overcurrent_status[wIndex])
-				*data |= cpu_to_le32(RH_PS_POCI);
-		}
-	}
-
- out:
-	return ret;
-}
-
-/*-------------------------------------------------------------------------*/
-
-static irqreturn_t ohci_hcd_at91_overcurrent_irq(int irq, void *data)
-{
-	struct platform_device *pdev = data;
-	struct at91_usbh_data *pdata = dev_get_platdata(&pdev->dev);
-	int val, gpio, port;
-
-	/* From the GPIO notifying the over-current situation, find
-	 * out the corresponding port */
-	at91_for_each_port(port) {
-		if (gpio_is_valid(pdata->overcurrent_pin[port]) &&
-				gpio_to_irq(pdata->overcurrent_pin[port]) == irq) {
-			gpio = pdata->overcurrent_pin[port];
-			break;
-		}
-	}
-
-	if (port == AT91_MAX_USBH_PORTS) {
-		dev_err(& pdev->dev, "overcurrent interrupt from unknown GPIO\n");
-		return IRQ_HANDLED;
-	}
-
-	val = gpio_get_value(gpio);
-
-	/* When notified of an over-current situation, disable power
-	   on the corresponding port, and mark this port in
-	   over-current. */
-	if (!val) {
-		ohci_at91_usb_set_power(pdata, port, 0);
-		pdata->overcurrent_status[port]  = 1;
-		pdata->overcurrent_changed[port] = 1;
-	}
-
-	dev_dbg(& pdev->dev, "overcurrent situation %s\n",
-		val ? "exited" : "notified");
-
-	return IRQ_HANDLED;
-}
-
-static const struct of_device_id at91_ohci_dt_ids[] = {
-	{ .compatible = "atmel,at91rm9200-ohci" },
-	{ /* sentinel */ }
-};
-
-MODULE_DEVICE_TABLE(of, at91_ohci_dt_ids);
-
-/*-------------------------------------------------------------------------*/
-
-static int ohci_hcd_at91_drv_probe(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct at91_usbh_data	*pdata;
-	int			i;
-	int			gpio;
-	int			ret;
-	enum of_gpio_flags	flags;
-	u32			ports;
-
-	/* Right now device-tree probed devices don't get dma_mask set.
-	 * Since shared usb code relies on it, set it here for now.
-	 * Once we have dma capability bindings this can go away.
-	 */
-	ret = dma_coerce_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (ret)
-		return ret;
-
-	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
-	if (!pdata)
-		return -ENOMEM;
-
-	pdev->dev.platform_data = pdata;
-
-	if (!of_property_read_u32(np, "num-ports", &ports))
-		pdata->ports = ports;
-
-	at91_for_each_port(i) {
-		/*
-		 * do not configure PIO if not in relation with
-		 * real USB port on board
-		 */
-		if (i >= pdata->ports) {
-			pdata->vbus_pin[i] = -EINVAL;
-			pdata->overcurrent_pin[i] = -EINVAL;
-			continue;
-		}
-
-		gpio = of_get_named_gpio_flags(np, "atmel,vbus-gpio", i,
-					       &flags);
-		pdata->vbus_pin[i] = gpio;
-		if (!gpio_is_valid(gpio))
-			continue;
-		pdata->vbus_pin_active_low[i] = flags & OF_GPIO_ACTIVE_LOW;
-
-		ret = gpio_request(gpio, "ohci_vbus");
-		if (ret) {
-			dev_err(&pdev->dev,
-				"can't request vbus gpio %d\n", gpio);
-			continue;
-		}
-		ret = gpio_direction_output(gpio,
-					!pdata->vbus_pin_active_low[i]);
-		if (ret) {
-			dev_err(&pdev->dev,
-				"can't put vbus gpio %d as output %d\n",
-				gpio, !pdata->vbus_pin_active_low[i]);
-			gpio_free(gpio);
-			continue;
-		}
-
-		ohci_at91_usb_set_power(pdata, i, 1);
-	}
-
-	at91_for_each_port(i) {
-		if (i >= pdata->ports)
-			break;
-
-		pdata->overcurrent_pin[i] =
-			of_get_named_gpio_flags(np, "atmel,oc-gpio", i, &flags);
-
-		if (!gpio_is_valid(pdata->overcurrent_pin[i]))
-			continue;
-		gpio = pdata->overcurrent_pin[i];
-
-		ret = gpio_request(gpio, "ohci_overcurrent");
-		if (ret) {
-			dev_err(&pdev->dev,
-				"can't request overcurrent gpio %d\n",
-				gpio);
-			continue;
-		}
-
-		ret = gpio_direction_input(gpio);
-		if (ret) {
-			dev_err(&pdev->dev,
-				"can't configure overcurrent gpio %d as input\n",
-				gpio);
-			gpio_free(gpio);
-			continue;
-		}
-
-		ret = request_irq(gpio_to_irq(gpio),
-				  ohci_hcd_at91_overcurrent_irq,
-				  IRQF_SHARED, "ohci_overcurrent", pdev);
-		if (ret) {
-			gpio_free(gpio);
-			dev_err(&pdev->dev,
-				"can't get gpio IRQ for overcurrent\n");
-		}
-	}
-
-	device_init_wakeup(&pdev->dev, 1);
-	return usb_hcd_at91_probe(&ohci_at91_hc_driver, pdev);
-}
-
-static int ohci_hcd_at91_drv_remove(struct platform_device *pdev)
-{
-	struct at91_usbh_data	*pdata = dev_get_platdata(&pdev->dev);
-	int			i;
-
-	if (pdata) {
-		at91_for_each_port(i) {
-			if (!gpio_is_valid(pdata->vbus_pin[i]))
-				continue;
-			ohci_at91_usb_set_power(pdata, i, 0);
-			gpio_free(pdata->vbus_pin[i]);
-		}
-
-		at91_for_each_port(i) {
-			if (!gpio_is_valid(pdata->overcurrent_pin[i]))
-				continue;
-			free_irq(gpio_to_irq(pdata->overcurrent_pin[i]), pdev);
-			gpio_free(pdata->overcurrent_pin[i]);
-		}
-	}
-
-	device_init_wakeup(&pdev->dev, 0);
-	usb_hcd_at91_remove(platform_get_drvdata(pdev), pdev);
-	return 0;
-}
-
-#ifdef CONFIG_PM
-
-static int
-ohci_hcd_at91_drv_suspend(struct device *dev)
-{
-	struct usb_hcd	*hcd = dev_get_drvdata(dev);
-	struct ohci_hcd	*ohci = hcd_to_ohci(hcd);
-	struct ohci_at91_priv *ohci_at91 = hcd_to_ohci_at91_priv(hcd);
-	int		ret;
-
-	/*
-	 * Disable wakeup if we are going to sleep with slow clock mode
-	 * enabled.
-	 */
-	ohci_at91->wakeup = device_may_wakeup(dev)
-			&& !at91_suspend_entering_slow_clock();
-
-	if (ohci_at91->wakeup)
-		enable_irq_wake(hcd->irq);
-
-	ret = ohci_suspend(hcd, ohci_at91->wakeup);
-	if (ret) {
-		if (ohci_at91->wakeup)
-			disable_irq_wake(hcd->irq);
-		return ret;
-	}
-	/*
-	 * The integrated transceivers seem unable to notice disconnect,
-	 * reconnect, or wakeup without the 48 MHz clock active.  so for
-	 * correctness, always discard connection state (using reset).
-	 *
-	 * REVISIT: some boards will be able to turn VBUS off...
-	 */
-	if (!ohci_at91->wakeup) {
-		ohci->hc_control = ohci_readl(ohci, &ohci->regs->control);
-		ohci->hc_control &= OHCI_CTRL_RWC;
-		ohci_writel(ohci, ohci->hc_control, &ohci->regs->control);
-		ohci->rh_state = OHCI_RH_HALTED;
-
-		/* flush the writes */
-		(void) ohci_readl (ohci, &ohci->regs->control);
-		at91_stop_clock(ohci_at91);
-	}
-
-	return ret;
-}
-
-static int ohci_hcd_at91_drv_resume(struct device *dev)
-{
-	struct usb_hcd	*hcd = dev_get_drvdata(dev);
-	struct ohci_at91_priv *ohci_at91 = hcd_to_ohci_at91_priv(hcd);
-
-	if (ohci_at91->wakeup)
-		disable_irq_wake(hcd->irq);
-
-	at91_start_clock(ohci_at91);
-
-	ohci_resume(hcd, false);
-	/*
-	 * According to the comment in ohci_hcd_at91_drv_suspend()
-	 * we need to do a reset if the 48Mhz clock was stopped,
-	 * that is, if ohci_at91->wakeup is clear. Tell ohci_resume()
-	 * to reset in this case by setting its "hibernated" flag.
-	 */
-	ohci_resume(hcd, !ohci_at91->wakeup);
-
-	return 0;
-}
-#endif
-
-static SIMPLE_DEV_PM_OPS(ohci_hcd_at91_pm_ops, ohci_hcd_at91_drv_suspend,
-					ohci_hcd_at91_drv_resume);
-
-static struct platform_driver ohci_hcd_at91_driver = {
-	.probe		= ohci_hcd_at91_drv_probe,
-	.remove		= ohci_hcd_at91_drv_remove,
-	.shutdown	= usb_hcd_platform_shutdown,
-	.driver		= {
-		.name	= "at91_ohci",
-		.pm	= &ohci_hcd_at91_pm_ops,
-		.of_match_table	= at91_ohci_dt_ids,
-	},
-};
-
-static int __init ohci_at91_init(void)
-{
-	if (usb_disabled())
-		return -ENODEV;
-
-	pr_info("%s: " DRIVER_DESC "\n", hcd_name);
-	ohci_init_driver(&ohci_at91_hc_driver, &ohci_at91_drv_overrides);
-
-	/*
-	 * The Atmel HW has some unusual quirks, which require Atmel-specific
-	 * workarounds. We override certain hc_driver functions here to
-	 * achieve that. We explicitly do not enhance ohci_driver_overrides to
-	 * allow this more easily, since this is an unusual case, and we don't
-	 * want to encourage others to override these functions by making it
-	 * too easy.
-	 */
-
-	ohci_at91_hc_driver.hub_status_data	= ohci_at91_hub_status_data;
-	ohci_at91_hc_driver.hub_control		= ohci_at91_hub_control;
-
-	return platform_driver_register(&ohci_hcd_at91_driver);
-}
-module_init(ohci_at91_init);
-
-static void __exit ohci_at91_cleanup(void)
-{
-	platform_driver_unregister(&ohci_hcd_at91_driver);
-}
-module_exit(ohci_at91_cleanup);
-
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:at91_ohci");
+S_CLK5_SEL__SHIFT 0x0
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE1_PIN_SEL_MASK 0x1f
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE1_PIN_SEL__SHIFT 0x0
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE1_REGBIT_SEL_MASK 0x3e0
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE1_REGBIT_SEL__SHIFT 0x5
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE1_EN_MASK 0x1000
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE1_EN__SHIFT 0xc
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE2_PIN_SEL_MASK 0xf8000
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE2_PIN_SEL__SHIFT 0xf
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE2_REGBIT_SEL_MASK 0x1f00000
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE2_REGBIT_SEL__SHIFT 0x14
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE2_EN_MASK 0x10000000
+#define DCDEBUG_OUT_PIN_OVERRIDE__DCDEBUG_OUT_OVERRIDE2_EN__SHIFT 0x1c
+#define DCDEBUG_OUT_CNTL__DCDEBUG_BLOCK_SEL_MASK 0x1f
+#define DCDEBUG_OUT_CNTL__DCDEBUG_BLOCK_SEL__SHIFT 0x0
+#define DCDEBUG_OUT_CNTL__DCDEBUG_OUT_24BIT_SEL_MASK 0x800000
+#define DCDEBUG_OUT_CNTL__DCDEBUG_OUT_24BIT_SEL__SHIFT 0x17
+#define DCDEBUG_OUT_CNTL__DCDEBUG_CLK_SEL_MASK 0x1f000000
+#define DCDEBUG_OUT_CNTL__DCDEBUG_CLK_SEL__SHIFT 0x18
+#define DCDEBUG_OUT_DATA__DCDEBUG_OUT_DATA_MASK 0xffffffff
+#define DCDEBUG_OUT_DATA__DCDEBUG_OUT_DATA__SHIFT 0x0
+#define DMIF_ADDR_CONFIG__NUM_PIPES_MASK 0x7
+#define DMIF_ADDR_CONFIG__NUM_PIPES__SHIFT 0x0
+#define DMIF_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE_MASK 0x70
+#define DMIF_ADDR_CONFIG__PIPE_INTERLEAVE_SIZE__SHIFT 0x4
+#define DMIF_ADDR_CONFIG__BANK_INTERLEAVE_SIZE_MASK 0x700
+#define DMIF_ADDR_CONFIG__BANK_INTERLEAVE_SIZE__SHIFT 0x8
+#define DMIF_ADDR_CONFIG__NUM_SHADER_ENGINES_MASK 0x3000
+#define DMIF_ADDR_CONFIG__NUM_SHADER_ENGINES__SHIFT 0xc
+#define DMIF_ADDR_CONFIG__SHADER_ENGINE_TILE_SIZE_MASK 0x70000
+#define DMIF_ADDR_CONFIG__SHADER_ENGINE_TILE_SIZE__SHIFT 0x10
+#define DMIF_ADDR_CONFIG__ROW_SIZE_MASK 0x30000000
+#define DMIF_ADDR_CONFIG__ROW_SIZE__SHIFT 0x1c
+#define DMIF_ADDR_CONFIG__NUM_LOWER_PIPES_MASK 0x40000000
+#define DMIF_ADDR_CONFIG__NUM_LOWER_PIPES__SHIFT 0x1e
+#define DMIF_CONTROL__DMIF_BUFF_SIZE_MASK 0x3
+#define DMIF_CONTROL__DMIF_BUFF_SIZE__SHIFT 0x0
+#define DMIF_CONTROL__DMIF_GROUP_REQUESTS_IN_CHUNK_MASK 0x4
+#define DMIF_CONTROL__DMIF_GROUP_REQUESTS_IN_CHUNK__SHIFT 0x2
+#define DMIF_CONTROL__DMIF_DISABLE_EARLY_RECEIVED_LEVEL_COUNT_MASK 0x10
+#define DMIF_CONTROL__DMIF_DISABLE_EARLY_RECEIVED_LEVEL_COUNT__SHIFT 0x4
+#define DMIF_CONTROL__DMIF_REQ_BURST_SIZE_MASK 0x700
+#define DMIF_CONTROL__DMIF_REQ_BURST_SIZE__SHIFT 0x8
+#define DMIF_CONTROL__DMIF_UNDERFLOW_RECOVERY_EN_MASK 0x800
+#define DMIF_CONTROL__DMIF_UNDERFLOW_RECOVERY_EN__SHIFT 0xb
+#define DMIF_CONTROL__DMIF_FORCE_TOTAL_REQ_BURST_SIZE_MASK 0xf000
+#define DMIF_CONTROL__DMIF_FORCE_TOTAL_REQ_BURST_SIZE__SHIFT 0xc
+#define DMIF_CONTROL__DMIF_MAX_TOTAL_OUTSTANDING_CHUNK_REQUESTS_MASK 0x3f0000
+#define DMIF_CONTROL__DMIF_MAX_TOTAL_OUTSTANDING_CHUNK_REQUESTS__SHIFT 0x10
+#define DMIF_CONTROL__DMIF_DELAY_ARBITRATION_MASK 0x1f000000
+#define DMIF_CONTROL__DMIF_DELAY_ARBITRATION__SHIFT 0x18
+#define DMIF_CONTROL__DMIF_CHUNK_BUFF_MARGIN_MASK 0x60000000
+#define DMIF_CONTROL__DMIF_CHUNK_BUFF_MARGIN__SHIFT 0x1d
+#define DMIF_STATUS__DMIF_MC_SEND_ON_IDLE_MASK 0xff
+#define DMIF_STATUS__DMIF_MC_SEND_ON_IDLE__SHIFT 0x0
+#define DMIF_STATUS__DMIF_CLEAR_MC_SEND_ON_IDLE_MASK 0xff00
+#define DMIF_STATUS__DMIF_CLEAR_MC_SEND_ON_IDLE__SHIFT 0x8
+#define DMIF_STATUS__DMIF_MC_LATENCY_COUNTER_ENABLE_MASK 0x10000
+#define DMIF_STATUS__DMIF_MC_LATENCY_COUNTER_ENABLE__SHIFT 0x10
+#define DMIF_STATUS__DMIF_MC_LATENCY_COUNTER_URGENT_ONLY_MASK 0x20000
+#define DMIF_STATUS__DMIF_MC_LATENCY_COUNTER_URGENT_ONLY__SHIFT 0x11
+#define DMIF_STATUS__DMIF_MC_LATENCY_COUNTER_SOURCE_SELECT_MASK 0x700000
+#define DMIF_STATUS__DMIF_MC_LATENCY_COUNTER_SOURCE_SELECT__SHIFT 0x14
+#define DMIF_STATUS__DMIF_PERFORMANCE_COUNTER_SOURCE_SELECT_MASK 0x7000000
+#define DMIF_STATUS__DMIF_PERFORMANCE_COUNTER_SOURCE_SELECT__SHIFT 0x18
+#define DMIF_STATUS__DMIF_UNDERFLOW_MASK 0x10000000
+#define DMIF_STATUS__DMIF_UNDERFLOW__SHIFT 0x1c
+#define DMIF_HW_DEBUG__DMIF_HW_DEBUG_MASK 0xffffffff
+#define DMIF_HW_DEBUG__DMIF_HW_DEBUG__SHIFT 0x0
+#define DMIF_ARBITRATION_CONTROL__DMIF_ARBITRATION_REFERENCE_CLOCK_PERIOD_MASK 0xffff
+#define DMIF_ARBITRATION_CONTROL__DMIF_ARBITRATION_REFERENCE_CLOCK_PERIOD__SHIFT 0x0
+#define DMIF_ARBITRATION_CONTROL__PIPE_SWITCH_EFFICIENCY_WEIGHT_MASK 0xffff0000
+#define DMIF_ARBITRATION_CONTROL__PIPE_SWITCH_EFFICIENCY_WEIGHT__SHIFT 0x10
+#define PIPE0_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT_MASK 0xffff
+#define PIPE0_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT__SHIFT 0x0
+#define PIPE1_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT_MASK 0xffff
+#define PIPE1_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT__SHIFT 0x0
+#define PIPE2_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT_MASK 0xffff
+#define PIPE2_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT__SHIFT 0x0
+#define PIPE3_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT_MASK 0xffff
+#define PIPE3_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT__SHIFT 0x0
+#define PIPE4_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT_MASK 0xffff
+#define PIPE4_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT__SHIFT 0x0
+#define PIPE5_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT_MASK 0xffff
+#define PIPE5_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT__SHIFT 0x0
+#define PIPE6_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT_MASK 0xffff
+#define PIPE6_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT__SHIFT 0x0
+#define PIPE7_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT_MASK 0xffff
+#define PIPE7_ARBITRATION_CONTROL3__EFFICIENCY_WEIGHT__SHIFT 0x0
+#define DMIF_P_VMID__P_VMID_PIPE0_MASK 0xf
+#define DMIF_P_VMID__P_VMID_PIPE0__SHIFT 0x0
+#define DMIF_P_VMID__P_VMID_PIPE1_MASK 0xf0
+#define DMIF_P_VMID__P_VMID_PIPE1__SHIFT 0x4
+#define DMIF_P_VMID__P_VMID_PIPE2_MASK 0xf00
+#define DMIF_P_VMID__P_VMID_PIPE2__SHIFT 0x8
+#define DMIF_P_VMID__P_VMID_PIPE3_MASK 0xf000
+#define DMIF_P_VMID__P_VMID_PIPE3__SHIFT 0xc
+#define DMIF_P_VMID__P_VMID_PIPE4_MASK 0xf0000
+#define DMIF_P_VMID__P_VMID_PIPE4__SHIFT 0x10
+#define DMIF_P_VMID__P_VMID_PIPE5_MASK 0xf00000
+#define DMIF_P_VMID__P_VMID_PIPE5__SHIFT 0x14
+#define DMIF_P_VMID__P_VMID_PIPE6_MASK 0xf000000
+#define DMIF_P_VMID__P_VMID_PIPE6__SHIFT 0x18
+#define DMIF_P_VMID__P_VMID_PIPE7_MASK 0xf0000000
+#define DMIF_P_VMID__P_VMID_PIPE7__SHIFT 0x1c
+#define DMIF_URG_OVERRIDE__DMIF_URG_OVERRIDE_EN_MASK 0x1
+#define DMIF_URG_OVERRIDE__DMIF_URG_OVERRIDE_EN__SHIFT 0x0
+#define DMIF_URG_OVERRIDE__DMIF_URG_OVERRIDE_LEVEL_MASK 0xf0
+#define DMIF_URG_OVERRIDE__DMIF_URG_OVERRIDE_LEVEL__SHIFT 0x4
+#define DMIF_TEST_DEBUG_INDEX__DMIF_TEST_DEBUG_INDEX_MASK 0xff
+#define DMIF_TEST_DEBUG_INDEX__DMIF_TEST_DEBUG_INDEX__SHIFT 0x0
+#define DMIF_TEST_DEBUG_INDEX__DMIF_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define DMIF_TEST_DEBUG_INDEX__DMIF_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define DMIF_TEST_DEBUG_DATA__DMIF_TEST_DEBUG_DATA_MASK 0xffffffff
+#define DMIF_TEST_DEBUG_DATA__DMIF_TEST_DEBUG_DATA__SHIFT 0x0
+#define DMIF_DEBUG02_CORE0__DB_DATA_MASK 0xffff
+#define DMIF_DEBUG02_CORE0__DB_DATA__SHIFT 0x0
+#define DMIF_DEBUG02_CORE0__MC_RDRET_COUNT_EN_MASK 0x10000
+#define DMIF_DEBUG02_CORE0__MC_RDRET_COUNT_EN__SHIFT 0x10
+#define DMIF_DEBUG02_CORE0__MC_RDRET_COUNTER_MASK 0xffe0000
+#define DMIF_DEBUG02_CORE0__MC_RDRET_COUNTER__SHIFT 0x11
+#define DMIF_DEBUG02_CORE1__DB_DATA_MASK 0xffff
+#define DMIF_DEBUG02_CORE1__DB_DATA__SHIFT 0x0
+#define DMIF_DEBUG02_CORE1__MC_RDRET_COUNT_EN_MASK 0x10000
+#define DMIF_DEBUG02_CORE1__MC_RDRET_COUNT_EN__SHIFT 0x10
+#define DMIF_DEBUG02_CORE1__MC_RDRET_COUNTER_MASK 0xffe0000
+#define DMIF_DEBUG02_CORE1__MC_RDRET_COUNTER__SHIFT 0x11
+#define DMIF_ADDR_CALC__ADDR_CONFIG_PIPE_INTERLEAVE_SIZE_MASK 0x70
+#define DMIF_ADDR_CALC__ADDR_CONFIG_PIPE_INTERLEAVE_SIZE__SHIFT 0x4
+#define DMIF_ADDR_CALC__ADDR_CONFIG_ROW_SIZE_MASK 0x30000000
+#define DMIF_ADDR_CALC__ADDR_CONFIG_ROW_SIZE__SHIFT 0x1c
+#define DMIF_STATUS2__DMIF_PIPE0_DISPCLK_STATUS_MASK 0x1
+#define DMIF_STATUS2__DMIF_PIPE0_DISPCLK_STATUS__SHIFT 0x0
+#define DMIF_STATUS2__DMIF_PIPE1_DISPCLK_STATUS_MASK 0x2
+#define DMIF_STATUS2__DMIF_PIPE1_DISPCLK_STATUS__SHIFT 0x1
+#define DMIF_STATUS2__DMIF_PIPE2_DISPCLK_STATUS_MASK 0x4
+#define DMIF_STATUS2__DMIF_PIPE2_DISPCLK_STATUS__SHIFT 0x2
+#define DMIF_STATUS2__DMIF_PIPE3_DISPCLK_STATUS_MASK 0x8
+#define DMIF_STATUS2__DMIF_PIPE3_DISPCLK_STATUS__SHIFT 0x3
+#define DMIF_STATUS2__DMIF_PIPE4_DISPCLK_STATUS_MASK 0x10
+#define DMIF_STATUS2__DMIF_PIPE4_DISPCLK_STATUS__SHIFT 0x4
+#define DMIF_STATUS2__DMIF_PIPE5_DISPCLK_STATUS_MASK 0x20
+#define DMIF_STATUS2__DMIF_PIPE5_DISPCLK_STATUS__SHIFT 0x5
+#define DMIF_STATUS2__DMIF_CHUNK_TRACKER_SCLK_STATUS_MASK 0x100
+#define DMIF_STATUS2__DMIF_CHUNK_TRACKER_SCLK_STATUS__SHIFT 0x8
+#define DMIF_STATUS2__DMIF_FBC_TRACKER_SCLK_STATUS_MASK 0x200
+#define DMIF_STATUS2__DMIF_FBC_TRACKER_SCLK_STATUS__SHIFT 0x9
+#define PIPE0_MAX_REQUESTS__MAX_REQUESTS_MASK 0x3ff
+#define PIPE0_MAX_REQUESTS__MAX_REQUESTS__SHIFT 0x0
+#define PIPE1_MAX_REQUESTS__MAX_REQUESTS_MASK 0x3ff
+#define PIPE1_MAX_REQUESTS__MAX_REQUESTS__SHIFT 0x0
+#define PIPE2_MAX_REQUESTS__MAX_REQUESTS_MASK 0x3ff
+#define PIPE2_MAX_REQUESTS__MAX_REQUESTS__SHIFT 0x0
+#define PIPE3_MAX_REQUESTS__MAX_REQUESTS_MASK 0x3ff
+#define PIPE3_MAX_REQUESTS__MAX_REQUESTS__SHIFT 0x0
+#define PIPE4_MAX_REQUESTS__MAX_REQUESTS_MASK 0x3ff
+#define PIPE4_MAX_REQUESTS__MAX_REQUESTS__SHIFT 0x0
+#define PIPE5_MAX_REQUESTS__MAX_REQUESTS_MASK 0x3ff
+#define PIPE5_MAX_REQUESTS__MAX_REQUESTS__SHIFT 0x0
+#define PIPE6_MAX_REQUESTS__MAX_REQUESTS_MASK 0x3ff
+#define PIPE6_MAX_REQUESTS__MAX_REQUESTS__SHIFT 0x0
+#define PIPE7_MAX_REQUESTS__MAX_REQUESTS_MASK 0x3ff
+#define PIPE7_MAX_REQUESTS__MAX_REQUESTS__SHIFT 0x0
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_ENABLE_MASK 0x1
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_ENABLE__SHIFT 0x0
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_MODE_MASK 0x18
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_MODE__SHIFT 0x3
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_NUM_PIPES_MASK 0xe0
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_NUM_PIPES__SHIFT 0x5
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_NUM_BANKS_MASK 0x700
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_NUM_BANKS__SHIFT 0x8
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_PIPE_INTERLEAVE_SIZE_MASK 0x800
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_PIPE_INTERLEAVE_SIZE__SHIFT 0xb
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_ROW_SIZE_MASK 0x7000
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_ROW_SIZE__SHIFT 0xc
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_ROWS_PER_CHAN_MASK 0xfff0000
+#define LOW_POWER_TILING_CONTROL__LOW_POWER_TILING_ROWS_PER_CHAN__SHIFT 0x10
+#define MCIF_CONTROL__MCIF_BUFF_SIZE_MASK 0x3
+#define MCIF_CONTROL__MCIF_BUFF_SIZE__SHIFT 0x0
+#define MCIF_CONTROL__ADDRESS_TRANSLATION_ENABLE_MASK 0x10
+#define MCIF_CONTROL__ADDRESS_TRANSLATION_ENABLE__SHIFT 0x4
+#define MCIF_CONTROL__PRIVILEGED_ACCESS_ENABLE_MASK 0x100
+#define MCIF_CONTROL__PRIVILEGED_ACCESS_ENABLE__SHIFT 0x8
+#define MCIF_CONTROL__MCIF_SLOW_REQ_INTERVAL_MASK 0xf000
+#define MCIF_CONTROL__MCIF_SLOW_REQ_INTERVAL__SHIFT 0xc
+#define MCIF_CONTROL__LOW_READ_URG_LEVEL_MASK 0xff0000
+#define MCIF_CONTROL__LOW_READ_URG_LEVEL__SHIFT 0x10
+#define MCIF_CONTROL__MC_CLEAN_DEASSERT_LATENCY_MASK 0x3f000000
+#define MCIF_CONTROL__MC_CLEAN_DEASSERT_LATENCY__SHIFT 0x18
+#define MCIF_CONTROL__MCIF_MC_LATENCY_COUNTER_ENABLE_MASK 0x40000000
+#define MCIF_CONTROL__MCIF_MC_LATENCY_COUNTER_ENABLE__SHIFT 0x1e
+#define MCIF_CONTROL__MCIF_MC_LATENCY_COUNTER_URGENT_ONLY_MASK 0x80000000
+#define MCIF_CONTROL__MCIF_MC_LATENCY_COUNTER_URGENT_ONLY__SHIFT 0x1f
+#define MCIF_WRITE_COMBINE_CONTROL__MCIF_WRITE_COMBINE_TIMEOUT_MASK 0xff
+#define MCIF_WRITE_COMBINE_CONTROL__MCIF_WRITE_COMBINE_TIMEOUT__SHIFT 0x0
+#define MCIF_WRITE_COMBINE_CONTROL__VIP_WRITE_COMBINE_TIMEOUT_MASK 0xff00
+#define MCIF_WRITE_COMBINE_CONTROL__VIP_WRITE_COMBINE_TIMEOUT__SHIFT 0x8
+#define MCIF_TEST_DEBUG_INDEX__MCIF_TEST_DEBUG_INDEX_MASK 0xff
+#define MCIF_TEST_DEBUG_INDEX__MCIF_TEST_DEBUG_INDEX__SHIFT 0x0
+#define MCIF_TEST_DEBUG_INDEX__MCIF_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define MCIF_TEST_DEBUG_INDEX__MCIF_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define MCIF_TEST_DEBUG_DATA__MCIF_TEST_DEBUG_DATA_MASK 0xffffffff
+#define MCIF_TEST_DEBUG_DATA__MCIF_TEST_DEBUG_DATA__SHIFT 0x0
+#define IDDCCIF02_DBG_DCCIF_C__DBG_DCCIF_C_MASK 0xffffffff
+#define IDDCCIF02_DBG_DCCIF_C__DBG_DCCIF_C__SHIFT 0x0
+#define IDDCCIF04_DBG_DCCIF_E__DBG_DCCIF_E_MASK 0xffffffff
+#define IDDCCIF04_DBG_DCCIF_E__DBG_DCCIF_E__SHIFT 0x0
+#define IDDCCIF05_DBG_DCCIF_F__DBG_DCCIF_F_MASK 0xffffffff
+#define IDDCCIF05_DBG_DCCIF_F__DBG_DCCIF_F__SHIFT 0x0
+#define MCIF_VMID__MCIF_WR_VMID_MASK 0xf
+#define MCIF_VMID__MCIF_WR_VMID__SHIFT 0x0
+#define MCIF_VMID__VIP_WR_VMID_MASK 0xf0
+#define MCIF_VMID__VIP_WR_VMID__SHIFT 0x4
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_MODE_DIS_MASK 0x1
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_MODE_DIS__SHIFT 0x0
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_MODE_MASK 0x30
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_MODE__SHIFT 0x4
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_SIZE_MASK 0xff00
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_SIZE__SHIFT 0x8
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_PIPE_MASK 0x70000
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_PIPE__SHIFT 0x10
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_TYPE_MASK 0x180000
+#define MCIF_MEM_CONTROL__MCIFMEM_CACHE_TYPE__SHIFT 0x13
+#define CC_DC_PIPE_DIS__DC_PIPE_DIS_MASK 0x7e
+#define CC_DC_PIPE_DIS__DC_PIPE_DIS__SHIFT 0x1
+#define CC_DC_PIPE_DIS__MCIF_WB_URG_OVRD_MASK 0x100
+#define CC_DC_PIPE_DIS__MCIF_WB_URG_OVRD__SHIFT 0x8
+#define CC_DC_PIPE_DIS__MCIF_WB_URG_LVL_MASK 0x1e00
+#define CC_DC_PIPE_DIS__MCIF_WB_URG_LVL__SHIFT 0x9
+#define MC_DC_INTERFACE_NACK_STATUS__DMIF_RDRET_NACK_OCCURRED_MASK 0x1
+#define MC_DC_INTERFACE_NACK_STATUS__DMIF_RDRET_NACK_OCCURRED__SHIFT 0x0
+#define MC_DC_INTERFACE_NACK_STATUS__DMIF_RDRET_NACK_CLEAR_MASK 0x10
+#define MC_DC_INTERFACE_NACK_STATUS__DMIF_RDRET_NACK_CLEAR__SHIFT 0x4
+#define MC_DC_INTERFACE_NACK_STATUS__VIP_WRRET_NACK_OCCURRED_MASK 0x100
+#define MC_DC_INTERFACE_NACK_STATUS__VIP_WRRET_NACK_OCCURRED__SHIFT 0x8
+#define MC_DC_INTERFACE_NACK_STATUS__VIP_WRRET_NACK_CLEAR_MASK 0x1000
+#define MC_DC_INTERFACE_NACK_STATUS__VIP_WRRET_NACK_CLEAR__SHIFT 0xc
+#define MC_DC_INTERFACE_NACK_STATUS__MCIF_RDRET_NACK_OCCURRED_MASK 0x10000
+#define MC_DC_INTERFACE_NACK_STATUS__MCIF_RDRET_NACK_OCCURRED__SHIFT 0x10
+#define MC_DC_INTERFACE_NACK_STATUS__MCIF_RDRET_NACK_CLEAR_MASK 0x100000
+#define MC_DC_INTERFACE_NACK_STATUS__MCIF_RDRET_NACK_CLEAR__SHIFT 0x14
+#define MC_DC_INTERFACE_NACK_STATUS__MCIF_WRRET_NACK_OCCURRED_MASK 0x1000000
+#define MC_DC_INTERFACE_NACK_STATUS__MCIF_WRRET_NACK_OCCURRED__SHIFT 0x18
+#define MC_DC_INTERFACE_NACK_STATUS__MCIF_WRRET_NACK_CLEAR_MASK 0x10000000
+#define MC_DC_INTERFACE_NACK_STATUS__MCIF_WRRET_NACK_CLEAR__SHIFT 0x1c
+#define RBBMIF_TIMEOUT__RBBMIF_TIMEOUT_DELAY_MASK 0xfffff
+#define RBBMIF_TIMEOUT__RBBMIF_TIMEOUT_DELAY__SHIFT 0x0
+#define RBBMIF_TIMEOUT__RBBMIF_ACK_HOLD_MASK 0xfff00000
+#define RBBMIF_TIMEOUT__RBBMIF_ACK_HOLD__SHIFT 0x14
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_CLIENTS_DEC_MASK 0x7fff
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_CLIENTS_DEC__SHIFT 0x0
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_OP_MASK 0x10000000
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_OP__SHIFT 0x1c
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_RDWR_STATUS_MASK 0x20000000
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_RDWR_STATUS__SHIFT 0x1d
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_ACK_MASK 0x40000000
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_ACK__SHIFT 0x1e
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_MASK_MASK 0x80000000
+#define RBBMIF_STATUS__RBBMIF_TIMEOUT_MASK__SHIFT 0x1f
+#define RBBMIF_TIMEOUT_DIS__CLIENT0_TIMEOUT_DIS_MASK 0x1
+#define RBBMIF_TIMEOUT_DIS__CLIENT0_TIMEOUT_DIS__SHIFT 0x0
+#define RBBMIF_TIMEOUT_DIS__CLIENT1_TIMEOUT_DIS_MASK 0x2
+#define RBBMIF_TIMEOUT_DIS__CLIENT1_TIMEOUT_DIS__SHIFT 0x1
+#define RBBMIF_TIMEOUT_DIS__CLIENT2_TIMEOUT_DIS_MASK 0x4
+#define RBBMIF_TIMEOUT_DIS__CLIENT2_TIMEOUT_DIS__SHIFT 0x2
+#define RBBMIF_TIMEOUT_DIS__CLIENT3_TIMEOUT_DIS_MASK 0x8
+#define RBBMIF_TIMEOUT_DIS__CLIENT3_TIMEOUT_DIS__SHIFT 0x3
+#define RBBMIF_TIMEOUT_DIS__CLIENT4_TIMEOUT_DIS_MASK 0x10
+#define RBBMIF_TIMEOUT_DIS__CLIENT4_TIMEOUT_DIS__SHIFT 0x4
+#define RBBMIF_TIMEOUT_DIS__CLIENT5_TIMEOUT_DIS_MASK 0x20
+#define RBBMIF_TIMEOUT_DIS__CLIENT5_TIMEOUT_DIS__SHIFT 0x5
+#define RBBMIF_TIMEOUT_DIS__CLIENT6_TIMEOUT_DIS_MASK 0x40
+#define RBBMIF_TIMEOUT_DIS__CLIENT6_TIMEOUT_DIS__SHIFT 0x6
+#define RBBMIF_TIMEOUT_DIS__CLIENT7_TIMEOUT_DIS_MASK 0x80
+#define RBBMIF_TIMEOUT_DIS__CLIENT7_TIMEOUT_DIS__SHIFT 0x7
+#define RBBMIF_TIMEOUT_DIS__CLIENT8_TIMEOUT_DIS_MASK 0x100
+#define RBBMIF_TIMEOUT_DIS__CLIENT8_TIMEOUT_DIS__SHIFT 0x8
+#define RBBMIF_TIMEOUT_DIS__CLIENT9_TIMEOUT_DIS_MASK 0x200
+#define RBBMIF_TIMEOUT_DIS__CLIENT9_TIMEOUT_DIS__SHIFT 0x9
+#define RBBMIF_TIMEOUT_DIS__CLIENT10_TIMEOUT_DIS_MASK 0x400
+#define RBBMIF_TIMEOUT_DIS__CLIENT10_TIMEOUT_DIS__SHIFT 0xa
+#define RBBMIF_TIMEOUT_DIS__CLIENT11_TIMEOUT_DIS_MASK 0x800
+#define RBBMIF_TIMEOUT_DIS__CLIENT11_TIMEOUT_DIS__SHIFT 0xb
+#define RBBMIF_TIMEOUT_DIS__CLIENT12_TIMEOUT_DIS_MASK 0x1000
+#define RBBMIF_TIMEOUT_DIS__CLIENT12_TIMEOUT_DIS__SHIFT 0xc
+#define RBBMIF_TIMEOUT_DIS__CLIENT13_TIMEOUT_DIS_MASK 0x2000
+#define RBBMIF_TIMEOUT_DIS__CLIENT13_TIMEOUT_DIS__SHIFT 0xd
+#define RBBMIF_TIMEOUT_DIS__CLIENT14_TIMEOUT_DIS_MASK 0x4000
+#define RBBMIF_TIMEOUT_DIS__CLIENT14_TIMEOUT_DIS__SHIFT 0xe
+#define RBBMIF_STATUS_FLAG__RBBMIF_STATE_MASK 0x7
+#define RBBMIF_STATUS_FLAG__RBBMIF_STAT

@@ -1,121 +1,64 @@
-/*
- * WUSB cluster reservation management
- *
- * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- */
-#include <linux/kernel.h>
-#include <linux/uwb.h>
-
-#include "wusbhc.h"
-
-/*
- * WUSB cluster reservations are multicast reservations with the
- * broadcast cluster ID (BCID) as the target DevAddr.
- *
- * FIXME: consider adjusting the reservation depending on what devices
- * are attached.
- */
-
-static int wusbhc_bwa_set(struct wusbhc *wusbhc, u8 stream,
-	const struct uwb_mas_bm *mas)
-{
-	if (mas == NULL)
-		mas = &uwb_mas_bm_zero;
-	return wusbhc->bwa_set(wusbhc, stream, mas);
-}
-
-/**
- * wusbhc_rsv_complete_cb - WUSB HC reservation complete callback
- * @rsv:    the reservation
- *
- * Either set or clear the HC's view of the reservation.
- *
- * FIXME: when a reservation is denied the HC should be stopped.
- */
-static void wusbhc_rsv_complete_cb(struct uwb_rsv *rsv)
-{
-	struct wusbhc *wusbhc = rsv->pal_priv;
-	struct device *dev = wusbhc->dev;
-	struct uwb_mas_bm mas;
-
-	dev_dbg(dev, "%s: state = %d\n", __func__, rsv->state);
-	switch (rsv->state) {
-	case UWB_RSV_STATE_O_ESTABLISHED:
-		uwb_rsv_get_usable_mas(rsv, &mas);
-		dev_dbg(dev, "established reservation: %*pb\n",
-			UWB_NUM_MAS, mas.bm);
-		wusbhc_bwa_set(wusbhc, rsv->stream, &mas);
-		break;
-	case UWB_RSV_STATE_NONE:
-		dev_dbg(dev, "removed reservation\n");
-		wusbhc_bwa_set(wusbhc, 0, NULL);
-		break;
-	default:
-		dev_dbg(dev, "unexpected reservation state: %d\n", rsv->state);
-		break;
-	}
-}
-
-
-/**
- * wusbhc_rsv_establish - establish a reservation for the cluster
- * @wusbhc: the WUSB HC requesting a bandwidth reservation
- */
-int wusbhc_rsv_establish(struct wusbhc *wusbhc)
-{
-	struct uwb_rc *rc = wusbhc->uwb_rc;
-	struct uwb_rsv *rsv;
-	struct uwb_dev_addr bcid;
-	int ret;
-
-	if (rc == NULL)
-		return -ENODEV;
-
-	rsv = uwb_rsv_create(rc, wusbhc_rsv_complete_cb, wusbhc);
-	if (rsv == NULL)
-		return -ENOMEM;
-
-	bcid.data[0] = wusbhc->cluster_id;
-	bcid.data[1] = 0;
-
-	rsv->target.type = UWB_RSV_TARGET_DEVADDR;
-	rsv->target.devaddr = bcid;
-	rsv->type = UWB_DRP_TYPE_PRIVATE;
-	rsv->max_mas = 256; /* try to get as much as possible */
-	rsv->min_mas = 15;  /* one MAS per zone */
-	rsv->max_interval = 1; /* max latency is one zone */
-	rsv->is_multicast = true;
-
-	ret = uwb_rsv_establish(rsv);
-	if (ret == 0)
-		wusbhc->rsv = rsv;
-	else
-		uwb_rsv_destroy(rsv);
-	return ret;
-}
-
-
-/**
- * wusbhc_rsv_terminate - terminate the cluster reservation
- * @wusbhc: the WUSB host whose reservation is to be terminated
- */
-void wusbhc_rsv_terminate(struct wusbhc *wusbhc)
-{
-	if (wusbhc->rsv) {
-		uwb_rsv_terminate(wusbhc->rsv);
-		uwb_rsv_destroy(wusbhc->rsv);
-		wusbhc->rsv = NULL;
-	}
-}
+DREN_OVRD_EN_7__SHIFT 0x10
+#define PB1_PIF_LANE7_OVRD__CDREN_OVRD_VAL_7_MASK 0x20000
+#define PB1_PIF_LANE7_OVRD__CDREN_OVRD_VAL_7__SHIFT 0x11
+#define PB1_PIF_LANE7_OVRD2__GANGMODE_7_MASK 0x7
+#define PB1_PIF_LANE7_OVRD2__GANGMODE_7__SHIFT 0x0
+#define PB1_PIF_LANE7_OVRD2__FREQDIV_7_MASK 0x18
+#define PB1_PIF_LANE7_OVRD2__FREQDIV_7__SHIFT 0x3
+#define PB1_PIF_LANE7_OVRD2__LINKSPEED_7_MASK 0x60
+#define PB1_PIF_LANE7_OVRD2__LINKSPEED_7__SHIFT 0x5
+#define PB1_PIF_LANE7_OVRD2__TWOSYMENABLE_7_MASK 0x80
+#define PB1_PIF_LANE7_OVRD2__TWOSYMENABLE_7__SHIFT 0x7
+#define PB1_PIF_LANE7_OVRD2__TXPWR_7_MASK 0x700
+#define PB1_PIF_LANE7_OVRD2__TXPWR_7__SHIFT 0x8
+#define PB1_PIF_LANE7_OVRD2__TXPGENABLE_7_MASK 0x1800
+#define PB1_PIF_LANE7_OVRD2__TXPGENABLE_7__SHIFT 0xb
+#define PB1_PIF_LANE7_OVRD2__RXPWR_7_MASK 0xe000
+#define PB1_PIF_LANE7_OVRD2__RXPWR_7__SHIFT 0xd
+#define PB1_PIF_LANE7_OVRD2__RXPGENABLE_7_MASK 0x30000
+#define PB1_PIF_LANE7_OVRD2__RXPGENABLE_7__SHIFT 0x10
+#define PB1_PIF_LANE7_OVRD2__ELECIDLEDETEN_7_MASK 0x40000
+#define PB1_PIF_LANE7_OVRD2__ELECIDLEDETEN_7__SHIFT 0x12
+#define PB1_PIF_LANE7_OVRD2__ENABLEFOM_7_MASK 0x80000
+#define PB1_PIF_LANE7_OVRD2__ENABLEFOM_7__SHIFT 0x13
+#define PB1_PIF_LANE7_OVRD2__REQUESTFOM_7_MASK 0x100000
+#define PB1_PIF_LANE7_OVRD2__REQUESTFOM_7__SHIFT 0x14
+#define PB1_PIF_LANE7_OVRD2__RESPONSEMODE_7_MASK 0x200000
+#define PB1_PIF_LANE7_OVRD2__RESPONSEMODE_7__SHIFT 0x15
+#define PB1_PIF_LANE7_OVRD2__REQUESTTRK_7_MASK 0x400000
+#define PB1_PIF_LANE7_OVRD2__REQUESTTRK_7__SHIFT 0x16
+#define PB1_PIF_LANE7_OVRD2__REQUESTTRN_7_MASK 0x800000
+#define PB1_PIF_LANE7_OVRD2__REQUESTTRN_7__SHIFT 0x17
+#define PB1_PIF_LANE7_OVRD2__COEFFICIENTID_7_MASK 0x3000000
+#define PB1_PIF_LANE7_OVRD2__COEFFICIENTID_7__SHIFT 0x18
+#define PB1_PIF_LANE7_OVRD2__COEFFICIENT_7_MASK 0xfc000000
+#define PB1_PIF_LANE7_OVRD2__COEFFICIENT_7__SHIFT 0x1a
+#define PCIEP_RESERVED__PCIEP_RESERVED_MASK 0xffffffff
+#define PCIEP_RESERVED__PCIEP_RESERVED__SHIFT 0x0
+#define PCIEP_SCRATCH__PCIEP_SCRATCH_MASK 0xffffffff
+#define PCIEP_SCRATCH__PCIEP_SCRATCH__SHIFT 0x0
+#define PCIEP_HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define PCIEP_HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define PCIEP_HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define PCIEP_HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define PCIEP_HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define PCIEP_HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define PCIEP_HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define PCIEP_HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define PCIEP_HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define PCIEP_HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define PCIEP_HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define PCIEP_HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define PCIEP_HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define PCIEP_HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define PCIEP_HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define PCIEP_HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define PCIEP_HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define PCIEP_HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define PCIEP_HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define PCIEP_HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define PCIEP_HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define PCIEP_HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define PCIEP_HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define PCIEP_HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define PCIEP_HW_DEB

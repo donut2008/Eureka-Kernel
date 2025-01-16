@@ -1,4 +1,4 @@
-obj-y += clk-mtk.o clk-pll.o clk-gate.o clk-apmixed.o
-obj-$(CONFIG_RESET_CONTROLLER) += reset.o
-obj-y += clk-mt8135.o
-obj-y += clk-mt8173.o
+fff0000
+#define CRTC0_PIXEL_RATE_CNTL__CRTC0_DISPOUT_ERROR_COUNT__SHIFT 0x10
+#define DP_DTO0_PHASE__DP_DTO0_PHASE_MASK 0xffffffff
+#define DP

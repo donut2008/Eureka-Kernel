@@ -1,61 +1,19 @@
-#ifndef _BCACHE_STATS_H_
-#define _BCACHE_STATS_H_
-
-struct cache_stat_collector {
-	atomic_t cache_hits;
-	atomic_t cache_misses;
-	atomic_t cache_bypass_hits;
-	atomic_t cache_bypass_misses;
-	atomic_t cache_readaheads;
-	atomic_t cache_miss_collisions;
-	atomic_t sectors_bypassed;
-};
-
-struct cache_stats {
-	struct kobject		kobj;
-
-	unsigned long cache_hits;
-	unsigned long cache_misses;
-	unsigned long cache_bypass_hits;
-	unsigned long cache_bypass_misses;
-	unsigned long cache_readaheads;
-	unsigned long cache_miss_collisions;
-	unsigned long sectors_bypassed;
-
-	unsigned		rescale;
-};
-
-struct cache_accounting {
-	struct closure		cl;
-	struct timer_list	timer;
-	atomic_t		closing;
-
-	struct cache_stat_collector collector;
-
-	struct cache_stats total;
-	struct cache_stats five_minute;
-	struct cache_stats hour;
-	struct cache_stats day;
-};
-
-struct cache_set;
-struct cached_dev;
-struct bcache_device;
-
-void bch_cache_accounting_init(struct cache_accounting *acc,
-			       struct closure *parent);
-
-int bch_cache_accounting_add_kobjs(struct cache_accounting *acc,
-				   struct kobject *parent);
-
-void bch_cache_accounting_clear(struct cache_accounting *acc);
-
-void bch_cache_accounting_destroy(struct cache_accounting *acc);
-
-void bch_mark_cache_accounting(struct cache_set *, struct bcache_device *,
-			       bool, bool);
-void bch_mark_cache_readahead(struct cache_set *, struct bcache_device *);
-void bch_mark_cache_miss_collision(struct cache_set *, struct bcache_device *);
-void bch_mark_sectors_bypassed(struct cache_set *, struct cached_dev *, int);
-
-#endif /* _BCACHE_STATS_H_ */
+         0x3fe84
+#define ixSMU_PM_STATUS_34                                                      0x3fe88
+#define ixSMU_PM_STATUS_35                                                      0x3fe8c
+#define ixSMU_PM_STATUS_36                                                      0x3fe90
+#define ixSMU_PM_STATUS_37                                                      0x3fe94
+#define ixSMU_PM_STATUS_38                                                      0x3fe98
+#define ixSMU_PM_STATUS_39                                                      0x3fe9c
+#define ixSMU_PM_STATUS_40                                                      0x3fea0
+#define ixSMU_PM_STATUS_41                                                      0x3fea4
+#define ixSMU_PM_STATUS_42                                                      0x3fea8
+#define ixSMU_PM_STATUS_43                                                      0x3feac
+#define ixSMU_PM_STATUS_44                                                      0x3feb0
+#define ixSMU_PM_STATUS_45                                                      0x3feb4
+#define ixSMU_PM_STATUS_46                                                      0x3feb8
+#define ixSMU_PM_STATUS_47                                                      0x3febc
+#define ixSMU_PM_STATUS_48                                                      0x3fec0
+#define ixSMU_PM_STATUS_49                                                      0x3fec4
+#define ixSMU_PM_STATUS_50                                                      0x3fec8
+#define ixSMU_PM_STATUS_51                                      

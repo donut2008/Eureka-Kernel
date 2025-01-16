@@ -1,149 +1,126 @@
-/*
- *  m68k beeper driver for Linux
- *
- *  Copyright (c) 2002 Richard Zidlicky
- *  Copyright (c) 2002 Vojtech Pavlik
- *  Copyright (c) 1992 Orest Zborowski
- *
- */
+t(args, &token) || token < 1) {
+				pr_warn("bad queue_size parameter '%s'\n", p);
+				goto out;
+			}
+			target->scsi_host->can_queue = token;
+			target->queue_size = token + SRP_RSP_SQ_SIZE +
+					     SRP_TSK_MGMT_SQ_SIZE;
+			if (!(opt_mask & SRP_OPT_MAX_CMD_PER_LUN))
+				target->scsi_host->cmd_per_lun = token;
+			break;
 
-/*
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation
- */
+		case SRP_OPT_MAX_CMD_PER_LUN:
+			if (match_int(args, &token) || token < 1) {
+				pr_warn("bad max cmd_per_lun parameter '%s'\n",
+					p);
+				goto out;
+			}
+			target->scsi_host->cmd_per_lun = token;
+			break;
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/input.h>
-#include <linux/platform_device.h>
-#include <asm/machdep.h>
-#include <asm/io.h>
+		case SRP_OPT_IO_CLASS:
+			if (match_hex(args, &token)) {
+				pr_warn("bad IO class parameter '%s'\n", p);
+				goto out;
+			}
+			if (token != SRP_REV10_IB_IO_CLASS &&
+			    token != SRP_REV16A_IB_IO_CLASS) {
+				pr_warn("unknown IO class parameter value %x specified (use %x or %x).\n",
+					token, SRP_REV10_IB_IO_CLASS,
+					SRP_REV16A_IB_IO_CLASS);
+				goto out;
+			}
+			target->io_class = token;
+			break;
 
-MODULE_AUTHOR("Richard Zidlicky <rz@linux-m68k.org>");
-MODULE_DESCRIPTION("m68k beeper driver");
-MODULE_LICENSE("GPL");
+		case SRP_OPT_INITIATOR_EXT:
+			p = match_strdup(args);
+			if (!p) {
+				ret = -ENOMEM;
+				goto out;
+			}
+			target->initiator_ext = cpu_to_be64(simple_strtoull(p, NULL, 16));
+			kfree(p);
+			break;
 
-static struct platform_device *m68kspkr_platform_device;
+		case SRP_OPT_CMD_SG_ENTRIES:
+			if (match_int(args, &token) || token < 1 || token > 255) {
+				pr_warn("bad max cmd_sg_entries parameter '%s'\n",
+					p);
+				goto out;
+			}
+			target->cmd_sg_cnt = token;
+			break;
 
-static int m68kspkr_event(struct input_dev *dev, unsigned int type, unsigned int code, int value)
-{
-	unsigned int count = 0;
+		case SRP_OPT_ALLOW_EXT_SG:
+			if (match_int(args, &token)) {
+				pr_warn("bad allow_ext_sg parameter '%s'\n", p);
+				goto out;
+			}
+			target->allow_ext_sg = !!token;
+			break;
 
-	if (type != EV_SND)
-		return -1;
+		case SRP_OPT_SG_TABLESIZE:
+			if (match_int(args, &token) || token < 1 ||
+					token > SCSI_MAX_SG_CHAIN_SEGMENTS) {
+				pr_warn("bad max sg_tablesize parameter '%s'\n",
+					p);
+				goto out;
+			}
+			target->sg_tablesize = token;
+			break;
 
-	switch (code) {
-		case SND_BELL: if (value) value = 1000;
-		case SND_TONE: break;
-		default: return -1;
+		case SRP_OPT_COMP_VECTOR:
+			if (match_int(args, &token) || token < 0) {
+				pr_warn("bad comp_vector parameter '%s'\n", p);
+				goto out;
+			}
+			target->comp_vector = token;
+			break;
+
+		case SRP_OPT_TL_RETRY_COUNT:
+			if (match_int(args, &token) || token < 2 || token > 7) {
+				pr_warn("bad tl_retry_count parameter '%s' (must be a number between 2 and 7)\n",
+					p);
+				goto out;
+			}
+			target->tl_retry_count = token;
+			break;
+
+		default:
+			pr_warn("unknown parameter or missing value '%s' in target creation request\n",
+				p);
+			goto out;
+		}
 	}
 
-	if (value > 20 && value < 32767)
-		count = 1193182 / value;
+	if ((opt_mask & SRP_OPT_ALL) == SRP_OPT_ALL)
+		ret = 0;
+	else
+		for (i = 0; i < ARRAY_SIZE(srp_opt_tokens); ++i)
+			if ((srp_opt_tokens[i].token & SRP_OPT_ALL) &&
+			    !(srp_opt_tokens[i].token & opt_mask))
+				pr_warn("target creation request is missing parameter '%s'\n",
+					srp_opt_tokens[i].pattern);
 
-	mach_beep(count, -1);
+	if (target->scsi_host->cmd_per_lun > target->scsi_host->can_queue
+	    && (opt_mask & SRP_OPT_MAX_CMD_PER_LUN))
+		pr_warn("cmd_per_lun = %d > queue_size = %d\n",
+			target->scsi_host->cmd_per_lun,
+			target->scsi_host->can_queue);
 
-	return 0;
+out:
+	kfree(options);
+	return ret;
 }
 
-static int m68kspkr_probe(struct platform_device *dev)
+static ssize_t srp_create_target(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
 {
-	struct input_dev *input_dev;
-	int err;
-
-	input_dev = input_allocate_device();
-	if (!input_dev)
-		return -ENOMEM;
-
-	input_dev->name = "m68k beeper";
-	input_dev->phys = "m68k/generic";
-	input_dev->id.bustype = BUS_HOST;
-	input_dev->id.vendor  = 0x001f;
-	input_dev->id.product = 0x0001;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &dev->dev;
-
-	input_dev->evbit[0] = BIT_MASK(EV_SND);
-	input_dev->sndbit[0] = BIT_MASK(SND_BELL) | BIT_MASK(SND_TONE);
-	input_dev->event = m68kspkr_event;
-
-	err = input_register_device(input_dev);
-	if (err) {
-		input_free_device(input_dev);
-		return err;
-	}
-
-	platform_set_drvdata(dev, input_dev);
-
-	return 0;
-}
-
-static int m68kspkr_remove(struct platform_device *dev)
-{
-	struct input_dev *input_dev = platform_get_drvdata(dev);
-
-	input_unregister_device(input_dev);
-	/* turn off the speaker */
-	m68kspkr_event(NULL, EV_SND, SND_BELL, 0);
-
-	return 0;
-}
-
-static void m68kspkr_shutdown(struct platform_device *dev)
-{
-	/* turn off the speaker */
-	m68kspkr_event(NULL, EV_SND, SND_BELL, 0);
-}
-
-static struct platform_driver m68kspkr_platform_driver = {
-	.driver		= {
-		.name	= "m68kspkr",
-	},
-	.probe		= m68kspkr_probe,
-	.remove		= m68kspkr_remove,
-	.shutdown	= m68kspkr_shutdown,
-};
-
-static int __init m68kspkr_init(void)
-{
-	int err;
-
-	if (!mach_beep) {
-		printk(KERN_INFO "m68kspkr: no lowlevel beep support\n");
-		return -ENODEV;
-        }
-
-	err = platform_driver_register(&m68kspkr_platform_driver);
-	if (err)
-		return err;
-
-	m68kspkr_platform_device = platform_device_alloc("m68kspkr", -1);
-	if (!m68kspkr_platform_device) {
-		err = -ENOMEM;
-		goto err_unregister_driver;
-	}
-
-	err = platform_device_add(m68kspkr_platform_device);
-	if (err)
-		goto err_free_device;
-
-	return 0;
-
- err_free_device:
-	platform_device_put(m68kspkr_platform_device);
- err_unregister_driver:
-	platform_driver_unregister(&m68kspkr_platform_driver);
-
-	return err;
-}
-
-static void __exit m68kspkr_exit(void)
-{
-	platform_device_unregister(m68kspkr_platform_device);
-	platform_driver_unregister(&m68kspkr_platform_driver);
-}
-
-module_init(m68kspkr_init);
-module_exit(m68kspkr_exit);
+	struct srp_host *host =
+		container_of(dev, struct srp_host, dev);
+	struct Scsi_Host *target_host;
+	struct srp_target_port *target;
+	struct srp_rdma_ch *ch;
+	struct srp_d

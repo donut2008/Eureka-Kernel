@@ -1,317 +1,132 @@
-/*
- * WUSB Wire Adapter: Control/Data Streaming Interface (WUSB[8])
- * MMC (Microscheduled Management Command) handling
- *
- * Copyright (C) 2005-2006 Intel Corporation
- * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
- *
- * WUIEs and MMC IEs...well, they are almost the same at the end. MMC
- * IEs are Wireless USB IEs that go into the MMC period...[what is
- * that? look in Design-overview.txt].
- *
- *
- * This is a simple subsystem to keep track of which IEs are being
- * sent by the host in the MMC period.
- *
- * For each WUIE we ask to send, we keep it in an array, so we can
- * request its removal later, or replace the content. They are tracked
- * by pointer, so be sure to use the same pointer if you want to
- * remove it or update the contents.
- *
- * FIXME:
- *  - add timers that autoremove intervalled IEs?
- */
-#include <linux/usb/wusb.h>
-#include <linux/slab.h>
-#include <linux/export.h>
-#include "wusbhc.h"
-
-/* Initialize the MMCIEs handling mechanism */
-int wusbhc_mmcie_create(struct wusbhc *wusbhc)
-{
-	u8 mmcies = wusbhc->mmcies_max;
-	wusbhc->mmcie = kcalloc(mmcies, sizeof(wusbhc->mmcie[0]), GFP_KERNEL);
-	if (wusbhc->mmcie == NULL)
-		return -ENOMEM;
-	mutex_init(&wusbhc->mmcie_mutex);
-	return 0;
-}
-
-/* Release resources used by the MMCIEs handling mechanism */
-void wusbhc_mmcie_destroy(struct wusbhc *wusbhc)
-{
-	kfree(wusbhc->mmcie);
-}
-
-/*
- * Add or replace an MMC Wireless USB IE.
- *
- * @interval:    See WUSB1.0[8.5.3.1]
- * @repeat_cnt:  See WUSB1.0[8.5.3.1]
- * @handle:      See WUSB1.0[8.5.3.1]
- * @wuie:        Pointer to the header of the WUSB IE data to add.
- *               MUST BE allocated in a kmalloc buffer (no stack or
- *               vmalloc).
- *               THE CALLER ALWAYS OWNS THE POINTER (we don't free it
- *               on remove, we just forget about it).
- * @returns:     0 if ok, < 0 errno code on error.
- *
- * Goes over the *whole* @wusbhc->mmcie array looking for (a) the
- * first free spot and (b) if @wuie is already in the array (aka:
- * transmitted in the MMCs) the spot were it is.
- *
- * If present, we "overwrite it" (update).
- *
- *
- * NOTE: Need special ordering rules -- see below WUSB1.0 Table 7-38.
- *       The host uses the handle as the 'sort' index. We
- *       allocate the last one always for the WUIE_ID_HOST_INFO, and
- *       the rest, first come first serve in inverse order.
- *
- *       Host software must make sure that it adds the other IEs in
- *       the right order... the host hardware is responsible for
- *       placing the WCTA IEs in the right place with the other IEs
- *       set by host software.
- *
- * NOTE: we can access wusbhc->wa_descr without locking because it is
- *       read only.
- */
-int wusbhc_mmcie_set(struct wusbhc *wusbhc, u8 interval, u8 repeat_cnt,
-		     struct wuie_hdr *wuie)
-{
-	int result = -ENOBUFS;
-	unsigned handle, itr;
-
-	/* Search a handle, taking into account the ordering */
-	mutex_lock(&wusbhc->mmcie_mutex);
-	switch (wuie->bIEIdentifier) {
-	case WUIE_ID_HOST_INFO:
-		/* Always last */
-		handle = wusbhc->mmcies_max - 1;
-		break;
-	case WUIE_ID_ISOCH_DISCARD:
-		dev_err(wusbhc->dev, "Special ordering case for WUIE ID 0x%x "
-			"unimplemented\n", wuie->bIEIdentifier);
-		result = -ENOSYS;
-		goto error_unlock;
-	default:
-		/* search for it or find the last empty slot */
-		handle = ~0;
-		for (itr = 0; itr < wusbhc->mmcies_max - 1; itr++) {
-			if (wusbhc->mmcie[itr] == wuie) {
-				handle = itr;
-				break;
-			}
-			if (wusbhc->mmcie[itr] == NULL)
-				handle = itr;
-		}
-		if (handle == ~0)
-			goto error_unlock;
-	}
-	result = (wusbhc->mmcie_add)(wusbhc, interval, repeat_cnt, handle,
-				     wuie);
-	if (result >= 0)
-		wusbhc->mmcie[handle] = wuie;
-error_unlock:
-	mutex_unlock(&wusbhc->mmcie_mutex);
-	return result;
-}
-EXPORT_SYMBOL_GPL(wusbhc_mmcie_set);
-
-/*
- * Remove an MMC IE previously added with wusbhc_mmcie_set()
- *
- * @wuie	Pointer used to add the WUIE
- */
-void wusbhc_mmcie_rm(struct wusbhc *wusbhc, struct wuie_hdr *wuie)
-{
-	int result;
-	unsigned handle, itr;
-
-	mutex_lock(&wusbhc->mmcie_mutex);
-	for (itr = 0; itr < wusbhc->mmcies_max; itr++) {
-		if (wusbhc->mmcie[itr] == wuie) {
-			handle = itr;
-			goto found;
-		}
-	}
-	mutex_unlock(&wusbhc->mmcie_mutex);
-	return;
-
-found:
-	result = (wusbhc->mmcie_rm)(wusbhc, handle);
-	if (result == 0)
-		wusbhc->mmcie[itr] = NULL;
-	mutex_unlock(&wusbhc->mmcie_mutex);
-}
-EXPORT_SYMBOL_GPL(wusbhc_mmcie_rm);
-
-static int wusbhc_mmc_start(struct wusbhc *wusbhc)
-{
-	int ret;
-
-	mutex_lock(&wusbhc->mutex);
-	ret = wusbhc->start(wusbhc);
-	if (ret >= 0)
-		wusbhc->active = 1;
-	mutex_unlock(&wusbhc->mutex);
-
-	return ret;
-}
-
-static void wusbhc_mmc_stop(struct wusbhc *wusbhc)
-{
-	mutex_lock(&wusbhc->mutex);
-	wusbhc->active = 0;
-	wusbhc->stop(wusbhc, WUSB_CHANNEL_STOP_DELAY_MS);
-	mutex_unlock(&wusbhc->mutex);
-}
-
-/*
- * wusbhc_start - start transmitting MMCs and accepting connections
- * @wusbhc: the HC to start
- *
- * Establishes a cluster reservation, enables device connections, and
- * starts MMCs with appropriate DNTS parameters.
- */
-int wusbhc_start(struct wusbhc *wusbhc)
-{
-	int result;
-	struct device *dev = wusbhc->dev;
-
-	WARN_ON(wusbhc->wuie_host_info != NULL);
-	BUG_ON(wusbhc->uwb_rc == NULL);
-
-	result = wusbhc_rsv_establish(wusbhc);
-	if (result < 0) {
-		dev_err(dev, "cannot establish cluster reservation: %d\n",
-			result);
-		goto error_rsv_establish;
-	}
-
-	result = wusbhc_devconnect_start(wusbhc);
-	if (result < 0) {
-		dev_err(dev, "error enabling device connections: %d\n",
-			result);
-		goto error_devconnect_start;
-	}
-
-	result = wusbhc_sec_start(wusbhc);
-	if (result < 0) {
-		dev_err(dev, "error starting security in the HC: %d\n",
-			result);
-		goto error_sec_start;
-	}
-
-	result = wusbhc->set_num_dnts(wusbhc, wusbhc->dnts_interval,
-		wusbhc->dnts_num_slots);
-	if (result < 0) {
-		dev_err(dev, "Cannot set DNTS parameters: %d\n", result);
-		goto error_set_num_dnts;
-	}
-	result = wusbhc_mmc_start(wusbhc);
-	if (result < 0) {
-		dev_err(dev, "error starting wusbch: %d\n", result);
-		goto error_wusbhc_start;
-	}
-
-	return 0;
-
-error_wusbhc_start:
-	wusbhc_sec_stop(wusbhc);
-error_set_num_dnts:
-error_sec_start:
-	wusbhc_devconnect_stop(wusbhc);
-error_devconnect_start:
-	wusbhc_rsv_terminate(wusbhc);
-error_rsv_establish:
-	return result;
-}
-
-/*
- * wusbhc_stop - stop transmitting MMCs
- * @wusbhc: the HC to stop
- *
- * Stops the WUSB channel and removes the cluster reservation.
- */
-void wusbhc_stop(struct wusbhc *wusbhc)
-{
-	wusbhc_mmc_stop(wusbhc);
-	wusbhc_sec_stop(wusbhc);
-	wusbhc_devconnect_stop(wusbhc);
-	wusbhc_rsv_terminate(wusbhc);
-}
-
-/*
- * Set/reset/update a new CHID
- *
- * Depending on the previous state of the MMCs, start, stop or change
- * the sent MMC. This effectively switches the host controller on and
- * off (radio wise).
- */
-int wusbhc_chid_set(struct wusbhc *wusbhc, const struct wusb_ckhdid *chid)
-{
-	int result = 0;
-
-	if (memcmp(chid, &wusb_ckhdid_zero, sizeof(*chid)) == 0)
-		chid = NULL;
-
-	mutex_lock(&wusbhc->mutex);
-	if (chid) {
-		if (wusbhc->active) {
-			mutex_unlock(&wusbhc->mutex);
-			return -EBUSY;
-		}
-		wusbhc->chid = *chid;
-	}
-
-	/* register with UWB if we haven't already since we are about to start
-	    the radio. */
-	if ((chid) && (wusbhc->uwb_rc == NULL)) {
-		wusbhc->uwb_rc = uwb_rc_get_by_grandpa(wusbhc->dev->parent);
-		if (wusbhc->uwb_rc == NULL) {
-			result = -ENODEV;
-			dev_err(wusbhc->dev,
-				"Cannot get associated UWB Host Controller\n");
-			goto error_rc_get;
-		}
-
-		result = wusbhc_pal_register(wusbhc);
-		if (result < 0) {
-			dev_err(wusbhc->dev, "Cannot register as a UWB PAL\n");
-			goto error_pal_register;
-		}
-	}
-	mutex_unlock(&wusbhc->mutex);
-
-	if (chid)
-		result = uwb_radio_start(&wusbhc->pal);
-	else if (wusbhc->uwb_rc)
-		uwb_radio_stop(&wusbhc->pal);
-
-	return result;
-
-error_pal_register:
-	uwb_rc_put(wusbhc->uwb_rc);
-	wusbhc->uwb_rc = NULL;
-error_rc_get:
-	mutex_unlock(&wusbhc->mutex);
-
-	return result;
-}
-EXPORT_SYMBOL_GPL(wusbhc_chid_set);
+e PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN_MASK 0x2000000
+#define PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN__SHIFT 0x19
+#define PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK_MASK 0xfc000000
+#define PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK__SHIFT 0x1a
+#define PCIE_LC_CNTL5__LC_EQ_FS_0_MASK 0x3f
+#define PCIE_LC_CNTL5__LC_EQ_FS_0__SHIFT 0x0
+#define PCIE_LC_CNTL5__LC_EQ_FS_8_MASK 0xfc0
+#define PCIE_LC_CNTL5__LC_EQ_FS_8__SHIFT 0x6
+#define PCIE_LC_CNTL5__LC_EQ_LF_0_MASK 0x3f000
+#define PCIE_LC_CNTL5__LC_EQ_LF_0__SHIFT 0xc
+#define PCIE_LC_CNTL5__LC_EQ_LF_8_MASK 0xfc0000
+#define PCIE_LC_CNTL5__LC_EQ_LF_8__SHIFT 0x12
+#define PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS_MASK 0x1000000
+#define PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS__SHIFT 0x18
+#define PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT_MASK 0x1
+#define PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT__SHIFT 0x0
+#define PCIE_LC_CNTL6__LC_SPC_MODE_5GT_MASK 0x4
+#define PCIE_LC_CNTL6__LC_SPC_MODE_5GT__SHIFT 0x2
+#define PCIE_LC_CNTL6__LC_SPC_MODE_8GT_MASK 0x10
+#define PCIE_LC_CNTL6__LC_SPC_MODE_8GT__SHIFT 0x4
+#define PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN_MASK 0x1
+#define PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN__SHIFT 0x0
+#define PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE_MASK 0x2
+#define PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE__SHIFT 0x1
+#define PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE_MASK 0x4
+#define PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE__SHIFT 0x2
+#define PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE_MASK 0x8
+#define PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE__SHIFT 0x3
+#define PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE_MASK 0x10
+#define PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE__SHIFT 0x4
+#define PCIE_LC_BW_CHANGE_CNTL__LC_FAILED_SPEED_NEG_MASK 0x20
+#define PCIE_LC_BW_CHANGE_CNTL__LC_FAILED_SPEED_NEG__SHIFT 0x5
+#define PCIE_LC_BW_CHANGE_CNTL__LC_LONG_LW_CHANGE_MASK 0x40
+#define PCIE_LC_BW_CHANGE_CNTL__LC_LONG_LW_CHANGE__SHIFT 0x6
+#define PCIE_LC_BW_CHANGE_CNTL__LC_SHORT_LW_CHANGE_MASK 0x80
+#define PCIE_LC_BW_CHANGE_CNTL__LC_SHORT_LW_CHANGE__SHIFT 0x7
+#define PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_OTHER_MASK 0x100
+#define PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_OTHER__SHIFT 0x8
+#define PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED_MASK 0x200
+#define PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED__SHIFT 0x9
+#define PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE_MASK 0x400
+#define PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE__SHIFT 0xa
+#define PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL_MASK 0xf
+#define PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL__SHIFT 0x0
+#define PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE_MASK 0x10
+#define PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE__SHIFT 0x4
+#define PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1_MASK 0x20
+#define PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1__SHIFT 0x5
+#define PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN_MASK 0x40
+#define PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN__SHIFT 0x6
+#define PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN_MASK 0x80
+#define PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN__SHIFT 0x7
+#define PCIE_LC_TRAINING_CNTL__LC_POWER_STATE_MASK 0x700
+#define PCIE_LC_TRAINING_CNTL__LC_POWER_STATE__SHIFT 0x8
+#define PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED_MASK 0x800
+#define PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED__SHIFT 0xb
+#define PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN_MASK 0x1000
+#define PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN__SHIFT 0xc
+#define PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH_MASK 0x2000
+#define PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH__SHIFT 0xd
+#define PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG_MASK 0x4000
+#define PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG__SHIFT 0xe
+#define PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN_MASK 0x8000
+#define PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN__SHIFT 0xf
+#define PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP_MASK 0x10000
+#define PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP__SHIFT 0x10
+#define PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF_MASK 0x20000
+#define PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF__SHIFT 0x11
+#define PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF_MASK 0x40000
+#define PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF__SHIFT 0x12
+#define PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN_MASK 0x80000
+#define PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN__SHIFT 0x13
+#define PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW_MASK 0x100000
+#define PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW__SHIFT 0x14
+#define PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN_MASK 0x200000
+#define PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN__SHIFT 0x15
+#define PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL_MASK 0xc00000
+#define PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL__SHIFT 0x16
+#define PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED_MASK 0x1000000
+#define PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED__SHIFT 0x18
+#define PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST_MASK 0x2000000
+#define PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST__SHIFT 0x19
+#define PCIE_LC_TRAINING_CNTL__LC_RESET_ASPM_L1_NAK_TIMER_MASK 0x4000000
+#define PCIE_LC_TRAINING_CNTL__LC_RESET_ASPM_L1_NAK_TIMER__SHIFT 0x1a
+#define PCIE_LC_TRAINING_CNTL__LC_SHORT_RCFG_TIMEOUT_MASK 0x8000000
+#define PCIE_LC_TRAINING_CNTL__LC_SHORT_RCFG_TIMEOUT__SHIFT 0x1b
+#define PCIE_LC_TRAINING_CNTL__LC_ALLOW_TX_L1_CONTROL_MASK 0x10000000
+#define PCIE_LC_TRAINING_CNTL__LC_ALLOW_TX_L1_CONTROL__SHIFT 0x1c
+#define PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_FOM_VALID_AFTER_TRACK_MASK 0x20000000
+#define PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_FOM_VALID_AFTER_TRACK__SHIFT 0x1d
+#define PCIE_LC_TRAINING_CNTL__LC_EXTEND_EQ_REQ_TIME_MASK 0xc0000000
+#define PCIE_LC_TRAINING_CNTL__LC_EXTEND_EQ_REQ_TIME__SHIFT 0x1e
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_MASK 0x7
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH__SHIFT 0x0
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_RD_MASK 0x70
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_RD__SHIFT 0x4
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_ARC_MISSING_ESCAPE_MASK 0x80
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_ARC_MISSING_ESCAPE__SHIFT 0x7
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_NOW_MASK 0x100
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_NOW__SHIFT 0x8
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATION_SUPPORT_MASK 0x200
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATION_SUPPORT__SHIFT 0x9
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATE_EN_MASK 0x400
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATE_EN__SHIFT 0xa
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_SHORT_RECONFIG_EN_MASK 0x800
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_SHORT_RECONFIG_EN__SHIFT 0xb
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_SUPPORT_MASK 0x1000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_SUPPORT__SHIFT 0xc
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_DIS_MASK 0x2000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_DIS__SHIFT 0xd
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_WAIT_FOR_RCVR_DIS_MASK 0x4000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_WAIT_FOR_RCVR_DIS__SHIFT 0xe
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_TIMER_SEL_MASK 0x8000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_TIMER_SEL__SHIFT 0xf
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_DEASSERT_TX_PDNB_MASK 0x10000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_DEASSERT_TX_PDNB__SHIFT 0x10
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_L1_RECONFIG_EN_MASK 0x20000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_L1_RECONFIG_EN__SHIFT 0x11
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_DYNLINK_MST_EN_MASK 0x40000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_DYNLINK_MST_EN__SHIFT 0x12
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_DUAL_END_RECONFIG_EN_MASK 0x80000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_DUAL_END_RECONFIG_EN__SHIFT 0x13
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_CAPABLE_MASK 0x100000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_CAPABLE__SHIFT 0x14
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_DYN_LANES_PWR_STATE_MASK 0x600000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_DYN_LANES_PWR_STATE__SHIFT 0x15
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_EQ_REVERSAL_LOGIC_EN_MASK 0x800000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_EQ_REVERSAL_LOGIC_EN__SHIFT 0x17
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_MULT_REVERSE_ATTEMP_EN_MASK 0x1000000
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_MULT_REVERSE_ATTEMP_EN__SHIFT 0x18
+#define PCIE_LC_LINK_WIDTH_CNTL__LC_RESET_TSX_CNT_IN_RCONFIG_EN_MASK 0x2000000
+#define PCIE_LC_LINK_WIDTH

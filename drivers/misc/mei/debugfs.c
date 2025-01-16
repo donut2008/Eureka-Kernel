@@ -1,238 +1,180 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2012-2013, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
-#include <linux/slab.h>
-#include <linux/kernel.h>
-#include <linux/device.h>
-#include <linux/debugfs.h>
-
-#include <linux/mei.h>
-
-#include "mei_dev.h"
-#include "client.h"
-#include "hw.h"
-
-static ssize_t mei_dbgfs_read_meclients(struct file *fp, char __user *ubuf,
-					size_t cnt, loff_t *ppos)
-{
-	struct mei_device *dev = fp->private_data;
-	struct mei_me_client *me_cl;
-	size_t bufsz = 1;
-	char *buf;
-	int i = 0;
-	int pos = 0;
-	int ret;
-
-#define HDR \
-"  |id|fix|         UUID                       |con|msg len|sb|refc|\n"
-
-	down_read(&dev->me_clients_rwsem);
-	list_for_each_entry(me_cl, &dev->me_clients, list)
-		bufsz++;
-
-	bufsz *= sizeof(HDR) + 1;
-	buf = kzalloc(bufsz, GFP_KERNEL);
-	if (!buf) {
-		up_read(&dev->me_clients_rwsem);
-		return -ENOMEM;
+tate->TG_LO <= FmaxBin) {
+		status += MXL_ControlWrite(fe, TG_LO_DIVVAL,	0x8);
+		status += MXL_ControlWrite(fe, TG_LO_SELVAL,	0x2);
+		divider_val = 12 ;
+		Fmax = FmaxBin ;
+		Fmin = FminBin ;
+	}
+	FminBin = 150000000UL ;
+	FmaxBin = 200000000UL ;
+	if (state->TG_LO > FminBin && state->TG_LO <= FmaxBin) {
+		status += MXL_ControlWrite(fe, TG_LO_DIVVAL,	0x0);
+		status += MXL_ControlWrite(fe, TG_LO_SELVAL,	0x2);
+		divider_val = 8 ;
+		Fmax = FmaxBin ;
+		Fmin = FminBin ;
+	}
+	FminBin = 200000000UL ;
+	FmaxBin = 300000000UL ;
+	if (state->TG_LO > FminBin && state->TG_LO <= FmaxBin) {
+		status += MXL_ControlWrite(fe, TG_LO_DIVVAL,	0x8);
+		status += MXL_ControlWrite(fe, TG_LO_SELVAL,	0x3);
+		divider_val = 6 ;
+		Fmax = FmaxBin ;
+		Fmin = FminBin ;
+	}
+	FminBin = 300000000UL ;
+	FmaxBin = 400000000UL ;
+	if (state->TG_LO > FminBin && state->TG_LO <= FmaxBin) {
+		status += MXL_ControlWrite(fe, TG_LO_DIVVAL,	0x0);
+		status += MXL_ControlWrite(fe, TG_LO_SELVAL,	0x3);
+		divider_val = 4 ;
+		Fmax = FmaxBin ;
+		Fmin = FminBin ;
+	}
+	FminBin = 400000000UL ;
+	FmaxBin = 600000000UL ;
+	if (state->TG_LO > FminBin && state->TG_LO <= FmaxBin) {
+		status += MXL_ControlWrite(fe, TG_LO_DIVVAL,	0x8);
+		status += MXL_ControlWrite(fe, TG_LO_SELVAL,	0x7);
+		divider_val = 3 ;
+		Fmax = FmaxBin ;
+		Fmin = FminBin ;
+	}
+	FminBin = 600000000UL ;
+	FmaxBin = 900000000UL ;
+	if (state->TG_LO > FminBin && state->TG_LO <= FmaxBin) {
+		status += MXL_ControlWrite(fe, TG_LO_DIVVAL,	0x0);
+		status += MXL_ControlWrite(fe, TG_LO_SELVAL,	0x7);
+		divider_val = 2 ;
+		Fmax = FmaxBin ;
+		Fmin = FminBin ;
 	}
 
-	pos += scnprintf(buf + pos, bufsz - pos, HDR);
+	/* TG_DIV_VAL */
+	tg_divval = (state->TG_LO*divider_val/100000) *
+		(MXL_Ceiling(state->Fxtal, 1000000) * 100) /
+		(state->Fxtal/1000);
 
-	/*  if the driver is not enabled the list won't be consistent */
-	if (dev->dev_state != MEI_DEV_ENABLED)
-		goto out;
+	status += MXL_ControlWrite(fe, TG_DIV_VAL, tg_divval);
 
-	list_for_each_entry(me_cl, &dev->me_clients, list) {
+	if (state->TG_LO > 600000000UL)
+		status += MXL_ControlWrite(fe, TG_DIV_VAL, tg_divval + 1);
 
-		if (mei_me_cl_get(me_cl)) {
-			pos += scnprintf(buf + pos, bufsz - pos,
-				"%2d|%2d|%3d|%pUl|%3d|%7d|%2d|%4d|\n",
-				i++, me_cl->client_id,
-				me_cl->props.fixed_address,
-				&me_cl->props.protocol_name,
-				me_cl->props.max_number_of_connections,
-				me_cl->props.max_msg_length,
-				me_cl->props.single_recv_buf,
-				atomic_read(&me_cl->refcnt.refcount));
+	Fmax = 1800000000UL ;
+	Fmin = 1200000000UL ;
 
-			mei_me_cl_put(me_cl);
+	/* prevent overflow of 32 bit unsigned integer, use
+	 * following equation. Edit for v2.6.4
+	 */
+	/* Fref_TF = Fref_TG * 1000 */
+	Fref_TG = (state->Fxtal/1000) / MXL_Ceiling(state->Fxtal, 1000000);
+
+	/* Fvco = Fvco/10 */
+	Fvco = (state->TG_LO/10000) * divider_val * Fref_TG;
+
+	tg_lo = (((Fmax/10 - Fvco)/100)*32) / ((Fmax-Fmin)/1000)+8;
+
+	/* below equation is same as above but much harder to debug.
+	 *
+	 * static u32 MXL_GetXtalInt(u32 Xtal_Freq)
+	 * {
+	 *	if ((Xtal_Freq % 1000000) == 0)
+	 *		return (Xtal_Freq / 10000);
+	 *	else
+	 *		return (((Xtal_Freq / 1000000) + 1)*100);
+	 * }
+	 *
+	 * u32 Xtal_Int = MXL_GetXtalInt(state->Fxtal);
+	 * tg_lo = ( ((Fmax/10000 * Xtal_Int)/100) -
+	 * ((state->TG_LO/10000)*divider_val *
+	 * (state->Fxtal/10000)/100) )*32/((Fmax-Fmin)/10000 *
+	 * Xtal_Int/100) + 8;
+	 */
+
+	status += MXL_ControlWrite(fe, TG_VCO_BIAS , tg_lo);
+
+	/* add for 2.6.5 Special setting for QAM */
+	if (state->Mod_Type == MXL_QAM) {
+		if (state->config->qam_gain != 0)
+			status += MXL_ControlWrite(fe, RFSYN_CHP_GAIN,
+						   state->config->qam_gain);
+		else if (state->RF_IN < 680000000)
+			status += MXL_ControlWrite(fe, RFSYN_CHP_GAIN, 3);
+		else
+			status += MXL_ControlWrite(fe, RFSYN_CHP_GAIN, 2);
+	}
+
+	/* Off Chip Tracking Filter Control */
+	if (state->TF_Type == MXL_TF_OFF) {
+		/* Tracking Filter Off State; turn off all the banks */
+		status += MXL_ControlWrite(fe, DAC_A_ENABLE, 0);
+		status += MXL_ControlWrite(fe, DAC_B_ENABLE, 0);
+		status += MXL_SetGPIO(fe, 3, 1); /* Bank1 Off */
+		status += MXL_SetGPIO(fe, 1, 1); /* Bank2 Off */
+		status += MXL_SetGPIO(fe, 4, 1); /* Bank3 Off */
+	}
+
+	if (state->TF_Type == MXL_TF_C) /* Tracking Filter type C */ {
+		status += MXL_ControlWrite(fe, DAC_B_ENABLE, 1);
+		status += MXL_ControlWrite(fe, DAC_DIN_A, 0);
+
+		if (state->RF_IN >= 43000000 && state->RF_IN < 150000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 0);
+			status += MXL_ControlWrite(fe, DAC_DIN_B, 0);
+			status += MXL_SetGPIO(fe, 3, 0);
+			status += MXL_SetGPIO(fe, 1, 1);
+			status += MXL_SetGPIO(fe, 4, 1);
 		}
-	}
-
-out:
-	up_read(&dev->me_clients_rwsem);
-	ret = simple_read_from_buffer(ubuf, cnt, ppos, buf, pos);
-	kfree(buf);
-	return ret;
-}
-
-static const struct file_operations mei_dbgfs_fops_meclients = {
-	.open = simple_open,
-	.read = mei_dbgfs_read_meclients,
-	.llseek = generic_file_llseek,
-};
-
-static ssize_t mei_dbgfs_read_active(struct file *fp, char __user *ubuf,
-					size_t cnt, loff_t *ppos)
-{
-	struct mei_device *dev = fp->private_data;
-	struct mei_cl *cl;
-	const size_t bufsz = 1024;
-	char *buf;
-	int i = 0;
-	int pos = 0;
-	int ret;
-
-	if (!dev)
-		return -ENODEV;
-
-	buf = kzalloc(bufsz, GFP_KERNEL);
-	if  (!buf)
-		return -ENOMEM;
-
-	pos += scnprintf(buf + pos, bufsz - pos,
-			"  |me|host|state|rd|wr|\n");
-
-	mutex_lock(&dev->device_lock);
-
-	/*  if the driver is not enabled the list won't be consistent */
-	if (dev->dev_state != MEI_DEV_ENABLED)
-		goto out;
-
-	list_for_each_entry(cl, &dev->file_list, link) {
-
-		pos += scnprintf(buf + pos, bufsz - pos,
-			"%2d|%2d|%4d|%5d|%2d|%2d|\n",
-			i, mei_cl_me_id(cl), cl->host_client_id, cl->state,
-			!list_empty(&cl->rd_completed), cl->writing_state);
-		i++;
-	}
-out:
-	mutex_unlock(&dev->device_lock);
-	ret = simple_read_from_buffer(ubuf, cnt, ppos, buf, pos);
-	kfree(buf);
-	return ret;
-}
-
-static const struct file_operations mei_dbgfs_fops_active = {
-	.open = simple_open,
-	.read = mei_dbgfs_read_active,
-	.llseek = generic_file_llseek,
-};
-
-static ssize_t mei_dbgfs_read_devstate(struct file *fp, char __user *ubuf,
-					size_t cnt, loff_t *ppos)
-{
-	struct mei_device *dev = fp->private_data;
-	const size_t bufsz = 1024;
-	char *buf = kzalloc(bufsz, GFP_KERNEL);
-	int pos = 0;
-	int ret;
-
-	if  (!buf)
-		return -ENOMEM;
-
-	pos += scnprintf(buf + pos, bufsz - pos, "dev: %s\n",
-			mei_dev_state_str(dev->dev_state));
-	pos += scnprintf(buf + pos, bufsz - pos, "hbm: %s\n",
-			mei_hbm_state_str(dev->hbm_state));
-
-	if (dev->hbm_state == MEI_HBM_STARTED) {
-		pos += scnprintf(buf + pos, bufsz - pos, "hbm features:\n");
-		pos += scnprintf(buf + pos, bufsz - pos, "\tPG: %01d\n",
-				 dev->hbm_f_pg_supported);
-		pos += scnprintf(buf + pos, bufsz - pos, "\tDC: %01d\n",
-				 dev->hbm_f_dc_supported);
-		pos += scnprintf(buf + pos, bufsz - pos, "\tDOT: %01d\n",
-				 dev->hbm_f_dot_supported);
-		pos += scnprintf(buf + pos, bufsz - pos, "\tEV: %01d\n",
-				 dev->hbm_f_ev_supported);
-	}
-
-	pos += scnprintf(buf + pos, bufsz - pos, "pg:  %s, %s\n",
-			mei_pg_is_enabled(dev) ? "ENABLED" : "DISABLED",
-			mei_pg_state_str(mei_pg_state(dev)));
-	ret = simple_read_from_buffer(ubuf, cnt, ppos, buf, pos);
-	kfree(buf);
-	return ret;
-}
-static const struct file_operations mei_dbgfs_fops_devstate = {
-	.open = simple_open,
-	.read = mei_dbgfs_read_devstate,
-	.llseek = generic_file_llseek,
-};
-
-/**
- * mei_dbgfs_deregister - Remove the debugfs files and directories
- *
- * @dev: the mei device structure
- */
-void mei_dbgfs_deregister(struct mei_device *dev)
-{
-	if (!dev->dbgfs_dir)
-		return;
-	debugfs_remove_recursive(dev->dbgfs_dir);
-	dev->dbgfs_dir = NULL;
-}
-
-/**
- * mei_dbgfs_register - Add the debugfs files
- *
- * @dev: the mei device structure
- * @name: the mei device name
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_dbgfs_register(struct mei_device *dev, const char *name)
-{
-	struct dentry *dir, *f;
-
-	dir = debugfs_create_dir(name, NULL);
-	if (!dir)
-		return -ENOMEM;
-
-	dev->dbgfs_dir = dir;
-
-	f = debugfs_create_file("meclients", S_IRUSR, dir,
-				dev, &mei_dbgfs_fops_meclients);
-	if (!f) {
-		dev_err(dev->dev, "meclients: registration failed\n");
-		goto err;
-	}
-	f = debugfs_create_file("active", S_IRUSR, dir,
-				dev, &mei_dbgfs_fops_active);
-	if (!f) {
-		dev_err(dev->dev, "active: registration failed\n");
-		goto err;
-	}
-	f = debugfs_create_file("devstate", S_IRUSR, dir,
-				dev, &mei_dbgfs_fops_devstate);
-	if (!f) {
-		dev_err(dev->dev, "devstate: registration failed\n");
-		goto err;
-	}
-	f = debugfs_create_bool("allow_fixed_address", S_IRUSR | S_IWUSR, dir,
-				&dev->allow_fixed_address);
-	if (!f) {
-		dev_err(dev->dev, "allow_fixed_address: registration failed\n");
-		goto err;
-	}
-	return 0;
-err:
-	mei_dbgfs_deregister(dev);
-	return -ENODEV;
-}
-
+		if (state->RF_IN >= 150000000 && state->RF_IN < 280000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 0);
+			status += MXL_ControlWrite(fe, DAC_DIN_B, 0);
+			status += MXL_SetGPIO(fe, 3, 1);
+			status += MXL_SetGPIO(fe, 1, 0);
+			status += MXL_SetGPIO(fe, 4, 1);
+		}
+		if (state->RF_IN >= 280000000 && state->RF_IN < 360000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 0);
+			status += MXL_ControlWrite(fe, DAC_DIN_B, 0);
+			status += MXL_SetGPIO(fe, 3, 1);
+			status += MXL_SetGPIO(fe, 1, 0);
+			status += MXL_SetGPIO(fe, 4, 0);
+		}
+		if (state->RF_IN >= 360000000 && state->RF_IN < 560000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 0);
+			status += MXL_ControlWrite(fe, DAC_DIN_B, 0);
+			status += MXL_SetGPIO(fe, 3, 1);
+			status += MXL_SetGPIO(fe, 1, 1);
+			status += MXL_SetGPIO(fe, 4, 0);
+		}
+		if (state->RF_IN >= 560000000 && state->RF_IN < 580000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 1);
+			status += MXL_ControlWrite(fe, DAC_DIN_B, 29);
+			status += MXL_SetGPIO(fe, 3, 1);
+			status += MXL_SetGPIO(fe, 1, 1);
+			status += MXL_SetGPIO(fe, 4, 0);
+		}
+		if (state->RF_IN >= 580000000 && state->RF_IN < 630000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 1);
+			status += MXL_ControlWrite(fe, DAC_DIN_B, 0);
+			status += MXL_SetGPIO(fe, 3, 1);
+			status += MXL_SetGPIO(fe, 1, 1);
+			status += MXL_SetGPIO(fe, 4, 0);
+		}
+		if (state->RF_IN >= 630000000 && state->RF_IN < 700000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 1);
+			status += MXL_ControlWrite(fe, DAC_DIN_B, 16);
+			status += MXL_SetGPIO(fe, 3, 1);
+			status += MXL_SetGPIO(fe, 1, 1);
+			status += MXL_SetGPIO(fe, 4, 1);
+		}
+		if (state->RF_IN >= 700000000 && state->RF_IN < 760000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 1);
+			status += MXL_ControlWrite(fe, DAC_DIN_B, 7);
+			status += MXL_SetGPIO(fe, 3, 1);
+			status += MXL_SetGPIO(fe, 1, 1);
+			status += MXL_SetGPIO(fe, 4, 1);
+		}
+		if (state->RF_IN >= 760000000 && state->RF_IN <= 900000000) {
+			status += MXL_ControlWrite(fe, DAC_A_ENABLE, 1);
+			status += MXL_ControlWrite(f

@@ -1,572 +1,423 @@
-/*
- * Copyright IBM Corp. 2012
+state *sos,
+		unsigned long *nat)
+{
+	const pal_min_state_area_t *ms = sos->pal_min_state;
+	const u64 *bank;
+
+	/* If ipsr.ic then use pmsa_{iip,ipsr,ifs}, else use
+	 * pmsa_{xip,xpsr,xfs}
+	 */
+	if (ia64_psr(regs)->ic) {
+		regs->cr_iip = ms->pmsa_iip;
+		regs->cr_ipsr = ms->pmsa_ipsr;
+		regs->cr_ifs = ms->pmsa_ifs;
+	} else {
+		regs->cr_iip = ms->pmsa_xip;
+		regs->cr_ipsr = ms->pmsa_xpsr;
+		regs->cr_ifs = ms->pmsa_xfs;
+
+		sos->iip = ms->pmsa_iip;
+		sos->ipsr = ms->pmsa_ipsr;
+		sos->ifs = ms->pmsa_ifs;
+	}
+	regs->pr = ms->pmsa_pr;
+	regs->b0 = ms->pmsa_br0;
+	regs->ar_rsc = ms->pmsa_rsc;
+	copy_reg(&ms->pmsa_gr[1-1], ms->pmsa_nat_bits, &regs->r1, nat);
+	copy_reg(&ms->pmsa_gr[2-1], ms->pmsa_nat_bits, &regs->r2, nat);
+	copy_reg(&ms->pmsa_gr[3-1], ms->pmsa_nat_bits, &regs->r3, nat);
+	copy_reg(&ms->pmsa_gr[8-1], ms->pmsa_nat_bits, &regs->r8, nat);
+	copy_reg(&ms->pmsa_gr[9-1], ms->pmsa_nat_bits, &regs->r9, nat);
+	copy_reg(&ms->pmsa_gr[10-1], ms->pmsa_nat_bits, &regs->r10, nat);
+	copy_reg(&ms->pmsa_gr[11-1], ms->pmsa_nat_bits, &regs->r11, nat);
+	copy_reg(&ms->pmsa_gr[12-1], ms->pmsa_nat_bits, &regs->r12, nat);
+	copy_reg(&ms->pmsa_gr[13-1], ms->pmsa_nat_bits, &regs->r13, nat);
+	copy_reg(&ms->pmsa_gr[14-1], ms->pmsa_nat_bits, &regs->r14, nat);
+	copy_reg(&ms->pmsa_gr[15-1], ms->pmsa_nat_bits, &regs->r15, nat);
+	if (ia64_psr(regs)->bn)
+		bank = ms->pmsa_bank1_gr;
+	else
+		bank = ms->pmsa_bank0_gr;
+	copy_reg(&bank[16-16], ms->pmsa_nat_bits, &regs->r16, nat);
+	copy_reg(&bank[17-16], ms->pmsa_nat_bits, &regs->r17, nat);
+	copy_reg(&bank[18-16], ms->pmsa_nat_bits, &regs->r18, nat);
+	copy_reg(&bank[19-16], ms->pmsa_nat_bits, &regs->r19, nat);
+	copy_reg(&bank[20-16], ms->pmsa_nat_bits, &regs->r20, nat);
+	copy_reg(&bank[21-16], ms->pmsa_nat_bits, &regs->r21, nat);
+	copy_reg(&bank[22-16], ms->pmsa_nat_bits, &regs->r22, nat);
+	copy_reg(&bank[23-16], ms->pmsa_nat_bits, &regs->r23, nat);
+	copy_reg(&bank[24-16], ms->pmsa_nat_bits, &regs->r24, nat);
+	copy_reg(&bank[25-16], ms->pmsa_nat_bits, &regs->r25, nat);
+	copy_reg(&bank[26-16], ms->pmsa_nat_bits, &regs->r26, nat);
+	copy_reg(&bank[27-16], ms->pmsa_nat_bits, &regs->r27, nat);
+	copy_reg(&bank[28-16], ms->pmsa_nat_bits, &regs->r28, nat);
+	copy_reg(&bank[29-16], ms->pmsa_nat_bits, &regs->r29, nat);
+	copy_reg(&bank[30-16], ms->pmsa_nat_bits, &regs->r30, nat);
+	copy_reg(&bank[31-16], ms->pmsa_nat_bits, &regs->r31, nat);
+}
+
+/* On entry to this routine, we are running on the per cpu stack, see
+ * mca_asm.h.  The original stack has not been touched by this event.  Some of
+ * the original stack's registers will be in the RBS on this stack.  This stack
+ * also contains a partial pt_regs and switch_stack, the rest of the data is in
+ * PAL minstate.
  *
- * Author(s):
- *   Jan Glauber <jang@linux.vnet.ibm.com>
+ * The first thing to do is modify the original stack to look like a blocked
+ * task so we can run backtrace on the original task.  Also mark the per cpu
+ * stack as current to ensure that we use the correct task state, it also means
+ * that we can do backtrace on the MCA/INIT handler code itself.
  */
 
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/export.h>
-#include <linux/iommu-helper.h>
-#include <linux/dma-mapping.h>
-#include <linux/vmalloc.h>
-#include <linux/pci.h>
-#include <asm/pci_dma.h>
-
-static struct kmem_cache *dma_region_table_cache;
-static struct kmem_cache *dma_page_table_cache;
-static int s390_iommu_strict;
-
-static int zpci_refresh_global(struct zpci_dev *zdev)
+static struct task_struct *
+ia64_mca_modify_original_stack(struct pt_regs *regs,
+		const struct switch_stack *sw,
+		struct ia64_sal_os_state *sos,
+		const char *type)
 {
-	return zpci_refresh_trans((u64) zdev->fh << 32, zdev->start_dma,
-				  zdev->iommu_pages * PAGE_SIZE);
-}
+	char *p;
+	ia64_va va;
+	extern char ia64_leave_kernel[];	/* Need asm address, not function descriptor */
+	const pal_min_state_area_t *ms = sos->pal_min_state;
+	struct task_struct *previous_current;
+	struct pt_regs *old_regs;
+	struct switch_stack *old_sw;
+	unsigned size = sizeof(struct pt_regs) +
+			sizeof(struct switch_stack) + 16;
+	unsigned long *old_bspstore, *old_bsp;
+	unsigned long *new_bspstore, *new_bsp;
+	unsigned long old_unat, old_rnat, new_rnat, nat;
+	u64 slots, loadrs = regs->loadrs;
+	u64 r12 = ms->pmsa_gr[12-1], r13 = ms->pmsa_gr[13-1];
+	u64 ar_bspstore = regs->ar_bspstore;
+	u64 ar_bsp = regs->ar_bspstore + (loadrs >> 16);
+	const char *msg;
+	int cpu = smp_processor_id();
 
-unsigned long *dma_alloc_cpu_table(void)
-{
-	unsigned long *table, *entry;
+	previous_current = curr_task(cpu);
+	set_curr_task(cpu, current);
+	if ((p = strchr(current->comm, ' ')))
+		*p = '\0';
 
-	table = kmem_cache_alloc(dma_region_table_cache, GFP_ATOMIC);
-	if (!table)
-		return NULL;
-
-	for (entry = table; entry < table + ZPCI_TABLE_ENTRIES; entry++)
-		*entry = ZPCI_TABLE_INVALID;
-	return table;
-}
-
-static void dma_free_cpu_table(void *table)
-{
-	kmem_cache_free(dma_region_table_cache, table);
-}
-
-static unsigned long *dma_alloc_page_table(void)
-{
-	unsigned long *table, *entry;
-
-	table = kmem_cache_alloc(dma_page_table_cache, GFP_ATOMIC);
-	if (!table)
-		return NULL;
-
-	for (entry = table; entry < table + ZPCI_PT_ENTRIES; entry++)
-		*entry = ZPCI_PTE_INVALID;
-	return table;
-}
-
-static void dma_free_page_table(void *table)
-{
-	kmem_cache_free(dma_page_table_cache, table);
-}
-
-static unsigned long *dma_get_seg_table_origin(unsigned long *entry)
-{
-	unsigned long *sto;
-
-	if (reg_entry_isvalid(*entry))
-		sto = get_rt_sto(*entry);
-	else {
-		sto = dma_alloc_cpu_table();
-		if (!sto)
-			return NULL;
-
-		set_rt_sto(entry, sto);
-		validate_rt_entry(entry);
-		entry_clr_protected(entry);
-	}
-	return sto;
-}
-
-static unsigned long *dma_get_page_table_origin(unsigned long *entry)
-{
-	unsigned long *pto;
-
-	if (reg_entry_isvalid(*entry))
-		pto = get_st_pto(*entry);
-	else {
-		pto = dma_alloc_page_table();
-		if (!pto)
-			return NULL;
-		set_st_pto(entry, pto);
-		validate_st_entry(entry);
-		entry_clr_protected(entry);
-	}
-	return pto;
-}
-
-unsigned long *dma_walk_cpu_trans(unsigned long *rto, dma_addr_t dma_addr)
-{
-	unsigned long *sto, *pto;
-	unsigned int rtx, sx, px;
-
-	rtx = calc_rtx(dma_addr);
-	sto = dma_get_seg_table_origin(&rto[rtx]);
-	if (!sto)
-		return NULL;
-
-	sx = calc_sx(dma_addr);
-	pto = dma_get_page_table_origin(&sto[sx]);
-	if (!pto)
-		return NULL;
-
-	px = calc_px(dma_addr);
-	return &pto[px];
-}
-
-void dma_update_cpu_trans(unsigned long *entry, void *page_addr, int flags)
-{
-	if (flags & ZPCI_PTE_INVALID) {
-		invalidate_pt_entry(entry);
-	} else {
-		set_pt_pfaa(entry, page_addr);
-		validate_pt_entry(entry);
-	}
-
-	if (flags & ZPCI_TABLE_PROTECTED)
-		entry_set_protected(entry);
-	else
-		entry_clr_protected(entry);
-}
-
-static int dma_update_trans(struct zpci_dev *zdev, unsigned long pa,
-			    dma_addr_t dma_addr, size_t size, int flags)
-{
-	unsigned int nr_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
-	u8 *page_addr = (u8 *) (pa & PAGE_MASK);
-	dma_addr_t start_dma_addr = dma_addr;
-	unsigned long irq_flags;
-	unsigned long *entry;
-	int i, rc = 0;
-
-	if (!nr_pages)
-		return -EINVAL;
-
-	spin_lock_irqsave(&zdev->dma_table_lock, irq_flags);
-	if (!zdev->dma_table) {
-		rc = -EINVAL;
-		goto no_refresh;
-	}
-
-	for (i = 0; i < nr_pages; i++) {
-		entry = dma_walk_cpu_trans(zdev->dma_table, dma_addr);
-		if (!entry) {
-			rc = -ENOMEM;
-			goto undo_cpu_trans;
-		}
-		dma_update_cpu_trans(entry, page_addr, flags);
-		page_addr += PAGE_SIZE;
-		dma_addr += PAGE_SIZE;
-	}
-
-	/*
-	 * With zdev->tlb_refresh == 0, rpcit is not required to establish new
-	 * translations when previously invalid translation-table entries are
-	 * validated. With lazy unmap, it also is skipped for previously valid
-	 * entries, but a global rpcit is then required before any address can
-	 * be re-used, i.e. after each iommu bitmap wrap-around.
+	/* Best effort attempt to cope with MCA/INIT delivered while in
+	 * physical mode.
 	 */
-	if (!zdev->tlb_refresh &&
-			(!s390_iommu_strict ||
-			((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID)))
-		goto no_refresh;
-
-	rc = zpci_refresh_trans((u64) zdev->fh << 32, start_dma_addr,
-				nr_pages * PAGE_SIZE);
-undo_cpu_trans:
-	if (rc && ((flags & ZPCI_PTE_VALID_MASK) == ZPCI_PTE_VALID)) {
-		flags = ZPCI_PTE_INVALID;
-		while (i-- > 0) {
-			page_addr -= PAGE_SIZE;
-			dma_addr -= PAGE_SIZE;
-			entry = dma_walk_cpu_trans(zdev->dma_table, dma_addr);
-			if (!entry)
-				break;
-			dma_update_cpu_trans(entry, page_addr, flags);
+	regs->cr_ipsr = ms->pmsa_ipsr;
+	if (ia64_psr(regs)->dt == 0) {
+		va.l = r12;
+		if (va.f.reg == 0) {
+			va.f.reg = 7;
+			r12 = va.l;
+		}
+		va.l = r13;
+		if (va.f.reg == 0) {
+			va.f.reg = 7;
+			r13 = va.l;
+		}
+	}
+	if (ia64_psr(regs)->rt == 0) {
+		va.l = ar_bspstore;
+		if (va.f.reg == 0) {
+			va.f.reg = 7;
+			ar_bspstore = va.l;
+		}
+		va.l = ar_bsp;
+		if (va.f.reg == 0) {
+			va.f.reg = 7;
+			ar_bsp = va.l;
 		}
 	}
 
-no_refresh:
-	spin_unlock_irqrestore(&zdev->dma_table_lock, irq_flags);
-	return rc;
-}
-
-void dma_free_seg_table(unsigned long entry)
-{
-	unsigned long *sto = get_rt_sto(entry);
-	int sx;
-
-	for (sx = 0; sx < ZPCI_TABLE_ENTRIES; sx++)
-		if (reg_entry_isvalid(sto[sx]))
-			dma_free_page_table(get_st_pto(sto[sx]));
-
-	dma_free_cpu_table(sto);
-}
-
-void dma_cleanup_tables(unsigned long *table)
-{
-	int rtx;
-
-	if (!table)
-		return;
-
-	for (rtx = 0; rtx < ZPCI_TABLE_ENTRIES; rtx++)
-		if (reg_entry_isvalid(table[rtx]))
-			dma_free_seg_table(table[rtx]);
-
-	dma_free_cpu_table(table);
-}
-
-static unsigned long __dma_alloc_iommu(struct zpci_dev *zdev,
-				       unsigned long start, int size)
-{
-	unsigned long boundary_size;
-
-	boundary_size = ALIGN(dma_get_seg_boundary(&zdev->pdev->dev) + 1,
-			      PAGE_SIZE) >> PAGE_SHIFT;
-	return iommu_area_alloc(zdev->iommu_bitmap, zdev->iommu_pages,
-				start, size, 0, boundary_size, 0);
-}
-
-static unsigned long dma_alloc_iommu(struct zpci_dev *zdev, int size)
-{
-	unsigned long offset, flags;
-	int wrap = 0;
-
-	spin_lock_irqsave(&zdev->iommu_bitmap_lock, flags);
-	offset = __dma_alloc_iommu(zdev, zdev->next_bit, size);
-	if (offset == -1) {
-		/* wrap-around */
-		offset = __dma_alloc_iommu(zdev, 0, size);
-		wrap = 1;
-	}
-
-	if (offset != -1) {
-		zdev->next_bit = offset + size;
-		if (!zdev->tlb_refresh && !s390_iommu_strict && wrap)
-			/* global flush after wrap-around with lazy unmap */
-			zpci_refresh_global(zdev);
-	}
-	spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
-	return offset;
-}
-
-static void dma_free_iommu(struct zpci_dev *zdev, unsigned long offset, int size)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&zdev->iommu_bitmap_lock, flags);
-	if (!zdev->iommu_bitmap)
-		goto out;
-	bitmap_clear(zdev->iommu_bitmap, offset, size);
-	/*
-	 * Lazy flush for unmap: need to move next_bit to avoid address re-use
-	 * until wrap-around.
+	/* mca_asm.S ia64_old_stack() cannot assume that the dirty registers
+	 * have been copied to the old stack, the old stack may fail the
+	 * validation tests below.  So ia64_old_stack() must restore the dirty
+	 * registers from the new stack.  The old and new bspstore probably
+	 * have different alignments, so loadrs calculated on the old bsp
+	 * cannot be used to restore from the new bsp.  Calculate a suitable
+	 * loadrs for the new stack and save it in the new pt_regs, where
+	 * ia64_old_stack() can get it.
 	 */
-	if (!s390_iommu_strict && offset >= zdev->next_bit)
-		zdev->next_bit = offset + size;
-out:
-	spin_unlock_irqrestore(&zdev->iommu_bitmap_lock, flags);
-}
+	old_bspstore = (unsigned long *)ar_bspstore;
+	old_bsp = (unsigned long *)ar_bsp;
+	slots = ia64_rse_num_regs(old_bspstore, old_bsp);
+	new_bspstore = (unsigned long *)((u64)current + IA64_RBS_OFFSET);
+	new_bsp = ia64_rse_skip_regs(new_bspstore, slots);
+	regs->loadrs = (new_bsp - new_bspstore) * 8 << 16;
 
-static inline void zpci_err_dma(unsigned long rc, unsigned long addr)
-{
-	struct {
-		unsigned long rc;
-		unsigned long addr;
-	} __packed data = {rc, addr};
-
-	zpci_err_hex(&data, sizeof(data));
-}
-
-static dma_addr_t s390_dma_map_pages(struct device *dev, struct page *page,
-				     unsigned long offset, size_t size,
-				     enum dma_data_direction direction,
-				     struct dma_attrs *attrs)
-{
-	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
-	unsigned long nr_pages, iommu_page_index;
-	unsigned long pa = page_to_phys(page) + offset;
-	int flags = ZPCI_PTE_VALID;
-	dma_addr_t dma_addr;
-	int ret;
-
-	/* This rounds up number of pages based on size and offset */
-	nr_pages = iommu_num_pages(pa, size, PAGE_SIZE);
-	iommu_page_index = dma_alloc_iommu(zdev, nr_pages);
-	if (iommu_page_index == -1) {
-		ret = -ENOSPC;
-		goto out_err;
+	/* Verify the previous stack state before we change it */
+	if (user_mode(regs)) {
+		msg = "occurred in user space";
+		/* previous_current is guaranteed to be valid when the task was
+		 * in user space, so ...
+		 */
+		ia64_mca_modify_comm(previous_current);
+		goto no_mod;
 	}
 
-	/* Use rounded up size */
-	size = nr_pages * PAGE_SIZE;
-
-	dma_addr = zdev->start_dma + iommu_page_index * PAGE_SIZE;
-	if (dma_addr + size > zdev->end_dma) {
-		ret = -ERANGE;
-		goto out_free;
+	if (r13 != sos->prev_IA64_KR_CURRENT) {
+		msg = "inconsistent previous current and r13";
+		goto no_mod;
 	}
 
-	if (direction == DMA_NONE || direction == DMA_TO_DEVICE)
-		flags |= ZPCI_TABLE_PROTECTED;
-
-	ret = dma_update_trans(zdev, pa, dma_addr, size, flags);
-	if (ret)
-		goto out_free;
-
-	atomic64_add(nr_pages, &zdev->mapped_pages);
-	return dma_addr + (offset & ~PAGE_MASK);
-
-out_free:
-	dma_free_iommu(zdev, iommu_page_index, nr_pages);
-out_err:
-	zpci_err("map error:\n");
-	zpci_err_dma(ret, pa);
-	return DMA_ERROR_CODE;
-}
-
-static void s390_dma_unmap_pages(struct device *dev, dma_addr_t dma_addr,
-				 size_t size, enum dma_data_direction direction,
-				 struct dma_attrs *attrs)
-{
-	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
-	unsigned long iommu_page_index;
-	int npages, ret;
-
-	npages = iommu_num_pages(dma_addr, size, PAGE_SIZE);
-	dma_addr = dma_addr & PAGE_MASK;
-	ret = dma_update_trans(zdev, 0, dma_addr, npages * PAGE_SIZE,
-			       ZPCI_PTE_INVALID);
-	if (ret) {
-		zpci_err("unmap error:\n");
-		zpci_err_dma(ret, dma_addr);
-		return;
+	if (!mca_recover_range(ms->pmsa_iip)) {
+		if ((r12 - r13) >= KERNEL_STACK_SIZE) {
+			msg = "inconsistent r12 and r13";
+			goto no_mod;
+		}
+		if ((ar_bspstore - r13) >= KERNEL_STACK_SIZE) {
+			msg = "inconsistent ar.bspstore and r13";
+			goto no_mod;
+		}
+		va.p = old_bspstore;
+		if (va.f.reg < 5) {
+			msg = "old_bspstore is in the wrong region";
+			goto no_mod;
+		}
+		if ((ar_bsp - r13) >= KERNEL_STACK_SIZE) {
+			msg = "inconsistent ar.bsp and r13";
+			goto no_mod;
+		}
+		size += (ia64_rse_skip_regs(old_bspstore, slots) - old_bspstore) * 8;
+		if (ar_bspstore + size > r12) {
+			msg = "no room for blocked state";
+			goto no_mod;
+		}
 	}
 
-	atomic64_add(npages, &zdev->unmapped_pages);
-	iommu_page_index = (dma_addr - zdev->start_dma) >> PAGE_SHIFT;
-	dma_free_iommu(zdev, iommu_page_index, npages);
-}
+	ia64_mca_modify_comm(previous_current);
 
-static void *s390_dma_alloc(struct device *dev, size_t size,
-			    dma_addr_t *dma_handle, gfp_t flag,
-			    struct dma_attrs *attrs)
-{
-	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
-	struct page *page;
-	unsigned long pa;
-	dma_addr_t map;
-
-	size = PAGE_ALIGN(size);
-	page = alloc_pages(flag, get_order(size));
-	if (!page)
-		return NULL;
-
-	pa = page_to_phys(page);
-	memset((void *) pa, 0, size);
-
-	map = s390_dma_map_pages(dev, page, pa % PAGE_SIZE,
-				 size, DMA_BIDIRECTIONAL, NULL);
-	if (dma_mapping_error(dev, map)) {
-		free_pages(pa, get_order(size));
-		return NULL;
-	}
-
-	atomic64_add(size / PAGE_SIZE, &zdev->allocated_pages);
-	if (dma_handle)
-		*dma_handle = map;
-	return (void *) pa;
-}
-
-static void s390_dma_free(struct device *dev, size_t size,
-			  void *pa, dma_addr_t dma_handle,
-			  struct dma_attrs *attrs)
-{
-	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
-
-	size = PAGE_ALIGN(size);
-	atomic64_sub(size / PAGE_SIZE, &zdev->allocated_pages);
-	s390_dma_unmap_pages(dev, dma_handle, size, DMA_BIDIRECTIONAL, NULL);
-	free_pages((unsigned long) pa, get_order(size));
-}
-
-static int s390_dma_map_sg(struct device *dev, struct scatterlist *sg,
-			   int nr_elements, enum dma_data_direction dir,
-			   struct dma_attrs *attrs)
-{
-	int mapped_elements = 0;
-	struct scatterlist *s;
-	int i;
-
-	for_each_sg(sg, s, nr_elements, i) {
-		struct page *page = sg_page(s);
-		s->dma_address = s390_dma_map_pages(dev, page, s->offset,
-						    s->length, dir, NULL);
-		if (!dma_mapping_error(dev, s->dma_address)) {
-			s->dma_length = s->length;
-			mapped_elements++;
-		} else
-			goto unmap;
-	}
-out:
-	return mapped_elements;
-
-unmap:
-	for_each_sg(sg, s, mapped_elements, i) {
-		if (s->dma_address)
-			s390_dma_unmap_pages(dev, s->dma_address, s->dma_length,
-					     dir, NULL);
-		s->dma_address = 0;
-		s->dma_length = 0;
-	}
-	mapped_elements = 0;
-	goto out;
-}
-
-static void s390_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
-			      int nr_elements, enum dma_data_direction dir,
-			      struct dma_attrs *attrs)
-{
-	struct scatterlist *s;
-	int i;
-
-	for_each_sg(sg, s, nr_elements, i) {
-		s390_dma_unmap_pages(dev, s->dma_address, s->dma_length, dir, NULL);
-		s->dma_address = 0;
-		s->dma_length = 0;
-	}
-}
-
-int zpci_dma_init_device(struct zpci_dev *zdev)
-{
-	int rc;
-
-	/*
-	 * At this point, if the device is part of an IOMMU domain, this would
-	 * be a strong hint towards a bug in the IOMMU API (common) code and/or
-	 * simultaneous access via IOMMU and DMA API. So let's issue a warning.
+	/* Make the original task look blocked.  First stack a struct pt_regs,
+	 * describing the state at the time of interrupt.  mca_asm.S built a
+	 * partial pt_regs, copy it and fill in the blanks using minstate.
 	 */
-	WARN_ON(zdev->s390_domain);
+	p = (char *)r12 - sizeof(*regs);
+	old_regs = (struct pt_regs *)p;
+	memcpy(old_regs, regs, sizeof(*regs));
+	old_regs->loadrs = loadrs;
+	old_unat = old_regs->ar_unat;
+	finish_pt_regs(old_regs, sos, &old_unat);
 
-	spin_lock_init(&zdev->iommu_bitmap_lock);
-	spin_lock_init(&zdev->dma_table_lock);
-
-	zdev->dma_table = dma_alloc_cpu_table();
-	if (!zdev->dma_table) {
-		rc = -ENOMEM;
-		goto out;
-	}
-
-	/*
-	 * Restrict the iommu bitmap size to the minimum of the following:
-	 * - main memory size
-	 * - 3-level pagetable address limit minus start_dma offset
-	 * - DMA address range allowed by the hardware (clp query pci fn)
+	/* Next stack a struct switch_stack.  mca_asm.S built a partial
+	 * switch_stack, copy it and fill in the blanks using pt_regs and
+	 * minstate.
 	 *
-	 * Also set zdev->end_dma to the actual end address of the usable
-	 * range, instead of the theoretical maximum as reported by hardware.
+	 * In the synthesized switch_stack, b0 points to ia64_leave_kernel,
+	 * ar.pfs is set to 0.
+	 *
+	 * unwind.c::unw_unwind() does special processing for interrupt frames.
+	 * It checks if the PRED_NON_SYSCALL predicate is set, if the predicate
+	 * is clear then unw_unwind() does _not_ adjust bsp over pt_regs.  Not
+	 * that this is documented, of course.  Set PRED_NON_SYSCALL in the
+	 * switch_stack on the original stack so it will unwind correctly when
+	 * unwind.c reads pt_regs.
+	 *
+	 * thread.ksp is updated to point to the synthesized switch_stack.
 	 */
-	zdev->iommu_size = min3((u64) high_memory,
-				ZPCI_TABLE_SIZE_RT - zdev->start_dma,
-				zdev->end_dma - zdev->start_dma + 1);
-	zdev->end_dma = zdev->start_dma + zdev->iommu_size - 1;
-	zdev->iommu_pages = zdev->iommu_size >> PAGE_SHIFT;
-	zdev->iommu_bitmap = vzalloc(zdev->iommu_pages / 8);
-	if (!zdev->iommu_bitmap) {
-		rc = -ENOMEM;
-		goto free_dma_table;
+	p -= sizeof(struct switch_stack);
+	old_sw = (struct switch_stack *)p;
+	memcpy(old_sw, sw, sizeof(*sw));
+	old_sw->caller_unat = old_unat;
+	old_sw->ar_fpsr = old_regs->ar_fpsr;
+	copy_reg(&ms->pmsa_gr[4-1], ms->pmsa_nat_bits, &old_sw->r4, &old_unat);
+	copy_reg(&ms->pmsa_gr[5-1], ms->pmsa_nat_bits, &old_sw->r5, &old_unat);
+	copy_reg(&ms->pmsa_gr[6-1], ms->pmsa_nat_bits, &old_sw->r6, &old_unat);
+	copy_reg(&ms->pmsa_gr[7-1], ms->pmsa_nat_bits, &old_sw->r7, &old_unat);
+	old_sw->b0 = (u64)ia64_leave_kernel;
+	old_sw->b1 = ms->pmsa_br1;
+	old_sw->ar_pfs = 0;
+	old_sw->ar_unat = old_unat;
+	old_sw->pr = old_regs->pr | (1UL << PRED_NON_SYSCALL);
+	previous_current->thread.ksp = (u64)p - 16;
+
+	/* Finally copy the original stack's registers back to its RBS.
+	 * Registers from ar.bspstore through ar.bsp at the time of the event
+	 * are in the current RBS, copy them back to the original stack.  The
+	 * copy must be done register by register because the original bspstore
+	 * and the current one have different alignments, so the saved RNAT
+	 * data occurs at different places.
+	 *
+	 * mca_asm does cover, so the old_bsp already includes all registers at
+	 * the time of MCA/INIT.  It also does flushrs, so all registers before
+	 * this function have been written to backing store on the MCA/INIT
+	 * stack.
+	 */
+	new_rnat = ia64_get_rnat(ia64_rse_rnat_addr(new_bspstore));
+	old_rnat = regs->ar_rnat;
+	while (slots--) {
+		if (ia64_rse_is_rnat_slot(new_bspstore)) {
+			new_rnat = ia64_get_rnat(new_bspstore++);
+		}
+		if (ia64_rse_is_rnat_slot(old_bspstore)) {
+			*old_bspstore++ = old_rnat;
+			old_rnat = 0;
+		}
+		nat = (new_rnat >> ia64_rse_slot_num(new_bspstore)) & 1UL;
+		old_rnat &= ~(1UL << ia64_rse_slot_num(old_bspstore));
+		old_rnat |= (nat << ia64_rse_slot_num(old_bspstore));
+		*old_bspstore++ = *new_bspstore++;
 	}
+	old_sw->ar_bspstore = (unsigned long)old_bspstore;
+	old_sw->ar_rnat = old_rnat;
 
-	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
-				(u64) zdev->dma_table);
-	if (rc)
-		goto free_bitmap;
+	sos->prev_task = previous_current;
+	return previous_current;
 
-	return 0;
-free_bitmap:
-	vfree(zdev->iommu_bitmap);
-	zdev->iommu_bitmap = NULL;
-free_dma_table:
-	dma_free_cpu_table(zdev->dma_table);
-	zdev->dma_table = NULL;
-out:
-	return rc;
+no_mod:
+	mprintk(KERN_INFO "cpu %d, %s %s, original stack not modified\n",
+			smp_processor_id(), type, msg);
+	old_unat = regs->ar_unat;
+	finish_pt_regs(regs, sos, &old_unat);
+	return previous_current;
 }
 
-void zpci_dma_exit_device(struct zpci_dev *zdev)
+/* The monarch/slave interaction is based on monarch_cpu and requires that all
+ * slaves have entered rendezvous before the monarch leaves.  If any cpu has
+ * not entered rendezvous yet then wait a bit.  The assumption is that any
+ * slave that has not rendezvoused after a reasonable time is never going to do
+ * so.  In this context, slave includes cpus that respond to the MCA rendezvous
+ * interrupt, as well as cpus that receive the INIT slave event.
+ */
+
+static void
+ia64_wait_for_slaves(int monarch, const char *type)
 {
+	int c, i , wait;
+
 	/*
-	 * At this point, if the device is part of an IOMMU domain, this would
-	 * be a strong hint towards a bug in the IOMMU API (common) code and/or
-	 * simultaneous access via IOMMU and DMA API. So let's issue a warning.
+	 * wait 5 seconds total for slaves (arbitrary)
 	 */
-	WARN_ON(zdev->s390_domain);
-
-	zpci_unregister_ioat(zdev, 0);
-	dma_cleanup_tables(zdev->dma_table);
-	zdev->dma_table = NULL;
-	vfree(zdev->iommu_bitmap);
-	zdev->iommu_bitmap = NULL;
-	zdev->next_bit = 0;
-}
-
-static int __init dma_alloc_cpu_table_caches(void)
-{
-	dma_region_table_cache = kmem_cache_create("PCI_DMA_region_tables",
-					ZPCI_TABLE_SIZE, ZPCI_TABLE_ALIGN,
-					0, NULL);
-	if (!dma_region_table_cache)
-		return -ENOMEM;
-
-	dma_page_table_cache = kmem_cache_create("PCI_DMA_page_tables",
-					ZPCI_PT_SIZE, ZPCI_PT_ALIGN,
-					0, NULL);
-	if (!dma_page_table_cache) {
-		kmem_cache_destroy(dma_region_table_cache);
-		return -ENOMEM;
+	for (i = 0; i < 5000; i++) {
+		wait = 0;
+		for_each_online_cpu(c) {
+			if (c == monarch)
+				continue;
+			if (ia64_mc_info.imi_rendez_checkin[c]
+					== IA64_MCA_RENDEZ_CHECKIN_NOTDONE) {
+				udelay(1000);		/* short wait */
+				wait = 1;
+				break;
+			}
+		}
+		if (!wait)
+			goto all_in;
 	}
-	return 0;
+
+	/*
+	 * Maybe slave(s) dead. Print buffered messages immediately.
+	 */
+	ia64_mlogbuf_finish(0);
+	mprintk(KERN_INFO "OS %s slave did not rendezvous on cpu", type);
+	for_each_online_cpu(c) {
+		if (c == monarch)
+			continue;
+		if (ia64_mc_info.imi_rendez_checkin[c] == IA64_MCA_RENDEZ_CHECKIN_NOTDONE)
+			mprintk(" %d", c);
+	}
+	mprintk("\n");
+	return;
+
+all_in:
+	mprintk(KERN_INFO "All OS %s slaves have reached rendezvous\n", type);
+	return;
 }
 
-int __init zpci_dma_init(void)
+/*  mca_insert_tr
+ *
+ *  Switch rid when TR reload and needed!
+ *  iord: 1: itr, 2: itr;
+ *
+*/
+static void mca_insert_tr(u64 iord)
 {
-	return dma_alloc_cpu_table_caches();
+
+	int i;
+	u64 old_rr;
+	struct ia64_tr_entry *p;
+	unsigned long psr;
+	int cpu = smp_processor_id();
+
+	if (!ia64_idtrs[cpu])
+		return;
+
+	psr = ia64_clear_ic();
+	for (i = IA64_TR_ALLOC_BASE; i < IA64_TR_ALLOC_MAX; i++) {
+		p = ia64_idtrs[cpu] + (iord - 1) * IA64_TR_ALLOC_MAX;
+		if (p->pte & 0x1) {
+			old_rr = ia64_get_rr(p->ifa);
+			if (old_rr != p->rr) {
+				ia64_set_rr(p->ifa, p->rr);
+				ia64_srlz_d();
+			}
+			ia64_ptr(iord, p->ifa, p->itir >> 2);
+			ia64_srlz_i();
+			if (iord & 0x1) {
+				ia64_itr(0x1, i, p->ifa, p->pte, p->itir >> 2);
+				ia64_srlz_i();
+			}
+			if (iord & 0x2) {
+				ia64_itr(0x2, i, p->ifa, p->pte, p->itir >> 2);
+				ia64_srlz_i();
+			}
+			if (old_rr != p->rr) {
+				ia64_set_rr(p->ifa, old_rr);
+				ia64_srlz_d();
+			}
+		}
+	}
+	ia64_set_psr(psr);
 }
 
-void zpci_dma_exit(void)
+/*
+ * ia64_mca_handler
+ *
+ *	This is uncorrectable machine check handler called from OS_MCA
+ *	dispatch code which is in turn called from SAL_CHECK().
+ *	This is the place where the core of OS MCA handling is done.
+ *	Right now the logs are extracted and displayed in a well-defined
+ *	format. This handler code is supposed to be run only on the
+ *	monarch processor. Once the monarch is done with MCA handling
+ *	further MCA logging is enabled by clearing logs.
+ *	Monarch also has the duty of sending wakeup-IPIs to pull the
+ *	slave processors out of rendezvous spinloop.
+ *
+ *	If multiple processors call into OS_MCA, the first will become
+ *	the monarch.  Subsequent cpus will be recorded in the mca_cpu
+ *	bitmask.  After the first monarch has processed its MCA, it
+ *	will wake up the next cpu in the mca_cpu bitmask and then go
+ *	into the rendezvous loop.  When all processors have serviced
+ *	their MCA, the last monarch frees up the rest of the processors.
+ */
+void
+ia64_mca_handler(struct pt_regs *regs, struct switch_stack *sw,
+		 struct ia64_sal_os_state *sos)
 {
-	kmem_cache_destroy(dma_page_table_cache);
-	kmem_cache_destroy(dma_region_table_cache);
-}
+	int recover, cpu = smp_processor_id();
+	struct task_struct *previous_current;
+	struct ia64_mca_notify_die nd =
+		{ .sos = sos, .monarch_cpu = &monarch_cpu, .data = &recover };
+	static atomic_t mca_count;
+	static cpumask_t mca_cpu;
 
-#define PREALLOC_DMA_DEBUG_ENTRIES	(1 << 16)
+	if (atomic_add_return(1, &mca_count) == 1) {
+		monarch_cpu = cpu;
+		sos->monarch = 1;
+	} else {
+		cpumask_set_cpu(cpu, &mca_cpu);
+		sos->monarch = 0;
+	}
+	mprintk(KERN_INFO "Entered OS MCA handler. PSP=%lx cpu=%d "
+		"monarch=%ld\n", sos->proc_state_param, cpu, sos->monarch);
 
-static int __init dma_debug_do_init(void)
-{
-	dma_debug_init(PREALLOC_DMA_DEBUG_ENTRIES);
-	return 0;
-}
-fs_initcall(dma_debug_do_init);
+	previous_current = ia64_mca_modify_original_stack(regs, sw, sos, "MCA");
 
-struct dma_map_ops s390_dma_ops = {
-	.alloc		= s390_dma_alloc,
-	.free		= s390_dma_free,
-	.map_sg		= s390_dma_map_sg,
-	.unmap_sg	= s390_dma_unmap_sg,
-	.map_page	= s390_dma_map_pages,
-	.unmap_page	= s390_dma_unmap_pages,
-	/* if we support direct DMA this must be conditional */
-	.is_phys	= 0,
-	/* dma_supported is unconditionally true without a callback */
-};
-EXPORT_SYMBOL_GPL(s390_dma_ops);
+	NOTIFY_MCA(DIE_MCA_MONARCH_ENTER, regs, (long)&nd, 1);
 
-static int __init s390_iommu_setup(char *str)
-{
-	if (!strncmp(str, "strict", 6))
-		s390_iommu_strict = 1;
-	return 0;
-}
+	ia64_mc_info.imi_rendez_checkin[cpu] = IA64_MCA_RENDEZ_CHECKIN_CONCURRENT_MCA;
+	if (sos->monarch) {
+		ia64_wait_for_slaves(cpu, "MCA");
 
-__setup("s390_iommu=", s390_iommu_setup);
+		/* Wakeup all the processors which are spinning in the
+		 * rendezvous loop.  They will leave SAL, then spin in the OS
+		 * with interrupts disabled until this monarch cpu leaves the
+		 * MCA handler.  That gets control back to the OS so we can
+		 * backtrace the other cpus, backtrace when spinning in SAL
+		 * 

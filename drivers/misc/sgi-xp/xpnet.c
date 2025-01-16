@@ -1,608 +1,653 @@
-/*
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- *
- * Copyright (C) 1999-2009 Silicon Graphics, Inc. All rights reserved.
- */
+v_priv->dev)->gen >= 8) {
+		for_each_ring(signaller, dev_priv, i) {
+			if (ring == signaller)
+				continue;
 
-/*
- * Cross Partition Network Interface (XPNET) support
- *
- *	XPNET provides a virtual network layered on top of the Cross
- *	Partition communication layer.
- *
- *	XPNET provides direct point-to-point and broadcast-like support
- *	for an ethernet-like device.  The ethernet broadcast medium is
- *	replaced with a point-to-point message structure which passes
- *	pointers to a DMA-capable block that a remote partition should
- *	retrieve and pass to the upper level networking layer.
- *
- */
+			if (offset == signaller->semaphore.signal_ggtt[ring->id])
+				return signaller;
+		}
+	} else {
+		u32 sync_bits = ipehr & MI_SEMAPHORE_SYNC_MASK;
 
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/netdevice.h>
-#include <linux/etherdevice.h>
-#include "xp.h"
+		for_each_ring(signaller, dev_priv, i) {
+			if(ring == signaller)
+				continue;
 
-/*
- * The message payload transferred by XPC.
- *
- * buf_pa is the physical address where the DMA should pull from.
- *
- * NOTE: for performance reasons, buf_pa should _ALWAYS_ begin on a
- * cacheline boundary.  To accomplish this, we record the number of
- * bytes from the beginning of the first cacheline to the first useful
- * byte of the skb (leadin_ignore) and the number of bytes from the
- * last useful byte of the skb to the end of the last cacheline
- * (tailout_ignore).
- *
- * size is the number of bytes to transfer which includes the skb->len
- * (useful bytes of the senders skb) plus the leadin and tailout
- */
-struct xpnet_message {
-	u16 version;		/* Version for this message */
-	u16 embedded_bytes;	/* #of bytes embedded in XPC message */
-	u32 magic;		/* Special number indicating this is xpnet */
-	unsigned long buf_pa;	/* phys address of buffer to retrieve */
-	u32 size;		/* #of bytes in buffer */
-	u8 leadin_ignore;	/* #of bytes to ignore at the beginning */
-	u8 tailout_ignore;	/* #of bytes to ignore at the end */
-	unsigned char data;	/* body of small packets */
-};
+			if (sync_bits == signaller->semaphore.mbox.wait[ring->id])
+				return signaller;
+		}
+	}
 
-/*
- * Determine the size of our message, the cacheline aligned size,
- * and then the number of message will request from XPC.
- *
- * XPC expects each message to exist in an individual cacheline.
- */
-#define XPNET_MSG_SIZE		XPC_MSG_PAYLOAD_MAX_SIZE
-#define XPNET_MSG_DATA_MAX	\
-		(XPNET_MSG_SIZE - offsetof(struct xpnet_message, data))
-#define XPNET_MSG_NENTRIES	(PAGE_SIZE / XPC_MSG_MAX_SIZE)
+	DRM_ERROR("No signaller ring found for ring %i, ipehr 0x%08x, offset 0x%016llx\n",
+		  ring->id, ipehr, offset);
 
-#define XPNET_MAX_KTHREADS	(XPNET_MSG_NENTRIES + 1)
-#define XPNET_MAX_IDLE_KTHREADS	(XPNET_MSG_NENTRIES + 1)
+	return NULL;
+}
 
-/*
- * Version number of XPNET implementation. XPNET can always talk to versions
- * with same major #, and never talk to versions with a different version.
- */
-#define _XPNET_VERSION(_major, _minor)	(((_major) << 4) | (_minor))
-#define XPNET_VERSION_MAJOR(_v)		((_v) >> 4)
-#define XPNET_VERSION_MINOR(_v)		((_v) & 0xf)
-
-#define	XPNET_VERSION _XPNET_VERSION(1, 0)	/* version 1.0 */
-#define	XPNET_VERSION_EMBED _XPNET_VERSION(1, 1)	/* version 1.1 */
-#define XPNET_MAGIC	0x88786984	/* "XNET" */
-
-#define XPNET_VALID_MSG(_m)						     \
-   ((XPNET_VERSION_MAJOR(_m->version) == XPNET_VERSION_MAJOR(XPNET_VERSION)) \
-    && (msg->magic == XPNET_MAGIC))
-
-#define XPNET_DEVICE_NAME		"xp0"
-
-/*
- * When messages are queued with xpc_send_notify, a kmalloc'd buffer
- * of the following type is passed as a notification cookie.  When the
- * notification function is called, we use the cookie to decide
- * whether all outstanding message sends have completed.  The skb can
- * then be released.
- */
-struct xpnet_pending_msg {
-	struct sk_buff *skb;
-	atomic_t use_count;
-};
-
-struct net_device *xpnet_device;
-
-/*
- * When we are notified of other partitions activating, we add them to
- * our bitmask of partitions to which we broadcast.
- */
-static unsigned long *xpnet_broadcast_partitions;
-/* protect above */
-static DEFINE_SPINLOCK(xpnet_broadcast_lock);
-
-/*
- * Since the Block Transfer Engine (BTE) is being used for the transfer
- * and it relies upon cache-line size transfers, we need to reserve at
- * least one cache-line for head and tail alignment.  The BTE is
- * limited to 8MB transfers.
- *
- * Testing has shown that changing MTU to greater than 64KB has no effect
- * on TCP as the two sides negotiate a Max Segment Size that is limited
- * to 64K.  Other protocols May use packets greater than this, but for
- * now, the default is 64KB.
- */
-#define XPNET_MAX_MTU (0x800000UL - L1_CACHE_BYTES)
-/* 32KB has been determined to be the ideal */
-#define XPNET_DEF_MTU (0x8000UL)
-
-/*
- * The partid is encapsulated in the MAC address beginning in the following
- * octet and it consists of two octets.
- */
-#define XPNET_PARTID_OCTET	2
-
-/* Define the XPNET debug device structures to be used with dev_dbg() et al */
-
-struct device_driver xpnet_dbg_name = {
-	.name = "xpnet"
-};
-
-struct device xpnet_dbg_subname = {
-	.init_name = "",	/* set to "" */
-	.driver = &xpnet_dbg_name
-};
-
-struct device *xpnet = &xpnet_dbg_subname;
-
-/*
- * Packet was recevied by XPC and forwarded to us.
- */
-static void
-xpnet_receive(short partid, int channel, struct xpnet_message *msg)
+static struct intel_engine_cs *
+semaphore_waits_for(struct intel_engine_cs *ring, u32 *seqno)
 {
-	struct sk_buff *skb;
-	void *dst;
-	enum xp_retval ret;
+	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+	u32 cmd, ipehr, head;
+	u64 offset = 0;
+	int i, backwards;
 
-	if (!XPNET_VALID_MSG(msg)) {
+	/*
+	 * This function does not support execlist mode - any attempt to
+	 * proceed further into this function will result in a kernel panic
+	 * when dereferencing ring->buffer, which is not set up in execlist
+	 * mode.
+	 *
+	 * The correct way of doing it would be to derive the currently
+	 * executing ring buffer from the current context, which is derived
+	 * from the currently running request. Unfortunately, to get the
+	 * current request we would have to grab the struct_mutex before doing
+	 * anything else, which would be ill-advised since some other thread
+	 * might have grabbed it already and managed to hang itself, causing
+	 * the hang checker to deadlock.
+	 *
+	 * Therefore, this function does not support execlist mode in its
+	 * current form. Just return NULL and move on.
+	 */
+	if (ring->buffer == NULL)
+		return NULL;
+
+	ipehr = I915_READ(RING_IPEHR(ring->mmio_base));
+	if (!ipehr_is_semaphore_wait(ring->dev, ipehr))
+		return NULL;
+
+	/*
+	 * HEAD is likely pointing to the dword after the actual command,
+	 * so scan backwards until we find the MBOX. But limit it to just 3
+	 * or 4 dwords depending on the semaphore wait command size.
+	 * Note that we don't care about ACTHD here since that might
+	 * point at at batch, and semaphores are always emitted into the
+	 * ringbuffer itself.
+	 */
+	head = I915_READ_HEAD(ring) & HEAD_ADDR;
+	backwards = (INTEL_INFO(ring->dev)->gen >= 8) ? 5 : 4;
+
+	for (i = backwards; i; --i) {
 		/*
-		 * Packet with a different XPC version.  Ignore.
+		 * Be paranoid and presume the hw has gone off into the wild -
+		 * our ring is smaller than what the hardware (and hence
+		 * HEAD_ADDR) allows. Also handles wrap-around.
 		 */
-		xpc_received(partid, channel, (void *)msg);
+		head &= ring->buffer->size - 1;
 
-		xpnet_device->stats.rx_errors++;
+		/* This here seems to blow up */
+		cmd = ioread32(ring->buffer->virtual_start + head);
+		if (cmd == ipehr)
+			break;
 
-		return;
-	}
-	dev_dbg(xpnet, "received 0x%lx, %d, %d, %d\n", msg->buf_pa, msg->size,
-		msg->leadin_ignore, msg->tailout_ignore);
-
-	/* reserve an extra cache line */
-	skb = dev_alloc_skb(msg->size + L1_CACHE_BYTES);
-	if (!skb) {
-		dev_err(xpnet, "failed on dev_alloc_skb(%d)\n",
-			msg->size + L1_CACHE_BYTES);
-
-		xpc_received(partid, channel, (void *)msg);
-
-		xpnet_device->stats.rx_errors++;
-
-		return;
+		head -= 4;
 	}
 
-	/*
-	 * The allocated skb has some reserved space.
-	 * In order to use xp_remote_memcpy(), we need to get the
-	 * skb->data pointer moved forward.
+	if (!i)
+		return NULL;
+
+	*seqno = ioread32(ring->buffer->virtual_start + head + 4) + 1;
+	if (INTEL_INFO(ring->dev)->gen >= 8) {
+		offset = ioread32(ring->buffer->virtual_start + head + 12);
+		offset <<= 32;
+		offset = ioread32(ring->buffer->virtual_start + head + 8);
+	}
+	return semaphore_wait_to_signaller_ring(ring, ipehr, offset);
+}
+
+static int semaphore_passed(struct intel_engine_cs *ring)
+{
+	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+	struct intel_engine_cs *signaller;
+	u32 seqno;
+
+	ring->hangcheck.deadlock++;
+
+	signaller = semaphore_waits_for(ring, &seqno);
+	if (signaller == NULL)
+		return -1;
+
+	/* Prevent pathological recursion due to driver bugs */
+	if (signaller->hangcheck.deadlock >= I915_NUM_RINGS)
+		return -1;
+
+	if (i915_seqno_passed(signaller->get_seqno(signaller, false), seqno))
+		return 1;
+
+	/* cursory check for an unkickable deadlock */
+	if (I915_READ_CTL(signaller) & RING_WAIT_SEMAPHORE &&
+	    semaphore_passed(signaller) < 0)
+		return -1;
+
+	return 0;
+}
+
+static void semaphore_clear_deadlocks(struct drm_i915_private *dev_priv)
+{
+	struct intel_engine_cs *ring;
+	int i;
+
+	for_each_ring(ring, dev_priv, i)
+		ring->hangcheck.deadlock = 0;
+}
+
+static enum intel_ring_hangcheck_action
+ring_stuck(struct intel_engine_cs *ring, u64 acthd)
+{
+	struct drm_device *dev = ring->dev;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	u32 tmp;
+
+	if (acthd != ring->hangcheck.acthd) {
+		if (acthd > ring->hangcheck.max_acthd) {
+			ring->hangcheck.max_acthd = acthd;
+			return HANGCHECK_ACTIVE;
+		}
+
+		return HANGCHECK_ACTIVE_LOOP;
+	}
+
+	if (IS_GEN2(dev))
+		return HANGCHECK_HUNG;
+
+	/* Is the chip hanging on a WAIT_FOR_EVENT?
+	 * If so we can simply poke the RB_WAIT bit
+	 * and break the hang. This should work on
+	 * all but the second generation chipsets.
 	 */
-	skb_reserve(skb, (L1_CACHE_BYTES - ((u64)skb->data &
-					    (L1_CACHE_BYTES - 1)) +
-			  msg->leadin_ignore));
+	tmp = I915_READ_CTL(ring);
+	if (tmp & RING_WAIT) {
+		i915_handle_error(dev, false,
+				  "Kicking stuck wait on %s",
+				  ring->name);
+		I915_WRITE_CTL(ring, tmp);
+		return HANGCHECK_KICK;
+	}
 
-	/*
-	 * Update the tail pointer to indicate data actually
-	 * transferred.
-	 */
-	skb_put(skb, (msg->size - msg->leadin_ignore - msg->tailout_ignore));
+	if (INTEL_INFO(dev)->gen >= 6 && tmp & RING_WAIT_SEMAPHORE) {
+		switch (semaphore_passed(ring)) {
+		default:
+			return HANGCHECK_HUNG;
+		case 1:
+			i915_handle_error(dev, false,
+					  "Kicking stuck semaphore on %s",
+					  ring->name);
+			I915_WRITE_CTL(ring, tmp);
+			return HANGCHECK_KICK;
+		case 0:
+			return HANGCHECK_WAIT;
+		}
+	}
 
-	/*
-	 * Move the data over from the other side.
-	 */
-	if ((XPNET_VERSION_MINOR(msg->version) == 1) &&
-	    (msg->embedded_bytes != 0)) {
-		dev_dbg(xpnet, "copying embedded message. memcpy(0x%p, 0x%p, "
-			"%lu)\n", skb->data, &msg->data,
-			(size_t)msg->embedded_bytes);
+	return HANGCHECK_HUNG;
+}
 
-		skb_copy_to_linear_data(skb, &msg->data,
-					(size_t)msg->embedded_bytes);
-	} else {
-		dst = (void *)((u64)skb->data & ~(L1_CACHE_BYTES - 1));
-		dev_dbg(xpnet, "transferring buffer to the skb->data area;\n\t"
-			"xp_remote_memcpy(0x%p, 0x%p, %hu)\n", dst,
-					  (void *)msg->buf_pa, msg->size);
+/*
+ * This is called when the chip hasn't reported back with completed
+ * batchbuffers in a long time. We keep track per ring seqno progress and
+ * if there are no progress, hangcheck score for that ring is increased.
+ * Further, acthd is inspected to see if the ring is stuck. On stuck case
+ * we kick the ring. If we see no progress on three subsequent calls
+ * we assume chip is wedged and try to fix it by resetting the chip.
+ */
+static void i915_hangcheck_elapsed(struct work_struct *work)
+{
+	struct drm_i915_private *dev_priv =
+		container_of(work, typeof(*dev_priv),
+			     gpu_error.hangcheck_work.work);
+	struct drm_device *dev = dev_priv->dev;
+	struct intel_engine_cs *ring;
+	int i;
+	int busy_count = 0, rings_hung = 0;
+	bool stuck[I915_NUM_RINGS] = { 0 };
+#define BUSY 1
+#define KICK 5
+#define HUNG 20
 
-		ret = xp_remote_memcpy(xp_pa(dst), msg->buf_pa, msg->size);
-		if (ret != xpSuccess) {
-			/*
-			 * !!! Need better way of cleaning skb.  Currently skb
-			 * !!! appears in_use and we can't just call
-			 * !!! dev_kfree_skb.
+	if (!i915.enable_hangcheck)
+		return;
+
+	for_each_ring(ring, dev_priv, i) {
+		u64 acthd;
+		u32 seqno;
+		bool busy = true;
+
+		semaphore_clear_deadlocks(dev_priv);
+
+		seqno = ring->get_seqno(ring, false);
+		acthd = intel_ring_get_active_head(ring);
+
+		if (ring->hangcheck.seqno == seqno) {
+			if (ring_idle(ring, seqno)) {
+				ring->hangcheck.action = HANGCHECK_IDLE;
+
+				if (waitqueue_active(&ring->irq_queue)) {
+					/* Issue a wake-up to catch stuck h/w. */
+					if (!test_and_set_bit(ring->id, &dev_priv->gpu_error.missed_irq_rings)) {
+						if (!(dev_priv->gpu_error.test_irq_rings & intel_ring_flag(ring)))
+							DRM_ERROR("Hangcheck timer elapsed... %s idle\n",
+								  ring->name);
+						else
+							DRM_INFO("Fake missed irq on %s\n",
+								 ring->name);
+						wake_up_all(&ring->irq_queue);
+					}
+					/* Safeguard against driver failure */
+					ring->hangcheck.score += BUSY;
+				} else
+					busy = false;
+			} else {
+				/* We always increment the hangcheck score
+				 * if the ring is busy and still processing
+				 * the same request, so that no single request
+				 * can run indefinitely (such as a chain of
+				 * batches). The only time we do not increment
+				 * the hangcheck score on this ring, if this
+				 * ring is in a legitimate wait for another
+				 * ring. In that case the waiting ring is a
+				 * victim and we want to be sure we catch the
+				 * right culprit. Then every time we do kick
+				 * the ring, add a small increment to the
+				 * score so that we can catch a batch that is
+				 * being repeatedly kicked and so responsible
+				 * for stalling the machine.
+				 */
+				ring->hangcheck.action = ring_stuck(ring,
+								    acthd);
+
+				switch (ring->hangcheck.action) {
+				case HANGCHECK_IDLE:
+				case HANGCHECK_WAIT:
+				case HANGCHECK_ACTIVE:
+					break;
+				case HANGCHECK_ACTIVE_LOOP:
+					ring->hangcheck.score += BUSY;
+					break;
+				case HANGCHECK_KICK:
+					ring->hangcheck.score += KICK;
+					break;
+				case HANGCHECK_HUNG:
+					ring->hangcheck.score += HUNG;
+					stuck[i] = true;
+					break;
+				}
+			}
+		} else {
+			ring->hangcheck.action = HANGCHECK_ACTIVE;
+
+			/* Gradually reduce the count so that we catch DoS
+			 * attempts across multiple batches.
 			 */
-			dev_err(xpnet, "xp_remote_memcpy(0x%p, 0x%p, 0x%hx) "
-				"returned error=0x%x\n", dst,
-				(void *)msg->buf_pa, msg->size, ret);
+			if (ring->hangcheck.score > 0)
+				ring->hangcheck.score--;
 
-			xpc_received(partid, channel, (void *)msg);
+			ring->hangcheck.acthd = ring->hangcheck.max_acthd = 0;
+		}
 
-			xpnet_device->stats.rx_errors++;
+		ring->hangcheck.seqno = seqno;
+		ring->hangcheck.acthd = acthd;
+		busy_count += busy;
+	}
 
-			return;
+	for_each_ring(ring, dev_priv, i) {
+		if (ring->hangcheck.score >= HANGCHECK_SCORE_RING_HUNG) {
+			DRM_INFO("%s on %s\n",
+				 stuck[i] ? "stuck" : "no progress",
+				 ring->name);
+			rings_hung++;
 		}
 	}
 
-	dev_dbg(xpnet, "<skb->head=0x%p skb->data=0x%p skb->tail=0x%p "
-		"skb->end=0x%p skb->len=%d\n", (void *)skb->head,
-		(void *)skb->data, skb_tail_pointer(skb), skb_end_pointer(skb),
-		skb->len);
+	if (rings_hung)
+		return i915_handle_error(dev, true, "Ring hung");
 
-	skb->protocol = eth_type_trans(skb, xpnet_device);
-	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	if (busy_count)
+		/* Reset timer case chip hangs without another request
+		 * being added */
+		i915_queue_hangcheck(dev);
+}
 
-	dev_dbg(xpnet, "passing skb to network layer\n"
-		"\tskb->head=0x%p skb->data=0x%p skb->tail=0x%p "
-		"skb->end=0x%p skb->len=%d\n",
-		(void *)skb->head, (void *)skb->data, skb_tail_pointer(skb),
-		skb_end_pointer(skb), skb->len);
+void i915_queue_hangcheck(struct drm_device *dev)
+{
+	struct i915_gpu_error *e = &to_i915(dev)->gpu_error;
 
-	xpnet_device->stats.rx_packets++;
-	xpnet_device->stats.rx_bytes += skb->len + ETH_HLEN;
+	if (!i915.enable_hangcheck)
+		return;
 
-	netif_rx_ni(skb);
-	xpc_received(partid, channel, (void *)msg);
+	/* Don't continually defer the hangcheck so that it is always run at
+	 * least once after work has been scheduled on any ring. Otherwise,
+	 * we will ignore a hung ring if a second ring is kept busy.
+	 */
+
+	queue_delayed_work(e->hangcheck_wq, &e->hangcheck_work,
+			   round_jiffies_up_relative(DRM_I915_HANGCHECK_JIFFIES));
+}
+
+static void ibx_irq_reset(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	if (HAS_PCH_NOP(dev))
+		return;
+
+	GEN5_IRQ_RESET(SDE);
+
+	if (HAS_PCH_CPT(dev) || HAS_PCH_LPT(dev))
+		I915_WRITE(SERR_INT, 0xffffffff);
 }
 
 /*
- * This is the handler which XPC calls during any sort of change in
- * state or message reception on a connection.
- */
-static void
-xpnet_connection_activity(enum xp_retval reason, short partid, int channel,
-			  void *data, void *key)
-{
-	DBUG_ON(partid < 0 || partid >= xp_max_npartitions);
-	DBUG_ON(channel != XPC_NET_CHANNEL);
-
-	switch (reason) {
-	case xpMsgReceived:	/* message received */
-		DBUG_ON(data == NULL);
-
-		xpnet_receive(partid, channel, (struct xpnet_message *)data);
-		break;
-
-	case xpConnected:	/* connection completed to a partition */
-		spin_lock_bh(&xpnet_broadcast_lock);
-		__set_bit(partid, xpnet_broadcast_partitions);
-		spin_unlock_bh(&xpnet_broadcast_lock);
-
-		netif_carrier_on(xpnet_device);
-
-		dev_dbg(xpnet, "%s connected to partition %d\n",
-			xpnet_device->name, partid);
-		break;
-
-	default:
-		spin_lock_bh(&xpnet_broadcast_lock);
-		__clear_bit(partid, xpnet_broadcast_partitions);
-		spin_unlock_bh(&xpnet_broadcast_lock);
-
-		if (bitmap_empty((unsigned long *)xpnet_broadcast_partitions,
-				 xp_max_npartitions)) {
-			netif_carrier_off(xpnet_device);
-		}
-
-		dev_dbg(xpnet, "%s disconnected from partition %d\n",
-			xpnet_device->name, partid);
-		break;
-	}
-}
-
-static int
-xpnet_dev_open(struct net_device *dev)
-{
-	enum xp_retval ret;
-
-	dev_dbg(xpnet, "calling xpc_connect(%d, 0x%p, NULL, %ld, %ld, %ld, "
-		"%ld)\n", XPC_NET_CHANNEL, xpnet_connection_activity,
-		(unsigned long)XPNET_MSG_SIZE,
-		(unsigned long)XPNET_MSG_NENTRIES,
-		(unsigned long)XPNET_MAX_KTHREADS,
-		(unsigned long)XPNET_MAX_IDLE_KTHREADS);
-
-	ret = xpc_connect(XPC_NET_CHANNEL, xpnet_connection_activity, NULL,
-			  XPNET_MSG_SIZE, XPNET_MSG_NENTRIES,
-			  XPNET_MAX_KTHREADS, XPNET_MAX_IDLE_KTHREADS);
-	if (ret != xpSuccess) {
-		dev_err(xpnet, "ifconfig up of %s failed on XPC connect, "
-			"ret=%d\n", dev->name, ret);
-
-		return -ENOMEM;
-	}
-
-	dev_dbg(xpnet, "ifconfig up of %s; XPC connected\n", dev->name);
-
-	return 0;
-}
-
-static int
-xpnet_dev_stop(struct net_device *dev)
-{
-	xpc_disconnect(XPC_NET_CHANNEL);
-
-	dev_dbg(xpnet, "ifconfig down of %s; XPC disconnected\n", dev->name);
-
-	return 0;
-}
-
-static int
-xpnet_dev_change_mtu(struct net_device *dev, int new_mtu)
-{
-	/* 68 comes from min TCP+IP+MAC header */
-	if ((new_mtu < 68) || (new_mtu > XPNET_MAX_MTU)) {
-		dev_err(xpnet, "ifconfig %s mtu %d failed; value must be "
-			"between 68 and %ld\n", dev->name, new_mtu,
-			XPNET_MAX_MTU);
-		return -EINVAL;
-	}
-
-	dev->mtu = new_mtu;
-	dev_dbg(xpnet, "ifconfig %s mtu set to %d\n", dev->name, new_mtu);
-	return 0;
-}
-
-/*
- * Notification that the other end has received the message and
- * DMA'd the skb information.  At this point, they are done with
- * our side.  When all recipients are done processing, we
- * release the skb and then release our pending message structure.
- */
-static void
-xpnet_send_completed(enum xp_retval reason, short partid, int channel,
-		     void *__qm)
-{
-	struct xpnet_pending_msg *queued_msg = (struct xpnet_pending_msg *)__qm;
-
-	DBUG_ON(queued_msg == NULL);
-
-	dev_dbg(xpnet, "message to %d notified with reason %d\n",
-		partid, reason);
-
-	if (atomic_dec_return(&queued_msg->use_count) == 0) {
-		dev_dbg(xpnet, "all acks for skb->head=-x%p\n",
-			(void *)queued_msg->skb->head);
-
-		dev_kfree_skb_any(queued_msg->skb);
-		kfree(queued_msg);
-	}
-}
-
-static void
-xpnet_send(struct sk_buff *skb, struct xpnet_pending_msg *queued_msg,
-	   u64 start_addr, u64 end_addr, u16 embedded_bytes, int dest_partid)
-{
-	u8 msg_buffer[XPNET_MSG_SIZE];
-	struct xpnet_message *msg = (struct xpnet_message *)&msg_buffer;
-	u16 msg_size = sizeof(struct xpnet_message);
-	enum xp_retval ret;
-
-	msg->embedded_bytes = embedded_bytes;
-	if (unlikely(embedded_bytes != 0)) {
-		msg->version = XPNET_VERSION_EMBED;
-		dev_dbg(xpnet, "calling memcpy(0x%p, 0x%p, 0x%lx)\n",
-			&msg->data, skb->data, (size_t)embedded_bytes);
-		skb_copy_from_linear_data(skb, &msg->data,
-					  (size_t)embedded_bytes);
-		msg_size += embedded_bytes - 1;
-	} else {
-		msg->version = XPNET_VERSION;
-	}
-	msg->magic = XPNET_MAGIC;
-	msg->size = end_addr - start_addr;
-	msg->leadin_ignore = (u64)skb->data - start_addr;
-	msg->tailout_ignore = end_addr - (u64)skb_tail_pointer(skb);
-	msg->buf_pa = xp_pa((void *)start_addr);
-
-	dev_dbg(xpnet, "sending XPC message to %d:%d\n"
-		"msg->buf_pa=0x%lx, msg->size=%u, "
-		"msg->leadin_ignore=%u, msg->tailout_ignore=%u\n",
-		dest_partid, XPC_NET_CHANNEL, msg->buf_pa, msg->size,
-		msg->leadin_ignore, msg->tailout_ignore);
-
-	atomic_inc(&queued_msg->use_count);
-
-	ret = xpc_send_notify(dest_partid, XPC_NET_CHANNEL, XPC_NOWAIT, msg,
-			      msg_size, xpnet_send_completed, queued_msg);
-	if (unlikely(ret != xpSuccess))
-		atomic_dec(&queued_msg->use_count);
-}
-
-/*
- * Network layer has formatted a packet (skb) and is ready to place it
- * "on the wire".  Prepare and send an xpnet_message to all partitions
- * which have connected with us and are targets of this packet.
+ * SDEIER is also touched by the interrupt handler to work around missed PCH
+ * interrupts. Hence we can't update it after the interrupt handler is enabled -
+ * instead we unconditionally enable all PCH interrupt sources here, but then
+ * only unmask them as needed with SDEIMR.
  *
- * MAC-NOTE:  For the XPNET driver, the MAC address contains the
- * destination partid.  If the destination partid octets are 0xffff,
- * this packet is to be broadcast to all connected partitions.
+ * This function needs to be called before interrupts are enabled.
  */
-static int
-xpnet_dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
+static void ibx_irq_pre_postinstall(struct drm_device *dev)
 {
-	struct xpnet_pending_msg *queued_msg;
-	u64 start_addr, end_addr;
-	short dest_partid;
-	u16 embedded_bytes = 0;
+	struct drm_i915_private *dev_priv = dev->dev_private;
 
-	dev_dbg(xpnet, ">skb->head=0x%p skb->data=0x%p skb->tail=0x%p "
-		"skb->end=0x%p skb->len=%d\n", (void *)skb->head,
-		(void *)skb->data, skb_tail_pointer(skb), skb_end_pointer(skb),
-		skb->len);
+	if (HAS_PCH_NOP(dev))
+		return;
 
-	if (skb->data[0] == 0x33) {
-		dev_kfree_skb(skb);
-		return NETDEV_TX_OK;	/* nothing needed to be done */
-	}
+	WARN_ON(I915_READ(SDEIER) != 0);
+	I915_WRITE(SDEIER, 0xffffffff);
+	POSTING_READ(SDEIER);
+}
 
-	/*
-	 * The xpnet_pending_msg tracks how many outstanding
-	 * xpc_send_notifies are relying on this skb.  When none
-	 * remain, release the skb.
-	 */
-	queued_msg = kmalloc(sizeof(struct xpnet_pending_msg), GFP_ATOMIC);
-	if (queued_msg == NULL) {
-		dev_warn(xpnet, "failed to kmalloc %ld bytes; dropping "
-			 "packet\n", sizeof(struct xpnet_pending_msg));
+static void gen5_gt_irq_reset(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
 
-		dev->stats.tx_errors++;
-		dev_kfree_skb(skb);
-		return NETDEV_TX_OK;
-	}
+	GEN5_IRQ_RESET(GT);
+	if (INTEL_INFO(dev)->gen >= 6)
+		GEN5_IRQ_RESET(GEN6_PM);
+}
 
-	/* get the beginning of the first cacheline and end of last */
-	start_addr = ((u64)skb->data & ~(L1_CACHE_BYTES - 1));
-	end_addr = L1_CACHE_ALIGN((u64)skb_tail_pointer(skb));
+/* drm_dma.h hooks
+*/
+static void ironlake_irq_reset(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
 
-	/* calculate how many bytes to embed in the XPC message */
-	if (unlikely(skb->len <= XPNET_MSG_DATA_MAX)) {
-		/* skb->data does fit so embed */
-		embedded_bytes = skb->len;
-	}
+	I915_WRITE(HWSTAM, 0xffffffff);
 
-	/*
-	 * Since the send occurs asynchronously, we set the count to one
-	 * and begin sending.  Any sends that happen to complete before
-	 * we are done sending will not free the skb.  We will be left
-	 * with that task during exit.  This also handles the case of
-	 * a packet destined for a partition which is no longer up.
-	 */
-	atomic_set(&queued_msg->use_count, 1);
-	queued_msg->skb = skb;
+	GEN5_IRQ_RESET(DE);
+	if (IS_GEN7(dev))
+		I915_WRITE(GEN7_ERR_INT, 0xffffffff);
 
-	if (skb->data[0] == 0xff) {
-		/* we are being asked to broadcast to all partitions */
-		for_each_set_bit(dest_partid, xpnet_broadcast_partitions,
-			     xp_max_npartitions) {
+	gen5_gt_irq_reset(dev);
 
-			xpnet_send(skb, queued_msg, start_addr, end_addr,
-				   embedded_bytes, dest_partid);
-		}
+	ibx_irq_reset(dev);
+}
+
+static void vlv_display_irq_reset(struct drm_i915_private *dev_priv)
+{
+	enum pipe pipe;
+
+	i915_hotplug_interrupt_update(dev_priv, 0xFFFFFFFF, 0);
+	I915_WRITE(PORT_HOTPLUG_STAT, I915_READ(PORT_HOTPLUG_STAT));
+
+	for_each_pipe(dev_priv, pipe)
+		I915_WRITE(PIPESTAT(pipe), 0xffff);
+
+	GEN5_IRQ_RESET(VLV_);
+}
+
+static void valleyview_irq_preinstall(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	/* VLV magic */
+	I915_WRITE(VLV_IMR, 0);
+	I915_WRITE(RING_IMR(RENDER_RING_BASE), 0);
+	I915_WRITE(RING_IMR(GEN6_BSD_RING_BASE), 0);
+	I915_WRITE(RING_IMR(BLT_RING_BASE), 0);
+
+	gen5_gt_irq_reset(dev);
+
+	I915_WRITE(DPINVGTT, DPINVGTT_STATUS_MASK);
+
+	vlv_display_irq_reset(dev_priv);
+}
+
+static void gen8_gt_irq_reset(struct drm_i915_private *dev_priv)
+{
+	GEN8_IRQ_RESET_NDX(GT, 0);
+	GEN8_IRQ_RESET_NDX(GT, 1);
+	GEN8_IRQ_RESET_NDX(GT, 2);
+	GEN8_IRQ_RESET_NDX(GT, 3);
+}
+
+static void gen8_irq_reset(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	int pipe;
+
+	I915_WRITE(GEN8_MASTER_IRQ, 0);
+	POSTING_READ(GEN8_MASTER_IRQ);
+
+	gen8_gt_irq_reset(dev_priv);
+
+	for_each_pipe(dev_priv, pipe)
+		if (intel_display_power_is_enabled(dev_priv,
+						   POWER_DOMAIN_PIPE(pipe)))
+			GEN8_IRQ_RESET_NDX(DE_PIPE, pipe);
+
+	GEN5_IRQ_RESET(GEN8_DE_PORT_);
+	GEN5_IRQ_RESET(GEN8_DE_MISC_);
+	GEN5_IRQ_RESET(GEN8_PCU_);
+
+	if (HAS_PCH_SPLIT(dev))
+		ibx_irq_reset(dev);
+}
+
+void gen8_irq_power_well_post_enable(struct drm_i915_private *dev_priv,
+				     unsigned int pipe_mask)
+{
+	uint32_t extra_ier = GEN8_PIPE_VBLANK | GEN8_PIPE_FIFO_UNDERRUN;
+
+	spin_lock_irq(&dev_priv->irq_lock);
+	if (pipe_mask & 1 << PIPE_A)
+		GEN8_IRQ_INIT_NDX(DE_PIPE, PIPE_A,
+				  dev_priv->de_irq_mask[PIPE_A],
+				  ~dev_priv->de_irq_mask[PIPE_A] | extra_ier);
+	if (pipe_mask & 1 << PIPE_B)
+		GEN8_IRQ_INIT_NDX(DE_PIPE, PIPE_B,
+				  dev_priv->de_irq_mask[PIPE_B],
+				  ~dev_priv->de_irq_mask[PIPE_B] | extra_ier);
+	if (pipe_mask & 1 << PIPE_C)
+		GEN8_IRQ_INIT_NDX(DE_PIPE, PIPE_C,
+				  dev_priv->de_irq_mask[PIPE_C],
+				  ~dev_priv->de_irq_mask[PIPE_C] | extra_ier);
+	spin_unlock_irq(&dev_priv->irq_lock);
+}
+
+static void cherryview_irq_preinstall(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	I915_WRITE(GEN8_MASTER_IRQ, 0);
+	POSTING_READ(GEN8_MASTER_IRQ);
+
+	gen8_gt_irq_reset(dev_priv);
+
+	GEN5_IRQ_RESET(GEN8_PCU_);
+
+	I915_WRITE(DPINVGTT, DPINVGTT_STATUS_MASK_CHV);
+
+	vlv_display_irq_reset(dev_priv);
+}
+
+static u32 intel_hpd_enabled_irqs(struct drm_device *dev,
+				  const u32 hpd[HPD_NUM_PINS])
+{
+	struct drm_i915_private *dev_priv = to_i915(dev);
+	struct intel_encoder *encoder;
+	u32 enabled_irqs = 0;
+
+	for_each_intel_encoder(dev, encoder)
+		if (dev_priv->hotplug.stats[encoder->hpd_pin].state == HPD_ENABLED)
+			enabled_irqs |= hpd[encoder->hpd_pin];
+
+	return enabled_irqs;
+}
+
+static void ibx_hpd_irq_setup(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	u32 hotplug_irqs, hotplug, enabled_irqs;
+
+	if (HAS_PCH_IBX(dev)) {
+		hotplug_irqs = SDE_HOTPLUG_MASK;
+		enabled_irqs = intel_hpd_enabled_irqs(dev, hpd_ibx);
 	} else {
-		dest_partid = (short)skb->data[XPNET_PARTID_OCTET + 1];
-		dest_partid |= (short)skb->data[XPNET_PARTID_OCTET + 0] << 8;
-
-		if (dest_partid >= 0 &&
-		    dest_partid < xp_max_npartitions &&
-		    test_bit(dest_partid, xpnet_broadcast_partitions) != 0) {
-
-			xpnet_send(skb, queued_msg, start_addr, end_addr,
-				   embedded_bytes, dest_partid);
-		}
+		hotplug_irqs = SDE_HOTPLUG_MASK_CPT;
+		enabled_irqs = intel_hpd_enabled_irqs(dev, hpd_cpt);
 	}
 
-	dev->stats.tx_packets++;
-	dev->stats.tx_bytes += skb->len;
+	ibx_display_interrupt_update(dev_priv, hotplug_irqs, enabled_irqs);
 
-	if (atomic_dec_return(&queued_msg->use_count) == 0) {
-		dev_kfree_skb(skb);
-		kfree(queued_msg);
-	}
-
-	return NETDEV_TX_OK;
+	/*
+	 * Enable digital hotplug on the PCH, and configure the DP short pulse
+	 * duration to 2ms (which is the minimum in the Display Port spec).
+	 * The pulse duration bits are reserved on LPT+.
+	 */
+	hotplug = I915_READ(PCH_PORT_HOTPLUG);
+	hotplug &= ~(PORTD_PULSE_DURATION_MASK|PORTC_PULSE_DURATION_MASK|PORTB_PULSE_DURATION_MASK);
+	hotplug |= PORTD_HOTPLUG_ENABLE | PORTD_PULSE_DURATION_2ms;
+	hotplug |= PORTC_HOTPLUG_ENABLE | PORTC_PULSE_DURATION_2ms;
+	hotplug |= PORTB_HOTPLUG_ENABLE | PORTB_PULSE_DURATION_2ms;
+	/*
+	 * When CPU and PCH are on the same package, port A
+	 * HPD must be enabled in both north and south.
+	 */
+	if (HAS_PCH_LPT_LP(dev))
+		hotplug |= PORTA_HOTPLUG_ENABLE;
+	I915_WRITE(PCH_PORT_HOTPLUG, hotplug);
 }
 
-/*
- * Deal with transmit timeouts coming from the network layer.
- */
-static void
-xpnet_dev_tx_timeout(struct net_device *dev)
+static void spt_hpd_irq_setup(struct drm_device *dev)
 {
-	dev->stats.tx_errors++;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	u32 hotplug_irqs, hotplug, enabled_irqs;
+
+	hotplug_irqs = SDE_HOTPLUG_MASK_SPT;
+	enabled_irqs = intel_hpd_enabled_irqs(dev, hpd_spt);
+
+	ibx_display_interrupt_update(dev_priv, hotplug_irqs, enabled_irqs);
+
+	/* Enable digital hotplug on the PCH */
+	hotplug = I915_READ(PCH_PORT_HOTPLUG);
+	hotplug |= PORTD_HOTPLUG_ENABLE | PORTC_HOTPLUG_ENABLE |
+		PORTB_HOTPLUG_ENABLE | PORTA_HOTPLUG_ENABLE;
+	I915_WRITE(PCH_PORT_HOTPLUG, hotplug);
+
+	hotplug = I915_READ(PCH_PORT_HOTPLUG2);
+	hotplug |= PORTE_HOTPLUG_ENABLE;
+	I915_WRITE(PCH_PORT_HOTPLUG2, hotplug);
 }
 
-static const struct net_device_ops xpnet_netdev_ops = {
-	.ndo_open		= xpnet_dev_open,
-	.ndo_stop		= xpnet_dev_stop,
-	.ndo_start_xmit		= xpnet_dev_hard_start_xmit,
-	.ndo_change_mtu		= xpnet_dev_change_mtu,
-	.ndo_tx_timeout		= xpnet_dev_tx_timeout,
-	.ndo_set_mac_address 	= eth_mac_addr,
-	.ndo_validate_addr	= eth_validate_addr,
-};
-
-static int __init
-xpnet_init(void)
+static void ilk_hpd_irq_setup(struct drm_device *dev)
 {
-	int result;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	u32 hotplug_irqs, hotplug, enabled_irqs;
 
-	if (!is_shub() && !is_uv())
-		return -ENODEV;
+	if (INTEL_INFO(dev)->gen >= 8) {
+		hotplug_irqs = GEN8_PORT_DP_A_HOTPLUG;
+		enabled_irqs = intel_hpd_enabled_irqs(dev, hpd_bdw);
 
-	dev_info(xpnet, "registering network device %s\n", XPNET_DEVICE_NAME);
+		bdw_update_port_irq(dev_priv, hotplug_irqs, enabled_irqs);
+	} else if (INTEL_INFO(dev)->gen >= 7) {
+		hotplug_irqs = DE_DP_A_HOTPLUG_IVB;
+		enabled_irqs = intel_hpd_enabled_irqs(dev, hpd_ivb);
 
-	xpnet_broadcast_partitions = kzalloc(BITS_TO_LONGS(xp_max_npartitions) *
-					     sizeof(long), GFP_KERNEL);
-	if (xpnet_broadcast_partitions == NULL)
-		return -ENOMEM;
+		ilk_update_display_irq(dev_priv, hotplug_irqs, enabled_irqs);
+	} else {
+		hotplug_irqs = DE_DP_A_HOTPLUG;
+		enabled_irqs = intel_hpd_enabled_irqs(dev, hpd_ilk);
 
-	/*
-	 * use ether_setup() to init the majority of our device
-	 * structure and then override the necessary pieces.
-	 */
-	xpnet_device = alloc_netdev(0, XPNET_DEVICE_NAME, NET_NAME_UNKNOWN,
-				    ether_setup);
-	if (xpnet_device == NULL) {
-		kfree(xpnet_broadcast_partitions);
-		return -ENOMEM;
+		ilk_update_display_irq(dev_priv, hotplug_irqs, enabled_irqs);
 	}
 
-	netif_carrier_off(xpnet_device);
-
-	xpnet_device->netdev_ops = &xpnet_netdev_ops;
-	xpnet_device->mtu = XPNET_DEF_MTU;
-
 	/*
-	 * Multicast assumes the LSB of the first octet is set for multicast
-	 * MAC addresses.  We chose the first octet of the MAC to be unlikely
-	 * to collide with any vendor's officially issued MAC.
+	 * Enable digital hotplug on the CPU, and configure the DP short pulse
+	 * duration to 2ms (which is the minimum in the Display Port spec)
+	 * The pulse duration bits are reserved on HSW+.
 	 */
-	xpnet_device->dev_addr[0] = 0x02;     /* locally administered, no OUI */
+	hotplug = I915_READ(DIGITAL_PORT_HOTPLUG_CNTRL);
+	hotplug &= ~DIGITAL_PORTA_PULSE_DURATION_MASK;
+	hotplug |= DIGITAL_PORTA_HOTPLUG_ENABLE | DIGITAL_PORTA_PULSE_DURATION_2ms;
+	I915_WRITE(DIGITAL_PORT_HOTPLUG_CNTRL, hotplug);
 
-	xpnet_device->dev_addr[XPNET_PARTID_OCTET + 1] = xp_partition_id;
-	xpnet_device->dev_addr[XPNET_PARTID_OCTET + 0] = (xp_partition_id >> 8);
+	ibx_hpd_irq_setup(dev);
+}
 
-	/*
-	 * ether_setup() sets this to a multicast device.  We are
-	 * really not supporting multicast at this time.
-	 */
-	xpnet_device->flags &= ~IFF_MULTICAST;
+static void bxt_hpd_irq_setup(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	u32 hotplug_irqs, hotplug, enabled_irqs;
 
-	/*
-	 * No need to checksum as it is a DMA transfer.  The BTE will
-	 * report an error if the data is not retrievable and the
-	 * packet will be dropped.
-	 */
-	xpnet_device->features = NETIF_F_HW_CSUM;
+	enabled_irqs = intel_hpd_enabled_irqs(dev, hpd_bxt);
+	hotplug_irqs = BXT_DE_PORT_HOTPLUG_MASK;
 
-	result = register_netdev(xpnet_device);
-	if (result != 0) {
-		free_netdev(xpnet_device);
-		kfree(xpnet_broadcast_partitions);
+	bdw_update_port_irq(dev_priv, hotplug_irqs, enabled_irqs);
+
+	hotplug = I915_READ(PCH_PORT_HOTPLUG);
+	hotplug |= PORTC_HOTPLUG_ENABLE | PORTB_HOTPLUG_ENABLE |
+		PORTA_HOTPLUG_ENABLE;
+	I915_WRITE(PCH_PORT_HOTPLUG, hotplug);
+}
+
+static void ibx_irq_postinstall(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	u32 mask;
+
+	if (HAS_PCH_NOP(dev))
+		return;
+
+	if (HAS_PCH_IBX(dev))
+		mask = SDE_GMBUS | SDE_AUX_MASK | SDE_POISON;
+	else
+		mask = SDE_GMBUS_CPT | SDE_AUX_MASK_CPT;
+
+	gen5_assert_iir_is_zero(dev_priv, SDEIIR);
+	I915_WRITE(SDEIMR, ~mask);
+}
+
+static void gen5_gt_irq_postinstall(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	u32 pm_irqs, gt_irqs;
+
+	pm_irqs = gt_irqs = 0;
+
+	dev_priv->gt_irq_mask = ~0;
+	if (HAS_L3_DPF(dev)) {
+		/* L3 parity interrupt is always unmasked. */
+		dev_priv->gt_irq_mask = ~GT_PARITY_ERROR(dev);
+		gt_irqs |= GT_PARITY_ERROR(dev);
 	}
 
-	return result;
-}
+	gt_irqs |= GT_RENDER_USER_INTERRUPT;
+	if (IS_GEN5(dev)) {
+		gt_irqs |= GT_RENDER_PIPECTL_NOTIFY_INTERRUPT |
+			   ILK_BSD_USER_INTERRUPT;
+	} else {
+		gt_irqs |= GT_BLT_USER_INTERRUPT | GT_BSD_USER_INTERRUPT;
+	}
 
-module_init(xpnet_init);
+	GEN5_IRQ_INIT(GT, dev_priv->gt_irq_mask, gt_irqs);
 
-static void __exit
-xpnet_exit(void)
-{
-	dev_info(xpnet, "unregistering network device %s\n",
-		 xpnet_device[0].name);
+	if (INTEL_INFO(dev)->gen >= 6) {
+		/*
+		 * RPS interrupts will get enabled/disabled on demand when RPS
+		 * itself is enabled/disabled.
+		 */
+		if (HAS_VEBOX(dev))
+			pm_irqs |= PM_VEBOX_USER_INTERRUPT;
 
-	unregister_netdev(xpnet_device);
-	free_netdev(xpnet_device);
-	kfree(xpnet_broadcast_partitions);
-}
-
-module_exit(xpnet_exit);
-
-MODULE_AUTHOR("Silicon Graphics, Inc.");
-MODULE_DESCRIPTION("Cross Partition Network adapter (XPNET)");
-MODULE_LICENSE("GPL");
+		dev_priv->pm_irq_mask = 0xffffffff;
+		GEN5_

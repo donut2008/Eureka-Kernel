@@ -1,157 +1,2 @@
-#ifndef _I8042_SPARCIO_H
-#define _I8042_SPARCIO_H
-
-#include <linux/of_device.h>
-
-#include <asm/io.h>
-#include <asm/oplib.h>
-#include <asm/prom.h>
-
-static int i8042_kbd_irq = -1;
-static int i8042_aux_irq = -1;
-#define I8042_KBD_IRQ i8042_kbd_irq
-#define I8042_AUX_IRQ i8042_aux_irq
-
-#define I8042_KBD_PHYS_DESC "sparcps2/serio0"
-#define I8042_AUX_PHYS_DESC "sparcps2/serio1"
-#define I8042_MUX_PHYS_DESC "sparcps2/serio%d"
-
-static void __iomem *kbd_iobase;
-
-#define I8042_COMMAND_REG	(kbd_iobase + 0x64UL)
-#define I8042_DATA_REG		(kbd_iobase + 0x60UL)
-
-static inline int i8042_read_data(void)
-{
-	return readb(kbd_iobase + 0x60UL);
-}
-
-static inline int i8042_read_status(void)
-{
-	return readb(kbd_iobase + 0x64UL);
-}
-
-static inline void i8042_write_data(int val)
-{
-	writeb(val, kbd_iobase + 0x60UL);
-}
-
-static inline void i8042_write_command(int val)
-{
-	writeb(val, kbd_iobase + 0x64UL);
-}
-
-#ifdef CONFIG_PCI
-
-static struct resource *kbd_res;
-
-#define OBP_PS2KBD_NAME1	"kb_ps2"
-#define OBP_PS2KBD_NAME2	"keyboard"
-#define OBP_PS2MS_NAME1		"kdmouse"
-#define OBP_PS2MS_NAME2		"mouse"
-
-static int sparc_i8042_probe(struct platform_device *op)
-{
-	struct device_node *dp = op->dev.of_node;
-
-	dp = dp->child;
-	while (dp) {
-		if (!strcmp(dp->name, OBP_PS2KBD_NAME1) ||
-		    !strcmp(dp->name, OBP_PS2KBD_NAME2)) {
-			struct platform_device *kbd = of_find_device_by_node(dp);
-			unsigned int irq = kbd->archdata.irqs[0];
-			if (irq == 0xffffffff)
-				irq = op->archdata.irqs[0];
-			i8042_kbd_irq = irq;
-			kbd_iobase = of_ioremap(&kbd->resource[0],
-						0, 8, "kbd");
-			kbd_res = &kbd->resource[0];
-		} else if (!strcmp(dp->name, OBP_PS2MS_NAME1) ||
-			   !strcmp(dp->name, OBP_PS2MS_NAME2)) {
-			struct platform_device *ms = of_find_device_by_node(dp);
-			unsigned int irq = ms->archdata.irqs[0];
-			if (irq == 0xffffffff)
-				irq = op->archdata.irqs[0];
-			i8042_aux_irq = irq;
-		}
-
-		dp = dp->sibling;
-	}
-
-	return 0;
-}
-
-static int sparc_i8042_remove(struct platform_device *op)
-{
-	of_iounmap(kbd_res, kbd_iobase, 8);
-
-	return 0;
-}
-
-static const struct of_device_id sparc_i8042_match[] = {
-	{
-		.name = "8042",
-	},
-	{},
-};
-MODULE_DEVICE_TABLE(of, sparc_i8042_match);
-
-static struct platform_driver sparc_i8042_driver = {
-	.driver = {
-		.name = "i8042",
-		.of_match_table = sparc_i8042_match,
-	},
-	.probe		= sparc_i8042_probe,
-	.remove		= sparc_i8042_remove,
-};
-
-static int __init i8042_platform_init(void)
-{
-	struct device_node *root = of_find_node_by_path("/");
-
-	if (!strcmp(root->name, "SUNW,JavaStation-1")) {
-		/* Hardcoded values for MrCoffee.  */
-		i8042_kbd_irq = i8042_aux_irq = 13 | 0x20;
-		kbd_iobase = ioremap(0x71300060, 8);
-		if (!kbd_iobase)
-			return -ENODEV;
-	} else {
-		int err = platform_driver_register(&sparc_i8042_driver);
-		if (err)
-			return err;
-
-		if (i8042_kbd_irq == -1 ||
-		    i8042_aux_irq == -1) {
-			if (kbd_iobase) {
-				of_iounmap(kbd_res, kbd_iobase, 8);
-				kbd_iobase = (void __iomem *) NULL;
-			}
-			return -ENODEV;
-		}
-	}
-
-	i8042_reset = I8042_RESET_ALWAYS;
-
-	return 0;
-}
-
-static inline void i8042_platform_exit(void)
-{
-	struct device_node *root = of_find_node_by_path("/");
-
-	if (strcmp(root->name, "SUNW,JavaStation-1"))
-		platform_driver_unregister(&sparc_i8042_driver);
-}
-
-#else /* !CONFIG_PCI */
-static int __init i8042_platform_init(void)
-{
-	return -ENODEV;
-}
-
-static inline void i8042_platform_exit(void)
-{
-}
-#endif /* !CONFIG_PCI */
-
-#endif /* _I8042_SPARCIO_H */
+юA1аD┴L$─AйAаг	D┴пD!ПD┴яD	ЯD!Ы	аD┴Юаю	D1ЮAадA1д▀|$╓A┴Ь▀T$░A1пAПаеAхD┴ь1ХD!Ю1Хсц▀D$┬аю3T$х1п┴аааD┴Наф3t$▄1ф1нD┴яааB█!│бO╠СPабс1яаю1ф┴t$╗AхAаф	D┴юD!пD┴аD	яD!Я	а┴ьаю	1ьац1ц▀t$°▀T$■1жDЧAацнD┴ЮD1ь!ьD1ьуе▀D$╟аю3T$└1п┴аааагD▀L$╛D1о1г1оD┴ааа█│б·bГ║абу1яаю1г┴|$■нAаб	┴ПD!ю┴ЯD	аD!я	а┴Хаю	1Хае1еD▀|$≤▀T$═A1вEВ┴ПаюAо█(│а=енCаа1хAгAад┴ьD1Ю!ХAсD1ЮAцAкAаю	D┴Ь!ПD┴З	РD!б	б▀|$хD1ОDвD┴ьаю	D1ьAацA1цацD┴ЬаювB█│бz┼²┤аб┴И1ыD!ыEЛ1ыAл1пAтгаф	┴ЬD!Ь┴ЫD	Ы!Я	аD┴Юаю	D1ЮAадA1дD▀l$└▀D$╓A1еEеаеAмD┴ы1ИD!А1Ицк▀L$■ааD1х1а┴йабD▀T$хD┴паю3D$╟1х1п┴ЗабF█"A│юУ;AаюDцD1баа1х┴D$░AуAаг	D┴Х!ЬD┴И	ЫD!Ы	а┴ьаю	1ьац1цD▀D$╢▀T$°A1пAПD┴ХаюAх█│аЙ)vаа1хAюAацD┴ЮD1ь!ьуD1ьемаг	D┴юD!ХD┴аD	И!Ы	аD▀L$▄E┴н▀t$≤A1ЖEЧ┴Хаю	1Хае1еAадD┴юаюAн█(│атSЛ<аа┴зD1Б!ЙAСD1БAс1хAкAфAае	D┴ПD!юD┴ЯD	аD!И	аD┴ьаю	D1ьAацA1ц▀t$╛D┴рD1жЧD┴ПаюнB█│а╗╖ьyаа1хфац┴Х1ьD!ьAт┴в1ьAдAл▀T$░аб┴Ь▀|$╟1Ь1б┴T$хD┴Юаю	D1ЮAадA1дD┴иаа┴паю3L$■1яAаю	1а┴L$╓┴ПD!П┴ЯD	ЯD!а	аD▀T$╦▀T$└A1рEЙAйае┴ПаюD┴ы1ИD!Ас1ИкB█ │аPO╠Саа1хк┴ыаа	Aб1ыац1кAаф	D┴п!ПD┴я	ЯD!Я	аD▀|$┬E┴Ы▀T$╢A1яEаAиAацD┴ЮD1ь!ьуD1ьеD┴паю█│а║·bГаам1х┴Иаа	аф	Aа1Иае1мD┴хD!пD┴иD	я!Я	аA┴Ь▀T$▄A1пEПAхAадD┴хаю┴ыD1А!ИAс┴вD1АAк█(│аC=енаа1хAкD┴ыаа	AюD1ыAацA1кAаб	D┴юD!хD┴аD	иD!я	аD▀t$─▀D$╛A1фAЖAнац┴И1ыD!ыAд1ыAлD┴бабB█│а┤z┼²ааAл1й▀D$ю1Ь▀|$╗A┴ЩAаеA1еD┴Фаф	▀D$≤аюAжD1ФAадA1ТAаа	D┴РD!бD┴ЖD	фD!нD┴Иаа	жD1ЬD1Х1хA┴г┴З▀D$╦1бDраеРD┴ы1ИD!А1Иц┴гкD┴ПаюB█ │аУ;аа1хкAаеE1ОD┴|$ь▀L$═3L$╢D▀T$─AабA1й┴ыаа	D▀|$°Aагб1ыац1кAаю	A┴уE!У┴яD	ЯD!аD┴паюD	ИA1ЪE1вA1г▀t$■▀|$┬1ЧDнAацнD┴ЮD1ь!ьD1ьЩе┴паю█│аЙ)vаа1хмAабE1в┴Иаа	Aаф	ф1Иае1м┴П!п┴Я	яD!Я	аE┴ЩD▀L$╟E1мEеAмAад┴Паю┴ыD1А!ИEкD1АAк█(│а<тSЛаа1хAкD┴ыаа	AеD1ыAацA1каб	D┴И!ЯD┴Х	ПA┴Р!п	х▀t$ьA┴Я▀L$─A1иEЯAаацAл┴Х1ьD!ь1ьAдD┴ХаюF█A│юy╗╖ьAаюD1юEд▀L$≤1ЫA┴ПA┴ЖAаюA1хD┴яаа	┴L$╪E┴БAаб	AаE1БAадE1тE┴йE!ЙD┴хD	Х!хD	п▀|$╢аг▀L$╗1оE┴бAабD1гD1вA┴З▀|$░1овD┴йабгB█"СPO╠аю1бв┴|$═аекD┴з1ЙD!Б1ЙсAаюE1бD┴T$ю▀L$хааAацц┴ьаю	1ь┴ЗабH┴T$Юац1ц█Г║·bаю┴б┴D$дD┴ЮD1ь!ьD▀T$■DуD1ьеу┴Хаю	▀T$╓1й1Хае1е▀D$╦┴ааа┴В1Я┴L$≤D▀D$°A1ю▀L$╛┴наф1Ь┴D$╦┴п┴T$╓1З┴T$хD1Ч┴t$°AадD1Ы┴L$╛┴ыD1АEШD▀t$юE1ЧD┴Ч!ИD1АафAЭD1фA┴гAаг▀D$▄D┴вD1пA1гD┴Заб▀D$┬аю3D$░D1Ь1п┴бD▀D$└AаюD3D$─┴ПаюA1ПA1юAагAае	D1З┴T$▄D▀T$═E┴вE!оD┴пD	хD!ХD	ЬафA1ПH▀t$Ю3t$дD┴б1ЗT$╪бРEНAаа	┴пD!п┴жD	жD!н	фAЖ┴паю█4(│фнC=еаф1ПAфAкAСD┴ьаю	D1ьAацA1цAаб	D┴T$═D┴П!пD┴Я	яD!я	а▀t$хDннацD┴ПаюB█│а²┤z┼аа1хф┴Х1ьD!ь1ьAдAлD┴Юаю	D1ЮAадA1дI┴ИAаа┴ПаюH┴аH┴D$хD┴ьD1хD!Ю\$░D1хцB█!;УL┴d$ьаю┴D$╪ц┴ьаю	1ьац1цD▀|$─D▀T$└E1ЗAагAацE┴ЕE1щA!щ▀L$▄▀D$ю1а┴L$└E1щAцA1гD┴|$─аю▀L$╢3L$╗1х┴ааа▀l$≤1е1м▀L$╟┴оагаб	аю1е┴l$≤A┴В┴ПD!ПD	Ж!ж	фD1гD1а┴L$╟D1еEаAаюE1пD┴юаю▀L$°D1а1аH▀D$х3D$╪AаюD1а┴L$°D▀T$░D1T$┬A┴хE1пDD$═AПAюуAаф	D┴бD!ЗD┴фD	ЧD!Ж	жУD┴баб█4│фvЙ)аф1РуEИAЯD┴йаб	D1йAааA1яAаг	D┴|$х┴ЙD!б┴НD	фD!Ч	жL▀d$ьAад▀D$└DП┴зD1БD!йD1БAсA┴ЙAабC█
+│бЛ<тSабA1рAсD▀l$■AаеD┴ыаа	ПD1ыAацA1кацE┴нA1чE!чA1ч▀L$°1L$─кA1маа3L$╛┴наф1о1ВDпаа1оAаю	┴а!И┴б	ЙD!б	йA┴ЪD▀T$╓D1в|$хEтEТA┴ф┴D$└AафC█4│фьy╗╖афA1ЖAТAагD3|$╟▀t$╗афD┴Ааа	вD1АAадA1лD1жAааD┴ыD1иD!А▀T$≤1жD1иAяаб3T$╦DВае	A┴ЧA!фA┴ЗA	бA!ЙE	РD▀t$─A1ж┴пабаюA1жA1ф┴ЗабкB█"│а╠СPOаа1йк┴ыаа	Eф1ыацEж1кAацE┴ЮE1ьA!ь▀L$▄A1мE1ьAкаа3L$┬Aж▀D$└аю	┴D$└E┴РA!ЗD┴Р	З!бD	р1нA┴йааAаб1нD1жНжH▀T$0EаD┴Паю█│аbГ║·аа1хфAиD┴хаю	D1хAааA1аD┴ЬE1ЩAагаюаг	E1Щ┴ЯD!ЯA1е┴ПD	ПD┴У!Ь	хDl$└AадD▀T$A1Р┴ЯH▀t$пааAе┴ьD1ЮD!

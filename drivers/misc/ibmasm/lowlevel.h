@@ -1,137 +1,58 @@
-/*
- * IBM ASM Service Processor Device Driver
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
- *
- * Copyright (C) IBM Corporation, 2004
- *
- * Author: Max Asböck <amax@us.ibm.com>
- *
- */
-
-/* Condor service processor specific hardware definitions */
-
-#ifndef __IBMASM_CONDOR_H__
-#define __IBMASM_CONDOR_H__
-
-#include <asm/io.h>
-
-#define VENDORID_IBM	0x1014
-#define DEVICEID_RSA	0x010F
-
-#define GET_MFA_ADDR(x)  (x & 0xFFFFFF00)
-
-#define MAILBOX_FULL(x)  (x & 0x00000001)
-
-#define NO_MFAS_AVAILABLE     0xFFFFFFFF
-
-
-#define INBOUND_QUEUE_PORT   0x40  /* contains address of next free MFA */
-#define OUTBOUND_QUEUE_PORT  0x44  /* contains address of posted MFA    */
-
-#define SP_INTR_MASK	0x00000008
-#define UART_INTR_MASK	0x00000010
-
-#define INTR_STATUS_REGISTER   0x13A0
-#define INTR_CONTROL_REGISTER  0x13A4
-
-#define SCOUT_COM_A_BASE         0x0000
-#define SCOUT_COM_B_BASE         0x0100
-#define SCOUT_COM_C_BASE         0x0200
-#define SCOUT_COM_D_BASE         0x0300
-
-static inline int sp_interrupt_pending(void __iomem *base_address)
-{
-	return SP_INTR_MASK & readl(base_address + INTR_STATUS_REGISTER);
-}
-
-static inline int uart_interrupt_pending(void __iomem *base_address)
-{
-	return UART_INTR_MASK & readl(base_address + INTR_STATUS_REGISTER);
-}
-
-static inline void ibmasm_enable_interrupts(void __iomem *base_address, int mask)
-{
-	void __iomem *ctrl_reg = base_address + INTR_CONTROL_REGISTER;
-	writel( readl(ctrl_reg) & ~mask, ctrl_reg);
-}
-
-static inline void ibmasm_disable_interrupts(void __iomem *base_address, int mask)
-{
-	void __iomem *ctrl_reg = base_address + INTR_CONTROL_REGISTER;
-	writel( readl(ctrl_reg) | mask, ctrl_reg);
-}
-
-static inline void enable_sp_interrupts(void __iomem *base_address)
-{
-	ibmasm_enable_interrupts(base_address, SP_INTR_MASK);
-}
-
-static inline void disable_sp_interrupts(void __iomem *base_address)
-{
-	ibmasm_disable_interrupts(base_address, SP_INTR_MASK);
-}
-
-static inline void enable_uart_interrupts(void __iomem *base_address)
-{
-	ibmasm_enable_interrupts(base_address, UART_INTR_MASK);
-}
-
-static inline void disable_uart_interrupts(void __iomem *base_address)
-{
-	ibmasm_disable_interrupts(base_address, UART_INTR_MASK);
-}
-
-#define valid_mfa(mfa)	( (mfa) != NO_MFAS_AVAILABLE )
-
-static inline u32 get_mfa_outbound(void __iomem *base_address)
-{
-	int retry;
-	u32 mfa;
-
-	for (retry=0; retry<=10; retry++) {
-		mfa = readl(base_address + OUTBOUND_QUEUE_PORT);
-		if (valid_mfa(mfa))
-			break;
-	}
-	return mfa;
-}
-
-static inline void set_mfa_outbound(void __iomem *base_address, u32 mfa)
-{
-	writel(mfa, base_address + OUTBOUND_QUEUE_PORT);
-}
-
-static inline u32 get_mfa_inbound(void __iomem *base_address)
-{
-	u32 mfa = readl(base_address + INBOUND_QUEUE_PORT);
-
-	if (MAILBOX_FULL(mfa))
-		return 0;
-
-	return mfa;
-}
-
-static inline void set_mfa_inbound(void __iomem *base_address, u32 mfa)
-{
-	writel(mfa, base_address + INBOUND_QUEUE_PORT);
-}
-
-static inline struct i2o_message *get_i2o_message(void __iomem *base_address, u32 mfa)
-{
-	return (struct i2o_message *)(GET_MFA_ADDR(mfa) + base_address);
-}
-
-#endif /* __IBMASM_CONDOR_H__ */
+TRL_REG0__TX_CFG_INV_DATA_1_MASK 0x2
+#define PB0_TX_LANE1_CTRL_REG0__TX_CFG_INV_DATA_1__SHIFT 0x1
+#define PB0_TX_LANE1_CTRL_REG0__TX_CFG_SWING_BOOST_EN_1_MASK 0x4
+#define PB0_TX_LANE1_CTRL_REG0__TX_CFG_SWING_BOOST_EN_1__SHIFT 0x2
+#define PB0_TX_LANE1_CTRL_REG0__TX_DBG_PRBS_EN_1_MASK 0x8
+#define PB0_TX_LANE1_CTRL_REG0__TX_DBG_PRBS_EN_1__SHIFT 0x3
+#define PB0_TX_LANE1_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_1_MASK 0x1
+#define PB0_TX_LANE1_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_1__SHIFT 0x0
+#define PB0_TX_LANE1_OVRD_REG0__TX_DCLK_EN_OVRD_EN_1_MASK 0x2
+#define PB0_TX_LANE1_OVRD_REG0__TX_DCLK_EN_OVRD_EN_1__SHIFT 0x1
+#define PB0_TX_LANE1_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_1_MASK 0x4
+#define PB0_TX_LANE1_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_1__SHIFT 0x2
+#define PB0_TX_LANE1_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_1_MASK 0x8
+#define PB0_TX_LANE1_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_1__SHIFT 0x3
+#define PB0_TX_LANE1_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_1_MASK 0x10
+#define PB0_TX_LANE1_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_1__SHIFT 0x4
+#define PB0_TX_LANE1_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_1_MASK 0x20
+#define PB0_TX_LANE1_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_1__SHIFT 0x5
+#define PB0_TX_LANE1_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_1_MASK 0x40
+#define PB0_TX_LANE1_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_1__SHIFT 0x6
+#define PB0_TX_LANE1_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_1_MASK 0x80
+#define PB0_TX_LANE1_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_1__SHIFT 0x7
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__TXPWR_1_MASK 0x7
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__TXPWR_1__SHIFT 0x0
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__TXMARG_1_MASK 0x70
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__TXMARG_1__SHIFT 0x4
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__DEEMPH_1_MASK 0x80
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__DEEMPH_1__SHIFT 0x7
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__COEFFICIENTID_1_MASK 0x300
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__COEFFICIENTID_1__SHIFT 0x8
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__COEFFICIENT_1_MASK 0xfc00
+#define PB0_TX_LANE1_SCI_STAT_OVRD_REG0__COEFFICIENT_1__SHIFT 0xa
+#define PB0_TX_LANE2_CTRL_REG0__TX_CFG_DISPCLK_MODE_2_MASK 0x1
+#define PB0_TX_LANE2_CTRL_REG0__TX_CFG_DISPCLK_MODE_2__SHIFT 0x0
+#define PB0_TX_LANE2_CTRL_REG0__TX_CFG_INV_DATA_2_MASK 0x2
+#define PB0_TX_LANE2_CTRL_REG0__TX_CFG_INV_DATA_2__SHIFT 0x1
+#define PB0_TX_LANE2_CTRL_REG0__TX_CFG_SWING_BOOST_EN_2_MASK 0x4
+#define PB0_TX_LANE2_CTRL_REG0__TX_CFG_SWING_BOOST_EN_2__SHIFT 0x2
+#define PB0_TX_LANE2_CTRL_REG0__TX_DBG_PRBS_EN_2_MASK 0x8
+#define PB0_TX_LANE2_CTRL_REG0__TX_DBG_PRBS_EN_2__SHIFT 0x3
+#define PB0_TX_LANE2_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_2_MASK 0x1
+#define PB0_TX_LANE2_OVRD_REG0__TX_DCLK_EN_OVRD_VAL_2__SHIFT 0x0
+#define PB0_TX_LANE2_OVRD_REG0__TX_DCLK_EN_OVRD_EN_2_MASK 0x2
+#define PB0_TX_LANE2_OVRD_REG0__TX_DCLK_EN_OVRD_EN_2__SHIFT 0x1
+#define PB0_TX_LANE2_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_2_MASK 0x4
+#define PB0_TX_LANE2_OVRD_REG0__TX_DRV_DATA_EN_OVRD_VAL_2__SHIFT 0x2
+#define PB0_TX_LANE2_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_2_MASK 0x8
+#define PB0_TX_LANE2_OVRD_REG0__TX_DRV_DATA_EN_OVRD_EN_2__SHIFT 0x3
+#define PB0_TX_LANE2_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_2_MASK 0x10
+#define PB0_TX_LANE2_OVRD_REG0__TX_DRV_PWRON_OVRD_VAL_2__SHIFT 0x4
+#define PB0_TX_LANE2_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_2_MASK 0x20
+#define PB0_TX_LANE2_OVRD_REG0__TX_DRV_PWRON_OVRD_EN_2__SHIFT 0x5
+#define PB0_TX_LANE2_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_2_MASK 0x40
+#define PB0_TX_LANE2_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_VAL_2__SHIFT 0x6
+#define PB0_TX_LANE2_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_2_MASK 0x80
+#define PB0_TX_LANE2_OVRD_REG0__TX_FRONTEND_PWRON_OVRD_EN_2__SHIFT 0x7
+#define PB0_TX_LANE2_SCI_STAT_OVRD_REG0__TXPWR_2_MASK 0x7
+#define PB0_TX_LANE2_SCI_STAT_OVRD_REG0__TXPWR_2__SHIFT 0x

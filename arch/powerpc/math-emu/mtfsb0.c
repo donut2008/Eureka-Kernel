@@ -1,19 +1,3 @@
-#include <linux/types.h>
-#include <linux/errno.h>
-#include <asm/uaccess.h>
-
-#include <asm/sfp-machine.h>
-#include <math-emu/soft-fp.h>
-
-int
-mtfsb0(int crbD)
-{
-	if ((crbD != 1) && (crbD != 2))
-		__FPU_FPSCR &= ~(1 << (31 - crbD));
-
-#ifdef DEBUG
-	printk("%s: %d %08lx\n", __func__, crbD, __FPU_FPSCR);
-#endif
-
-	return 0;
-}
+¿‰.mK?·šGÇhoÿGx¤«£göOSÍè¸GÊ
+Ğ1Úµ\Û<FOİ3cèÚg¦şUzö‘²tŒöáoÈ4:F¿*·èŒª
+(›ÀÈÔ€­…êU1‹*Q­„¬H)gôJiQIøÊê^,iÄ¦,BKÂIJ%åb\MÆı¾YõVÖëÂaL­ık8ãy±dÙlx„>ííÿø¹Ö$àgh›«t’'Ã#4z`l–áe.²á‘ª/f‰#—œF4¦¢•¡Ò<ÃÕÜû²aA—x²ÂbI"Ú)*¦KI‚—9Ë¤*ßØ[@:#’İS(g—–¹`ı °l±Lb¥üÅ//çy!H•r— ¥Ñ à”“ÇlÆäúêiéÕ'L•²%ğße»*ã–ˆH:Ëùj[[óñuÑFS+Á,“

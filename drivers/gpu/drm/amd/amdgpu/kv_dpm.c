@@ -1,3337 +1,3747 @@
-/*
- * Copyright 2013 Advanced Micro Devices, Inc.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
- * OTHER DEALINGS IN THE SOFTWARE.
- *
- */
+eout));
 
-#include "drmP.h"
-#include "amdgpu.h"
-#include "amdgpu_pm.h"
-#include "cikd.h"
-#include "atom.h"
-#include "amdgpu_atombios.h"
-#include "amdgpu_dpm.h"
-#include "kv_dpm.h"
-#include "gfx_v7_0.h"
-#include <linux/seq_file.h>
-
-#include "smu/smu_7_0_0_d.h"
-#include "smu/smu_7_0_0_sh_mask.h"
-
-#include "gca/gfx_7_2_d.h"
-#include "gca/gfx_7_2_sh_mask.h"
-
-#define KV_MAX_DEEPSLEEP_DIVIDER_ID     5
-#define KV_MINIMUM_ENGINE_CLOCK         800
-#define SMC_RAM_END                     0x40000
-
-static void kv_dpm_set_dpm_funcs(struct amdgpu_device *adev);
-static void kv_dpm_set_irq_funcs(struct amdgpu_device *adev);
-static int kv_enable_nb_dpm(struct amdgpu_device *adev,
-			    bool enable);
-static void kv_init_graphics_levels(struct amdgpu_device *adev);
-static int kv_calculate_ds_divider(struct amdgpu_device *adev);
-static int kv_calculate_nbps_level_settings(struct amdgpu_device *adev);
-static int kv_calculate_dpm_settings(struct amdgpu_device *adev);
-static void kv_enable_new_levels(struct amdgpu_device *adev);
-static void kv_program_nbps_index_settings(struct amdgpu_device *adev,
-					   struct amdgpu_ps *new_rps);
-static int kv_set_enabled_level(struct amdgpu_device *adev, u32 level);
-static int kv_set_enabled_levels(struct amdgpu_device *adev);
-static int kv_force_dpm_highest(struct amdgpu_device *adev);
-static int kv_force_dpm_lowest(struct amdgpu_device *adev);
-static void kv_apply_state_adjust_rules(struct amdgpu_device *adev,
-					struct amdgpu_ps *new_rps,
-					struct amdgpu_ps *old_rps);
-static int kv_set_thermal_temperature_range(struct amdgpu_device *adev,
-					    int min_temp, int max_temp);
-static int kv_init_fps_limits(struct amdgpu_device *adev);
-
-static void kv_dpm_powergate_uvd(struct amdgpu_device *adev, bool gate);
-static void kv_dpm_powergate_vce(struct amdgpu_device *adev, bool gate);
-static void kv_dpm_powergate_samu(struct amdgpu_device *adev, bool gate);
-static void kv_dpm_powergate_acp(struct amdgpu_device *adev, bool gate);
-
-
-static u32 kv_convert_vid2_to_vid7(struct amdgpu_device *adev,
-				   struct sumo_vid_mapping_table *vid_mapping_table,
-				   u32 vid_2bit)
-{
-	struct amdgpu_clock_voltage_dependency_table *vddc_sclk_table =
-		&adev->pm.dpm.dyn_state.vddc_dependency_on_sclk;
-	u32 i;
-
-	if (vddc_sclk_table && vddc_sclk_table->count) {
-		if (vid_2bit < vddc_sclk_table->count)
-			return vddc_sclk_table->entries[vid_2bit].v;
-		else
-			return vddc_sclk_table->entries[vddc_sclk_table->count - 1].v;
-	} else {
-		for (i = 0; i < vid_mapping_table->num_entries; i++) {
-			if (vid_mapping_table->entries[i].vid_2bit == vid_2bit)
-				return vid_mapping_table->entries[i].vid_7bit;
-		}
-		return vid_mapping_table->entries[vid_mapping_table->num_entries - 1].vid_7bit;
+	parport_negotiate (lp_table[minor].dev->port, IEEE1284_MODE_COMPAT);
+	if (parport_negotiate (lp_table[minor].dev->port,
+			       IEEE1284_MODE_NIBBLE)) {
+		retval = -EIO;
+		goto out;
 	}
+
+	while (retval == 0) {
+		retval = parport_read (port, kbuf, count);
+
+		if (retval > 0)
+			break;
+
+		if (nonblock) {
+			retval = -EAGAIN;
+			break;
+		}
+
+		/* Wait for data. */
+
+		if (lp_table[minor].dev->port->irq == PARPORT_IRQ_NONE) {
+			parport_negotiate (lp_table[minor].dev->port,
+					   IEEE1284_MODE_COMPAT);
+			lp_error (minor);
+			if (parport_negotiate (lp_table[minor].dev->port,
+					       IEEE1284_MODE_NIBBLE)) {
+				retval = -EIO;
+				goto out;
+			}
+		} else {
+			prepare_to_wait(&lp_table[minor].waitq, &wait, TASK_INTERRUPTIBLE);
+			schedule_timeout(LP_TIMEOUT_POLLED);
+			finish_wait(&lp_table[minor].waitq, &wait);
+		}
+
+		if (signal_pending (current)) {
+			retval = -ERESTARTSYS;
+			break;
+		}
+
+		cond_resched ();
+	}
+	parport_negotiate (lp_table[minor].dev->port, IEEE1284_MODE_COMPAT);
+ out:
+	lp_release_parport (&lp_table[minor]);
+
+	if (retval > 0 && copy_to_user (buf, kbuf, retval))
+		retval = -EFAULT;
+
+	mutex_unlock(&lp_table[minor].port_mutex);
+
+	return retval;
 }
 
-static u32 kv_convert_vid7_to_vid2(struct amdgpu_device *adev,
-				   struct sumo_vid_mapping_table *vid_mapping_table,
-				   u32 vid_7bit)
+#endif /* IEEE 1284 support */
+
+static int lp_open(struct inode * inode, struct file * file)
 {
-	struct amdgpu_clock_voltage_dependency_table *vddc_sclk_table =
-		&adev->pm.dpm.dyn_state.vddc_dependency_on_sclk;
-	u32 i;
+	unsigned int minor = iminor(inode);
+	int ret = 0;
 
-	if (vddc_sclk_table && vddc_sclk_table->count) {
-		for (i = 0; i < vddc_sclk_table->count; i++) {
-			if (vddc_sclk_table->entries[i].v == vid_7bit)
-				return i;
-		}
-		return vddc_sclk_table->count - 1;
-	} else {
-		for (i = 0; i < vid_mapping_table->num_entries; i++) {
-			if (vid_mapping_table->entries[i].vid_7bit == vid_7bit)
-				return vid_mapping_table->entries[i].vid_2bit;
-		}
-
-		return vid_mapping_table->entries[vid_mapping_table->num_entries - 1].vid_2bit;
+	mutex_lock(&lp_mutex);
+	if (minor >= LP_NO) {
+		ret = -ENXIO;
+		goto out;
 	}
+	if ((LP_F(minor) & LP_EXIST) == 0) {
+		ret = -ENXIO;
+		goto out;
+	}
+	if (test_and_set_bit(LP_BUSY_BIT_POS, &LP_F(minor))) {
+		ret = -EBUSY;
+		goto out;
+	}
+	/* If ABORTOPEN is set and the printer is offline or out of paper,
+	   we may still want to open it to perform ioctl()s.  Therefore we
+	   have commandeered O_NONBLOCK, even though it is being used in
+	   a non-standard manner.  This is strictly a Linux hack, and
+	   should most likely only ever be used by the tunelp application. */
+	if ((LP_F(minor) & LP_ABORTOPEN) && !(file->f_flags & O_NONBLOCK)) {
+		int status;
+		lp_claim_parport_or_block (&lp_table[minor]);
+		status = r_str(minor);
+		lp_release_parport (&lp_table[minor]);
+		if (status & LP_POUTPA) {
+			printk(KERN_INFO "lp%d out of paper\n", minor);
+			LP_F(minor) &= ~LP_BUSY;
+			ret = -ENOSPC;
+			goto out;
+		} else if (!(status & LP_PSELECD)) {
+			printk(KERN_INFO "lp%d off-line\n", minor);
+			LP_F(minor) &= ~LP_BUSY;
+			ret = -EIO;
+			goto out;
+		} else if (!(status & LP_PERRORP)) {
+			printk(KERN_ERR "lp%d printer error\n", minor);
+			LP_F(minor) &= ~LP_BUSY;
+			ret = -EIO;
+			goto out;
+		}
+	}
+	lp_table[minor].lp_buffer = kmalloc(LP_BUFFER_SIZE, GFP_KERNEL);
+	if (!lp_table[minor].lp_buffer) {
+		LP_F(minor) &= ~LP_BUSY;
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* Determine if the peripheral supports ECP mode */
+	lp_claim_parport_or_block (&lp_table[minor]);
+	if ( (lp_table[minor].dev->port->modes & PARPORT_MODE_ECP) &&
+             !parport_negotiate (lp_table[minor].dev->port, 
+                                 IEEE1284_MODE_ECP)) {
+		printk (KERN_INFO "lp%d: ECP mode\n", minor);
+		lp_table[minor].best_mode = IEEE1284_MODE_ECP;
+	} else {
+		lp_table[minor].best_mode = IEEE1284_MODE_COMPAT;
+	}
+	/* Leave peripheral in compatibility mode */
+	parport_negotiate (lp_table[minor].dev->port, IEEE1284_MODE_COMPAT);
+	lp_release_parport (&lp_table[minor]);
+	lp_table[minor].current_mode = IEEE1284_MODE_COMPAT;
+out:
+	mutex_unlock(&lp_mutex);
+	return ret;
 }
 
-static void sumo_take_smu_control(struct amdgpu_device *adev, bool enable)
+static int lp_release(struct inode * inode, struct file * file)
 {
-/* This bit selects who handles display phy powergating.
- * Clear the bit to let atom handle it.
- * Set it to let the driver handle it.
- * For now we just let atom handle it.
- */
-#if 0
-	u32 v = RREG32(mmDOUT_SCRATCH3);
+	unsigned int minor = iminor(inode);
 
-	if (enable)
-		v |= 0x4;
-	else
-		v &= 0xFFFFFFFB;
+	lp_claim_parport_or_block (&lp_table[minor]);
+	parport_negotiate (lp_table[minor].dev->port, IEEE1284_MODE_COMPAT);
+	lp_table[minor].current_mode = IEEE1284_MODE_COMPAT;
+	lp_release_parport (&lp_table[minor]);
+	kfree(lp_table[minor].lp_buffer);
+	lp_table[minor].lp_buffer = NULL;
+	LP_F(minor) &= ~LP_BUSY;
+	return 0;
+}
 
-	WREG32(mmDOUT_SCRATCH3, v);
+static int lp_do_ioctl(unsigned int minor, unsigned int cmd,
+	unsigned long arg, void __user *argp)
+{
+	int status;
+	int retval = 0;
+
+#ifdef LP_DEBUG
+	printk(KERN_DEBUG "lp%d ioctl, cmd: 0x%x, arg: 0x%lx\n", minor, cmd, arg);
 #endif
+	if (minor >= LP_NO)
+		return -ENODEV;
+	if ((LP_F(minor) & LP_EXIST) == 0)
+		return -ENODEV;
+	switch ( cmd ) {
+		case LPTIME:
+			if (arg > UINT_MAX / HZ)
+				return -EINVAL;
+			LP_TIME(minor) = arg * HZ/100;
+			break;
+		case LPCHAR:
+			LP_CHAR(minor) = arg;
+			break;
+		case LPABORT:
+			if (arg)
+				LP_F(minor) |= LP_ABORT;
+			else
+				LP_F(minor) &= ~LP_ABORT;
+			break;
+		case LPABORTOPEN:
+			if (arg)
+				LP_F(minor) |= LP_ABORTOPEN;
+			else
+				LP_F(minor) &= ~LP_ABORTOPEN;
+			break;
+		case LPCAREFUL:
+			if (arg)
+				LP_F(minor) |= LP_CAREFUL;
+			else
+				LP_F(minor) &= ~LP_CAREFUL;
+			break;
+		case LPWAIT:
+			LP_WAIT(minor) = arg;
+			break;
+		case LPSETIRQ: 
+			return -EINVAL;
+			break;
+		case LPGETIRQ:
+			if (copy_to_user(argp, &LP_IRQ(minor),
+					sizeof(int)))
+				return -EFAULT;
+			break;
+		case LPGETSTATUS:
+			if (mutex_lock_interruptible(&lp_table[minor].port_mutex))
+				return -EINTR;
+			lp_claim_parport_or_block (&lp_table[minor]);
+			status = r_str(minor);
+			lp_release_parport (&lp_table[minor]);
+			mutex_unlock(&lp_table[minor].port_mutex);
+
+			if (copy_to_user(argp, &status, sizeof(int)))
+				return -EFAULT;
+			break;
+		case LPRESET:
+			lp_reset(minor);
+			break;
+#ifdef LP_STATS
+		case LPGETSTATS:
+			if (copy_to_user(argp, &LP_STAT(minor),
+					sizeof(struct lp_stats)))
+				return -EFAULT;
+			if (capable(CAP_SYS_ADMIN))
+				memset(&LP_STAT(minor), 0,
+						sizeof(struct lp_stats));
+			break;
+#endif
+ 		case LPGETFLAGS:
+ 			status = LP_F(minor);
+			if (copy_to_user(argp, &status, sizeof(int)))
+				return -EFAULT;
+			break;
+
+		default:
+			retval = -EINVAL;
+	}
+	return retval;
 }
 
-static u32 sumo_get_sleep_divider_from_id(u32 id)
+static int lp_set_timeout(unsigned int minor, struct timeval *par_timeout)
 {
-	return 1 << id;
+	long to_jiffies;
+
+	/* Convert to jiffies, place in lp_table */
+	if ((par_timeout->tv_sec < 0) ||
+	    (par_timeout->tv_usec < 0)) {
+		return -EINVAL;
+	}
+	to_jiffies = DIV_ROUND_UP(par_timeout->tv_usec, 1000000/HZ);
+	to_jiffies += par_timeout->tv_sec * (long) HZ;
+	if (to_jiffies <= 0) {
+		return -EINVAL;
+	}
+	lp_table[minor].timeout = to_jiffies;
+	return 0;
 }
 
-static void sumo_construct_sclk_voltage_mapping_table(struct amdgpu_device *adev,
-						      struct sumo_sclk_voltage_mapping_table *sclk_voltage_mapping_table,
-						      ATOM_AVAILABLE_SCLK_LIST *table)
+static long lp_ioctl(struct file *file, unsigned int cmd,
+			unsigned long arg)
 {
-	u32 i;
-	u32 n = 0;
-	u32 prev_sclk = 0;
+	unsigned int minor;
+	struct timeval par_timeout;
+	int ret;
 
-	for (i = 0; i < SUMO_MAX_HARDWARE_POWERLEVELS; i++) {
-		if (table[i].ulSupportedSCLK > prev_sclk) {
-			sclk_voltage_mapping_table->entries[n].sclk_frequency =
-				table[i].ulSupportedSCLK;
-			sclk_voltage_mapping_table->entries[n].vid_2bit =
-				table[i].usVoltageIndex;
-			prev_sclk = table[i].ulSupportedSCLK;
-			n++;
+	minor = iminor(file_inode(file));
+	mutex_lock(&lp_mutex);
+	switch (cmd) {
+	case LPSETTIMEOUT:
+		if (copy_from_user(&par_timeout, (void __user *)arg,
+					sizeof (struct timeval))) {
+			ret = -EFAULT;
+			break;
 		}
+		ret = lp_set_timeout(minor, &par_timeout);
+		break;
+	default:
+		ret = lp_do_ioctl(minor, cmd, arg, (void __user *)arg);
+		break;
+	}
+	mutex_unlock(&lp_mutex);
+
+	return ret;
+}
+
+#ifdef CONFIG_COMPAT
+static long lp_compat_ioctl(struct file *file, unsigned int cmd,
+			unsigned long arg)
+{
+	unsigned int minor;
+	struct timeval par_timeout;
+	int ret;
+
+	minor = iminor(file_inode(file));
+	mutex_lock(&lp_mutex);
+	switch (cmd) {
+	case LPSETTIMEOUT:
+		if (compat_get_timeval(&par_timeout, compat_ptr(arg))) {
+			ret = -EFAULT;
+			break;
+		}
+		ret = lp_set_timeout(minor, &par_timeout);
+		break;
+#ifdef LP_STATS
+	case LPGETSTATS:
+		/* FIXME: add an implementation if you set LP_STATS */
+		ret = -EINVAL;
+		break;
+#endif
+	default:
+		ret = lp_do_ioctl(minor, cmd, arg, compat_ptr(arg));
+		break;
+	}
+	mutex_unlock(&lp_mutex);
+
+	return ret;
+}
+#endif
+
+static const struct file_operations lp_fops = {
+	.owner		= THIS_MODULE,
+	.write		= lp_write,
+	.unlocked_ioctl	= lp_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= lp_compat_ioctl,
+#endif
+	.open		= lp_open,
+	.release	= lp_release,
+#ifdef CONFIG_PARPORT_1284
+	.read		= lp_read,
+#endif
+	.llseek		= noop_llseek,
+};
+
+/* --- support for console on the line printer ----------------- */
+
+#ifdef CONFIG_LP_CONSOLE
+
+#define CONSOLE_LP 0
+
+/* If the printer is out of paper, we can either lose the messages or
+ * stall until the printer is happy again.  Define CONSOLE_LP_STRICT
+ * non-zero to get the latter behaviour. */
+#define CONSOLE_LP_STRICT 1
+
+/* The console must be locked when we get here. */
+
+static void lp_console_write (struct console *co, const char *s,
+			      unsigned count)
+{
+	struct pardevice *dev = lp_table[CONSOLE_LP].dev;
+	struct parport *port = dev->port;
+	ssize_t written;
+
+	if (parport_claim (dev))
+		/* Nothing we can do. */
+		return;
+
+	parport_set_timeout (dev, 0);
+
+	/* Go to compatibility mode. */
+	parport_negotiate (port, IEEE1284_MODE_COMPAT);
+
+	do {
+		/* Write the data, converting LF->CRLF as we go. */
+		ssize_t canwrite = count;
+		char *lf = memchr (s, '\n', count);
+		if (lf)
+			canwrite = lf - s;
+
+		if (canwrite > 0) {
+			written = parport_write (port, s, canwrite);
+
+			if (written <= 0)
+				continue;
+
+			s += written;
+			count -= written;
+			canwrite -= written;
+		}
+
+		if (lf && canwrite <= 0) {
+			const char *crlf = "\r\n";
+			int i = 2;
+
+			/* Dodge the original '\n', and put '\r\n' instead. */
+			s++;
+			count--;
+			do {
+				written = parport_write (port, crlf, i);
+				if (written > 0)
+					i -= written, crlf += written;
+			} while (i > 0 && (CONSOLE_LP_STRICT || written > 0));
+		}
+	} while (count > 0 && (CONSOLE_LP_STRICT || written > 0));
+
+	parport_release (dev);
+}
+
+static struct console lpcons = {
+	.name		= "lp",
+	.write		= lp_console_write,
+	.flags		= CON_PRINTBUFFER,
+};
+
+#endif /* console on line printer */
+
+/* --- initialisation code ------------------------------------- */
+
+static int parport_nr[LP_NO] = { [0 ... LP_NO-1] = LP_PARPORT_UNSPEC };
+static char *parport[LP_NO];
+static bool reset;
+
+module_param_array(parport, charp, NULL, 0);
+module_param(reset, bool, 0);
+
+#ifndef MODULE
+static int __init lp_setup (char *str)
+{
+	static int parport_ptr;
+	int x;
+
+	if (get_option(&str, &x)) {
+		if (x == 0) {
+			/* disable driver on "lp=" or "lp=0" */
+			parport_nr[0] = LP_PARPORT_OFF;
+		} else {
+			printk(KERN_WARNING "warning: 'lp=0x%x' is deprecated, ignored\n", x);
+			return 0;
+		}
+	} else if (!strncmp(str, "parport", 7)) {
+		int n = simple_strtoul(str+7, NULL, 10);
+		if (parport_ptr < LP_NO)
+			parport_nr[parport_ptr++] = n;
+		else
+			printk(KERN_INFO "lp: too many ports, %s ignored.\n",
+			       str);
+	} else if (!strcmp(str, "auto")) {
+		parport_nr[0] = LP_PARPORT_AUTO;
+	} else if (!strcmp(str, "none")) {
+		if (parport_ptr < LP_NO)
+			parport_nr[parport_ptr++] = LP_PARPORT_NONE;
+		else
+			printk(KERN_INFO "lp: too many ports, %s ignored.\n",
+			       str);
+	} else if (!strcmp(str, "reset")) {
+		reset = 1;
+	}
+	return 1;
+}
+#endif
+
+static int lp_register(int nr, struct parport *port)
+{
+	lp_table[nr].dev = parport_register_device(port, "lp", 
+						   lp_preempt, NULL, NULL, 0,
+						   (void *) &lp_table[nr]);
+	if (lp_table[nr].dev == NULL)
+		return 1;
+	lp_table[nr].flags |= LP_EXIST;
+
+	if (reset)
+		lp_reset(nr);
+
+	device_create(lp_class, port->dev, MKDEV(LP_MAJOR, nr), NULL,
+		      "lp%d", nr);
+
+	printk(KERN_INFO "lp%d: using %s (%s).\n", nr, port->name, 
+	       (port->irq == PARPORT_IRQ_NONE)?"polling":"interrupt-driven");
+
+#ifdef CONFIG_LP_CONSOLE
+	if (!nr) {
+		if (port->modes & PARPORT_MODE_SAFEININT) {
+			register_console(&lpcons);
+			console_registered = port;
+			printk (KERN_INFO "lp%d: console ready\n", CONSOLE_LP);
+		} else
+			printk (KERN_ERR "lp%d: cannot run console on %s\n",
+				CONSOLE_LP, port->name);
+	}
+#endif
+
+	return 0;
+}
+
+static void lp_attach (struct parport *port)
+{
+	unsigned int i;
+
+	switch (parport_nr[0]) {
+	case LP_PARPORT_UNSPEC:
+	case LP_PARPORT_AUTO:
+		if (parport_nr[0] == LP_PARPORT_AUTO &&
+		    port->probe_info[0].class != PARPORT_CLASS_PRINTER)
+			return;
+		if (lp_count == LP_NO) {
+			printk(KERN_INFO "lp: ignoring parallel port (max. %d)\n",LP_NO);
+			return;
+		}
+		if (!lp_register(lp_count, port))
+			lp_count++;
+		break;
+
+	default:
+		for (i = 0; i < LP_NO; i++) {
+			if (port->number == parport_nr[i]) {
+				if (!lp_register(i, port))
+					lp_count++;
+				break;
+			}
+		}
+		break;
+	}
+}
+
+static void lp_detach (struct parport *port)
+{
+	/* Write this some day. */
+#ifdef CONFIG_LP_CONSOLE
+	if (console_registered == port) {
+		unregister_console(&lpcons);
+		console_registered = NULL;
+	}
+#endif /* CONFIG_LP_CONSOLE */
+}
+
+static struct parport_driver lp_driver = {
+	.name = "lp",
+	.attach = lp_attach,
+	.detach = lp_detach,
+};
+
+static int __init lp_init (void)
+{
+	int i, err = 0;
+
+	if (parport_nr[0] == LP_PARPORT_OFF)
+		return 0;
+
+	for (i = 0; i < LP_NO; i++) {
+		lp_table[i].dev = NULL;
+		lp_table[i].flags = 0;
+		lp_table[i].chars = LP_INIT_CHAR;
+		lp_table[i].time = LP_INIT_TIME;
+		lp_table[i].wait = LP_INIT_WAIT;
+		lp_table[i].lp_buffer = NULL;
+#ifdef LP_STATS
+		lp_table[i].lastcall = 0;
+		lp_table[i].runchars = 0;
+		memset (&lp_table[i].stats, 0, sizeof (struct lp_stats));
+#endif
+		lp_table[i].last_error = 0;
+		init_waitqueue_head (&lp_table[i].waitq);
+		init_waitqueue_head (&lp_table[i].dataq);
+		mutex_init(&lp_table[i].port_mutex);
+		lp_table[i].timeout = 10 * HZ;
 	}
 
-	sclk_voltage_mapping_table->num_max_dpm_entries = n;
-}
-
-static void sumo_construct_vid_mapping_table(struct amdgpu_device *adev,
-					     struct sumo_vid_mapping_table *vid_mapping_table,
-					     ATOM_AVAILABLE_SCLK_LIST *table)
-{
-	u32 i, j;
-
-	for (i = 0; i < SUMO_MAX_HARDWARE_POWERLEVELS; i++) {
-		if (table[i].ulSupportedSCLK != 0) {
-			vid_mapping_table->entries[table[i].usVoltageIndex].vid_7bit =
-				table[i].usVoltageID;
-			vid_mapping_table->entries[table[i].usVoltageIndex].vid_2bit =
-				table[i].usVoltageIndex;
-		}
+	if (register_chrdev (LP_MAJOR, "lp", &lp_fops)) {
+		printk (KERN_ERR "lp: unable to get major %d\n", LP_MAJOR);
+		return -EIO;
 	}
 
-	for (i = 0; i < SUMO_MAX_NUMBER_VOLTAGES; i++) {
-		if (vid_mapping_table->entries[i].vid_7bit == 0) {
-			for (j = i + 1; j < SUMO_MAX_NUMBER_VOLTAGES; j++) {
-				if (vid_mapping_table->entries[j].vid_7bit != 0) {
-					vid_mapping_table->entries[i] =
-						vid_mapping_table->entries[j];
-					vid_mapping_table->entries[j].vid_7bit = 0;
-					break;
+	lp_class = class_create(THIS_MODULE, "printer");
+	if (IS_ERR(lp_class)) {
+		err = PTR_ERR(lp_class);
+		goto out_reg;
+	}
+
+	if (parport_register_driver (&lp_driver)) {
+		printk (KERN_ERR "lp: unable to register with parport\n");
+		err = -EIO;
+		goto out_class;
+	}
+
+	if (!lp_count) {
+		printk (KERN_INFO "lp: driver loaded but no devices found\n");
+#ifndef CONFIG_PARPORT_1284
+		if (parport_nr[0] == LP_PARPORT_AUTO)
+			printk (KERN_INFO "lp: (is IEEE 1284 support enabled?)\n");
+#endif
+	}
+
+	return 0;
+
+out_class:
+	class_destroy(lp_class);
+out_reg:
+	unregister_chrdev(LP_MAJOR, "lp");
+	return err;
+}
+
+static int __init lp_init_module (void)
+{
+	if (parport[0]) {
+		/* The user gave some parameters.  Let's see what they were.  */
+		if (!strncmp(parport[0], "auto", 4))
+			parport_nr[0] = LP_PARPORT_AUTO;
+		else {
+			int n;
+			for (n = 0; n < LP_NO && parport[n]; n++) {
+				if (!strncmp(parport[n], "none", 4))
+					parport_nr[n] = LP_PARPORT_NONE;
+				else {
+					char *ep;
+					unsigned long r = simple_strtoul(parport[n], &ep, 0);
+					if (ep != parport[n]) 
+						parport_nr[n] = r;
+					else {
+						printk(KERN_ERR "lp: bad port specifier `%s'\n", parport[n]);
+						return -ENODEV;
+					}
 				}
 			}
-
-			if (j == SUMO_MAX_NUMBER_VOLTAGES)
-				break;
 		}
 	}
 
-	vid_mapping_table->num_entries = i;
+	return lp_init();
 }
 
-static const struct kv_lcac_config_values sx_local_cac_cfg_kv[] =
+static void lp_cleanup_module (void)
 {
-	{  0,       4,        1    },
-	{  1,       4,        1    },
-	{  2,       5,        1    },
-	{  3,       4,        2    },
-	{  4,       1,        1    },
-	{  5,       5,        2    },
-	{  6,       6,        1    },
-	{  7,       9,        2    },
-	{ 0xffffffff }
-};
+	unsigned int offset;
 
-static const struct kv_lcac_config_values mc0_local_cac_cfg_kv[] =
-{
-	{  0,       4,        1    },
-	{ 0xffffffff }
-};
+	parport_unregister_driver (&lp_driver);
 
-static const struct kv_lcac_config_values mc1_local_cac_cfg_kv[] =
-{
-	{  0,       4,        1    },
-	{ 0xffffffff }
-};
-
-static const struct kv_lcac_config_values mc2_local_cac_cfg_kv[] =
-{
-	{  0,       4,        1    },
-	{ 0xffffffff }
-};
-
-static const struct kv_lcac_config_values mc3_local_cac_cfg_kv[] =
-{
-	{  0,       4,        1    },
-	{ 0xffffffff }
-};
-
-static const struct kv_lcac_config_values cpl_local_cac_cfg_kv[] =
-{
-	{  0,       4,        1    },
-	{  1,       4,        1    },
-	{  2,       5,        1    },
-	{  3,       4,        1    },
-	{  4,       1,        1    },
-	{  5,       5,        1    },
-	{  6,       6,        1    },
-	{  7,       9,        1    },
-	{  8,       4,        1    },
-	{  9,       2,        1    },
-	{  10,      3,        1    },
-	{  11,      6,        1    },
-	{  12,      8,        2    },
-	{  13,      1,        1    },
-	{  14,      2,        1    },
-	{  15,      3,        1    },
-	{  16,      1,        1    },
-	{  17,      4,        1    },
-	{  18,      3,        1    },
-	{  19,      1,        1    },
-	{  20,      8,        1    },
-	{  21,      5,        1    },
-	{  22,      1,        1    },
-	{  23,      1,        1    },
-	{  24,      4,        1    },
-	{  27,      6,        1    },
-	{  28,      1,        1    },
-	{ 0xffffffff }
-};
-
-static const struct kv_lcac_config_reg sx0_cac_config_reg[] =
-{
-	{ 0xc0400d00, 0x003e0000, 17, 0x3fc00000, 22, 0x0001fffe, 1, 0x00000001, 0 }
-};
-
-static const struct kv_lcac_config_reg mc0_cac_config_reg[] =
-{
-	{ 0xc0400d30, 0x003e0000, 17, 0x3fc00000, 22, 0x0001fffe, 1, 0x00000001, 0 }
-};
-
-static const struct kv_lcac_config_reg mc1_cac_config_reg[] =
-{
-	{ 0xc0400d3c, 0x003e0000, 17, 0x3fc00000, 22, 0x0001fffe, 1, 0x00000001, 0 }
-};
-
-static const struct kv_lcac_config_reg mc2_cac_config_reg[] =
-{
-	{ 0xc0400d48, 0x003e0000, 17, 0x3fc00000, 22, 0x0001fffe, 1, 0x00000001, 0 }
-};
-
-static const struct kv_lcac_config_reg mc3_cac_config_reg[] =
-{
-	{ 0xc0400d54, 0x003e0000, 17, 0x3fc00000, 22, 0x0001fffe, 1, 0x00000001, 0 }
-};
-
-static const struct kv_lcac_config_reg cpl_cac_config_reg[] =
-{
-	{ 0xc0400d80, 0x003e0000, 17, 0x3fc00000, 22, 0x0001fffe, 1, 0x00000001, 0 }
-};
-
-static const struct kv_pt_config_reg didt_config_kv[] =
-{
-	{ 0x10, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x10, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x10, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x10, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x11, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x11, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x11, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x11, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x12, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x12, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x12, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x12, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x2, 0x00003fff, 0, 0x4, KV_CONFIGREG_DIDT_IND },
-	{ 0x2, 0x03ff0000, 16, 0x80, KV_CONFIGREG_DIDT_IND },
-	{ 0x2, 0x78000000, 27, 0x3, KV_CONFIGREG_DIDT_IND },
-	{ 0x1, 0x0000ffff, 0, 0x3FFF, KV_CONFIGREG_DIDT_IND },
-	{ 0x1, 0xffff0000, 16, 0x3FFF, KV_CONFIGREG_DIDT_IND },
-	{ 0x0, 0x00000001, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x30, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x30, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x30, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x30, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x31, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x31, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x31, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x31, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x32, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x32, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x32, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x32, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x22, 0x00003fff, 0, 0x4, KV_CONFIGREG_DIDT_IND },
-	{ 0x22, 0x03ff0000, 16, 0x80, KV_CONFIGREG_DIDT_IND },
-	{ 0x22, 0x78000000, 27, 0x3, KV_CONFIGREG_DIDT_IND },
-	{ 0x21, 0x0000ffff, 0, 0x3FFF, KV_CONFIGREG_DIDT_IND },
-	{ 0x21, 0xffff0000, 16, 0x3FFF, KV_CONFIGREG_DIDT_IND },
-	{ 0x20, 0x00000001, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x50, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x50, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x50, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x50, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x51, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x51, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x51, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x51, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x52, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x52, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x52, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x52, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x42, 0x00003fff, 0, 0x4, KV_CONFIGREG_DIDT_IND },
-	{ 0x42, 0x03ff0000, 16, 0x80, KV_CONFIGREG_DIDT_IND },
-	{ 0x42, 0x78000000, 27, 0x3, KV_CONFIGREG_DIDT_IND },
-	{ 0x41, 0x0000ffff, 0, 0x3FFF, KV_CONFIGREG_DIDT_IND },
-	{ 0x41, 0xffff0000, 16, 0x3FFF, KV_CONFIGREG_DIDT_IND },
-	{ 0x40, 0x00000001, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x70, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x70, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x70, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x70, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x71, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x71, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x71, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x71, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x72, 0x000000ff, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x72, 0x0000ff00, 8, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x72, 0x00ff0000, 16, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x72, 0xff000000, 24, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0x62, 0x00003fff, 0, 0x4, KV_CONFIGREG_DIDT_IND },
-	{ 0x62, 0x03ff0000, 16, 0x80, KV_CONFIGREG_DIDT_IND },
-	{ 0x62, 0x78000000, 27, 0x3, KV_CONFIGREG_DIDT_IND },
-	{ 0x61, 0x0000ffff, 0, 0x3FFF, KV_CONFIGREG_DIDT_IND },
-	{ 0x61, 0xffff0000, 16, 0x3FFF, KV_CONFIGREG_DIDT_IND },
-	{ 0x60, 0x00000001, 0, 0x0, KV_CONFIGREG_DIDT_IND },
-	{ 0xFFFFFFFF }
-};
-
-static struct kv_ps *kv_get_ps(struct amdgpu_ps *rps)
-{
-	struct kv_ps *ps = rps->ps_priv;
-
-	return ps;
-}
-
-static struct kv_power_info *kv_get_pi(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = adev->pm.dpm.priv;
-
-	return pi;
-}
-
-#if 0
-static void kv_program_local_cac_table(struct amdgpu_device *adev,
-				       const struct kv_lcac_config_values *local_cac_table,
-				       const struct kv_lcac_config_reg *local_cac_reg)
-{
-	u32 i, count, data;
-	const struct kv_lcac_config_values *values = local_cac_table;
-
-	while (values->block_id != 0xffffffff) {
-		count = values->signal_id;
-		for (i = 0; i < count; i++) {
-			data = ((values->block_id << local_cac_reg->block_shift) &
-				local_cac_reg->block_mask);
-			data |= ((i << local_cac_reg->signal_shift) &
-				 local_cac_reg->signal_mask);
-			data |= ((values->t << local_cac_reg->t_shift) &
-				 local_cac_reg->t_mask);
-			data |= ((1 << local_cac_reg->enable_shift) &
-				 local_cac_reg->enable_mask);
-			WREG32_SMC(local_cac_reg->cntl, data);
-		}
-		values++;
-	}
-}
+#ifdef CONFIG_LP_CONSOLE
+	unregister_console (&lpcons);
 #endif
 
-static int kv_program_pt_config_registers(struct amdgpu_device *adev,
-					  const struct kv_pt_config_reg *cac_config_regs)
-{
-	const struct kv_pt_config_reg *config_regs = cac_config_regs;
-	u32 data;
-	u32 cache = 0;
-
-	if (config_regs == NULL)
-		return -EINVAL;
-
-	while (config_regs->offset != 0xFFFFFFFF) {
-		if (config_regs->type == KV_CONFIGREG_CACHE) {
-			cache |= ((config_regs->value << config_regs->shift) & config_regs->mask);
-		} else {
-			switch (config_regs->type) {
-			case KV_CONFIGREG_SMC_IND:
-				data = RREG32_SMC(config_regs->offset);
-				break;
-			case KV_CONFIGREG_DIDT_IND:
-				data = RREG32_DIDT(config_regs->offset);
-				break;
-			default:
-				data = RREG32(config_regs->offset);
-				break;
-			}
-
-			data &= ~config_regs->mask;
-			data |= ((config_regs->value << config_regs->shift) & config_regs->mask);
-			data |= cache;
-			cache = 0;
-
-			switch (config_regs->type) {
-			case KV_CONFIGREG_SMC_IND:
-				WREG32_SMC(config_regs->offset, data);
-				break;
-			case KV_CONFIGREG_DIDT_IND:
-				WREG32_DIDT(config_regs->offset, data);
-				break;
-			default:
-				WREG32(config_regs->offset, data);
-				break;
-			}
-		}
-		config_regs++;
+	unregister_chrdev(LP_MAJOR, "lp");
+	for (offset = 0; offset < LP_NO; offset++) {
+		if (lp_table[offset].dev == NULL)
+			continue;
+		parport_unregister_device(lp_table[offset].dev);
+		device_destroy(lp_class, MKDEV(LP_MAJOR, offset));
 	}
-
-	return 0;
+	class_destroy(lp_class);
 }
 
-static void kv_do_enable_didt(struct amdgpu_device *adev, bool enable)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 data;
+__setup("lp=", lp_setup);
+module_init(lp_init_module);
+module_exit(lp_cleanup_module);
 
-	if (pi->caps_sq_ramping) {
-		data = RREG32_DIDT(ixDIDT_SQ_CTRL0);
-		if (enable)
-			data |= DIDT_SQ_CTRL0__DIDT_CTRL_EN_MASK;
-		else
-			data &= ~DIDT_SQ_CTRL0__DIDT_CTRL_EN_MASK;
-		WREG32_DIDT(ixDIDT_SQ_CTRL0, data);
-	}
+MODULE_ALIAS_CHARDEV_MAJOR(LP_MAJOR);
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
+ *
+ * Copyright (c) 2005 Silicon Graphics, Inc.  All rights reserved.
+ */
 
-	if (pi->caps_db_ramping) {
-		data = RREG32_DIDT(ixDIDT_DB_CTRL0);
-		if (enable)
-			data |= DIDT_DB_CTRL0__DIDT_CTRL_EN_MASK;
-		else
-			data &= ~DIDT_DB_CTRL0__DIDT_CTRL_EN_MASK;
-		WREG32_DIDT(ixDIDT_DB_CTRL0, data);
-	}
+/*
+ *	MOATB Core Services driver.
+ */
 
-	if (pi->caps_td_ramping) {
-		data = RREG32_DIDT(ixDIDT_TD_CTRL0);
-		if (enable)
-			data |= DIDT_TD_CTRL0__DIDT_CTRL_EN_MASK;
-		else
-			data &= ~DIDT_TD_CTRL0__DIDT_CTRL_EN_MASK;
-		WREG32_DIDT(ixDIDT_TD_CTRL0, data);
-	}
+#include <linux/interrupt.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/types.h>
+#include <linux/ioport.h>
+#include <linux/kernel.h>
+#include <linux/notifier.h>
+#include <linux/reboot.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/mm.h>
+#include <linux/uio.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <asm/io.h>
+#include <asm/uaccess.h>
+#include <asm/pgtable.h>
+#include <asm/sn/addrs.h>
+#include <asm/sn/intr.h>
+#include <asm/sn/tiocx.h>
+#include "mbcs.h"
 
-	if (pi->caps_tcp_ramping) {
-		data = RREG32_DIDT(ixDIDT_TCP_CTRL0);
-		if (enable)
-			data |= DIDT_TCP_CTRL0__DIDT_CTRL_EN_MASK;
-		else
-			data &= ~DIDT_TCP_CTRL0__DIDT_CTRL_EN_MASK;
-		WREG32_DIDT(ixDIDT_TCP_CTRL0, data);
-	}
-}
-
-static int kv_enable_didt(struct amdgpu_device *adev, bool enable)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-
-	if (pi->caps_sq_ramping ||
-	    pi->caps_db_ramping ||
-	    pi->caps_td_ramping ||
-	    pi->caps_tcp_ramping) {
-		gfx_v7_0_enter_rlc_safe_mode(adev);
-
-		if (enable) {
-			ret = kv_program_pt_config_registers(adev, didt_config_kv);
-			if (ret) {
-				gfx_v7_0_exit_rlc_safe_mode(adev);
-				return ret;
-			}
-		}
-
-		kv_do_enable_didt(adev, enable);
-
-		gfx_v7_0_exit_rlc_safe_mode(adev);
-	}
-
-	return 0;
-}
-
-#if 0
-static void kv_initialize_hardware_cac_manager(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	if (pi->caps_cac) {
-		WREG32_SMC(ixLCAC_SX0_OVR_SEL, 0);
-		WREG32_SMC(ixLCAC_SX0_OVR_VAL, 0);
-		kv_program_local_cac_table(adev, sx_local_cac_cfg_kv, sx0_cac_config_reg);
-
-		WREG32_SMC(ixLCAC_MC0_OVR_SEL, 0);
-		WREG32_SMC(ixLCAC_MC0_OVR_VAL, 0);
-		kv_program_local_cac_table(adev, mc0_local_cac_cfg_kv, mc0_cac_config_reg);
-
-		WREG32_SMC(ixLCAC_MC1_OVR_SEL, 0);
-		WREG32_SMC(ixLCAC_MC1_OVR_VAL, 0);
-		kv_program_local_cac_table(adev, mc1_local_cac_cfg_kv, mc1_cac_config_reg);
-
-		WREG32_SMC(ixLCAC_MC2_OVR_SEL, 0);
-		WREG32_SMC(ixLCAC_MC2_OVR_VAL, 0);
-		kv_program_local_cac_table(adev, mc2_local_cac_cfg_kv, mc2_cac_config_reg);
-
-		WREG32_SMC(ixLCAC_MC3_OVR_SEL, 0);
-		WREG32_SMC(ixLCAC_MC3_OVR_VAL, 0);
-		kv_program_local_cac_table(adev, mc3_local_cac_cfg_kv, mc3_cac_config_reg);
-
-		WREG32_SMC(ixLCAC_CPL_OVR_SEL, 0);
-		WREG32_SMC(ixLCAC_CPL_OVR_VAL, 0);
-		kv_program_local_cac_table(adev, cpl_local_cac_cfg_kv, cpl_cac_config_reg);
-	}
-}
+#define MBCS_DEBUG 0
+#if MBCS_DEBUG
+#define DBG(fmt...)    printk(KERN_ALERT fmt)
+#else
+#define DBG(fmt...)
 #endif
+static DEFINE_MUTEX(mbcs_mutex);
+static int mbcs_major;
 
-static int kv_enable_smc_cac(struct amdgpu_device *adev, bool enable)
+static LIST_HEAD(soft_list);
+
+/*
+ * file operations
+ */
+static const struct file_operations mbcs_ops = {
+	.open = mbcs_open,
+	.llseek = mbcs_sram_llseek,
+	.read = mbcs_sram_read,
+	.write = mbcs_sram_write,
+	.mmap = mbcs_gscr_mmap,
+};
+
+struct mbcs_callback_arg {
+	int minor;
+	struct cx_dev *cx_dev;
+};
+
+static inline void mbcs_getdma_init(struct getdma *gdma)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret = 0;
-
-	if (pi->caps_cac) {
-		if (enable) {
-			ret = amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_EnableCac);
-			if (ret)
-				pi->cac_enabled = false;
-			else
-				pi->cac_enabled = true;
-		} else if (pi->cac_enabled) {
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_DisableCac);
-			pi->cac_enabled = false;
-		}
-	}
-
-	return ret;
+	memset(gdma, 0, sizeof(struct getdma));
+	gdma->DoneIntEnable = 1;
 }
 
-static int kv_process_firmware_header(struct amdgpu_device *adev)
+static inline void mbcs_putdma_init(struct putdma *pdma)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 tmp;
-	int ret;
-
-	ret = amdgpu_kv_read_smc_sram_dword(adev, SMU7_FIRMWARE_HEADER_LOCATION +
-				     offsetof(SMU7_Firmware_Header, DpmTable),
-				     &tmp, pi->sram_end);
-
-	if (ret == 0)
-		pi->dpm_table_start = tmp;
-
-	ret = amdgpu_kv_read_smc_sram_dword(adev, SMU7_FIRMWARE_HEADER_LOCATION +
-				     offsetof(SMU7_Firmware_Header, SoftRegisters),
-				     &tmp, pi->sram_end);
-
-	if (ret == 0)
-		pi->soft_regs_start = tmp;
-
-	return ret;
+	memset(pdma, 0, sizeof(struct putdma));
+	pdma->DoneIntEnable = 1;
 }
 
-static int kv_enable_dpm_voltage_scaling(struct amdgpu_device *adev)
+static inline void mbcs_algo_init(struct algoblock *algo_soft)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-
-	pi->graphics_voltage_change_enable = 1;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, GraphicsVoltageChangeEnable),
-				   &pi->graphics_voltage_change_enable,
-				   sizeof(u8), pi->sram_end);
-
-	return ret;
+	memset(algo_soft, 0, sizeof(struct algoblock));
 }
 
-static int kv_set_dpm_interval(struct amdgpu_device *adev)
+static inline void mbcs_getdma_set(void *mmr,
+		       uint64_t hostAddr,
+		       uint64_t localAddr,
+		       uint64_t localRamSel,
+		       uint64_t numPkts,
+		       uint64_t amoEnable,
+		       uint64_t intrEnable,
+		       uint64_t peerIO,
+		       uint64_t amoHostDest,
+		       uint64_t amoModType, uint64_t intrHostDest,
+		       uint64_t intrVector)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
+	union dma_control rdma_control;
+	union dma_amo_dest amo_dest;
+	union intr_dest intr_dest;
+	union dma_localaddr local_addr;
+	union dma_hostaddr host_addr;
 
-	pi->graphics_interval = 1;
+	rdma_control.dma_control_reg = 0;
+	amo_dest.dma_amo_dest_reg = 0;
+	intr_dest.intr_dest_reg = 0;
+	local_addr.dma_localaddr_reg = 0;
+	host_addr.dma_hostaddr_reg = 0;
 
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, GraphicsInterval),
-				   &pi->graphics_interval,
-				   sizeof(u8), pi->sram_end);
+	host_addr.dma_sys_addr = hostAddr;
+	MBCS_MMR_SET(mmr, MBCS_RD_DMA_SYS_ADDR, host_addr.dma_hostaddr_reg);
 
-	return ret;
+	local_addr.dma_ram_addr = localAddr;
+	local_addr.dma_ram_sel = localRamSel;
+	MBCS_MMR_SET(mmr, MBCS_RD_DMA_LOC_ADDR, local_addr.dma_localaddr_reg);
+
+	rdma_control.dma_op_length = numPkts;
+	rdma_control.done_amo_en = amoEnable;
+	rdma_control.done_int_en = intrEnable;
+	rdma_control.pio_mem_n = peerIO;
+	MBCS_MMR_SET(mmr, MBCS_RD_DMA_CTRL, rdma_control.dma_control_reg);
+
+	amo_dest.dma_amo_sys_addr = amoHostDest;
+	amo_dest.dma_amo_mod_type = amoModType;
+	MBCS_MMR_SET(mmr, MBCS_RD_DMA_AMO_DEST, amo_dest.dma_amo_dest_reg);
+
+	intr_dest.address = intrHostDest;
+	intr_dest.int_vector = intrVector;
+	MBCS_MMR_SET(mmr, MBCS_RD_DMA_INT_DEST, intr_dest.intr_dest_reg);
+
 }
 
-static int kv_set_dpm_boot_state(struct amdgpu_device *adev)
+static inline void mbcs_putdma_set(void *mmr,
+		       uint64_t hostAddr,
+		       uint64_t localAddr,
+		       uint64_t localRamSel,
+		       uint64_t numPkts,
+		       uint64_t amoEnable,
+		       uint64_t intrEnable,
+		       uint64_t peerIO,
+		       uint64_t amoHostDest,
+		       uint64_t amoModType,
+		       uint64_t intrHostDest, uint64_t intrVector)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
+	union dma_control wdma_control;
+	union dma_amo_dest amo_dest;
+	union intr_dest intr_dest;
+	union dma_localaddr local_addr;
+	union dma_hostaddr host_addr;
 
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, GraphicsBootLevel),
-				   &pi->graphics_boot_level,
-				   sizeof(u8), pi->sram_end);
+	wdma_control.dma_control_reg = 0;
+	amo_dest.dma_amo_dest_reg = 0;
+	intr_dest.intr_dest_reg = 0;
+	local_addr.dma_localaddr_reg = 0;
+	host_addr.dma_hostaddr_reg = 0;
 
-	return ret;
+	host_addr.dma_sys_addr = hostAddr;
+	MBCS_MMR_SET(mmr, MBCS_WR_DMA_SYS_ADDR, host_addr.dma_hostaddr_reg);
+
+	local_addr.dma_ram_addr = localAddr;
+	local_addr.dma_ram_sel = localRamSel;
+	MBCS_MMR_SET(mmr, MBCS_WR_DMA_LOC_ADDR, local_addr.dma_localaddr_reg);
+
+	wdma_control.dma_op_length = numPkts;
+	wdma_control.done_amo_en = amoEnable;
+	wdma_control.done_int_en = intrEnable;
+	wdma_control.pio_mem_n = peerIO;
+	MBCS_MMR_SET(mmr, MBCS_WR_DMA_CTRL, wdma_control.dma_control_reg);
+
+	amo_dest.dma_amo_sys_addr = amoHostDest;
+	amo_dest.dma_amo_mod_type = amoModType;
+	MBCS_MMR_SET(mmr, MBCS_WR_DMA_AMO_DEST, amo_dest.dma_amo_dest_reg);
+
+	intr_dest.address = intrHostDest;
+	intr_dest.int_vector = intrVector;
+	MBCS_MMR_SET(mmr, MBCS_WR_DMA_INT_DEST, intr_dest.intr_dest_reg);
+
 }
 
-static void kv_program_vc(struct amdgpu_device *adev)
+static inline void mbcs_algo_set(void *mmr,
+		     uint64_t amoHostDest,
+		     uint64_t amoModType,
+		     uint64_t intrHostDest,
+		     uint64_t intrVector, uint64_t algoStepCount)
 {
-	WREG32_SMC(ixCG_FREQ_TRAN_VOTING_0, 0x3FFFC100);
+	union dma_amo_dest amo_dest;
+	union intr_dest intr_dest;
+	union algo_step step;
+
+	step.algo_step_reg = 0;
+	intr_dest.intr_dest_reg = 0;
+	amo_dest.dma_amo_dest_reg = 0;
+
+	amo_dest.dma_amo_sys_addr = amoHostDest;
+	amo_dest.dma_amo_mod_type = amoModType;
+	MBCS_MMR_SET(mmr, MBCS_ALG_AMO_DEST, amo_dest.dma_amo_dest_reg);
+
+	intr_dest.address = intrHostDest;
+	intr_dest.int_vector = intrVector;
+	MBCS_MMR_SET(mmr, MBCS_ALG_INT_DEST, intr_dest.intr_dest_reg);
+
+	step.alg_step_cnt = algoStepCount;
+	MBCS_MMR_SET(mmr, MBCS_ALG_STEP, step.algo_step_reg);
 }
 
-static void kv_clear_vc(struct amdgpu_device *adev)
+static inline int mbcs_getdma_start(struct mbcs_soft *soft)
 {
-	WREG32_SMC(ixCG_FREQ_TRAN_VOTING_0, 0);
+	void *mmr_base;
+	struct getdma *gdma;
+	uint64_t numPkts;
+	union cm_control cm_control;
+
+	mmr_base = soft->mmr_base;
+	gdma = &soft->getdma;
+
+	/* check that host address got setup */
+	if (!gdma->hostAddr)
+		return -1;
+
+	numPkts =
+	    (gdma->bytes + (MBCS_CACHELINE_SIZE - 1)) / MBCS_CACHELINE_SIZE;
+
+	/* program engine */
+	mbcs_getdma_set(mmr_base, tiocx_dma_addr(gdma->hostAddr),
+		   gdma->localAddr,
+		   (gdma->localAddr < MB2) ? 0 :
+		   (gdma->localAddr < MB4) ? 1 :
+		   (gdma->localAddr < MB6) ? 2 : 3,
+		   numPkts,
+		   gdma->DoneAmoEnable,
+		   gdma->DoneIntEnable,
+		   gdma->peerIO,
+		   gdma->amoHostDest,
+		   gdma->amoModType,
+		   gdma->intrHostDest, gdma->intrVector);
+
+	/* start engine */
+	cm_control.cm_control_reg = MBCS_MMR_GET(mmr_base, MBCS_CM_CONTROL);
+	cm_control.rd_dma_go = 1;
+	MBCS_MMR_SET(mmr_base, MBCS_CM_CONTROL, cm_control.cm_control_reg);
+
+	return 0;
+
 }
 
-static int kv_set_divider_value(struct amdgpu_device *adev,
-				u32 index, u32 sclk)
+static inline int mbcs_putdma_start(struct mbcs_soft *soft)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct atom_clock_dividers dividers;
-	int ret;
+	void *mmr_base;
+	struct putdma *pdma;
+	uint64_t numPkts;
+	union cm_control cm_control;
 
-	ret = amdgpu_atombios_get_clock_dividers(adev, COMPUTE_ENGINE_PLL_PARAM,
-						 sclk, false, &dividers);
-	if (ret)
-		return ret;
+	mmr_base = soft->mmr_base;
+	pdma = &soft->putdma;
 
-	pi->graphics_level[index].SclkDid = (u8)dividers.post_div;
-	pi->graphics_level[index].SclkFrequency = cpu_to_be32(sclk);
+	/* check that host address got setup */
+	if (!pdma->hostAddr)
+		return -1;
+
+	numPkts =
+	    (pdma->bytes + (MBCS_CACHELINE_SIZE - 1)) / MBCS_CACHELINE_SIZE;
+
+	/* program engine */
+	mbcs_putdma_set(mmr_base, tiocx_dma_addr(pdma->hostAddr),
+		   pdma->localAddr,
+		   (pdma->localAddr < MB2) ? 0 :
+		   (pdma->localAddr < MB4) ? 1 :
+		   (pdma->localAddr < MB6) ? 2 : 3,
+		   numPkts,
+		   pdma->DoneAmoEnable,
+		   pdma->DoneIntEnable,
+		   pdma->peerIO,
+		   pdma->amoHostDest,
+		   pdma->amoModType,
+		   pdma->intrHostDest, pdma->intrVector);
+
+	/* start engine */
+	cm_control.cm_control_reg = MBCS_MMR_GET(mmr_base, MBCS_CM_CONTROL);
+	cm_control.wr_dma_go = 1;
+	MBCS_MMR_SET(mmr_base, MBCS_CM_CONTROL, cm_control.cm_control_reg);
+
+	return 0;
+
+}
+
+static inline int mbcs_algo_start(struct mbcs_soft *soft)
+{
+	struct algoblock *algo_soft = &soft->algo;
+	void *mmr_base = soft->mmr_base;
+	union cm_control cm_control;
+
+	if (mutex_lock_interruptible(&soft->algolock))
+		return -ERESTARTSYS;
+
+	atomic_set(&soft->algo_done, 0);
+
+	mbcs_algo_set(mmr_base,
+		 algo_soft->amoHostDest,
+		 algo_soft->amoModType,
+		 algo_soft->intrHostDest,
+		 algo_soft->intrVector, algo_soft->algoStepCount);
+
+	/* start algorithm */
+	cm_control.cm_control_reg = MBCS_MMR_GET(mmr_base, MBCS_CM_CONTROL);
+	cm_control.alg_done_int_en = 1;
+	cm_control.alg_go = 1;
+	MBCS_MMR_SET(mmr_base, MBCS_CM_CONTROL, cm_control.cm_control_reg);
+
+	mutex_unlock(&soft->algolock);
 
 	return 0;
 }
 
-static u16 kv_convert_8bit_index_to_voltage(struct amdgpu_device *adev,
-					    u16 voltage)
+static inline ssize_t
+do_mbcs_sram_dmawrite(struct mbcs_soft *soft, uint64_t hostAddr,
+		      size_t len, loff_t * off)
 {
-	return 6200 - (voltage * 25);
-}
+	int rv = 0;
 
-static u16 kv_convert_2bit_index_to_voltage(struct amdgpu_device *adev,
-					    u32 vid_2bit)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 vid_8bit = kv_convert_vid2_to_vid7(adev,
-					       &pi->sys_info.vid_mapping_table,
-					       vid_2bit);
+	if (mutex_lock_interruptible(&soft->dmawritelock))
+		return -ERESTARTSYS;
 
-	return kv_convert_8bit_index_to_voltage(adev, (u16)vid_8bit);
-}
+	atomic_set(&soft->dmawrite_done, 0);
 
+	soft->putdma.hostAddr = hostAddr;
+	soft->putdma.localAddr = *off;
+	soft->putdma.bytes = len;
 
-static int kv_set_vid(struct amdgpu_device *adev, u32 index, u32 vid)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->graphics_level[index].VoltageDownH = (u8)pi->voltage_drop_t;
-	pi->graphics_level[index].MinVddNb =
-		cpu_to_be32(kv_convert_2bit_index_to_voltage(adev, vid));
-
-	return 0;
-}
-
-static int kv_set_at(struct amdgpu_device *adev, u32 index, u32 at)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->graphics_level[index].AT = cpu_to_be16((u16)at);
-
-	return 0;
-}
-
-static void kv_dpm_power_level_enable(struct amdgpu_device *adev,
-				      u32 index, bool enable)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->graphics_level[index].EnabledForActivity = enable ? 1 : 0;
-}
-
-static void kv_start_dpm(struct amdgpu_device *adev)
-{
-	u32 tmp = RREG32_SMC(ixGENERAL_PWRMGT);
-
-	tmp |= GENERAL_PWRMGT__GLOBAL_PWRMGT_EN_MASK;
-	WREG32_SMC(ixGENERAL_PWRMGT, tmp);
-
-	amdgpu_kv_smc_dpm_enable(adev, true);
-}
-
-static void kv_stop_dpm(struct amdgpu_device *adev)
-{
-	amdgpu_kv_smc_dpm_enable(adev, false);
-}
-
-static void kv_start_am(struct amdgpu_device *adev)
-{
-	u32 sclk_pwrmgt_cntl = RREG32_SMC(ixSCLK_PWRMGT_CNTL);
-
-	sclk_pwrmgt_cntl &= ~(SCLK_PWRMGT_CNTL__RESET_SCLK_CNT_MASK |
-			SCLK_PWRMGT_CNTL__RESET_BUSY_CNT_MASK);
-	sclk_pwrmgt_cntl |= SCLK_PWRMGT_CNTL__DYNAMIC_PM_EN_MASK;
-
-	WREG32_SMC(ixSCLK_PWRMGT_CNTL, sclk_pwrmgt_cntl);
-}
-
-static void kv_reset_am(struct amdgpu_device *adev)
-{
-	u32 sclk_pwrmgt_cntl = RREG32_SMC(ixSCLK_PWRMGT_CNTL);
-
-	sclk_pwrmgt_cntl |= (SCLK_PWRMGT_CNTL__RESET_SCLK_CNT_MASK |
-			SCLK_PWRMGT_CNTL__RESET_BUSY_CNT_MASK);
-
-	WREG32_SMC(ixSCLK_PWRMGT_CNTL, sclk_pwrmgt_cntl);
-}
-
-static int kv_freeze_sclk_dpm(struct amdgpu_device *adev, bool freeze)
-{
-	return amdgpu_kv_notify_message_to_smu(adev, freeze ?
-					PPSMC_MSG_SCLKDPM_FreezeLevel : PPSMC_MSG_SCLKDPM_UnfreezeLevel);
-}
-
-static int kv_force_lowest_valid(struct amdgpu_device *adev)
-{
-	return kv_force_dpm_lowest(adev);
-}
-
-static int kv_unforce_levels(struct amdgpu_device *adev)
-{
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS)
-		return amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_NoForcedLevel);
-	else
-		return kv_set_enabled_levels(adev);
-}
-
-static int kv_update_sclk_t(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 low_sclk_interrupt_t = 0;
-	int ret = 0;
-
-	if (pi->caps_sclk_throttle_low_notification) {
-		low_sclk_interrupt_t = cpu_to_be32(pi->low_sclk_interrupt_t);
-
-		ret = amdgpu_kv_copy_bytes_to_smc(adev,
-					   pi->dpm_table_start +
-					   offsetof(SMU7_Fusion_DpmTable, LowSclkInterruptT),
-					   (u8 *)&low_sclk_interrupt_t,
-					   sizeof(u32), pi->sram_end);
-	}
-	return ret;
-}
-
-static int kv_program_bootup_state(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i;
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vddc_dependency_on_sclk;
-
-	if (table && table->count) {
-		for (i = pi->graphics_dpm_level_count - 1; i > 0; i--) {
-			if (table->entries[i].clk == pi->boot_pl.sclk)
-				break;
-		}
-
-		pi->graphics_boot_level = (u8)i;
-		kv_dpm_power_level_enable(adev, i, true);
-	} else {
-		struct sumo_sclk_voltage_mapping_table *table =
-			&pi->sys_info.sclk_voltage_mapping_table;
-
-		if (table->num_max_dpm_entries == 0)
-			return -EINVAL;
-
-		for (i = pi->graphics_dpm_level_count - 1; i > 0; i--) {
-			if (table->entries[i].sclk_frequency == pi->boot_pl.sclk)
-				break;
-		}
-
-		pi->graphics_boot_level = (u8)i;
-		kv_dpm_power_level_enable(adev, i, true);
-	}
-	return 0;
-}
-
-static int kv_enable_auto_thermal_throttling(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-
-	pi->graphics_therm_throttle_enable = 1;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, GraphicsThermThrottleEnable),
-				   &pi->graphics_therm_throttle_enable,
-				   sizeof(u8), pi->sram_end);
-
-	return ret;
-}
-
-static int kv_upload_dpm_settings(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, GraphicsLevel),
-				   (u8 *)&pi->graphics_level,
-				   sizeof(SMU7_Fusion_GraphicsLevel) * SMU7_MAX_LEVELS_GRAPHICS,
-				   pi->sram_end);
-
-	if (ret)
-		return ret;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, GraphicsDpmLevelCount),
-				   &pi->graphics_dpm_level_count,
-				   sizeof(u8), pi->sram_end);
-
-	return ret;
-}
-
-static u32 kv_get_clock_difference(u32 a, u32 b)
-{
-	return (a >= b) ? a - b : b - a;
-}
-
-static u32 kv_get_clk_bypass(struct amdgpu_device *adev, u32 clk)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 value;
-
-	if (pi->caps_enable_dfs_bypass) {
-		if (kv_get_clock_difference(clk, 40000) < 200)
-			value = 3;
-		else if (kv_get_clock_difference(clk, 30000) < 200)
-			value = 2;
-		else if (kv_get_clock_difference(clk, 20000) < 200)
-			value = 7;
-		else if (kv_get_clock_difference(clk, 15000) < 200)
-			value = 6;
-		else if (kv_get_clock_difference(clk, 10000) < 200)
-			value = 8;
-		else
-			value = 0;
-	} else {
-		value = 0;
+	if (mbcs_putdma_start(soft) < 0) {
+		DBG(KERN_ALERT "do_mbcs_sram_dmawrite: "
+					"mbcs_putdma_start failed\n");
+		rv = -EAGAIN;
+		goto dmawrite_exit;
 	}
 
-	return value;
+	if (wait_event_interruptible(soft->dmawrite_queue,
+					atomic_read(&soft->dmawrite_done))) {
+		rv = -ERESTARTSYS;
+		goto dmawrite_exit;
+	}
+
+	rv = len;
+	*off += len;
+
+dmawrite_exit:
+	mutex_unlock(&soft->dmawritelock);
+
+	return rv;
 }
 
-static int kv_populate_uvd_table(struct amdgpu_device *adev)
+static inline ssize_t
+do_mbcs_sram_dmaread(struct mbcs_soft *soft, uint64_t hostAddr,
+		     size_t len, loff_t * off)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_uvd_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.uvd_clock_voltage_dependency_table;
-	struct atom_clock_dividers dividers;
-	int ret;
-	u32 i;
+	int rv = 0;
 
-	if (table == NULL || table->count == 0)
-		return 0;
+	if (mutex_lock_interruptible(&soft->dmareadlock))
+		return -ERESTARTSYS;
 
-	pi->uvd_level_count = 0;
-	for (i = 0; i < table->count; i++) {
-		if (pi->high_voltage_t &&
-		    (pi->high_voltage_t < table->entries[i].v))
-			break;
+	atomic_set(&soft->dmawrite_done, 0);
 
-		pi->uvd_level[i].VclkFrequency = cpu_to_be32(table->entries[i].vclk);
-		pi->uvd_level[i].DclkFrequency = cpu_to_be32(table->entries[i].dclk);
-		pi->uvd_level[i].MinVddNb = cpu_to_be16(table->entries[i].v);
+	soft->getdma.hostAddr = hostAddr;
+	soft->getdma.localAddr = *off;
+	soft->getdma.bytes = len;
 
-		pi->uvd_level[i].VClkBypassCntl =
-			(u8)kv_get_clk_bypass(adev, table->entries[i].vclk);
-		pi->uvd_level[i].DClkBypassCntl =
-			(u8)kv_get_clk_bypass(adev, table->entries[i].dclk);
-
-		ret = amdgpu_atombios_get_clock_dividers(adev, COMPUTE_ENGINE_PLL_PARAM,
-							 table->entries[i].vclk, false, &dividers);
-		if (ret)
-			return ret;
-		pi->uvd_level[i].VclkDivider = (u8)dividers.post_div;
-
-		ret = amdgpu_atombios_get_clock_dividers(adev, COMPUTE_ENGINE_PLL_PARAM,
-							 table->entries[i].dclk, false, &dividers);
-		if (ret)
-			return ret;
-		pi->uvd_level[i].DclkDivider = (u8)dividers.post_div;
-
-		pi->uvd_level_count++;
+	if (mbcs_getdma_start(soft) < 0) {
+		DBG(KERN_ALERT "mbcs_strategy: mbcs_getdma_start failed\n");
+		rv = -EAGAIN;
+		goto dmaread_exit;
 	}
 
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, UvdLevelCount),
-				   (u8 *)&pi->uvd_level_count,
-				   sizeof(u8), pi->sram_end);
-	if (ret)
-		return ret;
+	if (wait_event_interruptible(soft->dmaread_queue,
+					atomic_read(&soft->dmaread_done))) {
+		rv = -ERESTARTSYS;
+		goto dmaread_exit;
+	}
 
-	pi->uvd_interval = 1;
+	rv = len;
+	*off += len;
 
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, UVDInterval),
-				   &pi->uvd_interval,
-				   sizeof(u8), pi->sram_end);
-	if (ret)
-		return ret;
+dmaread_exit:
+	mutex_unlock(&soft->dmareadlock);
 
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, UvdLevel),
-				   (u8 *)&pi->uvd_level,
-				   sizeof(SMU7_Fusion_UvdLevel) * SMU7_MAX_LEVELS_UVD,
-				   pi->sram_end);
-
-	return ret;
-
+	return rv;
 }
 
-static int kv_populate_vce_table(struct amdgpu_device *adev)
+static int mbcs_open(struct inode *ip, struct file *fp)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-	u32 i;
-	struct amdgpu_vce_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vce_clock_voltage_dependency_table;
-	struct atom_clock_dividers dividers;
-
-	if (table == NULL || table->count == 0)
-		return 0;
-
-	pi->vce_level_count = 0;
-	for (i = 0; i < table->count; i++) {
-		if (pi->high_voltage_t &&
-		    pi->high_voltage_t < table->entries[i].v)
-			break;
-
-		pi->vce_level[i].Frequency = cpu_to_be32(table->entries[i].evclk);
-		pi->vce_level[i].MinVoltage = cpu_to_be16(table->entries[i].v);
-
-		pi->vce_level[i].ClkBypassCntl =
-			(u8)kv_get_clk_bypass(adev, table->entries[i].evclk);
-
-		ret = amdgpu_atombios_get_clock_dividers(adev, COMPUTE_ENGINE_PLL_PARAM,
-							 table->entries[i].evclk, false, &dividers);
-		if (ret)
-			return ret;
-		pi->vce_level[i].Divider = (u8)dividers.post_div;
-
-		pi->vce_level_count++;
-	}
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, VceLevelCount),
-				   (u8 *)&pi->vce_level_count,
-				   sizeof(u8),
-				   pi->sram_end);
-	if (ret)
-		return ret;
-
-	pi->vce_interval = 1;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, VCEInterval),
-				   (u8 *)&pi->vce_interval,
-				   sizeof(u8),
-				   pi->sram_end);
-	if (ret)
-		return ret;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, VceLevel),
-				   (u8 *)&pi->vce_level,
-				   sizeof(SMU7_Fusion_ExtClkLevel) * SMU7_MAX_LEVELS_VCE,
-				   pi->sram_end);
-
-	return ret;
-}
-
-static int kv_populate_samu_table(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.samu_clock_voltage_dependency_table;
-	struct atom_clock_dividers dividers;
-	int ret;
-	u32 i;
-
-	if (table == NULL || table->count == 0)
-		return 0;
-
-	pi->samu_level_count = 0;
-	for (i = 0; i < table->count; i++) {
-		if (pi->high_voltage_t &&
-		    pi->high_voltage_t < table->entries[i].v)
-			break;
-
-		pi->samu_level[i].Frequency = cpu_to_be32(table->entries[i].clk);
-		pi->samu_level[i].MinVoltage = cpu_to_be16(table->entries[i].v);
-
-		pi->samu_level[i].ClkBypassCntl =
-			(u8)kv_get_clk_bypass(adev, table->entries[i].clk);
-
-		ret = amdgpu_atombios_get_clock_dividers(adev, COMPUTE_ENGINE_PLL_PARAM,
-							 table->entries[i].clk, false, &dividers);
-		if (ret)
-			return ret;
-		pi->samu_level[i].Divider = (u8)dividers.post_div;
-
-		pi->samu_level_count++;
-	}
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, SamuLevelCount),
-				   (u8 *)&pi->samu_level_count,
-				   sizeof(u8),
-				   pi->sram_end);
-	if (ret)
-		return ret;
-
-	pi->samu_interval = 1;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, SAMUInterval),
-				   (u8 *)&pi->samu_interval,
-				   sizeof(u8),
-				   pi->sram_end);
-	if (ret)
-		return ret;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, SamuLevel),
-				   (u8 *)&pi->samu_level,
-				   sizeof(SMU7_Fusion_ExtClkLevel) * SMU7_MAX_LEVELS_SAMU,
-				   pi->sram_end);
-	if (ret)
-		return ret;
-
-	return ret;
-}
-
-
-static int kv_populate_acp_table(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.acp_clock_voltage_dependency_table;
-	struct atom_clock_dividers dividers;
-	int ret;
-	u32 i;
-
-	if (table == NULL || table->count == 0)
-		return 0;
-
-	pi->acp_level_count = 0;
-	for (i = 0; i < table->count; i++) {
-		pi->acp_level[i].Frequency = cpu_to_be32(table->entries[i].clk);
-		pi->acp_level[i].MinVoltage = cpu_to_be16(table->entries[i].v);
-
-		ret = amdgpu_atombios_get_clock_dividers(adev, COMPUTE_ENGINE_PLL_PARAM,
-							 table->entries[i].clk, false, &dividers);
-		if (ret)
-			return ret;
-		pi->acp_level[i].Divider = (u8)dividers.post_div;
-
-		pi->acp_level_count++;
-	}
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, AcpLevelCount),
-				   (u8 *)&pi->acp_level_count,
-				   sizeof(u8),
-				   pi->sram_end);
-	if (ret)
-		return ret;
-
-	pi->acp_interval = 1;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, ACPInterval),
-				   (u8 *)&pi->acp_interval,
-				   sizeof(u8),
-				   pi->sram_end);
-	if (ret)
-		return ret;
-
-	ret = amdgpu_kv_copy_bytes_to_smc(adev,
-				   pi->dpm_table_start +
-				   offsetof(SMU7_Fusion_DpmTable, AcpLevel),
-				   (u8 *)&pi->acp_level,
-				   sizeof(SMU7_Fusion_ExtClkLevel) * SMU7_MAX_LEVELS_ACP,
-				   pi->sram_end);
-	if (ret)
-		return ret;
-
-	return ret;
-}
-
-static void kv_calculate_dfs_bypass_settings(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i;
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vddc_dependency_on_sclk;
-
-	if (table && table->count) {
-		for (i = 0; i < pi->graphics_dpm_level_count; i++) {
-			if (pi->caps_enable_dfs_bypass) {
-				if (kv_get_clock_difference(table->entries[i].clk, 40000) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 3;
-				else if (kv_get_clock_difference(table->entries[i].clk, 30000) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 2;
-				else if (kv_get_clock_difference(table->entries[i].clk, 26600) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 7;
-				else if (kv_get_clock_difference(table->entries[i].clk , 20000) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 6;
-				else if (kv_get_clock_difference(table->entries[i].clk , 10000) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 8;
-				else
-					pi->graphics_level[i].ClkBypassCntl = 0;
-			} else {
-				pi->graphics_level[i].ClkBypassCntl = 0;
-			}
-		}
-	} else {
-		struct sumo_sclk_voltage_mapping_table *table =
-			&pi->sys_info.sclk_voltage_mapping_table;
-		for (i = 0; i < pi->graphics_dpm_level_count; i++) {
-			if (pi->caps_enable_dfs_bypass) {
-				if (kv_get_clock_difference(table->entries[i].sclk_frequency, 40000) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 3;
-				else if (kv_get_clock_difference(table->entries[i].sclk_frequency, 30000) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 2;
-				else if (kv_get_clock_difference(table->entries[i].sclk_frequency, 26600) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 7;
-				else if (kv_get_clock_difference(table->entries[i].sclk_frequency, 20000) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 6;
-				else if (kv_get_clock_difference(table->entries[i].sclk_frequency, 10000) < 200)
-					pi->graphics_level[i].ClkBypassCntl = 8;
-				else
-					pi->graphics_level[i].ClkBypassCntl = 0;
-			} else {
-				pi->graphics_level[i].ClkBypassCntl = 0;
-			}
-		}
-	}
-}
-
-static int kv_enable_ulv(struct amdgpu_device *adev, bool enable)
-{
-	return amdgpu_kv_notify_message_to_smu(adev, enable ?
-					PPSMC_MSG_EnableULV : PPSMC_MSG_DisableULV);
-}
-
-static void kv_reset_acp_boot_level(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->acp_boot_level = 0xff;
-}
-
-static void kv_update_current_ps(struct amdgpu_device *adev,
-				 struct amdgpu_ps *rps)
-{
-	struct kv_ps *new_ps = kv_get_ps(rps);
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->current_rps = *rps;
-	pi->current_ps = *new_ps;
-	pi->current_rps.ps_priv = &pi->current_ps;
-}
-
-static void kv_update_requested_ps(struct amdgpu_device *adev,
-				   struct amdgpu_ps *rps)
-{
-	struct kv_ps *new_ps = kv_get_ps(rps);
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->requested_rps = *rps;
-	pi->requested_ps = *new_ps;
-	pi->requested_rps.ps_priv = &pi->requested_ps;
-}
-
-static void kv_dpm_enable_bapm(struct amdgpu_device *adev, bool enable)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-
-	if (pi->bapm_enable) {
-		ret = amdgpu_kv_smc_bapm_enable(adev, enable);
-		if (ret)
-			DRM_ERROR("amdgpu_kv_smc_bapm_enable failed\n");
-	}
-}
-
-static int kv_dpm_enable(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-
-	ret = kv_process_firmware_header(adev);
-	if (ret) {
-		DRM_ERROR("kv_process_firmware_header failed\n");
-		return ret;
-	}
-	kv_init_fps_limits(adev);
-	kv_init_graphics_levels(adev);
-	ret = kv_program_bootup_state(adev);
-	if (ret) {
-		DRM_ERROR("kv_program_bootup_state failed\n");
-		return ret;
-	}
-	kv_calculate_dfs_bypass_settings(adev);
-	ret = kv_upload_dpm_settings(adev);
-	if (ret) {
-		DRM_ERROR("kv_upload_dpm_settings failed\n");
-		return ret;
-	}
-	ret = kv_populate_uvd_table(adev);
-	if (ret) {
-		DRM_ERROR("kv_populate_uvd_table failed\n");
-		return ret;
-	}
-	ret = kv_populate_vce_table(adev);
-	if (ret) {
-		DRM_ERROR("kv_populate_vce_table failed\n");
-		return ret;
-	}
-	ret = kv_populate_samu_table(adev);
-	if (ret) {
-		DRM_ERROR("kv_populate_samu_table failed\n");
-		return ret;
-	}
-	ret = kv_populate_acp_table(adev);
-	if (ret) {
-		DRM_ERROR("kv_populate_acp_table failed\n");
-		return ret;
-	}
-	kv_program_vc(adev);
-#if 0
-	kv_initialize_hardware_cac_manager(adev);
-#endif
-	kv_start_am(adev);
-	if (pi->enable_auto_thermal_throttling) {
-		ret = kv_enable_auto_thermal_throttling(adev);
-		if (ret) {
-			DRM_ERROR("kv_enable_auto_thermal_throttling failed\n");
-			return ret;
-		}
-	}
-	ret = kv_enable_dpm_voltage_scaling(adev);
-	if (ret) {
-		DRM_ERROR("kv_enable_dpm_voltage_scaling failed\n");
-		return ret;
-	}
-	ret = kv_set_dpm_interval(adev);
-	if (ret) {
-		DRM_ERROR("kv_set_dpm_interval failed\n");
-		return ret;
-	}
-	ret = kv_set_dpm_boot_state(adev);
-	if (ret) {
-		DRM_ERROR("kv_set_dpm_boot_state failed\n");
-		return ret;
-	}
-	ret = kv_enable_ulv(adev, true);
-	if (ret) {
-		DRM_ERROR("kv_enable_ulv failed\n");
-		return ret;
-	}
-	kv_start_dpm(adev);
-	ret = kv_enable_didt(adev, true);
-	if (ret) {
-		DRM_ERROR("kv_enable_didt failed\n");
-		return ret;
-	}
-	ret = kv_enable_smc_cac(adev, true);
-	if (ret) {
-		DRM_ERROR("kv_enable_smc_cac failed\n");
-		return ret;
-	}
-
-	kv_reset_acp_boot_level(adev);
-
-	ret = amdgpu_kv_smc_bapm_enable(adev, false);
-	if (ret) {
-		DRM_ERROR("amdgpu_kv_smc_bapm_enable failed\n");
-		return ret;
-	}
-
-	kv_update_current_ps(adev, adev->pm.dpm.boot_ps);
-
-	if (adev->irq.installed &&
-	    amdgpu_is_internal_thermal_sensor(adev->pm.int_thermal_type)) {
-		ret = kv_set_thermal_temperature_range(adev, KV_TEMP_RANGE_MIN, KV_TEMP_RANGE_MAX);
-		if (ret) {
-			DRM_ERROR("kv_set_thermal_temperature_range failed\n");
-			return ret;
-		}
-		amdgpu_irq_get(adev, &adev->pm.dpm.thermal.irq,
-			       AMDGPU_THERMAL_IRQ_LOW_TO_HIGH);
-		amdgpu_irq_get(adev, &adev->pm.dpm.thermal.irq,
-			       AMDGPU_THERMAL_IRQ_HIGH_TO_LOW);
-	}
-
-	return ret;
-}
-
-static void kv_dpm_disable(struct amdgpu_device *adev)
-{
-	amdgpu_irq_put(adev, &adev->pm.dpm.thermal.irq,
-		       AMDGPU_THERMAL_IRQ_LOW_TO_HIGH);
-	amdgpu_irq_put(adev, &adev->pm.dpm.thermal.irq,
-		       AMDGPU_THERMAL_IRQ_HIGH_TO_LOW);
-
-	amdgpu_kv_smc_bapm_enable(adev, false);
-
-	if (adev->asic_type == CHIP_MULLINS)
-		kv_enable_nb_dpm(adev, false);
-
-	/* powerup blocks */
-	kv_dpm_powergate_acp(adev, false);
-	kv_dpm_powergate_samu(adev, false);
-	kv_dpm_powergate_vce(adev, false);
-	kv_dpm_powergate_uvd(adev, false);
-
-	kv_enable_smc_cac(adev, false);
-	kv_enable_didt(adev, false);
-	kv_clear_vc(adev);
-	kv_stop_dpm(adev);
-	kv_enable_ulv(adev, false);
-	kv_reset_am(adev);
-
-	kv_update_current_ps(adev, adev->pm.dpm.boot_ps);
-}
-
-#if 0
-static int kv_write_smc_soft_register(struct amdgpu_device *adev,
-				      u16 reg_offset, u32 value)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	return amdgpu_kv_copy_bytes_to_smc(adev, pi->soft_regs_start + reg_offset,
-				    (u8 *)&value, sizeof(u16), pi->sram_end);
-}
-
-static int kv_read_smc_soft_register(struct amdgpu_device *adev,
-				     u16 reg_offset, u32 *value)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	return amdgpu_kv_read_smc_sram_dword(adev, pi->soft_regs_start + reg_offset,
-				      value, pi->sram_end);
-}
-#endif
-
-static void kv_init_sclk_t(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->low_sclk_interrupt_t = 0;
-}
-
-static int kv_init_fps_limits(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret = 0;
-
-	if (pi->caps_fps) {
-		u16 tmp;
-
-		tmp = 45;
-		pi->fps_high_t = cpu_to_be16(tmp);
-		ret = amdgpu_kv_copy_bytes_to_smc(adev,
-					   pi->dpm_table_start +
-					   offsetof(SMU7_Fusion_DpmTable, FpsHighT),
-					   (u8 *)&pi->fps_high_t,
-					   sizeof(u16), pi->sram_end);
-
-		tmp = 30;
-		pi->fps_low_t = cpu_to_be16(tmp);
-
-		ret = amdgpu_kv_copy_bytes_to_smc(adev,
-					   pi->dpm_table_start +
-					   offsetof(SMU7_Fusion_DpmTable, FpsLowT),
-					   (u8 *)&pi->fps_low_t,
-					   sizeof(u16), pi->sram_end);
-
-	}
-	return ret;
-}
-
-static void kv_init_powergate_state(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->uvd_power_gated = false;
-	pi->vce_power_gated = false;
-	pi->samu_power_gated = false;
-	pi->acp_power_gated = false;
-
-}
-
-static int kv_enable_uvd_dpm(struct amdgpu_device *adev, bool enable)
-{
-	return amdgpu_kv_notify_message_to_smu(adev, enable ?
-					PPSMC_MSG_UVDDPM_Enable : PPSMC_MSG_UVDDPM_Disable);
-}
-
-static int kv_enable_vce_dpm(struct amdgpu_device *adev, bool enable)
-{
-	return amdgpu_kv_notify_message_to_smu(adev, enable ?
-					PPSMC_MSG_VCEDPM_Enable : PPSMC_MSG_VCEDPM_Disable);
-}
-
-static int kv_enable_samu_dpm(struct amdgpu_device *adev, bool enable)
-{
-	return amdgpu_kv_notify_message_to_smu(adev, enable ?
-					PPSMC_MSG_SAMUDPM_Enable : PPSMC_MSG_SAMUDPM_Disable);
-}
-
-static int kv_enable_acp_dpm(struct amdgpu_device *adev, bool enable)
-{
-	return amdgpu_kv_notify_message_to_smu(adev, enable ?
-					PPSMC_MSG_ACPDPM_Enable : PPSMC_MSG_ACPDPM_Disable);
-}
-
-static int kv_update_uvd_dpm(struct amdgpu_device *adev, bool gate)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_uvd_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.uvd_clock_voltage_dependency_table;
-	int ret;
-	u32 mask;
-
-	if (!gate) {
-		if (table->count)
-			pi->uvd_boot_level = table->count - 1;
-		else
-			pi->uvd_boot_level = 0;
-
-		if (!pi->caps_uvd_dpm || pi->caps_stable_p_state) {
-			mask = 1 << pi->uvd_boot_level;
-		} else {
-			mask = 0x1f;
-		}
-
-		ret = amdgpu_kv_copy_bytes_to_smc(adev,
-					   pi->dpm_table_start +
-					   offsetof(SMU7_Fusion_DpmTable, UvdBootLevel),
-					   (uint8_t *)&pi->uvd_boot_level,
-					   sizeof(u8), pi->sram_end);
-		if (ret)
-			return ret;
-
-		amdgpu_kv_send_msg_to_smc_with_parameter(adev,
-						  PPSMC_MSG_UVDDPM_SetEnabledMask,
-						  mask);
-	}
-
-	return kv_enable_uvd_dpm(adev, !gate);
-}
-
-static u8 kv_get_vce_boot_level(struct amdgpu_device *adev, u32 evclk)
-{
-	u8 i;
-	struct amdgpu_vce_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vce_clock_voltage_dependency_table;
-
-	for (i = 0; i < table->count; i++) {
-		if (table->entries[i].evclk >= evclk)
-			break;
-	}
-
-	return i;
-}
-
-static int kv_update_vce_dpm(struct amdgpu_device *adev,
-			     struct amdgpu_ps *amdgpu_new_state,
-			     struct amdgpu_ps *amdgpu_current_state)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_vce_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vce_clock_voltage_dependency_table;
-	int ret;
-
-	if (amdgpu_new_state->evclk > 0 && amdgpu_current_state->evclk == 0) {
-		kv_dpm_powergate_vce(adev, false);
-		/* turn the clocks on when encoding */
-		ret = amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-						    AMD_CG_STATE_UNGATE);
-		if (ret)
-			return ret;
-		if (pi->caps_stable_p_state)
-			pi->vce_boot_level = table->count - 1;
-		else
-			pi->vce_boot_level = kv_get_vce_boot_level(adev, amdgpu_new_state->evclk);
-
-		ret = amdgpu_kv_copy_bytes_to_smc(adev,
-					   pi->dpm_table_start +
-					   offsetof(SMU7_Fusion_DpmTable, VceBootLevel),
-					   (u8 *)&pi->vce_boot_level,
-					   sizeof(u8),
-					   pi->sram_end);
-		if (ret)
-			return ret;
-
-		if (pi->caps_stable_p_state)
-			amdgpu_kv_send_msg_to_smc_with_parameter(adev,
-							  PPSMC_MSG_VCEDPM_SetEnabledMask,
-							  (1 << pi->vce_boot_level));
-
-		kv_enable_vce_dpm(adev, true);
-	} else if (amdgpu_new_state->evclk == 0 && amdgpu_current_state->evclk > 0) {
-		kv_enable_vce_dpm(adev, false);
-		/* turn the clocks off when not encoding */
-		ret = amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-						    AMD_CG_STATE_GATE);
-		if (ret)
-			return ret;
-		kv_dpm_powergate_vce(adev, true);
-	}
-
-	return 0;
-}
-
-static int kv_update_samu_dpm(struct amdgpu_device *adev, bool gate)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.samu_clock_voltage_dependency_table;
-	int ret;
-
-	if (!gate) {
-		if (pi->caps_stable_p_state)
-			pi->samu_boot_level = table->count - 1;
-		else
-			pi->samu_boot_level = 0;
-
-		ret = amdgpu_kv_copy_bytes_to_smc(adev,
-					   pi->dpm_table_start +
-					   offsetof(SMU7_Fusion_DpmTable, SamuBootLevel),
-					   (u8 *)&pi->samu_boot_level,
-					   sizeof(u8),
-					   pi->sram_end);
-		if (ret)
-			return ret;
-
-		if (pi->caps_stable_p_state)
-			amdgpu_kv_send_msg_to_smc_with_parameter(adev,
-							  PPSMC_MSG_SAMUDPM_SetEnabledMask,
-							  (1 << pi->samu_boot_level));
-	}
-
-	return kv_enable_samu_dpm(adev, !gate);
-}
-
-static u8 kv_get_acp_boot_level(struct amdgpu_device *adev)
-{
-	return 0;
-}
-
-static void kv_update_acp_boot_level(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u8 acp_boot_level;
-
-	if (!pi->caps_stable_p_state) {
-		acp_boot_level = kv_get_acp_boot_level(adev);
-		if (acp_boot_level != pi->acp_boot_level) {
-			pi->acp_boot_level = acp_boot_level;
-			amdgpu_kv_send_msg_to_smc_with_parameter(adev,
-							  PPSMC_MSG_ACPDPM_SetEnabledMask,
-							  (1 << pi->acp_boot_level));
-		}
-	}
-}
-
-static int kv_update_acp_dpm(struct amdgpu_device *adev, bool gate)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.acp_clock_voltage_dependency_table;
-	int ret;
-
-	if (!gate) {
-		if (pi->caps_stable_p_state)
-			pi->acp_boot_level = table->count - 1;
-		else
-			pi->acp_boot_level = kv_get_acp_boot_level(adev);
-
-		ret = amdgpu_kv_copy_bytes_to_smc(adev,
-					   pi->dpm_table_start +
-					   offsetof(SMU7_Fusion_DpmTable, AcpBootLevel),
-					   (u8 *)&pi->acp_boot_level,
-					   sizeof(u8),
-					   pi->sram_end);
-		if (ret)
-			return ret;
-
-		if (pi->caps_stable_p_state)
-			amdgpu_kv_send_msg_to_smc_with_parameter(adev,
-							  PPSMC_MSG_ACPDPM_SetEnabledMask,
-							  (1 << pi->acp_boot_level));
-	}
-
-	return kv_enable_acp_dpm(adev, !gate);
-}
-
-static void kv_dpm_powergate_uvd(struct amdgpu_device *adev, bool gate)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-
-	if (pi->uvd_power_gated == gate)
-		return;
-
-	pi->uvd_power_gated = gate;
-
-	if (gate) {
-		if (pi->caps_uvd_pg) {
-			/* disable clockgating so we can properly shut down the block */
-			ret = amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_UVD,
-							    AMD_CG_STATE_UNGATE);
-			/* shutdown the UVD block */
-			ret = amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_UVD,
-							    AMD_PG_STATE_GATE);
-			/* XXX: check for errors */
-		}
-		kv_update_uvd_dpm(adev, gate);
-		if (pi->caps_uvd_pg)
-			/* power off the UVD block */
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_UVDPowerOFF);
-	} else {
-		if (pi->caps_uvd_pg) {
-			/* power on the UVD block */
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_UVDPowerON);
-			/* re-init the UVD block */
-			ret = amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_UVD,
-							    AMD_PG_STATE_UNGATE);
-			/* enable clockgating. hw will dynamically gate/ungate clocks on the fly */
-			ret = amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_UVD,
-							    AMD_CG_STATE_GATE);
-			/* XXX: check for errors */
-		}
-		kv_update_uvd_dpm(adev, gate);
-	}
-}
-
-static void kv_dpm_powergate_vce(struct amdgpu_device *adev, bool gate)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret;
-
-	if (pi->vce_power_gated == gate)
-		return;
-
-	pi->vce_power_gated = gate;
-
-	if (gate) {
-		if (pi->caps_vce_pg) {
-			/* shutdown the VCE block */
-			ret = amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-							    AMD_PG_STATE_GATE);
-			/* XXX: check for errors */
-			/* power off the VCE block */
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_VCEPowerOFF);
-		}
-	} else {
-		if (pi->caps_vce_pg) {
-			/* power on the VCE block */
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_VCEPowerON);
-			/* re-init the VCE block */
-			ret = amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-							    AMD_PG_STATE_UNGATE);
-			/* XXX: check for errors */
-		}
-	}
-}
-
-static void kv_dpm_powergate_samu(struct amdgpu_device *adev, bool gate)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	if (pi->samu_power_gated == gate)
-		return;
-
-	pi->samu_power_gated = gate;
-
-	if (gate) {
-		kv_update_samu_dpm(adev, true);
-		if (pi->caps_samu_pg)
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_SAMPowerOFF);
-	} else {
-		if (pi->caps_samu_pg)
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_SAMPowerON);
-		kv_update_samu_dpm(adev, false);
-	}
-}
-
-static void kv_dpm_powergate_acp(struct amdgpu_device *adev, bool gate)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	if (pi->acp_power_gated == gate)
-		return;
-
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS)
-		return;
-
-	pi->acp_power_gated = gate;
-
-	if (gate) {
-		kv_update_acp_dpm(adev, true);
-		if (pi->caps_acp_pg)
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_ACPPowerOFF);
-	} else {
-		if (pi->caps_acp_pg)
-			amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_ACPPowerON);
-		kv_update_acp_dpm(adev, false);
-	}
-}
-
-static void kv_set_valid_clock_range(struct amdgpu_device *adev,
-				     struct amdgpu_ps *new_rps)
-{
-	struct kv_ps *new_ps = kv_get_ps(new_rps);
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i;
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vddc_dependency_on_sclk;
-
-	if (table && table->count) {
-		for (i = 0; i < pi->graphics_dpm_level_count; i++) {
-			if ((table->entries[i].clk >= new_ps->levels[0].sclk) ||
-			    (i == (pi->graphics_dpm_level_count - 1))) {
-				pi->lowest_valid = i;
-				break;
-			}
-		}
-
-		for (i = pi->graphics_dpm_level_count - 1; i > 0; i--) {
-			if (table->entries[i].clk <= new_ps->levels[new_ps->num_levels - 1].sclk)
-				break;
-		}
-		pi->highest_valid = i;
-
-		if (pi->lowest_valid > pi->highest_valid) {
-			if ((new_ps->levels[0].sclk - table->entries[pi->highest_valid].clk) >
-			    (table->entries[pi->lowest_valid].clk - new_ps->levels[new_ps->num_levels - 1].sclk))
-				pi->highest_valid = pi->lowest_valid;
-			else
-				pi->lowest_valid =  pi->highest_valid;
-		}
-	} else {
-		struct sumo_sclk_voltage_mapping_table *table =
-			&pi->sys_info.sclk_voltage_mapping_table;
-
-		for (i = 0; i < (int)pi->graphics_dpm_level_count; i++) {
-			if (table->entries[i].sclk_frequency >= new_ps->levels[0].sclk ||
-			    i == (int)(pi->graphics_dpm_level_count - 1)) {
-				pi->lowest_valid = i;
-				break;
-			}
-		}
-
-		for (i = pi->graphics_dpm_level_count - 1; i > 0; i--) {
-			if (table->entries[i].sclk_frequency <=
-			    new_ps->levels[new_ps->num_levels - 1].sclk)
-				break;
-		}
-		pi->highest_valid = i;
-
-		if (pi->lowest_valid > pi->highest_valid) {
-			if ((new_ps->levels[0].sclk -
-			     table->entries[pi->highest_valid].sclk_frequency) >
-			    (table->entries[pi->lowest_valid].sclk_frequency -
-			     new_ps->levels[new_ps->num_levels -1].sclk))
-				pi->highest_valid = pi->lowest_valid;
-			else
-				pi->lowest_valid =  pi->highest_valid;
-		}
-	}
-}
-
-static int kv_update_dfs_bypass_settings(struct amdgpu_device *adev,
-					 struct amdgpu_ps *new_rps)
-{
-	struct kv_ps *new_ps = kv_get_ps(new_rps);
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret = 0;
-	u8 clk_bypass_cntl;
-
-	if (pi->caps_enable_dfs_bypass) {
-		clk_bypass_cntl = new_ps->need_dfs_bypass ?
-			pi->graphics_level[pi->graphics_boot_level].ClkBypassCntl : 0;
-		ret = amdgpu_kv_copy_bytes_to_smc(adev,
-					   (pi->dpm_table_start +
-					    offsetof(SMU7_Fusion_DpmTable, GraphicsLevel) +
-					    (pi->graphics_boot_level * sizeof(SMU7_Fusion_GraphicsLevel)) +
-					    offsetof(SMU7_Fusion_GraphicsLevel, ClkBypassCntl)),
-					   &clk_bypass_cntl,
-					   sizeof(u8), pi->sram_end);
-	}
-
-	return ret;
-}
-
-static int kv_enable_nb_dpm(struct amdgpu_device *adev,
-			    bool enable)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	int ret = 0;
-
-	if (enable) {
-		if (pi->enable_nb_dpm && !pi->nb_dpm_enabled) {
-			ret = amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_NBDPM_Enable);
-			if (ret == 0)
-				pi->nb_dpm_enabled = true;
-		}
-	} else {
-		if (pi->enable_nb_dpm && pi->nb_dpm_enabled) {
-			ret = amdgpu_kv_notify_message_to_smu(adev, PPSMC_MSG_NBDPM_Disable);
-			if (ret == 0)
-				pi->nb_dpm_enabled = false;
-		}
-	}
-
-	return ret;
-}
-
-static int kv_dpm_force_performance_level(struct amdgpu_device *adev,
-					  enum amdgpu_dpm_forced_level level)
-{
-	int ret;
-
-	if (level == AMDGPU_DPM_FORCED_LEVEL_HIGH) {
-		ret = kv_force_dpm_highest(adev);
-		if (ret)
-			return ret;
-	} else if (level == AMDGPU_DPM_FORCED_LEVEL_LOW) {
-		ret = kv_force_dpm_lowest(adev);
-		if (ret)
-			return ret;
-	} else if (level == AMDGPU_DPM_FORCED_LEVEL_AUTO) {
-		ret = kv_unforce_levels(adev);
-		if (ret)
-			return ret;
-	}
-
-	adev->pm.dpm.forced_level = level;
-
-	return 0;
-}
-
-static int kv_dpm_pre_set_power_state(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_ps requested_ps = *adev->pm.dpm.requested_ps;
-	struct amdgpu_ps *new_ps = &requested_ps;
-
-	kv_update_requested_ps(adev, new_ps);
-
-	kv_apply_state_adjust_rules(adev,
-				    &pi->requested_rps,
-				    &pi->current_rps);
-
-	return 0;
-}
-
-static int kv_dpm_set_power_state(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_ps *new_ps = &pi->requested_rps;
-	struct amdgpu_ps *old_ps = &pi->current_rps;
-	int ret;
-
-	if (pi->bapm_enable) {
-		ret = amdgpu_kv_smc_bapm_enable(adev, adev->pm.dpm.ac_power);
-		if (ret) {
-			DRM_ERROR("amdgpu_kv_smc_bapm_enable failed\n");
-			return ret;
-		}
-	}
-
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS) {
-		if (pi->enable_dpm) {
-			kv_set_valid_clock_range(adev, new_ps);
-			kv_update_dfs_bypass_settings(adev, new_ps);
-			ret = kv_calculate_ds_divider(adev);
-			if (ret) {
-				DRM_ERROR("kv_calculate_ds_divider failed\n");
-				return ret;
-			}
-			kv_calculate_nbps_level_settings(adev);
-			kv_calculate_dpm_settings(adev);
-			kv_force_lowest_valid(adev);
-			kv_enable_new_levels(adev);
-			kv_upload_dpm_settings(adev);
-			kv_program_nbps_index_settings(adev, new_ps);
-			kv_unforce_levels(adev);
-			kv_set_enabled_levels(adev);
-			kv_force_lowest_valid(adev);
-			kv_unforce_levels(adev);
-
-			ret = kv_update_vce_dpm(adev, new_ps, old_ps);
-			if (ret) {
-				DRM_ERROR("kv_update_vce_dpm failed\n");
-				return ret;
-			}
-			kv_update_sclk_t(adev);
-			if (adev->asic_type == CHIP_MULLINS)
-				kv_enable_nb_dpm(adev, true);
-		}
-	} else {
-		if (pi->enable_dpm) {
-			kv_set_valid_clock_range(adev, new_ps);
-			kv_update_dfs_bypass_settings(adev, new_ps);
-			ret = kv_calculate_ds_divider(adev);
-			if (ret) {
-				DRM_ERROR("kv_calculate_ds_divider failed\n");
-				return ret;
-			}
-			kv_calculate_nbps_level_settings(adev);
-			kv_calculate_dpm_settings(adev);
-			kv_freeze_sclk_dpm(adev, true);
-			kv_upload_dpm_settings(adev);
-			kv_program_nbps_index_settings(adev, new_ps);
-			kv_freeze_sclk_dpm(adev, false);
-			kv_set_enabled_levels(adev);
-			ret = kv_update_vce_dpm(adev, new_ps, old_ps);
-			if (ret) {
-				DRM_ERROR("kv_update_vce_dpm failed\n");
-				return ret;
-			}
-			kv_update_acp_boot_level(adev);
-			kv_update_sclk_t(adev);
-			kv_enable_nb_dpm(adev, true);
-		}
-	}
-
-	return 0;
-}
-
-static void kv_dpm_post_set_power_state(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_ps *new_ps = &pi->requested_rps;
-
-	kv_update_current_ps(adev, new_ps);
-}
-
-static void kv_dpm_setup_asic(struct amdgpu_device *adev)
-{
-	sumo_take_smu_control(adev, true);
-	kv_init_powergate_state(adev);
-	kv_init_sclk_t(adev);
-}
-
-#if 0
-static void kv_dpm_reset_asic(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS) {
-		kv_force_lowest_valid(adev);
-		kv_init_graphics_levels(adev);
-		kv_program_bootup_state(adev);
-		kv_upload_dpm_settings(adev);
-		kv_force_lowest_valid(adev);
-		kv_unforce_levels(adev);
-	} else {
-		kv_init_graphics_levels(adev);
-		kv_program_bootup_state(adev);
-		kv_freeze_sclk_dpm(adev, true);
-		kv_upload_dpm_settings(adev);
-		kv_freeze_sclk_dpm(adev, false);
-		kv_set_enabled_level(adev, pi->graphics_boot_level);
-	}
-}
-#endif
-
-static void kv_construct_max_power_limits_table(struct amdgpu_device *adev,
-						struct amdgpu_clock_and_voltage_limits *table)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	if (pi->sys_info.sclk_voltage_mapping_table.num_max_dpm_entries > 0) {
-		int idx = pi->sys_info.sclk_voltage_mapping_table.num_max_dpm_entries - 1;
-		table->sclk =
-			pi->sys_info.sclk_voltage_mapping_table.entries[idx].sclk_frequency;
-		table->vddc =
-			kv_convert_2bit_index_to_voltage(adev,
-							 pi->sys_info.sclk_voltage_mapping_table.entries[idx].vid_2bit);
-	}
-
-	table->mclk = pi->sys_info.nbp_memory_clock[0];
-}
-
-static void kv_patch_voltage_values(struct amdgpu_device *adev)
-{
-	int i;
-	struct amdgpu_uvd_clock_voltage_dependency_table *uvd_table =
-		&adev->pm.dpm.dyn_state.uvd_clock_voltage_dependency_table;
-	struct amdgpu_vce_clock_voltage_dependency_table *vce_table =
-		&adev->pm.dpm.dyn_state.vce_clock_voltage_dependency_table;
-	struct amdgpu_clock_voltage_dependency_table *samu_table =
-		&adev->pm.dpm.dyn_state.samu_clock_voltage_dependency_table;
-	struct amdgpu_clock_voltage_dependency_table *acp_table =
-		&adev->pm.dpm.dyn_state.acp_clock_voltage_dependency_table;
-
-	if (uvd_table->count) {
-		for (i = 0; i < uvd_table->count; i++)
-			uvd_table->entries[i].v =
-				kv_convert_8bit_index_to_voltage(adev,
-								 uvd_table->entries[i].v);
-	}
-
-	if (vce_table->count) {
-		for (i = 0; i < vce_table->count; i++)
-			vce_table->entries[i].v =
-				kv_convert_8bit_index_to_voltage(adev,
-								 vce_table->entries[i].v);
-	}
-
-	if (samu_table->count) {
-		for (i = 0; i < samu_table->count; i++)
-			samu_table->entries[i].v =
-				kv_convert_8bit_index_to_voltage(adev,
-								 samu_table->entries[i].v);
-	}
-
-	if (acp_table->count) {
-		for (i = 0; i < acp_table->count; i++)
-			acp_table->entries[i].v =
-				kv_convert_8bit_index_to_voltage(adev,
-								 acp_table->entries[i].v);
-	}
-
-}
-
-static void kv_construct_boot_state(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->boot_pl.sclk = pi->sys_info.bootup_sclk;
-	pi->boot_pl.vddc_index = pi->sys_info.bootup_nb_voltage_index;
-	pi->boot_pl.ds_divider_index = 0;
-	pi->boot_pl.ss_divider_index = 0;
-	pi->boot_pl.allow_gnb_slow = 1;
-	pi->boot_pl.force_nbp_state = 0;
-	pi->boot_pl.display_wm = 0;
-	pi->boot_pl.vce_wm = 0;
-}
-
-static int kv_force_dpm_highest(struct amdgpu_device *adev)
-{
-	int ret;
-	u32 enable_mask, i;
-
-	ret = amdgpu_kv_dpm_get_enable_mask(adev, &enable_mask);
-	if (ret)
-		return ret;
-
-	for (i = SMU7_MAX_LEVELS_GRAPHICS - 1; i > 0; i--) {
-		if (enable_mask & (1 << i))
-			break;
-	}
-
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS)
-		return amdgpu_kv_send_msg_to_smc_with_parameter(adev, PPSMC_MSG_DPM_ForceState, i);
-	else
-		return kv_set_enabled_level(adev, i);
-}
-
-static int kv_force_dpm_lowest(struct amdgpu_device *adev)
-{
-	int ret;
-	u32 enable_mask, i;
-
-	ret = amdgpu_kv_dpm_get_enable_mask(adev, &enable_mask);
-	if (ret)
-		return ret;
-
-	for (i = 0; i < SMU7_MAX_LEVELS_GRAPHICS; i++) {
-		if (enable_mask & (1 << i))
-			break;
-	}
-
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS)
-		return amdgpu_kv_send_msg_to_smc_with_parameter(adev, PPSMC_MSG_DPM_ForceState, i);
-	else
-		return kv_set_enabled_level(adev, i);
-}
-
-static u8 kv_get_sleep_divider_id_from_clock(struct amdgpu_device *adev,
-					     u32 sclk, u32 min_sclk_in_sr)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i;
-	u32 temp;
-	u32 min = (min_sclk_in_sr > KV_MINIMUM_ENGINE_CLOCK) ?
-		min_sclk_in_sr : KV_MINIMUM_ENGINE_CLOCK;
-
-	if (sclk < min)
-		return 0;
-
-	if (!pi->caps_sclk_ds)
-		return 0;
-
-	for (i = KV_MAX_DEEPSLEEP_DIVIDER_ID; i > 0; i--) {
-		temp = sclk / sumo_get_sleep_divider_from_id(i);
-		if (temp >= min)
-			break;
-	}
-
-	return (u8)i;
-}
-
-static int kv_get_high_voltage_limit(struct amdgpu_device *adev, int *limit)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vddc_dependency_on_sclk;
-	int i;
-
-	if (table && table->count) {
-		for (i = table->count - 1; i >= 0; i--) {
-			if (pi->high_voltage_t &&
-			    (kv_convert_8bit_index_to_voltage(adev, table->entries[i].v) <=
-			     pi->high_voltage_t)) {
-				*limit = i;
-				return 0;
-			}
-		}
-	} else {
-		struct sumo_sclk_voltage_mapping_table *table =
-			&pi->sys_info.sclk_voltage_mapping_table;
-
-		for (i = table->num_max_dpm_entries - 1; i >= 0; i--) {
-			if (pi->high_voltage_t &&
-			    (kv_convert_2bit_index_to_voltage(adev, table->entries[i].vid_2bit) <=
-			     pi->high_voltage_t)) {
-				*limit = i;
-				return 0;
-			}
-		}
-	}
-
-	*limit = 0;
-	return 0;
-}
-
-static void kv_apply_state_adjust_rules(struct amdgpu_device *adev,
-					struct amdgpu_ps *new_rps,
-					struct amdgpu_ps *old_rps)
-{
-	struct kv_ps *ps = kv_get_ps(new_rps);
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 min_sclk = 10000; /* ??? */
-	u32 sclk, mclk = 0;
-	int i, limit;
-	bool force_high;
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vddc_dependency_on_sclk;
-	u32 stable_p_state_sclk = 0;
-	struct amdgpu_clock_and_voltage_limits *max_limits =
-		&adev->pm.dpm.dyn_state.max_clock_voltage_on_ac;
-
-	if (new_rps->vce_active) {
-		new_rps->evclk = adev->pm.dpm.vce_states[adev->pm.dpm.vce_level].evclk;
-		new_rps->ecclk = adev->pm.dpm.vce_states[adev->pm.dpm.vce_level].ecclk;
-	} else {
-		new_rps->evclk = 0;
-		new_rps->ecclk = 0;
-	}
-
-	mclk = max_limits->mclk;
-	sclk = min_sclk;
-
-	if (pi->caps_stable_p_state) {
-		stable_p_state_sclk = (max_limits->sclk * 75) / 100;
-
-		for (i = table->count - 1; i >= 0; i--) {
-			if (stable_p_state_sclk >= table->entries[i].clk) {
-				stable_p_state_sclk = table->entries[i].clk;
-				break;
-			}
-		}
-
-		if (i > 0)
-			stable_p_state_sclk = table->entries[0].clk;
-
-		sclk = stable_p_state_sclk;
-	}
-
-	if (new_rps->vce_active) {
-		if (sclk < adev->pm.dpm.vce_states[adev->pm.dpm.vce_level].sclk)
-			sclk = adev->pm.dpm.vce_states[adev->pm.dpm.vce_level].sclk;
-	}
-
-	ps->need_dfs_bypass = true;
-
-	for (i = 0; i < ps->num_levels; i++) {
-		if (ps->levels[i].sclk < sclk)
-			ps->levels[i].sclk = sclk;
-	}
-
-	if (table && table->count) {
-		for (i = 0; i < ps->num_levels; i++) {
-			if (pi->high_voltage_t &&
-			    (pi->high_voltage_t <
-			     kv_convert_8bit_index_to_voltage(adev, ps->levels[i].vddc_index))) {
-				kv_get_high_voltage_limit(adev, &limit);
-				ps->levels[i].sclk = table->entries[limit].clk;
-			}
-		}
-	} else {
-		struct sumo_sclk_voltage_mapping_table *table =
-			&pi->sys_info.sclk_voltage_mapping_table;
-
-		for (i = 0; i < ps->num_levels; i++) {
-			if (pi->high_voltage_t &&
-			    (pi->high_voltage_t <
-			     kv_convert_8bit_index_to_voltage(adev, ps->levels[i].vddc_index))) {
-				kv_get_high_voltage_limit(adev, &limit);
-				ps->levels[i].sclk = table->entries[limit].sclk_frequency;
-			}
-		}
-	}
-
-	if (pi->caps_stable_p_state) {
-		for (i = 0; i < ps->num_levels; i++) {
-			ps->levels[i].sclk = stable_p_state_sclk;
-		}
-	}
-
-	pi->video_start = new_rps->dclk || new_rps->vclk ||
-		new_rps->evclk || new_rps->ecclk;
-
-	if ((new_rps->class & ATOM_PPLIB_CLASSIFICATION_UI_MASK) ==
-	    ATOM_PPLIB_CLASSIFICATION_UI_BATTERY)
-		pi->battery_state = true;
-	else
-		pi->battery_state = false;
-
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS) {
-		ps->dpm0_pg_nb_ps_lo = 0x1;
-		ps->dpm0_pg_nb_ps_hi = 0x0;
-		ps->dpmx_nb_ps_lo = 0x1;
-		ps->dpmx_nb_ps_hi = 0x0;
-	} else {
-		ps->dpm0_pg_nb_ps_lo = 0x3;
-		ps->dpm0_pg_nb_ps_hi = 0x0;
-		ps->dpmx_nb_ps_lo = 0x3;
-		ps->dpmx_nb_ps_hi = 0x0;
-
-		if (pi->sys_info.nb_dpm_enable) {
-			force_high = (mclk >= pi->sys_info.nbp_memory_clock[3]) ||
-				pi->video_start || (adev->pm.dpm.new_active_crtc_count >= 3) ||
-				pi->disable_nb_ps3_in_battery;
-			ps->dpm0_pg_nb_ps_lo = force_high ? 0x2 : 0x3;
-			ps->dpm0_pg_nb_ps_hi = 0x2;
-			ps->dpmx_nb_ps_lo = force_high ? 0x2 : 0x3;
-			ps->dpmx_nb_ps_hi = 0x2;
-		}
-	}
-}
-
-static void kv_dpm_power_level_enabled_for_throttle(struct amdgpu_device *adev,
-						    u32 index, bool enable)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	pi->graphics_level[index].EnabledForThrottle = enable ? 1 : 0;
-}
-
-static int kv_calculate_ds_divider(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 sclk_in_sr = 10000; /* ??? */
-	u32 i;
-
-	if (pi->lowest_valid > pi->highest_valid)
-		return -EINVAL;
-
-	for (i = pi->lowest_valid; i <= pi->highest_valid; i++) {
-		pi->graphics_level[i].DeepSleepDivId =
-			kv_get_sleep_divider_id_from_clock(adev,
-							   be32_to_cpu(pi->graphics_level[i].SclkFrequency),
-							   sclk_in_sr);
-	}
-	return 0;
-}
-
-static int kv_calculate_nbps_level_settings(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i;
-	bool force_high;
-	struct amdgpu_clock_and_voltage_limits *max_limits =
-		&adev->pm.dpm.dyn_state.max_clock_voltage_on_ac;
-	u32 mclk = max_limits->mclk;
-
-	if (pi->lowest_valid > pi->highest_valid)
-		return -EINVAL;
-
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS) {
-		for (i = pi->lowest_valid; i <= pi->highest_valid; i++) {
-			pi->graphics_level[i].GnbSlow = 1;
-			pi->graphics_level[i].ForceNbPs1 = 0;
-			pi->graphics_level[i].UpH = 0;
-		}
-
-		if (!pi->sys_info.nb_dpm_enable)
+	struct mbcs_soft *soft;
+	int minor;
+
+	mutex_lock(&mbcs_mutex);
+	minor = iminor(ip);
+
+	/* Nothing protects access to this list... */
+	list_for_each_entry(soft, &soft_list, list) {
+		if (soft->nasid == minor) {
+			fp->private_data = soft->cxdev;
+			mutex_unlock(&mbcs_mutex);
 			return 0;
-
-		force_high = ((mclk >= pi->sys_info.nbp_memory_clock[3]) ||
-			      (adev->pm.dpm.new_active_crtc_count >= 3) || pi->video_start);
-
-		if (force_high) {
-			for (i = pi->lowest_valid; i <= pi->highest_valid; i++)
-				pi->graphics_level[i].GnbSlow = 0;
-		} else {
-			if (pi->battery_state)
-				pi->graphics_level[0].ForceNbPs1 = 1;
-
-			pi->graphics_level[1].GnbSlow = 0;
-			pi->graphics_level[2].GnbSlow = 0;
-			pi->graphics_level[3].GnbSlow = 0;
-			pi->graphics_level[4].GnbSlow = 0;
-		}
-	} else {
-		for (i = pi->lowest_valid; i <= pi->highest_valid; i++) {
-			pi->graphics_level[i].GnbSlow = 1;
-			pi->graphics_level[i].ForceNbPs1 = 0;
-			pi->graphics_level[i].UpH = 0;
-		}
-
-		if (pi->sys_info.nb_dpm_enable && pi->battery_state) {
-			pi->graphics_level[pi->lowest_valid].UpH = 0x28;
-			pi->graphics_level[pi->lowest_valid].GnbSlow = 0;
-			if (pi->lowest_valid != pi->highest_valid)
-				pi->graphics_level[pi->lowest_valid].ForceNbPs1 = 1;
 		}
 	}
-	return 0;
+
+	mutex_unlock(&mbcs_mutex);
+	return -ENODEV;
 }
 
-static int kv_calculate_dpm_settings(struct amdgpu_device *adev)
+static ssize_t mbcs_sram_read(struct file * fp, char __user *buf, size_t len, loff_t * off)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i;
+	struct cx_dev *cx_dev = fp->private_data;
+	struct mbcs_soft *soft = cx_dev->soft;
+	uint64_t hostAddr;
+	int rv = 0;
 
-	if (pi->lowest_valid > pi->highest_valid)
+	hostAddr = __get_dma_pages(GFP_KERNEL, get_order(len));
+	if (hostAddr == 0)
+		return -ENOMEM;
+
+	rv = do_mbcs_sram_dmawrite(soft, hostAddr, len, off);
+	if (rv < 0)
+		goto exit;
+
+	if (copy_to_user(buf, (void *)hostAddr, len))
+		rv = -EFAULT;
+
+      exit:
+	free_pages(hostAddr, get_order(len));
+
+	return rv;
+}
+
+static ssize_t
+mbcs_sram_write(struct file * fp, const char __user *buf, size_t len, loff_t * off)
+{
+	struct cx_dev *cx_dev = fp->private_data;
+	struct mbcs_soft *soft = cx_dev->soft;
+	uint64_t hostAddr;
+	int rv = 0;
+
+	hostAddr = __get_dma_pages(GFP_KERNEL, get_order(len));
+	if (hostAddr == 0)
+		return -ENOMEM;
+
+	if (copy_from_user((void *)hostAddr, buf, len)) {
+		rv = -EFAULT;
+		goto exit;
+	}
+
+	rv = do_mbcs_sram_dmaread(soft, hostAddr, len, off);
+
+      exit:
+	free_pages(hostAddr, get_order(len));
+
+	return rv;
+}
+
+static loff_t mbcs_sram_llseek(struct file * filp, loff_t off, int whence)
+{
+	loff_t newpos;
+
+	switch (whence) {
+	case SEEK_SET:
+		newpos = off;
+		break;
+
+	case SEEK_CUR:
+		newpos = filp->f_pos + off;
+		break;
+
+	case SEEK_END:
+		newpos = MBCS_SRAM_SIZE + off;
+		break;
+
+	default:		/* can't happen */
+		return -EINVAL;
+	}
+
+	if (newpos < 0)
 		return -EINVAL;
 
-	for (i = pi->lowest_valid; i <= pi->highest_valid; i++)
-		pi->graphics_level[i].DisplayWatermark = (i == pi->highest_valid) ? 1 : 0;
+	filp->f_pos = newpos;
+
+	return newpos;
+}
+
+static uint64_t mbcs_pioaddr(struct mbcs_soft *soft, uint64_t offset)
+{
+	uint64_t mmr_base;
+
+	mmr_base = (uint64_t) (soft->mmr_base + offset);
+
+	return mmr_base;
+}
+
+static void mbcs_debug_pioaddr_set(struct mbcs_soft *soft)
+{
+	soft->debug_addr = mbcs_pioaddr(soft, MBCS_DEBUG_START);
+}
+
+static void mbcs_gscr_pioaddr_set(struct mbcs_soft *soft)
+{
+	soft->gscr_addr = mbcs_pioaddr(soft, MBCS_GSCR_START);
+}
+
+static int mbcs_gscr_mmap(struct file *fp, struct vm_area_struct *vma)
+{
+	struct cx_dev *cx_dev = fp->private_data;
+	struct mbcs_soft *soft = cx_dev->soft;
+
+	if (vma->vm_pgoff != 0)
+		return -EINVAL;
+
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+	/* Remap-pfn-range will mark the range VM_IO */
+	if (remap_pfn_range(vma,
+			    vma->vm_start,
+			    __pa(soft->gscr_addr) >> PAGE_SHIFT,
+			    PAGE_SIZE,
+			    vma->vm_page_prot))
+		return -EAGAIN;
 
 	return 0;
 }
 
-static void kv_init_graphics_levels(struct amdgpu_device *adev)
+/**
+ * mbcs_completion_intr_handler - Primary completion handler.
+ * @irq: irq
+ * @arg: soft struct for device
+ *
+ */
+static irqreturn_t
+mbcs_completion_intr_handler(int irq, void *arg)
 {
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i;
-	struct amdgpu_clock_voltage_dependency_table *table =
-		&adev->pm.dpm.dyn_state.vddc_dependency_on_sclk;
+	struct mbcs_soft *soft = (struct mbcs_soft *)arg;
+	void *mmr_base;
+	union cm_status cm_status;
+	union cm_control cm_control;
 
-	if (table && table->count) {
-		u32 vid_2bit;
+	mmr_base = soft->mmr_base;
+	cm_status.cm_status_reg = MBCS_MMR_GET(mmr_base, MBCS_CM_STATUS);
 
-		pi->graphics_dpm_level_count = 0;
-		for (i = 0; i < table->count; i++) {
-			if (pi->high_voltage_t &&
-			    (pi->high_voltage_t <
-			     kv_convert_8bit_index_to_voltage(adev, table->entries[i].v)))
-				break;
+	if (cm_status.rd_dma_done) {
+		/* stop dma-read engine, clear status */
+		cm_control.cm_control_reg =
+		    MBCS_MMR_GET(mmr_base, MBCS_CM_CONTROL);
+		cm_control.rd_dma_clr = 1;
+		MBCS_MMR_SET(mmr_base, MBCS_CM_CONTROL,
+			     cm_control.cm_control_reg);
+		atomic_set(&soft->dmaread_done, 1);
+		wake_up(&soft->dmaread_queue);
+	}
+	if (cm_status.wr_dma_done) {
+		/* stop dma-write engine, clear status */
+		cm_control.cm_control_reg =
+		    MBCS_MMR_GET(mmr_base, MBCS_CM_CONTROL);
+		cm_control.wr_dma_clr = 1;
+		MBCS_MMR_SET(mmr_base, MBCS_CM_CONTROL,
+			     cm_control.cm_control_reg);
+		atomic_set(&soft->dmawrite_done, 1);
+		wake_up(&soft->dmawrite_queue);
+	}
+	if (cm_status.alg_done) {
+		/* clear status */
+		cm_control.cm_control_reg =
+		    MBCS_MMR_GET(mmr_base, MBCS_CM_CONTROL);
+		cm_control.alg_done_clr = 1;
+		MBCS_MMR_SET(mmr_base, MBCS_CM_CONTROL,
+			     cm_control.cm_control_reg);
+		atomic_set(&soft->algo_done, 1);
+		wake_up(&soft->algo_queue);
+	}
 
-			kv_set_divider_value(adev, i, table->entries[i].clk);
-			vid_2bit = kv_convert_vid7_to_vid2(adev,
-							   &pi->sys_info.vid_mapping_table,
-							   table->entries[i].v);
-			kv_set_vid(adev, i, vid_2bit);
-			kv_set_at(adev, i, pi->at[i]);
-			kv_dpm_power_level_enabled_for_throttle(adev, i, true);
-			pi->graphics_dpm_level_count++;
+	return IRQ_HANDLED;
+}
+
+/**
+ * mbcs_intr_alloc - Allocate interrupts.
+ * @dev: device pointer
+ *
+ */
+static int mbcs_intr_alloc(struct cx_dev *dev)
+{
+	struct sn_irq_info *sn_irq;
+	struct mbcs_soft *soft;
+	struct getdma *getdma;
+	struct putdma *putdma;
+	struct algoblock *algo;
+
+	soft = dev->soft;
+	getdma = &soft->getdma;
+	putdma = &soft->putdma;
+	algo = &soft->algo;
+
+	soft->get_sn_irq = NULL;
+	soft->put_sn_irq = NULL;
+	soft->algo_sn_irq = NULL;
+
+	sn_irq = tiocx_irq_alloc(dev->cx_id.nasid, TIOCX_CORELET, -1, -1, -1);
+	if (sn_irq == NULL)
+		return -EAGAIN;
+	soft->get_sn_irq = sn_irq;
+	getdma->intrHostDest = sn_irq->irq_xtalkaddr;
+	getdma->intrVector = sn_irq->irq_irq;
+	if (request_irq(sn_irq->irq_irq,
+			(void *)mbcs_completion_intr_handler, IRQF_SHARED,
+			"MBCS get intr", (void *)soft)) {
+		tiocx_irq_free(soft->get_sn_irq);
+		return -EAGAIN;
+	}
+
+	sn_irq = tiocx_irq_alloc(dev->cx_id.nasid, TIOCX_CORELET, -1, -1, -1);
+	if (sn_irq == NULL) {
+		free_irq(soft->get_sn_irq->irq_irq, soft);
+		tiocx_irq_free(soft->get_sn_irq);
+		return -EAGAIN;
+	}
+	soft->put_sn_irq = sn_irq;
+	putdma->intrHostDest = sn_irq->irq_xtalkaddr;
+	putdma->intrVector = sn_irq->irq_irq;
+	if (request_irq(sn_irq->irq_irq,
+			(void *)mbcs_completion_intr_handler, IRQF_SHARED,
+			"MBCS put intr", (void *)soft)) {
+		tiocx_irq_free(soft->put_sn_irq);
+		free_irq(soft->get_sn_irq->irq_irq, soft);
+		tiocx_irq_free(soft->get_sn_irq);
+		return -EAGAIN;
+	}
+
+	sn_irq = tiocx_irq_alloc(dev->cx_id.nasid, TIOCX_CORELET, -1, -1, -1);
+	if (sn_irq == NULL) {
+		free_irq(soft->put_sn_irq->irq_irq, soft);
+		tiocx_irq_free(soft->put_sn_irq);
+		free_irq(soft->get_sn_irq->irq_irq, soft);
+		tiocx_irq_free(soft->get_sn_irq);
+		return -EAGAIN;
+	}
+	soft->algo_sn_irq = sn_irq;
+	algo->intrHostDest = sn_irq->irq_xtalkaddr;
+	algo->intrVector = sn_irq->irq_irq;
+	if (request_irq(sn_irq->irq_irq,
+			(void *)mbcs_completion_intr_handler, IRQF_SHARED,
+			"MBCS algo intr", (void *)soft)) {
+		tiocx_irq_free(soft->algo_sn_irq);
+		free_irq(soft->put_sn_irq->irq_irq, soft);
+		tiocx_irq_free(soft->put_sn_irq);
+		free_irq(soft->get_sn_irq->irq_irq, soft);
+		tiocx_irq_free(soft->get_sn_irq);
+		return -EAGAIN;
+	}
+
+	return 0;
+}
+
+/**
+ * mbcs_intr_dealloc - Remove interrupts.
+ * @dev: device pointer
+ *
+ */
+static void mbcs_intr_dealloc(struct cx_dev *dev)
+{
+	struct mbcs_soft *soft;
+
+	soft = dev->soft;
+
+	free_irq(soft->get_sn_irq->irq_irq, soft);
+	tiocx_irq_free(soft->get_sn_irq);
+	free_irq(soft->put_sn_irq->irq_irq, soft);
+	tiocx_irq_free(soft->put_sn_irq);
+	free_irq(soft->algo_sn_irq->irq_irq, soft);
+	tiocx_irq_free(soft->algo_sn_irq);
+}
+
+static inline int mbcs_hw_init(struct mbcs_soft *soft)
+{
+	void *mmr_base = soft->mmr_base;
+	union cm_control cm_control;
+	union cm_req_timeout cm_req_timeout;
+	uint64_t err_stat;
+
+	cm_req_timeout.cm_req_timeout_reg =
+	    MBCS_MMR_GET(mmr_base, MBCS_CM_REQ_TOUT);
+
+	cm_req_timeout.time_out = MBCS_CM_CONTROL_REQ_TOUT_MASK;
+	MBCS_MMR_SET(mmr_base, MBCS_CM_REQ_TOUT,
+		     cm_req_timeout.cm_req_timeout_reg);
+
+	mbcs_gscr_pioaddr_set(soft);
+	mbcs_debug_pioaddr_set(soft);
+
+	/* clear errors */
+	err_stat = MBCS_MMR_GET(mmr_base, MBCS_CM_ERR_STAT);
+	MBCS_MMR_SET(mmr_base, MBCS_CM_CLR_ERR_STAT, err_stat);
+	MBCS_MMR_ZERO(mmr_base, MBCS_CM_ERROR_DETAIL1);
+
+	/* enable interrupts */
+	/* turn off 2^23 (INT_EN_PIO_REQ_ADDR_INV) */
+	MBCS_MMR_SET(mmr_base, MBCS_CM_ERR_INT_EN, 0x3ffffff7e00ffUL);
+
+	/* arm status regs and clear engines */
+	cm_control.cm_control_reg = MBCS_MMR_GET(mmr_base, MBCS_CM_CONTROL);
+	cm_control.rearm_stat_regs = 1;
+	cm_control.alg_clr = 1;
+	cm_control.wr_dma_clr = 1;
+	cm_control.rd_dma_clr = 1;
+
+	MBCS_MMR_SET(mmr_base, MBCS_CM_CONTROL, cm_control.cm_control_reg);
+
+	return 0;
+}
+
+static ssize_t show_algo(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct cx_dev *cx_dev = to_cx_dev(dev);
+	struct mbcs_soft *soft = cx_dev->soft;
+	uint64_t debug0;
+
+	/*
+	 * By convention, the first debug register contains the
+	 * algorithm number and revision.
+	 */
+	debug0 = *(uint64_t *) soft->debug_addr;
+
+	return sprintf(buf, "0x%x 0x%x\n",
+		       upper_32_bits(debug0), lower_32_bits(debug0));
+}
+
+static ssize_t store_algo(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	int n;
+	struct cx_dev *cx_dev = to_cx_dev(dev);
+	struct mbcs_soft *soft = cx_dev->soft;
+
+	if (count <= 0)
+		return 0;
+
+	n = simple_strtoul(buf, NULL, 0);
+
+	if (n == 1) {
+		mbcs_algo_start(soft);
+		if (wait_event_interruptible(soft->algo_queue,
+					atomic_read(&soft->algo_done)))
+			return -ERESTARTSYS;
+	}
+
+	return count;
+}
+
+DEVICE_ATTR(algo, 0644, show_algo, store_algo);
+
+/**
+ * mbcs_probe - Initialize for device
+ * @dev: device pointer
+ * @device_id: id table pointer
+ *
+ */
+static int mbcs_probe(struct cx_dev *dev, const struct cx_device_id *id)
+{
+	struct mbcs_soft *soft;
+
+	dev->soft = NULL;
+
+	soft = kzalloc(sizeof(struct mbcs_soft), GFP_KERNEL);
+	if (soft == NULL)
+		return -ENOMEM;
+
+	soft->nasid = dev->cx_id.nasid;
+	list_add(&soft->list, &soft_list);
+	soft->mmr_base = (void *)tiocx_swin_base(dev->cx_id.nasid);
+	dev->soft = soft;
+	soft->cxdev = dev;
+
+	init_waitqueue_head(&soft->dmawrite_queue);
+	init_waitqueue_head(&soft->dmaread_queue);
+	init_waitqueue_head(&soft->algo_queue);
+
+	mutex_init(&soft->dmawritelock);
+	mutex_init(&soft->dmareadlock);
+	mutex_init(&soft->algolock);
+
+	mbcs_getdma_init(&soft->getdma);
+	mbcs_putdma_init(&soft->putdma);
+	mbcs_algo_init(&soft->algo);
+
+	mbcs_hw_init(soft);
+
+	/* Allocate interrupts */
+	mbcs_intr_alloc(dev);
+
+	device_create_file(&dev->dev, &dev_attr_algo);
+
+	return 0;
+}
+
+static int mbcs_remove(struct cx_dev *dev)
+{
+	if (dev->soft) {
+		mbcs_intr_dealloc(dev);
+		kfree(dev->soft);
+	}
+
+	device_remove_file(&dev->dev, &dev_attr_algo);
+
+	return 0;
+}
+
+static const struct cx_device_id mbcs_id_table[] = {
+	{
+	 .part_num = MBCS_PART_NUM,
+	 .mfg_num = MBCS_MFG_NUM,
+	 },
+	{
+	 .part_num = MBCS_PART_NUM_ALG0,
+	 .mfg_num = MBCS_MFG_NUM,
+	 },
+	{0, 0}
+};
+
+MODULE_DEVICE_TABLE(cx, mbcs_id_table);
+
+static struct cx_drv mbcs_driver = {
+	.name = DEVICE_NAME,
+	.id_table = mbcs_id_table,
+	.probe = mbcs_probe,
+	.remove = mbcs_remove,
+};
+
+static void __exit mbcs_exit(void)
+{
+	unregister_chrdev(mbcs_major, DEVICE_NAME);
+	cx_driver_unregister(&mbcs_driver);
+}
+
+static int __init mbcs_init(void)
+{
+	int rv;
+
+	if (!ia64_platform_is("sn2"))
+		return -ENODEV;
+
+	// Put driver into chrdevs[].  Get major number.
+	rv = register_chrdev(mbcs_major, DEVICE_NAME, &mbcs_ops);
+	if (rv < 0) {
+		DBG(KERN_ALERT "mbcs_init: can't get major number. %d\n", rv);
+		return rv;
+	}
+	mbcs_major = rv;
+
+	return cx_driver_register(&mbcs_driver);
+}
+
+module_init(mbcs_init);
+module_exit(mbcs_exit);
+
+MODULE_AUTHOR("Bruce Losure <blosure@sgi.com>");
+MODULE_DESCRIPTION("Driver for MOATB Core Services");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                           /*
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
+ *
+ * Copyright (c) 2005 Silicon Graphics, Inc.  All rights reserved.
+ */
+
+#ifndef __MBCS_H__
+#define __MBCS_H__
+
+/*
+ * General macros
+ */
+#define MB	(1024*1024)
+#define MB2	(2*MB)
+#define MB4	(4*MB)
+#define MB6	(6*MB)
+
+/*
+ * Offsets and masks
+ */
+#define MBCS_CM_ID		0x0000	/* Identification */
+#define MBCS_CM_STATUS		0x0008	/* Status */
+#define MBCS_CM_ERROR_DETAIL1	0x0010	/* Error Detail1 */
+#define MBCS_CM_ERROR_DETAIL2	0x0018	/* Error Detail2 */
+#define MBCS_CM_CONTROL		0x0020	/* Control */
+#define MBCS_CM_REQ_TOUT	0x0028	/* Request Time-out */
+#define MBCS_CM_ERR_INT_DEST	0x0038	/* Error Interrupt Destination */
+#define MBCS_CM_TARG_FL		0x0050	/* Target Flush */
+#define MBCS_CM_ERR_STAT	0x0060	/* Error Status */
+#define MBCS_CM_CLR_ERR_STAT	0x0068	/* Clear Error Status */
+#define MBCS_CM_ERR_INT_EN	0x0070	/* Error Interrupt Enable */
+#define MBCS_RD_DMA_SYS_ADDR	0x0100	/* Read DMA System Address */
+#define MBCS_RD_DMA_LOC_ADDR	0x0108	/* Read DMA Local Address */
+#define MBCS_RD_DMA_CTRL	0x0110	/* Read DMA Control */
+#define MBCS_RD_DMA_AMO_DEST	0x0118	/* Read DMA AMO Destination */
+#define MBCS_RD_DMA_INT_DEST	0x0120	/* Read DMA Interrupt Destination */
+#define MBCS_RD_DMA_AUX_STAT	0x0130	/* Read DMA Auxiliary Status */
+#define MBCS_WR_DMA_SYS_ADDR	0x0200	/* Write DMA System Address */
+#define MBCS_WR_DMA_LOC_ADDR	0x0208	/* Write DMA Local Address */
+#define MBCS_WR_DMA_CTRL	0x0210	/* Write DMA Control */
+#define MBCS_WR_DMA_AMO_DEST	0x0218	/* Write DMA AMO Destination */
+#define MBCS_WR_DMA_INT_DEST	0x0220	/* Write DMA Interrupt Destination */
+#define MBCS_WR_DMA_AUX_STAT	0x0230	/* Write DMA Auxiliary Status */
+#define MBCS_ALG_AMO_DEST	0x0300	/* Algorithm AMO Destination */
+#define MBCS_ALG_INT_DEST	0x0308	/* Algorithm Interrupt Destination */
+#define MBCS_ALG_OFFSETS	0x0310
+#define MBCS_ALG_STEP		0x0318	/* Algorithm Step */
+
+#define MBCS_GSCR_START		0x0000000
+#define MBCS_DEBUG_START	0x0100000
+#define MBCS_RAM0_START		0x0200000
+#define MBCS_RAM1_START		0x0400000
+#define MBCS_RAM2_START		0x0600000
+
+#define MBCS_CM_CONTROL_REQ_TOUT_MASK 0x0000000000ffffffUL
+//#define PIO_BASE_ADDR_BASE_OFFSET_MASK 0x00fffffffff00000UL
+
+#define MBCS_SRAM_SIZE		(1024*1024)
+#define MBCS_CACHELINE_SIZE	128
+
+/*
+ * MMR get's and put's
+ */
+#define MBCS_MMR_ADDR(mmr_base, offset)((uint64_t *)(mmr_base + offset))
+#define MBCS_MMR_SET(mmr_base, offset, value) {			\
+	uint64_t *mbcs_mmr_set_u64p, readback;				\
+	mbcs_mmr_set_u64p = (uint64_t *)(mmr_base + offset);	\
+	*mbcs_mmr_set_u64p = value;					\
+	readback = *mbcs_mmr_set_u64p; \
+}
+#define MBCS_MMR_GET(mmr_base, offset) *(uint64_t *)(mmr_base + offset)
+#define MBCS_MMR_ZERO(mmr_base, offset) MBCS_MMR_SET(mmr_base, offset, 0)
+
+/*
+ * MBCS mmr structures
+ */
+union cm_id {
+	uint64_t cm_id_reg;
+	struct {
+		uint64_t always_one:1,	// 0
+		 mfg_id:11,	// 11:1
+		 part_num:16,	// 27:12
+		 bitstream_rev:8,	// 35:28
+		:28;		// 63:36
+	};
+};
+
+union cm_status {
+	uint64_t cm_status_reg;
+	struct {
+		uint64_t pending_reads:8,	// 7:0
+		 pending_writes:8,	// 15:8
+		 ice_rsp_credits:8,	// 23:16
+		 ice_req_credits:8,	// 31:24
+		 cm_req_credits:8,	// 39:32
+		:1,		// 40
+		 rd_dma_in_progress:1,	// 41
+		 rd_dma_done:1,	// 42
+		:1,		// 43
+		 wr_dma_in_progress:1,	// 44
+		 wr_dma_done:1,	// 45
+		 alg_waiting:1,	// 46
+		 alg_pipe_running:1,	// 47
+		 alg_done:1,	// 48
+		:3,		// 51:49
+		 pending_int_reqs:8,	// 59:52
+		:3,		// 62:60
+		 alg_half_speed_sel:1;	// 63
+	};
+};
+
+union cm_error_detail1 {
+	uint64_t cm_error_detail1_reg;
+	struct {
+		uint64_t packet_type:4,	// 3:0
+		 source_id:2,	// 5:4
+		 data_size:2,	// 7:6
+		 tnum:8,	// 15:8
+		 byte_enable:8,	// 23:16
+		 gfx_cred:8,	// 31:24
+		 read_type:2,	// 33:32
+		 pio_or_memory:1,	// 34
+		 head_cw_error:1,	// 35
+		:12,		// 47:36
+		 head_error_bit:1,	// 48
+		 data_error_bit:1,	// 49
+		:13,		// 62:50
+		 valid:1;	// 63
+	};
+};
+
+union cm_error_detail2 {
+	uint64_t cm_error_detail2_reg;
+	struct {
+		uint64_t address:56,	// 55:0
+		:8;		// 63:56
+	};
+};
+
+union cm_control {
+	uint64_t cm_control_reg;
+	struct {
+		uint64_t cm_id:2,	// 1:0
+		:2,		// 3:2
+		 max_trans:5,	// 8:4
+		:3,		// 11:9
+		 address_mode:1,	// 12
+		:7,		// 19:13
+		 credit_limit:8,	// 27:20
+		:5,		// 32:28
+		 rearm_stat_regs:1,	// 33
+		 prescalar_byp:1,	// 34
+		 force_gap_war:1,	// 35
+		 rd_dma_go:1,	// 36
+		 wr_dma_go:1,	// 37
+		 alg_go:1,	// 38
+		 rd_dma_clr:1,	// 39
+		 wr_dma_clr:1,	// 40
+		 alg_clr:1,	// 41
+		:2,		// 43:42
+		 alg_wait_step:1,	// 44
+		 alg_done_amo_en:1,	// 45
+		 alg_done_int_en:1,	// 46
+		:1,		// 47
+		 alg_sram0_locked:1,	// 48
+		 alg_sram1_locked:1,	// 49
+		 alg_sram2_locked:1,	// 50
+		 alg_done_clr:1,	// 51
+		:12;		// 63:52
+	};
+};
+
+union cm_req_timeout {
+	uint64_t cm_req_timeout_reg;
+	struct {
+		uint64_t time_out:24,	// 23:0
+		:40;		// 63:24
+	};
+};
+
+union intr_dest {
+	uint64_t intr_dest_reg;
+	struct {
+		uint64_t address:56,	// 55:0
+		 int_vector:8;	// 63:56
+	};
+};
+
+union cm_error_status {
+	uint64_t cm_error_status_reg;
+	struct {
+		uint64_t ecc_sbe:1,	// 0
+		 ecc_mbe:1,	// 1
+		 unsupported_req:1,	// 2
+		 unexpected_rsp:1,	// 3
+		 bad_length:1,	// 4
+		 bad_datavalid:1,	// 5
+		 buffer_overflow:1,	// 6
+		 request_timeout:1,	// 7
+		:8,		// 15:8
+		 head_inv_data_size:1,	// 16
+		 rsp_pactype_inv:1,	// 17
+		 head_sb_err:1,	// 18
+		 missing_head:1,	// 19
+		 head_inv_rd_type:1,	// 20
+		 head_cmd_err_bit:1,	// 21
+		 req_addr_align_inv:1,	// 22
+		 pio_req_addr_inv:1,	// 23
+		 req_range_dsize_inv:1,	// 24
+		 early_term:1,	// 25
+		 early_tail:1,	// 26
+		 missing_tail:1,	// 27
+		 data_flit_sb_err:1,	// 28
+		 cm2hcm_req_cred_of:1,	// 29
+		 cm2hcm_rsp_cred_of:1,	// 30
+		 rx_bad_didn:1,	// 31
+		 rd_dma_err_rsp:1,	// 32
+		 rd_dma_tnum_tout:1,	// 33
+		 rd_dma_multi_tnum_tou:1,	// 34
+		 wr_dma_err_rsp:1,	// 35
+		 wr_dma_tnum_tout:1,	// 36
+		 wr_dma_multi_tnum_tou:1,	// 37
+		 alg_data_overflow:1,	// 38
+		 alg_data_underflow:1,	// 39
+		 ram0_access_conflict:1,	// 40
+		 ram1_access_conflict:1,	// 41
+		 ram2_access_conflict:1,	// 42
+		 ram0_perr:1,	// 43
+		 ram1_perr:1,	// 44
+		 ram2_perr:1,	// 45
+		 int_gen_rsp_err:1,	// 46
+		 int_gen_tnum_tout:1,	// 47
+		 rd_dma_prog_err:1,	// 48
+		 wr_dma_prog_err:1,	// 49
+		:14;		// 63:50
+	};
+};
+
+union cm_clr_error_status {
+	uint64_t cm_clr_error_status_reg;
+	struct {
+		uint64_t clr_ecc_sbe:1,	// 0
+		 clr_ecc_mbe:1,	// 1
+		 clr_unsupported_req:1,	// 2
+		 clr_unexpected_rsp:1,	// 3
+		 clr_bad_length:1,	// 4
+		 clr_bad_datavalid:1,	// 5
+		 clr_buffer_overflow:1,	// 6
+		 clr_request_timeout:1,	// 7
+		:8,		// 15:8
+		 clr_head_inv_data_siz:1,	// 16
+		 clr_rsp_pactype_inv:1,	// 17
+		 clr_head_sb_err:1,	// 18
+		 clr_missing_head:1,	// 19
+		 clr_head_inv_rd_type:1,	// 20
+		 clr_head_cmd_err_bit:1,	// 21
+		 clr_req_addr_align_in:1,	// 22
+		 clr_pio_req_addr_inv:1,	// 23
+		 clr_req_range_dsize_i:1,	// 24
+		 clr_early_term:1,	// 25
+		 clr_early_tail:1,	// 26
+		 clr_missing_tail:1,	// 27
+		 clr_data_flit_sb_err:1,	// 28
+		 clr_cm2hcm_req_cred_o:1,	// 29
+		 clr_cm2hcm_rsp_cred_o:1,	// 30
+		 clr_rx_bad_didn:1,	// 31
+		 clr_rd_dma_err_rsp:1,	// 32
+		 clr_rd_dma_tnum_tout:1,	// 33
+		 clr_rd_dma_multi_tnum:1,	// 34
+		 clr_wr_dma_err_rsp:1,	// 35
+		 clr_wr_dma_tnum_tout:1,	// 36
+		 clr_wr_dma_multi_tnum:1,	// 37
+		 clr_alg_data_overflow:1,	// 38
+		 clr_alg_data_underflo:1,	// 39
+		 clr_ram0_access_confl:1,	// 40
+		 clr_ram1_access_confl:1,	// 41
+		 clr_ram2_access_confl:1,	// 42
+		 clr_ram0_perr:1,	// 43
+		 clr_ram1_perr:1,	// 44
+		 clr_ram2_perr:1,	// 45
+		 clr_int_gen_rsp_err:1,	// 46
+		 clr_int_gen_tnum_tout:1,	// 47
+		 clr_rd_dma_prog_err:1,	// 48
+		 clr_wr_dma_prog_err:1,	// 49
+		:14;		// 63:50
+	};
+};
+
+union cm_error_intr_enable {
+	uint64_t cm_error_intr_enable_reg;
+	struct {
+		uint64_t int_en_ecc_sbe:1,	// 0
+		 int_en_ecc_mbe:1,	// 1
+		 int_en_unsupported_re:1,	// 2
+		 int_en_unexpected_rsp:1,	// 3
+		 int_en_bad_length:1,	// 4
+		 int_en_bad_datavalid:1,	// 5
+		 int_en_buffer_overflo:1,	// 6
+		 int_en_request_timeou:1,	// 7
+		:8,		// 15:8
+		 int_en_head_inv_data_:1,	// 16
+		 int_en_rsp_pactype_in:1,	// 17
+		 int_en_head_sb_err:1,	// 18
+		 int_en_missing_head:1,	// 19
+		 int_en_head_inv_rd_ty:1,	// 20
+		 int_en_head_cmd_err_b:1,	// 21
+		 int_en_req_addr_align:1,	// 22
+		 int_en_pio_req_addr_i:1,	// 23
+		 int_en_req_range_dsiz:1,	// 24
+		 int_en_early_term:1,	// 25
+		 int_en_early_tail:1,	// 26
+		 int_en_missing_tail:1,	// 27
+		 int_en_data_flit_sb_e:1,	// 28
+		 int_en_cm2hcm_req_cre:1,	// 29
+		 int_en_cm2hcm_rsp_cre:1,	// 30
+		 int_en_rx_bad_didn:1,	// 31
+		 int_en_rd_dma_err_rsp:1,	// 32
+		 int_en_rd_dma_tnum_to:1,	// 33
+		 int_en_rd_dma_multi_t:1,	// 34
+		 int_en_wr_dma_err_rsp:1,	// 35
+		 int_en_wr_dma_tnum_to:1,	// 36
+		 int_en_wr_dma_multi_t:1,	// 37
+		 int_en_alg_data_overf:1,	// 38
+		 int_en_alg_data_under:1,	// 39
+		 int_en_ram0_access_co:1,	// 40
+		 int_en_ram1_access_co:1,	// 41
+		 int_en_ram2_access_co:1,	// 42
+		 int_en_ram0_perr:1,	// 43
+		 int_en_ram1_perr:1,	// 44
+		 int_en_ram2_perr:1,	// 45
+		 int_en_int_gen_rsp_er:1,	// 46
+		 int_en_int_gen_tnum_t:1,	// 47
+		 int_en_rd_dma_prog_er:1,	// 48
+		 int_en_wr_dma_prog_er:1,	// 49
+		:14;		// 63:50
+	};
+};
+
+struct cm_mmr {
+	union cm_id id;
+	union cm_status status;
+	union cm_error_detail1 err_detail1;
+	union cm_error_detail2 err_detail2;
+	union cm_control control;
+	union cm_req_timeout req_timeout;
+	uint64_t reserved1[1];
+	union intr_dest int_dest;
+	uint64_t reserved2[2];
+	uint64_t targ_flush;
+	uint64_t reserved3[1];
+	union cm_error_status err_status;
+	union cm_clr_error_status clr_err_status;
+	union cm_error_intr_enable int_enable;
+};
+
+union dma_hostaddr {
+	uint64_t dma_hostaddr_reg;
+	struct {
+		uint64_t dma_sys_addr:56,	// 55:0
+		:8;		// 63:56
+	};
+};
+
+union dma_localaddr {
+	uint64_t dma_localaddr_reg;
+	struct {
+		uint64_t dma_ram_addr:21,	// 20:0
+		 dma_ram_sel:2,	// 22:21
+		:41;		// 63:23
+	};
+};
+
+union dma_control {
+	uint64_t dma_control_reg;
+	struct {
+		uint64_t dma_op_length:16,	// 15:0
+		:18,		// 33:16
+		 done_amo_en:1,	// 34
+		 done_int_en:1,	// 35
+		:1,		// 36
+		 pio_mem_n:1,	// 37
+		:26;		// 63:38
+	};
+};
+
+union dma_amo_dest {
+	uint64_t dma_amo_dest_reg;
+	struct {
+		uint64_t dma_amo_sys_addr:56,	// 55:0
+		 dma_amo_mod_type:3,	// 58:56
+		:5;		// 63:59
+	};
+};
+
+union rdma_aux_status {
+	uint64_t rdma_aux_status_reg;
+	struct {
+		uint64_t op_num_pacs_left:17,	// 16:0
+		:5,		// 21:17
+		 lrsp_buff_empty:1,	// 22
+		:17,		// 39:23
+		 pending_reqs_left:6,	// 45:40
+		:18;		// 63:46
+	};
+};
+
+struct rdma_mmr {
+	union dma_hostaddr host_addr;
+	union dma_localaddr local_addr;
+	union dma_control control;
+	union dma_amo_dest amo_dest;
+	union intr_dest intr_dest;
+	union rdma_aux_status aux_status;
+};
+
+union wdma_aux_status {
+	uint64_t wdma_aux_status_reg;
+	struct {
+		uint64_t op_num_pacs_left:17,	// 16:0
+		:4,		// 20:17
+		 lreq_buff_empty:1,	// 21
+		:18,		// 39:22
+		 pending_reqs_left:6,	// 45:40
+		:18;		// 63:46
+	};
+};
+
+struct wdma_mmr {
+	union dma_hostaddr host_addr;
+	union dma_localaddr local_addr;
+	union dma_control control;
+	union dma_amo_dest amo_dest;
+	union intr_dest intr_dest;
+	union wdma_aux_status aux_status;
+};
+
+union algo_step {
+	uint64_t algo_step_reg;
+	struct {
+		uint64_t alg_step_cnt:16,	// 15:0
+		:48;		// 63:16
+	};
+};
+
+struct algo_mmr {
+	union dma_amo_dest amo_dest;
+	union intr_dest intr_dest;
+	union {
+		uint64_t algo_offset_reg;
+		struct {
+			uint64_t sram0_offset:7,	// 6:0
+			reserved0:1,	// 7
+			sram1_offset:7,	// 14:8
+			reserved1:1,	// 15
+			sram2_offset:7,	// 22:16
+			reserved2:14;	// 63:23
+		};
+	} sram_offset;
+	union algo_step step;
+};
+
+struct mbcs_mmr {
+	struct cm_mmr cm;
+	uint64_t reserved1[17];
+	struct rdma_mmr rdDma;
+	uint64_t reserved2[25];
+	struct wdma_mmr wrDma;
+	uint64_t reserved3[25];
+	struct algo_mmr algo;
+	uint64_t reserved4[156];
+};
+
+/*
+ * defines
+ */
+#define DEVICE_NAME "mbcs"
+#define MBCS_PART_NUM 0xfff0
+#define MBCS_PART_NUM_ALG0 0xf001
+#define MBCS_MFG_NUM  0x1
+
+struct algoblock {
+	uint64_t amoHostDest;
+	uint64_t amoModType;
+	uint64_t intrHostDest;
+	uint64_t intrVector;
+	uint64_t algoStepCount;
+};
+
+struct getdma {
+	uint64_t hostAddr;
+	uint64_t localAddr;
+	uint64_t bytes;
+	uint64_t DoneAmoEnable;
+	uint64_t DoneIntEnable;
+	uint64_t peerIO;
+	uint64_t amoHostDest;
+	uint64_t amoModType;
+	uint64_t intrHostDest;
+	uint64_t intrVector;
+};
+
+struct putdma {
+	uint64_t hostAddr;
+	uint64_t localAddr;
+	uint64_t bytes;
+	uint64_t DoneAmoEnable;
+	uint64_t DoneIntEnable;
+	uint64_t peerIO;
+	uint64_t amoHostDest;
+	uint64_t amoModType;
+	uint64_t intrHostDest;
+	uint64_t intrVector;
+};
+
+struct mbcs_soft {
+	struct list_head list;
+	struct cx_dev *cxdev;
+	int major;
+	int nasid;
+	void *mmr_base;
+	wait_queue_head_t dmawrite_queue;
+	wait_queue_head_t dmaread_queue;
+	wait_queue_head_t algo_queue;
+	struct sn_irq_info *get_sn_irq;
+	struct sn_irq_info *put_sn_irq;
+	struct sn_irq_info *algo_sn_irq;
+	struct getdma getdma;
+	struct putdma putdma;
+	struct algoblock algo;
+	uint64_t gscr_addr;	// pio addr
+	uint64_t ram0_addr;	// pio addr
+	uint64_t ram1_addr;	// pio addr
+	uint64_t ram2_addr;	// pio addr
+	uint64_t debug_addr;	// pio addr
+	atomic_t dmawrite_done;
+	atomic_t dmaread_done;
+	atomic_t algo_done;
+	struct mutex dmawritelock;
+	struct mutex dmareadlock;
+	struct mutex algolock;
+};
+
+static int mbcs_open(struct inode *ip, struct file *fp);
+static ssize_t mbcs_sram_read(struct file *fp, char __user *buf, size_t len,
+			      loff_t * off);
+static ssize_t mbcs_sram_write(struct file *fp, const char __user *buf, size_t len,
+			       loff_t * off);
+static loff_t mbcs_sram_llseek(struct file *filp, loff_t off, int whence);
+static int mbcs_gscr_mmap(struct file *fp, struct vm_area_struct *vma);
+
+#endif				// __MBCS_H__
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ *  linux/drivers/char/mem.c
+ *
+ *  Copyright (C) 1991, 1992  Linus Torvalds
+ *
+ *  Added devfs support.
+ *    Jan-11-1998, C. Scott Ananian <cananian@alumni.princeton.edu>
+ *  Shared /dev/zero mmapping support, Feb 2000, Kanoj Sarcar <kanoj@sgi.com>
+ */
+
+#include <linux/mm.h>
+#include <linux/miscdevice.h>
+#include <linux/slab.h>
+#include <linux/vmalloc.h>
+#include <linux/mman.h>
+#include <linux/random.h>
+#include <linux/init.h>
+#include <linux/raw.h>
+#include <linux/tty.h>
+#include <linux/capability.h>
+#include <linux/ptrace.h>
+#include <linux/device.h>
+#include <linux/highmem.h>
+#include <linux/backing-dev.h>
+#include <linux/splice.h>
+#include <linux/pfn.h>
+#include <linux/export.h>
+#include <linux/io.h>
+#include <linux/uio.h>
+
+#ifdef CONFIG_KNOX_KAP
+#include <linux/knox_kap.h>
+#endif
+
+#ifdef CONFIG_MST_LDO
+#include <linux/mst_ctrl.h>
+#endif
+
+#include <linux/uaccess.h>
+
+#ifdef CONFIG_IA64
+# include <linux/efi.h>
+#endif
+
+#define DEVPORT_MINOR	4
+
+#ifdef CONFIG_SRANDOM
+#include <../drivers/char/srandom/srandom.h>
+#endif
+
+static inline unsigned long size_inside_page(unsigned long start,
+					     unsigned long size)
+{
+	unsigned long sz;
+
+	sz = PAGE_SIZE - (start & (PAGE_SIZE - 1));
+
+	return min(sz, size);
+}
+
+#ifndef ARCH_HAS_VALID_PHYS_ADDR_RANGE
+static inline int valid_phys_addr_range(phys_addr_t addr, size_t count)
+{
+	return addr + count <= __pa(high_memory);
+}
+
+static inline int valid_mmap_phys_addr_range(unsigned long pfn, size_t size)
+{
+	return 1;
+}
+#endif
+
+#ifdef CONFIG_STRICT_DEVMEM
+static inline int page_is_allowed(unsigned long pfn)
+{
+	return devmem_is_allowed(pfn);
+}
+static inline int range_is_allowed(unsigned long pfn, unsigned long size)
+{
+	u64 from = ((u64)pfn) << PAGE_SHIFT;
+	u64 to = from + size;
+	u64 cursor = from;
+
+	while (cursor < to) {
+		if (!devmem_is_allowed(pfn))
+			return 0;
+		cursor += PAGE_SIZE;
+		pfn++;
+	}
+	return 1;
+}
+#else
+static inline int page_is_allowed(unsigned long pfn)
+{
+	return 1;
+}
+static inline int range_is_allowed(unsigned long pfn, unsigned long size)
+{
+	return 1;
+}
+#endif
+
+#ifndef unxlate_dev_mem_ptr
+#define unxlate_dev_mem_ptr unxlate_dev_mem_ptr
+void __weak unxlate_dev_mem_ptr(phys_addr_t phys, void *addr)
+{
+}
+#endif
+
+static inline bool should_stop_iteration(void)
+{
+	if (need_resched())
+		cond_resched();
+	return fatal_signal_pending(current);
+}
+
+/*
+ * This funcion reads the *physical* memory. The f_pos points directly to the
+ * memory location.
+ */
+static ssize_t read_mem(struct file *file, char __user *buf,
+			size_t count, loff_t *ppos)
+{
+	phys_addr_t p = *ppos;
+	ssize_t read, sz;
+	void *ptr;
+
+	if (p != *ppos)
+		return 0;
+
+	if (!valid_phys_addr_range(p, count))
+		return -EFAULT;
+	read = 0;
+#ifdef __ARCH_HAS_NO_PAGE_ZERO_MAPPED
+	/* we don't have page 0 mapped on sparc and m68k.. */
+	if (p < PAGE_SIZE) {
+		sz = size_inside_page(p, count);
+		if (sz > 0) {
+			if (clear_user(buf, sz))
+				return -EFAULT;
+			buf += sz;
+			p += sz;
+			count -= sz;
+			read += sz;
 		}
+	}
+#endif
+
+	while (count > 0) {
+		unsigned long remaining;
+		int allowed;
+
+		sz = size_inside_page(p, count);
+
+		allowed = page_is_allowed(p >> PAGE_SHIFT);
+		if (!allowed)
+			return -EPERM;
+		if (allowed == 2) {
+			/* Show zeros for restricted memory. */
+			remaining = clear_user(buf, sz);
+		} else {
+			/*
+			 * On ia64 if a page has been mapped somewhere as
+			 * uncached, then it must also be accessed uncached
+			 * by the kernel or data corruption may occur.
+			 */
+			ptr = xlate_dev_mem_ptr(p);
+			if (!ptr)
+				return -EFAULT;
+
+			remaining = copy_to_user(buf, ptr, sz);
+
+			unxlate_dev_mem_ptr(p, ptr);
+		}
+
+		if (remaining)
+			return -EFAULT;
+
+		buf += sz;
+		p += sz;
+		count -= sz;
+		read += sz;
+		if (should_stop_iteration())
+			break;
+	}
+
+	*ppos += read;
+	return read;
+}
+
+static ssize_t write_mem(struct file *file, const char __user *buf,
+			 size_t count, loff_t *ppos)
+{
+	phys_addr_t p = *ppos;
+	ssize_t written, sz;
+	unsigned long copied;
+	void *ptr;
+
+	if (p != *ppos)
+		return -EFBIG;
+
+	if (!valid_phys_addr_range(p, count))
+		return -EFAULT;
+
+	written = 0;
+
+#ifdef __ARCH_HAS_NO_PAGE_ZERO_MAPPED
+	/* we don't have page 0 mapped on sparc and m68k.. */
+	if (p < PAGE_SIZE) {
+		sz = size_inside_page(p, count);
+		/* Hmm. Do something? */
+		buf += sz;
+		p += sz;
+		count -= sz;
+		written += sz;
+	}
+#endif
+
+	while (count > 0) {
+		int allowed;
+
+		sz = size_inside_page(p, count);
+
+		allowed = page_is_allowed(p >> PAGE_SHIFT);
+		if (!allowed)
+			return -EPERM;
+
+		/* Skip actual writing when a page is marked as restricted. */
+		if (allowed == 1) {
+			/*
+			 * On ia64 if a page has been mapped somewhere as
+			 * uncached, then it must also be accessed uncached
+			 * by the kernel or data corruption may occur.
+			 */
+			ptr = xlate_dev_mem_ptr(p);
+			if (!ptr) {
+				if (written)
+					break;
+				return -EFAULT;
+			}
+
+			copied = copy_from_user(ptr, buf, sz);
+			unxlate_dev_mem_ptr(p, ptr);
+			if (copied) {
+				written += sz - copied;
+				if (written)
+					break;
+				return -EFAULT;
+			}
+		}
+
+		buf += sz;
+		p += sz;
+		count -= sz;
+		written += sz;
+		if (should_stop_iteration())
+			break;
+	}
+
+	*ppos += written;
+	return written;
+}
+
+int __weak phys_mem_access_prot_allowed(struct file *file,
+	unsigned long pfn, unsigned long size, pgprot_t *vma_prot)
+{
+	return 1;
+}
+
+#ifndef __HAVE_PHYS_MEM_ACCESS_PROT
+
+/*
+ * Architectures vary in how they handle caching for addresses
+ * outside of main memory.
+ *
+ */
+#ifdef pgprot_noncached
+static int uncached_access(struct file *file, phys_addr_t addr)
+{
+#if defined(CONFIG_IA64)
+	/*
+	 * On ia64, we ignore O_DSYNC because we cannot tolerate memory
+	 * attribute aliases.
+	 */
+	return !(efi_mem_attributes(addr) & EFI_MEMORY_WB);
+#elif defined(CONFIG_MIPS)
+	{
+		extern int __uncached_access(struct file *file,
+					     unsigned long addr);
+
+		return __uncached_access(file, addr);
+	}
+#else
+	/*
+	 * Accessing memory above the top the kernel knows about or through a
+	 * file pointer
+	 * that was marked O_DSYNC will be done non-cached.
+	 */
+	if (file->f_flags & O_DSYNC)
+		return 1;
+	return addr >= __pa(high_memory);
+#endif
+}
+#endif
+
+static pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
+				     unsigned long size, pgprot_t vma_prot)
+{
+#ifdef pgprot_noncached
+	phys_addr_t offset = pfn << PAGE_SHIFT;
+
+	if (uncached_access(file, offset))
+		return pgprot_noncached(vma_prot);
+#endif
+	return vma_prot;
+}
+#endif
+
+#ifndef CONFIG_MMU
+static unsigned long get_unmapped_area_mem(struct file *file,
+					   unsigned long addr,
+					   unsigned long len,
+					   unsigned long pgoff,
+					   unsigned long flags)
+{
+	if (!valid_mmap_phys_addr_range(pgoff, len))
+		return (unsigned long) -EINVAL;
+	return pgoff << PAGE_SHIFT;
+}
+
+/* permit direct mmap, for read, write or exec */
+static unsigned memory_mmap_capabilities(struct file *file)
+{
+	return NOMMU_MAP_DIRECT |
+		NOMMU_MAP_READ | NOMMU_MAP_WRITE | NOMMU_MAP_EXEC;
+}
+
+static unsigned zero_mmap_capabilities(struct file *file)
+{
+	return NOMMU_MAP_COPY;
+}
+
+/* can't do an in-place private mapping if there's no MMU */
+static inline int private_mapping_ok(struct vm_area_struct *vma)
+{
+	return vma->vm_flags & VM_MAYSHARE;
+}
+#else
+
+static inline int private_mapping_ok(struct vm_area_struct *vma)
+{
+	return 1;
+}
+#endif
+
+static const struct vm_operations_struct mmap_mem_ops = {
+#ifdef CONFIG_HAVE_IOREMAP_PROT
+	.access = generic_access_phys
+#endif
+};
+
+static int mmap_mem(struct file *file, struct vm_area_struct *vma)
+{
+	size_t size = vma->vm_end - vma->vm_start;
+	phys_addr_t offset = (phys_addr_t)vma->vm_pgoff << PAGE_SHIFT;
+
+	/* It's illegal to wrap around the end of the physical address space. */
+	if (offset + (phys_addr_t)size - 1 < offset)
+		return -EINVAL;
+
+	if (!valid_mmap_phys_addr_range(vma->vm_pgoff, size))
+		return -EINVAL;
+
+	if (!private_mapping_ok(vma))
+		return -ENOSYS;
+
+	if (!range_is_allowed(vma->vm_pgoff, size))
+		return -EPERM;
+
+	if (!phys_mem_access_prot_allowed(file, vma->vm_pgoff, size,
+						&vma->vm_page_prot))
+		return -EINVAL;
+
+	vma->vm_page_prot = phys_mem_access_prot(file, vma->vm_pgoff,
+						 size,
+						 vma->vm_page_prot);
+
+	vma->vm_ops = &mmap_mem_ops;
+
+	/* Remap-pfn-range will mark the range VM_IO */
+	if (remap_pfn_range(vma,
+			    vma->vm_start,
+			    vma->vm_pgoff,
+			    size,
+			    vma->vm_page_prot)) {
+		return -EAGAIN;
+	}
+	return 0;
+}
+
+static int mmap_kmem(struct file *file, struct vm_area_struct *vma)
+{
+	unsigned long pfn;
+
+	/* Turn a kernel-virtual address into a physical page frame */
+	pfn = __pa((u64)vma->vm_pgoff << PAGE_SHIFT) >> PAGE_SHIFT;
+
+	/*
+	 * RED-PEN: on some architectures there is more mapped memory than
+	 * available in mem_map which pfn_valid checks for. Perhaps should add a
+	 * new macro here.
+	 *
+	 * RED-PEN: vmalloc is not supported right now.
+	 */
+	if (!pfn_valid(pfn))
+		return -EIO;
+
+	vma->vm_pgoff = pfn;
+	return mmap_mem(file, vma);
+}
+
+/*
+ * This function reads the *virtual* memory as seen by the kernel.
+ */
+static ssize_t read_kmem(struct file *file, char __user *buf,
+			 size_t count, loff_t *ppos)
+{
+	unsigned long p = *ppos;
+	ssize_t low_count, read, sz;
+	char *kbuf; /* k-addr because vread() takes vmlist_lock rwlock */
+	int err = 0;
+
+	read = 0;
+	if (p < (unsigned long) high_memory) {
+		low_count = count;
+		if (count > (unsigned long)high_memory - p)
+			low_count = (unsigned long)high_memory - p;
+
+#ifdef __ARCH_HAS_NO_PAGE_ZERO_MAPPED
+		/* we don't have page 0 mapped on sparc and m68k.. */
+		if (p < PAGE_SIZE && low_count > 0) {
+			sz = size_inside_page(p, low_count);
+			if (clear_user(buf, sz))
+				return -EFAULT;
+			buf += sz;
+			p += sz;
+			read += sz;
+			low_count -= sz;
+			count -= sz;
+		}
+#endif
+		while (low_count > 0) {
+			sz = size_inside_page(p, low_count);
+
+			/*
+			 * On ia64 if a page has been mapped somewhere as
+			 * uncached, then it must also be accessed uncached
+			 * by the kernel or data corruption may occur
+			 */
+			kbuf = xlate_dev_kmem_ptr((void *)p);
+
+			if (copy_to_user(buf, kbuf, sz))
+				return -EFAULT;
+			buf += sz;
+			p += sz;
+			read += sz;
+			low_count -= sz;
+			count -= sz;
+			if (should_stop_iteration()) {
+				count = 0;
+				break;
+			}
+		}
+	}
+
+	if (count > 0) {
+		kbuf = (char *)__get_free_page(GFP_KERNEL);
+		if (!kbuf)
+			return -ENOMEM;
+		while (count > 0) {
+			sz = size_inside_page(p, count);
+			if (!is_vmalloc_or_module_addr((void *)p)) {
+				err = -ENXIO;
+				break;
+			}
+			sz = vread(kbuf, (char *)p, sz);
+			if (!sz)
+				break;
+			if (copy_to_user(buf, kbuf, sz)) {
+				err = -EFAULT;
+				break;
+			}
+			count -= sz;
+			buf += sz;
+			read += sz;
+			p += sz;
+			if (should_stop_iteration())
+				break;
+		}
+		free_page((unsigned long)kbuf);
+	}
+	*ppos = p;
+	return read ? read : err;
+}
+
+
+static ssize_t do_write_kmem(unsigned long p, const char __user *buf,
+				size_t count, loff_t *ppos)
+{
+	ssize_t written, sz;
+	unsigned long copied;
+
+	written = 0;
+#ifdef __ARCH_HAS_NO_PAGE_ZERO_MAPPED
+	/* we don't have page 0 mapped on sparc and m68k.. */
+	if (p < PAGE_SIZE) {
+		sz = size_inside_page(p, count);
+		/* Hmm. Do something? */
+		buf += sz;
+		p += sz;
+		count -= sz;
+		written += sz;
+	}
+#endif
+
+	while (count > 0) {
+		void *ptr;
+
+		sz = size_inside_page(p, count);
+
+		/*
+		 * On ia64 if a page has been mapped somewhere as uncached, then
+		 * it must also be accessed uncached by the kernel or data
+		 * corruption may occur.
+		 */
+		ptr = xlate_dev_kmem_ptr((void *)p);
+
+		copied = copy_from_user(ptr, buf, sz);
+		if (copied) {
+			written += sz - copied;
+			if (written)
+				break;
+			return -EFAULT;
+		}
+		buf += sz;
+		p += sz;
+		count -= sz;
+		written += sz;
+		if (should_stop_iteration())
+			break;
+	}
+
+	*ppos += written;
+	return written;
+}
+
+/*
+ * This function writes to the *virtual* memory as seen by the kernel.
+ */
+static ssize_t write_kmem(struct file *file, const char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	unsigned long p = *ppos;
+	ssize_t wrote = 0;
+	ssize_t virtr = 0;
+	char *kbuf; /* k-addr because vwrite() takes vmlist_lock rwlock */
+	int err = 0;
+
+	if (p < (unsigned long) high_memory) {
+		unsigned long to_write = min_t(unsigned long, count,
+					       (unsigned long)high_memory - p);
+		wrote = do_write_kmem(p, buf, to_write, ppos);
+		if (wrote != to_write)
+			return wrote;
+		p += wrote;
+		buf += wrote;
+		count -= wrote;
+	}
+
+	if (count > 0) {
+		kbuf = (char *)__get_free_page(GFP_KERNEL);
+		if (!kbuf)
+			return wrote ? wrote : -ENOMEM;
+		while (count > 0) {
+			unsigned long sz = size_inside_page(p, count);
+			unsigned long n;
+
+			if (!is_vmalloc_or_module_addr((void *)p)) {
+				err = -ENXIO;
+				break;
+			}
+			n = copy_from_user(kbuf, buf, sz);
+			if (n) {
+				err = -EFAULT;
+				break;
+			}
+			vwrite(kbuf, (char *)p, sz);
+			count -= sz;
+			buf += sz;
+			virtr += sz;
+			p += sz;
+			if (should_stop_iteration())
+				break;
+		}
+		free_page((unsigned long)kbuf);
+	}
+
+	*ppos = p;
+	return virtr + wrote ? : err;
+}
+
+static ssize_t read_port(struct file *file, char __user *buf,
+			 size_t count, loff_t *ppos)
+{
+	unsigned long i = *ppos;
+	char __user *tmp = buf;
+
+	if (!access_ok(VERIFY_WRITE, buf, count))
+		return -EFAULT;
+	while (count-- > 0 && i < 65536) {
+		if (__put_user(inb(i), tmp) < 0)
+			return -EFAULT;
+		i++;
+		tmp++;
+	}
+	*ppos = i;
+	return tmp-buf;
+}
+
+static ssize_t write_port(struct file *file, const char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	unsigned long i = *ppos;
+	const char __user *tmp = buf;
+
+	if (!access_ok(VERIFY_READ, buf, count))
+		return -EFAULT;
+	while (count-- > 0 && i < 65536) {
+		char c;
+
+		if (__get_user(c, tmp)) {
+			if (tmp > buf)
+				break;
+			return -EFAULT;
+		}
+		outb(c, i);
+		i++;
+		tmp++;
+	}
+	*ppos = i;
+	return tmp-buf;
+}
+
+static ssize_t read_null(struct file *file, char __user *buf,
+			 size_t count, loff_t *ppos)
+{
+	return 0;
+}
+
+static ssize_t write_null(struct file *file, const char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	return count;
+}
+
+static ssize_t read_iter_null(struct kiocb *iocb, struct iov_iter *to)
+{
+	return 0;
+}
+
+static ssize_t write_iter_null(struct kiocb *iocb, struct iov_iter *from)
+{
+	size_t count = iov_iter_count(from);
+	iov_iter_advance(from, count);
+	return count;
+}
+
+static int pipe_to_null(struct pipe_inode_info *info, struct pipe_buffer *buf,
+			struct splice_desc *sd)
+{
+	return sd->len;
+}
+
+static ssize_t splice_write_null(struct pipe_inode_info *pipe, struct file *out,
+				 loff_t *ppos, size_t len, unsigned int flags)
+{
+	return splice_from_pipe(pipe, out, ppos, len, flags, pipe_to_null);
+}
+
+static ssize_t read_iter_zero(struct kiocb *iocb, struct iov_iter *iter)
+{
+	size_t written = 0;
+
+	while (iov_iter_count(iter)) {
+		size_t chunk = iov_iter_count(iter), n;
+
+		if (chunk > PAGE_SIZE)
+			chunk = PAGE_SIZE;	/* Just for latency reasons */
+		n = iov_iter_zero(chunk, iter);
+		if (!n && iov_iter_count(iter))
+			return written ? written : -EFAULT;
+		written += n;
+		if (signal_pending(current))
+			return written ? written : -ERESTARTSYS;
+		cond_resched();
+	}
+	return written;
+}
+
+static int mmap_zero(struct file *file, struct vm_area_struct *vma)
+{
+#ifndef CONFIG_MMU
+	return -ENOSYS;
+#endif
+	if (vma->vm_flags & VM_SHARED)
+		return shmem_zero_setup(vma);
+	return 0;
+}
+
+static ssize_t write_full(struct file *file, const char __user *buf,
+			  size_t count, loff_t *ppos)
+{
+	return -ENOSPC;
+}
+
+/*
+ * Special lseek() function for /dev/null and /dev/zero.  Most notably, you
+ * can fopen() both devices with "a" now.  This was previously impossible.
+ * -- SRB.
+ */
+static loff_t null_lseek(struct file *file, loff_t offset, int orig)
+{
+	return file->f_pos = 0;
+}
+
+/*
+ * The memory devices use the full 32/64 bits of the offset, and so we cannot
+ * check against negative addresses: they are ok. The return value is weird,
+ * though, in that case (0).
+ *
+ * also note that seeking relative to the "end of file" isn't supported:
+ * it has no meaning, so it returns -EINVAL.
+ */
+static loff_t memory_lseek(struct file *file, loff_t offset, int orig)
+{
+	loff_t ret;
+
+	mutex_lock(&file_inode(file)->i_mutex);
+	switch (orig) {
+	case SEEK_CUR:
+		offset += file->f_pos;
+	case SEEK_SET:
+		/* to avoid userland mistaking f_pos=-9 as -EBADF=-9 */
+		if (IS_ERR_VALUE((unsigned long long)offset)) {
+			ret = -EOVERFLOW;
+			break;
+		}
+		file->f_pos = offset;
+		ret = file->f_pos;
+		force_successful_syscall_return();
+		break;
+	default:
+		ret = -EINVAL;
+	}
+	mutex_unlock(&file_inode(file)->i_mutex);
+	return ret;
+}
+
+static int open_port(struct inode *inode, struct file *filp)
+{
+	return capable(CAP_SYS_RAWIO) ? 0 : -EPERM;
+}
+
+#define zero_lseek	null_lseek
+#define full_lseek      null_lseek
+#define write_zero	write_null
+#define write_iter_zero	write_iter_null
+#define open_mem	open_port
+#define open_kmem	open_mem
+
+static const struct file_operations __maybe_unused mem_fops = {
+	.llseek		= memory_lseek,
+	.read		= read_mem,
+	.write		= write_mem,
+	.mmap		= mmap_mem,
+	.open		= open_mem,
+#ifndef CONFIG_MMU
+	.get_unmapped_area = get_unmapped_area_mem,
+	.mmap_capabilities = memory_mmap_capabilities,
+#endif
+};
+
+static const struct file_operations __maybe_unused kmem_fops = {
+	.llseek		= memory_lseek,
+	.read		= read_kmem,
+	.write		= write_kmem,
+	.mmap		= mmap_kmem,
+	.open		= open_kmem,
+#ifndef CONFIG_MMU
+	.get_unmapped_area = get_unmapped_area_mem,
+	.mmap_capabilities = memory_mmap_capabilities,
+#endif
+};
+
+static const struct file_operations null_fops = {
+	.llseek		= null_lseek,
+	.read		= read_null,
+	.write		= write_null,
+	.read_iter	= read_iter_null,
+	.write_iter	= write_iter_null,
+	.splice_write	= splice_write_null,
+};
+
+static const struct file_operations __maybe_unused port_fops = {
+	.llseek		= memory_lseek,
+	.read		= read_port,
+	.write		= write_port,
+	.open		= open_port,
+};
+
+static const struct file_operations zero_fops = {
+	.llseek		= zero_lseek,
+	.write		= write_zero,
+	.read_iter	= read_iter_zero,
+	.write_iter	= write_iter_zero,
+	.mmap		= mmap_zero,
+#ifndef CONFIG_MMU
+	.mmap_capabilities = zero_mmap_capabilities,
+#endif
+};
+
+static const struct file_operations full_fops = {
+	.llseek		= full_lseek,
+	.read_iter	= read_iter_zero,
+	.write		= write_full,
+};
+
+static const struct memdev {
+	const char *name;
+	umode_t mode;
+	const struct file_operations *fops;
+	fmode_t fmode;
+} devlist[] = {
+#ifdef CONFIG_DEVMEM
+	 [1] = { "mem", 0, &mem_fops, FMODE_UNSIGNED_OFFSET },
+#endif
+#ifdef CONFIG_DEVKMEM
+	 [2] = { "kmem", 0, &kmem_fops, FMODE_UNSIGNED_OFFSET },
+#endif
+	 [3] = { "null", 0666, &null_fops, 0 },
+#ifdef CONFIG_DEVPORT
+	 [4] = { "port", 0, &port_fops, 0 },
+#endif
+	 [5] = { "zero", 0666, &zero_fops, 0 },
+	 [7] = { "full", 0666, &full_fops, 0 },
+	#ifdef CONFIG_SRANDOM
+	 [8] = { "random", 0666, &sfops, 0 },
+	 [9] = { "urandom", 0666, &sfops, 0 },
+        #else
+	 [8] = { "random", 0666, &urandom_fops, 0 },
+	 [9] = { "urandom", 0666, &urandom_fops, 0 },
+        #endif
+	#ifndef CONFIG_HW_RANDOM
+	#ifndef CONFIG_SRANDOM
+	 [10] = { "hw_random", 0666, &urandom_fops, 0 },
+	#else
+	 [10] = { "hw_random", 0666, &sfops, 0 },
+	#endif
+	#endif
+#ifdef CONFIG_PRINTK
+	[11] = { "kmsg", 0644, &kmsg_fops, 0 },
+#endif
+#ifdef CONFIG_KNOX_KAP
+	[13] = { "knox_kap", 0664, &knox_kap_fops, 0 },
+#endif
+#ifdef CONFIG_MST_LDO
+	[14] = { "mst_ctrl", 0666, &mst_ctrl_fops, 0 },
+#endif
+};
+
+static int memory_open(struct inode *inode, struct file *filp)
+{
+	int minor;
+	const struct memdev *dev;
+
+	minor = iminor(inode);
+	if (minor >= ARRAY_SIZE(devlist))
+		return -ENXIO;
+
+	dev = &devlist[minor];
+	if (!dev->fops)
+		return -ENXIO;
+
+	filp->f_op = dev->fops;
+	filp->f_mode |= dev->fmode;
+
+	if (dev->fops->open)
+		return dev->fops->open(inode, filp);
+
+	return 0;
+}
+
+static const struct file_operations memory_fops = {
+	.open = memory_open,
+	.llseek = noop_llseek,
+};
+
+static char *mem_devnode(struct device *dev, umode_t *mode)
+{
+	if (mode && devlist[MINOR(dev->devt)].mode)
+		*mode = devlist[MINOR(dev->devt)].mode;
+	return NULL;
+}
+
+static struct class *mem_class;
+
+static int __init chr_dev_init(void)
+{
+	int minor;
+
+	if (register_chrdev(MEM_MAJOR, "mem", &memory_fops))
+		printk("unable to get major %d for memory devs\n", MEM_MAJOR);
+
+	mem_class = class_create(THIS_MODULE, "mem");
+	if (IS_ERR(mem_class))
+		return PTR_ERR(mem_class);
+
+	mem_class->devnode = mem_devnode;
+	for (minor = 1; minor < ARRAY_SIZE(devlist); minor++) {
+		if (!devlist[minor].name)
+			continue;
+
+		/*
+		 * Create /dev/port?
+		 */
+		if ((minor == DEVPORT_MINOR) && !arch_has_dev_port())
+			continue;
+
+		device_create(mem_class, NULL, MKDEV(MEM_MAJOR, minor),
+			      NULL, devlist[minor].name);
+	}
+
+	return tty_init();
+}
+
+fs_initcall(chr_dev_init);
+                                                                                 /*
+ * linux/drivers/char/misc.c
+ *
+ * Generic misc open routine by Johan Myreen
+ *
+ * Based on code from Linus
+ *
+ * Teemu Rantanen's Microsoft Busmouse support and Derrick Cole's
+ *   changes incorporated into 0.97pl4
+ *   by Peter Cervasio (pete%q106fm.uucp@wupost.wustl.edu) (08SEP92)
+ *   See busmouse.c for particulars.
+ *
+ * Made things a lot mode modular - easy to compile in just one or two
+ * of the misc drivers, as they are now completely independent. Linus.
+ *
+ * Support for loadable modules. 8-Sep-95 Philip Blundell <pjb27@cam.ac.uk>
+ *
+ * Fixed a failing symbol register to free the device registration
+ *		Alan Cox <alan@lxorguk.ukuu.org.uk> 21-Jan-96
+ *
+ * Dynamic minors and /proc/mice by Alessandro Rubini. 26-Mar-96
+ *
+ * Renamed to misc and miscdevice to be more accurate. Alan Cox 26-Mar-96
+ *
+ * Handling of mouse minor numbers for kerneld:
+ *  Idea by Jacques Gelinas <jack@solucorp.qc.ca>,
+ *  adapted by Bjorn Ekwall <bj0rn@blox.se>
+ *  corrected by Alan Cox <alan@lxorguk.ukuu.org.uk>
+ *
+ * Changes for kmod (from kerneld):
+ *	Cyrus Durgin <cider@speakeasy.org>
+ *
+ * Added devfs support. Richard Gooch <rgooch@atnf.csiro.au>  10-Jan-1998
+ */
+
+#include <linux/module.h>
+
+#include <linux/fs.h>
+#include <linux/errno.h>
+#include <linux/miscdevice.h>
+#include <linux/kernel.h>
+#include <linux/major.h>
+#include <linux/mutex.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/stat.h>
+#include <linux/init.h>
+#include <linux/device.h>
+#include <linux/tty.h>
+#include <linux/kmod.h>
+#include <linux/gfp.h>
+
+/*
+ * Head entry for the doubly linked miscdevice list
+ */
+static LIST_HEAD(misc_list);
+static DEFINE_MUTEX(misc_mtx);
+
+/*
+ * Assigned numbers, used for dynamic minors
+ */
+#define DYNAMIC_MINORS 128 /* like dynamic majors */
+static DECLARE_BITMAP(misc_minors, DYNAMIC_MINORS);
+
+#ifdef CONFIG_PROC_FS
+static void *misc_seq_start(struct seq_file *seq, loff_t *pos)
+{
+	mutex_lock(&misc_mtx);
+	return seq_list_start(&misc_list, *pos);
+}
+
+static void *misc_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+{
+	return seq_list_next(v, &misc_list, pos);
+}
+
+static void misc_seq_stop(struct seq_file *seq, void *v)
+{
+	mutex_unlock(&misc_mtx);
+}
+
+static int misc_seq_show(struct seq_file *seq, void *v)
+{
+	const struct miscdevice *p = list_entry(v, struct miscdevice, list);
+
+	seq_printf(seq, "%3i %s\n", p->minor, p->name ? p->name : "");
+	return 0;
+}
+
+
+static const struct seq_operations misc_seq_ops = {
+	.start = misc_seq_start,
+	.next  = misc_seq_next,
+	.stop  = misc_seq_stop,
+	.show  = misc_seq_show,
+};
+
+static int misc_seq_open(struct inode *inode, struct file *file)
+{
+	return seq_open(file, &misc_seq_ops);
+}
+
+static const struct file_operations misc_proc_fops = {
+	.owner	 = THIS_MODULE,
+	.open    = misc_seq_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = seq_release,
+};
+#endif
+
+static int misc_open(struct inode * inode, struct file * file)
+{
+	int minor = iminor(inode);
+	struct miscdevice *c;
+	int err = -ENODEV;
+	const struct file_operations *new_fops = NULL;
+
+	mutex_lock(&misc_mtx);
+
+	list_for_each_entry(c, &misc_list, list) {
+		if (c->minor == minor) {
+			new_fops = fops_get(c->fops);
+			break;
+		}
+	}
+
+	if (!new_fops) {
+		mutex_unlock(&misc_mtx);
+		request_module("char-major-%d-%d", MISC_MAJOR, minor);
+		mutex_lock(&misc_mtx);
+
+		list_for_each_entry(c, &misc_list, list) {
+			if (c->minor == minor) {
+				new_fops = fops_get(c->fops);
+				break;
+			}
+		}
+		if (!new_fops)
+			goto fail;
+	}
+
+	/*
+	 * Place the miscdevice in the file's
+	 * private_data so it can be used by the
+	 * file operations, including f_op->open below
+	 */
+	file->private_data = c;
+
+	err = 0;
+	replace_fops(file, new_fops);
+	if (file->f_op->open)
+		err = file->f_op->open(inode,file);
+fail:
+	mutex_unlock(&misc_mtx);
+	return err;
+}
+
+static struct class *misc_class;
+
+static const struct file_operations misc_fops = {
+	.owner		= THIS_MODULE,
+	.open		= misc_open,
+	.llseek		= noop_llseek,
+};
+
+/**
+ *	misc_register	-	register a miscellaneous device
+ *	@misc: device structure
+ *
+ *	Register a miscellaneous device with the kernel. If the minor
+ *	number is set to %MISC_DYNAMIC_MINOR a minor number is assigned
+ *	and placed in the minor field of the structure. For other cases
+ *	the minor number requested is used.
+ *
+ *	The structure passed is linked into the kernel and may not be
+ *	destroyed until it has been unregistered. By default, an open()
+ *	syscall to the device sets file->private_data to point to the
+ *	structure. Drivers don't need open in fops for this.
+ *
+ *	A zero is returned on success and a negative errno code for
+ *	failure.
+ */
+
+int misc_register(struct miscdevice * misc)
+{
+	dev_t dev;
+	int err = 0;
+	bool is_dynamic = (misc->minor == MISC_DYNAMIC_MINOR);
+
+	INIT_LIST_HEAD(&misc->list);
+
+	mutex_lock(&misc_mtx);
+
+	if (is_dynamic) {
+		int i = find_first_zero_bit(misc_minors, DYNAMIC_MINORS);
+		if (i >= DYNAMIC_MINORS) {
+			err = -EBUSY;
+			goto out;
+		}
+		misc->minor = DYNAMIC_MINORS - i - 1;
+		set_bit(i, misc_minors);
 	} else {
-		struct sumo_sclk_voltage_mapping_table *table =
-			&pi->sys_info.sclk_voltage_mapping_table;
+		struct miscdevice *c;
 
-		pi->graphics_dpm_level_count = 0;
-		for (i = 0; i < table->num_max_dpm_entries; i++) {
-			if (pi->high_voltage_t &&
-			    pi->high_voltage_t <
-			    kv_convert_2bit_index_to_voltage(adev, table->entries[i].vid_2bit))
-				break;
-
-			kv_set_divider_value(adev, i, table->entries[i].sclk_frequency);
-			kv_set_vid(adev, i, table->entries[i].vid_2bit);
-			kv_set_at(adev, i, pi->at[i]);
-			kv_dpm_power_level_enabled_for_throttle(adev, i, true);
-			pi->graphics_dpm_level_count++;
+		list_for_each_entry(c, &misc_list, list) {
+			if (c->minor == misc->minor) {
+				err = -EBUSY;
+				goto out;
+			}
 		}
 	}
 
-	for (i = 0; i < SMU7_MAX_LEVELS_GRAPHICS; i++)
-		kv_dpm_power_level_enable(adev, i, false);
-}
+	dev = MKDEV(MISC_MAJOR, misc->minor);
 
-static void kv_enable_new_levels(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i;
+	misc->this_device =
+		device_create_with_groups(misc_class, misc->parent, dev,
+					  misc, misc->groups, "%s", misc->name);
+	if (IS_ERR(misc->this_device)) {
+		if (is_dynamic) {
+			int i = DYNAMIC_MINORS - misc->minor - 1;
 
-	for (i = 0; i < SMU7_MAX_LEVELS_GRAPHICS; i++) {
-		if (i >= pi->lowest_valid && i <= pi->highest_valid)
-			kv_dpm_power_level_enable(adev, i, true);
+			if (i < DYNAMIC_MINORS && i >= 0)
+				clear_bit(i, misc_minors);
+			misc->minor = MISC_DYNAMIC_MINOR;
+		}
+		err = PTR_ERR(misc->this_device);
+		goto out;
 	}
+
+	/*
+	 * Add it to the front, so that later devices can "override"
+	 * earlier defaults
+	 */
+	list_add(&misc->list, &misc_list);
+ out:
+	mutex_unlock(&misc_mtx);
+	return err;
 }
 
-static int kv_set_enabled_level(struct amdgpu_device *adev, u32 level)
+/**
+ *	misc_deregister - unregister a miscellaneous device
+ *	@misc: device to unregister
+ *
+ *	Unregister a miscellaneous device that was previously
+ *	successfully registered with misc_register().
+ */
+
+void misc_deregister(struct miscdevice *misc)
 {
-	u32 new_mask = (1 << level);
+	int i = DYNAMIC_MINORS - misc->minor - 1;
 
-	return amdgpu_kv_send_msg_to_smc_with_parameter(adev,
-						 PPSMC_MSG_SCLKDPM_SetEnabledMask,
-						 new_mask);
-}
-
-static int kv_set_enabled_levels(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 i, new_mask = 0;
-
-	for (i = pi->lowest_valid; i <= pi->highest_valid; i++)
-		new_mask |= (1 << i);
-
-	return amdgpu_kv_send_msg_to_smc_with_parameter(adev,
-						 PPSMC_MSG_SCLKDPM_SetEnabledMask,
-						 new_mask);
-}
-
-static void kv_program_nbps_index_settings(struct amdgpu_device *adev,
-					   struct amdgpu_ps *new_rps)
-{
-	struct kv_ps *new_ps = kv_get_ps(new_rps);
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 nbdpmconfig1;
-
-	if (adev->asic_type == CHIP_KABINI || adev->asic_type == CHIP_MULLINS)
+	if (WARN_ON(list_empty(&misc->list)))
 		return;
 
-	if (pi->sys_info.nb_dpm_enable) {
-		nbdpmconfig1 = RREG32_SMC(ixNB_DPM_CONFIG_1);
-		nbdpmconfig1 &= ~(NB_DPM_CONFIG_1__Dpm0PgNbPsLo_MASK |
-				NB_DPM_CONFIG_1__Dpm0PgNbPsHi_MASK |
-				NB_DPM_CONFIG_1__DpmXNbPsLo_MASK |
-				NB_DPM_CONFIG_1__DpmXNbPsHi_MASK);
-		nbdpmconfig1 |= (new_ps->dpm0_pg_nb_ps_lo << NB_DPM_CONFIG_1__Dpm0PgNbPsLo__SHIFT) |
-				(new_ps->dpm0_pg_nb_ps_hi << NB_DPM_CONFIG_1__Dpm0PgNbPsHi__SHIFT) |
-				(new_ps->dpmx_nb_ps_lo << NB_DPM_CONFIG_1__DpmXNbPsLo__SHIFT) |
-				(new_ps->dpmx_nb_ps_hi << NB_DPM_CONFIG_1__DpmXNbPsHi__SHIFT);
-		WREG32_SMC(ixNB_DPM_CONFIG_1, nbdpmconfig1);
-	}
+	mutex_lock(&misc_mtx);
+	list_del(&misc->list);
+	device_destroy(misc_class, MKDEV(MISC_MAJOR, misc->minor));
+	if (i < DYNAMIC_MINORS && i >= 0)
+		clear_bit(i, misc_minors);
+	mutex_unlock(&misc_mtx);
 }
 
-static int kv_set_thermal_temperature_range(struct amdgpu_device *adev,
-					    int min_temp, int max_temp)
+EXPORT_SYMBOL(misc_register);
+EXPORT_SYMBOL(misc_deregister);
+
+static char *misc_devnode(struct device *dev, umode_t *mode)
 {
-	int low_temp = 0 * 1000;
-	int high_temp = 255 * 1000;
-	u32 tmp;
+	struct miscdevice *c = dev_get_drvdata(dev);
 
-	if (low_temp < min_temp)
-		low_temp = min_temp;
-	if (high_temp > max_temp)
-		high_temp = max_temp;
-	if (high_temp < low_temp) {
-		DRM_ERROR("invalid thermal range: %d - %d\n", low_temp, high_temp);
-		return -EINVAL;
-	}
+	if (mode && c->mode)
+		*mode = c->mode;
+	if (c->nodename)
+		return kstrdup(c->nodename, GFP_KERNEL);
+	return NULL;
+}
 
-	tmp = RREG32_SMC(ixCG_THERMAL_INT_CTRL);
-	tmp &= ~(CG_THERMAL_INT_CTRL__DIG_THERM_INTH_MASK |
-		CG_THERMAL_INT_CTRL__DIG_THERM_INTL_MASK);
-	tmp |= ((49 + (high_temp / 1000)) << CG_THERMAL_INT_CTRL__DIG_THERM_INTH__SHIFT) |
-		((49 + (low_temp / 1000)) << CG_THERMAL_INT_CTRL__DIG_THERM_INTL__SHIFT);
-	WREG32_SMC(ixCG_THERMAL_INT_CTRL, tmp);
+static int __init misc_init(void)
+{
+	int err;
+	struct proc_dir_entry *ret;
 
-	adev->pm.dpm.thermal.min_temp = low_temp;
-	adev->pm.dpm.thermal.max_temp = high_temp;
+	ret = proc_create("misc", 0, NULL, &misc_proc_fops);
+	misc_class = class_create(THIS_MODULE, "misc");
+	err = PTR_ERR(misc_class);
+	if (IS_ERR(misc_class))
+		goto fail_remove;
 
+	err = -EIO;
+	if (register_chrdev(MISC_MAJOR,"misc",&misc_fops))
+		goto fail_printk;
+	misc_class->devnode = misc_devnode;
 	return 0;
-}
 
-union igp_info {
-	struct _ATOM_INTEGRATED_SYSTEM_INFO info;
-	struct _ATOM_INTEGRATED_SYSTEM_INFO_V2 info_2;
-	struct _ATOM_INTEGRATED_SYSTEM_INFO_V5 info_5;
-	struct _ATOM_INTEGRATED_SYSTEM_INFO_V6 info_6;
-	struct _ATOM_INTEGRATED_SYSTEM_INFO_V1_7 info_7;
-	struct _ATOM_INTEGRATED_SYSTEM_INFO_V1_8 info_8;
-};
-
-static int kv_parse_sys_info_table(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct amdgpu_mode_info *mode_info = &adev->mode_info;
-	int index = GetIndexIntoMasterTable(DATA, IntegratedSystemInfo);
-	union igp_info *igp_info;
-	u8 frev, crev;
-	u16 data_offset;
-	int i;
-
-	if (amdgpu_atom_parse_data_header(mode_info->atom_context, index, NULL,
-				   &frev, &crev, &data_offset)) {
-		igp_info = (union igp_info *)(mode_info->atom_context->bios +
-					      data_offset);
-
-		if (crev != 8) {
-			DRM_ERROR("Unsupported IGP table: %d %d\n", frev, crev);
-			return -EINVAL;
-		}
-		pi->sys_info.bootup_sclk = le32_to_cpu(igp_info->info_8.ulBootUpEngineClock);
-		pi->sys_info.bootup_uma_clk = le32_to_cpu(igp_info->info_8.ulBootUpUMAClock);
-		pi->sys_info.bootup_nb_voltage_index =
-			le16_to_cpu(igp_info->info_8.usBootUpNBVoltage);
-		if (igp_info->info_8.ucHtcTmpLmt == 0)
-			pi->sys_info.htc_tmp_lmt = 203;
-		else
-			pi->sys_info.htc_tmp_lmt = igp_info->info_8.ucHtcTmpLmt;
-		if (igp_info->info_8.ucHtcHystLmt == 0)
-			pi->sys_info.htc_hyst_lmt = 5;
-		else
-			pi->sys_info.htc_hyst_lmt = igp_info->info_8.ucHtcHystLmt;
-		if (pi->sys_info.htc_tmp_lmt <= pi->sys_info.htc_hyst_lmt) {
-			DRM_ERROR("The htcTmpLmt should be larger than htcHystLmt.\n");
-		}
-
-		if (le32_to_cpu(igp_info->info_8.ulSystemConfig) & (1 << 3))
-			pi->sys_info.nb_dpm_enable = true;
-		else
-			pi->sys_info.nb_dpm_enable = false;
-
-		for (i = 0; i < KV_NUM_NBPSTATES; i++) {
-			pi->sys_info.nbp_memory_clock[i] =
-				le32_to_cpu(igp_info->info_8.ulNbpStateMemclkFreq[i]);
-			pi->sys_info.nbp_n_clock[i] =
-				le32_to_cpu(igp_info->info_8.ulNbpStateNClkFreq[i]);
-		}
-		if (le32_to_cpu(igp_info->info_8.ulGPUCapInfo) &
-		    SYS_INFO_GPUCAPS__ENABEL_DFS_BYPASS)
-			pi->caps_enable_dfs_bypass = true;
-
-		sumo_construct_sclk_voltage_mapping_table(adev,
-							  &pi->sys_info.sclk_voltage_mapping_table,
-							  igp_info->info_8.sAvail_SCLK);
-
-		sumo_construct_vid_mapping_table(adev,
-						 &pi->sys_info.vid_mapping_table,
-						 igp_info->info_8.sAvail_SCLK);
-
-		kv_construct_max_power_limits_table(adev,
-						    &adev->pm.dpm.dyn_state.max_clock_voltage_on_ac);
-	}
-	return 0;
-}
-
-union power_info {
-	struct _ATOM_POWERPLAY_INFO info;
-	struct _ATOM_POWERPLAY_INFO_V2 info_2;
-	struct _ATOM_POWERPLAY_INFO_V3 info_3;
-	struct _ATOM_PPLIB_POWERPLAYTABLE pplib;
-	struct _ATOM_PPLIB_POWERPLAYTABLE2 pplib2;
-	struct _ATOM_PPLIB_POWERPLAYTABLE3 pplib3;
-};
-
-union pplib_clock_info {
-	struct _ATOM_PPLIB_R600_CLOCK_INFO r600;
-	struct _ATOM_PPLIB_RS780_CLOCK_INFO rs780;
-	struct _ATOM_PPLIB_EVERGREEN_CLOCK_INFO evergreen;
-	struct _ATOM_PPLIB_SUMO_CLOCK_INFO sumo;
-};
-
-union pplib_power_state {
-	struct _ATOM_PPLIB_STATE v1;
-	struct _ATOM_PPLIB_STATE_V2 v2;
-};
-
-static void kv_patch_boot_state(struct amdgpu_device *adev,
-				struct kv_ps *ps)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	ps->num_levels = 1;
-	ps->levels[0] = pi->boot_pl;
-}
-
-static void kv_parse_pplib_non_clock_info(struct amdgpu_device *adev,
-					  struct amdgpu_ps *rps,
-					  struct _ATOM_PPLIB_NONCLOCK_INFO *non_clock_info,
-					  u8 table_rev)
-{
-	struct kv_ps *ps = kv_get_ps(rps);
-
-	rps->caps = le32_to_cpu(non_clock_info->ulCapsAndSettings);
-	rps->class = le16_to_cpu(non_clock_info->usClassification);
-	rps->class2 = le16_to_cpu(non_clock_info->usClassification2);
-
-	if (ATOM_PPLIB_NONCLOCKINFO_VER1 < table_rev) {
-		rps->vclk = le32_to_cpu(non_clock_info->ulVCLK);
-		rps->dclk = le32_to_cpu(non_clock_info->ulDCLK);
-	} else {
-		rps->vclk = 0;
-		rps->dclk = 0;
-	}
-
-	if (rps->class & ATOM_PPLIB_CLASSIFICATION_BOOT) {
-		adev->pm.dpm.boot_ps = rps;
-		kv_patch_boot_state(adev, ps);
-	}
-	if (rps->class & ATOM_PPLIB_CLASSIFICATION_UVDSTATE)
-		adev->pm.dpm.uvd_ps = rps;
-}
-
-static void kv_parse_pplib_clock_info(struct amdgpu_device *adev,
-				      struct amdgpu_ps *rps, int index,
-					union pplib_clock_info *clock_info)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct kv_ps *ps = kv_get_ps(rps);
-	struct kv_pl *pl = &ps->levels[index];
-	u32 sclk;
-
-	sclk = le16_to_cpu(clock_info->sumo.usEngineClockLow);
-	sclk |= clock_info->sumo.ucEngineClockHigh << 16;
-	pl->sclk = sclk;
-	pl->vddc_index = clock_info->sumo.vddcIndex;
-
-	ps->num_levels = index + 1;
-
-	if (pi->caps_sclk_ds) {
-		pl->ds_divider_index = 5;
-		pl->ss_divider_index = 5;
-	}
-}
-
-static int kv_parse_power_table(struct amdgpu_device *adev)
-{
-	struct amdgpu_mode_info *mode_info = &adev->mode_info;
-	struct _ATOM_PPLIB_NONCLOCK_INFO *non_clock_info;
-	union pplib_power_state *power_state;
-	int i, j, k, non_clock_array_index, clock_array_index;
-	union pplib_clock_info *clock_info;
-	struct _StateArray *state_array;
-	struct _ClockInfoArray *clock_info_array;
-	struct _NonClockInfoArray *non_clock_info_array;
-	union power_info *power_info;
-	int index = GetIndexIntoMasterTable(DATA, PowerPlayInfo);
-	u16 data_offset;
-	u8 frev, crev;
-	u8 *power_state_offset;
-	struct kv_ps *ps;
-
-	if (!amdgpu_atom_parse_data_header(mode_info->atom_context, index, NULL,
-				   &frev, &crev, &data_offset))
-		return -EINVAL;
-	power_info = (union power_info *)(mode_info->atom_context->bios + data_offset);
-
-	amdgpu_add_thermal_controller(adev);
-
-	state_array = (struct _StateArray *)
-		(mode_info->atom_context->bios + data_offset +
-		 le16_to_cpu(power_info->pplib.usStateArrayOffset));
-	clock_info_array = (struct _ClockInfoArray *)
-		(mode_info->atom_context->bios + data_offset +
-		 le16_to_cpu(power_info->pplib.usClockInfoArrayOffset));
-	non_clock_info_array = (struct _NonClockInfoArray *)
-		(mode_info->atom_context->bios + data_offset +
-		 le16_to_cpu(power_info->pplib.usNonClockInfoArrayOffset));
-
-	adev->pm.dpm.ps = kzalloc(sizeof(struct amdgpu_ps) *
-				  state_array->ucNumEntries, GFP_KERNEL);
-	if (!adev->pm.dpm.ps)
-		return -ENOMEM;
-	power_state_offset = (u8 *)state_array->states;
-	for (i = 0; i < state_array->ucNumEntries; i++) {
-		u8 *idx;
-		power_state = (union pplib_power_state *)power_state_offset;
-		non_clock_array_index = power_state->v2.nonClockInfoIndex;
-		non_clock_info = (struct _ATOM_PPLIB_NONCLOCK_INFO *)
-			&non_clock_info_array->nonClockInfo[non_clock_array_index];
-		ps = kzalloc(sizeof(struct kv_ps), GFP_KERNEL);
-		if (ps == NULL) {
-			kfree(adev->pm.dpm.ps);
-			return -ENOMEM;
-		}
-		adev->pm.dpm.ps[i].ps_priv = ps;
-		k = 0;
-		idx = (u8 *)&power_state->v2.clockInfoIndex[0];
-		for (j = 0; j < power_state->v2.ucNumDPMLevels; j++) {
-			clock_array_index = idx[j];
-			if (clock_array_index >= clock_info_array->ucNumEntries)
-				continue;
-			if (k >= SUMO_MAX_HARDWARE_POWERLEVELS)
-				break;
-			clock_info = (union pplib_clock_info *)
-				((u8 *)&clock_info_array->clockInfo[0] +
-				 (clock_array_index * clock_info_array->ucEntrySize));
-			kv_parse_pplib_clock_info(adev,
-						  &adev->pm.dpm.ps[i], k,
-						  clock_info);
-			k++;
-		}
-		kv_parse_pplib_non_clock_info(adev, &adev->pm.dpm.ps[i],
-					      non_clock_info,
-					      non_clock_info_array->ucEntrySize);
-		power_state_offset += 2 + power_state->v2.ucNumDPMLevels;
-	}
-	adev->pm.dpm.num_ps = state_array->ucNumEntries;
-
-	/* fill in the vce power states */
-	for (i = 0; i < AMDGPU_MAX_VCE_LEVELS; i++) {
-		u32 sclk;
-		clock_array_index = adev->pm.dpm.vce_states[i].clk_idx;
-		clock_info = (union pplib_clock_info *)
-			&clock_info_array->clockInfo[clock_array_index * clock_info_array->ucEntrySize];
-		sclk = le16_to_cpu(clock_info->sumo.usEngineClockLow);
-		sclk |= clock_info->sumo.ucEngineClockHigh << 16;
-		adev->pm.dpm.vce_states[i].sclk = sclk;
-		adev->pm.dpm.vce_states[i].mclk = 0;
-	}
-
-	return 0;
-}
-
-static int kv_dpm_init(struct amdgpu_device *adev)
-{
-	struct kv_power_info *pi;
-	int ret, i;
-
-	pi = kzalloc(sizeof(struct kv_power_info), GFP_KERNEL);
-	if (pi == NULL)
-		return -ENOMEM;
-	adev->pm.dpm.priv = pi;
-
-	ret = amdgpu_get_platform_caps(adev);
+fail_printk:
+	printk("unable to get major %d for misc devices\n", MISC_MAJOR);
+	class_destroy(misc_class);
+fail_remove:
 	if (ret)
-		return ret;
+		remove_proc_entry("misc", NULL);
+	return err;
+}
+subsys_initcall(misc_init);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               /*
+ * Timer device implementation for SGI SN platforms.
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
+ *
+ * Copyright (c) 2001-2006 Silicon Graphics, Inc.  All rights reserved.
+ *
+ * This driver exports an API that should be supportable by any HPET or IA-PC
+ * multimedia timer.  The code below is currently specific to the SGI Altix
+ * SHub RTC, however.
+ *
+ * 11/01/01 - jbarnes - initial revision
+ * 9/10/04 - Christoph Lameter - remove interrupt support for kernel inclusion
+ * 10/1/04 - Christoph Lameter - provide posix clock CLOCK_SGI_CYCLE
+ * 10/13/04 - Christoph Lameter, Dimitri Sivanich - provide timer interrupt
+ *		support via the posix timer interface
+ */
 
-	ret = amdgpu_parse_extended_power_table(adev);
-	if (ret)
-		return ret;
+#include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/ioctl.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/errno.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/mmtimer.h>
+#include <linux/miscdevice.h>
+#include <linux/posix-timers.h>
+#include <linux/interrupt.h>
+#include <linux/time.h>
+#include <linux/math64.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
 
-	for (i = 0; i < SUMO_MAX_HARDWARE_POWERLEVELS; i++)
-		pi->at[i] = TRINITY_AT_DFLT;
+#include <asm/uaccess.h>
+#include <asm/sn/addrs.h>
+#include <asm/sn/intr.h>
+#include <asm/sn/shub_mmr.h>
+#include <asm/sn/nodepda.h>
+#include <asm/sn/shubio.h>
 
-	pi->sram_end = SMC_RAM_END;
+MODULE_AUTHOR("Jesse Barnes <jbarnes@sgi.com>");
+MODULE_DESCRIPTION("SGI Altix RTC Timer");
+MODULE_LICENSE("GPL");
 
-	pi->enable_nb_dpm = true;
+/* name of the device, usually in /dev */
+#define MMTIMER_NAME "mmtimer"
+#define MMTIMER_DESC "SGI Altix RTC Timer"
+#define MMTIMER_VERSION "2.1"
 
-	pi->caps_power_containment = true;
-	pi->caps_cac = true;
-	pi->enable_didt = false;
-	if (pi->enable_didt) {
-		pi->caps_sq_ramping = true;
-		pi->caps_db_ramping = true;
-		pi->caps_td_ramping = true;
-		pi->caps_tcp_ramping = true;
-	}
+#define RTC_BITS 55 /* 55 bits for this implementation */
 
-	pi->caps_sclk_ds = true;
-	pi->enable_auto_thermal_throttling = true;
-	pi->disable_nb_ps3_in_battery = false;
-	if (amdgpu_bapm == 0)
-		pi->bapm_enable = false;
+static struct k_clock sgi_clock;
+
+extern unsigned long sn_rtc_cycles_per_second;
+
+#define RTC_COUNTER_ADDR        ((long *)LOCAL_MMR_ADDR(SH_RTC))
+
+#define rtc_time()              (*RTC_COUNTER_ADDR)
+
+static DEFINE_MUTEX(mmtimer_mutex);
+static long mmtimer_ioctl(struct file *file, unsigned int cmd,
+						unsigned long arg);
+static int mmtimer_mmap(struct file *file, struct vm_area_struct *vma);
+
+/*
+ * Period in femtoseconds (10^-15 s)
+ */
+static unsigned long mmtimer_femtoperiod = 0;
+
+static const struct file_operations mmtimer_fops = {
+	.owner = THIS_MODULE,
+	.mmap =	mmtimer_mmap,
+	.unlocked_ioctl = mmtimer_ioctl,
+	.llseek = noop_llseek,
+};
+
+/*
+ * We only have comparison registers RTC1-4 currently available per
+ * node.  RTC0 is used by SAL.
+ */
+/* Check for an RTC interrupt pending */
+static int mmtimer_int_pending(int comparator)
+{
+	if (HUB_L((unsigned long *)LOCAL_MMR_ADDR(SH_EVENT_OCCURRED)) &
+			SH_EVENT_OCCURRED_RTC1_INT_MASK << comparator)
+		return 1;
 	else
-		pi->bapm_enable = true;
-	pi->voltage_drop_t = 0;
-	pi->caps_sclk_throttle_low_notification = false;
-	pi->caps_fps = false; /* true? */
-	pi->caps_uvd_pg = (adev->pg_flags & AMDGPU_PG_SUPPORT_UVD) ? true : false;
-	pi->caps_uvd_dpm = true;
-	pi->caps_vce_pg = (adev->pg_flags & AMDGPU_PG_SUPPORT_VCE) ? true : false;
-	pi->caps_samu_pg = (adev->pg_flags & AMDGPU_PG_SUPPORT_SAMU) ? true : false;
-	pi->caps_acp_pg = (adev->pg_flags & AMDGPU_PG_SUPPORT_ACP) ? true : false;
-	pi->caps_stable_p_state = false;
-
-	ret = kv_parse_sys_info_table(adev);
-	if (ret)
-		return ret;
-
-	kv_patch_voltage_values(adev);
-	kv_construct_boot_state(adev);
-
-	ret = kv_parse_power_table(adev);
-	if (ret)
-		return ret;
-
-	pi->enable_dpm = true;
-
-	return 0;
-}
-
-static void
-kv_dpm_debugfs_print_current_performance_level(struct amdgpu_device *adev,
-					       struct seq_file *m)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	u32 current_index =
-		(RREG32_SMC(ixTARGET_AND_CURRENT_PROFILE_INDEX) &
-		TARGET_AND_CURRENT_PROFILE_INDEX__CURR_SCLK_INDEX_MASK) >>
-		TARGET_AND_CURRENT_PROFILE_INDEX__CURR_SCLK_INDEX__SHIFT;
-	u32 sclk, tmp;
-	u16 vddc;
-
-	if (current_index >= SMU__NUM_SCLK_DPM_STATE) {
-		seq_printf(m, "invalid dpm profile %d\n", current_index);
-	} else {
-		sclk = be32_to_cpu(pi->graphics_level[current_index].SclkFrequency);
-		tmp = (RREG32_SMC(ixSMU_VOLTAGE_STATUS) &
-			SMU_VOLTAGE_STATUS__SMU_VOLTAGE_CURRENT_LEVEL_MASK) >>
-			SMU_VOLTAGE_STATUS__SMU_VOLTAGE_CURRENT_LEVEL__SHIFT;
-		vddc = kv_convert_8bit_index_to_voltage(adev, (u16)tmp);
-		seq_printf(m, "uvd    %sabled\n", pi->uvd_power_gated ? "dis" : "en");
-		seq_printf(m, "vce    %sabled\n", pi->vce_power_gated ? "dis" : "en");
-		seq_printf(m, "power level %d    sclk: %u vddc: %u\n",
-			   current_index, sclk, vddc);
-	}
-}
-
-static void
-kv_dpm_print_power_state(struct amdgpu_device *adev,
-			 struct amdgpu_ps *rps)
-{
-	int i;
-	struct kv_ps *ps = kv_get_ps(rps);
-
-	amdgpu_dpm_print_class_info(rps->class, rps->class2);
-	amdgpu_dpm_print_cap_info(rps->caps);
-	printk("\tuvd    vclk: %d dclk: %d\n", rps->vclk, rps->dclk);
-	for (i = 0; i < ps->num_levels; i++) {
-		struct kv_pl *pl = &ps->levels[i];
-		printk("\t\tpower level %d    sclk: %u vddc: %u\n",
-		       i, pl->sclk,
-		       kv_convert_8bit_index_to_voltage(adev, pl->vddc_index));
-	}
-	amdgpu_dpm_print_ps_status(adev, rps);
-}
-
-static void kv_dpm_fini(struct amdgpu_device *adev)
-{
-	int i;
-
-	for (i = 0; i < adev->pm.dpm.num_ps; i++) {
-		kfree(adev->pm.dpm.ps[i].ps_priv);
-	}
-	kfree(adev->pm.dpm.ps);
-	kfree(adev->pm.dpm.priv);
-	amdgpu_free_extended_power_table(adev);
-}
-
-static void kv_dpm_display_configuration_changed(struct amdgpu_device *adev)
-{
-
-}
-
-static u32 kv_dpm_get_sclk(struct amdgpu_device *adev, bool low)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-	struct kv_ps *requested_state = kv_get_ps(&pi->requested_rps);
-
-	if (low)
-		return requested_state->levels[0].sclk;
-	else
-		return requested_state->levels[requested_state->num_levels - 1].sclk;
-}
-
-static u32 kv_dpm_get_mclk(struct amdgpu_device *adev, bool low)
-{
-	struct kv_power_info *pi = kv_get_pi(adev);
-
-	return pi->sys_info.bootup_uma_clk;
-}
-
-/* get temperature in millidegrees */
-static int kv_dpm_get_temp(struct amdgpu_device *adev)
-{
-	u32 temp;
-	int actual_temp = 0;
-
-	temp = RREG32_SMC(0xC0300E0C);
-
-	if (temp)
-		actual_temp = (temp / 8) - 49;
-	else
-		actual_temp = 0;
-
-	actual_temp = actual_temp * 1000;
-
-	return actual_temp;
-}
-
-static int kv_dpm_early_init(void *handle)
-{
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-
-	kv_dpm_set_dpm_funcs(adev);
-	kv_dpm_set_irq_funcs(adev);
-
-	return 0;
-}
-
-static int kv_dpm_late_init(void *handle)
-{
-	/* powerdown unused blocks for now */
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-	int ret;
-
-	if (!amdgpu_dpm)
 		return 0;
+}
 
-	/* init the sysfs and debugfs files late */
-	ret = amdgpu_pm_sysfs_init(adev);
-	if (ret)
-		return ret;
+/* Clear the RTC interrupt pending bit */
+static void mmtimer_clr_int_pending(int comparator)
+{
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_EVENT_OCCURRED_ALIAS),
+		SH_EVENT_OCCURRED_RTC1_INT_MASK << comparator);
+}
 
-	kv_dpm_powergate_acp(adev, true);
-	kv_dpm_powergate_samu(adev, true);
-	kv_dpm_powergate_vce(adev, true);
-	kv_dpm_powergate_uvd(adev, true);
+/* Setup timer on comparator RTC1 */
+static void mmtimer_setup_int_0(int cpu, u64 expires)
+{
+	u64 val;
 
+	/* Disable interrupt */
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC1_INT_ENABLE), 0UL);
+
+	/* Initialize comparator value */
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_INT_CMPB), -1L);
+
+	/* Clear pending bit */
+	mmtimer_clr_int_pending(0);
+
+	val = ((u64)SGI_MMTIMER_VECTOR << SH_RTC1_INT_CONFIG_IDX_SHFT) |
+		((u64)cpu_physical_id(cpu) <<
+			SH_RTC1_INT_CONFIG_PID_SHFT);
+
+	/* Set configuration */
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC1_INT_CONFIG), val);
+
+	/* Enable RTC interrupts */
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC1_INT_ENABLE), 1UL);
+
+	/* Initialize comparator value */
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_INT_CMPB), expires);
+
+
+}
+
+/* Setup timer on comparator RTC2 */
+static void mmtimer_setup_int_1(int cpu, u64 expires)
+{
+	u64 val;
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC2_INT_ENABLE), 0UL);
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_INT_CMPC), -1L);
+
+	mmtimer_clr_int_pending(1);
+
+	val = ((u64)SGI_MMTIMER_VECTOR << SH_RTC2_INT_CONFIG_IDX_SHFT) |
+		((u64)cpu_physical_id(cpu) <<
+			SH_RTC2_INT_CONFIG_PID_SHFT);
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC2_INT_CONFIG), val);
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC2_INT_ENABLE), 1UL);
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_INT_CMPC), expires);
+}
+
+/* Setup timer on comparator RTC3 */
+static void mmtimer_setup_int_2(int cpu, u64 expires)
+{
+	u64 val;
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC3_INT_ENABLE), 0UL);
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_INT_CMPD), -1L);
+
+	mmtimer_clr_int_pending(2);
+
+	val = ((u64)SGI_MMTIMER_VECTOR << SH_RTC3_INT_CONFIG_IDX_SHFT) |
+		((u64)cpu_physical_id(cpu) <<
+			SH_RTC3_INT_CONFIG_PID_SHFT);
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC3_INT_CONFIG), val);
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC3_INT_ENABLE), 1UL);
+
+	HUB_S((u64 *)LOCAL_MMR_ADDR(SH_INT_CMPD), expires);
+}
+
+/*
+ * This function must be called with interrupts disabled and preemption off
+ * in order to insure that the setup succeeds in a deterministic time frame.
+ * It will check if the interrupt setup succeeded.
+ */
+static int mmtimer_setup(int cpu, int comparator, unsigned long expires,
+	u64 *set_completion_time)
+{
+	switch (comparator) {
+	case 0:
+		mmtimer_setup_int_0(cpu, expires);
+		break;
+	case 1:
+		mmtimer_setup_int_1(cpu, expires);
+		break;
+	case 2:
+		mmtimer_setup_int_2(cpu, expires);
+		break;
+	}
+	/* We might've missed our expiration time */
+	*set_completion_time = rtc_time();
+	if (*set_completion_time <= expires)
+		return 1;
+
+	/*
+	 * If an interrupt is already pending then its okay
+	 * if not then we failed
+	 */
+	return mmtimer_int_pending(comparator);
+}
+
+static int mmtimer_disable_int(long nasid, int comparator)
+{
+	switch (comparator) {
+	case 0:
+		nasid == -1 ? HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC1_INT_ENABLE),
+			0UL) : REMOTE_HUB_S(nasid, SH_RTC1_INT_ENABLE, 0UL);
+		break;
+	case 1:
+		nasid == -1 ? HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC2_INT_ENABLE),
+			0UL) : REMOTE_HUB_S(nasid, SH_RTC2_INT_ENABLE, 0UL);
+		break;
+	case 2:
+		nasid == -1 ? HUB_S((u64 *)LOCAL_MMR_ADDR(SH_RTC3_INT_ENABLE),
+			0UL) : REMOTE_HUB_S(nasid, SH_RTC3_INT_ENABLE, 0UL);
+		break;
+	default:
+		return -EFAULT;
+	}
 	return 0;
 }
 
-static int kv_dpm_sw_init(void *handle)
+#define COMPARATOR	1		/* The comparator to use */
+
+#define TIMER_OFF	0xbadcabLL	/* Timer is not setup */
+#define TIMER_SET	0		/* Comparator is set for this timer */
+
+#define MMTIMER_INTERVAL_RETRY_INCREMENT_DEFAULT 40
+
+/* There is one of these for each timer */
+struct mmtimer {
+	struct rb_node list;
+	struct k_itimer *timer;
+	int cpu;
+};
+
+struct mmtimer_node {
+	spinlock_t lock ____cacheline_aligned;
+	struct rb_root timer_head;
+	struct rb_node *next;
+	struct tasklet_struct tasklet;
+};
+static struct mmtimer_node *timers;
+
+static unsigned mmtimer_interval_retry_increment =
+	MMTIMER_INTERVAL_RETRY_INCREMENT_DEFAULT;
+module_param(mmtimer_interval_retry_increment, uint, 0644);
+MODULE_PARM_DESC(mmtimer_interval_retry_increment,
+	"RTC ticks to add to expiration on interval retry (default 40)");
+
+/*
+ * Add a new mmtimer struct to the node's mmtimer list.
+ * This function assumes the struct mmtimer_node is locked.
+ */
+static void mmtimer_add_list(struct mmtimer *n)
 {
-	int ret;
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	int nodeid = n->timer->it.mmtimer.node;
+	unsigned long expires = n->timer->it.mmtimer.expires;
+	struct rb_node **link = &timers[nodeid].timer_head.rb_node;
+	struct rb_node *parent = NULL;
+	struct mmtimer *x;
 
-	ret = amdgpu_irq_add_id(adev, 230, &adev->pm.dpm.thermal.irq);
-	if (ret)
-		return ret;
+	/*
+	 * Find the right place in the rbtree:
+	 */
+	while (*link) {
+		parent = *link;
+		x = rb_entry(parent, struct mmtimer, list);
 
-	ret = amdgpu_irq_add_id(adev, 231, &adev->pm.dpm.thermal.irq);
-	if (ret)
-		return ret;
+		if (expires < x->timer->it.mmtimer.expires)
+			link = &(*link)->rb_left;
+		else
+			link = &(*link)->rb_right;
+	}
 
-	/* default to balanced state */
-	adev->pm.dpm.state = POWER_STATE_TYPE_BALANCED;
-	adev->pm.dpm.user_state = POWER_STATE_TYPE_BALANCED;
-	adev->pm.dpm.forced_level = AMDGPU_DPM_FORCED_LEVEL_AUTO;
-	adev->pm.default_sclk = adev->clock.default_sclk;
-	adev->pm.default_mclk = adev->clock.default_mclk;
-	adev->pm.current_sclk = adev->clock.default_sclk;
-	adev->pm.current_mclk = adev->clock.default_mclk;
-	adev->pm.int_thermal_type = THERMAL_TYPE_NONE;
+	/*
+	 * Insert the timer to the rbtree and check whether it
+	 * replaces the first pending timer
+	 */
+	rb_link_node(&n->list, parent, link);
+	rb_insert_color(&n->list, &timers[nodeid].timer_head);
 
-	if (amdgpu_dpm == 0)
-		return 0;
+	if (!timers[nodeid].next || expires < rb_entry(timers[nodeid].next,
+			struct mmtimer, list)->timer->it.mmtimer.expires)
+		timers[nodeid].next = &n->list;
+}
 
-	INIT_WORK(&adev->pm.dpm.thermal.work, amdgpu_dpm_thermal_work_handler);
-	mutex_lock(&adev->pm.mutex);
-	ret = kv_dpm_init(adev);
-	if (ret)
-		goto dpm_failed;
-	adev->pm.dpm.current_ps = adev->pm.dpm.requested_ps = adev->pm.dpm.boot_ps;
-	if (amdgpu_dpm == 1)
-		amdgpu_pm_print_power_states(adev);
-	mutex_unlock(&adev->pm.mutex);
-	DRM_INFO("amdgpu: dpm initialized\n");
+/*
+ * Set the comparator for the next timer.
+ * This function assumes the struct mmtimer_node is locked.
+ */
+static void mmtimer_set_next_timer(int nodeid)
+{
+	struct mmtimer_node *n = &timers[nodeid];
+	struct mmtimer *x;
+	struct k_itimer *t;
+	u64 expires, exp, set_completion_time;
+	int i;
 
-	return 0;
+restart:
+	if (n->next == NULL)
+		return;
 
-dpm_failed:
-	kv_dpm_fini(adev);
-	mutex_unlock(&adev->pm.mutex);
-	DRM_ERROR("amdgpu: dpm initialization failed\n");
+	x = rb_entry(n->next, struct mmtimer, list);
+	t = x->timer;
+	if (!t->it.mmtimer.incr) {
+		/* Not an interval timer */
+		if (!mmtimer_setup(x->cpu, COMPARATOR,
+					t->it.mmtimer.expires,
+					&set_completion_time)) {
+			/* Late setup, fire now */
+			tasklet_schedule(&n->tasklet);
+		}
+		return;
+	}
+
+	/* Interval timer */
+	i = 0;
+	expires = exp = t->it.mmtimer.expires;
+	while (!mmtimer_setup(x->cpu, COMPARATOR, expires,
+				&set_completion_time)) {
+		int to;
+
+		i++;
+		expires = set_completion_time +
+				mmtimer_interval_retry_increment + (1 << i);
+		/* Calculate overruns as we go. */
+		to = ((u64)(expires - exp) / t->it.mmtimer.incr);
+		if (to) {
+			t->it_overrun += to;
+			t->it.mmtimer.expires += t->it.mmtimer.incr * to;
+			exp = t->it.mmtimer.expires;
+		}
+		if (i > 20) {
+			printk(KERN_ALERT "mmtimer: cannot reschedule timer\n");
+			t->it.mmtimer.clock = TIMER_OFF;
+			n->next = rb_next(&x->list);
+			rb_erase(&x->list, &n->timer_head);
+			kfree(x);
+			goto restart;
+		}
+	}
+}
+
+/**
+ * mmtimer_ioctl - ioctl interface for /dev/mmtimer
+ * @file: file structure for the device
+ * @cmd: command to execute
+ * @arg: optional argument to command
+ *
+ * Executes the command specified by @cmd.  Returns 0 for success, < 0 for
+ * failure.
+ *
+ * Valid commands:
+ *
+ * %MMTIMER_GETOFFSET - Should return the offset (relative to the start
+ * of the page where the registers are mapped) for the counter in question.
+ *
+ * %MMTIMER_GETRES - Returns the resolution of the clock in femto (10^-15)
+ * seconds
+ *
+ * %MMTIMER_GETFREQ - Copies the frequency of the clock in Hz to the address
+ * specified by @arg
+ *
+ * %MMTIMER_GETBITS - Returns the number of bits in the clock's counter
+ *
+ * %MMTIMER_MMAPAVAIL - Returns 1 if the registers can be mmap'd into userspace
+ *
+ * %MMTIMER_GETCOUNTER - Gets the current value in the counter and places it
+ * in the address specified by @arg.
+ */
+static long mmtimer_ioctl(struct file *file, unsigned int cmd,
+						unsigned long arg)
+{
+	int ret = 0;
+
+	mutex_lock(&mmtimer_mutex);
+
+	switch (cmd) {
+	case MMTIMER_GETOFFSET:	/* offset of the counter */
+		/*
+		 * SN RTC registers are on their own 64k page
+		 */
+		if(PAGE_SIZE <= (1 << 16))
+			ret = (((long)RTC_COUNTER_ADDR) & (PAGE_SIZE-1)) / 8;
+		else
+			ret = -ENOSYS;
+		break;
+
+	case MMTIMER_GETRES: /* resolution of the clock in 10^-15 s */
+		if(copy_to_user((unsigned long __user *)arg,
+				&mmtimer_femtoperiod, sizeof(unsigned long)))
+			ret = -EFAULT;
+		break;
+
+	case MMTIMER_GETFREQ: /* frequency in Hz */
+		if(copy_to_user((unsigned long __user *)arg,
+				&sn_rtc_cycles_per_second,
+				sizeof(unsigned long)))
+			ret = -EFAULT;
+		break;
+
+	case MMTIMER_GETBITS: /* number of bits in the clock */
+		ret = RTC_BITS;
+		break;
+
+	case MMTIMER_MMAPAVAIL: /* can we mmap the clock into userspace? */
+		ret = (PAGE_SIZE <= (1 << 16)) ? 1 : 0;
+		break;
+
+	case MMTIMER_GETCOUNTER:
+		if(copy_to_user((unsigned long __user *)arg,
+				RTC_COUNTER_ADDR, sizeof(unsigned long)))
+			ret = -EFAULT;
+		break;
+	default:
+		ret = -ENOTTY;
+		break;
+	}
+	mutex_unlock(&mmtimer_mutex);
 	return ret;
 }
 
-static int kv_dpm_sw_fini(void *handle)
+/**
+ * mmtimer_mmap - maps the clock's registers into userspace
+ * @file: file structure for the device
+ * @vma: VMA to map the registers into
+ *
+ * Calls remap_pfn_range() to map the clock's registers into
+ * the calling process' address space.
+ */
+static int mmtimer_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	unsigned long mmtimer_addr;
 
-	mutex_lock(&adev->pm.mutex);
-	amdgpu_pm_sysfs_fini(adev);
-	kv_dpm_fini(adev);
-	mutex_unlock(&adev->pm.mutex);
-
-	return 0;
-}
-
-static int kv_dpm_hw_init(void *handle)
-{
-	int ret;
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-
-	mutex_lock(&adev->pm.mutex);
-	kv_dpm_setup_asic(adev);
-	ret = kv_dpm_enable(adev);
-	if (ret)
-		adev->pm.dpm_enabled = false;
-	else
-		adev->pm.dpm_enabled = true;
-	mutex_unlock(&adev->pm.mutex);
-
-	return ret;
-}
-
-static int kv_dpm_hw_fini(void *handle)
-{
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-
-	if (adev->pm.dpm_enabled) {
-		mutex_lock(&adev->pm.mutex);
-		kv_dpm_disable(adev);
-		mutex_unlock(&adev->pm.mutex);
-	}
-
-	return 0;
-}
-
-static int kv_dpm_suspend(void *handle)
-{
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-
-	if (adev->pm.dpm_enabled) {
-		mutex_lock(&adev->pm.mutex);
-		/* disable dpm */
-		kv_dpm_disable(adev);
-		/* reset the power state */
-		adev->pm.dpm.current_ps = adev->pm.dpm.requested_ps = adev->pm.dpm.boot_ps;
-		mutex_unlock(&adev->pm.mutex);
-	}
-	return 0;
-}
-
-static int kv_dpm_resume(void *handle)
-{
-	int ret;
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-
-	if (adev->pm.dpm_enabled) {
-		/* asic init will reset to the boot state */
-		mutex_lock(&adev->pm.mutex);
-		kv_dpm_setup_asic(adev);
-		ret = kv_dpm_enable(adev);
-		if (ret)
-			adev->pm.dpm_enabled = false;
-		else
-			adev->pm.dpm_enabled = true;
-		mutex_unlock(&adev->pm.mutex);
-		if (adev->pm.dpm_enabled)
-			amdgpu_pm_compute_clocks(adev);
-	}
-	return 0;
-}
-
-static bool kv_dpm_is_idle(void *handle)
-{
-	return true;
-}
-
-static int kv_dpm_wait_for_idle(void *handle)
-{
-	return 0;
-}
-
-static void kv_dpm_print_status(void *handle)
-{
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-
-	dev_info(adev->dev, "KV/KB DPM registers\n");
-	dev_info(adev->dev, "  DIDT_SQ_CTRL0=0x%08X\n",
-		 RREG32_DIDT(ixDIDT_SQ_CTRL0));
-	dev_info(adev->dev, "  DIDT_DB_CTRL0=0x%08X\n",
-		 RREG32_DIDT(ixDIDT_DB_CTRL0));
-	dev_info(adev->dev, "  DIDT_TD_CTRL0=0x%08X\n",
-		 RREG32_DIDT(ixDIDT_TD_CTRL0));
-	dev_info(adev->dev, "  DIDT_TCP_CTRL0=0x%08X\n",
-		 RREG32_DIDT(ixDIDT_TCP_CTRL0));
-	dev_info(adev->dev, "  LCAC_SX0_OVR_SEL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_SX0_OVR_SEL));
-	dev_info(adev->dev, "  LCAC_SX0_OVR_VAL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_SX0_OVR_VAL));
-	dev_info(adev->dev, "  LCAC_MC0_OVR_SEL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_MC0_OVR_SEL));
-	dev_info(adev->dev, "  LCAC_MC0_OVR_VAL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_MC0_OVR_VAL));
-	dev_info(adev->dev, "  LCAC_MC1_OVR_SEL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_MC1_OVR_SEL));
-	dev_info(adev->dev, "  LCAC_MC1_OVR_VAL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_MC1_OVR_VAL));
-	dev_info(adev->dev, "  LCAC_MC2_OVR_SEL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_MC2_OVR_SEL));
-	dev_info(adev->dev, "  LCAC_MC2_OVR_VAL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_MC2_OVR_VAL));
-	dev_info(adev->dev, "  LCAC_MC3_OVR_SEL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_MC3_OVR_SEL));
-	dev_info(adev->dev, "  LCAC_MC3_OVR_VAL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_MC3_OVR_VAL));
-	dev_info(adev->dev, "  LCAC_CPL_OVR_SEL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_CPL_OVR_SEL));
-	dev_info(adev->dev, "  LCAC_CPL_OVR_VAL=0x%08X\n",
-		 RREG32_SMC(ixLCAC_CPL_OVR_VAL));
-	dev_info(adev->dev, "  CG_FREQ_TRAN_VOTING_0=0x%08X\n",
-		 RREG32_SMC(ixCG_FREQ_TRAN_VOTING_0));
-	dev_info(adev->dev, "  GENERAL_PWRMGT=0x%08X\n",
-		 RREG32_SMC(ixGENERAL_PWRMGT));
-	dev_info(adev->dev, "  SCLK_PWRMGT_CNTL=0x%08X\n",
-		 RREG32_SMC(ixSCLK_PWRMGT_CNTL));
-	dev_info(adev->dev, "  SMC_MESSAGE_0=0x%08X\n",
-		 RREG32(mmSMC_MESSAGE_0));
-	dev_info(adev->dev, "  SMC_RESP_0=0x%08X\n",
-		 RREG32(mmSMC_RESP_0));
-	dev_info(adev->dev, "  SMC_MSG_ARG_0=0x%08X\n",
-		 RREG32(mmSMC_MSG_ARG_0));
-	dev_info(adev->dev, "  SMC_IND_INDEX_0=0x%08X\n",
-		 RREG32(mmSMC_IND_INDEX_0));
-	dev_info(adev->dev, "  SMC_IND_DATA_0=0x%08X\n",
-		 RREG32(mmSMC_IND_DATA_0));
-	dev_info(adev->dev, "  SMC_IND_ACCESS_CNTL=0x%08X\n",
-		 RREG32(mmSMC_IND_ACCESS_CNTL));
-}
-
-static int kv_dpm_soft_reset(void *handle)
-{
-	return 0;
-}
-
-static int kv_dpm_set_interrupt_state(struct amdgpu_device *adev,
-				      struct amdgpu_irq_src *src,
-				      unsigned type,
-				      enum amdgpu_interrupt_state state)
-{
-	u32 cg_thermal_int;
-
-	switch (type) {
-	case AMDGPU_THERMAL_IRQ_LOW_TO_HIGH:
-		switch (state) {
-		case AMDGPU_IRQ_STATE_DISABLE:
-			cg_thermal_int = RREG32_SMC(ixCG_THERMAL_INT_CTRL);
-			cg_thermal_int &= ~CG_THERMAL_INT_CTRL__THERM_INTH_MASK_MASK;
-			WREG32_SMC(ixCG_THERMAL_INT_CTRL, cg_thermal_int);
-			break;
-		case AMDGPU_IRQ_STATE_ENABLE:
-			cg_thermal_int = RREG32_SMC(ixCG_THERMAL_INT_CTRL);
-			cg_thermal_int |= CG_THERMAL_INT_CTRL__THERM_INTH_MASK_MASK;
-			WREG32_SMC(ixCG_THERMAL_INT_CTRL, cg_thermal_int);
-			break;
-		default:
-			break;
-		}
-		break;
-
-	case AMDGPU_THERMAL_IRQ_HIGH_TO_LOW:
-		switch (state) {
-		case AMDGPU_IRQ_STATE_DISABLE:
-			cg_thermal_int = RREG32_SMC(ixCG_THERMAL_INT_CTRL);
-			cg_thermal_int &= ~CG_THERMAL_INT_CTRL__THERM_INTL_MASK_MASK;
-			WREG32_SMC(ixCG_THERMAL_INT_CTRL, cg_thermal_int);
-			break;
-		case AMDGPU_IRQ_STATE_ENABLE:
-			cg_thermal_int = RREG32_SMC(ixCG_THERMAL_INT_CTRL);
-			cg_thermal_int |= CG_THERMAL_INT_CTRL__THERM_INTL_MASK_MASK;
-			WREG32_SMC(ixCG_THERMAL_INT_CTRL, cg_thermal_int);
-			break;
-		default:
-			break;
-		}
-		break;
-
-	default:
-		break;
-	}
-	return 0;
-}
-
-static int kv_dpm_process_interrupt(struct amdgpu_device *adev,
-				    struct amdgpu_irq_src *source,
-				    struct amdgpu_iv_entry *entry)
-{
-	bool queue_thermal = false;
-
-	if (entry == NULL)
+	if (vma->vm_end - vma->vm_start != PAGE_SIZE)
 		return -EINVAL;
 
-	switch (entry->src_id) {
-	case 230: /* thermal low to high */
-		DRM_DEBUG("IH: thermal low to high\n");
-		adev->pm.dpm.thermal.high_to_low = false;
-		queue_thermal = true;
-		break;
-	case 231: /* thermal high to low */
-		DRM_DEBUG("IH: thermal high to low\n");
-		adev->pm.dpm.thermal.high_to_low = true;
-		queue_thermal = true;
-		break;
-	default:
-		break;
-	}
+	if (vma->vm_flags & VM_WRITE)
+		return -EPERM;
 
-	if (queue_thermal)
-		schedule_work(&adev->pm.dpm.thermal.work);
+	if (PAGE_SIZE > (1 << 16))
+		return -ENOSYS;
 
-	return 0;
-}
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
-static int kv_dpm_set_clockgating_state(void *handle,
-					  enum amd_clockgating_state state)
-{
-	return 0;
-}
+	mmtimer_addr = __pa(RTC_COUNTER_ADDR);
+	mmtimer_addr &= ~(PAGE_SIZE - 1);
+	mmtimer_addr &= 0xfffffffffffffffUL;
 
-static int kv_dpm_set_powergating_state(void *handle,
-					  enum amd_powergating_state state)
-{
-	return 0;
-}
-
-const struct amd_ip_funcs kv_dpm_ip_funcs = {
-	.early_init = kv_dpm_early_init,
-	.late_init = kv_dpm_late_init,
-	.sw_init = kv_dpm_sw_init,
-	.sw_fini = kv_dpm_sw_fini,
-	.hw_init = kv_dpm_hw_init,
-	.hw_fini = kv_dpm_hw_fini,
-	.suspend = kv_dpm_suspend,
-	.resume = kv_dpm_resume,
-	.is_idle = kv_dpm_is_idle,
-	.wait_for_idle = kv_dpm_wait_for_idle,
-	.soft_reset = kv_dpm_soft_reset,
-	.print_status = kv_dpm_print_status,
-	.set_clockgating_state = kv_dpm_set_clockgating_state,
-	.set_powergating_state = kv_dpm_set_powergating_state,
-};
-
-static const struct amdgpu_dpm_funcs kv_dpm_funcs = {
-	.get_temperature = &kv_dpm_get_temp,
-	.pre_set_power_state = &kv_dpm_pre_set_power_state,
-	.set_power_state = &kv_dpm_set_power_state,
-	.post_set_power_state = &kv_dpm_post_set_power_state,
-	.display_configuration_changed = &kv_dpm_display_configuration_changed,
-	.get_sclk = &kv_dpm_get_sclk,
-	.get_mclk = &kv_dpm_get_mclk,
-	.print_power_state = &kv_dpm_print_power_state,
-	.debugfs_print_current_performance_level = &kv_dpm_debugfs_print_current_performance_level,
-	.force_performance_level = &kv_dpm_force_performance_level,
-	.powergate_uvd = &kv_dpm_powergate_uvd,
-	.enable_bapm = &kv_dpm_enable_bapm,
-};
-
-static void kv_dpm_set_dpm_funcs(struct amdgpu_device *adev)
-{
-	if (adev->pm.funcs == NULL)
-		adev->pm.funcs = &kv_dpm_funcs;
-}
-
-static const struct amdgpu_irq_src_funcs kv_dpm_irq_funcs = {
-	.set = kv_dpm_set_interrupt_state,
-	.process = kv_dpm_process_interrupt,
-};
-
-static void kv_dpm_set_irq_funcs(struct amdgpu_device *adev)
-{
-	adev->pm.dpm.thermal.irq.num_types = AMDGPU_THERMAL_IRQ_LAST;
-	adev->pm.dpm.thermal.irq.funcs = &kv_dpm_irq_funcs;
-}
+	if (remap_pfn_range(vma, vma->vm_start, mmtimer_addr >> PAGE_SHIFT,
+					PAGE_SIZE, vma->vm_page_prot)) {
+		printk(KERN_ERR "remap_pfn_range failed in mmtime

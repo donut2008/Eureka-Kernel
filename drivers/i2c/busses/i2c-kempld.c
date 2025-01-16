@@ -1,409 +1,207 @@
-/*
- * I2C bus driver for Kontron COM modules
- *
- * Copyright (c) 2010-2013 Kontron Europe GmbH
- * Author: Michael Brunner <michael.brunner@kontron.com>
- *
- * The driver is based on the i2c-ocores driver by Peter Korsgaard.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License 2 as published
- * by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/i2c.h>
-#include <linux/delay.h>
-#include <linux/mfd/kempld.h>
-
-#define KEMPLD_I2C_PRELOW	0x0b
-#define KEMPLD_I2C_PREHIGH	0x0c
-#define KEMPLD_I2C_DATA		0x0e
-
-#define KEMPLD_I2C_CTRL		0x0d
-#define I2C_CTRL_IEN		0x40
-#define I2C_CTRL_EN		0x80
-
-#define KEMPLD_I2C_STAT		0x0f
-#define I2C_STAT_IF		0x01
-#define I2C_STAT_TIP		0x02
-#define I2C_STAT_ARBLOST	0x20
-#define I2C_STAT_BUSY		0x40
-#define I2C_STAT_NACK		0x80
-
-#define KEMPLD_I2C_CMD		0x0f
-#define I2C_CMD_START		0x91
-#define I2C_CMD_STOP		0x41
-#define I2C_CMD_READ		0x21
-#define I2C_CMD_WRITE		0x11
-#define I2C_CMD_READ_ACK	0x21
-#define I2C_CMD_READ_NACK	0x29
-#define I2C_CMD_IACK		0x01
-
-#define KEMPLD_I2C_FREQ_MAX	2700	/* 2.7 mHz */
-#define KEMPLD_I2C_FREQ_STD	100	/* 100 kHz */
-
-enum {
-	STATE_DONE = 0,
-	STATE_INIT,
-	STATE_ADDR,
-	STATE_ADDR10,
-	STATE_START,
-	STATE_WRITE,
-	STATE_READ,
-	STATE_ERROR,
-};
-
-struct kempld_i2c_data {
-	struct device			*dev;
-	struct kempld_device_data	*pld;
-	struct i2c_adapter		adap;
-	struct i2c_msg			*msg;
-	int				pos;
-	int				nmsgs;
-	int				state;
-	bool				was_active;
-};
-
-static unsigned int bus_frequency = KEMPLD_I2C_FREQ_STD;
-module_param(bus_frequency, uint, 0);
-MODULE_PARM_DESC(bus_frequency, "Set I2C bus frequency in kHz (default="
-				__MODULE_STRING(KEMPLD_I2C_FREQ_STD)")");
-
-static int i2c_bus = -1;
-module_param(i2c_bus, int, 0);
-MODULE_PARM_DESC(i2c_bus, "Set I2C bus number (default=-1 for dynamic assignment)");
-
-static bool i2c_gpio_mux;
-module_param(i2c_gpio_mux, bool, 0);
-MODULE_PARM_DESC(i2c_gpio_mux, "Enable I2C port on GPIO out (default=false)");
-
-/*
- * kempld_get_mutex must be called prior to calling this function.
- */
-static int kempld_i2c_process(struct kempld_i2c_data *i2c)
-{
-	struct kempld_device_data *pld = i2c->pld;
-	u8 stat = kempld_read8(pld, KEMPLD_I2C_STAT);
-	struct i2c_msg *msg = i2c->msg;
-	u8 addr;
-
-	/* Ready? */
-	if (stat & I2C_STAT_TIP)
-		return -EBUSY;
-
-	if (i2c->state == STATE_DONE || i2c->state == STATE_ERROR) {
-		/* Stop has been sent */
-		kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_IACK);
-		if (i2c->state == STATE_ERROR)
-			return -EIO;
-		return 0;
-	}
-
-	/* Error? */
-	if (stat & I2C_STAT_ARBLOST) {
-		i2c->state = STATE_ERROR;
-		kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_STOP);
-		return -EAGAIN;
-	}
-
-	if (i2c->state == STATE_INIT) {
-		if (stat & I2C_STAT_BUSY)
-			return -EBUSY;
-
-		i2c->state = STATE_ADDR;
-	}
-
-	if (i2c->state == STATE_ADDR) {
-		/* 10 bit address? */
-		if (i2c->msg->flags & I2C_M_TEN) {
-			addr = 0xf0 | ((i2c->msg->addr >> 7) & 0x6);
-			i2c->state = STATE_ADDR10;
-		} else {
-			addr = (i2c->msg->addr << 1);
-			i2c->state = STATE_START;
-		}
-
-		/* Set read bit if necessary */
-		addr |= (i2c->msg->flags & I2C_M_RD) ? 1 : 0;
-
-		kempld_write8(pld, KEMPLD_I2C_DATA, addr);
-		kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_START);
-
-		return 0;
-	}
-
-	/* Second part of 10 bit addressing */
-	if (i2c->state == STATE_ADDR10) {
-		kempld_write8(pld, KEMPLD_I2C_DATA, i2c->msg->addr & 0xff);
-		kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_WRITE);
-
-		i2c->state = STATE_START;
-		return 0;
-	}
-
-	if (i2c->state == STATE_START || i2c->state == STATE_WRITE) {
-		i2c->state = (msg->flags & I2C_M_RD) ? STATE_READ : STATE_WRITE;
-
-		if (stat & I2C_STAT_NACK) {
-			i2c->state = STATE_ERROR;
-			kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_STOP);
-			return -ENXIO;
-		}
-	} else {
-		msg->buf[i2c->pos++] = kempld_read8(pld, KEMPLD_I2C_DATA);
-	}
-
-	if (i2c->pos >= msg->len) {
-		i2c->nmsgs--;
-		i2c->msg++;
-		i2c->pos = 0;
-		msg = i2c->msg;
-
-		if (i2c->nmsgs) {
-			if (!(msg->flags & I2C_M_NOSTART)) {
-				i2c->state = STATE_ADDR;
-				return 0;
-			} else {
-				i2c->state = (msg->flags & I2C_M_RD)
-					? STATE_READ : STATE_WRITE;
-			}
-		} else {
-			i2c->state = STATE_DONE;
-			kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_STOP);
-			return 0;
-		}
-	}
-
-	if (i2c->state == STATE_READ) {
-		kempld_write8(pld, KEMPLD_I2C_CMD, i2c->pos == (msg->len - 1) ?
-			      I2C_CMD_READ_NACK : I2C_CMD_READ_ACK);
-	} else {
-		kempld_write8(pld, KEMPLD_I2C_DATA, msg->buf[i2c->pos++]);
-		kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_WRITE);
-	}
-
-	return 0;
-}
-
-static int kempld_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
-				int num)
-{
-	struct kempld_i2c_data *i2c = i2c_get_adapdata(adap);
-	struct kempld_device_data *pld = i2c->pld;
-	unsigned long timeout = jiffies + HZ;
-	int ret;
-
-	i2c->msg = msgs;
-	i2c->pos = 0;
-	i2c->nmsgs = num;
-	i2c->state = STATE_INIT;
-
-	/* Handle the transfer */
-	while (time_before(jiffies, timeout)) {
-		kempld_get_mutex(pld);
-		ret = kempld_i2c_process(i2c);
-		kempld_release_mutex(pld);
-
-		if (i2c->state == STATE_DONE || i2c->state == STATE_ERROR)
-			return (i2c->state == STATE_DONE) ? num : ret;
-
-		if (ret == 0)
-			timeout = jiffies + HZ;
-
-		usleep_range(5, 15);
-	}
-
-	i2c->state = STATE_ERROR;
-
-	return -ETIMEDOUT;
-}
-
-/*
- * kempld_get_mutex must be called prior to calling this function.
- */
-static void kempld_i2c_device_init(struct kempld_i2c_data *i2c)
-{
-	struct kempld_device_data *pld = i2c->pld;
-	u16 prescale_corr;
-	long prescale;
-	u8 ctrl;
-	u8 stat;
-	u8 cfg;
-
-	/* Make sure the device is disabled */
-	ctrl = kempld_read8(pld, KEMPLD_I2C_CTRL);
-	ctrl &= ~(I2C_CTRL_EN | I2C_CTRL_IEN);
-	kempld_write8(pld, KEMPLD_I2C_CTRL, ctrl);
-
-	if (bus_frequency > KEMPLD_I2C_FREQ_MAX)
-		bus_frequency = KEMPLD_I2C_FREQ_MAX;
-
-	if (pld->info.spec_major == 1)
-		prescale = pld->pld_clock / (bus_frequency * 5) - 1000;
-	else
-		prescale = pld->pld_clock / (bus_frequency * 4) - 3000;
-
-	if (prescale < 0)
-		prescale = 0;
-
-	/* Round to the best matching value */
-	prescale_corr = prescale / 1000;
-	if (prescale % 1000 >= 500)
-		prescale_corr++;
-
-	kempld_write8(pld, KEMPLD_I2C_PRELOW, prescale_corr & 0xff);
-	kempld_write8(pld, KEMPLD_I2C_PREHIGH, prescale_corr >> 8);
-
-	/* Activate I2C bus output on GPIO pins */
-	cfg = kempld_read8(pld, KEMPLD_CFG);
-	if (i2c_gpio_mux)
-		cfg |= KEMPLD_CFG_GPIO_I2C_MUX;
-	else
-		cfg &= ~KEMPLD_CFG_GPIO_I2C_MUX;
-	kempld_write8(pld, KEMPLD_CFG, cfg);
-
-	/* Enable the device */
-	kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_IACK);
-	ctrl |= I2C_CTRL_EN;
-	kempld_write8(pld, KEMPLD_I2C_CTRL, ctrl);
-
-	stat = kempld_read8(pld, KEMPLD_I2C_STAT);
-	if (stat & I2C_STAT_BUSY)
-		kempld_write8(pld, KEMPLD_I2C_CMD, I2C_CMD_STOP);
-}
-
-static u32 kempld_i2c_func(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_10BIT_ADDR | I2C_FUNC_SMBUS_EMUL;
-}
-
-static const struct i2c_algorithm kempld_i2c_algorithm = {
-	.master_xfer	= kempld_i2c_xfer,
-	.functionality	= kempld_i2c_func,
-};
-
-static struct i2c_adapter kempld_i2c_adapter = {
-	.owner		= THIS_MODULE,
-	.name		= "i2c-kempld",
-	.class		= I2C_CLASS_HWMON | I2C_CLASS_SPD,
-	.algo		= &kempld_i2c_algorithm,
-};
-
-static int kempld_i2c_probe(struct platform_device *pdev)
-{
-	struct kempld_device_data *pld = dev_get_drvdata(pdev->dev.parent);
-	struct kempld_i2c_data *i2c;
-	int ret;
-	u8 ctrl;
-
-	i2c = devm_kzalloc(&pdev->dev, sizeof(*i2c), GFP_KERNEL);
-	if (!i2c)
-		return -ENOMEM;
-
-	i2c->pld = pld;
-	i2c->dev = &pdev->dev;
-	i2c->adap = kempld_i2c_adapter;
-	i2c->adap.dev.parent = i2c->dev;
-	i2c_set_adapdata(&i2c->adap, i2c);
-	platform_set_drvdata(pdev, i2c);
-
-	kempld_get_mutex(pld);
-	ctrl = kempld_read8(pld, KEMPLD_I2C_CTRL);
-
-	if (ctrl & I2C_CTRL_EN)
-		i2c->was_active = true;
-
-	kempld_i2c_device_init(i2c);
-	kempld_release_mutex(pld);
-
-	/* Add I2C adapter to I2C tree */
-	if (i2c_bus >= -1)
-		i2c->adap.nr = i2c_bus;
-	ret = i2c_add_numbered_adapter(&i2c->adap);
-	if (ret)
-		return ret;
-
-	dev_info(i2c->dev, "I2C bus initialized at %dkHz\n",
-		 bus_frequency);
-
-	return 0;
-}
-
-static int kempld_i2c_remove(struct platform_device *pdev)
-{
-	struct kempld_i2c_data *i2c = platform_get_drvdata(pdev);
-	struct kempld_device_data *pld = i2c->pld;
-	u8 ctrl;
-
-	kempld_get_mutex(pld);
-	/*
-	 * Disable I2C logic if it was not activated before the
-	 * driver loaded
-	 */
-	if (!i2c->was_active) {
-		ctrl = kempld_read8(pld, KEMPLD_I2C_CTRL);
-		ctrl &= ~I2C_CTRL_EN;
-		kempld_write8(pld, KEMPLD_I2C_CTRL, ctrl);
-	}
-	kempld_release_mutex(pld);
-
-	i2c_del_adapter(&i2c->adap);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM
-static int kempld_i2c_suspend(struct platform_device *pdev, pm_message_t state)
-{
-	struct kempld_i2c_data *i2c = platform_get_drvdata(pdev);
-	struct kempld_device_data *pld = i2c->pld;
-	u8 ctrl;
-
-	kempld_get_mutex(pld);
-	ctrl = kempld_read8(pld, KEMPLD_I2C_CTRL);
-	ctrl &= ~I2C_CTRL_EN;
-	kempld_write8(pld, KEMPLD_I2C_CTRL, ctrl);
-	kempld_release_mutex(pld);
-
-	return 0;
-}
-
-static int kempld_i2c_resume(struct platform_device *pdev)
-{
-	struct kempld_i2c_data *i2c = platform_get_drvdata(pdev);
-	struct kempld_device_data *pld = i2c->pld;
-
-	kempld_get_mutex(pld);
-	kempld_i2c_device_init(i2c);
-	kempld_release_mutex(pld);
-
-	return 0;
-}
-#else
-#define kempld_i2c_suspend	NULL
-#define kempld_i2c_resume	NULL
-#endif
-
-static struct platform_driver kempld_i2c_driver = {
-	.driver = {
-		.name = "kempld-i2c",
-	},
-	.probe		= kempld_i2c_probe,
-	.remove		= kempld_i2c_remove,
-	.suspend	= kempld_i2c_suspend,
-	.resume		= kempld_i2c_resume,
-};
-
-module_platform_driver(kempld_i2c_driver);
-
-MODULE_DESCRIPTION("KEM PLD I2C Driver");
-MODULE_AUTHOR("Michael Brunner <michael.brunner@kontron.com>");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:kempld_i2c");
+B_MISC__ACPURG_STALL__SHIFT 0x1f
+#define MC_ARB_BANKMAP__BANK0_MASK 0xf
+#define MC_ARB_BANKMAP__BANK0__SHIFT 0x0
+#define MC_ARB_BANKMAP__BANK1_MASK 0xf0
+#define MC_ARB_BANKMAP__BANK1__SHIFT 0x4
+#define MC_ARB_BANKMAP__BANK2_MASK 0xf00
+#define MC_ARB_BANKMAP__BANK2__SHIFT 0x8
+#define MC_ARB_BANKMAP__BANK3_MASK 0xf000
+#define MC_ARB_BANKMAP__BANK3__SHIFT 0xc
+#define MC_ARB_BANKMAP__RANK_MASK 0xf0000
+#define MC_ARB_BANKMAP__RANK__SHIFT 0x10
+#define MC_ARB_RAMCFG__NOOFBANK_MASK 0x3
+#define MC_ARB_RAMCFG__NOOFBANK__SHIFT 0x0
+#define MC_ARB_RAMCFG__NOOFRANKS_MASK 0x4
+#define MC_ARB_RAMCFG__NOOFRANKS__SHIFT 0x2
+#define MC_ARB_RAMCFG__NOOFROWS_MASK 0x38
+#define MC_ARB_RAMCFG__NOOFROWS__SHIFT 0x3
+#define MC_ARB_RAMCFG__NOOFCOLS_MASK 0xc0
+#define MC_ARB_RAMCFG__NOOFCOLS__SHIFT 0x6
+#define MC_ARB_RAMCFG__CHANSIZE_MASK 0x100
+#define MC_ARB_RAMCFG__CHANSIZE__SHIFT 0x8
+#define MC_ARB_RAMCFG__RSV_1_MASK 0x200
+#define MC_ARB_RAMCFG__RSV_1__SHIFT 0x9
+#define MC_ARB_RAMCFG__RSV_2_MASK 0x400
+#define MC_ARB_RAMCFG__RSV_2__SHIFT 0xa
+#define MC_ARB_RAMCFG__RSV_3_MASK 0x800
+#define MC_ARB_RAMCFG__RSV_3__SHIFT 0xb
+#define MC_ARB_RAMCFG__NOOFGROUPS_MASK 0x1000
+#define MC_ARB_RAMCFG__NOOFGROUPS__SHIFT 0xc
+#define MC_ARB_RAMCFG__RSV_4_MASK 0x3e000
+#define MC_ARB_RAMCFG__RSV_4__SHIFT 0xd
+#define MC_ARB_POP__ENABLE_ARB_MASK 0x1
+#define MC_ARB_POP__ENABLE_ARB__SHIFT 0x0
+#define MC_ARB_POP__SPEC_OPEN_MASK 0x2
+#define MC_ARB_POP__SPEC_OPEN__SHIFT 0x1
+#define MC_ARB_POP__POP_DEPTH_MASK 0x3c
+#define MC_ARB_POP__POP_DEPTH__SHIFT 0x2
+#define MC_ARB_POP__WRDATAINDEX_DEPTH_MASK 0xfc0
+#define MC_ARB_POP__WRDATAINDEX_DEPTH__SHIFT 0x6
+#define MC_ARB_POP__SKID_DEPTH_MASK 0x7000
+#define MC_ARB_POP__SKID_DEPTH__SHIFT 0xc
+#define MC_ARB_POP__WAIT_AFTER_RFSH_MASK 0x18000
+#define MC_ARB_POP__WAIT_AFTER_RFSH__SHIFT 0xf
+#define MC_ARB_POP__QUICK_STOP_MASK 0x20000
+#define MC_ARB_POP__QUICK_STOP__SHIFT 0x11
+#define MC_ARB_POP__ENABLE_TWO_PAGE_MASK 0x40000
+#define MC_ARB_POP__ENABLE_TWO_PAGE__SHIFT 0x12
+#define MC_ARB_POP__ALLOW_EOB_BY_WRRET_STALL_MASK 0x80000
+#define MC_ARB_POP__ALLOW_EOB_BY_WRRET_STALL__SHIFT 0x13
+#define MC_ARB_MINCLKS__READ_CLKS_MASK 0xff
+#define MC_ARB_MINCLKS__READ_CLKS__SHIFT 0x0
+#define MC_ARB_MINCLKS__WRITE_CLKS_MASK 0xff00
+#define MC_ARB_MINCLKS__WRITE_CLKS__SHIFT 0x8
+#define MC_ARB_MINCLKS__ARB_RW_SWITCH_MASK 0x10000
+#define MC_ARB_MINCLKS__ARB_RW_SWITCH__SHIFT 0x10
+#define MC_ARB_MINCLKS__RW_SWITCH_HARSH_MASK 0x60000
+#define MC_ARB_MINCLKS__RW_SWITCH_HARSH__SHIFT 0x11
+#define MC_ARB_SQM_CNTL__MIN_PENAL_MASK 0xff
+#define MC_ARB_SQM_CNTL__MIN_PENAL__SHIFT 0x0
+#define MC_ARB_SQM_CNTL__DYN_SQM_ENABLE_MASK 0x100
+#define MC_ARB_SQM_CNTL__DYN_SQM_ENABLE__SHIFT 0x8
+#define MC_ARB_SQM_CNTL__SQM_RDY16_MASK 0x200
+#define MC_ARB_SQM_CNTL__SQM_RDY16__SHIFT 0x9
+#define MC_ARB_SQM_CNTL__SQM_RESERVE_MASK 0xfc00
+#define MC_ARB_SQM_CNTL__SQM_RESERVE__SHIFT 0xa
+#define MC_ARB_SQM_CNTL__RATIO_MASK 0xff0000
+#define MC_ARB_SQM_CNTL__RATIO__SHIFT 0x10
+#define MC_ARB_SQM_CNTL__RATIO_DEBUG_MASK 0xff000000
+#define MC_ARB_SQM_CNTL__RATIO_DEBUG__SHIFT 0x18
+#define MC_ARB_ADDR_HASH__BANK_XOR_ENABLE_MASK 0xf
+#define MC_ARB_ADDR_HASH__BANK_XOR_ENABLE__SHIFT 0x0
+#define MC_ARB_ADDR_HASH__COL_XOR_MASK 0xff0
+#define MC_ARB_ADDR_HASH__COL_XOR__SHIFT 0x4
+#define MC_ARB_ADDR_HASH__ROW_XOR_MASK 0xffff000
+#define MC_ARB_ADDR_HASH__ROW_XOR__SHIFT 0xc
+#define MC_ARB_DRAM_TIMING__ACTRD_MASK 0xff
+#define MC_ARB_DRAM_TIMING__ACTRD__SHIFT 0x0
+#define MC_ARB_DRAM_TIMING__ACTWR_MASK 0xff00
+#define MC_ARB_DRAM_TIMING__ACTWR__SHIFT 0x8
+#define MC_ARB_DRAM_TIMING__RASMACTRD_MASK 0xff0000
+#define MC_ARB_DRAM_TIMING__RASMACTRD__SHIFT 0x10
+#define MC_ARB_DRAM_TIMING__RASMACTWR_MASK 0xff000000
+#define MC_ARB_DRAM_TIMING__RASMACTWR__SHIFT 0x18
+#define MC_ARB_DRAM_TIMING2__RAS2RAS_MASK 0xff
+#define MC_ARB_DRAM_TIMING2__RAS2RAS__SHIFT 0x0
+#define MC_ARB_DRAM_TIMING2__RP_MASK 0xff00
+#define MC_ARB_DRAM_TIMING2__RP__SHIFT 0x8
+#define MC_ARB_DRAM_TIMING2__WRPLUSRP_MASK 0xff0000
+#define MC_ARB_DRAM_TIMING2__WRPLUSRP__SHIFT 0x10
+#define MC_ARB_DRAM_TIMING2__BUS_TURN_MASK 0x1f000000
+#define MC_ARB_DRAM_TIMING2__BUS_TURN__SHIFT 0x18
+#define MC_ARB_WTM_CNTL_RD__WTMODE_MASK 0x3
+#define MC_ARB_WTM_CNTL_RD__WTMODE__SHIFT 0x0
+#define MC_ARB_WTM_CNTL_RD__HARSH_PRI_MASK 0x4
+#define MC_ARB_WTM_CNTL_RD__HARSH_PRI__SHIFT 0x2
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP0_MASK 0x8
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP0__SHIFT 0x3
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP1_MASK 0x10
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP1__SHIFT 0x4
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP2_MASK 0x20
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP2__SHIFT 0x5
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP3_MASK 0x40
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP3__SHIFT 0x6
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP4_MASK 0x80
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP4__SHIFT 0x7
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP5_MASK 0x100
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP5__SHIFT 0x8
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP6_MASK 0x200
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP6__SHIFT 0x9
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP7_MASK 0x400
+#define MC_ARB_WTM_CNTL_RD__ALLOW_STUTTER_GRP7__SHIFT 0xa
+#define MC_ARB_WTM_CNTL_RD__ACP_HARSH_PRI_MASK 0x800
+#define MC_ARB_WTM_CNTL_RD__ACP_HARSH_PRI__SHIFT 0xb
+#define MC_ARB_WTM_CNTL_RD__ACP_OVER_DISP_MASK 0x1000
+#define MC_ARB_WTM_CNTL_RD__ACP_OVER_DISP__SHIFT 0xc
+#define MC_ARB_WTM_CNTL_RD__FORCE_ACP_URG_MASK 0x2000
+#define MC_ARB_WTM_CNTL_RD__FORCE_ACP_URG__SHIFT 0xd
+#define MC_ARB_WTM_CNTL_WR__WTMODE_MASK 0x3
+#define MC_ARB_WTM_CNTL_WR__WTMODE__SHIFT 0x0
+#define MC_ARB_WTM_CNTL_WR__HARSH_PRI_MASK 0x4
+#define MC_ARB_WTM_CNTL_WR__HARSH_PRI__SHIFT 0x2
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP0_MASK 0x8
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP0__SHIFT 0x3
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP1_MASK 0x10
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP1__SHIFT 0x4
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP2_MASK 0x20
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP2__SHIFT 0x5
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP3_MASK 0x40
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP3__SHIFT 0x6
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP4_MASK 0x80
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP4__SHIFT 0x7
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP5_MASK 0x100
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP5__SHIFT 0x8
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP6_MASK 0x200
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP6__SHIFT 0x9
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP7_MASK 0x400
+#define MC_ARB_WTM_CNTL_WR__ALLOW_STUTTER_GRP7__SHIFT 0xa
+#define MC_ARB_WTM_CNTL_WR__ACP_HARSH_PRI_MASK 0x800
+#define MC_ARB_WTM_CNTL_WR__ACP_HARSH_PRI__SHIFT 0xb
+#define MC_ARB_WTM_CNTL_WR__ACP_OVER_DISP_MASK 0x1000
+#define MC_ARB_WTM_CNTL_WR__ACP_OVER_DISP__SHIFT 0xc
+#define MC_ARB_WTM_CNTL_WR__FORCE_ACP_URG_MASK 0x2000
+#define MC_ARB_WTM_CNTL_WR__FORCE_ACP_URG__SHIFT 0xd
+#define MC_ARB_WTM_GRPWT_RD__GRP0_MASK 0x3
+#define MC_ARB_WTM_GRPWT_RD__GRP0__SHIFT 0x0
+#define MC_ARB_WTM_GRPWT_RD__GRP1_MASK 0xc
+#define MC_ARB_WTM_GRPWT_RD__GRP1__SHIFT 0x2
+#define MC_ARB_WTM_GRPWT_RD__GRP2_MASK 0x30
+#define MC_ARB_WTM_GRPWT_RD__GRP2__SHIFT 0x4
+#define MC_ARB_WTM_GRPWT_RD__GRP3_MASK 0xc0
+#define MC_ARB_WTM_GRPWT_RD__GRP3__SHIFT 0x6
+#define MC_ARB_WTM_GRPWT_RD__GRP4_MASK 0x300
+#define MC_ARB_WTM_GRPWT_RD__GRP4__SHIFT 0x8
+#define MC_ARB_WTM_GRPWT_RD__GRP5_MASK 0xc00
+#define MC_ARB_WTM_GRPWT_RD__GRP5__SHIFT 0xa
+#define MC_ARB_WTM_GRPWT_RD__GRP6_MASK 0x3000
+#define MC_ARB_WTM_GRPWT_RD__GRP6__SHIFT 0xc
+#define MC_ARB_WTM_GRPWT_RD__GRP7_MASK 0xc000
+#define MC_ARB_WTM_GRPWT_RD__GRP7__SHIFT 0xe
+#define MC_ARB_WTM_GRPWT_RD__GRP_EXT_MASK 0xff0000
+#define MC_ARB_WTM_GRPWT_RD__GRP_EXT__SHIFT 0x10
+#define MC_ARB_WTM_GRPWT_WR__GRP0_MASK 0x3
+#define MC_ARB_WTM_GRPWT_WR__GRP0__SHIFT 0x0
+#define MC_ARB_WTM_GRPWT_WR__GRP1_MASK 0xc
+#define MC_ARB_WTM_GRPWT_WR__GRP1__SHIFT 0x2
+#define MC_ARB_WTM_GRPWT_WR__GRP2_MASK 0x30
+#define MC_ARB_WTM_GRPWT_WR__GRP2__SHIFT 0x4
+#define MC_ARB_WTM_GRPWT_WR__GRP3_MASK 0xc0
+#define MC_ARB_WTM_GRPWT_WR__GRP3__SHIFT 0x6
+#define MC_ARB_WTM_GRPWT_WR__GRP4_MASK 0x300
+#define MC_ARB_WTM_GRPWT_WR__GRP4__SHIFT 0x8
+#define MC_ARB_WTM_GRPWT_WR__GRP5_MASK 0xc00
+#define MC_ARB_WTM_GRPWT_WR__GRP5__SHIFT 0xa
+#define MC_ARB_WTM_GRPWT_WR__GRP6_MASK 0x3000
+#define MC_ARB_WTM_GRPWT_WR__GRP6__SHIFT 0xc
+#define MC_ARB_WTM_GRPWT_WR__GRP7_MASK 0xc000
+#define MC_ARB_WTM_GRPWT_WR__GRP7__SHIFT 0xe
+#define MC_ARB_WTM_GRPWT_WR__GRP_EXT_MASK 0xff0000
+#define MC_ARB_WTM_GRPWT_WR__GRP_EXT__SHIFT 0x10
+#define MC_ARB_TM_CNTL_RD__GROUPBY_RANK_MASK 0x1
+#define MC_ARB_TM_CNTL_RD__GROUPBY_RANK__SHIFT 0x0
+#define MC_ARB_TM_CNTL_RD__BANK_SELECT_MASK 0x6
+#define MC_ARB_TM_CNTL_RD__BANK_SELECT__SHIFT 0x1
+#define MC_ARB_TM_CNTL_RD__MATCH_RANK_MASK 0x8
+#define MC_ARB_TM_CNTL_RD__MATCH_RANK__SHIFT 0x3
+#define MC_ARB_TM_CNTL_RD__MATCH_BANK_MASK 0x10
+#define MC_ARB_TM_CNTL_RD__MATCH_BANK__SHIFT 0x4
+#define MC_ARB_TM_CNTL_WR__GROUPBY_RANK_MASK 0x1
+#define MC_ARB_TM_CNTL_WR__GROUPBY_RANK__SHIFT 0x0
+#define MC_ARB_TM_CNTL_WR__BANK_SELECT_MASK 0x6
+#define MC_ARB_TM_CNTL_WR__BANK_SELECT__SHIFT 0x1
+#define MC_ARB_TM_CNTL_WR__MATCH_RANK_MASK 0x8
+#define MC_ARB_TM_CNTL_WR__MATCH_RANK__SHIFT 0x3
+#define MC_ARB_TM_CNTL_WR__MATCH_BANK_MASK 0x10
+#define MC_ARB_TM_CNTL_WR__MATCH_BANK__SHIFT 0x4
+#define MC_ARB_LAZY0_RD__GROUP0_MASK 0xff
+#define MC_ARB_LAZY0_RD__GROUP0__SHIFT 0x0
+#define MC_ARB_LAZY0_RD__GROUP1_MASK 0xff00
+#define MC_ARB_LAZY0_RD__GROUP1__SHIFT 0x8
+#define MC_ARB_LAZY0_RD__GROUP2_MASK 0xff0000
+#define MC_ARB_LAZY0_RD__GROUP2__SHIFT 0x10
+#define MC_ARB_LAZY0_RD__GROUP3_MASK 0xff000000
+#define MC_ARB_LAZY0_RD__GROUP3__SHIFT 0x18
+#define MC_ARB_LAZY0_WR__GROUP0_MASK 0xff
+#define MC_ARB_LAZY0_WR__GROUP0__SHIFT 0x0
+#define MC_ARB_LAZY0_WR__GROUP1_MASK 0xff00
+#define MC_

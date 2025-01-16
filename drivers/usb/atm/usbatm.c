@@ -1,1346 +1,544 @@
-/******************************************************************************
- *  usbatm.c - Generic USB xDSL driver core
- *
- *  Copyright (C) 2001, Alcatel
- *  Copyright (C) 2003, Duncan Sands, SolNegro, Josep Comas
- *  Copyright (C) 2004, David Woodhouse, Roman Kagan
- *
- *  This program is free software; you can redistribute it and/or modify it
- *  under the terms of the GNU General Public License as published by the Free
- *  Software Foundation; either version 2 of the License, or (at your option)
- *  any later version.
- *
- *  This program is distributed in the hope that it will be useful, but WITHOUT
- *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- *  more details.
- *
- *  You should have received a copy of the GNU General Public License along with
- *  this program; if not, write to the Free Software Foundation, Inc., 59
- *  Temple Place - Suite 330, Boston, MA  02111-1307, USA.
- *
- ******************************************************************************/
-
-/*
- *  Written by Johan Verrept, Duncan Sands (duncan.sands@free.fr) and David Woodhouse
- *
- *  1.7+:	- See the check-in logs
- *
- *  1.6:	- No longer opens a connection if the firmware is not loaded
- *  		- Added support for the speedtouch 330
- *  		- Removed the limit on the number of devices
- *  		- Module now autoloads on device plugin
- *  		- Merged relevant parts of sarlib
- *  		- Replaced the kernel thread with a tasklet
- *  		- New packet transmission code
- *  		- Changed proc file contents
- *  		- Fixed all known SMP races
- *  		- Many fixes and cleanups
- *  		- Various fixes by Oliver Neukum (oliver@neukum.name)
- *
- *  1.5A:	- Version for inclusion in 2.5 series kernel
- *		- Modifications by Richard Purdie (rpurdie@rpsys.net)
- *		- made compatible with kernel 2.5.6 onwards by changing
- *		usbatm_usb_send_data_context->urb to a pointer and adding code
- *		to alloc and free it
- *		- remove_wait_queue() added to usbatm_atm_processqueue_thread()
- *
- *  1.5:	- fixed memory leak when atmsar_decode_aal5 returned NULL.
- *		(reported by stephen.robinson@zen.co.uk)
- *
- *  1.4:	- changed the spin_lock() under interrupt to spin_lock_irqsave()
- *		- unlink all active send urbs of a vcc that is being closed.
- *
- *  1.3.1:	- added the version number
- *
- *  1.3:	- Added multiple send urb support
- *		- fixed memory leak and vcc->tx_inuse starvation bug
- *		  when not enough memory left in vcc.
- *
- *  1.2:	- Fixed race condition in usbatm_usb_send_data()
- *  1.1:	- Turned off packet debugging
- *
- */
-
-#include "usbatm.h"
-
-#include <asm/uaccess.h>
-#include <linux/crc32.h>
-#include <linux/errno.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/moduleparam.h>
-#include <linux/netdevice.h>
-#include <linux/proc_fs.h>
-#include <linux/sched.h>
-#include <linux/signal.h>
-#include <linux/slab.h>
-#include <linux/stat.h>
-#include <linux/timer.h>
-#include <linux/wait.h>
-#include <linux/kthread.h>
-#include <linux/ratelimit.h>
-
-#ifdef VERBOSE_DEBUG
-static int usbatm_print_packet(struct usbatm_data *instance, const unsigned char *data, int len);
-#define PACKETDEBUG(arg...)	usbatm_print_packet(arg)
-#define vdbg(arg...)		dev_dbg(arg)
-#else
-#define PACKETDEBUG(arg...)
-#define vdbg(arg...)
-#endif
-
-#define DRIVER_AUTHOR	"Johan Verrept, Duncan Sands <duncan.sands@free.fr>"
-#define DRIVER_VERSION	"1.10"
-#define DRIVER_DESC	"Generic USB ATM/DSL I/O, version " DRIVER_VERSION
-
-static const char usbatm_driver_name[] = "usbatm";
-
-#define UDSL_MAX_RCV_URBS		16
-#define UDSL_MAX_SND_URBS		16
-#define UDSL_MAX_BUF_SIZE		65536
-#define UDSL_DEFAULT_RCV_URBS		4
-#define UDSL_DEFAULT_SND_URBS		4
-#define UDSL_DEFAULT_RCV_BUF_SIZE	3392	/* 64 * ATM_CELL_SIZE */
-#define UDSL_DEFAULT_SND_BUF_SIZE	3392	/* 64 * ATM_CELL_SIZE */
-
-#define ATM_CELL_HEADER			(ATM_CELL_SIZE - ATM_CELL_PAYLOAD)
-
-#define THROTTLE_MSECS			100	/* delay to recover processing after urb submission fails */
-
-static unsigned int num_rcv_urbs = UDSL_DEFAULT_RCV_URBS;
-static unsigned int num_snd_urbs = UDSL_DEFAULT_SND_URBS;
-static unsigned int rcv_buf_bytes = UDSL_DEFAULT_RCV_BUF_SIZE;
-static unsigned int snd_buf_bytes = UDSL_DEFAULT_SND_BUF_SIZE;
-
-module_param(num_rcv_urbs, uint, S_IRUGO);
-MODULE_PARM_DESC(num_rcv_urbs,
-		 "Number of urbs used for reception (range: 0-"
-		 __MODULE_STRING(UDSL_MAX_RCV_URBS) ", default: "
-		 __MODULE_STRING(UDSL_DEFAULT_RCV_URBS) ")");
-
-module_param(num_snd_urbs, uint, S_IRUGO);
-MODULE_PARM_DESC(num_snd_urbs,
-		 "Number of urbs used for transmission (range: 0-"
-		 __MODULE_STRING(UDSL_MAX_SND_URBS) ", default: "
-		 __MODULE_STRING(UDSL_DEFAULT_SND_URBS) ")");
-
-module_param(rcv_buf_bytes, uint, S_IRUGO);
-MODULE_PARM_DESC(rcv_buf_bytes,
-		 "Size of the buffers used for reception, in bytes (range: 1-"
-		 __MODULE_STRING(UDSL_MAX_BUF_SIZE) ", default: "
-		 __MODULE_STRING(UDSL_DEFAULT_RCV_BUF_SIZE) ")");
-
-module_param(snd_buf_bytes, uint, S_IRUGO);
-MODULE_PARM_DESC(snd_buf_bytes,
-		 "Size of the buffers used for transmission, in bytes (range: 1-"
-		 __MODULE_STRING(UDSL_MAX_BUF_SIZE) ", default: "
-		 __MODULE_STRING(UDSL_DEFAULT_SND_BUF_SIZE) ")");
-
-
-/* receive */
-
-struct usbatm_vcc_data {
-	/* vpi/vci lookup */
-	struct list_head list;
-	short vpi;
-	int vci;
-	struct atm_vcc *vcc;
-
-	/* raw cell reassembly */
-	struct sk_buff *sarb;
-};
-
-
-/* send */
-
-struct usbatm_control {
-	struct atm_skb_data atm;
-	u32 len;
-	u32 crc;
-};
-
-#define UDSL_SKB(x)		((struct usbatm_control *)(x)->cb)
-
-
-/* ATM */
-
-static void usbatm_atm_dev_close(struct atm_dev *atm_dev);
-static int usbatm_atm_open(struct atm_vcc *vcc);
-static void usbatm_atm_close(struct atm_vcc *vcc);
-static int usbatm_atm_ioctl(struct atm_dev *atm_dev, unsigned int cmd, void __user *arg);
-static int usbatm_atm_send(struct atm_vcc *vcc, struct sk_buff *skb);
-static int usbatm_atm_proc_read(struct atm_dev *atm_dev, loff_t *pos, char *page);
-
-static struct atmdev_ops usbatm_atm_devops = {
-	.dev_close	= usbatm_atm_dev_close,
-	.open		= usbatm_atm_open,
-	.close		= usbatm_atm_close,
-	.ioctl		= usbatm_atm_ioctl,
-	.send		= usbatm_atm_send,
-	.proc_read	= usbatm_atm_proc_read,
-	.owner		= THIS_MODULE,
-};
-
-
-/***********
-**  misc  **
-***********/
-
-static inline unsigned int usbatm_pdu_length(unsigned int length)
-{
-	length += ATM_CELL_PAYLOAD - 1 + ATM_AAL5_TRAILER;
-	return length - length % ATM_CELL_PAYLOAD;
-}
-
-static inline void usbatm_pop(struct atm_vcc *vcc, struct sk_buff *skb)
-{
-	if (vcc->pop)
-		vcc->pop(vcc, skb);
-	else
-		dev_kfree_skb_any(skb);
-}
-
-
-/***********
-**  urbs  **
-************/
-
-static struct urb *usbatm_pop_urb(struct usbatm_channel *channel)
-{
-	struct urb *urb;
-
-	spin_lock_irq(&channel->lock);
-	if (list_empty(&channel->list)) {
-		spin_unlock_irq(&channel->lock);
-		return NULL;
-	}
-
-	urb = list_entry(channel->list.next, struct urb, urb_list);
-	list_del(&urb->urb_list);
-	spin_unlock_irq(&channel->lock);
-
-	return urb;
-}
-
-static int usbatm_submit_urb(struct urb *urb)
-{
-	struct usbatm_channel *channel = urb->context;
-	int ret;
-
-	/* vdbg("%s: submitting urb 0x%p, size %u",
-	     __func__, urb, urb->transfer_buffer_length); */
-
-	ret = usb_submit_urb(urb, GFP_ATOMIC);
-	if (ret) {
-		if (printk_ratelimit())
-			atm_warn(channel->usbatm, "%s: urb 0x%p submission failed (%d)!\n",
-				__func__, urb, ret);
-
-		/* consider all errors transient and return the buffer back to the queue */
-		urb->status = -EAGAIN;
-		spin_lock_irq(&channel->lock);
-
-		/* must add to the front when sending; doesn't matter when receiving */
-		list_add(&urb->urb_list, &channel->list);
-
-		spin_unlock_irq(&channel->lock);
-
-		/* make sure the channel doesn't stall */
-		mod_timer(&channel->delay, jiffies + msecs_to_jiffies(THROTTLE_MSECS));
-	}
-
-	return ret;
-}
-
-static void usbatm_complete(struct urb *urb)
-{
-	struct usbatm_channel *channel = urb->context;
-	unsigned long flags;
-	int status = urb->status;
-
-	/* vdbg("%s: urb 0x%p, status %d, actual_length %d",
-	     __func__, urb, status, urb->actual_length); */
-
-	/* usually in_interrupt(), but not always */
-	spin_lock_irqsave(&channel->lock, flags);
-
-	/* must add to the back when receiving; doesn't matter when sending */
-	list_add_tail(&urb->urb_list, &channel->list);
-
-	spin_unlock_irqrestore(&channel->lock, flags);
-
-	if (unlikely(status) &&
-			(!(channel->usbatm->flags & UDSL_IGNORE_EILSEQ) ||
-			 status != -EILSEQ)) {
-		if (status == -ESHUTDOWN)
-			return;
-
-		if (printk_ratelimit())
-			atm_warn(channel->usbatm, "%s: urb 0x%p failed (%d)!\n",
-				__func__, urb, status);
-		/* throttle processing in case of an error */
-		mod_timer(&channel->delay, jiffies + msecs_to_jiffies(THROTTLE_MSECS));
-	} else
-		tasklet_schedule(&channel->tasklet);
-}
-
-
-/*************
-**  decode  **
-*************/
-
-static inline struct usbatm_vcc_data *usbatm_find_vcc(struct usbatm_data *instance,
-						  short vpi, int vci)
-{
-	struct usbatm_vcc_data *vcc_data;
-
-	list_for_each_entry(vcc_data, &instance->vcc_list, list)
-		if ((vcc_data->vci == vci) && (vcc_data->vpi == vpi))
-			return vcc_data;
-	return NULL;
-}
-
-static void usbatm_extract_one_cell(struct usbatm_data *instance, unsigned char *source)
-{
-	struct atm_vcc *vcc;
-	struct sk_buff *sarb;
-	short vpi = ((source[0] & 0x0f) << 4)  | (source[1] >> 4);
-	int vci = ((source[1] & 0x0f) << 12) | (source[2] << 4) | (source[3] >> 4);
-	u8 pti = ((source[3] & 0xe) >> 1);
-
-	if ((vci != instance->cached_vci) || (vpi != instance->cached_vpi)) {
-		instance->cached_vpi = vpi;
-		instance->cached_vci = vci;
-
-		instance->cached_vcc = usbatm_find_vcc(instance, vpi, vci);
-
-		if (!instance->cached_vcc)
-			atm_rldbg(instance, "%s: unknown vpi/vci (%hd/%d)!\n", __func__, vpi, vci);
-	}
-
-	if (!instance->cached_vcc)
-		return;
-
-	vcc = instance->cached_vcc->vcc;
-
-	/* OAM F5 end-to-end */
-	if (pti == ATM_PTI_E2EF5) {
-		if (printk_ratelimit())
-			atm_warn(instance, "%s: OAM not supported (vpi %d, vci %d)!\n",
-				__func__, vpi, vci);
-		atomic_inc(&vcc->stats->rx_err);
-		return;
-	}
-
-	sarb = instance->cached_vcc->sarb;
-
-	if (sarb->tail + ATM_CELL_PAYLOAD > sarb->end) {
-		atm_rldbg(instance, "%s: buffer overrun (sarb->len %u, vcc: 0x%p)!\n",
-				__func__, sarb->len, vcc);
-		/* discard cells already received */
-		skb_trim(sarb, 0);
-	}
-
-	memcpy(skb_tail_pointer(sarb), source + ATM_CELL_HEADER, ATM_CELL_PAYLOAD);
-	__skb_put(sarb, ATM_CELL_PAYLOAD);
-
-	if (pti & 1) {
-		struct sk_buff *skb;
-		unsigned int length;
-		unsigned int pdu_length;
-
-		length = (source[ATM_CELL_SIZE - 6] << 8) + source[ATM_CELL_SIZE - 5];
-
-		/* guard against overflow */
-		if (length > ATM_MAX_AAL5_PDU) {
-			atm_rldbg(instance, "%s: bogus length %u (vcc: 0x%p)!\n",
-				  __func__, length, vcc);
-			atomic_inc(&vcc->stats->rx_err);
-			goto out;
-		}
-
-		pdu_length = usbatm_pdu_length(length);
-
-		if (sarb->len < pdu_length) {
-			atm_rldbg(instance, "%s: bogus pdu_length %u (sarb->len: %u, vcc: 0x%p)!\n",
-				  __func__, pdu_length, sarb->len, vcc);
-			atomic_inc(&vcc->stats->rx_err);
-			goto out;
-		}
-
-		if (crc32_be(~0, skb_tail_pointer(sarb) - pdu_length, pdu_length) != 0xc704dd7b) {
-			atm_rldbg(instance, "%s: packet failed crc check (vcc: 0x%p)!\n",
-				  __func__, vcc);
-			atomic_inc(&vcc->stats->rx_err);
-			goto out;
-		}
-
-		vdbg(&instance->usb_intf->dev,
-		     "%s: got packet (length: %u, pdu_length: %u, vcc: 0x%p)",
-		     __func__, length, pdu_length, vcc);
-
-		skb = dev_alloc_skb(length);
-		if (!skb) {
-			if (printk_ratelimit())
-				atm_err(instance, "%s: no memory for skb (length: %u)!\n",
-					__func__, length);
-			atomic_inc(&vcc->stats->rx_drop);
-			goto out;
-		}
-
-		vdbg(&instance->usb_intf->dev,
-		     "%s: allocated new sk_buff (skb: 0x%p, skb->truesize: %u)",
-		     __func__, skb, skb->truesize);
-
-		if (!atm_charge(vcc, skb->truesize)) {
-			atm_rldbg(instance, "%s: failed atm_charge (skb->truesize: %u)!\n",
-				  __func__, skb->truesize);
-			dev_kfree_skb_any(skb);
-			goto out;	/* atm_charge increments rx_drop */
-		}
-
-		skb_copy_to_linear_data(skb,
-					skb_tail_pointer(sarb) - pdu_length,
-					length);
-		__skb_put(skb, length);
-
-		vdbg(&instance->usb_intf->dev,
-		     "%s: sending skb 0x%p, skb->len %u, skb->truesize %u",
-		     __func__, skb, skb->len, skb->truesize);
-
-		PACKETDEBUG(instance, skb->data, skb->len);
-
-		vcc->push(vcc, skb);
-
-		atomic_inc(&vcc->stats->rx);
-	out:
-		skb_trim(sarb, 0);
-	}
-}
-
-static void usbatm_extract_cells(struct usbatm_data *instance,
-		unsigned char *source, unsigned int avail_data)
-{
-	unsigned int stride = instance->rx_channel.stride;
-	unsigned int buf_usage = instance->buf_usage;
-
-	/* extract cells from incoming data, taking into account that
-	 * the length of avail data may not be a multiple of stride */
-
-	if (buf_usage > 0) {
-		/* we have a partially received atm cell */
-		unsigned char *cell_buf = instance->cell_buf;
-		unsigned int space_left = stride - buf_usage;
-
-		if (avail_data >= space_left) {
-			/* add new data and process cell */
-			memcpy(cell_buf + buf_usage, source, space_left);
-			source += space_left;
-			avail_data -= space_left;
-			usbatm_extract_one_cell(instance, cell_buf);
-			instance->buf_usage = 0;
-		} else {
-			/* not enough data to fill the cell */
-			memcpy(cell_buf + buf_usage, source, avail_data);
-			instance->buf_usage = buf_usage + avail_data;
-			return;
-		}
-	}
-
-	for (; avail_data >= stride; avail_data -= stride, source += stride)
-		usbatm_extract_one_cell(instance, source);
-
-	if (avail_data > 0) {
-		/* length was not a multiple of stride -
-		 * save remaining data for next call */
-		memcpy(instance->cell_buf, source, avail_data);
-		instance->buf_usage = avail_data;
-	}
-}
-
-
-/*************
-**  encode  **
-*************/
-
-static unsigned int usbatm_write_cells(struct usbatm_data *instance,
-				       struct sk_buff *skb,
-				       u8 *target, unsigned int avail_space)
-{
-	struct usbatm_control *ctrl = UDSL_SKB(skb);
-	struct atm_vcc *vcc = ctrl->atm.vcc;
-	unsigned int bytes_written;
-	unsigned int stride = instance->tx_channel.stride;
-
-	for (bytes_written = 0; bytes_written < avail_space && ctrl->len;
-	     bytes_written += stride, target += stride) {
-		unsigned int data_len = min_t(unsigned int, skb->len, ATM_CELL_PAYLOAD);
-		unsigned int left = ATM_CELL_PAYLOAD - data_len;
-		u8 *ptr = target;
-
-		ptr[0] = vcc->vpi >> 4;
-		ptr[1] = (vcc->vpi << 4) | (vcc->vci >> 12);
-		ptr[2] = vcc->vci >> 4;
-		ptr[3] = vcc->vci << 4;
-		ptr[4] = 0xec;
-		ptr += ATM_CELL_HEADER;
-
-		skb_copy_from_linear_data(skb, ptr, data_len);
-		ptr += data_len;
-		__skb_pull(skb, data_len);
-
-		if (!left)
-			continue;
-
-		memset(ptr, 0, left);
-
-		if (left >= ATM_AAL5_TRAILER) {	/* trailer will go in this cell */
-			u8 *trailer = target + ATM_CELL_SIZE - ATM_AAL5_TRAILER;
-			/* trailer[0] = 0;		UU = 0 */
-			/* trailer[1] = 0;		CPI = 0 */
-			trailer[2] = ctrl->len >> 8;
-			trailer[3] = ctrl->len;
-
-			ctrl->crc = ~crc32_be(ctrl->crc, ptr, left - 4);
-
-			trailer[4] = ctrl->crc >> 24;
-			trailer[5] = ctrl->crc >> 16;
-			trailer[6] = ctrl->crc >> 8;
-			trailer[7] = ctrl->crc;
-
-			target[3] |= 0x2;	/* adjust PTI */
-
-			ctrl->len = 0;		/* tag this skb finished */
-		} else
-			ctrl->crc = crc32_be(ctrl->crc, ptr, left);
-	}
-
-	return bytes_written;
-}
-
-
-/**************
-**  receive  **
-**************/
-
-static void usbatm_rx_process(unsigned long data)
-{
-	struct usbatm_data *instance = (struct usbatm_data *)data;
-	struct urb *urb;
-
-	while ((urb = usbatm_pop_urb(&instance->rx_channel))) {
-		vdbg(&instance->usb_intf->dev,
-		     "%s: processing urb 0x%p", __func__, urb);
-
-		if (usb_pipeisoc(urb->pipe)) {
-			unsigned char *merge_start = NULL;
-			unsigned int merge_length = 0;
-			const unsigned int packet_size = instance->rx_channel.packet_size;
-			int i;
-
-			for (i = 0; i < urb->number_of_packets; i++) {
-				if (!urb->iso_frame_desc[i].status) {
-					unsigned int actual_length = urb->iso_frame_desc[i].actual_length;
-
-					if (!merge_length)
-						merge_start = (unsigned char *)urb->transfer_buffer + urb->iso_frame_desc[i].offset;
-					merge_length += actual_length;
-					if (merge_length && (actual_length < packet_size)) {
-						usbatm_extract_cells(instance, merge_start, merge_length);
-						merge_length = 0;
-					}
-				} else {
-					atm_rldbg(instance, "%s: status %d in frame %d!\n", __func__, urb->status, i);
-					if (merge_length)
-						usbatm_extract_cells(instance, merge_start, merge_length);
-					merge_length = 0;
-					instance->buf_usage = 0;
-				}
-			}
-
-			if (merge_length)
-				usbatm_extract_cells(instance, merge_start, merge_length);
-		} else
-			if (!urb->status)
-				usbatm_extract_cells(instance, urb->transfer_buffer, urb->actual_length);
-			else
-				instance->buf_usage = 0;
-
-		if (usbatm_submit_urb(urb))
-			return;
-	}
-}
-
-
-/***********
-**  send  **
-***********/
-
-static void usbatm_tx_process(unsigned long data)
-{
-	struct usbatm_data *instance = (struct usbatm_data *)data;
-	struct sk_buff *skb = instance->current_skb;
-	struct urb *urb = NULL;
-	const unsigned int buf_size = instance->tx_channel.buf_size;
-	unsigned int bytes_written = 0;
-	u8 *buffer = NULL;
-
-	if (!skb)
-		skb = skb_dequeue(&instance->sndqueue);
-
-	while (skb) {
-		if (!urb) {
-			urb = usbatm_pop_urb(&instance->tx_channel);
-			if (!urb)
-				break;		/* no more senders */
-			buffer = urb->transfer_buffer;
-			bytes_written = (urb->status == -EAGAIN) ?
-				urb->transfer_buffer_length : 0;
-		}
-
-		bytes_written += usbatm_write_cells(instance, skb,
-						  buffer + bytes_written,
-						  buf_size - bytes_written);
-
-		vdbg(&instance->usb_intf->dev,
-		     "%s: wrote %u bytes from skb 0x%p to urb 0x%p",
-		     __func__, bytes_written, skb, urb);
-
-		if (!UDSL_SKB(skb)->len) {
-			struct atm_vcc *vcc = UDSL_SKB(skb)->atm.vcc;
-
-			usbatm_pop(vcc, skb);
-			atomic_inc(&vcc->stats->tx);
-
-			skb = skb_dequeue(&instance->sndqueue);
-		}
-
-		if (bytes_written == buf_size || (!skb && bytes_written)) {
-			urb->transfer_buffer_length = bytes_written;
-
-			if (usbatm_submit_urb(urb))
-				break;
-			urb = NULL;
-		}
-	}
-
-	instance->current_skb = skb;
-}
-
-static void usbatm_cancel_send(struct usbatm_data *instance,
-			       struct atm_vcc *vcc)
-{
-	struct sk_buff *skb, *n;
-
-	spin_lock_irq(&instance->sndqueue.lock);
-	skb_queue_walk_safe(&instance->sndqueue, skb, n) {
-		if (UDSL_SKB(skb)->atm.vcc == vcc) {
-			atm_dbg(instance, "%s: popping skb 0x%p\n", __func__, skb);
-			__skb_unlink(skb, &instance->sndqueue);
-			usbatm_pop(vcc, skb);
-		}
-	}
-	spin_unlock_irq(&instance->sndqueue.lock);
-
-	tasklet_disable(&instance->tx_channel.tasklet);
-	if ((skb = instance->current_skb) && (UDSL_SKB(skb)->atm.vcc == vcc)) {
-		atm_dbg(instance, "%s: popping current skb (0x%p)\n", __func__, skb);
-		instance->current_skb = NULL;
-		usbatm_pop(vcc, skb);
-	}
-	tasklet_enable(&instance->tx_channel.tasklet);
-}
-
-static int usbatm_atm_send(struct atm_vcc *vcc, struct sk_buff *skb)
-{
-	struct usbatm_data *instance = vcc->dev->dev_data;
-	struct usbatm_control *ctrl = UDSL_SKB(skb);
-	int err;
-
-	/* racy disconnection check - fine */
-	if (!instance || instance->disconnected) {
-#ifdef VERBOSE_DEBUG
-		printk_ratelimited(KERN_DEBUG "%s: %s!\n", __func__, instance ? "disconnected" : "NULL instance");
-#endif
-		err = -ENODEV;
-		goto fail;
-	}
-
-	if (vcc->qos.aal != ATM_AAL5) {
-		atm_rldbg(instance, "%s: unsupported ATM type %d!\n", __func__, vcc->qos.aal);
-		err = -EINVAL;
-		goto fail;
-	}
-
-	if (skb->len > ATM_MAX_AAL5_PDU) {
-		atm_rldbg(instance, "%s: packet too long (%d vs %d)!\n",
-				__func__, skb->len, ATM_MAX_AAL5_PDU);
-		err = -EINVAL;
-		goto fail;
-	}
-
-	PACKETDEBUG(instance, skb->data, skb->len);
-
-	/* initialize the control block */
-	ctrl->atm.vcc = vcc;
-	ctrl->len = skb->len;
-	ctrl->crc = crc32_be(~0, skb->data, skb->len);
-
-	skb_queue_tail(&instance->sndqueue, skb);
-	tasklet_schedule(&instance->tx_channel.tasklet);
-
-	return 0;
-
- fail:
-	usbatm_pop(vcc, skb);
-	return err;
-}
-
-
-/********************
-**  bean counting  **
-********************/
-
-static void usbatm_destroy_instance(struct kref *kref)
-{
-	struct usbatm_data *instance = container_of(kref, struct usbatm_data, refcount);
-
-	tasklet_kill(&instance->rx_channel.tasklet);
-	tasklet_kill(&instance->tx_channel.tasklet);
-	usb_put_dev(instance->usb_dev);
-	kfree(instance);
-}
-
-static void usbatm_get_instance(struct usbatm_data *instance)
-{
-	kref_get(&instance->refcount);
-}
-
-static void usbatm_put_instance(struct usbatm_data *instance)
-{
-	kref_put(&instance->refcount, usbatm_destroy_instance);
-}
-
-
-/**********
-**  ATM  **
-**********/
-
-static void usbatm_atm_dev_close(struct atm_dev *atm_dev)
-{
-	struct usbatm_data *instance = atm_dev->dev_data;
-
-	if (!instance)
-		return;
-
-	atm_dev->dev_data = NULL; /* catch bugs */
-	usbatm_put_instance(instance);	/* taken in usbatm_atm_init */
-}
-
-static int usbatm_atm_proc_read(struct atm_dev *atm_dev, loff_t *pos, char *page)
-{
-	struct usbatm_data *instance = atm_dev->dev_data;
-	int left = *pos;
-
-	if (!instance)
-		return -ENODEV;
-
-	if (!left--)
-		return sprintf(page, "%s\n", instance->description);
-
-	if (!left--)
-		return sprintf(page, "MAC: %pM\n", atm_dev->esi);
-
-	if (!left--)
-		return sprintf(page,
-			       "AAL5: tx %d ( %d err ), rx %d ( %d err, %d drop )\n",
-			       atomic_read(&atm_dev->stats.aal5.tx),
-			       atomic_read(&atm_dev->stats.aal5.tx_err),
-			       atomic_read(&atm_dev->stats.aal5.rx),
-			       atomic_read(&atm_dev->stats.aal5.rx_err),
-			       atomic_read(&atm_dev->stats.aal5.rx_drop));
-
-	if (!left--) {
-		if (instance->disconnected)
-			return sprintf(page, "Disconnected\n");
-		else
-			switch (atm_dev->signal) {
-			case ATM_PHY_SIG_FOUND:
-				return sprintf(page, "Line up\n");
-			case ATM_PHY_SIG_LOST:
-				return sprintf(page, "Line down\n");
-			default:
-				return sprintf(page, "Line state unknown\n");
-			}
-	}
-
-	return 0;
-}
-
-static int usbatm_atm_open(struct atm_vcc *vcc)
-{
-	struct usbatm_data *instance = vcc->dev->dev_data;
-	struct usbatm_vcc_data *new = NULL;
-	int ret;
-	int vci = vcc->vci;
-	short vpi = vcc->vpi;
-
-	if (!instance)
-		return -ENODEV;
-
-	/* only support AAL5 */
-	if ((vcc->qos.aal != ATM_AAL5)) {
-		atm_warn(instance, "%s: unsupported ATM type %d!\n", __func__, vcc->qos.aal);
-		return -EINVAL;
-	}
-
-	/* sanity checks */
-	if ((vcc->qos.rxtp.max_sdu < 0) || (vcc->qos.rxtp.max_sdu > ATM_MAX_AAL5_PDU)) {
-		atm_dbg(instance, "%s: max_sdu %d out of range!\n", __func__, vcc->qos.rxtp.max_sdu);
-		return -EINVAL;
-	}
-
-	mutex_lock(&instance->serialize);	/* vs self, usbatm_atm_close, usbatm_usb_disconnect */
-
-	if (instance->disconnected) {
-		atm_dbg(instance, "%s: disconnected!\n", __func__);
-		ret = -ENODEV;
-		goto fail;
-	}
-
-	if (usbatm_find_vcc(instance, vpi, vci)) {
-		atm_dbg(instance, "%s: %hd/%d already in use!\n", __func__, vpi, vci);
-		ret = -EADDRINUSE;
-		goto fail;
-	}
-
-	new = kzalloc(sizeof(struct usbatm_vcc_data), GFP_KERNEL);
-	if (!new) {
-		atm_err(instance, "%s: no memory for vcc_data!\n", __func__);
-		ret = -ENOMEM;
-		goto fail;
-	}
-
-	new->vcc = vcc;
-	new->vpi = vpi;
-	new->vci = vci;
-
-	new->sarb = alloc_skb(usbatm_pdu_length(vcc->qos.rxtp.max_sdu), GFP_KERNEL);
-	if (!new->sarb) {
-		atm_err(instance, "%s: no memory for SAR buffer!\n", __func__);
-		ret = -ENOMEM;
-		goto fail;
-	}
-
-	vcc->dev_data = new;
-
-	tasklet_disable(&instance->rx_channel.tasklet);
-	instance->cached_vcc = new;
-	instance->cached_vpi = vpi;
-	instance->cached_vci = vci;
-	list_add(&new->list, &instance->vcc_list);
-	tasklet_enable(&instance->rx_channel.tasklet);
-
-	set_bit(ATM_VF_ADDR, &vcc->flags);
-	set_bit(ATM_VF_PARTIAL, &vcc->flags);
-	set_bit(ATM_VF_READY, &vcc->flags);
-
-	mutex_unlock(&instance->serialize);
-
-	atm_dbg(instance, "%s: allocated vcc data 0x%p\n", __func__, new);
-
-	return 0;
-
-fail:
-	kfree(new);
-	mutex_unlock(&instance->serialize);
-	return ret;
-}
-
-static void usbatm_atm_close(struct atm_vcc *vcc)
-{
-	struct usbatm_data *instance = vcc->dev->dev_data;
-	struct usbatm_vcc_data *vcc_data = vcc->dev_data;
-
-	if (!instance || !vcc_data)
-		return;
-
-	usbatm_cancel_send(instance, vcc);
-
-	mutex_lock(&instance->serialize);	/* vs self, usbatm_atm_open, usbatm_usb_disconnect */
-
-	tasklet_disable(&instance->rx_channel.tasklet);
-	if (instance->cached_vcc == vcc_data) {
-		instance->cached_vcc = NULL;
-		instance->cached_vpi = ATM_VPI_UNSPEC;
-		instance->cached_vci = ATM_VCI_UNSPEC;
-	}
-	list_del(&vcc_data->list);
-	tasklet_enable(&instance->rx_channel.tasklet);
-
-	kfree_skb(vcc_data->sarb);
-	vcc_data->sarb = NULL;
-
-	kfree(vcc_data);
-	vcc->dev_data = NULL;
-
-	vcc->vpi = ATM_VPI_UNSPEC;
-	vcc->vci = ATM_VCI_UNSPEC;
-	clear_bit(ATM_VF_READY, &vcc->flags);
-	clear_bit(ATM_VF_PARTIAL, &vcc->flags);
-	clear_bit(ATM_VF_ADDR, &vcc->flags);
-
-	mutex_unlock(&instance->serialize);
-}
-
-static int usbatm_atm_ioctl(struct atm_dev *atm_dev, unsigned int cmd,
-			  void __user *arg)
-{
-	struct usbatm_data *instance = atm_dev->dev_data;
-
-	if (!instance || instance->disconnected)
-		return -ENODEV;
-
-	switch (cmd) {
-	case ATM_QUERYLOOP:
-		return put_user(ATM_LM_NONE, (int __user *)arg) ? -EFAULT : 0;
-	default:
-		return -ENOIOCTLCMD;
-	}
-}
-
-static int usbatm_atm_init(struct usbatm_data *instance)
-{
-	struct atm_dev *atm_dev;
-	int ret, i;
-
-	/* ATM init.  The ATM initialization scheme suffers from an intrinsic race
-	 * condition: callbacks we register can be executed at once, before we have
-	 * initialized the struct atm_dev.  To protect against this, all callbacks
-	 * abort if atm_dev->dev_data is NULL. */
-	atm_dev = atm_dev_register(instance->driver_name,
-				   &instance->usb_intf->dev, &usbatm_atm_devops,
-				   -1, NULL);
-	if (!atm_dev) {
-		usb_err(instance, "%s: failed to register ATM device!\n", __func__);
-		return -1;
-	}
-
-	instance->atm_dev = atm_dev;
-
-	atm_dev->ci_range.vpi_bits = ATM_CI_MAX;
-	atm_dev->ci_range.vci_bits = ATM_CI_MAX;
-	atm_dev->signal = ATM_PHY_SIG_UNKNOWN;
-
-	/* temp init ATM device, set to 128kbit */
-	atm_dev->link_rate = 128 * 1000 / 424;
-
-	if (instance->driver->atm_start && ((ret = instance->driver->atm_start(instance, atm_dev)) < 0)) {
-		atm_err(instance, "%s: atm_start failed: %d!\n", __func__, ret);
-		goto fail;
-	}
-
-	usbatm_get_instance(instance);	/* dropped in usbatm_atm_dev_close */
-
-	/* ready for ATM callbacks */
-	mb();
-	atm_dev->dev_data = instance;
-
-	/* submit all rx URBs */
-	for (i = 0; i < num_rcv_urbs; i++)
-		usbatm_submit_urb(instance->urbs[i]);
-
-	return 0;
-
- fail:
-	instance->atm_dev = NULL;
-	atm_dev_deregister(atm_dev); /* usbatm_atm_dev_close will eventually be called */
-	return ret;
-}
-
-
-/**********
-**  USB  **
-**********/
-
-static int usbatm_do_heavy_init(void *arg)
-{
-	struct usbatm_data *instance = arg;
-	int ret;
-
-	allow_signal(SIGTERM);
-	complete(&instance->thread_started);
-
-	ret = instance->driver->heavy_init(instance, instance->usb_intf);
-
-	if (!ret)
-		ret = usbatm_atm_init(instance);
-
-	mutex_lock(&instance->serialize);
-	instance->thread = NULL;
-	mutex_unlock(&instance->serialize);
-
-	complete_and_exit(&instance->thread_exited, ret);
-}
-
-static int usbatm_heavy_init(struct usbatm_data *instance)
-{
-	struct task_struct *t;
-
-	t = kthread_create(usbatm_do_heavy_init, instance, "%s",
-			instance->driver->driver_name);
-	if (IS_ERR(t)) {
-		usb_err(instance, "%s: failed to create kernel_thread (%ld)!\n",
-				__func__, PTR_ERR(t));
-		return PTR_ERR(t);
-	}
-
-	instance->thread = t;
-	wake_up_process(t);
-	wait_for_completion(&instance->thread_started);
-
-	return 0;
-}
-
-static void usbatm_tasklet_schedule(unsigned long data)
-{
-	tasklet_schedule((struct tasklet_struct *) data);
-}
-
-static void usbatm_init_channel(struct usbatm_channel *channel)
-{
-	spin_lock_init(&channel->lock);
-	INIT_LIST_HEAD(&channel->list);
-	channel->delay.function = usbatm_tasklet_schedule;
-	channel->delay.data = (unsigned long) &channel->tasklet;
-	init_timer(&channel->delay);
-}
-
-int usbatm_usb_probe(struct usb_interface *intf, const struct usb_device_id *id,
-		     struct usbatm_driver *driver)
-{
-	struct device *dev = &intf->dev;
-	struct usb_device *usb_dev = interface_to_usbdev(intf);
-	struct usbatm_data *instance;
-	char *buf;
-	int error = -ENOMEM;
-	int i, length;
-	unsigned int maxpacket, num_packets;
-
-	/* instance init */
-	instance = kzalloc(sizeof(*instance) + sizeof(struct urb *) * (num_rcv_urbs + num_snd_urbs), GFP_KERNEL);
-	if (!instance) {
-		dev_err(dev, "%s: no memory for instance data!\n", __func__);
-		return -ENOMEM;
-	}
-
-	/* public fields */
-
-	instance->driver = driver;
-	strlcpy(instance->driver_name, driver->driver_name,
-		sizeof(instance->driver_name));
-
-	instance->usb_dev = usb_dev;
-	instance->usb_intf = intf;
-
-	buf = instance->description;
-	length = sizeof(instance->description);
-
-	if ((i = usb_string(usb_dev, usb_dev->descriptor.iProduct, buf, length)) < 0)
-		goto bind;
-
-	buf += i;
-	length -= i;
-
-	i = scnprintf(buf, length, " (");
-	buf += i;
-	length -= i;
-
-	if (length <= 0 || (i = usb_make_path(usb_dev, buf, length)) < 0)
-		goto bind;
-
-	buf += i;
-	length -= i;
-
-	snprintf(buf, length, ")");
-
- bind:
-	if (driver->bind && (error = driver->bind(instance, intf, id)) < 0) {
-			dev_err(dev, "%s: bind failed: %d!\n", __func__, error);
-			goto fail_free;
-	}
-
-	/* private fields */
-
-	kref_init(&instance->refcount);		/* dropped in usbatm_usb_disconnect */
-	mutex_init(&instance->serialize);
-
-	instance->thread = NULL;
-	init_completion(&instance->thread_started);
-	init_completion(&instance->thread_exited);
-
-	INIT_LIST_HEAD(&instance->vcc_list);
-	skb_queue_head_init(&instance->sndqueue);
-
-	usbatm_init_channel(&instance->rx_channel);
-	usbatm_init_channel(&instance->tx_channel);
-	tasklet_init(&instance->rx_channel.tasklet, usbatm_rx_process, (unsigned long)instance);
-	tasklet_init(&instance->tx_channel.tasklet, usbatm_tx_process, (unsigned long)instance);
-	instance->rx_channel.stride = ATM_CELL_SIZE + driver->rx_padding;
-	instance->tx_channel.stride = ATM_CELL_SIZE + driver->tx_padding;
-	instance->rx_channel.usbatm = instance->tx_channel.usbatm = instance;
-
-	if ((instance->flags & UDSL_USE_ISOC) && driver->isoc_in)
-		instance->rx_channel.endpoint = usb_rcvisocpipe(usb_dev, driver->isoc_in);
-	else
-		instance->rx_channel.endpoint = usb_rcvbulkpipe(usb_dev, driver->bulk_in);
-
-	instance->tx_channel.endpoint = usb_sndbulkpipe(usb_dev, driver->bulk_out);
-
-	/* tx buffer size must be a positive multiple of the stride */
-	instance->tx_channel.buf_size = max(instance->tx_channel.stride,
-			snd_buf_bytes - (snd_buf_bytes % instance->tx_channel.stride));
-
-	/* rx buffer size must be a positive multiple of the endpoint maxpacket */
-	maxpacket = usb_maxpacket(usb_dev, instance->rx_channel.endpoint, 0);
-
-	if ((maxpacket < 1) || (maxpacket > UDSL_MAX_BUF_SIZE)) {
-		dev_err(dev, "%s: invalid endpoint %02x!\n", __func__,
-				usb_pipeendpoint(instance->rx_channel.endpoint));
-		error = -EINVAL;
-		goto fail_unbind;
-	}
-
-	num_packets = max(1U, (rcv_buf_bytes + maxpacket / 2) / maxpacket); /* round */
-
-	if (num_packets * maxpacket > UDSL_MAX_BUF_SIZE)
-		num_packets--;
-
-	instance->rx_channel.buf_size = num_packets * maxpacket;
-	instance->rx_channel.packet_size = maxpacket;
-
-	for (i = 0; i < 2; i++) {
-		struct usbatm_channel *channel = i ?
-			&instance->tx_channel : &instance->rx_channel;
-
-		dev_dbg(dev, "%s: using %d byte buffer for %s channel 0x%p\n",
-			__func__, channel->buf_size, i ? "tx" : "rx", channel);
-	}
-
-	/* initialize urbs */
-
-	for (i = 0; i < num_rcv_urbs + num_snd_urbs; i++) {
-		u8 *buffer;
-		struct usbatm_channel *channel = i < num_rcv_urbs ?
-			&instance->rx_channel : &instance->tx_channel;
-		struct urb *urb;
-		unsigned int iso_packets = usb_pipeisoc(channel->endpoint) ? channel->buf_size / channel->packet_size : 0;
-
-		urb = usb_alloc_urb(iso_packets, GFP_KERNEL);
-		if (!urb) {
-			dev_err(dev, "%s: no memory for urb %d!\n", __func__, i);
-			error = -ENOMEM;
-			goto fail_unbind;
-		}
-
-		instance->urbs[i] = urb;
-
-		/* zero the tx padding to avoid leaking information */
-		buffer = kzalloc(channel->buf_size, GFP_KERNEL);
-		if (!buffer) {
-			dev_err(dev, "%s: no memory for buffer %d!\n", __func__, i);
-			error = -ENOMEM;
-			goto fail_unbind;
-		}
-
-		usb_fill_bulk_urb(urb, instance->usb_dev, channel->endpoint,
-				  buffer, channel->buf_size, usbatm_complete, channel);
-		if (iso_packets) {
-			int j;
-			urb->interval = 1;
-			urb->transfer_flags = URB_ISO_ASAP;
-			urb->number_of_packets = iso_packets;
-			for (j = 0; j < iso_packets; j++) {
-				urb->iso_frame_desc[j].offset = channel->packet_size * j;
-				urb->iso_frame_desc[j].length = channel->packet_size;
-			}
-		}
-
-		/* put all tx URBs on the list of spares */
-		if (i >= num_rcv_urbs)
-			list_add_tail(&urb->urb_list, &channel->list);
-
-		vdbg(&intf->dev, "%s: alloced buffer 0x%p buf size %u urb 0x%p",
-		     __func__, urb->transfer_buffer, urb->transfer_buffer_length, urb);
-	}
-
-	instance->cached_vpi = ATM_VPI_UNSPEC;
-	instance->cached_vci = ATM_VCI_UNSPEC;
-	instance->cell_buf = kmalloc(instance->rx_channel.stride, GFP_KERNEL);
-
-	if (!instance->cell_buf) {
-		dev_err(dev, "%s: no memory for cell buffer!\n", __func__);
-		error = -ENOMEM;
-		goto fail_unbind;
-	}
-
-	if (!(instance->flags & UDSL_SKIP_HEAVY_INIT) && driver->heavy_init) {
-		error = usbatm_heavy_init(instance);
-	} else {
-		complete(&instance->thread_exited);	/* pretend that heavy_init was run */
-		error = usbatm_atm_init(instance);
-	}
-
-	if (error < 0)
-		goto fail_unbind;
-
-	usb_get_dev(usb_dev);
-	usb_set_intfdata(intf, instance);
-
-	return 0;
-
- fail_unbind:
-	if (instance->driver->unbind)
-		instance->driver->unbind(instance, intf);
- fail_free:
-	kfree(instance->cell_buf);
-
-	for (i = 0; i < num_rcv_urbs + num_snd_urbs; i++) {
-		if (instance->urbs[i])
-			kfree(instance->urbs[i]->transfer_buffer);
-		usb_free_urb(instance->urbs[i]);
-	}
-
-	kfree(instance);
-
-	return error;
-}
-EXPORT_SYMBOL_GPL(usbatm_usb_probe);
-
-void usbatm_usb_disconnect(struct usb_interface *intf)
-{
-	struct device *dev = &intf->dev;
-	struct usbatm_data *instance = usb_get_intfdata(intf);
-	struct usbatm_vcc_data *vcc_data;
-	int i;
-
-	if (!instance) {
-		dev_dbg(dev, "%s: NULL instance!\n", __func__);
-		return;
-	}
-
-	usb_set_intfdata(intf, NULL);
-
-	mutex_lock(&instance->serialize);
-	instance->disconnected = 1;
-	if (instance->thread != NULL)
-		send_sig(SIGTERM, instance->thread, 1);
-	mutex_unlock(&instance->serialize);
-
-	wait_for_completion(&instance->thread_exited);
-
-	mutex_lock(&instance->serialize);
-	list_for_each_entry(vcc_data, &instance->vcc_list, list)
-		vcc_release_async(vcc_data->vcc, -EPIPE);
-	mutex_unlock(&instance->serialize);
-
-	tasklet_disable(&instance->rx_channel.tasklet);
-	tasklet_disable(&instance->tx_channel.tasklet);
-
-	for (i = 0; i < num_rcv_urbs + num_snd_urbs; i++)
-		usb_kill_urb(instance->urbs[i]);
-
-	del_timer_sync(&instance->rx_channel.delay);
-	del_timer_sync(&instance->tx_channel.delay);
-
-	/* turn usbatm_[rt]x_process into something close to a no-op */
-	/* no need to take the spinlock */
-	INIT_LIST_HEAD(&instance->rx_channel.list);
-	INIT_LIST_HEAD(&instance->tx_channel.list);
-
-	tasklet_enable(&instance->rx_channel.tasklet);
-	tasklet_enable(&instance->tx_channel.tasklet);
-
-	if (instance->atm_dev && instance->driver->atm_stop)
-		instance->driver->atm_stop(instance, instance->atm_dev);
-
-	if (instance->driver->unbind)
-		instance->driver->unbind(instance, intf);
-
-	instance->driver_data = NULL;
-
-	for (i = 0; i < num_rcv_urbs + num_snd_urbs; i++) {
-		kfree(instance->urbs[i]->transfer_buffer);
-		usb_free_urb(instance->urbs[i]);
-	}
-
-	kfree(instance->cell_buf);
-
-	/* ATM finalize */
-	if (instance->atm_dev) {
-		atm_dev_deregister(instance->atm_dev);
-		instance->atm_dev = NULL;
-	}
-
-	usbatm_put_instance(instance);	/* taken in usbatm_usb_probe */
-}
-EXPORT_SYMBOL_GPL(usbatm_usb_disconnect);
-
-
-/***********
-**  init  **
-***********/
-
-static int __init usbatm_usb_init(void)
-{
-	if (sizeof(struct usbatm_control) > FIELD_SIZEOF(struct sk_buff, cb)) {
-		printk(KERN_ERR "%s unusable with this kernel!\n", usbatm_driver_name);
-		return -EIO;
-	}
-
-	if ((num_rcv_urbs > UDSL_MAX_RCV_URBS)
-	    || (num_snd_urbs > UDSL_MAX_SND_URBS)
-	    || (rcv_buf_bytes < 1)
-	    || (rcv_buf_bytes > UDSL_MAX_BUF_SIZE)
-	    || (snd_buf_bytes < 1)
-	    || (snd_buf_bytes > UDSL_MAX_BUF_SIZE))
-		return -EINVAL;
-
-	return 0;
-}
-module_init(usbatm_usb_init);
-
-static void __exit usbatm_usb_exit(void)
-{
-}
-module_exit(usbatm_usb_exit);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-MODULE_VERSION(DRIVER_VERSION);
-
-/************
-**  debug  **
-************/
-
-#ifdef VERBOSE_DEBUG
-static int usbatm_print_packet(struct usbatm_data *instance,
-			       const unsigned char *data, int len)
-{
-	unsigned char buffer[256];
-	int i = 0, j = 0;
-
-	for (i = 0; i < len;) {
-		buffer[0] = '\0';
-		sprintf(buffer, "%.3d :", i);
-		for (j = 0; (j < 16) && (i < len); j++, i++)
-			sprintf(buffer, "%s %2.2x", buffer, data[i]);
-		dev_dbg(&instance->usb_intf->dev, "%s", buffer);
-	}
-	return i;
-}
-#endif
+3_PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F3_PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F3_PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F3_PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F3_PCIE_LANE_9_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F3_PCIE_LANE_10_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F3_PCIE_LANE_11_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F3_PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F3_PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define D2F3_PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf0000
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x10
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x700000
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x14
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf000000
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x18
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x70000000
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x1c
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED_MASK 0x80000000
+#define D2F3_PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED__SHIFT 0x1f
+#define D2F3_PCIE_ACS_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F3_PCIE_ACS_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F3_PCIE_ACS_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F3_PCIE_ACS_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F3_PCIE_ACS_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F3_PCIE_ACS_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F3_PCIE_ACS_CAP__SOURCE_VALIDATION_MASK 0x1
+#define D2F3_PCIE_ACS_CAP__SOURCE_VALIDATION__SHIFT 0x0
+#define D2F3_PCIE_ACS_CAP__TRANSLATION_BLOCKING_MASK 0x2
+#define D2F3_PCIE_ACS_CAP__TRANSLATION_BLOCKING__SHIFT 0x1
+#define D2F3_PCIE_ACS_CAP__P2P_REQUEST_REDIRECT_MASK 0x4
+#define D2F3_PCIE_ACS_CAP__P2P_REQUEST_REDIRECT__SHIFT 0x2
+#define D2F3_PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT_MASK 0x8
+#define D2F3_PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT__SHIFT 0x3
+#define D2F3_PCIE_ACS_CAP__UPSTREAM_FORWARDING_MASK 0x10
+#define D2F3_PCIE_ACS_CAP__UPSTREAM_FORWARDING__SHIFT 0x4
+#define D2F3_PCIE_ACS_CAP__P2P_EGRESS_CONTROL_MASK 0x20
+#define D2F3_PCIE_ACS_CAP__P2P_EGRESS_CONTROL__SHIFT 0x5
+#define D2F3_PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P_MASK 0x40
+#define D2F3_PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P__SHIFT 0x6
+#define D2F3_PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE_MASK 0xff00
+#define D2F3_PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE__SHIFT 0x8
+#define D2F3_PCIE_ACS_CNTL__SOURCE_VALIDATION_EN_MASK 0x10000
+#define D2F3_PCIE_ACS_CNTL__SOURCE_VALIDATION_EN__SHIFT 0x10
+#define D2F3_PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN_MASK 0x20000
+#define D2F3_PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN__SHIFT 0x11
+#define D2F3_PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN_MASK 0x40000
+#define D2F3_PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN__SHIFT 0x12
+#define D2F3_PCIE_ACS_CNTL__P2P_COMPLETION_REDIRECT_EN_MASK 0x80000
+#define D2F3_PCIE_ACS_CNTL__P2P_COMPLETION_REDIRECT_EN__SHIFT 0x13
+#define D2F3_PCIE_ACS_CNTL__UPSTREAM_FORWARDING_EN_MASK 0x100000
+#define D2F3_PCIE_ACS_CNTL__UPSTREAM_FORWARDING_EN__SHIFT 0x14
+#define D2F3_PCIE_ACS_CNTL__P2P_EGRESS_CONTROL_EN_MASK 0x200000
+#define D2F3_PCIE_ACS_CNTL__P2P_EGRESS_CONTROL_EN__SHIFT 0x15
+#define D2F3_PCIE_ACS_CNTL__DIRECT_TRANSLATED_P2P_EN_MASK 0x400000
+#define D2F3_PCIE_ACS_CNTL__DIRECT_TRANSLATED_P2P_EN__SHIFT 0x16
+#define D2F3_PCIE_MC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define D2F3_PCIE_MC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define D2F3_PCIE_MC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define D2F3_PCIE_MC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define D2F3_PCIE_MC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define D2F3_PCIE_MC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define D2F3_PCIE_MC_CAP__MC_MAX_GROUP_MASK 0x3f
+#define D2F3_PCIE_MC_CAP__MC_MAX_GROUP__SHIFT 0x0
+#define D2F3_PCIE_MC_CAP__MC_ECRC_REGEN_SUPP_MASK 0x8000
+#define D2F3_PCIE_MC_CAP__MC_ECRC_REGEN_SUPP__SHIFT 0xf
+#define D2F3_PCIE_MC_CNTL__MC_NUM_GROUP_MASK 0x3f0000
+#define D2F3_PCIE_MC_CNTL__MC_NUM_GROUP__SHIFT 0x10
+#define D2F3_PCIE_MC_CNTL__MC_ENABLE_MASK 0x80000000
+#define D2F3_PCIE_MC_CNTL__MC_ENABLE__SHIFT 0x1f
+#define D2F3_PCIE_MC_ADDR0__MC_INDEX_POS_MASK 0x3f
+#define D2F3_PCIE_MC_ADDR0__MC_INDEX_POS__SHIFT 0x0
+#define D2F3_PCIE_MC_ADDR0__MC_BASE_ADDR_0_MASK 0xfffff000
+#define D2F3_PCIE_MC_ADDR0__MC_BASE_ADDR_0__SHIFT 0xc
+#define D2F3_PCIE_MC_ADDR1__MC_BASE_ADDR_1_MASK 0xffffffff
+#define D2F3_PCIE_MC_ADDR1__MC_BASE_ADDR_1__SHIFT 0x0
+#define D2F3_PCIE_MC_RCV0__MC_RECEIVE_0_MASK 0xffffffff
+#define D2F3_PCIE_MC_RCV0__MC_RECEIVE_0__SHIFT 0x0
+#define D2F3_PCIE_MC_RCV1__MC_RECEIVE_1_MASK 0xffffffff
+#define D2F3_PCIE_MC_RCV1__MC_RECEIVE_1__SHIFT 0x0
+#define D2F3_PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0_MASK 0xffffffff
+#define D2F3_PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0__SHIFT 0x0
+#define D2F3_PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1_MASK 0xffffffff
+#define D2F3_PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1__SHIFT 0x0
+#define D2F3_PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0_MASK 0xffffffff
+#define D2F3_PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0__SHIFT 0x0
+#define D2F3_PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1_MASK 0xffffffff
+#define D2F3_PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1__SHIFT 0x0
+#define D2F3_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_SIZE_MASK 0x3f
+#define D2F3_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_SIZE__SHIFT 0x0
+#define D2F3_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_BAR_0_MASK 0xffffffc0
+#define D2F3_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_BAR_0__SHIFT 0x6
+#define D2F3_PCIE_MC_OVERLAY_BAR1__MC_OVERLAY_BAR_1_MASK 0xffffffff
+#define D2F3_PCIE_MC_OVERLAY_BAR1__MC_OVERLAY_BAR_1__SHIFT 0x0
+#define D2F4_PCIE_PORT_INDEX__PCIE_INDEX_MASK 0xff
+#define D2F4_PCIE_PORT_INDEX__PCIE_INDEX__SHIFT 0x0
+#define D2F4_PCIE_PORT_DATA__PCIE_DATA_MASK 0xffffffff
+#define D2F4_PCIE_PORT_DATA__PCIE_DATA__SHIFT 0x0
+#define D2F4_PCIEP_RESERVED__PCIEP_RESERVED_MASK 0xffffffff
+#define D2F4_PCIEP_RESERVED__PCIEP_RESERVED__SHIFT 0x0
+#define D2F4_PCIEP_SCRATCH__PCIEP_SCRATCH_MASK 0xffffffff
+#define D2F4_PCIEP_SCRATCH__PCIEP_SCRATCH__SHIFT 0x0
+#define D2F4_PCIEP_HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define D2F4_PCIEP_HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define D2F4_PCIEP_HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define D2F4_PCIEP_HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define D2F4_PCIEP_HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define D2F4_PCIEP_HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define D2F4_PCIEP_HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define D2F4_PCIEP_HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define D2F4_PCIEP_HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define D2F4_PCIEP_HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define D2F4_PCIEP_HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define D2F4_PCIEP_HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define D2F4_PCIEP_HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define D2F4_PCIEP_HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define D2F4_PCIEP_HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define D2F4_PCIEP_HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define D2F4_PCIEP_HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define D2F4_PCIEP_HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define D2F4_PCIEP_HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define D2F4_PCIEP_HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define D2F4_PCIEP_HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define D2F4_PCIEP_HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define D2F4_PCIEP_HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define D2F4_PCIEP_HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define D2F4_PCIEP_HW_DEBUG__HW_12_DEBUG_MASK 0x1000
+#define D2F4_PCIEP_HW_DEBUG__HW_12_DEBUG__SHIFT 0xc
+#define D2F4_PCIEP_HW_DEBUG__HW_13_DEBUG_MASK 0x2000
+#define D2F4_PCIEP_HW_DEBUG__HW_13_DEBUG__SHIFT 0xd
+#define D2F4_PCIEP_HW_DEBUG__HW_14_DEBUG_MASK 0x4000
+#define D2F4_PCIEP_HW_DEBUG__HW_14_DEBUG__SHIFT 0xe
+#define D2F4_PCIEP_HW_DEBUG__HW_15_DEBUG_MASK 0x8000
+#define D2F4_PCIEP_HW_DEBUG__HW_15_DEBUG__SHIFT 0xf
+#define D2F4_PCIEP_PORT_CNTL__SLV_PORT_REQ_EN_MASK 0x1
+#define D2F4_PCIEP_PORT_CNTL__SLV_PORT_REQ_EN__SHIFT 0x0
+#define D2F4_PCIEP_PORT_CNTL__CI_SNOOP_OVERRIDE_MASK 0x2
+#define D2F4_PCIEP_PORT_CNTL__CI_SNOOP_OVERRIDE__SHIFT 0x1
+#define D2F4_PCIEP_PORT_CNTL__HOTPLUG_MSG_EN_MASK 0x4
+#define D2F4_PCIEP_PORT_CNTL__HOTPLUG_MSG_EN__SHIFT 0x2
+#define D2F4_PCIEP_PORT_CNTL__NATIVE_PME_EN_MASK 0x8
+#define D2F4_PCIEP_PORT_CNTL__NATIVE_PME_EN__SHIFT 0x3
+#define D2F4_PCIEP_PORT_CNTL__PWR_FAULT_EN_MASK 0x10
+#define D2F4_PCIEP_PORT_CNTL__PWR_FAULT_EN__SHIFT 0x4
+#define D2F4_PCIEP_PORT_CNTL__PMI_BM_DIS_MASK 0x20
+#define D2F4_PCIEP_PORT_CNTL__PMI_BM_DIS__SHIFT 0x5
+#define D2F4_PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE_MASK 0x40
+#define D2F4_PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE__SHIFT 0x6
+#define D2F4_PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S_MASK 0x7f00
+#define D2F4_PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S__SHIFT 0x8
+#define D2F4_PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE_MASK 0x30000
+#define D2F4_PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define D2F4_PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE_MASK 0x1c0000
+#define D2F4_PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE__SHIFT 0x12
+#define D2F4_PCIE_TX_CNTL__TX_SNR_OVERRIDE_MASK 0xc00
+#define D2F4_PCIE_TX_CNTL__TX_SNR_OVERRIDE__SHIFT 0xa
+#define D2F4_PCIE_TX_CNTL__TX_RO_OVERRIDE_MASK 0x3000
+#define D2F4_PCIE_TX_CNTL__TX_RO_OVERRIDE__SHIFT 0xc
+#define D2F4_PCIE_TX_CNTL__TX_PACK_PACKET_DIS_MASK 0x4000
+#define D2F4_PCIE_TX_CNTL__TX_PACK_PACKET_DIS__SHIFT 0xe
+#define D2F4_PCIE_TX_CNTL__TX_FLUSH_TLP_DIS_MASK 0x8000
+#define D2F4_PCIE_TX_CNTL__TX_FLUSH_TLP_DIS__SHIFT 0xf
+#define D2F4_PCIE_TX_CNTL__TX_CPL_PASS_P_MASK 0x100000
+#define D2F4_PCIE_TX_CNTL__TX_CPL_PASS_P__SHIFT 0x14
+#define D2F4_PCIE_TX_CNTL__TX_NP_PASS_P_MASK 0x200000
+#define D2F4_PCIE_TX_CNTL__TX_NP_PASS_P__SHIFT 0x15
+#define D2F4_PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS_MASK 0x400000
+#define D2F4_PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS__SHIFT 0x16
+#define D2F4_PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS_MASK 0x800000
+#define D2F4_PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS__SHIFT 0x17
+#define D2F4_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION_MASK 0x7
+#define D2F4_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION__SHIFT 0x0
+#define D2F4_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE_MASK 0xf8
+#define D2F4_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE__SHIFT 0x3
+#define D2F4_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS_MASK 0xff00
+#define D2F4_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS__SHIFT 0x8
+#define D2F4_PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA_MASK 0xffffff
+#define D2F4_PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA__SHIFT 0x0
+#define D2F4_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_MASK 0x3f000000
+#define D2F4_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP__SHIFT 0x18
+#define D2F4_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN_MASK 0x40000000
+#define D2F4_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN__SHIFT 0x1e
+#define D2F4_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN_MASK 0x80000000
+#define D2F4_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN__SHIFT 0x1f
+#define D2F4_PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ_MASK 0xfff
+#define D2F4_PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ__SHIFT 0x0
+#define D2F4_PCIE_TX_SEQ__TX_ACKD_SEQ_MASK 0xfff0000
+#define D2F4_PCIE_TX_SEQ__TX_ACKD_SEQ__SHIFT 0x10
+#define D2F4_PCIE_TX_REPLAY__TX_REPLAY_NUM_MASK 0x7
+#define D2F4_PCIE_TX_REPLAY__TX_REPLAY_NUM__SHIFT 0x0
+#define D2F4_PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE_MASK 0x8000
+#define D2F4_PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE__SHIFT 0xf
+#define D2F4_PCIE_TX_REPLAY__TX_REPLAY_TIMER_MASK 0xffff0000
+#define D2F4_PCIE_TX_REPLAY__TX_REPLAY_TIMER__SHIFT 0x10
+#define D2F4_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_MASK 0xfff
+#define D2F4_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT__SHIFT 0x0
+#define D2F4_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE_MASK 0x1000
+#define D2F4_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE__SHIFT 0xc
+#define D2F4_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD_MASK 0xfff
+#define D2F4_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD__SHIFT 0x0
+#define D2F4_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH_MASK 0xff0000
+#define D2F4_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH__SHIFT 0x10
+#define D2F4_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD_MASK 0xfff
+#define D2F4_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD__SHIFT 0x0
+#define D2F4_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPH_MASK 0xff0000
+#define D2F4_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPH__SHIFT 0x10
+#define D2F4_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLD_MASK 0xfff
+#define D2F4_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLD__SHIFT 0x0
+#define D2F4_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLH_MASK 0xff0000
+#define D2F4_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLH__SHIFT 0x10
+#define D2F4_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PD_MASK 0xfff
+#define D2F4_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PD__SHIFT 0x0
+#define D2F4_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PH_MASK 0xff0000
+#define D2F4_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PH__SHIFT 0x10
+#define D2F4_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPD_MASK 0xfff
+#define D2F4_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPD__SHIFT 0x0
+#define D2F4_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPH_MASK 0xff0000
+#define D2F4_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPH__SHIFT 0x10
+#define D2F4_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLD_MASK 0xfff
+#define D2F4_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLD__SHIFT 0x0
+#define D2F4_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLH_MASK 0xff0000
+#define D2F4_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLH__SHIFT 0x10
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD_MASK 0x1
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD__SHIFT 0x0
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH_MASK 0x2
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH__SHIFT 0x1
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD_MASK 0x4
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD__SHIFT 0x2
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH_MASK 0x8
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH__SHIFT 0x3
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD_MASK 0x10
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD__SHIFT 0x4
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH_MASK 0x20
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH__SHIFT 0x5
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD_MASK 0x10000
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD__SHIFT 0x10
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH_MASK 0x20000
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH__SHIFT 0x11
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD_MASK 0x40000
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD__SHIFT 0x12
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH_MASK 0x80000
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH__SHIFT 0x13
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD_MASK 0x100000
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD__SHIFT 0x14
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH_MASK 0x200000
+#define D2F4_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH__SHIFT 0x15
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0_MASK 0x7
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0__SHIFT 0x0
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0_MASK 0x70
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0__SHIFT 0x4
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0_MASK 0x700
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0__SHIFT 0x8
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1_MASK 0x70000
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1__SHIFT 0x10
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1_MASK 0x700000
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1__SHIFT 0x14
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1_MASK 0x7000000
+#define D2F4_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1__SHIFT 0x18
+#define D2F4_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL_MASK 0x1
+#define D2F4_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL__SHIFT 0x0
+#define D2F4_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH_MASK 0x7e
+#define D2F4_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH__SHIFT 0x1
+#define D2F4_PCIE_FC_P__PD_CREDITS_MASK 0xff
+#define D2F4_PCIE_FC_P__PD_CREDITS__SHIFT 0x0
+#define D2F4_PCIE_FC_P__PH_CREDITS_MASK 0xff00
+#define D2F4_PCIE_FC_P__PH_CREDITS__SHIFT 0x8
+#define D2F4_PCIE_FC_NP__NPD_CREDITS_MASK 0xff
+#define D2F4_PCIE_FC_NP__NPD_CREDITS__SHIFT 0x0
+#define D2F4_PCIE_FC_NP__NPH_CREDITS_MASK 0xff00
+#define D2F4_PCIE_FC_NP__NPH_CREDITS__SHIFT 0x8
+#define D2F4_PCIE_FC_CPL__CPLD_CREDITS_MASK 0xff
+#define D2F4_PCIE_FC_CPL__CPLD_CREDITS__SHIFT 0x0
+#define D2F4_PCIE_FC_CPL__CPLH_CREDITS_MASK 0xff00
+#define D2F4_PCIE_FC_CPL__CPLH_CREDITS__SHIFT 0x8
+#define D2F4_PCIE_ERR_CNTL__ERR_REPORTING_DIS_MASK 0x1
+#define D2F4_PCIE_ERR_CNTL__ERR_REPORTING_DIS__SHIFT 0x0
+#define D2F4_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG_MASK 0x2
+#define D2F4_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG__SHIFT 0x1
+#define D2F4_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES_MASK 0x4
+#define D2F4_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES__SHIFT 0x2
+#define D2F4_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR_MASK 0x10
+#define D2F4_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR__SHIFT 0x4
+#define D2F4_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR_MASK 0x20
+#define D2F4_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR__SHIFT 0x5
+#define D2F4_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR_MASK 0x40
+#define D2F4_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR__SHIFT 0x6
+#define D2F4_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR_MASK 0x80
+#define D2F4_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR__SHIFT 0x7
+#define D2F4_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT_MASK 0x700
+#define D2F4_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT__SHIFT 0x8
+#define D2F4_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED_MASK 0x800
+#define D2F4_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED__SHIFT 0xb
+#define D2F4_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS_MASK 0x4000
+#define D2F4_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS__SHIFT 0xe
+#define D2F4_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS_MASK 0x8000
+#define D2F4_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS__SHIFT 0xf
+#define D2F4_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET_MASK 0x10000
+#define D2F4_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET__SHIFT 0x10
+#define D2F4_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY_MASK 0x20000
+#define D2F4_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY__SHIFT 0x11
+#define D2F4_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL_MASK 0x40000
+#define D2F4_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL__SHIFT 0x12
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_IO_ERR_MASK 0x1
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_IO_ERR__SHIFT 0x0
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_BE_ERR_MASK 0x2
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_BE_ERR__SHIFT 0x1
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR_MASK 0x4
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR__SHIFT 0x2
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR_MASK 0x8
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR__SHIFT 0x3
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR_MASK 0x10
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR__SHIFT 0x4
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR_MASK 0x20
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR__SHIFT 0x5
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_EP_ERR_MASK 0x40
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_EP_ERR__SHIFT 0x6
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR_MASK 0x80
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR__SHIFT 0x7
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR_MASK 0x100
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR__SHIFT 0x8
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_TC_ERR_MASK 0x200
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_TC_ERR__SHIFT 0x9
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CFG_UR_MASK 0x400
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CFG_UR__SHIFT 0xa
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_IO_UR_MASK 0x800
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_IO_UR__SHIFT 0xb
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_AT_ERR_MASK 0x1000
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_AT_ERR__SHIFT 0xc
+#define D2F4_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL_MASK 0x2000
+#define D2F4_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL__SHIFT 0xd
+#define D2F4_PCIE_RX_CNTL__RX_GEN_ONE_NAK_MASK 0x4000
+#define D2F4_PCIE_RX_CNTL__RX_GEN_ONE_NAK__SHIFT 0xe
+#define D2F4_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG_MASK 0x8000
+#define D2F4_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG__SHIFT 0xf
+#define D2F4_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MASK 0x70000
+#define D2F4_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT__SHIFT 0x10
+#define D2F4_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE_MASK 0x80000
+#define D2F4_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE__SHIFT 0x13
+#define D2F4_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS_MASK 0x100000
+#define D2F4_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS__SHIFT 0x14
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR_MASK 0x200000
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR__SHIFT 0x15
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR_MASK 0x400000
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR__SHIFT 0x16
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR_MASK 0x800000
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR__SHIFT 0x17
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR_MASK 0x1000000
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR__SHIFT 0x18
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR_MASK 0x2000000
+#define D2F4_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR__SHIFT 0x19
+#define D2F4_PCIE_RX_CNTL__RX_TPH_DIS_MASK 0x4000000
+#define D2F4_PCIE_RX_CNTL__RX_TPH_DIS__SHIFT 0x1a
+#define D2F4_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS_MASK 0x8000000
+#define D2F4_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS__SHIFT 0x1b
+#define D2F4_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM_MASK 0xfff
+#define D2F4_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM__SHIFT 0x0
+#define D2F4_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA_MASK 0xffffff
+#define D2F4_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA__SHIFT 0x0
+#define D2F4_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS_MASK 0x1000000
+#define D2F4_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS__SHIFT 0x18
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR_MASK 0x1
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR__SHIFT 0x0
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR_MASK 0x2
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR__SHIFT 0x1
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR_MASK 0x4
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR__SHIFT 0x2
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR_MASK 0x8
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR__SHIFT 0x3
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR_MASK 0x10
+#define D2F4_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR__SHIFT 0x4
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD_MASK 0xfff
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD__SHIFT 0x0
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH_MASK 0xff0000
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH__SHIFT 0x10
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD_MASK 0xfff
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD__SHIFT 0x0
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH_MASK 0xff0000
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH__SHIFT 0x10
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD_MASK 0xfff
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD__SHIFT 0x0
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH_MASK 0xff0000
+#define D2F4_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH__SHIFT 0x10
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR_MASK 0x3
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR__SHIFT 0x0
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR_MASK 0xc
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR__SHIFT 0x2
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP_MASK 0x30
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP__SHIFT 0x4
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP_MASK 0xc0
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP__SHIFT 0x6
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW_MASK 0x300
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW__SHIFT 0x8
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW_MASK 0xc00
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW__SHIFT 0xa
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR_MASK 0x3000
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR__SHIFT 0xc
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR_MASK 0xc000
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR__SHIFT 0xe
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR_MASK 0x30000
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR__SHIFT 0x10
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR_MASK 0xc0000
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR__SHIFT 0x12
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER_MASK 0x300000
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER__SHIFT 0x14
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER_MASK 0xc00000
+#define D2F4_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER__SHIFT 0x16
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR_MASK 0x3
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR__SHIFT 0x0
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER_MASK 0xc
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER__SHIFT 0x2
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP_MASK 0x30
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP__SHIFT 0x4
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP_MASK 0xc0
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP__SHIFT 0x6
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNSUPPORTED_REQ_MASK 0x300
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNSUPPORTED_REQ__SHIFT 0x8
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_ECRC_ERROR_MASK 0xc00
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_ECRC_ERROR__SHIFT 0xa
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_MALFORMED_TLP_MASK 0x3000
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_MALFORMED_TLP__SHIFT 0xc
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNEXPECTED_CMPLT_MASK 0xc000
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNEXPECTED_CMPLT__SHIFT 0xe
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETER_ABORT_MASK 0x30000
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETER_ABORT__SHIFT 0x10
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETION_TIMEOUT_MASK 0xc0000
+#define D2F4_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETION_TIMEOUT__SHIFT 0x12
+#define D2F4_PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0_MASK 0x2
+#define D2F4_PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0__SHIFT 0x1
+#define D2F4_PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN_MASK 0x4
+#define D2F4_PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN__SHIFT 0x2
+#define D2F4_PCIE_LC_CNTL__LC_RESET_LINK_MASK 0x8
+#define D2F4_PCIE_LC_CNTL__LC_RESET_LINK__SHIFT 0x3
+#define D2F4_PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE_MASK 0xf0
+#define D2F4_PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE__SHIFT 0x4
+#define D2F4_PCIE_LC_CNTL__LC_L0S_INACTIVITY_MASK 0xf00
+#define D2F4_PCIE_LC_CNTL__LC_L0S_INACTIVITY__SHIFT 0x8
+#define D2F4_PCIE_LC_CNTL__LC_L1_INACTIVITY_MASK 0xf000
+#define D2F4_PCIE_LC_CNTL__LC_L1_INACTIVITY__SHIFT 0xc
+#define D2F4_PCIE_LC_CNTL__LC_PMI_TO_L1_DIS_MASK 0x10000
+#define D2F4_PCIE_LC_CNTL__LC_PMI_TO_L1_DIS__SHIFT 0x10
+#define D2F4_PCIE_LC_CNTL__LC_INC_N_FTS_EN_MASK 0x20000
+#define D2F4_PCIE_LC_CNTL__LC_INC_N_FTS_EN__SHIFT 0x11
+#define D2F4_PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23_MASK 0xc0000
+#define D2F4_PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23__SHIFT 0x12
+#define D2F4_PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC_MASK 0x100000
+#define D2F4_PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC__SHIFT 0x14
+#define D2F4_PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS_MASK 0x200000
+#define D2F4_PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS__SHIFT 0x15
+#define D2F4_PCIE_LC_CNTL__LC_WAKE_FROM_L23_MASK 0x400000
+#define D2F4_PCIE_LC_CNTL__LC_WAKE_FROM_L23__SHIFT 0x16
+#define D2F4_PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK_MASK 0x800000
+#define D2F4_PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK__SHIFT 0x17
+#define D2F4_PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS_MASK 0x1000000
+#define D2F4_PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS__SHIFT 0x18
+#define D2F4_PCIE_LC_CNTL__LC_DELAY_COUNT_MASK 0x6000000
+#define D2F4_PCIE_LC_CNTL__LC_DELAY_COUNT__SHIFT 0x19
+#define D2F4_PCIE_LC_CNTL__LC_DELAY_L0S_EXIT_MASK 0x8000000
+#define D2F4_PCIE_LC_CNTL__LC_DELAY_L0S_EXIT__SHIFT 0x1b
+#define D2F4_PCIE_LC_CNTL__LC_DELAY_L1_EXIT_MASK 0x10000000
+#define D2F4_PCIE_LC_CNTL__LC_DELAY_L1_EXIT__SHIFT 0x1c
+#define D2F4_PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE_MASK 0x20000000
+#define D2F4_PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE__SHIFT 0x1d
+#defin

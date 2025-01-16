@@ -1,120 +1,100 @@
-/* NXP PCF50633 Input Driver
- *
- * (C) 2006-2008 by Openmoko, Inc.
- * Author: Balaji Rao <balajirrao@openmoko.org>
- * All rights reserved.
- *
- * Broken down from monstrous PCF50633 driver mainly by
- * Harald Welte, Andy Green and Werner Almesberger
- *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the  License, or (at your
- *  option) any later version.
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/device.h>
-#include <linux/platform_device.h>
-#include <linux/input.h>
-#include <linux/slab.h>
-
-#include <linux/mfd/pcf50633/core.h>
-
-#define PCF50633_OOCSTAT_ONKEY	0x01
-#define PCF50633_REG_OOCSTAT	0x12
-#define PCF50633_REG_OOCMODE	0x10
-
-struct pcf50633_input {
-	struct pcf50633 *pcf;
-	struct input_dev *input_dev;
-};
-
-static void
-pcf50633_input_irq(int irq, void *data)
-{
-	struct pcf50633_input *input;
-	int onkey_released;
-
-	input = data;
-
-	/* We report only one event depending on the key press status */
-	onkey_released = pcf50633_reg_read(input->pcf, PCF50633_REG_OOCSTAT)
-						& PCF50633_OOCSTAT_ONKEY;
-
-	if (irq == PCF50633_IRQ_ONKEYF && !onkey_released)
-		input_report_key(input->input_dev, KEY_POWER, 1);
-	else if (irq == PCF50633_IRQ_ONKEYR && onkey_released)
-		input_report_key(input->input_dev, KEY_POWER, 0);
-
-	input_sync(input->input_dev);
-}
-
-static int pcf50633_input_probe(struct platform_device *pdev)
-{
-	struct pcf50633_input *input;
-	struct input_dev *input_dev;
-	int ret;
-
-
-	input = kzalloc(sizeof(*input), GFP_KERNEL);
-	if (!input)
-		return -ENOMEM;
-
-	input_dev = input_allocate_device();
-	if (!input_dev) {
-		kfree(input);
-		return -ENOMEM;
-	}
-
-	platform_set_drvdata(pdev, input);
-	input->pcf = dev_to_pcf50633(pdev->dev.parent);
-	input->input_dev = input_dev;
-
-	input_dev->name = "PCF50633 PMU events";
-	input_dev->id.bustype = BUS_I2C;
-	input_dev->evbit[0] = BIT(EV_KEY) | BIT(EV_PWR);
-	set_bit(KEY_POWER, input_dev->keybit);
-
-	ret = input_register_device(input_dev);
+OUCH_STATUS,
+			&touch_status);
 	if (ret) {
-		input_free_device(input_dev);
-		kfree(input);
-		return ret;
+		input_err(true, &data->client->dev, "Touch status read fail!\n");
+		return;
 	}
-	pcf50633_register_irq(input->pcf, PCF50633_IRQ_ONKEYR,
-				pcf50633_input_irq, input);
-	pcf50633_register_irq(input->pcf, PCF50633_IRQ_ONKEYF,
-				pcf50633_input_irq, input);
 
-	return 0;
+	tsp_verb("Touch Info: 0x%08x\n", touch_status);
+
+	/* Check valid scan count */
+	if ((touch_status & TOUCH_STATUS_MASK) != TOUCH_STATUS_MAGIC) {
+		input_err(true, &data->client->dev, "Touch status is not corrected! (0x%08x)\n",
+			  touch_status);
+		return;
+	}
+
+	/* Status of IC is idle */
+	if (GET_FINGER_ENABLE(touch_status) == 0)
+		clear_input_data(data);
 }
+#endif
 
-static int pcf50633_input_remove(struct platform_device *pdev)
+void timer_handler(unsigned long timer_data)
 {
-	struct pcf50633_input *input  = platform_get_drvdata(pdev);
+	struct ist40xx_data *data = (struct ist40xx_data *)timer_data;
+	struct ist40xx_status *status = &data->status;
 
-	pcf50633_free_irq(input->pcf, PCF50633_IRQ_ONKEYR);
-	pcf50633_free_irq(input->pcf, PCF50633_IRQ_ONKEYF);
+	if (data->irq_working || !data->initialized || data->rec_mode ||
+			!status->event_mode)
+		goto restart_timer;
 
-	input_unregister_device(input->input_dev);
-	kfree(input);
+	if ((status->sys_mode == STATE_POWER_ON) && (status->update != 1) &&
+			(status->calib < 1) && (status->miscalib < 1)) {
+		data->timer_ms = (u32) get_milli_second(data);
 
-	return 0;
+		if (status->noise_mode) {
+			/* 100ms after last interrupt */
+			if (data->timer_ms - data->event_ms > 100) {
+#ifdef IST40XX_NOISE_MODE
+				schedule_delayed_work(&data->work_noise_protect, 0);
+#else
+				schedule_delayed_work(&data->work_force_release, 0);
+#endif
+			}
+		}
+	}
+
+restart_timer:
+	mod_timer(&data->event_timer, get_jiffies_64() + EVENT_TIMER_INTERVAL);
 }
 
-static struct platform_driver pcf50633_input_driver = {
-	.driver = {
-		.name = "pcf50633-input",
-	},
-	.probe = pcf50633_input_probe,
-	.remove = pcf50633_input_remove,
-};
-module_platform_driver(pcf50633_input_driver);
+#ifdef CONFIG_OF
+static int ist40xx_parse_dt(struct device *dev, struct ist40xx_data *data)
+{
+	struct device_node *np = dev->of_node;
+	u32 px_zone[3];
+	u32 cm_spec[3];
 
-MODULE_AUTHOR("Balaji Rao <balajirrao@openmoko.org>");
-MODULE_DESCRIPTION("PCF50633 input driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:pcf50633-input");
+	data->dt_data->irq_gpio = of_get_named_gpio(np, "imagis,irq-gpio", 0);
+
+	data->dt_data->is_power_by_gpio = of_property_read_bool(np,
+			"imagis,power-gpioen");
+	if (data->dt_data->is_power_by_gpio) {
+		data->dt_data->power_gpio = of_get_named_gpio(np, "imagis,power-gpio", 0);
+	} else {
+		data->dt_data->power_gpio = -1;
+		if (of_property_read_string(np, "imagis,regulator_avdd",
+					&data->dt_data->regulator_avdd)) {
+			input_err(true, dev, "%s Failed to get regulator_avdd name property\n",
+				  __func__);
+		}
+	}
+
+	if (of_property_read_u32(np, "imagis,fw-bin", &data->dt_data->fw_bin) >= 0) {
+		input_info(true, dev, "%s: fw-bin: %d\n", __func__, data->dt_data->fw_bin);
+	}
+
+	if (of_property_read_string(np, "imagis,ic-version",
+				&data->dt_data->ic_version) >= 0) {
+		input_info(true, dev, "%s: ic_version: %s\n", __func__,
+			   data->dt_data->ic_version);
+	}
+
+	if (of_property_read_string(np, "imagis,project-name",
+				&data->dt_data->project_name) >= 0) {
+		input_info(true, dev, "%s: project_name: %s\n", __func__,
+			   data->dt_data->project_name);
+	}
+
+	if (data->dt_data->ic_version && data->dt_data->project_name) {
+		snprintf(data->dt_data->fw_path, FIRMWARE_PATH_LENGTH, "%s%s_%s.bin",
+			 FIRMWARE_PATH, data->dt_data->ic_version,
+			 data->dt_data->project_name);
+		input_info(true, dev, "%s: firm path: %s\n", __func__,
+			   data->dt_data->fw_path);
+
+		snprintf(data->dt_data->cmcs_path, FIRMWARE_PATH_LENGTH,
+			 "%s%s_%s_cmcs.bin", FIRMWARE_PATH,
+			 data->dt_data->ic_version, data->dt_data->project_name);
+		input_info(true, dev, "%s:

@@ -1,106 +1,80 @@
-/*
- * arch/sh/mm/tlb-pteaex.c
- *
- * TLB operations for SH-X3 CPUs featuring PTE ASID Extensions.
- *
- * Copyright (C) 2009 Paul Mundt
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+B_ECODE_* (in shubio.h). The hardware uses
+ * an error code of 0 (IIO_ICRB_ECODE_DERR), but we want zero
+ * to mean BTE_SUCCESS, so add one (BTEFAIL_OFFSET) to the error
+ * codes to give the following error codes.
  */
-#include <linux/kernel.h>
-#include <linux/mm.h>
-#include <linux/io.h>
-#include <asm/mmu_context.h>
-#include <asm/cacheflush.h>
+#define BTEFAIL_OFFSET	1
 
-void __update_tlb(struct vm_area_struct *vma, unsigned long address, pte_t pte)
-{
-	unsigned long flags, pteval, vpn;
+typedef enum {
+	BTE_SUCCESS,		/* 0 is success */
+	BTEFAIL_DIR,		/* Directory error due to IIO access*/
+	BTEFAIL_POISON,		/* poison error on IO access (write to poison page) */
+	BTEFAIL_WERR,		/* Write error (ie WINV to a Read only line) */
+	BTEFAIL_ACCESS,		/* access error (protection violation) */
+	BTEFAIL_PWERR,		/* Partial Write Error */
+	BTEFAIL_PRERR,		/* Partial Read Error */
+	BTEFAIL_TOUT,		/* CRB Time out */
+	BTEFAIL_XTERR,		/* Incoming xtalk pkt had error bit */
+	BTEFAIL_NOTAVAIL,	/* BTE not available */
+} bte_result_t;
 
-	/*
-	 * Handle debugger faulting in for debugee.
-	 */
-	if (vma && current->active_mm != vma->vm_mm)
-		return;
+#define BTEFAIL_SH2_RESP_SHORT	0x1	/* bit 000001 */
+#define BTEFAIL_SH2_RESP_LONG	0x2	/* bit 000010 */
+#define BTEFAIL_SH2_RESP_DSP	0x4	/* bit 000100 */
+#define BTEFAIL_SH2_RESP_ACCESS	0x8	/* bit 001000 */
+#define BTEFAIL_SH2_CRB_TO	0x10	/* bit 010000 */
+#define BTEFAIL_SH2_NACK_LIMIT	0x20	/* bit 100000 */
+#define BTEFAIL_SH2_ALL		0x3F	/* bit 111111 */
 
-	local_irq_save(flags);
+#define	BTE_ERR_BITS	0x3FUL
+#define	BTE_ERR_SHIFT	36
+#define BTE_ERR_MASK	(BTE_ERR_BITS << BTE_ERR_SHIFT)
 
-	/* Set PTEH register */
-	vpn = address & MMU_VPN_MASK;
-	__raw_writel(vpn, MMU_PTEH);
-
-	/* Set PTEAEX */
-	__raw_writel(get_asid(), MMU_PTEAEX);
-
-	pteval = pte.pte_low;
-
-	/* Set PTEA register */
-#ifdef CONFIG_X2TLB
-	/*
-	 * For the extended mode TLB this is trivial, only the ESZ and
-	 * EPR bits need to be written out to PTEA, with the remainder of
-	 * the protection bits (with the exception of the compat-mode SZ
-	 * and PR bits, which are cleared) being written out in PTEL.
-	 */
-	__raw_writel(pte.pte_high, MMU_PTEA);
-#endif
-
-	/* Set PTEL register */
-	pteval &= _PAGE_FLAGS_HARDWARE_MASK; /* drop software flags */
-#ifdef CONFIG_CACHE_WRITETHROUGH
-	pteval |= _PAGE_WT;
-#endif
-	/* conveniently, we want all the software flags to be 0 anyway */
-	__raw_writel(pteval, MMU_PTEL);
-
-	/* Load the TLB */
-	asm volatile("ldtlb": /* no output */ : /* no input */ : "memory");
-	local_irq_restore(flags);
-}
+#define BTE_ERROR_RETRY(value)						\
+	(is_shub2() ? (value != BTEFAIL_SH2_CRB_TO)			\
+		: (value != BTEFAIL_TOUT))
 
 /*
- * While SH-X2 extended TLB mode splits out the memory-mapped I/UTLB
- * data arrays, SH-X3 cores with PTEAEX split out the memory-mapped
- * address arrays. In compat mode the second array is inaccessible, while
- * in extended mode, the legacy 8-bit ASID field in address array 1 has
- * undefined behaviour.
+ * On shub1 BTE_ERR_MASK will always be false, so no need for is_shub2()
  */
-void local_flush_tlb_one(unsigned long asid, unsigned long page)
-{
-	jump_to_uncached();
-	__raw_writel(page, MMU_UTLB_ADDRESS_ARRAY | MMU_PAGE_ASSOC_BIT);
-	__raw_writel(asid, MMU_UTLB_ADDRESS_ARRAY2 | MMU_PAGE_ASSOC_BIT);
-	__raw_writel(page, MMU_ITLB_ADDRESS_ARRAY | MMU_PAGE_ASSOC_BIT);
-	__raw_writel(asid, MMU_ITLB_ADDRESS_ARRAY2 | MMU_PAGE_ASSOC_BIT);
-	back_to_cached();
-}
+#define BTE_SHUB2_ERROR(_status)					\
+	((_status & BTE_ERR_MASK) 					\
+	   ? (((_status >> BTE_ERR_SHIFT) & BTE_ERR_BITS) | IBLS_ERROR) \
+	   : _status)
 
-void local_flush_tlb_all(void)
-{
-	unsigned long flags, status;
-	int i;
+#define BTE_GET_ERROR_STATUS(_status)					\
+	(BTE_SHUB2_ERROR(_status) & ~IBLS_ERROR)
 
-	/*
-	 * Flush all the TLB.
-	 */
-	local_irq_save(flags);
-	jump_to_uncached();
+#define BTE_VALID_SH2_ERROR(value)					\
+	((value >= BTEFAIL_SH2_RESP_SHORT) && (value <= BTEFAIL_SH2_ALL))
 
-	status = __raw_readl(MMUCR);
-	status = ((status & MMUCR_URB) >> MMUCR_URB_SHIFT);
+/*
+ * Structure defining a bte.  An instance of this
+ * structure is created in the nodepda for each
+ * bte on that node (as defined by BTES_PER_NODE)
+ * This structure contains everything necessary
+ * to work with a BTE.
+ */
+struct bteinfo_s {
+	volatile u64 notify ____cacheline_aligned;
+	u64 *bte_base_addr ____cacheline_aligned;
+	u64 *bte_source_addr;
+	u64 *bte_destination_addr;
+	u64 *bte_control_addr;
+	u64 *bte_notify_addr;
+	spinlock_t spinlock;
+	cnodeid_t bte_cnode;	/* cnode                            */
+	int bte_error_count;	/* Number of errors encountered     */
+	int bte_num;		/* 0 --> BTE0, 1 --> BTE1           */
+	int cleanup_active;	/* Interface is locked for cleanup  */
+	volatile bte_result_t bh_error;	/* error while processing   */
+	volatile u64 *most_rcnt_na;
+	struct bteinfo_s *btes_to_try[MAX_BTES_PER_NODE];
+};
 
-	if (status == 0)
-		status = MMUCR_URB_NENTRIES;
 
-	for (i = 0; i < status; i++)
-		__raw_writel(0x0, MMU_UTLB_ADDRESS_ARRAY | (i << 8));
-
-	for (i = 0; i < 4; i++)
-		__raw_writel(0x0, MMU_ITLB_ADDRESS_ARRAY | (i << 8));
-
-	back_to_cached();
-	ctrl_barrier();
-	local_irq_restore(flags);
-}
+/*
+ * Function prototypes (functions defined in bte.c, used elsewhere)
+ */
+extern bte_result_t bte_copy(u64, u64, u64, u64, void *);
+extern bte_result_t bte_unaligned_copy(u6

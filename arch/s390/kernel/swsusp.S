@@ -1,287 +1,283 @@
-/*
- * S390 64-bit swsusp implementation
- *
- * Copyright IBM Corp. 2009
- *
- * Author(s): Hans-Joachim Picht <hans@linux.vnet.ibm.com>
- *	      Michael Holzheu <holzheu@linux.vnet.ibm.com>
- */
-
-#include <linux/linkage.h>
-#include <asm/page.h>
-#include <asm/ptrace.h>
-#include <asm/thread_info.h>
-#include <asm/asm-offsets.h>
-#include <asm/nospec-insn.h>
-#include <asm/sigp.h>
-
-/*
- * Save register context in absolute 0 lowcore and call swsusp_save() to
- * create in-memory kernel image. The context is saved in the designated
- * "store status" memory locations (see POP).
- * We return from this function twice. The first time during the suspend to
- * disk process. The second time via the swsusp_arch_resume() function
- * (see below) in the resume process.
- * This function runs with disabled interrupts.
- */
-	GEN_BR_THUNK %r14
-
-	.section .text
-ENTRY(swsusp_arch_suspend)
-	stmg	%r6,%r15,__SF_GPRS(%r15)
-	lgr	%r1,%r15
-	aghi	%r15,-STACK_FRAME_OVERHEAD
-	stg	%r1,__SF_BACKCHAIN(%r15)
-
-	/* Store FPU registers */
-	brasl	%r14,save_fpu_regs
-
-	/* Deactivate DAT */
-	stnsm	__SF_EMPTY(%r15),0xfb
-
-	/* Store prefix register on stack */
-	stpx	__SF_EMPTY(%r15)
-
-	/* Save prefix register contents for lowcore copy */
-	llgf	%r10,__SF_EMPTY(%r15)
-
-	/* Get pointer to save area */
-	lghi	%r1,0x1000
-
-	/* Save CPU address */
-	stap	__LC_EXT_CPU_ADDR(%r0)
-
-	/* Store registers */
-	mvc	0x318(4,%r1),__SF_EMPTY(%r15)	/* move prefix to lowcore */
-	stam	%a0,%a15,0x340(%r1)		/* store access registers */
-	stctg	%c0,%c15,0x380(%r1)		/* store control registers */
-	stmg	%r0,%r15,0x280(%r1)		/* store general registers */
-
-	stpt	0x328(%r1)			/* store timer */
-	stck	__SF_EMPTY(%r15)		/* store clock */
-	stckc	0x330(%r1)			/* store clock comparator */
-
-	/* Update cputime accounting before going to sleep */
-	lg	%r0,__LC_LAST_UPDATE_TIMER
-	slg	%r0,0x328(%r1)
-	alg	%r0,__LC_SYSTEM_TIMER
-	stg	%r0,__LC_SYSTEM_TIMER
-	mvc	__LC_LAST_UPDATE_TIMER(8),0x328(%r1)
-	lg	%r0,__LC_LAST_UPDATE_CLOCK
-	slg	%r0,__SF_EMPTY(%r15)
-	alg	%r0,__LC_STEAL_TIMER
-	stg	%r0,__LC_STEAL_TIMER
-	mvc	__LC_LAST_UPDATE_CLOCK(8),__SF_EMPTY(%r15)
-
-	/* Activate DAT */
-	stosm	__SF_EMPTY(%r15),0x04
-
-	/* Set prefix page to zero */
-	xc	__SF_EMPTY(4,%r15),__SF_EMPTY(%r15)
-	spx	__SF_EMPTY(%r15)
-
-	/* Save absolute zero pages */
-	larl	%r2,suspend_zero_pages
-	lg	%r2,0(%r2)
-	lghi	%r4,0
-	lghi	%r3,2*PAGE_SIZE
-	lghi	%r5,2*PAGE_SIZE
-1:	mvcle	%r2,%r4,0
-	jo	1b
-
-	/* Copy lowcore to absolute zero lowcore */
-	lghi	%r2,0
-	lgr	%r4,%r10
-	lghi	%r3,2*PAGE_SIZE
-	lghi	%r5,2*PAGE_SIZE
-1:	mvcle	%r2,%r4,0
-	jo	1b
-
-	/* Save image */
-	brasl	%r14,swsusp_save
-
-	/* Restore prefix register and return */
-	lghi	%r1,0x1000
-	spx	0x318(%r1)
-	lmg	%r6,%r15,STACK_FRAME_OVERHEAD + __SF_GPRS(%r15)
-	lghi	%r2,0
-	BR_EX	%r14
-
-/*
- * Restore saved memory image to correct place and restore register context.
- * Then we return to the function that called swsusp_arch_suspend().
- * swsusp_arch_resume() runs with disabled interrupts.
- */
-ENTRY(swsusp_arch_resume)
-	stmg	%r6,%r15,__SF_GPRS(%r15)
-	lgr	%r1,%r15
-	aghi	%r15,-STACK_FRAME_OVERHEAD
-	stg	%r1,__SF_BACKCHAIN(%r15)
-
-	/* Make all free pages stable */
-	lghi	%r2,1
-	brasl	%r14,arch_set_page_states
-
-	/* Deactivate DAT */
-	stnsm	__SF_EMPTY(%r15),0xfb
-
-	/* Set prefix page to zero */
-	xc	__SF_EMPTY(4,%r15),__SF_EMPTY(%r15)
-	spx	__SF_EMPTY(%r15)
-
-	/* Restore saved image */
-	larl	%r1,restore_pblist
-	lg	%r1,0(%r1)
-	ltgr	%r1,%r1
-	jz	2f
-0:
-	lg	%r2,8(%r1)
-	lg	%r4,0(%r1)
-	iske	%r0,%r4
-	lghi	%r3,PAGE_SIZE
-	lghi	%r5,PAGE_SIZE
-1:
-	mvcle	%r2,%r4,0
-	jo	1b
-	lg	%r2,8(%r1)
-	sske	%r0,%r2
-	lg	%r1,16(%r1)
-	ltgr	%r1,%r1
-	jnz	0b
-2:
-	ptlb				/* flush tlb */
-
-	/* Reset System */
-	larl	%r1,restart_entry
-	larl	%r2,.Lrestart_diag308_psw
-	og	%r1,0(%r2)
-	stg	%r1,0(%r0)
-	larl	%r1,.Lnew_pgm_check_psw
-	epsw	%r2,%r3
-	stm	%r2,%r3,0(%r1)
-	mvc	__LC_PGM_NEW_PSW(16,%r0),0(%r1)
-	lghi	%r0,0
-	diag	%r0,%r0,0x308
-restart_entry:
-	lhi	%r1,1
-	sigp	%r1,%r0,SIGP_SET_ARCHITECTURE
-	sam64
-#ifdef CONFIG_SMP
-	larl	%r1,smp_cpu_mt_shift
-	icm	%r1,15,0(%r1)
-	jz	smt_done
-	llgfr	%r1,%r1
-smt_loop:
-	sigp	%r1,%r0,SIGP_SET_MULTI_THREADING
-	brc	8,smt_done			/* accepted */
-	brc	2,smt_loop			/* busy, try again */
-smt_done:
+16,sp
 #endif
-	larl	%r1,.Lnew_pgm_check_psw
-	lpswe	0(%r1)
-pgm_check_entry:
+	;;
+	st8.spill [r15]=r5,SW(R7)-SW(R5)	// spill r5
+	mov.m ar.rsc=0			// put RSE in mode: enforced lazy, little endian, pl 0
+	add r2=SW(F2)+16,sp		// r2 = &sw->f2
+	;;
+	st8.spill [r14]=r6,SW(B0)-SW(R6)	// spill r6
+	mov.m r18=ar.fpsr		// preserve fpsr
+	add r3=SW(F3)+16,sp		// r3 = &sw->f3
+	;;
+	stf.spill [r2]=f2,32
+	mov.m r19=ar.rnat
+	mov r21=b0
 
-	/* Switch to original suspend CPU */
-	larl	%r1,.Lresume_cpu		/* Resume CPU address: r2 */
-	stap	0(%r1)
-	llgh	%r2,0(%r1)
-	llgh	%r1,__LC_EXT_CPU_ADDR(%r0)	/* Suspend CPU address: r1 */
-	cgr	%r1,%r2
-	je	restore_registers		/* r1 = r2 -> nothing to do */
-	larl	%r4,.Lrestart_suspend_psw	/* Set new restart PSW */
-	mvc	__LC_RST_NEW_PSW(16,%r0),0(%r4)
-3:
-	sigp	%r9,%r1,SIGP_INITIAL_CPU_RESET	/* sigp initial cpu reset */
-	brc	8,4f				/* accepted */
-	brc	2,3b				/* busy, try again */
+	stf.spill [r3]=f3,32
+	st8.spill [r15]=r7,SW(B2)-SW(R7)	// spill r7
+	mov r22=b1
+	;;
+	// since we're done with the spills, read and save ar.unat:
+	mov.m r29=ar.unat
+	mov.m r20=ar.bspstore
+	mov r23=b2
+	stf.spill [r2]=f4,32
+	stf.spill [r3]=f5,32
+	mov r24=b3
+	;;
+	st8 [r14]=r21,SW(B1)-SW(B0)		// save b0
+	st8 [r15]=r23,SW(B3)-SW(B2)		// save b2
+	mov r25=b4
+	mov r26=b5
+	;;
+	st8 [r14]=r22,SW(B4)-SW(B1)		// save b1
+	st8 [r15]=r24,SW(AR_PFS)-SW(B3)		// save b3
+	mov r21=ar.lc		// I-unit
+	stf.spill [r2]=f12,32
+	stf.spill [r3]=f13,32
+	;;
+	st8 [r14]=r25,SW(B5)-SW(B4)		// save b4
+	st8 [r15]=r16,SW(AR_LC)-SW(AR_PFS)	// save ar.pfs
+	stf.spill [r2]=f14,32
+	stf.spill [r3]=f15,32
+	;;
+	st8 [r14]=r26				// save b5
+	st8 [r15]=r21				// save ar.lc
+	stf.spill [r2]=f16,32
+	stf.spill [r3]=f17,32
+	;;
+	stf.spill [r2]=f18,32
+	stf.spill [r3]=f19,32
+	;;
+	stf.spill [r2]=f20,32
+	stf.spill [r3]=f21,32
+	;;
+	stf.spill [r2]=f22,32
+	stf.spill [r3]=f23,32
+	;;
+	stf.spill [r2]=f24,32
+	stf.spill [r3]=f25,32
+	;;
+	stf.spill [r2]=f26,32
+	stf.spill [r3]=f27,32
+	;;
+	stf.spill [r2]=f28,32
+	stf.spill [r3]=f29,32
+	;;
+	stf.spill [r2]=f30,SW(AR_UNAT)-SW(F30)
+	stf.spill [r3]=f31,SW(PR)-SW(F31)
+	add r14=SW(CALLER_UNAT)+16,sp
+	;;
+	st8 [r2]=r29,SW(AR_RNAT)-SW(AR_UNAT)	// save ar.unat
+	st8 [r14]=r17,SW(AR_FPSR)-SW(CALLER_UNAT) // save caller_unat
+	mov r21=pr
+	;;
+	st8 [r2]=r19,SW(AR_BSPSTORE)-SW(AR_RNAT) // save ar.rnat
+	st8 [r3]=r21				// save predicate registers
+	;;
+	st8 [r2]=r20				// save ar.bspstore
+	st8 [r14]=r18				// save fpsr
+	mov ar.rsc=3		// put RSE back into eager mode, pl 0
+	br.cond.sptk.many b7
+END(save_switch_stack)
 
-	/* Suspend CPU not available -> panic */
-	larl	%r15,init_thread_union
-	ahi	%r15,1<<(PAGE_SHIFT+THREAD_ORDER)
-	larl	%r2,.Lpanic_string
-	lghi	%r1,0
-	sam31
-	sigp	%r1,%r0,SIGP_SET_ARCHITECTURE
-	brasl	%r14,_sclp_print_early
-	larl	%r3,.Ldisabled_wait_31
-	lpsw	0(%r3)
-4:
-	/* Switch to suspend CPU */
-	sigp	%r9,%r1,SIGP_RESTART	/* sigp restart to suspend CPU */
-	brc	2,4b			/* busy, try again */
-5:
-	sigp	%r9,%r2,SIGP_STOP	/* sigp stop to current resume CPU */
-	brc	2,5b			/* busy, try again */
-6:	j	6b
+/*
+ * load_switch_stack:
+ *	- "invala" MUST be done at call site (normally in DO_LOAD_SWITCH_STACK)
+ *	- b7 holds address to return to
+ *	- must not touch r8-r11
+ */
+GLOBAL_ENTRY(load_switch_stack)
+	.prologue
+	.altrp b7
 
-restart_suspend:
-	larl	%r1,.Lresume_cpu
-	llgh	%r2,0(%r1)
-7:
-	sigp	%r9,%r2,SIGP_SENSE	/* sigp sense, wait for resume CPU */
-	brc	8,7b			/* accepted, status 0, still running */
-	brc	2,7b			/* busy, try again */
-	tmll	%r9,0x40		/* Test if resume CPU is stopped */
-	jz	7b
+	.body
+	lfetch.fault.nt1 [sp]
+	adds r2=SW(AR_BSPSTORE)+16,sp
+	adds r3=SW(AR_UNAT)+16,sp
+	mov ar.rsc=0						// put RSE into enforced lazy mode
+	adds r14=SW(CALLER_UNAT)+16,sp
+	adds r15=SW(AR_FPSR)+16,sp
+	;;
+	ld8 r27=[r2],(SW(B0)-SW(AR_BSPSTORE))	// bspstore
+	ld8 r29=[r3],(SW(B1)-SW(AR_UNAT))	// unat
+	;;
+	ld8 r21=[r2],16		// restore b0
+	ld8 r22=[r3],16		// restore b1
+	;;
+	ld8 r23=[r2],16		// restore b2
+	ld8 r24=[r3],16		// restore b3
+	;;
+	ld8 r25=[r2],16		// restore b4
+	ld8 r26=[r3],16		// restore b5
+	;;
+	ld8 r16=[r2],(SW(PR)-SW(AR_PFS))	// ar.pfs
+	ld8 r17=[r3],(SW(AR_RNAT)-SW(AR_LC))	// ar.lc
+	;;
+	ld8 r28=[r2]		// restore pr
+	ld8 r30=[r3]		// restore rnat
+	;;
+	ld8 r18=[r14],16	// restore caller's unat
+	ld8 r19=[r15],24	// restore fpsr
+	;;
+	ldf.fill f2=[r14],32
+	ldf.fill f3=[r15],32
+	;;
+	ldf.fill f4=[r14],32
+	ldf.fill f5=[r15],32
+	;;
+	ldf.fill f12=[r14],32
+	ldf.fill f13=[r15],32
+	;;
+	ldf.fill f14=[r14],32
+	ldf.fill f15=[r15],32
+	;;
+	ldf.fill f16=[r14],32
+	ldf.fill f17=[r15],32
+	;;
+	ldf.fill f18=[r14],32
+	ldf.fill f19=[r15],32
+	mov b0=r21
+	;;
+	ldf.fill f20=[r14],32
+	ldf.fill f21=[r15],32
+	mov b1=r22
+	;;
+	ldf.fill f22=[r14],32
+	ldf.fill f23=[r15],32
+	mov b2=r23
+	;;
+	mov ar.bspstore=r27
+	mov ar.unat=r29		// establish unat holding the NaT bits for r4-r7
+	mov b3=r24
+	;;
+	ldf.fill f24=[r14],32
+	ldf.fill f25=[r15],32
+	mov b4=r25
+	;;
+	ldf.fill f26=[r14],32
+	ldf.fill f27=[r15],32
+	mov b5=r26
+	;;
+	ldf.fill f28=[r14],32
+	ldf.fill f29=[r15],32
+	mov ar.pfs=r16
+	;;
+	ldf.fill f30=[r14],32
+	ldf.fill f31=[r15],24
+	mov ar.lc=r17
+	;;
+	ld8.fill r4=[r14],16
+	ld8.fill r5=[r15],16
+	mov pr=r28,-1
+	;;
+	ld8.fill r6=[r14],16
+	ld8.fill r7=[r15],16
 
-restore_registers:
-	/* Restore registers */
-	lghi	%r13,0x1000		/* %r1 = pointer to save area */
+	mov ar.unat=r18				// restore caller's unat
+	mov ar.rnat=r30				// must restore after bspstore but before rsc!
+	mov ar.fpsr=r19				// restore fpsr
+	mov ar.rsc=3				// put RSE back into eager mode, pl 0
+	br.cond.sptk.many b7
+END(load_switch_stack)
 
-	/* Ignore time spent in suspended state. */
-	llgf	%r1,0x318(%r13)
-	stck	__LC_LAST_UPDATE_CLOCK(%r1)
-	spt	0x328(%r13)		/* reprogram timer */
-	//sckc	0x330(%r13)		/* set clock comparator */
+GLOBAL_ENTRY(prefetch_stack)
+	add r14 = -IA64_SWITCH_STACK_SIZE, sp
+	add r15 = IA64_TASK_THREAD_KSP_OFFSET, in0
+	;;
+	ld8 r16 = [r15]				// load next's stack pointer
+	lfetch.fault.excl [r14], 128
+	;;
+	lfetch.fault.excl [r14], 128
+	lfetch.fault [r16], 128
+	;;
+	lfetch.fault.excl [r14], 128
+	lfetch.fault [r16], 128
+	;;
+	lfetch.fault.excl [r14], 128
+	lfetch.fault [r16], 128
+	;;
+	lfetch.fault.excl [r14], 128
+	lfetch.fault [r16], 128
+	;;
+	lfetch.fault [r16], 128
+	br.ret.sptk.many rp
+END(prefetch_stack)
 
-	lctlg	%c0,%c15,0x380(%r13)	/* load control registers */
-	lam	%a0,%a15,0x340(%r13)	/* load access registers */
+	/*
+	 * Invoke a system call, but do some tracing before and after the call.
+	 * We MUST preserve the current register frame throughout this routine
+	 * because some system calls (such as ia64_execve) directly
+	 * manipulate ar.pfs.
+	 */
+GLOBAL_ENTRY(ia64_trace_syscall)
+	PT_REGS_UNWIND_INFO(0)
+	/*
+	 * We need to preserve the scratch registers f6-f11 in case the system
+	 * call is sigreturn.
+	 */
+	adds r16=PT(F6)+16,sp
+	adds r17=PT(F7)+16,sp
+	;;
+ 	stf.spill [r16]=f6,32
+ 	stf.spill [r17]=f7,32
+	;;
+ 	stf.spill [r16]=f8,32
+ 	stf.spill [r17]=f9,32
+	;;
+ 	stf.spill [r16]=f10
+ 	stf.spill [r17]=f11
+	br.call.sptk.many rp=syscall_trace_enter // give parent a chance to catch syscall args
+	cmp.lt p6,p0=r8,r0			// check tracehook
+	adds r2=PT(R8)+16,sp			// r2 = &pt_regs.r8
+	adds r3=PT(R10)+16,sp			// r3 = &pt_regs.r10
+	mov r10=0
+(p6)	br.cond.sptk strace_error		// syscall failed ->
+	adds r16=PT(F6)+16,sp
+	adds r17=PT(F7)+16,sp
+	;;
+	ldf.fill f6=[r16],32
+	ldf.fill f7=[r17],32
+	;;
+	ldf.fill f8=[r16],32
+	ldf.fill f9=[r17],32
+	;;
+	ldf.fill f10=[r16]
+	ldf.fill f11=[r17]
+	// the syscall number may have changed, so re-load it and re-calculate the
+	// syscall entry-point:
+	adds r15=PT(R15)+16,sp			// r15 = &pt_regs.r15 (syscall #)
+	;;
+	ld8 r15=[r15]
+	mov r3=NR_syscalls - 1
+	;;
+	adds r15=-1024,r15
+	movl r16=sys_call_table
+	;;
+	shladd r20=r15,3,r16			// r20 = sys_call_table + 8*(syscall-1024)
+	cmp.leu p6,p7=r15,r3
+	;;
+(p6)	ld8 r20=[r20]				// load address of syscall entry point
+(p7)	movl r20=sys_ni_syscall
+	;;
+	mov b6=r20
+	br.call.sptk.many rp=b6			// do the syscall
+.strace_check_retval:
+	cmp.lt p6,p0=r8,r0			// syscall failed?
+	adds r2=PT(R8)+16,sp			// r2 = &pt_regs.r8
+	adds r3=PT(R10)+16,sp			// r3 = &pt_regs.r10
+	mov r10=0
+(p6)	br.cond.sptk strace_error		// syscall failed ->
+	;;					// avoid RAW on r10
+.strace_save_retval:
+.mem.offset 0,0; st8.spill [r2]=r8		// store return value in slot for r8
+.mem.offset 8,0; st8.spill [r3]=r10		// clear error indication in slot for r10
+	br.call.sptk.many rp=syscall_trace_leave // give parent a chance to catch return value
+.ret3:
+(pUStk)	cmp.eq.unc p6,p0=r0,r0			// p6 <- pUStk
+(pUStk)	rsm psr.i				// disable interrupts
+	br.cond.sptk ia64_work_pending_syscall_end
 
-	/* Load old stack */
-	lg	%r15,0x2f8(%r13)
-
-	/* Save prefix register */
-	mvc __SF_EMPTY(4,%r15),0x318(%r13)
-
-	/* Restore absolute zero pages */
-	lghi	%r2,0
-	larl	%r4,suspend_zero_pages
-	lg	%r4,0(%r4)
-	lghi	%r3,2*PAGE_SIZE
-	lghi	%r5,2*PAGE_SIZE
-1:	mvcle	%r2,%r4,0
-	jo	1b
-
-	/* Restore prefix register */
-	spx	__SF_EMPTY(%r15)
-
-	/* Activate DAT */
-	stosm	__SF_EMPTY(%r15),0x04
-
-	/* Make all free pages unstable */
-	lghi	%r2,0
-	brasl	%r14,arch_set_page_states
-
-	/* Call arch specific early resume code */
-	brasl	%r14,s390_early_resume
-
-	/* Return 0 */
-	lmg	%r6,%r15,STACK_FRAME_OVERHEAD + __SF_GPRS(%r15)
-	lghi	%r2,0
-	BR_EX	%r14
-
-	.section .data..nosave,"aw",@progbits
-	.align	8
-.Ldisabled_wait_31:
-	.long  0x000a0000,0x00000000
-.Lpanic_string:
-	.asciz	"Resume not possible because suspend CPU is no longer available"
-	.align	8
-.Lrestart_diag308_psw:
-	.long	0x00080000,0x80000000
-.Lrestart_suspend_psw:
-	.quad	0x0000000180000000,restart_suspend
-.Lnew_pgm_check_psw:
-	.quad	0,pgm_check_entry
-.Lresume_cpu:
-	.byte	0,0
+strace_error:
+	ld8 r3=[r2]				// load pt_regs.r8
+	sub r

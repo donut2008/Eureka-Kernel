@@ -1,493 +1,497 @@
-/*
- * Cryptographic API.
- *
- * Support for s390 cryptographic instructions.
- *
- *   Copyright IBM Corp. 2003, 2015
- *   Author(s): Thomas Spatzier
- *		Jan Glauber (jan.glauber@de.ibm.com)
- *		Harald Freudenberger (freude@de.ibm.com)
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option)
- * any later version.
- *
- */
-#ifndef _CRYPTO_ARCH_S390_CRYPT_S390_H
-#define _CRYPTO_ARCH_S390_CRYPT_S390_H
-
-#include <asm/errno.h>
-#include <asm/facility.h>
-
-#define CRYPT_S390_OP_MASK 0xFF00
-#define CRYPT_S390_FUNC_MASK 0x00FF
-
-#define CRYPT_S390_PRIORITY 300
-#define CRYPT_S390_COMPOSITE_PRIORITY 400
-
-#define CRYPT_S390_MSA	0x1
-#define CRYPT_S390_MSA3	0x2
-#define CRYPT_S390_MSA4	0x4
-#define CRYPT_S390_MSA5	0x8
-
-/* s390 cryptographic operations */
-enum crypt_s390_operations {
-	CRYPT_S390_KM	 = 0x0100,
-	CRYPT_S390_KMC	 = 0x0200,
-	CRYPT_S390_KIMD  = 0x0300,
-	CRYPT_S390_KLMD  = 0x0400,
-	CRYPT_S390_KMAC  = 0x0500,
-	CRYPT_S390_KMCTR = 0x0600,
-	CRYPT_S390_PPNO  = 0x0700
-};
+uff.status;
+}
+#define SN_MEMPROT_ACCESS_CLASS_0		0x14a080
+#define SN_MEMPROT_ACCESS_CLASS_1		0x2520c2
+#define SN_MEMPROT_ACCESS_CLASS_2		0x14a1ca
+#define SN_MEMPROT_ACCESS_CLASS_3		0x14a290
+#define SN_MEMPROT_ACCESS_CLASS_6		0x084080
+#define SN_MEMPROT_ACCESS_CLASS_7		0x021080
 
 /*
- * function codes for KM (CIPHER MESSAGE) instruction
- * 0x80 is the decipher modifier bit
+ * Turns off system power.
  */
-enum crypt_s390_km_func {
-	KM_QUERY	    = CRYPT_S390_KM | 0x0,
-	KM_DEA_ENCRYPT      = CRYPT_S390_KM | 0x1,
-	KM_DEA_DECRYPT      = CRYPT_S390_KM | 0x1 | 0x80,
-	KM_TDEA_128_ENCRYPT = CRYPT_S390_KM | 0x2,
-	KM_TDEA_128_DECRYPT = CRYPT_S390_KM | 0x2 | 0x80,
-	KM_TDEA_192_ENCRYPT = CRYPT_S390_KM | 0x3,
-	KM_TDEA_192_DECRYPT = CRYPT_S390_KM | 0x3 | 0x80,
-	KM_AES_128_ENCRYPT  = CRYPT_S390_KM | 0x12,
-	KM_AES_128_DECRYPT  = CRYPT_S390_KM | 0x12 | 0x80,
-	KM_AES_192_ENCRYPT  = CRYPT_S390_KM | 0x13,
-	KM_AES_192_DECRYPT  = CRYPT_S390_KM | 0x13 | 0x80,
-	KM_AES_256_ENCRYPT  = CRYPT_S390_KM | 0x14,
-	KM_AES_256_DECRYPT  = CRYPT_S390_KM | 0x14 | 0x80,
-	KM_XTS_128_ENCRYPT  = CRYPT_S390_KM | 0x32,
-	KM_XTS_128_DECRYPT  = CRYPT_S390_KM | 0x32 | 0x80,
-	KM_XTS_256_ENCRYPT  = CRYPT_S390_KM | 0x34,
-	KM_XTS_256_DECRYPT  = CRYPT_S390_KM | 0x34 | 0x80,
-};
-
-/*
- * function codes for KMC (CIPHER MESSAGE WITH CHAINING)
- * instruction
- */
-enum crypt_s390_kmc_func {
-	KMC_QUERY            = CRYPT_S390_KMC | 0x0,
-	KMC_DEA_ENCRYPT      = CRYPT_S390_KMC | 0x1,
-	KMC_DEA_DECRYPT      = CRYPT_S390_KMC | 0x1 | 0x80,
-	KMC_TDEA_128_ENCRYPT = CRYPT_S390_KMC | 0x2,
-	KMC_TDEA_128_DECRYPT = CRYPT_S390_KMC | 0x2 | 0x80,
-	KMC_TDEA_192_ENCRYPT = CRYPT_S390_KMC | 0x3,
-	KMC_TDEA_192_DECRYPT = CRYPT_S390_KMC | 0x3 | 0x80,
-	KMC_AES_128_ENCRYPT  = CRYPT_S390_KMC | 0x12,
-	KMC_AES_128_DECRYPT  = CRYPT_S390_KMC | 0x12 | 0x80,
-	KMC_AES_192_ENCRYPT  = CRYPT_S390_KMC | 0x13,
-	KMC_AES_192_DECRYPT  = CRYPT_S390_KMC | 0x13 | 0x80,
-	KMC_AES_256_ENCRYPT  = CRYPT_S390_KMC | 0x14,
-	KMC_AES_256_DECRYPT  = CRYPT_S390_KMC | 0x14 | 0x80,
-	KMC_PRNG	     = CRYPT_S390_KMC | 0x43,
-};
-
-/*
- * function codes for KMCTR (CIPHER MESSAGE WITH COUNTER)
- * instruction
- */
-enum crypt_s390_kmctr_func {
-	KMCTR_QUERY            = CRYPT_S390_KMCTR | 0x0,
-	KMCTR_DEA_ENCRYPT      = CRYPT_S390_KMCTR | 0x1,
-	KMCTR_DEA_DECRYPT      = CRYPT_S390_KMCTR | 0x1 | 0x80,
-	KMCTR_TDEA_128_ENCRYPT = CRYPT_S390_KMCTR | 0x2,
-	KMCTR_TDEA_128_DECRYPT = CRYPT_S390_KMCTR | 0x2 | 0x80,
-	KMCTR_TDEA_192_ENCRYPT = CRYPT_S390_KMCTR | 0x3,
-	KMCTR_TDEA_192_DECRYPT = CRYPT_S390_KMCTR | 0x3 | 0x80,
-	KMCTR_AES_128_ENCRYPT  = CRYPT_S390_KMCTR | 0x12,
-	KMCTR_AES_128_DECRYPT  = CRYPT_S390_KMCTR | 0x12 | 0x80,
-	KMCTR_AES_192_ENCRYPT  = CRYPT_S390_KMCTR | 0x13,
-	KMCTR_AES_192_DECRYPT  = CRYPT_S390_KMCTR | 0x13 | 0x80,
-	KMCTR_AES_256_ENCRYPT  = CRYPT_S390_KMCTR | 0x14,
-	KMCTR_AES_256_DECRYPT  = CRYPT_S390_KMCTR | 0x14 | 0x80,
-};
-
-/*
- * function codes for KIMD (COMPUTE INTERMEDIATE MESSAGE DIGEST)
- * instruction
- */
-enum crypt_s390_kimd_func {
-	KIMD_QUERY   = CRYPT_S390_KIMD | 0,
-	KIMD_SHA_1   = CRYPT_S390_KIMD | 1,
-	KIMD_SHA_256 = CRYPT_S390_KIMD | 2,
-	KIMD_SHA_512 = CRYPT_S390_KIMD | 3,
-	KIMD_GHASH   = CRYPT_S390_KIMD | 65,
-};
-
-/*
- * function codes for KLMD (COMPUTE LAST MESSAGE DIGEST)
- * instruction
- */
-enum crypt_s390_klmd_func {
-	KLMD_QUERY   = CRYPT_S390_KLMD | 0,
-	KLMD_SHA_1   = CRYPT_S390_KLMD | 1,
-	KLMD_SHA_256 = CRYPT_S390_KLMD | 2,
-	KLMD_SHA_512 = CRYPT_S390_KLMD | 3,
-};
-
-/*
- * function codes for KMAC (COMPUTE MESSAGE AUTHENTICATION CODE)
- * instruction
- */
-enum crypt_s390_kmac_func {
-	KMAC_QUERY    = CRYPT_S390_KMAC | 0,
-	KMAC_DEA      = CRYPT_S390_KMAC | 1,
-	KMAC_TDEA_128 = CRYPT_S390_KMAC | 2,
-	KMAC_TDEA_192 = CRYPT_S390_KMAC | 3
-};
-
-/*
- * function codes for PPNO (PERFORM PSEUDORANDOM NUMBER
- * OPERATION) instruction
- */
-enum crypt_s390_ppno_func {
-	PPNO_QUERY	      = CRYPT_S390_PPNO | 0,
-	PPNO_SHA512_DRNG_GEN  = CRYPT_S390_PPNO | 3,
-	PPNO_SHA512_DRNG_SEED = CRYPT_S390_PPNO | 0x83
-};
-
-/**
- * crypt_s390_km:
- * @func: the function code passed to KM; see crypt_s390_km_func
- * @param: address of parameter block; see POP for details on each func
- * @dest: address of destination memory area
- * @src: address of source memory area
- * @src_len: length of src operand in bytes
- *
- * Executes the KM (CIPHER MESSAGE) operation of the CPU.
- *
- * Returns -1 for failure, 0 for the query func, number of processed
- * bytes for encryption/decryption funcs
- */
-static inline int crypt_s390_km(long func, void *param,
-				u8 *dest, const u8 *src, long src_len)
+static inline void
+ia64_sn_power_down(void)
 {
-	register long __func asm("0") = func & CRYPT_S390_FUNC_MASK;
-	register void *__param asm("1") = param;
-	register const u8 *__src asm("2") = src;
-	register long __src_len asm("3") = src_len;
-	register u8 *__dest asm("4") = dest;
-	int ret;
-
-	asm volatile(
-		"0:	.insn	rre,0xb92e0000,%3,%1\n" /* KM opcode */
-		"1:	brc	1,0b\n" /* handle partial completion */
-		"	la	%0,0\n"
-		"2:\n"
-		EX_TABLE(0b, 2b) EX_TABLE(1b, 2b)
-		: "=d" (ret), "+a" (__src), "+d" (__src_len), "+a" (__dest)
-		: "d" (__func), "a" (__param), "0" (-1) : "cc", "memory");
-	if (ret < 0)
-		return ret;
-	return (func & CRYPT_S390_FUNC_MASK) ? src_len - __src_len : __src_len;
+	struct ia64_sal_retval ret_stuff;
+	SAL_CALL(ret_stuff, SN_SAL_SYSTEM_POWER_DOWN, 0, 0, 0, 0, 0, 0, 0);
+	while(1)
+		cpu_relax();
+	/* never returns */
 }
 
 /**
- * crypt_s390_kmc:
- * @func: the function code passed to KM; see crypt_s390_kmc_func
- * @param: address of parameter block; see POP for details on each func
- * @dest: address of destination memory area
- * @src: address of source memory area
- * @src_len: length of src operand in bytes
+ * ia64_sn_fru_capture - tell the system controller to capture hw state
  *
- * Executes the KMC (CIPHER MESSAGE WITH CHAINING) operation of the CPU.
- *
- * Returns -1 for failure, 0 for the query func, number of processed
- * bytes for encryption/decryption funcs
+ * This routine will call the SAL which will tell the system controller(s)
+ * to capture hw mmr information from each SHub in the system.
  */
-static inline int crypt_s390_kmc(long func, void *param,
-				 u8 *dest, const u8 *src, long src_len)
+static inline u64
+ia64_sn_fru_capture(void)
 {
-	register long __func asm("0") = func & CRYPT_S390_FUNC_MASK;
-	register void *__param asm("1") = param;
-	register const u8 *__src asm("2") = src;
-	register long __src_len asm("3") = src_len;
-	register u8 *__dest asm("4") = dest;
-	int ret;
+        struct ia64_sal_retval isrv;
+        SAL_CALL(isrv, SN_SAL_SYSCTL_FRU_CAPTURE, 0, 0, 0, 0, 0, 0, 0);
+        if (isrv.status)
+                return 0;
+        return isrv.v0;
+}
 
-	asm volatile(
-		"0:	.insn	rre,0xb92f0000,%3,%1\n" /* KMC opcode */
-		"1:	brc	1,0b\n" /* handle partial completion */
-		"	la	%0,0\n"
-		"2:\n"
-		EX_TABLE(0b, 2b) EX_TABLE(1b, 2b)
-		: "=d" (ret), "+a" (__src), "+d" (__src_len), "+a" (__dest)
-		: "d" (__func), "a" (__param), "0" (-1) : "cc", "memory");
-	if (ret < 0)
-		return ret;
-	return (func & CRYPT_S390_FUNC_MASK) ? src_len - __src_len : __src_len;
+/*
+ * Performs an operation on a PCI bus or slot -- power up, power down
+ * or reset.
+ */
+static inline u64
+ia64_sn_sysctl_iobrick_pci_op(nasid_t n, u64 connection_type, 
+			      u64 bus, char slot, 
+			      u64 action)
+{
+	struct ia64_sal_retval rv = {0, 0, 0, 0};
+
+	SAL_CALL_NOLOCK(rv, SN_SAL_SYSCTL_IOBRICK_PCI_OP, connection_type, n, action,
+		 bus, (u64) slot, 0, 0);
+	if (rv.status)
+	    	return rv.v0;
+	return 0;
+}
+
+
+/*
+ * Open a subchannel for sending arbitrary data to the system
+ * controller network via the system controller device associated with
+ * 'nasid'.  Return the subchannel number or a negative error code.
+ */
+static inline int
+ia64_sn_irtr_open(nasid_t nasid)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_IROUTER_OP, SAL_IROUTER_OPEN, nasid,
+			   0, 0, 0, 0, 0);
+	return (int) rv.v0;
+}
+
+/*
+ * Close system controller subchannel 'subch' previously opened on 'nasid'.
+ */
+static inline int
+ia64_sn_irtr_close(nasid_t nasid, int subch)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_IROUTER_OP, SAL_IROUTER_CLOSE,
+			   (u64) nasid, (u64) subch, 0, 0, 0, 0);
+	return (int) rv.status;
+}
+
+/*
+ * Read data from system controller associated with 'nasid' on
+ * subchannel 'subch'.  The buffer to be filled is pointed to by
+ * 'buf', and its capacity is in the integer pointed to by 'len'.  The
+ * referent of 'len' is set to the number of bytes read by the SAL
+ * call.  The return value is either SALRET_OK (for bytes read) or
+ * SALRET_ERROR (for error or "no data available").
+ */
+static inline int
+ia64_sn_irtr_recv(nasid_t nasid, int subch, char *buf, int *len)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_IROUTER_OP, SAL_IROUTER_RECV,
+			   (u64) nasid, (u64) subch, (u64) buf, (u64) len,
+			   0, 0);
+	return (int) rv.status;
+}
+
+/*
+ * Write data to the system controller network via the system
+ * controller associated with 'nasid' on suchannel 'subch'.  The
+ * buffer to be written out is pointed to by 'buf', and 'len' is the
+ * number of bytes to be written.  The return value is either the
+ * number of bytes written (which could be zero) or a negative error
+ * code.
+ */
+static inline int
+ia64_sn_irtr_send(nasid_t nasid, int subch, char *buf, int len)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_IROUTER_OP, SAL_IROUTER_SEND,
+			   (u64) nasid, (u64) subch, (u64) buf, (u64) len,
+			   0, 0);
+	return (int) rv.v0;
+}
+
+/*
+ * Check whether any interrupts are pending for the system controller
+ * associated with 'nasid' and its subchannel 'subch'.  The return
+ * value is a mask of pending interrupts (SAL_IROUTER_INTR_XMIT and/or
+ * SAL_IROUTER_INTR_RECV).
+ */
+static inline int
+ia64_sn_irtr_intr(nasid_t nasid, int subch)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_IROUTER_OP, SAL_IROUTER_INTR_STATUS,
+			   (u64) nasid, (u64) subch, 0, 0, 0, 0);
+	return (int) rv.v0;
+}
+
+/*
+ * Enable the interrupt indicated by the intr parameter (either
+ * SAL_IROUTER_INTR_XMIT or SAL_IROUTER_INTR_RECV).
+ */
+static inline int
+ia64_sn_irtr_intr_enable(nasid_t nasid, int subch, u64 intr)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_IROUTER_OP, SAL_IROUTER_INTR_ON,
+			   (u64) nasid, (u64) subch, intr, 0, 0, 0);
+	return (int) rv.v0;
+}
+
+/*
+ * Disable the interrupt indicated by the intr parameter (either
+ * SAL_IROUTER_INTR_XMIT or SAL_IROUTER_INTR_RECV).
+ */
+static inline int
+ia64_sn_irtr_intr_disable(nasid_t nasid, int subch, u64 intr)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_IROUTER_OP, SAL_IROUTER_INTR_OFF,
+			   (u64) nasid, (u64) subch, intr, 0, 0, 0);
+	return (int) rv.v0;
+}
+
+/*
+ * Set up a node as the point of contact for system controller
+ * environmental event delivery.
+ */
+static inline int
+ia64_sn_sysctl_event_init(nasid_t nasid)
+{
+        struct ia64_sal_retval rv;
+        SAL_CALL_REENTRANT(rv, SN_SAL_SYSCTL_EVENT, (u64) nasid,
+			   0, 0, 0, 0, 0, 0);
+        return (int) rv.v0;
+}
+
+/*
+ * Ask the system controller on the specified nasid to reset
+ * the CX corelet clock.  Only valid on TIO nodes.
+ */
+static inline int
+ia64_sn_sysctl_tio_clock_reset(nasid_t nasid)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_SYSCTL_OP, SAL_SYSCTL_OP_TIO_JLCK_RST,
+			nasid, 0, 0, 0, 0, 0);
+	if (rv.status != 0)
+		return (int)rv.status;
+	if (rv.v0 != 0)
+		return (int)rv.v0;
+
+	return 0;
+}
+
+/*
+ * Get the associated ioboard type for a given nasid.
+ */
+static inline long
+ia64_sn_sysctl_ioboard_get(nasid_t nasid, u16 *ioboard)
+{
+	struct ia64_sal_retval isrv;
+	SAL_CALL_REENTRANT(isrv, SN_SAL_SYSCTL_OP, SAL_SYSCTL_OP_IOBOARD,
+			   nasid, 0, 0, 0, 0, 0);
+	if (isrv.v0 != 0) {
+		*ioboard = isrv.v0;
+		return isrv.status;
+	}
+	if (isrv.v1 != 0) {
+		*ioboard = isrv.v1;
+		return isrv.status;
+	}
+
+	return isrv.status;
 }
 
 /**
- * crypt_s390_kimd:
- * @func: the function code passed to KM; see crypt_s390_kimd_func
- * @param: address of parameter block; see POP for details on each func
- * @src: address of source memory area
- * @src_len: length of src operand in bytes
+ * ia64_sn_get_fit_compt - read a FIT entry from the PROM header
+ * @nasid: NASID of node to read
+ * @index: FIT entry index to be retrieved (0..n)
+ * @fitentry: 16 byte buffer where FIT entry will be stored.
+ * @banbuf: optional buffer for retrieving banner
+ * @banlen: length of banner buffer
  *
- * Executes the KIMD (COMPUTE INTERMEDIATE MESSAGE DIGEST) operation
- * of the CPU.
+ * Access to the physical PROM chips needs to be serialized since reads and
+ * writes can't occur at the same time, so we need to call into the SAL when
+ * we want to look at the FIT entries on the chips.
  *
- * Returns -1 for failure, 0 for the query func, number of processed
- * bytes for digest funcs
+ * Returns:
+ *	%SALRET_OK if ok
+ *	%SALRET_INVALID_ARG if index too big
+ *	%SALRET_NOT_IMPLEMENTED if running on older PROM
+ *	??? if nasid invalid OR banner buffer not large enough
  */
-static inline int crypt_s390_kimd(long func, void *param,
-				  const u8 *src, long src_len)
+static inline int
+ia64_sn_get_fit_compt(u64 nasid, u64 index, void *fitentry, void *banbuf,
+		      u64 banlen)
 {
-	register long __func asm("0") = func & CRYPT_S390_FUNC_MASK;
-	register void *__param asm("1") = param;
-	register const u8 *__src asm("2") = src;
-	register long __src_len asm("3") = src_len;
-	int ret;
-
-	asm volatile(
-		"0:	.insn	rre,0xb93e0000,%1,%1\n" /* KIMD opcode */
-		"1:	brc	1,0b\n" /* handle partial completion */
-		"	la	%0,0\n"
-		"2:\n"
-		EX_TABLE(0b, 2b) EX_TABLE(1b, 2b)
-		: "=d" (ret), "+a" (__src), "+d" (__src_len)
-		: "d" (__func), "a" (__param), "0" (-1) : "cc", "memory");
-	if (ret < 0)
-		return ret;
-	return (func & CRYPT_S390_FUNC_MASK) ? src_len - __src_len : __src_len;
+	struct ia64_sal_retval rv;
+	SAL_CALL_NOLOCK(rv, SN_SAL_GET_FIT_COMPT, nasid, index, fitentry,
+			banbuf, banlen, 0, 0);
+	return (int) rv.status;
 }
 
-/**
- * crypt_s390_klmd:
- * @func: the function code passed to KM; see crypt_s390_klmd_func
- * @param: address of parameter block; see POP for details on each func
- * @src: address of source memory area
- * @src_len: length of src operand in bytes
- *
- * Executes the KLMD (COMPUTE LAST MESSAGE DIGEST) operation of the CPU.
- *
- * Returns -1 for failure, 0 for the query func, number of processed
- * bytes for digest funcs
+/*
+ * Initialize the SAL components of the system controller
+ * communication driver; specifically pass in a sizable buffer that
+ * can be used for allocation of subchannel queues as new subchannels
+ * are opened.  "buf" points to the buffer, and "len" specifies its
+ * length.
  */
-static inline int crypt_s390_klmd(long func, void *param,
-				  const u8 *src, long src_len)
+static inline int
+ia64_sn_irtr_init(nasid_t nasid, void *buf, int len)
 {
-	register long __func asm("0") = func & CRYPT_S390_FUNC_MASK;
-	register void *__param asm("1") = param;
-	register const u8 *__src asm("2") = src;
-	register long __src_len asm("3") = src_len;
-	int ret;
-
-	asm volatile(
-		"0:	.insn	rre,0xb93f0000,%1,%1\n" /* KLMD opcode */
-		"1:	brc	1,0b\n" /* handle partial completion */
-		"	la	%0,0\n"
-		"2:\n"
-		EX_TABLE(0b, 2b) EX_TABLE(1b, 2b)
-		: "=d" (ret), "+a" (__src), "+d" (__src_len)
-		: "d" (__func), "a" (__param), "0" (-1) : "cc", "memory");
-	if (ret < 0)
-		return ret;
-	return (func & CRYPT_S390_FUNC_MASK) ? src_len - __src_len : __src_len;
+	struct ia64_sal_retval rv;
+	SAL_CALL_REENTRANT(rv, SN_SAL_IROUTER_OP, SAL_IROUTER_INIT,
+			   (u64) nasid, (u64) buf, (u64) len, 0, 0, 0);
+	return (int) rv.status;
 }
 
-/**
- * crypt_s390_kmac:
- * @func: the function code passed to KM; see crypt_s390_klmd_func
- * @param: address of parameter block; see POP for details on each func
- * @src: address of source memory area
- * @src_len: length of src operand in bytes
+/*
+ * Returns the nasid, subnode & slice corresponding to a SAPIC ID
  *
- * Executes the KMAC (COMPUTE MESSAGE AUTHENTICATION CODE) operation
- * of the CPU.
- *
- * Returns -1 for failure, 0 for the query func, number of processed
- * bytes for digest funcs
+ *  In:
+ *	arg0 - SN_SAL_GET_SAPIC_INFO
+ *	arg1 - sapicid (lid >> 16) 
+ *  Out:
+ *	v0 - nasid
+ *	v1 - subnode
+ *	v2 - slice
  */
-static inline int crypt_s390_kmac(long func, void *param,
-				  const u8 *src, long src_len)
+static inline u64
+ia64_sn_get_sapic_info(int sapicid, int *nasid, int *subnode, int *slice)
 {
-	register long __func asm("0") = func & CRYPT_S390_FUNC_MASK;
-	register void *__param asm("1") = param;
-	register const u8 *__src asm("2") = src;
-	register long __src_len asm("3") = src_len;
-	int ret;
+	struct ia64_sal_retval ret_stuff;
 
-	asm volatile(
-		"0:	.insn	rre,0xb91e0000,%1,%1\n" /* KLAC opcode */
-		"1:	brc	1,0b\n" /* handle partial completion */
-		"	la	%0,0\n"
-		"2:\n"
-		EX_TABLE(0b, 2b) EX_TABLE(1b, 2b)
-		: "=d" (ret), "+a" (__src), "+d" (__src_len)
-		: "d" (__func), "a" (__param), "0" (-1) : "cc", "memory");
-	if (ret < 0)
-		return ret;
-	return (func & CRYPT_S390_FUNC_MASK) ? src_len - __src_len : __src_len;
-}
+	ret_stuff.status = 0;
+	ret_stuff.v0 = 0;
+	ret_stuff.v1 = 0;
+	ret_stuff.v2 = 0;
+	SAL_CALL_NOLOCK(ret_stuff, SN_SAL_GET_SAPIC_INFO, sapicid, 0, 0, 0, 0, 0, 0);
 
-/**
- * crypt_s390_kmctr:
- * @func: the function code passed to KMCTR; see crypt_s390_kmctr_func
- * @param: address of parameter block; see POP for details on each func
- * @dest: address of destination memory area
- * @src: address of source memory area
- * @src_len: length of src operand in bytes
- * @counter: address of counter value
- *
- * Executes the KMCTR (CIPHER MESSAGE WITH COUNTER) operation of the CPU.
- *
- * Returns -1 for failure, 0 for the query func, number of processed
- * bytes for encryption/decryption funcs
- */
-static inline int crypt_s390_kmctr(long func, void *param, u8 *dest,
-				 const u8 *src, long src_len, u8 *counter)
-{
-	register long __func asm("0") = func & CRYPT_S390_FUNC_MASK;
-	register void *__param asm("1") = param;
-	register const u8 *__src asm("2") = src;
-	register long __src_len asm("3") = src_len;
-	register u8 *__dest asm("4") = dest;
-	register u8 *__ctr asm("6") = counter;
-	int ret = -1;
-
-	asm volatile(
-		"0:	.insn	rrf,0xb92d0000,%3,%1,%4,0\n" /* KMCTR opcode */
-		"1:	brc	1,0b\n" /* handle partial completion */
-		"	la	%0,0\n"
-		"2:\n"
-		EX_TABLE(0b, 2b) EX_TABLE(1b, 2b)
-		: "+d" (ret), "+a" (__src), "+d" (__src_len), "+a" (__dest),
-		  "+a" (__ctr)
-		: "d" (__func), "a" (__param) : "cc", "memory");
-	if (ret < 0)
-		return ret;
-	return (func & CRYPT_S390_FUNC_MASK) ? src_len - __src_len : __src_len;
-}
-
-/**
- * crypt_s390_ppno:
- * @func: the function code passed to PPNO; see crypt_s390_ppno_func
- * @param: address of parameter block; see POP for details on each func
- * @dest: address of destination memory area
- * @dest_len: size of destination memory area in bytes
- * @seed: address of seed data
- * @seed_len: size of seed data in bytes
- *
- * Executes the PPNO (PERFORM PSEUDORANDOM NUMBER OPERATION)
- * operation of the CPU.
- *
- * Returns -1 for failure, 0 for the query func, number of random
- * bytes stored in dest buffer for generate function
- */
-static inline int crypt_s390_ppno(long func, void *param,
-				  u8 *dest, long dest_len,
-				  const u8 *seed, long seed_len)
-{
-	register long  __func	  asm("0") = func & CRYPT_S390_FUNC_MASK;
-	register void *__param	  asm("1") = param;    /* param block (240 bytes) */
-	register u8   *__dest	  asm("2") = dest;     /* buf for recv random bytes */
-	register long  __dest_len asm("3") = dest_len; /* requested random bytes */
-	register const u8 *__seed asm("4") = seed;     /* buf with seed data */
-	register long  __seed_len asm("5") = seed_len; /* bytes in seed buf */
-	int ret = -1;
-
-	asm volatile (
-		"0:	.insn	rre,0xb93c0000,%1,%5\n"	/* PPNO opcode */
-		"1:	brc	1,0b\n"	  /* handle partial completion */
-		"	la	%0,0\n"
-		"2:\n"
-		EX_TABLE(0b, 2b) EX_TABLE(1b, 2b)
-		: "+d" (ret), "+a"(__dest), "+d"(__dest_len)
-		: "d"(__func), "a"(__param), "a"(__seed), "d"(__seed_len)
-		: "cc", "memory");
-	if (ret < 0)
-		return ret;
-	return (func & CRYPT_S390_FUNC_MASK) ? dest_len - __dest_len : 0;
-}
-
-/**
- * crypt_s390_func_available:
- * @func: the function code of the specific function; 0 if op in general
- *
- * Tests if a specific crypto function is implemented on the machine.
- *
- * Returns 1 if func available; 0 if func or op in general not available
- */
-static inline int crypt_s390_func_available(int func,
-					    unsigned int facility_mask)
-{
-	unsigned char status[16];
-	int ret;
-
-	if (facility_mask & CRYPT_S390_MSA && !test_facility(17))
-		return 0;
-	if (facility_mask & CRYPT_S390_MSA3 && !test_facility(76))
-		return 0;
-	if (facility_mask & CRYPT_S390_MSA4 && !test_facility(77))
-		return 0;
-	if (facility_mask & CRYPT_S390_MSA5 && !test_facility(57))
-		return 0;
-
-	switch (func & CRYPT_S390_OP_MASK) {
-	case CRYPT_S390_KM:
-		ret = crypt_s390_km(KM_QUERY, &status, NULL, NULL, 0);
-		break;
-	case CRYPT_S390_KMC:
-		ret = crypt_s390_kmc(KMC_QUERY, &status, NULL, NULL, 0);
-		break;
-	case CRYPT_S390_KIMD:
-		ret = crypt_s390_kimd(KIMD_QUERY, &status, NULL, 0);
-		break;
-	case CRYPT_S390_KLMD:
-		ret = crypt_s390_klmd(KLMD_QUERY, &status, NULL, 0);
-		break;
-	case CRYPT_S390_KMAC:
-		ret = crypt_s390_kmac(KMAC_QUERY, &status, NULL, 0);
-		break;
-	case CRYPT_S390_KMCTR:
-		ret = crypt_s390_kmctr(KMCTR_QUERY, &status,
-				       NULL, NULL, 0, NULL);
-		break;
-	case CRYPT_S390_PPNO:
-		ret = crypt_s390_ppno(PPNO_QUERY, &status,
-				      NULL, 0, NULL, 0);
-		break;
-	default:
+/***** BEGIN HACK - temp til old proms no longer supported ********/
+	if (ret_stuff.status == SALRET_NOT_IMPLEMENTED) {
+		if (nasid) *nasid = sapicid & 0xfff;
+		if (subnode) *subnode = (sapicid >> 13) & 1;
+		if (slice) *slice = (sapicid >> 12) & 3;
 		return 0;
 	}
-	if (ret < 0)
-		return 0;
-	func &= CRYPT_S390_FUNC_MASK;
-	func &= 0x7f;		/* mask modifier bit */
-	return (status[func >> 3] & (0x80 >> (func & 7))) != 0;
-}
+/***** END HACK *******/
 
-/**
- * crypt_s390_pcc:
- * @func: the function code passed to KM; see crypt_s390_km_func
- * @param: address of parameter block; see POP for details on each func
- *
- * Executes the PCC (PERFORM CRYPTOGRAPHIC COMPUTATION) operation of the CPU.
- *
- * Returns -1 for failure, 0 for success.
+	if (ret_stuff.status < 0)
+		return ret_stuff.status;
+
+	if (nasid) *nasid = (int) ret_stuff.v0;
+	if (subnode) *subnode = (int) ret_stuff.v1;
+	if (slice) *slice = (int) ret_stuff.v2;
+	return 0;
+}
+ 
+/*
+ * Returns information about the HUB/SHUB.
+ *  In:
+ *	arg0 - SN_SAL_GET_SN_INFO
+ * 	arg1 - 0 (other values reserved for future use)
+ *  Out:
+ *	v0 
+ *		[7:0]   - shub type (0=shub1, 1=shub2)
+ *		[15:8]  - Log2 max number of nodes in entire system (includes
+ *			  C-bricks, I-bricks, etc)
+ *		[23:16] - Log2 of nodes per sharing domain			 
+ * 		[31:24] - partition ID
+ * 		[39:32] - coherency_id
+ * 		[47:40] - regionsize
+ *	v1 
+ *		[15:0]  - nasid mask (ex., 0x7ff for 11 bit nasid)
+ *	 	[23:15] - bit position of low nasid bit
  */
-static inline int crypt_s390_pcc(long func, void *param)
+static inline u64
+ia64_sn_get_sn_info(int fc, u8 *shubtype, u16 *nasid_bitmask, u8 *nasid_shift, 
+		u8 *systemsize, u8 *sharing_domain_size, u8 *partid, u8 *coher, u8 *reg)
 {
-	register long __func asm("0") = func & 0x7f; /* encrypt or decrypt */
-	register void *__param asm("1") = param;
-	int ret = -1;
+	struct ia64_sal_retval ret_stuff;
 
-	asm volatile(
-		"0:	.insn	rre,0xb92c0000,0,0\n" /* PCC opcode */
-		"1:	brc	1,0b\n" /* handle partial completion */
-		"	la	%0,0\n"
-		"2:\n"
-		EX_TABLE(0b, 2b) EX_TABLE(1b, 2b)
-		: "+d" (ret)
-		: "d" (__func), "a" (__param) : "cc", "memory");
-	return ret;
+	ret_stuff.status = 0;
+	ret_stuff.v0 = 0;
+	ret_stuff.v1 = 0;
+	ret_stuff.v2 = 0;
+	SAL_CALL_NOLOCK(ret_stuff, SN_SAL_GET_SN_INFO, fc, 0, 0, 0, 0, 0, 0);
+
+/***** BEGIN HACK - temp til old proms no longer supported ********/
+	if (ret_stuff.status == SALRET_NOT_IMPLEMENTED) {
+		int nasid = get_sapicid() & 0xfff;
+#define SH_SHUB_ID_NODES_PER_BIT_MASK 0x001f000000000000UL
+#define SH_SHUB_ID_NODES_PER_BIT_SHFT 48
+		if (shubtype) *shubtype = 0;
+		if (nasid_bitmask) *nasid_bitmask = 0x7ff;
+		if (nasid_shift) *nasid_shift = 38;
+		if (systemsize) *systemsize = 10;
+		if (sharing_domain_size) *sharing_domain_size = 8;
+		if (partid) *partid = ia64_sn_sysctl_partition_get(nasid);
+		if (coher) *coher = nasid >> 9;
+		if (reg) *reg = (HUB_L((u64 *) LOCAL_MMR_ADDR(SH1_SHUB_ID)) & SH_SHUB_ID_NODES_PER_BIT_MASK) >>
+			SH_SHUB_ID_NODES_PER_BIT_SHFT;
+		return 0;
+	}
+/***** END HACK *******/
+
+	if (ret_stuff.status < 0)
+		return ret_stuff.status;
+
+	if (shubtype) *shubtype = ret_stuff.v0 & 0xff;
+	if (systemsize) *systemsize = (ret_stuff.v0 >> 8) & 0xff;
+	if (sharing_domain_size) *sharing_domain_size = (ret_stuff.v0 >> 16) & 0xff;
+	if (partid) *partid = (ret_stuff.v0 >> 24) & 0xff;
+	if (coher) *coher = (ret_stuff.v0 >> 32) & 0xff;
+	if (reg) *reg = (ret_stuff.v0 >> 40) & 0xff;
+	if (nasid_bitmask) *nasid_bitmask = (ret_stuff.v1 & 0xffff);
+	if (nasid_shift) *nasid_shift = (ret_stuff.v1 >> 16) & 0xff;
+	return 0;
+}
+ 
+/*
+ * This is the access point to the Altix PROM hardware performance
+ * and status monitoring interface. For info on using this, see
+ * arch/ia64/include/asm/sn/sn2/sn_hwperf.h
+ */
+static inline int
+ia64_sn_hwperf_op(nasid_t nasid, u64 opcode, u64 a0, u64 a1, u64 a2,
+                  u64 a3, u64 a4, int *v0)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_NOLOCK(rv, SN_SAL_HWPERF_OP, (u64)nasid,
+		opcode, a0, a1, a2, a3, a4);
+	if (v0)
+		*v0 = (int) rv.v0;
+	return (int) rv.status;
 }
 
-#endif	/* _CRYPTO_ARCH_S390_CRYPT_S390_H */
+static inline int
+ia64_sn_ioif_get_pci_topology(u64 buf, u64 len)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_NOLOCK(rv, SN_SAL_IOIF_GET_PCI_TOPOLOGY, buf, len, 0, 0, 0, 0, 0);
+	return (int) rv.status;
+}
+
+/*
+ * BTE error recovery is implemented in SAL
+ */
+static inline int
+ia64_sn_bte_recovery(nasid_t nasid)
+{
+	struct ia64_sal_retval rv;
+
+	rv.status = 0;
+	SAL_CALL_NOLOCK(rv, SN_SAL_BTE_RECOVER, (u64)nasid, 0, 0, 0, 0, 0, 0);
+	if (rv.status == SALRET_NOT_IMPLEMENTED)
+		return 0;
+	return (int) rv.status;
+}
+
+static inline int
+ia64_sn_is_fake_prom(void)
+{
+	struct ia64_sal_retval rv;
+	SAL_CALL_NOLOCK(rv, SN_SAL_FAKE_PROM, 0, 0, 0, 0, 0, 0, 0);
+	return (rv.status == 0);
+}
+
+static inline int
+ia64_sn_get_prom_feature_set(int set, unsigned long *feature_set)
+{
+	struct ia64_sal_retval rv;
+
+	SAL_CALL_NOLOCK(rv, SN_SAL_GET_PROM_FEATURE_SET, set, 0, 0, 0, 0, 0, 0);
+	if (rv.status != 0)
+		return rv.status;
+	*feature_set = rv.v0;
+	return 0;
+}
+
+static inline int
+ia64_sn_set_os_feature(int feature)
+{
+	struct ia64_sal_retval rv;
+
+	SAL_CALL_NOLOCK(rv, SN_SAL_SET_OS_FEATURE_SET, feature, 0, 0, 0, 0, 0, 0);
+	return rv.status;
+}
+
+static inline int
+sn_inject_error(u64 paddr, u64 *data, u64 *ecc)
+{
+	struct ia64_sal_retval ret_stuff;
+
+	ia64_sal_oemcall_nolock(&ret_stuff, SN_SAL_INJECT_ERROR, paddr, (u64)data,
+				(u64)ecc, 0, 0, 0, 0);
+	return ret_stuff.status;
+}
+
+static inline int
+ia64_sn_set_cpu_number(int cpu)
+{
+	struct ia64_sal_retval rv;
+
+	SAL_CALL_NOLOCK(rv, SN_SAL_SET_CPU_NUMBER, cpu, 0, 0, 0, 0, 0, 0);
+	return rv.status;
+}
+static inline int
+ia64_sn_kernel_launch_event(void)
+{
+ 	struct ia64_sal_retval rv;
+	SAL_CALL_NOLOCK(rv, SN_SAL_KERNEL_LAUNCH_EVENT, 0, 0, 0, 0, 0, 0, 0);
+	return rv.status;
+}
+
+union sn_watchlist_u {
+	u64     val;
+	struct {
+		u64	blade	: 16,
+			size	: 32,
+			filler	: 16;
+	};
+};
+
+static inline int
+sn_mq_watchlist_alloc(int blade, void *mq, unsigned int mq_size,
+				unsigned long *intr_mmr_offset)
+{
+	struct ia64_sal_retval rv;
+	unsigned long addr;
+	union sn_watchlist_u size_blade;
+	int watchlist;
+
+	addr = (unsigned long)mq;
+	size_blade.size = mq_size;
+	size_blade.blade = blade;
+
+	/*
+	 * bios returns watchlist number or negative error number.
+	 */
+	ia64_sal_oemcall_nolock(&rv, SN_SAL_WATCHLIST_ALLOC, addr,
+			size_blade.val, (u64)intr_mmr_offset,
+			(u64)&watchlist, 0, 0, 0);
+	if (rv.status < 0)
+		return rv.status;
+
+	return watchlist;
+}
+
+static inline int
+sn_mq_watchlist_free(int blade, int watchlist_num)
+{
+	struct ia64_sal_retval rv;
+	ia64_sal_oemcall_nolock(&rv, SN_SAL_WATCHLIST_FREE, blade,
+			watchlist_num, 0, 0, 0, 0, 0);
+	return rv.status;
+}
+#endif /* _ASM_IA64_SN_SN_SAL_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            

@@ -1,10 +1,16 @@
-To use the amateur radio protocols within Linux you will need to get a
-suitable copy of the AX.25 Utilities. More detailed information about
-AX.25, NET/ROM and ROSE, associated programs and and utilities can be
-found on http://www.linux-ax25.org.
+os to convert bank configuration size enumerations into MiB and
+ * page values.
+ */
+#define SDRAM_MBCF_SZ_MiB_MIN		4
+#define SDRAM_MBCF_SZ_TO_MiB(n)		(SDRAM_MBCF_SZ_MiB_MIN \
+					 << (SDRAM_MBCF_SZ_DECODE(n)))
+#define SDRAM_MBCF_SZ_TO_PAGES(n)	(SDRAM_MBCF_SZ_MiB_MIN \
+					 << (20 - PAGE_SHIFT + \
+					     SDRAM_MBCF_SZ_DECODE(n)))
 
-There is an active mailing list for discussing Linux amateur radio matters
-called linux-hams@vger.kernel.org. To subscribe to it, send a message to
-majordomo@vger.kernel.org with the words "subscribe linux-hams" in the body
-of the message, the subject field is ignored.  You don't need to be
-subscribed to post but of course that means you might miss an answer.
+/*
+ * The ibm,sdram-4xx-ddr2 Device Control Registers (DCRs) are
+ * indirectly accessed and have a base and length defined by the
+ * device tree. The base can be anything; however, we expect the
+ * length to be precisely two registers, the first for the address
+ * window a

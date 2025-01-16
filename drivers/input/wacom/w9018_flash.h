@@ -1,121 +1,155 @@
-#ifndef _WACOM_I2C_FLASH_H_
-#define _WACOM_I2C_FLASH_H_
+_MAX_SRQ_RQE_OFFSET		= 16,
+	OCRDMA_MBX_QUERY_CFG_MAX_SRQ_RQE_MASK		= 0xFFFF <<
+				OCRDMA_MBX_QUERY_CFG_MAX_SRQ_RQE_OFFSET,
+	OCRDMA_MBX_QUERY_CFG_MAX_SRQ_SGE_OFFSET		= 0,
+	OCRDMA_MBX_QUERY_CFG_MAX_SRQ_SGE_MASK		= 0xFFFF <<
+				OCRDMA_MBX_QUERY_CFG_MAX_SRQ_SGE_OFFSET,
+};
 
-/* --------------------------------------------- */
-#define FLASH_START0				'f'
-#define FLASH_START1				'l'
-#define FLASH_START2				'a'
-#define FLASH_START3				's'
-#define FLASH_START4				'h'
-#define FLASH_START5				'\r'
-#define FLASH_ACK				0x06
+struct ocrdma_mbx_query_config {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
+	u32 qp_srq_cq_ird_ord;
+	u32 max_pd_ca_ack_delay;
+	u32 max_write_send_sge;
+	u32 max_ird_ord_per_qp;
+	u32 max_shared_ird_ord;
+	u32 max_mr;
+	u32 max_mr_size_hi;
+	u32 max_mr_size_lo;
+	u32 max_num_mr_pbl;
+	u32 max_mw;
+	u32 max_fmr;
+	u32 max_pages_per_frmr;
+	u32 max_mcast_group;
+	u32 max_mcast_qp_attach;
+	u32 max_total_mcast_qp_attach;
+	u32 wqe_rqe_stride_max_dpp_cqs;
+	u32 max_srq_rpir_qps;
+	u32 max_dpp_pds_credits;
+	u32 max_dpp_credits_pds_per_pd;
+	u32 max_wqes_rqes_per_q;
+	u32 max_cq_cqes_per_cq;
+	u32 max_srq_rqe_sge;
+};
 
-#define WACOM_QUERY_SIZE			19
-#define pen_QUERY				'*'
-#define ACK					0
+struct ocrdma_fw_ver_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
 
-#define MPU_W9018				0x42
+	u8 running_ver[32];
+};
 
-#define FLASH_BLOCK_SIZE			256
-#define DATA_SIZE				(65536 * 2)
-#define BLOCK_NUM				31
-#define W9018_START_ADDR			0x3000
-#define W9018_END_ADDR				0x1efff
+struct ocrdma_fw_conf_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
 
-#define CMD_GET_FEATURE				2
-#define CMD_SET_FEATURE				3
+	u32 config_num;
+	u32 asic_revision;
+	u32 phy_port;
+	u32 fn_mode;
+	struct {
+		u32 mode;
+		u32 nic_wqid_base;
+		u32 nic_wq_tot;
+		u32 prot_wqid_base;
+		u32 prot_wq_tot;
+		u32 prot_rqid_base;
+		u32 prot_rqid_tot;
+		u32 rsvd[6];
+	} ulp[2];
+	u32 fn_capabilities;
+	u32 rsvd1;
+	u32 rsvd2;
+	u32 base_eqid;
+	u32 max_eq;
 
-/* Added for using this prog. in Linux user-space program */
-#define RTYPE_FEATURE				0x03	/* : Report type -> feature(11b) */
-#define GET_FEATURE				0x02
-#define SET_FEATURE				0x03
-#define GFEATURE_SIZE				6
-#define SFEATURE_SIZE				8
+};
 
-#define COMM_REG				0x04
-#define DATA_REG				0x05
-#define REPORT_ID_1				0x07
-#define REPORT_ID_2				0x08
-#define BOOT_QUERY_SIZE				5
+enum {
+	OCRDMA_FN_MODE_RDMA	= 0x4
+};
 
-#define REPORT_ID_ENTER_BOOT			2
-#define BOOT_CMD_SIZE				(0x010c + 0x02)	/* 78 */
-#define BOOT_RSP_SIZE				6
-#define BOOT_CMD_REPORT_ID			7
-#define BOOT_WRITE_FLASH			1
-#define BOOT_EXIT				3
-#define BOOT_BLVER				4
-#define BOOT_MPU				5
-#define BOOT_QUERY				7
+enum {
+	OCRDMA_IF_TYPE_MASK		= 0xFFFF0000,
+	OCRDMA_IF_TYPE_SHIFT		= 0x10,
+	OCRDMA_PHY_TYPE_MASK		= 0x0000FFFF,
+	OCRDMA_FUTURE_DETAILS_MASK	= 0xFFFF0000,
+	OCRDMA_FUTURE_DETAILS_SHIFT	= 0x10,
+	OCRDMA_EX_PHY_DETAILS_MASK	= 0x0000FFFF,
+	OCRDMA_FSPEED_SUPP_MASK		= 0xFFFF0000,
+	OCRDMA_FSPEED_SUPP_SHIFT	= 0x10,
+	OCRDMA_ASPEED_SUPP_MASK		= 0x0000FFFF
+};
 
-#define QUERY_CMD				0x07
-#define BOOT_CMD				0x04
-#define MPU_CMD					0x05
-/* #define ERS_CMD				0x00 */
-#define ERS_ALL_CMD				0x10
-#define WRITE_CMD				0x01
+struct ocrdma_get_phy_info_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
 
-#define ERS_ECH2				0x03
-#define QUERY_RSP				0x06
+	u32 ityp_ptyp;
+	u32 misc_params;
+	u32 ftrdtl_exphydtl;
+	u32 fspeed_aspeed;
+	u32 future_use[2];
+};
 
-#define CMD_SIZE				(72 + 6)
-#define RSP_SIZE				6
+enum {
+	OCRDMA_PHY_SPEED_ZERO = 0x0,
+	OCRDMA_PHY_SPEED_10MBPS = 0x1,
+	OCRDMA_PHY_SPEED_100MBPS = 0x2,
+	OCRDMA_PHY_SPEED_1GBPS = 0x4,
+	OCRDMA_PHY_SPEED_10GBPS = 0x8,
+	OCRDMA_PHY_SPEED_40GBPS = 0x20
+};
 
-#define PROCESS_INPROGRESS			0xff
-#define PROCESS_COMPLETED			0x00
-#define PROCESS_CHKSUM1_ERR			0x81
-#define PROCESS_CHKSUM2_ERR			0x82
-#define PROCESS_TIMEOUT_ERR			0x87
-#define RETRY_COUNT				5
+enum {
+	OCRDMA_PORT_NUM_MASK	= 0x3F,
+	OCRDMA_PT_MASK		= 0xC0,
+	OCRDMA_PT_SHIFT		= 0x6,
+	OCRDMA_LINK_DUP_MASK	= 0x0000FF00,
+	OCRDMA_LINK_DUP_SHIFT	= 0x8,
+	OCRDMA_PHY_PS_MASK	= 0x00FF0000,
+	OCRDMA_PHY_PS_SHIFT	= 0x10,
+	OCRDMA_PHY_PFLT_MASK	= 0xFF000000,
+	OCRDMA_PHY_PFLT_SHIFT	= 0x18,
+	OCRDMA_QOS_LNKSP_MASK	= 0xFFFF0000,
+	OCRDMA_QOS_LNKSP_SHIFT	= 0x10,
+	OCRDMA_LINK_ST_MASK	= 0x01,
+	OCRDMA_PLFC_MASK	= 0x00000400,
+	OCRDMA_PLFC_SHIFT	= 0x8,
+	OCRDMA_PLRFC_MASK	= 0x00000200,
+	OCRDMA_PLRFC_SHIFT	= 0x8,
+	OCRDMA_PLTFC_MASK	= 0x00000100,
+	OCRDMA_PLTFC_SHIFT	= 0x8
+};
 
-/*
- * exit codes
- */
-#define EXIT_OK					(0)
-#define EXIT_REBOOT				(1)
-#define EXIT_FAIL				(2)
-#define EXIT_USAGE				(3)
-#define EXIT_NO_SUCH_FILE			(4)
-#define EXIT_NO_INTEL_HEX			(5)
-#define EXIT_FAIL_OPEN_COM_PORT			(6)
-#define EXIT_FAIL_ENTER_FLASH_MODE		(7)
-#define EXIT_FAIL_FLASH_QUERY			(8)
-#define EXIT_FAIL_BAUDRATE_CHANGE		(9)
-#define EXIT_FAIL_WRITE_FIRMWARE		(10)
-#define EXIT_FAIL_EXIT_FLASH_MODE		(11)
-#define EXIT_CANCEL_UPDATE			(12)
-#define EXIT_SUCCESS_UPDATE			(13)
-#define EXIT_FAIL_HID2SERIAL			(14)
-#define EXIT_FAIL_VERIFY_FIRMWARE		(15)
-#define EXIT_FAIL_MAKE_WRITING_MARK		(16)
-#define EXIT_FAIL_ERASE_WRITING_MARK		(17)
-#define EXIT_FAIL_READ_WRITING_MARK		(18)
-#define EXIT_EXIST_MARKING			(19)
-#define EXIT_FAIL_MISMATCHING			(20)
-#define EXIT_FAIL_ERASE				(21)
-#define EXIT_FAIL_GET_BOOT_LOADER_VERSION	(22)
-#define EXIT_FAIL_GET_MPU_TYPE			(23)
-#define EXIT_MISMATCH_BOOTLOADER		(24)
-#define EXIT_MISMATCH_MPUTYPE			(25)
-#define EXIT_FAIL_ERASE_BOOT			(26)
-#define EXIT_FAIL_WRITE_BOOTLOADER		(27)
-#define EXIT_FAIL_SWAP_BOOT			(28)
-#define EXIT_FAIL_WRITE_DATA			(29)
-#define EXIT_FAIL_GET_FIRMWARE_VERSION		(30)
-#define EXIT_FAIL_GET_UNIT_ID			(31)
-#define EXIT_FAIL_SEND_STOP_COMMAND		(32)
-#define EXIT_FAIL_SEND_QUERY_COMMAND		(33)
-#define EXIT_NOT_FILE_FOR_535			(34)
-#define EXIT_NOT_FILE_FOR_514			(35)
-#define EXIT_NOT_FILE_FOR_503			(36)
-#define EXIT_MISMATCH_MPU_TYPE			(37)
-#define EXIT_NOT_FILE_FOR_515			(38)
-#define EXIT_NOT_FILE_FOR_1024			(39)
-#define EXIT_FAIL_VERIFY_WRITING_MARK		(40)
-#define EXIT_DEVICE_NOT_FOUND			(41)
-#define EXIT_FAIL_WRITING_MARK_NOT_SET		(42)
-#define EXIT_FAIL_SET_PDCT			(43)
-#define ERR_SET_PDCT				(44)
-#define ERR_GET_PDCT				(45)
+struct ocrdma_get_link_speed_rsp {
+	struct ocrdma_mqe_hdr hdr;
+	struct ocrdma_mbx_rsp rsp;
 
-#endif /* _WACOM_I2C_FLASH_H_ */
+	u32 pflt_pps_ld_pnum;
+	u32 qos_lsp;
+	u32 res_lnk_st;
+};
+
+enum {
+	OCRDMA_PHYS_LINK_SPEED_ZERO = 0x0,
+	OCRDMA_PHYS_LINK_SPEED_10MBPS = 0x1,
+	OCRDMA_PHYS_LINK_SPEED_100MBPS = 0x2,
+	OCRDMA_PHYS_LINK_SPEED_1GBPS = 0x3,
+	OCRDMA_PHYS_LINK_SPEED_10GBPS = 0x4,
+	OCRDMA_PHYS_LINK_SPEED_20GBPS = 0x5,
+	OCRDMA_PHYS_LINK_SPEED_25GBPS = 0x6,
+	OCRDMA_PHYS_LINK_SPEED_40GBPS = 0x7,
+	OCRDMA_PHYS_LINK_SPEED_100GBPS = 0x8
+};
+
+enum {
+	OCRDMA_CREATE_CQ_VER2			= 2,
+	OCRDMA_CREATE_CQ_VER3			= 3,
+
+	OCRDMA_CREATE_CQ_PAGE_CNT_MASK		= 0xFFFF,
+	OCRDMA_CREATE_CQ_PAGE_SIZE_SHIFT	= 16,
+	OCRDMA_CREATE_CQ_PAGE_SIZE_MASK		= 0xFF,
+
+	OCRDMA_CREATE_CQ_COALESCWM_SHIFT	= 1

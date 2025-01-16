@@ -1,203 +1,103 @@
-/*
- * IDT CPS RapidIO switches support
- *
- * Copyright 2009-2010 Integrated Device Technology, Inc.
- * Alexandre Bounine <alexandre.bounine@idt.com>
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
- */
-
-#include <linux/rio.h>
-#include <linux/rio_drv.h>
-#include <linux/rio_ids.h>
-#include <linux/module.h>
-#include "../rio.h"
-
-#define CPS_DEFAULT_ROUTE	0xde
-#define CPS_NO_ROUTE		0xdf
-
-#define IDTCPS_RIO_DOMAIN 0xf20020
-
-static int
-idtcps_route_add_entry(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table, u16 route_destid, u8 route_port)
-{
-	u32 result;
-
-	if (route_port == RIO_INVALID_ROUTE)
-		route_port = CPS_DEFAULT_ROUTE;
-
-	if (table == RIO_GLOBAL_TABLE) {
-		rio_mport_write_config_32(mport, destid, hopcount,
-				RIO_STD_RTE_CONF_DESTID_SEL_CSR, route_destid);
-
-		rio_mport_read_config_32(mport, destid, hopcount,
-				RIO_STD_RTE_CONF_PORT_SEL_CSR, &result);
-
-		result = (0xffffff00 & result) | (u32)route_port;
-		rio_mport_write_config_32(mport, destid, hopcount,
-				RIO_STD_RTE_CONF_PORT_SEL_CSR, result);
-	}
-
-	return 0;
-}
-
-static int
-idtcps_route_get_entry(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table, u16 route_destid, u8 *route_port)
-{
-	u32 result;
-
-	if (table == RIO_GLOBAL_TABLE) {
-		rio_mport_write_config_32(mport, destid, hopcount,
-				RIO_STD_RTE_CONF_DESTID_SEL_CSR, route_destid);
-
-		rio_mport_read_config_32(mport, destid, hopcount,
-				RIO_STD_RTE_CONF_PORT_SEL_CSR, &result);
-
-		if (CPS_DEFAULT_ROUTE == (u8)result ||
-		    CPS_NO_ROUTE == (u8)result)
-			*route_port = RIO_INVALID_ROUTE;
-		else
-			*route_port = (u8)result;
-	}
-
-	return 0;
-}
-
-static int
-idtcps_route_clr_table(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u16 table)
-{
-	u32 i;
-
-	if (table == RIO_GLOBAL_TABLE) {
-		for (i = 0x80000000; i <= 0x800000ff;) {
-			rio_mport_write_config_32(mport, destid, hopcount,
-				RIO_STD_RTE_CONF_DESTID_SEL_CSR, i);
-			rio_mport_write_config_32(mport, destid, hopcount,
-				RIO_STD_RTE_CONF_PORT_SEL_CSR,
-				(CPS_DEFAULT_ROUTE << 24) |
-				(CPS_DEFAULT_ROUTE << 16) |
-				(CPS_DEFAULT_ROUTE << 8) | CPS_DEFAULT_ROUTE);
-			i += 4;
-		}
-	}
-
-	return 0;
-}
-
-static int
-idtcps_set_domain(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u8 sw_domain)
-{
-	/*
-	 * Switch domain configuration operates only at global level
-	 */
-	rio_mport_write_config_32(mport, destid, hopcount,
-				  IDTCPS_RIO_DOMAIN, (u32)sw_domain);
-	return 0;
-}
-
-static int
-idtcps_get_domain(struct rio_mport *mport, u16 destid, u8 hopcount,
-		       u8 *sw_domain)
-{
-	u32 regval;
-
-	/*
-	 * Switch domain configuration operates only at global level
-	 */
-	rio_mport_read_config_32(mport, destid, hopcount,
-				IDTCPS_RIO_DOMAIN, &regval);
-
-	*sw_domain = (u8)(regval & 0xff);
-
-	return 0;
-}
-
-static struct rio_switch_ops idtcps_switch_ops = {
-	.owner = THIS_MODULE,
-	.add_entry = idtcps_route_add_entry,
-	.get_entry = idtcps_route_get_entry,
-	.clr_table = idtcps_route_clr_table,
-	.set_domain = idtcps_set_domain,
-	.get_domain = idtcps_get_domain,
-	.em_init = NULL,
-	.em_handle = NULL,
-};
-
-static int idtcps_probe(struct rio_dev *rdev, const struct rio_device_id *id)
-{
-	pr_debug("RIO: %s for %s\n", __func__, rio_name(rdev));
-
-	spin_lock(&rdev->rswitch->lock);
-
-	if (rdev->rswitch->ops) {
-		spin_unlock(&rdev->rswitch->lock);
-		return -EINVAL;
-	}
-
-	rdev->rswitch->ops = &idtcps_switch_ops;
-
-	if (rdev->do_enum) {
-		/* set TVAL = ~50us */
-		rio_write_config_32(rdev,
-			rdev->phys_efptr + RIO_PORT_LINKTO_CTL_CSR, 0x8e << 8);
-		/* Ensure that default routing is disabled on startup */
-		rio_write_config_32(rdev,
-				    RIO_STD_RTE_DEFAULT_PORT, CPS_NO_ROUTE);
-	}
-
-	spin_unlock(&rdev->rswitch->lock);
-	return 0;
-}
-
-static void idtcps_remove(struct rio_dev *rdev)
-{
-	pr_debug("RIO: %s for %s\n", __func__, rio_name(rdev));
-	spin_lock(&rdev->rswitch->lock);
-	if (rdev->rswitch->ops != &idtcps_switch_ops) {
-		spin_unlock(&rdev->rswitch->lock);
-		return;
-	}
-	rdev->rswitch->ops = NULL;
-	spin_unlock(&rdev->rswitch->lock);
-}
-
-static struct rio_device_id idtcps_id_table[] = {
-	{RIO_DEVICE(RIO_DID_IDTCPS6Q, RIO_VID_IDT)},
-	{RIO_DEVICE(RIO_DID_IDTCPS8, RIO_VID_IDT)},
-	{RIO_DEVICE(RIO_DID_IDTCPS10Q, RIO_VID_IDT)},
-	{RIO_DEVICE(RIO_DID_IDTCPS12, RIO_VID_IDT)},
-	{RIO_DEVICE(RIO_DID_IDTCPS16, RIO_VID_IDT)},
-	{RIO_DEVICE(RIO_DID_IDT70K200, RIO_VID_IDT)},
-	{ 0, }	/* terminate list */
-};
-
-static struct rio_driver idtcps_driver = {
-	.name = "idtcps",
-	.id_table = idtcps_id_table,
-	.probe = idtcps_probe,
-	.remove = idtcps_remove,
-};
-
-static int __init idtcps_init(void)
-{
-	return rio_register_driver(&idtcps_driver);
-}
-
-static void __exit idtcps_exit(void)
-{
-	rio_unregister_driver(&idtcps_driver);
-}
-
-device_initcall(idtcps_init);
-module_exit(idtcps_exit);
-
-MODULE_DESCRIPTION("IDT CPS Gen.1 Serial RapidIO switch family driver");
-MODULE_AUTHOR("Integrated Device Technology, Inc.");
-MODULE_LICENSE("GPL");
+fine CLIENT3_OFFSET__RESERVED_MASK 0xffffffff
+#define CLIENT3_OFFSET__RESERVED__SHIFT 0x0
+#define CLIENT3_STATUS__RESERVED_MASK 0xffffffff
+#define CLIENT3_STATUS__RESERVED__SHIFT 0x0
+#define CLIENT4_OFFSET_HI__RESERVED_MASK 0xffffffff
+#define CLIENT4_OFFSET_HI__RESERVED__SHIFT 0x0
+#define CLIENT4_K0__RESERVED_MASK 0xffffffff
+#define CLIENT4_K0__RESERVED__SHIFT 0x0
+#define CLIENT4_K1__RESERVED_MASK 0xffffffff
+#define CLIENT4_K1__RESERVED__SHIFT 0x0
+#define CLIENT4_K2__RESERVED_MASK 0xffffffff
+#define CLIENT4_K2__RESERVED__SHIFT 0x0
+#define CLIENT4_K3__RESERVED_MASK 0xffffffff
+#define CLIENT4_K3__RESERVED__SHIFT 0x0
+#define CLIENT4_CK0__RESERVED_MASK 0xffffffff
+#define CLIENT4_CK0__RESERVED__SHIFT 0x0
+#define CLIENT4_CK1__RESERVED_MASK 0xffffffff
+#define CLIENT4_CK1__RESERVED__SHIFT 0x0
+#define CLIENT4_CK2__RESERVED_MASK 0xffffffff
+#define CLIENT4_CK2__RESERVED__SHIFT 0x0
+#define CLIENT4_CK3__RESERVED_MASK 0xffffffff
+#define CLIENT4_CK3__RESERVED__SHIFT 0x0
+#define CLIENT4_CD0__RESERVED_MASK 0xffffffff
+#define CLIENT4_CD0__RESERVED__SHIFT 0x0
+#define CLIENT4_CD1__RESERVED_MASK 0xffffffff
+#define CLIENT4_CD1__RESERVED__SHIFT 0x0
+#define CLIENT4_CD2__RESERVED_MASK 0xffffffff
+#define CLIENT4_CD2__RESERVED__SHIFT 0x0
+#define CLIENT4_CD3__RESERVED_MASK 0xffffffff
+#define CLIENT4_CD3__RESERVED__SHIFT 0x0
+#define CLIENT4_BM__RESERVED_MASK 0xffffffff
+#define CLIENT4_BM__RESERVED__SHIFT 0x0
+#define CLIENT4_OFFSET__RESERVED_MASK 0xffffffff
+#define CLIENT4_OFFSET__RESERVED__SHIFT 0x0
+#define CLIENT4_STATUS__RESERVED_MASK 0xffffffff
+#define CLIENT4_STATUS__RESERVED__SHIFT 0x0
+#define DC_TEST_DEBUG_INDEX__DC_TEST_DEBUG_INDEX_MASK 0xff
+#define DC_TEST_DEBUG_INDEX__DC_TEST_DEBUG_INDEX__SHIFT 0x0
+#define DC_TEST_DEBUG_INDEX__DC_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define DC_TEST_DEBUG_INDEX__DC_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define DC_TEST_DEBUG_DATA__DC_TEST_DEBUG_DATA_MASK 0xffffffff
+#define DC_TEST_DEBUG_DATA__DC_TEST_DEBUG_DATA__SHIFT 0x0
+#define SDMA0_UCODE_ADDR__VALUE_MASK 0x1fff
+#define SDMA0_UCODE_ADDR__VALUE__SHIFT 0x0
+#define SDMA0_UCODE_DATA__VALUE_MASK 0xffffffff
+#define SDMA0_UCODE_DATA__VALUE__SHIFT 0x0
+#define SDMA0_POWER_CNTL__MEM_POWER_OVERRIDE_MASK 0x100
+#define SDMA0_POWER_CNTL__MEM_POWER_OVERRIDE__SHIFT 0x8
+#define SDMA0_POWER_CNTL__MEM_POWER_LS_EN_MASK 0x200
+#define SDMA0_POWER_CNTL__MEM_POWER_LS_EN__SHIFT 0x9
+#define SDMA0_POWER_CNTL__MEM_POWER_DS_EN_MASK 0x400
+#define SDMA0_POWER_CNTL__MEM_POWER_DS_EN__SHIFT 0xa
+#define SDMA0_POWER_CNTL__MEM_POWER_SD_EN_MASK 0x800
+#define SDMA0_POWER_CNTL__MEM_POWER_SD_EN__SHIFT 0xb
+#define SDMA0_POWER_CNTL__MEM_POWER_DELAY_MASK 0x3ff000
+#define SDMA0_POWER_CNTL__MEM_POWER_DELAY__SHIFT 0xc
+#define SDMA0_CLK_CTRL__ON_DELAY_MASK 0xf
+#define SDMA0_CLK_CTRL__ON_DELAY__SHIFT 0x0
+#define SDMA0_CLK_CTRL__OFF_HYSTERESIS_MASK 0xff0
+#define SDMA0_CLK_CTRL__OFF_HYSTERESIS__SHIFT 0x4
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE7_MASK 0x1000000
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE7__SHIFT 0x18
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE6_MASK 0x2000000
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE6__SHIFT 0x19
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE5_MASK 0x4000000
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE5__SHIFT 0x1a
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE4_MASK 0x8000000
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE4__SHIFT 0x1b
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE3_MASK 0x10000000
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE3__SHIFT 0x1c
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE2_MASK 0x20000000
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE2__SHIFT 0x1d
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE1_MASK 0x40000000
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE1__SHIFT 0x1e
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE0_MASK 0x80000000
+#define SDMA0_CLK_CTRL__SOFT_OVERRIDE0__SHIFT 0x1f
+#define SDMA0_CNTL__TRAP_ENABLE_MASK 0x1
+#define SDMA0_CNTL__TRAP_ENABLE__SHIFT 0x0
+#define SDMA0_CNTL__ATC_L1_ENABLE_MASK 0x2
+#define SDMA0_CNTL__ATC_L1_ENABLE__SHIFT 0x1
+#define SDMA0_CNTL__SEM_WAIT_INT_ENABLE_MASK 0x4
+#define SDMA0_CNTL__SEM_WAIT_INT_ENABLE__SHIFT 0x2
+#define SDMA0_CNTL__DATA_SWAP_ENABLE_MASK 0x8
+#define SDMA0_CNTL__DATA_SWAP_ENABLE__SHIFT 0x3
+#define SDMA0_CNTL__FENCE_SWAP_ENABLE_MASK 0x10
+#define SDMA0_CNTL__FENCE_SWAP_ENABLE__SHIFT 0x4
+#define SDMA0_CNTL__MIDCMD_PREEMPT_ENABLE_MASK 0x20
+#define SDMA0_CNTL__MIDCMD_PREEMPT_ENABLE__SHIFT 0x5
+#define SDMA0_CNTL__MC_WRREQ_CREDIT_MASK 0x1f800
+#define SDMA0_CNTL__MC_WRREQ_CREDIT__SHIFT 0xb
+#define SDMA0_CNTL__MIDCMD_WORLDSWITCH_ENABLE_MASK 0x20000
+#define SDMA0_CNTL__MIDCMD_WORLDSWITCH_ENABLE__SHIFT 0x11
+#define SDMA0_CNTL__AUTO_CTXSW_ENABLE_MASK 0x40000
+#define SDMA0_CNTL__AUTO_CTXSW_ENABLE__SHIFT 0x12
+#define SDMA0_CNTL__MC_RDREQ_CREDIT_MASK 0xfc00000
+#define SDMA0_CNTL__MC_RDREQ_CREDIT__SHIFT 0x16
+#define SDMA0_CNTL__CTXEMPTY_INT_ENABLE_MASK 0x10000000
+#define SDMA0_CNTL__CTXEMPTY_INT_ENABLE__SHIFT 0x1c
+#define SDMA0_CNTL__FROZEN_INT_ENABLE_MASK 0x20000000
+#define SDMA0_CNTL__FROZEN_INT_ENABLE__SHIFT 0x1d
+#define SDMA0_CNTL__IB_PREEMPT_INT_ENABLE_MASK 0x40000000
+#define SDMA0_CNTL__IB_PREEMPT_INT_ENABLE__SHIFT 0x1e
+#define SDMA0_CHICKEN_BITS__COPY_EFFICIENCY_ENABLE_MASK 0x

@@ -1,759 +1,244 @@
-/*
- * Copyright (c) 2014 Chelsio, Inc. All rights reserved.
- * Copyright (c) 2014 Intel Corporation. All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *	  copyright notice, this list of conditions and the following
- *	  disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *	  copyright notice, this list of conditions and the following
- *	  disclaimer in the documentation and/or other materials
- *	  provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-#include "iwpm_util.h"
-
-#define IWPM_MAPINFO_HASH_SIZE	512
-#define IWPM_MAPINFO_HASH_MASK	(IWPM_MAPINFO_HASH_SIZE - 1)
-#define IWPM_REMINFO_HASH_SIZE	64
-#define IWPM_REMINFO_HASH_MASK	(IWPM_REMINFO_HASH_SIZE - 1)
-
-static LIST_HEAD(iwpm_nlmsg_req_list);
-static DEFINE_SPINLOCK(iwpm_nlmsg_req_lock);
-
-static struct hlist_head *iwpm_hash_bucket;
-static DEFINE_SPINLOCK(iwpm_mapinfo_lock);
-
-static struct hlist_head *iwpm_reminfo_bucket;
-static DEFINE_SPINLOCK(iwpm_reminfo_lock);
-
-static DEFINE_MUTEX(iwpm_admin_lock);
-static struct iwpm_admin_data iwpm_admin;
-
-int iwpm_init(u8 nl_client)
-{
-	int ret = 0;
-	if (iwpm_valid_client(nl_client))
-		return -EINVAL;
-	mutex_lock(&iwpm_admin_lock);
-	if (atomic_read(&iwpm_admin.refcount) == 0) {
-		iwpm_hash_bucket = kzalloc(IWPM_MAPINFO_HASH_SIZE *
-					sizeof(struct hlist_head), GFP_KERNEL);
-		if (!iwpm_hash_bucket) {
-			ret = -ENOMEM;
-			pr_err("%s Unable to create mapinfo hash table\n", __func__);
-			goto init_exit;
-		}
-		iwpm_reminfo_bucket = kzalloc(IWPM_REMINFO_HASH_SIZE *
-					sizeof(struct hlist_head), GFP_KERNEL);
-		if (!iwpm_reminfo_bucket) {
-			kfree(iwpm_hash_bucket);
-			ret = -ENOMEM;
-			pr_err("%s Unable to create reminfo hash table\n", __func__);
-			goto init_exit;
-		}
-	}
-	atomic_inc(&iwpm_admin.refcount);
-init_exit:
-	mutex_unlock(&iwpm_admin_lock);
-	if (!ret) {
-		iwpm_set_valid(nl_client, 1);
-		iwpm_set_registration(nl_client, IWPM_REG_UNDEF);
-		pr_debug("%s: Mapinfo and reminfo tables are created\n",
-				__func__);
-	}
-	return ret;
-}
-EXPORT_SYMBOL(iwpm_init);
-
-static void free_hash_bucket(void);
-static void free_reminfo_bucket(void);
-
-int iwpm_exit(u8 nl_client)
-{
-
-	if (!iwpm_valid_client(nl_client))
-		return -EINVAL;
-	mutex_lock(&iwpm_admin_lock);
-	if (atomic_read(&iwpm_admin.refcount) == 0) {
-		mutex_unlock(&iwpm_admin_lock);
-		pr_err("%s Incorrect usage - negative refcount\n", __func__);
-		return -EINVAL;
-	}
-	if (atomic_dec_and_test(&iwpm_admin.refcount)) {
-		free_hash_bucket();
-		free_reminfo_bucket();
-		pr_debug("%s: Resources are destroyed\n", __func__);
-	}
-	mutex_unlock(&iwpm_admin_lock);
-	iwpm_set_valid(nl_client, 0);
-	iwpm_set_registration(nl_client, IWPM_REG_UNDEF);
-	return 0;
-}
-EXPORT_SYMBOL(iwpm_exit);
-
-static struct hlist_head *get_mapinfo_hash_bucket(struct sockaddr_storage *,
-					       struct sockaddr_storage *);
-
-int iwpm_create_mapinfo(struct sockaddr_storage *local_sockaddr,
-			struct sockaddr_storage *mapped_sockaddr,
-			u8 nl_client)
-{
-	struct hlist_head *hash_bucket_head;
-	struct iwpm_mapping_info *map_info;
-	unsigned long flags;
-	int ret = -EINVAL;
-
-	if (!iwpm_valid_client(nl_client))
-		return ret;
-	map_info = kzalloc(sizeof(struct iwpm_mapping_info), GFP_KERNEL);
-	if (!map_info) {
-		pr_err("%s: Unable to allocate a mapping info\n", __func__);
-		return -ENOMEM;
-	}
-	memcpy(&map_info->local_sockaddr, local_sockaddr,
-	       sizeof(struct sockaddr_storage));
-	memcpy(&map_info->mapped_sockaddr, mapped_sockaddr,
-	       sizeof(struct sockaddr_storage));
-	map_info->nl_client = nl_client;
-
-	spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
-	if (iwpm_hash_bucket) {
-		hash_bucket_head = get_mapinfo_hash_bucket(
-					&map_info->local_sockaddr,
-					&map_info->mapped_sockaddr);
-		if (hash_bucket_head) {
-			hlist_add_head(&map_info->hlist_node, hash_bucket_head);
-			ret = 0;
-		}
-	}
-	spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
-	return ret;
-}
-EXPORT_SYMBOL(iwpm_create_mapinfo);
-
-int iwpm_remove_mapinfo(struct sockaddr_storage *local_sockaddr,
-			struct sockaddr_storage *mapped_local_addr)
-{
-	struct hlist_node *tmp_hlist_node;
-	struct hlist_head *hash_bucket_head;
-	struct iwpm_mapping_info *map_info = NULL;
-	unsigned long flags;
-	int ret = -EINVAL;
-
-	spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
-	if (iwpm_hash_bucket) {
-		hash_bucket_head = get_mapinfo_hash_bucket(
-					local_sockaddr,
-					mapped_local_addr);
-		if (!hash_bucket_head)
-			goto remove_mapinfo_exit;
-
-		hlist_for_each_entry_safe(map_info, tmp_hlist_node,
-					hash_bucket_head, hlist_node) {
-
-			if (!iwpm_compare_sockaddr(&map_info->mapped_sockaddr,
-						mapped_local_addr)) {
-
-				hlist_del_init(&map_info->hlist_node);
-				kfree(map_info);
-				ret = 0;
-				break;
-			}
-		}
-	}
-remove_mapinfo_exit:
-	spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
-	return ret;
-}
-EXPORT_SYMBOL(iwpm_remove_mapinfo);
-
-static void free_hash_bucket(void)
-{
-	struct hlist_node *tmp_hlist_node;
-	struct iwpm_mapping_info *map_info;
-	unsigned long flags;
-	int i;
-
-	/* remove all the mapinfo data from the list */
-	spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
-	for (i = 0; i < IWPM_MAPINFO_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(map_info, tmp_hlist_node,
-			&iwpm_hash_bucket[i], hlist_node) {
-
-				hlist_del_init(&map_info->hlist_node);
-				kfree(map_info);
-			}
-	}
-	/* free the hash list */
-	kfree(iwpm_hash_bucket);
-	iwpm_hash_bucket = NULL;
-	spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
-}
-
-static void free_reminfo_bucket(void)
-{
-	struct hlist_node *tmp_hlist_node;
-	struct iwpm_remote_info *rem_info;
-	unsigned long flags;
-	int i;
-
-	/* remove all the remote info from the list */
-	spin_lock_irqsave(&iwpm_reminfo_lock, flags);
-	for (i = 0; i < IWPM_REMINFO_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(rem_info, tmp_hlist_node,
-			&iwpm_reminfo_bucket[i], hlist_node) {
-
-				hlist_del_init(&rem_info->hlist_node);
-				kfree(rem_info);
-			}
-	}
-	/* free the hash list */
-	kfree(iwpm_reminfo_bucket);
-	iwpm_reminfo_bucket = NULL;
-	spin_unlock_irqrestore(&iwpm_reminfo_lock, flags);
-}
-
-static struct hlist_head *get_reminfo_hash_bucket(struct sockaddr_storage *,
-						struct sockaddr_storage *);
-
-void iwpm_add_remote_info(struct iwpm_remote_info *rem_info)
-{
-	struct hlist_head *hash_bucket_head;
-	unsigned long flags;
-
-	spin_lock_irqsave(&iwpm_reminfo_lock, flags);
-	if (iwpm_reminfo_bucket) {
-		hash_bucket_head = get_reminfo_hash_bucket(
-					&rem_info->mapped_loc_sockaddr,
-					&rem_info->mapped_rem_sockaddr);
-		if (hash_bucket_head)
-			hlist_add_head(&rem_info->hlist_node, hash_bucket_head);
-	}
-	spin_unlock_irqrestore(&iwpm_reminfo_lock, flags);
-}
-
-int iwpm_get_remote_info(struct sockaddr_storage *mapped_loc_addr,
-				struct sockaddr_storage *mapped_rem_addr,
-				struct sockaddr_storage *remote_addr,
-				u8 nl_client)
-{
-	struct hlist_node *tmp_hlist_node;
-	struct hlist_head *hash_bucket_head;
-	struct iwpm_remote_info *rem_info = NULL;
-	unsigned long flags;
-	int ret = -EINVAL;
-
-	if (!iwpm_valid_client(nl_client)) {
-		pr_info("%s: Invalid client = %d\n", __func__, nl_client);
-		return ret;
-	}
-	spin_lock_irqsave(&iwpm_reminfo_lock, flags);
-	if (iwpm_reminfo_bucket) {
-		hash_bucket_head = get_reminfo_hash_bucket(
-					mapped_loc_addr,
-					mapped_rem_addr);
-		if (!hash_bucket_head)
-			goto get_remote_info_exit;
-		hlist_for_each_entry_safe(rem_info, tmp_hlist_node,
-					hash_bucket_head, hlist_node) {
-
-			if (!iwpm_compare_sockaddr(&rem_info->mapped_loc_sockaddr,
-				mapped_loc_addr) &&
-				!iwpm_compare_sockaddr(&rem_info->mapped_rem_sockaddr,
-				mapped_rem_addr)) {
-
-				memcpy(remote_addr, &rem_info->remote_sockaddr,
-					sizeof(struct sockaddr_storage));
-				iwpm_print_sockaddr(remote_addr,
-						"get_remote_info: Remote sockaddr:");
-
-				hlist_del_init(&rem_info->hlist_node);
-				kfree(rem_info);
-				ret = 0;
-				break;
-			}
-		}
-	}
-get_remote_info_exit:
-	spin_unlock_irqrestore(&iwpm_reminfo_lock, flags);
-	return ret;
-}
-EXPORT_SYMBOL(iwpm_get_remote_info);
-
-struct iwpm_nlmsg_request *iwpm_get_nlmsg_request(__u32 nlmsg_seq,
-					u8 nl_client, gfp_t gfp)
-{
-	struct iwpm_nlmsg_request *nlmsg_request = NULL;
-	unsigned long flags;
-
-	nlmsg_request = kzalloc(sizeof(struct iwpm_nlmsg_request), gfp);
-	if (!nlmsg_request) {
-		pr_err("%s Unable to allocate a nlmsg_request\n", __func__);
-		return NULL;
-	}
-	spin_lock_irqsave(&iwpm_nlmsg_req_lock, flags);
-	list_add_tail(&nlmsg_request->inprocess_list, &iwpm_nlmsg_req_list);
-	spin_unlock_irqrestore(&iwpm_nlmsg_req_lock, flags);
-
-	kref_init(&nlmsg_request->kref);
-	kref_get(&nlmsg_request->kref);
-	nlmsg_request->nlmsg_seq = nlmsg_seq;
-	nlmsg_request->nl_client = nl_client;
-	nlmsg_request->request_done = 0;
-	nlmsg_request->err_code = 0;
-	return nlmsg_request;
-}
-
-void iwpm_free_nlmsg_request(struct kref *kref)
-{
-	struct iwpm_nlmsg_request *nlmsg_request;
-	unsigned long flags;
-
-	nlmsg_request = container_of(kref, struct iwpm_nlmsg_request, kref);
-
-	spin_lock_irqsave(&iwpm_nlmsg_req_lock, flags);
-	list_del_init(&nlmsg_request->inprocess_list);
-	spin_unlock_irqrestore(&iwpm_nlmsg_req_lock, flags);
-
-	if (!nlmsg_request->request_done)
-		pr_debug("%s Freeing incomplete nlmsg request (seq = %u).\n",
-			__func__, nlmsg_request->nlmsg_seq);
-	kfree(nlmsg_request);
-}
-
-struct iwpm_nlmsg_request *iwpm_find_nlmsg_request(__u32 echo_seq)
-{
-	struct iwpm_nlmsg_request *nlmsg_request;
-	struct iwpm_nlmsg_request *found_request = NULL;
-	unsigned long flags;
-
-	spin_lock_irqsave(&iwpm_nlmsg_req_lock, flags);
-	list_for_each_entry(nlmsg_request, &iwpm_nlmsg_req_list,
-			    inprocess_list) {
-		if (nlmsg_request->nlmsg_seq == echo_seq) {
-			found_request = nlmsg_request;
-			kref_get(&nlmsg_request->kref);
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&iwpm_nlmsg_req_lock, flags);
-	return found_request;
-}
-
-int iwpm_wait_complete_req(struct iwpm_nlmsg_request *nlmsg_request)
-{
-	int ret;
-	init_waitqueue_head(&nlmsg_request->waitq);
-
-	ret = wait_event_timeout(nlmsg_request->waitq,
-			(nlmsg_request->request_done != 0), IWPM_NL_TIMEOUT);
-	if (!ret) {
-		ret = -EINVAL;
-		pr_info("%s: Timeout %d sec for netlink request (seq = %u)\n",
-			__func__, (IWPM_NL_TIMEOUT/HZ), nlmsg_request->nlmsg_seq);
-	} else {
-		ret = nlmsg_request->err_code;
-	}
-	kref_put(&nlmsg_request->kref, iwpm_free_nlmsg_request);
-	return ret;
-}
-
-int iwpm_get_nlmsg_seq(void)
-{
-	return atomic_inc_return(&iwpm_admin.nlmsg_seq);
-}
-
-int iwpm_valid_client(u8 nl_client)
-{
-	if (nl_client >= RDMA_NL_NUM_CLIENTS)
-		return 0;
-	return iwpm_admin.client_list[nl_client];
-}
-
-void iwpm_set_valid(u8 nl_client, int valid)
-{
-	if (nl_client >= RDMA_NL_NUM_CLIENTS)
-		return;
-	iwpm_admin.client_list[nl_client] = valid;
-}
-
-/* valid client */
-u32 iwpm_get_registration(u8 nl_client)
-{
-	return iwpm_admin.reg_list[nl_client];
-}
-
-/* valid client */
-void iwpm_set_registration(u8 nl_client, u32 reg)
-{
-	iwpm_admin.reg_list[nl_client] = reg;
-}
-
-/* valid client */
-u32 iwpm_check_registration(u8 nl_client, u32 reg)
-{
-	return (iwpm_get_registration(nl_client) & reg);
-}
-
-int iwpm_compare_sockaddr(struct sockaddr_storage *a_sockaddr,
-				struct sockaddr_storage *b_sockaddr)
-{
-	if (a_sockaddr->ss_family != b_sockaddr->ss_family)
-		return 1;
-	if (a_sockaddr->ss_family == AF_INET) {
-		struct sockaddr_in *a4_sockaddr =
-			(struct sockaddr_in *)a_sockaddr;
-		struct sockaddr_in *b4_sockaddr =
-			(struct sockaddr_in *)b_sockaddr;
-		if (!memcmp(&a4_sockaddr->sin_addr,
-			&b4_sockaddr->sin_addr, sizeof(struct in_addr))
-			&& a4_sockaddr->sin_port == b4_sockaddr->sin_port)
-				return 0;
-
-	} else if (a_sockaddr->ss_family == AF_INET6) {
-		struct sockaddr_in6 *a6_sockaddr =
-			(struct sockaddr_in6 *)a_sockaddr;
-		struct sockaddr_in6 *b6_sockaddr =
-			(struct sockaddr_in6 *)b_sockaddr;
-		if (!memcmp(&a6_sockaddr->sin6_addr,
-			&b6_sockaddr->sin6_addr, sizeof(struct in6_addr))
-			&& a6_sockaddr->sin6_port == b6_sockaddr->sin6_port)
-				return 0;
-
-	} else {
-		pr_err("%s: Invalid sockaddr family\n", __func__);
-	}
-	return 1;
-}
-
-struct sk_buff *iwpm_create_nlmsg(u32 nl_op, struct nlmsghdr **nlh,
-						int nl_client)
-{
-	struct sk_buff *skb = NULL;
-
-	skb = dev_alloc_skb(NLMSG_GOODSIZE);
-	if (!skb) {
-		pr_err("%s Unable to allocate skb\n", __func__);
-		goto create_nlmsg_exit;
-	}
-	if (!(ibnl_put_msg(skb, nlh, 0, 0, nl_client, nl_op,
-			   NLM_F_REQUEST))) {
-		pr_warn("%s: Unable to put the nlmsg header\n", __func__);
-		dev_kfree_skb(skb);
-		skb = NULL;
-	}
-create_nlmsg_exit:
-	return skb;
-}
-
-int iwpm_parse_nlmsg(struct netlink_callback *cb, int policy_max,
-				   const struct nla_policy *nlmsg_policy,
-				   struct nlattr *nltb[], const char *msg_type)
-{
-	int nlh_len = 0;
-	int ret;
-	const char *err_str = "";
-
-	ret = nlmsg_validate(cb->nlh, nlh_len, policy_max-1, nlmsg_policy);
-	if (ret) {
-		err_str = "Invalid attribute";
-		goto parse_nlmsg_error;
-	}
-	ret = nlmsg_parse(cb->nlh, nlh_len, nltb, policy_max-1, nlmsg_policy);
-	if (ret) {
-		err_str = "Unable to parse the nlmsg";
-		goto parse_nlmsg_error;
-	}
-	ret = iwpm_validate_nlmsg_attr(nltb, policy_max);
-	if (ret) {
-		err_str = "Invalid NULL attribute";
-		goto parse_nlmsg_error;
-	}
-	return 0;
-parse_nlmsg_error:
-	pr_warn("%s: %s (msg type %s ret = %d)\n",
-			__func__, err_str, msg_type, ret);
-	return ret;
-}
-
-void iwpm_print_sockaddr(struct sockaddr_storage *sockaddr, char *msg)
-{
-	struct sockaddr_in6 *sockaddr_v6;
-	struct sockaddr_in *sockaddr_v4;
-
-	switch (sockaddr->ss_family) {
-	case AF_INET:
-		sockaddr_v4 = (struct sockaddr_in *)sockaddr;
-		pr_debug("%s IPV4 %pI4: %u(0x%04X)\n",
-			msg, &sockaddr_v4->sin_addr,
-			ntohs(sockaddr_v4->sin_port),
-			ntohs(sockaddr_v4->sin_port));
-		break;
-	case AF_INET6:
-		sockaddr_v6 = (struct sockaddr_in6 *)sockaddr;
-		pr_debug("%s IPV6 %pI6: %u(0x%04X)\n",
-			msg, &sockaddr_v6->sin6_addr,
-			ntohs(sockaddr_v6->sin6_port),
-			ntohs(sockaddr_v6->sin6_port));
-		break;
-	default:
-		break;
-	}
-}
-
-static u32 iwpm_ipv6_jhash(struct sockaddr_in6 *ipv6_sockaddr)
-{
-	u32 ipv6_hash = jhash(&ipv6_sockaddr->sin6_addr, sizeof(struct in6_addr), 0);
-	u32 hash = jhash_2words(ipv6_hash, (__force u32) ipv6_sockaddr->sin6_port, 0);
-	return hash;
-}
-
-static u32 iwpm_ipv4_jhash(struct sockaddr_in *ipv4_sockaddr)
-{
-	u32 ipv4_hash = jhash(&ipv4_sockaddr->sin_addr, sizeof(struct in_addr), 0);
-	u32 hash = jhash_2words(ipv4_hash, (__force u32) ipv4_sockaddr->sin_port, 0);
-	return hash;
-}
-
-static int get_hash_bucket(struct sockaddr_storage *a_sockaddr,
-				struct sockaddr_storage *b_sockaddr, u32 *hash)
-{
-	u32 a_hash, b_hash;
-
-	if (a_sockaddr->ss_family == AF_INET) {
-		a_hash = iwpm_ipv4_jhash((struct sockaddr_in *) a_sockaddr);
-		b_hash = iwpm_ipv4_jhash((struct sockaddr_in *) b_sockaddr);
-
-	} else if (a_sockaddr->ss_family == AF_INET6) {
-		a_hash = iwpm_ipv6_jhash((struct sockaddr_in6 *) a_sockaddr);
-		b_hash = iwpm_ipv6_jhash((struct sockaddr_in6 *) b_sockaddr);
-	} else {
-		pr_err("%s: Invalid sockaddr family\n", __func__);
-		return -EINVAL;
-	}
-
-	if (a_hash == b_hash) /* if port mapper isn't available */
-		*hash = a_hash;
-	else
-		*hash = jhash_2words(a_hash, b_hash, 0);
-	return 0;
-}
-
-static struct hlist_head *get_mapinfo_hash_bucket(struct sockaddr_storage
-				*local_sockaddr, struct sockaddr_storage
-				*mapped_sockaddr)
-{
-	u32 hash;
-	int ret;
-
-	ret = get_hash_bucket(local_sockaddr, mapped_sockaddr, &hash);
-	if (ret)
-		return NULL;
-	return &iwpm_hash_bucket[hash & IWPM_MAPINFO_HASH_MASK];
-}
-
-static struct hlist_head *get_reminfo_hash_bucket(struct sockaddr_storage
-				*mapped_loc_sockaddr, struct sockaddr_storage
-				*mapped_rem_sockaddr)
-{
-	u32 hash;
-	int ret;
-
-	ret = get_hash_bucket(mapped_loc_sockaddr, mapped_rem_sockaddr, &hash);
-	if (ret)
-		return NULL;
-	return &iwpm_reminfo_bucket[hash & IWPM_REMINFO_HASH_MASK];
-}
-
-static int send_mapinfo_num(u32 mapping_num, u8 nl_client, int iwpm_pid)
-{
-	struct sk_buff *skb = NULL;
-	struct nlmsghdr *nlh;
-	u32 msg_seq;
-	const char *err_str = "";
-	int ret = -EINVAL;
-
-	skb = iwpm_create_nlmsg(RDMA_NL_IWPM_MAPINFO_NUM, &nlh, nl_client);
-	if (!skb) {
-		err_str = "Unable to create a nlmsg";
-		goto mapinfo_num_error;
-	}
-	nlh->nlmsg_seq = iwpm_get_nlmsg_seq();
-	msg_seq = 0;
-	err_str = "Unable to put attribute of mapinfo number nlmsg";
-	ret = ibnl_put_attr(skb, nlh, sizeof(u32), &msg_seq, IWPM_NLA_MAPINFO_SEQ);
-	if (ret)
-		goto mapinfo_num_error;
-	ret = ibnl_put_attr(skb, nlh, sizeof(u32),
-				&mapping_num, IWPM_NLA_MAPINFO_SEND_NUM);
-	if (ret)
-		goto mapinfo_num_error;
-	ret = ibnl_unicast(skb, nlh, iwpm_pid);
-	if (ret) {
-		skb = NULL;
-		err_str = "Unable to send a nlmsg";
-		goto mapinfo_num_error;
-	}
-	pr_debug("%s: Sent mapping number = %d\n", __func__, mapping_num);
-	return 0;
-mapinfo_num_error:
-	pr_info("%s: %s\n", __func__, err_str);
-	if (skb)
-		dev_kfree_skb(skb);
-	return ret;
-}
-
-static int send_nlmsg_done(struct sk_buff *skb, u8 nl_client, int iwpm_pid)
-{
-	struct nlmsghdr *nlh = NULL;
-	int ret = 0;
-
-	if (!skb)
-		return ret;
-	if (!(ibnl_put_msg(skb, &nlh, 0, 0, nl_client,
-			   RDMA_NL_IWPM_MAPINFO, NLM_F_MULTI))) {
-		pr_warn("%s Unable to put NLMSG_DONE\n", __func__);
-		dev_kfree_skb(skb);
-		return -ENOMEM;
-	}
-	nlh->nlmsg_type = NLMSG_DONE;
-	ret = ibnl_unicast(skb, (struct nlmsghdr *)skb->data, iwpm_pid);
-	if (ret)
-		pr_warn("%s Unable to send a nlmsg\n", __func__);
-	return ret;
-}
-
-int iwpm_send_mapinfo(u8 nl_client, int iwpm_pid)
-{
-	struct iwpm_mapping_info *map_info;
-	struct sk_buff *skb = NULL;
-	struct nlmsghdr *nlh;
-	int skb_num = 0, mapping_num = 0;
-	int i = 0, nlmsg_bytes = 0;
-	unsigned long flags;
-	const char *err_str = "";
-	int ret;
-
-	skb = dev_alloc_skb(NLMSG_GOODSIZE);
-	if (!skb) {
-		ret = -ENOMEM;
-		err_str = "Unable to allocate skb";
-		goto send_mapping_info_exit;
-	}
-	skb_num++;
-	spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
-	ret = -EINVAL;
-	for (i = 0; i < IWPM_MAPINFO_HASH_SIZE; i++) {
-		hlist_for_each_entry(map_info, &iwpm_hash_bucket[i],
-				     hlist_node) {
-			if (map_info->nl_client != nl_client)
-				continue;
-			nlh = NULL;
-			if (!(ibnl_put_msg(skb, &nlh, 0, 0, nl_client,
-					RDMA_NL_IWPM_MAPINFO, NLM_F_MULTI))) {
-				ret = -ENOMEM;
-				err_str = "Unable to put the nlmsg header";
-				goto send_mapping_info_unlock;
-			}
-			err_str = "Unable to put attribute of the nlmsg";
-			ret = ibnl_put_attr(skb, nlh,
-					sizeof(struct sockaddr_storage),
-					&map_info->local_sockaddr,
-					IWPM_NLA_MAPINFO_LOCAL_ADDR);
-			if (ret)
-				goto send_mapping_info_unlock;
-
-			ret = ibnl_put_attr(skb, nlh,
-					sizeof(struct sockaddr_storage),
-					&map_info->mapped_sockaddr,
-					IWPM_NLA_MAPINFO_MAPPED_ADDR);
-			if (ret)
-				goto send_mapping_info_unlock;
-
-			iwpm_print_sockaddr(&map_info->local_sockaddr,
-				"send_mapping_info: Local sockaddr:");
-			iwpm_print_sockaddr(&map_info->mapped_sockaddr,
-				"send_mapping_info: Mapped local sockaddr:");
-			mapping_num++;
-			nlmsg_bytes += nlh->nlmsg_len;
-
-			/* check if all mappings can fit in one skb */
-			if (NLMSG_GOODSIZE - nlmsg_bytes < nlh->nlmsg_len * 2) {
-				/* and leave room for NLMSG_DONE */
-				nlmsg_bytes = 0;
-				skb_num++;
-				spin_unlock_irqrestore(&iwpm_mapinfo_lock,
-						       flags);
-				/* send the skb */
-				ret = send_nlmsg_done(skb, nl_client, iwpm_pid);
-				skb = NULL;
-				if (ret) {
-					err_str = "Unable to send map info";
-					goto send_mapping_info_exit;
-				}
-				if (skb_num == IWPM_MAPINFO_SKB_COUNT) {
-					ret = -ENOMEM;
-					err_str = "Insufficient skbs for map info";
-					goto send_mapping_info_exit;
-				}
-				skb = dev_alloc_skb(NLMSG_GOODSIZE);
-				if (!skb) {
-					ret = -ENOMEM;
-					err_str = "Unable to allocate skb";
-					goto send_mapping_info_exit;
-				}
-				spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
-			}
-		}
-	}
-send_mapping_info_unlock:
-	spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
-send_mapping_info_exit:
-	if (ret) {
-		pr_warn("%s: %s (ret = %d)\n", __func__, err_str, ret);
-		if (skb)
-			dev_kfree_skb(skb);
-		return ret;
-	}
-	send_nlmsg_done(skb, nl_client, iwpm_pid);
-	return send_mapinfo_num(mapping_num, nl_client, iwpm_pid);
-}
-
-int iwpm_mapinfo_available(void)
-{
-	unsigned long flags;
-	int full_bucket = 0, i = 0;
-
-	spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
-	if (iwpm_hash_bucket) {
-		for (i = 0; i < IWPM_MAPINFO_HASH_SIZE; i++) {
-			if (!hlist_empty(&iwpm_hash_bucket[i])) {
-				full_bucket = 1;
-				break;
-			}
-		}
-	}
-	spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
-	return full_bucket;
-}
+                             0x1ed7
+#define mmLB3_LB_BUFFER_LEVEL_STATUS                                            0x40d7
+#define mmLB4_LB_BUFFER_LEVEL_STATUS                                            0x42d7
+#define mmLB5_LB_BUFFER_LEVEL_STATUS                                            0x44d7
+#define mmLB_BUFFER_URGENCY_CTRL                                                0x1ad8
+#define mmLB0_LB_BUFFER_URGENCY_CTRL                                            0x1ad8
+#define mmLB1_LB_BUFFER_URGENCY_CTRL                                            0x1cd8
+#define mmLB2_LB_BUFFER_URGENCY_CTRL                                            0x1ed8
+#define mmLB3_LB_BUFFER_URGENCY_CTRL                                            0x40d8
+#define mmLB4_LB_BUFFER_URGENCY_CTRL                                            0x42d8
+#define mmLB5_LB_BUFFER_URGENCY_CTRL                                            0x44d8
+#define mmLB_BUFFER_URGENCY_STATUS                                              0x1ad9
+#define mmLB0_LB_BUFFER_URGENCY_STATUS                                          0x1ad9
+#define mmLB1_LB_BUFFER_URGENCY_STATUS                                          0x1cd9
+#define mmLB2_LB_BUFFER_URGENCY_STATUS                                          0x1ed9
+#define mmLB3_LB_BUFFER_URGENCY_STATUS                                          0x40d9
+#define mmLB4_LB_BUFFER_URGENCY_STATUS                                          0x42d9
+#define mmLB5_LB_BUFFER_URGENCY_STATUS                                          0x44d9
+#define mmLB_BUFFER_STATUS                                                      0x1ada
+#define mmLB0_LB_BUFFER_STATUS                                                  0x1ada
+#define mmLB1_LB_BUFFER_STATUS                                                  0x1cda
+#define mmLB2_LB_BUFFER_STATUS                                                  0x1eda
+#define mmLB3_LB_BUFFER_STATUS                                                  0x40da
+#define mmLB4_LB_BUFFER_STATUS                                                  0x42da
+#define mmLB5_LB_BUFFER_STATUS                                                  0x44da
+#define mmLB_NO_OUTSTANDING_REQ_STATUS                                          0x1adc
+#define mmLB0_LB_NO_OUTSTANDING_REQ_STATUS                                      0x1adc
+#define mmLB1_LB_NO_OUTSTANDING_REQ_STATUS                                      0x1cdc
+#define mmLB2_LB_NO_OUTSTANDING_REQ_STATUS                                      0x1edc
+#define mmLB3_LB_NO_OUTSTANDING_REQ_STATUS                                      0x40dc
+#define mmLB4_LB_NO_OUTSTANDING_REQ_STATUS                                      0x42dc
+#define mmLB5_LB_NO_OUTSTANDING_REQ_STATUS                                      0x44dc
+#define mmMVP_AFR_FLIP_MODE                                                     0x1ae0
+#define mmLB0_MVP_AFR_FLIP_MODE                                                 0x1ae0
+#define mmLB1_MVP_AFR_FLIP_MODE                                                 0x1ce0
+#define mmLB2_MVP_AFR_FLIP_MODE                                                 0x1ee0
+#define mmLB3_MVP_AFR_FLIP_MODE                                                 0x40e0
+#define mmLB4_MVP_AFR_FLIP_MODE                                                 0x42e0
+#define mmLB5_MVP_AFR_FLIP_MODE                                                 0x44e0
+#define mmMVP_AFR_FLIP_FIFO_CNTL                                                0x1ae1
+#define mmLB0_MVP_AFR_FLIP_FIFO_CNTL                                            0x1ae1
+#define mmLB1_MVP_AFR_FLIP_FIFO_CNTL                                            0x1ce1
+#define mmLB2_MVP_AFR_FLIP_FIFO_CNTL                                            0x1ee1
+#define mmLB3_MVP_AFR_FLIP_FIFO_CNTL                                            0x40e1
+#define mmLB4_MVP_AFR_FLIP_FIFO_CNTL                                            0x42e1
+#define mmLB5_MVP_AFR_FLIP_FIFO_CNTL                                            0x44e1
+#define mmMVP_FLIP_LINE_NUM_INSERT                                              0x1ae2
+#define mmLB0_MVP_FLIP_LINE_NUM_INSERT                                          0x1ae2
+#define mmLB1_MVP_FLIP_LINE_NUM_INSERT                                          0x1ce2
+#define mmLB2_MVP_FLIP_LINE_NUM_INSERT                                          0x1ee2
+#define mmLB3_MVP_FLIP_LINE_NUM_INSERT                                          0x40e2
+#define mmLB4_MVP_FLIP_LINE_NUM_INSERT                                          0x42e2
+#define mmLB5_MVP_FLIP_LINE_NUM_INSERT                                          0x44e2
+#define mmDC_MVP_LB_CONTROL                                                     0x1ae3
+#define mmLB0_DC_MVP_LB_CONTROL                                                 0x1ae3
+#define mmLB1_DC_MVP_LB_CONTROL                                                 0x1ce3
+#define mmLB2_DC_MVP_LB_CONTROL                                                 0x1ee3
+#define mmLB3_DC_MVP_LB_CONTROL                                                 0x40e3
+#define mmLB4_DC_MVP_LB_CONTROL                                                 0x42e3
+#define mmLB5_DC_MVP_LB_CONTROL                                                 0x44e3
+#define mmLB_DEBUG                                                              0x1ae4
+#define mmLB0_LB_DEBUG                                                          0x1ae4
+#define mmLB1_LB_DEBUG                                                          0x1ce4
+#define mmLB2_LB_DEBUG                                                          0x1ee4
+#define mmLB3_LB_DEBUG                                                          0x40e4
+#define mmLB4_LB_DEBUG                                                          0x42e4
+#define mmLB5_LB_DEBUG                                                          0x44e4
+#define mmLB_DEBUG2                                                             0x1ae5
+#define mmLB0_LB_DEBUG2                                                         0x1ae5
+#define mmLB1_LB_DEBUG2                                                         0x1ce5
+#define mmLB2_LB_DEBUG2                                                         0x1ee5
+#define mmLB3_LB_DEBUG2                                                         0x40e5
+#define mmLB4_LB_DEBUG2                                                         0x42e5
+#define mmLB5_LB_DEBUG2                                                         0x44e5
+#define mmLB_DEBUG3                                                             0x1ae6
+#define mmLB0_LB_DEBUG3                                                         0x1ae6
+#define mmLB1_LB_DEBUG3                                                         0x1ce6
+#define mmLB2_LB_DEBUG3                                                         0x1ee6
+#define mmLB3_LB_DEBUG3                                                         0x40e6
+#define mmLB4_LB_DEBUG3                                                         0x42e6
+#define mmLB5_LB_DEBUG3                                                         0x44e6
+#define mmLB_TEST_DEBUG_INDEX                                                   0x1afe
+#define mmLB0_LB_TEST_DEBUG_INDEX                                               0x1afe
+#define mmLB1_LB_TEST_DEBUG_INDEX                                               0x1cfe
+#define mmLB2_LB_TEST_DEBUG_INDEX                                               0x1efe
+#define mmLB3_LB_TEST_DEBUG_INDEX                                               0x40fe
+#define mmLB4_LB_TEST_DEBUG_INDEX                                               0x42fe
+#define mmLB5_LB_TEST_DEBUG_INDEX                                               0x44fe
+#define mmLB_TEST_DEBUG_DATA                                                    0x1aff
+#define mmLB0_LB_TEST_DEBUG_DATA                                                0x1aff
+#define mmLB1_LB_TEST_DEBUG_DATA                                                0x1cff
+#define mmLB2_LB_TEST_DEBUG_DATA                                                0x1eff
+#define mmLB3_LB_TEST_DEBUG_DATA                                                0x40ff
+#define mmLB4_LB_TEST_DEBUG_DATA                                                0x42ff
+#define mmLB5_LB_TEST_DEBUG_DATA                                                0x44ff
+#define mmLBV_DATA_FORMAT                                                       0x463c
+#define mmLBV_MEMORY_CTRL                                                       0x463d
+#define mmLBV_MEMORY_SIZE_STATUS                                                0x463e
+#define mmLBV_DESKTOP_HEIGHT                                                    0x463f
+#define mmLBV_VLINE_START_END                                                   0x4640
+#define mmLBV_VLINE2_START_END                                                  0x4641
+#define mmLBV_V_COUNTER                                                         0x4642
+#define mmLBV_SNAPSHOT_V_COUNTER                                                0x4643
+#define mmLBV_V_COUNTER_CHROMA                                                  0x4644
+#define mmLBV_SNAPSHOT_V_COUNTER_CHROMA                                         0x4645
+#define mmLBV_INTERRUPT_MASK                                                    0x4646
+#define mmLBV_VLINE_STATUS                                                      0x4647
+#define mmLBV_VLINE2_STATUS                                                     0x4648
+#define mmLBV_VBLANK_STATUS                                                     0x4649
+#define mmLBV_SYNC_RESET_SEL                                                    0x464a
+#define mmLBV_BLACK_KEYER_R_CR                                                  0x464b
+#define mmLBV_BLACK_KEYER_G_Y                                                   0x464c
+#define mmLBV_BLACK_KEYER_B_CB                                                  0x464d
+#define mmLBV_KEYER_COLOR_CTRL                                                  0x464e
+#define mmLBV_KEYER_COLOR_R_CR                                                  0x464f
+#define mmLBV_KEYER_COLOR_G_Y                                                   0x4650
+#define mmLBV_KEYER_COLOR_B_CB                                                  0x4651
+#define mmLBV_KEYER_COLOR_REP_R_CR                                              0x4652
+#define mmLBV_KEYER_COLOR_REP_G_Y                                               0x4653
+#define mmLBV_KEYER_COLOR_REP_B_CB                                              0x4654
+#define mmLBV_BUFFER_LEVEL_STATUS                                               0x4655
+#define mmLBV_BUFFER_URGENCY_CTRL                                               0x4656
+#define mmLBV_BUFFER_URGENCY_STATUS                                             0x4657
+#define mmLBV_BUFFER_STATUS                                                     0x4658
+#define mmLBV_NO_OUTSTANDING_REQ_STATUS                                         0x4659
+#define mmLBV_DEBUG                                                             0x465a
+#define mmLBV_DEBUG2                                                            0x465b
+#define mmLBV_DEBUG3                                                            0x465c
+#define mmLBV_TEST_DEBUG_INDEX                                                  0x4666
+#define mmLBV_TEST_DEBUG_DATA                                                   0x4667
+#define mmMVP_CONTROL1                                                          0x2ac
+#define mmMVP_CONTROL2                                                          0x2ad
+#define mmMVP_FIFO_CONTROL                                                      0x2ae
+#define mmMVP_FIFO_STATUS                                                       0x2af
+#define mmMVP_SLAVE_STATUS                                                      0x2b0
+#define mmMVP_INBAND_CNTL_CAP                                                   0x2b1
+#define mmMVP_BLACK_KEYER                                                       0x2b2
+#define mmMVP_CRC_CNTL                                                          0x2b3
+#define mmMVP_CRC_RESULT_BLUE_GREEN                                             0x2b4
+#define mmMVP_CRC_RESULT_RED                                                    0x2b5
+#define mmMVP_CONTROL3                                                          0x2b6
+#define mmMVP_RECEIVE_CNT_CNTL1                                                 0x2b7
+#define mmMVP_RECEIVE_CNT_CNTL2                                                 0x2b8
+#define mmMVP_DEBUG                                                             0x2bb
+#define mmMVP_TEST_DEBUG_INDEX                                                  0x2b9
+#define mmMVP_TEST_DEBUG_DATA                                                   0x2ba
+#define ixMVP_DEBUG_12                                                          0xc
+#define ixMVP_DEBUG_13                                                          0xd
+#define ixMVP_DEBUG_14                                                          0xe
+#define ixMVP_DEBUG_15                                                          0xf
+#define ixMVP_DEBUG_16                                                          0x10
+#define ixMVP_DEBUG_17                                                          0x11
+#define mmSCL_COEF_RAM_SELECT                                                   0x1b40
+#define mmSCL0_SCL_COEF_RAM_SELECT                                              0x1b40
+#define mmSCL1_SCL_COEF_RAM_SELECT                                              0x1d40
+#define mmSCL2_SCL_COEF_RAM_SELECT                                              0x1f40
+#define mmSCL3_SCL_COEF_RAM_SELECT                                              0x4140
+#define mmSCL4_SCL_COEF_RAM_SELECT                                              0x4340
+#define mmSCL5_SCL_COEF_RAM_SELECT                                              0x4540
+#define mmSCL_COEF_RAM_TAP_DATA                                                 0x1b41
+#define mmSCL0_SCL_COEF_RAM_TAP_DATA                                            0x1b41
+#define mmSCL1_SCL_COEF_RAM_TAP_DATA                                            0x1d41
+#define mmSCL2_SCL_COEF_RAM_TAP_DATA                                            0x1f41
+#define mmSCL3_SCL_COEF_RAM_TAP_DATA                                            0x4141
+#define mmSCL4_SCL_COEF_RAM_TAP_DATA                                            0x4341
+#define mmSCL5_SCL_COEF_RAM_TAP_DATA                                            0x4541
+#define mmSCL_MODE                                                              0x1b42
+#define mmSCL0_SCL_MODE                                                         0x1b42
+#define mmSCL1_SCL_MODE                                                         0x1d42
+#define mmSCL2_SCL_MODE                                                         0x1f42
+#define mmSCL3_SCL_MODE                                                         0x4142
+#define mmSCL4_SCL_MODE                                                         0x4342
+#define mmSCL5_SCL_MODE                                                         0x4542
+#define mmSCL_TAP_CONTROL                                                       0x1b43
+#define mmSCL0_SCL_TAP_CONTROL                                                  0x1b43
+#define mmSCL1_SCL_TAP_CONTROL                                                  0x1d43
+#define mmSCL2_SCL_TAP_CONTROL                                                  0x1f43
+#define mmSCL3_SCL_TAP_CONTROL                                                  0x4143
+#define mmSCL4_SCL_TAP_CONTROL                                                  0x4343
+#define mmSCL5_SCL_TAP_CONTROL                                                  0x4543
+#define mmSCL_CONTROL                                                           0x1b44
+#define mmSCL0_SCL_CONTROL                                                      0x1b44
+#define mmSCL1_SCL_CONTROL                                                      0x1d44
+#define mmSCL2_SCL_CONTROL                                                      0x1f44
+#define mmSCL3_SCL_CONTROL                                                      0x4144
+#define mmSCL4_SCL_CONTROL                                                      0x4344
+#define mmSCL5_SCL_CONTROL                                                      0x4544
+#define mmSCL_BYPASS_CONTROL                                                    0x1b45
+#define mmSCL0_SCL_BYPASS_CONTROL                                               0x1b45
+#define mmSCL1_SCL_BYPASS_CONTROL                                               0x1d45
+#define mmSCL2_SCL_BYPASS_CONTROL                                               0x1f45
+#define mmSCL3_SCL_BYPASS_CONTROL                                               0x4145
+#define mmSCL4_SCL_BYPASS_CONTROL                                               0x4345
+#define mmSCL5_SCL_BYPASS_CONTROL                                               0x4545
+#define mmSCL_MANUAL_REPLICATE_CONTROL                                          0x1b46
+#define mmSCL0_SCL_MANUAL_REPLICATE_CONTROL                                     0x1b46
+#define mmSCL1_SCL_MANUAL_REPLICATE_CONTROL                                     0x1d46
+#define mmSCL2_SCL_MANUAL_REPLICATE_CONTROL                                     0x1f46
+#define mmSCL3_SCL_MANUAL_REPLICATE_CONTROL                                     0x4146
+#define mmSCL4_SCL_MANUAL_REPLICATE_CONTROL                                     0x4346
+#define mmSCL5_SCL_MANUAL_REPLICATE_CONTROL                                     0x4546
+#define mmSCL_AUTOMATIC_MODE_CONTROL                                            0x1b47
+#define mmSCL0_SCL_AUTOMATIC_MODE_CONTROL                                       0x1b47
+#define mmSCL1_SCL_AUTOMATIC_MODE_CONTROL                                       0x1d47
+#define mmSCL2_SCL_AUTOMATIC_MODE_CONTROL                                       0x1f47
+#define mmSCL3_SCL_AUTOMATIC_MODE_CONTROL                                       0x4147
+#define mmSCL4_SCL_AUTOMATIC_MODE_CONTROL                                       0x4347
+#define mmSCL5_SCL_AUTOMATIC_MODE_CONTROL                                       0x4547
+#define mmSCL_HORZ_FILTER_CONTROL                                               0x1b48
+#define mmSCL0_SCL_HORZ_FILTER_CONTROL                                          0x1b48
+#define mmSCL1_SCL_HORZ_FILTER_CONTROL                                          0x1d48
+#define mmSCL2_SCL_HORZ_FILTER_CONTROL                                          0x1f48
+#define mmSCL3_SCL_HORZ_FILTER_CONTROL                                          0x4148
+#define mmSCL4_SCL_HORZ_FILTER_CONTROL                                          0x4348
+#define mmSCL5_SCL_HORZ_FILTER_CONTROL                                          0x4548
+#define mmSCL_HORZ_FILTER_SCALE_RATIO                                           0x1b49
+#define mmSCL0_SCL_HORZ_FILTER_SCALE_RATIO                                      0x1b49
+#define mmSCL1_SCL_HORZ_FILTER_SCALE_RATIO                                      0x1d49
+#define mmSCL2_SCL_HORZ_FILTER_SCALE_RATIO                                      0x1f49
+#define mmSCL3_SCL_HORZ_FILTER_SCALE_RATIO                                      0x4149
+#define mmSCL4_SCL_HORZ_FILTER_SCALE_RATIO                                      0x4349
+#define mmSCL5_SCL_HORZ_FILTER_SCALE_RATIO                                      0x4549
+#define mmSCL_HORZ_FILTER_INIT                                                  0x1b4a
+#define mmSCL0_SCL_HORZ_FILTER_INIT                                             0x1b4a
+#define mmSCL1_SCL_HORZ_FILTER_INIT                                             0x1d4a
+#define mmSCL2_SCL_HORZ_FILTER_INIT                                             0x1f4a
+#define mmSCL3_SCL_HORZ_FILTER_INIT                                             0x414a
+#define mmSCL4_SCL_HORZ_FILTER_INIT                                             0x434a
+#define mmSCL5_SCL_HORZ_FILTER_INIT                                             0x454a
+#define mmSCL_VERT_FILTER_CONTROL                                               0x1b4b
+#define mmSCL0_SCL_VERT_FILTER_CONTROL                                          0x1b4b
+#define mmSCL1_SCL_VERT_FILTER_CONTROL                                          0x1d4b
+#define mmSCL2_SCL_VERT_FILTER_CONTROL                                          0x1f4b
+#define mmSCL3_SCL_VERT_FILTER_CONTROL                                          0x414b
+#define mmSCL4_SCL_VERT_FILTER_CONTROL                                          0x434b
+#define mmSCL5_SCL_VERT_FILTER_CONTROL                                          0x454b
+#define mmSCL_VERT_FILTER_SCALE_RATIO                                           0x1b4c
+#define mmSCL0_SCL_VERT_FILTER_SCALE_RATIO                                      0x1b4c
+#define mmSCL1_SCL_VERT_FILTER_SCALE_RATIO                                      0x1d4c
+#define mmSCL2_SCL_VERT_FILTER_SCALE_RATIO                                      0x1f4c
+#define mmSCL3_SCL_VERT_FILTER_SCALE_RATIO                                      0x414c
+#define mmSCL4_SCL_VERT_FILTER_SCALE_RATIO                                      0x434c
+#define mmSCL5_SCL_VERT_FILTER_SCALE_RATIO                                      0x454c
+#define mmSCL_VERT_FILTER_INIT                      

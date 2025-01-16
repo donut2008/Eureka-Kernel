@@ -1,9 +1,5 @@
-obj-$(CONFIG_INFINIBAND_MTHCA)		+= mthca/
-obj-$(CONFIG_INFINIBAND_QIB)		+= qib/
-obj-$(CONFIG_INFINIBAND_CXGB3)		+= cxgb3/
-obj-$(CONFIG_INFINIBAND_CXGB4)		+= cxgb4/
-obj-$(CONFIG_MLX4_INFINIBAND)		+= mlx4/
-obj-$(CONFIG_MLX5_INFINIBAND)		+= mlx5/
-obj-$(CONFIG_INFINIBAND_NES)		+= nes/
-obj-$(CONFIG_INFINIBAND_OCRDMA)		+= ocrdma/
-obj-$(CONFIG_INFINIBAND_USNIC)		+= usnic/
+                                                 0x447c
+#define mmDC_LUT_VGA_ACCESS_ENABLE                                              0x1a7d
+#define mmDCP0_DC_LUT_VGA_ACCESS_ENABLE                                         0x1a7d
+#define mmDCP1_DC_LUT_VGA_ACCESS_ENABLE                                         0x1c7d
+#define mmDCP2_DC_LUT_VGA_ACCESS_ENABLE            

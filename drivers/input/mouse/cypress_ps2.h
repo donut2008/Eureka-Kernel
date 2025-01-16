@@ -1,186 +1,124 @@
-#ifndef _CYPRESS_PS2_H
-#define _CYPRESS_PS2_H
-
-#include "psmouse.h"
-
-#define CMD_BITS_MASK 0x03
-#define COMPOSIT(x, s) (((x) & CMD_BITS_MASK) << (s))
-
-#define ENCODE_CMD(aa, bb, cc, dd) \
-	(COMPOSIT((aa), 6) | COMPOSIT((bb), 4) | COMPOSIT((cc), 2) | COMPOSIT((dd), 0))
-#define CYTP_CMD_ABS_NO_PRESSURE_MODE       ENCODE_CMD(0, 1, 0, 0)
-#define CYTP_CMD_ABS_WITH_PRESSURE_MODE     ENCODE_CMD(0, 1, 0, 1)
-#define CYTP_CMD_SMBUS_MODE                 ENCODE_CMD(0, 1, 1, 0)
-#define CYTP_CMD_STANDARD_MODE              ENCODE_CMD(0, 2, 0, 0)  /* not implemented yet. */
-#define CYTP_CMD_CYPRESS_REL_MODE           ENCODE_CMD(1, 1, 1, 1)  /* not implemented yet. */
-#define CYTP_CMD_READ_CYPRESS_ID            ENCODE_CMD(0, 0, 0, 0)
-#define CYTP_CMD_READ_TP_METRICS            ENCODE_CMD(0, 0, 0, 1)
-#define CYTP_CMD_SET_HSCROLL_WIDTH(w)       ENCODE_CMD(1, 1, 0, (w))
-#define     CYTP_CMD_SET_HSCROLL_MASK       ENCODE_CMD(1, 1, 0, 0)
-#define CYTP_CMD_SET_VSCROLL_WIDTH(w)       ENCODE_CMD(1, 2, 0, (w))
-#define     CYTP_CMD_SET_VSCROLL_MASK       ENCODE_CMD(1, 2, 0, 0)
-#define CYTP_CMD_SET_PALM_GEOMETRY(e)       ENCODE_CMD(1, 2, 1, (e))
-#define     CYTP_CMD_PALM_GEMMETRY_MASK     ENCODE_CMD(1, 2, 1, 0)
-#define CYTP_CMD_SET_PALM_SENSITIVITY(s)    ENCODE_CMD(1, 2, 2, (s))
-#define     CYTP_CMD_PALM_SENSITIVITY_MASK  ENCODE_CMD(1, 2, 2, 0)
-#define CYTP_CMD_SET_MOUSE_SENSITIVITY(s)   ENCODE_CMD(1, 3, ((s) >> 2), (s))
-#define     CYTP_CMD_MOUSE_SENSITIVITY_MASK ENCODE_CMD(1, 3, 0, 0)
-#define CYTP_CMD_REQUEST_BASELINE_STATUS    ENCODE_CMD(2, 0, 0, 1)
-#define CYTP_CMD_REQUEST_RECALIBRATION      ENCODE_CMD(2, 0, 0, 3)
-
-#define DECODE_CMD_AA(x) (((x) >> 6) & CMD_BITS_MASK)
-#define DECODE_CMD_BB(x) (((x) >> 4) & CMD_BITS_MASK)
-#define DECODE_CMD_CC(x) (((x) >> 2) & CMD_BITS_MASK)
-#define DECODE_CMD_DD(x) ((x) & CMD_BITS_MASK)
-
-/* Cypress trackpad working mode. */
-#define CYTP_BIT_ABS_PRESSURE    (1 << 3)
-#define CYTP_BIT_ABS_NO_PRESSURE (1 << 2)
-#define CYTP_BIT_CYPRESS_REL     (1 << 1)
-#define CYTP_BIT_STANDARD_REL    (1 << 0)
-#define CYTP_BIT_REL_MASK (CYTP_BIT_CYPRESS_REL | CYTP_BIT_STANDARD_REL)
-#define CYTP_BIT_ABS_MASK (CYTP_BIT_ABS_PRESSURE | CYTP_BIT_ABS_NO_PRESSURE)
-#define CYTP_BIT_ABS_REL_MASK (CYTP_BIT_ABS_MASK | CYTP_BIT_REL_MASK)
-
-#define CYTP_BIT_HIGH_RATE       (1 << 4)
-/*
- * report mode bit is set, firmware working in Remote Mode.
- * report mode bit is cleared, firmware working in Stream Mode.
- */
-#define CYTP_BIT_REPORT_MODE     (1 << 5)
-
-/* scrolling width values for set HSCROLL and VSCROLL width command. */
-#define SCROLL_WIDTH_NARROW 1
-#define SCROLL_WIDTH_NORMAL 2
-#define SCROLL_WIDTH_WIDE   3
-
-#define PALM_GEOMETRY_ENABLE  1
-#define PALM_GEOMETRY_DISABLE 0
-
-#define TP_METRICS_MASK  0x80
-#define FW_VERSION_MASX    0x7f
-#define FW_VER_HIGH_MASK 0x70
-#define FW_VER_LOW_MASK  0x0f
-
-/* Times to retry a ps2_command and millisecond delay between tries. */
-#define CYTP_PS2_CMD_TRIES 3
-#define CYTP_PS2_CMD_DELAY 500
-
-/* time out for PS/2 command only in milliseconds. */
-#define CYTP_CMD_TIMEOUT  200
-#define CYTP_DATA_TIMEOUT 30
-
-#define CYTP_EXT_CMD   0xe8
-#define CYTP_PS2_RETRY 0xfe
-#define CYTP_PS2_ERROR 0xfc
-
-#define CYTP_RESP_RETRY 0x01
-#define CYTP_RESP_ERROR 0xfe
-
-
-#define CYTP_105001_WIDTH  97   /* Dell XPS 13 */
-#define CYTP_105001_HIGH   59
-#define CYTP_DEFAULT_WIDTH (CYTP_105001_WIDTH)
-#define CYTP_DEFAULT_HIGH  (CYTP_105001_HIGH)
-
-#define CYTP_ABS_MAX_X     1600
-#define CYTP_ABS_MAX_Y     900
-#define CYTP_MAX_PRESSURE  255
-#define CYTP_MIN_PRESSURE  0
-
-/* header byte bits of relative package. */
-#define BTN_LEFT_BIT   0x01
-#define BTN_RIGHT_BIT  0x02
-#define BTN_MIDDLE_BIT 0x04
-#define REL_X_SIGN_BIT 0x10
-#define REL_Y_SIGN_BIT 0x20
-
-/* header byte bits of absolute package. */
-#define ABS_VSCROLL_BIT 0x10
-#define ABS_HSCROLL_BIT 0x20
-#define ABS_MULTIFINGER_TAP 0x04
-#define ABS_EDGE_MOTION_MASK 0x80
-
-#define DFLT_RESP_BITS_VALID     0x88  /* SMBus bit should not be set. */
-#define DFLT_RESP_SMBUS_BIT      0x80
-#define   DFLT_SMBUS_MODE        0x80
-#define   DFLT_PS2_MODE          0x00
-#define DFLT_RESP_BIT_MODE       0x40
-#define   DFLT_RESP_REMOTE_MODE  0x40
-#define   DFLT_RESP_STREAM_MODE  0x00
-#define DFLT_RESP_BIT_REPORTING  0x20
-#define DFLT_RESP_BIT_SCALING    0x10
-
-#define TP_METRICS_BIT_PALM               0x80
-#define TP_METRICS_BIT_STUBBORN           0x40
-#define TP_METRICS_BIT_2F_JITTER          0x30
-#define TP_METRICS_BIT_1F_JITTER          0x0c
-#define TP_METRICS_BIT_APA                0x02
-#define TP_METRICS_BIT_MTG                0x01
-#define TP_METRICS_BIT_ABS_PKT_FORMAT_SET 0xf0
-#define TP_METRICS_BIT_2F_SPIKE           0x0c
-#define TP_METRICS_BIT_1F_SPIKE           0x03
-
-/* bits of first byte response of E9h-Status Request command. */
-#define RESP_BTN_RIGHT_BIT  0x01
-#define RESP_BTN_MIDDLE_BIT 0x02
-#define RESP_BTN_LEFT_BIT   0x04
-#define RESP_SCALING_BIT    0x10
-#define RESP_ENABLE_BIT     0x20
-#define RESP_REMOTE_BIT     0x40
-#define RESP_SMBUS_BIT      0x80
-
-#define CYTP_MAX_MT_SLOTS 2
-
-struct cytp_contact {
-	int x;
-	int y;
-	int z;  /* also named as touch pressure. */
-};
-
-/* The structure of Cypress Trackpad event data. */
-struct cytp_report_data {
-	int contact_cnt;
-	struct cytp_contact contacts[CYTP_MAX_MT_SLOTS];
-	unsigned int left:1;
-	unsigned int right:1;
-	unsigned int middle:1;
-	unsigned int tap:1;  /* multi-finger tap detected. */
-};
-
-/* The structure of Cypress Trackpad device private data. */
-struct cytp_data {
-	int fw_version;
-
-	int pkt_size;
-	int mode;
-
-	int tp_min_pressure;
-	int tp_max_pressure;
-	int tp_width;  /* X direction physical size in mm. */
-	int tp_high;  /* Y direction physical size in mm. */
-	int tp_max_abs_x;  /* Max X absolute units that can be reported. */
-	int tp_max_abs_y;  /* Max Y absolute units that can be reported. */
-
-	int tp_res_x;  /* X resolution in units/mm. */
-	int tp_res_y;  /* Y resolution in units/mm. */
-
-	int tp_metrics_supported;
-};
-
-
-#ifdef CONFIG_MOUSE_PS2_CYPRESS
-int cypress_detect(struct psmouse *psmouse, bool set_properties);
-int cypress_init(struct psmouse *psmouse);
-#else
-inline int cypress_detect(struct psmouse *psmouse, bool set_properties)
-{
-	return -ENOSYS;
-}
-inline int cypress_init(struct psmouse *psmouse)
-{
-	return -ENOSYS;
-}
-#endif /* CONFIG_MOUSE_PS2_CYPRESS */
-
-#endif  /* _CYPRESS_PS2_H */
+CY_29_MASK 0xc000000
+#define TC_CFG_L2_STORE_POLICY1__POLICY_29__SHIFT 0x1a
+#define TC_CFG_L2_STORE_POLICY1__POLICY_30_MASK 0x30000000
+#define TC_CFG_L2_STORE_POLICY1__POLICY_30__SHIFT 0x1c
+#define TC_CFG_L2_STORE_POLICY1__POLICY_31_MASK 0xc0000000
+#define TC_CFG_L2_STORE_POLICY1__POLICY_31__SHIFT 0x1e
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_0_MASK 0x3
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_0__SHIFT 0x0
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_1_MASK 0xc
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_1__SHIFT 0x2
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_2_MASK 0x30
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_2__SHIFT 0x4
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_3_MASK 0xc0
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_3__SHIFT 0x6
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_4_MASK 0x300
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_4__SHIFT 0x8
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_5_MASK 0xc00
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_5__SHIFT 0xa
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_6_MASK 0x3000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_6__SHIFT 0xc
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_7_MASK 0xc000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_7__SHIFT 0xe
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_8_MASK 0x30000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_8__SHIFT 0x10
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_9_MASK 0xc0000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_9__SHIFT 0x12
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_10_MASK 0x300000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_10__SHIFT 0x14
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_11_MASK 0xc00000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_11__SHIFT 0x16
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_12_MASK 0x3000000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_12__SHIFT 0x18
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_13_MASK 0xc000000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_13__SHIFT 0x1a
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_14_MASK 0x30000000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_14__SHIFT 0x1c
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_15_MASK 0xc0000000
+#define TC_CFG_L2_ATOMIC_POLICY__POLICY_15__SHIFT 0x1e
+#define TC_CFG_L1_VOLATILE__VOL_MASK 0xf
+#define TC_CFG_L1_VOLATILE__VOL__SHIFT 0x0
+#define TC_CFG_L2_VOLATILE__VOL_MASK 0xf
+#define TC_CFG_L2_VOLATILE__VOL__SHIFT 0x0
+#define TCP_WATCH0_ADDR_H__ADDR_MASK 0xffff
+#define TCP_WATCH0_ADDR_H__ADDR__SHIFT 0x0
+#define TCP_WATCH1_ADDR_H__ADDR_MASK 0xffff
+#define TCP_WATCH1_ADDR_H__ADDR__SHIFT 0x0
+#define TCP_WATCH2_ADDR_H__ADDR_MASK 0xffff
+#define TCP_WATCH2_ADDR_H__ADDR__SHIFT 0x0
+#define TCP_WATCH3_ADDR_H__ADDR_MASK 0xffff
+#define TCP_WATCH3_ADDR_H__ADDR__SHIFT 0x0
+#define TCP_WATCH0_ADDR_L__ADDR_MASK 0xffffffc0
+#define TCP_WATCH0_ADDR_L__ADDR__SHIFT 0x6
+#define TCP_WATCH1_ADDR_L__ADDR_MASK 0xffffffc0
+#define TCP_WATCH1_ADDR_L__ADDR__SHIFT 0x6
+#define TCP_WATCH2_ADDR_L__ADDR_MASK 0xffffffc0
+#define TCP_WATCH2_ADDR_L__ADDR__SHIFT 0x6
+#define TCP_WATCH3_ADDR_L__ADDR_MASK 0xffffffc0
+#define TCP_WATCH3_ADDR_L__ADDR__SHIFT 0x6
+#define TCP_WATCH0_CNTL__MASK_MASK 0xffffff
+#define TCP_WATCH0_CNTL__MASK__SHIFT 0x0
+#define TCP_WATCH0_CNTL__VMID_MASK 0xf000000
+#define TCP_WATCH0_CNTL__VMID__SHIFT 0x18
+#define TCP_WATCH0_CNTL__ATC_MASK 0x10000000
+#define TCP_WATCH0_CNTL__ATC__SHIFT 0x1c
+#define TCP_WATCH0_CNTL__MODE_MASK 0x60000000
+#define TCP_WATCH0_CNTL__MODE__SHIFT 0x1d
+#define TCP_WATCH0_CNTL__VALID_MASK 0x80000000
+#define TCP_WATCH0_CNTL__VALID__SHIFT 0x1f
+#define TCP_WATCH1_CNTL__MASK_MASK 0xffffff
+#define TCP_WATCH1_CNTL__MASK__SHIFT 0x0
+#define TCP_WATCH1_CNTL__VMID_MASK 0xf000000
+#define TCP_WATCH1_CNTL__VMID__SHIFT 0x18
+#define TCP_WATCH1_CNTL__ATC_MASK 0x10000000
+#define TCP_WATCH1_CNTL__ATC__SHIFT 0x1c
+#define TCP_WATCH1_CNTL__MODE_MASK 0x60000000
+#define TCP_WATCH1_CNTL__MODE__SHIFT 0x1d
+#define TCP_WATCH1_CNTL__VALID_MASK 0x80000000
+#define TCP_WATCH1_CNTL__VALID__SHIFT 0x1f
+#define TCP_WATCH2_CNTL__MASK_MASK 0xffffff
+#define TCP_WATCH2_CNTL__MASK__SHIFT 0x0
+#define TCP_WATCH2_CNTL__VMID_MASK 0xf000000
+#define TCP_WATCH2_CNTL__VMID__SHIFT 0x18
+#define TCP_WATCH2_CNTL__ATC_MASK 0x10000000
+#define TCP_WATCH2_CNTL__ATC__SHIFT 0x1c
+#define TCP_WATCH2_CNTL__MODE_MASK 0x60000000
+#define TCP_WATCH2_CNTL__MODE__SHIFT 0x1d
+#define TCP_WATCH2_CNTL__VALID_MASK 0x80000000
+#define TCP_WATCH2_CNTL__VALID__SHIFT 0x1f
+#define TCP_WATCH3_CNTL__MASK_MASK 0xffffff
+#define TCP_WATCH3_CNTL__MASK__SHIFT 0x0
+#define TCP_WATCH3_CNTL__VMID_MASK 0xf000000
+#define TCP_WATCH3_CNTL__VMID__SHIFT 0x18
+#define TCP_WATCH3_CNTL__ATC_MASK 0x10000000
+#define TCP_WATCH3_CNTL__ATC__SHIFT 0x1c
+#define TCP_WATCH3_CNTL__MODE_MASK 0x60000000
+#define TCP_WATCH3_CNTL__MODE__SHIFT 0x1d
+#define TCP_WATCH3_CNTL__VALID_MASK 0x80000000
+#define TCP_WATCH3_CNTL__VALID__SHIFT 0x1f
+#define TCP_GATCL1_CNTL__INVALIDATE_ALL_VMID_MASK 0x2000000
+#define TCP_GATCL1_CNTL__INVALIDATE_ALL_VMID__SHIFT 0x19
+#define TCP_GATCL1_CNTL__FORCE_MISS_MASK 0x4000000
+#define TCP_GATCL1_CNTL__FORCE_MISS__SHIFT 0x1a
+#define TCP_GATCL1_CNTL__FORCE_IN_ORDER_MASK 0x8000000
+#define TCP_GATCL1_CNTL__FORCE_IN_ORDER__SHIFT 0x1b
+#define TCP_GATCL1_CNTL__REDUCE_FIFO_DEPTH_BY_2_MASK 0x30000000
+#define TCP_GATCL1_CNTL__REDUCE_FIFO_DEPTH_BY_2__SHIFT 0x1c
+#define TCP_GATCL1_CNTL__REDUCE_CACHE_SIZE_BY_2_MASK 0xc0000000
+#define TCP_GATCL1_CNTL__REDUCE_CACHE_SIZE_BY_2__SHIFT 0x1e
+#define TCP_ATC_EDC_GATCL1_CNT__DATA_SEC_MASK 0xff
+#define TCP_ATC_EDC_GATCL1_CNT__DATA_SEC__SHIFT 0x0
+#define TCP_GATCL1_DSM_CNTL__SEL_DSM_TCP_GATCL1_IRRITATOR_DATA_A0_MASK 0x1
+#define TCP_GATCL1_DSM_CNTL__SEL_DSM_TCP_GATCL1_IRRITATOR_DATA_A0__SHIFT 0x0
+#define TCP_GATCL1_DSM_CNTL__SEL_DSM_TCP_GATCL1_IRRITATOR_DATA_A1_MASK 0x2
+#define TCP_GATCL1_DSM_CNTL__SEL_DSM_TCP_GATCL1_IRRITATOR_DATA_A1__SHIFT 0x1
+#define TCP_GATCL1_DSM_CNTL__TCP_GATCL1_ENABLE_SINGLE_WRITE_A_MASK 0x4
+#define TCP_GATCL1_DSM_CNTL__TCP_GATCL1_ENABLE_SINGLE_WRITE_A__SHIFT 0x2
+#define TCP_DSM_CNTL__CACHE_RAM_IRRITATOR_DATA_SEL_MASK 0x3
+#define TCP_DSM_CNTL__CACHE_RAM_IRRITATOR_DATA_SEL__SHIFT 0x0
+#define TCP_DSM_CNTL__CACHE_RAM_IRRITATOR_SINGLE_WRITE_MASK 0x4
+#define TCP_DSM_CNTL__CACHE_RAM_IRRITATOR_SINGLE_WRITE__SHIFT 0x2
+#define TCP_DSM_CNTL__LFIFO_RAM_IRRITATOR_DATA_SEL_MASK 0x18
+#define TCP_DSM_CNTL__LFIFO_RAM_IRRITATOR_DATA_SEL__SHIFT 0x3
+#define TCP_DSM_CNTL__LFIFO_RAM_IRRITATOR_SINGLE_WRITE_MASK 0x20
+#define TCP_DSM_CNTL__LFIFO_RAM_IRRITATOR_SINGLE_W

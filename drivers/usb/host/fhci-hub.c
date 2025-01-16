@@ -1,340 +1,148 @@
-/*
- * Freescale QUICC Engine USB Host Controller Driver
- *
- * Copyright (c) Freescale Semicondutor, Inc. 2006.
- *               Shlomi Gridish <gridish@freescale.com>
- *               Jerry Huang <Chang-Ming.Huang@freescale.com>
- * Copyright (c) Logic Product Development, Inc. 2007
- *               Peter Barada <peterb@logicpd.com>
- * Copyright (c) MontaVista Software, Inc. 2008.
- *               Anton Vorontsov <avorontsov@ru.mvista.com>
- *
- * This program is free software; you can redistribute  it and/or modify it
- * under  the terms of  the GNU General  Public License as published by the
- * Free Software Foundation;  either version 2 of the  License, or (at your
- * option) any later version.
- */
-
-#include <linux/kernel.h>
-#include <linux/types.h>
-#include <linux/spinlock.h>
-#include <linux/delay.h>
-#include <linux/errno.h>
-#include <linux/io.h>
-#include <linux/usb.h>
-#include <linux/usb/hcd.h>
-#include <linux/gpio.h>
-#include <asm/qe.h>
-#include "fhci.h"
-
-/* virtual root hub specific descriptor */
-static u8 root_hub_des[] = {
-	0x09, /* blength */
-	USB_DT_HUB, /* bDescriptorType;hub-descriptor */
-	0x01, /* bNbrPorts */
-	HUB_CHAR_INDV_PORT_LPSM | HUB_CHAR_NO_OCPM, /* wHubCharacteristics */
-	0x00, /* per-port power, no overcurrent */
-	0x01, /* bPwrOn2pwrGood;2ms */
-	0x00, /* bHubContrCurrent;0mA */
-	0x00, /* DeviceRemoveable */
-	0xff, /* PortPwrCtrlMask */
-};
-
-static void fhci_gpio_set_value(struct fhci_hcd *fhci, int gpio_nr, bool on)
-{
-	int gpio = fhci->gpios[gpio_nr];
-	bool alow = fhci->alow_gpios[gpio_nr];
-
-	if (!gpio_is_valid(gpio))
-		return;
-
-	gpio_set_value(gpio, on ^ alow);
-	mdelay(5);
-}
-
-void fhci_config_transceiver(struct fhci_hcd *fhci,
-			     enum fhci_port_status status)
-{
-	fhci_dbg(fhci, "-> %s: %d\n", __func__, status);
-
-	switch (status) {
-	case FHCI_PORT_POWER_OFF:
-		fhci_gpio_set_value(fhci, GPIO_POWER, false);
-		break;
-	case FHCI_PORT_DISABLED:
-	case FHCI_PORT_WAITING:
-		fhci_gpio_set_value(fhci, GPIO_POWER, true);
-		break;
-	case FHCI_PORT_LOW:
-		fhci_gpio_set_value(fhci, GPIO_SPEED, false);
-		break;
-	case FHCI_PORT_FULL:
-		fhci_gpio_set_value(fhci, GPIO_SPEED, true);
-		break;
-	default:
-		WARN_ON(1);
-		break;
-	}
-
-	fhci_dbg(fhci, "<- %s: %d\n", __func__, status);
-}
-
-/* disable the USB port by clearing the EN bit in the USBMOD register */
-void fhci_port_disable(struct fhci_hcd *fhci)
-{
-	struct fhci_usb *usb = (struct fhci_usb *)fhci->usb_lld;
-	enum fhci_port_status port_status;
-
-	fhci_dbg(fhci, "-> %s\n", __func__);
-
-	fhci_stop_sof_timer(fhci);
-
-	fhci_flush_all_transmissions(usb);
-
-	fhci_usb_disable_interrupt((struct fhci_usb *)fhci->usb_lld);
-	port_status = usb->port_status;
-	usb->port_status = FHCI_PORT_DISABLED;
-
-	/* Enable IDLE since we want to know if something comes along */
-	usb->saved_msk |= USB_E_IDLE_MASK;
-	out_be16(&usb->fhci->regs->usb_usbmr, usb->saved_msk);
-
-	/* check if during the disconnection process attached new device */
-	if (port_status == FHCI_PORT_WAITING)
-		fhci_device_connected_interrupt(fhci);
-	usb->vroot_hub->port.wPortStatus &= ~USB_PORT_STAT_ENABLE;
-	usb->vroot_hub->port.wPortChange |= USB_PORT_STAT_C_ENABLE;
-	fhci_usb_enable_interrupt((struct fhci_usb *)fhci->usb_lld);
-
-	fhci_dbg(fhci, "<- %s\n", __func__);
-}
-
-/* enable the USB port by setting the EN bit in the USBMOD register */
-void fhci_port_enable(void *lld)
-{
-	struct fhci_usb *usb = (struct fhci_usb *)lld;
-	struct fhci_hcd *fhci = usb->fhci;
-
-	fhci_dbg(fhci, "-> %s\n", __func__);
-
-	fhci_config_transceiver(fhci, usb->port_status);
-
-	if ((usb->port_status != FHCI_PORT_FULL) &&
-			(usb->port_status != FHCI_PORT_LOW))
-		fhci_start_sof_timer(fhci);
-
-	usb->vroot_hub->port.wPortStatus |= USB_PORT_STAT_ENABLE;
-	usb->vroot_hub->port.wPortChange |= USB_PORT_STAT_C_ENABLE;
-
-	fhci_dbg(fhci, "<- %s\n", __func__);
-}
-
-void fhci_io_port_generate_reset(struct fhci_hcd *fhci)
-{
-	fhci_dbg(fhci, "-> %s\n", __func__);
-
-	gpio_direction_output(fhci->gpios[GPIO_USBOE], 0);
-	gpio_direction_output(fhci->gpios[GPIO_USBTP], 0);
-	gpio_direction_output(fhci->gpios[GPIO_USBTN], 0);
-
-	mdelay(5);
-
-	qe_pin_set_dedicated(fhci->pins[PIN_USBOE]);
-	qe_pin_set_dedicated(fhci->pins[PIN_USBTP]);
-	qe_pin_set_dedicated(fhci->pins[PIN_USBTN]);
-
-	fhci_dbg(fhci, "<- %s\n", __func__);
-}
-
-/* generate the RESET condition on the bus */
-void fhci_port_reset(void *lld)
-{
-	struct fhci_usb *usb = (struct fhci_usb *)lld;
-	struct fhci_hcd *fhci = usb->fhci;
-	u8 mode;
-	u16 mask;
-
-	fhci_dbg(fhci, "-> %s\n", __func__);
-
-	fhci_stop_sof_timer(fhci);
-	/* disable the USB controller */
-	mode = in_8(&fhci->regs->usb_usmod);
-	out_8(&fhci->regs->usb_usmod, mode & (~USB_MODE_EN));
-
-	/* disable idle interrupts */
-	mask = in_be16(&fhci->regs->usb_usbmr);
-	out_be16(&fhci->regs->usb_usbmr, mask & (~USB_E_IDLE_MASK));
-
-	fhci_io_port_generate_reset(fhci);
-
-	/* enable interrupt on this endpoint */
-	out_be16(&fhci->regs->usb_usbmr, mask);
-
-	/* enable the USB controller */
-	mode = in_8(&fhci->regs->usb_usmod);
-	out_8(&fhci->regs->usb_usmod, mode | USB_MODE_EN);
-	fhci_start_sof_timer(fhci);
-
-	fhci_dbg(fhci, "<- %s\n", __func__);
-}
-
-int fhci_hub_status_data(struct usb_hcd *hcd, char *buf)
-{
-	struct fhci_hcd *fhci = hcd_to_fhci(hcd);
-	int ret = 0;
-	unsigned long flags;
-
-	fhci_dbg(fhci, "-> %s\n", __func__);
-
-	spin_lock_irqsave(&fhci->lock, flags);
-
-	if (fhci->vroot_hub->port.wPortChange & (USB_PORT_STAT_C_CONNECTION |
-			USB_PORT_STAT_C_ENABLE | USB_PORT_STAT_C_SUSPEND |
-			USB_PORT_STAT_C_RESET | USB_PORT_STAT_C_OVERCURRENT)) {
-		*buf = 1 << 1;
-		ret = 1;
-		fhci_dbg(fhci, "-- %s\n", __func__);
-	}
-
-	spin_unlock_irqrestore(&fhci->lock, flags);
-
-	fhci_dbg(fhci, "<- %s\n", __func__);
-
-	return ret;
-}
-
-int fhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
-			    u16 wIndex, char *buf, u16 wLength)
-{
-	struct fhci_hcd *fhci = hcd_to_fhci(hcd);
-	int retval = 0;
-	struct usb_hub_status *hub_status;
-	struct usb_port_status *port_status;
-	unsigned long flags;
-
-	spin_lock_irqsave(&fhci->lock, flags);
-
-	fhci_dbg(fhci, "-> %s\n", __func__);
-
-	switch (typeReq) {
-	case ClearHubFeature:
-		switch (wValue) {
-		case C_HUB_LOCAL_POWER:
-		case C_HUB_OVER_CURRENT:
-			break;
-		default:
-			goto error;
-		}
-		break;
-	case ClearPortFeature:
-		fhci->vroot_hub->feature &= (1 << wValue);
-
-		switch (wValue) {
-		case USB_PORT_FEAT_ENABLE:
-			fhci->vroot_hub->port.wPortStatus &=
-			    ~USB_PORT_STAT_ENABLE;
-			fhci_port_disable(fhci);
-			break;
-		case USB_PORT_FEAT_C_ENABLE:
-			fhci->vroot_hub->port.wPortChange &=
-			    ~USB_PORT_STAT_C_ENABLE;
-			break;
-		case USB_PORT_FEAT_SUSPEND:
-			fhci->vroot_hub->port.wPortStatus &=
-			    ~USB_PORT_STAT_SUSPEND;
-			fhci_stop_sof_timer(fhci);
-			break;
-		case USB_PORT_FEAT_C_SUSPEND:
-			fhci->vroot_hub->port.wPortChange &=
-			    ~USB_PORT_STAT_C_SUSPEND;
-			break;
-		case USB_PORT_FEAT_POWER:
-			fhci->vroot_hub->port.wPortStatus &=
-			    ~USB_PORT_STAT_POWER;
-			fhci_config_transceiver(fhci, FHCI_PORT_POWER_OFF);
-			break;
-		case USB_PORT_FEAT_C_CONNECTION:
-			fhci->vroot_hub->port.wPortChange &=
-			    ~USB_PORT_STAT_C_CONNECTION;
-			break;
-		case USB_PORT_FEAT_C_OVER_CURRENT:
-			fhci->vroot_hub->port.wPortChange &=
-			    ~USB_PORT_STAT_C_OVERCURRENT;
-			break;
-		case USB_PORT_FEAT_C_RESET:
-			fhci->vroot_hub->port.wPortChange &=
-			    ~USB_PORT_STAT_C_RESET;
-			break;
-		default:
-			goto error;
-		}
-		break;
-	case GetHubDescriptor:
-		memcpy(buf, root_hub_des, sizeof(root_hub_des));
-		break;
-	case GetHubStatus:
-		hub_status = (struct usb_hub_status *)buf;
-		hub_status->wHubStatus =
-		    cpu_to_le16(fhci->vroot_hub->hub.wHubStatus);
-		hub_status->wHubChange =
-		    cpu_to_le16(fhci->vroot_hub->hub.wHubChange);
-		break;
-	case GetPortStatus:
-		port_status = (struct usb_port_status *)buf;
-		port_status->wPortStatus =
-		    cpu_to_le16(fhci->vroot_hub->port.wPortStatus);
-		port_status->wPortChange =
-		    cpu_to_le16(fhci->vroot_hub->port.wPortChange);
-		break;
-	case SetHubFeature:
-		switch (wValue) {
-		case C_HUB_OVER_CURRENT:
-		case C_HUB_LOCAL_POWER:
-			break;
-		default:
-			goto error;
-		}
-		break;
-	case SetPortFeature:
-		fhci->vroot_hub->feature |= (1 << wValue);
-
-		switch (wValue) {
-		case USB_PORT_FEAT_ENABLE:
-			fhci->vroot_hub->port.wPortStatus |=
-			    USB_PORT_STAT_ENABLE;
-			fhci_port_enable(fhci->usb_lld);
-			break;
-		case USB_PORT_FEAT_SUSPEND:
-			fhci->vroot_hub->port.wPortStatus |=
-			    USB_PORT_STAT_SUSPEND;
-			fhci_stop_sof_timer(fhci);
-			break;
-		case USB_PORT_FEAT_RESET:
-			fhci->vroot_hub->port.wPortStatus |=
-			    USB_PORT_STAT_RESET;
-			fhci_port_reset(fhci->usb_lld);
-			fhci->vroot_hub->port.wPortStatus |=
-			    USB_PORT_STAT_ENABLE;
-			fhci->vroot_hub->port.wPortStatus &=
-			    ~USB_PORT_STAT_RESET;
-			break;
-		case USB_PORT_FEAT_POWER:
-			fhci->vroot_hub->port.wPortStatus |=
-			    USB_PORT_STAT_POWER;
-			fhci_config_transceiver(fhci, FHCI_PORT_WAITING);
-			break;
-		default:
-			goto error;
-		}
-		break;
-	default:
-error:
-		retval = -EPIPE;
-	}
-
-	fhci_dbg(fhci, "<- %s\n", __func__);
-
-	spin_unlock_irqrestore(&fhci->lock, flags);
-
-	return retval;
-}
+18000000
+#define DCI_MEM_PWR_CNTL3__MCIF_CWB1_MEM_PWR_MODE_SEL__SHIFT 0x1b
+#define DCI_MEM_PWR_CNTL3__MCIF_DWB_MEM_PWR_MODE_SEL_MASK 0x60000000
+#define DCI_MEM_PWR_CNTL3__MCIF_DWB_MEM_PWR_MODE_SEL__SHIFT 0x1d
+#define DCI_SOFT_RESET__VGA_SOFT_RESET_MASK 0x1
+#define DCI_SOFT_RESET__VGA_SOFT_RESET__SHIFT 0x0
+#define DCI_SOFT_RESET__VIP_SOFT_RESET_MASK 0x2
+#define DCI_SOFT_RESET__VIP_SOFT_RESET__SHIFT 0x1
+#define DCI_SOFT_RESET__MCIF_SOFT_RESET_MASK 0x4
+#define DCI_SOFT_RESET__MCIF_SOFT_RESET__SHIFT 0x2
+#define DCI_SOFT_RESET__FBC_SOFT_RESET_MASK 0x8
+#define DCI_SOFT_RESET__FBC_SOFT_RESET__SHIFT 0x3
+#define DCI_SOFT_RESET__DMIF0_SOFT_RESET_MASK 0x10
+#define DCI_SOFT_RESET__DMIF0_SOFT_RESET__SHIFT 0x4
+#define DCI_SOFT_RESET__DMIF1_SOFT_RESET_MASK 0x20
+#define DCI_SOFT_RESET__DMIF1_SOFT_RESET__SHIFT 0x5
+#define DCI_SOFT_RESET__DMIF2_SOFT_RESET_MASK 0x40
+#define DCI_SOFT_RESET__DMIF2_SOFT_RESET__SHIFT 0x6
+#define DCI_SOFT_RESET__DMIF3_SOFT_RESET_MASK 0x80
+#define DCI_SOFT_RESET__DMIF3_SOFT_RESET__SHIFT 0x7
+#define DCI_SOFT_RESET__DMIF4_SOFT_RESET_MASK 0x100
+#define DCI_SOFT_RESET__DMIF4_SOFT_RESET__SHIFT 0x8
+#define DCI_SOFT_RESET__DMIF5_SOFT_RESET_MASK 0x200
+#define DCI_SOFT_RESET__DMIF5_SOFT_RESET__SHIFT 0x9
+#define DCI_SOFT_RESET__DCFEV0_L_SOFT_RESET_MASK 0x400
+#define DCI_SOFT_RESET__DCFEV0_L_SOFT_RESET__SHIFT 0xa
+#define DCI_SOFT_RESET__DCFEV0_C_SOFT_RESET_MASK 0x800
+#define DCI_SOFT_RESET__DCFEV0_C_SOFT_RESET__SHIFT 0xb
+#define DCI_SOFT_RESET__DMIFARB_SOFT_RESET_MASK 0x1000
+#define DCI_SOFT_RESET__DMIFARB_SOFT_RESET__SHIFT 0xc
+#define DCI_SOFT_RESET__MCIF_DWB_SOFT_RESET_MASK 0x10000
+#define DCI_SOFT_RESET__MCIF_DWB_SOFT_RESET__SHIFT 0x10
+#define DCI_SOFT_RESET__MCIF_CWB0_SOFT_RESET_MASK 0x20000
+#define DCI_SOFT_RESET__MCIF_CWB0_SOFT_RESET__SHIFT 0x11
+#define DCI_SOFT_RESET__MCIF_CWB1_SOFT_RESET_MASK 0x40000
+#define DCI_SOFT_RESET__MCIF_CWB1_SOFT_RESET__SHIFT 0x12
+#define DCI_TEST_DEBUG_INDEX__DCI_TEST_DEBUG_INDEX_MASK 0xff
+#define DCI_TEST_DEBUG_INDEX__DCI_TEST_DEBUG_INDEX__SHIFT 0x0
+#define DCI_TEST_DEBUG_INDEX__DCI_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define DCI_TEST_DEBUG_INDEX__DCI_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define DCI_TEST_DEBUG_DATA__DCI_TEST_DEBUG_DATA_MASK 0xffffffff
+#define DCI_TEST_DEBUG_DATA__DCI_TEST_DEBUG_DATA__SHIFT 0x0
+#define DCI_DEBUG_CONFIG__DCI_DBG_EN_MASK 0x1
+#define DCI_DEBUG_CONFIG__DCI_DBG_EN__SHIFT 0x0
+#define DCI_DEBUG_CONFIG__DCI_DBG_BLOCK_SEL_MASK 0xf0
+#define DCI_DEBUG_CONFIG__DCI_DBG_BLOCK_SEL__SHIFT 0x4
+#define DCI_DEBUG_CONFIG__DCI_DBG_CLOCK_SEL_MASK 0xf00
+#define DCI_DEBUG_CONFIG__DCI_DBG_CLOCK_SEL__SHIFT 0x8
+#define PIPE0_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED_MASK 0x7
+#define PIPE0_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED__SHIFT 0x0
+#define PIPE0_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED_MASK 0x10
+#define PIPE0_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED__SHIFT 0x4
+#define PIPE1_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED_MASK 0x7
+#define PIPE1_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED__SHIFT 0x0
+#define PIPE1_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED_MASK 0x10
+#define PIPE1_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED__SHIFT 0x4
+#define PIPE2_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED_MASK 0x7
+#define PIPE2_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED__SHIFT 0x0
+#define PIPE2_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED_MASK 0x10
+#define PIPE2_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED__SHIFT 0x4
+#define PIPE3_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED_MASK 0x7
+#define PIPE3_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED__SHIFT 0x0
+#define PIPE3_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED_MASK 0x10
+#define PIPE3_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED__SHIFT 0x4
+#define PIPE4_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED_MASK 0x7
+#define PIPE4_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED__SHIFT 0x0
+#define PIPE4_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED_MASK 0x10
+#define PIPE4_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED__SHIFT 0x4
+#define PIPE5_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED_MASK 0x7
+#define PIPE5_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATED__SHIFT 0x0
+#define PIPE5_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED_MASK 0x10
+#define PIPE5_DMIF_BUFFER_CONTROL__DMIF_BUFFERS_ALLOCATION_COMPLETED__SHIFT 0x4
+#define DC_GENERICA__GENERICA_EN_MASK 0x1
+#define DC_GENERICA__GENERICA_EN__SHIFT 0x0
+#define DC_GENERICA__GENERICA_SEL_MASK 0xf80
+#define DC_GENERICA__GENERICA_SEL__SHIFT 0x7
+#define DC_GENERICA__GENERICA_UNIPHY_REFDIV_CLK_SEL_MASK 0x7000
+#define DC_GENERICA__GENERICA_UNIPHY_REFDIV_CLK_SEL__SHIFT 0xc
+#define DC_GENERICA__GENERICA_UNIPHY_FBDIV_CLK_SEL_MASK 0x70000
+#define DC_GENERICA__GENERICA_UNIPHY_FBDIV_CLK_SEL__SHIFT 0x10
+#define DC_GENERICA__GENERICA_UNIPHY_FBDIV_SSC_CLK_SEL_MASK 0x700000
+#define DC_GENERICA__GENERICA_UNIPHY_FBDIV_SSC_CLK_SEL__SHIFT 0x14
+#define DC_GENERICA__GENERICA_UNIPHY_FBDIV_CLK_DIV2_SEL_MASK 0x7000000
+#define DC_GENERICA__GENERICA_UNIPHY_FBDIV_CLK_DIV2_SEL__SHIFT 0x18
+#define DC_GENERICB__GENERICB_EN_MASK 0x1
+#define DC_GENERICB__GENERICB_EN__SHIFT 0x0
+#define DC_GENERICB__GENERICB_SEL_MASK 0xf00
+#define DC_GENERICB__GENERICB_SEL__SHIFT 0x8
+#define DC_GENERICB__GENERICB_UNIPHY_REFDIV_CLK_SEL_MASK 0x7000
+#define DC_GENERICB__GENERICB_UNIPHY_REFDIV_CLK_SEL__SHIFT 0xc
+#define DC_GENERICB__GENERICB_UNIPHY_FBDIV_CLK_SEL_MASK 0x70000
+#define DC_GENERICB__GENERICB_UNIPHY_FBDIV_CLK_SEL__SHIFT 0x10
+#define DC_GENERICB__GENERICB_UNIPHY_FBDIV_SSC_CLK_SEL_MASK 0x700000
+#define DC_GENERICB__GENERICB_UNIPHY_FBDIV_SSC_CLK_SEL__SHIFT 0x14
+#define DC_GENERICB__GENERICB_UNIPHY_FBDIV_CLK_DIV2_SEL_MASK 0x7000000
+#define DC_GENERICB__GENERICB_UNIPHY_FBDIV_CLK_DIV2_SEL__SHIFT 0x18
+#define DC_PAD_EXTERN_SIG__DC_PAD_EXTERN_SIG_SEL_MASK 0xf
+#define DC_PAD_EXTERN_SIG__DC_PAD_EXTERN_SIG_SEL__SHIFT 0x0
+#define DC_PAD_EXTERN_SIG__MVP_PIXEL_SRC_STATUS_MASK 0x30
+#define DC_PAD_EXTERN_SIG__MVP_PIXEL_SRC_STATUS__SHIFT 0x4
+#define DC_REF_CLK_CNTL__HSYNCA_OUTPUT_SEL_MASK 0x3
+#define DC_REF_CLK_CNTL__HSYNCA_OUTPUT_SEL__SHIFT 0x0
+#define DC_REF_CLK_CNTL__GENLK_CLK_OUTPUT_SEL_MASK 0x300
+#define DC_REF_CLK_CNTL__GENLK_CLK_OUTPUT_SEL__SHIFT 0x8
+#define DC_GPIO_DEBUG__DC_GPIO_VIP_DEBUG_MASK 0x1
+#define DC_GPIO_DEBUG__DC_GPIO_VIP_DEBUG__SHIFT 0x0
+#define DC_GPIO_DEBUG__DC_GPIO_MACRO_DEBUG_MASK 0x300
+#define DC_GPIO_DEBUG__DC_GPIO_MACRO_DEBUG__SHIFT 0x8
+#define DC_GPIO_DEBUG__DC_GPIO_CHIP_DEBUG_OUT_PIN_SEL_MASK 0x10000
+#define DC_GPIO_DEBUG__DC_GPIO_CHIP_DEBUG_OUT_PIN_SEL__SHIFT 0x10
+#define DC_GPIO_DEBUG__DC_GPIO_DEBUG_BUS_FLOP_EN_MASK 0x20000
+#define DC_GPIO_DEBUG__DC_GPIO_DEBUG_BUS_FLOP_EN__SHIFT 0x11
+#define DC_GPIO_DEBUG__DPRX_LOOPBACK_ENABLE_MASK 0x80000000
+#define DC_GPIO_DEBUG__DPRX_LOOPBACK_ENABLE__SHIFT 0x1f
+#define UNIPHYA_LINK_CNTL__UNIPHY_PFREQCHG_MASK 0x1
+#define UNIPHYA_LINK_CNTL__UNIPHY_PFREQCHG__SHIFT 0x0
+#define UNIPHYA_LINK_CNTL__UNIPHY_PIXVLD_RESET_MASK 0x10
+#define UNIPHYA_LINK_CNTL__UNIPHY_PIXVLD_RESET__SHIFT 0x4
+#define UNIPHYA_LINK_CNTL__UNIPHY_MINIMUM_PIXVLD_LOW_DURATION_MASK 0x700
+#define UNIPHYA_LINK_CNTL__UNIPHY_MINIMUM_PIXVLD_LOW_DURATION__SHIFT 0x8
+#define UNIPHYA_LINK_CNTL__UNIPHY_CHANNEL0_INVERT_MASK 0x1000
+#define UNIPHYA_LINK_CNTL__UNIPHY_CHANNEL0_INVERT__SHIFT 0xc
+#define UNIPHYA_LINK_CNTL__UNIPHY_CHANNEL1_INVERT_MASK 0x2000
+#define UNIPHYA_LINK_CNTL__UNIPHY_CHANNEL1_INVERT__SHIFT 0xd
+#define UNIPHYA_LINK_CNTL__UNIPHY_CHANNEL2_INVERT_MASK 0x4000
+#define UNIPHYA_LINK_CNTL__UNIPHY_CHANNEL2_INVERT__SHIFT 0xe
+#define UNIPHYA_LINK_CNTL__UNIPHY_CHANNEL3_INVERT_MASK 0x8000
+#define UNIPHYA_LINK_CNTL__UNIPHY_CHANNEL3_INVERT__SHIFT 0xf
+#define UNIPHYA_LINK_CNTL__UNIPHY_LANE_STAGGER_DELAY_MASK 0x700000
+#define UNIPHYA_LINK_CNTL__UNIPHY_LANE_STAGGER_DELAY__SHIFT 0x14
+#define UNIPHYA_LINK_CNTL__UNIPHY_LINK_ENABLE_HPD_MASK_MASK 0x3000000
+#define UNIPHYA_LINK_CNTL__UNIPHY_LINK_ENABLE_HPD_MASK__SHIFT 0x18
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_CHANNEL0_XBAR_SOURCE_MASK 0x3
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_CHANNEL0_XBAR_SOURCE__SHIFT 0x0
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_CHANNEL1_XBAR_SOURCE_MASK 0x300
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_CHANNEL1_XBAR_SOURCE__SHIFT 0x8
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_CHANNEL2_XBAR_SOURCE_MASK 0x30000
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_CHANNEL2_XBAR_SOURCE__SHIFT 0x10
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_CHANNEL3_XBAR_SOURCE_MASK 0x3000000
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_CHANNEL3_XBAR_SOURCE__SHIFT 0x18
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_LINK_ENABLE_MASK 0x10000000
+#define UNIPHYA_CHANNEL_XBAR_CNTL__UNIPHY_LINK_ENABLE__SHIFT 0x1c
+#define UNIPHYB_LINK_CNTL__UNIPHY_PFREQCHG_MASK 0x1
+#define UNIPHYB_LINK_CNTL__UNIPHY_PFREQCHG__SHIFT 0x0
+#define UNIPHYB_LINK_CNTL__UNIPHY_PIXVLD_RESET_MASK 0x10
+#define UNIPHYB_LINK_CNTL__UNIPHY_PIXVLD_RESET__SHIFT 0x4
+#define UNIPHYB_LINK_CNTL__UNIPHY_MINIMUM_PIXVLD_LOW_DURATION_MASK 0x700
+#define UNIPHYB_LINK_CNTL__

@@ -1,179 +1,203 @@
-/*
- * Copyright (c) 2015 MediaTek Inc.
- * Author: Henry Chen <henryc.chen@mediatek.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/err.h>
-#include <linux/gpio.h>
-#include <linux/i2c.h>
-#include <linux/init.h>
-#include <linux/interrupt.h>
-#include <linux/module.h>
-#include <linux/regmap.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/regulator/mt6311.h>
-#include <linux/slab.h>
-#include "mt6311-regulator.h"
-
-static const struct regmap_config mt6311_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 8,
-	.max_register = MT6311_FQMTR_CON4,
+struct e7xxx_dev_info *dev_info;
 };
 
-/* Default limits measured in millivolts and milliamps */
-#define MT6311_MIN_UV		600000
-#define MT6311_MAX_UV		1393750
-#define MT6311_STEP_UV		6250
-
-static const struct regulator_linear_range buck_volt_range[] = {
-	REGULATOR_LINEAR_RANGE(MT6311_MIN_UV, 0, 0x7f, MT6311_STEP_UV),
+struct e7xxx_dev_info {
+	u16 err_dev;
+	const char *ctl_name;
 };
 
-static const struct regulator_ops mt6311_buck_ops = {
-	.list_voltage = regulator_list_voltage_linear_range,
-	.map_voltage = regulator_map_voltage_linear_range,
-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
-	.get_voltage_sel = regulator_get_voltage_sel_regmap,
-	.set_voltage_time_sel = regulator_set_voltage_time_sel,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.is_enabled = regulator_is_enabled_regmap,
+struct e7xxx_error_info {
+	u8 dram_ferr;
+	u8 dram_nerr;
+	u32 dram_celog_add;
+	u16 dram_celog_syndrome;
+	u32 dram_uelog_add;
 };
 
-static const struct regulator_ops mt6311_ldo_ops = {
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.is_enabled = regulator_is_enabled_regmap,
+static struct edac_pci_ctl_info *e7xxx_pci;
+
+static const struct e7xxx_dev_info e7xxx_devs[] = {
+	[E7500] = {
+		.err_dev = PCI_DEVICE_ID_INTEL_7500_1_ERR,
+		.ctl_name = "E7500"},
+	[E7501] = {
+		.err_dev = PCI_DEVICE_ID_INTEL_7501_1_ERR,
+		.ctl_name = "E7501"},
+	[E7505] = {
+		.err_dev = PCI_DEVICE_ID_INTEL_7505_1_ERR,
+		.ctl_name = "E7505"},
+	[E7205] = {
+		.err_dev = PCI_DEVICE_ID_INTEL_7205_1_ERR,
+		.ctl_name = "E7205"},
 };
 
-#define MT6311_BUCK(_id) \
-{\
-	.name = #_id,\
-	.ops = &mt6311_buck_ops,\
-	.of_match = of_match_ptr(#_id),\
-	.regulators_node = of_match_ptr("regulators"),\
-	.type = REGULATOR_VOLTAGE,\
-	.id = MT6311_ID_##_id,\
-	.n_voltages = (MT6311_MAX_UV - MT6311_MIN_UV) / MT6311_STEP_UV + 1,\
-	.min_uV = MT6311_MIN_UV,\
-	.uV_step = MT6311_STEP_UV,\
-	.owner = THIS_MODULE,\
-	.linear_ranges = buck_volt_range, \
-	.n_linear_ranges = ARRAY_SIZE(buck_volt_range), \
-	.enable_reg = MT6311_VDVFS11_CON9,\
-	.enable_mask = MT6311_PMIC_VDVFS11_EN_MASK,\
-	.vsel_reg = MT6311_VDVFS11_CON12,\
-	.vsel_mask = MT6311_PMIC_VDVFS11_VOSEL_MASK,\
-}
-
-#define MT6311_LDO(_id) \
-{\
-	.name = #_id,\
-	.ops = &mt6311_ldo_ops,\
-	.of_match = of_match_ptr(#_id),\
-	.regulators_node = of_match_ptr("regulators"),\
-	.type = REGULATOR_VOLTAGE,\
-	.id = MT6311_ID_##_id,\
-	.owner = THIS_MODULE,\
-	.enable_reg = MT6311_LDO_CON3,\
-	.enable_mask = MT6311_PMIC_RG_VBIASN_EN_MASK,\
-}
-
-static const struct regulator_desc mt6311_regulators[] = {
-	MT6311_BUCK(VDVFS),
-	MT6311_LDO(VBIASN),
-};
-
-/*
- * I2C driver interface functions
- */
-static int mt6311_i2c_probe(struct i2c_client *i2c,
-		const struct i2c_device_id *id)
+/* FIXME - is this valid for both SECDED and S4ECD4ED? */
+static inline int e7xxx_find_channel(u16 syndrome)
 {
-	struct regulator_config config = { };
-	struct regulator_dev *rdev;
-	struct regmap *regmap;
-	int i, ret;
-	unsigned int data;
+	edac_dbg(3, "\n");
 
-	regmap = devm_regmap_init_i2c(i2c, &mt6311_regmap_config);
-	if (IS_ERR(regmap)) {
-		ret = PTR_ERR(regmap);
-		dev_err(&i2c->dev, "Failed to allocate register map: %d\n",
-			ret);
-		return ret;
+	if ((syndrome & 0xff00) == 0)
+		return 0;
+
+	if ((syndrome & 0x00ff) == 0)
+		return 1;
+
+	if ((syndrome & 0xf000) == 0 || (syndrome & 0x0f00) == 0)
+		return 0;
+
+	return 1;
+}
+
+static unsigned long ctl_page_to_phys(struct mem_ctl_info *mci,
+				unsigned long page)
+{
+	u32 remap;
+	struct e7xxx_pvt *pvt = (struct e7xxx_pvt *)mci->pvt_info;
+
+	edac_dbg(3, "\n");
+
+	if ((page < pvt->tolm) ||
+		((page >= 0x100000) && (page < pvt->remapbase)))
+		return page;
+
+	remap = (page - pvt->tolm) + pvt->remapbase;
+
+	if (remap < pvt->remaplimit)
+		return remap;
+
+	e7xxx_printk(KERN_ERR, "Invalid page %lx - out of range\n", page);
+	return pvt->tolm - 1;
+}
+
+static void process_ce(struct mem_ctl_info *mci, struct e7xxx_error_info *info)
+{
+	u32 error_1b, page;
+	u16 syndrome;
+	int row;
+	int channel;
+
+	edac_dbg(3, "\n");
+	/* read the error address */
+	error_1b = info->dram_celog_add;
+	/* FIXME - should use PAGE_SHIFT */
+	page = error_1b >> 6;	/* convert the address to 4k page */
+	/* read the syndrome */
+	syndrome = info->dram_celog_syndrome;
+	/* FIXME - check for -1 */
+	row = edac_mc_find_csrow_by_page(mci, page);
+	/* convert syndrome to channel */
+	channel = e7xxx_find_channel(syndrome);
+	edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1, page, 0, syndrome,
+			     row, channel, -1, "e7xxx CE", "");
+}
+
+static void process_ce_no_info(struct mem_ctl_info *mci)
+{
+	edac_dbg(3, "\n");
+	edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1, 0, 0, 0, -1, -1, -1,
+			     "e7xxx CE log register overflow", "");
+}
+
+static void process_ue(struct mem_ctl_info *mci, struct e7xxx_error_info *info)
+{
+	u32 error_2b, block_page;
+	int row;
+
+	edac_dbg(3, "\n");
+	/* read the error address */
+	error_2b = info->dram_uelog_add;
+	/* FIXME - should use PAGE_SHIFT */
+	block_page = error_2b >> 6;	/* convert to 4k address */
+	row = edac_mc_find_csrow_by_page(mci, block_page);
+
+	edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1, block_page, 0, 0,
+			     row, -1, -1, "e7xxx UE", "");
+}
+
+static void process_ue_no_info(struct mem_ctl_info *mci)
+{
+	edac_dbg(3, "\n");
+
+	edac_mc_handle_error(HW_EVENT_ERR_UNCORRECTED, mci, 1, 0, 0, 0, -1, -1, -1,
+			     "e7xxx UE log register overflow", "");
+}
+
+static void e7xxx_get_error_info(struct mem_ctl_info *mci,
+				 struct e7xxx_error_info *info)
+{
+	struct e7xxx_pvt *pvt;
+
+	pvt = (struct e7xxx_pvt *)mci->pvt_info;
+	pci_read_config_byte(pvt->bridge_ck, E7XXX_DRAM_FERR, &info->dram_ferr);
+	pci_read_config_byte(pvt->bridge_ck, E7XXX_DRAM_NERR, &info->dram_nerr);
+
+	if ((info->dram_ferr & 1) || (info->dram_nerr & 1)) {
+		pci_read_config_dword(pvt->bridge_ck, E7XXX_DRAM_CELOG_ADD,
+				&info->dram_celog_add);
+		pci_read_config_word(pvt->bridge_ck,
+				E7XXX_DRAM_CELOG_SYNDROME,
+				&info->dram_celog_syndrome);
 	}
 
-	ret = regmap_read(regmap, MT6311_SWCID, &data);
-	if (ret < 0) {
-		dev_err(&i2c->dev, "Failed to read DEVICE_ID reg: %d\n", ret);
-		return ret;
+	if ((info->dram_ferr & 2) || (info->dram_nerr & 2))
+		pci_read_config_dword(pvt->bridge_ck, E7XXX_DRAM_UELOG_ADD,
+				&info->dram_uelog_add);
+
+	if (info->dram_ferr & 3)
+		pci_write_bits8(pvt->bridge_ck, E7XXX_DRAM_FERR, 0x03, 0x03);
+
+	if (info->dram_nerr & 3)
+		pci_write_bits8(pvt->bridge_ck, E7XXX_DRAM_NERR, 0x03, 0x03);
+}
+
+static int e7xxx_process_error_info(struct mem_ctl_info *mci,
+				struct e7xxx_error_info *info,
+				int handle_errors)
+{
+	int error_found;
+
+	error_found = 0;
+
+	/* decode and report errors */
+	if (info->dram_ferr & 1) {	/* check first error correctable */
+		error_found = 1;
+
+		if (handle_errors)
+			process_ce(mci, info);
 	}
 
-	switch (data) {
-	case MT6311_E1_CID_CODE:
-	case MT6311_E2_CID_CODE:
-	case MT6311_E3_CID_CODE:
-		break;
-	default:
-		dev_err(&i2c->dev, "Unsupported device id = 0x%x.\n", data);
-		return -ENODEV;
+	if (info->dram_ferr & 2) {	/* check first error uncorrectable */
+		error_found = 1;
+
+		if (handle_errors)
+			process_ue(mci, info);
 	}
 
-	for (i = 0; i < MT6311_MAX_REGULATORS; i++) {
-		config.dev = &i2c->dev;
-		config.regmap = regmap;
+	if (info->dram_nerr & 1) {	/* check next error correctable */
+		error_found = 1;
 
-		rdev = devm_regulator_register(&i2c->dev,
-			&mt6311_regulators[i], &config);
-		if (IS_ERR(rdev)) {
-			dev_err(&i2c->dev,
-				"Failed to register MT6311 regulator\n");
-			return PTR_ERR(rdev);
+		if (handle_errors) {
+			if (info->dram_ferr & 1)
+				process_ce_no_info(mci);
+			else
+				process_ce(mci, info);
 		}
 	}
 
-	return 0;
+	if (info->dram_nerr & 2) {	/* check next error uncorrectable */
+		error_found = 1;
+
+		if (handle_errors) {
+			if (info->dram_ferr & 2)
+				process_ue_no_info(mci);
+			else
+				process_ue(mci, info);
+		}
+	}
+
+	return error_found;
 }
 
-static const struct i2c_device_id mt6311_i2c_id[] = {
-	{"mt6311", 0},
-	{},
-};
-MODULE_DEVICE_TABLE(i2c, mt6311_i2c_id);
-
-#ifdef CONFIG_OF
-static const struct of_device_id mt6311_dt_ids[] = {
-	{ .compatible = "mediatek,mt6311-regulator",
-	  .data = &mt6311_i2c_id[0] },
-	{},
-};
-MODULE_DEVICE_TABLE(of, mt6311_dt_ids);
-#endif
-
-static struct i2c_driver mt6311_regulator_driver = {
-	.driver = {
-		.name = "mt6311",
-		.of_match_table = of_match_ptr(mt6311_dt_ids),
-	},
-	.probe = mt6311_i2c_probe,
-	.id_table = mt6311_i2c_id,
-};
-
-module_i2c_driver(mt6311_regulator_driver);
-
-MODULE_AUTHOR("Henry Chen <henryc.chen@mediatek.com>");
-MODULE_DESCRIPTION("Regulator device driver for Mediatek MT6311");
-MODULE_LICENSE("GPL v2");
+static void e7xxx_check(struct mem_ctl_info *mci)
+{
+	struct 

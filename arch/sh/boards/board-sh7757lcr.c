@@ -1,612 +1,344 @@
+I-P3 colorspace, used by cinema projectors */
+	V4L2_COLORSPACE_DCI_P3        = 12,
+};
+
 /*
- * Renesas R0P7757LC0012RL Support.
- *
- * Copyright (C) 2009 - 2010  Renesas Solutions Corp.
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ * Determine how COLORSPACE_DEFAULT should map to a proper colorspace.
+ * This depends on whether this is a SDTV image (use SMPTE 170M), an
+ * HDTV image (use Rec. 709), or something else (use sRGB).
  */
-
-#include <linux/init.h>
-#include <linux/platform_device.h>
-#include <linux/gpio.h>
-#include <linux/irq.h>
-#include <linux/regulator/fixed.h>
-#include <linux/regulator/machine.h>
-#include <linux/spi/spi.h>
-#include <linux/spi/flash.h>
-#include <linux/io.h>
-#include <linux/mfd/tmio.h>
-#include <linux/mmc/host.h>
-#include <linux/mmc/sh_mmcif.h>
-#include <linux/mmc/sh_mobile_sdhi.h>
-#include <linux/sh_eth.h>
-#include <linux/sh_intc.h>
-#include <linux/usb/renesas_usbhs.h>
-#include <cpu/sh7757.h>
-#include <asm/heartbeat.h>
-
-static struct resource heartbeat_resource = {
-	.start	= 0xffec005c,	/* PUDR */
-	.end	= 0xffec005c,
-	.flags	= IORESOURCE_MEM | IORESOURCE_MEM_8BIT,
-};
-
-static unsigned char heartbeat_bit_pos[] = { 0, 1, 2, 3 };
-
-static struct heartbeat_data heartbeat_data = {
-	.bit_pos	= heartbeat_bit_pos,
-	.nr_bits	= ARRAY_SIZE(heartbeat_bit_pos),
-	.flags		= HEARTBEAT_INVERTED,
-};
-
-static struct platform_device heartbeat_device = {
-	.name		= "heartbeat",
-	.id		= -1,
-	.dev	= {
-		.platform_data	= &heartbeat_data,
-	},
-	.num_resources	= 1,
-	.resource	= &heartbeat_resource,
-};
-
-/* Fast Ethernet */
-#define GBECONT		0xffc10100
-#define GBECONT_RMII1	BIT(17)
-#define GBECONT_RMII0	BIT(16)
-static void sh7757_eth_set_mdio_gate(void *addr)
-{
-	if (((unsigned long)addr & 0x00000fff) < 0x0800)
-		writel(readl(GBECONT) | GBECONT_RMII0, GBECONT);
-	else
-		writel(readl(GBECONT) | GBECONT_RMII1, GBECONT);
-}
-
-static struct resource sh_eth0_resources[] = {
-	{
-		.start  = 0xfef00000,
-		.end    = 0xfef001ff,
-		.flags  = IORESOURCE_MEM,
-	}, {
-		.start  = evt2irq(0xc80),
-		.end    = evt2irq(0xc80),
-		.flags  = IORESOURCE_IRQ,
-	},
-};
-
-static struct sh_eth_plat_data sh7757_eth0_pdata = {
-	.phy = 1,
-	.edmac_endian = EDMAC_LITTLE_ENDIAN,
-	.set_mdio_gate = sh7757_eth_set_mdio_gate,
-};
-
-static struct platform_device sh7757_eth0_device = {
-	.name		= "sh7757-ether",
-	.resource	= sh_eth0_resources,
-	.id		= 0,
-	.num_resources	= ARRAY_SIZE(sh_eth0_resources),
-	.dev		= {
-		.platform_data = &sh7757_eth0_pdata,
-	},
-};
-
-static struct resource sh_eth1_resources[] = {
-	{
-		.start  = 0xfef00800,
-		.end    = 0xfef009ff,
-		.flags  = IORESOURCE_MEM,
-	}, {
-		.start  = evt2irq(0xc80),
-		.end    = evt2irq(0xc80),
-		.flags  = IORESOURCE_IRQ,
-	},
-};
-
-static struct sh_eth_plat_data sh7757_eth1_pdata = {
-	.phy = 1,
-	.edmac_endian = EDMAC_LITTLE_ENDIAN,
-	.set_mdio_gate = sh7757_eth_set_mdio_gate,
-};
-
-static struct platform_device sh7757_eth1_device = {
-	.name		= "sh7757-ether",
-	.resource	= sh_eth1_resources,
-	.id		= 1,
-	.num_resources	= ARRAY_SIZE(sh_eth1_resources),
-	.dev		= {
-		.platform_data = &sh7757_eth1_pdata,
-	},
-};
-
-static void sh7757_eth_giga_set_mdio_gate(void *addr)
-{
-	if (((unsigned long)addr & 0x00000fff) < 0x0800) {
-		gpio_set_value(GPIO_PTT4, 1);
-		writel(readl(GBECONT) & ~GBECONT_RMII0, GBECONT);
-	} else {
-		gpio_set_value(GPIO_PTT4, 0);
-		writel(readl(GBECONT) & ~GBECONT_RMII1, GBECONT);
-	}
-}
-
-static struct resource sh_eth_giga0_resources[] = {
-	{
-		.start  = 0xfee00000,
-		.end    = 0xfee007ff,
-		.flags  = IORESOURCE_MEM,
-	}, {
-		/* TSU */
-		.start  = 0xfee01800,
-		.end    = 0xfee01fff,
-		.flags  = IORESOURCE_MEM,
-	}, {
-		.start  = evt2irq(0x2960),
-		.end    = evt2irq(0x2960),
-		.flags  = IORESOURCE_IRQ,
-	},
-};
-
-static struct sh_eth_plat_data sh7757_eth_giga0_pdata = {
-	.phy = 18,
-	.edmac_endian = EDMAC_LITTLE_ENDIAN,
-	.set_mdio_gate = sh7757_eth_giga_set_mdio_gate,
-	.phy_interface = PHY_INTERFACE_MODE_RGMII_ID,
-};
-
-static struct platform_device sh7757_eth_giga0_device = {
-	.name		= "sh7757-gether",
-	.resource	= sh_eth_giga0_resources,
-	.id		= 2,
-	.num_resources	= ARRAY_SIZE(sh_eth_giga0_resources),
-	.dev		= {
-		.platform_data = &sh7757_eth_giga0_pdata,
-	},
-};
-
-static struct resource sh_eth_giga1_resources[] = {
-	{
-		.start  = 0xfee00800,
-		.end    = 0xfee00fff,
-		.flags  = IORESOURCE_MEM,
-	}, {
-		/* TSU */
-		.start  = 0xfee01800,
-		.end    = 0xfee01fff,
-		.flags  = IORESOURCE_MEM,
-	}, {
-		.start  = evt2irq(0x2980),
-		.end    = evt2irq(0x2980),
-		.flags  = IORESOURCE_IRQ,
-	},
-};
-
-static struct sh_eth_plat_data sh7757_eth_giga1_pdata = {
-	.phy = 19,
-	.edmac_endian = EDMAC_LITTLE_ENDIAN,
-	.set_mdio_gate = sh7757_eth_giga_set_mdio_gate,
-	.phy_interface = PHY_INTERFACE_MODE_RGMII_ID,
-};
-
-static struct platform_device sh7757_eth_giga1_device = {
-	.name		= "sh7757-gether",
-	.resource	= sh_eth_giga1_resources,
-	.id		= 3,
-	.num_resources	= ARRAY_SIZE(sh_eth_giga1_resources),
-	.dev		= {
-		.platform_data = &sh7757_eth_giga1_pdata,
-	},
-};
-
-/* Fixed 3.3V regulator to be used by SDHI0, MMCIF */
-static struct regulator_consumer_supply fixed3v3_power_consumers[] =
-{
-	REGULATOR_SUPPLY("vmmc", "sh_mobile_sdhi.0"),
-	REGULATOR_SUPPLY("vqmmc", "sh_mobile_sdhi.0"),
-	REGULATOR_SUPPLY("vmmc", "sh_mmcif.0"),
-	REGULATOR_SUPPLY("vqmmc", "sh_mmcif.0"),
-};
-
-/* SH_MMCIF */
-static struct resource sh_mmcif_resources[] = {
-	[0] = {
-		.start	= 0xffcb0000,
-		.end	= 0xffcb00ff,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= evt2irq(0x1c60),
-		.flags	= IORESOURCE_IRQ,
-	},
-	[2] = {
-		.start	= evt2irq(0x1c80),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct sh_mmcif_plat_data sh_mmcif_plat = {
-	.sup_pclk	= 0x0f,
-	.caps		= MMC_CAP_4_BIT_DATA | MMC_CAP_8_BIT_DATA |
-			  MMC_CAP_NONREMOVABLE,
-	.ocr		= MMC_VDD_32_33 | MMC_VDD_33_34,
-	.slave_id_tx	= SHDMA_SLAVE_MMCIF_TX,
-	.slave_id_rx	= SHDMA_SLAVE_MMCIF_RX,
-};
-
-static struct platform_device sh_mmcif_device = {
-	.name		= "sh_mmcif",
-	.id		= 0,
-	.dev		= {
-		.platform_data		= &sh_mmcif_plat,
-	},
-	.num_resources	= ARRAY_SIZE(sh_mmcif_resources),
-	.resource	= sh_mmcif_resources,
-};
-
-/* SDHI0 */
-static struct tmio_mmc_data sdhi_info = {
-	.chan_priv_tx	= (void *)SHDMA_SLAVE_SDHI_TX,
-	.chan_priv_rx	= (void *)SHDMA_SLAVE_SDHI_RX,
-	.capabilities	= MMC_CAP_SD_HIGHSPEED,
-};
-
-static struct resource sdhi_resources[] = {
-	[0] = {
-		.start  = 0xffe50000,
-		.end    = 0xffe500ff,
-		.flags  = IORESOURCE_MEM,
-	},
-	[1] = {
-		.start  = evt2irq(0x480),
-		.flags  = IORESOURCE_IRQ,
-	},
-};
-
-static struct platform_device sdhi_device = {
-	.name           = "sh_mobile_sdhi",
-	.num_resources  = ARRAY_SIZE(sdhi_resources),
-	.resource       = sdhi_resources,
-	.id             = 0,
-	.dev	= {
-		.platform_data	= &sdhi_info,
-	},
-};
-
-static int usbhs0_get_id(struct platform_device *pdev)
-{
-	return USBHS_GADGET;
-}
-
-static struct renesas_usbhs_platform_info usb0_data = {
-	.platform_callback = {
-		.get_id = usbhs0_get_id,
-	},
-	.driver_param = {
-		.buswait_bwait = 5,
-	}
-};
-
-static struct resource usb0_resources[] = {
-	[0] = {
-		.start	= 0xfe450000,
-		.end	= 0xfe4501ff,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= evt2irq(0x840),
-		.end	= evt2irq(0x840),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct platform_device usb0_device = {
-	.name		= "renesas_usbhs",
-	.id		= 0,
-	.dev = {
-		.platform_data		= &usb0_data,
-	},
-	.num_resources	= ARRAY_SIZE(usb0_resources),
-	.resource	= usb0_resources,
-};
-
-static struct platform_device *sh7757lcr_devices[] __initdata = {
-	&heartbeat_device,
-	&sh7757_eth0_device,
-	&sh7757_eth1_device,
-	&sh7757_eth_giga0_device,
-	&sh7757_eth_giga1_device,
-	&sh_mmcif_device,
-	&sdhi_device,
-	&usb0_device,
-};
-
-static struct flash_platform_data spi_flash_data = {
-	.name = "m25p80",
-	.type = "m25px64",
-};
-
-static struct spi_board_info spi_board_info[] = {
-	{
-		.modalias = "m25p80",
-		.max_speed_hz = 25000000,
-		.bus_num = 0,
-		.chip_select = 1,
-		.platform_data = &spi_flash_data,
-	},
-};
-
-static int __init sh7757lcr_devices_setup(void)
-{
-	regulator_register_always_on(0, "fixed-3.3V", fixed3v3_power_consumers,
-				     ARRAY_SIZE(fixed3v3_power_consumers), 3300000);
-
-	/* RGMII (PTA) */
-	gpio_request(GPIO_FN_ET0_MDC, NULL);
-	gpio_request(GPIO_FN_ET0_MDIO, NULL);
-	gpio_request(GPIO_FN_ET1_MDC, NULL);
-	gpio_request(GPIO_FN_ET1_MDIO, NULL);
-
-	/* ONFI (PTB, PTZ) */
-	gpio_request(GPIO_FN_ON_NRE, NULL);
-	gpio_request(GPIO_FN_ON_NWE, NULL);
-	gpio_request(GPIO_FN_ON_NWP, NULL);
-	gpio_request(GPIO_FN_ON_NCE0, NULL);
-	gpio_request(GPIO_FN_ON_R_B0, NULL);
-	gpio_request(GPIO_FN_ON_ALE, NULL);
-	gpio_request(GPIO_FN_ON_CLE, NULL);
-
-	gpio_request(GPIO_FN_ON_DQ7, NULL);
-	gpio_request(GPIO_FN_ON_DQ6, NULL);
-	gpio_request(GPIO_FN_ON_DQ5, NULL);
-	gpio_request(GPIO_FN_ON_DQ4, NULL);
-	gpio_request(GPIO_FN_ON_DQ3, NULL);
-	gpio_request(GPIO_FN_ON_DQ2, NULL);
-	gpio_request(GPIO_FN_ON_DQ1, NULL);
-	gpio_request(GPIO_FN_ON_DQ0, NULL);
-
-	/* IRQ8 to 0 (PTB, PTC) */
-	gpio_request(GPIO_FN_IRQ8, NULL);
-	gpio_request(GPIO_FN_IRQ7, NULL);
-	gpio_request(GPIO_FN_IRQ6, NULL);
-	gpio_request(GPIO_FN_IRQ5, NULL);
-	gpio_request(GPIO_FN_IRQ4, NULL);
-	gpio_request(GPIO_FN_IRQ3, NULL);
-	gpio_request(GPIO_FN_IRQ2, NULL);
-	gpio_request(GPIO_FN_IRQ1, NULL);
-	gpio_request(GPIO_FN_IRQ0, NULL);
-
-	/* SPI0 (PTD) */
-	gpio_request(GPIO_FN_SP0_MOSI, NULL);
-	gpio_request(GPIO_FN_SP0_MISO, NULL);
-	gpio_request(GPIO_FN_SP0_SCK, NULL);
-	gpio_request(GPIO_FN_SP0_SCK_FB, NULL);
-	gpio_request(GPIO_FN_SP0_SS0, NULL);
-	gpio_request(GPIO_FN_SP0_SS1, NULL);
-	gpio_request(GPIO_FN_SP0_SS2, NULL);
-	gpio_request(GPIO_FN_SP0_SS3, NULL);
-
-	/* RMII 0/1 (PTE, PTF) */
-	gpio_request(GPIO_FN_RMII0_CRS_DV, NULL);
-	gpio_request(GPIO_FN_RMII0_TXD1, NULL);
-	gpio_request(GPIO_FN_RMII0_TXD0, NULL);
-	gpio_request(GPIO_FN_RMII0_TXEN, NULL);
-	gpio_request(GPIO_FN_RMII0_REFCLK, NULL);
-	gpio_request(GPIO_FN_RMII0_RXD1, NULL);
-	gpio_request(GPIO_FN_RMII0_RXD0, NULL);
-	gpio_request(GPIO_FN_RMII0_RX_ER, NULL);
-	gpio_request(GPIO_FN_RMII1_CRS_DV, NULL);
-	gpio_request(GPIO_FN_RMII1_TXD1, NULL);
-	gpio_request(GPIO_FN_RMII1_TXD0, NULL);
-	gpio_request(GPIO_FN_RMII1_TXEN, NULL);
-	gpio_request(GPIO_FN_RMII1_REFCLK, NULL);
-	gpio_request(GPIO_FN_RMII1_RXD1, NULL);
-	gpio_request(GPIO_FN_RMII1_RXD0, NULL);
-	gpio_request(GPIO_FN_RMII1_RX_ER, NULL);
-
-	/* eMMC (PTG) */
-	gpio_request(GPIO_FN_MMCCLK, NULL);
-	gpio_request(GPIO_FN_MMCCMD, NULL);
-	gpio_request(GPIO_FN_MMCDAT7, NULL);
-	gpio_request(GPIO_FN_MMCDAT6, NULL);
-	gpio_request(GPIO_FN_MMCDAT5, NULL);
-	gpio_request(GPIO_FN_MMCDAT4, NULL);
-	gpio_request(GPIO_FN_MMCDAT3, NULL);
-	gpio_request(GPIO_FN_MMCDAT2, NULL);
-	gpio_request(GPIO_FN_MMCDAT1, NULL);
-	gpio_request(GPIO_FN_MMCDAT0, NULL);
-
-	/* LPC (PTG, PTH, PTQ, PTU) */
-	gpio_request(GPIO_FN_SERIRQ, NULL);
-	gpio_request(GPIO_FN_LPCPD, NULL);
-	gpio_request(GPIO_FN_LDRQ, NULL);
-	gpio_request(GPIO_FN_WP, NULL);
-	gpio_request(GPIO_FN_FMS0, NULL);
-	gpio_request(GPIO_FN_LAD3, NULL);
-	gpio_request(GPIO_FN_LAD2, NULL);
-	gpio_request(GPIO_FN_LAD1, NULL);
-	gpio_request(GPIO_FN_LAD0, NULL);
-	gpio_request(GPIO_FN_LFRAME, NULL);
-	gpio_request(GPIO_FN_LRESET, NULL);
-	gpio_request(GPIO_FN_LCLK, NULL);
-	gpio_request(GPIO_FN_LGPIO7, NULL);
-	gpio_request(GPIO_FN_LGPIO6, NULL);
-	gpio_request(GPIO_FN_LGPIO5, NULL);
-	gpio_request(GPIO_FN_LGPIO4, NULL);
-
-	/* SPI1 (PTH) */
-	gpio_request(GPIO_FN_SP1_MOSI, NULL);
-	gpio_request(GPIO_FN_SP1_MISO, NULL);
-	gpio_request(GPIO_FN_SP1_SCK, NULL);
-	gpio_request(GPIO_FN_SP1_SCK_FB, NULL);
-	gpio_request(GPIO_FN_SP1_SS0, NULL);
-	gpio_request(GPIO_FN_SP1_SS1, NULL);
-
-	/* SDHI (PTI) */
-	gpio_request(GPIO_FN_SD_WP, NULL);
-	gpio_request(GPIO_FN_SD_CD, NULL);
-	gpio_request(GPIO_FN_SD_CLK, NULL);
-	gpio_request(GPIO_FN_SD_CMD, NULL);
-	gpio_request(GPIO_FN_SD_D3, NULL);
-	gpio_request(GPIO_FN_SD_D2, NULL);
-	gpio_request(GPIO_FN_SD_D1, NULL);
-	gpio_request(GPIO_FN_SD_D0, NULL);
-
-	/* SCIF3/4 (PTJ, PTW) */
-	gpio_request(GPIO_FN_RTS3, NULL);
-	gpio_request(GPIO_FN_CTS3, NULL);
-	gpio_request(GPIO_FN_TXD3, NULL);
-	gpio_request(GPIO_FN_RXD3, NULL);
-	gpio_request(GPIO_FN_RTS4, NULL);
-	gpio_request(GPIO_FN_RXD4, NULL);
-	gpio_request(GPIO_FN_TXD4, NULL);
-	gpio_request(GPIO_FN_CTS4, NULL);
-
-	/* SERMUX (PTK, PTL, PTO, PTV) */
-	gpio_request(GPIO_FN_COM2_TXD, NULL);
-	gpio_request(GPIO_FN_COM2_RXD, NULL);
-	gpio_request(GPIO_FN_COM2_RTS, NULL);
-	gpio_request(GPIO_FN_COM2_CTS, NULL);
-	gpio_request(GPIO_FN_COM2_DTR, NULL);
-	gpio_request(GPIO_FN_COM2_DSR, NULL);
-	gpio_request(GPIO_FN_COM2_DCD, NULL);
-	gpio_request(GPIO_FN_COM2_RI, NULL);
-	gpio_request(GPIO_FN_RAC_RXD, NULL);
-	gpio_request(GPIO_FN_RAC_RTS, NULL);
-	gpio_request(GPIO_FN_RAC_CTS, NULL);
-	gpio_request(GPIO_FN_RAC_DTR, NULL);
-	gpio_request(GPIO_FN_RAC_DSR, NULL);
-	gpio_request(GPIO_FN_RAC_DCD, NULL);
-	gpio_request(GPIO_FN_RAC_TXD, NULL);
-	gpio_request(GPIO_FN_COM1_TXD, NULL);
-	gpio_request(GPIO_FN_COM1_RXD, NULL);
-	gpio_request(GPIO_FN_COM1_RTS, NULL);
-	gpio_request(GPIO_FN_COM1_CTS, NULL);
-
-	writeb(0x10, 0xfe470000);	/* SMR0: SerMux mode 0 */
-
-	/* IIC (PTM, PTR, PTS) */
-	gpio_request(GPIO_FN_SDA7, NULL);
-	gpio_request(GPIO_FN_SCL7, NULL);
-	gpio_request(GPIO_FN_SDA6, NULL);
-	gpio_request(GPIO_FN_SCL6, NULL);
-	gpio_request(GPIO_FN_SDA5, NULL);
-	gpio_request(GPIO_FN_SCL5, NULL);
-	gpio_request(GPIO_FN_SDA4, NULL);
-	gpio_request(GPIO_FN_SCL4, NULL);
-	gpio_request(GPIO_FN_SDA3, NULL);
-	gpio_request(GPIO_FN_SCL3, NULL);
-	gpio_request(GPIO_FN_SDA2, NULL);
-	gpio_request(GPIO_FN_SCL2, NULL);
-	gpio_request(GPIO_FN_SDA1, NULL);
-	gpio_request(GPIO_FN_SCL1, NULL);
-	gpio_request(GPIO_FN_SDA0, NULL);
-	gpio_request(GPIO_FN_SCL0, NULL);
-
-	/* USB (PTN) */
-	gpio_request(GPIO_FN_VBUS_EN, NULL);
-	gpio_request(GPIO_FN_VBUS_OC, NULL);
-
-	/* SGPIO1/0 (PTN, PTO) */
-	gpio_request(GPIO_FN_SGPIO1_CLK, NULL);
-	gpio_request(GPIO_FN_SGPIO1_LOAD, NULL);
-	gpio_request(GPIO_FN_SGPIO1_DI, NULL);
-	gpio_request(GPIO_FN_SGPIO1_DO, NULL);
-	gpio_request(GPIO_FN_SGPIO0_CLK, NULL);
-	gpio_request(GPIO_FN_SGPIO0_LOAD, NULL);
-	gpio_request(GPIO_FN_SGPIO0_DI, NULL);
-	gpio_request(GPIO_FN_SGPIO0_DO, NULL);
-
-	/* WDT (PTN) */
-	gpio_request(GPIO_FN_SUB_CLKIN, NULL);
-
-	/* System (PTT) */
-	gpio_request(GPIO_FN_STATUS1, NULL);
-	gpio_request(GPIO_FN_STATUS0, NULL);
-
-	/* PWMX (PTT) */
-	gpio_request(GPIO_FN_PWMX1, NULL);
-	gpio_request(GPIO_FN_PWMX0, NULL);
-
-	/* R-SPI (PTV) */
-	gpio_request(GPIO_FN_R_SPI_MOSI, NULL);
-	gpio_request(GPIO_FN_R_SPI_MISO, NULL);
-	gpio_request(GPIO_FN_R_SPI_RSPCK, NULL);
-	gpio_request(GPIO_FN_R_SPI_SSL0, NULL);
-	gpio_request(GPIO_FN_R_SPI_SSL1, NULL);
-
-	/* EVC (PTV, PTW) */
-	gpio_request(GPIO_FN_EVENT7, NULL);
-	gpio_request(GPIO_FN_EVENT6, NULL);
-	gpio_request(GPIO_FN_EVENT5, NULL);
-	gpio_request(GPIO_FN_EVENT4, NULL);
-	gpio_request(GPIO_FN_EVENT3, NULL);
-	gpio_request(GPIO_FN_EVENT2, NULL);
-	gpio_request(GPIO_FN_EVENT1, NULL);
-	gpio_request(GPIO_FN_EVENT0, NULL);
-
-	/* LED for heartbeat */
-	gpio_request(GPIO_PTU3, NULL);
-	gpio_direction_output(GPIO_PTU3, 1);
-	gpio_request(GPIO_PTU2, NULL);
-	gpio_direction_output(GPIO_PTU2, 1);
-	gpio_request(GPIO_PTU1, NULL);
-	gpio_direction_output(GPIO_PTU1, 1);
-	gpio_request(GPIO_PTU0, NULL);
-	gpio_direction_output(GPIO_PTU0, 1);
-
-	/* control for MDIO of Gigabit Ethernet */
-	gpio_request(GPIO_PTT4, NULL);
-	gpio_direction_output(GPIO_PTT4, 1);
-
-	/* control for eMMC */
-	gpio_request(GPIO_PTT7, NULL);		/* eMMC_RST# */
-	gpio_direction_output(GPIO_PTT7, 0);
-	gpio_request(GPIO_PTT6, NULL);		/* eMMC_INDEX# */
-	gpio_direction_output(GPIO_PTT6, 0);
-	gpio_request(GPIO_PTT5, NULL);		/* eMMC_PRST# */
-	gpio_direction_output(GPIO_PTT5, 1);
-
-	/* register SPI device information */
-	spi_register_board_info(spi_board_info,
-				ARRAY_SIZE(spi_board_info));
-
-	/* General platform */
-	return platform_add_devices(sh7757lcr_devices,
-				    ARRAY_SIZE(sh7757lcr_devices));
-}
-arch_initcall(sh7757lcr_devices_setup);
-
-/* Initialize IRQ setting */
-void __init init_sh7757lcr_IRQ(void)
-{
-	plat_irq_setup_pins(IRQ_MODE_IRQ7654);
-	plat_irq_setup_pins(IRQ_MODE_IRQ3210);
-}
-
-/* Initialize the board */
-static void __init sh7757lcr_setup(char **cmdline_p)
-{
-	printk(KERN_INFO "Renesas R0P7757LC0012RL support.\n");
-}
-
-static int sh7757lcr_mode_pins(void)
-{
-	int value = 0;
-
-	/* These are the factory default settings of S3 (Low active).
-	 * If you change these dip switches then you will need to
-	 * adjust the values below as well.
+#define V4L2_MAP_COLORSPACE_DEFAULT(is_sdtv, is_hdtv) \
+	((is_sdtv) ? V4L2_COLORSPACE_SMPTE170M : \
+	 ((is_hdtv) ? V4L2_COLORSPACE_REC709 : V4L2_COLORSPACE_SRGB))
+
+enum v4l2_xfer_func {
+	/*
+	 * Mapping of V4L2_XFER_FUNC_DEFAULT to actual transfer functions
+	 * for the various colorspaces:
+	 *
+	 * V4L2_COLORSPACE_SMPTE170M, V4L2_COLORSPACE_470_SYSTEM_M,
+	 * V4L2_COLORSPACE_470_SYSTEM_BG, V4L2_COLORSPACE_REC709 and
+	 * V4L2_COLORSPACE_BT2020: V4L2_XFER_FUNC_709
+	 *
+	 * V4L2_COLORSPACE_SRGB, V4L2_COLORSPACE_JPEG: V4L2_XFER_FUNC_SRGB
+	 *
+	 * V4L2_COLORSPACE_ADOBERGB: V4L2_XFER_FUNC_ADOBERGB
+	 *
+	 * V4L2_COLORSPACE_SMPTE240M: V4L2_XFER_FUNC_SMPTE240M
+	 *
+	 * V4L2_COLORSPACE_RAW: V4L2_XFER_FUNC_NONE
+	 *
+	 * V4L2_COLORSPACE_DCI_P3: V4L2_XFER_FUNC_DCI_P3
 	 */
-	value |= MODE_PIN0;	/* Clock Mode: 1 */
-
-	return value;
-}
-
-/* The Machine Vector */
-static struct sh_machine_vector mv_sh7757lcr __initmv = {
-	.mv_name		= "SH7757LCR",
-	.mv_setup		= sh7757lcr_setup,
-	.mv_init_irq		= init_sh7757lcr_IRQ,
-	.mv_mode_pins		= sh7757lcr_mode_pins,
+	V4L2_XFER_FUNC_DEFAULT     = 0,
+	V4L2_XFER_FUNC_709         = 1,
+	V4L2_XFER_FUNC_SRGB        = 2,
+	V4L2_XFER_FUNC_ADOBERGB    = 3,
+	V4L2_XFER_FUNC_SMPTE240M   = 4,
+	V4L2_XFER_FUNC_NONE        = 5,
+	V4L2_XFER_FUNC_DCI_P3      = 6,
+	V4L2_XFER_FUNC_SMPTE2084   = 7,
 };
 
+/*
+ * Determine how XFER_FUNC_DEFAULT should map to a proper transfer function.
+ * This depends on the colorspace.
+ */
+#define V4L2_MAP_XFER_FUNC_DEFAULT(colsp) \
+	((colsp) == V4L2_COLORSPACE_ADOBERGB ? V4L2_XFER_FUNC_ADOBERGB : \
+	 ((colsp) == V4L2_COLORSPACE_SMPTE240M ? V4L2_XFER_FUNC_SMPTE240M : \
+	  ((colsp) == V4L2_COLORSPACE_DCI_P3 ? V4L2_XFER_FUNC_DCI_P3 : \
+	   ((colsp) == V4L2_COLORSPACE_RAW ? V4L2_XFER_FUNC_NONE : \
+	    ((colsp) == V4L2_COLORSPACE_SRGB || (colsp) == V4L2_COLORSPACE_JPEG ? \
+	     V4L2_XFER_FUNC_SRGB : V4L2_XFER_FUNC_709)))))
+
+enum v4l2_ycbcr_encoding {
+	/*
+	 * Mapping of V4L2_YCBCR_ENC_DEFAULT to actual encodings for the
+	 * various colorspaces:
+	 *
+	 * V4L2_COLORSPACE_SMPTE170M, V4L2_COLORSPACE_470_SYSTEM_M,
+	 * V4L2_COLORSPACE_470_SYSTEM_BG, V4L2_COLORSPACE_ADOBERGB and
+	 * V4L2_COLORSPACE_JPEG: V4L2_YCBCR_ENC_601
+	 *
+	 * V4L2_COLORSPACE_REC709 and V4L2_COLORSPACE_DCI_P3: V4L2_YCBCR_ENC_709
+	 *
+	 * V4L2_COLORSPACE_SRGB: V4L2_YCBCR_ENC_SYCC
+	 *
+	 * V4L2_COLORSPACE_BT2020: V4L2_YCBCR_ENC_BT2020
+	 *
+	 * V4L2_COLORSPACE_SMPTE240M: V4L2_YCBCR_ENC_SMPTE240M
+	 */
+	V4L2_YCBCR_ENC_DEFAULT        = 0,
+
+	/* ITU-R 601 -- SDTV */
+	V4L2_YCBCR_ENC_601            = 1,
+
+	/* Rec. 709 -- HDTV */
+	V4L2_YCBCR_ENC_709            = 2,
+
+	/* ITU-R 601/EN 61966-2-4 Extended Gamut -- SDTV */
+	V4L2_YCBCR_ENC_XV601          = 3,
+
+	/* Rec. 709/EN 61966-2-4 Extended Gamut -- HDTV */
+	V4L2_YCBCR_ENC_XV709          = 4,
+
+	/* sYCC (Y'CbCr encoding of sRGB) */
+	V4L2_YCBCR_ENC_SYCC           = 5,
+
+	/* BT.2020 Non-constant Luminance Y'CbCr */
+	V4L2_YCBCR_ENC_BT2020         = 6,
+
+	/* BT.2020 Constant Luminance Y'CbcCrc */
+	V4L2_YCBCR_ENC_BT2020_CONST_LUM = 7,
+
+	/* SMPTE 240M -- Obsolete HDTV */
+	V4L2_YCBCR_ENC_SMPTE240M      = 8,
+};
+
+/*
+ * Determine how YCBCR_ENC_DEFAULT should map to a proper Y'CbCr encoding.
+ * This depends on the colorspace.
+ */
+#define V4L2_MAP_YCBCR_ENC_DEFAULT(colsp) \
+	(((colsp) == V4L2_COLORSPACE_REC709 || \
+	  (colsp) == V4L2_COLORSPACE_DCI_P3) ? V4L2_YCBCR_ENC_709 : \
+	 ((colsp) == V4L2_COLORSPACE_BT2020 ? V4L2_YCBCR_ENC_BT2020 : \
+	  ((colsp) == V4L2_COLORSPACE_SMPTE240M ? V4L2_YCBCR_ENC_SMPTE240M : \
+	   V4L2_YCBCR_ENC_601)))
+
+enum v4l2_quantization {
+	/*
+	 * The default for R'G'B' quantization is always full range, except
+	 * for the BT2020 colorspace. For Y'CbCr the quantization is always
+	 * limited range, except for COLORSPACE_JPEG, SYCC, XV601 or XV709:
+	 * those are full range.
+	 */
+	V4L2_QUANTIZATION_DEFAULT     = 0,
+	V4L2_QUANTIZATION_FULL_RANGE  = 1,
+	V4L2_QUANTIZATION_LIM_RANGE   = 2,
+};
+
+/*
+ * Determine how QUANTIZATION_DEFAULT should map to a proper quantization.
+ * This depends on whether the image is RGB or not, the colorspace and the
+ * Y'CbCr encoding.
+ */
+#define V4L2_MAP_QUANTIZATION_DEFAULT(is_rgb, colsp, ycbcr_enc) \
+	(((is_rgb) && (colsp) == V4L2_COLORSPACE_BT2020) ? V4L2_QUANTIZATION_LIM_RANGE : \
+	 (((is_rgb) || (ycbcr_enc) == V4L2_YCBCR_ENC_XV601 || \
+	  (ycbcr_enc) == V4L2_YCBCR_ENC_XV709 || (colsp) == V4L2_COLORSPACE_JPEG) ? \
+	 V4L2_QUANTIZATION_FULL_RANGE : V4L2_QUANTIZATION_LIM_RANGE))
+
+enum v4l2_priority {
+	V4L2_PRIORITY_UNSET       = 0,  /* not initialized */
+	V4L2_PRIORITY_BACKGROUND  = 1,
+	V4L2_PRIORITY_INTERACTIVE = 2,
+	V4L2_PRIORITY_RECORD      = 3,
+	V4L2_PRIORITY_DEFAULT     = V4L2_PRIORITY_INTERACTIVE,
+};
+
+struct v4l2_rect {
+	__s32   left;
+	__s32   top;
+	__u32   width;
+	__u32   height;
+};
+
+struct v4l2_fract {
+	__u32   numerator;
+	__u32   denominator;
+};
+
+/**
+  * struct v4l2_capability - Describes V4L2 device caps returned by VIDIOC_QUERYCAP
+  *
+  * @driver:	   name of the driver module (e.g. "bttv")
+  * @card:	   name of the card (e.g. "Hauppauge WinTV")
+  * @bus_info:	   name of the bus (e.g. "PCI:" + pci_name(pci_dev) )
+  * @version:	   KERNEL_VERSION
+  * @capabilities: capabilities of the physical device as a whole
+  * @device_caps:  capabilities accessed via this particular device (node)
+  * @reserved:	   reserved fields for future extensions
+  */
+struct v4l2_capability {
+	__u8	driver[16];
+	__u8	card[32];
+	__u8	bus_info[32];
+	__u32   version;
+	__u32	capabilities;
+	__u32	device_caps;
+	__u32	reserved[3];
+};
+
+/* Values for 'capabilities' field */
+#define V4L2_CAP_VIDEO_CAPTURE		0x00000001  /* Is a video capture device */
+#define V4L2_CAP_VIDEO_OUTPUT		0x00000002  /* Is a video output device */
+#define V4L2_CAP_VIDEO_OVERLAY		0x00000004  /* Can do video overlay */
+#define V4L2_CAP_VBI_CAPTURE		0x00000010  /* Is a raw VBI capture device */
+#define V4L2_CAP_VBI_OUTPUT		0x00000020  /* Is a raw VBI output device */
+#define V4L2_CAP_SLICED_VBI_CAPTURE	0x00000040  /* Is a sliced VBI capture device */
+#define V4L2_CAP_SLICED_VBI_OUTPUT	0x00000080  /* Is a sliced VBI output device */
+#define V4L2_CAP_RDS_CAPTURE		0x00000100  /* RDS data capture */
+#define V4L2_CAP_VIDEO_OUTPUT_OVERLAY	0x00000200  /* Can do video output overlay */
+#define V4L2_CAP_HW_FREQ_SEEK		0x00000400  /* Can do hardware frequency seek  */
+#define V4L2_CAP_RDS_OUTPUT		0x00000800  /* Is an RDS encoder */
+
+/* Is a video capture device that supports multiplanar formats */
+#define V4L2_CAP_VIDEO_CAPTURE_MPLANE	0x00001000
+/* Is a video output device that supports multiplanar formats */
+#define V4L2_CAP_VIDEO_OUTPUT_MPLANE	0x00002000
+/* Is a video mem-to-mem device that supports multiplanar formats */
+#define V4L2_CAP_VIDEO_M2M_MPLANE	0x00004000
+/* Is a video mem-to-mem device */
+#define V4L2_CAP_VIDEO_M2M		0x00008000
+
+#define V4L2_CAP_TUNER			0x00010000  /* has a tuner */
+#define V4L2_CAP_AUDIO			0x00020000  /* has audio support */
+#define V4L2_CAP_RADIO			0x00040000  /* is a radio device */
+#define V4L2_CAP_MODULATOR		0x00080000  /* has a modulator */
+
+#define V4L2_CAP_SDR_CAPTURE		0x00100000  /* Is a SDR capture device */
+#define V4L2_CAP_EXT_PIX_FORMAT		0x00200000  /* Supports the extended pixel format */
+#define V4L2_CAP_SDR_OUTPUT		0x00400000  /* Is a SDR output device */
+
+#define V4L2_CAP_READWRITE              0x01000000  /* read/write systemcalls */
+#define V4L2_CAP_ASYNCIO                0x02000000  /* async I/O */
+#define V4L2_CAP_STREAMING              0x04000000  /* streaming I/O ioctls */
+
+#define V4L2_CAP_DEVICE_CAPS            0x80000000  /* sets device capabilities field */
+
+/*
+ *	V I D E O   I M A G E   F O R M A T
+ */
+struct v4l2_pix_format {
+	__u32         		width;
+	__u32			height;
+	__u32			pixelformat;
+	__u32			field;		/* enum v4l2_field */
+	__u32            	bytesperline;	/* for padding, zero if unused */
+	__u32          		sizeimage;
+	__u32			colorspace;	/* enum v4l2_colorspace */
+	__u32			priv;		/* private data, depends on pixelformat */
+	__u32			flags;		/* format flags (V4L2_PIX_FMT_FLAG_*) */
+	__u32			ycbcr_enc;	/* enum v4l2_ycbcr_encoding */
+	__u32			quantization;	/* enum v4l2_quantization */
+	__u32			xfer_func;	/* enum v4l2_xfer_func */
+};
+
+/*      Pixel format         FOURCC                          depth  Description  */
+
+/* RGB formats */
+#define V4L2_PIX_FMT_RGB332  v4l2_fourcc('R', 'G', 'B', '1') /*  8  RGB-3-3-2     */
+#define V4L2_PIX_FMT_RGB444  v4l2_fourcc('R', '4', '4', '4') /* 16  xxxxrrrr ggggbbbb */
+#define V4L2_PIX_FMT_ARGB444 v4l2_fourcc('A', 'R', '1', '2') /* 16  aaaarrrr ggggbbbb */
+#define V4L2_PIX_FMT_XRGB444 v4l2_fourcc('X', 'R', '1', '2') /* 16  xxxxrrrr ggggbbbb */
+#define V4L2_PIX_FMT_RGB555  v4l2_fourcc('R', 'G', 'B', 'O') /* 16  RGB-5-5-5     */
+#define V4L2_PIX_FMT_ARGB555 v4l2_fourcc('A', 'R', '1', '5') /* 16  ARGB-1-5-5-5  */
+#define V4L2_PIX_FMT_XRGB555 v4l2_fourcc('X', 'R', '1', '5') /* 16  XRGB-1-5-5-5  */
+#define V4L2_PIX_FMT_RGB565  v4l2_fourcc('R', 'G', 'B', 'P') /* 16  RGB-5-6-5     */
+#define V4L2_PIX_FMT_RGB555X v4l2_fourcc('R', 'G', 'B', 'Q') /* 16  RGB-5-5-5 BE  */
+#define V4L2_PIX_FMT_ARGB555X v4l2_fourcc_be('A', 'R', '1', '5') /* 16  ARGB-5-5-5 BE */
+#define V4L2_PIX_FMT_XRGB555X v4l2_fourcc_be('X', 'R', '1', '5') /* 16  XRGB-5-5-5 BE */
+#define V4L2_PIX_FMT_RGB565X v4l2_fourcc('R', 'G', 'B', 'R') /* 16  RGB-5-6-5 BE  */
+#define V4L2_PIX_FMT_BGR666  v4l2_fourcc('B', 'G', 'R', 'H') /* 18  BGR-6-6-6	  */
+#define V4L2_PIX_FMT_BGR24   v4l2_fourcc('B', 'G', 'R', '3') /* 24  BGR-8-8-8     */
+#define V4L2_PIX_FMT_RGB24   v4l2_fourcc('R', 'G', 'B', '3') /* 24  RGB-8-8-8     */
+#define V4L2_PIX_FMT_BGR32   v4l2_fourcc('B', 'G', 'R', '4') /* 32  BGR-8-8-8-8   */
+#define V4L2_PIX_FMT_ABGR32  v4l2_fourcc('A', 'R', '2', '4') /* 32  BGRA-8-8-8-8  */
+#define V4L2_PIX_FMT_XBGR32  v4l2_fourcc('X', 'R', '2', '4') /* 32  BGRX-8-8-8-8  */
+#define V4L2_PIX_FMT_RGB32   v4l2_fourcc('R', 'G', 'B', '4') /* 32  RGB-8-8-8-8   */
+#define V4L2_PIX_FMT_ARGB32  v4l2_fourcc('B', 'A', '2', '4') /* 32  ARGB-8-8-8-8  */
+#define V4L2_PIX_FMT_XRGB32  v4l2_fourcc('B', 'X', '2', '4') /* 32  XRGB-8-8-8-8  */
+
+/* Grey formats */
+#define V4L2_PIX_FMT_GREY    v4l2_fourcc('G', 'R', 'E', 'Y') /*  8  Greyscale     */
+#define V4L2_PIX_FMT_Y4      v4l2_fourcc('Y', '0', '4', ' ') /*  4  Greyscale     */
+#define V4L2_PIX_FMT_Y6      v4l2_fourcc('Y', '0', '6', ' ') /*  6  Greyscale     */
+#define V4L2_PIX_FMT_Y10     v4l2_fourcc('Y', '1', '0', ' ') /* 10  Greyscale     */
+#define V4L2_PIX_FMT_Y12     v4l2_fourcc('Y', '1', '2', ' ') /* 12  Greyscale     */
+#define V4L2_PIX_FMT_Y16     v4l2_fourcc('Y', '1', '6', ' ') /* 16  Greyscale     */
+#define V4L2_PIX_FMT_Y16_BE  v4l2_fourcc_be('Y', '1', '6', ' ') /* 16  Greyscale BE  */
+
+/* Grey bit-packed formats */
+#define V4L2_PIX_FMT_Y10BPACK    v4l2_fourcc('Y', '1', '0', 'B') /* 10  Greyscale bit-packed */
+
+/* Palette formats */
+#define V4L2_PIX_FMT_PAL8    v4l2_fourcc('P', 'A', 'L', '8') /*  8  8-bit palette */
+
+/* Chrominance formats */
+#define V4L2_PIX_FMT_UV8     v4l2_fourcc('U', 'V', '8', ' ') /*  8  UV 4:4 */
+
+/* Luminance+Chrominance formats */
+#define V4L2_PIX_FMT_YVU410  v4l2_fourcc('Y', 'V', 'U', '9') /*  9  YVU 4:1:0     */
+#define V4L2_PIX_FMT_YVU420  v4l2_fourcc('Y', 'V', '1', '2') /* 12  YVU 4:2:0     */
+#define V4L2_PIX_FMT_YUYV    v4l2_fourcc('Y', 'U', 'Y', 'V') /* 16  YUV 4:2:2     */
+#define V4L2_PIX_FMT_YYUV    v4l2_fourcc('Y', 'Y', 'U', 'V') /* 16  YUV 4:2:2     */
+#define V4L2_PIX_FMT_YVYU    v4l2_fourcc('Y', 'V', 'Y', 'U') /* 16 YVU 4:2:2 */
+#define V4L2_PIX_FMT_UYVY    v4l2_fourcc('U', 'Y', 'V', 'Y') /* 16  YUV 4:2:2     */
+#define V4L2_PIX_FMT_VYUY    v4l2_fourcc('V', 'Y', 'U', 'Y') /* 16  YUV 4:2:2     */
+#define V4L2_PIX_FMT_YUV422P v4l2_fourcc('4', '2', '2', 'P') /* 16  YVU422 planar */
+#define V4L2_PIX_FMT_YUV411P v4l2_fourcc('4', '1', '1', 'P') /* 16  YVU411 planar */
+#define V4L2_PIX_FMT_Y41P    v4l2_fourcc('Y', '4', '1', 'P') /* 12  YUV 4:1:1     */
+#define V4L2_PIX_FMT_YUV444  v4l2_fourcc('Y', '4', '4', '4') /* 16  xxxxyyyy uuuuvvvv */
+#define V4L2_PIX_FMT_YUV555  v4l2_fourcc('Y', 'U', 'V', 'O') /* 16  YUV-5-5-5     */
+#define V4L2_PIX_FMT_YUV565  v4l2_fourcc('Y', 'U', 'V', 'P') /* 16  YUV-5-6-5     */
+#define V4L2_PIX_FMT_YUV32   v4l2_fourcc('Y', 'U', 'V', '4') /* 32  YUV-8-8-8-8   */
+#define V4L2_PIX_FMT_YUV410  v4l2_fourcc('Y', 'U', 'V', '9') /*  9  YUV 4:1:0     */
+#define V4L2_PIX_FMT_YUV420  v4l2_fourcc('Y', 'U', '1', '2') /* 12  YUV 4:2:0     */
+#define V4L2_PIX_FMT_HI240   v4l2_fourcc('H', 'I', '2', '4') /*  8  8-bit color   */
+#define V4L2_PIX_FMT_HM12    v4l2_fourcc('H', 'M', '1', '2') /*  8  YUV 4:2:0 16x16 macroblocks */
+#define V4L2_PIX_FMT_M420    v4l2_fourcc('M', '4', '2', '0') /* 12  YUV 4:2:0 2 lines y, 1 line uv interleaved */
+
+/* two planes -- one Y, one Cr + Cb interleaved  */
+#define V4L2_PIX_FMT_NV12    v4l2_fourcc('N', 'V', '1', '2') /* 12  Y/CbCr 4:2:0  */
+#define V4L2_PIX_FMT_NV21    v4l2_fourcc('N', 'V', '2', '1') /* 12  Y/CrCb 4:2:0  */
+#define V4L2_PIX_FMT_NV16    v4l2_fourcc('N', 'V', '1', '6') /* 16  Y/CbCr 4:2:2  */
+#define V4L2_PIX_FMT_NV61    v4l2_fourcc('N', 'V', '6', '1') /* 16  Y/CrCb 4:2:2  */
+#define V4L2_PIX_FMT_NV24    v4l2_fourcc('N', 'V', '2', '4') /* 24  Y/CbCr 4:4:4  */
+#define V4L2_PIX_FMT_NV42    v4l2_fourcc('N', 'V', '4', '2') /* 24  Y/CrCb 4:4:4  */
+
+/* two non contiguous planes - one Y, one Cr + Cb interleaved  */
+#define V4L2_PIX_FMT_NV12M   v4l2_fourcc('N', 'M', '1', '2') /* 12  Y/CbCr 4:2:0  */
+#define V4L2_PIX_FMT_NV21M   v4l2_fourcc('N', 'M', '2', '1') /* 21  Y/CrCb 4:2:0  */
+#define V4L2_PIX_FMT_NV16M   v4l2_fourcc('N', 'M', '1', '6') /* 16  Y/CbCr 4:2:2  */
+#define V4L2_PIX_FMT_NV61M   v4l2_fourcc('N', 'M', '6', '1') /* 16  Y/CrCb 4:2:2  */
+#define V4L2_PIX_FMT_NV12MT  v4l2_fourcc('T', 'M', '1', '2') /* 12  Y/CbCr 4:2:0 64x32 macroblocks */
+#define V4L2_PIX_FMT_NV12MT_16X16 v4l2_fourcc('V', 'M', '1', '2') /* 12  Y/CbCr 4:2:0 16x16 macroblocks */
+
+/* three non contiguous planes - Y, Cb, Cr */
+#define V4L2_PIX_FMT_YUV420M v4l2_fourcc('Y', 'M', '1', '2') /* 12  YUV420 planar */
+#define V4L2_PIX_FMT_YVU420M v4l2_fourcc('Y', 'M', '2', '1') /* 12  YVU420 planar */
+
+/* Bayer formats - see http://www.siliconimaging.com/RGB%20Bayer.htm */
+#define V4L2_PIX_FMT_SBGGR8  v4l2_fourcc('B', 'A', '8', '1') /*  8  BGBG.. GRGR.. */
+#define V4L2_PIX_FMT_SGBRG8  v4l2_fourcc('G', 'B', 'R', 'G') /*  8  GBGB.. RGRG.. */
+#define V4L2_PIX_FMT_SGRBG8  v4l2_fourcc('G', 'R', 'B', 'G') /*  8  GRGR.. BGBG.. */
+#define V4L2_PIX_FMT_SRGGB8  v4l2_fourcc('R', 'G', 'G', 'B') /*  8  RGRG.. GBGB.. */
+#define V4L2_PIX_FMT_SBGGR10 v4l2_fourcc('B', 'G', '1', '0') /* 10  BGBG.. GRGR.. */
+#define V4L2_PIX_FMT_SGBRG10 v4l2_fourcc('G', 'B', '1', '0') /* 10  GBGB.. RGRG.. */
+#define V4L2_PIX_FMT_SGRBG10 v4l2_fourcc('B', 'A', '1', '0') /* 10  GRGR.. BGBG.. */
+#define V4L2_PIX_FMT_SRGGB10 v4l2_fourcc('R', 'G', '1', '0') /* 10  RGRG.. GBGB.. */
+	/* 10bit raw bayer packed, 5 bytes for every 4 pixels */
+#define V4L2_PIX_FMT_SBGGR10P v4l2_fourcc('p', 'B', 'A', 'A')
+#define V4L2_PIX_FMT_SGBRG10P v4l2_fourcc('p', 'G', 'A', 'A')
+#define V4L2_PIX_FMT_SGRBG10P v4l2_fourcc('p', 'g', 'A', 'A')
+#define V4L2_PIX_FMT_SRGGB10P v4l2_fourcc('p', 'R', 'A', 'A')
+	/* 10bit raw bayer a-law compressed to 8 bits */
+#define V4L2_PIX_FMT_SBGGR10ALAW8 v4l2_fourcc('a', 'B', 'A', '8')
+#define V4L2_PIX_FMT_SGBRG10ALAW8 v4l2_fourcc('a', 'G', 'A', '8')
+#define V4L2_PIX_FMT_SGRBG10ALAW8 v4l2_fourcc('a', 'g', 'A', '8')
+#define V4L2_PIX_FMT_SRGGB10ALAW8 v4l2_fourcc('a', 'R', 'A', '8')
+	/* 10bit raw bayer DPCM compressed to 8 bits */
+#define V4L2_PIX_FMT_SBGGR10DPCM8 v4l2_fourcc('b', 'B', 'A', '8')
+#define V4L2_PIX_FMT_SGBRG10DPCM8 v4l2_fourcc('b', 'G', 'A', '8')
+#define V4L2_PIX_FMT_SGRBG10DPCM8 v4l2_fourcc('B', 'D', '1', '0')
+#define V4L2_PIX_FMT_SRGGB10DPCM8 v4l2_fourcc('b', 'R', 'A', '8')
+#define V4L2_PIX_FMT_SBGGR12 v4l2_fourcc('B', 'G', '1', '2') /* 12  BGBG.. GRGR.. */
+#define V4L2_PIX_FMT_SGBRG12 v4l2_fourcc('G', 'B', '1', '2') /* 12  GBGB.. RGRG.. */
+#define V4L2_PIX_FMT_SGRBG12 v4l2_fourcc('B', 'A', '1', '2') /* 12  GRGR.. BGBG.. */
+#define V4L2_PIX_FMT_SRGGB12 v4l2_fourcc('R', 'G', '1', '2') /* 12  RGRG.. GBGB.. */
+#define V4L2_PIX_FMT_SBGGR16 v4l2_fourcc('B', 'Y', 'R', '2') /* 16  BGBG.. GRGR.. */
+
+/* compressed formats */
+#define V4L2_PIX_FMT_MJPEG 

@@ -1,77 +1,35 @@
-/*
- * IBM ASM Service Processor Device Driver
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
- *
- * Copyright (C) IBM Corporation, 2004
- *
- * Author: Max Asböck <amax@us.ibm.com>
- *
- */
-
-#pragma pack(1)
-struct i2o_header {
-	u8	version;
-	u8	message_flags;
-	u16	message_size;
-	u8	target;
-	u8	initiator_and_target;
-	u8	initiator;
-	u8	function;
-	u32	initiator_context;
-};
-#pragma pack()
-
-#define I2O_HEADER_TEMPLATE \
-      { .version              = 0x01, \
-	.message_flags        = 0x00, \
-	.function             = 0xFF, \
-	.initiator            = 0x00, \
-	.initiator_and_target = 0x40, \
-	.target               = 0x00, \
-	.initiator_context    = 0x0 }
-
-#define I2O_MESSAGE_SIZE	0x1000
-#define I2O_COMMAND_SIZE	(I2O_MESSAGE_SIZE - sizeof(struct i2o_header))
-
-#pragma pack(1)
-struct i2o_message {
-	struct i2o_header	header;
-	void			*data;
-};
-#pragma pack()
-
-static inline unsigned short outgoing_message_size(unsigned int data_size)
-{
-	unsigned int size;
-	unsigned short i2o_size;
-
-	if (data_size > I2O_COMMAND_SIZE)
-		data_size = I2O_COMMAND_SIZE;
-
-	size = sizeof(struct i2o_header) + data_size;
-
-	i2o_size = size / sizeof(u32);
-
-	if (size % sizeof(u32))
-	       i2o_size++;
-
-	return i2o_size;
-}
-
-static inline u32 incoming_data_size(struct i2o_message *i2o_message)
-{
-	return (sizeof(u32) * i2o_message->header.message_size);
-}
+CMDET_TIME_MASK 0x600
+#define PB0_STRAP_GLB_REG2__STRAP_TX_CMDET_TIME__SHIFT 0x9
+#define PB0_STRAP_GLB_REG2__STRAP_TX_STARTUP_TIME_MASK 0x1800
+#define PB0_STRAP_GLB_REG2__STRAP_TX_STARTUP_TIME__SHIFT 0xb
+#define PB0_STRAP_GLB_REG2__STRAP_B_PCB_DIS0_MASK 0x10000000
+#define PB0_STRAP_GLB_REG2__STRAP_B_PCB_DIS0__SHIFT 0x1c
+#define PB0_STRAP_GLB_REG2__STRAP_B_PCB_DIS1_MASK 0x20000000
+#define PB0_STRAP_GLB_REG2__STRAP_B_PCB_DIS1__SHIFT 0x1d
+#define PB0_STRAP_GLB_REG2__STRAP_B_PCB_DRV_STR_MASK 0xc0000000
+#define PB0_STRAP_GLB_REG2__STRAP_B_PCB_DRV_STR__SHIFT 0x1e
+#define PB0_DFT_JIT_INJ_REG0__DFT_NUM_STEPS_MASK 0x3f
+#define PB0_DFT_JIT_INJ_REG0__DFT_NUM_STEPS__SHIFT 0x0
+#define PB0_DFT_JIT_INJ_REG0__DFT_DISABLE_ERR_MASK 0x80
+#define PB0_DFT_JIT_INJ_REG0__DFT_DISABLE_ERR__SHIFT 0x7
+#define PB0_DFT_JIT_INJ_REG0__DFT_CLK_PER_STEP_MASK 0xf00
+#define PB0_DFT_JIT_INJ_REG0__DFT_CLK_PER_STEP__SHIFT 0x8
+#define PB0_DFT_JIT_INJ_REG0__DFT_MODE_CDR_EN_MASK 0x100000
+#define PB0_DFT_JIT_INJ_REG0__DFT_MODE_CDR_EN__SHIFT 0x14
+#define PB0_DFT_JIT_INJ_REG0__DFT_EN_RECOVERY_MASK 0x200000
+#define PB0_DFT_JIT_INJ_REG0__DFT_EN_RECOVERY__SHIFT 0x15
+#define PB0_DFT_JIT_INJ_REG0__DFT_INCR_SWP_EN_MASK 0x400000
+#define PB0_DFT_JIT_INJ_REG0__DFT_INCR_SWP_EN__SHIFT 0x16
+#define PB0_DFT_JIT_INJ_REG0__DFT_DECR_SWP_EN_MASK 0x800000
+#define PB0_DFT_JIT_INJ_REG0__DFT_DECR_SWP_EN__SHIFT 0x17
+#define PB0_DFT_JIT_INJ_REG0__DFT_RECOVERY_TIME_MASK 0xff000000
+#define PB0_DFT_JIT_INJ_REG0__DFT_RECOVERY_TIME__SHIFT 0x18
+#define PB0_DFT_JIT_INJ_REG1__DFT_BYPASS_VALUE_MASK 0xff
+#define PB0_DFT_JIT_INJ_REG1__DFT_BYPASS_VALUE__SHIFT 0x0
+#define PB0_DFT_JIT_INJ_REG1__DFT_BYPASS_EN_MASK 0x100
+#define PB0_DFT_JIT_INJ_REG1__DFT_BYPASS_EN__SHIFT 0x8
+#define PB0_DFT_JIT_INJ_REG1__DFT_BLOCK_EN_MASK 0x10000
+#define PB0_DFT_JIT_INJ_REG1__DFT_BLOCK_EN__SHIFT 0x10
+#define PB0_DFT_JIT_INJ_REG1__DFT_NUM_OF_TESTS_MASK 0xe0000
+#define PB0_DFT_JIT_INJ_REG1__DFT_NUM_OF_TESTS__SHIFT 0x11
+#define PB0_DFT_JIT_INJ_REG1__DFT_CHECK_TIM

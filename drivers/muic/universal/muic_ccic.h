@@ -1,13 +1,11 @@
-#ifndef _MUIC_CCIC_
-#define _MUIC_CCIC_
-
-extern int get_ccic_info(void);
-extern int muic_handle_ccic_supported_dev(muic_data_t *pmuic, muic_attached_dev_t new_dev);
-extern int muic_is_ccic_supported_dev(muic_data_t *pmuic, muic_attached_dev_t new_dev);
-extern int muic_is_ccic_supported_jig(muic_data_t *pmuic, muic_attached_dev_t new_dev);
-extern void muic_register_ccic_notifier(muic_data_t *pmuic);
-extern int mdev_continue_for_TA_USB(muic_data_t *pmuic, int mdev);
-extern int muic_get_current_legacy_dev(muic_data_t *pmuic);
-extern void muic_set_legacy_dev(muic_data_t *pmuic, int new_dev);
-
-#endif
+__SHIFT 0x10
+#define DPM_TABLE_143__GraphicsLevel_4_UpHyst_MASK 0xff000000
+#define DPM_TABLE_143__GraphicsLevel_4_UpHyst__SHIFT 0x18
+#define DPM_TABLE_144__GraphicsLevel_4_padding_2_MASK 0xff
+#define DPM_TABLE_144__GraphicsLevel_4_padding_2__SHIFT 0x0
+#define DPM_TABLE_144__GraphicsLevel_4_padding_1_MASK 0xff00
+#define DPM_TABLE_144__GraphicsLevel_4_padding_1__SHIFT 0x8
+#define DPM_TABLE_144__GraphicsLevel_4_padding_0_MASK 0xff0000
+#define DPM_TABLE_144__GraphicsLevel_4_padding_0__SHIFT 0x10
+#define DPM_TABLE_144__GraphicsLevel_4_DeepSleepDivId_MASK 0xff000000
+#define DPM_TABLE_144__GraphicsLevel

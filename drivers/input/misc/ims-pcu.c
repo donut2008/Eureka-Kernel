@@ -1,1493 +1,526 @@
+NTERFACE_INFO('X', 'B', 0) },	/* X-Box USB-IF not approved class */
+	XPAD_XBOX360_VENDOR(0x0079),		/* GPD Win 2 Controller */
+	XPAD_XBOX360_VENDOR(0x03eb),		/* Wooting Keyboards (Legacy) */
+	XPAD_XBOX360_VENDOR(0x044f),		/* Thrustmaster X-Box 360 controllers */
+	XPAD_XBOX360_VENDOR(0x045e),		/* Microsoft X-Box 360 controllers */
+	XPAD_XBOXONE_VENDOR(0x045e),		/* Microsoft X-Box One controllers */
+	XPAD_XBOX360_VENDOR(0x046d),		/* Logitech X-Box 360 style controllers */
+	XPAD_XBOX360_VENDOR(0x056e),		/* Elecom JC-U3613M */
+	XPAD_XBOX360_VENDOR(0x06a3),		/* Saitek P3600 */
+	XPAD_XBOX360_VENDOR(0x0738),		/* Mad Catz X-Box 360 controllers */
+	{ USB_DEVICE(0x0738, 0x4540) },		/* Mad Catz Beat Pad */
+	XPAD_XBOXONE_VENDOR(0x0738),		/* Mad Catz FightStick TE 2 */
+	XPAD_XBOX360_VENDOR(0x07ff),		/* Mad Catz GamePad */
+	XPAD_XBOX360_VENDOR(0x0c12),		/* Zeroplus X-Box 360 controllers */
+	XPAD_XBOX360_VENDOR(0x0e6f),		/* 0x0e6f X-Box 360 controllers */
+	XPAD_XBOXONE_VENDOR(0x0e6f),		/* 0x0e6f X-Box One controllers */
+	XPAD_XBOX360_VENDOR(0x0f0d),		/* Hori Controllers */
+	XPAD_XBOXONE_VENDOR(0x0f0d),		/* Hori Controllers */
+	XPAD_XBOX360_VENDOR(0x1038),		/* SteelSeries Controllers */
+	XPAD_XBOX360_VENDOR(0x11c9),		/* Nacon GC100XF */
+	XPAD_XBOX360_VENDOR(0x11ff),		/* PXN V900 */
+	XPAD_XBOX360_VENDOR(0x1209),		/* Ardwiino Controllers */
+	XPAD_XBOX360_VENDOR(0x12ab),		/* X-Box 360 dance pads */
+	XPAD_XBOX360_VENDOR(0x1430),		/* RedOctane X-Box 360 controllers */
+	XPAD_XBOX360_VENDOR(0x146b),		/* BigBen Interactive Controllers */
+	XPAD_XBOX360_VENDOR(0x1532),		/* Razer Sabertooth */
+	XPAD_XBOXONE_VENDOR(0x1532),		/* Razer Wildcat */
+	XPAD_XBOX360_VENDOR(0x15e4),		/* Numark X-Box 360 controllers */
+	XPAD_XBOX360_VENDOR(0x162e),		/* Joytech X-Box 360 controllers */
+	XPAD_XBOX360_VENDOR(0x1689),		/* Razer Onza */
+	XPAD_XBOX360_VENDOR(0x1bad),		/* Harminix Rock Band Guitar and Drums */
+	XPAD_XBOX360_VENDOR(0x20d6),		/* PowerA Controllers */
+	XPAD_XBOXONE_VENDOR(0x20d6),		/* PowerA Controllers */
+	XPAD_XBOX360_VENDOR(0x24c6),		/* PowerA Controllers */
+	XPAD_XBOXONE_VENDOR(0x24c6),		/* PowerA Controllers */
+	XPAD_XBOX360_VENDOR(0x2563),		/* OneXPlayer Gamepad */
+	XPAD_XBOX360_VENDOR(0x260d),		/* Dareu H101 */
+	XPAD_XBOXONE_VENDOR(0x2dc8),		/* 8BitDo Pro 2 Wired Controller for Xbox */
+	XPAD_XBOXONE_VENDOR(0x2e24),		/* Hyperkin Duke X-Box One pad */
+	XPAD_XBOX360_VENDOR(0x2f24),		/* GameSir Controllers */
+	XPAD_XBOX360_VENDOR(0x31e3),		/* Wooting Keyboards */
+	XPAD_XBOX360_VENDOR(0x3285),		/* Nacon GC-100 */
+	{ }
+};
+
+MODULE_DEVICE_TABLE(usb, xpad_table);
+
+struct xboxone_init_packet {
+	u16 idVendor;
+	u16 idProduct;
+	const u8 *data;
+	u8 len;
+};
+
+#define XBOXONE_INIT_PKT(_vid, _pid, _data)		\
+	{						\
+		.idVendor	= (_vid),		\
+		.idProduct	= (_pid),		\
+		.data		= (_data),		\
+		.len		= ARRAY_SIZE(_data),	\
+	}
+
+
+#define GIP_WIRED_INTF_DATA 0
+#define GIP_WIRED_INTF_AUDIO 1
+
 /*
- * Driver for IMS Passenger Control Unit Devices
+ * This packet is required for all Xbox One pads with 2015
+ * or later firmware installed (or present from the factory).
+ */
+static const u8 xboxone_fw2015_init[] = {
+	0x05, 0x20, 0x00, 0x01, 0x00
+};
+
+/*
+ * This packet is required for Xbox One S (0x045e:0x02ea)
+ * and Xbox One Elite Series 2 (0x045e:0x0b00) pads to
+ * initialize the controller that was previously used in
+ * Bluetooth mode.
+ */
+static const u8 xboxone_s_init[] = {
+	0x05, 0x20, 0x00, 0x0f, 0x06
+};
+
+/*
+ * This packet is required for the Titanfall 2 Xbox One pads
+ * (0x0e6f:0x0165) to finish initialization and for Hori pads
+ * (0x0f0d:0x0067) to make the analog sticks work.
+ */
+static const u8 xboxone_hori_init[] = {
+	0x01, 0x20, 0x00, 0x09, 0x00, 0x04, 0x20, 0x3a,
+	0x00, 0x00, 0x00, 0x80, 0x00
+};
+
+/*
+ * This packet is required for most (all?) of the PDP pads to start
+ * sending input reports. These pads include: (0x0e6f:0x02ab),
+ * (0x0e6f:0x02a4), (0x0e6f:0x02a6).
+ */
+static const u8 xboxone_pdp_init1[] = {
+	0x0a, 0x20, 0x00, 0x03, 0x00, 0x01, 0x14
+};
+
+/*
+ * This packet is required for most (all?) of the PDP pads to start
+ * sending input reports. These pads include: (0x0e6f:0x02ab),
+ * (0x0e6f:0x02a4), (0x0e6f:0x02a6).
+ */
+static const u8 xboxone_pdp_init2[] = {
+	0x06, 0x20, 0x00, 0x02, 0x01, 0x00
+};
+
+/*
+ * A specific rumble packet is required for some PowerA pads to start
+ * sending input reports. One of those pads is (0x24c6:0x543a).
+ */
+static const u8 xboxone_rumblebegin_init[] = {
+	0x09, 0x00, 0x00, 0x09, 0x00, 0x0F, 0x00, 0x00,
+	0x1D, 0x1D, 0xFF, 0x00, 0x00
+};
+
+/*
+ * A rumble packet with zero FF intensity will immediately
+ * terminate the rumbling required to init PowerA pads.
+ * This should happen fast enough that the motors don't
+ * spin up to enough speed to actually vibrate the gamepad.
+ */
+static const u8 xboxone_rumbleend_init[] = {
+	0x09, 0x00, 0x00, 0x09, 0x00, 0x0F, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+/*
+ * This specifies the selection of init packets that a gamepad
+ * will be sent on init *and* the order in which they will be
+ * sent. The correct sequence number will be added when the
+ * packet is going to be sent.
+ */
+static const struct xboxone_init_packet xboxone_init_packets[] = {
+	XBOXONE_INIT_PKT(0x0e6f, 0x0165, xboxone_hori_init),
+	XBOXONE_INIT_PKT(0x0f0d, 0x0067, xboxone_hori_init),
+	XBOXONE_INIT_PKT(0x0000, 0x0000, xboxone_fw2015_init),
+	XBOXONE_INIT_PKT(0x045e, 0x02ea, xboxone_s_init),
+	XBOXONE_INIT_PKT(0x045e, 0x0b00, xboxone_s_init),
+	XBOXONE_INIT_PKT(0x0e6f, 0x0000, xboxone_pdp_init1),
+	XBOXONE_INIT_PKT(0x0e6f, 0x0000, xboxone_pdp_init2),
+	XBOXONE_INIT_PKT(0x24c6, 0x541a, xboxone_rumblebegin_init),
+	XBOXONE_INIT_PKT(0x24c6, 0x542a, xboxone_rumblebegin_init),
+	XBOXONE_INIT_PKT(0x24c6, 0x543a, xboxone_rumblebegin_init),
+	XBOXONE_INIT_PKT(0x24c6, 0x541a, xboxone_rumbleend_init),
+	XBOXONE_INIT_PKT(0x24c6, 0x542a, xboxone_rumbleend_init),
+	XBOXONE_INIT_PKT(0x24c6, 0x543a, xboxone_rumbleend_init),
+};
+
+struct xpad_output_packet {
+	u8 data[XPAD_PKT_LEN];
+	u8 len;
+	bool pending;
+};
+
+#define XPAD_OUT_CMD_IDX	0
+#define XPAD_OUT_FF_IDX		1
+#define XPAD_OUT_LED_IDX	(1 + IS_ENABLED(CONFIG_JOYSTICK_XPAD_FF))
+#define XPAD_NUM_OUT_PACKETS	(1 + \
+				 IS_ENABLED(CONFIG_JOYSTICK_XPAD_FF) + \
+				 IS_ENABLED(CONFIG_JOYSTICK_XPAD_LEDS))
+
+struct usb_xpad {
+	struct input_dev *dev;		/* input device interface */
+	struct input_dev __rcu *x360w_dev;
+	struct usb_device *udev;	/* usb device */
+	struct usb_interface *intf;	/* usb interface */
+
+	bool pad_present;
+	bool input_created;
+
+	struct urb *irq_in;		/* urb for interrupt in report */
+	unsigned char *idata;		/* input data */
+	dma_addr_t idata_dma;
+
+	struct urb *irq_out;		/* urb for interrupt out report */
+	struct usb_anchor irq_out_anchor;
+	bool irq_out_active;		/* we must not use an active URB */
+	u8 odata_serial;		/* serial number for xbox one protocol */
+	unsigned char *odata;		/* output data */
+	dma_addr_t odata_dma;
+	spinlock_t odata_lock;
+
+	struct xpad_output_packet out_packets[XPAD_NUM_OUT_PACKETS];
+	int last_out_packet;
+	int init_seq;
+
+#if defined(CONFIG_JOYSTICK_XPAD_LEDS)
+	struct xpad_led *led;
+#endif
+
+	char phys[64];			/* physical device path */
+
+	int mapping;			/* map d-pad to buttons or to axes */
+	int xtype;			/* type of xbox device */
+	int pad_nr;			/* the order x360 pads were attached */
+	const char *name;		/* name of the device */
+	struct work_struct work;	/* init/remove device from callback */
+};
+
+static int xpad_init_input(struct usb_xpad *xpad);
+static void xpad_deinit_input(struct usb_xpad *xpad);
+static void xpadone_ack_mode_report(struct usb_xpad *xpad, u8 seq_num);
+
+/*
+ *	xpad_process_packet
  *
- * Copyright (C) 2013 The IMS Company
+ *	Completes a request by converting the data into events for the
+ *	input subsystem.
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2
- * as published by the Free Software Foundation.
+ *	The used report descriptor was taken from ITO Takayukis website:
+ *	 http://euc.jp/periphs/xbox-controller.ja.html
+ */
+static void xpad_process_packet(struct usb_xpad *xpad, u16 cmd, unsigned char *data)
+{
+	struct input_dev *dev = xpad->dev;
+
+	if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
+		/* left stick */
+		input_report_abs(dev, ABS_X,
+				 (__s16) le16_to_cpup((__le16 *)(data + 12)));
+		input_report_abs(dev, ABS_Y,
+				 ~(__s16) le16_to_cpup((__le16 *)(data + 14)));
+
+		/* right stick */
+		input_report_abs(dev, ABS_RX,
+				 (__s16) le16_to_cpup((__le16 *)(data + 16)));
+		input_report_abs(dev, ABS_RY,
+				 ~(__s16) le16_to_cpup((__le16 *)(data + 18)));
+	}
+
+	/* triggers left/right */
+	if (xpad->mapping & MAP_TRIGGERS_TO_BUTTONS) {
+		input_report_key(dev, BTN_TL2, data[10]);
+		input_report_key(dev, BTN_TR2, data[11]);
+	} else {
+		input_report_abs(dev, ABS_Z, data[10]);
+		input_report_abs(dev, ABS_RZ, data[11]);
+	}
+
+	/* digital pad */
+	if (xpad->mapping & MAP_DPAD_TO_BUTTONS) {
+		/* dpad as buttons (left, right, up, down) */
+		input_report_key(dev, BTN_TRIGGER_HAPPY1, data[2] & 0x04);
+		input_report_key(dev, BTN_TRIGGER_HAPPY2, data[2] & 0x08);
+		input_report_key(dev, BTN_TRIGGER_HAPPY3, data[2] & 0x01);
+		input_report_key(dev, BTN_TRIGGER_HAPPY4, data[2] & 0x02);
+	} else {
+		input_report_abs(dev, ABS_HAT0X,
+				 !!(data[2] & 0x08) - !!(data[2] & 0x04));
+		input_report_abs(dev, ABS_HAT0Y,
+				 !!(data[2] & 0x02) - !!(data[2] & 0x01));
+	}
+
+	/* start/back buttons and stick press left/right */
+	input_report_key(dev, BTN_START,  data[2] & 0x10);
+	input_report_key(dev, BTN_SELECT, data[2] & 0x20);
+	input_report_key(dev, BTN_THUMBL, data[2] & 0x40);
+	input_report_key(dev, BTN_THUMBR, data[2] & 0x80);
+
+	/* "analog" buttons A, B, X, Y */
+	input_report_key(dev, BTN_A, data[4]);
+	input_report_key(dev, BTN_B, data[5]);
+	input_report_key(dev, BTN_X, data[6]);
+	input_report_key(dev, BTN_Y, data[7]);
+
+	/* "analog" buttons black, white */
+	input_report_key(dev, BTN_C, data[8]);
+	input_report_key(dev, BTN_Z, data[9]);
+
+	input_sync(dev);
+}
+
+/*
+ *	xpad360_process_packet
+ *
+ *	Completes a request by converting the data into events for the
+ *	input subsystem. It is version for xbox 360 controller
+ *
+ *	The used report descriptor was taken from:
+ *		http://www.free60.org/wiki/Gamepad
  */
 
-#include <linux/completion.h>
-#include <linux/device.h>
-#include <linux/firmware.h>
-#include <linux/ihex.h>
-#include <linux/input.h>
-#include <linux/kernel.h>
-#include <linux/leds.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/types.h>
-#include <linux/usb/input.h>
-#include <linux/usb/cdc.h>
-#include <asm/unaligned.h>
-
-#define IMS_PCU_KEYMAP_LEN		32
-
-struct ims_pcu_buttons {
-	struct input_dev *input;
-	char name[32];
-	char phys[32];
-	unsigned short keymap[IMS_PCU_KEYMAP_LEN];
-};
-
-struct ims_pcu_gamepad {
-	struct input_dev *input;
-	char name[32];
-	char phys[32];
-};
-
-struct ims_pcu_backlight {
-	struct led_classdev cdev;
-	struct work_struct work;
-	enum led_brightness desired_brightness;
-	char name[32];
-};
-
-#define IMS_PCU_PART_NUMBER_LEN		15
-#define IMS_PCU_SERIAL_NUMBER_LEN	8
-#define IMS_PCU_DOM_LEN			8
-#define IMS_PCU_FW_VERSION_LEN		(9 + 1)
-#define IMS_PCU_BL_VERSION_LEN		(9 + 1)
-#define IMS_PCU_BL_RESET_REASON_LEN	(2 + 1)
-
-#define IMS_PCU_PCU_B_DEVICE_ID		5
-
-#define IMS_PCU_BUF_SIZE		128
-
-struct ims_pcu {
-	struct usb_device *udev;
-	struct device *dev; /* control interface's device, used for logging */
-
-	unsigned int device_no;
-
-	bool bootloader_mode;
-
-	char part_number[IMS_PCU_PART_NUMBER_LEN];
-	char serial_number[IMS_PCU_SERIAL_NUMBER_LEN];
-	char date_of_manufacturing[IMS_PCU_DOM_LEN];
-	char fw_version[IMS_PCU_FW_VERSION_LEN];
-	char bl_version[IMS_PCU_BL_VERSION_LEN];
-	char reset_reason[IMS_PCU_BL_RESET_REASON_LEN];
-	int update_firmware_status;
-	u8 device_id;
-
-	u8 ofn_reg_addr;
-
-	struct usb_interface *ctrl_intf;
-
-	struct usb_endpoint_descriptor *ep_ctrl;
-	struct urb *urb_ctrl;
-	u8 *urb_ctrl_buf;
-	dma_addr_t ctrl_dma;
-	size_t max_ctrl_size;
-
-	struct usb_interface *data_intf;
-
-	struct usb_endpoint_descriptor *ep_in;
-	struct urb *urb_in;
-	u8 *urb_in_buf;
-	dma_addr_t read_dma;
-	size_t max_in_size;
-
-	struct usb_endpoint_descriptor *ep_out;
-	u8 *urb_out_buf;
-	size_t max_out_size;
-
-	u8 read_buf[IMS_PCU_BUF_SIZE];
-	u8 read_pos;
-	u8 check_sum;
-	bool have_stx;
-	bool have_dle;
-
-	u8 cmd_buf[IMS_PCU_BUF_SIZE];
-	u8 ack_id;
-	u8 expected_response;
-	u8 cmd_buf_len;
-	struct completion cmd_done;
-	struct mutex cmd_mutex;
-
-	u32 fw_start_addr;
-	u32 fw_end_addr;
-	struct completion async_firmware_done;
-
-	struct ims_pcu_buttons buttons;
-	struct ims_pcu_gamepad *gamepad;
-	struct ims_pcu_backlight backlight;
-
-	bool setup_complete; /* Input and LED devices have been created */
-};
-
-
-/*********************************************************************
- *             Buttons Input device support                          *
- *********************************************************************/
-
-static const unsigned short ims_pcu_keymap_1[] = {
-	[1] = KEY_ATTENDANT_OFF,
-	[2] = KEY_ATTENDANT_ON,
-	[3] = KEY_LIGHTS_TOGGLE,
-	[4] = KEY_VOLUMEUP,
-	[5] = KEY_VOLUMEDOWN,
-	[6] = KEY_INFO,
-};
-
-static const unsigned short ims_pcu_keymap_2[] = {
-	[4] = KEY_VOLUMEUP,
-	[5] = KEY_VOLUMEDOWN,
-	[6] = KEY_INFO,
-};
-
-static const unsigned short ims_pcu_keymap_3[] = {
-	[1] = KEY_HOMEPAGE,
-	[2] = KEY_ATTENDANT_TOGGLE,
-	[3] = KEY_LIGHTS_TOGGLE,
-	[4] = KEY_VOLUMEUP,
-	[5] = KEY_VOLUMEDOWN,
-	[6] = KEY_DISPLAYTOGGLE,
-	[18] = KEY_PLAYPAUSE,
-};
-
-static const unsigned short ims_pcu_keymap_4[] = {
-	[1] = KEY_ATTENDANT_OFF,
-	[2] = KEY_ATTENDANT_ON,
-	[3] = KEY_LIGHTS_TOGGLE,
-	[4] = KEY_VOLUMEUP,
-	[5] = KEY_VOLUMEDOWN,
-	[6] = KEY_INFO,
-	[18] = KEY_PLAYPAUSE,
-};
-
-static const unsigned short ims_pcu_keymap_5[] = {
-	[1] = KEY_ATTENDANT_OFF,
-	[2] = KEY_ATTENDANT_ON,
-	[3] = KEY_LIGHTS_TOGGLE,
-};
-
-struct ims_pcu_device_info {
-	const unsigned short *keymap;
-	size_t keymap_len;
-	bool has_gamepad;
-};
-
-#define IMS_PCU_DEVINFO(_n, _gamepad)				\
-	[_n] = {						\
-		.keymap = ims_pcu_keymap_##_n,			\
-		.keymap_len = ARRAY_SIZE(ims_pcu_keymap_##_n),	\
-		.has_gamepad = _gamepad,			\
-	}
-
-static const struct ims_pcu_device_info ims_pcu_device_info[] = {
-	IMS_PCU_DEVINFO(1, true),
-	IMS_PCU_DEVINFO(2, true),
-	IMS_PCU_DEVINFO(3, true),
-	IMS_PCU_DEVINFO(4, true),
-	IMS_PCU_DEVINFO(5, false),
-};
-
-static void ims_pcu_buttons_report(struct ims_pcu *pcu, u32 data)
+static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
+				   u16 cmd, unsigned char *data)
 {
-	struct ims_pcu_buttons *buttons = &pcu->buttons;
-	struct input_dev *input = buttons->input;
-	int i;
+	/* valid pad data */
+	if (data[0] != 0x00)
+		return;
 
-	for (i = 0; i < 32; i++) {
-		unsigned short keycode = buttons->keymap[i];
-
-		if (keycode != KEY_RESERVED)
-			input_report_key(input, keycode, data & (1UL << i));
+	/* digital pad */
+	if (xpad->mapping & MAP_DPAD_TO_BUTTONS) {
+		/* dpad as buttons (left, right, up, down) */
+		input_report_key(dev, BTN_TRIGGER_HAPPY1, data[2] & 0x04);
+		input_report_key(dev, BTN_TRIGGER_HAPPY2, data[2] & 0x08);
+		input_report_key(dev, BTN_TRIGGER_HAPPY3, data[2] & 0x01);
+		input_report_key(dev, BTN_TRIGGER_HAPPY4, data[2] & 0x02);
 	}
 
-	input_sync(input);
+	/*
+	 * This should be a simple else block. However historically
+	 * xbox360w has mapped DPAD to buttons while xbox360 did not. This
+	 * made no sense, but now we can not just switch back and have to
+	 * support both behaviors.
+	 */
+	if (!(xpad->mapping & MAP_DPAD_TO_BUTTONS) ||
+	    xpad->xtype == XTYPE_XBOX360W) {
+		input_report_abs(dev, ABS_HAT0X,
+				 !!(data[2] & 0x08) - !!(data[2] & 0x04));
+		input_report_abs(dev, ABS_HAT0Y,
+				 !!(data[2] & 0x02) - !!(data[2] & 0x01));
+	}
+
+	/* start/back buttons */
+	input_report_key(dev, BTN_START,  data[2] & 0x10);
+	input_report_key(dev, BTN_SELECT, data[2] & 0x20);
+
+	/* stick press left/right */
+	input_report_key(dev, BTN_THUMBL, data[2] & 0x40);
+	input_report_key(dev, BTN_THUMBR, data[2] & 0x80);
+
+	/* buttons A,B,X,Y,TL,TR and MODE */
+	input_report_key(dev, BTN_A,	data[3] & 0x10);
+	input_report_key(dev, BTN_B,	data[3] & 0x20);
+	input_report_key(dev, BTN_X,	data[3] & 0x40);
+	input_report_key(dev, BTN_Y,	data[3] & 0x80);
+	input_report_key(dev, BTN_TL,	data[3] & 0x01);
+	input_report_key(dev, BTN_TR,	data[3] & 0x02);
+	input_report_key(dev, BTN_MODE,	data[3] & 0x04);
+
+	if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
+		/* left stick */
+		input_report_abs(dev, ABS_X,
+				 (__s16) le16_to_cpup((__le16 *)(data + 6)));
+		input_report_abs(dev, ABS_Y,
+				 ~(__s16) le16_to_cpup((__le16 *)(data + 8)));
+
+		/* right stick */
+		input_report_abs(dev, ABS_RX,
+				 (__s16) le16_to_cpup((__le16 *)(data + 10)));
+		input_report_abs(dev, ABS_RY,
+				 ~(__s16) le16_to_cpup((__le16 *)(data + 12)));
+	}
+
+	/* triggers left/right */
+	if (xpad->mapping & MAP_TRIGGERS_TO_BUTTONS) {
+		input_report_key(dev, BTN_TL2, data[4]);
+		input_report_key(dev, BTN_TR2, data[5]);
+	} else {
+		input_report_abs(dev, ABS_Z, data[4]);
+		input_report_abs(dev, ABS_RZ, data[5]);
+	}
+
+	input_sync(dev);
 }
 
-static int ims_pcu_setup_buttons(struct ims_pcu *pcu,
-				 const unsigned short *keymap,
-				 size_t keymap_len)
+static void xpad_presence_work(struct work_struct *work)
 {
-	struct ims_pcu_buttons *buttons = &pcu->buttons;
-	struct input_dev *input;
-	int i;
+	struct usb_xpad *xpad = container_of(work, struct usb_xpad, work);
 	int error;
 
-	input = input_allocate_device();
-	if (!input) {
-		dev_err(pcu->dev,
-			"Not enough memory for input input device\n");
-		return -ENOMEM;
-	}
-
-	snprintf(buttons->name, sizeof(buttons->name),
-		 "IMS PCU#%d Button Interface", pcu->device_no);
-
-	usb_make_path(pcu->udev, buttons->phys, sizeof(buttons->phys));
-	strlcat(buttons->phys, "/input0", sizeof(buttons->phys));
-
-	memcpy(buttons->keymap, keymap, sizeof(*keymap) * keymap_len);
-
-	input->name = buttons->name;
-	input->phys = buttons->phys;
-	usb_to_input_id(pcu->udev, &input->id);
-	input->dev.parent = &pcu->ctrl_intf->dev;
-
-	input->keycode = buttons->keymap;
-	input->keycodemax = ARRAY_SIZE(buttons->keymap);
-	input->keycodesize = sizeof(buttons->keymap[0]);
-
-	__set_bit(EV_KEY, input->evbit);
-	for (i = 0; i < IMS_PCU_KEYMAP_LEN; i++)
-		__set_bit(buttons->keymap[i], input->keybit);
-	__clear_bit(KEY_RESERVED, input->keybit);
-
-	error = input_register_device(input);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to register buttons input device: %d\n",
-			error);
-		input_free_device(input);
-		return error;
-	}
-
-	buttons->input = input;
-	return 0;
-}
-
-static void ims_pcu_destroy_buttons(struct ims_pcu *pcu)
-{
-	struct ims_pcu_buttons *buttons = &pcu->buttons;
-
-	input_unregister_device(buttons->input);
-}
-
-
-/*********************************************************************
- *             Gamepad Input device support                          *
- *********************************************************************/
-
-static void ims_pcu_gamepad_report(struct ims_pcu *pcu, u32 data)
-{
-	struct ims_pcu_gamepad *gamepad = pcu->gamepad;
-	struct input_dev *input = gamepad->input;
-	int x, y;
-
-	x = !!(data & (1 << 14)) - !!(data & (1 << 13));
-	y = !!(data & (1 << 12)) - !!(data & (1 << 11));
-
-	input_report_abs(input, ABS_X, x);
-	input_report_abs(input, ABS_Y, y);
-
-	input_report_key(input, BTN_A, data & (1 << 7));
-	input_report_key(input, BTN_B, data & (1 << 8));
-	input_report_key(input, BTN_X, data & (1 << 9));
-	input_report_key(input, BTN_Y, data & (1 << 10));
-	input_report_key(input, BTN_START, data & (1 << 15));
-	input_report_key(input, BTN_SELECT, data & (1 << 16));
-
-	input_sync(input);
-}
-
-static int ims_pcu_setup_gamepad(struct ims_pcu *pcu)
-{
-	struct ims_pcu_gamepad *gamepad;
-	struct input_dev *input;
-	int error;
-
-	gamepad = kzalloc(sizeof(struct ims_pcu_gamepad), GFP_KERNEL);
-	input = input_allocate_device();
-	if (!gamepad || !input) {
-		dev_err(pcu->dev,
-			"Not enough memory for gamepad device\n");
-		error = -ENOMEM;
-		goto err_free_mem;
-	}
-
-	gamepad->input = input;
-
-	snprintf(gamepad->name, sizeof(gamepad->name),
-		 "IMS PCU#%d Gamepad Interface", pcu->device_no);
-
-	usb_make_path(pcu->udev, gamepad->phys, sizeof(gamepad->phys));
-	strlcat(gamepad->phys, "/input1", sizeof(gamepad->phys));
-
-	input->name = gamepad->name;
-	input->phys = gamepad->phys;
-	usb_to_input_id(pcu->udev, &input->id);
-	input->dev.parent = &pcu->ctrl_intf->dev;
-
-	__set_bit(EV_KEY, input->evbit);
-	__set_bit(BTN_A, input->keybit);
-	__set_bit(BTN_B, input->keybit);
-	__set_bit(BTN_X, input->keybit);
-	__set_bit(BTN_Y, input->keybit);
-	__set_bit(BTN_START, input->keybit);
-	__set_bit(BTN_SELECT, input->keybit);
-
-	__set_bit(EV_ABS, input->evbit);
-	input_set_abs_params(input, ABS_X, -1, 1, 0, 0);
-	input_set_abs_params(input, ABS_Y, -1, 1, 0, 0);
-
-	error = input_register_device(input);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to register gamepad input device: %d\n",
-			error);
-		goto err_free_mem;
-	}
-
-	pcu->gamepad = gamepad;
-	return 0;
-
-err_free_mem:
-	input_free_device(input);
-	kfree(gamepad);
-	return -ENOMEM;
-}
-
-static void ims_pcu_destroy_gamepad(struct ims_pcu *pcu)
-{
-	struct ims_pcu_gamepad *gamepad = pcu->gamepad;
-
-	input_unregister_device(gamepad->input);
-	kfree(gamepad);
-}
-
-
-/*********************************************************************
- *             PCU Communication protocol handling                   *
- *********************************************************************/
-
-#define IMS_PCU_PROTOCOL_STX		0x02
-#define IMS_PCU_PROTOCOL_ETX		0x03
-#define IMS_PCU_PROTOCOL_DLE		0x10
-
-/* PCU commands */
-#define IMS_PCU_CMD_STATUS		0xa0
-#define IMS_PCU_CMD_PCU_RESET		0xa1
-#define IMS_PCU_CMD_RESET_REASON	0xa2
-#define IMS_PCU_CMD_SEND_BUTTONS	0xa3
-#define IMS_PCU_CMD_JUMP_TO_BTLDR	0xa4
-#define IMS_PCU_CMD_GET_INFO		0xa5
-#define IMS_PCU_CMD_SET_BRIGHTNESS	0xa6
-#define IMS_PCU_CMD_EEPROM		0xa7
-#define IMS_PCU_CMD_GET_FW_VERSION	0xa8
-#define IMS_PCU_CMD_GET_BL_VERSION	0xa9
-#define IMS_PCU_CMD_SET_INFO		0xab
-#define IMS_PCU_CMD_GET_BRIGHTNESS	0xac
-#define IMS_PCU_CMD_GET_DEVICE_ID	0xae
-#define IMS_PCU_CMD_SPECIAL_INFO	0xb0
-#define IMS_PCU_CMD_BOOTLOADER		0xb1	/* Pass data to bootloader */
-#define IMS_PCU_CMD_OFN_SET_CONFIG	0xb3
-#define IMS_PCU_CMD_OFN_GET_CONFIG	0xb4
-
-/* PCU responses */
-#define IMS_PCU_RSP_STATUS		0xc0
-#define IMS_PCU_RSP_PCU_RESET		0	/* Originally 0xc1 */
-#define IMS_PCU_RSP_RESET_REASON	0xc2
-#define IMS_PCU_RSP_SEND_BUTTONS	0xc3
-#define IMS_PCU_RSP_JUMP_TO_BTLDR	0	/* Originally 0xc4 */
-#define IMS_PCU_RSP_GET_INFO		0xc5
-#define IMS_PCU_RSP_SET_BRIGHTNESS	0xc6
-#define IMS_PCU_RSP_EEPROM		0xc7
-#define IMS_PCU_RSP_GET_FW_VERSION	0xc8
-#define IMS_PCU_RSP_GET_BL_VERSION	0xc9
-#define IMS_PCU_RSP_SET_INFO		0xcb
-#define IMS_PCU_RSP_GET_BRIGHTNESS	0xcc
-#define IMS_PCU_RSP_CMD_INVALID		0xcd
-#define IMS_PCU_RSP_GET_DEVICE_ID	0xce
-#define IMS_PCU_RSP_SPECIAL_INFO	0xd0
-#define IMS_PCU_RSP_BOOTLOADER		0xd1	/* Bootloader response */
-#define IMS_PCU_RSP_OFN_SET_CONFIG	0xd2
-#define IMS_PCU_RSP_OFN_GET_CONFIG	0xd3
-
-
-#define IMS_PCU_RSP_EVNT_BUTTONS	0xe0	/* Unsolicited, button state */
-#define IMS_PCU_GAMEPAD_MASK		0x0001ff80UL	/* Bits 7 through 16 */
-
-
-#define IMS_PCU_MIN_PACKET_LEN		3
-#define IMS_PCU_DATA_OFFSET		2
-
-#define IMS_PCU_CMD_WRITE_TIMEOUT	100 /* msec */
-#define IMS_PCU_CMD_RESPONSE_TIMEOUT	500 /* msec */
-
-static void ims_pcu_report_events(struct ims_pcu *pcu)
-{
-	u32 data = get_unaligned_be32(&pcu->read_buf[3]);
-
-	ims_pcu_buttons_report(pcu, data & ~IMS_PCU_GAMEPAD_MASK);
-	if (pcu->gamepad)
-		ims_pcu_gamepad_report(pcu, data);
-}
-
-static void ims_pcu_handle_response(struct ims_pcu *pcu)
-{
-	switch (pcu->read_buf[0]) {
-	case IMS_PCU_RSP_EVNT_BUTTONS:
-		if (likely(pcu->setup_complete))
-			ims_pcu_report_events(pcu);
-		break;
-
-	default:
-		/*
-		 * See if we got command completion.
-		 * If both the sequence and response code match save
-		 * the data and signal completion.
-		 */
-		if (pcu->read_buf[0] == pcu->expected_response &&
-		    pcu->read_buf[1] == pcu->ack_id - 1) {
-
-			memcpy(pcu->cmd_buf, pcu->read_buf, pcu->read_pos);
-			pcu->cmd_buf_len = pcu->read_pos;
-			complete(&pcu->cmd_done);
-		}
-		break;
-	}
-}
-
-static void ims_pcu_process_data(struct ims_pcu *pcu, struct urb *urb)
-{
-	int i;
-
-	for (i = 0; i < urb->actual_length; i++) {
-		u8 data = pcu->urb_in_buf[i];
-
-		/* Skip everything until we get Start Xmit */
-		if (!pcu->have_stx && data != IMS_PCU_PROTOCOL_STX)
-			continue;
-
-		if (pcu->have_dle) {
-			pcu->have_dle = false;
-			pcu->read_buf[pcu->read_pos++] = data;
-			pcu->check_sum += data;
-			continue;
-		}
-
-		switch (data) {
-		case IMS_PCU_PROTOCOL_STX:
-			if (pcu->have_stx)
-				dev_warn(pcu->dev,
-					 "Unexpected STX at byte %d, discarding old data\n",
-					 pcu->read_pos);
-			pcu->have_stx = true;
-			pcu->have_dle = false;
-			pcu->read_pos = 0;
-			pcu->check_sum = 0;
-			break;
-
-		case IMS_PCU_PROTOCOL_DLE:
-			pcu->have_dle = true;
-			break;
-
-		case IMS_PCU_PROTOCOL_ETX:
-			if (pcu->read_pos < IMS_PCU_MIN_PACKET_LEN) {
-				dev_warn(pcu->dev,
-					 "Short packet received (%d bytes), ignoring\n",
-					 pcu->read_pos);
-			} else if (pcu->check_sum != 0) {
-				dev_warn(pcu->dev,
-					 "Invalid checksum in packet (%d bytes), ignoring\n",
-					 pcu->read_pos);
-			} else {
-				ims_pcu_handle_response(pcu);
-			}
-
-			pcu->have_stx = false;
-			pcu->have_dle = false;
-			pcu->read_pos = 0;
-			break;
-
-		default:
-			pcu->read_buf[pcu->read_pos++] = data;
-			pcu->check_sum += data;
-			break;
-		}
-	}
-}
-
-static bool ims_pcu_byte_needs_escape(u8 byte)
-{
-	return byte == IMS_PCU_PROTOCOL_STX ||
-	       byte == IMS_PCU_PROTOCOL_ETX ||
-	       byte == IMS_PCU_PROTOCOL_DLE;
-}
-
-static int ims_pcu_send_cmd_chunk(struct ims_pcu *pcu,
-				  u8 command, int chunk, int len)
-{
-	int error;
-
-	error = usb_bulk_msg(pcu->udev,
-			     usb_sndbulkpipe(pcu->udev,
-					     pcu->ep_out->bEndpointAddress),
-			     pcu->urb_out_buf, len,
-			     NULL, IMS_PCU_CMD_WRITE_TIMEOUT);
-	if (error < 0) {
-		dev_dbg(pcu->dev,
-			"Sending 0x%02x command failed at chunk %d: %d\n",
-			command, chunk, error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int ims_pcu_send_command(struct ims_pcu *pcu,
-				u8 command, const u8 *data, int len)
-{
-	int count = 0;
-	int chunk = 0;
-	int delta;
-	int i;
-	int error;
-	u8 csum = 0;
-	u8 ack_id;
-
-	pcu->urb_out_buf[count++] = IMS_PCU_PROTOCOL_STX;
-
-	/* We know the command need not be escaped */
-	pcu->urb_out_buf[count++] = command;
-	csum += command;
-
-	ack_id = pcu->ack_id++;
-	if (ack_id == 0xff)
-		ack_id = pcu->ack_id++;
-
-	if (ims_pcu_byte_needs_escape(ack_id))
-		pcu->urb_out_buf[count++] = IMS_PCU_PROTOCOL_DLE;
-
-	pcu->urb_out_buf[count++] = ack_id;
-	csum += ack_id;
-
-	for (i = 0; i < len; i++) {
-
-		delta = ims_pcu_byte_needs_escape(data[i]) ? 2 : 1;
-		if (count + delta >= pcu->max_out_size) {
-			error = ims_pcu_send_cmd_chunk(pcu, command,
-						       ++chunk, count);
-			if (error)
-				return error;
-
-			count = 0;
-		}
-
-		if (delta == 2)
-			pcu->urb_out_buf[count++] = IMS_PCU_PROTOCOL_DLE;
-
-		pcu->urb_out_buf[count++] = data[i];
-		csum += data[i];
-	}
-
-	csum = 1 + ~csum;
-
-	delta = ims_pcu_byte_needs_escape(csum) ? 3 : 2;
-	if (count + delta >= pcu->max_out_size) {
-		error = ims_pcu_send_cmd_chunk(pcu, command, ++chunk, count);
-		if (error)
-			return error;
-
-		count = 0;
-	}
-
-	if (delta == 3)
-		pcu->urb_out_buf[count++] = IMS_PCU_PROTOCOL_DLE;
-
-	pcu->urb_out_buf[count++] = csum;
-	pcu->urb_out_buf[count++] = IMS_PCU_PROTOCOL_ETX;
-
-	return ims_pcu_send_cmd_chunk(pcu, command, ++chunk, count);
-}
-
-static int __ims_pcu_execute_command(struct ims_pcu *pcu,
-				     u8 command, const void *data, size_t len,
-				     u8 expected_response, int response_time)
-{
-	int error;
-
-	pcu->expected_response = expected_response;
-	init_completion(&pcu->cmd_done);
-
-	error = ims_pcu_send_command(pcu, command, data, len);
-	if (error)
-		return error;
-
-	if (expected_response &&
-	    !wait_for_completion_timeout(&pcu->cmd_done,
-					 msecs_to_jiffies(response_time))) {
-		dev_dbg(pcu->dev, "Command 0x%02x timed out\n", command);
-		return -ETIMEDOUT;
-	}
-
-	return 0;
-}
-
-#define ims_pcu_execute_command(pcu, code, data, len)			\
-	__ims_pcu_execute_command(pcu,					\
-				  IMS_PCU_CMD_##code, data, len,	\
-				  IMS_PCU_RSP_##code,			\
-				  IMS_PCU_CMD_RESPONSE_TIMEOUT)
-
-#define ims_pcu_execute_query(pcu, code)				\
-	ims_pcu_execute_command(pcu, code, NULL, 0)
-
-/* Bootloader commands */
-#define IMS_PCU_BL_CMD_QUERY_DEVICE	0xa1
-#define IMS_PCU_BL_CMD_UNLOCK_CONFIG	0xa2
-#define IMS_PCU_BL_CMD_ERASE_APP	0xa3
-#define IMS_PCU_BL_CMD_PROGRAM_DEVICE	0xa4
-#define IMS_PCU_BL_CMD_PROGRAM_COMPLETE	0xa5
-#define IMS_PCU_BL_CMD_READ_APP		0xa6
-#define IMS_PCU_BL_CMD_RESET_DEVICE	0xa7
-#define IMS_PCU_BL_CMD_LAUNCH_APP	0xa8
-
-/* Bootloader commands */
-#define IMS_PCU_BL_RSP_QUERY_DEVICE	0xc1
-#define IMS_PCU_BL_RSP_UNLOCK_CONFIG	0xc2
-#define IMS_PCU_BL_RSP_ERASE_APP	0xc3
-#define IMS_PCU_BL_RSP_PROGRAM_DEVICE	0xc4
-#define IMS_PCU_BL_RSP_PROGRAM_COMPLETE	0xc5
-#define IMS_PCU_BL_RSP_READ_APP		0xc6
-#define IMS_PCU_BL_RSP_RESET_DEVICE	0	/* originally 0xa7 */
-#define IMS_PCU_BL_RSP_LAUNCH_APP	0	/* originally 0xa8 */
-
-#define IMS_PCU_BL_DATA_OFFSET		3
-
-static int __ims_pcu_execute_bl_command(struct ims_pcu *pcu,
-				        u8 command, const void *data, size_t len,
-				        u8 expected_response, int response_time)
-{
-	int error;
-
-	pcu->cmd_buf[0] = command;
-	if (data)
-		memcpy(&pcu->cmd_buf[1], data, len);
-
-	error = __ims_pcu_execute_command(pcu,
-				IMS_PCU_CMD_BOOTLOADER, pcu->cmd_buf, len + 1,
-				expected_response ? IMS_PCU_RSP_BOOTLOADER : 0,
-				response_time);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failure when sending 0x%02x command to bootloader, error: %d\n",
-			pcu->cmd_buf[0], error);
-		return error;
-	}
-
-	if (expected_response && pcu->cmd_buf[2] != expected_response) {
-		dev_err(pcu->dev,
-			"Unexpected response from bootloader: 0x%02x, wanted 0x%02x\n",
-			pcu->cmd_buf[2], expected_response);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-#define ims_pcu_execute_bl_command(pcu, code, data, len, timeout)	\
-	__ims_pcu_execute_bl_command(pcu,				\
-				     IMS_PCU_BL_CMD_##code, data, len,	\
-				     IMS_PCU_BL_RSP_##code, timeout)	\
-
-#define IMS_PCU_INFO_PART_OFFSET	2
-#define IMS_PCU_INFO_DOM_OFFSET		17
-#define IMS_PCU_INFO_SERIAL_OFFSET	25
-
-#define IMS_PCU_SET_INFO_SIZE		31
-
-static int ims_pcu_get_info(struct ims_pcu *pcu)
-{
-	int error;
-
-	error = ims_pcu_execute_query(pcu, GET_INFO);
-	if (error) {
-		dev_err(pcu->dev,
-			"GET_INFO command failed, error: %d\n", error);
-		return error;
-	}
-
-	memcpy(pcu->part_number,
-	       &pcu->cmd_buf[IMS_PCU_INFO_PART_OFFSET],
-	       sizeof(pcu->part_number));
-	memcpy(pcu->date_of_manufacturing,
-	       &pcu->cmd_buf[IMS_PCU_INFO_DOM_OFFSET],
-	       sizeof(pcu->date_of_manufacturing));
-	memcpy(pcu->serial_number,
-	       &pcu->cmd_buf[IMS_PCU_INFO_SERIAL_OFFSET],
-	       sizeof(pcu->serial_number));
-
-	return 0;
-}
-
-static int ims_pcu_set_info(struct ims_pcu *pcu)
-{
-	int error;
-
-	memcpy(&pcu->cmd_buf[IMS_PCU_INFO_PART_OFFSET],
-	       pcu->part_number, sizeof(pcu->part_number));
-	memcpy(&pcu->cmd_buf[IMS_PCU_INFO_DOM_OFFSET],
-	       pcu->date_of_manufacturing, sizeof(pcu->date_of_manufacturing));
-	memcpy(&pcu->cmd_buf[IMS_PCU_INFO_SERIAL_OFFSET],
-	       pcu->serial_number, sizeof(pcu->serial_number));
-
-	error = ims_pcu_execute_command(pcu, SET_INFO,
-					&pcu->cmd_buf[IMS_PCU_DATA_OFFSET],
-					IMS_PCU_SET_INFO_SIZE);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to update device information, error: %d\n",
-			error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int ims_pcu_switch_to_bootloader(struct ims_pcu *pcu)
-{
-	int error;
-
-	/* Execute jump to the bootoloader */
-	error = ims_pcu_execute_command(pcu, JUMP_TO_BTLDR, NULL, 0);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failure when sending JUMP TO BOOLTLOADER command, error: %d\n",
-			error);
-		return error;
-	}
-
-	return 0;
-}
-
-/*********************************************************************
- *             Firmware Update handling                              *
- *********************************************************************/
-
-#define IMS_PCU_FIRMWARE_NAME	"imspcu.fw"
-
-struct ims_pcu_flash_fmt {
-	__le32 addr;
-	u8 len;
-	u8 data[];
-};
-
-static unsigned int ims_pcu_count_fw_records(const struct firmware *fw)
-{
-	const struct ihex_binrec *rec = (const struct ihex_binrec *)fw->data;
-	unsigned int count = 0;
-
-	while (rec) {
-		count++;
-		rec = ihex_next_binrec(rec);
-	}
-
-	return count;
-}
-
-static int ims_pcu_verify_block(struct ims_pcu *pcu,
-				u32 addr, u8 len, const u8 *data)
-{
-	struct ims_pcu_flash_fmt *fragment;
-	int error;
-
-	fragment = (void *)&pcu->cmd_buf[1];
-	put_unaligned_le32(addr, &fragment->addr);
-	fragment->len = len;
-
-	error = ims_pcu_execute_bl_command(pcu, READ_APP, NULL, 5,
-					IMS_PCU_CMD_RESPONSE_TIMEOUT);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to retrieve block at 0x%08x, len %d, error: %d\n",
-			addr, len, error);
-		return error;
-	}
-
-	fragment = (void *)&pcu->cmd_buf[IMS_PCU_BL_DATA_OFFSET];
-	if (get_unaligned_le32(&fragment->addr) != addr ||
-	    fragment->len != len) {
-		dev_err(pcu->dev,
-			"Wrong block when retrieving 0x%08x (0x%08x), len %d (%d)\n",
-			addr, get_unaligned_le32(&fragment->addr),
-			len, fragment->len);
-		return -EINVAL;
-	}
-
-	if (memcmp(fragment->data, data, len)) {
-		dev_err(pcu->dev,
-			"Mismatch in block at 0x%08x, len %d\n",
-			addr, len);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int ims_pcu_flash_firmware(struct ims_pcu *pcu,
-				  const struct firmware *fw,
-				  unsigned int n_fw_records)
-{
-	const struct ihex_binrec *rec = (const struct ihex_binrec *)fw->data;
-	struct ims_pcu_flash_fmt *fragment;
-	unsigned int count = 0;
-	u32 addr;
-	u8 len;
-	int error;
-
-	error = ims_pcu_execute_bl_command(pcu, ERASE_APP, NULL, 0, 2000);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to erase application image, error: %d\n",
-			error);
-		return error;
-	}
-
-	while (rec) {
-		/*
-		 * The firmware format is messed up for some reason.
-		 * The address twice that of what is needed for some
-		 * reason and we end up overwriting half of the data
-		 * with the next record.
-		 */
-		addr = be32_to_cpu(rec->addr) / 2;
-		len = be16_to_cpu(rec->len);
-
-		fragment = (void *)&pcu->cmd_buf[1];
-		put_unaligned_le32(addr, &fragment->addr);
-		fragment->len = len;
-		memcpy(fragment->data, rec->data, len);
-
-		error = ims_pcu_execute_bl_command(pcu, PROGRAM_DEVICE,
-						NULL, len + 5,
-						IMS_PCU_CMD_RESPONSE_TIMEOUT);
+	if (xpad->pad_present) {
+		error = xpad_init_input(xpad);
 		if (error) {
-			dev_err(pcu->dev,
-				"Failed to write block at 0x%08x, len %d, error: %d\n",
-				addr, len, error);
-			return error;
-		}
-
-		if (addr >= pcu->fw_start_addr && addr < pcu->fw_end_addr) {
-			error = ims_pcu_verify_block(pcu, addr, len, rec->data);
-			if (error)
-				return error;
-		}
-
-		count++;
-		pcu->update_firmware_status = (count * 100) / n_fw_records;
-
-		rec = ihex_next_binrec(rec);
-	}
-
-	error = ims_pcu_execute_bl_command(pcu, PROGRAM_COMPLETE,
-					    NULL, 0, 2000);
-	if (error)
-		dev_err(pcu->dev,
-			"Failed to send PROGRAM_COMPLETE, error: %d\n",
-			error);
-
-	return 0;
-}
-
-static int ims_pcu_handle_firmware_update(struct ims_pcu *pcu,
-					  const struct firmware *fw)
-{
-	unsigned int n_fw_records;
-	int retval;
-
-	dev_info(pcu->dev, "Updating firmware %s, size: %zu\n",
-		 IMS_PCU_FIRMWARE_NAME, fw->size);
-
-	n_fw_records = ims_pcu_count_fw_records(fw);
-
-	retval = ims_pcu_flash_firmware(pcu, fw, n_fw_records);
-	if (retval)
-		goto out;
-
-	retval = ims_pcu_execute_bl_command(pcu, LAUNCH_APP, NULL, 0, 0);
-	if (retval)
-		dev_err(pcu->dev,
-			"Failed to start application image, error: %d\n",
-			retval);
-
-out:
-	pcu->update_firmware_status = retval;
-	sysfs_notify(&pcu->dev->kobj, NULL, "update_firmware_status");
-	return retval;
-}
-
-static void ims_pcu_process_async_firmware(const struct firmware *fw,
-					   void *context)
-{
-	struct ims_pcu *pcu = context;
-	int error;
-
-	if (!fw) {
-		dev_err(pcu->dev, "Failed to get firmware %s\n",
-			IMS_PCU_FIRMWARE_NAME);
-		goto out;
-	}
-
-	error = ihex_validate_fw(fw);
-	if (error) {
-		dev_err(pcu->dev, "Firmware %s is invalid\n",
-			IMS_PCU_FIRMWARE_NAME);
-		goto out;
-	}
-
-	mutex_lock(&pcu->cmd_mutex);
-	ims_pcu_handle_firmware_update(pcu, fw);
-	mutex_unlock(&pcu->cmd_mutex);
-
-	release_firmware(fw);
-
-out:
-	complete(&pcu->async_firmware_done);
-}
-
-/*********************************************************************
- *             Backlight LED device support                          *
- *********************************************************************/
-
-#define IMS_PCU_MAX_BRIGHTNESS		31998
-
-static void ims_pcu_backlight_work(struct work_struct *work)
-{
-	struct ims_pcu_backlight *backlight =
-			container_of(work, struct ims_pcu_backlight, work);
-	struct ims_pcu *pcu =
-			container_of(backlight, struct ims_pcu, backlight);
-	int desired_brightness = backlight->desired_brightness;
-	__le16 br_val = cpu_to_le16(desired_brightness);
-	int error;
-
-	mutex_lock(&pcu->cmd_mutex);
-
-	error = ims_pcu_execute_command(pcu, SET_BRIGHTNESS,
-					&br_val, sizeof(br_val));
-	if (error && error != -ENODEV)
-		dev_warn(pcu->dev,
-			 "Failed to set desired brightness %u, error: %d\n",
-			 desired_brightness, error);
-
-	mutex_unlock(&pcu->cmd_mutex);
-}
-
-static void ims_pcu_backlight_set_brightness(struct led_classdev *cdev,
-					     enum led_brightness value)
-{
-	struct ims_pcu_backlight *backlight =
-			container_of(cdev, struct ims_pcu_backlight, cdev);
-
-	backlight->desired_brightness = value;
-	schedule_work(&backlight->work);
-}
-
-static enum led_brightness
-ims_pcu_backlight_get_brightness(struct led_classdev *cdev)
-{
-	struct ims_pcu_backlight *backlight =
-			container_of(cdev, struct ims_pcu_backlight, cdev);
-	struct ims_pcu *pcu =
-			container_of(backlight, struct ims_pcu, backlight);
-	int brightness;
-	int error;
-
-	mutex_lock(&pcu->cmd_mutex);
-
-	error = ims_pcu_execute_query(pcu, GET_BRIGHTNESS);
-	if (error) {
-		dev_warn(pcu->dev,
-			 "Failed to get current brightness, error: %d\n",
-			 error);
-		/* Assume the LED is OFF */
-		brightness = LED_OFF;
-	} else {
-		brightness =
-			get_unaligned_le16(&pcu->cmd_buf[IMS_PCU_DATA_OFFSET]);
-	}
-
-	mutex_unlock(&pcu->cmd_mutex);
-
-	return brightness;
-}
-
-static int ims_pcu_setup_backlight(struct ims_pcu *pcu)
-{
-	struct ims_pcu_backlight *backlight = &pcu->backlight;
-	int error;
-
-	INIT_WORK(&backlight->work, ims_pcu_backlight_work);
-	snprintf(backlight->name, sizeof(backlight->name),
-		 "pcu%d::kbd_backlight", pcu->device_no);
-
-	backlight->cdev.name = backlight->name;
-	backlight->cdev.max_brightness = IMS_PCU_MAX_BRIGHTNESS;
-	backlight->cdev.brightness_get = ims_pcu_backlight_get_brightness;
-	backlight->cdev.brightness_set = ims_pcu_backlight_set_brightness;
-
-	error = led_classdev_register(pcu->dev, &backlight->cdev);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to register backlight LED device, error: %d\n",
-			error);
-		return error;
-	}
-
-	return 0;
-}
-
-static void ims_pcu_destroy_backlight(struct ims_pcu *pcu)
-{
-	struct ims_pcu_backlight *backlight = &pcu->backlight;
-
-	led_classdev_unregister(&backlight->cdev);
-	cancel_work_sync(&backlight->work);
-}
-
-
-/*********************************************************************
- *             Sysfs attributes handling                             *
- *********************************************************************/
-
-struct ims_pcu_attribute {
-	struct device_attribute dattr;
-	size_t field_offset;
-	int field_length;
-};
-
-static ssize_t ims_pcu_attribute_show(struct device *dev,
-				      struct device_attribute *dattr,
-				      char *buf)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	struct ims_pcu_attribute *attr =
-			container_of(dattr, struct ims_pcu_attribute, dattr);
-	char *field = (char *)pcu + attr->field_offset;
-
-	return scnprintf(buf, PAGE_SIZE, "%.*s\n", attr->field_length, field);
-}
-
-static ssize_t ims_pcu_attribute_store(struct device *dev,
-				       struct device_attribute *dattr,
-				       const char *buf, size_t count)
-{
-
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	struct ims_pcu_attribute *attr =
-			container_of(dattr, struct ims_pcu_attribute, dattr);
-	char *field = (char *)pcu + attr->field_offset;
-	size_t data_len;
-	int error;
-
-	if (count > attr->field_length)
-		return -EINVAL;
-
-	data_len = strnlen(buf, attr->field_length);
-	if (data_len > attr->field_length)
-		return -EINVAL;
-
-	error = mutex_lock_interruptible(&pcu->cmd_mutex);
-	if (error)
-		return error;
-
-	memset(field, 0, attr->field_length);
-	memcpy(field, buf, data_len);
-
-	error = ims_pcu_set_info(pcu);
-
-	/*
-	 * Even if update failed, let's fetch the info again as we just
-	 * clobbered one of the fields.
-	 */
-	ims_pcu_get_info(pcu);
-
-	mutex_unlock(&pcu->cmd_mutex);
-
-	return error < 0 ? error : count;
-}
-
-#define IMS_PCU_ATTR(_field, _mode)					\
-struct ims_pcu_attribute ims_pcu_attr_##_field = {			\
-	.dattr = __ATTR(_field, _mode,					\
-			ims_pcu_attribute_show,				\
-			ims_pcu_attribute_store),			\
-	.field_offset = offsetof(struct ims_pcu, _field),		\
-	.field_length = sizeof(((struct ims_pcu *)NULL)->_field),	\
-}
-
-#define IMS_PCU_RO_ATTR(_field)						\
-		IMS_PCU_ATTR(_field, S_IRUGO)
-#define IMS_PCU_RW_ATTR(_field)						\
-		IMS_PCU_ATTR(_field, S_IRUGO | S_IWUSR)
-
-static IMS_PCU_RW_ATTR(part_number);
-static IMS_PCU_RW_ATTR(serial_number);
-static IMS_PCU_RW_ATTR(date_of_manufacturing);
-
-static IMS_PCU_RO_ATTR(fw_version);
-static IMS_PCU_RO_ATTR(bl_version);
-static IMS_PCU_RO_ATTR(reset_reason);
-
-static ssize_t ims_pcu_reset_device(struct device *dev,
-				    struct device_attribute *dattr,
-				    const char *buf, size_t count)
-{
-	static const u8 reset_byte = 1;
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	int value;
-	int error;
-
-	error = kstrtoint(buf, 0, &value);
-	if (error)
-		return error;
-
-	if (value != 1)
-		return -EINVAL;
-
-	dev_info(pcu->dev, "Attempting to reset device\n");
-
-	error = ims_pcu_execute_command(pcu, PCU_RESET, &reset_byte, 1);
-	if (error) {
-		dev_info(pcu->dev,
-			 "Failed to reset device, error: %d\n",
-			 error);
-		return error;
-	}
-
-	return count;
-}
-
-static DEVICE_ATTR(reset_device, S_IWUSR, NULL, ims_pcu_reset_device);
-
-static ssize_t ims_pcu_update_firmware_store(struct device *dev,
-					     struct device_attribute *dattr,
-					     const char *buf, size_t count)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	const struct firmware *fw = NULL;
-	int value;
-	int error;
-
-	error = kstrtoint(buf, 0, &value);
-	if (error)
-		return error;
-
-	if (value != 1)
-		return -EINVAL;
-
-	error = mutex_lock_interruptible(&pcu->cmd_mutex);
-	if (error)
-		return error;
-
-	error = request_ihex_firmware(&fw, IMS_PCU_FIRMWARE_NAME, pcu->dev);
-	if (error) {
-		dev_err(pcu->dev, "Failed to request firmware %s, error: %d\n",
-			IMS_PCU_FIRMWARE_NAME, error);
-		goto out;
-	}
-
-	/*
-	 * If we are already in bootloader mode we can proceed with
-	 * flashing the firmware.
-	 *
-	 * If we are in application mode, then we need to switch into
-	 * bootloader mode, which will cause the device to disconnect
-	 * and reconnect as different device.
-	 */
-	if (pcu->bootloader_mode)
-		error = ims_pcu_handle_firmware_update(pcu, fw);
-	else
-		error = ims_pcu_switch_to_bootloader(pcu);
-
-	release_firmware(fw);
-
-out:
-	mutex_unlock(&pcu->cmd_mutex);
-	return error ?: count;
-}
-
-static DEVICE_ATTR(update_firmware, S_IWUSR,
-		   NULL, ims_pcu_update_firmware_store);
-
-static ssize_t
-ims_pcu_update_firmware_status_show(struct device *dev,
-				    struct device_attribute *dattr,
-				    char *buf)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-
-	return scnprintf(buf, PAGE_SIZE, "%d\n", pcu->update_firmware_status);
-}
-
-static DEVICE_ATTR(update_firmware_status, S_IRUGO,
-		   ims_pcu_update_firmware_status_show, NULL);
-
-static struct attribute *ims_pcu_attrs[] = {
-	&ims_pcu_attr_part_number.dattr.attr,
-	&ims_pcu_attr_serial_number.dattr.attr,
-	&ims_pcu_attr_date_of_manufacturing.dattr.attr,
-	&ims_pcu_attr_fw_version.dattr.attr,
-	&ims_pcu_attr_bl_version.dattr.attr,
-	&ims_pcu_attr_reset_reason.dattr.attr,
-	&dev_attr_reset_device.attr,
-	&dev_attr_update_firmware.attr,
-	&dev_attr_update_firmware_status.attr,
-	NULL
-};
-
-static umode_t ims_pcu_is_attr_visible(struct kobject *kobj,
-				       struct attribute *attr, int n)
-{
-	struct device *dev = container_of(kobj, struct device, kobj);
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	umode_t mode = attr->mode;
-
-	if (pcu->bootloader_mode) {
-		if (attr != &dev_attr_update_firmware_status.attr &&
-		    attr != &dev_attr_update_firmware.attr &&
-		    attr != &dev_attr_reset_device.attr) {
-			mode = 0;
+			/* complain only, not much else we can do here */
+			dev_err(&xpad->dev->dev,
+				"unable to init device: %d\n", error);
+		} else {
+			rcu_assign_pointer(xpad->x360w_dev, xpad->dev);
 		}
 	} else {
-		if (attr == &dev_attr_update_firmware_status.attr)
-			mode = 0;
+		RCU_INIT_POINTER(xpad->x360w_dev, NULL);
+		synchronize_rcu();
+		/*
+		 * Now that we are sure xpad360w_process_packet is not
+		 * using input device we can get rid of it.
+		 */
+		xpad_deinit_input(xpad);
+	}
+}
+
+/*
+ * xpad360w_process_packet
+ *
+ * Completes a request by converting the data into events for the
+ * input subsystem. It is version for xbox 360 wireless controller.
+ *
+ * Byte.Bit
+ * 00.1 - Status change: The controller or headset has connected/disconnected
+ *                       Bits 01.7 and 01.6 are valid
+ * 01.7 - Controller present
+ * 01.6 - Headset present
+ * 01.1 - Pad state (Bytes 4+) valid
+ *
+ */
+static void xpad360w_process_packet(struct usb_xpad *xpad, u16 cmd, unsigned char *data)
+{
+	struct input_dev *dev;
+	bool present;
+
+	/* Presence change */
+	if (data[0] & 0x08) {
+		present = (data[1] & 0x80) != 0;
+
+		if (xpad->pad_present != present) {
+			xpad->pad_present = present;
+			schedule_work(&xpad->work);
+		}
 	}
 
-	return mode;
+	/* Valid pad data */
+	if (data[1] != 0x1)
+		return;
+
+	rcu_read_lock();
+	dev = rcu_dereference(xpad->x360w_dev);
+	if (dev)
+		xpad360_process_packet(xpad, dev, cmd, &data[4]);
+	rcu_read_unlock();
 }
 
-static struct attribute_group ims_pcu_attr_group = {
-	.is_visible	= ims_pcu_is_attr_visible,
-	.attrs		= ims_pcu_attrs,
-};
-
-/* Support for a separate OFN attribute group */
-
-#define OFN_REG_RESULT_OFFSET	2
-
-static int ims_pcu_read_ofn_config(struct ims_pcu *pcu, u8 addr, u8 *data)
+/*
+ *	xpadone_process_packet
+ *
+ *	Completes a request by converting the data into events for the
+ *	input subsystem. This version is for the Xbox One controller.
+ *
+ *	The report format was gleaned from
+ *	https://github.com/kylelemons/xbox/blob/master/xbox.go
+ */
+static void xpadone_process_packet(struct usb_xpad *xpad, u16 cmd, unsigned char *data)
 {
-	int error;
-	s16 result;
+	struct input_dev *dev = xpad->dev;
 
-	error = ims_pcu_execute_command(pcu, OFN_GET_CONFIG,
-					&addr, sizeof(addr));
-	if (error)
-		return error;
+	/* the xbox button has its own special report */
+	if (data[0] == 0X07) {
+		/*
+		 * The Xbox One S controller requires these reports to be
+		 * acked otherwise it continues sending them forever and
+		 * won't report further mode button events.
+		 */
+		if (data[1] == 0x30)
+			xpadone_ack_mode_report(xpad, data[2]);
 
-	result = (s16)get_unaligned_le16(pcu->cmd_buf + OFN_REG_RESULT_OFFSET);
-	if (result < 0)
-		return -EIO;
+		input_report_key(dev, BTN_MODE, data[4] & 0x01);
+		input_sync(dev);
+		return;
+	}
+	/* check invalid packet */
+	else if (data[0] != 0X20)
+		return;
 
-	/* We only need LSB */
-	*data = pcu->cmd_buf[OFN_REG_RESULT_OFFSET];
-	return 0;
-}
+	/* menu/view buttons */
+	input_report_key(dev, BTN_START,  data[4] & 0x04);
+	input_report_key(dev, BTN_SELECT, data[4] & 0x08);
 
-static int ims_pcu_write_ofn_config(struct ims_pcu *pcu, u8 addr, u8 data)
-{
-	u8 buffer[] = { addr, data };
-	int error;
-	s16 result;
+	/* buttons A,B,X,Y */
+	input_report_key(dev, BTN_A,	data[4] & 0x10);
+	input_report_key(dev, BTN_B,	data[4] & 0x20);
+	input_report_key(dev, BTN_X,	data[4] & 0x40);
+	input_report_key(dev, BTN_Y,	data[4] & 0x80);
 
-	error = ims_pcu_execute_command(pcu, OFN_SET_CONFIG,
-					&buffer, sizeof(buffer));
-	if (error)
-		return error;
-
-	result = (s16)get_unaligned_le16(pcu->cmd_buf + OFN_REG_RESULT_OFFSET);
-	if (result < 0)
-		return -EIO;
-
-	return 0;
-}
-
-static ssize_t ims_pcu_ofn_reg_data_show(struct device *dev,
-					 struct device_attribute *dattr,
-					 char *buf)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	int error;
-	u8 data;
-
-	mutex_lock(&pcu->cmd_mutex);
-	error = ims_pcu_read_ofn_config(pcu, pcu->ofn_reg_addr, &data);
-	mutex_unlock(&pcu->cmd_mutex);
-
-	if (error)
-		return error;
-
-	return scnprintf(buf, PAGE_SIZE, "%x\n", data);
-}
-
-static ssize_t ims_pcu_ofn_reg_data_store(struct device *dev,
-					  struct device_attribute *dattr,
-					  const char *buf, size_t count)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	int error;
-	u8 value;
-
-	error = kstrtou8(buf, 0, &value);
-	if (error)
-		return error;
-
-	mutex_lock(&pcu->cmd_mutex);
-	error = ims_pcu_write_ofn_config(pcu, pcu->ofn_reg_addr, value);
-	mutex_unlock(&pcu->cmd_mutex);
-
-	return error ?: count;
-}
-
-static DEVICE_ATTR(reg_data, S_IRUGO | S_IWUSR,
-		   ims_pcu_ofn_reg_data_show, ims_pcu_ofn_reg_data_store);
-
-static ssize_t ims_pcu_ofn_reg_addr_show(struct device *dev,
-					 struct device_attribute *dattr,
-					 char *buf)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	int error;
-
-	mutex_lock(&pcu->cmd_mutex);
-	error = scnprintf(buf, PAGE_SIZE, "%x\n", pcu->ofn_reg_addr);
-	mutex_unlock(&pcu->cmd_mutex);
-
-	return error;
-}
-
-static ssize_t ims_pcu_ofn_reg_addr_store(struct device *dev,
-					  struct device_attribute *dattr,
-					  const char *buf, size_t count)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	int error;
-	u8 value;
-
-	error = kstrtou8(buf, 0, &value);
-	if (error)
-		return error;
-
-	mutex_lock(&pcu->cmd_mutex);
-	pcu->ofn_reg_addr = value;
-	mutex_unlock(&pcu->cmd_mutex);
-
-	return count;
-}
-
-static DEVICE_ATTR(reg_addr, S_IRUGO | S_IWUSR,
-		   ims_pcu_ofn_reg_addr_show, ims_pcu_ofn_reg_addr_store);
-
-struct ims_pcu_ofn_bit_attribute {
-	struct device_attribute dattr;
-	u8 addr;
-	u8 nr;
-};
-
-static ssize_t ims_pcu_ofn_bit_show(struct device *dev,
-				    struct device_attribute *dattr,
-				    char *buf)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	struct ims_pcu_ofn_bit_attribute *attr =
-		container_of(dattr, struct ims_pcu_ofn_bit_attribute, dattr);
-	int error;
-	u8 data;
-
-	mutex_lock(&pcu->cmd_mutex);
-	error = ims_pcu_read_ofn_config(pcu, attr->addr, &data);
-	mutex_unlock(&pcu->cmd_mutex);
-
-	if (error)
-		return error;
-
-	return scnprintf(buf, PAGE_SIZE, "%d\n", !!(data & (1 << attr->nr)));
-}
-
-static ssize_t ims_pcu_ofn_bit_store(struct device *dev,
-				     struct device_attribute *dattr,
-				     const char *buf, size_t count)
-{
-	struct usb_interface *intf = to_usb_interface(dev);
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	struct ims_pcu_ofn_bit_attribute *attr =
-		container_of(dattr, struct ims_pcu_ofn_bit_attribute, dattr);
-	int error;
-	int value;
-	u8 data;
-
-	error = kstrtoint(buf, 0, &value);
-	if (error)
-		return error;
-
-	if (value > 1)
-		return -EINVAL;
-
-	mutex_lock(&pcu->cmd_mutex);
-
-	error = ims_pcu_read_ofn_config(pcu, attr->addr, &data);
-	if (!error) {
-		if (value)
-			data |= 1U << attr->nr;
-		else
-			data &= ~(1U << attr->nr);
-
-		error = ims_pcu_write_ofn_config(pcu, attr->addr, data);
+	/* digital pad */
+	if (xpad->mapping & MAP_DPAD_TO_BUTTONS) {
+		/* dpad as buttons (left, right, up, down) */
+		input_report_key(dev, BTN_TRIGGER_HAPPY1, data[5] & 0x04);
+		input_report_key(dev, BTN_TRIGGER_HAPPY2, data[5] & 0x08);
+		input_report_key(dev, BTN_TRIGGER_HAPPY3, data[5] & 0x01);
+		input_report_key(dev, BTN_TRIGGER_HAPPY4, data[5] & 0x02);
+	} else {
+		input_report_abs(dev, ABS_HAT0X,
+				 !!(data[5] & 0x08) - !!(data[5] & 0x04));
+		input_report_abs(dev, ABS_HAT0Y,
+				 !!(data[5] & 0x02) - !!(data[5] & 0x01));
 	}
 
-	mutex_unlock(&pcu->cmd_mutex);
+	/* TL/TR */
+	input_report_key(dev, BTN_TL,	data[5] & 0x10);
+	input_report_key(dev, BTN_TR,	data[5] & 0x20);
 
-	return error ?: count;
+	/* stick press left/right */
+	input_report_key(dev, BTN_THUMBL, data[5] & 0x40);
+	input_report_key(dev, BTN_THUMBR, data[5] & 0x80);
+
+	if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
+		/* left stick */
+		input_report_abs(dev, ABS_X,
+				 (__s16) le16_to_cpup((__le16 *)(data + 10)));
+		input_report_abs(dev, ABS_Y,
+				 ~(__s16) le16_to_cpup((__le16 *)(data + 12)));
+
+		/* right stick */
+		input_report_abs(dev, ABS_RX,
+				 (__s16) le16_to_cpup((__le16 *)(data + 14)));
+		input_report_abs(dev, ABS_RY,
+				 ~(__s16) le16_to_cpup((__le16 *)(data + 16)));
+	}
+
+	/* triggers left/right */
+	if (xpad->mapping & MAP_TRIGGERS_TO_BUTTONS) {
+		input_report_key(dev, BTN_TL2,
+				 (__u16) le16_to_cpup((__le16 *)(data + 6)));
+		input_report_key(dev, BTN_TR2,
+				 (__u16) le16_to_cpup((__le16 *)(data + 8)));
+	} else {
+		input_report_abs(dev, ABS_Z,
+				 (__u16) le16_to_cpup((__le16 *)(data + 6)));
+		input_report_abs(dev, ABS_RZ,
+				 (__u16) le16_to_cpup((__le16 *)(data + 8)));
+	}
+
+	input_sync(dev);
 }
 
-#define IMS_PCU_OFN_BIT_ATTR(_field, _addr, _nr)			\
-struct ims_pcu_ofn_bit_attribute ims_pcu_ofn_attr_##_field = {		\
-	.dattr = __ATTR(_field, S_IWUSR | S_IRUGO,			\
-			ims_pcu_ofn_bit_show, ims_pcu_ofn_bit_store),	\
-	.addr = _addr,							\
-	.nr = _nr,							\
-}
-
-static IMS_PCU_OFN_BIT_ATTR(engine_enable,   0x60, 7);
-static IMS_PCU_OFN_BIT_ATTR(speed_enable,    0x60, 6);
-static IMS_PCU_OFN_BIT_ATTR(assert_enable,   0x60, 5);
-static IMS_PCU_OFN_BIT_ATTR(xyquant_enable,  0x60, 4);
-static IMS_PCU_OFN_BIT_ATTR(xyscale_enable,  0x60, 1);
-
-static IMS_PCU_OFN_BIT_ATTR(scale_x2,        0x63, 6);
-static IMS_PCU_OFN_BIT_ATTR(scale_y2,        0x63, 7);
-
-static struct attribute *ims_pcu_ofn_attrs[] = {
-	&dev_attr_reg_data.attr,
-	&dev_attr_reg_addr.attr,
-	&ims_pcu_ofn_attr_engine_enable.dattr.attr,
-	&ims_pcu_ofn_attr_speed_enable.dattr.attr,
-	&ims_pcu_ofn_attr_assert_enable.dattr.attr,
-	&ims_pcu_ofn_attr_xyquant_enable.dattr.attr,
-	&ims_pcu_ofn_attr_xyscale_enable.dattr.attr,
-	&ims_pcu_ofn_attr_scale_x2.dattr.attr,
-	&ims_pcu_ofn_attr_scale_y2.dattr.attr,
-	NULL
-};
-
-static struct attribute_group ims_pcu_ofn_attr_group = {
-	.name	= "ofn",
-	.attrs	= ims_pcu_ofn_attrs,
-};
-
-static void ims_pcu_irq(struct urb *urb)
+static void xpad_irq_in(struct urb *urb)
 {
-	struct ims_pcu *pcu = urb->context;
+	struct usb_xpad *xpad = urb->context;
+	struct device *dev = &xpad->intf->dev;
 	int retval, status;
 
 	status = urb->status;
@@ -1500,665 +533,1441 @@ static void ims_pcu_irq(struct urb *urb)
 	case -ENOENT:
 	case -ESHUTDOWN:
 		/* this urb is terminated, clean up */
-		dev_dbg(pcu->dev, "%s - urb shutting down with status: %d\n",
+		dev_dbg(dev, "%s - urb shutting down with status: %d\n",
 			__func__, status);
 		return;
 	default:
-		dev_dbg(pcu->dev, "%s - nonzero urb status received: %d\n",
+		dev_dbg(dev, "%s - nonzero urb status received: %d\n",
 			__func__, status);
 		goto exit;
 	}
 
-	dev_dbg(pcu->dev, "%s: received %d: %*ph\n", __func__,
-		urb->actual_length, urb->actual_length, pcu->urb_in_buf);
-
-	if (urb == pcu->urb_in)
-		ims_pcu_process_data(pcu, urb);
+	switch (xpad->xtype) {
+	case XTYPE_XBOX360:
+		xpad360_process_packet(xpad, xpad->dev, 0, xpad->idata);
+		break;
+	case XTYPE_XBOX360W:
+		xpad360w_process_packet(xpad, 0, xpad->idata);
+		break;
+	case XTYPE_XBOXONE:
+		xpadone_process_packet(xpad, 0, xpad->idata);
+		break;
+	default:
+		xpad_process_packet(xpad, 0, xpad->idata);
+	}
 
 exit:
 	retval = usb_submit_urb(urb, GFP_ATOMIC);
-	if (retval && retval != -ENODEV)
-		dev_err(pcu->dev, "%s - usb_submit_urb failed with result %d\n",
+	if (retval)
+		dev_err(dev, "%s - usb_submit_urb failed with result %d\n",
 			__func__, retval);
 }
 
-static int ims_pcu_buffers_alloc(struct ims_pcu *pcu)
+/* Callers must hold xpad->odata_lock spinlock */
+static bool xpad_prepare_next_init_packet(struct usb_xpad *xpad)
+{
+	const struct xboxone_init_packet *init_packet;
+
+	if (xpad->xtype != XTYPE_XBOXONE)
+		return false;
+
+	/* Perform initialization sequence for Xbox One pads that require it */
+	while (xpad->init_seq < ARRAY_SIZE(xboxone_init_packets)) {
+		init_packet = &xboxone_init_packets[xpad->init_seq++];
+
+		if (init_packet->idVendor != 0 &&
+		    init_packet->idVendor != xpad->dev->id.vendor)
+			continue;
+
+		if (init_packet->idProduct != 0 &&
+		    init_packet->idProduct != xpad->dev->id.product)
+			continue;
+
+		/* This packet applies to our device, so prepare to send it */
+		memcpy(xpad->odata, init_packet->data, init_packet->len);
+		xpad->irq_out->transfer_buffer_length = init_packet->len;
+
+		/* Update packet with current sequence number */
+		xpad->odata[2] = xpad->odata_serial++;
+		return true;
+	}
+
+	return false;
+}
+
+/* Callers must hold xpad->odata_lock spinlock */
+static bool xpad_prepare_next_out_packet(struct usb_xpad *xpad)
+{
+	struct xpad_output_packet *pkt, *packet = NULL;
+	int i;
+
+	/* We may have init packets to send before we can send user commands */
+	if (xpad_prepare_next_init_packet(xpad))
+		return true;
+
+	for (i = 0; i < XPAD_NUM_OUT_PACKETS; i++) {
+		if (++xpad->last_out_packet >= XPAD_NUM_OUT_PACKETS)
+			xpad->last_out_packet = 0;
+
+		pkt = &xpad->out_packets[xpad->last_out_packet];
+		if (pkt->pending) {
+			dev_dbg(&xpad->intf->dev,
+				"%s - found pending output packet %d\n",
+				__func__, xpad->last_out_packet);
+			packet = pkt;
+			break;
+		}
+	}
+
+	if (packet) {
+		memcpy(xpad->odata, packet->data, packet->len);
+		xpad->irq_out->transfer_buffer_length = packet->len;
+		packet->pending = false;
+		return true;
+	}
+
+	return false;
+}
+
+/* Callers must hold xpad->odata_lock spinlock */
+static int xpad_try_sending_next_out_packet(struct usb_xpad *xpad)
 {
 	int error;
 
-	pcu->urb_in_buf = usb_alloc_coherent(pcu->udev, pcu->max_in_size,
-					     GFP_KERNEL, &pcu->read_dma);
-	if (!pcu->urb_in_buf) {
-		dev_err(pcu->dev,
-			"Failed to allocate memory for read buffer\n");
+	if (!xpad->irq_out_active && xpad_prepare_next_out_packet(xpad)) {
+		usb_anchor_urb(xpad->irq_out, &xpad->irq_out_anchor);
+		error = usb_submit_urb(xpad->irq_out, GFP_ATOMIC);
+		if (error) {
+			dev_err(&xpad->intf->dev,
+				"%s - usb_submit_urb failed with result %d\n",
+				__func__, error);
+			usb_unanchor_urb(xpad->irq_out);
+			return -EIO;
+		}
+
+		xpad->irq_out_active = true;
+	}
+
+	return 0;
+}
+
+static void xpad_irq_out(struct urb *urb)
+{
+	struct usb_xpad *xpad = urb->context;
+	struct device *dev = &xpad->intf->dev;
+	int status = urb->status;
+	int error;
+	unsigned long flags;
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
+
+	switch (status) {
+	case 0:
+		/* success */
+		xpad->irq_out_active = xpad_prepare_next_out_packet(xpad);
+		break;
+
+	case -ECONNRESET:
+	case -ENOENT:
+	case -ESHUTDOWN:
+		/* this urb is terminated, clean up */
+		dev_dbg(dev, "%s - urb shutting down with status: %d\n",
+			__func__, status);
+		xpad->irq_out_active = false;
+		break;
+
+	default:
+		dev_dbg(dev, "%s - nonzero urb status received: %d\n",
+			__func__, status);
+		break;
+	}
+
+	if (xpad->irq_out_active) {
+		usb_anchor_urb(urb, &xpad->irq_out_anchor);
+		error = usb_submit_urb(urb, GFP_ATOMIC);
+		if (error) {
+			dev_err(dev,
+				"%s - usb_submit_urb failed with result %d\n",
+				__func__, error);
+			usb_unanchor_urb(urb);
+			xpad->irq_out_active = false;
+		}
+	}
+
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+}
+
+static int xpad_init_output(struct usb_interface *intf, struct usb_xpad *xpad,
+			struct usb_endpoint_descriptor *ep_irq_out)
+{
+	int error;
+
+	if (xpad->xtype == XTYPE_UNKNOWN)
+		return 0;
+
+	init_usb_anchor(&xpad->irq_out_anchor);
+
+	xpad->odata = usb_alloc_coherent(xpad->udev, XPAD_PKT_LEN,
+					 GFP_KERNEL, &xpad->odata_dma);
+	if (!xpad->odata)
 		return -ENOMEM;
-	}
 
-	pcu->urb_in = usb_alloc_urb(0, GFP_KERNEL);
-	if (!pcu->urb_in) {
-		dev_err(pcu->dev, "Failed to allocate input URB\n");
+	spin_lock_init(&xpad->odata_lock);
+
+	xpad->irq_out = usb_alloc_urb(0, GFP_KERNEL);
+	if (!xpad->irq_out) {
 		error = -ENOMEM;
-		goto err_free_urb_in_buf;
+		goto err_free_coherent;
 	}
 
-	pcu->urb_in->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	pcu->urb_in->transfer_dma = pcu->read_dma;
+	usb_fill_int_urb(xpad->irq_out, xpad->udev,
+			 usb_sndintpipe(xpad->udev, ep_irq_out->bEndpointAddress),
+			 xpad->odata, XPAD_PKT_LEN,
+			 xpad_irq_out, xpad, ep_irq_out->bInterval);
+	xpad->irq_out->transfer_dma = xpad->odata_dma;
+	xpad->irq_out->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-	usb_fill_bulk_urb(pcu->urb_in, pcu->udev,
-			  usb_rcvbulkpipe(pcu->udev,
-					  pcu->ep_in->bEndpointAddress),
-			  pcu->urb_in_buf, pcu->max_in_size,
-			  ims_pcu_irq, pcu);
+	return 0;
+
+err_free_coherent:
+	usb_free_coherent(xpad->udev, XPAD_PKT_LEN, xpad->odata, xpad->odata_dma);
+	return error;
+}
+
+static void xpad_stop_output(struct usb_xpad *xpad)
+{
+	if (xpad->xtype != XTYPE_UNKNOWN) {
+		if (!usb_wait_anchor_empty_timeout(&xpad->irq_out_anchor,
+						   5000)) {
+			dev_warn(&xpad->intf->dev,
+				 "timed out waiting for output URB to complete, killing\n");
+			usb_kill_anchored_urbs(&xpad->irq_out_anchor);
+		}
+	}
+}
+
+static void xpad_deinit_output(struct usb_xpad *xpad)
+{
+	if (xpad->xtype != XTYPE_UNKNOWN) {
+		usb_free_urb(xpad->irq_out);
+		usb_free_coherent(xpad->udev, XPAD_PKT_LEN,
+				xpad->odata, xpad->odata_dma);
+	}
+}
+
+static int xpad_inquiry_pad_presence(struct usb_xpad *xpad)
+{
+	struct xpad_output_packet *packet =
+			&xpad->out_packets[XPAD_OUT_CMD_IDX];
+	unsigned long flags;
+	int retval;
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
+
+	packet->data[0] = 0x08;
+	packet->data[1] = 0x00;
+	packet->data[2] = 0x0F;
+	packet->data[3] = 0xC0;
+	packet->data[4] = 0x00;
+	packet->data[5] = 0x00;
+	packet->data[6] = 0x00;
+	packet->data[7] = 0x00;
+	packet->data[8] = 0x00;
+	packet->data[9] = 0x00;
+	packet->data[10] = 0x00;
+	packet->data[11] = 0x00;
+	packet->len = 12;
+	packet->pending = true;
+
+	/* Reset the sequence so we send out presence first */
+	xpad->last_out_packet = -1;
+	retval = xpad_try_sending_next_out_packet(xpad);
+
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+
+	return retval;
+}
+
+static int xpad_start_xbox_one(struct usb_xpad *xpad)
+{
+	unsigned long flags;
+	int retval;
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
 
 	/*
-	 * We are using usb_bulk_msg() for sending so there is no point
-	 * in allocating memory with usb_alloc_coherent().
+	 * Begin the init sequence by attempting to send a packet.
+	 * We will cycle through the init packet sequence before
+	 * sending any packets from the output ring.
 	 */
-	pcu->urb_out_buf = kmalloc(pcu->max_out_size, GFP_KERNEL);
-	if (!pcu->urb_out_buf) {
-		dev_err(pcu->dev, "Failed to allocate memory for write buffer\n");
+	xpad->init_seq = 0;
+	retval = xpad_try_sending_next_out_packet(xpad);
+
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+
+	return retval;
+}
+
+static void xpadone_ack_mode_report(struct usb_xpad *xpad, u8 seq_num)
+{
+	unsigned long flags;
+	struct xpad_output_packet *packet =
+			&xpad->out_packets[XPAD_OUT_CMD_IDX];
+	static const u8 mode_report_ack[] = {
+		0x01, 0x20, 0x00, 0x09, 0x00, 0x07, 0x20, 0x02,
+		0x00, 0x00, 0x00, 0x00, 0x00
+	};
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
+
+	packet->len = sizeof(mode_report_ack);
+	memcpy(packet->data, mode_report_ack, packet->len);
+	packet->data[2] = seq_num;
+	packet->pending = true;
+
+	/* Reset the sequence so we send out the ack now */
+	xpad->last_out_packet = -1;
+	xpad_try_sending_next_out_packet(xpad);
+
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+}
+
+#ifdef CONFIG_JOYSTICK_XPAD_FF
+static int xpad_play_effect(struct input_dev *dev, void *data, struct ff_effect *effect)
+{
+	struct usb_xpad *xpad = input_get_drvdata(dev);
+	struct xpad_output_packet *packet = &xpad->out_packets[XPAD_OUT_FF_IDX];
+	__u16 strong;
+	__u16 weak;
+	int retval;
+	unsigned long flags;
+
+	if (effect->type != FF_RUMBLE)
+		return 0;
+
+	strong = effect->u.rumble.strong_magnitude;
+	weak = effect->u.rumble.weak_magnitude;
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
+
+	switch (xpad->xtype) {
+	case XTYPE_XBOX:
+		packet->data[0] = 0x00;
+		packet->data[1] = 0x06;
+		packet->data[2] = 0x00;
+		packet->data[3] = strong / 256;	/* left actuator */
+		packet->data[4] = 0x00;
+		packet->data[5] = weak / 256;	/* right actuator */
+		packet->len = 6;
+		packet->pending = true;
+		break;
+
+	case XTYPE_XBOX360:
+		packet->data[0] = 0x00;
+		packet->data[1] = 0x08;
+		packet->data[2] = 0x00;
+		packet->data[3] = strong / 256;  /* left actuator? */
+		packet->data[4] = weak / 256;	/* right actuator? */
+		packet->data[5] = 0x00;
+		packet->data[6] = 0x00;
+		packet->data[7] = 0x00;
+		packet->len = 8;
+		packet->pending = true;
+		break;
+
+	case XTYPE_XBOX360W:
+		packet->data[0] = 0x00;
+		packet->data[1] = 0x01;
+		packet->data[2] = 0x0F;
+		packet->data[3] = 0xC0;
+		packet->data[4] = 0x00;
+		packet->data[5] = strong / 256;
+		packet->data[6] = weak / 256;
+		packet->data[7] = 0x00;
+		packet->data[8] = 0x00;
+		packet->data[9] = 0x00;
+		packet->data[10] = 0x00;
+		packet->data[11] = 0x00;
+		packet->len = 12;
+		packet->pending = true;
+		break;
+
+	case XTYPE_XBOXONE:
+		packet->data[0] = 0x09; /* activate rumble */
+		packet->data[1] = 0x00;
+		packet->data[2] = xpad->odata_serial++;
+		packet->data[3] = 0x09;
+		packet->data[4] = 0x00;
+		packet->data[5] = 0x0F;
+		packet->data[6] = 0x00;
+		packet->data[7] = 0x00;
+		packet->data[8] = strong / 512;	/* left actuator */
+		packet->data[9] = weak / 512;	/* right actuator */
+		packet->data[10] = 0xFF; /* on period */
+		packet->data[11] = 0x00; /* off period */
+		packet->data[12] = 0xFF; /* repeat count */
+		packet->len = 13;
+		packet->pending = true;
+		break;
+
+	default:
+		dev_dbg(&xpad->dev->dev,
+			"%s - rumble command sent to unsupported xpad type: %d\n",
+			__func__, xpad->xtype);
+		retval = -EINVAL;
+		goto out;
+	}
+
+	retval = xpad_try_sending_next_out_packet(xpad);
+
+out:
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+	return retval;
+}
+
+static int xpad_init_ff(struct usb_xpad *xpad)
+{
+	if (xpad->xtype == XTYPE_UNKNOWN)
+		return 0;
+
+	input_set_capability(xpad->dev, EV_FF, FF_RUMBLE);
+
+	return input_ff_create_memless(xpad->dev, NULL, xpad_play_effect);
+}
+
+#else
+static int xpad_init_ff(struct usb_xpad *xpad) { return 0; }
+#endif
+
+#if defined(CONFIG_JOYSTICK_XPAD_LEDS)
+#include <linux/leds.h>
+#include <linux/idr.h>
+
+static DEFINE_IDA(xpad_pad_seq);
+
+struct xpad_led {
+	char name[16];
+	struct led_classdev led_cdev;
+	struct usb_xpad *xpad;
+};
+
+/**
+ * set the LEDs on Xbox360 / Wireless Controllers
+ * @param command
+ *  0: off
+ *  1: all blink, then previous setting
+ *  2: 1/top-left blink, then on
+ *  3: 2/top-right blink, then on
+ *  4: 3/bottom-left blink, then on
+ *  5: 4/bottom-right blink, then on
+ *  6: 1/top-left on
+ *  7: 2/top-right on
+ *  8: 3/bottom-left on
+ *  9: 4/bottom-right on
+ * 10: rotate
+ * 11: blink, based on previous setting
+ * 12: slow blink, based on previous setting
+ * 13: rotate with two lights
+ * 14: persistent slow all blink
+ * 15: blink once, then previous setting
+ */
+static void xpad_send_led_command(struct usb_xpad *xpad, int command)
+{
+	struct xpad_output_packet *packet =
+			&xpad->out_packets[XPAD_OUT_LED_IDX];
+	unsigned long flags;
+
+	command %= 16;
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
+
+	switch (xpad->xtype) {
+	case XTYPE_XBOX360:
+		packet->data[0] = 0x01;
+		packet->data[1] = 0x03;
+		packet->data[2] = command;
+		packet->len = 3;
+		packet->pending = true;
+		break;
+
+	case XTYPE_XBOX360W:
+		packet->data[0] = 0x00;
+		packet->data[1] = 0x00;
+		packet->data[2] = 0x08;
+		packet->data[3] = 0x40 + command;
+		packet->data[4] = 0x00;
+		packet->data[5] = 0x00;
+		packet->data[6] = 0x00;
+		packet->data[7] = 0x00;
+		packet->data[8] = 0x00;
+		packet->data[9] = 0x00;
+		packet->data[10] = 0x00;
+		packet->data[11] = 0x00;
+		packet->len = 12;
+		packet->pending = true;
+		break;
+	}
+
+	xpad_try_sending_next_out_packet(xpad);
+
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+}
+
+/*
+ * Light up the segment corresponding to the pad number on
+ * Xbox 360 Controllers.
+ */
+static void xpad_identify_controller(struct usb_xpad *xpad)
+{
+	led_set_brightness(&xpad->led->led_cdev, (xpad->pad_nr % 4) + 2);
+}
+
+static void xpad_led_set(struct led_classdev *led_cdev,
+			 enum led_brightness value)
+{
+	struct xpad_led *xpad_led = container_of(led_cdev,
+						 struct xpad_led, led_cdev);
+
+	xpad_send_led_command(xpad_led->xpad, value);
+}
+
+static int xpad_led_probe(struct usb_xpad *xpad)
+{
+	struct xpad_led *led;
+	struct led_classdev *led_cdev;
+	int error;
+
+	if (xpad->xtype != XTYPE_XBOX360 && xpad->xtype != XTYPE_XBOX360W)
+		return 0;
+
+	xpad->led = led = kzalloc(sizeof(struct xpad_led), GFP_KERNEL);
+	if (!led)
+		return -ENOMEM;
+
+	xpad->pad_nr = ida_simple_get(&xpad_pad_seq, 0, 0, GFP_KERNEL);
+	if (xpad->pad_nr < 0) {
+		error = xpad->pad_nr;
+		goto err_free_mem;
+	}
+
+	snprintf(led->name, sizeof(led->name), "xpad%d", xpad->pad_nr);
+	led->xpad = xpad;
+
+	led_cdev = &led->led_cdev;
+	led_cdev->name = led->name;
+	led_cdev->brightness_set = xpad_led_set;
+	led_cdev->flags = LED_CORE_SUSPENDRESUME;
+
+	error = led_classdev_register(&xpad->udev->dev, led_cdev);
+	if (error)
+		goto err_free_id;
+
+	xpad_identify_controller(xpad);
+
+	return 0;
+
+err_free_id:
+	ida_simple_remove(&xpad_pad_seq, xpad->pad_nr);
+err_free_mem:
+	kfree(led);
+	xpad->led = NULL;
+	return error;
+}
+
+static void xpad_led_disconnect(struct usb_xpad *xpad)
+{
+	struct xpad_led *xpad_led = xpad->led;
+
+	if (xpad_led) {
+		led_classdev_unregister(&xpad_led->led_cdev);
+		ida_simple_remove(&xpad_pad_seq, xpad->pad_nr);
+		kfree(xpad_led);
+	}
+}
+#else
+static int xpad_led_probe(struct usb_xpad *xpad) { return 0; }
+static void xpad_led_disconnect(struct usb_xpad *xpad) { }
+#endif
+
+static int xpad_start_input(struct usb_xpad *xpad)
+{
+	int error;
+
+	if (usb_submit_urb(xpad->irq_in, GFP_KERNEL))
+		return -EIO;
+
+	if (xpad->xtype == XTYPE_XBOXONE) {
+		error = xpad_start_xbox_one(xpad);
+		if (error) {
+			usb_kill_urb(xpad->irq_in);
+			return error;
+		}
+	}
+
+	return 0;
+}
+
+static void xpad_stop_input(struct usb_xpad *xpad)
+{
+	usb_kill_urb(xpad->irq_in);
+}
+
+static void xpad360w_poweroff_controller(struct usb_xpad *xpad)
+{
+	unsigned long flags;
+	struct xpad_output_packet *packet =
+			&xpad->out_packets[XPAD_OUT_CMD_IDX];
+
+	spin_lock_irqsave(&xpad->odata_lock, flags);
+
+	packet->data[0] = 0x00;
+	packet->data[1] = 0x00;
+	packet->data[2] = 0x08;
+	packet->data[3] = 0xC0;
+	packet->data[4] = 0x00;
+	packet->data[5] = 0x00;
+	packet->data[6] = 0x00;
+	packet->data[7] = 0x00;
+	packet->data[8] = 0x00;
+	packet->data[9] = 0x00;
+	packet->data[10] = 0x00;
+	packet->data[11] = 0x00;
+	packet->len = 12;
+	packet->pending = true;
+
+	/* Reset the sequence so we send out poweroff now */
+	xpad->last_out_packet = -1;
+	xpad_try_sending_next_out_packet(xpad);
+
+	spin_unlock_irqrestore(&xpad->odata_lock, flags);
+}
+
+static int xpad360w_start_input(struct usb_xpad *xpad)
+{
+	int error;
+
+	error = usb_submit_urb(xpad->irq_in, GFP_KERNEL);
+	if (error)
+		return -EIO;
+
+	/*
+	 * Send presence packet.
+	 * This will force the controller to resend connection packets.
+	 * This is useful in the case we activate the module after the
+	 * adapter has been plugged in, as it won't automatically
+	 * send us info about the controllers.
+	 */
+	error = xpad_inquiry_pad_presence(xpad);
+	if (error) {
+		usb_kill_urb(xpad->irq_in);
+		return error;
+	}
+
+	return 0;
+}
+
+static void xpad360w_stop_input(struct usb_xpad *xpad)
+{
+	usb_kill_urb(xpad->irq_in);
+
+	/* Make sure we are done with presence work if it was scheduled */
+	flush_work(&xpad->work);
+}
+
+static int xpad_open(struct input_dev *dev)
+{
+	struct usb_xpad *xpad = input_get_drvdata(dev);
+
+	return xpad_start_input(xpad);
+}
+
+static void xpad_close(struct input_dev *dev)
+{
+	struct usb_xpad *xpad = input_get_drvdata(dev);
+
+	xpad_stop_input(xpad);
+}
+
+static void xpad_set_up_abs(struct input_dev *input_dev, signed short abs)
+{
+	struct usb_xpad *xpad = input_get_drvdata(input_dev);
+
+	switch (abs) {
+	case ABS_X:
+	case ABS_Y:
+	case ABS_RX:
+	case ABS_RY:	/* the two sticks */
+		input_set_abs_params(input_dev, abs, -32768, 32767, 16, 128);
+		break;
+	case ABS_Z:
+	case ABS_RZ:	/* the triggers (if mapped to axes) */
+		if (xpad->xtype == XTYPE_XBOXONE)
+			input_set_abs_params(input_dev, abs, 0, 1023, 0, 0);
+		else
+			input_set_abs_params(input_dev, abs, 0, 255, 0, 0);
+		break;
+	case ABS_HAT0X:
+	case ABS_HAT0Y:	/* the d-pad (only if dpad is mapped to axes */
+		input_set_abs_params(input_dev, abs, -1, 1, 0, 0);
+		break;
+	default:
+		input_set_abs_params(input_dev, abs, 0, 0, 0, 0);
+		break;
+	}
+}
+
+static void xpad_deinit_input(struct usb_xpad *xpad)
+{
+	if (xpad->input_created) {
+		xpad->input_created = false;
+		xpad_led_disconnect(xpad);
+		input_unregister_device(xpad->dev);
+	}
+}
+
+static int xpad_init_input(struct usb_xpad *xpad)
+{
+	struct input_dev *input_dev;
+	int i, error;
+
+	input_dev = input_allocate_device();
+	if (!input_dev)
+		return -ENOMEM;
+
+	xpad->dev = input_dev;
+	input_dev->name = xpad->name;
+	input_dev->phys = xpad->phys;
+	usb_to_input_id(xpad->udev, &input_dev->id);
+
+	if (xpad->xtype == XTYPE_XBOX360W) {
+		/* x360w controllers and the receiver have different ids */
+		input_dev->id.product = 0x02a1;
+	}
+
+	input_dev->dev.parent = &xpad->intf->dev;
+
+	input_set_drvdata(input_dev, xpad);
+
+	if (xpad->xtype != XTYPE_XBOX360W) {
+		input_dev->open = xpad_open;
+		input_dev->close = xpad_close;
+	}
+
+	if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
+		/* set up axes */
+		for (i = 0; xpad_abs[i] >= 0; i++)
+			xpad_set_up_abs(input_dev, xpad_abs[i]);
+	}
+
+	/* set up standard buttons */
+	for (i = 0; xpad_common_btn[i] >= 0; i++)
+		input_set_capability(input_dev, EV_KEY, xpad_common_btn[i]);
+
+	/* set up model-specific ones */
+	if (xpad->xtype == XTYPE_XBOX360 || xpad->xtype == XTYPE_XBOX360W ||
+	    xpad->xtype == XTYPE_XBOXONE) {
+		for (i = 0; xpad360_btn[i] >= 0; i++)
+			input_set_capability(input_dev, EV_KEY, xpad360_btn[i]);
+	} else {
+		for (i = 0; xpad_btn[i] >= 0; i++)
+			input_set_capability(input_dev, EV_KEY, xpad_btn[i]);
+	}
+
+	if (xpad->mapping & MAP_DPAD_TO_BUTTONS) {
+		for (i = 0; xpad_btn_pad[i] >= 0; i++)
+			input_set_capability(input_dev, EV_KEY,
+					     xpad_btn_pad[i]);
+	}
+
+	/*
+	 * This should be a simple else block. However historically
+	 * xbox360w has mapped DPAD to buttons while xbox360 did not. This
+	 * made no sense, but now we can not just switch back and have to
+	 * support both behaviors.
+	 */
+	if (!(xpad->mapping & MAP_DPAD_TO_BUTTONS) ||
+	    xpad->xtype == XTYPE_XBOX360W) {
+		for (i = 0; xpad_abs_pad[i] >= 0; i++)
+			xpad_set_up_abs(input_dev, xpad_abs_pad[i]);
+	}
+
+	if (xpad->mapping & MAP_TRIGGERS_TO_BUTTONS) {
+		for (i = 0; xpad_btn_triggers[i] >= 0; i++)
+			input_set_capability(input_dev, EV_KEY,
+					     xpad_btn_triggers[i]);
+	} else {
+		for (i = 0; xpad_abs_triggers[i] >= 0; i++)
+			xpad_set_up_abs(input_dev, xpad_abs_triggers[i]);
+	}
+
+	error = xpad_init_ff(xpad);
+	if (error)
+		goto err_free_input;
+
+	error = xpad_led_probe(xpad);
+	if (error)
+		goto err_destroy_ff;
+
+	error = input_register_device(xpad->dev);
+	if (error)
+		goto err_disconnect_led;
+
+	xpad->input_created = true;
+	return 0;
+
+err_disconnect_led:
+	xpad_led_disconnect(xpad);
+err_destroy_ff:
+	input_ff_destroy(input_dev);
+err_free_input:
+	input_free_device(input_dev);
+	return error;
+}
+
+static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id)
+{
+	struct usb_device *udev = interface_to_usbdev(intf);
+	struct usb_xpad *xpad;
+	struct usb_endpoint_descriptor *ep_irq_in, *ep_irq_out;
+	int i, error;
+
+	if (intf->cur_altsetting->desc.bNumEndpoints != 2)
+		return -ENODEV;
+
+	for (i = 0; xpad_device[i].idVendor; i++) {
+		if ((le16_to_cpu(udev->descriptor.idVendor) == xpad_device[i].idVendor) &&
+		    (le16_to_cpu(udev->descriptor.idProduct) == xpad_device[i].idProduct))
+			break;
+	}
+
+	xpad = kzalloc(sizeof(struct usb_xpad), GFP_KERNEL);
+	if (!xpad)
+		return -ENOMEM;
+
+	usb_make_path(udev, xpad->phys, sizeof(xpad->phys));
+	strlcat(xpad->phys, "/input0", sizeof(xpad->phys));
+
+	xpad->idata = usb_alloc_coherent(udev, XPAD_PKT_LEN,
+					 GFP_KERNEL, &xpad->idata_dma);
+	if (!xpad->idata) {
 		error = -ENOMEM;
+		goto err_free_mem;
+	}
+
+	xpad->irq_in = usb_alloc_urb(0, GFP_KERNEL);
+	if (!xpad->irq_in) {
+		error = -ENOMEM;
+		goto err_free_idata;
+	}
+
+	xpad->udev = udev;
+	xpad->intf = intf;
+	xpad->mapping = xpad_device[i].mapping;
+	xpad->xtype = xpad_device[i].xtype;
+	xpad->name = xpad_device[i].name;
+	INIT_WORK(&xpad->work, xpad_presence_work);
+
+	if (xpad->xtype == XTYPE_UNKNOWN) {
+		if (intf->cur_altsetting->desc.bInterfaceClass == USB_CLASS_VENDOR_SPEC) {
+			if (intf->cur_altsetting->desc.bInterfaceProtocol == 129)
+				xpad->xtype = XTYPE_XBOX360W;
+			else if (intf->cur_altsetting->desc.bInterfaceProtocol == 208)
+				xpad->xtype = XTYPE_XBOXONE;
+			else
+				xpad->xtype = XTYPE_XBOX360;
+		} else {
+			xpad->xtype = XTYPE_XBOX;
+		}
+
+		if (dpad_to_buttons)
+			xpad->mapping |= MAP_DPAD_TO_BUTTONS;
+		if (triggers_to_buttons)
+			xpad->mapping |= MAP_TRIGGERS_TO_BUTTONS;
+		if (sticks_to_null)
+			xpad->mapping |= MAP_STICKS_TO_NULL;
+	}
+
+	if (xpad->xtype == XTYPE_XBOXONE &&
+	    intf->cur_altsetting->desc.bInterfaceNumber != GIP_WIRED_INTF_DATA) {
+		/*
+		 * The Xbox One controller lists three interfaces all with the
+		 * same interface class, subclass and protocol. Differentiate by
+		 * interface number.
+		 */
+		error = -ENODEV;
 		goto err_free_in_urb;
 	}
 
-	pcu->urb_ctrl_buf = usb_alloc_coherent(pcu->udev, pcu->max_ctrl_size,
-					       GFP_KERNEL, &pcu->ctrl_dma);
-	if (!pcu->urb_ctrl_buf) {
-		dev_err(pcu->dev,
-			"Failed to allocate memory for read buffer\n");
-		error = -ENOMEM;
-		goto err_free_urb_out_buf;
+	ep_irq_in = ep_irq_out = NULL;
+
+	for (i = 0; i < 2; i++) {
+		struct usb_endpoint_descriptor *ep =
+				&intf->cur_altsetting->endpoint[i].desc;
+
+		if (usb_endpoint_xfer_int(ep)) {
+			if (usb_endpoint_dir_in(ep))
+				ep_irq_in = ep;
+			else
+				ep_irq_out = ep;
+		}
 	}
 
-	pcu->urb_ctrl = usb_alloc_urb(0, GFP_KERNEL);
-	if (!pcu->urb_ctrl) {
-		dev_err(pcu->dev, "Failed to allocate input URB\n");
-		error = -ENOMEM;
-		goto err_free_urb_ctrl_buf;
+	if (!ep_irq_in || !ep_irq_out) {
+		error = -ENODEV;
+		goto err_free_in_urb;
 	}
 
-	pcu->urb_ctrl->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	pcu->urb_ctrl->transfer_dma = pcu->ctrl_dma;
+	error = xpad_init_output(intf, xpad, ep_irq_out);
+	if (error)
+		goto err_free_in_urb;
 
-	usb_fill_int_urb(pcu->urb_ctrl, pcu->udev,
-			  usb_rcvintpipe(pcu->udev,
-					 pcu->ep_ctrl->bEndpointAddress),
-			  pcu->urb_ctrl_buf, pcu->max_ctrl_size,
-			  ims_pcu_irq, pcu, pcu->ep_ctrl->bInterval);
+	usb_fill_int_urb(xpad->irq_in, udev,
+			 usb_rcvintpipe(udev, ep_irq_in->bEndpointAddress),
+			 xpad->idata, XPAD_PKT_LEN, xpad_irq_in,
+			 xpad, ep_irq_in->bInterval);
+	xpad->irq_in->transfer_dma = xpad->idata_dma;
+	xpad->irq_in->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
+	usb_set_intfdata(intf, xpad);
+
+	if (xpad->xtype == XTYPE_XBOX360W) {
+		/*
+		 * Submit the int URB immediately rather than waiting for open
+		 * because we get status messages from the device whether
+		 * or not any controllers are attached.  In fact, it's
+		 * exactly the message that a controller has arrived that
+		 * we're waiting for.
+		 */
+		error = xpad360w_start_input(xpad);
+		if (error)
+			goto err_deinit_output;
+		/*
+		 * Wireless controllers require RESET_RESUME to work properly
+		 * after suspend. Ideally this quirk should be in usb core
+		 * quirk list, but we have too many vendors producing these
+		 * controllers and we'd need to maintain 2 identical lists
+		 * here in this driver and in usb core.
+		 */
+		udev->quirks |= USB_QUIRK_RESET_RESUME;
+	} else {
+		error = xpad_init_input(xpad);
+		if (error)
+			goto err_deinit_output;
+	}
 	return 0;
 
-err_free_urb_ctrl_buf:
-	usb_free_coherent(pcu->udev, pcu->max_ctrl_size,
-			  pcu->urb_ctrl_buf, pcu->ctrl_dma);
-err_free_urb_out_buf:
-	kfree(pcu->urb_out_buf);
+err_deinit_output:
+	xpad_deinit_output(xpad);
 err_free_in_urb:
-	usb_free_urb(pcu->urb_in);
-err_free_urb_in_buf:
-	usb_free_coherent(pcu->udev, pcu->max_in_size,
-			  pcu->urb_in_buf, pcu->read_dma);
+	usb_free_urb(xpad->irq_in);
+err_free_idata:
+	usb_free_coherent(udev, XPAD_PKT_LEN, xpad->idata, xpad->idata_dma);
+err_free_mem:
+	kfree(xpad);
 	return error;
 }
 
-static void ims_pcu_buffers_free(struct ims_pcu *pcu)
+static void xpad_disconnect(struct usb_interface *intf)
 {
-	usb_kill_urb(pcu->urb_in);
-	usb_free_urb(pcu->urb_in);
+	struct usb_xpad *xpad = usb_get_intfdata(intf);
 
-	usb_free_coherent(pcu->udev, pcu->max_out_size,
-			  pcu->urb_in_buf, pcu->read_dma);
+	if (xpad->xtype == XTYPE_XBOX360W)
+		xpad360w_stop_input(xpad);
 
-	kfree(pcu->urb_out_buf);
-
-	usb_kill_urb(pcu->urb_ctrl);
-	usb_free_urb(pcu->urb_ctrl);
-
-	usb_free_coherent(pcu->udev, pcu->max_ctrl_size,
-			  pcu->urb_ctrl_buf, pcu->ctrl_dma);
-}
-
-static const struct usb_cdc_union_desc *
-ims_pcu_get_cdc_union_desc(struct usb_interface *intf)
-{
-	const void *buf = intf->altsetting->extra;
-	size_t buflen = intf->altsetting->extralen;
-	struct usb_cdc_union_desc *union_desc;
-
-	if (!buf) {
-		dev_err(&intf->dev, "Missing descriptor data\n");
-		return NULL;
-	}
-
-	if (!buflen) {
-		dev_err(&intf->dev, "Zero length descriptor\n");
-		return NULL;
-	}
-
-	while (buflen >= sizeof(*union_desc)) {
-		union_desc = (struct usb_cdc_union_desc *)buf;
-
-		if (union_desc->bLength > buflen) {
-			dev_err(&intf->dev, "Too large descriptor\n");
-			return NULL;
-		}
-
-		if (union_desc->bDescriptorType == USB_DT_CS_INTERFACE &&
-		    union_desc->bDescriptorSubType == USB_CDC_UNION_TYPE) {
-			dev_dbg(&intf->dev, "Found union header\n");
-
-			if (union_desc->bLength >= sizeof(*union_desc))
-				return union_desc;
-
-			dev_err(&intf->dev,
-				"Union descriptor to short (%d vs %zd\n)",
-				union_desc->bLength, sizeof(*union_desc));
-			return NULL;
-		}
-
-		buflen -= union_desc->bLength;
-		buf += union_desc->bLength;
-	}
-
-	dev_err(&intf->dev, "Missing CDC union descriptor\n");
-	return NULL;
-}
-
-static int ims_pcu_parse_cdc_data(struct usb_interface *intf, struct ims_pcu *pcu)
-{
-	const struct usb_cdc_union_desc *union_desc;
-	struct usb_host_interface *alt;
-
-	union_desc = ims_pcu_get_cdc_union_desc(intf);
-	if (!union_desc)
-		return -EINVAL;
-
-	pcu->ctrl_intf = usb_ifnum_to_if(pcu->udev,
-					 union_desc->bMasterInterface0);
-	if (!pcu->ctrl_intf)
-		return -EINVAL;
-
-	alt = pcu->ctrl_intf->cur_altsetting;
-
-	if (alt->desc.bNumEndpoints < 1)
-		return -ENODEV;
-
-	pcu->ep_ctrl = &alt->endpoint[0].desc;
-	pcu->max_ctrl_size = usb_endpoint_maxp(pcu->ep_ctrl);
-
-	pcu->data_intf = usb_ifnum_to_if(pcu->udev,
-					 union_desc->bSlaveInterface0);
-	if (!pcu->data_intf)
-		return -EINVAL;
-
-	alt = pcu->data_intf->cur_altsetting;
-	if (alt->desc.bNumEndpoints != 2) {
-		dev_err(pcu->dev,
-			"Incorrect number of endpoints on data interface (%d)\n",
-			alt->desc.bNumEndpoints);
-		return -EINVAL;
-	}
-
-	pcu->ep_out = &alt->endpoint[0].desc;
-	if (!usb_endpoint_is_bulk_out(pcu->ep_out)) {
-		dev_err(pcu->dev,
-			"First endpoint on data interface is not BULK OUT\n");
-		return -EINVAL;
-	}
-
-	pcu->max_out_size = usb_endpoint_maxp(pcu->ep_out);
-	if (pcu->max_out_size < 8) {
-		dev_err(pcu->dev,
-			"Max OUT packet size is too small (%zd)\n",
-			pcu->max_out_size);
-		return -EINVAL;
-	}
-
-	pcu->ep_in = &alt->endpoint[1].desc;
-	if (!usb_endpoint_is_bulk_in(pcu->ep_in)) {
-		dev_err(pcu->dev,
-			"Second endpoint on data interface is not BULK IN\n");
-		return -EINVAL;
-	}
-
-	pcu->max_in_size = usb_endpoint_maxp(pcu->ep_in);
-	if (pcu->max_in_size < 8) {
-		dev_err(pcu->dev,
-			"Max IN packet size is too small (%zd)\n",
-			pcu->max_in_size);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int ims_pcu_start_io(struct ims_pcu *pcu)
-{
-	int error;
-
-	error = usb_submit_urb(pcu->urb_ctrl, GFP_KERNEL);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to start control IO - usb_submit_urb failed with result: %d\n",
-			error);
-		return -EIO;
-	}
-
-	error = usb_submit_urb(pcu->urb_in, GFP_KERNEL);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to start IO - usb_submit_urb failed with result: %d\n",
-			error);
-		usb_kill_urb(pcu->urb_ctrl);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static void ims_pcu_stop_io(struct ims_pcu *pcu)
-{
-	usb_kill_urb(pcu->urb_in);
-	usb_kill_urb(pcu->urb_ctrl);
-}
-
-static int ims_pcu_line_setup(struct ims_pcu *pcu)
-{
-	struct usb_host_interface *interface = pcu->ctrl_intf->cur_altsetting;
-	struct usb_cdc_line_coding *line = (void *)pcu->cmd_buf;
-	int error;
-
-	memset(line, 0, sizeof(*line));
-	line->dwDTERate = cpu_to_le32(57600);
-	line->bDataBits = 8;
-
-	error = usb_control_msg(pcu->udev, usb_sndctrlpipe(pcu->udev, 0),
-				USB_CDC_REQ_SET_LINE_CODING,
-				USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-				0, interface->desc.bInterfaceNumber,
-				line, sizeof(struct usb_cdc_line_coding),
-				5000);
-	if (error < 0) {
-		dev_err(pcu->dev, "Failed to set line coding, error: %d\n",
-			error);
-		return error;
-	}
-
-	error = usb_control_msg(pcu->udev, usb_sndctrlpipe(pcu->udev, 0),
-				USB_CDC_REQ_SET_CONTROL_LINE_STATE,
-				USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-				0x03, interface->desc.bInterfaceNumber,
-				NULL, 0, 5000);
-	if (error < 0) {
-		dev_err(pcu->dev, "Failed to set line state, error: %d\n",
-			error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int ims_pcu_get_device_info(struct ims_pcu *pcu)
-{
-	int error;
-
-	error = ims_pcu_get_info(pcu);
-	if (error)
-		return error;
-
-	error = ims_pcu_execute_query(pcu, GET_FW_VERSION);
-	if (error) {
-		dev_err(pcu->dev,
-			"GET_FW_VERSION command failed, error: %d\n", error);
-		return error;
-	}
-
-	snprintf(pcu->fw_version, sizeof(pcu->fw_version),
-		 "%02d%02d%02d%02d.%c%c",
-		 pcu->cmd_buf[2], pcu->cmd_buf[3], pcu->cmd_buf[4], pcu->cmd_buf[5],
-		 pcu->cmd_buf[6], pcu->cmd_buf[7]);
-
-	error = ims_pcu_execute_query(pcu, GET_BL_VERSION);
-	if (error) {
-		dev_err(pcu->dev,
-			"GET_BL_VERSION command failed, error: %d\n", error);
-		return error;
-	}
-
-	snprintf(pcu->bl_version, sizeof(pcu->bl_version),
-		 "%02d%02d%02d%02d.%c%c",
-		 pcu->cmd_buf[2], pcu->cmd_buf[3], pcu->cmd_buf[4], pcu->cmd_buf[5],
-		 pcu->cmd_buf[6], pcu->cmd_buf[7]);
-
-	error = ims_pcu_execute_query(pcu, RESET_REASON);
-	if (error) {
-		dev_err(pcu->dev,
-			"RESET_REASON command failed, error: %d\n", error);
-		return error;
-	}
-
-	snprintf(pcu->reset_reason, sizeof(pcu->reset_reason),
-		 "%02x", pcu->cmd_buf[IMS_PCU_DATA_OFFSET]);
-
-	dev_dbg(pcu->dev,
-		"P/N: %s, MD: %s, S/N: %s, FW: %s, BL: %s, RR: %s\n",
-		pcu->part_number,
-		pcu->date_of_manufacturing,
-		pcu->serial_number,
-		pcu->fw_version,
-		pcu->bl_version,
-		pcu->reset_reason);
-
-	return 0;
-}
-
-static int ims_pcu_identify_type(struct ims_pcu *pcu, u8 *device_id)
-{
-	int error;
-
-	error = ims_pcu_execute_query(pcu, GET_DEVICE_ID);
-	if (error) {
-		dev_err(pcu->dev,
-			"GET_DEVICE_ID command failed, error: %d\n", error);
-		return error;
-	}
-
-	*device_id = pcu->cmd_buf[IMS_PCU_DATA_OFFSET];
-	dev_dbg(pcu->dev, "Detected device ID: %d\n", *device_id);
-
-	return 0;
-}
-
-static int ims_pcu_init_application_mode(struct ims_pcu *pcu)
-{
-	static atomic_t device_no = ATOMIC_INIT(-1);
-
-	const struct ims_pcu_device_info *info;
-	int error;
-
-	error = ims_pcu_get_device_info(pcu);
-	if (error) {
-		/* Device does not respond to basic queries, hopeless */
-		return error;
-	}
-
-	error = ims_pcu_identify_type(pcu, &pcu->device_id);
-	if (error) {
-		dev_err(pcu->dev,
-			"Failed to identify device, error: %d\n", error);
-		/*
-		 * Do not signal error, but do not create input nor
-		 * backlight devices either, let userspace figure this
-		 * out (flash a new firmware?).
-		 */
-		return 0;
-	}
-
-	if (pcu->device_id >= ARRAY_SIZE(ims_pcu_device_info) ||
-	    !ims_pcu_device_info[pcu->device_id].keymap) {
-		dev_err(pcu->dev, "Device ID %d is not valid\n", pcu->device_id);
-		/* Same as above, punt to userspace */
-		return 0;
-	}
-
-	/* Device appears to be operable, complete initialization */
-	pcu->device_no = atomic_inc_return(&device_no);
+	xpad_deinit_input(xpad);
 
 	/*
-	 * PCU-B devices, both GEN_1 and GEN_2 do not have OFN sensor
+	 * Now that both input device and LED device are gone we can
+	 * stop output URB.
 	 */
-	if (pcu->device_id != IMS_PCU_PCU_B_DEVICE_ID) {
-		error = sysfs_create_group(&pcu->dev->kobj,
-					   &ims_pcu_ofn_attr_group);
-		if (error)
-			return error;
-	}
+	xpad_stop_output(xpad);
 
-	error = ims_pcu_setup_backlight(pcu);
-	if (error)
-		return error;
+	xpad_deinit_output(xpad);
 
-	info = &ims_pcu_device_info[pcu->device_id];
-	error = ims_pcu_setup_buttons(pcu, info->keymap, info->keymap_len);
-	if (error)
-		goto err_destroy_backlight;
+	usb_free_urb(xpad->irq_in);
+	usb_free_coherent(xpad->udev, XPAD_PKT_LEN,
+			xpad->idata, xpad->idata_dma);
 
-	if (info->has_gamepad) {
-		error = ims_pcu_setup_gamepad(pcu);
-		if (error)
-			goto err_destroy_buttons;
-	}
-
-	pcu->setup_complete = true;
-
-	return 0;
-
-err_destroy_buttons:
-	ims_pcu_destroy_buttons(pcu);
-err_destroy_backlight:
-	ims_pcu_destroy_backlight(pcu);
-	return error;
-}
-
-static void ims_pcu_destroy_application_mode(struct ims_pcu *pcu)
-{
-	if (pcu->setup_complete) {
-		pcu->setup_complete = false;
-		mb(); /* make sure flag setting is not reordered */
-
-		if (pcu->gamepad)
-			ims_pcu_destroy_gamepad(pcu);
-		ims_pcu_destroy_buttons(pcu);
-		ims_pcu_destroy_backlight(pcu);
-
-		if (pcu->device_id != IMS_PCU_PCU_B_DEVICE_ID)
-			sysfs_remove_group(&pcu->dev->kobj,
-					   &ims_pcu_ofn_attr_group);
-	}
-}
-
-static int ims_pcu_init_bootloader_mode(struct ims_pcu *pcu)
-{
-	int error;
-
-	error = ims_pcu_execute_bl_command(pcu, QUERY_DEVICE, NULL, 0,
-					   IMS_PCU_CMD_RESPONSE_TIMEOUT);
-	if (error) {
-		dev_err(pcu->dev, "Bootloader does not respond, aborting\n");
-		return error;
-	}
-
-	pcu->fw_start_addr =
-		get_unaligned_le32(&pcu->cmd_buf[IMS_PCU_DATA_OFFSET + 11]);
-	pcu->fw_end_addr =
-		get_unaligned_le32(&pcu->cmd_buf[IMS_PCU_DATA_OFFSET + 15]);
-
-	dev_info(pcu->dev,
-		 "Device is in bootloader mode (addr 0x%08x-0x%08x), requesting firmware\n",
-		 pcu->fw_start_addr, pcu->fw_end_addr);
-
-	error = request_firmware_nowait(THIS_MODULE, true,
-					IMS_PCU_FIRMWARE_NAME,
-					pcu->dev, GFP_KERNEL, pcu,
-					ims_pcu_process_async_firmware);
-	if (error) {
-		/* This error is not fatal, let userspace have another chance */
-		complete(&pcu->async_firmware_done);
-	}
-
-	return 0;
-}
-
-static void ims_pcu_destroy_bootloader_mode(struct ims_pcu *pcu)
-{
-	/* Make sure our initial firmware request has completed */
-	wait_for_completion(&pcu->async_firmware_done);
-}
-
-#define IMS_PCU_APPLICATION_MODE	0
-#define IMS_PCU_BOOTLOADER_MODE		1
-
-static struct usb_driver ims_pcu_driver;
-
-static int ims_pcu_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct usb_device *udev = interface_to_usbdev(intf);
-	struct ims_pcu *pcu;
-	int error;
-
-	pcu = kzalloc(sizeof(struct ims_pcu), GFP_KERNEL);
-	if (!pcu)
-		return -ENOMEM;
-
-	pcu->dev = &intf->dev;
-	pcu->udev = udev;
-	pcu->bootloader_mode = id->driver_info == IMS_PCU_BOOTLOADER_MODE;
-	mutex_init(&pcu->cmd_mutex);
-	init_completion(&pcu->cmd_done);
-	init_completion(&pcu->async_firmware_done);
-
-	error = ims_pcu_parse_cdc_data(intf, pcu);
-	if (error)
-		goto err_free_mem;
-
-	error = usb_driver_claim_interface(&ims_pcu_driver,
-					   pcu->data_intf, pcu);
-	if (error) {
-		dev_err(&intf->dev,
-			"Unable to claim corresponding data interface: %d\n",
-			error);
-		goto err_free_mem;
-	}
-
-	usb_set_intfdata(pcu->ctrl_intf, pcu);
-	usb_set_intfdata(pcu->data_intf, pcu);
-
-	error = ims_pcu_buffers_alloc(pcu);
-	if (error)
-		goto err_unclaim_intf;
-
-	error = ims_pcu_start_io(pcu);
-	if (error)
-		goto err_free_buffers;
-
-	error = ims_pcu_line_setup(pcu);
-	if (error)
-		goto err_stop_io;
-
-	error = sysfs_create_group(&intf->dev.kobj, &ims_pcu_attr_group);
-	if (error)
-		goto err_stop_io;
-
-	error = pcu->bootloader_mode ?
-			ims_pcu_init_bootloader_mode(pcu) :
-			ims_pcu_init_application_mode(pcu);
-	if (error)
-		goto err_remove_sysfs;
-
-	return 0;
-
-err_remove_sysfs:
-	sysfs_remove_group(&intf->dev.kobj, &ims_pcu_attr_group);
-err_stop_io:
-	ims_pcu_stop_io(pcu);
-err_free_buffers:
-	ims_pcu_buffers_free(pcu);
-err_unclaim_intf:
-	usb_driver_release_interface(&ims_pcu_driver, pcu->data_intf);
-err_free_mem:
-	kfree(pcu);
-	return error;
-}
-
-static void ims_pcu_disconnect(struct usb_interface *intf)
-{
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	struct usb_host_interface *alt = intf->cur_altsetting;
+	kfree(xpad);
 
 	usb_set_intfdata(intf, NULL);
-
-	/*
-	 * See if we are dealing with control or data interface. The cleanup
-	 * happens when we unbind primary (control) interface.
-	 */
-	if (alt->desc.bInterfaceClass != USB_CLASS_COMM)
-		return;
-
-	sysfs_remove_group(&intf->dev.kobj, &ims_pcu_attr_group);
-
-	ims_pcu_stop_io(pcu);
-
-	if (pcu->bootloader_mode)
-		ims_pcu_destroy_bootloader_mode(pcu);
-	else
-		ims_pcu_destroy_application_mode(pcu);
-
-	ims_pcu_buffers_free(pcu);
-	kfree(pcu);
 }
 
-#ifdef CONFIG_PM
-static int ims_pcu_suspend(struct usb_interface *intf,
-			   pm_message_t message)
+static int xpad_suspend(struct usb_interface *intf, pm_message_t message)
 {
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	struct usb_host_interface *alt = intf->cur_altsetting;
+	struct usb_xpad *xpad = usb_get_intfdata(intf);
+	struct input_dev *input = xpad->dev;
 
-	if (alt->desc.bInterfaceClass == USB_CLASS_COMM)
-		ims_pcu_stop_io(pcu);
+	if (xpad->xtype == XTYPE_XBOX360W) {
+		/*
+		 * Wireless controllers always listen to input so
+		 * they are notified when controller shows up
+		 * or goes away.
+		 */
+		xpad360w_stop_input(xpad);
+
+		/*
+		 * The wireless adapter is going off now, so the
+		 * gamepads are going to become disconnected.
+		 * Unless explicitly disabled, power them down
+		 * so they don't just sit there flashing.
+		 */
+		if (auto_poweroff && xpad->pad_present)
+			xpad360w_poweroff_controller(xpad);
+	} else {
+		mutex_lock(&input->mutex);
+		if (input->users)
+			xpad_stop_input(xpad);
+		mutex_unlock(&input->mutex);
+	}
+
+	xpad_stop_output(xpad);
 
 	return 0;
 }
 
-static int ims_pcu_resume(struct usb_interface *intf)
+static int xpad_resume(struct usb_interface *intf)
 {
-	struct ims_pcu *pcu = usb_get_intfdata(intf);
-	struct usb_host_interface *alt = intf->cur_altsetting;
+	struct usb_xpad *xpad = usb_get_intfdata(intf);
+	struct input_dev *input = xpad->dev;
 	int retval = 0;
 
-	if (alt->desc.bInterfaceClass == USB_CLASS_COMM) {
-		retval = ims_pcu_start_io(pcu);
-		if (retval == 0)
-			retval = ims_pcu_line_setup(pcu);
+	if (xpad->xtype == XTYPE_XBOX360W) {
+		retval = xpad360w_start_input(xpad);
+	} else {
+		mutex_lock(&input->mutex);
+		if (input->users) {
+			retval = xpad_start_input(xpad);
+		} else if (xpad->xtype == XTYPE_XBOXONE) {
+			/*
+			 * Even if there are no users, we'll send Xbox One pads
+			 * the startup sequence so they don't sit there and
+			 * blink until somebody opens the input device again.
+			 */
+			retval = xpad_start_xbox_one(xpad);
+		}
+		mutex_unlock(&input->mutex);
 	}
 
 	return retval;
 }
-#endif
 
-static const struct usb_device_id ims_pcu_id_table[] = {
-	{
-		USB_DEVICE_AND_INTERFACE_INFO(0x04d8, 0x0082,
-					USB_CLASS_COMM,
-					USB_CDC_SUBCLASS_ACM,
-					USB_CDC_ACM_PROTO_AT_V25TER),
-		.driver_info = IMS_PCU_APPLICATION_MODE,
-	},
-	{
-		USB_DEVICE_AND_INTERFACE_INFO(0x04d8, 0x0083,
-					USB_CLASS_COMM,
-					USB_CDC_SUBCLASS_ACM,
-					USB_CDC_ACM_PROTO_AT_V25TER),
-		.driver_info = IMS_PCU_BOOTLOADER_MODE,
-	},
-	{ }
+static struct usb_driver xpad_driver = {
+	.name		= "xpad",
+	.probe		= xpad_probe,
+	.disconnect	= xpad_disconnect,
+	.suspend	= xpad_suspend,
+	.resume		= xpad_resume,
+	.id_table	= xpad_table,
 };
 
-static struct usb_driver ims_pcu_driver = {
-	.name			= "ims_pcu",
-	.id_table		= ims_pcu_id_table,
-	.probe			= ims_pcu_probe,
-	.disconnect		= ims_pcu_disconnect,
-#ifdef CONFIG_PM
-	.suspend		= ims_pcu_suspend,
-	.resume			= ims_pcu_resume,
-	.reset_resume		= ims_pcu_resume,
-#endif
-};
+module_usb_driver(xpad_driver);
 
-module_usb_driver(ims_pcu_driver);
-
-MODULE_DESCRIPTION("IMS Passenger Control Unit driver");
-MODULE_AUTHOR("Dmitry Torokhov <dmitry.torokhov@gmail.com>");
+MODULE_AUTHOR(DRIVER_AUTHOR);
+MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /* abov_touchkey.c -- Linux driver for abov chip as touchkey
+ *
+ * Copyright (C) 2013 Samsung Electronics Co.Ltd
+ * Author: Junkyeong Kim <jk0430.kim@samsung.com>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ */
+
+#include <linux/delay.h>
+#include <linux/firmware.h>
+#include <linux/gpio.h>
+#include <linux/i2c.h>
+#include <linux/init.h>
+#include <linux/input.h>
+#include <linux/input/mt.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/io.h>
+#include <asm/unaligned.h>
+#include <linux/regulator/consumer.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/wakelock.h>
+#include <linux/sec_sysfs.h>
+
+#if 0
+#include <linux/sec_class.h>
+#else
+extern struct class *sec_class;
+#endif
+
+#ifdef CONFIG_OF
+#include <linux/of_gpio.h>
+#endif
+
+#ifdef CONFIG_VBUS_NOTIFIER
+#include <linux/muic/muic.h>
+#include <linux/muic/muic_notifier.h>
+#include <linux/vbus_notifier.h>
+#endif
+
+bool ta_connected;
+
+#define ABOV_TK_NAME "abov-touchkey-3x6"
+
+/* registers */
+#define ABOV_LED_CONTROL	0x00
+#define ABOV_FW_VER		0x01
+#define ABOV_THRESHOLD		0x02
+#define ABOV_BTNSTATUS		0x07
+#define ABOV_DIFFDATA		0x0A
+#define ABOV_RAWDATA		0x0E
+#define ABOV_VENDORID		0x12
+#define ABOV_GLOVE		0x13
+#define ABOV_TSPTA			0x13
+#define ABOV_MODEL_NO		0x14
+#define CMD_SAR_TOTALCAP	0x16
+#define CMD_SAR_MODE		0x17
+#define CMD_SAR_TOTALCAP_READ	0x18
+#define ABOV_SW_RESET		0x1A
+#define CMD_SAR_ENABLE		0x24
+#define CMD_SAR_SENSING		0x25
+#define CMD_SAR_NOISE_THRESHOLD	0x26
+#define CMD_SAR_BASELINE	0x28
+#define CMD_SAR_DIFFDATA	0x2A
+#define CMD_SAR_RAWDATA		0x2E
+#define CMD_SAR_THRESHOLD	0x32
+
+#define CMD_DATA_UPDATE		0x40
+#define CMD_MODE_CHECK		0x41
+#define CMD_LED_CTRL_ON		0x60
+#define CMD_LED_CTRL_OFF	0x70
+#define CMD_STOP_MODE		0x80
+
+/* command */
+#define CMD_LED_ON		0x10
+#define CMD_LED_OFF		0x20
+#define CMD_ON			0x20
+#define CMD_OFF			0x10
+#define CMD_SW_RESET		0x10
+
+#define ABOV_BOOT_DELAY		45
+#define ABOV_RESET_DELAY	150
+#define ABOV_FLASH_MODE		0x18
+
+#define USE_OPEN_CLSOE
+static struct device *sec_touchkey;
+
+/* Force FW update if module# is different */
+#undef FORCE_FW_UPDATE_DIFF_MODULE
+
+/* Touchkey LED twinkle during booting in factory sw (in LCD detached status) */
+#ifdef CONFIG_SEC_FACTORY
+/* Jade project don't use KEY_LED, if use KEY LED, let's define*/
+#undef LED_TWINKLE_BOOTING
+#endif
+
+#define USE_OPEN_CLOSE
+
+#define TK_FW_PATH_SDCARD "/sdcard/Firmware/TOUCHKEY/abov_fw.bin"
+
+#ifdef LED_TWINKLE_BOOTING
+static void led_twinkle_work(struct work_struct *work);
+#endif
+
+#define I2C_M_WR 0		/* for i2c */
+
+enum {
+	BUILT_IN = 0,
+	SDCARD,
+};
+
+#ifdef CONFIG_SAMSUNG_LPM_MODE
+extern int poweroff_charging;
+#endif
+extern unsigned int system_rev;
+extern unsigned int lcdtype;
+static int touchkey_keycode[] = { 0,
+	KEY_RECENT, KEY_BACK,
+#ifdef CONFIG_TOUCHKEY_GRIP
+	KEY_CP_GRIP,
+#endif
+};
+
+struct abov_tk_info {
+	struct i2c_client *client;
+	struct input_dev *input_dev;
+	struct abov_touchkey_devicetree_data *dtdata;
+	struct mutex lock;
+	struct pinctrl *pinctrl;
+
+	const struct firmware *firm_data_bin;
+	const u8 *firm_data_ums;
+	char phys[32];
+	long firm_size;
+	int irq;
+	u16 menu_s;
+	u16 back_s;
+	u16 menu_raw;
+	u16 back_raw;
+#ifdef CONFIG_TOUCHKEY_GRIP
+	struct wake_lock touchkey_wake_lock;
+
+	u16 grip_p_thd;
+	u16 grip_r_thd;
+	u16 grip_n_thd;
+	u16 grip_s1;
+	u16 grip_s2;
+	u16 grip_baseline;
+	u16 grip_raw1;
+	u16 grip_raw2;
+	u16 grip_event;
+	bool sar_mode;
+	bool sar_enable;
+	bool sar_enable_off;
+	int irq_count;
+	int abnormal_mode;
+	s16 diff;
+	s16 max_diff;
+#endif
+	int (*power)(bool on);
+	int touchkey_count;
+	u8 fw_update_state;
+	u8 fw_ver;
+	u8 md_ver;
+	u8 checksum_h;
+	u8 checksum_l;
+	u8 fw_ver_bin;
+	u8 md_ver_bin;
+	u8 checksum_h_bin;
+	u8 checksum_l_bin;
+	bool enabled;
+#ifdef GLOVE_MODE
+	bool glovemode;
+#endif
+	bool probe_done;
+#ifdef LED_TWINKLE_BOOTING
+	struct delayed_work led_twinkle_work;
+	bool led_twinkle_check;
+#endif
+#ifdef CONFIG_VBUS_NOTIFIER
+	struct notifier_block vbus_nb;
+#endif
+	bool flip_mode;
+	struct completion resume_done;
+	bool is_lpm_suspend;
+};
+
+struct abov_touchkey_devicetree_data {
+	unsigned long irq_flag;
+	int gpio_en;
+	int gpio_int;
+	int gpio_sda;
+	int gpio_scl;
+	int gpio_rst;
+	int vdd_io_alwayson;
+	struct regulator *vdd_io_vreg;
+	struct regulator *avdd_vreg;
+	struct regulator *vdd_led;
+	const char *fw_name;
+	int bringup;
+	int firmup_cmd;
+	bool ta_notifier;
+	bool not_support_key;
+	int (*power)(struct abov_tk_info *info, bool on);
+	int (*keyled)(bool on);
+};
+
+#ifdef USE_OPEN_CLOSE
+static int abov_tk_input_open(struct input_dev *dev);
+static void abov_tk_input_close(struct input_dev *dev);
+#endif
+
+static int abov_tk_i2c_read_checksum(struct abov_tk_info *info);
+static void abov_set_ta_status(struct abov_tk_info *info);
+
+static int abov_touchkey_led_status;
+static int abov_touchled_cmd_reserved;
+
+#if defined(GLOVE_MODE) || defined(CONFIG_TOUCHKEY_GRIP)
+static int abov_mode_enable(struct i2c_client *client,u8 cmd_reg, u8 cmd)
+{
+	return i2c_smbus_write_byte_data(client, cmd_reg, cmd);
+}
+#endif
+
+static int abov_tk_i2c_read(struct i2c_client *client,
+		u8 reg, u8 *val, unsigned int len)
+{
+	struct abov_tk_info *info = i2c_get_clientdata(client);
+	struct i2c_msg msg;
+	int ret;
+	int retry = 3;
+
+	mutex_lock(&info->lock);
+	msg.addr = client->addr;
+	msg.flags = I2C_M_WR;
+	msg.len = 1;
+	msg.buf = &reg;
+	while (retry--) {
+		ret = i2c_transfer(client->adapter, &msg, 1);
+		if (ret >= 0)
+			break;
+
+		input_err(true, &client->dev, "%s fail(address set)(%d)\n",
+			__func__, retry);
+		usleep_range(10 * 1000, 10 * 1000);
+	}
+	if (ret < 0) {
+		mutex_unlock(&info->lock);
+		return ret;
+	}
+	retry = 3;
+	msg.flags = 1;/*I2C_M_RD*/
+	msg.len = len;
+	msg.buf = val;
+	while (retry--) {
+		ret = i2c_transfer(client->adapter, &msg, 1);
+		if (ret >= 0) {
+			mutex_unlock(&info->lock);
+			return 0;
+		}
+		input_err(true, &client->dev, "%s fail(data read)(%d)\n",
+			__func__, retry);
+		usleep_range(10 * 1000, 10 * 1000);
+	}
+	mutex_unlock(&info->lock);
+	return ret;
+}
+
+static int abov_tk_i2c_read_data(struct i2c_client *client, u8 *val, unsigned int len)
+{
+	struct abov_tk_info *info = i2c_get_clientdata(client);
+	struct i2c_msg msg;
+	int ret;
+	int retry = 3;
+
+	mutex_lock(&info->lock);
+	msg.addr = client->addr;
+	msg.flags = 1;/*I2C_M_RD*/
+	msg.len = len;
+	msg.buf = val;
+	while (retry--) {
+		ret = i2c_transfer(client->adapter, &msg, 1);
+		if (ret >= 0) {
+			mutex_unlock(&info->lock);
+			return 0;
+		}
+		input_err(true, &client->dev, "%s fail(data read)(%d)\n",
+			__func__, retry);
+		usleep_range(10 * 1000, 10 * 1000);
+	}
+	mutex_unlock(&info->lock);
+	return ret;
+}
+
+static int abov_tk_i2c_write(struct i2c_client *client,
+		u8 reg, u8 *val, unsigned int len)
+{
+	struct abov_tk_info *info = i2c_get_clientdata(client);
+	struct i2c_msg msg[1];
+	unsigned char data[2];
+	int ret;
+	int retry = 3;
+
+	mutex_lock(&info->lock);
+	data[0] = reg;
+	data[1] = *val;
+	msg->addr = client->addr;
+	msg->flags = I2C_M_WR;
+	msg->len = 2;
+	msg->buf = data;
+
+	while (retry--) {
+		ret = i2c_transfer(client->adapter, msg, 1);
+		if (ret >= 0) {
+			mutex_unlock(&info->lock);
+			return 0;
+		}
+		input_err(true, &client->dev, "%s fail(%d)\n",
+			__func__, retry);
+		usleep_range(10 * 1000, 10 * 1000);
+	}
+	mutex_unlock(&info->lock);
+	return ret;
+}
+
+#ifdef CONFIG_TOUCHKEY_GRIP
+static void abov_sar_only_mode(struct abov_tk_info *info, int on)
+{
+	struct i2c_client *client = info->client;
+	int retry =3;
+	int ret;
+	u8 cmd;
+	u8 r_buf;
+	int mode_retry = 1;
+
+	if (info->sar_mode == on) {
+		input_info(true, &client->dev, "[TK] %s : skip already %s\n",
+				__func__, (on == 1) ? "sar only mode" : "normal mode");
+		return;
+	}
+
+	if (on == 1)
+		cmd = CMD_ON;
+	else
+		cmd = CMD_OFF;
+
+	input_info(true, &client->dev, "[TK] %s : %s, cmd=%x\n",
+		__func__, (on == 1) ? "sar only mode" : "normal mode", cmd);
+
+sar_mode:
+	while (retry > 0) {
+		ret = abov_mode_enable(client, CMD_SAR_MODE, cmd);
+		if (ret < 0) {
+			input_err(true, &info->client->dev,
+					"%s fail(%d), retry %d\n", __func__, ret, retry);
+			retry--;
+			msleep(20);
+			continue;
+		}
+		break;
+	}
+
+	msleep(40);
+
+	ret = abov_tk_i2c_read(info->client, CMD_SAR_MODE, &r_buf, 1);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s fail(%d)\n", __func__, ret);
+	}
+
+	input_info(true, &client->dev, "%s read reg = %x\n", __func__, r_buf);
+
+	if ((r_buf != cmd) && (mode_retry == 1)) {
+		input_err(true, &info->client->dev, "%s change fail retry\n", __func__);
+		mode_retry = 0;
+		goto sar_mode;
+	}
+
+	if (r_buf == CMD_ON)
+		info->sar_mode = 1;
+	else
+		info->sar_mode = 0;
+}
+
+static void touchkey_sar_sensing(struct abov_tk_info *info, int on)
+{
+	struct i2c_client *client = info->client;
+	int ret;
+	u8 cmd;
+
+	if (on == 0)
+		cmd 

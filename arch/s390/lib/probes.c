@@ -1,159 +1,77 @@
-/*
- *    Common helper functions for kprobes and uprobes
- *
- *    Copyright IBM Corp. 2014
- */
-
-#include <asm/kprobes.h>
-#include <asm/dis.h>
-
-int probe_is_prohibited_opcode(u16 *insn)
-{
-	if (!is_known_insn((unsigned char *)insn))
-		return -EINVAL;
-	switch (insn[0] >> 8) {
-	case 0x0c:	/* bassm */
-	case 0x0b:	/* bsm	 */
-	case 0x83:	/* diag  */
-	case 0x44:	/* ex	 */
-	case 0xac:	/* stnsm */
-	case 0xad:	/* stosm */
-		return -EINVAL;
-	case 0xc6:
-		switch (insn[0] & 0x0f) {
-		case 0x00: /* exrl   */
-			return -EINVAL;
-		}
-	}
-	switch (insn[0]) {
-	case 0x0101:	/* pr	 */
-	case 0xb25a:	/* bsa	 */
-	case 0xb240:	/* bakr  */
-	case 0xb258:	/* bsg	 */
-	case 0xb218:	/* pc	 */
-	case 0xb228:	/* pt	 */
-	case 0xb98d:	/* epsw	 */
-	case 0xe560:	/* tbegin */
-	case 0xe561:	/* tbeginc */
-	case 0xb2f8:	/* tend	 */
-		return -EINVAL;
-	}
-	return 0;
-}
-
-int probe_get_fixup_type(u16 *insn)
-{
-	/* default fixup method */
-	int fixup = FIXUP_PSW_NORMAL;
-
-	switch (insn[0] >> 8) {
-	case 0x05:	/* balr	*/
-	case 0x0d:	/* basr */
-		fixup = FIXUP_RETURN_REGISTER;
-		/* if r2 = 0, no branch will be taken */
-		if ((insn[0] & 0x0f) == 0)
-			fixup |= FIXUP_BRANCH_NOT_TAKEN;
-		break;
-	case 0x06:	/* bctr	*/
-	case 0x07:	/* bcr	*/
-		fixup = FIXUP_BRANCH_NOT_TAKEN;
-		break;
-	case 0x45:	/* bal	*/
-	case 0x4d:	/* bas	*/
-		fixup = FIXUP_RETURN_REGISTER;
-		break;
-	case 0x47:	/* bc	*/
-	case 0x46:	/* bct	*/
-	case 0x86:	/* bxh	*/
-	case 0x87:	/* bxle	*/
-		fixup = FIXUP_BRANCH_NOT_TAKEN;
-		break;
-	case 0x82:	/* lpsw	*/
-		fixup = FIXUP_NOT_REQUIRED;
-		break;
-	case 0xb2:	/* lpswe */
-		if ((insn[0] & 0xff) == 0xb2)
-			fixup = FIXUP_NOT_REQUIRED;
-		break;
-	case 0xa7:	/* bras	*/
-		if ((insn[0] & 0x0f) == 0x05)
-			fixup |= FIXUP_RETURN_REGISTER;
-		break;
-	case 0xc0:
-		if ((insn[0] & 0x0f) == 0x05)	/* brasl */
-			fixup |= FIXUP_RETURN_REGISTER;
-		break;
-	case 0xeb:
-		switch (insn[2] & 0xff) {
-		case 0x44: /* bxhg  */
-		case 0x45: /* bxleg */
-			fixup = FIXUP_BRANCH_NOT_TAKEN;
-			break;
-		}
-		break;
-	case 0xe3:	/* bctg	*/
-		if ((insn[2] & 0xff) == 0x46)
-			fixup = FIXUP_BRANCH_NOT_TAKEN;
-		break;
-	case 0xec:
-		switch (insn[2] & 0xff) {
-		case 0xe5: /* clgrb */
-		case 0xe6: /* cgrb  */
-		case 0xf6: /* crb   */
-		case 0xf7: /* clrb  */
-		case 0xfc: /* cgib  */
-		case 0xfd: /* cglib */
-		case 0xfe: /* cib   */
-		case 0xff: /* clib  */
-			fixup = FIXUP_BRANCH_NOT_TAKEN;
-			break;
-		}
-		break;
-	}
-	return fixup;
-}
-
-int probe_is_insn_relative_long(u16 *insn)
-{
-	/* Check if we have a RIL-b or RIL-c format instruction which
-	 * we need to modify in order to avoid instruction emulation. */
-	switch (insn[0] >> 8) {
-	case 0xc0:
-		if ((insn[0] & 0x0f) == 0x00) /* larl */
-			return true;
-		break;
-	case 0xc4:
-		switch (insn[0] & 0x0f) {
-		case 0x02: /* llhrl  */
-		case 0x04: /* lghrl  */
-		case 0x05: /* lhrl   */
-		case 0x06: /* llghrl */
-		case 0x07: /* sthrl  */
-		case 0x08: /* lgrl   */
-		case 0x0b: /* stgrl  */
-		case 0x0c: /* lgfrl  */
-		case 0x0d: /* lrl    */
-		case 0x0e: /* llgfrl */
-		case 0x0f: /* strl   */
-			return true;
-		}
-		break;
-	case 0xc6:
-		switch (insn[0] & 0x0f) {
-		case 0x02: /* pfdrl  */
-		case 0x04: /* cghrl  */
-		case 0x05: /* chrl   */
-		case 0x06: /* clghrl */
-		case 0x07: /* clhrl  */
-		case 0x08: /* cgrl   */
-		case 0x0a: /* clgrl  */
-		case 0x0c: /* cgfrl  */
-		case 0x0d: /* crl    */
-		case 0x0e: /* clgfrl */
-		case 0x0f: /* clrl   */
-			return true;
-		}
-		break;
-	}
-	return false;
-}
+                (*dealloc_pd)(struct ib_pd *pd);
+	struct ib_ah *             (*create_ah)(struct ib_pd *pd,
+						struct ib_ah_attr *ah_attr);
+	int                        (*modify_ah)(struct ib_ah *ah,
+						struct ib_ah_attr *ah_attr);
+	int                        (*query_ah)(struct ib_ah *ah,
+					       struct ib_ah_attr *ah_attr);
+	int                        (*destroy_ah)(struct ib_ah *ah);
+	struct ib_srq *            (*create_srq)(struct ib_pd *pd,
+						 struct ib_srq_init_attr *srq_init_attr,
+						 struct ib_udata *udata);
+	int                        (*modify_srq)(struct ib_srq *srq,
+						 struct ib_srq_attr *srq_attr,
+						 enum ib_srq_attr_mask srq_attr_mask,
+						 struct ib_udata *udata);
+	int                        (*query_srq)(struct ib_srq *srq,
+						struct ib_srq_attr *srq_attr);
+	int                        (*destroy_srq)(struct ib_srq *srq);
+	int                        (*post_srq_recv)(struct ib_srq *srq,
+						    struct ib_recv_wr *recv_wr,
+						    struct ib_recv_wr **bad_recv_wr);
+	struct ib_qp *             (*create_qp)(struct ib_pd *pd,
+						struct ib_qp_init_attr *qp_init_attr,
+						struct ib_udata *udata);
+	int                        (*modify_qp)(struct ib_qp *qp,
+						struct ib_qp_attr *qp_attr,
+						int qp_attr_mask,
+						struct ib_udata *udata);
+	int                        (*query_qp)(struct ib_qp *qp,
+					       struct ib_qp_attr *qp_attr,
+					       int qp_attr_mask,
+					       struct ib_qp_init_attr *qp_init_attr);
+	int                        (*destroy_qp)(struct ib_qp *qp);
+	int                        (*post_send)(struct ib_qp *qp,
+						struct ib_send_wr *send_wr,
+						struct ib_send_wr **bad_send_wr);
+	int                        (*post_recv)(struct ib_qp *qp,
+						struct ib_recv_wr *recv_wr,
+						struct ib_recv_wr **bad_recv_wr);
+	struct ib_cq *             (*create_cq)(struct ib_device *device,
+						const struct ib_cq_init_attr *attr,
+						struct ib_ucontext *context,
+						struct ib_udata *udata);
+	int                        (*modify_cq)(struct ib_cq *cq, u16 cq_count,
+						u16 cq_period);
+	int                        (*destroy_cq)(struct ib_cq *cq);
+	int                        (*resize_cq)(struct ib_cq *cq, int cqe,
+						struct ib_udata *udata);
+	int                        (*poll_cq)(struct ib_cq *cq, int num_entries,
+					      struct ib_wc *wc);
+	int                        (*peek_cq)(struct ib_cq *cq, int wc_cnt);
+	int                        (*req_notify_cq)(struct ib_cq *cq,
+						    enum ib_cq_notify_flags flags);
+	int                        (*req_ncomp_notif)(struct ib_cq *cq,
+						      int wc_cnt);
+	struct ib_mr *             (*get_dma_mr)(struct ib_pd *pd,
+						 int mr_access_flags);
+	struct ib_mr *             (*reg_phys_mr)(struct ib_pd *pd,
+						  struct ib_phys_buf *phys_buf_array,
+						  int num_phys_buf,
+						  int mr_access_flags,
+						  u64 *iova_start);
+	struct ib_mr *             (*reg_user_mr)(struct ib_pd *pd,
+						  u64 start, u64 length,
+						  u64 virt_addr,
+						  int mr_access_flags,
+						  struct ib_udata *udata);
+	int			   (*rereg_user_mr)(struct ib_mr *mr,
+						    int flags,
+						    u64 start, u64 length,
+						    u64 virt_addr,
+						    int mr_access_flags,
+						    struct ib_pd *pd,
+						    struct ib_udata *udata);
+	int                        (*query_mr)(struct ib_mr *mr,
+					       struct ib_mr_attr *mr_attr);
+	int           

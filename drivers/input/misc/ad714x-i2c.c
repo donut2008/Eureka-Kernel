@@ -1,111 +1,117 @@
-/*
- * AD714X CapTouch Programmable Controller driver (I2C bus)
- *
- * Copyright 2009-2011 Analog Devices Inc.
- *
- * Licensed under the GPL-2 or later.
- */
-
-#include <linux/input.h>	/* BUS_I2C */
-#include <linux/i2c.h>
-#include <linux/module.h>
-#include <linux/types.h>
-#include <linux/pm.h>
-#include "ad714x.h"
-
-static int __maybe_unused ad714x_i2c_suspend(struct device *dev)
-{
-	return ad714x_disable(i2c_get_clientdata(to_i2c_client(dev)));
+zalloc:
+	filp_close(fp, current->files);
+fail_sdcard_open:
+	set_fs(old_fs);
+	return ret;
 }
 
-static int __maybe_unused ad714x_i2c_resume(struct device *dev)
+static int abov_tk_check_busy(struct abov_tk_info *info)
 {
-	return ad714x_enable(i2c_get_clientdata(to_i2c_client(dev)));
+	int ret, count = 0;
+	unsigned char val = 0x00;
+
+	do {
+		ret = i2c_master_recv(info->client, &val, sizeof(val));
+
+		if (val)
+			count++;
+		else
+			break;
+
+		if (count > 1000)
+			break;
+	} while (1);
+
+	if (count > 1000)
+		input_err(true, &info->client->dev, "%s: busy %d\n", __func__, count);
+	return ret;
 }
 
-static SIMPLE_DEV_PM_OPS(ad714x_i2c_pm, ad714x_i2c_suspend, ad714x_i2c_resume);
-
-static int ad714x_i2c_write(struct ad714x_chip *chip,
-			    unsigned short reg, unsigned short data)
+static int abov_tk_i2c_read_checksum(struct abov_tk_info *info)
 {
-	struct i2c_client *client = to_i2c_client(chip->dev);
-	int error;
+	unsigned char data[6] = {0xAC, 0x9E, 0x10, 0x00, 0x3F, 0xFF};
+	unsigned char data2[1] = {0x00};
+	unsigned char checksum[6] = {0, };
+	int ret;
 
-	chip->xfer_buf[0] = cpu_to_be16(reg);
-	chip->xfer_buf[1] = cpu_to_be16(data);
+	i2c_master_send(info->client, data, 6);
 
-	error = i2c_master_send(client, (u8 *)chip->xfer_buf,
-				2 * sizeof(*chip->xfer_buf));
-	if (unlikely(error < 0)) {
-		dev_err(&client->dev, "I2C write error: %d\n", error);
-		return error;
+	usleep_range(5 * 1000, 5 * 1000);
+	/* abov_tk_check_busy(info); */
+
+	i2c_master_send(info->client, data2, 1);
+	usleep_range(5 * 1000, 5 * 1000);
+
+	ret = abov_tk_i2c_read_data(info->client, checksum, 6);
+
+
+	input_info(true, &info->client->dev, "%s: ret:%d [%X][%X][%X][%X][%X][%X]\n",
+			__func__, ret, checksum[0], checksum[1], checksum[2]
+			, checksum[3], checksum[4], checksum[5]);
+	info->checksum_h = checksum[4];
+	info->checksum_l = checksum[5];
+	return 0;
+}
+
+static int abov_tk_fw_write(struct abov_tk_info *info, unsigned char *addrH,
+						unsigned char *addrL, unsigned char *val)
+{
+	int length = 36, ret = 0;
+	unsigned char data[36];
+
+	data[0] = 0xAC;
+	data[1] = 0x7A;
+	memcpy(&data[2], addrH, 1);
+	memcpy(&data[3], addrL, 1);
+	memcpy(&data[4], val, 32);
+
+	ret = i2c_master_send(info->client, data, length);
+	if (ret != length) {
+		input_err(true, &info->client->dev, "%s: write fail[%x%x], %d\n", __func__, *addrH, *addrL, ret);
+		return ret;
+	}
+
+	usleep_range(2 * 1000, 2 * 1000);
+
+	abov_tk_check_busy(info);
+
+	return 0;
+}
+
+static int abov_tk_fw_mode_enter(struct abov_tk_info *info)
+{
+	unsigned char data[2] = {0xAC, 0x5B};
+	u8 ic_ver = 0;
+	int ret = 0;
+
+	ret = i2c_master_send(info->client, data, 2);
+	if (ret != 2) {
+		pr_err("%s: write fail\n", __func__);
+		return -1;
+	}
+
+	ret = i2c_master_recv(info->client, &ic_ver, 1);
+	input_info(true, &info->client->dev, "%s: %2x, %2x\n", __func__, info->dtdata->firmup_cmd, ic_ver);
+	if(info->dtdata->firmup_cmd != ic_ver){
+		input_err(true, &info->client->dev, "%s: ic not matched, firmup fail\n", __func__);
+		return -2;
 	}
 
 	return 0;
+
 }
 
-static int ad714x_i2c_read(struct ad714x_chip *chip,
-			   unsigned short reg, unsigned short *data, size_t len)
+static int abov_tk_fw_mode_check(struct abov_tk_info *info)
 {
-	struct i2c_client *client = to_i2c_client(chip->dev);
-	int i;
-	int error;
+	unsigned char buf[1] = {0};
+	int ret;
 
-	chip->xfer_buf[0] = cpu_to_be16(reg);
-
-	error = i2c_master_send(client, (u8 *)chip->xfer_buf,
-				sizeof(*chip->xfer_buf));
-	if (error >= 0)
-		error = i2c_master_recv(client, (u8 *)chip->xfer_buf,
-					len * sizeof(*chip->xfer_buf));
-
-	if (unlikely(error < 0)) {
-		dev_err(&client->dev, "I2C read error: %d\n", error);
-		return error;
+	ret = abov_tk_i2c_read_data(info->client, buf, 1);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s: write fail\n", __func__);
+		return 0;
 	}
 
-	for (i = 0; i < len; i++)
-		data[i] = be16_to_cpu(chip->xfer_buf[i]);
+	input_info(true, &info->client->dev, "%s: ret:%02X\n", __func__, buf[0]);
 
-	return 0;
-}
-
-static int ad714x_i2c_probe(struct i2c_client *client,
-					const struct i2c_device_id *id)
-{
-	struct ad714x_chip *chip;
-
-	chip = ad714x_probe(&client->dev, BUS_I2C, client->irq,
-			    ad714x_i2c_read, ad714x_i2c_write);
-	if (IS_ERR(chip))
-		return PTR_ERR(chip);
-
-	i2c_set_clientdata(client, chip);
-
-	return 0;
-}
-
-static const struct i2c_device_id ad714x_id[] = {
-	{ "ad7142_captouch", 0 },
-	{ "ad7143_captouch", 0 },
-	{ "ad7147_captouch", 0 },
-	{ "ad7147a_captouch", 0 },
-	{ "ad7148_captouch", 0 },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, ad714x_id);
-
-static struct i2c_driver ad714x_i2c_driver = {
-	.driver = {
-		.name = "ad714x_captouch",
-		.pm   = &ad714x_i2c_pm,
-	},
-	.probe    = ad714x_i2c_probe,
-	.id_table = ad714x_id,
-};
-
-module_i2c_driver(ad714x_i2c_driver);
-
-MODULE_DESCRIPTION("Analog Devices AD714X Capacitance Touch Sensor I2C Bus Driver");
-MODULE_AUTHOR("Barry Song <21cnbao@gmail.com>");
-MODULE_LICENSE("GPL");
+	if (buf[0] == 

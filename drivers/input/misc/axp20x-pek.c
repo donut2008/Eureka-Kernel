@@ -1,295 +1,279 @@
-/*
- * axp20x power button driver.
- *
- * Copyright (C) 2013 Carlo Caione <carlo@caione.org>
- *
- * This file is subject to the terms and conditions of the GNU General
- * Public License. See the file "COPYING" in the main directory of this
- * archive for more details.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
+izeof *attr, GFP_KERNEL);
+	if (!attr)
+		return -ENOMEM;
 
-#include <linux/errno.h>
-#include <linux/irq.h>
-#include <linux/init.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/kernel.h>
-#include <linux/mfd/axp20x.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
-#include <linux/slab.h>
-
-#define AXP20X_PEK_STARTUP_MASK		(0xc0)
-#define AXP20X_PEK_SHUTDOWN_MASK	(0x03)
-
-struct axp20x_pek {
-	struct axp20x_dev *axp20x;
-	struct input_dev *input;
-	int irq_dbr;
-	int irq_dbf;
-};
-
-struct axp20x_time {
-	unsigned int time;
-	unsigned int idx;
-};
-
-static const struct axp20x_time startup_time[] = {
-	{ .time = 128,  .idx = 0 },
-	{ .time = 1000, .idx = 2 },
-	{ .time = 3000, .idx = 1 },
-	{ .time = 2000, .idx = 3 },
-};
-
-static const struct axp20x_time shutdown_time[] = {
-	{ .time = 4000,  .idx = 0 },
-	{ .time = 6000,  .idx = 1 },
-	{ .time = 8000,  .idx = 2 },
-	{ .time = 10000, .idx = 3 },
-};
-
-struct axp20x_pek_ext_attr {
-	const struct axp20x_time *p_time;
-	unsigned int mask;
-};
-
-static struct axp20x_pek_ext_attr axp20x_pek_startup_ext_attr = {
-	.p_time	= startup_time,
-	.mask	= AXP20X_PEK_STARTUP_MASK,
-};
-
-static struct axp20x_pek_ext_attr axp20x_pek_shutdown_ext_attr = {
-	.p_time	= shutdown_time,
-	.mask	= AXP20X_PEK_SHUTDOWN_MASK,
-};
-
-static struct axp20x_pek_ext_attr *get_axp_ext_attr(struct device_attribute *attr)
-{
-	return container_of(attr, struct dev_ext_attribute, attr)->var;
-}
-
-static ssize_t axp20x_show_ext_attr(struct device *dev,
-				    struct device_attribute *attr, char *buf)
-{
-	struct axp20x_pek *axp20x_pek = dev_get_drvdata(dev);
-	struct axp20x_pek_ext_attr *axp20x_ea = get_axp_ext_attr(attr);
-	unsigned int val;
-	int ret, i;
-
-	ret = regmap_read(axp20x_pek->axp20x->regmap, AXP20X_PEK_KEY, &val);
-	if (ret != 0)
-		return ret;
-
-	val &= axp20x_ea->mask;
-	val >>= ffs(axp20x_ea->mask) - 1;
-
-	for (i = 0; i < 4; i++)
-		if (val == axp20x_ea->p_time[i].idx)
-			val = axp20x_ea->p_time[i].time;
-
-	return sprintf(buf, "%u\n", val);
-}
-
-static ssize_t axp20x_store_ext_attr(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t count)
-{
-	struct axp20x_pek *axp20x_pek = dev_get_drvdata(dev);
-	struct axp20x_pek_ext_attr *axp20x_ea = get_axp_ext_attr(attr);
-	char val_str[20];
-	size_t len;
-	int ret, i;
-	unsigned int val, idx = 0;
-	unsigned int best_err = UINT_MAX;
-
-	val_str[sizeof(val_str) - 1] = '\0';
-	strncpy(val_str, buf, sizeof(val_str) - 1);
-	len = strlen(val_str);
-
-	if (len && val_str[len - 1] == '\n')
-		val_str[len - 1] = '\0';
-
-	ret = kstrtouint(val_str, 10, &val);
+	ret = ib_find_cached_pkey(target->srp_host->srp_dev->dev,
+				  target->srp_host->port,
+				  be16_to_cpu(target->pkey),
+				  &attr->pkey_index);
 	if (ret)
-		return ret;
+		goto out;
 
-	for (i = 3; i >= 0; i--) {
-		unsigned int err;
+	attr->qp_state        = IB_QPS_INIT;
+	attr->qp_access_flags = (IB_ACCESS_REMOTE_READ |
+				    IB_ACCESS_REMOTE_WRITE);
+	attr->port_num        = target->srp_host->port;
 
-		err = abs(axp20x_ea->p_time[i].time - val);
-		if (err < best_err) {
-			best_err = err;
-			idx = axp20x_ea->p_time[i].idx;
-		}
+	ret = ib_modify_qp(qp, attr,
+			   IB_QP_STATE		|
+			   IB_QP_PKEY_INDEX	|
+			   IB_QP_ACCESS_FLAGS	|
+			   IB_QP_PORT);
 
-		if (!err)
-			break;
-	}
-
-	idx <<= ffs(axp20x_ea->mask) - 1;
-	ret = regmap_update_bits(axp20x_pek->axp20x->regmap,
-				 AXP20X_PEK_KEY,
-				 axp20x_ea->mask, idx);
-	if (ret != 0)
-		return -EINVAL;
-
-	return count;
+out:
+	kfree(attr);
+	return ret;
 }
 
-static struct dev_ext_attribute axp20x_dev_attr_startup = {
-	.attr	= __ATTR(startup, 0644, axp20x_show_ext_attr, axp20x_store_ext_attr),
-	.var	= &axp20x_pek_startup_ext_attr,
-};
-
-static struct dev_ext_attribute axp20x_dev_attr_shutdown = {
-	.attr	= __ATTR(shutdown, 0644, axp20x_show_ext_attr, axp20x_store_ext_attr),
-	.var	= &axp20x_pek_shutdown_ext_attr,
-};
-
-static struct attribute *axp20x_attributes[] = {
-	&axp20x_dev_attr_startup.attr.attr,
-	&axp20x_dev_attr_shutdown.attr.attr,
-	NULL,
-};
-
-static const struct attribute_group axp20x_attribute_group = {
-	.attrs = axp20x_attributes,
-};
-
-static irqreturn_t axp20x_pek_irq(int irq, void *pwr)
+static int srp_new_cm_id(struct srp_rdma_ch *ch)
 {
-	struct input_dev *idev = pwr;
-	struct axp20x_pek *axp20x_pek = input_get_drvdata(idev);
+	struct srp_target_port *target = ch->target;
+	struct ib_cm_id *new_cm_id;
 
-	/*
-	 * The power-button is connected to ground so a falling edge (dbf)
-	 * means it is pressed.
-	 */
-	if (irq == axp20x_pek->irq_dbf)
-		input_report_key(idev, KEY_POWER, true);
-	else if (irq == axp20x_pek->irq_dbr)
-		input_report_key(idev, KEY_POWER, false);
+	new_cm_id = ib_create_cm_id(target->srp_host->srp_dev->dev,
+				    srp_cm_handler, ch);
+	if (IS_ERR(new_cm_id))
+		return PTR_ERR(new_cm_id);
 
-	input_sync(idev);
-
-	return IRQ_HANDLED;
-}
-
-static void axp20x_remove_sysfs_group(void *_data)
-{
-	struct device *dev = _data;
-
-	sysfs_remove_group(&dev->kobj, &axp20x_attribute_group);
-}
-
-static int axp20x_pek_probe(struct platform_device *pdev)
-{
-	struct axp20x_pek *axp20x_pek;
-	struct axp20x_dev *axp20x;
-	struct input_dev *idev;
-	int error;
-
-	axp20x_pek = devm_kzalloc(&pdev->dev, sizeof(struct axp20x_pek),
-				  GFP_KERNEL);
-	if (!axp20x_pek)
-		return -ENOMEM;
-
-	axp20x_pek->axp20x = dev_get_drvdata(pdev->dev.parent);
-	axp20x = axp20x_pek->axp20x;
-
-	axp20x_pek->irq_dbr = platform_get_irq_byname(pdev, "PEK_DBR");
-	if (axp20x_pek->irq_dbr < 0) {
-		dev_err(&pdev->dev, "No IRQ for PEK_DBR, error=%d\n",
-				axp20x_pek->irq_dbr);
-		return axp20x_pek->irq_dbr;
-	}
-	axp20x_pek->irq_dbr = regmap_irq_get_virq(axp20x->regmap_irqc,
-						  axp20x_pek->irq_dbr);
-
-	axp20x_pek->irq_dbf = platform_get_irq_byname(pdev, "PEK_DBF");
-	if (axp20x_pek->irq_dbf < 0) {
-		dev_err(&pdev->dev, "No IRQ for PEK_DBF, error=%d\n",
-				axp20x_pek->irq_dbf);
-		return axp20x_pek->irq_dbf;
-	}
-	axp20x_pek->irq_dbf = regmap_irq_get_virq(axp20x->regmap_irqc,
-						  axp20x_pek->irq_dbf);
-
-	axp20x_pek->input = devm_input_allocate_device(&pdev->dev);
-	if (!axp20x_pek->input)
-		return -ENOMEM;
-
-	idev = axp20x_pek->input;
-
-	idev->name = "axp20x-pek";
-	idev->phys = "m1kbd/input2";
-	idev->dev.parent = &pdev->dev;
-
-	input_set_capability(idev, EV_KEY, KEY_POWER);
-
-	input_set_drvdata(idev, axp20x_pek);
-
-	error = devm_request_any_context_irq(&pdev->dev, axp20x_pek->irq_dbr,
-					     axp20x_pek_irq, 0,
-					     "axp20x-pek-dbr", idev);
-	if (error < 0) {
-		dev_err(axp20x->dev, "Failed to request dbr IRQ#%d: %d\n",
-			axp20x_pek->irq_dbr, error);
-		return error;
-	}
-
-	error = devm_request_any_context_irq(&pdev->dev, axp20x_pek->irq_dbf,
-					  axp20x_pek_irq, 0,
-					  "axp20x-pek-dbf", idev);
-	if (error < 0) {
-		dev_err(axp20x->dev, "Failed to request dbf IRQ#%d: %d\n",
-			axp20x_pek->irq_dbf, error);
-		return error;
-	}
-
-	error = sysfs_create_group(&pdev->dev.kobj, &axp20x_attribute_group);
-	if (error) {
-		dev_err(axp20x->dev, "Failed to create sysfs attributes: %d\n",
-			error);
-		return error;
-	}
-
-	error = devm_add_action(&pdev->dev,
-				axp20x_remove_sysfs_group, &pdev->dev);
-	if (error) {
-		axp20x_remove_sysfs_group(&pdev->dev);
-		dev_err(&pdev->dev, "Failed to add sysfs cleanup action: %d\n",
-			error);
-		return error;
-	}
-
-	error = input_register_device(idev);
-	if (error) {
-		dev_err(axp20x->dev, "Can't register input device: %d\n",
-			error);
-		return error;
-	}
-
-	platform_set_drvdata(pdev, axp20x_pek);
+	if (ch->cm_id)
+		ib_destroy_cm_id(ch->cm_id);
+	ch->cm_id = new_cm_id;
+	ch->path.sgid = target->sgid;
+	ch->path.dgid = target->orig_dgid;
+	ch->path.pkey = target->pkey;
+	ch->path.service_id = target->service_id;
 
 	return 0;
 }
 
-static struct platform_driver axp20x_pek_driver = {
-	.probe		= axp20x_pek_probe,
-	.driver		= {
-		.name		= "axp20x-pek",
-	},
-};
-module_platform_driver(axp20x_pek_driver);
+static struct ib_fmr_pool *srp_alloc_fmr_pool(struct srp_target_port *target)
+{
+	struct srp_device *dev = target->srp_host->srp_dev;
+	struct ib_fmr_pool_param fmr_param;
 
-MODULE_DESCRIPTION("axp20x Power Button");
-MODULE_AUTHOR("Carlo Caione <carlo@caione.org>");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:axp20x-pek");
+	memset(&fmr_param, 0, sizeof(fmr_param));
+	fmr_param.pool_size	    = target->scsi_host->can_queue;
+	fmr_param.dirty_watermark   = fmr_param.pool_size / 4;
+	fmr_param.cache		    = 1;
+	fmr_param.max_pages_per_fmr = dev->max_pages_per_mr;
+	fmr_param.page_shift	    = ilog2(dev->mr_page_size);
+	fmr_param.access	    = (IB_ACCESS_LOCAL_WRITE |
+				       IB_ACCESS_REMOTE_WRITE |
+				       IB_ACCESS_REMOTE_READ);
+
+	return ib_create_fmr_pool(dev->pd, &fmr_param);
+}
+
+/**
+ * srp_destroy_fr_pool() - free the resources owned by a pool
+ * @pool: Fast registration pool to be destroyed.
+ */
+static void srp_destroy_fr_pool(struct srp_fr_pool *pool)
+{
+	int i;
+	struct srp_fr_desc *d;
+
+	if (!pool)
+		return;
+
+	for (i = 0, d = &pool->desc[0]; i < pool->size; i++, d++) {
+		if (d->mr)
+			ib_dereg_mr(d->mr);
+	}
+	kfree(pool);
+}
+
+/**
+ * srp_create_fr_pool() - allocate and initialize a pool for fast registration
+ * @device:            IB device to allocate fast registration descriptors for.
+ * @pd:                Protection domain associated with the FR descriptors.
+ * @pool_size:         Number of descriptors to allocate.
+ * @max_page_list_len: Maximum fast registration work request page list length.
+ */
+static struct srp_fr_pool *srp_create_fr_pool(struct ib_device *device,
+					      struct ib_pd *pd, int pool_size,
+					      int max_page_list_len)
+{
+	struct srp_fr_pool *pool;
+	struct srp_fr_desc *d;
+	struct ib_mr *mr;
+	int i, ret = -EINVAL;
+
+	if (pool_size <= 0)
+		goto err;
+	ret = -ENOMEM;
+	pool = kzalloc(sizeof(struct srp_fr_pool) +
+		       pool_size * sizeof(struct srp_fr_desc), GFP_KERNEL);
+	if (!pool)
+		goto err;
+	pool->size = pool_size;
+	pool->max_page_list_len = max_page_list_len;
+	spin_lock_init(&pool->lock);
+	INIT_LIST_HEAD(&pool->free_list);
+
+	for (i = 0, d = &pool->desc[0]; i < pool->size; i++, d++) {
+		mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG,
+				 max_page_list_len);
+		if (IS_ERR(mr)) {
+			ret = PTR_ERR(mr);
+			goto destroy_pool;
+		}
+		d->mr = mr;
+		list_add_tail(&d->entry, &pool->free_list);
+	}
+
+out:
+	return pool;
+
+destroy_pool:
+	srp_destroy_fr_pool(pool);
+
+err:
+	pool = ERR_PTR(ret);
+	goto out;
+}
+
+/**
+ * srp_fr_pool_get() - obtain a descriptor suitable for fast registration
+ * @pool: Pool to obtain descriptor from.
+ */
+static struct srp_fr_desc *srp_fr_pool_get(struct srp_fr_pool *pool)
+{
+	struct srp_fr_desc *d = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pool->lock, flags);
+	if (!list_empty(&pool->free_list)) {
+		d = list_first_entry(&pool->free_list, typeof(*d), entry);
+		list_del(&d->entry);
+	}
+	spin_unlock_irqrestore(&pool->lock, flags);
+
+	return d;
+}
+
+/**
+ * srp_fr_pool_put() - put an FR descriptor back in the free list
+ * @pool: Pool the descriptor was allocated from.
+ * @desc: Pointer to an array of fast registration descriptor pointers.
+ * @n:    Number of descriptors to put back.
+ *
+ * Note: The caller must already have queued an invalidation request for
+ * desc->mr->rkey before calling this function.
+ */
+static void srp_fr_pool_put(struct srp_fr_pool *pool, struct srp_fr_desc **desc,
+			    int n)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&pool->lock, flags);
+	for (i = 0; i < n; i++)
+		list_add(&desc[i]->entry, &pool->free_list);
+	spin_unlock_irqrestore(&pool->lock, flags);
+}
+
+static struct srp_fr_pool *srp_alloc_fr_pool(struct srp_target_port *target)
+{
+	struct srp_device *dev = target->srp_host->srp_dev;
+
+	return srp_create_fr_pool(dev->dev, dev->pd,
+				  target->scsi_host->can_queue,
+				  dev->max_pages_per_mr);
+}
+
+/**
+ * srp_destroy_qp() - destroy an RDMA queue pair
+ * @ch: SRP RDMA channel.
+ *
+ * Change a queue pair into the error state and wait until all receive
+ * completions have been processed before destroying it. This avoids that
+ * the receive completion handler can access the queue pair while it is
+ * being destroyed.
+ */
+static void srp_destroy_qp(struct srp_rdma_ch *ch)
+{
+	static struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
+	static struct ib_recv_wr wr = { .wr_id = SRP_LAST_WR_ID };
+	struct ib_recv_wr *bad_wr;
+	int ret;
+
+	/* Destroying a QP and reusing ch->done is only safe if not connected */
+	WARN_ON_ONCE(ch->connected);
+
+	ret = ib_modify_qp(ch->qp, &attr, IB_QP_STATE);
+	WARN_ONCE(ret, "ib_cm_init_qp_attr() returned %d\n", ret);
+	if (ret)
+		goto out;
+
+	init_completion(&ch->done);
+	ret = ib_post_recv(ch->qp, &wr, &bad_wr);
+	WARN_ONCE(ret, "ib_post_recv() returned %d\n", ret);
+	if (ret == 0)
+		wait_for_completion(&ch->done);
+
+out:
+	ib_destroy_qp(ch->qp);
+}
+
+static int srp_create_ch_ib(struct srp_rdma_ch *ch)
+{
+	struct srp_target_port *target = ch->target;
+	struct srp_device *dev = target->srp_host->srp_dev;
+	struct ib_qp_init_attr *init_attr;
+	struct ib_cq *recv_cq, *send_cq;
+	struct ib_qp *qp;
+	struct ib_fmr_pool *fmr_pool = NULL;
+	struct srp_fr_pool *fr_pool = NULL;
+	const int m = dev->use_fast_reg ? 3 : 1;
+	struct ib_cq_init_attr cq_attr = {};
+	int ret;
+
+	init_attr = kzalloc(sizeof *init_attr, GFP_KERNEL);
+	if (!init_attr)
+		return -ENOMEM;
+
+	/* + 1 for SRP_LAST_WR_ID */
+	cq_attr.cqe = target->queue_size + 1;
+	cq_attr.comp_vector = ch->comp_vector;
+	recv_cq = ib_create_cq(dev->dev, srp_recv_completion, NULL, ch,
+			       &cq_attr);
+	if (IS_ERR(recv_cq)) {
+		ret = PTR_ERR(recv_cq);
+		goto err;
+	}
+
+	cq_attr.cqe = m * target->queue_size;
+	cq_attr.comp_vector = ch->comp_vector;
+	send_cq = ib_create_cq(dev->dev, srp_send_completion, NULL, ch,
+			       &cq_attr);
+	if (IS_ERR(send_cq)) {
+		ret = PTR_ERR(send_cq);
+		goto err_recv_cq;
+	}
+
+	ib_req_notify_cq(recv_cq, IB_CQ_NEXT_COMP);
+
+	init_attr->event_handler       = srp_qp_event;
+	init_attr->cap.max_send_wr     = m * target->queue_size;
+	init_attr->cap.max_recv_wr     = target->queue_size + 1;
+	init_attr->cap.max_recv_sge    = 1;
+	init_attr->cap.max_send_sge    = 1;
+	init_attr->sq_sig_type         = IB_SIGNAL_REQ_WR;
+	init_attr->qp_type             = IB_QPT_RC;
+	init_attr->send_cq             = send_cq;
+	init_attr->recv_cq             = recv_cq;
+
+	qp = ib_create_qp(dev->pd, init_attr);
+	if (IS_ERR(qp)) {
+		ret = PTR_ERR(qp);
+		goto err_send_cq;
+	}
+
+	ret = srp_init_qp(target, qp);
+	if (ret)
+		goto err_qp;
+
+	if (dev->use_fast_reg) {
+		fr_pool = srp_alloc_fr_pool(target);
+		if (IS_ERR(fr_p

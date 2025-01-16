@@ -1,246 +1,233 @@
-/*
- * pbias-regulator.c
- *
- * Copyright (C) 2014 Texas Instruments Incorporated - http://www.ti.com/
- * Author: Balaji T K <balajitk@ti.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation version 2.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
+/
+	pci_read_config_dword(pvt->pci_dev_16_2_fsb_err_regs,
+			      FERR_GLOBAL_HI, &error_reg);
+	if (unlikely(error_reg)) {
+		errors = error_reg;
+		errnum = find_first_bit(&errors,
+					ARRAY_SIZE(ferr_global_hi_name));
+		specific = GET_ERR_FROM_TABLE(ferr_global_hi_name, errnum);
+		is_fatal = ferr_global_hi_is_fatal(errnum);
 
-#include <linux/err.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/mfd/syscon.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/machine.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/regmap.h>
-#include <linux/slab.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
+		/* Clear the error bit */
+		pci_write_config_dword(pvt->pci_dev_16_2_fsb_err_regs,
+				       FERR_GLOBAL_HI, error_reg);
 
-struct pbias_reg_info {
-	u32 enable;
-	u32 enable_mask;
-	u32 disable_val;
-	u32 vmode;
-	unsigned int enable_time;
-	char *name;
-};
-
-struct pbias_regulator_data {
-	struct regulator_desc desc;
-	void __iomem *pbias_addr;
-	struct regulator_dev *dev;
-	struct regmap *syscon;
-	const struct pbias_reg_info *info;
-	int voltage;
-};
-
-struct pbias_of_data {
-	unsigned int offset;
-};
-
-static const unsigned int pbias_volt_table[] = {
-	1800000,
-	3000000
-};
-
-static struct regulator_ops pbias_regulator_voltage_ops = {
-	.list_voltage = regulator_list_voltage_table,
-	.get_voltage_sel = regulator_get_voltage_sel_regmap,
-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.is_enabled = regulator_is_enabled_regmap,
-};
-
-static const struct pbias_reg_info pbias_mmc_omap2430 = {
-	.enable = BIT(1),
-	.enable_mask = BIT(1),
-	.vmode = BIT(0),
-	.disable_val = 0,
-	.enable_time = 100,
-	.name = "pbias_mmc_omap2430"
-};
-
-static const struct pbias_reg_info pbias_sim_omap3 = {
-	.enable = BIT(9),
-	.enable_mask = BIT(9),
-	.vmode = BIT(8),
-	.enable_time = 100,
-	.name = "pbias_sim_omap3"
-};
-
-static const struct pbias_reg_info pbias_mmc_omap4 = {
-	.enable = BIT(26) | BIT(22),
-	.enable_mask = BIT(26) | BIT(25) | BIT(22),
-	.disable_val = BIT(25),
-	.vmode = BIT(21),
-	.enable_time = 100,
-	.name = "pbias_mmc_omap4"
-};
-
-static const struct pbias_reg_info pbias_mmc_omap5 = {
-	.enable = BIT(27) | BIT(26),
-	.enable_mask = BIT(27) | BIT(25) | BIT(26),
-	.disable_val = BIT(25),
-	.vmode = BIT(21),
-	.enable_time = 100,
-	.name = "pbias_mmc_omap5"
-};
-
-static struct of_regulator_match pbias_matches[] = {
-	{ .name = "pbias_mmc_omap2430", .driver_data = (void *)&pbias_mmc_omap2430},
-	{ .name = "pbias_sim_omap3", .driver_data = (void *)&pbias_sim_omap3},
-	{ .name = "pbias_mmc_omap4", .driver_data = (void *)&pbias_mmc_omap4},
-	{ .name = "pbias_mmc_omap5", .driver_data = (void *)&pbias_mmc_omap5},
-};
-#define PBIAS_NUM_REGS	ARRAY_SIZE(pbias_matches)
-
-/* Offset from SCM general area (and syscon) base */
-
-static const struct pbias_of_data pbias_of_data_omap2 = {
-	.offset = 0x230,
-};
-
-static const struct pbias_of_data pbias_of_data_omap3 = {
-	.offset = 0x2b0,
-};
-
-static const struct pbias_of_data pbias_of_data_omap4 = {
-	.offset = 0x60,
-};
-
-static const struct pbias_of_data pbias_of_data_omap5 = {
-	.offset = 0x60,
-};
-
-static const struct pbias_of_data pbias_of_data_dra7 = {
-	.offset = 0xe00,
-};
-
-static const struct of_device_id pbias_of_match[] = {
-	{ .compatible = "ti,pbias-omap", },
-	{ .compatible = "ti,pbias-omap2", .data = &pbias_of_data_omap2, },
-	{ .compatible = "ti,pbias-omap3", .data = &pbias_of_data_omap3, },
-	{ .compatible = "ti,pbias-omap4", .data = &pbias_of_data_omap4, },
-	{ .compatible = "ti,pbias-omap5", .data = &pbias_of_data_omap5, },
-	{ .compatible = "ti,pbias-dra7", .data = &pbias_of_data_dra7, },
-	{},
-};
-MODULE_DEVICE_TABLE(of, pbias_of_match);
-
-static int pbias_regulator_probe(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct pbias_regulator_data *drvdata;
-	struct resource *res;
-	struct regulator_config cfg = { };
-	struct regmap *syscon;
-	const struct pbias_reg_info *info;
-	int ret = 0;
-	int count, idx, data_idx = 0;
-	const struct of_device_id *match;
-	const struct pbias_of_data *data;
-	unsigned int offset;
-
-	count = of_regulator_match(&pdev->dev, np, pbias_matches,
-						PBIAS_NUM_REGS);
-	if (count < 0)
-		return count;
-
-	drvdata = devm_kzalloc(&pdev->dev, sizeof(struct pbias_regulator_data)
-			       * count, GFP_KERNEL);
-	if (!drvdata)
-		return -ENOMEM;
-
-	syscon = syscon_regmap_lookup_by_phandle(np, "syscon");
-	if (IS_ERR(syscon))
-		return PTR_ERR(syscon);
-
-	match = of_match_device(of_match_ptr(pbias_of_match), &pdev->dev);
-	if (match && match->data) {
-		data = match->data;
-		offset = data->offset;
-	} else {
-		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-		if (!res)
-			return -EINVAL;
-
-		offset = res->start;
-		dev_WARN(&pdev->dev,
-			 "using legacy dt data for pbias offset\n");
+		goto error_global;
 	}
 
-	cfg.regmap = syscon;
-	cfg.dev = &pdev->dev;
+	pci_read_config_dword(pvt->pci_dev_16_2_fsb_err_regs,
+			      FERR_GLOBAL_LO, &error_reg);
+	if (unlikely(error_reg)) {
+		errors = error_reg;
+		errnum = find_first_bit(&errors,
+					ARRAY_SIZE(ferr_global_lo_name));
+		specific = GET_ERR_FROM_TABLE(ferr_global_lo_name, errnum);
+		is_fatal = ferr_global_lo_is_fatal(errnum);
 
-	for (idx = 0; idx < PBIAS_NUM_REGS && data_idx < count; idx++) {
-		if (!pbias_matches[idx].init_data ||
-			!pbias_matches[idx].of_node)
-			continue;
+		/* Clear the error bit */
+		pci_write_config_dword(pvt->pci_dev_16_2_fsb_err_regs,
+				       FERR_GLOBAL_LO, error_reg);
 
-		info = pbias_matches[idx].driver_data;
-		if (!info)
-			return -ENODEV;
-
-		drvdata[data_idx].syscon = syscon;
-		drvdata[data_idx].info = info;
-		drvdata[data_idx].desc.name = info->name;
-		drvdata[data_idx].desc.owner = THIS_MODULE;
-		drvdata[data_idx].desc.type = REGULATOR_VOLTAGE;
-		drvdata[data_idx].desc.ops = &pbias_regulator_voltage_ops;
-		drvdata[data_idx].desc.volt_table = pbias_volt_table;
-		drvdata[data_idx].desc.n_voltages = 2;
-		drvdata[data_idx].desc.enable_time = info->enable_time;
-		drvdata[data_idx].desc.vsel_reg = offset;
-		drvdata[data_idx].desc.vsel_mask = info->vmode;
-		drvdata[data_idx].desc.enable_reg = offset;
-		drvdata[data_idx].desc.enable_mask = info->enable_mask;
-		drvdata[data_idx].desc.enable_val = info->enable;
-		drvdata[data_idx].desc.disable_val = info->disable_val;
-
-		cfg.init_data = pbias_matches[idx].init_data;
-		cfg.driver_data = &drvdata[data_idx];
-		cfg.of_node = pbias_matches[idx].of_node;
-
-		drvdata[data_idx].dev = devm_regulator_register(&pdev->dev,
-					&drvdata[data_idx].desc, &cfg);
-		if (IS_ERR(drvdata[data_idx].dev)) {
-			ret = PTR_ERR(drvdata[data_idx].dev);
-			dev_err(&pdev->dev,
-				"Failed to register regulator: %d\n", ret);
-			goto err_regulator;
-		}
-		data_idx++;
+		goto error_global;
 	}
+	return;
 
-	platform_set_drvdata(pdev, drvdata);
-
-err_regulator:
-	return ret;
+error_global:
+	i7300_mc_printk(mci, KERN_EMERG, "%s misc error: %s\n",
+			is_fatal ? "Fatal" : "NOT fatal", specific);
 }
 
-static struct platform_driver pbias_regulator_driver = {
-	.probe		= pbias_regulator_probe,
-	.driver		= {
-		.name		= "pbias-regulator",
-		.of_match_table = of_match_ptr(pbias_of_match),
-	},
+/**
+ * i7300_process_fbd_error() - Retrieve the hardware error information from
+ *			       the FBD error registers and sends it via
+ *			       EDAC error API calls
+ * @mci: struct mem_ctl_info pointer
+ */
+static void i7300_process_fbd_error(struct mem_ctl_info *mci)
+{
+	struct i7300_pvt *pvt;
+	u32 errnum, value, error_reg;
+	u16 val16;
+	unsigned branch, channel, bank, rank, cas, ras;
+	u32 syndrome;
+
+	unsigned long errors;
+	const char *specific;
+	bool is_wr;
+
+	pvt = mci->pvt_info;
+
+	/* read in the 1st FATAL error register */
+	pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			      FERR_FAT_FBD, &error_reg);
+	if (unlikely(error_reg & FERR_FAT_FBD_ERR_MASK)) {
+		errors = error_reg & FERR_FAT_FBD_ERR_MASK ;
+		errnum = find_first_bit(&errors,
+					ARRAY_SIZE(ferr_fat_fbd_name));
+		specific = GET_ERR_FROM_TABLE(ferr_fat_fbd_name, errnum);
+		branch = (GET_FBD_FAT_IDX(error_reg) == 2) ? 1 : 0;
+
+		pci_read_config_word(pvt->pci_dev_16_1_fsb_addr_map,
+				     NRECMEMA, &val16);
+		bank = NRECMEMA_BANK(val16);
+		rank = NRECMEMA_RANK(val16);
+
+		pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+				NRECMEMB, &value);
+		is_wr = NRECMEMB_IS_WR(value);
+		cas = NRECMEMB_CAS(value);
+		ras = NRECMEMB_RAS(value);
+
+		/* Clean the error register */
+		pci_write_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+				FERR_FAT_FBD, error_reg);
+
+		snprintf(pvt->tmp_prt_buffer, PAGE_SIZE,
+			 "Bank=%d RAS=%d CAS=%d Err=0x%lx (%s))",
+			 bank, ras, cas, errors, specific);
+
+		edac_mc_handle_error(HW_EVENT_ERR_FATAL, mci, 1, 0, 0, 0,
+				     branch, -1, rank,
+				     is_wr ? "Write error" : "Read error",
+				     pvt->tmp_prt_buffer);
+
+	}
+
+	/* read in the 1st NON-FATAL error register */
+	pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			      FERR_NF_FBD, &error_reg);
+	if (unlikely(error_reg & FERR_NF_FBD_ERR_MASK)) {
+		errors = error_reg & FERR_NF_FBD_ERR_MASK;
+		errnum = find_first_bit(&errors,
+					ARRAY_SIZE(ferr_nf_fbd_name));
+		specific = GET_ERR_FROM_TABLE(ferr_nf_fbd_name, errnum);
+		branch = (GET_FBD_NF_IDX(error_reg) == 2) ? 1 : 0;
+
+		pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			REDMEMA, &syndrome);
+
+		pci_read_config_word(pvt->pci_dev_16_1_fsb_addr_map,
+				     RECMEMA, &val16);
+		bank = RECMEMA_BANK(val16);
+		rank = RECMEMA_RANK(val16);
+
+		pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+				RECMEMB, &value);
+		is_wr = RECMEMB_IS_WR(value);
+		cas = RECMEMB_CAS(value);
+		ras = RECMEMB_RAS(value);
+
+		pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+				     REDMEMB, &value);
+		channel = (branch << 1);
+		if (IS_SECOND_CH(value))
+			channel++;
+
+		/* Clear the error bit */
+		pci_write_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+				FERR_NF_FBD, error_reg);
+
+		/* Form out message */
+		snprintf(pvt->tmp_prt_buffer, PAGE_SIZE,
+			 "DRAM-Bank=%d RAS=%d CAS=%d, Err=0x%lx (%s))",
+			 bank, ras, cas, errors, specific);
+
+		edac_mc_handle_error(HW_EVENT_ERR_CORRECTED, mci, 1, 0, 0,
+				     syndrome,
+				     branch >> 1, channel % 2, rank,
+				     is_wr ? "Write error" : "Read error",
+				     pvt->tmp_prt_buffer);
+	}
+	return;
+}
+
+/**
+ * i7300_check_error() - Calls the error checking subroutines
+ * @mci: struct mem_ctl_info pointer
+ */
+static void i7300_check_error(struct mem_ctl_info *mci)
+{
+	i7300_process_error_global(mci);
+	i7300_process_fbd_error(mci);
 };
 
-module_platform_driver(pbias_regulator_driver);
+/**
+ * i7300_clear_error() - Clears the error registers
+ * @mci: struct mem_ctl_info pointer
+ */
+static void i7300_clear_error(struct mem_ctl_info *mci)
+{
+	struct i7300_pvt *pvt = mci->pvt_info;
+	u32 value;
+	/*
+	 * All error values are RWC - we need to read and write 1 to the
+	 * bit that we want to cleanup
+	 */
 
-MODULE_AUTHOR("Balaji T K <balajitk@ti.com>");
-MODULE_DESCRIPTION("pbias voltage regulator");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:pbias-regulator");
+	/* Clear global error registers */
+	pci_read_config_dword(pvt->pci_dev_16_2_fsb_err_regs,
+			      FERR_GLOBAL_HI, &value);
+	pci_write_config_dword(pvt->pci_dev_16_2_fsb_err_regs,
+			      FERR_GLOBAL_HI, value);
+
+	pci_read_config_dword(pvt->pci_dev_16_2_fsb_err_regs,
+			      FERR_GLOBAL_LO, &value);
+	pci_write_config_dword(pvt->pci_dev_16_2_fsb_err_regs,
+			      FERR_GLOBAL_LO, value);
+
+	/* Clear FBD error registers */
+	pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			      FERR_FAT_FBD, &value);
+	pci_write_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			      FERR_FAT_FBD, value);
+
+	pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			      FERR_NF_FBD, &value);
+	pci_write_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			      FERR_NF_FBD, value);
+}
+
+/**
+ * i7300_enable_error_reporting() - Enable the memory reporting logic at the
+ *				    hardware
+ * @mci: struct mem_ctl_info pointer
+ */
+static void i7300_enable_error_reporting(struct mem_ctl_info *mci)
+{
+	struct i7300_pvt *pvt = mci->pvt_info;
+	u32 fbd_error_mask;
+
+	/* Read the FBD Error Mask Register */
+	pci_read_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			      EMASK_FBD, &fbd_error_mask);
+
+	/* Enable with a '0' */
+	fbd_error_mask &= ~(EMASK_FBD_ERR_MASK);
+
+	pci_write_config_dword(pvt->pci_dev_16_1_fsb_addr_map,
+			       EMASK_FBD, fbd_error_mask);
+}
+
+/************************************************
+ * i7300 Functions related to memory enumberation
+ ************************************************/
+
+/**
+ * decode_mtr() - Decodes the MTR descriptor, filling the edac structs
+ * @pvt: pointer to the private data struct used by i7300 driver
+ * @slot: DIMM slot (0 to 7)
+ * @ch: Channel number within the branch (0 or 1)
+ * @branch: Branch number (0 or 1)
+ * @dinfo: Pointer to DIMM info where dimm size is stored
+ * @p_csrow: Pointer to the struct csrow_info that corresponds to that element
+ */
+static int decode_mtr(struct i7300_pvt *pvt,
+		      int slot, int ch, int branch,
+		      struct i7300_dimm_info *dinfo,
+		      struct dimm_info *dimm)
+{
+	int mtr, ans, addrBits, channel;
+
+	channel = to_channel(ch, branch);
+
+	mtr = pvt->mtr[slot][branch];

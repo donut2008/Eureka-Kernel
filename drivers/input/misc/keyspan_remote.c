@@ -1,598 +1,601 @@
-/*
- * keyspan_remote: USB driver for the Keyspan DMR
- *
- * Copyright (C) 2005 Zymeta Corporation - Michael Downey (downey@zymeta.com)
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License as
- *	published by the Free Software Foundation, version 2.
- *
- * This driver has been put together with the support of Innosys, Inc.
- * and Keyspan, Inc the manufacturers of the Keyspan USB DMR product.
- */
+_dbg("sge: addr: 0x%llx  length: %u lkey: %x\n",
+		  sge->addr, sge->length, sge->lkey);
 
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/usb/input.h>
-
-#define DRIVER_VERSION	"v0.1"
-#define DRIVER_AUTHOR	"Michael Downey <downey@zymeta.com>"
-#define DRIVER_DESC	"Driver for the USB Keyspan remote control."
-#define DRIVER_LICENSE	"GPL"
-
-/* Parameters that can be passed to the driver. */
-static int debug;
-module_param(debug, int, 0444);
-MODULE_PARM_DESC(debug, "Enable extra debug messages and information");
-
-/* Vendor and product ids */
-#define USB_KEYSPAN_VENDOR_ID		0x06CD
-#define USB_KEYSPAN_PRODUCT_UIA11	0x0202
-
-/* Defines for converting the data from the remote. */
-#define ZERO		0x18
-#define ZERO_MASK	0x1F	/* 5 bits for a 0 */
-#define ONE		0x3C
-#define ONE_MASK	0x3F	/* 6 bits for a 1 */
-#define SYNC		0x3F80
-#define SYNC_MASK	0x3FFF	/* 14 bits for a SYNC sequence */
-#define STOP		0x00
-#define STOP_MASK	0x1F	/* 5 bits for the STOP sequence */
-#define GAP		0xFF
-
-#define RECV_SIZE	8	/* The UIA-11 type have a 8 byte limit. */
-
-/*
- * Table that maps the 31 possible keycodes to input keys.
- * Currently there are 15 and 17 button models so RESERVED codes
- * are blank areas in the mapping.
- */
-static const unsigned short keyspan_key_table[] = {
-	KEY_RESERVED,		/* 0 is just a place holder. */
-	KEY_RESERVED,
-	KEY_STOP,
-	KEY_PLAYCD,
-	KEY_RESERVED,
-	KEY_PREVIOUSSONG,
-	KEY_REWIND,
-	KEY_FORWARD,
-	KEY_NEXTSONG,
-	KEY_RESERVED,
-	KEY_RESERVED,
-	KEY_RESERVED,
-	KEY_PAUSE,
-	KEY_VOLUMEUP,
-	KEY_RESERVED,
-	KEY_RESERVED,
-	KEY_RESERVED,
-	KEY_VOLUMEDOWN,
-	KEY_RESERVED,
-	KEY_UP,
-	KEY_RESERVED,
-	KEY_MUTE,
-	KEY_LEFT,
-	KEY_ENTER,
-	KEY_RIGHT,
-	KEY_RESERVED,
-	KEY_RESERVED,
-	KEY_DOWN,
-	KEY_RESERVED,
-	KEY_KPASTERISK,
-	KEY_RESERVED,
-	KEY_MENU
-};
-
-/* table of devices that work with this driver */
-static struct usb_device_id keyspan_table[] = {
-	{ USB_DEVICE(USB_KEYSPAN_VENDOR_ID, USB_KEYSPAN_PRODUCT_UIA11) },
-	{ }					/* Terminating entry */
-};
-
-/* Structure to store all the real stuff that a remote sends to us. */
-struct keyspan_message {
-	u16	system;
-	u8	button;
-	u8	toggle;
-};
-
-/* Structure used for all the bit testing magic needed to be done. */
-struct bit_tester {
-	u32	tester;
-	int	len;
-	int	pos;
-	int	bits_left;
-	u8	buffer[32];
-};
-
-/* Structure to hold all of our driver specific stuff */
-struct usb_keyspan {
-	char				name[128];
-	char				phys[64];
-	unsigned short			keymap[ARRAY_SIZE(keyspan_key_table)];
-	struct usb_device		*udev;
-	struct input_dev		*input;
-	struct usb_interface		*interface;
-	struct usb_endpoint_descriptor	*in_endpoint;
-	struct urb*			irq_urb;
-	int				open;
-	dma_addr_t			in_dma;
-	unsigned char			*in_buffer;
-
-	/* variables used to parse messages from remote. */
-	struct bit_tester		data;
-	int				stage;
-	int				toggle;
-};
-
-static struct usb_driver keyspan_driver;
-
-/*
- * Debug routine that prints out what we've received from the remote.
- */
-static void keyspan_print(struct usb_keyspan* dev) /*unsigned char* data)*/
-{
-	char codes[4 * RECV_SIZE];
-	int i;
-
-	for (i = 0; i < RECV_SIZE; i++)
-		snprintf(codes + i * 3, 4, "%02x ", dev->in_buffer[i]);
-
-	dev_info(&dev->udev->dev, "%s\n", codes);
+	return ret;
 }
 
-/*
- * Routine that manages the bit_tester structure.  It makes sure that there are
- * at least bits_needed bits loaded into the tester.
- */
-static int keyspan_load_tester(struct usb_keyspan* dev, int bits_needed)
+static inline void
+isert_set_dif_domain(struct se_cmd *se_cmd, struct ib_sig_attrs *sig_attrs,
+		     struct ib_sig_domain *domain)
 {
-	if (dev->data.bits_left >= bits_needed)
+	domain->sig_type = IB_SIG_TYPE_T10_DIF;
+	domain->sig.dif.bg_type = IB_T10DIF_CRC;
+	domain->sig.dif.pi_interval = se_cmd->se_dev->dev_attrib.block_size;
+	domain->sig.dif.ref_tag = se_cmd->reftag_seed;
+	/*
+	 * At the moment we hard code those, but if in the future
+	 * the target core would like to use it, we will take it
+	 * from se_cmd.
+	 */
+	domain->sig.dif.apptag_check_mask = 0xffff;
+	domain->sig.dif.app_escape = true;
+	domain->sig.dif.ref_escape = true;
+	if (se_cmd->prot_type == TARGET_DIF_TYPE1_PROT ||
+	    se_cmd->prot_type == TARGET_DIF_TYPE2_PROT)
+		domain->sig.dif.ref_remap = true;
+};
+
+static int
+isert_set_sig_attrs(struct se_cmd *se_cmd, struct ib_sig_attrs *sig_attrs)
+{
+	switch (se_cmd->prot_op) {
+	case TARGET_PROT_DIN_INSERT:
+	case TARGET_PROT_DOUT_STRIP:
+		sig_attrs->mem.sig_type = IB_SIG_TYPE_NONE;
+		isert_set_dif_domain(se_cmd, sig_attrs, &sig_attrs->wire);
+		break;
+	case TARGET_PROT_DOUT_INSERT:
+	case TARGET_PROT_DIN_STRIP:
+		sig_attrs->wire.sig_type = IB_SIG_TYPE_NONE;
+		isert_set_dif_domain(se_cmd, sig_attrs, &sig_attrs->mem);
+		break;
+	case TARGET_PROT_DIN_PASS:
+	case TARGET_PROT_DOUT_PASS:
+		isert_set_dif_domain(se_cmd, sig_attrs, &sig_attrs->wire);
+		isert_set_dif_domain(se_cmd, sig_attrs, &sig_attrs->mem);
+		break;
+	default:
+		isert_err("Unsupported PI operation %d\n", se_cmd->prot_op);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static inline u8
+isert_set_prot_checks(u8 prot_checks)
+{
+	return (prot_checks & TARGET_DIF_CHECK_GUARD  ? 0xc0 : 0) |
+	       (prot_checks & TARGET_DIF_CHECK_REFTAG ? 0x30 : 0) |
+	       (prot_checks & TARGET_DIF_CHECK_REFTAG ? 0x0f : 0);
+}
+
+static int
+isert_reg_sig_mr(struct isert_conn *isert_conn,
+		 struct se_cmd *se_cmd,
+		 struct isert_rdma_wr *rdma_wr,
+		 struct fast_reg_descriptor *fr_desc)
+{
+	struct ib_sig_handover_wr sig_wr;
+	struct ib_send_wr inv_wr, *bad_wr, *wr = NULL;
+	struct pi_context *pi_ctx = fr_desc->pi_ctx;
+	struct ib_sig_attrs sig_attrs;
+	int ret;
+
+	memset(&sig_attrs, 0, sizeof(sig_attrs));
+	ret = isert_set_sig_attrs(se_cmd, &sig_attrs);
+	if (ret)
+		goto err;
+
+	sig_attrs.check_mask = isert_set_prot_checks(se_cmd->prot_checks);
+
+	if (!(fr_desc->ind & ISERT_SIG_KEY_VALID)) {
+		isert_inv_rkey(&inv_wr, pi_ctx->sig_mr);
+		wr = &inv_wr;
+	}
+
+	memset(&sig_wr, 0, sizeof(sig_wr));
+	sig_wr.wr.opcode = IB_WR_REG_SIG_MR;
+	sig_wr.wr.wr_id = ISER_FASTREG_LI_WRID;
+	sig_wr.wr.sg_list = &rdma_wr->ib_sg[DATA];
+	sig_wr.wr.num_sge = 1;
+	sig_wr.access_flags = IB_ACCESS_LOCAL_WRITE;
+	sig_wr.sig_attrs = &sig_attrs;
+	sig_wr.sig_mr = pi_ctx->sig_mr;
+	if (se_cmd->t_prot_sg)
+		sig_wr.prot = &rdma_wr->ib_sg[PROT];
+
+	if (!wr)
+		wr = &sig_wr.wr;
+	else
+		wr->next = &sig_wr.wr;
+
+	ret = ib_post_send(isert_conn->qp, wr, &bad_wr);
+	if (ret) {
+		isert_err("fast registration failed, ret:%d\n", ret);
+		goto err;
+	}
+	fr_desc->ind &= ~ISERT_SIG_KEY_VALID;
+
+	rdma_wr->ib_sg[SIG].lkey = pi_ctx->sig_mr->lkey;
+	rdma_wr->ib_sg[SIG].addr = 0;
+	rdma_wr->ib_sg[SIG].length = se_cmd->data_length;
+	if (se_cmd->prot_op != TARGET_PROT_DIN_STRIP &&
+	    se_cmd->prot_op != TARGET_PROT_DOUT_INSERT)
+		/*
+		 * We have protection guards on the wire
+		 * so we need to set a larget transfer
+		 */
+		rdma_wr->ib_sg[SIG].length += se_cmd->prot_length;
+
+	isert_dbg("sig_sge: addr: 0x%llx  length: %u lkey: %x\n",
+		  rdma_wr->ib_sg[SIG].addr, rdma_wr->ib_sg[SIG].length,
+		  rdma_wr->ib_sg[SIG].lkey);
+err:
+	return ret;
+}
+
+static int
+isert_handle_prot_cmd(struct isert_conn *isert_conn,
+		      struct isert_cmd *isert_cmd,
+		      struct isert_rdma_wr *wr)
+{
+	struct isert_device *device = isert_conn->device;
+	struct se_cmd *se_cmd = &isert_cmd->iscsi_cmd->se_cmd;
+	int ret;
+
+	if (!wr->fr_desc->pi_ctx) {
+		ret = isert_create_pi_ctx(wr->fr_desc,
+					  device->ib_device,
+					  device->pd);
+		if (ret) {
+			isert_err("conn %p failed to allocate pi_ctx\n",
+				  isert_conn);
+			return ret;
+		}
+	}
+
+	if (se_cmd->t_prot_sg) {
+		ret = isert_map_data_buf(isert_conn, isert_cmd,
+					 se_cmd->t_prot_sg,
+					 se_cmd->t_prot_nents,
+					 se_cmd->prot_length,
+					 0, wr->iser_ib_op, &wr->prot);
+		if (ret) {
+			isert_err("conn %p failed to map protection buffer\n",
+				  isert_conn);
+			return ret;
+		}
+
+		memset(&wr->ib_sg[PROT], 0, sizeof(wr->ib_sg[PROT]));
+		ret = isert_fast_reg_mr(isert_conn, wr->fr_desc, &wr->prot,
+					ISERT_PROT_KEY_VALID, &wr->ib_sg[PROT]);
+		if (ret) {
+			isert_err("conn %p failed to fast reg mr\n",
+				  isert_conn);
+			goto unmap_prot_cmd;
+		}
+	}
+
+	ret = isert_reg_sig_mr(isert_conn, se_cmd, wr, wr->fr_desc);
+	if (ret) {
+		isert_err("conn %p failed to fast reg mr\n",
+			  isert_conn);
+		goto unmap_prot_cmd;
+	}
+	wr->fr_desc->ind |= ISERT_PROTECTED;
+
+	return 0;
+
+unmap_prot_cmd:
+	if (se_cmd->t_prot_sg)
+		isert_unmap_data_buf(isert_conn, &wr->prot);
+
+	return ret;
+}
+
+static int
+isert_reg_rdma(struct iscsi_conn *conn, struct iscsi_cmd *cmd,
+	       struct isert_rdma_wr *wr)
+{
+	struct se_cmd *se_cmd = &cmd->se_cmd;
+	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+	struct isert_conn *isert_conn = conn->context;
+	struct fast_reg_descriptor *fr_desc = NULL;
+	struct ib_rdma_wr *rdma_wr;
+	struct ib_sge *ib_sg;
+	u32 offset;
+	int ret = 0;
+	unsigned long flags;
+
+	isert_cmd->tx_desc.isert_cmd = isert_cmd;
+
+	offset = wr->iser_ib_op == ISER_IB_RDMA_READ ? cmd->write_data_done : 0;
+	ret = isert_map_data_buf(isert_conn, isert_cmd, se_cmd->t_data_sg,
+				 se_cmd->t_data_nents, se_cmd->data_length,
+				 offset, wr->iser_ib_op, &wr->data);
+	if (ret)
+		return ret;
+
+	if (wr->data.dma_nents != 1 || isert_prot_cmd(isert_conn, se_cmd)) {
+		spin_lock_irqsave(&isert_conn->pool_lock, flags);
+		fr_desc = list_first_entry(&isert_conn->fr_pool,
+					   struct fast_reg_descriptor, list);
+		list_del(&fr_desc->list);
+		spin_unlock_irqrestore(&isert_conn->pool_lock, flags);
+		wr->fr_desc = fr_desc;
+	}
+
+	ret = isert_fast_reg_mr(isert_conn, fr_desc, &wr->data,
+				ISERT_DATA_KEY_VALID, &wr->ib_sg[DATA]);
+	if (ret)
+		goto unmap_cmd;
+
+	if (isert_prot_cmd(isert_conn, se_cmd)) {
+		ret = isert_handle_prot_cmd(isert_conn, isert_cmd, wr);
+		if (ret)
+			goto unmap_cmd;
+
+		ib_sg = &wr->ib_sg[SIG];
+	} else {
+		ib_sg = &wr->ib_sg[DATA];
+	}
+
+	memcpy(&wr->s_ib_sge, ib_sg, sizeof(*ib_sg));
+	wr->ib_sge = &wr->s_ib_sge;
+	wr->rdma_wr_num = 1;
+	memset(&wr->s_rdma_wr, 0, sizeof(wr->s_rdma_wr));
+	wr->rdma_wr = &wr->s_rdma_wr;
+	wr->isert_cmd = isert_cmd;
+
+	rdma_wr = &isert_cmd->rdma_wr.s_rdma_wr;
+	rdma_wr->wr.sg_list = &wr->s_ib_sge;
+	rdma_wr->wr.num_sge = 1;
+	rdma_wr->wr.wr_id = (uintptr_t)&isert_cmd->tx_desc;
+	if (wr->iser_ib_op == ISER_IB_RDMA_WRITE) {
+		rdma_wr->wr.opcode = IB_WR_RDMA_WRITE;
+		rdma_wr->remote_addr = isert_cmd->read_va;
+		rdma_wr->rkey = isert_cmd->read_stag;
+		rdma_wr->wr.send_flags = !isert_prot_cmd(isert_conn, se_cmd) ?
+				      0 : IB_SEND_SIGNALED;
+	} else {
+		rdma_wr->wr.opcode = IB_WR_RDMA_READ;
+		rdma_wr->remote_addr = isert_cmd->write_va;
+		rdma_wr->rkey = isert_cmd->write_stag;
+		rdma_wr->wr.send_flags = IB_SEND_SIGNALED;
+	}
+
+	return 0;
+
+unmap_cmd:
+	if (fr_desc) {
+		spin_lock_irqsave(&isert_conn->pool_lock, flags);
+		list_add_tail(&fr_desc->list, &isert_conn->fr_pool);
+		spin_unlock_irqrestore(&isert_conn->pool_lock, flags);
+	}
+	isert_unmap_data_buf(isert_conn, &wr->data);
+
+	return ret;
+}
+
+static int
+isert_put_datain(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
+{
+	struct se_cmd *se_cmd = &cmd->se_cmd;
+	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
+	struct isert_conn *isert_conn = conn->context;
+	struct isert_device *device = isert_conn->device;
+	struct ib_send_wr *wr_failed;
+	int rc;
+
+	isert_dbg("Cmd: %p RDMA_WRITE data_length: %u\n",
+		 isert_cmd, se_cmd->data_length);
+
+	wr->iser_ib_op = ISER_IB_RDMA_WRITE;
+	rc = device->reg_rdma_mem(conn, cmd, wr);
+	if (rc) {
+		isert_err("Cmd: %p failed to prepare RDMA res\n", isert_cmd);
+		return rc;
+	}
+
+	if (!isert_prot_cmd(isert_conn, se_cmd)) {
+		/*
+		 * Build isert_conn->tx_desc for iSCSI response PDU and attach
+		 */
+		isert_create_send_desc(isert_conn, isert_cmd,
+				       &isert_cmd->tx_desc);
+		iscsit_build_rsp_pdu(cmd, conn, true, (struct iscsi_scsi_rsp *)
+				     &isert_cmd->tx_desc.iscsi_header);
+		isert_init_tx_hdrs(isert_conn, &isert_cmd->tx_desc);
+		isert_init_send_wr(isert_conn, isert_cmd,
+				   &isert_cmd->tx_desc.send_wr);
+		isert_cmd->rdma_wr.s_rdma_wr.wr.next = &isert_cmd->tx_desc.send_wr;
+		wr->rdma_wr_num += 1;
+
+		rc = isert_post_recv(isert_conn, isert_cmd->rx_desc);
+		if (rc) {
+			isert_err("ib_post_recv failed with %d\n", rc);
+			return rc;
+		}
+	}
+
+	rc = ib_post_send(isert_conn->qp, &wr->rdma_wr->wr, &wr_failed);
+	if (rc)
+		isert_warn("ib_post_send() failed for IB_WR_RDMA_WRITE\n");
+
+	if (!isert_prot_cmd(isert_conn, se_cmd))
+		isert_dbg("Cmd: %p posted RDMA_WRITE + Response for iSER Data "
+			 "READ\n", isert_cmd);
+	else
+		isert_dbg("Cmd: %p posted RDMA_WRITE for iSER Data READ\n",
+			 isert_cmd);
+
+	return 1;
+}
+
+static int
+isert_get_dataout(struct iscsi_conn *conn, struct iscsi_cmd *cmd, bool recovery)
+{
+	struct se_cmd *se_cmd = &cmd->se_cmd;
+	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+	struct isert_rdma_wr *wr = &isert_cmd->rdma_wr;
+	struct isert_conn *isert_conn = conn->context;
+	struct isert_device *device = isert_conn->device;
+	struct ib_send_wr *wr_failed;
+	int rc;
+
+	isert_dbg("Cmd: %p RDMA_READ data_length: %u write_data_done: %u\n",
+		 isert_cmd, se_cmd->data_length, cmd->write_data_done);
+	wr->iser_ib_op = ISER_IB_RDMA_READ;
+	rc = device->reg_rdma_mem(conn, cmd, wr);
+	if (rc) {
+		isert_err("Cmd: %p failed to prepare RDMA res\n", isert_cmd);
+		return rc;
+	}
+
+	rc = ib_post_send(isert_conn->qp, &wr->rdma_wr->wr, &wr_failed);
+	if (rc)
+		isert_warn("ib_post_send() failed for IB_WR_RDMA_READ\n");
+
+	isert_dbg("Cmd: %p posted RDMA_READ memory for ISER Data WRITE\n",
+		 isert_cmd);
+
+	return 0;
+}
+
+static int
+isert_immediate_queue(struct iscsi_conn *conn, struct iscsi_cmd *cmd, int state)
+{
+	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
+	int ret = 0;
+
+	switch (state) {
+	case ISTATE_REMOVE:
+		spin_lock_bh(&conn->cmd_lock);
+		list_del_init(&cmd->i_conn_node);
+		spin_unlock_bh(&conn->cmd_lock);
+		isert_put_cmd(isert_cmd, true);
+		break;
+	case ISTATE_SEND_NOPIN_WANT_RESPONSE:
+		ret = isert_put_nopin(cmd, conn, false);
+		break;
+	default:
+		isert_err("Unknown immediate state: 0x%02x\n", state);
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+static int
+isert_response_queue(struct iscsi_conn *conn, struct iscsi_cmd *cmd, int state)
+{
+	struct isert_conn *isert_conn = conn->context;
+	int ret;
+
+	switch (state) {
+	case ISTATE_SEND_LOGOUTRSP:
+		ret = isert_put_logout_rsp(cmd, conn);
+		if (!ret)
+			isert_conn->logout_posted = true;
+		break;
+	case ISTATE_SEND_NOPIN:
+		ret = isert_put_nopin(cmd, conn, true);
+		break;
+	case ISTATE_SEND_TASKMGTRSP:
+		ret = isert_put_tm_rsp(cmd, conn);
+		break;
+	case ISTATE_SEND_REJECT:
+		ret = isert_put_reject(cmd, conn);
+		break;
+	case ISTATE_SEND_TEXTRSP:
+		ret = isert_put_text_rsp(cmd, conn);
+		break;
+	case ISTATE_SEND_STATUS:
+		/*
+		 * Special case for sending non GOOD SCSI status from TX thread
+		 * context during pre se_cmd excecution failure.
+		 */
+		ret = isert_put_response(conn, cmd);
+		break;
+	default:
+		isert_err("Unknown response state: 0x%02x\n", state);
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+struct rdma_cm_id *
+isert_setup_id(struct isert_np *isert_np)
+{
+	struct iscsi_np *np = isert_np->np;
+	struct rdma_cm_id *id;
+	struct sockaddr *sa;
+	int ret;
+
+	sa = (struct sockaddr *)&np->np_sockaddr;
+	isert_dbg("ksockaddr: %p, sa: %p\n", &np->np_sockaddr, sa);
+
+	id = rdma_create_id(&init_net, isert_cma_handler, isert_np,
+			    RDMA_PS_TCP, IB_QPT_RC);
+	if (IS_ERR(id)) {
+		isert_err("rdma_create_id() failed: %ld\n", PTR_ERR(id));
+		ret = PTR_ERR(id);
+		goto out;
+	}
+	isert_dbg("id %p context %p\n", id, id->context);
+
+	ret = rdma_bind_addr(id, sa);
+	if (ret) {
+		isert_err("rdma_bind_addr() failed: %d\n", ret);
+		goto out_id;
+	}
+
+	ret = rdma_listen(id, 0);
+	if (ret) {
+		isert_err("rdma_listen() failed: %d\n", ret);
+		goto out_id;
+	}
+
+	return id;
+out_id:
+	rdma_destroy_id(id);
+out:
+	return ERR_PTR(ret);
+}
+
+static int
+isert_setup_np(struct iscsi_np *np,
+	       struct sockaddr_storage *ksockaddr)
+{
+	struct isert_np *isert_np;
+	struct rdma_cm_id *isert_lid;
+	int ret;
+
+	isert_np = kzalloc(sizeof(struct isert_np), GFP_KERNEL);
+	if (!isert_np) {
+		isert_err("Unable to allocate struct isert_np\n");
+		return -ENOMEM;
+	}
+	sema_init(&isert_np->sem, 0);
+	mutex_init(&isert_np->mutex);
+	INIT_LIST_HEAD(&isert_np->accepted);
+	INIT_LIST_HEAD(&isert_np->pending);
+	isert_np->np = np;
+
+	/*
+	 * Setup the np->np_sockaddr from the passed sockaddr setup
+	 * in iscsi_target_configfs.c code..
+	 */
+	memcpy(&np->np_sockaddr, ksockaddr,
+	       sizeof(struct sockaddr_storage));
+
+	isert_lid = isert_setup_id(isert_np);
+	if (IS_ERR(isert_lid)) {
+		ret = PTR_ERR(isert_lid);
+		goto out;
+	}
+
+	isert_np->cm_id = isert_lid;
+	np->np_context = isert_np;
+
+	return 0;
+
+out:
+	kfree(isert_np);
+
+	return ret;
+}
+
+static int
+isert_rdma_accept(struct isert_conn *isert_conn)
+{
+	struct rdma_cm_id *cm_id = isert_conn->cm_id;
+	struct rdma_conn_param cp;
+	int ret;
+
+	memset(&cp, 0, sizeof(struct rdma_conn_param));
+	cp.initiator_depth = isert_conn->initiator_depth;
+	cp.retry_count = 7;
+	cp.rnr_retry_count = 7;
+
+	ret = rdma_accept(cm_id, &cp);
+	if (ret) {
+		isert_err("rdma_accept() failed with: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int
+isert_get_login_rx(struct iscsi_conn *conn, struct iscsi_login *login)
+{
+	struct isert_conn *isert_conn = conn->context;
+	int ret;
+
+	isert_info("before login_req comp conn: %p\n", isert_conn);
+	ret = wait_for_completion_interruptible(&isert_conn->login_req_comp);
+	if (ret) {
+		isert_err("isert_conn %p interrupted before got login req\n",
+			  isert_conn);
+		return ret;
+	}
+	reinit_completion(&isert_conn->login_req_comp);
+
+	/*
+	 * For login requests after the first PDU, isert_rx_login_req() will
+	 * kick schedule_delayed_work(&conn->login_work) as the packet is
+	 * received, which turns this callback from iscsi_target_do_login_rx()
+	 * into a NOP.
+	 */
+	if (!login->first_request)
 		return 0;
 
-	/*
-	 * Somehow we've missed the last message. The message will be repeated
-	 * though so it's not too big a deal
-	 */
-	if (dev->data.pos >= dev->data.len) {
-		dev_dbg(&dev->interface->dev,
-			"%s - Error ran out of data. pos: %d, len: %d\n",
-			__func__, dev->data.pos, dev->data.len);
-		return -1;
-	}
+	isert_rx_login_req(isert_conn);
 
-	/* Load as much as we can into the tester. */
-	while ((dev->data.bits_left + 7 < (sizeof(dev->data.tester) * 8)) &&
-	       (dev->data.pos < dev->data.len)) {
-		dev->data.tester += (dev->data.buffer[dev->data.pos++] << dev->data.bits_left);
-		dev->data.bits_left += 8;
-	}
+	isert_info("before login_comp conn: %p\n", conn);
+	ret = wait_for_completion_interruptible(&isert_conn->login_comp);
+	if (ret)
+		return ret;
+
+	isert_info("processing login->req: %p\n", login->req);
 
 	return 0;
 }
 
-static void keyspan_report_button(struct usb_keyspan *remote, int button, int press)
+static void
+isert_set_conn_info(struct iscsi_np *np, struct iscsi_conn *conn,
+		    struct isert_conn *isert_conn)
 {
-	struct input_dev *input = remote->input;
+	struct rdma_cm_id *cm_id = isert_conn->cm_id;
+	struct rdma_route *cm_route = &cm_id->route;
 
-	input_event(input, EV_MSC, MSC_SCAN, button);
-	input_report_key(input, remote->keymap[button], press);
-	input_sync(input);
+	conn->login_family = np->np_sockaddr.ss_family;
+
+	conn->login_sockaddr = cm_route->addr.dst_addr;
+	conn->local_sockaddr = cm_route->addr.src_addr;
 }
 
-/*
- * Routine that handles all the logic needed to parse out the message from the remote.
- */
-static void keyspan_check_data(struct usb_keyspan *remote)
+static int
+isert_accept_np(struct iscsi_np *np, struct iscsi_conn *conn)
 {
-	int i;
-	int found = 0;
-	struct keyspan_message message;
+	struct isert_np *isert_np = np->np_context;
+	struct isert_conn *isert_conn;
+	int ret;
 
-	switch(remote->stage) {
-	case 0:
-		/*
-		 * In stage 0 we want to find the start of a message.  The remote sends a 0xFF as filler.
-		 * So the first byte that isn't a FF should be the start of a new message.
-		 */
-		for (i = 0; i < RECV_SIZE && remote->in_buffer[i] == GAP; ++i);
-
-		if (i < RECV_SIZE) {
-			memcpy(remote->data.buffer, remote->in_buffer, RECV_SIZE);
-			remote->data.len = RECV_SIZE;
-			remote->data.pos = 0;
-			remote->data.tester = 0;
-			remote->data.bits_left = 0;
-			remote->stage = 1;
-		}
-		break;
-
-	case 1:
-		/*
-		 * Stage 1 we should have 16 bytes and should be able to detect a
-		 * SYNC.  The SYNC is 14 bits, 7 0's and then 7 1's.
-		 */
-		memcpy(remote->data.buffer + remote->data.len, remote->in_buffer, RECV_SIZE);
-		remote->data.len += RECV_SIZE;
-
-		found = 0;
-		while ((remote->data.bits_left >= 14 || remote->data.pos < remote->data.len) && !found) {
-			for (i = 0; i < 8; ++i) {
-				if (keyspan_load_tester(remote, 14) != 0) {
-					remote->stage = 0;
-					return;
-				}
-
-				if ((remote->data.tester & SYNC_MASK) == SYNC) {
-					remote->data.tester = remote->data.tester >> 14;
-					remote->data.bits_left -= 14;
-					found = 1;
-					break;
-				} else {
-					remote->data.tester = remote->data.tester >> 1;
-					--remote->data.bits_left;
-				}
-			}
-		}
-
-		if (!found) {
-			remote->stage = 0;
-			remote->data.len = 0;
-		} else {
-			remote->stage = 2;
-		}
-		break;
-
-	case 2:
-		/*
-		 * Stage 2 we should have 24 bytes which will be enough for a full
-		 * message.  We need to parse out the system code, button code,
-		 * toggle code, and stop.
-		 */
-		memcpy(remote->data.buffer + remote->data.len, remote->in_buffer, RECV_SIZE);
-		remote->data.len += RECV_SIZE;
-
-		message.system = 0;
-		for (i = 0; i < 9; i++) {
-			keyspan_load_tester(remote, 6);
-
-			if ((remote->data.tester & ZERO_MASK) == ZERO) {
-				message.system = message.system << 1;
-				remote->data.tester = remote->data.tester >> 5;
-				remote->data.bits_left -= 5;
-			} else if ((remote->data.tester & ONE_MASK) == ONE) {
-				message.system = (message.system << 1) + 1;
-				remote->data.tester = remote->data.tester >> 6;
-				remote->data.bits_left -= 6;
-			} else {
-				dev_err(&remote->interface->dev,
-					"%s - Unknown sequence found in system data.\n",
-					__func__);
-				remote->stage = 0;
-				return;
-			}
-		}
-
-		message.button = 0;
-		for (i = 0; i < 5; i++) {
-			keyspan_load_tester(remote, 6);
-
-			if ((remote->data.tester & ZERO_MASK) == ZERO) {
-				message.button = message.button << 1;
-				remote->data.tester = remote->data.tester >> 5;
-				remote->data.bits_left -= 5;
-			} else if ((remote->data.tester & ONE_MASK) == ONE) {
-				message.button = (message.button << 1) + 1;
-				remote->data.tester = remote->data.tester >> 6;
-				remote->data.bits_left -= 6;
-			} else {
-				dev_err(&remote->interface->dev,
-					"%s - Unknown sequence found in button data.\n",
-					__func__);
-				remote->stage = 0;
-				return;
-			}
-		}
-
-		keyspan_load_tester(remote, 6);
-		if ((remote->data.tester & ZERO_MASK) == ZERO) {
-			message.toggle = 0;
-			remote->data.tester = remote->data.tester >> 5;
-			remote->data.bits_left -= 5;
-		} else if ((remote->data.tester & ONE_MASK) == ONE) {
-			message.toggle = 1;
-			remote->data.tester = remote->data.tester >> 6;
-			remote->data.bits_left -= 6;
-		} else {
-			dev_err(&remote->interface->dev,
-				"%s - Error in message, invalid toggle.\n",
-				__func__);
-			remote->stage = 0;
-			return;
-		}
-
-		keyspan_load_tester(remote, 5);
-		if ((remote->data.tester & STOP_MASK) == STOP) {
-			remote->data.tester = remote->data.tester >> 5;
-			remote->data.bits_left -= 5;
-		} else {
-			dev_err(&remote->interface->dev,
-				"Bad message received, no stop bit found.\n");
-		}
-
-		dev_dbg(&remote->interface->dev,
-			"%s found valid message: system: %d, button: %d, toggle: %d\n",
-			__func__, message.system, message.button, message.toggle);
-
-		if (message.toggle != remote->toggle) {
-			keyspan_report_button(remote, message.button, 1);
-			keyspan_report_button(remote, message.button, 0);
-			remote->toggle = message.toggle;
-		}
-
-		remote->stage = 0;
-		break;
-	}
-}
-
-/*
- * Routine for sending all the initialization messages to the remote.
- */
-static int keyspan_setup(struct usb_device* dev)
-{
-	int retval = 0;
-
-	retval = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-				 0x11, 0x40, 0x5601, 0x0, NULL, 0,
-				 USB_CTRL_SET_TIMEOUT);
-	if (retval) {
-		dev_dbg(&dev->dev, "%s - failed to set bit rate due to error: %d\n",
-			__func__, retval);
-		return(retval);
-	}
-
-	retval = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-				 0x44, 0x40, 0x0, 0x0, NULL, 0,
-				 USB_CTRL_SET_TIMEOUT);
-	if (retval) {
-		dev_dbg(&dev->dev, "%s - failed to set resume sensitivity due to error: %d\n",
-			__func__, retval);
-		return(retval);
-	}
-
-	retval = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
-				 0x22, 0x40, 0x0, 0x0, NULL, 0,
-				 USB_CTRL_SET_TIMEOUT);
-	if (retval) {
-		dev_dbg(&dev->dev, "%s - failed to turn receive on due to error: %d\n",
-			__func__, retval);
-		return(retval);
-	}
-
-	dev_dbg(&dev->dev, "%s - Setup complete.\n", __func__);
-	return(retval);
-}
-
-/*
- * Routine used to handle a new message that has come in.
- */
-static void keyspan_irq_recv(struct urb *urb)
-{
-	struct usb_keyspan *dev = urb->context;
-	int retval;
-
-	/* Check our status in case we need to bail out early. */
-	switch (urb->status) {
-	case 0:
-		break;
-
-	/* Device went away so don't keep trying to read from it. */
-	case -ECONNRESET:
-	case -ENOENT:
-	case -ESHUTDOWN:
-		return;
-
-	default:
-		goto resubmit;
-	}
-
-	if (debug)
-		keyspan_print(dev);
-
-	keyspan_check_data(dev);
-
-resubmit:
-	retval = usb_submit_urb(urb, GFP_ATOMIC);
-	if (retval)
-		dev_err(&dev->interface->dev,
-			"%s - usb_submit_urb failed with result: %d\n",
-			__func__, retval);
-}
-
-static int keyspan_open(struct input_dev *dev)
-{
-	struct usb_keyspan *remote = input_get_drvdata(dev);
-
-	remote->irq_urb->dev = remote->udev;
-	if (usb_submit_urb(remote->irq_urb, GFP_KERNEL))
-		return -EIO;
-
-	return 0;
-}
-
-static void keyspan_close(struct input_dev *dev)
-{
-	struct usb_keyspan *remote = input_get_drvdata(dev);
-
-	usb_kill_urb(remote->irq_urb);
-}
-
-static struct usb_endpoint_descriptor *keyspan_get_in_endpoint(struct usb_host_interface *iface)
-{
-
-	struct usb_endpoint_descriptor *endpoint;
-	int i;
-
-	for (i = 0; i < iface->desc.bNumEndpoints; ++i) {
-		endpoint = &iface->endpoint[i].desc;
-
-		if (usb_endpoint_is_int_in(endpoint)) {
-			/* we found our interrupt in endpoint */
-			return endpoint;
-		}
-	}
-
-	return NULL;
-}
-
-/*
- * Routine that sets up the driver to handle a specific USB device detected on the bus.
- */
-static int keyspan_probe(struct usb_interface *interface, const struct usb_device_id *id)
-{
-	struct usb_device *udev = interface_to_usbdev(interface);
-	struct usb_endpoint_descriptor *endpoint;
-	struct usb_keyspan *remote;
-	struct input_dev *input_dev;
-	int i, error;
-
-	endpoint = keyspan_get_in_endpoint(interface->cur_altsetting);
-	if (!endpoint)
+accept_wait:
+	ret = down_interruptible(&isert_np->sem);
+	if (ret)
 		return -ENODEV;
 
-	remote = kzalloc(sizeof(*remote), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!remote || !input_dev) {
-		error = -ENOMEM;
-		goto fail1;
+	spin_lock_bh(&np->np_thread_lock);
+	if (np->np_thread_state >= ISCSI_NP_THREAD_RESET) {
+		spin_unlock_bh(&np->np_thread_lock);
+		isert_dbg("np_thread_state %d\n",
+			 np->np_thread_state);
+		/**
+		 * No point in stalling here when np_thread
+		 * is in state RESET/SHUTDOWN/EXIT - bail
+		 **/
+		return -ENODEV;
 	}
+	spin_unlock_bh(&np->np_thread_lock);
 
-	remote->udev = udev;
-	remote->input = input_dev;
-	remote->interface = interface;
-	remote->in_endpoint = endpoint;
-	remote->toggle = -1;	/* Set to -1 so we will always not match the toggle from the first remote message. */
-
-	remote->in_buffer = usb_alloc_coherent(udev, RECV_SIZE, GFP_ATOMIC, &remote->in_dma);
-	if (!remote->in_buffer) {
-		error = -ENOMEM;
-		goto fail1;
-	}
-
-	remote->irq_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!remote->irq_urb) {
-		error = -ENOMEM;
-		goto fail2;
-	}
-
-	error = keyspan_setup(udev);
-	if (error) {
-		error = -ENODEV;
-		goto fail3;
-	}
-
-	if (udev->manufacturer)
-		strlcpy(remote->name, udev->manufacturer, sizeof(remote->name));
-
-	if (udev->product) {
-		if (udev->manufacturer)
-			strlcat(remote->name, " ", sizeof(remote->name));
-		strlcat(remote->name, udev->product, sizeof(remote->name));
-	}
-
-	if (!strlen(remote->name))
-		snprintf(remote->name, sizeof(remote->name),
-			 "USB Keyspan Remote %04x:%04x",
-			 le16_to_cpu(udev->descriptor.idVendor),
-			 le16_to_cpu(udev->descriptor.idProduct));
-
-	usb_make_path(udev, remote->phys, sizeof(remote->phys));
-	strlcat(remote->phys, "/input0", sizeof(remote->phys));
-	memcpy(remote->keymap, keyspan_key_table, sizeof(remote->keymap));
-
-	input_dev->name = remote->name;
-	input_dev->phys = remote->phys;
-	usb_to_input_id(udev, &input_dev->id);
-	input_dev->dev.parent = &interface->dev;
-	input_dev->keycode = remote->keymap;
-	input_dev->keycodesize = sizeof(unsigned short);
-	input_dev->keycodemax = ARRAY_SIZE(remote->keymap);
-
-	input_set_capability(input_dev, EV_MSC, MSC_SCAN);
-	__set_bit(EV_KEY, input_dev->evbit);
-	for (i = 0; i < ARRAY_SIZE(keyspan_key_table); i++)
-		__set_bit(keyspan_key_table[i], input_dev->keybit);
-	__clear_bit(KEY_RESERVED, input_dev->keybit);
-
-	input_set_drvdata(input_dev, remote);
-
-	input_dev->open = keyspan_open;
-	input_dev->close = keyspan_close;
-
-	/*
-	 * Initialize the URB to access the device.
-	 * The urb gets sent to the device in keyspan_open()
-	 */
-	usb_fill_int_urb(remote->irq_urb,
-			 remote->udev,
-			 usb_rcvintpipe(remote->udev, endpoint->bEndpointAddress),
-			 remote->in_buffer, RECV_SIZE, keyspan_irq_recv, remote,
-			 endpoint->bInterval);
-	remote->irq_urb->transfer_dma = remote->in_dma;
-	remote->irq_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-
-	/* we can register the device now, as it is ready */
-	error = input_register_device(remote->input);
-	if (error)
-		goto fail3;
-
-	/* save our data pointer in this interface device */
-	usb_set_intfdata(interface, remote);
-
-	return 0;
-
- fail3:	usb_free_urb(remote->irq_urb);
- fail2:	usb_free_coherent(udev, RECV_SIZE, remote->in_buffer, remote->in_dma);
- fail1:	kfree(remote);
-	input_free_device(input_dev);
-
-	return error;
-}
-
-/*
- * Routine called when a device is disconnected from the USB.
- */
-static void keyspan_disconnect(struct usb_interface *interface)
-{
-	struct usb_keyspan *remote;
-
-	remote = usb_get_intfdata(interface);
-	usb_set_intfdata(interface, NULL);
-
-	if (remote) {	/* We have a valid driver structure so clean up everything we allocated. */
-		input_unregister_device(remote->input);
-		usb_kill_urb(remote->irq_urb);
-		usb_free_urb(remote->irq_urb);
-		usb_free_coherent(remote->udev, RECV_SIZE, remote->in_buffer, remote->in_dma);
-		kfree(remote);
-	}
-}
-
-/*
- * Standard driver set up sections
- */
-static struct usb_driver keyspan_driver =
-{
-	.name =		"keyspan_remote",
-	.probe =	keyspan_probe,
-	.disconnect =	keyspan_disconnect,
-	.id_table =	keyspan_table
-};
-
-module_usb_driver(keyspan_driver);
-
-MODULE_DEVICE_TABLE(usb, keyspan_table);
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE(DRIVER_LICENSE);
+	mutex_lock(&isert_np->mutex);
+	if (list_empty(&isert_np->pending)) {
+		mutex_unlock(&isert_np->mut

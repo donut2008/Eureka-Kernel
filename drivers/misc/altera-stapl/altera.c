@@ -1,2536 +1,2154 @@
-/*
- * altera.c
- *
- * altera FPGA driver
- *
- * Copyright (C) Altera Corporation 1998-2001
- * Copyright (C) 2010,2011 NetUP Inc.
- * Copyright (C) 2010,2011 Igor M. Liplianin <liplianin@netup.ru>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- */
+pped(mq->queue) && !ctx_info->active_reqs)
+		complete(&mq->cmdq_shutdown_complete);
 
-#include <asm/unaligned.h>
-#include <linux/ctype.h>
-#include <linux/string.h>
-#include <linux/firmware.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <misc/altera.h>
-#include "altera-exprt.h"
-#include "altera-jtag.h"
-
-static int debug = 1;
-module_param(debug, int, 0644);
-MODULE_PARM_DESC(debug, "enable debugging information");
-
-MODULE_DESCRIPTION("altera FPGA kernel module");
-MODULE_AUTHOR("Igor M. Liplianin  <liplianin@netup.ru>");
-MODULE_LICENSE("GPL");
-
-#define dprintk(args...) \
-	if (debug) { \
-		printk(KERN_DEBUG args); \
-	}
-
-enum altera_fpga_opcode {
-	OP_NOP = 0,
-	OP_DUP,
-	OP_SWP,
-	OP_ADD,
-	OP_SUB,
-	OP_MULT,
-	OP_DIV,
-	OP_MOD,
-	OP_SHL,
-	OP_SHR,
-	OP_NOT,
-	OP_AND,
-	OP_OR,
-	OP_XOR,
-	OP_INV,
-	OP_GT,
-	OP_LT,
-	OP_RET,
-	OP_CMPS,
-	OP_PINT,
-	OP_PRNT,
-	OP_DSS,
-	OP_DSSC,
-	OP_ISS,
-	OP_ISSC,
-	OP_DPR = 0x1c,
-	OP_DPRL,
-	OP_DPO,
-	OP_DPOL,
-	OP_IPR,
-	OP_IPRL,
-	OP_IPO,
-	OP_IPOL,
-	OP_PCHR,
-	OP_EXIT,
-	OP_EQU,
-	OP_POPT,
-	OP_ABS = 0x2c,
-	OP_BCH0,
-	OP_PSH0 = 0x2f,
-	OP_PSHL = 0x40,
-	OP_PSHV,
-	OP_JMP,
-	OP_CALL,
-	OP_NEXT,
-	OP_PSTR,
-	OP_SINT = 0x47,
-	OP_ST,
-	OP_ISTP,
-	OP_DSTP,
-	OP_SWPN,
-	OP_DUPN,
-	OP_POPV,
-	OP_POPE,
-	OP_POPA,
-	OP_JMPZ,
-	OP_DS,
-	OP_IS,
-	OP_DPRA,
-	OP_DPOA,
-	OP_IPRA,
-	OP_IPOA,
-	OP_EXPT,
-	OP_PSHE,
-	OP_PSHA,
-	OP_DYNA,
-	OP_EXPV = 0x5c,
-	OP_COPY = 0x80,
-	OP_REVA,
-	OP_DSC,
-	OP_ISC,
-	OP_WAIT,
-	OP_VS,
-	OP_CMPA = 0xc0,
-	OP_VSC,
-};
-
-struct altera_procinfo {
-	char			*name;
-	u8			attrs;
-	struct altera_procinfo	*next;
-};
-
-/* This function checks if enough parameters are available on the stack. */
-static int altera_check_stack(int stack_ptr, int count, int *status)
-{
-	if (stack_ptr < count) {
-		*status = -EOVERFLOW;
-		return 0;
-	}
-
-	return 1;
+	return err ? 1 : 0;
 }
 
-static void altera_export_int(char *key, s32 value)
+static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
 {
-	dprintk("Export: key = \"%s\", value = %d\n", key, value);
-}
-
-#define HEX_LINE_CHARS 72
-#define HEX_LINE_BITS (HEX_LINE_CHARS * 4)
-
-static void altera_export_bool_array(char *key, u8 *data, s32 count)
-{
-	char string[HEX_LINE_CHARS + 1];
-	s32 i, offset;
-	u32 size, line, lines, linebits, value, j, k;
-
-	if (count > HEX_LINE_BITS) {
-		dprintk("Export: key = \"%s\", %d bits, value = HEX\n",
-							key, count);
-		lines = (count + (HEX_LINE_BITS - 1)) / HEX_LINE_BITS;
-
-		for (line = 0; line < lines; ++line) {
-			if (line < (lines - 1)) {
-				linebits = HEX_LINE_BITS;
-				size = HEX_LINE_CHARS;
-				offset = count - ((line + 1) * HEX_LINE_BITS);
-			} else {
-				linebits =
-					count - ((lines - 1) * HEX_LINE_BITS);
-				size = (linebits + 3) / 4;
-				offset = 0L;
-			}
-
-			string[size] = '\0';
-			j = size - 1;
-			value = 0;
-
-			for (k = 0; k < linebits; ++k) {
-				i = k + offset;
-				if (data[i >> 3] & (1 << (i & 7)))
-					value |= (1 << (i & 3));
-				if ((i & 3) == 3) {
-					sprintf(&string[j], "%1x", value);
-					value = 0;
-					--j;
-				}
-			}
-			if ((k & 3) > 0)
-				sprintf(&string[j], "%1x", value);
-
-			dprintk("%s\n", string);
-		}
-
-	} else {
-		size = (count + 3) / 4;
-		string[size] = '\0';
-		j = size - 1;
-		value = 0;
-
-		for (i = 0; i < count; ++i) {
-			if (data[i >> 3] & (1 << (i & 7)))
-				value |= (1 << (i & 3));
-			if ((i & 3) == 3) {
-				sprintf(&string[j], "%1x", value);
-				value = 0;
-				--j;
-			}
-		}
-		if ((i & 3) > 0)
-			sprintf(&string[j], "%1x", value);
-
-		dprintk("Export: key = \"%s\", %d bits, value = HEX %s\n",
-			key, count, string);
-	}
-}
-
-static int altera_execute(struct altera_state *astate,
-				u8 *p,
-				s32 program_size,
-				s32 *error_address,
-				int *exit_code,
-				int *format_version)
-{
-	struct altera_config *aconf = astate->config;
-	char *msg_buff = astate->msg_buff;
-	long *stack = astate->stack;
-	int status = 0;
-	u32 first_word = 0L;
-	u32 action_table = 0L;
-	u32 proc_table = 0L;
-	u32 str_table = 0L;
-	u32 sym_table = 0L;
-	u32 data_sect = 0L;
-	u32 code_sect = 0L;
-	u32 debug_sect = 0L;
-	u32 action_count = 0L;
-	u32 proc_count = 0L;
-	u32 sym_count = 0L;
-	long *vars = NULL;
-	s32 *var_size = NULL;
-	char *attrs = NULL;
-	u8 *proc_attributes = NULL;
-	u32 pc;
-	u32 opcode_address;
-	u32 args[3];
-	u32 opcode;
-	u32 name_id;
-	u8 charbuf[4];
-	long long_tmp;
-	u32 variable_id;
-	u8 *charptr_tmp;
-	u8 *charptr_tmp2;
-	long *longptr_tmp;
-	int version = 0;
-	int delta = 0;
-	int stack_ptr = 0;
-	u32 arg_count;
-	int done = 0;
-	int bad_opcode = 0;
-	u32 count;
-	u32 index;
-	u32 index2;
-	s32 long_count;
-	s32 long_idx;
-	s32 long_idx2;
-	u32 i;
-	u32 j;
-	u32 uncomp_size;
-	u32 offset;
-	u32 value;
-	int current_proc = 0;
-	int reverse;
-
-	char *name;
-
-	dprintk("%s\n", __func__);
-
-	/* Read header information */
-	if (program_size > 52L) {
-		first_word    = get_unaligned_be32(&p[0]);
-		version = (first_word & 1L);
-		*format_version = version + 1;
-		delta = version * 8;
-
-		action_table  = get_unaligned_be32(&p[4]);
-		proc_table    = get_unaligned_be32(&p[8]);
-		str_table  = get_unaligned_be32(&p[4 + delta]);
-		sym_table  = get_unaligned_be32(&p[16 + delta]);
-		data_sect  = get_unaligned_be32(&p[20 + delta]);
-		code_sect  = get_unaligned_be32(&p[24 + delta]);
-		debug_sect = get_unaligned_be32(&p[28 + delta]);
-		action_count  = get_unaligned_be32(&p[40 + delta]);
-		proc_count    = get_unaligned_be32(&p[44 + delta]);
-		sym_count  = get_unaligned_be32(&p[48 + (2 * delta)]);
-	}
-
-	if ((first_word != 0x4A414D00L) && (first_word != 0x4A414D01L)) {
-		done = 1;
-		status = -EIO;
-		goto exit_done;
-	}
-
-	if (sym_count <= 0)
-		goto exit_done;
-
-	vars = kzalloc(sym_count * sizeof(long), GFP_KERNEL);
-
-	if (vars == NULL)
-		status = -ENOMEM;
-
-	if (status == 0) {
-		var_size = kzalloc(sym_count * sizeof(s32), GFP_KERNEL);
-
-		if (var_size == NULL)
-			status = -ENOMEM;
-	}
-
-	if (status == 0) {
-		attrs = kzalloc(sym_count, GFP_KERNEL);
-
-		if (attrs == NULL)
-			status = -ENOMEM;
-	}
-
-	if ((status == 0) && (version > 0)) {
-		proc_attributes = kzalloc(proc_count, GFP_KERNEL);
-
-		if (proc_attributes == NULL)
-			status = -ENOMEM;
-	}
-
-	if (status != 0)
-		goto exit_done;
-
-	delta = version * 2;
-
-	for (i = 0; i < sym_count; ++i) {
-		offset = (sym_table + ((11 + delta) * i));
-
-		value = get_unaligned_be32(&p[offset + 3 + delta]);
-
-		attrs[i] = p[offset];
-
-		/*
-		 * use bit 7 of attribute byte to indicate that
-		 * this buffer was dynamically allocated
-		 * and should be freed later
-		 */
-		attrs[i] &= 0x7f;
-
-		var_size[i] = get_unaligned_be32(&p[offset + 7 + delta]);
-
-		/*
-		 * Attribute bits:
-		 * bit 0: 0 = read-only, 1 = read-write
-		 * bit 1: 0 = not compressed, 1 = compressed
-		 * bit 2: 0 = not initialized, 1 = initialized
-		 * bit 3: 0 = scalar, 1 = array
-		 * bit 4: 0 = Boolean, 1 = integer
-		 * bit 5: 0 = declared variable,
-		 *	1 = compiler created temporary variable
-		 */
-
-		if ((attrs[i] & 0x0c) == 0x04)
-			/* initialized scalar variable */
-			vars[i] = value;
-		else if ((attrs[i] & 0x1e) == 0x0e) {
-			/* initialized compressed Boolean array */
-			uncomp_size = get_unaligned_le32(&p[data_sect + value]);
-
-			/* allocate a buffer for the uncompressed data */
-			vars[i] = (long)kzalloc(uncomp_size, GFP_KERNEL);
-			if (vars[i] == 0L)
-				status = -ENOMEM;
-			else {
-				/* set flag so buffer will be freed later */
-				attrs[i] |= 0x80;
-
-				/* uncompress the data */
-				if (altera_shrink(&p[data_sect + value],
-						var_size[i],
-						(u8 *)vars[i],
-						uncomp_size,
-						version) != uncomp_size)
-					/* decompression failed */
-					status = -EIO;
-				else
-					var_size[i] = uncomp_size * 8L;
-
-			}
-		} else if ((attrs[i] & 0x1e) == 0x0c) {
-			/* initialized Boolean array */
-			vars[i] = value + data_sect + (long)p;
-		} else if ((attrs[i] & 0x1c) == 0x1c) {
-			/* initialized integer array */
-			vars[i] = value + data_sect;
-		} else if ((attrs[i] & 0x0c) == 0x08) {
-			/* uninitialized array */
-
-			/* flag attrs so that memory is freed */
-			attrs[i] |= 0x80;
-
-			if (var_size[i] > 0) {
-				u32 size;
-
-				if (attrs[i] & 0x10)
-					/* integer array */
-					size = (var_size[i] * sizeof(s32));
-				else
-					/* Boolean array */
-					size = ((var_size[i] + 7L) / 8L);
-
-				vars[i] = (long)kzalloc(size, GFP_KERNEL);
-
-				if (vars[i] == 0) {
-					status = -ENOMEM;
-				} else {
-					/* zero out memory */
-					for (j = 0; j < size; ++j)
-						((u8 *)(vars[i]))[j] = 0;
-
-				}
-			} else
-				vars[i] = 0;
-
-		} else
-			vars[i] = 0;
-
-	}
-
-exit_done:
-	if (status != 0)
-		done = 1;
-
-	altera_jinit(astate);
-
-	pc = code_sect;
-	msg_buff[0] = '\0';
-
-	/*
-	 * For JBC version 2, we will execute the procedures corresponding to
-	 * the selected ACTION
-	 */
-	if (version > 0) {
-		if (aconf->action == NULL) {
-			status = -EINVAL;
-			done = 1;
-		} else {
-			int action_found = 0;
-			for (i = 0; (i < action_count) && !action_found; ++i) {
-				name_id = get_unaligned_be32(&p[action_table +
-								(12 * i)]);
-
-				name = &p[str_table + name_id];
-
-				if (strncasecmp(aconf->action, name, strlen(name)) == 0) {
-					action_found = 1;
-					current_proc =
-						get_unaligned_be32(&p[action_table +
-								(12 * i) + 8]);
-				}
-			}
-
-			if (!action_found) {
-				status = -EINVAL;
-				done = 1;
-			}
-		}
-
-		if (status == 0) {
-			int first_time = 1;
-			i = current_proc;
-			while ((i != 0) || first_time) {
-				first_time = 0;
-				/* check procedure attribute byte */
-				proc_attributes[i] =
-						(p[proc_table +
-								(13 * i) + 8] &
-									0x03);
-
-				/*
-				 * BIT0 - OPTIONAL
-				 * BIT1 - RECOMMENDED
-				 * BIT6 - FORCED OFF
-				 * BIT7 - FORCED ON
-				 */
-
-				i = get_unaligned_be32(&p[proc_table +
-							(13 * i) + 4]);
-			}
-
-			/*
-			 * Set current_proc to the first procedure
-			 * to be executed
-			 */
-			i = current_proc;
-			while ((i != 0) &&
-				((proc_attributes[i] == 1) ||
-				((proc_attributes[i] & 0xc0) == 0x40))) {
-				i = get_unaligned_be32(&p[proc_table +
-							(13 * i) + 4]);
-			}
-
-			if ((i != 0) || ((i == 0) && (current_proc == 0) &&
-				((proc_attributes[0] != 1) &&
-				((proc_attributes[0] & 0xc0) != 0x40)))) {
-				current_proc = i;
-				pc = code_sect +
-					get_unaligned_be32(&p[proc_table +
-								(13 * i) + 9]);
-				if ((pc < code_sect) || (pc >= debug_sect))
-					status = -ERANGE;
-			} else
-				/* there are no procedures to execute! */
-				done = 1;
-
-		}
-	}
-
-	msg_buff[0] = '\0';
-
-	while (!done) {
-		opcode = (p[pc] & 0xff);
-		opcode_address = pc;
-		++pc;
-
-		if (debug > 1)
-			printk("opcode: %02x\n", opcode);
-
-		arg_count = (opcode >> 6) & 3;
-		for (i = 0; i < arg_count; ++i) {
-			args[i] = get_unaligned_be32(&p[pc]);
-			pc += 4;
-		}
-
-		switch (opcode) {
-		case OP_NOP:
-			break;
-		case OP_DUP:
-			if (altera_check_stack(stack_ptr, 1, &status)) {
-				stack[stack_ptr] = stack[stack_ptr - 1];
-				++stack_ptr;
-			}
-			break;
-		case OP_SWP:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				long_tmp = stack[stack_ptr - 2];
-				stack[stack_ptr - 2] = stack[stack_ptr - 1];
-				stack[stack_ptr - 1] = long_tmp;
-			}
-			break;
-		case OP_ADD:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] += stack[stack_ptr];
-			}
-			break;
-		case OP_SUB:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] -= stack[stack_ptr];
-			}
-			break;
-		case OP_MULT:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] *= stack[stack_ptr];
-			}
-			break;
-		case OP_DIV:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] /= stack[stack_ptr];
-			}
-			break;
-		case OP_MOD:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] %= stack[stack_ptr];
-			}
-			break;
-		case OP_SHL:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] <<= stack[stack_ptr];
-			}
-			break;
-		case OP_SHR:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] >>= stack[stack_ptr];
-			}
-			break;
-		case OP_NOT:
-			if (altera_check_stack(stack_ptr, 1, &status))
-				stack[stack_ptr - 1] ^= (-1L);
-
-			break;
-		case OP_AND:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] &= stack[stack_ptr];
-			}
-			break;
-		case OP_OR:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] |= stack[stack_ptr];
-			}
-			break;
-		case OP_XOR:
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				--stack_ptr;
-				stack[stack_ptr - 1] ^= stack[stack_ptr];
-			}
-			break;
-		case OP_INV:
-			if (!altera_check_stack(stack_ptr, 1, &status))
-				break;
-			stack[stack_ptr - 1] = stack[stack_ptr - 1] ? 0L : 1L;
-			break;
-		case OP_GT:
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			--stack_ptr;
-			stack[stack_ptr - 1] =
-				(stack[stack_ptr - 1] > stack[stack_ptr]) ?
-									1L : 0L;
-
-			break;
-		case OP_LT:
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			--stack_ptr;
-			stack[stack_ptr - 1] =
-				(stack[stack_ptr - 1] < stack[stack_ptr]) ?
-									1L : 0L;
-
-			break;
-		case OP_RET:
-			if ((version > 0) && (stack_ptr == 0)) {
-				/*
-				 * We completed one of the main procedures
-				 * of an ACTION.
-				 * Find the next procedure
-				 * to be executed and jump to it.
-				 * If there are no more procedures, then EXIT.
-				 */
-				i = get_unaligned_be32(&p[proc_table +
-						(13 * current_proc) + 4]);
-				while ((i != 0) &&
-					((proc_attributes[i] == 1) ||
-					((proc_attributes[i] & 0xc0) == 0x40)))
-					i = get_unaligned_be32(&p[proc_table +
-								(13 * i) + 4]);
-
-				if (i == 0) {
-					/* no procedures to execute! */
-					done = 1;
-					*exit_code = 0;	/* success */
-				} else {
-					current_proc = i;
-					pc = code_sect + get_unaligned_be32(
-								&p[proc_table +
-								(13 * i) + 9]);
-					if ((pc < code_sect) ||
-					    (pc >= debug_sect))
-						status = -ERANGE;
-				}
-
-			} else
-				if (altera_check_stack(stack_ptr, 1, &status)) {
-					pc = stack[--stack_ptr] + code_sect;
-					if ((pc <= code_sect) ||
-					    (pc >= debug_sect))
-						status = -ERANGE;
-
-				}
-
-			break;
-		case OP_CMPS:
-			/*
-			 * Array short compare
-			 * ...stack 0 is source 1 value
-			 * ...stack 1 is source 2 value
-			 * ...stack 2 is mask value
-			 * ...stack 3 is count
-			 */
-			if (altera_check_stack(stack_ptr, 4, &status)) {
-				s32 a = stack[--stack_ptr];
-				s32 b = stack[--stack_ptr];
-				long_tmp = stack[--stack_ptr];
-				count = stack[stack_ptr - 1];
-
-				if ((count < 1) || (count > 32))
-					status = -ERANGE;
-				else {
-					long_tmp &= ((-1L) >> (32 - count));
-
-					stack[stack_ptr - 1] =
-					((a & long_tmp) == (b & long_tmp))
-								? 1L : 0L;
-				}
-			}
-			break;
-		case OP_PINT:
-			/*
-			 * PRINT add integer
-			 * ...stack 0 is integer value
-			 */
-			if (!altera_check_stack(stack_ptr, 1, &status))
-				break;
-			sprintf(&msg_buff[strlen(msg_buff)],
-					"%ld", stack[--stack_ptr]);
-			break;
-		case OP_PRNT:
-			/* PRINT finish */
-			if (debug)
-				printk(msg_buff, "\n");
-
-			msg_buff[0] = '\0';
-			break;
-		case OP_DSS:
-			/*
-			 * DRSCAN short
-			 * ...stack 0 is scan data
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			long_tmp = stack[--stack_ptr];
-			count = stack[--stack_ptr];
-			put_unaligned_le32(long_tmp, &charbuf[0]);
-			status = altera_drscan(astate, count, charbuf, 0);
-			break;
-		case OP_DSSC:
-			/*
-			 * DRSCAN short with capture
-			 * ...stack 0 is scan data
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			long_tmp = stack[--stack_ptr];
-			count = stack[stack_ptr - 1];
-			put_unaligned_le32(long_tmp, &charbuf[0]);
-			status = altera_swap_dr(astate, count, charbuf,
-							0, charbuf, 0);
-			stack[stack_ptr - 1] = get_unaligned_le32(&charbuf[0]);
-			break;
-		case OP_ISS:
-			/*
-			 * IRSCAN short
-			 * ...stack 0 is scan data
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			long_tmp = stack[--stack_ptr];
-			count = stack[--stack_ptr];
-			put_unaligned_le32(long_tmp, &charbuf[0]);
-			status = altera_irscan(astate, count, charbuf, 0);
-			break;
-		case OP_ISSC:
-			/*
-			 * IRSCAN short with capture
-			 * ...stack 0 is scan data
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			long_tmp = stack[--stack_ptr];
-			count = stack[stack_ptr - 1];
-			put_unaligned_le32(long_tmp, &charbuf[0]);
-			status = altera_swap_ir(astate, count, charbuf,
-							0, charbuf, 0);
-			stack[stack_ptr - 1] = get_unaligned_le32(&charbuf[0]);
-			break;
-		case OP_DPR:
-			if (!altera_check_stack(stack_ptr, 1, &status))
-				break;
-			count = stack[--stack_ptr];
-			status = altera_set_dr_pre(&astate->js, count, 0, NULL);
-			break;
-		case OP_DPRL:
-			/*
-			 * DRPRE with literal data
-			 * ...stack 0 is count
-			 * ...stack 1 is literal data
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			count = stack[--stack_ptr];
-			long_tmp = stack[--stack_ptr];
-			put_unaligned_le32(long_tmp, &charbuf[0]);
-			status = altera_set_dr_pre(&astate->js, count, 0,
-						charbuf);
-			break;
-		case OP_DPO:
-			/*
-			 * DRPOST
-			 * ...stack 0 is count
-			 */
-			if (altera_check_stack(stack_ptr, 1, &status)) {
-				count = stack[--stack_ptr];
-				status = altera_set_dr_post(&astate->js, count,
-								0, NULL);
-			}
-			break;
-		case OP_DPOL:
-			/*
-			 * DRPOST with literal data
-			 * ...stack 0 is count
-			 * ...stack 1 is literal data
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			count = stack[--stack_ptr];
-			long_tmp = stack[--stack_ptr];
-			put_unaligned_le32(long_tmp, &charbuf[0]);
-			status = altera_set_dr_post(&astate->js, count, 0,
-							charbuf);
-			break;
-		case OP_IPR:
-			if (altera_check_stack(stack_ptr, 1, &status)) {
-				count = stack[--stack_ptr];
-				status = altera_set_ir_pre(&astate->js, count,
-								0, NULL);
-			}
-			break;
-		case OP_IPRL:
-			/*
-			 * IRPRE with literal data
-			 * ...stack 0 is count
-			 * ...stack 1 is literal data
-			 */
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				count = stack[--stack_ptr];
-				long_tmp = stack[--stack_ptr];
-				put_unaligned_le32(long_tmp, &charbuf[0]);
-				status = altera_set_ir_pre(&astate->js, count,
-							0, charbuf);
-			}
-			break;
-		case OP_IPO:
-			/*
-			 * IRPOST
-			 * ...stack 0 is count
-			 */
-			if (altera_check_stack(stack_ptr, 1, &status)) {
-				count = stack[--stack_ptr];
-				status = altera_set_ir_post(&astate->js, count,
-							0, NULL);
-			}
-			break;
-		case OP_IPOL:
-			/*
-			 * IRPOST with literal data
-			 * ...stack 0 is count
-			 * ...stack 1 is literal data
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			count = stack[--stack_ptr];
-			long_tmp = stack[--stack_ptr];
-			put_unaligned_le32(long_tmp, &charbuf[0]);
-			status = altera_set_ir_post(&astate->js, count, 0,
-							charbuf);
-			break;
-		case OP_PCHR:
-			if (altera_check_stack(stack_ptr, 1, &status)) {
-				u8 ch;
-				count = strlen(msg_buff);
-				ch = (char) stack[--stack_ptr];
-				if ((ch < 1) || (ch > 127)) {
-					/*
-					 * character code out of range
-					 * instead of flagging an error,
-					 * force the value to 127
-					 */
-					ch = 127;
-				}
-				msg_buff[count] = ch;
-				msg_buff[count + 1] = '\0';
-			}
-			break;
-		case OP_EXIT:
-			if (altera_check_stack(stack_ptr, 1, &status))
-				*exit_code = stack[--stack_ptr];
-
-			done = 1;
-			break;
-		case OP_EQU:
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			--stack_ptr;
-			stack[stack_ptr - 1] =
-				(stack[stack_ptr - 1] == stack[stack_ptr]) ?
-									1L : 0L;
-			break;
-		case OP_POPT:
-			if (altera_check_stack(stack_ptr, 1, &status))
-				--stack_ptr;
-
-			break;
-		case OP_ABS:
-			if (!altera_check_stack(stack_ptr, 1, &status))
-				break;
-			if (stack[stack_ptr - 1] < 0)
-				stack[stack_ptr - 1] = 0 - stack[stack_ptr - 1];
-
-			break;
-		case OP_BCH0:
-			/*
-			 * Batch operation 0
-			 * SWP
-			 * SWPN 7
-			 * SWP
-			 * SWPN 6
-			 * DUPN 8
-			 * SWPN 2
-			 * SWP
-			 * DUPN 6
-			 * DUPN 6
-			 */
-
-			/* SWP  */
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				long_tmp = stack[stack_ptr - 2];
-				stack[stack_ptr - 2] = stack[stack_ptr - 1];
-				stack[stack_ptr - 1] = long_tmp;
-			}
-
-			/* SWPN 7 */
-			index = 7 + 1;
-			if (altera_check_stack(stack_ptr, index, &status)) {
-				long_tmp = stack[stack_ptr - index];
-				stack[stack_ptr - index] = stack[stack_ptr - 1];
-				stack[stack_ptr - 1] = long_tmp;
-			}
-
-			/* SWP  */
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				long_tmp = stack[stack_ptr - 2];
-				stack[stack_ptr - 2] = stack[stack_ptr - 1];
-				stack[stack_ptr - 1] = long_tmp;
-			}
-
-			/* SWPN 6 */
-			index = 6 + 1;
-			if (altera_check_stack(stack_ptr, index, &status)) {
-				long_tmp = stack[stack_ptr - index];
-				stack[stack_ptr - index] = stack[stack_ptr - 1];
-				stack[stack_ptr - 1] = long_tmp;
-			}
-
-			/* DUPN 8 */
-			index = 8 + 1;
-			if (altera_check_stack(stack_ptr, index, &status)) {
-				stack[stack_ptr] = stack[stack_ptr - index];
-				++stack_ptr;
-			}
-
-			/* SWPN 2 */
-			index = 2 + 1;
-			if (altera_check_stack(stack_ptr, index, &status)) {
-				long_tmp = stack[stack_ptr - index];
-				stack[stack_ptr - index] = stack[stack_ptr - 1];
-				stack[stack_ptr - 1] = long_tmp;
-			}
-
-			/* SWP  */
-			if (altera_check_stack(stack_ptr, 2, &status)) {
-				long_tmp = stack[stack_ptr - 2];
-				stack[stack_ptr - 2] = stack[stack_ptr - 1];
-				stack[stack_ptr - 1] = long_tmp;
-			}
-
-			/* DUPN 6 */
-			index = 6 + 1;
-			if (altera_check_stack(stack_ptr, index, &status)) {
-				stack[stack_ptr] = stack[stack_ptr - index];
-				++stack_ptr;
-			}
-
-			/* DUPN 6 */
-			index = 6 + 1;
-			if (altera_check_stack(stack_ptr, index, &status)) {
-				stack[stack_ptr] = stack[stack_ptr - index];
-				++stack_ptr;
-			}
-			break;
-		case OP_PSH0:
-			stack[stack_ptr++] = 0;
-			break;
-		case OP_PSHL:
-			stack[stack_ptr++] = (s32) args[0];
-			break;
-		case OP_PSHV:
-			stack[stack_ptr++] = vars[args[0]];
-			break;
-		case OP_JMP:
-			pc = args[0] + code_sect;
-			if ((pc < code_sect) || (pc >= debug_sect))
-				status = -ERANGE;
-			break;
-		case OP_CALL:
-			stack[stack_ptr++] = pc;
-			pc = args[0] + code_sect;
-			if ((pc < code_sect) || (pc >= debug_sect))
-				status = -ERANGE;
-			break;
-		case OP_NEXT:
-			/*
-			 * Process FOR / NEXT loop
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is step value
-			 * ...stack 1 is end value
-			 * ...stack 2 is top address
-			 */
-			if (altera_check_stack(stack_ptr, 3, &status)) {
-				s32 step = stack[stack_ptr - 1];
-				s32 end = stack[stack_ptr - 2];
-				s32 top = stack[stack_ptr - 3];
-				s32 iterator = vars[args[0]];
-				int break_out = 0;
-
-				if (step < 0) {
-					if (iterator <= end)
-						break_out = 1;
-				} else if (iterator >= end)
-					break_out = 1;
-
-				if (break_out) {
-					stack_ptr -= 3;
-				} else {
-					vars[args[0]] = iterator + step;
-					pc = top + code_sect;
-					if ((pc < code_sect) ||
-					    (pc >= debug_sect))
-						status = -ERANGE;
-				}
-			}
-			break;
-		case OP_PSTR:
-			/*
-			 * PRINT add string
-			 * ...argument 0 is string ID
-			 */
-			count = strlen(msg_buff);
-			strlcpy(&msg_buff[count],
-				&p[str_table + args[0]],
-				ALTERA_MESSAGE_LENGTH - count);
-			break;
-		case OP_SINT:
-			/*
-			 * STATE intermediate state
-			 * ...argument 0 is state code
-			 */
-			status = altera_goto_jstate(astate, args[0]);
-			break;
-		case OP_ST:
-			/*
-			 * STATE final state
-			 * ...argument 0 is state code
-			 */
-			status = altera_goto_jstate(astate, args[0]);
-			break;
-		case OP_ISTP:
-			/*
-			 * IRSTOP state
-			 * ...argument 0 is state code
-			 */
-			status = altera_set_irstop(&astate->js, args[0]);
-			break;
-		case OP_DSTP:
-			/*
-			 * DRSTOP state
-			 * ...argument 0 is state code
-			 */
-			status = altera_set_drstop(&astate->js, args[0]);
-			break;
-
-		case OP_SWPN:
-			/*
-			 * Exchange top with Nth stack value
-			 * ...argument 0 is 0-based stack entry
-			 * to swap with top element
-			 */
-			index = (args[0]) + 1;
-			if (altera_check_stack(stack_ptr, index, &status)) {
-				long_tmp = stack[stack_ptr - index];
-				stack[stack_ptr - index] = stack[stack_ptr - 1];
-				stack[stack_ptr - 1] = long_tmp;
-			}
-			break;
-		case OP_DUPN:
-			/*
-			 * Duplicate Nth stack value
-			 * ...argument 0 is 0-based stack entry to duplicate
-			 */
-			index = (args[0]) + 1;
-			if (altera_check_stack(stack_ptr, index, &status)) {
-				stack[stack_ptr] = stack[stack_ptr - index];
-				++stack_ptr;
-			}
-			break;
-		case OP_POPV:
-			/*
-			 * Pop stack into scalar variable
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is value
-			 */
-			if (altera_check_stack(stack_ptr, 1, &status))
-				vars[args[0]] = stack[--stack_ptr];
-
-			break;
-		case OP_POPE:
-			/*
-			 * Pop stack into integer array element
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is array index
-			 * ...stack 1 is value
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			variable_id = args[0];
-
-			/*
-			 * If variable is read-only,
-			 * convert to writable array
-			 */
-			if ((version > 0) &&
-				((attrs[variable_id] & 0x9c) == 0x1c)) {
-				/* Allocate a writable buffer for this array */
-				count = var_size[variable_id];
-				long_tmp = vars[variable_id];
-				longptr_tmp = kzalloc(count * sizeof(long),
-								GFP_KERNEL);
-				vars[variable_id] = (long)longptr_tmp;
-
-				if (vars[variable_id] == 0) {
-					status = -ENOMEM;
-					break;
-				}
-
-				/* copy previous contents into buffer */
-				for (i = 0; i < count; ++i) {
-					longptr_tmp[i] =
-						get_unaligned_be32(&p[long_tmp]);
-					long_tmp += sizeof(long);
-				}
-
-				/*
-				 * set bit 7 - buffer was
-				 * dynamically allocated
-				 */
-				attrs[variable_id] |= 0x80;
-
-				/* clear bit 2 - variable is writable */
-				attrs[variable_id] &= ~0x04;
-				attrs[variable_id] |= 0x01;
-
-			}
-
-			/* check that variable is a writable integer array */
-			if ((attrs[variable_id] & 0x1c) != 0x18)
-				status = -ERANGE;
-			else {
-				longptr_tmp = (long *)vars[variable_id];
-
-				/* pop the array index */
-				index = stack[--stack_ptr];
-
-				/* pop the value and store it into the array */
-				longptr_tmp[index] = stack[--stack_ptr];
-			}
-
-			break;
-		case OP_POPA:
-			/*
-			 * Pop stack into Boolean array
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is count
-			 * ...stack 1 is array index
-			 * ...stack 2 is value
-			 */
-			if (!altera_check_stack(stack_ptr, 3, &status))
-				break;
-			variable_id = args[0];
-
-			/*
-			 * If variable is read-only,
-			 * convert to writable array
-			 */
-			if ((version > 0) &&
-				((attrs[variable_id] & 0x9c) == 0x0c)) {
-				/* Allocate a writable buffer for this array */
-				long_tmp =
-					(var_size[variable_id] + 7L) >> 3L;
-				charptr_tmp2 = (u8 *)vars[variable_id];
-				charptr_tmp =
-					kzalloc(long_tmp, GFP_KERNEL);
-				vars[variable_id] = (long)charptr_tmp;
-
-				if (vars[variable_id] == 0) {
-					status = -ENOMEM;
-					break;
-				}
-
-				/* zero the buffer */
-				for (long_idx = 0L;
-					long_idx < long_tmp;
-					++long_idx) {
-					charptr_tmp[long_idx] = 0;
-				}
-
-				/* copy previous contents into buffer */
-				for (long_idx = 0L;
-					long_idx < var_size[variable_id];
-					++long_idx) {
-					long_idx2 = long_idx;
-
-					if (charptr_tmp2[long_idx2 >> 3] &
-						(1 << (long_idx2 & 7))) {
-						charptr_tmp[long_idx >> 3] |=
-							(1 << (long_idx & 7));
-					}
-				}
-
-				/*
-				 * set bit 7 - buffer was
-				 * dynamically allocated
-				 */
-				attrs[variable_id] |= 0x80;
-
-				/* clear bit 2 - variable is writable */
-				attrs[variable_id] &= ~0x04;
-				attrs[variable_id] |= 0x01;
-
-			}
-
-			/*
-			 * check that variable is
-			 * a writable Boolean array
-			 */
-			if ((attrs[variable_id] & 0x1c) != 0x08) {
-				status = -ERANGE;
-				break;
-			}
-
-			charptr_tmp = (u8 *)vars[variable_id];
-
-			/* pop the count (number of bits to copy) */
-			long_count = stack[--stack_ptr];
-
-			/* pop the array index */
-			long_idx = stack[--stack_ptr];
-
-			reverse = 0;
-
-			if (version > 0) {
-				/*
-				 * stack 0 = array right index
-				 * stack 1 = array left index
-				 */
-
-				if (long_idx > long_count) {
-					reverse = 1;
-					long_tmp = long_count;
-					long_count = 1 + long_idx -
-								long_count;
-					long_idx = long_tmp;
-
-					/* reverse POPA is not supported */
-					status = -ERANGE;
-					break;
-				} else
-					long_count = 1 + long_count -
-								long_idx;
-
-			}
-
-			/* pop the data */
-			long_tmp = stack[--stack_ptr];
-
-			if (long_count < 1) {
-				status = -ERANGE;
-				break;
-			}
-
-			for (i = 0; i < long_count; ++i) {
-				if (long_tmp & (1L << (s32) i))
-					charptr_tmp[long_idx >> 3L] |=
-						(1L << (long_idx & 7L));
-				else
-					charptr_tmp[long_idx >> 3L] &=
-						~(1L << (long_idx & 7L));
-
-				++long_idx;
-			}
-
-			break;
-		case OP_JMPZ:
-			/*
-			 * Pop stack and branch if zero
-			 * ...argument 0 is address
-			 * ...stack 0 is condition value
-			 */
-			if (altera_check_stack(stack_ptr, 1, &status)) {
-				if (stack[--stack_ptr] == 0) {
-					pc = args[0] + code_sect;
-					if ((pc < code_sect) ||
-					    (pc >= debug_sect))
-						status = -ERANGE;
-				}
-			}
-			break;
-		case OP_DS:
-		case OP_IS:
-			/*
-			 * DRSCAN
-			 * IRSCAN
-			 * ...argument 0 is scan data variable ID
-			 * ...stack 0 is array index
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			long_idx = stack[--stack_ptr];
-			long_count = stack[--stack_ptr];
-			reverse = 0;
-			if (version > 0) {
-				/*
-				 * stack 0 = array right index
-				 * stack 1 = array left index
-				 * stack 2 = count
-				 */
-				long_tmp = long_count;
-				long_count = stack[--stack_ptr];
-
-				if (long_idx > long_tmp) {
-					reverse = 1;
-					long_idx = long_tmp;
-				}
-			}
-
-			charptr_tmp = (u8 *)vars[args[0]];
-
-			if (reverse) {
-				/*
-				 * allocate a buffer
-				 * and reverse the data order
-				 */
-				charptr_tmp2 = charptr_tmp;
-				charptr_tmp = kzalloc((long_count >> 3) + 1,
-								GFP_KERNEL);
-				if (charptr_tmp == NULL) {
-					status = -ENOMEM;
-					break;
-				}
-
-				long_tmp = long_idx + long_count - 1;
-				long_idx2 = 0;
-				while (long_idx2 < long_count) {
-					if (charptr_tmp2[long_tmp >> 3] &
-							(1 << (long_tmp & 7)))
-						charptr_tmp[long_idx2 >> 3] |=
-							(1 << (long_idx2 & 7));
-					else
-						charptr_tmp[long_idx2 >> 3] &=
-							~(1 << (long_idx2 & 7));
-
-					--long_tmp;
-					++long_idx2;
-				}
-			}
-
-			if (opcode == 0x51) /* DS */
-				status = altera_drscan(astate, long_count,
-						charptr_tmp, long_idx);
-			else /* IS */
-				status = altera_irscan(astate, long_count,
-						charptr_tmp, long_idx);
-
-			if (reverse)
-				kfree(charptr_tmp);
-
-			break;
-		case OP_DPRA:
-			/*
-			 * DRPRE with array data
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is array index
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			index = stack[--stack_ptr];
-			count = stack[--stack_ptr];
-
-			if (version > 0)
-				/*
-				 * stack 0 = array right index
-				 * stack 1 = array left index
-				 */
-				count = 1 + count - index;
-
-			charptr_tmp = (u8 *)vars[args[0]];
-			status = altera_set_dr_pre(&astate->js, count, index,
-							charptr_tmp);
-			break;
-		case OP_DPOA:
-			/*
-			 * DRPOST with array data
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is array index
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			index = stack[--stack_ptr];
-			count = stack[--stack_ptr];
-
-			if (version > 0)
-				/*
-				 * stack 0 = array right index
-				 * stack 1 = array left index
-				 */
-				count = 1 + count - index;
-
-			charptr_tmp = (u8 *)vars[args[0]];
-			status = altera_set_dr_post(&astate->js, count, index,
-							charptr_tmp);
-			break;
-		case OP_IPRA:
-			/*
-			 * IRPRE with array data
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is array index
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			index = stack[--stack_ptr];
-			count = stack[--stack_ptr];
-
-			if (version > 0)
-				/*
-				 * stack 0 = array right index
-				 * stack 1 = array left index
-				 */
-				count = 1 + count - index;
-
-			charptr_tmp = (u8 *)vars[args[0]];
-			status = altera_set_ir_pre(&astate->js, count, index,
-							charptr_tmp);
-
-			break;
-		case OP_IPOA:
-			/*
-			 * IRPOST with array data
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is array index
-			 * ...stack 1 is count
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			index = stack[--stack_ptr];
-			count = stack[--stack_ptr];
-
-			if (version > 0)
-				/*
-				 * stack 0 = array right index
-				 * stack 1 = array left index
-				 */
-				count = 1 + count - index;
-
-			charptr_tmp = (u8 *)vars[args[0]];
-			status = altera_set_ir_post(&astate->js, count, index,
-							charptr_tmp);
-
-			break;
-		case OP_EXPT:
-			/*
-			 * EXPORT
-			 * ...argument 0 is string ID
-			 * ...stack 0 is integer expression
-			 */
-			if (altera_check_stack(stack_ptr, 1, &status)) {
-				name = &p[str_table + args[0]];
-				long_tmp = stack[--stack_ptr];
-				altera_export_int(name, long_tmp);
-			}
-			break;
-		case OP_PSHE:
-			/*
-			 * Push integer array element
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is array index
-			 */
-			if (!altera_check_stack(stack_ptr, 1, &status))
-				break;
-			variable_id = args[0];
-			index = stack[stack_ptr - 1];
-
-			/* check variable type */
-			if ((attrs[variable_id] & 0x1f) == 0x19) {
-				/* writable integer array */
-				longptr_tmp = (long *)vars[variable_id];
-				stack[stack_ptr - 1] = longptr_tmp[index];
-			} else if ((attrs[variable_id] & 0x1f) == 0x1c) {
-				/* read-only integer array */
-				long_tmp = vars[variable_id] +
-						(index * sizeof(long));
-				stack[stack_ptr - 1] =
-					get_unaligned_be32(&p[long_tmp]);
-			} else
-				status = -ERANGE;
-
-			break;
-		case OP_PSHA:
-			/*
-			 * Push Boolean array
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is count
-			 * ...stack 1 is array index
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			variable_id = args[0];
-
-			/* check that variable is a Boolean array */
-			if ((attrs[variable_id] & 0x18) != 0x08) {
-				status = -ERANGE;
-				break;
-			}
-
-			charptr_tmp = (u8 *)vars[variable_id];
-
-			/* pop the count (number of bits to copy) */
-			count = stack[--stack_ptr];
-
-			/* pop the array index */
-			index = stack[stack_ptr - 1];
-
-			if (version > 0)
-				/*
-				 * stack 0 = array right index
-				 * stack 1 = array left index
-				 */
-				count = 1 + count - index;
-
-			if ((count < 1) || (count > 32)) {
-				status = -ERANGE;
-				break;
-			}
-
-			long_tmp = 0L;
-
-			for (i = 0; i < count; ++i)
-				if (charptr_tmp[(i + index) >> 3] &
-						(1 << ((i + index) & 7)))
-					long_tmp |= (1L << i);
-
-			stack[stack_ptr - 1] = long_tmp;
-
-			break;
-		case OP_DYNA:
-			/*
-			 * Dynamically change size of array
-			 * ...argument 0 is variable ID
-			 * ...stack 0 is new size
-			 */
-			if (!altera_check_stack(stack_ptr, 1, &status))
-				break;
-			variable_id = args[0];
-			long_tmp = stack[--stack_ptr];
-
-			if (long_tmp > var_size[variable_id]) {
-				var_size[variable_id] = long_tmp;
-
-				if (attrs[variable_id] & 0x10)
-					/* allocate integer array */
-					long_tmp *= sizeof(long);
-				else
-					/* allocate Boolean array */
-					long_tmp = (long_tmp + 7) >> 3;
-
-				/*
-				 * If the buffer was previously allocated,
-				 * free it
-				 */
-				if (attrs[variable_id] & 0x80) {
-					kfree((void *)vars[variable_id]);
-					vars[variable_id] = 0;
-				}
-
-				/*
-				 * Allocate a new buffer
-				 * of the requested size
-				 */
-				vars[variable_id] = (long)
-					kzalloc(long_tmp, GFP_KERNEL);
-
-				if (vars[variable_id] == 0) {
-					status = -ENOMEM;
-					break;
-				}
-
-				/*
-				 * Set the attribute bit to indicate that
-				 * this buffer was dynamically allocated and
-				 * should be freed later
-				 */
-				attrs[variable_id] |= 0x80;
-
-				/* zero out memory */
-				count = ((var_size[variable_id] + 7L) /
-									8L);
-				charptr_tmp = (u8 *)(vars[variable_id]);
-				for (index = 0; index < count; ++index)
-					charptr_tmp[index] = 0;
-
-			}
-
-			break;
-		case OP_EXPV:
-			/*
-			 * Export Boolean array
-			 * ...argument 0 is string ID
-			 * ...stack 0 is variable ID
-			 * ...stack 1 is array right index
-			 * ...stack 2 is array left index
-			 */
-			if (!altera_check_stack(stack_ptr, 3, &status))
-				break;
-			if (version == 0) {
-				/* EXPV is not supported in JBC 1.0 */
-				bad_opcode = 1;
-				break;
-			}
-			name = &p[str_table + args[0]];
-			variable_id = stack[--stack_ptr];
-			long_idx = stack[--stack_ptr];/* right indx */
-			long_idx2 = stack[--stack_ptr];/* left indx */
-
-			if (long_idx > long_idx2) {
-				/* reverse indices not supported */
-				status = -ERANGE;
-				break;
-			}
-
-			long_count = 1 + long_idx2 - long_idx;
-
-			charptr_tmp = (u8 *)vars[variable_id];
-			charptr_tmp2 = NULL;
-
-			if ((long_idx & 7L) != 0) {
-				s32 k = long_idx;
-				charptr_tmp2 =
-					kzalloc(((long_count + 7L) / 8L),
-							GFP_KERNEL);
-				if (charptr_tmp2 == NULL) {
-					status = -ENOMEM;
-					break;
-				}
-
-				for (i = 0; i < long_count; ++i) {
-					if (charptr_tmp[k >> 3] &
-							(1 << (k & 7)))
-						charptr_tmp2[i >> 3] |=
-								(1 << (i & 7));
-					else
-						charptr_tmp2[i >> 3] &=
-								~(1 << (i & 7));
-
-					++k;
-				}
-				charptr_tmp = charptr_tmp2;
-
-			} else if (long_idx != 0)
-				charptr_tmp = &charptr_tmp[long_idx >> 3];
-
-			altera_export_bool_array(name, charptr_tmp,
-							long_count);
-
-			/* free allocated buffer */
-			if ((long_idx & 7L) != 0)
-				kfree(charptr_tmp2);
-
-			break;
-		case OP_COPY: {
-			/*
-			 * Array copy
-			 * ...argument 0 is dest ID
-			 * ...argument 1 is source ID
-			 * ...stack 0 is count
-			 * ...stack 1 is dest index
-			 * ...stack 2 is source index
-			 */
-			s32 copy_count;
-			s32 copy_index;
-			s32 copy_index2;
-			s32 destleft;
-			s32 src_count;
-			s32 dest_count;
-			int src_reverse = 0;
-			int dest_reverse = 0;
-
-			if (!altera_check_stack(stack_ptr, 3, &status))
-				break;
-
-			copy_count = stack[--stack_ptr];
-			copy_index = stack[--stack_ptr];
-			copy_index2 = stack[--stack_ptr];
-			reverse = 0;
-
-			if (version > 0) {
-				/*
-				 * stack 0 = source right index
-				 * stack 1 = source left index
-				 * stack 2 = destination right index
-				 * stack 3 = destination left index
-				 */
-				destleft = stack[--stack_ptr];
-
-				if (copy_count > copy_index) {
-					src_reverse = 1;
-					reverse = 1;
-					src_count = 1 + copy_count - copy_index;
-					/* copy_index = source start index */
-				} else {
-					src_count = 1 + copy_index - copy_count;
-					/* source start index */
-					copy_index = copy_count;
-				}
-
-				if (copy_index2 > destleft) {
-					dest_reverse = 1;
-					reverse = !reverse;
-					dest_count = 1 + copy_index2 - destleft;
-					/* destination start index */
-					copy_index2 = destleft;
-				} else
-					dest_count = 1 + destleft - copy_index2;
-
-				copy_count = (src_count < dest_count) ?
-							src_count : dest_count;
-
-				if ((src_reverse || dest_reverse) &&
-					(src_count != dest_count))
-					/*
-					 * If either the source or destination
-					 * is reversed, we can't tolerate
-					 * a length mismatch, because we
-					 * "left justify" arrays when copying.
-					 * This won't work correctly
-					 * with reversed arrays.
-					 */
-					status = -ERANGE;
-
-			}
-
-			count = copy_count;
-			index = copy_index;
-			index2 = copy_index2;
-
-			/*
-			 * If destination is a read-only array,
-			 * allocate a buffer and convert it to a writable array
-			 */
-			variable_id = args[1];
-			if ((version > 0) &&
-				((attrs[variable_id] & 0x9c) == 0x0c)) {
-				/* Allocate a writable buffer for this array */
-				long_tmp =
-					(var_size[variable_id] + 7L) >> 3L;
-				charptr_tmp2 = (u8 *)vars[variable_id];
-				charptr_tmp =
-					kzalloc(long_tmp, GFP_KERNEL);
-				vars[variable_id] = (long)charptr_tmp;
-
-				if (vars[variable_id] == 0) {
-					status = -ENOMEM;
-					break;
-				}
-
-				/* zero the buffer */
-				for (long_idx = 0L; long_idx < long_tmp;
-								++long_idx)
-					charptr_tmp[long_idx] = 0;
-
-				/* copy previous contents into buffer */
-				for (long_idx = 0L;
-					long_idx < var_size[variable_id];
-								++long_idx) {
-					long_idx2 = long_idx;
-
-					if (charptr_tmp2[long_idx2 >> 3] &
-						(1 << (long_idx2 & 7)))
-						charptr_tmp[long_idx >> 3] |=
-							(1 << (long_idx & 7));
-
-				}
-
-				/*
-				set bit 7 - buffer was dynamically allocated */
-				attrs[variable_id] |= 0x80;
-
-				/* clear bit 2 - variable is writable */
-				attrs[variable_id] &= ~0x04;
-				attrs[variable_id] |= 0x01;
-			}
-
-			charptr_tmp = (u8 *)vars[args[1]];
-			charptr_tmp2 = (u8 *)vars[args[0]];
-
-			/* check if destination is a writable Boolean array */
-			if ((attrs[args[1]] & 0x1c) != 0x08) {
-				status = -ERANGE;
-				break;
-			}
-
-			if (count < 1) {
-				status = -ERANGE;
-				break;
-			}
-
-			if (reverse)
-				index2 += (count - 1);
-
-			for (i = 0; i < count; ++i) {
-				if (charptr_tmp2[index >> 3] &
-							(1 << (index & 7)))
-					charptr_tmp[index2 >> 3] |=
-							(1 << (index2 & 7));
-				else
-					charptr_tmp[index2 >> 3] &=
-						~(1 << (index2 & 7));
-
-				++index;
-				if (reverse)
-					--index2;
-				else
-					++index2;
-			}
-
-			break;
-		}
-		case OP_DSC:
-		case OP_ISC: {
-			/*
-			 * DRSCAN with capture
-			 * IRSCAN with capture
-			 * ...argument 0 is scan data variable ID
-			 * ...argument 1 is capture variable ID
-			 * ...stack 0 is capture index
-			 * ...stack 1 is scan data index
-			 * ...stack 2 is count
-			 */
-			s32 scan_right, scan_left;
-			s32 capture_count = 0;
-			s32 scan_count = 0;
-			s32 capture_index;
-			s32 scan_index;
-
-			if (!altera_check_stack(stack_ptr, 3, &status))
-				break;
-
-			capture_index = stack[--stack_ptr];
-			scan_index = stack[--stack_ptr];
-
-			if (version > 0) {
-				/*
-				 * stack 0 = capture right index
-				 * stack 1 = capture left index
-				 * stack 2 = scan right index
-				 * stack 3 = scan left index
-				 * stack 4 = count
-				 */
-				scan_right = stack[--stack_ptr];
-				scan_left = stack[--stack_ptr];
-				capture_count = 1 + scan_index - capture_index;
-				scan_count = 1 + scan_left - scan_right;
-				scan_index = scan_right;
-			}
-
-			long_count = stack[--stack_ptr];
-			/*
-			 * If capture array is read-only, allocate a buffer
-			 * and convert it to a writable array
-			 */
-			variable_id = args[1];
-			if ((version > 0) &&
-				((attrs[variable_id] & 0x9c) == 0x0c)) {
-				/* Allocate a writable buffer for this array */
-				long_tmp =
-					(var_size[variable_id] + 7L) >> 3L;
-				charptr_tmp2 = (u8 *)vars[variable_id];
-				charptr_tmp =
-					kzalloc(long_tmp, GFP_KERNEL);
-				vars[variable_id] = (long)charptr_tmp;
-
-				if (vars[variable_id] == 0) {
-					status = -ENOMEM;
-					break;
-				}
-
-				/* zero the buffer */
-				for (long_idx = 0L; long_idx < long_tmp;
-								++long_idx)
-					charptr_tmp[long_idx] = 0;
-
-				/* copy previous contents into buffer */
-				for (long_idx = 0L;
-					long_idx < var_size[variable_id];
-								++long_idx) {
-					long_idx2 = long_idx;
-
-					if (charptr_tmp2[long_idx2 >> 3] &
-						(1 << (long_idx2 & 7)))
-						charptr_tmp[long_idx >> 3] |=
-							(1 << (long_idx & 7));
-
-				}
-
-				/*
-				 * set bit 7 - buffer was
-				 * dynamically allocated
-				 */
-				attrs[variable_id] |= 0x80;
-
-				/* clear bit 2 - variable is writable */
-				attrs[variable_id] &= ~0x04;
-				attrs[variable_id] |= 0x01;
-
-			}
-
-			charptr_tmp = (u8 *)vars[args[0]];
-			charptr_tmp2 = (u8 *)vars[args[1]];
-
-			if ((version > 0) &&
-					((long_count > capture_count) ||
-					(long_count > scan_count))) {
-				status = -ERANGE;
-				break;
-			}
-
-			/*
-			 * check that capture array
-			 * is a writable Boolean array
-			 */
-			if ((attrs[args[1]] & 0x1c) != 0x08) {
-				status = -ERANGE;
-				break;
-			}
-
-			if (status == 0) {
-				if (opcode == 0x82) /* DSC */
-					status = altera_swap_dr(astate,
-							long_count,
-							charptr_tmp,
-							scan_index,
-							charptr_tmp2,
-							capture_index);
-				else /* ISC */
-					status = altera_swap_ir(astate,
-							long_count,
-							charptr_tmp,
-							scan_index,
-							charptr_tmp2,
-							capture_index);
-
-			}
-
-			break;
-		}
-		case OP_WAIT:
-			/*
-			 * WAIT
-			 * ...argument 0 is wait state
-			 * ...argument 1 is end state
-			 * ...stack 0 is cycles
-			 * ...stack 1 is microseconds
-			 */
-			if (!altera_check_stack(stack_ptr, 2, &status))
-				break;
-			long_tmp = stack[--stack_ptr];
-
-			if (long_tmp != 0L)
-				status = altera_wait_cycles(astate, long_tmp,
-								args[0]);
-
-			long_tmp = stack[--stack_ptr];
-
-			if ((status == 0) && (long_tmp != 0L))
-				status = altera_wait_msecs(astate,
-								long_tmp,
-								args[0]);
-
-			if ((status == 0) && (args[1] != args[0]))
-				status = altera_goto_jstate(astate,
-								args[1]);
-
-			if (version > 0) {
-				--stack_ptr; /* throw away MAX cycles */
-				--stack_ptr; /* throw away MAX microseconds */
-			}
-			break;
-		case OP_CMPA: {
-			/*
-			 * Array compare
-			 * ...argument 0 is source 1 ID
-			 * ...argument 1 is source 2 ID
-			 * ...argument 2 is mask ID
-			 * ...stack 0 is source 1 index
-			 * ...stack 1 is source 2 index
-			 * ...stack 2 is mask index
-			 * ...stack 3 is count
-			 */
-			s32 a, b;
-			u8 *source1 = (u8 *)vars[args[0]];
-			u8 *source2 = (u8 *)vars[args[1]];
-			u8 *mask = (u8 *)vars[args[2]];
-			u32 index1;
-			u32 index2;
-			u32 mask_index;
-
-			if (!altera_check_stack(stack_ptr, 4, &status))
-				break;
-
-			index1 = stack[--stack_ptr];
-			index2 = stack[--stack_ptr];
-			mask_index = stack[--stack_ptr];
-			long_count = stack[--stack_ptr];
-
-			if (version > 0) {
-				/*
-				 * stack 0 = source 1 right index
-				 * stack 1 = source 1 left index
-				 * stack 2 = source 2 right index
-				 * stack 3 = source 2 left index
-				 * stack 4 = mask right index
-				 * stack 5 = mask left index
-				 */
-				s32 mask_right = stack[--stack_ptr];
-				s32 mask_left = stack[--stack_ptr];
-				/* source 1 count */
-				a = 1 + index2 - index1;
-				/* source 2 count */
-				b = 1 + long_count - mask_index;
-				a = (a < b) ? a : b;
-				/* mask count */
-				b = 1 + mask_left - mask_right;
-				a = (a < b) ? a : b;
-				/* source 2 start index */
-				index2 = mask_index;
-				/* mask start index */
-				mask_index = mask_right;
-				long_count = a;
-			}
-
-			long_tmp = 1L;
-
-			if (long_count < 1)
-				status = -ERANGE;
-			else {
-				count = long_count;
-
-				for (i = 0; i < count; ++i) {
-					if (mask[mask_index >> 3] &
-						(1 << (mask_index & 7))) {
-						a = source1[index1 >> 3] &
-							(1 << (index1 & 7))
-								? 1 : 0;
-						b = source2[index2 >> 3] &
-							(1 << (index2 & 7))
-								? 1 : 0;
-
-						if (a != b) /* failure */
-							long_tmp = 0L;
-					}
-					++index1;
-					++index2;
-					++mask_index;
-				}
-			}
-
-			stack[stack_ptr++] = long_tmp;
-
-			break;
-		}
-		default:
-			/* Unrecognized opcode -- ERROR! */
-			bad_opcode = 1;
-			break;
-		}
-
-		if (bad_opcode)
-			status = -ENOSYS;
-
-		if ((stack_ptr < 0) || (stack_ptr >= ALTERA_STACK_SIZE))
-			status = -EOVERFLOW;
-
-		if (status != 0) {
-			done = 1;
-			*error_address = (s32)(opcode_address - code_sect);
-		}
-	}
-
-	altera_free_buffers(astate);
-
-	/* Free all dynamically allocated arrays */
-	if ((attrs != NULL) && (vars != NULL))
-		for (i = 0; i < sym_count; ++i)
-			if (attrs[i] & 0x80)
-				kfree((void *)vars[i]);
-
-	kfree(vars);
-	kfree(var_size);
-	kfree(attrs);
-	kfree(proc_attributes);
-
-	return status;
-}
-
-static int altera_get_note(u8 *p, s32 program_size, s32 *offset,
-			   char *key, char *value, int keylen, int vallen)
-/*
- * Gets key and value of NOTE fields in the JBC file.
- * Can be called in two modes:  if offset pointer is NULL,
- * then the function searches for note fields which match
- * the key string provided.  If offset is not NULL, then
- * the function finds the next note field of any key,
- * starting at the offset specified by the offset pointer.
- * Returns 0 for success, else appropriate error code
- */
-{
-	int status = -ENODATA;
-	u32 note_strings = 0L;
-	u32 note_table = 0L;
-	u32 note_count = 0L;
-	u32 first_word = 0L;
-	int version = 0;
-	int delta = 0;
-	char *key_ptr;
-	char *value_ptr;
-	int i;
-
-	/* Read header information */
-	if (program_size > 52L) {
-		first_word    = get_unaligned_be32(&p[0]);
-		version = (first_word & 1L);
-		delta = version * 8;
-
-		note_strings  = get_unaligned_be32(&p[8 + delta]);
-		note_table    = get_unaligned_be32(&p[12 + delta]);
-		note_count    = get_unaligned_be32(&p[44 + (2 * delta)]);
-	}
-
-	if ((first_word != 0x4A414D00L) && (first_word != 0x4A414D01L))
-		return -EIO;
-
-	if (note_count <= 0L)
-		return status;
-
-	if (offset == NULL) {
-		/*
-		 * We will search for the first note with a specific key,
-		 * and return only the value
-		 */
-		for (i = 0; (i < note_count) &&
-						(status != 0); ++i) {
-			key_ptr = &p[note_strings +
-					get_unaligned_be32(
-					&p[note_table + (8 * i)])];
-			if (key && !strncasecmp(key, key_ptr, strlen(key_ptr))) {
-				status = 0;
-
-				value_ptr = &p[note_strings +
-						get_unaligned_be32(
-						&p[note_table + (8 * i) + 4])];
-
-				if (value != NULL)
-					strlcpy(value, value_ptr, vallen);
-
-			}
-		}
-	} else {
-		/*
-		 * We will search for the next note, regardless of the key,
-		 * and return both the value and the key
-		 */
-
-		i = *offset;
-
-		if ((i >= 0) && (i < note_count)) {
-			status = 0;
-
-			if (key != NULL)
-				strlcpy(key, &p[note_strings +
-						get_unaligned_be32(
-						&p[note_table + (8 * i)])],
-					keylen);
-
-			if (value != NULL)
-				strlcpy(value, &p[note_strings +
-						get_unaligned_be32(
-						&p[note_table + (8 * i) + 4])],
-					vallen);
-
-			*offset = i + 1;
-		}
-	}
-
-	return status;
-}
-
-static int altera_check_crc(u8 *p, s32 program_size)
-{
-	int status = 0;
-	u16 local_expected = 0,
-	    local_actual = 0,
-	    shift_reg = 0xffff;
-	int bit, feedback;
-	u8 databyte;
-	u32 i;
-	u32 crc_section = 0L;
-	u32 first_word = 0L;
-	int version = 0;
-	int delta = 0;
-
-	if (program_size > 52L) {
-		first_word  = get_unaligned_be32(&p[0]);
-		version = (first_word & 1L);
-		delta = version * 8;
-
-		crc_section = get_unaligned_be32(&p[32 + delta]);
-	}
-
-	if ((first_word != 0x4A414D00L) && (first_word != 0x4A414D01L))
-		status = -EIO;
-
-	if (crc_section >= program_size)
-		status = -EIO;
-
-	if (status == 0) {
-		local_expected = (u16)get_unaligned_be16(&p[crc_section]);
-
-		for (i = 0; i < crc_section; ++i) {
-			databyte = p[i];
-			for (bit = 0; bit < 8; bit++) {
-				feedback = (databyte ^ shift_reg) & 0x01;
-				shift_reg >>= 1;
-				if (feedback)
-					shift_reg ^= 0x8408;
-
-				databyte >>= 1;
-			}
-		}
-
-		local_actual = (u16)~shift_reg;
-
-		if (local_expected != local_actual)
-			status = -EILSEQ;
-
-	}
-
-	if (debug || status) {
-		switch (status) {
-		case 0:
-			printk(KERN_INFO "%s: CRC matched: %04x\n", __func__,
-				local_actual);
-			break;
-		case -EILSEQ:
-			printk(KERN_ERR "%s: CRC mismatch: expected %04x, "
-				"actual %04x\n", __func__, local_expected,
-				local_actual);
-			break;
-		case -ENODATA:
-			printk(KERN_ERR "%s: expected CRC not found, "
-				"actual CRC = %04x\n", __func__,
-				local_actual);
-			break;
-		case -EIO:
-			printk(KERN_ERR "%s: error: format isn't "
-				"recognized.\n", __func__);
-			break;
-		default:
-			printk(KERN_ERR "%s: CRC function returned error "
-				"code %d\n", __func__, status);
-			break;
-		}
-	}
-
-	return status;
-}
-
-static int altera_get_file_info(u8 *p,
-					s32 program_size,
-					int *format_version,
-					int *action_count,
-					int *procedure_count)
-{
-	int status = -EIO;
-	u32 first_word = 0;
-	int version = 0;
-
-	if (program_size <= 52L)
-		return status;
-
-	first_word = get_unaligned_be32(&p[0]);
-
-	if ((first_word == 0x4A414D00L) || (first_word == 0x4A414D01L)) {
-		status = 0;
-
-		version = (first_word & 1L);
-		*format_version = version + 1;
-
-		if (version > 0) {
-			*action_count = get_unaligned_be32(&p[48]);
-			*procedure_count = get_unaligned_be32(&p[52]);
-		}
-	}
-
-	return status;
-}
-
-static int altera_get_act_info(u8 *p,
-					s32 program_size,
-					int index,
-					char **name,
-					char **description,
-					struct altera_procinfo **proc_list)
-{
-	int status = -EIO;
-	struct altera_procinfo *procptr = NULL;
-	struct altera_procinfo *tmpptr = NULL;
-	u32 first_word = 0L;
-	u32 action_table = 0L;
-	u32 proc_table = 0L;
-	u32 str_table = 0L;
-	u32 note_strings = 0L;
-	u32 action_count = 0L;
-	u32 proc_count = 0L;
-	u32 act_name_id = 0L;
-	u32 act_desc_id = 0L;
-	u32 act_proc_id = 0L;
-	u32 act_proc_name = 0L;
-	u8 act_proc_attribute = 0;
-
-	if (program_size <= 52L)
-		return status;
-	/* Read header information */
-	first_word = get_unaligned_be32(&p[0]);
-
-	if (first_word != 0x4A414D01L)
-		return status;
-
-	action_table = get_unaligned_be32(&p[4]);
-	proc_table   = get_unaligned_be32(&p[8]);
-	str_table = get_unaligned_be32(&p[12]);
-	note_strings = get_unaligned_be32(&p[16]);
-	action_count = get_unaligned_be32(&p[48]);
-	proc_count   = get_unaligned_be32(&p[52]);
-
-	if (index >= action_count)
-		return status;
-
-	act_name_id = get_unaligned_be32(&p[action_table + (12 * index)]);
-	act_desc_id = get_unaligned_be32(&p[action_table + (12 * index) + 4]);
-	act_proc_id = get_unaligned_be32(&p[action_table + (12 * index) + 8]);
-
-	*name = &p[str_table + act_name_id];
-
-	if (act_desc_id < (note_strings - str_table))
-		*description = &p[str_table + act_desc_id];
-
-	do {
-		act_proc_name = get_unaligned_be32(
-					&p[proc_table + (13 * act_proc_id)]);
-		act_proc_attribute =
-			(p[proc_table + (13 * act_proc_id) + 8] & 0x03);
-
-		procptr =
-				kzalloc(sizeof(struct altera_procinfo),
-								GFP_KERNEL);
-
-		if (procptr == NULL)
-			status = -ENOMEM;
-		else {
-			procptr->name = &p[str_table + act_proc_name];
-			procptr->attrs = act_proc_attribute;
-			procptr->next = NULL;
-
-			/* add record to end of linked list */
-			if (*proc_list == NULL)
-				*proc_list = procptr;
-			else {
-				tmpptr = *proc_list;
-				while (tmpptr->next != NULL)
-					tmpptr = tmpptr->next;
-				tmpptr->next = procptr;
-			}
-		}
-
-		act_proc_id = get_unaligned_be32(
-				&p[proc_table + (13 * act_proc_id) + 4]);
-	} while ((act_proc_id != 0) && (act_proc_id < proc_count));
-
-	return status;
-}
-
-int altera_init(struct altera_config *config, const struct firmware *fw)
-{
-	struct altera_state *astate = NULL;
-	struct altera_procinfo *proc_list = NULL;
-	struct altera_procinfo *procptr = NULL;
-	char *key = NULL;
-	char *value = NULL;
-	char *action_name = NULL;
-	char *description = NULL;
-	int exec_result = 0;
-	int exit_code = 0;
-	int format_version = 0;
-	int action_count = 0;
-	int procedure_count = 0;
-	int index = 0;
-	s32 offset = 0L;
-	s32 error_address = 0L;
-	int retval = 0;
-
-	key = kzalloc(33, GFP_KERNEL);
-	if (!key) {
-		retval = -ENOMEM;
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	unsigned int from, nr, arg;
+	int err = 0, type = MMC_BLK_DISCARD;
+
+	if (!mmc_can_erase(card)) {
+		err = -EOPNOTSUPP;
 		goto out;
 	}
-	value = kzalloc(257, GFP_KERNEL);
-	if (!value) {
-		retval = -ENOMEM;
-		goto free_key;
+
+	from = blk_rq_pos(req);
+	nr = blk_rq_sectors(req);
+
+	if (mmc_can_discard(card))
+		arg = MMC_DISCARD_ARG;
+	else if (mmc_can_trim(card))
+		arg = MMC_TRIM_ARG;
+	else
+		arg = MMC_ERASE_ARG;
+retry:
+	if (card->quirks & MMC_QUIRK_INAND_CMD38) {
+		err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+				 INAND_CMD38_ARG_EXT_CSD,
+				 arg == MMC_TRIM_ARG ?
+				 INAND_CMD38_ARG_TRIM :
+				 INAND_CMD38_ARG_ERASE,
+				 card->ext_csd.generic_cmd6_time);
+		if (err)
+			goto out;
 	}
-	astate = kzalloc(sizeof(struct altera_state), GFP_KERNEL);
-	if (!astate) {
-		retval = -ENOMEM;
-		goto free_value;
+	err = mmc_erase(card, from, nr, arg);
+out:
+	if (err == -EIO && !mmc_blk_reset(md, card->host, type))
+		goto retry;
+	if (!err)
+		mmc_blk_reset_success(md, type);
+	blk_end_request(req, err, blk_rq_bytes(req));
+
+	return err ? 0 : 1;
+}
+
+static int mmc_blk_cmdq_issue_secdiscard_rq(struct mmc_queue *mq,
+				       struct request *req)
+{
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	struct mmc_cmdq_req *cmdq_req = NULL;
+	unsigned int from, nr, arg;
+	struct mmc_host *host = card->host;
+	struct mmc_cmdq_context_info *ctx_info = &host->cmdq_ctx;
+	int err = 0;
+
+	if (!(mmc_can_secure_erase_trim(card))) {
+		err = -EOPNOTSUPP;
+		goto out;
 	}
 
-	astate->config = config;
-	if (!astate->config->jtag_io) {
-		dprintk("%s: using byteblaster!\n", __func__);
-		astate->config->jtag_io = netup_jtag_io_lpt;
+#ifdef CONFIG_MMC_CMDQ_DEBUG
+	/* cq debug */
+	exynos_ss_printk("[CQ] I_SD: tag = %d, flag = 0x%lx, active = 0x%lx\n",
+				req->tag, ctx_info->curr_state,
+				ctx_info->active_reqs);
+#endif
+	from = blk_rq_pos(req);
+	nr = blk_rq_sectors(req);
+
+	if (mmc_can_trim(card) && !mmc_erase_group_aligned(card, from, nr))
+		arg = MMC_SECURE_TRIM1_ARG;
+	else
+		arg = MMC_SECURE_ERASE_ARG;
+
+	cmdq_req = mmc_blk_cmdq_prep_discard_req(mq, req);
+	if (card->quirks & MMC_QUIRK_INAND_CMD38) {
+		__mmc_switch_cmdq_mode(cmdq_req->mrq.cmd,
+				EXT_CSD_CMD_SET_NORMAL,
+				INAND_CMD38_ARG_EXT_CSD,
+				arg == MMC_SECURE_TRIM1_ARG ?
+				INAND_CMD38_ARG_SECTRIM1 :
+				INAND_CMD38_ARG_SECERASE,
+				0, true, false);
+		err = mmc_cmdq_wait_for_dcmd(card->host, cmdq_req);
+		if (err)
+			goto clear_dcmd;
 	}
 
-	altera_check_crc((u8 *)fw->data, fw->size);
+	err = mmc_cmdq_erase(cmdq_req, card, from, nr, arg);
+	if (err)
+		goto clear_dcmd;
 
-	if (debug) {
-		altera_get_file_info((u8 *)fw->data, fw->size, &format_version,
-					&action_count, &procedure_count);
-		printk(KERN_INFO "%s: File format is %s ByteCode format\n",
-			__func__, (format_version == 2) ? "Jam STAPL" :
-						"pre-standardized Jam 1.1");
-		while (altera_get_note((u8 *)fw->data, fw->size,
-					&offset, key, value, 32, 256) == 0)
-			printk(KERN_INFO "%s: NOTE \"%s\" = \"%s\"\n",
-					__func__, key, value);
+	if (arg == MMC_SECURE_TRIM1_ARG) {
+		if (card->quirks & MMC_QUIRK_INAND_CMD38) {
+			__mmc_switch_cmdq_mode(cmdq_req->mrq.cmd,
+					EXT_CSD_CMD_SET_NORMAL,
+					INAND_CMD38_ARG_EXT_CSD,
+					INAND_CMD38_ARG_SECTRIM2,
+					0, true, false);
+			err = mmc_cmdq_wait_for_dcmd(card->host, cmdq_req);
+			if (err)
+				goto clear_dcmd;
+		}
+
+		err = mmc_cmdq_erase(cmdq_req, card, from, nr,
+				MMC_SECURE_TRIM2_ARG);
+	}
+clear_dcmd:
+	/* clear pending request */
+	if (cmdq_req) {
+		BUG_ON(!test_and_clear_bit(cmdq_req->tag,
+					   &ctx_info->active_reqs));
+		clear_bit(CMDQ_STATE_DCMD_ACTIVE, &ctx_info->curr_state);
+	}
+out:
+	blk_end_request(req, err, blk_rq_bytes(req));
+	wake_up(&ctx_info->wait);
+	mmc_put_card(card);
+	return err ? 1 : 0;
+}
+
+static int mmc_blk_issue_secdiscard_rq(struct mmc_queue *mq,
+				       struct request *req)
+{
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	unsigned int from, nr, arg;
+	int err = 0, type = MMC_BLK_SECDISCARD;
+
+	if (!(mmc_can_secure_erase_trim(card))) {
+		err = -EOPNOTSUPP;
+		goto out;
 	}
 
-	if (debug && (format_version == 2) && (action_count > 0)) {
-		printk(KERN_INFO "%s: Actions available:\n", __func__);
-		for (index = 0; index < action_count; ++index) {
-			altera_get_act_info((u8 *)fw->data, fw->size,
-						index, &action_name,
-						&description,
-						&proc_list);
+	from = blk_rq_pos(req);
+	nr = blk_rq_sectors(req);
 
-			if (description == NULL)
-				printk(KERN_INFO "%s: %s\n",
-						__func__,
-						action_name);
-			else
-				printk(KERN_INFO "%s: %s \"%s\"\n",
-						__func__,
-						action_name,
-						description);
+	if (mmc_can_trim(card) && !mmc_erase_group_aligned(card, from, nr))
+		arg = MMC_SECURE_TRIM1_ARG;
+	else
+		arg = MMC_SECURE_ERASE_ARG;
 
-			procptr = proc_list;
-			while (procptr != NULL) {
-				if (procptr->attrs != 0)
-					printk(KERN_INFO "%s:    %s (%s)\n",
-						__func__,
-						procptr->name,
-						(procptr->attrs == 1) ?
-						"optional" : "recommended");
+retry:
+	if (card->quirks & MMC_QUIRK_INAND_CMD38) {
+		err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+				 INAND_CMD38_ARG_EXT_CSD,
+				 arg == MMC_SECURE_TRIM1_ARG ?
+				 INAND_CMD38_ARG_SECTRIM1 :
+				 INAND_CMD38_ARG_SECERASE,
+				 card->ext_csd.generic_cmd6_time);
+		if (err)
+			goto out_retry;
+	}
 
-				proc_list = procptr->next;
-				kfree(procptr);
-				procptr = proc_list;
+	err = mmc_erase(card, from, nr, arg);
+	if (err == -EIO)
+		goto out_retry;
+	if (err)
+		goto out;
+
+	if (arg == MMC_SECURE_TRIM1_ARG) {
+		if (card->quirks & MMC_QUIRK_INAND_CMD38) {
+			err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+					 INAND_CMD38_ARG_EXT_CSD,
+					 INAND_CMD38_ARG_SECTRIM2,
+					 card->ext_csd.generic_cmd6_time);
+			if (err)
+				goto out_retry;
+		}
+
+		err = mmc_erase(card, from, nr, MMC_SECURE_TRIM2_ARG);
+		if (err == -EIO)
+			goto out_retry;
+		if (err)
+			goto out;
+	}
+
+out_retry:
+	if (err && !mmc_blk_reset(md, card->host, type))
+		goto retry;
+	if (!err)
+		mmc_blk_reset_success(md, type);
+out:
+	blk_end_request(req, err, blk_rq_bytes(req));
+
+	return err ? 0 : 1;
+}
+
+static int mmc_blk_issue_flush(struct mmc_queue *mq, struct request *req)
+{
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	int ret = 0;
+
+	if (!req)
+		return 0;
+
+	if (req->cmd_flags & REQ_BARRIER) {
+		/*
+		 * If eMMC cache flush policy is set to 1, then the device
+		 * shall flush the requests in First-In-First-Out (FIFO) order.
+		 * In this case, as per spec, the host must not send any cache
+		 * barrier requests as they are redundant and add unnecessary
+		 * overhead to both device and host.
+		 */
+		if (card->ext_csd.cache_flush_policy & 1)
+			goto end_req;
+
+		/*
+		 * In case barrier is not supported or enabled in the device,
+		 * use flush as a fallback option.
+		 */
+		ret = mmc_cache_barrier(card);
+		if (ret)
+			ret = mmc_flush_cache(card);
+	 } else if (req->cmd_flags & REQ_FLUSH) {
+		ret = mmc_flush_cache(card);
+	 }
+	if (ret == -ENODEV) {
+		pr_err("%s: %s: restart mmc card",
+				req->rq_disk->disk_name, __func__);
+		if (mmc_blk_reset(md, card->host, MMC_BLK_FLUSH))
+			pr_err("%s: %s: fail to restart mmc",
+				req->rq_disk->disk_name, __func__);
+		else
+			mmc_blk_reset_success(md, MMC_BLK_FLUSH);
+	}
+
+	if (ret) {
+		pr_err("%s: %s: notify flush error to upper layers",
+				req->rq_disk->disk_name, __func__);
+		ret = -EIO;
+	}
+
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+	else if (atomic_read(&mq->cache_size)) {
+		long used = mmc_blk_cache_used(mq, jiffies);
+
+		if (used) {
+			int speed = atomic_read(&mq->max_write_speed);
+
+			if (speed_valid(speed)) {
+				unsigned long msecs = jiffies_to_msecs(
+					size_and_speed_to_jiffies(
+						used, speed));
+				if (msecs)
+					msleep(msecs);
+			}
+		}
+	}
+#endif
+end_req:
+	blk_end_request_all(req, ret);
+
+	return ret ? 0 : 1;
+}
+
+/*
+ * Reformat current write as a reliable write, supporting
+ * both legacy and the enhanced reliable write MMC cards.
+ * In each transfer we'll handle only as much as a single
+ * reliable write can handle, thus finish the request in
+ * partial completions.
+ */
+static inline void mmc_apply_rel_rw(struct mmc_blk_request *brq,
+				    struct mmc_card *card,
+				    struct request *req)
+{
+	if (!(card->ext_csd.rel_param & EXT_CSD_WR_REL_PARAM_EN)) {
+		/* Legacy mode imposes restrictions on transfers. */
+		if (!IS_ALIGNED(brq->cmd.arg, card->ext_csd.rel_sectors))
+			brq->data.blocks = 1;
+
+		if (brq->data.blocks > card->ext_csd.rel_sectors)
+			brq->data.blocks = card->ext_csd.rel_sectors;
+		else if (brq->data.blocks < card->ext_csd.rel_sectors)
+			brq->data.blocks = 1;
+	}
+}
+
+static int mmc_blk_err_check(struct mmc_card *card,
+			     struct mmc_async_req *areq)
+{
+	struct mmc_queue_req *mq_mrq = container_of(areq, struct mmc_queue_req,
+						    mmc_active);
+	struct mmc_blk_request *brq = &mq_mrq->brq;
+	struct request *req = mq_mrq->req;
+	int need_retune = card->host->need_retune;
+	int ecc_err = 0, gen_err = 0;
+
+	/*
+	 * sbc.error indicates a problem with the set block count
+	 * command.  No data will have been transferred.
+	 *
+	 * cmd.error indicates a problem with the r/w command.  No
+	 * data will have been transferred.
+	 *
+	 * stop.error indicates a problem with the stop command.  Data
+	 * may have been transferred, or may still be transferring.
+	 */
+	if (brq->sbc.error || brq->cmd.error || brq->stop.error ||
+	    brq->data.error) {
+		switch (mmc_blk_cmd_recovery(card, req, brq, &ecc_err, &gen_err)) {
+		case ERR_RETRY:
+			return MMC_BLK_RETRY;
+		case ERR_ABORT:
+			return MMC_BLK_ABORT;
+		case ERR_NOMEDIUM:
+			return MMC_BLK_NOMEDIUM;
+		case ERR_CONTINUE:
+			break;
+		}
+	}
+
+	/*
+	 * Check for errors relating to the execution of the
+	 * initial command - such as address errors.  No data
+	 * has been transferred.
+	 */
+	if (brq->cmd.resp[0] & CMD_ERRORS) {
+		pr_err("%s: r/w command failed, status = %#x\n",
+		       req->rq_disk->disk_name, brq->cmd.resp[0]);
+		mmc_card_error_logging(card, brq, brq->cmd.resp[0]);
+		return MMC_BLK_ABORT;
+	}
+
+	/*
+	 * Everything else is either success, or a data error of some
+	 * kind.  If it was a write, we may have transitioned to
+	 * program mode, which we have to wait for it to complete.
+	 */
+	if (!mmc_host_is_spi(card->host) && rq_data_dir(req) != READ) {
+		int err;
+
+		/* Check stop command response */
+		if (brq->stop.resp[0] & R1_ERROR) {
+			pr_err("%s: %s: general error sending stop command, stop cmd response %#x\n",
+			       req->rq_disk->disk_name, __func__,
+			       brq->stop.resp[0]);
+			gen_err = 1;
+		}
+
+		err = card_busy_detect(card, MMC_BLK_TIMEOUT_MS, false, req,
+					&gen_err);
+		if (err)
+			return MMC_BLK_CMD_ERR;
+	}
+
+	if (brq->data.error) {
+		if (need_retune && !brq->retune_retry_done) {
+			pr_info("%s: retrying because a re-tune was needed\n",
+				req->rq_disk->disk_name);
+			brq->retune_retry_done = 1;
+			return MMC_BLK_RETRY;
+		}
+		pr_err("%s: error %d transferring data, sector %u, nr %u, cmd response %#x, card status %#x\n",
+		       req->rq_disk->disk_name, brq->data.error,
+		       (unsigned)blk_rq_pos(req),
+		       (unsigned)blk_rq_sectors(req),
+		       brq->cmd.resp[0], brq->stop.resp[0]);
+
+		if (rq_data_dir(req) == READ) {
+			if (ecc_err)
+				return MMC_BLK_ABORT;
+			if (mmc_card_sd(card))
+				return MMC_BLK_ABORT;
+			return MMC_BLK_DATA_ERR;
+		} else {
+			return MMC_BLK_CMD_ERR;
+		}
+	}
+
+	if (!brq->data.bytes_xfered)
+		return MMC_BLK_RETRY;
+
+	if (mmc_packed_cmd(mq_mrq->cmd_type)) {
+		if (unlikely(brq->data.blocks << 9 != brq->data.bytes_xfered))
+			return MMC_BLK_PARTIAL;
+		else
+			return MMC_BLK_SUCCESS;
+	}
+
+	if (blk_rq_bytes(req) != brq->data.bytes_xfered)
+		return MMC_BLK_PARTIAL;
+
+	return MMC_BLK_SUCCESS;
+}
+
+static int mmc_blk_packed_err_check(struct mmc_card *card,
+				    struct mmc_async_req *areq)
+{
+	struct mmc_queue_req *mq_rq = container_of(areq, struct mmc_queue_req,
+			mmc_active);
+	struct request *req = mq_rq->req;
+	struct mmc_packed *packed = mq_rq->packed;
+	int err, check, status;
+	u8 *ext_csd;
+
+	BUG_ON(!packed);
+
+	packed->retries--;
+	check = mmc_blk_err_check(card, areq);
+	err = get_card_status(card, &status, 0);
+	if (err) {
+		pr_err("%s: error %d sending status command\n",
+		       req->rq_disk->disk_name, err);
+		return MMC_BLK_ABORT;
+	}
+
+	if (status & R1_EXCEPTION_EVENT) {
+		err = mmc_get_ext_csd(card, &ext_csd);
+		if (err) {
+			pr_err("%s: error %d sending ext_csd\n",
+			       req->rq_disk->disk_name, err);
+			return MMC_BLK_ABORT;
+		}
+
+		if ((ext_csd[EXT_CSD_EXP_EVENTS_STATUS] &
+		     EXT_CSD_PACKED_FAILURE) &&
+		    (ext_csd[EXT_CSD_PACKED_CMD_STATUS] &
+		     EXT_CSD_PACKED_GENERIC_ERROR)) {
+			if (ext_csd[EXT_CSD_PACKED_CMD_STATUS] &
+			    EXT_CSD_PACKED_INDEXED_ERROR) {
+				packed->idx_failure =
+				  ext_csd[EXT_CSD_PACKED_FAILURE_INDEX] - 1;
+				check = MMC_BLK_PARTIAL;
+			}
+			pr_err("%s: packed cmd failed, nr %u, sectors %u, "
+			       "failure index: %d\n",
+			       req->rq_disk->disk_name, packed->nr_entries,
+			       packed->blocks, packed->idx_failure);
+		}
+		kfree(ext_csd);
+	}
+
+	return check;
+}
+
+static void mmc_blk_rw_rq_prep(struct mmc_queue_req *mqrq,
+			       struct mmc_card *card,
+			       int disable_multi,
+			       struct mmc_queue *mq)
+{
+	u32 readcmd, writecmd;
+	struct mmc_blk_request *brq = &mqrq->brq;
+	struct request *req = mqrq->req;
+	struct mmc_blk_data *md = mq->data;
+	bool do_data_tag;
+
+	/*
+	 * Reliable writes are used to implement Forced Unit Access and
+	 * are supported only on MMCs.
+	 */
+	bool do_rel_wr = (req->cmd_flags & REQ_FUA) &&
+		(rq_data_dir(req) == WRITE) &&
+		(md->flags & MMC_BLK_REL_WR);
+
+	memset(brq, 0, sizeof(struct mmc_blk_request));
+	brq->mrq.cmd = &brq->cmd;
+	brq->mrq.data = &brq->data;
+
+	brq->cmd.arg = blk_rq_pos(req);
+	if (!mmc_card_blockaddr(card))
+		brq->cmd.arg <<= 9;
+	brq->cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_ADTC;
+	brq->data.blksz = 512;
+	brq->stop.opcode = MMC_STOP_TRANSMISSION;
+	brq->stop.arg = 0;
+	brq->data.blocks = blk_rq_sectors(req);
+
+	/*
+	 * The block layer doesn't support all sector count
+	 * restrictions, so we need to be prepared for too big
+	 * requests.
+	 */
+	if (brq->data.blocks > card->host->max_blk_count)
+		brq->data.blocks = card->host->max_blk_count;
+
+	if (brq->data.blocks > 1) {
+		/*
+		 * After a read error, we redo the request one sector
+		 * at a time in order to accurately determine which
+		 * sectors can be read successfully.
+		 */
+		if (disable_multi)
+			brq->data.blocks = 1;
+
+		/*
+		 * Some controllers have HW issues while operating
+		 * in multiple I/O mode
+		 */
+		if (card->host->ops->multi_io_quirk)
+			brq->data.blocks = card->host->ops->multi_io_quirk(card,
+						(rq_data_dir(req) == READ) ?
+						MMC_DATA_READ : MMC_DATA_WRITE,
+						brq->data.blocks);
+	}
+
+	if (brq->data.blocks > 1 || do_rel_wr) {
+		/* SPI multiblock writes terminate using a special
+		 * token, not a STOP_TRANSMISSION request.
+		 */
+		if (!mmc_host_is_spi(card->host) ||
+		    rq_data_dir(req) == READ)
+			brq->mrq.stop = &brq->stop;
+		readcmd = MMC_READ_MULTIPLE_BLOCK;
+		writecmd = MMC_WRITE_MULTIPLE_BLOCK;
+	} else {
+		brq->mrq.stop = NULL;
+		readcmd = MMC_READ_SINGLE_BLOCK;
+		writecmd = MMC_WRITE_BLOCK;
+	}
+	if (rq_data_dir(req) == READ) {
+		brq->cmd.opcode = readcmd;
+		brq->data.flags |= MMC_DATA_READ;
+		if (brq->mrq.stop)
+			brq->stop.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 |
+					MMC_CMD_AC;
+	} else {
+		brq->cmd.opcode = writecmd;
+		brq->data.flags |= MMC_DATA_WRITE;
+		if (brq->mrq.stop)
+			brq->stop.flags = MMC_RSP_SPI_R1B | MMC_RSP_R1B |
+					MMC_CMD_AC;
+	}
+
+	if (do_rel_wr)
+		mmc_apply_rel_rw(brq, card, req);
+
+	/*
+	 * Data tag is used only during writing meta data to speed
+	 * up write and any subsequent read of this meta data
+	 */
+	do_data_tag = (card->ext_csd.data_tag_unit_size) &&
+		(req->cmd_flags & REQ_META) &&
+		(rq_data_dir(req) == WRITE) &&
+		((brq->data.blocks * brq->data.blksz) >=
+		 card->ext_csd.data_tag_unit_size);
+
+	/*
+	 * Pre-defined multi-block transfers are preferable to
+	 * open ended-ones (and necessary for reliable writes).
+	 * However, it is not sufficient to just send CMD23,
+	 * and avoid the final CMD12, as on an error condition
+	 * CMD12 (stop) needs to be sent anyway. This, coupled
+	 * with Auto-CMD23 enhancements provided by some
+	 * hosts, means that the complexity of dealing
+	 * with this is best left to the host. If CMD23 is
+	 * supported by card and host, we'll fill sbc in and let
+	 * the host deal with handling it correctly. This means
+	 * that for hosts that don't expose MMC_CAP_CMD23, no
+	 * change of behavior will be observed.
+	 *
+	 * N.B: Some MMC cards experience perf degradation.
+	 * We'll avoid using CMD23-bounded multiblock writes for
+	 * these, while retaining features like reliable writes.
+	 */
+	if ((md->flags & MMC_BLK_CMD23) && mmc_op_multi(brq->cmd.opcode) &&
+	    (do_rel_wr || !(card->quirks & MMC_QUIRK_BLK_NO_CMD23) ||
+	     do_data_tag)) {
+		brq->sbc.opcode = MMC_SET_BLOCK_COUNT;
+		brq->sbc.arg = brq->data.blocks |
+			(do_rel_wr ? (1 << 31) : 0) |
+			(do_data_tag ? (1 << 29) : 0);
+		brq->sbc.flags = MMC_RSP_R1 | MMC_CMD_AC;
+		brq->mrq.sbc = &brq->sbc;
+	}
+
+	mmc_set_data_timeout(&brq->data, card);
+
+	brq->data.sg = mqrq->sg;
+	brq->data.sg_len = mmc_queue_map_sg(mq, mqrq);
+
+	/*
+	 * Adjust the sg list so it is the same size as the
+	 * request.
+	 */
+	if (brq->data.blocks != blk_rq_sectors(req)) {
+		int i, data_size = brq->data.blocks << 9;
+		struct scatterlist *sg;
+
+		for_each_sg(brq->data.sg, sg, brq->data.sg_len, i) {
+			data_size -= sg->length;
+			if (data_size <= 0) {
+				sg->length += data_size;
+				i++;
+				break;
+			}
+		}
+		brq->data.sg_len = i;
+	}
+
+	mqrq->mmc_active.mrq = &brq->mrq;
+	mqrq->mmc_active.err_check = mmc_blk_err_check;
+
+	mmc_queue_bounce_pre(mqrq);
+}
+
+static inline u8 mmc_calc_packed_hdr_segs(struct request_queue *q,
+					  struct mmc_card *card)
+{
+	unsigned int hdr_sz = mmc_large_sector(card) ? 4096 : 512;
+	unsigned int max_seg_sz = queue_max_segment_size(q);
+	unsigned int len, nr_segs = 0;
+
+	do {
+		len = min(hdr_sz, max_seg_sz);
+		hdr_sz -= len;
+		nr_segs++;
+	} while (hdr_sz);
+
+	return nr_segs;
+}
+
+static u8 mmc_blk_prep_packed_list(struct mmc_queue *mq, struct request *req)
+{
+	struct request_queue *q = mq->queue;
+	struct mmc_card *card = mq->card;
+	struct request *cur = req, *next = NULL;
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_queue_req *mqrq = mq->mqrq_cur;
+	bool en_rel_wr = card->ext_csd.rel_param & EXT_CSD_WR_REL_PARAM_EN;
+	unsigned int req_sectors = 0, phys_segments = 0;
+	unsigned int max_blk_count, max_phys_segs;
+	bool put_back = true;
+	u8 max_packed_rw = 0;
+	u8 reqs = 0;
+
+	if (!(md->flags & MMC_BLK_PACKED_CMD))
+		goto no_packed;
+
+	if ((rq_data_dir(cur) == WRITE) &&
+	    mmc_host_packed_wr(card->host))
+		max_packed_rw = card->ext_csd.max_packed_writes;
+
+	if (max_packed_rw == 0)
+		goto no_packed;
+
+	if (mmc_req_rel_wr(cur) &&
+	    (md->flags & MMC_BLK_REL_WR) && !en_rel_wr)
+		goto no_packed;
+
+	if (mmc_large_sector(card) &&
+	    !IS_ALIGNED(blk_rq_sectors(cur), 8))
+		goto no_packed;
+
+	mmc_blk_clear_packed(mqrq);
+
+	max_blk_count = min(card->host->max_blk_count,
+			    card->host->max_req_size >> 9);
+	if (unlikely(max_blk_count > 0xffff))
+		max_blk_count = 0xffff;
+
+	max_phys_segs = queue_max_segments(q);
+	req_sectors += blk_rq_sectors(cur);
+	phys_segments += cur->nr_phys_segments;
+
+	if (rq_data_dir(cur) == WRITE) {
+		req_sectors += mmc_large_sector(card) ? 8 : 1;
+		phys_segments += mmc_calc_packed_hdr_segs(q, card);
+	}
+
+	do {
+		if (reqs >= max_packed_rw - 1) {
+			put_back = false;
+			break;
+		}
+
+		spin_lock_irq(q->queue_lock);
+		next = blk_fetch_request(q);
+		spin_unlock_irq(q->queue_lock);
+		if (!next) {
+			put_back = false;
+			break;
+		}
+
+		if (mmc_large_sector(card) &&
+		    !IS_ALIGNED(blk_rq_sectors(next), 8))
+			break;
+
+		if (next->cmd_flags & REQ_DISCARD ||
+		    next->cmd_flags & REQ_FLUSH)
+			break;
+
+		if (rq_data_dir(cur) != rq_data_dir(next))
+			break;
+
+		if (mmc_req_rel_wr(next) &&
+		    (md->flags & MMC_BLK_REL_WR) && !en_rel_wr)
+			break;
+
+		req_sectors += blk_rq_sectors(next);
+		if (req_sectors > max_blk_count)
+			break;
+
+		phys_segments +=  next->nr_phys_segments;
+		if (phys_segments > max_phys_segs)
+			break;
+
+		list_add_tail(&next->queuelist, &mqrq->packed->list);
+		cur = next;
+		reqs++;
+	} while (1);
+
+	if (put_back) {
+		spin_lock_irq(q->queue_lock);
+		blk_requeue_request(q, next);
+		spin_unlock_irq(q->queue_lock);
+	}
+
+	if (reqs > 0) {
+		list_add(&req->queuelist, &mqrq->packed->list);
+		mqrq->packed->nr_entries = ++reqs;
+		mqrq->packed->retries = reqs;
+		return reqs;
+	}
+
+no_packed:
+	mqrq->cmd_type = MMC_PACKED_NONE;
+	return 0;
+}
+
+static void mmc_blk_packed_hdr_wrq_prep(struct mmc_queue_req *mqrq,
+					struct mmc_card *card,
+					struct mmc_queue *mq)
+{
+	struct mmc_blk_request *brq = &mqrq->brq;
+	struct request *req = mqrq->req;
+	struct request *prq;
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_packed *packed = mqrq->packed;
+	bool do_rel_wr, do_data_tag;
+	__le32 *packed_cmd_hdr;
+	u8 hdr_blocks;
+	u8 i = 1;
+
+	BUG_ON(!packed);
+
+	mqrq->cmd_type = MMC_PACKED_WRITE;
+	packed->blocks = 0;
+	packed->idx_failure = MMC_PACKED_NR_IDX;
+
+	packed_cmd_hdr = packed->cmd_hdr;
+	memset(packed_cmd_hdr, 0, sizeof(packed->cmd_hdr));
+	packed_cmd_hdr[0] = cpu_to_le32((packed->nr_entries << 16) |
+		(PACKED_CMD_WR << 8) | PACKED_CMD_VER);
+	hdr_blocks = mmc_large_sector(card) ? 8 : 1;
+
+	/*
+	 * Argument for each entry of packed group
+	 */
+	list_for_each_entry(prq, &packed->list, queuelist) {
+		do_rel_wr = mmc_req_rel_wr(prq) && (md->flags & MMC_BLK_REL_WR);
+		do_data_tag = (card->ext_csd.data_tag_unit_size) &&
+			(prq->cmd_flags & REQ_META) &&
+			(rq_data_dir(prq) == WRITE) &&
+			blk_rq_bytes(prq) >= card->ext_csd.data_tag_unit_size;
+		/* Argument of CMD23 */
+		packed_cmd_hdr[(i * 2)] = cpu_to_le32(
+			(do_rel_wr ? MMC_CMD23_ARG_REL_WR : 0) |
+			(do_data_tag ? MMC_CMD23_ARG_TAG_REQ : 0) |
+			blk_rq_sectors(prq));
+		/* Argument of CMD18 or CMD25 */
+		packed_cmd_hdr[((i * 2)) + 1] = cpu_to_le32(
+			mmc_card_blockaddr(card) ?
+			blk_rq_pos(prq) : blk_rq_pos(prq) << 9);
+		packed->blocks += blk_rq_sectors(prq);
+		i++;
+	}
+
+	memset(brq, 0, sizeof(struct mmc_blk_request));
+	brq->mrq.cmd = &brq->cmd;
+	brq->mrq.data = &brq->data;
+	brq->mrq.sbc = &brq->sbc;
+	brq->mrq.stop = &brq->stop;
+
+	brq->sbc.opcode = MMC_SET_BLOCK_COUNT;
+	brq->sbc.arg = MMC_CMD23_ARG_PACKED | (packed->blocks + hdr_blocks);
+	brq->sbc.flags = MMC_RSP_R1 | MMC_CMD_AC;
+
+	brq->cmd.opcode = MMC_WRITE_MULTIPLE_BLOCK;
+	brq->cmd.arg = blk_rq_pos(req);
+	if (!mmc_card_blockaddr(card))
+		brq->cmd.arg <<= 9;
+	brq->cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R1 | MMC_CMD_ADTC;
+
+	brq->data.blksz = 512;
+	brq->data.blocks = packed->blocks + hdr_blocks;
+	brq->data.flags |= MMC_DATA_WRITE;
+
+	brq->stop.opcode = MMC_STOP_TRANSMISSION;
+	brq->stop.arg = 0;
+	brq->stop.flags = MMC_RSP_SPI_R1B | MMC_RSP_R1B | MMC_CMD_AC;
+
+	mmc_set_data_timeout(&brq->data, card);
+
+	brq->data.sg = mqrq->sg;
+	brq->data.sg_len = mmc_queue_map_sg(mq, mqrq);
+
+	mqrq->mmc_active.mrq = &brq->mrq;
+	mqrq->mmc_active.err_check = mmc_blk_packed_err_check;
+
+	mmc_queue_bounce_pre(mqrq);
+}
+
+static int mmc_blk_cmd_err(struct mmc_blk_data *md, struct mmc_card *card,
+			   struct mmc_blk_request *brq, struct request *req,
+			   int ret)
+{
+	struct mmc_queue_req *mq_rq;
+	mq_rq = container_of(brq, struct mmc_queue_req, brq);
+
+	/*
+	 * If this is an SD card and we're writing, we can first
+	 * mark the known good sectors as ok.
+	 *
+	 * If the card is not SD, we can still ok written sectors
+	 * as reported by the controller (which might be less than
+	 * the real number of written sectors, but never more).
+	 */
+	if (mmc_card_sd(card)) {
+		u32 blocks;
+
+		blocks = mmc_sd_num_wr_blocks(card);
+		if (blocks != (u32)-1) {
+			ret = blk_end_request(req, 0, blocks << 9);
+		}
+	} else {
+		if (!mmc_packed_cmd(mq_rq->cmd_type))
+			ret = blk_end_request(req, 0, brq->data.bytes_xfered);
+	}
+	return ret;
+}
+
+static int mmc_blk_end_packed_req(struct mmc_queue_req *mq_rq)
+{
+	struct request *prq;
+	struct mmc_packed *packed = mq_rq->packed;
+	int idx = packed->idx_failure, i = 0;
+	int ret = 0;
+
+	BUG_ON(!packed);
+
+	while (!list_empty(&packed->list)) {
+		prq = list_entry_rq(packed->list.next);
+		if (idx == i) {
+			/* retry from error index */
+			packed->nr_entries -= idx;
+			mq_rq->req = prq;
+			ret = 1;
+
+			if (packed->nr_entries == MMC_PACKED_NR_SINGLE) {
+				list_del_init(&prq->queuelist);
+				mmc_blk_clear_packed(mq_rq);
+			}
+			return ret;
+		}
+		list_del_init(&prq->queuelist);
+		blk_end_request(prq, 0, blk_rq_bytes(prq));
+		i++;
+	}
+
+	mmc_blk_clear_packed(mq_rq);
+	return ret;
+}
+
+static void mmc_blk_abort_packed_req(struct mmc_queue_req *mq_rq)
+{
+	struct request *prq;
+	struct mmc_packed *packed = mq_rq->packed;
+
+	BUG_ON(!packed);
+
+	while (!list_empty(&packed->list)) {
+		prq = list_entry_rq(packed->list.next);
+		list_del_init(&prq->queuelist);
+		blk_end_request(prq, -EIO, blk_rq_bytes(prq));
+	}
+
+	mmc_blk_clear_packed(mq_rq);
+}
+
+static void mmc_blk_revert_packed_req(struct mmc_queue *mq,
+				      struct mmc_queue_req *mq_rq)
+{
+	struct request *prq;
+	struct request_queue *q = mq->queue;
+	struct mmc_packed *packed = mq_rq->packed;
+
+	BUG_ON(!packed);
+
+	while (!list_empty(&packed->list)) {
+		prq = list_entry_rq(packed->list.prev);
+		if (prq->queuelist.prev != &packed->list) {
+			list_del_init(&prq->queuelist);
+			spin_lock_irq(q->queue_lock);
+			blk_requeue_request(mq->queue, prq);
+			spin_unlock_irq(q->queue_lock);
+		} else {
+			list_del_init(&prq->queuelist);
+		}
+	}
+
+	mmc_blk_clear_packed(mq_rq);
+}
+
+static int mmc_blk_cmdq_start_req(struct mmc_host *host,
+				  struct mmc_cmdq_req *cmdq_req)
+{
+	struct mmc_request *mrq = &cmdq_req->mrq;
+
+	mrq->done = mmc_blk_cmdq_req_done;
+	return mmc_cmdq_start_req(host, cmdq_req);
+}
+
+/* prepare for non-data commands */
+static struct mmc_cmdq_req *mmc_cmdq_prep_dcmd(
+		struct mmc_queue_req *mqrq, struct mmc_queue *mq)
+{
+	struct request *req = mqrq->req;
+	struct mmc_cmdq_req *cmdq_req = &mqrq->cmdq_req;
+
+	memset(&mqrq->cmdq_req, 0, sizeof(struct mmc_cmdq_req));
+
+	cmdq_req->mrq.data = NULL;
+	cmdq_req->cmd_flags = req->cmd_flags;
+	cmdq_req->mrq.req = mqrq->req;
+	req->special = mqrq;
+	cmdq_req->cmdq_req_flags |= DCMD;
+	cmdq_req->mrq.cmdq_req = cmdq_req;
+	mqrq->allowed = MAX_RETRIES;
+
+	return &mqrq->cmdq_req;
+}
+
+
+#define IS_RT_CLASS_REQ(x)     \
+	(IOPRIO_PRIO_CLASS(req_get_ioprio(x)) == IOPRIO_CLASS_RT)
+SIO_PATCH_VERSION(eMMC_CP, 1, 0, "");
+/* IOPP-emmc_cp-v1.0.4.4 */
+
+static struct mmc_cmdq_req *mmc_blk_cmdq_rw_prep(
+		struct mmc_queue_req *mqrq, struct mmc_queue *mq)
+{
+	struct mmc_card *card = mq->card;
+	struct request *req = mqrq->req;
+	struct mmc_blk_data *md = mq->data;
+	bool do_rel_wr = mmc_req_rel_wr(req) && (md->flags & MMC_BLK_REL_WR);
+	bool do_data_tag;
+	bool read_dir = (rq_data_dir(req) == READ);
+	struct mmc_cmdq_req *cmdq_rq = &mqrq->cmdq_req;
+
+	memset(&mqrq->cmdq_req, 0, sizeof(struct mmc_cmdq_req));
+
+	cmdq_rq->tag = req->tag;
+	if (read_dir) {
+		cmdq_rq->cmdq_req_flags |= DIR;
+		cmdq_rq->data.flags = MMC_DATA_READ;
+	} else {
+		cmdq_rq->data.flags = MMC_DATA_WRITE;
+	}
+	if (read_dir || req->cmd_flags & REQ_SYNC)
+		cmdq_rq->cmdq_req_flags |= PRIO;
+
+	if (do_rel_wr)
+		cmdq_rq->cmdq_req_flags |= REL_WR;
+
+	cmdq_rq->data.blocks = blk_rq_sectors(req);
+	cmdq_rq->blk_addr = blk_rq_pos(req);
+	cmdq_rq->data.blksz = MMC_CARD_CMDQ_BLK_SIZE;
+
+	mmc_set_data_timeout(&cmdq_rq->data, card);
+
+	do_data_tag = (card->ext_csd.data_tag_unit_size) &&
+		(req->cmd_flags & REQ_META) &&
+		(rq_data_dir(req) == WRITE) &&
+		((cmdq_rq->data.blocks * cmdq_rq->data.blksz) >=
+		 card->ext_csd.data_tag_unit_size);
+	if (do_data_tag)
+		cmdq_rq->cmdq_req_flags |= DAT_TAG;
+	cmdq_rq->data.sg = mqrq->sg;
+	cmdq_rq->data.sg_len = mmc_queue_map_sg(mq, mqrq);
+
+	/*
+	 * Adjust the sg list so it is the same size as the
+	 * request.
+	 */
+	if (cmdq_rq->data.blocks > card->host->max_blk_count)
+		cmdq_rq->data.blocks = card->host->max_blk_count;
+
+	if (cmdq_rq->data.blocks != blk_rq_sectors(req)) {
+		int i, data_size = cmdq_rq->data.blocks << 9;
+		struct scatterlist *sg;
+
+		for_each_sg(cmdq_rq->data.sg, sg, cmdq_rq->data.sg_len, i) {
+			data_size -= sg->length;
+			if (data_size <= 0) {
+				sg->length += data_size;
+				i++;
+				break;
+			}
+		}
+		cmdq_rq->data.sg_len = i;
+	}
+
+	mqrq->cmdq_req.cmd_flags = req->cmd_flags;
+	mqrq->cmdq_req.mrq.req = mqrq->req;
+	mqrq->cmdq_req.mrq.cmdq_req = &mqrq->cmdq_req;
+	mqrq->cmdq_req.mrq.data = &mqrq->cmdq_req.data;
+	mqrq->req->special = mqrq;
+	mqrq->allowed = MAX_RETRIES;
+
+	pr_debug("%s: %s: mrq: 0x%p req: 0x%p mqrq: 0x%p bytes to xf: %d mmc_cmdq_req: 0x%p card-addr: 0x%08x dir(r-1/w-0): %d\n",
+		 mmc_hostname(card->host), __func__, &mqrq->cmdq_req.mrq,
+		 mqrq->req, mqrq, (cmdq_rq->data.blocks * cmdq_rq->data.blksz),
+		 cmdq_rq, cmdq_rq->blk_addr,
+		 (cmdq_rq->cmdq_req_flags & DIR) ? 1 : 0);
+
+	return &mqrq->cmdq_req;
+}
+
+static int mmc_blk_cmdq_issue_rw_rq(struct mmc_queue *mq, struct request *req)
+{
+	struct mmc_queue_req *active_mqrq;
+	struct mmc_card *card = mq->card;
+	struct mmc_host *host = card->host;
+	struct mmc_cmdq_req *mc_rq;
+#ifdef CONFIG_MMC_CMDQ_DEBUG
+	struct mmc_cmdq_context_info *ctx_info = &host->cmdq_ctx;
+#endif
+	int ret = 0;
+
+	BUG_ON((req->tag < 0) || (req->tag > card->ext_csd.cmdq_depth));
+	BUG_ON(test_and_set_bit(req->tag, &host->cmdq_ctx.data_active_reqs));
+	BUG_ON(test_and_set_bit(req->tag, &host->cmdq_ctx.active_reqs));
+
+#ifdef CONFIG_MMC_CMDQ_DEBUG
+	/* cq debug */
+	exynos_ss_printk("[CQ] I_N: tag = %d, flag = 0x%lx, active = 0x%lx\n",
+				req->tag, ctx_info->curr_state,
+				ctx_info->active_reqs);
+#endif
+	active_mqrq = &mq->mqrq_cmdq[req->tag];
+	active_mqrq->req = req;
+
+	mc_rq = mmc_blk_cmdq_rw_prep(active_mqrq, mq);
+
+#if defined(CONFIG_MMC_CQ_HCI) && defined(CONFIG_MMC_DATA_LOG)
+	mmc_blk_cmdq_store_req_log(card, req, &mc_rq->data, true, 0);
+#endif
+
+	ret = mmc_blk_cmdq_start_req(card->host, mc_rq);
+
+	if (!ret && (card->quirks & MMC_QUIRK_CMDQ_EMPTY_BEFORE_DCMD)) {
+		unsigned int sectors = blk_rq_sectors(req);
+
+		if (((sectors > 0) && (sectors < 8))
+		    && (rq_data_dir(req) == READ))
+			host->cmdq_ctx.active_small_sector_read_reqs++;
+	}
+
+	return ret;
+}
+
+/*
+ * Issues a flush (dcmd) request
+ */
+int mmc_blk_cmdq_issue_flush_rq(struct mmc_queue *mq, struct request *req)
+{
+	int err;
+	struct mmc_queue_req *active_mqrq;
+	struct mmc_card *card = mq->card;
+	struct mmc_cmdq_req *cmdq_req;
+	struct mmc_host *host = card->host;
+	struct mmc_cmdq_context_info *ctx_info = &host->cmdq_ctx;
+
+	BUG_ON(!card);
+	host = card->host;
+	BUG_ON(!host);
+	BUG_ON(req->tag > card->ext_csd.cmdq_depth);
+	BUG_ON(test_and_set_bit(req->tag, &host->cmdq_ctx.active_reqs));
+
+#ifdef CONFIG_MMC_CMDQ_DEBUG
+	/* cq debug */
+	exynos_ss_printk("[CQ] I_F: tag = %d, flag = 0x%lx, active = 0x%lx\n",
+				req->tag, ctx_info->curr_state,
+				ctx_info->active_reqs);
+#endif
+	ctx_info = &host->cmdq_ctx;
+
+	set_bit(CMDQ_STATE_DCMD_ACTIVE, &ctx_info->curr_state);
+
+	active_mqrq = &mq->mqrq_cmdq[req->tag];
+	active_mqrq->req = req;
+
+	cmdq_req = mmc_cmdq_prep_dcmd(active_mqrq, mq);
+	cmdq_req->cmdq_req_flags |= QBR;
+	cmdq_req->mrq.cmd = &cmdq_req->cmd;
+	cmdq_req->tag = req->tag;
+
+	err = mmc_cmdq_prepare_flush(cmdq_req->mrq.cmd);
+	if (err) {
+		pr_err("%s: failed (%d) preparing flush req\n",
+		       mmc_hostname(host), err);
+		return err;
+	}
+
+	err = mmc_blk_cmdq_start_req(card->host, cmdq_req);
+	return err;
+}
+EXPORT_SYMBOL(mmc_blk_cmdq_issue_flush_rq);
+
+static void mmc_blk_cmdq_reset(struct mmc_host *host, bool clear_all)
+{
+	if (!host->cmdq_ops->reset)
+		return;
+
+	if (!test_bit(CMDQ_STATE_HALT, &host->cmdq_ctx.curr_state)) {
+		if (mmc_cmdq_halt(host, true)) {
+			pr_err("%s: halt failed\n", mmc_hostname(host));
+			goto reset;
+		}
+	}
+
+	if (clear_all)
+		mmc_cmdq_discard_queue(host, 0);
+reset:
+	mmc_hw_reset(host);
+	host->cmdq_ops->reset(host, true);
+	clear_bit(CMDQ_STATE_HALT, &host->cmdq_ctx.curr_state);
+	mmc_cmdq_error_logging(host->card, NULL, CQ_HW_RST);
+}
+
+static void mmc_blk_cmdq_shutdown(struct mmc_queue *mq)
+{
+	int err;
+	struct mmc_card *card = mq->card;
+	struct mmc_host *host = card->host;
+
+	mmc_get_card(card);
+	err = mmc_cmdq_halt(host, true);
+	if (err) {
+		pr_err("%s: halt: failed: %d\n", __func__, err);
+		return;
+	}
+
+	/* disable CQ mode in card */
+	err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+			 EXT_CSD_CMDQ, 0,
+			 card->ext_csd.generic_cmd6_time);
+	if (err) {
+		pr_err("%s: failed to switch card to legacy mode: %d\n",
+		       __func__, err);
+		goto out;
+	} else {
+		mmc_card_clr_cmdq(card);
+		host->cmdq_ops->disable(host, false);
+		host->card->cmdq_init = false;
+	}
+out:
+	mmc_put_card(card);
+}
+
+static enum blk_eh_timer_return mmc_blk_cmdq_req_timed_out(struct request *req)
+{
+	struct mmc_queue *mq = req->q->queuedata;
+	struct mmc_host *host = mq->card->host;
+	struct mmc_queue_req *mq_rq = req->special;
+	struct mmc_request *mrq;
+	struct mmc_cmdq_req *cmdq_req;
+
+	BUG_ON(!host);
+	/*
+	 * The mmc_queue_req will be present only if the request
+	 * is issued to the LLD. The request could be fetched from
+	 * block layer queue but could be waiting to be issued
+	 * (for e.g. clock scaling is waiting for an empty cmdq queue)
+	 * Reset the timer in such cases to give LLD more time
+	 */
+	if (!mq_rq) {
+		pr_warn("%s: restart timer for tag: %d\n", __func__, req->tag);
+		return BLK_EH_RESET_TIMER;
+	}
+
+	mrq = &mq_rq->cmdq_req.mrq;
+	cmdq_req = &mq_rq->cmdq_req;
+
+	if (host->err_mrq == NULL)
+		host->err_mrq = mrq;
+
+	BUG_ON(!mrq || !cmdq_req);
+
+	if (cmdq_req->cmdq_req_flags & DCMD)
+		mrq->cmd->error = -ETIMEDOUT;
+	else
+		mrq->data->error = -ETIMEDOUT;
+
+	if (cmdq_req->cmdq_req_flags & DCMD &&
+			!(mrq->req->cmd_flags & REQ_FLUSH)) {
+		mrq->done(mrq);
+		return BLK_EH_NOT_HANDLED;
+	} else {
+		return BLK_EH_HANDLED;
+	}
+}
+
+static void mmc_blk_cmdq_err(struct mmc_queue *mq)
+{
+	int err;
+	int retry = 0;
+	int gen_err;
+	u32 status;
+	unsigned long timeout;
+	struct mmc_request *mrq_t;
+	struct mmc_request *mrq_n;
+	struct mmc_queue_req *mqrq_t;
+
+	struct mmc_host *host = mq->card->host;
+	struct mmc_request *mrq = host->err_mrq;
+	struct mmc_card *card = mq->card;
+	struct mmc_cmdq_context_info *ctx_info = &host->cmdq_ctx;
+	unsigned long flags;
+
+	mmc_get_card(card);
+	printk("\n\n=============== CQ RECOVERY START ======================\n\n");
+
+	err = mmc_cmdq_halt(host, true);
+	if (err) {
+		pr_err("halt: failed: %d\n", err);
+		goto reset;
+	}
+
+	if (mrq->data && mrq->data->error) {
+		for (; retry < MAX_RETRIES; retry++) {
+			err = get_card_status(card, &status, 0);
+			if (!err)
+				break;
+		}
+
+		mmc_cmdq_error_logging(host->card, mrq->cmdq_req, status);
+
+		if (err) {
+			pr_err("%s: No response from card !!! err:%d\n",
+			       mmc_hostname(host), err);
+			goto reset;
+		}
+
+		if (R1_CURRENT_STATE(status) == R1_STATE_DATA ||
+		    R1_CURRENT_STATE(status) == R1_STATE_RCV) {
+			err =  send_stop(card, MMC_CMDQ_STOP_TIMEOUT_MS,
+					 mrq->req, &gen_err, &status);
+
+			mmc_cmdq_error_logging(host->card, mrq->cmdq_req, status);
+
+			if (err) {
+				pr_err("%s: error %d sending stop (%d) command\n",
+					mrq->req->rq_disk->disk_name,
+					err, status);
+				goto reset;
 			}
 		}
 
-		printk(KERN_INFO "\n");
+		/*
+		 * Exynos supports only Discard entire queue mode
+		 * when it comes to Task Management
+		 * So you should go to cq reset routine and requeue some tasks.
+		 */
+
+	} else if (mrq->cmd && mrq->cmd->error) {
+		/* DCMD commands */
+
+		/*
+		 * Notify completion for non flush commands like discard
+		 * that wait for DCMD finish.
+		 */
+		if (!(mrq->req->cmd_flags & REQ_FLUSH)) {
+			complete(&mrq->completion);
+			goto reset;
+		}
+	} else {
+		/* Unexpected cases */
+		WARN_ON(1);
 	}
 
-	exec_result = altera_execute(astate, (u8 *)fw->data, fw->size,
-				&error_address, &exit_code, &format_version);
+reset:
+	/* Collect all the pending tasks to cancel */
+	timeout = jiffies + msecs_to_jiffies(120000);
+	while (time_before(jiffies, timeout)) {
+		if (!ctx_info->active_reqs)
+			break;
+	}
 
-	if (exit_code)
-		exec_result = -EREMOTEIO;
+	spin_lock_irqsave(&mq->eh_lock, flags);
+	list_for_each_entry_safe_reverse(mrq_t, mrq_n, &mq->eh_mrq, eh_entry) {
+		list_del(&mrq_t->eh_entry);
+		BUG_ON(!mrq_t->req);
+		mqrq_t = mrq_t->req->special;
+		/* Increase retry count */
+		mrq_t->req->retries++;
+		if (mrq_t->req->retries <= mqrq_t->allowed) {
+			pr_err("[CQ] %s:----- REQUEUE: tag %d sector %u, nr %u, retries %d\n",
+				mmc_hostname(mrq_t->host), mrq_t->req->tag,
+				(unsigned)blk_rq_pos(mrq_t->req),
+				(unsigned)blk_rq_sectors(mrq_t->req),
+				mrq_t->req->retries);
+			spin_lock_irq(mq->queue->queue_lock);
+			blk_requeue_request(mrq_t->req->q, mrq_t->req);
+			spin_unlock_irq(mq->queue->queue_lock);
+		} else {
+			pr_err("[CQ] %s:----- Finish request: tag %d, sector %u, nr %u, retries %d\n",
+				mmc_hostname(mrq_t->host), mrq_t->req->tag,
+				(unsigned)blk_rq_pos(mrq_t->req),
+				(unsigned)blk_rq_sectors(mrq_t->req),
+				mrq_t->req->retries);
+			blk_end_request_all(mrq_t->req, err);
+		}
+	}
+	spin_unlock_irqrestore(&mq->eh_lock, flags);
+	mmc_blk_cmdq_reset(host, true);
 
-	if ((format_version == 2) && (exec_result == -EINVAL)) {
-		if (astate->config->action == NULL)
-			printk(KERN_ERR "%s: error: no action specified for "
-				"Jam STAPL file.\nprogram terminated.\n",
-				__func__);
-		else
-			printk(KERN_ERR "%s: error: action \"%s\""
-				" is not supported "
-				"for this Jam STAPL file.\n"
-				"Program terminated.\n", __func__,
-				astate->config->action);
-
-	} else if (exec_result)
-		printk(KERN_ERR "%s: error %d\n", __func__, exec_result);
-
-	kfree(astate);
-free_value:
-	kfree(value);
-free_key:
-	kfree(key);
-out:
-	return retval;
+	host->err_mrq = NULL;
+	pm_runtime_mark_last_busy(&card->dev);
+	clear_bit(CMDQ_STATE_ERR, &ctx_info->curr_state);
+	clear_bit(CMDQ_STATE_ERR_HOST, &ctx_info->curr_state);
+	set_bit(CMDQ_STATE_ERR_RCV_DONE, &ctx_info->curr_state);
+	clear_bit(CMDQ_STATE_DCMD_ACTIVE, &ctx_info->curr_state);
+	clear_bit(CMDQ_STATE_DO_RECOVERY, &ctx_info->curr_state);
+	ctx_info->dump_state = CMDQ_DUMP_NONE_ERR;
+	printk("\n\n=============== CQ RECOVERY END ======================\n\n");
+	wake_up(&ctx_info->wait);
+	mmc_put_card(card);
 }
-EXPORT_SYMBOL(altera_init);
+
+/* invoked by block layer in softirq context */
+void mmc_blk_cmdq_complete_rq(struct request *rq)
+{
+	struct mmc_queue_req *mq_rq = rq->special;
+	struct mmc_request *mrq = &mq_rq->cmdq_req.mrq;
+	struct mmc_host *host = mrq->host;
+	struct mmc_cmdq_context_info *ctx_info = &host->cmdq_ctx;
+	struct mmc_cmdq_req *cmdq_req = &mq_rq->cmdq_req;
+	struct mmc_queue *mq = (struct mmc_queue *)rq->q->queuedata;
+	int err = 0;
+	unsigned long flags;
+
+	if (mrq->cmd && mrq->cmd->error)
+		err = mrq->cmd->error;
+	else if (mrq->data && mrq->data->error)
+		err = mrq->data->error;
+	else if (mrq->cmdq_req && mrq->cmdq_req->resp_err)
+		err = mrq->cmdq_req->resp_err;
+
+	/* clear pending request */
+	BUG_ON(!test_and_clear_bit(cmdq_req->tag,
+				   &ctx_info->active_reqs));
+
+	if (!(cmdq_req->cmdq_req_flags & DCMD))
+		BUG_ON(!test_and_clear_bit(cmdq_req->tag,
+			 &ctx_info->data_active_reqs));
+
+	mmc_cmdq_post_req(host, mrq, err);
+
+#if defined(CONFIG_MMC_CQ_HCI) && defined(CONFIG_MMC_DATA_LOG)
+	mmc_blk_cmdq_store_req_log(host->card, rq, &cmdq_req->data, false, err);
+#endif
+
+	/*
+	 * All the host and timed-out errors would come here
+	 * except for discard.
+	 */
+	if (err) {
+		if (host->err_mrq == NULL)
+			host->err_mrq = mrq;
+
+		pr_err("%s: %s: txfr error: %d\n", mmc_hostname(mrq->host),
+		       __func__, err);
+		spin_lock_irqsave(&mq->eh_lock, flags);
+		list_add_tail(&mrq->eh_entry, &mq->eh_mrq);
+		spin_unlock_irqrestore(&mq->eh_lock, flags);
+		if (test_bit(CMDQ_STATE_ERR, &ctx_info->curr_state)) {
+			pr_err("%s: CQ in error state, ending current req: %d\n",
+				__func__, err);
+		} else {
+			set_bit(CMDQ_STATE_ERR, &ctx_info->curr_state);
+			host->cmdq_ops->pclear(host);
+			schedule_work(&mq->cmdq_err_work);
+		}
+		goto err;
+	}
+
+	if (cmdq_req->cmdq_req_flags & DCMD) {
+		clear_bit(CMDQ_STATE_DCMD_ACTIVE, &ctx_info->curr_state);
+		blk_end_request_all(rq, err);
+		goto out;
+	}
+
+	blk_end_request(rq, err, cmdq_req->data.bytes_xfered);
+
+out:
+	if (!test_bit(CMDQ_STATE_ERR, &ctx_info->curr_state))
+		wake_up(&ctx_info->wait);
+
+	mmc_put_card(host->card);
+	if (!ctx_info->active_reqs)
+		wake_up_interruptible(&host->cmdq_ctx.queue_empty_wq);
+
+	if (blk_queue_stopped(mq->queue) && !ctx_info->active_reqs)
+		complete(&mq->cmdq_shutdown_complete);
+
+	return;
+err:
+	mmc_put_card(host->card);
+
+	return;
+}
+
+/*
+ * Complete reqs from block layer softirq context
+ * Invoked in irq context
+ */
+void mmc_blk_cmdq_req_done(struct mmc_request *mrq)
+{
+	struct request *req = mrq->req;
+
+	blk_complete_request(req);
+}
+EXPORT_SYMBOL(mmc_blk_cmdq_req_done);
+
+static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+{
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	struct mmc_blk_request *brq = &mq->mqrq_cur->brq;
+	int ret = 1, disable_multi = 0, retry = 0, type, retune_retry_done = 0;
+	enum mmc_blk_status status;
+	struct mmc_queue_req *mq_rq;
+	struct request *req = rqc;
+	struct mmc_async_req *areq;
+	const u8 packed_nr = 2;
+	u8 reqs = 0;
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+	unsigned long waitfor = jiffies;
+#endif
+
+	if (!rqc && !mq->mqrq_prev->req)
+		return 0;
+
+	if (rqc)
+		reqs = mmc_blk_prep_packed_list(mq, rqc);
+
+	do {
+		if (rqc) {
+			/*
+			 * When 4KB native sector is enabled, only 8 blocks
+			 * multiple read or write is allowed
+			 */
+			if ((brq->data.blocks & 0x07) &&
+			    (card->ext_csd.data_sector_size == 4096)) {
+				pr_err("%s: Transfer size is not 4KB sector size aligned\n",
+					req->rq_disk->disk_name);
+				mq_rq = mq->mqrq_cur;
+				goto cmd_abort;
+			}
+
+			if (reqs >= packed_nr)
+				mmc_blk_packed_hdr_wrq_prep(mq->mqrq_cur,
+							    card, mq);
+			else
+				mmc_blk_rw_rq_prep(mq->mqrq_cur, card, 0, mq);
+			areq = &mq->mqrq_cur->mmc_active;
+		} else
+			areq = NULL;
+		areq = mmc_start_req(card->host, areq, (int *) &status);
+		if (!areq) {
+			if (status == MMC_BLK_NEW_REQUEST)
+				set_bit(MMC_QUEUE_NEW_REQUEST, &mq->flags);
+			return 0;
+		}
+
+		mq_rq = container_of(areq, struct mmc_queue_req, mmc_active);
+		brq = &mq_rq->brq;
+		req = mq_rq->req;
+		type = rq_data_dir(req) == READ ? MMC_BLK_READ : MMC_BLK_WRITE;
+		mmc_queue_bounce_post(mq_rq);
+
+		switch (status) {
+		case MMC_BLK_SUCCESS:
+		case MMC_BLK_PARTIAL:
+			/*
+			 * A block was successfully transferred.
+			 */
+			mmc_blk_reset_success(md, type);
+
+			mmc_blk_simulate_delay(mq, rqc, waitfor);
+
+			if (mmc_packed_cmd(mq_rq->cmd_type)) {
+				ret = mmc_blk_end_packed_req(mq_rq);
+				break;
+			} else {
+				ret = blk_end_request(req, 0,
+						brq->data.bytes_xfered);
+			}
+
+			/*
+			 * If the blk_end_request function returns non-zero even
+			 * though all data has been transferred and no errors
+			 * were returned by the host controller, it's a bug.
+			 */
+			if (status == MMC_BLK_SUCCESS && ret) {
+				pr_err("%s BUG rq_tot %d d_xfer %d\n",
+				       __func__, blk_rq_bytes(req),
+				       brq->data.bytes_xfered);
+				rqc = NULL;
+				goto cmd_abort;
+			}
+			break;
+		case MMC_BLK_CMD_ERR:
+			ret = mmc_blk_cmd_err(md, card, brq, req, ret);
+			if (mmc_blk_reset(md, card->host, type))
+				goto cmd_abort;
+			if (!ret)
+				goto start_new_req;
+			break;
+		case MMC_BLK_RETRY:
+			retune_retry_done = brq->retune_retry_done;
+			if (retry++ < 5)
+				break;
+			/* Fall through */
+		case MMC_BLK_ABORT:
+			if (!mmc_blk_reset(md, card->host, type))
+				break;
+			goto cmd_abort;
+		case MMC_BLK_DATA_ERR: {
+			int err;
+
+			err = mmc_blk_reset(md, card->host, type);
+			if (!err)
+				break;
+			if (err == -ENODEV ||
+				mmc_packed_cmd(mq_rq->cmd_type))
+				goto cmd_abort;
+			/* Fall through */
+		}
+		case MMC_BLK_ECC_ERR:
+			if (brq->data.blocks > 1) {
+				/* Redo read one sector at a time */
+				pr_warn("%s: retrying using single block read\n",
+					req->rq_disk->disk_name);
+				disable_multi = 1;
+				break;
+			}
+			/*
+			 * After an error, we redo I/O one sector at a
+			 * time, so we only reach here after trying to
+			 * read a single sector.
+			 */
+			ret = blk_end_request(req, -EIO,
+						brq->data.blksz);
+			if (!ret)
+				goto start_new_req;
+			break;
+		case MMC_BLK_NOMEDIUM:
+			goto cmd_abort;
+		default:
+			pr_err("%s: Unhandled return value (%d)",
+					req->rq_disk->disk_name, status);
+			goto cmd_abort;
+		}
+
+		if (ret) {
+			if (mmc_packed_cmd(mq_rq->cmd_type)) {
+				if (!mq_rq->packed->retries)
+					goto cmd_abort;
+				mmc_blk_packed_hdr_wrq_prep(mq_rq, card, mq);
+				mmc_start_req(card->host,
+					      &mq_rq->mmc_active, NULL);
+			} else {
+
+				/*
+				 * In case of a incomplete request
+				 * prepare it again and resend.
+				 */
+				mmc_blk_rw_rq_prep(mq_rq, card,
+						disable_multi, mq);
+				mmc_start_req(card->host,
+						&mq_rq->mmc_active, NULL);
+			}
+			mq_rq->brq.retune_retry_done = retune_retry_done;
+		}
+	} while (ret);
+
+	return 1;
+
+ cmd_abort:
+	if (mmc_packed_cmd(mq_rq->cmd_type)) {
+		mmc_blk_abort_packed_req(mq_rq);
+	} else {
+		if (mmc_card_removed(card))
+			req->cmd_flags |= REQ_QUIET;
+		while (ret)
+			ret = blk_end_request(req, -EIO,
+					blk_rq_cur_bytes(req));
+	}
+
+ start_new_req:
+	if (rqc) {
+		if (mmc_card_removed(card)) {
+			rqc->cmd_flags |= REQ_QUIET;
+			blk_end_request_all(rqc, -EIO);
+		} else {
+			/*
+			 * If current request is packed, it needs to put back.
+			 */
+			if (mmc_packed_cmd(mq->mqrq_cur->cmd_type))
+				mmc_blk_revert_packed_req(mq, mq->mqrq_cur);
+
+			mmc_blk_rw_rq_prep(mq->mqrq_cur, card, 0, mq);
+			mmc_start_req(card->host,
+				      &mq->mqrq_cur->mmc_active, NULL);
+		}
+	}
+
+	return 0;
+}
+
+static inline int mmc_blk_cmdq_part_switch(struct mmc_card *card,
+				      struct mmc_blk_data *md)
+{
+	struct mmc_blk_data *main_md = mmc_get_drvdata(card);
+	struct mmc_host *host = card->host;
+	struct mmc_cmdq_context_info *ctx = &host->cmdq_ctx;
+	u8 part_config = card->ext_csd.part_config;
+	int status, ret;
+	u8 *ext_csd;
+
+	if ((main_md->part_curr == md->part_type) &&
+	    (card->part_curr == md->part_type))
+		return 0;
+
+	WARN_ON(!((card->host->caps2 & MMC_CAP2_CMD_QUEUE) &&
+		 card->ext_csd.cmdq_support &&
+		 (md->flags & MMC_BLK_CMD_QUEUE)));
+
+	if (!test_bit(CMDQ_STATE_HALT, &ctx->curr_state))
+		WARN_ON(mmc_cmdq_halt(host, true));
+
+	/* disable CQ mode in card */
+	if (mmc_card_cmdq(card)) {
+		WARN_ON(mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+				 EXT_CSD_CMDQ, 0,
+				  card->ext_csd.generic_cmd6_time));
+		mmc_card_clr_cmdq(card);
+	}
+
+	part_config &= ~EXT_CSD_PART_CONFIG_ACC_MASK;
+	part_config |= md->part_type;
+
+	ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+			 EXT_CSD_PART_CONFIG, part_config,
+			  card->ext_csd.part_time);
+
+	if (ret) {
+			if(ret != -ETIMEDOUT)
+				return ret;
+
+			/* re-check the partition config is changed or not */
+			ret = get_card_status(card, &status, 0);
+			if (ret) {
+				pr_err("%s: error %d requesting status\n",
+			    	   __func__, ret);
+				return ret;
+			}
+			if((R1_CURRENT_STATE(status) == R1_STATE_TRAN)
+				&& (status & R1_READY_FOR_DATA)) {
+				ret = mmc_get_ext_csd(card, &ext_csd);
+				if (ret) {
+					pr_err("%s: error %d sending ext_csd\n",
+			    		   __func__, ret);
+					if(ext_csd != NULL)
+						kfree(ext_csd);
+					return ret;
+				}
+				if (ext_csd[EXT_CSD_PART_CONFIG] == part_config) {
+					pr_info("%s: partition config is changed %d", __func__, part_config);
+					kfree(ext_csd);
+					goto done;
+				}
+			}
+			return ret;
+		}
+done:
+	card->ext_csd.part_config = part_config;
+	card->part_curr = md->part_type;
+
+	main_md->part_curr = md->part_type;
+
+	WARN_ON(mmc_blk_cmdq_switch(card, md, true));
+	WARN_ON(mmc_cmdq_halt(host, false));
+
+	return 0;
+}
+
+static int mmc_blk_cmdq_issue_rq(struct mmc_queue *mq, struct request *req)
+{
+	int ret;
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	unsigned int cmd_flags = req ? req->cmd_flags : 0;
+	struct mmc_host *host = card->host;
+	struct mmc_cmdq_context_info *ctx = &host->cmdq_ctx;
+
+	mmc_get_card(card);
+
+	/* Orphan requests doesn't exist anymore */
+	clear_bit(CMDQ_STATE_ERR_RCV_DONE, &ctx->curr_state);
+
+	if (!card->host->cmdq_ctx.active_reqs && mmc_card_doing_bkops(card)) {
+		ret = mmc_cmdq_halt(card->host, true);
+		if (ret)
+			goto out;
+		ret = mmc_stop_bkops(card);
+		if (ret) {
+			pr_err("%s: %s: mmc_stop_bkops failed %d\n",
+					md->disk->disk_name, __func__, ret);
+			goto out;
+		}
+		ret = mmc_cmdq_halt(card->host, false);
+		if (ret)
+			goto out;
+	}
+
+	ret = mmc_blk_cmdq_part_switch(card, md);
+	if (ret) {
+		pr_err("%s: %s: partition switch failed %d\n",
+				md->disk->disk_name, __func__, ret);
+		goto out;
+	}
+
+	if (req) {
+		if ((cmd_flags & (REQ_FLUSH | REQ_DISCARD)) &&
+		    (card->quirks & MMC_QUIRK_CMDQ_EMPTY_BEFORE_DCMD) &&
+		    ctx->active_small_sector_read_reqs) {
+			ret = wait_event_interruptible(ctx->queue_empty_wq,
+						      !ctx->active_reqs);
+			if (ret) {
+				pr_err("%s: failed while waiting for the CMDQ to be empty %s err (%d)\n",
+					mmc_hostname(host),
+					__func__, ret);
+				BUG_ON(1);
+			}
+			/* clear the counter now */
+			ctx->active_small_sector_read_reqs = 0;
+			/*
+			 * If there were small sector (less than 8 sectors) read
+			 * operations in progress then we have to wait for the
+			 * outstanding requests to finish and should also have
+			 * atleast 6 microseconds delay before queuing the DCMD
+			 * request.
+			 */
+			udelay(MMC_QUIRK_CMDQ_DELAY_BEFORE_DCMD);
+		}
+
+		if (cmd_flags & REQ_DISCARD) {
+			if (cmd_flags & REQ_SECURE &&
+			   !(card->quirks & MMC_QUIRK_SEC_ERASE_TRIM_BROKEN))
+				ret = mmc_blk_cmdq_issue_secdiscard_rq(mq, req);
+			else
+				ret = mmc_blk_cmdq_issue_discard_rq(mq, req);
+		} else if (cmd_flags & REQ_FLUSH) {
+			ret = mmc_blk_cmdq_issue_flush_rq(mq, req);
+		} else {
+			ret = mmc_blk_cmdq_issue_rw_rq(mq, req);
+		}
+	}
+
+	return ret;
+
+out:
+	if (req)
+		blk_end_request_all(req, ret);
+	mmc_put_card(card);
+
+	return ret;
+}
+
+static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+{
+	int ret;
+	struct mmc_blk_data *md = mq->data;
+	struct mmc_card *card = md->queue.card;
+	struct mmc_host *host = card->host;
+	unsigned long flags;
+	unsigned int cmd_flags = req ? req->cmd_flags : 0;
+
+	if (req && !mq->mqrq_prev->req) {
+		/* claim host only for the first request */
+		mmc_get_card(card);
+#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
+		if (mmc_bus_needs_resume(card->host))
+			mmc_resume_bus(card->host);
+#endif
+	}
+
+	ret = mmc_blk_part_switch(card, md);
+	if (ret) {
+		if (req) {
+			blk_end_request_all(req, -EIO);
+		}
+		ret = 0;
+		goto out;
+	}
+
+	clear_bit(MMC_QUEUE_NEW_REQUEST, &mq->flags);
+	if (cmd_flags & REQ_DISCARD) {
+		/* complete ongoing async transfer before issuing discard */
+		if (card->host->areq)
+			mmc_blk_issue_rw_rq(mq, NULL);
+		if (req->cmd_flags & REQ_SECURE)
+			ret = mmc_blk_issue_secdiscard_rq(mq, req);
+		else
+			ret = mmc_blk_issue_discard_rq(mq, req);
+	} else if (cmd_flags & (REQ_FLUSH | REQ_BARRIER)) {
+		/* complete ongoing async transfer before issuing flush */
+		if (card->host->areq)
+			mmc_blk_issue_rw_rq(mq, NULL);
+		ret = mmc_blk_issue_flush(mq, req);
+	} else {
+		if (!req && host->areq) {
+			spin_lock_irqsave(&host->context_info.lock, flags);
+			host->context_info.is_waiting_last_req = true;
+			spin_unlock_irqrestore(&host->context_info.lock, flags);
+		}
+		ret = mmc_blk_issue_rw_rq(mq, req);
+	}
+
+out:
+	if ((!req && !(test_bit(MMC_QUEUE_NEW_REQUEST, &mq->flags))) ||
+	     (cmd_flags & MMC_REQ_SPECIAL_MASK))
+		/*
+		 * Release host when there are no more requests
+		 * and after special request(discard, flush) is done.
+		 * In case sepecial request, there is no reentry to
+		 * the 'mmc_blk_issue_rq' with 'mqrq_prev->req'.
+		 */
+		mmc_put_card(card);
+	return ret;
+}
+
+static inline int mmc_blk_readonly(struct mmc_card *card)
+{
+	return mmc_card_readonly(card) ||
+	       !(card->csd.cmdclass & CCC_BLOCK_WRITE);
+}
+
+static struct mmc_blk_data *mmc_blk_alloc_req(struct mmc_card *card,
+					      struct device *parent,
+					      sector_t size,
+					      bool default_ro,
+					      const char *subname,
+					      int area_type)
+{
+	struct mmc_blk_data *md;
+	int devidx, ret;
+
+	devidx = find_first_zero_bit(dev_use, max_devices);
+	if (devidx >= max_devices)
+		return ERR_PTR(-ENOSPC);
+	__set_bit(devidx, dev_use);
+
+	md = kzalloc(sizeof(struct mmc_blk_data), GFP_KERNEL);
+	if (!md) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/*
+	 * !subname implies we are creating main mmc_blk_data that will be
+	 * associated with mmc_card with dev_set_drvdata. Due to device
+	 * partitions, devidx will not coincide with a per-physical card
+	 * index anymore so we keep track of a name index.
+	 */
+	if (!subname) {
+		md->name_idx = find_first_zero_bit(name_use, max_devices);
+		__set_bit(md->name_idx, name_use);
+	} else
+		md->name_idx = ((struct mmc_blk_data *)
+				dev_to_disk(parent)->private_data)->name_idx;
+
+	md->area_type = area_type;
+
+	/*
+	 * Set the read-only status based on the supported commands
+	 * and the write protect switch.
+	 */
+	md->read_only = mmc_blk_readonly(card);
+
+	md->disk = alloc_disk(perdev_minors);
+	if (md->disk == NULL) {
+		ret = -ENOMEM;
+		goto err_kfree;
+	}
+
+	spin_lock_init(&md->lock);
+	INIT_LIST_HEAD(&md->part);
+	md->usage = 1;
+
+	ret = mmc_init_queue(&md->queue, card, &md->lock, subname, area_type);
+	if (ret)
+		goto err_putdisk;
+
+	md->queue.issue_fn = mmc_blk_issue_rq;
+	md->queue.data = md;
+
+	md->disk->major	= MMC_BLOCK_MAJOR;
+	md->disk->first_minor = devidx * perdev_minors;
+	md->disk->fops = &mmc_bdops;
+	md->disk->private_data = md;
+	md->disk->queue = md->queue.queue;
+	md->disk->driverfs_dev = parent;
+	set_disk_ro(md->disk, md->read_only || default_ro);
+	md->disk->flags = GENHD_FL_EXT_DEVT;
+	if (area_type & (MMC_BLK_DATA_AREA_RPMB | MMC_BLK_DATA_AREA_BOOT))
+		md->disk->flags |= GENHD_FL_NO_PART_SCAN;
+
+	/*
+	 * As discussed on lkml, GENHD_FL_REMOVABLE should:
+	 *
+	 * - be set for removable media with permanent block devices
+	 * - be unset for removable block devices with permanent media
+	 *
+	 * Since MMC block devices clearly fall under the second
+	 * case, we do not set GENHD_FL_REMOVABLE.  Userspace
+	 * should use the block device creation/destruction hotplug
+	 * messages to tell when the card is present.
+	 */
+
+	snprintf(md->disk->disk_name, sizeof(md->disk->disk_name),
+		 "mmcblk%u%s", md->name_idx, subname ? subname : "");
+
+	if (mmc_card_mmc(card))
+		blk_queue_logical_block_size(md->queue.queue,
+					     card->ext_csd.data_sector_size);
+	else
+		blk_queue_logical_block_size(md->queue.queue, 512);
+
+	set_capacity(md->disk, size);
+
+	if (mmc_host_cmd23(card->host)) {
+		if ((mmc_card_mmc(card) &&
+		     card->csd.mmca_vsn >= CSD_SPEC_VER_3) ||
+		    (mmc_card_sd(card) &&
+		     card->scr.cmds & SD_SCR_CMD23_SUPPORT &&
+			 mmc_card_uhs(card)))
+			md->flags |= MMC_BLK_CMD23;
+	}
+
+	if (mmc_card_mmc(card) &&
+	    md->flags & MMC_BLK_CMD23 &&
+	    ((card->ext_csd.rel_param & EXT_CSD_WR_REL_PARAM_EN) ||
+	     card->ext_csd.rel_sectors)) {
+		md->flags |= MMC_BLK_REL_WR;
+		blk_queue_flush(md->queue.queue, REQ_FLUSH | REQ_FUA);
+	}
+
+	if (card->cmdq_init) {
+		md->flags |= MMC_BLK_CMD_QUEUE;
+		md->queue.cmdq_complete_fn = mmc_blk_cmdq_complete_rq;
+		md->queue.cmdq_issue_fn = mmc_blk_cmdq_issue_rq;
+		md->queue.cmdq_error_fn = mmc_blk_cmdq_err;
+		md->queue.cmdq_req_timed_out = mmc_blk_cmdq_req_timed_out;
+		md->queue.cmdq_shutdown = mmc_blk_cmdq_shutdown;
+	}
+
+	if (mmc_card_mmc(card) && !card->cmdq_init &&
+	    (area_type == MMC_BLK_DATA_AREA_MAIN) &&
+	    (md->flags & MMC_BLK_CMD23) &&
+	    card->ext_csd.packed_event_en) {
+		if (!mmc_packed_init(&md->queue, card))
+			md->flags |= MMC_BLK_PACKED_CMD;
+	}
+
+	return md;
+
+ err_putdisk:
+	put_disk(md->disk);
+ err_kfree:
+	kfree(md);
+ out:
+	return ERR_PTR(ret);
+}
+
+static struct mmc_blk_data *mmc_blk_alloc(struct mmc_card *card)
+{
+	sector_t size;
+
+	if (!mmc_card_sd(card) && mmc_card_blockaddr(card)) {
+		/*
+		 * The EXT_CSD sector count is in number or 512 byte
+		 * sectors.
+		 */
+		size = card->ext_csd.sectors;
+	} else {
+		/*
+		 * The CSD capacity field is in units of read_blkbits.
+		 * set_capacity takes units of 512 bytes.
+		 */
+		size = (typeof(sector_t))card->csd.capacity
+			<< (card->csd.read_blkbits - 9);
+	}
+
+	return mmc_blk_alloc_req(card, &card->dev, size, false, NULL,
+					MMC_BLK_DATA_AREA_MAIN);
+}
+
+static int mmc_blk_alloc_part(struct mmc_card *card,
+			      struct mmc_blk_data *md,
+			      unsigned int part_type,
+			      sector_t size,
+			      bool default_ro,
+			      const char *subname,
+			      int area_type)
+{
+	char cap_str[10];
+	struct mmc_blk_data *part_md;
+
+	part_md = mmc_blk_alloc_req(card, disk_to_dev(md->disk), size, default_ro,
+				    subname, area_type);
+	if (IS_ERR(part_md))
+		return PTR_ERR(part_md);
+	part_md->part_type = part_type;
+	list_add(&part_md->part, &md->part);
+
+	string_get_size((u64)get_capacity(part_md->disk), 512, STRING_UNITS_2,
+			cap_str, sizeof(cap_str));
+	pr_info("%s: %s %s partition %u %s\n",
+	       part_md->disk->disk_name, mmc_card_id(card),
+	       mmc_card_name(card), part_md->part_type, cap_str);
+	return 0;
+}
+
+/* MMC Physical partitions consist of two boot partitions and
+ * up to four general purpose partitions.
+ * For each partition enabled in EXT_CSD a block device will be allocatedi
+ * to provide access to the partition.
+ */
+
+static int mmc_blk_alloc_parts(struct mmc_card *card, struct mmc_blk_data *md)
+{
+	int idx, ret = 0;
+
+	if (!mmc_card_mmc(card))
+		return 0;
+
+	for (idx = 0; idx < card->nr_parts; idx++) {
+		if (card->part[idx].size) {
+			ret = mmc_blk_alloc_part(card, md,
+				card->part[idx].part_cfg,
+				card->part[idx].size >> 9,
+				card->part[idx].force_ro,
+				card->part[idx].name,
+				card->part[idx].area_type);
+			if (ret)
+				return ret;
+		}
+	}
+
+	return ret;
+}
+
+static void mmc_blk_remove_req(struct mmc_blk_data *md)
+{
+	struct mmc_card *card;
+
+	if (md) {
+		/*
+		 * Flush remaining requests and free queues. It
+		 * is freeing the queue that stops new requests
+		 * from being accepted.
+		 */
+		card = md->queue.card;
+		mmc_cleanup_queue(&md->queue);
+		if (md->flags & MMC_BLK_PACKED_CMD)
+			mmc_packed_clean(&md->queue);
+		if (md->flags & MMC_BLK_CMD_QUEUE)
+			mmc_cmdq_clean(&md->queue, card);
+		if (md->disk->flags & GENHD_FL_UP) {
+			device_remove_file(disk_to_dev(md->disk), &md->force_ro);
+			if ((md->area_type & MMC_BLK_DATA_AREA_BOOT) &&
+					card->ext_csd.boot_ro_lockable)
+				device_remove_file(disk_to_dev(md->disk),
+					&md->power_ro_lock);
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+			device_remove_file(disk_to_dev(md->disk),
+						&dev_attr_max_write_speed);
+			device_remove_file(disk_to_dev(md->disk),
+						&dev_attr_max_read_speed);
+			device_remove_file(disk_to_dev(md->disk),
+						&dev_attr_cache_size);
+#endif
+
+			del_gendisk(md->disk);
+		}
+		mmc_blk_put(md);
+	}
+}
+
+static void mmc_blk_remove_parts(struct mmc_card *card,
+				 struct mmc_blk_data *md)
+{
+	struct list_head *pos, *q;
+	struct mmc_blk_data *part_md;
+
+	__clear_bit(md->name_idx, name_use);
+	list_for_each_safe(pos, q, &md->part) {
+		part_md = list_entry(pos, struct mmc_blk_data, part);
+		list_del(pos);
+		mmc_blk_remove_req(part_md);
+	}
+}
+
+static int mmc_add_disk(struct mmc_blk_data *md)
+{
+	int ret;
+	struct mmc_card *card = md->queue.card;
+
+	add_disk(md->disk);
+	md->force_ro.show = force_ro_show;
+	md->force_ro.store = force_ro_store;
+	sysfs_attr_init(&md->force_ro.attr);
+	md->force_ro.attr.name = "force_ro";
+	md->force_ro.attr.mode = S_IRUGO | S_IWUSR;
+	ret = device_create_file(disk_to_dev(md->disk), &md->force_ro);
+	if (ret)
+		goto force_ro_fail;
+#ifdef CONFIG_MMC_SIMULATE_MAX_SPEED
+	atomic_set(&md->queue.max_write_speed, max_write_speed);
+	ret = device_create_file(disk_to_dev(md->disk),
+			&dev_attr_max_write_speed);
+	if (ret)
+		goto max_write_speed_fail;
+	atomic_set(&md->queue.max_read_speed, max_read_speed);
+	ret = device_create_file(disk_to_dev(md->disk),
+			&dev_attr_max_read_speed);
+	if (ret)
+		goto max_read_speed_fail;
+	atomic_set(&md->queue.cache_size, cache_size);
+	atomic_long_set(&md->queue.cache_used, 0);
+	md->queue.cache_jiffies = jiffies;
+	ret = device_create_file(disk_to_dev(md->disk), &dev_attr_c

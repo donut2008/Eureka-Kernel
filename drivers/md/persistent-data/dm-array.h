@@ -1,166 +1,104 @@
-/*
- * Copyright (C) 2012 Red Hat, Inc.
- *
- * This file is released under the GPL.
- */
-#ifndef _LINUX_DM_ARRAY_H
-#define _LINUX_DM_ARRAY_H
-
-#include "dm-btree.h"
-
-/*----------------------------------------------------------------*/
-
-/*
- * The dm-array is a persistent version of an array.  It packs the data
- * more efficiently than a btree which will result in less disk space use,
- * and a performance boost.  The element get and set operations are still
- * O(ln(n)), but with a much smaller constant.
- *
- * The value type structure is reused from the btree type to support proper
- * reference counting of values.
- *
- * The arrays implicitly know their length, and bounds are checked for
- * lookups and updated.  It doesn't store this in an accessible place
- * because it would waste a whole metadata block.  Make sure you store the
- * size along with the array root in your encompassing data.
- *
- * Array entries are indexed via an unsigned integer starting from zero.
- * Arrays are not sparse; if you resize an array to have 'n' entries then
- * 'n - 1' will be the last valid index.
- *
- * Typical use:
- *
- * a) initialise a dm_array_info structure.  This describes the array
- *    values and ties it into a specific transaction manager.  It holds no
- *    instance data; the same info can be used for many similar arrays if
- *    you wish.
- *
- * b) Get yourself a root.  The root is the index of a block of data on the
- *    disk that holds a particular instance of an array.  You may have a
- *    pre existing root in your metadata that you wish to use, or you may
- *    want to create a brand new, empty array with dm_array_empty().
- *
- * Like the other data structures in this library, dm_array objects are
- * immutable between transactions.  Update functions will return you the
- * root for a _new_ array.  If you've incremented the old root, via
- * dm_tm_inc(), before calling the update function you may continue to use
- * it in parallel with the new root.
- *
- * c) resize an array with dm_array_resize().
- *
- * d) Get a value from the array with dm_array_get_value().
- *
- * e) Set a value in the array with dm_array_set_value().
- *
- * f) Walk an array of values in index order with dm_array_walk().  More
- *    efficient than making many calls to dm_array_get_value().
- *
- * g) Destroy the array with dm_array_del().  This tells the transaction
- *    manager that you're no longer using this data structure so it can
- *    recycle it's blocks.  (dm_array_dec() would be a better name for it,
- *    but del is in keeping with dm_btree_del()).
- */
-
-/*
- * Describes an array.  Don't initialise this structure yourself, use the
- * init function below.
- */
-struct dm_array_info {
-	struct dm_transaction_manager *tm;
-	struct dm_btree_value_type value_type;
-	struct dm_btree_info btree_info;
-};
-
-/*
- * Sets up a dm_array_info structure.  You don't need to do anything with
- * this structure when you finish using it.
- *
- * info - the structure being filled in.
- * tm   - the transaction manager that should supervise this structure.
- * vt   - describes the leaf values.
- */
-void dm_array_info_init(struct dm_array_info *info,
-			struct dm_transaction_manager *tm,
-			struct dm_btree_value_type *vt);
-
-/*
- * Create an empty, zero length array.
- *
- * info - describes the array
- * root - on success this will be filled out with the root block
- */
-int dm_array_empty(struct dm_array_info *info, dm_block_t *root);
-
-/*
- * Resizes the array.
- *
- * info - describes the array
- * root - the root block of the array on disk
- * old_size - the caller is responsible for remembering the size of
- *            the array
- * new_size - can be bigger or smaller than old_size
- * value - if we're growing the array the new entries will have this value
- * new_root - on success, points to the new root block
- *
- * If growing the inc function for 'value' will be called the appropriate
- * number of times.  So if the caller is holding a reference they may want
- * to drop it.
- */
-int dm_array_resize(struct dm_array_info *info, dm_block_t root,
-		    uint32_t old_size, uint32_t new_size,
-		    const void *value, dm_block_t *new_root)
-	__dm_written_to_disk(value);
-
-/*
- * Frees a whole array.  The value_type's decrement operation will be called
- * for all values in the array
- */
-int dm_array_del(struct dm_array_info *info, dm_block_t root);
-
-/*
- * Lookup a value in the array
- *
- * info - describes the array
- * root - root block of the array
- * index - array index
- * value - the value to be read.  Will be in on-disk format of course.
- *
- * -ENODATA will be returned if the index is out of bounds.
- */
-int dm_array_get_value(struct dm_array_info *info, dm_block_t root,
-		       uint32_t index, void *value);
-
-/*
- * Set an entry in the array.
- *
- * info - describes the array
- * root - root block of the array
- * index - array index
- * value - value to be written to disk.  Make sure you confirm the value is
- *         in on-disk format with__dm_bless_for_disk() before calling.
- * new_root - the new root block
- *
- * The old value being overwritten will be decremented, the new value
- * incremented.
- *
- * -ENODATA will be returned if the index is out of bounds.
- */
-int dm_array_set_value(struct dm_array_info *info, dm_block_t root,
-		       uint32_t index, const void *value, dm_block_t *new_root)
-	__dm_written_to_disk(value);
-
-/*
- * Walk through all the entries in an array.
- *
- * info - describes the array
- * root - root block of the array
- * fn - called back for every element
- * context - passed to the callback
- */
-int dm_array_walk(struct dm_array_info *info, dm_block_t root,
-		  int (*fn)(void *context, uint64_t key, void *leaf),
-		  void *context);
-
-/*----------------------------------------------------------------*/
-
-#endif	/* _LINUX_DM_ARRAY_H */
+0__SDMA1_UCODE_ADDR_MASK 0x1
+#define SDMA1_PUB_REG_TYPE0__SDMA1_UCODE_ADDR__SHIFT 0x0
+#define SDMA1_PUB_REG_TYPE0__SDMA1_UCODE_DATA_MASK 0x2
+#define SDMA1_PUB_REG_TYPE0__SDMA1_UCODE_DATA__SHIFT 0x1
+#define SDMA1_PUB_REG_TYPE0__SDMA1_POWER_CNTL_MASK 0x4
+#define SDMA1_PUB_REG_TYPE0__SDMA1_POWER_CNTL__SHIFT 0x2
+#define SDMA1_PUB_REG_TYPE0__SDMA1_CLK_CTRL_MASK 0x8
+#define SDMA1_PUB_REG_TYPE0__SDMA1_CLK_CTRL__SHIFT 0x3
+#define SDMA1_PUB_REG_TYPE0__SDMA1_CNTL_MASK 0x10
+#define SDMA1_PUB_REG_TYPE0__SDMA1_CNTL__SHIFT 0x4
+#define SDMA1_PUB_REG_TYPE0__SDMA1_CHICKEN_BITS_MASK 0x20
+#define SDMA1_PUB_REG_TYPE0__SDMA1_CHICKEN_BITS__SHIFT 0x5
+#define SDMA1_PUB_REG_TYPE0__SDMA1_TILING_CONFIG_MASK 0x40
+#define SDMA1_PUB_REG_TYPE0__SDMA1_TILING_CONFIG__SHIFT 0x6
+#define SDMA1_PUB_REG_TYPE0__SDMA1_HASH_MASK 0x80
+#define SDMA1_PUB_REG_TYPE0__SDMA1_HASH__SHIFT 0x7
+#define SDMA1_PUB_REG_TYPE0__SDMA1_SEM_WAIT_FAIL_TIMER_CNTL_MASK 0x200
+#define SDMA1_PUB_REG_TYPE0__SDMA1_SEM_WAIT_FAIL_TIMER_CNTL__SHIFT 0x9
+#define SDMA1_PUB_REG_TYPE0__SDMA1_RB_RPTR_FETCH_MASK 0x400
+#define SDMA1_PUB_REG_TYPE0__SDMA1_RB_RPTR_FETCH__SHIFT 0xa
+#define SDMA1_PUB_REG_TYPE0__SDMA1_IB_OFFSET_FETCH_MASK 0x800
+#define SDMA1_PUB_REG_TYPE0__SDMA1_IB_OFFSET_FETCH__SHIFT 0xb
+#define SDMA1_PUB_REG_TYPE0__SDMA1_PROGRAM_MASK 0x1000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_PROGRAM__SHIFT 0xc
+#define SDMA1_PUB_REG_TYPE0__SDMA1_STATUS_REG_MASK 0x2000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_STATUS_REG__SHIFT 0xd
+#define SDMA1_PUB_REG_TYPE0__SDMA1_STATUS1_REG_MASK 0x4000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_STATUS1_REG__SHIFT 0xe
+#define SDMA1_PUB_REG_TYPE0__SDMA1_RD_BURST_CNTL_MASK 0x8000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_RD_BURST_CNTL__SHIFT 0xf
+#define SDMA1_PUB_REG_TYPE0__RESERVED_16_MASK 0x10000
+#define SDMA1_PUB_REG_TYPE0__RESERVED_16__SHIFT 0x10
+#define SDMA1_PUB_REG_TYPE0__RESERVED_17_MASK 0x20000
+#define SDMA1_PUB_REG_TYPE0__RESERVED_17__SHIFT 0x11
+#define SDMA1_PUB_REG_TYPE0__SDMA1_F32_CNTL_MASK 0x40000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_F32_CNTL__SHIFT 0x12
+#define SDMA1_PUB_REG_TYPE0__SDMA1_FREEZE_MASK 0x80000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_FREEZE__SHIFT 0x13
+#define SDMA1_PUB_REG_TYPE0__SDMA1_PHASE0_QUANTUM_MASK 0x100000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_PHASE0_QUANTUM__SHIFT 0x14
+#define SDMA1_PUB_REG_TYPE0__SDMA1_PHASE1_QUANTUM_MASK 0x200000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_PHASE1_QUANTUM__SHIFT 0x15
+#define SDMA1_PUB_REG_TYPE0__VOID_REG0_MASK 0x3c00000
+#define SDMA1_PUB_REG_TYPE0__VOID_REG0__SHIFT 0x16
+#define SDMA1_PUB_REG_TYPE0__SDMA1_EDC_CONFIG_MASK 0x4000000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_EDC_CONFIG__SHIFT 0x1a
+#define SDMA1_PUB_REG_TYPE0__SDMA1_BA_THRESHOLD_MASK 0x8000000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_BA_THRESHOLD__SHIFT 0x1b
+#define SDMA1_PUB_REG_TYPE0__SDMA1_DEVICE_ID_MASK 0x10000000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_DEVICE_ID__SHIFT 0x1c
+#define SDMA1_PUB_REG_TYPE0__SDMA1_VERSION_MASK 0x20000000
+#define SDMA1_PUB_REG_TYPE0__SDMA1_VERSION__SHIFT 0x1d
+#define SDMA1_PUB_REG_TYPE0__RESERVED_MASK 0xc0000000
+#define SDMA1_PUB_REG_TYPE0__RESERVED__SHIFT 0x1e
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VM_CNTL_MASK 0x1
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VM_CNTL__SHIFT 0x0
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VM_CTX_LO_MASK 0x2
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VM_CTX_LO__SHIFT 0x1
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VM_CTX_HI_MASK 0x4
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VM_CTX_HI__SHIFT 0x2
+#define SDMA1_PUB_REG_TYPE1__SDMA1_STATUS2_REG_MASK 0x8
+#define SDMA1_PUB_REG_TYPE1__SDMA1_STATUS2_REG__SHIFT 0x3
+#define SDMA1_PUB_REG_TYPE1__SDMA1_ACTIVE_FCN_ID_MASK 0x10
+#define SDMA1_PUB_REG_TYPE1__SDMA1_ACTIVE_FCN_ID__SHIFT 0x4
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VM_CTX_CNTL_MASK 0x20
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VM_CTX_CNTL__SHIFT 0x5
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VIRT_RESET_REQ_MASK 0x40
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VIRT_RESET_REQ__SHIFT 0x6
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VF_ENABLE_MASK 0x80
+#define SDMA1_PUB_REG_TYPE1__SDMA1_VF_ENABLE__SHIFT 0x7
+#define SDMA1_PUB_REG_TYPE1__SDMA1_ATOMIC_CNTL_MASK 0x100
+#define SDMA1_PUB_REG_TYPE1__SDMA1_ATOMIC_CNTL__SHIFT 0x8
+#define SDMA1_PUB_REG_TYPE1__SDMA1_ATOMIC_PREOP_LO_MASK 0x200
+#define SDMA1_PUB_REG_TYPE1__SDMA1_ATOMIC_PREOP_LO__SHIFT 0x9
+#define SDMA1_PUB_REG_TYPE1__SDMA1_ATOMIC_PREOP_HI_MASK 0x400
+#define SDMA1_PUB_REG_TYPE1__SDMA1_ATOMIC_PREOP_HI__SHIFT 0xa
+#define SDMA1_PUB_REG_TYPE1__RESERVED_MASK 0xfffff800
+#define SDMA1_PUB_REG_TYPE1__RESERVED__SHIFT 0xb
+#define SDMA1_GFX_RB_CNTL__RB_ENABLE_MASK 0x1
+#define SDMA1_GFX_RB_CNTL__RB_ENABLE__SHIFT 0x0
+#define SDMA1_GFX_RB_CNTL__RB_SIZE_MASK 0x3e
+#define SDMA1_GFX_RB_CNTL__RB_SIZE__SHIFT 0x1
+#define SDMA1_GFX_RB_CNTL__RB_SWAP_ENABLE_MASK 0x200
+#define SDMA1_GFX_RB_CNTL__RB_SWAP_ENABLE__SHIFT 0x9
+#define SDMA1_GFX_RB_CNTL__RPTR_WRITEBACK_ENABLE_MASK 0x1000
+#define SDMA1_GFX_RB_CNTL__RPTR_WRITEBACK_ENABLE__SHIFT 0xc
+#define SDMA1_GFX_RB_CNTL__RPTR_WRITEBACK_SWAP_ENABLE_MASK 0x2000
+#define SDMA1_GFX_RB_CNTL__RPTR_WRITEBACK_SWAP_ENABLE__SHIFT 0xd
+#define SDMA1_GFX_RB_CNTL__RPTR_WRITEBACK_TIMER_MASK 0x1f0000
+#define SDMA1_GFX_RB_CNTL__RPTR_WRITEBACK_TIMER__SHIFT 0x10
+#define SDMA1_GFX_RB_CNTL__RB_PRIV_MASK 0x800000
+#define SDMA1_GFX_RB_CNTL__RB_PRIV__SHIFT 0x17
+#define SDMA1_GFX_RB_CNTL__RB_VMID_MASK 0xf000000
+#define SDMA1_GFX_RB_CNTL__RB_VMID__SHIFT 0x18
+#define SDMA1_GFX_RB_BASE__ADDR_MASK 0xffffffff
+#define SDMA1_GFX_RB_BASE__ADDR__SHIFT 0x0
+#define SDMA1_GFX_RB_BASE_HI__ADDR_MASK 0xffffff
+#define SDMA1_GFX_RB_BASE_HI__ADDR__SHIFT 0x0
+#define SDMA1_GFX_RB_RPTR__OFFSET_MASK 0xfffffffc
+#define SDMA1_GFX_RB_RPTR__OFFSET__SHIFT 0x2
+#define SDMA1_GFX_RB_WPTR__OFFSET_MASK 0xfffffffc
+#define SDMA1_GFX_RB_WPTR__OFFSET__SHIFT 0x2
+#define SDMA1_GFX_RB_WPTR_POLL_CNTL__ENABLE_MASK 0x1
+#define SDMA1_GFX_RB_WPT

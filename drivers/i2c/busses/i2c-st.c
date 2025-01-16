@@ -1,879 +1,849 @@
-/*
- * Copyright (C) 2013 STMicroelectronics
- *
- * I2C master mode controller driver, used in STMicroelectronics devices.
- *
- * Author: Maxime Coquelin <maxime.coquelin@st.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2, as
- * published by the Free Software Foundation.
- */
-
-#include <linux/clk.h>
-#include <linux/delay.h>
-#include <linux/err.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/of_address.h>
-#include <linux/of_irq.h>
-#include <linux/of.h>
-#include <linux/pinctrl/consumer.h>
-#include <linux/platform_device.h>
-
-/* SSC registers */
-#define SSC_BRG				0x000
-#define SSC_TBUF			0x004
-#define SSC_RBUF			0x008
-#define SSC_CTL				0x00C
-#define SSC_IEN				0x010
-#define SSC_STA				0x014
-#define SSC_I2C				0x018
-#define SSC_SLAD			0x01C
-#define SSC_REP_START_HOLD		0x020
-#define SSC_START_HOLD			0x024
-#define SSC_REP_START_SETUP		0x028
-#define SSC_DATA_SETUP			0x02C
-#define SSC_STOP_SETUP			0x030
-#define SSC_BUS_FREE			0x034
-#define SSC_TX_FSTAT			0x038
-#define SSC_RX_FSTAT			0x03C
-#define SSC_PRE_SCALER_BRG		0x040
-#define SSC_CLR				0x080
-#define SSC_NOISE_SUPP_WIDTH		0x100
-#define SSC_PRSCALER			0x104
-#define SSC_NOISE_SUPP_WIDTH_DATAOUT	0x108
-#define SSC_PRSCALER_DATAOUT		0x10c
-
-/* SSC Control */
-#define SSC_CTL_DATA_WIDTH_9		0x8
-#define SSC_CTL_DATA_WIDTH_MSK		0xf
-#define SSC_CTL_BM			0xf
-#define SSC_CTL_HB			BIT(4)
-#define SSC_CTL_PH			BIT(5)
-#define SSC_CTL_PO			BIT(6)
-#define SSC_CTL_SR			BIT(7)
-#define SSC_CTL_MS			BIT(8)
-#define SSC_CTL_EN			BIT(9)
-#define SSC_CTL_LPB			BIT(10)
-#define SSC_CTL_EN_TX_FIFO		BIT(11)
-#define SSC_CTL_EN_RX_FIFO		BIT(12)
-#define SSC_CTL_EN_CLST_RX		BIT(13)
-
-/* SSC Interrupt Enable */
-#define SSC_IEN_RIEN			BIT(0)
-#define SSC_IEN_TIEN			BIT(1)
-#define SSC_IEN_TEEN			BIT(2)
-#define SSC_IEN_REEN			BIT(3)
-#define SSC_IEN_PEEN			BIT(4)
-#define SSC_IEN_AASEN			BIT(6)
-#define SSC_IEN_STOPEN			BIT(7)
-#define SSC_IEN_ARBLEN			BIT(8)
-#define SSC_IEN_NACKEN			BIT(10)
-#define SSC_IEN_REPSTRTEN		BIT(11)
-#define SSC_IEN_TX_FIFO_HALF		BIT(12)
-#define SSC_IEN_RX_FIFO_HALF_FULL	BIT(14)
-
-/* SSC Status */
-#define SSC_STA_RIR			BIT(0)
-#define SSC_STA_TIR			BIT(1)
-#define SSC_STA_TE			BIT(2)
-#define SSC_STA_RE			BIT(3)
-#define SSC_STA_PE			BIT(4)
-#define SSC_STA_CLST			BIT(5)
-#define SSC_STA_AAS			BIT(6)
-#define SSC_STA_STOP			BIT(7)
-#define SSC_STA_ARBL			BIT(8)
-#define SSC_STA_BUSY			BIT(9)
-#define SSC_STA_NACK			BIT(10)
-#define SSC_STA_REPSTRT			BIT(11)
-#define SSC_STA_TX_FIFO_HALF		BIT(12)
-#define SSC_STA_TX_FIFO_FULL		BIT(13)
-#define SSC_STA_RX_FIFO_HALF		BIT(14)
-
-/* SSC I2C Control */
-#define SSC_I2C_I2CM			BIT(0)
-#define SSC_I2C_STRTG			BIT(1)
-#define SSC_I2C_STOPG			BIT(2)
-#define SSC_I2C_ACKG			BIT(3)
-#define SSC_I2C_AD10			BIT(4)
-#define SSC_I2C_TXENB			BIT(5)
-#define SSC_I2C_REPSTRTG		BIT(11)
-#define SSC_I2C_SLAVE_DISABLE		BIT(12)
-
-/* SSC Tx FIFO Status */
-#define SSC_TX_FSTAT_STATUS		0x07
-
-/* SSC Rx FIFO Status */
-#define SSC_RX_FSTAT_STATUS		0x07
-
-/* SSC Clear bit operation */
-#define SSC_CLR_SSCAAS			BIT(6)
-#define SSC_CLR_SSCSTOP			BIT(7)
-#define SSC_CLR_SSCARBL			BIT(8)
-#define SSC_CLR_NACK			BIT(10)
-#define SSC_CLR_REPSTRT			BIT(11)
-
-/* SSC Clock Prescaler */
-#define SSC_PRSC_VALUE			0x0f
-
-
-#define SSC_TXFIFO_SIZE			0x8
-#define SSC_RXFIFO_SIZE			0x8
-
-enum st_i2c_mode {
-	I2C_MODE_STANDARD,
-	I2C_MODE_FAST,
-	I2C_MODE_END,
-};
-
-/**
- * struct st_i2c_timings - per-Mode tuning parameters
- * @rate: I2C bus rate
- * @rep_start_hold: I2C repeated start hold time requirement
- * @rep_start_setup: I2C repeated start set up time requirement
- * @start_hold: I2C start hold time requirement
- * @data_setup_time: I2C data set up time requirement
- * @stop_setup_time: I2C stop set up time requirement
- * @bus_free_time: I2C bus free time requirement
- * @sda_pulse_min_limit: I2C SDA pulse mini width limit
- */
-struct st_i2c_timings {
-	u32 rate;
-	u32 rep_start_hold;
-	u32 rep_start_setup;
-	u32 start_hold;
-	u32 data_setup_time;
-	u32 stop_setup_time;
-	u32 bus_free_time;
-	u32 sda_pulse_min_limit;
-};
-
-/**
- * struct st_i2c_client - client specific data
- * @addr: 8-bit slave addr, including r/w bit
- * @count: number of bytes to be transfered
- * @xfered: number of bytes already transferred
- * @buf: data buffer
- * @result: result of the transfer
- * @stop: last I2C msg to be sent, i.e. STOP to be generated
- */
-struct st_i2c_client {
-	u8	addr;
-	u32	count;
-	u32	xfered;
-	u8	*buf;
-	int	result;
-	bool	stop;
-};
-
-/**
- * struct st_i2c_dev - private data of the controller
- * @adap: I2C adapter for this controller
- * @dev: device for this controller
- * @base: virtual memory area
- * @complete: completion of I2C message
- * @irq: interrupt line for th controller
- * @clk: hw ssc block clock
- * @mode: I2C mode of the controller. Standard or Fast only supported
- * @scl_min_width_us: SCL line minimum pulse width in us
- * @sda_min_width_us: SDA line minimum pulse width in us
- * @client: I2C transfert information
- * @busy: I2C transfer on-going
- */
-struct st_i2c_dev {
-	struct i2c_adapter	adap;
-	struct device		*dev;
-	void __iomem		*base;
-	struct completion	complete;
-	int			irq;
-	struct clk		*clk;
-	int			mode;
-	u32			scl_min_width_us;
-	u32			sda_min_width_us;
-	struct st_i2c_client	client;
-	bool			busy;
-};
-
-static inline void st_i2c_set_bits(void __iomem *reg, u32 mask)
-{
-	writel_relaxed(readl_relaxed(reg) | mask, reg);
-}
-
-static inline void st_i2c_clr_bits(void __iomem *reg, u32 mask)
-{
-	writel_relaxed(readl_relaxed(reg) & ~mask, reg);
-}
-
-/*
- * From I2C Specifications v0.5.
- *
- * All the values below have +10% margin added to be
- * compatible with some out-of-spec devices,
- * like HDMI link of the Toshiba 19AV600 TV.
- */
-static struct st_i2c_timings i2c_timings[] = {
-	[I2C_MODE_STANDARD] = {
-		.rate			= 100000,
-		.rep_start_hold		= 4400,
-		.rep_start_setup	= 5170,
-		.start_hold		= 4400,
-		.data_setup_time	= 275,
-		.stop_setup_time	= 4400,
-		.bus_free_time		= 5170,
-	},
-	[I2C_MODE_FAST] = {
-		.rate			= 400000,
-		.rep_start_hold		= 660,
-		.rep_start_setup	= 660,
-		.start_hold		= 660,
-		.data_setup_time	= 110,
-		.stop_setup_time	= 660,
-		.bus_free_time		= 1430,
-	},
-};
-
-static void st_i2c_flush_rx_fifo(struct st_i2c_dev *i2c_dev)
-{
-	int count, i;
-
-	/*
-	 * Counter only counts up to 7 but fifo size is 8...
-	 * When fifo is full, counter is 0 and RIR bit of status register is
-	 * set
-	 */
-	if (readl_relaxed(i2c_dev->base + SSC_STA) & SSC_STA_RIR)
-		count = SSC_RXFIFO_SIZE;
-	else
-		count = readl_relaxed(i2c_dev->base + SSC_RX_FSTAT) &
-			SSC_RX_FSTAT_STATUS;
-
-	for (i = 0; i < count; i++)
-		readl_relaxed(i2c_dev->base + SSC_RBUF);
-}
-
-static void st_i2c_soft_reset(struct st_i2c_dev *i2c_dev)
-{
-	/*
-	 * FIFO needs to be emptied before reseting the IP,
-	 * else the controller raises a BUSY error.
-	 */
-	st_i2c_flush_rx_fifo(i2c_dev);
-
-	st_i2c_set_bits(i2c_dev->base + SSC_CTL, SSC_CTL_SR);
-	st_i2c_clr_bits(i2c_dev->base + SSC_CTL, SSC_CTL_SR);
-}
-
-/**
- * st_i2c_hw_config() - Prepare SSC block, calculate and apply tuning timings
- * @i2c_dev: Controller's private data
- */
-static void st_i2c_hw_config(struct st_i2c_dev *i2c_dev)
-{
-	unsigned long rate;
-	u32 val, ns_per_clk;
-	struct st_i2c_timings *t = &i2c_timings[i2c_dev->mode];
-
-	st_i2c_soft_reset(i2c_dev);
-
-	val = SSC_CLR_REPSTRT | SSC_CLR_NACK | SSC_CLR_SSCARBL |
-		SSC_CLR_SSCAAS | SSC_CLR_SSCSTOP;
-	writel_relaxed(val, i2c_dev->base + SSC_CLR);
-
-	/* SSC Control register setup */
-	val = SSC_CTL_PO | SSC_CTL_PH | SSC_CTL_HB | SSC_CTL_DATA_WIDTH_9;
-	writel_relaxed(val, i2c_dev->base + SSC_CTL);
-
-	rate = clk_get_rate(i2c_dev->clk);
-	ns_per_clk = 1000000000 / rate;
-
-	/* Baudrate */
-	val = rate / (2 * t->rate);
-	writel_relaxed(val, i2c_dev->base + SSC_BRG);
-
-	/* Pre-scaler baudrate */
-	writel_relaxed(1, i2c_dev->base + SSC_PRE_SCALER_BRG);
-
-	/* Enable I2C mode */
-	writel_relaxed(SSC_I2C_I2CM, i2c_dev->base + SSC_I2C);
-
-	/* Repeated start hold time */
-	val = t->rep_start_hold / ns_per_clk;
-	writel_relaxed(val, i2c_dev->base + SSC_REP_START_HOLD);
-
-	/* Repeated start set up time */
-	val = t->rep_start_setup / ns_per_clk;
-	writel_relaxed(val, i2c_dev->base + SSC_REP_START_SETUP);
-
-	/* Start hold time */
-	val = t->start_hold / ns_per_clk;
-	writel_relaxed(val, i2c_dev->base + SSC_START_HOLD);
-
-	/* Data set up time */
-	val = t->data_setup_time / ns_per_clk;
-	writel_relaxed(val, i2c_dev->base + SSC_DATA_SETUP);
-
-	/* Stop set up time */
-	val = t->stop_setup_time / ns_per_clk;
-	writel_relaxed(val, i2c_dev->base + SSC_STOP_SETUP);
-
-	/* Bus free time */
-	val = t->bus_free_time / ns_per_clk;
-	writel_relaxed(val, i2c_dev->base + SSC_BUS_FREE);
-
-	/* Prescalers set up */
-	val = rate / 10000000;
-	writel_relaxed(val, i2c_dev->base + SSC_PRSCALER);
-	writel_relaxed(val, i2c_dev->base + SSC_PRSCALER_DATAOUT);
-
-	/* Noise suppression witdh */
-	val = i2c_dev->scl_min_width_us * rate / 100000000;
-	writel_relaxed(val, i2c_dev->base + SSC_NOISE_SUPP_WIDTH);
-
-	/* Noise suppression max output data delay width */
-	val = i2c_dev->sda_min_width_us * rate / 100000000;
-	writel_relaxed(val, i2c_dev->base + SSC_NOISE_SUPP_WIDTH_DATAOUT);
-}
-
-static int st_i2c_wait_free_bus(struct st_i2c_dev *i2c_dev)
-{
-	u32 sta;
-	int i;
-
-	for (i = 0; i < 10; i++) {
-		sta = readl_relaxed(i2c_dev->base + SSC_STA);
-		if (!(sta & SSC_STA_BUSY))
-			return 0;
-
-		usleep_range(2000, 4000);
+) {
+		qib_dev_err(dd,
+		 "failed to allocate congestion setting list for port %d!\n",
+		 port);
+		goto bail_1;
 	}
 
-	dev_err(i2c_dev->dev, "bus not free (status = 0x%08x)\n", sta);
-
-	return -EBUSY;
-}
-
-/**
- * st_i2c_write_tx_fifo() - Write a byte in the Tx FIFO
- * @i2c_dev: Controller's private data
- * @byte: Data to write in the Tx FIFO
- */
-static inline void st_i2c_write_tx_fifo(struct st_i2c_dev *i2c_dev, u8 byte)
-{
-	u16 tbuf = byte << 1;
-
-	writel_relaxed(tbuf | 1, i2c_dev->base + SSC_TBUF);
-}
-
-/**
- * st_i2c_wr_fill_tx_fifo() - Fill the Tx FIFO in write mode
- * @i2c_dev: Controller's private data
- *
- * This functions fills the Tx FIFO with I2C transfert buffer when
- * in write mode.
- */
-static void st_i2c_wr_fill_tx_fifo(struct st_i2c_dev *i2c_dev)
-{
-	struct st_i2c_client *c = &i2c_dev->client;
-	u32 tx_fstat, sta;
-	int i;
-
-	sta = readl_relaxed(i2c_dev->base + SSC_STA);
-	if (sta & SSC_STA_TX_FIFO_FULL)
-		return;
-
-	tx_fstat = readl_relaxed(i2c_dev->base + SSC_TX_FSTAT);
-	tx_fstat &= SSC_TX_FSTAT_STATUS;
-
-	if (c->count < (SSC_TXFIFO_SIZE - tx_fstat))
-		i = c->count;
-	else
-		i = SSC_TXFIFO_SIZE - tx_fstat;
-
-	for (; i > 0; i--, c->count--, c->buf++)
-		st_i2c_write_tx_fifo(i2c_dev, *c->buf);
-}
-
-/**
- * st_i2c_rd_fill_tx_fifo() - Fill the Tx FIFO in read mode
- * @i2c_dev: Controller's private data
- * @max: Maximum amount of data to fill into the Tx FIFO
- *
- * This functions fills the Tx FIFO with fixed pattern when
- * in read mode to trigger clock.
- */
-static void st_i2c_rd_fill_tx_fifo(struct st_i2c_dev *i2c_dev, int max)
-{
-	struct st_i2c_client *c = &i2c_dev->client;
-	u32 tx_fstat, sta;
-	int i;
-
-	sta = readl_relaxed(i2c_dev->base + SSC_STA);
-	if (sta & SSC_STA_TX_FIFO_FULL)
-		return;
-
-	tx_fstat = readl_relaxed(i2c_dev->base + SSC_TX_FSTAT);
-	tx_fstat &= SSC_TX_FSTAT_STATUS;
-
-	if (max < (SSC_TXFIFO_SIZE - tx_fstat))
-		i = max;
-	else
-		i = SSC_TXFIFO_SIZE - tx_fstat;
-
-	for (; i > 0; i--, c->xfered++)
-		st_i2c_write_tx_fifo(i2c_dev, 0xff);
-}
-
-static void st_i2c_read_rx_fifo(struct st_i2c_dev *i2c_dev)
-{
-	struct st_i2c_client *c = &i2c_dev->client;
-	u32 i, sta;
-	u16 rbuf;
-
-	sta = readl_relaxed(i2c_dev->base + SSC_STA);
-	if (sta & SSC_STA_RIR) {
-		i = SSC_RXFIFO_SIZE;
-	} else {
-		i = readl_relaxed(i2c_dev->base + SSC_RX_FSTAT);
-		i &= SSC_RX_FSTAT_STATUS;
+	size = sizeof(struct cc_table_shadow);
+	ppd->ccti_entries_shadow = kzalloc(size, GFP_KERNEL);
+	if (!ppd->ccti_entries_shadow) {
+		qib_dev_err(dd,
+		 "failed to allocate shadow ccti list for port %d!\n",
+		 port);
+		goto bail_2;
 	}
 
-	for (; (i > 0) && (c->count > 0); i--, c->count--) {
-		rbuf = readl_relaxed(i2c_dev->base + SSC_RBUF) >> 1;
-		*c->buf++ = (u8)rbuf & 0xff;
+	size = sizeof(struct ib_cc_congestion_setting_attr);
+	ppd->congestion_entries_shadow = kzalloc(size, GFP_KERNEL);
+	if (!ppd->congestion_entries_shadow) {
+		qib_dev_err(dd,
+		 "failed to allocate shadow congestion setting list for port %d!\n",
+		 port);
+		goto bail_3;
 	}
 
-	if (i) {
-		dev_err(i2c_dev->dev, "Unexpected %d bytes in rx fifo\n", i);
-		st_i2c_flush_rx_fifo(i2c_dev);
+	return 0;
+
+bail_3:
+	kfree(ppd->ccti_entries_shadow);
+	ppd->ccti_entries_shadow = NULL;
+bail_2:
+	kfree(ppd->congestion_entries);
+	ppd->congestion_entries = NULL;
+bail_1:
+	kfree(ppd->ccti_entries);
+	ppd->ccti_entries = NULL;
+bail:
+	/* User is intentionally disabling the congestion control agent */
+	if (!qib_cc_table_size)
+		return 0;
+
+	if (qib_cc_table_size < IB_CCT_MIN_ENTRIES) {
+		qib_cc_table_size = 0;
+		qib_dev_err(dd,
+		 "Congestion Control table size %d less than minimum %d for port %d\n",
+		 qib_cc_table_size, IB_CCT_MIN_ENTRIES, port);
 	}
+
+	qib_dev_err(dd, "Congestion Control Agent disabled for port %d\n",
+		port);
+	return 0;
 }
 
-/**
- * st_i2c_terminate_xfer() - Send either STOP or REPSTART condition
- * @i2c_dev: Controller's private data
- */
-static void st_i2c_terminate_xfer(struct st_i2c_dev *i2c_dev)
+static int init_pioavailregs(struct qib_devdata *dd)
 {
-	struct st_i2c_client *c = &i2c_dev->client;
+	int ret, pidx;
+	u64 *status_page;
 
-	st_i2c_clr_bits(i2c_dev->base + SSC_IEN, SSC_IEN_TEEN);
-	st_i2c_clr_bits(i2c_dev->base + SSC_I2C, SSC_I2C_STRTG);
-
-	if (c->stop) {
-		st_i2c_set_bits(i2c_dev->base + SSC_IEN, SSC_IEN_STOPEN);
-		st_i2c_set_bits(i2c_dev->base + SSC_I2C, SSC_I2C_STOPG);
-	} else {
-		st_i2c_set_bits(i2c_dev->base + SSC_IEN, SSC_IEN_REPSTRTEN);
-		st_i2c_set_bits(i2c_dev->base + SSC_I2C, SSC_I2C_REPSTRTG);
-	}
-}
-
-/**
- * st_i2c_handle_write() - Handle FIFO empty interrupt in case of write
- * @i2c_dev: Controller's private data
- */
-static void st_i2c_handle_write(struct st_i2c_dev *i2c_dev)
-{
-	struct st_i2c_client *c = &i2c_dev->client;
-
-	st_i2c_flush_rx_fifo(i2c_dev);
-
-	if (!c->count)
-		/* End of xfer, send stop or repstart */
-		st_i2c_terminate_xfer(i2c_dev);
-	else
-		st_i2c_wr_fill_tx_fifo(i2c_dev);
-}
-
-/**
- * st_i2c_handle_write() - Handle FIFO enmpty interrupt in case of read
- * @i2c_dev: Controller's private data
- */
-static void st_i2c_handle_read(struct st_i2c_dev *i2c_dev)
-{
-	struct st_i2c_client *c = &i2c_dev->client;
-	u32 ien;
-
-	/* Trash the address read back */
-	if (!c->xfered) {
-		readl_relaxed(i2c_dev->base + SSC_RBUF);
-		st_i2c_clr_bits(i2c_dev->base + SSC_I2C, SSC_I2C_TXENB);
-	} else {
-		st_i2c_read_rx_fifo(i2c_dev);
-	}
-
-	if (!c->count) {
-		/* End of xfer, send stop or repstart */
-		st_i2c_terminate_xfer(i2c_dev);
-	} else if (c->count == 1) {
-		/* Penultimate byte to xfer, disable ACK gen. */
-		st_i2c_clr_bits(i2c_dev->base + SSC_I2C, SSC_I2C_ACKG);
-
-		/* Last received byte is to be handled by NACK interrupt */
-		ien = SSC_IEN_NACKEN | SSC_IEN_ARBLEN;
-		writel_relaxed(ien, i2c_dev->base + SSC_IEN);
-
-		st_i2c_rd_fill_tx_fifo(i2c_dev, c->count);
-	} else {
-		st_i2c_rd_fill_tx_fifo(i2c_dev, c->count - 1);
-	}
-}
-
-/**
- * st_i2c_isr() - Interrupt routine
- * @irq: interrupt number
- * @data: Controller's private data
- */
-static irqreturn_t st_i2c_isr_thread(int irq, void *data)
-{
-	struct st_i2c_dev *i2c_dev = data;
-	struct st_i2c_client *c = &i2c_dev->client;
-	u32 sta, ien;
-	int it;
-
-	ien = readl_relaxed(i2c_dev->base + SSC_IEN);
-	sta = readl_relaxed(i2c_dev->base + SSC_STA);
-
-	/* Use __fls() to check error bits first */
-	it = __fls(sta & ien);
-	if (it < 0) {
-		dev_dbg(i2c_dev->dev, "spurious it (sta=0x%04x, ien=0x%04x)\n",
-				sta, ien);
-		return IRQ_NONE;
-	}
-
-	switch (1 << it) {
-	case SSC_STA_TE:
-		if (c->addr & I2C_M_RD)
-			st_i2c_handle_read(i2c_dev);
-		else
-			st_i2c_handle_write(i2c_dev);
-		break;
-
-	case SSC_STA_STOP:
-	case SSC_STA_REPSTRT:
-		writel_relaxed(0, i2c_dev->base + SSC_IEN);
-		complete(&i2c_dev->complete);
-		break;
-
-	case SSC_STA_NACK:
-		writel_relaxed(SSC_CLR_NACK, i2c_dev->base + SSC_CLR);
-
-		/* Last received byte handled by NACK interrupt */
-		if ((c->addr & I2C_M_RD) && (c->count == 1) && (c->xfered)) {
-			st_i2c_handle_read(i2c_dev);
-			break;
-		}
-
-		it = SSC_IEN_STOPEN | SSC_IEN_ARBLEN;
-		writel_relaxed(it, i2c_dev->base + SSC_IEN);
-
-		st_i2c_set_bits(i2c_dev->base + SSC_I2C, SSC_I2C_STOPG);
-		c->result = -EIO;
-		break;
-
-	case SSC_STA_ARBL:
-		writel_relaxed(SSC_CLR_SSCARBL, i2c_dev->base + SSC_CLR);
-
-		it = SSC_IEN_STOPEN | SSC_IEN_ARBLEN;
-		writel_relaxed(it, i2c_dev->base + SSC_IEN);
-
-		st_i2c_set_bits(i2c_dev->base + SSC_I2C, SSC_I2C_STOPG);
-		c->result = -EAGAIN;
-		break;
-
-	default:
-		dev_err(i2c_dev->dev,
-				"it %d unhandled (sta=0x%04x)\n", it, sta);
+	dd->pioavailregs_dma = dma_alloc_coherent(
+		&dd->pcidev->dev, PAGE_SIZE, &dd->pioavailregs_phys,
+		GFP_KERNEL);
+	if (!dd->pioavailregs_dma) {
+		qib_dev_err(dd,
+			"failed to allocate PIOavail reg area in memory\n");
+		ret = -ENOMEM;
+		goto done;
 	}
 
 	/*
-	 * Read IEN register to ensure interrupt mask write is effective
-	 * before re-enabling interrupt at GIC level, and thus avoid spurious
-	 * interrupts.
+	 * We really want L2 cache aligned, but for current CPUs of
+	 * interest, they are the same.
 	 */
-	readl(i2c_dev->base + SSC_IEN);
-
-	return IRQ_HANDLED;
-}
-
-/**
- * st_i2c_xfer_msg() - Transfer a single I2C message
- * @i2c_dev: Controller's private data
- * @msg: I2C message to transfer
- * @is_first: first message of the sequence
- * @is_last: last message of the sequence
- */
-static int st_i2c_xfer_msg(struct st_i2c_dev *i2c_dev, struct i2c_msg *msg,
-			    bool is_first, bool is_last)
-{
-	struct st_i2c_client *c = &i2c_dev->client;
-	u32 ctl, i2c, it;
-	unsigned long timeout;
-	int ret;
-
-	c->addr		= (u8)(msg->addr << 1);
-	c->addr		|= (msg->flags & I2C_M_RD);
-	c->buf		= msg->buf;
-	c->count	= msg->len;
-	c->xfered	= 0;
-	c->result	= 0;
-	c->stop		= is_last;
-
-	reinit_completion(&i2c_dev->complete);
-
-	ctl = SSC_CTL_EN | SSC_CTL_MS |	SSC_CTL_EN_RX_FIFO | SSC_CTL_EN_TX_FIFO;
-	st_i2c_set_bits(i2c_dev->base + SSC_CTL, ctl);
-
-	i2c = SSC_I2C_TXENB;
-	if (c->addr & I2C_M_RD)
-		i2c |= SSC_I2C_ACKG;
-	st_i2c_set_bits(i2c_dev->base + SSC_I2C, i2c);
-
-	/* Write slave address */
-	st_i2c_write_tx_fifo(i2c_dev, c->addr);
-
-	/* Pre-fill Tx fifo with data in case of write */
-	if (!(c->addr & I2C_M_RD))
-		st_i2c_wr_fill_tx_fifo(i2c_dev);
-
-	it = SSC_IEN_NACKEN | SSC_IEN_TEEN | SSC_IEN_ARBLEN;
-	writel_relaxed(it, i2c_dev->base + SSC_IEN);
-
-	if (is_first) {
-		ret = st_i2c_wait_free_bus(i2c_dev);
-		if (ret)
-			return ret;
-
-		st_i2c_set_bits(i2c_dev->base + SSC_I2C, SSC_I2C_STRTG);
+	status_page = (u64 *)
+		((char *) dd->pioavailregs_dma +
+		 ((2 * L1_CACHE_BYTES +
+		   dd->pioavregs * sizeof(u64)) & ~L1_CACHE_BYTES));
+	/* device status comes first, for backwards compatibility */
+	dd->devstatusp = status_page;
+	*status_page++ = 0;
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		dd->pport[pidx].statusp = status_page;
+		*status_page++ = 0;
 	}
 
-	timeout = wait_for_completion_timeout(&i2c_dev->complete,
-			i2c_dev->adap.timeout);
-	ret = c->result;
+	/*
+	 * Setup buffer to hold freeze and other messages, accessible to
+	 * apps, following statusp.  This is per-unit, not per port.
+	 */
+	dd->freezemsg = (char *) status_page;
+	*dd->freezemsg = 0;
+	/* length of msg buffer is "whatever is left" */
+	ret = (char *) status_page - (char *) dd->pioavailregs_dma;
+	dd->freezelen = PAGE_SIZE - ret;
 
-	if (!timeout) {
-		dev_err(i2c_dev->dev, "Write to slave 0x%x timed out\n",
-				c->addr);
-		ret = -ETIMEDOUT;
-	}
+	ret = 0;
 
-	i2c = SSC_I2C_STOPG | SSC_I2C_REPSTRTG;
-	st_i2c_clr_bits(i2c_dev->base + SSC_I2C, i2c);
-
-	writel_relaxed(SSC_CLR_SSCSTOP | SSC_CLR_REPSTRT,
-			i2c_dev->base + SSC_CLR);
-
+done:
 	return ret;
 }
 
 /**
- * st_i2c_xfer() - Transfer a single I2C message
- * @i2c_adap: Adapter pointer to the controller
- * @msgs: Pointer to data to be written.
- * @num: Number of messages to be executed
+ * init_shadow_tids - allocate the shadow TID array
+ * @dd: the qlogic_ib device
+ *
+ * allocate the shadow TID array, so we can qib_munlock previous
+ * entries.  It may make more sense to move the pageshadow to the
+ * ctxt data structure, so we only allocate memory for ctxts actually
+ * in use, since we at 8k per ctxt, now.
+ * We don't want failures here to prevent use of the driver/chip,
+ * so no return value.
  */
-static int st_i2c_xfer(struct i2c_adapter *i2c_adap,
-			struct i2c_msg msgs[], int num)
+static void init_shadow_tids(struct qib_devdata *dd)
 {
-	struct st_i2c_dev *i2c_dev = i2c_get_adapdata(i2c_adap);
-	int ret, i;
+	struct page **pages;
+	dma_addr_t *addrs;
 
-	i2c_dev->busy = true;
-
-	ret = clk_prepare_enable(i2c_dev->clk);
-	if (ret) {
-		dev_err(i2c_dev->dev, "Failed to prepare_enable clock\n");
-		return ret;
+	pages = vzalloc(dd->cfgctxts * dd->rcvtidcnt * sizeof(struct page *));
+	if (!pages) {
+		qib_dev_err(dd,
+			"failed to allocate shadow page * array, no expected sends!\n");
+		goto bail;
 	}
 
-	pinctrl_pm_select_default_state(i2c_dev->dev);
+	addrs = vzalloc(dd->cfgctxts * dd->rcvtidcnt * sizeof(dma_addr_t));
+	if (!addrs) {
+		qib_dev_err(dd,
+			"failed to allocate shadow dma handle array, no expected sends!\n");
+		goto bail_free;
+	}
 
-	st_i2c_hw_config(i2c_dev);
+	dd->pageshadow = pages;
+	dd->physshadow = addrs;
+	return;
 
-	for (i = 0; (i < num) && !ret; i++)
-		ret = st_i2c_xfer_msg(i2c_dev, &msgs[i], i == 0, i == num - 1);
-
-	pinctrl_pm_select_idle_state(i2c_dev->dev);
-
-	clk_disable_unprepare(i2c_dev->clk);
-
-	i2c_dev->busy = false;
-
-	return (ret < 0) ? ret : i;
+bail_free:
+	vfree(pages);
+bail:
+	dd->pageshadow = NULL;
 }
 
-#ifdef CONFIG_PM_SLEEP
-static int st_i2c_suspend(struct device *dev)
+/*
+ * Do initialization for device that is only needed on
+ * first detect, not on resets.
+ */
+static int loadtime_init(struct qib_devdata *dd)
 {
-	struct platform_device *pdev =
-		container_of(dev, struct platform_device, dev);
-	struct st_i2c_dev *i2c_dev = platform_get_drvdata(pdev);
+	int ret = 0;
 
-	if (i2c_dev->busy)
-		return -EBUSY;
+	if (((dd->revision >> QLOGIC_IB_R_SOFTWARE_SHIFT) &
+	     QLOGIC_IB_R_SOFTWARE_MASK) != QIB_CHIP_SWVERSION) {
+		qib_dev_err(dd,
+			"Driver only handles version %d, chip swversion is %d (%llx), failng\n",
+			QIB_CHIP_SWVERSION,
+			(int)(dd->revision >>
+				QLOGIC_IB_R_SOFTWARE_SHIFT) &
+				QLOGIC_IB_R_SOFTWARE_MASK,
+			(unsigned long long) dd->revision);
+		ret = -ENOSYS;
+		goto done;
+	}
 
-	pinctrl_pm_select_sleep_state(dev);
+	if (dd->revision & QLOGIC_IB_R_EMULATOR_MASK)
+		qib_devinfo(dd->pcidev, "%s", dd->boardversion);
+
+	spin_lock_init(&dd->pioavail_lock);
+	spin_lock_init(&dd->sendctrl_lock);
+	spin_lock_init(&dd->uctxt_lock);
+	spin_lock_init(&dd->qib_diag_trans_lock);
+	spin_lock_init(&dd->eep_st_lock);
+	mutex_init(&dd->eep_lock);
+
+	if (qib_mini_init)
+		goto done;
+
+	ret = init_pioavailregs(dd);
+	init_shadow_tids(dd);
+
+	qib_get_eeprom_info(dd);
+
+	/* setup time (don't start yet) to verify we got interrupt */
+	init_timer(&dd->intrchk_timer);
+	dd->intrchk_timer.function = verify_interrupt;
+	dd->intrchk_timer.data = (unsigned long) dd;
+
+	ret = qib_cq_init(dd);
+done:
+	return ret;
+}
+
+/**
+ * init_after_reset - re-initialize after a reset
+ * @dd: the qlogic_ib device
+ *
+ * sanity check at least some of the values after reset, and
+ * ensure no receive or transmit (explicitly, in case reset
+ * failed
+ */
+static int init_after_reset(struct qib_devdata *dd)
+{
+	int i;
+
+	/*
+	 * Ensure chip does no sends or receives, tail updates, or
+	 * pioavail updates while we re-initialize.  This is mostly
+	 * for the driver data structures, not chip registers.
+	 */
+	for (i = 0; i < dd->num_pports; ++i) {
+		/*
+		 * ctxt == -1 means "all contexts". Only really safe for
+		 * _dis_abling things, as here.
+		 */
+		dd->f_rcvctrl(dd->pport + i, QIB_RCVCTRL_CTXT_DIS |
+				  QIB_RCVCTRL_INTRAVAIL_DIS |
+				  QIB_RCVCTRL_TAILUPD_DIS, -1);
+		/* Redundant across ports for some, but no big deal.  */
+		dd->f_sendctrl(dd->pport + i, QIB_SENDCTRL_SEND_DIS |
+			QIB_SENDCTRL_AVAIL_DIS);
+	}
 
 	return 0;
 }
 
-static int st_i2c_resume(struct device *dev)
+static void enable_chip(struct qib_devdata *dd)
 {
-	pinctrl_pm_select_default_state(dev);
-	/* Go in idle state if available */
-	pinctrl_pm_select_idle_state(dev);
+	u64 rcvmask;
+	int i;
 
+	/*
+	 * Enable PIO send, and update of PIOavail regs to memory.
+	 */
+	for (i = 0; i < dd->num_pports; ++i)
+		dd->f_sendctrl(dd->pport + i, QIB_SENDCTRL_SEND_ENB |
+			QIB_SENDCTRL_AVAIL_ENB);
+	/*
+	 * Enable kernel ctxts' receive and receive interrupt.
+	 * Other ctxts done as user opens and inits them.
+	 */
+	rcvmask = QIB_RCVCTRL_CTXT_ENB | QIB_RCVCTRL_INTRAVAIL_ENB;
+	rcvmask |= (dd->flags & QIB_NODMA_RTAIL) ?
+		  QIB_RCVCTRL_TAILUPD_DIS : QIB_RCVCTRL_TAILUPD_ENB;
+	for (i = 0; dd->rcd && i < dd->first_user_ctxt; ++i) {
+		struct qib_ctxtdata *rcd = dd->rcd[i];
+
+		if (rcd)
+			dd->f_rcvctrl(rcd->ppd, rcvmask, i);
+	}
+}
+
+static void verify_interrupt(unsigned long opaque)
+{
+	struct qib_devdata *dd = (struct qib_devdata *) opaque;
+	u64 int_counter;
+
+	if (!dd)
+		return; /* being torn down */
+
+	/*
+	 * If we don't have a lid or any interrupts, let the user know and
+	 * don't bother checking again.
+	 */
+	int_counter = qib_int_counter(dd) - dd->z_int_counter;
+	if (int_counter == 0) {
+		if (!dd->f_intr_fallback(dd))
+			dev_err(&dd->pcidev->dev,
+				"No interrupts detected, not usable.\n");
+		else /* re-arm the timer to see if fallback works */
+			mod_timer(&dd->intrchk_timer, jiffies + HZ/2);
+	}
+}
+
+static void init_piobuf_state(struct qib_devdata *dd)
+{
+	int i, pidx;
+	u32 uctxts;
+
+	/*
+	 * Ensure all buffers are free, and fifos empty.  Buffers
+	 * are common, so only do once for port 0.
+	 *
+	 * After enable and qib_chg_pioavailkernel so we can safely
+	 * enable pioavail updates and PIOENABLE.  After this, packets
+	 * are ready and able to go out.
+	 */
+	dd->f_sendctrl(dd->pport, QIB_SENDCTRL_DISARM_ALL);
+	for (pidx = 0; pidx < dd->num_pports; ++pidx)
+		dd->f_sendctrl(dd->pport + pidx, QIB_SENDCTRL_FLUSH);
+
+	/*
+	 * If not all sendbufs are used, add the one to each of the lower
+	 * numbered contexts.  pbufsctxt and lastctxt_piobuf are
+	 * calculated in chip-specific code because it may cause some
+	 * chip-specific adjustments to be made.
+	 */
+	uctxts = dd->cfgctxts - dd->first_user_ctxt;
+	dd->ctxts_extrabuf = dd->pbufsctxt ?
+		dd->lastctxt_piobuf - (dd->pbufsctxt * uctxts) : 0;
+
+	/*
+	 * Set up the shadow copies of the piobufavail registers,
+	 * which we compare against the chip registers for now, and
+	 * the in memory DMA'ed copies of the registers.
+	 * By now pioavail updates to memory should have occurred, so
+	 * copy them into our working/shadow registers; this is in
+	 * case something went wrong with abort, but mostly to get the
+	 * initial values of the generation bit correct.
+	 */
+	for (i = 0; i < dd->pioavregs; i++) {
+		__le64 tmp;
+
+		tmp = dd->pioavailregs_dma[i];
+		/*
+		 * Don't need to worry about pioavailkernel here
+		 * because we will call qib_chg_pioavailkernel() later
+		 * in initialization, to busy out buffers as needed.
+		 */
+		dd->pioavailshadow[i] = le64_to_cpu(tmp);
+	}
+	while (i < ARRAY_SIZE(dd->pioavailshadow))
+		dd->pioavailshadow[i++] = 0; /* for debugging sanity */
+
+	/* after pioavailshadow is setup */
+	qib_chg_pioavailkernel(dd, 0, dd->piobcnt2k + dd->piobcnt4k,
+			       TXCHK_CHG_TYPE_KERN, NULL);
+	dd->f_initvl15_bufs(dd);
+}
+
+/**
+ * qib_create_workqueues - create per port workqueues
+ * @dd: the qlogic_ib device
+ */
+static int qib_create_workqueues(struct qib_devdata *dd)
+{
+	int pidx;
+	struct qib_pportdata *ppd;
+
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		ppd = dd->pport + pidx;
+		if (!ppd->qib_wq) {
+			char wq_name[8]; /* 3 + 2 + 1 + 1 + 1 */
+
+			snprintf(wq_name, sizeof(wq_name), "qib%d_%d",
+				dd->unit, pidx);
+			ppd->qib_wq =
+				create_singlethread_workqueue(wq_name);
+			if (!ppd->qib_wq)
+				goto wq_error;
+		}
+	}
 	return 0;
+wq_error:
+	pr_err("create_singlethread_workqueue failed for port %d\n",
+		pidx + 1);
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		ppd = dd->pport + pidx;
+		if (ppd->qib_wq) {
+			destroy_workqueue(ppd->qib_wq);
+			ppd->qib_wq = NULL;
+		}
+	}
+	return -ENOMEM;
 }
 
-static SIMPLE_DEV_PM_OPS(st_i2c_pm, st_i2c_suspend, st_i2c_resume);
-#define ST_I2C_PM	(&st_i2c_pm)
-#else
-#define ST_I2C_PM	NULL
-#endif
-
-static u32 st_i2c_func(struct i2c_adapter *adap)
+static void qib_free_pportdata(struct qib_pportdata *ppd)
 {
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
+	free_percpu(ppd->ibport_data.pmastats);
+	ppd->ibport_data.pmastats = NULL;
 }
 
-static struct i2c_algorithm st_i2c_algo = {
-	.master_xfer = st_i2c_xfer,
-	.functionality = st_i2c_func,
-};
-
-static int st_i2c_of_get_deglitch(struct device_node *np,
-		struct st_i2c_dev *i2c_dev)
+/**
+ * qib_init - do the actual initialization sequence on the chip
+ * @dd: the qlogic_ib device
+ * @reinit: reinitializing, so don't allocate new memory
+ *
+ * Do the actual initialization sequence on the chip.  This is done
+ * both from the init routine called from the PCI infrastructure, and
+ * when we reset the chip, or detect that it was reset internally,
+ * or it's administratively re-enabled.
+ *
+ * Memory allocation here and in called routines is only done in
+ * the first case (reinit == 0).  We have to be careful, because even
+ * without memory allocation, we need to re-write all the chip registers
+ * TIDs, etc. after the reset or enable has completed.
+ */
+int qib_init(struct qib_devdata *dd, int reinit)
 {
-	int ret;
+	int ret = 0, pidx, lastfail = 0;
+	u32 portok = 0;
+	unsigned i;
+	struct qib_ctxtdata *rcd;
+	struct qib_pportdata *ppd;
+	unsigned long flags;
 
-	ret = of_property_read_u32(np, "st,i2c-min-scl-pulse-width-us",
-			&i2c_dev->scl_min_width_us);
-	if ((ret == -ENODATA) || (ret == -EOVERFLOW)) {
-		dev_err(i2c_dev->dev, "st,i2c-min-scl-pulse-width-us invalid\n");
-		return ret;
+	/* Set linkstate to unknown, so we can watch for a transition. */
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		ppd = dd->pport + pidx;
+		spin_lock_irqsave(&ppd->lflags_lock, flags);
+		ppd->lflags &= ~(QIBL_LINKACTIVE | QIBL_LINKARMED |
+				 QIBL_LINKDOWN | QIBL_LINKINIT |
+				 QIBL_LINKV);
+		spin_unlock_irqrestore(&ppd->lflags_lock, flags);
 	}
 
-	ret = of_property_read_u32(np, "st,i2c-min-sda-pulse-width-us",
-			&i2c_dev->sda_min_width_us);
-	if ((ret == -ENODATA) || (ret == -EOVERFLOW)) {
-		dev_err(i2c_dev->dev, "st,i2c-min-sda-pulse-width-us invalid\n");
-		return ret;
-	}
-
-	return 0;
-}
-
-static int st_i2c_probe(struct platform_device *pdev)
-{
-	struct device_node *np = pdev->dev.of_node;
-	struct st_i2c_dev *i2c_dev;
-	struct resource *res;
-	u32 clk_rate;
-	struct i2c_adapter *adap;
-	int ret;
-
-	i2c_dev = devm_kzalloc(&pdev->dev, sizeof(*i2c_dev), GFP_KERNEL);
-	if (!i2c_dev)
-		return -ENOMEM;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	i2c_dev->base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(i2c_dev->base))
-		return PTR_ERR(i2c_dev->base);
-
-	i2c_dev->irq = irq_of_parse_and_map(np, 0);
-	if (!i2c_dev->irq) {
-		dev_err(&pdev->dev, "IRQ missing or invalid\n");
-		return -EINVAL;
-	}
-
-	i2c_dev->clk = of_clk_get_by_name(np, "ssc");
-	if (IS_ERR(i2c_dev->clk)) {
-		dev_err(&pdev->dev, "Unable to request clock\n");
-		return PTR_ERR(i2c_dev->clk);
-	}
-
-	i2c_dev->mode = I2C_MODE_STANDARD;
-	ret = of_property_read_u32(np, "clock-frequency", &clk_rate);
-	if ((!ret) && (clk_rate == 400000))
-		i2c_dev->mode = I2C_MODE_FAST;
-
-	i2c_dev->dev = &pdev->dev;
-
-	ret = devm_request_threaded_irq(&pdev->dev, i2c_dev->irq,
-			NULL, st_i2c_isr_thread,
-			IRQF_ONESHOT, pdev->name, i2c_dev);
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to request irq %i\n", i2c_dev->irq);
-		return ret;
-	}
-
-	pinctrl_pm_select_default_state(i2c_dev->dev);
-	/* In case idle state available, select it */
-	pinctrl_pm_select_idle_state(i2c_dev->dev);
-
-	ret = st_i2c_of_get_deglitch(np, i2c_dev);
+	if (reinit)
+		ret = init_after_reset(dd);
+	else
+		ret = loadtime_init(dd);
 	if (ret)
-		return ret;
+		goto done;
 
-	adap = &i2c_dev->adap;
-	i2c_set_adapdata(adap, i2c_dev);
-	snprintf(adap->name, sizeof(adap->name), "ST I2C(%pa)", &res->start);
-	adap->owner = THIS_MODULE;
-	adap->timeout = 2 * HZ;
-	adap->retries = 0;
-	adap->algo = &st_i2c_algo;
-	adap->dev.parent = &pdev->dev;
-	adap->dev.of_node = pdev->dev.of_node;
+	/* Bypass most chip-init, to get to device creation */
+	if (qib_mini_init)
+		return 0;
 
-	init_completion(&i2c_dev->complete);
+	ret = dd->f_late_initreg(dd);
+	if (ret)
+		goto done;
 
-	ret = i2c_add_adapter(adap);
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to add adapter\n");
-		return ret;
+	/* dd->rcd can be NULL if early init failed */
+	for (i = 0; dd->rcd && i < dd->first_user_ctxt; ++i) {
+		/*
+		 * Set up the (kernel) rcvhdr queue and egr TIDs.  If doing
+		 * re-init, the simplest way to handle this is to free
+		 * existing, and re-allocate.
+		 * Need to re-create rest of ctxt 0 ctxtdata as well.
+		 */
+		rcd = dd->rcd[i];
+		if (!rcd)
+			continue;
+
+		lastfail = qib_create_rcvhdrq(dd, rcd);
+		if (!lastfail)
+			lastfail = qib_setup_eagerbufs(rcd);
+		if (lastfail) {
+			qib_dev_err(dd,
+				"failed to allocate kernel ctxt's rcvhdrq and/or egr bufs\n");
+			continue;
+		}
 	}
 
-	platform_set_drvdata(pdev, i2c_dev);
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		int mtu;
 
-	dev_info(i2c_dev->dev, "%s initialized\n", adap->name);
+		if (lastfail)
+			ret = lastfail;
+		ppd = dd->pport + pidx;
+		mtu = ib_mtu_enum_to_int(qib_ibmtu);
+		if (mtu == -1) {
+			mtu = QIB_DEFAULT_MTU;
+			qib_ibmtu = 0; /* don't leave invalid value */
+		}
+		/* set max we can ever have for this driver load */
+		ppd->init_ibmaxlen = min(mtu > 2048 ?
+					 dd->piosize4k : dd->piosize2k,
+					 dd->rcvegrbufsize +
+					 (dd->rcvhdrentsize << 2));
+		/*
+		 * Have to initialize ibmaxlen, but this will normally
+		 * change immediately in qib_set_mtu().
+		 */
+		ppd->ibmaxlen = ppd->init_ibmaxlen;
+		qib_set_mtu(ppd, mtu);
 
-	return 0;
+		spin_lock_irqsave(&ppd->lflags_lock, flags);
+		ppd->lflags |= QIBL_IB_LINK_DISABLED;
+		spin_unlock_irqrestore(&ppd->lflags_lock, flags);
+
+		lastfail = dd->f_bringup_serdes(ppd);
+		if (lastfail) {
+			qib_devinfo(dd->pcidev,
+				 "Failed to bringup IB port %u\n", ppd->port);
+			lastfail = -ENETDOWN;
+			continue;
+		}
+
+		portok++;
+	}
+
+	if (!portok) {
+		/* none of the ports initialized */
+		if (!ret && lastfail)
+			ret = lastfail;
+		else if (!ret)
+			ret = -ENETDOWN;
+		/* but continue on, so we can debug cause */
+	}
+
+	enable_chip(dd);
+
+	init_piobuf_state(dd);
+
+done:
+	if (!ret) {
+		/* chip is OK for user apps; mark it as initialized */
+		for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+			ppd = dd->pport + pidx;
+			/*
+			 * Set status even if port serdes is not initialized
+			 * so that diags will work.
+			 */
+			*ppd->statusp |= QIB_STATUS_CHIP_PRESENT |
+				QIB_STATUS_INITTED;
+			if (!ppd->link_speed_enabled)
+				continue;
+			if (dd->flags & QIB_HAS_SEND_DMA)
+				ret = qib_setup_sdma(ppd);
+			init_timer(&ppd->hol_timer);
+			ppd->hol_timer.function = qib_hol_event;
+			ppd->hol_timer.data = (unsigned long)ppd;
+			ppd->hol_state = QIB_HOL_UP;
+		}
+
+		/* now we can enable all interrupts from the chip */
+		dd->f_set_intr_state(dd, 1);
+
+		/*
+		 * Setup to verify we get an interrupt, and fallback
+		 * to an alternate if necessary and possible.
+		 */
+		mod_timer(&dd->intrchk_timer, jiffies + HZ/2);
+		/* start stats retrieval timer */
+		mod_timer(&dd->stats_timer, jiffies + HZ * ACTIVITY_TIMER);
+	}
+
+	/* if ret is non-zero, we probably should do some cleanup here... */
+	return ret;
 }
 
-static int st_i2c_remove(struct platform_device *pdev)
+/*
+ * These next two routines are placeholders in case we don't have per-arch
+ * code for controlling write combining.  If explicit control of write
+ * combining is not available, performance will probably be awful.
+ */
+
+int __attribute__((weak)) qib_enable_wc(struct qib_devdata *dd)
 {
-	struct st_i2c_dev *i2c_dev = platform_get_drvdata(pdev);
-
-	i2c_del_adapter(&i2c_dev->adap);
-
-	return 0;
+	return -EOPNOTSUPP;
 }
 
-static const struct of_device_id st_i2c_match[] = {
-	{ .compatible = "st,comms-ssc-i2c", },
-	{ .compatible = "st,comms-ssc4-i2c", },
-	{},
-};
-MODULE_DEVICE_TABLE(of, st_i2c_match);
+void __attribute__((weak)) qib_disable_wc(struct qib_devdata *dd)
+{
+}
 
-static struct platform_driver st_i2c_driver = {
-	.driver = {
-		.name = "st-i2c",
-		.of_match_table = st_i2c_match,
-		.pm = ST_I2C_PM,
-	},
-	.probe = st_i2c_probe,
-	.remove = st_i2c_remove,
-};
+static inline struct qib_devdata *__qib_lookup(int unit)
+{
+	return idr_find(&qib_unit_table, unit);
+}
 
-module_platform_driver(st_i2c_driver);
+struct qib_devdata *qib_lookup(int unit)
+{
+	struct qib_devdata *dd;
+	unsigned long flags;
 
-MODULE_AUTHOR("Maxime Coquelin <maxime.coquelin@st.com>");
-MODULE_DESCRIPTION("STMicroelectronics I2C driver");
-MODULE_LICENSE("GPL v2");
+	spin_lock_irqsave(&qib_devs_lock, flags);
+	dd = __qib_lookup(unit);
+	spin_unlock_irqrestore(&qib_devs_lock, flags);
+
+	return dd;
+}
+
+/*
+ * Stop the timers during unit shutdown, or after an error late
+ * in initialization.
+ */
+static void qib_stop_timers(struct qib_devdata *dd)
+{
+	struct qib_pportdata *ppd;
+	int pidx;
+
+	if (dd->stats_timer.data) {
+		del_timer_sync(&dd->stats_timer);
+		dd->stats_timer.data = 0;
+	}
+	if (dd->intrchk_timer.data) {
+		del_timer_sync(&dd->intrchk_timer);
+		dd->intrchk_timer.data = 0;
+	}
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		ppd = dd->pport + pidx;
+		if (ppd->hol_timer.data)
+			del_timer_sync(&ppd->hol_timer);
+		if (ppd->led_override_timer.data) {
+			del_timer_sync(&ppd->led_override_timer);
+			atomic_set(&ppd->led_override_timer_active, 0);
+		}
+		if (ppd->symerr_clear_timer.data)
+			del_timer_sync(&ppd->symerr_clear_timer);
+	}
+}
+
+/**
+ * qib_shutdown_device - shut down a device
+ * @dd: the qlogic_ib device
+ *
+ * This is called to make the device quiet when we are about to
+ * unload the driver, and also when the device is administratively
+ * disabled.   It does not free any data structures.
+ * Everything it does has to be setup again by qib_init(dd, 1)
+ */
+static void qib_shutdown_device(struct qib_devdata *dd)
+{
+	struct qib_pportdata *ppd;
+	unsigned pidx;
+
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		ppd = dd->pport + pidx;
+
+		spin_lock_irq(&ppd->lflags_lock);
+		ppd->lflags &= ~(QIBL_LINKDOWN | QIBL_LINKINIT |
+				 QIBL_LINKARMED | QIBL_LINKACTIVE |
+				 QIBL_LINKV);
+		spin_unlock_irq(&ppd->lflags_lock);
+		*ppd->statusp &= ~(QIB_STATUS_IB_CONF | QIB_STATUS_IB_READY);
+	}
+	dd->flags &= ~QIB_INITTED;
+
+	/* mask interrupts, but not errors */
+	dd->f_set_intr_state(dd, 0);
+
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		ppd = dd->pport + pidx;
+		dd->f_rcvctrl(ppd, QIB_RCVCTRL_TAILUPD_DIS |
+				   QIB_RCVCTRL_CTXT_DIS |
+				   QIB_RCVCTRL_INTRAVAIL_DIS |
+				   QIB_RCVCTRL_PKEY_ENB, -1);
+		/*
+		 * Gracefully stop all sends allowing any in progress to
+		 * trickle out first.
+		 */
+		dd->f_sendctrl(ppd, QIB_SENDCTRL_CLEAR);
+	}
+
+	/*
+	 * Enough for anything that's going to trickle out to have actually
+	 * done so.
+	 */
+	udelay(20);
+
+	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+		ppd = dd->pport + pidx;
+		dd->f_setextled(ppd, 0); /* make sure LEDs are off */
+
+		if (dd->flags & QIB_HAS_SEND_DMA)
+			qib_teardown_sdma(ppd);
+
+		dd->f_sendctrl(ppd, QIB_SENDCTRL_AVAIL_DIS |
+				    QIB_SENDCTRL_SEND_DIS);
+		/*
+		 * Clear SerdesEnable.
+		 * We can't count on interrupts since we are stopping.
+		 */
+		dd->f_quiet_serdes(ppd);
+
+		if (ppd->qib_wq) {
+			destroy_workqueue(ppd->qib_wq);
+			ppd->qib_wq = NULL;
+		}
+		qib_free_pportdata(ppd);
+	}
+
+}
+
+/**
+ * qib_free_ctxtdata - free a context's allocated data
+ * @dd: the qlogic_ib device
+ * @rcd: the ctxtdata structure
+ *
+ * free up any allocated data for a context
+ * This should not touch anything that would affect a simultaneous
+ * re-allocation of context data, because it is called after qib_mutex
+ * is released (and can be called from reinit as well).
+ * It should never change any chip state, or global driver state.
+ */
+void qib_free_ctxtdata(struct qib_devdata *dd, struct qib_ctxtdata *rcd)
+{
+	if (!rcd)
+		return;
+
+	if (rcd->rcvhdrq) {
+		dma_free_coherent(&dd->pcidev->dev, rcd->rcvhdrq_size,
+				  rcd->rcvhdrq, rcd->rcvhdrq_phys);
+		rcd->rcvhdrq = NULL;
+		if (rcd->rcvhdrtail_kvaddr) {
+			dma_free_coherent(&dd->pcidev->dev, PAGE_SIZE,
+					  rcd->rcvhdrtail_kvaddr,
+					  rcd->rcvhdrqtailaddr_phys);
+			rcd->rcvhdrtail_kvaddr = NULL;
+		}
+	}
+	if (rcd->rcvegrbuf) {
+		unsigned e;
+
+		for (e = 0; e < rcd->rcvegrbuf_chunks; e++) {
+			void *base = rcd->rcvegrbuf[e];
+			size_t size = rcd->rcvegrbuf_size;
+
+			dma_free_coherent(&dd->pcidev->dev, size,
+					  base, rcd->rcvegrbuf_phys[e]);
+		}
+		kfree(rcd->rcvegrbuf);
+		rcd->rcvegrbuf = NULL;
+		kfree(rcd->rcvegrbuf_phys);
+		rcd->rcvegrbuf_phys = NULL;
+		rcd->rcvegrbuf_chunks = 0;
+	}
+
+	kfree(rcd->tid_pg_list);
+	vfree(rcd->user_event_mask);
+	vfree(rcd->subctxt_uregbase);
+	vfree(rcd->subctxt_rcvegrbuf);
+	vfree(rcd->subctxt_rcvhdr_base);
+#ifdef CONFIG_DEBUG_FS
+	kfree(rcd->opstats);
+	rcd->opstats = NULL;
+#endif
+	kfree(rcd);
+}
+
+/*
+ * Perform a PIO buffer bandwidth write test, to verify proper system
+ * configuration.  Even when all the setup calls work, occasionally
+ * BIOS or other issues can prevent write combining from working, or
+ * can cause other bandwidth problems to the chip.
+ *
+ * This test simply writes the same buffer over and over again, and
+ * measures close to the peak bandwidth to the chip (not testing
+ * data bandwidth to the wire).   On chips that use an address-based
+ * trigger to send packets to the wire, this is easy.  On chips that
+ * use a count to trigger, we want to make sure that the packet doesn't
+ * go out on the wire, or trigger flow control checks.
+ */
+static void qib_verify_pioperf(struct qib_devdata *dd)
+{
+	u32 pbnum, cnt, lcnt;
+	u32 __iomem *piobuf;
+	u32 *addr;
+	u64 msecs, emsecs;
+
+	piobuf = dd->f_getsendbuf(dd->pport, 0ULL, &pbnum);
+	if (!piobuf) {
+		qib_devinfo(dd->pcidev,
+			 "No PIObufs for checking perf, skipping\n");
+		return;
+	}
+
+	/*
+	 * Enough to give us a reasonable test, less than piobuf size, and
+	 * likely multiple of store buffer length.
+	 */
+	cnt = 1024;
+
+	addr = vmalloc(cnt);
+	if (!addr) {
+		qib_devinfo(dd->pcidev,
+			 "Couldn't get memory for checking PIO perf, skipping\n");
+		goto done;
+	}
+
+	preempt_disable();  /* we want reasonably accurate elapsed time */
+	msecs = 1 + jiffies_to_msecs(jiffies);
+	for (lcnt = 0; lcnt < 10000U; lcnt++) {
+		/* wait until we cross msec boundary */
+		if (jiffies_to_msecs(jiffies) >= msecs)
+			break;
+		udelay(1);
+	}
+
+	dd->f_set_armlaunch(dd, 0);
+
+	/*
+	 * length 0, no dwords actually sent
+	 */
+	writeq(0, piobuf);
+	qib_flush_wc();
+
+	/*
+	 * This is only roughly accurate, since even with preempt we
+	 * still take interrupts that could take a while.   Running for
+	 * >= 5 msec seems to get us "close enough" to accurate values.
+	 */
+	msecs = jiffies_to_msecs(jiffies);
+	for (emsecs = lcnt = 0; emsecs <= 5UL; lcnt++) {
+		qib_pio_copy(piobuf + 64, addr, cnt >> 2);
+		emsecs = jiffies_to_msecs(jiffies) - msecs;
+	}
+
+	/* 1 GiB/sec, slightly over IB SDR line rate */
+	if (lcnt < (emsecs * 1024U))
+		qib_dev_err(dd,
+			    "Performance problem: bandwidth to PIO buffers is only %u MiB/sec\n",
+			    lcnt / (u32) emsecs);
+
+	preempt_enable();
+
+	vfree(addr);
+
+done:
+	/* disarm piobuf, so it's available again */
+	dd->f_sendctrl(dd->pport, QIB_SENDCTRL_DISARM_BUF(pbnum));
+	qib_sendbuf_done(dd, pbnum);
+	dd->f_set_armlaunch(dd, 1);
+}
+
+void qib_free_devdata(struct qib_devdata *dd)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&qib_devs_lock, flags);
+	idr_remove(&qib_unit_table, dd->unit);
+	list_del(&dd->list);
+	spin_unlock_irqrestore(&qib_devs_lock, flags);
+
+#ifdef CONFIG_DEBUG_FS
+	qib_dbg_ibdev_exit(&dd->verbs_dev);
+#endif
+	free_percpu(dd->int_counter);
+	ib_dealloc_device(&dd->verbs_dev.ibdev);
+}
+
+u64 qib_int_counter(struct qib_devdata *dd)
+{
+	int cpu;
+	u64 int_counter = 0;
+
+	for_each_possible_cpu(cpu)
+		int_counter += *per_cpu_ptr(dd->int_counter, cpu);
+	return int_counter;
+}
+
+u64 qib_sps_ints(void)
+{
+	unsigned long flags;
+	struct qib_devdata *dd;
+	u64 sps_ints = 0;
+
+	spin_lock_irqsave(&qib_devs_lock, flags);
+	list_for_each_entry(dd, &qib_dev_list, list) {
+		sps_ints += qib_int_counter(dd);
+	}
+	spin_unlock_irqrestore(&qib_devs_lock, flags);
+	return sps_ints;
+}
+
+/*
+ * Allocate our primary per-unit data structure.  Must be done via verbs
+ * allocator, because the verbs cleanup process both does cleanup and
+ * free of the data structure.
+ * "extra" is for chip-specific data.
+ *
+ * 

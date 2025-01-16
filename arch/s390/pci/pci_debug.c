@@ -1,177 +1,149 @@
-/*
- *  Copyright IBM Corp. 2012
- *
- *  Author(s):
- *    Jan Glauber <jang@linux.vnet.ibm.com>
+d get their customers updated.
+	 */
+	if (sos->monarch && atomic_add_return(1, &monarchs) > 1) {
+		mprintk(KERN_WARNING "%s: Demoting cpu %d to slave.\n",
+			       __func__, cpu);
+		atomic_dec(&monarchs);
+		sos->monarch = 0;
+	}
+
+	if (!sos->monarch) {
+		ia64_mc_info.imi_rendez_checkin[cpu] = IA64_MCA_RENDEZ_CHECKIN_INIT;
+
+#ifdef CONFIG_KEXEC
+		while (monarch_cpu == -1 && !atomic_read(&kdump_in_progress))
+			udelay(1000);
+#else
+		while (monarch_cpu == -1)
+			cpu_relax();	/* spin until monarch enters */
+#endif
+
+		NOTIFY_INIT(DIE_INIT_SLAVE_ENTER, regs, (long)&nd, 1);
+		NOTIFY_INIT(DIE_INIT_SLAVE_PROCESS, regs, (long)&nd, 1);
+
+#ifdef CONFIG_KEXEC
+		while (monarch_cpu != -1 && !atomic_read(&kdump_in_progress))
+			udelay(1000);
+#else
+		while (monarch_cpu != -1)
+			cpu_relax();	/* spin until monarch leaves */
+#endif
+
+		NOTIFY_INIT(DIE_INIT_SLAVE_LEAVE, regs, (long)&nd, 1);
+
+		mprintk("Slave on cpu %d returning to normal service.\n", cpu);
+		set_curr_task(cpu, previous_current);
+		ia64_mc_info.imi_rendez_checkin[cpu] = IA64_MCA_RENDEZ_CHECKIN_NOTDONE;
+		atomic_dec(&slaves);
+		return;
+	}
+
+	monarch_cpu = cpu;
+	NOTIFY_INIT(DIE_INIT_MONARCH_ENTER, regs, (long)&nd, 1);
+
+	/*
+	 * Wait for a bit.  On some machines (e.g., HP's zx2000 and zx6000, INIT can be
+	 * generated via the BMC's command-line interface, but since the console is on the
+	 * same serial line, the user will need some time to switch out of the BMC before
+	 * the dump begins.
+	 */
+	mprintk("Delaying for 5 seconds...\n");
+	udelay(5*1000000);
+	ia64_wait_for_slaves(cpu, "INIT");
+	/* If nobody intercepts DIE_INIT_MONARCH_PROCESS then we drop through
+	 * to default_monarch_init_process() above and just print all the
+	 * tasks.
+	 */
+	NOTIFY_INIT(DIE_INIT_MONARCH_PROCESS, regs, (long)&nd, 1);
+	NOTIFY_INIT(DIE_INIT_MONARCH_LEAVE, regs, (long)&nd, 1);
+
+	mprintk("\nINIT dump complete.  Monarch on cpu %d returning to normal service.\n", cpu);
+	atomic_dec(&monarchs);
+	set_curr_task(cpu, previous_current);
+	monarch_cpu = -1;
+	return;
+}
+
+static int __init
+ia64_mca_disable_cpe_polling(char *str)
+{
+	cpe_poll_enabled = 0;
+	return 1;
+}
+
+__setup("disable_cpe_poll", ia64_mca_disable_cpe_polling);
+
+static struct irqaction cmci_irqaction = {
+	.handler =	ia64_mca_cmc_int_handler,
+	.name =		"cmc_hndlr"
+};
+
+static struct irqaction cmcp_irqaction = {
+	.handler =	ia64_mca_cmc_int_caller,
+	.name =		"cmc_poll"
+};
+
+static struct irqaction mca_rdzv_irqaction = {
+	.handler =	ia64_mca_rendez_int_handler,
+	.name =		"mca_rdzv"
+};
+
+static struct irqaction mca_wkup_irqaction = {
+	.handler =	ia64_mca_wakeup_int_handler,
+	.name =		"mca_wkup"
+};
+
+#ifdef CONFIG_ACPI
+static struct irqaction mca_cpe_irqaction = {
+	.handler =	ia64_mca_cpe_int_handler,
+	.name =		"cpe_hndlr"
+};
+
+static struct irqaction mca_cpep_irqaction = {
+	.handler =	ia64_mca_cpe_int_caller,
+	.name =		"cpe_poll"
+};
+#endif /* CONFIG_ACPI */
+
+/* Minimal format of the MCA/INIT stacks.  The pseudo processes that run on
+ * these stacks can never sleep, they cannot return from the kernel to user
+ * space, they do not appear in a normal ps listing.  So there is no need to
+ * format most of the fields.
  */
 
-#define KMSG_COMPONENT "zpci"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
-
-#include <linux/kernel.h>
-#include <linux/seq_file.h>
-#include <linux/debugfs.h>
-#include <linux/export.h>
-#include <linux/pci.h>
-#include <asm/debug.h>
-
-#include <asm/pci_dma.h>
-
-static struct dentry *debugfs_root;
-debug_info_t *pci_debug_msg_id;
-EXPORT_SYMBOL_GPL(pci_debug_msg_id);
-debug_info_t *pci_debug_err_id;
-EXPORT_SYMBOL_GPL(pci_debug_err_id);
-
-static char *pci_perf_names[] = {
-	/* hardware counters */
-	"Load operations",
-	"Store operations",
-	"Store block operations",
-	"Refresh operations",
-	"DMA read bytes",
-	"DMA write bytes",
-};
-
-static char *pci_sw_names[] = {
-	"Allocated pages",
-	"Mapped pages",
-	"Unmapped pages",
-};
-
-static void pci_sw_counter_show(struct seq_file *m)
+static void
+format_mca_init_stack(void *mca_data, unsigned long offset,
+		const char *type, int cpu)
 {
-	struct zpci_dev *zdev = m->private;
-	atomic64_t *counter = &zdev->allocated_pages;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(pci_sw_names); i++, counter++)
-		seq_printf(m, "%26s:\t%llu\n", pci_sw_names[i],
-			   atomic64_read(counter));
+	struct task_struct *p = (struct task_struct *)((char *)mca_data + offset);
+	struct thread_info *ti;
+	memset(p, 0, KERNEL_STACK_SIZE);
+	ti = task_thread_info(p);
+	ti->flags = _TIF_MCA_INIT;
+	ti->preempt_count = 1;
+	ti->task = p;
+	ti->cpu = cpu;
+	p->stack = ti;
+	p->state = TASK_UNINTERRUPTIBLE;
+	cpumask_set_cpu(cpu, &p->cpus_allowed);
+	INIT_LIST_HEAD(&p->tasks);
+	p->parent = p->real_parent = p->group_leader = p;
+	INIT_LIST_HEAD(&p->children);
+	INIT_LIST_HEAD(&p->sibling);
+	strncpy(p->comm, type, sizeof(p->comm)-1);
 }
 
-static int pci_perf_show(struct seq_file *m, void *v)
+/* Caller prevents this from being called after init */
+static void * __init_refok mca_bootmem(void)
 {
-	struct zpci_dev *zdev = m->private;
-	u64 *stat;
-	int i;
-
-	if (!zdev)
-		return 0;
-
-	mutex_lock(&zdev->lock);
-	if (!zdev->fmb) {
-		mutex_unlock(&zdev->lock);
-		seq_puts(m, "FMB statistics disabled\n");
-		return 0;
-	}
-
-	/* header */
-	seq_printf(m, "FMB @ %p\n", zdev->fmb);
-	seq_printf(m, "Update interval: %u ms\n", zdev->fmb_update);
-	seq_printf(m, "Samples: %u\n", zdev->fmb->samples);
-	seq_printf(m, "Last update TOD: %Lx\n", zdev->fmb->last_update);
-
-	/* hardware counters */
-	stat = (u64 *) &zdev->fmb->ld_ops;
-	for (i = 0; i < 4; i++)
-		seq_printf(m, "%26s:\t%llu\n",
-			   pci_perf_names[i], *(stat + i));
-	if (zdev->fmb->dma_valid)
-		for (i = 4; i < 6; i++)
-			seq_printf(m, "%26s:\t%llu\n",
-				   pci_perf_names[i], *(stat + i));
-
-	pci_sw_counter_show(m);
-	mutex_unlock(&zdev->lock);
-	return 0;
+	return __alloc_bootmem(sizeof(struct ia64_mca_cpu),
+	                    KERNEL_STACK_SIZE, 0);
 }
 
-static ssize_t pci_perf_seq_write(struct file *file, const char __user *ubuf,
-				  size_t count, loff_t *off)
+/* Do per-CPU MCA-related initialization.  */
+void
+ia64_mca_cpu_init(void *cpu_data)
 {
-	struct zpci_dev *zdev = ((struct seq_file *) file->private_data)->private;
-	unsigned long val;
-	int rc;
-
-	if (!zdev)
-		return 0;
-
-	rc = kstrtoul_from_user(ubuf, count, 10, &val);
-	if (rc)
-		return rc;
-
-	mutex_lock(&zdev->lock);
-	switch (val) {
-	case 0:
-		rc = zpci_fmb_disable_device(zdev);
-		break;
-	case 1:
-		rc = zpci_fmb_enable_device(zdev);
-		break;
-	}
-	mutex_unlock(&zdev->lock);
-	return rc ? rc : count;
-}
-
-static int pci_perf_seq_open(struct inode *inode, struct file *filp)
-{
-	return single_open(filp, pci_perf_show,
-			   file_inode(filp)->i_private);
-}
-
-static const struct file_operations debugfs_pci_perf_fops = {
-	.open	 = pci_perf_seq_open,
-	.read	 = seq_read,
-	.write	 = pci_perf_seq_write,
-	.llseek  = seq_lseek,
-	.release = single_release,
-};
-
-void zpci_debug_init_device(struct zpci_dev *zdev)
-{
-	zdev->debugfs_dev = debugfs_create_dir(dev_name(&zdev->pdev->dev),
-					       debugfs_root);
-	if (IS_ERR(zdev->debugfs_dev))
-		zdev->debugfs_dev = NULL;
-
-	zdev->debugfs_perf = debugfs_create_file("statistics",
-				S_IFREG | S_IRUGO | S_IWUSR,
-				zdev->debugfs_dev, zdev,
-				&debugfs_pci_perf_fops);
-	if (IS_ERR(zdev->debugfs_perf))
-		zdev->debugfs_perf = NULL;
-}
-
-void zpci_debug_exit_device(struct zpci_dev *zdev)
-{
-	debugfs_remove(zdev->debugfs_perf);
-	debugfs_remove(zdev->debugfs_dev);
-}
-
-int __init zpci_debug_init(void)
-{
-	/* event trace buffer */
-	pci_debug_msg_id = debug_register("pci_msg", 8, 1, 8 * sizeof(long));
-	if (!pci_debug_msg_id)
-		return -EINVAL;
-	debug_register_view(pci_debug_msg_id, &debug_sprintf_view);
-	debug_set_level(pci_debug_msg_id, 3);
-
-	/* error log */
-	pci_debug_err_id = debug_register("pci_error", 2, 1, 16);
-	if (!pci_debug_err_id)
-		return -EINVAL;
-	debug_register_view(pci_debug_err_id, &debug_hex_ascii_view);
-	debug_set_level(pci_debug_err_id, 6);
-
-	debugfs_root = debugfs_create_dir("pci", NULL);
-	return 0;
-}
-
-void zpci_debug_exit(void)
-{
-	debug_unregister(pci_debug_msg_id);
-	debug_unregister(pci_debug_err_id);
-	debugfs_remove(debugfs_root);
-}
+	void *pal_vaddr;
+	void *data;
+	long sz = 

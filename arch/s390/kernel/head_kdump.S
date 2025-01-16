@@ -1,100 +1,51 @@
 /*
- * S390 kdump lowlevel functions (new kernel)
+ * I/O SAPIC support.
  *
- * Copyright IBM Corp. 2011
- * Author(s): Michael Holzheu <holzheu@linux.vnet.ibm.com>
+ * Copyright (C) 1999 Intel Corp.
+ * Copyright (C) 1999 Asit Mallick <asit.k.mallick@intel.com>
+ * Copyright (C) 2000-2002 J.I. Lee <jung-ik.lee@intel.com>
+ * Copyright (C) 1999-2000, 2002-2003 Hewlett-Packard Co.
+ *	David Mosberger-Tang <davidm@hpl.hp.com>
+ * Copyright (C) 1999 VA Linux Systems
+ * Copyright (C) 1999,2000 Walt Drummond <drummond@valinux.com>
+ *
+ * 00/04/19	D. Mosberger	Rewritten to mirror more closely the x86 I/O
+ *				APIC code.  In particular, we now have separate
+ *				handlers for edge and level triggered
+ *				interrupts.
+ * 00/10/27	Asit Mallick, Goutham Rao <goutham.rao@intel.com> IRQ vector
+ *				allocation PCI to vector mapping, shared PCI
+ *				interrupts.
+ * 00/10/27	D. Mosberger	Document things a bit more to make them more
+ *				understandable.  Clean up much of the old
+ *				IOSAPIC cruft.
+ * 01/07/27	J.I. Lee	PCI irq routing, Platform/Legacy interrupts
+ *				and fixes for ACPI S5(SoftOff) support.
+ * 02/01/23	J.I. Lee	iosapic pgm fixes for PCI irq routing from _PRT
+ * 02/01/07     E. Focht        <efocht@ess.nec.de> Redirectable interrupt
+ *				vectors in iosapic_set_affinity(),
+ *				initializations for /proc/irq/#/smp_affinity
+ * 02/04/02	P. Diefenbaugh	Cleaned up ACPI PCI IRQ routing.
+ * 02/04/18	J.I. Lee	bug fix in iosapic_init_pci_irq
+ * 02/04/30	J.I. Lee	bug fix in find_iosapic to fix ACPI PCI IRQ to
+ *				IOSAPIC mapping error
+ * 02/07/29	T. Kochi	Allocate interrupt vectors dynamically
+ * 02/08/04	T. Kochi	Cleaned up terminology (irq, global system
+ *				interrupt, vector, etc.)
+ * 02/09/20	D. Mosberger	Simplified by taking advantage of ACPI's
+ *				pci_irq code.
+ * 03/02/19	B. Helgaas	Make pcat_compat system-wide, not per-IOSAPIC.
+ *				Remove iosapic_address & gsi_base from
+ *				external interfaces.  Rationalize
+ *				__init/__devinit attributes.
+ * 04/12/04 Ashok Raj	<ashok.raj@intel.com> Intel Corporation 2004
+ *				Updated to work with irq migration necessary
+ *				for CPU Hotplug
  */
-
-#include <asm/sigp.h>
-
-#define DATAMOVER_ADDR	0x4000
-#define COPY_PAGE_ADDR	0x6000
-
-#ifdef CONFIG_CRASH_DUMP
-
-#
-# kdump entry (new kernel - not yet relocated)
-#
-# Note: This code has to be position independent
-#
-
-.align 2
-.Lep_startup_kdump:
-	lhi	%r1,2				# mode 2 = esame (dump)
-	sigp	%r1,%r0,SIGP_SET_ARCHITECTURE	# Switch to esame mode
-	sam64					# Switch to 64 bit addressing
-	basr	%r13,0
-.Lbase:
-	larl	%r2,.Lbase_addr			# Check, if we have been
-	lg	%r2,0(%r2)			# already relocated:
-	clgr	%r2,%r13			#
-	jne	.Lrelocate			# No : Start data mover
-	lghi	%r2,0				# Yes: Start kdump kernel
-	brasl	%r14,startup_kdump_relocated
-
-.Lrelocate:
-	larl	%r4,startup
-	lg	%r2,0x418(%r4)			# Get kdump base
-	lg	%r3,0x420(%r4)			# Get kdump size
-
-	larl	%r10,.Lcopy_start		# Source of data mover
-	lghi	%r8,DATAMOVER_ADDR		# Target of data mover
-	mvc	0(256,%r8),0(%r10)		# Copy data mover code
-
-	agr	%r8,%r2				# Copy data mover to
-	mvc	0(256,%r8),0(%r10)		# reserved mem
-
-	lghi	%r14,DATAMOVER_ADDR		# Jump to copied data mover
-	basr	%r14,%r14
-.Lbase_addr:
-	.quad	.Lbase
-
-#
-# kdump data mover code (runs at address DATAMOVER_ADDR)
-#
-# r2: kdump base address
-# r3: kdump size
-#
-.Lcopy_start:
-	basr	%r13,0				# Base
-0:
-	lgr	%r11,%r2			# Save kdump base address
-	lgr	%r12,%r2
-	agr	%r12,%r3			# Compute kdump end address
-
-	lghi	%r5,0
-	lghi	%r10,COPY_PAGE_ADDR		# Load copy page address
-1:
-	mvc	0(256,%r10),0(%r5)		# Copy old kernel to tmp
-	mvc	0(256,%r5),0(%r11)		# Copy new kernel to old
-	mvc	0(256,%r11),0(%r10)		# Copy tmp to new
-	aghi	%r11,256
-	aghi	%r5,256
-	clgr	%r11,%r12
-	jl	1b
-
-	lg	%r14,.Lstartup_kdump-0b(%r13)
-	basr	%r14,%r14			# Start relocated kernel
-.Lstartup_kdump:
-	.long	0x00000000,0x00000000 + startup_kdump_relocated
-.Lcopy_end:
-
-#
-# Startup of kdump (relocated new kernel)
-#
-.align 2
-startup_kdump_relocated:
-	basr	%r13,0
-0:	lpswe	.Lrestart_psw-0b(%r13)		# Start new kernel...
-.align	8
-.Lrestart_psw:
-	.quad	0x0000000080000000,0x0000000000000000 + startup
-#else
-.align 2
-.Lep_startup_kdump:
-	larl	%r13,startup_kdump_crash
-	lpswe	0(%r13)
-.align 8
-startup_kdump_crash:
-	.quad	0x0002000080000000,0x0000000000000000 + startup_kdump_crash
-#endif /* CONFIG_CRASH_DUMP */
+/*
+ * Here is what the interrupt logic between a PCI device and the kernel looks
+ * like:
+ *
+ * (1) A PCI device raises one of the four interrupt pins (INTA, INTB, INTC,
+ *     INTD).  The device is uniquely identified by its bus-, and slot-number
+ *     (the function number does not matter here because all functions 

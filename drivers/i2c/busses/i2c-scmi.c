@@ -1,441 +1,432 @@
 /*
- * SMBus driver for ACPI SMBus CMI
+ * Copyright (c) 2006, 2007, 2008, 2009, 2010 QLogic Corporation.
+ * All rights reserved.
+ * Copyright (c) 2005, 2006 PathScale, Inc. All rights reserved.
  *
- * Copyright (C) 2009 Crane Cai <crane.cai@amd.com>
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation version 2.
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/kernel.h>
-#include <linux/stddef.h>
-#include <linux/i2c.h>
-#include <linux/acpi.h>
+#include "qib.h"
 
-#define ACPI_SMBUS_HC_CLASS		"smbus"
-#define ACPI_SMBUS_HC_DEVICE_NAME	"cmi"
+/* cut down ridiculously long IB macro names */
+#define OP(x) IB_OPCODE_UC_##x
 
-/* SMBUS HID definition as supported by Microsoft Windows */
-#define ACPI_SMBUS_MS_HID		"SMB0001"
-
-ACPI_MODULE_NAME("smbus_cmi");
-
-struct smbus_methods_t {
-	char *mt_info;
-	char *mt_sbr;
-	char *mt_sbw;
-};
-
-struct acpi_smbus_cmi {
-	acpi_handle handle;
-	struct i2c_adapter adapter;
-	u8 cap_info:1;
-	u8 cap_read:1;
-	u8 cap_write:1;
-	struct smbus_methods_t *methods;
-};
-
-static const struct smbus_methods_t smbus_methods = {
-	.mt_info = "_SBI",
-	.mt_sbr  = "_SBR",
-	.mt_sbw  = "_SBW",
-};
-
-/* Some IBM BIOSes omit the leading underscore */
-static const struct smbus_methods_t ibm_smbus_methods = {
-	.mt_info = "SBI_",
-	.mt_sbr  = "SBR_",
-	.mt_sbw  = "SBW_",
-};
-
-static const struct acpi_device_id acpi_smbus_cmi_ids[] = {
-	{"SMBUS01", (kernel_ulong_t)&smbus_methods},
-	{ACPI_SMBUS_IBM_HID, (kernel_ulong_t)&ibm_smbus_methods},
-	{ACPI_SMBUS_MS_HID, (kernel_ulong_t)&smbus_methods},
-	{"", 0}
-};
-MODULE_DEVICE_TABLE(acpi, acpi_smbus_cmi_ids);
-
-#define ACPI_SMBUS_STATUS_OK			0x00
-#define ACPI_SMBUS_STATUS_FAIL			0x07
-#define ACPI_SMBUS_STATUS_DNAK			0x10
-#define ACPI_SMBUS_STATUS_DERR			0x11
-#define ACPI_SMBUS_STATUS_CMD_DENY		0x12
-#define ACPI_SMBUS_STATUS_UNKNOWN		0x13
-#define ACPI_SMBUS_STATUS_ACC_DENY		0x17
-#define ACPI_SMBUS_STATUS_TIMEOUT		0x18
-#define ACPI_SMBUS_STATUS_NOTSUP		0x19
-#define ACPI_SMBUS_STATUS_BUSY			0x1a
-#define ACPI_SMBUS_STATUS_PEC			0x1f
-
-#define ACPI_SMBUS_PRTCL_WRITE			0x00
-#define ACPI_SMBUS_PRTCL_READ			0x01
-#define ACPI_SMBUS_PRTCL_QUICK			0x02
-#define ACPI_SMBUS_PRTCL_BYTE			0x04
-#define ACPI_SMBUS_PRTCL_BYTE_DATA		0x06
-#define ACPI_SMBUS_PRTCL_WORD_DATA		0x08
-#define ACPI_SMBUS_PRTCL_BLOCK_DATA		0x0a
-
-
-static int
-acpi_smbus_cmi_access(struct i2c_adapter *adap, u16 addr, unsigned short flags,
-		   char read_write, u8 command, int size,
-		   union i2c_smbus_data *data)
+/**
+ * qib_make_uc_req - construct a request packet (SEND, RDMA write)
+ * @qp: a pointer to the QP
+ *
+ * Return 1 if constructed; otherwise, return 0.
+ */
+int qib_make_uc_req(struct qib_qp *qp)
 {
-	int result = 0;
-	struct acpi_smbus_cmi *smbus_cmi = adap->algo_data;
-	unsigned char protocol;
-	acpi_status status = 0;
-	struct acpi_object_list input;
-	union acpi_object mt_params[5];
-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
-	union acpi_object *obj;
-	union acpi_object *pkg;
-	char *method;
-	int len = 0;
+	struct qib_other_headers *ohdr;
+	struct qib_swqe *wqe;
+	unsigned long flags;
+	u32 hwords;
+	u32 bth0;
+	u32 len;
+	u32 pmtu = qp->pmtu;
+	int ret = 0;
 
-	dev_dbg(&adap->dev, "access size: %d %s\n", size,
-		(read_write) ? "READ" : "WRITE");
-	switch (size) {
-	case I2C_SMBUS_QUICK:
-		protocol = ACPI_SMBUS_PRTCL_QUICK;
-		command = 0;
-		if (read_write == I2C_SMBUS_WRITE) {
-			mt_params[3].type = ACPI_TYPE_INTEGER;
-			mt_params[3].integer.value = 0;
-			mt_params[4].type = ACPI_TYPE_INTEGER;
-			mt_params[4].integer.value = 0;
+	spin_lock_irqsave(&qp->s_lock, flags);
+
+	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_SEND_OK)) {
+		if (!(ib_qib_state_ops[qp->state] & QIB_FLUSH_SEND))
+			goto bail;
+		/* We are in the error state, flush the work request. */
+		if (qp->s_last == qp->s_head)
+			goto bail;
+		/* If DMAs are in progress, we can't flush immediately. */
+		if (atomic_read(&qp->s_dma_busy)) {
+			qp->s_flags |= QIB_S_WAIT_DMA;
+			goto bail;
 		}
-		break;
+		wqe = get_swqe_ptr(qp, qp->s_last);
+		qib_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
+		goto done;
+	}
 
-	case I2C_SMBUS_BYTE:
-		protocol = ACPI_SMBUS_PRTCL_BYTE;
-		if (read_write == I2C_SMBUS_WRITE) {
-			mt_params[3].type = ACPI_TYPE_INTEGER;
-			mt_params[3].integer.value = 0;
-			mt_params[4].type = ACPI_TYPE_INTEGER;
-			mt_params[4].integer.value = 0;
-		} else {
-			command = 0;
-		}
-		break;
+	ohdr = &qp->s_hdr->u.oth;
+	if (qp->remote_ah_attr.ah_flags & IB_AH_GRH)
+		ohdr = &qp->s_hdr->u.l.oth;
 
-	case I2C_SMBUS_BYTE_DATA:
-		protocol = ACPI_SMBUS_PRTCL_BYTE_DATA;
-		if (read_write == I2C_SMBUS_WRITE) {
-			mt_params[3].type = ACPI_TYPE_INTEGER;
-			mt_params[3].integer.value = 1;
-			mt_params[4].type = ACPI_TYPE_INTEGER;
-			mt_params[4].integer.value = data->byte;
-		}
-		break;
+	/* header size in 32-bit words LRH+BTH = (8+12)/4. */
+	hwords = 5;
+	bth0 = 0;
 
-	case I2C_SMBUS_WORD_DATA:
-		protocol = ACPI_SMBUS_PRTCL_WORD_DATA;
-		if (read_write == I2C_SMBUS_WRITE) {
-			mt_params[3].type = ACPI_TYPE_INTEGER;
-			mt_params[3].integer.value = 2;
-			mt_params[4].type = ACPI_TYPE_INTEGER;
-			mt_params[4].integer.value = data->word;
-		}
-		break;
-
-	case I2C_SMBUS_BLOCK_DATA:
-		protocol = ACPI_SMBUS_PRTCL_BLOCK_DATA;
-		if (read_write == I2C_SMBUS_WRITE) {
-			len = data->block[0];
-			if (len == 0 || len > I2C_SMBUS_BLOCK_MAX)
-				return -EINVAL;
-			mt_params[3].type = ACPI_TYPE_INTEGER;
-			mt_params[3].integer.value = len;
-			mt_params[4].type = ACPI_TYPE_BUFFER;
-			mt_params[4].buffer.length = len;
-			mt_params[4].buffer.pointer = data->block + 1;
-		}
-		break;
-
+	/* Get the next send request. */
+	wqe = get_swqe_ptr(qp, qp->s_cur);
+	qp->s_wqe = NULL;
+	switch (qp->s_state) {
 	default:
-		dev_warn(&adap->dev, "Unsupported transaction %d\n", size);
-		return -EOPNOTSUPP;
-	}
+		if (!(ib_qib_state_ops[qp->state] &
+		    QIB_PROCESS_NEXT_SEND_OK))
+			goto bail;
+		/* Check if send work queue is empty. */
+		if (qp->s_cur == qp->s_head)
+			goto bail;
+		/*
+		 * Start a new request.
+		 */
+		wqe->psn = qp->s_next_psn;
+		qp->s_psn = qp->s_next_psn;
+		qp->s_sge.sge = wqe->sg_list[0];
+		qp->s_sge.sg_list = wqe->sg_list + 1;
+		qp->s_sge.num_sge = wqe->wr.num_sge;
+		qp->s_sge.total_len = wqe->length;
+		len = wqe->length;
+		qp->s_len = len;
+		switch (wqe->wr.opcode) {
+		case IB_WR_SEND:
+		case IB_WR_SEND_WITH_IMM:
+			if (len > pmtu) {
+				qp->s_state = OP(SEND_FIRST);
+				len = pmtu;
+				break;
+			}
+			if (wqe->wr.opcode == IB_WR_SEND)
+				qp->s_state = OP(SEND_ONLY);
+			else {
+				qp->s_state =
+					OP(SEND_ONLY_WITH_IMMEDIATE);
+				/* Immediate data comes after the BTH */
+				ohdr->u.imm_data = wqe->wr.ex.imm_data;
+				hwords += 1;
+			}
+			if (wqe->wr.send_flags & IB_SEND_SOLICITED)
+				bth0 |= IB_BTH_SOLICITED;
+			qp->s_wqe = wqe;
+			if (++qp->s_cur >= qp->s_size)
+				qp->s_cur = 0;
+			break;
 
-	if (read_write == I2C_SMBUS_READ) {
-		protocol |= ACPI_SMBUS_PRTCL_READ;
-		method = smbus_cmi->methods->mt_sbr;
-		input.count = 3;
-	} else {
-		protocol |= ACPI_SMBUS_PRTCL_WRITE;
-		method = smbus_cmi->methods->mt_sbw;
-		input.count = 5;
-	}
+		case IB_WR_RDMA_WRITE:
+		case IB_WR_RDMA_WRITE_WITH_IMM:
+			ohdr->u.rc.reth.vaddr =
+				cpu_to_be64(wqe->rdma_wr.remote_addr);
+			ohdr->u.rc.reth.rkey =
+				cpu_to_be32(wqe->rdma_wr.rkey);
+			ohdr->u.rc.reth.length = cpu_to_be32(len);
+			hwords += sizeof(struct ib_reth) / 4;
+			if (len > pmtu) {
+				qp->s_state = OP(RDMA_WRITE_FIRST);
+				len = pmtu;
+				break;
+			}
+			if (wqe->wr.opcode == IB_WR_RDMA_WRITE)
+				qp->s_state = OP(RDMA_WRITE_ONLY);
+			else {
+				qp->s_state =
+					OP(RDMA_WRITE_ONLY_WITH_IMMEDIATE);
+				/* Immediate data comes after the RETH */
+				ohdr->u.rc.imm_data = wqe->wr.ex.imm_data;
+				hwords += 1;
+				if (wqe->wr.send_flags & IB_SEND_SOLICITED)
+					bth0 |= IB_BTH_SOLICITED;
+			}
+			qp->s_wqe = wqe;
+			if (++qp->s_cur >= qp->s_size)
+				qp->s_cur = 0;
+			break;
 
-	input.pointer = mt_params;
-	mt_params[0].type = ACPI_TYPE_INTEGER;
-	mt_params[0].integer.value = protocol;
-	mt_params[1].type = ACPI_TYPE_INTEGER;
-	mt_params[1].integer.value = addr;
-	mt_params[2].type = ACPI_TYPE_INTEGER;
-	mt_params[2].integer.value = command;
-
-	status = acpi_evaluate_object(smbus_cmi->handle, method, &input,
-				      &buffer);
-	if (ACPI_FAILURE(status)) {
-		ACPI_ERROR((AE_INFO, "Evaluating %s: %i", method, status));
-		return -EIO;
-	}
-
-	pkg = buffer.pointer;
-	if (pkg && pkg->type == ACPI_TYPE_PACKAGE)
-		obj = pkg->package.elements;
-	else {
-		ACPI_ERROR((AE_INFO, "Invalid argument type"));
-		result = -EIO;
-		goto out;
-	}
-	if (obj == NULL || obj->type != ACPI_TYPE_INTEGER) {
-		ACPI_ERROR((AE_INFO, "Invalid argument type"));
-		result = -EIO;
-		goto out;
-	}
-
-	result = obj->integer.value;
-	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "%s return status: %i\n",
-			  method, result));
-
-	switch (result) {
-	case ACPI_SMBUS_STATUS_OK:
-		result = 0;
-		break;
-	case ACPI_SMBUS_STATUS_BUSY:
-		result = -EBUSY;
-		goto out;
-	case ACPI_SMBUS_STATUS_TIMEOUT:
-		result = -ETIMEDOUT;
-		goto out;
-	case ACPI_SMBUS_STATUS_DNAK:
-		result = -ENXIO;
-		goto out;
-	default:
-		result = -EIO;
-		goto out;
-	}
-
-	if (read_write == I2C_SMBUS_WRITE || size == I2C_SMBUS_QUICK)
-		goto out;
-
-	obj = pkg->package.elements + 1;
-	if (obj->type != ACPI_TYPE_INTEGER) {
-		ACPI_ERROR((AE_INFO, "Invalid argument type"));
-		result = -EIO;
-		goto out;
-	}
-
-	len = obj->integer.value;
-	obj = pkg->package.elements + 2;
-	switch (size) {
-	case I2C_SMBUS_BYTE:
-	case I2C_SMBUS_BYTE_DATA:
-	case I2C_SMBUS_WORD_DATA:
-		if (obj->type != ACPI_TYPE_INTEGER) {
-			ACPI_ERROR((AE_INFO, "Invalid argument type"));
-			result = -EIO;
-			goto out;
+		default:
+			goto bail;
 		}
-		if (len == 2)
-			data->word = obj->integer.value;
-		else
-			data->byte = obj->integer.value;
 		break;
-	case I2C_SMBUS_BLOCK_DATA:
-		if (obj->type != ACPI_TYPE_BUFFER) {
-			ACPI_ERROR((AE_INFO, "Invalid argument type"));
-			result = -EIO;
-			goto out;
+
+	case OP(SEND_FIRST):
+		qp->s_state = OP(SEND_MIDDLE);
+		/* FALLTHROUGH */
+	case OP(SEND_MIDDLE):
+		len = qp->s_len;
+		if (len > pmtu) {
+			len = pmtu;
+			break;
 		}
-		if (len == 0 || len > I2C_SMBUS_BLOCK_MAX)
-			return -EPROTO;
-		data->block[0] = len;
-		memcpy(data->block + 1, obj->buffer.pointer, len);
+		if (wqe->wr.opcode == IB_WR_SEND)
+			qp->s_state = OP(SEND_LAST);
+		else {
+			qp->s_state = OP(SEND_LAST_WITH_IMMEDIATE);
+			/* Immediate data comes after the BTH */
+			ohdr->u.imm_data = wqe->wr.ex.imm_data;
+			hwords += 1;
+		}
+		if (wqe->wr.send_flags & IB_SEND_SOLICITED)
+			bth0 |= IB_BTH_SOLICITED;
+		qp->s_wqe = wqe;
+		if (++qp->s_cur >= qp->s_size)
+			qp->s_cur = 0;
+		break;
+
+	case OP(RDMA_WRITE_FIRST):
+		qp->s_state = OP(RDMA_WRITE_MIDDLE);
+		/* FALLTHROUGH */
+	case OP(RDMA_WRITE_MIDDLE):
+		len = qp->s_len;
+		if (len > pmtu) {
+			len = pmtu;
+			break;
+		}
+		if (wqe->wr.opcode == IB_WR_RDMA_WRITE)
+			qp->s_state = OP(RDMA_WRITE_LAST);
+		else {
+			qp->s_state =
+				OP(RDMA_WRITE_LAST_WITH_IMMEDIATE);
+			/* Immediate data comes after the BTH */
+			ohdr->u.imm_data = wqe->wr.ex.imm_data;
+			hwords += 1;
+			if (wqe->wr.send_flags & IB_SEND_SOLICITED)
+				bth0 |= IB_BTH_SOLICITED;
+		}
+		qp->s_wqe = wqe;
+		if (++qp->s_cur >= qp->s_size)
+			qp->s_cur = 0;
 		break;
 	}
+	qp->s_len -= len;
+	qp->s_hdrwords = hwords;
+	qp->s_cur_sge = &qp->s_sge;
+	qp->s_cur_size = len;
+	qib_make_ruc_header(qp, ohdr, bth0 | (qp->s_state << 24),
+			    qp->s_next_psn++ & QIB_PSN_MASK);
+done:
+	ret = 1;
+	goto unlock;
 
-out:
-	kfree(buffer.pointer);
-	dev_dbg(&adap->dev, "Transaction status: %i\n", result);
-	return result;
-}
-
-static u32 acpi_smbus_cmi_func(struct i2c_adapter *adapter)
-{
-	struct acpi_smbus_cmi *smbus_cmi = adapter->algo_data;
-	u32 ret;
-
-	ret = smbus_cmi->cap_read | smbus_cmi->cap_write ?
-		I2C_FUNC_SMBUS_QUICK : 0;
-
-	ret |= smbus_cmi->cap_read ?
-		(I2C_FUNC_SMBUS_READ_BYTE |
-		I2C_FUNC_SMBUS_READ_BYTE_DATA |
-		I2C_FUNC_SMBUS_READ_WORD_DATA |
-		I2C_FUNC_SMBUS_READ_BLOCK_DATA) : 0;
-
-	ret |= smbus_cmi->cap_write ?
-		(I2C_FUNC_SMBUS_WRITE_BYTE |
-		I2C_FUNC_SMBUS_WRITE_BYTE_DATA |
-		I2C_FUNC_SMBUS_WRITE_WORD_DATA |
-		I2C_FUNC_SMBUS_WRITE_BLOCK_DATA) : 0;
-
+bail:
+	qp->s_flags &= ~QIB_S_BUSY;
+unlock:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
 	return ret;
 }
 
-static const struct i2c_algorithm acpi_smbus_cmi_algorithm = {
-	.smbus_xfer = acpi_smbus_cmi_access,
-	.functionality = acpi_smbus_cmi_func,
-};
-
-
-static int acpi_smbus_cmi_add_cap(struct acpi_smbus_cmi *smbus_cmi,
-				  const char *name)
+/**
+ * qib_uc_rcv - handle an incoming UC packet
+ * @ibp: the port the packet came in on
+ * @hdr: the header of the packet
+ * @has_grh: true if the packet has a GRH
+ * @data: the packet data
+ * @tlen: the length of the packet
+ * @qp: the QP for this packet.
+ *
+ * This is called from qib_qp_rcv() to process an incoming UC packet
+ * for the given QP.
+ * Called at interrupt level.
+ */
+void qib_uc_rcv(struct qib_ibport *ibp, struct qib_ib_header *hdr,
+		int has_grh, void *data, u32 tlen, struct qib_qp *qp)
 {
-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
-	union acpi_object *obj;
-	acpi_status status;
-
-	if (!strcmp(name, smbus_cmi->methods->mt_info)) {
-		status = acpi_evaluate_object(smbus_cmi->handle,
-					smbus_cmi->methods->mt_info,
-					NULL, &buffer);
-		if (ACPI_FAILURE(status)) {
-			ACPI_ERROR((AE_INFO, "Evaluating %s: %i",
-				   smbus_cmi->methods->mt_info, status));
-			return -EIO;
-		}
-
-		obj = buffer.pointer;
-		if (obj && obj->type == ACPI_TYPE_PACKAGE)
-			obj = obj->package.elements;
-		else {
-			ACPI_ERROR((AE_INFO, "Invalid argument type"));
-			kfree(buffer.pointer);
-			return -EIO;
-		}
-
-		if (obj->type != ACPI_TYPE_INTEGER) {
-			ACPI_ERROR((AE_INFO, "Invalid argument type"));
-			kfree(buffer.pointer);
-			return -EIO;
-		} else
-			ACPI_DEBUG_PRINT((ACPI_DB_INFO, "SMBus CMI Version %x"
-					  "\n", (int)obj->integer.value));
-
-		kfree(buffer.pointer);
-		smbus_cmi->cap_info = 1;
-	} else if (!strcmp(name, smbus_cmi->methods->mt_sbr))
-		smbus_cmi->cap_read = 1;
-	else if (!strcmp(name, smbus_cmi->methods->mt_sbw))
-		smbus_cmi->cap_write = 1;
-	else
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Unsupported CMI method: %s\n",
-				 name));
-
-	return 0;
-}
-
-static acpi_status acpi_smbus_cmi_query_methods(acpi_handle handle, u32 level,
-			void *context, void **return_value)
-{
-	char node_name[5];
-	struct acpi_buffer buffer = { sizeof(node_name), node_name };
-	struct acpi_smbus_cmi *smbus_cmi = context;
-	acpi_status status;
-
-	status = acpi_get_name(handle, ACPI_SINGLE_NAME, &buffer);
-
-	if (ACPI_SUCCESS(status))
-		acpi_smbus_cmi_add_cap(smbus_cmi, node_name);
-
-	return AE_OK;
-}
-
-static int acpi_smbus_cmi_add(struct acpi_device *device)
-{
-	struct acpi_smbus_cmi *smbus_cmi;
-	const struct acpi_device_id *id;
+	struct qib_other_headers *ohdr;
+	u32 opcode;
+	u32 hdrsize;
+	u32 psn;
+	u32 pad;
+	struct ib_wc wc;
+	u32 pmtu = qp->pmtu;
+	struct ib_reth *reth;
 	int ret;
 
-	smbus_cmi = kzalloc(sizeof(struct acpi_smbus_cmi), GFP_KERNEL);
-	if (!smbus_cmi)
-		return -ENOMEM;
-
-	smbus_cmi->handle = device->handle;
-	strcpy(acpi_device_name(device), ACPI_SMBUS_HC_DEVICE_NAME);
-	strcpy(acpi_device_class(device), ACPI_SMBUS_HC_CLASS);
-	device->driver_data = smbus_cmi;
-	smbus_cmi->cap_info = 0;
-	smbus_cmi->cap_read = 0;
-	smbus_cmi->cap_write = 0;
-
-	for (id = acpi_smbus_cmi_ids; id->id[0]; id++)
-		if (!strcmp(id->id, acpi_device_hid(device)))
-			smbus_cmi->methods =
-				(struct smbus_methods_t *) id->driver_data;
-
-	acpi_walk_namespace(ACPI_TYPE_METHOD, smbus_cmi->handle, 1,
-			    acpi_smbus_cmi_query_methods, NULL, smbus_cmi, NULL);
-
-	if (smbus_cmi->cap_info == 0) {
-		ret = -ENODEV;
-		goto err;
+	/* Check for GRH */
+	if (!has_grh) {
+		ohdr = &hdr->u.oth;
+		hdrsize = 8 + 12;       /* LRH + BTH */
+	} else {
+		ohdr = &hdr->u.l.oth;
+		hdrsize = 8 + 40 + 12;  /* LRH + GRH + BTH */
 	}
 
-	snprintf(smbus_cmi->adapter.name, sizeof(smbus_cmi->adapter.name),
-		"SMBus CMI adapter %s",
-		acpi_device_name(device));
-	smbus_cmi->adapter.owner = THIS_MODULE;
-	smbus_cmi->adapter.algo = &acpi_smbus_cmi_algorithm;
-	smbus_cmi->adapter.algo_data = smbus_cmi;
-	smbus_cmi->adapter.class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
-	smbus_cmi->adapter.dev.parent = &device->dev;
+	opcode = be32_to_cpu(ohdr->bth[0]);
+	if (qib_ruc_check_hdr(ibp, hdr, has_grh, qp, opcode))
+		return;
 
-	ret = i2c_add_adapter(&smbus_cmi->adapter);
-	if (ret) {
-		dev_err(&device->dev, "Couldn't register adapter!\n");
-		goto err;
+	psn = be32_to_cpu(ohdr->bth[2]);
+	opcode >>= 24;
+
+	/* Compare the PSN verses the expected PSN. */
+	if (unlikely(qib_cmp24(psn, qp->r_psn) != 0)) {
+		/*
+		 * Handle a sequence error.
+		 * Silently drop any current message.
+		 */
+		qp->r_psn = psn;
+inv:
+		if (qp->r_state == OP(SEND_FIRST) ||
+		    qp->r_state == OP(SEND_MIDDLE)) {
+			set_bit(QIB_R_REWIND_SGE, &qp->r_aflags);
+			qp->r_sge.num_sge = 0;
+		} else
+			qib_put_ss(&qp->r_sge);
+		qp->r_state = OP(SEND_LAST);
+		switch (opcode) {
+		case OP(SEND_FIRST):
+		case OP(SEND_ONLY):
+		case OP(SEND_ONLY_WITH_IMMEDIATE):
+			goto send_first;
+
+		case OP(RDMA_WRITE_FIRST):
+		case OP(RDMA_WRITE_ONLY):
+		case OP(RDMA_WRITE_ONLY_WITH_IMMEDIATE):
+			goto rdma_first;
+
+		default:
+			goto drop;
+		}
 	}
 
-	return 0;
+	/* Check for opcode sequence errors. */
+	switch (qp->r_state) {
+	case OP(SEND_FIRST):
+	case OP(SEND_MIDDLE):
+		if (opcode == OP(SEND_MIDDLE) ||
+		    opcode == OP(SEND_LAST) ||
+		    opcode == OP(SEND_LAST_WITH_IMMEDIATE))
+			break;
+		goto inv;
 
-err:
-	kfree(smbus_cmi);
-	device->driver_data = NULL;
-	return ret;
-}
+	case OP(RDMA_WRITE_FIRST):
+	case OP(RDMA_WRITE_MIDDLE):
+		if (opcode == OP(RDMA_WRITE_MIDDLE) ||
+		    opcode == OP(RDMA_WRITE_LAST) ||
+		    opcode == OP(RDMA_WRITE_LAST_WITH_IMMEDIATE))
+			break;
+		goto inv;
 
-static int acpi_smbus_cmi_remove(struct acpi_device *device)
-{
-	struct acpi_smbus_cmi *smbus_cmi = acpi_driver_data(device);
+	default:
+		if (opcode == OP(SEND_FIRST) ||
+		    opcode == OP(SEND_ONLY) ||
+		    opcode == OP(SEND_ONLY_WITH_IMMEDIATE) ||
+		    opcode == OP(RDMA_WRITE_FIRST) ||
+		    opcode == OP(RDMA_WRITE_ONLY) ||
+		    opcode == OP(RDMA_WRITE_ONLY_WITH_IMMEDIATE))
+			break;
+		goto inv;
+	}
 
-	i2c_del_adapter(&smbus_cmi->adapter);
-	kfree(smbus_cmi);
-	device->driver_data = NULL;
+	if (qp->state == IB_QPS_RTR && !(qp->r_flags & QIB_R_COMM_EST)) {
+		qp->r_flags |= QIB_R_COMM_EST;
+		if (qp->ibqp.event_handler) {
+			struct ib_event ev;
 
-	return 0;
-}
+			ev.device = qp->ibqp.device;
+			ev.element.qp = &qp->ibqp;
+			ev.event = IB_EVENT_COMM_EST;
+			qp->ibqp.event_handler(&ev, qp->ibqp.qp_context);
+		}
+	}
 
-static struct acpi_driver acpi_smbus_cmi_driver = {
-	.name = ACPI_SMBUS_HC_DEVICE_NAME,
-	.class = ACPI_SMBUS_HC_CLASS,
-	.ids = acpi_smbus_cmi_ids,
-	.ops = {
-		.add = acpi_smbus_cmi_add,
-		.remove = acpi_smbus_cmi_remove,
-	},
-};
-module_acpi_driver(acpi_smbus_cmi_driver);
+	/* OK, process the packet. */
+	switch (opcode) {
+	case OP(SEND_FIRST):
+	case OP(SEND_ONLY):
+	case OP(SEND_ONLY_WITH_IMMEDIATE):
+send_first:
+		if (test_and_clear_bit(QIB_R_REWIND_SGE, &qp->r_aflags))
+			qp->r_sge = qp->s_rdma_read_sge;
+		else {
+			ret = qib_get_rwqe(qp, 0);
+			if (ret < 0)
+				goto op_err;
+			if (!ret)
+				goto drop;
+			/*
+			 * qp->s_rdma_read_sge will be the owner
+			 * of the mr references.
+			 */
+			qp->s_rdma_read_sge = qp->r_sge;
+		}
+		qp->r_rcv_len = 0;
+		if (opcode == OP(SEND_ONLY))
+			goto no_immediate_data;
+		else if (opcode == OP(SEND_ONLY_WITH_IMMEDIATE))
+			goto send_last_imm;
+		/* FALLTHROUGH */
+	case OP(SEND_MIDDLE):
+		/* Check for invalid length PMTU or posted rwqe len. */
+		if (unlikely(tlen != (hdrsize + pmtu + 4)))
+			goto rewind;
+		qp->r_rcv_len += pmtu;
+		if (unlikely(qp->r_rcv_len > qp->r_len))
+			goto rewind;
+		qib_copy_sge(&qp->r_sge, data, pmtu, 0);
+		break;
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Crane Cai <crane.cai@amd.com>");
-MODULE_DESCRIPTION("ACPI SMBus CMI driver");
+	case OP(SEND_LAST_WITH_IMMEDIATE):
+send_last_imm:
+		wc.ex.imm_data = ohdr->u.imm_data;
+		hdrsize += 4;
+		wc.wc_flags = IB_WC_WITH_IMM;
+		goto send_last;
+	case OP(SEND_LAST):
+no_immediate_data:
+		wc.ex.imm_data = 0;
+		wc.wc_flags = 0;
+send_last:
+		/* Get the number of bytes the message was padded by. */
+		pad = (be32_to_cpu(ohdr->bth[0]) >> 20) & 3;
+		/* Check for invalid length. */
+		/* XXX LAST len should be >= 1 */
+		if (unlikely(tlen < (hdrsize + pad + 4)))
+			goto rewind;
+		/* Don't count the CRC. */
+		tlen -= (hdrsize + pad + 4);
+		wc.byte_len = tlen + qp->r_rcv_len;
+		if (unlikely(wc.byte_len > qp->r_len))
+			goto rewind;
+		wc.opcode = IB_WC_RECV;
+		qib_copy_sge(&qp->r_sge, data, tlen, 0);
+		qib_put_ss(&qp->s_rdma_read_sge);
+last_imm:
+		wc.wr_id = qp->r_wr_id;
+		wc.status = IB_WC_SUCCESS;
+		wc.qp = &qp->ibqp;
+		wc.src_qp = qp->remote_qpn;
+		wc.slid = qp->remote_ah_attr.dlid;
+		wc.sl = qp->remote_ah_attr.sl;
+		/* zero fields that are N/A */
+		wc.vendor_err = 0;
+		wc.pkey_index = 0;
+		wc.dlid_path_bits = 0;
+		wc.port_num = 0;
+		/* Signal completion event if the solicited bit is set. */
+		qib_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,
+			     (ohdr->bth[0] &
+				cpu_to_be32(IB_BTH_SOLICITED)) != 0);
+		break;
+
+	case OP(RDMA_WRITE_FIRST):
+	case OP(RDMA_WRITE_ONLY):
+	case OP(RDMA_WRITE_ONLY_WITH_IMMEDIATE): /* consume RWQE */
+rdma_first:
+		if (unlikely(!(qp->qp_access_flags &
+			       IB_ACCESS_REMOTE_WRITE))) {
+			goto drop;
+		}
+		reth = &ohdr->u.rc.reth;
+		hdrsize += sizeof(*reth);
+		qp->r_len = be32_to_cpu(re

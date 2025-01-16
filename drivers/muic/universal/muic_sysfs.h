@@ -1,6 +1,3 @@
-#ifndef _MUIC_SYSFS_
-#define _MUIC_SYSFS_
-
-extern const struct attribute_group muic_sysfs_group;
-
-#endif
+FuncCntl_2_MASK 0xffffffff
+#define DPM_TABLE_234__MemoryLevel_1_MpllFuncCntl_2__SHIFT 0x0
+#define DPM_TAB

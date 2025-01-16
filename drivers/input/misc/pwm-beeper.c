@@ -1,220 +1,203 @@
-/*
- *  Copyright (C) 2010, Lars-Peter Clausen <lars@metafoo.de>
- *  PWM beeper driver
- *
- *  This program is free software; you can redistribute it and/or modify it
- *  under  the terms of the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the License, or (at your
- *  option) any later version.
- *
- *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  675 Mass Ave, Cambridge, MA 02139, USA.
- *
- */
 
-#include <linux/input.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/pwm.h>
-#include <linux/slab.h>
-#include <linux/workqueue.h>
-
-struct pwm_beeper {
-	struct input_dev *input;
-	struct pwm_device *pwm;
-	struct work_struct work;
-	unsigned long period;
-};
-
-#define HZ_TO_NANOSECONDS(x) (1000000000UL/(x))
-
-static void __pwm_beeper_set(struct pwm_beeper *beeper)
-{
-	unsigned long period = beeper->period;
-
-	if (period) {
-		pwm_config(beeper->pwm, period / 2, period);
-		pwm_enable(beeper->pwm);
-	} else
-		pwm_disable(beeper->pwm);
 }
 
-static void pwm_beeper_work(struct work_struct *work)
+static void tc300k_grip_cal_reset(struct tc300k_data *data)
 {
-	struct pwm_beeper *beeper =
-		container_of(work, struct pwm_beeper, work);
+	/* calibrate grip sensor chn */
+	struct i2c_client *client = data->client;
 
-	__pwm_beeper_set(beeper);
+	input_info(true, &client->dev, "%s\n", __func__);
+	i2c_smbus_write_byte_data(client, TC300K_CMD_ADDR, TC300K_CMD_GRIP_BASELINE_CAL);
+	msleep(TC300K_CMD_DELAY);
 }
 
-static int pwm_beeper_event(struct input_dev *input,
-			    unsigned int type, unsigned int code, int value)
-{
-	struct pwm_beeper *beeper = input_get_drvdata(input);
-
-	if (type != EV_SND || value < 0)
-		return -EINVAL;
-
-	switch (code) {
-	case SND_BELL:
-		value = value ? 1000 : 0;
-		break;
-	case SND_TONE:
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (value == 0)
-		beeper->period = 0;
-	else
-		beeper->period = HZ_TO_NANOSECONDS(value);
-
-	schedule_work(&beeper->work);
-
-	return 0;
-}
-
-static void pwm_beeper_stop(struct pwm_beeper *beeper)
-{
-	cancel_work_sync(&beeper->work);
-
-	if (beeper->period)
-		pwm_disable(beeper->pwm);
-}
-
-static void pwm_beeper_close(struct input_dev *input)
-{
-	struct pwm_beeper *beeper = input_get_drvdata(input);
-
-	pwm_beeper_stop(beeper);
-}
-
-static int pwm_beeper_probe(struct platform_device *pdev)
-{
-	unsigned long pwm_id = (unsigned long)dev_get_platdata(&pdev->dev);
-	struct pwm_beeper *beeper;
-	int error;
-
-	beeper = kzalloc(sizeof(*beeper), GFP_KERNEL);
-	if (!beeper)
-		return -ENOMEM;
-
-	beeper->pwm = pwm_get(&pdev->dev, NULL);
-	if (IS_ERR(beeper->pwm)) {
-		dev_dbg(&pdev->dev, "unable to request PWM, trying legacy API\n");
-		beeper->pwm = pwm_request(pwm_id, "pwm beeper");
-	}
-
-	if (IS_ERR(beeper->pwm)) {
-		error = PTR_ERR(beeper->pwm);
-		dev_err(&pdev->dev, "Failed to request pwm device: %d\n", error);
-		goto err_free;
-	}
-
-	INIT_WORK(&beeper->work, pwm_beeper_work);
-
-	beeper->input = input_allocate_device();
-	if (!beeper->input) {
-		dev_err(&pdev->dev, "Failed to allocate input device\n");
-		error = -ENOMEM;
-		goto err_pwm_free;
-	}
-	beeper->input->dev.parent = &pdev->dev;
-
-	beeper->input->name = "pwm-beeper";
-	beeper->input->phys = "pwm/input0";
-	beeper->input->id.bustype = BUS_HOST;
-	beeper->input->id.vendor = 0x001f;
-	beeper->input->id.product = 0x0001;
-	beeper->input->id.version = 0x0100;
-
-	beeper->input->evbit[0] = BIT(EV_SND);
-	beeper->input->sndbit[0] = BIT(SND_TONE) | BIT(SND_BELL);
-
-	beeper->input->event = pwm_beeper_event;
-	beeper->input->close = pwm_beeper_close;
-
-	input_set_drvdata(beeper->input, beeper);
-
-	error = input_register_device(beeper->input);
-	if (error) {
-		dev_err(&pdev->dev, "Failed to register input device: %d\n", error);
-		goto err_input_free;
-	}
-
-	platform_set_drvdata(pdev, beeper);
-
-	return 0;
-
-err_input_free:
-	input_free_device(beeper->input);
-err_pwm_free:
-	pwm_free(beeper->pwm);
-err_free:
-	kfree(beeper);
-
-	return error;
-}
-
-static int pwm_beeper_remove(struct platform_device *pdev)
-{
-	struct pwm_beeper *beeper = platform_get_drvdata(pdev);
-
-	input_unregister_device(beeper->input);
-
-	pwm_free(beeper->pwm);
-
-	kfree(beeper);
-
-	return 0;
-}
-
-static int __maybe_unused pwm_beeper_suspend(struct device *dev)
-{
-	struct pwm_beeper *beeper = dev_get_drvdata(dev);
-
-	pwm_beeper_stop(beeper);
-
-	return 0;
-}
-
-static int __maybe_unused pwm_beeper_resume(struct device *dev)
-{
-	struct pwm_beeper *beeper = dev_get_drvdata(dev);
-
-	if (beeper->period)
-		__pwm_beeper_set(beeper);
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(pwm_beeper_pm_ops,
-			 pwm_beeper_suspend, pwm_beeper_resume);
-
-#ifdef CONFIG_OF
-static const struct of_device_id pwm_beeper_match[] = {
-	{ .compatible = "pwm-beeper", },
-	{ },
-};
-MODULE_DEVICE_TABLE(of, pwm_beeper_match);
 #endif
 
-static struct platform_driver pwm_beeper_driver = {
-	.probe	= pwm_beeper_probe,
-	.remove = pwm_beeper_remove,
-	.driver = {
-		.name	= "pwm-beeper",
-		.pm	= &pwm_beeper_pm_ops,
-		.of_match_table = of_match_ptr(pwm_beeper_match),
-	},
-};
-module_platform_driver(pwm_beeper_driver);
 
-MODULE_AUTHOR("Lars-Peter Clausen <lars@metafoo.de>");
-MODULE_DESCRIPTION("PWM beeper driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:pwm-beeper");
+
+static void tc300k_release_all_fingers(struct tc300k_data *data)
+{
+	struct i2c_client *client = data->client;
+	int i;
+
+	input_dbg(true, &client->dev, "%s\n", __func__);
+
+	for (i = 0; i < data->key_num ; i++) {
+		input_report_key(data->input_dev,
+			data->tsk_ev_val[i].tsk_keycode, 0);
+#ifdef CONFIG_INPUT_BOOSTER
+		input_booster_send_event(data->tsk_ev_val[i].tsk_keycode,
+			BOOSTER_MODE_FORCE_OFF);
+#endif
+
+	}
+	input_sync(data->input_dev);
+}
+
+static void tc300k_reset(struct tc300k_data *data)
+{
+	input_info(true, &data->client->dev, "%s\n",__func__);
+
+	disable_irq_nosync(data->client->irq);
+
+	tc300k_release_all_fingers(data);
+
+	data->pdata->keyled(data, false);
+	data->pdata->power(data, false);
+
+	msleep(50);
+
+	data->pdata->power(data, true);
+	data->pdata->keyled(data, true);
+	msleep(200);
+
+	if (data->flip_mode)
+		tc300k_mode_enable(data->client, TC300K_CMD_FLIP_ON);
+
+	if (data->glove_mode)
+		tc300k_mode_enable(data->client, TC300K_CMD_GLOVE_ON);
+#ifdef FEATURE_GRIP_FOR_SAR
+	if (data->sar_enable)
+		tc300k_mode_enable(data->client, TC300K_CMD_SAR_ENABLE);
+#endif
+
+	enable_irq(data->client->irq);
+}
+
+static void tc300k_reset_probe(struct tc300k_data *data)
+{
+	data->pdata->keyled(data, false);
+	data->pdata->power(data, false);
+
+	msleep(50);
+
+	data->pdata->power(data, true);
+	data->pdata->keyled(data, true);
+	msleep(200);
+}
+
+int tc300k_get_fw_version(struct tc300k_data *data, bool probe)
+{
+	struct i2c_client *client = data->client;
+#ifdef CONFIG_SEC_FACTORY
+	int retry = 1;
+#else
+	int retry = 3;
+#endif
+	int buf;
+
+	if ((!data->enabled) || data->fw_downloding) {
+		input_err(true, &client->dev, "can't excute %s\n", __func__);
+		return -1;
+	}
+
+	buf = i2c_smbus_read_byte_data(client, TC300K_FWVER);
+	if (buf < 0) {
+		while (retry--) {
+			input_err(true, &client->dev, "%s read fail(%d)\n",
+				__func__, retry);
+			if (probe)
+				tc300k_reset_probe(data);
+			else
+				tc300k_reset(data);
+			buf = i2c_smbus_read_byte_data(client, TC300K_FWVER);
+			if (buf > 0)
+				break;
+		}
+		if (retry <= 0) {
+			input_err(true, &client->dev, "%s read fail\n", __func__);
+			data->fw_ver = 0;
+			return -1;
+		}
+	}
+	data->fw_ver = (u8)buf;
+	input_info(true, &client->dev, "fw_ver : 0x%x\n", data->fw_ver);
+
+	return 0;
+}
+
+int tc300k_get_md_version(struct tc300k_data *data, bool probe)
+{
+	struct i2c_client *client = data->client;
+#ifdef CONFIG_SEC_FACTORY
+	int retry = 1;
+#else
+	int retry = 3;
+#endif
+	int buf;
+
+	if ((!data->enabled) || data->fw_downloding) {
+		input_err(true, &client->dev, "can't excute %s\n", __func__);
+		return -1;
+	}
+
+	buf = i2c_smbus_read_byte_data(client, TC300K_MDVER);
+	if (buf < 0) {
+		while (retry--) {
+			input_err(true, &client->dev, "%s read fail(%d)\n",
+				__func__, retry);
+			if (probe)
+				tc300k_reset_probe(data);
+			else
+				tc300k_reset(data);
+			buf = i2c_smbus_read_byte_data(client, TC300K_MDVER);
+			if (buf > 0)
+				break;
+		}
+		if (retry <= 0) {
+			input_err(true, &client->dev, "%s read fail\n", __func__);
+			data->md_ver = 0;
+			return -1;
+		}
+	}
+	data->md_ver = (u8)buf;
+	input_info(true, &client->dev, "md_ver : 0x%x\n", data->md_ver);
+
+	return 0;
+}
+static void tc300k_gpio_request(struct tc300k_data *data)
+{
+	int ret = 0;
+	input_info(true, &data->client->dev, "%s: enter \n",__func__);
+
+	if (!data->pdata->i2c_gpio) {
+		ret = gpio_request(data->pdata->gpio_scl, "touchkey_scl");
+		if (ret) {
+			input_err(true, &data->client->dev, "%s: unable to request touchkey_scl [%d]\n",
+					__func__, data->pdata->gpio_scl);
+		}
+
+		ret = gpio_request(data->pdata->gpio_sda, "touchkey_sda");
+		if (ret) {
+			input_err(true, &data->client->dev, "%s: unable to request touchkey_sda [%d]\n",
+					__func__, data->pdata->gpio_sda);
+		}
+	}
+
+	ret = gpio_request(data->pdata->gpio_int, "touchkey_irq");
+	if (ret) {
+		input_err(true, &data->client->dev, "%s: unable to request touchkey_irq [%d]\n",
+				__func__, data->pdata->gpio_int);
+	}
+}
+
+#ifdef CONFIG_OF
+static int tc300k_parse_dt(struct device *dev,
+			struct tc300k_platform_data *pdata)
+{
+	struct device_node *np = dev->of_node;
+
+	of_property_read_u32(np, "coreriver,use_bitmap", &pdata->use_bitmap);
+
+	input_info(true, dev, "%s : %s protocol.\n",
+				__func__, pdata->use_bitmap ? "Use Bit-map" : "Use OLD");
+
+	pdata->gpio_scl = of_get_named_gpio_flags(np, "coreriver,scl-gpio", 0, &pdata->scl_gpio_flags);
+	pdata->gpio_sda = of_get_named_gpio_flags(np, "coreriver,sda-gpio", 0, &pdata->sda_gpio_flags);
+	pdata->gpio_int = of_get_named_gpio_flags(np, "coreriver,irq-gpio", 0, &pdata->irq_gpio_flags);
+
+	pdata->boot_on_ldo = of_property_read_bool(np, "coreriver,boot-on-ldo");
+
+	pdata->touchkey_led = of_property_read_bool(np, "coreriver,touchkey-led");
+
+//	if (pdata->use_touchkey_

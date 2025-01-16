@@ -1,665 +1,509 @@
-/* -------------------------------------------------------------------------
- * i2c-algo-bit.c i2c driver algorithms for bit-shift adapters
- * -------------------------------------------------------------------------
- *   Copyright (C) 1995-2000 Simon G. Vogl
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
- * ------------------------------------------------------------------------- */
-
-/* With some changes from Frodo Looijaard <frodol@dds.nl>, Kyösti Mälkki
-   <kmalkki@cc.hut.fi> and Jean Delvare <jdelvare@suse.de> */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/delay.h>
-#include <linux/errno.h>
-#include <linux/sched.h>
-#include <linux/i2c.h>
-#include <linux/i2c-algo-bit.h>
-
-
-/* ----- global defines ----------------------------------------------- */
-
-#ifdef DEBUG
-#define bit_dbg(level, dev, format, args...) \
-	do { \
-		if (i2c_debug >= level) \
-			dev_dbg(dev, format, ##args); \
-	} while (0)
-#else
-#define bit_dbg(level, dev, format, args...) \
-	do {} while (0)
-#endif /* DEBUG */
-
-/* ----- global variables ---------------------------------------------	*/
-
-static int bit_test;	/* see if the line-setting functions work	*/
-module_param(bit_test, int, S_IRUGO);
-MODULE_PARM_DESC(bit_test, "lines testing - 0 off; 1 report; 2 fail if stuck");
-
-#ifdef DEBUG
-static int i2c_debug = 1;
-module_param(i2c_debug, int, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(i2c_debug,
-		 "debug level - 0 off; 1 normal; 2 verbose; 3 very verbose");
-#endif
-
-/* --- setting states on the bus with the right timing: ---------------	*/
-
-#define setsda(adap, val)	adap->setsda(adap->data, val)
-#define setscl(adap, val)	adap->setscl(adap->data, val)
-#define getsda(adap)		adap->getsda(adap->data)
-#define getscl(adap)		adap->getscl(adap->data)
-
-static inline void sdalo(struct i2c_algo_bit_data *adap)
-{
-	setsda(adap, 0);
-	udelay((adap->udelay + 1) / 2);
-}
-
-static inline void sdahi(struct i2c_algo_bit_data *adap)
-{
-	setsda(adap, 1);
-	udelay((adap->udelay + 1) / 2);
-}
-
-static inline void scllo(struct i2c_algo_bit_data *adap)
-{
-	setscl(adap, 0);
-	udelay(adap->udelay / 2);
-}
+MASTER              0x0010
+#define QIB_RUNTIME_RCHK                0x0020
+#define QIB_RUNTIME_NODMA_RTAIL         0x0080
+#define QIB_RUNTIME_SPECIAL_TRIGGER     0x0100
+#define QIB_RUNTIME_SDMA                0x0200
+#define QIB_RUNTIME_FORCE_PIOAVAIL      0x0400
+#define QIB_RUNTIME_PIO_REGSWAPPED      0x0800
+#define QIB_RUNTIME_CTXT_MSB_IN_QP      0x1000
+#define QIB_RUNTIME_CTXT_REDIRECT       0x2000
+#define QIB_RUNTIME_HDRSUPP             0x4000
 
 /*
- * Raise scl line, and do checking for delays. This is necessary for slower
- * devices.
+ * This structure is returned by qib_userinit() immediately after
+ * open to get implementation-specific info, and info specific to this
+ * instance.
+ *
+ * This struct must have explict pad fields where type sizes
+ * may result in different alignments between 32 and 64 bit
+ * programs, since the 64 bit * bit kernel requires the user code
+ * to have matching offsets
  */
-static int sclhi(struct i2c_algo_bit_data *adap)
-{
-	unsigned long start;
-
-	setscl(adap, 1);
-
-	/* Not all adapters have scl sense line... */
-	if (!adap->getscl)
-		goto done;
-
-	start = jiffies;
-	while (!getscl(adap)) {
-		/* This hw knows how to read the clock line, so we wait
-		 * until it actually gets high.  This is safer as some
-		 * chips may hold it low ("clock stretching") while they
-		 * are processing data internally.
-		 */
-		if (time_after(jiffies, start + adap->timeout)) {
-			/* Test one last time, as we may have been preempted
-			 * between last check and timeout test.
-			 */
-			if (getscl(adap))
-				break;
-			return -ETIMEDOUT;
-		}
-		cpu_relax();
-	}
-#ifdef DEBUG
-	if (jiffies != start && i2c_debug >= 3)
-		pr_debug("i2c-algo-bit: needed %ld jiffies for SCL to go "
-			 "high\n", jiffies - start);
-#endif
-
-done:
-	udelay(adap->udelay);
-	return 0;
-}
-
-
-/* --- other auxiliary functions --------------------------------------	*/
-static void i2c_start(struct i2c_algo_bit_data *adap)
-{
-	/* assert: scl, sda are high */
-	setsda(adap, 0);
-	udelay(adap->udelay);
-	scllo(adap);
-}
-
-static void i2c_repstart(struct i2c_algo_bit_data *adap)
-{
-	/* assert: scl is low */
-	sdahi(adap);
-	sclhi(adap);
-	setsda(adap, 0);
-	udelay(adap->udelay);
-	scllo(adap);
-}
-
-
-static void i2c_stop(struct i2c_algo_bit_data *adap)
-{
-	/* assert: scl is low */
-	sdalo(adap);
-	sclhi(adap);
-	setsda(adap, 1);
-	udelay(adap->udelay);
-}
-
-
-
-/* send a byte without start cond., look for arbitration,
-   check ackn. from slave */
-/* returns:
- * 1 if the device acknowledged
- * 0 if the device did not ack
- * -ETIMEDOUT if an error occurred (while raising the scl line)
- */
-static int i2c_outb(struct i2c_adapter *i2c_adap, unsigned char c)
-{
-	int i;
-	int sb;
-	int ack;
-	struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
-
-	/* assert: scl is low */
-	for (i = 7; i >= 0; i--) {
-		sb = (c >> i) & 1;
-		setsda(adap, sb);
-		udelay((adap->udelay + 1) / 2);
-		if (sclhi(adap) < 0) { /* timed out */
-			bit_dbg(1, &i2c_adap->dev, "i2c_outb: 0x%02x, "
-				"timeout at bit #%d\n", (int)c, i);
-			return -ETIMEDOUT;
-		}
-		/* FIXME do arbitration here:
-		 * if (sb && !getsda(adap)) -> ouch! Get out of here.
-		 *
-		 * Report a unique code, so higher level code can retry
-		 * the whole (combined) message and *NOT* issue STOP.
-		 */
-		scllo(adap);
-	}
-	sdahi(adap);
-	if (sclhi(adap) < 0) { /* timeout */
-		bit_dbg(1, &i2c_adap->dev, "i2c_outb: 0x%02x, "
-			"timeout at ack\n", (int)c);
-		return -ETIMEDOUT;
-	}
-
-	/* read ack: SDA should be pulled down by slave, or it may
-	 * NAK (usually to report problems with the data we wrote).
+struct qib_base_info {
+	/* version of hardware, for feature checking. */
+	__u32 spi_hw_version;
+	/* version of software, for feature checking. */
+	__u32 spi_sw_version;
+	/* QLogic_IB context assigned, goes into sent packets */
+	__u16 spi_ctxt;
+	__u16 spi_subctxt;
+	/*
+	 * IB MTU, packets IB data must be less than this.
+	 * The MTU is in bytes, and will be a multiple of 4 bytes.
 	 */
-	ack = !getsda(adap);    /* ack: sda is pulled low -> success */
-	bit_dbg(2, &i2c_adap->dev, "i2c_outb: 0x%02x %s\n", (int)c,
-		ack ? "A" : "NA");
+	__u32 spi_mtu;
+	/*
+	 * Size of a PIO buffer.  Any given packet's total size must be less
+	 * than this (in words).  Included is the starting control word, so
+	 * if 513 is returned, then total pkt size is 512 words or less.
+	 */
+	__u32 spi_piosize;
+	/* size of the TID cache in qlogic_ib, in entries */
+	__u32 spi_tidcnt;
+	/* size of the TID Eager list in qlogic_ib, in entries */
+	__u32 spi_tidegrcnt;
+	/* size of a single receive header queue entry in words. */
+	__u32 spi_rcvhdrent_size;
+	/*
+	 * Count of receive header queue entries allocated.
+	 * This may be less than the spu_rcvhdrcnt passed in!.
+	 */
+	__u32 spi_rcvhdr_cnt;
 
-	scllo(adap);
-	return ack;
-	/* assert: scl is low (sda undef) */
-}
+	/* per-chip and other runtime features bitmap (QIB_RUNTIME_*) */
+	__u32 spi_runtime_flags;
 
+	/* address where hardware receive header queue is mapped */
+	__u64 spi_rcvhdr_base;
 
-static int i2c_inb(struct i2c_adapter *i2c_adap)
-{
-	/* read byte via i2c port, without start/stop sequence	*/
-	/* acknowledge is sent in i2c_read.			*/
-	int i;
-	unsigned char indata = 0;
-	struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
+	/* user program. */
 
-	/* assert: scl is low */
-	sdahi(adap);
-	for (i = 0; i < 8; i++) {
-		if (sclhi(adap) < 0) { /* timeout */
-			bit_dbg(1, &i2c_adap->dev, "i2c_inb: timeout at bit "
-				"#%d\n", 7 - i);
-			return -ETIMEDOUT;
-		}
-		indata *= 2;
-		if (getsda(adap))
-			indata |= 0x01;
-		setscl(adap, 0);
-		udelay(i == 7 ? adap->udelay / 2 : adap->udelay);
-	}
-	/* assert: scl is low */
-	return indata;
-}
+	/* base address of eager TID receive buffers used by hardware. */
+	__u64 spi_rcv_egrbufs;
+
+	/* Allocated by initialization code, not by protocol. */
+
+	/*
+	 * Size of each TID buffer in host memory, starting at
+	 * spi_rcv_egrbufs.  The buffers are virtually contiguous.
+	 */
+	__u32 spi_rcv_egrbufsize;
+	/*
+	 * The special QP (queue pair) value that identifies an qlogic_ib
+	 * protocol packet from standard IB packets.  More, probably much
+	 * more, to be added.
+	 */
+	__u32 spi_qpair;
+
+	/*
+	 * User register base for init code, not to be used directly by
+	 * protocol or applications.  Always points to chip registers,
+	 * for normal or shared context.
+	 */
+	__u64 spi_uregbase;
+	/*
+	 * Maximum buffer size in bytes that can be used in a single TID
+	 * entry (assuming the buffer is aligned to this boundary).  This is
+	 * the minimum of what the hardware and software support Guaranteed
+	 * to be a power of 2.
+	 */
+	__u32 spi_tid_maxsize;
+	/*
+	 * alignment of each pio send buffer (byte count
+	 * to add to spi_piobufbase to get to second buffer)
+	 */
+	__u32 spi_pioalign;
+	/*
+	 * The index of the first pio buffer available to this process;
+	 * needed to do lookup in spi_pioavailaddr; not added to
+	 * spi_piobufbase.
+	 */
+	__u32 spi_pioindex;
+	 /* number of buffers mapped for this process */
+	__u32 spi_piocnt;
+
+	/*
+	 * Base address of writeonly pio buffers for this process.
+	 * Each buffer has spi_piosize words, and is aligned on spi_pioalign
+	 * boundaries.  spi_piocnt buffers are mapped from this address
+	 */
+	__u64 spi_piobufbase;
+
+	/*
+	 * Base address of readonly memory copy of the pioavail registers.
+	 * There are 2 bits for each buffer.
+	 */
+	__u64 spi_pioavailaddr;
+
+	/*
+	 * Address where driver updates a copy of the interface and driver
+	 * status (QIB_STATUS_*) as a 64 bit value.  It's followed by a
+	 * link status qword (formerly combined with driver status), then a
+	 * string indicating hardware error, if there was one.
+	 */
+	__u64 spi_status;
+
+	/* number of chip ctxts available to user processes */
+	__u32 spi_nctxts;
+	__u16 spi_unit; /* unit number of chip we are using */
+	__u16 spi_port; /* IB port number we are using */
+	/* num bufs in each contiguous set */
+	__u32 spi_rcv_egrperchunk;
+	/* size in bytes of each contiguous set */
+	__u32 spi_rcv_egrchunksize;
+	/* total size of mmap to cover full rcvegrbuffers */
+	__u32 spi_rcv_egrbuftotlen;
+	__u32 spi_rhf_offset; /* dword offset in hdrqent for rcvhdr flags */
+	/* address of readonly memory copy of the rcvhdrq tail register. */
+	__u64 spi_rcvhdr_tailaddr;
+
+	/*
+	 * shared memory pages for subctxts if ctxt is shared; these cover
+	 * all the processes in the group sharing a single context.
+	 * all have enough space for the num_subcontexts value on this job.
+	 */
+	__u64 spi_subctxt_uregbase;
+	__u64 spi_subctxt_rcvegrbuf;
+	__u64 spi_subctxt_rcvhdr_base;
+
+	/* shared memory page for send buffer disarm status */
+	__u64 spi_sendbuf_status;
+} __aligned(8);
 
 /*
- * Sanity check for the adapter hardware - check the reaction of
- * the bus lines only if it seems to be idle.
+ * This version number is given to the driver by the user code during
+ * initialization in the spu_userversion field of qib_user_info, so
+ * the driver can check for compatibility with user code.
+ *
+ * The major version changes when data structures
+ * change in an incompatible way.  The driver must be the same or higher
+ * for initialization to succeed.  In some cases, a higher version
+ * driver will not interoperate with older software, and initialization
+ * will return an error.
  */
-static int test_bus(struct i2c_adapter *i2c_adap)
-{
-	struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
-	const char *name = i2c_adap->name;
-	int scl, sda, ret;
+#define QIB_USER_SWMAJOR 1
 
-	if (adap->pre_xfer) {
-		ret = adap->pre_xfer(i2c_adap);
-		if (ret < 0)
-			return -ENODEV;
-	}
-
-	if (adap->getscl == NULL)
-		pr_info("%s: Testing SDA only, SCL is not readable\n", name);
-
-	sda = getsda(adap);
-	scl = (adap->getscl == NULL) ? 1 : getscl(adap);
-	if (!scl || !sda) {
-		printk(KERN_WARNING
-		       "%s: bus seems to be busy (scl=%d, sda=%d)\n",
-		       name, scl, sda);
-		goto bailout;
-	}
-
-	sdalo(adap);
-	sda = getsda(adap);
-	scl = (adap->getscl == NULL) ? 1 : getscl(adap);
-	if (sda) {
-		printk(KERN_WARNING "%s: SDA stuck high!\n", name);
-		goto bailout;
-	}
-	if (!scl) {
-		printk(KERN_WARNING "%s: SCL unexpected low "
-		       "while pulling SDA low!\n", name);
-		goto bailout;
-	}
-
-	sdahi(adap);
-	sda = getsda(adap);
-	scl = (adap->getscl == NULL) ? 1 : getscl(adap);
-	if (!sda) {
-		printk(KERN_WARNING "%s: SDA stuck low!\n", name);
-		goto bailout;
-	}
-	if (!scl) {
-		printk(KERN_WARNING "%s: SCL unexpected low "
-		       "while pulling SDA high!\n", name);
-		goto bailout;
-	}
-
-	scllo(adap);
-	sda = getsda(adap);
-	scl = (adap->getscl == NULL) ? 0 : getscl(adap);
-	if (scl) {
-		printk(KERN_WARNING "%s: SCL stuck high!\n", name);
-		goto bailout;
-	}
-	if (!sda) {
-		printk(KERN_WARNING "%s: SDA unexpected low "
-		       "while pulling SCL low!\n", name);
-		goto bailout;
-	}
-
-	sclhi(adap);
-	sda = getsda(adap);
-	scl = (adap->getscl == NULL) ? 1 : getscl(adap);
-	if (!scl) {
-		printk(KERN_WARNING "%s: SCL stuck low!\n", name);
-		goto bailout;
-	}
-	if (!sda) {
-		printk(KERN_WARNING "%s: SDA unexpected low "
-		       "while pulling SCL high!\n", name);
-		goto bailout;
-	}
-
-	if (adap->post_xfer)
-		adap->post_xfer(i2c_adap);
-
-	pr_info("%s: Test OK\n", name);
-	return 0;
-bailout:
-	sdahi(adap);
-	sclhi(adap);
-
-	if (adap->post_xfer)
-		adap->post_xfer(i2c_adap);
-
-	return -ENODEV;
-}
-
-/* ----- Utility functions
+/*
+ * Minor version differences are always compatible
+ * a within a major version, however if user software is larger
+ * than driver software, some new features and/or structure fields
+ * may not be implemented; the user code must deal with this if it
+ * cares, or it must abort after initialization reports the difference.
  */
+#define QIB_USER_SWMINOR 13
 
-/* try_address tries to contact a chip for a number of
- * times before it gives up.
- * return values:
- * 1 chip answered
- * 0 chip did not answer
- * -x transmission error
+#define QIB_USER_SWVERSION ((QIB_USER_SWMAJOR << 16) | QIB_USER_SWMINOR)
+
+#ifndef QIB_KERN_TYPE
+#define QIB_KERN_TYPE 0
+#endif
+
+/*
+ * Similarly, this is the kernel version going back to the user.  It's
+ * slightly different, in that we want to tell if the driver was built as
+ * part of a QLogic release, or from the driver from openfabrics.org,
+ * kernel.org, or a standard distribution, for support reasons.
+ * The high bit is 0 for non-QLogic and 1 for QLogic-built/supplied.
+ *
+ * It's returned by the driver to the user code during initialization in the
+ * spi_sw_version field of qib_base_info, so the user code can in turn
+ * check for compatibility with the kernel.
+*/
+#define QIB_KERN_SWVERSION ((QIB_KERN_TYPE << 31) | QIB_USER_SWVERSION)
+
+/*
+ * Define the driver version number.  This is something that refers only
+ * to the driver itself, not the software interfaces it supports.
  */
-static int try_address(struct i2c_adapter *i2c_adap,
-		       unsigned char addr, int retries)
-{
-	struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
-	int i, ret = 0;
+#define QIB_DRIVER_VERSION_BASE "1.11"
 
-	for (i = 0; i <= retries; i++) {
-		ret = i2c_outb(i2c_adap, addr);
-		if (ret == 1 || i == retries)
-			break;
-		bit_dbg(3, &i2c_adap->dev, "emitting stop condition\n");
-		i2c_stop(adap);
-		udelay(adap->udelay);
-		yield();
-		bit_dbg(3, &i2c_adap->dev, "emitting start condition\n");
-		i2c_start(adap);
-	}
-	if (i && ret)
-		bit_dbg(1, &i2c_adap->dev, "Used %d tries to %s client at "
-			"0x%02x: %s\n", i + 1,
-			addr & 1 ? "read from" : "write to", addr >> 1,
-			ret == 1 ? "success" : "failed, timeout?");
-	return ret;
-}
+/* create the final driver version string */
+#ifdef QIB_IDSTR
+#define QIB_DRIVER_VERSION QIB_DRIVER_VERSION_BASE " " QIB_IDSTR
+#else
+#define QIB_DRIVER_VERSION QIB_DRIVER_VERSION_BASE
+#endif
 
-static int sendbytes(struct i2c_adapter *i2c_adap, struct i2c_msg *msg)
-{
-	const unsigned char *temp = msg->buf;
-	int count = msg->len;
-	unsigned short nak_ok = msg->flags & I2C_M_IGNORE_NAK;
-	int retval;
-	int wrcount = 0;
-
-	while (count > 0) {
-		retval = i2c_outb(i2c_adap, *temp);
-
-		/* OK/ACK; or ignored NAK */
-		if ((retval > 0) || (nak_ok && (retval == 0))) {
-			count--;
-			temp++;
-			wrcount++;
-
-		/* A slave NAKing the master means the slave didn't like
-		 * something about the data it saw.  For example, maybe
-		 * the SMBus PEC was wrong.
-		 */
-		} else if (retval == 0) {
-			dev_err(&i2c_adap->dev, "sendbytes: NAK bailout.\n");
-			return -EIO;
-
-		/* Timeout; or (someday) lost arbitration
-		 *
-		 * FIXME Lost ARB implies retrying the transaction from
-		 * the first message, after the "winning" master issues
-		 * its STOP.  As a rule, upper layer code has no reason
-		 * to know or care about this ... it is *NOT* an error.
-		 */
-		} else {
-			dev_err(&i2c_adap->dev, "sendbytes: error %d\n",
-					retval);
-			return retval;
-		}
-	}
-	return wrcount;
-}
-
-static int acknak(struct i2c_adapter *i2c_adap, int is_ack)
-{
-	struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
-
-	/* assert: sda is high */
-	if (is_ack)		/* send ack */
-		setsda(adap, 0);
-	udelay((adap->udelay + 1) / 2);
-	if (sclhi(adap) < 0) {	/* timeout */
-		dev_err(&i2c_adap->dev, "readbytes: ack/nak timeout\n");
-		return -ETIMEDOUT;
-	}
-	scllo(adap);
-	return 0;
-}
-
-static int readbytes(struct i2c_adapter *i2c_adap, struct i2c_msg *msg)
-{
-	int inval;
-	int rdcount = 0;	/* counts bytes read */
-	unsigned char *temp = msg->buf;
-	int count = msg->len;
-	const unsigned flags = msg->flags;
-
-	while (count > 0) {
-		inval = i2c_inb(i2c_adap);
-		if (inval >= 0) {
-			*temp = inval;
-			rdcount++;
-		} else {   /* read timed out */
-			break;
-		}
-
-		temp++;
-		count--;
-
-		/* Some SMBus transactions require that we receive the
-		   transaction length as the first read byte. */
-		if (rdcount == 1 && (flags & I2C_M_RECV_LEN)) {
-			if (inval <= 0 || inval > I2C_SMBUS_BLOCK_MAX) {
-				if (!(flags & I2C_M_NO_RD_ACK))
-					acknak(i2c_adap, 0);
-				dev_err(&i2c_adap->dev, "readbytes: invalid "
-					"block length (%d)\n", inval);
-				return -EPROTO;
-			}
-			/* The original count value accounts for the extra
-			   bytes, that is, either 1 for a regular transaction,
-			   or 2 for a PEC transaction. */
-			count += inval;
-			msg->len += inval;
-		}
-
-		bit_dbg(2, &i2c_adap->dev, "readbytes: 0x%02x %s\n",
-			inval,
-			(flags & I2C_M_NO_RD_ACK)
-				? "(no ack/nak)"
-				: (count ? "A" : "NA"));
-
-		if (!(flags & I2C_M_NO_RD_ACK)) {
-			inval = acknak(i2c_adap, count);
-			if (inval < 0)
-				return inval;
-		}
-	}
-	return rdcount;
-}
-
-/* doAddress initiates the transfer by generating the start condition (in
- * try_address) and transmits the address in the necessary format to handle
- * reads, writes as well as 10bit-addresses.
- * returns:
- *  0 everything went okay, the chip ack'ed, or IGNORE_NAK flag was set
- * -x an error occurred (like: -ENXIO if the device did not answer, or
- *	-ETIMEDOUT, for example if the lines are stuck...)
+/*
+ * If the unit is specified via open, HCA choice is fixed.  If port is
+ * specified, it's also fixed.  Otherwise we try to spread contexts
+ * across ports and HCAs, using different algorithims.  WITHIN is
+ * the old default, prior to this mechanism.
  */
-static int bit_doAddress(struct i2c_adapter *i2c_adap, struct i2c_msg *msg)
-{
-	unsigned short flags = msg->flags;
-	unsigned short nak_ok = msg->flags & I2C_M_IGNORE_NAK;
-	struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
+#define QIB_PORT_ALG_ACROSS 0 /* round robin contexts across HCAs, then
+			       * ports; this is the default */
+#define QIB_PORT_ALG_WITHIN 1 /* use all contexts on an HCA (round robin
+			       * active ports within), then next HCA */
+#define QIB_PORT_ALG_COUNT 2 /* number of algorithm choices */
 
-	unsigned char addr;
-	int ret, retries;
+/*
+ * This structure is passed to qib_userinit() to tell the driver where
+ * user code buffers are, sizes, etc.   The offsets and sizes of the
+ * fields must remain unchanged, for binary compatibility.  It can
+ * be extended, if userversion is changed so user code can tell, if needed
+ */
+struct qib_user_info {
+	/*
+	 * version of user software, to detect compatibility issues.
+	 * Should be set to QIB_USER_SWVERSION.
+	 */
+	__u32 spu_userversion;
 
-	retries = nak_ok ? 0 : i2c_adap->retries;
+	__u32 _spu_unused2;
 
-	if (flags & I2C_M_TEN) {
-		/* a ten bit address */
-		addr = 0xf0 | ((msg->addr >> 7) & 0x06);
-		bit_dbg(2, &i2c_adap->dev, "addr0: %d\n", addr);
-		/* try extended address code...*/
-		ret = try_address(i2c_adap, addr, retries);
-		if ((ret != 1) && !nak_ok)  {
-			dev_err(&i2c_adap->dev,
-				"died at extended address code\n");
-			return -ENXIO;
-		}
-		/* the remaining 8 bit address */
-		ret = i2c_outb(i2c_adap, msg->addr & 0xff);
-		if ((ret != 1) && !nak_ok) {
-			/* the chip did not ack / xmission error occurred */
-			dev_err(&i2c_adap->dev, "died at 2nd address code\n");
-			return -ENXIO;
-		}
-		if (flags & I2C_M_RD) {
-			bit_dbg(3, &i2c_adap->dev, "emitting repeated "
-				"start condition\n");
-			i2c_repstart(adap);
-			/* okay, now switch into reading mode */
-			addr |= 0x01;
-			ret = try_address(i2c_adap, addr, retries);
-			if ((ret != 1) && !nak_ok) {
-				dev_err(&i2c_adap->dev,
-					"died at repeated address code\n");
-				return -EIO;
-			}
-		}
-	} else {		/* normal 7bit address	*/
-		addr = msg->addr << 1;
-		if (flags & I2C_M_RD)
-			addr |= 1;
-		if (flags & I2C_M_REV_DIR_ADDR)
-			addr ^= 1;
-		ret = try_address(i2c_adap, addr, retries);
-		if ((ret != 1) && !nak_ok)
-			return -ENXIO;
-	}
+	/* size of struct base_info to write to */
+	__u32 spu_base_info_size;
 
-	return 0;
-}
+	__u32 spu_port_alg; /* which QIB_PORT_ALG_*; unused user minor < 11 */
 
-static int bit_xfer(struct i2c_adapter *i2c_adap,
-		    struct i2c_msg msgs[], int num)
-{
-	struct i2c_msg *pmsg;
-	struct i2c_algo_bit_data *adap = i2c_adap->algo_data;
-	int i, ret;
-	unsigned short nak_ok;
+	/*
+	 * If two or more processes wish to share a context, each process
+	 * must set the spu_subctxt_cnt and spu_subctxt_id to the same
+	 * values.  The only restriction on the spu_subctxt_id is that
+	 * it be unique for a given node.
+	 */
+	__u16 spu_subctxt_cnt;
+	__u16 spu_subctxt_id;
 
-	if (adap->pre_xfer) {
-		ret = adap->pre_xfer(i2c_adap);
-		if (ret < 0)
-			return ret;
-	}
+	__u32 spu_port; /* IB port requested by user if > 0 */
 
-	bit_dbg(3, &i2c_adap->dev, "emitting start condition\n");
-	i2c_start(adap);
-	for (i = 0; i < num; i++) {
-		pmsg = &msgs[i];
-		nak_ok = pmsg->flags & I2C_M_IGNORE_NAK;
-		if (!(pmsg->flags & I2C_M_NOSTART)) {
-			if (i) {
-				bit_dbg(3, &i2c_adap->dev, "emitting "
-					"repeated start condition\n");
-				i2c_repstart(adap);
-			}
-			ret = bit_doAddress(i2c_adap, pmsg);
-			if ((ret != 0) && !nak_ok) {
-				bit_dbg(1, &i2c_adap->dev, "NAK from "
-					"device addr 0x%02x msg #%d\n",
-					msgs[i].addr, i);
-				goto bailout;
-			}
-		}
-		if (pmsg->flags & I2C_M_RD) {
-			/* read bytes into buffer*/
-			ret = readbytes(i2c_adap, pmsg);
-			if (ret >= 1)
-				bit_dbg(2, &i2c_adap->dev, "read %d byte%s\n",
-					ret, ret == 1 ? "" : "s");
-			if (ret < pmsg->len) {
-				if (ret >= 0)
-					ret = -EIO;
-				goto bailout;
-			}
-		} else {
-			/* write bytes from buffer */
-			ret = sendbytes(i2c_adap, pmsg);
-			if (ret >= 1)
-				bit_dbg(2, &i2c_adap->dev, "wrote %d byte%s\n",
-					ret, ret == 1 ? "" : "s");
-			if (ret < pmsg->len) {
-				if (ret >= 0)
-					ret = -EIO;
-				goto bailout;
-			}
-		}
-	}
-	ret = i;
+	/*
+	 * address of struct base_info to write to
+	 */
+	__u64 spu_base_info;
 
-bailout:
-	bit_dbg(3, &i2c_adap->dev, "emitting stop condition\n");
-	i2c_stop(adap);
+} __aligned(8);
 
-	if (adap->post_xfer)
-		adap->post_xfer(i2c_adap);
-	return ret;
-}
+/* User commands. */
 
-static u32 bit_func(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_NOSTART | I2C_FUNC_SMBUS_EMUL |
-	       I2C_FUNC_SMBUS_READ_BLOCK_DATA |
-	       I2C_FUNC_SMBUS_BLOCK_PROC_CALL |
-	       I2C_FUNC_10BIT_ADDR | I2C_FUNC_PROTOCOL_MANGLING;
-}
+/* 16 available, was: old set up userspace (for old user code) */
+#define QIB_CMD_CTXT_INFO       17      /* find out what resources we got */
+#define QIB_CMD_RECV_CTRL       18      /* control receipt of packets */
+#define QIB_CMD_TID_UPDATE      19      /* update expected TID entries */
+#define QIB_CMD_TID_FREE        20      /* free expected TID entries */
+#define QIB_CMD_SET_PART_KEY    21      /* add partition key */
+/* 22 available, was: return info on slave processes (for old user code) */
+#define QIB_CMD_ASSIGN_CTXT     23      /* allocate HCA and ctxt */
+#define QIB_CMD_USER_INIT       24      /* set up userspace */
+#define QIB_CMD_UNUSED_1        25
+#define QIB_CMD_UNUSED_2        26
+#define QIB_CMD_PIOAVAILUPD     27      /* force an update of PIOAvail reg */
+#define QIB_CMD_POLL_TYPE       28      /* set the kind of polling we want */
+#define QIB_CMD_ARMLAUNCH_CTRL  29      /* armlaunch detection control */
+/* 30 is unused */
+#define QIB_CMD_SDMA_INFLIGHT   31      /* sdma inflight counter request */
+#define QIB_CMD_SDMA_COMPLETE   32      /* sdma completion counter request */
+/* 33 available, was a testing feature  */
+#define QIB_CMD_DISARM_BUFS     34      /* disarm send buffers w/ errors */
+#define QIB_CMD_ACK_EVENT       35      /* ack & clear bits */
+#define QIB_CMD_CPUS_LIST       36      /* list of cpus allocated, for pinned
+					 * processes: qib_cpus_list */
+
+/*
+ * QIB_CMD_ACK_EVENT obsoletes QIB_CMD_DISARM_BUFS, but we keep it for
+ * compatibility with libraries from previous release.   The ACK_EVENT
+ * will take appropriate driver action (if any, just DISARM for now),
+ * then clear the bits passed in as part of the mask.  These bits are
+ * in the first 64bit word at spi_sendbuf_status, and are passed to
+ * the driver in the event_mask union as well.
+ */
+#define _QIB_EVENT_DISARM_BUFS_BIT	0
+#define _QIB_EVENT_LINKDOWN_BIT		1
+#define _QIB_EVENT_LID_CHANGE_BIT	2
+#define _QIB_EVENT_LMC_CHANGE_BIT	3
+#define _QIB_EVENT_SL2VL_CHANGE_BIT	4
+#define _QIB_MAX_EVENT_BIT _QIB_EVENT_SL2VL_CHANGE_BIT
+
+#define QIB_EVENT_DISARM_BUFS_BIT	(1UL << _QIB_EVENT_DISARM_BUFS_BIT)
+#define QIB_EVENT_LINKDOWN_BIT		(1UL << _QIB_EVENT_LINKDOWN_BIT)
+#define QIB_EVENT_LID_CHANGE_BIT	(1UL << _QIB_EVENT_LID_CHANGE_BIT)
+#define QIB_EVENT_LMC_CHANGE_BIT	(1UL << _QIB_EVENT_LMC_CHANGE_BIT)
+#define QIB_EVENT_SL2VL_CHANGE_BIT	(1UL << _QIB_EVENT_SL2VL_CHANGE_BIT)
 
 
-/* -----exported algorithm data: -------------------------------------	*/
+/*
+ * Poll types
+ */
+#define QIB_POLL_TYPE_ANYRCV     0x0
+#define QIB_POLL_TYPE_URGENT     0x1
 
-const struct i2c_algorithm i2c_bit_algo = {
-	.master_xfer	= bit_xfer,
-	.functionality	= bit_func,
+struct qib_ctxt_info {
+	__u16 num_active;       /* number of active units */
+	__u16 unit;             /* unit (chip) assigned to caller */
+	__u16 port;             /* IB port assigned to caller (1-based) */
+	__u16 ctxt;             /* ctxt on unit assigned to caller */
+	__u16 subctxt;          /* subctxt on unit assigned to caller */
+	__u16 num_ctxts;        /* number of ctxts available on unit */
+	__u16 num_subctxts;     /* number of subctxts opened on ctxt */
+	__u16 rec_cpu;          /* cpu # for affinity (ffff if none) */
 };
-EXPORT_SYMBOL(i2c_bit_algo);
+
+struct qib_tid_info {
+	__u32 tidcnt;
+	/* make structure same size in 32 and 64 bit */
+	__u32 tid__unused;
+	/* virtual address of first page in transfer */
+	__u64 tidvaddr;
+	/* pointer (same size 32/64 bit) to __u16 tid array */
+	__u64 tidlist;
+
+	/*
+	 * pointer (same size 32/64 bit) to bitmap of TIDs used
+	 * for this call; checked for being large enough at open
+	 */
+	__u64 tidmap;
+};
+
+struct qib_cmd {
+	__u32 type;                     /* command type */
+	union {
+		struct qib_tid_info tid_info;
+		struct qib_user_info user_info;
+
+		/*
+		 * address in userspace where we should put the sdma
+		 * inflight counter
+		 */
+		__u64 sdma_inflight;
+		/*
+		 * address in userspace where we should put the sdma
+		 * completion counter
+		 */
+		__u64 sdma_complete;
+		/* address in userspace of struct qib_ctxt_info to
+		   write result to */
+		__u64 ctxt_info;
+		/* enable/disable receipt of packets */
+		__u32 recv_ctrl;
+		/* enable/disable armlaunch errors (non-zero to enable) */
+		__u32 armlaunch_ctrl;
+		/* partition key to set */
+		__u16 part_key;
+		/* user address of __u32 bitmask of active slaves */
+		__u64 slave_mask_addr;
+		/* type of polling we want */
+		__u16 poll_type;
+		/* back pressure enable bit for one particular context */
+		__u8 ctxt_bp;
+		/* qib_user_event_ack(), IPATH_EVENT_* bits */
+		__u64 event_mask;
+	} cmd;
+};
+
+struct qib_iovec {
+	/* Pointer to data, but same size 32 and 64 bit */
+	__u64 iov_base;
+
+	/*
+	 * Length of data; don't need 64 bits, but want
+	 * qib_sendpkt to remain same size as before 32 bit changes, so...
+	 */
+	__u64 iov_len;
+};
 
 /*
- * registering functions to load algorithms at runtime
+ * Describes a single packet for send.  Each packet can have one or more
+ * buffers, but the total length (exclusive of IB headers) must be less
+ * than the MTU, and if using the PIO method, entire packet length,
+ * including IB headers, must be less than the qib_piosize value (words).
+ * Use of this necessitates including sys/uio.h
  */
-static int __i2c_bit_add_bus(struct i2c_adapter *adap,
-			     int (*add_adapter)(struct i2c_adapter *))
-{
-	struct i2c_algo_bit_data *bit_adap = adap->algo_data;
-	int ret;
+struct __qib_sendpkt {
+	__u32 sps_flags;        /* flags for packet (TBD) */
+	__u32 sps_cnt;          /* number of entries to use in sps_iov */
+	/* array of iov's describing packet. TEMPORARY */
+	struct qib_iovec sps_iov[4];
+};
 
-	if (bit_test) {
-		ret = test_bus(adap);
-		if (bit_test >= 2 && ret < 0)
-			return -ENODEV;
-	}
+/*
+ * Diagnostics can send a packet by "writing" the following
+ * structs to the diag data special file.
+ * This allows a custom
+ * pbc (+ static rate) qword, so that special modes and deliberate
+ * changes to CRCs can be used. The elements were also re-ordered
+ * for better alignment and to avoid padding issues.
+ */
+#define _DIAG_XPKT_VERS 3
+struct qib_diag_xpkt {
+	__u16 version;
+	__u16 unit;
+	__u16 port;
+	__u16 len;
+	__u64 data;
+	__u64 pbc_wd;
+};
 
-	/* register new adapter to i2c module... */
-	adap->algo = &i2c_bit_algo;
-	adap->retries = 3;
+/*
+ * Data layout in I2C flash (for GUID, etc.)
+ * All fields are little-endian binary unless otherwise stated
+ */
+#define QIB_FLASH_VERSION 2
+struct qib_flash {
+	/* flash layout version (QIB_FLASH_VERSION) */
+	__u8 if_fversion;
+	/* checksum protecting if_length bytes */
+	__u8 if_csum;
+	/*
+	 * valid length (in use, protected by if_csum), including
+	 * if_fversion and if_csum themselves)
+	 */
+	__u8 if_length;
+	/* the GUID, in network order */
+	__u8 if_guid[8];
+	/* number of GUIDs to use, starting from if_guid */
+	__u8 if_numguid;
+	/* the (last 10 characters of) board serial number, in ASCII */
+	char if_serial[12];
+	/* board mfg date (YYYYMMDD ASCII) */
+	char if_mfgdate[8];
+	/* last board rework/test date (YYYYMMDD ASCII) */
+	char if_testdate[8];
+	/* logging of error counts, TBD */
+	__u8 if_errcntp[4];
+	/* powered on hours, updated at driver unload */
+	__u8 if_powerhour[2];
+	/* ASCII free-form comment field */
+	char if_comment[32];
+	/* Backwards compatible prefix for longer QLogic Serial Numbers */
+	char if_sprefix[4];
+	/* 82 bytes used, min flash size is 128 bytes */
+	__u8 if_future[46];
+};
 
-	ret = add_adapter(adap);
-	if (ret < 0)
-		return ret;
-
-	/* Complain if SCL can't be read */
-	if (bit_adap->getscl == NULL) {
-		dev_warn(&adap->dev, "Not I2C compliant: can't read SCL\n");
-		dev_warn(&adap->dev, "Bus may be unreliable\n");
-	}
-	return 0;
-}
-
-int i2c_bit_add_bus(struct i2c_adapter *adap)
-{
-	return __i2c_bit_add_bus(adap, i2c_add_adapter);
-}
-EXPORT_SYMBOL(i2c_bit_add_bus);
-
-int i2c_bit_add_numbered_bus(struct i2c_adapter *adap)
-{
-	return __i2c_bit_add_bus(adap, i2c_add_numbered_adapter);
-}
-EXPORT_SYMBOL(i2c_bit_add_numbered_bus);
-
-MODULE_AUTHOR("Simon G. Vogl <simon@tk.uni-linz.ac.at>");
-MODULE_DESCRIPTION("I2C-Bus bit-banging algorithm");
-MODULE_LICENSE("GPL");
+/*
+ * These are the counters implemented in the chip, and are listed in order.
+ * The InterCaps naming is taken straight from the chip spec.
+ */
+struct qlogic_ib_counters {
+	__u64 LBIntCnt;
+	__u64 LBFlowStallCnt;
+	__u64 TxSDmaDescCnt;    /* was Reserved1 */
+	__u64 TxUnsupVLErrCnt;
+	__u64 TxDataPktCnt;
+	__u64 TxFlowPktCnt;
+	__u64 TxDwordCnt;
+	__u64 TxLenErrCnt;
+	__u64 TxMaxMinLenErrCnt;
+	__u64 TxUnderrunCnt;
+	__u64 TxFlowStallCnt;
+	__u64 TxDroppedPktCnt;
+	__u64 RxDroppedPktCnt;
+	__u64 RxDataPktCnt;
+	__u64 RxFlowPktCnt;
+	__u64 RxDwordCnt;
+	__u64 RxLenErrCnt;
+	__u64 RxMaxMinLenErrCnt;
+	__u64 RxICRCErrCnt;
+	__u64 RxVCRCErrCnt;
+	__u64 RxFlowCtrlErrCnt;
+	__u64 RxBadFormatCnt;
+	__u64 RxLinkProblemCnt;
+	__u64 RxEBPCnt;
+	__u64 RxLPCRCErrCnt;
+	__u64 RxBufOvflCnt;
+	__u64 RxTIDFullErrCnt;
+	__u64 RxTIDValidErrCnt;
+	__u64 RxPKeyMismatchCnt;
+	__u64 RxP0HdrEgrOvflCnt;
+	__u64 RxP1HdrEgrOvflCnt;
+	__u64 RxP2HdrEgrOvflCnt;
+	__u64 RxP3HdrEgrOvflCnt;
+	__u64 RxP4HdrEgrOvflCnt;
+	__u64 RxP5HdrEgrOvflCnt;
+	__u64 RxP6HdrEgrOvflCnt;
+	__u64 RxP7HdrEgrOvflCnt;
+	__u64 RxP8HdrEgrOvflCnt;
+	__u64 RxP9HdrEgrOvflCnt;
+	__u64 RxP10HdrEgrOvflCnt;
+	__u64 RxP11HdrEgrOvflCnt;
+	__u64 RxP12HdrEgrOvflCnt;
+	__u64 RxP13HdrEgrOvflCnt;
+	__u64 RxP14HdrEgrOvflCnt;
+	__u64 RxP15HdrEgrOvflCnt;
+	__u64 RxP16HdrEgrOvflCnt;
+	__u64 IBStatusChangeCnt;
+	__u64 IBLinkErrRecoveryCnt;
+	__u64 IBLinkDownedCnt;
+	__u64 IBSymbolErrCnt;
+	__u64 RxVL15DroppedPktCnt;
+	__u64 RxOtherLocalPhyErrCnt;

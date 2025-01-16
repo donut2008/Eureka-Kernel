@@ -1,400 +1,163 @@
-/*
- * Copyright (C) 2011 Samsung Electronics.
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
-
-#include "gnss_prj.h"
-#include "gnss_link_device_memory.h"
-
-void gnss_msq_reset(struct mem_status_queue *msq)
-{
-	unsigned long flags;
-	spin_lock_irqsave(&msq->lock, flags);
-	msq->out = msq->in;
-	spin_unlock_irqrestore(&msq->lock, flags);
-}
-
-/**
- * gnss_msq_get_free_slot
- * @trq : pointer to an instance of mem_status_queue structure
- *
- * Succeeds always by dropping the oldest slot if a "msq" is full.
- */
-struct mem_status *gnss_msq_get_free_slot(struct mem_status_queue *msq)
-{
-	int qsize = MAX_MEM_LOG_CNT;
-	int in;
-	int out;
-	unsigned long flags;
-	struct mem_status *stat;
-
-	spin_lock_irqsave(&msq->lock, flags);
-
-	in = msq->in;
-	out = msq->out;
-
-	if (circ_get_space(qsize, in, out) < 1) {
-		/* Make the oldest slot empty */
-		out++;
-		msq->out = (out == qsize) ? 0 : out;
-	}
-
-	/* Get a free slot */
-	stat = &msq->stat[in];
-
-	/* Make it as "data" slot */
-	in++;
-	msq->in = (in == qsize) ? 0 : in;
-
-	spin_unlock_irqrestore(&msq->lock, flags);
-
-	return stat;
-}
-
-struct mem_status *gnss_msq_get_data_slot(struct mem_status_queue *msq)
-{
-	int qsize = MAX_MEM_LOG_CNT;
-	int in;
-	int out;
-	unsigned long flags;
-	struct mem_status *stat;
-
-	spin_lock_irqsave(&msq->lock, flags);
-
-	in = msq->in;
-	out = msq->out;
-
-	if (in == out) {
-		stat = NULL;
-		goto exit;
-	}
-
-	/* Get a data slot */
-	stat = &msq->stat[out];
-
-	/* Make it "free" slot */
-	out++;
-	msq->out = (out == qsize) ? 0 : out;
-
-exit:
-	spin_unlock_irqrestore(&msq->lock, flags);
-	return stat;
-}
-
-/**
- * gnss_memcpy16_from_io
- * @to: pointer to "real" memory
- * @from: pointer to IO memory
- * @count: data length in bytes to be copied
- *
- * Copies data from IO memory space to "real" memory space.
- */
-void gnss_memcpy16_from_io(const void *to, const void __iomem *from, u32 count)
-{
-	u16 *d = (u16 *)to;
-	u16 *s = (u16 *)from;
-	u32 words = count >> 1;
-	while (words--)
-		*d++ = ioread16(s++);
-}
-
-/**
- * gnss_memcpy16_to_io
- * @to: pointer to IO memory
- * @from: pointer to "real" memory
- * @count: data length in bytes to be copied
- *
- * Copies data from "real" memory space to IO memory space.
- */
-void gnss_memcpy16_to_io(const void __iomem *to, const void *from, u32 count)
-{
-	u16 *d = (u16 *)to;
-	u16 *s = (u16 *)from;
-	u32 words = count >> 1;
-	while (words--)
-		iowrite16(*s++, d++);
-}
-
-/**
- * gnss_memcmp16_to_io
- * @to: pointer to IO memory
- * @from: pointer to "real" memory
- * @count: data length in bytes to be compared
- *
- * Compares data from "real" memory space to IO memory space.
- */
-int gnss_memcmp16_to_io(const void __iomem *to, const void *from, u32 count)
-{
-	u16 *d = (u16 *)to;
-	u16 *s = (u16 *)from;
-	int words = count >> 1;
-	int diff = 0;
-	int i;
-	u16 d1;
-	u16 s1;
-
-	for (i = 0; i < words; i++) {
-		d1 = ioread16(d);
-		s1 = *s;
-		if (d1 != s1) {
-			diff++;
-			gif_err("ERR! [%d] d:0x%04X != s:0x%04X\n", i, d1, s1);
-		}
-		d++;
-		s++;
-	}
-
-	return diff;
-}
-
-/**
- * gnss_circ_read16_from_io
- * @dst: start address of the destination buffer
- * @src: start address of the buffer in a circular queue
- * @qsize: size of the circular queue
- * @out: offset to read
- * @len: length of data to be read
- *
- * Should be invoked after checking data length
- */
-void gnss_circ_read16_from_io(void *dst, void *src, u32 qsize, u32 out, u32 len)
-{
-	if ((out + len) <= qsize) {
-		/* ----- (out)         (in) ----- */
-		/* -----   7f 00 00 7e      ----- */
-		gnss_memcpy16_from_io(dst, (src + out), len);
-	} else {
-		/*       (in) ----------- (out)   */
-		/* 00 7e      -----------   7f 00 */
-		unsigned len1 = qsize - out;
-
-		/* 1) data start (out) ~ buffer end */
-		gnss_memcpy16_from_io(dst, (src + out), len1);
-
-		/* 2) buffer start ~ data end (in - 1) */
-		gnss_memcpy16_from_io((dst + len1), src, (len - len1));
-	}
-}
-
-/**
- * gnss_circ_write16_to_io
- * @dst: pointer to the start of the circular queue
- * @src: pointer to the source
- * @qsize: size of the circular queue
- * @in: offset to write
- * @len: length of data to be written
- *
- * Should be invoked after checking free space
- */
-void gnss_circ_write16_to_io(void *dst, void *src, u32 qsize, u32 in, u32 len)
-{
-	u32 space;
-
-	if ((in + len) < qsize) {
-		/*       (in) ----------- (out)   */
-		/* 00 7e      -----------   7f 00 */
-		gnss_memcpy16_to_io((dst + in), src, len);
-	} else {
-		/* ----- (out)         (in) ----- */
-		/* -----   7f 00 00 7e      ----- */
-
-		/* 1) space start (in) ~ buffer end */
-		space = qsize - in;
-		gnss_memcpy16_to_io((dst + in), src, ((len > space) ? space : len));
-
-		/* 2) buffer start ~ data end */
-		if (len > space)
-			gnss_memcpy16_to_io(dst, (src + space), (len - space));
-	}
-}
-
-/**
- * gnss_copy_circ_to_user
- * @dst: start address of the destination buffer
- * @src: start address of the buffer in a circular queue
- * @qsize: size of the circular queue
- * @out: offset to read
- * @len: length of data to be read
- *
- * Should be invoked after checking data length
- */
-int gnss_copy_circ_to_user(void __user *dst, void *src, u32 qsize, u32 out, u32 len)
-{
-	if ((out + len) <= qsize) {
-		/* ----- (out)         (in) ----- */
-		/* -----   7f 00 00 7e      ----- */
-		if (copy_to_user(dst, (src + out), len)) {
-			gif_err("ERR! <called by %pf> copy_to_user fail\n",
-				CALLER);
-			return -EFAULT;
-		}
-	} else {
-		/*       (in) ----------- (out)   */
-		/* 00 7e      -----------   7f 00 */
-		unsigned len1 = qsize - out;
-
-		/* 1) data start (out) ~ buffer end */
-		if (copy_to_user(dst, (src + out), len1)) {
-			gif_err("ERR! <called by %pf> copy_to_user fail\n",
-				CALLER);
-			return -EFAULT;
-		}
-
-		/* 2) buffer start ~ data end (in?) */
-		if (copy_to_user((dst + len1), src, (len - len1))) {
-			gif_err("ERR! <called by %pf> copy_to_user fail\n",
-				CALLER);
-			return -EFAULT;
-		}
-	}
-
-	return 0;
-}
-
-/**
- * gnss_copy_user_to_circ
- * @dst: pointer to the start of the circular queue
- * @src: pointer to the source
- * @qsize: size of the circular queue
- * @in: offset to write
- * @len: length of data to be written
- *
- * Should be invoked after checking free space
- */
-int gnss_copy_user_to_circ(void *dst, void __user *src, u32 qsize, u32 in, u32 len)
-{
-	u32 space;
-	u32 len1;
-
-	if ((in + len) < qsize) {
-		/*       (in) ----------- (out)   */
-		/* 00 7e      -----------   7f 00 */
-		if (copy_from_user((dst + in), src, len)) {
-			gif_err("ERR! <called by %pf> copy_from_user fail\n",
-				CALLER);
-			return -EFAULT;
-		}
-	} else {
-		/* ----- (out)         (in) ----- */
-		/* -----   7f 00 00 7e      ----- */
-
-		/* 1) space start (in) ~ buffer end */
-		space = qsize - in;
-		len1 = (len > space) ? space : len;
-		if (copy_from_user((dst + in), src, len1)) {
-			gif_err("ERR! <called by %pf> copy_from_user fail\n",
-				CALLER);
-			return -EFAULT;
-		}
-
-		/* 2) buffer start ~ data end */
-		if (len > len1) {
-			if (copy_from_user(dst, (src + space), (len - len1))) {
-				gif_err("ERR! <called by %pf> copy_from_user fail\n",
-						CALLER);
-				return -EFAULT;
-			}
-		}
-	}
-
-	return 0;
-}
-
-/**
- * gnss_capture_mem_dump
- * @ld: pointer to an instance of link_device structure
- * @base: base virtual address to a memory interface medium
- * @size: size of the memory interface medium
- *
- * Captures a dump for a memory interface medium.
- *
- * Returns the pointer to a memory dump buffer.
- */
-u8 *gnss_capture_mem_dump(struct link_device *ld, u8 *base, u32 size)
-{
-	u8 *buff = kzalloc(size, GFP_ATOMIC);
-	if (!buff) {
-		gif_err("%s: ERR! kzalloc(%d) fail\n", ld->name, size);
-		return NULL;
-	} else {
-		gnss_memcpy16_from_io(buff, base, size);
-		return buff;
-	}
-}
-
-/**
- * gnss_trq_get_free_slot
- * @trq : pointer to an instance of trace_data_queue structure
- *
- * Succeeds always by dropping the oldest slot if a "trq" is full.
- */
-struct trace_data *gnss_trq_get_free_slot(struct trace_data_queue *trq)
-{
-	int qsize = MAX_TRACE_SIZE;
-	int in;
-	int out;
-	unsigned long flags;
-	struct trace_data *trd;
-
-	spin_lock_irqsave(&trq->lock, flags);
-
-	in = trq->in;
-	out = trq->out;
-
-	/* The oldest slot can be dropped. */
-	if (circ_get_space(qsize, in, out) < 1) {
-		/* Free the data buffer in the oldest slot */
-		trd = &trq->trd[out];
-		kfree(trd->data);
-
-		/* Make the oldest slot empty */
-		out++;
-		trq->out = (out == qsize) ? 0 : out;
-	}
-
-	/* Get a free slot and make it occupied */
-	trd = &trq->trd[in++];
-	trq->in = (in == qsize) ? 0 : in;
-
-	spin_unlock_irqrestore(&trq->lock, flags);
-
-	memset(trd, 0, sizeof(struct trace_data));
-
-	return trd;
-}
-
-struct trace_data *gnss_trq_get_data_slot(struct trace_data_queue *trq)
-{
-	int qsize = MAX_TRACE_SIZE;
-	int in;
-	int out;
-	unsigned long flags;
-	struct trace_data *trd;
-
-	spin_lock_irqsave(&trq->lock, flags);
-
-	in = trq->in;
-	out = trq->out;
-
-	if (circ_get_usage(qsize, in, out) < 1) {
-		spin_unlock_irqrestore(&trq->lock, flags);
-		return NULL;
-	}
-
-	/* Get a data slot and make it empty */
-	trd = &trq->trd[out++];
-	trq->out = (out == qsize) ? 0 : out;
-
-	spin_unlock_irqrestore(&trq->lock, flags);
-
-	return trd;
-}
+     = 0x86,
+	DBG_CLIENT_BLKID_vceb0_0                         = 0x87,
+	DBG_CLIENT_BLKID_vgt3                            = 0x88,
+	DBG_CLIENT_BLKID_pc3                             = 0x89,
+	DBG_CLIENT_BLKID_mcd3_0                          = 0x8a,
+	DBG_CLIENT_BLKID_mcd3_1                          = 0x8b,
+	DBG_CLIENT_BLKID_uvdu_0                          = 0x8c,
+	DBG_CLIENT_BLKID_uvdu_1                          = 0x8d,
+	DBG_CLIENT_BLKID_uvdu_2                          = 0x8e,
+	DBG_CLIENT_BLKID_uvdu_3                          = 0x8f,
+	DBG_CLIENT_BLKID_uvdu_4                          = 0x90,
+	DBG_CLIENT_BLKID_uvdu_5                          = 0x91,
+	DBG_CLIENT_BLKID_uvdu_6                          = 0x92,
+	DBG_CLIENT_BLKID_cb300                           = 0x93,
+	DBG_CLIENT_BLKID_mcd1_0                          = 0x94,
+	DBG_CLIENT_BLKID_mcd1_1                          = 0x95,
+	DBG_CLIENT_BLKID_sx00                            = 0x96,
+	DBG_CLIENT_BLKID_uvdc_0                          = 0x97,
+	DBG_CLIENT_BLKID_uvdc_1                          = 0x98,
+	DBG_CLIENT_BLKID_mcc3                            = 0x99,
+	DBG_CLIENT_BLKID_mcc4                            = 0x9a,
+	DBG_CLIENT_BLKID_mcc5                            = 0x9b,
+	DBG_CLIENT_BLKID_mcc6                            = 0x9c,
+	DBG_CLIENT_BLKID_mcc7                            = 0x9d,
+	DBG_CLIENT_BLKID_cpg_0                           = 0x9e,
+	DBG_CLIENT_BLKID_cpg_1                           = 0x9f,
+	DBG_CLIENT_BLKID_gck                             = 0xa0,
+	DBG_CLIENT_BLKID_mcc1                            = 0xa1,
+	DBG_CLIENT_BLKID_cpf_0                           = 0xa2,
+	DBG_CLIENT_BLKID_cpf_1                           = 0xa3,
+	DBG_CLIENT_BLKID_rlc                             = 0xa4,
+	DBG_CLIENT_BLKID_grbm                            = 0xa5,
+	DBG_CLIENT_BLKID_sammsp                          = 0xa6,
+	DBG_CLIENT_BLKID_dci_pg                          = 0xa7,
+	DBG_CLIENT_BLKID_dci_0                           = 0xa8,
+	DBG_CLIENT_BLKID_dccg0_0                         = 0xa9,
+	DBG_CLIENT_BLKID_dccg0_1                         = 0xaa,
+	DBG_CLIENT_BLKID_dcfe01_0                        = 0xab,
+	DBG_CLIENT_BLKID_dcfe02_0                        = 0xac,
+	DBG_CLIENT_BLKID_dcfe03_0                        = 0xad,
+	DBG_CLIENT_BLKID_dcfe04_0                        = 0xae,
+	DBG_CLIENT_BLKID_dcfe05_0                        = 0xaf,
+	DBG_CLIENT_BLKID_dcfe06_0                        = 0xb0,
+	DBG_CLIENT_BLKID_mcq0_0                          = 0xb1,
+	DBG_CLIENT_BLKID_mcq0_1                          = 0xb2,
+	DBG_CLIENT_BLKID_mcq1_0                          = 0xb3,
+	DBG_CLIENT_BLKID_mcq1_1                          = 0xb4,
+	DBG_CLIENT_BLKID_mcq2_0                          = 0xb5,
+	DBG_CLIENT_BLKID_mcq2_1                          = 0xb6,
+	DBG_CLIENT_BLKID_mcq3_0                          = 0xb7,
+	DBG_CLIENT_BLKID_mcq3_1                          = 0xb8,
+	DBG_CLIENT_BLKID_mcq4_0                          = 0xb9,
+	DBG_CLIENT_BLKID_mcq4_1                          = 0xba,
+	DBG_CLIENT_BLKID_mcq5_0                          = 0xbb,
+	DBG_CLIENT_BLKID_mcq5_1                          = 0xbc,
+	DBG_CLIENT_BLKID_mcq6_0                          = 0xbd,
+	DBG_CLIENT_BLKID_mcq6_1                          = 0xbe,
+	DBG_CLIENT_BLKID_mcq7_0                          = 0xbf,
+	DBG_CLIENT_BLKID_mcq7_1                          = 0xc0,
+	DBG_CLIENT_BLKID_uvdi_0                          = 0xc1,
+	DBG_CLIENT_BLKID_RESERVED_LAST                   = 0xc2,
+} DebugBlockId;
+typedef enum DebugBlockId_OLD {
+	DBG_BLOCK_ID_RESERVED                            = 0x0,
+	DBG_BLOCK_ID_DBG                                 = 0x1,
+	DBG_BLOCK_ID_VMC                                 = 0x2,
+	DBG_BLOCK_ID_PDMA                                = 0x3,
+	DBG_BLOCK_ID_CG                                  = 0x4,
+	DBG_BLOCK_ID_SRBM                                = 0x5,
+	DBG_BLOCK_ID_GRBM                                = 0x6,
+	DBG_BLOCK_ID_RLC                                 = 0x7,
+	DBG_BLOCK_ID_CSC                                 = 0x8,
+	DBG_BLOCK_ID_SEM                                 = 0x9,
+	DBG_BLOCK_ID_IH                                  = 0xa,
+	DBG_BLOCK_ID_SC                                  = 0xb,
+	DBG_BLOCK_ID_SQ                                  = 0xc,
+	DBG_BLOCK_ID_AVP                                 = 0xd,
+	DBG_BLOCK_ID_GMCON                               = 0xe,
+	DBG_BLOCK_ID_SMU                                 = 0xf,
+	DBG_BLOCK_ID_DMA0                                = 0x10,
+	DBG_BLOCK_ID_DMA1                                = 0x11,
+	DBG_BLOCK_ID_SPIM                                = 0x12,
+	DBG_BLOCK_ID_GDS                                 = 0x13,
+	DBG_BLOCK_ID_SPIS                                = 0x14,
+	DBG_BLOCK_ID_UNUSED0                             = 0x15,
+	DBG_BLOCK_ID_PA0                                 = 0x16,
+	DBG_BLOCK_ID_PA1                                 = 0x17,
+	DBG_BLOCK_ID_CP0                                 = 0x18,
+	DBG_BLOCK_ID_CP1                                 = 0x19,
+	DBG_BLOCK_ID_CP2                                 = 0x1a,
+	DBG_BLOCK_ID_UNUSED1                             = 0x1b,
+	DBG_BLOCK_ID_UVDU                                = 0x1c,
+	DBG_BLOCK_ID_UVDM                                = 0x1d,
+	DBG_BLOCK_ID_VCE                                 = 0x1e,
+	DBG_BLOCK_ID_UNUSED2                             = 0x1f,
+	DBG_BLOCK_ID_VGT0                                = 0x20,
+	DBG_BLOCK_ID_VGT1                                = 0x21,
+	DBG_BLOCK_ID_IA                                  = 0x22,
+	DBG_BLOCK_ID_UNUSED3                             = 0x23,
+	DBG_BLOCK_ID_SCT0                                = 0x24,
+	DBG_BLOCK_ID_SCT1                                = 0x25,
+	DBG_BLOCK_ID_SPM0                                = 0x26,
+	DBG_BLOCK_ID_SPM1                                = 0x27,
+	DBG_BLOCK_ID_TCAA                                = 0x28,
+	DBG_BLOCK_ID_TCAB                                = 0x29,
+	DBG_BLOCK_ID_TCCA                                = 0x2a,
+	DBG_BLOCK_ID_TCCB                                = 0x2b,
+	DBG_BLOCK_ID_MCC0                                = 0x2c,
+	DBG_BLOCK_ID_MCC1                                = 0x2d,
+	DBG_BLOCK_ID_MCC2                                = 0x2e,
+	DBG_BLOCK_ID_MCC3                                = 0x2f,
+	DBG_BLOCK_ID_SX0                                 = 0x30,
+	DBG_BLOCK_ID_SX1                                 = 0x31,
+	DBG_BLOCK_ID_SX2                                 = 0x32,
+	DBG_BLOCK_ID_SX3                                 = 0x33,
+	DBG_BLOCK_ID_UNUSED4                             = 0x34,
+	DBG_BLOCK_ID_UNUSED5                             = 0x35,
+	DBG_BLOCK_ID_UNUSED6                             = 0x36,
+	DBG_BLOCK_ID_UNUSED7                             = 0x37,
+	DBG_BLOCK_ID_PC0                                 = 0x38,
+	DBG_BLOCK_ID_PC1                                 = 0x39,
+	DBG_BLOCK_ID_UNUSED8                             = 0x3a,
+	DBG_BLOCK_ID_UNUSED9                             = 0x3b,
+	DBG_BLOCK_ID_UNUSED10                            = 0x3c,
+	DBG_BLOCK_ID_UNUSED11                            = 0x3d,
+	DBG_BLOCK_ID_MCB                                 = 0x3e,
+	DBG_BLOCK_ID_UNUSED12                            = 0x3f,
+	DBG_BLOCK_ID_SCB0                                = 0x40,
+	DBG_BLOCK_ID_SCB1                                = 0x41,
+	DBG_BLOCK_ID_UNUSED13                            = 0x42,
+	DBG_BLOCK_ID_UNUSED14                            = 0x43,
+	DBG_BLOCK_ID_SCF0                                = 0x44,
+	DBG_BLOCK_ID_SCF1                                = 0x45,
+	DBG_BLOCK_ID_UNUSED15                            = 0x46,
+	DBG_BLOCK_ID_UNUSED16                            = 0x47,
+	DBG_BLOCK_ID_BCI0                                = 0x48,
+	DBG_BLOCK_ID_BCI1                                = 0x49,
+	DBG_BLOCK_ID_BCI2                                = 0x4a,
+	DBG_BLOCK_ID_BCI3                                = 0x4b,
+	DBG_BLOCK_ID_UNUSED17                            = 0x4c,
+	DBG_BLOCK_ID_UNUSED18                            = 0x4d,
+	DBG_BLOCK_ID_UNUSED19                            = 0x4e,
+	DBG_BLOCK_ID_UNUSED20                            = 0x4f,
+	DBG_BLOCK_ID_CB00                                = 0x50,
+	DBG_BLOCK_ID_CB01                                = 0x51,
+	DBG_BLOCK_ID_CB02                                = 0x52,
+	DBG_BLOCK_ID_CB03                                = 0x53,
+	DBG_BLOCK_ID_CB04                                = 0x54,
+	DBG_BLOCK_ID_UNUSED21                            = 0x55,
+	DBG_BLOCK_ID_UNUSED22                            = 0x56,
+	DBG_BLOCK_ID_UNUSED23                            = 0x57,
+	DBG_BLOCK_ID_CB10                                = 0x58,
+	DBG_BLOCK_ID_CB11                                = 0x59,
+	DBG_BLOCK_ID_CB12                                = 0x5a,
+	DBG_BLOCK_ID_CB13                                = 0x5b,
+	DBG_BLOCK_ID_CB14                                = 0x5c,
+	DBG_BLOCK_ID_UNUSED24                            = 0x5d,
+	DBG_BLOCK_ID_UNUSED25                            = 0x5e,
+	DBG_BLOCK_ID_UNUSED26                            = 0x5f,
+	DBG_BLOCK_ID_TCP0                                = 0x60,
+	DBG_BLOCK_ID_TCP1                                = 0x61,
+	DBG_BLOCK_ID_TCP2                                = 0x62,
+	DBG_BLOCK_ID_TCP3                                = 0x63

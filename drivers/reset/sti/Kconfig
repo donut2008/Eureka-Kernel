@@ -1,19 +1,5 @@
-if ARCH_STI
-
-config STI_RESET_SYSCFG
-	bool
-	select RESET_CONTROLLER
-
-config STIH415_RESET
-	bool
-	select STI_RESET_SYSCFG
-
-config STIH416_RESET
-	bool
-	select STI_RESET_SYSCFG
-
-config STIH407_RESET
-	bool
-	select STI_RESET_SYSCFG
-
-endif
+= 0x69,
+	DBG_BLOCK_ID_LDS04_BY2                           = 0x6a,
+	DBG_BLOCK_ID_LDS06_BY2                           = 0x6b,
+	DBG_BLOCK_ID_LDS08_BY2                           = 0x6c,
+	DBG_BLOCK_ID_LDS0A_BY2                           = 

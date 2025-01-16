@@ -1,66 +1,28 @@
-/*
- * Copyright (c) 2004 Topspin Communications.  All rights reserved.
- * Copyright (c) 2005 Voltaire, Inc.  All rights reserved.
- * Copyright (c) 2006 Intel Corporation.  All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-#ifndef SA_H
-#define SA_H
-
-#include <rdma/ib_sa.h>
-
-static inline void ib_sa_client_get(struct ib_sa_client *client)
-{
-	atomic_inc(&client->users);
-}
-
-static inline void ib_sa_client_put(struct ib_sa_client *client)
-{
-	if (atomic_dec_and_test(&client->users))
-		complete(&client->comp);
-}
-
-int ib_sa_mcmember_rec_query(struct ib_sa_client *client,
-			     struct ib_device *device, u8 port_num,
-			     u8 method,
-			     struct ib_sa_mcmember_rec *rec,
-			     ib_sa_comp_mask comp_mask,
-			     int timeout_ms, gfp_t gfp_mask,
-			     void (*callback)(int status,
-					      struct ib_sa_mcmember_rec *resp,
-					      void *context),
-			     void *context,
-			     struct ib_sa_query **sa_query);
-
-int mcast_init(void);
-void mcast_cleanup(void);
-
-#endif /* SA_H */
+      0x54a5
+#define mmDP7_DP_STEER_FIFO                                                     0x56a5
+#define mmDP8_DP_STEER_FIFO                                                     0x57a5
+#define mmDP_MSA_MISC                                                           0x4aa6
+#define mmDP0_DP_MSA_MISC                                                       0x4aa6
+#define mmDP1_DP_MSA_MISC                                                       0x4ba6
+#define mmDP2_DP_MSA_MISC                                                       0x4ca6
+#define mmDP3_DP_MSA_MISC                                                       0x4da6
+#define mmDP4_DP_MSA_MISC                                                       0x4ea6
+#define mmDP5_DP_MSA_MISC                                                       0x4fa6
+#define mmDP6_DP_MSA_MISC                                                       0x54a6
+#define mmDP7_DP_MSA_MISC                                                       0x56a6
+#define mmDP8_DP_MSA_MISC                                                       0x57a6
+#define mmDP_VID_TIMING                                                         0x4aa8
+#define mmDP0_DP_VID_TIMING                                                     0x4aa8
+#define mmDP1_DP_VID_TIMING                                                     0x4ba8
+#define mmDP2_DP_VID_TIMING                                                     0x4ca8
+#define mmDP3_DP_VID_TIMING                                                     0x4da8
+#define mmDP4_DP_VID_TIMING                                                     0x4ea8
+#define mmDP5_DP_VID_TIMING                                                     0x4fa8
+#define mmDP6_DP_VID_TIMING                                                     0x54a8
+#define mmDP7_DP_VID_TIMING                                                     0x56a8
+#define mmDP8_DP_VID_TIMING                                                     0x57a8
+#define mmDP_VID_N                                                              0x4aa9
+#define mmDP0_DP_VID_N                                                          0x4aa9
+#define mmDP1_DP_VID_N                                                          0x4ba9
+#define mmDP2_DP_VID_N                                                          0x4ca9
+#define mmDP3_DP_VID_N                             

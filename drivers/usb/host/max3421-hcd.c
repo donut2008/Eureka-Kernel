@@ -1,1923 +1,810 @@
-/*
- * MAX3421 Host Controller driver for USB.
- *
- * Author: David Mosberger-Tang <davidm@egauge.net>
- *
- * (C) Copyright 2014 David Mosberger-Tang <davidm@egauge.net>
- *
- * MAX3421 is a chip implementing a USB 2.0 Full-/Low-Speed host
- * controller on a SPI bus.
- *
- * Based on:
- *	o MAX3421E datasheet
- *		http://datasheets.maximintegrated.com/en/ds/MAX3421E.pdf
- *	o MAX3421E Programming Guide
- *		http://www.hdl.co.jp/ftpdata/utl-001/AN3785.pdf
- *	o gadget/dummy_hcd.c
- *		For USB HCD implementation.
- *	o Arduino MAX3421 driver
- *	     https://github.com/felis/USB_Host_Shield_2.0/blob/master/Usb.cpp
- *
- * This file is licenced under the GPL v2.
- *
- * Important note on worst-case (full-speed) packet size constraints
- * (See USB 2.0 Section 5.6.3 and following):
- *
- *	- control:	  64 bytes
- *	- isochronous:	1023 bytes
- *	- interrupt:	  64 bytes
- *	- bulk:		  64 bytes
- *
- * Since the MAX3421 FIFO size is 64 bytes, we do not have to work about
- * multi-FIFO writes/reads for a single USB packet *except* for isochronous
- * transfers.  We don't support isochronous transfers at this time, so we
- * just assume that a USB packet always fits into a single FIFO buffer.
- *
- * NOTE: The June 2006 version of "MAX3421E Programming Guide"
- * (AN3785) has conflicting info for the RCVDAVIRQ bit:
- *
- *	The description of RCVDAVIRQ says "The CPU *must* clear
- *	this IRQ bit (by writing a 1 to it) before reading the
- *	RCVFIFO data.
- *
- * However, the earlier section on "Programming BULK-IN
- * Transfers" says * that:
- *
- *	After the CPU retrieves the data, it clears the
- *	RCVDAVIRQ bit.
- *
- * The December 2006 version has been corrected and it consistently
- * states the second behavior is the correct one.
- *
- * Synchronous SPI transactions sleep so we can't perform any such
- * transactions while holding a spin-lock (and/or while interrupts are
- * masked).  To achieve this, all SPI transactions are issued from a
- * single thread (max3421_spi_thread).
- */
-
-#include <linux/jiffies.h>
-#include <linux/module.h>
-#include <linux/spi/spi.h>
-#include <linux/usb.h>
-#include <linux/usb/hcd.h>
-
-#include <linux/platform_data/max3421-hcd.h>
-
-#define DRIVER_DESC	"MAX3421 USB Host-Controller Driver"
-#define DRIVER_VERSION	"1.0"
-
-/* 11-bit counter that wraps around (USB 2.0 Section 8.3.3): */
-#define USB_MAX_FRAME_NUMBER	0x7ff
-#define USB_MAX_RETRIES		3 /* # of retries before error is reported */
-
-/*
- * Max. # of times we're willing to retransmit a request immediately in
- * resposne to a NAK.  Afterwards, we fall back on trying once a frame.
- */
-#define NAK_MAX_FAST_RETRANSMITS	2
-
-#define POWER_BUDGET	500	/* in mA; use 8 for low-power port testing */
-
-/* Port-change mask: */
-#define PORT_C_MASK	((USB_PORT_STAT_C_CONNECTION |	\
-			  USB_PORT_STAT_C_ENABLE |	\
-			  USB_PORT_STAT_C_SUSPEND |	\
-			  USB_PORT_STAT_C_OVERCURRENT | \
-			  USB_PORT_STAT_C_RESET) << 16)
-
-enum max3421_rh_state {
-	MAX3421_RH_RESET,
-	MAX3421_RH_SUSPENDED,
-	MAX3421_RH_RUNNING
-};
-
-enum pkt_state {
-	PKT_STATE_SETUP,	/* waiting to send setup packet to ctrl pipe */
-	PKT_STATE_TRANSFER,	/* waiting to xfer transfer_buffer */
-	PKT_STATE_TERMINATE	/* waiting to terminate control transfer */
-};
-
-enum scheduling_pass {
-	SCHED_PASS_PERIODIC,
-	SCHED_PASS_NON_PERIODIC,
-	SCHED_PASS_DONE
-};
-
-/* Bit numbers for max3421_hcd->todo: */
-enum {
-	ENABLE_IRQ = 0,
-	RESET_HCD,
-	RESET_PORT,
-	CHECK_UNLINK,
-	IOPIN_UPDATE
-};
-
-struct max3421_dma_buf {
-	u8 data[2];
-};
-
-struct max3421_hcd {
-	spinlock_t lock;
-
-	struct task_struct *spi_thread;
-
-	enum max3421_rh_state rh_state;
-	/* lower 16 bits contain port status, upper 16 bits the change mask: */
-	u32 port_status;
-
-	unsigned active:1;
-
-	struct list_head ep_list;	/* list of EP's with work */
-
-	/*
-	 * The following are owned by spi_thread (may be accessed by
-	 * SPI-thread without acquiring the HCD lock:
-	 */
-	u8 rev;				/* chip revision */
-	u16 frame_number;
-	/*
-	 * kmalloc'd buffers guaranteed to be in separate (DMA)
-	 * cache-lines:
-	 */
-	struct max3421_dma_buf *tx;
-	struct max3421_dma_buf *rx;
-	/*
-	 * URB we're currently processing.  Must not be reset to NULL
-	 * unless MAX3421E chip is idle:
-	 */
-	struct urb *curr_urb;
-	enum scheduling_pass sched_pass;
-	int urb_done;			/* > 0 -> no errors, < 0: errno */
-	size_t curr_len;
-	u8 hien;
-	u8 mode;
-	u8 iopins[2];
-	unsigned long todo;
-#ifdef DEBUG
-	unsigned long err_stat[16];
-#endif
-};
-
-struct max3421_ep {
-	struct usb_host_endpoint *ep;
-	struct list_head ep_list;
-	u32 naks;
-	u16 last_active;		/* frame # this ep was last active */
-	enum pkt_state pkt_state;
-	u8 retries;
-	u8 retransmit;			/* packet needs retransmission */
-};
-
-#define MAX3421_FIFO_SIZE	64
-
-#define MAX3421_SPI_DIR_RD	0	/* read register from MAX3421 */
-#define MAX3421_SPI_DIR_WR	1	/* write register to MAX3421 */
-
-/* SPI commands: */
-#define MAX3421_SPI_DIR_SHIFT	1
-#define MAX3421_SPI_REG_SHIFT	3
-
-#define MAX3421_REG_RCVFIFO	1
-#define MAX3421_REG_SNDFIFO	2
-#define MAX3421_REG_SUDFIFO	4
-#define MAX3421_REG_RCVBC	6
-#define MAX3421_REG_SNDBC	7
-#define MAX3421_REG_USBIRQ	13
-#define MAX3421_REG_USBIEN	14
-#define MAX3421_REG_USBCTL	15
-#define MAX3421_REG_CPUCTL	16
-#define MAX3421_REG_PINCTL	17
-#define MAX3421_REG_REVISION	18
-#define MAX3421_REG_IOPINS1	20
-#define MAX3421_REG_IOPINS2	21
-#define MAX3421_REG_GPINIRQ	22
-#define MAX3421_REG_GPINIEN	23
-#define MAX3421_REG_GPINPOL	24
-#define MAX3421_REG_HIRQ	25
-#define MAX3421_REG_HIEN	26
-#define MAX3421_REG_MODE	27
-#define MAX3421_REG_PERADDR	28
-#define MAX3421_REG_HCTL	29
-#define MAX3421_REG_HXFR	30
-#define MAX3421_REG_HRSL	31
-
-enum {
-	MAX3421_USBIRQ_OSCOKIRQ_BIT = 0,
-	MAX3421_USBIRQ_NOVBUSIRQ_BIT = 5,
-	MAX3421_USBIRQ_VBUSIRQ_BIT
-};
-
-enum {
-	MAX3421_CPUCTL_IE_BIT = 0,
-	MAX3421_CPUCTL_PULSEWID0_BIT = 6,
-	MAX3421_CPUCTL_PULSEWID1_BIT
-};
-
-enum {
-	MAX3421_USBCTL_PWRDOWN_BIT = 4,
-	MAX3421_USBCTL_CHIPRES_BIT
-};
-
-enum {
-	MAX3421_PINCTL_GPXA_BIT	= 0,
-	MAX3421_PINCTL_GPXB_BIT,
-	MAX3421_PINCTL_POSINT_BIT,
-	MAX3421_PINCTL_INTLEVEL_BIT,
-	MAX3421_PINCTL_FDUPSPI_BIT,
-	MAX3421_PINCTL_EP0INAK_BIT,
-	MAX3421_PINCTL_EP2INAK_BIT,
-	MAX3421_PINCTL_EP3INAK_BIT,
-};
-
-enum {
-	MAX3421_HI_BUSEVENT_BIT = 0,	/* bus-reset/-resume */
-	MAX3421_HI_RWU_BIT,		/* remote wakeup */
-	MAX3421_HI_RCVDAV_BIT,		/* receive FIFO data available */
-	MAX3421_HI_SNDBAV_BIT,		/* send buffer available */
-	MAX3421_HI_SUSDN_BIT,		/* suspend operation done */
-	MAX3421_HI_CONDET_BIT,		/* peripheral connect/disconnect */
-	MAX3421_HI_FRAME_BIT,		/* frame generator */
-	MAX3421_HI_HXFRDN_BIT,		/* host transfer done */
-};
-
-enum {
-	MAX3421_HCTL_BUSRST_BIT = 0,
-	MAX3421_HCTL_FRMRST_BIT,
-	MAX3421_HCTL_SAMPLEBUS_BIT,
-	MAX3421_HCTL_SIGRSM_BIT,
-	MAX3421_HCTL_RCVTOG0_BIT,
-	MAX3421_HCTL_RCVTOG1_BIT,
-	MAX3421_HCTL_SNDTOG0_BIT,
-	MAX3421_HCTL_SNDTOG1_BIT
-};
-
-enum {
-	MAX3421_MODE_HOST_BIT = 0,
-	MAX3421_MODE_LOWSPEED_BIT,
-	MAX3421_MODE_HUBPRE_BIT,
-	MAX3421_MODE_SOFKAENAB_BIT,
-	MAX3421_MODE_SEPIRQ_BIT,
-	MAX3421_MODE_DELAYISO_BIT,
-	MAX3421_MODE_DMPULLDN_BIT,
-	MAX3421_MODE_DPPULLDN_BIT
-};
-
-enum {
-	MAX3421_HRSL_OK = 0,
-	MAX3421_HRSL_BUSY,
-	MAX3421_HRSL_BADREQ,
-	MAX3421_HRSL_UNDEF,
-	MAX3421_HRSL_NAK,
-	MAX3421_HRSL_STALL,
-	MAX3421_HRSL_TOGERR,
-	MAX3421_HRSL_WRONGPID,
-	MAX3421_HRSL_BADBC,
-	MAX3421_HRSL_PIDERR,
-	MAX3421_HRSL_PKTERR,
-	MAX3421_HRSL_CRCERR,
-	MAX3421_HRSL_KERR,
-	MAX3421_HRSL_JERR,
-	MAX3421_HRSL_TIMEOUT,
-	MAX3421_HRSL_BABBLE,
-	MAX3421_HRSL_RESULT_MASK = 0xf,
-	MAX3421_HRSL_RCVTOGRD_BIT = 4,
-	MAX3421_HRSL_SNDTOGRD_BIT,
-	MAX3421_HRSL_KSTATUS_BIT,
-	MAX3421_HRSL_JSTATUS_BIT
-};
-
-/* Return same error-codes as ohci.h:cc_to_error: */
-static const int hrsl_to_error[] = {
-	[MAX3421_HRSL_OK] =		0,
-	[MAX3421_HRSL_BUSY] =		-EINVAL,
-	[MAX3421_HRSL_BADREQ] =		-EINVAL,
-	[MAX3421_HRSL_UNDEF] =		-EINVAL,
-	[MAX3421_HRSL_NAK] =		-EAGAIN,
-	[MAX3421_HRSL_STALL] =		-EPIPE,
-	[MAX3421_HRSL_TOGERR] =		-EILSEQ,
-	[MAX3421_HRSL_WRONGPID] =	-EPROTO,
-	[MAX3421_HRSL_BADBC] =		-EREMOTEIO,
-	[MAX3421_HRSL_PIDERR] =		-EPROTO,
-	[MAX3421_HRSL_PKTERR] =		-EPROTO,
-	[MAX3421_HRSL_CRCERR] =		-EILSEQ,
-	[MAX3421_HRSL_KERR] =		-EIO,
-	[MAX3421_HRSL_JERR] =		-EIO,
-	[MAX3421_HRSL_TIMEOUT] =	-ETIME,
-	[MAX3421_HRSL_BABBLE] =		-EOVERFLOW
-};
-
-/*
- * See http://www.beyondlogic.org/usbnutshell/usb4.shtml#Control for a
- * reasonable overview of how control transfers use the the IN/OUT
- * tokens.
- */
-#define MAX3421_HXFR_BULK_IN(ep)	(0x00 | (ep))	/* bulk or interrupt */
-#define MAX3421_HXFR_SETUP		 0x10
-#define MAX3421_HXFR_BULK_OUT(ep)	(0x20 | (ep))	/* bulk or interrupt */
-#define MAX3421_HXFR_ISO_IN(ep)		(0x40 | (ep))
-#define MAX3421_HXFR_ISO_OUT(ep)	(0x60 | (ep))
-#define MAX3421_HXFR_HS_IN		 0x80		/* handshake in */
-#define MAX3421_HXFR_HS_OUT		 0xa0		/* handshake out */
-
-#define field(val, bit)	((val) << (bit))
-
-static inline s16
-frame_diff(u16 left, u16 right)
-{
-	return ((unsigned) (left - right)) % (USB_MAX_FRAME_NUMBER + 1);
-}
-
-static inline struct max3421_hcd *
-hcd_to_max3421(struct usb_hcd *hcd)
-{
-	return (struct max3421_hcd *) hcd->hcd_priv;
-}
-
-static inline struct usb_hcd *
-max3421_to_hcd(struct max3421_hcd *max3421_hcd)
-{
-	return container_of((void *) max3421_hcd, struct usb_hcd, hcd_priv);
-}
-
-static u8
-spi_rd8(struct usb_hcd *hcd, unsigned int reg)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct spi_transfer transfer;
-	struct spi_message msg;
-
-	memset(&transfer, 0, sizeof(transfer));
-
-	spi_message_init(&msg);
-
-	max3421_hcd->tx->data[0] =
-		(field(reg, MAX3421_SPI_REG_SHIFT) |
-		 field(MAX3421_SPI_DIR_RD, MAX3421_SPI_DIR_SHIFT));
-
-	transfer.tx_buf = max3421_hcd->tx->data;
-	transfer.rx_buf = max3421_hcd->rx->data;
-	transfer.len = 2;
-
-	spi_message_add_tail(&transfer, &msg);
-	spi_sync(spi, &msg);
-
-	return max3421_hcd->rx->data[1];
-}
-
-static void
-spi_wr8(struct usb_hcd *hcd, unsigned int reg, u8 val)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct spi_transfer transfer;
-	struct spi_message msg;
-
-	memset(&transfer, 0, sizeof(transfer));
-
-	spi_message_init(&msg);
-
-	max3421_hcd->tx->data[0] =
-		(field(reg, MAX3421_SPI_REG_SHIFT) |
-		 field(MAX3421_SPI_DIR_WR, MAX3421_SPI_DIR_SHIFT));
-	max3421_hcd->tx->data[1] = val;
-
-	transfer.tx_buf = max3421_hcd->tx->data;
-	transfer.len = 2;
-
-	spi_message_add_tail(&transfer, &msg);
-	spi_sync(spi, &msg);
-}
-
-static void
-spi_rd_buf(struct usb_hcd *hcd, unsigned int reg, void *buf, size_t len)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct spi_transfer transfer[2];
-	struct spi_message msg;
-
-	memset(transfer, 0, sizeof(transfer));
-
-	spi_message_init(&msg);
-
-	max3421_hcd->tx->data[0] =
-		(field(reg, MAX3421_SPI_REG_SHIFT) |
-		 field(MAX3421_SPI_DIR_RD, MAX3421_SPI_DIR_SHIFT));
-	transfer[0].tx_buf = max3421_hcd->tx->data;
-	transfer[0].len = 1;
-
-	transfer[1].rx_buf = buf;
-	transfer[1].len = len;
-
-	spi_message_add_tail(&transfer[0], &msg);
-	spi_message_add_tail(&transfer[1], &msg);
-	spi_sync(spi, &msg);
-}
-
-static void
-spi_wr_buf(struct usb_hcd *hcd, unsigned int reg, void *buf, size_t len)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct spi_transfer transfer[2];
-	struct spi_message msg;
-
-	memset(transfer, 0, sizeof(transfer));
-
-	spi_message_init(&msg);
-
-	max3421_hcd->tx->data[0] =
-		(field(reg, MAX3421_SPI_REG_SHIFT) |
-		 field(MAX3421_SPI_DIR_WR, MAX3421_SPI_DIR_SHIFT));
-
-	transfer[0].tx_buf = max3421_hcd->tx->data;
-	transfer[0].len = 1;
-
-	transfer[1].tx_buf = buf;
-	transfer[1].len = len;
-
-	spi_message_add_tail(&transfer[0], &msg);
-	spi_message_add_tail(&transfer[1], &msg);
-	spi_sync(spi, &msg);
-}
-
-/*
- * Figure out the correct setting for the LOWSPEED and HUBPRE mode
- * bits.  The HUBPRE bit needs to be set when MAX3421E operates at
- * full speed, but it's talking to a low-speed device (i.e., through a
- * hub).  Setting that bit ensures that every low-speed packet is
- * preceded by a full-speed PRE PID.  Possible configurations:
- *
- * Hub speed:	Device speed:	=>	LOWSPEED bit:	HUBPRE bit:
- *	FULL	FULL		=>	0		0
- *	FULL	LOW		=>	1		1
- *	LOW	LOW		=>	1		0
- *	LOW	FULL		=>	1		0
- */
-static void
-max3421_set_speed(struct usb_hcd *hcd, struct usb_device *dev)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	u8 mode_lowspeed, mode_hubpre, mode = max3421_hcd->mode;
-
-	mode_lowspeed = BIT(MAX3421_MODE_LOWSPEED_BIT);
-	mode_hubpre   = BIT(MAX3421_MODE_HUBPRE_BIT);
-	if (max3421_hcd->port_status & USB_PORT_STAT_LOW_SPEED) {
-		mode |=  mode_lowspeed;
-		mode &= ~mode_hubpre;
-	} else if (dev->speed == USB_SPEED_LOW) {
-		mode |= mode_lowspeed | mode_hubpre;
-	} else {
-		mode &= ~(mode_lowspeed | mode_hubpre);
-	}
-	if (mode != max3421_hcd->mode) {
-		max3421_hcd->mode = mode;
-		spi_wr8(hcd, MAX3421_REG_MODE, max3421_hcd->mode);
-	}
-
-}
-
-/*
- * Caller must NOT hold HCD spinlock.
- */
-static void
-max3421_set_address(struct usb_hcd *hcd, struct usb_device *dev, int epnum)
-{
-	int rcvtog, sndtog;
-	u8 hctl;
-
-	/* setup new endpoint's toggle bits: */
-	rcvtog = usb_gettoggle(dev, epnum, 0);
-	sndtog = usb_gettoggle(dev, epnum, 1);
-	hctl = (BIT(rcvtog + MAX3421_HCTL_RCVTOG0_BIT) |
-		BIT(sndtog + MAX3421_HCTL_SNDTOG0_BIT));
-
-	spi_wr8(hcd, MAX3421_REG_HCTL, hctl);
-
-	/*
-	 * Note: devnum for one and the same device can change during
-	 * address-assignment so it's best to just always load the
-	 * address whenever the end-point changed/was forced.
-	 */
-	spi_wr8(hcd, MAX3421_REG_PERADDR, dev->devnum);
-}
-
-static int
-max3421_ctrl_setup(struct usb_hcd *hcd, struct urb *urb)
-{
-	spi_wr_buf(hcd, MAX3421_REG_SUDFIFO, urb->setup_packet, 8);
-	return MAX3421_HXFR_SETUP;
-}
-
-static int
-max3421_transfer_in(struct usb_hcd *hcd, struct urb *urb)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	int epnum = usb_pipeendpoint(urb->pipe);
-
-	max3421_hcd->curr_len = 0;
-	max3421_hcd->hien |= BIT(MAX3421_HI_RCVDAV_BIT);
-	return MAX3421_HXFR_BULK_IN(epnum);
-}
-
-static int
-max3421_transfer_out(struct usb_hcd *hcd, struct urb *urb, int fast_retransmit)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	int epnum = usb_pipeendpoint(urb->pipe);
-	u32 max_packet;
-	void *src;
-
-	src = urb->transfer_buffer + urb->actual_length;
-
-	if (fast_retransmit) {
-		if (max3421_hcd->rev == 0x12) {
-			/* work around rev 0x12 bug: */
-			spi_wr8(hcd, MAX3421_REG_SNDBC, 0);
-			spi_wr8(hcd, MAX3421_REG_SNDFIFO, ((u8 *) src)[0]);
-			spi_wr8(hcd, MAX3421_REG_SNDBC, max3421_hcd->curr_len);
-		}
-		return MAX3421_HXFR_BULK_OUT(epnum);
-	}
-
-	max_packet = usb_maxpacket(urb->dev, urb->pipe, 1);
-
-	if (max_packet > MAX3421_FIFO_SIZE) {
-		/*
-		 * We do not support isochronous transfers at this
-		 * time.
-		 */
-		dev_err(&spi->dev,
-			"%s: packet-size of %u too big (limit is %u bytes)",
-			__func__, max_packet, MAX3421_FIFO_SIZE);
-		max3421_hcd->urb_done = -EMSGSIZE;
-		return -EMSGSIZE;
-	}
-	max3421_hcd->curr_len = min((urb->transfer_buffer_length -
-				     urb->actual_length), max_packet);
-
-	spi_wr_buf(hcd, MAX3421_REG_SNDFIFO, src, max3421_hcd->curr_len);
-	spi_wr8(hcd, MAX3421_REG_SNDBC, max3421_hcd->curr_len);
-	return MAX3421_HXFR_BULK_OUT(epnum);
-}
-
-/*
- * Issue the next host-transfer command.
- * Caller must NOT hold HCD spinlock.
- */
-static void
-max3421_next_transfer(struct usb_hcd *hcd, int fast_retransmit)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct urb *urb = max3421_hcd->curr_urb;
-	struct max3421_ep *max3421_ep;
-	int cmd = -EINVAL;
-
-	if (!urb)
-		return;	/* nothing to do */
-
-	max3421_ep = urb->ep->hcpriv;
-
-	switch (max3421_ep->pkt_state) {
-	case PKT_STATE_SETUP:
-		cmd = max3421_ctrl_setup(hcd, urb);
-		break;
-
-	case PKT_STATE_TRANSFER:
-		if (usb_urb_dir_in(urb))
-			cmd = max3421_transfer_in(hcd, urb);
-		else
-			cmd = max3421_transfer_out(hcd, urb, fast_retransmit);
-		break;
-
-	case PKT_STATE_TERMINATE:
-		/*
-		 * IN transfers are terminated with HS_OUT token,
-		 * OUT transfers with HS_IN:
-		 */
-		if (usb_urb_dir_in(urb))
-			cmd = MAX3421_HXFR_HS_OUT;
-		else
-			cmd = MAX3421_HXFR_HS_IN;
-		break;
-	}
-
-	if (cmd < 0)
-		return;
-
-	/* issue the command and wait for host-xfer-done interrupt: */
-
-	spi_wr8(hcd, MAX3421_REG_HXFR, cmd);
-	max3421_hcd->hien |= BIT(MAX3421_HI_HXFRDN_BIT);
-}
-
-/*
- * Find the next URB to process and start its execution.
- *
- * At this time, we do not anticipate ever connecting a USB hub to the
- * MAX3421 chip, so at most USB device can be connected and we can use
- * a simplistic scheduler: at the start of a frame, schedule all
- * periodic transfers.  Once that is done, use the remainder of the
- * frame to process non-periodic (bulk & control) transfers.
- *
- * Preconditions:
- * o Caller must NOT hold HCD spinlock.
- * o max3421_hcd->curr_urb MUST BE NULL.
- * o MAX3421E chip must be idle.
- */
-static int
-max3421_select_and_start_urb(struct usb_hcd *hcd)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct urb *urb, *curr_urb = NULL;
-	struct max3421_ep *max3421_ep;
-	int epnum;
-	struct usb_host_endpoint *ep;
-	struct list_head *pos;
-	unsigned long flags;
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-
-	for (;
-	     max3421_hcd->sched_pass < SCHED_PASS_DONE;
-	     ++max3421_hcd->sched_pass)
-		list_for_each(pos, &max3421_hcd->ep_list) {
-			urb = NULL;
-			max3421_ep = container_of(pos, struct max3421_ep,
-						  ep_list);
-			ep = max3421_ep->ep;
-
-			switch (usb_endpoint_type(&ep->desc)) {
-			case USB_ENDPOINT_XFER_ISOC:
-			case USB_ENDPOINT_XFER_INT:
-				if (max3421_hcd->sched_pass !=
-				    SCHED_PASS_PERIODIC)
-					continue;
-				break;
-
-			case USB_ENDPOINT_XFER_CONTROL:
-			case USB_ENDPOINT_XFER_BULK:
-				if (max3421_hcd->sched_pass !=
-				    SCHED_PASS_NON_PERIODIC)
-					continue;
-				break;
-			}
-
-			if (list_empty(&ep->urb_list))
-				continue;	/* nothing to do */
-			urb = list_first_entry(&ep->urb_list, struct urb,
-					       urb_list);
-			if (urb->unlinked) {
-				dev_dbg(&spi->dev, "%s: URB %p unlinked=%d",
-					__func__, urb, urb->unlinked);
-				max3421_hcd->curr_urb = urb;
-				max3421_hcd->urb_done = 1;
-				spin_unlock_irqrestore(&max3421_hcd->lock,
-						       flags);
-				return 1;
-			}
-
-			switch (usb_endpoint_type(&ep->desc)) {
-			case USB_ENDPOINT_XFER_CONTROL:
-				/*
-				 * Allow one control transaction per
-				 * frame per endpoint:
-				 */
-				if (frame_diff(max3421_ep->last_active,
-					       max3421_hcd->frame_number) == 0)
-					continue;
-				break;
-
-			case USB_ENDPOINT_XFER_BULK:
-				if (max3421_ep->retransmit
-				    && (frame_diff(max3421_ep->last_active,
-						   max3421_hcd->frame_number)
-					== 0))
-					/*
-					 * We already tried this EP
-					 * during this frame and got a
-					 * NAK or error; wait for next frame
-					 */
-					continue;
-				break;
-
-			case USB_ENDPOINT_XFER_ISOC:
-			case USB_ENDPOINT_XFER_INT:
-				if (frame_diff(max3421_hcd->frame_number,
-					       max3421_ep->last_active)
-				    < urb->interval)
-					/*
-					 * We already processed this
-					 * end-point in the current
-					 * frame
-					 */
-					continue;
-				break;
-			}
-
-			/* move current ep to tail: */
-			list_move_tail(pos, &max3421_hcd->ep_list);
-			curr_urb = urb;
-			goto done;
-		}
-done:
-	if (!curr_urb) {
-		spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-		return 0;
-	}
-
-	urb = max3421_hcd->curr_urb = curr_urb;
-	epnum = usb_endpoint_num(&urb->ep->desc);
-	if (max3421_ep->retransmit)
-		/* restart (part of) a USB transaction: */
-		max3421_ep->retransmit = 0;
-	else {
-		/* start USB transaction: */
-		if (usb_endpoint_xfer_control(&ep->desc)) {
-			/*
-			 * See USB 2.0 spec section 8.6.1
-			 * Initialization via SETUP Token:
-			 */
-			usb_settoggle(urb->dev, epnum, 0, 1);
-			usb_settoggle(urb->dev, epnum, 1, 1);
-			max3421_ep->pkt_state = PKT_STATE_SETUP;
-		} else
-			max3421_ep->pkt_state = PKT_STATE_TRANSFER;
-	}
-
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-
-	max3421_ep->last_active = max3421_hcd->frame_number;
-	max3421_set_address(hcd, urb->dev, epnum);
-	max3421_set_speed(hcd, urb->dev);
-	max3421_next_transfer(hcd, 0);
-	return 1;
-}
-
-/*
- * Check all endpoints for URBs that got unlinked.
- *
- * Caller must NOT hold HCD spinlock.
- */
-static int
-max3421_check_unlink(struct usb_hcd *hcd)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct list_head *pos, *upos, *next_upos;
-	struct max3421_ep *max3421_ep;
-	struct usb_host_endpoint *ep;
-	struct urb *urb;
-	unsigned long flags;
-	int retval = 0;
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-	list_for_each(pos, &max3421_hcd->ep_list) {
-		max3421_ep = container_of(pos, struct max3421_ep, ep_list);
-		ep = max3421_ep->ep;
-		list_for_each_safe(upos, next_upos, &ep->urb_list) {
-			urb = container_of(upos, struct urb, urb_list);
-			if (urb->unlinked) {
-				retval = 1;
-				dev_dbg(&spi->dev, "%s: URB %p unlinked=%d",
-					__func__, urb, urb->unlinked);
-				usb_hcd_unlink_urb_from_ep(hcd, urb);
-				spin_unlock_irqrestore(&max3421_hcd->lock,
-						       flags);
-				usb_hcd_giveback_urb(hcd, urb, 0);
-				spin_lock_irqsave(&max3421_hcd->lock, flags);
-			}
-		}
-	}
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-	return retval;
-}
-
-/*
- * Caller must NOT hold HCD spinlock.
- */
-static void
-max3421_slow_retransmit(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct urb *urb = max3421_hcd->curr_urb;
-	struct max3421_ep *max3421_ep;
-
-	max3421_ep = urb->ep->hcpriv;
-	max3421_ep->retransmit = 1;
-	max3421_hcd->curr_urb = NULL;
-}
-
-/*
- * Caller must NOT hold HCD spinlock.
- */
-static void
-max3421_recv_data_available(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct urb *urb = max3421_hcd->curr_urb;
-	size_t remaining, transfer_size;
-	u8 rcvbc;
-
-	rcvbc = spi_rd8(hcd, MAX3421_REG_RCVBC);
-
-	if (rcvbc > MAX3421_FIFO_SIZE)
-		rcvbc = MAX3421_FIFO_SIZE;
-	if (urb->actual_length >= urb->transfer_buffer_length)
-		remaining = 0;
-	else
-		remaining = urb->transfer_buffer_length - urb->actual_length;
-	transfer_size = rcvbc;
-	if (transfer_size > remaining)
-		transfer_size = remaining;
-	if (transfer_size > 0) {
-		void *dst = urb->transfer_buffer + urb->actual_length;
-
-		spi_rd_buf(hcd, MAX3421_REG_RCVFIFO, dst, transfer_size);
-		urb->actual_length += transfer_size;
-		max3421_hcd->curr_len = transfer_size;
-	}
-
-	/* ack the RCVDAV irq now that the FIFO has been read: */
-	spi_wr8(hcd, MAX3421_REG_HIRQ, BIT(MAX3421_HI_RCVDAV_BIT));
-}
-
-static void
-max3421_handle_error(struct usb_hcd *hcd, u8 hrsl)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	u8 result_code = hrsl & MAX3421_HRSL_RESULT_MASK;
-	struct urb *urb = max3421_hcd->curr_urb;
-	struct max3421_ep *max3421_ep = urb->ep->hcpriv;
-	int switch_sndfifo;
-
-	/*
-	 * If an OUT command results in any response other than OK
-	 * (i.e., error or NAK), we have to perform a dummy-write to
-	 * SNDBC so the FIFO gets switched back to us.  Otherwise, we
-	 * get out of sync with the SNDFIFO double buffer.
-	 */
-	switch_sndfifo = (max3421_ep->pkt_state == PKT_STATE_TRANSFER &&
-			  usb_urb_dir_out(urb));
-
-	switch (result_code) {
-	case MAX3421_HRSL_OK:
-		return;			/* this shouldn't happen */
-
-	case MAX3421_HRSL_WRONGPID:	/* received wrong PID */
-	case MAX3421_HRSL_BUSY:		/* SIE busy */
-	case MAX3421_HRSL_BADREQ:	/* bad val in HXFR */
-	case MAX3421_HRSL_UNDEF:	/* reserved */
-	case MAX3421_HRSL_KERR:		/* K-state instead of response */
-	case MAX3421_HRSL_JERR:		/* J-state instead of response */
-		/*
-		 * packet experienced an error that we cannot recover
-		 * from; report error
-		 */
-		max3421_hcd->urb_done = hrsl_to_error[result_code];
-		dev_dbg(&spi->dev, "%s: unexpected error HRSL=0x%02x",
-			__func__, hrsl);
-		break;
-
-	case MAX3421_HRSL_TOGERR:
-		if (usb_urb_dir_in(urb))
-			; /* don't do anything (device will switch toggle) */
-		else {
-			/* flip the send toggle bit: */
-			int sndtog = (hrsl >> MAX3421_HRSL_SNDTOGRD_BIT) & 1;
-
-			sndtog ^= 1;
-			spi_wr8(hcd, MAX3421_REG_HCTL,
-				BIT(sndtog + MAX3421_HCTL_SNDTOG0_BIT));
-		}
-		/* FALL THROUGH */
-	case MAX3421_HRSL_BADBC:	/* bad byte count */
-	case MAX3421_HRSL_PIDERR:	/* received PID is corrupted */
-	case MAX3421_HRSL_PKTERR:	/* packet error (stuff, EOP) */
-	case MAX3421_HRSL_CRCERR:	/* CRC error */
-	case MAX3421_HRSL_BABBLE:	/* device talked too long */
-	case MAX3421_HRSL_TIMEOUT:
-		if (max3421_ep->retries++ < USB_MAX_RETRIES)
-			/* retry the packet again in the next frame */
-			max3421_slow_retransmit(hcd);
-		else {
-			/* Based on ohci.h cc_to_err[]: */
-			max3421_hcd->urb_done = hrsl_to_error[result_code];
-			dev_dbg(&spi->dev, "%s: unexpected error HRSL=0x%02x",
-				__func__, hrsl);
-		}
-		break;
-
-	case MAX3421_HRSL_STALL:
-		dev_dbg(&spi->dev, "%s: unexpected error HRSL=0x%02x",
-			__func__, hrsl);
-		max3421_hcd->urb_done = hrsl_to_error[result_code];
-		break;
-
-	case MAX3421_HRSL_NAK:
-		/*
-		 * Device wasn't ready for data or has no data
-		 * available: retry the packet again.
-		 */
-		if (max3421_ep->naks++ < NAK_MAX_FAST_RETRANSMITS) {
-			max3421_next_transfer(hcd, 1);
-			switch_sndfifo = 0;
-		} else
-			max3421_slow_retransmit(hcd);
-		break;
-	}
-	if (switch_sndfifo)
-		spi_wr8(hcd, MAX3421_REG_SNDBC, 0);
-}
-
-/*
- * Caller must NOT hold HCD spinlock.
- */
-static int
-max3421_transfer_in_done(struct usb_hcd *hcd, struct urb *urb)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	u32 max_packet;
-
-	if (urb->actual_length >= urb->transfer_buffer_length)
-		return 1;	/* read is complete, so we're done */
-
-	/*
-	 * USB 2.0 Section 5.3.2 Pipes: packets must be full size
-	 * except for last one.
-	 */
-	max_packet = usb_maxpacket(urb->dev, urb->pipe, 0);
-	if (max_packet > MAX3421_FIFO_SIZE) {
-		/*
-		 * We do not support isochronous transfers at this
-		 * time...
-		 */
-		dev_err(&spi->dev,
-			"%s: packet-size of %u too big (limit is %u bytes)",
-			__func__, max_packet, MAX3421_FIFO_SIZE);
-		return -EINVAL;
-	}
-
-	if (max3421_hcd->curr_len < max_packet) {
-		if (urb->transfer_flags & URB_SHORT_NOT_OK) {
-			/*
-			 * remaining > 0 and received an
-			 * unexpected partial packet ->
-			 * error
-			 */
-			return -EREMOTEIO;
-		} else
-			/* short read, but it's OK */
-			return 1;
-	}
-	return 0;	/* not done */
-}
-
-/*
- * Caller must NOT hold HCD spinlock.
- */
-static int
-max3421_transfer_out_done(struct usb_hcd *hcd, struct urb *urb)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-
-	urb->actual_length += max3421_hcd->curr_len;
-	if (urb->actual_length < urb->transfer_buffer_length)
-		return 0;
-	if (urb->transfer_flags & URB_ZERO_PACKET) {
-		/*
-		 * Some hardware needs a zero-size packet at the end
-		 * of a bulk-out transfer if the last transfer was a
-		 * full-sized packet (i.e., such hardware use <
-		 * max_packet as an indicator that the end of the
-		 * packet has been reached).
-		 */
-		u32 max_packet = usb_maxpacket(urb->dev, urb->pipe, 1);
-
-		if (max3421_hcd->curr_len == max_packet)
-			return 0;
-	}
-	return 1;
-}
-
-/*
- * Caller must NOT hold HCD spinlock.
- */
-static void
-max3421_host_transfer_done(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct urb *urb = max3421_hcd->curr_urb;
-	struct max3421_ep *max3421_ep;
-	u8 result_code, hrsl;
-	int urb_done = 0;
-
-	max3421_hcd->hien &= ~(BIT(MAX3421_HI_HXFRDN_BIT) |
-			       BIT(MAX3421_HI_RCVDAV_BIT));
-
-	hrsl = spi_rd8(hcd, MAX3421_REG_HRSL);
-	result_code = hrsl & MAX3421_HRSL_RESULT_MASK;
-
-#ifdef DEBUG
-	++max3421_hcd->err_stat[result_code];
-#endif
-
-	max3421_ep = urb->ep->hcpriv;
-
-	if (unlikely(result_code != MAX3421_HRSL_OK)) {
-		max3421_handle_error(hcd, hrsl);
-		return;
-	}
-
-	max3421_ep->naks = 0;
-	max3421_ep->retries = 0;
-	switch (max3421_ep->pkt_state) {
-
-	case PKT_STATE_SETUP:
-		if (urb->transfer_buffer_length > 0)
-			max3421_ep->pkt_state = PKT_STATE_TRANSFER;
-		else
-			max3421_ep->pkt_state = PKT_STATE_TERMINATE;
-		break;
-
-	case PKT_STATE_TRANSFER:
-		if (usb_urb_dir_in(urb))
-			urb_done = max3421_transfer_in_done(hcd, urb);
-		else
-			urb_done = max3421_transfer_out_done(hcd, urb);
-		if (urb_done > 0 && usb_pipetype(urb->pipe) == PIPE_CONTROL) {
-			/*
-			 * We aren't really done - we still need to
-			 * terminate the control transfer:
-			 */
-			max3421_hcd->urb_done = urb_done = 0;
-			max3421_ep->pkt_state = PKT_STATE_TERMINATE;
-		}
-		break;
-
-	case PKT_STATE_TERMINATE:
-		urb_done = 1;
-		break;
-	}
-
-	if (urb_done)
-		max3421_hcd->urb_done = urb_done;
-	else
-		max3421_next_transfer(hcd, 0);
-}
-
-/*
- * Caller must NOT hold HCD spinlock.
- */
-static void
-max3421_detect_conn(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	unsigned int jk, have_conn = 0;
-	u32 old_port_status, chg;
-	unsigned long flags;
-	u8 hrsl, mode;
-
-	hrsl = spi_rd8(hcd, MAX3421_REG_HRSL);
-
-	jk = ((((hrsl >> MAX3421_HRSL_JSTATUS_BIT) & 1) << 0) |
-	      (((hrsl >> MAX3421_HRSL_KSTATUS_BIT) & 1) << 1));
-
-	mode = max3421_hcd->mode;
-
-	switch (jk) {
-	case 0x0: /* SE0: disconnect */
-		/*
-		 * Turn off SOFKAENAB bit to avoid getting interrupt
-		 * every milli-second:
-		 */
-		mode &= ~BIT(MAX3421_MODE_SOFKAENAB_BIT);
-		break;
-
-	case 0x1: /* J=0,K=1: low-speed (in full-speed or vice versa) */
-	case 0x2: /* J=1,K=0: full-speed (in full-speed or vice versa) */
-		if (jk == 0x2)
-			/* need to switch to the other speed: */
-			mode ^= BIT(MAX3421_MODE_LOWSPEED_BIT);
-		/* turn on SOFKAENAB bit: */
-		mode |= BIT(MAX3421_MODE_SOFKAENAB_BIT);
-		have_conn = 1;
-		break;
-
-	case 0x3: /* illegal */
-		break;
-	}
-
-	max3421_hcd->mode = mode;
-	spi_wr8(hcd, MAX3421_REG_MODE, max3421_hcd->mode);
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-	old_port_status = max3421_hcd->port_status;
-	if (have_conn)
-		max3421_hcd->port_status |=  USB_PORT_STAT_CONNECTION;
-	else
-		max3421_hcd->port_status &= ~USB_PORT_STAT_CONNECTION;
-	if (mode & BIT(MAX3421_MODE_LOWSPEED_BIT))
-		max3421_hcd->port_status |=  USB_PORT_STAT_LOW_SPEED;
-	else
-		max3421_hcd->port_status &= ~USB_PORT_STAT_LOW_SPEED;
-	chg = (old_port_status ^ max3421_hcd->port_status);
-	max3421_hcd->port_status |= chg << 16;
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-}
-
-static irqreturn_t
-max3421_irq_handler(int irq, void *dev_id)
-{
-	struct usb_hcd *hcd = dev_id;
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-
-	if (max3421_hcd->spi_thread &&
-	    max3421_hcd->spi_thread->state != TASK_RUNNING)
-		wake_up_process(max3421_hcd->spi_thread);
-	if (!test_and_set_bit(ENABLE_IRQ, &max3421_hcd->todo))
-		disable_irq_nosync(spi->irq);
-	return IRQ_HANDLED;
-}
-
-#ifdef DEBUG
-
-static void
-dump_eps(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct max3421_ep *max3421_ep;
-	struct usb_host_endpoint *ep;
-	struct list_head *pos, *upos;
-	char ubuf[512], *dp, *end;
-	unsigned long flags;
-	struct urb *urb;
-	int epnum, ret;
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-	list_for_each(pos, &max3421_hcd->ep_list) {
-		max3421_ep = container_of(pos, struct max3421_ep, ep_list);
-		ep = max3421_ep->ep;
-
-		dp = ubuf;
-		end = dp + sizeof(ubuf);
-		*dp = '\0';
-		list_for_each(upos, &ep->urb_list) {
-			urb = container_of(upos, struct urb, urb_list);
-			ret = snprintf(dp, end - dp, " %p(%d.%s %d/%d)", urb,
-				       usb_pipetype(urb->pipe),
-				       usb_urb_dir_in(urb) ? "IN" : "OUT",
-				       urb->actual_length,
-				       urb->transfer_buffer_length);
-			if (ret < 0 || ret >= end - dp)
-				break;	/* error or buffer full */
-			dp += ret;
-		}
-
-		epnum = usb_endpoint_num(&ep->desc);
-		pr_info("EP%0u %u lst %04u rtr %u nak %6u rxmt %u: %s\n",
-			epnum, max3421_ep->pkt_state, max3421_ep->last_active,
-			max3421_ep->retries, max3421_ep->naks,
-			max3421_ep->retransmit, ubuf);
-	}
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-}
-
-#endif /* DEBUG */
-
-/* Return zero if no work was performed, 1 otherwise.  */
-static int
-max3421_handle_irqs(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	u32 chg, old_port_status;
-	unsigned long flags;
-	u8 hirq;
-
-	/*
-	 * Read and ack pending interrupts (CPU must never
-	 * clear SNDBAV directly and RCVDAV must be cleared by
-	 * max3421_recv_data_available()!):
-	 */
-	hirq = spi_rd8(hcd, MAX3421_REG_HIRQ);
-	hirq &= max3421_hcd->hien;
-	if (!hirq)
-		return 0;
-
-	spi_wr8(hcd, MAX3421_REG_HIRQ,
-		hirq & ~(BIT(MAX3421_HI_SNDBAV_BIT) |
-			 BIT(MAX3421_HI_RCVDAV_BIT)));
-
-	if (hirq & BIT(MAX3421_HI_FRAME_BIT)) {
-		max3421_hcd->frame_number = ((max3421_hcd->frame_number + 1)
-					     & USB_MAX_FRAME_NUMBER);
-		max3421_hcd->sched_pass = SCHED_PASS_PERIODIC;
-	}
-
-	if (hirq & BIT(MAX3421_HI_RCVDAV_BIT))
-		max3421_recv_data_available(hcd);
-
-	if (hirq & BIT(MAX3421_HI_HXFRDN_BIT))
-		max3421_host_transfer_done(hcd);
-
-	if (hirq & BIT(MAX3421_HI_CONDET_BIT))
-		max3421_detect_conn(hcd);
-
-	/*
-	 * Now process interrupts that may affect HCD state
-	 * other than the end-points:
-	 */
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-
-	old_port_status = max3421_hcd->port_status;
-	if (hirq & BIT(MAX3421_HI_BUSEVENT_BIT)) {
-		if (max3421_hcd->port_status & USB_PORT_STAT_RESET) {
-			/* BUSEVENT due to completion of Bus Reset */
-			max3421_hcd->port_status &= ~USB_PORT_STAT_RESET;
-			max3421_hcd->port_status |=  USB_PORT_STAT_ENABLE;
-		} else {
-			/* BUSEVENT due to completion of Bus Resume */
-			pr_info("%s: BUSEVENT Bus Resume Done\n", __func__);
-		}
-	}
-	if (hirq & BIT(MAX3421_HI_RWU_BIT))
-		pr_info("%s: RWU\n", __func__);
-	if (hirq & BIT(MAX3421_HI_SUSDN_BIT))
-		pr_info("%s: SUSDN\n", __func__);
-
-	chg = (old_port_status ^ max3421_hcd->port_status);
-	max3421_hcd->port_status |= chg << 16;
-
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-
-#ifdef DEBUG
-	{
-		static unsigned long last_time;
-		char sbuf[16 * 16], *dp, *end;
-		int i;
-
-		if (time_after(jiffies, last_time + 5*HZ)) {
-			dp = sbuf;
-			end = sbuf + sizeof(sbuf);
-			*dp = '\0';
-			for (i = 0; i < 16; ++i) {
-				int ret = snprintf(dp, end - dp, " %lu",
-						   max3421_hcd->err_stat[i]);
-				if (ret < 0 || ret >= end - dp)
-					break;	/* error or buffer full */
-				dp += ret;
-			}
-			pr_info("%s: hrsl_stats %s\n", __func__, sbuf);
-			memset(max3421_hcd->err_stat, 0,
-			       sizeof(max3421_hcd->err_stat));
-			last_time = jiffies;
-
-			dump_eps(hcd);
-		}
-	}
-#endif
-	return 1;
-}
-
-static int
-max3421_reset_hcd(struct usb_hcd *hcd)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	int timeout;
-
-	/* perform a chip reset and wait for OSCIRQ signal to appear: */
-	spi_wr8(hcd, MAX3421_REG_USBCTL, BIT(MAX3421_USBCTL_CHIPRES_BIT));
-	/* clear reset: */
-	spi_wr8(hcd, MAX3421_REG_USBCTL, 0);
-	timeout = 1000;
-	while (1) {
-		if (spi_rd8(hcd, MAX3421_REG_USBIRQ)
-		    & BIT(MAX3421_USBIRQ_OSCOKIRQ_BIT))
-			break;
-		if (--timeout < 0) {
-			dev_err(&spi->dev,
-				"timed out waiting for oscillator OK signal");
-			return 1;
-		}
-		cond_resched();
-	}
-
-	/*
-	 * Turn on host mode, automatic generation of SOF packets, and
-	 * enable pull-down registers on DM/DP:
-	 */
-	max3421_hcd->mode = (BIT(MAX3421_MODE_HOST_BIT) |
-			     BIT(MAX3421_MODE_SOFKAENAB_BIT) |
-			     BIT(MAX3421_MODE_DMPULLDN_BIT) |
-			     BIT(MAX3421_MODE_DPPULLDN_BIT));
-	spi_wr8(hcd, MAX3421_REG_MODE, max3421_hcd->mode);
-
-	/* reset frame-number: */
-	max3421_hcd->frame_number = USB_MAX_FRAME_NUMBER;
-	spi_wr8(hcd, MAX3421_REG_HCTL, BIT(MAX3421_HCTL_FRMRST_BIT));
-
-	/* sample the state of the D+ and D- lines */
-	spi_wr8(hcd, MAX3421_REG_HCTL, BIT(MAX3421_HCTL_SAMPLEBUS_BIT));
-	max3421_detect_conn(hcd);
-
-	/* enable frame, connection-detected, and bus-event interrupts: */
-	max3421_hcd->hien = (BIT(MAX3421_HI_FRAME_BIT) |
-			     BIT(MAX3421_HI_CONDET_BIT) |
-			     BIT(MAX3421_HI_BUSEVENT_BIT));
-	spi_wr8(hcd, MAX3421_REG_HIEN, max3421_hcd->hien);
-
-	/* enable interrupts: */
-	spi_wr8(hcd, MAX3421_REG_CPUCTL, BIT(MAX3421_CPUCTL_IE_BIT));
-	return 1;
-}
-
-static int
-max3421_urb_done(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	unsigned long flags;
-	struct urb *urb;
-	int status;
-
-	status = max3421_hcd->urb_done;
-	max3421_hcd->urb_done = 0;
-	if (status > 0)
-		status = 0;
-	urb = max3421_hcd->curr_urb;
-	if (urb) {
-		/* save the old end-points toggles: */
-		u8 hrsl = spi_rd8(hcd, MAX3421_REG_HRSL);
-		int rcvtog = (hrsl >> MAX3421_HRSL_RCVTOGRD_BIT) & 1;
-		int sndtog = (hrsl >> MAX3421_HRSL_SNDTOGRD_BIT) & 1;
-		int epnum = usb_endpoint_num(&urb->ep->desc);
-
-		/* no locking: HCD (i.e., we) own toggles, don't we? */
-		usb_settoggle(urb->dev, epnum, 0, rcvtog);
-		usb_settoggle(urb->dev, epnum, 1, sndtog);
-
-		max3421_hcd->curr_urb = NULL;
-		spin_lock_irqsave(&max3421_hcd->lock, flags);
-		usb_hcd_unlink_urb_from_ep(hcd, urb);
-		spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-
-		/* must be called without the HCD spinlock: */
-		usb_hcd_giveback_urb(hcd, urb, status);
-	}
-	return 1;
-}
-
-static int
-max3421_spi_thread(void *dev_id)
-{
-	struct usb_hcd *hcd = dev_id;
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	int i, i_worked = 1;
-
-	/* set full-duplex SPI mode, low-active interrupt pin: */
-	spi_wr8(hcd, MAX3421_REG_PINCTL,
-		(BIT(MAX3421_PINCTL_FDUPSPI_BIT) |	/* full-duplex */
-		 BIT(MAX3421_PINCTL_INTLEVEL_BIT)));	/* low-active irq */
-
-	while (!kthread_should_stop()) {
-		max3421_hcd->rev = spi_rd8(hcd, MAX3421_REG_REVISION);
-		if (max3421_hcd->rev == 0x12 || max3421_hcd->rev == 0x13)
-			break;
-		dev_err(&spi->dev, "bad rev 0x%02x", max3421_hcd->rev);
-		msleep(10000);
-	}
-	dev_info(&spi->dev, "rev 0x%x, SPI clk %dHz, bpw %u, irq %d\n",
-		 max3421_hcd->rev, spi->max_speed_hz, spi->bits_per_word,
-		 spi->irq);
-
-	while (!kthread_should_stop()) {
-		if (!i_worked) {
-			/*
-			 * We'll be waiting for wakeups from the hard
-			 * interrupt handler, so now is a good time to
-			 * sync our hien with the chip:
-			 */
-			spi_wr8(hcd, MAX3421_REG_HIEN, max3421_hcd->hien);
-
-			set_current_state(TASK_INTERRUPTIBLE);
-			if (test_and_clear_bit(ENABLE_IRQ, &max3421_hcd->todo))
-				enable_irq(spi->irq);
-			schedule();
-			__set_current_state(TASK_RUNNING);
-		}
-
-		i_worked = 0;
-
-		if (max3421_hcd->urb_done)
-			i_worked |= max3421_urb_done(hcd);
-		else if (max3421_handle_irqs(hcd))
-			i_worked = 1;
-		else if (!max3421_hcd->curr_urb)
-			i_worked |= max3421_select_and_start_urb(hcd);
-
-		if (test_and_clear_bit(RESET_HCD, &max3421_hcd->todo))
-			/* reset the HCD: */
-			i_worked |= max3421_reset_hcd(hcd);
-		if (test_and_clear_bit(RESET_PORT, &max3421_hcd->todo)) {
-			/* perform a USB bus reset: */
-			spi_wr8(hcd, MAX3421_REG_HCTL,
-				BIT(MAX3421_HCTL_BUSRST_BIT));
-			i_worked = 1;
-		}
-		if (test_and_clear_bit(CHECK_UNLINK, &max3421_hcd->todo))
-			i_worked |= max3421_check_unlink(hcd);
-		if (test_and_clear_bit(IOPIN_UPDATE, &max3421_hcd->todo)) {
-			/*
-			 * IOPINS1/IOPINS2 do not auto-increment, so we can't
-			 * use spi_wr_buf().
-			 */
-			for (i = 0; i < ARRAY_SIZE(max3421_hcd->iopins); ++i) {
-				u8 val = spi_rd8(hcd, MAX3421_REG_IOPINS1);
-
-				val = ((val & 0xf0) |
-				       (max3421_hcd->iopins[i] & 0x0f));
-				spi_wr8(hcd, MAX3421_REG_IOPINS1 + i, val);
-				max3421_hcd->iopins[i] = val;
-			}
-			i_worked = 1;
-		}
-	}
-	set_current_state(TASK_RUNNING);
-	dev_info(&spi->dev, "SPI thread exiting");
-	return 0;
-}
-
-static int
-max3421_reset_port(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-
-	max3421_hcd->port_status &= ~(USB_PORT_STAT_ENABLE |
-				      USB_PORT_STAT_LOW_SPEED);
-	max3421_hcd->port_status |= USB_PORT_STAT_RESET;
-	set_bit(RESET_PORT, &max3421_hcd->todo);
-	wake_up_process(max3421_hcd->spi_thread);
-	return 0;
-}
-
-static int
-max3421_reset(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-
-	hcd->self.sg_tablesize = 0;
-	hcd->speed = HCD_USB2;
-	hcd->self.root_hub->speed = USB_SPEED_FULL;
-	set_bit(RESET_HCD, &max3421_hcd->todo);
-	wake_up_process(max3421_hcd->spi_thread);
-	return 0;
-}
-
-static int
-max3421_start(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-
-	spin_lock_init(&max3421_hcd->lock);
-	max3421_hcd->rh_state = MAX3421_RH_RUNNING;
-
-	INIT_LIST_HEAD(&max3421_hcd->ep_list);
-
-	hcd->power_budget = POWER_BUDGET;
-	hcd->state = HC_STATE_RUNNING;
-	hcd->uses_new_polling = 1;
-	return 0;
-}
-
-static void
-max3421_stop(struct usb_hcd *hcd)
-{
-}
-
-static int
-max3421_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct max3421_ep *max3421_ep;
-	unsigned long flags;
-	int retval;
-
-	switch (usb_pipetype(urb->pipe)) {
-	case PIPE_INTERRUPT:
-	case PIPE_ISOCHRONOUS:
-		if (urb->interval < 0) {
-			dev_err(&spi->dev,
-			  "%s: interval=%d for intr-/iso-pipe; expected > 0\n",
-				__func__, urb->interval);
-			return -EINVAL;
-		}
-	default:
-		break;
-	}
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-
-	max3421_ep = urb->ep->hcpriv;
-	if (!max3421_ep) {
-		/* gets freed in max3421_endpoint_disable: */
-		max3421_ep = kzalloc(sizeof(struct max3421_ep), GFP_ATOMIC);
-		if (!max3421_ep) {
-			retval = -ENOMEM;
-			goto out;
-		}
-		max3421_ep->ep = urb->ep;
-		max3421_ep->last_active = max3421_hcd->frame_number;
-		urb->ep->hcpriv = max3421_ep;
-
-		list_add_tail(&max3421_ep->ep_list, &max3421_hcd->ep_list);
-	}
-
-	retval = usb_hcd_link_urb_to_ep(hcd, urb);
-	if (retval == 0) {
-		/* Since we added to the queue, restart scheduling: */
-		max3421_hcd->sched_pass = SCHED_PASS_PERIODIC;
-		wake_up_process(max3421_hcd->spi_thread);
-	}
-
-out:
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-	return retval;
-}
-
-static int
-max3421_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	unsigned long flags;
-	int retval;
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-
-	/*
-	 * This will set urb->unlinked which in turn causes the entry
-	 * to be dropped at the next opportunity.
-	 */
-	retval = usb_hcd_check_unlink_urb(hcd, urb, status);
-	if (retval == 0) {
-		set_bit(CHECK_UNLINK, &max3421_hcd->todo);
-		wake_up_process(max3421_hcd->spi_thread);
-	}
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-	return retval;
-}
-
-static void
-max3421_endpoint_disable(struct usb_hcd *hcd, struct usb_host_endpoint *ep)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	unsigned long flags;
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-
-	if (ep->hcpriv) {
-		struct max3421_ep *max3421_ep = ep->hcpriv;
-
-		/* remove myself from the ep_list: */
-		if (!list_empty(&max3421_ep->ep_list))
-			list_del(&max3421_ep->ep_list);
-		kfree(max3421_ep);
-		ep->hcpriv = NULL;
-	}
-
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-}
-
-static int
-max3421_get_frame_number(struct usb_hcd *hcd)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	return max3421_hcd->frame_number;
-}
-
-/*
- * Should return a non-zero value when any port is undergoing a resume
- * transition while the root hub is suspended.
- */
-static int
-max3421_hub_status_data(struct usb_hcd *hcd, char *buf)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	unsigned long flags;
-	int retval = 0;
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-	if (!HCD_HW_ACCESSIBLE(hcd))
-		goto done;
-
-	*buf = 0;
-	if ((max3421_hcd->port_status & PORT_C_MASK) != 0) {
-		*buf = (1 << 1); /* a hub over-current condition exists */
-		dev_dbg(hcd->self.controller,
-			"port status 0x%08x has changes\n",
-			max3421_hcd->port_status);
-		retval = 1;
-		if (max3421_hcd->rh_state == MAX3421_RH_SUSPENDED)
-			usb_hcd_resume_root_hub(hcd);
-	}
-done:
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-	return retval;
-}
-
-static inline void
-hub_descriptor(struct usb_hub_descriptor *desc)
-{
-	memset(desc, 0, sizeof(*desc));
-	/*
-	 * See Table 11-13: Hub Descriptor in USB 2.0 spec.
-	 */
-	desc->bDescriptorType = USB_DT_HUB; /* hub descriptor */
-	desc->bDescLength = 9;
-	desc->wHubCharacteristics = cpu_to_le16(HUB_CHAR_INDV_PORT_LPSM |
-						HUB_CHAR_COMMON_OCPM);
-	desc->bNbrPorts = 1;
-}
-
-/*
- * Set the MAX3421E general-purpose output with number PIN_NUMBER to
- * VALUE (0 or 1).  PIN_NUMBER may be in the range from 1-8.  For
- * any other value, this function acts as a no-op.
- */
-static void
-max3421_gpout_set_value(struct usb_hcd *hcd, u8 pin_number, u8 value)
-{
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	u8 mask, idx;
-
-	--pin_number;
-	if (pin_number > 7)
-		return;
-
-	mask = 1u << pin_number;
-	idx = pin_number / 4;
-
-	if (value)
-		max3421_hcd->iopins[idx] |=  mask;
-	else
-		max3421_hcd->iopins[idx] &= ~mask;
-	set_bit(IOPIN_UPDATE, &max3421_hcd->todo);
-	wake_up_process(max3421_hcd->spi_thread);
-}
-
-static int
-max3421_hub_control(struct usb_hcd *hcd, u16 type_req, u16 value, u16 index,
-		    char *buf, u16 length)
-{
-	struct spi_device *spi = to_spi_device(hcd->self.controller);
-	struct max3421_hcd *max3421_hcd = hcd_to_max3421(hcd);
-	struct max3421_hcd_platform_data *pdata;
-	unsigned long flags;
-	int retval = 0;
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-
-	pdata = spi->dev.platform_data;
-
-	switch (type_req) {
-	case ClearHubFeature:
-		break;
-	case ClearPortFeature:
-		switch (value) {
-		case USB_PORT_FEAT_SUSPEND:
-			break;
-		case USB_PORT_FEAT_POWER:
-			dev_dbg(hcd->self.controller, "power-off\n");
-			max3421_gpout_set_value(hcd, pdata->vbus_gpout,
-						!pdata->vbus_active_level);
-			/* FALLS THROUGH */
-		default:
-			max3421_hcd->port_status &= ~(1 << value);
-		}
-		break;
-	case GetHubDescriptor:
-		hub_descriptor((struct usb_hub_descriptor *) buf);
-		break;
-
-	case DeviceRequest | USB_REQ_GET_DESCRIPTOR:
-	case GetPortErrorCount:
-	case SetHubDepth:
-		/* USB3 only */
-		goto error;
-
-	case GetHubStatus:
-		*(__le32 *) buf = cpu_to_le32(0);
-		break;
-
-	case GetPortStatus:
-		if (index != 1) {
-			retval = -EPIPE;
-			goto error;
-		}
-		((__le16 *) buf)[0] = cpu_to_le16(max3421_hcd->port_status);
-		((__le16 *) buf)[1] =
-			cpu_to_le16(max3421_hcd->port_status >> 16);
-		break;
-
-	case SetHubFeature:
-		retval = -EPIPE;
-		break;
-
-	case SetPortFeature:
-		switch (value) {
-		case USB_PORT_FEAT_LINK_STATE:
-		case USB_PORT_FEAT_U1_TIMEOUT:
-		case USB_PORT_FEAT_U2_TIMEOUT:
-		case USB_PORT_FEAT_BH_PORT_RESET:
-			goto error;
-		case USB_PORT_FEAT_SUSPEND:
-			if (max3421_hcd->active)
-				max3421_hcd->port_status |=
-					USB_PORT_STAT_SUSPEND;
-			break;
-		case USB_PORT_FEAT_POWER:
-			dev_dbg(hcd->self.controller, "power-on\n");
-			max3421_hcd->port_status |= USB_PORT_STAT_POWER;
-			max3421_gpout_set_value(hcd, pdata->vbus_gpout,
-						pdata->vbus_active_level);
-			break;
-		case USB_PORT_FEAT_RESET:
-			max3421_reset_port(hcd);
-			/* FALLS THROUGH */
-		default:
-			if ((max3421_hcd->port_status & USB_PORT_STAT_POWER)
-			    != 0)
-				max3421_hcd->port_status |= (1 << value);
-		}
-		break;
-
-	default:
-		dev_dbg(hcd->self.controller,
-			"hub control req%04x v%04x i%04x l%d\n",
-			type_req, value, index, length);
-error:		/* "protocol stall" on error */
-		retval = -EPIPE;
-	}
-
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-	return retval;
-}
-
-static int
-max3421_bus_suspend(struct usb_hcd *hcd)
-{
-	return -1;
-}
-
-static int
-max3421_bus_resume(struct usb_hcd *hcd)
-{
-	return -1;
-}
-
-/*
- * The SPI driver already takes care of DMA-mapping/unmapping, so no
- * reason to do it twice.
- */
-static int
-max3421_map_urb_for_dma(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
-{
-	return 0;
-}
-
-static void
-max3421_unmap_urb_for_dma(struct usb_hcd *hcd, struct urb *urb)
-{
-}
-
-static struct hc_driver max3421_hcd_desc = {
-	.description =		"max3421",
-	.product_desc =		DRIVER_DESC,
-	.hcd_priv_size =	sizeof(struct max3421_hcd),
-	.flags =		HCD_USB11,
-	.reset =		max3421_reset,
-	.start =		max3421_start,
-	.stop =			max3421_stop,
-	.get_frame_number =	max3421_get_frame_number,
-	.urb_enqueue =		max3421_urb_enqueue,
-	.urb_dequeue =		max3421_urb_dequeue,
-	.map_urb_for_dma =	max3421_map_urb_for_dma,
-	.unmap_urb_for_dma =	max3421_unmap_urb_for_dma,
-	.endpoint_disable =	max3421_endpoint_disable,
-	.hub_status_data =	max3421_hub_status_data,
-	.hub_control =		max3421_hub_control,
-	.bus_suspend =		max3421_bus_suspend,
-	.bus_resume =		max3421_bus_resume,
-};
-
-static int
-max3421_probe(struct spi_device *spi)
-{
-	struct max3421_hcd *max3421_hcd;
-	struct usb_hcd *hcd = NULL;
-	int retval = -ENOMEM;
-
-	if (spi_setup(spi) < 0) {
-		dev_err(&spi->dev, "Unable to setup SPI bus");
-		return -EFAULT;
-	}
-
-	hcd = usb_create_hcd(&max3421_hcd_desc, &spi->dev,
-			     dev_name(&spi->dev));
-	if (!hcd) {
-		dev_err(&spi->dev, "failed to create HCD structure\n");
-		goto error;
-	}
-	set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
-	max3421_hcd = hcd_to_max3421(hcd);
-	INIT_LIST_HEAD(&max3421_hcd->ep_list);
-	spi_set_drvdata(spi, max3421_hcd);
-
-	max3421_hcd->tx = kmalloc(sizeof(*max3421_hcd->tx), GFP_KERNEL);
-	if (!max3421_hcd->tx) {
-		dev_err(&spi->dev, "failed to kmalloc tx buffer\n");
-		goto error;
-	}
-	max3421_hcd->rx = kmalloc(sizeof(*max3421_hcd->rx), GFP_KERNEL);
-	if (!max3421_hcd->rx) {
-		dev_err(&spi->dev, "failed to kmalloc rx buffer\n");
-		goto error;
-	}
-
-	max3421_hcd->spi_thread = kthread_run(max3421_spi_thread, hcd,
-					      "max3421_spi_thread");
-	if (max3421_hcd->spi_thread == ERR_PTR(-ENOMEM)) {
-		dev_err(&spi->dev,
-			"failed to create SPI thread (out of memory)\n");
-		goto error;
-	}
-
-	retval = usb_add_hcd(hcd, 0, 0);
-	if (retval) {
-		dev_err(&spi->dev, "failed to add HCD\n");
-		goto error;
-	}
-
-	retval = request_irq(spi->irq, max3421_irq_handler,
-			     IRQF_TRIGGER_LOW, "max3421", hcd);
-	if (retval < 0) {
-		dev_err(&spi->dev, "failed to request irq %d\n", spi->irq);
-		goto error;
-	}
-	return 0;
-
-error:
-	if (hcd) {
-		kfree(max3421_hcd->tx);
-		kfree(max3421_hcd->rx);
-		if (max3421_hcd->spi_thread)
-			kthread_stop(max3421_hcd->spi_thread);
-		usb_put_hcd(hcd);
-	}
-	return retval;
-}
-
-static int
-max3421_remove(struct spi_device *spi)
-{
-	struct max3421_hcd *max3421_hcd;
-	struct usb_hcd *hcd;
-	unsigned long flags;
-
-	max3421_hcd = spi_get_drvdata(spi);
-	hcd = max3421_to_hcd(max3421_hcd);
-
-	usb_remove_hcd(hcd);
-
-	spin_lock_irqsave(&max3421_hcd->lock, flags);
-
-	kthread_stop(max3421_hcd->spi_thread);
-
-	spin_unlock_irqrestore(&max3421_hcd->lock, flags);
-
-	free_irq(spi->irq, hcd);
-
-	usb_put_hcd(hcd);
-	return 0;
-}
-
-static struct spi_driver max3421_driver = {
-	.probe		= max3421_probe,
-	.remove		= max3421_remove,
-	.driver		= {
-		.name	= "max3421-hcd",
-	},
-};
-
-module_spi_driver(max3421_driver);
-
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_AUTHOR("David Mosberger <davidm@egauge.net>");
-MODULE_LICENSE("GPL");
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_MC_EN__SHIFT 0x11
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_ATOMIC_EN_MASK 0x40000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_ATOMIC_EN__SHIFT 0x12
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_ATOMIC_64BIT_EN_MASK 0x80000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_ATOMIC_64BIT_EN__SHIFT 0x13
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_ATOMIC_ROUTING_EN_MASK 0x100000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_ATOMIC_ROUTING_EN__SHIFT 0x14
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_MSI_MULTI_CAP_MASK 0xe00000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_MSI_MULTI_CAP__SHIFT 0x15
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_VFn_MSI_MULTI_CAP_MASK 0x7000000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_VFn_MSI_MULTI_CAP__SHIFT 0x18
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_MSI_PERVECTOR_MASK_CAP_MASK 0x8000000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_MSI_PERVECTOR_MASK_CAP__SHIFT 0x1b
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_NO_RO_ENABLED_P2P_PASSING_MASK 0x10000000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_NO_RO_ENABLED_P2P_PASSING__SHIFT 0x1c
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_ARI_EN_MASK 0x20000000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_ARI_EN__SHIFT 0x1d
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_SRIOV_EN_MASK 0x40000000
+#define PSX80_BIF_PCIE_STRAP_F0__STRAP_F0_SRIOV_EN__SHIFT 0x1e
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_TL_ALT_BUF_EN_MASK 0x10
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_TL_ALT_BUF_EN__SHIFT 0x4
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_CLK_PM_EN_MASK 0x1000000
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_CLK_PM_EN__SHIFT 0x18
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_ECN1P1_EN_MASK 0x2000000
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_ECN1P1_EN__SHIFT 0x19
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_EXT_VC_COUNT_MASK 0x4000000
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_EXT_VC_COUNT__SHIFT 0x1a
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_REVERSE_ALL_MASK 0x10000000
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_REVERSE_ALL__SHIFT 0x1c
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_MST_ADR64_EN_MASK 0x20000000
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_MST_ADR64_EN__SHIFT 0x1d
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_FLR_EN_MASK 0x40000000
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_FLR_EN__SHIFT 0x1e
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_INTERNAL_ERR_EN_MASK 0x80000000
+#define PSX80_BIF_PCIE_STRAP_MISC__STRAP_INTERNAL_ERR_EN__SHIFT 0x1f
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_LINK_BW_NOTIFICATION_CAP_EN_MASK 0x1
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_LINK_BW_NOTIFICATION_CAP_EN__SHIFT 0x0
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_GEN2_COMPLIANCE_MASK 0x2
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_GEN2_COMPLIANCE__SHIFT 0x1
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_MSTCPL_TIMEOUT_EN_MASK 0x4
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_MSTCPL_TIMEOUT_EN__SHIFT 0x2
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_GEN3_COMPLIANCE_MASK 0x8
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_GEN3_COMPLIANCE__SHIFT 0x3
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_TPH_SUPPORTED_MASK 0x10
+#define PSX80_BIF_PCIE_STRAP_MISC2__STRAP_TPH_SUPPORTED__SHIFT 0x4
+#define PSX80_BIF_PCIE_STRAP_PI__STRAP_QUICKSIM_START_MASK 0x1
+#define PSX80_BIF_PCIE_STRAP_PI__STRAP_QUICKSIM_START__SHIFT 0x0
+#define PSX80_BIF_PCIE_STRAP_PI__STRAP_TEST_TOGGLE_PATTERN_MASK 0x10000000
+#define PSX80_BIF_PCIE_STRAP_PI__STRAP_TEST_TOGGLE_PATTERN__SHIFT 0x1c
+#define PSX80_BIF_PCIE_STRAP_PI__STRAP_TEST_TOGGLE_MODE_MASK 0x20000000
+#define PSX80_BIF_PCIE_STRAP_PI__STRAP_TEST_TOGGLE_MODE__SHIFT 0x1d
+#define PSX80_BIF_PCIE_STRAP_I2C_BD__STRAP_BIF_I2C_SLV_ADR_MASK 0x7f
+#define PSX80_BIF_PCIE_STRAP_I2C_BD__STRAP_BIF_I2C_SLV_ADR__SHIFT 0x0
+#define PSX80_BIF_PCIE_STRAP_I2C_BD__STRAP_BIF_DBG_I2C_EN_MASK 0x80
+#define PSX80_BIF_PCIE_STRAP_I2C_BD__STRAP_BIF_DBG_I2C_EN__SHIFT 0x7
+#define PSX80_BIF_PCIE_PRBS_CLR__PRBS_CLR_MASK 0xffff
+#define PSX80_BIF_PCIE_PRBS_CLR__PRBS_CLR__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_CLR__PRBS_CHECKER_DEBUG_BUS_SELECT_MASK 0xf0000
+#define PSX80_BIF_PCIE_PRBS_CLR__PRBS_CHECKER_DEBUG_BUS_SELECT__SHIFT 0x10
+#define PSX80_BIF_PCIE_PRBS_CLR__PRBS_POLARITY_EN_MASK 0x1000000
+#define PSX80_BIF_PCIE_PRBS_CLR__PRBS_POLARITY_EN__SHIFT 0x18
+#define PSX80_BIF_PCIE_PRBS_STATUS1__PRBS_ERRSTAT_MASK 0xffff
+#define PSX80_BIF_PCIE_PRBS_STATUS1__PRBS_ERRSTAT__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_STATUS1__PRBS_LOCKED_MASK 0xffff0000
+#define PSX80_BIF_PCIE_PRBS_STATUS1__PRBS_LOCKED__SHIFT 0x10
+#define PSX80_BIF_PCIE_PRBS_STATUS2__PRBS_BITCNT_DONE_MASK 0xffff
+#define PSX80_BIF_PCIE_PRBS_STATUS2__PRBS_BITCNT_DONE__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_FREERUN__PRBS_FREERUN_MASK 0xffff
+#define PSX80_BIF_PCIE_PRBS_FREERUN__PRBS_FREERUN__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_EN_MASK 0x1
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_EN__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_TEST_MODE_MASK 0xe
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_TEST_MODE__SHIFT 0x1
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_USER_PATTERN_TOGGLE_MASK 0x10
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_USER_PATTERN_TOGGLE__SHIFT 0x4
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_8BIT_SEL_MASK 0x20
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_8BIT_SEL__SHIFT 0x5
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_COMMA_NUM_MASK 0xc0
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_COMMA_NUM__SHIFT 0x6
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_LOCK_CNT_MASK 0x1f00
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_LOCK_CNT__SHIFT 0x8
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_DATA_RATE_MASK 0xc000
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_DATA_RATE__SHIFT 0xe
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_CHK_ERR_MASK_MASK 0xffff0000
+#define PSX80_BIF_PCIE_PRBS_MISC__PRBS_CHK_ERR_MASK__SHIFT 0x10
+#define PSX80_BIF_PCIE_PRBS_USER_PATTERN__PRBS_USER_PATTERN_MASK 0x3fffffff
+#define PSX80_BIF_PCIE_PRBS_USER_PATTERN__PRBS_USER_PATTERN__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_LO_BITCNT__PRBS_LO_BITCNT_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_LO_BITCNT__PRBS_LO_BITCNT__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_HI_BITCNT__PRBS_HI_BITCNT_MASK 0xff
+#define PSX80_BIF_PCIE_PRBS_HI_BITCNT__PRBS_HI_BITCNT__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_0__PRBS_ERRCNT_0_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_0__PRBS_ERRCNT_0__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_1__PRBS_ERRCNT_1_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_1__PRBS_ERRCNT_1__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_2__PRBS_ERRCNT_2_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_2__PRBS_ERRCNT_2__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_3__PRBS_ERRCNT_3_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_3__PRBS_ERRCNT_3__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_4__PRBS_ERRCNT_4_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_4__PRBS_ERRCNT_4__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_5__PRBS_ERRCNT_5_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_5__PRBS_ERRCNT_5__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_6__PRBS_ERRCNT_6_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_6__PRBS_ERRCNT_6__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_7__PRBS_ERRCNT_7_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_7__PRBS_ERRCNT_7__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_8__PRBS_ERRCNT_8_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_8__PRBS_ERRCNT_8__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_9__PRBS_ERRCNT_9_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_9__PRBS_ERRCNT_9__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_10__PRBS_ERRCNT_10_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_10__PRBS_ERRCNT_10__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_11__PRBS_ERRCNT_11_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_11__PRBS_ERRCNT_11__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_12__PRBS_ERRCNT_12_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_12__PRBS_ERRCNT_12__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_13__PRBS_ERRCNT_13_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_13__PRBS_ERRCNT_13__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_14__PRBS_ERRCNT_14_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_14__PRBS_ERRCNT_14__SHIFT 0x0
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_15__PRBS_ERRCNT_15_MASK 0xffffffff
+#define PSX80_BIF_PCIE_PRBS_ERRCNT_15__PRBS_ERRCNT_15__SHIFT 0x0
+#define PSX80_BIF_SWRST_COMMAND_STATUS__RECONFIGURE_MASK 0x1
+#define PSX80_BIF_SWRST_COMMAND_STATUS__RECONFIGURE__SHIFT 0x0
+#define PSX80_BIF_SWRST_COMMAND_STATUS__ATOMIC_RESET_MASK 0x2
+#define PSX80_BIF_SWRST_COMMAND_STATUS__ATOMIC_RESET__SHIFT 0x1
+#define PSX80_BIF_SWRST_COMMAND_STATUS__RESET_COMPLETE_MASK 0x10000
+#define PSX80_BIF_SWRST_COMMAND_STATUS__RESET_COMPLETE__SHIFT 0x10
+#define PSX80_BIF_SWRST_COMMAND_STATUS__WAIT_STATE_MASK 0x20000
+#define PSX80_BIF_SWRST_COMMAND_STATUS__WAIT_STATE__SHIFT 0x11
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__RECONFIGURE_EN_MASK 0x1
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__RECONFIGURE_EN__SHIFT 0x0
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__ATOMIC_RESET_EN_MASK 0x2
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__ATOMIC_RESET_EN__SHIFT 0x1
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__RESET_PERIOD_MASK 0x1c
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__RESET_PERIOD__SHIFT 0x2
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__WAIT_LINKUP_MASK 0x100
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__WAIT_LINKUP__SHIFT 0x8
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__FORCE_REGIDLE_MASK 0x200
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__FORCE_REGIDLE__SHIFT 0x9
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__BLOCK_ON_IDLE_MASK 0x400
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__BLOCK_ON_IDLE__SHIFT 0xa
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__CONFIG_XFER_MODE_MASK 0x1000
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__CONFIG_XFER_MODE__SHIFT 0xc
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__MUXSEL_XFER_MODE_MASK 0x2000
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__MUXSEL_XFER_MODE__SHIFT 0xd
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__HLDTRAIN_XFER_MODE_MASK 0x4000
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__HLDTRAIN_XFER_MODE__SHIFT 0xe
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__BYPASS_HOLD_MASK 0x10000
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__BYPASS_HOLD__SHIFT 0x10
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__BYPASS_PIF_HOLD_MASK 0x20000
+#define PSX80_BIF_SWRST_GENERAL_CONTROL__BYPASS_PIF_HOLD__SHIFT 0x11
+#define PSX80_BIF_SWRST_COMMAND_0__BIF_STRAPREG_RESET_MASK 0x8000
+#define PSX80_BIF_SWRST_COMMAND_0__BIF_STRAPREG_RESET__SHIFT 0xf
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_GLOBAL_RESET_MASK 0x10000
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_GLOBAL_RESET__SHIFT 0x10
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_CALIB_RESET_MASK 0x20000
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_CALIB_RESET__SHIFT 0x11
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_CORE_RESET_MASK 0x40000
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_CORE_RESET__SHIFT 0x12
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_REGISTER_RESET_MASK 0x80000
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_REGISTER_RESET__SHIFT 0x13
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_PHY_RESET_MASK 0x100000
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_PHY_RESET__SHIFT 0x14
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_STICKY_RESET_MASK 0x200000
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_STICKY_RESET__SHIFT 0x15
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_CONFIG_RESET_MASK 0x400000
+#define PSX80_BIF_SWRST_COMMAND_0__BIF0_CONFIG_RESET__SHIFT 0x16
+#define PSX80_BIF_SWRST_COMMAND_1__SWITCHCLK_MASK 0x1
+#define PSX80_BIF_SWRST_COMMAND_1__SWITCHCLK__SHIFT 0x0
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPCFG_MASK 0x2
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPCFG__SHIFT 0x1
+#define PSX80_BIF_SWRST_COMMAND_1__RESETLANEMUX_MASK 0x4
+#define PSX80_BIF_SWRST_COMMAND_1__RESETLANEMUX__SHIFT 0x2
+#define PSX80_BIF_SWRST_COMMAND_1__RESETWRAPREGS_MASK 0x8
+#define PSX80_BIF_SWRST_COMMAND_1__RESETWRAPREGS__SHIFT 0x3
+#define PSX80_BIF_SWRST_COMMAND_1__RESETSRBM0_MASK 0x10
+#define PSX80_BIF_SWRST_COMMAND_1__RESETSRBM0__SHIFT 0x4
+#define PSX80_BIF_SWRST_COMMAND_1__RESETSRBM1_MASK 0x20
+#define PSX80_BIF_SWRST_COMMAND_1__RESETSRBM1__SHIFT 0x5
+#define PSX80_BIF_SWRST_COMMAND_1__RESETLC_MASK 0x40
+#define PSX80_BIF_SWRST_COMMAND_1__RESETLC__SHIFT 0x6
+#define PSX80_BIF_SWRST_COMMAND_1__SYNCIDLEPIF0_MASK 0x100
+#define PSX80_BIF_SWRST_COMMAND_1__SYNCIDLEPIF0__SHIFT 0x8
+#define PSX80_BIF_SWRST_COMMAND_1__SYNCIDLEPIF1_MASK 0x200
+#define PSX80_BIF_SWRST_COMMAND_1__SYNCIDLEPIF1__SHIFT 0x9
+#define PSX80_BIF_SWRST_COMMAND_1__RESETMNTR_MASK 0x2000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETMNTR__SHIFT 0xd
+#define PSX80_BIF_SWRST_COMMAND_1__RESETHLTR_MASK 0x4000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETHLTR__SHIFT 0xe
+#define PSX80_BIF_SWRST_COMMAND_1__RESETCPM_MASK 0x8000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETCPM__SHIFT 0xf
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPIF0_MASK 0x10000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPIF0__SHIFT 0x10
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPIF1_MASK 0x20000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPIF1__SHIFT 0x11
+#define PSX80_BIF_SWRST_COMMAND_1__RESETIMPARB0_MASK 0x100000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETIMPARB0__SHIFT 0x14
+#define PSX80_BIF_SWRST_COMMAND_1__RESETIMPARB1_MASK 0x200000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETIMPARB1__SHIFT 0x15
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPHY0_MASK 0x1000000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPHY0__SHIFT 0x18
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPHY1_MASK 0x2000000
+#define PSX80_BIF_SWRST_COMMAND_1__RESETPHY1__SHIFT 0x19
+#define PSX80_BIF_SWRST_COMMAND_1__TOGGLESTRAP_MASK 0x10000000
+#define PSX80_BIF_SWRST_COMMAND_1__TOGGLESTRAP__SHIFT 0x1c
+#define PSX80_BIF_SWRST_COMMAND_1__CMDCFGEN_MASK 0x20000000
+#define PSX80_BIF_SWRST_COMMAND_1__CMDCFGEN__SHIFT 0x1d
+#define PSX80_BIF_SWRST_CONTROL_0__BIF_STRAPREG_RESETRCEN_MASK 0x8000
+#define PSX80_BIF_SWRST_CONTROL_0__BIF_STRAPREG_RESETRCEN__SHIFT 0xf
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_GLOBAL_RESETRCEN_MASK 0x10000
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_GLOBAL_RESETRCEN__SHIFT 0x10
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_CALIB_RESETRCEN_MASK 0x20000
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_CALIB_RESETRCEN__SHIFT 0x11
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_CORE_RESETRCEN_MASK 0x40000
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_CORE_RESETRCEN__SHIFT 0x12
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_REGISTER_RESETRCEN_MASK 0x80000
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_REGISTER_RESETRCEN__SHIFT 0x13
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_PHY_RESETRCEN_MASK 0x100000
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_PHY_RESETRCEN__SHIFT 0x14
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_STICKY_RESETRCEN_MASK 0x200000
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_STICKY_RESETRCEN__SHIFT 0x15
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_CONFIG_RESETRCEN_MASK 0x400000
+#define PSX80_BIF_SWRST_CONTROL_0__BIF0_CONFIG_RESETRCEN__SHIFT 0x16
+#define PSX80_BIF_SWRST_CONTROL_1__SWITCHCLK_RCEN_MASK 0x1
+#define PSX80_BIF_SWRST_CONTROL_1__SWITCHCLK_RCEN__SHIFT 0x0
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPCFG_RCEN_MASK 0x2
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPCFG_RCEN__SHIFT 0x1
+#define PSX80_BIF_SWRST_CONTROL_1__RESETLANEMUX_RCEN_MASK 0x4
+#define PSX80_BIF_SWRST_CONTROL_1__RESETLANEMUX_RCEN__SHIFT 0x2
+#define PSX80_BIF_SWRST_CONTROL_1__RESETWRAPREGS_RCEN_MASK 0x8
+#define PSX80_BIF_SWRST_CONTROL_1__RESETWRAPREGS_RCEN__SHIFT 0x3
+#define PSX80_BIF_SWRST_CONTROL_1__RESETSRBM0_RCEN_MASK 0x10
+#define PSX80_BIF_SWRST_CONTROL_1__RESETSRBM0_RCEN__SHIFT 0x4
+#define PSX80_BIF_SWRST_CONTROL_1__RESETSRBM1_RCEN_MASK 0x20
+#define PSX80_BIF_SWRST_CONTROL_1__RESETSRBM1_RCEN__SHIFT 0x5
+#define PSX80_BIF_SWRST_CONTROL_1__RESETLC_RCEN_MASK 0x40
+#define PSX80_BIF_SWRST_CONTROL_1__RESETLC_RCEN__SHIFT 0x6
+#define PSX80_BIF_SWRST_CONTROL_1__SYNCIDLEPIF0_RCEN_MASK 0x100
+#define PSX80_BIF_SWRST_CONTROL_1__SYNCIDLEPIF0_RCEN__SHIFT 0x8
+#define PSX80_BIF_SWRST_CONTROL_1__SYNCIDLEPIF1_RCEN_MASK 0x200
+#define PSX80_BIF_SWRST_CONTROL_1__SYNCIDLEPIF1_RCEN__SHIFT 0x9
+#define PSX80_BIF_SWRST_CONTROL_1__RESETMNTR_RCEN_MASK 0x2000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETMNTR_RCEN__SHIFT 0xd
+#define PSX80_BIF_SWRST_CONTROL_1__RESETHLTR_RCEN_MASK 0x4000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETHLTR_RCEN__SHIFT 0xe
+#define PSX80_BIF_SWRST_CONTROL_1__RESETCPM_RCEN_MASK 0x8000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETCPM_RCEN__SHIFT 0xf
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPIF0_RCEN_MASK 0x10000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPIF0_RCEN__SHIFT 0x10
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPIF1_RCEN_MASK 0x20000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPIF1_RCEN__SHIFT 0x11
+#define PSX80_BIF_SWRST_CONTROL_1__RESETIMPARB0_RCEN_MASK 0x100000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETIMPARB0_RCEN__SHIFT 0x14
+#define PSX80_BIF_SWRST_CONTROL_1__RESETIMPARB1_RCEN_MASK 0x200000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETIMPARB1_RCEN__SHIFT 0x15
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPHY0_RCEN_MASK 0x1000000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPHY0_RCEN__SHIFT 0x18
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPHY1_RCEN_MASK 0x2000000
+#define PSX80_BIF_SWRST_CONTROL_1__RESETPHY1_RCEN__SHIFT 0x19
+#define PSX80_BIF_SWRST_CONTROL_1__STRAPVLD_RCEN_MASK 0x10000000
+#define PSX80_BIF_SWRST_CONTROL_1__STRAPVLD_RCEN__SHIFT 0x1c
+#define PSX80_BIF_SWRST_CONTROL_1__CMDCFG_RCEN_MASK 0x20000000
+#define PSX80_BIF_SWRST_CONTROL_1__CMDCFG_RCEN__SHIFT 0x1d
+#define PSX80_BIF_SWRST_CONTROL_2__BIF_STRAPREG_RESETATEN_MASK 0x8000
+#define PSX80_BIF_SWRST_CONTROL_2__BIF_STRAPREG_RESETATEN__SHIFT 0xf
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_GLOBAL_RESETATEN_MASK 0x10000
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_GLOBAL_RESETATEN__SHIFT 0x10
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_CALIB_RESETATEN_MASK 0x20000
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_CALIB_RESETATEN__SHIFT 0x11
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_CORE_RESETATEN_MASK 0x40000
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_CORE_RESETATEN__SHIFT 0x12
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_REGISTER_RESETATEN_MASK 0x80000
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_REGISTER_RESETATEN__SHIFT 0x13
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_PHY_RESETATEN_MASK 0x100000
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_PHY_RESETATEN__SHIFT 0x14
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_STICKY_RESETATEN_MASK 0x200000
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_STICKY_RESETATEN__SHIFT 0x15
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_CONFIG_RESETATEN_MASK 0x400000
+#define PSX80_BIF_SWRST_CONTROL_2__BIF0_CONFIG_RESETATEN__SHIFT 0x16
+#define PSX80_BIF_SWRST_CONTROL_3__SWITCHCLK_ATEN_MASK 0x1
+#define PSX80_BIF_SWRST_CONTROL_3__SWITCHCLK_ATEN__SHIFT 0x0
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPCFG_ATEN_MASK 0x2
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPCFG_ATEN__SHIFT 0x1
+#define PSX80_BIF_SWRST_CONTROL_3__RESETLANEMUX_ATEN_MASK 0x4
+#define PSX80_BIF_SWRST_CONTROL_3__RESETLANEMUX_ATEN__SHIFT 0x2
+#define PSX80_BIF_SWRST_CONTROL_3__RESETWRAPREGS_ATEN_MASK 0x8
+#define PSX80_BIF_SWRST_CONTROL_3__RESETWRAPREGS_ATEN__SHIFT 0x3
+#define PSX80_BIF_SWRST_CONTROL_3__RESETSRBM0_ATEN_MASK 0x10
+#define PSX80_BIF_SWRST_CONTROL_3__RESETSRBM0_ATEN__SHIFT 0x4
+#define PSX80_BIF_SWRST_CONTROL_3__RESETSRBM1_ATEN_MASK 0x20
+#define PSX80_BIF_SWRST_CONTROL_3__RESETSRBM1_ATEN__SHIFT 0x5
+#define PSX80_BIF_SWRST_CONTROL_3__RESETLC_ATEN_MASK 0x40
+#define PSX80_BIF_SWRST_CONTROL_3__RESETLC_ATEN__SHIFT 0x6
+#define PSX80_BIF_SWRST_CONTROL_3__SYNCIDLEPIF0_ATEN_MASK 0x100
+#define PSX80_BIF_SWRST_CONTROL_3__SYNCIDLEPIF0_ATEN__SHIFT 0x8
+#define PSX80_BIF_SWRST_CONTROL_3__SYNCIDLEPIF1_ATEN_MASK 0x200
+#define PSX80_BIF_SWRST_CONTROL_3__SYNCIDLEPIF1_ATEN__SHIFT 0x9
+#define PSX80_BIF_SWRST_CONTROL_3__RESETMNTR_ATEN_MASK 0x2000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETMNTR_ATEN__SHIFT 0xd
+#define PSX80_BIF_SWRST_CONTROL_3__RESETHLTR_ATEN_MASK 0x4000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETHLTR_ATEN__SHIFT 0xe
+#define PSX80_BIF_SWRST_CONTROL_3__RESETCPM_ATEN_MASK 0x8000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETCPM_ATEN__SHIFT 0xf
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPIF0_ATEN_MASK 0x10000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPIF0_ATEN__SHIFT 0x10
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPIF1_ATEN_MASK 0x20000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPIF1_ATEN__SHIFT 0x11
+#define PSX80_BIF_SWRST_CONTROL_3__RESETIMPARB0_ATEN_MASK 0x100000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETIMPARB0_ATEN__SHIFT 0x14
+#define PSX80_BIF_SWRST_CONTROL_3__RESETIMPARB1_ATEN_MASK 0x200000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETIMPARB1_ATEN__SHIFT 0x15
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPHY0_ATEN_MASK 0x1000000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPHY0_ATEN__SHIFT 0x18
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPHY1_ATEN_MASK 0x2000000
+#define PSX80_BIF_SWRST_CONTROL_3__RESETPHY1_ATEN__SHIFT 0x19
+#define PSX80_BIF_SWRST_CONTROL_3__STRAPVLD_ATEN_MASK 0x10000000
+#define PSX80_BIF_SWRST_CONTROL_3__STRAPVLD_ATEN__SHIFT 0x1c
+#define PSX80_BIF_SWRST_CONTROL_3__CMDCFG_ATEN_MASK 0x20000000
+#define PSX80_BIF_SWRST_CONTROL_3__CMDCFG_ATEN__SHIFT 0x1d
+#define PSX80_BIF_SWRST_CONTROL_4__BIF_STRAPREG_WRRESETEN_MASK 0x4000
+#define PSX80_BIF_SWRST_CONTROL_4__BIF_STRAPREG_WRRESETEN__SHIFT 0xe
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_GLOBAL_WRRESETEN_MASK 0x10000
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_GLOBAL_WRRESETEN__SHIFT 0x10
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_CALIB_WRRESETEN_MASK 0x20000
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_CALIB_WRRESETEN__SHIFT 0x11
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_CORE_WRRESETEN_MASK 0x40000
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_CORE_WRRESETEN__SHIFT 0x12
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_REGISTER_WRRESETEN_MASK 0x80000
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_REGISTER_WRRESETEN__SHIFT 0x13
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_PHY_WRRESETEN_MASK 0x100000
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_PHY_WRRESETEN__SHIFT 0x14
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_STICKY_WRRESETEN_MASK 0x200000
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_STICKY_WRRESETEN__SHIFT 0x15
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_CONFIG_WRRESETEN_MASK 0x400000
+#define PSX80_BIF_SWRST_CONTROL_4__BIF0_CONFIG_WRRESETEN__SHIFT 0x16
+#define PSX80_BIF_SWRST_CONTROL_5__WRSWITCHCLK_EN_MASK 0x1
+#define PSX80_BIF_SWRST_CONTROL_5__WRSWITCHCLK_EN__SHIFT 0x0
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPCFG_EN_MASK 0x2
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPCFG_EN__SHIFT 0x1
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETLANEMUX_EN_MASK 0x4
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETLANEMUX_EN__SHIFT 0x2
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETWRAPREGS_EN_MASK 0x8
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETWRAPREGS_EN__SHIFT 0x3
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETSRBM0_EN_MASK 0x10
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETSRBM0_EN__SHIFT 0x4
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETSRBM1_EN_MASK 0x20
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETSRBM1_EN__SHIFT 0x5
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETLC_EN_MASK 0x40
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETLC_EN__SHIFT 0x6
+#define PSX80_BIF_SWRST_CONTROL_5__WRSYNCIDLEPIF0_EN_MASK 0x100
+#define PSX80_BIF_SWRST_CONTROL_5__WRSYNCIDLEPIF0_EN__SHIFT 0x8
+#define PSX80_BIF_SWRST_CONTROL_5__WRSYNCIDLEPIF1_EN_MASK 0x200
+#define PSX80_BIF_SWRST_CONTROL_5__WRSYNCIDLEPIF1_EN__SHIFT 0x9
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETMNTR_EN_MASK 0x2000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETMNTR_EN__SHIFT 0xd
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETHLTR_EN_MASK 0x4000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETHLTR_EN__SHIFT 0xe
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETCPM_EN_MASK 0x8000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETCPM_EN__SHIFT 0xf
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPIF0_EN_MASK 0x10000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPIF0_EN__SHIFT 0x10
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPIF1_EN_MASK 0x20000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPIF1_EN__SHIFT 0x11
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETIMPARB0_EN_MASK 0x100000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETIMPARB0_EN__SHIFT 0x14
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETIMPARB1_EN_MASK 0x200000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETIMPARB1_EN__SHIFT 0x15
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPHY0_EN_MASK 0x1000000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPHY0_EN__SHIFT 0x18
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPHY1_EN_MASK 0x2000000
+#define PSX80_BIF_SWRST_CONTROL_5__WRRESETPHY1_EN__SHIFT 0x19
+#define PSX80_BIF_SWRST_CONTROL_5__WRSTRAPVLD_EN_MASK 0x10000000
+#define PSX80_BIF_SWRST_CONTROL_5__WRSTRAPVLD_EN__SHIFT 0x1c
+#define PSX80_BIF_SWRST_CONTROL_5__WRCMDCFG_EN_MASK 0x20000000
+#define PSX80_BIF_SWRST_CONTROL_5__WRCMDCFG_EN__SHIFT 0x1d
+#define PSX80_BIF_SWRST_CONTROL_6__WARMRESET_EN_MASK 0x1
+#define PSX80_BIF_SWRST_CONTROL_6__WARMRESET_EN__SHIFT 0x0
+#define PSX80_BIF_SWRST_CONTROL_6__CONNECTWITHWRAPREGS_EN_MASK 0x100
+#define PSX80_BIF_SWRST_CONTROL_6__CONNECTWITHWRAPREGS_EN__SHIFT 0x8
+#define PSX80_BIF_CPM_CONTROL__LCLK_DYN_GATE_ENABLE_MASK 0x1
+#define PSX80_BIF_CPM_CONTROL__LCLK_DYN_GATE_ENABLE__SHIFT 0x0
+#define PSX80_BIF_CPM_CONTROL__TXCLK_DYN_GATE_ENABLE_MASK 0x2
+#define PSX80_BIF_CPM_CONTROL__TXCLK_DYN_GATE_ENABLE__SHIFT 0x1
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PERM_GATE_ENABLE_MASK 0x4
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PERM_GATE_ENABLE__SHIFT 0x2
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PIF_GATE_ENABLE_MASK 0x8
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PIF_GATE_ENABLE__SHIFT 0x3
+#define PSX80_BIF_CPM_CONTROL__TXCLK_GSKT_GATE_ENABLE_MASK 0x10
+#define PSX80_BIF_CPM_CONTROL__TXCLK_GSKT_GATE_ENABLE__SHIFT 0x4
+#define PSX80_BIF_CPM_CONTROL__TXCLK_LCNT_GATE_ENABLE_MASK 0x20
+#define PSX80_BIF_CPM_CONTROL__TXCLK_LCNT_GATE_ENABLE__SHIFT 0x5
+#define PSX80_BIF_CPM_CONTROL__TXCLK_REGS_GATE_ENABLE_MASK 0x40
+#define PSX80_BIF_CPM_CONTROL__TXCLK_REGS_GATE_ENABLE__SHIFT 0x6
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PRBS_GATE_ENABLE_MASK 0x80
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PRBS_GATE_ENABLE__SHIFT 0x7
+#define PSX80_BIF_CPM_CONTROL__REFCLK_REGS_GATE_ENABLE_MASK 0x100
+#define PSX80_BIF_CPM_CONTROL__REFCLK_REGS_GATE_ENABLE__SHIFT 0x8
+#define PSX80_BIF_CPM_CONTROL__LCLK_DYN_GATE_LATENCY_MASK 0x200
+#define PSX80_BIF_CPM_CONTROL__LCLK_DYN_GATE_LATENCY__SHIFT 0x9
+#define PSX80_BIF_CPM_CONTROL__TXCLK_DYN_GATE_LATENCY_MASK 0x400
+#define PSX80_BIF_CPM_CONTROL__TXCLK_DYN_GATE_LATENCY__SHIFT 0xa
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PERM_GATE_LATENCY_MASK 0x800
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PERM_GATE_LATENCY__SHIFT 0xb
+#define PSX80_BIF_CPM_CONTROL__TXCLK_REGS_GATE_LATENCY_MASK 0x1000
+#define PSX80_BIF_CPM_CONTROL__TXCLK_REGS_GATE_LATENCY__SHIFT 0xc
+#define PSX80_BIF_CPM_CONTROL__REFCLK_REGS_GATE_LATENCY_MASK 0x2000
+#define PSX80_BIF_CPM_CONTROL__REFCLK_REGS_GATE_LATENCY__SHIFT 0xd
+#define PSX80_BIF_CPM_CONTROL__LCLK_GATE_TXCLK_FREE_MASK 0x4000
+#define PSX80_BIF_CPM_CONTROL__LCLK_GATE_TXCLK_FREE__SHIFT 0xe
+#define PSX80_BIF_CPM_CONTROL__RCVR_DET_CLK_ENABLE_MASK 0x8000
+#define PSX80_BIF_CPM_CONTROL__RCVR_DET_CLK_ENABLE__SHIFT 0xf
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PERM_GATE_PLL_PDN_MASK 0x10000
+#define PSX80_BIF_CPM_CONTROL__TXCLK_PERM_GATE_PLL_PDN__SHIFT 0x10
+#define PSX80_BIF_CPM_CONTROL__FAST_TXCLK_LATENCY_MASK 0xe0000
+#define PSX80_BIF_CPM_CONTROL__FAST_TXCLK_LATENCY__SHIFT 0x11
+#define PSX80_BIF_CPM_CONTROL__MASTER_PCIE_PLL_SELECT_MASK 0x100000
+#define PSX80_BIF_CPM_CONTROL__MASTER_PCIE_PLL_SELECT__SHIFT 0x14
+#define PSX80_BIF_CPM_CONTROL__MASTER_PCIE_PLL_AUTO_MASK 0x200000
+#define PSX80_BIF_CPM_CONTROL__MASTER_PCIE_PLL_AUTO__SHIFT 0x15
+#define PSX80_BIF_CPM_CONTROL__REFCLK_XSTCLK_ENABLE_MASK 0x400000
+#define PSX80_BIF_CPM_CONTROL__REFCLK_XSTCLK_ENABLE__SHIFT 0x16
+#define PSX80_BIF_CPM_CONTROL__REFCLK_XSTCLK_LATENCY_MASK 0x800000
+#define PSX80_BIF_CPM_CONTROL__REFCLK_XSTCLK_LATENCY__SHIFT 0x17
+#define PSX80_BIF_CPM_CONTROL__SPARE_REGS_MASK 0xff000000
+#define PSX80_BIF_CPM_CONTROL__SPARE_REGS__SHIFT 0x18
+#define PSX80_BIF_LM_CONTROL__LoopbackSelect_MASK 0x1e
+#define PSX80_BIF_LM_CONTROL__LoopbackSelect__SHIFT 0x1
+#define PSX80_BIF_LM_CONTROL__PRBSPCIeLbSelect_MASK 0x20
+#define PSX80_BIF_LM_CONTROL__PRBSPCIeLbSelect__SHIFT 0x5
+#define PSX80_BIF_LM_CONTROL__LoopbackHalfRate_MASK 0xc0
+#define PSX80_BIF_LM_CONTROL__LoopbackHalfRate__SHIFT 0x6
+#define PSX80_BIF_LM_CONTROL__LoopbackFifoPtr_MASK 0x700
+#define PSX80_BIF_LM_CONTROL__LoopbackFifoPtr__SHIFT 0x8
+#define PSX80_BIF_LM_PCIETXMUX0__TXLANE0_MASK 0xff
+#define PSX80_BIF_LM_PCIETXMUX0__TXLANE0__SHIFT 0x0
+#define PSX80_BIF_LM_PCIETXMUX0__TXLANE1_MASK 0xff00
+#define PSX80_BIF_LM_PCIETXMUX0__TXLANE1__SHIFT 0x8
+#define PSX80_BIF_LM_PCIETXMUX0__TXLANE2_MASK 0xff0000
+#define PSX80_BIF_LM_PCIETXMUX0__TXLANE2__SHIFT 0x10
+#define PSX80_BIF_LM_PCIETXMUX0__TXLANE3_MASK 0xff000000
+#define PSX80_BIF_LM_PCIETXMUX0__TXLANE3__SHIFT 0x18
+#define PSX80_BIF_LM_PCIETXMUX1__TXLANE4_MASK 0xff
+#define PSX80_BIF_LM_PCIETXMUX1__TXLANE4__SHIFT 0x0
+#define PSX80_BIF_LM_PCIETXMUX1__TXLANE5_MASK 0xff00
+#define PSX80_BIF_LM_PCIETXMUX1__TXLANE5__SHIFT 0x8
+#define PSX80_BIF_LM_PCIETXMUX1__TXLANE6_MASK 0xff0000
+#define PSX80_BIF_LM_PCIETXMUX1__TXLANE6__SHIFT 0x10
+#define PSX80_BIF_LM_PCIETXMUX1__TXLANE7_MASK 0xff000000
+#define PSX80_BIF_LM_PCIETXMUX1__TXLANE7__SHIFT 0x18
+#define PSX80_BIF_LM_PCIETXMUX2__TXLANE8_MASK 0xff
+#define PSX80_BIF_LM_PCIETXMUX2__TXLANE8__SHIFT 0x0
+#define PSX80_BIF_LM_PCIETXMUX2__TXLANE9_MASK 0xff00
+#define PSX80_BIF_LM_PCIETXMUX2__TXLANE9__SHIFT 0x8
+#define PSX80_BIF_LM_PCIETXMUX2__TXLANE10_MASK 0xff0000
+#define PSX80_BIF_LM_PCIETXMUX2__TXLANE10__SHIFT 0x10
+#define PSX80_BIF_LM_PCIETXMUX2__TXLANE11_MASK 0xff000000
+#define PSX80_BIF_LM_PCIETXMUX2__TXLANE11__SHIFT 0x18
+#define PSX80_BIF_LM_PCIETXMUX3__TXLANE12_MASK 0xff
+#define PSX80_BIF_LM_PCIETXMUX3__TXLANE12__SHIFT 0x0
+#define PSX80_BIF_LM_PCIETXMUX3__TXLANE13_MASK 0xff00
+#define PSX80_BIF_LM_PCIETXMUX3__TXLANE13__SHIFT 0x8
+#define PSX80_BIF_LM_PCIETXMUX3__TXLANE14_MASK 0xff0000
+#define PSX80_BIF_LM_PCIETXMUX3__TXLANE14__SHIFT 0x10
+#define PSX80_BIF_LM_PCIETXMUX3__TXLANE15_MASK 0xff000000
+#define PSX80_BIF_LM_PCIETXMUX3__TXLANE15__SHIFT 0x18
+#define PSX80_BIF_LM_PCIERXMUX0__RXLANE0_MASK 0xff
+#define PSX80_BIF_LM_PCIERXMUX0__RXLANE0__SHIFT 0x0
+#define PSX80_BIF_LM_PCIERXMUX0__RXLANE1_MASK 0xff00
+#define PSX80_BIF_LM_PCIERXMUX0__RXLANE1__SHIFT 0x8
+#define PSX80_BIF_LM_PCIERXMUX0__RXLANE2_MASK 0xff0000
+#define PSX80_BIF_LM_PCIERXMUX0__RXLANE2__SHIFT 0x10
+#define PSX80_BIF_LM_PCIERXMUX0__RXLANE3_MASK 0xff000000
+#define PSX80_BIF_LM_PCIERXMUX0__RXLANE3__SHIFT 0x18
+#define PSX80_BIF_LM_PCIERXMUX1__RXLANE4_MASK 0xff
+#define PSX80_BIF_LM_PCIERXMUX1__RXLANE4__SHIFT 0x0
+#define PSX80_BIF_LM_PCIERXMUX1__RXLANE5_MASK 0xff00
+#define PSX80_BIF_LM_PCIERXMUX1__RXLANE5__SHIFT 0x8
+#define PSX80_BIF_LM_PCIERXMUX1__RXLANE6_MASK 0xff0000
+#define PSX80_BIF_LM_PCIERXMUX1__RXLANE6__SHIFT 0x10
+#define PSX80_BIF_LM_PCIERXMUX1__RXLANE7_MASK 0xff000000
+#define PSX80_BIF_LM_PCIERXMUX1__RXLANE7__SHIFT 0x18
+#define PSX80_BIF_LM_PCIERXMUX2__RXLANE8_MASK 0xff
+#define PSX80_BIF_LM_PCIERXMUX2__RXLANE8__SHIFT 0x0
+#define PSX80_BIF_LM_PCIERXMUX2__RXLANE9_MASK 0xff00
+#define PSX80_BIF_LM_PCIERXMUX2__RXLANE9__SHIFT 0x8
+#define PSX80_BIF_LM_PCIERXMUX2__RXLANE10_MASK 0xff0000
+#define PSX80_BIF_LM_PCIERXMUX2__RXLANE10__SHIFT 0x10
+#define PSX80_BIF_LM_PCIERXMUX2__RXLANE11_MASK 0xff000000
+#define PSX80_BIF_LM_PCIERXMUX2__RXLANE11__SHIFT 0x18
+#define PSX80_BIF_LM_PCIERXMUX3__RXLANE12_MASK 0xff
+#define PSX80_BIF_LM_PCIERXMUX3__RXLANE12__SHIFT 0x0
+#define PSX80_BIF_LM_PCIERXMUX3__RXLANE13_MASK 0xff00
+#define PSX80_BIF_LM_PCIERXMUX3__RXLANE13__SHIFT 0x8
+#define PSX80_BIF_LM_PCIERXMUX3__RXLANE14_MASK 0xff0000
+#define PSX80_BIF_LM_PCIERXMUX3__RXLANE14__SHIFT 0x10
+#define PSX80_BIF_LM_PCIERXMUX3__RXLANE15_MASK 0xff000000
+#define PSX80_BIF_LM_PCIERXMUX3__RXLANE15__SHIFT 0x18
+#define PSX80_BIF_LM_LANEENABLE__LANE_enable_MASK 0xffff
+#define PSX80_BIF_LM_LANEENABLE__LANE_enable__SHIFT 0x0
+#define PSX80_BIF_LM_PRBSCONTROL__PRBSPCIeSelect_MASK 0xffff
+#define PSX80_BIF_LM_PRBSCONTROL__PRBSPCIeSelect__SHIFT 0x0
+#define PSX80_BIF_LM_PRBSCONTROL__LMLaneDegrade0_MASK 0x10000000
+#define PSX80_BIF_LM_PRBSCONTROL__LMLaneDegrade0__SHIFT 0x1c
+#define PSX80_BIF_LM_PRBSCONTROL__LMLaneDegrade1_MASK 0x20000000
+#define PSX80_BIF_LM_PRBSCONTROL__LMLaneDegrade1__SHIFT 0x1d
+#define PSX80_BIF_LM_PRBSCONTROL__LMLaneDegrade2_MASK 0x40000000
+#define PSX80_BIF_LM_PRBSCONTROL__LMLaneDegrade2__SHIFT 0x1e
+#define PSX80_BIF_LM_PRBSCONTROL__LMLaneDegrade3_MASK 0x80000000
+#define PSX80_BIF_LM_PRBSCONTROL__LMLaneDegrade3__SHIFT 0x1f
+#define PSX80_BIF_LM_POWERCONTROL__LMTxPhyCmd0_MASK 0x7
+#define PSX80_BIF_LM_POWERCONTROL__LMTxPhyCmd0__SHIFT 0x0
+#define PSX80_BIF_LM_POWERCONTROL__LMRxPhyCmd0_MASK 0x38
+#define PSX80_BIF_LM_POWERCONTROL__LMRxPhyCmd0__SHIFT 0x3
+#define PSX80_BIF_LM_POWERCONTROL__LMLinkSpeed0_MASK 0xc0
+#define PSX80_BIF_LM_POWERCONTROL__LMLinkSpeed0__SHIFT 0x6
+#define PSX80_BIF_LM_POWERCONTROL__LMTxPhyCmd1_MASK 0x700
+#define PSX80_BIF_LM_POWERCONTROL__LMTxPhyCmd1__SHIFT 0x8
+#define PSX80_BIF_LM_POWERCONTROL__LMRxPhyCmd1_MASK 0x3800
+#define PSX80_BIF_LM_POWERCONTROL__LMRxPhyCmd1__SHIFT 0xb
+#define PSX80_BIF_LM_POWERCONTROL__LMLinkSpeed1_MASK 0xc000
+#define PSX80_BIF_LM_POWERCONTROL__LMLinkSpeed1__SHIFT 0xe
+#define PSX80_BIF_LM_POWERCONTROL__LMTxPhyCmd2_MASK 0x70000
+#define PSX80_BIF_LM_POWERCONTROL__LMTxPhyCmd2__SHIFT 0x10
+#define PSX80_BIF_LM_POWERCONTROL__LMRxPhyCmd2_MASK 0x380000
+#define PSX80_BIF_LM_POWERCONTROL__LMRxPhyCmd2__SHIFT 0x13
+#define PSX80_BIF_LM_POWERCONTROL__LMLinkSpeed2_MASK 0xc00000
+#define PSX80_BIF_LM_POWERCONTROL__LMLinkSpeed2__SHIFT 0x16
+#define PSX80_BIF_LM_POWERCONTROL__LMTxPhyCmd3_MASK 0x7000000
+#define PSX80_BIF_LM_POWERCONTROL__LMTxPhyCmd3__SHIFT 0x18
+#define PSX80_BIF_LM_POWERCONTROL__LMRxPhyCmd3_MASK 0x38000000
+#define PSX80_BIF_LM_POWERCONTROL__LMRxPhyCmd3__SHIFT 0x1b
+#define PSX80_BIF_LM_POWERCONTROL__LMLinkSpeed3_MASK 0xc0000000
+#define PSX80_BIF_LM_POWERCONTROL__LMLinkSpeed3__SHIFT 0x1e
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxEn0_MASK 0x1
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxEn0__SHIFT 0x0
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxClkEn0_MASK 0x2
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxClkEn0__SHIFT 0x1
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMargin0_MASK 0x1c
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMargin0__SHIFT 0x2
+#define PSX80_BIF_LM_POWERCONTROL1__LMSkipBit0_MASK 0x20
+#define PSX80_BIF_LM_POWERCONTROL1__LMSkipBit0__SHIFT 0x5
+#define PSX80_BIF_LM_POWERCONTROL1__LMLaneUnused0_MASK 0x40
+#define PSX80_BIF_LM_POWERCONTROL1__LMLaneUnused0__SHIFT 0x6
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMarginEn0_MASK 0x80
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMarginEn0__SHIFT 0x7
+#define PSX80_BIF_LM_POWERCONTROL1__LMDeemph0_MASK 0x100
+#define PSX80_BIF_LM_POWERCONTROL1__LMDeemph0__SHIFT 0x8
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxEn1_MASK 0x200
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxEn1__SHIFT 0x9
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxClkEn1_MASK 0x400
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxClkEn1__SHIFT 0xa
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMargin1_MASK 0x3800
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMargin1__SHIFT 0xb
+#define PSX80_BIF_LM_POWERCONTROL1__LMSkipBit1_MASK 0x4000
+#define PSX80_BIF_LM_POWERCONTROL1__LMSkipBit1__SHIFT 0xe
+#define PSX80_BIF_LM_POWERCONTROL1__LMLaneUnused1_MASK 0x8000
+#define PSX80_BIF_LM_POWERCONTROL1__LMLaneUnused1__SHIFT 0xf
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMarginEn1_MASK 0x10000
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMarginEn1__SHIFT 0x10
+#define PSX80_BIF_LM_POWERCONTROL1__LMDeemph1_MASK 0x20000
+#define PSX80_BIF_LM_POWERCONTROL1__LMDeemph1__SHIFT 0x11
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxEn2_MASK 0x40000
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxEn2__SHIFT 0x12
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxClkEn2_MASK 0x80000
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxClkEn2__SHIFT 0x13
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMargin2_MASK 0x700000
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMargin2__SHIFT 0x14
+#define PSX80_BIF_LM_POWERCONTROL1__LMSkipBit2_MASK 0x800000
+#define PSX80_BIF_LM_POWERCONTROL1__LMSkipBit2__SHIFT 0x17
+#define PSX80_BIF_LM_POWERCONTROL1__LMLaneUnused2_MASK 0x1000000
+#define PSX80_BIF_LM_POWERCONTROL1__LMLaneUnused2__SHIFT 0x18
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMarginEn2_MASK 0x2000000
+#define PSX80_BIF_LM_POWERCONTROL1__LMTxMarginEn2__SHIFT 0x19
+#define PSX80_BIF_LM_POWERCONTROL1__LMDeemph2_MASK 0x4000000
+#define PSX80_BIF_LM_POWERCONTROL1__LMDeemph2__SHIFT 0x1a
+#define PSX80_BIF_LM_POWERCONTROL1__TxCoeffID0_MASK 0x18000000
+#define PSX80_BIF_LM_POWERCONTROL1__TxCoeffID0__SHIFT 0x1b
+#define PSX80_BIF_LM_POWERCONTROL1__TxCoeffID1_MASK 0x60000000
+#define PSX80_BIF_LM_POWERCONTROL1__TxCoeffID1__SHIFT 0x1d
+#define PSX80_BIF_LM_POWERCONTROL2__LMTxEn3_MASK 0x1
+#define PSX80_BIF_LM_POWERCONTROL2__LMTxEn3__SHIFT 0x0
+#define PSX80_BIF_LM_POWERCONTROL2__LMTxClkEn3_MASK 0x2
+#define PSX80_BIF_LM_POWERCONTROL2__LMTxClkEn3__SHIFT 0x1
+#define PSX80_BIF_LM_POWERCONTROL2__LMTxMargin3_MASK 0x1c
+#define PSX80_BIF_LM_POWERCONTROL2__LMTxMargin3__SHIFT 0x2
+#define PSX80_BIF_LM_POWERCONTROL2__LMSkipBit3_MASK 0x20
+#define PSX80_BIF_LM_POWERCONTROL2__LMSkipBit3__SHIFT 0x5
+#define PSX80_BIF_LM_POWERCONTROL2__LMLaneUnused3_MASK 0x40
+#define PSX80_BIF_LM_POWERCONTROL2__LMLaneUnused3__SHIFT 0x6
+#define PSX80_BIF_LM_POWERCONTROL2__LMTxMarginEn3_MASK 0x80
+#define PSX80_BIF_LM_POWERCONTROL2__LMTxMarginEn3__SHIFT 0x7
+#define PSX80_BIF_LM_POWERCONTROL2__LMDeemph3_MASK 0x100
+#define PSX80_BIF_LM_POWERCONTROL2__LMDeemph3__SHIFT 0x8
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeffID2_MASK 0x600
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeffID2__SHIFT 0x9
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeffID3_MASK 0x1800
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeffID3__SHIFT 0xb
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeff0_MASK 0x7e000
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeff0__SHIFT 0xd
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeff1_MASK 0x1f80000
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeff1__SHIFT 0x13
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeff2_MASK 0x7e000000
+#define PSX80_BIF_LM_POWERCONTROL2__TxCoeff2__SHIFT 0x19
+#define PSX80_BIF_LM_POWERCONTROL3__TxCoeff3_MASK 0x3f
+#define PSX80_BIF_LM_POWERCONTROL3__TxCoeff3__SHIFT 0x0
+#define PSX80_BIF_LM_POWERCONTROL3__RxEqCtl0_MASK 0xfc0
+#define PSX80_BIF_LM_POWERCONTROL3__RxEqCtl0__SHIFT 0x6
+#define PSX80_BIF_LM_POWERCONTROL3__RxEqCtl1_MASK 0x3f000
+#define PSX80_BIF_LM_POWERCONTROL3__RxEqCtl1__SHIFT 0xc
+#define PSX80_BIF_LM_POWERCONTROL3__RxEqCtl2_MASK 0xfc0000
+#define PSX80_BIF_LM_POWERCONTROL3__RxEqCtl2__SHIFT 0x12
+#define PSX80_BIF_LM_POWERCONTROL3__RxEqCtl3_MASK 0x3f000000
+#define PSX80_BIF_LM_POWERCONTROL3__RxEqCtl3__SHIFT 0x18
+#define PSX80_BIF_LM_POWERCONTROL4__LinkNum0_MASK 0x7
+#define PSX80_BIF_LM_POWERCONTROL4__LinkNum0__SHIFT 0x0
+#define PSX80_BIF_LM_POWERCONTROL4__LinkNum1_MASK 0x38
+#define PSX80_BIF_LM_POWERCONTROL4__LinkNum1__SHIFT 0x3
+#define PSX80_BIF_LM_POWERCONTROL4__LinkNum2_MASK 0x1c0
+#define PSX80_BIF_LM_POWERCONTROL4__LinkNum2__SHIFT 0x6
+#define PSX80_BIF_LM_POWERCONTROL4__LinkNum3_MASK 0xe00
+#define PSX80_BIF_LM_POWERCONTROL4__LinkNum3__SHIFT 0x9
+#define PSX80_BIF_LM_POWERCONTROL4__LaneNum0_MASK 0xf000
+#define PSX80_BIF_LM_POWERCONTROL4__LaneNum0__SHIFT 0xc
+#define PSX80_BIF_LM_POWERCONTROL4__LaneNum1_MASK 0xf0000
+#define PSX80_BIF_LM_POWERCONTROL4__LaneNum1__SHIFT 0x10
+#define PSX80_BIF_LM_POWERCONTROL4__LaneNum2_MASK 0xf00000
+#define PSX80_BIF_LM_POWERCONTROL4__LaneNum2__SHIFT 0x14
+#define PSX80_BIF_LM_POWERCONTROL4__LaneNum3_MASK 0xf000000
+#define PSX80_BIF_LM_POWERCONTROL4__LaneNum3__SHIFT 0x18
+#define PSX80_BIF_LM_POWERCONTROL4__SpcMode0_MASK 0x10000000
+#define PSX80_BIF_LM_POWERCONTROL4__SpcMode0__SHIFT 0x1c
+#define PSX80_BIF_LM_POWERCONTROL4__SpcMode1_MASK 0x20000000
+#define PSX80_BIF_LM_POWERCONTROL4__SpcMode1__SHIFT 0x1d
+#define PSX80_BIF_LM_POWERCONTROL4__SpcMode2_MASK 0x40000000
+#define PSX80_BIF_LM_POWERCONTROL4__SpcMode2__SHIFT 0x1e
+#define PSX80_BIF_LM_POWERCONTROL4__SpcMode3_MASK 0x80000000
+#define PSX80_BIF_LM_POWERCONTROL4__SpcMode3__SHIFT 0x1f
+#define PSX81_BIF_PCIE_RESERVED__PCIE_RESERVED_MASK 0xffffffff
+#define PSX81_BIF_PCIE_RESERVED__PCIE_RESERVED__SHIFT 0x0
+#define PSX81_BIF_PCIE_SCRATCH__PCIE_SCRATCH_MASK 0xffffffff
+#define PSX81_BIF_PCIE_SCRATCH__PCIE_SCRATCH__SHIFT 0x0
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_12_DEBUG_MASK 0x1000
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_12_DEBUG__SHIFT 0xc
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_13_DEBUG_MASK 0x2000
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_13_DEBUG__SHIFT 0xd
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_14_DEBUG_MASK 0x4000
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_14_DEBUG__SHIFT 0xe
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_15_DEBUG_MASK 0x8000
+#define PSX81_BIF_PCIE_HW_DEBUG__HW_15_DEBUG__SHIFT 0xf
+#define PSX81_BIF_PCIE_RX_NUM_NAK__RX_NUM_NAK_MASK 0xffffffff
+#define PSX81_BIF_PCIE_RX_NUM_NAK__RX_NUM_NAK__SHIFT 0x0
+#define PSX81_BIF_PCIE_RX_NUM_NAK_GENERATED__RX_NUM_NAK_GENERATED_MASK 0xffffffff
+#define PSX81_BIF_PCIE_RX_NUM_NAK_GENERATED__RX_NUM_NAK_GENERATED__SHIFT 0x0
+#define PSX81_BIF_PCIE_CNTL__HWINIT_WR_LOCK_MASK 0x1
+#define PSX81_BIF_PCIE_CNTL__HWINIT_WR_LOCK__SHIFT 0x0
+#define PSX81_BIF_PCIE_CNTL__LC_HOT_PLUG_DELAY_SEL_MASK 0xe
+#define PSX81_BIF_PCIE_CNTL__LC_HOT_PLUG_DELAY_SEL__SHIFT 0x1
+#define PSX81_BIF_PCIE_CNTL__UR_ERR_REPORT_DIS_MASK 0x80
+#define PSX81_BIF_PCIE_CNTL__UR_ERR_REPORT_DIS__SHIFT 0x7
+#define PSX81_BIF_PCIE_CNTL__PCIE_MALFORM_ATOMIC_OPS_MASK 0x100
+#define PSX81_BIF_PCIE_CNTL__PCIE_MALFORM_ATOMIC_OPS__SHIFT 0x8
+#define PSX81_BIF_PCIE_CNTL__PCIE_HT_NP_MEM_WRITE_MASK 0x200
+#define PSX81_BIF_PCIE_CNTL__PCIE_HT_NP_MEM_WRITE__SHIFT 0x9
+#define PSX81_BIF_PCIE_CNTL__RX_SB_ADJ_PAYLOAD_SIZE_MASK 0x1c00
+#define PSX81_BIF_PCIE_CNTL__RX_SB_ADJ_PAYLOAD_SIZE__SHIFT 0xa
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_ATS_UC_DIS_MASK 0x8000
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_ATS_UC_DIS__SHIFT 0xf
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_REORDER_EN_MASK 0x10000
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_REORDER_EN__SHIFT 0x10
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS_MASK 0x20000
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS__SHIFT 0x11
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS_MASK 0x40000
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS__SHIFT 0x12
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE_MASK 0x80000
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE__SHIFT 0x13
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_WRONG_PREFIX_DIS_MASK 0x100000
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_WRONG_PREFIX_DIS__SHIFT 0x14
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS_MASK 0x200000
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS__SHIFT 0x15
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_WRONG_FUNCNUM_DIS_MASK 0x400000
+#define PSX81_BIF_PCIE_CNTL__RX_RCB_WRONG_FUNCNUM_DIS__SHIFT 0x16
+#define PSX81_BIF_PCIE_CNTL__RX_ATS_TRAN_CPL_SPLIT_DIS_MASK 0x800000
+#define PSX81_BIF_PCIE_CNTL__RX_ATS_TRAN_CPL_SPLIT_DIS__SHIFT 0x17
+#define PSX81_BIF_PCIE_CNTL__TX_CPL_DEBUG_MASK 0x3f000000
+#define PSX81_BIF_PCIE_CNTL__TX_CPL_DEBUG__SHIFT 0x18
+#define PSX81_BIF_PCIE_CNTL__RX_IGNORE_LTR_MSG_UR_MASK 0x40000000
+#define PSX81_BIF_PCIE_CNTL__RX_IGNORE_LTR_MSG_UR__SHIFT 0x1e
+#define PSX81_BIF_PCIE_CNTL__RX_CPL_POSTED_REQ_ORD_EN_MASK 0x80000000
+#define PSX81_BIF_PCIE_CNTL__RX_CPL_POSTED_REQ_ORD_EN__SHIFT 0x1f
+#define PSX81_BIF_PCIE_CONFIG_CNTL__DYN_CLK_LATENCY_MASK 0xf
+#define PSX81_BIF_PCIE_CONFIG_CNTL__DYN_CLK_LATENCY__SHIFT 0x0
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_MAX_PAYLOAD_SIZE_MODE_MASK 0x10000
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_MAX_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_PRIV_MAX_PAYLOAD_SIZE_MASK 0xe0000
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_PRIV_MAX_PAYLOAD_SIZE__SHIFT 0x11
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_MAX_READ_REQUEST_SIZE_MODE_MASK 0x100000
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_MAX_READ_REQUEST_SIZE_MODE__SHIFT 0x14
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_PRIV_MAX_READ_REQUEST_SIZE_MASK 0xe00000
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_PRIV_MAX_READ_REQUEST_SIZE__SHIFT 0x15
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_MAX_READ_SAFE_MODE_MASK 0x1000000
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_MAX_READ_SAFE_MODE__SHIFT 0x18
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_EXTENDED_TAG_EN_OVERRIDE_MASK 0x6000000
+#define PSX81_BIF_PCIE_CONFIG_CNTL__CI_EXTENDED_TAG_EN_OVERRIDE__SHIFT 0x19
+#define PSX81_BIF_PCIE_DEBUG_CNTL__DEBUG_PORT_EN_MASK 0xff
+#define PSX81_BIF_PCIE_DEBUG_CNTL__DEBUG_PORT_EN__SHIFT 0x0
+#define PSX81_BIF_PCIE_DEBUG_CNTL__DEBUG_SELECT_MASK 0x100
+#define PSX81_BIF_PCIE_DEBUG_CNTL__DEBUG_SELECT__SHIFT 0x8
+#define PSX81_BIF_PCIE_DEBUG_CNTL__DEBUG_LANE_EN_MASK 0xffff0000
+#define PSX81_BIF_PCIE_DEBUG_CNTL__DEBUG_LANE_EN__SHIFT 0x10
+#define PSX81_BIF_PCIE_CNTL2__TX_ARB_ROUND_ROBIN_EN_MASK 0x1
+#define PSX81_BIF_PCIE_CNTL2__TX_ARB_ROUND_ROBIN_EN__SHIFT 0x0
+#define PSX81_BIF_PCIE_CNTL2__TX_ARB_SLV_LIMIT_MASK 0x3e
+#define PSX81_BIF_PCIE_CNTL2__TX_ARB_SLV_LIMIT__SHIFT 0x1
+#define PSX81_BIF_PCIE_CNTL2__TX_ARB_MST_LIMIT_MASK 0x7c0
+#define PSX81_BIF_PCIE_CNTL2__TX_ARB_MST_LIMIT__SHIFT 0x6
+#define PSX81_BIF_PCIE_CNTL2__TX_BLOCK_TLP_ON_PM_DIS_MASK 0x800
+#define PSX81_BIF_PCIE_CNTL2__TX_BLOCK_TLP_ON_PM_DIS__SHIFT 0xb
+#define PSX81_BIF_PCIE_CNTL2__TX_NP_MEM_WRITE_SWP_ENCODING_MASK 0x1000
+#define PSX81_BIF_PCIE_CNTL2__TX_NP_MEM_WRITE_SWP_ENCODING__SHIFT 0xc
+#define PSX81_BIF_PCIE_CNTL2__TX_ATOMIC_OPS_DISABLE_MASK 0x2000
+#define PSX81_BIF_PCIE_CNTL2__TX_ATOMIC_OPS_DISABLE__SHIFT 0xd
+#define PSX81_BIF_PCIE_CNTL2__TX_ATOMIC_ORDERING_DIS_MASK 0x4000
+#define PSX81_BIF_PCIE_CNTL2__TX_ATOMIC_ORDERING_DIS__SHIFT 0xe
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_LS_EN_MASK 0x10000
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_LS_EN__SHIFT 0x10
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN_MASK 0x20000
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN__SHIFT 0x11
+#define PSX81_BIF_PCIE_CNTL2__MST_MEM_LS_EN_MASK 0x40000
+#define PSX81_BIF_PCIE_CNTL2__MST_MEM_LS_EN__SHIFT 0x12
+#define PSX81_BIF_PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK 0x80000
+#define PSX81_BIF_PCIE_CNTL2__REPLAY_MEM_LS_EN__SHIFT 0x13
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_SD_EN_MASK 0x100000
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_SD_EN__SHIFT 0x14
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN_MASK 0x200000
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN__SHIFT 0x15
+#define PSX81_BIF_PCIE_CNTL2__MST_MEM_SD_EN_MASK 0x400000
+#define PSX81_BIF_PCIE_CNTL2__MST_MEM_SD_EN__SHIFT 0x16
+#define PSX81_BIF_PCIE_CNTL2__REPLAY_MEM_SD_EN_MASK 0x800000
+#define PSX81_BIF_PCIE_CNTL2__REPLAY_MEM_SD_EN__SHIFT 0x17
+#define PSX81_BIF_PCIE_CNTL2__RX_NP_MEM_WRITE_ENCODING_MASK 0x1f000000
+#define PSX81_BIF_PCIE_CNTL2__RX_NP_MEM_WRITE_ENCODING__SHIFT 0x18
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_DS_EN_MASK 0x20000000
+#define PSX81_BIF_PCIE_CNTL2__SLV_MEM_DS_EN__SHIFT 0x1d
+#define PSX81_BIF_PCIE_CNTL2__MST_MEM_DS_EN_MASK 0x40000000
+#define PSX81_BIF_PCIE_CNTL2__MST_MEM_DS_EN__SHIFT 0x1e
+#define PSX81_BIF_PCIE_CNTL2__REPLAY_MEM_DS_EN_MASK 0x80000000
+#define PSX81_BIF_PCIE_CNTL2__REPLAY_MEM_DS_EN__SHIFT 0x1f
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_INVALIDPASID_UR_MASK 0x1
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_INVALIDPASID_UR__SHIFT 0x0
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMRD_UR_MASK 0x2
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMRD_UR__SHIFT 0x1
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMWR_UR_MASK 0x4
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMWR_UR__SHIFT 0x2
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_ATSTRANSREQ_UR_MASK 0x8
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_ATSTRANSREQ_UR__SHIFT 0x3
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_PAGEREQMSG_UR_MASK 0x10
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_PAGEREQMSG_UR__SHIFT 0x4
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_INVCPL_UR_MASK 0x20
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_IGNORE_EP_INVCPL_UR__SHIFT 0x5
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_RCB_LATENCY_EN_MASK 0x100
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_RCB_LATENCY_EN__SHIFT 0x8
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_RCB_LATENCY_SCALE_MASK 0xe00
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_RCB_LATENCY_SCALE__SHIFT 0x9
+#define PSX81_BIF_PCIE_RX_CNTL2__SLVCPL_MEM_LS_EN_MASK 0x1000
+#define PSX81_BIF_PCIE_RX_CNTL2__SLVCPL_MEM_LS_EN__SHIFT 0xc
+#define PSX81_BIF_PCIE_RX_CNTL2__SLVCPL_MEM_SD_EN_MASK 0x2000
+#define PSX81_BIF_PCIE_RX_CNTL2__SLVCPL_MEM_SD_EN__SHIFT 0xd
+#define PSX81_BIF_PCIE_RX_CNTL2__SLVCPL_MEM_DS_EN_MASK 0x4000
+#define PSX81_BIF_PCIE_RX_CNTL2__SLVCPL_MEM_DS_EN__SHIFT 0xe
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_RCB_LATENCY_MAX_COUNT_MASK 0x3ff0000
+#define PSX81_BIF_PCIE_RX_CNTL2__RX_RCB_LATENCY_MAX_COUNT__SHIFT 0x10
+#define PSX81_BIF_PCIE_RX_CNTL2__FLR_EXTEND_MODE_MASK 0x70000000
+#define PSX81_BIF_PCIE_RX_CNTL2__FLR_EXTEND_MODE__SHIFT 0x1c
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_P_MASK 0x3
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_P__SHIFT 0x0
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_NP_MASK 0xc
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_NP__SHIFT 0x2
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_CPL_MASK 0x30
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_CPL__SHIFT 0x4
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_P_MASK 0xc0
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_P__SHIFT 0x6
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_NP_MASK 0x300
+#define PSX81_BIF_PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_NP__SHIFT 0x8
+#define PS

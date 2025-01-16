@@ -1,107 +1,5 @@
-/*
- * This program is used to generate definitions needed by
- * assembly language modules.
- *
- * We use the technique used in the OSF Mach kernel code:
- * generate asm statements containing #defines,
- * compile this file to assembler, and then extract the
- * #defines from the assembly-language output.
- */
-
-#define ASM_OFFSETS_C
-
-#include <linux/stddef.h>
-#include <linux/sched.h>
-#include <linux/kernel_stat.h>
-#include <linux/kbuild.h>
-#include <asm/bootinfo.h>
-#include <asm/irq.h>
-#include <asm/amigahw.h>
-#include <linux/font.h>
-
-int main(void)
-{
-	/* offsets into the task struct */
-	DEFINE(TASK_THREAD, offsetof(struct task_struct, thread));
-	DEFINE(TASK_MM, offsetof(struct task_struct, mm));
-	DEFINE(TASK_STACK, offsetof(struct task_struct, stack));
-
-	/* offsets into the thread struct */
-	DEFINE(THREAD_KSP, offsetof(struct thread_struct, ksp));
-	DEFINE(THREAD_USP, offsetof(struct thread_struct, usp));
-	DEFINE(THREAD_SR, offsetof(struct thread_struct, sr));
-	DEFINE(THREAD_FS, offsetof(struct thread_struct, fs));
-	DEFINE(THREAD_CRP, offsetof(struct thread_struct, crp));
-	DEFINE(THREAD_ESP0, offsetof(struct thread_struct, esp0));
-	DEFINE(THREAD_FPREG, offsetof(struct thread_struct, fp));
-	DEFINE(THREAD_FPCNTL, offsetof(struct thread_struct, fpcntl));
-	DEFINE(THREAD_FPSTATE, offsetof(struct thread_struct, fpstate));
-
-	/* offsets into the thread_info struct */
-	DEFINE(TINFO_PREEMPT, offsetof(struct thread_info, preempt_count));
-	DEFINE(TINFO_FLAGS, offsetof(struct thread_info, flags));
-
-	/* offsets into the pt_regs */
-	DEFINE(PT_OFF_D0, offsetof(struct pt_regs, d0));
-	DEFINE(PT_OFF_ORIG_D0, offsetof(struct pt_regs, orig_d0));
-	DEFINE(PT_OFF_D1, offsetof(struct pt_regs, d1));
-	DEFINE(PT_OFF_D2, offsetof(struct pt_regs, d2));
-	DEFINE(PT_OFF_D3, offsetof(struct pt_regs, d3));
-	DEFINE(PT_OFF_D4, offsetof(struct pt_regs, d4));
-	DEFINE(PT_OFF_D5, offsetof(struct pt_regs, d5));
-	DEFINE(PT_OFF_A0, offsetof(struct pt_regs, a0));
-	DEFINE(PT_OFF_A1, offsetof(struct pt_regs, a1));
-	DEFINE(PT_OFF_A2, offsetof(struct pt_regs, a2));
-	DEFINE(PT_OFF_PC, offsetof(struct pt_regs, pc));
-	DEFINE(PT_OFF_SR, offsetof(struct pt_regs, sr));
-
-	/* bitfields are a bit difficult */
-#ifdef CONFIG_COLDFIRE
-	DEFINE(PT_OFF_FORMATVEC, offsetof(struct pt_regs, sr) - 2);
-#else
-	DEFINE(PT_OFF_FORMATVEC, offsetof(struct pt_regs, pc) + 4);
-#endif
-
-	/* offsets into the irq_cpustat_t struct */
-	DEFINE(CPUSTAT_SOFTIRQ_PENDING, offsetof(irq_cpustat_t, __softirq_pending));
-
-	/* signal defines */
-	DEFINE(LSIGSEGV, SIGSEGV);
-	DEFINE(LSEGV_MAPERR, SEGV_MAPERR);
-	DEFINE(LSIGTRAP, SIGTRAP);
-	DEFINE(LTRAP_TRACE, TRAP_TRACE);
-
-#ifdef CONFIG_MMU
-	/* offsets into the bi_record struct */
-	DEFINE(BIR_TAG, offsetof(struct bi_record, tag));
-	DEFINE(BIR_SIZE, offsetof(struct bi_record, size));
-	DEFINE(BIR_DATA, offsetof(struct bi_record, data));
-
-	/* offsets into the font_desc struct */
-	DEFINE(FONT_DESC_IDX, offsetof(struct font_desc, idx));
-	DEFINE(FONT_DESC_NAME, offsetof(struct font_desc, name));
-	DEFINE(FONT_DESC_WIDTH, offsetof(struct font_desc, width));
-	DEFINE(FONT_DESC_HEIGHT, offsetof(struct font_desc, height));
-	DEFINE(FONT_DESC_DATA, offsetof(struct font_desc, data));
-	DEFINE(FONT_DESC_PREF, offsetof(struct font_desc, pref));
-
-	/* offsets into the custom struct */
-	DEFINE(CUSTOMBASE, &amiga_custom);
-	DEFINE(C_INTENAR, offsetof(struct CUSTOM, intenar));
-	DEFINE(C_INTREQR, offsetof(struct CUSTOM, intreqr));
-	DEFINE(C_INTENA, offsetof(struct CUSTOM, intena));
-	DEFINE(C_INTREQ, offsetof(struct CUSTOM, intreq));
-	DEFINE(C_SERDATR, offsetof(struct CUSTOM, serdatr));
-	DEFINE(C_SERDAT, offsetof(struct CUSTOM, serdat));
-	DEFINE(C_SERPER, offsetof(struct CUSTOM, serper));
-	DEFINE(CIAABASE, &ciaa);
-	DEFINE(CIABBASE, &ciab);
-	DEFINE(C_PRA, offsetof(struct CIA, pra));
-	DEFINE(ZTWOBASE, zTwoBase);
-
-	/* enum m68k_fixup_type */
-	DEFINE(M68K_FIXUP_MEMOFFSET, m68k_fixup_memoffset);
-#endif
-
-	return 0;
-}
+¸I´I´I¸I¸I´I´I´I´I´I¸I´IÔIÔIÔIÔIÒÓIGÔI=ÔI=ÔIüIäïIüIoJÃ§IÃ§I{§I{§IÃ§IÃ§I{§I{§I{§I{§I{§IÃ§I{§IˆËIeIeIárIárIeIeIárIárIárIárIárIeIárIí¿I¨I¨IÑ§IÑ§I¨I¨IÑ§IÑ§IÑ§IÑ§IÑ§I¨IÑ§I!ËIIIksIksIIIksIksIksIksIksIIksI†¿I­ÃI­ÃIÀIÀI­ÃI­ÃIÀIÀIÀIÀIÀI­ÃIÀI?àIWÃIWÃI_¿I_¿IWÃIWÃI_¿I_¿I_¿I_¿I_¿IWÃI_¿IşßIÚIÚIúHúHÚIÚIúHúHúHúHúHÚIúHÑ”IúHúHúHúHúHúHúHÑ”IúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHúHIÚÜIúHúHúHúHúHúHúHúHÚIúHÚIİ6Iİ6I~ûH~ûHİ6Iİ6I~ûH~ûH~ûH~ûH~ûHİ6I~ûHášIüHüH~ûH~ûHüHüH~ûH~ûH~ûH~ûH~ûHüH~ûHE,IêûHêûH‰ûH‰ûHêûHêûH‰ûH‰ûH‰ûH‰ûH‰ûHêûH‰ûH,I#6I#6IIIII#6I#6IIIIIIIIIII#6III£I*€I*€IæIæI*€I*€IæIæIæIæIæI*€IæI˜ÁIMIMIOAIOAIMIMIOAIOAIOAIOAIOAIMIOAIU­I+¶I+¶IçµIçµI+¶I+¶IçµIçµIçµIçµIçµI+¶IçµI–ÙIII‡I‡III‡I‡I‡I‡I‡II‡ID{I‡I‡IIIInØIØII‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡I‡III‡I‡I‡I‡I‡I‡I‡I‡II‡IIT¯IT¯IT¯I¬I–J¡ÅI¡ÅI’«I’«I’«I¯¨I§ÙIqÂIqÂIğ±Iğ±Iğ±IÌ¬I|JªÅIªÅIÑ½IÑ½IÑ½IÊ¹IœJSÌISÌIgÌIgÌIgÌIF‰IëJšóIšóI`‘I`‘I‘I‘I`‘I`‘I‘I‘I‘I‘I‘I`‘I‘I‹ÃI;_I;_I+QI+QI;_I;_I+QI+QI+QI+QI+QI;_I+QIğ®IW´IW´Iÿ°Iÿ°IW´IW´Iÿ°Iÿ°Iÿ°Iÿ°Iÿ°IW´Iÿ°IdÏIîJîJ÷|J÷|JîJîJ÷|J÷|J÷|J÷|J÷|JîJ÷|JÃ„J÷|J÷|J÷|J÷|J÷|J÷|J÷|JÃ„J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|JD‚JO‡J÷|J÷|J÷|J÷|J÷|J÷|J÷|J÷|JîJ÷|JîJM‚JM‚J´}J´}JM‚JM‚J´}J´}J´}J´}J´}JM‚J´}J×ƒJG~JG~J°}J°}JG~JG~J°}J°}J°}J°}J°}JG~J°}JĞJ~J~J·}J·}J~J~J·}J·}J·}J·}J·}J~J·}JªJ~‚J~‚J:‚J:‚J~‚J~‚J:‚J:‚J:‚J:‚J:‚J~‚J:‚J’ƒJòËJòËJòËJÃšJ0òJAÖJAÖJõÃJõÃJ®ÃJ®ÃJõÃJõÃJ®ÃJ®ÃJ®ÃJ®ÃJ®ÃJõÃJ®ÃJX×JfºJfºJ“·J“·JfºJfºJ“·J“·J“·J“·J“·JfºJ“·J_ĞJAÍJAÍJAÍJ†ªJğñJ×J×J%ÕJ%ÕJ%ÕJŒÔJKëJˆâJˆâJİÑJİÑJ:ĞJ:ĞJİÑJİÑJ:ĞJ:ĞJ:ĞJ:ĞJ:ĞJİÑJ:ĞJpäJÿãJÿãJÿãJòãJ,äJ"äJ"äJ
+­J
+­J,›J,›J,›J,›J,›J
+­J,›J,›J,›JåĞJ¢ĞJ¢ĞJ,›J,›J,›J,›J,›J,›J
+­J,›J,›J,›J,›JïµJ,›J,›J,›J,›J,›J,›JÖÌJ,›JÿĞJ,›J,›J,›J,›J,›JÖÌJ,›J,›JÂÌJ,›Jk±JïµJ›JÒÛJ,›J,›J,›Jd¯Jd¯JcäJcäJcäJcäJcäJd¯JcäJcäJcäJÏàJµ×Jµ×JcäJcäJcäJcäJcäJcäJd¯JcäJcäJcäJcäJÛ¸JcäJcäJcäJcäJcäJcäJvçJcäJZäJcäJcäJcäJcäJcäJvçJcäJcäJYÎJcäJZ³JÛ¸J²JTäJcäJcäJcäJÒ²J«šJ«šJÒ²J«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ°ÓJ«šJpâJ/àJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJ«šJå²Jº§Jì¦Jì¦JRœJRœJì¦Jì¦JRœJRœJRœJRœJRœJì¦JRœJ¹JRœJRœJRœJRœJRœJRœJRœJ¹JRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJRœJ§J¯ßJRœJRœJRœJRœJRœJRœJRœJRœJì¦JRœJì¦J”J”J†ŸJ†ŸJ”J”J†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ”J†ŸJ8¶J†ŸJ†ŸJ”J”J”JÇŞJ¡ŞJ”J†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ”J”J†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ†ŸJ”J†ŸJ”JFÆJFÆJFÆJ½œJTìJƒĞJƒĞJŠÀJŠÀJŠÀJá J¨İJÈÏJÈÏJİÆJİÆJİÆJvJ]ìJCÑJCÑJ©ÌJ©Ì

@@ -1,15 +1,4 @@
-
-obj-$(CONFIG_IBM_ASM) := ibmasm.o
-
-ibmasm-y :=	module.o      \
-		ibmasmfs.o    \
-		event.o       \
-		command.o     \
-		remote.o      \
-		heartbeat.o   \
-		r_heartbeat.o \
-		dot_command.o \
-		lowlevel.o
-
-ibmasm-$(CONFIG_SERIAL_8250) += uart.o
-
+efine PB0_RX_LANE0_SCI_STAT_OVRD_REG0__ENABLEFOM_0__SHIFT 0x7
+#define PB0_RX_LANE0_SCI_STAT_OVRD_REG0__REQUESTFOM_0_MASK 0x100
+#define PB0_RX_LANE0_SCI_STAT_OVRD_REG0__REQUESTFOM_0__SHIFT 0x8
+#define PB0_RX_LANE0_SCI_STAT_OVRD_REG0__RESPONSEMOD

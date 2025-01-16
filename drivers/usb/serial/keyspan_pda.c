@@ -1,826 +1,332 @@
-/*
- * USB Keyspan PDA / Xircom / Entrega Converter driver
- *
- * Copyright (C) 1999 - 2001 Greg Kroah-Hartman	<greg@kroah.com>
- * Copyright (C) 1999, 2000 Brian Warner	<warner@lothar.com>
- * Copyright (C) 2000 Al Borchers		<borchers@steinerpoint.com>
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License as published by
- *	the Free Software Foundation; either version 2 of the License, or
- *	(at your option) any later version.
- *
- * See Documentation/usb/usb-serial.txt for more information on using this
- * driver
- */
-
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/spinlock.h>
-#include <linux/workqueue.h>
-#include <linux/uaccess.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-#include <linux/usb/ezusb.h>
-
-/* make a simple define to handle if we are compiling keyspan_pda or xircom support */
-#if defined(CONFIG_USB_SERIAL_KEYSPAN_PDA) || defined(CONFIG_USB_SERIAL_KEYSPAN_PDA_MODULE)
-	#define KEYSPAN
-#else
-	#undef KEYSPAN
-#endif
-#if defined(CONFIG_USB_SERIAL_XIRCOM) || defined(CONFIG_USB_SERIAL_XIRCOM_MODULE)
-	#define XIRCOM
-#else
-	#undef XIRCOM
-#endif
-
-#define DRIVER_AUTHOR "Brian Warner <warner@lothar.com>"
-#define DRIVER_DESC "USB Keyspan PDA Converter driver"
-
-#define KEYSPAN_TX_THRESHOLD	16
-
-struct keyspan_pda_private {
-	int			tx_room;
-	int			tx_throttled;
-	struct work_struct	unthrottle_work;
-	struct usb_serial	*serial;
-	struct usb_serial_port	*port;
-};
-
-
-#define KEYSPAN_VENDOR_ID		0x06cd
-#define KEYSPAN_PDA_FAKE_ID		0x0103
-#define KEYSPAN_PDA_ID			0x0104 /* no clue */
-
-/* For Xircom PGSDB9 and older Entrega version of the same device */
-#define XIRCOM_VENDOR_ID		0x085a
-#define XIRCOM_FAKE_ID			0x8027
-#define XIRCOM_FAKE_ID_2		0x8025 /* "PGMFHUB" serial */
-#define ENTREGA_VENDOR_ID		0x1645
-#define ENTREGA_FAKE_ID			0x8093
-
-static const struct usb_device_id id_table_combined[] = {
-#ifdef KEYSPAN
-	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_FAKE_ID) },
-#endif
-#ifdef XIRCOM
-	{ USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID) },
-	{ USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID_2) },
-	{ USB_DEVICE(ENTREGA_VENDOR_ID, ENTREGA_FAKE_ID) },
-#endif
-	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_ID) },
-	{ }						/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, id_table_combined);
-
-static const struct usb_device_id id_table_std[] = {
-	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_ID) },
-	{ }						/* Terminating entry */
-};
-
-#ifdef KEYSPAN
-static const struct usb_device_id id_table_fake[] = {
-	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_FAKE_ID) },
-	{ }						/* Terminating entry */
-};
-#endif
-
-#ifdef XIRCOM
-static const struct usb_device_id id_table_fake_xircom[] = {
-	{ USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID) },
-	{ USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID_2) },
-	{ USB_DEVICE(ENTREGA_VENDOR_ID, ENTREGA_FAKE_ID) },
-	{ }
-};
-#endif
-
-static void keyspan_pda_request_unthrottle(struct work_struct *work)
-{
-	struct keyspan_pda_private *priv =
-		container_of(work, struct keyspan_pda_private, unthrottle_work);
-	struct usb_serial *serial = priv->serial;
-	int result;
-
-	/* ask the device to tell us when the tx buffer becomes
-	   sufficiently empty */
-	result = usb_control_msg(serial->dev,
-				 usb_sndctrlpipe(serial->dev, 0),
-				 7, /* request_unthrottle */
-				 USB_TYPE_VENDOR | USB_RECIP_INTERFACE
-				 | USB_DIR_OUT,
-				 KEYSPAN_TX_THRESHOLD,
-				 0, /* index */
-				 NULL,
-				 0,
-				 2000);
-	if (result < 0)
-		dev_dbg(&serial->dev->dev, "%s - error %d from usb_control_msg\n",
-			__func__, result);
-}
-
-
-static void keyspan_pda_rx_interrupt(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	unsigned char *data = urb->transfer_buffer;
-	unsigned int len = urb->actual_length;
-	int retval;
-	int status = urb->status;
-	struct keyspan_pda_private *priv;
-	unsigned long flags;
-
-	priv = usb_get_serial_port_data(port);
-
-	switch (status) {
-	case 0:
-		/* success */
-		break;
-	case -ECONNRESET:
-	case -ENOENT:
-	case -ESHUTDOWN:
-		/* this urb is terminated, clean up */
-		dev_dbg(&urb->dev->dev, "%s - urb shutting down with status: %d\n", __func__, status);
-		return;
-	default:
-		dev_dbg(&urb->dev->dev, "%s - nonzero urb status received: %d\n", __func__, status);
-		goto exit;
-	}
-
-	if (len < 1) {
-		dev_warn(&port->dev, "short message received\n");
-		goto exit;
-	}
-
-	/* see if the message is data or a status interrupt */
-	switch (data[0]) {
-	case 0:
-		 /* rest of message is rx data */
-		if (len < 2)
-			break;
-		tty_insert_flip_string(&port->port, data + 1, len - 1);
-		tty_flip_buffer_push(&port->port);
-		break;
-	case 1:
-		/* status interrupt */
-		if (len < 2) {
-			dev_warn(&port->dev, "short interrupt message received\n");
-			break;
-		}
-		dev_dbg(&port->dev, "rx int, d1=%d\n", data[1]);
-		switch (data[1]) {
-		case 1: /* modemline change */
-			break;
-		case 2: /* tx unthrottle interrupt */
-			spin_lock_irqsave(&port->lock, flags);
-			priv->tx_throttled = 0;
-			priv->tx_room = max(priv->tx_room, KEYSPAN_TX_THRESHOLD);
-			spin_unlock_irqrestore(&port->lock, flags);
-			/* queue up a wakeup at scheduler time */
-			usb_serial_port_softint(port);
-			break;
-		default:
-			break;
-		}
-		break;
-	default:
-		break;
-	}
-
-exit:
-	retval = usb_submit_urb(urb, GFP_ATOMIC);
-	if (retval)
-		dev_err(&port->dev,
-			"%s - usb_submit_urb failed with result %d\n",
-			__func__, retval);
-}
-
-
-static void keyspan_pda_rx_throttle(struct tty_struct *tty)
-{
-	/* stop receiving characters. We just turn off the URB request, and
-	   let chars pile up in the device. If we're doing hardware
-	   flowcontrol, the device will signal the other end when its buffer
-	   fills up. If we're doing XON/XOFF, this would be a good time to
-	   send an XOFF, although it might make sense to foist that off
-	   upon the device too. */
-	struct usb_serial_port *port = tty->driver_data;
-
-	usb_kill_urb(port->interrupt_in_urb);
-}
-
-
-static void keyspan_pda_rx_unthrottle(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	/* just restart the receive interrupt URB */
-
-	if (usb_submit_urb(port->interrupt_in_urb, GFP_KERNEL))
-		dev_dbg(&port->dev, "usb_submit_urb(read urb) failed\n");
-}
-
-
-static speed_t keyspan_pda_setbaud(struct usb_serial *serial, speed_t baud)
-{
-	int rc;
-	int bindex;
-
-	switch (baud) {
-	case 110:
-		bindex = 0;
-		break;
-	case 300:
-		bindex = 1;
-		break;
-	case 1200:
-		bindex = 2;
-		break;
-	case 2400:
-		bindex = 3;
-		break;
-	case 4800:
-		bindex = 4;
-		break;
-	case 9600:
-		bindex = 5;
-		break;
-	case 19200:
-		bindex = 6;
-		break;
-	case 38400:
-		bindex = 7;
-		break;
-	case 57600:
-		bindex = 8;
-		break;
-	case 115200:
-		bindex = 9;
-		break;
-	default:
-		bindex = 5;	/* Default to 9600 */
-		baud = 9600;
-	}
-
-	/* rather than figure out how to sleep while waiting for this
-	   to complete, I just use the "legacy" API. */
-	rc = usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0),
-			     0, /* set baud */
-			     USB_TYPE_VENDOR
-			     | USB_RECIP_INTERFACE
-			     | USB_DIR_OUT, /* type */
-			     bindex, /* value */
-			     0, /* index */
-			     NULL, /* &data */
-			     0, /* size */
-			     2000); /* timeout */
-	if (rc < 0)
-		return 0;
-	return baud;
-}
-
-
-static void keyspan_pda_break_ctl(struct tty_struct *tty, int break_state)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct usb_serial *serial = port->serial;
-	int value;
-	int result;
-
-	if (break_state == -1)
-		value = 1; /* start break */
-	else
-		value = 0; /* clear break */
-	result = usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0),
-			4, /* set break */
-			USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
-			value, 0, NULL, 0, 2000);
-	if (result < 0)
-		dev_dbg(&port->dev, "%s - error %d from usb_control_msg\n",
-			__func__, result);
-	/* there is something funky about this.. the TCSBRK that 'cu' performs
-	   ought to translate into a break_ctl(-1),break_ctl(0) pair HZ/4
-	   seconds apart, but it feels like the break sent isn't as long as it
-	   is on /dev/ttyS0 */
-}
-
-
-static void keyspan_pda_set_termios(struct tty_struct *tty,
-		struct usb_serial_port *port, struct ktermios *old_termios)
-{
-	struct usb_serial *serial = port->serial;
-	speed_t speed;
-
-	/* cflag specifies lots of stuff: number of stop bits, parity, number
-	   of data bits, baud. What can the device actually handle?:
-	   CSTOPB (1 stop bit or 2)
-	   PARENB (parity)
-	   CSIZE (5bit .. 8bit)
-	   There is minimal hw support for parity (a PSW bit seems to hold the
-	   parity of whatever is in the accumulator). The UART either deals
-	   with 10 bits (start, 8 data, stop) or 11 bits (start, 8 data,
-	   1 special, stop). So, with firmware changes, we could do:
-	   8N1: 10 bit
-	   8N2: 11 bit, extra bit always (mark?)
-	   8[EOMS]1: 11 bit, extra bit is parity
-	   7[EOMS]1: 10 bit, b0/b7 is parity
-	   7[EOMS]2: 11 bit, b0/b7 is parity, extra bit always (mark?)
-
-	   HW flow control is dictated by the tty->termios.c_cflags & CRTSCTS
-	   bit.
-
-	   For now, just do baud. */
-
-	speed = tty_get_baud_rate(tty);
-	speed = keyspan_pda_setbaud(serial, speed);
-
-	if (speed == 0) {
-		dev_dbg(&port->dev, "can't handle requested baud rate\n");
-		/* It hasn't changed so.. */
-		speed = tty_termios_baud_rate(old_termios);
-	}
-	/* Only speed can change so copy the old h/w parameters
-	   then encode the new speed */
-	tty_termios_copy_hw(&tty->termios, old_termios);
-	tty_encode_baud_rate(tty, speed, speed);
-}
-
-
-/* modem control pins: DTR and RTS are outputs and can be controlled.
-   DCD, RI, DSR, CTS are inputs and can be read. All outputs can also be
-   read. The byte passed is: DTR(b7) DCD RI DSR CTS RTS(b2) unused unused */
-
-static int keyspan_pda_get_modem_info(struct usb_serial *serial,
-				      unsigned char *value)
-{
-	int rc;
-	u8 *data;
-
-	data = kmalloc(1, GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-
-	rc = usb_control_msg(serial->dev, usb_rcvctrlpipe(serial->dev, 0),
-			     3, /* get pins */
-			     USB_TYPE_VENDOR|USB_RECIP_INTERFACE|USB_DIR_IN,
-			     0, 0, data, 1, 2000);
-	if (rc == 1)
-		*value = *data;
-	else if (rc >= 0)
-		rc = -EIO;
-
-	kfree(data);
-	return rc;
-}
-
-
-static int keyspan_pda_set_modem_info(struct usb_serial *serial,
-				      unsigned char value)
-{
-	int rc;
-	rc = usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0),
-			     3, /* set pins */
-			     USB_TYPE_VENDOR|USB_RECIP_INTERFACE|USB_DIR_OUT,
-			     value, 0, NULL, 0, 2000);
-	return rc;
-}
-
-static int keyspan_pda_tiocmget(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct usb_serial *serial = port->serial;
-	int rc;
-	unsigned char status;
-	int value;
-
-	rc = keyspan_pda_get_modem_info(serial, &status);
-	if (rc < 0)
-		return rc;
-	value =
-		((status & (1<<7)) ? TIOCM_DTR : 0) |
-		((status & (1<<6)) ? TIOCM_CAR : 0) |
-		((status & (1<<5)) ? TIOCM_RNG : 0) |
-		((status & (1<<4)) ? TIOCM_DSR : 0) |
-		((status & (1<<3)) ? TIOCM_CTS : 0) |
-		((status & (1<<2)) ? TIOCM_RTS : 0);
-	return value;
-}
-
-static int keyspan_pda_tiocmset(struct tty_struct *tty,
-				unsigned int set, unsigned int clear)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct usb_serial *serial = port->serial;
-	int rc;
-	unsigned char status;
-
-	rc = keyspan_pda_get_modem_info(serial, &status);
-	if (rc < 0)
-		return rc;
-
-	if (set & TIOCM_RTS)
-		status |= (1<<2);
-	if (set & TIOCM_DTR)
-		status |= (1<<7);
-
-	if (clear & TIOCM_RTS)
-		status &= ~(1<<2);
-	if (clear & TIOCM_DTR)
-		status &= ~(1<<7);
-	rc = keyspan_pda_set_modem_info(serial, status);
-	return rc;
-}
-
-static int keyspan_pda_write(struct tty_struct *tty,
-	struct usb_serial_port *port, const unsigned char *buf, int count)
-{
-	struct usb_serial *serial = port->serial;
-	int request_unthrottle = 0;
-	int rc = 0;
-	struct keyspan_pda_private *priv;
-	unsigned long flags;
-
-	priv = usb_get_serial_port_data(port);
-	/* guess how much room is left in the device's ring buffer, and if we
-	   want to send more than that, check first, updating our notion of
-	   what is left. If our write will result in no room left, ask the
-	   device to give us an interrupt when the room available rises above
-	   a threshold, and hold off all writers (eventually, those using
-	   select() or poll() too) until we receive that unthrottle interrupt.
-	   Block if we can't write anything at all, otherwise write as much as
-	   we can. */
-	if (count == 0) {
-		dev_dbg(&port->dev, "write request of 0 bytes\n");
-		return 0;
-	}
-
-	/* we might block because of:
-	   the TX urb is in-flight (wait until it completes)
-	   the device is full (wait until it says there is room)
-	*/
-	spin_lock_irqsave(&port->lock, flags);
-	if (!test_bit(0, &port->write_urbs_free) || priv->tx_throttled) {
-		spin_unlock_irqrestore(&port->lock, flags);
-		return 0;
-	}
-	clear_bit(0, &port->write_urbs_free);
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	/* At this point the URB is in our control, nobody else can submit it
-	   again (the only sudden transition was the one from EINPROGRESS to
-	   finished).  Also, the tx process is not throttled. So we are
-	   ready to write. */
-
-	count = (count > port->bulk_out_size) ? port->bulk_out_size : count;
-
-	/* Check if we might overrun the Tx buffer.   If so, ask the
-	   device how much room it really has.  This is done only on
-	   scheduler time, since usb_control_msg() sleeps. */
-	if (count > priv->tx_room && !in_interrupt()) {
-		u8 *room;
-
-		room = kmalloc(1, GFP_KERNEL);
-		if (!room) {
-			rc = -ENOMEM;
-			goto exit;
-		}
-
-		rc = usb_control_msg(serial->dev,
-				     usb_rcvctrlpipe(serial->dev, 0),
-				     6, /* write_room */
-				     USB_TYPE_VENDOR | USB_RECIP_INTERFACE
-				     | USB_DIR_IN,
-				     0, /* value: 0 means "remaining room" */
-				     0, /* index */
-				     room,
-				     1,
-				     2000);
-		if (rc > 0) {
-			dev_dbg(&port->dev, "roomquery says %d\n", *room);
-			priv->tx_room = *room;
-		}
-		kfree(room);
-		if (rc < 0) {
-			dev_dbg(&port->dev, "roomquery failed\n");
-			goto exit;
-		}
-		if (rc == 0) {
-			dev_dbg(&port->dev, "roomquery returned 0 bytes\n");
-			rc = -EIO; /* device didn't return any data */
-			goto exit;
-		}
-	}
-
-	if (count >= priv->tx_room) {
-		/* we're about to completely fill the Tx buffer, so
-		   we'll be throttled afterwards. */
-		count = priv->tx_room;
-		request_unthrottle = 1;
-	}
-
-	if (count) {
-		/* now transfer data */
-		memcpy(port->write_urb->transfer_buffer, buf, count);
-		/* send the data out the bulk port */
-		port->write_urb->transfer_buffer_length = count;
-
-		priv->tx_room -= count;
-
-		rc = usb_submit_urb(port->write_urb, GFP_ATOMIC);
-		if (rc) {
-			dev_dbg(&port->dev, "usb_submit_urb(write bulk) failed\n");
-			goto exit;
-		}
-	} else {
-		/* There wasn't any room left, so we are throttled until
-		   the buffer empties a bit */
-		request_unthrottle = 1;
-	}
-
-	if (request_unthrottle) {
-		priv->tx_throttled = 1; /* block writers */
-		schedule_work(&priv->unthrottle_work);
-	}
-
-	rc = count;
-exit:
-	if (rc <= 0)
-		set_bit(0, &port->write_urbs_free);
-	return rc;
-}
-
-
-static void keyspan_pda_write_bulk_callback(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-
-	set_bit(0, &port->write_urbs_free);
-
-	/* queue up a wakeup at scheduler time */
-	usb_serial_port_softint(port);
-}
-
-
-static int keyspan_pda_write_room(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct keyspan_pda_private *priv = usb_get_serial_port_data(port);
-	unsigned long flags;
-	int room = 0;
-
-	spin_lock_irqsave(&port->lock, flags);
-	if (test_bit(0, &port->write_urbs_free) && !priv->tx_throttled)
-		room = priv->tx_room;
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	return room;
-}
-
-static int keyspan_pda_chars_in_buffer(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct keyspan_pda_private *priv;
-	unsigned long flags;
-	int ret = 0;
-
-	priv = usb_get_serial_port_data(port);
-
-	/* when throttled, return at least WAKEUP_CHARS to tell select() (via
-	   n_tty.c:normal_poll() ) that we're not writeable. */
-
-	spin_lock_irqsave(&port->lock, flags);
-	if (!test_bit(0, &port->write_urbs_free) || priv->tx_throttled)
-		ret = 256;
-	spin_unlock_irqrestore(&port->lock, flags);
-	return ret;
-}
-
-
-static void keyspan_pda_dtr_rts(struct usb_serial_port *port, int on)
-{
-	struct usb_serial *serial = port->serial;
-
-	if (on)
-		keyspan_pda_set_modem_info(serial, (1 << 7) | (1 << 2));
-	else
-		keyspan_pda_set_modem_info(serial, 0);
-}
-
-
-static int keyspan_pda_open(struct tty_struct *tty,
-					struct usb_serial_port *port)
-{
-	struct usb_serial *serial = port->serial;
-	u8 *room;
-	int rc = 0;
-	struct keyspan_pda_private *priv;
-
-	/* find out how much room is in the Tx ring */
-	room = kmalloc(1, GFP_KERNEL);
-	if (!room)
-		return -ENOMEM;
-
-	rc = usb_control_msg(serial->dev, usb_rcvctrlpipe(serial->dev, 0),
-			     6, /* write_room */
-			     USB_TYPE_VENDOR | USB_RECIP_INTERFACE
-			     | USB_DIR_IN,
-			     0, /* value */
-			     0, /* index */
-			     room,
-			     1,
-			     2000);
-	if (rc < 0) {
-		dev_dbg(&port->dev, "%s - roomquery failed\n", __func__);
-		goto error;
-	}
-	if (rc == 0) {
-		dev_dbg(&port->dev, "%s - roomquery returned 0 bytes\n", __func__);
-		rc = -EIO;
-		goto error;
-	}
-	priv = usb_get_serial_port_data(port);
-	priv->tx_room = *room;
-	priv->tx_throttled = *room ? 0 : 1;
-
-	/*Start reading from the device*/
-	rc = usb_submit_urb(port->interrupt_in_urb, GFP_KERNEL);
-	if (rc) {
-		dev_dbg(&port->dev, "%s - usb_submit_urb(read int) failed\n", __func__);
-		goto error;
-	}
-error:
-	kfree(room);
-	return rc;
-}
-static void keyspan_pda_close(struct usb_serial_port *port)
-{
-	struct keyspan_pda_private *priv = usb_get_serial_port_data(port);
-
-	usb_kill_urb(port->write_urb);
-	usb_kill_urb(port->interrupt_in_urb);
-
-	cancel_work_sync(&priv->unthrottle_work);
-}
-
-
-/* download the firmware to a "fake" device (pre-renumeration) */
-static int keyspan_pda_fake_startup(struct usb_serial *serial)
-{
-	int response;
-	const char *fw_name;
-
-	/* download the firmware here ... */
-	response = ezusb_fx1_set_reset(serial->dev, 1);
-
-	if (0) { ; }
-#ifdef KEYSPAN
-	else if (le16_to_cpu(serial->dev->descriptor.idVendor) == KEYSPAN_VENDOR_ID)
-		fw_name = "keyspan_pda/keyspan_pda.fw";
-#endif
-#ifdef XIRCOM
-	else if ((le16_to_cpu(serial->dev->descriptor.idVendor) == XIRCOM_VENDOR_ID) ||
-		 (le16_to_cpu(serial->dev->descriptor.idVendor) == ENTREGA_VENDOR_ID))
-		fw_name = "keyspan_pda/xircom_pgs.fw";
-#endif
-	else {
-		dev_err(&serial->dev->dev, "%s: unknown vendor, aborting.\n",
-			__func__);
-		return -ENODEV;
-	}
-
-	if (ezusb_fx1_ihex_firmware_download(serial->dev, fw_name) < 0) {
-		dev_err(&serial->dev->dev, "failed to load firmware \"%s\"\n",
-			fw_name);
-		return -ENOENT;
-	}
-
-	/* after downloading firmware Renumeration will occur in a
-	  moment and the new device will bind to the real driver */
-
-	/* we want this device to fail to have a driver assigned to it. */
-	return 1;
-}
-
-#ifdef KEYSPAN
-MODULE_FIRMWARE("keyspan_pda/keyspan_pda.fw");
-#endif
-#ifdef XIRCOM
-MODULE_FIRMWARE("keyspan_pda/xircom_pgs.fw");
-#endif
-
-static int keyspan_pda_attach(struct usb_serial *serial)
-{
-	unsigned char num_ports = serial->num_ports;
-
-	if (serial->num_bulk_out < num_ports ||
-			serial->num_interrupt_in < num_ports) {
-		dev_err(&serial->interface->dev, "missing endpoints\n");
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-static int keyspan_pda_port_probe(struct usb_serial_port *port)
-{
-
-	struct keyspan_pda_private *priv;
-
-	priv = kmalloc(sizeof(struct keyspan_pda_private), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	INIT_WORK(&priv->unthrottle_work, keyspan_pda_request_unthrottle);
-	priv->serial = port->serial;
-	priv->port = port;
-
-	usb_set_serial_port_data(port, priv);
-
-	return 0;
-}
-
-static int keyspan_pda_port_remove(struct usb_serial_port *port)
-{
-	struct keyspan_pda_private *priv;
-
-	priv = usb_get_serial_port_data(port);
-	kfree(priv);
-
-	return 0;
-}
-
-#ifdef KEYSPAN
-static struct usb_serial_driver keyspan_pda_fake_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"keyspan_pda_pre",
-	},
-	.description =		"Keyspan PDA - (prerenumeration)",
-	.id_table =		id_table_fake,
-	.num_ports =		1,
-	.attach =		keyspan_pda_fake_startup,
-};
-#endif
-
-#ifdef XIRCOM
-static struct usb_serial_driver xircom_pgs_fake_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"xircom_no_firm",
-	},
-	.description =		"Xircom / Entrega PGS - (prerenumeration)",
-	.id_table =		id_table_fake_xircom,
-	.num_ports =		1,
-	.attach =		keyspan_pda_fake_startup,
-};
-#endif
-
-static struct usb_serial_driver keyspan_pda_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"keyspan_pda",
-	},
-	.description =		"Keyspan PDA",
-	.id_table =		id_table_std,
-	.num_ports =		1,
-	.dtr_rts =		keyspan_pda_dtr_rts,
-	.open =			keyspan_pda_open,
-	.close =		keyspan_pda_close,
-	.write =		keyspan_pda_write,
-	.write_room =		keyspan_pda_write_room,
-	.write_bulk_callback = 	keyspan_pda_write_bulk_callback,
-	.read_int_callback =	keyspan_pda_rx_interrupt,
-	.chars_in_buffer =	keyspan_pda_chars_in_buffer,
-	.throttle =		keyspan_pda_rx_throttle,
-	.unthrottle =		keyspan_pda_rx_unthrottle,
-	.set_termios =		keyspan_pda_set_termios,
-	.break_ctl =		keyspan_pda_break_ctl,
-	.tiocmget =		keyspan_pda_tiocmget,
-	.tiocmset =		keyspan_pda_tiocmset,
-	.attach =		keyspan_pda_attach,
-	.port_probe =		keyspan_pda_port_probe,
-	.port_remove =		keyspan_pda_port_remove,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&keyspan_pda_device,
-#ifdef KEYSPAN
-	&keyspan_pda_fake_device,
-#endif
-#ifdef XIRCOM
-	&xircom_pgs_fake_device,
-#endif
-	NULL
-};
-
-module_usb_serial_driver(serial_drivers, id_table_combined);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+_MC_BLOCK_ALL_1__SHIFT 0x0
+#define D2F4_PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0_MASK 0xffffffff
+#define D2F4_PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0__SHIFT 0x0
+#define D2F4_PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1_MASK 0xffffffff
+#define D2F4_PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1__SHIFT 0x0
+#define D2F4_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_SIZE_MASK 0x3f
+#define D2F4_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_SIZE__SHIFT 0x0
+#define D2F4_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_BAR_0_MASK 0xffffffc0
+#define D2F4_PCIE_MC_OVERLAY_BAR0__MC_OVERLAY_BAR_0__SHIFT 0x6
+#define D2F4_PCIE_MC_OVERLAY_BAR1__MC_OVERLAY_BAR_1_MASK 0xffffffff
+#define D2F4_PCIE_MC_OVERLAY_BAR1__MC_OVERLAY_BAR_1__SHIFT 0x0
+#define D2F5_PCIE_PORT_INDEX__PCIE_INDEX_MASK 0xff
+#define D2F5_PCIE_PORT_INDEX__PCIE_INDEX__SHIFT 0x0
+#define D2F5_PCIE_PORT_DATA__PCIE_DATA_MASK 0xffffffff
+#define D2F5_PCIE_PORT_DATA__PCIE_DATA__SHIFT 0x0
+#define D2F5_PCIEP_RESERVED__PCIEP_RESERVED_MASK 0xffffffff
+#define D2F5_PCIEP_RESERVED__PCIEP_RESERVED__SHIFT 0x0
+#define D2F5_PCIEP_SCRATCH__PCIEP_SCRATCH_MASK 0xffffffff
+#define D2F5_PCIEP_SCRATCH__PCIEP_SCRATCH__SHIFT 0x0
+#define D2F5_PCIEP_HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define D2F5_PCIEP_HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define D2F5_PCIEP_HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define D2F5_PCIEP_HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define D2F5_PCIEP_HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define D2F5_PCIEP_HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define D2F5_PCIEP_HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define D2F5_PCIEP_HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define D2F5_PCIEP_HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define D2F5_PCIEP_HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define D2F5_PCIEP_HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define D2F5_PCIEP_HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define D2F5_PCIEP_HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define D2F5_PCIEP_HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define D2F5_PCIEP_HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define D2F5_PCIEP_HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define D2F5_PCIEP_HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define D2F5_PCIEP_HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define D2F5_PCIEP_HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define D2F5_PCIEP_HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define D2F5_PCIEP_HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define D2F5_PCIEP_HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define D2F5_PCIEP_HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define D2F5_PCIEP_HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define D2F5_PCIEP_HW_DEBUG__HW_12_DEBUG_MASK 0x1000
+#define D2F5_PCIEP_HW_DEBUG__HW_12_DEBUG__SHIFT 0xc
+#define D2F5_PCIEP_HW_DEBUG__HW_13_DEBUG_MASK 0x2000
+#define D2F5_PCIEP_HW_DEBUG__HW_13_DEBUG__SHIFT 0xd
+#define D2F5_PCIEP_HW_DEBUG__HW_14_DEBUG_MASK 0x4000
+#define D2F5_PCIEP_HW_DEBUG__HW_14_DEBUG__SHIFT 0xe
+#define D2F5_PCIEP_HW_DEBUG__HW_15_DEBUG_MASK 0x8000
+#define D2F5_PCIEP_HW_DEBUG__HW_15_DEBUG__SHIFT 0xf
+#define D2F5_PCIEP_PORT_CNTL__SLV_PORT_REQ_EN_MASK 0x1
+#define D2F5_PCIEP_PORT_CNTL__SLV_PORT_REQ_EN__SHIFT 0x0
+#define D2F5_PCIEP_PORT_CNTL__CI_SNOOP_OVERRIDE_MASK 0x2
+#define D2F5_PCIEP_PORT_CNTL__CI_SNOOP_OVERRIDE__SHIFT 0x1
+#define D2F5_PCIEP_PORT_CNTL__HOTPLUG_MSG_EN_MASK 0x4
+#define D2F5_PCIEP_PORT_CNTL__HOTPLUG_MSG_EN__SHIFT 0x2
+#define D2F5_PCIEP_PORT_CNTL__NATIVE_PME_EN_MASK 0x8
+#define D2F5_PCIEP_PORT_CNTL__NATIVE_PME_EN__SHIFT 0x3
+#define D2F5_PCIEP_PORT_CNTL__PWR_FAULT_EN_MASK 0x10
+#define D2F5_PCIEP_PORT_CNTL__PWR_FAULT_EN__SHIFT 0x4
+#define D2F5_PCIEP_PORT_CNTL__PMI_BM_DIS_MASK 0x20
+#define D2F5_PCIEP_PORT_CNTL__PMI_BM_DIS__SHIFT 0x5
+#define D2F5_PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE_MASK 0x40
+#define D2F5_PCIEP_PORT_CNTL__SEQNUM_DEBUG_MODE__SHIFT 0x6
+#define D2F5_PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S_MASK 0x7f00
+#define D2F5_PCIEP_PORT_CNTL__CI_SLV_CPL_STATIC_ALLOC_LIMIT_S__SHIFT 0x8
+#define D2F5_PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE_MASK 0x30000
+#define D2F5_PCIEP_PORT_CNTL__CI_MAX_CPL_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define D2F5_PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE_MASK 0x1c0000
+#define D2F5_PCIEP_PORT_CNTL__CI_PRIV_MAX_CPL_PAYLOAD_SIZE__SHIFT 0x12
+#define D2F5_PCIE_TX_CNTL__TX_SNR_OVERRIDE_MASK 0xc00
+#define D2F5_PCIE_TX_CNTL__TX_SNR_OVERRIDE__SHIFT 0xa
+#define D2F5_PCIE_TX_CNTL__TX_RO_OVERRIDE_MASK 0x3000
+#define D2F5_PCIE_TX_CNTL__TX_RO_OVERRIDE__SHIFT 0xc
+#define D2F5_PCIE_TX_CNTL__TX_PACK_PACKET_DIS_MASK 0x4000
+#define D2F5_PCIE_TX_CNTL__TX_PACK_PACKET_DIS__SHIFT 0xe
+#define D2F5_PCIE_TX_CNTL__TX_FLUSH_TLP_DIS_MASK 0x8000
+#define D2F5_PCIE_TX_CNTL__TX_FLUSH_TLP_DIS__SHIFT 0xf
+#define D2F5_PCIE_TX_CNTL__TX_CPL_PASS_P_MASK 0x100000
+#define D2F5_PCIE_TX_CNTL__TX_CPL_PASS_P__SHIFT 0x14
+#define D2F5_PCIE_TX_CNTL__TX_NP_PASS_P_MASK 0x200000
+#define D2F5_PCIE_TX_CNTL__TX_NP_PASS_P__SHIFT 0x15
+#define D2F5_PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS_MASK 0x400000
+#define D2F5_PCIE_TX_CNTL__TX_CLEAR_EXTRA_PM_REQS__SHIFT 0x16
+#define D2F5_PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS_MASK 0x800000
+#define D2F5_PCIE_TX_CNTL__TX_FC_UPDATE_TIMEOUT_DIS__SHIFT 0x17
+#define D2F5_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION_MASK 0x7
+#define D2F5_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_FUNCTION__SHIFT 0x0
+#define D2F5_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE_MASK 0xf8
+#define D2F5_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_DEVICE__SHIFT 0x3
+#define D2F5_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS_MASK 0xff00
+#define D2F5_PCIE_TX_REQUESTER_ID__TX_REQUESTER_ID_BUS__SHIFT 0x8
+#define D2F5_PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA_MASK 0xffffff
+#define D2F5_PCIE_TX_VENDOR_SPECIFIC__TX_VENDOR_DATA__SHIFT 0x0
+#define D2F5_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_MASK 0x3f000000
+#define D2F5_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP__SHIFT 0x18
+#define D2F5_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN_MASK 0x40000000
+#define D2F5_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_VC1_EN__SHIFT 0x1e
+#define D2F5_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN_MASK 0x80000000
+#define D2F5_PCIE_TX_REQUEST_NUM_CNTL__TX_NUM_OUTSTANDING_NP_EN__SHIFT 0x1f
+#define D2F5_PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ_MASK 0xfff
+#define D2F5_PCIE_TX_SEQ__TX_NEXT_TRANSMIT_SEQ__SHIFT 0x0
+#define D2F5_PCIE_TX_SEQ__TX_ACKD_SEQ_MASK 0xfff0000
+#define D2F5_PCIE_TX_SEQ__TX_ACKD_SEQ__SHIFT 0x10
+#define D2F5_PCIE_TX_REPLAY__TX_REPLAY_NUM_MASK 0x7
+#define D2F5_PCIE_TX_REPLAY__TX_REPLAY_NUM__SHIFT 0x0
+#define D2F5_PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE_MASK 0x8000
+#define D2F5_PCIE_TX_REPLAY__TX_REPLAY_TIMER_OVERWRITE__SHIFT 0xf
+#define D2F5_PCIE_TX_REPLAY__TX_REPLAY_TIMER_MASK 0xffff0000
+#define D2F5_PCIE_TX_REPLAY__TX_REPLAY_TIMER__SHIFT 0x10
+#define D2F5_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_MASK 0xfff
+#define D2F5_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT__SHIFT 0x0
+#define D2F5_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE_MASK 0x1000
+#define D2F5_PCIE_TX_ACK_LATENCY_LIMIT__TX_ACK_LATENCY_LIMIT_OVERWRITE__SHIFT 0xc
+#define D2F5_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD_MASK 0xfff
+#define D2F5_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PD__SHIFT 0x0
+#define D2F5_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH_MASK 0xff0000
+#define D2F5_PCIE_TX_CREDITS_ADVT_P__TX_CREDITS_ADVT_PH__SHIFT 0x10
+#define D2F5_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD_MASK 0xfff
+#define D2F5_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPD__SHIFT 0x0
+#define D2F5_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPH_MASK 0xff0000
+#define D2F5_PCIE_TX_CREDITS_ADVT_NP__TX_CREDITS_ADVT_NPH__SHIFT 0x10
+#define D2F5_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLD_MASK 0xfff
+#define D2F5_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLD__SHIFT 0x0
+#define D2F5_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLH_MASK 0xff0000
+#define D2F5_PCIE_TX_CREDITS_ADVT_CPL__TX_CREDITS_ADVT_CPLH__SHIFT 0x10
+#define D2F5_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PD_MASK 0xfff
+#define D2F5_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PD__SHIFT 0x0
+#define D2F5_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PH_MASK 0xff0000
+#define D2F5_PCIE_TX_CREDITS_INIT_P__TX_CREDITS_INIT_PH__SHIFT 0x10
+#define D2F5_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPD_MASK 0xfff
+#define D2F5_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPD__SHIFT 0x0
+#define D2F5_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPH_MASK 0xff0000
+#define D2F5_PCIE_TX_CREDITS_INIT_NP__TX_CREDITS_INIT_NPH__SHIFT 0x10
+#define D2F5_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLD_MASK 0xfff
+#define D2F5_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLD__SHIFT 0x0
+#define D2F5_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLH_MASK 0xff0000
+#define D2F5_PCIE_TX_CREDITS_INIT_CPL__TX_CREDITS_INIT_CPLH__SHIFT 0x10
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD_MASK 0x1
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PD__SHIFT 0x0
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH_MASK 0x2
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_PH__SHIFT 0x1
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD_MASK 0x4
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPD__SHIFT 0x2
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH_MASK 0x8
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_NPH__SHIFT 0x3
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD_MASK 0x10
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLD__SHIFT 0x4
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH_MASK 0x20
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_ERR_CPLH__SHIFT 0x5
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD_MASK 0x10000
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PD__SHIFT 0x10
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH_MASK 0x20000
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_PH__SHIFT 0x11
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD_MASK 0x40000
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPD__SHIFT 0x12
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH_MASK 0x80000
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_NPH__SHIFT 0x13
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD_MASK 0x100000
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLD__SHIFT 0x14
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH_MASK 0x200000
+#define D2F5_PCIE_TX_CREDITS_STATUS__TX_CREDITS_CUR_STATUS_CPLH__SHIFT 0x15
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0_MASK 0x7
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC0__SHIFT 0x0
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0_MASK 0x70
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC0__SHIFT 0x4
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0_MASK 0x700
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC0__SHIFT 0x8
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1_MASK 0x70000
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_P_VC1__SHIFT 0x10
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1_MASK 0x700000
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1__SHIFT 0x14
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1_MASK 0x7000000
+#define D2F5_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1__SHIFT 0x18
+#define D2F5_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL_MASK 0x1
+#define D2F5_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL__SHIFT 0x0
+#define D2F5_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH_MASK 0x7e
+#define D2F5_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH__SHIFT 0x1
+#define D2F5_PCIE_FC_P__PD_CREDITS_MASK 0xff
+#define D2F5_PCIE_FC_P__PD_CREDITS__SHIFT 0x0
+#define D2F5_PCIE_FC_P__PH_CREDITS_MASK 0xff00
+#define D2F5_PCIE_FC_P__PH_CREDITS__SHIFT 0x8
+#define D2F5_PCIE_FC_NP__NPD_CREDITS_MASK 0xff
+#define D2F5_PCIE_FC_NP__NPD_CREDITS__SHIFT 0x0
+#define D2F5_PCIE_FC_NP__NPH_CREDITS_MASK 0xff00
+#define D2F5_PCIE_FC_NP__NPH_CREDITS__SHIFT 0x8
+#define D2F5_PCIE_FC_CPL__CPLD_CREDITS_MASK 0xff
+#define D2F5_PCIE_FC_CPL__CPLD_CREDITS__SHIFT 0x0
+#define D2F5_PCIE_FC_CPL__CPLH_CREDITS_MASK 0xff00
+#define D2F5_PCIE_FC_CPL__CPLH_CREDITS__SHIFT 0x8
+#define D2F5_PCIE_ERR_CNTL__ERR_REPORTING_DIS_MASK 0x1
+#define D2F5_PCIE_ERR_CNTL__ERR_REPORTING_DIS__SHIFT 0x0
+#define D2F5_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG_MASK 0x2
+#define D2F5_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG__SHIFT 0x1
+#define D2F5_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES_MASK 0x4
+#define D2F5_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES__SHIFT 0x2
+#define D2F5_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR_MASK 0x10
+#define D2F5_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR__SHIFT 0x4
+#define D2F5_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR_MASK 0x20
+#define D2F5_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR__SHIFT 0x5
+#define D2F5_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR_MASK 0x40
+#define D2F5_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR__SHIFT 0x6
+#define D2F5_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR_MASK 0x80
+#define D2F5_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR__SHIFT 0x7
+#define D2F5_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT_MASK 0x700
+#define D2F5_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT__SHIFT 0x8
+#define D2F5_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED_MASK 0x800
+#define D2F5_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED__SHIFT 0xb
+#define D2F5_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS_MASK 0x4000
+#define D2F5_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS__SHIFT 0xe
+#define D2F5_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS_MASK 0x8000
+#define D2F5_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS__SHIFT 0xf
+#define D2F5_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET_MASK 0x10000
+#define D2F5_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET__SHIFT 0x10
+#define D2F5_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY_MASK 0x20000
+#define D2F5_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY__SHIFT 0x11
+#define D2F5_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL_MASK 0x40000
+#define D2F5_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL__SHIFT 0x12
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_IO_ERR_MASK 0x1
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_IO_ERR__SHIFT 0x0
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_BE_ERR_MASK 0x2
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_BE_ERR__SHIFT 0x1
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR_MASK 0x4
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR__SHIFT 0x2
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR_MASK 0x8
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR__SHIFT 0x3
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR_MASK 0x10
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR__SHIFT 0x4
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR_MASK 0x20
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR__SHIFT 0x5
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_EP_ERR_MASK 0x40
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_EP_ERR__SHIFT 0x6
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR_MASK 0x80
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR__SHIFT 0x7
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR_MASK 0x100
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR__SHIFT 0x8
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_TC_ERR_MASK 0x200
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_TC_ERR__SHIFT 0x9
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CFG_UR_MASK 0x400
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CFG_UR__SHIFT 0xa
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_IO_UR_MASK 0x800
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_IO_UR__SHIFT 0xb
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_AT_ERR_MASK 0x1000
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_AT_ERR__SHIFT 0xc
+#define D2F5_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL_MASK 0x2000
+#define D2F5_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL__SHIFT 0xd
+#define D2F5_PCIE_RX_CNTL__RX_GEN_ONE_NAK_MASK 0x4000
+#define D2F5_PCIE_RX_CNTL__RX_GEN_ONE_NAK__SHIFT 0xe
+#define D2F5_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG_MASK 0x8000
+#define D2F5_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG__SHIFT 0xf
+#define D2F5_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MASK 0x70000
+#define D2F5_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT__SHIFT 0x10
+#define D2F5_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE_MASK 0x80000
+#define D2F5_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE__SHIFT 0x13
+#define D2F5_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS_MASK 0x100000
+#define D2F5_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS__SHIFT 0x14
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR_MASK 0x200000
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR__SHIFT 0x15
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR_MASK 0x400000
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR__SHIFT 0x16
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR_MASK 0x800000
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR__SHIFT 0x17
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR_MASK 0x1000000
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR__SHIFT 0x18
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR_MASK 0x2000000
+#define D2F5_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR__SHIFT 0x19
+#define D2F5_PCIE_RX_CNTL__RX_TPH_DIS_MASK 0x4000000
+#define D2F5_PCIE_RX_CNTL__RX_TPH_DIS__SHIFT 0x1a
+#define D2F5_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS_MASK 0x8000000
+#define D2F5_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS__SHIFT 0x1b
+#define D2F5_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM_MASK 0xfff
+#define D2F5_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM__SHIFT 0x0
+#define D2F5_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA_MASK 0xffffff
+#define D2F5_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA__SHIFT 0x0
+#define D2F5_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS_MASK 0x1000000
+#define D2F5_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS__SHIFT 0x18
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR_MASK 0x1
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR__SHIFT 0x0
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR_MASK 0x2
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR__SHIFT 0x1
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR_MASK 0x4
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR__SHIFT 0x2
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR_MASK 0x8
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR__SHIFT 0x3
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR_MASK 0x10
+#define D2F5_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR__SHIFT 0x4
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD_MASK 0xfff
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD__SHIFT 0x0
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH_MASK 0xff0000
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH__SHIFT 0x10
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD_MASK 0xfff
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD__SHIFT 0x0
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH_MASK 0xff0000
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH__SHIFT 0x10
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD_MASK 0xfff
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD__SHIFT 0x0
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH_MASK 0xff0000
+#define D2F5_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH__SHIFT 0x10
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR_MASK 0x3
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR__SHIFT 0x0
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR_MASK 0xc
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR__SHIFT 0x2
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP_MASK 0x30
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP__SHIFT 0x4
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP_MASK 0xc0
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP__SHIFT 0x6
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW_MASK 0x300
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW__SHIFT 0x8
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW_MASK 0xc00
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW__SHIFT 0xa
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR_MASK 0x3000
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR__SHIFT 0xc
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR_MASK 0xc000
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR__SHIFT 0xe
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR_MASK 0x30000
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR__SHIFT 0x10
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR_MASK 0xc0000
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR__SHIFT 0x12
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER_MASK 0x300000
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER__SHIFT 0x14
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER_MASK 0xc00000
+#define D2F5_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER__SHIFT 0x16
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR_MASK 0x3
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR__SHIFT 0x0
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER_MASK 0xc
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER__SHIFT 0x2
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP_MASK 0x30
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP__SHIFT 0x4
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP_MASK 0xc0
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP__SHIFT 0x6
+#define D2F5_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_

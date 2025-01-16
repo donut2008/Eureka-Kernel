@@ -1,11 +1,7 @@
-#
-# Makefile for the tablet drivers
-#
-
-
-obj-$(CONFIG_TABLET_USB_ACECAD)	+= acecad.o
-obj-$(CONFIG_TABLET_USB_AIPTEK)	+= aiptek.o
-obj-$(CONFIG_TABLET_USB_GTCO)	+= gtco.o
-obj-$(CONFIG_TABLET_USB_HANWANG) += hanwang.o
-obj-$(CONFIG_TABLET_USB_KBTAB)	+= kbtab.o
-obj-$(CONFIG_TABLET_SERIAL_WACOM4) += wacom_serial4.o
+ pcur, "threshold_frmr",
+				(u64)rsrc_stats->frmr);
+	pcur += ocrdma_add_stat(stats, pcur, "threshold_prefetch_qps",
+				(u64)rsrc_stats->prefetch_qps);
+	pcur += ocrdma_add_stat(stats, pcur, "threshold_ondemand_qps",
+				(u64)rsrc_stats->ondemand_qps);
+	pcur += ocrdma_add_stat(stats, pcur, "threshold_phy_mr",

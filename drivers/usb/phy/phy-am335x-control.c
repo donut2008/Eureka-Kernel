@@ -1,186 +1,51 @@
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/err.h>
-#include <linux/of.h>
-#include <linux/io.h>
-#include <linux/delay.h>
-#include "am35x-phy-control.h"
-
-struct am335x_control_usb {
-	struct device *dev;
-	void __iomem *phy_reg;
-	void __iomem *wkup;
-	spinlock_t lock;
-	struct phy_control phy_ctrl;
-};
-
-#define AM335X_USB0_CTRL		0x0
-#define AM335X_USB1_CTRL		0x8
-#define AM335x_USB_WKUP			0x0
-
-#define USBPHY_CM_PWRDN		(1 << 0)
-#define USBPHY_OTG_PWRDN	(1 << 1)
-#define USBPHY_OTGVDET_EN	(1 << 19)
-#define USBPHY_OTGSESSEND_EN	(1 << 20)
-
-#define AM335X_PHY0_WK_EN	(1 << 0)
-#define AM335X_PHY1_WK_EN	(1 << 8)
-
-static void am335x_phy_wkup(struct  phy_control *phy_ctrl, u32 id, bool on)
-{
-	struct am335x_control_usb *usb_ctrl;
-	u32 val;
-	u32 reg;
-
-	usb_ctrl = container_of(phy_ctrl, struct am335x_control_usb, phy_ctrl);
-
-	switch (id) {
-	case 0:
-		reg = AM335X_PHY0_WK_EN;
-		break;
-	case 1:
-		reg = AM335X_PHY1_WK_EN;
-		break;
-	default:
-		WARN_ON(1);
-		return;
-	}
-
-	spin_lock(&usb_ctrl->lock);
-	val = readl(usb_ctrl->wkup);
-
-	if (on)
-		val |= reg;
-	else
-		val &= ~reg;
-
-	writel(val, usb_ctrl->wkup);
-	spin_unlock(&usb_ctrl->lock);
-}
-
-static void am335x_phy_power(struct phy_control *phy_ctrl, u32 id, bool on)
-{
-	struct am335x_control_usb *usb_ctrl;
-	u32 val;
-	u32 reg;
-
-	usb_ctrl = container_of(phy_ctrl, struct am335x_control_usb, phy_ctrl);
-
-	switch (id) {
-	case 0:
-		reg = AM335X_USB0_CTRL;
-		break;
-	case 1:
-		reg = AM335X_USB1_CTRL;
-		break;
-	default:
-		WARN_ON(1);
-		return;
-	}
-
-	val = readl(usb_ctrl->phy_reg + reg);
-	if (on) {
-		val &= ~(USBPHY_CM_PWRDN | USBPHY_OTG_PWRDN);
-		val |= USBPHY_OTGVDET_EN | USBPHY_OTGSESSEND_EN;
-	} else {
-		val |= USBPHY_CM_PWRDN | USBPHY_OTG_PWRDN;
-	}
-
-	writel(val, usb_ctrl->phy_reg + reg);
-
-	/*
-	 * Give the PHY ~1ms to complete the power up operation.
-	 * Tests have shown unstable behaviour if other USB PHY related
-	 * registers are written too shortly after such a transition.
-	 */
-	if (on)
-		mdelay(1);
-}
-
-static const struct phy_control ctrl_am335x = {
-	.phy_power = am335x_phy_power,
-	.phy_wkup = am335x_phy_wkup,
-};
-
-static const struct of_device_id omap_control_usb_id_table[] = {
-	{ .compatible = "ti,am335x-usb-ctrl-module", .data = &ctrl_am335x },
-	{}
-};
-MODULE_DEVICE_TABLE(of, omap_control_usb_id_table);
-
-static struct platform_driver am335x_control_driver;
-static int match(struct device *dev, void *data)
-{
-	struct device_node *node = (struct device_node *)data;
-	return dev->of_node == node &&
-		dev->driver == &am335x_control_driver.driver;
-}
-
-struct phy_control *am335x_get_phy_control(struct device *dev)
-{
-	struct device_node *node;
-	struct am335x_control_usb *ctrl_usb;
-
-	node = of_parse_phandle(dev->of_node, "ti,ctrl_mod", 0);
-	if (!node)
-		return NULL;
-
-	dev = bus_find_device(&platform_bus_type, NULL, node, match);
-	of_node_put(node);
-	if (!dev)
-		return NULL;
-
-	ctrl_usb = dev_get_drvdata(dev);
-	put_device(dev);
-	if (!ctrl_usb)
-		return NULL;
-	return &ctrl_usb->phy_ctrl;
-}
-EXPORT_SYMBOL_GPL(am335x_get_phy_control);
-
-static int am335x_control_usb_probe(struct platform_device *pdev)
-{
-	struct resource	*res;
-	struct am335x_control_usb *ctrl_usb;
-	const struct of_device_id *of_id;
-	const struct phy_control *phy_ctrl;
-
-	of_id = of_match_node(omap_control_usb_id_table, pdev->dev.of_node);
-	if (!of_id)
-		return -EINVAL;
-
-	phy_ctrl = of_id->data;
-
-	ctrl_usb = devm_kzalloc(&pdev->dev, sizeof(*ctrl_usb), GFP_KERNEL);
-	if (!ctrl_usb)
-		return -ENOMEM;
-
-	ctrl_usb->dev = &pdev->dev;
-
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "phy_ctrl");
-	ctrl_usb->phy_reg = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(ctrl_usb->phy_reg))
-		return PTR_ERR(ctrl_usb->phy_reg);
-
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wakeup");
-	ctrl_usb->wkup = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(ctrl_usb->wkup))
-		return PTR_ERR(ctrl_usb->wkup);
-
-	spin_lock_init(&ctrl_usb->lock);
-	ctrl_usb->phy_ctrl = *phy_ctrl;
-
-	dev_set_drvdata(ctrl_usb->dev, ctrl_usb);
-	return 0;
-}
-
-static struct platform_driver am335x_control_driver = {
-	.probe		= am335x_control_usb_probe,
-	.driver		= {
-		.name	= "am335x-control-usb",
-		.of_match_table = omap_control_usb_id_table,
-	},
-};
-
-module_platform_driver(am335x_control_driver);
-MODULE_LICENSE("GPL v2");
+ine AZALIA_F0_CODEC_CONVERTER_CONTROL_CONVERTER_FORMAT__STREAM_TYPE__SHIFT 0xf
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_CHANNEL_STREAM_ID__CHANNEL_ID_MASK 0xf
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_CHANNEL_STREAM_ID__CHANNEL_ID__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_CHANNEL_STREAM_ID__STREAM_ID_MASK 0xf0
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_CHANNEL_STREAM_ID__STREAM_ID__SHIFT 0x4
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__DIGEN_MASK 0x1
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__DIGEN__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__V_MASK 0x2
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__V__SHIFT 0x1
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__VCFG_MASK 0x4
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__VCFG__SHIFT 0x2
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__PRE_MASK 0x8
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__PRE__SHIFT 0x3
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__COPY_MASK 0x10
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__COPY__SHIFT 0x4
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__NON_AUDIO_MASK 0x20
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__NON_AUDIO__SHIFT 0x5
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__PRO_MASK 0x40
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__PRO__SHIFT 0x6
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__L_MASK 0x80
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__L__SHIFT 0x7
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__CC_MASK 0x7f00
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__CC__SHIFT 0x8
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__KEEPALIVE_MASK 0x800000
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_DIGITAL_CONVERTER__KEEPALIVE__SHIFT 0x17
+#define AZALIA_F0_CODEC_CONVERTER_PARAMETER_STREAM_FORMATS__STREAM_FORMATS_MASK 0xffffffff
+#define AZALIA_F0_CODEC_CONVERTER_PARAMETER_STREAM_FORMATS__STREAM_FORMATS__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_RATE_CAPABILITIES_MASK 0xfff
+#define AZALIA_F0_CODEC_CONVERTER_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_RATE_CAPABILITIES__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_BIT_CAPABILITIES_MASK 0x1f0000
+#define AZALIA_F0_CODEC_CONVERTER_PARAMETER_SUPPORTED_SIZE_RATES__AUDIO_BIT_CAPABILITIES__SHIFT 0x10
+#define AZALIA_F0_CODEC_CONVERTER_STRIPE_CONTROL__STRIPE_CONTROL_MASK 0x3
+#define AZALIA_F0_CODEC_CONVERTER_STRIPE_CONTROL__STRIPE_CONTROL__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_STRIPE_CONTROL__STRIPE_CAPABILITY_MASK 0x700000
+#define AZALIA_F0_CODEC_CONVERTER_STRIPE_CONTROL__STRIPE_CAPABILITY__SHIFT 0x14
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_RAMP_RATE__RAMP_RATE_MASK 0xff
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_RAMP_RATE__RAMP_RATE__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_EMBEDDING__PRESENTATION_TIME_EMBEDDING_ENABLE_MASK 0x1
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_EMBEDDING__PRESENTATION_TIME_EMBEDDING_ENABLE__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_EMBEDDING__PRESENTATION_TIME_OFFSET_CHANGED_MASK 0x2
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_EMBEDDING__PRESENTATION_TIME_OFFSET_CHANGED__SHIFT 0x1
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_EMBEDDING__CLEAR_GTC_COUNTER_MIN_MAX_DELTA_MASK 0x4
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_EMBEDDING__CLEAR_GTC_COUNTER_MIN_MAX_DELTA__SHIFT 0x2
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_EMBEDDING__PRESENTATION_TIME_EMBEDDING_GROUP_MASK 0x70
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_EMBEDDING__PRESENTATION_TIME_EMBEDDING_GROUP__SHIFT 0x4
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_OFFSET_DEBUG__PRESENTATION_TIME_OFFSET_DEBUG_MASK 0xffffffff
+#define AZALIA_F0_CODEC_CONVERTER_CONTROL_GTC_OFFSET_DEBUG__PRESENTATION_TIME_OFFSET_DEBUG__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_GTC_COUNTER_DELTA__GTC_COUNTER_DELTA_MASK 0xffffffff
+#define AZALIA_F0_CODEC_CONVERTER_GTC_COUNTER_DELTA__GTC_COUNTER_DELTA__SHIFT 0x0
+#define AZALIA_F0_CODEC_CONVERTER_GTC_COUNTER_DELTA_MIN__GTC_COUNTER_DELTA_MIN_MASK 0xffffffff
+#defi

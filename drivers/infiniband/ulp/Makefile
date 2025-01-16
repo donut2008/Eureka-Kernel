@@ -1,5 +1,3 @@
-obj-$(CONFIG_INFINIBAND_IPOIB)		+= ipoib/
-obj-$(CONFIG_INFINIBAND_SRP)		+= srp/
-obj-$(CONFIG_INFINIBAND_SRPT)		+= srpt/
-obj-$(CONFIG_INFINIBAND_ISER)		+= iser/
-obj-$(CONFIG_INFINIBAND_ISERT)		+= isert/
+ST_FILTER_CNTL                                          0x1a99
+#define mmDCP1_CUR_REQUEST_FILTER_CNTL                                          0x1c99
+#define mmDCP2_CUR_REQUEST_FILTER_CNTL              

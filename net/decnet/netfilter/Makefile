@@ -1,6 +1,1 @@
-#
-# Makefile for DECnet netfilter modules
-#
-
-obj-$(CONFIG_DECNET_NF_GRABULATOR) += dn_rtmsg.o
-
+έªΤH	έªΤ4	έªΐΧH	έªΐΧ4	κύH	κύ4	κύX	κύΩ#	Ε^ή=έªΩ©X	Ε^ή=έªΩ©Ω#	"aζC_H	

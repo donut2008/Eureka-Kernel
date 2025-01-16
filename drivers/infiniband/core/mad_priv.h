@@ -1,225 +1,72 @@
-/*
- * Copyright (c) 2004, 2005, Voltaire, Inc. All rights reserved.
- * Copyright (c) 2005 Intel Corporation. All rights reserved.
- * Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
- * Copyright (c) 2009 HNR Consulting. All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-#ifndef __IB_MAD_PRIV_H__
-#define __IB_MAD_PRIV_H__
-
-#include <linux/completion.h>
-#include <linux/err.h>
-#include <linux/workqueue.h>
-#include <rdma/ib_mad.h>
-#include <rdma/ib_smi.h>
-#include <rdma/opa_smi.h>
-
-#define IB_MAD_QPS_CORE		2 /* Always QP0 and QP1 as a minimum */
-
-/* QP and CQ parameters */
-#define IB_MAD_QP_SEND_SIZE	128
-#define IB_MAD_QP_RECV_SIZE	512
-#define IB_MAD_QP_MIN_SIZE	64
-#define IB_MAD_QP_MAX_SIZE	8192
-#define IB_MAD_SEND_REQ_MAX_SG	2
-#define IB_MAD_RECV_REQ_MAX_SG	1
-
-#define IB_MAD_SEND_Q_PSN	0
-
-/* Registration table sizes */
-#define MAX_MGMT_CLASS		80
-#define MAX_MGMT_VERSION	0x83
-#define MAX_MGMT_OUI		8
-#define MAX_MGMT_VENDOR_RANGE2	(IB_MGMT_CLASS_VENDOR_RANGE2_END - \
-				IB_MGMT_CLASS_VENDOR_RANGE2_START + 1)
-
-struct ib_mad_list_head {
-	struct list_head list;
-	struct ib_mad_queue *mad_queue;
-};
-
-struct ib_mad_private_header {
-	struct ib_mad_list_head mad_list;
-	struct ib_mad_recv_wc recv_wc;
-	struct ib_wc wc;
-	u64 mapping;
-} __attribute__ ((packed));
-
-struct ib_mad_private {
-	struct ib_mad_private_header header;
-	size_t mad_size;
-	struct ib_grh grh;
-	u8 mad[0];
-} __attribute__ ((packed));
-
-struct ib_rmpp_segment {
-	struct list_head list;
-	u32 num;
-	u8 data[0];
-};
-
-struct ib_mad_agent_private {
-	struct list_head agent_list;
-	struct ib_mad_agent agent;
-	struct ib_mad_reg_req *reg_req;
-	struct ib_mad_qp_info *qp_info;
-
-	spinlock_t lock;
-	struct list_head send_list;
-	struct list_head wait_list;
-	struct list_head done_list;
-	struct delayed_work timed_work;
-	unsigned long timeout;
-	struct list_head local_list;
-	struct work_struct local_work;
-	struct list_head rmpp_list;
-
-	atomic_t refcount;
-	struct completion comp;
-};
-
-struct ib_mad_snoop_private {
-	struct ib_mad_agent agent;
-	struct ib_mad_qp_info *qp_info;
-	int snoop_index;
-	int mad_snoop_flags;
-	atomic_t refcount;
-	struct completion comp;
-};
-
-struct ib_mad_send_wr_private {
-	struct ib_mad_list_head mad_list;
-	struct list_head agent_list;
-	struct ib_mad_agent_private *mad_agent_priv;
-	struct ib_mad_send_buf send_buf;
-	u64 header_mapping;
-	u64 payload_mapping;
-	struct ib_ud_wr send_wr;
-	struct ib_sge sg_list[IB_MAD_SEND_REQ_MAX_SG];
-	__be64 tid;
-	unsigned long timeout;
-	int max_retries;
-	int retries_left;
-	int retry;
-	int refcount;
-	enum ib_wc_status status;
-
-	/* RMPP control */
-	struct list_head rmpp_list;
-	struct ib_rmpp_segment *last_ack_seg;
-	struct ib_rmpp_segment *cur_seg;
-	int last_ack;
-	int seg_num;
-	int newwin;
-	int pad;
-};
-
-struct ib_mad_local_private {
-	struct list_head completion_list;
-	struct ib_mad_private *mad_priv;
-	struct ib_mad_agent_private *recv_mad_agent;
-	struct ib_mad_send_wr_private *mad_send_wr;
-	size_t return_wc_byte_len;
-};
-
-struct ib_mad_mgmt_method_table {
-	struct ib_mad_agent_private *agent[IB_MGMT_MAX_METHODS];
-};
-
-struct ib_mad_mgmt_class_table {
-	struct ib_mad_mgmt_method_table *method_table[MAX_MGMT_CLASS];
-};
-
-struct ib_mad_mgmt_vendor_class {
-	u8	oui[MAX_MGMT_OUI][3];
-	struct ib_mad_mgmt_method_table *method_table[MAX_MGMT_OUI];
-};
-
-struct ib_mad_mgmt_vendor_class_table {
-	struct ib_mad_mgmt_vendor_class *vendor_class[MAX_MGMT_VENDOR_RANGE2];
-};
-
-struct ib_mad_mgmt_version_table {
-	struct ib_mad_mgmt_class_table *class;
-	struct ib_mad_mgmt_vendor_class_table *vendor;
-};
-
-struct ib_mad_queue {
-	spinlock_t lock;
-	struct list_head list;
-	int count;
-	int max_active;
-	struct ib_mad_qp_info *qp_info;
-};
-
-struct ib_mad_qp_info {
-	struct ib_mad_port_private *port_priv;
-	struct ib_qp *qp;
-	struct ib_mad_queue send_queue;
-	struct ib_mad_queue recv_queue;
-	struct list_head overflow_list;
-	spinlock_t snoop_lock;
-	struct ib_mad_snoop_private **snoop_table;
-	int snoop_table_size;
-	atomic_t snoop_count;
-};
-
-struct ib_mad_port_private {
-	struct list_head port_list;
-	struct ib_device *device;
-	int port_num;
-	struct ib_cq *cq;
-	struct ib_pd *pd;
-
-	spinlock_t reg_lock;
-	struct ib_mad_mgmt_version_table version[MAX_MGMT_VERSION];
-	struct list_head agent_list;
-	struct workqueue_struct *wq;
-	struct work_struct work;
-	struct ib_mad_qp_info qp_info[IB_MAD_QPS_CORE];
-};
-
-int ib_send_mad(struct ib_mad_send_wr_private *mad_send_wr);
-
-struct ib_mad_send_wr_private *
-ib_find_send_mad(const struct ib_mad_agent_private *mad_agent_priv,
-		 const struct ib_mad_recv_wc *mad_recv_wc);
-
-void ib_mad_complete_send_wr(struct ib_mad_send_wr_private *mad_send_wr,
-			     struct ib_mad_send_wc *mad_send_wc);
-
-void ib_mark_mad_done(struct ib_mad_send_wr_private *mad_send_wr);
-
-void ib_reset_mad_timeout(struct ib_mad_send_wr_private *mad_send_wr,
-			  int timeout_ms);
-
-#endif	/* __IB_MAD_PRIV_H__ */
+ee
+#define mmFMT4_FMT_CONTROL                                                      0x43ee
+#define mmFMT5_FMT_CONTROL                                                      0x45ee
+#define mmFMT_BIT_DEPTH_CONTROL                                                 0x1bf2
+#define mmFMT0_FMT_BIT_DEPTH_CONTROL                                            0x1bf2
+#define mmFMT1_FMT_BIT_DEPTH_CONTROL                                            0x1df2
+#define mmFMT2_FMT_BIT_DEPTH_CONTROL                                            0x1ff2
+#define mmFMT3_FMT_BIT_DEPTH_CONTROL                                            0x41f2
+#define mmFMT4_FMT_BIT_DEPTH_CONTROL                                            0x43f2
+#define mmFMT5_FMT_BIT_DEPTH_CONTROL                                            0x45f2
+#define mmFMT_DITHER_RAND_R_SEED                                                0x1bf3
+#define mmFMT0_FMT_DITHER_RAND_R_SEED                                           0x1bf3
+#define mmFMT1_FMT_DITHER_RAND_R_SEED                                           0x1df3
+#define mmFMT2_FMT_DITHER_RAND_R_SEED                                           0x1ff3
+#define mmFMT3_FMT_DITHER_RAND_R_SEED                                           0x41f3
+#define mmFMT4_FMT_DITHER_RAND_R_SEED                                           0x43f3
+#define mmFMT5_FMT_DITHER_RAND_R_SEED                                           0x45f3
+#define mmFMT_DITHER_RAND_G_SEED                                                0x1bf4
+#define mmFMT0_FMT_DITHER_RAND_G_SEED                                           0x1bf4
+#define mmFMT1_FMT_DITHER_RAND_G_SEED                                           0x1df4
+#define mmFMT2_FMT_DITHER_RAND_G_SEED                                           0x1ff4
+#define mmFMT3_FMT_DITHER_RAND_G_SEED                                           0x41f4
+#define mmFMT4_FMT_DITHER_RAND_G_SEED                                           0x43f4
+#define mmFMT5_FMT_DITHER_RAND_G_SEED                                           0x45f4
+#define mmFMT_DITHER_RAND_B_SEED                                                0x1bf5
+#define mmFMT0_FMT_DITHER_RAND_B_SEED                                           0x1bf5
+#define mmFMT1_FMT_DITHER_RAND_B_SEED                                           0x1df5
+#define mmFMT2_FMT_DITHER_RAND_B_SEED                                           0x1ff5
+#define mmFMT3_FMT_DITHER_RAND_B_SEED                                           0x41f5
+#define mmFMT4_FMT_DITHER_RAND_B_SEED                                           0x43f5
+#define mmFMT5_FMT_DITHER_RAND_B_SEED                                           0x45f5
+#define mmFMT_TEMPORAL_DITHER_PATTERN_CONTROL                                   0x1bf6
+#define mmFMT0_FMT_TEMPORAL_DITHER_PATTERN_CONTROL                              0x1bf6
+#define mmFMT1_FMT_TEMPORAL_DITHER_PATTERN_CONTROL                              0x1df6
+#define mmFMT2_FMT_TEMPORAL_DITHER_PATTERN_CONTROL                              0x1ff6
+#define mmFMT3_FMT_TEMPORAL_DITHER_PATTERN_CONTROL                              0x41f6
+#define mmFMT4_FMT_TEMPORAL_DITHER_PATTERN_CONTROL                              0x43f6
+#define mmFMT5_FMT_TEMPORAL_DITHER_PATTERN_CONTROL                              0x45f6
+#define mmFMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX                     0x1bf7
+#define mmFMT0_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX                0x1bf7
+#define mmFMT1_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX                0x1df7
+#define mmFMT2_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX                0x1ff7
+#define mmFMT3_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX                0x41f7
+#define mmFMT4_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX                0x43f7
+#define mmFMT5_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_S_MATRIX                0x45f7
+#define mmFMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX                     0x1bf8
+#define mmFMT0_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX                0x1bf8
+#define mmFMT1_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX                0x1df8
+#define mmFMT2_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX                0x1ff8
+#define mmFMT3_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX                0x41f8
+#define mmFMT4_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX                0x43f8
+#define mmFMT5_FMT_TEMPORAL_DITHER_PROGRAMMABLE_PATTERN_T_MATRIX                0x45f8
+#define mmFMT_CLAMP_CNTL                                                        0x1bf9
+#define mmFMT0_FMT_CLAMP_CNTL                                                   0x1bf9
+#define mmFMT1_FMT_CLAMP_CNTL                                                   0x1df9
+#define mmFMT2_FMT_CLAMP_CNTL                                                   0x1ff9
+#define mmFMT3_FMT_CLAMP_CNTL                                                   0x41f9
+#define mmFMT4_FMT_CLAMP_CNTL                                                   0x43f9
+#define mmFMT5_FMT_CLAMP_CNTL                                                   0x45f9
+#define mmFMT_CRC_CNTL                                                          0x1bfa
+#define mmFMT0_FMT_CRC_CNTL                                                     0x1bfa
+#define mmFMT1_FMT_CRC_CNTL                                                     0x1dfa
+#define mmFMT2_FMT_CRC_CNTL                                                     0x1ffa
+#define mmFMT3_FMT_CRC_CNTL                                                     0x41fa
+#define mmFMT4_FMT_CRC_CNTL                                                     0x43fa
+#define mmFMT5_FMT_CRC_CNTL                                                     0x45fa
+#define mmFMT_CRC_SIG_RED_GREEN_MASK                                            0x1bfb
+#define mmFMT0_FMT_CRC_SIG_RED_GREEN_MASK                                       0x1bfb
+#define mmFMT1_FMT_CRC_SIG_RED_GREEN_MASK                                       0x1dfb
+#define mmFMT2_FMT_CRC_SIG_RED_GREEN_MASK                                       0x1ffb
+#define mmFMT3_FMT_CRC_SIG_RED_GREEN_MASK                                       0x41fb
+#define mmFMT4_FMT_CRC_SIG_RED_GREEN_MASK                                      

@@ -1,1273 +1,1251 @@
-/*
- *  lis3lv02d.c - ST LIS3LV02DL accelerometer driver
- *
- *  Copyright (C) 2007-2008 Yan Burman
- *  Copyright (C) 2008 Eric Piel
- *  Copyright (C) 2008-2009 Pavel Machek
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation; either version 2 of the License, or
- *  (at your option) any later version.
- *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- */
-
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
-#include <linux/kernel.h>
-#include <linux/dmi.h>
-#include <linux/module.h>
-#include <linux/types.h>
-#include <linux/platform_device.h>
-#include <linux/interrupt.h>
-#include <linux/input-polldev.h>
-#include <linux/delay.h>
-#include <linux/wait.h>
-#include <linux/poll.h>
-#include <linux/slab.h>
-#include <linux/freezer.h>
-#include <linux/uaccess.h>
-#include <linux/miscdevice.h>
-#include <linux/pm_runtime.h>
-#include <linux/atomic.h>
-#include <linux/of_device.h>
-#include "lis3lv02d.h"
-
-#define DRIVER_NAME     "lis3lv02d"
-
-/* joystick device poll interval in milliseconds */
-#define MDPS_POLL_INTERVAL 50
-#define MDPS_POLL_MIN	   0
-#define MDPS_POLL_MAX	   2000
-
-#define LIS3_SYSFS_POWERDOWN_DELAY 5000 /* In milliseconds */
-
-#define SELFTEST_OK	       0
-#define SELFTEST_FAIL	       -1
-#define SELFTEST_IRQ	       -2
-
-#define IRQ_LINE0	       0
-#define IRQ_LINE1	       1
-
-/*
- * The sensor can also generate interrupts (DRDY) but it's pretty pointless
- * because they are generated even if the data do not change. So it's better
- * to keep the interrupt for the free-fall event. The values are updated at
- * 40Hz (at the lowest frequency), but as it can be pretty time consuming on
- * some low processor, we poll the sensor only at 20Hz... enough for the
- * joystick.
- */
-
-#define LIS3_PWRON_DELAY_WAI_12B	(5000)
-#define LIS3_PWRON_DELAY_WAI_8B		(3000)
-
-/*
- * LIS3LV02D spec says 1024 LSBs corresponds 1 G -> 1LSB is 1000/1024 mG
- * LIS302D spec says: 18 mG / digit
- * LIS3_ACCURACY is used to increase accuracy of the intermediate
- * calculation results.
- */
-#define LIS3_ACCURACY			1024
-/* Sensitivity values for -2G +2G scale */
-#define LIS3_SENSITIVITY_12B		((LIS3_ACCURACY * 1000) / 1024)
-#define LIS3_SENSITIVITY_8B		(18 * LIS3_ACCURACY)
-
-/*
- * LIS331DLH spec says 1LSBs corresponds 4G/4096 -> 1LSB is 1000/1024 mG.
- * Below macros defines sensitivity values for +/-2G. Dataout bits for
- * +/-2G range is 12 bits so 4 bits adjustment must be done to get 12bit
- * data from 16bit value. Currently this driver supports only 2G range.
- */
-#define LIS3DLH_SENSITIVITY_2G		((LIS3_ACCURACY * 1000) / 1024)
-#define SHIFT_ADJ_2G			4
-
-#define LIS3_DEFAULT_FUZZ_12B		3
-#define LIS3_DEFAULT_FLAT_12B		3
-#define LIS3_DEFAULT_FUZZ_8B		1
-#define LIS3_DEFAULT_FLAT_8B		1
-
-struct lis3lv02d lis3_dev = {
-	.misc_wait   = __WAIT_QUEUE_HEAD_INITIALIZER(lis3_dev.misc_wait),
-};
-EXPORT_SYMBOL_GPL(lis3_dev);
-
-/* just like param_set_int() but does sanity-check so that it won't point
- * over the axis array size
- */
-static int param_set_axis(const char *val, const struct kernel_param *kp)
-{
-	int ret = param_set_int(val, kp);
-	if (!ret) {
-		int val = *(int *)kp->arg;
-		if (val < 0)
-			val = -val;
-		if (!val || val > 3)
-			return -EINVAL;
-	}
-	return ret;
-}
-
-static const struct kernel_param_ops param_ops_axis = {
-	.set = param_set_axis,
-	.get = param_get_int,
-};
-
-#define param_check_axis(name, p) param_check_int(name, p)
-
-module_param_array_named(axes, lis3_dev.ac.as_array, axis, NULL, 0644);
-MODULE_PARM_DESC(axes, "Axis-mapping for x,y,z directions");
-
-static s16 lis3lv02d_read_8(struct lis3lv02d *lis3, int reg)
-{
-	s8 lo;
-	if (lis3->read(lis3, reg, &lo) < 0)
-		return 0;
-
-	return lo;
-}
-
-static s16 lis3lv02d_read_12(struct lis3lv02d *lis3, int reg)
-{
-	u8 lo, hi;
-
-	lis3->read(lis3, reg - 1, &lo);
-	lis3->read(lis3, reg, &hi);
-	/* In "12 bit right justified" mode, bit 6, bit 7, bit 8 = bit 5 */
-	return (s16)((hi << 8) | lo);
-}
-
-/* 12bits for 2G range, 13 bits for 4G range and 14 bits for 8G range */
-static s16 lis331dlh_read_data(struct lis3lv02d *lis3, int reg)
-{
-	u8 lo, hi;
-	int v;
-
-	lis3->read(lis3, reg - 1, &lo);
-	lis3->read(lis3, reg, &hi);
-	v = (int) ((hi << 8) | lo);
-
-	return (s16) v >> lis3->shift_adj;
-}
-
-/**
- * lis3lv02d_get_axis - For the given axis, give the value converted
- * @axis:      1,2,3 - can also be negative
- * @hw_values: raw values returned by the hardware
- *
- * Returns the converted value.
- */
-static inline int lis3lv02d_get_axis(s8 axis, int hw_values[3])
-{
-	if (axis > 0)
-		return hw_values[axis - 1];
-	else
-		return -hw_values[-axis - 1];
-}
-
-/**
- * lis3lv02d_get_xyz - Get X, Y and Z axis values from the accelerometer
- * @lis3: pointer to the device struct
- * @x:    where to store the X axis value
- * @y:    where to store the Y axis value
- * @z:    where to store the Z axis value
- *
- * Note that 40Hz input device can eat up about 10% CPU at 800MHZ
- */
-static void lis3lv02d_get_xyz(struct lis3lv02d *lis3, int *x, int *y, int *z)
-{
-	int position[3];
-	int i;
-
-	if (lis3->blkread) {
-		if (lis3->whoami == WAI_12B) {
-			u16 data[3];
-			lis3->blkread(lis3, OUTX_L, 6, (u8 *)data);
-			for (i = 0; i < 3; i++)
-				position[i] = (s16)le16_to_cpu(data[i]);
-		} else {
-			u8 data[5];
-			/* Data: x, dummy, y, dummy, z */
-			lis3->blkread(lis3, OUTX, 5, data);
-			for (i = 0; i < 3; i++)
-				position[i] = (s8)data[i * 2];
-		}
-	} else {
-		position[0] = lis3->read_data(lis3, OUTX);
-		position[1] = lis3->read_data(lis3, OUTY);
-		position[2] = lis3->read_data(lis3, OUTZ);
-	}
-
-	for (i = 0; i < 3; i++)
-		position[i] = (position[i] * lis3->scale) / LIS3_ACCURACY;
-
-	*x = lis3lv02d_get_axis(lis3->ac.x, position);
-	*y = lis3lv02d_get_axis(lis3->ac.y, position);
-	*z = lis3lv02d_get_axis(lis3->ac.z, position);
-}
-
-/* conversion btw sampling rate and the register values */
-static int lis3_12_rates[4] = {40, 160, 640, 2560};
-static int lis3_8_rates[2] = {100, 400};
-static int lis3_3dc_rates[16] = {0, 1, 10, 25, 50, 100, 200, 400, 1600, 5000};
-static int lis3_3dlh_rates[4] = {50, 100, 400, 1000};
-
-/* ODR is Output Data Rate */
-static int lis3lv02d_get_odr_index(struct lis3lv02d *lis3)
-{
-	u8 ctrl;
-	int shift;
-
-	lis3->read(lis3, CTRL_REG1, &ctrl);
-	ctrl &= lis3->odr_mask;
-	shift = ffs(lis3->odr_mask) - 1;
-	return (ctrl >> shift);
-}
-
-static int lis3lv02d_get_pwron_wait(struct lis3lv02d *lis3)
-{
-	int odr_idx = lis3lv02d_get_odr_index(lis3);
-	int div = lis3->odrs[odr_idx];
-
-	if (div == 0) {
-		if (odr_idx == 0) {
-			/* Power-down mode, not sampling no need to sleep */
-			return 0;
+q_payload.num_slots = 0;
 		}
 
-		dev_err(&lis3->pdev->dev, "Error unknown odrs-index: %d\n", odr_idx);
-		return -ENXIO;
-	}
-
-	/* LIS3 power on delay is quite long */
-	msleep(lis3->pwron_delay / div);
-	return 0;
-}
-
-static int lis3lv02d_set_odr(struct lis3lv02d *lis3, int rate)
-{
-	u8 ctrl;
-	int i, len, shift;
-
-	if (!rate)
-		return -EINVAL;
-
-	lis3->read(lis3, CTRL_REG1, &ctrl);
-	ctrl &= ~lis3->odr_mask;
-	len = 1 << hweight_long(lis3->odr_mask); /* # of possible values */
-	shift = ffs(lis3->odr_mask) - 1;
-
-	for (i = 0; i < len; i++)
-		if (lis3->odrs[i] == rate) {
-			lis3->write(lis3, CTRL_REG1,
-					ctrl | (i << shift));
-			return 0;
+		if (mgr->payloads[i].start_slot != req_payload.start_slot) {
+			mgr->payloads[i].start_slot = req_payload.start_slot;
 		}
-	return -EINVAL;
-}
+		/* work out what is required to happen with this payload */
+		if (mgr->payloads[i].num_slots != req_payload.num_slots) {
 
-static int lis3lv02d_selftest(struct lis3lv02d *lis3, s16 results[3])
-{
-	u8 ctlreg, reg;
-	s16 x, y, z;
-	u8 selftest;
-	int ret;
-	u8 ctrl_reg_data;
-	unsigned char irq_cfg;
-
-	mutex_lock(&lis3->mutex);
-
-	irq_cfg = lis3->irq_cfg;
-	if (lis3->whoami == WAI_8B) {
-		lis3->data_ready_count[IRQ_LINE0] = 0;
-		lis3->data_ready_count[IRQ_LINE1] = 0;
-
-		/* Change interrupt cfg to data ready for selftest */
-		atomic_inc(&lis3->wake_thread);
-		lis3->irq_cfg = LIS3_IRQ1_DATA_READY | LIS3_IRQ2_DATA_READY;
-		lis3->read(lis3, CTRL_REG3, &ctrl_reg_data);
-		lis3->write(lis3, CTRL_REG3, (ctrl_reg_data &
-				~(LIS3_IRQ1_MASK | LIS3_IRQ2_MASK)) |
-				(LIS3_IRQ1_DATA_READY | LIS3_IRQ2_DATA_READY));
-	}
-
-	if ((lis3->whoami == WAI_3DC) || (lis3->whoami == WAI_3DLH)) {
-		ctlreg = CTRL_REG4;
-		selftest = CTRL4_ST0;
-	} else {
-		ctlreg = CTRL_REG1;
-		if (lis3->whoami == WAI_12B)
-			selftest = CTRL1_ST;
-		else
-			selftest = CTRL1_STP;
-	}
-
-	lis3->read(lis3, ctlreg, &reg);
-	lis3->write(lis3, ctlreg, (reg | selftest));
-	ret = lis3lv02d_get_pwron_wait(lis3);
-	if (ret)
-		goto fail;
-
-	/* Read directly to avoid axis remap */
-	x = lis3->read_data(lis3, OUTX);
-	y = lis3->read_data(lis3, OUTY);
-	z = lis3->read_data(lis3, OUTZ);
-
-	/* back to normal settings */
-	lis3->write(lis3, ctlreg, reg);
-	ret = lis3lv02d_get_pwron_wait(lis3);
-	if (ret)
-		goto fail;
-
-	results[0] = x - lis3->read_data(lis3, OUTX);
-	results[1] = y - lis3->read_data(lis3, OUTY);
-	results[2] = z - lis3->read_data(lis3, OUTZ);
-
-	ret = 0;
-
-	if (lis3->whoami == WAI_8B) {
-		/* Restore original interrupt configuration */
-		atomic_dec(&lis3->wake_thread);
-		lis3->write(lis3, CTRL_REG3, ctrl_reg_data);
-		lis3->irq_cfg = irq_cfg;
-
-		if ((irq_cfg & LIS3_IRQ1_MASK) &&
-			lis3->data_ready_count[IRQ_LINE0] < 2) {
-			ret = SELFTEST_IRQ;
-			goto fail;
-		}
-
-		if ((irq_cfg & LIS3_IRQ2_MASK) &&
-			lis3->data_ready_count[IRQ_LINE1] < 2) {
-			ret = SELFTEST_IRQ;
-			goto fail;
-		}
-	}
-
-	if (lis3->pdata) {
-		int i;
-		for (i = 0; i < 3; i++) {
-			/* Check against selftest acceptance limits */
-			if ((results[i] < lis3->pdata->st_min_limits[i]) ||
-			    (results[i] > lis3->pdata->st_max_limits[i])) {
-				ret = SELFTEST_FAIL;
-				goto fail;
+			/* need to push an update for this payload */
+			if (req_payload.num_slots) {
+				drm_dp_create_payload_step1(mgr, mgr->proposed_vcpis[i]->vcpi, &req_payload);
+				mgr->payloads[i].num_slots = req_payload.num_slots;
+				mgr->payloads[i].vcpi = req_payload.vcpi;
+			} else if (mgr->payloads[i].num_slots) {
+				mgr->payloads[i].num_slots = 0;
+				drm_dp_destroy_payload_step1(mgr, port, mgr->payloads[i].vcpi, &mgr->payloads[i]);
+				req_payload.payload_state = mgr->payloads[i].payload_state;
+				mgr->payloads[i].start_slot = 0;
 			}
+			mgr->payloads[i].payload_state = req_payload.payload_state;
 		}
+		cur_slots += req_payload.num_slots;
+
+		if (port)
+			drm_dp_put_port(port);
 	}
 
-	/* test passed */
-fail:
-	mutex_unlock(&lis3->mutex);
-	return ret;
-}
+	for (i = 0; i < mgr->max_payloads; i++) {
+		if (mgr->payloads[i].payload_state == DP_PAYLOAD_DELETE_LOCAL) {
+			DRM_DEBUG_KMS("removing payload %d\n", i);
+			for (j = i; j < mgr->max_payloads - 1; j++) {
+				memcpy(&mgr->payloads[j], &mgr->payloads[j + 1], sizeof(struct drm_dp_payload));
+				mgr->proposed_vcpis[j] = mgr->proposed_vcpis[j + 1];
+				if (mgr->proposed_vcpis[j] && mgr->proposed_vcpis[j]->num_slots) {
+					set_bit(j + 1, &mgr->payload_mask);
+				} else {
+					clear_bit(j + 1, &mgr->payload_mask);
+				}
+			}
+			memset(&mgr->payloads[mgr->max_payloads - 1], 0, sizeof(struct drm_dp_payload));
+			mgr->proposed_vcpis[mgr->max_payloads - 1] = NULL;
+			clear_bit(mgr->max_payloads, &mgr->payload_mask);
 
-/*
- * Order of registers in the list affects to order of the restore process.
- * Perhaps it is a good idea to set interrupt enable register as a last one
- * after all other configurations
+		}
+	}
+	mutex_unlock(&mgr->payload_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL(drm_dp_update_payload_part1);
+
+/**
+ * drm_dp_update_payload_part2() - Execute payload update part 2
+ * @mgr: manager to use.
+ *
+ * This iterates over all proposed virtual channels, and tries to
+ * allocate space in the link for them. For 0->slots transitions,
+ * this step writes the remote VC payload commands. For slots->0
+ * this just resets some internal state.
  */
-static u8 lis3_wai8_regs[] = { FF_WU_CFG_1, FF_WU_THS_1, FF_WU_DURATION_1,
-			       FF_WU_CFG_2, FF_WU_THS_2, FF_WU_DURATION_2,
-			       CLICK_CFG, CLICK_SRC, CLICK_THSY_X, CLICK_THSZ,
-			       CLICK_TIMELIMIT, CLICK_LATENCY, CLICK_WINDOW,
-			       CTRL_REG1, CTRL_REG2, CTRL_REG3};
-
-static u8 lis3_wai12_regs[] = {FF_WU_CFG, FF_WU_THS_L, FF_WU_THS_H,
-			       FF_WU_DURATION, DD_CFG, DD_THSI_L, DD_THSI_H,
-			       DD_THSE_L, DD_THSE_H,
-			       CTRL_REG1, CTRL_REG3, CTRL_REG2};
-
-static inline void lis3_context_save(struct lis3lv02d *lis3)
+int drm_dp_update_payload_part2(struct drm_dp_mst_topology_mgr *mgr)
 {
+	struct drm_dp_mst_port *port;
 	int i;
-	for (i = 0; i < lis3->regs_size; i++)
-		lis3->read(lis3, lis3->regs[i], &lis3->reg_cache[i]);
-	lis3->regs_stored = true;
-}
+	int ret = 0;
+	mutex_lock(&mgr->payload_lock);
+	for (i = 0; i < mgr->max_payloads; i++) {
 
-static inline void lis3_context_restore(struct lis3lv02d *lis3)
-{
-	int i;
-	if (lis3->regs_stored)
-		for (i = 0; i < lis3->regs_size; i++)
-			lis3->write(lis3, lis3->regs[i], lis3->reg_cache[i]);
-}
+		if (!mgr->proposed_vcpis[i])
+			continue;
 
-void lis3lv02d_poweroff(struct lis3lv02d *lis3)
-{
-	if (lis3->reg_ctrl)
-		lis3_context_save(lis3);
-	/* disable X,Y,Z axis and power down */
-	lis3->write(lis3, CTRL_REG1, 0x00);
-	if (lis3->reg_ctrl)
-		lis3->reg_ctrl(lis3, LIS3_REG_OFF);
-}
-EXPORT_SYMBOL_GPL(lis3lv02d_poweroff);
+		port = container_of(mgr->proposed_vcpis[i], struct drm_dp_mst_port, vcpi);
 
-int lis3lv02d_poweron(struct lis3lv02d *lis3)
-{
-	int err;
-	u8 reg;
-
-	lis3->init(lis3);
-
-	/*
-	 * Common configuration
-	 * BDU: (12 bits sensors only) LSB and MSB values are not updated until
-	 *      both have been read. So the value read will always be correct.
-	 * Set BOOT bit to refresh factory tuning values.
-	 */
-	if (lis3->pdata) {
-		lis3->read(lis3, CTRL_REG2, &reg);
-		if (lis3->whoami ==  WAI_12B)
-			reg |= CTRL2_BDU | CTRL2_BOOT;
-		else if (lis3->whoami ==  WAI_3DLH)
-			reg |= CTRL2_BOOT_3DLH;
-		else
-			reg |= CTRL2_BOOT_8B;
-		lis3->write(lis3, CTRL_REG2, reg);
-
-		if (lis3->whoami ==  WAI_3DLH) {
-			lis3->read(lis3, CTRL_REG4, &reg);
-			reg |= CTRL4_BDU;
-			lis3->write(lis3, CTRL_REG4, reg);
+		DRM_DEBUG_KMS("payload %d %d\n", i, mgr->payloads[i].payload_state);
+		if (mgr->payloads[i].payload_state == DP_PAYLOAD_LOCAL) {
+			ret = drm_dp_create_payload_step2(mgr, port, mgr->proposed_vcpis[i]->vcpi, &mgr->payloads[i]);
+		} else if (mgr->payloads[i].payload_state == DP_PAYLOAD_DELETE_LOCAL) {
+			ret = drm_dp_destroy_payload_step2(mgr, mgr->proposed_vcpis[i]->vcpi, &mgr->payloads[i]);
+		}
+		if (ret) {
+			mutex_unlock(&mgr->payload_lock);
+			return ret;
 		}
 	}
-
-	err = lis3lv02d_get_pwron_wait(lis3);
-	if (err)
-		return err;
-
-	if (lis3->reg_ctrl)
-		lis3_context_restore(lis3);
-
+	mutex_unlock(&mgr->payload_lock);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(lis3lv02d_poweron);
+EXPORT_SYMBOL(drm_dp_update_payload_part2);
 
-
-static void lis3lv02d_joystick_poll(struct input_polled_dev *pidev)
+#if 0 /* unused as of yet */
+static int drm_dp_send_dpcd_read(struct drm_dp_mst_topology_mgr *mgr,
+				 struct drm_dp_mst_port *port,
+				 int offset, int size)
 {
-	struct lis3lv02d *lis3 = pidev->private;
-	int x, y, z;
+	int len;
+	struct drm_dp_sideband_msg_tx *txmsg;
 
-	mutex_lock(&lis3->mutex);
-	lis3lv02d_get_xyz(lis3, &x, &y, &z);
-	input_report_abs(pidev->input, ABS_X, x);
-	input_report_abs(pidev->input, ABS_Y, y);
-	input_report_abs(pidev->input, ABS_Z, z);
-	input_sync(pidev->input);
-	mutex_unlock(&lis3->mutex);
-}
-
-static void lis3lv02d_joystick_open(struct input_polled_dev *pidev)
-{
-	struct lis3lv02d *lis3 = pidev->private;
-
-	if (lis3->pm_dev)
-		pm_runtime_get_sync(lis3->pm_dev);
-
-	if (lis3->pdata && lis3->whoami == WAI_8B && lis3->idev)
-		atomic_set(&lis3->wake_thread, 1);
-	/*
-	 * Update coordinates for the case where poll interval is 0 and
-	 * the chip in running purely under interrupt control
-	 */
-	lis3lv02d_joystick_poll(pidev);
-}
-
-static void lis3lv02d_joystick_close(struct input_polled_dev *pidev)
-{
-	struct lis3lv02d *lis3 = pidev->private;
-
-	atomic_set(&lis3->wake_thread, 0);
-	if (lis3->pm_dev)
-		pm_runtime_put(lis3->pm_dev);
-}
-
-static irqreturn_t lis302dl_interrupt(int irq, void *data)
-{
-	struct lis3lv02d *lis3 = data;
-
-	if (!test_bit(0, &lis3->misc_opened))
-		goto out;
-
-	/*
-	 * Be careful: on some HP laptops the bios force DD when on battery and
-	 * the lid is closed. This leads to interrupts as soon as a little move
-	 * is done.
-	 */
-	atomic_inc(&lis3->count);
-
-	wake_up_interruptible(&lis3->misc_wait);
-	kill_fasync(&lis3->async_queue, SIGIO, POLL_IN);
-out:
-	if (atomic_read(&lis3->wake_thread))
-		return IRQ_WAKE_THREAD;
-	return IRQ_HANDLED;
-}
-
-static void lis302dl_interrupt_handle_click(struct lis3lv02d *lis3)
-{
-	struct input_dev *dev = lis3->idev->input;
-	u8 click_src;
-
-	mutex_lock(&lis3->mutex);
-	lis3->read(lis3, CLICK_SRC, &click_src);
-
-	if (click_src & CLICK_SINGLE_X) {
-		input_report_key(dev, lis3->mapped_btns[0], 1);
-		input_report_key(dev, lis3->mapped_btns[0], 0);
-	}
-
-	if (click_src & CLICK_SINGLE_Y) {
-		input_report_key(dev, lis3->mapped_btns[1], 1);
-		input_report_key(dev, lis3->mapped_btns[1], 0);
-	}
-
-	if (click_src & CLICK_SINGLE_Z) {
-		input_report_key(dev, lis3->mapped_btns[2], 1);
-		input_report_key(dev, lis3->mapped_btns[2], 0);
-	}
-	input_sync(dev);
-	mutex_unlock(&lis3->mutex);
-}
-
-static inline void lis302dl_data_ready(struct lis3lv02d *lis3, int index)
-{
-	int dummy;
-
-	/* Dummy read to ack interrupt */
-	lis3lv02d_get_xyz(lis3, &dummy, &dummy, &dummy);
-	lis3->data_ready_count[index]++;
-}
-
-static irqreturn_t lis302dl_interrupt_thread1_8b(int irq, void *data)
-{
-	struct lis3lv02d *lis3 = data;
-	u8 irq_cfg = lis3->irq_cfg & LIS3_IRQ1_MASK;
-
-	if (irq_cfg == LIS3_IRQ1_CLICK)
-		lis302dl_interrupt_handle_click(lis3);
-	else if (unlikely(irq_cfg == LIS3_IRQ1_DATA_READY))
-		lis302dl_data_ready(lis3, IRQ_LINE0);
-	else
-		lis3lv02d_joystick_poll(lis3->idev);
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t lis302dl_interrupt_thread2_8b(int irq, void *data)
-{
-	struct lis3lv02d *lis3 = data;
-	u8 irq_cfg = lis3->irq_cfg & LIS3_IRQ2_MASK;
-
-	if (irq_cfg == LIS3_IRQ2_CLICK)
-		lis302dl_interrupt_handle_click(lis3);
-	else if (unlikely(irq_cfg == LIS3_IRQ2_DATA_READY))
-		lis302dl_data_ready(lis3, IRQ_LINE1);
-	else
-		lis3lv02d_joystick_poll(lis3->idev);
-
-	return IRQ_HANDLED;
-}
-
-static int lis3lv02d_misc_open(struct inode *inode, struct file *file)
-{
-	struct lis3lv02d *lis3 = container_of(file->private_data,
-					      struct lis3lv02d, miscdev);
-
-	if (test_and_set_bit(0, &lis3->misc_opened))
-		return -EBUSY; /* already open */
-
-	if (lis3->pm_dev)
-		pm_runtime_get_sync(lis3->pm_dev);
-
-	atomic_set(&lis3->count, 0);
-	return 0;
-}
-
-static int lis3lv02d_misc_release(struct inode *inode, struct file *file)
-{
-	struct lis3lv02d *lis3 = container_of(file->private_data,
-					      struct lis3lv02d, miscdev);
-
-	clear_bit(0, &lis3->misc_opened); /* release the device */
-	if (lis3->pm_dev)
-		pm_runtime_put(lis3->pm_dev);
-	return 0;
-}
-
-static ssize_t lis3lv02d_misc_read(struct file *file, char __user *buf,
-				size_t count, loff_t *pos)
-{
-	struct lis3lv02d *lis3 = container_of(file->private_data,
-					      struct lis3lv02d, miscdev);
-
-	DECLARE_WAITQUEUE(wait, current);
-	u32 data;
-	unsigned char byte_data;
-	ssize_t retval = 1;
-
-	if (count < 1)
-		return -EINVAL;
-
-	add_wait_queue(&lis3->misc_wait, &wait);
-	while (true) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		data = atomic_xchg(&lis3->count, 0);
-		if (data)
-			break;
-
-		if (file->f_flags & O_NONBLOCK) {
-			retval = -EAGAIN;
-			goto out;
-		}
-
-		if (signal_pending(current)) {
-			retval = -ERESTARTSYS;
-			goto out;
-		}
-
-		schedule();
-	}
-
-	if (data < 255)
-		byte_data = data;
-	else
-		byte_data = 255;
-
-	/* make sure we are not going into copy_to_user() with
-	 * TASK_INTERRUPTIBLE state */
-	set_current_state(TASK_RUNNING);
-	if (copy_to_user(buf, &byte_data, sizeof(byte_data)))
-		retval = -EFAULT;
-
-out:
-	__set_current_state(TASK_RUNNING);
-	remove_wait_queue(&lis3->misc_wait, &wait);
-
-	return retval;
-}
-
-static unsigned int lis3lv02d_misc_poll(struct file *file, poll_table *wait)
-{
-	struct lis3lv02d *lis3 = container_of(file->private_data,
-					      struct lis3lv02d, miscdev);
-
-	poll_wait(file, &lis3->misc_wait, wait);
-	if (atomic_read(&lis3->count))
-		return POLLIN | POLLRDNORM;
-	return 0;
-}
-
-static int lis3lv02d_misc_fasync(int fd, struct file *file, int on)
-{
-	struct lis3lv02d *lis3 = container_of(file->private_data,
-					      struct lis3lv02d, miscdev);
-
-	return fasync_helper(fd, file, on, &lis3->async_queue);
-}
-
-static const struct file_operations lis3lv02d_misc_fops = {
-	.owner   = THIS_MODULE,
-	.llseek  = no_llseek,
-	.read    = lis3lv02d_misc_read,
-	.open    = lis3lv02d_misc_open,
-	.release = lis3lv02d_misc_release,
-	.poll    = lis3lv02d_misc_poll,
-	.fasync  = lis3lv02d_misc_fasync,
-};
-
-int lis3lv02d_joystick_enable(struct lis3lv02d *lis3)
-{
-	struct input_dev *input_dev;
-	int err;
-	int max_val, fuzz, flat;
-	int btns[] = {BTN_X, BTN_Y, BTN_Z};
-
-	if (lis3->idev)
-		return -EINVAL;
-
-	lis3->idev = input_allocate_polled_device();
-	if (!lis3->idev)
+	txmsg = kzalloc(sizeof(*txmsg), GFP_KERNEL);
+	if (!txmsg)
 		return -ENOMEM;
 
-	lis3->idev->poll = lis3lv02d_joystick_poll;
-	lis3->idev->open = lis3lv02d_joystick_open;
-	lis3->idev->close = lis3lv02d_joystick_close;
-	lis3->idev->poll_interval = MDPS_POLL_INTERVAL;
-	lis3->idev->poll_interval_min = MDPS_POLL_MIN;
-	lis3->idev->poll_interval_max = MDPS_POLL_MAX;
-	lis3->idev->private = lis3;
-	input_dev = lis3->idev->input;
+	len = build_dpcd_read(txmsg, port->port_num, 0, 8);
+	txmsg->dst = port->parent;
 
-	input_dev->name       = "ST LIS3LV02DL Accelerometer";
-	input_dev->phys       = DRIVER_NAME "/input0";
-	input_dev->id.bustype = BUS_HOST;
-	input_dev->id.vendor  = 0;
-	input_dev->dev.parent = &lis3->pdev->dev;
+	drm_dp_queue_down_tx(mgr, txmsg);
 
-	set_bit(EV_ABS, input_dev->evbit);
-	max_val = (lis3->mdps_max_val * lis3->scale) / LIS3_ACCURACY;
-	if (lis3->whoami == WAI_12B) {
-		fuzz = LIS3_DEFAULT_FUZZ_12B;
-		flat = LIS3_DEFAULT_FLAT_12B;
-	} else {
-		fuzz = LIS3_DEFAULT_FUZZ_8B;
-		flat = LIS3_DEFAULT_FLAT_8B;
-	}
-	fuzz = (fuzz * lis3->scale) / LIS3_ACCURACY;
-	flat = (flat * lis3->scale) / LIS3_ACCURACY;
-
-	input_set_abs_params(input_dev, ABS_X, -max_val, max_val, fuzz, flat);
-	input_set_abs_params(input_dev, ABS_Y, -max_val, max_val, fuzz, flat);
-	input_set_abs_params(input_dev, ABS_Z, -max_val, max_val, fuzz, flat);
-
-	lis3->mapped_btns[0] = lis3lv02d_get_axis(abs(lis3->ac.x), btns);
-	lis3->mapped_btns[1] = lis3lv02d_get_axis(abs(lis3->ac.y), btns);
-	lis3->mapped_btns[2] = lis3lv02d_get_axis(abs(lis3->ac.z), btns);
-
-	err = input_register_polled_device(lis3->idev);
-	if (err) {
-		input_free_polled_device(lis3->idev);
-		lis3->idev = NULL;
-	}
-
-	return err;
-}
-EXPORT_SYMBOL_GPL(lis3lv02d_joystick_enable);
-
-void lis3lv02d_joystick_disable(struct lis3lv02d *lis3)
-{
-	if (lis3->irq)
-		free_irq(lis3->irq, lis3);
-	if (lis3->pdata && lis3->pdata->irq2)
-		free_irq(lis3->pdata->irq2, lis3);
-
-	if (!lis3->idev)
-		return;
-
-	if (lis3->irq)
-		misc_deregister(&lis3->miscdev);
-	input_unregister_polled_device(lis3->idev);
-	input_free_polled_device(lis3->idev);
-	lis3->idev = NULL;
-}
-EXPORT_SYMBOL_GPL(lis3lv02d_joystick_disable);
-
-/* Sysfs stuff */
-static void lis3lv02d_sysfs_poweron(struct lis3lv02d *lis3)
-{
-	/*
-	 * SYSFS functions are fast visitors so put-call
-	 * immediately after the get-call. However, keep
-	 * chip running for a while and schedule delayed
-	 * suspend. This way periodic sysfs calls doesn't
-	 * suffer from relatively long power up time.
-	 */
-
-	if (lis3->pm_dev) {
-		pm_runtime_get_sync(lis3->pm_dev);
-		pm_runtime_put_noidle(lis3->pm_dev);
-		pm_schedule_suspend(lis3->pm_dev, LIS3_SYSFS_POWERDOWN_DELAY);
-	}
-}
-
-static ssize_t lis3lv02d_selftest_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct lis3lv02d *lis3 = dev_get_drvdata(dev);
-	s16 values[3];
-
-	static const char ok[] = "OK";
-	static const char fail[] = "FAIL";
-	static const char irq[] = "FAIL_IRQ";
-	const char *res;
-
-	lis3lv02d_sysfs_poweron(lis3);
-	switch (lis3lv02d_selftest(lis3, values)) {
-	case SELFTEST_FAIL:
-		res = fail;
-		break;
-	case SELFTEST_IRQ:
-		res = irq;
-		break;
-	case SELFTEST_OK:
-	default:
-		res = ok;
-		break;
-	}
-	return sprintf(buf, "%s %d %d %d\n", res,
-		values[0], values[1], values[2]);
-}
-
-static ssize_t lis3lv02d_position_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct lis3lv02d *lis3 = dev_get_drvdata(dev);
-	int x, y, z;
-
-	lis3lv02d_sysfs_poweron(lis3);
-	mutex_lock(&lis3->mutex);
-	lis3lv02d_get_xyz(lis3, &x, &y, &z);
-	mutex_unlock(&lis3->mutex);
-	return sprintf(buf, "(%d,%d,%d)\n", x, y, z);
-}
-
-static ssize_t lis3lv02d_rate_show(struct device *dev,
-			struct device_attribute *attr, char *buf)
-{
-	struct lis3lv02d *lis3 = dev_get_drvdata(dev);
-	int odr_idx;
-
-	lis3lv02d_sysfs_poweron(lis3);
-
-	odr_idx = lis3lv02d_get_odr_index(lis3);
-	return sprintf(buf, "%d\n", lis3->odrs[odr_idx]);
-}
-
-static ssize_t lis3lv02d_rate_set(struct device *dev,
-				struct device_attribute *attr, const char *buf,
-				size_t count)
-{
-	struct lis3lv02d *lis3 = dev_get_drvdata(dev);
-	unsigned long rate;
-	int ret;
-
-	ret = kstrtoul(buf, 0, &rate);
-	if (ret)
-		return ret;
-
-	lis3lv02d_sysfs_poweron(lis3);
-	if (lis3lv02d_set_odr(lis3, rate))
-		return -EINVAL;
-
-	return count;
-}
-
-static DEVICE_ATTR(selftest, S_IRUSR, lis3lv02d_selftest_show, NULL);
-static DEVICE_ATTR(position, S_IRUGO, lis3lv02d_position_show, NULL);
-static DEVICE_ATTR(rate, S_IRUGO | S_IWUSR, lis3lv02d_rate_show,
-					    lis3lv02d_rate_set);
-
-static struct attribute *lis3lv02d_attributes[] = {
-	&dev_attr_selftest.attr,
-	&dev_attr_position.attr,
-	&dev_attr_rate.attr,
-	NULL
-};
-
-static struct attribute_group lis3lv02d_attribute_group = {
-	.attrs = lis3lv02d_attributes
-};
-
-
-static int lis3lv02d_add_fs(struct lis3lv02d *lis3)
-{
-	lis3->pdev = platform_device_register_simple(DRIVER_NAME, -1, NULL, 0);
-	if (IS_ERR(lis3->pdev))
-		return PTR_ERR(lis3->pdev);
-
-	platform_set_drvdata(lis3->pdev, lis3);
-	return sysfs_create_group(&lis3->pdev->dev.kobj, &lis3lv02d_attribute_group);
-}
-
-int lis3lv02d_remove_fs(struct lis3lv02d *lis3)
-{
-	sysfs_remove_group(&lis3->pdev->dev.kobj, &lis3lv02d_attribute_group);
-	platform_device_unregister(lis3->pdev);
-	if (lis3->pm_dev) {
-		/* Barrier after the sysfs remove */
-		pm_runtime_barrier(lis3->pm_dev);
-
-		/* SYSFS may have left chip running. Turn off if necessary */
-		if (!pm_runtime_suspended(lis3->pm_dev))
-			lis3lv02d_poweroff(lis3);
-
-		pm_runtime_disable(lis3->pm_dev);
-		pm_runtime_set_suspended(lis3->pm_dev);
-	}
-	kfree(lis3->reg_cache);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(lis3lv02d_remove_fs);
-
-static void lis3lv02d_8b_configure(struct lis3lv02d *lis3,
-				struct lis3lv02d_platform_data *p)
-{
-	int err;
-	int ctrl2 = p->hipass_ctrl;
-
-	if (p->click_flags) {
-		lis3->write(lis3, CLICK_CFG, p->click_flags);
-		lis3->write(lis3, CLICK_TIMELIMIT, p->click_time_limit);
-		lis3->write(lis3, CLICK_LATENCY, p->click_latency);
-		lis3->write(lis3, CLICK_WINDOW, p->click_window);
-		lis3->write(lis3, CLICK_THSZ, p->click_thresh_z & 0xf);
-		lis3->write(lis3, CLICK_THSY_X,
-			(p->click_thresh_x & 0xf) |
-			(p->click_thresh_y << 4));
-
-		if (lis3->idev) {
-			struct input_dev *input_dev = lis3->idev->input;
-			input_set_capability(input_dev, EV_KEY, BTN_X);
-			input_set_capability(input_dev, EV_KEY, BTN_Y);
-			input_set_capability(input_dev, EV_KEY, BTN_Z);
-		}
-	}
-
-	if (p->wakeup_flags) {
-		lis3->write(lis3, FF_WU_CFG_1, p->wakeup_flags);
-		lis3->write(lis3, FF_WU_THS_1, p->wakeup_thresh & 0x7f);
-		/* pdata value + 1 to keep this backward compatible*/
-		lis3->write(lis3, FF_WU_DURATION_1, p->duration1 + 1);
-		ctrl2 ^= HP_FF_WU1; /* Xor to keep compatible with old pdata*/
-	}
-
-	if (p->wakeup_flags2) {
-		lis3->write(lis3, FF_WU_CFG_2, p->wakeup_flags2);
-		lis3->write(lis3, FF_WU_THS_2, p->wakeup_thresh2 & 0x7f);
-		/* pdata value + 1 to keep this backward compatible*/
-		lis3->write(lis3, FF_WU_DURATION_2, p->duration2 + 1);
-		ctrl2 ^= HP_FF_WU2; /* Xor to keep compatible with old pdata*/
-	}
-	/* Configure hipass filters */
-	lis3->write(lis3, CTRL_REG2, ctrl2);
-
-	if (p->irq2) {
-		err = request_threaded_irq(p->irq2,
-					NULL,
-					lis302dl_interrupt_thread2_8b,
-					IRQF_TRIGGER_RISING | IRQF_ONESHOT |
-					(p->irq_flags2 & IRQF_TRIGGER_MASK),
-					DRIVER_NAME, lis3);
-		if (err < 0)
-			pr_err("No second IRQ. Limited functionality\n");
-	}
-}
-
-#ifdef CONFIG_OF
-int lis3lv02d_init_dt(struct lis3lv02d *lis3)
-{
-	struct lis3lv02d_platform_data *pdata;
-	struct device_node *np = lis3->of_node;
-	u32 val;
-	s32 sval;
-
-	if (!lis3->of_node)
-		return 0;
-
-	pdata = kzalloc(sizeof(*pdata), GFP_KERNEL);
-	if (!pdata)
-		return -ENOMEM;
-
-	if (of_get_property(np, "st,click-single-x", NULL))
-		pdata->click_flags |= LIS3_CLICK_SINGLE_X;
-	if (of_get_property(np, "st,click-double-x", NULL))
-		pdata->click_flags |= LIS3_CLICK_DOUBLE_X;
-
-	if (of_get_property(np, "st,click-single-y", NULL))
-		pdata->click_flags |= LIS3_CLICK_SINGLE_Y;
-	if (of_get_property(np, "st,click-double-y", NULL))
-		pdata->click_flags |= LIS3_CLICK_DOUBLE_Y;
-
-	if (of_get_property(np, "st,click-single-z", NULL))
-		pdata->click_flags |= LIS3_CLICK_SINGLE_Z;
-	if (of_get_property(np, "st,click-double-z", NULL))
-		pdata->click_flags |= LIS3_CLICK_DOUBLE_Z;
-
-	if (!of_property_read_u32(np, "st,click-threshold-x", &val))
-		pdata->click_thresh_x = val;
-	if (!of_property_read_u32(np, "st,click-threshold-y", &val))
-		pdata->click_thresh_y = val;
-	if (!of_property_read_u32(np, "st,click-threshold-z", &val))
-		pdata->click_thresh_z = val;
-
-	if (!of_property_read_u32(np, "st,click-time-limit", &val))
-		pdata->click_time_limit = val;
-	if (!of_property_read_u32(np, "st,click-latency", &val))
-		pdata->click_latency = val;
-	if (!of_property_read_u32(np, "st,click-window", &val))
-		pdata->click_window = val;
-
-	if (of_get_property(np, "st,irq1-disable", NULL))
-		pdata->irq_cfg |= LIS3_IRQ1_DISABLE;
-	if (of_get_property(np, "st,irq1-ff-wu-1", NULL))
-		pdata->irq_cfg |= LIS3_IRQ1_FF_WU_1;
-	if (of_get_property(np, "st,irq1-ff-wu-2", NULL))
-		pdata->irq_cfg |= LIS3_IRQ1_FF_WU_2;
-	if (of_get_property(np, "st,irq1-data-ready", NULL))
-		pdata->irq_cfg |= LIS3_IRQ1_DATA_READY;
-	if (of_get_property(np, "st,irq1-click", NULL))
-		pdata->irq_cfg |= LIS3_IRQ1_CLICK;
-
-	if (of_get_property(np, "st,irq2-disable", NULL))
-		pdata->irq_cfg |= LIS3_IRQ2_DISABLE;
-	if (of_get_property(np, "st,irq2-ff-wu-1", NULL))
-		pdata->irq_cfg |= LIS3_IRQ2_FF_WU_1;
-	if (of_get_property(np, "st,irq2-ff-wu-2", NULL))
-		pdata->irq_cfg |= LIS3_IRQ2_FF_WU_2;
-	if (of_get_property(np, "st,irq2-data-ready", NULL))
-		pdata->irq_cfg |= LIS3_IRQ2_DATA_READY;
-	if (of_get_property(np, "st,irq2-click", NULL))
-		pdata->irq_cfg |= LIS3_IRQ2_CLICK;
-
-	if (of_get_property(np, "st,irq-open-drain", NULL))
-		pdata->irq_cfg |= LIS3_IRQ_OPEN_DRAIN;
-	if (of_get_property(np, "st,irq-active-low", NULL))
-		pdata->irq_cfg |= LIS3_IRQ_ACTIVE_LOW;
-
-	if (!of_property_read_u32(np, "st,wu-duration-1", &val))
-		pdata->duration1 = val;
-	if (!of_property_read_u32(np, "st,wu-duration-2", &val))
-		pdata->duration2 = val;
-
-	if (of_get_property(np, "st,wakeup-x-lo", NULL))
-		pdata->wakeup_flags |= LIS3_WAKEUP_X_LO;
-	if (of_get_property(np, "st,wakeup-x-hi", NULL))
-		pdata->wakeup_flags |= LIS3_WAKEUP_X_HI;
-	if (of_get_property(np, "st,wakeup-y-lo", NULL))
-		pdata->wakeup_flags |= LIS3_WAKEUP_Y_LO;
-	if (of_get_property(np, "st,wakeup-y-hi", NULL))
-		pdata->wakeup_flags |= LIS3_WAKEUP_Y_HI;
-	if (of_get_property(np, "st,wakeup-z-lo", NULL))
-		pdata->wakeup_flags |= LIS3_WAKEUP_Z_LO;
-	if (of_get_property(np, "st,wakeup-z-hi", NULL))
-		pdata->wakeup_flags |= LIS3_WAKEUP_Z_HI;
-	if (of_get_property(np, "st,wakeup-threshold", &val))
-		pdata->wakeup_thresh = val;
-
-	if (of_get_property(np, "st,wakeup2-x-lo", NULL))
-		pdata->wakeup_flags2 |= LIS3_WAKEUP_X_LO;
-	if (of_get_property(np, "st,wakeup2-x-hi", NULL))
-		pdata->wakeup_flags2 |= LIS3_WAKEUP_X_HI;
-	if (of_get_property(np, "st,wakeup2-y-lo", NULL))
-		pdata->wakeup_flags2 |= LIS3_WAKEUP_Y_LO;
-	if (of_get_property(np, "st,wakeup2-y-hi", NULL))
-		pdata->wakeup_flags2 |= LIS3_WAKEUP_Y_HI;
-	if (of_get_property(np, "st,wakeup2-z-lo", NULL))
-		pdata->wakeup_flags2 |= LIS3_WAKEUP_Z_LO;
-	if (of_get_property(np, "st,wakeup2-z-hi", NULL))
-		pdata->wakeup_flags2 |= LIS3_WAKEUP_Z_HI;
-	if (of_get_property(np, "st,wakeup2-threshold", &val))
-		pdata->wakeup_thresh2 = val;
-
-	if (!of_property_read_u32(np, "st,highpass-cutoff-hz", &val)) {
-		switch (val) {
-		case 1:
-			pdata->hipass_ctrl = LIS3_HIPASS_CUTFF_1HZ;
-			break;
-		case 2:
-			pdata->hipass_ctrl = LIS3_HIPASS_CUTFF_2HZ;
-			break;
-		case 4:
-			pdata->hipass_ctrl = LIS3_HIPASS_CUTFF_4HZ;
-			break;
-		case 8:
-			pdata->hipass_ctrl = LIS3_HIPASS_CUTFF_8HZ;
-			break;
-		}
-	}
-
-	if (of_get_property(np, "st,hipass1-disable", NULL))
-		pdata->hipass_ctrl |= LIS3_HIPASS1_DISABLE;
-	if (of_get_property(np, "st,hipass2-disable", NULL))
-		pdata->hipass_ctrl |= LIS3_HIPASS2_DISABLE;
-
-	if (of_property_read_s32(np, "st,axis-x", &sval) == 0)
-		pdata->axis_x = sval;
-	if (of_property_read_s32(np, "st,axis-y", &sval) == 0)
-		pdata->axis_y = sval;
-	if (of_property_read_s32(np, "st,axis-z", &sval) == 0)
-		pdata->axis_z = sval;
-
-	if (of_get_property(np, "st,default-rate", NULL))
-		pdata->default_rate = val;
-
-	if (of_property_read_s32(np, "st,min-limit-x", &sval) == 0)
-		pdata->st_min_limits[0] = sval;
-	if (of_property_read_s32(np, "st,min-limit-y", &sval) == 0)
-		pdata->st_min_limits[1] = sval;
-	if (of_property_read_s32(np, "st,min-limit-z", &sval) == 0)
-		pdata->st_min_limits[2] = sval;
-
-	if (of_property_read_s32(np, "st,max-limit-x", &sval) == 0)
-		pdata->st_max_limits[0] = sval;
-	if (of_property_read_s32(np, "st,max-limit-y", &sval) == 0)
-		pdata->st_max_limits[1] = sval;
-	if (of_property_read_s32(np, "st,max-limit-z", &sval) == 0)
-		pdata->st_max_limits[2] = sval;
-
-
-	lis3->pdata = pdata;
-
-	return 0;
-}
-
-#else
-int lis3lv02d_init_dt(struct lis3lv02d *lis3)
-{
 	return 0;
 }
 #endif
-EXPORT_SYMBOL_GPL(lis3lv02d_init_dt);
 
-/*
- * Initialise the accelerometer and the various subsystems.
- * Should be rather independent of the bus system.
- */
-int lis3lv02d_init_device(struct lis3lv02d *lis3)
+static int drm_dp_send_dpcd_write(struct drm_dp_mst_topology_mgr *mgr,
+				  struct drm_dp_mst_port *port,
+				  int offset, int size, u8 *bytes)
 {
-	int err;
-	irq_handler_t thread_fn;
-	int irq_flags = 0;
+	int len;
+	int ret;
+	struct drm_dp_sideband_msg_tx *txmsg;
+	struct drm_dp_mst_branch *mstb;
 
-	lis3->whoami = lis3lv02d_read_8(lis3, WHO_AM_I);
-
-	switch (lis3->whoami) {
-	case WAI_12B:
-		pr_info("12 bits sensor found\n");
-		lis3->read_data = lis3lv02d_read_12;
-		lis3->mdps_max_val = 2048;
-		lis3->pwron_delay = LIS3_PWRON_DELAY_WAI_12B;
-		lis3->odrs = lis3_12_rates;
-		lis3->odr_mask = CTRL1_DF0 | CTRL1_DF1;
-		lis3->scale = LIS3_SENSITIVITY_12B;
-		lis3->regs = lis3_wai12_regs;
-		lis3->regs_size = ARRAY_SIZE(lis3_wai12_regs);
-		break;
-	case WAI_8B:
-		pr_info("8 bits sensor found\n");
-		lis3->read_data = lis3lv02d_read_8;
-		lis3->mdps_max_val = 128;
-		lis3->pwron_delay = LIS3_PWRON_DELAY_WAI_8B;
-		lis3->odrs = lis3_8_rates;
-		lis3->odr_mask = CTRL1_DR;
-		lis3->scale = LIS3_SENSITIVITY_8B;
-		lis3->regs = lis3_wai8_regs;
-		lis3->regs_size = ARRAY_SIZE(lis3_wai8_regs);
-		break;
-	case WAI_3DC:
-		pr_info("8 bits 3DC sensor found\n");
-		lis3->read_data = lis3lv02d_read_8;
-		lis3->mdps_max_val = 128;
-		lis3->pwron_delay = LIS3_PWRON_DELAY_WAI_8B;
-		lis3->odrs = lis3_3dc_rates;
-		lis3->odr_mask = CTRL1_ODR0|CTRL1_ODR1|CTRL1_ODR2|CTRL1_ODR3;
-		lis3->scale = LIS3_SENSITIVITY_8B;
-		break;
-	case WAI_3DLH:
-		pr_info("16 bits lis331dlh sensor found\n");
-		lis3->read_data = lis331dlh_read_data;
-		lis3->mdps_max_val = 2048; /* 12 bits for 2G */
-		lis3->shift_adj = SHIFT_ADJ_2G;
-		lis3->pwron_delay = LIS3_PWRON_DELAY_WAI_8B;
-		lis3->odrs = lis3_3dlh_rates;
-		lis3->odr_mask = CTRL1_DR0 | CTRL1_DR1;
-		lis3->scale = LIS3DLH_SENSITIVITY_2G;
-		break;
-	default:
-		pr_err("unknown sensor type 0x%X\n", lis3->whoami);
+	mstb = drm_dp_get_validated_mstb_ref(mgr, port->parent);
+	if (!mstb)
 		return -EINVAL;
+
+	txmsg = kzalloc(sizeof(*txmsg), GFP_KERNEL);
+	if (!txmsg) {
+		ret = -ENOMEM;
+		goto fail_put;
 	}
 
-	lis3->reg_cache = kzalloc(max(sizeof(lis3_wai8_regs),
-				     sizeof(lis3_wai12_regs)), GFP_KERNEL);
+	len = build_dpcd_write(txmsg, port->port_num, offset, size, bytes);
+	txmsg->dst = mstb;
 
-	if (lis3->reg_cache == NULL) {
-		printk(KERN_ERR DRIVER_NAME "out of memory\n");
-		return -ENOMEM;
+	drm_dp_queue_down_tx(mgr, txmsg);
+
+	ret = drm_dp_mst_wait_tx_reply(mstb, txmsg);
+	if (ret > 0) {
+		if (txmsg->reply.reply_type == 1) {
+			ret = -EINVAL;
+		} else
+			ret = 0;
 	}
+	kfree(txmsg);
+fail_put:
+	drm_dp_put_mst_branch_device(mstb);
+	return ret;
+}
 
-	mutex_init(&lis3->mutex);
-	atomic_set(&lis3->wake_thread, 0);
+static int drm_dp_encode_up_ack_reply(struct drm_dp_sideband_msg_tx *msg, u8 req_type)
+{
+	struct drm_dp_sideband_msg_reply_body reply;
 
-	lis3lv02d_add_fs(lis3);
-	err = lis3lv02d_poweron(lis3);
-	if (err) {
-		lis3lv02d_remove_fs(lis3);
-		return err;
-	}
-
-	if (lis3->pm_dev) {
-		pm_runtime_set_active(lis3->pm_dev);
-		pm_runtime_enable(lis3->pm_dev);
-	}
-
-	if (lis3lv02d_joystick_enable(lis3))
-		pr_err("joystick initialization failed\n");
-
-	/* passing in platform specific data is purely optional and only
-	 * used by the SPI transport layer at the moment */
-	if (lis3->pdata) {
-		struct lis3lv02d_platform_data *p = lis3->pdata;
-
-		if (lis3->whoami == WAI_8B)
-			lis3lv02d_8b_configure(lis3, p);
-
-		irq_flags = p->irq_flags1 & IRQF_TRIGGER_MASK;
-
-		lis3->irq_cfg = p->irq_cfg;
-		if (p->irq_cfg)
-			lis3->write(lis3, CTRL_REG3, p->irq_cfg);
-
-		if (p->default_rate)
-			lis3lv02d_set_odr(lis3, p->default_rate);
-	}
-
-	/* bail if we did not get an IRQ from the bus layer */
-	if (!lis3->irq) {
-		pr_debug("No IRQ. Disabling /dev/freefall\n");
-		goto out;
-	}
-
-	/*
-	 * The sensor can generate interrupts for free-fall and direction
-	 * detection (distinguishable with FF_WU_SRC and DD_SRC) but to keep
-	 * the things simple and _fast_ we activate it only for free-fall, so
-	 * no need to read register (very slow with ACPI). For the same reason,
-	 * we forbid shared interrupts.
-	 *
-	 * IRQF_TRIGGER_RISING seems pointless on HP laptops because the
-	 * io-apic is not configurable (and generates a warning) but I keep it
-	 * in case of support for other hardware.
-	 */
-	if (lis3->pdata && lis3->whoami == WAI_8B)
-		thread_fn = lis302dl_interrupt_thread1_8b;
-	else
-		thread_fn = NULL;
-
-	err = request_threaded_irq(lis3->irq, lis302dl_interrupt,
-				thread_fn,
-				IRQF_TRIGGER_RISING | IRQF_ONESHOT |
-				irq_flags,
-				DRIVER_NAME, lis3);
-
-	if (err < 0) {
-		pr_err("Cannot get IRQ\n");
-		goto out;
-	}
-
-	lis3->miscdev.minor	= MISC_DYNAMIC_MINOR;
-	lis3->miscdev.name	= "freefall";
-	lis3->miscdev.fops	= &lis3lv02d_misc_fops;
-
-	if (misc_register(&lis3->miscdev))
-		pr_err("misc_register failed\n");
-out:
+	reply.reply_type = 1;
+	reply.req_type = req_type;
+	drm_dp_encode_sideband_reply(&reply, msg);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(lis3lv02d_init_device);
 
-MODULE_DESCRIPTION("ST LIS3LV02Dx three-axis digital accelerometer driver");
-MODULE_AUTHOR("Yan Burman, Eric Piel, Pavel Machek");
-MODULE_LICENSE("GPL");
+static int drm_dp_send_up_ack_reply(struct drm_dp_mst_topology_mgr *mgr,
+				    struct drm_dp_mst_branch *mstb,
+				    int req_type, int seqno, bool broadcast)
+{
+	struct drm_dp_sideband_msg_tx *txmsg;
+
+	txmsg = kzalloc(sizeof(*txmsg), GFP_KERNEL);
+	if (!txmsg)
+		return -ENOMEM;
+
+	txmsg->dst = mstb;
+	txmsg->seqno = seqno;
+	drm_dp_encode_up_ack_reply(txmsg, req_type);
+
+	mutex_lock(&mgr->qlock);
+
+	process_single_up_tx_qlock(mgr, txmsg);
+
+	mutex_unlock(&mgr->qlock);
+
+	kfree(txmsg);
+	return 0;
+}
+
+static bool drm_dp_get_vc_payload_bw(int dp_link_bw,
+				     int dp_link_count,
+				     int *out)
+{
+	switch (dp_link_bw) {
+	default:
+		DRM_DEBUG_KMS("invalid link bandwidth in DPCD: %x (link count: %d)\n",
+			      dp_link_bw, dp_link_count);
+		return false;
+
+	case DP_LINK_BW_1_62:
+		*out = 3 * dp_link_count;
+		break;
+	case DP_LINK_BW_2_7:
+		*out = 5 * dp_link_count;
+		break;
+	case DP_LINK_BW_5_4:
+		*out = 10 * dp_link_count;
+		break;
+	}
+	return true;
+}
+
+/**
+ * drm_dp_mst_topology_mgr_set_mst() - Set the MST state for a topology manager
+ * @mgr: manager to set state for
+ * @mst_state: true to enable MST on this connector - false to disable.
+ *
+ * This is called by the driver when it detects an MST capable device plugged
+ * into a DP MST capable port, or when a DP MST capable device is unplugged.
+ */
+int drm_dp_mst_topology_mgr_set_mst(struct drm_dp_mst_topology_mgr *mgr, bool mst_state)
+{
+	int ret = 0;
+	struct drm_dp_mst_branch *mstb = NULL;
+
+	mutex_lock(&mgr->payload_lock);
+	mutex_lock(&mgr->lock);
+	if (mst_state == mgr->mst_state)
+		goto out_unlock;
+
+	mgr->mst_state = mst_state;
+	/* set the device into MST mode */
+	if (mst_state) {
+		WARN_ON(mgr->mst_primary);
+
+		/* get dpcd info */
+		ret = drm_dp_dpcd_read(mgr->aux, DP_DPCD_REV, mgr->dpcd, DP_RECEIVER_CAP_SIZE);
+		if (ret != DP_RECEIVER_CAP_SIZE) {
+			DRM_DEBUG_KMS("failed to read DPCD\n");
+			goto out_unlock;
+		}
+
+		if (!drm_dp_get_vc_payload_bw(mgr->dpcd[1],
+					      mgr->dpcd[2] & DP_MAX_LANE_COUNT_MASK,
+					      &mgr->pbn_div)) {
+			ret = -EINVAL;
+			goto out_unlock;
+		}
+
+		mgr->total_pbn = 2560;
+		mgr->total_slots = DIV_ROUND_UP(mgr->total_pbn, mgr->pbn_div);
+		mgr->avail_slots = mgr->total_slots;
+
+		/* add initial branch device at LCT 1 */
+		mstb = drm_dp_add_mst_branch_device(1, NULL);
+		if (mstb == NULL) {
+			ret = -ENOMEM;
+			goto out_unlock;
+		}
+		mstb->mgr = mgr;
+
+		/* give this the main reference */
+		mgr->mst_primary = mstb;
+		kref_get(&mgr->mst_primary->kref);
+
+		ret = drm_dp_dpcd_writeb(mgr->aux, DP_MSTM_CTRL,
+							 DP_MST_EN | DP_UP_REQ_EN | DP_UPSTREAM_IS_SRC);
+		if (ret < 0) {
+			goto out_unlock;
+		}
+
+		{
+			struct drm_dp_payload reset_pay;
+			reset_pay.start_slot = 0;
+			reset_pay.num_slots = 0x3f;
+			drm_dp_dpcd_write_payload(mgr, 0, &reset_pay);
+		}
+
+		queue_work(system_long_wq, &mgr->work);
+
+		ret = 0;
+	} else {
+		/* disable MST on the device */
+		mstb = mgr->mst_primary;
+		mgr->mst_primary = NULL;
+		/* this can fail if the device is gone */
+		drm_dp_dpcd_writeb(mgr->aux, DP_MSTM_CTRL, 0);
+		ret = 0;
+		memset(mgr->payloads, 0,
+		       mgr->max_payloads * sizeof(mgr->payloads[0]));
+		memset(mgr->proposed_vcpis, 0,
+		       mgr->max_payloads * sizeof(mgr->proposed_vcpis[0]));
+		mgr->payload_mask = 0;
+		set_bit(0, &mgr->payload_mask);
+		mgr->vcpi_mask = 0;
+	}
+
+out_unlock:
+	mutex_unlock(&mgr->lock);
+	mutex_unlock(&mgr->payload_lock);
+	if (mstb)
+		drm_dp_put_mst_branch_device(mstb);
+	return ret;
+
+}
+EXPORT_SYMBOL(drm_dp_mst_topology_mgr_set_mst);
+
+/**
+ * drm_dp_mst_topology_mgr_suspend() - suspend the MST manager
+ * @mgr: manager to suspend
+ *
+ * This function tells the MST device that we can't handle UP messages
+ * anymore. This should stop it from sending any since we are suspended.
+ */
+void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr)
+{
+	mutex_lock(&mgr->lock);
+	drm_dp_dpcd_writeb(mgr->aux, DP_MSTM_CTRL,
+			   DP_MST_EN | DP_UPSTREAM_IS_SRC);
+	mutex_unlock(&mgr->lock);
+	flush_work(&mgr->work);
+	flush_work(&mgr->destroy_connector_work);
+}
+EXPORT_SYMBOL(drm_dp_mst_topology_mgr_suspend);
+
+/**
+ * drm_dp_mst_topology_mgr_resume() - resume the MST manager
+ * @mgr: manager to resume
+ *
+ * This will fetch DPCD and see if the device is still there,
+ * if it is, it will rewrite the MSTM control bits, and return.
+ *
+ * if the device fails this returns -1, and the driver should do
+ * a full MST reprobe, in case we were undocked.
+ */
+int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr)
+{
+	int ret = 0;
+
+	mutex_lock(&mgr->lock);
+
+	if (mgr->mst_primary) {
+		int sret;
+		u8 guid[16];
+
+		sret = drm_dp_dpcd_read(mgr->aux, DP_DPCD_REV, mgr->dpcd, DP_RECEIVER_CAP_SIZE);
+		if (sret != DP_RECEIVER_CAP_SIZE) {
+			DRM_DEBUG_KMS("dpcd read failed - undocked during suspend?\n");
+			ret = -1;
+			goto out_unlock;
+		}
+
+		ret = drm_dp_dpcd_writeb(mgr->aux, DP_MSTM_CTRL,
+					 DP_MST_EN | DP_UP_REQ_EN | DP_UPSTREAM_IS_SRC);
+		if (ret < 0) {
+			DRM_DEBUG_KMS("mst write failed - undocked during suspend?\n");
+			ret = -1;
+			goto out_unlock;
+		}
+
+		/* Some hubs forget their guids after they resume */
+		sret = drm_dp_dpcd_read(mgr->aux, DP_GUID, guid, 16);
+		if (sret != 16) {
+			DRM_DEBUG_KMS("dpcd read failed - undocked during suspend?\n");
+			ret = -1;
+			goto out_unlock;
+		}
+		drm_dp_check_mstb_guid(mgr->mst_primary, guid);
+
+		ret = 0;
+	} else
+		ret = -1;
+
+out_unlock:
+	mutex_unlock(&mgr->lock);
+	return ret;
+}
+EXPORT_SYMBOL(drm_dp_mst_topology_mgr_resume);
+
+static bool drm_dp_get_one_sb_msg(struct drm_dp_mst_topology_mgr *mgr, bool up)
+{
+	int len;
+	u8 replyblock[32];
+	int replylen, origlen, curreply;
+	int ret;
+	struct drm_dp_sideband_msg_rx *msg;
+	int basereg = up ? DP_SIDEBAND_MSG_UP_REQ_BASE : DP_SIDEBAND_MSG_DOWN_REP_BASE;
+	msg = up ? &mgr->up_req_recv : &mgr->down_rep_recv;
+
+	len = min(mgr->max_dpcd_transaction_bytes, 16);
+	ret = drm_dp_dpcd_read(mgr->aux, basereg,
+			       replyblock, len);
+	if (ret != len) {
+		DRM_DEBUG_KMS("failed to read DPCD down rep %d %d\n", len, ret);
+		return false;
+	}
+	ret = drm_dp_sideband_msg_build(msg, replyblock, len, true);
+	if (!ret) {
+		DRM_DEBUG_KMS("sideband msg build failed %d\n", replyblock[0]);
+		return false;
+	}
+	replylen = msg->curchunk_len + msg->curchunk_hdrlen;
+
+	origlen = replylen;
+	replylen -= len;
+	curreply = len;
+	while (replylen > 0) {
+		len = min3(replylen, mgr->max_dpcd_transaction_bytes, 16);
+		ret = drm_dp_dpcd_read(mgr->aux, basereg + curreply,
+				    replyblock, len);
+		if (ret != len) {
+			DRM_DEBUG_KMS("failed to read a chunk (len %d, ret %d)\n",
+				      len, ret);
+			return false;
+		}
+
+		ret = drm_dp_sideband_msg_build(msg, replyblock, len, false);
+		if (!ret) {
+			DRM_DEBUG_KMS("failed to build sideband msg\n");
+			return false;
+		}
+
+		curreply += len;
+		replylen -= len;
+	}
+	return true;
+}
+
+static int drm_dp_mst_handle_down_rep(struct drm_dp_mst_topology_mgr *mgr)
+{
+	int ret = 0;
+
+	if (!drm_dp_get_one_sb_msg(mgr, false)) {
+		memset(&mgr->down_rep_recv, 0,
+		       sizeof(struct drm_dp_sideband_msg_rx));
+		return 0;
+	}
+
+	if (mgr->down_rep_recv.have_eomt) {
+		struct drm_dp_sideband_msg_tx *txmsg;
+		struct drm_dp_mst_branch *mstb;
+		int slot = -1;
+		mstb = drm_dp_get_mst_branch_device(mgr,
+						    mgr->down_rep_recv.initial_hdr.lct,
+						    mgr->down_rep_recv.initial_hdr.rad);
+
+		if (!mstb) {
+			DRM_DEBUG_KMS("Got MST reply from unknown device %d\n", mgr->down_rep_recv.initial_hdr.lct);
+			memset(&mgr->down_rep_recv, 0, sizeof(struct drm_dp_sideband_msg_rx));
+			return 0;
+		}
+
+		/* find the message */
+		slot = mgr->down_rep_recv.initial_hdr.seqno;
+		mutex_lock(&mgr->qlock);
+		txmsg = mstb->tx_slots[slot];
+		/* remove from slots */
+		mutex_unlock(&mgr->qlock);
+
+		if (!txmsg) {
+			DRM_DEBUG_KMS("Got MST reply with no msg %p %d %d %02x %02x\n",
+			       mstb,
+			       mgr->down_rep_recv.initial_hdr.seqno,
+			       mgr->down_rep_recv.initial_hdr.lct,
+				      mgr->down_rep_recv.initial_hdr.rad[0],
+				      mgr->down_rep_recv.msg[0]);
+			drm_dp_put_mst_branch_device(mstb);
+			memset(&mgr->down_rep_recv, 0, sizeof(struct drm_dp_sideband_msg_rx));
+			return 0;
+		}
+
+		drm_dp_sideband_parse_reply(&mgr->down_rep_recv, &txmsg->reply);
+		if (txmsg->reply.reply_type == 1) {
+			DRM_DEBUG_KMS("Got NAK reply: req 0x%02x, reason 0x%02x, nak data 0x%02x\n", txmsg->reply.req_type, txmsg->reply.u.nak.reason, txmsg->reply.u.nak.nak_data);
+		}
+
+		memset(&mgr->down_rep_recv, 0, sizeof(struct drm_dp_sideband_msg_rx));
+		drm_dp_put_mst_branch_device(mstb);
+
+		mutex_lock(&mgr->qlock);
+		txmsg->state = DRM_DP_SIDEBAND_TX_RX;
+		mstb->tx_slots[slot] = NULL;
+		mutex_unlock(&mgr->qlock);
+
+		wake_up(&mgr->tx_waitq);
+	}
+	return ret;
+}
+
+static int drm_dp_mst_handle_up_req(struct drm_dp_mst_topology_mgr *mgr)
+{
+	int ret = 0;
+
+	if (!drm_dp_get_one_sb_msg(mgr, true)) {
+		memset(&mgr->up_req_recv, 0,
+		       sizeof(struct drm_dp_sideband_msg_rx));
+		return 0;
+	}
+
+	if (mgr->up_req_recv.have_eomt) {
+		struct drm_dp_sideband_msg_req_body msg;
+		struct drm_dp_mst_branch *mstb = NULL;
+		bool seqno;
+
+		if (!mgr->up_req_recv.initial_hdr.broadcast) {
+			mstb = drm_dp_get_mst_branch_device(mgr,
+							    mgr->up_req_recv.initial_hdr.lct,
+							    mgr->up_req_recv.initial_hdr.rad);
+			if (!mstb) {
+				DRM_DEBUG_KMS("Got MST reply from unknown device %d\n", mgr->up_req_recv.initial_hdr.lct);
+				memset(&mgr->up_req_recv, 0, sizeof(struct drm_dp_sideband_msg_rx));
+				return 0;
+			}
+		}
+
+		seqno = mgr->up_req_recv.initial_hdr.seqno;
+		drm_dp_sideband_parse_req(&mgr->up_req_recv, &msg);
+
+		if (msg.req_type == DP_CONNECTION_STATUS_NOTIFY) {
+			drm_dp_send_up_ack_reply(mgr, mgr->mst_primary, msg.req_type, seqno, false);
+
+			if (!mstb)
+				mstb = drm_dp_get_mst_branch_device_by_guid(mgr, msg.u.conn_stat.guid);
+
+			if (!mstb) {
+				DRM_DEBUG_KMS("Got MST reply from unknown device %d\n", mgr->up_req_recv.initial_hdr.lct);
+				memset(&mgr->up_req_recv, 0, sizeof(struct drm_dp_sideband_msg_rx));
+				return 0;
+			}
+
+			drm_dp_update_port(mstb, &msg.u.conn_stat);
+
+			DRM_DEBUG_KMS("Got CSN: pn: %d ldps:%d ddps: %d mcs: %d ip: %d pdt: %d\n", msg.u.conn_stat.port_number, msg.u.conn_stat.legacy_device_plug_status, msg.u.conn_stat.displayport_device_plug_status, msg.u.conn_stat.message_capability_status, msg.u.conn_stat.input_port, msg.u.conn_stat.peer_device_type);
+			(*mgr->cbs->hotplug)(mgr);
+
+		} else if (msg.req_type == DP_RESOURCE_STATUS_NOTIFY) {
+			drm_dp_send_up_ack_reply(mgr, mgr->mst_primary, msg.req_type, seqno, false);
+			if (!mstb)
+				mstb = drm_dp_get_mst_branch_device_by_guid(mgr, msg.u.resource_stat.guid);
+
+			if (!mstb) {
+				DRM_DEBUG_KMS("Got MST reply from unknown device %d\n", mgr->up_req_recv.initial_hdr.lct);
+				memset(&mgr->up_req_recv, 0, sizeof(struct drm_dp_sideband_msg_rx));
+				return 0;
+			}
+
+			DRM_DEBUG_KMS("Got RSN: pn: %d avail_pbn %d\n", msg.u.resource_stat.port_number, msg.u.resource_stat.available_pbn);
+		}
+
+		if (mstb)
+			drm_dp_put_mst_branch_device(mstb);
+
+		memset(&mgr->up_req_recv, 0, sizeof(struct drm_dp_sideband_msg_rx));
+	}
+	return ret;
+}
+
+/**
+ * drm_dp_mst_hpd_irq() - MST hotplug IRQ notify
+ * @mgr: manager to notify irq for.
+ * @esi: 4 bytes from SINK_COUNT_ESI
+ * @handled: whether the hpd interrupt was consumed or not
+ *
+ * This should be called from the driver when it detects a short IRQ,
+ * along with the value of the DEVICE_SERVICE_IRQ_VECTOR_ESI0. The
+ * topology manager will process the sideband messages received as a result
+ * of this.
+ */
+int drm_dp_mst_hpd_irq(struct drm_dp_mst_topology_mgr *mgr, u8 *esi, bool *handled)
+{
+	int ret = 0;
+	int sc;
+	*handled = false;
+	sc = esi[0] & 0x3f;
+
+	if (sc != mgr->sink_count) {
+		mgr->sink_count = sc;
+		*handled = true;
+	}
+
+	if (esi[1] & DP_DOWN_REP_MSG_RDY) {
+		ret = drm_dp_mst_handle_down_rep(mgr);
+		*handled = true;
+	}
+
+	if (esi[1] & DP_UP_REQ_MSG_RDY) {
+		ret |= drm_dp_mst_handle_up_req(mgr);
+		*handled = true;
+	}
+
+	drm_dp_mst_kick_tx(mgr);
+	return ret;
+}
+EXPORT_SYMBOL(drm_dp_mst_hpd_irq);
+
+/**
+ * drm_dp_mst_detect_port() - get connection status for an MST port
+ * @mgr: manager for this port
+ * @port: unverified pointer to a port
+ *
+ * This returns the current connection state for a port. It validates the
+ * port pointer still exists so the caller doesn't require a reference
+ */
+enum drm_connector_status drm_dp_mst_detect_port(struct drm_connector *connector,
+						 struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port)
+{
+	enum drm_connector_status status = connector_status_disconnected;
+
+	/* we need to search for the port in the mgr in case its gone */
+	port = drm_dp_get_validated_port_ref(mgr, port);
+	if (!port)
+		return connector_status_disconnected;
+
+	if (!port->ddps)
+		goto out;
+
+	switch (port->pdt) {
+	case DP_PEER_DEVICE_NONE:
+	case DP_PEER_DEVICE_MST_BRANCHING:
+		break;
+
+	case DP_PEER_DEVICE_SST_SINK:
+		status = connector_status_connected;
+		/* for logical ports - cache the EDID */
+		if (port->port_num >= 8 && !port->cached_edid) {
+			port->cached_edid = drm_get_edid(connector, &port->aux.ddc);
+		}
+		break;
+	case DP_PEER_DEVICE_DP_LEGACY_CONV:
+		if (port->ldps)
+			status = connector_status_connected;
+		break;
+	}
+out:
+	drm_dp_put_port(port);
+	return status;
+}
+EXPORT_SYMBOL(drm_dp_mst_detect_port);
+
+/**
+ * drm_dp_mst_get_edid() - get EDID for an MST port
+ * @connector: toplevel connector to get EDID for
+ * @mgr: manager for this port
+ * @port: unverified pointer to a port.
+ *
+ * This returns an EDID for the port connected to a connector,
+ * It validates the pointer still exists so the caller doesn't require a
+ * reference.
+ */
+struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port)
+{
+	struct edid *edid = NULL;
+
+	/* we need to search for the port in the mgr in case its gone */
+	port = drm_dp_get_validated_port_ref(mgr, port);
+	if (!port)
+		return NULL;
+
+	if (port->cached_edid)
+		edid = drm_edid_duplicate(port->cached_edid);
+	else {
+		edid = drm_get_edid(connector, &port->aux.ddc);
+		drm_mode_connector_set_tile_property(connector);
+	}
+	drm_dp_put_port(port);
+	return edid;
+}
+EXPORT_SYMBOL(drm_dp_mst_get_edid);
+
+/**
+ * drm_dp_find_vcpi_slots() - find slots for this PBN value
+ * @mgr: manager to use
+ * @pbn: payload bandwidth to convert into slots.
+ */
+int drm_dp_find_vcpi_slots(struct drm_dp_mst_topology_mgr *mgr,
+			   int pbn)
+{
+	int num_slots;
+
+	num_slots = DIV_ROUND_UP(pbn, mgr->pbn_div);
+
+	if (num_slots > mgr->avail_slots)
+		return -ENOSPC;
+	return num_slots;
+}
+EXPORT_SYMBOL(drm_dp_find_vcpi_slots);
+
+static int drm_dp_init_vcpi(struct drm_dp_mst_topology_mgr *mgr,
+			    struct drm_dp_vcpi *vcpi, int pbn)
+{
+	int num_slots;
+	int ret;
+
+	num_slots = DIV_ROUND_UP(pbn, mgr->pbn_div);
+
+	if (num_slots > mgr->avail_slots)
+		return -ENOSPC;
+
+	vcpi->pbn = pbn;
+	vcpi->aligned_pbn = num_slots * mgr->pbn_div;
+	vcpi->num_slots = num_slots;
+
+	ret = drm_dp_mst_assign_payload_id(mgr, vcpi);
+	if (ret < 0)
+		return ret;
+	return 0;
+}
+
+/**
+ * drm_dp_mst_allocate_vcpi() - Allocate a virtual channel
+ * @mgr: manager for this port
+ * @port: port to allocate a virtual channel for.
+ * @pbn: payload bandwidth number to request
+ * @slots: returned number of slots for this PBN.
+ */
+bool drm_dp_mst_allocate_vcpi(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, int pbn, int *slots)
+{
+	int ret;
+
+	port = drm_dp_get_validated_port_ref(mgr, port);
+	if (!port)
+		return false;
+
+	if (port->vcpi.vcpi > 0) {
+		DRM_DEBUG_KMS("payload: vcpi %d already allocated for pbn %d - requested pbn %d\n", port->vcpi.vcpi, port->vcpi.pbn, pbn);
+		if (pbn == port->vcpi.pbn) {
+			*slots = port->vcpi.num_slots;
+			drm_dp_put_port(port);
+			return true;
+		}
+	}
+
+	ret = drm_dp_init_vcpi(mgr, &port->vcpi, pbn);
+	if (ret) {
+		DRM_DEBUG_KMS("failed to init vcpi %d %d %d\n", DIV_ROUND_UP(pbn, mgr->pbn_div), mgr->avail_slots, ret);
+		goto out;
+	}
+	DRM_DEBUG_KMS("initing vcpi for %d %d\n", pbn, port->vcpi.num_slots);
+	*slots = port->vcpi.num_slots;
+
+	drm_dp_put_port(port);
+	return true;
+out:
+	return false;
+}
+EXPORT_SYMBOL(drm_dp_mst_allocate_vcpi);
+
+int drm_dp_mst_get_vcpi_slots(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port)
+{
+	int slots = 0;
+	port = drm_dp_get_validated_port_ref(mgr, port);
+	if (!port)
+		return slots;
+
+	slots = port->vcpi.num_slots;
+	drm_dp_put_port(port);
+	return slots;
+}
+EXPORT_SYMBOL(drm_dp_mst_get_vcpi_slots);
+
+/**
+ * drm_dp_mst_reset_vcpi_slots() - Reset number of slots to 0 for VCPI
+ * @mgr: manager for this port
+ * @port: unverified pointer to a port.
+ *
+ * This just resets the number of slots for the ports VCPI for later programming.
+ */
+void drm_dp_mst_reset_vcpi_slots(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port)
+{
+	port = drm_dp_get_validated_port_ref(mgr, port);
+	if (!port)
+		return;
+	port->vcpi.num_slots = 0;
+	drm_dp_put_port(port);
+}
+EXPORT_SYMBOL(drm_dp_mst_reset_vcpi_slots);
+
+/**
+ * drm_dp_mst_deallocate_vcpi() - deallocate a VCPI
+ * @mgr: manager for this port
+ * @port: unverified port to deallocate vcpi for
+ */
+void drm_dp_mst_deallocate_vcpi(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port)
+{
+	port = drm_dp_get_validated_port_ref(mgr, port);
+	if (!port)
+		return;
+
+	drm_dp_mst_put_payload_id(mgr, port->vcpi.vcpi);
+	port->vcpi.num_slots = 0;
+	port->vcpi.pbn = 0;
+	port->vcpi.aligned_pbn = 0;
+	port->vcpi.vcpi = 0;
+	drm_dp_put_port(port);
+}
+EXPORT_SYMBOL(drm_dp_mst_deallocate_vcpi);
+
+static int drm_dp_dpcd_write_payload(struct drm_dp_mst_topology_mgr *mgr,
+				     int id, struct drm_dp_payload *payload)
+{
+	u8 payload_alloc[3], status;
+	int ret;
+	int retries = 0;
+
+	drm_dp_dpcd_writeb(mgr->aux, DP_PAYLOAD_TABLE_UPDATE_STATUS,
+			   DP_PAYLOAD_TABLE_UPDATED);
+
+	payload_alloc[0] = id;
+	payload_alloc[1] = payload->start_slot;
+	payload_alloc[2] = payload->num_slots;
+
+	ret = drm_dp_dpcd_write(mgr->aux, DP_PAYLOAD_ALLOCATE_SET, payload_alloc, 3);
+	if (ret != 3) {
+		DRM_DEBUG_KMS("failed to write payload allocation %d\n", ret);
+		goto fail;
+	}
+
+retry:
+	ret = drm_dp_dpcd_readb(mgr->aux, DP_PAYLOAD_TABLE_UPDATE_STATUS, &status);
+	if (ret < 0) {
+		DRM_DEBUG_KMS("failed to read payload table status %d\n", ret);
+		goto fail;
+	}
+
+	if (!(status & DP_PAYLOAD_TABLE_UPDATED)) {
+		retries++;
+		if (retries < 20) {
+			usleep_range(10000, 20000);
+			goto retry;
+		}
+		DRM_DEBUG_KMS("status not set after read payload table status %d\n", status);
+		ret = -EINVAL;
+		goto fail;
+	}
+	ret = 0;
+fail:
+	return ret;
+}
+
+static int do_get_act_status(struct drm_dp_aux *aux)
+{
+	int ret;
+	u8 status;
+
+	ret = drm_dp_dpcd_readb(aux, DP_PAYLOAD_TABLE_UPDATE_STATUS, &status);
+	if (ret < 0)
+		return ret;
+
+	return status;
+}
+
+/**
+ * drm_dp_check_act_status() - Check ACT handled status.
+ * @mgr: manager to use
+ *
+ * Check the payload status bits in the DPCD for ACT handled completion.
+ */
+int drm_dp_check_act_status(struct drm_dp_mst_topology_mgr *mgr)
+{
+	/*
+	 * There doesn't seem to be any recommended retry count or timeout in
+	 * the MST specification. Since some hubs have been observed to take
+	 * over 1 second to update their payload allocations under certain
+	 * conditions, we use a rather large timeout value.
+	 */
+	const int timeout_ms = 3000;
+	int ret, status;
+
+	ret = readx_poll_timeout(do_get_act_status, mgr->aux, status,
+				 status & DP_PAYLOAD_ACT_HANDLED || status < 0,
+				 200, timeout_ms * USEC_PER_MSEC);
+	if (ret < 0 && status >= 0) {
+		DRM_DEBUG_KMS("Failed to get ACT after %dms, last status: %02x\n",
+			      timeout_ms, status);
+		return -EINVAL;
+	} else if (status < 0) {
+		DRM_DEBUG_KMS("Failed to read payload table status: %d\n",
+			      status);
+		return status;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL(drm_dp_check_act_status);
+
+/**
+ * drm_dp_calc_pbn_mode() - Calculate the PBN for a mode.
+ * @clock: dot clock for the mode
+ * @bpp: bpp for the mode.
+ *
+ * This uses the formula in the spec to calculate the PBN value for a mode.
+ */
+int drm_dp_calc_pbn_mode(int clock, int bpp)
+{
+	u64 kbps;
+	s64 peak_kbps;
+	u32 numerator;
+	u32 denominator;
+
+	kbps = clock * bpp;
+
+	/*
+	 * margin 5300ppm + 300ppm ~ 0.6% as per spec, factor is 1.006
+	 * The unit of 54/64Mbytes/sec is an arbitrary unit chosen based on
+	 * common multiplier to render an integer PBN for all link rate/lane
+	 * counts combinations
+	 * calculate
+	 * peak_kbps *= (1006/1000)
+	 * peak_kbps *= (64/54)
+	 * peak_kbps *= 8    convert to bytes
+	 */
+
+	numerator = 64 * 1006;
+	denominator = 54 * 8 * 1000 * 1000;
+
+	kbps *= numerator;
+	peak_kbps = drm_fixp_from_fraction(kbps, denominator);
+
+	return drm_fixp2int_ceil(peak_kbps);
+}
+EXPORT_SYMBOL(drm_dp_calc_pbn_mode);
+
+static int test_calc_pbn_mode(void)
+{
+	int ret;
+	ret = drm_dp_calc_pbn_mode(154000, 30);
+	if (ret != 689) {
+		DRM_ERROR("PBN calculation test failed - clock %d, bpp %d, expected PBN %d, actual PBN %d.\n",
+				154000, 30, 689, ret);
+		return -EINVAL;
+	}
+	ret = drm_dp_calc_pbn_mode(234000, 30);
+	if (ret != 1047) {
+		DRM_ERROR("PBN calculation test failed - clock %d, bpp %d, expected PBN %d, actual PBN %d.\n",
+				234000, 30, 1047, ret);
+		return -EINVAL;
+	}
+	ret = drm_dp_calc_pbn_mode(297000, 24);
+	if (ret != 1063) {
+		DRM_ERROR("PBN calculation test failed - clock %d, bpp %d, expected PBN %d, actual PBN %d.\n",
+				297000, 24, 1063, ret);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/* we want to kick the TX after we've ack the up/down IRQs. */
+static void drm_dp_mst_kick_tx(struct drm_dp_mst_topology_mgr *mgr)
+{
+	queue_work(system_long_wq, &mgr->tx_work);
+}
+
+static void drm_dp_mst_dump_mstb(struct seq_file *m,
+				 struct drm_dp_mst_branch *mstb)
+{
+	struct drm_dp_mst_port *port;
+	int tabs = mstb->lct;
+	char prefix[10];
+	int i;
+
+	for (i = 0; i < tabs; i++)
+		prefix[i] = '\t';
+	prefix[i] = '\0';
+
+	seq_printf(m, "%smst: %p, %d\n", prefix, mstb, mstb->num_ports);
+	list_for_each_entry(port, &mstb->ports, next) {
+		seq_printf(m, "%sport: %d: ddps: %d ldps: %d, %p, conn: %p\n", prefix, port->port_num, port->ddps, port->ldps, port, port->connector);
+		if (port->mstb)
+			drm_dp_mst_dump_mstb(m, port->mstb);
+	}
+}
+
+static bool dump_dp_payload_table(struct drm_dp_mst_topology_mgr *mgr,
+				  char *buf)
+{
+	int ret;
+	int i;
+	for (i = 0; i < 4; i++) {
+		ret = drm_dp_dpcd_read(mgr->aux, DP_PAYLOAD_TABLE_UPDATE_STATUS + (i * 16), &buf[i * 16], 16);
+		if (ret != 16)
+			break;
+	}
+	if (i == 4)
+		return true;
+	return false;
+}
+
+/**
+ * drm_dp_mst_dump_topology(): dump topology to seq file.
+ * @m: seq_file to dump output to
+ * @mgr: manager to dump current topology for.
+ *
+ * helper to dump MST topology to a seq file for debugfs.
+ */
+void drm_dp_mst_dump_topology(struct seq_file *m,
+			      struct drm_dp_mst_topology_mgr *mgr)
+{
+	int i;
+	struct drm_dp_mst_port *port;
+	mutex_lock(&mgr->lock);
+	if (mgr->mst_primary)
+		drm_dp_mst_dump_mstb(m, mgr->mst_primary);
+
+	/* dump VCPIs */
+	mutex_unlock(&mgr->lock);
+
+	mutex_lock(&mgr->payload_lock);
+	seq_printf(m, "vcpi: %lx %lx\n", mgr->payload_mask, mgr->vcpi_mask);
+
+	for (i = 0; i < mgr->max_payloads; i++) {
+		if (mgr->proposed_vcpis[i]) {
+			port = container_of(mgr->proposed_vcpis[i], struct drm_dp_mst_port, vcpi);
+			seq_printf(m, "vcpi %d: %d %d %d\n", i, port->port_num, port->vcpi.vcpi, port->vcpi.num_slots);
+		} else
+			seq_printf(m, "vcpi %d:unsed\n", i);
+	}
+	for (i = 0; i < mgr->max_payloads; i++) {
+		seq_printf(m, "payload %d: %d, %d, %d\n",
+			   i,
+			   mgr->payloads[i].payload_state,
+			   mgr->payloads[i].start_slot,
+			   mgr->payloads[i].num_slots);
+
+
+	}
+	mutex_unlock(&mgr->payload_lock);
+
+	mutex_lock(&mgr->lock);
+	if (mgr->mst_primary) {
+		u8 buf[64];
+		bool bret;
+		int ret;
+		ret = drm_dp_dpcd_read(mgr->aux, DP_DPCD_REV, buf, DP_RECEIVER_CAP_SIZE);
+		seq_printf(m, "dpcd: ");
+		for (i = 0; i < DP_RECEIVER_CAP_SIZE; i++)
+			seq_printf(m, "%02x ", buf[i]);
+		seq_printf(m, "\n");
+		ret = drm_dp_dpcd_read(mgr->aux, DP_FAUX_CAP, buf, 2);
+		seq_printf(m, "faux/mst: ");
+		for (i = 0; i < 2; i++)
+			seq_printf(m, "%02x ", buf[i]);
+		seq_printf(m, "\n");
+		ret = drm_dp_dpcd_read(mgr->aux, DP_MSTM_CTRL, buf, 1);
+		seq_printf(m, "mst ctrl: ");
+		for (i = 0; i < 1; i++)
+			seq_printf(m, "%02x ", buf[i]);
+		seq_printf(m, "\n");
+
+		/* dump the standard OUI branch header */
+		ret = drm_dp_dpcd_read(mgr->aux, DP_BRANCH_OUI, buf, DP_BRANCH_OUI_HEADER_SIZE);
+		seq_printf(m, "branch oui: ");
+		for (i = 0; i < 0x3; i++)
+			seq_printf(m, "%02x", buf[i]);
+		seq_printf(m, " devid: ");
+		for (i = 0x3; i < 0x8; i++)
+			seq_printf(m, "%c", buf[i]);
+		seq_printf(m, " revision: hw: %x.%x sw: %x.%x", buf[0x9] >> 4, buf[0x9] & 0xf, buf[0xa], buf[0xb]);
+		seq_printf(m, "\n");
+		bret = dump_dp_payload_table(mgr, buf);
+		if (bret == true) {
+			seq_printf(m, "payload table: ");
+			for (i = 0; i < 63; i++)
+				seq_printf(m, "%02x ", buf[i]);
+			seq_printf(m, "\n");
+		}
+
+	}
+
+	mutex_unlock(&mgr->lock);
+
+}
+EXPORT_SYMBOL(drm_dp_mst_dump_topology);
+
+static void drm_dp_tx_work(struct work_struct *work)
+{
+	struct drm_dp_mst_topology_mgr *mgr = container_of(work, struct drm_dp_mst_topology_mgr, tx_work);
+
+	mutex_lock(&mgr->qlock);
+	if (mgr->tx_down_in_progress)
+		process_single_down_tx_qlock(mgr);
+	mutex_unlock(&mgr->qlock);
+}
+
+static void drm_dp_free_mst_port(struct kref *kref)
+{
+	struct drm_dp_mst_port *port = container_of(kref, struct drm_dp_mst_port, kref);
+	kref_put(&port->parent->kref, drm_dp_free_mst_branch_device);
+	kfree(port);
+}
+
+static void drm_dp_destroy_connector_work(struct work_struct *work)
+{
+	struct drm_dp_mst_topology_mgr *mgr = container_of(work, struct drm_dp_mst_topology_mgr, destroy_connector_work);
+	struct drm_dp_mst_port *port;
+	bool send_hotplug = false;
+	/*
+	 * Not a regular list traverse as we have to drop the destroy
+	 * connector lock before destroying the connector, to avoid AB->BA
+	 * ordering between this lock and the config mutex.
+	 */
+	for (;;) {
+		mutex_lock(&mgr->destroy_connector_lock);
+		port = list_first_entry_or_null(&mgr->destroy_connector_list, struct drm_dp_mst_port, next);
+		if (!port) {
+			mutex_unlock(&mgr->destroy_connector_lock);
+			break;
+		}
+		list_del(&port->next);
+		mutex_unlock(&mgr->destroy_connector_lock);
+
+		kref_init(&port->kref);
+		INIT_LIST_HEAD(&port->next);
+
+		mgr->cbs->destroy_connector(mgr, port->connector);
+
+		drm_dp_port_teardown_pdt(port, port->pdt);
+		port->pdt = DP_PEER_DEVICE_NONE;
+
+		if (!port->input && port->vcpi.vcpi > 0) {
+			drm_dp_mst_reset_vcpi_slots(mgr, port);
+			drm_dp_update_payload_part1(mgr);
+			drm_dp_mst_put_payload_id(mgr, port->vcpi.vcpi);
+		}
+
+		kref_put(&port->kref, drm_dp_free_mst_port);
+		send_hotplug = true;
+	}
+	if (send_hotplug)
+		(*mgr->cbs->hotplug)(mgr);
+}
+
+/**
+ * drm_dp_mst_topology_mgr_init - initialise a topology manager
+ * @mgr: manager struct to initialise
+ * @dev: device providing this structure - for i2c addition.
+ * @aux: DP helper aux channel to talk to this device
+ * @max_dpcd_transaction_bytes: hw specific DPCD transaction limit
+ * @max_payloads: maximum number of payloads this GPU can source
+ * @conn_base_id: the connector object ID the MST device is connected to.
+ *
+ * Return 0 for success, or negative error code on failure
+ */
+int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr,
+				 struct device *dev, struct drm_dp_aux *aux,
+				 int max_dpcd_transaction_bytes,
+				 int max_payloads, int conn_base_id)
+{
+	mutex_init(&mgr->lock);
+	mutex_init(&mgr->qlock);
+	mutex_init(&mgr->payload_lock);
+	mutex_init(&mgr->destroy_connector_lock);
+	INIT_LIST_HEAD(&mgr->tx_msg_downq);
+	INIT_LIST_HEAD(&mgr->destroy_connector_list);
+	INIT_WORK(&mgr->work, drm_dp_mst_link_probe_work);
+	INIT_WORK(&mgr->tx_work, drm_dp_tx_work);
+	INIT_WORK(&mgr->destroy_connector_work, drm_dp_destroy_connector_work);
+	init_waitqueue_head(&mgr->tx_waitq);
+	mgr->dev = dev;
+	mgr->aux = aux;
+	mgr->max_dpcd_transaction_bytes = max_dpcd_transaction_bytes;
+	mgr->max_payloads = max_payloads;
+	mgr->conn_base_id = conn_base_id;
+	mgr->payloads = kcalloc(max_payloads, sizeof(struct drm_dp_payload), GFP_KERNEL);
+	if (!mgr->payloads)
+		return -ENOMEM;
+	mgr->proposed_vcpis = kcalloc(max_payloads, sizeof(struct drm_dp_vcpi *), GFP_KERNEL);
+	if (!mgr->proposed_vcpis)
+		return -ENOMEM;
+	set_bit(0, &mgr->payload_mask);
+	test_calc_pbn_mode();
+	return 0;
+}
+EXPORT_SYMBOL(drm_dp_mst_topology_mgr_init);
+
+/**
+ * drm_dp_mst_topology_mgr_destroy() - destroy topology manager.
+ * @mgr: manager to destroy
+ */
+void drm_dp_mst_topology_mgr_destroy(struct drm_dp_mst_topology_mgr *mgr)
+{
+	flush_work(&mgr->work);
+	flush_work(&mgr->destroy_connector_work);
+	mutex_lock(&mgr->payload_lock);
+	kfree(mgr->payloads);
+	mgr->payloads = NULL;
+	kfree(mgr->proposed_vcpis);
+	mgr->proposed_vcpis = NULL;
+	mutex_unlock(&mgr->payload_lock);
+	mgr->dev = NULL;
+	mgr->aux = NULL;
+}
+EXPORT_SYMBOL(drm_dp_mst_topology_mgr_destroy);
+
+/* I2C device */
+static int drm_dp_mst_i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
+			       int num)
+{
+	struct drm_dp_aux *aux = adapter->algo_data;
+	struct drm_dp_mst_port *port = container_of(aux, struct drm_dp_mst_port, aux);
+	struct drm_dp_mst_branch *mstb;
+	struct drm_dp_mst_topology_mgr *mgr = port->mgr;
+	unsigned int i;
+	bool reading = false;
+	struct drm_dp_sideband_msg_req_body msg;
+	struct drm_dp_sideband_msg_tx *txmsg = NULL;
+	int ret;
+
+	mstb = drm_dp_get_validated_mstb_ref(mgr, port->parent);
+	if (!mstb)
+		return -EREMOTEIO;
+
+	/* construct i2c msg */
+	/* see if last msg is a read */
+	if (msgs[num - 1].flags & I2C_M_RD)
+		reading = true;
+
+	if (!reading || (num - 1 > DP_REMOTE_I2C_READ_MAX_TRANSACTIONS)) {
+		DRM_DEBUG_KMS("Unsupported I2C transaction for MST device\n");
+		ret = -EIO;
+		goto out;
+	}
+
+	memset(&msg, 0, sizeof(msg));
+	msg.req_type = DP_REMOTE_I2C_READ;
+	msg.u.i2c_read.num_transactions = num - 1;
+	msg.u.i2c_read.port_number = port->port_num;
+	for (i = 0; i < num - 1; i++) {
+		msg.u.i2c_read.transactions[i].i2c_dev_id = msgs[i].addr;
+		msg.u.i2c_read.transactions[i].num_bytes = msgs[i].len;
+		msg.u.i2c_read.transactions[i].bytes = msgs[i].buf;
+		msg.u.i2c_read.transactions[i].no_stop_bit = !(msgs[i].flags & I2C_M_STOP);
+	}
+	msg.u.i2c_read.read_i2c_device_id = msgs[num - 1].addr;
+	msg.u.i2c_read.num_bytes_read = msgs[num - 1].len;
+
+	txmsg = kzalloc(sizeof(*txmsg), GFP_KERNEL);
+	if (!txmsg) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	txmsg->dst = mstb;
+	drm_dp_encode_sideband_req(&msg, txmsg);
+
+	drm_dp_queue_down_tx(mgr, txmsg);
+
+	ret = drm_dp_mst_wait_tx_reply(mstb, txmsg);
+	if (ret > 0) {
+
+		if (txmsg->reply.reply_type == 1) { /* got a NAK back */
+			ret = -EREMOTEIO;
+			goto out;
+		}
+		if (txmsg->reply.u.remote_i2c_read_ack.num_bytes != msgs[num - 1].len) {
+			ret = -EIO;
+			goto out;
+		}
+		memcpy(msgs[num - 1].buf, txmsg->reply.u.remote_i2c_read_ack.bytes, msgs[num - 1].len

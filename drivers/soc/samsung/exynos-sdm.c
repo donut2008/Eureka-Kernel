@@ -1,32 +1,12 @@
-/*
- * Copyright (c) 2016 Samsung Electronics Co., Ltd.
- *	      http://www.samsung.com/
- *
- * EXYNOS - Security Dump Manager support
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/smc.h>
-#include <linux/printk.h>
-
-int exynos_sdm_dump_secure_region(void)
-{
-	int ret;
-
-	ret = exynos_smc(SMC_CMD_DUMP_SECURE_REGION, 0, 0, 0);
-	pr_info("%s: 0x%x\n", __func__, ret);
-
-	return ret;
-}
-
-int exynos_sdm_flush_secdram(void)
-{
-	int ret;
-
-	ret = exynos_smc(SMC_CMD_FLUSH_SECDRAM, 0, 0, 0);
-
-	return ret;
-}
+ISC_FUSES__MISC_SPARE__SHIFT 0x9
+#define CC_SMU_MISC_FUSES__PostResetGnbClkDid_MASK 0x3f800
+#define CC_SMU_MISC_FUSES__PostResetGnbClkDid__SHIFT 0xb
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_dtc_half_MASK 0x40000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_dtc_half__SHIFT 0x12
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_ptc_half_MASK 0x80000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_ptc_half__SHIFT 0x13
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_itc_half_MASK 0x100000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_itc_half__SHIFT 0x14
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_pdc_half_MASK 0x200000
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_pdc_half__SHIFT 0x15
+#define CC_SMU_MISC_FUSES__L2IMU_tn2_pt

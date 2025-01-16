@@ -1,43 +1,34 @@
-#
-# Makefile for the mouse drivers.
-#
-
-# Each configuration option enables a list of files.
-
-obj-$(CONFIG_MOUSE_AMIGA)		+= amimouse.o
-obj-$(CONFIG_MOUSE_APPLETOUCH)		+= appletouch.o
-obj-$(CONFIG_MOUSE_ATARI)		+= atarimouse.o
-obj-$(CONFIG_MOUSE_BCM5974)		+= bcm5974.o
-obj-$(CONFIG_MOUSE_CYAPA)		+= cyapatp.o
-obj-$(CONFIG_MOUSE_ELAN_I2C)		+= elan_i2c.o
-obj-$(CONFIG_MOUSE_GPIO)		+= gpio_mouse.o
-obj-$(CONFIG_MOUSE_INPORT)		+= inport.o
-obj-$(CONFIG_MOUSE_LOGIBM)		+= logibm.o
-obj-$(CONFIG_MOUSE_MAPLE)		+= maplemouse.o
-obj-$(CONFIG_MOUSE_NAVPOINT_PXA27x)	+= navpoint.o
-obj-$(CONFIG_MOUSE_PC110PAD)		+= pc110pad.o
-obj-$(CONFIG_MOUSE_PS2)			+= psmouse.o
-obj-$(CONFIG_MOUSE_PXA930_TRKBALL)	+= pxa930_trkball.o
-obj-$(CONFIG_MOUSE_RISCPC)		+= rpcmouse.o
-obj-$(CONFIG_MOUSE_SERIAL)		+= sermouse.o
-obj-$(CONFIG_MOUSE_SYNAPTICS_I2C)	+= synaptics_i2c.o
-obj-$(CONFIG_MOUSE_SYNAPTICS_USB)	+= synaptics_usb.o
-obj-$(CONFIG_MOUSE_VSXXXAA)		+= vsxxxaa.o
-
-cyapatp-objs := cyapa.o cyapa_gen3.o cyapa_gen5.o cyapa_gen6.o
-psmouse-objs := psmouse-base.o synaptics.o focaltech.o
-
-psmouse-$(CONFIG_MOUSE_PS2_ALPS)	+= alps.o
-psmouse-$(CONFIG_MOUSE_PS2_ELANTECH)	+= elantech.o
-psmouse-$(CONFIG_MOUSE_PS2_OLPC)	+= hgpk.o
-psmouse-$(CONFIG_MOUSE_PS2_LOGIPS2PP)	+= logips2pp.o
-psmouse-$(CONFIG_MOUSE_PS2_LIFEBOOK)	+= lifebook.o
-psmouse-$(CONFIG_MOUSE_PS2_SENTELIC)	+= sentelic.o
-psmouse-$(CONFIG_MOUSE_PS2_TRACKPOINT)	+= trackpoint.o
-psmouse-$(CONFIG_MOUSE_PS2_TOUCHKIT)	+= touchkit_ps2.o
-psmouse-$(CONFIG_MOUSE_PS2_CYPRESS)	+= cypress_ps2.o
-psmouse-$(CONFIG_MOUSE_PS2_VMMOUSE)	+= vmmouse.o
-
-elan_i2c-objs := elan_i2c_core.o
-elan_i2c-$(CONFIG_MOUSE_ELAN_I2C_I2C)	+= elan_i2c_i2c.o
-elan_i2c-$(CONFIG_MOUSE_ELAN_I2C_SMBUS)	+= elan_i2c_smbus.o
+7__SHIFT 0x1c
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_8_MASK 0xf
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_8__SHIFT 0x0
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_9_MASK 0xf0
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_9__SHIFT 0x4
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_10_MASK 0xf00
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_10__SHIFT 0x8
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_11_MASK 0xf000
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_11__SHIFT 0xc
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_12_MASK 0xf0000
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_12__SHIFT 0x10
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_13_MASK 0xf00000
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_13__SHIFT 0x14
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_14_MASK 0xf000000
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_14__SHIFT 0x18
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_15_MASK 0xf0000000
+#define PA_SC_CENTROID_PRIORITY_1__DISTANCE_15__SHIFT 0x1c
+#define PA_SC_CLIPRECT_0_TL__TL_X_MASK 0x7fff
+#define PA_SC_CLIPRECT_0_TL__TL_X__SHIFT 0x0
+#define PA_SC_CLIPRECT_0_TL__TL_Y_MASK 0x7fff0000
+#define PA_SC_CLIPRECT_0_TL__TL_Y__SHIFT 0x10
+#define PA_SC_CLIPRECT_0_BR__BR_X_MASK 0x7fff
+#define PA_SC_CLIPRECT_0_BR__BR_X__SHIFT 0x0
+#define PA_SC_CLIPRECT_0_BR__BR_Y_MASK 0x7fff0000
+#define PA_SC_CLIPRECT_0_BR__BR_Y__SHIFT 0x10
+#define PA_SC_CLIPRECT_1_TL__TL_X_MASK 0x7fff
+#define PA_SC_CLIPRECT_1_TL__TL_X__SHIFT 0x0
+#define PA_SC_CLIPRECT_1_TL__TL_Y_MASK 0x7fff0000
+#define PA_SC_CLIPRECT_1_TL__TL_Y__SHIFT 0x10
+#define PA_SC_CLIPRECT_1_BR__BR_X_MASK 0x7fff
+#define PA_SC_CLIPRECT_1_BR__BR_X__SHIFT 0x0
+#define PA_SC_CLIPRECT_1_BR__BR_Y_MASK 0x7fff0000
+#define PA_SC_CLIPRECT_1_BR__BR_Y__SHIFT 0x10
+#define 

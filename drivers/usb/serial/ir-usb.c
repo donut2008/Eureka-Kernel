@@ -1,516 +1,178 @@
-/*
- * USB IR Dongle driver
- *
- *	Copyright (C) 2001-2002	Greg Kroah-Hartman (greg@kroah.com)
- *	Copyright (C) 2002	Gary Brubaker (xavyer@ix.netcom.com)
- *	Copyright (C) 2010	Johan Hovold (jhovold@gmail.com)
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License as published by
- *	the Free Software Foundation; either version 2 of the License, or
- *	(at your option) any later version.
- *
- * This driver allows a USB IrDA device to be used as a "dumb" serial device.
- * This can be useful if you do not have access to a full IrDA stack on the
- * other side of the connection.  If you do have an IrDA stack on both devices,
- * please use the usb-irda driver, as it contains the proper error checking and
- * other goodness of a full IrDA stack.
- *
- * Portions of this driver were taken from drivers/net/irda/irda-usb.c, which
- * was written by Roman Weissgaerber <weissg@vienna.at>, Dag Brattli
- * <dag@brattli.net>, and Jean Tourrilhes <jt@hpl.hp.com>
- *
- * See Documentation/usb/usb-serial.txt for more information on using this
- * driver
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/init.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/spinlock.h>
-#include <linux/uaccess.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-#include <linux/usb/irda.h>
-
-#define DRIVER_AUTHOR "Greg Kroah-Hartman <greg@kroah.com>, Johan Hovold <jhovold@gmail.com>"
-#define DRIVER_DESC "USB IR Dongle driver"
-
-/* if overridden by the user, then use their value for the size of the read and
- * write urbs */
-static int buffer_size;
-
-/* if overridden by the user, then use the specified number of XBOFs */
-static int xbof = -1;
-
-static int  ir_startup (struct usb_serial *serial);
-static int ir_write(struct tty_struct *tty, struct usb_serial_port *port,
-		const unsigned char *buf, int count);
-static int ir_write_room(struct tty_struct *tty);
-static void ir_write_bulk_callback(struct urb *urb);
-static void ir_process_read_urb(struct urb *urb);
-static void ir_set_termios(struct tty_struct *tty,
-		struct usb_serial_port *port, struct ktermios *old_termios);
-
-/* Not that this lot means you can only have one per system */
-static u8 ir_baud;
-static u8 ir_xbof;
-static u8 ir_add_bof;
-
-static const struct usb_device_id ir_id_table[] = {
-	{ USB_DEVICE(0x050f, 0x0180) },		/* KC Technology, KC-180 */
-	{ USB_DEVICE(0x08e9, 0x0100) },		/* XTNDAccess */
-	{ USB_DEVICE(0x09c4, 0x0011) },		/* ACTiSys ACT-IR2000U */
-	{ USB_INTERFACE_INFO(USB_CLASS_APP_SPEC, USB_SUBCLASS_IRDA, 0) },
-	{ }					/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, ir_id_table);
-
-static struct usb_serial_driver ir_device = {
-	.driver	= {
-		.owner	= THIS_MODULE,
-		.name	= "ir-usb",
-	},
-	.description		= "IR Dongle",
-	.id_table		= ir_id_table,
-	.num_ports		= 1,
-	.set_termios		= ir_set_termios,
-	.attach			= ir_startup,
-	.write			= ir_write,
-	.write_room		= ir_write_room,
-	.write_bulk_callback	= ir_write_bulk_callback,
-	.process_read_urb	= ir_process_read_urb,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&ir_device, NULL
-};
-
-static inline void irda_usb_dump_class_desc(struct usb_serial *serial,
-					    struct usb_irda_cs_descriptor *desc)
-{
-	struct device *dev = &serial->dev->dev;
-
-	dev_dbg(dev, "bLength=%x\n", desc->bLength);
-	dev_dbg(dev, "bDescriptorType=%x\n", desc->bDescriptorType);
-	dev_dbg(dev, "bcdSpecRevision=%x\n", __le16_to_cpu(desc->bcdSpecRevision));
-	dev_dbg(dev, "bmDataSize=%x\n", desc->bmDataSize);
-	dev_dbg(dev, "bmWindowSize=%x\n", desc->bmWindowSize);
-	dev_dbg(dev, "bmMinTurnaroundTime=%d\n", desc->bmMinTurnaroundTime);
-	dev_dbg(dev, "wBaudRate=%x\n", __le16_to_cpu(desc->wBaudRate));
-	dev_dbg(dev, "bmAdditionalBOFs=%x\n", desc->bmAdditionalBOFs);
-	dev_dbg(dev, "bIrdaRateSniff=%x\n", desc->bIrdaRateSniff);
-	dev_dbg(dev, "bMaxUnicastList=%x\n", desc->bMaxUnicastList);
-}
-
-/*------------------------------------------------------------------*/
-/*
- * Function irda_usb_find_class_desc(dev, ifnum)
- *
- *    Returns instance of IrDA class descriptor, or NULL if not found
- *
- * The class descriptor is some extra info that IrDA USB devices will
- * offer to us, describing their IrDA characteristics. We will use that in
- * irda_usb_init_qos()
- *
- * Based on the same function in drivers/net/irda/irda-usb.c
- */
-static struct usb_irda_cs_descriptor *
-irda_usb_find_class_desc(struct usb_serial *serial, unsigned int ifnum)
-{
-	struct usb_device *dev = serial->dev;
-	struct usb_irda_cs_descriptor *desc;
-	int ret;
-
-	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
-	if (!desc)
-		return NULL;
-
-	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-			USB_REQ_CS_IRDA_GET_CLASS_DESC,
-			USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			0, ifnum, desc, sizeof(*desc), 1000);
-
-	dev_dbg(&serial->dev->dev, "%s -  ret=%d\n", __func__, ret);
-	if (ret < sizeof(*desc)) {
-		dev_dbg(&serial->dev->dev,
-			"%s - class descriptor read %s (%d)\n", __func__,
-			(ret < 0) ? "failed" : "too short", ret);
-		goto error;
-	}
-	if (desc->bDescriptorType != USB_DT_CS_IRDA) {
-		dev_dbg(&serial->dev->dev, "%s - bad class descriptor type\n",
-			__func__);
-		goto error;
-	}
-
-	irda_usb_dump_class_desc(serial, desc);
-	return desc;
-
-error:
-	kfree(desc);
-	return NULL;
-}
-
-static u8 ir_xbof_change(u8 xbof)
-{
-	u8 result;
-
-	/* reference irda-usb.c */
-	switch (xbof) {
-	case 48:
-		result = 0x10;
-		break;
-	case 28:
-	case 24:
-		result = 0x20;
-		break;
-	default:
-	case 12:
-		result = 0x30;
-		break;
-	case  5:
-	case  6:
-		result = 0x40;
-		break;
-	case  3:
-		result = 0x50;
-		break;
-	case  2:
-		result = 0x60;
-		break;
-	case  1:
-		result = 0x70;
-		break;
-	case  0:
-		result = 0x80;
-		break;
-	}
-
-	return(result);
-}
-
-static int ir_startup(struct usb_serial *serial)
-{
-	struct usb_irda_cs_descriptor *irda_desc;
-
-	if (serial->num_bulk_in < 1 || serial->num_bulk_out < 1)
-		return -ENODEV;
-
-	irda_desc = irda_usb_find_class_desc(serial, 0);
-	if (!irda_desc) {
-		dev_err(&serial->dev->dev,
-			"IRDA class descriptor not found, device not bound\n");
-		return -ENODEV;
-	}
-
-	dev_dbg(&serial->dev->dev,
-		"%s - Baud rates supported:%s%s%s%s%s%s%s%s%s\n",
-		__func__,
-		(irda_desc->wBaudRate & USB_IRDA_BR_2400) ? " 2400" : "",
-		(irda_desc->wBaudRate & USB_IRDA_BR_9600) ? " 9600" : "",
-		(irda_desc->wBaudRate & USB_IRDA_BR_19200) ? " 19200" : "",
-		(irda_desc->wBaudRate & USB_IRDA_BR_38400) ? " 38400" : "",
-		(irda_desc->wBaudRate & USB_IRDA_BR_57600) ? " 57600" : "",
-		(irda_desc->wBaudRate & USB_IRDA_BR_115200) ? " 115200" : "",
-		(irda_desc->wBaudRate & USB_IRDA_BR_576000) ? " 576000" : "",
-		(irda_desc->wBaudRate & USB_IRDA_BR_1152000) ? " 1152000" : "",
-		(irda_desc->wBaudRate & USB_IRDA_BR_4000000) ? " 4000000" : "");
-
-	switch (irda_desc->bmAdditionalBOFs) {
-	case USB_IRDA_AB_48:
-		ir_add_bof = 48;
-		break;
-	case USB_IRDA_AB_24:
-		ir_add_bof = 24;
-		break;
-	case USB_IRDA_AB_12:
-		ir_add_bof = 12;
-		break;
-	case USB_IRDA_AB_6:
-		ir_add_bof = 6;
-		break;
-	case USB_IRDA_AB_3:
-		ir_add_bof = 3;
-		break;
-	case USB_IRDA_AB_2:
-		ir_add_bof = 2;
-		break;
-	case USB_IRDA_AB_1:
-		ir_add_bof = 1;
-		break;
-	case USB_IRDA_AB_0:
-		ir_add_bof = 0;
-		break;
-	default:
-		break;
-	}
-
-	kfree(irda_desc);
-
-	return 0;
-}
-
-static int ir_write(struct tty_struct *tty, struct usb_serial_port *port,
-		const unsigned char *buf, int count)
-{
-	struct urb *urb = NULL;
-	unsigned long flags;
-	int ret;
-
-	if (port->bulk_out_size == 0)
-		return -EINVAL;
-
-	if (count == 0)
-		return 0;
-
-	count = min(count, port->bulk_out_size - 1);
-
-	spin_lock_irqsave(&port->lock, flags);
-	if (__test_and_clear_bit(0, &port->write_urbs_free)) {
-		urb = port->write_urbs[0];
-		port->tx_bytes += count;
-	}
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	if (!urb)
-		return 0;
-
-	/*
-	 * The first byte of the packet we send to the device contains an
-	 * outbound header which indicates an additional number of BOFs and
-	 * a baud rate change.
-	 *
-	 * See section 5.4.2.2 of the USB IrDA spec.
-	 */
-	*(u8 *)urb->transfer_buffer = ir_xbof | ir_baud;
-
-	memcpy(urb->transfer_buffer + 1, buf, count);
-
-	urb->transfer_buffer_length = count + 1;
-	urb->transfer_flags = URB_ZERO_PACKET;
-
-	ret = usb_submit_urb(urb, GFP_ATOMIC);
-	if (ret) {
-		dev_err(&port->dev, "failed to submit write urb: %d\n", ret);
-
-		spin_lock_irqsave(&port->lock, flags);
-		__set_bit(0, &port->write_urbs_free);
-		port->tx_bytes -= count;
-		spin_unlock_irqrestore(&port->lock, flags);
-
-		return ret;
-	}
-
-	return count;
-}
-
-static void ir_write_bulk_callback(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	int status = urb->status;
-	unsigned long flags;
-
-	spin_lock_irqsave(&port->lock, flags);
-	__set_bit(0, &port->write_urbs_free);
-	port->tx_bytes -= urb->transfer_buffer_length - 1;
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	switch (status) {
-	case 0:
-		break;
-	case -ENOENT:
-	case -ECONNRESET:
-	case -ESHUTDOWN:
-		dev_dbg(&port->dev, "write urb stopped: %d\n", status);
-		return;
-	case -EPIPE:
-		dev_err(&port->dev, "write urb stopped: %d\n", status);
-		return;
-	default:
-		dev_err(&port->dev, "nonzero write-urb status: %d\n", status);
-		break;
-	}
-
-	usb_serial_port_softint(port);
-}
-
-static int ir_write_room(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	int count = 0;
-
-	if (port->bulk_out_size == 0)
-		return 0;
-
-	if (test_bit(0, &port->write_urbs_free))
-		count = port->bulk_out_size - 1;
-
-	return count;
-}
-
-static void ir_process_read_urb(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	unsigned char *data = urb->transfer_buffer;
-
-	if (!urb->actual_length)
-		return;
-	/*
-	 * The first byte of the packet we get from the device
-	 * contains a busy indicator and baud rate change.
-	 * See section 5.4.1.2 of the USB IrDA spec.
-	 */
-	if (*data & 0x0f)
-		ir_baud = *data & 0x0f;
-
-	if (urb->actual_length == 1)
-		return;
-
-	tty_insert_flip_string(&port->port, data + 1, urb->actual_length - 1);
-	tty_flip_buffer_push(&port->port);
-}
-
-static void ir_set_termios_callback(struct urb *urb)
-{
-	kfree(urb->transfer_buffer);
-
-	if (urb->status)
-		dev_dbg(&urb->dev->dev, "%s - non-zero urb status: %d\n",
-			__func__, urb->status);
-}
-
-static void ir_set_termios(struct tty_struct *tty,
-		struct usb_serial_port *port, struct ktermios *old_termios)
-{
-	struct urb *urb;
-	unsigned char *transfer_buffer;
-	int result;
-	speed_t baud;
-	int ir_baud;
-
-	baud = tty_get_baud_rate(tty);
-
-	/*
-	 * FIXME, we should compare the baud request against the
-	 * capability stated in the IR header that we got in the
-	 * startup function.
-	 */
-
-	switch (baud) {
-	case 2400:
-		ir_baud = USB_IRDA_LS_2400;
-		break;
-	case 9600:
-		ir_baud = USB_IRDA_LS_9600;
-		break;
-	case 19200:
-		ir_baud = USB_IRDA_LS_19200;
-		break;
-	case 38400:
-		ir_baud = USB_IRDA_LS_38400;
-		break;
-	case 57600:
-		ir_baud = USB_IRDA_LS_57600;
-		break;
-	case 115200:
-		ir_baud = USB_IRDA_LS_115200;
-		break;
-	case 576000:
-		ir_baud = USB_IRDA_LS_576000;
-		break;
-	case 1152000:
-		ir_baud = USB_IRDA_LS_1152000;
-		break;
-	case 4000000:
-		ir_baud = USB_IRDA_LS_4000000;
-		break;
-	default:
-		ir_baud = USB_IRDA_LS_9600;
-		baud = 9600;
-	}
-
-	if (xbof == -1)
-		ir_xbof = ir_xbof_change(ir_add_bof);
-	else
-		ir_xbof = ir_xbof_change(xbof) ;
-
-	/* Only speed changes are supported */
-	tty_termios_copy_hw(&tty->termios, old_termios);
-	tty_encode_baud_rate(tty, baud, baud);
-
-	/*
-	 * send the baud change out on an "empty" data packet
-	 */
-	urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!urb)
-		return;
-
-	transfer_buffer = kmalloc(1, GFP_KERNEL);
-	if (!transfer_buffer)
-		goto err_buf;
-
-	*transfer_buffer = ir_xbof | ir_baud;
-
-	usb_fill_bulk_urb(
-		urb,
-		port->serial->dev,
-		usb_sndbulkpipe(port->serial->dev,
-			port->bulk_out_endpointAddress),
-		transfer_buffer,
-		1,
-		ir_set_termios_callback,
-		port);
-
-	urb->transfer_flags = URB_ZERO_PACKET;
-
-	result = usb_submit_urb(urb, GFP_KERNEL);
-	if (result) {
-		dev_err(&port->dev, "%s - failed to submit urb: %d\n",
-							__func__, result);
-		goto err_subm;
-	}
-
-	usb_free_urb(urb);
-
-	return;
-err_subm:
-	kfree(transfer_buffer);
-err_buf:
-	usb_free_urb(urb);
-}
-
-static int __init ir_init(void)
-{
-	if (buffer_size) {
-		ir_device.bulk_in_size = buffer_size;
-		ir_device.bulk_out_size = buffer_size;
-	}
-
-	return usb_serial_register_drivers(serial_drivers, KBUILD_MODNAME, ir_id_table);
-}
-
-static void __exit ir_exit(void)
-{
-	usb_serial_deregister_drivers(serial_drivers);
-}
-
-
-module_init(ir_init);
-module_exit(ir_exit);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-
-module_param(xbof, int, 0);
-MODULE_PARM_DESC(xbof, "Force specific number of XBOFs");
-module_param(buffer_size, int, 0);
-MODULE_PARM_DESC(buffer_size, "Size of the transfer buffers");
-
+W_CHANGE_OTHER__SHIFT 0x8
+#define D3F2_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED_MASK 0x200
+#define D3F2_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED__SHIFT 0x9
+#define D3F2_PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE_MASK 0x400
+#define D3F2_PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE__SHIFT 0xa
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL_MASK 0xf
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL__SHIFT 0x0
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE_MASK 0x10
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE__SHIFT 0x4
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1_MASK 0x20
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1__SHIFT 0x5
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN_MASK 0x40
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN__SHIFT 0x6
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN_MASK 0x80
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN__SHIFT 0x7
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_POWER_STATE_MASK 0x700
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_POWER_STATE__SHIFT 0x8
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED_MASK 0x800
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED__SHIFT 0xb
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN_MASK 0x1000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN__SHIFT 0xc
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH_MASK 0x2000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH__SHIFT 0xd
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG_MASK 0x4000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG__SHIFT 0xe
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN_MASK 0x8000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN__SHIFT 0xf
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP_MASK 0x10000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP__SHIFT 0x10
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF_MASK 0x20000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF__SHIFT 0x11
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF_MASK 0x40000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF__SHIFT 0x12
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN_MASK 0x80000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN__SHIFT 0x13
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW_MASK 0x100000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW__SHIFT 0x14
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN_MASK 0x200000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN__SHIFT 0x15
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL_MASK 0xc00000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL__SHIFT 0x16
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED_MASK 0x1000000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED__SHIFT 0x18
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST_MASK 0x2000000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST__SHIFT 0x19
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_RESET_ASPM_L1_NAK_TIMER_MASK 0x4000000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_RESET_ASPM_L1_NAK_TIMER__SHIFT 0x1a
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_SHORT_RCFG_TIMEOUT_MASK 0x8000000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_SHORT_RCFG_TIMEOUT__SHIFT 0x1b
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_ALLOW_TX_L1_CONTROL_MASK 0x10000000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_ALLOW_TX_L1_CONTROL__SHIFT 0x1c
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_FOM_VALID_AFTER_TRACK_MASK 0x20000000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_FOM_VALID_AFTER_TRACK__SHIFT 0x1d
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_EXTEND_EQ_REQ_TIME_MASK 0xc0000000
+#define D3F2_PCIE_LC_TRAINING_CNTL__LC_EXTEND_EQ_REQ_TIME__SHIFT 0x1e
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_MASK 0x7
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH__SHIFT 0x0
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_RD_MASK 0x70
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_RD__SHIFT 0x4
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_ARC_MISSING_ESCAPE_MASK 0x80
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_ARC_MISSING_ESCAPE__SHIFT 0x7
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_NOW_MASK 0x100
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_NOW__SHIFT 0x8
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATION_SUPPORT_MASK 0x200
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATION_SUPPORT__SHIFT 0x9
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATE_EN_MASK 0x400
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATE_EN__SHIFT 0xa
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_SHORT_RECONFIG_EN_MASK 0x800
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_SHORT_RECONFIG_EN__SHIFT 0xb
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_SUPPORT_MASK 0x1000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_SUPPORT__SHIFT 0xc
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_DIS_MASK 0x2000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_DIS__SHIFT 0xd
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_WAIT_FOR_RCVR_DIS_MASK 0x4000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_WAIT_FOR_RCVR_DIS__SHIFT 0xe
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_TIMER_SEL_MASK 0x8000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_TIMER_SEL__SHIFT 0xf
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_DEASSERT_TX_PDNB_MASK 0x10000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_DEASSERT_TX_PDNB__SHIFT 0x10
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_L1_RECONFIG_EN_MASK 0x20000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_L1_RECONFIG_EN__SHIFT 0x11
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_DYNLINK_MST_EN_MASK 0x40000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_DYNLINK_MST_EN__SHIFT 0x12
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_DUAL_END_RECONFIG_EN_MASK 0x80000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_DUAL_END_RECONFIG_EN__SHIFT 0x13
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_CAPABLE_MASK 0x100000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_CAPABLE__SHIFT 0x14
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_DYN_LANES_PWR_STATE_MASK 0x600000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_DYN_LANES_PWR_STATE__SHIFT 0x15
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_EQ_REVERSAL_LOGIC_EN_MASK 0x800000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_EQ_REVERSAL_LOGIC_EN__SHIFT 0x17
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_MULT_REVERSE_ATTEMP_EN_MASK 0x1000000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_MULT_REVERSE_ATTEMP_EN__SHIFT 0x18
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RESET_TSX_CNT_IN_RCONFIG_EN_MASK 0x2000000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_RESET_TSX_CNT_IN_RCONFIG_EN__SHIFT 0x19
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_L_IDLE_IN_R_IDLE_MASK 0x4000000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_L_IDLE_IN_R_IDLE__SHIFT 0x1a
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_NON_EI_ON_RXL0S_EXIT_MASK 0x8000000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_NON_EI_ON_RXL0S_EXIT__SHIFT 0x1b
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE_MASK 0x10000000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE__SHIFT 0x1c
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI_MASK 0x20000000
+#define D3F2_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI__SHIFT 0x1d
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_MASK 0xff
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS__SHIFT 0x0
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_OVERRIDE_EN_MASK 0x100
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_OVERRIDE_EN__SHIFT 0x8
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_XMIT_FTS_BEFORE_RECOVERY_MASK 0x200
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_XMIT_FTS_BEFORE_RECOVERY__SHIFT 0x9
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_LIMIT_MASK 0xff0000
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_LIMIT__SHIFT 0x10
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_N_FTS_MASK 0xff000000
+#define D3F2_PCIE_LC_N_FTS_CNTL__LC_N_FTS__SHIFT 0x18
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_GEN2_EN_STRAP_MASK 0x1
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_GEN2_EN_STRAP__SHIFT 0x0
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_GEN3_EN_STRAP_MASK 0x2
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_GEN3_EN_STRAP__SHIFT 0x1
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_EN_MASK 0x4
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_EN__SHIFT 0x2
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_MASK 0x18
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE__SHIFT 0x3
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_SW_SPEED_CHANGE_MASK 0x20
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_SW_SPEED_CHANGE__SHIFT 0x5
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_SW_SPEED_CHANGE_MASK 0x40
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_SW_SPEED_CHANGE__SHIFT 0x6
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_HW_SPEED_CHANGE_MASK 0x80
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_HW_SPEED_CHANGE__SHIFT 0x7
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_HW_SPEED_CHANGE_MASK 0x100
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_HW_SPEED_CHANGE__SHIFT 0x8
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_INITIATE_LINK_SPEED_CHANGE_MASK 0x200
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_INITIATE_LINK_SPEED_CHANGE__SHIFT 0x9
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK 0xc00
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPTS_ALLOWED__SHIFT 0xa
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPT_FAILED_MASK 0x1000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPT_FAILED__SHIFT 0xc
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_CURRENT_DATA_RATE_MASK 0x6000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_CURRENT_DATA_RATE__SHIFT 0xd
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_DONT_CLR_TARGET_SPD_CHANGE_STATUS_MASK 0x8000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_DONT_CLR_TARGET_SPD_CHANGE_STATUS__SHIFT 0xf
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_CLR_FAILED_SPD_CHANGE_CNT_MASK 0x10000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_CLR_FAILED_SPD_CHANGE_CNT__SHIFT 0x10
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_1_OR_MORE_TS2_SPEED_ARC_EN_MASK 0x20000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_1_OR_MORE_TS2_SPEED_ARC_EN__SHIFT 0x11
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN2_MASK 0x40000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN2__SHIFT 0x12
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN2_MASK 0x80000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN2__SHIFT 0x13
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN3_MASK 0x100000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN3__SHIFT 0x14
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3_MASK 0x200000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3__SHIFT 0x15
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS_MASK 0x400000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS__SHIFT 0x16
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS_MASK 0x800000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS__SHIFT 0x17
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED_MASK 0x3000000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED__SHIFT 0x18
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE_MASK 0x4000000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE__SHIFT 0x1a
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN_MASK 0x8000000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN__SHIFT 0x1b
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN_MASK 0x10000000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN__SHIFT 0x1c
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN_MASK 0x20000000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN__SHIFT 0x1d
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG_MASK 0x40000000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG__SHIFT 0x1e
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS_MASK 0x80000000
+#define D3F2_PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS__SHIFT 0x1f
+#define D3F2_PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF_MASK 0xfff
+#define D3F2_PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF__SHIFT 0x0
+#define D3F2_PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS_MASK 0xfff000
+#define D3F2_PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS__SHIFT 0xc
+#define D3F2_PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE_MASK 0x3000000
+#define D3F2_PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE__SHIFT 0x18
+#define D3F2_PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES_MASK 0xffff
+#define D3F2_PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES__SHIFT 0x0
+#define D3F2_PCIE_LC_LANE_CNTL__LC_LAN

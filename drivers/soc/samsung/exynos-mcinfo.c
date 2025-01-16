@@ -1,226 +1,99 @@
-/*
- * Copyright (c) 2015 Samsung Electronics Co., Ltd.
- *	      http://www.samsung.com/
- *
- * Exynos - Support Memory controller specific information
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
 
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/of.h>
-#include <linux/of_irq.h>
-#include <linux/platform_device.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/debugfs.h>
-
-struct mcinfo_data {
-	struct device	*dev;
-	void __iomem	**base;
-
-	u32		basecnt;
-	u32		irqcnt;
-	u32		bit_array[2];
-};
-
-#if defined(CONFIG_MCINFO_SYSFS)
-static ssize_t show_exynos_ref_rate(struct device *dev,
-			struct device_attribute *attr, char *buf)
-{
-	struct mcinfo_data *data = dev_get_drvdata(dev);
-	ssize_t count = 0;
-	unsigned int tmp;
-	int i = 0;
-
-	count = snprintf(buf, PAGE_SIZE, "HW Refreshing rate\n");
-
-	for (i = 0; i < data->basecnt; i++) {
-		tmp = __raw_readl(data->base[i])
-			<< (31 - data->bit_array[0] - data->bit_array[1])
-			>> (31 - data->bit_array[1]);
-		count += snprintf(buf + count, PAGE_SIZE,
-			"HwTempRange#%d: 0x%x\n", i, tmp);
-	}
-
-	return count;
-}
-static DEVICE_ATTR(ref_rate, 0640, show_exynos_ref_rate, NULL);
-
-static struct attribute *exynos_mcinfo_sysfs_entries[] = {
-	&dev_attr_ref_rate.attr,
-	NULL,
-};
-
-static struct attribute_group exynos_mcinfo_attr_group = {
-	.name	= "ref_rate",
-	.attrs	= exynos_mcinfo_sysfs_entries,
-};
-#endif /* MCINFO_SYSFS */
-
-static irqreturn_t exynos_mc_irq_handler(int irq, void *p)
-{
-	struct mcinfo_data *data = p;
-	unsigned int tmp;
-	int i;
-
-	for (i = 0; i < data->basecnt; i++) {
-		tmp = __raw_readl(data->base[i])
-			<< (31 - data->bit_array[0] - data->bit_array[1])
-			>> (31 - data->bit_array[1]);
-		pr_info("[SW Trip] HwTempRange#%d: 0x%x\n", i, tmp);
-	}
-
-	panic("[SW Trip] Memory temperature is too high (irqnum: %d)\n", irq);
-
-	return IRQ_HANDLED;
-}
-
-#if defined(CONFIG_OF)
-static int exynos_mcinfo_parse_dt(struct device_node *np, struct mcinfo_data *data)
-{
-	int i, ret = 0;
-	unsigned int irqnum = 0;
-
-	if (!np)
-		return -ENODEV;
-
-	ret = of_property_read_u32(np, "basecnt", &data->basecnt);
-	if (ret) {
-		dev_err(data->dev, "Failed to get basecnt value!\n");
-		return ret;
-	}
-
-	ret = of_property_read_u32(np, "irqcnt", &data->irqcnt);
-	if (ret) {
-		dev_err(data->dev, "Failed to get irqcnt value!\n");
-		return ret;
-	}
-
-	ret = of_property_read_u32_array(np, "bit_field", (u32 *)&data->bit_array,
-				(size_t)(ARRAY_SIZE(data->bit_array)));
-	if (ret) {
-		dev_err(data->dev, "Failed to get bit field information!\n");
-		return ret;
-	}
-
-	/* Register IRQ for SW trip */
-	for (i = 0; i < data->irqcnt; i++) {
-		irqnum = irq_of_parse_and_map(data->dev->of_node, i);
-		if (!irqnum) {
-			dev_err(data->dev, "Failed to get IRQ map\n");
-			return -EINVAL;
-		}
-		ret = devm_request_irq(data->dev, irqnum,
-			exynos_mc_irq_handler,
-			IRQF_SHARED, dev_name(data->dev), data);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-#else
-static int exynos_mcinfo_parse_dt(struct device_node *np, struct mcinfo_data *data)
-{
-	return -EINVAL;
-}
-#endif /* OF */
-
-static int exynos_mcinfo_probe(struct platform_device *pdev)
-{
-	struct mcinfo_data *data;
-	struct resource *res;
-	int i, ret = 0;
-
-	data = devm_kzalloc(&pdev->dev, sizeof(struct mcinfo_data), GFP_KERNEL);
-	if (!data) {
-		dev_err(data->dev, "Not enough memory\n");
-		return -ENOMEM;
-	}
-
-	data->dev = &pdev->dev;
-	dev_set_drvdata(data->dev, data);
-
-	ret = exynos_mcinfo_parse_dt(data->dev->of_node, data);
-	if (ret) {
-		dev_err(data->dev, "Failed to parse device tree\n");
-		return ret;
-	}
-
-	/* Allocate memory for Memory controller base address */
-	if (data->basecnt) {
-		data->base = kzalloc((sizeof(void __iomem *)) * data->basecnt,
-					GFP_KERNEL);
-		if (data->base == NULL) {
-			dev_err(data->dev, "Failed to allocate memory\n");
-			return -ENOMEM;
-		}
-		for (i = 0; i < data->basecnt; i++) {
-			res = platform_get_resource(pdev, IORESOURCE_MEM, i);
-			data->base[i] = devm_ioremap_resource(&pdev->dev, res);
-			if (IS_ERR(data->base[i])) {
-				kfree(data->base);
-				return PTR_ERR(data->base[i]);
-			}
-		}
-	}
-
-#if defined(CONFIG_MCINFO_SYSFS)
-	ret = sysfs_create_group(&data->dev->kobj,
-					&exynos_mcinfo_attr_group);
-	if (ret)
-		dev_warn(data->dev, "Failed to create sysfs for MR4\n");
-#endif /* MCINFO_SYSFS */
-
-	dev_info(data->dev, "probe finished!\n");
-	return 0;
-}
-
-static int exynos_mcinfo_remove(struct platform_device *pdev)
-{
-	struct mcinfo_data *data = platform_get_drvdata(pdev);
-	int i;
-
-#if defined(CONFIG_MCINFO_SYSFS)
-	sysfs_remove_group(&data->dev->kobj,
-				&exynos_mcinfo_attr_group);
-#endif /* MCINFO_SYSFS */
-
-	platform_set_drvdata(pdev, NULL);
-
-	for (i = 0; i < data->basecnt; i++) {
-		devm_iounmap(&pdev->dev, data->base[i]);
-	}
-
-	kfree(data->base);
-	kfree(data);
-
-	return 0;
-}
-
-static const struct of_device_id exynos_mcinfo_match[] = {
-	{ .compatible	= "samsung,exynos-mcinfo", },
-	{ },
-};
-MODULE_DEVICE_TABLE(of, exynos_mcinfo_match);
-
-static struct platform_driver exynos_mcinfo_driver = {
-	.probe		= exynos_mcinfo_probe,
-	.remove		= exynos_mcinfo_remove,
-	.driver	= {
-		.name	= "exynos-mcinfo",
-		.owner	= THIS_MODULE,
-		.of_match_table = of_match_ptr(exynos_mcinfo_match),
-	},
-};
-module_platform_driver(exynos_mcinfo_driver);
-
-MODULE_AUTHOR("Eunok Jo <eunok25.jo@samsung.com");
-MODULE_DESCRIPTION("Samsung EXYNOS Memory controller specific information");
-MODULE_LICENSE("GPU v2");
+#define GENERAL_PWRMGT__GPU_COUNTER_CLK_MASK 0x8000
+#define GENERAL_PWRMGT__GPU_COUNTER_CLK__SHIFT 0xf
+#define GENERAL_PWRMGT__GPU_COUNTER_OFF_MASK 0x10000
+#define GENERAL_PWRMGT__GPU_COUNTER_OFF__SHIFT 0x10
+#define GENERAL_PWRMGT__GPU_COUNTER_INTF_OFF_MASK 0x20000
+#define GENERAL_PWRMGT__GPU_COUNTER_INTF_OFF__SHIFT 0x11
+#define GENERAL_PWRMGT__SPARE18_MASK 0x40000
+#define GENERAL_PWRMGT__SPARE18__SHIFT 0x12
+#define GENERAL_PWRMGT__ACPI_D3_VID_MASK 0x180000
+#define GENERAL_PWRMGT__ACPI_D3_VID__SHIFT 0x13
+#define GENERAL_PWRMGT__DYN_SPREAD_SPECTRUM_EN_MASK 0x800000
+#define GENERAL_PWRMGT__DYN_SPREAD_SPECTRUM_EN__SHIFT 0x17
+#define GENERAL_PWRMGT__SPARE27_MASK 0x8000000
+#define GENERAL_PWRMGT__SPARE27__SHIFT 0x1b
+#define GENERAL_PWRMGT__SPARE_MASK 0xf0000000
+#define GENERAL_PWRMGT__SPARE__SHIFT 0x1c
+#define CNB_PWRMGT_CNTL__GNB_SLOW_MODE_MASK 0x3
+#define CNB_PWRMGT_CNTL__GNB_SLOW_MODE__SHIFT 0x0
+#define CNB_PWRMGT_CNTL__GNB_SLOW_MASK 0x4
+#define CNB_PWRMGT_CNTL__GNB_SLOW__SHIFT 0x2
+#define CNB_PWRMGT_CNTL__FORCE_NB_PS1_MASK 0x8
+#define CNB_PWRMGT_CNTL__FORCE_NB_PS1__SHIFT 0x3
+#define CNB_PWRMGT_CNTL__DPM_ENABLED_MASK 0x10
+#define CNB_PWRMGT_CNTL__DPM_ENABLED__SHIFT 0x4
+#define CNB_PWRMGT_CNTL__SPARE_MASK 0xffffffe0
+#define CNB_PWRMGT_CNTL__SPARE__SHIFT 0x5
+#define SCLK_PWRMGT_CNTL__SCLK_PWRMGT_OFF_MASK 0x1
+#define SCLK_PWRMGT_CNTL__SCLK_PWRMGT_OFF__SHIFT 0x0
+#define SCLK_PWRMGT_CNTL__SCLK_LOW_D1_MASK 0x2
+#define SCLK_PWRMGT_CNTL__SCLK_LOW_D1__SHIFT 0x1
+#define SCLK_PWRMGT_CNTL__DYN_PWR_DOWN_EN_MASK 0x4
+#define SCLK_PWRMGT_CNTL__DYN_PWR_DOWN_EN__SHIFT 0x2
+#define SCLK_PWRMGT_CNTL__RESET_BUSY_CNT_MASK 0x10
+#define SCLK_PWRMGT_CNTL__RESET_BUSY_CNT__SHIFT 0x4
+#define SCLK_PWRMGT_CNTL__RESET_SCLK_CNT_MASK 0x20
+#define SCLK_PWRMGT_CNTL__RESET_SCLK_CNT__SHIFT 0x5
+#define SCLK_PWRMGT_CNTL__RESERVED_0_MASK 0x40
+#define SCLK_PWRMGT_CNTL__RESERVED_0__SHIFT 0x6
+#define SCLK_PWRMGT_CNTL__DYN_GFX_CLK_OFF_EN_MASK 0x80
+#define SCLK_PWRMGT_CNTL__DYN_GFX_CLK_OFF_EN__SHIFT 0x7
+#define SCLK_PWRMGT_CNTL__GFX_CLK_FORCE_ON_MASK 0x100
+#define SCLK_PWRMGT_CNTL__GFX_CLK_FORCE_ON__SHIFT 0x8
+#define SCLK_PWRMGT_CNTL__GFX_CLK_REQUEST_OFF_MASK 0x200
+#define SCLK_PWRMGT_CNTL__GFX_CLK_REQUEST_OFF__SHIFT 0x9
+#define SCLK_PWRMGT_CNTL__GFX_CLK_FORCE_OFF_MASK 0x400
+#define SCLK_PWRMGT_CNTL__GFX_CLK_FORCE_OFF__SHIFT 0xa
+#define SCLK_PWRMGT_CNTL__GFX_CLK_OFF_ACPI_D1_MASK 0x800
+#define SCLK_PWRMGT_CNTL__GFX_CLK_OFF_ACPI_D1__SHIFT 0xb
+#define SCLK_PWRMGT_CNTL__GFX_CLK_OFF_ACPI_D2_MASK 0x1000
+#define SCLK_PWRMGT_CNTL__GFX_CLK_OFF_ACPI_D2__SHIFT 0xc
+#define SCLK_PWRMGT_CNTL__GFX_CLK_OFF_ACPI_D3_MASK 0x2000
+#define SCLK_PWRMGT_CNTL__GFX_CLK_OFF_ACPI_D3__SHIFT 0xd
+#define SCLK_PWRMGT_CNTL__DYN_LIGHT_SLEEP_EN_MASK 0x4000
+#define SCLK_PWRMGT_CNTL__DYN_LIGHT_SLEEP_EN__SHIFT 0xe
+#define SCLK_PWRMGT_CNTL__AUTO_SCLK_PULSE_SKIP_MASK 0x8000
+#define SCLK_PWRMGT_CNTL__AUTO_SCLK_PULSE_SKIP__SHIFT 0xf
+#define SCLK_PWRMGT_CNTL__LIGHT_SLEEP_COUNTER_MASK 0x1f0000
+#define SCLK_PWRMGT_CNTL__LIGHT_SLEEP_COUNTER__SHIFT 0x10
+#define SCLK_PWRMGT_CNTL__DYNAMIC_PM_EN_MASK 0x200000
+#define SCLK_PWRMGT_CNTL__DYNAMIC_PM_EN__SHIFT 0x15
+#define SCLK_PWRMGT_CNTL__DPM_DYN_PWR_DOWN_CNTL_MASK 0x400000
+#define SCLK_PWRMGT_CNTL__DPM_DYN_PWR_DOWN_CNTL__SHIFT 0x16
+#define SCLK_PWRMGT_CNTL__DPM_DYN_PWR_DOWN_EN_MASK 0x800000
+#define SCLK_PWRMGT_CNTL__DPM_DYN_PWR_DOWN_EN__SHIFT 0x17
+#define SCLK_PWRMGT_CNTL__RESERVED_3_MASK 0x1000000
+#define SCLK_PWRMGT_CNTL__RESERVED_3__SHIFT 0x18
+#define SCLK_PWRMGT_CNTL__VOLTAGE_UPDATE_EN_MASK 0x2000000
+#define SCLK_PWRMGT_CNTL__VOLTAGE_UPDATE_EN__SHIFT 0x19
+#define SCLK_PWRMGT_CNTL__FORCE_PM0_INTERRUPT_MASK 0x10000000
+#define SCLK_PWRMGT_CNTL__FORCE_PM0_INTERRUPT__SHIFT 0x1c
+#define SCLK_PWRMGT_CNTL__FORCE_PM1_INTERRUPT_MASK 0x20000000
+#define SCLK_PWRMGT_CNTL__FORCE_PM1_INTERRUPT__SHIFT 0x1d
+#define SCLK_PWRMGT_CNTL__GFX_VOLTAGE_CHANGE_EN_MASK 0x40000000
+#define SCLK_PWRMGT_CNTL__GFX_VOLTAGE_CHANGE_EN__SHIFT 0x1e
+#define SCLK_PWRMGT_CNTL__GFX_VOLTAGE_CHANGE_MODE_MASK 0x80000000
+#define SCLK_PWRMGT_CNTL__GFX_VOLTAGE_CHANGE_MODE__SHIFT 0x1f
+#define TARGET_AND_CURRENT_PROFILE_INDEX__TARGET_STATE_MASK 0xf
+#define TARGET_AND_CURRENT_PROFILE_INDEX__TARGET_STATE__SHIFT 0x0
+#define TARGET_AND_CURRENT_PROFILE_INDEX__CURRENT_STATE_MASK 0xf0
+#define TARGET_AND_CURRENT_PROFILE_INDEX__CURRENT_STATE__SHIFT 0x4
+#define TARGET_AND_CURRENT_PROFILE_INDEX__CURR_MCLK_INDEX_MASK 0xf00
+#define TARGET_AND_CURRENT_PROFILE_INDEX__CURR_MCLK_INDEX__SHIFT 0x8
+#define TARGET_AND_CURRENT_PROFILE_INDEX__TARG_MCLK_INDEX_MASK 0xf000
+#define TARGET_AND_CURRENT_PROFILE_INDEX__TARG_MCLK_INDEX__SHIFT 0xc
+#define TARGET_AND_CURRENT_PROFILE_INDEX__CURR_SCLK_INDEX_MASK 0x1f0000
+#define TARGET_AND_CURRENT_PROFILE_INDEX__CURR_SCLK_INDEX__SHIFT 0x10
+#define TARGET_AND_CURRENT_PROFILE_INDEX__TARG_SCLK_INDEX_MASK 0x3e00000
+#define TARGET_AND_CURRENT_PROFILE_INDEX__TARG_SCLK_INDEX__SHIFT 0x15
+#define TARGET_AND_CURRENT_PROFILE_INDEX__CURR_LCLK_INDEX_MASK 0x1c000000
+#define TARGET_AND_CURRENT_PROFILE_INDEX__CURR_LCLK_INDEX__SHIFT 0x1a
+#define TARGET_AND_CURRENT_PROFILE_INDEX__TARG_LCLK_INDEX_MASK 0xe0000000
+#define TARGET_AND_CURRENT_PROFILE_INDEX__TARG_LCLK_INDEX__SHIFT 0x1d
+#define CG_FREQ_TRAN_VOTING_0__BIF_FREQ_THROTTLING_VOTE_EN_MASK 0x1
+#define CG_FREQ_TRAN_VOTING_0__BIF_FREQ_THROTTLING_VOTE_EN__SHIFT 0x0
+#define CG_FREQ_TRAN_VOTING_0__HDP_FREQ_THROTTLING_VOTE_EN_MASK 0x2
+#define CG_FREQ_TRAN_VOTING_0__HDP_FREQ_THROTTLING_VOTE_EN__SHIFT 0x1
+#define CG_FREQ_TRAN_VOTING_0__ROM_FREQ_THROTTLING_VOTE_EN_MASK 0x4
+#define

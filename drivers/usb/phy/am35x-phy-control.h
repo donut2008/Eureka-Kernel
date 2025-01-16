@@ -1,21 +1,8 @@
-#ifndef _AM335x_PHY_CONTROL_H_
-#define _AM335x_PHY_CONTROL_H_
-
-struct phy_control {
-	void (*phy_power)(struct phy_control *phy_ctrl, u32 id, bool on);
-	void (*phy_wkup)(struct phy_control *phy_ctrl, u32 id, bool on);
-};
-
-static inline void phy_ctrl_power(struct phy_control *phy_ctrl, u32 id, bool on)
-{
-	phy_ctrl->phy_power(phy_ctrl, id, on);
-}
-
-static inline void phy_ctrl_wkup(struct phy_control *phy_ctrl, u32 id, bool on)
-{
-	phy_ctrl->phy_wkup(phy_ctrl, id, on);
-}
-
-struct phy_control *am335x_get_phy_control(struct device *dev);
-
-#endif
+00000
+#define DMCU_PERFMON_INTERRUPT_STATUS3__DCFE4_PERFMON_COUNTER_OFF_INT_CLEAR__SHIFT 0x19
+#define DMCU_PERFMON_INTERRUPT_STATUS3__DCFE5_PERFMON_COUNTER_OFF_INT_OCCURRED_MASK 0x4000000
+#define DMCU_PERFMON_INTERRUPT_STATUS3__DCFE5_PERFMON_COUNTER_OFF_INT_OCCURRED__SHIFT 0x1a
+#define DMCU_PERFMON_INTERRUPT_STATUS3__DCFE5_PERFMON_COUNTER_OFF_INT_CLEAR_MASK 0x4000000
+#define DMCU_PERFMON_INTERRUPT_STATUS3__DCFE5_PERFMON_COUNTER_OFF_INT_CLEAR__SHIFT 0x1a
+#define DMCU_PERFMON_INTERRUPT_STATUS4__WB_PERFMON_COUNTER0_INT_OCCURRED_MASK 0x1
+#de

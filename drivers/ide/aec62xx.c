@@ -1,330 +1,383 @@
 /*
- * Copyright (C) 1999-2002	Andre Hedrick <andre@linux-ide.org>
- * Copyright (C) 2007		MontaVista Software, Inc. <source@mvista.com>
+ * Copyright (C) 2008
+ * Guennadi Liakhovetski, DENX Software Engineering, <lg@denx.de>
  *
+ * Copyright (C) 2005-2007 Freescale Semiconductor, Inc. All Rights Reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 
-#include <linux/module.h>
-#include <linux/types.h>
-#include <linux/pci.h>
-#include <linux/ide.h>
+#include <linux/dma-mapping.h>
 #include <linux/init.h>
+#include <linux/platform_device.h>
+#include <linux/err.h>
+#include <linux/spinlock.h>
+#include <linux/delay.h>
+#include <linux/list.h>
+#include <linux/clk.h>
+#include <linux/vmalloc.h>
+#include <linux/string.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/module.h>
+#include <linux/dma/ipu-dma.h>
 
-#include <asm/io.h>
+#include "../dmaengine.h"
+#include "ipu_intern.h"
 
-#define DRV_NAME "aec62xx"
+#define FS_VF_IN_VALID	0x00000002
+#define FS_ENC_IN_VALID	0x00000001
 
-struct chipset_bus_clock_list_entry {
-	u8 xfer_speed;
-	u8 chipset_settings;
-	u8 ultra_settings;
-};
-
-static const struct chipset_bus_clock_list_entry aec6xxx_33_base [] = {
-	{	XFER_UDMA_6,	0x31,	0x07	},
-	{	XFER_UDMA_5,	0x31,	0x06	},
-	{	XFER_UDMA_4,	0x31,	0x05	},
-	{	XFER_UDMA_3,	0x31,	0x04	},
-	{	XFER_UDMA_2,	0x31,	0x03	},
-	{	XFER_UDMA_1,	0x31,	0x02	},
-	{	XFER_UDMA_0,	0x31,	0x01	},
-
-	{	XFER_MW_DMA_2,	0x31,	0x00	},
-	{	XFER_MW_DMA_1,	0x31,	0x00	},
-	{	XFER_MW_DMA_0,	0x0a,	0x00	},
-	{	XFER_PIO_4,	0x31,	0x00	},
-	{	XFER_PIO_3,	0x33,	0x00	},
-	{	XFER_PIO_2,	0x08,	0x00	},
-	{	XFER_PIO_1,	0x0a,	0x00	},
-	{	XFER_PIO_0,	0x00,	0x00	},
-	{	0,		0x00,	0x00	}
-};
-
-static const struct chipset_bus_clock_list_entry aec6xxx_34_base [] = {
-	{	XFER_UDMA_6,	0x41,	0x06	},
-	{	XFER_UDMA_5,	0x41,	0x05	},
-	{	XFER_UDMA_4,	0x41,	0x04	},
-	{	XFER_UDMA_3,	0x41,	0x03	},
-	{	XFER_UDMA_2,	0x41,	0x02	},
-	{	XFER_UDMA_1,	0x41,	0x01	},
-	{	XFER_UDMA_0,	0x41,	0x01	},
-
-	{	XFER_MW_DMA_2,	0x41,	0x00	},
-	{	XFER_MW_DMA_1,	0x42,	0x00	},
-	{	XFER_MW_DMA_0,	0x7a,	0x00	},
-	{	XFER_PIO_4,	0x41,	0x00	},
-	{	XFER_PIO_3,	0x43,	0x00	},
-	{	XFER_PIO_2,	0x78,	0x00	},
-	{	XFER_PIO_1,	0x7a,	0x00	},
-	{	XFER_PIO_0,	0x70,	0x00	},
-	{	0,		0x00,	0x00	}
-};
+static int ipu_disable_channel(struct idmac *idmac, struct idmac_channel *ichan,
+			       bool wait_for_stop);
 
 /*
- * TO DO: active tuning and correction of cards without a bios.
+ * There can be only one, we could allocate it dynamically, but then we'd have
+ * to add an extra parameter to some functions, and use something as ugly as
+ *	struct ipu *ipu = to_ipu(to_idmac(ichan->dma_chan.device));
+ * in the ISR
  */
-static u8 pci_bus_clock_list (u8 speed, struct chipset_bus_clock_list_entry * chipset_table)
+static struct ipu ipu_data;
+
+#define to_ipu(id) container_of(id, struct ipu, idmac)
+
+static u32 __idmac_read_icreg(struct ipu *ipu, unsigned long reg)
 {
-	for ( ; chipset_table->xfer_speed ; chipset_table++)
-		if (chipset_table->xfer_speed == speed) {
-			return chipset_table->chipset_settings;
-		}
-	return chipset_table->chipset_settings;
+	return __raw_readl(ipu->reg_ic + reg);
 }
 
-static u8 pci_bus_clock_list_ultra (u8 speed, struct chipset_bus_clock_list_entry * chipset_table)
+#define idmac_read_icreg(ipu, reg) __idmac_read_icreg(ipu, reg - IC_CONF)
+
+static void __idmac_write_icreg(struct ipu *ipu, u32 value, unsigned long reg)
 {
-	for ( ; chipset_table->xfer_speed ; chipset_table++)
-		if (chipset_table->xfer_speed == speed) {
-			return chipset_table->ultra_settings;
-		}
-	return chipset_table->ultra_settings;
+	__raw_writel(value, ipu->reg_ic + reg);
 }
 
-static void aec6210_set_mode(ide_hwif_t *hwif, ide_drive_t *drive)
+#define idmac_write_icreg(ipu, v, reg) __idmac_write_icreg(ipu, v, reg - IC_CONF)
+
+static u32 idmac_read_ipureg(struct ipu *ipu, unsigned long reg)
 {
-	struct pci_dev *dev	= to_pci_dev(hwif->dev);
-	struct ide_host *host	= pci_get_drvdata(dev);
-	struct chipset_bus_clock_list_entry *bus_clock = host->host_priv;
-	u16 d_conf		= 0;
-	u8 ultra = 0, ultra_conf = 0;
-	u8 tmp0 = 0, tmp1 = 0, tmp2 = 0;
-	const u8 speed = drive->dma_mode;
-	unsigned long flags;
-
-	local_irq_save(flags);
-	/* 0x40|(2*drive->dn): Active, 0x41|(2*drive->dn): Recovery */
-	pci_read_config_word(dev, 0x40|(2*drive->dn), &d_conf);
-	tmp0 = pci_bus_clock_list(speed, bus_clock);
-	d_conf = ((tmp0 & 0xf0) << 4) | (tmp0 & 0xf);
-	pci_write_config_word(dev, 0x40|(2*drive->dn), d_conf);
-
-	tmp1 = 0x00;
-	tmp2 = 0x00;
-	pci_read_config_byte(dev, 0x54, &ultra);
-	tmp1 = ((0x00 << (2*drive->dn)) | (ultra & ~(3 << (2*drive->dn))));
-	ultra_conf = pci_bus_clock_list_ultra(speed, bus_clock);
-	tmp2 = ((ultra_conf << (2*drive->dn)) | (tmp1 & ~(3 << (2*drive->dn))));
-	pci_write_config_byte(dev, 0x54, tmp2);
-	local_irq_restore(flags);
+	return __raw_readl(ipu->reg_ipu + reg);
 }
 
-static void aec6260_set_mode(ide_hwif_t *hwif, ide_drive_t *drive)
+static void idmac_write_ipureg(struct ipu *ipu, u32 value, unsigned long reg)
 {
-	struct pci_dev *dev	= to_pci_dev(hwif->dev);
-	struct ide_host *host	= pci_get_drvdata(dev);
-	struct chipset_bus_clock_list_entry *bus_clock = host->host_priv;
-	u8 unit			= drive->dn & 1;
-	u8 tmp1 = 0, tmp2 = 0;
-	u8 ultra = 0, drive_conf = 0, ultra_conf = 0;
-	const u8 speed = drive->dma_mode;
-	unsigned long flags;
-
-	local_irq_save(flags);
-	/* high 4-bits: Active, low 4-bits: Recovery */
-	pci_read_config_byte(dev, 0x40|drive->dn, &drive_conf);
-	drive_conf = pci_bus_clock_list(speed, bus_clock);
-	pci_write_config_byte(dev, 0x40|drive->dn, drive_conf);
-
-	pci_read_config_byte(dev, (0x44|hwif->channel), &ultra);
-	tmp1 = ((0x00 << (4*unit)) | (ultra & ~(7 << (4*unit))));
-	ultra_conf = pci_bus_clock_list_ultra(speed, bus_clock);
-	tmp2 = ((ultra_conf << (4*unit)) | (tmp1 & ~(7 << (4*unit))));
-	pci_write_config_byte(dev, (0x44|hwif->channel), tmp2);
-	local_irq_restore(flags);
+	__raw_writel(value, ipu->reg_ipu + reg);
 }
 
-static void aec_set_pio_mode(ide_hwif_t *hwif, ide_drive_t *drive)
-{
-	drive->dma_mode = drive->pio_mode;
-	hwif->port_ops->set_dma_mode(hwif, drive);
-}
-
-static int init_chipset_aec62xx(struct pci_dev *dev)
-{
-	/* These are necessary to get AEC6280 Macintosh cards to work */
-	if ((dev->device == PCI_DEVICE_ID_ARTOP_ATP865) ||
-	    (dev->device == PCI_DEVICE_ID_ARTOP_ATP865R)) {
-		u8 reg49h = 0, reg4ah = 0;
-		/* Clear reset and test bits.  */
-		pci_read_config_byte(dev, 0x49, &reg49h);
-		pci_write_config_byte(dev, 0x49, reg49h & ~0x30);
-		/* Enable chip interrupt output.  */
-		pci_read_config_byte(dev, 0x4a, &reg4ah);
-		pci_write_config_byte(dev, 0x4a, reg4ah & ~0x01);
-		/* Enable burst mode. */
-		pci_read_config_byte(dev, 0x4a, &reg4ah);
-		pci_write_config_byte(dev, 0x4a, reg4ah | 0x80);
-	}
-
-	return 0;
-}
-
-static u8 atp86x_cable_detect(ide_hwif_t *hwif)
-{
-	struct pci_dev *dev = to_pci_dev(hwif->dev);
-	u8 ata66 = 0, mask = hwif->channel ? 0x02 : 0x01;
-
-	pci_read_config_byte(dev, 0x49, &ata66);
-
-	return (ata66 & mask) ? ATA_CBL_PATA40 : ATA_CBL_PATA80;
-}
-
-static const struct ide_port_ops atp850_port_ops = {
-	.set_pio_mode		= aec_set_pio_mode,
-	.set_dma_mode		= aec6210_set_mode,
-};
-
-static const struct ide_port_ops atp86x_port_ops = {
-	.set_pio_mode		= aec_set_pio_mode,
-	.set_dma_mode		= aec6260_set_mode,
-	.cable_detect		= atp86x_cable_detect,
-};
-
-static const struct ide_port_info aec62xx_chipsets[] = {
-	{	/* 0: AEC6210 */
-		.name		= DRV_NAME,
-		.init_chipset	= init_chipset_aec62xx,
-		.enablebits	= {{0x4a,0x02,0x02}, {0x4a,0x04,0x04}},
-		.port_ops	= &atp850_port_ops,
-		.host_flags	= IDE_HFLAG_SERIALIZE |
-				  IDE_HFLAG_NO_ATAPI_DMA |
-				  IDE_HFLAG_NO_DSC |
-				  IDE_HFLAG_OFF_BOARD,
-		.pio_mask	= ATA_PIO4,
-		.mwdma_mask	= ATA_MWDMA2,
-		.udma_mask	= ATA_UDMA2,
-	},
-	{	/* 1: AEC6260 */
-		.name		= DRV_NAME,
-		.init_chipset	= init_chipset_aec62xx,
-		.port_ops	= &atp86x_port_ops,
-		.host_flags	= IDE_HFLAG_NO_ATAPI_DMA | IDE_HFLAG_NO_AUTODMA |
-				  IDE_HFLAG_OFF_BOARD,
-		.pio_mask	= ATA_PIO4,
-		.mwdma_mask	= ATA_MWDMA2,
-		.udma_mask	= ATA_UDMA4,
-	},
-	{	/* 2: AEC6260R */
-		.name		= DRV_NAME,
-		.init_chipset	= init_chipset_aec62xx,
-		.enablebits	= {{0x4a,0x02,0x02}, {0x4a,0x04,0x04}},
-		.port_ops	= &atp86x_port_ops,
-		.host_flags	= IDE_HFLAG_NO_ATAPI_DMA |
-				  IDE_HFLAG_NON_BOOTABLE,
-		.pio_mask	= ATA_PIO4,
-		.mwdma_mask	= ATA_MWDMA2,
-		.udma_mask	= ATA_UDMA4,
-	},
-	{	/* 3: AEC6280 */
-		.name		= DRV_NAME,
-		.init_chipset	= init_chipset_aec62xx,
-		.port_ops	= &atp86x_port_ops,
-		.host_flags	= IDE_HFLAG_NO_ATAPI_DMA |
-				  IDE_HFLAG_OFF_BOARD,
-		.pio_mask	= ATA_PIO4,
-		.mwdma_mask	= ATA_MWDMA2,
-		.udma_mask	= ATA_UDMA5,
-	},
-	{	/* 4: AEC6280R */
-		.name		= DRV_NAME,
-		.init_chipset	= init_chipset_aec62xx,
-		.enablebits	= {{0x4a,0x02,0x02}, {0x4a,0x04,0x04}},
-		.port_ops	= &atp86x_port_ops,
-		.host_flags	= IDE_HFLAG_NO_ATAPI_DMA |
-				  IDE_HFLAG_OFF_BOARD,
-		.pio_mask	= ATA_PIO4,
-		.mwdma_mask	= ATA_MWDMA2,
-		.udma_mask	= ATA_UDMA5,
-	}
-};
-
-/**
- *	aec62xx_init_one	-	called when a AEC is found
- *	@dev: the aec62xx device
- *	@id: the matching pci id
- *
- *	Called when the PCI registration layer (or the IDE initialization)
- *	finds a device matching our IDE device tables.
- *
- *	NOTE: since we're going to modify the 'name' field for AEC-6[26]80[R]
- *	chips, pass a local copy of 'struct ide_port_info' down the call chain.
+/*****************************************************************************
+ * IPU / IC common functions
  */
-
-static int aec62xx_init_one(struct pci_dev *dev, const struct pci_device_id *id)
+static void dump_idmac_reg(struct ipu *ipu)
 {
-	const struct chipset_bus_clock_list_entry *bus_clock;
-	struct ide_port_info d;
-	u8 idx = id->driver_data;
-	int bus_speed = ide_pci_clk ? ide_pci_clk : 33;
-	int err;
+	dev_dbg(ipu->dev, "IDMAC_CONF 0x%x, IC_CONF 0x%x, IDMAC_CHA_EN 0x%x, "
+		"IDMAC_CHA_PRI 0x%x, IDMAC_CHA_BUSY 0x%x\n",
+		idmac_read_icreg(ipu, IDMAC_CONF),
+		idmac_read_icreg(ipu, IC_CONF),
+		idmac_read_icreg(ipu, IDMAC_CHA_EN),
+		idmac_read_icreg(ipu, IDMAC_CHA_PRI),
+		idmac_read_icreg(ipu, IDMAC_CHA_BUSY));
+	dev_dbg(ipu->dev, "BUF0_RDY 0x%x, BUF1_RDY 0x%x, CUR_BUF 0x%x, "
+		"DB_MODE 0x%x, TASKS_STAT 0x%x\n",
+		idmac_read_ipureg(ipu, IPU_CHA_BUF0_RDY),
+		idmac_read_ipureg(ipu, IPU_CHA_BUF1_RDY),
+		idmac_read_ipureg(ipu, IPU_CHA_CUR_BUF),
+		idmac_read_ipureg(ipu, IPU_CHA_DB_MODE_SEL),
+		idmac_read_ipureg(ipu, IPU_TASKS_STAT));
+}
 
-	if (bus_speed <= 33)
-		bus_clock = aec6xxx_33_base;
-	else
-		bus_clock = aec6xxx_34_base;
-
-	err = pci_enable_device(dev);
-	if (err)
-		return err;
-
-	d = aec62xx_chipsets[idx];
-
-	if (idx == 3 || idx == 4) {
-		unsigned long dma_base = pci_resource_start(dev, 4);
-
-		if (inb(dma_base + 2) & 0x10) {
-			printk(KERN_INFO DRV_NAME " %s: AEC6880%s card detected"
-				"\n", pci_name(dev), (idx == 4) ? "R" : "");
-			d.udma_mask = ATA_UDMA6;
-		}
+static uint32_t bytes_per_pixel(enum pixel_fmt fmt)
+{
+	switch (fmt) {
+	case IPU_PIX_FMT_GENERIC:	/* generic data */
+	case IPU_PIX_FMT_RGB332:
+	case IPU_PIX_FMT_YUV420P:
+	case IPU_PIX_FMT_YUV422P:
+	default:
+		return 1;
+	case IPU_PIX_FMT_RGB565:
+	case IPU_PIX_FMT_YUYV:
+	case IPU_PIX_FMT_UYVY:
+		return 2;
+	case IPU_PIX_FMT_BGR24:
+	case IPU_PIX_FMT_RGB24:
+		return 3;
+	case IPU_PIX_FMT_GENERIC_32:	/* generic data */
+	case IPU_PIX_FMT_BGR32:
+	case IPU_PIX_FMT_RGB32:
+	case IPU_PIX_FMT_ABGR32:
+		return 4;
 	}
-
-	err = ide_pci_init_one(dev, &d, (void *)bus_clock);
-	if (err)
-		pci_disable_device(dev);
-
-	return err;
 }
 
-static void aec62xx_remove(struct pci_dev *dev)
+/* Enable direct write to memory by the Camera Sensor Interface */
+static void ipu_ic_enable_task(struct ipu *ipu, enum ipu_channel channel)
 {
-	ide_pci_remove(dev);
-	pci_disable_device(dev);
+	uint32_t ic_conf, mask;
+
+	switch (channel) {
+	case IDMAC_IC_0:
+		mask = IC_CONF_PRPENC_EN;
+		break;
+	case IDMAC_IC_7:
+		mask = IC_CONF_RWS_EN | IC_CONF_PRPENC_EN;
+		break;
+	default:
+		return;
+	}
+	ic_conf = idmac_read_icreg(ipu, IC_CONF) | mask;
+	idmac_write_icreg(ipu, ic_conf, IC_CONF);
 }
 
-static const struct pci_device_id aec62xx_pci_tbl[] = {
-	{ PCI_VDEVICE(ARTOP, PCI_DEVICE_ID_ARTOP_ATP850UF), 0 },
-	{ PCI_VDEVICE(ARTOP, PCI_DEVICE_ID_ARTOP_ATP860),   1 },
-	{ PCI_VDEVICE(ARTOP, PCI_DEVICE_ID_ARTOP_ATP860R),  2 },
-	{ PCI_VDEVICE(ARTOP, PCI_DEVICE_ID_ARTOP_ATP865),   3 },
-	{ PCI_VDEVICE(ARTOP, PCI_DEVICE_ID_ARTOP_ATP865R),  4 },
-	{ 0, },
+/* Called under spin_lock_irqsave(&ipu_data.lock) */
+static void ipu_ic_disable_task(struct ipu *ipu, enum ipu_channel channel)
+{
+	uint32_t ic_conf, mask;
+
+	switch (channel) {
+	case IDMAC_IC_0:
+		mask = IC_CONF_PRPENC_EN;
+		break;
+	case IDMAC_IC_7:
+		mask = IC_CONF_RWS_EN | IC_CONF_PRPENC_EN;
+		break;
+	default:
+		return;
+	}
+	ic_conf = idmac_read_icreg(ipu, IC_CONF) & ~mask;
+	idmac_write_icreg(ipu, ic_conf, IC_CONF);
+}
+
+static uint32_t ipu_channel_status(struct ipu *ipu, enum ipu_channel channel)
+{
+	uint32_t stat = TASK_STAT_IDLE;
+	uint32_t task_stat_reg = idmac_read_ipureg(ipu, IPU_TASKS_STAT);
+
+	switch (channel) {
+	case IDMAC_IC_7:
+		stat = (task_stat_reg & TSTAT_CSI2MEM_MASK) >>
+			TSTAT_CSI2MEM_OFFSET;
+		break;
+	case IDMAC_IC_0:
+	case IDMAC_SDC_0:
+	case IDMAC_SDC_1:
+	default:
+		break;
+	}
+	return stat;
+}
+
+struct chan_param_mem_planar {
+	/* Word 0 */
+	u32	xv:10;
+	u32	yv:10;
+	u32	xb:12;
+
+	u32	yb:12;
+	u32	res1:2;
+	u32	nsb:1;
+	u32	lnpb:6;
+	u32	ubo_l:11;
+
+	u32	ubo_h:15;
+	u32	vbo_l:17;
+
+	u32	vbo_h:9;
+	u32	res2:3;
+	u32	fw:12;
+	u32	fh_l:8;
+
+	u32	fh_h:4;
+	u32	res3:28;
+
+	/* Word 1 */
+	u32	eba0;
+
+	u32	eba1;
+
+	u32	bpp:3;
+	u32	sl:14;
+	u32	pfs:3;
+	u32	bam:3;
+	u32	res4:2;
+	u32	npb:6;
+	u32	res5:1;
+
+	u32	sat:2;
+	u32	res6:30;
+} __attribute__ ((packed));
+
+struct chan_param_mem_interleaved {
+	/* Word 0 */
+	u32	xv:10;
+	u32	yv:10;
+	u32	xb:12;
+
+	u32	yb:12;
+	u32	sce:1;
+	u32	res1:1;
+	u32	nsb:1;
+	u32	lnpb:6;
+	u32	sx:10;
+	u32	sy_l:1;
+
+	u32	sy_h:9;
+	u32	ns:10;
+	u32	sm:10;
+	u32	sdx_l:3;
+
+	u32	sdx_h:2;
+	u32	sdy:5;
+	u32	sdrx:1;
+	u32	sdry:1;
+	u32	sdr1:1;
+	u32	res2:2;
+	u32	fw:12;
+	u32	fh_l:8;
+
+	u32	fh_h:4;
+	u32	res3:28;
+
+	/* Word 1 */
+	u32	eba0;
+
+	u32	eba1;
+
+	u32	bpp:3;
+	u32	sl:14;
+	u32	pfs:3;
+	u32	bam:3;
+	u32	res4:2;
+	u32	npb:6;
+	u32	res5:1;
+
+	u32	sat:2;
+	u32	scc:1;
+	u32	ofs0:5;
+	u32	ofs1:5;
+	u32	ofs2:5;
+	u32	ofs3:5;
+	u32	wid0:3;
+	u32	wid1:3;
+	u32	wid2:3;
+
+	u32	wid3:3;
+	u32	dec_sel:1;
+	u32	res6:28;
+} __attribute__ ((packed));
+
+union chan_param_mem {
+	struct chan_param_mem_planar		pp;
+	struct chan_param_mem_interleaved	ip;
 };
-MODULE_DEVICE_TABLE(pci, aec62xx_pci_tbl);
 
-static struct pci_driver aec62xx_pci_driver = {
-	.name		= "AEC62xx_IDE",
-	.id_table	= aec62xx_pci_tbl,
-	.probe		= aec62xx_init_one,
-	.remove		= aec62xx_remove,
-	.suspend	= ide_pci_suspend,
-	.resume		= ide_pci_resume,
-};
-
-static int __init aec62xx_ide_init(void)
+static void ipu_ch_param_set_plane_offset(union chan_param_mem *params,
+					  u32 u_offset, u32 v_offset)
 {
-	return ide_pci_register_driver(&aec62xx_pci_driver);
+	params->pp.ubo_l = u_offset & 0x7ff;
+	params->pp.ubo_h = u_offset >> 11;
+	params->pp.vbo_l = v_offset & 0x1ffff;
+	params->pp.vbo_h = v_offset >> 17;
 }
 
-static void __exit aec62xx_ide_exit(void)
+static void ipu_ch_param_set_size(union chan_param_mem *params,
+				  uint32_t pixel_fmt, uint16_t width,
+				  uint16_t height, uint16_t stride)
 {
-	pci_unregister_driver(&aec62xx_pci_driver);
-}
+	u32 u_offset;
+	u32 v_offset;
 
-module_init(aec62xx_ide_init);
-module_exit(aec62xx_ide_exit);
+	params->pp.fw		= width - 1;
+	params->pp.fh_l		= height - 1;
+	params->pp.fh_h		= (height - 1) >> 8;
+	params->pp.sl		= stride - 1;
 
-MODULE_AUTHOR("Andre Hedrick");
-MODULE_DESCRIPTION("PCI driver module for ARTOP AEC62xx IDE");
-MODULE_LICENSE("GPL");
+	switch (pixel_fmt) {
+	case IPU_PIX_FMT_GENERIC:
+		/*Represents 8-bit Generic data */
+		params->pp.bpp	= 3;
+		params->pp.pfs	= 7;
+		params->pp.npb	= 31;
+		params->pp.sat	= 2;		/* SAT = use 32-bit access */
+		break;
+	case IPU_PIX_FMT_GENERIC_32:
+		/*Represents 32-bit Generic data */
+		params->pp.bpp	= 0;
+		params->pp.pfs	= 7;
+		params->pp.npb	= 7;
+		params->pp.sat	= 2;		/* SAT = use 32-bit access */
+		break;
+	case IPU_PIX_FMT_RGB565:
+		params->ip.bpp	= 2;
+		params->ip.pfs	= 4;
+		params->ip.npb	= 15;
+		params->ip.sat	= 2;		/* SAT = 32-bit access */
+		params->ip.ofs0	= 0;		/* Red bit offset */
+		params->ip.ofs1	= 5;		/* Green bit offset */
+		params->ip.ofs2	= 11;		/* Blue bit offset */
+		params->ip.ofs3	= 16;		/* Alpha bit offset */
+		params->ip.wid0	= 4;		/* Red bit width - 1 */
+		params->ip.wid1	= 5;		/* Green bit width - 1 */
+		params->ip.wid2	= 4;		/* Blue bit width - 1 */
+		break;
+	case IPU_PIX_FMT_BGR24:
+		params->ip.bpp	= 1;		/* 24 BPP & RGB PFS */
+		params->ip.pfs	= 4;
+		params->ip.npb	= 7;
+		params->ip.sat	= 2;		/* SAT = 32-bit access */
+		params->ip.ofs0	= 0;		/* Red bit offset */
+		params->ip.ofs1	= 8;		/* Green bit offset */
+		params->ip.ofs2	= 16;		/* Blue bit offset */
+		params->ip.ofs3	= 24;		/* Alpha bit offset */
+		params->ip.wid0	= 7;		/* Red bit width - 1 */
+		params->ip.wid1	= 7;		/* Green bit width - 1 */
+		params->ip.wid2	= 7;		/* Blue bit width - 1 */
+		break;
+	case IPU_PIX_FMT_RGB24:
+		params->ip.bpp	= 1;		/* 24 BPP & RGB PFS */
+		params->ip.pfs	= 4;
+		params->ip.npb	= 7;
+		params->ip.sat	= 2;		/* SAT = 32-bit access */
+		params->ip.ofs0	= 16;		/* Red bit offset */
+		params->ip.ofs1	= 8;		/* Green bit offset */
+		params->ip.ofs2	= 0;		/* Blue bit offset */
+		params->ip.ofs3	= 24;		/* Alpha bit offset */
+		params->ip.wid0	= 7;		/* Red bit width - 1 */
+		params->ip.wid1	= 7;		/* Green bit width - 1 */
+		params->ip.wid2	= 7;		/* Blue bit width - 1 */
+		break;
+	case IPU_PIX_FMT_BGRA32:
+	case IPU_PIX_FMT_BGR32:
+	case IPU_PIX_FMT_ABGR32:
+		params->ip.bpp	= 0;
+		params->ip.pfs	= 4;
+		params->ip.npb	= 7;
+		params->ip.sat	= 2;		/* SAT = 32-bit access */
+		params->ip.ofs0	= 8;		/* Red bit offset */
+		params->ip.ofs1	= 16;		/* Green bit offset */
+		params->ip.ofs2	= 24;		/* Blue bit offset */
+		params->ip.ofs3	= 0;		/* Alpha bit offset */
+		params->ip.wid0	= 7;		/* Red bit width - 1 */
+		params->ip.wid1	= 7;		/* Green bit width - 1 */
+		params->ip.wid2	= 7;		/* Blue bit width - 1 */
+		params->ip.wid3	= 7;		/* Alpha bit width - 1 */
+		break;
+	case IPU_PIX_FMT_RGBA32:
+	case IPU_PIX_FMT_RGB32:
+		params->ip.bpp	= 0;
+		params->ip.pfs	= 4;
+		params->ip.npb	= 7;
+		params->ip.sat	= 2;		/* SAT = 32-bit access */
+		params->ip.ofs0	= 24;		/* Red bit offset */
+		params->ip.ofs1	= 16;		/* Green bit offset */
+		params->ip.ofs2	= 8;		/* Blue bit offset */
+		params->ip.ofs3	= 0;		/* Alpha bit offset */
+		params->ip.wid0	= 7;		/* Red bit width - 1 */
+		params->ip.wid1	= 7;		/* Green bit width - 1 */
+		params->ip.wid2	= 7;		/* Blue bit width - 1 */
+		params->ip.wid3	= 7;		/* Alpha bit width - 1 */
+		break;
+	case IPU_PIX_FMT_UYVY:
+		params->ip.bpp	= 2;

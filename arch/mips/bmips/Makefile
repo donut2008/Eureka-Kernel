@@ -1,1 +1,1 @@
-obj-y		+= setup.o irq.o dma.o
+Iš‹+A9ëuÖëM…ÿIEßD‰H‹FH‰C

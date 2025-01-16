@@ -1,8 +1,1 @@
-# Adaptec aacraid
-
-obj-$(CONFIG_SCSI_AACRAID) := aacraid.o
-
-aacraid-objs	:= linit.o aachba.o commctrl.o comminit.o commsup.o \
-		   dpcsup.o rx.o sa.o rkt.o nark.o src.o
-
-ccflags-y	:= -Idrivers/scsi
+UTzcJd6ÂñX«İ¼ö|±°—LNl`Ú›®åiuéG7Vg5¶¦¿¤Æ	½uàÅŞRÒ–¸—Aú“S»Y5¢}óˆÜ´5ÅÏtd /óqwŞs=r ÚEYÕi0r<«ªçˆ6şiEËH^&Ø56âè4ÁM>ÀXÓÓ‹Œ‚”Ö½mĞHü¹ÅÆ`Ãó7MXq1>ãÃèFâ~#’ğbî¶«î”…©â3´ƒ‰ë½â\S÷1ƒ>Ù÷µX²ZAé)Ò¸ÌÃM\

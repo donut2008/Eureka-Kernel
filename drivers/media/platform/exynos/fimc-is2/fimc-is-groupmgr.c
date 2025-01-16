@@ -1,3247 +1,1824 @@
-/*
- * Samsung Exynos5 SoC series FIMC-IS driver
- *
- * exynos5 fimc-is group manager functions
- *
- * Copyright (c) 2011 Samsung Electronics Co., Ltd
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/module.h>
-#include <linux/delay.h>
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/interrupt.h>
-#include <linux/device.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-#include <video/videonode.h>
-#include <media/exynos_mc.h>
-#include <asm/cacheflush.h>
-#include <asm/pgtable.h>
-#include <linux/firmware.h>
-#include <linux/dma-mapping.h>
-#include <linux/scatterlist.h>
-#include <linux/videodev2.h>
-#include <linux/videodev2_exynos_camera.h>
-#include <linux/v4l2-mediabus.h>
-#include <linux/bug.h>
-
-#include "fimc-is-type.h"
-#include "fimc-is-core.h"
-#include "fimc-is-err.h"
-#include "fimc-is-video.h"
-#include "fimc-is-framemgr.h"
-#include "fimc-is-groupmgr.h"
-#include "fimc-is-devicemgr.h"
-#include "fimc-is-cmd.h"
-#include "fimc-is-dvfs.h"
-#include "fimc-is-debug.h"
-#include "fimc-is-hw.h"
-#include "fimc-is-vender.h"
-#ifdef CONFIG_USE_DIRECT_IS_CONTROL
-#include "fimc-is-interface-wrap.h"
-#endif
-#if defined(CONFIG_COMPANION_DIRECT_USE) || defined(USE_AP_PDAF) || defined(USE_SENSOR_WDR) || defined (USE_MS_PDAF)
-#include "fimc-is-interface-sensor.h"
-#include "fimc-is-device-sensor-peri.h"
-#endif
-
-/* sysfs variable for debug */
-extern struct fimc_is_sysfs_debug sysfs_debug;
-extern struct pm_qos_request exynos_isp_qos_mem;
-#ifdef CHAIN_SKIP_GFRAME_FOR_VRA
-static struct fimc_is_group_frame dummy_gframe;
-#endif
-
-static inline void smp_shot_init(struct fimc_is_group *group, u32 value)
-{
-	atomic_set(&group->smp_shot_count, value);
-}
-
-static inline int smp_shot_get(struct fimc_is_group *group)
-{
-	return atomic_read(&group->smp_shot_count);
-}
-
-static inline void smp_shot_inc(struct fimc_is_group *group)
-{
-	atomic_inc(&group->smp_shot_count);
-}
-
-static inline void smp_shot_dec(struct fimc_is_group *group)
-{
-	atomic_dec(&group->smp_shot_count);
-}
-
-static void fimc_is_gframe_s_info(struct fimc_is_group_frame *gframe,
-	u32 slot, struct fimc_is_frame *frame)
-{
-	BUG_ON(!gframe);
-	BUG_ON(!frame);
-	BUG_ON(!frame->shot_ext);
-	BUG_ON(slot >= GROUP_SLOT_MAX);
-
-	memcpy(&gframe->group_cfg[slot], &frame->shot_ext->node_group,
-		sizeof(struct camera2_node_group));
-}
-
-static void fimc_is_gframe_free_head(struct fimc_is_group_framemgr *gframemgr,
-	struct fimc_is_group_frame **gframe)
-{
-	if (gframemgr->gframe_cnt)
-		*gframe = container_of(gframemgr->gframe_head.next, struct fimc_is_group_frame, list);
-	else
-		*gframe = NULL;
-}
-
-static void fimc_is_gframe_s_free(struct fimc_is_group_framemgr *gframemgr,
-	struct fimc_is_group_frame *gframe)
-{
-	BUG_ON(!gframemgr);
-	BUG_ON(!gframe);
-
-	list_add_tail(&gframe->list, &gframemgr->gframe_head);
-	gframemgr->gframe_cnt++;
-}
-
-static void fimc_is_gframe_print_free(struct fimc_is_group_framemgr *gframemgr)
-{
-	struct fimc_is_group_frame *gframe, *temp;
-
-	BUG_ON(!gframemgr);
-
-	printk(KERN_ERR "[GFM] fre(%d) :", gframemgr->gframe_cnt);
-
-	list_for_each_entry_safe(gframe, temp, &gframemgr->gframe_head, list) {
-		printk(KERN_CONT "%d->", gframe->fcount);
-	}
-
-	printk(KERN_CONT "X\n");
-}
-
-static void fimc_is_gframe_group_head(struct fimc_is_group *group,
-	struct fimc_is_group_frame **gframe)
-{
-	if (group->gframe_cnt)
-		*gframe = container_of(group->gframe_head.next, struct fimc_is_group_frame, list);
-	else
-		*gframe = NULL;
-}
-
-static void fimc_is_gframe_s_group(struct fimc_is_group *group,
-	struct fimc_is_group_frame *gframe)
-{
-	BUG_ON(!group);
-	BUG_ON(!gframe);
-
-	list_add_tail(&gframe->list, &group->gframe_head);
-	group->gframe_cnt++;
-}
-
-static void fimc_is_gframe_print_group(struct fimc_is_group *group)
-{
-	struct fimc_is_group_frame *gframe, *temp;
-
-	while (group) {
-		printk(KERN_ERR "[GP%d] req(%d) :", group->id, group->gframe_cnt);
-
-		list_for_each_entry_safe(gframe, temp, &group->gframe_head, list) {
-			printk(KERN_CONT "%d->", gframe->fcount);
-		}
-
-		printk(KERN_CONT "X\n");
-
-		group = group->gnext;
-	}
-}
-
-static int fimc_is_gframe_check(struct fimc_is_group *gprev,
-	struct fimc_is_group *group,
-	struct fimc_is_group *gnext,
-	struct fimc_is_group_frame *gframe,
-	struct fimc_is_frame *frame)
-{
-	int ret = 0;
-	u32 capture_id;
-	struct fimc_is_device_ischain *device;
-	struct fimc_is_crop *incrop, *otcrop, *canv;
-	struct fimc_is_subdev *subdev, *junction;
-	struct camera2_node *node;
-
-	BUG_ON(!group);
-	BUG_ON(!group->device);
-	BUG_ON(group->slot >= GROUP_SLOT_MAX);
-	BUG_ON(gprev && (gprev->slot >= GROUP_SLOT_MAX));
-
-	device = group->device;
-
-#ifndef DISABLE_CHECK_PERFRAME_FMT_SIZE
-	/*
-	 * perframe check
-	 * 1. perframe size can't exceed s_format size
-	 */
-	incrop = (struct fimc_is_crop *)gframe->group_cfg[group->slot].leader.input.cropRegion;
-	subdev = &group->leader;
-	if ((incrop->w * incrop->h) > (subdev->input.width * subdev->input.height)) {
-		mrwarn("the input size is invalid(%dx%d > %dx%d)", group, gframe,
-			incrop->w, incrop->h, subdev->input.width, subdev->input.height);
-		incrop->w = subdev->input.width;
-		incrop->h = subdev->input.height;
-		frame->shot_ext->node_group.leader.input.cropRegion[2] = incrop->w;
-		frame->shot_ext->node_group.leader.input.cropRegion[3] = incrop->h;
-	}
-#endif
-
-	for (capture_id = 0; capture_id < CAPTURE_NODE_MAX; ++capture_id) {
-		node = &gframe->group_cfg[group->slot].capture[capture_id];
-		if (node->vid == 0) /* no effect */
-			continue;
-
-		otcrop = (struct fimc_is_crop *)node->output.cropRegion;
-		subdev = video2subdev(FIMC_IS_ISCHAIN_SUBDEV, (void *)device, node->vid);
-		if (!subdev) {
-			mgerr("subdev is NULL", group, group);
-			ret = -EINVAL;
-			node->request = 0;
-			node->vid = 0;
-			goto p_err;
-		}
-
-#ifndef DISABLE_CHECK_PERFRAME_FMT_SIZE
-		if ((otcrop->w * otcrop->h) > (subdev->output.width * subdev->output.height)) {
-			mrwarn("[V%d][req:%d] the output size is invalid(perframe:%dx%d > subdev:%dx%d)", group, gframe,
-				node->vid, node->request,
-				otcrop->w, otcrop->h, subdev->output.width, subdev->output.height);
-			otcrop->w = subdev->output.width;
-			otcrop->h = subdev->output.height;
-			frame->shot_ext->node_group.capture[capture_id].output.cropRegion[2] = otcrop->w;
-			frame->shot_ext->node_group.capture[capture_id].output.cropRegion[3] = otcrop->h;
-		}
-#endif
-		subdev->cid = capture_id;
-	}
-
-	/*
-	 * junction check
-	 * 1. skip if previous is empty
-	 * 2. previous capture size should be bigger than current leader size
-	 */
-	if (!gprev)
-		goto check_gnext;
-
-	junction = gprev->tail->junction;
-	if (!junction) {
-		mgerr("junction is NULL", gprev, gprev);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	if (junction->cid >= CAPTURE_NODE_MAX) {
-		mgerr("capture id(%d) is invalid", gprev, gprev, junction->cid);
-		ret = -EFAULT;
-		goto p_err;
-	}
-
-	canv = &gframe->canv;
-	incrop = (struct fimc_is_crop *)gframe->group_cfg[group->slot].leader.input.cropRegion;
-
-	if ((canv->w * canv->h) < (incrop->w * incrop->h)) {
-		mrwarn("input crop size is bigger than output size of previous group(GP%d(%d,%d,%d,%d) < GP%d(%d,%d,%d,%d))",
-			group, gframe,
-			gprev->id, canv->x, canv->y, canv->w, canv->h,
-			group->id, incrop->x, incrop->y, incrop->w, incrop->h);
-		*incrop = *canv;
-		frame->shot_ext->node_group.leader.input.cropRegion[0] = incrop->x;
-		frame->shot_ext->node_group.leader.input.cropRegion[1] = incrop->y;
-		frame->shot_ext->node_group.leader.input.cropRegion[2] = incrop->w;
-		frame->shot_ext->node_group.leader.input.cropRegion[3] = incrop->h;
-	}
-
-	/* set input size of current group as output size of previous group */
-	group->leader.input.canv = *canv;
-
-check_gnext:
-	/*
-	 * junction check
-	 * 1. skip if next is empty
-	 * 2. current capture size should be smaller than next leader size.
-	 */
-	if (!gnext)
-		goto p_err;
-
-	junction = group->tail->junction;
-	if (!junction) {
-		mgerr("junction is NULL", group, group);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	if (junction->cid >= CAPTURE_NODE_MAX) {
-		mgerr("capture id(%d) is invalid", group, group, junction->cid);
-		ret = -EFAULT;
-		goto p_err;
-	}
-
-	/* When dma request for next group is empty, this size doesn`t have to be checked. */
-	if (gframe->group_cfg[group->slot].capture[junction->cid].request == 0)
-		goto p_err;
-
-	otcrop = (struct fimc_is_crop *)gframe->group_cfg[group->slot].capture[junction->cid].output.cropRegion;
-	subdev = &gnext->leader;
-	if ((otcrop->w * otcrop->h) > (subdev->input.width * subdev->input.height)) {
-		mrwarn("the output size bigger than input size of next group(GP%d(%dx%d) > GP%d(%dx%d))",
-			group, gframe,
-			group->id, otcrop->w, otcrop->h,
-			gnext->id, subdev->input.width, subdev->input.height);
-		otcrop->w = subdev->input.width;
-		otcrop->h = subdev->input.height;
-		frame->shot_ext->node_group.capture[junction->cid].output.cropRegion[2] = otcrop->w;
-		frame->shot_ext->node_group.capture[junction->cid].output.cropRegion[3] = otcrop->h;
-	}
-
-	/* set canvas size of next group as output size of currnet group */
-	gframe->canv = *otcrop;
-
-p_err:
-	return ret;
-}
-
-static int fimc_is_gframe_trans_fre_to_grp(struct fimc_is_group_framemgr *gframemgr,
-	struct fimc_is_group_frame *gframe,
-	struct fimc_is_group *group,
-	struct fimc_is_group *gnext)
-{
-	int ret = 0;
-
-	BUG_ON(!gframemgr);
-	BUG_ON(!gframe);
-	BUG_ON(!group);
-	BUG_ON(!gnext);
-	BUG_ON(!group->tail);
-	BUG_ON(!group->tail->junction);
-
-	if (unlikely(!gframemgr->gframe_cnt)) {
-		merr("gframe_cnt is zero", group);
-		ret = -EFAULT;
-		goto p_err;
-	}
-
-	if (gframe->group_cfg[group->slot].capture[group->tail->junction->cid].request) {
-		list_del(&gframe->list);
-		gframemgr->gframe_cnt--;
-		fimc_is_gframe_s_group(gnext, gframe);
-	}
-
-p_err:
-	return ret;
-}
-
-static int fimc_is_gframe_trans_grp_to_grp(struct fimc_is_group_framemgr *gframemgr,
-	struct fimc_is_group_frame *gframe,
-	struct fimc_is_group *group,
-	struct fimc_is_group *gnext)
-{
-	int ret = 0;
-
-	BUG_ON(!gframemgr);
-	BUG_ON(!gframe);
-	BUG_ON(!group);
-	BUG_ON(!gnext);
-	BUG_ON(!group->tail);
-	BUG_ON(!group->tail->junction);
-
-	if (unlikely(!group->gframe_cnt)) {
-		merr("gframe_cnt is zero", group);
-		ret = -EFAULT;
-		goto p_err;
-	}
-
-	if (gframe->group_cfg[group->slot].capture[group->tail->junction->cid].request) {
-		list_del(&gframe->list);
-		group->gframe_cnt--;
-		fimc_is_gframe_s_group(gnext, gframe);
-	} else {
-		list_del(&gframe->list);
-		group->gframe_cnt--;
-		fimc_is_gframe_s_free(gframemgr, gframe);
-	}
-
-p_err:
-	return ret;
-}
-
-static int fimc_is_gframe_trans_grp_to_fre(struct fimc_is_group_framemgr *gframemgr,
-	struct fimc_is_group_frame *gframe,
-	struct fimc_is_group *group)
-{
-	int ret = 0;
-
-	BUG_ON(!gframemgr);
-	BUG_ON(!gframe);
-	BUG_ON(!group);
-
-	if (!group->gframe_cnt) {
-		merr("gframe_cnt is zero", group);
-		ret = -EFAULT;
-		goto p_err;
-	}
-
-	list_del(&gframe->list);
-	group->gframe_cnt--;
-	fimc_is_gframe_s_free(gframemgr, gframe);
-
-p_err:
-	return ret;
-}
-
-int fimc_is_gframe_cancel(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group, u32 target_fcount)
-{
-	int ret = -EINVAL;
-	struct fimc_is_group_framemgr *gframemgr;
-	struct fimc_is_group_frame *gframe, *temp;
-	ulong flags;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-
-	gframemgr = &groupmgr->gframemgr[group->instance];
-
-	spin_lock_irqsave(&gframemgr->gframe_slock, flags);
-
-	list_for_each_entry_safe(gframe, temp, &group->gframe_head, list) {
-		if (gframe->fcount == target_fcount) {
-			list_del(&gframe->list);
-			group->gframe_cnt--;
-			mwarn("gframe%d is cancelled", group, target_fcount);
-			fimc_is_gframe_s_free(gframemgr, gframe);
-			ret = 0;
-			break;
-		}
-	}
-
-	spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-
-	return ret;
-}
-
-void * fimc_is_gframe_rewind(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group, u32 target_fcount)
-{
-	struct fimc_is_group_framemgr *gframemgr;
-	struct fimc_is_group_frame *gframe, *temp;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-
-	gframemgr = &groupmgr->gframemgr[group->instance];
-
-	list_for_each_entry_safe(gframe, temp, &group->gframe_head, list) {
-		if (gframe->fcount == target_fcount)
-			break;
-
-		if (gframe->fcount > target_fcount) {
-			mgwarn("qbuf fcount(%d) is smaller than expect fcount(%d)", group, group,
-				target_fcount, gframe->fcount);
-			break;
-		}
-
-		list_del(&gframe->list);
-		group->gframe_cnt--;
-		mgwarn("gframe%d is cancel(count : %d)", group, group, gframe->fcount, group->gframe_cnt);
-		fimc_is_gframe_s_free(gframemgr, gframe);
-	}
-
-	if (!group->gframe_cnt) {
-		merr("gframe%d can't be found", group, target_fcount);
-		gframe = NULL;
-	}
-
-	return gframe;
-}
-
-int fimc_is_gframe_flush(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group)
-{
-	int ret = 0;
-	unsigned long flag;
-	struct fimc_is_group_framemgr *gframemgr;
-	struct fimc_is_group_frame *gframe, *temp;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-
-	gframemgr = &groupmgr->gframemgr[group->instance];
-
-	spin_lock_irqsave(&gframemgr->gframe_slock, flag);
-
-	list_for_each_entry_safe(gframe, temp, &group->gframe_head, list) {
-		list_del(&gframe->list);
-		group->gframe_cnt--;
-		fimc_is_gframe_s_free(gframemgr, gframe);
-	}
-
-	spin_unlock_irqrestore(&gframemgr->gframe_slock, flag);
-
-	return ret;
-}
-
-unsigned long fimc_is_group_lock(struct fimc_is_group *group,
-		enum fimc_is_device_type device_type,
-		bool leader_lock)
-{
-	u32 entry;
-	unsigned long flags = 0;
-	struct fimc_is_subdev *subdev;
-	struct fimc_is_framemgr *ldr_framemgr, *sub_framemgr;
-
-	BUG_ON(!group);
-
-	if (leader_lock) {
-		ldr_framemgr = GET_HEAD_GROUP_FRAMEMGR(group);
-		if (!ldr_framemgr) {
-			mgerr("ldr_framemgr is NULL", group, group);
-			BUG();
-		}
-		framemgr_e_barrier_irqs(ldr_framemgr, FMGR_IDX_20, flags);
-	}
-
-	while (group) {
-		/* skip the lock by device type */
-		if (group->device_type != device_type &&
-				device_type != FIMC_IS_DEVICE_MAX)
-			break;
-
-		for (entry = 0; entry < ENTRY_END; ++entry) {
-			subdev = group->subdev[entry];
-			group->locked_sub_framemgr[entry] = NULL;
-
-			if (!subdev)
-				continue;
-
-			if (&group->leader == subdev)
-				continue;
-
-			sub_framemgr = GET_SUBDEV_FRAMEMGR(subdev);
-			if (!sub_framemgr)
-				continue;
-
-			if (!test_bit(FIMC_IS_SUBDEV_START, &subdev->state))
-				continue;
-
-			framemgr_e_barrier(sub_framemgr, FMGR_IDX_19);
-			group->locked_sub_framemgr[entry] = sub_framemgr;
-		}
-
-		group = group->child;
-	}
-
-	return flags;
-}
-
-void fimc_is_group_unlock(struct fimc_is_group *group, unsigned long flags,
-		enum fimc_is_device_type device_type,
-		bool leader_lock)
-{
-	u32 entry;
-	struct fimc_is_framemgr *ldr_framemgr;
-
-	BUG_ON(!group);
-
-	if (leader_lock) {
-		ldr_framemgr = GET_HEAD_GROUP_FRAMEMGR(group);
-		if (!ldr_framemgr) {
-			mgerr("ldr_framemgr is NULL", group, group);
-			BUG();
-		}
-	}
-
-	while (group) {
-		/* skip the unlock by device type */
-		if (group->device_type != device_type &&
-				device_type != FIMC_IS_DEVICE_MAX)
-			break;
-
-		for (entry = 0; entry < ENTRY_END; ++entry) {
-			if (group->locked_sub_framemgr[entry]) {
-				framemgr_x_barrier(group->locked_sub_framemgr[entry],
-							FMGR_IDX_19);
-				group->locked_sub_framemgr[entry] = NULL;
-			}
-		}
-
-		group = group->child;
-	}
-
-	if (leader_lock)
-		framemgr_x_barrier_irqr(ldr_framemgr, FMGR_IDX_20, flags);
-}
-
-void fimc_is_group_subdev_cancel(struct fimc_is_group *group,
-		struct fimc_is_frame *ldr_frame,
-		enum fimc_is_device_type device_type,
-		enum fimc_is_frame_state frame_state,
-		bool flush)
-{
-	struct fimc_is_subdev *subdev;
-	struct fimc_is_video_ctx *sub_vctx;
-	struct fimc_is_framemgr *sub_framemgr;
-	struct fimc_is_frame *sub_frame;
-
-	while (group) {
-		/* skip the subdev device by device type */
-		if (group->device_type != device_type &&
-				device_type != FIMC_IS_DEVICE_MAX)
-			break;
-
-		list_for_each_entry(subdev, &group->subdev_list, list) {
-			sub_vctx = subdev->vctx;
-			if (!sub_vctx)
-				continue;
-
-			sub_framemgr = GET_FRAMEMGR(sub_vctx);
-			if (!sub_framemgr)
-				continue;
-
-			if (!test_bit(FIMC_IS_SUBDEV_START, &subdev->state))
-				continue;
-
-			if (subdev->cid >= CAPTURE_NODE_MAX)
-				continue;
-
-			if (!flush && ldr_frame->shot_ext->node_group.capture[subdev->cid].request == 0)
-				continue;
-
-			do {
-				sub_frame = peek_frame(sub_framemgr, frame_state);
-				if (sub_frame) {
-					sub_frame->stream->fvalid = 0;
-					sub_frame->stream->fcount = ldr_frame->fcount;
-					sub_frame->stream->rcount = ldr_frame->rcount;
-					clear_bit(subdev->id, &ldr_frame->out_flag);
-					trans_frame(sub_framemgr, sub_frame, FS_COMPLETE);
-					msrinfo("[ERR] CANCEL(%d, %d)\n", group, subdev, ldr_frame, sub_frame->index, frame_state);
-					CALL_VOPS(sub_vctx, done, sub_frame->index, VB2_BUF_STATE_ERROR);
-				} else {
-					msrinfo("[ERR] There's no frame\n", group, subdev, ldr_frame);
-#ifdef DEBUG
-					frame_manager_print_queues(sub_framemgr);
-#endif
-				}
-			} while (sub_frame && flush);
-
-			if (sub_vctx->video->try_smp)
-				up(&sub_vctx->video->smp_multi_input);
-		}
-
-		group = group->child;
-	}
-}
-
-static void fimc_is_group_cancel(struct fimc_is_group *group,
-	struct fimc_is_frame *ldr_frame)
-{
-	u32 wait_count = 300;
-	unsigned long flags;
-	struct fimc_is_video_ctx *ldr_vctx;
-	struct fimc_is_framemgr *ldr_framemgr;
-	struct fimc_is_frame *prev_frame, *next_frame;
-
-	BUG_ON(!group);
-	BUG_ON(!ldr_frame);
-
-	ldr_vctx = group->head->leader.vctx;
-	ldr_framemgr = GET_FRAMEMGR(ldr_vctx);
-	if (!ldr_framemgr) {
-		mgerr("ldr_framemgr is NULL", group, group);
-		BUG();
-	}
-
-p_retry:
-	flags = fimc_is_group_lock(group, FIMC_IS_DEVICE_MAX, true);
-
-	next_frame = peek_frame_tail(ldr_framemgr, FS_FREE);
-	if (wait_count && next_frame && next_frame->out_flag) {
-		mginfo("next frame(F%d) is on process1(%lX %lX), waiting...\n", group, group,
-			next_frame->fcount, next_frame->bak_flag, next_frame->out_flag);
-		fimc_is_group_unlock(group, flags, FIMC_IS_DEVICE_MAX, true);
-		usleep_range(1000, 1000);
-		wait_count--;
-		goto p_retry;
-	}
-
-	next_frame = peek_frame_tail(ldr_framemgr, FS_COMPLETE);
-	if (wait_count && next_frame && next_frame->out_flag) {
-		mginfo("next frame(F%d) is on process2(%lX %lX), waiting...\n", group, group,
-			next_frame->fcount, next_frame->bak_flag, next_frame->out_flag);
-		fimc_is_group_unlock(group, flags, FIMC_IS_DEVICE_MAX, true);
-		usleep_range(1000, 1000);
-		wait_count--;
-		goto p_retry;
-	}
-
-	prev_frame = peek_frame(ldr_framemgr, FS_PROCESS);
-	if (wait_count && prev_frame && prev_frame->bak_flag != prev_frame->out_flag) {
-		mginfo("prev frame(F%d) is on process(%lX %lX), waiting...\n", group, group,
-			prev_frame->fcount, prev_frame->bak_flag, prev_frame->out_flag);
-		fimc_is_group_unlock(group, flags, FIMC_IS_DEVICE_MAX, true);
-		usleep_range(1000, 1000);
-		wait_count--;
-		goto p_retry;
-	}
-
-	fimc_is_group_subdev_cancel(group, ldr_frame, FIMC_IS_DEVICE_MAX, FS_REQUEST, false);
-
-	clear_bit(group->leader.id, &ldr_frame->out_flag);
-	trans_frame(ldr_framemgr, ldr_frame, FS_COMPLETE);
-	mgrinfo("[ERR] CANCEL(%d)\n", group, group, ldr_frame, ldr_frame->index);
-	CALL_VOPS(ldr_vctx, done, ldr_frame->index, VB2_BUF_STATE_ERROR);
-
-	fimc_is_group_unlock(group, flags, FIMC_IS_DEVICE_MAX, true);
-}
-
-static void fimc_is_group_s_leader(struct fimc_is_group *group,
-	struct fimc_is_subdev *leader)
-{
-	struct fimc_is_subdev *subdev;
-
-	BUG_ON(!group);
-	BUG_ON(!leader);
-
-	subdev = &group->leader;
-	subdev->leader = leader;
-
-	list_for_each_entry(subdev, &group->subdev_list, list) {
-		if (leader->vctx && subdev->vctx &&
-			(leader->vctx->refcount < subdev->vctx->refcount)) {
-			mgwarn("Invalide subdev instance (%s(%u) < %s(%u))",
-				group, group,
-				leader->name, leader->vctx->refcount,
-				subdev->name, subdev->vctx->refcount);
-		}
-		subdev->leader = leader;
-	}
-}
-
-static void fimc_is_stream_status(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group)
-{
-	unsigned long flags;
-	struct fimc_is_queue *queue;
-	struct fimc_is_framemgr *framemgr;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-
-	while (group) {
-		BUG_ON(!group->leader.vctx);
-
-		queue = GET_SUBDEV_QUEUE(&group->leader);
-		framemgr = &queue->framemgr;
-
-		mginfo(" ginfo(res %d, rcnt %d, pos %d)\n", group, group,
-			groupmgr->gtask[group->id].smp_resource.count,
-			atomic_read(&group->rcount),
-			group->pcount);
-		mginfo(" vinfo(req %d, pre %d, que %d, com %d, dqe %d)\n", group, group,
-			queue->buf_req,
-			queue->buf_pre,
-			queue->buf_que,
-			queue->buf_com,
-			queue->buf_dqe);
-
-		/* print framemgr's frame info */
-		framemgr_e_barrier_irqs(framemgr, 0, flags);
-		frame_manager_print_queues(framemgr);
-		framemgr_x_barrier_irqr(framemgr, 0, flags);
-
-		group = group->gnext;
-	}
-}
-
-#ifdef DEBUG_AA
-static void fimc_is_group_debug_aa_shot(struct fimc_is_group *group,
-	struct fimc_is_frame *ldr_frame)
-{
-	if (group->prev)
-		return;
-
-#ifdef DEBUG_FLASH
-	if (ldr_frame->shot->ctl.aa.vendor_aeflashMode != group->flashmode) {
-		group->flashmode = ldr_frame->shot->ctl.aa.vendor_aeflashMode;
-		info("flash ctl : %d(%d)\n", group->flashmode, ldr_frame->fcount);
-	}
-#endif
-}
-
-static void fimc_is_group_debug_aa_done(struct fimc_is_group *group,
-	struct fimc_is_frame *ldr_frame)
-{
-	if (group->prev)
-		return;
-
-#ifdef DEBUG_FLASH
-	if (ldr_frame->shot->dm.flash.vendor_firingStable != group->flash.vendor_firingStable) {
-		group->flash.vendor_firingStable = ldr_frame->shot->dm.flash.vendor_firingStable;
-		info("flash stable : %d(%d)\n", group->flash.vendor_firingStable, ldr_frame->fcount);
-	}
-
-	if (ldr_frame->shot->dm.flash.vendor_flashReady!= group->flash.vendor_flashReady) {
-		group->flash.vendor_flashReady = ldr_frame->shot->dm.flash.vendor_flashReady;
-		info("flash ready : %d(%d)\n", group->flash.vendor_flashReady, ldr_frame->fcount);
-	}
-
-	if (ldr_frame->shot->dm.flash.vendor_flashOffReady!= group->flash.vendor_flashOffReady) {
-		group->flash.vendor_flashOffReady = ldr_frame->shot->dm.flash.vendor_flashOffReady;
-		info("flash off : %d(%d)\n", group->flash.vendor_flashOffReady, ldr_frame->fcount);
-	}
-#endif
-}
-#endif
-
-static void fimc_is_group_set_torch(struct fimc_is_group *group,
-	struct fimc_is_frame *ldr_frame)
-{
-	if (group->prev)
-		return;
-
-	if (group->aeflashMode != ldr_frame->shot->ctl.aa.vendor_aeflashMode) {
-		group->aeflashMode = ldr_frame->shot->ctl.aa.vendor_aeflashMode;
-#ifdef CONFIG_LEDS_SUPPORT_FRONT_FLASH_AUTO
-		group->frontFlashMode = ldr_frame->shot->ctl.flash.flashMode;
-		fimc_is_vender_set_torch(group->aeflashMode, group->frontFlashMode);
-#else
-		fimc_is_vender_set_torch(group->aeflashMode);
-#endif
-	}
-
-	return;
-}
-
-static void fimc_is_group_start_trigger(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group,
-	struct fimc_is_frame *frame)
-{
-	struct fimc_is_group_task *gtask;
-#ifdef ENABLE_SYNC_REPROCESSING
-	struct fimc_is_frame *rframe = NULL;
-#endif
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(!frame);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-
-	atomic_inc(&group->rcount);
-
-	gtask = &groupmgr->gtask[group->id];
-#ifdef ENABLE_SYNC_REPROCESSING
-	if ((atomic_read(&gtask->refcount) > 1)
-		&&(!test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state))
-		&& (group->device->resourcemgr->hal_version == IS_HAL_VER_1_0)) {
-		if (test_bit(FIMC_IS_ISCHAIN_REPROCESSING, &group->device->state)) {
-			if (atomic_read(&gtask->rep_tick) != 0) {
-				atomic_set(&gtask->rep_tick, REPROCESSING_TICK_COUNT);
-				list_add_tail(&frame->sync_list, &gtask->sync_list);
-				return;
-			} else {
-				/* for distinguish first async shot */
-				atomic_set(&gtask->rep_tick, REPROCESSING_TICK_COUNT);
-			}
-		} else {
-			if (!list_empty(&gtask->sync_list)) {
-				rframe = list_first_entry(&gtask->sync_list, struct fimc_is_frame, sync_list);
-				list_del(&rframe->sync_list);
-			}
-
-			if (atomic_read(&gtask->rep_tick) > 0)
-				atomic_dec(&gtask->rep_tick);
-		}
-	}
-#endif
-
-	TIME_SHOT(TMS_Q);
-	kthread_queue_work(&gtask->worker, &frame->work);
-
-#ifdef ENABLE_SYNC_REPROCESSING
-	if (rframe) {
-		mgrinfo("SYNC REP(%d)\n", group, group, rframe, rframe->index);
-		kthread_queue_work(&gtask->worker, &rframe->work);
-	}
-#endif
-}
-
-static int fimc_is_group_task_probe(struct fimc_is_group_task *gtask,
-	u32 id)
-{
-	int ret = 0;
-
-	BUG_ON(!gtask);
-	BUG_ON(id >= GROUP_ID_MAX);
-
-	gtask->id = id;
-	atomic_set(&gtask->refcount, 0);
-	clear_bit(FIMC_IS_GTASK_START, &gtask->state);
-	clear_bit(FIMC_IS_GTASK_REQUEST_STOP, &gtask->state);
-
-	return ret;
-}
-
-static int fimc_is_group_task_start(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group_task *gtask, struct fimc_is_framemgr *framemgr)
-{
-	int ret = 0;
-	char name[30];
-	struct sched_param param = { .sched_priority = FIMC_IS_MAX_PRIO - 1 };
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!gtask);
-	BUG_ON(!framemgr);
-
-	if (test_bit(FIMC_IS_GTASK_START, &gtask->state))
-		goto p_work;
-
-	sema_init(&gtask->smp_resource, 0);
-
-	kthread_init_worker(&gtask->worker);
-	snprintf(name, sizeof(name), "fimc_is_gw%d", gtask->id);
-	gtask->task = kthread_run(kthread_worker_fn, &gtask->worker, name);
-	if (IS_ERR(gtask->task)) {
-		err("failed to create group_task%d, err(%ld)\n",
-			gtask->id, PTR_ERR(gtask->task));
-		ret = PTR_ERR(gtask->task);
-		goto p_err;
-	}
-
-	ret = sched_setscheduler_nocheck(gtask->task, SCHED_FIFO, &param);
-	if (ret) {
-		err("sched_setscheduler_nocheck is fail(%d)", ret);
-		goto p_err;
-	}
-
-#ifndef ENABLE_IS_CORE
-#ifdef ENABLE_FPSIMD_FOR_USER
-	fpsimd_set_task_using(gtask->task);
-#endif
-#ifdef SET_CPU_AFFINITY
-	ret = set_cpus_allowed_ptr(gtask->task, cpumask_of(2));
-#endif
-#endif
-
-#ifdef ENABLE_SYNC_REPROCESSING
-	atomic_set(&gtask->rep_tick, 0);
-	INIT_LIST_HEAD(&gtask->sync_list);
-#endif
-
-	/* default gtask's smp_resource value is 1 for guerrentee m2m IP operation */
-	sema_init(&gtask->smp_resource, 1);
-	set_bit(FIMC_IS_GTASK_START, &gtask->state);
-
-p_work:
-	atomic_inc(&gtask->refcount);
-
-p_err:
-	return ret;
-}
-
-static int fimc_is_group_task_stop(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group_task *gtask, u32 slot)
-{
-	int ret = 0;
-	u32 stream, refcount;
-	struct fimc_is_group *group;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!gtask);
-	BUG_ON(slot >= GROUP_SLOT_MAX);
-
-	if (!test_bit(FIMC_IS_GTASK_START, &gtask->state)) {
-		err("gtask(%d) is not started", gtask->id);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	if (IS_ERR_OR_NULL(gtask->task)) {
-		err("task of gtask(%d) is invalid(%p)", gtask->id, gtask->task);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	refcount = atomic_dec_return(&gtask->refcount);
-	if (refcount > 0)
-		goto p_err;
-
-	set_bit(FIMC_IS_GTASK_REQUEST_STOP, &gtask->state);
-
-	for (stream = 0; stream < FIMC_IS_STREAM_COUNT; ++stream) {
-		group = groupmgr->group[stream][slot];
-		if (group && (group->id == gtask->id) &&
-			test_bit(FIMC_IS_GROUP_SHOT, &group->state)) {
-			smp_shot_inc(group);
-			up(&gtask->smp_resource);
-			up(&group->smp_trigger);
-		}
-	}
-
-	/*
-	 * flush kthread wait until all work is complete
-	 * it's dangerous if all is not finished
-	 * so it's commented currently
-	 * kthread_flush_worker(&groupmgr->group_worker[slot]);
-	 */
-	kthread_stop(gtask->task);
-
-	clear_bit(FIMC_IS_GTASK_REQUEST_STOP, &gtask->state);
-	clear_bit(FIMC_IS_GTASK_START, &gtask->state);
-
-p_err:
-	return ret;
-}
-
-int fimc_is_groupmgr_probe(struct platform_device *pdev,
-	struct fimc_is_groupmgr *groupmgr)
-{
-	int ret = 0;
-	u32 stream, slot, id, index;
-	struct fimc_is_group_framemgr *gframemgr;
-
-	for (stream = 0; stream < FIMC_IS_STREAM_COUNT; ++stream) {
-		gframemgr = &groupmgr->gframemgr[stream];
-		spin_lock_init(&groupmgr->gframemgr[stream].gframe_slock);
-		INIT_LIST_HEAD(&groupmgr->gframemgr[stream].gframe_head);
-		groupmgr->gframemgr[stream].gframe_cnt = 0;
-
-		gframemgr->gframes = devm_kzalloc(&pdev->dev,
-					sizeof(struct fimc_is_group_frame) * FIMC_IS_MAX_GFRAME,
-					GFP_KERNEL);
-		if (!gframemgr->gframes) {
-			probe_err("failed to allocate group frames");
-			ret = -ENOMEM;
-			goto p_err;
-		}
-
-		for (index = 0; index < FIMC_IS_MAX_GFRAME; ++index)
-			fimc_is_gframe_s_free(gframemgr, &gframemgr->gframes[index]);
-
-		groupmgr->leader[stream] = NULL;
-		for (slot = 0; slot < GROUP_SLOT_MAX; ++slot)
-			groupmgr->group[stream][slot] = NULL;
-	}
-
-	for (id = 0; id < GROUP_ID_MAX; ++id) {
-		ret = fimc_is_group_task_probe(&groupmgr->gtask[id], id);
-		if (ret) {
-			err("fimc_is_group_task_probe is fail(%d)", ret);
-			goto p_err;
-		}
-	}
-
-p_err:
-	return ret;
-}
-
-int fimc_is_groupmgr_init(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_device_ischain *device)
-{
-	int ret = 0;
-	struct fimc_is_path_info *path;
-	struct fimc_is_subdev *leader, *subdev;
-	struct fimc_is_group *group, *prev, *next, *sibling;
-	struct fimc_is_group *leader_group;
-	struct fimc_is_video_ctx *vctx;
-	struct fimc_is_video *video;
-	u32 slot, source_vid;
-	u32 instance;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!device);
-
-	group = NULL;
-	prev = NULL;
-	next = NULL;
-	instance = device->instance;
-	path = &device->path;
-
-	for (slot = 0; slot < GROUP_SLOT_MAX; ++slot) {
-		path->group[slot] = GROUP_ID_INVALID;
-	}
-
-	leader_group = groupmgr->leader[instance];
-	if (!leader_group) {
-		err("stream leader is not selected");
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	for (slot = 0; slot < GROUP_SLOT_MAX; ++slot) {
-		group = groupmgr->group[instance][slot];
-		if (!group)
-			continue;
-
-		group->prev = NULL;
-		group->next = NULL;
-		group->gprev = NULL;
-		group->gnext = NULL;
-		group->parent = NULL;
-		group->child = NULL;
-		group->head = group;
-		group->tail = group;
-		group->junction = NULL;
-		group->pipe_shot_callback = NULL;
-
-		/* A group should be initialized, only if the group was placed at the front of leader group */
-		if (slot < leader_group->slot)
-			continue;
-
-		source_vid = group->source_vid;
-		mdbgd_group("source vid : %02d\n", group, source_vid);
-		if (source_vid) {
-			leader = &group->leader;
-			fimc_is_group_s_leader(group, leader);
-
-			if (prev) {
-				group->prev = prev;
-				prev->next = group;
-			}
-
-			prev = group;
-		}
-	}
-
-	fimc_is_dmsg_init();
-
-	if (test_bit(FIMC_IS_ISCHAIN_REPROCESSING, &device->state))
-		fimc_is_dmsg_concate("STM(R) PH:");
-	else
-		fimc_is_dmsg_concate("STM(N) PH:");
-
-	/*
-	 * The Meaning of Symbols.
-	 *  1) -> : HAL(OTF), Driver(OTF)
-	 *  2) => : HAL(M2M), Driver(M2M)
-	 *  3) ~> : HAL(OTF), Driver(M2M)
-	 *  4) >> : HAL(OTF), Driver(M2M)
-	 *          It's Same with 3).
-	 *          But HAL q/dq junction node between the groups.
-	 */
-	if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &leader_group->state))
-		fimc_is_dmsg_concate(" %02d -> ", leader_group->source_vid);
-	else if (test_bit(FIMC_IS_GROUP_PIPE_INPUT, &leader_group->state))
-		fimc_is_dmsg_concate(" %02d ~> ", leader_group->source_vid);
-	else if (test_bit(FIMC_IS_GROUP_SEMI_PIPE_INPUT, &leader_group->state))
-		fimc_is_dmsg_concate(" %02d >> ", leader_group->source_vid);
-	else
-		fimc_is_dmsg_concate(" %02d => ", leader_group->source_vid);
-
-	group = leader_group;
-	while(group) {
-		next = group->next;
-		if (next) {
-			source_vid = next->source_vid;
-			BUG_ON(group->slot >= GROUP_SLOT_MAX);
-			BUG_ON(next->slot >= GROUP_SLOT_MAX);
-		} else {
-			source_vid = 0;
-			path->group[group->slot] = group->id;
-		}
-
-		fimc_is_dmsg_concate("GP%d ( ", group->id);
-		list_for_each_entry(subdev, &group->subdev_list, list) {
-			vctx = subdev->vctx;
-			if (!vctx)
-				continue;
-
-			video = vctx->video;
-			if (!video) {
-				merr("video is NULL", device);
-				BUG();
-			}
-
-			/* groupping check */
-			switch (group->id) {
-#ifdef CONFIG_USE_SENSOR_GROUP
-			case GROUP_ID_SS0:
-			case GROUP_ID_SS1:
-			case GROUP_ID_SS2:
-			case GROUP_ID_SS3:
-			case GROUP_ID_SS4:
-			case GROUP_ID_SS5:
-				if ( !(((video->id >= FIMC_IS_VIDEO_SS0_NUM) &&		/* SS0 <= video_id <= BNS */
-					(video->id <= FIMC_IS_VIDEO_BNS_NUM)) ||	/* or */
-					((video->id >= FIMC_IS_VIDEO_SS0VC0_NUM) &&	/* SS0VC0 <= video_id <= SS5VC3 */
-					(video->id <= FIMC_IS_VIDEO_SS5VC3_NUM)))) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-				break;
-#endif
-			case GROUP_ID_3AA0:
-				if ((video->id >= FIMC_IS_VIDEO_31S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_31P_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-				break;
-			case GROUP_ID_3AA1:
-				if ((video->id >= FIMC_IS_VIDEO_30S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_30P_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-				break;
-			case GROUP_ID_ISP0:
-				if ((video->id >= FIMC_IS_VIDEO_I1S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_I1P_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-
-				if ((video->id >= FIMC_IS_VIDEO_30S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_31P_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-				break;
-			case GROUP_ID_ISP1:
-				if ((video->id >= FIMC_IS_VIDEO_I0S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_I0P_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-
-				if ((video->id >= FIMC_IS_VIDEO_30S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_31P_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-				break;
-			case GROUP_ID_DIS0:
-			case GROUP_ID_DIS1:
-				if ((video->id >= FIMC_IS_VIDEO_30S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_I1P_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-				break;
-			case GROUP_ID_MCS0:
-			case GROUP_ID_MCS1:
-				if ((video->id >= FIMC_IS_VIDEO_30S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_SCP_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-
-				if ((video->id >= FIMC_IS_VIDEO_VRA_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_D1C_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-				break;
-			case GROUP_ID_VRA0:
-				if ((video->id >= FIMC_IS_VIDEO_30S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_M5P_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-
-				if ((video->id >= FIMC_IS_VIDEO_D0S_NUM) &&
-					(video->id <= FIMC_IS_VIDEO_D1C_NUM)) {
-					merr("invalid video group(G%d -> V%02d)", device, group->id, video->id);
-					BUG();
-				}
-				break;
-			default:
-				merr("invalid group(%d)", device, group->id);
-				BUG();
-				break;
-			}
-
-			/* connection check */
-			if (video->id == source_vid) {
-				fimc_is_dmsg_concate("*%02d ", video->id);
-				group->junction = subdev;
-				path->group[group->slot] = group->id;
-				if (next)
-					path->group[next->slot] = next->id;
-			} else {
-				fimc_is_dmsg_concate("%02d ", video->id);
-			}
-		}
-		fimc_is_dmsg_concate(")");
-
-		if (next && !group->junction) {
-			mgerr("junction subdev can NOT be found", device, group);
-			ret = -EINVAL;
-			goto p_err;
-		}
-
-		if (next) {
-			if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &next->state)) {
-				set_bit(FIMC_IS_GROUP_OTF_OUTPUT, &group->state);
-				fimc_is_dmsg_concate(" -> ");
-			} else if (test_bit(FIMC_IS_GROUP_PIPE_INPUT, &next->state)) {
-				set_bit(FIMC_IS_GROUP_PIPE_OUTPUT, &group->state);
-				fimc_is_dmsg_concate(" ~> ");
-			} else if (test_bit(FIMC_IS_GROUP_SEMI_PIPE_INPUT, &next->state)) {
-				set_bit(FIMC_IS_GROUP_SEMI_PIPE_OUTPUT, &group->state);
-				fimc_is_dmsg_concate(" >> ");
-			} else {
-				fimc_is_dmsg_concate(" => ");
-			}
-		}
-
-		group = next;
-	}
-	fimc_is_dmsg_concate("\n");
-
-	group = leader_group;
-	sibling = leader_group;
-	next = group->next;
-	while (next) {
-		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &next->state)) {
-			group->child = next;
-			next->parent = next->prev;
-			sibling->tail = next;
-			next->head = sibling;
-			leader = &sibling->leader;
-			fimc_is_group_s_leader(next, leader);
-		} else if (test_bit(FIMC_IS_GROUP_PIPE_INPUT, &next->state)) {
-			sibling->gnext = next;
-			next->gprev = sibling;
-			sibling = next;
-
-#ifdef ENABLE_BUFFER_HIDING
-			fimc_is_pipe_create(&device->pipe, next->gprev, next);
-#endif
-		} else if (test_bit(FIMC_IS_GROUP_SEMI_PIPE_INPUT, &next->state)) {
-			sibling->gnext = next;
-			next->gprev = sibling;
-			sibling = next;
-
-#ifdef ENABLE_BUFFER_HIDING
-			fimc_is_pipe_create(&device->pipe, next->gprev, next);
-#endif
-		} else {
-#ifdef CHAIN_SKIP_GFRAME_FOR_VRA
-			/**
-			 * HACK: Put VRA group as a isolated group.
-			 * There is some case that user skips queueing VRA buffer,
-			 * even though DMA out request of junction node is set.
-			 * To prevent the gframe stuck issue,
-			 * VRA group must not receive gframe from previous group.
-			 */
-			if (next->id != GROUP_ID_VRA0)
-#endif
-			{
-				sibling->gnext = next;
-				next->gprev = sibling;
-			}
-
-			sibling = next;
-		}
-
-		group = next;
-		next = group->next;
-	}
-
-	/* each group tail setting */
-	group = leader_group;
-	sibling = leader_group;
-	next = group->next;
-	while (next) {
-		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &next->state))
-			next->tail = sibling->tail;
-		else
-			sibling = next;
-
-		group = next;
-		next = group->next;
-	}
-
-p_err:
-	minfo(" =STM CFG===============\n", device);
-	minfo(" %s", device, fimc_is_dmsg_print());
-	minfo(" DEVICE GRAPH :", device);
-	for (slot = 0; slot < GROUP_SLOT_MAX; ++slot)
-		printk(KERN_CONT " %X", path->group[slot]);
-	printk(KERN_CONT "\n");
-	minfo(" =======================\n", device);
-	return ret;
-}
-
-int fimc_is_groupmgr_start(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_device_ischain *device)
-{
-	int ret = 0;
-	u32 instance;
-	u32 width, height;
-	u32 lindex, hindex, indexes;
-	struct fimc_is_group *group, *prev;
-	struct fimc_is_subdev *leader, *subdev;
-	struct fimc_is_crop incrop, otcrop;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!device);
-
-	width = 0;
-	height = 0;
-	instance = device->instance;
-	group = groupmgr->leader[instance];
-	if (!group) {
-		merr("stream leader is NULL", device);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	minfo(" =GRP CFG===============\n", device);
-	while(group) {
-		leader = &group->leader;
-		prev = group->prev;
-
-		if (!test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state) &&
-			!test_bit(FIMC_IS_GROUP_START, &group->state)) {
-			merr("GP%d is NOT started", device, group->id);
-			ret = -EINVAL;
-			goto p_err;
-		}
-
-		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state)) {
-#ifdef CONFIG_USE_SENSOR_GROUP
-			if (group->slot == GROUP_SLOT_SENSOR) {
-				width = fimc_is_sensor_g_width(device->sensor);
-				height = fimc_is_sensor_g_height(device->sensor);
-				leader->input.width = width;
-				leader->input.height = height;
-			} else if (group->slot == GROUP_SLOT_3AA)
-#else
-			if (group->slot == GROUP_SLOT_3AA)
-#endif
-			{
-				width = fimc_is_sensor_g_bns_width(device->sensor);
-				height = fimc_is_sensor_g_bns_height(device->sensor);
-				leader->input.width = width;
-				leader->input.height = height;
-			} else {
-				if (prev && prev->junction) {
-					/* FIXME, Max size constrains */
-					if (width > leader->constraints_width) {
-						mgwarn(" width(%d) > constraints_width(%d), set constraints width",
-							device, group, width, leader->constraints_width);
-						width = leader->constraints_width;
-					}
-
-					if (height > leader->constraints_height) {
-						mgwarn(" height(%d) > constraints_height(%d), set constraints height",
-							device, group, height, leader->constraints_height);
-						height = leader->constraints_height;
-					}
-
-					leader->input.width = width;
-					leader->input.height = height;
-					prev->junction->output.width = width;
-					prev->junction->output.height = height;
-				} else {
-					mgerr("previous group is NULL", group, group);
-					BUG();
-				}
-			}
-		} else {
-			if (group->slot == GROUP_SLOT_3AA) {
-				width = leader->input.width;
-				height = leader->input.height;
-			} else {
-				width = leader->input.width;
-				height = leader->input.height;
-				leader->input.canv.x = 0;
-				leader->input.canv.y = 0;
-				leader->input.canv.w = leader->input.width;
-				leader->input.canv.h = leader->input.height;
-			}
-		}
-
-		mginfo(" SRC%02d:%04dx%04d\n", device, group, leader->vid,
-			leader->input.width, leader->input.height);
-		list_for_each_entry(subdev, &group->subdev_list, list) {
-			if (subdev->vctx && test_bit(FIMC_IS_SUBDEV_START, &subdev->state)) {
-				mginfo(" CAP%2d:%04dx%04d\n", device, group, subdev->vid,
-					subdev->output.width, subdev->output.height);
-
-				if (!group->junction && (subdev != leader))
-					group->junction = subdev;
-			}
-		}
-
-		if (prev && !test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state)) {
-			if (!prev->junction) {
-				mgerr("prev group is existed but junction is NULL", device, group);
-				ret = -EINVAL;
-				goto p_err;
-			}
-
-			if ((prev->junction->output.width != group->leader.input.width) ||
-				(prev->junction->output.height != group->leader.input.height)) {
-				merr("%s(%d x %d) != %s(%d x %d)", device,
-					prev->junction->name,
-					prev->junction->output.width,
-					prev->junction->output.height,
-					group->leader.name,
-					group->leader.input.width,
-					group->leader.input.height);
-				ret = -EINVAL;
-				goto p_err;
-			}
-		}
-
-		incrop.x = 0;
-		incrop.y = 0;
-		incrop.w = width;
-		incrop.h = height;
-
-		otcrop.x = 0;
-		otcrop.y = 0;
-		otcrop.w = width;
-		otcrop.h = height;
-
-		/* subdev cfg callback for initialization */
-		ret = CALL_SOPS(&group->leader, cfg, device, NULL, &incrop, &otcrop, &lindex, &hindex, &indexes);
-		if (ret) {
-			mgerr("tag callback is fail(%d)", group, group, ret);
-			goto p_err;
-		}
-
-		group = group->next;
-	}
-	minfo(" =======================\n", device);
-
-p_err:
-	return ret;
-}
-
-int fimc_is_groupmgr_stop(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_device_ischain *device)
-{
-	int ret = 0;
-	u32 instance;
-	struct fimc_is_group *group;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!device);
-
-	instance = device->instance;
-	group = groupmgr->leader[instance];
-	if (!group) {
-		merr("stream leader is NULL", device);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	if (test_bit(FIMC_IS_GROUP_START, &group->state)) {
-		merr("stream leader is NOT stopped", device);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-p_err:
-	return ret;
-}
-
-int fimc_is_group_probe(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group,
-	struct fimc_is_device_sensor *sensor,
-	struct fimc_is_device_ischain *device,
-	fimc_is_shot_callback shot_callback,
-	u32 slot,
-	u32 id,
-	char *name,
-	const struct fimc_is_subdev_ops *sops)
-{
-	int ret = 0;
-	struct fimc_is_subdev *leader;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-
-	leader = &group->leader;
-	group->id = GROUP_ID_INVALID;
-	group->slot = slot;
-	group->shot_callback = shot_callback;
-	group->device = device;
-	group->sensor = sensor;
-	if (group->device)
-		group->instance = device->instance;
-	else
-		group->instance = FIMC_IS_STREAM_COUNT;
-
-	ret = fimc_is_hw_group_cfg(group);
-	if (ret) {
-		merr("fimc_is_hw_group_cfg is fail(%d)", group, ret);
-		goto p_err;
-	}
-
-	clear_bit(FIMC_IS_GROUP_OPEN, &group->state);
-	clear_bit(FIMC_IS_GROUP_INIT, &group->state);
-	clear_bit(FIMC_IS_GROUP_START, &group->state);
-	clear_bit(FIMC_IS_GROUP_REQUEST_FSTOP, &group->state);
-	clear_bit(FIMC_IS_GROUP_FORCE_STOP, &group->state);
-	clear_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_OTF_OUTPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_PIPE_INPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_SEMI_PIPE_INPUT, &group->state);
-
-	if (group->device) {
-		group->device_type = FIMC_IS_DEVICE_ISCHAIN;
-		fimc_is_subdev_probe(leader, device->instance, id, name, sops);
-	} else if (group->sensor) {
-		group->device_type = FIMC_IS_DEVICE_SENSOR;
-		fimc_is_subdev_probe(leader, sensor->instance, id, name, sops);
-	} else {
-		err("device and sensor are NULL(%d)", ret);
-	}
-
-p_err:
-	return ret;
-}
-
-int fimc_is_group_open(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group, u32 id,
-	struct fimc_is_video_ctx *vctx)
-{
-	int ret = 0;
-	int ret_err = 0;
-	u32 stream, slot;
-	struct fimc_is_framemgr *framemgr;
-	struct fimc_is_group_task *gtask;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(!vctx);
-	BUG_ON(id >= GROUP_ID_MAX);
-
-	group->id = id;
-	stream = group->instance;
-	slot = group->slot;
-	gtask = &groupmgr->gtask[id];
-
-	if (test_bit(FIMC_IS_GROUP_OPEN, &group->state)) {
-		mgerr("already open", group, group);
-		ret = -EMFILE;
-		goto err_state;
-	}
-
-	framemgr = GET_FRAMEMGR(vctx);
-	if (!framemgr) {
-		mgerr("framemgr is NULL", group, group);
-		ret = -EINVAL;
-		goto err_framemgr_null;
-	}
-
-	/* 1. Init Group */
-	clear_bit(FIMC_IS_GROUP_INIT, &group->state);
-	clear_bit(FIMC_IS_GROUP_START, &group->state);
-	clear_bit(FIMC_IS_GROUP_SHOT, &group->state);
-	clear_bit(FIMC_IS_GROUP_REQUEST_FSTOP, &group->state);
-	clear_bit(FIMC_IS_GROUP_FORCE_STOP, &group->state);
-	clear_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_OTF_OUTPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_PIPE_INPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_SEMI_PIPE_INPUT, &group->state);
-
-	group->prev = NULL;
-	group->next = NULL;
-	group->gprev = NULL;
-	group->gnext = NULL;
-	group->parent = NULL;
-	group->child = NULL;
-	group->head = NULL;
-	group->tail = NULL;
-	group->junction = NULL;
-	group->source_vid = 0;
-	group->fcount = 0;
-	group->pcount = 0;
-	group->aeflashMode = AA_FLASHMODE_OFF; /* Flash Mode Control */
-#ifdef CONFIG_LEDS_SUPPORT_FRONT_FLASH_AUTO
-	group->frontFlashMode = CAM2_FLASH_MODE_NONE; /* Auto Flash Mode Control */
-#endif
-	atomic_set(&group->scount, 0);
-	atomic_set(&group->rcount, 0);
-	atomic_set(&group->backup_fcount, 0);
-	atomic_set(&group->sensor_fcount, 1);
-	sema_init(&group->smp_trigger, 0);
-
-	INIT_LIST_HEAD(&group->gframe_head);
-	group->gframe_cnt = 0;
-
-#ifdef MEASURE_TIME
-#ifdef MONITOR_TIME
-	monitor_init(&group->time);
-#endif
-#endif
-
-	/* 2. start kthread */
-	ret = fimc_is_group_task_start(groupmgr, gtask, framemgr);
-	if (ret) {
-		mgerr("fimc_is_group_task_start is fail(%d)", group, group, ret);
-		goto err_group_task_start;
-	}
-
-	/* 3. Subdev Init */
-	ret = fimc_is_subdev_open(&group->leader, vctx, NULL);
-	if (ret) {
-		mgerr("fimc_is_subdev_open is fail(%d)", group, group, ret);
-		goto err_subdev_open;
-	}
-
-	/* 4. group hw Init */
-	ret = fimc_is_hw_group_open(group);
-	if (ret) {
-		mgerr("fimc_is_hw_group_open is fail(%d)", group, group, ret);
-		goto err_hw_group_open;
-	}
-
-	/* 5. Update Group Manager */
-	groupmgr->group[stream][slot] = group;
-	set_bit(FIMC_IS_GROUP_OPEN, &group->state);
-
-	mdbgd_group("%s(%d) E\n", group, __func__, ret);
-	return 0;
-
-err_hw_group_open:
-	ret_err = fimc_is_subdev_close(&group->leader);
-	if (ret_err)
-		mgerr("fimc_is_subdev_close is fail(%d)", group, group, ret_err);
-err_subdev_open:
-	ret_err = fimc_is_group_task_stop(groupmgr, gtask, slot);
-	if (ret_err)
-		mgerr("fimc_is_group_task_stop is fail(%d)", group, group, ret_err);
-err_group_task_start:
-err_framemgr_null:
-err_state:
-	return ret;
-}
-
-int fimc_is_group_close(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group)
-{
-	int ret = 0;
-	bool all_slot_empty = true;
-	u32 stream, slot, i;
-	struct fimc_is_group_task *gtask;
-	struct fimc_is_group_framemgr *gframemgr;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-
-	slot = group->slot;
-	stream = group->instance;
-	gtask = &groupmgr->gtask[group->id];
-
-	if (!test_bit(FIMC_IS_GROUP_OPEN, &group->state)) {
-		mgerr("already close", group, group);
-		return -EMFILE;
-	}
-
-	ret = fimc_is_group_task_stop(groupmgr, gtask, slot);
-	if (ret)
-		mgerr("fimc_is_group_task_stop is fail(%d)", group, group, ret);
-
-	ret = fimc_is_subdev_close(&group->leader);
-	if (ret)
-		mgerr("fimc_is_subdev_close is fail(%d)", group, group, ret);
-
-	group->prev = NULL;
-	group->next = NULL;
-	group->gprev = NULL;
-	group->gnext = NULL;
-	group->parent = NULL;
-	group->child = NULL;
-	group->head = NULL;
-	group->tail = NULL;
-	group->junction = NULL;
-	clear_bit(FIMC_IS_GROUP_INIT, &group->state);
-	clear_bit(FIMC_IS_GROUP_OPEN, &group->state);
-	groupmgr->group[stream][slot] = NULL;
-
-	for (i = 0; i < GROUP_SLOT_MAX; i++) {
-		if (groupmgr->group[stream][i]) {
-			all_slot_empty = false;
-			break;
-		}
-	}
-
-	if (all_slot_empty) {
-		gframemgr = &groupmgr->gframemgr[stream];
-
-		if (gframemgr->gframe_cnt != FIMC_IS_MAX_GFRAME) {
-			mwarn("gframemgr free count is invalid(%d)", group, gframemgr->gframe_cnt);
-			INIT_LIST_HEAD(&gframemgr->gframe_head);
-			gframemgr->gframe_cnt = 0;
-			for (i = 0; i < FIMC_IS_MAX_GFRAME; ++i) {
-				gframemgr->gframes[i].fcount = 0;
-				fimc_is_gframe_s_free(gframemgr, &gframemgr->gframes[i]);
-			}
-		}
-	}
-
-	mdbgd_group("%s(ref %d, %d)", group, __func__, atomic_read(&gtask->refcount), ret);
-
-	/* reset after using it */
-	group->id = GROUP_ID_INVALID;
-
-	return ret;
-}
-
-int fimc_is_group_init(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group,
-	u32 input_type,
-	u32 video_id,
-	u32 stream_leader)
-{
-	int ret = 0;
-	u32 slot;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-	BUG_ON(video_id >= FIMC_IS_VIDEO_MAX_NUM);
-
-	if (!test_bit(FIMC_IS_GROUP_OPEN, &group->state)) {
-		mgerr("group is NOT open", group, group);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	slot = group->slot;
-	group->source_vid = video_id;
-	clear_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_OTF_OUTPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_PIPE_INPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_PIPE_OUTPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_SEMI_PIPE_INPUT, &group->state);
-	clear_bit(FIMC_IS_GROUP_SEMI_PIPE_OUTPUT, &group->state);
-
-	if (stream_leader)
-		groupmgr->leader[group->instance] = group;
-
-	switch (input_type) {
-	case GROUP_INPUT_MEMORY:
-		smp_shot_init(group, 1);
-		group->asyn_shots = 0;
-		group->skip_shots = 0;
-		group->init_shots = 0;
-		group->sync_shots = 1;
-		break;
-	case GROUP_INPUT_OTF:
-		set_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state);
-		smp_shot_init(group, MIN_OF_SHOT_RSC);
-		group->asyn_shots = MIN_OF_ASYNC_SHOTS;
-		group->skip_shots = MIN_OF_ASYNC_SHOTS;
-		group->init_shots = MIN_OF_ASYNC_SHOTS;
-		group->sync_shots = MIN_OF_SYNC_SHOTS;
-		break;
-	case GROUP_INPUT_PIPE:
-		set_bit(FIMC_IS_GROUP_PIPE_INPUT, &group->state);
-		smp_shot_init(group, 1);
-		group->asyn_shots = 0;
-		group->skip_shots = 0;
-		group->init_shots = 0;
-		group->sync_shots = 1;
-		break;
-	case GROUP_INPUT_SEMI_PIPE:
-		set_bit(FIMC_IS_GROUP_SEMI_PIPE_INPUT, &group->state);
-		smp_shot_init(group, 1);
-		group->asyn_shots = 0;
-		group->skip_shots = 0;
-		group->init_shots = 0;
-		group->sync_shots = 1;
-		break;
-	default:
-		mgerr("input type is invalid(%d)", group, group, input_type);
-		ret = -EINVAL;
-		goto p_err;
-		break;
-	}
-
-	set_bit(FIMC_IS_GROUP_INIT, &group->state);
-
-p_err:
-	mdbgd_group("%s(input : %d):%d\n", group, __func__, input_type, ret);
-	return ret;
-}
-
-static void set_group_shots(struct fimc_is_group *group,
-	u32 hal_version,
-	u32 framerate,
-	enum fimc_is_ex_mode ex_mode)
-{
-#ifdef ENABLE_IS_CORE
-	if (hal_version == IS_HAL_VER_3_2) {
-		if (framerate <= 30) {
-			group->asyn_shots = 0;
-			group->skip_shots = 1;
-			group->init_shots = 1;
-			group->sync_shots = 3;
-		} else {
-			group->asyn_shots = 0;
-			group->skip_shots = 3;
-			group->init_shots = 3;
-			group->sync_shots = 3;
-		}
-	} else {
-		if (framerate <= 30) {
-#ifdef REDUCE_COMMAND_DELAY
-			group->asyn_shots = MIN_OF_ASYNC_SHOTS + 1;
-			group->sync_shots = 0;
-#else
-			group->asyn_shots = MIN_OF_ASYNC_SHOTS + 0;
-			group->sync_shots = MIN_OF_SYNC_SHOTS;
-#endif
-		} else if (framerate <= 60) {
-			group->asyn_shots = MIN_OF_ASYNC_SHOTS + 1;
-			group->sync_shots = MIN_OF_SYNC_SHOTS;
-		} else if (framerate <= 120) {
-			group->asyn_shots = MIN_OF_ASYNC_SHOTS + 2;
-			group->sync_shots = MIN_OF_SYNC_SHOTS;
-		} else if (framerate <= 240) {
-			group->asyn_shots = MIN_OF_ASYNC_SHOTS + 2;
-			group->sync_shots = MIN_OF_SYNC_SHOTS;
-		} else { /* 300fps */
-			group->asyn_shots = MIN_OF_ASYNC_SHOTS + 3;
-			group->sync_shots = MIN_OF_SYNC_SHOTS;
-		}
-		group->init_shots = group->asyn_shots;
-		group->skip_shots = group->asyn_shots;
-	}
-#else
-	if (ex_mode == EX_DUALFPS) {
-		group->asyn_shots = MIN_OF_ASYNC_SHOTS + 1;
-		group->sync_shots = MIN_OF_SYNC_SHOTS;
-	} else {
-#ifdef REDUCE_COMMAND_DELAY
-		group->asyn_shots = MIN_OF_ASYNC_SHOTS + 1;
-		group->sync_shots = 0;
-#else
-		group->asyn_shots = MIN_OF_ASYNC_SHOTS + 0;
-		group->sync_shots = MIN_OF_SYNC_SHOTS;
-#endif
-	}
-	group->init_shots = group->asyn_shots;
-	group->skip_shots = group->asyn_shots;
-#endif
-	return;
-}
-
-int fimc_is_group_start(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group)
-{
-	int ret = 0;
-	struct fimc_is_device_ischain *device;
-	struct fimc_is_device_sensor *sensor;
-	struct fimc_is_resourcemgr *resourcemgr;
-	struct fimc_is_framemgr *framemgr = NULL;
-	struct fimc_is_group_task *gtask;
-	u32 sensor_fcount;
-	u32 framerate;
-	enum fimc_is_ex_mode ex_mode;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(!group->device);
-	BUG_ON(!group->device->sensor);
-	BUG_ON(!group->device->resourcemgr);
-	BUG_ON(!group->leader.vctx);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-
-	if (!test_bit(FIMC_IS_GROUP_INIT, &group->state)) {
-		merr("group is NOT initialized", group);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	if (test_bit(FIMC_IS_GROUP_START, &group->state)) {
-		warn("already group start");
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	device = group->device;
-	gtask = &groupmgr->gtask[group->id];
-	framemgr = GET_HEAD_GROUP_FRAMEMGR(group);
-	if (!framemgr) {
-		mgerr("framemgr is NULL", group, group);
-		goto p_err;
-	}
-
-	atomic_set(&group->scount, 0);
-	sema_init(&group->smp_trigger, 0);
-
-	if (test_bit(FIMC_IS_ISCHAIN_REPROCESSING, &device->state)) {
-		group->asyn_shots = 1;
-		group->skip_shots = 0;
-		group->init_shots = 0;
-		group->sync_shots = 0;
-		smp_shot_init(group, group->asyn_shots + group->sync_shots);
-	} else {
-		sensor = device->sensor;
-		framerate = fimc_is_sensor_g_framerate(sensor);
-		ex_mode = fimc_is_sensor_g_ex_mode(sensor);
-
-		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state)) {
-			resourcemgr = device->resourcemgr;
-			set_group_shots(group, resourcemgr->hal_version, framerate, ex_mode);
-
-			/* frame count */
-			sensor_fcount = fimc_is_sensor_g_fcount(sensor) + 1;
-			atomic_set(&group->sensor_fcount, sensor_fcount);
-			atomic_set(&group->backup_fcount, sensor_fcount - 1);
-			group->fcount = sensor_fcount - 1;
-
-			memset(&group->intent_ctl, 0, sizeof(struct camera2_aa_ctl));
-
-			/* shot resource */
-			sema_init(&gtask->smp_resource, group->asyn_shots + group->sync_shots);
-			smp_shot_init(group, group->asyn_shots + group->sync_shots);
-		} else {
-			if (framerate > 120)
-				group->asyn_shots = MIN_OF_ASYNC_SHOTS_240FPS;
-			else
-				group->asyn_shots = MIN_OF_ASYNC_SHOTS;
-			group->skip_shots = 0;
-			group->init_shots = 0;
-			group->sync_shots = 0;
-			smp_shot_init(group, group->asyn_shots + group->sync_shots);
-		}
-	}
-
-	set_bit(FIMC_IS_SUBDEV_START, &group->leader.state);
-	set_bit(FIMC_IS_GROUP_START, &group->state);
-
-p_err:
-	mginfo("bufs: %02d, init : %d, asyn: %d, skip: %d, sync : %d\n", group, group,
-		framemgr ? framemgr->num_frames : 0, group->init_shots,
-		group->asyn_shots, group->skip_shots, group->sync_shots);
-	return ret;
-}
-
-void wait_subdev_flush_work(struct fimc_is_device_ischain *device,
-	struct fimc_is_group *group, u32 entry)
-{
-#ifdef ENABLE_IS_CORE
-	return;
-#else
-	struct fimc_is_interface *itf;
-	u32 wq_id = WORK_MAX_MAP;
-	bool ret;
-
-	BUG_ON(!group);
-	BUG_ON(!device);
-
-	itf = device->interface;
-	BUG_ON(!itf);
-
-	switch (entry) {
-	case ENTRY_3AC:
-		wq_id = (group->id == GROUP_ID_3AA0) ? WORK_30C_FDONE: WORK_31C_FDONE;
-		break;
-	case ENTRY_3AP:
-		wq_id = (group->id == GROUP_ID_3AA0) ? WORK_30P_FDONE: WORK_31P_FDONE;
-		break;
-	case ENTRY_IXC:
-		wq_id = (group->id == GROUP_ID_ISP0) ? WORK_I0C_FDONE: WORK_I1C_FDONE;
-		break;
-	case ENTRY_IXP:
-		wq_id = (group->id == GROUP_ID_ISP0) ? WORK_I0P_FDONE: WORK_I1P_FDONE;
-		break;
-	case ENTRY_SCC:
-		wq_id = WORK_SCC_FDONE;
-		break;
-	case ENTRY_SCP:
-		wq_id = WORK_SCP_FDONE;
-		break;
-	case ENTRY_M0P:
-		wq_id = WORK_M0P_FDONE;
-		break;
-	case ENTRY_M1P:
-		wq_id = WORK_M1P_FDONE;
-		break;
-	case ENTRY_M2P:
-		wq_id = WORK_M2P_FDONE;
-		break;
-	case ENTRY_M3P:
-		wq_id = WORK_M3P_FDONE;
-		break;
-	case ENTRY_M4P:
-		wq_id = WORK_M4P_FDONE;
-		break;
-	case ENTRY_SENSOR:	/* Falls Through */
-	case ENTRY_3AA:		/* Falls Through */
-	case ENTRY_ISP:		/* Falls Through */
-	case ENTRY_DIS:		/* Falls Through */
-	case ENTRY_MCS:		/* Falls Through */
-	case ENTRY_VRA:
-		mginfo("flush SHOT_DONE wq, subdev[%d]", device, group, entry);
-		wq_id = WORK_SHOT_DONE;
-		break;
-	default:
-		mgerr(" invalid subdev[%d]", device, group, entry);
-		return;
-		break;
-	}
-
-	ret = flush_work(&itf->work_wq[wq_id]);
-	if (ret)
-		mginfo(" flush_work executed! wq_id(%d)\n", device, group, wq_id);
-#endif
-}
-
-int fimc_is_group_stop(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group)
-{
-	int ret = 0;
-	int errcnt = 0;
-	int retry;
-	u32 rcount;
-	unsigned long flags;
-	struct fimc_is_framemgr *framemgr;
-	struct fimc_is_device_ischain *device;
-	struct fimc_is_device_sensor *sensor;
-	struct fimc_is_group *head;
-	struct fimc_is_group *child;
-	struct fimc_is_subdev *subdev;
-	struct fimc_is_group_task *gtask;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(!group->device);
-	BUG_ON(!group->leader.vctx);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-
-	if (!test_bit(FIMC_IS_GROUP_START, &group->state)) {
-		mwarn("already group stop", group);
-		return -EPERM;
-	}
-	head = group->head;
-	if (head && !test_bit(FIMC_IS_GROUP_START, &head->state)) {
-		mwarn("already head group stop", group);
-		return -EPERM;
-	}
-	framemgr = GET_HEAD_GROUP_FRAMEMGR(group);
-	if (!framemgr) {
-		mgerr("framemgr is NULL", group, group);
-		goto p_err;
-	}
-
-	if (test_bit(FIMC_IS_GROUP_REQUEST_FSTOP, &group->state)) {
-		set_bit(FIMC_IS_GROUP_FORCE_STOP, &group->state);
-		clear_bit(FIMC_IS_GROUP_REQUEST_FSTOP, &group->state);
-	}
-	gtask = &groupmgr->gtask[head->id];
-	device = group->device;
-
-	retry = 150;
-	while (--retry && framemgr->queued_count[FS_REQUEST]) {
-		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &head->state) &&
-			!list_empty(&head->smp_trigger.wait_list)) {
-
-			sensor = device->sensor;
-			if (!sensor) {
-				mwarn(" sensor is NULL, forcely trigger(pc %d)", device, head->pcount);
-				set_bit(FIMC_IS_GROUP_FORCE_STOP, &head->state);
-				up(&head->smp_trigger);
-			} else if (!test_bit(FIMC_IS_SENSOR_OPEN, &head->state)) {
-				mwarn(" sensor is closed, forcely trigger(pc %d)", device, head->pcount);
-				set_bit(FIMC_IS_GROUP_FORCE_STOP, &head->state);
-				up(&head->smp_trigger);
-			} else if (!test_bit(FIMC_IS_SENSOR_FRONT_START, &sensor->state)) {
-				mwarn(" front is stopped, forcely trigger(pc %d)", device, head->pcount);
-				set_bit(FIMC_IS_GROUP_FORCE_STOP, &head->state);
-				up(&head->smp_trigger);
-			} else if (!test_bit(FIMC_IS_SENSOR_BACK_START, &sensor->state)) {
-				mwarn(" back is stopped, forcely trigger(pc %d)", device, head->pcount);
-				set_bit(FIMC_IS_GROUP_FORCE_STOP, &head->state);
-				up(&head->smp_trigger);
-			} else if (retry < 100) {
-				merr(" sensor is working but no trigger(pc %d)", device, head->pcount);
-				set_bit(FIMC_IS_GROUP_FORCE_STOP, &head->state);
-				up(&head->smp_trigger);
-			} else {
-				mwarn(" wating for sensor trigger(pc %d)", device, head->pcount);
-			}
-#ifdef ENABLE_SYNC_REPROCESSING
-		} else if (!test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state)) {
-			if (!list_empty(&gtask->sync_list)) {
-				struct fimc_is_frame *rframe;
-				rframe = list_first_entry(&gtask->sync_list, struct fimc_is_frame, sync_list);
-				list_del(&rframe->sync_list);
-				mgrinfo("flush SYNC REP(%d)\n", group, group, rframe, rframe->index);
-				kthread_queue_work(&gtask->worker, &rframe->work);
-			}
-#endif
-		}
-
-		mgwarn(" %d reqs waiting...(pc %d) smp_resource(%d)", device, head,
-				framemgr->queued_count[FS_REQUEST], head->pcount,
-				list_empty(&gtask->smp_resource.wait_list));
-		msleep(20);
-	}
-
-	if (!retry) {
-		mgerr(" waiting(until request empty) is fail(pc %d)", device, head, head->pcount);
-		errcnt++;
-	}
-
-	/* ensure that request cancel work is complete fully */
-	framemgr_e_barrier_irqs(framemgr, FMGR_IDX_21, flags);
-	framemgr_x_barrier_irqr(framemgr, FMGR_IDX_21, flags);
-
-	retry = 150;
-	while (--retry && test_bit(FIMC_IS_GROUP_SHOT, &group->state)) {
-		mgwarn(" thread stop waiting...(pc %d)", device, group, group->pcount);
-		msleep(20);
-	}
-
-	if (!retry) {
-		mgerr(" waiting(until thread stop) is fail(pc %d)", device, group, group->pcount);
-		errcnt++;
-	}
-
-	child = group;
-	while (child) {
-		if (test_bit(FIMC_IS_GROUP_FORCE_STOP, &group->state)) {
-			ret = fimc_is_itf_force_stop(device, GROUP_ID(child->id));
-			if (ret) {
-				mgerr(" fimc_is_itf_force_stop is fail(%d)", device, child, ret);
-				errcnt++;
-			}
-		} else {
-			ret = fimc_is_itf_process_stop(device, GROUP_ID(child->id));
-			if (ret) {
-				mgerr(" fimc_is_itf_process_stop is fail(%d)", device, child, ret);
-				errcnt++;
-			}
-		}
-		child = child->child;
-	}
-
-	retry = 150;
-	while (--retry && framemgr->queued_count[FS_PROCESS]) {
-		mgwarn(" %d pros waiting...(pc %d)", device, head, framemgr->queued_count[FS_PROCESS], head->pcount);
-		msleep(20);
-	}
-
-	if (!retry) {
-		mgerr(" waiting(until process empty) is fail(pc %d)", device, head, head->pcount);
-		errcnt++;
-	}
-
-	rcount = atomic_read(&head->rcount);
-	if (rcount) {
-		mgerr(" request is NOT empty(%d) (pc %d)", device, head, rcount, head->pcount);
-		errcnt++;
-	}
-	/* the count of request should be clear for next streaming */
-	atomic_set(&head->rcount, 0);
-
-	child = group;
-	while(child) {
-		list_for_each_entry(subdev, &child->subdev_list, list) {
-			if (IS_ERR_OR_NULL(subdev))
-				continue;
-
-			if (subdev->vctx && test_bit(FIMC_IS_SUBDEV_START, &subdev->state)) {
-				framemgr = GET_SUBDEV_FRAMEMGR(subdev);
-				if (!framemgr) {
-					mgerr("framemgr is NULL", group, group);
-					goto p_err;
-				}
-
-				retry = 150;
-				while (--retry && framemgr->queued_count[FS_PROCESS]) {
-					mgwarn(" subdev[%d] stop waiting...", device, group, subdev->vid);
-					msleep(20);
-				}
-
-				if (!retry) {
-					wait_subdev_flush_work(device, child, subdev->id);
-					mgerr(" waiting(subdev stop) is fail", device, group);
-					errcnt++;
-				}
-
-				clear_bit(FIMC_IS_SUBDEV_RUN, &subdev->state);
-			}
-			/*
-			 *
-			 * For subdev only to be control by driver (no video node)
-			 * In "process-stop" state of a group which have these subdevs,
-			 * subdev's state can be invalid like tdnr, odc or drc etc.
-			 * The wrong state problem can be happened in just stream-on/off ->
-			 * stream-on case.
-			 * ex.  previous stream on : state = FIMC_IS_SUBDEV_RUN && bypass = 0
-			 *      next stream on     : state = FIMC_IS_SUBDEV_RUN && bypass = 0
-			 * In this case, the subdev's function can't be worked.
-			 * Because driver skips the function if it's state is FIMC_IS_SUBDEV_RUN.
-			 */
-			clear_bit(FIMC_IS_SUBDEV_RUN, &subdev->state);
-		}
-		child = child->child;
-	}
-
-	fimc_is_gframe_flush(groupmgr, head);
-
-	if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state))
-		mginfo(" sensor fcount: %d, fcount: %d\n", device, group,
-			atomic_read(&group->sensor_fcount), group->fcount);
-
-	clear_bit(FIMC_IS_GROUP_FORCE_STOP, &group->state);
-	clear_bit(FIMC_IS_SUBDEV_START, &group->leader.state);
-	clear_bit(FIMC_IS_GROUP_START, &group->state);
-	clear_bit(FIMC_IS_SUBDEV_RUN, &group->leader.state);
-
-p_err:
-	return -errcnt;
-}
-
-int fimc_is_group_buffer_queue(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group,
-	struct fimc_is_queue *queue,
-	u32 index)
-{
-	int ret = 0;
-	unsigned long flags;
-	struct fimc_is_resourcemgr *resourcemgr;
-	struct fimc_is_device_ischain *device;
-	struct fimc_is_framemgr *framemgr;
-	struct fimc_is_frame *frame;
-#if defined(CONFIG_COMPANION_DIRECT_USE) || defined(USE_AP_PDAF) || defined(USE_SENSOR_WDR) || defined (USE_MS_PDAF)
-	struct fimc_is_module_enum *module = NULL;
-	struct fimc_is_device_sensor *sensor = NULL;
-	struct fimc_is_device_sensor_peri *sensor_peri = NULL;
-	cis_shared_data *cis_data = NULL;
-#endif
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(!group->device);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-	BUG_ON(!queue);
-
-	device = group->device;
-	resourcemgr = device->resourcemgr;
-	framemgr = &queue->framemgr;
-
-	BUG_ON(index >= framemgr->num_frames);
-#if defined(CONFIG_COMPANION_DIRECT_USE) || defined(USE_AP_PDAF) || defined(USE_SENSOR_WDR) || defined (USE_MS_PDAF)
-	sensor = device->sensor;
-	BUG_ON(!sensor);
-
-	module = (struct fimc_is_module_enum *)v4l2_get_subdevdata(sensor->subdev_module);
-	BUG_ON(!module);
-
-	sensor_peri = (struct fimc_is_device_sensor_peri *)module->private_data;
-	BUG_ON(!sensor_peri);
-
-	cis_data = sensor_peri->cis.cis_data;
-	BUG_ON(!cis_data);
-#endif
-
-	/* 1. check frame validation */
-	frame = &framemgr->frames[index];
-
-	if (unlikely(!test_bit(FRAME_MEM_INIT, &frame->mem_state))) {
-		err("frame %d is NOT init", index);
-		ret = EINVAL;
-		goto p_err;
-	}
-
-	/* 2. update frame manager */
-	framemgr_e_barrier_irqs(framemgr, FMGR_IDX_22, flags);
-
-	if (frame->state == FS_FREE) {
-		if (unlikely(frame->out_flag)) {
-			mgwarn("output(0x%lX) is NOT completed", device, group, frame->out_flag);
-			frame->out_flag = 0;
-		}
-
-		if (!test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state) &&
-			(framemgr->queued_count[FS_REQUEST] >= DIV_ROUND_UP(framemgr->num_frames, 2))) {
-				mgwarn(" request bufs : %d", device, group, framemgr->queued_count[FS_REQUEST]);
-				frame_manager_print_queues(framemgr);
-				if (test_bit(FIMC_IS_HAL_DEBUG_PILE_REQ_BUF, &sysfs_debug.hal_debug_mode)) {
-					mdelay(sysfs_debug.hal_debug_delay);
-					panic("HAL panic for request bufs");
-				}
-		}
-
-		frame->lindex = 0;
-		frame->hindex = 0;
-		frame->result = 0;
-		frame->fcount = frame->shot->dm.request.frameCount;
-		frame->rcount = frame->shot->ctl.request.frameCount;
-		frame->groupmgr = groupmgr;
-		frame->group    = group;
-
-#ifdef FIXED_FPS_DEBUG
-		frame->shot->ctl.aa.aeTargetFpsRange[0] = FIXED_FPS_VALUE;
-		frame->shot->ctl.aa.aeTargetFpsRange[1] = FIXED_FPS_VALUE;
-		frame->shot->ctl.sensor.frameDuration = 1000000000/FIXED_FPS_VALUE;
-#endif
-
-		if (resourcemgr->limited_fps) {
-			frame->shot->ctl.aa.aeTargetFpsRange[0] = resourcemgr->limited_fps;
-			frame->shot->ctl.aa.aeTargetFpsRange[1] = resourcemgr->limited_fps;
-			frame->shot->ctl.sensor.frameDuration = 1000000000/resourcemgr->limited_fps;
-		}
-
-#ifdef ENABLE_FAST_SHOT
-		/* only fast shot can be enabled in case hal 1.0 */
-		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state) &&
-			(resourcemgr->hal_version == IS_HAL_VER_1_0)) {
-			memcpy(&group->fast_ctl.aa, &frame->shot->ctl.aa,
-				sizeof(struct camera2_aa_ctl));
-			memcpy(&group->fast_ctl.scaler, &frame->shot->ctl.scaler,
-				sizeof(struct camera2_scaler_ctl));
-		}
-#endif
-
-#ifdef SENSOR_REQUEST_DELAY
-		if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state) &&
-			(frame->shot->uctl.opMode == CAMERA_OP_MODE_HAL3_GED
-			|| frame->shot->uctl.opMode == CAMERA_OP_MODE_HAL3_SDK
-			|| frame->shot->uctl.opMode == CAMERA_OP_MODE_HAL3_CAMERAX)) {
-			int req_cnt = 0;
-			struct fimc_is_frame *prev;
-			list_for_each_entry_reverse(prev, &framemgr->queued_list[FS_REQUEST], list) {
-				if (++req_cnt > SENSOR_REQUEST_DELAY)
-					break;
-
-				if (frame->shot->ctl.aa.aeMode == AA_AEMODE_OFF
-					|| frame->shot->ctl.aa.mode == AA_CONTROL_OFF) {
-					prev->shot->ctl.sensor.exposureTime	= frame->shot->ctl.sensor.exposureTime;
-					prev->shot->ctl.sensor.frameDuration	= frame->shot->ctl.sensor.frameDuration;
-					prev->shot->ctl.sensor.sensitivity	= frame->shot->ctl.sensor.sensitivity;
-					prev->shot->ctl.aa.vendor_isoValue	= frame->shot->ctl.aa.vendor_isoValue;
-					prev->shot->ctl.aa.vendor_isoMode	= frame->shot->ctl.aa.vendor_isoMode;
-					prev->shot->ctl.aa.aeMode		= frame->shot->ctl.aa.aeMode;
-				}
-
-				/*
-				 * Flash capture has 2 Frame delays due to DDK constraints.
-				 * N + 1: The DDK uploads the best shot and streams off.
-				 * N + 2: HAL used the buffer of the next of best shot as a flash image.
-				 */
-				if (frame->shot->ctl.aa.vendor_aeflashMode == AA_FLASHMODE_CAPTURE) {
-					prev->shot->ctl.aa.vendor_aeflashMode	= frame->shot->ctl.aa.vendor_aeflashMode;
-				}
-				prev->shot->ctl.aa.aeExpCompensation		= frame->shot->ctl.aa.aeExpCompensation;
-				prev->shot->ctl.aa.aeLock			= frame->shot->ctl.aa.aeLock;
-				prev->shot->ctl.lens.opticalStabilizationMode	= frame->shot->ctl.lens.opticalStabilizationMode;
-			}
-		}
-#endif
-
-#ifdef ENABLE_REMOSAIC_CAPTURE_WITH_ROTATION
-		if ((GET_DEVICE_TYPE_BY_GRP(group->id) == FIMC_IS_DEVICE_SENSOR)
-			&& (device->sensor && !test_bit(FIMC_IS_SENSOR_FRONT_START, &device->sensor->state))) {
-			device->sensor->mode_chg_frame = NULL;
-
-			if (CHK_REMOSAIC_SCN(frame->shot->ctl.aa.captureIntent)) {
-				clear_bit(FIMC_IS_SENSOR_OTF_OUTPUT, &device->sensor->state);
-				device->sensor->mode_chg_frame = frame;
-			} else {
-				if (group->child)
-					set_bit(FIMC_IS_SENSOR_OTF_OUTPUT, &device->sensor->state);
-			}
-		}
-#endif
-		trans_frame(framemgr, frame, FS_REQUEST);
-	} else {
-		err("frame(%d) is invalid state(%d)\n", index, frame->state);
-		frame_manager_print_queues(framemgr);
-		ret = -EINVAL;
-	}
-
-	framemgr_x_barrier_irqr(framemgr, FMGR_IDX_22, flags);
-
-#ifdef CONFIG_COMPANION_DIRECT_USE
-	if (test_bit(FIMC_IS_SENSOR_PREPROCESSOR_AVAILABLE, &sensor_peri->peri_state)) {
-		/* PAF */
-		if (cis_data->is_data.paf_stat_enable == false) {
-			frame->shot->uctl.isModeUd.paf_mode = CAMERA_PAF_OFF;
-		}
-
-		/* CAF */
-		if (cis_data->is_data.caf_stat_enable == false) {
-			frame->shot->uctl.isModeUd.caf_mode = CAMERA_PAF_OFF;
-		}
-
-		/* WDR */
-		if (cis_data->is_data.wdr_enable == false) {
-			frame->shot->uctl.isModeUd.wdr_mode = CAMERA_WDR_OFF;
-		}
-	}
-#endif
-#if defined (USE_AP_PDAF)
-	/* PAF */
-	if ((cis_data->is_data.paf_stat_enable == false) &&
-		(sensor_peri->cis.use_pdaf == true )) {
-		frame->shot->uctl.isModeUd.paf_mode = CAMERA_PAF_OFF;
-	}
-#else
-	frame->shot->uctl.isModeUd.paf_mode = CAMERA_PAF_OFF;
-#endif
-
-#if defined (USE_MS_PDAF)
-	if (sensor_peri->cis.use_pdaf) {
-		frame->shot->uctl.isModeUd.paf_mode  = CAMERA_PAF_ON;
-	} else {
-		frame->shot->uctl.isModeUd.paf_mode = CAMERA_PAF_OFF;
-	}
-#endif /* USE_MS_PDAF */
-
-#if defined(USE_SENSOR_WDR)
-	/* WDR */
-	if ((cis_data->is_data.wdr_enable == false) &&
-		(sensor->position == SENSOR_POSITION_REAR)){
-		frame->shot->uctl.isModeUd.wdr_mode = CAMERA_WDR_OFF;
-	}
-#else
-#ifdef USE_WDR_INTERFACE
-	if ((frame->shot->uctl.isModeUd.wdr_mode != CAMERA_WDR_ON) &&
-		(frame->shot->uctl.isModeUd.wdr_mode != CAMERA_WDR_AUTO) &&
-		(frame->shot->uctl.isModeUd.wdr_mode != CAMERA_WDR_AUTO_LIKE))
-	{
-		frame->shot->uctl.isModeUd.wdr_mode = CAMERA_WDR_OFF;
-	}
-#else
-	frame->shot->uctl.isModeUd.wdr_mode = CAMERA_WDR_OFF;
-#endif
-#endif
-	fimc_is_group_start_trigger(groupmgr, group, frame);
-
-p_err:
-	return ret;
-}
-
-int fimc_is_group_buffer_finish(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group, u32 index)
-{
-	int ret = 0;
-	unsigned long flags;
-	struct fimc_is_device_ischain *device;
-	struct fimc_is_framemgr *framemgr;
-	struct fimc_is_frame *frame;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(!group->device);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-
-	device = group->device;
-
-	if (unlikely(!test_bit(FIMC_IS_GROUP_OPEN, &group->state))) {
-		warn("group was closed..(%d)", index);
-		return ret;
-	}
-
-	if (unlikely(!group->leader.vctx)) {
-		mgerr("leder vctx is null(%d)", device, group, index);
-		ret = -EINVAL;
-		return ret;
-	}
-
-	if (unlikely(group->id >= GROUP_ID_MAX)) {
-		mgerr("group id is invalid(%d)", device, group, index);
-		ret = -EINVAL;
-		return ret;
-	}
-
-	framemgr = GET_HEAD_GROUP_FRAMEMGR(group);
-	BUG_ON(index >= (framemgr ? framemgr->num_frames : 0));
-
-	frame = &framemgr->frames[index];
-	/* 2. update frame manager */
-	framemgr_e_barrier_irqs(framemgr, FMGR_IDX_23, flags);
-
-	if (frame->state == FS_COMPLETE) {
-		trans_frame(framemgr, frame, FS_FREE);
-
-		frame->shot_ext->free_cnt = framemgr->queued_count[FS_FREE];
-		frame->shot_ext->request_cnt = framemgr->queued_count[FS_REQUEST];
-		frame->shot_ext->process_cnt = framemgr->queued_count[FS_PROCESS];
-		frame->shot_ext->complete_cnt = framemgr->queued_count[FS_COMPLETE];
-	} else {
-		mgerr("frame(%d) is not com state(%d)", device, group, index, frame->state);
-		frame_manager_print_queues(framemgr);
-		ret = -EINVAL;
-	}
-
-	framemgr_x_barrier_irqr(framemgr, FMGR_IDX_23, flags);
-
-	PROGRAM_COUNT(15);
-	TIME_SHOT(TMS_DQ);
-
-	return ret;
-}
-
-static int fimc_is_group_check_pre(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_device_ischain *device,
-	struct fimc_is_group *gprev,
-	struct fimc_is_group *group,
-	struct fimc_is_group *gnext,
-	struct fimc_is_frame *frame,
-	struct fimc_is_group_frame **result)
-{
-	int ret = 0;
-	struct fimc_is_group *group_leader;
-	struct fimc_is_group_framemgr *gframemgr;
-	struct fimc_is_group_frame *gframe;
-	ulong flags;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!device);
-	BUG_ON(!group);
-	BUG_ON(!frame);
-	BUG_ON(!frame->shot_ext);
-
-	gframemgr = &groupmgr->gframemgr[device->instance];
-	group_leader = groupmgr->leader[device->instance];
-
-	/* invalid shot can be processed only on memory input */
-	if (unlikely(!test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state) &&
-		frame->shot_ext->invalid)) {
-		mgrerr("invalid shot", device, group, frame);
-		ret = -EINVAL;
-		goto p_err;
-	}
-
-	spin_lock_irqsave(&gframemgr->gframe_slock, flags);
-
-	if (gprev && !gnext) {
-		/* tailer */
-		fimc_is_gframe_group_head(group, &gframe);
-		if (unlikely(!gframe)) {
-			mgrerr("gframe is NULL1", device, group, frame);
-			fimc_is_gframe_print_free(gframemgr);
-			fimc_is_gframe_print_group(group_leader);
-			spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-			fimc_is_stream_status(groupmgr, group_leader);
-			ret = -EINVAL;
-			goto p_err;
-		}
-
-		if (unlikely(frame->fcount != gframe->fcount)) {
-			mgwarn("shot mismatch(%d != %d)", device, group,
-				frame->fcount, gframe->fcount);
-			gframe = fimc_is_gframe_rewind(groupmgr, group, frame->fcount);
-			if (!gframe) {
-				spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-				merr("rewinding is fail,can't recovery", group);
-				goto p_err;
-			}
-		}
-
-		fimc_is_gframe_s_info(gframe, group->slot, frame);
-		fimc_is_gframe_check(gprev, group, gnext, gframe, frame);
-	} else if (!gprev && gnext) {
-		/* leader */
-		if (atomic_read(&group->scount))
-			group->fcount += frame->num_buffers;
-		else
-			group->fcount++;
-
-		fimc_is_gframe_free_head(gframemgr, &gframe);
-		if (unlikely(!gframe)) {
-			mgerr("gframe is NULL2", device, group);
-			fimc_is_gframe_print_free(gframemgr);
-			fimc_is_gframe_print_group(group_leader);
-			spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-			fimc_is_stream_status(groupmgr, group_leader);
-			group->fcount -= frame->num_buffers;
-			ret = -EINVAL;
-			goto p_err;
-		}
-
-		if (unlikely(!test_bit(FIMC_IS_ISCHAIN_REPROCESSING, &device->state) &&
-			(frame->fcount != group->fcount))) {
-			if (frame->fcount > group->fcount) {
-				mgwarn("shot mismatch(%d, %d)", device, group,
-					frame->fcount, group->fcount);
-				group->fcount = frame->fcount;
-			} else {
-				spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-				mgerr("shot mismatch(%d, %d)", device, group,
-					frame->fcount, group->fcount);
-				group->fcount -= frame->num_buffers;
-				ret = -EINVAL;
-				goto p_err;
-			}
-		}
-
-		gframe->fcount = frame->fcount;
-		fimc_is_gframe_s_info(gframe, group->slot, frame);
-		fimc_is_gframe_check(gprev, group, gnext, gframe, frame);
-	} else if (gprev && gnext) {
-		/* middler */
-		fimc_is_gframe_group_head(group, &gframe);
-		if (unlikely(!gframe)) {
-			mgrerr("gframe is NULL3", device, group, frame);
-			fimc_is_gframe_print_free(gframemgr);
-			fimc_is_gframe_print_group(group_leader);
-			spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-			fimc_is_stream_status(groupmgr, group_leader);
-			ret = -EINVAL;
-			goto p_err;
-		}
-
-		if (unlikely(frame->fcount != gframe->fcount)) {
-			mgwarn("shot mismatch(%d != %d)", device, group,
-				frame->fcount, gframe->fcount);
-			gframe = fimc_is_gframe_rewind(groupmgr, group, frame->fcount);
-			if (!gframe) {
-				spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-				merr("rewinding is fail,can't recovery", group);
-				goto p_err;
-			}
-		}
-
-		fimc_is_gframe_s_info(gframe, group->slot, frame);
-		fimc_is_gframe_check(gprev, group, gnext, gframe, frame);
-	} else {
-#ifdef CHAIN_SKIP_GFRAME_FOR_VRA
-		if (group->id == GROUP_ID_VRA0) {
-			/* VRA: Skip gframe logic. */
-			struct fimc_is_crop *incrop
-				= (struct fimc_is_crop *)frame->shot_ext->node_group.leader.input.cropRegion;
-			struct fimc_is_subdev *subdev = &group->leader;
-
-			if ((incrop->w * incrop->h) > (subdev->input.width * subdev->input.height)) {
-				mrwarn("the input size is invalid(%dx%d > %dx%d)", group, frame,
-						incrop->w, incrop->h,
-						subdev->input.width, subdev->input.height);
-				incrop->w = subdev->input.width;
-				incrop->h = subdev->input.height;
-			}
-
-			gframe = &dummy_gframe;
-		} else
-#endif
-		{
-			/* single */
-			if (atomic_read(&group->scount))
-				group->fcount += frame->num_buffers;
-			else
-				group->fcount++;
-
-			fimc_is_gframe_free_head(gframemgr, &gframe);
-			if (unlikely(!gframe)) {
-				mgerr("gframe is NULL4", device, group);
-				fimc_is_gframe_print_free(gframemgr);
-				fimc_is_gframe_print_group(group_leader);
-				spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-				fimc_is_stream_status(groupmgr, group_leader);
-				ret = -EINVAL;
-				goto p_err;
-			}
-			if (unlikely(!test_bit(FIMC_IS_ISCHAIN_REPROCESSING, &device->state) &&
-						(frame->fcount != group->fcount))) {
-				if (frame->fcount > group->fcount) {
-					mgwarn("shot mismatch(%d != %d)", device, group,
-							frame->fcount, group->fcount);
-					group->fcount = frame->fcount;
-				} else {
-					spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-					mgerr("shot mismatch(%d, %d)", device, group,
-							frame->fcount, group->fcount);
-					group->fcount -= frame->num_buffers;
-					ret = -EINVAL;
-					goto p_err;
-				}
-			}
-
-			fimc_is_gframe_s_info(gframe, group->slot, frame);
-			fimc_is_gframe_check(gprev, group, gnext, gframe, frame);
-		}
-	}
-
-	*result = gframe;
-
-	spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-
-p_err:
-	return ret;
-}
-
-static int fimc_is_group_check_post(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_device_ischain *device,
-	struct fimc_is_group *gprev,
-	struct fimc_is_group *group,
-	struct fimc_is_group *gnext,
-	struct fimc_is_frame *frame,
-	struct fimc_is_group_frame *gframe)
-{
-	int ret = 0;
-	struct fimc_is_group *tail;
-	struct fimc_is_group_framemgr *gframemgr;
-	ulong flags;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!device);
-	BUG_ON(!group);
-	BUG_ON(!frame);
-	BUG_ON(!gframe);
-	BUG_ON(group->slot >= GROUP_SLOT_MAX);
-
-	tail = group->tail;
-	gframemgr = &groupmgr->gframemgr[group->instance];
-
-	spin_lock_irqsave(&gframemgr->gframe_slock, flags);
-
-	if (gprev && !gnext) {
-		/* tailer */
-		ret = fimc_is_gframe_trans_grp_to_fre(gframemgr, gframe, group);
-		if (ret) {
-			mgerr("fimc_is_gframe_trans_grp_to_fre is fail(%d)", device, group, ret);
-			BUG();
-		}
-	} else if (!gprev && gnext) {
-		/* leader */
-		if (!tail || !tail->junction) {
-			mgerr("junction is NULL", device, group);
-			BUG();
-		}
-
-		if (gframe->group_cfg[group->slot].capture[tail->junction->cid].request) {
-			ret = fimc_is_gframe_trans_fre_to_grp(gframemgr, gframe, group, gnext);
-			if (ret) {
-				mgerr("fimc_is_gframe_trans_fre_to_grp is fail(%d)", device, group, ret);
-				BUG();
-			}
-		}
-	} else if (gprev && gnext) {
-		/* middler */
-		if (!tail || !group->junction) {
-			mgerr("junction is NULL", device, group);
-			BUG();
-		}
-
-		/* gframe should be destroyed if the request of junction is zero, so need to check first */
-		if (gframe->group_cfg[group->slot].capture[tail->junction->cid].request) {
-			ret = fimc_is_gframe_trans_grp_to_grp(gframemgr, gframe, group, gnext);
-			if (ret) {
-				mgerr("fimc_is_gframe_trans_grp_to_grp is fail(%d)", device, group, ret);
-				BUG();
-			}
-		} else {
-			ret = fimc_is_gframe_trans_grp_to_fre(gframemgr, gframe, group);
-			if (ret) {
-				mgerr("fimc_is_gframe_trans_grp_to_fre is fail(%d)", device, group, ret);
-				BUG();
-			}
-		}
-	} else {
-#ifdef CHAIN_SKIP_GFRAME_FOR_VRA
-		/* VRA: Skip gframe logic. */
-		if (group->id != GROUP_ID_VRA0)
-#endif
-			/* single */
-			gframe->fcount = frame->fcount;
-	}
-
-	spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-
-	return ret;
-}
-
-int fimc_is_group_shot(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group,
-	struct fimc_is_frame *frame)
-{
-	int ret = 0;
-	struct fimc_is_device_ischain *device;
-	struct fimc_is_resourcemgr *resourcemgr;
-	struct fimc_is_group *gprev, *gnext;
-	struct fimc_is_group_frame *gframe;
-	struct fimc_is_group_task *gtask;
-	bool try_sdown = false;
-	bool try_rdown = false;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(!group->shot_callback);
-	BUG_ON(!group->device);
-	BUG_ON(!frame);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-
-	set_bit(FIMC_IS_GROUP_SHOT, &group->state);
-	atomic_dec(&group->rcount);
-	device = group->device;
-	gtask = &groupmgr->gtask[group->id];
-
-	if (unlikely(test_bit(FIMC_IS_GROUP_FORCE_STOP, &group->state))) {
-		mgwarn(" cancel by fstop1", group, group);
-		ret = -EINVAL;
-		goto p_err_cancel;
-	}
-
-	if (unlikely(test_bit(FIMC_IS_GTASK_REQUEST_STOP, &gtask->state))) {
-		mgerr(" cancel by gstop1", group, group);
-		ret = -EINVAL;
-		goto p_err_ignore;
-	}
-
-	PROGRAM_COUNT(2);
-	smp_shot_dec(group);
-	try_sdown = true;
-
-	PROGRAM_COUNT(3);
-	ret = down_interruptible(&gtask->smp_resource);
-	if (ret) {
-		mgerr(" down fail(%d) #2", group, group, ret);
-		goto p_err_ignore;
-	}
-	try_rdown = true;
-
-	if (device->sensor && !test_bit(FIMC_IS_SENSOR_FRONT_START, &device->sensor->state)) {
-		/*
-		 * this statement is execued only at initial.
-		 * automatic increase the frame count of sensor
-		 * for next shot without real frame start
-		 */
-		if (group->init_shots > atomic_read(&group->scount)) {
-			frame->fcount = atomic_read(&group->sensor_fcount);
-			atomic_set(&group->backup_fcount, frame->fcount);
-			/* for multi-buffer */
-			if (frame->num_buffers)
-				atomic_set(&group->sensor_fcount, frame->fcount + frame->num_buffers);
-			else
-				atomic_inc(&group->sensor_fcount);
-
-			goto p_skip_sync;
-		}
-	}
-
-	if (group->sync_shots) {
-		bool try_sync_shot = false;
-
-		if (group->asyn_shots == 0) {
-			try_sync_shot = true;
-		} else {
-			if ((smp_shot_get(group) < MIN_OF_SYNC_SHOTS))
-				try_sync_shot = true;
-			else
-				if (atomic_read(&group->backup_fcount) >=
-					atomic_read(&group->sensor_fcount))
-					try_sync_shot = true;
-		}
-
-		if (try_sync_shot) {
-			PROGRAM_COUNT(4);
-			ret = down_interruptible(&group->smp_trigger);
-			if (ret) {
-				mgerr(" down fail(%d) #4", group, group, ret);
-				goto p_err_ignore;
-			}
-		}
-
-		/* for multi-buffer */
-		if (frame->num_buffers) {
-			if (atomic_read(&group->sensor_fcount) <= (atomic_read(&group->backup_fcount) + frame->num_buffers)) {
-				frame->fcount = atomic_read(&group->backup_fcount) + frame->num_buffers;
-			} else {
-				frame->fcount = atomic_read(&group->sensor_fcount);
-				mgwarn(" frame count reset by sensor focunt(%d->%d)", group, group,
-					atomic_read(&group->backup_fcount) + frame->num_buffers,
-					frame->fcount);
-			}
-		} else {
-			frame->fcount = atomic_read(&group->sensor_fcount);
-		}
-		atomic_set(&group->backup_fcount, frame->fcount);
-
-		/* real automatic increase */
-		if (!try_sync_shot && (smp_shot_get(group) > MIN_OF_SYNC_SHOTS)) {
-			/* for multi-buffer */
-			if (frame->num_buffers)
-				atomic_add(frame->num_buffers, &group->sensor_fcount);
-			else
-				atomic_inc(&group->sensor_fcount);
-		}
-	} else {
-		if (device->sensor && test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state)) {
-			frame->fcount = fimc_is_sensor_g_fcount(device->sensor) + 1;
-			if (frame->fcount <= atomic_read(&group->backup_fcount))
-				frame->fcount = atomic_read(&group->backup_fcount) + 1;
-			atomic_set(&group->backup_fcount, frame->fcount);
-		}
-	}
-
-p_skip_sync:
-	if (unlikely(test_bit(FIMC_IS_GROUP_FORCE_STOP, &group->state))) {
-		mgwarn(" cancel by fstop2", group, group);
-		ret = -EINVAL;
-		goto p_err_cancel;
-	}
-
-	if (unlikely(test_bit(FIMC_IS_GTASK_REQUEST_STOP, &gtask->state))) {
-		mgerr(" cancel by gstop2", group, group);
-		ret = -EINVAL;
-		goto p_err_ignore;
-	}
-
-	PROGRAM_COUNT(6);
-	gnext = group->gnext;
-	gprev = group->gprev;
-	resourcemgr = device->resourcemgr;
-	gframe = NULL;
-
-	/*
-	 * pipe shot callback
-	 * For example, junction qbuf was processed in this callback
-	 */
-	if (group->pipe_shot_callback)
-		group->pipe_shot_callback(device, group, frame);
-
-	ret = fimc_is_group_check_pre(groupmgr, device, gprev, group, gnext, frame, &gframe);
-	if (unlikely(ret)) {
-		merr(" fimc_is_group_check_pre is fail(%d)", device, ret);
-		goto p_err_cancel;
-	}
-
-	if (unlikely(!gframe)) {
-		merr(" gframe is NULL", device);
-		goto p_err_cancel;
-	}
-
-#ifdef DEBUG_AA
-	fimc_is_group_debug_aa_shot(group, frame);
-#endif
-
-	fimc_is_group_set_torch(group, frame);
-
-#ifdef ENABLE_SHARED_METADATA
-	fimc_is_hw_shared_meta_update(device, group, frame, SHARED_META_SHOT);
-#endif
-
-	ret = group->shot_callback(device, frame);
-	if (unlikely(ret)) {
-		mgerr(" shot_callback is fail(%d)", group, group, ret);
-		goto p_err_cancel;
-	}
-
-#ifdef CONFIG_SOC_EXYNOS8895
-	fimc_is_dual_mode_update(device, group, frame);
-#endif
-
-#ifdef ENABLE_DVFS
-	if ((!pm_qos_request_active(&device->user_qos)) && (sysfs_debug.en_dvfs)) {
-		int scenario_id;
-
-#ifdef ENABLE_REMOSAIC_CAPTURE
-		int mif_qos;
-		struct fimc_is_core *core = (struct fimc_is_core *)platform_get_drvdata(device->pdev);
-#endif
-
-		mutex_lock(&resourcemgr->dvfs_ctrl.lock);
-
-		/* try to find dynamic scenario to apply */
-		fimc_is_dual_dvfs_update(device, group, frame);
-
-		scenario_id = fimc_is_dvfs_sel_dynamic(device, group);
-		if (scenario_id > 0) {
-			struct fimc_is_dvfs_scenario_ctrl *dynamic_ctrl = resourcemgr->dvfs_ctrl.dynamic_ctrl;
-			mgrinfo("tbl[%d] dynamic scenario(%d)-[%s]\n", device, group, frame,
-				resourcemgr->dvfs_ctrl.dvfs_table_idx,
-				scenario_id,
-				dynamic_ctrl->scenarios[dynamic_ctrl->cur_scenario_idx].scenario_nm);
-			fimc_is_set_dvfs((struct fimc_is_core *)device->interface->core, device, scenario_id);
-
-#ifdef ENABLE_REMOSAIC_CAPTURE
-			/*
-			 * HACK: Happen to CSIS_ERR_DMA_ERR_DMAFIFO_FULL when remosaic capture
-			 * 4MB -> 16MB captreu setting to MIF MAX level when 16MB scenario
-			 */
-			if (frame->shot_ext->setfile == ISS_SUB_SCENARIO_REMOSAIC_CAPTURE_WDR_AUTO) {
-				mif_qos = fimc_is_get_qos(core, FIMC_IS_DVFS_MIF, FIMC_IS_SN_MAX);
-				pm_qos_update_request(&exynos_isp_qos_mem, mif_qos);
-				info("[REMOSAIC]: setting to max MIF(%d)\n", mif_qos);
-			}
-#endif
-		}
-
-		if ((scenario_id < 0) && (resourcemgr->dvfs_ctrl.dynamic_ctrl->cur_frame_tick == 0)) {
-			struct fimc_is_dvfs_scenario_ctrl *static_ctrl = resourcemgr->dvfs_ctrl.static_ctrl;
-			mgrinfo("tbl[%d] restore scenario(%d)-[%s]\n", device, group, frame,
-				resourcemgr->dvfs_ctrl.dvfs_table_idx,
-				static_ctrl->cur_scenario_id,
-				static_ctrl->scenarios[static_ctrl->cur_scenario_idx].scenario_nm);
-			fimc_is_set_dvfs((struct fimc_is_core *)device->interface->core, device, static_ctrl->cur_scenario_id);
-		}
-
-		mutex_unlock(&resourcemgr->dvfs_ctrl.lock);
-	}
-#endif
-
-	PROGRAM_COUNT(7);
-
-	ret = fimc_is_group_check_post(groupmgr, device, gprev, group, gnext, frame, gframe);
-	if (unlikely(ret)) {
-		merr(" fimc_is_group_check_post is fail(%d)", device, ret);
-		goto p_err_cancel;
-	}
-
-	fimc_is_itf_grp_shot(device, group, frame);
-	atomic_inc(&group->scount);
-
-	clear_bit(FIMC_IS_GROUP_SHOT, &group->state);
-	PROGRAM_COUNT(12);
-	TIME_SHOT(TMS_SHOT1);
-
-	return ret;
-
-p_err_ignore:
-	if (try_sdown)
-		smp_shot_inc(group);
-
-	if (try_rdown)
-		up(&gtask->smp_resource);
-
-	clear_bit(FIMC_IS_GROUP_SHOT, &group->state);
-	PROGRAM_COUNT(12);
-
-	return ret;
-
-p_err_cancel:
-	fimc_is_group_cancel(group, frame);
-
-	if (try_sdown)
-		smp_shot_inc(group);
-
-	if (try_rdown)
-		up(&gtask->smp_resource);
-
-	clear_bit(FIMC_IS_GROUP_SHOT, &group->state);
-	PROGRAM_COUNT(12);
-
-	return ret;
-}
-
-int fimc_is_group_done(struct fimc_is_groupmgr *groupmgr,
-	struct fimc_is_group *group,
-	struct fimc_is_frame *frame,
-	u32 done_state)
-{
-	int ret = 0;
-	struct fimc_is_device_ischain *device;
-	struct fimc_is_group_framemgr *gframemgr;
-	struct fimc_is_group_frame *gframe;
-	struct fimc_is_group *gnext;
-	struct fimc_is_group_task *gtask;
-#if !defined(ENABLE_SHARED_METADATA)
-	struct fimc_is_group *child;
-#endif
-	ulong flags;
-
-	BUG_ON(!groupmgr);
-	BUG_ON(!group);
-	BUG_ON(!frame);
-	BUG_ON(group->instance >= FIMC_IS_STREAM_COUNT);
-	BUG_ON(group->id >= GROUP_ID_MAX);
-	BUG_ON(!group->device);
-
-	/* check shot & resource count validation */
-	device = group->device;
-	gnext = group->gnext;
-	gframemgr = &groupmgr->gframemgr[group->instance];
-	gtask = &groupmgr->gtask[group->id];
-
-	if (unlikely(test_bit(FIMC_IS_ISCHAIN_REPROCESSING, &device->state) &&
-		(done_state != VB2_BUF_STATE_DONE))) {
-		merr("G%d NOT DONE(reprocessing)\n", group, group->id);
-		fimc_is_hw_logdump(device->interface);
-	}
-
-#ifdef DEBUG_AA
-	fimc_is_group_debug_aa_done(group, frame);
-#endif
-
-	/* sensor tagging */
-	if (test_bit(FIMC_IS_GROUP_OTF_INPUT, &group->state))
-		fimc_is_sensor_dm_tag(device->sensor, frame);
-
-#ifdef ENABLE_SHARED_METADATA
-	fimc_is_hw_shared_meta_update(device, group, frame, SHARED_META_SHOT_DONE);
-#else
-	child = group;
-	while(child) {
-		if ((child == &device->group_3aa) || (child->subdev[ENTRY_3AA])) {
-			/* NI(Noise Index) information backup */
-			device->cur_noise_idx[frame->fcount % NI_BACKUP_MAX] =
-				frame->shot->udm.ni.currentFrameNoiseIndex;
-			device->next_noise_idx[(frame->fcount + 2) % NI_BACKUP_MAX] =
-				frame->shot->udm.ni.nextNextFrameNoiseIndex;
-		}
-
-#ifdef ENABLE_INIT_AWB
-		/* wb gain backup for initial AWB */
-		if (device->sensor && ((child == &device->group_isp) || (child->subdev[ENTRY_ISP])))
-			memcpy(device->sensor->last_wb, frame->shot->dm.color.gains,
-				sizeof(float) * WB_GAIN_COUNT);
-#endif
-
-#if !defined(FAST_FDAE)
-		if ((child == &device->group_vra) || (child->subdev[ENTRY_VRA])) {
-#ifdef ENABLE_FD_SW
-			fimc_is_vra_trigger(device, &group->leader, frame);
-#endif
-			/* fd information backup */
-			memcpy(&device->fdUd, &frame->shot->dm.stats,
-				sizeof(struct camera2_fd_uctl));
-		}
-#endif
-		child = child->child;
-	}
-#endif
-
-	/* gframe should move to free list next group is existed and not done is oocured */
-	if (unlikely((done_state != VB2_BUF_STATE_DONE) && gnext)) {
-		spin_lock_irqsave(&gframemgr->gframe_slock, flags);
-
-		fimc_is_gframe_group_head(gnext, &gframe);
-		if (gframe && (gframe->fcount == frame->fcount)) {
-			ret = fimc_is_gframe_trans_grp_to_fre(gframemgr, gframe, gnext);
-			if (ret) {
-				mgerr("fimc_is_gframe_trans_grp_to_fre is fail(%d)", device, gnext, ret);
-				BUG();
-			}
-		}
-
-		spin_unlock_irqrestore(&gframemgr->gframe_slock, flags);
-	}
-
-	smp_shot_inc(group);
-	up(&gtask->smp_resource);
-
-	if (unlikely(frame->result)) {
-		ret = fimc_is_devicemgr_shot_done(group, frame, frame->result);
-		if (ret) {
-			mgerr("fimc_is_devicemgr_shot_done is fail(%d)", device, group, ret);
-			return ret;
-		}
-	}
-
-	return ret;
-}
+ total count of connected ISDB-Tsb
+			channels.</para>
+		<para>Possible values: 1 .. 13</para>
+		<para>Note: This value cannot be determined by an automatic channel search.</para>
+	</section>
+	<section id="isdb-hierq-layers">
+		<title><constant>DTV-ISDBT-LAYER*</constant> parameters</title>
+		<para>ISDB-T channels can be coded hierarchically. As opposed to DVB-T in
+			ISDB-T hierarchical layers can be decoded simultaneously. For that
+			reason a ISDB-T demodulator has 3 Viterbi and 3 Reed-Solomon decoders.</para>
+		<para>ISDB-T has 3 hierarchical layers which each can use a part of the
+			available segments. The total number of segments over all layers has
+			to 13 in ISDB-T.</para>
+		<para>There are 3 parameter sets, for Layers A, B and C.</para>
+		<section id="DTV-ISDBT-LAYER-ENABLED">
+			<title><constant>DTV_ISDBT_LAYER_ENABLED</constant></title>
+			<para>Hierarchical reception in ISDB-T is achieved by enabling or disabling
+				layers in the decoding process. Setting all bits of
+				<constant>DTV_ISDBT_LAYER_ENABLED</constant> to '1' forces all layers (if applicable) to be
+				demodulated. This is the default.</para>
+			<para>If the channel is in the partial reception mode
+				(<constant>DTV_ISDBT_PARTIAL_RECEPTION</constant> = 1) the central segment can be decoded
+				independently of the other 12 segments. In that mode layer A has to
+				have a <constant>SEGMENT_COUNT</constant> of 1.</para>
+			<para>In ISDB-Tsb only layer A is used, it can be 1 or 3 in ISDB-Tsb
+				according to <constant>DTV_ISDBT_PARTIAL_RECEPTION</constant>. <constant>SEGMENT_COUNT</constant> must be filled
+				accordingly.</para>
+			<para>Possible values: 0x1, 0x2, 0x4 (|-able)</para>
+			<para><constant>DTV_ISDBT_LAYER_ENABLED[0:0]</constant> - layer A</para>
+			<para><constant>DTV_ISDBT_LAYER_ENABLED[1:1]</constant> - layer B</para>
+			<para><constant>DTV_ISDBT_LAYER_ENABLED[2:2]</constant> - layer C</para>
+			<para><constant>DTV_ISDBT_LAYER_ENABLED[31:3]</constant> unused</para>
+		</section>
+		<section id="DTV-ISDBT-LAYER-FEC">
+			<title><constant>DTV_ISDBT_LAYER*_FEC</constant></title>
+			<para>Possible values: <constant>FEC_AUTO</constant>, <constant>FEC_1_2</constant>, <constant>FEC_2_3</constant>, <constant>FEC_3_4</constant>, <constant>FEC_5_6</constant>, <constant>FEC_7_8</constant></para>
+		</section>
+		<section id="DTV-ISDBT-LAYER-MODULATION">
+			<title><constant>DTV_ISDBT_LAYER*_MODULATION</constant></title>
+			<para>Possible values: <constant>QAM_AUTO</constant>, QP<constant>SK, QAM_16</constant>, <constant>QAM_64</constant>, <constant>DQPSK</constant></para>
+			<para>Note: If layer C is <constant>DQPSK</constant> layer B has to be <constant>DQPSK</constant>. If layer B is <constant>DQPSK</constant>
+				and <constant>DTV_ISDBT_PARTIAL_RECEPTION</constant>=0 layer has to be <constant>DQPSK</constant>.</para>
+		</section>
+		<section id="DTV-ISDBT-LAYER-SEGMENT-COUNT">
+			<title><constant>DTV_ISDBT_LAYER*_SEGMENT_COUNT</constant></title>
+			<para>Possible values: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, -1 (AUTO)</para>
+			<para>Note: Truth table for <constant>DTV_ISDBT_SOUND_BROADCASTING</constant> and
+				<constant>DTV_ISDBT_PARTIAL_RECEPTION</constant> and <constant>LAYER</constant>*_SEGMENT_COUNT</para>
+			<informaltable id="isdbt-layer_seg-cnt-table">
+				<tgroup cols="6">
+					<tbody>
+						<row>
+							<entry>PR</entry>
+							<entry>SB</entry>
+							<entry>Layer A width</entry>
+							<entry>Layer B width</entry>
+							<entry>Layer C width</entry>
+							<entry>total width</entry>
+						</row>
+						<row>
+							<entry>0</entry>
+							<entry>0</entry>
+							<entry>1 .. 13</entry>
+							<entry>1 .. 13</entry>
+							<entry>1 .. 13</entry>
+							<entry>13</entry>
+						</row>
+						<row>
+							<entry>1</entry>
+							<entry>0</entry>
+							<entry>1</entry>
+							<entry>1 .. 13</entry>
+							<entry>1 .. 13</entry>
+							<entry>13</entry>
+						</row>
+						<row>
+							<entry>0</entry>
+							<entry>1</entry>
+							<entry>1</entry>
+							<entry>0</entry>
+							<entry>0</entry>
+							<entry>1</entry>
+						</row>
+						<row>
+							<entry>1</entry>
+							<entry>1</entry>
+							<entry>1</entry>
+							<entry>2</entry>
+							<entry>0</entry>
+							<entry>13</entry>
+						</row>
+					</tbody>
+				</tgroup>
+			</informaltable>
+		</section>
+		<section id="DTV-ISDBT-LAYER-TIME-INTERLEAVING">
+			<title><constant>DTV_ISDBT_LAYER*_TIME_INTERLEAVING</constant></title>
+			<para>Valid values: 0, 1, 2, 4, -1 (AUTO)</para>
+			<para>when DTV_ISDBT_SOUND_BROADCASTING is active, value 8 is also valid.</para>
+			<para>Note: The real time interleaving length depends on the mode (fft-size). The values
+				here are referring to what can be found in the TMCC-structure, as shown in the table below.</para>
+			<informaltable id="isdbt-layer-interleaving-table">
+				<tgroup cols="4" align="center">
+					<tbody>
+						<row>
+							<entry>DTV_ISDBT_LAYER*_TIME_INTERLEAVING</entry>
+							<entry>Mode 1 (2K FFT)</entry>
+							<entry>Mode 2 (4K FFT)</entry>
+							<entry>Mode 3 (8K FFT)</entry>
+						</row>
+						<row>
+							<entry>0</entry>
+							<entry>0</entry>
+							<entry>0</entry>
+							<entry>0</entry>
+						</row>
+						<row>
+							<entry>1</entry>
+							<entry>4</entry>
+							<entry>2</entry>
+							<entry>1</entry>
+						</row>
+						<row>
+							<entry>2</entry>
+							<entry>8</entry>
+							<entry>4</entry>
+							<entry>2</entry>
+						</row>
+						<row>
+							<entry>4</entry>
+							<entry>16</entry>
+							<entry>8</entry>
+							<entry>4</entry>
+						</row>
+					</tbody>
+				</tgroup>
+			</informaltable>
+		</section>
+		<section id="DTV-ATSCMH-FIC-VER">
+			<title><constant>DTV_ATSCMH_FIC_VER</constant></title>
+			<para>Version number of the FIC (Fast Information Channel) signaling data.</para>
+			<para>FIC is used for relaying information to allow rapid service acquisition by the receiver.</para>
+			<para>Possible values: 0, 1, 2, 3, ..., 30, 31</para>
+		</section>
+		<section id="DTV-ATSCMH-PARADE-ID">
+			<title><constant>DTV_ATSCMH_PARADE_ID</constant></title>
+			<para>Parade identification number</para>
+			<para>A parade is a collection of up to eight MH groups, conveying one or two ensembles.</para>
+			<para>Possible values: 0, 1, 2, 3, ..., 126, 127</para>
+		</section>
+		<section id="DTV-ATSCMH-NOG">
+			<title><constant>DTV_ATSCMH_NOG</constant></title>
+			<para>Number of MH groups per MH subframe for a designated parade.</para>
+			<para>Possible values: 1, 2, 3, 4, 5, 6, 7, 8</para>
+		</section>
+		<section id="DTV-ATSCMH-TNOG">
+			<title><constant>DTV_ATSCMH_TNOG</constant></title>
+			<para>Total number of MH groups including all MH groups belonging to all MH parades in one MH subframe.</para>
+			<para>Possible values: 0, 1, 2, 3, ..., 30, 31</para>
+		</section>
+		<section id="DTV-ATSCMH-SGN">
+			<title><constant>DTV_ATSCMH_SGN</constant></title>
+			<para>Start group number.</para>
+			<para>Possible values: 0, 1, 2, 3, ..., 14, 15</para>
+		</section>
+		<section id="DTV-ATSCMH-PRC">
+			<title><constant>DTV_ATSCMH_PRC</constant></title>
+			<para>Parade repetition cycle.</para>
+			<para>Possible values: 1, 2, 3, 4, 5, 6, 7, 8</para>
+		</section>
+		<section id="DTV-ATSCMH-RS-FRAME-MODE">
+			<title><constant>DTV_ATSCMH_RS_FRAME_MODE</constant></title>
+			<para>Reed Solomon (RS) frame mode.</para>
+			<para>Possible values are:</para>
+<table pgwide="1" frame="none" id="atscmh-rs-frame-mode">
+    <title>enum atscmh_rs_frame_mode</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="ATSCMH-RSFRAME-PRI-ONLY"><constant>ATSCMH_RSFRAME_PRI_ONLY</constant></entry>
+	    <entry>Single Frame: There is only a primary RS Frame for all
+		Group Regions.</entry>
+	</row><row>
+	    <entry id="ATSCMH-RSFRAME-PRI-SEC"><constant>ATSCMH_RSFRAME_PRI_SEC</constant></entry>
+	    <entry>Dual Frame: There are two separate RS Frames: Primary RS
+		Frame for Group Region A and B and Secondary RS Frame for Group
+		Region C and D.</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+		</section>
+		<section id="DTV-ATSCMH-RS-FRAME-ENSEMBLE">
+			<title><constant>DTV_ATSCMH_RS_FRAME_ENSEMBLE</constant></title>
+			<para>Reed Solomon(RS) frame ensemble.</para>
+			<para>Possible values are:</para>
+<table pgwide="1" frame="none" id="atscmh-rs-frame-ensemble">
+    <title>enum atscmh_rs_frame_ensemble</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="ATSCMH-RSFRAME-ENS-PRI"><constant>ATSCMH_RSFRAME_ENS_PRI</constant></entry>
+	    <entry>Primary Ensemble.</entry>
+	</row><row>
+	    <entry id="ATSCMH-RSFRAME-ENS-SEC"><constant>AATSCMH_RSFRAME_PRI_SEC</constant></entry>
+	    <entry>Secondary Ensemble.</entry>
+	</row><row>
+	    <entry id="ATSCMH-RSFRAME-RES"><constant>AATSCMH_RSFRAME_RES</constant></entry>
+	    <entry>Reserved. Shouldn't be used.</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+		</section>
+		<section id="DTV-ATSCMH-RS-CODE-MODE-PRI">
+			<title><constant>DTV_ATSCMH_RS_CODE_MODE_PRI</constant></title>
+			<para>Reed Solomon (RS) code mode (primary).</para>
+			<para>Possible values are:</para>
+<table pgwide="1" frame="none" id="atscmh-rs-code-mode">
+    <title>enum atscmh_rs_code_mode</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="ATSCMH-RSCODE-211-187"><constant>ATSCMH_RSCODE_211_187</constant></entry>
+	    <entry>Reed Solomon code (211,187).</entry>
+	</row><row>
+	    <entry id="ATSCMH-RSCODE-223-187"><constant>ATSCMH_RSCODE_223_187</constant></entry>
+	    <entry>Reed Solomon code (223,187).</entry>
+	</row><row>
+	    <entry id="ATSCMH-RSCODE-235-187"><constant>ATSCMH_RSCODE_235_187</constant></entry>
+	    <entry>Reed Solomon code (235,187).</entry>
+	</row><row>
+	    <entry id="ATSCMH-RSCODE-RES"><constant>ATSCMH_RSCODE_RES</constant></entry>
+	    <entry>Reserved. Shouldn't be used.</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+		</section>
+		<section id="DTV-ATSCMH-RS-CODE-MODE-SEC">
+			<title><constant>DTV_ATSCMH_RS_CODE_MODE_SEC</constant></title>
+			<para>Reed Solomon (RS) code mode (secondary).</para>
+			<para>Possible values are the same as documented on
+			    &atscmh-rs-code-mode;:</para>
+		</section>
+		<section id="DTV-ATSCMH-SCCC-BLOCK-MODE">
+			<title><constant>DTV_ATSCMH_SCCC_BLOCK_MODE</constant></title>
+			<para>Series Concatenated Convolutional Code Block Mode.</para>
+			<para>Possible values are:</para>
+<table pgwide="1" frame="none" id="atscmh-sccc-block-mode">
+    <title>enum atscmh_scc_block_mode</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="ATSCMH-SCCC-BLK-SEP"><constant>ATSCMH_SCCC_BLK_SEP</constant></entry>
+	    <entry>Separate SCCC: the SCCC outer code mode shall be set independently
+		for each Group Region (A, B, C, D)</entry>
+	</row><row>
+	    <entry id="ATSCMH-SCCC-BLK-COMB"><constant>ATSCMH_SCCC_BLK_COMB</constant></entry>
+	    <entry>Combined SCCC: all four Regions shall have the same SCCC outer
+		code mode.</entry>
+	</row><row>
+	    <entry id="ATSCMH-SCCC-BLK-RES"><constant>ATSCMH_SCCC_BLK_RES</constant></entry>
+	    <entry>Reserved. Shouldn't be used.</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+		</section>
+		<section id="DTV-ATSCMH-SCCC-CODE-MODE-A">
+			<title><constant>DTV_ATSCMH_SCCC_CODE_MODE_A</constant></title>
+			<para>Series Concatenated Convolutional Code Rate.</para>
+			<para>Possible values are:</para>
+<table pgwide="1" frame="none" id="atscmh-sccc-code-mode">
+    <title>enum atscmh_sccc_code_mode</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="ATSCMH-SCCC-CODE-HLF"><constant>ATSCMH_SCCC_CODE_HLF</constant></entry>
+	    <entry>The outer code rate of a SCCC Block is 1/2 rate.</entry>
+	</row><row>
+	    <entry id="ATSCMH-SCCC-CODE-QTR"><constant>ATSCMH_SCCC_CODE_QTR</constant></entry>
+	    <entry>The outer code rate of a SCCC Block is 1/4 rate.</entry>
+	</row><row>
+	    <entry id="ATSCMH-SCCC-CODE-RES"><constant>ATSCMH_SCCC_CODE_RES</constant></entry>
+	    <entry>to be documented.</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+		</section>
+		<section id="DTV-ATSCMH-SCCC-CODE-MODE-B">
+			<title><constant>DTV_ATSCMH_SCCC_CODE_MODE_B</constant></title>
+			<para>Series Concatenated Convolutional Code Rate.</para>
+			<para>Possible values are the same as documented on
+			    &atscmh-sccc-code-mode;.</para>
+		</section>
+		<section id="DTV-ATSCMH-SCCC-CODE-MODE-C">
+			<title><constant>DTV_ATSCMH_SCCC_CODE_MODE_C</constant></title>
+			<para>Series Concatenated Convolutional Code Rate.</para>
+			<para>Possible values are the same as documented on
+			    &atscmh-sccc-code-mode;.</para>
+		</section>
+		<section id="DTV-ATSCMH-SCCC-CODE-MODE-D">
+			<title><constant>DTV_ATSCMH_SCCC_CODE_MODE_D</constant></title>
+			<para>Series Concatenated Convolutional Code Rate.</para>
+			<para>Possible values are the same as documented on
+			    &atscmh-sccc-code-mode;.</para>
+		</section>
+	</section>
+	<section id="DTV-API-VERSION">
+	<title><constant>DTV_API_VERSION</constant></title>
+	<para>Returns the major/minor version of the DVB API</para>
+	</section>
+	<section id="DTV-CODE-RATE-HP">
+	<title><constant>DTV_CODE_RATE_HP</constant></title>
+	<para>Used on terrestrial transmissions.  The acceptable values are
+	    the ones described at &fe-transmit-mode-t;.
+	</para>
+	</section>
+	<section id="DTV-CODE-RATE-LP">
+	<title><constant>DTV_CODE_RATE_LP</constant></title>
+	<para>Used on terrestrial transmissions. The acceptable values are
+	    the ones described at &fe-transmit-mode-t;.
+	</para>
+
+	</section>
+
+	<section id="DTV-GUARD-INTERVAL">
+		<title><constant>DTV_GUARD_INTERVAL</constant></title>
+
+		<para>Possible values are:</para>
+
+<section id="fe-guard-interval-t">
+<title>Modulation guard interval</title>
+
+<table pgwide="1" frame="none" id="fe-guard-interval">
+    <title>enum fe_guard_interval</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="GUARD-INTERVAL-AUTO"><constant>GUARD_INTERVAL_AUTO</constant></entry>
+	    <entry>Autodetect the guard interval</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-1-128"><constant>GUARD_INTERVAL_1_128</constant></entry>
+	    <entry>Guard interval 1/128</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-1-32"><constant>GUARD_INTERVAL_1_32</constant></entry>
+	    <entry>Guard interval 1/32</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-1-16"><constant>GUARD_INTERVAL_1_16</constant></entry>
+	    <entry>Guard interval 1/16</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-1-8"><constant>GUARD_INTERVAL_1_8</constant></entry>
+	    <entry>Guard interval 1/8</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-1-4"><constant>GUARD_INTERVAL_1_4</constant></entry>
+	    <entry>Guard interval 1/4</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-19-128"><constant>GUARD_INTERVAL_19_128</constant></entry>
+	    <entry>Guard interval 19/128</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-19-256"><constant>GUARD_INTERVAL_19_256</constant></entry>
+	    <entry>Guard interval 19/256</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-PN420"><constant>GUARD_INTERVAL_PN420</constant></entry>
+	    <entry>PN length 420 (1/4)</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-PN595"><constant>GUARD_INTERVAL_PN595</constant></entry>
+	    <entry>PN length 595 (1/6)</entry>
+	</row><row>
+	    <entry id="GUARD-INTERVAL-PN945"><constant>GUARD_INTERVAL_PN945</constant></entry>
+	    <entry>PN length 945 (1/9)</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+
+		<para>Notes:</para>
+		<para>1) If <constant>DTV_GUARD_INTERVAL</constant> is set the <constant>GUARD_INTERVAL_AUTO</constant> the hardware will
+			try to find the correct guard interval (if capable) and will use TMCC to fill
+			in the missing parameters.</para>
+		<para>2) Intervals 1/128, 19/128 and 19/256 are used only for DVB-T2 at present</para>
+		<para>3) DTMB specifies PN420, PN595 and PN945.</para>
+</section>
+	</section>
+	<section id="DTV-TRANSMISSION-MODE">
+		<title><constant>DTV_TRANSMISSION_MODE</constant></title>
+
+		<para>Specifies the number of carriers used by the standard.
+		    This is used only on OFTM-based standards, e. g.
+		    DVB-T/T2, ISDB-T, DTMB</para>
+
+<section id="fe-transmit-mode-t">
+<title>enum fe_transmit_mode: Number of carriers per channel</title>
+
+<table pgwide="1" frame="none" id="fe-transmit-mode">
+    <title>enum fe_transmit_mode</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="TRANSMISSION-MODE-AUTO"><constant>TRANSMISSION_MODE_AUTO</constant></entry>
+	    <entry>Autodetect transmission mode. The hardware will try to find
+		the correct FFT-size (if capable) to fill in the missing
+		parameters.</entry>
+	</row><row>
+	    <entry id="TRANSMISSION-MODE-1K"><constant>TRANSMISSION_MODE_1K</constant></entry>
+	    <entry>Transmission mode 1K</entry>
+	</row><row>
+	    <entry id="TRANSMISSION-MODE-2K"><constant>TRANSMISSION_MODE_2K</constant></entry>
+	    <entry>Transmission mode 2K</entry>
+	</row><row>
+	    <entry id="TRANSMISSION-MODE-8K"><constant>TRANSMISSION_MODE_8K</constant></entry>
+	    <entry>Transmission mode 8K</entry>
+	</row><row>
+	    <entry id="TRANSMISSION-MODE-4K"><constant>TRANSMISSION_MODE_4K</constant></entry>
+	    <entry>Transmission mode 4K</entry>
+	</row><row>
+	    <entry id="TRANSMISSION-MODE-16K"><constant>TRANSMISSION_MODE_16K</constant></entry>
+	    <entry>Transmission mode 16K</entry>
+	</row><row>
+	    <entry id="TRANSMISSION-MODE-32K"><constant>TRANSMISSION_MODE_32K</constant></entry>
+	    <entry>Transmission mode 32K</entry>
+	</row><row>
+	    <entry id="TRANSMISSION-MODE-C1"><constant>TRANSMISSION_MODE_C1</constant></entry>
+	    <entry>Single Carrier (C=1) transmission mode (DTMB)</entry>
+	</row><row>
+	    <entry id="TRANSMISSION-MODE-C3780"><constant>TRANSMISSION_MODE_C3780</constant></entry>
+	    <entry>Multi Carrier (C=3780) transmission mode (DTMB)</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+
+
+		<para>Notes:</para>
+		<para>1) ISDB-T supports three carrier/symbol-size: 8K, 4K, 2K. It is called
+			'mode' in the standard: Mode 1 is 2K, mode 2 is 4K, mode 3 is 8K</para>
+
+		<para>2) If <constant>DTV_TRANSMISSION_MODE</constant> is set the <constant>TRANSMISSION_MODE_AUTO</constant> the
+			hardware will try to find the correct FFT-size (if capable) and will
+			use TMCC to fill in the missing parameters.</para>
+		<para>3) DVB-T specifies 2K and 8K as valid sizes.</para>
+		<para>4) DVB-T2 specifies 1K, 2K, 4K, 8K, 16K and 32K.</para>
+		<para>5) DTMB specifies C1 and C3780.</para>
+</section>
+	</section>
+	<section id="DTV-HIERARCHY">
+	<title><constant>DTV_HIERARCHY</constant></title>
+	<para>Frontend hierarchy</para>
+
+
+<section id="fe-hierarchy-t">
+<title>Frontend hierarchy</title>
+
+<table pgwide="1" frame="none" id="fe-hierarchy">
+    <title>enum fe_hierarchy</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	     <entry id="HIERARCHY-NONE"><constant>HIERARCHY_NONE</constant></entry>
+	    <entry>No hierarchy</entry>
+	</row><row>
+	     <entry id="HIERARCHY-AUTO"><constant>HIERARCHY_AUTO</constant></entry>
+	    <entry>Autodetect hierarchy (if supported)</entry>
+	</row><row>
+	     <entry id="HIERARCHY-1"><constant>HIERARCHY_1</constant></entry>
+	    <entry>Hierarchy 1</entry>
+	</row><row>
+	     <entry id="HIERARCHY-2"><constant>HIERARCHY_2</constant></entry>
+	    <entry>Hierarchy 2</entry>
+	</row><row>
+	     <entry id="HIERARCHY-4"><constant>HIERARCHY_4</constant></entry>
+	    <entry>Hierarchy 4</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+</section>
+
+	</section>
+	<section id="DTV-STREAM-ID">
+	<title><constant>DTV_STREAM_ID</constant></title>
+	<para>DVB-S2, DVB-T2 and ISDB-S support the transmission of several
+	      streams on a single transport stream.
+	      This property enables the DVB driver to handle substream filtering,
+	      when supported by the hardware.
+	      By default, substream filtering is disabled.
+	</para><para>
+	      For DVB-S2 and DVB-T2, the valid substream id range is from 0 to 255.
+	</para><para>
+	      For ISDB, the valid substream id range is from 1 to 65535.
+	</para><para>
+	      To disable it, you should use the special macro NO_STREAM_ID_FILTER.
+	</para><para>
+	      Note: any value outside the id range also disables filtering.
+	</para>
+	</section>
+	<section id="DTV-DVBT2-PLP-ID-LEGACY">
+		<title><constant>DTV_DVBT2_PLP_ID_LEGACY</constant></title>
+		<para>Obsolete, replaced with DTV_STREAM_ID.</para>
+	</section>
+	<section id="DTV-ENUM-DELSYS">
+		<title><constant>DTV_ENUM_DELSYS</constant></title>
+		<para>A Multi standard frontend needs to advertise the delivery systems provided.
+			Applications need to enumerate the provided delivery systems, before using
+			any other operation with the frontend. Prior to it's introduction,
+			FE_GET_INFO was used to determine a frontend type. A frontend which
+			provides more than a single delivery system, FE_GET_INFO doesn't help much.
+			Applications which intends to use a multistandard frontend must enumerate
+			the delivery systems associated with it, rather than trying to use
+			FE_GET_INFO. In the case of a legacy frontend, the result is just the same
+			as with FE_GET_INFO, but in a more structured format </para>
+	</section>
+	<section id="DTV-INTERLEAVING">
+	<title><constant>DTV_INTERLEAVING</constant></title>
+
+<para>Time interleaving to be used. Currently, used only on DTMB.</para>
+
+<table pgwide="1" frame="none" id="fe-interleaving">
+    <title>enum fe_interleaving</title>
+    <tgroup cols="2">
+	&cs-def;
+	<thead>
+	<row>
+	    <entry>ID</entry>
+	    <entry>Description</entry>
+	</row>
+	</thead>
+	<tbody valign="top">
+	<row>
+	    <entry id="INTERLEAVING-NONE"><constant>INTERLEAVING_NONE</constant></entry>
+	    <entry>No interleaving.</entry>
+	</row><row>
+	    <entry id="INTERLEAVING-AUTO"><constant>INTERLEAVING_AUTO</constant></entry>
+	    <entry>Auto-detect interleaving.</entry>
+	</row><row>
+	    <entry id="INTERLEAVING-240"><constant>INTERLEAVING_240</constant></entry>
+	    <entry>Interleaving of 240 symbols.</entry>
+	</row><row>
+	    <entry id="INTERLEAVING-720"><constant>INTERLEAVING_720</constant></entry>
+	    <entry>Interleaving of 720 symbols.</entry>
+	</row>
+        </tbody>
+    </tgroup>
+</table>
+
+	</section>
+	<section id="DTV-LNA">
+	<title><constant>DTV_LNA</constant></title>
+	<para>Low-noise amplifier.</para>
+	<para>Hardware might offer controllable LNA which can be set manually
+		using that parameter. Usually LNA could be found only from
+		terrestrial devices if at all.</para>
+	<para>Possible values: 0, 1, LNA_AUTO</para>
+	<para>0, LNA off</para>
+	<para>1, LNA on</para>
+	<para>use the special macro LNA_AUTO to set LNA auto</para>
+	</section>
+</section>
+
+	<section id="frontend-stat-properties">
+	<title>Frontend statistics indicators</title>
+	<para>The values are returned via <constant>dtv_property.stat</constant>.
+	      If the property is supported, <constant>dtv_property.stat.len</constant> is bigger than zero.</para>
+	<para>For most delivery systems, <constant>dtv_property.stat.len</constant>
+	      will be 1 if the stats is supported, and the properties will
+	      return a single value for each parameter.</para>
+	<para>It should be noted, however, that new OFDM delivery systems
+	      like ISDB can use different modulation types for each group of
+	      carriers. On such standards, up to 3 groups of statistics can be
+	      provided, and <constant>dtv_property.stat.len</constant> is updated
+	      to reflect the "global" metrics, plus one metric per each carrier
+	      group (called "layer" on ISDB).</para>
+	<para>So, in order to be consistent with other delivery systems, the first
+	      value at <link linkend="dtv-stats"><constant>dtv_property.stat.dtv_stats</constant></link>
+	      array refers to the global metric. The other elements of the array
+	      represent each layer, starting from layer A(index 1),
+	      layer B (index 2) and so on.</para>
+	<para>The number of filled elements are stored at <constant>dtv_property.stat.len</constant>.</para>
+	<para>Each element of the <constant>dtv_property.stat.dtv_stats</constant> array consists on two elements:</para>
+	<itemizedlist mark='opencircle'>
+		<listitem><para><constant>svalue</constant> or <constant>uvalue</constant>, where
+			<constant>svalue</constant> is for signed values of the measure (dB measures)
+			and <constant>uvalue</constant> is for unsigned values (counters, relative scale)</para></listitem>
+		<listitem><para><constant>scale</constant> - Scale for the value. It can be:</para>
+			<itemizedlist mark='bullet' id="fecap-scale-params">
+				<listitem id="FE-SCALE-NOT-AVAILABLE"><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - The parameter is supported by the frontend, but it was not possible to collect it (could be a transitory or permanent condition)</para></listitem>
+				<listitem id="FE-SCALE-DECIBEL"><para><constant>FE_SCALE_DECIBEL</constant> - parameter is a signed value, measured in 1/1000 dB</para></listitem>
+				<listitem id="FE-SCALE-RELATIVE"><para><constant>FE_SCALE_RELATIVE</constant> - parameter is a unsigned value, where 0 means 0% and 65535 means 100%.</para></listitem>
+				<listitem id="FE-SCALE-COUNTER"><para><constant>FE_SCALE_COUNTER</constant> - parameter is a unsigned value that counts the occurrence of an event, like bit error, block error, or lapsed time.</para></listitem>
+			</itemizedlist>
+		</listitem>
+	</itemizedlist>
+	<section id="DTV-STAT-SIGNAL-STRENGTH">
+		<title><constant>DTV_STAT_SIGNAL_STRENGTH</constant></title>
+		<para>Indicates the signal strength level at the analog part of the tuner or of the demod.</para>
+		<para>Possible scales for this metric are:</para>
+		<itemizedlist mark='bullet'>
+			<listitem><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - it failed to measure it, or the measurement was not complete yet.</para></listitem>
+			<listitem><para><constant>FE_SCALE_DECIBEL</constant> - signal strength is in 0.001 dBm units, power measured in miliwatts. This value is generally negative.</para></listitem>
+			<listitem><para><constant>FE_SCALE_RELATIVE</constant> - The frontend provides a 0% to 100% measurement for power (actually, 0 to 65535).</para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="DTV-STAT-CNR">
+		<title><constant>DTV_STAT_CNR</constant></title>
+		<para>Indicates the Signal to Noise ratio for the main carrier.</para>
+		<para>Possible scales for this metric are:</para>
+		<itemizedlist mark='bullet'>
+			<listitem><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - it failed to measure it, or the measurement was not complete yet.</para></listitem>
+			<listitem><para><constant>FE_SCALE_DECIBEL</constant> - Signal/Noise ratio is in 0.001 dB units.</para></listitem>
+			<listitem><para><constant>FE_SCALE_RELATIVE</constant> - The frontend provides a 0% to 100% measurement for Signal/Noise (actually, 0 to 65535).</para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="DTV-STAT-PRE-ERROR-BIT-COUNT">
+		<title><constant>DTV_STAT_PRE_ERROR_BIT_COUNT</constant></title>
+		<para>Measures the number of bit errors before the forward error correction (FEC) on the inner coding block (before Viterbi, LDPC or other inner code).</para>
+		<para>This measure is taken during the same interval as <constant>DTV_STAT_PRE_TOTAL_BIT_COUNT</constant>.</para>
+		<para>In order to get the BER (Bit Error Rate) measurement, it should be divided by
+		<link linkend="DTV-STAT-PRE-TOTAL-BIT-COUNT"><constant>DTV_STAT_PRE_TOTAL_BIT_COUNT</constant></link>.</para>
+		<para>This measurement is monotonically increased, as the frontend gets more bit count measurements.
+		      The frontend may reset it when a channel/transponder is tuned.</para>
+		<para>Possible scales for this metric are:</para>
+		<itemizedlist mark='bullet'>
+			<listitem><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - it failed to measure it, or the measurement was not complete yet.</para></listitem>
+			<listitem><para><constant>FE_SCALE_COUNTER</constant> - Number of error bits counted before the inner coding.</para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="DTV-STAT-PRE-TOTAL-BIT-COUNT">
+		<title><constant>DTV_STAT_PRE_TOTAL_BIT_COUNT</constant></title>
+		<para>Measures the amount of bits received before the inner code block, during the same period as
+		<link linkend="DTV-STAT-PRE-ERROR-BIT-COUNT"><constant>DTV_STAT_PRE_ERROR_BIT_COUNT</constant></link> measurement was taken.</para>
+		<para>It should be noted that this measurement can be smaller than the total amount of bits on the transport stream,
+		      as the frontend may need to manually restart the measurement, losing some data between each measurement interval.</para>
+		<para>This measurement is monotonically increased, as the frontend gets more bit count measurements.
+		      The frontend may reset it when a channel/transponder is tuned.</para>
+		<para>Possible scales for this metric are:</para>
+		<itemizedlist mark='bullet'>
+			<listitem><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - it failed to measure it, or the measurement was not complete yet.</para></listitem>
+			<listitem><para><constant>FE_SCALE_COUNTER</constant> - Number of bits counted while measuring
+				 <link linkend="DTV-STAT-PRE-ERROR-BIT-COUNT"><constant>DTV_STAT_PRE_ERROR_BIT_COUNT</constant></link>.</para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="DTV-STAT-POST-ERROR-BIT-COUNT">
+		<title><constant>DTV_STAT_POST_ERROR_BIT_COUNT</constant></title>
+		<para>Measures the number of bit errors after the forward error correction (FEC) done by inner code block (after Viterbi, LDPC or other inner code).</para>
+		<para>This measure is taken during the same interval as <constant>DTV_STAT_POST_TOTAL_BIT_COUNT</constant>.</para>
+		<para>In order to get the BER (Bit Error Rate) measurement, it should be divided by
+		<link linkend="DTV-STAT-POST-TOTAL-BIT-COUNT"><constant>DTV_STAT_POST_TOTAL_BIT_COUNT</constant></link>.</para>
+		<para>This measurement is monotonically increased, as the frontend gets more bit count measurements.
+		      The frontend may reset it when a channel/transponder is tuned.</para>
+		<para>Possible scales for this metric are:</para>
+		<itemizedlist mark='bullet'>
+			<listitem><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - it failed to measure it, or the measurement was not complete yet.</para></listitem>
+			<listitem><para><constant>FE_SCALE_COUNTER</constant> - Number of error bits counted after the inner coding.</para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="DTV-STAT-POST-TOTAL-BIT-COUNT">
+		<title><constant>DTV_STAT_POST_TOTAL_BIT_COUNT</constant></title>
+		<para>Measures the amount of bits received after the inner coding, during the same period as
+		<link linkend="DTV-STAT-POST-ERROR-BIT-COUNT"><constant>DTV_STAT_POST_ERROR_BIT_COUNT</constant></link> measurement was taken.</para>
+		<para>It should be noted that this measurement can be smaller than the total amount of bits on the transport stream,
+		      as the frontend may need to manually restart the measurement, losing some data between each measurement interval.</para>
+		<para>This measurement is monotonically increased, as the frontend gets more bit count measurements.
+		      The frontend may reset it when a channel/transponder is tuned.</para>
+		<para>Possible scales for this metric are:</para>
+		<itemizedlist mark='bullet'>
+			<listitem><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - it failed to measure it, or the measurement was not complete yet.</para></listitem>
+			<listitem><para><constant>FE_SCALE_COUNTER</constant> - Number of bits counted while measuring
+				 <link linkend="DTV-STAT-POST-ERROR-BIT-COUNT"><constant>DTV_STAT_POST_ERROR_BIT_COUNT</constant></link>.</para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="DTV-STAT-ERROR-BLOCK-COUNT">
+		<title><constant>DTV_STAT_ERROR_BLOCK_COUNT</constant></title>
+		<para>Measures the number of block errors after the outer forward error correction coding (after Reed-Solomon or other outer code).</para>
+		<para>This measurement is monotonically increased, as the frontend gets more bit count measurements.
+		      The frontend may reset it when a channel/transponder is tuned.</para>
+		<para>Possible scales for this metric are:</para>
+		<itemizedlist mark='bullet'>
+			<listitem><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - it failed to measure it, or the measurement was not complete yet.</para></listitem>
+			<listitem><para><constant>FE_SCALE_COUNTER</constant> - Number of error blocks counted after the outer coding.</para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="DTV-STAT-TOTAL-BLOCK-COUNT">
+		<title><constant>DTV-STAT_TOTAL_BLOCK_COUNT</constant></title>
+		<para>Measures the total number of blocks received during the same period as
+		<link linkend="DTV-STAT-ERROR-BLOCK-COUNT"><constant>DTV_STAT_ERROR_BLOCK_COUNT</constant></link> measurement was taken.</para>
+		<para>It can be used to calculate the PER indicator, by dividing
+		<link linkend="DTV-STAT-ERROR-BLOCK-COUNT"><constant>DTV_STAT_ERROR_BLOCK_COUNT</constant></link>
+		by <link linkend="DTV-STAT-TOTAL-BLOCK-COUNT"><constant>DTV-STAT-TOTAL-BLOCK-COUNT</constant></link>.</para>
+		<para>Possible scales for this metric are:</para>
+		<itemizedlist mark='bullet'>
+			<listitem><para><constant>FE_SCALE_NOT_AVAILABLE</constant> - it failed to measure it, or the measurement was not complete yet.</para></listitem>
+			<listitem><para><constant>FE_SCALE_COUNTER</constant> - Number of blocks counted while measuring
+			<link linkend="DTV-STAT-ERROR-BLOCK-COUNT"><constant>DTV_STAT_ERROR_BLOCK_COUNT</constant></link>.</para></listitem>
+		</itemizedlist>
+	</section>
+	</section>
+
+	<section id="frontend-property-terrestrial-systems">
+	<title>Properties used on terrestrial delivery systems</title>
+		<section id="dvbt-params">
+			<title>DVB-T delivery system</title>
+			<para>The following parameters are valid for DVB-T:</para>
+			<itemizedlist mark='opencircle'>
+				<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-MODULATION"><constant>DTV_MODULATION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-BANDWIDTH-HZ"><constant>DTV_BANDWIDTH_HZ</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-INVERSION"><constant>DTV_INVERSION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-CODE-RATE-HP"><constant>DTV_CODE_RATE_HP</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-CODE-RATE-LP"><constant>DTV_CODE_RATE_LP</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-GUARD-INTERVAL"><constant>DTV_GUARD_INTERVAL</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-TRANSMISSION-MODE"><constant>DTV_TRANSMISSION_MODE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-HIERARCHY"><constant>DTV_HIERARCHY</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-LNA"><constant>DTV_LNA</constant></link></para></listitem>
+			</itemizedlist>
+			<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+		</section>
+		<section id="dvbt2-params">
+			<title>DVB-T2 delivery system</title>
+			<para>DVB-T2 support is currently in the early stages
+			of development, so expect that this section maygrow and become
+			more detailed with time.</para>
+		<para>The following parameters are valid for DVB-T2:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-MODULATION"><constant>DTV_MODULATION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-BANDWIDTH-HZ"><constant>DTV_BANDWIDTH_HZ</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INVERSION"><constant>DTV_INVERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-CODE-RATE-HP"><constant>DTV_CODE_RATE_HP</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-CODE-RATE-LP"><constant>DTV_CODE_RATE_LP</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-GUARD-INTERVAL"><constant>DTV_GUARD_INTERVAL</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TRANSMISSION-MODE"><constant>DTV_TRANSMISSION_MODE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-HIERARCHY"><constant>DTV_HIERARCHY</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-STREAM-ID"><constant>DTV_STREAM_ID</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-LNA"><constant>DTV_LNA</constant></link></para></listitem>
+		</itemizedlist>
+		<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+		</section>
+		<section id="isdbt">
+		<title>ISDB-T delivery system</title>
+		<para>This ISDB-T/ISDB-Tsb API extension should reflect all information
+			needed to tune any ISDB-T/ISDB-Tsb hardware. Of course it is possible
+			that some very sophisticated devices won't need certain parameters to
+			tune.</para>
+		<para>The information given here should help application writers to know how
+			to handle ISDB-T and ISDB-Tsb hardware using the Linux DVB-API.</para>
+		<para>The details given here about ISDB-T and ISDB-Tsb are just enough to
+			basically show the dependencies between the needed parameter values,
+			but surely some information is left out. For more detailed information
+			see the following documents:</para>
+		<para>ARIB STD-B31 - "Transmission System for Digital Terrestrial
+			Television Broadcasting" and</para>
+		<para>ARIB TR-B14 - "Operational Guidelines for Digital Terrestrial
+			Television Broadcasting".</para>
+		<para>In order to understand the ISDB specific parameters,
+			one has to have some knowledge the channel structure in
+			ISDB-T and ISDB-Tsb. I.e. it has to be known to
+			the reader that an ISDB-T channel consists of 13 segments,
+			that it can have up to 3 layer sharing those segments,
+			and things like that.</para>
+		<para>The following parameters are valid for ISDB-T:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-BANDWIDTH-HZ"><constant>DTV_BANDWIDTH_HZ</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INVERSION"><constant>DTV_INVERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-GUARD-INTERVAL"><constant>DTV_GUARD_INTERVAL</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TRANSMISSION-MODE"><constant>DTV_TRANSMISSION_MODE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-ENABLED"><constant>DTV_ISDBT_LAYER_ENABLED</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-PARTIAL-RECEPTION"><constant>DTV_ISDBT_PARTIAL_RECEPTION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-SOUND-BROADCASTING"><constant>DTV_ISDBT_SOUND_BROADCASTING</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-SB-SUBCHANNEL-ID"><constant>DTV_ISDBT_SB_SUBCHANNEL_ID</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-SB-SEGMENT-IDX"><constant>DTV_ISDBT_SB_SEGMENT_IDX</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-SB-SEGMENT-COUNT"><constant>DTV_ISDBT_SB_SEGMENT_COUNT</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-FEC"><constant>DTV_ISDBT_LAYERA_FEC</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-MODULATION"><constant>DTV_ISDBT_LAYERA_MODULATION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-SEGMENT-COUNT"><constant>DTV_ISDBT_LAYERA_SEGMENT_COUNT</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-TIME-INTERLEAVING"><constant>DTV_ISDBT_LAYERA_TIME_INTERLEAVING</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-FEC"><constant>DTV_ISDBT_LAYERB_FEC</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-MODULATION"><constant>DTV_ISDBT_LAYERB_MODULATION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-SEGMENT-COUNT"><constant>DTV_ISDBT_LAYERB_SEGMENT_COUNT</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-TIME-INTERLEAVING"><constant>DTV_ISDBT_LAYERB_TIME_INTERLEAVING</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-FEC"><constant>DTV_ISDBT_LAYERC_FEC</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-MODULATION"><constant>DTV_ISDBT_LAYERC_MODULATION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-SEGMENT-COUNT"><constant>DTV_ISDBT_LAYERC_SEGMENT_COUNT</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ISDBT-LAYER-TIME-INTERLEAVING"><constant>DTV_ISDBT_LAYERC_TIME_INTERLEAVING</constant></link></para></listitem>
+		</itemizedlist>
+		<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+		</section>
+		<section id="atsc-params">
+			<title>ATSC delivery system</title>
+			<para>The following parameters are valid for ATSC:</para>
+			<itemizedlist mark='opencircle'>
+				<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-MODULATION"><constant>DTV_MODULATION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-BANDWIDTH-HZ"><constant>DTV_BANDWIDTH_HZ</constant></link></para></listitem>
+			</itemizedlist>
+			<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+		</section>
+		<section id="atscmh-params">
+			<title>ATSC-MH delivery system</title>
+			<para>The following parameters are valid for ATSC-MH:</para>
+			<itemizedlist mark='opencircle'>
+				<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-BANDWIDTH-HZ"><constant>DTV_BANDWIDTH_HZ</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-FIC-VER"><constant>DTV_ATSCMH_FIC_VER</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-PARADE-ID"><constant>DTV_ATSCMH_PARADE_ID</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-NOG"><constant>DTV_ATSCMH_NOG</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-TNOG"><constant>DTV_ATSCMH_TNOG</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-SGN"><constant>DTV_ATSCMH_SGN</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-PRC"><constant>DTV_ATSCMH_PRC</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-RS-FRAME-MODE"><constant>DTV_ATSCMH_RS_FRAME_MODE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-RS-FRAME-ENSEMBLE"><constant>DTV_ATSCMH_RS_FRAME_ENSEMBLE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-RS-CODE-MODE-PRI"><constant>DTV_ATSCMH_RS_CODE_MODE_PRI</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-RS-CODE-MODE-SEC"><constant>DTV_ATSCMH_RS_CODE_MODE_SEC</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-SCCC-BLOCK-MODE"><constant>DTV_ATSCMH_SCCC_BLOCK_MODE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-SCCC-CODE-MODE-A"><constant>DTV_ATSCMH_SCCC_CODE_MODE_A</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-SCCC-CODE-MODE-B"><constant>DTV_ATSCMH_SCCC_CODE_MODE_B</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-SCCC-CODE-MODE-C"><constant>DTV_ATSCMH_SCCC_CODE_MODE_C</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-ATSCMH-SCCC-CODE-MODE-D"><constant>DTV_ATSCMH_SCCC_CODE_MODE_D</constant></link></para></listitem>
+			</itemizedlist>
+			<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+		</section>
+		<section id="dtmb-params">
+			<title>DTMB delivery system</title>
+			<para>The following parameters are valid for DTMB:</para>
+			<itemizedlist mark='opencircle'>
+				<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-MODULATION"><constant>DTV_MODULATION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-BANDWIDTH-HZ"><constant>DTV_BANDWIDTH_HZ</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-INVERSION"><constant>DTV_INVERSION</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-INNER-FEC"><constant>DTV_INNER_FEC</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-GUARD-INTERVAL"><constant>DTV_GUARD_INTERVAL</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-TRANSMISSION-MODE"><constant>DTV_TRANSMISSION_MODE</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-INTERLEAVING"><constant>DTV_INTERLEAVING</constant></link></para></listitem>
+				<listitem><para><link linkend="DTV-LNA"><constant>DTV_LNA</constant></link></para></listitem>
+			</itemizedlist>
+			<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+		</section>
+	</section>
+	<section id="frontend-property-cable-systems">
+	<title>Properties used on cable delivery systems</title>
+	<section id="dvbc-params">
+		<title>DVB-C delivery system</title>
+		<para>The DVB-C Annex-A is the widely used cable standard. Transmission uses QAM modulation.</para>
+		<para>The DVB-C Annex-C is optimized for 6MHz, and is used in Japan. It supports a subset of the Annex A modulation types, and a roll-off of 0.13, instead of 0.15</para>
+		<para>The following parameters are valid for DVB-C Annex A/C:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-MODULATION"><constant>DTV_MODULATION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INVERSION"><constant>DTV_INVERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-SYMBOL-RATE"><constant>DTV_SYMBOL_RATE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INNER-FEC"><constant>DTV_INNER_FEC</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-LNA"><constant>DTV_LNA</constant></link></para></listitem>
+		</itemizedlist>
+		<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+	</section>
+	<section id="dvbc-annex-b-params">
+		<title>DVB-C Annex B delivery system</title>
+		<para>The DVB-C Annex-B is only used on a few Countries like the United States.</para>
+		<para>The following parameters are valid for DVB-C Annex B:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-MODULATION"><constant>DTV_MODULATION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INVERSION"><constant>DTV_INVERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-LNA"><constant>DTV_LNA</constant></link></para></listitem>
+		</itemizedlist>
+		<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+	</section>
+	</section>
+	<section id="frontend-property-satellite-systems">
+	<title>Properties used on satellite delivery systems</title>
+	<section id="dvbs-params">
+		<title>DVB-S delivery system</title>
+		<para>The following parameters are valid for DVB-S:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INVERSION"><constant>DTV_INVERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-SYMBOL-RATE"><constant>DTV_SYMBOL_RATE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INNER-FEC"><constant>DTV_INNER_FEC</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-VOLTAGE"><constant>DTV_VOLTAGE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TONE"><constant>DTV_TONE</constant></link></para></listitem>
+		</itemizedlist>
+		<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+		<para>Future implementations might add those two missing parameters:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-DISEQC-MASTER"><constant>DTV_DISEQC_MASTER</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-DISEQC-SLAVE-REPLY"><constant>DTV_DISEQC_SLAVE_REPLY</constant></link></para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="dvbs2-params">
+		<title>DVB-S2 delivery system</title>
+		<para>In addition to all parameters valid for DVB-S, DVB-S2 supports the following parameters:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-MODULATION"><constant>DTV_MODULATION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-PILOT"><constant>DTV_PILOT</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-ROLLOFF"><constant>DTV_ROLLOFF</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-STREAM-ID"><constant>DTV_STREAM_ID</constant></link></para></listitem>
+		</itemizedlist>
+		<para>In addition, the <link linkend="frontend-stat-properties">DTV QoS statistics</link> are also valid.</para>
+	</section>
+	<section id="turbo-params">
+		<title>Turbo code delivery system</title>
+		<para>In addition to all parameters valid for DVB-S, turbo code supports the following parameters:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-MODULATION"><constant>DTV_MODULATION</constant></link></para></listitem>
+		</itemizedlist>
+	</section>
+	<section id="isdbs-params">
+		<title>ISDB-S delivery system</title>
+		<para>The following parameters are valid for ISDB-S:</para>
+		<itemizedlist mark='opencircle'>
+			<listitem><para><link linkend="DTV-API-VERSION"><constant>DTV_API_VERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-DELIVERY-SYSTEM"><constant>DTV_DELIVERY_SYSTEM</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-TUNE"><constant>DTV_TUNE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-CLEAR"><constant>DTV_CLEAR</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-FREQUENCY"><constant>DTV_FREQUENCY</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INVERSION"><constant>DTV_INVERSION</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-SYMBOL-RATE"><constant>DTV_SYMBOL_RATE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-INNER-FEC"><constant>DTV_INNER_FEC</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-VOLTAGE"><constant>DTV_VOLTAGE</constant></link></para></listitem>
+			<listitem><para><link linkend="DTV-STREAM-ID"><constant>DTV_STREAM_ID</constant></link></para></listitem>
+		</itemizedlist>
+	</section>
+	</section>
+</section>
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       <title>Changes</title>
+
+  <para>The following chapters document the evolution of the V4L2 API,
+errata or extensions. They are also intended to help application and
+driver writers to port or update their code.</para>
+
+  <section id="diff-v4l">
+    <title>Differences between V4L and V4L2</title>
+
+    <para>The Video For Linux API was first introduced in Linux 2.1 to
+unify and replace various TV and radio device related interfaces,
+developed independently by driver writers in prior years. Starting
+with Linux 2.5 the much improved V4L2 API replaces the V4L API.
+The support for the old V4L calls were removed from Kernel, but the
+library <xref linkend="libv4l" /> supports the conversion of a V4L
+API system call into a V4L2 one.</para>
+
+    <section>
+      <title>Opening and Closing Devices</title>
+
+      <para>For compatibility reasons the character device file names
+recommended for V4L2 video capture, overlay, radio and raw
+vbi capture devices did not change from those used by V4L. They are
+listed in <xref linkend="devices" /> and below in <xref
+	  linkend="v4l-dev" />.</para>
+
+      <para>The teletext devices (minor range 192-223) have been removed in
+V4L2 and no longer exist. There is no hardware available anymore for handling
+pure teletext. Instead raw or sliced VBI is used.</para>
+
+      <para>The V4L <filename>videodev</filename> module automatically
+assigns minor numbers to drivers in load order, depending on the
+registered device type. We recommend that V4L2 drivers by default
+register devices with the same numbers, but the system administrator
+can assign arbitrary minor numbers using driver module options. The
+major device number remains 81.</para>
+
+      <table id="v4l-dev">
+	<title>V4L Device Types, Names and Numbers</title>
+	<tgroup cols="3">
+	  <thead>
+	    <row>
+	      <entry>Device Type</entry>
+	      <entry>File Name</entry>
+	      <entry>Minor Numbers</entry>
+	    </row>
+	  </thead>
+	  <tbody valign="top">
+	    <row>
+	      <entry>Video capture and overlay</entry>
+	      <entry><para><filename>/dev/video</filename> and
+<filename>/dev/bttv0</filename><footnote> <para>According to
+Documentation/devices.txt these should be symbolic links to
+<filename>/dev/video0</filename>. Note the original bttv interface is
+not compatible with V4L or V4L2.</para> </footnote>,
+<filename>/dev/video0</filename> to
+<filename>/dev/video63</filename></para></entry>
+	      <entry>0-63</entry>
+	    </row>
+	    <row>
+	      <entry>Radio receiver</entry>
+	      <entry><para><filename>/dev/radio</filename><footnote>
+		    <para>According to
+<filename>Documentation/devices.txt</filename> a symbolic link to
+<filename>/dev/radio0</filename>.</para>
+		  </footnote>, <filename>/dev/radio0</filename> to
+<filename>/dev/radio63</filename></para></entry>
+	      <entry>64-127</entry>
+	    </row>
+	    <row>
+	      <entry>Raw VBI capture</entry>
+	      <entry><para><filename>/dev/vbi</filename>,
+<filename>/dev/vbi0</filename> to
+<filename>/dev/vbi31</filename></para></entry>
+	      <entry>224-255</entry>
+	    </row>
+	  </tbody>
+	</tgroup>
+      </table>
+
+      <para>V4L prohibits (or used to prohibit) multiple opens of a
+device file. V4L2 drivers <emphasis>may</emphasis> support multiple
+opens, see <xref linkend="open" /> for details and consequences.</para>
+
+      <para>V4L drivers respond to V4L2 ioctls with an &EINVAL;.</para>
+    </section>
+
+    <section>
+      <title>Querying Capabilities</title>
+
+      <para>The V4L <constant>VIDIOCGCAP</constant> ioctl is
+equivalent to V4L2's &VIDIOC-QUERYCAP;.</para>
+
+      <para>The <structfield>name</structfield> field in struct
+<structname>video_capability</structname> became
+<structfield>card</structfield> in &v4l2-capability;,
+<structfield>type</structfield> was replaced by
+<structfield>capabilities</structfield>. Note V4L2 does not
+distinguish between device types like this, better think of basic
+video input, video output and radio devices supporting a set of
+related functions like video capturing, video overlay and VBI
+capturing. See <xref linkend="open" /> for an
+introduction.<informaltable>
+	  <tgroup cols="3">
+	    <thead>
+	      <row>
+		<entry>struct
+<structname>video_capability</structname>
+<structfield>type</structfield></entry>
+		<entry>&v4l2-capability;
+<structfield>capabilities</structfield> flags</entry>
+		<entry>Purpose</entry>
+	      </row>
+	    </thead>
+	    <tbody valign="top">
+	      <row>
+		<entry><constant>VID_TYPE_CAPTURE</constant></entry>
+		<entry><constant>V4L2_CAP_VIDEO_CAPTURE</constant></entry>
+		<entry>The <link linkend="capture">video
+capture</link> interface is supported.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_TUNER</constant></entry>
+		<entry><constant>V4L2_CAP_TUNER</constant></entry>
+		<entry>The device has a <link linkend="tuner">tuner or
+modulator</link>.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_TELETEXT</constant></entry>
+		<entry><constant>V4L2_CAP_VBI_CAPTURE</constant></entry>
+		<entry>The <link linkend="raw-vbi">raw VBI
+capture</link> interface is supported.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_OVERLAY</constant></entry>
+		<entry><constant>V4L2_CAP_VIDEO_OVERLAY</constant></entry>
+		<entry>The <link linkend="overlay">video
+overlay</link> interface is supported.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_CHROMAKEY</constant></entry>
+		<entry><constant>V4L2_FBUF_CAP_CHROMAKEY</constant> in
+field <structfield>capability</structfield> of
+&v4l2-framebuffer;</entry>
+		<entry>Whether chromakey overlay is supported. For
+more information on overlay see
+<xref linkend="overlay" />.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_CLIPPING</constant></entry>
+		<entry><constant>V4L2_FBUF_CAP_LIST_CLIPPING</constant>
+and <constant>V4L2_FBUF_CAP_BITMAP_CLIPPING</constant> in field
+<structfield>capability</structfield> of &v4l2-framebuffer;</entry>
+		<entry>Whether clipping the overlaid image is
+supported, see <xref linkend="overlay" />.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_FRAMERAM</constant></entry>
+		<entry><constant>V4L2_FBUF_CAP_EXTERNOVERLAY</constant>
+<emphasis>not set</emphasis> in field
+<structfield>capability</structfield> of &v4l2-framebuffer;</entry>
+		<entry>Whether overlay overwrites frame buffer memory,
+see <xref linkend="overlay" />.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_SCALES</constant></entry>
+		<entry><constant>-</constant></entry>
+		<entry>This flag indicates if the hardware can scale
+images. The V4L2 API implies the scale factor by setting the cropping
+dimensions and image size with the &VIDIOC-S-CROP; and &VIDIOC-S-FMT;
+ioctl, respectively. The driver returns the closest sizes possible.
+For more information on cropping and scaling see <xref
+		    linkend="crop" />.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_MONOCHROME</constant></entry>
+		<entry><constant>-</constant></entry>
+		<entry>Applications can enumerate the supported image
+formats with the &VIDIOC-ENUM-FMT; ioctl to determine if the device
+supports grey scale capturing only. For more information on image
+formats see <xref linkend="pixfmt" />.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_SUBCAPTURE</constant></entry>
+		<entry><constant>-</constant></entry>
+		<entry>Applications can call the &VIDIOC-G-CROP; ioctl
+to determine if the device supports capturing a subsection of the full
+picture ("cropping" in V4L2). If not, the ioctl returns the &EINVAL;.
+For more information on cropping and scaling see <xref
+		    linkend="crop" />.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_MPEG_DECODER</constant></entry>
+		<entry><constant>-</constant></entry>
+		<entry>Applications can enumerate the supported image
+formats with the &VIDIOC-ENUM-FMT; ioctl to determine if the device
+supports MPEG streams.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_MPEG_ENCODER</constant></entry>
+		<entry><constant>-</constant></entry>
+		<entry>See above.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_MJPEG_DECODER</constant></entry>
+		<entry><constant>-</constant></entry>
+		<entry>See above.</entry>
+	      </row>
+	      <row>
+		<entry><constant>VID_TYPE_MJPEG_ENCODER</constant></entry>
+		<entry><constant>-</constant></entry>
+		<entry>See above.</entry>
+	      </row>
+	    </tbody>
+	  </tgroup>
+	</informaltable></para>
+
+      <para>The <structfield>audios</structfield> field was replaced
+by <structfield>capabilities</structfield> flag
+<constant>V4L2_CAP_AUDIO</constant>, indicating
+<emphasis>if</emphasis> the device has any audio inputs or outputs. To
+determine their number applications can enumerate audio inputs with
+the &VIDIOC-G-AUDIO; ioctl. The audio ioctls are described in <xref
+	  linkend="audio" />.</para>
+
+      <para>The <structfield>maxwidth</structfield>,
+<structfield>maxheight</structfield>,
+<structfield>minwidth</structfield> and
+<structfield>minheight</structfield> fields were removed. Calling the
+&VIDIOC-S-FMT; or &VIDIOC-TRY-FMT; ioctl with the desired dimensions
+returns the closest size possible, taking into account the current
+video standard, cropping and scaling limitations.</para>
+    </section>
+
+    <section>
+      <title>Video Sources</title>
+
+      <para>V4L provides the <constant>VIDIOCGCHAN</constant> and
+<constant>VIDIOCSCHAN</constant> ioctl using struct
+<structname>video_channel</structname> to enumerate
+the video inputs of a V4L device. The equivalent V4L2 ioctls
+are &VIDIOC-ENUMINPUT;, &VIDIOC-G-INPUT; and &VIDIOC-S-INPUT;
+using &v4l2-input; as discussed in <xref linkend="video" />.</para>
+
+      <para>The <structfield>channel</structfield> field counting
+inputs was renamed to <structfield>index</structfield>, the video
+input types were renamed as follows: <informaltable>
+	  <tgroup cols="2">
+	    <thead>
+	      <row>
+		<entry>struct <structname>video_channel</structname>
+<structfield>type</structfield></entry>
+		<entry>&v4l2-input;
+<structfield>type</structfield></entry>
+	      </row>
+	    </thead>
+	    <tbody valign="top">
+	      <row>
+		<entry><constant>VIDEO_TYPE_TV</constant></entry>
+		<entry><constant>V4L2_INPUT_TYPE_TUNER</constant></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_TYPE_CAMERA</constant></entry>
+		<entry><constant>V4L2_INPUT_TYPE_CAMERA</constant></entry>
+	      </row>
+	    </tbody>
+	  </tgroup>
+	</informaltable></para>
+
+      <para>Unlike the <structfield>tuners</structfield> field
+expressing the number of tuners of this input, V4L2 assumes each video
+input is connected to at most one tuner. However a tuner can have more
+than one input, &ie; RF connectors, and a device can have multiple
+tuners. The index number of the tuner associated with the input, if
+any, is stored in field <structfield>tuner</structfield> of
+&v4l2-input;. Enumeration of tuners is discussed in <xref
+	  linkend="tuner" />.</para>
+
+      <para>The redundant <constant>VIDEO_VC_TUNER</constant> flag was
+dropped. Video inputs associated with a tuner are of type
+<constant>V4L2_INPUT_TYPE_TUNER</constant>. The
+<constant>VIDEO_VC_AUDIO</constant> flag was replaced by the
+<structfield>audioset</structfield> field. V4L2 considers devices with
+up to 32 audio inputs. Each set bit in the
+<structfield>audioset</structfield> field represents one audio input
+this video input combines with. For information about audio inputs and
+how to switch between them see <xref linkend="audio" />.</para>
+
+      <para>The <structfield>norm</structfield> field describing the
+supported video standards was replaced by
+<structfield>std</structfield>. The V4L specification mentions a flag
+<constant>VIDEO_VC_NORM</constant> indicating whether the standard can
+be changed. This flag was a later addition together with the
+<structfield>norm</structfield> field and has been removed in the
+meantime. V4L2 has a similar, albeit more comprehensive approach
+to video standards, see <xref linkend="standard" /> for more
+information.</para>
+    </section>
+
+    <section>
+      <title>Tuning</title>
+
+      <para>The V4L <constant>VIDIOCGTUNER</constant> and
+<constant>VIDIOCSTUNER</constant> ioctl and struct
+<structname>video_tuner</structname> can be used to enumerate the
+tuners of a V4L TV or radio device. The equivalent V4L2 ioctls are
+&VIDIOC-G-TUNER; and &VIDIOC-S-TUNER; using &v4l2-tuner;. Tuners are
+covered in <xref linkend="tuner" />.</para>
+
+      <para>The <structfield>tuner</structfield> field counting tuners
+was renamed to <structfield>index</structfield>. The fields
+<structfield>name</structfield>, <structfield>rangelow</structfield>
+and <structfield>rangehigh</structfield> remained unchanged.</para>
+
+      <para>The <constant>VIDEO_TUNER_PAL</constant>,
+<constant>VIDEO_TUNER_NTSC</constant> and
+<constant>VIDEO_TUNER_SECAM</constant> flags indicating the supported
+video standards were dropped. This information is now contained in the
+associated &v4l2-input;. No replacement exists for the
+<constant>VIDEO_TUNER_NORM</constant> flag indicating whether the
+video standard can be switched. The <structfield>mode</structfield>
+field to select a different video standard was replaced by a whole new
+set of ioctls and structures described in <xref linkend="standard" />.
+Due to its ubiquity it should be mentioned the BTTV driver supports
+several standards in addition to the regular
+<constant>VIDEO_MODE_PAL</constant> (0),
+<constant>VIDEO_MODE_NTSC</constant>,
+<constant>VIDEO_MODE_SECAM</constant> and
+<constant>VIDEO_MODE_AUTO</constant> (3). Namely N/PAL Argentina,
+M/PAL, N/PAL, and NTSC Japan with numbers 3-6 (sic).</para>
+
+      <para>The <constant>VIDEO_TUNER_STEREO_ON</constant> flag
+indicating stereo reception became
+<constant>V4L2_TUNER_SUB_STEREO</constant> in field
+<structfield>rxsubchans</structfield>. This field also permits the
+detection of monaural and bilingual audio, see the definition of
+&v4l2-tuner; for details. Presently no replacement exists for the
+<constant>VIDEO_TUNER_RDS_ON</constant> and
+<constant>VIDEO_TUNER_MBS_ON</constant> flags.</para>
+
+      <para> The <constant>VIDEO_TUNER_LOW</constant> flag was renamed
+to <constant>V4L2_TUNER_CAP_LOW</constant> in the &v4l2-tuner;
+<structfield>capability</structfield> field.</para>
+
+      <para>The <constant>VIDIOCGFREQ</constant> and
+<constant>VIDIOCSFREQ</constant> ioctl to change the tuner frequency
+where renamed to &VIDIOC-G-FREQUENCY; and  &VIDIOC-S-FREQUENCY;. They
+take a pointer to a &v4l2-frequency; instead of an unsigned long
+integer.</para>
+    </section>
+
+    <section id="v4l-image-properties">
+      <title>Image Properties</title>
+
+      <para>V4L2 has no equivalent of the
+<constant>VIDIOCGPICT</constant> and <constant>VIDIOCSPICT</constant>
+ioctl and struct <structname>video_picture</structname>. The following
+fields where replaced by V4L2 controls accessible with the
+&VIDIOC-QUERYCTRL;, &VIDIOC-G-CTRL; and &VIDIOC-S-CTRL; ioctls:<informaltable>
+	  <tgroup cols="2">
+	    <thead>
+	      <row>
+		<entry>struct <structname>video_picture</structname></entry>
+		<entry>V4L2 Control ID</entry>
+	      </row>
+	    </thead>
+	    <tbody valign="top">
+	      <row>
+		<entry><structfield>brightness</structfield></entry>
+		<entry><constant>V4L2_CID_BRIGHTNESS</constant></entry>
+	      </row>
+	      <row>
+		<entry><structfield>hue</structfield></entry>
+		<entry><constant>V4L2_CID_HUE</constant></entry>
+	      </row>
+	      <row>
+		<entry><structfield>colour</structfield></entry>
+		<entry><constant>V4L2_CID_SATURATION</constant></entry>
+	      </row>
+	      <row>
+		<entry><structfield>contrast</structfield></entry>
+		<entry><constant>V4L2_CID_CONTRAST</constant></entry>
+	      </row>
+	      <row>
+		<entry><structfield>whiteness</structfield></entry>
+		<entry><constant>V4L2_CID_WHITENESS</constant></entry>
+	      </row>
+	    </tbody>
+	  </tgroup>
+	</informaltable></para>
+
+      <para>The V4L picture controls are assumed to range from 0 to
+65535 with no particular reset value. The V4L2 API permits arbitrary
+limits and defaults which can be queried with the &VIDIOC-QUERYCTRL;
+ioctl. For general information about controls see <xref
+linkend="control" />.</para>
+
+      <para>The <structfield>depth</structfield> (average number of
+bits per pixel) of a video image is implied by the selected image
+format. V4L2 does not explicitly provide such information assuming
+applications recognizing the format are aware of the image depth and
+others need not know. The <structfield>palette</structfield> field
+moved into the &v4l2-pix-format;:<informaltable>
+	  <tgroup cols="2">
+	    <thead>
+	      <row>
+		<entry>struct <structname>video_picture</structname>
+<structfield>palette</structfield></entry>
+		<entry>&v4l2-pix-format;
+<structfield>pixfmt</structfield></entry>
+	      </row>
+	    </thead>
+	    <tbody valign="top">
+	      <row>
+		<entry><constant>VIDEO_PALETTE_GREY</constant></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-GREY"><constant>V4L2_PIX_FMT_GREY</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_HI240</constant></entry>
+		<entry><para><link
+linkend="pixfmt-reserved"><constant>V4L2_PIX_FMT_HI240</constant></link><footnote>
+		      <para>This is a custom format used by the BTTV
+driver, not one of the V4L2 standard formats.</para>
+		    </footnote></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_RGB565</constant></entry>
+		<entry><para><link
+linkend="pixfmt-rgb"><constant>V4L2_PIX_FMT_RGB565</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_RGB555</constant></entry>
+		<entry><para><link
+linkend="pixfmt-rgb"><constant>V4L2_PIX_FMT_RGB555</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_RGB24</constant></entry>
+		<entry><para><link
+linkend="pixfmt-rgb"><constant>V4L2_PIX_FMT_BGR24</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_RGB32</constant></entry>
+		<entry><para><link
+linkend="pixfmt-rgb"><constant>V4L2_PIX_FMT_BGR32</constant></link><footnote>
+		      <para>Presumably all V4L RGB formats are
+little-endian, although some drivers might interpret them according to machine endianness. V4L2 defines little-endian, big-endian and red/blue
+swapped variants. For details see <xref linkend="pixfmt-rgb" />.</para>
+		    </footnote></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_YUV422</constant></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-YUYV"><constant>V4L2_PIX_FMT_YUYV</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><para><constant>VIDEO_PALETTE_YUYV</constant><footnote>
+		      <para><constant>VIDEO_PALETTE_YUV422</constant>
+and <constant>VIDEO_PALETTE_YUYV</constant> are the same formats. Some
+V4L drivers respond to one, some to the other.</para>
+		    </footnote></para></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-YUYV"><constant>V4L2_PIX_FMT_YUYV</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_UYVY</constant></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-UYVY"><constant>V4L2_PIX_FMT_UYVY</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_YUV420</constant></entry>
+		<entry>None</entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_YUV411</constant></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-Y41P"><constant>V4L2_PIX_FMT_Y41P</constant></link><footnote>
+		      <para>Not to be confused with
+<constant>V4L2_PIX_FMT_YUV411P</constant>, which is a planar
+format.</para> </footnote></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_RAW</constant></entry>
+		<entry><para>None<footnote> <para>V4L explains this
+as: "RAW capture (BT848)"</para> </footnote></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_YUV422P</constant></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-YUV422P"><constant>V4L2_PIX_FMT_YUV422P</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_YUV411P</constant></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-YUV411P"><constant>V4L2_PIX_FMT_YUV411P</constant></link><footnote>
+		      <para>Not to be confused with
+<constant>V4L2_PIX_FMT_Y41P</constant>, which is a packed
+format.</para> </footnote></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_YUV420P</constant></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-YVU420"><constant>V4L2_PIX_FMT_YVU420</constant></link></para></entry>
+	      </row>
+	      <row>
+		<entry><constant>VIDEO_PALETTE_YUV410P</constant></entry>
+		<entry><para><link
+linkend="V4L2-PIX-FMT-YVU410"><constant>V4L2_PIX_FMT_YVU410</constant></link></para></entry>
+	      </row>
+	    </tbody>
+	  </tgroup>
+	</informaltable></para>
+
+      <para>V4L2 image formats are defined in <xref
+linkend="pixfmt" />. The image format can be selected with the
+&VIDIOC-S-FMT; ioctl.</para>
+    </section>
+
+    <section>
+      <title>Audio</title>
+
+      <para>The <constant>VIDIOCGAUDIO</constant> and
+<constant>VIDIOCSAUDIO</constant> ioctl and struct
+<structname>video_audio</structname> are used to enumerate the
+audio inputs of a V4L device. The equivalent V4L2 ioctls are
+&VIDIOC-G-AUDIO; and &VIDIOC-S-AUDIO; using &v4l2-audio; as
+discussed in <xref linkend="audio" />.</para>
+
+      <para>The <structfield>audio</structfield> "channel number"
+field counting audio inputs was renamed to
+<structfield>index</structfield>.</para>
+
+      <para>On <constant>VIDIOCSAUDIO</constant> the
+<structfield>mode</structfield> field selects <emphasis>one</emphasis>
+of the <constant>VIDEO_SOUND_MONO</constant>,
+<constant>VIDEO_SOUND_STEREO</constant>,
+<constant>VIDEO_SOUND_LANG1</constant> or
+<constant>VIDEO_SOUND_LANG2</constant> audio demodulation modes. When
+the current audio standard is BTSC
+<constant>VIDEO_SOUND_LANG2</constant> refers to SAP and
+<constant>VIDEO_SOUND_LANG1</constant> is meaningless. Also
+undocumented in the V4L specification, there is no way to query the
+selected mode. On <constant>VIDIOCGAUDIO</constant> the driver returns
+the <emphasis>actually received</emphasis> audio programmes in this
+field. In the V4L2 API this information is stored in the &v4l2-tuner;
+<structfield>rxsubchans</structfield> and
+<structfield>audmode</structfield> fields, respectively. See <xref
+linkend="tuner" /> for more information on tuners. Related to audio
+modes &v4l2-audio; also reports if this is a mono or stereo
+input, regardless if the source is a tuner.</para>
+
+      <para>The following fields where replaced by V4L2 controls
+accessible with the &VIDIOC-QUERYCTRL;, &VIDIOC-G-CTRL; and
+&VIDIOC-S-CTRL; ioctls:<informaltable>
+	  <tgroup cols="2">
+	    <thead>
+	      <row>
+		<entry>struct
+<structname>video_audio</structname></entry>
+		<entry>V4L2 Control ID</entry>
+	      </row>
+	    </thead>
+	    <tbody valign="top">
+	      <row>
+		<entry><structfield>volume</structfield></entry>
+		<entry><constant>V4L2_CID_AUDIO_VOLUME</constant></entry>
+	      </row>
+	      <row>
+		<entry><structfield>bass</structfield></entry>
+		<entry><constant>V4L2_CID_AUDIO_BASS</constant></entry>
+	      </row>
+	      <row>
+		<entry><structfield>treble</structfield></entry>
+		<entry><constant>V4L2_CID_AUDIO_TREBLE</constant></entry>
+	      </row>
+	      <row>
+		<entry><structfield>balance</structfield></entry>
+		<entry><constant>V4L2_CID_AUDIO_BALANCE</constant></entry>
+	      </row>
+	    </tbody>
+	  </tgroup>
+	</informaltable></para>
+
+      <para>To determine which of these controls are supported by a
+driver V4L provides the <structfield>flags</structfield>
+<constant>VIDEO_AUDIO_VOLUME</constant>,
+<constant>VIDEO_AUDIO_BASS</constant>,
+<constant>VIDEO_AUDIO_TREBLE</constant> and
+<constant>VIDEO_AUDIO_BALANCE</constant>. In the V4L2 API the
+&VIDIOC-QUERYCTRL; ioctl reports if the respective control is
+supported. Accordingly the <constant>VIDEO_AUDIO_MUTABLE</constant>
+and <constant>VIDEO_AUDIO_MUTE</constant> flags where replaced by the
+boolean <constant>V4L2_CID_AUDIO_MUTE</constant> control.</para>
+
+      <para>All V4L2 controls have a <structfield>step</structfield>
+attribute replacing the struct <structname>video_audio</structname>
+<structfield>step</structfield> field. The V4L audio controls are
+assumed to range from 0 to 65535 with no particular reset value. The
+V4L2 API permits arbitrary limits and defaults which can be queried
+with the &VIDIOC-QUERYCTRL; ioctl. For general information about
+controls see <xref linkend="control" />.</para>
+    </section>
+
+    <section>
+      <title>Frame Buffer Overlay</title>
+
+      <para>The V4L2 ioctls equivalent to
+<constant>VIDIOCGFBUF</constant> and <constant>VIDIOCSFBUF</constant>
+are &VIDIOC-G-FBUF; and &VIDIOC-S-FBUF;. The
+<structfield>base</structfield> field of struct
+<structname>video_buffer</structname> remained unchanged, except V4L2
+defines a flag to indicate non-destructive overlays instead of a
+<constant>NULL</constant> pointer. All other fields moved into the
+&v4l2-pix-format; <structfield>fmt</structfield> substructure of
+&v4l2-framebuffer;. The <structfield>depth</structfield> field was
+replaced by <structfield>pixelformat</structfield>. See <xref
+	  linkend="pixfmt-rgb" /> for a list of RGB formats and their
+respective color depths.</para>
+
+      <para>Instead of the special ioctls
+<constant>VIDIOCGWIN</constant> and <constant>VIDIOCSWIN</constant>
+V4L2 uses the general-purpose data format negotiation ioctls
+&VIDIOC-G-FMT; and &VIDIOC-S-FMT;. They take a pointer to a
+&v4l2-format; as argument. Here the <structfield>win</structfield>
+member of the <structfield>fmt</structfield> union is used, a
+&v4l2-window;.</para>
+
+      <para>The <structfield>x</structfield>,
+<structfield>y</structfield>, <structfield>width</structfield> and
+<structfield>height</structfield> fields of struct
+<structname>video_window</structname> moved into &v4l2-rect;
+substructure <structfield>w</structfield> of struct
+<structname>v4l2_window</structname>. The
+<structfield>chromakey</structfield>,
+<structfield>clips</structfield>, and
+<structfield>clipcount</structfield> fields remained unchanged. Struct
+<structname>video_clip</structname> was renamed to &v4l2-clip;, also
+containing a struct <structname>v4l2_rect</structname>, but the
+semantics are still the same.</para>
+
+      <para>The <constant>VIDEO_WINDOW_INTERLACE</constant> flag was
+dropped. Instead applications must set the
+<structfield>field</structfield> field to
+<constant>V4L2_FIELD_ANY</constant> or
+<constant>V4L2_FIELD_INTERLACED</constant>. The
+<constant>VIDEO_WINDOW_CHROMAKEY</constant> flag moved into
+&v4l2-framebuffer;, under the new name
+<constant>V4L2_FBUF_FLAG_CHROMAKEY</constant>.</para>
+
+      <para>In V4L, storing a bitmap pointer in
+<structfield>clips</structfield> and setting
+<structfield>clipcount</structfield> to
+<constant>VIDEO_CLIP_BITMAP</constant> (-1) requests bitmap
+clipping, using a fixed size bitmap of 1024 &times; 625 bits. Struct
+<structname>v4l2_window</structname> has a separate
+<structfield>bitmap</structfield> pointer field for this purpose and
+the bitmap size is determined by <structfield>w.width</structfield> and
+<structfield>w.height</structfield>.</para>
+
+      <para>The <constant>VIDIOCCAPTURE</constant> ioctl to enable or
+disable overlay was renamed to &VIDIOC-OVERLAY;.</para>
+    </section>
+
+    <section>
+      <title>Cropping</title>
+
+      <para>To capture only a subsection of the full picture V4L
+defines the <constant>VIDIOCGCAPTURE</constant> and
+<constant>VIDIOCSCAPTURE</constant> ioctls using struct
+<structname>video_capture</structname>. The equivalent V4L2 ioctls are
+&VIDIOC-G-CROP; and &VIDIOC-S-CROP; using &v4l2-crop;, and the related
+&VIDIOC-CROPCAP; ioctl. This is a rather complex matter, see
+<xref linkend="crop" /> for details.</para>
+
+      <para>The <structfield>x</structfield>,
+<structfield>y</structfield>, <structfield>width</structfield> and
+<structfield>height</structfield> fields moved into &v4l2-rect;
+substructure <structfield>c</structfield> of struct
+<structname>v4l2_crop</structname>. The
+<structfield>decimation</structfield> field was dropped. In the V4L2
+API the scaling factor is implied by the size of the cropping
+rectangle and the size of the captured or overlaid image.</para>
+
+      <para>The <constant>VIDEO_CAPTURE_ODD</constant>
+and <constant>VIDEO_CAPTURE_EVEN</constant> flags to capture only the
+odd or even field, respectively, were replaced by
+<constant>V4L2_FIELD_TOP</constant> and
+<constant>V4L2_FIELD_BOTTOM</constant> in the field named
+<structfield>field</structfield> of &v4l2-pix-format; and
+&v4l2-window;. These structures are used to select a capture or
+overlay format with the &VIDIOC-S-FMT; ioctl.</para>
+    </section>
+
+    <section>
+      <title>Reading Images, Memory Mapping</title>
+
+      <section>
+	<title>Capturing using the read method</title>
+
+	<para>There is no essential difference between reading images
+from a V4L or V4L2 device using the &func-read; function, however V4L2
+drivers are not required to support this I/O method. Applications can
+determine if the function is available with the &VIDIOC-QUERYCAP;
+ioctl. All V4L2 devices exchanging data with applications must support
+the &func-select; and &func-poll; functions.</para>
+
+	<para>To select an image format and size, V4L provides the
+<constant>VIDIOCSPICT</constant> and <constant>VIDIOCSWIN</constant>
+ioctls. V4L2 uses the general-purpose data format negotiation ioctls
+&VIDIOC-G-FMT; and &VIDIOC-S-FMT;. They take a pointer to a
+&v4l2-format; as argument, here the &v4l2-pix-format; named
+<structfield>pix</structfield> of its <structfield>fmt</structfield>
+union is used.</para>
+
+	<para>For more information about the V4L2 read interface see
+<xref linkend="rw" />.</para>
+      </section>
+      <section>
+	<title>Capturing using memory mapping</title>
+
+	<para>Applications can read from V4L devices by mapping
+buffers in device memory, or more often just buffers allocated in
+DMA-able system memory, into their address space. This avoids the data
+copying overhead of the read method. V4L2 supports memory mapping as
+well, with a few differences.</para>
+
+	<informaltable>
+	  <tgroup cols="2">
+	    <thead>
+	      <row>
+		<entry>V4L</entry>
+		<entry>V4L2</entry>
+	      </row>
+	    </thead>
+	    <tbody valign="top">
+	      <row>
+		<entry></entry>
+		<entry>The image format must be selected before
+buffers are allocated, with the &VIDIOC-S-FMT; ioctl. When no format
+is selected the driver may use the last, possibly by another
+application requested format.</entry>
+	      </row>
+	      <row>
+		<entry><para>Applications cannot change the number of
+buffers. The it is built into the driver, unless it has a module
+option to change the number when the driver module is
+loaded.</para></entry>
+		<entry><para>The &VIDIOC-REQBUFS; ioctl allocates the
+desired number of buffers, this is a required step in the initialization
+sequence.</para></entry>
+	      </row>
+	      <row>
+		<entry><para>Drivers map all buffers as one contiguous
+range of memory. The <constant>VIDIOCGMBUF</constant> ioctl is
+available to query the number of buffers, the offset of each buffer
+from the start of the virtual file, and the overall amount of memory
+used, which can be used as arguments for the &func-mmap;
+function.</para></entry>
+		<entry><para>Buffers are individually mapped. The
+offset and size of each buffer can be determined with the
+&VIDIOC-QUERYBUF; ioctl.</para></entry>
+	      </row>
+	      <row>
+		<entry><para>The <constant>VIDIOCMCAPTURE</constant>
+ioctl prepares a buffer for capturing. It also determines the image
+format for this buffer. The ioctl returns immediately, eventually with
+an &EAGAIN; if no video signal had been detected. When the driver
+supports more than one buffer applications can call the ioctl multiple
+times and thus have multiple outstanding capture
+requests.</para><para>The <constant>VIDIOCSYNC</constant> ioctl
+suspends execution until a particular buffer has been
+filled.</para></entry>
+		<entry><para>Drivers maintain an incoming and outgoing
+queue. &VIDIOC-QBUF; enqueues any empty buffer into the incoming
+queue. Filled buffers are dequeued from the outgoing queue with the
+&VIDIOC-DQBUF; ioctl. To wait until filled buffers become available this
+function, &func-select; or &func-poll; can be used. The
+&VIDIOC-STREAMON; ioctl must be called once after enqueuing one or
+more buffers to start capturing. Its counterpart
+&VIDIOC-STREAMOFF; stops capturing and dequeues all buffers from both
+queues. Applications can query the signal status, if known, with the
+&VIDIOC-ENUMINPUT; ioctl.</para></entry>
+	      </row>
+	    </tbody>
+	  </tgroup>
+	</informaltable>
+
+	<para>For a more in-depth discussion of memory mapping and
+examples, see <xref linkend="mmap" />.</para>
+      </section>
+    </section>
+
+    <section>
+      <title>Reading Raw VBI Data</title>
+
+      <para>Originally the V4L API did not specify a raw VBI capture
+interface, only the device file <filename>/dev/vbi</filename> was
+reserved for this purpose. The only driver supporting this interface
+was the BTTV driver, de-facto defining the V4L VBI interface. Reading
+from the device yields a raw VBI image with the following
+parameters:<informaltable>
+	    <tgroup cols="2">
+	      <thead>
+		<row>
+		  <entry>&v4l2-vbi-format;</entry>
+		  <

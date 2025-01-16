@@ -1,286 +1,235 @@
-/*
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+/*===---- xopintrin.h - XOP intrinsics -------------------------------------===
  *
- * Copyright (c) 2004-2008 Silicon Graphics, Inc.  All Rights Reserved.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ *===-----------------------------------------------------------------------===
  */
 
+#ifndef __X86INTRIN_H
+#error "Never use <xopintrin.h> directly; include <x86intrin.h> instead."
+#endif
+
+#ifndef __XOPINTRIN_H
+#define __XOPINTRIN_H
+
+#include <fma4intrin.h>
+
+/* Define the default attributes for the functions in this file. */
+#define __DEFAULT_FN_ATTRS __attribute__((__always_inline__, __nodebug__, __target__("xop")))
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_maccs_epi16(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacssww((__v8hi)__A, (__v8hi)__B, (__v8hi)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_macc_epi16(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacsww((__v8hi)__A, (__v8hi)__B, (__v8hi)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_maccsd_epi16(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacsswd((__v8hi)__A, (__v8hi)__B, (__v4si)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_maccd_epi16(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacswd((__v8hi)__A, (__v8hi)__B, (__v4si)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_maccs_epi32(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacssdd((__v4si)__A, (__v4si)__B, (__v4si)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_macc_epi32(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacsdd((__v4si)__A, (__v4si)__B, (__v4si)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_maccslo_epi32(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacssdql((__v4si)__A, (__v4si)__B, (__v2di)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_macclo_epi32(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacsdql((__v4si)__A, (__v4si)__B, (__v2di)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_maccshi_epi32(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacssdqh((__v4si)__A, (__v4si)__B, (__v2di)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_macchi_epi32(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmacsdqh((__v4si)__A, (__v4si)__B, (__v2di)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_maddsd_epi16(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmadcsswd((__v8hi)__A, (__v8hi)__B, (__v4si)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_maddd_epi16(__m128i __A, __m128i __B, __m128i __C)
+{
+  return (__m128i)__builtin_ia32_vpmadcswd((__v8hi)__A, (__v8hi)__B, (__v4si)__C);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_haddw_epi8(__m128i __A)
+{
+  return (__m128i)__builtin_ia32_vphaddbw((__v16qi)__A);
+}
+
+static __inline__ __m128i __DEFAULT_FN_ATTRS
+_mm_haddd_epi8(__m128i __A)
+{
+  return (__m128i)__builtin_ia32_vphaddbd((_/* i915_irq.c -- IRQ support for the I915 -*- linux-c -*-
+ */
 /*
- * Cross Partition (XP) base.
+ * Copyright 2003 Tungsten Graphics, Inc., Cedar Park, Texas.
+ * All Rights Reserved.
  *
- *	XP provides a base from which its users can interact
- *	with XPC, yet not be dependent on XPC.
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+ * IN NO EVENT SHALL TUNGSTEN GRAPHICS AND/OR ITS SUPPLIERS BE LIABLE FOR
+ * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
  */
 
-#include <linux/module.h>
-#include <linux/device.h>
-#include "xp.h"
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-/* define the XP debug device structures to be used with dev_dbg() et al */
+#include <linux/sysrq.h>
+#include <linux/slab.h>
+#include <linux/circ_buf.h>
+#include <drm/drmP.h>
+#include <drm/i915_drm.h>
+#include "i915_drv.h"
+#include "i915_trace.h"
+#include "intel_drv.h"
 
-struct device_driver xp_dbg_name = {
-	.name = "xp"
+/**
+ * DOC: interrupt handling
+ *
+ * These functions provide the basic support for enabling and disabling the
+ * interrupt handling support. There's a lot more functionality in i915_irq.c
+ * and related files, but that will be described in separate chapters.
+ */
+
+static const u32 hpd_ilk[HPD_NUM_PINS] = {
+	[HPD_PORT_A] = DE_DP_A_HOTPLUG,
 };
 
-struct device xp_dbg_subname = {
-	.init_name = "",		/* set to "" */
-	.driver = &xp_dbg_name
+static const u32 hpd_ivb[HPD_NUM_PINS] = {
+	[HPD_PORT_A] = DE_DP_A_HOTPLUG_IVB,
 };
 
-struct device *xp = &xp_dbg_subname;
-
-/* max #of partitions possible */
-short xp_max_npartitions;
-EXPORT_SYMBOL_GPL(xp_max_npartitions);
-
-short xp_partition_id;
-EXPORT_SYMBOL_GPL(xp_partition_id);
-
-u8 xp_region_size;
-EXPORT_SYMBOL_GPL(xp_region_size);
-
-unsigned long (*xp_pa) (void *addr);
-EXPORT_SYMBOL_GPL(xp_pa);
-
-unsigned long (*xp_socket_pa) (unsigned long gpa);
-EXPORT_SYMBOL_GPL(xp_socket_pa);
-
-enum xp_retval (*xp_remote_memcpy) (unsigned long dst_gpa,
-				    const unsigned long src_gpa, size_t len);
-EXPORT_SYMBOL_GPL(xp_remote_memcpy);
-
-int (*xp_cpu_to_nasid) (int cpuid);
-EXPORT_SYMBOL_GPL(xp_cpu_to_nasid);
-
-enum xp_retval (*xp_expand_memprotect) (unsigned long phys_addr,
-					unsigned long size);
-EXPORT_SYMBOL_GPL(xp_expand_memprotect);
-enum xp_retval (*xp_restrict_memprotect) (unsigned long phys_addr,
-					  unsigned long size);
-EXPORT_SYMBOL_GPL(xp_restrict_memprotect);
-
-/*
- * xpc_registrations[] keeps track of xpc_connect()'s done by the kernel-level
- * users of XPC.
- */
-struct xpc_registration xpc_registrations[XPC_MAX_NCHANNELS];
-EXPORT_SYMBOL_GPL(xpc_registrations);
-
-/*
- * Initialize the XPC interface to indicate that XPC isn't loaded.
- */
-static enum xp_retval
-xpc_notloaded(void)
-{
-	return xpNotLoaded;
-}
-
-struct xpc_interface xpc_interface = {
-	(void (*)(int))xpc_notloaded,
-	(void (*)(int))xpc_notloaded,
-	(enum xp_retval(*)(short, int, u32, void *, u16))xpc_notloaded,
-	(enum xp_retval(*)(short, int, u32, void *, u16, xpc_notify_func,
-			   void *))xpc_notloaded,
-	(void (*)(short, int, void *))xpc_notloaded,
-	(enum xp_retval(*)(short, void *))xpc_notloaded
+static const u32 hpd_bdw[HPD_NUM_PINS] = {
+	[HPD_PORT_A] = GEN8_PORT_DP_A_HOTPLUG,
 };
-EXPORT_SYMBOL_GPL(xpc_interface);
 
-/*
- * XPC calls this when it (the XPC module) has been loaded.
- */
-void
-xpc_set_interface(void (*connect) (int),
-		  void (*disconnect) (int),
-		  enum xp_retval (*send) (short, int, u32, void *, u16),
-		  enum xp_retval (*send_notify) (short, int, u32, void *, u16,
-						  xpc_notify_func, void *),
-		  void (*received) (short, int, void *),
-		  enum xp_retval (*partid_to_nasids) (short, void *))
-{
-	xpc_interface.connect = connect;
-	xpc_interface.disconnect = disconnect;
-	xpc_interface.send = send;
-	xpc_interface.send_notify = send_notify;
-	xpc_interface.received = received;
-	xpc_interface.partid_to_nasids = partid_to_nasids;
-}
-EXPORT_SYMBOL_GPL(xpc_set_interface);
+static const u32 hpd_ibx[HPD_NUM_PINS] = {
+	[HPD_CRT] = SDE_CRT_HOTPLUG,
+	[HPD_SDVO_B] = SDE_SDVOB_HOTPLUG,
+	[HPD_PORT_B] = SDE_PORTB_HOTPLUG,
+	[HPD_PORT_C] = SDE_PORTC_HOTPLUG,
+	[HPD_PORT_D] = SDE_PORTD_HOTPLUG
+};
 
-/*
- * XPC calls this when it (the XPC module) is being unloaded.
- */
-void
-xpc_clear_interface(void)
-{
-	xpc_interface.connect = (void (*)(int))xpc_notloaded;
-	xpc_interface.disconnect = (void (*)(int))xpc_notloaded;
-	xpc_interface.send = (enum xp_retval(*)(short, int, u32, void *, u16))
-	    xpc_notloaded;
-	xpc_interface.send_notify = (enum xp_retval(*)(short, int, u32, void *,
-						       u16, xpc_notify_func,
-						       void *))xpc_notloaded;
-	xpc_interface.received = (void (*)(short, int, void *))
-	    xpc_notloaded;
-	xpc_interface.partid_to_nasids = (enum xp_retval(*)(short, void *))
-	    xpc_notloaded;
-}
-EXPORT_SYMBOL_GPL(xpc_clear_interface);
+static const u32 hpd_cpt[HPD_NUM_PINS] = {
+	[HPD_CRT] = SDE_CRT_HOTPLUG_CPT,
+	[HPD_SDVO_B] = SDE_SDVOB_HOTPLUG_CPT,
+	[HPD_PORT_B] = SDE_PORTB_HOTPLUG_CPT,
+	[HPD_PORT_C] = SDE_PORTC_HOTPLUG_CPT,
+	[HPD_PORT_D] = SDE_PORTD_HOTPLUG_CPT
+};
 
-/*
- * Register for automatic establishment of a channel connection whenever
- * a partition comes up.
- *
- * Arguments:
- *
- *	ch_number - channel # to register for connection.
- *	func - function to call for asynchronous notification of channel
- *	       state changes (i.e., connection, disconnection, error) and
- *	       the arrival of incoming messages.
- *      key - pointer to optional user-defined value that gets passed back
- *	      to the user on any callouts made to func.
- *	payload_size - size in bytes of the XPC message's payload area which
- *		       contains a user-defined message. The user should make
- *		       this large enough to hold their largest message.
- *	nentries - max #of XPC message entries a message queue can contain.
- *		   The actual number, which is determined when a connection
- * 		   is established and may be less then requested, will be
- *		   passed to the user via the xpConnected callout.
- *	assigned_limit - max number of kthreads allowed to be processing
- * 			 messages (per connection) at any given instant.
- *	idle_limit - max number of kthreads allowed to be idle at any given
- * 		     instant.
- */
-enum xp_retval
-xpc_connect(int ch_number, xpc_channel_func func, void *key, u16 payload_size,
-	    u16 nentries, u32 assigned_limit, u32 idle_limit)
-{
-	struct xpc_registration *registration;
+static const u32 hpd_spt[HPD_NUM_PINS] = {
+	[HPD_PORT_A] = SDE_PORTA_HOTPLUG_SPT,
+	[HPD_PORT_B] = SDE_PORTB_HOTPLUG_CPT,
+	[HPD_PORT_C] = SDE_PORTC_HOTPLUG_CPT,
+	[HPD_PORT_D] = SDE_PORTD_HOTPLUG_CPT,
+	[HPD_PORT_E] = SDE_PORTE_HOTPLUG_SPT
+};
 
-	DBUG_ON(ch_number < 0 || ch_number >= XPC_MAX_NCHANNELS);
-	DBUG_ON(payload_size == 0 || nentries == 0);
-	DBUG_ON(func == NULL);
-	DBUG_ON(assigned_limit == 0 || idle_limit > assigned_limit);
+static const u32 hpd_mask_i915[HPD_NUM_PINS] = {
+	[HPD_CRT] = CRT_HOTPLUG_INT_EN,
+	[HPD_SDVO_B] = SDVOB_HOTPLUG_INT_EN,
+	[HPD_SDVO_C] = SDVOC_HOTPLUG_INT_EN,
+	[HPD_PORT_B] = PORTB_HOTPLUG_INT_EN,
+	[HPD_PORT_C] = PORTC_HOTPLUG_INT_EN,
+	[HPD_PORT_D] = PORTD_HOTPLUG_INT_EN
+};
 
-	if (XPC_MSG_SIZE(payload_size) > XPC_MSG_MAX_SIZE)
-		return xpPayloadTooBig;
+static const u32 hpd_status_g4x[HPD_NUM_PINS] = {
+	[HPD_CRT] = CRT_HOTPLUG_INT_STATUS,
+	[HPD_SDVO_B] = SDVOB_HOTPLUG_INT_STATUS_G4X,
+	[HPD_SDVO_C] = SDVOC_HOTPLUG_INT_STATUS_G4X,
+	[HPD_PORT_B] = PORTB_HOTPLUG_INT_STATUS,
+	[HPD_PORT_C] = PORTC_HOTPLUG_INT_STATUS,
+	[HPD_PORT_D] = PORTD_HOTPLUG_INT_STATUS
+};
 
-	registration = &xpc_registrations[ch_number];
+static const u32 hpd_status_i915[HPD_NUM_PINS] = {
+	[HPD_CRT] = CRT_HOTPLUG_INT_STATUS,
+	[HPD_SDVO_B] = SDVOB_HOTPLUG_INT_STATUS_I915,
+	[HPD_SDVO_C] = SDVOC_HOTPLUG_INT_STATUS_I915,
+	[HPD_PORT_B] = PORTB_HOTPLUG_INT_STATUS,
+	[HPD_PORT_C] = PORTC_HOTPLUG_INT_STATUS,
+	[HPD_PORT_D] = PORTD_HOTPLUG_INT_STATUS
+};
 
-	if (mutex_lock_interruptible(&registration->mutex) != 0)
-		return xpInterrupted;
+/* BXT hpd list */
+static const u32 hpd_bxt[HPD_NUM_PINS] = {
+	[HPD_PORT_A] = BXT_DE_PORT_HP_DDIA,
+	[HPD_PORT_B] = BXT_DE_PORT_HP_DDIB,
+	[HPD_PORT_C] = BXT_DE_PORT_HP_DDIC
+};
 
-	/* if XPC_CHANNEL_REGISTERED(ch_number) */
-	if (registration->func != NULL) {
-		mutex_unlock(&registration->mutex);
-		return xpAlreadyRegistered;
-	}
-
-	/* register the channel for connection */
-	registration->entry_size = XPC_MSG_SIZE(payload_size);
-	registration->nentries = nentries;
-	registration->assigned_limit = assigned_limit;
-	registration->idle_limit = idle_limit;
-	registration->key = key;
-	registration->func = func;
-
-	mutex_unlock(&registration->mutex);
-
-	xpc_interface.connect(ch_number);
-
-	return xpSuccess;
-}
-EXPORT_SYMBOL_GPL(xpc_connect);
-
-/*
- * Remove the registration for automatic connection of the specified channel
- * when a partition comes up.
- *
- * Before returning this xpc_disconnect() will wait for all connections on the
- * specified channel have been closed/torndown. So the caller can be assured
- * that they will not be receiving any more callouts from XPC to their
- * function registered via xpc_connect().
- *
- * Arguments:
- *
- *	ch_number - channel # to unregister.
- */
-void
-xpc_disconnect(int ch_number)
-{
-	struct xpc_registration *registration;
-
-	DBUG_ON(ch_number < 0 || ch_number >= XPC_MAX_NCHANNELS);
-
-	registration = &xpc_registrations[ch_number];
-
-	/*
-	 * We've decided not to make this a down_interruptible(), since we
-	 * figured XPC's users will just turn around and call xpc_disconnect()
-	 * again anyways, so we might as well wait, if need be.
-	 */
-	mutex_lock(&registration->mutex);
-
-	/* if !XPC_CHANNEL_REGISTERED(ch_number) */
-	if (registration->func == NULL) {
-		mutex_unlock(&registration->mutex);
-		return;
-	}
-
-	/* remove the connection registration for the specified channel */
-	registration->func = NULL;
-	registration->key = NULL;
-	registration->nentries = 0;
-	registration->entry_size = 0;
-	registration->assigned_limit = 0;
-	registration->idle_limit = 0;
-
-	xpc_interface.disconnect(ch_number);
-
-	mutex_unlock(&registration->mutex);
-
-	return;
-}
-EXPORT_SYMBOL_GPL(xpc_disconnect);
-
-int __init
-xp_init(void)
-{
-	enum xp_retval ret;
-	int ch_number;
-
-	/* initialize the connection registration mutex */
-	for (ch_number = 0; ch_number < XPC_MAX_NCHANNELS; ch_number++)
-		mutex_init(&xpc_registrations[ch_number].mutex);
-
-	if (is_shub())
-		ret = xp_init_sn2();
-	else if (is_uv())
-		ret = xp_init_uv();
-	else
-		ret = 0;
-
-	if (ret != xpSuccess)
-		return ret;
-
-	return 0;
-}
-
-module_init(xp_init);
-
-void __exit
-xp_exit(void)
-{
-	if (is_shub())
-		xp_exit_sn2();
-	else if (is_uv())
-		xp_exit_uv();
-}
-
-module_exit(xp_exit);
-
-MODULE_AUTHOR("Silicon Graphics, Inc.");
-MODULE_DESCRIPTION("Cross Partition (XP) base");
-MODULE_LICENSE("GPL");
+/* IIR can theoretically queue up two events. Be paranoid. */
+#define GEN8_IRQ_RESET_NDX(typ

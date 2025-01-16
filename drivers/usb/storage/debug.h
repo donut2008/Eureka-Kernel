@@ -1,71 +1,49 @@
-/* Driver for USB Mass Storage compliant devices
- * Debugging Functions Header File
- *
- * Current development and maintenance by:
- *   (c) 1999-2002 Matthew Dharm (mdharm-usb@one-eyed-alien.net)
- *
- * Initial work by:
- *   (c) 1999 Michael Gee (michael@linuxspecific.com)
- *
- * This driver is based on the 'USB Mass Storage Class' document. This
- * describes in detail the protocol used to communicate with such
- * devices.  Clearly, the designers had SCSI and ATAPI commands in
- * mind when they created this document.  The commands are all very
- * similar to commands in the SCSI-II and ATAPI specifications.
- *
- * It is important to note that in a number of cases this class
- * exhibits class-specific exemptions from the USB specification.
- * Notably the usage of NAK, STALL and ACK differs from the norm, in
- * that they are used to communicate wait, failed and OK on commands.
- *
- * Also, for certain devices, the interrupt endpoint is used to convey
- * status of a command.
- *
- * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
- * information about this driver.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#ifndef _DEBUG_H_
-#define _DEBUG_H_
-
-#include <linux/kernel.h>
-
-#define USB_STORAGE "usb-storage: "
-
-#ifdef CONFIG_USB_STORAGE_DEBUG
-void usb_stor_show_command(const struct us_data *us, struct scsi_cmnd *srb);
-void usb_stor_show_sense(const struct us_data *us, unsigned char key,
-			 unsigned char asc, unsigned char ascq);
-__printf(2, 3) void usb_stor_dbg(const struct us_data *us,
-				 const char *fmt, ...);
-
-#define US_DEBUGPX(fmt, ...)	printk(fmt, ##__VA_ARGS__)
-#define US_DEBUG(x)		x
-#else
-__printf(2, 3)
-static inline void _usb_stor_dbg(const struct us_data *us,
-				 const char *fmt, ...)
-{
-}
-#define usb_stor_dbg(us, fmt, ...)				\
-	do { if (0) _usb_stor_dbg(us, fmt, ##__VA_ARGS__); } while (0)
-#define US_DEBUGPX(fmt, ...)					\
-	do { if (0) printk(fmt, ##__VA_ARGS__); } while (0)
-#define US_DEBUG(x)
-#endif
-
-#endif
+ACTIONS_PEND_MASK 0x200000
+#define D2F1_DEVICE_STATUS__TRANSACTIONS_PEND__SHIFT 0x15
+#define D2F1_LINK_CAP__LINK_SPEED_MASK 0xf
+#define D2F1_LINK_CAP__LINK_SPEED__SHIFT 0x0
+#define D2F1_LINK_CAP__LINK_WIDTH_MASK 0x3f0
+#define D2F1_LINK_CAP__LINK_WIDTH__SHIFT 0x4
+#define D2F1_LINK_CAP__PM_SUPPORT_MASK 0xc00
+#define D2F1_LINK_CAP__PM_SUPPORT__SHIFT 0xa
+#define D2F1_LINK_CAP__L0S_EXIT_LATENCY_MASK 0x7000
+#define D2F1_LINK_CAP__L0S_EXIT_LATENCY__SHIFT 0xc
+#define D2F1_LINK_CAP__L1_EXIT_LATENCY_MASK 0x38000
+#define D2F1_LINK_CAP__L1_EXIT_LATENCY__SHIFT 0xf
+#define D2F1_LINK_CAP__CLOCK_POWER_MANAGEMENT_MASK 0x40000
+#define D2F1_LINK_CAP__CLOCK_POWER_MANAGEMENT__SHIFT 0x12
+#define D2F1_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING_MASK 0x80000
+#define D2F1_LINK_CAP__SURPRISE_DOWN_ERR_REPORTING__SHIFT 0x13
+#define D2F1_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE_MASK 0x100000
+#define D2F1_LINK_CAP__DL_ACTIVE_REPORTING_CAPABLE__SHIFT 0x14
+#define D2F1_LINK_CAP__LINK_BW_NOTIFICATION_CAP_MASK 0x200000
+#define D2F1_LINK_CAP__LINK_BW_NOTIFICATION_CAP__SHIFT 0x15
+#define D2F1_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE_MASK 0x400000
+#define D2F1_LINK_CAP__ASPM_OPTIONALITY_COMPLIANCE__SHIFT 0x16
+#define D2F1_LINK_CAP__PORT_NUMBER_MASK 0xff000000
+#define D2F1_LINK_CAP__PORT_NUMBER__SHIFT 0x18
+#define D2F1_LINK_CNTL__PM_CONTROL_MASK 0x3
+#define D2F1_LINK_CNTL__PM_CONTROL__SHIFT 0x0
+#define D2F1_LINK_CNTL__READ_CPL_BOUNDARY_MASK 0x8
+#define D2F1_LINK_CNTL__READ_CPL_BOUNDARY__SHIFT 0x3
+#define D2F1_LINK_CNTL__LINK_DIS_MASK 0x10
+#define D2F1_LINK_CNTL__LINK_DIS__SHIFT 0x4
+#define D2F1_LINK_CNTL__RETRAIN_LINK_MASK 0x20
+#define D2F1_LINK_CNTL__RETRAIN_LINK__SHIFT 0x5
+#define D2F1_LINK_CNTL__COMMON_CLOCK_CFG_MASK 0x40
+#define D2F1_LINK_CNTL__COMMON_CLOCK_CFG__SHIFT 0x6
+#define D2F1_LINK_CNTL__EXTENDED_SYNC_MASK 0x80
+#define D2F1_LINK_CNTL__EXTENDED_SYNC__SHIFT 0x7
+#define D2F1_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN_MASK 0x100
+#define D2F1_LINK_CNTL__CLOCK_POWER_MANAGEMENT_EN__SHIFT 0x8
+#define D2F1_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE_MASK 0x200
+#define D2F1_LINK_CNTL__HW_AUTONOMOUS_WIDTH_DISABLE__SHIFT 0x9
+#define D2F1_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN_MASK 0x400
+#define D2F1_LINK_CNTL__LINK_BW_MANAGEMENT_INT_EN__SHIFT 0xa
+#define D2F1_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN_MASK 0x800
+#define D2F1_LINK_CNTL__LINK_AUTONOMOUS_BW_INT_EN__SHIFT 0xb
+#define D2F1_LINK_STATUS__CURRENT_LINK_SPEED_MASK 0xf0000
+#define D2F1_LINK_STATUS__CURRENT_LINK_SPEED__SHIFT 0x10
+#define D2F1_LINK_STATUS__NEGOTIATED_LINK_WIDTH_MASK 0x3f00000
+#define D2F1_LINK_STATUS__NEGOTIATED_LINK_WIDTH__SHIFT 0x14
+#define D2F1_LINK_STATUS

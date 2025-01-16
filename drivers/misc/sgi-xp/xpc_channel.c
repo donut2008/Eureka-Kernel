@@ -1,1014 +1,553 @@
-/*
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+/*===---- unwind.h - Stack unwinding ----------------------------------------===
  *
- * Copyright (c) 2004-2009 Silicon Graphics, Inc.  All Rights Reserved.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ *===-----------------------------------------------------------------------===
  */
 
-/*
- * Cross Partition Communication (XPC) channel support.
+/* See "Data Definitions for libgcc_s" in the Linux Standard Base.*/
+
+#ifndef __CLANG_UNWIND_H
+#define __CLANG_UNWIND_H
+
+#if defined(__APPLE__) && __has_include_next(<unwind.h>)
+/* Darwin (from 11.x on) provide an unwind.h. If that's available,
+ * use it. libunwind wraps some of its definitions in #ifdef _GNU_SOURCE,
+ * so define that around the include.*/
+# ifndef _GNU_SOURCE
+#  define _SHOULD_UNDEFINE_GNU_SOURCE
+#  define _GNU_SOURCE
+# endif
+// libunwind's unwind.h reflects the current visibility.  However, Mozilla
+// builds with -fvisibility=hidden and relies on gcc's unwind.h to reset the
+// visibility to default and export its contents.  gcc also allows users to
+// override its override by #defining HIDE_EXPORTS (but note, this only obeys
+// the user's -fvisibility setting; it doesn't hide any exports on its own).  We
+// imitate gcc's header here:
+# ifdef HIDE_EXPORTS
+#  include_next <unwind.h>
+# else
+#  pragma GCC visibility push(default)
+#  include_next <unwind.h>
+#  pragma GCC visibility pop
+# endif
+# ifdef _SHOULD_UNDEFINE_GNU_SOURCE
+#  undef _GNU_SOURCE
+#  undef _SHOULD_UNDEFINE_GNU_SOURCE
+# endif
+#else
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* It is a bit strange for a header to play with the visibility of the
+   symbols it declares, but this matches gcc's behavior and some programs
+   depend on it */
+#ifndef HIDE_EXPORTS
+#pragma GCC visibility push(default)
+#endif
+
+typedef uintptr_t _Unwind_Word;
+typedef intptr_t _Unwind_Sword;
+typedef uintptr_t _Unwind_Ptr;
+typedef uintptr_t _Unwind_Internal_Ptr;
+typedef uint64_t _Unwind_Exception_Class;
+
+typedef intptr_t _sleb128_t;
+typedef uintptr_t _uleb128_t;
+
+struct _Unwind_Context;
+#if defined(__arm__) && !(defined(__USING_SJLJ_EXCEPTIONS__) || defined(__ARM_DWARF_EH__))
+struct _Unwind_Control_Block;
+typedef struct _Unwind_Control_Block _Unwind_Exception; /* Alias */
+#else
+struct _Unwind_Exception;
+typedef struct _Unwind_Exception _Unwind_Exception;
+#endif
+typedef enum {
+  _URC_NO_REASON = 0,
+#if defined(__arm__) && !defined(__USING_SJLJ_EXCEPTIONS__) && \
+    !defined(__ARM_DWARF_EH__)
+  _URC_OK = 0, /* used by ARM EHABI */
+#endif
+  _URC_FOREIGN_EXCEPTION_CAUGHT = 1,
+
+  _URC_FATAL_PHASE2_ERROR = 2,
+  _URC_FATAL_PHASE1_ERROR = 3,
+  _URC_NORMAL_STOP = 4,
+
+  _URC_END_OF_STACK = 5,
+  _URC_HANDLER_FOUND = 6,
+  _URC_INSTALL_CONTEXT = 7,
+  _URC_CONTINUE_UNWIND = 8,
+#if defined(__arm__) && !defined(__USING_SJLJ_EXCEPTIONS__) && \
+    !defined(__ARM_DWARF_EH__)
+  _URC_FAILURE = 9 /* used by ARM EHABI */
+#endif
+} _Unwind_Reason_Code;
+
+typedef enum {
+  _UA_SEARCH_PHASE = 1,
+  _UA_CLEANUP_PHASE = 2,
+
+  _UA_HANDLER_FRAME = 4,
+  _UA_FORCE_UNWIND = 8,
+  _UA_END_OF_STACK = 16 /* gcc extension to C++ ABI */
+} _Unwind_Action;
+
+typedef void (*_Unwind_Exception_Cleanup_Fn)(_Unwind_Reason_Code,
+                                             _Unwind_Exception *);
+
+#if defined(__arm__) && !(defined(__USING_SJLJ_EXCEPTIONS__) || defined(__ARM_DWARF_EH__))
+typedef struct _Unwind_Control_Block _Unwind_Control_Block;
+typedef uint32_t _Unwind_EHT_Header;
+
+struct _Unwind_Control_Block {
+  uint64_t exception_class;
+  void (*exception_cleanup)(_Unwind_Reason_Code, _Unwind_Control_Block *);
+  /* unwinder cache (private fields for the unwinder's use) */
+  struct {
+    uint32_t reserved1; /* forced unwind stop function, 0 if not forced */
+    uint32_t reserved2; /* personality routine */
+    uint32_t reserved3; /* callsite */
+    uint32_t reserved4; /* forced unwind stop argument */
+    uint32_t reserved5;
+  } unwinder_cache;
+  /* propagation barrier cache (valid after phase 1) */
+  struct {
+    uint32_t sp;
+    uint32_t bitpattern[5];
+  } barrier_cache;
+  /* cleanup cache (preserved over cleanup) */
+  struct {
+    uint32_t bitpattern[4];
+  } cleanup_cache;
+  /* personality cache (for personality's benefit) */
+  struct {
+    uint32_t fnstart;         /* function start address */
+    _Unwind_EHT_Header *ehtp; /* pointer to EHT entry header word */
+    uint32_t additional;      /* additional data */
+    uint32_t reserved1;
+  } pr_cache;
+  long long int : 0; /* force alignment of next item to 8-byte boundary */
+} __attribute__((__aligned__(8)));
+#else
+struct _Unwind_Exception {
+  _Unwind_Exception_Class exception_class;
+  _Unwind_Exception_Cleanup_Fn exception_cleanup;
+  _Unwind_Word private_1;
+  _Unwind_Word private_2;
+  /* The Itanium ABI requires that _Unwind_Exception objects are "double-word
+   * aligned".  GCC has interpreted this to mean "use the maximum useful
+   * alignment for the target"; so do we. */
+} __attribute__((__aligned__));
+#endif
+
+typedef _Unwind_Reason_Code (*_Unwind_Stop_Fn)(int, _Unwind_Action,
+                                               _Unwind_Exception_Class,
+                                               _Unwind_Exception *,
+                                               struct _Unwind_Context *,
+                                               void *);
+
+typedef _Unwind_Reason_Code (*_Unwind_Personality_Fn)(int, _Unwind_Action,
+                                                      _Unwind_Exception_Class,
+                                                      _Unwind_Exception *,
+                                                      struct _Unwind_Context *);
+typedef _Unwind_Personality_Fn __personality_routine;
+
+typedef _Unwind_Reason_Code (*_Unwind_Trace_Fn)(struct _Unwind_Context *,
+                                                void *);
+
+#if defined(__arm__) && !(defined(__USING_SJLJ_EXCEPTIONS__) || defined(__ARM_DWARF_EH__))
+typedef enum {
+  _UVRSC_CORE = 0,        /* integer register */
+  _UVRSC_VFP = 1,         /* vfp */
+  _UVRSC_WMMXD = 3,       /* Intel WMMX data register */
+  _UVRSC_WMMXC = 4        /* Intel WMMX control register */
+} _Unwind_VRS_RegClass;
+
+typedef enum {
+  _UVRSD_UINT32 = 0,
+  _UVRSD_VFPX = 1,
+  _UVRSD_UINT64 = 3,
+  _UVRSD_FLOAT = 4,
+  _UVRSD_DOUBLE = 5
+} _Unwind_VRS_DataRepresentation;
+
+typedef enum {
+  _UVRSR_OK = 0,
+  _UVRSR_NOT_IMPLEMENTED = 1,
+  _UVRSR_FAILED = 2
+} _Unwind_VRS_Result;
+
+typedef uint32_t _Unwind_State;
+#define _US_VIRTUAL_UNWIND_FRAME  ((_Unwind_State)0)
+#define _US_UNWIND_FRAME_STARTING ((_Unwind_State)1)
+#define _US_UNWIND_FRAME_RESUME   ((_Unwind_State)2)
+#define _US_ACTION_MASK           ((_Unwind_State)3)
+#define _US_FORCE_UNWIND          ((_Unwind_State)8)
+
+_Unwind_VRS_Result _Unwind_VRS_Get(struct _Unwind_Context *__context,
+  _Unwind_VRS_RegClass __regclass,
+  uint32_t __regno,
+  _Unwind_VRS_DataRepresentation __representation,
+  void *__valuep);
+
+_Unwind_VRS_Result _Unwind_VRS_Set(struct _Unwind_Context *__context,
+  _Unwind_VRS_RegClass __regclass,
+  uint32_t __regno,
+  _Unwind_VRS_DataRepresentation __representation,
+  void *__valuep);
+
+static __inline__
+_Unwind_Word _Unwind_GetGR(struct _Unwind_Context *__context, int __index) {
+  _Unwind_Word __value;
+  _Unwind_VRS_Get(__context, _UVRSC_CORE, __index, _UVRSD_UINT32, &__value);
+  return __value;
+}
+
+static __inline__
+void _Unwind_SetGR(struct _Unwind_Context *__context, int __index,
+                   _Unwind_Word __value) {
+  _Unwind_VRS_Set(__context, _UVRSC_CORE, __index, _UVRSD_UINT32, &__value);
+}
+
+static __inline__
+_Unwind_Word _Unwind_GetIP(struct _Unwind_Context *__context) {
+  _Unwind_Word __ip = _Unwind_GetGR(__context, 15);
+  return __ip & ~(_Unwind_Word)(0x1); /* Remove thumb mode bit. */
+}
+
+static __inline__
+void _Unwind_SetIP(struct _Unwind_Context *__context, _Unwind_Word __value) {
+  _Unwind_Word __thumb_mode_bit = _Unwind_GetGR(__context, 15) & 0x1;
+  _Unwind_SetGR(__context, 15, __value | __thumb_mode_bit);
+}
+#else
+_Unwind_Word _Unwind_GetGR(struct _Unwind_Context *, int);
+void _Unwind_SetGR(struct _Unwind_Context *, int, _Unwind_Word);
+
+_Unwind_Word _Unwind_GetIP(struct _Unwind_Context *);
+void _Unwind_SetIP(struct _Unwind_Context *, _Unwind_Word);
+#endif
+
+
+_Unwind_Word _Unwind_GetIPInfo(struct _Unwind_Context *, int *);
+
+_Unwind_Word _Unwind_GetCFA(struct _Unwind_Context *);
+
+_Unwind_Word _Unwind_GetBSP(struct _Unwind_Context *);
+
+void *_Unwind_GetLanguageSpecificData(struct _Unwind_Context *);
+
+_Unwind_Ptr _Unwind_GetRegionStart(struct _Unwind_Context *);
+
+/* DWARF EH functions; currently not available on Darwin/ARM */
+#if !defined(__APPLE__) || !defined(__arm__)
+_Unwind_Reason_Code _Unwind_RaiseException(_Unwind_Exception *);
+_Unwind_Reason_Code _Unwind_ForcedUnwind(_Unwind_Exception *, _Unwind_Stop_Fn,
+                                         void *);
+void _Unwind_DeleteException(_Unwind_Exception *);
+void _Unwind_Resume(_Unwind_Exception *);
+_Unwind_Reason_Code _Unwind_Resume_or_Rethrow(_Unwind_Exception *);
+
+#endif
+
+_Unwind_Reason_Code _Unwind_Backtrace(_Unwind_Trace_Fn, void *);
+
+/* setjmp(3)/longjmp(3) stuff */
+typedef struct SjLj_Function_Context *_Unwind_FunctionContext_t;
+
+void _Unwind_SjLj_Register(_Unwind_FunctionContext_t);
+void _Unwind_SjLj_Unregister(_Unwind_FunctionContext_t);
+_Unwind_Reason_Code _Unwind_SjLj_RaiseException(_Unwind_Exception *);
+_Unwind_Reason_Code _Unwind_SjLj_ForcedUnwind(_Unwind_Exception *,
+                                              _Unwind_Stop_Fn, void *);
+void _Unwind_SjLj_Resume(_Unwind_Exception *);
+_Unwind_Reason_Code _Unwind_SjLj_Resume_or_Rethrow(_Unwind_Exception *);
+
+void *_Unwind_FindEnclosingFunction(void *);
+
+#ifdef __APPLE__
+
+_Unwind_Ptr _Unwind_GetDataRelBase(struct _Unwind_Context *)
+    __attribute__((__unavailable__));
+_Unwind_Ptr _Unwind_GetTextRelBase(struct _Unwind_Context *)
+    __attribute__((__unavailable__));
+
+/* Darwin-specific functions */
+void __register_frame(const void *);
+void __deregister_frame(const void *);
+
+struct dwarf_eh_bases {
+  uintptr_t tbase;
+  uintptr_t dbase;
+  uintptr_t func;
+};
+void *_Unwind_Find_FDE(const void *, struct dwarf_eh_bases *);
+
+void __register_frame_info_bases(const void *, void *, void *, void *)
+  __attribute__((__unavailable__));
+void __register_frame_info(const void *, void *) __attribute__((__unavailable__));
+void __register_frame_info_table_bases(const void *, void*, void *, void *)
+  __attribute__((__unavailable__));
+void __register_frame_info_table(const void *, void *)
+  __attribute__((__unavailable__));
+void __register_frame_table(const void *) __attribute__((__unavailable__));
+void __deregister_frame_info(const void *) __attribute__((__unavailable__));
+void __deregister_frame_info_bases(const void *)__attribute__((__unavailable__));
+
+#else
+
+_Unwind_Ptr _Unwind_GetDataRelBase(struct _Unwind_Context *);
+_Unwind_Ptr _Unwind_GetTextRelBase(struct _Unwind_Context *);
+
+#endif
+
+
+#ifndef HIDE_EXPORTS
+#pragma GCC visibility pop
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+#endif /* __CLANG_UNWIND_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                              /* ===-------- vadefs.h ---------------------------------------------------===
  *
- *	This is the part of XPC that manages the channels and
- *	sends/receives messages across them to/from other partitions.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ *===-----------------------------------------------------------------------===
  */
 
-#include <linux/device.h>
-#include "xpc.h"
+/* Only include this if we are aiming for MSVC compatibility. */
+#ifndef _MSC_VER
+#include_next <vadefs.h>
+#else
 
-/*
- * Process a connect message from a remote partition.
- *
- * Note: xpc_process_connect() is expecting to be called with the
- * spin_lock_irqsave held and will leave it locked upon return.
+#ifndef __clang_vadefs_h
+#define __clang_vadefs_h
+
+#include_next <vadefs.h>
+
+/* Override macros from vadefs.h with definitions that work with Clang. */
+#ifdef _crt_va_start
+#undef _crt_va_start
+#define _crt_va_start(ap, param) __builtin_va_start(ap, param)
+#endif
+#ifdef _crt_va_end
+#undef _crt_va_end
+#define _crt_va_end(ap)          __builtin_va_end(ap)
+#endif
+#ifdef _crt_va_arg
+#undef _crt_va_arg
+#define _crt_va_arg(ap, type)    __builtin_va_arg(ap, type)
+#endif
+
+/* VS 2015 switched to double underscore names, which is an improvement, but now
+ * we have to intercept those names too.
  */
-static void
-xpc_process_connect(struct xpc_channel *ch, unsigned long *irq_flags)
-{
-	enum xp_retval ret;
+#ifdef __crt_va_start
+#undef __crt_va_start
+#define __crt_va_start(ap, param) __builtin_va_start(ap, param)
+#endif
+#ifdef __crt_va_end
+#undef __crt_va_end
+#define __crt_va_end(ap)          __builtin_va_end(ap)
+#endif
+#ifdef __crt_va_arg
+#undef __crt_va_arg
+#define __crt_va_arg(ap, type)    __builtin_va_arg(ap, type)
+#endif
 
-	DBUG_ON(!spin_is_locked(&ch->lock));
-
-	if (!(ch->flags & XPC_C_OPENREQUEST) ||
-	    !(ch->flags & XPC_C_ROPENREQUEST)) {
-		/* nothing more to do for now */
-		return;
-	}
-	DBUG_ON(!(ch->flags & XPC_C_CONNECTING));
-
-	if (!(ch->flags & XPC_C_SETUP)) {
-		spin_unlock_irqrestore(&ch->lock, *irq_flags);
-		ret = xpc_arch_ops.setup_msg_structures(ch);
-		spin_lock_irqsave(&ch->lock, *irq_flags);
-
-		if (ret != xpSuccess)
-			XPC_DISCONNECT_CHANNEL(ch, ret, irq_flags);
-		else
-			ch->flags |= XPC_C_SETUP;
-
-		if (ch->flags & XPC_C_DISCONNECTING)
-			return;
-	}
-
-	if (!(ch->flags & XPC_C_OPENREPLY)) {
-		ch->flags |= XPC_C_OPENREPLY;
-		xpc_arch_ops.send_chctl_openreply(ch, irq_flags);
-	}
-
-	if (!(ch->flags & XPC_C_ROPENREPLY))
-		return;
-
-	if (!(ch->flags & XPC_C_OPENCOMPLETE)) {
-		ch->flags |= (XPC_C_OPENCOMPLETE | XPC_C_CONNECTED);
-		xpc_arch_ops.send_chctl_opencomplete(ch, irq_flags);
-	}
-
-	if (!(ch->flags & XPC_C_ROPENCOMPLETE))
-		return;
-
-	dev_info(xpc_chan, "channel %d to partition %d connected\n",
-		 ch->number, ch->partid);
-
-	ch->flags = (XPC_C_CONNECTED | XPC_C_SETUP);	/* clear all else */
-}
-
-/*
- * spin_lock_irqsave() is expected to be held on entry.
+#endif
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*===---- varargs.h - Variable argument handling -------------------------------------===
+*
+* Permission is hereby granted, free of charge, to any person obtaining a copy
+* of this software and associated documentation files (the "Software"), to deal
+* in the Software without restriction, including without limitation the rights
+* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+* copies of the Software, and to permit persons to whom the Software is
+* furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+* THE SOFTWARE.
+*
+*===-----------------------------------------------------------------------===
+*/
+#ifndef __VARARGS_H
+#define __VARARGS_H
+  #error "Please use <stdarg.h> instead of <varargs.h>"
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*===---- wmmintrin.h - AES intrinsics ------------------------------------===
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ *===-----------------------------------------------------------------------===
  */
-static void
-xpc_process_disconnect(struct xpc_channel *ch, unsigned long *irq_flags)
-{
-	struct xpc_partition *part = &xpc_partitions[ch->partid];
-	u32 channel_was_connected = (ch->flags & XPC_C_WASCONNECTED);
 
-	DBUG_ON(!spin_is_locked(&ch->lock));
+#ifndef _WMMINTRIN_H
+#define _WMMINTRIN_H
 
-	if (!(ch->flags & XPC_C_DISCONNECTING))
-		return;
+#include <emmintrin.h>
 
-	DBUG_ON(!(ch->flags & XPC_C_CLOSEREQUEST));
+#include <__wmmintrin_aes.h>
 
-	/* make sure all activity has settled down first */
+#include <__wmmintrin_pclmul.h>
 
-	if (atomic_read(&ch->kthreads_assigned) > 0 ||
-	    atomic_read(&ch->references) > 0) {
-		return;
-	}
-	DBUG_ON((ch->flags & XPC_C_CONNECTEDCALLOUT_MADE) &&
-		!(ch->flags & XPC_C_DISCONNECTINGCALLOUT_MADE));
-
-	if (part->act_state == XPC_P_AS_DEACTIVATING) {
-		/* can't proceed until the other side disengages from us */
-		if (xpc_arch_ops.partition_engaged(ch->partid))
-			return;
-
-	} else {
-
-		/* as long as the other side is up do the full protocol */
-
-		if (!(ch->flags & XPC_C_RCLOSEREQUEST))
-			return;
-
-		if (!(ch->flags & XPC_C_CLOSEREPLY)) {
-			ch->flags |= XPC_C_CLOSEREPLY;
-			xpc_arch_ops.send_chctl_closereply(ch, irq_flags);
-		}
-
-		if (!(ch->flags & XPC_C_RCLOSEREPLY))
-			return;
-	}
-
-	/* wake those waiting for notify completion */
-	if (atomic_read(&ch->n_to_notify) > 0) {
-		/* we do callout while holding ch->lock, callout can't block */
-		xpc_arch_ops.notify_senders_of_disconnect(ch);
-	}
-
-	/* both sides are disconnected now */
-
-	if (ch->flags & XPC_C_DISCONNECTINGCALLOUT_MADE) {
-		spin_unlock_irqrestore(&ch->lock, *irq_flags);
-		xpc_disconnect_callout(ch, xpDisconnected);
-		spin_lock_irqsave(&ch->lock, *irq_flags);
-	}
-
-	DBUG_ON(atomic_read(&ch->n_to_notify) != 0);
-
-	/* it's now safe to free the channel's message queues */
-	xpc_arch_ops.teardown_msg_structures(ch);
-
-	ch->func = NULL;
-	ch->key = NULL;
-	ch->entry_size = 0;
-	ch->local_nentries = 0;
-	ch->remote_nentries = 0;
-	ch->kthreads_assigned_limit = 0;
-	ch->kthreads_idle_limit = 0;
-
-	/*
-	 * Mark the channel disconnected and clear all other flags, including
-	 * XPC_C_SETUP (because of call to
-	 * xpc_arch_ops.teardown_msg_structures()) but not including
-	 * XPC_C_WDISCONNECT (if it was set).
-	 */
-	ch->flags = (XPC_C_DISCONNECTED | (ch->flags & XPC_C_WDISCONNECT));
-
-	atomic_dec(&part->nchannels_active);
-
-	if (channel_was_connected) {
-		dev_info(xpc_chan, "channel %d to partition %d disconnected, "
-			 "reason=%d\n", ch->number, ch->partid, ch->reason);
-	}
-
-	if (ch->flags & XPC_C_WDISCONNECT) {
-		/* we won't lose the CPU since we're holding ch->lock */
-		complete(&ch->wdisconnect_wait);
-	} else if (ch->delayed_chctl_flags) {
-		if (part->act_state != XPC_P_AS_DEACTIVATING) {
-			/* time to take action on any delayed chctl flags */
-			spin_lock(&part->chctl_lock);
-			part->chctl.flags[ch->number] |=
-			    ch->delayed_chctl_flags;
-			spin_unlock(&part->chctl_lock);
-		}
-		ch->delayed_chctl_flags = 0;
-	}
-}
-
-/*
- * Process a change in the channel's remote connection state.
+#endif /* _WMMINTRIN_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          /*===---- x86intrin.h - X86 intrinsics -------------------------------------===
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ *===-----------------------------------------------------------------------===
  */
-static void
-xpc_process_openclose_chctl_flags(struct xpc_partition *part, int ch_number,
-				  u8 chctl_flags)
-{
-	unsigned long irq_flags;
-	struct xpc_openclose_args *args =
-	    &part->remote_openclose_args[ch_number];
-	struct xpc_channel *ch = &part->channels[ch_number];
-	enum xp_retval reason;
-	enum xp_retval ret;
-	int create_kthread = 0;
 
-	spin_lock_irqsave(&ch->lock, irq_flags);
+#ifndef __X86INTRIN_H
+#define __X86INTRIN_H
 
-again:
+#include <ia32intrin.h>
 
-	if ((ch->flags & XPC_C_DISCONNECTED) &&
-	    (ch->flags & XPC_C_WDISCONNECT)) {
-		/*
-		 * Delay processing chctl flags until thread waiting disconnect
-		 * has had a chance to see that the channel is disconnected.
-		 */
-		ch->delayed_chctl_flags |= chctl_flags;
-		goto out;
-	}
+#include <immintrin.h>
 
-	if (chctl_flags & XPC_CHCTL_CLOSEREQUEST) {
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__3dNOW__)
+#include <mm3dnow.h>
+#endif
 
-		dev_dbg(xpc_chan, "XPC_CHCTL_CLOSEREQUEST (reason=%d) received "
-			"from partid=%d, channel=%d\n", args->reason,
-			ch->partid, ch->number);
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__BMI__)
+#include <bmiintrin.h>
+#endif
 
-		/*
-		 * If RCLOSEREQUEST is set, we're probably waiting for
-		 * RCLOSEREPLY. We should find it and a ROPENREQUEST packed
-		 * with this RCLOSEREQUEST in the chctl_flags.
-		 */
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__BMI2__)
+#include <bmi2intrin.h>
+#endif
 
-		if (ch->flags & XPC_C_RCLOSEREQUEST) {
-			DBUG_ON(!(ch->flags & XPC_C_DISCONNECTING));
-			DBUG_ON(!(ch->flags & XPC_C_CLOSEREQUEST));
-			DBUG_ON(!(ch->flags & XPC_C_CLOSEREPLY));
-			DBUG_ON(ch->flags & XPC_C_RCLOSEREPLY);
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__LZCNT__)
+#include <lzcntintrin.h>
+#endif
 
-			DBUG_ON(!(chctl_flags & XPC_CHCTL_CLOSEREPLY));
-			chctl_flags &= ~XPC_CHCTL_CLOSEREPLY;
-			ch->flags |= XPC_C_RCLOSEREPLY;
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__POPCNT__)
+#include <popcntintrin.h>
+#endif
 
-			/* both sides have finished disconnecting */
-			xpc_process_disconnect(ch, &irq_flags);
-			DBUG_ON(!(ch->flags & XPC_C_DISCONNECTED));
-			goto again;
-		}
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__RDSEED__)
+#include <rdseedintrin.h>
+#endif
 
-		if (ch->flags & XPC_C_DISCONNECTED) {
-			if (!(chctl_flags & XPC_CHCTL_OPENREQUEST)) {
-				if (part->chctl.flags[ch_number] &
-				    XPC_CHCTL_OPENREQUEST) {
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__PRFCHW__)
+#include <prfchwintrin.h>
+#endif
 
-					DBUG_ON(ch->delayed_chctl_flags != 0);
-					spin_lock(&part->chctl_lock);
-					part->chctl.flags[ch_number] |=
-					    XPC_CHCTL_CLOSEREQUEST;
-					spin_unlock(&part->chctl_lock);
-				}
-				goto out;
-			}
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__SSE4A__)
+#include <ammintrin.h>
+#endif
 
-			XPC_SET_REASON(ch, 0, 0);
-			ch->flags &= ~XPC_C_DISCONNECTED;
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__FMA4__)
+#include <fma4intrin.h>
+#endif
 
-			atomic_inc(&part->nchannels_active);
-			ch->flags |= (XPC_C_CONNECTING | XPC_C_ROPENREQUEST);
-		}
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__XOP__)
+#include <xopintrin.h>
+#endif
 
-		chctl_flags &= ~(XPC_CHCTL_OPENREQUEST | XPC_CHCTL_OPENREPLY |
-		    XPC_CHCTL_OPENCOMPLETE);
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__TBM__)
+#include <tbmintrin.h>
+#endif
 
-		/*
-		 * The meaningful CLOSEREQUEST connection state fields are:
-		 *      reason = reason connection is to be closed
-		 */
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__LWP__)
+#include <lwpintrin.h>
+#endif
 
-		ch->flags |= XPC_C_RCLOSEREQUEST;
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__F16C__)
+#include <f16cintrin.h>
+#endif
 
-		if (!(ch->flags & XPC_C_DISCONNECTING)) {
-			reason = args->reason;
-			if (reason <= xpSuccess || reason > xpUnknownReason)
-				reason = xpUnknownReason;
-			else if (reason == xpUnregistering)
-				reason = xpOtherUnregistering;
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__MWAITX__)
+#include <mwaitxintrin.h>
+#endif
 
-			XPC_DISCONNECT_CHANNEL(ch, reason, &irq_flags);
+#if !defined(_MSC_VER) || __has_feature(modules) || defined(__CLZERO__)
+#include <clzerointrin.h>
+#endif
 
-			DBUG_ON(chctl_flags & XPC_CHCTL_CLOSEREPLY);
-			goto out;
-		}
-
-		xpc_process_disconnect(ch, &irq_flags);
-	}
-
-	if (chctl_flags & XPC_CHCTL_CLOSEREPLY) {
-
-		dev_dbg(xpc_chan, "XPC_CHCTL_CLOSEREPLY received from partid="
-			"%d, channel=%d\n", ch->partid, ch->number);
-
-		if (ch->flags & XPC_C_DISCONNECTED) {
-			DBUG_ON(part->act_state != XPC_P_AS_DEACTIVATING);
-			goto out;
-		}
-
-		DBUG_ON(!(ch->flags & XPC_C_CLOSEREQUEST));
-
-		if (!(ch->flags & XPC_C_RCLOSEREQUEST)) {
-			if (part->chctl.flags[ch_number] &
-			    XPC_CHCTL_CLOSEREQUEST) {
-
-				DBUG_ON(ch->delayed_chctl_flags != 0);
-				spin_lock(&part->chctl_lock);
-				part->chctl.flags[ch_number] |=
-				    XPC_CHCTL_CLOSEREPLY;
-				spin_unlock(&part->chctl_lock);
-			}
-			goto out;
-		}
-
-		ch->flags |= XPC_C_RCLOSEREPLY;
-
-		if (ch->flags & XPC_C_CLOSEREPLY) {
-			/* both sides have finished disconnecting */
-			xpc_process_disconnect(ch, &irq_flags);
-		}
-	}
-
-	if (chctl_flags & XPC_CHCTL_OPENREQUEST) {
-
-		dev_dbg(xpc_chan, "XPC_CHCTL_OPENREQUEST (entry_size=%d, "
-			"local_nentries=%d) received from partid=%d, "
-			"channel=%d\n", args->entry_size, args->local_nentries,
-			ch->partid, ch->number);
-
-		if (part->act_state == XPC_P_AS_DEACTIVATING ||
-		    (ch->flags & XPC_C_ROPENREQUEST)) {
-			goto out;
-		}
-
-		if (ch->flags & (XPC_C_DISCONNECTING | XPC_C_WDISCONNECT)) {
-			ch->delayed_chctl_flags |= XPC_CHCTL_OPENREQUEST;
-			goto out;
-		}
-		DBUG_ON(!(ch->flags & (XPC_C_DISCONNECTED |
-				       XPC_C_OPENREQUEST)));
-		DBUG_ON(ch->flags & (XPC_C_ROPENREQUEST | XPC_C_ROPENREPLY |
-				     XPC_C_OPENREPLY | XPC_C_CONNECTED));
-
-		/*
-		 * The meaningful OPENREQUEST connection state fields are:
-		 *      entry_size = size of channel's messages in bytes
-		 *      local_nentries = remote partition's local_nentries
-		 */
-		if (args->entry_size == 0 || args->local_nentries == 0) {
-			/* assume OPENREQUEST was delayed by mistake */
-			goto out;
-		}
-
-		ch->flags |= (XPC_C_ROPENREQUEST | XPC_C_CONNECTING);
-		ch->remote_nentries = args->local_nentries;
-
-		if (ch->flags & XPC_C_OPENREQUEST) {
-			if (args->entry_size != ch->entry_size) {
-				XPC_DISCONNECT_CHANNEL(ch, xpUnequalMsgSizes,
-						       &irq_flags);
-				goto out;
-			}
-		} else {
-			ch->entry_size = args->entry_size;
-
-			XPC_SET_REASON(ch, 0, 0);
-			ch->flags &= ~XPC_C_DISCONNECTED;
-
-			atomic_inc(&part->nchannels_active);
-		}
-
-		xpc_process_connect(ch, &irq_flags);
-	}
-
-	if (chctl_flags & XPC_CHCTL_OPENREPLY) {
-
-		dev_dbg(xpc_chan, "XPC_CHCTL_OPENREPLY (local_msgqueue_pa="
-			"0x%lx, local_nentries=%d, remote_nentries=%d) "
-			"received from partid=%d, channel=%d\n",
-			args->local_msgqueue_pa, args->local_nentries,
-			args->remote_nentries, ch->partid, ch->number);
-
-		if (ch->flags & (XPC_C_DISCONNECTING | XPC_C_DISCONNECTED))
-			goto out;
-
-		if (!(ch->flags & XPC_C_OPENREQUEST)) {
-			XPC_DISCONNECT_CHANNEL(ch, xpOpenCloseError,
-					       &irq_flags);
-			goto out;
-		}
-
-		DBUG_ON(!(ch->flags & XPC_C_ROPENREQUEST));
-		DBUG_ON(ch->flags & XPC_C_CONNECTED);
-
-		/*
-		 * The meaningful OPENREPLY connection state fields are:
-		 *      local_msgqueue_pa = physical address of remote
-		 *                          partition's local_msgqueue
-		 *      local_nentries = remote partition's local_nentries
-		 *      remote_nentries = remote partition's remote_nentries
-		 */
-		DBUG_ON(args->local_msgqueue_pa == 0);
-		DBUG_ON(args->local_nentries == 0);
-		DBUG_ON(args->remote_nentries == 0);
-
-		ret = xpc_arch_ops.save_remote_msgqueue_pa(ch,
-						      args->local_msgqueue_pa);
-		if (ret != xpSuccess) {
-			XPC_DISCONNECT_CHANNEL(ch, ret, &irq_flags);
-			goto out;
-		}
-		ch->flags |= XPC_C_ROPENREPLY;
-
-		if (args->local_nentries < ch->remote_nentries) {
-			dev_dbg(xpc_chan, "XPC_CHCTL_OPENREPLY: new "
-				"remote_nentries=%d, old remote_nentries=%d, "
-				"partid=%d, channel=%d\n",
-				args->local_nentries, ch->remote_nentries,
-				ch->partid, ch->number);
-
-			ch->remote_nentries = args->local_nentries;
-		}
-		if (args->remote_nentries < ch->local_nentries) {
-			dev_dbg(xpc_chan, "XPC_CHCTL_OPENREPLY: new "
-				"local_nentries=%d, old local_nentries=%d, "
-				"partid=%d, channel=%d\n",
-				args->remote_nentries, ch->local_nentries,
-				ch->partid, ch->number);
-
-			ch->local_nentries = args->remote_nentries;
-		}
-
-		xpc_process_connect(ch, &irq_flags);
-	}
-
-	if (chctl_flags & XPC_CHCTL_OPENCOMPLETE) {
-
-		dev_dbg(xpc_chan, "XPC_CHCTL_OPENCOMPLETE received from "
-			"partid=%d, channel=%d\n", ch->partid, ch->number);
-
-		if (ch->flags & (XPC_C_DISCONNECTING | XPC_C_DISCONNECTED))
-			goto out;
-
-		if (!(ch->flags & XPC_C_OPENREQUEST) ||
-		    !(ch->flags & XPC_C_OPENREPLY)) {
-			XPC_DISCONNECT_CHANNEL(ch, xpOpenCloseError,
-					       &irq_flags);
-			goto out;
-		}
-
-		DBUG_ON(!(ch->flags & XPC_C_ROPENREQUEST));
-		DBUG_ON(!(ch->flags & XPC_C_ROPENREPLY));
-		DBUG_ON(!(ch->flags & XPC_C_CONNECTED));
-
-		ch->flags |= XPC_C_ROPENCOMPLETE;
-
-		xpc_process_connect(ch, &irq_flags);
-		create_kthread = 1;
-	}
-
-out:
-	spin_unlock_irqrestore(&ch->lock, irq_flags);
-
-	if (create_kthread)
-		xpc_create_kthreads(ch, 1, 0);
-}
-
-/*
- * Attempt to establish a channel connection to a remote partition.
- */
-static enum xp_retval
-xpc_connect_channel(struct xpc_channel *ch)
-{
-	unsigned long irq_flags;
-	struct xpc_registration *registration = &xpc_registrations[ch->number];
-
-	if (mutex_trylock(&registration->mutex) == 0)
-		return xpRetry;
-
-	if (!XPC_CHANNEL_REGISTERED(ch->number)) {
-		mutex_unlock(&registration->mutex);
-		return xpUnregistered;
-	}
-
-	spin_lock_irqsave(&ch->lock, irq_flags);
-
-	DBUG_ON(ch->flags & XPC_C_CONNECTED);
-	DBUG_ON(ch->flags & XPC_C_OPENREQUEST);
-
-	if (ch->flags & XPC_C_DISCONNECTING) {
-		spin_unlock_irqrestore(&ch->lock, irq_flags);
-		mutex_unlock(&registration->mutex);
-		return ch->reason;
-	}
-
-	/* add info from the channel connect registration to the channel */
-
-	ch->kthreads_assigned_limit = registration->assigned_limit;
-	ch->kthreads_idle_limit = registration->idle_limit;
-	DBUG_ON(atomic_read(&ch->kthreads_assigned) != 0);
-	DBUG_ON(atomic_read(&ch->kthreads_idle) != 0);
-	DBUG_ON(atomic_read(&ch->kthreads_active) != 0);
-
-	ch->func = registration->func;
-	DBUG_ON(registration->func == NULL);
-	ch->key = registration->key;
-
-	ch->local_nentries = registration->nentries;
-
-	if (ch->flags & XPC_C_ROPENREQUEST) {
-		if (registration->entry_size != ch->entry_size) {
-			/* the local and remote sides aren't the same */
-
-			/*
-			 * Because XPC_DISCONNECT_CHANNEL() can block we're
-			 * forced to up the registration sema before we unlock
-			 * the channel lock. But that's okay here because we're
-			 * done with the part that required the registration
-			 * sema. XPC_DISCONNECT_CHANNEL() requires that the
-			 * channel lock be locked and will unlock and relock
-			 * the channel lock as needed.
-			 */
-			mutex_unlock(&registration->mutex);
-			XPC_DISCONNECT_CHANNEL(ch, xpUnequalMsgSizes,
-					       &irq_flags);
-			spin_unlock_irqrestore(&ch->lock, irq_flags);
-			return xpUnequalMsgSizes;
-		}
-	} else {
-		ch->entry_size = registration->entry_size;
-
-		XPC_SET_REASON(ch, 0, 0);
-		ch->flags &= ~XPC_C_DISCONNECTED;
-
-		atomic_inc(&xpc_partitions[ch->partid].nchannels_active);
-	}
-
-	mutex_unlock(&registration->mutex);
-
-	/* initiate the connection */
-
-	ch->flags |= (XPC_C_OPENREQUEST | XPC_C_CONNECTING);
-	xpc_arch_ops.send_chctl_openrequest(ch, &irq_flags);
-
-	xpc_process_connect(ch, &irq_flags);
-
-	spin_unlock_irqrestore(&ch->lock, irq_flags);
-
-	return xpSuccess;
-}
-
-void
-xpc_process_sent_chctl_flags(struct xpc_partition *part)
-{
-	unsigned long irq_flags;
-	union xpc_channel_ctl_flags chctl;
-	struct xpc_channel *ch;
-	int ch_number;
-	u32 ch_flags;
-
-	chctl.all_flags = xpc_arch_ops.get_chctl_all_flags(part);
-
-	/*
-	 * Initiate channel connections for registered channels.
-	 *
-	 * For each connected channel that has pending messages activate idle
-	 * kthreads and/or create new kthreads as needed.
-	 */
-
-	for (ch_number = 0; ch_number < part->nchannels; ch_number++) {
-		ch = &part->channels[ch_number];
-
-		/*
-		 * Process any open or close related chctl flags, and then deal
-		 * with connecting or disconnecting the channel as required.
-		 */
-
-		if (chctl.flags[ch_number] & XPC_OPENCLOSE_CHCTL_FLAGS) {
-			xpc_process_openclose_chctl_flags(part, ch_number,
-							chctl.flags[ch_number]);
-		}
-
-		ch_flags = ch->flags;	/* need an atomic snapshot of flags */
-
-		if (ch_flags & XPC_C_DISCONNECTING) {
-			spin_lock_irqsave(&ch->lock, irq_flags);
-			xpc_process_disconnect(ch, &irq_flags);
-			spin_unlock_irqrestore(&ch->lock, irq_flags);
-			continue;
-		}
-
-		if (part->act_state == XPC_P_AS_DEACTIVATING)
-			continue;
-
-		if (!(ch_flags & XPC_C_CONNECTED)) {
-			if (!(ch_flags & XPC_C_OPENREQUEST)) {
-				DBUG_ON(ch_flags & XPC_C_SETUP);
-				(void)xpc_connect_channel(ch);
-			}
-			continue;
-		}
-
-		/*
-		 * Process any message related chctl flags, this may involve
-		 * the activation of kthreads to deliver any pending messages
-		 * sent from the other partition.
-		 */
-
-		if (chctl.flags[ch_number] & XPC_MSG_CHCTL_FLAGS)
-			xpc_arch_ops.process_msg_chctl_flags(part, ch_number);
-	}
-}
-
-/*
- * XPC's heartbeat code calls this function to inform XPC that a partition is
- * going down.  XPC responds by tearing down the XPartition Communication
- * infrastructure used for the just downed partition.
- *
- * XPC's heartbeat code will never call this function and xpc_partition_up()
- * at the same time. Nor will it ever make multiple calls to either function
- * at the same time.
- */
-void
-xpc_partition_going_down(struct xpc_partition *part, enum xp_retval reason)
-{
-	unsigned long irq_flags;
-	int ch_number;
-	struct xpc_channel *ch;
-
-	dev_dbg(xpc_chan, "deactivating partition %d, reason=%d\n",
-		XPC_PARTID(part), reason);
-
-	if (!xpc_part_ref(part)) {
-		/* infrastructure for this partition isn't currently set up */
-		return;
-	}
-
-	/* disconnect channels associated with the partition going down */
-
-	for (ch_number = 0; ch_number < part->nchannels; ch_number++) {
-		ch = &part->channels[ch_number];
-
-		xpc_msgqueue_ref(ch);
-		spin_lock_irqsave(&ch->lock, irq_flags);
-
-		XPC_DISCONNECT_CHANNEL(ch, reason, &irq_flags);
-
-		spin_unlock_irqrestore(&ch->lock, irq_flags);
-		xpc_msgqueue_deref(ch);
-	}
-
-	xpc_wakeup_channel_mgr(part);
-
-	xpc_part_deref(part);
-}
-
-/*
- * Called by XP at the time of channel connection registration to cause
- * XPC to establish connections to all currently active partitions.
- */
-void
-xpc_initiate_connect(int ch_number)
-{
-	short partid;
-	struct xpc_partition *part;
-	struct xpc_channel *ch;
-
-	DBUG_ON(ch_number < 0 || ch_number >= XPC_MAX_NCHANNELS);
-
-	for (partid = 0; partid < xp_max_npartitions; partid++) {
-		part = &xpc_partitions[partid];
-
-		if (xpc_part_ref(part)) {
-			ch = &part->channels[ch_number];
-
-			/*
-			 * Initiate the establishment of a connection on the
-			 * newly registered channel to the remote partition.
-			 */
-			xpc_wakeup_channel_mgr(part);
-			xpc_part_deref(part);
-		}
-	}
-}
-
-void
-xpc_connected_callout(struct xpc_channel *ch)
-{
-	/* let the registerer know that a connection has been established */
-
-	if (ch->func != NULL) {
-		dev_dbg(xpc_chan, "ch->func() called, reason=xpConnected, "
-			"partid=%d, channel=%d\n", ch->partid, ch->number);
-
-		ch->func(xpConnected, ch->partid, ch->number,
-			 (void *)(u64)ch->local_nentries, ch->key);
-
-		dev_dbg(xpc_chan, "ch->func() returned, reason=xpConnected, "
-			"partid=%d, channel=%d\n", ch->partid, ch->number);
-	}
-}
-
-/*
- * Called by XP at the time of channel connection unregistration to cause
- * XPC to teardown all current connections for the specified channel.
- *
- * Before returning xpc_initiate_disconnect() will wait until all connections
- * on the specified channel have been closed/torndown. So the caller can be
- * assured that they will not be receiving any more callouts from XPC to the
- * function they registered via xpc_connect().
- *
- * Arguments:
- *
- *	ch_number - channel # to unregister.
- */
-void
-xpc_initiate_disconnect(int ch_number)
-{
-	unsigned long irq_flags;
-	short partid;
-	struct xpc_partition *part;
-	struct xpc_channel *ch;
-
-	DBUG_ON(ch_number < 0 || ch_number >= XPC_MAX_NCHANNELS);
-
-	/* initiate the channel disconnect for every active partition */
-	for (partid = 0; partid < xp_max_npartitions; partid++) {
-		part = &xpc_partitions[partid];
-
-		if (xpc_part_ref(part)) {
-			ch = &part->channels[ch_number];
-			xpc_msgqueue_ref(ch);
-
-			spin_lock_irqsave(&ch->lock, irq_flags);
-
-			if (!(ch->flags & XPC_C_DISCONNECTED)) {
-				ch->flags |= XPC_C_WDISCONNECT;
-
-				XPC_DISCONNECT_CHANNEL(ch, xpUnregistering,
-						       &irq_flags);
-			}
-
-			spin_unlock_irqrestore(&ch->lock, irq_flags);
-
-			xpc_msgqueue_deref(ch);
-			xpc_part_deref(part);
-		}
-	}
-
-	xpc_disconnect_wait(ch_number);
-}
-
-/*
- * To disconnect a channel, and reflect it back to all who may be waiting.
- *
- * An OPEN is not allowed until XPC_C_DISCONNECTING is cleared by
- * xpc_process_disconnect(), and if set, XPC_C_WDISCONNECT is cleared by
- * xpc_disconnect_wait().
- *
- * THE CHANNEL IS TO BE LOCKED BY THE CALLER AND WILL REMAIN LOCKED UPON RETURN.
- */
-void
-xpc_disconnect_channel(const int line, struct xpc_channel *ch,
-		       enum xp_retval reason, unsigned long *irq_flags)
-{
-	u32 channel_was_connected = (ch->flags & XPC_C_CONNECTED);
-
-	DBUG_ON(!spin_is_locked(&ch->lock));
-
-	if (ch->flags & (XPC_C_DISCONNECTING | XPC_C_DISCONNECTED))
-		return;
-
-	DBUG_ON(!(ch->flags & (XPC_C_CONNECTING | XPC_C_CONNECTED)));
-
-	dev_dbg(xpc_chan, "reason=%d, line=%d, partid=%d, channel=%d\n",
-		reason, line, ch->partid, ch->number);
-
-	XPC_SET_REASON(ch, reason, line);
-
-	ch->flags |= (XPC_C_CLOSEREQUEST | XPC_C_DISCONNECTING);
-	/* some of these may not have been set */
-	ch->flags &= ~(XPC_C_OPENREQUEST | XPC_C_OPENREPLY |
-		       XPC_C_ROPENREQUEST | XPC_C_ROPENREPLY |
-		       XPC_C_CONNECTING | XPC_C_CONNECTED);
-
-	xpc_arch_ops.send_chctl_closerequest(ch, irq_flags);
-
-	if (channel_was_connected)
-		ch->flags |= XPC_C_WASCONNECTED;
-
-	spin_unlock_irqrestore(&ch->lock, *irq_flags);
-
-	/* wake all idle kthreads so they can exit */
-	if (atomic_read(&ch->kthreads_idle) > 0) {
-		wake_up_all(&ch->idle_wq);
-
-	} else if ((ch->flags & XPC_C_CONNECTEDCALLOUT_MADE) &&
-		   !(ch->flags & XPC_C_DISCONNECTINGCALLOUT)) {
-		/* start a kthread that will do the xpDisconnecting callout */
-		xpc_create_kthreads(ch, 1, 1);
-	}
-
-	/* wake those waiting to allocate an entry from the local msg queue */
-	if (atomic_read(&ch->n_on_msg_allocate_wq) > 0)
-		wake_up(&ch->msg_allocate_wq);
-
-	spin_lock_irqsave(&ch->lock, *irq_flags);
-}
-
-void
-xpc_disconnect_callout(struct xpc_channel *ch, enum xp_retval reason)
-{
-	/*
-	 * Let the channel's registerer know that the channel is being
-	 * disconnected. We don't want to do this if the registerer was never
-	 * informed of a connection being made.
-	 */
-
-	if (ch->func != NULL) {
-		dev_dbg(xpc_chan, "ch->func() called, reason=%d, partid=%d, "
-			"channel=%d\n", reason, ch->partid, ch->number);
-
-		ch->func(reason, ch->partid, ch->number, NULL, ch->key);
-
-		dev_dbg(xpc_chan, "ch->func() returned, reason=%d, partid=%d, "
-			"channel=%d\n", reason, ch->partid, ch->number);
-	}
-}
-
-/*
- * Wait for a message entry to become available for the specified channel,
- * but don't wait any longer than 1 jiffy.
- */
-enum xp_retval
-xpc_allocate_msg_wait(struct xpc_channel *ch)
-{
-	enum xp_retval ret;
-	DEFINE_WAIT(wait);
-
-	if (ch->flags & XPC_C_DISCONNECTING) {
-		DBUG_ON(ch->reason == xpInterrupted);
-		return ch->reason;
-	}
-
-	atomic_inc(&ch->n_on_msg_allocate_wq);
-	prepare_to_wait(&ch->msg_allocate_wq, &wait, TASK_INTERRUPTIBLE);
-	ret = schedule_timeout(1);
-	finish_wait(&ch->msg_allocate_wq, &wait);
-	atomic_dec(&ch->n_on_msg_allocate_wq);
-
-	if (ch->flags & XPC_C_DISCONNECTING) {
-		ret = ch->reason;
-		DBUG_ON(ch->reason == xpInterrupted);
-	} else if (ret == 0) {
-		ret = xpTimeout;
-	} else {
-		ret = xpInterrupted;
-	}
-
-	return ret;
-}
-
-/*
- * Send a message that contains the user's payload on the specified channel
- * connected to the specified partition.
- *
- * NOTE that this routine can sleep waiting for a message entry to become
- * available. To not sleep, pass in the XPC_NOWAIT flag.
- *
- * Once sent, this routine will not wait for the message to be received, nor
- * will notification be given when it does happen.
- *
- * Arguments:
- *
- *	partid - ID of partition to which the channel is connected.
- *	ch_number - channel # to send message on.
- *	flags - see xp.h for valid flags.
- *	payload - pointer to the payload which is to be sent.
- *	payload_size - size of the payload in bytes.
- */
-enum xp_retval
-xpc_initiate_send(short partid, int ch_number, u32 flags, void *payload,
-		  u16 payload_size)
-{
-	struct xpc_partition *part = &xpc_partitions[partid];
-	enum xp_retval ret = xpUnknownReason;
-
-	dev_dbg(xpc_chan, "payload=0x%p, partid=%d, channel=%d\n", payload,
-		partid, ch_number);
-
-	DBUG_ON(partid < 0 || partid >= xp_max_npartitions);
-	DBUG_ON(ch_number < 0 || ch_number >= part->nchannels);
-	DBUG_ON(payload == NULL);
-
-	if (xpc_part_ref(part)) {
-		ret = xpc_arch_ops.send_payload(&part->channels[ch_number],
-				  flags, payload, payload_size, 0, NULL, NULL);
-		xpc_part_deref(part);
-	}
-
-	return ret;
-}
-
-/*
- * Send a message that contains the user's payload on the specified channel
- * connected to the specified partition.
- *
- * NOTE that this routine can sleep waiting for a message entry to become
- * available. To not sleep, pass in the XPC_NOWAIT flag.
- *
- * This routine will not wait for the message to be sent or received.
- *
- * Once the remote end of the channel has received the message, the function
- * passed as an argument to xpc_initiate_send_notify() will be called. This
- * allows the sender to free up or re-use any buffers referenced by the
- * message, but does NOT mean the message has been processed at the remote
- * end by a receiver.
- *
- * If this routine returns an error, the caller's function will NOT be called.
- *
- * Arguments:
- *
- *	partid - ID of partition to which the channel is connected.
- *	ch_number - channel # to send message on.
- *	flags - see xp.h for valid flags.
- *	payload - pointer to the payload which is to be sent.
- *	payload_size - size of the payload in bytes.
- *	func - function to call with asynchronous notification of message
- *		  receipt. THIS FUNCTION MUST BE NON-BLOCKING.
- *	key - user-defined key to be passed to the function when it's called.
- */
-enum xp_retval
-xpc_initiate_send_notify(short partid, int ch_number, u32 flags, void *payload,
-			 u16 payload_size, xpc_notify_func func, void *key)
-{
-	struct xpc_partition *part = &xpc_partitions[partid];
-	enum xp_retval ret = xpUnknownReason;
-
-	dev_dbg(xpc_chan, "payload=0x%p, partid=%d, channel=%d\n", payload,
-		partid, ch_number);
-
-	DBUG_ON(partid < 0 || partid >= xp_max_npartitions);
-	DBUG_ON(ch_number < 0 || ch_number >= part->nchannels);
-	DBUG_ON(payload == NULL);
-	DBUG_ON(func == NULL);
-
-	if (xpc_part_ref(part)) {
-		ret = xpc_arch_ops.send_payload(&part->channels[ch_number],
-			  flags, payload, payload_size, XPC_N_CALL, func, key);
-		xpc_part_deref(part);
-	}
-	return ret;
-}
-
-/*
- * Deliver a message's payload to its intended recipient.
- */
-void
-xpc_deliver_payload(struct xpc_channel *ch)
-{
-	void *payload;
-
-	payload = xpc_arch_ops.get_deliverable_payload(ch);
-	if (payload != NULL) {
-
-		/*
-		 * This ref is taken to protect the payload itself from being
-		 * freed before the user is finished with it, which the user
-		 * indicates by calling xpc_initiate_received().
-		 */
-		xpc_msgqueue_ref(ch);
-
-		atomic_inc(&ch->kthreads_active);
-
-		if (ch->func != NULL) {
-			dev_dbg(xpc_chan, "ch->func() called, payload=0x%p "
-				"partid=%d channel=%d\n", payload, ch->partid,
-				ch->number);
-
-			/* deliver the message to its intended recipient */
-			ch->func(xpMsgReceived, ch->partid, ch->number, payload,
-				 ch->key);
-
-			dev_dbg(xpc_chan, "ch->func() returned, payload=0x%p "
-				"partid=%d channel=%d\n", payload, ch->partid,
-				ch->number);
-		}
-
-		atomic_dec(&ch->kthreads_active);
-	}
-}
-
-/*
- * Acknowledge receipt of a delivered message's payload.
- *
- * This function, although called by users, does not call xpc_part_ref() to
- * ensure that the partition infrastructure is in place. It relies on the
- * fact that we called xpc_msgqueue_ref() in xpc_deliver_payload().
- *
- * Arguments:
- *
- *	partid - ID of partition to which the channel is connected.
- *	ch_number - channel # message received on.
- *	payload - pointer to the payload area allocated via
- *			xpc_initiate_send() or xpc_initiate_send_notify().
- */
-void
-xpc_initiate_received(short partid, int ch_number, void *payload)
-{
-	struct xpc_partition *part = &xpc_partitions[partid];
-	struct xpc_channel *ch;
-
-	DBUG_ON(partid < 0 || partid >= xp_max_npartitions);
-	DBUG_ON(ch_number < 0 || ch_number >= part->nchannels);
-
-	ch = &part->channels[ch_number];
-	xpc_arch_ops.received_payload(ch, payload);
-
-	/* the call to xpc_msgqueue_ref() was done by xpc_deliver_payload()  */
-	xpc_msgqueue_deref(ch);
-}
+#endif /* __X86INTRIN_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    

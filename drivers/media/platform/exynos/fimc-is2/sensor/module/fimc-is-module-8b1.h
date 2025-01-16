@@ -1,28 +1,13 @@
-/*
- * Samsung Exynos5 SoC series Sensor driver
- *
- *
- * Copyright (c) 2011 Samsung Electronics Co., Ltd
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
+ module search path; path[0] is the script directory, else ''
+modules -- dictionary of loaded modules
 
-#ifndef FIMC_IS_DEVICE_8B1_H
-#define FIMC_IS_DEVICE_8B1_H
+displayhook -- called to show results in an interactive session
+excepthook -- called to handle any uncaught exception other than SystemExit
+  To customize printing in an interactive session or to install a custom
+  top-level exception handler, assign other functions to replace these.
 
-#define SENSOR_S5K8B1_INSTANCE	1
-#define SENSOR_S5K8B1_NAME	SENSOR_NAME_S5K8B1
-
-struct fimc_is_module_8b1 {
-	u16		vis_duration;
-	u16		frame_length_line;
-	u32		line_length_pck;
-	u32		system_clock;
-};
-
-int sensor_8b1_probe(struct i2c_client *client,
-	const struct i2c_device_id *id);
-
-#endif
+stdin -- standard input file object; used by input()
+stdout -- standard output file object; used by print()
+stderr -- standard error object; used for error messages
+  By assigning other file objects (or objects that behave like files)
+  to these, it is possib

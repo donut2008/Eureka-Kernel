@@ -1,592 +1,467 @@
-/*
- * Allwinner A23 SoCs pinctrl driver.
- *
- * Copyright (C) 2014 Chen-Yu Tsai
- *
- * Chen-Yu Tsai <wens@csie.org>
- *
- * Copyright (C) 2014 Maxime Ripard
- *
- * Maxime Ripard <maxime.ripard@free-electrons.com>
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2.  This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
- */
-
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/pinctrl/pinctrl.h>
-
-#include "pinctrl-sunxi.h"
-
-static const struct sunxi_desc_pin sun8i_a23_pins[] = {
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(A, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi1"),		/* CS */
-		  SUNXI_FUNCTION(0x3, "jtag"),		/* MS0 */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 0, 0)),	/* PA_EINT0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(A, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi1"),		/* CLK */
-		  SUNXI_FUNCTION(0x3, "jtag"),		/* CKO */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 0, 1)),	/* PA_EINT1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(A, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi1"),		/* MOSI */
-		  SUNXI_FUNCTION(0x3, "jtag"),		/* DOO */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 0, 2)),	/* PA_EINT2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(A, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi1"),		/* MISO */
-		  SUNXI_FUNCTION(0x3, "jtag"),		/* DIO */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 0, 3)),	/* PA_EINT3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(A, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart4"),		/* TX */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 0, 4)),	/* PA_EINT4 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(A, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart4"),		/* RX */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 0, 5)),	/* PA_EINT5 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(A, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart4"),		/* RTS */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 0, 6)),	/* PA_EINT6 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(A, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart4"),		/* CTS */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 0, 7)),	/* PA_EINT7 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart2"),		/* TX */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 1, 0)),	/* PB_EINT0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart2"),		/* RX */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 1, 1)),	/* PB_EINT1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart2"),		/* RTS */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 1, 2)),	/* PB_EINT2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart2"),		/* CTS */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 1, 3)),	/* PB_EINT3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2s0"),		/* SYNC */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 1, 4)),	/* PB_EINT4 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2s0"),		/* DOUT */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 1, 5)),	/* PB_EINT5 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2s0"),		/* DIN */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 1, 6)),	/* PB_EINT6 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(B, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x3, "i2s0"),		/* DI */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 1, 7)),	/* PB_EINT7 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* WE */
-		  SUNXI_FUNCTION(0x3, "spi0")),		/* MOSI */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* ALE */
-		  SUNXI_FUNCTION(0x3, "spi0")),		/* MISO */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* CLE */
-		  SUNXI_FUNCTION(0x3, "spi0")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* CE1 */
-		  SUNXI_FUNCTION(0x3, "spi0")),		/* CS */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0")),	/* CE0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* RE */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* RB0 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* CMD */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0")),	/* RB1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 8),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* DQ0 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 9),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* DQ1 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* DQ2 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 11),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* DQ3 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 12),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* DQ4 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D4 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 13),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0"),		/* DQ5 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D5 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 14),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand"),		/* DQ6 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D6 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 15),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand"),		/* DQ7 */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* D7 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 16),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand"),		/* DQS */
-		  SUNXI_FUNCTION(0x3, "mmc2")),		/* RST */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 17),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0")),	/* CE2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(C, 18),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "nand0")),	/* CE3 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0")),		/* D1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D2 */
-		  SUNXI_FUNCTION(0x3, "mmc1")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D3 */
-		  SUNXI_FUNCTION(0x3, "mmc1")),		/* CMD */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D4 */
-		  SUNXI_FUNCTION(0x3, "mmc1")),		/* D0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D5 */
-		  SUNXI_FUNCTION(0x3, "mmc1")),		/* D1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D6 */
-		  SUNXI_FUNCTION(0x3, "mmc1")),		/* D2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D7 */
-		  SUNXI_FUNCTION(0x3, "mmc1")),		/* D3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 8),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D8 */
-		  SUNXI_FUNCTION(0x3, "uart3")),	/* TX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 9),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D9 */
-		  SUNXI_FUNCTION(0x3, "uart3")),	/* RX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D10 */
-		  SUNXI_FUNCTION(0x3, "uart1")),	/* TX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 11),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D11 */
-		  SUNXI_FUNCTION(0x3, "uart1")),	/* RX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 12),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D12 */
-		  SUNXI_FUNCTION(0x3, "uart1")),	/* RTS */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 13),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D13 */
-		  SUNXI_FUNCTION(0x3, "uart1")),	/* CTS */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 14),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D14 */
-		  SUNXI_FUNCTION(0x3, "i2s1")),		/* SYNC */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 15),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D15 */
-		  SUNXI_FUNCTION(0x3, "i2s1")),		/* CLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 16),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D16 */
-		  SUNXI_FUNCTION(0x3, "i2s1")),		/* DOUT */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 17),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D17 */
-		  SUNXI_FUNCTION(0x3, "i2s1")),		/* DIN */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 18),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D18 */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VN0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 19),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D19 */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VP0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 20),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D20 */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VP1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 21),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D21 */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VN1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 22),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D22 */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VP2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 23),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* D23 */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VN2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 24),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* CLK */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VPC */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 25),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* DE */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VNC */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 26),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* HSYNC */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VP3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(D, 27),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "lcd0"),		/* VSYNC */
-		  SUNXI_FUNCTION(0x3, "lvds0")),	/* VN3 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* PCLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* MCLK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* HSYNC */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* VSYNC */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* D0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* D1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* D2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* D3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 8),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* D4 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 9),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* D5 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* D6 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 11),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi")),		/* D7 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 12),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi"),		/* SCK */
-		  SUNXI_FUNCTION(0x3, "i2c2")),		/* SCK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 13),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "csi"),		/* SDA */
-		  SUNXI_FUNCTION(0x3, "i2c2")),		/* SDA */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 14),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out")),
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 15),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out")),
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 16),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out")),
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(E, 17),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out")),
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0"),		/* D1 */
-		  SUNXI_FUNCTION(0x3, "jtag")),		/* MS1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0"),		/* D0 */
-		  SUNXI_FUNCTION(0x3, "jtag")),		/* DI1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0"),		/* CLK */
-		  SUNXI_FUNCTION(0x3, "uart0")),	/* TX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0"),		/* CMD */
-		  SUNXI_FUNCTION(0x3, "jtag")),		/* DO1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0"),		/* D3 */
-		  SUNXI_FUNCTION(0x3, "uart0")),	/* RX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(F, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc0"),		/* D2 */
-		  SUNXI_FUNCTION(0x3, "jtag")),		/* CK1 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc1"),		/* CLK */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 0)),	/* PG_EINT0 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc1"),		/* CMD */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 1)),	/* PG_EINT1 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc1"),		/* D0 */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 2)),	/* PG_EINT2 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc1"),		/* D1 */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 3)),	/* PG_EINT3 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc1"),		/* D2 */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 4)),	/* PG_EINT4 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "mmc1"),		/* D3 */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 5)),	/* PG_EINT5 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart1"),		/* TX */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 6)),	/* PG_EINT6 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart1"),		/* RX */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 7)),	/* PG_EINT7 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 8),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart1"),		/* RTS */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 8)),	/* PG_EINT8 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 9),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "uart1"),		/* CTS */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 9)),	/* PG_EINT9 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 10),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2s1"),		/* SYNC */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 10)),	/* PG_EINT10 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 11),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2s1"),		/* CLK */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 11)),	/* PG_EINT11 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 12),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2s1"),		/* DOUT */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 12)),	/* PG_EINT12 */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(G, 13),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2s1"),		/* DIN */
-		  SUNXI_FUNCTION_IRQ_BANK(0x4, 2, 13)),	/* PG_EINT13 */
-	/* Hole */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 0),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "pwm0")),
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 1),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "pwm1")),
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 2),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c0")),		/* SCK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 3),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c0")),		/* SDA */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 4),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c1")),		/* SCK */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 5),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "i2c1")),		/* SDA */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 6),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi0"),		/* CS */
-		  SUNXI_FUNCTION(0x3, "uart3")),	/* TX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 7),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi0"),		/* CLK */
-		  SUNXI_FUNCTION(0x3, "uart3")),	/* RX */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 8),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi0"),		/* DOUT */
-		  SUNXI_FUNCTION(0x3, "uart3")),	/* RTS */
-	SUNXI_PIN(SUNXI_PINCTRL_PIN(H, 9),
-		  SUNXI_FUNCTION(0x0, "gpio_in"),
-		  SUNXI_FUNCTION(0x1, "gpio_out"),
-		  SUNXI_FUNCTION(0x2, "spi0"),		/* DIN */
-		  SUNXI_FUNCTION(0x3, "uart3")),	/* CTS */
-};
-
-static const struct sunxi_pinctrl_desc sun8i_a23_pinctrl_data = {
-	.pins = sun8i_a23_pins,
-	.npins = ARRAY_SIZE(sun8i_a23_pins),
-	.irq_banks = 3,
-};
-
-static int sun8i_a23_pinctrl_probe(struct platform_device *pdev)
-{
-	return sunxi_pinctrl_init(pdev,
-				  &sun8i_a23_pinctrl_data);
-}
-
-static const struct of_device_id sun8i_a23_pinctrl_match[] = {
-	{ .compatible = "allwinner,sun8i-a23-pinctrl", },
-	{}
-};
-MODULE_DEVICE_TABLE(of, sun8i_a23_pinctrl_match);
-
-static struct platform_driver sun8i_a23_pinctrl_driver = {
-	.probe	= sun8i_a23_pinctrl_probe,
-	.driver	= {
-		.name		= "sun8i-a23-pinctrl",
-		.of_match_table	= sun8i_a23_pinctrl_match,
-	},
-};
-module_platform_driver(sun8i_a23_pinctrl_driver);
-
-MODULE_AUTHOR("Chen-Yu Tsai <wens@csie.org>");
-MODULE_AUTHOR("Maxime Ripard <maxime.ripard@free-electrons.com");
-MODULE_DESCRIPTION("Allwinner A23 pinctrl driver");
-MODULE_LICENSE("GPL");
+BE_CNTL_MODE {
+	DIG_BE_DP_SST_MODE                               = 0x0,
+	DIG_BE_RESERVED1                                 = 0x1,
+	DIG_BE_TMDS_DVI_MODE                             = 0x2,
+	DIG_BE_TMDS_HDMI_MODE                            = 0x3,
+	DIG_BE_SDVO_RESERVED                             = 0x4,
+	DIG_BE_DP_MST_MODE                               = 0x5,
+	DIG_BE_RESERVED2                                 = 0x6,
+	DIG_BE_RESERVED3                                 = 0x7,
+} DIG_BE_CNTL_MODE;
+typedef enum DIG_BE_CNTL_HPD_SELECT {
+	DIG_BE_CNTL_HPD1                                 = 0x0,
+	DIG_BE_CNTL_HPD2                                 = 0x1,
+	DIG_BE_CNTL_HPD3                                 = 0x2,
+	DIG_BE_CNTL_HPD4                                 = 0x3,
+	DIG_BE_CNTL_HPD5                                 = 0x4,
+	DIG_BE_CNTL_HPD6                                 = 0x5,
+} DIG_BE_CNTL_HPD_SELECT;
+typedef enum LVTMA_RANDOM_PATTERN_SEED_RAN_PAT {
+	LVTMA_RANDOM_PATTERN_SEED_ALL_PIXELS             = 0x0,
+	LVTMA_RANDOM_PATTERN_SEED_ONLY_DE_HIGH           = 0x1,
+} LVTMA_RANDOM_PATTERN_SEED_RAN_PAT;
+typedef enum TMDS_SYNC_PHASE {
+	TMDS_NOT_SYNC_PHASE_ON_FRAME_START               = 0x0,
+	TMDS_SYNC_PHASE_ON_FRAME_START                   = 0x1,
+} TMDS_SYNC_PHASE;
+typedef enum TMDS_DATA_SYNCHRONIZATION_DSINTSEL {
+	TMDS_DATA_SYNCHRONIZATION_DSINTSEL_PCLK_TMDS     = 0x0,
+	TMDS_DATA_SYNCHRONIZATION_DSINTSEL_TMDS_PLL      = 0x1,
+} TMDS_DATA_SYNCHRONIZATION_DSINTSEL;
+typedef enum TMDS_TRANSMITTER_ENABLE_HPD_MASK {
+	TMDS_TRANSMITTER_HPD_MASK_NOT_OVERRIDE           = 0x0,
+	TMDS_TRANSMITTER_HPD_MASK_OVERRIDE               = 0x1,
+} TMDS_TRANSMITTER_ENABLE_HPD_MASK;
+typedef enum TMDS_TRANSMITTER_ENABLE_LNKCEN_HPD_MASK {
+	TMDS_TRANSMITTER_LNKCEN_HPD_MASK_NOT_OVERRIDE    = 0x0,
+	TMDS_TRANSMITTER_LNKCEN_HPD_MASK_OVERRIDE        = 0x1,
+} TMDS_TRANSMITTER_ENABLE_LNKCEN_HPD_MASK;
+typedef enum TMDS_TRANSMITTER_ENABLE_LNKDEN_HPD_MASK {
+	TMDS_TRANSMITTER_LNKDEN_HPD_MASK_NOT_OVERRIDE    = 0x0,
+	TMDS_TRANSMITTER_LNKDEN_HPD_MASK_OVERRIDE        = 0x1,
+} TMDS_TRANSMITTER_ENABLE_LNKDEN_HPD_MASK;
+typedef enum TMDS_TRANSMITTER_CONTROL_PLL_ENABLE_HPD_MASK {
+	TMDS_TRANSMITTER_HPD_NOT_OVERRIDE_PLL_ENABLE     = 0x0,
+	TMDS_TRANSMITTER_HPD_OVERRIDE_PLL_ENABLE_ON_DISCON= 0x1,
+	TMDS_TRANSMITTER_HPD_OVERRIDE_PLL_ENABLE_ON_CON  = 0x2,
+	TMDS_TRANSMITTER_HPD_OVERRIDE_PLL_ENABLE         = 0x3,
+} TMDS_TRANSMITTER_CONTROL_PLL_ENABLE_HPD_MASK;
+typedef enum TMDS_TRANSMITTER_CONTROL_IDSCKSELA {
+	TMDS_TRANSMITTER_IDSCKSELA_USE_IPIXCLK           = 0x0,
+	TMDS_TRANSMITTER_IDSCKSELA_USE_IDCLK             = 0x1,
+} TMDS_TRANSMITTER_CONTROL_IDSCKSELA;
+typedef enum TMDS_TRANSMITTER_CONTROL_IDSCKSELB {
+	TMDS_TRANSMITTER_IDSCKSELB_USE_IPIXCLK           = 0x0,
+	TMDS_TRANSMITTER_IDSCKSELB_USE_IDCLK             = 0x1,
+} TMDS_TRANSMITTER_CONTROL_IDSCKSELB;
+typedef enum TMDS_TRANSMITTER_CONTROL_PLL_PWRUP_SEQ_EN {
+	TMDS_TRANSMITTER_PLL_PWRUP_SEQ_DISABLE           = 0x0,
+	TMDS_TRANSMITTER_PLL_PWRUP_SEQ_ENABLE            = 0x1,
+} TMDS_TRANSMITTER_CONTROL_PLL_PWRUP_SEQ_EN;
+typedef enum TMDS_TRANSMITTER_CONTROL_PLL_RESET_HPD_MASK {
+	TMDS_TRANSMITTER_PLL_NOT_RST_ON_HPD              = 0x0,
+	TMDS_TRANSMITTER_PLL_RST_ON_HPD                  = 0x1,
+} TMDS_TRANSMITTER_CONTROL_PLL_RESET_HPD_MASK;
+typedef enum TMDS_TRANSMITTER_CONTROL_TMCLK_FROM_PADS {
+	TMDS_TRANSMITTER_TMCLK_FROM_TMDS_TMCLK           = 0x0,
+	TMDS_TRANSMITTER_TMCLK_FROM_PADS                 = 0x1,
+} TMDS_TRANSMITTER_CONTROL_TMCLK_FROM_PADS;
+typedef enum TMDS_TRANSMITTER_CONTROL_TDCLK_FROM_PADS {
+	TMDS_TRANSMITTER_TDCLK_FROM_TMDS_TDCLK           = 0x0,
+	TMDS_TRANSMITTER_TDCLK_FROM_PADS                 = 0x1,
+} TMDS_TRANSMITTER_CONTROL_TDCLK_FROM_PADS;
+typedef enum TMDS_TRANSMITTER_CONTROL_PLLSEL_OVERWRITE_EN {
+	TMDS_TRANSMITTER_PLLSEL_BY_HW                    = 0x0,
+	TMDS_TRANSMITTER_PLLSEL_OVERWRITE_BY_SW          = 0x1,
+} TMDS_TRANSMITTER_CONTROL_PLLSEL_OVERWRITE_EN;
+typedef enum TMDS_TRANSMITTER_CONTROL_BYPASS_PLLA {
+	TMDS_TRANSMITTER_BYPASS_PLLA_COHERENT            = 0x0,
+	TMDS_TRANSMITTER_BYPASS_PLLA_INCOHERENT          = 0x1,
+} TMDS_TRANSMITTER_CONTROL_BYPASS_PLLA;
+typedef enum TMDS_TRANSMITTER_CONTROL_BYPASS_PLLB {
+	TMDS_TRANSMITTER_BYPASS_PLLB_COHERENT            = 0x0,
+	TMDS_TRANSMITTER_BYPASS_PLLB_INCOHERENT          = 0x1,
+} TMDS_TRANSMITTER_CONTROL_BYPASS_PLLB;
+typedef enum TMDS_REG_TEST_OUTPUTA_CNTLA {
+	TMDS_REG_TEST_OUTPUTA_CNTLA_OTDATA0              = 0x0,
+	TMDS_REG_TEST_OUTPUTA_CNTLA_OTDATA1              = 0x1,
+	TMDS_REG_TEST_OUTPUTA_CNTLA_OTDATA2              = 0x2,
+	TMDS_REG_TEST_OUTPUTA_CNTLA_NA                   = 0x3,
+} TMDS_REG_TEST_OUTPUTA_CNTLA;
+typedef enum TMDS_REG_TEST_OUTPUTB_CNTLB {
+	TMDS_REG_TEST_OUTPUTB_CNTLB_OTDATB0              = 0x0,
+	TMDS_REG_TEST_OUTPUTB_CNTLB_OTDATB1              = 0x1,
+	TMDS_REG_TEST_OUTPUTB_CNTLB_OTDATB2              = 0x2,
+	TMDS_REG_TEST_OUTPUTB_CNTLB_NA                   = 0x3,
+} TMDS_REG_TEST_OUTPUTB_CNTLB;
+typedef enum DP_LINK_TRAINING_COMPLETE {
+	DP_LINK_TRAINING_NOT_COMPLETE                    = 0x0,
+	DP_LINK_TRAINING_ALREADY_COMPLETE                = 0x1,
+} DP_LINK_TRAINING_COMPLETE;
+typedef enum DP_EMBEDDED_PANEL_MODE {
+	DP_EXTERNAL_PANEL                                = 0x0,
+	DP_EMBEDDED_PANEL                                = 0x1,
+} DP_EMBEDDED_PANEL_MODE;
+typedef enum DP_PIXEL_ENCODING {
+	DP_PIXEL_ENCODING_RGB444                         = 0x0,
+	DP_PIXEL_ENCODING_YCBCR422                       = 0x1,
+	DP_PIXEL_ENCODING_YCBCR444                       = 0x2,
+	DP_PIXEL_ENCODING_RGB_WIDE_GAMUT                 = 0x3,
+	DP_PIXEL_ENCODING_Y_ONLY                         = 0x4,
+	DP_PIXEL_ENCODING_RESERVED                       = 0x5,
+} DP_PIXEL_ENCODING;
+typedef enum DP_DYN_RANGE {
+	DP_DYN_VESA_RANGE                                = 0x0,
+	DP_DYN_CEA_RANGE                                 = 0x1,
+} DP_DYN_RANGE;
+typedef enum DP_YCBCR_RANGE {
+	DP_YCBCR_RANGE_BT601_5                           = 0x0,
+	DP_YCBCR_RANGE_BT709_5                           = 0x1,
+} DP_YCBCR_RANGE;
+typedef enum DP_COMPONENT_DEPTH {
+	DP_COMPONENT_DEPTH_6BPC                          = 0x0,
+	DP_COMPONENT_DEPTH_8BPC                          = 0x1,
+	DP_COMPONENT_DEPTH_10BPC                         = 0x2,
+	DP_COMPONENT_DEPTH_12BPC                         = 0x3,
+	DP_COMPONENT_DEPTH_16BPC                         = 0x4,
+	DP_COMPONENT_DEPTH_RESERVED                      = 0x5,
+} DP_COMPONENT_DEPTH;
+typedef enum DP_MSA_MISC0_OVERRIDE_ENABLE {
+	MSA_MISC0_OVERRIDE_DISABLE                       = 0x0,
+	MSA_MISC0_OVERRIDE_ENABLE                        = 0x1,
+} DP_MSA_MISC0_OVERRIDE_ENABLE;
+typedef enum DP_UDI_LANES {
+	DP_UDI_1_LANE                                    = 0x0,
+	DP_UDI_2_LANES                                   = 0x1,
+	DP_UDI_LANES_RESERVED                            = 0x2,
+	DP_UDI_4_LANES                                   = 0x3,
+} DP_UDI_LANES;
+typedef enum DP_VID_STREAM_DIS_DEFER {
+	DP_VID_STREAM_DIS_NO_DEFER                       = 0x0,
+	DP_VID_STREAM_DIS_DEFER_TO_HBLANK                = 0x1,
+	DP_VID_STREAM_DIS_DEFER_TO_VBLANK                = 0x2,
+} DP_VID_STREAM_DIS_DEFER;
+typedef enum DP_STEER_OVERFLOW_ACK {
+	DP_STEER_OVERFLOW_ACK_NO_EFFECT                  = 0x0,
+	DP_STEER_OVERFLOW_ACK_CLR_INTERRUPT              = 0x1,
+} DP_STEER_OVERFLOW_ACK;
+typedef enum DP_STEER_OVERFLOW_MASK {
+	DP_STEER_OVERFLOW_MASKED                         = 0x0,
+	DP_STEER_OVERFLOW_UNMASK                         = 0x1,
+} DP_STEER_OVERFLOW_MASK;
+typedef enum DP_TU_OVERFLOW_ACK {
+	DP_TU_OVERFLOW_ACK_NO_EFFECT                     = 0x0,
+	DP_TU_OVERFLOW_ACK_CLR_INTERRUPT                 = 0x1,
+} DP_TU_OVERFLOW_ACK;
+typedef enum DP_VID_TIMING_MODE {
+	DP_VID_TIMING_MODE_ASYNC                         = 0x0,
+	DP_VID_TIMING_MODE_SYNC                          = 0x1,
+} DP_VID_TIMING_MODE;
+typedef enum DP_VID_M_N_DOUBLE_BUFFER_MODE {
+	DP_VID_M_N_DOUBLE_BUFFER_AFTER_VID_M_UPDATE      = 0x0,
+	DP_VID_M_N_DOUBLE_BUFFER_AT_FRAME_START          = 0x1,
+} DP_VID_M_N_DOUBLE_BUFFER_MODE;
+typedef enum DP_VID_M_N_GEN_EN {
+	DP_VID_M_N_PROGRAMMED_VIA_REG                    = 0x0,
+	DP_VID_M_N_CALC_AUTO                             = 0x1,
+} DP_VID_M_N_GEN_EN;
+typedef enum DP_VID_ENHANCED_FRAME_MODE {
+	VID_NORMAL_FRAME_MODE                            = 0x0,
+	VID_ENHANCED_MODE                                = 0x1,
+} DP_VID_ENHANCED_FRAME_MODE;
+typedef enum DP_VID_MSA_TOP_FIELD_MODE {
+	DP_TOP_FIELD_ONLY                                = 0x0,
+	DP_TOP_PLUS_BOTTOM_FIELD                         = 0x1,
+} DP_VID_MSA_TOP_FIELD_MODE;
+typedef enum DP_VID_VBID_FIELD_POL {
+	DP_VID_VBID_FIELD_POL_NORMAL                     = 0x0,
+	DP_VID_VBID_FIELD_POL_INV                        = 0x1,
+} DP_VID_VBID_FIELD_POL;
+typedef enum DP_VID_STREAM_DISABLE_ACK {
+	ID_STREAM_DISABLE_NO_ACK                         = 0x0,
+	ID_STREAM_DISABLE_ACKED                          = 0x1,
+} DP_VID_STREAM_DISABLE_ACK;
+typedef enum DP_VID_STREAM_DISABLE_MASK {
+	VID_STREAM_DISABLE_MASKED                        = 0x0,
+	VID_STREAM_DISABLE_UNMASK                        = 0x1,
+} DP_VID_STREAM_DISABLE_MASK;
+typedef enum DPHY_ATEST_SEL_LANE0 {
+	DPHY_ATEST_LANE0_PRBS_PATTERN                    = 0x0,
+	DPHY_ATEST_LANE0_REG_PATTERN                     = 0x1,
+} DPHY_ATEST_SEL_LANE0;
+typedef enum DPHY_ATEST_SEL_LANE1 {
+	DPHY_ATEST_LANE1_PRBS_PATTERN                    = 0x0,
+	DPHY_ATEST_LANE1_REG_PATTERN                     = 0x1,
+} DPHY_ATEST_SEL_LANE1;
+typedef enum DPHY_ATEST_SEL_LANE2 {
+	DPHY_ATEST_LANE2_PRBS_PATTERN                    = 0x0,
+	DPHY_ATEST_LANE2_REG_PATTERN                     = 0x1,
+} DPHY_ATEST_SEL_LANE2;
+typedef enum DPHY_ATEST_SEL_LANE3 {
+	DPHY_ATEST_LANE3_PRBS_PATTERN                    = 0x0,
+	DPHY_ATEST_LANE3_REG_PATTERN                     = 0x1,
+} DPHY_ATEST_SEL_LANE3;
+typedef enum DPHY_BYPASS {
+	DPHY_8B10B_OUTPUT                                = 0x0,
+	DPHY_DBG_OUTPUT                                  = 0x1,
+} DPHY_BYPASS;
+typedef enum DPHY_SKEW_BYPASS {
+	DPHY_WITH_SKEW                                   = 0x0,
+	DPHY_NO_SKEW                                     = 0x1,
+} DPHY_SKEW_BYPASS;
+typedef enum DPHY_TRAINING_PATTERN_SEL {
+	DPHY_TRAINING_PATTERN_1                          = 0x0,
+	DPHY_TRAINING_PATTERN_2                          = 0x1,
+	DPHY_TRAINING_PATTERN_3                          = 0x2,
+} DPHY_TRAINING_PATTERN_SEL;
+typedef enum DPHY_8B10B_RESET {
+	DPHY_8B10B_NOT_RESET                             = 0x0,
+	DPHY_8B10B_RESETET                               = 0x1,
+} DPHY_8B10B_RESET;
+typedef enum DP_DPHY_8B10B_EXT_DISP {
+	DP_DPHY_8B10B_EXT_DISP_ZERO                      = 0x0,
+	DP_DPHY_8B10B_EXT_DISP_ONE                       = 0x1,
+} DP_DPHY_8B10B_EXT_DISP;
+typedef enum DPHY_8B10B_CUR_DISP {
+	DPHY_8B10B_CUR_DISP_ZERO                         = 0x0,
+	DPHY_8B10B_CUR_DISP_ONE                          = 0x1,
+} DPHY_8B10B_CUR_DISP;
+typedef enum DPHY_PRBS_EN {
+	DPHY_PRBS_DISABLE                                = 0x0,
+	DPHY_PRBS_ENABLE                                 = 0x1,
+} DPHY_PRBS_EN;
+typedef enum DPHY_PRBS_SEL {
+	DPHY_PRBS7_SELECTED                              = 0x0,
+	DPHY_PRBS23_SELECTED                             = 0x1,
+	DPHY_PRBS11_SELECTED                             = 0x2,
+} DPHY_PRBS_SEL;
+typedef enum DPHY_LOAD_BS_COUNT_START {
+	DPHY_LOAD_BS_COUNT_STARTED                       = 0x0,
+	DPHY_LOAD_BS_COUNT_NOT_STARTED                   = 0x1,
+} DPHY_LOAD_BS_COUNT_START;
+typedef enum DPHY_CRC_EN {
+	DPHY_CRC_DISABLED                                = 0x0,
+	DPHY_CRC_ENABLED                                 = 0x1,
+} DPHY_CRC_EN;
+typedef enum DPHY_CRC_CONT_EN {
+	DPHY_CRC_ONE_SHOT                                = 0x0,
+	DPHY_CRC_CONTINUOUS                              = 0x1,
+} DPHY_CRC_CONT_EN;
+typedef enum DPHY_CRC_FIELD {
+	DPHY_CRC_START_FROM_TOP_FIELD                    = 0x0,
+	DPHY_CRC_START_FROM_BOTTOM_FIELD                 = 0x1,
+} DPHY_CRC_FIELD;
+typedef enum DPHY_CRC_SEL {
+	DPHY_CRC_LANE0_SELECTED                          = 0x0,
+	DPHY_CRC_LANE1_SELECTED                          = 0x1,
+	DPHY_CRC_LANE2_SELECTED                          = 0x2,
+	DPHY_CRC_LANE3_SELECTED                          = 0x3,
+} DPHY_CRC_SEL;
+typedef enum DPHY_RX_FAST_TRAINING_CAPABLE {
+	DPHY_FAST_TRAINING_NOT_CAPABLE_0                 = 0x0,
+	DPHY_FAST_TRAINING_CAPABLE                       = 0x1,
+} DPHY_RX_FAST_TRAINING_CAPABLE;
+typedef enum DP_SEC_COLLISION_ACK {
+	DP_SEC_COLLISION_ACK_NO_EFFECT                   = 0x0,
+	DP_SEC_COLLISION_ACK_CLR_FLAG                    = 0x1,
+} DP_SEC_COLLISION_ACK;
+typedef enum DP_SEC_AUDIO_MUTE {
+	DP_SEC_AUDIO_MUTE_HW_CTRL                        = 0x0,
+	DP_SEC_AUDIO_MUTE_SW_CTRL                        = 0x1,
+} DP_SEC_AUDIO_MUTE;
+typedef enum DP_SEC_TIMESTAMP_MODE {
+	DP_SEC_TIMESTAMP_PROGRAMMABLE_MODE               = 0x0,
+	DP_SEC_TIMESTAMP_AUTO_CALC_MODE                  = 0x1,
+} DP_SEC_TIMESTAMP_MODE;
+typedef enum DP_SEC_ASP_PRIORITY {
+	DP_SEC_ASP_LOW_PRIORITY                          = 0x0,
+	DP_SEC_ASP_HIGH_PRIORITY                         = 0x1,
+} DP_SEC_ASP_PRIORITY;
+typedef enum DP_SEC_ASP_CHANNEL_COUNT_OVERRIDE {
+	DP_SEC_ASP_CHANNEL_COUNT_FROM_AZ                 = 0x0,
+	DP_SEC_ASP_CHANNEL_COUNT_OVERRIDE_ENABLED        = 0x1,
+} DP_SEC_ASP_CHANNEL_COUNT_OVERRIDE;
+typedef enum DP_MSE_SAT_UPDATE_ACT {
+	DP_MSE_SAT_UPDATE_NO_ACTION                      = 0x0,
+	DP_MSE_SAT_UPDATE_WITH_TRIGGER                   = 0x1,
+	DP_MSE_SAT_UPDATE_WITHOUT_TRIGGER                = 0x2,
+} DP_MSE_SAT_UPDATE_ACT;
+typedef enum DP_MSE_LINK_LINE {
+	DP_MSE_LINK_LINE_32_MTP_LONG                     = 0x0,
+	DP_MSE_LINK_LINE_64_MTP_LONG                     = 0x1,
+	DP_MSE_LINK_LINE_128_MTP_LONG                    = 0x2,
+	DP_MSE_LINK_LINE_256_MTP_LONG                    = 0x3,
+} DP_MSE_LINK_LINE;
+typedef enum DP_MSE_BLANK_CODE {
+	DP_MSE_BLANK_CODE_SF_FILLED                      = 0x0,
+	DP_MSE_BLANK_CODE_ZERO_FILLED                    = 0x1,
+} DP_MSE_BLANK_CODE;
+typedef enum DP_MSE_TIMESTAMP_MODE {
+	DP_MSE_TIMESTAMP_CALC_BASED_ON_LINK_RATE         = 0x0,
+	DP_MSE_TIMESTAMP_CALC_BASED_ON_VC_RATE           = 0x1,
+} DP_MSE_TIMESTAMP_MODE;
+typedef enum DP_MSE_ZERO_ENCODER {
+	DP_MSE_NOT_ZERO_FE_ENCODER                       = 0x0,
+	DP_MSE_ZERO_FE_ENCODER                           = 0x1,
+} DP_MSE_ZERO_ENCODER;
+typedef enum DP_MSE_OUTPUT_DPDBG_DATA {
+	DP_MSE_OUTPUT_DPDBG_DATA_DIS                     = 0x0,
+	DP_MSE_OUTPUT_DPDBG_DATA_EN                      = 0x1,
+} DP_MSE_OUTPUT_DPDBG_DATA;
+typedef enum DP_DPHY_HBR2_PATTERN_CONTROL_MODE {
+	DP_DPHY_HBR2_PASS_THROUGH                        = 0x0,
+	DP_DPHY_HBR2_PATTERN_1                           = 0x1,
+	DP_DPHY_HBR2_PATTERN_2_NEG                       = 0x2,
+	DP_DPHY_HBR2_PATTERN_3                           = 0x3,
+	DP_DPHY_HBR2_PATTERN_2_POS                       = 0x6,
+} DP_DPHY_HBR2_PATTERN_CONTROL_MODE;
+typedef enum DPHY_CRC_MST_PHASE_ERROR_ACK {
+	DPHY_CRC_MST_PHASE_ERROR_NO_ACK                  = 0x0,
+	DPHY_CRC_MST_PHASE_ERROR_ACKED                   = 0x1,
+} DPHY_CRC_MST_PHASE_ERROR_ACK;
+typedef enum DPHY_SW_FAST_TRAINING_START {
+	DPHY_SW_FAST_TRAINING_NOT_STARTED                = 0x0,
+	DPHY_SW_FAST_TRAINING_STARTED                    = 0x1,
+} DPHY_SW_FAST_TRAINING_START;
+typedef enum DP_DPHY_FAST_TRAINING_VBLANK_EDGE_DETECT_EN {
+	DP_DPHY_FAST_TRAINING_VBLANK_EDGE_DETECT_DISABLED= 0x0,
+	DP_DPHY_FAST_TRAINING_VBLANK_EDGE_DETECT_ENABLED = 0x1,
+} DP_DPHY_FAST_TRAINING_VBLANK_EDGE_DETECT_EN;
+typedef enum DP_DPHY_FAST_TRAINING_COMPLETE_MASK {
+	DP_DPHY_FAST_TRAINING_COMPLETE_MASKED            = 0x0,
+	DP_DPHY_FAST_TRAINING_COMPLETE_NOT_MASKED        = 0x1,
+} DP_DPHY_FAST_TRAINING_COMPLETE_MASK;
+typedef enum DP_DPHY_FAST_TRAINING_COMPLETE_ACK {
+	DP_DPHY_FAST_TRAINING_COMPLETE_NOT_ACKED         = 0x0,
+	DP_DPHY_FAST_TRAINING_COMPLETE_ACKED             = 0x1,
+} DP_DPHY_FAST_TRAINING_COMPLETE_ACK;
+typedef enum DP_MSA_V_TIMING_OVERRIDE_EN {
+	MSA_V_TIMING_OVERRIDE_DISABLED                   = 0x0,
+	MSA_V_TIMING_OVERRIDE_ENABLED                    = 0x1,
+} DP_MSA_V_TIMING_OVERRIDE_EN;
+typedef enum DP_SEC_GSP0_PRIORITY {
+	SEC_GSP0_PRIORITY_LOW                            = 0x0,
+	SEC_GSP0_PRIORITY_HIGH                           = 0x1,
+} DP_SEC_GSP0_PRIORITY;
+typedef enum DP_SEC_GSP0_SEND {
+	NOT_SENT                                         = 0x0,
+	FORCE_SENT                                       = 0x1,
+} DP_SEC_GSP0_SEND;
+typedef enum DP_AUX_CONTROL_HPD_SEL {
+	DP_AUX_CONTROL_HPD1_SELECTED                     = 0x0,
+	DP_AUX_CONTROL_HPD2_SELECTED                     = 0x1,
+	DP_AUX_CONTROL_HPD3_SELECTED                     = 0x2,
+	DP_AUX_CONTROL_HPD4_SELECTED                     = 0x3,
+	DP_AUX_CONTROL_HPD5_SELECTED                     = 0x4,
+	DP_AUX_CONTROL_HPD6_SELECTED                     = 0x5,
+} DP_AUX_CONTROL_HPD_SEL;
+typedef enum DP_AUX_CONTROL_TEST_MODE {
+	DP_AUX_CONTROL_TEST_MODE_DISABLE                 = 0x0,
+	DP_AUX_CONTROL_TEST_MODE_ENABLE                  = 0x1,
+} DP_AUX_CONTROL_TEST_MODE;
+typedef enum DP_AUX_SW_CONTROL_SW_GO {
+	DP_AUX_SW_CONTROL_SW__NOT_GO                     = 0x0,
+	DP_AUX_SW_CONTROL_SW__GO                         = 0x1,
+} DP_AUX_SW_CONTROL_SW_GO;
+typedef enum DP_AUX_SW_CONTROL_LS_READ_TRIG {
+	DP_AUX_SW_CONTROL_LS_READ__NOT_TRIG              = 0x0,
+	DP_AUX_SW_CONTROL_LS_READ__TRIG                  = 0x1,
+} DP_AUX_SW_CONTROL_LS_READ_TRIG;
+typedef enum DP_AUX_ARB_CONTROL_ARB_PRIORITY {
+	DP_AUX_ARB_CONTROL_ARB_PRIORITY__GTC_LS_SW       = 0x0,
+	DP_AUX_ARB_CONTROL_ARB_PRIORITY__LS_GTC_SW       = 0x1,
+	DP_AUX_ARB_CONTROL_ARB_PRIORITY__SW_LS_GTC       = 0x2,
+	DP_AUX_ARB_CONTROL_ARB_PRIORITY__SW_GTC_LS       = 0x3,
+} DP_AUX_ARB_CONTROL_ARB_PRIORITY;
+typedef enum DP_AUX_ARB_CONTROL_USE_AUX_REG_REQ {
+	DP_AUX_ARB_CONTROL__NOT_USE_AUX_REG_REQ          = 0x0,
+	DP_AUX_ARB_CONTROL__USE_AUX_REG_REQ              = 0x1,
+} DP_AUX_ARB_CONTROL_USE_AUX_REG_REQ;
+typedef enum DP_AUX_ARB_CONTROL_DONE_USING_AUX_REG {
+	DP_AUX_ARB_CONTROL__DONE_NOT_USING_AUX_REG       = 0x0,
+	DP_AUX_ARB_CONTROL__DONE_USING_AUX_REG           = 0x1,
+} DP_AUX_ARB_CONTROL_DONE_USING_AUX_REG;
+typedef enum DP_AUX_INT_ACK {
+	DP_AUX_INT__NOT_ACK                              = 0x0,
+	DP_AUX_INT__ACK                                  = 0x1,
+} DP_AUX_INT_ACK;
+typedef enum DP_AUX_LS_UPDATE_ACK {
+	DP_AUX_INT_LS_UPDATE_NOT_ACK                     = 0x0,
+	DP_AUX_INT_LS_UPDATE_ACK                         = 0x1,
+} DP_AUX_LS_UPDATE_ACK;
+typedef enum DP_AUX_DPHY_TX_REF_CONTROL_TX_REF_SEL {
+	DP_AUX_DPHY_TX_REF_CONTROL_TX_REF_SEL__DIVIDED_SYM_CLK= 0x0,
+	DP_AUX_DPHY_TX_REF_CONTROL_TX_REF_SEL__FROM_DCCG_MICROSECOND_REF= 0x1,
+} DP_AUX_DPHY_TX_REF_CONTROL_TX_REF_SEL;
+typedef enum DP_AUX_DPHY_TX_REF_CONTROL_TX_RATE {
+	DP_AUX_DPHY_TX_REF_CONTROL_TX_RATE__1MHZ         = 0x0,
+	DP_AUX_DPHY_TX_REF_CONTROL_TX_RATE__2MHZ         = 0x1,
+	DP_AUX_DPHY_TX_REF_CONTROL_TX_RATE__4MHZ         = 0x2,
+	DP_AUX_DPHY_TX_REF_CONTROL_TX_RATE__8MHZ         = 0x3,
+} DP_AUX_DPHY_TX_REF_CONTROL_TX_RATE;
+typedef enum DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN {
+	DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN__0US        = 0x0,
+	DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN__8US        = 0x1,
+	DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN__16US       = 0x2,
+	DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN__24US       = 0x3,
+	DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN__32US       = 0x4,
+	DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN__40US       = 0x5,
+	DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN__48US       = 0x6,
+	DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN__56US       = 0x7,
+} DP_AUX_DPHY_TX_CONTROL_PRECHARGE_LEN;
+typedef enum DP_AUX_DPHY_TX_CONTROL_MODE_DET_CHECK_DELAY {
+	DP_AUX_DPHY_TX_CONTROL_MODE_DET_CHECK_DELAY__0   = 0x0,
+	DP_AUX_DPHY_TX_CONTROL_MODE_DET_CHECK_DELAY__16US= 0x1,
+	DP_AUX_DPHY_TX_CONTROL_MODE_DET_CHECK_DELAY__32US= 0x2,
+	DP_AUX_DPHY_TX_CONTROL_MODE_DET_CHECK_DELAY__64US= 0x3,
+	DP_AUX_DPHY_TX_CONTROL_MODE_DET_CHECK_DELAY__128US= 0x4,
+	DP_AUX_DPHY_TX_CONTROL_MODE_DET_CHECK_DELAY__256US= 0x5,
+} DP_AUX_DPHY_TX_CONTROL_MODE_DET_CHECK_DELAY;
+typedef enum DP_AUX_DPHY_RX_CONTROL_START_WINDOW {
+	DP_AUX_DPHY_RX_CONTROL_START_WINDOW__1TO2_PERIOD = 0x0,
+	DP_AUX_DPHY_RX_CONTROL_START_WINDOW__1TO4_PERIOD = 0x1,
+	DP_AUX_DPHY_RX_CONTROL_START_WINDOW__1TO8_PERIOD = 0x2,
+	DP_AUX_DPHY_RX_CONTROL_START_WINDOW__1TO16_PERIOD= 0x3,
+	DP_AUX_DPHY_RX_CONTROL_START_WINDOW__1TO32_PERIOD= 0x4,
+	DP_AUX_DPHY_RX_CONTROL_START_WINDOW__1TO64_PERIOD= 0x5,
+	DP_AUX_DPHY_RX_CONTROL_START_WINDOW__1TO128_PERIOD= 0x6,
+	DP_AUX_DPHY_RX_CONTROL_START_WINDOW__1TO256_PERIOD= 0x7,
+} DP_AUX_DPHY_RX_CONTROL_START_WINDOW;
+typedef enum DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW {
+	DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW__1TO2_PERIOD= 0x0,
+	DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW__1TO4_PERIOD= 0x1,
+	DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW__1TO8_PERIOD= 0x2,
+	DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW__1TO16_PERIOD= 0x3,
+	DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW__1TO32_PERIOD= 0x4,
+	DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW__1TO64_PERIOD= 0x5,
+	DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW__1TO128_PERIOD= 0x6,
+	DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW__1TO256_PERIOD= 0x7,
+} DP_AUX_DPHY_RX_CONTROL_RECEIVE_WINDOW;
+typedef enum DP_AUX_DPHY_RX_CONTROL_HALF_SYM_DETECT_LEN {
+	DP_AUX_DPHY_RX_CONTROL_HALF_SYM_DETECT_LEN__6_EDGES= 0x0,
+	DP_AUX_DPHY_RX_CONTROL_HALF_SYM_DETECT_LEN__10_EDGES= 0x1,
+	DP_AUX_DPHY_RX_CONTROL_HALF_SYM_DETECT_LEN__18_EDGES= 0x2,
+	DP_AUX_DPHY_RX_CONTROL_HALF_SYM_DETECT_LEN__RESERVED= 0x3,
+} DP_AUX_DPHY_RX_CONTROL_HALF_SYM_DETECT_LEN;
+typedef enum DP_AUX_DPHY_RX_CONTROL_ALLOW_BELOW_THRESHOLD_PHASE_DETECT {
+	DP_AUX_DPHY_RX_CONTROL__NOT_ALLOW_BELOW_THRESHOLD_PHASE_DETECT= 0x0,
+	DP_AUX_DPHY_RX_CONTROL__ALLOW_BELOW_THRESHOLD_PHASE_DETECT= 0x1,
+} DP_AUX_DPHY_RX_CONTROL_ALLOW_BELOW_THRESHOLD_PHASE_DETECT;
+typedef enum DP_AUX_DPHY_RX_CONTROL_ALLOW_BELOW_THRESHOLD_START {
+	DP_AUX_DPHY_RX_CONTROL__NOT_ALLOW_BELOW_THRESHOLD_START= 0x0,
+	DP_AUX_DPHY_RX_CONTROL__ALLOW_BELOW_THRESHOLD_START= 0x1,
+} DP_AUX_DPHY_RX_CONTROL_ALLOW_BELOW_THRESHOLD_START;
+typedef enum DP_AUX_DPHY_RX_CONTROL_ALLOW_BELOW_THRESHOLD_STOP {
+	DP_AUX_DPHY_RX_CONTROL__NOT_ALLOW_BELOW_THRESHOLD_STOP= 0x0,
+	DP_AUX_DPHY_RX_CONTROL__ALLOW_BELOW_THRESHOLD_STOP= 0x1,
+} DP_AUX_DPHY_RX_CONTROL_ALLOW_BELOW_THRESHOLD_STOP;
+typedef enum DP_AUX_DPHY_RX_CONTROL_PHASE_DETECT_LEN {
+	DP_AUX_DPHY_RX_CONTROL_PHASE_DETECT_LEN__2_HALF_SYMBOLS= 0x0,
+	DP_AUX_DPHY_RX_CONTROL_PHASE_DETECT_LEN__4_HALF_SYMBOLS= 0x1,
+	DP_AUX_DPHY_RX_CONTROL_PHASE_DETECT_LEN__6_HALF_SYMBOLS= 0x2,
+	DP_AUX_DPHY_RX_CONTROL_PHASE_DETECT_LEN__8_HALF_SYMBOLS= 0x3,
+} DP_AUX_DPHY_RX_CONTROL_PHASE_DETECT_LEN;
+typedef enum DP_AUX_DPHY_RX_CONTROL_TIMEOUT_LEN {
+	DP_AUX_DPHY_RX_CONTROL_TIMEOUT_LEN_450US         = 0x0,
+	DP_AUX_DPHY_RX_CONTROL_TIMEOUT_LEN_500US         = 0x1,
+	DP_AUX_DPHY_RX_CONTROL_TIMEOUT_LEN_550US      

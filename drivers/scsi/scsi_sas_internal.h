@@ -1,42 +1,59 @@
-#ifndef _SCSI_SAS_INTERNAL_H
-#define _SCSI_SAS_INTERNAL_H
+ice_alloc_chan_resources	= moxart_alloc_chan_resources;
+	dma->device_free_chan_resources		= moxart_free_chan_resources;
+	dma->device_issue_pending		= moxart_issue_pending;
+	dma->device_tx_status			= moxart_tx_status;
+	dma->device_config			= moxart_slave_config;
+	dma->device_terminate_all		= moxart_terminate_all;
+	dma->dev				= dev;
 
-#define SAS_HOST_ATTRS		0
-#define SAS_PHY_ATTRS		17
-#define SAS_PORT_ATTRS		1
-#define SAS_RPORT_ATTRS		7
-#define SAS_END_DEV_ATTRS	5
-#define SAS_EXPANDER_ATTRS	7
+	INIT_LIST_HEAD(&dma->channels);
+}
 
-struct sas_internal {
-	struct scsi_transport_template t;
-	struct sas_function_template *f;
-	struct sas_domain_function_template *dft;
+static irqreturn_t moxart_dma_interrupt(int irq, void *devid)
+{
+	struct moxart_dmadev *mc = devid;
+	struct moxart_chan *ch = &mc->slave_chans[0];
+	unsigned int i;
+	unsigned long flags;
+	u32 ctrl;
 
-	struct device_attribute private_host_attrs[SAS_HOST_ATTRS];
-	struct device_attribute private_phy_attrs[SAS_PHY_ATTRS];
-	struct device_attribute private_port_attrs[SAS_PORT_ATTRS];
-	struct device_attribute private_rphy_attrs[SAS_RPORT_ATTRS];
-	struct device_attribute private_end_dev_attrs[SAS_END_DEV_ATTRS];
-	struct device_attribute private_expander_attrs[SAS_EXPANDER_ATTRS];
+	dev_dbg(chan2dev(&ch->vc.chan), "%s\n", __func__);
 
-	struct transport_container phy_attr_cont;
-	struct transport_container port_attr_cont;
-	struct transport_container rphy_attr_cont;
-	struct transport_container end_dev_attr_cont;
-	struct transport_container expander_attr_cont;
+	for (i = 0; i < APB_DMA_MAX_CHANNEL; i++, ch++) {
+		if (!ch->allocated)
+			continue;
 
-	/*
-	 * The array of null terminated pointers to attributes
-	 * needed by scsi_sysfs.c
-	 */
-	struct device_attribute *host_attrs[SAS_HOST_ATTRS + 1];
-	struct device_attribute *phy_attrs[SAS_PHY_ATTRS + 1];
-	struct device_attribute *port_attrs[SAS_PORT_ATTRS + 1];
-	struct device_attribute *rphy_attrs[SAS_RPORT_ATTRS + 1];
-	struct device_attribute *end_dev_attrs[SAS_END_DEV_ATTRS + 1];
-	struct device_attribute *expander_attrs[SAS_EXPANDER_ATTRS + 1];
-};
-#define to_sas_internal(tmpl)	container_of(tmpl, struct sas_internal, t)
+		ctrl = readl(ch->base + REG_OFF_CTRL);
 
-#endif
+		dev_dbg(chan2dev(&ch->vc.chan), "%s: ch=%p ch->base=%p ctrl=%x\n",
+			__func__, ch, ch->base, ctrl);
+
+		if (ctrl & APB_DMA_FIN_INT_STS) {
+			ctrl &= ~APB_DMA_FIN_INT_STS;
+			if (ch->desc) {
+				spin_lock_irqsave(&ch->vc.lock, flags);
+				if (++ch->sgidx < ch->desc->sglen) {
+					moxart_dma_start_sg(ch, ch->sgidx);
+				} else {
+					vchan_cookie_complete(&ch->desc->vd);
+					moxart_dma_start_desc(&ch->vc.chan);
+				}
+				spin_unlock_irqrestore(&ch->vc.lock, flags);
+			}
+		}
+
+		if (ctrl & APB_DMA_ERR_INT_STS) {
+			ctrl &= ~APB_DMA_ERR_INT_STS;
+			ch->error = 1;
+		}
+
+		writel(ctrl, ch->base + REG_OFF_CTRL);
+	}
+
+	return IRQ_HANDLED;
+}
+
+static int moxart_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct device_node

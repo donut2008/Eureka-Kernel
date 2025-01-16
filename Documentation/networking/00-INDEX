@@ -1,238 +1,299 @@
-00-INDEX
-	- this file
-3c509.txt
-	- information on the 3Com Etherlink III Series Ethernet cards.
-6pack.txt
-	- info on the 6pack protocol, an alternative to KISS for AX.25
-LICENSE.qla3xxx
-	- GPLv2 for QLogic Linux Networking HBA Driver
-LICENSE.qlge
-	- GPLv2 for QLogic Linux qlge NIC Driver
-LICENSE.qlcnic
-	- GPLv2 for QLogic Linux qlcnic NIC Driver
-Makefile
-	- Makefile for docsrc.
-PLIP.txt
-	- PLIP: The Parallel Line Internet Protocol device driver
-README.ipw2100
-	- README for the Intel PRO/Wireless 2100 driver.
-README.ipw2200
-	- README for the Intel PRO/Wireless 2915ABG and 2200BG driver.
-README.sb1000
-	- info on General Instrument/NextLevel SURFboard1000 cable modem.
-alias.txt
-	- info on using alias network devices.
-altera_tse.txt
-	- Altera Triple-Speed Ethernet controller.
-arcnet-hardware.txt
-	- tons of info on ARCnet, hubs, jumper settings for ARCnet cards, etc.
-arcnet.txt
-	- info on the using the ARCnet driver itself.
-atm.txt
-	- info on where to get ATM programs and support for Linux.
-ax25.txt
-	- info on using AX.25 and NET/ROM code for Linux
-batman-adv.txt
-	- B.A.T.M.A.N routing protocol on top of layer 2 Ethernet Frames.
-baycom.txt
-	- info on the driver for Baycom style amateur radio modems
-bonding.txt
-	- Linux Ethernet Bonding Driver HOWTO: link aggregation in Linux.
-bridge.txt
-	- where to get user space programs for ethernet bridging with Linux.
-can.txt
-	- documentation on CAN protocol family.
-cdc_mbim.txt
-	- 3G/LTE USB modem (Mobile Broadband Interface Model)
-cops.txt
-	- info on the COPS LocalTalk Linux driver
-cs89x0.txt
-	- the Crystal LAN (CS8900/20-based) Ethernet ISA adapter driver
-cxacru.txt
-	- Conexant AccessRunner USB ADSL Modem
-cxacru-cf.py
-	- Conexant AccessRunner USB ADSL Modem configuration file parser
-cxgb.txt
-	- Release Notes for the Chelsio N210 Linux device driver.
-dccp.txt
-	- the Datagram Congestion Control Protocol (DCCP) (RFC 4340..42).
-dctcp.txt
-	- DataCenter TCP congestion control
-de4x5.txt
-	- the Digital EtherWORKS DE4?? and DE5?? PCI Ethernet driver
-decnet.txt
-	- info on using the DECnet networking layer in Linux.
-dl2k.txt
-	- README for D-Link DL2000-based Gigabit Ethernet Adapters (dl2k.ko).
-dm9000.txt
-	- README for the Simtec DM9000 Network driver.
-dmfe.txt
-	- info on the Davicom DM9102(A)/DM9132/DM9801 fast ethernet driver.
-dns_resolver.txt
-	- The DNS resolver module allows kernel servies to make DNS queries.
-driver.txt
-	- Softnet driver issues.
-e100.txt
-	- info on Intel's EtherExpress PRO/100 line of 10/100 boards
-e1000.txt
-	- info on Intel's E1000 line of gigabit ethernet boards
-e1000e.txt
-	- README for the Intel Gigabit Ethernet Driver (e1000e).
-eql.txt
-	- serial IP load balancing
-fib_trie.txt
-	- Level Compressed Trie (LC-trie) notes: a structure for routing.
-filter.txt
-	- Linux Socket Filtering
-fore200e.txt
-	- FORE Systems PCA-200E/SBA-200E ATM NIC driver info.
-framerelay.txt
-	- info on using Frame Relay/Data Link Connection Identifier (DLCI).
-gen_stats.txt
-	- Generic networking statistics for netlink users.
-generic-hdlc.txt
-	- The generic High Level Data Link Control (HDLC) layer.
-generic_netlink.txt
-	- info on Generic Netlink
-gianfar.txt
-	- Gianfar Ethernet Driver.
-i40e.txt
-	- README for the Intel Ethernet Controller XL710 Driver (i40e).
-i40evf.txt
-	- Short note on the Driver for the Intel(R) XL710 X710 Virtual Function
-ieee802154.txt
-	- Linux IEEE 802.15.4 implementation, API and drivers
-igb.txt
-	- README for the Intel Gigabit Ethernet Driver (igb).
-igbvf.txt
-	- README for the Intel Gigabit Ethernet Driver (igbvf).
-ip-sysctl.txt
-	- /proc/sys/net/ipv4/* variables
-ip_dynaddr.txt
-	- IP dynamic address hack e.g. for auto-dialup links
-ipddp.txt
-	- AppleTalk-IP Decapsulation and AppleTalk-IP Encapsulation
-iphase.txt
-	- Interphase PCI ATM (i)Chip IA Linux driver info.
-ipsec.txt
-	- Note on not compressing IPSec payload and resulting failed policy check.
-ipv6.txt
-	- Options to the ipv6 kernel module.
-ipvs-sysctl.txt
-	- Per-inode explanation of the /proc/sys/net/ipv4/vs interface.
-irda.txt
-	- where to get IrDA (infrared) utilities and info for Linux.
-ixgb.txt
-	- README for the Intel 10 Gigabit Ethernet Driver (ixgb).
-ixgbe.txt
-	- README for the Intel 10 Gigabit Ethernet Driver (ixgbe).
-ixgbevf.txt
-	- README for the Intel Virtual Function (VF) Driver (ixgbevf).
-l2tp.txt
-	- User guide to the L2TP tunnel protocol.
-lapb-module.txt
-	- programming information of the LAPB module.
-ltpc.txt
-	- the Apple or Farallon LocalTalk PC card driver
-mac80211-auth-assoc-deauth.txt
-	- authentication and association / deauth-disassoc with max80211
-mac80211-injection.txt
-	- HOWTO use packet injection with mac80211
-multiqueue.txt
-	- HOWTO for multiqueue network device support.
-netconsole.txt
-	- The network console module netconsole.ko: configuration and notes.
-netdev-FAQ.txt
-	- FAQ describing how to submit net changes to netdev mailing list.
-netdev-features.txt
-	- Network interface features API description.
-netdevices.txt
-	- info on network device driver functions exported to the kernel.
-netif-msg.txt
-	- Design of the network interface message level setting (NETIF_MSG_*).
-netlink_mmap.txt
-	- memory mapped I/O with netlink
-nf_conntrack-sysctl.txt
-	- list of netfilter-sysctl knobs.
-nfc.txt
-	- The Linux Near Field Communication (NFS) subsystem.
-openvswitch.txt
-	- Open vSwitch developer documentation.
-operstates.txt
-	- Overview of network interface operational states.
-packet_mmap.txt
-	- User guide to memory mapped packet socket rings (PACKET_[RT]X_RING).
-phonet.txt
-	- The Phonet packet protocol used in Nokia cellular modems.
-phy.txt
-	- The PHY abstraction layer.
-pktgen.txt
-	- User guide to the kernel packet generator (pktgen.ko).
-policy-routing.txt
-	- IP policy-based routing
-ppp_generic.txt
-	- Information about the generic PPP driver.
-proc_net_tcp.txt
-	- Per inode overview of the /proc/net/tcp and /proc/net/tcp6 interfaces.
-radiotap-headers.txt
-	- Background on radiotap headers.
-ray_cs.txt
-	- Raylink Wireless LAN card driver info.
-rds.txt
-	- Background on the reliable, ordered datagram delivery method RDS.
-regulatory.txt
-	- Overview of the Linux wireless regulatory infrastructure.
-rxrpc.txt
-	- Guide to the RxRPC protocol.
-s2io.txt
-	- Release notes for Neterion Xframe I/II 10GbE driver.
-scaling.txt
-	- Explanation of network scaling techniques: RSS, RPS, RFS, aRFS, XPS.
-sctp.txt
-	- Notes on the Linux kernel implementation of the SCTP protocol.
-secid.txt
-	- Explanation of the secid member in flow structures.
-skfp.txt
-	- SysKonnect FDDI (SK-5xxx, Compaq Netelligent) driver info.
-smc9.txt
-	- the driver for SMC's 9000 series of Ethernet cards
-spider_net.txt
-	- README for the Spidernet Driver (as found in PS3 / Cell BE).
-stmmac.txt
-	- README for the STMicro Synopsys Ethernet driver.
-tc-actions-env-rules.txt
-	- rules for traffic control (tc) actions.
-timestamping.txt
-	- overview of network packet timestamping variants.
-tcp.txt
-	- short blurb on how TCP output takes place.
-tcp-thin.txt
-	- kernel tuning options for low rate 'thin' TCP streams.
-team.txt
-	- pointer to information for ethernet teaming devices.
-tlan.txt
-	- ThunderLAN (Compaq Netelligent 10/100, Olicom OC-2xxx) driver info.
-tproxy.txt
-	- Transparent proxy support user guide.
-tuntap.txt
-	- TUN/TAP device driver, allowing user space Rx/Tx of packets.
-udplite.txt
-	- UDP-Lite protocol (RFC 3828) introduction.
-vortex.txt
-	- info on using 3Com Vortex (3c590, 3c592, 3c595, 3c597) Ethernet cards.
-vxge.txt
-	- README for the Neterion X3100 PCIe Server Adapter.
-vxlan.txt
-	- Virtual extensible LAN overview
-x25.txt
-	- general info on X.25 development.
-x25-iface.txt
-	- description of the X.25 Packet Layer to LAPB device interface.
-xfrm_proc.txt
-	- description of the statistics package for XFRM.
-xfrm_sync.txt
-	- sync patches for XFRM enable migration of an SA between hosts.
-xfrm_sysctl.txt
-	- description of the XFRM configuration options.
-z8530drv.txt
-	- info about Linux driver for Z8530 based HDLC cards for AX.25
+/*
+ * Marvell MV64x60 Memory Controller kernel module for PPC platforms
+ *
+ * Author: Dave Jiang <djiang@mvista.com>
+ *
+ * 2006-2007 (c) MontaVista Software, Inc. This file is licensed under
+ * the terms of the GNU General Public License version 2. This program
+ * is licensed "as is" without any warranty of any kind, whether express
+ * or implied.
+ *
+ */
+
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/edac.h>
+#include <linux/gfp.h>
+
+#include "edac_core.h"
+#include "edac_module.h"
+#include "mv64x60_edac.h"
+
+static const char *mv64x60_ctl_name = "MV64x60";
+static int edac_dev_idx;
+static int edac_pci_idx;
+static int edac_mc_idx;
+
+/*********************** PCI err device **********************************/
+#ifdef CONFIG_PCI
+static void mv64x60_pci_check(struct edac_pci_ctl_info *pci)
+{
+	struct mv64x60_pci_pdata *pdata = pci->pvt_info;
+	u32 cause;
+
+	cause = in_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_CAUSE);
+	if (!cause)
+		return;
+
+	printk(KERN_ERR "Error in PCI %d Interface\n", pdata->pci_hose);
+	printk(KERN_ERR "Cause register: 0x%08x\n", cause);
+	printk(KERN_ERR "Address Low: 0x%08x\n",
+	       in_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_ADDR_LO));
+	printk(KERN_ERR "Address High: 0x%08x\n",
+	       in_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_ADDR_HI));
+	printk(KERN_ERR "Attribute: 0x%08x\n",
+	       in_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_ATTR));
+	printk(KERN_ERR "Command: 0x%08x\n",
+	       in_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_CMD));
+	out_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_CAUSE, ~cause);
+
+	if (cause & MV64X60_PCI_PE_MASK)
+		edac_pci_handle_pe(pci, pci->ctl_name);
+
+	if (!(cause & MV64X60_PCI_PE_MASK))
+		edac_pci_handle_npe(pci, pci->ctl_name);
+}
+
+static irqreturn_t mv64x60_pci_isr(int irq, void *dev_id)
+{
+	struct edac_pci_ctl_info *pci = dev_id;
+	struct mv64x60_pci_pdata *pdata = pci->pvt_info;
+	u32 val;
+
+	val = in_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_CAUSE);
+	if (!val)
+		return IRQ_NONE;
+
+	mv64x60_pci_check(pci);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * Bit 0 of MV64x60_PCIx_ERR_MASK does not exist on the 64360 and because of
+ * errata FEr-#11 and FEr-##16 for the 64460, it should be 0 on that chip as
+ * well.  IOW, don't set bit 0.
+ */
+
+/* Erratum FEr PCI-#16: clear bit 0 of PCI SERRn Mask reg. */
+static int __init mv64x60_pci_fixup(struct platform_device *pdev)
+{
+	struct resource *r;
+	void __iomem *pci_serr;
+
+	r = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!r) {
+		printk(KERN_ERR "%s: Unable to get resource for "
+		       "PCI err regs\n", __func__);
+		return -ENOENT;
+	}
+
+	pci_serr = ioremap(r->start, resource_size(r));
+	if (!pci_serr)
+		return -ENOMEM;
+
+	out_le32(pci_serr, in_le32(pci_serr) & ~0x1);
+	iounmap(pci_serr);
+
+	return 0;
+}
+
+static int mv64x60_pci_err_probe(struct platform_device *pdev)
+{
+	struct edac_pci_ctl_info *pci;
+	struct mv64x60_pci_pdata *pdata;
+	struct resource *r;
+	int res = 0;
+
+	if (!devres_open_group(&pdev->dev, mv64x60_pci_err_probe, GFP_KERNEL))
+		return -ENOMEM;
+
+	pci = edac_pci_alloc_ctl_info(sizeof(*pdata), "mv64x60_pci_err");
+	if (!pci)
+		return -ENOMEM;
+
+	pdata = pci->pvt_info;
+
+	pdata->pci_hose = pdev->id;
+	pdata->name = "mpc85xx_pci_err";
+	pdata->irq = NO_IRQ;
+	platform_set_drvdata(pdev, pci);
+	pci->dev = &pdev->dev;
+	pci->dev_name = dev_name(&pdev->dev);
+	pci->mod_name = EDAC_MOD_STR;
+	pci->ctl_name = pdata->name;
+
+	if (edac_op_state == EDAC_OPSTATE_POLL)
+		pci->edac_check = mv64x60_pci_check;
+
+	pdata->edac_idx = edac_pci_idx++;
+
+	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!r) {
+		printk(KERN_ERR "%s: Unable to get resource for "
+		       "PCI err regs\n", __func__);
+		res = -ENOENT;
+		goto err;
+	}
+
+	if (!devm_request_mem_region(&pdev->dev,
+				     r->start,
+				     resource_size(r),
+				     pdata->name)) {
+		printk(KERN_ERR "%s: Error while requesting mem region\n",
+		       __func__);
+		res = -EBUSY;
+		goto err;
+	}
+
+	pdata->pci_vbase = devm_ioremap(&pdev->dev,
+					r->start,
+					resource_size(r));
+	if (!pdata->pci_vbase) {
+		printk(KERN_ERR "%s: Unable to setup PCI err regs\n", __func__);
+		res = -ENOMEM;
+		goto err;
+	}
+
+	res = mv64x60_pci_fixup(pdev);
+	if (res < 0) {
+		printk(KERN_ERR "%s: PCI fixup failed\n", __func__);
+		goto err;
+	}
+
+	out_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_CAUSE, 0);
+	out_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_MASK, 0);
+	out_le32(pdata->pci_vbase + MV64X60_PCI_ERROR_MASK,
+		 MV64X60_PCIx_ERR_MASK_VAL);
+
+	if (edac_pci_add_device(pci, pdata->edac_idx) > 0) {
+		edac_dbg(3, "failed edac_pci_add_device()\n");
+		goto err;
+	}
+
+	if (edac_op_state == EDAC_OPSTATE_INT) {
+		pdata->irq = platform_get_irq(pdev, 0);
+		res = devm_request_irq(&pdev->dev,
+				       pdata->irq,
+				       mv64x60_pci_isr,
+				       0,
+				       "[EDAC] PCI err",
+				       pci);
+		if (res < 0) {
+			printk(KERN_ERR "%s: Unable to request irq %d for "
+			       "MV64x60 PCI ERR\n", __func__, pdata->irq);
+			res = -ENODEV;
+			goto err2;
+		}
+		printk(KERN_INFO EDAC_MOD_STR " acquired irq %d for PCI Err\n",
+		       pdata->irq);
+	}
+
+	devres_remove_group(&pdev->dev, mv64x60_pci_err_probe);
+
+	/* get this far and it's successful */
+	edac_dbg(3, "success\n");
+
+	return 0;
+
+err2:
+	edac_pci_del_device(&pdev->dev);
+err:
+	edac_pci_free_ctl_info(pci);
+	devres_release_group(&pdev->dev, mv64x60_pci_err_probe);
+	return res;
+}
+
+static int mv64x60_pci_err_remove(struct platform_device *pdev)
+{
+	struct edac_pci_ctl_info *pci = platform_get_drvdata(pdev);
+
+	edac_dbg(0, "\n");
+
+	edac_pci_del_device(&pdev->dev);
+
+	edac_pci_free_ctl_info(pci);
+
+	return 0;
+}
+
+static struct platform_driver mv64x60_pci_err_driver = {
+	.probe = mv64x60_pci_err_probe,
+	.remove = mv64x60_pci_err_remove,
+	.driver = {
+		   .name = "mv64x60_pci_err",
+	}
+};
+
+#endif /* CONFIG_PCI */
+
+/*********************** SRAM err device **********************************/
+static void mv64x60_sram_check(struct edac_device_ctl_info *edac_dev)
+{
+	struct mv64x60_sram_pdata *pdata = edac_dev->pvt_info;
+	u32 cause;
+
+	cause = in_le32(pdata->sram_vbase + MV64X60_SRAM_ERR_CAUSE);
+	if (!cause)
+		return;
+
+	printk(KERN_ERR "Error in internal SRAM\n");
+	printk(KERN_ERR "Cause register: 0x%08x\n", cause);
+	printk(KERN_ERR "Address Low: 0x%08x\n",
+	       in_le32(pdata->sram_vbase + MV64X60_SRAM_ERR_ADDR_LO));
+	printk(KERN_ERR "Address High: 0x%08x\n",
+	       in_le32(pdata->sram_vbase + MV64X60_SRAM_ERR_ADDR_HI));
+	printk(KERN_ERR "Data Low: 0x%08x\n",
+	       in_le32(pdata->sram_vbase + MV64X60_SRAM_ERR_DATA_LO));
+	printk(KERN_ERR "Data High: 0x%08x\n",
+	       in_le32(pdata->sram_vbase + MV64X60_SRAM_ERR_DATA_HI));
+	printk(KERN_ERR "Parity: 0x%08x\n",
+	       in_le32(pdata->sram_vbase + MV64X60_SRAM_ERR_PARITY));
+	out_le32(pdata->sram_vbase + MV64X60_SRAM_ERR_CAUSE, 0);
+
+	edac_device_handle_ue(edac_dev, 0, 0, edac_dev->ctl_name);
+}
+
+static irqreturn_t mv64x60_sram_isr(int irq, void *dev_id)
+{
+	struct edac_device_ctl_info *edac_dev = dev_id;
+	struct mv64x60_sram_pdata *pdata = edac_dev->pvt_info;
+	u32 cause;
+
+	cause = in_le32(pdata->sram_vbase + MV64X60_SRAM_ERR_CAUSE);
+	if (!cause)
+		return IRQ_NONE;
+
+	mv64x60_sram_check(edac_dev);
+
+	return IRQ_HANDLED;
+}
+
+static int mv64x60_sram_err_probe(struct platform_device *pdev)
+{
+	struct edac_device_ctl_info *edac_dev;
+	struct mv64x60_sram_pdata *pdata;
+	struct resource *r;
+	int res = 0;
+
+	if (!devres_open_group(&pdev->dev, mv64x60_sram_err_probe, GFP_KERNEL))
+		return -ENOMEM;
+
+	edac_dev = edac_device_alloc_ctl_info(sizeof(*pdata),
+					      "sram", 1, NULL, 0, 0, NULL, 0,
+					      edac_dev_idx);
+	if (!edac_dev) {
+		devres_release_group(&pdev->dev, mv64x60_sram_err_probe);
+		return -ENOMEM;
+	}
+
+	pdata = edac_dev->pvt_info;
+	pdata->name = "mv64x60_sram_err";
+	pdata->irq = NO_IRQ;
+	edac_dev->dev = &pdev->dev;
+	platform_set_drvdata(pdev, edac_dev);
+	edac_dev->dev_name = dev_name(&pdev->dev);
+
+	r = platform_get_resource(pdev, IORESOURCE_M

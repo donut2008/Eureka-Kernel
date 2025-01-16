@@ -1,213 +1,373 @@
-Linux and the 3Com EtherLink III Series Ethercards (driver v1.18c and higher)
-----------------------------------------------------------------------------
+nfig_dword(pvt->pci_noncore,
+			       MC_CFG_CONTROL, 8);
 
-This file contains the instructions and caveats for v1.18c and higher versions
-of the 3c509 driver. You should not use the driver without reading this file.
-
-release 1.0
-28 February 2002
-Current maintainer (corrections to):
-  David Ruggiero <jdr@farfalle.com>
-
-----------------------------------------------------------------------------
-
-(0) Introduction
-
-The following are notes and information on using the 3Com EtherLink III series
-ethercards in Linux. These cards are commonly known by the most widely-used
-card's 3Com model number, 3c509. They are all 10mb/s ISA-bus cards and shouldn't
-be (but sometimes are) confused with the similarly-numbered PCI-bus "3c905"
-(aka "Vortex" or "Boomerang") series.  Kernel support for the 3c509 family is
-provided by the module 3c509.c, which has code to support all of the following
-models:
-
-  3c509 (original ISA card)
-  3c509B (later revision of the ISA card; supports full-duplex)
-  3c589 (PCMCIA)
-  3c589B (later revision of the 3c589; supports full-duplex)
-  3c579 (EISA)
-
-Large portions of this documentation were heavily borrowed from the guide
-written the original author of the 3c509 driver, Donald Becker. The master
-copy of that document, which contains notes on older versions of the driver,
-currently resides on Scyld web server: http://www.scyld.com/.
+	edac_dbg(0, "Error inject addr match 0x%016llx, ecc 0x%08x, inject 0x%08x\n",
+		 mask, pvt->inject.eccmask, injectmask);
 
 
-(1) Special Driver Features
+	return count;
+}
 
-Overriding card settings
+static ssize_t i7core_inject_enable_show(struct device *dev,
+					 struct device_attribute *mattr,
+					 char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	struct i7core_pvt *pvt = mci->pvt_info;
+	u32 injectmask;
 
-The driver allows boot- or load-time overriding of the card's detected IOADDR,
-IRQ, and transceiver settings, although this capability shouldn't generally be
-needed except to enable full-duplex mode (see below). An example of the syntax
-for LILO parameters for doing this:
+	if (!pvt->pci_ch[pvt->inject.channel][0])
+		return 0;
 
-    ether=10,0x310,3,0x3c509,eth0 
+	pci_read_config_dword(pvt->pci_ch[pvt->inject.channel][0],
+			       MC_CHANNEL_ERROR_INJECT, &injectmask);
 
-This configures the first found 3c509 card for IRQ 10, base I/O 0x310, and
-transceiver type 3 (10base2). The flag "0x3c509" must be set to avoid conflicts
-with other card types when overriding the I/O address. When the driver is
-loaded as a module, only the IRQ may be overridden. For example,
-setting two cards to IRQ10 and IRQ11 is done by using the irq module
-option:
+	edac_dbg(0, "Inject error read: 0x%018x\n", injectmask);
 
-   options 3c509 irq=10,11
+	if (injectmask & 0x0c)
+		pvt->inject.enable = 1;
 
+	return sprintf(data, "%d\n", pvt->inject.enable);
+}
 
-(2) Full-duplex mode
+#define DECLARE_COUNTER(param)					\
+static ssize_t i7core_show_counter_##param(			\
+	struct device *dev,					\
+	struct device_attribute *mattr,				\
+	char *data)						\
+{								\
+	struct mem_ctl_info *mci = dev_get_drvdata(dev);	\
+	struct i7core_pvt *pvt = mci->pvt_info;			\
+								\
+	edac_dbg(1, "\n");					\
+	if (!pvt->ce_count_available || (pvt->is_registered))	\
+		return sprintf(data, "data unavailable\n");	\
+	return sprintf(data, "%lu\n",				\
+			pvt->udimm_ce_count[param]);		\
+}
 
-The v1.18c driver added support for the 3c509B's full-duplex capabilities.
-In order to enable and successfully use full-duplex mode, three conditions
-must be met: 
+#define ATTR_COUNTER(param)					\
+	static DEVICE_ATTR(udimm##param, S_IRUGO | S_IWUSR,	\
+		    i7core_show_counter_##param,		\
+		    NULL)
 
-(a) You must have a Etherlink III card model whose hardware supports full-
-duplex operations. Currently, the only members of the 3c509 family that are
-positively known to support full-duplex are the 3c509B (ISA bus) and 3c589B
-(PCMCIA) cards. Cards without the "B" model designation do *not* support
-full-duplex mode; these include the original 3c509 (no "B"), the original
-3c589, the 3c529 (MCA bus), and the 3c579 (EISA bus).
+DECLARE_COUNTER(0);
+DECLARE_COUNTER(1);
+DECLARE_COUNTER(2);
 
-(b) You must be using your card's 10baseT transceiver (i.e., the RJ-45
-connector), not its AUI (thick-net) or 10base2 (thin-net/coax) interfaces.
-AUI and 10base2 network cabling is physically incapable of full-duplex
-operation.
+ATTR_COUNTER(0);
+ATTR_COUNTER(1);
+ATTR_COUNTER(2);
 
-(c) Most importantly, your 3c509B must be connected to a link partner that is
-itself full-duplex capable. This is almost certainly one of two things: a full-
-duplex-capable  Ethernet switch (*not* a hub), or a full-duplex-capable NIC on
-another system that's connected directly to the 3c509B via a crossover cable.
+/*
+ * inject_addrmatch device sysfs struct
+ */
 
-Full-duplex mode can be enabled using 'ethtool'.
- 
-/////Extremely important caution concerning full-duplex mode/////
-Understand that the 3c509B's hardware's full-duplex support is much more
-limited than that provide by more modern network interface cards. Although
-at the physical layer of the network it fully supports full-duplex operation,
-the card was designed before the current Ethernet auto-negotiation (N-way)
-spec was written. This means that the 3c509B family ***cannot and will not
-auto-negotiate a full-duplex connection with its link partner under any
-circumstances, no matter how it is initialized***. If the full-duplex mode
-of the 3c509B is enabled, its link partner will very likely need to be
-independently _forced_ into full-duplex mode as well; otherwise various nasty
-failures will occur - at the very least, you'll see massive numbers of packet
-collisions. This is one of very rare circumstances where disabling auto-
-negotiation and forcing the duplex mode of a network interface card or switch
-would ever be necessary or desirable.
+static struct attribute *i7core_addrmatch_attrs[] = {
+	&dev_attr_channel.attr,
+	&dev_attr_dimm.attr,
+	&dev_attr_rank.attr,
+	&dev_attr_bank.attr,
+	&dev_attr_page.attr,
+	&dev_attr_col.attr,
+	NULL
+};
 
+static struct attribute_group addrmatch_grp = {
+	.attrs	= i7core_addrmatch_attrs,
+};
 
-(3) Available Transceiver Types
+static const struct attribute_group *addrmatch_groups[] = {
+	&addrmatch_grp,
+	NULL
+};
 
-For versions of the driver v1.18c and above, the available transceiver types are:
- 
-0  transceiver type from EEPROM config (normally 10baseT); force half-duplex
-1  AUI (thick-net / DB15 connector)
-2  (undefined)
-3  10base2 (thin-net == coax / BNC connector)
-4  10baseT (RJ-45 connector); force half-duplex mode
-8  transceiver type and duplex mode taken from card's EEPROM config settings
-12 10baseT (RJ-45 connector); force full-duplex mode
+static void addrmatch_release(struct device *device)
+{
+	edac_dbg(1, "Releasing device %s\n", dev_name(device));
+	kfree(device);
+}
 
-Prior to driver version 1.18c, only transceiver codes 0-4 were supported. Note
-that the new transceiver codes 8 and 12 are the *only* ones that will enable
-full-duplex mode, no matter what the card's detected EEPROM settings might be.
-This insured that merely upgrading the driver from an earlier version would
-never automatically enable full-duplex mode in an existing installation;
-it must always be explicitly enabled via one of these code in order to be
-activated.
+static struct device_type addrmatch_type = {
+	.groups		= addrmatch_groups,
+	.release	= addrmatch_release,
+};
 
-The transceiver type can be changed using 'ethtool'.
-  
+/*
+ * all_channel_counts sysfs struct
+ */
 
-(4a) Interpretation of error messages and common problems
+static struct attribute *i7core_udimm_counters_attrs[] = {
+	&dev_attr_udimm0.attr,
+	&dev_attr_udimm1.attr,
+	&dev_attr_udimm2.attr,
+	NULL
+};
 
-Error Messages
+static struct attribute_group all_channel_counts_grp = {
+	.attrs	= i7core_udimm_counters_attrs,
+};
 
-eth0: Infinite loop in interrupt, status 2011. 
-These are "mostly harmless" message indicating that the driver had too much
-work during that interrupt cycle. With a status of 0x2011 you are receiving
-packets faster than they can be removed from the card. This should be rare
-or impossible in normal operation. Possible causes of this error report are:
- 
-   - a "green" mode enabled that slows the processor down when there is no
-     keyboard activity. 
+static const struct attribute_group *all_channel_counts_groups[] = {
+	&all_channel_counts_grp,
+	NULL
+};
 
-   - some other device or device driver hogging the bus or disabling interrupts.
-     Check /proc/interrupts for excessive interrupt counts. The timer tick
-     interrupt should always be incrementing faster than the others. 
+static void all_channel_counts_release(struct device *device)
+{
+	edac_dbg(1, "Releasing device %s\n", dev_name(device));
+	kfree(device);
+}
 
-No received packets 
-If a 3c509, 3c562 or 3c589 can successfully transmit packets, but never
-receives packets (as reported by /proc/net/dev or 'ifconfig') you likely
-have an interrupt line problem. Check /proc/interrupts to verify that the
-card is actually generating interrupts. If the interrupt count is not
-increasing you likely have a physical conflict with two devices trying to
-use the same ISA IRQ line. The common conflict is with a sound card on IRQ10
-or IRQ5, and the easiest solution is to move the 3c509 to a different
-interrupt line. If the device is receiving packets but 'ping' doesn't work,
-you have a routing problem.
+static struct device_type all_channel_counts_type = {
+	.groups		= all_channel_counts_groups,
+	.release	= all_channel_counts_release,
+};
 
-Tx Carrier Errors Reported in /proc/net/dev 
-If an EtherLink III appears to transmit packets, but the "Tx carrier errors"
-field in /proc/net/dev increments as quickly as the Tx packet count, you
-likely have an unterminated network or the incorrect media transceiver selected. 
+/*
+ * inject sysfs attributes
+ */
 
-3c509B card is not detected on machines with an ISA PnP BIOS. 
-While the updated driver works with most PnP BIOS programs, it does not work
-with all. This can be fixed by disabling PnP support using the 3Com-supplied
-setup program. 
+static DEVICE_ATTR(inject_section, S_IRUGO | S_IWUSR,
+		   i7core_inject_section_show, i7core_inject_section_store);
 
-3c509 card is not detected on overclocked machines 
-Increase the delay time in id_read_eeprom() from the current value, 500,
-to an absurdly high value, such as 5000. 
-
-
-(4b) Decoding Status and Error Messages
-
-The bits in the main status register are: 
-
-value 	description
-0x01 	Interrupt latch
-0x02 	Tx overrun, or Rx underrun
-0x04 	Tx complete
-0x08 	Tx FIFO room available
-0x10 	A complete Rx packet has arrived
-0x20 	A Rx packet has started to arrive
-0x40 	The driver has requested an interrupt
-0x80 	Statistics counter nearly full
-
-The bits in the transmit (Tx) status word are: 
-
-value 	description
-0x02 	Out-of-window collision.
-0x04 	Status stack overflow (normally impossible).
-0x08 	16 collisions.
-0x10 	Tx underrun (not enough PCI bus bandwidth).
-0x20 	Tx jabber.
-0x40 	Tx interrupt requested.
-0x80 	Status is valid (this should always be set).
+static DEVICE_ATTR(inject_type, S_IRUGO | S_IWUSR,
+		   i7core_inject_type_show, i7core_inject_type_store);
 
 
-When a transmit error occurs the driver produces a status message such as 
+static DEVICE_ATTR(inject_eccmask, S_IRUGO | S_IWUSR,
+		   i7core_inject_eccmask_show, i7core_inject_eccmask_store);
 
-   eth0: Transmit error, Tx status register 82
+static DEVICE_ATTR(inject_enable, S_IRUGO | S_IWUSR,
+		   i7core_inject_enable_show, i7core_inject_enable_store);
 
-The two values typically seen here are:
+static struct attribute *i7core_dev_attrs[] = {
+	&dev_attr_inject_section.attr,
+	&dev_attr_inject_type.attr,
+	&dev_attr_inject_eccmask.attr,
+	&dev_attr_inject_enable.attr,
+	NULL
+};
 
-0x82 
-Out of window collision. This typically occurs when some other Ethernet
-host is incorrectly set to full duplex on a half duplex network. 
+ATTRIBUTE_GROUPS(i7core_dev);
 
-0x88 
-16 collisions. This typically occurs when the network is exceptionally busy
-or when another host doesn't correctly back off after a collision. If this
-error is mixed with 0x82 errors it is the result of a host incorrectly set
-to full duplex (see above).
+static int i7core_create_sysfs_devices(struct mem_ctl_info *mci)
+{
+	struct i7core_pvt *pvt = mci->pvt_info;
+	int rc;
 
-Both of these errors are the result of network problems that should be
-corrected. They do not represent driver malfunction.
+	pvt->addrmatch_dev = kzalloc(sizeof(*pvt->addrmatch_dev), GFP_KERNEL);
+	if (!pvt->addrmatch_dev)
+		return -ENOMEM;
 
+	pvt->addrmatch_dev->type = &addrmatch_type;
+	pvt->addrmatch_dev->bus = mci->dev.bus;
+	device_initialize(pvt->addrmatch_dev);
+	pvt->addrmatch_dev->parent = &mci->dev;
+	dev_set_name(pvt->addrmatch_dev, "inject_addrmatch");
+	dev_set_drvdata(pvt->addrmatch_dev, mci);
 
-(5) Revision history (this file)
+	edac_dbg(1, "creating %s\n", dev_name(pvt->addrmatch_dev));
 
-28Feb02 v1.0  DR   New; major portions based on Becker original 3c509 docs
+	rc = device_add(pvt->addrmatch_dev);
+	if (rc < 0)
+		goto err_put_addrmatch;
 
+	if (!pvt->is_registered) {
+		pvt->chancounts_dev = kzalloc(sizeof(*pvt->chancounts_dev),
+					      GFP_KERNEL);
+		if (!pvt->chancounts_dev) {
+			rc = -ENOMEM;
+			goto err_del_addrmatch;
+		}
+
+		pvt->chancounts_dev->type = &all_channel_counts_type;
+		pvt->chancounts_dev->bus = mci->dev.bus;
+		device_initialize(pvt->chancounts_dev);
+		pvt->chancounts_dev->parent = &mci->dev;
+		dev_set_name(pvt->chancounts_dev, "all_channel_counts");
+		dev_set_drvdata(pvt->chancounts_dev, mci);
+
+		edac_dbg(1, "creating %s\n", dev_name(pvt->chancounts_dev));
+
+		rc = device_add(pvt->chancounts_dev);
+		if (rc < 0)
+			goto err_put_chancounts;
+	}
+	return 0;
+
+err_put_chancounts:
+	put_device(pvt->chancounts_dev);
+err_del_addrmatch:
+	device_del(pvt->addrmatch_dev);
+err_put_addrmatch:
+	put_device(pvt->addrmatch_dev);
+
+	return rc;
+}
+
+static void i7core_delete_sysfs_devices(struct mem_ctl_info *mci)
+{
+	struct i7core_pvt *pvt = mci->pvt_info;
+
+	edac_dbg(1, "\n");
+
+	if (!pvt->is_registered) {
+		device_del(pvt->chancounts_dev);
+		put_device(pvt->chancounts_dev);
+	}
+	device_del(pvt->addrmatch_dev);
+	put_device(pvt->addrmatch_dev);
+}
+
+/****************************************************************************
+	Device initialization routines: put/get, init/exit
+ ****************************************************************************/
+
+/*
+ *	i7core_put_all_devices	'put' all the devices that we have
+ *				reserved via 'get'
+ */
+static void i7core_put_devices(struct i7core_dev *i7core_dev)
+{
+	int i;
+
+	edac_dbg(0, "\n");
+	for (i = 0; i < i7core_dev->n_devs; i++) {
+		struct pci_dev *pdev = i7core_dev->pdev[i];
+		if (!pdev)
+			continue;
+		edac_dbg(0, "Removing dev %02x:%02x.%d\n",
+			 pdev->bus->number,
+			 PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
+		pci_dev_put(pdev);
+	}
+}
+
+static void i7core_put_all_devices(void)
+{
+	struct i7core_dev *i7core_dev, *tmp;
+
+	list_for_each_entry_safe(i7core_dev, tmp, &i7core_edac_list, list) {
+		i7core_put_devices(i7core_dev);
+		free_i7core_dev(i7core_dev);
+	}
+}
+
+static void __init i7core_xeon_pci_fixup(const struct pci_id_table *table)
+{
+	struct pci_dev *pdev = NULL;
+	int i;
+
+	/*
+	 * On Xeon 55xx, the Intel Quick Path Arch Generic Non-core pci buses
+	 * aren't announced by acpi. So, we need to use a legacy scan probing
+	 * to detect them
+	 */
+	while (table && table->descr) {
+		pdev = pci_get_device(PCI_VENDOR_ID_INTEL, table->descr[0].dev_id, NULL);
+		if (unlikely(!pdev)) {
+			for (i = 0; i < MAX_SOCKET_BUSES; i++)
+				pcibios_scan_specific_bus(255-i);
+		}
+		pci_dev_put(pdev);
+		table++;
+	}
+}
+
+static unsigned i7core_pci_lastbus(void)
+{
+	int last_bus = 0, bus;
+	struct pci_bus *b = NULL;
+
+	while ((b = pci_find_next_bus(b)) != NULL) {
+		bus = b->number;
+		edac_dbg(0, "Found bus %d\n", bus);
+		if (bus > last_bus)
+			last_bus = bus;
+	}
+
+	edac_dbg(0, "Last bus %d\n", last_bus);
+
+	return last_bus;
+}
+
+/*
+ *	i7core_get_all_devices	Find and perform 'get' operation on the MCH's
+ *			device/functions we want to reference for this driver
+ *
+ *			Need to 'get' device 16 func 1 and func 2
+ */
+static int i7core_get_onedevice(struct pci_dev **prev,
+				const struct pci_id_table *table,
+				const unsigned devno,
+				const unsigned last_bus)
+{
+	struct i7core_dev *i7core_dev;
+	const struct pci_id_descr *dev_descr = &table->descr[devno];
+
+	struct pci_dev *pdev = NULL;
+	u8 bus = 0;
+	u8 socket = 0;
+
+	pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+			      dev_descr->dev_id, *prev);
+
+	/*
+	 * On Xeon 55xx, the Intel QuickPath Arch Generic Non-core regs
+	 * is at addr 8086:2c40, instead of 8086:2c41. So, we need
+	 * to probe for the alternate address in case of failure
+	 */
+	if (dev_descr->dev_id == PCI_DEVICE_ID_INTEL_I7_NONCORE && !pdev) {
+		pci_dev_get(*prev);	/* pci_get_device will put it */
+		pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				      PCI_DEVICE_ID_INTEL_I7_NONCORE_ALT, *prev);
+	}
+
+	if (dev_descr->dev_id == PCI_DEVICE_ID_INTEL_LYNNFIELD_NONCORE &&
+	    !pdev) {
+		pci_dev_get(*prev);	/* pci_get_device will put it */
+		pdev = pci_get_device(PCI_VENDOR_ID_INTEL,
+				      PCI_DEVICE_ID_INTEL_LYNNFIELD_NONCORE_ALT,
+				      *prev);
+	}
+
+	if (!pdev) {
+		if (*prev) {
+			*prev = pdev;
+			return 0;
+		}
+
+		if (dev_descr->optional)
+			return 0;
+
+		if (devno == 0)
+			return -ENODEV;
+
+		i7core_printk(KERN_INFO,
+			"Device not found: dev %02x.%d PCI ID %04x:%04x\n",
+			dev_descr->dev, dev_descr->func,
+			PCI_VENDOR_ID_INTEL, dev_descr->dev_id);
+
+		/* End of list, leave */
+		return -ENODEV;
+	}
+	bus = pdev->bus->number;
+
+	socket = last_bus - bus;
+
+	i7core_dev = get_i7core_dev(socket);
+	if (!i7core_dev) {
+		i7core_dev = alloc_i7core_dev(socket, table);
+		if (!i7core_dev) {
+			pci_dev_put(pdev);
+			return -ENOMEM;
+		}
+	}
+
+	if (i7core_dev->pdev[devno]) {
+		i7core_printk(KERN_ERR,
+			"Duplicated device for "
+			"dev %02x:%02x.%d PCI ID %04x:%04x\n",
+			bus, dev_descr->dev, dev_descr->func,
+	

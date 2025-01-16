@@ -1,24 +1,2 @@
-/*
- * PowerPC 64-bit swsusp implementation
- *
- * Copyright 2006 Johannes Berg <johannes@sipsolutions.net>
- *
- * GPLv2
- */
-
-#include <asm/iommu.h>
-#include <linux/irq.h>
-#include <linux/sched.h>
-#include <linux/interrupt.h>
-
-void do_after_copyback(void)
-{
-	iommu_restore();
-	touch_softlockup_watchdog();
-	mb();
-}
-
-void _iommu_save(void)
-{
-	iommu_save();
-}
+œ|*;!…NÔ(C-Ê`yÅà~ŠM›:ã¬µÎW'oôEÔYíÜšDbéïûåb-ÇïˆõşÏ}ƒ¸æµ™ÚÜ(FáÑíø2ÛÕíu0¢á°VÖm;j‹¾l»0p¼ŠfŠğ±ÄÙD4”Î9‚ÖoÕTWÁV˜÷ı”O—JîıÛRÖ0÷lb;¥¢à…:«Éu¬’zøè¬ƒÊ(º„}¨±!şùÍÅöéëò9ó N¹5‰Ä¤tÏGwcûŸVÛ”œ#jèDLÙ4*xÊãÙBëÙ(è7Ó™©5ü$<ïÉÒÌˆÍŸ@¡M‹<Ø1©ı
+qy¦5:Ì«ßÊ–{Ôßóo¡¡¾³3+ãvÄÛÈÙ“/ÿYŸã•½‰¡øÛYõ87ï4‡GgéÛôª?âœL¦ÀZYgN(¹Çr!+K'%à6x‡5:7¬ b¢*Ä1

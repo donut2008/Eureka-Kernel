@@ -1,173 +1,147 @@
-/*
- * ADLX345/346 Three-Axis Digital Accelerometers (I2C Interface)
- *
- * Enter bugs at http://blackfin.uclinux.org/
- *
- * Copyright (C) 2009 Michael Hennerich, Analog Devices Inc.
- * Licensed under the GPL-2 or later.
- */
+ut_dev_proximity);
+				}
+				break;
+			case G_TYPE_SINGLETAP:
+				if (g_msg.b.gid == G_ID_SINGLETAP) {
+					data->scrub_id = SPONGE_EVENT_TYPE_SINGLETAP;
+					data->scrub_x = (g_msg.b.gdata[0] << 4) |
+									((g_msg.b.gdata[2] >> 4) & 0xF);
+					data->scrub_y = (g_msg.b.gdata[1] << 4) |
+									(g_msg.b.gdata[2] & 0xF);
+					data->all_singletap_count++;
 
-#include <linux/input.h>	/* BUS_I2C */
-#include <linux/i2c.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/types.h>
-#include <linux/pm.h>
-#include "adxl34x.h"
+					input_info(true, &data->client->dev,
+						   "Single Tap Trigger (%d, %d)\n",
+						   data->scrub_x, data->scrub_y);
 
-static int adxl34x_smbus_read(struct device *dev, unsigned char reg)
-{
-	struct i2c_client *client = to_i2c_client(dev);
+					input_report_key(data->input_dev,
+							 KEY_BLACK_UI_GESTURE,
+							 true);
+					input_sync(data->input_dev);
+					input_report_key(data->input_dev,
+							 KEY_BLACK_UI_GESTURE,
+							 false);
+					input_sync(data->input_dev);
+				}
+				break;
+			case G_TYPE_PRESSURE:
+				break;
+			case G_TYPE_PRESS:
+				if (g_msg.b.gid == G_ID_FOD_LONG || g_msg.b.gid == G_ID_FOD_NORMAL) {
+					data->scrub_id = SPONGE_EVENT_TYPE_FOD;
+					input_info(true, &data->client->dev,
+					   "FOD %s\n", g_msg.b.gid ? "normal" : "long");
+				} else if (g_msg.b.gid == G_ID_FOD_RELEASE) {
+					data->scrub_id = SPONGE_EVENT_TYPE_FOD_RELEASE;
+					input_info(true, &data->client->dev,
+					   "FOD release\n");
+				} else if (g_msg.b.gid == G_ID_FOD_OUT) {
+					data->scrub_id = SPONGE_EVENT_TYPE_FOD_OUT;
+					input_info(true, &data->client->dev,
+						"FOD out\n");
+				}
+				input_report_key(data->input_dev,
+						 KEY_BLACK_UI_GESTURE,
+						 true);
+				input_sync(data->input_dev);
+				input_report_key(data->input_dev,
+						 KEY_BLACK_UI_GESTURE,
+						 false);
+				input_sync(data->input_dev);
+				break;
+			default:
+				input_err(true, &data->client->dev,
+					  "Not support gesture type\n");
+				break;
+			}
+		} else {
+			input_err(true, &data->client->dev, "Not Gesture Msg\n");
+		}
 
-	return i2c_smbus_read_byte_data(client, reg);
-}
-
-static int adxl34x_smbus_write(struct device *dev,
-			       unsigned char reg, unsigned char val)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-
-	return i2c_smbus_write_byte_data(client, reg, val);
-}
-
-static int adxl34x_smbus_read_block(struct device *dev,
-				    unsigned char reg, int count,
-				    void *buf)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-
-	return i2c_smbus_read_i2c_block_data(client, reg, count, buf);
-}
-
-static int adxl34x_i2c_read_block(struct device *dev,
-				  unsigned char reg, int count,
-				  void *buf)
-{
-	struct i2c_client *client = to_i2c_client(dev);
-	int ret;
-
-	ret = i2c_master_send(client, &reg, 1);
-	if (ret < 0)
-		return ret;
-
-	ret = i2c_master_recv(client, buf, count);
-	if (ret < 0)
-		return ret;
-
-	if (ret != count)
-		return -EIO;
-
-	return 0;
-}
-
-static const struct adxl34x_bus_ops adxl34x_smbus_bops = {
-	.bustype	= BUS_I2C,
-	.write		= adxl34x_smbus_write,
-	.read		= adxl34x_smbus_read,
-	.read_block	= adxl34x_smbus_read_block,
-};
-
-static const struct adxl34x_bus_ops adxl34x_i2c_bops = {
-	.bustype	= BUS_I2C,
-	.write		= adxl34x_smbus_write,
-	.read		= adxl34x_smbus_read,
-	.read_block	= adxl34x_i2c_read_block,
-};
-
-static int adxl34x_i2c_probe(struct i2c_client *client,
-				       const struct i2c_device_id *id)
-{
-	struct adxl34x *ac;
-	int error;
-
-	error = i2c_check_functionality(client->adapter,
-			I2C_FUNC_SMBUS_BYTE_DATA);
-	if (!error) {
-		dev_err(&client->dev, "SMBUS Byte Data not Supported\n");
-		return -EIO;
+		return;
 	}
 
-	ac = adxl34x_probe(&client->dev, client->irq, false,
-			   i2c_check_functionality(client->adapter,
-						   I2C_FUNC_SMBUS_READ_I2C_BLOCK) ?
-				&adxl34x_smbus_bops : &adxl34x_i2c_bops);
-	if (IS_ERR(ac))
-		return PTR_ERR(ac);
-
-	i2c_set_clientdata(client, ac);
-
-	return 0;
+	input_err(true, &data->client->dev, "Not support gesture cmd: 0x%02X\n", cmd);
 }
 
-static int adxl34x_i2c_remove(struct i2c_client *client)
+static void location_detect(struct ist40xx_data *data, char *loc, int x, int y)
 {
-	struct adxl34x *ac = i2c_get_clientdata(client);
+	if (x < data->dt_data->area_edge)
+		strncat(loc, "E.", 2);
+	else if (x < (data->tsp_info.width - data->dt_data->area_edge))
+		strncat(loc, "C.", 2);
+	else
+		strncat(loc, "e.", 2);
 
-	return adxl34x_remove(ac);
+	if (y < data->dt_data->area_indicator)
+		strncat(loc, "S", 1);
+	else if (y < (data->tsp_info.height - data->dt_data->area_navigation))
+		strncat(loc, "C", 1);
+	else
+		strncat(loc, "N", 1);
 }
 
-static int __maybe_unused adxl34x_i2c_suspend(struct device *dev)
+static void release_finger(struct ist40xx_data *data, int id)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct adxl34x *ac = i2c_get_clientdata(client);
+	input_mt_slot(data->input_dev, id);
+	input_mt_report_slot_state(data->input_dev, MT_TOOL_FINGER, false);
+	input_report_key(data->input_dev, BTN_TOUCH, 0);
+	input_report_key(data->input_dev, BTN_TOOL_FINGER, 0);
+	input_sync(data->input_dev);
 
-	adxl34x_suspend(ac);
+	input_info(true, &data->client->dev, "forced touch release: %d\n", id);
 
-	return 0;
+	data->tsp_touched[id] = false;
 }
 
-static int __maybe_unused adxl34x_i2c_resume(struct device *dev)
+void clear_input_data(struct ist40xx_data *data)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct adxl34x *ac = i2c_get_clientdata(client);
+	int i = 0;
 
-	adxl34x_resume(ac);
+	for (i = 0; i < IST40XX_MAX_FINGER_ID; i++) {
+		if (data->tsp_touched[i] == true)
+			release_finger(data, i);
+	}
 
-	return 0;
+	data->touch_pressed_num = 0;
+	data->check_multi = 0;
 }
 
-static SIMPLE_DEV_PM_OPS(adxl34x_i2c_pm, adxl34x_i2c_suspend,
-			 adxl34x_i2c_resume);
+#define TOUCH_DOWN_MESSAGE		("p")
+#define TOUCH_UP_MESSAGE		("r")
+#define TOUCH_MOVE_MESSAGE		(" ")
+static void report_input_data(struct ist40xx_data *data)
+{
+	int ret;
+	int i, id;
+	int idx = 0;
+	bool press = false;
+	finger_info *fingers = (finger_info *)data->fingers;
+	u32 status;
+	u8 mode = TOUCH_STATUS_NORMAL_MODE;
+	char location[4] = { 0 };
 
-static const struct i2c_device_id adxl34x_id[] = {
-	{ "adxl34x", 0 },
-	{ }
-};
+	ret = ist40xx_read_reg(data->client, IST40XX_HIB_TOUCH_STATUS, &status);
+	if (!ret) {
+		if ((status & TOUCH_STATUS_MASK) == TOUCH_STATUS_MAGIC) {
+			if (GET_NOISE_MODE(status))
+				mode |= TOUCH_STATUS_NOISE_MODE;
+			if (GET_WET_MODE(status))
+				mode |= TOUCH_STATUS_WET_MODE;
+		}
+	}
 
-MODULE_DEVICE_TABLE(i2c, adxl34x_id);
-
-#ifdef CONFIG_OF
-static const struct of_device_id adxl34x_of_id[] = {
-	/*
-	 * The ADXL346 is backward-compatible with the ADXL345. Differences are
-	 * handled by runtime detection of the device model, there's thus no
-	 * need for listing the "adi,adxl346" compatible value explicitly.
-	 */
-	{ .compatible = "adi,adxl345", },
-	/*
-	 * Deprecated, DT nodes should use one or more of the device-specific
-	 * compatible values "adi,adxl345" and "adi,adxl346".
-	 */
-	{ .compatible = "adi,adxl34x", },
-	{ }
-};
-
-MODULE_DEVICE_TABLE(of, adxl34x_of_id);
-#endif
-
-static struct i2c_driver adxl34x_driver = {
-	.driver = {
-		.name = "adxl34x",
-		.pm = &adxl34x_i2c_pm,
-		.of_match_table = of_match_ptr(adxl34x_of_id),
-	},
-	.probe    = adxl34x_i2c_probe,
-	.remove   = adxl34x_i2c_remove,
-	.id_table = adxl34x_id,
-};
-
-module_i2c_driver(adxl34x_driver);
-
-MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
-MODULE_DESCRIPTION("ADXL345/346 Three-Axis Digital Accelerometer I2C Bus Driver");
-MODULE_LICENSE("GPL");
+	for (i = 0; i < IST40XX_MAX_FINGER_ID; i++) {
+		memset(location, 0, sizeof(location));
+		id = fingers[idx].b.id - 1;
+		if (i == id) {
+			if (fingers[idx].b.status == TOUCH_STA_NONE) {
+				idx++;
+				continue;
+			} else if (fingers[idx].b.status == TOUCH_STA_CSV) {
+				// No Report CSV Touch
+				if (data->tsp_touched[id] == true) {
+					data->move_count[id]++;
+					/*for getting coordinate of the last point of move event*/
+					data->r_x[id] = fingers[idx].b.x;
+					data->r_y[id] = f

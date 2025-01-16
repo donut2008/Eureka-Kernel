@@ -1,860 +1,972 @@
-menuconfig REGULATOR
-	bool "Voltage and Current Regulator Support"
-	help
-	  Generic Voltage and Current Regulator support.
-
-	  This framework is designed to provide a generic interface to voltage
-	  and current regulators within the Linux kernel. It's intended to
-	  provide voltage and current control to client or consumer drivers and
-	  also provide status information to user space applications through a
-	  sysfs interface.
-
-	  The intention is to allow systems to dynamically control regulator
-	  output in order to save power and prolong battery life. This applies
-	  to both voltage regulators (where voltage output is controllable) and
-	  current sinks (where current output is controllable).
-
-	  This framework safely compiles out if not selected so that client
-	  drivers can still be used in systems with no software controllable
-	  regulators.
-
-	  If unsure, say no.
-
-
-if REGULATOR
-
-config REGULATOR_DEBUG
-	bool "Regulator debug support"
-	help
-	  Say yes here to enable debugging support.
-
-config REGULATOR_FIXED_VOLTAGE
-	tristate "Fixed voltage regulator support"
-	help
-	  This driver provides support for fixed voltage regulators,
-	  useful for systems which use a combination of software
-	  managed regulators and simple non-configurable regulators.
-
-config REGULATOR_VIRTUAL_CONSUMER
-	tristate "Virtual regulator consumer support"
-	help
-	  This driver provides a virtual consumer for the voltage and
-	  current regulator API which provides sysfs controls for
-	  configuring the supplies requested.  This is mainly useful
-	  for test purposes.
-
-	  If unsure, say no.
-
-config REGULATOR_USERSPACE_CONSUMER
-	tristate "Userspace regulator consumer support"
-	help
-	  There are some classes of devices that are controlled entirely
-	  from user space. Userspace consumer driver provides ability to
-	  control power supplies for such devices.
-
-	  If unsure, say no.
-
-config REGULATOR_88PM800
-	tristate "Marvell 88PM800 Power regulators"
-	depends on MFD_88PM800
-	help
-	  This driver supports Marvell 88PM800 voltage regulator chips.
-	  It delivers digitally programmable output,
-	  the voltage is programmed via I2C interface.
-	  It's suitable to support PXA988 chips to control VCC_MAIN and
-	  various voltages.
-
-config REGULATOR_88PM8607
-	tristate "Marvell 88PM8607 Power regulators"
-	depends on MFD_88PM860X=y
-	help
-	  This driver supports 88PM8607 voltage regulator chips.
-
-config REGULATOR_ACT8865
-	tristate "Active-semi act8865 voltage regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver controls a active-semi act8865 voltage output
-	  regulator via I2C bus.
-
-config REGULATOR_AD5398
-	tristate "Analog Devices AD5398/AD5821 regulators"
-	depends on I2C
-	help
-	  This driver supports AD5398 and AD5821 current regulator chips.
-	  If building into module, its name is ad5398.ko.
-
-config REGULATOR_ANATOP
-	tristate "Freescale i.MX on-chip ANATOP LDO regulators"
-	depends on MFD_SYSCON
-	help
-	  Say y here to support Freescale i.MX on-chip ANATOP LDOs
-	  regulators. It is recommended that this option be
-	  enabled on i.MX6 platform.
-
-config REGULATOR_AAT2870
-	tristate "AnalogicTech AAT2870 Regulators"
-	depends on MFD_AAT2870_CORE
-	help
-	  If you have a AnalogicTech AAT2870 say Y to enable the
-	  regulator driver.
-
-config REGULATOR_AB3100
-	tristate "ST-Ericsson AB3100 Regulator functions"
-	depends on AB3100_CORE
-	default y if AB3100_CORE
-	help
-	 These regulators correspond to functionality in the
-	 AB3100 analog baseband dealing with power regulators
-	 for the system.
-
-config REGULATOR_AB8500
-	bool "ST-Ericsson AB8500 Power Regulators"
-	depends on AB8500_CORE
-	help
-	  This driver supports the regulators found on the ST-Ericsson mixed
-	  signal AB8500 PMIC
-
-config REGULATOR_ARIZONA
-	tristate "Wolfson Arizona class devices"
-	depends on MFD_ARIZONA
-	depends on SND_SOC
-	help
-	  Support for the regulators found on Wolfson Arizona class
-	  devices.
-
-config REGULATOR_AS3711
-	tristate "AS3711 PMIC"
-	depends on MFD_AS3711
-	help
-	  This driver provides support for the voltage regulators on the
-	  AS3711 PMIC
-
-config REGULATOR_AS3722
-	tristate "AMS AS3722 PMIC Regulators"
-	depends on MFD_AS3722
-	help
-	  This driver provides support for the voltage regulators on the
-	  AS3722 PMIC. This will enable support for all the software
-	  controllable DCDC/LDO regulators.
-
-config REGULATOR_AXP20X
-	tristate "X-POWERS AXP20X PMIC Regulators"
-	depends on MFD_AXP20X
-	help
-	  This driver provides support for the voltage regulators on the
-	  AXP20X PMIC.
-
-config REGULATOR_BCM590XX
-	tristate "Broadcom BCM590xx PMU Regulators"
-	depends on MFD_BCM590XX
-	help
-	  This driver provides support for the voltage regulators on the
-	  BCM590xx PMUs. This will enable support for the software
-	  controllable LDO/Switching regulators.
-
-config REGULATOR_MADERA_LDO1
-	tristate "Cirrus Logic Madera codecs LDO1 regulator"
-	depends on MFD_MADERA
-	depends on SND_SOC
-	help
-	  For Cirrus Logic Madera class codecs, if you want to use the
-	  internal LDO1 regulator to supply DCVDD you need to include this
-	  driver. If you are using an external DCVDD regulator or the codec
-	  does not have an LDO1 regulator you do not need this driver.
-
-config REGULATOR_MADERA_MICSUPP
-	tristate "Cirrus Logic Madera codecs mic supply regulator"
-	depends on MFD_MADERA
-	depends on SND_SOC
-	help
-	  Support for the microphone supply regulator on Cirrus Logic
-	  Madera class codecs
-
-config REGULATOR_DA903X
-	tristate "Dialog Semiconductor DA9030/DA9034 regulators"
-	depends on PMIC_DA903X
-	help
-	  Say y here to support the BUCKs and LDOs regulators found on
-	  Dialog Semiconductor DA9030/DA9034 PMIC.
-
-config REGULATOR_DA9052
-	tristate "Dialog Semiconductor DA9052/DA9053 regulators"
-	depends on PMIC_DA9052
-	help
-	  This driver supports the voltage regulators of DA9052-BC and
-	  DA9053-AA/Bx PMIC.
-
-config REGULATOR_DA9055
-	tristate "Dialog Semiconductor DA9055 regulators"
-	depends on MFD_DA9055
-	help
-	  Say y here to support the BUCKs and LDOs regulators found on
-	  Dialog Semiconductor DA9055 PMIC.
-
-	  This driver can also be built as a module. If so, the module
-	  will be called da9055-regulator.
-
-config REGULATOR_DA9062
-	tristate "Dialog Semiconductor DA9062 regulators"
-	depends on MFD_DA9062
-	help
-	  Say y here to support the BUCKs and LDOs regulators found on
-	  DA9062 PMICs.
-
-	  This driver can also be built as a module. If so, the module
-	  will be called da9062-regulator.
-
-config REGULATOR_DA9063
-	tristate "Dialog Semiconductor DA9063 regulators"
-	depends on MFD_DA9063
-	help
-	  Say y here to support the BUCKs and LDOs regulators found on
-	  DA9063 PMICs.
-
-	  This driver can also be built as a module. If so, the module
-	  will be called da9063-regulator.
-
-config REGULATOR_DA9210
-	tristate "Dialog Semiconductor DA9210 regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  Say y here to support for the Dialog Semiconductor DA9210.
-	  The DA9210 is a multi-phase synchronous step down
-	  converter 12A DC-DC Buck controlled through an I2C
-	  interface.
-
-config REGULATOR_DA9211
-	tristate "Dialog Semiconductor DA9211/DA9212/DA9213/DA9214/DA9215 regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  Say y here to support for the Dialog Semiconductor DA9211/DA9212
-	  /DA9213/DA9214/DA9215.
-	  The DA9211/DA9212/DA9213/DA9214/DA9215 is a multi-phase synchronous
-	  step down converter 12A or 16A DC-DC Buck controlled through an I2C
-	  interface.
-
-config REGULATOR_DBX500_PRCMU
-	bool
-
-config REGULATOR_DB8500_PRCMU
-	bool "ST-Ericsson DB8500 Voltage Domain Regulators"
-	depends on MFD_DB8500_PRCMU
-	select REGULATOR_DBX500_PRCMU
-	help
-	  This driver supports the voltage domain regulators controlled by the
-	  DB8500 PRCMU
-
-config REGULATOR_FAN53555
-	tristate "Fairchild FAN53555 Regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver supports Fairchild FAN53555 Digitally Programmable
-	  TinyBuck Regulator. The FAN53555 is a step-down switching voltage
-	  regulator that delivers a digitally programmable output from an
-	  input voltage supply of 2.5V to 5.5V. The output voltage is
-	  programmed through an I2C interface.
-
-config REGULATOR_GPIO
-	tristate "GPIO regulator support"
-	depends on GPIOLIB || COMPILE_TEST
-	help
-	  This driver provides support for regulators that can be
-	  controlled via gpios.
-	  It is capable of supporting current and voltage regulators
-	  and the platform has to provide a mapping of GPIO-states
-	  to target volts/amps.
-
-config REGULATOR_HI6421
-	tristate "HiSilicon Hi6421 PMIC voltage regulator support"
-	depends on MFD_HI6421_PMIC && OF
-	help
-	  This driver provides support for the voltage regulators on the
-	  HiSilicon Hi6421 PMU / Codec IC.
-	  Hi6421 is a multi-function device which, on regulator part, provides
-	  21 general purpose LDOs, 3 dedicated LDOs, and 5 BUCKs. All
-	  of them come with support to either ECO (idle) or sleep mode.
-
-config REGULATOR_ISL9305
-	tristate "Intersil ISL9305 regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver supports ISL9305 voltage regulator chip.
-
-config REGULATOR_ISL6271A
-	tristate "Intersil ISL6271A Power regulator"
-	depends on I2C
-	help
-	  This driver supports ISL6271A voltage regulator chip.
-
-config REGULATOR_LP3971
-	tristate "National Semiconductors LP3971 PMIC regulator driver"
-	depends on I2C
-	help
-	 Say Y here to support the voltage regulators and convertors
-	 on National Semiconductors LP3971 PMIC
-
-config REGULATOR_LP3972
-	tristate "National Semiconductors LP3972 PMIC regulator driver"
-	depends on I2C
-	help
-	 Say Y here to support the voltage regulators and convertors
-	 on National Semiconductors LP3972 PMIC
-
-config REGULATOR_LP872X
-	tristate "TI/National Semiconductor LP8720/LP8725 voltage regulators"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver supports LP8720/LP8725 PMIC
-
-config REGULATOR_LP8755
-	tristate "TI LP8755 High Performance PMU driver"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver supports LP8755 High Performance PMU driver. This
-	  chip contains six step-down DC/DC converters which can support
-	  9 mode multiphase configuration.
-
-config REGULATOR_LP8788
-	tristate "TI LP8788 Power Regulators"
-	depends on MFD_LP8788
-	help
-	  This driver supports LP8788 voltage regulator chip.
-
-config REGULATOR_LTC3589
-	tristate "LTC3589 8-output voltage regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This enables support for the LTC3589, LTC3589-1, and LTC3589-2
-	  8-output regulators controlled via I2C.
-
-config REGULATOR_MAX14577
-	tristate "Maxim 14577/77836 regulator"
-	depends on MFD_MAX14577
-	help
-	  This driver controls a Maxim MAX14577/77836 regulator via I2C bus.
-	  The MAX14577 regulators include safeout LDO and charger current
-	  regulator. The MAX77836 has two additional LDOs.
-
-config REGULATOR_MAX1586
-	tristate "Maxim 1586/1587 voltage regulator"
-	depends on I2C
-	help
-	  This driver controls a Maxim 1586 or 1587 voltage output
-	  regulator via I2C bus. The provided regulator is suitable
-	  for PXA27x chips to control VCC_CORE and VCC_USIM voltages.
-
-config REGULATOR_MAX8649
-	tristate "Maxim 8649 voltage regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver controls a Maxim 8649 voltage output regulator via
-	  I2C bus.
-
-config REGULATOR_MAX8660
-	tristate "Maxim 8660/8661 voltage regulator"
-	depends on I2C
-	help
-	  This driver controls a Maxim 8660/8661 voltage output
-	  regulator via I2C bus.
-
-config REGULATOR_MAX8907
-	tristate "Maxim 8907 voltage regulator"
-	depends on MFD_MAX8907
-	help
-	  This driver controls a Maxim 8907 voltage output regulator
-	  via I2C bus. The provided regulator is suitable for Tegra
-	  chip to control Step-Down DC-DC and LDOs.
-
-config REGULATOR_MAX8925
-	tristate "Maxim MAX8925 Power Management IC"
-	depends on MFD_MAX8925
-	help
-	  Say y here to support the voltage regulaltor of Maxim MAX8925 PMIC.
-
-config REGULATOR_MAX8952
-	tristate "Maxim MAX8952 Power Management IC"
-	depends on I2C
-	help
-	  This driver controls a Maxim 8952 voltage output regulator
-	  via I2C bus. Maxim 8952 has one voltage output and supports 4 DVS
-	  modes ranging from 0.77V to 1.40V by 0.01V steps.
-
-config REGULATOR_MAX8973
-	tristate "Maxim MAX8973 voltage regulator "
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  The MAXIM MAX8973 high-efficiency. three phase, DC-DC step-down
-	  switching regulator delievers up to 9A of output current. Each
-	  phase operates at a 2MHz fixed frequency with a 120 deg shift
-	  from the adjacent phase, allowing the use of small magnetic component.
-
-config REGULATOR_MAX8997
-	tristate "Maxim 8997/8966 regulator"
-	depends on MFD_MAX8997
-	help
-	  This driver controls a Maxim 8997/8966 regulator
-	  via I2C bus. The provided regulator is suitable for S5PC110,
-	  S5PV210, and Exynos-4 chips to control VCC_CORE and
-	  VCC_USIM voltages.
-
-config REGULATOR_MAX8998
-	tristate "Maxim 8998 voltage regulator"
-	depends on MFD_MAX8998
-	help
-	  This driver controls a Maxim 8998 voltage output regulator
-	  via I2C bus. The provided regulator is suitable for S3C6410
-	  and S5PC1XX chips to control VCC_CORE and VCC_USIM voltages.
-
-config REGULATOR_MAX77686
-	tristate "Maxim 77686 regulator"
-	depends on MFD_MAX77686
-	help
-	  This driver controls a Maxim 77686 regulator
-	  via I2C bus. The provided regulator is suitable for
-	  Exynos-4 chips to control VARM and VINT voltages.
-
-config REGULATOR_MAX77693
-	tristate "Maxim 77693/77843 regulator"
-	depends on (MFD_MAX77693 || MFD_MAX77843)
-	help
-	  This driver controls a Maxim 77693/77843 regulators via I2C bus.
-	  The regulators include two LDOs, 'SAFEOUT1', 'SAFEOUT2'
-	  and one current regulator 'CHARGER'. This is suitable for
-	  Exynos-4x12 (MAX77693) or Exynos5433 (MAX77843) SoC chips.
-
-config REGULATOR_MAX77802
-	tristate "Maxim 77802 regulator"
-	depends on MFD_MAX77686
-	help
-	  This driver controls a Maxim 77802 regulator
-	  via I2C bus. The provided regulator is suitable for
-	  Exynos5420/Exynos5800 SoCs to control various voltages.
-	  It includes support for control of voltage and ramp speed.
-
-config REGULATOR_MC13XXX_CORE
-	tristate
-
-config REGULATOR_MC13783
-	tristate "Freescale MC13783 regulator driver"
-	depends on MFD_MC13XXX
-	select REGULATOR_MC13XXX_CORE
-	help
-	  Say y here to support the regulators found on the Freescale MC13783
-	  PMIC.
-
-config REGULATOR_MC13892
-	tristate "Freescale MC13892 regulator driver"
-	depends on MFD_MC13XXX
-	select REGULATOR_MC13XXX_CORE
-	help
-	  Say y here to support the regulators found on the Freescale MC13892
-	  PMIC.
-
-config REGULATOR_MT6311
-	tristate "MediaTek MT6311 PMIC"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  Say y here to select this option to enable the power regulator of
-	  MediaTek MT6311 PMIC.
-	  This driver supports the control of different power rails of device
-	  through regulator interface.
-
-config REGULATOR_MT6397
-	tristate "MediaTek MT6397 PMIC"
-	depends on MFD_MT6397
-	help
-	  Say y here to select this option to enable the power regulator of
-	  MediaTek MT6397 PMIC.
-	  This driver supports the control of different power rails of device
-	  through regulator interface.
-
-config REGULATOR_PALMAS
-	tristate "TI Palmas PMIC Regulators"
-	depends on MFD_PALMAS
-	help
-	  If you wish to control the regulators on the Palmas series of
-	  chips say Y here. This will enable support for all the software
-	  controllable SMPS/LDO regulators.
-
-	  The regulators available on Palmas series chips vary depending
-	  on the muxing. This is handled automatically in the driver by
-	  reading the mux info from OTP.
-
-config REGULATOR_PBIAS
-	tristate "PBIAS OMAP regulator driver"
-	depends on (ARCH_OMAP || COMPILE_TEST) && MFD_SYSCON
-	help
-	 Say y here to support pbias regulator for mmc1:SD card i/o
-	 on OMAP SoCs.
-	 This driver provides support for OMAP pbias modelled
-	 regulators.
-
-config REGULATOR_PCAP
-	tristate "Motorola PCAP2 regulator driver"
-	depends on EZX_PCAP
-	help
-	 This driver provides support for the voltage regulators of the
-	 PCAP2 PMIC.
-
-config REGULATOR_PCF50633
-	tristate "NXP PCF50633 regulator driver"
-	depends on MFD_PCF50633
-	help
-	 Say Y here to support the voltage regulators and convertors
-	 on PCF50633
-
-config REGULATOR_PFUZE100
-	tristate "Freescale PFUZE100/PFUZE200 regulator driver"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  Say y here to support the regulators found on the Freescale
-	  PFUZE100/PFUZE200 PMIC.
-
-config REGULATOR_PWM
-	tristate "PWM voltage regulator"
-	depends on PWM
-	help
-	  This driver supports PWM controlled voltage regulators. PWM
-	  duty cycle can increase or decrease the voltage.
-
-config REGULATOR_QCOM_RPM
-	tristate "Qualcomm RPM regulator driver"
-	depends on MFD_QCOM_RPM
-	help
-	  If you say yes to this option, support will be included for the
-	  regulators exposed by the Resource Power Manager found in Qualcomm
-	  8660, 8960 and 8064 based devices.
-
-	  Say M here if you want to include support for the regulators on the
-	  Qualcomm RPM as a module. The module will be named
-	  "qcom_rpm-regulator".
-
-config REGULATOR_QCOM_SMD_RPM
-	tristate "Qualcomm SMD based RPM regulator driver"
-	depends on QCOM_SMD_RPM
-	help
-	  If you say yes to this option, support will be included for the
-	  regulators exposed by the Resource Power Manager found in Qualcomm
-	  8974 based devices.
-
-	  Say M here if you want to include support for the regulators on the
-	  Qualcomm RPM as a module. The module will be named
-	  "qcom_smd-regulator".
-
-config REGULATOR_QCOM_SPMI
-	tristate "Qualcomm SPMI regulator driver"
-	depends on SPMI || COMPILE_TEST
-	help
-	  If you say yes to this option, support will be included for the
-	  regulators found in Qualcomm SPMI PMICs.
-
-	  Say M here if you want to include support for the regulators on the
-	  Qualcomm SPMI PMICs as a module. The module will be named
-	  "qcom_spmi-regulator".
-
-config REGULATOR_RC5T583
-	tristate "RICOH RC5T583 Power regulators"
-	depends on MFD_RC5T583
-	help
-	  Select this option to enable the power regulator of RICOH
-	  PMIC RC5T583.
-	  This driver supports the control of different power rails of device
-	  through regulator interface. The device supports multiple DCDC/LDO
-	  outputs which can be controlled by i2c communication.
-
-config REGULATOR_RK808
-	tristate "Rockchip RK808 Power regulators"
-	depends on MFD_RK808
-	help
-	  Select this option to enable the power regulator of ROCKCHIP
-	  PMIC RK808.
-	  This driver supports the control of different power rails of device
-	  through regulator interface. The device supports multiple DCDC/LDO
-	  outputs which can be controlled by i2c communication.
-
-config REGULATOR_RN5T618
-	tristate "Ricoh RN5T618 voltage regulators"
-	depends on MFD_RN5T618
-	help
-	  Say y here to support the regulators found on Ricoh RN5T618 PMIC.
-
-config REGULATOR_RT5033
-	tristate "Richtek RT5033 Regulators"
-	depends on MFD_RT5033
-	help
-	  This adds support for voltage and current regulators in Richtek
-	  RT5033 PMIC. The device supports multiple regulators like
-	  current source, LDO and Buck.
-
-config REGULATOR_S2MPA01
-	tristate "Samsung S2MPA01 voltage regulator"
-	depends on MFD_SEC_CORE
-	help
-	 This driver controls Samsung S2MPA01 voltage output regulator
-	 via I2C bus. S2MPA01 has 10 Bucks and 26 LDO outputs.
-
-config REGULATOR_S2MPS11
-	tristate "Samsung S2MPS11/S2MPS13/S2MPS14/S2MPU02 voltage regulator"
-	depends on MFD_SEC_CORE
-	help
-	 This driver supports a Samsung S2MPS11/S2MPS13/S2MPS14/S2MPU02 voltage
-	 output regulator via I2C bus. The chip is comprised of high efficient
-	 Buck converters including Dual-Phase Buck converter, Buck-Boost
-	 converter, various LDOs.
-
-config REGULATOR_S2MPS16
-	tristate "Samsung S2MPS16 voltage regulator"
-	depends on MFD_SEC_CORE
-	help
-	 This driver supports a Samsung S2MPS16 voltage output regulator
-	 via I2C bus. S2MPS16 is comprised of high efficient Buck converters
-	 including Dual-Phase Buck converter, Buck-Boost converter, various LDOs.
-
-config REGULATOR_S2MPS17
-	tristate "Samsung S2MPS17 voltage regulator"
-	depends on MFD_S2MPS17
-	help
-	 This driver supports a Samsung S2MPS17 voltage output regulator
-	 via I2C bus. S2MPS17 is comprised of high efficient Buck converters
-	 including Dual-Phase Buck converter, Buck-Boost converter, various LDOs.
-
-config REGULATOR_S2MPU07
-	tristate "Samsung S2MPU07 voltage regulator"
-	depends on MFD_S2MPU07
-	help
-	 This driver supports a Samsung S2MPU07 voltage output regulator
-	 via I2C bus. S2MPU07 is comprised of high efficient Buck converters
-	 including Dual-Phase Buck converter, Buck-Boost converter, various LDOs.
-
-config REGULATOR_S2MPU08
-	tristate "Samsung S2MPU08 voltage regulator"
-	depends on MFD_S2MPU08
-	help
-	 This driver supports a Samsung S2MPU08 voltage output regulator
-	 via I2C bus. S2MPU08 is comprised of high efficient Buck converters
-	 including Dual-Phase Buck converter, Buck-Boost converter, various LDOs.
-
-config REGULATOR_S2MPB02
-	tristate "Samsung S2MPB02 regulator"
-	depends on MFD_S2MPB02
-	help
-	 This driver controls a Samsung S2MPB02 regulator
-	 via I2C bus.
-
-config REGULATOR_S2MPB03
-	tristate "Samsung S2MPB03 regulator"
-	depends on I2C
-	help
-	 This driver controls a Samsung S2MPB03 regulator
-	 via I2C bus.
-
-config REGULATOR_S2DOS03
-	tristate "Samsung S2DOS03 regulator"
-	depends on I2C
-	help
-	 This driver controls a Samsung S2DOS03 regulator
-	 via I2C bus.
-
-config REGULATOR_S5M8767
-	tristate "Samsung S5M8767A voltage regulator"
-	depends on MFD_SEC_CORE
-	help
-	 This driver supports a Samsung S5M8767A voltage output regulator
-	 via I2C bus. S5M8767A have 9 Bucks and 28 LDOs output and
-	 supports DVS mode with 8bits of output voltage control.
-
-config REGULATOR_SKY81452
-	tristate "Skyworks Solutions SKY81452 voltage regulator"
-	depends on MFD_SKY81452
-	help
-	  This driver supports Skyworks SKY81452 voltage output regulator
-	  via I2C bus. SKY81452 has one voltage linear regulator can be
-	  programmed from 4.5V to 20V.
-
-	  This driver can also be built as a module. If so, the module
-	  will be called sky81452-regulator.
-
-config REGULATOR_TI_ABB
-	tristate "TI Adaptive Body Bias on-chip LDO"
-	depends on ARCH_OMAP
-	help
-	  Select this option to support Texas Instruments' on-chip Adaptive Body
-	  Bias (ABB) LDO regulators. It is recommended that this option be
-	  enabled on required TI SoC. Certain Operating Performance Points
-	  on TI SoCs may be unstable without enabling this as it provides
-	  device specific optimized bias to allow/optimize functionality.
-
-config REGULATOR_STW481X_VMMC
-	bool "ST Microelectronics STW481X VMMC regulator"
-	depends on MFD_STW481X || COMPILE_TEST
-	default y if MFD_STW481X
-	help
-	  This driver supports the internal VMMC regulator in the STw481x
-	  PMIC chips.
-
-config REGULATOR_TPS51632
-	tristate "TI TPS51632 Power Regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver supports TPS51632 voltage regulator chip.
-	  The TPS51632 is 3-2-1 Phase D-Cap+ Step Down Driverless Controller
-	  with Serial VID control and DVFS.
-	  The voltage output can be configure through I2C interface or PWM
-	  interface.
-
-config REGULATOR_TPS6105X
-	tristate "TI TPS6105X Power regulators"
-	depends on TPS6105X
-	default y if TPS6105X
-	help
-	  This driver supports TPS61050/TPS61052 voltage regulator chips.
-	  It is a single boost converter primarily for white LEDs and
-	  audio amplifiers.
-
-config REGULATOR_TPS62360
-	tristate "TI TPS6236x Power Regulator"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver supports TPS6236x voltage regulator chip. This
-	  regulator is meant for processor core supply. This chip is
-	  high-frequency synchronous step down dc-dc converter optimized
-	  for battery-powered portable applications.
-
-config REGULATOR_TPS65023
-	tristate "TI TPS65023 Power regulators"
-	depends on I2C
-	select REGMAP_I2C
-	help
-	  This driver supports TPS65023 voltage regulator chips. TPS65023 provides
-	  three step-down converters and two general-purpose LDO voltage regulators.
-	  It supports TI's software based Class-2 SmartReflex implementation.
-
-config REGULATOR_TPS6507X
-	tristate "TI TPS6507X Power regulators"
-	depends on I2C
-	help
-	  This driver supports TPS6507X voltage regulator chips. TPS6507X provides
-	  three step-down converters and two general-purpose LDO voltage regulators.
-	  It supports TI's software based Class-2 SmartReflex implementation.
-
-config REGULATOR_TPS65090
-	tristate "TI TPS65090 Power regulator"
-	depends on MFD_TPS65090
-	help
-	  This driver provides support for the voltage regulators on the
-	  TI TPS65090 PMIC.
-
-config REGULATOR_TPS65217
-	tristate "TI TPS65217 Power regulators"
-	depends on MFD_TPS65217
-	help
-	  This driver supports TPS65217 voltage regulator chips. TPS65217
-	  provides three step-down converters and four general-purpose LDO
-	  voltage regulators. It supports software based voltage control
-	  for different voltage domains
-
-config REGULATOR_TPS65218
-	tristate "TI TPS65218 Power regulators"
-	depends on MFD_TPS65218 && OF
-	help
-	  This driver supports TPS65218 voltage regulator chips. TPS65218
-	  provides six step-down converters and one general-purpose LDO
-	  voltage regulators. It supports software based voltage control
-	  for different voltage domains
-
-config REGULATOR_TPS6524X
-	tristate "TI TPS6524X Power regulators"
-	depends on SPI
-	help
-	  This driver supports TPS6524X voltage regulator chips. TPS6524X
-	  provides three step-down converters and two general-purpose LDO
-	  voltage regulators.  This device is interfaced using a customized
-	  serial interface currently supported on the sequencer serial
-	  port controller.
-
-config REGULATOR_TPS6586X
-	tristate "TI TPS6586X Power regulators"
-	depends on MFD_TPS6586X
-	help
-	  This driver supports TPS6586X voltage regulator chips.
-
-config REGULATOR_TPS65910
-	tristate "TI TPS65910/TPS65911 Power Regulators"
-	depends on MFD_TPS65910
-	help
-	  This driver supports TPS65910/TPS65911 voltage regulator chips.
-
-config REGULATOR_TPS65912
-	tristate "TI TPS65912 Power regulator"
-	depends on (MFD_TPS65912_I2C || MFD_TPS65912_SPI)
-	help
-	    This driver supports TPS65912 voltage regulator chip.
-
-config REGULATOR_TPS80031
-	tristate "TI TPS80031/TPS80032 power regualtor driver"
-	depends on MFD_TPS80031
-	help
-	  TPS80031/ TPS80032 Fully Integrated Power Management with Power
-	  Path and Battery Charger. It has 5 configurable step-down
-	  converters, 11 general purpose LDOs, VBUS generator and digital
-	  output to control regulators.
-
-config REGULATOR_TWL4030
-	tristate "TI TWL4030/TWL5030/TWL6030/TPS659x0 PMIC"
-	depends on TWL4030_CORE
-	help
-	  This driver supports the voltage regulators provided by
-	  this family of companion chips.
-
-config REGULATOR_VEXPRESS
-	tristate "Versatile Express regulators"
-	depends on VEXPRESS_CONFIG
-	help
-	  This driver provides support for voltage regulators available
-	  on the ARM Ltd's Versatile Express platform.
-
-config REGULATOR_WM831X
-	tristate "Wolfson Microelectronics WM831x PMIC regulators"
-	depends on MFD_WM831X
-	help
-	  Support the voltage and current regulators of the WM831x series
-	  of PMIC devices.
-
-config REGULATOR_WM8350
-	tristate "Wolfson Microelectronics WM8350 AudioPlus PMIC"
-	depends on MFD_WM8350
-	help
-	  This driver provides support for the voltage and current regulators
-	  of the WM8350 AudioPlus PMIC.
-
-config REGULATOR_WM8400
-	tristate "Wolfson Microelectronics WM8400 AudioPlus PMIC"
-	depends on MFD_WM8400
-	help
-	  This driver provides support for the voltage regulators of the
-	  WM8400 AudioPlus PMIC.
-
-config REGULATOR_WM8994
-	tristate "Wolfson Microelectronics WM8994 CODEC"
-	depends on MFD_WM8994
-	help
-	  This driver provides support for the voltage regulators on the
-	  WM8994 CODEC.
-
-endif
-
+/* Intel i7 core/Nehalem Memory Controller kernel module
+ *
+ * This driver supports the memory controllers found on the Intel
+ * processor families i7core, i7core 7xx/8xx, i5core, Xeon 35xx,
+ * Xeon 55xx and Xeon 56xx also known as Nehalem, Nehalem-EP, Lynnfield
+ * and Westmere-EP.
+ *
+ * This file may be distributed under the terms of the
+ * GNU General Public License version 2 only.
+ *
+ * Copyright (c) 2009-2010 by:
+ *	 Mauro Carvalho Chehab
+ *
+ * Red Hat Inc. http://www.redhat.com
+ *
+ * Forked and adapted from the i5400_edac driver
+ *
+ * Based on the following public Intel datasheets:
+ * Intel Core i7 Processor Extreme Edition and Intel Core i7 Processor
+ * Datasheet, Volume 2:
+ *	http://download.intel.com/design/processor/datashts/320835.pdf
+ * Intel Xeon Processor 5500 Series Datasheet Volume 2
+ *	http://www.intel.com/Assets/PDF/datasheet/321322.pdf
+ * also available at:
+ * 	http://www.arrownac.com/manufacturers/intel/s/nehalem/5500-datasheet-v2.pdf
+ */
+
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/pci.h>
+#include <linux/pci_ids.h>
+#include <linux/slab.h>
+#include <linux/delay.h>
+#include <linux/dmi.h>
+#include <linux/edac.h>
+#include <linux/mmzone.h>
+#include <linux/smp.h>
+#include <asm/mce.h>
+#include <asm/processor.h>
+#include <asm/div64.h>
+
+#include "edac_core.h"
+
+/* Static vars */
+static LIST_HEAD(i7core_edac_list);
+static DEFINE_MUTEX(i7core_edac_lock);
+static int probed;
+
+static int use_pci_fixup;
+module_param(use_pci_fixup, int, 0444);
+MODULE_PARM_DESC(use_pci_fixup, "Enable PCI fixup to seek for hidden devices");
+/*
+ * This is used for Nehalem-EP and Nehalem-EX devices, where the non-core
+ * registers start at bus 255, and are not reported by BIOS.
+ * We currently find devices with only 2 sockets. In order to support more QPI
+ * Quick Path Interconnect, just increment this number.
+ */
+#define MAX_SOCKET_BUSES	2
+
+
+/*
+ * Alter this version for the module when modifications are made
+ */
+#define I7CORE_REVISION    " Ver: 1.0.0"
+#define EDAC_MOD_STR      "i7core_edac"
+
+/*
+ * Debug macros
+ */
+#define i7core_printk(level, fmt, arg...)			\
+	edac_printk(level, "i7core", fmt, ##arg)
+
+#define i7core_mc_printk(mci, level, fmt, arg...)		\
+	edac_mc_chipset_printk(mci, level, "i7core", fmt, ##arg)
+
+/*
+ * i7core Memory Controller Registers
+ */
+
+	/* OFFSETS for Device 0 Function 0 */
+
+#define MC_CFG_CONTROL	0x90
+  #define MC_CFG_UNLOCK		0x02
+  #define MC_CFG_LOCK		0x00
+
+	/* OFFSETS for Device 3 Function 0 */
+
+#define MC_CONTROL	0x48
+#define MC_STATUS	0x4c
+#define MC_MAX_DOD	0x64
+
+/*
+ * OFFSETS for Device 3 Function 4, as indicated on Xeon 5500 datasheet:
+ * http://www.arrownac.com/manufacturers/intel/s/nehalem/5500-datasheet-v2.pdf
+ */
+
+#define MC_TEST_ERR_RCV1	0x60
+  #define DIMM2_COR_ERR(r)			((r) & 0x7fff)
+
+#define MC_TEST_ERR_RCV0	0x64
+  #define DIMM1_COR_ERR(r)			(((r) >> 16) & 0x7fff)
+  #define DIMM0_COR_ERR(r)			((r) & 0x7fff)
+
+/* OFFSETS for Device 3 Function 2, as indicated on Xeon 5500 datasheet */
+#define MC_SSRCONTROL		0x48
+  #define SSR_MODE_DISABLE	0x00
+  #define SSR_MODE_ENABLE	0x01
+  #define SSR_MODE_MASK		0x03
+
+#define MC_SCRUB_CONTROL	0x4c
+  #define STARTSCRUB		(1 << 24)
+  #define SCRUBINTERVAL_MASK    0xffffff
+
+#define MC_COR_ECC_CNT_0	0x80
+#define MC_COR_ECC_CNT_1	0x84
+#define MC_COR_ECC_CNT_2	0x88
+#define MC_COR_ECC_CNT_3	0x8c
+#define MC_COR_ECC_CNT_4	0x90
+#define MC_COR_ECC_CNT_5	0x94
+
+#define DIMM_TOP_COR_ERR(r)			(((r) >> 16) & 0x7fff)
+#define DIMM_BOT_COR_ERR(r)			((r) & 0x7fff)
+
+
+	/* OFFSETS for Devices 4,5 and 6 Function 0 */
+
+#define MC_CHANNEL_DIMM_INIT_PARAMS 0x58
+  #define THREE_DIMMS_PRESENT		(1 << 24)
+  #define SINGLE_QUAD_RANK_PRESENT	(1 << 23)
+  #define QUAD_RANK_PRESENT		(1 << 22)
+  #define REGISTERED_DIMM		(1 << 15)
+
+#define MC_CHANNEL_MAPPER	0x60
+  #define RDLCH(r, ch)		((((r) >> (3 + (ch * 6))) & 0x07) - 1)
+  #define WRLCH(r, ch)		((((r) >> (ch * 6)) & 0x07) - 1)
+
+#define MC_CHANNEL_RANK_PRESENT 0x7c
+  #define RANK_PRESENT_MASK		0xffff
+
+#define MC_CHANNEL_ADDR_MATCH	0xf0
+#define MC_CHANNEL_ERROR_MASK	0xf8
+#define MC_CHANNEL_ERROR_INJECT	0xfc
+  #define INJECT_ADDR_PARITY	0x10
+  #define INJECT_ECC		0x08
+  #define MASK_CACHELINE	0x06
+  #define MASK_FULL_CACHELINE	0x06
+  #define MASK_MSB32_CACHELINE	0x04
+  #define MASK_LSB32_CACHELINE	0x02
+  #define NO_MASK_CACHELINE	0x00
+  #define REPEAT_EN		0x01
+
+	/* OFFSETS for Devices 4,5 and 6 Function 1 */
+
+#define MC_DOD_CH_DIMM0		0x48
+#define MC_DOD_CH_DIMM1		0x4c
+#define MC_DOD_CH_DIMM2		0x50
+  #define RANKOFFSET_MASK	((1 << 12) | (1 << 11) | (1 << 10))
+  #define RANKOFFSET(x)		((x & RANKOFFSET_MASK) >> 10)
+  #define DIMM_PRESENT_MASK	(1 << 9)
+  #define DIMM_PRESENT(x)	(((x) & DIMM_PRESENT_MASK) >> 9)
+  #define MC_DOD_NUMBANK_MASK		((1 << 8) | (1 << 7))
+  #define MC_DOD_NUMBANK(x)		(((x) & MC_DOD_NUMBANK_MASK) >> 7)
+  #define MC_DOD_NUMRANK_MASK		((1 << 6) | (1 << 5))
+  #define MC_DOD_NUMRANK(x)		(((x) & MC_DOD_NUMRANK_MASK) >> 5)
+  #define MC_DOD_NUMROW_MASK		((1 << 4) | (1 << 3) | (1 << 2))
+  #define MC_DOD_NUMROW(x)		(((x) & MC_DOD_NUMROW_MASK) >> 2)
+  #define MC_DOD_NUMCOL_MASK		3
+  #define MC_DOD_NUMCOL(x)		((x) & MC_DOD_NUMCOL_MASK)
+
+#define MC_RANK_PRESENT		0x7c
+
+#define MC_SAG_CH_0	0x80
+#define MC_SAG_CH_1	0x84
+#define MC_SAG_CH_2	0x88
+#define MC_SAG_CH_3	0x8c
+#define MC_SAG_CH_4	0x90
+#define MC_SAG_CH_5	0x94
+#define MC_SAG_CH_6	0x98
+#define MC_SAG_CH_7	0x9c
+
+#define MC_RIR_LIMIT_CH_0	0x40
+#define MC_RIR_LIMIT_CH_1	0x44
+#define MC_RIR_LIMIT_CH_2	0x48
+#define MC_RIR_LIMIT_CH_3	0x4C
+#define MC_RIR_LIMIT_CH_4	0x50
+#define MC_RIR_LIMIT_CH_5	0x54
+#define MC_RIR_LIMIT_CH_6	0x58
+#define MC_RIR_LIMIT_CH_7	0x5C
+#define MC_RIR_LIMIT_MASK	((1 << 10) - 1)
+
+#define MC_RIR_WAY_CH		0x80
+  #define MC_RIR_WAY_OFFSET_MASK	(((1 << 14) - 1) & ~0x7)
+  #define MC_RIR_WAY_RANK_MASK		0x7
+
+/*
+ * i7core structs
+ */
+
+#define NUM_CHANS 3
+#define MAX_DIMMS 3		/* Max DIMMS per channel */
+#define MAX_MCR_FUNC  4
+#define MAX_CHAN_FUNC 3
+
+struct i7core_info {
+	u32	mc_control;
+	u32	mc_status;
+	u32	max_dod;
+	u32	ch_map;
+};
+
+
+struct i7core_inject {
+	int	enable;
+
+	u32	section;
+	u32	type;
+	u32	eccmask;
+
+	/* Error address mask */
+	int channel, dimm, rank, bank, page, col;
+};
+
+struct i7core_channel {
+	bool		is_3dimms_present;
+	bool		is_single_4rank;
+	bool		has_4rank;
+	u32		dimms;
+};
+
+struct pci_id_descr {
+	int			dev;
+	int			func;
+	int 			dev_id;
+	int			optional;
+};
+
+struct pci_id_table {
+	const struct pci_id_descr	*descr;
+	int				n_devs;
+};
+
+struct i7core_dev {
+	struct list_head	list;
+	u8			socket;
+	struct pci_dev		**pdev;
+	int			n_devs;
+	struct mem_ctl_info	*mci;
+};
+
+struct i7core_pvt {
+	struct device *addrmatch_dev, *chancounts_dev;
+
+	struct pci_dev	*pci_noncore;
+	struct pci_dev	*pci_mcr[MAX_MCR_FUNC + 1];
+	struct pci_dev	*pci_ch[NUM_CHANS][MAX_CHAN_FUNC + 1];
+
+	struct i7core_dev *i7core_dev;
+
+	struct i7core_info	info;
+	struct i7core_inject	inject;
+	struct i7core_channel	channel[NUM_CHANS];
+
+	int		ce_count_available;
+
+			/* ECC corrected errors counts per udimm */
+	unsigned long	udimm_ce_count[MAX_DIMMS];
+	int		udimm_last_ce_count[MAX_DIMMS];
+			/* ECC corrected errors counts per rdimm */
+	unsigned long	rdimm_ce_count[NUM_CHANS][MAX_DIMMS];
+	int		rdimm_last_ce_count[NUM_CHANS][MAX_DIMMS];
+
+	bool		is_registered, enable_scrub;
+
+	/* Fifo double buffers */
+	struct mce		mce_entry[MCE_LOG_LEN];
+	struct mce		mce_outentry[MCE_LOG_LEN];
+
+	/* Fifo in/out counters */
+	unsigned		mce_in, mce_out;
+
+	/* Count indicator to show errors not got */
+	unsigned		mce_overrun;
+
+	/* DCLK Frequency used for computing scrub rate */
+	int			dclk_freq;
+
+	/* Struct to control EDAC polling */
+	struct edac_pci_ctl_info *i7core_pci;
+};
+
+#define PCI_DESCR(device, function, device_id)	\
+	.dev = (device),			\
+	.func = (function),			\
+	.dev_id = (device_id)
+
+static const struct pci_id_descr pci_dev_descr_i7core_nehalem[] = {
+		/* Memory controller */
+	{ PCI_DESCR(3, 0, PCI_DEVICE_ID_INTEL_I7_MCR)     },
+	{ PCI_DESCR(3, 1, PCI_DEVICE_ID_INTEL_I7_MC_TAD)  },
+			/* Exists only for RDIMM */
+	{ PCI_DESCR(3, 2, PCI_DEVICE_ID_INTEL_I7_MC_RAS), .optional = 1  },
+	{ PCI_DESCR(3, 4, PCI_DEVICE_ID_INTEL_I7_MC_TEST) },
+
+		/* Channel 0 */
+	{ PCI_DESCR(4, 0, PCI_DEVICE_ID_INTEL_I7_MC_CH0_CTRL) },
+	{ PCI_DESCR(4, 1, PCI_DEVICE_ID_INTEL_I7_MC_CH0_ADDR) },
+	{ PCI_DESCR(4, 2, PCI_DEVICE_ID_INTEL_I7_MC_CH0_RANK) },
+	{ PCI_DESCR(4, 3, PCI_DEVICE_ID_INTEL_I7_MC_CH0_TC)   },
+
+		/* Channel 1 */
+	{ PCI_DESCR(5, 0, PCI_DEVICE_ID_INTEL_I7_MC_CH1_CTRL) },
+	{ PCI_DESCR(5, 1, PCI_DEVICE_ID_INTEL_I7_MC_CH1_ADDR) },
+	{ PCI_DESCR(5, 2, PCI_DEVICE_ID_INTEL_I7_MC_CH1_RANK) },
+	{ PCI_DESCR(5, 3, PCI_DEVICE_ID_INTEL_I7_MC_CH1_TC)   },
+
+		/* Channel 2 */
+	{ PCI_DESCR(6, 0, PCI_DEVICE_ID_INTEL_I7_MC_CH2_CTRL) },
+	{ PCI_DESCR(6, 1, PCI_DEVICE_ID_INTEL_I7_MC_CH2_ADDR) },
+	{ PCI_DESCR(6, 2, PCI_DEVICE_ID_INTEL_I7_MC_CH2_RANK) },
+	{ PCI_DESCR(6, 3, PCI_DEVICE_ID_INTEL_I7_MC_CH2_TC)   },
+
+		/* Generic Non-core registers */
+	/*
+	 * This is the PCI device on i7core and on Xeon 35xx (8086:2c41)
+	 * On Xeon 55xx, however, it has a different id (8086:2c40). So,
+	 * the probing code needs to test for the other address in case of
+	 * failure of this one
+	 */
+	{ PCI_DESCR(0, 0, PCI_DEVICE_ID_INTEL_I7_NONCORE)  },
+
+};
+
+static const struct pci_id_descr pci_dev_descr_lynnfield[] = {
+	{ PCI_DESCR( 3, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_MCR)         },
+	{ PCI_DESCR( 3, 1, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_TAD)      },
+	{ PCI_DESCR( 3, 4, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_TEST)     },
+
+	{ PCI_DESCR( 4, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH0_CTRL) },
+	{ PCI_DESCR( 4, 1, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH0_ADDR) },
+	{ PCI_DESCR( 4, 2, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH0_RANK) },
+	{ PCI_DESCR( 4, 3, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH0_TC)   },
+
+	{ PCI_DESCR( 5, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH1_CTRL) },
+	{ PCI_DESCR( 5, 1, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH1_ADDR) },
+	{ PCI_DESCR( 5, 2, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH1_RANK) },
+	{ PCI_DESCR( 5, 3, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH1_TC)   },
+
+	/*
+	 * This is the PCI device has an alternate address on some
+	 * processors like Core i7 860
+	 */
+	{ PCI_DESCR( 0, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_NONCORE)     },
+};
+
+static const struct pci_id_descr pci_dev_descr_i7core_westmere[] = {
+		/* Memory controller */
+	{ PCI_DESCR(3, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_MCR_REV2)     },
+	{ PCI_DESCR(3, 1, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_TAD_REV2)  },
+			/* Exists only for RDIMM */
+	{ PCI_DESCR(3, 2, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_RAS_REV2), .optional = 1  },
+	{ PCI_DESCR(3, 4, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_TEST_REV2) },
+
+		/* Channel 0 */
+	{ PCI_DESCR(4, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH0_CTRL_REV2) },
+	{ PCI_DESCR(4, 1, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH0_ADDR_REV2) },
+	{ PCI_DESCR(4, 2, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH0_RANK_REV2) },
+	{ PCI_DESCR(4, 3, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH0_TC_REV2)   },
+
+		/* Channel 1 */
+	{ PCI_DESCR(5, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH1_CTRL_REV2) },
+	{ PCI_DESCR(5, 1, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH1_ADDR_REV2) },
+	{ PCI_DESCR(5, 2, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH1_RANK_REV2) },
+	{ PCI_DESCR(5, 3, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH1_TC_REV2)   },
+
+		/* Channel 2 */
+	{ PCI_DESCR(6, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH2_CTRL_REV2) },
+	{ PCI_DESCR(6, 1, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH2_ADDR_REV2) },
+	{ PCI_DESCR(6, 2, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH2_RANK_REV2) },
+	{ PCI_DESCR(6, 3, PCI_DEVICE_ID_INTEL_LYNNFIELD_MC_CH2_TC_REV2)   },
+
+		/* Generic Non-core registers */
+	{ PCI_DESCR(0, 0, PCI_DEVICE_ID_INTEL_LYNNFIELD_NONCORE_REV2)  },
+
+};
+
+#define PCI_ID_TABLE_ENTRY(A) { .descr=A, .n_devs = ARRAY_SIZE(A) }
+static const struct pci_id_table pci_dev_table[] = {
+	PCI_ID_TABLE_ENTRY(pci_dev_descr_i7core_nehalem),
+	PCI_ID_TABLE_ENTRY(pci_dev_descr_lynnfield),
+	PCI_ID_TABLE_ENTRY(pci_dev_descr_i7core_westmere),
+	{0,}			/* 0 terminated list. */
+};
+
+/*
+ *	pci_device_id	table for which devices we are looking for
+ */
+static const struct pci_device_id i7core_pci_tbl[] = {
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_X58_HUB_MGMT)},
+	{PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_LYNNFIELD_QPI_LINK0)},
+	{0,}			/* 0 terminated list. */
+};
+
+/****************************************************************************
+			Ancillary status routines
+ ****************************************************************************/
+
+	/* MC_CONTROL bits */
+#define CH_ACTIVE(pvt, ch)	((pvt)->info.mc_control & (1 << (8 + ch)))
+#define ECCx8(pvt)		((pvt)->info.mc_control & (1 << 1))
+
+	/* MC_STATUS bits */
+#define ECC_ENABLED(pvt)	((pvt)->info.mc_status & (1 << 4))
+#define CH_DISABLED(pvt, ch)	((pvt)->info.mc_status & (1 << ch))
+
+	/* MC_MAX_DOD read functions */
+static inline int numdimms(u32 dimms)
+{
+	return (dimms & 0x3) + 1;
+}
+
+static inline int numrank(u32 rank)
+{
+	static const int ranks[] = { 1, 2, 4, -EINVAL };
+
+	return ranks[rank & 0x3];
+}
+
+static inline int numbank(u32 bank)
+{
+	static const int banks[] = { 4, 8, 16, -EINVAL };
+
+	return banks[bank & 0x3];
+}
+
+static inline int numrow(u32 row)
+{
+	static const int rows[] = {
+		1 << 12, 1 << 13, 1 << 14, 1 << 15,
+		1 << 16, -EINVAL, -EINVAL, -EINVAL,
+	};
+
+	return rows[row & 0x7];
+}
+
+static inline int numcol(u32 col)
+{
+	static const int cols[] = {
+		1 << 10, 1 << 11, 1 << 12, -EINVAL,
+	};
+	return cols[col & 0x3];
+}
+
+static struct i7core_dev *get_i7core_dev(u8 socket)
+{
+	struct i7core_dev *i7core_dev;
+
+	list_for_each_entry(i7core_dev, &i7core_edac_list, list) {
+		if (i7core_dev->socket == socket)
+			return i7core_dev;
+	}
+
+	return NULL;
+}
+
+static struct i7core_dev *alloc_i7core_dev(u8 socket,
+					   const struct pci_id_table *table)
+{
+	struct i7core_dev *i7core_dev;
+
+	i7core_dev = kzalloc(sizeof(*i7core_dev), GFP_KERNEL);
+	if (!i7core_dev)
+		return NULL;
+
+	i7core_dev->pdev = kzalloc(sizeof(*i7core_dev->pdev) * table->n_devs,
+				   GFP_KERNEL);
+	if (!i7core_dev->pdev) {
+		kfree(i7core_dev);
+		return NULL;
+	}
+
+	i7core_dev->socket = socket;
+	i7core_dev->n_devs = table->n_devs;
+	list_add_tail(&i7core_dev->list, &i7core_edac_list);
+
+	return i7core_dev;
+}
+
+static void free_i7core_dev(struct i7core_dev *i7core_dev)
+{
+	list_del(&i7core_dev->list);
+	kfree(i7core_dev->pdev);
+	kfree(i7core_dev);
+}
+
+/****************************************************************************
+			Memory check routines
+ ****************************************************************************/
+
+static int get_dimm_config(struct mem_ctl_info *mci)
+{
+	struct i7core_pvt *pvt = mci->pvt_info;
+	struct pci_dev *pdev;
+	int i, j;
+	enum edac_type mode;
+	enum mem_type mtype;
+	struct dimm_info *dimm;
+
+	/* Get data from the MC register, function 0 */
+	pdev = pvt->pci_mcr[0];
+	if (!pdev)
+		return -ENODEV;
+
+	/* Device 3 function 0 reads */
+	pci_read_config_dword(pdev, MC_CONTROL, &pvt->info.mc_control);
+	pci_read_config_dword(pdev, MC_STATUS, &pvt->info.mc_status);
+	pci_read_config_dword(pdev, MC_MAX_DOD, &pvt->info.max_dod);
+	pci_read_config_dword(pdev, MC_CHANNEL_MAPPER, &pvt->info.ch_map);
+
+	edac_dbg(0, "QPI %d control=0x%08x status=0x%08x dod=0x%08x map=0x%08x\n",
+		 pvt->i7core_dev->socket, pvt->info.mc_control,
+		 pvt->info.mc_status, pvt->info.max_dod, pvt->info.ch_map);
+
+	if (ECC_ENABLED(pvt)) {
+		edac_dbg(0, "ECC enabled with x%d SDCC\n", ECCx8(pvt) ? 8 : 4);
+		if (ECCx8(pvt))
+			mode = EDAC_S8ECD8ED;
+		else
+			mode = EDAC_S4ECD4ED;
+	} else {
+		edac_dbg(0, "ECC disabled\n");
+		mode = EDAC_NONE;
+	}
+
+	/* FIXME: need to handle the error codes */
+	edac_dbg(0, "DOD Max limits: DIMMS: %d, %d-ranked, %d-banked x%x x 0x%x\n",
+		 numdimms(pvt->info.max_dod),
+		 numrank(pvt->info.max_dod >> 2),
+		 numbank(pvt->info.max_dod >> 4),
+		 numrow(pvt->info.max_dod >> 6),
+		 numcol(pvt->info.max_dod >> 9));
+
+	for (i = 0; i < NUM_CHANS; i++) {
+		u32 data, dimm_dod[3], value[8];
+
+		if (!pvt->pci_ch[i][0])
+			continue;
+
+		if (!CH_ACTIVE(pvt, i)) {
+			edac_dbg(0, "Channel %i is not active\n", i);
+			continue;
+		}
+		if (CH_DISABLED(pvt, i)) {
+			edac_dbg(0, "Channel %i is disabled\n", i);
+			continue;
+		}
+
+		/* Devices 4-6 function 0 */
+		pci_read_config_dword(pvt->pci_ch[i][0],
+				MC_CHANNEL_DIMM_INIT_PARAMS, &data);
+
+
+		if (data & THREE_DIMMS_PRESENT)
+			pvt->channel[i].is_3dimms_present = true;
+
+		if (data & SINGLE_QUAD_RANK_PRESENT)
+			pvt->channel[i].is_single_4rank = true;
+
+		if (data & QUAD_RANK_PRESENT)
+			pvt->channel[i].has_4rank = true;
+
+		if (data & REGISTERED_DIMM)
+			mtype = MEM_RDDR3;
+		else
+			mtype = MEM_DDR3;
+
+		/* Devices 4-6 function 1 */
+		pci_read_config_dword(pvt->pci_ch[i][1],
+				MC_DOD_CH_DIMM0, &dimm_dod[0]);
+		pci_read_config_dword(pvt->pci_ch[i][1],
+				MC_DOD_CH_DIMM1, &dimm_dod[1]);
+		pci_read_config_dword(pvt->pci_ch[i][1],
+				MC_DOD_CH_DIMM2, &dimm_dod[2]);
+
+		edac_dbg(0, "Ch%d phy rd%d, wr%d (0x%08x): %s%s%s%cDIMMs\n",
+			 i,
+			 RDLCH(pvt->info.ch_map, i), WRLCH(pvt->info.ch_map, i),
+			 data,
+			 pvt->channel[i].is_3dimms_present ? "3DIMMS " : "",
+			 pvt->channel[i].is_3dimms_present ? "SINGLE_4R " : "",
+			 pvt->channel[i].has_4rank ? "HAS_4R " : "",
+			 (data & REGISTERED_DIMM) ? 'R' : 'U');
+
+		for (j = 0; j < 3; j++) {
+			u32 banks, ranks, rows, cols;
+			u32 size, npages;
+
+			if (!DIMM_PRESENT(dimm_dod[j]))
+				continue;
+
+			dimm = EDAC_DIMM_PTR(mci->layers, mci->dimms, mci->n_layers,
+				       i, j, 0);
+			banks = numbank(MC_DOD_NUMBANK(dimm_dod[j]));
+			ranks = numrank(MC_DOD_NUMRANK(dimm_dod[j]));
+			rows = numrow(MC_DOD_NUMROW(dimm_dod[j]));
+			cols = numcol(MC_DOD_NUMCOL(dimm_dod[j]));
+
+			/* DDR3 has 8 I/O banks */
+			size = (rows * cols * banks * ranks) >> (20 - 3);
+
+			edac_dbg(0, "\tdimm %d %d Mb offset: %x, bank: %d, rank: %d, row: %#x, col: %#x\n",
+				 j, size,
+				 RANKOFFSET(dimm_dod[j]),
+				 banks, ranks, rows, cols);
+
+			npages = MiB_TO_PAGES(size);
+
+			dimm->nr_pages = npages;
+
+			switch (banks) {
+			case 4:
+				dimm->dtype = DEV_X4;
+				break;
+			case 8:
+				dimm->dtype = DEV_X8;
+				break;
+			case 16:
+				dimm->dtype = DEV_X16;
+				break;
+			default:
+				dimm->dtype = DEV_UNKNOWN;
+			}
+
+			snprintf(dimm->label, sizeof(dimm->label),
+				 "CPU#%uChannel#%u_DIMM#%u",
+				 pvt->i7core_dev->socket, i, j);
+			dimm->grain = 8;
+			dimm->edac_mode = mode;
+			dimm->mtype = mtype;
+		}
+
+		pci_read_config_dword(pdev, MC_SAG_CH_0, &value[0]);
+		pci_read_config_dword(pdev, MC_SAG_CH_1, &value[1]);
+		pci_read_config_dword(pdev, MC_SAG_CH_2, &value[2]);
+		pci_read_config_dword(pdev, MC_SAG_CH_3, &value[3]);
+		pci_read_config_dword(pdev, MC_SAG_CH_4, &value[4]);
+		pci_read_config_dword(pdev, MC_SAG_CH_5, &value[5]);
+		pci_read_config_dword(pdev, MC_SAG_CH_6, &value[6]);
+		pci_read_config_dword(pdev, MC_SAG_CH_7, &value[7]);
+		edac_dbg(1, "\t[%i] DIVBY3\tREMOVED\tOFFSET\n", i);
+		for (j = 0; j < 8; j++)
+			edac_dbg(1, "\t\t%#x\t%#x\t%#x\n",
+				 (value[j] >> 27) & 0x1,
+				 (value[j] >> 24) & 0x7,
+				 (value[j] & ((1 << 24) - 1)));
+	}
+
+	return 0;
+}
+
+/****************************************************************************
+			Error insertion routines
+ ****************************************************************************/
+
+#define to_mci(k) container_of(k, struct mem_ctl_info, dev)
+
+/* The i7core has independent error injection features per channel.
+   However, to have a simpler code, we don't allow enabling error injection
+   on more than one channel.
+   Also, since a change at an inject parameter will be applied only at enable,
+   we're disabling error injection on all write calls to the sysfs nodes that
+   controls the error code injection.
+ */
+static int disable_inject(const struct mem_ctl_info *mci)
+{
+	struct i7core_pvt *pvt = mci->pvt_info;
+
+	pvt->inject.enable = 0;
+
+	if (!pvt->pci_ch[pvt->inject.channel][0])
+		return -ENODEV;
+
+	pci_write_config_dword(pvt->pci_ch[pvt->inject.channel][0],
+				MC_CHANNEL_ERROR_INJECT, 0);
+
+	return 0;
+}
+
+/*
+ * i7core inject inject.section
+ *
+ *	accept and store error injection inject.section value
+ *	bit 0 - refers to the lower 32-byte half cacheline
+ *	bit 1 - refers to the upper 32-byte half cacheline
+ */
+static ssize_t i7core_inject_section_store(struct device *dev,
+					   struct device_attribute *mattr,
+					   const char *data, size_t count)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	struct i7core_pvt *pvt = mci->pvt_info;
+	unsigned long value;
+	int rc;
+
+	if (pvt->inject.enable)
+		disable_inject(mci);
+
+	rc = kstrtoul(data, 10, &value);
+	if ((rc < 0) || (value > 3))
+		return -EIO;
+
+	pvt->inject.section = (u32) value;
+	return count;
+}
+
+static ssize_t i7core_inject_section_show(struct device *dev,
+					  struct device_attribute *mattr,
+					  char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	struct i7core_pvt *pvt = mci->pvt_info;
+	return sprintf(data, "0x%08x\n", pvt->inject.section);
+}
+
+/*
+ * i7core inject.type
+ *
+ *	accept and store error injection inject.section value
+ *	bit 0 - repeat enable - Enable error repetition
+ *	bit 1 - inject ECC error
+ *	bit 2 - inject parity error
+ */
+static ssize_t i7core_inject_type_store(struct device *dev,
+					struct device_attribute *mattr,
+					const char *data, size_t count)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+struct i7core_pvt *pvt = mci->pvt_info;
+	unsigned long value;
+	int rc;
+
+	if (pvt->inject.enable)
+		disable_inject(mci);
+
+	rc = kstrtoul(data, 10, &value);
+	if ((rc < 0) || (value > 7))
+		return -EIO;
+
+	pvt->inject.type = (u32) value;
+	return count;
+}
+
+static ssize_t i7core_inject_type_show(struct device *dev,
+				       struct device_attribute *mattr,
+				       char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	struct i7core_pvt *pvt = mci->pvt_info;
+
+	return sprintf(data, "0x%08x\n", pvt->inject.type);
+}
+
+/*
+ * i7core_inject_inject.eccmask_store
+ *
+ * The type of error (UE/CE) will depend on the inject.eccmask value:
+ *   Any bits set to a 1 will flip the corresponding ECC bit
+ *   Correctable errors can be injected by flipping 1 bit or the bits within
+ *   a symbol pair (2 consecutive aligned 8-bit pairs - i.e. 7:0 and 15:8 or
+ *   23:16 and 31:24). Flipping bits in two symbol pairs will cause an
+ *   uncorrectable error to be injected.
+ */
+static ssize_t i7core_inject_eccmask_store(struct device *dev,
+					   struct device_attribute *mattr,
+					   const char *data, size_t count)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	struct i7core_pvt *pvt = mci->pvt_info;
+	unsigned long value;
+	int rc;
+
+	if (pvt->inject.enable)
+		disable_inject(mci);
+
+	rc = kstrtoul(data, 10, &value);
+	if (rc < 0)
+		return -EIO;
+
+	pvt->inject.eccmask = (u32) value;
+	return count;
+}
+
+static ssize_t i7core_inject_eccmask_show(struct device *dev,
+					  struct device_attribute *mattr,
+					  char *data)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	struct i7core_pvt *pvt = mci->pvt_info;
+
+	return sprintf(data, "0x%08x\n", pvt->inject.eccmask);
+}
+
+/*
+ * i7core_addrmatch
+ *
+ * The type of error (UE/CE) will depend on the inject.eccmask value:
+ *   Any bits set to a 1 will flip the corresponding ECC bit
+ *   Correctable errors can be injected by flipping 1 bit or the bits within
+ *   a symbol pair (2 consecutive aligned 8-bit pairs - i.e. 7:0 and 15:8 or
+ *   23:16 and 31:24). Flipping bits in two symbol pairs will cause an
+ *   uncorrectable error to be injected.
+ */
+
+#define DECLARE_ADDR_MATCH(param, limit)			\
+static ssize_t i7core_inject_store_##param(			\
+	struct device *dev,					\
+	struct device_attribute *mattr,				\
+	const char *data, size_t count)				\
+{								\
+	struct mem_ctl_info *mci = dev_get_drvdata(dev);	\
+	struct i7core_pvt *pvt;					\
+	long value;						\
+	int rc;							\
+								\
+	edac_dbg(1, "\n");					\
+	pvt = mci->pvt_info;					\
+								\
+	if (pvt->inject.enable)					\
+		disable_inject(mci);				\
+								\
+	if (!strcasecmp(data, "any") || !strcasecmp(data, "any\n"))\
+		value = -1;					\
+	else {							\
+		rc = kstrtoul(data, 10, &value);		\
+		if ((rc < 0) || (value >= limit))		\
+			return -EIO;				\
+	}							\
+								\
+	pvt->inject.param = value;				\
+								\
+	return count;						\
+}								\
+								\
+static ssize_t i7core_inject_show_##param(			\
+	struct device *dev,					\
+	struct device_attribute *mattr,				\
+	char *data)						\
+{								\
+	struct mem_ctl_info *mci = dev_get_drvdata(dev);	\
+	struct i7core_pvt *pvt;					\
+								\
+	pvt = mci->pvt_info;					\
+	edac_dbg(1, "pvt=%p\n", pvt);				\
+	if (pvt->inject.param < 0)				\
+		return sprintf(data, "any\n");			\
+	else							\
+		return sprintf(data, "%d\n", pvt->inject.param);\
+}
+
+#define ATTR_ADDR_MATCH(param)					\
+	static DEVICE_ATTR(param, S_IRUGO | S_IWUSR,		\
+		    i7core_inject_show_##param,			\
+		    i7core_inject_store_##param)
+
+DECLARE_ADDR_MATCH(channel, 3);
+DECLARE_ADDR_MATCH(dimm, 3);
+DECLARE_ADDR_MATCH(rank, 4);
+DECLARE_ADDR_MATCH(bank, 32);
+DECLARE_ADDR_MATCH(page, 0x10000);
+DECLARE_ADDR_MATCH(col, 0x4000);
+
+ATTR_ADDR_MATCH(channel);
+ATTR_ADDR_MATCH(dimm);
+ATTR_ADDR_MATCH(rank);
+ATTR_ADDR_MATCH(bank);
+ATTR_ADDR_MATCH(page);
+ATTR_ADDR_MATCH(col);
+
+static int write_and_test(struct pci_dev *dev, const int where, const u32 val)
+{
+	u32 read;
+	int count;
+
+	edac_dbg(0, "setting pci %02x:%02x.%x reg=%02x value=%08x\n",
+		 dev->bus->number, PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+		 where, val);
+
+	for (count = 0; count < 10; count++) {
+		if (count)
+			msleep(100);
+		pci_write_config_dword(dev, where, val);
+		pci_read_config_dword(dev, where, &read);
+
+		if (read == val)
+			return 0;
+	}
+
+	i7core_printk(KERN_ERR, "Error during set pci %02x:%02x.%x reg=%02x "
+		"write=%08x. Read=%08x\n",
+		dev->bus->number, PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn),
+		where, val, read);
+
+	return -EINVAL;
+}
+
+/*
+ * This routine prepares the Memory Controller for error injection.
+ * The error will be injected when some process tries to write to the
+ * memory that matches the given criteria.
+ * The criteria can be set in terms of a mask where dimm, rank, bank, page
+ * and col can be specified.
+ * A -1 value for any of the mask items will make the MCU to ignore
+ * that matching criteria for error injection.
+ *
+ * It should be noticed that the error will only happen after a write operation
+ * on a memory that matches the condition. if REPEAT_EN is not enabled at
+ * inject mask, then it will produce just one error. Otherwise, it will repeat
+ * until the injectmask would be cleaned.
+ *
+ * FIXME: This routine assumes that MAXNUMDIMMS value of MC_MAX_DOD
+ *    is reliable enough to check if the MC is using the
+ *    three channels. However, this is not clear at the datasheet.
+ */
+static ssize_t i7core_inject_enable_store(struct device *dev,
+					  struct device_attribute *mattr,
+					  const char *data, size_t count)
+{
+	struct mem_ctl_info *mci = to_mci(dev);
+	struct i7core_pvt *pvt = mci->pvt_info;
+	u32 injectmask;
+	u64 mask = 0;
+	int  rc;
+	long enable;
+
+	if (!pvt->pci_ch[pvt->inject.channel][0])
+		return 0;
+
+	rc = kstrtoul(data, 10, &enable);
+	if ((rc < 0))
+		return 0;
+
+	if (enable) {
+		pvt->inject.enable = 1;
+	} else {
+		disable_inject(mci);
+		return count;
+	}
+
+	/* Sets pvt->inject.dimm mask */
+	if (pvt->inject.dimm < 0)
+		mask |= 1LL << 41;
+	else {
+		if (pvt->channel[pvt->inject.channel].dimms > 2)
+			mask |= (pvt->inject.dimm & 0x3LL) << 35;
+		else
+			mask |= (pvt->inject.dimm & 0x1LL) << 36;
+	}
+
+	/* Sets pvt->inject.rank mask */
+	if (pvt->inject.rank < 0)
+		mask |= 1LL << 40;
+	else {
+		if (pvt->channel[pvt->inject.channel].dimms > 2)
+			mask |= (pvt->inject.rank & 0x1LL) << 34;
+		else
+			mask |= (pvt->inject.rank & 0x3LL) << 34;
+	}
+
+	/* Sets pvt->inject.bank mask */
+	if (pvt->inject.bank < 0)
+		mask |= 1LL << 39;
+	else
+		mask |= (pvt->inject.b

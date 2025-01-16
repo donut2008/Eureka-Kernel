@@ -1,43 +1,26 @@
-# define_trace.h needs to know how to find our header
-CFLAGS_trace.o				:= -I$(src)
-
-obj-$(CONFIG_USB_DWC3)			+= dwc3.o
-
-dwc3-y					:= core.o debug.o trace.o
-
-dwc3-y					+= otg.o
-
-ifneq ($(filter y,$(CONFIG_USB_DWC3_HOST) $(CONFIG_USB_DWC3_DUAL_ROLE)),)
-	dwc3-y				+= host.o
-endif
-
-ifneq ($(filter y,$(CONFIG_USB_DWC3_GADGET) $(CONFIG_USB_DWC3_DUAL_ROLE)),)
-	dwc3-y				+= gadget.o ep0.o
-endif
-
-ifneq ($(CONFIG_USB_DWC3_ULPI),)
-	dwc3-y				+= ulpi.o
-endif
-
-ifneq ($(CONFIG_DEBUG_FS),)
-	dwc3-y				+= debugfs.o
-endif
-
-##
-# Platform-specific glue layers go here
-#
-# NOTICE: Make sure your glue layer doesn't depend on anything
-# which is arch-specific and that it compiles on all situations.
-#
-# We want to keep this requirement in order to be able to compile
-# the entire driver (with all its glue layers) on several architectures
-# and make sure it compiles fine. This will also help with allmodconfig
-# and allyesconfig builds.
-##
-
-obj-$(CONFIG_USB_DWC3_OMAP)		+= dwc3-omap.o
-obj-$(CONFIG_USB_DWC3_EXYNOS)		+= dwc3-exynos.o
-obj-$(CONFIG_USB_DWC3_PCI)		+= dwc3-pci.o
-obj-$(CONFIG_USB_DWC3_KEYSTONE)		+= dwc3-keystone.o
-obj-$(CONFIG_USB_DWC3_QCOM)		+= dwc3-qcom.o
-obj-$(CONFIG_USB_DWC3_ST)		+= dwc3-st.o
+b
+#define THM_TMON2_CTRL__DEBUG_MODE_MASK 0x1000
+#define THM_TMON2_CTRL__DEBUG_MODE__SHIFT 0xc
+#define THM_TMON2_CTRL__EN_CFG_SERDES_MASK 0x2000
+#define THM_TMON2_CTRL__EN_CFG_SERDES__SHIFT 0xd
+#define THM_TMON2_CTRL2__RDIL_PRESENT_MASK 0xffff
+#define THM_TMON2_CTRL2__RDIL_PRESENT__SHIFT 0x0
+#define THM_TMON2_CTRL2__RDIR_PRESENT_MASK 0xffff0000
+#define THM_TMON2_CTRL2__RDIR_PRESENT__SHIFT 0x10
+#define THM_TMON2_CSR_WR__CSR_WRITE_MASK 0x1
+#define THM_TMON2_CSR_WR__CSR_WRITE__SHIFT 0x0
+#define THM_TMON2_CSR_WR__CSR_READ_MASK 0x2
+#define THM_TMON2_CSR_WR__CSR_READ__SHIFT 0x1
+#define THM_TMON2_CSR_WR__CSR_ADDR_MASK 0xffc
+#define THM_TMON2_CSR_WR__CSR_ADDR__SHIFT 0x2
+#define THM_TMON2_CSR_WR__WRITE_DATA_MASK 0xfff000
+#define THM_TMON2_CSR_WR__WRITE_DATA__SHIFT 0xc
+#define THM_TMON2_CSR_WR__SPARE_MASK 0x1000000
+#define THM_TMON2_CSR_WR__SPARE__SHIFT 0x18
+#define THM_TMON2_CSR_RD__READ_DATA_MASK 0xfff
+#define THM_TMON2_CSR_RD__READ_DATA__SHIFT 0x0
+#define CG_FDO_CTRL0__FDO_STATIC_DUTY_MASK 0xff
+#define CG_FDO_CTRL0__FDO_STATIC_DUTY__SHIFT 0x0
+#define CG_FDO_CTRL0__FAN_SPINUP_DUTY_MASK 0xff00
+#define CG_FDO_CTRL0__FAN_SPINUP_DUTY__SHIFT 0x8
+#define CG_FDO_CTRL0__FDO_PWM_MANUAL_MASK 0x10000

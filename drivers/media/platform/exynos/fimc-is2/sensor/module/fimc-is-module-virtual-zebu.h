@@ -1,27 +1,4 @@
-/*
- * Samsung Exynos5 SoC series Sensor driver
- *
- *
- * Copyright (c) 2011 Samsung Electronics Co., Ltd
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#ifndef FIMC_IS_DEVICE_VIRTUAL_ZEBU_H
-#define FIMC_IS_DEVICE_VIRTUAL_ZEBU_H
-
-#define SENSOR_VIRTUAL_ZEBU_INSTANCE	1
-#define SENSOR_VIRTUAL_ZEBU_NAME	SENSOR_NAME_VIRTUAL_ZEBU
-
-struct fimc_is_module_virtual_zebu {
-	u16		vis_duration;
-	u16		frame_length_line;
-	u32		line_length_pck;
-	u32		system_clock;
-};
-int sensor_virtual_zebu_vision_probe(struct i2c_client *client,
-	const struct i2c_device_id *id);
-int sensor_virtual_zebu_probe(struct platform_device *pdev);
-#endif
+‘fÙfn¶^Ò}røf¯…÷…øŠ©RÙSsY^_U`ä’d–·PQİR SGSìSèTFU1UVhY¾Y<Zµ[\\\\„^Š^à^p_b„bÛbŒcwcff-fvf~g¢hj5j¼lˆm	nXn<q&qgqÇuw]xyeyğyàz{§|9}–€Öƒ‹„I…]ˆóˆŠ<ŠTŠsŠaŒŞŒ¤‘f’~“”œ–˜—
+NNNWN—QpRÎW4XÌX"[8^Å`şdagVgDm¶rsucz¸„r‹¸‘ “1VôWş˜íbi–kíqT~w€r‚æ‰ß˜U‡±;\8OáOµOU Zİ[é[Ã_Na/c°eKfîh›ixmñm3u¹uw^yæy3}ã¯‚ª…ª‰:Š«›2İ‘—ºNÁNRuXìX\u=\N
+ŠÅc–m—%{ÏŠ˜b‘óV¨S9T‚W%^¨c4lŠpaw‹|àpˆBT‘““–^tÄš]i]pe¢g¨Û–ncIgiÅƒ˜À–şˆ„ozdø[N,p]u/fÄQ6RâRÓY_'`b?eteftfòhhcknrruÛv¾|V€ğXıˆ‰ Š“ŠËŠ’‘R—Y—‰ez»–-^Ü`b¥efgówMzM|>~
+¬Œdá_©xRÙb¥cBd˜b-ŠƒzÀ{¬Šê–v}‚I‡ÙNHQCS`S£[\\İ]&bGb°dh4hÉlEmmÓg\oNq}qËez­{Ú}J~¨z‚9‚¦…nŠÎŒõxw­’‘’ƒ•®›MR„U8o6qhQ…yU~³Î|LVQX¨\ªcşfıfZiÙruuyVyßy—| }D}†4Š;–a ŸçPuRÌSâS	PªUîXOY=r‹[d\Sã`ó`\cƒc?c»cÍdéeùfã]Íiıioåq‰Néuøv“zß|Ï}œ}a€IƒXƒl„

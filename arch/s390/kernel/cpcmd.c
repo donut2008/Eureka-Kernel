@@ -1,117 +1,87 @@
 /*
- *  S390 version
- *    Copyright IBM Corp. 1999, 2007
- *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com),
- *               Christian Borntraeger (cborntra@de.ibm.com),
+ * This file contains the code that gets mapped at the upper end of each task's text
+ * region.  For now, it contains the signal trampoline code only.
+ *
+ * Copyright (C) 1999-2003 Hewlett-Packard Co
+ * 	David Mosberger-Tang <davidm@hpl.hp.com>
  */
 
-#define KMSG_COMPONENT "cpcmd"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/spinlock.h>
-#include <linux/stddef.h>
-#include <linux/string.h>
-#include <asm/diag.h>
-#include <asm/ebcdic.h>
-#include <asm/cpcmd.h>
-#include <asm/io.h>
-
-static DEFINE_SPINLOCK(cpcmd_lock);
-static char cpcmd_buf[241];
-
-static int diag8_noresponse(int cmdlen)
-{
-	register unsigned long reg2 asm ("2") = (addr_t) cpcmd_buf;
-	register unsigned long reg3 asm ("3") = cmdlen;
-
-	asm volatile(
-		"	sam31\n"
-		"	diag	%1,%0,0x8\n"
-		"	sam64\n"
-		: "+d" (reg3) : "d" (reg2) : "cc");
-	return reg3;
-}
-
-static int diag8_response(int cmdlen, char *response, int *rlen)
-{
-	unsigned long _cmdlen = cmdlen | 0x40000000L;
-	unsigned long _rlen = *rlen;
-	register unsigned long reg2 asm ("2") = (addr_t) cpcmd_buf;
-	register unsigned long reg3 asm ("3") = (addr_t) response;
-	register unsigned long reg4 asm ("4") = _cmdlen;
-	register unsigned long reg5 asm ("5") = _rlen;
-
-	asm volatile(
-		"	sam31\n"
-		"	diag	%2,%0,0x8\n"
-		"	sam64\n"
-		"	brc	8,1f\n"
-		"	agr	%1,%4\n"
-		"1:\n"
-		: "+d" (reg4), "+d" (reg5)
-		: "d" (reg2), "d" (reg3), "d" (*rlen) : "cc");
-	*rlen = reg5;
-	return reg4;
-}
+#include <asm/asmmacro.h>
+#include <asm/errno.h>
+#include <asm/asm-offsets.h>
+#include <asm/sigcontext.h>
+#include <asm/unistd.h>
+#include <asm/kregs.h>
+#include <asm/page.h>
+#include <asm/native/inst.h>
 
 /*
- * __cpcmd has some restrictions over cpcmd
- *  - the response buffer must reside below 2GB (if any)
- *  - __cpcmd is unlocked and therefore not SMP-safe
+ * We can't easily refer to symbols inside the kernel.  To avoid full runtime relocation,
+ * complications with the linker (which likes to create PLT stubs for branches
+ * to targets outside the shared object) and to avoid multi-phase kernel builds, we
+ * simply create minimalistic "patch lists" in special ELF sections.
  */
-int  __cpcmd(const char *cmd, char *response, int rlen, int *response_code)
-{
-	int cmdlen;
-	int rc;
-	int response_len;
+	.section ".data..patch.fsyscall_table", "a"
+	.previous
+#define LOAD_FSYSCALL_TABLE(reg)			\
+[1:]	movl reg=0;					\
+	.xdata4 ".data..patch.fsyscall_table", 1b-.
 
-	cmdlen = strlen(cmd);
-	BUG_ON(cmdlen > 240);
-	memcpy(cpcmd_buf, cmd, cmdlen);
-	ASCEBC(cpcmd_buf, cmdlen);
+	.section ".data..patch.brl_fsys_bubble_down", "a"
+	.previous
+#define BRL_COND_FSYS_BUBBLE_DOWN(pr)			\
+[1:](pr)brl.cond.sptk 0;				\
+	;;						\
+	.xdata4 ".data..patch.brl_fsys_bubble_down", 1b-.
 
-	diag_stat_inc(DIAG_STAT_X008);
-	if (response) {
-		memset(response, 0, rlen);
-		response_len = rlen;
-		rc = diag8_response(cmdlen, response, &rlen);
-		EBCASC(response, response_len);
-        } else {
-		rc = diag8_noresponse(cmdlen);
-        }
-	if (response_code)
-		*response_code = rc;
-	return rlen;
+GLOBAL_ENTRY(__kernel_syscall_via_break)
+	.prologue
+	.altrp b6
+	.body
+	/*
+	 * Note: for (fast) syscall restart to work, the break instruction must be
+	 *	 the first one in the bundle addressed by syscall_via_break.
+	 */
+{ .mib
+	break 0x100000
+	nop.i 0
+	br.ret.sptk.many b6
 }
-EXPORT_SYMBOL(__cpcmd);
+END(__kernel_syscall_via_break)
 
-int cpcmd(const char *cmd, char *response, int rlen, int *response_code)
-{
-	char *lowbuf;
-	int len;
-	unsigned long flags;
+#	define ARG0_OFF		(16 + IA64_SIGFRAME_ARG0_OFFSET)
+#	define ARG1_OFF		(16 + IA64_SIGFRAME_ARG1_OFFSET)
+#	define ARG2_OFF		(16 + IA64_SIGFRAME_ARG2_OFFSET)
+#	define SIGHANDLER_OFF	(16 + IA64_SIGFRAME_HANDLER_OFFSET)
+#	define SIGCONTEXT_OFF	(16 + IA64_SIGFRAME_SIGCONTEXT_OFFSET)
 
-	if ((virt_to_phys(response) != (unsigned long) response) ||
-			(((unsigned long)response + rlen) >> 31)) {
-		lowbuf = kmalloc(rlen, GFP_KERNEL | GFP_DMA);
-		if (!lowbuf) {
-			pr_warning("The cpcmd kernel function failed to "
-				   "allocate a response buffer\n");
-			return -ENOMEM;
-		}
-		spin_lock_irqsave(&cpcmd_lock, flags);
-		len = __cpcmd(cmd, lowbuf, rlen, response_code);
-		spin_unlock_irqrestore(&cpcmd_lock, flags);
-		memcpy(response, lowbuf, rlen);
-		kfree(lowbuf);
-	} else {
-		spin_lock_irqsave(&cpcmd_lock, flags);
-		len = __cpcmd(cmd, response, rlen, response_code);
-		spin_unlock_irqrestore(&cpcmd_lock, flags);
-	}
-	return len;
-}
-EXPORT_SYMBOL(cpcmd);
+#	define FLAGS_OFF	IA64_SIGCONTEXT_FLAGS_OFFSET
+#	define CFM_OFF		IA64_SIGCONTEXT_CFM_OFFSET
+#	define FR6_OFF		IA64_SIGCONTEXT_FR6_OFFSET
+#	define BSP_OFF		IA64_SIGCONTEXT_AR_BSP_OFFSET
+#	define RNAT_OFF		IA64_SIGCONTEXT_AR_RNAT_OFFSET
+#	define UNAT_OFF		IA64_SIGCONTEXT_AR_UNAT_OFFSET
+#	define FPSR_OFF		IA64_SIGCONTEXT_AR_FPSR_OFFSET
+#	define PR_OFF		IA64_SIGCONTEXT_PR_OFFSET
+#	define RP_OFF		IA64_SIGCONTEXT_IP_OFFSET
+#	define SP_OFF		IA64_SIGCONTEXT_R12_OFFSET
+#	define RBS_BASE_OFF	IA64_SIGCONTEXT_RBS_BASE_OFFSET
+#	define LOADRS_OFF	IA64_SIGCONTEXT_LOADRS_OFFSET
+#	define base0		r2
+#	define base1		r3
+	/*
+	 * When we get here, the memory stack looks like this:
+	 *
+	 *   +===============================+
+       	 *   |				     |
+       	 *   //	    struct sigframe          //
+       	 *   |				     |
+	 *   +-------------------------------+ <-- sp+16
+	 *   |      16 byte of scratch       |
+	 *   |            space              |
+	 *   +-------------------------------+ <-- sp
+	 *
+	 * The register stack looks _exactly_ the way it looked at the time the signal
+	 * occurred.  In other words, we're treading on a potential mine-field: each
+	 * incoming general register may be a NaT val

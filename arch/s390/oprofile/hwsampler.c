@@ -1,1178 +1,669 @@
-/*
- * Copyright IBM Corp. 2010
- * Author: Heinz Graalfs <graalfs@de.ibm.com>
- */
-
-#include <linux/kernel_stat.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/smp.h>
-#include <linux/errno.h>
-#include <linux/workqueue.h>
-#include <linux/interrupt.h>
-#include <linux/notifier.h>
-#include <linux/cpu.h>
-#include <linux/semaphore.h>
-#include <linux/oom.h>
-#include <linux/oprofile.h>
-
-#include <asm/facility.h>
-#include <asm/cpu_mf.h>
-#include <asm/irq.h>
-
-#include "hwsampler.h"
-#include "op_counter.h"
-
-#define MAX_NUM_SDB 511
-#define MIN_NUM_SDB 1
-
-DECLARE_PER_CPU(struct hws_cpu_buffer, sampler_cpu_buffer);
-
-struct hws_execute_parms {
-	void *buffer;
-	signed int rc;
-};
-
-DEFINE_PER_CPU(struct hws_cpu_buffer, sampler_cpu_buffer);
-EXPORT_PER_CPU_SYMBOL(sampler_cpu_buffer);
-
-static DEFINE_MUTEX(hws_sem);
-static DEFINE_MUTEX(hws_sem_oom);
-
-static unsigned char hws_flush_all;
-static unsigned int hws_oom;
-static unsigned int hws_alert;
-static struct workqueue_struct *hws_wq;
-
-static unsigned int hws_state;
-enum {
-	HWS_INIT = 1,
-	HWS_DEALLOCATED,
-	HWS_STOPPED,
-	HWS_STARTED,
-	HWS_STOPPING };
-
-/* set to 1 if called by kernel during memory allocation */
-static unsigned char oom_killer_was_active;
-/* size of SDBT and SDB as of allocate API */
-static unsigned long num_sdbt = 100;
-static unsigned long num_sdb = 511;
-/* sampling interval (machine cycles) */
-static unsigned long interval;
-
-static unsigned long min_sampler_rate;
-static unsigned long max_sampler_rate;
-
-static void execute_qsi(void *parms)
-{
-	struct hws_execute_parms *ep = parms;
-
-	ep->rc = qsi(ep->buffer);
-}
-
-static void execute_ssctl(void *parms)
-{
-	struct hws_execute_parms *ep = parms;
-
-	ep->rc = lsctl(ep->buffer);
-}
-
-static int smp_ctl_ssctl_stop(int cpu)
-{
-	int rc;
-	struct hws_execute_parms ep;
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-	cb->ssctl.es = 0;
-	cb->ssctl.cs = 0;
-
-	ep.buffer = &cb->ssctl;
-	smp_call_function_single(cpu, execute_ssctl, &ep, 1);
-	rc = ep.rc;
-	if (rc) {
-		printk(KERN_ERR "hwsampler: CPU %d CPUMF SSCTL failed.\n", cpu);
-		dump_stack();
-	}
-
-	ep.buffer = &cb->qsi;
-	smp_call_function_single(cpu, execute_qsi, &ep, 1);
-
-	if (cb->qsi.es || cb->qsi.cs) {
-		printk(KERN_EMERG "CPUMF sampling did not stop properly.\n");
-		dump_stack();
-	}
-
-	return rc;
-}
-
-static int smp_ctl_ssctl_deactivate(int cpu)
-{
-	int rc;
-	struct hws_execute_parms ep;
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-	cb->ssctl.es = 1;
-	cb->ssctl.cs = 0;
-
-	ep.buffer = &cb->ssctl;
-	smp_call_function_single(cpu, execute_ssctl, &ep, 1);
-	rc = ep.rc;
-	if (rc)
-		printk(KERN_ERR "hwsampler: CPU %d CPUMF SSCTL failed.\n", cpu);
-
-	ep.buffer = &cb->qsi;
-	smp_call_function_single(cpu, execute_qsi, &ep, 1);
-
-	if (cb->qsi.cs)
-		printk(KERN_EMERG "CPUMF sampling was not set inactive.\n");
-
-	return rc;
-}
-
-static int smp_ctl_ssctl_enable_activate(int cpu, unsigned long interval)
-{
-	int rc;
-	struct hws_execute_parms ep;
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-	cb->ssctl.h = 1;
-	cb->ssctl.tear = cb->first_sdbt;
-	cb->ssctl.dear = *(unsigned long *) cb->first_sdbt;
-	cb->ssctl.interval = interval;
-	cb->ssctl.es = 1;
-	cb->ssctl.cs = 1;
-
-	ep.buffer = &cb->ssctl;
-	smp_call_function_single(cpu, execute_ssctl, &ep, 1);
-	rc = ep.rc;
-	if (rc)
-		printk(KERN_ERR "hwsampler: CPU %d CPUMF SSCTL failed.\n", cpu);
-
-	ep.buffer = &cb->qsi;
-	smp_call_function_single(cpu, execute_qsi, &ep, 1);
-	if (ep.rc)
-		printk(KERN_ERR "hwsampler: CPU %d CPUMF QSI failed.\n", cpu);
-
-	return rc;
-}
-
-static int smp_ctl_qsi(int cpu)
-{
-	struct hws_execute_parms ep;
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-	ep.buffer = &cb->qsi;
-	smp_call_function_single(cpu, execute_qsi, &ep, 1);
-
-	return ep.rc;
-}
-
-static void hws_ext_handler(struct ext_code ext_code,
-			    unsigned int param32, unsigned long param64)
-{
-	struct hws_cpu_buffer *cb = this_cpu_ptr(&sampler_cpu_buffer);
-
-	if (!(param32 & CPU_MF_INT_SF_MASK))
-		return;
-
-	if (!hws_alert)
-		return;
-
-	inc_irq_stat(IRQEXT_CMS);
-	atomic_xchg(&cb->ext_params, atomic_read(&cb->ext_params) | param32);
-
-	if (hws_wq)
-		queue_work(hws_wq, &cb->worker);
-}
-
-static void worker(struct work_struct *work);
-
-static void add_samples_to_oprofile(unsigned cpu, unsigned long *,
-				unsigned long *dear);
-
-static void init_all_cpu_buffers(void)
-{
-	int cpu;
-	struct hws_cpu_buffer *cb;
-
-	for_each_online_cpu(cpu) {
-		cb = &per_cpu(sampler_cpu_buffer, cpu);
-		memset(cb, 0, sizeof(struct hws_cpu_buffer));
-	}
-}
-
-static void prepare_cpu_buffers(void)
-{
-	struct hws_cpu_buffer *cb;
-	int cpu;
-
-	for_each_online_cpu(cpu) {
-		cb = &per_cpu(sampler_cpu_buffer, cpu);
-		atomic_set(&cb->ext_params, 0);
-		cb->worker_entry = 0;
-		cb->sample_overflow = 0;
-		cb->req_alert = 0;
-		cb->incorrect_sdbt_entry = 0;
-		cb->invalid_entry_address = 0;
-		cb->loss_of_sample_data = 0;
-		cb->sample_auth_change_alert = 0;
-		cb->finish = 0;
-		cb->oom = 0;
-		cb->stop_mode = 0;
-	}
-}
-
-/*
- * allocate_sdbt() - allocate sampler memory
- * @cpu: the cpu for which sampler memory is allocated
- *
- * A 4K page is allocated for each requested SDBT.
- * A maximum of 511 4K pages are allocated for the SDBs in each of the SDBTs.
- * Set ALERT_REQ mask in each SDBs trailer.
- * Returns zero if successful, <0 otherwise.
- */
-static int allocate_sdbt(int cpu)
-{
-	int j, k, rc;
-	unsigned long *sdbt;
-	unsigned long  sdb;
-	unsigned long *tail;
-	unsigned long *trailer;
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-	if (cb->first_sdbt)
-		return -EINVAL;
-
-	sdbt = NULL;
-	tail = sdbt;
-
-	for (j = 0; j < num_sdbt; j++) {
-		sdbt = (unsigned long *)get_zeroed_page(GFP_KERNEL);
-
-		mutex_lock(&hws_sem_oom);
-		/* OOM killer might have been activated */
-		barrier();
-		if (oom_killer_was_active || !sdbt) {
-			if (sdbt)
-				free_page((unsigned long)sdbt);
-
-			goto allocate_sdbt_error;
-		}
-		if (cb->first_sdbt == 0)
-			cb->first_sdbt = (unsigned long)sdbt;
-
-		/* link current page to tail of chain */
-		if (tail)
-			*tail = (unsigned long)(void *)sdbt + 1;
-
-		mutex_unlock(&hws_sem_oom);
-
-		for (k = 0; k < num_sdb; k++) {
-			/* get and set SDB page */
-			sdb = get_zeroed_page(GFP_KERNEL);
-
-			mutex_lock(&hws_sem_oom);
-			/* OOM killer might have been activated */
-			barrier();
-			if (oom_killer_was_active || !sdb) {
-				if (sdb)
-					free_page(sdb);
-
-				goto allocate_sdbt_error;
-			}
-			*sdbt = sdb;
-			trailer = trailer_entry_ptr(*sdbt);
-			*trailer = SDB_TE_ALERT_REQ_MASK;
-			sdbt++;
-			mutex_unlock(&hws_sem_oom);
-		}
-		tail = sdbt;
-	}
-	mutex_lock(&hws_sem_oom);
-	if (oom_killer_was_active)
-		goto allocate_sdbt_error;
-
-	rc = 0;
-	if (tail)
-		*tail = (unsigned long)
-			((void *)cb->first_sdbt) + 1;
-
-allocate_sdbt_exit:
-	mutex_unlock(&hws_sem_oom);
-	return rc;
-
-allocate_sdbt_error:
-	rc = -ENOMEM;
-	goto allocate_sdbt_exit;
-}
-
-/*
- * deallocate_sdbt() - deallocate all sampler memory
- *
- * For each online CPU all SDBT trees are deallocated.
- * Returns the number of freed pages.
- */
-static int deallocate_sdbt(void)
-{
-	int cpu;
-	int counter;
-
-	counter = 0;
-
-	for_each_online_cpu(cpu) {
-		unsigned long start;
-		unsigned long sdbt;
-		unsigned long *curr;
-		struct hws_cpu_buffer *cb;
-
-		cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-		if (!cb->first_sdbt)
-			continue;
-
-		sdbt = cb->first_sdbt;
-		curr = (unsigned long *) sdbt;
-		start = sdbt;
-
-		/* we'll free the SDBT after all SDBs are processed... */
-		while (1) {
-			if (!*curr || !sdbt)
-				break;
-
-			/* watch for link entry reset if found */
-			if (is_link_entry(curr)) {
-				curr = get_next_sdbt(curr);
-				if (sdbt)
-					free_page(sdbt);
-
-				/* we are done if we reach the start */
-				if ((unsigned long) curr == start)
-					break;
-				else
-					sdbt = (unsigned long) curr;
-			} else {
-				/* process SDB pointer */
-				if (*curr) {
-					free_page(*curr);
-					curr++;
+e_addr) ||
+					(regs->b6 == bundle_addr + 0x10)) {
+					regs->b6 = (regs->b6 - bundle_addr) +
+						resume_addr;
 				}
-			}
-			counter++;
+				break;
+			case 7:
+				if ((regs->b7 == bundle_addr) ||
+					(regs->b7 == bundle_addr + 0x10)) {
+					regs->b7 = (regs->b7 - bundle_addr) +
+						resume_addr;
+				}
+				break;
+			} /* end switch */
 		}
-		cb->first_sdbt = 0;
-	}
-	return counter;
-}
-
-static int start_sampling(int cpu)
-{
-	int rc;
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-	rc = smp_ctl_ssctl_enable_activate(cpu, interval);
-	if (rc) {
-		printk(KERN_INFO "hwsampler: CPU %d ssctl failed.\n", cpu);
-		goto start_exit;
+		goto turn_ss_off;
 	}
 
-	rc = -EINVAL;
-	if (!cb->qsi.es) {
-		printk(KERN_INFO "hwsampler: CPU %d ssctl not enabled.\n", cpu);
-		goto start_exit;
-	}
-
-	if (!cb->qsi.cs) {
-		printk(KERN_INFO "hwsampler: CPU %d ssctl not active.\n", cpu);
-		goto start_exit;
-	}
-
-	printk(KERN_INFO
-		"hwsampler: CPU %d, CPUMF Sampling started, interval %lu.\n",
-		cpu, interval);
-
-	rc = 0;
-
-start_exit:
-	return rc;
-}
-
-static int stop_sampling(int cpu)
-{
-	unsigned long v;
-	int rc;
-	struct hws_cpu_buffer *cb;
-
-	rc = smp_ctl_qsi(cpu);
-	WARN_ON(rc);
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-	if (!rc && !cb->qsi.es)
-		printk(KERN_INFO "hwsampler: CPU %d, already stopped.\n", cpu);
-
-	rc = smp_ctl_ssctl_stop(cpu);
-	if (rc) {
-		printk(KERN_INFO "hwsampler: CPU %d, ssctl stop error %d.\n",
-				cpu, rc);
-		goto stop_exit;
-	}
-
-	printk(KERN_INFO "hwsampler: CPU %d, CPUMF Sampling stopped.\n", cpu);
-
-stop_exit:
-	v = cb->req_alert;
-	if (v)
-		printk(KERN_ERR "hwsampler: CPU %d CPUMF Request alert,"
-				" count=%lu.\n", cpu, v);
-
-	v = cb->loss_of_sample_data;
-	if (v)
-		printk(KERN_ERR "hwsampler: CPU %d CPUMF Loss of sample data,"
-				" count=%lu.\n", cpu, v);
-
-	v = cb->invalid_entry_address;
-	if (v)
-		printk(KERN_ERR "hwsampler: CPU %d CPUMF Invalid entry address,"
-				" count=%lu.\n", cpu, v);
-
-	v = cb->incorrect_sdbt_entry;
-	if (v)
-		printk(KERN_ERR
-				"hwsampler: CPU %d CPUMF Incorrect SDBT address,"
-				" count=%lu.\n", cpu, v);
-
-	v = cb->sample_auth_change_alert;
-	if (v)
-		printk(KERN_ERR
-				"hwsampler: CPU %d CPUMF Sample authorization change,"
-				" count=%lu.\n", cpu, v);
-
-	return rc;
-}
-
-static int check_hardware_prerequisites(void)
-{
-	if (!test_facility(68))
-		return -EOPNOTSUPP;
-	return 0;
-}
-/*
- * hws_oom_callback() - the OOM callback function
- *
- * In case the callback is invoked during memory allocation for the
- *  hw sampler, all obtained memory is deallocated and a flag is set
- *  so main sampler memory allocation can exit with a failure code.
- * In case the callback is invoked during sampling the hw sampler
- *  is deactivated for all CPUs.
- */
-static int hws_oom_callback(struct notifier_block *nfb,
-	unsigned long dummy, void *parm)
-{
-	unsigned long *freed;
-	int cpu;
-	struct hws_cpu_buffer *cb;
-
-	freed = parm;
-
-	mutex_lock(&hws_sem_oom);
-
-	if (hws_state == HWS_DEALLOCATED) {
-		/* during memory allocation */
-		if (oom_killer_was_active == 0) {
-			oom_killer_was_active = 1;
-			*freed += deallocate_sdbt();
+	if (slot == 2) {
+		if (regs->cr_iip == bundle_addr + 0x10) {
+			regs->cr_iip = resume_addr + 0x10;
 		}
 	} else {
-		int i;
-		cpu = get_cpu();
-		cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-		if (!cb->oom) {
-			for_each_online_cpu(i) {
-				smp_ctl_ssctl_deactivate(i);
-				cb->oom = 1;
-			}
-			cb->finish = 1;
-
-			printk(KERN_INFO
-				"hwsampler: CPU %d, OOM notify during CPUMF Sampling.\n",
-				cpu);
+		if (regs->cr_iip == bundle_addr) {
+			regs->cr_iip = resume_addr;
 		}
 	}
 
-	mutex_unlock(&hws_sem_oom);
-
-	return NOTIFY_OK;
+turn_ss_off:
+	/* Turn off Single Step bit */
+	ia64_psr(regs)->ss = 0;
 }
 
-static struct notifier_block hws_oom_notifier = {
-	.notifier_call = hws_oom_callback
-};
-
-static int hws_cpu_callback(struct notifier_block *nfb,
-	unsigned long action, void *hcpu)
+static void __kprobes prepare_ss(struct kprobe *p, struct pt_regs *regs)
 {
-	/* We do not have sampler space available for all possible CPUs.
-	   All CPUs should be online when hw sampling is activated. */
-	return (hws_state <= HWS_DEALLOCATED) ? NOTIFY_OK : NOTIFY_BAD;
+	unsigned long bundle_addr = (unsigned long) &p->ainsn.insn->bundle;
+	unsigned long slot = (unsigned long)p->addr & 0xf;
+
+	/* single step inline if break instruction */
+	if (p->ainsn.inst_flag == INST_FLAG_BREAK_INST)
+		regs->cr_iip = (unsigned long)p->addr & ~0xFULL;
+	else
+		regs->cr_iip = bundle_addr & ~0xFULL;
+
+	if (slot > 2)
+		slot = 0;
+
+	ia64_psr(regs)->ri = slot;
+
+	/* turn on single stepping */
+	ia64_psr(regs)->ss = 1;
 }
 
-static struct notifier_block hws_cpu_notifier = {
-	.notifier_call = hws_cpu_callback
-};
-
-/**
- * hwsampler_deactivate() - set hardware sampling temporarily inactive
- * @cpu:  specifies the CPU to be set inactive.
- *
- * Returns 0 on success, !0 on failure.
- */
-int hwsampler_deactivate(unsigned int cpu)
+static int __kprobes is_ia64_break_inst(struct pt_regs *regs)
 {
+	unsigned int slot = ia64_psr(regs)->ri;
+	unsigned long *kprobe_addr = (unsigned long *)regs->cr_iip;
+	bundle_t bundle;
+
+	memcpy(&bundle, kprobe_addr, sizeof(bundle_t));
+
+	return __is_ia64_break_inst(&bundle, slot);
+}
+
+static int __kprobes pre_kprobes_handler(struct die_args *args)
+{
+	struct kprobe *p;
+	int ret = 0;
+	struct pt_regs *regs = args->regs;
+	kprobe_opcode_t *addr = (kprobe_opcode_t *)instruction_pointer(regs);
+	struct kprobe_ctlblk *kcb;
+
 	/*
-	 * Deactivate hw sampling temporarily and flush the buffer
-	 * by pushing all the pending samples to oprofile buffer.
-	 *
-	 * This function can be called under one of the following conditions:
-	 *     Memory unmap, task is exiting.
+	 * We don't want to be preempted for the entire
+	 * duration of kprobe processing
 	 */
-	int rc;
-	struct hws_cpu_buffer *cb;
+	preempt_disable();
+	kcb = get_kprobe_ctlblk();
 
-	rc = 0;
-	mutex_lock(&hws_sem);
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-	if (hws_state == HWS_STARTED) {
-		rc = smp_ctl_qsi(cpu);
-		WARN_ON(rc);
-		if (cb->qsi.cs) {
-			rc = smp_ctl_ssctl_deactivate(cpu);
-			if (rc) {
-				printk(KERN_INFO
-				"hwsampler: CPU %d, CPUMF Deactivation failed.\n", cpu);
-				cb->finish = 1;
-				hws_state = HWS_STOPPING;
-			} else  {
-				hws_flush_all = 1;
-				/* Add work to queue to read pending samples.*/
-				queue_work_on(cpu, hws_wq, &cb->worker);
+	/* Handle recursion cases */
+	if (kprobe_running()) {
+		p = get_kprobe(addr);
+		if (p) {
+			if ((kcb->kprobe_status == KPROBE_HIT_SS) &&
+	 		     (p->ainsn.inst_flag == INST_FLAG_BREAK_INST)) {
+				ia64_psr(regs)->ss = 0;
+				goto no_kprobe;
 			}
-		}
-	}
-	mutex_unlock(&hws_sem);
-
-	if (hws_wq)
-		flush_workqueue(hws_wq);
-
-	return rc;
-}
-
-/**
- * hwsampler_activate() - activate/resume hardware sampling which was deactivated
- * @cpu:  specifies the CPU to be set active.
- *
- * Returns 0 on success, !0 on failure.
- */
-int hwsampler_activate(unsigned int cpu)
-{
-	/*
-	 * Re-activate hw sampling. This should be called in pair with
-	 * hwsampler_deactivate().
-	 */
-	int rc;
-	struct hws_cpu_buffer *cb;
-
-	rc = 0;
-	mutex_lock(&hws_sem);
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-	if (hws_state == HWS_STARTED) {
-		rc = smp_ctl_qsi(cpu);
-		WARN_ON(rc);
-		if (!cb->qsi.cs) {
-			hws_flush_all = 0;
-			rc = smp_ctl_ssctl_enable_activate(cpu, interval);
-			if (rc) {
-				printk(KERN_ERR
-				"CPU %d, CPUMF activate sampling failed.\n",
-					 cpu);
+			/* We have reentered the pre_kprobe_handler(), since
+			 * another probe was hit while within the handler.
+			 * We here save the original kprobes variables and
+			 * just single step on the instruction of the new probe
+			 * without calling any user handlers.
+			 */
+			save_previous_kprobe(kcb);
+			set_current_kprobe(p, kcb);
+			kprobes_inc_nmissed_count(p);
+			prepare_ss(p, regs);
+			kcb->kprobe_status = KPROBE_REENTER;
+			return 1;
+		} else if (args->err == __IA64_BREAK_JPROBE) {
+			/*
+			 * jprobe instrumented function just completed
+			 */
+			p = __this_cpu_read(current_kprobe);
+			if (p->break_handler && p->break_handler(p, regs)) {
+				goto ss_probe;
 			}
+		} else if (!is_ia64_break_inst(regs)) {
+			/* The breakpoint instruction was removed by
+			 * another cpu right after we hit, no further
+			 * handling of this interrupt is appropriate
+			 */
+			ret = 1;
+			goto no_kprobe;
+		} else {
+			/* Not our break */
+			goto no_kprobe;
 		}
 	}
 
-	mutex_unlock(&hws_sem);
+	p = get_kprobe(addr);
+	if (!p) {
+		if (!is_ia64_break_inst(regs)) {
+			/*
+			 * The breakpoint instruction was removed right
+			 * after we hit it.  Another cpu has removed
+			 * either a probepoint or a debugger breakpoint
+			 * at this address.  In either case, no further
+			 * handling of this interrupt is appropriate.
+			 */
+			ret = 1;
 
-	return rc;
-}
-
-static int check_qsi_on_setup(void)
-{
-	int rc;
-	unsigned int cpu;
-	struct hws_cpu_buffer *cb;
-
-	for_each_online_cpu(cpu) {
-		cb = &per_cpu(sampler_cpu_buffer, cpu);
-		rc = smp_ctl_qsi(cpu);
-		WARN_ON(rc);
-		if (rc)
-			return -EOPNOTSUPP;
-
-		if (!cb->qsi.as) {
-			printk(KERN_INFO "hwsampler: CPUMF sampling is not authorized.\n");
-			return -EINVAL;
 		}
 
-		if (cb->qsi.es) {
-			printk(KERN_WARNING "hwsampler: CPUMF is still enabled.\n");
-			rc = smp_ctl_ssctl_stop(cpu);
-			if (rc)
-				return -EINVAL;
-
-			printk(KERN_INFO
-				"CPU %d, CPUMF Sampling stopped now.\n", cpu);
-		}
+		/* Not one of our break, let kernel handle it */
+		goto no_kprobe;
 	}
-	return 0;
+
+	set_current_kprobe(p, kcb);
+	kcb->kprobe_status = KPROBE_HIT_ACTIVE;
+
+	if (p->pre_handler && p->pre_handler(p, regs))
+		/*
+		 * Our pre-handler is specifically requesting that we just
+		 * do a return.  This is used for both the jprobe pre-handler
+		 * and the kretprobe trampoline
+		 */
+		return 1;
+
+ss_probe:
+#if !defined(CONFIG_PREEMPT)
+	if (p->ainsn.inst_flag == INST_FLAG_BOOSTABLE && !p->post_handler) {
+		/* Boost up -- we can execute copied instructions directly */
+		ia64_psr(regs)->ri = p->ainsn.slot;
+		regs->cr_iip = (unsigned long)&p->ainsn.insn->bundle & ~0xFULL;
+		/* turn single stepping off */
+		ia64_psr(regs)->ss = 0;
+
+		reset_current_kprobe();
+		preempt_enable_no_resched();
+		return 1;
+	}
+#endif
+	prepare_ss(p, regs);
+	kcb->kprobe_status = KPROBE_HIT_SS;
+	return 1;
+
+no_kprobe:
+	preempt_enable_no_resched();
+	return ret;
 }
 
-static int check_qsi_on_start(void)
+static int __kprobes post_kprobes_handler(struct pt_regs *regs)
 {
-	unsigned int cpu;
-	int rc;
-	struct hws_cpu_buffer *cb;
+	struct kprobe *cur = kprobe_running();
+	struct kprobe_ctlblk *kcb = get_kprobe_ctlblk();
 
-	for_each_online_cpu(cpu) {
-		cb = &per_cpu(sampler_cpu_buffer, cpu);
-		rc = smp_ctl_qsi(cpu);
-		WARN_ON(rc);
+	if (!cur)
+		return 0;
 
-		if (!cb->qsi.as)
-			return -EINVAL;
-
-		if (cb->qsi.es)
-			return -EINVAL;
-
-		if (cb->qsi.cs)
-			return -EINVAL;
+	if ((kcb->kprobe_status != KPROBE_REENTER) && cur->post_handler) {
+		kcb->kprobe_status = KPROBE_HIT_SSDONE;
+		cur->post_handler(cur, regs, 0);
 	}
-	return 0;
+
+	resume_execution(cur, regs);
+
+	/*Restore back the original saved kprobes variables and continue. */
+	if (kcb->kprobe_status == KPROBE_REENTER) {
+		restore_previous_kprobe(kcb);
+		goto out;
+	}
+	reset_current_kprobe();
+
+out:
+	preempt_enable_no_resched();
+	return 1;
 }
 
-static void worker_on_start(unsigned int cpu)
+int __kprobes kprobe_fault_handler(struct pt_regs *regs, int trapnr)
 {
-	struct hws_cpu_buffer *cb;
+	struct kprobe *cur = kprobe_running();
+	struct kprobe_ctlblk *kcb = get_kprobe_ctlblk();
 
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-	cb->worker_entry = cb->first_sdbt;
-}
 
-static int worker_check_error(unsigned int cpu, int ext_params)
-{
-	int rc;
-	unsigned long *sdbt;
-	struct hws_cpu_buffer *cb;
-
-	rc = 0;
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-	sdbt = (unsigned long *) cb->worker_entry;
-
-	if (!sdbt || !*sdbt)
-		return -EINVAL;
-
-	if (ext_params & CPU_MF_INT_SF_PRA)
-		cb->req_alert++;
-
-	if (ext_params & CPU_MF_INT_SF_LSDA)
-		cb->loss_of_sample_data++;
-
-	if (ext_params & CPU_MF_INT_SF_IAE) {
-		cb->invalid_entry_address++;
-		rc = -EINVAL;
-	}
-
-	if (ext_params & CPU_MF_INT_SF_ISE) {
-		cb->incorrect_sdbt_entry++;
-		rc = -EINVAL;
-	}
-
-	if (ext_params & CPU_MF_INT_SF_SACA) {
-		cb->sample_auth_change_alert++;
-		rc = -EINVAL;
-	}
-
-	return rc;
-}
-
-static void worker_on_finish(unsigned int cpu)
-{
-	int rc, i;
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-	if (cb->finish) {
-		rc = smp_ctl_qsi(cpu);
-		WARN_ON(rc);
-		if (cb->qsi.es) {
-			printk(KERN_INFO
-				"hwsampler: CPU %d, CPUMF Stop/Deactivate sampling.\n",
-				cpu);
-			rc = smp_ctl_ssctl_stop(cpu);
-			if (rc)
-				printk(KERN_INFO
-					"hwsampler: CPU %d, CPUMF Deactivation failed.\n",
-					cpu);
-
-			for_each_online_cpu(i) {
-				if (i == cpu)
-					continue;
-				if (!cb->finish) {
-					cb->finish = 1;
-					queue_work_on(i, hws_wq,
-						&cb->worker);
-				}
-			}
-		}
-	}
-}
-
-static void worker_on_interrupt(unsigned int cpu)
-{
-	unsigned long *sdbt;
-	unsigned char done;
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-	sdbt = (unsigned long *) cb->worker_entry;
-
-	done = 0;
-	/* do not proceed if stop was entered,
-	 * forget the buffers not yet processed */
-	while (!done && !cb->stop_mode) {
-		unsigned long *trailer;
-		struct hws_trailer_entry *te;
-		unsigned long *dear = 0;
-
-		trailer = trailer_entry_ptr(*sdbt);
-		/* leave loop if no more work to do */
-		if (!(*trailer & SDB_TE_BUFFER_FULL_MASK)) {
-			done = 1;
-			if (!hws_flush_all)
-				continue;
-		}
-
-		te = (struct hws_trailer_entry *)trailer;
-		cb->sample_overflow += te->overflow;
-
-		add_samples_to_oprofile(cpu, sdbt, dear);
-
-		/* reset trailer */
-		xchg((unsigned char *) te, 0x40);
-
-		/* advance to next sdb slot in current sdbt */
-		sdbt++;
-		/* in case link bit is set use address w/o link bit */
-		if (is_link_entry(sdbt))
-			sdbt = get_next_sdbt(sdbt);
-
-		cb->worker_entry = (unsigned long)sdbt;
-	}
-}
-
-static void add_samples_to_oprofile(unsigned int cpu, unsigned long *sdbt,
-		unsigned long *dear)
-{
-	struct hws_basic_entry *sample_data_ptr;
-	unsigned long *trailer;
-
-	trailer = trailer_entry_ptr(*sdbt);
-	if (dear) {
-		if (dear > trailer)
-			return;
-		trailer = dear;
-	}
-
-	sample_data_ptr = (struct hws_basic_entry *)(*sdbt);
-
-	while ((unsigned long *)sample_data_ptr < trailer) {
-		struct pt_regs *regs = NULL;
-		struct task_struct *tsk = NULL;
+	switch(kcb->kprobe_status) {
+	case KPROBE_HIT_SS:
+	case KPROBE_REENTER:
+		/*
+		 * We are here because the instruction being single
+		 * stepped caused a page fault. We reset the current
+		 * kprobe and the instruction pointer points back to
+		 * the probe address and allow the page fault handler
+		 * to continue as a normal page fault.
+		 */
+		regs->cr_iip = ((unsigned long)cur->addr) & ~0xFULL;
+		ia64_psr(regs)->ri = ((unsigned long)cur->addr) & 0xf;
+		if (kcb->kprobe_status == KPROBE_REENTER)
+			restore_previous_kprobe(kcb);
+		else
+			reset_current_kprobe();
+		preempt_enable_no_resched();
+		break;
+	case KPROBE_HIT_ACTIVE:
+	case KPROBE_HIT_SSDONE:
+		/*
+		 * We increment the nmissed count for accounting,
+		 * we can also use npre/npostfault count for accounting
+		 * these specific fault cases.
+		 */
+		kprobes_inc_nmissed_count(cur);
 
 		/*
-		 * Check sampling mode, 1 indicates basic (=customer) sampling
-		 * mode.
+		 * We come here because instructions in the pre/post
+		 * handler caused the page_fault, this could happen
+		 * if handler tries to access user space by
+		 * copy_from_user(), get_user() etc. Let the
+		 * user-specified handler try to fix it first.
 		 */
-		if (sample_data_ptr->def != 1) {
-			/* sample slot is not yet written */
-			break;
-		} else {
-			/* make sure we don't use it twice,
-			 * the next time the sampler will set it again */
-			sample_data_ptr->def = 0;
-		}
+		if (cur->fault_handler && cur->fault_handler(cur, regs, trapnr))
+			return 1;
+		/*
+		 * In case the user-specified fault handler returned
+		 * zero, try to fix up.
+		 */
+		if (ia64_done_with_exception(regs))
+			return 1;
 
-		/* Get pt_regs. */
-		if (sample_data_ptr->P == 1) {
-			/* userspace sample */
-			unsigned int pid = sample_data_ptr->prim_asn;
-			if (!counter_config.user)
-				goto skip_sample;
-			rcu_read_lock();
-			tsk = pid_task(find_vpid(pid), PIDTYPE_PID);
-			if (tsk)
-				regs = task_pt_regs(tsk);
-			rcu_read_unlock();
-		} else {
-			/* kernelspace sample */
-			if (!counter_config.kernel)
-				goto skip_sample;
-			regs = task_pt_regs(current);
-		}
-
-		mutex_lock(&hws_sem);
-		oprofile_add_ext_hw_sample(sample_data_ptr->ia, regs, 0,
-				!sample_data_ptr->P, tsk);
-		mutex_unlock(&hws_sem);
-	skip_sample:
-		sample_data_ptr++;
+		/*
+		 * Let ia64_do_page_fault() fix it.
+		 */
+		break;
+	default:
+		break;
 	}
-}
-
-static void worker(struct work_struct *work)
-{
-	unsigned int cpu;
-	int ext_params;
-	struct hws_cpu_buffer *cb;
-
-	cb = container_of(work, struct hws_cpu_buffer, worker);
-	cpu = smp_processor_id();
-	ext_params = atomic_xchg(&cb->ext_params, 0);
-
-	if (!cb->worker_entry)
-		worker_on_start(cpu);
-
-	if (worker_check_error(cpu, ext_params))
-		return;
-
-	if (!cb->finish)
-		worker_on_interrupt(cpu);
-
-	if (cb->finish)
-		worker_on_finish(cpu);
-}
-
-/**
- * hwsampler_allocate() - allocate memory for the hardware sampler
- * @sdbt:  number of SDBTs per online CPU (must be > 0)
- * @sdb:   number of SDBs per SDBT (minimum 1, maximum 511)
- *
- * Returns 0 on success, !0 on failure.
- */
-int hwsampler_allocate(unsigned long sdbt, unsigned long sdb)
-{
-	int cpu, rc;
-	mutex_lock(&hws_sem);
-
-	rc = -EINVAL;
-	if (hws_state != HWS_DEALLOCATED)
-		goto allocate_exit;
-
-	if (sdbt < 1)
-		goto allocate_exit;
-
-	if (sdb > MAX_NUM_SDB || sdb < MIN_NUM_SDB)
-		goto allocate_exit;
-
-	num_sdbt = sdbt;
-	num_sdb = sdb;
-
-	oom_killer_was_active = 0;
-	register_oom_notifier(&hws_oom_notifier);
-
-	for_each_online_cpu(cpu) {
-		if (allocate_sdbt(cpu)) {
-			unregister_oom_notifier(&hws_oom_notifier);
-			goto allocate_error;
-		}
-	}
-	unregister_oom_notifier(&hws_oom_notifier);
-	if (oom_killer_was_active)
-		goto allocate_error;
-
-	hws_state = HWS_STOPPED;
-	rc = 0;
-
-allocate_exit:
-	mutex_unlock(&hws_sem);
-	return rc;
-
-allocate_error:
-	rc = -ENOMEM;
-	printk(KERN_ERR "hwsampler: CPUMF Memory allocation failed.\n");
-	goto allocate_exit;
-}
-
-/**
- * hwsampler_deallocate() - deallocate hardware sampler memory
- *
- * Returns 0 on success, !0 on failure.
- */
-int hwsampler_deallocate(void)
-{
-	int rc;
-
-	mutex_lock(&hws_sem);
-
-	rc = -EINVAL;
-	if (hws_state != HWS_STOPPED)
-		goto deallocate_exit;
-
-	irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
-	hws_alert = 0;
-	deallocate_sdbt();
-
-	hws_state = HWS_DEALLOCATED;
-	rc = 0;
-
-deallocate_exit:
-	mutex_unlock(&hws_sem);
-
-	return rc;
-}
-
-unsigned long hwsampler_query_min_interval(void)
-{
-	return min_sampler_rate;
-}
-
-unsigned long hwsampler_query_max_interval(void)
-{
-	return max_sampler_rate;
-}
-
-unsigned long hwsampler_get_sample_overflow_count(unsigned int cpu)
-{
-	struct hws_cpu_buffer *cb;
-
-	cb = &per_cpu(sampler_cpu_buffer, cpu);
-
-	return cb->sample_overflow;
-}
-
-int hwsampler_setup(void)
-{
-	int rc;
-	int cpu;
-	struct hws_cpu_buffer *cb;
-
-	mutex_lock(&hws_sem);
-
-	rc = -EINVAL;
-	if (hws_state)
-		goto setup_exit;
-
-	hws_state = HWS_INIT;
-
-	init_all_cpu_buffers();
-
-	rc = check_hardware_prerequisites();
-	if (rc)
-		goto setup_exit;
-
-	rc = check_qsi_on_setup();
-	if (rc)
-		goto setup_exit;
-
-	rc = -EINVAL;
-	hws_wq = create_workqueue("hwsampler");
-	if (!hws_wq)
-		goto setup_exit;
-
-	register_cpu_notifier(&hws_cpu_notifier);
-
-	for_each_online_cpu(cpu) {
-		cb = &per_cpu(sampler_cpu_buffer, cpu);
-		INIT_WORK(&cb->worker, worker);
-		rc = smp_ctl_qsi(cpu);
-		WARN_ON(rc);
-		if (min_sampler_rate != cb->qsi.min_sampl_rate) {
-			if (min_sampler_rate) {
-				printk(KERN_WARNING
-					"hwsampler: different min sampler rate values.\n");
-				if (min_sampler_rate < cb->qsi.min_sampl_rate)
-					min_sampler_rate =
-						cb->qsi.min_sampl_rate;
-			} else
-				min_sampler_rate = cb->qsi.min_sampl_rate;
-		}
-		if (max_sampler_rate != cb->qsi.max_sampl_rate) {
-			if (max_sampler_rate) {
-				printk(KERN_WARNING
-					"hwsampler: different max sampler rate values.\n");
-				if (max_sampler_rate > cb->qsi.max_sampl_rate)
-					max_sampler_rate =
-						cb->qsi.max_sampl_rate;
-			} else
-				max_sampler_rate = cb->qsi.max_sampl_rate;
-		}
-	}
-	register_external_irq(EXT_IRQ_MEASURE_ALERT, hws_ext_handler);
-
-	hws_state = HWS_DEALLOCATED;
-	rc = 0;
-
-setup_exit:
-	mutex_unlock(&hws_sem);
-	return rc;
-}
-
-int hwsampler_shutdown(void)
-{
-	int rc;
-
-	mutex_lock(&hws_sem);
-
-	rc = -EINVAL;
-	if (hws_state == HWS_DEALLOCATED || hws_state == HWS_STOPPED) {
-		mutex_unlock(&hws_sem);
-
-		if (hws_wq)
-			flush_workqueue(hws_wq);
-
-		mutex_lock(&hws_sem);
-
-		if (hws_state == HWS_STOPPED) {
-			irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
-			hws_alert = 0;
-			deallocate_sdbt();
-		}
-		if (hws_wq) {
-			destroy_workqueue(hws_wq);
-			hws_wq = NULL;
-		}
-
-		unregister_external_irq(EXT_IRQ_MEASURE_ALERT, hws_ext_handler);
-		hws_state = HWS_INIT;
-		rc = 0;
-	}
-	mutex_unlock(&hws_sem);
-
-	unregister_cpu_notifier(&hws_cpu_notifier);
-
-	return rc;
-}
-
-/**
- * hwsampler_start_all() - start hardware sampling on all online CPUs
- * @rate:  specifies the used interval when samples are taken
- *
- * Returns 0 on success, !0 on failure.
- */
-int hwsampler_start_all(unsigned long rate)
-{
-	int rc, cpu;
-
-	mutex_lock(&hws_sem);
-
-	hws_oom = 0;
-
-	rc = -EINVAL;
-	if (hws_state != HWS_STOPPED)
-		goto start_all_exit;
-
-	interval = rate;
-
-	/* fail if rate is not valid */
-	if (interval < min_sampler_rate || interval > max_sampler_rate)
-		goto start_all_exit;
-
-	rc = check_qsi_on_start();
-	if (rc)
-		goto start_all_exit;
-
-	prepare_cpu_buffers();
-
-	for_each_online_cpu(cpu) {
-		rc = start_sampling(cpu);
-		if (rc)
-			break;
-	}
-	if (rc) {
-		for_each_online_cpu(cpu) {
-			stop_sampling(cpu);
-		}
-		goto start_all_exit;
-	}
-	hws_state = HWS_STARTED;
-	rc = 0;
-
-start_all_exit:
-	mutex_unlock(&hws_sem);
-
-	if (rc)
-		return rc;
-
-	register_oom_notifier(&hws_oom_notifier);
-	hws_oom = 1;
-	hws_flush_all = 0;
-	/* now let them in, 1407 CPUMF external interrupts */
-	hws_alert = 1;
-	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
 
 	return 0;
 }
 
-/**
- * hwsampler_stop_all() - stop hardware sampling on all online CPUs
- *
- * Returns 0 on success, !0 on failure.
- */
-int hwsampler_stop_all(void)
+int __kprobes kprobe_exceptions_notify(struct notifier_block *self,
+				       unsigned long val, void *data)
 {
-	int tmp_rc, rc, cpu;
-	struct hws_cpu_buffer *cb;
+	struct die_args *args = (struct die_args *)data;
+	int ret = NOTIFY_DONE;
 
-	mutex_lock(&hws_sem);
+	if (args->regs && user_mode(args->regs))
+		return ret;
 
-	rc = 0;
-	if (hws_state == HWS_INIT) {
-		mutex_unlock(&hws_sem);
-		return 0;
+	switch(val) {
+	case DIE_BREAK:
+		/* err is break number from ia64_bad_break() */
+		if ((args->err >> 12) == (__IA64_BREAK_KPROBE >> 12)
+			|| args->err == __IA64_BREAK_JPROBE
+			|| args->err == 0)
+			if (pre_kprobes_handler(args))
+				ret = NOTIFY_STOP;
+		break;
+	case DIE_FAULT:
+		/* err is vector number from ia64_fault() */
+		if (args->err == 36)
+			if (post_kprobes_handler(args->regs))
+				ret = NOTIFY_STOP;
+		break;
+	default:
+		break;
 	}
-	hws_state = HWS_STOPPING;
-	mutex_unlock(&hws_sem);
-
-	for_each_online_cpu(cpu) {
-		cb = &per_cpu(sampler_cpu_buffer, cpu);
-		cb->stop_mode = 1;
-		tmp_rc = stop_sampling(cpu);
-		if (tmp_rc)
-			rc = tmp_rc;
-	}
-
-	if (hws_wq)
-		flush_workqueue(hws_wq);
-
-	mutex_lock(&hws_sem);
-	if (hws_oom) {
-		unregister_oom_notifier(&hws_oom_notifier);
-		hws_oom = 0;
-	}
-	hws_state = HWS_STOPPED;
-	mutex_unlock(&hws_sem);
-
-	return rc;
+	return ret;
 }
+
+struct param_bsp_cfm {
+	unsigned long ip;
+	unsigned long *bsp;
+	unsigned long cfm;
+};
+
+static void ia64_get_bsp_cfm(struct unw_frame_info *info, void *arg)
+{
+	unsigned long ip;
+	struct param_bsp_cfm *lp = arg;
+
+	do {
+		unw_get_ip(info, &ip);
+		if (ip == 0)
+			break;
+		if (ip == lp->ip) {
+			unw_get_bsp(info, (unsigned long*)&lp->bsp);
+			unw_get_cfm(info, (unsigned long*)&lp->cfm);
+			return;
+		}
+	} while (unw_unwind(info) >= 0);
+	lp->bsp = NULL;
+	lp->cfm = 0;
+	return;
+}
+
+unsigned long arch_deref_entry_point(void *entry)
+{
+	return ((struct fnptr *)entry)->ip;
+}
+
+int __kprobes setjmp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+	struct jprobe *jp = container_of(p, struct jprobe, kp);
+	unsigned long addr = arch_deref_entry_point(jp->entry);
+	struct kprobe_ctlblk *kcb = get_kprobe_ctlblk();
+	struct param_bsp_cfm pa;
+	int bytes;
+
+	/*
+	 * Callee owns the argument space and could overwrite it, eg
+	 * tail call optimization. So to be absolutely safe
+	 * we save the argument space before transferring the control
+	 * to instrumented jprobe function which runs in
+	 * the process context
+	 */
+	pa.ip = regs->cr_iip;
+	unw_init_running(ia64_get_bsp_cfm, &pa);
+	bytes = (char *)ia64_rse_skip_regs(pa.bsp, pa.cfm & 0x3f)
+				- (char *)pa.bsp;
+	memcpy( kcb->jprobes_saved_stacked_regs,
+		pa.bsp,
+		bytes );
+	kcb->bsp = pa.bsp;
+	kcb->cfm = pa.cfm;
+
+	/* save architectural state */
+	kcb->jprobe_saved_regs = *regs;
+
+	/* after rfi, execute the jprobe instrumented function */
+	regs->cr_iip = addr & ~0xFULL;
+	ia64_psr(regs)->ri = addr & 0xf;
+	regs->r1 = ((struct fnptr *)(jp->entry))->gp;
+
+	/*
+	 * fix the return address to our jprobe_inst_return() function
+	 * in the jprobes.S file
+	 */
+	regs->b0 = ((struct fnptr *)(jprobe_inst_return))->ip;
+
+	return 1;
+}
+
+/* ia64 does not need this */
+void __kprobes jprobe_return(void)
+{
+}
+
+int __kprobes longjmp_break_handler(struct kprobe *p, struct pt_regs *regs)
+{
+	struct kprobe_ctlblk *kcb = get_kprobe_ctlblk();
+	int bytes;
+
+	/* restoring architectural state */
+	*regs = kcb->jprobe_saved_regs;
+
+	/* restoring the original argument space */
+	flush_register_stack();
+	bytes = (char *)ia64_rse_skip_regs(kcb->bsp, kcb->cfm & 0x3f)
+				- (char *)kcb->bsp;
+	memcpy( kcb->bsp,
+		kcb->jprobes_saved_stacked_regs,
+		bytes );
+	invalidate_stacked_regs();
+
+	preempt_enable_no_resched();
+	return 1;
+}
+
+static struct kprobe trampoline_p = {
+	.pre_handler = trampoline_probe_handler
+};
+
+int __init arch_init_kprobes(void)
+{
+	trampoline_p.addr =
+		(kprobe_opcode_t *)((struct fnptr *)kretprobe_trampoline)->ip;
+	return register_kprobe(&trampoline_p);
+}
+
+int __kprobes arch_trampoline_kprobe(struct kprobe *p)
+{
+	if (p->addr ==
+		(kprobe_opcode_t *)((struct fnptr *)kretprobe_trampoline)->ip)
+		return 1;
+
+	return 0;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             /*
+ * arch/ia64/kernel/machine_kexec.c
+ *
+ * Handle transition of Linux booting another kernel
+ * Copyright (C) 2005 Hewlett-Packard Development Comapny, L.P.
+ * Copyright (C) 2005 Khalid Aziz <khalid.aziz@hp.com>
+ * Copyright (C) 2006 Intel Corp, Zou Nan hai <nanhai.zou@intel.com>
+ *
+ * This source code is licensed under the GNU General Public License,
+ * Version 2.  See the file COPYING for more details.
+ */
+
+#include <linux/mm.h>
+#include <linux/kexec.h>
+#include <linux/cpu.h>
+#include <linux/irq.h>
+#include <linux/efi.h>
+#include <linux/numa.h>
+#include <linux/mmzone.h>
+
+#include <asm/numa.h>
+#include <asm/mmu_context.h>
+#include <asm/setup.h>
+#include <asm/delay.h>
+#include <asm/meminit.h>
+#include <asm/processor.h>
+#include <asm/sal.h>
+#include <asm/mca.h>
+
+typedef void (*relocate_new_kernel_t)(
+					unsigned long indirection_page,
+					unsigned long start_address,
+					struct ia64_boot_param *boot_param,
+					unsigned long pal_addr) __noreturn;
+
+struct kimage *ia64_kimage;
+
+struct resource efi_memmap_res = {
+        .name  = "EFI Memory Map",
+        .start = 0,
+        .end   = 0,
+        .flags = IORESOURCE_BUSY | IORESOURCE_MEM
+};
+
+struct resource boot_param_res = {
+        .name  = "Boot parameter",
+        .start = 0,
+        .end   = 0,
+        .flags = IORESOURCE_BUSY | IORESOURCE_MEM
+};
+
+
+/*
+ * Do what every setup is needed on image and the
+ * reboot code buffer to allow us to avoid allocations
+ * later.
+ */
+int machine_kexec_prepare(struct kimage *image)
+{
+	void *control_code_buffer;
+	const unsigned long *func;
+
+	func = (unsigned long *)&relocate_new_kernel;
+	/* Pre-load control code buffer to minimize work in kexec path */
+	control_code_buffer = page_address(image->control_code_page);
+	memcpy((void *)control_code_buffer, (const void *)func[0],
+			relocate_new_kernel_size);
+	flush_icache_range((unsigned long)control_code_buffer,
+			(unsigned long)control_code_buffer + relocate_new_kernel_size);
+	ia64_kimage = image;
+
+	return 0;
+}
+
+void machine_kexec_cleanup(struct kimage *image)
+{
+}
+
+/*
+ * Do not allocate memory (or fail in any way) in machine_kexec().
+ * We are past the point of no return, committed to rebooting now.
+ */
+static void ia64_machine_kexec(struct unw_frame_info *info, void *arg)
+{
+	struct kimage *image = arg;
+	relocate_new_kernel_t rnk;
+	void *pal_addr = efi_get_pal_addr();
+	unsigned long code_addr;
+	int ii;
+	u64 fp, gp;
+	ia64_fptr_t *init_handler = (ia64_fptr_t *)ia64_os_init_on_kdump;
+
+	BUG_ON(!image);
+	code_addr = (unsigned long)page_address(image->control_code_page);
+	if (image->type == KEXEC_TYPE_CRASH) {
+		crash_save_this_cpu();
+		current->thread.ksp = (__u64)info->sw - 16;
+
+		/* Register noop init handler */
+		fp = ia64_tpa(init_handler->fp);
+		gp = ia64_tpa(ia64_getreg(_IA64_REG_GP));
+		ia64_sal_set_vectors(SAL_VECTOR_OS_INIT, fp, gp, 0, fp, gp, 0);
+	} else {
+		/* Unregister init handlers of current kernel */
+		ia64_sal_set_vectors(SAL_VECTOR_OS_INIT, 0, 0, 0, 0, 0, 0);
+	}
+
+	/* Unregister mca handler - No more recovery on current kernel */
+	ia64_sal_set_vectors(SAL_VECTOR_OS_MCA, 0, 0, 0, 0, 0, 0);
+
+	/* Interrupts aren't acceptable while we reboot */
+	local_irq_disable();
+
+	/* Mask CMC and Performance Monitor interrupts */
+	ia64_setreg(_IA64_REG_CR_PMV, 1 << 16);
+	ia64_setreg(_IA64_REG_CR_CMCV, 1 << 16);
+
+	/* Mask ITV and Local Redirect Registers */
+	ia64_set_itv(1 << 16);
+	ia64_set_lrr0(1 << 16);
+	ia64_set_lrr1(1 << 16);
+
+	/* terminate possible nested in-service interrupts */
+	for (ii = 0; ii < 16; ii++)
+		ia64_eoi();
+
+	/* unmask TPR and clear any pending interrupts */
+	ia64_setreg(_IA64_REG_CR_TPR, 0);
+	ia64_srlz_d();
+	while (ia64_get_ivr() != IA64_SPURIOUS_INT_VECTOR)
+		ia64_eoi();
+	platform_kernel_launch_event();
+	rnk = (relocate_new_kernel_t)&code_addr;
+	(*rnk)(image->head, image->start, ia64_boot_param,
+		     GRANULEROUNDDOWN((unsigned long) pal_addr));
+	BUG();
+}
+
+void machine_kexec(struct kimage *image)
+{
+	BUG_ON(!image);
+	unw_init_running(ia64_machine_kexec, image);
+	for(;;);
+}
+
+void arch_crash_save_vmcoreinfo(void)
+{
+#if defined(CONFIG_DISCONTIGMEM) || defined(CONFIG_SPARSEMEM)
+	VMCOREINFO_SYMBOL(pgdat_list);
+	VMCOREINFO_LENGTH(pgdat_list, MAX_NUMNODES);
+#endif
+#ifdef CONFIG_NUMA
+	VMCOREINFO_SYMBOL(node_memblk);
+	VMCOREINFO_LENGTH(node_memblk, NR_NODE_MEMBLKS);
+	VMCOREINFO_STRUCT_SIZE(node_memblk_s);
+	VMCOREINFO_OFFSET(node_memblk_s, start_paddr);
+	VMCOREINFO_OFFSET(node_memblk_s, size);
+#endif
+#if CONFIG_PGTABLE_LEVELS == 3
+	VMCOREINFO_CONFIG(PGTABLE_3);
+#elif CONFIG_PGTABLE_LEVELS == 4
+	VMCOREINFO_CONFIG(PGTABLE_4);
+#endif
+}
+
+unsigned long paddr_vmcoreinfo_note(void)
+{
+	return ia64_tpa((unsigned long)(char *)&vmcoreinfo_note);
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       #include <linux/module.h>
+#include <linux/dma-mapping.h>
+#include <asm/machvec.h>
+
+#ifdef CONFIG_IA64_GENERIC
+
+#include <linux/kernel.h>
+#include <linux/string.h>
+
+#include <asm/page.h>
+
+struct ia64_machine_vector ia64_mv;
+EXPORT_SYMBOL(ia64_mv);
+
+static struct ia64_machine_vector * __init
+lookup_machvec (const char *name)
+{
+	extern struct ia64_machine_vector machvec_start[];
+	extern struct ia64_machine_vector machvec_end[];
+	struct ia64_machine_vector *mv;
+
+	for (mv = machvec_start; mv < machvec_end; ++mv)
+		if (strcmp (mv->name, name) == 0)
+			return mv;
+
+	return 0;
+}
+
+void __init
+machvec_init (const char *name)
+{
+	struct ia64_machine_vector *mv;
+
+	if (!name)
+		name = acpi_get_sysname();
+	mv = lookup_machvec(name);
+	if (!mv)
+		panic("generic kernel failed to find machine vector for"
+		      " platform %s!", name);
+
+	ia64_mv = *mv;
+	printk(KERN_INFO "booting generic kernel on platform %s\n", name);
+}
+
+void __init
+machvec_init_from_cmdline(const char *cmdline)
+{
+	char str[64];
+	const char *start;
+	char *end;
+
+	if (! (start = strstr(cmdline, "machvec=")) )
+		return machvec_init(NULL);
+
+	strlcpy(str, start + strlen("machvec="), sizeof(str));
+	if ( (end = strchr(str, ' ')) )
+		*end = '\0';
+
+	return machvec_init(str);
+}
+
+#endif /* CONFIG_IA64_GENERIC */
+
+void
+machvec_setup (char **arg)
+{
+}
+EXPORT_SYMBOL(machvec_setup);
+
+void
+machvec_timer_interrupt (int irq, void *dev_id)
+{
+}
+EXPORT_SYMBOL(machvec_timer_interrupt);
+
+void
+machvec_dma_sync_single(struct device *hwdev, dma_addr_t dma_handle, size_t size,
+			enum dma_data_direction dir)
+{
+	mb();
+}
+EXPORT_SYMBOL(machvec_dma_sync_single);
+
+void
+machvec_dma_sync_sg(struct device *hwdev, struct scatterlist *sg, int n,
+		    enum dma_data_direction dir)
+{
+	mb();
+}
+EXPORT_SYMBOL(machvec_dma_sync_sg);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        

@@ -1,1316 +1,802 @@
-/*
- * Copyright (c) 2014 Samsung Electronics Co., Ltd.
- * Author: Naveen Krishna Ch <naveenkrishna.ch@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
-*/
-
-#include <linux/clk-provider.h>
-#include <linux/of.h>
-
-#include "clk.h"
-#include <dt-bindings/clock/exynos7-clk.h>
-
-/* Register Offset definitions for CMU_TOPC (0x10570000) */
-#define CC_PLL_LOCK		0x0000
-#define BUS0_PLL_LOCK		0x0004
-#define BUS1_DPLL_LOCK		0x0008
-#define MFC_PLL_LOCK		0x000C
-#define AUD_PLL_LOCK		0x0010
-#define CC_PLL_CON0		0x0100
-#define BUS0_PLL_CON0		0x0110
-#define BUS1_DPLL_CON0		0x0120
-#define MFC_PLL_CON0		0x0130
-#define AUD_PLL_CON0		0x0140
-#define MUX_SEL_TOPC0		0x0200
-#define MUX_SEL_TOPC1		0x0204
-#define MUX_SEL_TOPC2		0x0208
-#define MUX_SEL_TOPC3		0x020C
-#define DIV_TOPC0		0x0600
-#define DIV_TOPC1		0x0604
-#define DIV_TOPC3		0x060C
-#define ENABLE_ACLK_TOPC0	0x0800
-#define ENABLE_ACLK_TOPC1	0x0804
-#define ENABLE_SCLK_TOPC1	0x0A04
-
-static struct samsung_fixed_factor_clock topc_fixed_factor_clks[] __initdata = {
-	FFACTOR(0, "ffac_topc_bus0_pll_div2", "mout_topc_bus0_pll", 1, 2, 0),
-	FFACTOR(0, "ffac_topc_bus0_pll_div4",
-		"ffac_topc_bus0_pll_div2", 1, 2, 0),
-	FFACTOR(0, "ffac_topc_bus1_pll_div2", "mout_topc_bus1_pll", 1, 2, 0),
-	FFACTOR(0, "ffac_topc_cc_pll_div2", "mout_topc_cc_pll", 1, 2, 0),
-	FFACTOR(0, "ffac_topc_mfc_pll_div2", "mout_topc_mfc_pll", 1, 2, 0),
-};
-
-/* List of parent clocks for Muxes in CMU_TOPC */
-PNAME(mout_topc_aud_pll_ctrl_p)	= { "fin_pll", "fout_aud_pll" };
-PNAME(mout_topc_bus0_pll_ctrl_p)	= { "fin_pll", "fout_bus0_pll" };
-PNAME(mout_topc_bus1_pll_ctrl_p)	= { "fin_pll", "fout_bus1_pll" };
-PNAME(mout_topc_cc_pll_ctrl_p)	= { "fin_pll", "fout_cc_pll" };
-PNAME(mout_topc_mfc_pll_ctrl_p)	= { "fin_pll", "fout_mfc_pll" };
-
-PNAME(mout_topc_group2) = { "mout_topc_bus0_pll_half",
-	"mout_topc_bus1_pll_half", "mout_topc_cc_pll_half",
-	"mout_topc_mfc_pll_half" };
-
-PNAME(mout_topc_bus0_pll_half_p) = { "mout_topc_bus0_pll",
-	"ffac_topc_bus0_pll_div2", "ffac_topc_bus0_pll_div4"};
-PNAME(mout_topc_bus1_pll_half_p) = { "mout_topc_bus1_pll",
-	"ffac_topc_bus1_pll_div2"};
-PNAME(mout_topc_cc_pll_half_p) = { "mout_topc_cc_pll",
-	"ffac_topc_cc_pll_div2"};
-PNAME(mout_topc_mfc_pll_half_p) = { "mout_topc_mfc_pll",
-	"ffac_topc_mfc_pll_div2"};
-
-
-PNAME(mout_topc_bus0_pll_out_p) = {"mout_topc_bus0_pll",
-	"ffac_topc_bus0_pll_div2"};
-
-static unsigned long topc_clk_regs[] __initdata = {
-	CC_PLL_LOCK,
-	BUS0_PLL_LOCK,
-	BUS1_DPLL_LOCK,
-	MFC_PLL_LOCK,
-	AUD_PLL_LOCK,
-	CC_PLL_CON0,
-	BUS0_PLL_CON0,
-	BUS1_DPLL_CON0,
-	MFC_PLL_CON0,
-	AUD_PLL_CON0,
-	MUX_SEL_TOPC0,
-	MUX_SEL_TOPC1,
-	MUX_SEL_TOPC2,
-	MUX_SEL_TOPC3,
-	DIV_TOPC0,
-	DIV_TOPC1,
-	DIV_TOPC3,
-};
-
-static struct samsung_mux_clock topc_mux_clks[] __initdata = {
-	MUX(0, "mout_topc_bus0_pll", mout_topc_bus0_pll_ctrl_p,
-		MUX_SEL_TOPC0, 0, 1),
-	MUX(0, "mout_topc_bus1_pll", mout_topc_bus1_pll_ctrl_p,
-		MUX_SEL_TOPC0, 4, 1),
-	MUX(0, "mout_topc_cc_pll", mout_topc_cc_pll_ctrl_p,
-		MUX_SEL_TOPC0, 8, 1),
-	MUX(0, "mout_topc_mfc_pll", mout_topc_mfc_pll_ctrl_p,
-		MUX_SEL_TOPC0, 12, 1),
-	MUX(0, "mout_topc_bus0_pll_half", mout_topc_bus0_pll_half_p,
-		MUX_SEL_TOPC0, 16, 2),
-	MUX(0, "mout_topc_bus1_pll_half", mout_topc_bus1_pll_half_p,
-		MUX_SEL_TOPC0, 20, 1),
-	MUX(0, "mout_topc_cc_pll_half", mout_topc_cc_pll_half_p,
-		MUX_SEL_TOPC0, 24, 1),
-	MUX(0, "mout_topc_mfc_pll_half", mout_topc_mfc_pll_half_p,
-		MUX_SEL_TOPC0, 28, 1),
-
-	MUX(0, "mout_topc_aud_pll", mout_topc_aud_pll_ctrl_p,
-		MUX_SEL_TOPC1, 0, 1),
-	MUX(0, "mout_topc_bus0_pll_out", mout_topc_bus0_pll_out_p,
-		MUX_SEL_TOPC1, 16, 1),
-
-	MUX(0, "mout_aclk_ccore_133", mout_topc_group2,	MUX_SEL_TOPC2, 4, 2),
-
-	MUX(0, "mout_aclk_mscl_532", mout_topc_group2, MUX_SEL_TOPC3, 20, 2),
-	MUX(0, "mout_aclk_peris_66", mout_topc_group2, MUX_SEL_TOPC3, 24, 2),
-};
-
-static struct samsung_div_clock topc_div_clks[] __initdata = {
-	DIV(DOUT_ACLK_CCORE_133, "dout_aclk_ccore_133", "mout_aclk_ccore_133",
-		DIV_TOPC0, 4, 4),
-
-	DIV(DOUT_ACLK_MSCL_532, "dout_aclk_mscl_532", "mout_aclk_mscl_532",
-		DIV_TOPC1, 20, 4),
-	DIV(DOUT_ACLK_PERIS, "dout_aclk_peris_66", "mout_aclk_peris_66",
-		DIV_TOPC1, 24, 4),
-
-	DIV(DOUT_SCLK_BUS0_PLL, "dout_sclk_bus0_pll", "mout_topc_bus0_pll_out",
-		DIV_TOPC3, 0, 4),
-	DIV(DOUT_SCLK_BUS1_PLL, "dout_sclk_bus1_pll", "mout_topc_bus1_pll",
-		DIV_TOPC3, 8, 4),
-	DIV(DOUT_SCLK_CC_PLL, "dout_sclk_cc_pll", "mout_topc_cc_pll",
-		DIV_TOPC3, 12, 4),
-	DIV(DOUT_SCLK_MFC_PLL, "dout_sclk_mfc_pll", "mout_topc_mfc_pll",
-		DIV_TOPC3, 16, 4),
-	DIV(DOUT_SCLK_AUD_PLL, "dout_sclk_aud_pll", "mout_topc_aud_pll",
-		DIV_TOPC3, 28, 4),
-};
-
-static struct samsung_pll_rate_table pll1460x_24mhz_tbl[] __initdata = {
-	PLL_36XX_RATE(491520000, 20, 1, 0, 31457),
-	{},
-};
-
-static struct samsung_gate_clock topc_gate_clks[] __initdata = {
-	GATE(ACLK_CCORE_133, "aclk_ccore_133", "dout_aclk_ccore_133",
-		ENABLE_ACLK_TOPC0, 4, 0, 0),
-
-	GATE(ACLK_MSCL_532, "aclk_mscl_532", "dout_aclk_mscl_532",
-		ENABLE_ACLK_TOPC1, 20, 0, 0),
-
-	GATE(ACLK_PERIS_66, "aclk_peris_66", "dout_aclk_peris_66",
-		ENABLE_ACLK_TOPC1, 24, 0, 0),
-
-	GATE(SCLK_AUD_PLL, "sclk_aud_pll", "dout_sclk_aud_pll",
-		ENABLE_SCLK_TOPC1, 20, 0, 0),
-	GATE(SCLK_MFC_PLL_B, "sclk_mfc_pll_b", "dout_sclk_mfc_pll",
-		ENABLE_SCLK_TOPC1, 17, 0, 0),
-	GATE(SCLK_MFC_PLL_A, "sclk_mfc_pll_a", "dout_sclk_mfc_pll",
-		ENABLE_SCLK_TOPC1, 16, 0, 0),
-	GATE(SCLK_BUS1_PLL_B, "sclk_bus1_pll_b", "dout_sclk_bus1_pll",
-		ENABLE_SCLK_TOPC1, 13, 0, 0),
-	GATE(SCLK_BUS1_PLL_A, "sclk_bus1_pll_a", "dout_sclk_bus1_pll",
-		ENABLE_SCLK_TOPC1, 12, 0, 0),
-	GATE(SCLK_BUS0_PLL_B, "sclk_bus0_pll_b", "dout_sclk_bus0_pll",
-		ENABLE_SCLK_TOPC1, 5, 0, 0),
-	GATE(SCLK_BUS0_PLL_A, "sclk_bus0_pll_a", "dout_sclk_bus0_pll",
-		ENABLE_SCLK_TOPC1, 4, 0, 0),
-	GATE(SCLK_CC_PLL_B, "sclk_cc_pll_b", "dout_sclk_cc_pll",
-		ENABLE_SCLK_TOPC1, 1, 0, 0),
-	GATE(SCLK_CC_PLL_A, "sclk_cc_pll_a", "dout_sclk_cc_pll",
-		ENABLE_SCLK_TOPC1, 0, 0, 0),
-};
-
-static struct samsung_pll_clock topc_pll_clks[] __initdata = {
-	PLL(pll_1451x, 0, "fout_bus0_pll", "fin_pll", BUS0_PLL_LOCK,
-		BUS0_PLL_CON0, NULL),
-	PLL(pll_1452x, 0, "fout_cc_pll", "fin_pll", CC_PLL_LOCK,
-		CC_PLL_CON0, NULL),
-	PLL(pll_1452x, 0, "fout_bus1_pll", "fin_pll", BUS1_DPLL_LOCK,
-		BUS1_DPLL_CON0, NULL),
-	PLL(pll_1452x, 0, "fout_mfc_pll", "fin_pll", MFC_PLL_LOCK,
-		MFC_PLL_CON0, NULL),
-	PLL(pll_1460x, FOUT_AUD_PLL, "fout_aud_pll", "fin_pll", AUD_PLL_LOCK,
-		AUD_PLL_CON0, pll1460x_24mhz_tbl),
-};
-
-static struct samsung_cmu_info topc_cmu_info __initdata = {
-	.pll_clks		= topc_pll_clks,
-	.nr_pll_clks		= ARRAY_SIZE(topc_pll_clks),
-	.mux_clks		= topc_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(topc_mux_clks),
-	.div_clks		= topc_div_clks,
-	.nr_div_clks		= ARRAY_SIZE(topc_div_clks),
-	.gate_clks		= topc_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(topc_gate_clks),
-	.fixed_factor_clks	= topc_fixed_factor_clks,
-	.nr_fixed_factor_clks	= ARRAY_SIZE(topc_fixed_factor_clks),
-	.nr_clk_ids		= TOPC_NR_CLK,
-	.clk_regs		= topc_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(topc_clk_regs),
-};
-
-static void __init exynos7_clk_topc_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &topc_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_topc, "samsung,exynos7-clock-topc",
-	exynos7_clk_topc_init);
-
-/* Register Offset definitions for CMU_TOP0 (0x105D0000) */
-#define MUX_SEL_TOP00			0x0200
-#define MUX_SEL_TOP01			0x0204
-#define MUX_SEL_TOP03			0x020C
-#define MUX_SEL_TOP0_PERIC0		0x0230
-#define MUX_SEL_TOP0_PERIC1		0x0234
-#define MUX_SEL_TOP0_PERIC2		0x0238
-#define MUX_SEL_TOP0_PERIC3		0x023C
-#define DIV_TOP03			0x060C
-#define DIV_TOP0_PERIC0			0x0630
-#define DIV_TOP0_PERIC1			0x0634
-#define DIV_TOP0_PERIC2			0x0638
-#define DIV_TOP0_PERIC3			0x063C
-#define ENABLE_ACLK_TOP03		0x080C
-#define ENABLE_SCLK_TOP0_PERIC0		0x0A30
-#define ENABLE_SCLK_TOP0_PERIC1		0x0A34
-#define ENABLE_SCLK_TOP0_PERIC2		0x0A38
-#define ENABLE_SCLK_TOP0_PERIC3		0x0A3C
-
-/* List of parent clocks for Muxes in CMU_TOP0 */
-PNAME(mout_top0_bus0_pll_user_p)	= { "fin_pll", "sclk_bus0_pll_a" };
-PNAME(mout_top0_bus1_pll_user_p)	= { "fin_pll", "sclk_bus1_pll_a" };
-PNAME(mout_top0_cc_pll_user_p)	= { "fin_pll", "sclk_cc_pll_a" };
-PNAME(mout_top0_mfc_pll_user_p)	= { "fin_pll", "sclk_mfc_pll_a" };
-PNAME(mout_top0_aud_pll_user_p)	= { "fin_pll", "sclk_aud_pll" };
-
-PNAME(mout_top0_bus0_pll_half_p) = {"mout_top0_bus0_pll_user",
-	"ffac_top0_bus0_pll_div2"};
-PNAME(mout_top0_bus1_pll_half_p) = {"mout_top0_bus1_pll_user",
-	"ffac_top0_bus1_pll_div2"};
-PNAME(mout_top0_cc_pll_half_p) = {"mout_top0_cc_pll_user",
-	"ffac_top0_cc_pll_div2"};
-PNAME(mout_top0_mfc_pll_half_p) = {"mout_top0_mfc_pll_user",
-	"ffac_top0_mfc_pll_div2"};
-
-PNAME(mout_top0_group1) = {"mout_top0_bus0_pll_half",
-	"mout_top0_bus1_pll_half", "mout_top0_cc_pll_half",
-	"mout_top0_mfc_pll_half"};
-PNAME(mout_top0_group3) = {"ioclk_audiocdclk0",
-	"ioclk_audiocdclk1", "ioclk_spdif_extclk",
-	"mout_top0_aud_pll_user", "mout_top0_bus0_pll_half",
-	"mout_top0_bus1_pll_half"};
-PNAME(mout_top0_group4) = {"ioclk_audiocdclk1", "mout_top0_aud_pll_user",
-	"mout_top0_bus0_pll_half", "mout_top0_bus1_pll_half"};
-
-static unsigned long top0_clk_regs[] __initdata = {
-	MUX_SEL_TOP00,
-	MUX_SEL_TOP01,
-	MUX_SEL_TOP03,
-	MUX_SEL_TOP0_PERIC0,
-	MUX_SEL_TOP0_PERIC1,
-	MUX_SEL_TOP0_PERIC2,
-	MUX_SEL_TOP0_PERIC3,
-	DIV_TOP03,
-	DIV_TOP0_PERIC0,
-	DIV_TOP0_PERIC1,
-	DIV_TOP0_PERIC2,
-	DIV_TOP0_PERIC3,
-	ENABLE_SCLK_TOP0_PERIC0,
-	ENABLE_SCLK_TOP0_PERIC1,
-	ENABLE_SCLK_TOP0_PERIC2,
-	ENABLE_SCLK_TOP0_PERIC3,
-};
-
-static struct samsung_mux_clock top0_mux_clks[] __initdata = {
-	MUX(0, "mout_top0_aud_pll_user", mout_top0_aud_pll_user_p,
-		MUX_SEL_TOP00, 0, 1),
-	MUX(0, "mout_top0_mfc_pll_user", mout_top0_mfc_pll_user_p,
-		MUX_SEL_TOP00, 4, 1),
-	MUX(0, "mout_top0_cc_pll_user", mout_top0_cc_pll_user_p,
-		MUX_SEL_TOP00, 8, 1),
-	MUX(0, "mout_top0_bus1_pll_user", mout_top0_bus1_pll_user_p,
-		MUX_SEL_TOP00, 12, 1),
-	MUX(0, "mout_top0_bus0_pll_user", mout_top0_bus0_pll_user_p,
-		MUX_SEL_TOP00, 16, 1),
-
-	MUX(0, "mout_top0_mfc_pll_half", mout_top0_mfc_pll_half_p,
-		MUX_SEL_TOP01, 4, 1),
-	MUX(0, "mout_top0_cc_pll_half", mout_top0_cc_pll_half_p,
-		MUX_SEL_TOP01, 8, 1),
-	MUX(0, "mout_top0_bus1_pll_half", mout_top0_bus1_pll_half_p,
-		MUX_SEL_TOP01, 12, 1),
-	MUX(0, "mout_top0_bus0_pll_half", mout_top0_bus0_pll_half_p,
-		MUX_SEL_TOP01, 16, 1),
-
-	MUX(0, "mout_aclk_peric1_66", mout_top0_group1, MUX_SEL_TOP03, 12, 2),
-	MUX(0, "mout_aclk_peric0_66", mout_top0_group1, MUX_SEL_TOP03, 20, 2),
-
-	MUX(0, "mout_sclk_spdif", mout_top0_group3, MUX_SEL_TOP0_PERIC0, 4, 3),
-	MUX(0, "mout_sclk_pcm1", mout_top0_group4, MUX_SEL_TOP0_PERIC0, 8, 2),
-	MUX(0, "mout_sclk_i2s1", mout_top0_group4, MUX_SEL_TOP0_PERIC0, 20, 2),
-
-	MUX(0, "mout_sclk_spi1", mout_top0_group1, MUX_SEL_TOP0_PERIC1, 8, 2),
-	MUX(0, "mout_sclk_spi0", mout_top0_group1, MUX_SEL_TOP0_PERIC1, 20, 2),
-
-	MUX(0, "mout_sclk_spi3", mout_top0_group1, MUX_SEL_TOP0_PERIC2, 8, 2),
-	MUX(0, "mout_sclk_spi2", mout_top0_group1, MUX_SEL_TOP0_PERIC2, 20, 2),
-	MUX(0, "mout_sclk_uart3", mout_top0_group1, MUX_SEL_TOP0_PERIC3, 4, 2),
-	MUX(0, "mout_sclk_uart2", mout_top0_group1, MUX_SEL_TOP0_PERIC3, 8, 2),
-	MUX(0, "mout_sclk_uart1", mout_top0_group1, MUX_SEL_TOP0_PERIC3, 12, 2),
-	MUX(0, "mout_sclk_uart0", mout_top0_group1, MUX_SEL_TOP0_PERIC3, 16, 2),
-	MUX(0, "mout_sclk_spi4", mout_top0_group1, MUX_SEL_TOP0_PERIC3, 20, 2),
-};
-
-static struct samsung_div_clock top0_div_clks[] __initdata = {
-	DIV(DOUT_ACLK_PERIC1, "dout_aclk_peric1_66", "mout_aclk_peric1_66",
-		DIV_TOP03, 12, 6),
-	DIV(DOUT_ACLK_PERIC0, "dout_aclk_peric0_66", "mout_aclk_peric0_66",
-		DIV_TOP03, 20, 6),
-
-	DIV(0, "dout_sclk_spdif", "mout_sclk_spdif", DIV_TOP0_PERIC0, 4, 4),
-	DIV(0, "dout_sclk_pcm1", "mout_sclk_pcm1", DIV_TOP0_PERIC0, 8, 12),
-	DIV(0, "dout_sclk_i2s1", "mout_sclk_i2s1", DIV_TOP0_PERIC0, 20, 10),
-
-	DIV(0, "dout_sclk_spi1", "mout_sclk_spi1", DIV_TOP0_PERIC1, 8, 12),
-	DIV(0, "dout_sclk_spi0", "mout_sclk_spi0", DIV_TOP0_PERIC1, 20, 12),
-
-	DIV(0, "dout_sclk_spi3", "mout_sclk_spi3", DIV_TOP0_PERIC2, 8, 12),
-	DIV(0, "dout_sclk_spi2", "mout_sclk_spi2", DIV_TOP0_PERIC2, 20, 12),
-
-	DIV(0, "dout_sclk_uart3", "mout_sclk_uart3", DIV_TOP0_PERIC3, 4, 4),
-	DIV(0, "dout_sclk_uart2", "mout_sclk_uart2", DIV_TOP0_PERIC3, 8, 4),
-	DIV(0, "dout_sclk_uart1", "mout_sclk_uart1", DIV_TOP0_PERIC3, 12, 4),
-	DIV(0, "dout_sclk_uart0", "mout_sclk_uart0", DIV_TOP0_PERIC3, 16, 4),
-	DIV(0, "dout_sclk_spi4", "mout_sclk_spi4", DIV_TOP0_PERIC3, 20, 12),
-};
-
-static struct samsung_gate_clock top0_gate_clks[] __initdata = {
-	GATE(CLK_ACLK_PERIC0_66, "aclk_peric0_66", "dout_aclk_peric0_66",
-		ENABLE_ACLK_TOP03, 20, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_ACLK_PERIC1_66, "aclk_peric1_66", "dout_aclk_peric1_66",
-		ENABLE_ACLK_TOP03, 12, CLK_SET_RATE_PARENT, 0),
-
-	GATE(CLK_SCLK_SPDIF, "sclk_spdif", "dout_sclk_spdif",
-		ENABLE_SCLK_TOP0_PERIC0, 4, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_SCLK_PCM1, "sclk_pcm1", "dout_sclk_pcm1",
-		ENABLE_SCLK_TOP0_PERIC0, 8, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_SCLK_I2S1, "sclk_i2s1", "dout_sclk_i2s1",
-		ENABLE_SCLK_TOP0_PERIC0, 20, CLK_SET_RATE_PARENT, 0),
-
-	GATE(CLK_SCLK_SPI1, "sclk_spi1", "dout_sclk_spi1",
-		ENABLE_SCLK_TOP0_PERIC1, 8, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_SCLK_SPI0, "sclk_spi0", "dout_sclk_spi0",
-		ENABLE_SCLK_TOP0_PERIC1, 20, CLK_SET_RATE_PARENT, 0),
-
-	GATE(CLK_SCLK_SPI3, "sclk_spi3", "dout_sclk_spi3",
-		ENABLE_SCLK_TOP0_PERIC2, 8, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_SCLK_SPI2, "sclk_spi2", "dout_sclk_spi2",
-		ENABLE_SCLK_TOP0_PERIC2, 20, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_SCLK_UART3, "sclk_uart3", "dout_sclk_uart3",
-		ENABLE_SCLK_TOP0_PERIC3, 4, 0, 0),
-	GATE(CLK_SCLK_UART2, "sclk_uart2", "dout_sclk_uart2",
-		ENABLE_SCLK_TOP0_PERIC3, 8, 0, 0),
-	GATE(CLK_SCLK_UART1, "sclk_uart1", "dout_sclk_uart1",
-		ENABLE_SCLK_TOP0_PERIC3, 12, 0, 0),
-	GATE(CLK_SCLK_UART0, "sclk_uart0", "dout_sclk_uart0",
-		ENABLE_SCLK_TOP0_PERIC3, 16, 0, 0),
-	GATE(CLK_SCLK_SPI4, "sclk_spi4", "dout_sclk_spi4",
-		ENABLE_SCLK_TOP0_PERIC3, 20, CLK_SET_RATE_PARENT, 0),
-};
-
-static struct samsung_fixed_factor_clock top0_fixed_factor_clks[] __initdata = {
-	FFACTOR(0, "ffac_top0_bus0_pll_div2", "mout_top0_bus0_pll_user",
-		1, 2, 0),
-	FFACTOR(0, "ffac_top0_bus1_pll_div2", "mout_top0_bus1_pll_user",
-		1, 2, 0),
-	FFACTOR(0, "ffac_top0_cc_pll_div2", "mout_top0_cc_pll_user", 1, 2, 0),
-	FFACTOR(0, "ffac_top0_mfc_pll_div2", "mout_top0_mfc_pll_user", 1, 2, 0),
-};
-
-static struct samsung_cmu_info top0_cmu_info __initdata = {
-	.mux_clks		= top0_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(top0_mux_clks),
-	.div_clks		= top0_div_clks,
-	.nr_div_clks		= ARRAY_SIZE(top0_div_clks),
-	.gate_clks		= top0_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(top0_gate_clks),
-	.fixed_factor_clks	= top0_fixed_factor_clks,
-	.nr_fixed_factor_clks	= ARRAY_SIZE(top0_fixed_factor_clks),
-	.nr_clk_ids		= TOP0_NR_CLK,
-	.clk_regs		= top0_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(top0_clk_regs),
-};
-
-static void __init exynos7_clk_top0_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &top0_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_top0, "samsung,exynos7-clock-top0",
-	exynos7_clk_top0_init);
-
-/* Register Offset definitions for CMU_TOP1 (0x105E0000) */
-#define MUX_SEL_TOP10			0x0200
-#define MUX_SEL_TOP11			0x0204
-#define MUX_SEL_TOP13			0x020C
-#define MUX_SEL_TOP1_FSYS0		0x0224
-#define MUX_SEL_TOP1_FSYS1		0x0228
-#define MUX_SEL_TOP1_FSYS11		0x022C
-#define DIV_TOP13			0x060C
-#define DIV_TOP1_FSYS0			0x0624
-#define DIV_TOP1_FSYS1			0x0628
-#define DIV_TOP1_FSYS11			0x062C
-#define ENABLE_ACLK_TOP13		0x080C
-#define ENABLE_SCLK_TOP1_FSYS0		0x0A24
-#define ENABLE_SCLK_TOP1_FSYS1		0x0A28
-#define ENABLE_SCLK_TOP1_FSYS11		0x0A2C
-
-/* List of parent clocks for Muxes in CMU_TOP1 */
-PNAME(mout_top1_bus0_pll_user_p)	= { "fin_pll", "sclk_bus0_pll_b" };
-PNAME(mout_top1_bus1_pll_user_p)	= { "fin_pll", "sclk_bus1_pll_b" };
-PNAME(mout_top1_cc_pll_user_p)	= { "fin_pll", "sclk_cc_pll_b" };
-PNAME(mout_top1_mfc_pll_user_p)	= { "fin_pll", "sclk_mfc_pll_b" };
-
-PNAME(mout_top1_bus0_pll_half_p) = {"mout_top1_bus0_pll_user",
-	"ffac_top1_bus0_pll_div2"};
-PNAME(mout_top1_bus1_pll_half_p) = {"mout_top1_bus1_pll_user",
-	"ffac_top1_bus1_pll_div2"};
-PNAME(mout_top1_cc_pll_half_p) = {"mout_top1_cc_pll_user",
-	"ffac_top1_cc_pll_div2"};
-PNAME(mout_top1_mfc_pll_half_p) = {"mout_top1_mfc_pll_user",
-	"ffac_top1_mfc_pll_div2"};
-
-PNAME(mout_top1_group1) = {"mout_top1_bus0_pll_half",
-	"mout_top1_bus1_pll_half", "mout_top1_cc_pll_half",
-	"mout_top1_mfc_pll_half"};
-
-static unsigned long top1_clk_regs[] __initdata = {
-	MUX_SEL_TOP10,
-	MUX_SEL_TOP11,
-	MUX_SEL_TOP13,
-	MUX_SEL_TOP1_FSYS0,
-	MUX_SEL_TOP1_FSYS1,
-	MUX_SEL_TOP1_FSYS11,
-	DIV_TOP13,
-	DIV_TOP1_FSYS0,
-	DIV_TOP1_FSYS1,
-	DIV_TOP1_FSYS11,
-	ENABLE_ACLK_TOP13,
-	ENABLE_SCLK_TOP1_FSYS0,
-	ENABLE_SCLK_TOP1_FSYS1,
-	ENABLE_SCLK_TOP1_FSYS11,
-};
-
-static struct samsung_mux_clock top1_mux_clks[] __initdata = {
-	MUX(0, "mout_top1_mfc_pll_user", mout_top1_mfc_pll_user_p,
-		MUX_SEL_TOP10, 4, 1),
-	MUX(0, "mout_top1_cc_pll_user", mout_top1_cc_pll_user_p,
-		MUX_SEL_TOP10, 8, 1),
-	MUX(0, "mout_top1_bus1_pll_user", mout_top1_bus1_pll_user_p,
-		MUX_SEL_TOP10, 12, 1),
-	MUX(0, "mout_top1_bus0_pll_user", mout_top1_bus0_pll_user_p,
-		MUX_SEL_TOP10, 16, 1),
-
-	MUX(0, "mout_top1_mfc_pll_half", mout_top1_mfc_pll_half_p,
-		MUX_SEL_TOP11, 4, 1),
-	MUX(0, "mout_top1_cc_pll_half", mout_top1_cc_pll_half_p,
-		MUX_SEL_TOP11, 8, 1),
-	MUX(0, "mout_top1_bus1_pll_half", mout_top1_bus1_pll_half_p,
-		MUX_SEL_TOP11, 12, 1),
-	MUX(0, "mout_top1_bus0_pll_half", mout_top1_bus0_pll_half_p,
-		MUX_SEL_TOP11, 16, 1),
-
-	MUX(0, "mout_aclk_fsys1_200", mout_top1_group1, MUX_SEL_TOP13, 24, 2),
-	MUX(0, "mout_aclk_fsys0_200", mout_top1_group1, MUX_SEL_TOP13, 28, 2),
-
-	MUX(0, "mout_sclk_phy_fsys0_26m", mout_top1_group1,
-		MUX_SEL_TOP1_FSYS0, 0, 2),
-	MUX(0, "mout_sclk_mmc2", mout_top1_group1, MUX_SEL_TOP1_FSYS0, 16, 2),
-	MUX(0, "mout_sclk_usbdrd300", mout_top1_group1,
-		MUX_SEL_TOP1_FSYS0, 28, 2),
-
-	MUX(0, "mout_sclk_phy_fsys1", mout_top1_group1,
-		MUX_SEL_TOP1_FSYS1, 0, 2),
-	MUX(0, "mout_sclk_ufsunipro20", mout_top1_group1,
-		MUX_SEL_TOP1_FSYS1, 16, 2),
-
-	MUX(0, "mout_sclk_mmc1", mout_top1_group1, MUX_SEL_TOP1_FSYS11, 0, 2),
-	MUX(0, "mout_sclk_mmc0", mout_top1_group1, MUX_SEL_TOP1_FSYS11, 12, 2),
-	MUX(0, "mout_sclk_phy_fsys1_26m", mout_top1_group1,
-		MUX_SEL_TOP1_FSYS11, 24, 2),
-};
-
-static struct samsung_div_clock top1_div_clks[] __initdata = {
-	DIV(DOUT_ACLK_FSYS1_200, "dout_aclk_fsys1_200", "mout_aclk_fsys1_200",
-		DIV_TOP13, 24, 4),
-	DIV(DOUT_ACLK_FSYS0_200, "dout_aclk_fsys0_200", "mout_aclk_fsys0_200",
-		DIV_TOP13, 28, 4),
-
-	DIV(DOUT_SCLK_PHY_FSYS1, "dout_sclk_phy_fsys1",
-		"mout_sclk_phy_fsys1", DIV_TOP1_FSYS1, 0, 6),
-
-	DIV(DOUT_SCLK_UFSUNIPRO20, "dout_sclk_ufsunipro20",
-		"mout_sclk_ufsunipro20",
-		DIV_TOP1_FSYS1, 16, 6),
-
-	DIV(DOUT_SCLK_MMC2, "dout_sclk_mmc2", "mout_sclk_mmc2",
-		DIV_TOP1_FSYS0, 16, 10),
-	DIV(0, "dout_sclk_usbdrd300", "mout_sclk_usbdrd300",
-		DIV_TOP1_FSYS0, 28, 4),
-
-	DIV(DOUT_SCLK_MMC1, "dout_sclk_mmc1", "mout_sclk_mmc1",
-		DIV_TOP1_FSYS11, 0, 10),
-	DIV(DOUT_SCLK_MMC0, "dout_sclk_mmc0", "mout_sclk_mmc0",
-		DIV_TOP1_FSYS11, 12, 10),
-
-	DIV(DOUT_SCLK_PHY_FSYS1_26M, "dout_sclk_phy_fsys1_26m",
-		"mout_sclk_phy_fsys1_26m", DIV_TOP1_FSYS11, 24, 6),
-};
-
-static struct samsung_gate_clock top1_gate_clks[] __initdata = {
-	GATE(CLK_SCLK_MMC2, "sclk_mmc2", "dout_sclk_mmc2",
-		ENABLE_SCLK_TOP1_FSYS0, 16, CLK_SET_RATE_PARENT, 0),
-	GATE(0, "sclk_usbdrd300", "dout_sclk_usbdrd300",
-		ENABLE_SCLK_TOP1_FSYS0, 28, 0, 0),
-
-	GATE(CLK_SCLK_PHY_FSYS1, "sclk_phy_fsys1", "dout_sclk_phy_fsys1",
-		ENABLE_SCLK_TOP1_FSYS1, 0, CLK_SET_RATE_PARENT, 0),
-
-	GATE(CLK_SCLK_UFSUNIPRO20, "sclk_ufsunipro20", "dout_sclk_ufsunipro20",
-		ENABLE_SCLK_TOP1_FSYS1, 16, CLK_SET_RATE_PARENT, 0),
-
-	GATE(CLK_SCLK_MMC1, "sclk_mmc1", "dout_sclk_mmc1",
-		ENABLE_SCLK_TOP1_FSYS11, 0, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_SCLK_MMC0, "sclk_mmc0", "dout_sclk_mmc0",
-		ENABLE_SCLK_TOP1_FSYS11, 12, CLK_SET_RATE_PARENT, 0),
-
-	GATE(CLK_ACLK_FSYS0_200, "aclk_fsys0_200", "dout_aclk_fsys0_200",
-		ENABLE_ACLK_TOP13, 28, CLK_SET_RATE_PARENT, 0),
-	GATE(CLK_ACLK_FSYS1_200, "aclk_fsys1_200", "dout_aclk_fsys1_200",
-		ENABLE_ACLK_TOP13, 24, CLK_SET_RATE_PARENT, 0),
-
-	GATE(CLK_SCLK_PHY_FSYS1_26M, "sclk_phy_fsys1_26m",
-		"dout_sclk_phy_fsys1_26m", ENABLE_SCLK_TOP1_FSYS11,
-		24, CLK_SET_RATE_PARENT, 0),
-};
-
-static struct samsung_fixed_factor_clock top1_fixed_factor_clks[] __initdata = {
-	FFACTOR(0, "ffac_top1_bus0_pll_div2", "mout_top1_bus0_pll_user",
-		1, 2, 0),
-	FFACTOR(0, "ffac_top1_bus1_pll_div2", "mout_top1_bus1_pll_user",
-		1, 2, 0),
-	FFACTOR(0, "ffac_top1_cc_pll_div2", "mout_top1_cc_pll_user", 1, 2, 0),
-	FFACTOR(0, "ffac_top1_mfc_pll_div2", "mout_top1_mfc_pll_user", 1, 2, 0),
-};
-
-static struct samsung_cmu_info top1_cmu_info __initdata = {
-	.mux_clks		= top1_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(top1_mux_clks),
-	.div_clks		= top1_div_clks,
-	.nr_div_clks		= ARRAY_SIZE(top1_div_clks),
-	.gate_clks		= top1_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(top1_gate_clks),
-	.fixed_factor_clks	= top1_fixed_factor_clks,
-	.nr_fixed_factor_clks	= ARRAY_SIZE(top1_fixed_factor_clks),
-	.nr_clk_ids		= TOP1_NR_CLK,
-	.clk_regs		= top1_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(top1_clk_regs),
-};
-
-static void __init exynos7_clk_top1_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &top1_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_top1, "samsung,exynos7-clock-top1",
-	exynos7_clk_top1_init);
-
-/* Register Offset definitions for CMU_CCORE (0x105B0000) */
-#define MUX_SEL_CCORE			0x0200
-#define DIV_CCORE			0x0600
-#define ENABLE_ACLK_CCORE0		0x0800
-#define ENABLE_ACLK_CCORE1		0x0804
-#define ENABLE_PCLK_CCORE		0x0900
-
-/*
- * List of parent clocks for Muxes in CMU_CCORE
- */
-PNAME(mout_aclk_ccore_133_user_p)	= { "fin_pll", "aclk_ccore_133" };
-
-static unsigned long ccore_clk_regs[] __initdata = {
-	MUX_SEL_CCORE,
-	ENABLE_PCLK_CCORE,
-};
-
-static struct samsung_mux_clock ccore_mux_clks[] __initdata = {
-	MUX(0, "mout_aclk_ccore_133_user", mout_aclk_ccore_133_user_p,
-		MUX_SEL_CCORE, 1, 1),
-};
-
-static struct samsung_gate_clock ccore_gate_clks[] __initdata = {
-	GATE(PCLK_RTC, "pclk_rtc", "mout_aclk_ccore_133_user",
-		ENABLE_PCLK_CCORE, 8, 0, 0),
-};
-
-static struct samsung_cmu_info ccore_cmu_info __initdata = {
-	.mux_clks		= ccore_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(ccore_mux_clks),
-	.gate_clks		= ccore_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(ccore_gate_clks),
-	.nr_clk_ids		= CCORE_NR_CLK,
-	.clk_regs		= ccore_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(ccore_clk_regs),
-};
-
-static void __init exynos7_clk_ccore_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &ccore_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_ccore, "samsung,exynos7-clock-ccore",
-	exynos7_clk_ccore_init);
-
-/* Register Offset definitions for CMU_PERIC0 (0x13610000) */
-#define MUX_SEL_PERIC0			0x0200
-#define ENABLE_PCLK_PERIC0		0x0900
-#define ENABLE_SCLK_PERIC0		0x0A00
-
-/* List of parent clocks for Muxes in CMU_PERIC0 */
-PNAME(mout_aclk_peric0_66_user_p)	= { "fin_pll", "aclk_peric0_66" };
-PNAME(mout_sclk_uart0_user_p)	= { "fin_pll", "sclk_uart0" };
-
-static unsigned long peric0_clk_regs[] __initdata = {
-	MUX_SEL_PERIC0,
-	ENABLE_PCLK_PERIC0,
-	ENABLE_SCLK_PERIC0,
-};
-
-static struct samsung_mux_clock peric0_mux_clks[] __initdata = {
-	MUX(0, "mout_aclk_peric0_66_user", mout_aclk_peric0_66_user_p,
-		MUX_SEL_PERIC0, 0, 1),
-	MUX(0, "mout_sclk_uart0_user", mout_sclk_uart0_user_p,
-		MUX_SEL_PERIC0, 16, 1),
-};
-
-static struct samsung_gate_clock peric0_gate_clks[] __initdata = {
-	GATE(PCLK_HSI2C0, "pclk_hsi2c0", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 8, 0, 0),
-	GATE(PCLK_HSI2C1, "pclk_hsi2c1", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 9, 0, 0),
-	GATE(PCLK_HSI2C4, "pclk_hsi2c4", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 10, 0, 0),
-	GATE(PCLK_HSI2C5, "pclk_hsi2c5", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 11, 0, 0),
-	GATE(PCLK_HSI2C9, "pclk_hsi2c9", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 12, 0, 0),
-	GATE(PCLK_HSI2C10, "pclk_hsi2c10", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 13, 0, 0),
-	GATE(PCLK_HSI2C11, "pclk_hsi2c11", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 14, 0, 0),
-	GATE(PCLK_UART0, "pclk_uart0", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 16, 0, 0),
-	GATE(PCLK_ADCIF, "pclk_adcif", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 20, 0, 0),
-	GATE(PCLK_PWM, "pclk_pwm", "mout_aclk_peric0_66_user",
-		ENABLE_PCLK_PERIC0, 21, 0, 0),
-
-	GATE(SCLK_UART0, "sclk_uart0_user", "mout_sclk_uart0_user",
-		ENABLE_SCLK_PERIC0, 16, 0, 0),
-	GATE(SCLK_PWM, "sclk_pwm", "fin_pll", ENABLE_SCLK_PERIC0, 21, 0, 0),
-};
-
-static struct samsung_cmu_info peric0_cmu_info __initdata = {
-	.mux_clks		= peric0_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(peric0_mux_clks),
-	.gate_clks		= peric0_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(peric0_gate_clks),
-	.nr_clk_ids		= PERIC0_NR_CLK,
-	.clk_regs		= peric0_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(peric0_clk_regs),
-};
-
-static void __init exynos7_clk_peric0_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &peric0_cmu_info);
-}
-
-/* Register Offset definitions for CMU_PERIC1 (0x14C80000) */
-#define MUX_SEL_PERIC10			0x0200
-#define MUX_SEL_PERIC11			0x0204
-#define MUX_SEL_PERIC12			0x0208
-#define ENABLE_PCLK_PERIC1		0x0900
-#define ENABLE_SCLK_PERIC10		0x0A00
-
-CLK_OF_DECLARE(exynos7_clk_peric0, "samsung,exynos7-clock-peric0",
-	exynos7_clk_peric0_init);
-
-/* List of parent clocks for Muxes in CMU_PERIC1 */
-PNAME(mout_aclk_peric1_66_user_p)	= { "fin_pll", "aclk_peric1_66" };
-PNAME(mout_sclk_uart1_user_p)	= { "fin_pll", "sclk_uart1" };
-PNAME(mout_sclk_uart2_user_p)	= { "fin_pll", "sclk_uart2" };
-PNAME(mout_sclk_uart3_user_p)	= { "fin_pll", "sclk_uart3" };
-PNAME(mout_sclk_spi0_user_p)		= { "fin_pll", "sclk_spi0" };
-PNAME(mout_sclk_spi1_user_p)		= { "fin_pll", "sclk_spi1" };
-PNAME(mout_sclk_spi2_user_p)		= { "fin_pll", "sclk_spi2" };
-PNAME(mout_sclk_spi3_user_p)		= { "fin_pll", "sclk_spi3" };
-PNAME(mout_sclk_spi4_user_p)		= { "fin_pll", "sclk_spi4" };
-
-static unsigned long peric1_clk_regs[] __initdata = {
-	MUX_SEL_PERIC10,
-	MUX_SEL_PERIC11,
-	MUX_SEL_PERIC12,
-	ENABLE_PCLK_PERIC1,
-	ENABLE_SCLK_PERIC10,
-};
-
-static struct samsung_mux_clock peric1_mux_clks[] __initdata = {
-	MUX(0, "mout_aclk_peric1_66_user", mout_aclk_peric1_66_user_p,
-		MUX_SEL_PERIC10, 0, 1),
-
-	MUX_F(0, "mout_sclk_spi0_user", mout_sclk_spi0_user_p,
-		MUX_SEL_PERIC11, 0, 1, CLK_SET_RATE_PARENT, 0),
-	MUX_F(0, "mout_sclk_spi1_user", mout_sclk_spi1_user_p,
-		MUX_SEL_PERIC11, 4, 1, CLK_SET_RATE_PARENT, 0),
-	MUX_F(0, "mout_sclk_spi2_user", mout_sclk_spi2_user_p,
-		MUX_SEL_PERIC11, 8, 1, CLK_SET_RATE_PARENT, 0),
-	MUX_F(0, "mout_sclk_spi3_user", mout_sclk_spi3_user_p,
-		MUX_SEL_PERIC11, 12, 1, CLK_SET_RATE_PARENT, 0),
-	MUX_F(0, "mout_sclk_spi4_user", mout_sclk_spi4_user_p,
-		MUX_SEL_PERIC11, 16, 1, CLK_SET_RATE_PARENT, 0),
-	MUX(0, "mout_sclk_uart1_user", mout_sclk_uart1_user_p,
-		MUX_SEL_PERIC11, 20, 1),
-	MUX(0, "mout_sclk_uart2_user", mout_sclk_uart2_user_p,
-		MUX_SEL_PERIC11, 24, 1),
-	MUX(0, "mout_sclk_uart3_user", mout_sclk_uart3_user_p,
-		MUX_SEL_PERIC11, 28, 1),
-};
-
-static struct samsung_gate_clock peric1_gate_clks[] __initdata = {
-	GATE(PCLK_HSI2C2, "pclk_hsi2c2", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 4, 0, 0),
-	GATE(PCLK_HSI2C3, "pclk_hsi2c3", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 5, 0, 0),
-	GATE(PCLK_HSI2C6, "pclk_hsi2c6", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 6, 0, 0),
-	GATE(PCLK_HSI2C7, "pclk_hsi2c7", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 7, 0, 0),
-	GATE(PCLK_HSI2C8, "pclk_hsi2c8", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 8, 0, 0),
-	GATE(PCLK_UART1, "pclk_uart1", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 9, 0, 0),
-	GATE(PCLK_UART2, "pclk_uart2", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 10, 0, 0),
-	GATE(PCLK_UART3, "pclk_uart3", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 11, 0, 0),
-	GATE(PCLK_SPI0, "pclk_spi0", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 12, 0, 0),
-	GATE(PCLK_SPI1, "pclk_spi1", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 13, 0, 0),
-	GATE(PCLK_SPI2, "pclk_spi2", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 14, 0, 0),
-	GATE(PCLK_SPI3, "pclk_spi3", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 15, 0, 0),
-	GATE(PCLK_SPI4, "pclk_spi4", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 16, 0, 0),
-	GATE(PCLK_I2S1, "pclk_i2s1", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 17, CLK_SET_RATE_PARENT, 0),
-	GATE(PCLK_PCM1, "pclk_pcm1", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 18, 0, 0),
-	GATE(PCLK_SPDIF, "pclk_spdif", "mout_aclk_peric1_66_user",
-		ENABLE_PCLK_PERIC1, 19, 0, 0),
-
-	GATE(SCLK_UART1, "sclk_uart1_user", "mout_sclk_uart1_user",
-		ENABLE_SCLK_PERIC10, 9, 0, 0),
-	GATE(SCLK_UART2, "sclk_uart2_user", "mout_sclk_uart2_user",
-		ENABLE_SCLK_PERIC10, 10, 0, 0),
-	GATE(SCLK_UART3, "sclk_uart3_user", "mout_sclk_uart3_user",
-		ENABLE_SCLK_PERIC10, 11, 0, 0),
-	GATE(SCLK_SPI0, "sclk_spi0_user", "mout_sclk_spi0_user",
-		ENABLE_SCLK_PERIC10, 12, CLK_SET_RATE_PARENT, 0),
-	GATE(SCLK_SPI1, "sclk_spi1_user", "mout_sclk_spi1_user",
-		ENABLE_SCLK_PERIC10, 13, CLK_SET_RATE_PARENT, 0),
-	GATE(SCLK_SPI2, "sclk_spi2_user", "mout_sclk_spi2_user",
-		ENABLE_SCLK_PERIC10, 14, CLK_SET_RATE_PARENT, 0),
-	GATE(SCLK_SPI3, "sclk_spi3_user", "mout_sclk_spi3_user",
-		ENABLE_SCLK_PERIC10, 15, CLK_SET_RATE_PARENT, 0),
-	GATE(SCLK_SPI4, "sclk_spi4_user", "mout_sclk_spi4_user",
-		ENABLE_SCLK_PERIC10, 16, CLK_SET_RATE_PARENT, 0),
-	GATE(SCLK_I2S1, "sclk_i2s1_user", "sclk_i2s1",
-		ENABLE_SCLK_PERIC10, 17, CLK_SET_RATE_PARENT, 0),
-	GATE(SCLK_PCM1, "sclk_pcm1_user", "sclk_pcm1",
-		ENABLE_SCLK_PERIC10, 18, CLK_SET_RATE_PARENT, 0),
-	GATE(SCLK_SPDIF, "sclk_spdif_user", "sclk_spdif",
-		ENABLE_SCLK_PERIC10, 19, CLK_SET_RATE_PARENT, 0),
-};
-
-static struct samsung_cmu_info peric1_cmu_info __initdata = {
-	.mux_clks		= peric1_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(peric1_mux_clks),
-	.gate_clks		= peric1_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(peric1_gate_clks),
-	.nr_clk_ids		= PERIC1_NR_CLK,
-	.clk_regs		= peric1_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(peric1_clk_regs),
-};
-
-static void __init exynos7_clk_peric1_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &peric1_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_peric1, "samsung,exynos7-clock-peric1",
-	exynos7_clk_peric1_init);
-
-/* Register Offset definitions for CMU_PERIS (0x10040000) */
-#define MUX_SEL_PERIS			0x0200
-#define ENABLE_PCLK_PERIS		0x0900
-#define ENABLE_PCLK_PERIS_SECURE_CHIPID	0x0910
-#define ENABLE_SCLK_PERIS		0x0A00
-#define ENABLE_SCLK_PERIS_SECURE_CHIPID	0x0A10
-
-/* List of parent clocks for Muxes in CMU_PERIS */
-PNAME(mout_aclk_peris_66_user_p) = { "fin_pll", "aclk_peris_66" };
-
-static unsigned long peris_clk_regs[] __initdata = {
-	MUX_SEL_PERIS,
-	ENABLE_PCLK_PERIS,
-	ENABLE_PCLK_PERIS_SECURE_CHIPID,
-	ENABLE_SCLK_PERIS,
-	ENABLE_SCLK_PERIS_SECURE_CHIPID,
-};
-
-static struct samsung_mux_clock peris_mux_clks[] __initdata = {
-	MUX(0, "mout_aclk_peris_66_user",
-		mout_aclk_peris_66_user_p, MUX_SEL_PERIS, 0, 1),
-};
-
-static struct samsung_gate_clock peris_gate_clks[] __initdata = {
-	GATE(PCLK_WDT, "pclk_wdt", "mout_aclk_peris_66_user",
-		ENABLE_PCLK_PERIS, 6, 0, 0),
-	GATE(PCLK_TMU, "pclk_tmu_apbif", "mout_aclk_peris_66_user",
-		ENABLE_PCLK_PERIS, 10, 0, 0),
-
-	GATE(PCLK_CHIPID, "pclk_chipid", "mout_aclk_peris_66_user",
-		ENABLE_PCLK_PERIS_SECURE_CHIPID, 0, 0, 0),
-	GATE(SCLK_CHIPID, "sclk_chipid", "fin_pll",
-		ENABLE_SCLK_PERIS_SECURE_CHIPID, 0, 0, 0),
-
-	GATE(SCLK_TMU, "sclk_tmu", "fin_pll", ENABLE_SCLK_PERIS, 10, 0, 0),
-};
-
-static struct samsung_cmu_info peris_cmu_info __initdata = {
-	.mux_clks		= peris_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(peris_mux_clks),
-	.gate_clks		= peris_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(peris_gate_clks),
-	.nr_clk_ids		= PERIS_NR_CLK,
-	.clk_regs		= peris_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(peris_clk_regs),
-};
-
-static void __init exynos7_clk_peris_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &peris_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_peris, "samsung,exynos7-clock-peris",
-	exynos7_clk_peris_init);
-
-/* Register Offset definitions for CMU_FSYS0 (0x10E90000) */
-#define MUX_SEL_FSYS00			0x0200
-#define MUX_SEL_FSYS01			0x0204
-#define MUX_SEL_FSYS02			0x0208
-#define ENABLE_ACLK_FSYS00		0x0800
-#define ENABLE_ACLK_FSYS01		0x0804
-#define ENABLE_SCLK_FSYS01		0x0A04
-#define ENABLE_SCLK_FSYS02		0x0A08
-#define ENABLE_SCLK_FSYS04		0x0A10
-
-/*
- * List of parent clocks for Muxes in CMU_FSYS0
- */
-PNAME(mout_aclk_fsys0_200_user_p)	= { "fin_pll", "aclk_fsys0_200" };
-PNAME(mout_sclk_mmc2_user_p)		= { "fin_pll", "sclk_mmc2" };
-
-PNAME(mout_sclk_usbdrd300_user_p)	= { "fin_pll", "sclk_usbdrd300" };
-PNAME(mout_phyclk_usbdrd300_udrd30_phyclk_user_p)	= { "fin_pll",
-				"phyclk_usbdrd300_udrd30_phyclock" };
-PNAME(mout_phyclk_usbdrd300_udrd30_pipe_pclk_user_p)	= { "fin_pll",
-				"phyclk_usbdrd300_udrd30_pipe_pclk" };
-
-/* fixed rate clocks used in the FSYS0 block */
-static struct samsung_fixed_rate_clock fixed_rate_clks_fsys0[] __initdata = {
-	FRATE(0, "phyclk_usbdrd300_udrd30_phyclock", NULL,
-		CLK_IS_ROOT, 60000000),
-	FRATE(0, "phyclk_usbdrd300_udrd30_pipe_pclk", NULL,
-		CLK_IS_ROOT, 125000000),
-};
-
-static unsigned long fsys0_clk_regs[] __initdata = {
-	MUX_SEL_FSYS00,
-	MUX_SEL_FSYS01,
-	MUX_SEL_FSYS02,
-	ENABLE_ACLK_FSYS00,
-	ENABLE_ACLK_FSYS01,
-	ENABLE_SCLK_FSYS01,
-	ENABLE_SCLK_FSYS02,
-	ENABLE_SCLK_FSYS04,
-};
-
-static struct samsung_mux_clock fsys0_mux_clks[] __initdata = {
-	MUX(0, "mout_aclk_fsys0_200_user", mout_aclk_fsys0_200_user_p,
-		MUX_SEL_FSYS00, 24, 1),
-
-	MUX(0, "mout_sclk_mmc2_user", mout_sclk_mmc2_user_p,
-		MUX_SEL_FSYS01, 24, 1),
-	MUX(0, "mout_sclk_usbdrd300_user", mout_sclk_usbdrd300_user_p,
-		MUX_SEL_FSYS01, 28, 1),
-
-	MUX(0, "mout_phyclk_usbdrd300_udrd30_pipe_pclk_user",
-		mout_phyclk_usbdrd300_udrd30_pipe_pclk_user_p,
-		MUX_SEL_FSYS02, 24, 1),
-	MUX(0, "mout_phyclk_usbdrd300_udrd30_phyclk_user",
-		mout_phyclk_usbdrd300_udrd30_phyclk_user_p,
-		MUX_SEL_FSYS02, 28, 1),
-};
-
-static struct samsung_gate_clock fsys0_gate_clks[] __initdata = {
-	GATE(ACLK_PDMA1, "aclk_pdma1", "mout_aclk_fsys0_200_user",
-			ENABLE_ACLK_FSYS00, 3, 0, 0),
-	GATE(ACLK_PDMA0, "aclk_pdma0", "mout_aclk_fsys0_200_user",
-			ENABLE_ACLK_FSYS00, 4, 0, 0),
-	GATE(ACLK_AXIUS_USBDRD30X_FSYS0X, "aclk_axius_usbdrd30x_fsys0x",
-		"mout_aclk_fsys0_200_user",
-		ENABLE_ACLK_FSYS00, 19, 0, 0),
-
-	GATE(ACLK_USBDRD300, "aclk_usbdrd300", "mout_aclk_fsys0_200_user",
-		ENABLE_ACLK_FSYS01, 29, 0, 0),
-	GATE(ACLK_MMC2, "aclk_mmc2", "mout_aclk_fsys0_200_user",
-		ENABLE_ACLK_FSYS01, 31, 0, 0),
-
-	GATE(SCLK_USBDRD300_SUSPENDCLK, "sclk_usbdrd300_suspendclk",
-		"mout_sclk_usbdrd300_user",
-		ENABLE_SCLK_FSYS01, 4, 0, 0),
-	GATE(SCLK_USBDRD300_REFCLK, "sclk_usbdrd300_refclk", "fin_pll",
-		ENABLE_SCLK_FSYS01, 8, 0, 0),
-
-	GATE(PHYCLK_USBDRD300_UDRD30_PIPE_PCLK_USER,
-		"phyclk_usbdrd300_udrd30_pipe_pclk_user",
-		"mout_phyclk_usbdrd300_udrd30_pipe_pclk_user",
-		ENABLE_SCLK_FSYS02, 24, 0, 0),
-	GATE(PHYCLK_USBDRD300_UDRD30_PHYCLK_USER,
-		"phyclk_usbdrd300_udrd30_phyclk_user",
-		"mout_phyclk_usbdrd300_udrd30_phyclk_user",
-		ENABLE_SCLK_FSYS02, 28, 0, 0),
-
-	GATE(OSCCLK_PHY_CLKOUT_USB30_PHY, "oscclk_phy_clkout_usb30_phy",
-		"fin_pll",
-		ENABLE_SCLK_FSYS04, 28, 0, 0),
-};
-
-static struct samsung_cmu_info fsys0_cmu_info __initdata = {
-	.fixed_clks		= fixed_rate_clks_fsys0,
-	.nr_fixed_clks		= ARRAY_SIZE(fixed_rate_clks_fsys0),
-	.mux_clks		= fsys0_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(fsys0_mux_clks),
-	.gate_clks		= fsys0_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(fsys0_gate_clks),
-	.nr_clk_ids		= FSYS0_NR_CLK,
-	.clk_regs		= fsys0_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(fsys0_clk_regs),
-};
-
-static void __init exynos7_clk_fsys0_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &fsys0_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_fsys0, "samsung,exynos7-clock-fsys0",
-	exynos7_clk_fsys0_init);
-
-/* Register Offset definitions for CMU_FSYS1 (0x156E0000) */
-#define MUX_SEL_FSYS10			0x0200
-#define MUX_SEL_FSYS11			0x0204
-#define MUX_SEL_FSYS12			0x0208
-#define DIV_FSYS1			0x0600
-#define ENABLE_ACLK_FSYS1		0x0800
-#define ENABLE_PCLK_FSYS1               0x0900
-#define ENABLE_SCLK_FSYS11              0x0A04
-#define ENABLE_SCLK_FSYS12              0x0A08
-#define ENABLE_SCLK_FSYS13              0x0A0C
-
-/*
- * List of parent clocks for Muxes in CMU_FSYS1
- */
-PNAME(mout_aclk_fsys1_200_user_p)	= { "fin_pll", "aclk_fsys1_200" };
-PNAME(mout_fsys1_group_p)	= { "fin_pll", "fin_pll_26m",
-				"sclk_phy_fsys1_26m" };
-PNAME(mout_sclk_mmc0_user_p)		= { "fin_pll", "sclk_mmc0" };
-PNAME(mout_sclk_mmc1_user_p)		= { "fin_pll", "sclk_mmc1" };
-PNAME(mout_sclk_ufsunipro20_user_p)  = { "fin_pll", "sclk_ufsunipro20" };
-PNAME(mout_phyclk_ufs20_tx0_user_p) = { "fin_pll", "phyclk_ufs20_tx0_symbol" };
-PNAME(mout_phyclk_ufs20_rx0_user_p) = { "fin_pll", "phyclk_ufs20_rx0_symbol" };
-PNAME(mout_phyclk_ufs20_rx1_user_p) = { "fin_pll", "phyclk_ufs20_rx1_symbol" };
-
-/* fixed rate clocks used in the FSYS1 block */
-static struct samsung_fixed_rate_clock fixed_rate_clks_fsys1[] __initdata = {
-	FRATE(PHYCLK_UFS20_TX0_SYMBOL, "phyclk_ufs20_tx0_symbol", NULL,
-			CLK_IS_ROOT, 300000000),
-	FRATE(PHYCLK_UFS20_RX0_SYMBOL, "phyclk_ufs20_rx0_symbol", NULL,
-			CLK_IS_ROOT, 300000000),
-	FRATE(PHYCLK_UFS20_RX1_SYMBOL, "phyclk_ufs20_rx1_symbol", NULL,
-			CLK_IS_ROOT, 300000000),
-};
-
-static unsigned long fsys1_clk_regs[] __initdata = {
-	MUX_SEL_FSYS10,
-	MUX_SEL_FSYS11,
-	MUX_SEL_FSYS12,
-	DIV_FSYS1,
-	ENABLE_ACLK_FSYS1,
-	ENABLE_PCLK_FSYS1,
-	ENABLE_SCLK_FSYS11,
-	ENABLE_SCLK_FSYS12,
-	ENABLE_SCLK_FSYS13,
-};
-
-static struct samsung_mux_clock fsys1_mux_clks[] __initdata = {
-	MUX(MOUT_FSYS1_PHYCLK_SEL1, "mout_fsys1_phyclk_sel1",
-		mout_fsys1_group_p, MUX_SEL_FSYS10, 16, 2),
-	MUX(0, "mout_fsys1_phyclk_sel0", mout_fsys1_group_p,
-		 MUX_SEL_FSYS10, 20, 2),
-	MUX(0, "mout_aclk_fsys1_200_user", mout_aclk_fsys1_200_user_p,
-		MUX_SEL_FSYS10, 28, 1),
-
-	MUX(0, "mout_sclk_mmc1_user", mout_sclk_mmc1_user_p,
-		MUX_SEL_FSYS11, 24, 1),
-	MUX(0, "mout_sclk_mmc0_user", mout_sclk_mmc0_user_p,
-		MUX_SEL_FSYS11, 28, 1),
-	MUX(0, "mout_sclk_ufsunipro20_user", mout_sclk_ufsunipro20_user_p,
-		MUX_SEL_FSYS11, 20, 1),
-
-	MUX(0, "mout_phyclk_ufs20_rx1_symbol_user",
-		mout_phyclk_ufs20_rx1_user_p, MUX_SEL_FSYS12, 16, 1),
-	MUX(0, "mout_phyclk_ufs20_rx0_symbol_user",
-		mout_phyclk_ufs20_rx0_user_p, MUX_SEL_FSYS12, 24, 1),
-	MUX(0, "mout_phyclk_ufs20_tx0_symbol_user",
-		mout_phyclk_ufs20_tx0_user_p, MUX_SEL_FSYS12, 28, 1),
-};
-
-static struct samsung_div_clock fsys1_div_clks[] __initdata = {
-	DIV(DOUT_PCLK_FSYS1, "dout_pclk_fsys1", "mout_aclk_fsys1_200_user",
-		DIV_FSYS1, 0, 2),
-};
-
-static struct samsung_gate_clock fsys1_gate_clks[] __initdata = {
-	GATE(SCLK_UFSUNIPRO20_USER, "sclk_ufsunipro20_user",
-		"mout_sclk_ufsunipro20_user",
-		ENABLE_SCLK_FSYS11, 20, 0, 0),
-
-	GATE(ACLK_MMC1, "aclk_mmc1", "mout_aclk_fsys1_200_user",
-		ENABLE_ACLK_FSYS1, 29, 0, 0),
-	GATE(ACLK_MMC0, "aclk_mmc0", "mout_aclk_fsys1_200_user",
-		ENABLE_ACLK_FSYS1, 30, 0, 0),
-
-	GATE(ACLK_UFS20_LINK, "aclk_ufs20_link", "dout_pclk_fsys1",
-		ENABLE_ACLK_FSYS1, 31, 0, 0),
-	GATE(PCLK_GPIO_FSYS1, "pclk_gpio_fsys1", "mout_aclk_fsys1_200_user",
-		ENABLE_PCLK_FSYS1, 30, 0, 0),
-
-	GATE(PHYCLK_UFS20_RX1_SYMBOL_USER, "phyclk_ufs20_rx1_symbol_user",
-		"mout_phyclk_ufs20_rx1_symbol_user",
-		ENABLE_SCLK_FSYS12, 16, 0, 0),
-	GATE(PHYCLK_UFS20_RX0_SYMBOL_USER, "phyclk_ufs20_rx0_symbol_user",
-		"mout_phyclk_ufs20_rx0_symbol_user",
-		ENABLE_SCLK_FSYS12, 24, 0, 0),
-	GATE(PHYCLK_UFS20_TX0_SYMBOL_USER, "phyclk_ufs20_tx0_symbol_user",
-		"mout_phyclk_ufs20_tx0_symbol_user",
-		ENABLE_SCLK_FSYS12, 28, 0, 0),
-
-	GATE(OSCCLK_PHY_CLKOUT_EMBEDDED_COMBO_PHY,
-		"oscclk_phy_clkout_embedded_combo_phy",
-		"fin_pll",
-		ENABLE_SCLK_FSYS12, 4, CLK_IGNORE_UNUSED, 0),
-
-	GATE(SCLK_COMBO_PHY_EMBEDDED_26M, "sclk_combo_phy_embedded_26m",
-		"mout_fsys1_phyclk_sel1",
-		ENABLE_SCLK_FSYS13, 24, CLK_IGNORE_UNUSED, 0),
-};
-
-static struct samsung_cmu_info fsys1_cmu_info __initdata = {
-	.fixed_clks		= fixed_rate_clks_fsys1,
-	.nr_fixed_clks		= ARRAY_SIZE(fixed_rate_clks_fsys1),
-	.mux_clks		= fsys1_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(fsys1_mux_clks),
-	.div_clks		= fsys1_div_clks,
-	.nr_div_clks		= ARRAY_SIZE(fsys1_div_clks),
-	.gate_clks		= fsys1_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(fsys1_gate_clks),
-	.nr_clk_ids		= FSYS1_NR_CLK,
-	.clk_regs		= fsys1_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(fsys1_clk_regs),
-};
-
-static void __init exynos7_clk_fsys1_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &fsys1_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_fsys1, "samsung,exynos7-clock-fsys1",
-	exynos7_clk_fsys1_init);
-
-#define MUX_SEL_MSCL			0x0200
-#define DIV_MSCL			0x0600
-#define ENABLE_ACLK_MSCL		0x0800
-#define ENABLE_PCLK_MSCL		0x0900
-
-/* List of parent clocks for Muxes in CMU_MSCL */
-PNAME(mout_aclk_mscl_532_user_p)	= { "fin_pll", "aclk_mscl_532" };
-
-static unsigned long mscl_clk_regs[] __initdata = {
-	MUX_SEL_MSCL,
-	DIV_MSCL,
-	ENABLE_ACLK_MSCL,
-	ENABLE_PCLK_MSCL,
-};
-
-static struct samsung_mux_clock mscl_mux_clks[] __initdata = {
-	MUX(USERMUX_ACLK_MSCL_532, "usermux_aclk_mscl_532",
-		mout_aclk_mscl_532_user_p, MUX_SEL_MSCL, 0, 1),
-};
-static struct samsung_div_clock mscl_div_clks[] __initdata = {
-	DIV(DOUT_PCLK_MSCL, "dout_pclk_mscl", "usermux_aclk_mscl_532",
-			DIV_MSCL, 0, 3),
-};
-static struct samsung_gate_clock mscl_gate_clks[] __initdata = {
-
-	GATE(ACLK_MSCL_0, "aclk_mscl_0", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 31, 0, 0),
-	GATE(ACLK_MSCL_1, "aclk_mscl_1", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 30, 0, 0),
-	GATE(ACLK_JPEG, "aclk_jpeg", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 29, 0, 0),
-	GATE(ACLK_G2D, "aclk_g2d", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 28, 0, 0),
-	GATE(ACLK_LH_ASYNC_SI_MSCL_0, "aclk_lh_async_si_mscl_0",
-			"usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 27, 0, 0),
-	GATE(ACLK_LH_ASYNC_SI_MSCL_1, "aclk_lh_async_si_mscl_1",
-			"usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 26, 0, 0),
-	GATE(ACLK_XIU_MSCLX_0, "aclk_xiu_msclx_0", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 25, 0, 0),
-	GATE(ACLK_XIU_MSCLX_1, "aclk_xiu_msclx_1", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 24, 0, 0),
-	GATE(ACLK_AXI2ACEL_BRIDGE, "aclk_axi2acel_bridge",
-			"usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 23, 0, 0),
-	GATE(ACLK_QE_MSCL_0, "aclk_qe_mscl_0", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 22, 0, 0),
-	GATE(ACLK_QE_MSCL_1, "aclk_qe_mscl_1", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 21, 0, 0),
-	GATE(ACLK_QE_JPEG, "aclk_qe_jpeg", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 20, 0, 0),
-	GATE(ACLK_QE_G2D, "aclk_qe_g2d", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 19, 0, 0),
-	GATE(ACLK_PPMU_MSCL_0, "aclk_ppmu_mscl_0", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 18, 0, 0),
-	GATE(ACLK_PPMU_MSCL_1, "aclk_ppmu_mscl_1", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 17, 0, 0),
-	GATE(ACLK_MSCLNP_133, "aclk_msclnp_133", "usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 16, 0, 0),
-	GATE(ACLK_AHB2APB_MSCL0P, "aclk_ahb2apb_mscl0p",
-			"usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 15, 0, 0),
-	GATE(ACLK_AHB2APB_MSCL1P, "aclk_ahb2apb_mscl1p",
-			"usermux_aclk_mscl_532",
-			ENABLE_ACLK_MSCL, 14, 0, 0),
-
-	GATE(PCLK_MSCL_0, "pclk_mscl_0", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 31, 0, 0),
-	GATE(PCLK_MSCL_1, "pclk_mscl_1", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 30, 0, 0),
-	GATE(PCLK_JPEG, "pclk_jpeg", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 29, 0, 0),
-	GATE(PCLK_G2D, "pclk_g2d", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 28, 0, 0),
-	GATE(PCLK_QE_MSCL_0, "pclk_qe_mscl_0", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 27, 0, 0),
-	GATE(PCLK_QE_MSCL_1, "pclk_qe_mscl_1", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 26, 0, 0),
-	GATE(PCLK_QE_JPEG, "pclk_qe_jpeg", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 25, 0, 0),
-	GATE(PCLK_QE_G2D, "pclk_qe_g2d", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 24, 0, 0),
-	GATE(PCLK_PPMU_MSCL_0, "pclk_ppmu_mscl_0", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 23, 0, 0),
-	GATE(PCLK_PPMU_MSCL_1, "pclk_ppmu_mscl_1", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 22, 0, 0),
-	GATE(PCLK_AXI2ACEL_BRIDGE, "pclk_axi2acel_bridge", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 21, 0, 0),
-	GATE(PCLK_PMU_MSCL, "pclk_pmu_mscl", "dout_pclk_mscl",
-			ENABLE_PCLK_MSCL, 20, 0, 0),
-};
-
-static struct samsung_cmu_info mscl_cmu_info __initdata = {
-	.mux_clks		= mscl_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(mscl_mux_clks),
-	.div_clks		= mscl_div_clks,
-	.nr_div_clks		= ARRAY_SIZE(mscl_div_clks),
-	.gate_clks		= mscl_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(mscl_gate_clks),
-	.nr_clk_ids		= MSCL_NR_CLK,
-	.clk_regs		= mscl_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(mscl_clk_regs),
-};
-
-static void __init exynos7_clk_mscl_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &mscl_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_mscl, "samsung,exynos7-clock-mscl",
-		exynos7_clk_mscl_init);
-
-/* Register Offset definitions for CMU_AUD (0x114C0000) */
-#define	MUX_SEL_AUD			0x0200
-#define	DIV_AUD0			0x0600
-#define	DIV_AUD1			0x0604
-#define	ENABLE_ACLK_AUD			0x0800
-#define	ENABLE_PCLK_AUD			0x0900
-#define	ENABLE_SCLK_AUD			0x0A00
-
-/*
- * List of parent clocks for Muxes in CMU_AUD
- */
-PNAME(mout_aud_pll_user_p) = { "fin_pll", "fout_aud_pll" };
-PNAME(mout_aud_group_p) = { "dout_aud_cdclk", "ioclk_audiocdclk0" };
-
-static unsigned long aud_clk_regs[] __initdata = {
-	MUX_SEL_AUD,
-	DIV_AUD0,
-	DIV_AUD1,
-	ENABLE_ACLK_AUD,
-	ENABLE_PCLK_AUD,
-	ENABLE_SCLK_AUD,
-};
-
-static struct samsung_mux_clock aud_mux_clks[] __initdata = {
-	MUX(0, "mout_sclk_i2s", mout_aud_group_p, MUX_SEL_AUD, 12, 1),
-	MUX(0, "mout_sclk_pcm", mout_aud_group_p, MUX_SEL_AUD, 16, 1),
-	MUX(0, "mout_aud_pll_user", mout_aud_pll_user_p, MUX_SEL_AUD, 20, 1),
-};
-
-static struct samsung_div_clock aud_div_clks[] __initdata = {
-	DIV(0, "dout_aud_ca5", "mout_aud_pll_user", DIV_AUD0, 0, 4),
-	DIV(0, "dout_aclk_aud", "dout_aud_ca5", DIV_AUD0, 4, 4),
-	DIV(0, "dout_aud_pclk_dbg", "dout_aud_ca5", DIV_AUD0, 8, 4),
-
-	DIV(0, "dout_sclk_i2s", "mout_sclk_i2s", DIV_AUD1, 0, 4),
-	DIV(0, "dout_sclk_pcm", "mout_sclk_pcm", DIV_AUD1, 4, 8),
-	DIV(0, "dout_sclk_uart", "dout_aud_cdclk", DIV_AUD1, 12, 4),
-	DIV(0, "dout_sclk_slimbus", "dout_aud_cdclk", DIV_AUD1, 16, 5),
-	DIV(0, "dout_aud_cdclk", "mout_aud_pll_user", DIV_AUD1, 24, 4),
-};
-
-static struct samsung_gate_clock aud_gate_clks[] __initdata = {
-	GATE(SCLK_PCM, "sclk_pcm", "dout_sclk_pcm",
-			ENABLE_SCLK_AUD, 27, CLK_SET_RATE_PARENT, 0),
-	GATE(SCLK_I2S, "sclk_i2s", "dout_sclk_i2s",
-			ENABLE_SCLK_AUD, 28, CLK_SET_RATE_PARENT, 0),
-	GATE(0, "sclk_uart", "dout_sclk_uart", ENABLE_SCLK_AUD, 29, 0, 0),
-	GATE(0, "sclk_slimbus", "dout_sclk_slimbus",
-			ENABLE_SCLK_AUD, 30, 0, 0),
-
-	GATE(0, "pclk_dbg_aud", "dout_aud_pclk_dbg", ENABLE_PCLK_AUD, 19, 0, 0),
-	GATE(0, "pclk_gpio_aud", "dout_aclk_aud", ENABLE_PCLK_AUD, 20, 0, 0),
-	GATE(0, "pclk_wdt1", "dout_aclk_aud", ENABLE_PCLK_AUD, 22, 0, 0),
-	GATE(0, "pclk_wdt0", "dout_aclk_aud", ENABLE_PCLK_AUD, 23, 0, 0),
-	GATE(0, "pclk_slimbus", "dout_aclk_aud", ENABLE_PCLK_AUD, 24, 0, 0),
-	GATE(0, "pclk_uart", "dout_aclk_aud", ENABLE_PCLK_AUD, 25, 0, 0),
-	GATE(PCLK_PCM, "pclk_pcm", "dout_aclk_aud",
-			ENABLE_PCLK_AUD, 26, CLK_SET_RATE_PARENT, 0),
-	GATE(PCLK_I2S, "pclk_i2s", "dout_aclk_aud",
-			ENABLE_PCLK_AUD, 27, CLK_SET_RATE_PARENT, 0),
-	GATE(0, "pclk_timer", "dout_aclk_aud", ENABLE_PCLK_AUD, 28, 0, 0),
-	GATE(0, "pclk_smmu_aud", "dout_aclk_aud", ENABLE_PCLK_AUD, 31, 0, 0),
-
-	GATE(0, "aclk_smmu_aud", "dout_aclk_aud", ENABLE_ACLK_AUD, 27, 0, 0),
-	GATE(0, "aclk_acel_lh_async_si_top", "dout_aclk_aud",
-			 ENABLE_ACLK_AUD, 28, 0, 0),
-	GATE(ACLK_ADMA, "aclk_dmac", "dout_aclk_aud", ENABLE_ACLK_AUD, 31, 0, 0),
-};
-
-static struct samsung_cmu_info aud_cmu_info __initdata = {
-	.mux_clks		= aud_mux_clks,
-	.nr_mux_clks		= ARRAY_SIZE(aud_mux_clks),
-	.div_clks		= aud_div_clks,
-	.nr_div_clks		= ARRAY_SIZE(aud_div_clks),
-	.gate_clks		= aud_gate_clks,
-	.nr_gate_clks		= ARRAY_SIZE(aud_gate_clks),
-	.nr_clk_ids		= AUD_NR_CLK,
-	.clk_regs		= aud_clk_regs,
-	.nr_clk_regs		= ARRAY_SIZE(aud_clk_regs),
-};
-
-static void __init exynos7_clk_aud_init(struct device_node *np)
-{
-	samsung_cmu_register_one(np, &aud_cmu_info);
-}
-
-CLK_OF_DECLARE(exynos7_clk_aud, "samsung,exynos7-clock-aud",
-		exynos7_clk_aud_init);
+P_REGION0_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLA_REGION_0_1__GAMMA_CORR_CNTLA_EXP_REGION0_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLA_REGION_0_1__GAMMA_CORR_CNTLA_EXP_REGION1_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLA_REGION_0_1__GAMMA_CORR_CNTLA_EXP_REGION1_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLA_REGION_0_1__GAMMA_CORR_CNTLA_EXP_REGION1_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLA_REGION_0_1__GAMMA_CORR_CNTLA_EXP_REGION1_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLA_REGION_2_3__GAMMA_CORR_CNTLA_EXP_REGION2_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLA_REGION_2_3__GAMMA_CORR_CNTLA_EXP_REGION2_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLA_REGION_2_3__GAMMA_CORR_CNTLA_EXP_REGION2_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLA_REGION_2_3__GAMMA_CORR_CNTLA_EXP_REGION2_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLA_REGION_2_3__GAMMA_CORR_CNTLA_EXP_REGION3_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLA_REGION_2_3__GAMMA_CORR_CNTLA_EXP_REGION3_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLA_REGION_2_3__GAMMA_CORR_CNTLA_EXP_REGION3_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLA_REGION_2_3__GAMMA_CORR_CNTLA_EXP_REGION3_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLA_REGION_4_5__GAMMA_CORR_CNTLA_EXP_REGION4_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLA_REGION_4_5__GAMMA_CORR_CNTLA_EXP_REGION4_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLA_REGION_4_5__GAMMA_CORR_CNTLA_EXP_REGION4_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLA_REGION_4_5__GAMMA_CORR_CNTLA_EXP_REGION4_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLA_REGION_4_5__GAMMA_CORR_CNTLA_EXP_REGION5_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLA_REGION_4_5__GAMMA_CORR_CNTLA_EXP_REGION5_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLA_REGION_4_5__GAMMA_CORR_CNTLA_EXP_REGION5_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLA_REGION_4_5__GAMMA_CORR_CNTLA_EXP_REGION5_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLA_REGION_6_7__GAMMA_CORR_CNTLA_EXP_REGION6_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLA_REGION_6_7__GAMMA_CORR_CNTLA_EXP_REGION6_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLA_REGION_6_7__GAMMA_CORR_CNTLA_EXP_REGION6_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLA_REGION_6_7__GAMMA_CORR_CNTLA_EXP_REGION6_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLA_REGION_6_7__GAMMA_CORR_CNTLA_EXP_REGION7_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLA_REGION_6_7__GAMMA_CORR_CNTLA_EXP_REGION7_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLA_REGION_6_7__GAMMA_CORR_CNTLA_EXP_REGION7_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLA_REGION_6_7__GAMMA_CORR_CNTLA_EXP_REGION7_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLA_REGION_8_9__GAMMA_CORR_CNTLA_EXP_REGION8_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLA_REGION_8_9__GAMMA_CORR_CNTLA_EXP_REGION8_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLA_REGION_8_9__GAMMA_CORR_CNTLA_EXP_REGION8_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLA_REGION_8_9__GAMMA_CORR_CNTLA_EXP_REGION8_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLA_REGION_8_9__GAMMA_CORR_CNTLA_EXP_REGION9_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLA_REGION_8_9__GAMMA_CORR_CNTLA_EXP_REGION9_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLA_REGION_8_9__GAMMA_CORR_CNTLA_EXP_REGION9_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLA_REGION_8_9__GAMMA_CORR_CNTLA_EXP_REGION9_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLA_REGION_10_11__GAMMA_CORR_CNTLA_EXP_REGION10_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLA_REGION_10_11__GAMMA_CORR_CNTLA_EXP_REGION10_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLA_REGION_10_11__GAMMA_CORR_CNTLA_EXP_REGION10_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLA_REGION_10_11__GAMMA_CORR_CNTLA_EXP_REGION10_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLA_REGION_10_11__GAMMA_CORR_CNTLA_EXP_REGION11_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLA_REGION_10_11__GAMMA_CORR_CNTLA_EXP_REGION11_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLA_REGION_10_11__GAMMA_CORR_CNTLA_EXP_REGION11_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLA_REGION_10_11__GAMMA_CORR_CNTLA_EXP_REGION11_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLA_REGION_12_13__GAMMA_CORR_CNTLA_EXP_REGION12_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLA_REGION_12_13__GAMMA_CORR_CNTLA_EXP_REGION12_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLA_REGION_12_13__GAMMA_CORR_CNTLA_EXP_REGION12_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLA_REGION_12_13__GAMMA_CORR_CNTLA_EXP_REGION12_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLA_REGION_12_13__GAMMA_CORR_CNTLA_EXP_REGION13_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLA_REGION_12_13__GAMMA_CORR_CNTLA_EXP_REGION13_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLA_REGION_12_13__GAMMA_CORR_CNTLA_EXP_REGION13_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLA_REGION_12_13__GAMMA_CORR_CNTLA_EXP_REGION13_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLA_REGION_14_15__GAMMA_CORR_CNTLA_EXP_REGION14_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLA_REGION_14_15__GAMMA_CORR_CNTLA_EXP_REGION14_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLA_REGION_14_15__GAMMA_CORR_CNTLA_EXP_REGION14_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLA_REGION_14_15__GAMMA_CORR_CNTLA_EXP_REGION14_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLA_REGION_14_15__GAMMA_CORR_CNTLA_EXP_REGION15_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLA_REGION_14_15__GAMMA_CORR_CNTLA_EXP_REGION15_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLA_REGION_14_15__GAMMA_CORR_CNTLA_EXP_REGION15_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLA_REGION_14_15__GAMMA_CORR_CNTLA_EXP_REGION15_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLB_START_CNTL__GAMMA_CORR_CNTLB_EXP_REGION_START_MASK 0x3ffff
+#define GAMMA_CORR_CNTLB_START_CNTL__GAMMA_CORR_CNTLB_EXP_REGION_START__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_START_CNTL__GAMMA_CORR_CNTLB_EXP_REGION_START_SEGMENT_MASK 0x7f00000
+#define GAMMA_CORR_CNTLB_START_CNTL__GAMMA_CORR_CNTLB_EXP_REGION_START_SEGMENT__SHIFT 0x14
+#define GAMMA_CORR_CNTLB_SLOPE_CNTL__GAMMA_CORR_CNTLB_EXP_REGION_LINEAR_SLOPE_MASK 0x3ffff
+#define GAMMA_CORR_CNTLB_SLOPE_CNTL__GAMMA_CORR_CNTLB_EXP_REGION_LINEAR_SLOPE__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_END_CNTL1__GAMMA_CORR_CNTLB_EXP_REGION_END_MASK 0xffff
+#define GAMMA_CORR_CNTLB_END_CNTL1__GAMMA_CORR_CNTLB_EXP_REGION_END__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_END_CNTL2__GAMMA_CORR_CNTLB_EXP_REGION_END_SLOPE_MASK 0xffff
+#define GAMMA_CORR_CNTLB_END_CNTL2__GAMMA_CORR_CNTLB_EXP_REGION_END_SLOPE__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_END_CNTL2__GAMMA_CORR_CNTLB_EXP_REGION_END_BASE_MASK 0xffff0000
+#define GAMMA_CORR_CNTLB_END_CNTL2__GAMMA_CORR_CNTLB_EXP_REGION_END_BASE__SHIFT 0x10
+#define GAMMA_CORR_CNTLB_REGION_0_1__GAMMA_CORR_CNTLB_EXP_REGION0_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLB_REGION_0_1__GAMMA_CORR_CNTLB_EXP_REGION0_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_REGION_0_1__GAMMA_CORR_CNTLB_EXP_REGION0_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLB_REGION_0_1__GAMMA_CORR_CNTLB_EXP_REGION0_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLB_REGION_0_1__GAMMA_CORR_CNTLB_EXP_REGION1_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLB_REGION_0_1__GAMMA_CORR_CNTLB_EXP_REGION1_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLB_REGION_0_1__GAMMA_CORR_CNTLB_EXP_REGION1_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLB_REGION_0_1__GAMMA_CORR_CNTLB_EXP_REGION1_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLB_REGION_2_3__GAMMA_CORR_CNTLB_EXP_REGION2_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLB_REGION_2_3__GAMMA_CORR_CNTLB_EXP_REGION2_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_REGION_2_3__GAMMA_CORR_CNTLB_EXP_REGION2_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLB_REGION_2_3__GAMMA_CORR_CNTLB_EXP_REGION2_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLB_REGION_2_3__GAMMA_CORR_CNTLB_EXP_REGION3_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLB_REGION_2_3__GAMMA_CORR_CNTLB_EXP_REGION3_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLB_REGION_2_3__GAMMA_CORR_CNTLB_EXP_REGION3_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLB_REGION_2_3__GAMMA_CORR_CNTLB_EXP_REGION3_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLB_REGION_4_5__GAMMA_CORR_CNTLB_EXP_REGION4_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLB_REGION_4_5__GAMMA_CORR_CNTLB_EXP_REGION4_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_REGION_4_5__GAMMA_CORR_CNTLB_EXP_REGION4_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLB_REGION_4_5__GAMMA_CORR_CNTLB_EXP_REGION4_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLB_REGION_4_5__GAMMA_CORR_CNTLB_EXP_REGION5_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLB_REGION_4_5__GAMMA_CORR_CNTLB_EXP_REGION5_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLB_REGION_4_5__GAMMA_CORR_CNTLB_EXP_REGION5_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLB_REGION_4_5__GAMMA_CORR_CNTLB_EXP_REGION5_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLB_REGION_6_7__GAMMA_CORR_CNTLB_EXP_REGION6_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLB_REGION_6_7__GAMMA_CORR_CNTLB_EXP_REGION6_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_REGION_6_7__GAMMA_CORR_CNTLB_EXP_REGION6_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLB_REGION_6_7__GAMMA_CORR_CNTLB_EXP_REGION6_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLB_REGION_6_7__GAMMA_CORR_CNTLB_EXP_REGION7_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLB_REGION_6_7__GAMMA_CORR_CNTLB_EXP_REGION7_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLB_REGION_6_7__GAMMA_CORR_CNTLB_EXP_REGION7_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLB_REGION_6_7__GAMMA_CORR_CNTLB_EXP_REGION7_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLB_REGION_8_9__GAMMA_CORR_CNTLB_EXP_REGION8_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLB_REGION_8_9__GAMMA_CORR_CNTLB_EXP_REGION8_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_REGION_8_9__GAMMA_CORR_CNTLB_EXP_REGION8_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLB_REGION_8_9__GAMMA_CORR_CNTLB_EXP_REGION8_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLB_REGION_8_9__GAMMA_CORR_CNTLB_EXP_REGION9_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLB_REGION_8_9__GAMMA_CORR_CNTLB_EXP_REGION9_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLB_REGION_8_9__GAMMA_CORR_CNTLB_EXP_REGION9_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLB_REGION_8_9__GAMMA_CORR_CNTLB_EXP_REGION9_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLB_REGION_10_11__GAMMA_CORR_CNTLB_EXP_REGION10_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLB_REGION_10_11__GAMMA_CORR_CNTLB_EXP_REGION10_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_REGION_10_11__GAMMA_CORR_CNTLB_EXP_REGION10_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLB_REGION_10_11__GAMMA_CORR_CNTLB_EXP_REGION10_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLB_REGION_10_11__GAMMA_CORR_CNTLB_EXP_REGION11_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLB_REGION_10_11__GAMMA_CORR_CNTLB_EXP_REGION11_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLB_REGION_10_11__GAMMA_CORR_CNTLB_EXP_REGION11_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLB_REGION_10_11__GAMMA_CORR_CNTLB_EXP_REGION11_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLB_REGION_12_13__GAMMA_CORR_CNTLB_EXP_REGION12_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLB_REGION_12_13__GAMMA_CORR_CNTLB_EXP_REGION12_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_REGION_12_13__GAMMA_CORR_CNTLB_EXP_REGION12_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLB_REGION_12_13__GAMMA_CORR_CNTLB_EXP_REGION12_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLB_REGION_12_13__GAMMA_CORR_CNTLB_EXP_REGION13_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLB_REGION_12_13__GAMMA_CORR_CNTLB_EXP_REGION13_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLB_REGION_12_13__GAMMA_CORR_CNTLB_EXP_REGION13_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLB_REGION_12_13__GAMMA_CORR_CNTLB_EXP_REGION13_NUM_SEGMENTS__SHIFT 0x1b
+#define GAMMA_CORR_CNTLB_REGION_14_15__GAMMA_CORR_CNTLB_EXP_REGION14_LUT_OFFSET_MASK 0xff
+#define GAMMA_CORR_CNTLB_REGION_14_15__GAMMA_CORR_CNTLB_EXP_REGION14_LUT_OFFSET__SHIFT 0x0
+#define GAMMA_CORR_CNTLB_REGION_14_15__GAMMA_CORR_CNTLB_EXP_REGION14_NUM_SEGMENTS_MASK 0x3800
+#define GAMMA_CORR_CNTLB_REGION_14_15__GAMMA_CORR_CNTLB_EXP_REGION14_NUM_SEGMENTS__SHIFT 0xb
+#define GAMMA_CORR_CNTLB_REGION_14_15__GAMMA_CORR_CNTLB_EXP_REGION15_LUT_OFFSET_MASK 0x7f8000
+#define GAMMA_CORR_CNTLB_REGION_14_15__GAMMA_CORR_CNTLB_EXP_REGION15_LUT_OFFSET__SHIFT 0xf
+#define GAMMA_CORR_CNTLB_REGION_14_15__GAMMA_CORR_CNTLB_EXP_REGION15_NUM_SEGMENTS_MASK 0x38000000
+#define GAMMA_CORR_CNTLB_REGION_14_15__GAMMA_CORR_CNTLB_EXP_REGION15_NUM_SEGMENTS__SHIFT 0x1b
+#define PACK_FIFO_ERROR__PACK_FIFO_L_UNDERFLOW_OCCURED_MASK 0x1
+#define PACK_FIFO_ERROR__PACK_FIFO_L_UNDERFLOW_OCCURED__SHIFT 0x0
+#define PACK_FIFO_ERROR__PACK_FIFO_L_UNDERFLOW_ACK_MASK 0x2
+#define PACK_FIFO_ERROR__PACK_FIFO_L_UNDERFLOW_ACK__SHIFT 0x1
+#define PACK_FIFO_ERROR__PACK_FIFO_C_UNDERFLOW_OCCURED_MASK 0x100
+#define PACK_FIFO_ERROR__PACK_FIFO_C_UNDERFLOW_OCCURED__SHIFT 0x8
+#define PACK_FIFO_ERROR__PACK_FIFO_C_UNDERFLOW_ACK_MASK 0x200
+#define PACK_FIFO_ERROR__PACK_FIFO_C_UNDERFLOW_ACK__SHIFT 0x9
+#define PACK_FIFO_ERROR__PACK_FIFO_L_OVERFLOW_OCCURED_MASK 0x10000
+#define PACK_FIFO_ERROR__PACK_FIFO_L_OVERFLOW_OCCURED__SHIFT 0x10
+#define PACK_FIFO_ERROR__PACK_FIFO_L_OVERFLOW_ACK_MASK 0x20000
+#define PACK_FIFO_ERROR__PACK_FIFO_L_OVERFLOW_ACK__SHIFT 0x11
+#define PACK_FIFO_ERROR__PACK_FIFO_C_OVERFLOW_OCCURED_MASK 0x1000000
+#define PACK_FIFO_ERROR__PACK_FIFO_C_OVERFLOW_OCCURED__SHIFT 0x18
+#define PACK_FIFO_ERROR__PACK_FIFO_C_OVERFLOW_ACK_MASK 0x2000000
+#define PACK_FIFO_ERROR__PACK_FIFO_C_OVERFLOW_ACK__SHIFT 0x19
+#define OUTPUT_FIFO_ERROR__OUTPUT_FIFO_UNDERFLOW_OCCURED_MASK 0x1
+#define OUTPUT_FIFO_ERROR__OUTPUT_FIFO_UNDERFLOW_OCCURED__SHIFT 0x0
+#define OUTPUT_FIFO_ERROR__OUTPUT_FIFO_UNDERFLOW_ACK_MASK 0x2
+#define OUTPUT_FIFO_ERROR__OUTPUT_FIFO_UNDERFLOW_ACK__SHIFT 0x1
+#define OUTPUT_FIFO_ERROR__OUTPUT_FIFO_OVERFLOW_OCCURED_MASK 0x100
+#define OUTPUT_FIFO_ERROR__OUTPUT_FIFO_OVERFLOW_OCCURED__SHIFT 0x8
+#define OUTPUT_FIFO_ERROR__OUTPUT_FIFO_OVERFLOW_ACK_MASK 0x200
+#define OUTPUT_FIFO_ERROR__OUTPUT_FIFO_OVERFLOW_ACK__SHIFT 0x9
+#define INPUT_GAMMA_LUT_AUTOFILL__INPUT_GAMMA_LUT_AUTOFILL_MASK 0x1
+#define INPUT_GAMMA_LUT_AUTOFILL__INPUT_GAMMA_LUT_AUTOFILL__SHIFT 0x0
+#define INPUT_GAMMA_LUT_AUTOFILL__INPUT_GAMMA_LUT_AUTOFILL_DONE_MASK 0x2
+#define INPUT_GAMMA_LUT_AUTOFILL__INPUT_GAMMA_LUT_AUTOFILL_DONE__SHIFT 0x1
+#define INPUT_GAMMA_LUT_RW_INDEX__INPUT_GAMMA_LUT_RW_INDEX_MASK 0xff
+#define INPUT_GAMMA_LUT_RW_INDEX__INPUT_GAMMA_LUT_RW_INDEX__SHIFT 0x0
+#define INPUT_GAMMA_LUT_SEQ_COLOR__INPUT_GAMMA_LUT_SEQ_COLOR_MASK 0xffff
+#define INPUT_GAMMA_LUT_SEQ_COLOR__INPUT_GAMMA_LUT_SEQ_COLOR__SHIFT 0x0
+#define INPUT_GAMMA_LUT_PWL_DATA__INPUT_GAMMA_LUT_BASE_MASK 0xffff
+#define INPUT_GAMMA_LUT_PWL_DATA__INPUT_GAMMA_LUT_BASE__SHIFT 0x0
+#define INPUT_GAMMA_LUT_PWL_DATA__INPUT_GAMMA_LUT_DELTA_MASK 0xffff0000
+#define INPUT_GAMMA_LUT_PWL_DATA__INPUT_GAMMA_LUT_DELTA__SHIFT 0x10
+#define INPUT_GAMMA_LUT_30_COLOR__INPUT_GAMMA_LUT_COLOR_10_BLUE_MASK 0x3ff
+#define INPUT_GAMMA_LUT_30_COLOR__INPUT_GAMMA_LUT_COLOR_10_BLUE__SHIFT 0x0
+#define INPUT_GAMMA_LUT_30_COLOR__INPUT_GAMMA_LUT_COLOR_10_GREEN_MASK 0xffc00
+#define INPUT_GAMMA_LUT_30_COLOR__INPUT_GAMMA_LUT_COLOR_10_GREEN__SHIFT 0xa
+#define INPUT_GAMMA_LUT_30_COLOR__INPUT_GAMMA_LUT_COLOR_10_RED_MASK 0x3ff00000
+#define INPUT_GAMMA_LUT_30_COLOR__INPUT_GAMMA_LUT_COLOR_10_RED__SHIFT 0x14
+#define COL_MAN_INPUT_GAMMA_CONTROL1__INPUT_GAMMA_MODE_MASK 0x3
+#define COL_MAN_INPUT_GAMMA_CONTROL1__INPUT_GAMMA_MODE__SHIFT 0x0
+#define COL_MAN_INPUT_GAMMA_CONTROL1__INPUT_GAMMA_LUT_10BIT_BYPASS_EN_MASK 0x4000000
+#define COL_MAN_INPUT_GAMMA_CONTROL1__INPUT_GAMMA_LUT_10BIT_BYPASS_EN__SHIFT 0x1a
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_INC_B_MASK 0x1e
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_INC_B__SHIFT 0x1
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_B_SIGNED_EN_MASK 0x20
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_B_SIGNED_EN__SHIFT 0x5
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_B_FORMAT_MASK 0xc0
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_B_FORMAT__SHIFT 0x6
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_INC_G_MASK 0xf00
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_INC_G__SHIFT 0x8
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_G_SIGNED_EN_MASK 0x1000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_G_SIGNED_EN__SHIFT 0xc
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_G_FORMAT_MASK 0x6000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_G_FORMAT__SHIFT 0xd
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_INC_R_MASK 0x78000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_INC_R__SHIFT 0xf
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_R_SIGNED_EN_MASK 0x80000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_R_SIGNED_EN__SHIFT 0x13
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_R_FORMAT_MASK 0x300000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_DATA_R_FORMAT__SHIFT 0x14
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_LUT_RW_MODE_MASK 0x400000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_LUT_RW_MODE__SHIFT 0x16
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_LUT_WRITE_EN_MASK_MASK 0x3800000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_LUT_WRITE_EN_MASK__SHIFT 0x17
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_LUT_VGA_ACCESS_ENABLE_MASK 0x4000000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_LUT_VGA_ACCESS_ENABLE__SHIFT 0x1a
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_LUT_10BIT_BYPASS_DBL_BUF_EN_MASK 0x8000000
+#define COL_MAN_INPUT_GAMMA_CONTROL2__INPUT_GAMMA_LUT_10BIT_BYPASS_DBL_BUF_EN__SHIFT 0x1b
+#define INPUT_GAMMA_BW_OFFSETS_B__INPUT_GAMMA_BLACK_OFFSET_B_MASK 0xffff
+#define INPUT_GAMMA_BW_OFFSETS_B__INPUT_GAMMA_BLACK_OFFSET_B__SHIFT 0x0
+#define INPUT_GAMMA_BW_OFFSETS_B__INPUT_GAMMA_WHITE_OFFSET_B_MASK 0xffff0000
+#define INPUT_GAMMA_BW_OFFSETS_B__INPUT_GAMMA_WHITE_OFFSET_B__SHIFT 0x10
+#define INPUT_GAMMA_BW_OFFSETS_G__INPUT_GAMMA_BLACK_OFFSET_G_MASK 0xffff
+#define INPUT_GAMMA_BW_OFFSETS_G__INPUT_GAMMA_BLACK_OFFSET_G__SHIFT 0x0
+#define INPUT_GAMMA_BW_OFFSETS_G__INPUT_GAMMA_WHITE_OFFSET_G_MASK 0xffff0000
+#define INPUT_GAMMA_BW_OFFSETS_G__INPUT_GAMMA_WHITE_OFFSET_G__SHIFT 0x10
+#define INPUT_GAMMA_BW_OFFSETS_R__INPUT_GAMMA_BLACK_OFFSET_R_MASK 0xffff
+#define INPUT_GAMMA_BW_OFFSETS_R__INPUT_GAMMA_BLACK_OFFSET_R__SHIFT 0x0
+#define INPUT_GAMMA_BW_OFFSETS_R__INPUT_GAMMA_WHITE_OFFSET_R_MASK 0xffff0000
+#define INPUT_GAMMA_BW_OFFSETS_R__INPUT_GAMMA_WHITE_OFFSET_R__SHIFT 0x10
+#define COL_MAN_DEBUG_CONTROL__COL_MAN_GLOBAL_PASSTHROUGH_ENABLE_MASK 0x1
+#define COL_MAN_DEBUG_CONTROL__COL_MAN_GLOBAL_PASSTHROUGH_ENABLE__SHIFT 0x0
+#define COL_MAN_TEST_DEBUG_INDEX__COL_MAN_TEST_DEBUG_INDEX_MASK 0xff
+#define COL_MAN_TEST_DEBUG_INDEX__COL_MAN_TEST_DEBUG_INDEX__SHIFT 0x0
+#define COL_MAN_TEST_DEBUG_INDEX__COL_MAN_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define COL_MAN_TEST_DEBUG_INDEX__COL_MAN_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define COL_MAN_TEST_DEBUG_DATA__COL_MAN_TEST_DEBUG_DATA_MASK 0xffffffff
+#define COL_MAN_TEST_DEBUG_DATA__COL_MAN_TEST_DEBUG_DATA__SHIFT 0x0
+#define UNP_GRPH_ENABLE__GRPH_ENABLE_MASK 0x1
+#define UNP_GRPH_ENABLE__GRPH_ENABLE__SHIFT 0x0
+#define UNP_GRPH_CONTROL__GRPH_DEPTH_MASK 0x3
+#define UNP_GRPH_CONTROL__GRPH_DEPTH__SHIFT 0x0
+#define UNP_GRPH_CONTROL__GRPH_NUM_BANKS_MASK 0xc
+#define UNP_GRPH_CONTROL__GRPH_NUM_BANKS__SHIFT 0x2
+#define UNP_GRPH_CONTROL__GRPH_Z_MASK 0x30
+#define UNP_GRPH_CONTROL__GRPH_Z__SHIFT 0x4
+#define UNP_GRPH_CONTROL__GRPH_BANK_WIDTH_L_MASK 0xc0
+#define UNP_GRPH_CONTROL__GRPH_BANK_WIDTH_L__SHIFT 0x6
+#define UNP_GRPH_CONTROL__GRPH_FORMAT_MASK 0x700
+#define UNP_GRPH_CONTROL__GRPH_FORMAT__SHIFT 0x8
+#define UNP_GRPH_CONTROL__GRPH_BANK_HEIGHT_L_MASK 0x1800
+#define UNP_GRPH_CONTROL__GRPH_BANK_HEIGHT_L__SHIFT 0xb
+#define UNP_GRPH_CONTROL__GRPH_TILE_SPLIT_L_MASK 0xe000
+#define UNP_GRPH_CONTROL__GRPH_TILE_SPLIT_L__SHIFT 0xd
+#define UNP_GRPH_CONTROL__GRPH_ADDRESS_TRANSLATION_ENABLE_MASK 0x10000
+#define UNP_GRPH_CONTROL__GRPH_ADDRESS_TRANSLATION_ENABLE__SHIFT 0x10
+#define UNP_GRPH_CONTROL__GRPH_PRIVILEGED_ACCESS_ENABLE_MASK 0x20000
+#define UNP_GRPH_CONTROL__GRPH_PRIVILEGED_ACCESS_ENABLE__SHIFT 0x11
+#define UNP_GRPH_CONTROL__GRPH_MACRO_TILE_ASPECT_L_MASK 0xc0000
+#define UNP_GRPH_CONTROL__GRPH_MACRO_TILE_ASPECT_L__SHIFT 0x12
+#define UNP_GRPH_CONTROL__GRPH_ARRAY_MODE_MASK 0xf00000
+#define UNP_GRPH_CONTROL__GRPH_ARRAY_MODE__SHIFT 0x14
+#define UNP_GRPH_CONTROL__GRPH_PIPE_CONFIG_MASK 0x1f000000
+#define UNP_GRPH_CONTROL__GRPH_PIPE_CONFIG__SHIFT 0x18
+#define UNP_GRPH_CONTROL__GRPH_MICRO_TILE_MODE_L_MASK 0x60000000
+#define UNP_GRPH_CONTROL__GRPH_MICRO_TILE_MODE_L__SHIFT 0x1d
+#define UNP_GRPH_CONTROL__GRPH_COLOR_EXPANSION_MODE_MASK 0x80000000
+#define UNP_GRPH_CONTROL__GRPH_COLOR_EXPANSION_MODE__SHIFT 0x1f
+#define UNP_GRPH_CONTROL_C__GRPH_BANK_WIDTH_C_MASK 0xc0
+#define UNP_GRPH_CONTROL_C__GRPH_BANK_WIDTH_C__SHIFT 0x6
+#define UNP_GRPH_CONTROL_C__GRPH_BANK_HEIGHT_C_MASK 0x1800
+#define UNP_GRPH_CONTROL_C__GRPH_BANK_HEIGHT_C__SHIFT 0xb
+#define UNP_GRPH_CONTROL_C__GRPH_TILE_SPLIT_C_MASK 0xe000
+#define UNP_GRPH_CONTROL_C__GRPH_TILE_SPLIT_C__SHIFT 0xd
+#define UNP_GRPH_CONTROL_C__GRPH_MACRO_TILE_ASPECT_C_MASK 0xc0000
+#define UNP_GRPH_CONTROL_C__GRPH_MACRO_TILE_ASPECT_C__SHIFT 0x12
+#define UNP_GRPH_CONTROL_C__GRPH_MICRO_TILE_MODE_C_MASK 0x60000000
+#define UNP_GRPH_CONTROL_C__GRPH_MICRO_TILE_MODE_C__SHIFT 0x1d
+#define UNP_GRPH_CONTROL_EXP__VIDEO_FORMAT_MASK 0x7
+#define UNP_GRPH_CONTROL_EXP__VIDEO_FORMAT__SHIFT 0x0
+#define UNP_GRPH_SWAP_CNTL__GRPH_ENDIAN_SWAP_MASK 0x3
+#define UNP_GRPH_SWAP_CNTL__GRPH_ENDIAN_SWAP__SHIFT 0x0
+#define UNP_GRPH_SWAP_CNTL__GRPH_RED_CROSSBAR_MASK 0x30
+#define UNP_GRPH_SWAP_CNTL__GRPH_RED_CROSSBAR__SHIFT 0x4
+#define UNP_GRPH_SWAP_CNTL__GRPH_GREEN_CROSSBAR_MASK 0xc0
+#define UNP_GRPH_SWAP_CNTL__GRPH_GREEN_CROSSBAR__SHIFT 0x6
+#define UNP_GRPH_SWAP_CNTL__GRPH_BLUE_CROSSBAR_MASK 0x300
+#define UNP_GRPH_SWAP_CNTL__GRPH_BLUE_CROSSBAR__SHIFT 0x8
+#define UNP_GRPH_PRIMARY_SURFACE_ADDRESS_L__GRPH_PRIMARY_SURFACE_ADDRESS_L_MASK 0xffffff00
+#define UNP_GRPH_PRIMARY_SURFACE_ADDRESS_L__GRPH_PRIMARY_SURFACE_ADDRESS_L__SHIFT 0x8
+#define UNP_GRPH_PRIMARY_SURFACE_ADDRESS_C__GRPH_PRIMARY_SURFACE_ADDRESS_C_MASK 0xffffff00
+#define UNP_GRPH_PRIMARY_SURFACE_ADDRESS_C__GRPH_PRIMARY_SURFACE_ADDRESS_C__SHIFT 0x8
+#define UNP_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH_L__GRPH_PRIMARY_SURFACE_ADDRESS_HIGH_L_MASK 0xff
+#define UNP_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH_L__GRPH_PRIMARY_SURFACE_ADDRESS_HIGH_L__SHIFT 0x0
+#define UNP_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH_C__GRPH_PRIMARY_SURFACE_ADDRESS_HIGH_C_MASK 0xff
+#define UNP_GRPH_PRIMARY_SURFACE_ADDRESS_HIGH_C__GRPH_PRIMARY_SURFACE_ADDRESS_HIGH_C__SHIFT 0x0
+#define UNP_GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_L__GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_L_MASK 0xffffff00
+#define UNP_GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_L__GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_L__SHIFT 0x8
+#define UNP_GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_C__GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_C_MASK 0xffffff00
+#define UNP_GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_C__GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_C__SHIFT 0x8
+#define UNP_GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_HIGH_L__GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_HIGH_L_MASK 0xff
+#define UNP_GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_HIGH_L__GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_HIGH_L__SHIFT 0x0
+#define UNP_GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_HIGH_C__GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_HIGH_C_MASK 0xff
+#define UNP_GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_HIGH_C__GRPH_PRIMARY_BOTTOM_SURFACE_ADDRESS_HIGH_C__SHIFT 0x0
+#define UNP_GRPH_SECONDARY_SURFACE_ADDRESS_L__GRPH_SECONDARY_SURFACE_ADDRESS_L_MASK 0xffffff00
+#define UNP_GRPH_SECONDARY_SURFACE_ADDRESS_L__GRPH_SECONDARY_SURFACE_ADDRESS_L__SHIFT 0x8
+#define UNP_GRPH_SECONDARY_SURFACE_ADDRESS_C__GRPH_SECONDARY_SURFACE_ADDRESS_C_MASK 0xffffff00
+#define UNP_GRPH_SECONDARY_SURFACE_ADDRESS_C__GRPH_SECONDARY_SURFACE_ADDRESS_C__SHIFT 0x8
+#define UNP_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH_L__GRPH_SECONDARY_SURFACE_ADDRESS_HIGH_L_MASK 0xff
+#define UNP_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH_L__GRPH_SECONDARY_SURFACE_ADDRESS_HIGH_L__SHIFT 0x0
+#define UNP_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH_C__GRPH_SECONDARY_SURFACE_ADDRESS_HIGH_C_MASK 0xff
+#define UNP_GRPH_SECONDARY_SURFACE_ADDRESS_HIGH_C__GRPH_SECONDARY_SURFACE_ADDRESS_HIGH_C__SHIFT 0x0
+#define UNP_GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_L__GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_L_MASK 0xffffff00
+#define UNP_GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_L__GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_L__SHIFT 0x8
+#define UNP_GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_C__GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_C_MASK 0xffffff00
+#define UNP_GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_C__GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_C__SHIFT 0x8
+#define UNP_GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_HIGH_L__GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_HIGH_L_MASK 0xff
+#define UNP_GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_HIGH_L__GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_HIGH_L__SHIFT 0x0
+#define UNP_GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_HIGH_C__GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_HIGH_C_MASK 0xff
+#define UNP_GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_HIGH_C__GRPH_SECONDARY_BOTTOM_SURFACE_ADDRESS_HIGH_C__SHIFT 0x0
+#define UNP_GRPH_PITCH_L__GRPH_PITCH_L_MASK 0x7fff
+#define UNP_GRPH_PITCH_L__GRPH_PITCH_L__SHIFT 0x0
+#define UNP_GRPH_PITCH_C__GRPH_PITCH_C_MASK 0x7fff
+#define UNP_GRPH_PITCH_C__GRPH_PITCH_C__SHIFT 0x0
+#define UNP_GRPH_SURFACE_OFFSET_X_L__GRPH_SURFACE_OFFSET_X_L_MASK 0x3fff
+#define UNP_GRPH_SURFACE_OFFSET_X_L__GRPH_SURFACE_OFFSET_X_L__SHIFT 0x0
+#define UNP_GRPH_SURFACE_OFFSET_X_C__GRPH_SURFACE_OFFSET_X_C_MASK 0x3fff
+#define UNP_GRPH_SURFACE_OFFSET_X_C__GRPH_SURFACE_OFFSET_X_C__SHIFT 0x0
+#define UNP_GRPH_SURFACE_OFFSET_Y_L__GRPH_SURFACE_OFFSET_Y_L_MASK 0x3fff
+#define UNP_GRPH_SURFACE_OFFSET_Y_L__GRPH_SURFACE_OFFSET_Y_L__SHIFT 0x0
+#define UNP_GRPH_SURFACE_OFFSET_Y_C__GRPH_SURFACE_OFFSET_Y_C_MASK 0x3fff
+#define UNP_GRPH_SURFACE_OFFSET_Y_C__GRPH_SURFACE_OFFSET_Y_C__SHIFT 0x0
+#define UNP_GRPH_X_START_L__GRPH_X_START_L_MASK 0x3fff
+#define UNP_GRPH_X_START_L__GRPH_X_START_L__SHIFT 0x0
+#define UNP_GRPH_X_START_C__GRPH_X_START_C_MASK 0x3fff
+#define UNP_GRPH_X_START_C__GRPH_X_START_C__SHIFT 0x0
+#define UNP_GRPH_Y_START_L__GRPH_Y_START_L_MASK 0x3fff
+#define UNP_GRPH_Y_START_L__GRPH_Y_START_L__SHIFT 0x0
+#define UNP_GRPH_Y_START_C__GRPH_Y_START_C_MASK 0x3fff
+#define UNP_GRPH_Y_START_C__GRPH_Y_START_C__SHIFT 0x0
+#define UNP_GRPH_X_END_L__GRPH_X_END_L_MASK 0x7fff
+#define UNP_GRPH_X_END_L__GRPH_X_END_L__SHIFT 0x0
+#define UNP_GRPH_X_END_C__GRPH_X_END_C_MASK 0x7fff
+#define UNP_GRPH_X_END_C__GRPH_X_END_C__SHIFT 0x0
+#define UNP_GRPH_Y_END_L__GRPH_Y_END_L_MASK 0x7fff
+#define UNP_GRPH_Y_END_L__GRPH_Y_END_L__SHIFT 0x0
+#define UNP_GRPH_Y_END_C__GRPH_Y_END_C_MASK 0x7fff
+#define UNP_GRPH_Y_END_C__GRPH_Y_END_C__SHIFT 0x0
+#define UNP_GRPH_UPDATE__GRPH_MODE_UPDATE_PENDING_MASK 0x1
+#define UNP_GRPH_UPDATE__GRPH_MODE_UPDATE_PENDING__SHIFT 0x0
+#define UNP_GRPH_UPDATE__GRPH_MODE_UPDATE_TAKEN_MASK 0x2
+#define UNP_GRPH_UPDATE__GRPH_MODE_UPDATE_TAKEN__SHIFT 0x1
+#define UNP_GRPH_UPDATE__GRPH_SURFACE_UPDATE_PENDING_MASK 0x4
+#define UNP_GRPH_UPDATE__GRPH_SURFACE_UPDATE_PENDING__SHIFT 0x2
+#define UNP_GRPH_UPDATE__GRPH_SURFACE_UPDATE_TAKEN_MASK 0x8
+#define UNP_GRPH_UPDATE__GRPH_SURFACE_UPDATE_TAKEN__SHIFT 0x3
+#define UNP_GRPH_UPDATE__GRPH_UPDATE_LOCK_MASK 0x10000
+#define UNP_GRPH_UPDATE__GRPH_UPDATE_LOCK__SHIFT 0x10
+#define UNP_GRPH_UPDATE__GRPH_SURFACE_IGNORE_UPDATE_LOCK_MASK 0x100000
+#define UNP_GRPH_UPDATE__GRPH_SURFACE_IGNORE_UPDATE_LOCK__SHIFT 0x14
+#define UNP_GRPH_UPDATE__GRPH_MODE_DISABLE_MULTIPLE_UPDATE_MASK 0x1000000
+#define UNP_GRPH_UPDATE__GRPH_MODE_DISABLE_MULTIPLE_UPDATE__SHIFT 0x18
+#define UNP_GRPH_UPDATE__GRPH_SURFACE_DISABLE_MULTIPLE_UPDATE_MASK 0x10000000
+#define UNP_GRPH_UPDATE__GRPH_SURFACE_DISABLE_MULTIPLE_UPDATE__SHIFT 0x1c
+#define UNP_PIPE_OUTSTANDING_REQUEST_LIMIT__UNP_PIPE_OUTSTANDING_REQUEST_LIMIT_L_MASK 0xff
+#define UNP_PIPE_OUTSTANDING_REQUEST_LIMIT__UNP_PIPE_OUTSTANDING_REQUEST_LIMIT_L__SHIFT 0x0
+#define UNP_PIPE_OUTSTANDING_REQUEST_LIMIT__UNP_PIPE_OUTSTANDING_REQUEST_LIMIT_C_MASK 0xff00
+#define UNP_PIPE_OUTSTANDING_REQUEST_LIMIT__UNP_PIPE_OUTSTANDING_REQUEST_LIMIT_C__SHIFT 0x8
+#define UNP_GRPH_SURFACE_ADDRESS_INUSE_L__GRPH_SURFACE_ADDRESS_INUSE_L_MASK 0xffffff00
+#define UNP_GRPH_SURFACE_ADDRESS_INUSE_L__GRPH_SURFACE_ADDRESS_INUSE_L__SHIFT 0x8
+#define UNP_GRPH_SURFACE_ADDRESS_INUSE_C__GRPH_SURFACE_ADDRESS_INUSE_C_MASK 0xffffff00
+#define UNP_GRPH_SURFACE_ADDRESS_INUSE_C__GRPH_SURFACE_ADDRESS_INUSE_C__SHIFT 0x8
+#define UNP_GRPH_SURFACE_ADDRESS_HIGH_INUSE_L__GRPH_SURFACE_ADDRESS_HIGH_INUSE_L_MASK 0xff
+#define UNP_GRPH_SURFACE_ADDRESS_HIGH_INUSE_L__GRPH_SURFACE_ADDRESS_HIGH_INUSE_L__SHIFT 0x0
+#define UNP_GRPH_SURFACE_ADDRESS_HIGH_INUSE_C__GRPH_SURFACE_ADDRESS_HIGH_INUSE_C_MASK 0xff
+#define UNP_GRPH_SURFACE_ADDRESS_HIGH_INUSE_C__GRPH_SURFACE_ADDRESS_HIGH_INUSE_C__SHIFT 0x0
+#define UNP_DVMM_PTE_CONTROL__DVMM_USE_SINGLE_PTE_MASK 0x1
+#define UNP_DVMM_PTE_CONTROL__DVMM_USE_SINGLE_PTE__SHIFT 0x0
+#define UNP_DVMM_PTE_CONTROL__DVMM_PAGE_WIDTH_MASK 0x1e
+#define UNP_DVMM_PTE_CONTROL__DVMM_PAGE_WIDTH__SHIFT 0x1
+#define UNP_DVMM_PTE_CONTROL__DVMM_PAGE_HEIGHT_MASK 0x1e0
+#define UNP_DVMM_PTE_CONTROL__DVMM_PAGE_HEIGHT__SHIFT 0x5
+#define UNP_DVMM_PTE_CONTROL__DVMM_MIN_PTE_BEFORE_FLIP_MASK 0x7fe00
+#define UNP_DVMM_PTE_CONTROL__DVMM_MIN_PTE_BEFORE_FLIP__SHIFT 0x9
+#define UNP_DVMM_PTE_CONTROL__DVMM_PTE_BUFFER_MODE0_MASK 0x100000
+#define UNP_DVMM_PTE_CONTROL__DVMM_PTE_BUFFER_MODE0__SHIFT 0x14
+#define UNP_DVMM_PTE_CONTROL__DVMM_PTE_BUFFER_MODE1_MASK 0x200000
+#define UNP_DVMM_PTE_CONTROL__DVMM_PTE_BUFFER_MODE1__SHIFT 0x15
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_USE_SINGLE_PTE_C_MASK 0x1
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_USE_SINGLE_PTE_C__SHIFT 0x0
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_PAGE_WIDTH_C_MASK 0x1e
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_PAGE_WIDTH_C__SHIFT 0x1
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_PAGE_HEIGHT_C_MASK 0x1e0
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_PAGE_HEIGHT_C__SHIFT 0x5
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_MIN_PTE_BEFORE_FLIP_C_MASK 0x7fe00
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_MIN_PTE_BEFORE_FLIP_C__SHIFT 0x9
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_PTE_BUFFER_MODE0_C_MASK 0x100000
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_PTE_BUFFER_MODE0_C__SHIFT 0x14
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_PTE_BUFFER_MODE1_C_MASK 0x200000
+#define UNP_DVMM_PTE_CONTROL_C__DVMM_PTE_BUFFER_MODE1_C__SHIFT 0x15
+#define UNP_DVMM_PTE_ARB_CONTROL__DVMM_PTE_REQ_PER_CHUNK_MASK 0x3f
+#define UNP_DVMM_PTE_ARB_CONTROL__DVMM_PTE_REQ_PER_CHUNK__SHIFT 0x0
+#define UNP_DVMM_PTE_ARB_CONTROL__DVMM_MAX_PTE_REQ_OUTSTANDING_MASK 0xff00
+#define UNP_DVMM_PTE_ARB_CONTROL__DVMM_MAX_PTE_REQ_OUTSTANDING__SHIFT 0x8
+#define UNP_DVMM_PTE_ARB_CONTROL_C__DVMM_PTE_REQ_PER_CHUNK_C_MASK 0x3f
+#define UNP_DVMM_PTE_ARB_CONTROL_C__DVMM_PTE_REQ_PER_CHUNK_C__SHIFT 0x0
+#define UNP_DVMM_PTE_ARB_CONTROL_C__DVMM_MAX_PTE_REQ_OUTSTANDING_C_MASK 0xff00
+#define UNP_DVMM_PTE_ARB_CONTROL_C__DVMM_MAX_PTE_REQ_OUTSTANDING_C__SHIFT 0x8
+#define UNP_GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_OCCURRED_MASK 0x1
+#define UNP_GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_OCCURRED__SHIFT 0x0
+#define UNP_GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_CLEAR_MASK 0x100
+#define UNP_GRPH_INTERRUPT_STATUS__GRPH_PFLIP_INT_CLEAR__SHIFT 0x8
+#define UNP_GRPH_INTERRUPT_CONTROL__GRPH_PFLIP_INT_MASK_MASK 0x1
+#define UNP_GRPH_INTERRUPT_CONTROL__GRPH_PFLIP_INT_MASK__SHIFT 0x0
+#define UNP_GRPH_INTERRUPT_CONTROL__GRPH_PFLIP_INT_TYPE_MASK 0x100
+#define UNP_GRPH_INTERRUPT_CONTROL__GRPH_PFLIP_INT_TYPE__SHIFT 0x8
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STEREOSYNC_FLIP_EN_MASK 0x1
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STEREOSYNC_FLIP_EN__SHIFT 0x0
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STEREOSYNC_FLIP_MODE_MASK 0x30
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STEREOSYNC_FLIP_MODE__SHIFT 0x4
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STACK_INTERLACE_FLIP_EN_MASK 0x100
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STACK_INTERLACE_FLIP_EN__SHIFT 0x8
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STACK_INTERLACE_FLIP_MODE_MASK 0x3000
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STACK_INTERLACE_FLIP_MODE__SHIFT 0xc
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_PRIMARY_SURFACE_PENDING_MASK 0x10000
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_PRIMARY_SURFACE_PENDING__SHIFT 0x10
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_SECONDARY_SURFACE_PENDING_MASK 0x20000
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_SECONDARY_SURFACE_PENDING__SHIFT 0x11
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_PRIMARY_BOTTOM_SURFACE_PENDING_MASK 0x40000
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_PRIMARY_BOTTOM_SURFACE_PENDING__SHIFT 0x12
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_SECONDARY_BOTTOM_SURFACE_PENDING_MASK 0x80000
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_SECONDARY_BOTTOM_SURFACE_PENDING__SHIFT 0x13
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STEREOSYNC_SELECT_DISABLE_MASK 0x10000000
+#define UNP_GRPH_STEREOSYNC_FLIP__GRPH_STEREOSYNC_SELECT_DISABLE__SHIFT 0x1c
+#define UNP_FLIP_CONTROL__GRPH_SURFACE_UPDATE_PENDING_MODE_MASK 0x1
+#define UNP_FLIP_CONTROL__GRPH_SURFACE_UPDATE_PENDING_MODE__SHIFT 0x0
+#define UNP_FLIP_CONTROL__UNP_DEBUG_SG_MASK 0xfffffffc
+#define UNP_FLIP_CONTROL__UNP_DEBUG_SG__SHIFT 0x2
+#define UNP_CRC_CONTROL__UNP_CRC_ENABLE_MASK 0x1
+#define UNP_CRC_CONTROL__UNP_CRC_ENABLE__SHIFT 0x0
+#define UNP_CRC_CONTROL__UNP_CRC_SOURCE_SEL_MASK 0x1c
+#define UNP_CRC_CONTROL__UNP_CRC_SOURCE_SEL__SHIFT 0x2
+#define UNP_CRC_CONTROL__UNP_CRC_LINE_SEL_MASK 0x300
+#define UNP_CRC_CONTROL__UNP_CRC_LINE_SEL__SHIFT 0x8
+#define UNP_CRC_MASK__UNP_CRC_MASK_MASK 0xffffffff
+#define UNP_CRC_MASK__UNP_CRC_MASK__SHIFT 0x0
+#define UNP_CRC_CURRENT__UNP_CRC_CURRENT_MASK 0xffffffff
+#define UNP_CRC_CURRENT__UNP_CRC_CURRENT__SHIFT 0x0
+#define UNP_CRC_LAST__UNP_CRC_LAST_MASK 0xffffffff
+#define UNP_CRC_LAST__UNP_CRC_LAST__SHIFT 0x0
+#define UNP_LB_DATA_GAP_BETWEEN_CHUNK__UNP_LB_GAP_BETWEEN_CHUNK_MASK 0x1f0
+#define UNP_LB_DATA_GAP_BETWEEN_CHUNK__UNP_LB_GAP_BETWEEN_CHUNK__SHIFT 0x4
+#define UNP_HW_ROTATION__ROTATION_ANGLE_MASK 0x7
+#define UNP_HW_ROTATION__ROTATION_ANGLE__SHIFT 0x0
+#define UNP_HW_ROTATION__PIXEL_DROP_MASK 0x10
+#define UNP_HW_ROTATION__PIXEL_DROP__SHIFT 0x4
+#define UNP_HW_ROTATION__BUFFER_MODE_MASK 0x100
+#define UNP_HW_ROTATION__BUFFER_MODE__SHIFT 0x8
+#define UNP_DEBUG__UNP_DEBUG_MASK 0xffffffff
+#define UNP_DEBUG__UNP_DEBUG__SHIFT 0x0
+#define UNP_DEBUG2__UNP_DEBUG2_MASK 0xffffffff
+#define UNP_DEBUG2__UNP_DEBUG2__SHIFT 0x0
+#define UNP_DVMM_DEBUG__UNP_L_DVMM_DEBUG_MASK 0xffff
+#define UNP_DVMM_DEBUG__UNP_L_DVMM_DEBUG__SHIFT 0x0
+#define UNP_DVMM_DEBUG__UNP_C_DVMM_DEBUG_MASK 0xffff0000
+#define UNP_DVMM_DEBUG__UNP_C_DVMM_DEBUG__SHIFT 0x10
+#define UNP_TEST_DEBUG_INDEX__UNP_TEST_DEBUG_INDEX_MASK 0xff
+#define UNP_TEST_DEBUG_INDEX__UNP_TEST_DEBUG_INDEX__SHIFT 0x0
+#define UNP_TEST_DEBUG_INDEX__UNP_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define UNP_TEST_DEBUG_INDEX__UNP_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define UNP_TEST_DEBUG_DATA__UNP_TEST_DEBUG_DATA_MASK 0xffffffff
+#define UNP_TEST_DEBUG_DATA__UNP_TEST_DEBUG_DATA__SHIFT 0x0
+#define GENMO_WT__GENMO_MONO_ADDRESS_B_MASK 0x1
+#define GENMO_WT__GENMO_MONO_ADDRESS_B__SHIFT 0x0
+#define GENMO_WT__VGA_RAM_EN_MASK 0x2
+#define GENMO_WT__VGA_RAM_EN__SHIFT 0x1
+#define GENMO_WT__VGA_CKSEL_MASK 0xc
+#define GENMO_WT__VGA_CKSEL__SHIFT 0x2
+#define GENMO_WT__ODD_EVEN_MD_PGSEL_MASK 0x20
+#define GENMO_WT__ODD_EVEN_MD_PGSEL__SHIFT 0x5
+#define GENMO_WT__VGA_HSYNC_POL_MASK 0x40
+#define GENMO_WT__VGA_HSYNC_POL__SHIFT 0x6
+#define GENMO_WT__VGA_VSYNC_POL_MASK 0x80
+#define GENMO_WT__VGA_VSYNC_POL__SHIFT 0x7
+#define GENMO_RD__GENMO_MONO_ADDRESS_B_MASK 0x1
+#define GENMO_RD__GENMO_MONO_ADDRESS_B__SHIFT 0x0
+#define GENMO_RD__VGA_RAM_EN_MASK 0x2
+#define GENMO_RD__VGA_RAM_EN__SHIFT 0x1
+#define GENMO_RD__VGA_CKSEL_MASK 0xc
+#define GENMO_RD__VGA_CKSEL__SHIFT 0x2
+#define GENMO_RD__ODD_EVEN_MD_PGSEL_MASK 0x20
+#define GENMO_RD__ODD_EVEN_MD_PGSEL__SHIFT 0x5
+#define GENMO_RD__VGA_HSYNC_POL_MASK 0x40
+#define GENMO_RD__VGA_HSYNC_POL__SHIFT 0x6
+#define GENMO_RD__VGA_VSYNC_POL_MASK 0x80
+#define GENMO_RD__VGA_VSYNC_POL__SHIFT 0x7
+#define GENENB__BLK_IO_BASE_MASK 0xff
+#define GENENB__BLK_IO_BASE__SHIFT 0x0
+#define GENFC_WT__VSYNC_SEL_W_MASK 0x8
+#define GENFC_WT__VSYNC_SEL_W__SHIFT 0x3
+#define GENFC_RD__VSYNC_SEL_R_MASK 0x8
+#define GENFC_RD__VSYNC_SEL_R__SHIFT 0x3
+#define GENS0__SENSE_SWITCH_MASK 0x10
+#define GENS0__SENSE_SWITCH__SHIFT 0x4
+#define GENS0__CRT_INTR_MASK 0x80
+#define GENS0__CRT_INTR__SHIFT 0x7
+#define GENS1__NO_DISPLAY_MASK 0x1
+#define GENS1__NO_DISPLAY__SHIFT 0x0
+#define GENS1__VGA_VSTATUS_MASK 0x8
+#define GENS1__VGA_VSTATUS__SHIFT 0x3
+#define GENS1__PIXEL_READ_BACK_MASK 0x30
+#define GENS1__PIXEL_READ_BACK__SHIFT 0x4
+#define DAC_DATA__DAC_DATA_MASK 0x3f
+#define DAC_DATA__DAC_DATA__SHIFT 0x0
+#define DAC_MASK__DAC_MASK_MASK 0xff
+#define DAC_MASK__DAC_MASK__SHIFT 0x0
+#define DAC_R_INDEX__DAC_R_INDEX_MASK 0xff
+#define DAC_R_INDEX__DAC_R_INDEX__SHIFT 0x0
+#define DAC_W_INDEX__DAC_W_INDEX_MASK 0xff
+#define DAC_W_INDEX__DAC_W_INDEX__SHIFT 0x0
+#define SEQ8_IDX__SEQ_IDX_MASK 0x7
+#define SEQ8_IDX__SEQ_IDX__SHIFT 0x0
+#define SEQ8_DATA__SEQ_DATA_MASK 0xff
+#define SEQ8_DATA__SEQ_DATA__SHIFT 0x0
+#define SEQ00__SEQ_RST0B_MASK 0x1
+#define SEQ00__SEQ_RST0B__SHIFT 0x0
+#define SEQ00__SEQ_RST1B_MASK 0x2
+#define SEQ00__SEQ_RST1B__SHIFT 0x1
+#define SEQ01__SEQ_DOT8_MASK 0x1
+#define SEQ01__SEQ_DOT8__SHIFT 0x0
+#define SEQ01__SEQ_SHIFT2_MASK 0x4
+#define SEQ01__SEQ_SHIFT2__SHIFT 0x2
+#define SEQ01__SEQ_PCLKBY2_MASK 0x8
+#define SEQ01__SEQ_PCLKBY2__SHIFT 0x3
+#define SEQ01__SEQ_SHIFT4_MASK 0x10
+#define SEQ01__SEQ_SHIFT4__SHIFT 0x4
+#define SEQ01__SEQ_MAXBW_MASK 0x20
+#define SEQ01__SEQ_MAXBW__SHIFT 0x5
+#define SEQ02__SEQ_MAP0_EN_MASK 0x1
+#define SEQ02__SEQ_MAP0_EN__SHIFT 0x0
+#define SEQ02__SEQ_MAP1_EN_MASK 0x2
+#define SEQ02__SEQ_MAP1_EN__SHIFT 0x1
+#define SEQ02__SEQ_MAP2_EN_MASK 0x4
+#define SEQ02__SEQ_MAP2_EN__SHIFT 0x2
+#define SEQ02__SEQ_MAP3_EN_MASK 0x8
+#define SEQ02__SEQ_MAP3_EN__SHIFT 0x3
+#define SEQ03__SEQ_FONT_B1_MASK 0x1
+#define SEQ03__SEQ_FONT_B1__SHIFT 0x0
+#define SEQ03__SEQ_FONT_B2_MASK 0x2
+#define SEQ03__SEQ_FONT_B2__SHIFT 0x1
+#define SEQ03__SEQ_FONT_A1_MASK 0x4
+#define SEQ03__SEQ_FONT_A1__SHIFT 0x2
+#define SEQ03__SEQ_FONT_A2_MASK 0x8
+#define SEQ03__SEQ_FONT_A2__SHIFT 0x3
+#define SEQ03__SEQ_FONT_B0_MASK 0x10
+#define SEQ03__SEQ_FONT_B0__SHIFT 0x4
+#define SEQ03__SEQ_FONT_A0_MASK 0x20
+#define SEQ03__SEQ_FONT_A0__SHIFT 0x5
+#define SEQ04__SEQ_256K_MASK 0x2
+#define SEQ04__SEQ_256K__SHIFT 0x1
+#define SEQ04__SEQ_ODDEVEN_MASK 0x4
+#define SEQ04__SEQ_ODDEVEN__SHIFT 0x2
+#define SEQ04__SEQ_CHAIN_MASK 0x8
+#define SEQ04__SEQ_CHAIN__SHIFT 0x3
+#define CRTC8_IDX__VCRTC_IDX_MASK 0x3f
+#define CRTC8_IDX__VCRTC_IDX__SHIFT 0x0
+#define CRTC8_DATA__VCRTC_DATA_MASK 0xff
+#define CRTC8_DATA__VCRTC_DATA__SHIFT 0x0
+#define CRT00__H_TOTAL_MASK 0xff
+#define CRT00__H_TOTAL__SHIFT 0x0
+#define CRT01__H_DISP_END_MASK 0xff
+#define CRT01__H_DISP_END__SHIFT 0x0
+#define CRT02__H_BLANK_START_MASK 0xff
+#define CRT02__H_BLANK_START__SHIFT 0x0
+#define CRT03__H_BLANK_END_MASK 0x1f
+#define CRT03__H_BLANK_END__SHIFT 0x0
+#define CRT03__H_DE_SKEW_MASK 0x60
+#define CRT03__H_DE_SKEW__SHIFT 0x5
+#define CRT03__CR10CR11_R_DIS_B_MASK 0x80
+#define CRT03__CR10CR11_R_DIS_B__SHIFT 0x7
+#define CRT04__H_SYNC_START_MASK 0xff
+#define CRT04__H_SYNC_START__SHIFT 0x0
+#define CRT05__H_SYNC_END_MASK 0x1f
+#define CRT05__H_SYNC_END__SHIFT 0x0
+#define CRT05__H_SYNC_SKEW_MASK 0x60
+#define CRT05__H_SYNC_SKEW__SHIFT 0x5
+#define CRT05__H_BLANK_END_B5_MASK 0x80
+#define CRT05__H_BLANK_END_B5__SHIFT 0x7
+#define CRT06__V_TOTAL_MASK 0xff
+#define CRT06__V_TOTAL__SHIFT 0x0
+#define CRT07__V_TOTAL_B8_MASK 0x1
+#define CRT07__V_TOTAL_B8__SHIFT 0x0
+#define CRT07__V_DISP_END_B8_MASK 0x2
+#define CRT07__V_DISP_END_B8__SHIFT 0x1
+#define CRT07__V_SYNC_START_B8_MASK 0x4
+#define CRT07__V_SYNC_START_B8__SHIFT 0x2
+#define CRT07__V_BLANK_START_B8_MASK 0x8
+#define CRT07__V_BLANK_START_B8__SHIFT 0x3
+#define CRT07__LINE_CMP_B8_MASK 0x10
+#define CRT07__LINE_CMP_B8__SHIFT 0x4
+#define CRT07__V_TOTAL_B9_MASK 0x20
+#define CRT07__V_TOTAL_B9__SHIFT 0x5
+#define CRT07__V_DISP_END_B9_MASK 0x40
+#define CRT07__V_DISP_END_B9__SHIFT 0x6
+#define CRT07__V_SYNC_START_B9_MASK 0x80
+#define CRT07__V_SYNC_START_B9__SHIFT 0x7
+#define CRT08__ROW_SCAN_START_MASK 0x1f
+#define CRT08__ROW_SCAN_START__SHIFT 0x0
+#define CRT08__BYTE_PAN_MASK 0x60
+#define CRT08__BYTE_PAN__SHIFT 0x5
+#define CRT09__MAX_ROW_SCAN_MASK 0x1f
+#define CRT09__MAX_ROW_SCAN__SHIFT 0x0
+#define CRT09__V_BLANK_START_B9_MASK 0x20
+#define CRT09__V_BLANK_START_B9__SHIFT 0x5
+#define CRT09__LINE_CMP_B9_MASK 0x40
+#define CRT09__LINE_CMP_B9__SHIFT 0x6
+#define CRT09__DOUBLE_CHAR_HEIGHT_MASK 0x80
+#define CRT09__DOUBLE_CHAR_HEIGHT__SHIFT 0x7
+#define CRT0A__CURSOR_START_MASK 0x1f
+#define CRT0A__CURSOR_START__SHIFT 0x0
+#define CRT0A__CURSOR_DISABLE_MASK 0x20
+#define CRT0A__CURSOR_DISABLE__SHIFT 0x5
+#define CRT0B__CURSOR_END_MASK 0x1f
+#define CRT0B__CURSOR_END__SHIFT 0x0
+#define CRT0B__CURSOR_SKEW_MASK 0x60
+#define CRT0B__CURSOR_SKEW__SHIFT 0x5
+#define CRT0C__DISP_START_MASK 0xff
+#define CRT0C__DISP_START__SHIFT 0x0
+#define CRT0D__DISP_START_MASK 0xff
+#define CRT0D__DISP_START__SHIFT 0x0
+#define CRT0E__CURSOR_LOC_HI_MASK 0xff
+#define CRT0E__CURSOR_LOC_HI__SHIFT 0x0
+#define CRT0F__CURSOR_LOC_LO_MASK 0xff
+#define CRT0F__CURSOR_LOC_LO__SHIFT 0x0
+#define CRT10__V_SYNC_START_MASK 0xff
+#define CRT10__V_SYNC_START__SHIFT 0x0
+#define CRT11__V_SYNC_END_MASK 0xf
+#define CRT11__V_SYNC_END__SHIFT 0x0
+#define CRT11__V_INTR_CLR_MASK 0x10
+#define CRT11__V_INTR_CLR__SHIFT 0x4
+#define CRT11__V_INTR_EN_MASK 0x20
+#define CRT11__V_INTR_EN__SHIFT 0x5
+#define CRT11__SEL5_REFRESH_CYC_MASK 0x40
+#define CRT11__SEL5_REFRESH_CYC__SHIFT 0x6
+#define CRT11__C0T7_WR_ONLY_MASK 0x80
+#define CRT11__C0T7_WR_ONLY__SHIFT 0x7
+#define CRT12__V_DISP_END_MASK 0xff
+#define CRT12__V_DISP_END__SHIFT 0x0
+#define CRT13__DISP_PITCH_MASK 0xff
+#define CRT13__DISP_PITCH__SHIFT 0x0
+#define CRT14__UNDRLN_LOC_MASK 0x1f
+#define CRT14__UNDRLN_LOC__SHIFT 0x0
+#define CRT14__ADDR_CNT_BY4_MASK 0x20
+#define CRT14__ADDR_CNT_BY4__SHIFT 0x5
+#define CRT14__DOUBLE_WORD_MASK 0x40
+#define CRT14__DOUBLE_WORD__SHIFT 0x6
+#define CRT15__V_BLANK_START_MASK 0xff
+#define CRT15__V_BLANK_START__SHIFT 0x0
+#define CRT16__V_BLANK_END_MASK 0xff
+#define CRT16__V_BLANK_END__SHIFT 0x0
+#define CRT17__RA0_AS_A13B_MASK 0x1
+#define CRT17__RA0_AS_A13B__SHIFT 0x0
+#define CRT17__RA1_AS_A14B_MASK 0x2
+#define CRT17__RA1_AS_A14B__SHIFT 0x1
+#define CRT17__VCOUNT_BY2_MASK 0x4
+#define CRT17__VCOUNT_BY2__SHIFT 0x2
+#define CRT17__ADDR_CNT_BY2_MASK 0x8
+#define CRT17__ADDR_CNT_BY2__SHIFT 0x3
+#define CRT17__WRAP_A15TOA0_MASK 0x20
+#define CRT17__WRAP_A15TOA0__SHIFT 0x5
+#define CRT17__BYTE_MODE_MASK 0x40
+#define CRT17__BYTE_MODE__SHIFT 0x6
+#define CRT17__CRTC_SYNC_EN_MASK 0x80
+#define CRT17__CRTC_SYNC_EN__SHIFT 0x7
+#define CRT18__LINE_CMP_MASK 0xff
+#define CRT18__LINE_CMP__SHIFT 0x0
+#define CRT1E__GRPH_DEC_RD1_MASK 0x2
+#define CRT1E__GRPH_DEC_RD1__SHIFT 0x1
+#define CRT1F__GRPH_DEC_RD0_MASK 0xff
+#define CRT1F__GRPH_DEC_RD0__SHIFT 0x0
+#define CRT22__GRPH_LATCH_DATA_MASK 0xff
+#define CRT22__GRPH_LATCH_DATA__SHIFT 0x0
+#define GRPH8_IDX__GRPH_IDX_MASK 0xf
+#define GRPH8_IDX__GRPH_IDX__SHIFT 0x0
+#define GRPH8_DATA__GRPH_DATA_MASK 0xff
+#define GRPH8_DATA__GRPH_DATA__SHIFT 0x0
+#define GRA00__GRPH_SET_RESET0_MASK 0x1
+#define GRA00__GRPH_SET_RESET0__SHIFT 0x0
+#define GRA00__GRPH_SET_RESET1_MASK 0x2
+#define GRA00__GRPH_SET_RESET1__SHIFT 0x1
+#define GRA00__GRPH_SET_RESET2_MASK 0x4
+#define GRA00__GRPH_SET_RESET2__SHIFT 0x2
+#define GRA00__GRPH_SET_RESET3_MASK 0x8
+#define GRA00__GRPH_SET_RESET3__SHIFT 0x3
+#define GRA01__GRPH_SET_RESET_ENA0_MASK 0x1
+#define GRA01__GRPH_SET_RESET_ENA0__SHIFT 0x0
+#define GRA01__GRPH_SET_RESET_ENA1_MASK 0x2
+#define GRA01__GRPH_SET_RESET_ENA1__SHIFT 0x1
+#define GRA01__GRPH_SET_RESET_ENA2_MASK 0x4
+#define GRA01__GRPH_SET_RESET_ENA2__SHIFT 0x2
+#define GRA01__GRPH_SET_RESET_ENA3_MASK 0x8
+#define GRA01__GRPH_SET_RESET_ENA3__SHIFT 0x3
+#define GRA02__GRPH_CCOMP_MASK 0xf
+#define GRA02__GRPH_CCOMP__SHIFT 0x0
+#define GRA03__GRPH_ROTATE_MASK 0x7
+#define GRA03__GRPH_ROTATE__SHIFT 0x0
+#define GRA03__GRPH_FN_SEL_MASK 0x18
+#define GRA03__GRPH_FN_SEL__SHIFT 0x3
+#define GRA04__GRPH_RMAP_MASK 0x3
+#define GRA04__GRPH_RMAP__SHIFT 0x0
+#define GRA05__GRPH_WRITE_MODE_MASK 0x3
+#define GRA05__GRPH_WRITE_MODE__SHIFT 0x0
+#define GRA05__GRPH_READ1_MASK 0x8
+#define GRA05__GRPH_READ1__SHIFT 0x3
+#define GRA05__CGA_ODDEVEN_MASK 0x10
+#define GRA05__CGA_ODDEVEN__SHIFT 0x4
+#define GRA05__GRPH_OES_MASK 0x20
+#define GRA05__GRPH_OES__SHIFT 0x5
+#define GRA05__GRPH_PACK_MASK 0x40
+#define GRA05__GRPH_PACK__SHIFT 0x6
+#define GRA06__GRPH_GRAPHICS_MASK 0x1
+#define GRA06__GRPH_GRAPHICS__SHIFT 0x0
+#define GRA06__GRPH_ODDEVEN_MASK 0x2
+#define GRA06__GRPH_ODDEVEN__SHIFT 0x1
+#define GRA06__GRPH_ADRSEL_MASK 0xc
+#define GRA06__GRPH_ADRSEL__SHIFT 0x2
+#define GRA07__GRPH_XCARE0_MASK 0x1
+#define GRA07__GRPH_XCARE0__SHIFT 0x0
+#define GRA07__GRPH_XCARE1_MASK 0x2
+#define GRA07__GRPH_XCARE1__SHIFT 0x1
+#define GRA07__GRPH_XCARE2_MASK 0x4
+#define GRA07__GRPH_XCARE2__SHIFT 0x2
+#define GRA07__GRPH_XCARE3_MASK 0x8
+#define GRA07__GRPH_XCARE3__SHIFT 0x3
+#define GRA08__GRPH_BMSK_MASK 0xff
+#define GRA08__GRPH_BMSK__SHIFT 0x0
+#define ATTRX__ATTR_IDX_MASK 0x1f
+#define ATTRX__ATTR_IDX__SHIFT 0x0
+#define ATTRX__ATTR_PAL_RW_ENB_MASK 0x20
+#define ATTRX__ATTR_PAL_RW_ENB__SHIFT 0x5
+#define ATTRDW__ATTR_DATA_MASK 0xff
+#define ATTRDW__ATTR_DATA__SHIFT 0x0
+#define ATTRDR__ATTR_DATA_MASK 0xff
+#define ATTRDR__ATTR_DATA__SHIFT 0x0
+#define ATTR00__ATTR_PAL_MASK 0x3f
+#define ATTR00__ATTR_PAL__SHIFT 0x0
+#define ATTR01__ATTR_PAL_MASK 0x3f
+#define ATTR01__ATTR_PAL__SHIFT 0x0
+#define ATTR02__ATTR_PAL_MASK 0x3f
+#define ATTR02__ATTR_PAL__SHIFT 0x0
+#define ATTR03__ATTR_PAL_MASK 0x3f
+#define ATTR03__ATTR_PAL__SHIFT 0x0
+#define ATTR04__ATTR_PAL_MASK 0x3f
+#define ATTR04__ATTR_PAL__SHIFT 0x0
+#define ATTR05__ATTR_PAL_MASK 0x3f
+#define ATTR05__ATTR_PAL__SHIFT 0x0
+#define ATTR06__ATTR_PAL_MASK 0x3f
+#define ATTR06__ATTR_PAL__SHIFT 0x0
+#define ATTR07__ATTR_PAL_MASK 0x3f
+#define ATTR07__ATTR_PAL__SHIFT 0x0
+#define ATTR08__ATTR_PAL_MASK 0x3f
+#define ATTR08__ATTR_PAL__SHIFT 0x0
+#define ATTR09__ATTR_PAL_MASK 0x3f
+#define ATTR09__ATTR_PAL__SHIFT 0x0
+#define ATTR0A__ATTR_PAL_MASK 0x3f
+#define ATTR0A__ATTR_PAL__SHIFT 0x0
+#define ATTR0B__ATTR_PAL_MASK 0x3f
+#define ATTR0B__ATTR_PAL__SHIFT 0x0
+#define ATTR0C__ATTR_PAL_MASK 0x3f
+#define ATTR0C__ATTR_PAL__SHIFT 0x0
+#define ATTR0D__ATTR_PAL_MASK 0x3f
+#define ATTR0D__ATTR_PAL__SHIFT 0x0
+#define ATTR0E__ATTR_PAL_MASK 0x3f
+#define ATTR0E__ATTR_PAL__SHIFT 0x0
+#define ATTR0F__ATTR_PAL_MASK 0x3f
+#define ATTR0F__ATTR_PAL__SHIFT 0x0
+#define ATTR10__ATTR_GRPH_MODE_MASK 0x1
+#define ATTR10__ATTR_GRPH_MODE__SHIFT 0x0
+#define ATTR10__ATTR_MONO_EN_MASK 0x2
+#define ATTR10__ATTR_MONO_EN__SHIFT 0x1
+#define ATTR10__ATTR_LGRPH_EN_MASK 0x4
+#define ATTR10__ATTR_LGRPH_EN__SHIFT 0x2
+#define ATTR10__ATTR_BLINK_EN_MASK 0x8
+#define ATTR10__ATTR_BLINK_EN__SHIFT 0x3
+#define ATTR10__ATTR_PANTOPONLY_MASK 0x20
+#define ATTR10__ATTR_PANTOPONLY__SHIFT 0x5
+#define ATTR10__ATTR_PCLKBY2_MASK 0x40
+#define ATTR10__ATTR_PCLKBY2__SHIFT 0x6
+#define ATTR10__ATTR_CSEL_EN_MASK 0x80
+#define ATTR10__ATTR_CSEL_EN__SHIFT 0x7
+#define ATTR11__ATTR_OVSC_MASK 0xff
+#define ATTR11__ATTR_OVSC__SHIFT 0x0
+#define ATTR12__ATTR_MAP_EN_MASK 0xf
+#define ATTR12__ATTR_MAP_EN__SHIFT 0x0
+#define ATTR12__ATTR_VSMUX_MASK 0x30
+#define ATTR12__ATTR_VSMUX__SHIFT 0x4
+#define ATTR13__ATTR_PPAN_MASK 0xf
+#define ATTR13__ATTR_PPAN__SHIFT 0x0
+#define ATTR14__ATTR_CSEL1_MASK 0x3
+#define ATTR14__ATTR_CSEL1__SHIFT 0x0
+#define ATTR14__ATTR_CSEL2_MASK 0xc
+#define ATTR14__ATTR_CSEL2__SHIFT 0x2
+#define VGA_RENDER_CONTROL__VGA_BLINK_RATE_MASK 0x1f
+#define VGA_RENDER_CONTROL__VGA_BLINK_RATE__SHIFT 0x0
+#define VGA_RENDER_CONTROL__VGA_BLINK_MODE_MASK 0x60
+#define VGA_RENDER_CONTROL__VGA_BLINK_MODE__SHIFT 0x5
+#define VGA_RENDER_CONTROL__VGA_CURSOR_BLINK_INVERT_MASK 0x80
+#define VGA_RENDER_CONTROL__VGA_CURSOR_BLINK_INVERT__SHIFT 0x7
+#define VGA_RENDER_CONTROL__VGA_EXTD_ADDR_COUNT_ENABLE_MASK 0x100
+#define VGA_RENDER_CONTROL__VGA_EXTD_ADDR_COUNT_ENABLE__SHIFT 0x8

@@ -1,75 +1,53 @@
-/*
- * Copyright (C) 2002  David McCullough <davidm@snapgear.com>
- * Copyright (C) 2003  Paul Mundt <lethal@linux-sh.org>
- *
- * Based on files with the following comments:
- *
- *           Copyright (C) 2000  Kazumoto Kojima
- *
- *           Modified for 7751 Solution Engine by
- *           Ian da Silva and Jeremy Siegel, 2001.
+addresses
+ * @dev: The device for which the DMA addresses are to be created
+ * @sg: The array of scatter/gather entries
+ * @nents: The number of scatter/gather entries
+ * @direction: The direction of the DMA
  */
-#include <linux/init.h>
-#include <linux/irq.h>
-#include <linux/interrupt.h>
-#include <linux/timer.h>
-#include <linux/delay.h>
-#include <linux/module.h>
-#include <linux/sched.h>
-#include <asm/machvec.h>
-#include <mach/secureedge5410.h>
-#include <asm/irq.h>
-#include <asm/io.h>
-#include <cpu/timer.h>
-
-unsigned short secureedge5410_ioport;
-
-/*
- * EraseConfig handling functions
- */
-static irqreturn_t eraseconfig_interrupt(int irq, void *dev_id)
+static inline int ib_dma_map_sg(struct ib_device *dev,
+				struct scatterlist *sg, int nents,
+				enum dma_data_direction direction)
 {
-	printk("SnapGear: erase switch interrupt!\n");
-
-	return IRQ_HANDLED;
+	if (dev->dma_ops)
+		return dev->dma_ops->map_sg(dev, sg, nents, direction);
+	return dma_map_sg(dev->dma_device, sg, nents, direction);
 }
 
-static int __init eraseconfig_init(void)
+/**
+ * ib_dma_unmap_sg - Unmap a scatter/gather list of DMA addresses
+ * @dev: The device for which the DMA addresses were created
+ * @sg: The array of scatter/gather entries
+ * @nents: The number of scatter/gather entries
+ * @direction: The direction of the DMA
+ */
+static inline void ib_dma_unmap_sg(struct ib_device *dev,
+				   struct scatterlist *sg, int nents,
+				   enum dma_data_direction direction)
 {
-	unsigned int irq = evt2irq(0x240);
-
-	printk("SnapGear: EraseConfig init\n");
-
-	/* Setup "EraseConfig" switch on external IRQ 0 */
-	if (request_irq(irq, eraseconfig_interrupt, 0, "Erase Config", NULL))
-		printk("SnapGear: failed to register IRQ%d for Reset witch\n",
-				irq);
+	if (dev->dma_ops)
+		dev->dma_ops->unmap_sg(dev, sg, nents, direction);
 	else
-		printk("SnapGear: registered EraseConfig switch on IRQ%d\n",
-				irq);
-	return 0;
+		dma_unmap_sg(dev->dma_device, sg, nents, direction);
 }
-module_init(eraseconfig_init);
 
-/*
- * Initialize IRQ setting
- *
- * IRL0 = erase switch
- * IRL1 = eth0
- * IRL2 = eth1
- * IRL3 = crypto
- */
-static void __init init_snapgear_IRQ(void)
+static inline int ib_dma_map_sg_attrs(struct ib_device *dev,
+				      struct scatterlist *sg, int nents,
+				      enum dma_data_direction direction,
+				      struct dma_attrs *attrs)
 {
-	printk("Setup SnapGear IRQ/IPR ...\n");
-	/* enable individual interrupt mode for externals */
-	plat_irq_setup_pins(IRQ_MODE_IRQ);
+	return dma_map_sg_attrs(dev->dma_device, sg, nents, direction, attrs);
 }
 
-/*
- * The Machine Vector
- */
-static struct sh_machine_vector mv_snapgear __initmv = {
-	.mv_name		= "SnapGear SecureEdge5410",
-	.mv_init_irq		= init_snapgear_IRQ,
-};
+static inline void ib_dma_unmap_sg_attrs(struct ib_device *dev,
+					 struct scatterlist *sg, int nents,
+					 enum dma_data_direction direction,
+					 struct dma_attrs *attrs)
+{
+	dma_unmap_sg_attrs(dev->dma_device, sg, nents, direction, attrs);
+}
+/**
+ * ib_sg_dma_address - Return the DMA address from a scatter/gather entry
+ * @dev: The device for which the DMA addresses were created
+ * @sg: The scatter/gather entry
+ *
+ * Note: this function is

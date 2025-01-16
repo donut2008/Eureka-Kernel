@@ -1,67 +1,42 @@
-How to use packet injection with mac80211
-=========================================
+     */
+#define SDRAM_MCOPT1_MCHK_NON	    PPC_REG_VAL(3, 0x0)	 /* No ECC gen	     */
+#define SDRAM_MCOPT1_MCHK_GEN	    PPC_REG_VAL(3, 0x2)	 /* ECC gen	     */
+#define SDRAM_MCOPT1_MCHK_CHK	    PPC_REG_VAL(3, 0x1)	 /* ECC gen and chk  */
+#define SDRAM_MCOPT1_MCHK_CHK_REP   PPC_REG_VAL(3, 0x3)	 /* ECC gen/chk/rpt  */
+#define SDRAM_MCOPT1_MCHK_DECODE(n) ((((u32)(n)) >> 28) & 0x3)
+#define SDRAM_MCOPT1_RDEN_MASK	    PPC_REG_VAL(4, 0x1)	 /* Rgstrd DIMM mask */
+#define SDRAM_MCOPT1_RDEN	    PPC_REG_VAL(4, 0x1)	 /* Rgstrd DIMM enbl */
+#define SDRAM_MCOPT1_WDTH_MASK	    PPC_REG_VAL(7, 0x1)	 /* Width mask	     */
+#define SDRAM_MCOPT1_WDTH_32	    PPC_REG_VAL(7, 0x0)	 /* 32 bits	     */
+#define SDRAM_MCOPT1_WDTH_16	    PPC_REG_VAL(7, 0x1)	 /* 16 bits	     */
+#define SDRAM_MCOPT1_DDR_TYPE_MASK  PPC_REG_VAL(11, 0x1) /* DDR type mask    */
+#define SDRAM_MCOPT1_DDR1_TYPE	    PPC_REG_VAL(11, 0x0) /* DDR1 type	     */
+#define SDRAM_MCOPT1_DDR2_TYPE	    PPC_REG_VAL(11, 0x1) /* DDR2 type	     */
 
-mac80211 now allows arbitrary packets to be injected down any Monitor Mode
-interface from userland.  The packet you inject needs to be composed in the
-following format:
-
- [ radiotap header  ]
- [ ieee80211 header ]
- [ payload ]
-
-The radiotap format is discussed in
-./Documentation/networking/radiotap-headers.txt.
-
-Despite many radiotap parameters being currently defined, most only make sense
-to appear on received packets.  The following information is parsed from the
-radiotap headers and used to control injection:
-
- * IEEE80211_RADIOTAP_FLAGS
-
-   IEEE80211_RADIOTAP_F_FCS: FCS will be removed and recalculated
-   IEEE80211_RADIOTAP_F_WEP: frame will be encrypted if key available
-   IEEE80211_RADIOTAP_F_FRAG: frame will be fragmented if longer than the
-			      current fragmentation threshold.
-
- * IEEE80211_RADIOTAP_TX_FLAGS
-
-   IEEE80211_RADIOTAP_F_TX_NOACK: frame should be sent without waiting for
-				  an ACK even if it is a unicast frame
-
-The injection code can also skip all other currently defined radiotap fields
-facilitating replay of captured radiotap headers directly.
-
-Here is an example valid radiotap header defining some parameters
-
-	0x00, 0x00, // <-- radiotap version
-	0x0b, 0x00, // <- radiotap header length
-	0x04, 0x0c, 0x00, 0x00, // <-- bitmap
-	0x6c, // <-- rate
-	0x0c, //<-- tx power
-	0x01 //<-- antenna
-
-The ieee80211 header follows immediately afterwards, looking for example like
-this:
-
-	0x08, 0x01, 0x00, 0x00,
-	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-	0x13, 0x22, 0x33, 0x44, 0x55, 0x66,
-	0x13, 0x22, 0x33, 0x44, 0x55, 0x66,
-	0x10, 0x86
-
-Then lastly there is the payload.
-
-After composing the packet contents, it is sent by send()-ing it to a logical
-mac80211 interface that is in Monitor mode.  Libpcap can also be used,
-(which is easier than doing the work to bind the socket to the right
-interface), along the following lines:
-
-	ppcap = pcap_open_live(szInterfaceName, 800, 1, 20, szErrbuf);
-...
-	r = pcap_inject(ppcap, u8aSendBuffer, nLength);
-
-You can also find a link to a complete inject application here:
-
-http://wireless.kernel.org/en/users/Documentation/packetspammer
-
-Andy Green <andy@warmcat.com>
+/*
+ * Memory Bank 0 - n Configuration Register
+ */
+#define SDRAM_MBCF_BA_MASK		PPC_REG_VAL(12, 0x1FFF)
+#define SDRAM_MBCF_SZ_MASK		PPC_REG_VAL(19, 0xF)
+#define SDRAM_MBCF_SZ_DECODE(mbxcf)	PPC_REG_DECODE(19, mbxcf)
+#define SDRAM_MBCF_SZ_4MB		PPC_REG_VAL(19, 0x0)
+#define SDRAM_MBCF_SZ_8MB		PPC_REG_VAL(19, 0x1)
+#define SDRAM_MBCF_SZ_16MB		PPC_REG_VAL(19, 0x2)
+#define SDRAM_MBCF_SZ_32MB		PPC_REG_VAL(19, 0x3)
+#define SDRAM_MBCF_SZ_64MB		PPC_REG_VAL(19, 0x4)
+#define SDRAM_MBCF_SZ_128MB		PPC_REG_VAL(19, 0x5)
+#define SDRAM_MBCF_SZ_256MB		PPC_REG_VAL(19, 0x6)
+#define SDRAM_MBCF_SZ_512MB		PPC_REG_VAL(19, 0x7)
+#define SDRAM_MBCF_SZ_1GB		PPC_REG_VAL(19, 0x8)
+#define SDRAM_MBCF_SZ_2GB		PPC_REG_VAL(19, 0x9)
+#define SDRAM_MBCF_SZ_4GB		PPC_REG_VAL(19, 0xA)
+#define SDRAM_MBCF_SZ_8GB		PPC_REG_VAL(19, 0xB)
+#define SDRAM_MBCF_AM_MASK		PPC_REG_VAL(23, 0xF)
+#define SDRAM_MBCF_AM_MODE0		PPC_REG_VAL(23, 0x0)
+#define SDRAM_MBCF_AM_MODE1		PPC_REG_VAL(23, 0x1)
+#define SDRAM_MBCF_AM_MODE2		PPC_REG_VAL(23, 0x2)
+#define SDRAM_MBCF_AM_MODE3		PPC_REG_VAL(23, 0x3)
+#define SDRAM_MBCF_AM_MODE4		PPC_REG_VAL(23, 0x4)
+#define SDRAM_MBCF_AM_MODE5		PPC_REG_VAL(23, 0x5)
+#define SDRAM_MBCF_AM_MODE6		PPC_REG_VAL(23, 0x6)
+#define SDRAM_MBCF_AM_MODE7		PPC_REG

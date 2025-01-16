@@ -1,152 +1,80 @@
-/*
- * Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/usb.h>
-#include <linux/usb/ch11.h>
-
-#define TEST_SE0_NAK_PID			0x0101
-#define TEST_J_PID				0x0102
-#define TEST_K_PID				0x0103
-#define TEST_PACKET_PID				0x0104
-#define TEST_HS_HOST_PORT_SUSPEND_RESUME	0x0106
-#define TEST_SINGLE_STEP_GET_DEV_DESC		0x0107
-#define TEST_SINGLE_STEP_SET_FEATURE		0x0108
-
-static int ehset_probe(struct usb_interface *intf,
-		       const struct usb_device_id *id)
-{
-	int ret = -EINVAL;
-	struct usb_device *dev = interface_to_usbdev(intf);
-	struct usb_device *hub_udev = dev->parent;
-	struct usb_device_descriptor *buf;
-	u8 portnum = dev->portnum;
-	u16 test_pid = le16_to_cpu(dev->descriptor.idProduct);
-
-	switch (test_pid) {
-	case TEST_SE0_NAK_PID:
-		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
-					USB_REQ_SET_FEATURE, USB_RT_PORT,
-					USB_PORT_FEAT_TEST,
-					(TEST_SE0_NAK << 8) | portnum,
-					NULL, 0, 1000);
-		break;
-	case TEST_J_PID:
-		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
-					USB_REQ_SET_FEATURE, USB_RT_PORT,
-					USB_PORT_FEAT_TEST,
-					(TEST_J << 8) | portnum,
-					NULL, 0, 1000);
-		break;
-	case TEST_K_PID:
-		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
-					USB_REQ_SET_FEATURE, USB_RT_PORT,
-					USB_PORT_FEAT_TEST,
-					(TEST_K << 8) | portnum,
-					NULL, 0, 1000);
-		break;
-	case TEST_PACKET_PID:
-		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
-					USB_REQ_SET_FEATURE, USB_RT_PORT,
-					USB_PORT_FEAT_TEST,
-					(TEST_PACKET << 8) | portnum,
-					NULL, 0, 1000);
-		break;
-	case TEST_HS_HOST_PORT_SUSPEND_RESUME:
-		/* Test: wait for 15secs -> suspend -> 15secs delay -> resume */
-		msleep(15 * 1000);
-		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
-					USB_REQ_SET_FEATURE, USB_RT_PORT,
-					USB_PORT_FEAT_SUSPEND, portnum,
-					NULL, 0, 1000);
-		if (ret < 0)
-			break;
-
-		msleep(15 * 1000);
-		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
-					USB_REQ_CLEAR_FEATURE, USB_RT_PORT,
-					USB_PORT_FEAT_SUSPEND, portnum,
-					NULL, 0, 1000);
-		break;
-	case TEST_SINGLE_STEP_GET_DEV_DESC:
-		/* Test: wait for 15secs -> GetDescriptor request */
-		msleep(15 * 1000);
-		buf = kmalloc(USB_DT_DEVICE_SIZE, GFP_KERNEL);
-		if (!buf)
-			return -ENOMEM;
-
-		ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
-					USB_REQ_GET_DESCRIPTOR, USB_DIR_IN,
-					USB_DT_DEVICE << 8, 0,
-					buf, USB_DT_DEVICE_SIZE,
-					USB_CTRL_GET_TIMEOUT);
-		kfree(buf);
-		break;
-	case TEST_SINGLE_STEP_SET_FEATURE:
-		/*
-		 * GetDescriptor SETUP request -> 15secs delay -> IN & STATUS
-		 *
-		 * Note, this test is only supported on root hubs since the
-		 * SetPortFeature handling can only be done inside the HCD's
-		 * hub_control callback function.
-		 */
-		if (hub_udev != dev->bus->root_hub) {
-			dev_err(&intf->dev, "SINGLE_STEP_SET_FEATURE test only supported on root hub\n");
-			break;
-		}
-
-		ret = usb_control_msg(hub_udev, usb_sndctrlpipe(hub_udev, 0),
-					USB_REQ_SET_FEATURE, USB_RT_PORT,
-					USB_PORT_FEAT_TEST,
-					(6 << 8) | portnum,
-					NULL, 0, 60 * 1000);
-
-		break;
-	default:
-		dev_err(&intf->dev, "%s: unsupported PID: 0x%x\n",
-			__func__, test_pid);
-	}
-
-	return (ret < 0) ? ret : 0;
-}
-
-static void ehset_disconnect(struct usb_interface *intf)
-{
-}
-
-static const struct usb_device_id ehset_id_table[] = {
-	{ USB_DEVICE(0x1a0a, TEST_SE0_NAK_PID) },
-	{ USB_DEVICE(0x1a0a, TEST_J_PID) },
-	{ USB_DEVICE(0x1a0a, TEST_K_PID) },
-	{ USB_DEVICE(0x1a0a, TEST_PACKET_PID) },
-	{ USB_DEVICE(0x1a0a, TEST_HS_HOST_PORT_SUSPEND_RESUME) },
-	{ USB_DEVICE(0x1a0a, TEST_SINGLE_STEP_GET_DEV_DESC) },
-	{ USB_DEVICE(0x1a0a, TEST_SINGLE_STEP_SET_FEATURE) },
-	{ }			/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, ehset_id_table);
-
-static struct usb_driver ehset_driver = {
-	.name =		"usb_ehset_test",
-	.probe =	ehset_probe,
-	.disconnect =	ehset_disconnect,
-	.id_table =	ehset_id_table,
-};
-
-module_usb_driver(ehset_driver);
-
-MODULE_DESCRIPTION("USB Driver for EHSET Test Fixture");
-MODULE_LICENSE("GPL v2");
+ine PB0_PIF_RX_CTRL__RX_EI_DET_IN_PS2_DEGRADE__SHIFT 0x1a
+#define PB0_PIF_RX_CTRL2__RX_RDY_DASRT_COUNT_MASK 0x7
+#define PB0_PIF_RX_CTRL2__RX_RDY_DASRT_COUNT__SHIFT 0x0
+#define PB0_PIF_RX_CTRL2__RX_STATUS_DASRT_COUNT_MASK 0x38
+#define PB0_PIF_RX_CTRL2__RX_STATUS_DASRT_COUNT__SHIFT 0x3
+#define PB0_PIF_RX_CTRL2__RXPHYSTATUS_DELAY_MASK 0x1c0
+#define PB0_PIF_RX_CTRL2__RXPHYSTATUS_DELAY__SHIFT 0x6
+#define PB0_PIF_RX_CTRL2__RX_L1_PG_PHY_STATUS_MODE_MASK 0x200
+#define PB0_PIF_RX_CTRL2__RX_L1_PG_PHY_STATUS_MODE__SHIFT 0x9
+#define PB0_PIF_RX_CTRL2__RX_OFF_PG_PHY_STATUS_MODE_MASK 0x400
+#define PB0_PIF_RX_CTRL2__RX_OFF_PG_PHY_STATUS_MODE__SHIFT 0xa
+#define PB0_PIF_RX_CTRL2__FORCE_CDREN_IN_L0S_MASK 0x10000
+#define PB0_PIF_RX_CTRL2__FORCE_CDREN_IN_L0S__SHIFT 0x10
+#define PB0_PIF_RX_CTRL2__EI_DET_CYCLE_MODE_MASK 0x60000
+#define PB0_PIF_RX_CTRL2__EI_DET_CYCLE_MODE__SHIFT 0x11
+#define PB0_PIF_RX_CTRL2__EI_DET_ON_TIME_MASK 0x180000
+#define PB0_PIF_RX_CTRL2__EI_DET_ON_TIME__SHIFT 0x13
+#define PB0_PIF_RX_CTRL2__EI_DET_OFF_TIME_MASK 0xe00000
+#define PB0_PIF_RX_CTRL2__EI_DET_OFF_TIME__SHIFT 0x15
+#define PB0_PIF_RX_CTRL2__EI_DET_CYCLE_DIS_IN_PS1_MASK 0x1000000
+#define PB0_PIF_RX_CTRL2__EI_DET_CYCLE_DIS_IN_PS1__SHIFT 0x18
+#define PB0_PIF_RX_CTRL2__RX_CDR_XTND_MODE_MASK 0x6000000
+#define PB0_PIF_RX_CTRL2__RX_CDR_XTND_MODE__SHIFT 0x19
+#define PB0_PIF_RX_CTRL2__RX_L0S_TO_L0_DETECT_EI_MASK 0x8000000
+#define PB0_PIF_RX_CTRL2__RX_L0S_TO_L0_DETECT_EI__SHIFT 0x1b
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_0_MASK 0x1
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_0__SHIFT 0x0
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_1_MASK 0x2
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_1__SHIFT 0x1
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_2_MASK 0x4
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_2__SHIFT 0x2
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_3_MASK 0x8
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_3__SHIFT 0x3
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_4_MASK 0x10
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_4__SHIFT 0x4
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_5_MASK 0x20
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_5__SHIFT 0x5
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_6_MASK 0x40
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_6__SHIFT 0x6
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_7_MASK 0x80
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_VAL_7__SHIFT 0x7
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_EN_MASK 0x10000
+#define PB0_PIF_GLB_OVRD__RXDETECT_OVERRIDE_EN__SHIFT 0x10
+#define PB0_PIF_GLB_OVRD2__X2_LANE_1_0_OVRD_MASK 0x1
+#define PB0_PIF_GLB_OVRD2__X2_LANE_1_0_OVRD__SHIFT 0x0
+#define PB0_PIF_GLB_OVRD2__X2_LANE_3_2_OVRD_MASK 0x2
+#define PB0_PIF_GLB_OVRD2__X2_LANE_3_2_OVRD__SHIFT 0x1
+#define PB0_PIF_GLB_OVRD2__X2_LANE_5_4_OVRD_MASK 0x4
+#define PB0_PIF_GLB_OVRD2__X2_LANE_5_4_OVRD__SHIFT 0x2
+#define PB0_PIF_GLB_OVRD2__X2_LANE_7_6_OVRD_MASK 0x8
+#define PB0_PIF_GLB_OVRD2__X2_LANE_7_6_OVRD__SHIFT 0x3
+#define PB0_PIF_GLB_OVRD2__X2_LANE_9_8_OVRD_MASK 0x10
+#define PB0_PIF_GLB_OVRD2__X2_LANE_9_8_OVRD__SHIFT 0x4
+#define PB0_PIF_GLB_OVRD2__X2_LANE_11_10_OVRD_MASK 0x20
+#define PB0_PIF_GLB_OVRD2__X2_LANE_11_10_OVRD__SHIFT 0x5
+#define PB0_PIF_GLB_OVRD2__X2_LANE_13_12_OVRD_MASK 0x40
+#define PB0_PIF_GLB_OVRD2__X2_LANE_13_12_OVRD__SHIFT 0x6
+#define PB0_PIF_GLB_OVRD2__X2_LANE_15_14_OVRD_MASK 0x80
+#define PB0_PIF_GLB_OVRD2__X2_LANE_15_14_OVRD__SHIFT 0x7
+#define PB0_PIF_GLB_OVRD2__X4_LANE_3_0_OVRD_MASK 0x100
+#define PB0_PIF_GLB_OVRD2__X4_LANE_3_0_OVRD__SHIFT 0x8
+#define PB0_PIF_GLB_OVRD2__X4_LANE_7_4_OVRD_MASK 0x200
+#define PB0_PIF_GLB_OVRD2__X4_LANE_7_4_OVRD__SHIFT 0x9
+#define PB0_PIF_GLB_OVRD2__X4_LANE_11_8_OVRD_MASK 0x400
+#define PB0_PIF_GLB_OVRD2__X4_LANE_11_8_OVRD__SHIFT 0xa
+#define PB0_PIF_GLB_OVRD2__X4_LANE_15_12_OVRD_MASK 0x800
+#define PB0_PIF_GLB_OVRD2__X4_LANE_15_12_OVRD__SHIFT 0xb
+#define PB0_PIF_GLB_OVRD2__X8_LANE_7_0_OVRD_MASK 0x10000
+#define PB0_PIF_GLB_OVRD2__X8_LANE_7_0_OVRD__SHIFT 0x10
+#define PB0_PIF_GLB_OVRD2__X8_LANE_15_8_OVRD_MASK 0x20000
+#define PB0_PIF_GLB_OVRD2__X8_LANE_15_8_OVRD__SHIFT 0x11
+#define PB0_PIF_GLB_OVRD2__X16_LANE_15_0_OVRD_MASK 0x100000
+#define PB0_PIF_GLB_OVRD2__X16_LANE_15_0_OVRD__SHIFT 0x14
+#define PB0_PIF_BIF_CMD_STATUS__TXPHYSTATUS_0_MASK 0x1
+#define PB0_PIF_BIF_CMD_STATUS__TXPHYSTATUS_0__SHIFT 0x0
+#define PB0_PIF_BIF_CMD_STATUS__TXPHYSTATUS_1_MASK 0x2
+#define PB0_PIF_BIF_CMD_STATUS__TXPHYSTATUS_1__SHIFT 0x1
+#define PB0_PIF_BIF_CMD_STATUS__TXPHYSTATUS_2_MASK 0x4
+#define PB0_PIF_BIF_CMD_STATUS__TXPHYSTATUS_2__SHIFT 0x2
+#define PB0_PIF_BIF_CMD_STATUS__TXPHYSTATU

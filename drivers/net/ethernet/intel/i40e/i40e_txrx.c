@@ -1,2912 +1,2713 @@
-/*******************************************************************************
- *
- * Intel Ethernet Controller XL710 Family Linux Driver
- * Copyright(c) 2013 - 2014 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * The full GNU General Public License is included in this distribution in
- * the file called "COPYING".
- *
- * Contact Information:
- * e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
- *
- ******************************************************************************/
-
-#include <linux/prefetch.h>
-#include <net/busy_poll.h>
-#include "i40e.h"
-#include "i40e_prototype.h"
-
-static inline __le64 build_ctob(u32 td_cmd, u32 td_offset, unsigned int size,
-				u32 td_tag)
+* extent entries, both for clustered and non-clustered allocation requests.
+ */
+static int
+test_steal_space_from_bitmap_to_extent(struct btrfs_block_group_cache *cache)
 {
-	return cpu_to_le64(I40E_TX_DESC_DTYPE_DATA |
-			   ((u64)td_cmd  << I40E_TXD_QW1_CMD_SHIFT) |
-			   ((u64)td_offset << I40E_TXD_QW1_OFFSET_SHIFT) |
-			   ((u64)size  << I40E_TXD_QW1_TX_BUF_SZ_SHIFT) |
-			   ((u64)td_tag  << I40E_TXD_QW1_L2TAG1_SHIFT));
-}
+	int ret;
+	u64 offset;
+	u64 max_extent_size;
 
-#define I40E_TXD_CMD (I40E_TX_DESC_CMD_EOP | I40E_TX_DESC_CMD_RS)
-#define I40E_FD_CLEAN_DELAY 10
-/**
- * i40e_program_fdir_filter - Program a Flow Director filter
- * @fdir_data: Packet data that will be filter parameters
- * @raw_packet: the pre-allocated packet buffer for FDir
- * @pf: The PF pointer
- * @add: True for add/update, False for remove
- **/
-int i40e_program_fdir_filter(struct i40e_fdir_filter *fdir_data, u8 *raw_packet,
-			     struct i40e_pf *pf, bool add)
-{
-	struct i40e_filter_program_desc *fdir_desc;
-	struct i40e_tx_buffer *tx_buf, *first;
-	struct i40e_tx_desc *tx_desc;
-	struct i40e_ring *tx_ring;
-	unsigned int fpt, dcc;
-	struct i40e_vsi *vsi;
-	struct device *dev;
-	dma_addr_t dma;
-	u32 td_cmd = 0;
-	u16 delay = 0;
-	u16 i;
+	bool (*use_bitmap_op)(struct btrfs_free_space_ctl *,
+			      struct btrfs_free_space *);
 
-	/* find existing FDIR VSI */
-	vsi = NULL;
-	for (i = 0; i < pf->num_alloc_vsi; i++)
-		if (pf->vsi[i] && pf->vsi[i]->type == I40E_VSI_FDIR)
-			vsi = pf->vsi[i];
-	if (!vsi)
-		return -ENOENT;
+	test_msg("Running space stealing from bitmap to extent\n");
 
-	tx_ring = vsi->tx_rings[0];
-	dev = tx_ring->dev;
-
-	/* we need two descriptors to add/del a filter and we can wait */
-	do {
-		if (I40E_DESC_UNUSED(tx_ring) > 1)
-			break;
-		msleep_interruptible(1);
-		delay++;
-	} while (delay < I40E_FD_CLEAN_DELAY);
-
-	if (!(I40E_DESC_UNUSED(tx_ring) > 1))
-		return -EAGAIN;
-
-	dma = dma_map_single(dev, raw_packet,
-			     I40E_FDIR_MAX_RAW_PACKET_SIZE, DMA_TO_DEVICE);
-	if (dma_mapping_error(dev, dma))
-		goto dma_fail;
-
-	/* grab the next descriptor */
-	i = tx_ring->next_to_use;
-	fdir_desc = I40E_TX_FDIRDESC(tx_ring, i);
-	first = &tx_ring->tx_bi[i];
-	memset(first, 0, sizeof(struct i40e_tx_buffer));
-
-	tx_ring->next_to_use = ((i + 1) < tx_ring->count) ? i + 1 : 0;
-
-	fpt = (fdir_data->q_index << I40E_TXD_FLTR_QW0_QINDEX_SHIFT) &
-	      I40E_TXD_FLTR_QW0_QINDEX_MASK;
-
-	fpt |= (fdir_data->flex_off << I40E_TXD_FLTR_QW0_FLEXOFF_SHIFT) &
-	       I40E_TXD_FLTR_QW0_FLEXOFF_MASK;
-
-	fpt |= (fdir_data->pctype << I40E_TXD_FLTR_QW0_PCTYPE_SHIFT) &
-	       I40E_TXD_FLTR_QW0_PCTYPE_MASK;
-
-	/* Use LAN VSI Id if not programmed by user */
-	if (fdir_data->dest_vsi == 0)
-		fpt |= (pf->vsi[pf->lan_vsi]->id) <<
-		       I40E_TXD_FLTR_QW0_DEST_VSI_SHIFT;
-	else
-		fpt |= ((u32)fdir_data->dest_vsi <<
-			I40E_TXD_FLTR_QW0_DEST_VSI_SHIFT) &
-		       I40E_TXD_FLTR_QW0_DEST_VSI_MASK;
-
-	dcc = I40E_TX_DESC_DTYPE_FILTER_PROG;
-
-	if (add)
-		dcc |= I40E_FILTER_PROGRAM_DESC_PCMD_ADD_UPDATE <<
-		       I40E_TXD_FLTR_QW1_PCMD_SHIFT;
-	else
-		dcc |= I40E_FILTER_PROGRAM_DESC_PCMD_REMOVE <<
-		       I40E_TXD_FLTR_QW1_PCMD_SHIFT;
-
-	dcc |= (fdir_data->dest_ctl << I40E_TXD_FLTR_QW1_DEST_SHIFT) &
-	       I40E_TXD_FLTR_QW1_DEST_MASK;
-
-	dcc |= (fdir_data->fd_status << I40E_TXD_FLTR_QW1_FD_STATUS_SHIFT) &
-	       I40E_TXD_FLTR_QW1_FD_STATUS_MASK;
-
-	if (fdir_data->cnt_index != 0) {
-		dcc |= I40E_TXD_FLTR_QW1_CNT_ENA_MASK;
-		dcc |= ((u32)fdir_data->cnt_index <<
-			I40E_TXD_FLTR_QW1_CNTINDEX_SHIFT) &
-			I40E_TXD_FLTR_QW1_CNTINDEX_MASK;
-	}
-
-	fdir_desc->qindex_flex_ptype_vsi = cpu_to_le32(fpt);
-	fdir_desc->rsvd = cpu_to_le32(0);
-	fdir_desc->dtype_cmd_cntindex = cpu_to_le32(dcc);
-	fdir_desc->fd_id = cpu_to_le32(fdir_data->fd_id);
-
-	/* Now program a dummy descriptor */
-	i = tx_ring->next_to_use;
-	tx_desc = I40E_TX_DESC(tx_ring, i);
-	tx_buf = &tx_ring->tx_bi[i];
-
-	tx_ring->next_to_use = ((i + 1) < tx_ring->count) ? i + 1 : 0;
-
-	memset(tx_buf, 0, sizeof(struct i40e_tx_buffer));
-
-	/* record length, and DMA address */
-	dma_unmap_len_set(tx_buf, len, I40E_FDIR_MAX_RAW_PACKET_SIZE);
-	dma_unmap_addr_set(tx_buf, dma, dma);
-
-	tx_desc->buffer_addr = cpu_to_le64(dma);
-	td_cmd = I40E_TXD_CMD | I40E_TX_DESC_CMD_DUMMY;
-
-	tx_buf->tx_flags = I40E_TX_FLAGS_FD_SB;
-	tx_buf->raw_buf = (void *)raw_packet;
-
-	tx_desc->cmd_type_offset_bsz =
-		build_ctob(td_cmd, 0, I40E_FDIR_MAX_RAW_PACKET_SIZE, 0);
-
-	/* Force memory writes to complete before letting h/w
-	 * know there are new descriptors to fetch.
+	/*
+	 * For this test, we want to ensure we end up with an extent entry
+	 * immediately adjacent to a bitmap entry, where the bitmap starts
+	 * at an offset where the extent entry ends. We keep adding and
+	 * removing free space to reach into this state, but to get there
+	 * we need to reach a point where marking new free space doesn't
+	 * result in adding new extent entries or merging the new space
+	 * with existing extent entries - the space ends up being marked
+	 * in an existing bitmap that covers the new free space range.
+	 *
+	 * To get there, we need to reach the threshold defined set at
+	 * cache->free_space_ctl->extents_thresh, which currently is
+	 * 256 extents on a x86_64 system at least, and a few other
+	 * conditions (check free_space_cache.c). Instead of making the
+	 * test much longer and complicated, use a "use_bitmap" operation
+	 * that forces use of bitmaps as soon as we have at least 1
+	 * extent entry.
 	 */
-	wmb();
+	use_bitmap_op = cache->free_space_ctl->op->use_bitmap;
+	cache->free_space_ctl->op->use_bitmap = test_use_bitmap;
 
-	/* Mark the data descriptor to be watched */
-	first->next_to_watch = tx_desc;
+	/*
+	 * Extent entry covering free space range [128Mb - 256Kb, 128Mb - 128Kb[
+	 */
+	ret = test_add_free_space_entry(cache, 128 * 1024 * 1024 - 256 * 1024,
+					128 * 1024, 0);
+	if (ret) {
+		test_msg("Couldn't add extent entry %d\n", ret);
+		return ret;
+	}
 
-	writel(tx_ring->next_to_use, tx_ring->tail);
+	/* Bitmap entry covering free space range [128Mb + 512Kb, 256Mb[ */
+	ret = test_add_free_space_entry(cache, 128 * 1024 * 1024 + 512 * 1024,
+					128 * 1024 * 1024 - 512 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't add bitmap entry %d\n", ret);
+		return ret;
+	}
+
+	ret = check_num_extents_and_bitmaps(cache, 2, 1);
+	if (ret)
+		return ret;
+
+	/*
+	 * Now make only the first 256Kb of the bitmap marked as free, so that
+	 * we end up with only the following ranges marked as free space:
+	 *
+	 * [128Mb - 256Kb, 128Mb - 128Kb[
+	 * [128Mb + 512Kb, 128Mb + 768Kb[
+	 */
+	ret = btrfs_remove_free_space(cache,
+				      128 * 1024 * 1024 + 768 * 1024,
+				      128 * 1024 * 1024 - 768 * 1024);
+	if (ret) {
+		test_msg("Failed to free part of bitmap space %d\n", ret);
+		return ret;
+	}
+
+	/* Confirm that only those 2 ranges are marked as free. */
+	if (!test_check_exists(cache, 128 * 1024 * 1024 - 256 * 1024,
+			       128 * 1024)) {
+		test_msg("Free space range missing\n");
+		return -ENOENT;
+	}
+	if (!test_check_exists(cache, 128 * 1024 * 1024 + 512 * 1024,
+			       256 * 1024)) {
+		test_msg("Free space range missing\n");
+		return -ENOENT;
+	}
+
+	/*
+	 * Confirm that the bitmap range [128Mb + 768Kb, 256Mb[ isn't marked
+	 * as free anymore.
+	 */
+	if (test_check_exists(cache, 128 * 1024 * 1024 + 768 * 1024,
+			      128 * 1024 * 1024 - 768 * 1024)) {
+		test_msg("Bitmap region not removed from space cache\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * Confirm that the region [128Mb + 256Kb, 128Mb + 512Kb[, which is
+	 * covered by the bitmap, isn't marked as free.
+	 */
+	if (test_check_exists(cache, 128 * 1024 * 1024 + 256 * 1024,
+			      256 * 1024)) {
+		test_msg("Invalid bitmap region marked as free\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * Confirm that the region [128Mb, 128Mb + 256Kb[, which is covered
+	 * by the bitmap too, isn't marked as free either.
+	 */
+	if (test_check_exists(cache, 128 * 1024 * 1024,
+			      256 * 1024)) {
+		test_msg("Invalid bitmap region marked as free\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * Now lets mark the region [128Mb, 128Mb + 512Kb[ as free too. But,
+	 * lets make sure the free space cache marks it as free in the bitmap,
+	 * and doesn't insert a new extent entry to represent this region.
+	 */
+	ret = btrfs_add_free_space(cache, 128 * 1024 * 1024, 512 * 1024);
+	if (ret) {
+		test_msg("Error adding free space: %d\n", ret);
+		return ret;
+	}
+	/* Confirm the region is marked as free. */
+	if (!test_check_exists(cache, 128 * 1024 * 1024, 512 * 1024)) {
+		test_msg("Bitmap region not marked as free\n");
+		return -ENOENT;
+	}
+
+	/*
+	 * Confirm that no new extent entries or bitmap entries were added to
+	 * the cache after adding that free space region.
+	 */
+	ret = check_num_extents_and_bitmaps(cache, 2, 1);
+	if (ret)
+		return ret;
+
+	/*
+	 * Now lets add a small free space region to the right of the previous
+	 * one, which is not contiguous with it and is part of the bitmap too.
+	 * The goal is to test that the bitmap entry space stealing doesn't
+	 * steal this space region.
+	 */
+	ret = btrfs_add_free_space(cache, 128 * 1024 * 1024 + 16 * 1024 * 1024,
+				   4096);
+	if (ret) {
+		test_msg("Error adding free space: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Confirm that no new extent entries or bitmap entries were added to
+	 * the cache after adding that free space region.
+	 */
+	ret = check_num_extents_and_bitmaps(cache, 2, 1);
+	if (ret)
+		return ret;
+
+	/*
+	 * Now mark the region [128Mb - 128Kb, 128Mb[ as free too. This will
+	 * expand the range covered by the existing extent entry that represents
+	 * the free space [128Mb - 256Kb, 128Mb - 128Kb[.
+	 */
+	ret = btrfs_add_free_space(cache, 128 * 1024 * 1024 - 128 * 1024,
+				   128 * 1024);
+	if (ret) {
+		test_msg("Error adding free space: %d\n", ret);
+		return ret;
+	}
+	/* Confirm the region is marked as free. */
+	if (!test_check_exists(cache, 128 * 1024 * 1024 - 128 * 1024,
+			       128 * 1024)) {
+		test_msg("Extent region not marked as free\n");
+		return -ENOENT;
+	}
+
+	/*
+	 * Confirm that our extent entry didn't stole all free space from the
+	 * bitmap, because of the small 4Kb free space region.
+	 */
+	ret = check_num_extents_and_bitmaps(cache, 2, 1);
+	if (ret)
+		return ret;
+
+	/*
+	 * So now we have the range [128Mb - 256Kb, 128Mb + 768Kb[ as free
+	 * space. Without stealing bitmap free space into extent entry space,
+	 * we would have all this free space represented by 2 entries in the
+	 * cache:
+	 *
+	 * extent entry covering range: [128Mb - 256Kb, 128Mb[
+	 * bitmap entry covering range: [128Mb, 128Mb + 768Kb[
+	 *
+	 * Attempting to allocate the whole free space (1Mb) would fail, because
+	 * we can't allocate from multiple entries.
+	 * With the bitmap free space stealing, we get a single extent entry
+	 * that represents the 1Mb free space, and therefore we're able to
+	 * allocate the whole free space at once.
+	 */
+	if (!test_check_exists(cache, 128 * 1024 * 1024 - 256 * 1024,
+			       1 * 1024 * 1024)) {
+		test_msg("Expected region not marked as free\n");
+		return -ENOENT;
+	}
+
+	if (cache->free_space_ctl->free_space != (1 * 1024 * 1024 + 4096)) {
+		test_msg("Cache free space is not 1Mb + 4Kb\n");
+		return -EINVAL;
+	}
+
+	offset = btrfs_find_space_for_alloc(cache,
+					    0, 1 * 1024 * 1024, 0,
+					    &max_extent_size);
+	if (offset != (128 * 1024 * 1024 - 256 * 1024)) {
+		test_msg("Failed to allocate 1Mb from space cache, returned offset is: %llu\n",
+			 offset);
+		return -EINVAL;
+	}
+
+	/* All that remains is a 4Kb free space region in a bitmap. Confirm. */
+	ret = check_num_extents_and_bitmaps(cache, 1, 1);
+	if (ret)
+		return ret;
+
+	if (cache->free_space_ctl->free_space != 4096) {
+		test_msg("Cache free space is not 4Kb\n");
+		return -EINVAL;
+	}
+
+	offset = btrfs_find_space_for_alloc(cache,
+					    0, 4096, 0,
+					    &max_extent_size);
+	if (offset != (128 * 1024 * 1024 + 16 * 1024 * 1024)) {
+		test_msg("Failed to allocate 4Kb from space cache, returned offset is: %llu\n",
+			 offset);
+		return -EINVAL;
+	}
+
+	ret = check_cache_empty(cache);
+	if (ret)
+		return ret;
+
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
+
+	/*
+	 * Now test a similar scenario, but where our extent entry is located
+	 * to the right of the bitmap entry, so that we can check that stealing
+	 * space from a bitmap to the front of an extent entry works.
+	 */
+
+	/*
+	 * Extent entry covering free space range [128Mb + 128Kb, 128Mb + 256Kb[
+	 */
+	ret = test_add_free_space_entry(cache, 128 * 1024 * 1024 + 128 * 1024,
+					128 * 1024, 0);
+	if (ret) {
+		test_msg("Couldn't add extent entry %d\n", ret);
+		return ret;
+	}
+
+	/* Bitmap entry covering free space range [0, 128Mb - 512Kb[ */
+	ret = test_add_free_space_entry(cache, 0,
+					128 * 1024 * 1024 - 512 * 1024, 1);
+	if (ret) {
+		test_msg("Couldn't add bitmap entry %d\n", ret);
+		return ret;
+	}
+
+	ret = check_num_extents_and_bitmaps(cache, 2, 1);
+	if (ret)
+		return ret;
+
+	/*
+	 * Now make only the last 256Kb of the bitmap marked as free, so that
+	 * we end up with only the following ranges marked as free space:
+	 *
+	 * [128Mb + 128b, 128Mb + 256Kb[
+	 * [128Mb - 768Kb, 128Mb - 512Kb[
+	 */
+	ret = btrfs_remove_free_space(cache,
+				      0,
+				      128 * 1024 * 1024 - 768 * 1024);
+	if (ret) {
+		test_msg("Failed to free part of bitmap space %d\n", ret);
+		return ret;
+	}
+
+	/* Confirm that only those 2 ranges are marked as free. */
+	if (!test_check_exists(cache, 128 * 1024 * 1024 + 128 * 1024,
+			       128 * 1024)) {
+		test_msg("Free space range missing\n");
+		return -ENOENT;
+	}
+	if (!test_check_exists(cache, 128 * 1024 * 1024 - 768 * 1024,
+			       256 * 1024)) {
+		test_msg("Free space range missing\n");
+		return -ENOENT;
+	}
+
+	/*
+	 * Confirm that the bitmap range [0, 128Mb - 768Kb[ isn't marked
+	 * as free anymore.
+	 */
+	if (test_check_exists(cache, 0,
+			      128 * 1024 * 1024 - 768 * 1024)) {
+		test_msg("Bitmap region not removed from space cache\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * Confirm that the region [128Mb - 512Kb, 128Mb[, which is
+	 * covered by the bitmap, isn't marked as free.
+	 */
+	if (test_check_exists(cache, 128 * 1024 * 1024 - 512 * 1024,
+			      512 * 1024)) {
+		test_msg("Invalid bitmap region marked as free\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * Now lets mark the region [128Mb - 512Kb, 128Mb[ as free too. But,
+	 * lets make sure the free space cache marks it as free in the bitmap,
+	 * and doesn't insert a new extent entry to represent this region.
+	 */
+	ret = btrfs_add_free_space(cache, 128 * 1024 * 1024 - 512 * 1024,
+				   512 * 1024);
+	if (ret) {
+		test_msg("Error adding free space: %d\n", ret);
+		return ret;
+	}
+	/* Confirm the region is marked as free. */
+	if (!test_check_exists(cache, 128 * 1024 * 1024 - 512 * 1024,
+			       512 * 1024)) {
+		test_msg("Bitmap region not marked as free\n");
+		return -ENOENT;
+	}
+
+	/*
+	 * Confirm that no new extent entries or bitmap entries were added to
+	 * the cache after adding that free space region.
+	 */
+	ret = check_num_extents_and_bitmaps(cache, 2, 1);
+	if (ret)
+		return ret;
+
+	/*
+	 * Now lets add a small free space region to the left of the previous
+	 * one, which is not contiguous with it and is part of the bitmap too.
+	 * The goal is to test that the bitmap entry space stealing doesn't
+	 * steal this space region.
+	 */
+	ret = btrfs_add_free_space(cache, 32 * 1024 * 1024, 8192);
+	if (ret) {
+		test_msg("Error adding free space: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Now mark the region [128Mb, 128Mb + 128Kb[ as free too. This will
+	 * expand the range covered by the existing extent entry that represents
+	 * the free space [128Mb + 128Kb, 128Mb + 256Kb[.
+	 */
+	ret = btrfs_add_free_space(cache, 128 * 1024 * 1024, 128 * 1024);
+	if (ret) {
+		test_msg("Error adding free space: %d\n", ret);
+		return ret;
+	}
+	/* Confirm the region is marked as free. */
+	if (!test_check_exists(cache, 128 * 1024 * 1024, 128 * 1024)) {
+		test_msg("Extent region not marked as free\n");
+		return -ENOENT;
+	}
+
+	/*
+	 * Confirm that our extent entry didn't stole all free space from the
+	 * bitmap, because of the small 8Kb free space region.
+	 */
+	ret = check_num_extents_and_bitmaps(cache, 2, 1);
+	if (ret)
+		return ret;
+
+	/*
+	 * So now we have the range [128Mb - 768Kb, 128Mb + 256Kb[ as free
+	 * space. Without stealing bitmap free space into extent entry space,
+	 * we would have all this free space represented by 2 entries in the
+	 * cache:
+	 *
+	 * extent entry covering range: [128Mb, 128Mb + 256Kb[
+	 * bitmap entry covering range: [128Mb - 768Kb, 128Mb[
+	 *
+	 * Attempting to allocate the whole free space (1Mb) would fail, because
+	 * we can't allocate from multiple entries.
+	 * With the bitmap free space stealing, we get a single extent entry
+	 * that represents the 1Mb free space, and therefore we're able to
+	 * allocate the whole free space at once.
+	 */
+	if (!test_check_exists(cache, 128 * 1024 * 1024 - 768 * 1024,
+			       1 * 1024 * 1024)) {
+		test_msg("Expected region not marked as free\n");
+		return -ENOENT;
+	}
+
+	if (cache->free_space_ctl->free_space != (1 * 1024 * 1024 + 8192)) {
+		test_msg("Cache free space is not 1Mb + 8Kb\n");
+		return -EINVAL;
+	}
+
+	offset = btrfs_find_space_for_alloc(cache,
+					    0, 1 * 1024 * 1024, 0,
+					    &max_extent_size);
+	if (offset != (128 * 1024 * 1024 - 768 * 1024)) {
+		test_msg("Failed to allocate 1Mb from space cache, returned offset is: %llu\n",
+			 offset);
+		return -EINVAL;
+	}
+
+	/* All that remains is a 8Kb free space region in a bitmap. Confirm. */
+	ret = check_num_extents_and_bitmaps(cache, 1, 1);
+	if (ret)
+		return ret;
+
+	if (cache->free_space_ctl->free_space != 8192) {
+		test_msg("Cache free space is not 8Kb\n");
+		return -EINVAL;
+	}
+
+	offset = btrfs_find_space_for_alloc(cache,
+					    0, 8192, 0,
+					    &max_extent_size);
+	if (offset != (32 * 1024 * 1024)) {
+		test_msg("Failed to allocate 8Kb from space cache, returned offset is: %llu\n",
+			 offset);
+		return -EINVAL;
+	}
+
+	ret = check_cache_empty(cache);
+	if (ret)
+		return ret;
+
+	cache->free_space_ctl->op->use_bitmap = use_bitmap_op;
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
+
 	return 0;
-
-dma_fail:
-	return -1;
 }
 
-#define IP_HEADER_OFFSET 14
-#define I40E_UDPIP_DUMMY_PACKET_LEN 42
-/**
- * i40e_add_del_fdir_udpv4 - Add/Remove UDPv4 filters
- * @vsi: pointer to the targeted VSI
- * @fd_data: the flow director data required for the FDir descriptor
- * @add: true adds a filter, false removes it
- *
- * Returns 0 if the filters were successfully added or removed
- **/
-static int i40e_add_del_fdir_udpv4(struct i40e_vsi *vsi,
-				   struct i40e_fdir_filter *fd_data,
-				   bool add)
+int btrfs_test_free_space_cache(void)
 {
-	struct i40e_pf *pf = vsi->back;
-	struct udphdr *udp;
-	struct iphdr *ip;
-	bool err = false;
-	u8 *raw_packet;
-	int ret;
-	static char packet[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0,
-		0x45, 0, 0, 0x1c, 0, 0, 0x40, 0, 0x40, 0x11, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+	struct btrfs_block_group_cache *cache;
+	struct btrfs_root *root = NULL;
+	int ret = -ENOMEM;
 
-	raw_packet = kzalloc(I40E_FDIR_MAX_RAW_PACKET_SIZE, GFP_KERNEL);
-	if (!raw_packet)
-		return -ENOMEM;
-	memcpy(raw_packet, packet, I40E_UDPIP_DUMMY_PACKET_LEN);
+	test_msg("Running btrfs free space cache tests\n");
 
-	ip = (struct iphdr *)(raw_packet + IP_HEADER_OFFSET);
-	udp = (struct udphdr *)(raw_packet + IP_HEADER_OFFSET
-	      + sizeof(struct iphdr));
-
-	ip->daddr = fd_data->dst_ip[0];
-	udp->dest = fd_data->dst_port;
-	ip->saddr = fd_data->src_ip[0];
-	udp->source = fd_data->src_port;
-
-	fd_data->pctype = I40E_FILTER_PCTYPE_NONF_IPV4_UDP;
-	ret = i40e_program_fdir_filter(fd_data, raw_packet, pf, add);
-	if (ret) {
-		dev_info(&pf->pdev->dev,
-			 "PCTYPE:%d, Filter command send failed for fd_id:%d (ret = %d)\n",
-			 fd_data->pctype, fd_data->fd_id, ret);
-		err = true;
-	} else if (I40E_DEBUG_FD & pf->hw.debug_mask) {
-		if (add)
-			dev_info(&pf->pdev->dev,
-				 "Filter OK for PCTYPE %d loc = %d\n",
-				 fd_data->pctype, fd_data->fd_id);
-		else
-			dev_info(&pf->pdev->dev,
-				 "Filter deleted for PCTYPE %d loc = %d\n",
-				 fd_data->pctype, fd_data->fd_id);
+	cache = init_test_block_group();
+	if (!cache) {
+		test_msg("Couldn't run the tests\n");
+		return 0;
 	}
-	if (err)
-		kfree(raw_packet);
 
-	return err ? -EOPNOTSUPP : 0;
+	root = btrfs_alloc_dummy_root();
+	if (IS_ERR(root)) {
+		ret = PTR_ERR(root);
+		goto out;
+	}
+
+	root->fs_info = btrfs_alloc_dummy_fs_info();
+	if (!root->fs_info)
+		goto out;
+
+	root->fs_info->extent_root = root;
+	cache->fs_info = root->fs_info;
+
+	ret = test_extents(cache);
+	if (ret)
+		goto out;
+	ret = test_bitmaps(cache);
+	if (ret)
+		goto out;
+	ret = test_bitmaps_and_extents(cache);
+	if (ret)
+		goto out;
+
+	ret = test_steal_space_from_bitmap_to_extent(cache);
+out:
+	__btrfs_remove_free_space_cache(cache->free_space_ctl);
+	kfree(cache->free_space_ctl);
+	kfree(cache);
+	btrfs_free_dummy_root(root);
+	test_msg("Free space cache tests finished\n");
+	return ret;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 /*
+ * Copyright (C) 2013 Fusion IO.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include "btrfs-tests.h"
+#include "../ctree.h"
+#include "../btrfs_inode.h"
+#include "../disk-io.h"
+#include "../extent_io.h"
+#include "../volumes.h"
+
+static void insert_extent(struct btrfs_root *root, u64 start, u64 len,
+			  u64 ram_bytes, u64 offset, u64 disk_bytenr,
+			  u64 disk_len, u32 type, u8 compression, int slot)
+{
+	struct btrfs_path path;
+	struct btrfs_file_extent_item *fi;
+	struct extent_buffer *leaf = root->node;
+	struct btrfs_key key;
+	u32 value_len = sizeof(struct btrfs_file_extent_item);
+
+	if (type == BTRFS_FILE_EXTENT_INLINE)
+		value_len += len;
+	memset(&path, 0, sizeof(path));
+
+	path.nodes[0] = leaf;
+	path.slots[0] = slot;
+
+	key.objectid = BTRFS_FIRST_FREE_OBJECTID;
+	key.type = BTRFS_EXTENT_DATA_KEY;
+	key.offset = start;
+
+	setup_items_for_insert(root, &path, &key, &value_len, value_len,
+			       value_len + sizeof(struct btrfs_item), 1);
+	fi = btrfs_item_ptr(leaf, slot, struct btrfs_file_extent_item);
+	btrfs_set_file_extent_generation(leaf, fi, 1);
+	btrfs_set_file_extent_type(leaf, fi, type);
+	btrfs_set_file_extent_disk_bytenr(leaf, fi, disk_bytenr);
+	btrfs_set_file_extent_disk_num_bytes(leaf, fi, disk_len);
+	btrfs_set_file_extent_offset(leaf, fi, offset);
+	btrfs_set_file_extent_num_bytes(leaf, fi, len);
+	btrfs_set_file_extent_ram_bytes(leaf, fi, ram_bytes);
+	btrfs_set_file_extent_compression(leaf, fi, compression);
+	btrfs_set_file_extent_encryption(leaf, fi, 0);
+	btrfs_set_file_extent_other_encoding(leaf, fi, 0);
 }
 
-#define I40E_TCPIP_DUMMY_PACKET_LEN 54
-/**
- * i40e_add_del_fdir_tcpv4 - Add/Remove TCPv4 filters
- * @vsi: pointer to the targeted VSI
- * @fd_data: the flow director data required for the FDir descriptor
- * @add: true adds a filter, false removes it
- *
- * Returns 0 if the filters were successfully added or removed
- **/
-static int i40e_add_del_fdir_tcpv4(struct i40e_vsi *vsi,
-				   struct i40e_fdir_filter *fd_data,
-				   bool add)
+static void insert_inode_item_key(struct btrfs_root *root)
 {
-	struct i40e_pf *pf = vsi->back;
-	struct tcphdr *tcp;
-	struct iphdr *ip;
-	bool err = false;
-	u8 *raw_packet;
-	int ret;
-	/* Dummy packet */
-	static char packet[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0,
-		0x45, 0, 0, 0x28, 0, 0, 0x40, 0, 0x40, 0x6, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x11,
-		0x0, 0x72, 0, 0, 0, 0};
+	struct btrfs_path path;
+	struct extent_buffer *leaf = root->node;
+	struct btrfs_key key;
+	u32 value_len = 0;
 
-	raw_packet = kzalloc(I40E_FDIR_MAX_RAW_PACKET_SIZE, GFP_KERNEL);
-	if (!raw_packet)
-		return -ENOMEM;
-	memcpy(raw_packet, packet, I40E_TCPIP_DUMMY_PACKET_LEN);
+	memset(&path, 0, sizeof(path));
 
-	ip = (struct iphdr *)(raw_packet + IP_HEADER_OFFSET);
-	tcp = (struct tcphdr *)(raw_packet + IP_HEADER_OFFSET
-	      + sizeof(struct iphdr));
+	path.nodes[0] = leaf;
+	path.slots[0] = 0;
 
-	ip->daddr = fd_data->dst_ip[0];
-	tcp->dest = fd_data->dst_port;
-	ip->saddr = fd_data->src_ip[0];
-	tcp->source = fd_data->src_port;
+	key.objectid = BTRFS_INODE_ITEM_KEY;
+	key.type = BTRFS_INODE_ITEM_KEY;
+	key.offset = 0;
 
-	if (add) {
-		pf->fd_tcp_rule++;
-		if (pf->flags & I40E_FLAG_FD_ATR_ENABLED) {
-			if (I40E_DEBUG_FD & pf->hw.debug_mask)
-				dev_info(&pf->pdev->dev, "Forcing ATR off, sideband rules for TCP/IPv4 flow being applied\n");
-			pf->flags &= ~I40E_FLAG_FD_ATR_ENABLED;
-		}
-	} else {
-		pf->fd_tcp_rule = (pf->fd_tcp_rule > 0) ?
-				  (pf->fd_tcp_rule - 1) : 0;
-		if (pf->fd_tcp_rule == 0) {
-			pf->flags |= I40E_FLAG_FD_ATR_ENABLED;
-			if (I40E_DEBUG_FD & pf->hw.debug_mask)
-				dev_info(&pf->pdev->dev, "ATR re-enabled due to no sideband TCP/IPv4 rules\n");
-		}
-	}
-
-	fd_data->pctype = I40E_FILTER_PCTYPE_NONF_IPV4_TCP;
-	ret = i40e_program_fdir_filter(fd_data, raw_packet, pf, add);
-
-	if (ret) {
-		dev_info(&pf->pdev->dev,
-			 "PCTYPE:%d, Filter command send failed for fd_id:%d (ret = %d)\n",
-			 fd_data->pctype, fd_data->fd_id, ret);
-		err = true;
-	} else if (I40E_DEBUG_FD & pf->hw.debug_mask) {
-		if (add)
-			dev_info(&pf->pdev->dev, "Filter OK for PCTYPE %d loc = %d)\n",
-				 fd_data->pctype, fd_data->fd_id);
-		else
-			dev_info(&pf->pdev->dev,
-				 "Filter deleted for PCTYPE %d loc = %d\n",
-				 fd_data->pctype, fd_data->fd_id);
-	}
-
-	if (err)
-		kfree(raw_packet);
-
-	return err ? -EOPNOTSUPP : 0;
+	setup_items_for_insert(root, &path, &key, &value_len, value_len,
+			       value_len + sizeof(struct btrfs_item), 1);
 }
 
-/**
- * i40e_add_del_fdir_sctpv4 - Add/Remove SCTPv4 Flow Director filters for
- * a specific flow spec
- * @vsi: pointer to the targeted VSI
- * @fd_data: the flow director data required for the FDir descriptor
- * @add: true adds a filter, false removes it
+/*
+ * Build the most complicated map of extents the earth has ever seen.  We want
+ * this so we can test all of the corner cases of btrfs_get_extent.  Here is a
+ * diagram of how the extents will look though this may not be possible we still
+ * want to make sure everything acts normally (the last number is not inclusive)
  *
- * Always returns -EOPNOTSUPP
- **/
-static int i40e_add_del_fdir_sctpv4(struct i40e_vsi *vsi,
-				    struct i40e_fdir_filter *fd_data,
-				    bool add)
+ * [0 - 5][5 -  6][6 - 10][10 - 4096][  4096 - 8192 ][8192 - 12288]
+ * [hole ][inline][ hole ][ regular ][regular1 split][    hole    ]
+ *
+ * [ 12288 - 20480][20480 - 24576][  24576 - 28672  ][28672 - 36864][36864 - 45056]
+ * [regular1 split][   prealloc1 ][prealloc1 written][   prealloc1 ][ compressed  ]
+ *
+ * [45056 - 49152][49152-53248][53248-61440][61440-65536][     65536+81920   ]
+ * [ compressed1 ][  regular  ][compressed1][  regular  ][ hole but no extent]
+ *
+ * [81920-86016]
+ * [  regular  ]
+ */
+static void setup_file_extents(struct btrfs_root *root)
 {
-	return -EOPNOTSUPP;
+	int slot = 0;
+	u64 disk_bytenr = 1 * 1024 * 1024;
+	u64 offset = 0;
+
+	/* First we want a hole */
+	insert_extent(root, offset, 5, 5, 0, 0, 0, BTRFS_FILE_EXTENT_REG, 0,
+		      slot);
+	slot++;
+	offset += 5;
+
+	/*
+	 * Now we want an inline extent, I don't think this is possible but hey
+	 * why not?  Also keep in mind if we have an inline extent it counts as
+	 * the whole first page.  If we were to expand it we would have to cow
+	 * and we wouldn't have an inline extent anymore.
+	 */
+	insert_extent(root, offset, 1, 1, 0, 0, 0, BTRFS_FILE_EXTENT_INLINE, 0,
+		      slot);
+	slot++;
+	offset = 4096;
+
+	/* Now another hole */
+	insert_extent(root, offset, 4, 4, 0, 0, 0, BTRFS_FILE_EXTENT_REG, 0,
+		      slot);
+	slot++;
+	offset += 4;
+
+	/* Now for a regular extent */
+	insert_extent(root, offset, 4095, 4095, 0, disk_bytenr, 4096,
+		      BTRFS_FILE_EXTENT_REG, 0, slot);
+	slot++;
+	disk_bytenr += 4096;
+	offset += 4095;
+
+	/*
+	 * Now for 3 extents that were split from a hole punch so we test
+	 * offsets properly.
+	 */
+	insert_extent(root, offset, 4096, 16384, 0, disk_bytenr, 16384,
+		      BTRFS_FILE_EXTENT_REG, 0, slot);
+	slot++;
+	offset += 4096;
+	insert_extent(root, offset, 4096, 4096, 0, 0, 0, BTRFS_FILE_EXTENT_REG,
+		      0, slot);
+	slot++;
+	offset += 4096;
+	insert_extent(root, offset, 8192, 16384, 8192, disk_bytenr, 16384,
+		      BTRFS_FILE_EXTENT_REG, 0, slot);
+	slot++;
+	offset += 8192;
+	disk_bytenr += 16384;
+
+	/* Now for a unwritten prealloc extent */
+	insert_extent(root, offset, 4096, 4096, 0, disk_bytenr, 4096,
+		      BTRFS_FILE_EXTENT_PREALLOC, 0, slot);
+	slot++;
+	offset += 4096;
+
+	/*
+	 * We want to jack up disk_bytenr a little more so the em stuff doesn't
+	 * merge our records.
+	 */
+	disk_bytenr += 8192;
+
+	/*
+	 * Now for a partially written prealloc extent, basically the same as
+	 * the hole punch example above.  Ram_bytes never changes when you mark
+	 * extents written btw.
+	 */
+	insert_extent(root, offset, 4096, 16384, 0, disk_bytenr, 16384,
+		      BTRFS_FILE_EXTENT_PREALLOC, 0, slot);
+	slot++;
+	offset += 4096;
+	insert_extent(root, offset, 4096, 16384, 4096, disk_bytenr, 16384,
+		      BTRFS_FILE_EXTENT_REG, 0, slot);
+	slot++;
+	offset += 4096;
+	insert_extent(root, offset, 8192, 16384, 8192, disk_bytenr, 16384,
+		      BTRFS_FILE_EXTENT_PREALLOC, 0, slot);
+	slot++;
+	offset += 8192;
+	disk_bytenr += 16384;
+
+	/* Now a normal compressed extent */
+	insert_extent(root, offset, 8192, 8192, 0, disk_bytenr, 4096,
+		      BTRFS_FILE_EXTENT_REG, BTRFS_COMPRESS_ZLIB, slot);
+	slot++;
+	offset += 8192;
+	/* No merges */
+	disk_bytenr += 8192;
+
+	/* Now a split compressed extent */
+	insert_extent(root, offset, 4096, 16384, 0, disk_bytenr, 4096,
+		      BTRFS_FILE_EXTENT_REG, BTRFS_COMPRESS_ZLIB, slot);
+	slot++;
+	offset += 4096;
+	insert_extent(root, offset, 4096, 4096, 0, disk_bytenr + 4096, 4096,
+		      BTRFS_FILE_EXTENT_REG, 0, slot);
+	slot++;
+	offset += 4096;
+	insert_extent(root, offset, 8192, 16384, 8192, disk_bytenr, 4096,
+		      BTRFS_FILE_EXTENT_REG, BTRFS_COMPRESS_ZLIB, slot);
+	slot++;
+	offset += 8192;
+	disk_bytenr += 8192;
+
+	/* Now extents that have a hole but no hole extent */
+	insert_extent(root, offset, 4096, 4096, 0, disk_bytenr, 4096,
+		      BTRFS_FILE_EXTENT_REG, 0, slot);
+	slot++;
+	offset += 16384;
+	disk_bytenr += 4096;
+	insert_extent(root, offset, 4096, 4096, 0, disk_bytenr, 4096,
+		      BTRFS_FILE_EXTENT_REG, 0, slot);
 }
 
-#define I40E_IP_DUMMY_PACKET_LEN 34
-/**
- * i40e_add_del_fdir_ipv4 - Add/Remove IPv4 Flow Director filters for
- * a specific flow spec
- * @vsi: pointer to the targeted VSI
- * @fd_data: the flow director data required for the FDir descriptor
- * @add: true adds a filter, false removes it
- *
- * Returns 0 if the filters were successfully added or removed
- **/
-static int i40e_add_del_fdir_ipv4(struct i40e_vsi *vsi,
-				  struct i40e_fdir_filter *fd_data,
-				  bool add)
+static unsigned long prealloc_only = 0;
+static unsigned long compressed_only = 0;
+static unsigned long vacancy_only = 0;
+
+static noinline int test_btrfs_get_extent(void)
 {
-	struct i40e_pf *pf = vsi->back;
-	struct iphdr *ip;
-	bool err = false;
-	u8 *raw_packet;
-	int ret;
-	int i;
-	static char packet[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08, 0,
-		0x45, 0, 0, 0x14, 0, 0, 0x40, 0, 0x40, 0x10, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0};
+	struct inode *inode = NULL;
+	struct btrfs_root *root = NULL;
+	struct extent_map *em = NULL;
+	u64 orig_start;
+	u64 disk_bytenr;
+	u64 offset;
+	int ret = -ENOMEM;
 
-	for (i = I40E_FILTER_PCTYPE_NONF_IPV4_OTHER;
-	     i <= I40E_FILTER_PCTYPE_FRAG_IPV4;	i++) {
-		raw_packet = kzalloc(I40E_FDIR_MAX_RAW_PACKET_SIZE, GFP_KERNEL);
-		if (!raw_packet)
-			return -ENOMEM;
-		memcpy(raw_packet, packet, I40E_IP_DUMMY_PACKET_LEN);
-		ip = (struct iphdr *)(raw_packet + IP_HEADER_OFFSET);
-
-		ip->saddr = fd_data->src_ip[0];
-		ip->daddr = fd_data->dst_ip[0];
-		ip->protocol = 0;
-
-		fd_data->pctype = i;
-		ret = i40e_program_fdir_filter(fd_data, raw_packet, pf, add);
-
-		if (ret) {
-			dev_info(&pf->pdev->dev,
-				 "PCTYPE:%d, Filter command send failed for fd_id:%d (ret = %d)\n",
-				 fd_data->pctype, fd_data->fd_id, ret);
-			err = true;
-		} else if (I40E_DEBUG_FD & pf->hw.debug_mask) {
-			if (add)
-				dev_info(&pf->pdev->dev,
-					 "Filter OK for PCTYPE %d loc = %d\n",
-					 fd_data->pctype, fd_data->fd_id);
-			else
-				dev_info(&pf->pdev->dev,
-					 "Filter deleted for PCTYPE %d loc = %d\n",
-					 fd_data->pctype, fd_data->fd_id);
-		}
+	inode = btrfs_new_test_inode();
+	if (!inode) {
+		test_msg("Couldn't allocate inode\n");
+		return ret;
 	}
 
-	if (err)
-		kfree(raw_packet);
+	inode->i_mode = S_IFREG;
+	BTRFS_I(inode)->location.type = BTRFS_INODE_ITEM_KEY;
+	BTRFS_I(inode)->location.objectid = BTRFS_FIRST_FREE_OBJECTID;
+	BTRFS_I(inode)->location.offset = 0;
 
-	return err ? -EOPNOTSUPP : 0;
-}
-
-/**
- * i40e_add_del_fdir - Build raw packets to add/del fdir filter
- * @vsi: pointer to the targeted VSI
- * @cmd: command to get or set RX flow classification rules
- * @add: true adds a filter, false removes it
- *
- **/
-int i40e_add_del_fdir(struct i40e_vsi *vsi,
-		      struct i40e_fdir_filter *input, bool add)
-{
-	struct i40e_pf *pf = vsi->back;
-	int ret;
-
-	switch (input->flow_type & ~FLOW_EXT) {
-	case TCP_V4_FLOW:
-		ret = i40e_add_del_fdir_tcpv4(vsi, input, add);
-		break;
-	case UDP_V4_FLOW:
-		ret = i40e_add_del_fdir_udpv4(vsi, input, add);
-		break;
-	case SCTP_V4_FLOW:
-		ret = i40e_add_del_fdir_sctpv4(vsi, input, add);
-		break;
-	case IPV4_FLOW:
-		ret = i40e_add_del_fdir_ipv4(vsi, input, add);
-		break;
-	case IP_USER_FLOW:
-		switch (input->ip4_proto) {
-		case IPPROTO_TCP:
-			ret = i40e_add_del_fdir_tcpv4(vsi, input, add);
-			break;
-		case IPPROTO_UDP:
-			ret = i40e_add_del_fdir_udpv4(vsi, input, add);
-			break;
-		case IPPROTO_SCTP:
-			ret = i40e_add_del_fdir_sctpv4(vsi, input, add);
-			break;
-		default:
-			ret = i40e_add_del_fdir_ipv4(vsi, input, add);
-			break;
-		}
-		break;
-	default:
-		dev_info(&pf->pdev->dev, "Could not specify spec type %d\n",
-			 input->flow_type);
-		ret = -EINVAL;
+	root = btrfs_alloc_dummy_root();
+	if (IS_ERR(root)) {
+		test_msg("Couldn't allocate root\n");
+		goto out;
 	}
 
-	/* The buffer allocated here is freed by the i40e_clean_tx_ring() */
+	/*
+	 * We do this since btrfs_get_extent wants to assign em->bdev to
+	 * root->fs_info->fs_devices->latest_bdev.
+	 */
+	root->fs_info = btrfs_alloc_dummy_fs_info();
+	if (!root->fs_info) {
+		test_msg("Couldn't allocate dummy fs info\n");
+		goto out;
+	}
+
+	root->node = alloc_dummy_extent_buffer(NULL, 4096);
+	if (!root->node) {
+		test_msg("Couldn't allocate dummy buffer\n");
+		goto out;
+	}
+
+	/*
+	 * We will just free a dummy node if it's ref count is 2 so we need an
+	 * extra ref so our searches don't accidently release our page.
+	 */
+	extent_buffer_get(root->node);
+	btrfs_set_header_nritems(root->node, 0);
+	btrfs_set_header_level(root->node, 0);
+	ret = -EINVAL;
+
+	/* First with no extents */
+	BTRFS_I(inode)->root = root;
+	em = btrfs_get_extent(inode, NULL, 0, 0, 4096, 0);
+	if (IS_ERR(em)) {
+		em = NULL;
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != EXTENT_MAP_HOLE) {
+		test_msg("Expected a hole, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (!test_bit(EXTENT_FLAG_VACANCY, &em->flags)) {
+		test_msg("Vacancy flag wasn't set properly\n");
+		goto out;
+	}
+	free_extent_map(em);
+	btrfs_drop_extent_cache(inode, 0, (u64)-1, 0);
+
+	/*
+	 * All of the magic numbers are based on the mapping setup in
+	 * setup_file_extents, so if you change anything there you need to
+	 * update the comment and update the expected values below.
+	 */
+	setup_file_extents(root);
+
+	em = btrfs_get_extent(inode, NULL, 0, 0, (u64)-1, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != EXTENT_MAP_HOLE) {
+		test_msg("Expected a hole, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != 0 || em->len != 5) {
+		test_msg("Unexpected extent wanted start 0 len 5, got start "
+			 "%llu len %llu\n", em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != EXTENT_MAP_INLINE) {
+		test_msg("Expected an inline, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4091) {
+		test_msg("Unexpected extent wanted start %llu len 1, got start "
+			 "%llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	/*
+	 * We don't test anything else for inline since it doesn't get set
+	 * unless we have a page for it to write into.  Maybe we should change
+	 * this?
+	 */
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != EXTENT_MAP_HOLE) {
+		test_msg("Expected a hole, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4) {
+		test_msg("Unexpected extent wanted start %llu len 4, got start "
+			 "%llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	/* Regular extent */
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4095) {
+		test_msg("Unexpected extent wanted start %llu len 4095, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", em->start,
+			 em->orig_start);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	/* The next 3 are split extents */
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", em->start,
+			 em->orig_start);
+		goto out;
+	}
+	disk_bytenr = em->block_start;
+	orig_start = em->start;
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != EXTENT_MAP_HOLE) {
+		test_msg("Expected a hole, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 8192) {
+		test_msg("Unexpected extent wanted start %llu len 8192, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	if (em->orig_start != orig_start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n",
+			 orig_start, em->orig_start);
+		goto out;
+	}
+	disk_bytenr += (em->start - orig_start);
+	if (em->block_start != disk_bytenr) {
+		test_msg("Wrong block start, want %llu, have %llu\n",
+			 disk_bytenr, em->block_start);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	/* Prealloc extent */
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != prealloc_only) {
+		test_msg("Unexpected flags set, want %lu have %lu\n",
+			 prealloc_only, em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", em->start,
+			 em->orig_start);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	/* The next 3 are a half written prealloc extent */
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != prealloc_only) {
+		test_msg("Unexpected flags set, want %lu have %lu\n",
+			 prealloc_only, em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", em->start,
+			 em->orig_start);
+		goto out;
+	}
+	disk_bytenr = em->block_start;
+	orig_start = em->start;
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_HOLE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	if (em->orig_start != orig_start) {
+		test_msg("Unexpected orig offset, wanted %llu, have %llu\n",
+			 orig_start, em->orig_start);
+		goto out;
+	}
+	if (em->block_start != (disk_bytenr + (em->start - em->orig_start))) {
+		test_msg("Unexpected block start, wanted %llu, have %llu\n",
+			 disk_bytenr + (em->start - em->orig_start),
+			 em->block_start);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 8192) {
+		test_msg("Unexpected extent wanted start %llu len 8192, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != prealloc_only) {
+		test_msg("Unexpected flags set, want %lu have %lu\n",
+			 prealloc_only, em->flags);
+		goto out;
+	}
+	if (em->orig_start != orig_start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", orig_start,
+			 em->orig_start);
+		goto out;
+	}
+	if (em->block_start != (disk_bytenr + (em->start - em->orig_start))) {
+		test_msg("Unexpected block start, wanted %llu, have %llu\n",
+			 disk_bytenr + (em->start - em->orig_start),
+			 em->block_start);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	/* Now for the compressed extent */
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 8192) {
+		test_msg("Unexpected extent wanted start %llu len 8192, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != compressed_only) {
+		test_msg("Unexpected flags set, want %lu have %lu\n",
+			 compressed_only, em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n",
+			 em->start, em->orig_start);
+		goto out;
+	}
+	if (em->compress_type != BTRFS_COMPRESS_ZLIB) {
+		test_msg("Unexpected compress type, wanted %d, got %d\n",
+			 BTRFS_COMPRESS_ZLIB, em->compress_type);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	/* Split compressed extent */
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != compressed_only) {
+		test_msg("Unexpected flags set, want %lu have %lu\n",
+			 compressed_only, em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n",
+			 em->start, em->orig_start);
+		goto out;
+	}
+	if (em->compress_type != BTRFS_COMPRESS_ZLIB) {
+		test_msg("Unexpected compress type, wanted %d, got %d\n",
+			 BTRFS_COMPRESS_ZLIB, em->compress_type);
+		goto out;
+	}
+	disk_bytenr = em->block_start;
+	orig_start = em->start;
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", em->start,
+			 em->orig_start);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != disk_bytenr) {
+		test_msg("Block start does not match, want %llu got %llu\n",
+			 disk_bytenr, em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 8192) {
+		test_msg("Unexpected extent wanted start %llu len 8192, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != compressed_only) {
+		test_msg("Unexpected flags set, want %lu have %lu\n",
+			 compressed_only, em->flags);
+		goto out;
+	}
+	if (em->orig_start != orig_start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n",
+			 em->start, orig_start);
+		goto out;
+	}
+	if (em->compress_type != BTRFS_COMPRESS_ZLIB) {
+		test_msg("Unexpected compress type, wanted %d, got %d\n",
+			 BTRFS_COMPRESS_ZLIB, em->compress_type);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	/* A hole between regular extents but no hole extent */
+	em = btrfs_get_extent(inode, NULL, 0, offset + 6, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", em->start,
+			 em->orig_start);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096 * 1024, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != EXTENT_MAP_HOLE) {
+		test_msg("Expected a hole extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	/*
+	 * Currently we just return a length that we requested rather than the
+	 * length of the actual hole, if this changes we'll have to change this
+	 * test.
+	 */
+	if (em->start != offset || em->len != 12288) {
+		test_msg("Unexpected extent wanted start %llu len 12288, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != vacancy_only) {
+		test_msg("Unexpected flags set, want %lu have %lu\n",
+			 vacancy_only, em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", em->start,
+			 em->orig_start);
+		goto out;
+	}
+	offset = em->start + em->len;
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, offset, 4096, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start >= EXTENT_MAP_LAST_BYTE) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != offset || em->len != 4096) {
+		test_msg("Unexpected extent wanted start %llu len 4096, got "
+			 "start %llu len %llu\n", offset, em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, want 0 have %lu\n", em->flags);
+		goto out;
+	}
+	if (em->orig_start != em->start) {
+		test_msg("Wrong orig offset, want %llu, have %llu\n", em->start,
+			 em->orig_start);
+		goto out;
+	}
+	ret = 0;
+out:
+	if (!IS_ERR(em))
+		free_extent_map(em);
+	iput(inode);
+	btrfs_free_dummy_root(root);
 	return ret;
 }
 
-/**
- * i40e_fd_handle_status - check the Programming Status for FD
- * @rx_ring: the Rx ring for this descriptor
- * @rx_desc: the Rx descriptor for programming Status, not a packet descriptor.
- * @prog_id: the id originally used for programming
- *
- * This is used to verify if the FD programming or invalidation
- * requested by SW to the HW is successful or not and take actions accordingly.
- **/
-static void i40e_fd_handle_status(struct i40e_ring *rx_ring,
-				  union i40e_rx_desc *rx_desc, u8 prog_id)
+static int test_hole_first(void)
 {
-	struct i40e_pf *pf = rx_ring->vsi->back;
-	struct pci_dev *pdev = pf->pdev;
-	u32 fcnt_prog, fcnt_avail;
-	u32 error;
-	u64 qw;
+	struct inode *inode = NULL;
+	struct btrfs_root *root = NULL;
+	struct extent_map *em = NULL;
+	int ret = -ENOMEM;
 
-	qw = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
-	error = (qw & I40E_RX_PROG_STATUS_DESC_QW1_ERROR_MASK) >>
-		I40E_RX_PROG_STATUS_DESC_QW1_ERROR_SHIFT;
-
-	if (error == BIT(I40E_RX_PROG_STATUS_DESC_FD_TBL_FULL_SHIFT)) {
-		pf->fd_inv = le32_to_cpu(rx_desc->wb.qword0.hi_dword.fd_id);
-		if ((rx_desc->wb.qword0.hi_dword.fd_id != 0) ||
-		    (I40E_DEBUG_FD & pf->hw.debug_mask))
-			dev_warn(&pdev->dev, "ntuple filter loc = %d, could not be added\n",
-				 pf->fd_inv);
-
-		/* Check if the programming error is for ATR.
-		 * If so, auto disable ATR and set a state for
-		 * flush in progress. Next time we come here if flush is in
-		 * progress do nothing, once flush is complete the state will
-		 * be cleared.
-		 */
-		if (test_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state))
-			return;
-
-		pf->fd_add_err++;
-		/* store the current atr filter count */
-		pf->fd_atr_cnt = i40e_get_current_atr_cnt(pf);
-
-		if ((rx_desc->wb.qword0.hi_dword.fd_id == 0) &&
-		    (pf->auto_disable_flags & I40E_FLAG_FD_SB_ENABLED)) {
-			pf->auto_disable_flags |= I40E_FLAG_FD_ATR_ENABLED;
-			set_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state);
-		}
-
-		/* filter programming failed most likely due to table full */
-		fcnt_prog = i40e_get_global_fd_count(pf);
-		fcnt_avail = pf->fdir_pf_filter_count;
-		/* If ATR is running fcnt_prog can quickly change,
-		 * if we are very close to full, it makes sense to disable
-		 * FD ATR/SB and then re-enable it when there is room.
-		 */
-		if (fcnt_prog >= (fcnt_avail - I40E_FDIR_BUFFER_FULL_MARGIN)) {
-			if ((pf->flags & I40E_FLAG_FD_SB_ENABLED) &&
-			    !(pf->auto_disable_flags &
-				     I40E_FLAG_FD_SB_ENABLED)) {
-				if (I40E_DEBUG_FD & pf->hw.debug_mask)
-					dev_warn(&pdev->dev, "FD filter space full, new ntuple rules will not be added\n");
-				pf->auto_disable_flags |=
-							I40E_FLAG_FD_SB_ENABLED;
-			}
-		} else {
-			dev_info(&pdev->dev,
-				"FD filter programming failed due to incorrect filter parameters\n");
-		}
-	} else if (error == BIT(I40E_RX_PROG_STATUS_DESC_NO_FD_ENTRY_SHIFT)) {
-		if (I40E_DEBUG_FD & pf->hw.debug_mask)
-			dev_info(&pdev->dev, "ntuple filter fd_id = %d, could not be removed\n",
-				 rx_desc->wb.qword0.hi_dword.fd_id);
-	}
-}
-
-/**
- * i40e_unmap_and_free_tx_resource - Release a Tx buffer
- * @ring:      the ring that owns the buffer
- * @tx_buffer: the buffer to free
- **/
-static void i40e_unmap_and_free_tx_resource(struct i40e_ring *ring,
-					    struct i40e_tx_buffer *tx_buffer)
-{
-	if (tx_buffer->skb) {
-		dev_kfree_skb_any(tx_buffer->skb);
-		if (dma_unmap_len(tx_buffer, len))
-			dma_unmap_single(ring->dev,
-					 dma_unmap_addr(tx_buffer, dma),
-					 dma_unmap_len(tx_buffer, len),
-					 DMA_TO_DEVICE);
-	} else if (dma_unmap_len(tx_buffer, len)) {
-		dma_unmap_page(ring->dev,
-			       dma_unmap_addr(tx_buffer, dma),
-			       dma_unmap_len(tx_buffer, len),
-			       DMA_TO_DEVICE);
+	inode = btrfs_new_test_inode();
+	if (!inode) {
+		test_msg("Couldn't allocate inode\n");
+		return ret;
 	}
 
-	if (tx_buffer->tx_flags & I40E_TX_FLAGS_FD_SB)
-		kfree(tx_buffer->raw_buf);
+	BTRFS_I(inode)->location.type = BTRFS_INODE_ITEM_KEY;
+	BTRFS_I(inode)->location.objectid = BTRFS_FIRST_FREE_OBJECTID;
+	BTRFS_I(inode)->location.offset = 0;
 
-	tx_buffer->next_to_watch = NULL;
-	tx_buffer->skb = NULL;
-	dma_unmap_len_set(tx_buffer, len, 0);
-	/* tx_buffer must be completely set up in the transmit path */
-}
-
-/**
- * i40e_clean_tx_ring - Free any empty Tx buffers
- * @tx_ring: ring to be cleaned
- **/
-void i40e_clean_tx_ring(struct i40e_ring *tx_ring)
-{
-	unsigned long bi_size;
-	u16 i;
-
-	/* ring already cleared, nothing to do */
-	if (!tx_ring->tx_bi)
-		return;
-
-	/* Free all the Tx ring sk_buffs */
-	for (i = 0; i < tx_ring->count; i++)
-		i40e_unmap_and_free_tx_resource(tx_ring, &tx_ring->tx_bi[i]);
-
-	bi_size = sizeof(struct i40e_tx_buffer) * tx_ring->count;
-	memset(tx_ring->tx_bi, 0, bi_size);
-
-	/* Zero out the descriptor ring */
-	memset(tx_ring->desc, 0, tx_ring->size);
-
-	tx_ring->next_to_use = 0;
-	tx_ring->next_to_clean = 0;
-
-	if (!tx_ring->netdev)
-		return;
-
-	/* cleanup Tx queue statistics */
-	netdev_tx_reset_queue(netdev_get_tx_queue(tx_ring->netdev,
-						  tx_ring->queue_index));
-}
-
-/**
- * i40e_free_tx_resources - Free Tx resources per queue
- * @tx_ring: Tx descriptor ring for a specific queue
- *
- * Free all transmit software resources
- **/
-void i40e_free_tx_resources(struct i40e_ring *tx_ring)
-{
-	i40e_clean_tx_ring(tx_ring);
-	kfree(tx_ring->tx_bi);
-	tx_ring->tx_bi = NULL;
-
-	if (tx_ring->desc) {
-		dma_free_coherent(tx_ring->dev, tx_ring->size,
-				  tx_ring->desc, tx_ring->dma);
-		tx_ring->desc = NULL;
+	root = btrfs_alloc_dummy_root();
+	if (IS_ERR(root)) {
+		test_msg("Couldn't allocate root\n");
+		goto out;
 	}
+
+	root->fs_info = btrfs_alloc_dummy_fs_info();
+	if (!root->fs_info) {
+		test_msg("Couldn't allocate dummy fs info\n");
+		goto out;
+	}
+
+	root->node = alloc_dummy_extent_buffer(NULL, 4096);
+	if (!root->node) {
+		test_msg("Couldn't allocate dummy buffer\n");
+		goto out;
+	}
+
+	extent_buffer_get(root->node);
+	btrfs_set_header_nritems(root->node, 0);
+	btrfs_set_header_level(root->node, 0);
+	BTRFS_I(inode)->root = root;
+	ret = -EINVAL;
+
+	/*
+	 * Need a blank inode item here just so we don't confuse
+	 * btrfs_get_extent.
+	 */
+	insert_inode_item_key(root);
+	insert_extent(root, 4096, 4096, 4096, 0, 4096, 4096,
+		      BTRFS_FILE_EXTENT_REG, 0, 1);
+	em = btrfs_get_extent(inode, NULL, 0, 0, 8192, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != EXTENT_MAP_HOLE) {
+		test_msg("Expected a hole, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != 0 || em->len != 4096) {
+		test_msg("Unexpected extent wanted start 0 len 4096, got start "
+			 "%llu len %llu\n", em->start, em->len);
+		goto out;
+	}
+	if (em->flags != vacancy_only) {
+		test_msg("Wrong flags, wanted %lu, have %lu\n", vacancy_only,
+			 em->flags);
+		goto out;
+	}
+	free_extent_map(em);
+
+	em = btrfs_get_extent(inode, NULL, 0, 4096, 8192, 0);
+	if (IS_ERR(em)) {
+		test_msg("Got an error when we shouldn't have\n");
+		goto out;
+	}
+	if (em->block_start != 4096) {
+		test_msg("Expected a real extent, got %llu\n", em->block_start);
+		goto out;
+	}
+	if (em->start != 4096 || em->len != 4096) {
+		test_msg("Unexpected extent wanted start 4096 len 4096, got "
+			 "start %llu len %llu\n", em->start, em->len);
+		goto out;
+	}
+	if (em->flags != 0) {
+		test_msg("Unexpected flags set, wanted 0 got %lu\n",
+			 em->flags);
+		goto out;
+	}
+	ret = 0;
+out:
+	if (!IS_ERR(em))
+		free_extent_map(em);
+	iput(inode);
+	btrfs_free_dummy_root(root);
+	return ret;
 }
 
-/**
- * i40e_get_tx_pending - how many tx descriptors not processed
- * @tx_ring: the ring of descriptors
- *
- * Since there is no access to the ring head register
- * in XL710, we need to use our local copies
- **/
-u32 i40e_get_tx_pending(struct i40e_ring *ring)
+static int test_extent_accounting(void)
 {
-	u32 head, tail;
+	struct inode *inode = NULL;
+	struct btrfs_root *root = NULL;
+	int ret = -ENOMEM;
 
-	head = i40e_get_head(ring);
-	tail = readl(ring->tail);
+	inode = btrfs_new_test_inode();
+	if (!inode) {
+		test_msg("Couldn't allocate inode\n");
+		return ret;
+	}
 
-	if (head != tail)
-		return (head < tail) ?
-			tail - head : (tail + ring->count - head);
+	root = btrfs_alloc_dummy_root();
+	if (IS_ERR(root)) {
+		test_msg("Couldn't allocate root\n");
+		goto out;
+	}
+
+	root->fs_info = btrfs_alloc_dummy_fs_info();
+	if (!root->fs_info) {
+		test_msg("Couldn't allocate dummy fs info\n");
+		goto out;
+	}
+
+	BTRFS_I(inode)->root = root;
+	btrfs_test_inode_set_ops(inode);
+
+	/* [BTRFS_MAX_EXTENT_SIZE] */
+	BTRFS_I(inode)->outstanding_extents++;
+	ret = btrfs_set_extent_delalloc(inode, 0, BTRFS_MAX_EXTENT_SIZE - 1,
+					NULL);
+	if (ret) {
+		test_msg("btrfs_set_extent_delalloc returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents != 1) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 1, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+
+	/* [BTRFS_MAX_EXTENT_SIZE][4k] */
+	BTRFS_I(inode)->outstanding_extents++;
+	ret = btrfs_set_extent_delalloc(inode, BTRFS_MAX_EXTENT_SIZE,
+					BTRFS_MAX_EXTENT_SIZE + 4095, NULL);
+	if (ret) {
+		test_msg("btrfs_set_extent_delalloc returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents != 2) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 2, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+
+	/* [BTRFS_MAX_EXTENT_SIZE/2][4K HOLE][the rest] */
+	ret = clear_extent_bit(&BTRFS_I(inode)->io_tree,
+			       BTRFS_MAX_EXTENT_SIZE >> 1,
+			       (BTRFS_MAX_EXTENT_SIZE >> 1) + 4095,
+			       EXTENT_DELALLOC | EXTENT_DIRTY |
+			       EXTENT_UPTODATE | EXTENT_DO_ACCOUNTING, 0, 0,
+			       NULL, GFP_NOFS);
+	if (ret) {
+		test_msg("clear_extent_bit returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents != 2) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 2, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+
+	/* [BTRFS_MAX_EXTENT_SIZE][4K] */
+	BTRFS_I(inode)->outstanding_extents++;
+	ret = btrfs_set_extent_delalloc(inode, BTRFS_MAX_EXTENT_SIZE >> 1,
+					(BTRFS_MAX_EXTENT_SIZE >> 1) + 4095,
+					NULL);
+	if (ret) {
+		test_msg("btrfs_set_extent_delalloc returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents != 2) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 2, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+
+	/*
+	 * [BTRFS_MAX_EXTENT_SIZE+4K][4K HOLE][BTRFS_MAX_EXTENT_SIZE+4K]
+	 *
+	 * I'm artificially adding 2 to outstanding_extents because in the
+	 * buffered IO case we'd add things up as we go, but I don't feel like
+	 * doing that here, this isn't the interesting case we want to test.
+	 */
+	BTRFS_I(inode)->outstanding_extents += 2;
+	ret = btrfs_set_extent_delalloc(inode, BTRFS_MAX_EXTENT_SIZE + 8192,
+					(BTRFS_MAX_EXTENT_SIZE << 1) + 12287,
+					NULL);
+	if (ret) {
+		test_msg("btrfs_set_extent_delalloc returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents != 4) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 4, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+
+	/* [BTRFS_MAX_EXTENT_SIZE+4k][4k][BTRFS_MAX_EXTENT_SIZE+4k] */
+	BTRFS_I(inode)->outstanding_extents++;
+	ret = btrfs_set_extent_delalloc(inode, BTRFS_MAX_EXTENT_SIZE+4096,
+					BTRFS_MAX_EXTENT_SIZE+8191, NULL);
+	if (ret) {
+		test_msg("btrfs_set_extent_delalloc returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents != 3) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 3, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+
+	/* [BTRFS_MAX_EXTENT_SIZE+4k][4K HOLE][BTRFS_MAX_EXTENT_SIZE+4k] */
+	ret = clear_extent_bit(&BTRFS_I(inode)->io_tree,
+			       BTRFS_MAX_EXTENT_SIZE+4096,
+			       BTRFS_MAX_EXTENT_SIZE+8191,
+			       EXTENT_DIRTY | EXTENT_DELALLOC |
+			       EXTENT_DO_ACCOUNTING | EXTENT_UPTODATE, 0, 0,
+			       NULL, GFP_NOFS);
+	if (ret) {
+		test_msg("clear_extent_bit returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents != 4) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 4, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+
+	/*
+	 * Refill the hole again just for good measure, because I thought it
+	 * might fail and I'd rather satisfy my paranoia at this point.
+	 */
+	BTRFS_I(inode)->outstanding_extents++;
+	ret = btrfs_set_extent_delalloc(inode, BTRFS_MAX_EXTENT_SIZE+4096,
+					BTRFS_MAX_EXTENT_SIZE+8191, NULL);
+	if (ret) {
+		test_msg("btrfs_set_extent_delalloc returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents != 3) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 3, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+
+	/* Empty */
+	ret = clear_extent_bit(&BTRFS_I(inode)->io_tree, 0, (u64)-1,
+			       EXTENT_DIRTY | EXTENT_DELALLOC |
+			       EXTENT_DO_ACCOUNTING | EXTENT_UPTODATE, 0, 0,
+			       NULL, GFP_NOFS);
+	if (ret) {
+		test_msg("clear_extent_bit returned %d\n", ret);
+		goto out;
+	}
+	if (BTRFS_I(inode)->outstanding_extents) {
+		ret = -EINVAL;
+		test_msg("Miscount, wanted 0, got %u\n",
+			 BTRFS_I(inode)->outstanding_extents);
+		goto out;
+	}
+	ret = 0;
+out:
+	if (ret)
+		clear_extent_bit(&BTRFS_I(inode)->io_tree, 0, (u64)-1,
+				 EXTENT_DIRTY | EXTENT_DELALLOC |
+				 EXTENT_DO_ACCOUNTING | EXTENT_UPTODATE, 0, 0,
+				 NULL, GFP_NOFS);
+	iput(inode);
+	btrfs_free_dummy_root(root);
+	return ret;
+}
+
+int btrfs_test_inodes(void)
+{
+	int ret;
+
+	set_bit(EXTENT_FLAG_COMPRESSED, &compressed_only);
+	set_bit(EXTENT_FLAG_VACANCY, &vacancy_only);
+	set_bit(EXTENT_FLAG_PREALLOC, &prealloc_only);
+
+	test_msg("Running btrfs_get_extent tests\n");
+	ret = test_btrfs_get_extent();
+	if (ret)
+		return ret;
+	test_msg("Running hole first btrfs_get_extent test\n");
+	ret = test_hole_first();
+	if (ret)
+		return ret;
+	test_msg("Running outstanding_extents tests\n");
+	return test_extent_accounting();
+}
+                                                                                                                                                                                                                                                                              /*
+ * Copyright (C) 2013 Facebook.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include "btrfs-tests.h"
+#include "../ctree.h"
+#include "../transaction.h"
+#include "../disk-io.h"
+#include "../qgroup.h"
+#include "../backref.h"
+
+static void init_dummy_trans(struct btrfs_trans_handle *trans)
+{
+	memset(trans, 0, sizeof(*trans));
+	trans->transid = 1;
+	INIT_LIST_HEAD(&trans->qgroup_ref_list);
+	trans->type = __TRANS_DUMMY;
+}
+
+static int insert_normal_tree_ref(struct btrfs_root *root, u64 bytenr,
+				  u64 num_bytes, u64 parent, u64 root_objectid)
+{
+	struct btrfs_trans_handle trans;
+	struct btrfs_extent_item *item;
+	struct btrfs_extent_inline_ref *iref;
+	struct btrfs_tree_block_info *block_info;
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_key ins;
+	u32 size = sizeof(*item) + sizeof(*iref) + sizeof(*block_info);
+	int ret;
+
+	init_dummy_trans(&trans);
+
+	ins.objectid = bytenr;
+	ins.type = BTRFS_EXTENT_ITEM_KEY;
+	ins.offset = num_bytes;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		test_msg("Couldn't allocate path\n");
+		return -ENOMEM;
+	}
+
+	path->leave_spinning = 1;
+	ret = btrfs_insert_empty_item(&trans, root, path, &ins, size);
+	if (ret) {
+		test_msg("Couldn't insert ref %d\n", ret);
+		btrfs_free_path(path);
+		return ret;
+	}
+
+	leaf = path->nodes[0];
+	item = btrfs_item_ptr(leaf, path->slots[0], struct btrfs_extent_item);
+	btrfs_set_extent_refs(leaf, item, 1);
+	btrfs_set_extent_generation(leaf, item, 1);
+	btrfs_set_extent_flags(leaf, item, BTRFS_EXTENT_FLAG_TREE_BLOCK);
+	block_info = (struct btrfs_tree_block_info *)(item + 1);
+	btrfs_set_tree_block_level(leaf, block_info, 0);
+	iref = (struct btrfs_extent_inline_ref *)(block_info + 1);
+	if (parent > 0) {
+		btrfs_set_extent_inline_ref_type(leaf, iref,
+						 BTRFS_SHARED_BLOCK_REF_KEY);
+		btrfs_set_extent_inline_ref_offset(leaf, iref, parent);
+	} else {
+		btrfs_set_extent_inline_ref_type(leaf, iref, BTRFS_TREE_BLOCK_REF_KEY);
+		btrfs_set_extent_inline_ref_offset(leaf, iref, root_objectid);
+	}
+	btrfs_free_path(path);
+	return 0;
+}
+
+static int add_tree_ref(struct btrfs_root *root, u64 bytenr, u64 num_bytes,
+			u64 parent, u64 root_objectid)
+{
+	struct btrfs_trans_handle trans;
+	struct btrfs_extent_item *item;
+	struct btrfs_path *path;
+	struct btrfs_key key;
+	u64 refs;
+	int ret;
+
+	init_dummy_trans(&trans);
+
+	key.objectid = bytenr;
+	key.type = BTRFS_EXTENT_ITEM_KEY;
+	key.offset = num_bytes;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		test_msg("Couldn't allocate path\n");
+		return -ENOMEM;
+	}
+
+	path->leave_spinning = 1;
+	ret = btrfs_search_slot(&trans, root, &key, path, 0, 1);
+	if (ret) {
+		test_msg("Couldn't find extent ref\n");
+		btrfs_free_path(path);
+		return ret;
+	}
+
+	item = btrfs_item_ptr(path->nodes[0], path->slots[0],
+			      struct btrfs_extent_item);
+	refs = btrfs_extent_refs(path->nodes[0], item);
+	btrfs_set_extent_refs(path->nodes[0], item, refs + 1);
+	btrfs_release_path(path);
+
+	key.objectid = bytenr;
+	if (parent) {
+		key.type = BTRFS_SHARED_BLOCK_REF_KEY;
+		key.offset = parent;
+	} else {
+		key.type = BTRFS_TREE_BLOCK_REF_KEY;
+		key.offset = root_objectid;
+	}
+
+	ret = btrfs_insert_empty_item(&trans, root, path, &key, 0);
+	if (ret)
+		test_msg("Failed to insert backref\n");
+	btrfs_free_path(path);
+	return ret;
+}
+
+static int remove_extent_item(struct btrfs_root *root, u64 bytenr,
+			      u64 num_bytes)
+{
+	struct btrfs_trans_handle trans;
+	struct btrfs_key key;
+	struct btrfs_path *path;
+	int ret;
+
+	init_dummy_trans(&trans);
+
+	key.objectid = bytenr;
+	key.type = BTRFS_EXTENT_ITEM_KEY;
+	key.offset = num_bytes;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		test_msg("Couldn't allocate path\n");
+		return -ENOMEM;
+	}
+	path->leave_spinning = 1;
+
+	ret = btrfs_search_slot(&trans, root, &key, path, -1, 1);
+	if (ret) {
+		test_msg("Didn't find our key %d\n", ret);
+		btrfs_free_path(path);
+		return ret;
+	}
+	btrfs_del_item(&trans, root, path);
+	btrfs_free_path(path);
+	return 0;
+}
+
+static int remove_extent_ref(struct btrfs_root *root, u64 bytenr,
+			     u64 num_bytes, u64 parent, u64 root_objectid)
+{
+	struct btrfs_trans_handle trans;
+	struct btrfs_extent_item *item;
+	struct btrfs_path *path;
+	struct btrfs_key key;
+	u64 refs;
+	int ret;
+
+	init_dummy_trans(&trans);
+
+	key.objectid = bytenr;
+	key.type = BTRFS_EXTENT_ITEM_KEY;
+	key.offset = num_bytes;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		test_msg("Couldn't allocate path\n");
+		return -ENOMEM;
+	}
+
+	path->leave_spinning = 1;
+	ret = btrfs_search_slot(&trans, root, &key, path, 0, 1);
+	if (ret) {
+		test_msg("Couldn't find extent ref\n");
+		btrfs_free_path(path);
+		return ret;
+	}
+
+	item = btrfs_item_ptr(path->nodes[0], path->slots[0],
+			      struct btrfs_extent_item);
+	refs = btrfs_extent_refs(path->nodes[0], item);
+	btrfs_set_extent_refs(path->nodes[0], item, refs - 1);
+	btrfs_release_path(path);
+
+	key.objectid = bytenr;
+	if (parent) {
+		key.type = BTRFS_SHARED_BLOCK_REF_KEY;
+		key.offset = parent;
+	} else {
+		key.type = BTRFS_TREE_BLOCK_REF_KEY;
+		key.offset = root_objectid;
+	}
+
+	ret = btrfs_search_slot(&trans, root, &key, path, -1, 1);
+	if (ret) {
+		test_msg("Couldn't find backref %d\n", ret);
+		btrfs_free_path(path);
+		return ret;
+	}
+	btrfs_del_item(&trans, root, path);
+	btrfs_free_path(path);
+	return ret;
+}
+
+static int test_no_shared_qgroup(struct btrfs_root *root)
+{
+	struct btrfs_trans_handle trans;
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct ulist *old_roots = NULL;
+	struct ulist *new_roots = NULL;
+	int ret;
+
+	init_dummy_trans(&trans);
+
+	test_msg("Qgroup basic add\n");
+	ret = btrfs_create_qgroup(NULL, fs_info, 5);
+	if (ret) {
+		test_msg("Couldn't create a qgroup %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Since the test trans doesn't havee the complicated delayed refs,
+	 * we can only call btrfs_qgroup_account_extent() directly to test
+	 * quota.
+	 */
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &old_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = insert_normal_tree_ref(root, 4096, 4096, 0, 5);
+	if (ret) {
+		ulist_free(old_roots);
+		return ret;
+	}
+
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &new_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		ulist_free(new_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_qgroup_account_extent(&trans, fs_info, 4096, 4096,
+					  old_roots, new_roots);
+	if (ret) {
+		test_msg("Couldn't account space for a qgroup %d\n", ret);
+		return ret;
+	}
+
+	if (btrfs_verify_qgroup_counts(fs_info, 5, 4096, 4096)) {
+		test_msg("Qgroup counts didn't match expected values\n");
+		return -EINVAL;
+	}
+	old_roots = NULL;
+	new_roots = NULL;
+
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &old_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = remove_extent_item(root, 4096, 4096);
+	if (ret) {
+		ulist_free(old_roots);
+		return -EINVAL;
+	}
+
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &new_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		ulist_free(new_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_qgroup_account_extent(&trans, fs_info, 4096, 4096,
+					  old_roots, new_roots);
+	if (ret) {
+		test_msg("Couldn't account space for a qgroup %d\n", ret);
+		return -EINVAL;
+	}
+
+	if (btrfs_verify_qgroup_counts(fs_info, 5, 0, 0)) {
+		test_msg("Qgroup counts didn't match expected values\n");
+		return -EINVAL;
+	}
 
 	return 0;
 }
 
-#define WB_STRIDE 0x3
-
-/**
- * i40e_clean_tx_irq - Reclaim resources after transmit completes
- * @tx_ring:  tx ring to clean
- * @budget:   how many cleans we're allowed
- *
- * Returns true if there's any budget left (e.g. the clean is finished)
- **/
-static bool i40e_clean_tx_irq(struct i40e_ring *tx_ring, int budget)
+/*
+ * Add a ref for two different roots to make sure the shared value comes out
+ * right, also remove one of the roots and make sure the exclusive count is
+ * adjusted properly.
+ */
+static int test_multiple_refs(struct btrfs_root *root)
 {
-	u16 i = tx_ring->next_to_clean;
-	struct i40e_tx_buffer *tx_buf;
-	struct i40e_tx_desc *tx_head;
-	struct i40e_tx_desc *tx_desc;
-	unsigned int total_packets = 0;
-	unsigned int total_bytes = 0;
+	struct btrfs_trans_handle trans;
+	struct btrfs_fs_info *fs_info = root->fs_info;
+	struct ulist *old_roots = NULL;
+	struct ulist *new_roots = NULL;
+	int ret;
 
-	tx_buf = &tx_ring->tx_bi[i];
-	tx_desc = I40E_TX_DESC(tx_ring, i);
-	i -= tx_ring->count;
+	init_dummy_trans(&trans);
 
-	tx_head = I40E_TX_DESC(tx_ring, i40e_get_head(tx_ring));
+	test_msg("Qgroup multiple refs test\n");
 
-	do {
-		struct i40e_tx_desc *eop_desc = tx_buf->next_to_watch;
-
-		/* if next_to_watch is not set then there is no work pending */
-		if (!eop_desc)
-			break;
-
-		/* prevent any other reads prior to eop_desc */
-		smp_rmb();
-
-		/* we have caught up to head, no work left to do */
-		if (tx_head == tx_desc)
-			break;
-
-		/* clear next_to_watch to prevent false hangs */
-		tx_buf->next_to_watch = NULL;
-
-		/* update the statistics for this packet */
-		total_bytes += tx_buf->bytecount;
-		total_packets += tx_buf->gso_segs;
-
-		/* free the skb */
-		dev_consume_skb_any(tx_buf->skb);
-
-		/* unmap skb header data */
-		dma_unmap_single(tx_ring->dev,
-				 dma_unmap_addr(tx_buf, dma),
-				 dma_unmap_len(tx_buf, len),
-				 DMA_TO_DEVICE);
-
-		/* clear tx_buffer data */
-		tx_buf->skb = NULL;
-		dma_unmap_len_set(tx_buf, len, 0);
-
-		/* unmap remaining buffers */
-		while (tx_desc != eop_desc) {
-
-			tx_buf++;
-			tx_desc++;
-			i++;
-			if (unlikely(!i)) {
-				i -= tx_ring->count;
-				tx_buf = tx_ring->tx_bi;
-				tx_desc = I40E_TX_DESC(tx_ring, 0);
-			}
-
-			/* unmap any remaining paged data */
-			if (dma_unmap_len(tx_buf, len)) {
-				dma_unmap_page(tx_ring->dev,
-					       dma_unmap_addr(tx_buf, dma),
-					       dma_unmap_len(tx_buf, len),
-					       DMA_TO_DEVICE);
-				dma_unmap_len_set(tx_buf, len, 0);
-			}
-		}
-
-		/* move us one more past the eop_desc for start of next pkt */
-		tx_buf++;
-		tx_desc++;
-		i++;
-		if (unlikely(!i)) {
-			i -= tx_ring->count;
-			tx_buf = tx_ring->tx_bi;
-			tx_desc = I40E_TX_DESC(tx_ring, 0);
-		}
-
-		prefetch(tx_desc);
-
-		/* update budget accounting */
-		budget--;
-	} while (likely(budget));
-
-	i += tx_ring->count;
-	tx_ring->next_to_clean = i;
-	u64_stats_update_begin(&tx_ring->syncp);
-	tx_ring->stats.bytes += total_bytes;
-	tx_ring->stats.packets += total_packets;
-	u64_stats_update_end(&tx_ring->syncp);
-	tx_ring->q_vector->tx.total_bytes += total_bytes;
-	tx_ring->q_vector->tx.total_packets += total_packets;
-
-	if (tx_ring->flags & I40E_TXR_FLAGS_WB_ON_ITR) {
-		unsigned int j = 0;
-
-		/* check to see if there are < 4 descriptors
-		 * waiting to be written back, then kick the hardware to force
-		 * them to be written back in case we stay in NAPI.
-		 * In this mode on X722 we do not enable Interrupt.
-		 */
-		j = i40e_get_tx_pending(tx_ring);
-
-		if (budget &&
-		    ((j / (WB_STRIDE + 1)) == 0) && (j != 0) &&
-		    !test_bit(__I40E_DOWN, &tx_ring->vsi->state) &&
-		    (I40E_DESC_UNUSED(tx_ring) != tx_ring->count))
-			tx_ring->arm_wb = true;
+	/* We have 5 created already from the previous test */
+	ret = btrfs_create_qgroup(NULL, fs_info, 256);
+	if (ret) {
+		test_msg("Couldn't create a qgroup %d\n", ret);
+		return ret;
 	}
 
-	netdev_tx_completed_queue(netdev_get_tx_queue(tx_ring->netdev,
-						      tx_ring->queue_index),
-				  total_packets, total_bytes);
-
-#define TX_WAKE_THRESHOLD (DESC_NEEDED * 2)
-	if (unlikely(total_packets && netif_carrier_ok(tx_ring->netdev) &&
-		     (I40E_DESC_UNUSED(tx_ring) >= TX_WAKE_THRESHOLD))) {
-		/* Make sure that anybody stopping the queue after this
-		 * sees the new next_to_clean.
-		 */
-		smp_mb();
-		if (__netif_subqueue_stopped(tx_ring->netdev,
-					     tx_ring->queue_index) &&
-		   !test_bit(__I40E_DOWN, &tx_ring->vsi->state)) {
-			netif_wake_subqueue(tx_ring->netdev,
-					    tx_ring->queue_index);
-			++tx_ring->tx_stats.restart_queue;
-		}
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &old_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
 	}
 
-	return !!budget;
+	ret = insert_normal_tree_ref(root, 4096, 4096, 0, 5);
+	if (ret) {
+		ulist_free(old_roots);
+		return ret;
+	}
+
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &new_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		ulist_free(new_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_qgroup_account_extent(&trans, fs_info, 4096, 4096,
+					  old_roots, new_roots);
+	if (ret) {
+		test_msg("Couldn't account space for a qgroup %d\n", ret);
+		return ret;
+	}
+
+	if (btrfs_verify_qgroup_counts(fs_info, 5, 4096, 4096)) {
+		test_msg("Qgroup counts didn't match expected values\n");
+		return -EINVAL;
+	}
+
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &old_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = add_tree_ref(root, 4096, 4096, 0, 256);
+	if (ret) {
+		ulist_free(old_roots);
+		return ret;
+	}
+
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &new_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		ulist_free(new_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_qgroup_account_extent(&trans, fs_info, 4096, 4096,
+					  old_roots, new_roots);
+	if (ret) {
+		test_msg("Couldn't account space for a qgroup %d\n", ret);
+		return ret;
+	}
+
+	if (btrfs_verify_qgroup_counts(fs_info, 5, 4096, 0)) {
+		test_msg("Qgroup counts didn't match expected values\n");
+		return -EINVAL;
+	}
+
+	if (btrfs_verify_qgroup_counts(fs_info, 256, 4096, 0)) {
+		test_msg("Qgroup counts didn't match expected values\n");
+		return -EINVAL;
+	}
+
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &old_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = remove_extent_ref(root, 4096, 4096, 0, 256);
+	if (ret) {
+		ulist_free(old_roots);
+		return ret;
+	}
+
+	ret = btrfs_find_all_roots(&trans, fs_info, 4096, 0, &new_roots);
+	if (ret) {
+		ulist_free(old_roots);
+		ulist_free(new_roots);
+		test_msg("Couldn't find old roots: %d\n", ret);
+		return ret;
+	}
+
+	ret = btrfs_qgroup_account_extent(&trans, fs_info, 4096, 4096,
+					  old_roots, new_roots);
+	if (ret) {
+		test_msg("Couldn't account space for a qgroup %d\n", ret);
+		return ret;
+	}
+
+	if (btrfs_verify_qgroup_counts(fs_info, 256, 0, 0)) {
+		test_msg("Qgroup counts didn't match expected values\n");
+		return -EINVAL;
+	}
+
+	if (btrfs_verify_qgroup_counts(fs_info, 5, 4096, 4096)) {
+		test_msg("Qgroup counts didn't match expected values\n");
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
-/**
- * i40e_force_wb - Arm hardware to do a wb on noncache aligned descriptors
- * @vsi: the VSI we care about
- * @q_vector: the vector  on which to force writeback
- *
- **/
-void i40e_force_wb(struct i40e_vsi *vsi, struct i40e_q_vector *q_vector)
+int btrfs_test_qgroups(void)
 {
-	u16 flags = q_vector->tx.ring[0].flags;
+	struct btrfs_root *root;
+	struct btrfs_root *tmp_root;
+	int ret = 0;
 
-	if (flags & I40E_TXR_FLAGS_WB_ON_ITR) {
-		u32 val;
-
-		if (q_vector->arm_wb_state)
-			return;
-
-		val = I40E_PFINT_DYN_CTLN_WB_ON_ITR_MASK;
-
-		wr32(&vsi->back->hw,
-		     I40E_PFINT_DYN_CTLN(q_vector->v_idx +
-					 vsi->base_vector - 1),
-		     val);
-		q_vector->arm_wb_state = true;
-	} else if (vsi->back->flags & I40E_FLAG_MSIX_ENABLED) {
-		u32 val = I40E_PFINT_DYN_CTLN_INTENA_MASK |
-			  I40E_PFINT_DYN_CTLN_ITR_INDX_MASK | /* set noitr */
-			  I40E_PFINT_DYN_CTLN_SWINT_TRIG_MASK |
-			  I40E_PFINT_DYN_CTLN_SW_ITR_INDX_ENA_MASK;
-			  /* allow 00 to be written to the index */
-
-		wr32(&vsi->back->hw,
-		     I40E_PFINT_DYN_CTLN(q_vector->v_idx +
-					 vsi->base_vector - 1), val);
-	} else {
-		u32 val = I40E_PFINT_DYN_CTL0_INTENA_MASK |
-			  I40E_PFINT_DYN_CTL0_ITR_INDX_MASK | /* set noitr */
-			  I40E_PFINT_DYN_CTL0_SWINT_TRIG_MASK |
-			  I40E_PFINT_DYN_CTL0_SW_ITR_INDX_ENA_MASK;
-			/* allow 00 to be written to the index */
-
-		wr32(&vsi->back->hw, I40E_PFINT_DYN_CTL0, val);
+	root = btrfs_alloc_dummy_root();
+	if (IS_ERR(root)) {
+		test_msg("Couldn't allocate root\n");
+		return PTR_ERR(root);
 	}
-}
 
-/**
- * i40e_set_new_dynamic_itr - Find new ITR level
- * @rc: structure containing ring performance data
- *
- * Returns true if ITR changed, false if not
- *
- * Stores a new ITR value based on packets and byte counts during
- * the last interrupt.  The advantage of per interrupt computation
- * is faster updates and more accurate ITR for the current traffic
- * pattern.  Constants in this function were computed based on
- * theoretical maximum wire speed and thresholds were set based on
- * testing data as well as attempting to minimize response time
- * while increasing bulk throughput.
- **/
-static bool i40e_set_new_dynamic_itr(struct i40e_ring_container *rc)
-{
-	enum i40e_latency_range new_latency_range = rc->latency_range;
-	struct i40e_q_vector *qv = rc->ring->q_vector;
-	u32 new_itr = rc->itr;
-	int bytes_per_int;
-	int usecs;
+	root->fs_info = btrfs_alloc_dummy_fs_info();
+	if (!root->fs_info) {
+		test_msg("Couldn't allocate dummy fs info\n");
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* We are using this root as our extent root */
+	root->fs_info->extent_root = root;
 
-	if (rc->total_packets == 0 || !rc->itr)
-		return false;
-
-	/* simple throttlerate management
-	 *   0-10MB/s   lowest (50000 ints/s)
-	 *  10-20MB/s   low    (20000 ints/s)
-	 *  20-1249MB/s bulk   (18000 ints/s)
-	 *  > 40000 Rx packets per second (8000 ints/s)
-	 *
-	 * The math works out because the divisor is in 10^(-6) which
-	 * turns the bytes/us input value into MB/s values, but
-	 * make sure to use usecs, as the register values written
-	 * are in 2 usec increments in the ITR registers, and make sure
-	 * to use the smoothed values that the countdown timer gives us.
+	/*
+	 * Some of the paths we test assume we have a filled out fs_info, so we
+	 * just need to add the root in there so we don't panic.
 	 */
-	usecs = (rc->itr << 1) * ITR_COUNTDOWN_START;
-	bytes_per_int = rc->total_bytes / usecs;
+	root->fs_info->tree_root = root;
+	root->fs_info->quota_root = root;
+	root->fs_info->quota_enabled = 1;
 
-	switch (new_latency_range) {
-	case I40E_LOWEST_LATENCY:
-		if (bytes_per_int > 10)
-			new_latency_range = I40E_LOW_LATENCY;
-		break;
-	case I40E_LOW_LATENCY:
-		if (bytes_per_int > 20)
-			new_latency_range = I40E_BULK_LATENCY;
-		else if (bytes_per_int <= 10)
-			new_latency_range = I40E_LOWEST_LATENCY;
-		break;
-	case I40E_BULK_LATENCY:
-	case I40E_ULTRA_LATENCY:
-	default:
-		if (bytes_per_int <= 20)
-			new_latency_range = I40E_LOW_LATENCY;
-		break;
-	}
-
-	/* this is to adjust RX more aggressively when streaming small
-	 * packets.  The value of 40000 was picked as it is just beyond
-	 * what the hardware can receive per second if in low latency
-	 * mode.
+	/*
+	 * Can't use bytenr 0, some things freak out
+	 * *cough*backref walking code*cough*
 	 */
-#define RX_ULTRA_PACKET_RATE 40000
+	root->node = alloc_test_extent_buffer(root->fs_info, 4096);
+	if (IS_ERR(root->node)) {
+		test_msg("Couldn't allocate dummy buffer\n");
+		ret = PTR_ERR(root->node);
+		goto out;
+	}
+	btrfs_set_header_level(root->node, 0);
+	btrfs_set_header_nritems(root->node, 0);
+	root->alloc_bytenr += 8192;
 
-	if ((((rc->total_packets * 1000000) / usecs) > RX_ULTRA_PACKET_RATE) &&
-	    (&qv->rx == rc))
-		new_latency_range = I40E_ULTRA_LATENCY;
-
-	rc->latency_range = new_latency_range;
-
-	switch (new_latency_range) {
-	case I40E_LOWEST_LATENCY:
-		new_itr = I40E_ITR_50K;
-		break;
-	case I40E_LOW_LATENCY:
-		new_itr = I40E_ITR_20K;
-		break;
-	case I40E_BULK_LATENCY:
-		new_itr = I40E_ITR_18K;
-		break;
-	case I40E_ULTRA_LATENCY:
-		new_itr = I40E_ITR_8K;
-		break;
-	default:
-		break;
+	tmp_root = btrfs_alloc_dummy_root();
+	if (IS_ERR(tmp_root)) {
+		test_msg("Couldn't allocate a fs root\n");
+		ret = PTR_ERR(tmp_root);
+		goto out;
 	}
 
-	rc->total_bytes = 0;
-	rc->total_packets = 0;
-
-	if (new_itr != rc->itr) {
-		rc->itr = new_itr;
-		return true;
+	tmp_root->root_key.objectid = 5;
+	root->fs_info->fs_root = tmp_root;
+	ret = btrfs_insert_fs_root(root->fs_info, tmp_root);
+	if (ret) {
+		test_msg("Couldn't insert fs root %d\n", ret);
+		goto out;
 	}
 
-	return false;
+	tmp_root = btrfs_alloc_dummy_root();
+	if (IS_ERR(tmp_root)) {
+		test_msg("Couldn't allocate a fs root\n");
+		ret = PTR_ERR(tmp_root);
+		goto out;
+	}
+
+	tmp_root->root_key.objectid = 256;
+	ret = btrfs_insert_fs_root(root->fs_info, tmp_root);
+	if (ret) {
+		test_msg("Couldn't insert fs root %d\n", ret);
+		goto out;
+	}
+
+	test_msg("Running qgroup tests\n");
+	ret = test_no_shared_qgroup(root);
+	if (ret)
+		goto out;
+	ret = test_multiple_refs(root);
+out:
+	btrfs_free_dummy_root(root);
+	return ret;
+}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * Copyright (C) 2007 Oracle.  All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License v2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this program; if not, write to the
+ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 021110-1307, USA.
+ */
+
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/sched.h>
+#include <linux/writeback.h>
+#include <linux/pagemap.h>
+#include <linux/blkdev.h>
+#include <linux/uuid.h>
+#include "ctree.h"
+#include "disk-io.h"
+#include "transaction.h"
+#include "locking.h"
+#include "tree-log.h"
+#include "inode-map.h"
+#include "volumes.h"
+#include "dev-replace.h"
+#include "qgroup.h"
+
+#define BTRFS_ROOT_TRANS_TAG 0
+
+static const unsigned int btrfs_blocked_trans_types[TRANS_STATE_MAX] = {
+	[TRANS_STATE_RUNNING]		= 0U,
+	[TRANS_STATE_BLOCKED]		= (__TRANS_USERSPACE |
+					   __TRANS_START),
+	[TRANS_STATE_COMMIT_START]	= (__TRANS_USERSPACE |
+					   __TRANS_START |
+					   __TRANS_ATTACH),
+	[TRANS_STATE_COMMIT_DOING]	= (__TRANS_USERSPACE |
+					   __TRANS_START |
+					   __TRANS_ATTACH |
+					   __TRANS_JOIN),
+	[TRANS_STATE_UNBLOCKED]		= (__TRANS_USERSPACE |
+					   __TRANS_START |
+					   __TRANS_ATTACH |
+					   __TRANS_JOIN |
+					   __TRANS_JOIN_NOLOCK),
+	[TRANS_STATE_COMPLETED]		= (__TRANS_USERSPACE |
+					   __TRANS_START |
+					   __TRANS_ATTACH |
+					   __TRANS_JOIN |
+					   __TRANS_JOIN_NOLOCK),
+};
+
+void btrfs_put_transaction(struct btrfs_transaction *transaction)
+{
+	WARN_ON(atomic_read(&transaction->use_count) == 0);
+	if (atomic_dec_and_test(&transaction->use_count)) {
+		BUG_ON(!list_empty(&transaction->list));
+		WARN_ON(!RB_EMPTY_ROOT(&transaction->delayed_refs.href_root));
+		if (transaction->delayed_refs.pending_csums)
+			printk(KERN_ERR "pending csums is %llu\n",
+			       transaction->delayed_refs.pending_csums);
+		while (!list_empty(&transaction->pending_chunks)) {
+			struct extent_map *em;
+
+			em = list_first_entry(&transaction->pending_chunks,
+					      struct extent_map, list);
+			list_del_init(&em->list);
+			free_extent_map(em);
+		}
+		kmem_cache_free(btrfs_transaction_cachep, transaction);
+	}
 }
 
-/**
- * i40e_clean_programming_status - clean the programming status descriptor
- * @rx_ring: the rx ring that has this descriptor
- * @rx_desc: the rx descriptor written back by HW
- *
- * Flow director should handle FD_FILTER_STATUS to check its filter programming
- * status being successful or not and take actions accordingly. FCoE should
- * handle its context/filter programming/invalidation status and take actions.
- *
- **/
-static void i40e_clean_programming_status(struct i40e_ring *rx_ring,
-					  union i40e_rx_desc *rx_desc)
+static void clear_btree_io_tree(struct extent_io_tree *tree)
 {
-	u64 qw;
-	u8 id;
+	spin_lock(&tree->lock);
+	/*
+	 * Do a single barrier for the waitqueue_active check here, the state
+	 * of the waitqueue should not change once clear_btree_io_tree is
+	 * called.
+	 */
+	smp_mb();
+	while (!RB_EMPTY_ROOT(&tree->state)) {
+		struct rb_node *node;
+		struct extent_state *state;
 
-	qw = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
-	id = (qw & I40E_RX_PROG_STATUS_DESC_QW1_PROGID_MASK) >>
-		  I40E_RX_PROG_STATUS_DESC_QW1_PROGID_SHIFT;
+		node = rb_first(&tree->state);
+		state = rb_entry(node, struct extent_state, rb_node);
+		rb_erase(&state->rb_node, &tree->state);
+		RB_CLEAR_NODE(&state->rb_node);
+		/*
+		 * btree io trees aren't supposed to have tasks waiting for
+		 * changes in the flags of extent states ever.
+		 */
+		ASSERT(!waitqueue_active(&state->wq));
+		free_extent_state(state);
 
-	if (id == I40E_RX_PROG_STATUS_DESC_FD_FILTER_STATUS)
-		i40e_fd_handle_status(rx_ring, rx_desc, id);
-#ifdef I40E_FCOE
-	else if ((id == I40E_RX_PROG_STATUS_DESC_FCOE_CTXT_PROG_STATUS) ||
-		 (id == I40E_RX_PROG_STATUS_DESC_FCOE_CTXT_INVL_STATUS))
-		i40e_fcoe_handle_status(rx_ring, rx_desc, id);
-#endif
+		cond_resched_lock(&tree->lock);
+	}
+	spin_unlock(&tree->lock);
 }
 
-/**
- * i40e_setup_tx_descriptors - Allocate the Tx descriptors
- * @tx_ring: the tx ring to set up
- *
- * Return 0 on success, negative on error
- **/
-int i40e_setup_tx_descriptors(struct i40e_ring *tx_ring)
+static noinline void switch_commit_roots(struct btrfs_transaction *trans,
+					 struct btrfs_fs_info *fs_info)
 {
-	struct device *dev = tx_ring->dev;
-	int bi_size;
+	struct btrfs_root *root, *tmp;
 
-	if (!dev)
+	down_write(&fs_info->commit_root_sem);
+	list_for_each_entry_safe(root, tmp, &trans->switch_commits,
+				 dirty_list) {
+		list_del_init(&root->dirty_list);
+		free_extent_buffer(root->commit_root);
+		root->commit_root = btrfs_root_node(root);
+		if (is_fstree(root->objectid))
+			btrfs_unpin_free_ino(root);
+		clear_btree_io_tree(&root->dirty_log_pages);
+	}
+
+	/* We can free old roots now. */
+	spin_lock(&trans->dropped_roots_lock);
+	while (!list_empty(&trans->dropped_roots)) {
+		root = list_first_entry(&trans->dropped_roots,
+					struct btrfs_root, root_list);
+		list_del_init(&root->root_list);
+		spin_unlock(&trans->dropped_roots_lock);
+		btrfs_drop_and_free_fs_root(fs_info, root);
+		spin_lock(&trans->dropped_roots_lock);
+	}
+	spin_unlock(&trans->dropped_roots_lock);
+	up_write(&fs_info->commit_root_sem);
+}
+
+static inline void extwriter_counter_inc(struct btrfs_transaction *trans,
+					 unsigned int type)
+{
+	if (type & TRANS_EXTWRITERS)
+		atomic_inc(&trans->num_extwriters);
+}
+
+static inline void extwriter_counter_dec(struct btrfs_transaction *trans,
+					 unsigned int type)
+{
+	if (type & TRANS_EXTWRITERS)
+		atomic_dec(&trans->num_extwriters);
+}
+
+static inline void extwriter_counter_init(struct btrfs_transaction *trans,
+					  unsigned int type)
+{
+	atomic_set(&trans->num_extwriters, ((type & TRANS_EXTWRITERS) ? 1 : 0));
+}
+
+static inline int extwriter_counter_read(struct btrfs_transaction *trans)
+{
+	return atomic_read(&trans->num_extwriters);
+}
+
+/*
+ * either allocate a new transaction or hop into the existing one
+ */
+static noinline int join_transaction(struct btrfs_root *root, unsigned int type)
+{
+	struct btrfs_transaction *cur_trans;
+	struct btrfs_fs_info *fs_info = root->fs_info;
+
+	spin_lock(&fs_info->trans_lock);
+loop:
+	/* The file system has been taken offline. No new transactions. */
+	if (test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state)) {
+		spin_unlock(&fs_info->trans_lock);
+		return -EROFS;
+	}
+
+	cur_trans = fs_info->running_transaction;
+	if (cur_trans) {
+		if (cur_trans->aborted) {
+			spin_unlock(&fs_info->trans_lock);
+			return cur_trans->aborted;
+		}
+		if (btrfs_blocked_trans_types[cur_trans->state] & type) {
+			spin_unlock(&fs_info->trans_lock);
+			return -EBUSY;
+		}
+		atomic_inc(&cur_trans->use_count);
+		atomic_inc(&cur_trans->num_writers);
+		extwriter_counter_inc(cur_trans, type);
+		spin_unlock(&fs_info->trans_lock);
+		return 0;
+	}
+	spin_unlock(&fs_info->trans_lock);
+
+	/*
+	 * If we are ATTACH, we just want to catch the current transaction,
+	 * and commit it. If there is no transaction, just return ENOENT.
+	 */
+	if (type == TRANS_ATTACH)
+		return -ENOENT;
+
+	/*
+	 * JOIN_NOLOCK only happens during the transaction commit, so
+	 * it is impossible that ->running_transaction is NULL
+	 */
+	BUG_ON(type == TRANS_JOIN_NOLOCK);
+
+	cur_trans = kmem_cache_alloc(btrfs_transaction_cachep, GFP_NOFS);
+	if (!cur_trans)
 		return -ENOMEM;
 
-	/* warn if we are about to overwrite the pointer */
-	WARN_ON(tx_ring->tx_bi);
-	bi_size = sizeof(struct i40e_tx_buffer) * tx_ring->count;
-	tx_ring->tx_bi = kzalloc(bi_size, GFP_KERNEL);
-	if (!tx_ring->tx_bi)
-		goto err;
+	spin_lock(&fs_info->trans_lock);
+	if (fs_info->running_transaction) {
+		/*
+		 * someone started a transaction after we unlocked.  Make sure
+		 * to redo the checks above
+		 */
+		kmem_cache_free(btrfs_transaction_cachep, cur_trans);
+		goto loop;
+	} else if (test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state)) {
+		spin_unlock(&fs_info->trans_lock);
+		kmem_cache_free(btrfs_transaction_cachep, cur_trans);
+		return -EROFS;
+	}
 
-	/* round up to nearest 4K */
-	tx_ring->size = tx_ring->count * sizeof(struct i40e_tx_desc);
-	/* add u32 for head writeback, align after this takes care of
-	 * guaranteeing this is at least one cache line in size
+	atomic_set(&cur_trans->num_writers, 1);
+	extwriter_counter_init(cur_trans, type);
+	init_waitqueue_head(&cur_trans->writer_wait);
+	init_waitqueue_head(&cur_trans->commit_wait);
+	init_waitqueue_head(&cur_trans->pending_wait);
+	cur_trans->state = TRANS_STATE_RUNNING;
+	/*
+	 * One for this trans handle, one so it will live on until we
+	 * commit the transaction.
 	 */
-	tx_ring->size += sizeof(u32);
-	tx_ring->size = ALIGN(tx_ring->size, 4096);
-	tx_ring->desc = dma_alloc_coherent(dev, tx_ring->size,
-					   &tx_ring->dma, GFP_KERNEL);
-	if (!tx_ring->desc) {
-		dev_info(dev, "Unable to allocate memory for the Tx descriptor ring, size=%d\n",
-			 tx_ring->size);
-		goto err;
-	}
+	atomic_set(&cur_trans->use_count, 2);
+	atomic_set(&cur_trans->pending_ordered, 0);
+	cur_trans->flags = 0;
+	cur_trans->start_time = get_seconds();
 
-	tx_ring->next_to_use = 0;
-	tx_ring->next_to_clean = 0;
-	return 0;
+	memset(&cur_trans->delayed_refs, 0, sizeof(cur_trans->delayed_refs));
 
-err:
-	kfree(tx_ring->tx_bi);
-	tx_ring->tx_bi = NULL;
-	return -ENOMEM;
-}
+	cur_trans->delayed_refs.href_root = RB_ROOT;
+	cur_trans->delayed_refs.dirty_extent_root = RB_ROOT;
+	atomic_set(&cur_trans->delayed_refs.num_entries, 0);
 
-/**
- * i40e_clean_rx_ring - Free Rx buffers
- * @rx_ring: ring to be cleaned
- **/
-void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
-{
-	struct device *dev = rx_ring->dev;
-	struct i40e_rx_buffer *rx_bi;
-	unsigned long bi_size;
-	u16 i;
-
-	/* ring already cleared, nothing to do */
-	if (!rx_ring->rx_bi)
-		return;
-
-	if (ring_is_ps_enabled(rx_ring)) {
-		int bufsz = ALIGN(rx_ring->rx_hdr_len, 256) * rx_ring->count;
-
-		rx_bi = &rx_ring->rx_bi[0];
-		if (rx_bi->hdr_buf) {
-			dma_free_coherent(dev,
-					  bufsz,
-					  rx_bi->hdr_buf,
-					  rx_bi->dma);
-			for (i = 0; i < rx_ring->count; i++) {
-				rx_bi = &rx_ring->rx_bi[i];
-				rx_bi->dma = 0;
-				rx_bi->hdr_buf = NULL;
-			}
-		}
-	}
-	/* Free all the Rx ring sk_buffs */
-	for (i = 0; i < rx_ring->count; i++) {
-		rx_bi = &rx_ring->rx_bi[i];
-		if (rx_bi->dma) {
-			dma_unmap_single(dev,
-					 rx_bi->dma,
-					 rx_ring->rx_buf_len,
-					 DMA_FROM_DEVICE);
-			rx_bi->dma = 0;
-		}
-		if (rx_bi->skb) {
-			dev_kfree_skb(rx_bi->skb);
-			rx_bi->skb = NULL;
-		}
-		if (rx_bi->page) {
-			if (rx_bi->page_dma) {
-				dma_unmap_page(dev,
-					       rx_bi->page_dma,
-					       PAGE_SIZE / 2,
-					       DMA_FROM_DEVICE);
-				rx_bi->page_dma = 0;
-			}
-			__free_page(rx_bi->page);
-			rx_bi->page = NULL;
-			rx_bi->page_offset = 0;
-		}
-	}
-
-	bi_size = sizeof(struct i40e_rx_buffer) * rx_ring->count;
-	memset(rx_ring->rx_bi, 0, bi_size);
-
-	/* Zero out the descriptor ring */
-	memset(rx_ring->desc, 0, rx_ring->size);
-
-	rx_ring->next_to_clean = 0;
-	rx_ring->next_to_use = 0;
-}
-
-/**
- * i40e_free_rx_resources - Free Rx resources
- * @rx_ring: ring to clean the resources from
- *
- * Free all receive software resources
- **/
-void i40e_free_rx_resources(struct i40e_ring *rx_ring)
-{
-	i40e_clean_rx_ring(rx_ring);
-	kfree(rx_ring->rx_bi);
-	rx_ring->rx_bi = NULL;
-
-	if (rx_ring->desc) {
-		dma_free_coherent(rx_ring->dev, rx_ring->size,
-				  rx_ring->desc, rx_ring->dma);
-		rx_ring->desc = NULL;
-	}
-}
-
-/**
- * i40e_alloc_rx_headers - allocate rx header buffers
- * @rx_ring: ring to alloc buffers
- *
- * Allocate rx header buffers for the entire ring. As these are static,
- * this is only called when setting up a new ring.
- **/
-void i40e_alloc_rx_headers(struct i40e_ring *rx_ring)
-{
-	struct device *dev = rx_ring->dev;
-	struct i40e_rx_buffer *rx_bi;
-	dma_addr_t dma;
-	void *buffer;
-	int buf_size;
-	int i;
-
-	if (rx_ring->rx_bi[0].hdr_buf)
-		return;
-	/* Make sure the buffers don't cross cache line boundaries. */
-	buf_size = ALIGN(rx_ring->rx_hdr_len, 256);
-	buffer = dma_alloc_coherent(dev, buf_size * rx_ring->count,
-				    &dma, GFP_KERNEL);
-	if (!buffer)
-		return;
-	for (i = 0; i < rx_ring->count; i++) {
-		rx_bi = &rx_ring->rx_bi[i];
-		rx_bi->dma = dma + (i * buf_size);
-		rx_bi->hdr_buf = buffer + (i * buf_size);
-	}
-}
-
-/**
- * i40e_setup_rx_descriptors - Allocate Rx descriptors
- * @rx_ring: Rx descriptor ring (for a specific queue) to setup
- *
- * Returns 0 on success, negative on failure
- **/
-int i40e_setup_rx_descriptors(struct i40e_ring *rx_ring)
-{
-	struct device *dev = rx_ring->dev;
-	int bi_size;
-
-	/* warn if we are about to overwrite the pointer */
-	WARN_ON(rx_ring->rx_bi);
-	bi_size = sizeof(struct i40e_rx_buffer) * rx_ring->count;
-	rx_ring->rx_bi = kzalloc(bi_size, GFP_KERNEL);
-	if (!rx_ring->rx_bi)
-		goto err;
-
-	u64_stats_init(&rx_ring->syncp);
-
-	/* Round up to nearest 4K */
-	rx_ring->size = ring_is_16byte_desc_enabled(rx_ring)
-		? rx_ring->count * sizeof(union i40e_16byte_rx_desc)
-		: rx_ring->count * sizeof(union i40e_32byte_rx_desc);
-	rx_ring->size = ALIGN(rx_ring->size, 4096);
-	rx_ring->desc = dma_alloc_coherent(dev, rx_ring->size,
-					   &rx_ring->dma, GFP_KERNEL);
-
-	if (!rx_ring->desc) {
-		dev_info(dev, "Unable to allocate memory for the Rx descriptor ring, size=%d\n",
-			 rx_ring->size);
-		goto err;
-	}
-
-	rx_ring->next_to_clean = 0;
-	rx_ring->next_to_use = 0;
-
-	return 0;
-err:
-	kfree(rx_ring->rx_bi);
-	rx_ring->rx_bi = NULL;
-	return -ENOMEM;
-}
-
-/**
- * i40e_release_rx_desc - Store the new tail and head values
- * @rx_ring: ring to bump
- * @val: new head index
- **/
-static inline void i40e_release_rx_desc(struct i40e_ring *rx_ring, u32 val)
-{
-	rx_ring->next_to_use = val;
-	/* Force memory writes to complete before letting h/w
-	 * know there are new descriptors to fetch.  (Only
-	 * applicable for weak-ordered memory model archs,
-	 * such as IA-64).
+	/*
+	 * although the tree mod log is per file system and not per transaction,
+	 * the log must never go across transaction boundaries.
 	 */
-	wmb();
-	writel(val, rx_ring->tail);
-}
-
-/**
- * i40e_alloc_rx_buffers_ps - Replace used receive buffers; packet split
- * @rx_ring: ring to place buffers on
- * @cleaned_count: number of buffers to replace
- **/
-void i40e_alloc_rx_buffers_ps(struct i40e_ring *rx_ring, u16 cleaned_count)
-{
-	u16 i = rx_ring->next_to_use;
-	union i40e_rx_desc *rx_desc;
-	struct i40e_rx_buffer *bi;
-
-	/* do nothing if no valid netdev defined */
-	if (!rx_ring->netdev || !cleaned_count)
-		return;
-
-	while (cleaned_count--) {
-		rx_desc = I40E_RX_DESC(rx_ring, i);
-		bi = &rx_ring->rx_bi[i];
-
-		if (bi->skb) /* desc is in use */
-			goto no_buffers;
-		if (!bi->page) {
-			bi->page = alloc_page(GFP_ATOMIC);
-			if (!bi->page) {
-				rx_ring->rx_stats.alloc_page_failed++;
-				goto no_buffers;
-			}
-		}
-
-		if (!bi->page_dma) {
-			/* use a half page if we're re-using */
-			bi->page_offset ^= PAGE_SIZE / 2;
-			bi->page_dma = dma_map_page(rx_ring->dev,
-						    bi->page,
-						    bi->page_offset,
-						    PAGE_SIZE / 2,
-						    DMA_FROM_DEVICE);
-			if (dma_mapping_error(rx_ring->dev,
-					      bi->page_dma)) {
-				rx_ring->rx_stats.alloc_page_failed++;
-				bi->page_dma = 0;
-				goto no_buffers;
-			}
-		}
-
-		dma_sync_single_range_for_device(rx_ring->dev,
-						 bi->dma,
-						 0,
-						 rx_ring->rx_hdr_len,
-						 DMA_FROM_DEVICE);
-		/* Refresh the desc even if buffer_addrs didn't change
-		 * because each write-back erases this info.
-		 */
-		rx_desc->read.pkt_addr = cpu_to_le64(bi->page_dma);
-		rx_desc->read.hdr_addr = cpu_to_le64(bi->dma);
-		i++;
-		if (i == rx_ring->count)
-			i = 0;
-	}
-
-no_buffers:
-	if (rx_ring->next_to_use != i)
-		i40e_release_rx_desc(rx_ring, i);
-}
-
-/**
- * i40e_alloc_rx_buffers_1buf - Replace used receive buffers; single buffer
- * @rx_ring: ring to place buffers on
- * @cleaned_count: number of buffers to replace
- **/
-void i40e_alloc_rx_buffers_1buf(struct i40e_ring *rx_ring, u16 cleaned_count)
-{
-	u16 i = rx_ring->next_to_use;
-	union i40e_rx_desc *rx_desc;
-	struct i40e_rx_buffer *bi;
-	struct sk_buff *skb;
-
-	/* do nothing if no valid netdev defined */
-	if (!rx_ring->netdev || !cleaned_count)
-		return;
-
-	while (cleaned_count--) {
-		rx_desc = I40E_RX_DESC(rx_ring, i);
-		bi = &rx_ring->rx_bi[i];
-		skb = bi->skb;
-
-		if (!skb) {
-			skb = netdev_alloc_skb_ip_align(rx_ring->netdev,
-							rx_ring->rx_buf_len);
-			if (!skb) {
-				rx_ring->rx_stats.alloc_buff_failed++;
-				goto no_buffers;
-			}
-			/* initialize queue mapping */
-			skb_record_rx_queue(skb, rx_ring->queue_index);
-			bi->skb = skb;
-		}
-
-		if (!bi->dma) {
-			bi->dma = dma_map_single(rx_ring->dev,
-						 skb->data,
-						 rx_ring->rx_buf_len,
-						 DMA_FROM_DEVICE);
-			if (dma_mapping_error(rx_ring->dev, bi->dma)) {
-				rx_ring->rx_stats.alloc_buff_failed++;
-				bi->dma = 0;
-				goto no_buffers;
-			}
-		}
-
-		rx_desc->read.pkt_addr = cpu_to_le64(bi->dma);
-		rx_desc->read.hdr_addr = 0;
-		i++;
-		if (i == rx_ring->count)
-			i = 0;
-	}
-
-no_buffers:
-	if (rx_ring->next_to_use != i)
-		i40e_release_rx_desc(rx_ring, i);
-}
-
-/**
- * i40e_receive_skb - Send a completed packet up the stack
- * @rx_ring:  rx ring in play
- * @skb: packet to send up
- * @vlan_tag: vlan tag for packet
- **/
-static void i40e_receive_skb(struct i40e_ring *rx_ring,
-			     struct sk_buff *skb, u16 vlan_tag)
-{
-	struct i40e_q_vector *q_vector = rx_ring->q_vector;
-
-	if (vlan_tag & VLAN_VID_MASK)
-		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vlan_tag);
-
-	napi_gro_receive(&q_vector->napi, skb);
-}
-
-/**
- * i40e_rx_checksum - Indicate in skb if hw indicated a good cksum
- * @vsi: the VSI we care about
- * @skb: skb currently being received and modified
- * @rx_status: status value of last descriptor in packet
- * @rx_error: error value of last descriptor in packet
- * @rx_ptype: ptype value of last descriptor in packet
- **/
-static inline void i40e_rx_checksum(struct i40e_vsi *vsi,
-				    struct sk_buff *skb,
-				    u32 rx_status,
-				    u32 rx_error,
-				    u16 rx_ptype)
-{
-	struct i40e_rx_ptype_decoded decoded = decode_rx_desc_ptype(rx_ptype);
-	bool ipv4 = false, ipv6 = false;
-	bool ipv4_tunnel, ipv6_tunnel;
-	__wsum rx_udp_csum;
-	struct iphdr *iph;
-	__sum16 csum;
-
-	ipv4_tunnel = (rx_ptype >= I40E_RX_PTYPE_GRENAT4_MAC_PAY3) &&
-		     (rx_ptype <= I40E_RX_PTYPE_GRENAT4_MACVLAN_IPV6_ICMP_PAY4);
-	ipv6_tunnel = (rx_ptype >= I40E_RX_PTYPE_GRENAT6_MAC_PAY3) &&
-		     (rx_ptype <= I40E_RX_PTYPE_GRENAT6_MACVLAN_IPV6_ICMP_PAY4);
-
-	skb->ip_summed = CHECKSUM_NONE;
-
-	/* Rx csum enabled and ip headers found? */
-	if (!(vsi->netdev->features & NETIF_F_RXCSUM))
-		return;
-
-	/* did the hardware decode the packet and checksum? */
-	if (!(rx_status & BIT(I40E_RX_DESC_STATUS_L3L4P_SHIFT)))
-		return;
-
-	/* both known and outer_ip must be set for the below code to work */
-	if (!(decoded.known && decoded.outer_ip))
-		return;
-
-	if (decoded.outer_ip == I40E_RX_PTYPE_OUTER_IP &&
-	    decoded.outer_ip_ver == I40E_RX_PTYPE_OUTER_IPV4)
-		ipv4 = true;
-	else if (decoded.outer_ip == I40E_RX_PTYPE_OUTER_IP &&
-		 decoded.outer_ip_ver == I40E_RX_PTYPE_OUTER_IPV6)
-		ipv6 = true;
-
-	if (ipv4 &&
-	    (rx_error & (BIT(I40E_RX_DESC_ERROR_IPE_SHIFT) |
-			 BIT(I40E_RX_DESC_ERROR_EIPE_SHIFT))))
-		goto checksum_fail;
-
-	/* likely incorrect csum if alternate IP extension headers found */
-	if (ipv6 &&
-	    rx_status & BIT(I40E_RX_DESC_STATUS_IPV6EXADD_SHIFT))
-		/* don't increment checksum err here, non-fatal err */
-		return;
-
-	/* there was some L4 error, count error and punt packet to the stack */
-	if (rx_error & BIT(I40E_RX_DESC_ERROR_L4E_SHIFT))
-		goto checksum_fail;
-
-	/* handle packets that were not able to be checksummed due
-	 * to arrival speed, in this case the stack can compute
-	 * the csum.
-	 */
-	if (rx_error & BIT(I40E_RX_DESC_ERROR_PPRS_SHIFT))
-		return;
-
-	/* If VXLAN traffic has an outer UDPv4 checksum we need to check
-	 * it in the driver, hardware does not do it for us.
-	 * Since L3L4P bit was set we assume a valid IHL value (>=5)
-	 * so the total length of IPv4 header is IHL*4 bytes
-	 * The UDP_0 bit *may* bet set if the *inner* header is UDP
-	 */
-	if (!(vsi->back->flags & I40E_FLAG_OUTER_UDP_CSUM_CAPABLE) &&
-	    (ipv4_tunnel)) {
-		skb->transport_header = skb->mac_header +
-					sizeof(struct ethhdr) +
-					(ip_hdr(skb)->ihl * 4);
-
-		/* Add 4 bytes for VLAN tagged packets */
-		skb->transport_header += (skb->protocol == htons(ETH_P_8021Q) ||
-					  skb->protocol == htons(ETH_P_8021AD))
-					  ? VLAN_HLEN : 0;
-
-		if ((ip_hdr(skb)->protocol == IPPROTO_UDP) &&
-		    (udp_hdr(skb)->check != 0)) {
-			rx_udp_csum = udp_csum(skb);
-			iph = ip_hdr(skb);
-			csum = csum_tcpudp_magic(
-					iph->saddr, iph->daddr,
-					(skb->len - skb_transport_offset(skb)),
-					IPPROTO_UDP, rx_udp_csum);
-
-			if (udp_hdr(skb)->check != csum)
-				goto checksum_fail;
-
-		} /* else its GRE and so no outer UDP header */
-	}
-
-	skb->ip_summed = CHECKSUM_UNNECESSARY;
-	skb->csum_level = ipv4_tunnel || ipv6_tunnel;
-
-	return;
-
-checksum_fail:
-	vsi->back->hw_csum_rx_error++;
-}
-
-/**
- * i40e_ptype_to_htype - get a hash type
- * @ptype: the ptype value from the descriptor
- *
- * Returns a hash type to be used by skb_set_hash
- **/
-static inline enum pkt_hash_types i40e_ptype_to_htype(u8 ptype)
-{
-	struct i40e_rx_ptype_decoded decoded = decode_rx_desc_ptype(ptype);
-
-	if (!decoded.known)
-		return PKT_HASH_TYPE_NONE;
-
-	if (decoded.outer_ip == I40E_RX_PTYPE_OUTER_IP &&
-	    decoded.payload_layer == I40E_RX_PTYPE_PAYLOAD_LAYER_PAY4)
-		return PKT_HASH_TYPE_L4;
-	else if (decoded.outer_ip == I40E_RX_PTYPE_OUTER_IP &&
-		 decoded.payload_layer == I40E_RX_PTYPE_PAYLOAD_LAYER_PAY3)
-		return PKT_HASH_TYPE_L3;
-	else
-		return PKT_HASH_TYPE_L2;
-}
-
-/**
- * i40e_rx_hash - set the hash value in the skb
- * @ring: descriptor ring
- * @rx_desc: specific descriptor
- **/
-static inline void i40e_rx_hash(struct i40e_ring *ring,
-				union i40e_rx_desc *rx_desc,
-				struct sk_buff *skb,
-				u8 rx_ptype)
-{
-	u32 hash;
-	const __le64 rss_mask  =
-		cpu_to_le64((u64)I40E_RX_DESC_FLTSTAT_RSS_HASH <<
-			    I40E_RX_DESC_STATUS_FLTSTAT_SHIFT);
-
-	if (ring->netdev->features & NETIF_F_RXHASH)
-		return;
-
-	if ((rx_desc->wb.qword1.status_error_len & rss_mask) == rss_mask) {
-		hash = le32_to_cpu(rx_desc->wb.qword0.hi_dword.rss);
-		skb_set_hash(skb, hash, i40e_ptype_to_htype(rx_ptype));
-	}
-}
-
-/**
- * i40e_clean_rx_irq_ps - Reclaim resources after receive; packet split
- * @rx_ring:  rx ring to clean
- * @budget:   how many cleans we're allowed
- *
- * Returns true if there's any budget left (e.g. the clean is finished)
- **/
-static int i40e_clean_rx_irq_ps(struct i40e_ring *rx_ring, int budget)
-{
-	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
-	u16 rx_packet_len, rx_header_len, rx_sph, rx_hbo;
-	u16 cleaned_count = I40E_DESC_UNUSED(rx_ring);
-	const int current_node = numa_mem_id();
-	struct i40e_vsi *vsi = rx_ring->vsi;
-	u16 i = rx_ring->next_to_clean;
-	union i40e_rx_desc *rx_desc;
-	u32 rx_error, rx_status;
-	u8 rx_ptype;
-	u64 qword;
-
-	if (budget <= 0)
-		return 0;
-
-	do {
-		struct i40e_rx_buffer *rx_bi;
-		struct sk_buff *skb;
-		u16 vlan_tag;
-		/* return some buffers to hardware, one at a time is too slow */
-		if (cleaned_count >= I40E_RX_BUFFER_WRITE) {
-			i40e_alloc_rx_buffers_ps(rx_ring, cleaned_count);
-			cleaned_count = 0;
-		}
-
-		i = rx_ring->next_to_clean;
-		rx_desc = I40E_RX_DESC(rx_ring, i);
-		qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
-		rx_status = (qword & I40E_RXD_QW1_STATUS_MASK) >>
-			I40E_RXD_QW1_STATUS_SHIFT;
-
-		if (!(rx_status & BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
-			break;
-
-		/* This memory barrier is needed to keep us from reading
-		 * any other fields out of the rx_desc until we know the
-		 * DD bit is set.
-		 */
-		dma_rmb();
-		if (i40e_rx_is_programming_status(qword)) {
-			i40e_clean_programming_status(rx_ring, rx_desc);
-			I40E_RX_INCREMENT(rx_ring, i);
-			continue;
-		}
-		rx_bi = &rx_ring->rx_bi[i];
-		skb = rx_bi->skb;
-		if (likely(!skb)) {
-			skb = netdev_alloc_skb_ip_align(rx_ring->netdev,
-							rx_ring->rx_hdr_len);
-			if (!skb) {
-				rx_ring->rx_stats.alloc_buff_failed++;
-				break;
-			}
-
-			/* initialize queue mapping */
-			skb_record_rx_queue(skb, rx_ring->queue_index);
-			/* we are reusing so sync this buffer for CPU use */
-			dma_sync_single_range_for_cpu(rx_ring->dev,
-						      rx_bi->dma,
-						      0,
-						      rx_ring->rx_hdr_len,
-						      DMA_FROM_DEVICE);
-		}
-		rx_packet_len = (qword & I40E_RXD_QW1_LENGTH_PBUF_MASK) >>
-				I40E_RXD_QW1_LENGTH_PBUF_SHIFT;
-		rx_header_len = (qword & I40E_RXD_QW1_LENGTH_HBUF_MASK) >>
-				I40E_RXD_QW1_LENGTH_HBUF_SHIFT;
-		rx_sph = (qword & I40E_RXD_QW1_LENGTH_SPH_MASK) >>
-			 I40E_RXD_QW1_LENGTH_SPH_SHIFT;
-
-		rx_error = (qword & I40E_RXD_QW1_ERROR_MASK) >>
-			   I40E_RXD_QW1_ERROR_SHIFT;
-		rx_hbo = rx_error & BIT(I40E_RX_DESC_ERROR_HBO_SHIFT);
-		rx_error &= ~BIT(I40E_RX_DESC_ERROR_HBO_SHIFT);
-
-		rx_ptype = (qword & I40E_RXD_QW1_PTYPE_MASK) >>
-			   I40E_RXD_QW1_PTYPE_SHIFT;
-		prefetch(rx_bi->page);
-		rx_bi->skb = NULL;
-		cleaned_count++;
-		if (rx_hbo || rx_sph) {
-			int len;
-
-			if (rx_hbo)
-				len = I40E_RX_HDR_SIZE;
-			else
-				len = rx_header_len;
-			memcpy(__skb_put(skb, len), rx_bi->hdr_buf, len);
-		} else if (skb->len == 0) {
-			int len;
-
-			len = (rx_packet_len > skb_headlen(skb) ?
-				skb_headlen(skb) : rx_packet_len);
-			memcpy(__skb_put(skb, len),
-			       rx_bi->page + rx_bi->page_offset,
-			       len);
-			rx_bi->page_offset += len;
-			rx_packet_len -= len;
-		}
-
-		/* Get the rest of the data if this was a header split */
-		if (rx_packet_len) {
-			skb_fill_page_desc(skb, skb_shinfo(skb)->nr_frags,
-					   rx_bi->page,
-					   rx_bi->page_offset,
-					   rx_packet_len);
-
-			skb->len += rx_packet_len;
-			skb->data_len += rx_packet_len;
-			skb->truesize += rx_packet_len;
-
-			if ((page_count(rx_bi->page) == 1) &&
-			    (page_to_nid(rx_bi->page) == current_node))
-				get_page(rx_bi->page);
-			else
-				rx_bi->page = NULL;
-
-			dma_unmap_page(rx_ring->dev,
-				       rx_bi->page_dma,
-				       PAGE_SIZE / 2,
-				       DMA_FROM_DEVICE);
-			rx_bi->page_dma = 0;
-		}
-		I40E_RX_INCREMENT(rx_ring, i);
-
-		if (unlikely(
-		    !(rx_status & BIT(I40E_RX_DESC_STATUS_EOF_SHIFT)))) {
-			struct i40e_rx_buffer *next_buffer;
-
-			next_buffer = &rx_ring->rx_bi[i];
-			next_buffer->skb = skb;
-			rx_ring->rx_stats.non_eop_descs++;
-			continue;
-		}
-
-		/* ERR_MASK will only have valid bits if EOP set */
-		if (unlikely(rx_error & BIT(I40E_RX_DESC_ERROR_RXE_SHIFT))) {
-			dev_kfree_skb_any(skb);
-			continue;
-		}
-
-		i40e_rx_hash(rx_ring, rx_desc, skb, rx_ptype);
-
-		if (unlikely(rx_status & I40E_RXD_QW1_STATUS_TSYNVALID_MASK)) {
-			i40e_ptp_rx_hwtstamp(vsi->back, skb, (rx_status &
-					   I40E_RXD_QW1_STATUS_TSYNINDX_MASK) >>
-					   I40E_RXD_QW1_STATUS_TSYNINDX_SHIFT);
-			rx_ring->last_rx_timestamp = jiffies;
-		}
-
-		/* probably a little skewed due to removing CRC */
-		total_rx_bytes += skb->len;
-		total_rx_packets++;
-
-		skb->protocol = eth_type_trans(skb, rx_ring->netdev);
-
-		i40e_rx_checksum(vsi, skb, rx_status, rx_error, rx_ptype);
-
-		vlan_tag = rx_status & BIT(I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)
-			 ? le16_to_cpu(rx_desc->wb.qword0.lo_dword.l2tag1)
-			 : 0;
-#ifdef I40E_FCOE
-		if (!i40e_fcoe_handle_offload(rx_ring, rx_desc, skb)) {
-			dev_kfree_skb_any(skb);
-			continue;
-		}
-#endif
-		skb_mark_napi_id(skb, &rx_ring->q_vector->napi);
-		i40e_receive_skb(rx_ring, skb, vlan_tag);
-
-		rx_desc->wb.qword1.status_error_len = 0;
-
-	} while (likely(total_rx_packets < budget));
-
-	u64_stats_update_begin(&rx_ring->syncp);
-	rx_ring->stats.packets += total_rx_packets;
-	rx_ring->stats.bytes += total_rx_bytes;
-	u64_stats_update_end(&rx_ring->syncp);
-	rx_ring->q_vector->rx.total_packets += total_rx_packets;
-	rx_ring->q_vector->rx.total_bytes += total_rx_bytes;
-
-	return total_rx_packets;
-}
-
-/**
- * i40e_clean_rx_irq_1buf - Reclaim resources after receive; single buffer
- * @rx_ring:  rx ring to clean
- * @budget:   how many cleans we're allowed
- *
- * Returns number of packets cleaned
- **/
-static int i40e_clean_rx_irq_1buf(struct i40e_ring *rx_ring, int budget)
-{
-	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
-	u16 cleaned_count = I40E_DESC_UNUSED(rx_ring);
-	struct i40e_vsi *vsi = rx_ring->vsi;
-	union i40e_rx_desc *rx_desc;
-	u32 rx_error, rx_status;
-	u16 rx_packet_len;
-	u8 rx_ptype;
-	u64 qword;
-	u16 i;
-
-	do {
-		struct i40e_rx_buffer *rx_bi;
-		struct sk_buff *skb;
-		u16 vlan_tag;
-		/* return some buffers to hardware, one at a time is too slow */
-		if (cleaned_count >= I40E_RX_BUFFER_WRITE) {
-			i40e_alloc_rx_buffers_1buf(rx_ring, cleaned_count);
-			cleaned_count = 0;
-		}
-
-		i = rx_ring->next_to_clean;
-		rx_desc = I40E_RX_DESC(rx_ring, i);
-		qword = le64_to_cpu(rx_desc->wb.qword1.status_error_len);
-		rx_status = (qword & I40E_RXD_QW1_STATUS_MASK) >>
-			I40E_RXD_QW1_STATUS_SHIFT;
-
-		if (!(rx_status & BIT(I40E_RX_DESC_STATUS_DD_SHIFT)))
-			break;
-
-		/* This memory barrier is needed to keep us from reading
-		 * any other fields out of the rx_desc until we know the
-		 * DD bit is set.
-		 */
-		dma_rmb();
-
-		if (i40e_rx_is_programming_status(qword)) {
-			i40e_clean_programming_status(rx_ring, rx_desc);
-			I40E_RX_INCREMENT(rx_ring, i);
-			continue;
-		}
-		rx_bi = &rx_ring->rx_bi[i];
-		skb = rx_bi->skb;
-		prefetch(skb->data);
-
-		rx_packet_len = (qword & I40E_RXD_QW1_LENGTH_PBUF_MASK) >>
-				I40E_RXD_QW1_LENGTH_PBUF_SHIFT;
-
-		rx_error = (qword & I40E_RXD_QW1_ERROR_MASK) >>
-			   I40E_RXD_QW1_ERROR_SHIFT;
-		rx_error &= ~BIT(I40E_RX_DESC_ERROR_HBO_SHIFT);
-
-		rx_ptype = (qword & I40E_RXD_QW1_PTYPE_MASK) >>
-			   I40E_RXD_QW1_PTYPE_SHIFT;
-		rx_bi->skb = NULL;
-		cleaned_count++;
-
-		/* Get the header and possibly the whole packet
-		 * If this is an skb from previous receive dma will be 0
-		 */
-		skb_put(skb, rx_packet_len);
-		dma_unmap_single(rx_ring->dev, rx_bi->dma, rx_ring->rx_buf_len,
-				 DMA_FROM_DEVICE);
-		rx_bi->dma = 0;
-
-		I40E_RX_INCREMENT(rx_ring, i);
-
-		if (unlikely(
-		    !(rx_status & BIT(I40E_RX_DESC_STATUS_EOF_SHIFT)))) {
-			rx_ring->rx_stats.non_eop_descs++;
-			continue;
-		}
-
-		/* ERR_MASK will only have valid bits if EOP set */
-		if (unlikely(rx_error & BIT(I40E_RX_DESC_ERROR_RXE_SHIFT))) {
-			dev_kfree_skb_any(skb);
-			continue;
-		}
-
-		i40e_rx_hash(rx_ring, rx_desc, skb, rx_ptype);
-		if (unlikely(rx_status & I40E_RXD_QW1_STATUS_TSYNVALID_MASK)) {
-			i40e_ptp_rx_hwtstamp(vsi->back, skb, (rx_status &
-					   I40E_RXD_QW1_STATUS_TSYNINDX_MASK) >>
-					   I40E_RXD_QW1_STATUS_TSYNINDX_SHIFT);
-			rx_ring->last_rx_timestamp = jiffies;
-		}
-
-		/* probably a little skewed due to removing CRC */
-		total_rx_bytes += skb->len;
-		total_rx_packets++;
-
-		skb->protocol = eth_type_trans(skb, rx_ring->netdev);
-
-		i40e_rx_checksum(vsi, skb, rx_status, rx_error, rx_ptype);
-
-		vlan_tag = rx_status & BIT(I40E_RX_DESC_STATUS_L2TAG1P_SHIFT)
-			 ? le16_to_cpu(rx_desc->wb.qword0.lo_dword.l2tag1)
-			 : 0;
-#ifdef I40E_FCOE
-		if (!i40e_fcoe_handle_offload(rx_ring, rx_desc, skb)) {
-			dev_kfree_skb_any(skb);
-			continue;
-		}
-#endif
-		i40e_receive_skb(rx_ring, skb, vlan_tag);
-
-		rx_desc->wb.qword1.status_error_len = 0;
-	} while (likely(total_rx_packets < budget));
-
-	u64_stats_update_begin(&rx_ring->syncp);
-	rx_ring->stats.packets += total_rx_packets;
-	rx_ring->stats.bytes += total_rx_bytes;
-	u64_stats_update_end(&rx_ring->syncp);
-	rx_ring->q_vector->rx.total_packets += total_rx_packets;
-	rx_ring->q_vector->rx.total_bytes += total_rx_bytes;
-
-	return total_rx_packets;
-}
-
-static u32 i40e_buildreg_itr(const int type, const u16 itr)
-{
-	u32 val;
-
-	val = I40E_PFINT_DYN_CTLN_INTENA_MASK |
-	      I40E_PFINT_DYN_CTLN_CLEARPBA_MASK |
-	      (type << I40E_PFINT_DYN_CTLN_ITR_INDX_SHIFT) |
-	      (itr << I40E_PFINT_DYN_CTLN_INTERVAL_SHIFT);
-
-	return val;
-}
-
-/* a small macro to shorten up some long lines */
-#define INTREG I40E_PFINT_DYN_CTLN
-
-/**
- * i40e_update_enable_itr - Update itr and re-enable MSIX interrupt
- * @vsi: the VSI we care about
- * @q_vector: q_vector for which itr is being updated and interrupt enabled
- *
- **/
-static inline void i40e_update_enable_itr(struct i40e_vsi *vsi,
-					  struct i40e_q_vector *q_vector)
-{
-	struct i40e_hw *hw = &vsi->back->hw;
-	bool rx = false, tx = false;
-	u32 rxval, txval;
-	int vector;
-
-	vector = (q_vector->v_idx + vsi->base_vector);
-
-	/* avoid dynamic calculation if in countdown mode OR if
-	 * all dynamic is disabled
-	 */
-	rxval = txval = i40e_buildreg_itr(I40E_ITR_NONE, 0);
-
-	if (q_vector->itr_countdown > 0 ||
-	    (!ITR_IS_DYNAMIC(vsi->rx_itr_setting) &&
-	     !ITR_IS_DYNAMIC(vsi->tx_itr_setting))) {
-		goto enable_int;
-	}
-
-	if (ITR_IS_DYNAMIC(vsi->rx_itr_setting)) {
-		rx = i40e_set_new_dynamic_itr(&q_vector->rx);
-		rxval = i40e_buildreg_itr(I40E_RX_ITR, q_vector->rx.itr);
-	}
-
-	if (ITR_IS_DYNAMIC(vsi->tx_itr_setting)) {
-		tx = i40e_set_new_dynamic_itr(&q_vector->tx);
-		txval = i40e_buildreg_itr(I40E_TX_ITR, q_vector->tx.itr);
-	}
-
-	if (rx || tx) {
-		/* get the higher of the two ITR adjustments and
-		 * use the same value for both ITR registers
-		 * when in adaptive mode (Rx and/or Tx)
-		 */
-		u16 itr = max(q_vector->tx.itr, q_vector->rx.itr);
-
-		q_vector->tx.itr = q_vector->rx.itr = itr;
-		txval = i40e_buildreg_itr(I40E_TX_ITR, itr);
-		tx = true;
-		rxval = i40e_buildreg_itr(I40E_RX_ITR, itr);
-		rx = true;
-	}
-
-	/* only need to enable the interrupt once, but need
-	 * to possibly update both ITR values
-	 */
-	if (rx) {
-		/* set the INTENA_MSK_MASK so that this first write
-		 * won't actually enable the interrupt, instead just
-		 * updating the ITR (it's bit 31 PF and VF)
-		 */
-		rxval |= BIT(31);
-		/* don't check _DOWN because interrupt isn't being enabled */
-		wr32(hw, INTREG(vector - 1), rxval);
-	}
-
-enable_int:
-	if (!test_bit(__I40E_DOWN, &vsi->state))
-		wr32(hw, INTREG(vector - 1), txval);
-
-	if (q_vector->itr_countdown)
-		q_vector->itr_countdown--;
-	else
-		q_vector->itr_countdown = ITR_COUNTDOWN_START;
-
-}
-
-/**
- * i40e_napi_poll - NAPI polling Rx/Tx cleanup routine
- * @napi: napi struct with our devices info in it
- * @budget: amount of work driver is allowed to do this pass, in packets
- *
- * This function will clean all queues associated with a q_vector.
- *
- * Returns the amount of work done
- **/
-int i40e_napi_poll(struct napi_struct *napi, int budget)
-{
-	struct i40e_q_vector *q_vector =
-			       container_of(napi, struct i40e_q_vector, napi);
-	struct i40e_vsi *vsi = q_vector->vsi;
-	struct i40e_ring *ring;
-	bool clean_complete = true;
-	bool arm_wb = false;
-	int budget_per_ring;
-	int work_done = 0;
-
-	if (test_bit(__I40E_DOWN, &vsi->state)) {
-		napi_complete(napi);
-		return 0;
-	}
-
-	/* Since the actual Tx work is minimal, we can give the Tx a larger
-	 * budget and be more aggressive about cleaning up the Tx descriptors.
-	 */
-	i40e_for_each_ring(ring, q_vector->tx) {
-		clean_complete &= i40e_clean_tx_irq(ring, vsi->work_limit);
-		arm_wb |= ring->arm_wb;
-		ring->arm_wb = false;
-	}
-
-	/* Handle case where we are called by netpoll with a budget of 0 */
-	if (budget <= 0)
-		goto tx_only;
-
-	/* We attempt to distribute budget to each Rx queue fairly, but don't
-	 * allow the budget to go below 1 because that would exit polling early.
-	 */
-	budget_per_ring = max(budget/q_vector->num_ringpairs, 1);
-
-	i40e_for_each_ring(ring, q_vector->rx) {
-		int cleaned;
-
-		if (ring_is_ps_enabled(ring))
-			cleaned = i40e_clean_rx_irq_ps(ring, budget_per_ring);
-		else
-			cleaned = i40e_clean_rx_irq_1buf(ring, budget_per_ring);
-
-		work_done += cleaned;
-		/* if we didn't clean as many as budgeted, we must be done */
-		clean_complete &= (budget_per_ring != cleaned);
-	}
-
-	/* If work not completed, return budget and polling will return */
-	if (!clean_complete) {
-tx_only:
-		if (arm_wb)
-			i40e_force_wb(vsi, q_vector);
-		return budget;
-	}
-
-	if (q_vector->tx.ring[0].flags & I40E_TXR_FLAGS_WB_ON_ITR)
-		q_vector->arm_wb_state = false;
-
-	/* Work is done so exit the polling mode and re-enable the interrupt */
-	napi_complete_done(napi, work_done);
-	if (vsi->back->flags & I40E_FLAG_MSIX_ENABLED) {
-		i40e_update_enable_itr(vsi, q_vector);
-	} else { /* Legacy mode */
-		struct i40e_hw *hw = &vsi->back->hw;
-		/* We re-enable the queue 0 cause, but
-		 * don't worry about dynamic_enable
-		 * because we left it on for the other
-		 * possible interrupts during napi
-		 */
-		u32 qval = rd32(hw, I40E_QINT_RQCTL(0)) |
-			   I40E_QINT_RQCTL_CAUSE_ENA_MASK;
-
-		wr32(hw, I40E_QINT_RQCTL(0), qval);
-		qval = rd32(hw, I40E_QINT_TQCTL(0)) |
-		       I40E_QINT_TQCTL_CAUSE_ENA_MASK;
-		wr32(hw, I40E_QINT_TQCTL(0), qval);
-		i40e_irq_dynamic_enable_icr0(vsi->back);
-	}
-	return 0;
-}
-
-/**
- * i40e_atr - Add a Flow Director ATR filter
- * @tx_ring:  ring to add programming descriptor to
- * @skb:      send buffer
- * @tx_flags: send tx flags
- * @protocol: wire protocol
- **/
-static void i40e_atr(struct i40e_ring *tx_ring, struct sk_buff *skb,
-		     u32 tx_flags, __be16 protocol)
-{
-	struct i40e_filter_program_desc *fdir_desc;
-	struct i40e_pf *pf = tx_ring->vsi->back;
-	union {
-		unsigned char *network;
-		struct iphdr *ipv4;
-		struct ipv6hdr *ipv6;
-	} hdr;
-	struct tcphdr *th;
-	unsigned int hlen;
-	u32 flex_ptype, dtype_cmd;
-	u16 i;
-
-	/* make sure ATR is enabled */
-	if (!(pf->flags & I40E_FLAG_FD_ATR_ENABLED))
-		return;
-
-	if ((pf->auto_disable_flags & I40E_FLAG_FD_ATR_ENABLED))
-		return;
-
-	/* if sampling is disabled do nothing */
-	if (!tx_ring->atr_sample_rate)
-		return;
-
-	if (!(tx_flags & (I40E_TX_FLAGS_IPV4 | I40E_TX_FLAGS_IPV6)))
-		return;
-
-	if (!(tx_flags & I40E_TX_FLAGS_VXLAN_TUNNEL)) {
-		/* snag network header to get L4 type and address */
-		hdr.network = skb_network_header(skb);
-
-		/* Currently only IPv4/IPv6 with TCP is supported
-		 * access ihl as u8 to avoid unaligned access on ia64
-		 */
-		if (tx_flags & I40E_TX_FLAGS_IPV4)
-			hlen = (hdr.network[0] & 0x0F) << 2;
-		else if (protocol == htons(ETH_P_IPV6))
-			hlen = sizeof(struct ipv6hdr);
-		else
-			return;
-	} else {
-		hdr.network = skb_inner_network_header(skb);
-		hlen = skb_inner_network_header_len(skb);
-	}
-
-	/* Currently only IPv4/IPv6 with TCP is supported
-	 * Note: tx_flags gets modified to reflect inner protocols in
-	 * tx_enable_csum function if encap is enabled.
-	 */
-	if ((tx_flags & I40E_TX_FLAGS_IPV4) &&
-	    (hdr.ipv4->protocol != IPPROTO_TCP))
-		return;
-	else if ((tx_flags & I40E_TX_FLAGS_IPV6) &&
-		 (hdr.ipv6->nexthdr != IPPROTO_TCP))
-		return;
-
-	th = (struct tcphdr *)(hdr.network + hlen);
-
-	/* Due to lack of space, no more new filters can be programmed */
-	if (th->syn && (pf->auto_disable_flags & I40E_FLAG_FD_ATR_ENABLED))
-		return;
-	if (pf->flags & I40E_FLAG_HW_ATR_EVICT_CAPABLE) {
-		/* HW ATR eviction will take care of removing filters on FIN
-		 * and RST packets.
-		 */
-		if (th->fin || th->rst)
-			return;
-	}
-
-	tx_ring->atr_count++;
-
-	/* sample on all syn/fin/rst packets or once every atr sample rate */
-	if (!th->fin &&
-	    !th->syn &&
-	    !th->rst &&
-	    (tx_ring->atr_count < tx_ring->atr_sample_rate))
-		return;
-
-	tx_ring->atr_count = 0;
-
-	/* grab the next descriptor */
-	i = tx_ring->next_to_use;
-	fdir_desc = I40E_TX_FDIRDESC(tx_ring, i);
-
-	i++;
-	tx_ring->next_to_use = (i < tx_ring->count) ? i : 0;
-
-	flex_ptype = (tx_ring->queue_index << I40E_TXD_FLTR_QW0_QINDEX_SHIFT) &
-		      I40E_TXD_FLTR_QW0_QINDEX_MASK;
-	flex_ptype |= (protocol == htons(ETH_P_IP)) ?
-		      (I40E_FILTER_PCTYPE_NONF_IPV4_TCP <<
-		       I40E_TXD_FLTR_QW0_PCTYPE_SHIFT) :
-		      (I40E_FILTER_PCTYPE_NONF_IPV6_TCP <<
-		       I40E_TXD_FLTR_QW0_PCTYPE_SHIFT);
-
-	flex_ptype |= tx_ring->vsi->id << I40E_TXD_FLTR_QW0_DEST_VSI_SHIFT;
-
-	dtype_cmd = I40E_TX_DESC_DTYPE_FILTER_PROG;
-
-	dtype_cmd |= (th->fin || th->rst) ?
-		     (I40E_FILTER_PROGRAM_DESC_PCMD_REMOVE <<
-		      I40E_TXD_FLTR_QW1_PCMD_SHIFT) :
-		     (I40E_FILTER_PROGRAM_DESC_PCMD_ADD_UPDATE <<
-		      I40E_TXD_FLTR_QW1_PCMD_SHIFT);
-
-	dtype_cmd |= I40E_FILTER_PROGRAM_DESC_DEST_DIRECT_PACKET_QINDEX <<
-		     I40E_TXD_FLTR_QW1_DEST_SHIFT;
-
-	dtype_cmd |= I40E_FILTER_PROGRAM_DESC_FD_STATUS_FD_ID <<
-		     I40E_TXD_FLTR_QW1_FD_STATUS_SHIFT;
-
-	dtype_cmd |= I40E_TXD_FLTR_QW1_CNT_ENA_MASK;
-	if (!(tx_flags & I40E_TX_FLAGS_VXLAN_TUNNEL))
-		dtype_cmd |=
-			((u32)I40E_FD_ATR_STAT_IDX(pf->hw.pf_id) <<
-			I40E_TXD_FLTR_QW1_CNTINDEX_SHIFT) &
-			I40E_TXD_FLTR_QW1_CNTINDEX_MASK;
-	else
-		dtype_cmd |=
-			((u32)I40E_FD_ATR_TUNNEL_STAT_IDX(pf->hw.pf_id) <<
-			I40E_TXD_FLTR_QW1_CNTINDEX_SHIFT) &
-			I40E_TXD_FLTR_QW1_CNTINDEX_MASK;
-
-	if (pf->flags & I40E_FLAG_HW_ATR_EVICT_CAPABLE)
-		dtype_cmd |= I40E_TXD_FLTR_QW1_ATR_MASK;
-
-	fdir_desc->qindex_flex_ptype_vsi = cpu_to_le32(flex_ptype);
-	fdir_desc->rsvd = cpu_to_le32(0);
-	fdir_desc->dtype_cmd_cntindex = cpu_to_le32(dtype_cmd);
-	fdir_desc->fd_id = cpu_to_le32(0);
-}
-
-/**
- * i40e_tx_prepare_vlan_flags - prepare generic TX VLAN tagging flags for HW
- * @skb:     send buffer
- * @tx_ring: ring to send buffer on
- * @flags:   the tx flags to be set
- *
- * Checks the skb and set up correspondingly several generic transmit flags
- * related to VLAN tagging for the HW, such as VLAN, DCB, etc.
- *
- * Returns error code indicate the frame should be dropped upon error and the
- * otherwise  returns 0 to indicate the flags has been set properly.
- **/
-#ifdef I40E_FCOE
-inline int i40e_tx_prepare_vlan_flags(struct sk_buff *skb,
-				      struct i40e_ring *tx_ring,
-				      u32 *flags)
-#else
-static inline int i40e_tx_prepare_vlan_flags(struct sk_buff *skb,
-					     struct i40e_ring *tx_ring,
-					     u32 *flags)
-#endif
-{
-	__be16 protocol = skb->protocol;
-	u32  tx_flags = 0;
-
-	if (protocol == htons(ETH_P_8021Q) &&
-	    !(tx_ring->netdev->features & NETIF_F_HW_VLAN_CTAG_TX)) {
-		/* When HW VLAN acceleration is turned off by the user the
-		 * stack sets the protocol to 8021q so that the driver
-		 * can take any steps required to support the SW only
-		 * VLAN handling.  In our case the driver doesn't need
-		 * to take any further steps so just set the protocol
-		 * to the encapsulated ethertype.
-		 */
-		skb->protocol = vlan_get_protocol(skb);
-		goto out;
-	}
-
-	/* if we have a HW VLAN tag being added, default to the HW one */
-	if (skb_vlan_tag_present(skb)) {
-		tx_flags |= skb_vlan_tag_get(skb) << I40E_TX_FLAGS_VLAN_SHIFT;
-		tx_flags |= I40E_TX_FLAGS_HW_VLAN;
-	/* else if it is a SW VLAN, check the next protocol and store the tag */
-	} else if (protocol == htons(ETH_P_8021Q)) {
-		struct vlan_hdr *vhdr, _vhdr;
-
-		vhdr = skb_header_pointer(skb, ETH_HLEN, sizeof(_vhdr), &_vhdr);
-		if (!vhdr)
-			return -EINVAL;
-
-		protocol = vhdr->h_vlan_encapsulated_proto;
-		tx_flags |= ntohs(vhdr->h_vlan_TCI) << I40E_TX_FLAGS_VLAN_SHIFT;
-		tx_flags |= I40E_TX_FLAGS_SW_VLAN;
-	}
-
-	if (!(tx_ring->vsi->back->flags & I40E_FLAG_DCB_ENABLED))
-		goto out;
-
-	/* Insert 802.1p priority into VLAN header */
-	if ((tx_flags & (I40E_TX_FLAGS_HW_VLAN | I40E_TX_FLAGS_SW_VLAN)) ||
-	    (skb->priority != TC_PRIO_CONTROL)) {
-		tx_flags &= ~I40E_TX_FLAGS_VLAN_PRIO_MASK;
-		tx_flags |= (skb->priority & 0x7) <<
-				I40E_TX_FLAGS_VLAN_PRIO_SHIFT;
-		if (tx_flags & I40E_TX_FLAGS_SW_VLAN) {
-			struct vlan_ethhdr *vhdr;
-			int rc;
-
-			rc = skb_cow_head(skb, 0);
-			if (rc < 0)
-				return rc;
-			vhdr = (struct vlan_ethhdr *)skb->data;
-			vhdr->h_vlan_TCI = htons(tx_flags >>
-						 I40E_TX_FLAGS_VLAN_SHIFT);
-		} else {
-			tx_flags |= I40E_TX_FLAGS_HW_VLAN;
-		}
-	}
-
-out:
-	*flags = tx_flags;
-	return 0;
-}
-
-/**
- * i40e_tso - set up the tso context descriptor
- * @tx_ring:  ptr to the ring to send
- * @skb:      ptr to the skb we're sending
- * @hdr_len:  ptr to the size of the packet header
- * @cd_type_cmd_tso_mss: ptr to u64 object
- * @cd_tunneling: ptr to context descriptor bits
- *
- * Returns 0 if no TSO can happen, 1 if tso is going, or error
- **/
-static int i40e_tso(struct i40e_ring *tx_ring, struct sk_buff *skb,
-		    u8 *hdr_len, u64 *cd_type_cmd_tso_mss,
-		    u32 *cd_tunneling)
-{
-	u32 cd_cmd, cd_tso_len, cd_mss;
-	struct ipv6hdr *ipv6h;
-	struct tcphdr *tcph;
-	struct iphdr *iph;
-	u32 l4len;
-	int err;
-
-	if (!skb_is_gso(skb))
-		return 0;
-
-	err = skb_cow_head(skb, 0);
-	if (err < 0)
-		return err;
-
-	iph = skb->encapsulation ? inner_ip_hdr(skb) : ip_hdr(skb);
-	ipv6h = skb->encapsulation ? inner_ipv6_hdr(skb) : ipv6_hdr(skb);
-
-	if (iph->version == 4) {
-		tcph = skb->encapsulation ? inner_tcp_hdr(skb) : tcp_hdr(skb);
-		iph->tot_len = 0;
-		iph->check = 0;
-		tcph->check = ~csum_tcpudp_magic(iph->saddr, iph->daddr,
-						 0, IPPROTO_TCP, 0);
-	} else if (ipv6h->version == 6) {
-		tcph = skb->encapsulation ? inner_tcp_hdr(skb) : tcp_hdr(skb);
-		ipv6h->payload_len = 0;
-		tcph->check = ~csum_ipv6_magic(&ipv6h->saddr, &ipv6h->daddr,
-					       0, IPPROTO_TCP, 0);
-	}
-
-	l4len = skb->encapsulation ? inner_tcp_hdrlen(skb) : tcp_hdrlen(skb);
-	*hdr_len = (skb->encapsulation
-		    ? (skb_inner_transport_header(skb) - skb->data)
-		    : skb_transport_offset(skb)) + l4len;
-
-	/* find the field values */
-	cd_cmd = I40E_TX_CTX_DESC_TSO;
-	cd_tso_len = skb->len - *hdr_len;
-	cd_mss = skb_shinfo(skb)->gso_size;
-	*cd_type_cmd_tso_mss |= ((u64)cd_cmd << I40E_TXD_CTX_QW1_CMD_SHIFT) |
-				((u64)cd_tso_len <<
-				 I40E_TXD_CTX_QW1_TSO_LEN_SHIFT) |
-				((u64)cd_mss << I40E_TXD_CTX_QW1_MSS_SHIFT);
-	return 1;
-}
-
-/**
- * i40e_tsyn - set up the tsyn context descriptor
- * @tx_ring:  ptr to the ring to send
- * @skb:      ptr to the skb we're sending
- * @tx_flags: the collected send information
- * @cd_type_cmd_tso_mss: ptr to u64 object
- *
- * Returns 0 if no Tx timestamp can happen and 1 if the timestamp will happen
- **/
-static int i40e_tsyn(struct i40e_ring *tx_ring, struct sk_buff *skb,
-		     u32 tx_flags, u64 *cd_type_cmd_tso_mss)
-{
-	struct i40e_pf *pf;
-
-	if (likely(!(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)))
-		return 0;
-
-	/* Tx timestamps cannot be sampled when doing TSO */
-	if (tx_flags & I40E_TX_FLAGS_TSO)
-		return 0;
-
-	/* only timestamp the outbound packet if the user has requested it and
-	 * we are not already transmitting a packet to be timestamped
-	 */
-	pf = i40e_netdev_to_pf(tx_ring->netdev);
-	if (!(pf->flags & I40E_FLAG_PTP))
-		return 0;
-
-	if (pf->ptp_tx &&
-	    !test_and_set_bit_lock(__I40E_PTP_TX_IN_PROGRESS, &pf->state)) {
-		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
-		pf->ptp_tx_skb = skb_get(skb);
-	} else {
-		return 0;
-	}
-
-	*cd_type_cmd_tso_mss |= (u64)I40E_TX_CTX_DESC_TSYN <<
-				I40E_TXD_CTX_QW1_CMD_SHIFT;
-
-	return 1;
-}
-
-/**
- * i40e_tx_enable_csum - Enable Tx checksum offloads
- * @skb: send buffer
- * @tx_flags: pointer to Tx flags currently set
- * @td_cmd: Tx descriptor command bits to set
- * @td_offset: Tx descriptor header offsets to set
- * @tx_ring: Tx descriptor ring
- * @cd_tunneling: ptr to context desc bits
- **/
-static void i40e_tx_enable_csum(struct sk_buff *skb, u32 *tx_flags,
-				u32 *td_cmd, u32 *td_offset,
-				struct i40e_ring *tx_ring,
-				u32 *cd_tunneling)
-{
-	struct ipv6hdr *this_ipv6_hdr;
-	unsigned int this_tcp_hdrlen;
-	struct iphdr *this_ip_hdr;
-	u32 network_hdr_len;
-	u8 l4_hdr = 0;
-	struct udphdr *oudph;
-	struct iphdr *oiph;
-	u32 l4_tunnel = 0;
-
-	if (skb->encapsulation) {
-		switch (ip_hdr(skb)->protocol) {
-		case IPPROTO_UDP:
-			oudph = udp_hdr(skb);
-			oiph = ip_hdr(skb);
-			l4_tunnel = I40E_TXD_CTX_UDP_TUNNELING;
-			*tx_flags |= I40E_TX_FLAGS_VXLAN_TUNNEL;
-			break;
-		case IPPROTO_GRE:
-			l4_tunnel = I40E_TXD_CTX_GRE_TUNNELING;
-			break;
-		default:
-			return;
-		}
-		network_hdr_len = skb_inner_network_header_len(skb);
-		this_ip_hdr = inner_ip_hdr(skb);
-		this_ipv6_hdr = inner_ipv6_hdr(skb);
-		this_tcp_hdrlen = inner_tcp_hdrlen(skb);
-
-		if (*tx_flags & I40E_TX_FLAGS_IPV4) {
-			if (*tx_flags & I40E_TX_FLAGS_TSO) {
-				*cd_tunneling |= I40E_TX_CTX_EXT_IP_IPV4;
-				ip_hdr(skb)->check = 0;
-			} else {
-				*cd_tunneling |=
-					 I40E_TX_CTX_EXT_IP_IPV4_NO_CSUM;
-			}
-		} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
-			*cd_tunneling |= I40E_TX_CTX_EXT_IP_IPV6;
-			if (*tx_flags & I40E_TX_FLAGS_TSO)
-				ip_hdr(skb)->check = 0;
-		}
-
-		/* Now set the ctx descriptor fields */
-		*cd_tunneling |= (skb_network_header_len(skb) >> 2) <<
-				   I40E_TXD_CTX_QW0_EXT_IPLEN_SHIFT      |
-				   l4_tunnel                             |
-				   ((skb_inner_network_offset(skb) -
-					skb_transport_offset(skb)) >> 1) <<
-				   I40E_TXD_CTX_QW0_NATLEN_SHIFT;
-		if (this_ip_hdr->version == 6) {
-			*tx_flags &= ~I40E_TX_FLAGS_IPV4;
-			*tx_flags |= I40E_TX_FLAGS_IPV6;
-		}
-		if ((tx_ring->flags & I40E_TXR_FLAGS_OUTER_UDP_CSUM) &&
-		    (l4_tunnel == I40E_TXD_CTX_UDP_TUNNELING)        &&
-		    (*cd_tunneling & I40E_TXD_CTX_QW0_EXT_IP_MASK)) {
-			oudph->check = ~csum_tcpudp_magic(oiph->saddr,
-					oiph->daddr,
-					(skb->len - skb_transport_offset(skb)),
-					IPPROTO_UDP, 0);
-			*cd_tunneling |= I40E_TXD_CTX_QW0_L4T_CS_MASK;
-		}
-	} else {
-		network_hdr_len = skb_network_header_len(skb);
-		this_ip_hdr = ip_hdr(skb);
-		this_ipv6_hdr = ipv6_hdr(skb);
-		this_tcp_hdrlen = tcp_hdrlen(skb);
-	}
-
-	/* Enable IP checksum offloads */
-	if (*tx_flags & I40E_TX_FLAGS_IPV4) {
-		l4_hdr = this_ip_hdr->protocol;
-		/* the stack computes the IP header already, the only time we
-		 * need the hardware to recompute it is in the case of TSO.
-		 */
-		if (*tx_flags & I40E_TX_FLAGS_TSO) {
-			*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV4_CSUM;
-			this_ip_hdr->check = 0;
-		} else {
-			*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV4;
-		}
-		/* Now set the td_offset for IP header length */
-		*td_offset = (network_hdr_len >> 2) <<
-			      I40E_TX_DESC_LENGTH_IPLEN_SHIFT;
-	} else if (*tx_flags & I40E_TX_FLAGS_IPV6) {
-		l4_hdr = this_ipv6_hdr->nexthdr;
-		*td_cmd |= I40E_TX_DESC_CMD_IIPT_IPV6;
-		/* Now set the td_offset for IP header length */
-		*td_offset = (network_hdr_len >> 2) <<
-			      I40E_TX_DESC_LENGTH_IPLEN_SHIFT;
-	}
-	/* words in MACLEN + dwords in IPLEN + dwords in L4Len */
-	*td_offset |= (skb_network_offset(skb) >> 1) <<
-		       I40E_TX_DESC_LENGTH_MACLEN_SHIFT;
-
-	/* Enable L4 checksum offloads */
-	switch (l4_hdr) {
-	case IPPROTO_TCP:
-		/* enable checksum offloads */
-		*td_cmd |= I40E_TX_DESC_CMD_L4T_EOFT_TCP;
-		*td_offset |= (this_tcp_hdrlen >> 2) <<
-			       I40E_TX_DESC_LENGTH_L4_FC_LEN_SHIFT;
-		break;
-	case IPPROTO_SCTP:
-		/* enable SCTP checksum offload */
-		*td_cmd |= I40E_TX_DESC_CMD_L4T_EOFT_SCTP;
-		*td_offset |= (sizeof(struct sctphdr) >> 2) <<
-			       I40E_TX_DESC_LENGTH_L4_FC_LEN_SHIFT;
-		break;
-	case IPPROTO_UDP:
-		/* enable UDP checksum offload */
-		*td_cmd |= I40E_TX_DESC_CMD_L4T_EOFT_UDP;
-		*td_offset |= (sizeof(struct udphdr) >> 2) <<
-			       I40E_TX_DESC_LENGTH_L4_FC_LEN_SHIFT;
-		break;
-	default:
-		break;
-	}
-}
-
-/**
- * i40e_create_tx_ctx Build the Tx context descriptor
- * @tx_ring:  ring to create the descriptor on
- * @cd_type_cmd_tso_mss: Quad Word 1
- * @cd_tunneling: Quad Word 0 - bits 0-31
- * @cd_l2tag2: Quad Word 0 - bits 32-63
- **/
-static void i40e_create_tx_ctx(struct i40e_ring *tx_ring,
-			       const u64 cd_type_cmd_tso_mss,
-			       const u32 cd_tunneling, const u32 cd_l2tag2)
-{
-	struct i40e_tx_context_desc *context_desc;
-	int i = tx_ring->next_to_use;
-
-	if ((cd_type_cmd_tso_mss == I40E_TX_DESC_DTYPE_CONTEXT) &&
-	    !cd_tunneling && !cd_l2tag2)
-		return;
-
-	/* grab the next descriptor */
-	context_desc = I40E_TX_CTXTDESC(tx_ring, i);
-
-	i++;
-	tx_ring->next_to_use = (i < tx_ring->count) ? i : 0;
-
-	/* cpu_to_le32 and assign to struct fields */
-	context_desc->tunneling_params = cpu_to_le32(cd_tunneling);
-	context_desc->l2tag2 = cpu_to_le16(cd_l2tag2);
-	context_desc->rsvd = cpu_to_le16(0);
-	context_desc->type_cmd_tso_mss = cpu_to_le64(cd_type_cmd_tso_mss);
-}
-
-/**
- * __i40e_maybe_stop_tx - 2nd level check for tx stop conditions
- * @tx_ring: the ring to be checked
- * @size:    the size buffer we want to assure is available
- *
- * Returns -EBUSY if a stop is needed, else 0
- **/
-static inline int __i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
-{
-	netif_stop_subqueue(tx_ring->netdev, tx_ring->queue_index);
-	/* Memory barrier before checking head and tail */
 	smp_mb();
+	if (!list_empty(&fs_info->tree_mod_seq_list))
+		WARN(1, KERN_ERR "BTRFS: tree_mod_seq_list not empty when "
+			"creating a fresh transaction\n");
+	if (!RB_EMPTY_ROOT(&fs_info->tree_mod_log))
+		WARN(1, KERN_ERR "BTRFS: tree_mod_log rb tree not empty when "
+			"creating a fresh transaction\n");
+	atomic64_set(&fs_info->tree_mod_seq, 0);
 
-	/* Check again in a case another CPU has just made room available. */
-	if (likely(I40E_DESC_UNUSED(tx_ring) < size))
-		return -EBUSY;
+	spin_lock_init(&cur_trans->delayed_refs.lock);
 
-	/* A reprieve! - use start_queue because it doesn't call schedule */
-	netif_start_subqueue(tx_ring->netdev, tx_ring->queue_index);
-	++tx_ring->tx_stats.restart_queue;
+	INIT_LIST_HEAD(&cur_trans->pending_snapshots);
+	INIT_LIST_HEAD(&cur_trans->pending_chunks);
+	INIT_LIST_HEAD(&cur_trans->switch_commits);
+	INIT_LIST_HEAD(&cur_trans->dirty_bgs);
+	INIT_LIST_HEAD(&cur_trans->io_bgs);
+	INIT_LIST_HEAD(&cur_trans->dropped_roots);
+	mutex_init(&cur_trans->cache_write_mutex);
+	cur_trans->num_dirty_bgs = 0;
+	spin_lock_init(&cur_trans->dirty_bgs_lock);
+	INIT_LIST_HEAD(&cur_trans->deleted_bgs);
+	spin_lock_init(&cur_trans->dropped_roots_lock);
+	list_add_tail(&cur_trans->list, &fs_info->trans_list);
+	extent_io_tree_init(&cur_trans->dirty_pages,
+			     fs_info->btree_inode->i_mapping);
+	fs_info->generation++;
+	cur_trans->transid = fs_info->generation;
+	fs_info->running_transaction = cur_trans;
+	cur_trans->aborted = 0;
+	spin_unlock(&fs_info->trans_lock);
+
 	return 0;
 }
 
-/**
- * i40e_maybe_stop_tx - 1st level check for tx stop conditions
- * @tx_ring: the ring to be checked
- * @size:    the size buffer we want to assure is available
- *
- * Returns 0 if stop is not needed
- **/
-#ifdef I40E_FCOE
-inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
-#else
-static inline int i40e_maybe_stop_tx(struct i40e_ring *tx_ring, int size)
-#endif
+/*
+ * this does all the record keeping required to make sure that a reference
+ * counted root is properly recorded in a given transaction.  This is required
+ * to make sure the old root from before we joined the transaction is deleted
+ * when the transaction commits
+ */
+static int record_root_in_trans(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root)
 {
-	if (likely(I40E_DESC_UNUSED(tx_ring) >= size))
-		return 0;
-	return __i40e_maybe_stop_tx(tx_ring, size);
-}
+	if (test_bit(BTRFS_ROOT_REF_COWS, &root->state) &&
+	    root->last_trans < trans->transid) {
+		WARN_ON(root == root->fs_info->extent_root);
+		WARN_ON(root->commit_root != root->node);
 
-/**
- * i40e_chk_linearize - Check if there are more than 8 fragments per packet
- * @skb:      send buffer
- * @tx_flags: collected send information
- *
- * Note: Our HW can't scatter-gather more than 8 fragments to build
- * a packet on the wire and so we need to figure out the cases where we
- * need to linearize the skb.
- **/
-static bool i40e_chk_linearize(struct sk_buff *skb, u32 tx_flags)
-{
-	struct skb_frag_struct *frag;
-	bool linearize = false;
-	unsigned int size = 0;
-	u16 num_frags;
-	u16 gso_segs;
-
-	num_frags = skb_shinfo(skb)->nr_frags;
-	gso_segs = skb_shinfo(skb)->gso_segs;
-
-	if (tx_flags & (I40E_TX_FLAGS_TSO | I40E_TX_FLAGS_FSO)) {
-		u16 j = 0;
-
-		if (num_frags < (I40E_MAX_BUFFER_TXD))
-			goto linearize_chk_done;
-		/* try the simple math, if we have too many frags per segment */
-		if (DIV_ROUND_UP((num_frags + gso_segs), gso_segs) >
-		    I40E_MAX_BUFFER_TXD) {
-			linearize = true;
-			goto linearize_chk_done;
-		}
-		frag = &skb_shinfo(skb)->frags[0];
-		/* we might still have more fragments per segment */
-		do {
-			size += skb_frag_size(frag);
-			frag++; j++;
-			if ((size >= skb_shinfo(skb)->gso_size) &&
-			    (j < I40E_MAX_BUFFER_TXD)) {
-				size = (size % skb_shinfo(skb)->gso_size);
-				j = (size) ? 1 : 0;
-			}
-			if (j == I40E_MAX_BUFFER_TXD) {
-				linearize = true;
-				break;
-			}
-			num_frags--;
-		} while (num_frags);
-	} else {
-		if (num_frags >= I40E_MAX_BUFFER_TXD)
-			linearize = true;
-	}
-
-linearize_chk_done:
-	return linearize;
-}
-
-/**
- * i40e_tx_map - Build the Tx descriptor
- * @tx_ring:  ring to send buffer on
- * @skb:      send buffer
- * @first:    first buffer info buffer to use
- * @tx_flags: collected send information
- * @hdr_len:  size of the packet header
- * @td_cmd:   the command field in the descriptor
- * @td_offset: offset for checksum or crc
- **/
-#ifdef I40E_FCOE
-inline void i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,
-			struct i40e_tx_buffer *first, u32 tx_flags,
-			const u8 hdr_len, u32 td_cmd, u32 td_offset)
-#else
-static inline void i40e_tx_map(struct i40e_ring *tx_ring, struct sk_buff *skb,
-			       struct i40e_tx_buffer *first, u32 tx_flags,
-			       const u8 hdr_len, u32 td_cmd, u32 td_offset)
-#endif
-{
-	unsigned int data_len = skb->data_len;
-	unsigned int size = skb_headlen(skb);
-	struct skb_frag_struct *frag;
-	struct i40e_tx_buffer *tx_bi;
-	struct i40e_tx_desc *tx_desc;
-	u16 i = tx_ring->next_to_use;
-	u32 td_tag = 0;
-	dma_addr_t dma;
-	u16 gso_segs;
-	u16 desc_count = 0;
-	bool tail_bump = true;
-	bool do_rs = false;
-
-	if (tx_flags & I40E_TX_FLAGS_HW_VLAN) {
-		td_cmd |= I40E_TX_DESC_CMD_IL2TAG1;
-		td_tag = (tx_flags & I40E_TX_FLAGS_VLAN_MASK) >>
-			 I40E_TX_FLAGS_VLAN_SHIFT;
-	}
-
-	if (tx_flags & (I40E_TX_FLAGS_TSO | I40E_TX_FLAGS_FSO))
-		gso_segs = skb_shinfo(skb)->gso_segs;
-	else
-		gso_segs = 1;
-
-	/* multiply data chunks by size of headers */
-	first->bytecount = skb->len - hdr_len + (gso_segs * hdr_len);
-	first->gso_segs = gso_segs;
-	first->skb = skb;
-	first->tx_flags = tx_flags;
-
-	dma = dma_map_single(tx_ring->dev, skb->data, size, DMA_TO_DEVICE);
-
-	tx_desc = I40E_TX_DESC(tx_ring, i);
-	tx_bi = first;
-
-	for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
-		if (dma_mapping_error(tx_ring->dev, dma))
-			goto dma_error;
-
-		/* record length, and DMA address */
-		dma_unmap_len_set(tx_bi, len, size);
-		dma_unmap_addr_set(tx_bi, dma, dma);
-
-		tx_desc->buffer_addr = cpu_to_le64(dma);
-
-		while (unlikely(size > I40E_MAX_DATA_PER_TXD)) {
-			tx_desc->cmd_type_offset_bsz =
-				build_ctob(td_cmd, td_offset,
-					   I40E_MAX_DATA_PER_TXD, td_tag);
-
-			tx_desc++;
-			i++;
-			desc_count++;
-
-			if (i == tx_ring->count) {
-				tx_desc = I40E_TX_DESC(tx_ring, 0);
-				i = 0;
-			}
-
-			dma += I40E_MAX_DATA_PER_TXD;
-			size -= I40E_MAX_DATA_PER_TXD;
-
-			tx_desc->buffer_addr = cpu_to_le64(dma);
-		}
-
-		if (likely(!data_len))
-			break;
-
-		tx_desc->cmd_type_offset_bsz = build_ctob(td_cmd, td_offset,
-							  size, td_tag);
-
-		tx_desc++;
-		i++;
-		desc_count++;
-
-		if (i == tx_ring->count) {
-			tx_desc = I40E_TX_DESC(tx_ring, 0);
-			i = 0;
-		}
-
-		size = skb_frag_size(frag);
-		data_len -= size;
-
-		dma = skb_frag_dma_map(tx_ring->dev, frag, 0, size,
-				       DMA_TO_DEVICE);
-
-		tx_bi = &tx_ring->tx_bi[i];
-	}
-
-	/* set next_to_watch value indicating a packet is present */
-	first->next_to_watch = tx_desc;
-
-	i++;
-	if (i == tx_ring->count)
-		i = 0;
-
-	tx_ring->next_to_use = i;
-
-	netdev_tx_sent_queue(netdev_get_tx_queue(tx_ring->netdev,
-						 tx_ring->queue_index),
-						 first->bytecount);
-	i40e_maybe_stop_tx(tx_ring, DESC_NEEDED);
-
-	/* Algorithm to optimize tail and RS bit setting:
-	 * if xmit_more is supported
-	 *	if xmit_more is true
-	 *		do not update tail and do not mark RS bit.
-	 *	if xmit_more is false and last xmit_more was false
-	 *		if every packet spanned less than 4 desc
-	 *			then set RS bit on 4th packet and update tail
-	 *			on every packet
-	 *		else
-	 *			update tail and set RS bit on every packet.
-	 *	if xmit_more is false and last_xmit_more was true
-	 *		update tail and set RS bit.
-	 *
-	 * Optimization: wmb to be issued only in case of tail update.
-	 * Also optimize the Descriptor WB path for RS bit with the same
-	 * algorithm.
-	 *
-	 * Note: If there are less than 4 packets
-	 * pending and interrupts were disabled the service task will
-	 * trigger a force WB.
-	 */
-	if (skb->xmit_more  &&
-	    !netif_xmit_stopped(netdev_get_tx_queue(tx_ring->netdev,
-						    tx_ring->queue_index))) {
-		tx_ring->flags |= I40E_TXR_FLAGS_LAST_XMIT_MORE_SET;
-		tail_bump = false;
-	} else if (!skb->xmit_more &&
-		   !netif_xmit_stopped(netdev_get_tx_queue(tx_ring->netdev,
-						       tx_ring->queue_index)) &&
-		   (!(tx_ring->flags & I40E_TXR_FLAGS_LAST_XMIT_MORE_SET)) &&
-		   (tx_ring->packet_stride < WB_STRIDE) &&
-		   (desc_count < WB_STRIDE)) {
-		tx_ring->packet_stride++;
-	} else {
-		tx_ring->packet_stride = 0;
-		tx_ring->flags &= ~I40E_TXR_FLAGS_LAST_XMIT_MORE_SET;
-		do_rs = true;
-	}
-	if (do_rs)
-		tx_ring->packet_stride = 0;
-
-	tx_desc->cmd_type_offset_bsz =
-			build_ctob(td_cmd, td_offset, size, td_tag) |
-			cpu_to_le64((u64)(do_rs ? I40E_TXD_CMD :
-						  I40E_TX_DESC_CMD_EOP) <<
-						  I40E_TXD_QW1_CMD_SHIFT);
-
-	/* notify HW of packet */
-	if (!tail_bump)
-		prefetchw(tx_desc + 1);
-
-	if (tail_bump) {
-		/* Force memory writes to complete before letting h/w
-		 * know there are new descriptors to fetch.  (Only
-		 * applicable for weak-ordered memory model archs,
-		 * such as IA-64).
+		/*
+		 * see below for IN_TRANS_SETUP usage rules
+		 * we have the reloc mutex held now, so there
+		 * is only one writer in this function
 		 */
-		wmb();
-		writel(i, tx_ring->tail);
+		set_bit(BTRFS_ROOT_IN_TRANS_SETUP, &root->state);
+
+		/* make sure readers find IN_TRANS_SETUP before
+		 * they find our root->last_trans update
+		 */
+		smp_wmb();
+
+		spin_lock(&root->fs_info->fs_roots_radix_lock);
+		if (root->last_trans == trans->transid) {
+			spin_unlock(&root->fs_info->fs_roots_radix_lock);
+			return 0;
+		}
+		radix_tree_tag_set(&root->fs_info->fs_roots_radix,
+			   (unsigned long)root->root_key.objectid,
+			   BTRFS_ROOT_TRANS_TAG);
+		spin_unlock(&root->fs_info->fs_roots_radix_lock);
+		root->last_trans = trans->transid;
+
+		/* this is pretty tricky.  We don't want to
+		 * take the relocation lock in btrfs_record_root_in_trans
+		 * unless we're really doing the first setup for this root in
+		 * this transaction.
+		 *
+		 * Normally we'd use root->last_trans as a flag to decide
+		 * if we want to take the expensive mutex.
+		 *
+		 * But, we have to set root->last_trans before we
+		 * init the relocation root, otherwise, we trip over warnings
+		 * in ctree.c.  The solution used here is to flag ourselves
+		 * with root IN_TRANS_SETUP.  When this is 1, we're still
+		 * fixing up the reloc trees and everyone must wait.
+		 *
+		 * When this is zero, they can trust root->last_trans and fly
+		 * through btrfs_record_root_in_trans without having to take the
+		 * lock.  smp_wmb() makes sure that all the writes above are
+		 * done before we pop in the zero below
+		 */
+		btrfs_init_reloc_root(trans, root);
+		smp_mb__before_atomic();
+		clear_bit(BTRFS_ROOT_IN_TRANS_SETUP, &root->state);
 	}
-
-	return;
-
-dma_error:
-	dev_info(tx_ring->dev, "TX DMA map failed\n");
-
-	/* clear dma mappings for failed tx_bi map */
-	for (;;) {
-		tx_bi = &tx_ring->tx_bi[i];
-		i40e_unmap_and_free_tx_resource(tx_ring, tx_bi);
-		if (tx_bi == first)
-			break;
-		if (i == 0)
-			i = tx_ring->count;
-		i--;
-	}
-
-	tx_ring->next_to_use = i;
+	return 0;
 }
 
-/**
- * i40e_xmit_descriptor_count - calculate number of tx descriptors needed
- * @skb:     send buffer
- * @tx_ring: ring to send buffer on
- *
- * Returns number of data descriptors needed for this skb. Returns 0 to indicate
- * there is not enough descriptors available in this ring since we need at least
- * one descriptor.
- **/
-#ifdef I40E_FCOE
-inline int i40e_xmit_descriptor_count(struct sk_buff *skb,
-				      struct i40e_ring *tx_ring)
-#else
-static inline int i40e_xmit_descriptor_count(struct sk_buff *skb,
-					     struct i40e_ring *tx_ring)
-#endif
+
+void btrfs_add_dropped_root(struct btrfs_trans_handle *trans,
+			    struct btrfs_root *root)
 {
-	unsigned int f;
-	int count = 0;
+	struct btrfs_transaction *cur_trans = trans->transaction;
 
-	/* need: 1 descriptor per page * PAGE_SIZE/I40E_MAX_DATA_PER_TXD,
-	 *       + 1 desc for skb_head_len/I40E_MAX_DATA_PER_TXD,
-	 *       + 4 desc gap to avoid the cache line where head is,
-	 *       + 1 desc for context descriptor,
-	 * otherwise try next time
-	 */
-	for (f = 0; f < skb_shinfo(skb)->nr_frags; f++)
-		count += TXD_USE_COUNT(skb_shinfo(skb)->frags[f].size);
+	/* Add ourselves to the transaction dropped list */
+	spin_lock(&cur_trans->dropped_roots_lock);
+	list_add_tail(&root->root_list, &cur_trans->dropped_roots);
+	spin_unlock(&cur_trans->dropped_roots_lock);
 
-	count += TXD_USE_COUNT(skb_headlen(skb));
-	if (i40e_maybe_stop_tx(tx_ring, count + 4 + 1)) {
-		tx_ring->tx_stats.tx_busy++;
+	/* Make sure we don't try to update the root at commit time */
+	spin_lock(&root->fs_info->fs_roots_radix_lock);
+	radix_tree_tag_clear(&root->fs_info->fs_roots_radix,
+			     (unsigned long)root->root_key.objectid,
+			     BTRFS_ROOT_TRANS_TAG);
+	spin_unlock(&root->fs_info->fs_roots_radix_lock);
+}
+
+int btrfs_record_root_in_trans(struct btrfs_trans_handle *trans,
+			       struct btrfs_root *root)
+{
+	if (!test_bit(BTRFS_ROOT_REF_COWS, &root->state))
 		return 0;
-	}
-	return count;
+
+	/*
+	 * see record_root_in_trans for comments about IN_TRANS_SETUP usage
+	 * and barriers
+	 */
+	smp_rmb();
+	if (root->last_trans == trans->transid &&
+	    !test_bit(BTRFS_ROOT_IN_TRANS_SETUP, &root->state))
+		return 0;
+
+	mutex_lock(&root->fs_info->reloc_mutex);
+	record_root_in_trans(trans, root);
+	mutex_unlock(&root->fs_info->reloc_mutex);
+
+	return 0;
 }
 
-/**
- * i40e_xmit_frame_ring - Sends buffer on Tx ring
- * @skb:     send buffer
- * @tx_ring: ring to send buffer on
- *
- * Returns NETDEV_TX_OK if sent, else an error code
- **/
-static netdev_tx_t i40e_xmit_frame_ring(struct sk_buff *skb,
-					struct i40e_ring *tx_ring)
+static inline int is_transaction_blocked(struct btrfs_transaction *trans)
 {
-	u64 cd_type_cmd_tso_mss = I40E_TX_DESC_DTYPE_CONTEXT;
-	u32 cd_tunneling = 0, cd_l2tag2 = 0;
-	struct i40e_tx_buffer *first;
-	u32 td_offset = 0;
-	u32 tx_flags = 0;
-	__be16 protocol;
-	u32 td_cmd = 0;
-	u8 hdr_len = 0;
-	int tsyn;
-	int tso;
+	return (trans->state >= TRANS_STATE_BLOCKED &&
+		trans->state < TRANS_STATE_UNBLOCKED &&
+		!trans->aborted);
+}
 
-	if (0 == i40e_xmit_descriptor_count(skb, tx_ring))
-		return NETDEV_TX_BUSY;
+/* wait for commit against the current transaction to become unblocked
+ * when this is done, it is safe to start a new transaction, but the current
+ * transaction might not be fully on disk.
+ */
+static void wait_current_trans(struct btrfs_root *root)
+{
+	struct btrfs_transaction *cur_trans;
 
-	/* prepare the xmit flags */
-	if (i40e_tx_prepare_vlan_flags(skb, tx_ring, &tx_flags))
-		goto out_drop;
+	spin_lock(&root->fs_info->trans_lock);
+	cur_trans = root->fs_info->running_transaction;
+	if (cur_trans && is_transaction_blocked(cur_trans)) {
+		atomic_inc(&cur_trans->use_count);
+		spin_unlock(&root->fs_info->trans_lock);
 
-	/* obtain protocol of skb */
-	protocol = vlan_get_protocol(skb);
-
-	/* record the location of the first descriptor for this packet */
-	first = &tx_ring->tx_bi[tx_ring->next_to_use];
-
-	/* setup IPv4/IPv6 offloads */
-	if (protocol == htons(ETH_P_IP))
-		tx_flags |= I40E_TX_FLAGS_IPV4;
-	else if (protocol == htons(ETH_P_IPV6))
-		tx_flags |= I40E_TX_FLAGS_IPV6;
-
-	tso = i40e_tso(tx_ring, skb, &hdr_len,
-		       &cd_type_cmd_tso_mss, &cd_tunneling);
-
-	if (tso < 0)
-		goto out_drop;
-	else if (tso)
-		tx_flags |= I40E_TX_FLAGS_TSO;
-
-	tsyn = i40e_tsyn(tx_ring, skb, tx_flags, &cd_type_cmd_tso_mss);
-
-	if (tsyn)
-		tx_flags |= I40E_TX_FLAGS_TSYN;
-
-	if (i40e_chk_linearize(skb, tx_flags)) {
-		if (skb_linearize(skb))
-			goto out_drop;
-		tx_ring->tx_stats.tx_linearize++;
+		wait_event(root->fs_info->transaction_wait,
+			   cur_trans->state >= TRANS_STATE_UNBLOCKED ||
+			   cur_trans->aborted);
+		btrfs_put_transaction(cur_trans);
+	} else {
+		spin_unlock(&root->fs_info->trans_lock);
 	}
-	skb_tx_timestamp(skb);
+}
 
-	/* always enable CRC insertion offload */
-	td_cmd |= I40E_TX_DESC_CMD_ICRC;
+static int may_wait_transaction(struct btrfs_root *root, int type)
+{
+	if (root->fs_info->log_root_recovering)
+		return 0;
 
-	/* Always offload the checksum, since it's in the data descriptor */
-	if (skb->ip_summed == CHECKSUM_PARTIAL) {
-		tx_flags |= I40E_TX_FLAGS_CSUM;
+	if (type == TRANS_USERSPACE)
+		return 1;
 
-		i40e_tx_enable_csum(skb, &tx_flags, &td_cmd, &td_offset,
-				    tx_ring, &cd_tunneling);
+	if (type == TRANS_START &&
+	    !atomic_read(&root->fs_info->open_ioctl_trans))
+		return 1;
+
+	return 0;
+}
+
+static inline bool need_reserve_reloc_root(struct btrfs_root *root)
+{
+	if (!root->fs_info->reloc_ctl ||
+	    !test_bit(BTRFS_ROOT_REF_COWS, &root->state) ||
+	    root->root_key.objectid == BTRFS_TREE_RELOC_OBJECTID ||
+	    root->reloc_root)
+		return false;
+
+	return true;
+}
+
+static struct btrfs_trans_handle *
+start_transaction(struct btrfs_root *root, unsigned int num_items,
+		  unsigned int type, enum btrfs_reserve_flush_enum flush)
+{
+	struct btrfs_trans_handle *h;
+	struct btrfs_transaction *cur_trans;
+	u64 num_bytes = 0;
+	u64 qgroup_reserved = 0;
+	bool reloc_reserved = false;
+	int ret;
+
+	/* Send isn't supposed to start transactions. */
+	ASSERT(current->journal_info != BTRFS_SEND_TRANS_STUB);
+
+	if (test_bit(BTRFS_FS_STATE_ERROR, &root->fs_info->fs_state))
+		return ERR_PTR(-EROFS);
+
+	if (current->journal_info) {
+		WARN_ON(type & TRANS_EXTWRITERS);
+		h = current->journal_info;
+		h->use_count++;
+		WARN_ON(h->use_count > 2);
+		h->orig_rsv = h->block_rsv;
+		h->block_rsv = NULL;
+		goto got_it;
 	}
 
-	i40e_create_tx_ctx(tx_ring, cd_type_cmd_tso_mss,
-			   cd_tunneling, cd_l2tag2);
+	/*
+	 * Do the reservation before we join the transaction so we can do all
+	 * the appropriate flushing if need be.
+	 */
+	if (num_items > 0 && root != root->fs_info->chunk_root) {
+		qgroup_reserved = num_items * root->nodesize;
+		ret = btrfs_qgroup_reserve_meta(root, qgroup_reserved);
+		if (ret)
+			return ERR_PTR(ret);
 
-	/* Add Flow Director ATR if it's enabled.
+		num_bytes = btrfs_calc_trans_metadata_size(root, num_items);
+		/*
+		 * Do the reservation for the relocation root creation
+		 */
+		if (need_reserve_reloc_root(root)) {
+			num_bytes += root->nodesize;
+			reloc_reserved = true;
+		}
+
+		ret = btrfs_block_rsv_add(root,
+					  &root->fs_info->trans_block_rsv,
+					  num_bytes, flush);
+		if (ret)
+			goto reserve_fail;
+	}
+again:
+	h = kmem_cache_zalloc(btrfs_trans_handle_cachep, GFP_NOFS);
+	if (!h) {
+		ret = -ENOMEM;
+		goto alloc_fail;
+	}
+
+	/*
+	 * If we are JOIN_NOLOCK we're already committing a transaction and
+	 * waiting on this guy, so we don't need to do the sb_start_intwrite
+	 * because we're already holding a ref.  We need this because we could
+	 * have raced in and did an fsync() on a file which can kick a commit
+	 * and then we deadlock with somebody doing a freeze.
 	 *
-	 * NOTE: this must always be directly before the data descriptor.
+	 * If we are ATTACH, it means we just want to catch the current
+	 * transaction and commit it, so we needn't do sb_start_intwrite(). 
 	 */
-	i40e_atr(tx_ring, skb, tx_flags, protocol);
+	if (type & __TRANS_FREEZABLE)
+		sb_start_intwrite(root->fs_info->sb);
 
-	i40e_tx_map(tx_ring, skb, first, tx_flags, hdr_len,
-		    td_cmd, td_offset);
+	if (may_wait_transaction(root, type))
+		wait_current_trans(root);
 
-	return NETDEV_TX_OK;
+	do {
+		ret = join_transaction(root, type);
+		if (ret == -EBUSY) {
+			wait_current_trans(root);
+			if (unlikely(type == TRANS_ATTACH))
+				ret = -ENOENT;
+		}
+	} while (ret == -EBUSY);
 
-out_drop:
-	dev_kfree_skb_any(skb);
-	return NETDEV_TX_OK;
-}
+	if (ret < 0) {
+		/* We must get the transaction if we are JOIN_NOLOCK. */
+		BUG_ON(type == TRANS_JOIN_NOLOCK);
+		goto join_fail;
+	}
 
-/**
- * i40e_lan_xmit_frame - Selects the correct VSI and Tx queue to send buffer
- * @skb:    send buffer
- * @netdev: network interface device structure
- *
- * Returns NETDEV_TX_OK if sent, else an error code
- **/
-netdev_tx_t i40e_lan_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
-{
-	struct i40e_netdev_priv *np = netdev_priv(netdev);
-	struct i40e_vsi *vsi = np->vsi;
-	struct i40e_ring *tx_ring = vsi->tx_rings[skb->queue_mapping];
+	cur_trans = root->fs_info->running_transaction;
 
-	/* hardware can't handle really short frames, hardware padding works
-	 * beyond this point
-	 */
-	if (skb_put_padto(skb, I40E_MIN_TX_LEN))
-		return NETDEV_TX_OK;
+	h->transid = cur_trans->transid;
+	h->transaction = cur_trans;
+	h->root = root;
+	h->use_count = 1;
 
-	return i40e_xmit_frame_ring(skb, tx_ring);
-}
+	h->type = type;
+	h->can_flush_pending_bgs = true;
+	INIT_LIST_HEAD(&h->qgroup_ref_list);
+	INIT_LIST_HEAD(&h->new_bgs);
+
+	smp_mb();
+	if (cur_trans->state >= TRANS_STATE_BLOCKED &&
+	    may_wait_transaction(root, type)) {
+		current->journal_info = h;
+		btrfs_commit_transaction(h, root);
+		goto again;
+	}
+
+	if (num_bytes) {
+		trace_btrfs_spa

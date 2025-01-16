@@ -1,293 +1,163 @@
-/*
- * Support for emulating SAT (ata pass through) on devices based
- *       on the Cypress USB/ATA bridge supporting ATACB.
- *
- * Copyright (c) 2008 Matthieu Castet (castet.matthieu@free.fr)
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
- */
-
-#include <linux/module.h>
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-#include <scsi/scsi_eh.h>
-#include <linux/ata.h>
-
-#include "usb.h"
-#include "protocol.h"
-#include "scsiglue.h"
-#include "debug.h"
-
-#define DRV_NAME "ums-cypress"
-
-MODULE_DESCRIPTION("SAT support for Cypress USB/ATA bridges with ATACB");
-MODULE_AUTHOR("Matthieu Castet <castet.matthieu@free.fr>");
-MODULE_LICENSE("GPL");
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-static struct usb_device_id cypress_usb_ids[] = {
-#	include "unusual_cypress.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, cypress_usb_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev cypress_unusual_dev_list[] = {
-#	include "unusual_cypress.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-
-/*
- * ATACB is a protocol used on cypress usb<->ata bridge to
- * send raw ATA command over mass storage
- * There is a ATACB2 protocol that support LBA48 on newer chip.
- * More info that be found on cy7c68310_8.pdf and cy7c68300c_8.pdf
- * datasheet from cypress.com.
- */
-static void cypress_atacb_passthrough(struct scsi_cmnd *srb, struct us_data *us)
-{
-	unsigned char save_cmnd[MAX_COMMAND_SIZE];
-
-	if (likely(srb->cmnd[0] != ATA_16 && srb->cmnd[0] != ATA_12)) {
-		usb_stor_transparent_scsi_command(srb, us);
-		return;
-	}
-
-	memcpy(save_cmnd, srb->cmnd, sizeof(save_cmnd));
-	memset(srb->cmnd, 0, MAX_COMMAND_SIZE);
-
-	/* check if we support the command */
-	if (save_cmnd[1] >> 5) /* MULTIPLE_COUNT */
-		goto invalid_fld;
-	/* check protocol */
-	switch ((save_cmnd[1] >> 1) & 0xf) {
-	case 3: /*no DATA */
-	case 4: /* PIO in */
-	case 5: /* PIO out */
-		break;
-	default:
-		goto invalid_fld;
-	}
-
-	/* first build the ATACB command */
-	srb->cmd_len = 16;
-
-	srb->cmnd[0] = 0x24; /* bVSCBSignature : vendor-specific command
-	                        this value can change, but most(all ?) manufacturers
-							keep the cypress default : 0x24 */
-	srb->cmnd[1] = 0x24; /* bVSCBSubCommand : 0x24 for ATACB */
-
-	srb->cmnd[3] = 0xff - 1; /* features, sector count, lba low, lba med
-								lba high, device, command are valid */
-	srb->cmnd[4] = 1; /* TransferBlockCount : 512 */
-
-	if (save_cmnd[0] == ATA_16) {
-		srb->cmnd[ 6] = save_cmnd[ 4]; /* features */
-		srb->cmnd[ 7] = save_cmnd[ 6]; /* sector count */
-		srb->cmnd[ 8] = save_cmnd[ 8]; /* lba low */
-		srb->cmnd[ 9] = save_cmnd[10]; /* lba med */
-		srb->cmnd[10] = save_cmnd[12]; /* lba high */
-		srb->cmnd[11] = save_cmnd[13]; /* device */
-		srb->cmnd[12] = save_cmnd[14]; /* command */
-
-		if (save_cmnd[1] & 0x01) {/* extended bit set for LBA48 */
-			/* this could be supported by atacb2 */
-			if (save_cmnd[3] || save_cmnd[5] || save_cmnd[7] || save_cmnd[9]
-					|| save_cmnd[11])
-				goto invalid_fld;
-		}
-	} else { /* ATA12 */
-		srb->cmnd[ 6] = save_cmnd[3]; /* features */
-		srb->cmnd[ 7] = save_cmnd[4]; /* sector count */
-		srb->cmnd[ 8] = save_cmnd[5]; /* lba low */
-		srb->cmnd[ 9] = save_cmnd[6]; /* lba med */
-		srb->cmnd[10] = save_cmnd[7]; /* lba high */
-		srb->cmnd[11] = save_cmnd[8]; /* device */
-		srb->cmnd[12] = save_cmnd[9]; /* command */
-
-	}
-	/* Filter SET_FEATURES - XFER MODE command */
-	if ((srb->cmnd[12] == ATA_CMD_SET_FEATURES)
-			&& (srb->cmnd[6] == SETFEATURES_XFER))
-		goto invalid_fld;
-
-	if (srb->cmnd[12] == ATA_CMD_ID_ATA || srb->cmnd[12] == ATA_CMD_ID_ATAPI)
-		srb->cmnd[2] |= (1<<7); /* set  IdentifyPacketDevice for these cmds */
-
-
-	usb_stor_transparent_scsi_command(srb, us);
-
-	/* if the device doesn't support ATACB
-	 */
-	if (srb->result == SAM_STAT_CHECK_CONDITION &&
-			memcmp(srb->sense_buffer, usb_stor_sense_invalidCDB,
-				sizeof(usb_stor_sense_invalidCDB)) == 0) {
-		usb_stor_dbg(us, "cypress atacb not supported ???\n");
-		goto end;
-	}
-
-	/* if ck_cond flags is set, and there wasn't critical error,
-	 * build the special sense
-	 */
-	if ((srb->result != (DID_ERROR << 16) &&
-				srb->result != (DID_ABORT << 16)) &&
-			save_cmnd[2] & 0x20) {
-		struct scsi_eh_save ses;
-		unsigned char regs[8];
-		unsigned char *sb = srb->sense_buffer;
-		unsigned char *desc = sb + 8;
-		int tmp_result;
-
-		/* build the command for
-		 * reading the ATA registers */
-		scsi_eh_prep_cmnd(srb, &ses, NULL, 0, sizeof(regs));
-
-		/* we use the same command as before, but we set
-		 * the read taskfile bit, for not executing atacb command,
-		 * but reading register selected in srb->cmnd[4]
-		 */
-		srb->cmd_len = 16;
-		srb->cmnd = ses.cmnd;
-		srb->cmnd[2] = 1;
-
-		usb_stor_transparent_scsi_command(srb, us);
-		memcpy(regs, srb->sense_buffer, sizeof(regs));
-		tmp_result = srb->result;
-		scsi_eh_restore_cmnd(srb, &ses);
-		/* we fail to get registers, report invalid command */
-		if (tmp_result != SAM_STAT_GOOD)
-			goto invalid_fld;
-
-		/* build the sense */
-		memset(sb, 0, SCSI_SENSE_BUFFERSIZE);
-
-		/* set sk, asc for a good command */
-		sb[1] = RECOVERED_ERROR;
-		sb[2] = 0; /* ATA PASS THROUGH INFORMATION AVAILABLE */
-		sb[3] = 0x1D;
-
-		/* XXX we should generate sk, asc, ascq from status and error
-		 * regs
-		 * (see 11.1 Error translation ATA device error to SCSI error
-		 *  map, and ata_to_sense_error from libata.)
-		 */
-
-		/* Sense data is current and format is descriptor. */
-		sb[0] = 0x72;
-		desc[0] = 0x09; /* ATA_RETURN_DESCRIPTOR */
-
-		/* set length of additional sense data */
-		sb[7] = 14;
-		desc[1] = 12;
-
-		/* Copy registers into sense buffer. */
-		desc[ 2] = 0x00;
-		desc[ 3] = regs[1];  /* features */
-		desc[ 5] = regs[2];  /* sector count */
-		desc[ 7] = regs[3];  /* lba low */
-		desc[ 9] = regs[4];  /* lba med */
-		desc[11] = regs[5];  /* lba high */
-		desc[12] = regs[6];  /* device */
-		desc[13] = regs[7];  /* command */
-
-		srb->result = (DRIVER_SENSE << 24) | SAM_STAT_CHECK_CONDITION;
-	}
-	goto end;
-invalid_fld:
-	srb->result = (DRIVER_SENSE << 24) | SAM_STAT_CHECK_CONDITION;
-
-	memcpy(srb->sense_buffer,
-			usb_stor_sense_invalidCDB,
-			sizeof(usb_stor_sense_invalidCDB));
-end:
-	memcpy(srb->cmnd, save_cmnd, sizeof(save_cmnd));
-	if (srb->cmnd[0] == ATA_12)
-		srb->cmd_len = 12;
-}
-
-static struct scsi_host_template cypress_host_template;
-
-static int cypress_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-	struct usb_device *device;
-
-	result = usb_stor_probe1(&us, intf, id,
-			(id - cypress_usb_ids) + cypress_unusual_dev_list,
-			&cypress_host_template);
-	if (result)
-		return result;
-
-	/* Among CY7C68300 chips, the A revision does not support Cypress ATACB
-	 * Filter out this revision from EEPROM default descriptor values
-	 */
-	device = interface_to_usbdev(intf);
-	if (device->descriptor.iManufacturer != 0x38 ||
-	    device->descriptor.iProduct != 0x4e ||
-	    device->descriptor.iSerialNumber != 0x64) {
-		us->protocol_name = "Transparent SCSI with Cypress ATACB";
-		us->proto_handler = cypress_atacb_passthrough;
-	} else {
-		us->protocol_name = "Transparent SCSI";
-		us->proto_handler = usb_stor_transparent_scsi_command;
-	}
-
-	result = usb_stor_probe2(us);
-	return result;
-}
-
-static struct usb_driver cypress_driver = {
-	.name =		DRV_NAME,
-	.probe =	cypress_probe,
-	.disconnect =	usb_stor_disconnect,
-	.suspend =	usb_stor_suspend,
-	.resume =	usb_stor_resume,
-	.reset_resume =	usb_stor_reset_resume,
-	.pre_reset =	usb_stor_pre_reset,
-	.post_reset =	usb_stor_post_reset,
-	.id_table =	cypress_usb_ids,
-	.soft_unbind =	1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(cypress_driver, cypress_host_template, DRV_NAME);
+CIE_PERF_CNTL_TXCLK2__EVENT0_SEL__SHIFT 0x0
+#define PCIE_PERF_CNTL_TXCLK2__EVENT1_SEL_MASK 0xff00
+#define PCIE_PERF_CNTL_TXCLK2__EVENT1_SEL__SHIFT 0x8
+#define PCIE_PERF_CNTL_TXCLK2__COUNTER0_UPPER_MASK 0xff0000
+#define PCIE_PERF_CNTL_TXCLK2__COUNTER0_UPPER__SHIFT 0x10
+#define PCIE_PERF_CNTL_TXCLK2__COUNTER1_UPPER_MASK 0xff000000
+#define PCIE_PERF_CNTL_TXCLK2__COUNTER1_UPPER__SHIFT 0x18
+#define PCIE_PERF_COUNT0_TXCLK2__COUNTER0_MASK 0xffffffff
+#define PCIE_PERF_COUNT0_TXCLK2__COUNTER0__SHIFT 0x0
+#define PCIE_PERF_COUNT1_TXCLK2__COUNTER1_MASK 0xffffffff
+#define PCIE_PERF_COUNT1_TXCLK2__COUNTER1__SHIFT 0x0
+#define PCIE_STRAP_F0__STRAP_F0_EN_MASK 0x1
+#define PCIE_STRAP_F0__STRAP_F0_EN__SHIFT 0x0
+#define PCIE_STRAP_F0__STRAP_F0_LEGACY_DEVICE_TYPE_EN_MASK 0x2
+#define PCIE_STRAP_F0__STRAP_F0_LEGACY_DEVICE_TYPE_EN__SHIFT 0x1
+#define PCIE_STRAP_F0__STRAP_F0_MSI_EN_MASK 0x4
+#define PCIE_STRAP_F0__STRAP_F0_MSI_EN__SHIFT 0x2
+#define PCIE_STRAP_F0__STRAP_F0_VC_EN_MASK 0x8
+#define PCIE_STRAP_F0__STRAP_F0_VC_EN__SHIFT 0x3
+#define PCIE_STRAP_F0__STRAP_F0_DSN_EN_MASK 0x10
+#define PCIE_STRAP_F0__STRAP_F0_DSN_EN__SHIFT 0x4
+#define PCIE_STRAP_F0__STRAP_F0_AER_EN_MASK 0x20
+#define PCIE_STRAP_F0__STRAP_F0_AER_EN__SHIFT 0x5
+#define PCIE_STRAP_F0__STRAP_F0_ACS_EN_MASK 0x40
+#define PCIE_STRAP_F0__STRAP_F0_ACS_EN__SHIFT 0x6
+#define PCIE_STRAP_F0__STRAP_F0_BAR_EN_MASK 0x80
+#define PCIE_STRAP_F0__STRAP_F0_BAR_EN__SHIFT 0x7
+#define PCIE_STRAP_F0__STRAP_F0_PWR_EN_MASK 0x100
+#define PCIE_STRAP_F0__STRAP_F0_PWR_EN__SHIFT 0x8
+#define PCIE_STRAP_F0__STRAP_F0_DPA_EN_MASK 0x200
+#define PCIE_STRAP_F0__STRAP_F0_DPA_EN__SHIFT 0x9
+#define PCIE_STRAP_F0__STRAP_F0_ATS_EN_MASK 0x400
+#define PCIE_STRAP_F0__STRAP_F0_ATS_EN__SHIFT 0xa
+#define PCIE_STRAP_F0__STRAP_F0_PAGE_REQ_EN_MASK 0x800
+#define PCIE_STRAP_F0__STRAP_F0_PAGE_REQ_EN__SHIFT 0xb
+#define PCIE_STRAP_F0__STRAP_F0_PASID_EN_MASK 0x1000
+#define PCIE_STRAP_F0__STRAP_F0_PASID_EN__SHIFT 0xc
+#define PCIE_STRAP_F0__STRAP_F0_ECRC_CHECK_EN_MASK 0x2000
+#define PCIE_STRAP_F0__STRAP_F0_ECRC_CHECK_EN__SHIFT 0xd
+#define PCIE_STRAP_F0__STRAP_F0_ECRC_GEN_EN_MASK 0x4000
+#define PCIE_STRAP_F0__STRAP_F0_ECRC_GEN_EN__SHIFT 0xe
+#define PCIE_STRAP_F0__STRAP_F0_CPL_ABORT_ERR_EN_MASK 0x8000
+#define PCIE_STRAP_F0__STRAP_F0_CPL_ABORT_ERR_EN__SHIFT 0xf
+#define PCIE_STRAP_F0__STRAP_F0_POISONED_ADVISORY_NONFATAL_MASK 0x10000
+#define PCIE_STRAP_F0__STRAP_F0_POISONED_ADVISORY_NONFATAL__SHIFT 0x10
+#define PCIE_STRAP_F0__STRAP_F0_MC_EN_MASK 0x20000
+#define PCIE_STRAP_F0__STRAP_F0_MC_EN__SHIFT 0x11
+#define PCIE_STRAP_F1__STRAP_F1_EN_MASK 0x1
+#define PCIE_STRAP_F1__STRAP_F1_EN__SHIFT 0x0
+#define PCIE_STRAP_F1__STRAP_F1_LEGACY_DEVICE_TYPE_EN_MASK 0x2
+#define PCIE_STRAP_F1__STRAP_F1_LEGACY_DEVICE_TYPE_EN__SHIFT 0x1
+#define PCIE_STRAP_F1__STRAP_F1_MSI_EN_MASK 0x4
+#define PCIE_STRAP_F1__STRAP_F1_MSI_EN__SHIFT 0x2
+#define PCIE_STRAP_F1__STRAP_F1_VC_EN_MASK 0x8
+#define PCIE_STRAP_F1__STRAP_F1_VC_EN__SHIFT 0x3
+#define PCIE_STRAP_F1__STRAP_F1_DSN_EN_MASK 0x10
+#define PCIE_STRAP_F1__STRAP_F1_DSN_EN__SHIFT 0x4
+#define PCIE_STRAP_F1__STRAP_F1_AER_EN_MASK 0x20
+#define PCIE_STRAP_F1__STRAP_F1_AER_EN__SHIFT 0x5
+#define PCIE_STRAP_F1__STRAP_F1_ACS_EN_MASK 0x40
+#define PCIE_STRAP_F1__STRAP_F1_ACS_EN__SHIFT 0x6
+#define PCIE_STRAP_F1__STRAP_F1_BAR_EN_MASK 0x80
+#define PCIE_STRAP_F1__STRAP_F1_BAR_EN__SHIFT 0x7
+#define PCIE_STRAP_F1__STRAP_F1_PWR_EN_MASK 0x100
+#define PCIE_STRAP_F1__STRAP_F1_PWR_EN__SHIFT 0x8
+#define PCIE_STRAP_F1__STRAP_F1_DPA_EN_MASK 0x200
+#define PCIE_STRAP_F1__STRAP_F1_DPA_EN__SHIFT 0x9
+#define PCIE_STRAP_F1__STRAP_F1_ATS_EN_MASK 0x400
+#define PCIE_STRAP_F1__STRAP_F1_ATS_EN__SHIFT 0xa
+#define PCIE_STRAP_F1__STRAP_F1_PAGE_REQ_EN_MASK 0x800
+#define PCIE_STRAP_F1__STRAP_F1_PAGE_REQ_EN__SHIFT 0xb
+#define PCIE_STRAP_F1__STRAP_F1_PASID_EN_MASK 0x1000
+#define PCIE_STRAP_F1__STRAP_F1_PASID_EN__SHIFT 0xc
+#define PCIE_STRAP_F1__STRAP_F1_ECRC_CHECK_EN_MASK 0x2000
+#define PCIE_STRAP_F1__STRAP_F1_ECRC_CHECK_EN__SHIFT 0xd
+#define PCIE_STRAP_F1__STRAP_F1_ECRC_GEN_EN_MASK 0x4000
+#define PCIE_STRAP_F1__STRAP_F1_ECRC_GEN_EN__SHIFT 0xe
+#define PCIE_STRAP_F1__STRAP_F1_CPL_ABORT_ERR_EN_MASK 0x8000
+#define PCIE_STRAP_F1__STRAP_F1_CPL_ABORT_ERR_EN__SHIFT 0xf
+#define PCIE_STRAP_F1__STRAP_F1_POISONED_ADVISORY_NONFATAL_MASK 0x10000
+#define PCIE_STRAP_F1__STRAP_F1_POISONED_ADVISORY_NONFATAL__SHIFT 0x10
+#define PCIE_STRAP_F2__STRAP_F2_EN_MASK 0x1
+#define PCIE_STRAP_F2__STRAP_F2_EN__SHIFT 0x0
+#define PCIE_STRAP_F2__STRAP_F2_LEGACY_DEVICE_TYPE_EN_MASK 0x2
+#define PCIE_STRAP_F2__STRAP_F2_LEGACY_DEVICE_TYPE_EN__SHIFT 0x1
+#define PCIE_STRAP_F2__STRAP_F2_MSI_EN_MASK 0x4
+#define PCIE_STRAP_F2__STRAP_F2_MSI_EN__SHIFT 0x2
+#define PCIE_STRAP_F2__STRAP_F2_VC_EN_MASK 0x8
+#define PCIE_STRAP_F2__STRAP_F2_VC_EN__SHIFT 0x3
+#define PCIE_STRAP_F2__STRAP_F2_DSN_EN_MASK 0x10
+#define PCIE_STRAP_F2__STRAP_F2_DSN_EN__SHIFT 0x4
+#define PCIE_STRAP_F2__STRAP_F2_AER_EN_MASK 0x20
+#define PCIE_STRAP_F2__STRAP_F2_AER_EN__SHIFT 0x5
+#define PCIE_STRAP_F2__STRAP_F2_ACS_EN_MASK 0x40
+#define PCIE_STRAP_F2__STRAP_F2_ACS_EN__SHIFT 0x6
+#define PCIE_STRAP_F2__STRAP_F2_BAR_EN_MASK 0x80
+#define PCIE_STRAP_F2__STRAP_F2_BAR_EN__SHIFT 0x7
+#define PCIE_STRAP_F2__STRAP_F2_PWR_EN_MASK 0x100
+#define PCIE_STRAP_F2__STRAP_F2_PWR_EN__SHIFT 0x8
+#define PCIE_STRAP_F2__STRAP_F2_DPA_EN_MASK 0x200
+#define PCIE_STRAP_F2__STRAP_F2_DPA_EN__SHIFT 0x9
+#define PCIE_STRAP_F2__STRAP_F2_ATS_EN_MASK 0x400
+#define PCIE_STRAP_F2__STRAP_F2_ATS_EN__SHIFT 0xa
+#define PCIE_STRAP_F2__STRAP_F2_PAGE_REQ_EN_MASK 0x800
+#define PCIE_STRAP_F2__STRAP_F2_PAGE_REQ_EN__SHIFT 0xb
+#define PCIE_STRAP_F2__STRAP_F2_PASID_EN_MASK 0x1000
+#define PCIE_STRAP_F2__STRAP_F2_PASID_EN__SHIFT 0xc
+#define PCIE_STRAP_F2__STRAP_F2_ECRC_CHECK_EN_MASK 0x2000
+#define PCIE_STRAP_F2__STRAP_F2_ECRC_CHECK_EN__SHIFT 0xd
+#define PCIE_STRAP_F2__STRAP_F2_ECRC_GEN_EN_MASK 0x4000
+#define PCIE_STRAP_F2__STRAP_F2_ECRC_GEN_EN__SHIFT 0xe
+#define PCIE_STRAP_F2__STRAP_F2_CPL_ABORT_ERR_EN_MASK 0x8000
+#define PCIE_STRAP_F2__STRAP_F2_CPL_ABORT_ERR_EN__SHIFT 0xf
+#define PCIE_STRAP_F2__STRAP_F2_POISONED_ADVISORY_NONFATAL_MASK 0x10000
+#define PCIE_STRAP_F2__STRAP_F2_POISONED_ADVISORY_NONFATAL__SHIFT 0x10
+#define PCIE_STRAP_F3__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F3__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_F4__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F4__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_F5__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F5__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_F6__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F6__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_F7__RESERVED_MASK 0xffffffff
+#define PCIE_STRAP_F7__RESERVED__SHIFT 0x0
+#define PCIE_STRAP_MISC__STRAP_LINK_CONFIG_MASK 0xf
+#define PCIE_STRAP_MISC__STRAP_LINK_CONFIG__SHIFT 0x0
+#define PCIE_STRAP_MISC__STRAP_TL_ALT_BUF_EN_MASK 0x10
+#define PCIE_STRAP_MISC__STRAP_TL_ALT_BUF_EN__SHIFT 0x4
+#define PCIE_STRAP_MISC__STRAP_MAX_PASID_WIDTH_MASK 0x1f00
+#define PCIE_STRAP_MISC__STRAP_MAX_PASID_WIDTH__SHIFT 0x8
+#define PCIE_STRAP_MISC__STRAP_PASID_EXE_PERMISSION_SUPPORTED_MASK 0x2000
+#define PCIE_STRAP_MISC__STRAP_PASID_EXE_PERMISSION_SUPPORTED__SHIFT 0xd
+#define PCIE_STRAP_MISC__STRAP_PASID_PRIV_MODE_SUPPORTED_MASK 0x4000
+#define PCIE_STRAP_MISC__STRAP_PASID_PRIV_MODE_SUPPORTED__SHIFT 0xe
+#define PCIE_STRAP_MISC__STRAP_PASID_GLOBAL_INVALIDATE_SUPPORTED_MASK 0x8000
+#define PCIE_STRAP_MISC__STRAP_PASID_GLOBAL_INVALIDATE_SUPPORTED__SHIFT 0xf
+#define PCIE_STRAP_MISC__STRAP_CLK_PM_EN_MASK 0x1000000
+#define PCIE_STRAP_MISC__STRAP_CLK_PM_EN__SHIFT 0x18
+#define PCIE_STRAP_MISC__STRAP_ECN1P1_EN_MASK 0x2000000
+#define PCIE_STRAP_MISC__STRAP_ECN1P1_EN__SHIFT 0x19
+#define PCIE_STRAP_MISC__STRAP_EXT_VC_COUNT_MASK 0x4000000
+#define PCIE_STRAP_MISC__STRAP_EXT_VC_COUNT__SHIFT 0x1a
+#define PCIE_STRAP_MISC__STRAP_REVERSE_ALL_MASK 0x10000000
+#define PCIE_STRAP_MISC__STRAP_REVERSE_ALL__SHIFT 0x1c
+#define PCIE_STRAP_MISC__STRAP_MST_ADR64_EN_MASK 0x20000000
+#define PCIE_STRAP_MISC__STRAP_MST_ADR64_EN__SHIFT 0x1d
+#define PCIE_STRAP_MISC__STRAP_FLR_EN_MASK 0x40000000
+#define PCIE_STRAP_MISC__STRAP_FLR_EN__SHIFT 0x1e
+#define PCIE_STRAP_MISC__STRAP_INTERNAL_ERR_EN_MASK 0x80000000
+#define PCIE_STRAP_MISC__STRAP_INTERNAL_ERR_EN__SHIFT 0x1f
+#define PCIE_STRAP_MISC2__STRAP_GEN2_COMPLIANCE_MASK 0x2
+#define PCIE_STRAP_MISC2__STRAP_GEN2_COMPLIANCE__SHIFT 0x1
+#define PCIE_STRAP_MISC2__STRAP_MSTCPL_TIMEOUT_EN_MASK 0x4
+#define PCIE_STRAP_MISC2__STRAP_MSTCPL_TIMEOUT_EN__SHIFT 0x2
+#define PCIE_STRAP_MISC2__STRAP_GEN3_COMPLIANCE_MASK 0x8
+#define PCIE_STRAP_MISC2__STRAP_GEN3_COMPLIANCE__SHIFT 0x3
+#define PCIE_STRAP_MISC2__STRAP_TPH_SUPPORTED_MASK 0x10
+#define PCIE_STRAP_MISC2__STRAP_TPH_SUPPORTED__SHIFT 0x4
+#define PCIE_STRAP_PI__STRAP_QUICKSIM_START_MASK 0x1
+#define PCIE_STRAP_PI__STRAP_QUICKSIM_START__SHIFT 0x0
+#define PCIE_STRAP_PI__STRAP_TEST_TOGGLE_PATTERN_MASK 0x10000000
+#define PCIE_STRAP_PI__STRAP_T

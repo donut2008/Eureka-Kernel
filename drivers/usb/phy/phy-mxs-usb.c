@@ -1,590 +1,250 @@
-/*
- * Copyright 2012-2014 Freescale Semiconductor, Inc.
- * Copyright (C) 2012 Marek Vasut <marex@denx.de>
- * on behalf of DENX Software Engineering GmbH
- *
- * The code contained herein is licensed under the GNU General Public
- * License. You may obtain a copy of the GNU General Public License
- * Version 2 or later at the following locations:
- *
- * http://www.opensource.org/licenses/gpl-license.html
- * http://www.gnu.org/copyleft/gpl.html
- */
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/platform_device.h>
-#include <linux/clk.h>
-#include <linux/usb/otg.h>
-#include <linux/stmp_device.h>
-#include <linux/delay.h>
-#include <linux/err.h>
-#include <linux/io.h>
-#include <linux/of_device.h>
-#include <linux/regmap.h>
-#include <linux/mfd/syscon.h>
-
-#define DRIVER_NAME "mxs_phy"
-
-#define HW_USBPHY_PWD				0x00
-#define HW_USBPHY_CTRL				0x30
-#define HW_USBPHY_CTRL_SET			0x34
-#define HW_USBPHY_CTRL_CLR			0x38
-
-#define HW_USBPHY_DEBUG_SET			0x54
-#define HW_USBPHY_DEBUG_CLR			0x58
-
-#define HW_USBPHY_IP				0x90
-#define HW_USBPHY_IP_SET			0x94
-#define HW_USBPHY_IP_CLR			0x98
-
-#define BM_USBPHY_CTRL_SFTRST			BIT(31)
-#define BM_USBPHY_CTRL_CLKGATE			BIT(30)
-#define BM_USBPHY_CTRL_OTG_ID_VALUE		BIT(27)
-#define BM_USBPHY_CTRL_ENAUTOSET_USBCLKS	BIT(26)
-#define BM_USBPHY_CTRL_ENAUTOCLR_USBCLKGATE	BIT(25)
-#define BM_USBPHY_CTRL_ENVBUSCHG_WKUP		BIT(23)
-#define BM_USBPHY_CTRL_ENIDCHG_WKUP		BIT(22)
-#define BM_USBPHY_CTRL_ENDPDMCHG_WKUP		BIT(21)
-#define BM_USBPHY_CTRL_ENAUTOCLR_PHY_PWD	BIT(20)
-#define BM_USBPHY_CTRL_ENAUTOCLR_CLKGATE	BIT(19)
-#define BM_USBPHY_CTRL_ENAUTO_PWRON_PLL		BIT(18)
-#define BM_USBPHY_CTRL_ENUTMILEVEL3		BIT(15)
-#define BM_USBPHY_CTRL_ENUTMILEVEL2		BIT(14)
-#define BM_USBPHY_CTRL_ENHOSTDISCONDETECT	BIT(1)
-
-#define BM_USBPHY_IP_FIX                       (BIT(17) | BIT(18))
-
-#define BM_USBPHY_DEBUG_CLKGATE			BIT(30)
-
-/* Anatop Registers */
-#define ANADIG_ANA_MISC0			0x150
-#define ANADIG_ANA_MISC0_SET			0x154
-#define ANADIG_ANA_MISC0_CLR			0x158
-
-#define ANADIG_USB1_VBUS_DET_STAT		0x1c0
-#define ANADIG_USB2_VBUS_DET_STAT		0x220
-
-#define ANADIG_USB1_LOOPBACK_SET		0x1e4
-#define ANADIG_USB1_LOOPBACK_CLR		0x1e8
-#define ANADIG_USB2_LOOPBACK_SET		0x244
-#define ANADIG_USB2_LOOPBACK_CLR		0x248
-
-#define ANADIG_USB1_MISC			0x1f0
-#define ANADIG_USB2_MISC			0x250
-
-#define BM_ANADIG_ANA_MISC0_STOP_MODE_CONFIG	BIT(12)
-#define BM_ANADIG_ANA_MISC0_STOP_MODE_CONFIG_SL BIT(11)
-
-#define BM_ANADIG_USB1_VBUS_DET_STAT_VBUS_VALID	BIT(3)
-#define BM_ANADIG_USB2_VBUS_DET_STAT_VBUS_VALID	BIT(3)
-
-#define BM_ANADIG_USB1_LOOPBACK_UTMI_DIG_TST1	BIT(2)
-#define BM_ANADIG_USB1_LOOPBACK_TSTI_TX_EN	BIT(5)
-#define BM_ANADIG_USB2_LOOPBACK_UTMI_DIG_TST1	BIT(2)
-#define BM_ANADIG_USB2_LOOPBACK_TSTI_TX_EN	BIT(5)
-
-#define BM_ANADIG_USB1_MISC_RX_VPIN_FS		BIT(29)
-#define BM_ANADIG_USB1_MISC_RX_VMIN_FS		BIT(28)
-#define BM_ANADIG_USB2_MISC_RX_VPIN_FS		BIT(29)
-#define BM_ANADIG_USB2_MISC_RX_VMIN_FS		BIT(28)
-
-#define to_mxs_phy(p) container_of((p), struct mxs_phy, phy)
-
-/* Do disconnection between PHY and controller without vbus */
-#define MXS_PHY_DISCONNECT_LINE_WITHOUT_VBUS	BIT(0)
-
-/*
- * The PHY will be in messy if there is a wakeup after putting
- * bus to suspend (set portsc.suspendM) but before setting PHY to low
- * power mode (set portsc.phcd).
- */
-#define MXS_PHY_ABNORMAL_IN_SUSPEND		BIT(1)
-
-/*
- * The SOF sends too fast after resuming, it will cause disconnection
- * between host and high speed device.
- */
-#define MXS_PHY_SENDING_SOF_TOO_FAST		BIT(2)
-
-/*
- * IC has bug fixes logic, they include
- * MXS_PHY_ABNORMAL_IN_SUSPEND and MXS_PHY_SENDING_SOF_TOO_FAST
- * which are described at above flags, the RTL will handle it
- * according to different versions.
- */
-#define MXS_PHY_NEED_IP_FIX			BIT(3)
-
-struct mxs_phy_data {
-	unsigned int flags;
-};
-
-static const struct mxs_phy_data imx23_phy_data = {
-	.flags = MXS_PHY_ABNORMAL_IN_SUSPEND | MXS_PHY_SENDING_SOF_TOO_FAST,
-};
-
-static const struct mxs_phy_data imx6q_phy_data = {
-	.flags = MXS_PHY_SENDING_SOF_TOO_FAST |
-		MXS_PHY_DISCONNECT_LINE_WITHOUT_VBUS |
-		MXS_PHY_NEED_IP_FIX,
-};
-
-static const struct mxs_phy_data imx6sl_phy_data = {
-	.flags = MXS_PHY_DISCONNECT_LINE_WITHOUT_VBUS |
-		MXS_PHY_NEED_IP_FIX,
-};
-
-static const struct mxs_phy_data vf610_phy_data = {
-	.flags = MXS_PHY_DISCONNECT_LINE_WITHOUT_VBUS |
-		MXS_PHY_NEED_IP_FIX,
-};
-
-static const struct mxs_phy_data imx6sx_phy_data = {
-	.flags = MXS_PHY_DISCONNECT_LINE_WITHOUT_VBUS,
-};
-
-static const struct mxs_phy_data imx6ul_phy_data = {
-	.flags = MXS_PHY_DISCONNECT_LINE_WITHOUT_VBUS,
-};
-
-static const struct of_device_id mxs_phy_dt_ids[] = {
-	{ .compatible = "fsl,imx6sx-usbphy", .data = &imx6sx_phy_data, },
-	{ .compatible = "fsl,imx6sl-usbphy", .data = &imx6sl_phy_data, },
-	{ .compatible = "fsl,imx6q-usbphy", .data = &imx6q_phy_data, },
-	{ .compatible = "fsl,imx23-usbphy", .data = &imx23_phy_data, },
-	{ .compatible = "fsl,vf610-usbphy", .data = &vf610_phy_data, },
-	{ .compatible = "fsl,imx6ul-usbphy", .data = &imx6ul_phy_data, },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, mxs_phy_dt_ids);
-
-struct mxs_phy {
-	struct usb_phy phy;
-	struct clk *clk;
-	const struct mxs_phy_data *data;
-	struct regmap *regmap_anatop;
-	int port_id;
-};
-
-static inline bool is_imx6q_phy(struct mxs_phy *mxs_phy)
-{
-	return mxs_phy->data == &imx6q_phy_data;
-}
-
-static inline bool is_imx6sl_phy(struct mxs_phy *mxs_phy)
-{
-	return mxs_phy->data == &imx6sl_phy_data;
-}
-
-/*
- * PHY needs some 32K cycles to switch from 32K clock to
- * bus (such as AHB/AXI, etc) clock.
- */
-static void mxs_phy_clock_switch_delay(void)
-{
-	usleep_range(300, 400);
-}
-
-static int mxs_phy_hw_init(struct mxs_phy *mxs_phy)
-{
-	int ret;
-	void __iomem *base = mxs_phy->phy.io_priv;
-
-	ret = stmp_reset_block(base + HW_USBPHY_CTRL);
-	if (ret)
-		return ret;
-
-	/* Power up the PHY */
-	writel(0, base + HW_USBPHY_PWD);
-
-	/*
-	 * USB PHY Ctrl Setting
-	 * - Auto clock/power on
-	 * - Enable full/low speed support
-	 */
-	writel(BM_USBPHY_CTRL_ENAUTOSET_USBCLKS |
-		BM_USBPHY_CTRL_ENAUTOCLR_USBCLKGATE |
-		BM_USBPHY_CTRL_ENAUTOCLR_PHY_PWD |
-		BM_USBPHY_CTRL_ENAUTOCLR_CLKGATE |
-		BM_USBPHY_CTRL_ENAUTO_PWRON_PLL |
-		BM_USBPHY_CTRL_ENUTMILEVEL2 |
-		BM_USBPHY_CTRL_ENUTMILEVEL3,
-	       base + HW_USBPHY_CTRL_SET);
-
-	if (mxs_phy->data->flags & MXS_PHY_NEED_IP_FIX)
-		writel(BM_USBPHY_IP_FIX, base + HW_USBPHY_IP_SET);
-
-	return 0;
-}
-
-/* Return true if the vbus is there */
-static bool mxs_phy_get_vbus_status(struct mxs_phy *mxs_phy)
-{
-	unsigned int vbus_value;
-
-	if (!mxs_phy->regmap_anatop)
-		return false;
-
-	if (mxs_phy->port_id == 0)
-		regmap_read(mxs_phy->regmap_anatop,
-			ANADIG_USB1_VBUS_DET_STAT,
-			&vbus_value);
-	else if (mxs_phy->port_id == 1)
-		regmap_read(mxs_phy->regmap_anatop,
-			ANADIG_USB2_VBUS_DET_STAT,
-			&vbus_value);
-
-	if (vbus_value & BM_ANADIG_USB1_VBUS_DET_STAT_VBUS_VALID)
-		return true;
-	else
-		return false;
-}
-
-static void __mxs_phy_disconnect_line(struct mxs_phy *mxs_phy, bool disconnect)
-{
-	void __iomem *base = mxs_phy->phy.io_priv;
-	u32 reg;
-
-	if (disconnect)
-		writel_relaxed(BM_USBPHY_DEBUG_CLKGATE,
-			base + HW_USBPHY_DEBUG_CLR);
-
-	if (mxs_phy->port_id == 0) {
-		reg = disconnect ? ANADIG_USB1_LOOPBACK_SET
-			: ANADIG_USB1_LOOPBACK_CLR;
-		regmap_write(mxs_phy->regmap_anatop, reg,
-			BM_ANADIG_USB1_LOOPBACK_UTMI_DIG_TST1 |
-			BM_ANADIG_USB1_LOOPBACK_TSTI_TX_EN);
-	} else if (mxs_phy->port_id == 1) {
-		reg = disconnect ? ANADIG_USB2_LOOPBACK_SET
-			: ANADIG_USB2_LOOPBACK_CLR;
-		regmap_write(mxs_phy->regmap_anatop, reg,
-			BM_ANADIG_USB2_LOOPBACK_UTMI_DIG_TST1 |
-			BM_ANADIG_USB2_LOOPBACK_TSTI_TX_EN);
-	}
-
-	if (!disconnect)
-		writel_relaxed(BM_USBPHY_DEBUG_CLKGATE,
-			base + HW_USBPHY_DEBUG_SET);
-
-	/* Delay some time, and let Linestate be SE0 for controller */
-	if (disconnect)
-		usleep_range(500, 1000);
-}
-
-static bool mxs_phy_is_otg_host(struct mxs_phy *mxs_phy)
-{
-	return IS_ENABLED(CONFIG_USB_OTG) &&
-		mxs_phy->phy.last_event == USB_EVENT_ID;
-}
-
-static void mxs_phy_disconnect_line(struct mxs_phy *mxs_phy, bool on)
-{
-	bool vbus_is_on = false;
-
-	/* If the SoCs don't need to disconnect line without vbus, quit */
-	if (!(mxs_phy->data->flags & MXS_PHY_DISCONNECT_LINE_WITHOUT_VBUS))
-		return;
-
-	/* If the SoCs don't have anatop, quit */
-	if (!mxs_phy->regmap_anatop)
-		return;
-
-	vbus_is_on = mxs_phy_get_vbus_status(mxs_phy);
-
-	if (on && !vbus_is_on && !mxs_phy_is_otg_host(mxs_phy))
-		__mxs_phy_disconnect_line(mxs_phy, true);
-	else
-		__mxs_phy_disconnect_line(mxs_phy, false);
-
-}
-
-static int mxs_phy_init(struct usb_phy *phy)
-{
-	int ret;
-	struct mxs_phy *mxs_phy = to_mxs_phy(phy);
-
-	mxs_phy_clock_switch_delay();
-	ret = clk_prepare_enable(mxs_phy->clk);
-	if (ret)
-		return ret;
-
-	return mxs_phy_hw_init(mxs_phy);
-}
-
-static void mxs_phy_shutdown(struct usb_phy *phy)
-{
-	struct mxs_phy *mxs_phy = to_mxs_phy(phy);
-	u32 value = BM_USBPHY_CTRL_ENVBUSCHG_WKUP |
-			BM_USBPHY_CTRL_ENDPDMCHG_WKUP |
-			BM_USBPHY_CTRL_ENIDCHG_WKUP |
-			BM_USBPHY_CTRL_ENAUTOSET_USBCLKS |
-			BM_USBPHY_CTRL_ENAUTOCLR_USBCLKGATE |
-			BM_USBPHY_CTRL_ENAUTOCLR_PHY_PWD |
-			BM_USBPHY_CTRL_ENAUTOCLR_CLKGATE |
-			BM_USBPHY_CTRL_ENAUTO_PWRON_PLL;
-
-	writel(value, phy->io_priv + HW_USBPHY_CTRL_CLR);
-	writel(0xffffffff, phy->io_priv + HW_USBPHY_PWD);
-
-	writel(BM_USBPHY_CTRL_CLKGATE,
-	       phy->io_priv + HW_USBPHY_CTRL_SET);
-
-	clk_disable_unprepare(mxs_phy->clk);
-}
-
-static bool mxs_phy_is_low_speed_connection(struct mxs_phy *mxs_phy)
-{
-	unsigned int line_state;
-	/* bit definition is the same for all controllers */
-	unsigned int dp_bit = BM_ANADIG_USB1_MISC_RX_VPIN_FS,
-		     dm_bit = BM_ANADIG_USB1_MISC_RX_VMIN_FS;
-	unsigned int reg = ANADIG_USB1_MISC;
-
-	/* If the SoCs don't have anatop, quit */
-	if (!mxs_phy->regmap_anatop)
-		return false;
-
-	if (mxs_phy->port_id == 0)
-		reg = ANADIG_USB1_MISC;
-	else if (mxs_phy->port_id == 1)
-		reg = ANADIG_USB2_MISC;
-
-	regmap_read(mxs_phy->regmap_anatop, reg, &line_state);
-
-	if ((line_state & (dp_bit | dm_bit)) ==  dm_bit)
-		return true;
-	else
-		return false;
-}
-
-static int mxs_phy_suspend(struct usb_phy *x, int suspend)
-{
-	int ret;
-	struct mxs_phy *mxs_phy = to_mxs_phy(x);
-	bool low_speed_connection, vbus_is_on;
-
-	low_speed_connection = mxs_phy_is_low_speed_connection(mxs_phy);
-	vbus_is_on = mxs_phy_get_vbus_status(mxs_phy);
-
-	if (suspend) {
-		/*
-		 * FIXME: Do not power down RXPWD1PT1 bit for low speed
-		 * connect. The low speed connection will have problem at
-		 * very rare cases during usb suspend and resume process.
-		 */
-		if (low_speed_connection & vbus_is_on) {
-			/*
-			 * If value to be set as pwd value is not 0xffffffff,
-			 * several 32Khz cycles are needed.
-			 */
-			mxs_phy_clock_switch_delay();
-			writel(0xffbfffff, x->io_priv + HW_USBPHY_PWD);
-		} else {
-			writel(0xffffffff, x->io_priv + HW_USBPHY_PWD);
-		}
-		writel(BM_USBPHY_CTRL_CLKGATE,
-		       x->io_priv + HW_USBPHY_CTRL_SET);
-		clk_disable_unprepare(mxs_phy->clk);
-	} else {
-		mxs_phy_clock_switch_delay();
-		ret = clk_prepare_enable(mxs_phy->clk);
-		if (ret)
-			return ret;
-		writel(BM_USBPHY_CTRL_CLKGATE,
-		       x->io_priv + HW_USBPHY_CTRL_CLR);
-		writel(0, x->io_priv + HW_USBPHY_PWD);
-	}
-
-	return 0;
-}
-
-static int mxs_phy_set_wakeup(struct usb_phy *x, bool enabled)
-{
-	struct mxs_phy *mxs_phy = to_mxs_phy(x);
-	u32 value = BM_USBPHY_CTRL_ENVBUSCHG_WKUP |
-			BM_USBPHY_CTRL_ENDPDMCHG_WKUP |
-				BM_USBPHY_CTRL_ENIDCHG_WKUP;
-	if (enabled) {
-		mxs_phy_disconnect_line(mxs_phy, true);
-		writel_relaxed(value, x->io_priv + HW_USBPHY_CTRL_SET);
-	} else {
-		writel_relaxed(value, x->io_priv + HW_USBPHY_CTRL_CLR);
-		mxs_phy_disconnect_line(mxs_phy, false);
-	}
-
-	return 0;
-}
-
-static int mxs_phy_on_connect(struct usb_phy *phy,
-		enum usb_device_speed speed)
-{
-	dev_dbg(phy->dev, "%s device has connected\n",
-		(speed == USB_SPEED_HIGH) ? "HS" : "FS/LS");
-
-	if (speed == USB_SPEED_HIGH)
-		writel(BM_USBPHY_CTRL_ENHOSTDISCONDETECT,
-		       phy->io_priv + HW_USBPHY_CTRL_SET);
-
-	return 0;
-}
-
-static int mxs_phy_on_disconnect(struct usb_phy *phy,
-		enum usb_device_speed speed)
-{
-	dev_dbg(phy->dev, "%s device has disconnected\n",
-		(speed == USB_SPEED_HIGH) ? "HS" : "FS/LS");
-
-	/* Sometimes, the speed is not high speed when the error occurs */
-	if (readl(phy->io_priv + HW_USBPHY_CTRL) &
-			BM_USBPHY_CTRL_ENHOSTDISCONDETECT)
-		writel(BM_USBPHY_CTRL_ENHOSTDISCONDETECT,
-		       phy->io_priv + HW_USBPHY_CTRL_CLR);
-
-	return 0;
-}
-
-static int mxs_phy_probe(struct platform_device *pdev)
-{
-	struct resource *res;
-	void __iomem *base;
-	struct clk *clk;
-	struct mxs_phy *mxs_phy;
-	int ret;
-	const struct of_device_id *of_id;
-	struct device_node *np = pdev->dev.of_node;
-
-	of_id = of_match_device(mxs_phy_dt_ids, &pdev->dev);
-	if (!of_id)
-		return -ENODEV;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(base))
-		return PTR_ERR(base);
-
-	clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(clk)) {
-		dev_err(&pdev->dev,
-			"can't get the clock, err=%ld", PTR_ERR(clk));
-		return PTR_ERR(clk);
-	}
-
-	mxs_phy = devm_kzalloc(&pdev->dev, sizeof(*mxs_phy), GFP_KERNEL);
-	if (!mxs_phy)
-		return -ENOMEM;
-
-	/* Some SoCs don't have anatop registers */
-	if (of_get_property(np, "fsl,anatop", NULL)) {
-		mxs_phy->regmap_anatop = syscon_regmap_lookup_by_phandle
-			(np, "fsl,anatop");
-		if (IS_ERR(mxs_phy->regmap_anatop)) {
-			dev_dbg(&pdev->dev,
-				"failed to find regmap for anatop\n");
-			return PTR_ERR(mxs_phy->regmap_anatop);
-		}
-	}
-
-	ret = of_alias_get_id(np, "usbphy");
-	if (ret < 0)
-		dev_dbg(&pdev->dev, "failed to get alias id, errno %d\n", ret);
-	mxs_phy->port_id = ret;
-
-	mxs_phy->phy.io_priv		= base;
-	mxs_phy->phy.dev		= &pdev->dev;
-	mxs_phy->phy.label		= DRIVER_NAME;
-	mxs_phy->phy.init		= mxs_phy_init;
-	mxs_phy->phy.shutdown		= mxs_phy_shutdown;
-	mxs_phy->phy.set_suspend	= mxs_phy_suspend;
-	mxs_phy->phy.notify_connect	= mxs_phy_on_connect;
-	mxs_phy->phy.notify_disconnect	= mxs_phy_on_disconnect;
-	mxs_phy->phy.type		= USB_PHY_TYPE_USB2;
-	mxs_phy->phy.set_wakeup		= mxs_phy_set_wakeup;
-
-	mxs_phy->clk = clk;
-	mxs_phy->data = of_id->data;
-
-	platform_set_drvdata(pdev, mxs_phy);
-
-	device_set_wakeup_capable(&pdev->dev, true);
-
-	return usb_add_phy_dev(&mxs_phy->phy);
-}
-
-static int mxs_phy_remove(struct platform_device *pdev)
-{
-	struct mxs_phy *mxs_phy = platform_get_drvdata(pdev);
-
-	usb_remove_phy(&mxs_phy->phy);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static void mxs_phy_enable_ldo_in_suspend(struct mxs_phy *mxs_phy, bool on)
-{
-	unsigned int reg = on ? ANADIG_ANA_MISC0_SET : ANADIG_ANA_MISC0_CLR;
-
-	/* If the SoCs don't have anatop, quit */
-	if (!mxs_phy->regmap_anatop)
-		return;
-
-	if (is_imx6q_phy(mxs_phy))
-		regmap_write(mxs_phy->regmap_anatop, reg,
-			BM_ANADIG_ANA_MISC0_STOP_MODE_CONFIG);
-	else if (is_imx6sl_phy(mxs_phy))
-		regmap_write(mxs_phy->regmap_anatop,
-			reg, BM_ANADIG_ANA_MISC0_STOP_MODE_CONFIG_SL);
-}
-
-static int mxs_phy_system_suspend(struct device *dev)
-{
-	struct mxs_phy *mxs_phy = dev_get_drvdata(dev);
-
-	if (device_may_wakeup(dev))
-		mxs_phy_enable_ldo_in_suspend(mxs_phy, true);
-
-	return 0;
-}
-
-static int mxs_phy_system_resume(struct device *dev)
-{
-	struct mxs_phy *mxs_phy = dev_get_drvdata(dev);
-
-	if (device_may_wakeup(dev))
-		mxs_phy_enable_ldo_in_suspend(mxs_phy, false);
-
-	return 0;
-}
-#endif /* CONFIG_PM_SLEEP */
-
-static SIMPLE_DEV_PM_OPS(mxs_phy_pm, mxs_phy_system_suspend,
-		mxs_phy_system_resume);
-
-static struct platform_driver mxs_phy_driver = {
-	.probe = mxs_phy_probe,
-	.remove = mxs_phy_remove,
-	.driver = {
-		.name = DRIVER_NAME,
-		.of_match_table = mxs_phy_dt_ids,
-		.pm = &mxs_phy_pm,
-	 },
-};
-
-static int __init mxs_phy_module_init(void)
-{
-	return platform_driver_register(&mxs_phy_driver);
-}
-postcore_initcall(mxs_phy_module_init);
-
-static void __exit mxs_phy_module_exit(void)
-{
-	platform_driver_unregister(&mxs_phy_driver);
-}
-module_exit(mxs_phy_module_exit);
-
-MODULE_ALIAS("platform:mxs-usb-phy");
-MODULE_AUTHOR("Marek Vasut <marex@denx.de>");
-MODULE_AUTHOR("Richard Zhao <richard.zhao@freescale.com>");
-MODULE_DESCRIPTION("Freescale MXS USB PHY driver");
-MODULE_LICENSE("GPL");
+X_LS_STATUS__AUX_LS_RX_MIN_COUNT_VIOL__SHIFT 0xc
+#define AUX_LS_STATUS__AUX_LS_RX_INVALID_STOP_MASK 0x4000
+#define AUX_LS_STATUS__AUX_LS_RX_INVALID_STOP__SHIFT 0xe
+#define AUX_LS_STATUS__AUX_LS_RX_SYNC_INVALID_L_MASK 0x20000
+#define AUX_LS_STATUS__AUX_LS_RX_SYNC_INVALID_L__SHIFT 0x11
+#define AUX_LS_STATUS__AUX_LS_RX_SYNC_INVALID_H_MASK 0x40000
+#define AUX_LS_STATUS__AUX_LS_RX_SYNC_INVALID_H__SHIFT 0x12
+#define AUX_LS_STATUS__AUX_LS_RX_INVALID_START_MASK 0x80000
+#define AUX_LS_STATUS__AUX_LS_RX_INVALID_START__SHIFT 0x13
+#define AUX_LS_STATUS__AUX_LS_RX_RECV_NO_DET_MASK 0x100000
+#define AUX_LS_STATUS__AUX_LS_RX_RECV_NO_DET__SHIFT 0x14
+#define AUX_LS_STATUS__AUX_LS_RX_RECV_INVALID_H_MASK 0x400000
+#define AUX_LS_STATUS__AUX_LS_RX_RECV_INVALID_H__SHIFT 0x16
+#define AUX_LS_STATUS__AUX_LS_RX_RECV_INVALID_L_MASK 0x800000
+#define AUX_LS_STATUS__AUX_LS_RX_RECV_INVALID_L__SHIFT 0x17
+#define AUX_LS_STATUS__AUX_LS_REPLY_BYTE_COUNT_MASK 0x1f000000
+#define AUX_LS_STATUS__AUX_LS_REPLY_BYTE_COUNT__SHIFT 0x18
+#define AUX_LS_STATUS__AUX_LS_CP_IRQ_MASK 0x20000000
+#define AUX_LS_STATUS__AUX_LS_CP_IRQ__SHIFT 0x1d
+#define AUX_LS_STATUS__AUX_LS_UPDATED_MASK 0x40000000
+#define AUX_LS_STATUS__AUX_LS_UPDATED__SHIFT 0x1e
+#define AUX_LS_STATUS__AUX_LS_UPDATED_ACK_MASK 0x80000000
+#define AUX_LS_STATUS__AUX_LS_UPDATED_ACK__SHIFT 0x1f
+#define AUX_SW_DATA__AUX_SW_DATA_RW_MASK 0x1
+#define AUX_SW_DATA__AUX_SW_DATA_RW__SHIFT 0x0
+#define AUX_SW_DATA__AUX_SW_DATA_MASK 0xff00
+#define AUX_SW_DATA__AUX_SW_DATA__SHIFT 0x8
+#define AUX_SW_DATA__AUX_SW_INDEX_MASK 0x1f0000
+#define AUX_SW_DATA__AUX_SW_INDEX__SHIFT 0x10
+#define AUX_SW_DATA__AUX_SW_AUTOINCREMENT_DISABLE_MASK 0x80000000
+#define AUX_SW_DATA__AUX_SW_AUTOINCREMENT_DISABLE__SHIFT 0x1f
+#define AUX_LS_DATA__AUX_LS_DATA_MASK 0xff00
+#define AUX_LS_DATA__AUX_LS_DATA__SHIFT 0x8
+#define AUX_LS_DATA__AUX_LS_INDEX_MASK 0x1f0000
+#define AUX_LS_DATA__AUX_LS_INDEX__SHIFT 0x10
+#define AUX_DPHY_TX_REF_CONTROL__AUX_TX_REF_SEL_MASK 0x1
+#define AUX_DPHY_TX_REF_CONTROL__AUX_TX_REF_SEL__SHIFT 0x0
+#define AUX_DPHY_TX_REF_CONTROL__AUX_TX_RATE_MASK 0x30
+#define AUX_DPHY_TX_REF_CONTROL__AUX_TX_RATE__SHIFT 0x4
+#define AUX_DPHY_TX_REF_CONTROL__AUX_TX_REF_DIV_MASK 0x1ff0000
+#define AUX_DPHY_TX_REF_CONTROL__AUX_TX_REF_DIV__SHIFT 0x10
+#define AUX_DPHY_TX_CONTROL__AUX_TX_PRECHARGE_LEN_MASK 0x7
+#define AUX_DPHY_TX_CONTROL__AUX_TX_PRECHARGE_LEN__SHIFT 0x0
+#define AUX_DPHY_TX_CONTROL__AUX_TX_PRECHARGE_SYMBOLS_MASK 0x3f00
+#define AUX_DPHY_TX_CONTROL__AUX_TX_PRECHARGE_SYMBOLS__SHIFT 0x8
+#define AUX_DPHY_TX_CONTROL__AUX_MODE_DET_CHECK_DELAY_MASK 0x70000
+#define AUX_DPHY_TX_CONTROL__AUX_MODE_DET_CHECK_DELAY__SHIFT 0x10
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_START_WINDOW_MASK 0x70
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_START_WINDOW__SHIFT 0x4
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_RECEIVE_WINDOW_MASK 0x700
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_RECEIVE_WINDOW__SHIFT 0x8
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_HALF_SYM_DETECT_LEN_MASK 0x3000
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_HALF_SYM_DETECT_LEN__SHIFT 0xc
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_TRANSITION_FILTER_EN_MASK 0x10000
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_TRANSITION_FILTER_EN__SHIFT 0x10
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_ALLOW_BELOW_THRESHOLD_PHASE_DETECT_MASK 0x20000
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_ALLOW_BELOW_THRESHOLD_PHASE_DETECT__SHIFT 0x11
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_ALLOW_BELOW_THRESHOLD_START_MASK 0x40000
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_ALLOW_BELOW_THRESHOLD_START__SHIFT 0x12
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_ALLOW_BELOW_THRESHOLD_STOP_MASK 0x80000
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_ALLOW_BELOW_THRESHOLD_STOP__SHIFT 0x13
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_PHASE_DETECT_LEN_MASK 0x300000
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_PHASE_DETECT_LEN__SHIFT 0x14
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_TIMEOUT_LEN_MASK 0x7000000
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_TIMEOUT_LEN__SHIFT 0x18
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_DETECTION_THRESHOLD_MASK 0x70000000
+#define AUX_DPHY_RX_CONTROL0__AUX_RX_DETECTION_THRESHOLD__SHIFT 0x1c
+#define AUX_DPHY_RX_CONTROL1__AUX_RX_PRECHARGE_SKIP_MASK 0xff
+#define AUX_DPHY_RX_CONTROL1__AUX_RX_PRECHARGE_SKIP__SHIFT 0x0
+#define AUX_DPHY_TX_STATUS__AUX_TX_ACTIVE_MASK 0x1
+#define AUX_DPHY_TX_STATUS__AUX_TX_ACTIVE__SHIFT 0x0
+#define AUX_DPHY_TX_STATUS__AUX_TX_STATE_MASK 0x70
+#define AUX_DPHY_TX_STATUS__AUX_TX_STATE__SHIFT 0x4
+#define AUX_DPHY_TX_STATUS__AUX_TX_HALF_SYM_PERIOD_MASK 0x1ff0000
+#define AUX_DPHY_TX_STATUS__AUX_TX_HALF_SYM_PERIOD__SHIFT 0x10
+#define AUX_DPHY_RX_STATUS__AUX_RX_STATE_MASK 0x7
+#define AUX_DPHY_RX_STATUS__AUX_RX_STATE__SHIFT 0x0
+#define AUX_DPHY_RX_STATUS__AUX_RX_SYNC_VALID_COUNT_MASK 0x1f00
+#define AUX_DPHY_RX_STATUS__AUX_RX_SYNC_VALID_COUNT__SHIFT 0x8
+#define AUX_DPHY_RX_STATUS__AUX_RX_HALF_SYM_PERIOD_FRACT_MASK 0x1f0000
+#define AUX_DPHY_RX_STATUS__AUX_RX_HALF_SYM_PERIOD_FRACT__SHIFT 0x10
+#define AUX_DPHY_RX_STATUS__AUX_RX_HALF_SYM_PERIOD_MASK 0x3fe00000
+#define AUX_DPHY_RX_STATUS__AUX_RX_HALF_SYM_PERIOD__SHIFT 0x15
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_EN_MASK 0x1
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_EN__SHIFT 0x0
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_IMPCAL_EN_MASK 0x10
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_IMPCAL_EN__SHIFT 0x4
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_IMPCAL_INTERVAL_MASK 0xf00
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_IMPCAL_INTERVAL__SHIFT 0x8
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_LOCK_ACQ_PERIOD_MASK 0xf000
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_LOCK_ACQ_PERIOD__SHIFT 0xc
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_LOCK_MAINT_PERIOD_MASK 0x70000
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_LOCK_MAINT_PERIOD__SHIFT 0x10
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_BLOCK_REQ_MASK 0x100000
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_BLOCK_REQ__SHIFT 0x14
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_INTERVAL_RESET_WINDOW_MASK 0xc00000
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_INTERVAL_RESET_WINDOW__SHIFT 0x16
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_OFFSET_CALC_MAX_ATTEMPT_MASK 0x3000000
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_OFFSET_CALC_MAX_ATTEMPT__SHIFT 0x18
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_LOCK_ACQ_MAX_ATTEMPT_MASK 0xf0000000
+#define AUX_GTC_SYNC_CONTROL__AUX_GTC_SYNC_LOCK_ACQ_MAX_ATTEMPT__SHIFT 0x1c
+#define AUX_GTC_SYNC_ERROR_CONTROL__AUX_GTC_POTENTIAL_ERROR_THRESHOLD_MASK 0x1f
+#define AUX_GTC_SYNC_ERROR_CONTROL__AUX_GTC_POTENTIAL_ERROR_THRESHOLD__SHIFT 0x0
+#define AUX_GTC_SYNC_ERROR_CONTROL__AUX_GTC_DEFINITE_ERROR_THRESHOLD_MASK 0x1f00
+#define AUX_GTC_SYNC_ERROR_CONTROL__AUX_GTC_DEFINITE_ERROR_THRESHOLD__SHIFT 0x8
+#define AUX_GTC_SYNC_ERROR_CONTROL__AUX_GTC_SYNC_LOCK_ACQ_TIMEOUT_LEN_MASK 0x30000
+#define AUX_GTC_SYNC_ERROR_CONTROL__AUX_GTC_SYNC_LOCK_ACQ_TIMEOUT_LEN__SHIFT 0x10
+#define AUX_GTC_SYNC_ERROR_CONTROL__AUX_GTC_SYNC_NUM_RETRY_FOR_LOCK_MAINT_MASK 0x300000
+#define AUX_GTC_SYNC_ERROR_CONTROL__AUX_GTC_SYNC_NUM_RETRY_FOR_LOCK_MAINT__SHIFT 0x14
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_LOCK_ACQ_COMPLETE_MASK 0x1
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_LOCK_ACQ_COMPLETE__SHIFT 0x0
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_LOCK_LOST_MASK 0x10
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_LOCK_LOST__SHIFT 0x4
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_LOCK_ACQ_TIMEOUT_OCCURRED_MASK 0x100
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_LOCK_ACQ_TIMEOUT_OCCURRED__SHIFT 0x8
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_LOCK_ACQ_TIMEOUT_STATE_MASK 0x1e00
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_LOCK_ACQ_TIMEOUT_STATE__SHIFT 0x9
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_PHASE_ADJUST_TIME_VIOL_MASK 0x10000
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_PHASE_ADJUST_TIME_VIOL__SHIFT 0x10
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_CRITICAL_ERR_OCCURRED_MASK 0x100000
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_CRITICAL_ERR_OCCURRED__SHIFT 0x14
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_CRITICAL_ERR_OCCURRED_ACK_MASK 0x200000
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_CRITICAL_ERR_OCCURRED_ACK__SHIFT 0x15
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_MAX_POTENTIAL_ERR_REACHED_MASK 0x400000
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_MAX_POTENTIAL_ERR_REACHED__SHIFT 0x16
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_MAX_POTENTIAL_ERR_REACHED_ACK_MASK 0x800000
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_MAX_POTENTIAL_ERR_REACHED_ACK__SHIFT 0x17
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_MAX_DEFINITE_ERR_REACHED_MASK 0x1000000
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_MAX_DEFINITE_ERR_REACHED__SHIFT 0x18
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_MAX_DEFINITE_ERR_REACHED_ACK_MASK 0x2000000
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_MAX_DEFINITE_ERR_REACHED_ACK__SHIFT 0x19
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_CTRL_STATE_MASK 0xf0000000
+#define AUX_GTC_SYNC_CONTROLLER_STATUS__AUX_GTC_SYNC_CTRL_STATE__SHIFT 0x1c
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_DONE_MASK 0x1
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_DONE__SHIFT 0x0
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_REQ_MASK 0x2
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_REQ__SHIFT 0x1
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_TIMEOUT_STATE_MASK 0x70
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_TIMEOUT_STATE__SHIFT 0x4
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_TIMEOUT_MASK 0x80
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_TIMEOUT__SHIFT 0x7
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_OVERFLOW_MASK 0x100
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_OVERFLOW__SHIFT 0x8
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_HPD_DISCON_MASK 0x200
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_HPD_DISCON__SHIFT 0x9
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_PARTIAL_BYTE_MASK 0x400
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_PARTIAL_BYTE__SHIFT 0xa
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_NON_AUX_MODE_MASK 0x800
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_NON_AUX_MODE__SHIFT 0xb
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_MIN_COUNT_VIOL_MASK 0x1000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_MIN_COUNT_VIOL__SHIFT 0xc
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_INVALID_STOP_MASK 0x4000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_INVALID_STOP__SHIFT 0xe
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_SYNC_INVALID_L_MASK 0x20000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_SYNC_INVALID_L__SHIFT 0x11
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_SYNC_INVALID_H_MASK 0x40000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_SYNC_INVALID_H__SHIFT 0x12
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_INVALID_START_MASK 0x80000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_INVALID_START__SHIFT 0x13
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_RECV_NO_DET_MASK 0x100000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_RECV_NO_DET__SHIFT 0x14
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_RECV_INVALID_H_MASK 0x400000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_RECV_INVALID_H__SHIFT 0x16
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_RECV_INVALID_L_MASK 0x800000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_RX_RECV_INVALID_L__SHIFT 0x17
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_REPLY_BYTE_COUNT_MASK 0x1f000000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_REPLY_BYTE_COUNT__SHIFT 0x18
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_NACKED_MASK 0x20000000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_SYNC_NACKED__SHIFT 0x1d
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_MASTER_REQ_BY_RX_MASK 0x40000000
+#define AUX_GTC_SYNC_STATUS__AUX_GTC_MASTER_REQ_BY_RX__SHIFT 0x1e
+#define AUX_GTC_SYNC_DATA__AUX_GTC_DATA_RW_MASK 0x1
+#define AUX_GTC_SYNC_DATA__AUX_GTC_DATA_RW__SHIFT 0x0
+#define AUX_GTC_SYNC_DATA__AUX_GTC_DATA_MASK 0xff00
+#define AUX_GTC_SYNC_DATA__AUX_GTC_DATA__SHIFT 0x8
+#define AUX_GTC_SYNC_DATA__AUX_GTC_INDEX_MASK 0x3f0000
+#define AUX_GTC_SYNC_DATA__AUX_GTC_INDEX__SHIFT 0x10
+#define AUX_GTC_SYNC_DATA__AUX_GTC_INDEX_AUTOINCREMENT_DISABLE_MASK 0x80000000
+#define AUX_GTC_SYNC_DATA__AUX_GTC_INDEX_AUTOINCREMENT_DISABLE__SHIFT 0x1f
+#define AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE__AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE_EN_MASK 0x1
+#define AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE__AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE_EN__SHIFT 0x0
+#define AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE__AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE_VALUE_MASK 0xffff0
+#define AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE__AUX_GTC_SYNC_PHASE_OFFSET_OVERRIDE_VALUE__SHIFT 0x4
+#define AUX_TEST_DEBUG_INDEX__AUX_TEST_DEBUG_INDEX_MASK 0xff
+#define AUX_TEST_DEBUG_INDEX__AUX_TEST_DEBUG_INDEX__SHIFT 0x0
+#define AUX_TEST_DEBUG_INDEX__AUX_TEST_DEBUG_WRITE_EN_MASK 0x100
+#define AUX_TEST_DEBUG_INDEX__AUX_TEST_DEBUG_WRITE_EN__SHIFT 0x8
+#define AUX_TEST_DEBUG_DATA__AUX_TEST_DEBUG_DATA_MASK 0xffffffff
+#define AUX_TEST_DEBUG_DATA__AUX_TEST_DEBUG_DATA__SHIFT 0x0
+#define DP_AUX_DEBUG_A__DP_AUX_DEBUG_A_MASK 0xffffffff
+#define DP_AUX_DEBUG_A__DP_AUX_DEBUG_A__SHIFT 0x0
+#define DP_AUX_DEBUG_B__DP_AUX_DEBUG_B_MASK 0xffffffff
+#define DP_AUX_DEBUG_B__DP_AUX_DEBUG_B__SHIFT 0x0
+#define DP_AUX_DEBUG_C__DP_AUX_DEBUG_C_MASK 0xffffffff
+#define DP_AUX_DEBUG_C__DP_AUX_DEBUG_C__SHIFT 0x0
+#define DP_AUX_DEBUG_D__DP_AUX_DEBUG_D_MASK 0xffffffff
+#define DP_AUX_DEBUG_D__DP_AUX_DEBUG_D__SHIFT 0x0
+#define DP_AUX_DEBUG_E__DP_AUX_DEBUG_E_MASK 0xffffffff
+#define DP_AUX_DEBUG_E__DP_AUX_DEBUG_E__SHIFT 0x0
+#define DP_AUX_DEBUG_F__DP_AUX_DEBUG_F_MASK 0xffffffff
+#define DP_AUX_DEBUG_F__DP_AUX_DEBUG_F__SHIFT 0x0
+#define DP_AUX_DEBUG_G__DP_AUX_DEBUG_G_MASK 0xffffffff
+#define DP_AUX_DEBUG_G__DP_AUX_DEBUG_G__SHIFT 0x0
+#define DP_AUX_DEBUG_H__DP_AUX_DEBUG_H_MASK 0xffffffff
+#define DP_AUX_DEBUG_H__DP_AUX_DEBUG_H__SHIFT 0x0
+#define DP_AUX_DEBUG_I__DP_AUX_DEBUG_I_MASK 0xffffffff
+#define DP_AUX_DEBUG_I__DP_AUX_DEBUG_I__SHIFT 0x0
+#define DP_AUX_DEBUG_J__DP_AUX_DEBUG_J_MASK 0xffffffff
+#define DP_AUX_DEBUG_J__DP_AUX_DEBUG_J__SHIFT 0x0
+#define DP_AUX_DEBUG_K__DP_AUX_DEBUG_K_MASK 0xffffffff
+#define DP_AUX_DEBUG_K__DP_AUX_DEBUG_K__SHIFT 0x0
+#define DP_AUX_DEBUG_L__DP_AUX_DEBUG_L_MASK 0xffffffff
+#define DP_AUX_DEBUG_L__DP_AUX_DEBUG_L__SHIFT 0x0
+#define DP_AUX_DEBUG_M__DP_AUX_DEBUG_M_MASK 0xffffffff
+#define DP_AUX_DEBUG_M__DP_AUX_DEBUG_M__SHIFT 0x0
+#define DP_AUX_DEBUG_N__DP_AUX_DEBUG_N_MASK 0xffffffff
+#define DP_AUX_DEBUG_N__DP_AUX_DEBUG_N__SHIFT 0x0
+#define DP_AUX_DEBUG_O__DP_AUX_DEBUG_O_MASK 0xffffffff
+#define DP_AUX_DEBUG_O__DP_AUX_DEBUG_O__SHIFT 0x0
+#define DP_AUX_DEBUG_P__DP_AUX_DEBUG_P_MASK 0xffffffff
+#define DP_AUX_DEBUG_P__DP_AUX_DEBUG_P__SHIFT 0x0
+#define DP_AUX_DEBUG_Q__DP_AUX_DEBUG_Q_MASK 0xffffffff
+#define DP_AUX_DEBUG_Q__DP_AUX_DEBUG_Q__SHIFT 0x0
+#define DVO_ENABLE__DVO_ENABLE_MASK 0x1
+#define DVO_ENABLE__DVO_ENABLE__SHIFT 0x0
+#define DVO_ENABLE__DVO_PIXEL_WIDTH_MASK 0x30
+#define DVO_ENABLE__DVO_PIXEL_WIDTH__SHIFT 0x4
+#define DVO_SOURCE_SELECT__DVO_SOURCE_SELECT_MASK 0x7
+#define DVO_SOURCE_SELECT__DVO_SOURCE_SELECT__SHIFT 0x0
+#define DVO_SOURCE_SELECT__DVO_STEREOSYNC_SELECT_MASK 0x70000
+#define DVO_SOURCE_SELECT__DVO_STEREOSYNC_SELECT__SHIFT 0x10
+#define DVO_OUTPUT__DVO_OUTPUT_ENABLE_MODE_MASK 0x3
+#define DVO_OUTPUT__DVO_OUTPUT_ENABLE_MODE__SHIFT 0x0
+#define DVO_OUTPUT__DVO_CLOCK_MODE_MASK 0x100
+#define DVO_OUTPUT__DVO_CLOCK_MODE__SHIFT 0x8
+#define DVO_CONTROL__DVO_RATE_SELECT_MASK 0x1
+#define DVO_CONTROL__DVO_RATE_SELECT__SHIFT 0x0
+#define DVO_CONTROL__DVO_SDRCLK_SEL_MASK 0x2
+#define DVO_CONTROL__DVO_SDRCLK_SEL__SHIFT 0x1
+#define DVO_CONTROL__DVO_DVPDATA_WIDTH_MASK 0x30
+#define DVO_CONTROL__DVO_DVPDATA_WIDTH__SHIFT 0x4
+#define DVO_CONTROL__DVO_DUAL_CHANNEL_EN_MASK 0x100
+#define DVO_CONTROL__DVO_DUAL_CHANNEL_EN__SHIFT 0x8
+#define DVO_CONTROL__DVO_RESET_FIFO_MASK 0x10000
+#define DVO_CONTROL__DVO_RESET_FIFO__SHIFT 0x10
+#define DVO_CONTROL__DVO_SYNC_PHASE_MASK 0x20000
+#define DVO_CONTROL__DVO_SYNC_PHASE__SHIFT 0x11
+#define DVO_CONTROL__DVO_INVERT_DVOCLK_MASK 0x40000
+#define DVO_CONTROL__DVO_INVERT_DVOCLK__SHIFT 0x12
+#define DVO_CONTROL__

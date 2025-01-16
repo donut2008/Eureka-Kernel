@@ -1,346 +1,188 @@
-/*
- * BCM2835 master mode driver
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/clk.h>
-#include <linux/completion.h>
-#include <linux/err.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-
-#define BCM2835_I2C_C		0x0
-#define BCM2835_I2C_S		0x4
-#define BCM2835_I2C_DLEN	0x8
-#define BCM2835_I2C_A		0xc
-#define BCM2835_I2C_FIFO	0x10
-#define BCM2835_I2C_DIV		0x14
-#define BCM2835_I2C_DEL		0x18
-/*
- * 16-bit field for the number of SCL cycles to wait after rising SCL
- * before deciding the slave is not responding. 0 disables the
- * timeout detection.
- */
-#define BCM2835_I2C_CLKT	0x1c
-
-#define BCM2835_I2C_C_READ	BIT(0)
-#define BCM2835_I2C_C_CLEAR	BIT(4) /* bits 4 and 5 both clear */
-#define BCM2835_I2C_C_ST	BIT(7)
-#define BCM2835_I2C_C_INTD	BIT(8)
-#define BCM2835_I2C_C_INTT	BIT(9)
-#define BCM2835_I2C_C_INTR	BIT(10)
-#define BCM2835_I2C_C_I2CEN	BIT(15)
-
-#define BCM2835_I2C_S_TA	BIT(0)
-#define BCM2835_I2C_S_DONE	BIT(1)
-#define BCM2835_I2C_S_TXW	BIT(2)
-#define BCM2835_I2C_S_RXR	BIT(3)
-#define BCM2835_I2C_S_TXD	BIT(4)
-#define BCM2835_I2C_S_RXD	BIT(5)
-#define BCM2835_I2C_S_TXE	BIT(6)
-#define BCM2835_I2C_S_RXF	BIT(7)
-#define BCM2835_I2C_S_ERR	BIT(8)
-#define BCM2835_I2C_S_CLKT	BIT(9)
-#define BCM2835_I2C_S_LEN	BIT(10) /* Fake bit for SW error reporting */
-
-#define BCM2835_I2C_BITMSK_S	0x03FF
-
-#define BCM2835_I2C_CDIV_MIN	0x0002
-#define BCM2835_I2C_CDIV_MAX	0xFFFE
-
-#define BCM2835_I2C_TIMEOUT (msecs_to_jiffies(1000))
-
-struct bcm2835_i2c_dev {
-	struct device *dev;
-	void __iomem *regs;
-	struct clk *clk;
-	int irq;
-	struct i2c_adapter adapter;
-	struct completion completion;
-	u32 msg_err;
-	u8 *msg_buf;
-	size_t msg_buf_remaining;
-};
-
-static inline void bcm2835_i2c_writel(struct bcm2835_i2c_dev *i2c_dev,
-				      u32 reg, u32 val)
-{
-	writel(val, i2c_dev->regs + reg);
-}
-
-static inline u32 bcm2835_i2c_readl(struct bcm2835_i2c_dev *i2c_dev, u32 reg)
-{
-	return readl(i2c_dev->regs + reg);
-}
-
-static void bcm2835_fill_txfifo(struct bcm2835_i2c_dev *i2c_dev)
-{
-	u32 val;
-
-	while (i2c_dev->msg_buf_remaining) {
-		val = bcm2835_i2c_readl(i2c_dev, BCM2835_I2C_S);
-		if (!(val & BCM2835_I2C_S_TXD))
-			break;
-		bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_FIFO,
-				   *i2c_dev->msg_buf);
-		i2c_dev->msg_buf++;
-		i2c_dev->msg_buf_remaining--;
-	}
-}
-
-static void bcm2835_drain_rxfifo(struct bcm2835_i2c_dev *i2c_dev)
-{
-	u32 val;
-
-	while (i2c_dev->msg_buf_remaining) {
-		val = bcm2835_i2c_readl(i2c_dev, BCM2835_I2C_S);
-		if (!(val & BCM2835_I2C_S_RXD))
-			break;
-		*i2c_dev->msg_buf = bcm2835_i2c_readl(i2c_dev,
-						      BCM2835_I2C_FIFO);
-		i2c_dev->msg_buf++;
-		i2c_dev->msg_buf_remaining--;
-	}
-}
-
-static irqreturn_t bcm2835_i2c_isr(int this_irq, void *data)
-{
-	struct bcm2835_i2c_dev *i2c_dev = data;
-	u32 val, err;
-
-	val = bcm2835_i2c_readl(i2c_dev, BCM2835_I2C_S);
-	val &= BCM2835_I2C_BITMSK_S;
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_S, val);
-
-	err = val & (BCM2835_I2C_S_CLKT | BCM2835_I2C_S_ERR);
-	if (err) {
-		i2c_dev->msg_err = err;
-		complete(&i2c_dev->completion);
-		return IRQ_HANDLED;
-	}
-
-	if (val & BCM2835_I2C_S_RXD) {
-		bcm2835_drain_rxfifo(i2c_dev);
-		if (!(val & BCM2835_I2C_S_DONE))
-			return IRQ_HANDLED;
-	}
-
-	if (val & BCM2835_I2C_S_DONE) {
-		if (i2c_dev->msg_buf_remaining)
-			i2c_dev->msg_err = BCM2835_I2C_S_LEN;
-		else
-			i2c_dev->msg_err = 0;
-		complete(&i2c_dev->completion);
-		return IRQ_HANDLED;
-	}
-
-	if (val & BCM2835_I2C_S_TXD) {
-		bcm2835_fill_txfifo(i2c_dev);
-		return IRQ_HANDLED;
-	}
-
-	return IRQ_NONE;
-}
-
-static int bcm2835_i2c_xfer_msg(struct bcm2835_i2c_dev *i2c_dev,
-				struct i2c_msg *msg)
-{
-	u32 c;
-	unsigned long time_left;
-
-	i2c_dev->msg_buf = msg->buf;
-	i2c_dev->msg_buf_remaining = msg->len;
-	reinit_completion(&i2c_dev->completion);
-
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_C, BCM2835_I2C_C_CLEAR);
-
-	if (msg->flags & I2C_M_RD) {
-		c = BCM2835_I2C_C_READ | BCM2835_I2C_C_INTR;
-	} else {
-		c = BCM2835_I2C_C_INTT;
-		bcm2835_fill_txfifo(i2c_dev);
-	}
-	c |= BCM2835_I2C_C_ST | BCM2835_I2C_C_INTD | BCM2835_I2C_C_I2CEN;
-
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_A, msg->addr);
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_DLEN, msg->len);
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_C, c);
-
-	time_left = wait_for_completion_timeout(&i2c_dev->completion,
-						BCM2835_I2C_TIMEOUT);
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_C, BCM2835_I2C_C_CLEAR);
-	if (!time_left) {
-		dev_err(i2c_dev->dev, "i2c transfer timed out\n");
-		return -ETIMEDOUT;
-	}
-
-	if (likely(!i2c_dev->msg_err))
-		return 0;
-
-	if ((i2c_dev->msg_err & BCM2835_I2C_S_ERR) &&
-	    (msg->flags & I2C_M_IGNORE_NAK))
-		return 0;
-
-	dev_err(i2c_dev->dev, "i2c transfer failed: %x\n", i2c_dev->msg_err);
-
-	if (i2c_dev->msg_err & BCM2835_I2C_S_ERR)
-		return -EREMOTEIO;
-	else
-		return -EIO;
-}
-
-static int bcm2835_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
-			    int num)
-{
-	struct bcm2835_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
-	int i;
-	int ret = 0;
-
-	for (i = 0; i < num; i++) {
-		ret = bcm2835_i2c_xfer_msg(i2c_dev, &msgs[i]);
-		if (ret)
-			break;
-	}
-
-	return ret ?: i;
-}
-
-static u32 bcm2835_i2c_func(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static const struct i2c_algorithm bcm2835_i2c_algo = {
-	.master_xfer	= bcm2835_i2c_xfer,
-	.functionality	= bcm2835_i2c_func,
-};
-
-static int bcm2835_i2c_probe(struct platform_device *pdev)
-{
-	struct bcm2835_i2c_dev *i2c_dev;
-	struct resource *mem, *irq;
-	u32 bus_clk_rate, divider;
-	int ret;
-	struct i2c_adapter *adap;
-
-	i2c_dev = devm_kzalloc(&pdev->dev, sizeof(*i2c_dev), GFP_KERNEL);
-	if (!i2c_dev)
-		return -ENOMEM;
-	platform_set_drvdata(pdev, i2c_dev);
-	i2c_dev->dev = &pdev->dev;
-	init_completion(&i2c_dev->completion);
-
-	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	i2c_dev->regs = devm_ioremap_resource(&pdev->dev, mem);
-	if (IS_ERR(i2c_dev->regs))
-		return PTR_ERR(i2c_dev->regs);
-
-	i2c_dev->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(i2c_dev->clk)) {
-		dev_err(&pdev->dev, "Could not get clock\n");
-		return PTR_ERR(i2c_dev->clk);
-	}
-
-	ret = of_property_read_u32(pdev->dev.of_node, "clock-frequency",
-				   &bus_clk_rate);
-	if (ret < 0) {
-		dev_warn(&pdev->dev,
-			 "Could not read clock-frequency property\n");
-		bus_clk_rate = 100000;
-	}
-
-	divider = DIV_ROUND_UP(clk_get_rate(i2c_dev->clk), bus_clk_rate);
-	/*
-	 * Per the datasheet, the register is always interpreted as an even
-	 * number, by rounding down. In other words, the LSB is ignored. So,
-	 * if the LSB is set, increment the divider to avoid any issue.
-	 */
-	if (divider & 1)
-		divider++;
-	if ((divider < BCM2835_I2C_CDIV_MIN) ||
-	    (divider > BCM2835_I2C_CDIV_MAX)) {
-		dev_err(&pdev->dev, "Invalid clock-frequency\n");
-		return -ENODEV;
-	}
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_DIV, divider);
-
-	irq = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
-	if (!irq) {
-		dev_err(&pdev->dev, "No IRQ resource\n");
-		return -ENODEV;
-	}
-	i2c_dev->irq = irq->start;
-
-	ret = request_irq(i2c_dev->irq, bcm2835_i2c_isr, IRQF_SHARED,
-			  dev_name(&pdev->dev), i2c_dev);
-	if (ret) {
-		dev_err(&pdev->dev, "Could not request IRQ\n");
-		return -ENODEV;
-	}
-
-	adap = &i2c_dev->adapter;
-	i2c_set_adapdata(adap, i2c_dev);
-	adap->owner = THIS_MODULE;
-	adap->class = I2C_CLASS_DEPRECATED;
-	strlcpy(adap->name, "bcm2835 I2C adapter", sizeof(adap->name));
-	adap->algo = &bcm2835_i2c_algo;
-	adap->dev.parent = &pdev->dev;
-	adap->dev.of_node = pdev->dev.of_node;
-
-	/*
-	 * Disable the hardware clock stretching timeout. SMBUS
-	 * specifies a limit for how long the device can stretch the
-	 * clock, but core I2C doesn't.
-	 */
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_CLKT, 0);
-	bcm2835_i2c_writel(i2c_dev, BCM2835_I2C_C, 0);
-
-	ret = i2c_add_adapter(adap);
-	if (ret)
-		free_irq(i2c_dev->irq, i2c_dev);
-
-	return ret;
-}
-
-static int bcm2835_i2c_remove(struct platform_device *pdev)
-{
-	struct bcm2835_i2c_dev *i2c_dev = platform_get_drvdata(pdev);
-
-	free_irq(i2c_dev->irq, i2c_dev);
-	i2c_del_adapter(&i2c_dev->adapter);
-
-	return 0;
-}
-
-static const struct of_device_id bcm2835_i2c_of_match[] = {
-	{ .compatible = "brcm,bcm2835-i2c" },
-	{},
-};
-MODULE_DEVICE_TABLE(of, bcm2835_i2c_of_match);
-
-static struct platform_driver bcm2835_i2c_driver = {
-	.probe		= bcm2835_i2c_probe,
-	.remove		= bcm2835_i2c_remove,
-	.driver		= {
-		.name	= "i2c-bcm2835",
-		.of_match_table = bcm2835_i2c_of_match,
-	},
-};
-module_platform_driver(bcm2835_i2c_driver);
-
-MODULE_AUTHOR("Stephen Warren <swarren@wwwdotorg.org>");
-MODULE_DESCRIPTION("BCM2835 I2C bus adapter");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:i2c-bcm2835");
+T 0x3
+#define MC_SEQ_DLL_STBY__MSTRSTBY_VAL_MASK 0x10
+#define MC_SEQ_DLL_STBY__MSTRSTBY_VAL__SHIFT 0x4
+#define MC_SEQ_DLL_STBY__ENTR_DLY_MASK 0xe0
+#define MC_SEQ_DLL_STBY__ENTR_DLY__SHIFT 0x5
+#define MC_SEQ_DLL_STBY__STBY_DLY_MASK 0xf00
+#define MC_SEQ_DLL_STBY__STBY_DLY__SHIFT 0x8
+#define MC_SEQ_DLL_STBY__TCKE_PULSE_EXTN_MASK 0xf000
+#define MC_SEQ_DLL_STBY__TCKE_PULSE_EXTN__SHIFT 0xc
+#define MC_SEQ_DLL_STBY__TCKE_EXTN_MASK 0xff0000
+#define MC_SEQ_DLL_STBY__TCKE_EXTN__SHIFT 0x10
+#define MC_SEQ_DLL_STBY__EXIT_DLY_MASK 0x3f000000
+#define MC_SEQ_DLL_STBY__EXIT_DLY__SHIFT 0x18
+#define MC_SEQ_DLL_STBY_LP__EN_MASK 0x1
+#define MC_SEQ_DLL_STBY_LP__EN__SHIFT 0x0
+#define MC_SEQ_DLL_STBY_LP__VCTRLADC_FRC_MASK 0x2
+#define MC_SEQ_DLL_STBY_LP__VCTRLADC_FRC__SHIFT 0x1
+#define MC_SEQ_DLL_STBY_LP__VCTRLADC_VAL_MASK 0x4
+#define MC_SEQ_DLL_STBY_LP__VCTRLADC_VAL__SHIFT 0x2
+#define MC_SEQ_DLL_STBY_LP__MSTRSTBY_FRC_MASK 0x8
+#define MC_SEQ_DLL_STBY_LP__MSTRSTBY_FRC__SHIFT 0x3
+#define MC_SEQ_DLL_STBY_LP__MSTRSTBY_VAL_MASK 0x10
+#define MC_SEQ_DLL_STBY_LP__MSTRSTBY_VAL__SHIFT 0x4
+#define MC_SEQ_DLL_STBY_LP__ENTR_DLY_MASK 0xe0
+#define MC_SEQ_DLL_STBY_LP__ENTR_DLY__SHIFT 0x5
+#define MC_SEQ_DLL_STBY_LP__STBY_DLY_MASK 0xf00
+#define MC_SEQ_DLL_STBY_LP__STBY_DLY__SHIFT 0x8
+#define MC_SEQ_DLL_STBY_LP__TCKE_PULSE_EXTN_MASK 0xf000
+#define MC_SEQ_DLL_STBY_LP__TCKE_PULSE_EXTN__SHIFT 0xc
+#define MC_SEQ_DLL_STBY_LP__TCKE_EXTN_MASK 0xff0000
+#define MC_SEQ_DLL_STBY_LP__TCKE_EXTN__SHIFT 0x10
+#define MC_SEQ_DLL_STBY_LP__EXIT_DLY_MASK 0x3f000000
+#define MC_SEQ_DLL_STBY_LP__EXIT_DLY__SHIFT 0x18
+#define MC_DLB_MISCCTRL0__UDD_ON_STATUS_BITS_MASK 0x1
+#define MC_DLB_MISCCTRL0__UDD_ON_STATUS_BITS__SHIFT 0x0
+#define MC_DLB_MISCCTRL0__LOAD_DATA_SEL_MASK 0x2
+#define MC_DLB_MISCCTRL0__LOAD_DATA_SEL__SHIFT 0x1
+#define MC_DLB_MISCCTRL0__LOAD_UDD_MASK 0x4
+#define MC_DLB_MISCCTRL0__LOAD_UDD__SHIFT 0x2
+#define MC_DLB_MISCCTRL0__ADR_STATUS_SEL_MASK 0x8
+#define MC_DLB_MISCCTRL0__ADR_STATUS_SEL__SHIFT 0x3
+#define MC_DLB_MISCCTRL0__DATA_SEL_MASK 0xf0
+#define MC_DLB_MISCCTRL0__DATA_SEL__SHIFT 0x4
+#define MC_DLB_MISCCTRL0__PRBS_CHK_LOAD_CNT_MASK 0x7f00
+#define MC_DLB_MISCCTRL0__PRBS_CHK_LOAD_CNT__SHIFT 0x8
+#define MC_DLB_MISCCTRL0__UDD_MASK 0xffff0000
+#define MC_DLB_MISCCTRL0__UDD__SHIFT 0x10
+#define MC_DLB_MISCCTRL1__PRBS_ERR_CNT_LIMIT_MASK 0xffffffff
+#define MC_DLB_MISCCTRL1__PRBS_ERR_CNT_LIMIT__SHIFT 0x0
+#define MC_DLB_MISCCTRL2__PRBS_RUN_LENGTH_MASK 0x1ffff
+#define MC_DLB_MISCCTRL2__PRBS_RUN_LENGTH__SHIFT 0x0
+#define MC_DLB_MISCCTRL2__PRBS_FREERUN_MASK 0x20000
+#define MC_DLB_MISCCTRL2__PRBS_FREERUN__SHIFT 0x11
+#define MC_DLB_MISCCTRL2__PRBS15_MODE_MASK 0x40000
+#define MC_DLB_MISCCTRL2__PRBS15_MODE__SHIFT 0x12
+#define MC_DLB_MISCCTRL2__PRBS23_MODE_MASK 0x80000
+#define MC_DLB_MISCCTRL2__PRBS23_MODE__SHIFT 0x13
+#define MC_DLB_MISCCTRL2__STOP_ON_NEXT_ERR_MASK 0x100000
+#define MC_DLB_MISCCTRL2__STOP_ON_NEXT_ERR__SHIFT 0x14
+#define MC_DLB_MISCCTRL2__STOP_CLK_MASK 0x200000
+#define MC_DLB_MISCCTRL2__STOP_CLK__SHIFT 0x15
+#define MC_DLB_MISCCTRL2__SWEEP_DLY_MASK 0x3000000
+#define MC_DLB_MISCCTRL2__SWEEP_DLY__SHIFT 0x18
+#define MC_DLB_MISCCTRL2__GRAY_CODE_EN_MASK 0x4000000
+#define MC_DLB_MISCCTRL2__GRAY_CODE_EN__SHIFT 0x1a
+#define MC_DLB_MISCCTRL2__SEL_PHY_PRBS_CHK_MASK 0x10000000
+#define MC_DLB_MISCCTRL2__SEL_PHY_PRBS_CHK__SHIFT 0x1c
+#define MC_DLB_MISCCTRL2__SEL_AC_PRBS_CHK_MASK 0x20000000
+#define MC_DLB_MISCCTRL2__SEL_AC_PRBS_CHK__SHIFT 0x1d
+#define MC_DLB_MISCCTRL2__STATUS_SEL_MASK 0x40000000
+#define MC_DLB_MISCCTRL2__STATUS_SEL__SHIFT 0x1e
+#define MC_DLB_CONFIG0__CONF_EN_CH0_MASK 0x1
+#define MC_DLB_CONFIG0__CONF_EN_CH0__SHIFT 0x0
+#define MC_DLB_CONFIG0__CONF_EN_CH1_MASK 0x2
+#define MC_DLB_CONFIG0__CONF_EN_CH1__SHIFT 0x1
+#define MC_DLB_CONFIG0__CONF_AUTO_EN_MASK 0x4
+#define MC_DLB_CONFIG0__CONF_AUTO_EN__SHIFT 0x2
+#define MC_DLB_CONFIG0__MASK_MASK 0xf0
+#define MC_DLB_CONFIG0__MASK__SHIFT 0x4
+#define MC_DLB_CONFIG0__PTR_MASK 0x3ff00
+#define MC_DLB_CONFIG0__PTR__SHIFT 0x8
+#define MC_DLB_CONFIG1__DATA_MASK 0xffffffff
+#define MC_DLB_CONFIG1__DATA__SHIFT 0x0
+#define MC_DLB_SETUP__DLB_EN_MASK 0x1
+#define MC_DLB_SETUP__DLB_EN__SHIFT 0x0
+#define MC_DLB_SETUP__DLB_FIFO_EN_MASK 0x2
+#define MC_DLB_SETUP__DLB_FIFO_EN__SHIFT 0x1
+#define MC_DLB_SETUP__DLB_STATUS_EN_MASK 0x4
+#define MC_DLB_SETUP__DLB_STATUS_EN__SHIFT 0x2
+#define MC_DLB_SETUP__DLB_CONFIG_EN_MASK 0x8
+#define MC_DLB_SETUP__DLB_CONFIG_EN__SHIFT 0x3
+#define MC_DLB_SETUP__DLB_PRBS_EN_MASK 0x10
+#define MC_DLB_SETUP__DLB_PRBS_EN__SHIFT 0x4
+#define MC_DLB_SETUP__PRBS_GEN_RST_MASK 0x20
+#define MC_DLB_SETUP__PRBS_GEN_RST__SHIFT 0x5
+#define MC_DLB_SETUP__PRBS_CHK_RST_MASK 0x40
+#define MC_DLB_SETUP__PRBS_CHK_RST__SHIFT 0x6
+#define MC_DLB_SETUP__PRBS_PHY_RST_MASK 0x80
+#define MC_DLB_SETUP__PRBS_PHY_RST__SHIFT 0x7
+#define MC_DLB_SETUP__QDR_MODE_MASK 0x100
+#define MC_DLB_SETUP__QDR_MODE__SHIFT 0x8
+#define MC_DLB_SETUP__CHK_DATA_BITS_MASK 0xff0000
+#define MC_DLB_SETUP__CHK_DATA_BITS__SHIFT 0x10
+#define MC_DLB_SETUP__MEM_BIT_SEL_MASK 0x1f000000
+#define MC_DLB_SETUP__MEM_BIT_SEL__SHIFT 0x18
+#define MC_DLB_SETUP__RXTXLP_EN_MASK 0x80000000
+#define MC_DLB_SETUP__RXTXLP_EN__SHIFT 0x1f
+#define MC_DLB_SETUPSWEEP__DLL_RST_MASK 0x1
+#define MC_DLB_SETUPSWEEP__DLL_RST__SHIFT 0x0
+#define MC_DLB_SETUPSWEEP__CONFIG_MASK 0x2
+#define MC_DLB_SETUPSWEEP__CONFIG__SHIFT 0x1
+#define MC_DLB_SETUPSWEEP__MASTER_MASK 0x4
+#define MC_DLB_SETUPSWEEP__MASTER__SHIFT 0x2
+#define MC_DLB_SETUPSWEEP__DLLDLY_MASK 0xf0
+#define MC_DLB_SETUPSWEEP__DLLDLY__SHIFT 0x4
+#define MC_DLB_SETUPSWEEP__DLLSTEPS_MASK 0x1f00
+#define MC_DLB_SETUPSWEEP__DLLSTEPS__SHIFT 0x8
+#define MC_DLB_SETUPFIFO__WRITE_FIFO_RST_MASK 0x1
+#define MC_DLB_SETUPFIFO__WRITE_FIFO_RST__SHIFT 0x0
+#define MC_DLB_SETUPFIFO__READ_FIFO_RST_MASK 0x2
+#define MC_DLB_SETUPFIFO__READ_FIFO_RST__SHIFT 0x1
+#define MC_DLB_SETUPFIFO__BOTH_FIFO_RST_MASK 0x4
+#define MC_DLB_SETUPFIFO__BOTH_FIFO_RST__SHIFT 0x2
+#define MC_DLB_SETUPFIFO__SYNC_RST_MASK 0x8
+#define MC_DLB_SETUPFIFO__SYNC_RST__SHIFT 0x3
+#define MC_DLB_SETUPFIFO__SYNC_RST_MASK_MASK 0x30
+#define MC_DLB_SETUPFIFO__SYNC_RST_MASK__SHIFT 0x4
+#define MC_DLB_SETUPFIFO__OUTPUT_EN_RST_MASK 0x40
+#define MC_DLB_SETUPFIFO__OUTPUT_EN_RST__SHIFT 0x6
+#define MC_DLB_SETUPFIFO__SHIFT_WR_FIFO_PTR_MASK 0x300
+#define MC_DLB_SETUPFIFO__SHIFT_WR_FIFO_PTR__SHIFT 0x8
+#define MC_DLB_SETUPFIFO__DELAY_RD_FIFO_PTR_MASK 0x1c00
+#define MC_DLB_SETUPFIFO__DELAY_RD_FIFO_PTR__SHIFT 0xa
+#define MC_DLB_SETUPFIFO__STROBE_MASK 0xf0000
+#define MC_DLB_SETUPFIFO__STROBE__SHIFT 0x10
+#define MC_DLB_WRITE_MASK__BIT_MASK_MASK 0x3fffff
+#define MC_DLB_WRITE_MASK__BIT_MASK__SHIFT 0x0
+#define MC_DLB_WRITE_MASK__CH_MASK_MASK 0xf000000
+#define MC_DLB_WRITE_MASK__CH_MASK__SHIFT 0x18
+#define MC_DLB_STATUS__STICK_ERROR_MASK 0xf
+#define MC_DLB_STATUS__STICK_ERROR__SHIFT 0x0
+#define MC_DLB_STATUS__LOCK_MASK 0xf0
+#define MC_DLB_STATUS__LOCK__SHIFT 0x4
+#define MC_DLB_STATUS__SWEEP_DONE_MASK 0xf00
+#define MC_DLB_STATUS__SWEEP_DONE__SHIFT 0x8
+#define MC_DLB_STATUS_MISC0__DATA_MASK 0xffffffff
+#define MC_DLB_STATUS_MISC0__DATA__SHIFT 0x0
+#define MC_DLB_STATUS_MISC1__DATA_MASK 0xffffffff
+#define MC_DLB_STATUS_MISC1__DATA__SHIFT 0x0
+#define MC_DLB_STATUS_MISC2__DATA_MASK 0xffffffff
+#define MC_DLB_STATUS_MISC2__DATA__SHIFT 0x0
+#define MC_DLB_STATUS_MISC3__DATA_MASK 0xffffffff
+#define MC_DLB_STATUS_MISC3__DATA__SHIFT 0x0
+#define MC_DLB_STATUS_MISC4__DATA_MASK 0xffffffff
+#define MC_DLB_STATUS_MISC4__DATA__SHIFT 0x0
+#define MC_DLB_STATUS_MISC5__DATA_MASK 0xffffffff
+#define MC_DLB_STATUS_MISC5__DATA__SHIFT 0x0
+#define MC_DLB_STATUS_MISC6__DATA_MASK 0xffffffff
+#define MC_DLB_STATUS_MISC6__DATA__SHIFT 0x0
+#define MC_DLB_STATUS_MISC7__DATA_MASK 0xffffffff
+#define MC_DLB_STATUS_MISC7__DATA__SHIFT 0x0
+#define MC_ARB_HARSH_EN_RD__TX_PRI_MASK 0xff
+#define MC_ARB_HARSH_EN_RD__TX_PRI__SHIFT 0x0
+#define MC_ARB_HARSH_EN_RD__BW_PRI_MASK 0xff00
+#define MC_ARB_HARSH_EN_RD__BW_PRI__SHIFT 0x8
+#define MC_ARB_HARSH_EN_RD__FIX_PRI_MASK 0xff0000
+#define MC_ARB_HARSH_EN_RD__FIX_PRI__SHIFT 0x10
+#define MC_ARB_HARSH_EN_RD__ST_PRI_MASK 0xff000000
+#define MC_ARB_HARSH_EN_RD__ST_PRI__SHIFT 0x18
+#define MC_ARB_HARSH_EN_WR__TX_PRI_MASK 0xff
+#define MC_ARB_HARSH_EN_WR__TX_PRI__SHIFT 0x0
+#define MC_ARB_HARSH_EN_WR__BW_PRI_MASK 0xff00
+#define MC_ARB_HARSH_EN_WR__BW_PRI__SHIFT 0x8
+#define MC_ARB_HARSH_EN_WR__FIX_PRI_MASK 0xff0000
+#define MC_ARB_HARSH_EN_WR__FIX_PRI__SHIFT 0x10
+#define MC_ARB_HARSH_EN_WR__ST_PRI_MASK 0xff000000
+#define MC_ARB_HARSH_EN_WR__ST_PRI__SHIFT 0x18
+#define MC_ARB_HARSH_TX_HI0_RD__GROUP0_MASK 0xff
+#define MC_ARB_HARSH_TX_HI0_RD__GROUP0__SHIFT 0x0
+#define MC_ARB_HARSH_TX_HI0_RD__GROUP1_MASK 0xff00
+#define MC_ARB_HARSH_TX_HI0_RD__GROUP1__SHIFT 0x8
+#define MC_ARB_HARSH_TX_HI0_RD__GROUP2_MASK 0xff0000
+#define MC_ARB_HARSH_TX_HI0_RD__GROUP2__SHIFT 0x10
+#define MC_ARB_HARSH_TX_HI0_RD__GROUP3_MASK 0xff000000
+#define MC_ARB_HARSH_TX_HI0_RD__GROUP3__SHIFT 0x18
+#define MC_ARB_HARSH_TX_HI0_WR__GROUP0_MASK 0xff
+#define MC_ARB_HARSH_TX_HI0_WR__GROUP0__SHIFT 0x0
+#define MC_ARB_

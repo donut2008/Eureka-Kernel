@@ -1,219 +1,185 @@
-/*
- *  Copyright (c) 1999-2001 Vojtech Pavlik
- */
-
-/*
- * Logitech WingMan Warrior joystick driver for Linux
- */
-
-/*
- * This program is free warftware; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+endctrl writes, so write
+ * the scratch register after writing sendctrl.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
- *
- *  Should you need to contact me, the author, you can do so either by
- * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
- * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
+ * Which register is written depends on the operation.
+ * Most operate on the common register, while
+ * SEND_ENB and SEND_DIS operate on the per-port ones.
+ * SEND_ENB is included in common because it can change SPCL_TRIG
  */
+#define SENDCTRL_COMMON_MODS (\
+	QIB_SENDCTRL_CLEAR | \
+	QIB_SENDCTRL_AVAIL_DIS | \
+	QIB_SENDCTRL_AVAIL_ENB | \
+	QIB_SENDCTRL_AVAIL_BLIP | \
+	QIB_SENDCTRL_DISARM | \
+	QIB_SENDCTRL_DISARM_ALL | \
+	QIB_SENDCTRL_SEND_ENB)
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/input.h>
-#include <linux/serio.h>
+#define SENDCTRL_PORT_MODS (\
+	QIB_SENDCTRL_CLEAR | \
+	QIB_SENDCTRL_SEND_ENB | \
+	QIB_SENDCTRL_SEND_DIS | \
+	QIB_SENDCTRL_FLUSH)
 
-#define DRIVER_DESC	"Logitech WingMan Warrior joystick driver"
-
-MODULE_AUTHOR("Vojtech Pavlik <vojtech@ucw.cz>");
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-
-/*
- * Constants.
- */
-
-#define WARRIOR_MAX_LENGTH	16
-static char warrior_lengths[] = { 0, 4, 12, 3, 4, 4, 0, 0 };
-
-/*
- * Per-Warrior data.
- */
-
-struct warrior {
-	struct input_dev *dev;
-	int idx, len;
-	unsigned char data[WARRIOR_MAX_LENGTH];
-	char phys[32];
-};
-
-/*
- * warrior_process_packet() decodes packets the driver receives from the
- * Warrior. It updates the data accordingly.
- */
-
-static void warrior_process_packet(struct warrior *warrior)
+static void sendctrl_7322_mod(struct qib_pportdata *ppd, u32 op)
 {
-	struct input_dev *dev = warrior->dev;
-	unsigned char *data = warrior->data;
+	struct qib_devdata *dd = ppd->dd;
+	u64 tmp_dd_sendctrl;
+	unsigned long flags;
 
-	if (!warrior->idx) return;
+	spin_lock_irqsave(&dd->sendctrl_lock, flags);
 
-	switch ((data[0] >> 4) & 7) {
-		case 1:					/* Button data */
-			input_report_key(dev, BTN_TRIGGER,  data[3]       & 1);
-			input_report_key(dev, BTN_THUMB,   (data[3] >> 1) & 1);
-			input_report_key(dev, BTN_TOP,     (data[3] >> 2) & 1);
-			input_report_key(dev, BTN_TOP2,    (data[3] >> 3) & 1);
-			break;
-		case 3:					/* XY-axis info->data */
-			input_report_abs(dev, ABS_X, ((data[0] & 8) << 5) - (data[2] | ((data[0] & 4) << 5)));
-			input_report_abs(dev, ABS_Y, (data[1] | ((data[0] & 1) << 7)) - ((data[0] & 2) << 7));
-			break;
-		case 5:					/* Throttle, spinner, hat info->data */
-			input_report_abs(dev, ABS_THROTTLE, (data[1] | ((data[0] & 1) << 7)) - ((data[0] & 2) << 7));
-			input_report_abs(dev, ABS_HAT0X, (data[3] & 2 ? 1 : 0) - (data[3] & 1 ? 1 : 0));
-			input_report_abs(dev, ABS_HAT0Y, (data[3] & 8 ? 1 : 0) - (data[3] & 4 ? 1 : 0));
-			input_report_rel(dev, REL_DIAL,  (data[2] | ((data[0] & 4) << 5)) - ((data[0] & 8) << 5));
-			break;
-	}
-	input_sync(dev);
-}
-
-/*
- * warrior_interrupt() is called by the low level driver when characters
- * are ready for us. We then buffer them for further processing, or call the
- * packet processing routine.
- */
-
-static irqreturn_t warrior_interrupt(struct serio *serio,
-		unsigned char data, unsigned int flags)
-{
-	struct warrior *warrior = serio_get_drvdata(serio);
-
-	if (data & 0x80) {
-		if (warrior->idx) warrior_process_packet(warrior);
-		warrior->idx = 0;
-		warrior->len = warrior_lengths[(data >> 4) & 7];
+	/* First the dd ones that are "sticky", saved in shadow */
+	if (op & QIB_SENDCTRL_CLEAR)
+		dd->sendctrl = 0;
+	if (op & QIB_SENDCTRL_AVAIL_DIS)
+		dd->sendctrl &= ~SYM_MASK(SendCtrl, SendBufAvailUpd);
+	else if (op & QIB_SENDCTRL_AVAIL_ENB) {
+		dd->sendctrl |= SYM_MASK(SendCtrl, SendBufAvailUpd);
+		if (dd->flags & QIB_USE_SPCL_TRIG)
+			dd->sendctrl |= SYM_MASK(SendCtrl, SpecialTriggerEn);
 	}
 
-	if (warrior->idx < warrior->len)
-		warrior->data[warrior->idx++] = data;
+	/* Then the ppd ones that are "sticky", saved in shadow */
+	if (op & QIB_SENDCTRL_SEND_DIS)
+		ppd->p_sendctrl &= ~SYM_MASK(SendCtrl_0, SendEnable);
+	else if (op & QIB_SENDCTRL_SEND_ENB)
+		ppd->p_sendctrl |= SYM_MASK(SendCtrl_0, SendEnable);
 
-	if (warrior->idx == warrior->len) {
-		if (warrior->idx) warrior_process_packet(warrior);
-		warrior->idx = 0;
-		warrior->len = 0;
+	if (op & QIB_SENDCTRL_DISARM_ALL) {
+		u32 i, last;
+
+		tmp_dd_sendctrl = dd->sendctrl;
+		last = dd->piobcnt2k + dd->piobcnt4k + NUM_VL15_BUFS;
+		/*
+		 * Disarm any buffers that are not yet launched,
+		 * disabling updates until done.
+		 */
+		tmp_dd_sendctrl &= ~SYM_MASK(SendCtrl, SendBufAvailUpd);
+		for (i = 0; i < last; i++) {
+			qib_write_kreg(dd, kr_sendctrl,
+				       tmp_dd_sendctrl |
+				       SYM_MASK(SendCtrl, Disarm) | i);
+			qib_write_kreg(dd, kr_scratch, 0);
+		}
 	}
-	return IRQ_HANDLED;
+
+	if (op & QIB_SENDCTRL_FLUSH) {
+		u64 tmp_ppd_sendctrl = ppd->p_sendctrl;
+
+		/*
+		 * Now drain all the fifos.  The Abort bit should never be
+		 * needed, so for now, at least, we don't use it.
+		 */
+		tmp_ppd_sendctrl |=
+			SYM_MASK(SendCtrl_0, TxeDrainRmFifo) |
+			SYM_MASK(SendCtrl_0, TxeDrainLaFifo) |
+			SYM_MASK(SendCtrl_0, TxeBypassIbc);
+		qib_write_kreg_port(ppd, krp_sendctrl, tmp_ppd_sendctrl);
+		qib_write_kreg(dd, kr_scratch, 0);
+	}
+
+	tmp_dd_sendctrl = dd->sendctrl;
+
+	if (op & QIB_SENDCTRL_DISARM)
+		tmp_dd_sendctrl |= SYM_MASK(SendCtrl, Disarm) |
+			((op & QIB_7322_SendCtrl_DisarmSendBuf_RMASK) <<
+			 SYM_LSB(SendCtrl, DisarmSendBuf));
+	if ((op & QIB_SENDCTRL_AVAIL_BLIP) &&
+	    (dd->sendctrl & SYM_MASK(SendCtrl, SendBufAvailUpd)))
+		tmp_dd_sendctrl &= ~SYM_MASK(SendCtrl, SendBufAvailUpd);
+
+	if (op == 0 || (op & SENDCTRL_COMMON_MODS)) {
+		qib_write_kreg(dd, kr_sendctrl, tmp_dd_sendctrl);
+		qib_write_kreg(dd, kr_scratch, 0);
+	}
+
+	if (op == 0 || (op & SENDCTRL_PORT_MODS)) {
+		qib_write_kreg_port(ppd, krp_sendctrl, ppd->p_sendctrl);
+		qib_write_kreg(dd, kr_scratch, 0);
+	}
+
+	if (op & QIB_SENDCTRL_AVAIL_BLIP) {
+		qib_write_kreg(dd, kr_sendctrl, dd->sendctrl);
+		qib_write_kreg(dd, kr_scratch, 0);
+	}
+
+	spin_unlock_irqrestore(&dd->sendctrl_lock, flags);
+
+	if (op & QIB_SENDCTRL_FLUSH) {
+		u32 v;
+		/*
+		 * ensure writes have hit chip, then do a few
+		 * more reads, to allow DMA of pioavail registers
+		 * to occur, so in-memory copy is in sync with
+		 * the chip.  Not always safe to sleep.
+		 */
+		v = qib_read_kreg32(dd, kr_scratch);
+		qib_write_kreg(dd, kr_scratch, v);
+		v = qib_read_kreg32(dd, kr_scratch);
+		qib_write_kreg(dd, kr_scratch, v);
+		qib_read_kreg32(dd, kr_scratch);
+	}
 }
 
-/*
- * warrior_disconnect() is the opposite of warrior_connect()
- */
+#define _PORT_VIRT_FLAG 0x8000U /* "virtual", need adjustments */
+#define _PORT_64BIT_FLAG 0x10000U /* not "virtual", but 64bit */
+#define _PORT_CNTR_IDXMASK 0x7fffU /* mask off flags above */
 
-static void warrior_disconnect(struct serio *serio)
+/**
+ * qib_portcntr_7322 - read a per-port chip counter
+ * @ppd: the qlogic_ib pport
+ * @creg: the counter to read (not a chip offset)
+ */
+static u64 qib_portcntr_7322(struct qib_pportdata *ppd, u32 reg)
 {
-	struct warrior *warrior = serio_get_drvdata(serio);
+	struct qib_devdata *dd = ppd->dd;
+	u64 ret = 0ULL;
+	u16 creg;
+	/* 0xffff for unimplemented or synthesized counters */
+	static const u32 xlator[] = {
+		[QIBPORTCNTR_PKTSEND] = crp_pktsend | _PORT_64BIT_FLAG,
+		[QIBPORTCNTR_WORDSEND] = crp_wordsend | _PORT_64BIT_FLAG,
+		[QIBPORTCNTR_PSXMITDATA] = crp_psxmitdatacount,
+		[QIBPORTCNTR_PSXMITPKTS] = crp_psxmitpktscount,
+		[QIBPORTCNTR_PSXMITWAIT] = crp_psxmitwaitcount,
+		[QIBPORTCNTR_SENDSTALL] = crp_sendstall,
+		[QIBPORTCNTR_PKTRCV] = crp_pktrcv | _PORT_64BIT_FLAG,
+		[QIBPORTCNTR_PSRCVDATA] = crp_psrcvdatacount,
+		[QIBPORTCNTR_PSRCVPKTS] = crp_psrcvpktscount,
+		[QIBPORTCNTR_RCVEBP] = crp_rcvebp,
+		[QIBPORTCNTR_RCVOVFL] = crp_rcvovfl,
+		[QIBPORTCNTR_WORDRCV] = crp_wordrcv | _PORT_64BIT_FLAG,
+		[QIBPORTCNTR_RXDROPPKT] = 0xffff, /* not needed  for 7322 */
+		[QIBPORTCNTR_RXLOCALPHYERR] = crp_rxotherlocalphyerr,
+		[QIBPORTCNTR_RXVLERR] = crp_rxvlerr,
+		[QIBPORTCNTR_ERRICRC] = crp_erricrc,
+		[QIBPORTCNTR_ERRVCRC] = crp_errvcrc,
+		[QIBPORTCNTR_ERRLPCRC] = crp_errlpcrc,
+		[QIBPORTCNTR_BADFORMAT] = crp_badformat,
+		[QIBPORTCNTR_ERR_RLEN] = crp_err_rlen,
+		[QIBPORTCNTR_IBSYMBOLERR] = crp_ibsymbolerr,
+		[QIBPORTCNTR_INVALIDRLEN] = crp_invalidrlen,
+		[QIBPORTCNTR_UNSUPVL] = crp_txunsupvl,
+		[QIBPORTCNTR_EXCESSBUFOVFL] = crp_excessbufferovfl,
+		[QIBPORTCNTR_ERRLINK] = crp_errlink,
+		[QIBPORTCNTR_IBLINKDOWN] = crp_iblinkdown,
+		[QIBPORTCNTR_IBLINKERRRECOV] = crp_iblinkerrrecov,
+		[QIBPORTCNTR_LLI] = crp_locallinkintegrityerr,
+		[QIBPORTCNTR_VL15PKTDROP] = crp_vl15droppedpkt,
+		[QIBPORTCNTR_ERRPKEY] = crp_errpkey,
+		/*
+		 * the next 3 aren't really counters, but were implemented
+		 * as counters in older chips, so still get accessed as
+		 * though they were counters from this code.
+		 */
+		[QIBPORTCNTR_PSINTERVAL] = krp_psinterval,
+		[QIBPORTCNTR_PSSTART] = krp_psstart,
+		[QIBPORTCNTR_PSSTAT] = krp_psstat,
+		/* pseudo-counter, summed for all ports */
+		[QIBPORTCNTR_KHDROVFL] = 0xffff,
+	};
 
-	serio_close(serio);
-	serio_set_drvdata(serio, NULL);
-	input_unregister_device(warrior->dev);
-	kfree(warrior);
-}
-
-/*
- * warrior_connect() is the routine that is called when someone adds a
- * new serio device. It looks for the Warrior, and if found, registers
- * it as an input device.
- */
-
-static int warrior_connect(struct serio *serio, struct serio_driver *drv)
-{
-	struct warrior *warrior;
-	struct input_dev *input_dev;
-	int err = -ENOMEM;
-
-	warrior = kzalloc(sizeof(struct warrior), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!warrior || !input_dev)
-		goto fail1;
-
-	warrior->dev = input_dev;
-	snprintf(warrior->phys, sizeof(warrior->phys), "%s/input0", serio->phys);
-
-	input_dev->name = "Logitech WingMan Warrior";
-	input_dev->phys = warrior->phys;
-	input_dev->id.bustype = BUS_RS232;
-	input_dev->id.vendor = SERIO_WARRIOR;
-	input_dev->id.product = 0x0001;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &serio->dev;
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REL) |
-		BIT_MASK(EV_ABS);
-	input_dev->keybit[BIT_WORD(BTN_TRIGGER)] = BIT_MASK(BTN_TRIGGER) |
-		BIT_MASK(BTN_THUMB) | BIT_MASK(BTN_TOP) | BIT_MASK(BTN_TOP2);
-	input_dev->relbit[0] = BIT_MASK(REL_DIAL);
-	input_set_abs_params(input_dev, ABS_X, -64, 64, 0, 8);
-	input_set_abs_params(input_dev, ABS_Y, -64, 64, 0, 8);
-	input_set_abs_params(input_dev, ABS_THROTTLE, -112, 112, 0, 0);
-	input_set_abs_params(input_dev, ABS_HAT0X, -1, 1, 0, 0);
-	input_set_abs_params(input_dev, ABS_HAT0Y, -1, 1, 0, 0);
-
-	serio_set_drvdata(serio, warrior);
-
-	err = serio_open(serio, drv);
-	if (err)
-		goto fail2;
-
-	err = input_register_device(warrior->dev);
-	if (err)
-		goto fail3;
-
-	return 0;
-
- fail3:	serio_close(serio);
- fail2:	serio_set_drvdata(serio, NULL);
- fail1:	input_free_device(input_dev);
-	kfree(warrior);
-	return err;
-}
-
-/*
- * The serio driver structure.
- */
-
-static struct serio_device_id warrior_serio_ids[] = {
-	{
-		.type	= SERIO_RS232,
-		.proto	= SERIO_WARRIOR,
-		.id	= SERIO_ANY,
-		.extra	= SERIO_ANY,
-	},
-	{ 0 }
-};
-
-MODULE_DEVICE_TABLE(serio, warrior_serio_ids);
-
-static struct serio_driver warrior_drv = {
-	.driver		= {
-		.name	= "warrior",
-	},
-	.description	= DRIVER_DESC,
-	.id_table	= warrior_serio_ids,
-	.interrupt	= warrior_interrupt,
-	.connect	= warrior_connect,
-	.disconnect	= warrior_disconnect,
-};
-
-module_serio_driver(warrior_drv);
+	if (reg >= ARRAY_SIZE(xlator)) {
+		qib_devinfo(ppd->dd->pcidev,
+			 "Unimplemented p

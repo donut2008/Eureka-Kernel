@@ -1,3238 +1,2723 @@
-/* Intel PRO/1000 Linux driver
- * Copyright(c) 1999 - 2015 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * The full GNU General Public License is included in this distribution in
- * the file called "COPYING".
- *
- * Contact Information:
- * Linux NICS <linux.nics@intel.com>
- * e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+cted\n");
+			return;
+		}
+
+		cpuid(CPUID_FREQ_VOLT_CAPABILITIES, &eax, &ebx, &ecx, &edx);
+		if ((edx & P_STATE_TRANSITION_CAPABLE)
+			!= P_STATE_TRANSITION_CAPABLE) {
+			pr_info("Power state transitions not supported\n");
+			return;
+		}
+		*rc = 0;
+	}
+}
+
+static int check_pst_table(struct powernow_k8_data *data, struct pst_s *pst,
+		u8 maxvid)
+{
+	unsigned int j;
+	u8 lastfid = 0xff;
+
+	for (j = 0; j < data->numps; j++) {
+		if (pst[j].vid > LEAST_VID) {
+			pr_err(FW_BUG "vid %d invalid : 0x%x\n", j,
+				pst[j].vid);
+			return -EINVAL;
+		}
+		if (pst[j].vid < data->rvo) {
+			/* vid + rvo >= 0 */
+			pr_err(FW_BUG "0 vid exceeded with pstate %d\n", j);
+			return -ENODEV;
+		}
+		if (pst[j].vid < maxvid + data->rvo) {
+			/* vid + rvo >= maxvid */
+			pr_err(FW_BUG "maxvid exceeded with pstate %d\n", j);
+			return -ENODEV;
+		}
+		if (pst[j].fid > MAX_FID) {
+			pr_err(FW_BUG "maxfid exceeded with pstate %d\n", j);
+			return -ENODEV;
+		}
+		if (j && (pst[j].fid < HI_FID_TABLE_BOTTOM)) {
+			/* Only first fid is allowed to be in "low" range */
+			pr_err(FW_BUG "two low fids - %d : 0x%x\n", j,
+				pst[j].fid);
+			return -EINVAL;
+		}
+		if (pst[j].fid < lastfid)
+			lastfid = pst[j].fid;
+	}
+	if (lastfid & 1) {
+		pr_err(FW_BUG "lastfid invalid\n");
+		return -EINVAL;
+	}
+	if (lastfid > LO_FID_TABLE_TOP)
+		pr_info(FW_BUG "first fid not from lo freq table\n");
+
+	return 0;
+}
+
+static void invalidate_entry(struct cpufreq_frequency_table *powernow_table,
+		unsigned int entry)
+{
+	powernow_table[entry].frequency = CPUFREQ_ENTRY_INVALID;
+}
+
+static void print_basics(struct powernow_k8_data *data)
+{
+	int j;
+	for (j = 0; j < data->numps; j++) {
+		if (data->powernow_table[j].frequency !=
+				CPUFREQ_ENTRY_INVALID) {
+			pr_info("fid 0x%x (%d MHz), vid 0x%x\n",
+				data->powernow_table[j].driver_data & 0xff,
+				data->powernow_table[j].frequency/1000,
+				data->powernow_table[j].driver_data >> 8);
+		}
+	}
+	if (data->batps)
+		pr_info("Only %d pstates on battery\n", data->batps);
+}
+
+static int fill_powernow_table(struct powernow_k8_data *data,
+		struct pst_s *pst, u8 maxvid)
+{
+	struct cpufreq_frequency_table *powernow_table;
+	unsigned int j;
+
+	if (data->batps) {
+		/* use ACPI support to get full speed on mains power */
+		pr_warn("Only %d pstates usable (use ACPI driver for full range\n",
+			data->batps);
+		data->numps = data->batps;
+	}
+
+	for (j = 1; j < data->numps; j++) {
+		if (pst[j-1].fid >= pst[j].fid) {
+			pr_err("PST out of sequence\n");
+			return -EINVAL;
+		}
+	}
+
+	if (data->numps < 2) {
+		pr_err("no p states to transition\n");
+		return -ENODEV;
+	}
+
+	if (check_pst_table(data, pst, maxvid))
+		return -EINVAL;
+
+	powernow_table = kzalloc((sizeof(*powernow_table)
+		* (data->numps + 1)), GFP_KERNEL);
+	if (!powernow_table) {
+		pr_err("powernow_table memory alloc failure\n");
+		return -ENOMEM;
+	}
+
+	for (j = 0; j < data->numps; j++) {
+		int freq;
+		powernow_table[j].driver_data = pst[j].fid; /* lower 8 bits */
+		powernow_table[j].driver_data |= (pst[j].vid << 8); /* upper 8 bits */
+		freq = find_khz_freq_from_fid(pst[j].fid);
+		powernow_table[j].frequency = freq;
+	}
+	powernow_table[data->numps].frequency = CPUFREQ_TABLE_END;
+	powernow_table[data->numps].driver_data = 0;
+
+	if (query_current_values_with_pending_wait(data)) {
+		kfree(powernow_table);
+		return -EIO;
+	}
+
+	pr_debug("cfid 0x%x, cvid 0x%x\n", data->currfid, data->currvid);
+	data->powernow_table = powernow_table;
+	if (cpumask_first(topology_core_cpumask(data->cpu)) == data->cpu)
+		print_basics(data);
+
+	for (j = 0; j < data->numps; j++)
+		if ((pst[j].fid == data->currfid) &&
+		    (pst[j].vid == data->currvid))
+			return 0;
+
+	pr_debug("currfid/vid do not match PST, ignoring\n");
+	return 0;
+}
+
+/* Find and validate the PSB/PST table in BIOS. */
+static int find_psb_table(struct powernow_k8_data *data)
+{
+	struct psb_s *psb;
+	unsigned int i;
+	u32 mvs;
+	u8 maxvid;
+	u32 cpst = 0;
+	u32 thiscpuid;
+
+	for (i = 0xc0000; i < 0xffff0; i += 0x10) {
+		/* Scan BIOS looking for the signature. */
+		/* It can not be at ffff0 - it is too big. */
+
+		psb = phys_to_virt(i);
+		if (memcmp(psb, PSB_ID_STRING, PSB_ID_STRING_LEN) != 0)
+			continue;
+
+		pr_debug("found PSB header at 0x%p\n", psb);
+
+		pr_debug("table vers: 0x%x\n", psb->tableversion);
+		if (psb->tableversion != PSB_VERSION_1_4) {
+			pr_err(FW_BUG "PSB table is not v1.4\n");
+			return -ENODEV;
+		}
+
+		pr_debug("flags: 0x%x\n", psb->flags1);
+		if (psb->flags1) {
+			pr_err(FW_BUG "unknown flags\n");
+			return -ENODEV;
+		}
+
+		data->vstable = psb->vstable;
+		pr_debug("voltage stabilization time: %d(*20us)\n",
+				data->vstable);
+
+		pr_debug("flags2: 0x%x\n", psb->flags2);
+		data->rvo = psb->flags2 & 3;
+		data->irt = ((psb->flags2) >> 2) & 3;
+		mvs = ((psb->flags2) >> 4) & 3;
+		data->vidmvs = 1 << mvs;
+		data->batps = ((psb->flags2) >> 6) & 3;
+
+		pr_debug("ramp voltage offset: %d\n", data->rvo);
+		pr_debug("isochronous relief time: %d\n", data->irt);
+		pr_debug("maximum voltage step: %d - 0x%x\n", mvs, data->vidmvs);
+
+		pr_debug("numpst: 0x%x\n", psb->num_tables);
+		cpst = psb->num_tables;
+		if ((psb->cpuid == 0x00000fc0) ||
+		    (psb->cpuid == 0x00000fe0)) {
+			thiscpuid = cpuid_eax(CPUID_PROCESSOR_SIGNATURE);
+			if ((thiscpuid == 0x00000fc0) ||
+			    (thiscpuid == 0x00000fe0))
+				cpst = 1;
+		}
+		if (cpst != 1) {
+			pr_err(FW_BUG "numpst must be 1\n");
+			return -ENODEV;
+		}
+
+		data->plllock = psb->plllocktime;
+		pr_debug("plllocktime: 0x%x (units 1us)\n", psb->plllocktime);
+		pr_debug("maxfid: 0x%x\n", psb->maxfid);
+		pr_debug("maxvid: 0x%x\n", psb->maxvid);
+		maxvid = psb->maxvid;
+
+		data->numps = psb->numps;
+		pr_debug("numpstates: 0x%x\n", data->numps);
+		return fill_powernow_table(data,
+				(struct pst_s *)(psb+1), maxvid);
+	}
+	/*
+	 * If you see this message, complain to BIOS manufacturer. If
+	 * he tells you "we do not support Linux" or some similar
+	 * nonsense, remember that Windows 2000 uses the same legacy
+	 * mechanism that the old Linux PSB driver uses. Tell them it
+	 * is broken with Windows 2000.
+	 *
+	 * The reference to the AMD documentation is chapter 9 in the
+	 * BIOS and Kernel Developer's Guide, which is available on
+	 * www.amd.com
+	 */
+	pr_err(FW_BUG "No PSB or ACPI _PSS objects\n");
+	pr_err("Make sure that your BIOS is up to date and Cool'N'Quiet support is enabled in BIOS setup\n");
+	return -ENODEV;
+}
+
+static void powernow_k8_acpi_pst_values(struct powernow_k8_data *data,
+		unsigned int index)
+{
+	u64 control;
+
+	if (!data->acpi_data.state_count)
+		return;
+
+	control = data->acpi_data.states[index].control;
+	data->irt = (control >> IRT_SHIFT) & IRT_MASK;
+	data->rvo = (control >> RVO_SHIFT) & RVO_MASK;
+	data->exttype = (control >> EXT_TYPE_SHIFT) & EXT_TYPE_MASK;
+	data->plllock = (control >> PLL_L_SHIFT) & PLL_L_MASK;
+	data->vidmvs = 1 << ((control >> MVS_SHIFT) & MVS_MASK);
+	data->vstable = (control >> VST_SHIFT) & VST_MASK;
+}
+
+static int powernow_k8_cpu_init_acpi(struct powernow_k8_data *data)
+{
+	struct cpufreq_frequency_table *powernow_table;
+	int ret_val = -ENODEV;
+	u64 control, status;
+
+	if (acpi_processor_register_performance(&data->acpi_data, data->cpu)) {
+		pr_debug("register performance failed: bad ACPI data\n");
+		return -EIO;
+	}
+
+	/* verify the data contained in the ACPI structures */
+	if (data->acpi_data.state_count <= 1) {
+		pr_debug("No ACPI P-States\n");
+		goto err_out;
+	}
+
+	control = data->acpi_data.control_register.space_id;
+	status = data->acpi_data.status_register.space_id;
+
+	if ((control != ACPI_ADR_SPACE_FIXED_HARDWARE) ||
+	    (status != ACPI_ADR_SPACE_FIXED_HARDWARE)) {
+		pr_debug("Invalid control/status registers (%llx - %llx)\n",
+			control, status);
+		goto err_out;
+	}
+
+	/* fill in data->powernow_table */
+	powernow_table = kzalloc((sizeof(*powernow_table)
+		* (data->acpi_data.state_count + 1)), GFP_KERNEL);
+	if (!powernow_table) {
+		pr_debug("powernow_table memory alloc failure\n");
+		goto err_out;
+	}
+
+	/* fill in data */
+	data->numps = data->acpi_data.state_count;
+	powernow_k8_acpi_pst_values(data, 0);
+
+	ret_val = fill_powernow_table_fidvid(data, powernow_table);
+	if (ret_val)
+		goto err_out_mem;
+
+	powernow_table[data->acpi_data.state_count].frequency =
+		CPUFREQ_TABLE_END;
+	data->powernow_table = powernow_table;
+
+	if (cpumask_first(topology_core_cpumask(data->cpu)) == data->cpu)
+		print_basics(data);
+
+	/* notify BIOS that we exist */
+	acpi_processor_notify_smm(THIS_MODULE);
+
+	if (!zalloc_cpumask_var(&data->acpi_data.shared_cpu_map, GFP_KERNEL)) {
+		pr_err("unable to alloc powernow_k8_data cpumask\n");
+		ret_val = -ENOMEM;
+		goto err_out_mem;
+	}
+
+	return 0;
+
+err_out_mem:
+	kfree(powernow_table);
+
+err_out:
+	acpi_processor_unregister_performance(data->cpu);
+
+	/* data->acpi_data.state_count informs us at ->exit()
+	 * whether ACPI was used */
+	data->acpi_data.state_count = 0;
+
+	return ret_val;
+}
+
+static int fill_powernow_table_fidvid(struct powernow_k8_data *data,
+		struct cpufreq_frequency_table *powernow_table)
+{
+	int i;
+
+	for (i = 0; i < data->acpi_data.state_count; i++) {
+		u32 fid;
+		u32 vid;
+		u32 freq, index;
+		u64 status, control;
+
+		if (data->exttype) {
+			status =  data->acpi_data.states[i].status;
+			fid = status & EXT_FID_MASK;
+			vid = (status >> VID_SHIFT) & EXT_VID_MASK;
+		} else {
+			control =  data->acpi_data.states[i].control;
+			fid = control & FID_MASK;
+			vid = (control >> VID_SHIFT) & VID_MASK;
+		}
+
+		pr_debug("   %d : fid 0x%x, vid 0x%x\n", i, fid, vid);
+
+		index = fid | (vid<<8);
+		powernow_table[i].driver_data = index;
+
+		freq = find_khz_freq_from_fid(fid);
+		powernow_table[i].frequency = freq;
+
+		/* verify frequency is OK */
+		if ((freq > (MAX_FREQ * 1000)) || (freq < (MIN_FREQ * 1000))) {
+			pr_debug("invalid freq %u kHz, ignoring\n", freq);
+			invalidate_entry(powernow_table, i);
+			continue;
+		}
+
+		/* verify voltage is OK -
+		 * BIOSs are using "off" to indicate invalid */
+		if (vid == VID_OFF) {
+			pr_debug("invalid vid %u, ignoring\n", vid);
+			invalidate_entry(powernow_table, i);
+			continue;
+		}
+
+		if (freq != (data->acpi_data.states[i].core_frequency * 1000)) {
+			pr_info("invalid freq entries %u kHz vs. %u kHz\n",
+				freq, (unsigned int)
+				(data->acpi_data.states[i].core_frequency
+				 * 1000));
+			invalidate_entry(powernow_table, i);
+			continue;
+		}
+	}
+	return 0;
+}
+
+static void powernow_k8_cpu_exit_acpi(struct powernow_k8_data *data)
+{
+	if (data->acpi_data.state_count)
+		acpi_processor_unregister_performance(data->cpu);
+	free_cpumask_var(data->acpi_data.shared_cpu_map);
+}
+
+static int get_transition_latency(struct powernow_k8_data *data)
+{
+	int max_latency = 0;
+	int i;
+	for (i = 0; i < data->acpi_data.state_count; i++) {
+		int cur_latency = data->acpi_data.states[i].transition_latency
+			+ data->acpi_data.states[i].bus_master_latency;
+		if (cur_latency > max_latency)
+			max_latency = cur_latency;
+	}
+	if (max_latency == 0) {
+		pr_err(FW_WARN "Invalid zero transition latency\n");
+		max_latency = 1;
+	}
+	/* value in usecs, needs to be in nanoseconds */
+	return 1000 * max_latency;
+}
+
+/* Take a frequency, and issue the fid/vid transition command */
+static int transition_frequency_fidvid(struct powernow_k8_data *data,
+		unsigned int index,
+		struct cpufreq_policy *policy)
+{
+	u32 fid = 0;
+	u32 vid = 0;
+	int res;
+	struct cpufreq_freqs freqs;
+
+	pr_debug("cpu %d transition to index %u\n", smp_processor_id(), index);
+
+	/* fid/vid correctness check for k8 */
+	/* fid are the lower 8 bits of the index we stored into
+	 * the cpufreq frequency table in find_psb_table, vid
+	 * are the upper 8 bits.
+	 */
+	fid = data->powernow_table[index].driver_data & 0xFF;
+	vid = (data->powernow_table[index].driver_data & 0xFF00) >> 8;
+
+	pr_debug("table matched fid 0x%x, giving vid 0x%x\n", fid, vid);
+
+	if (query_current_values_with_pending_wait(data))
+		return 1;
+
+	if ((data->currvid == vid) && (data->currfid == fid)) {
+		pr_debug("target matches current values (fid 0x%x, vid 0x%x)\n",
+			fid, vid);
+		return 0;
+	}
+
+	pr_debug("cpu %d, changing to fid 0x%x, vid 0x%x\n",
+		smp_processor_id(), fid, vid);
+	freqs.old = find_khz_freq_from_fid(data->currfid);
+	freqs.new = find_khz_freq_from_fid(fid);
+
+	cpufreq_freq_transition_begin(policy, &freqs);
+	res = transition_fid_vid(data, fid, vid);
+	cpufreq_freq_transition_end(policy, &freqs, res);
+
+	return res;
+}
+
+struct powernowk8_target_arg {
+	struct cpufreq_policy		*pol;
+	unsigned			newstate;
+};
+
+static long powernowk8_target_fn(void *arg)
+{
+	struct powernowk8_target_arg *pta = arg;
+	struct cpufreq_policy *pol = pta->pol;
+	unsigned newstate = pta->newstate;
+	struct powernow_k8_data *data = per_cpu(powernow_data, pol->cpu);
+	u32 checkfid;
+	u32 checkvid;
+	int ret;
+
+	if (!data)
+		return -EINVAL;
+
+	checkfid = data->currfid;
+	checkvid = data->currvid;
+
+	if (pending_bit_stuck()) {
+		pr_err("failing targ, change pending bit set\n");
+		return -EIO;
+	}
+
+	pr_debug("targ: cpu %d, %d kHz, min %d, max %d\n",
+		pol->cpu, data->powernow_table[newstate].frequency, pol->min,
+		pol->max);
+
+	if (query_current_values_with_pending_wait(data))
+		return -EIO;
+
+	pr_debug("targ: curr fid 0x%x, vid 0x%x\n",
+		data->currfid, data->currvid);
+
+	if ((checkvid != data->currvid) ||
+	    (checkfid != data->currfid)) {
+		pr_info("error - out of sync, fix 0x%x 0x%x, vid 0x%x 0x%x\n",
+		       checkfid, data->currfid,
+		       checkvid, data->currvid);
+	}
+
+	mutex_lock(&fidvid_mutex);
+
+	powernow_k8_acpi_pst_values(data, newstate);
+
+	ret = transition_frequency_fidvid(data, newstate, pol);
+
+	if (ret) {
+		pr_err("transition frequency failed\n");
+		mutex_unlock(&fidvid_mutex);
+		return 1;
+	}
+	mutex_unlock(&fidvid_mutex);
+
+	pol->cur = find_khz_freq_from_fid(data->currfid);
+
+	return 0;
+}
+
+/* Driver entry point to switch to the target frequency */
+static int powernowk8_target(struct cpufreq_policy *pol, unsigned index)
+{
+	struct powernowk8_target_arg pta = { .pol = pol, .newstate = index };
+
+	return work_on_cpu(pol->cpu, powernowk8_target_fn, &pta);
+}
+
+struct init_on_cpu {
+	struct powernow_k8_data *data;
+	int rc;
+};
+
+static void powernowk8_cpu_init_on_cpu(void *_init_on_cpu)
+{
+	struct init_on_cpu *init_on_cpu = _init_on_cpu;
+
+	if (pending_bit_stuck()) {
+		pr_err("failing init, change pending bit set\n");
+		init_on_cpu->rc = -ENODEV;
+		return;
+	}
+
+	if (query_current_values_with_pending_wait(init_on_cpu->data)) {
+		init_on_cpu->rc = -ENODEV;
+		return;
+	}
+
+	fidvid_msr_init();
+
+	init_on_cpu->rc = 0;
+}
+
+#define MISSING_PSS_MSG \
+	FW_BUG "No compatible ACPI _PSS objects found.\n" \
+	FW_BUG "First, make sure Cool'N'Quiet is enabled in the BIOS.\n" \
+	FW_BUG "If that doesn't help, try upgrading your BIOS.\n"
+
+/* per CPU init entry point to the driver */
+static int powernowk8_cpu_init(struct cpufreq_policy *pol)
+{
+	struct powernow_k8_data *data;
+	struct init_on_cpu init_on_cpu;
+	int rc, cpu;
+
+	smp_call_function_single(pol->cpu, check_supported_cpu, &rc, 1);
+	if (rc)
+		return -ENODEV;
+
+	data = kzalloc(sizeof(*data), GFP_KERNEL);
+	if (!data) {
+		pr_err("unable to alloc powernow_k8_data");
+		return -ENOMEM;
+	}
+
+	data->cpu = pol->cpu;
+
+	if (powernow_k8_cpu_init_acpi(data)) {
+		/*
+		 * Use the PSB BIOS structure. This is only available on
+		 * an UP version, and is deprecated by AMD.
+		 */
+		if (num_online_cpus() != 1) {
+			pr_err_once(MISSING_PSS_MSG);
+			goto err_out;
+		}
+		if (pol->cpu != 0) {
+			pr_err(FW_BUG "No ACPI _PSS objects for CPU other than CPU0. Complain to your BIOS vendor.\n");
+			goto err_out;
+		}
+		rc = find_psb_table(data);
+		if (rc)
+			goto err_out;
+
+		/* Take a crude guess here.
+		 * That guess was in microseconds, so multiply with 1000 */
+		pol->cpuinfo.transition_latency = (
+			 ((data->rvo + 8) * data->vstable * VST_UNITS_20US) +
+			 ((1 << data->irt) * 30)) * 1000;
+	} else /* ACPI _PSS objects available */
+		pol->cpuinfo.transition_latency = get_transition_latency(data);
+
+	/* only run on specific CPU from here on */
+	init_on_cpu.data = data;
+	smp_call_function_single(data->cpu, powernowk8_cpu_init_on_cpu,
+				 &init_on_cpu, 1);
+	rc = init_on_cpu.rc;
+	if (rc != 0)
+		goto err_out_exit_acpi;
+
+	cpumask_copy(pol->cpus, topology_core_cpumask(pol->cpu));
+	data->available_cores = pol->cpus;
+
+	/* min/max the cpu is capable of */
+	if (cpufreq_table_validate_and_show(pol, data->powernow_table)) {
+		pr_err(FW_BUG "invalid powernow_table\n");
+		powernow_k8_cpu_exit_acpi(data);
+		kfree(data->powernow_table);
+		kfree(data);
+		return -EINVAL;
+	}
+
+	pr_debug("cpu_init done, current fid 0x%x, vid 0x%x\n",
+		data->currfid, data->currvid);
+
+	/* Point all the CPUs in this policy to the same data */
+	for_each_cpu(cpu, pol->cpus)
+		per_cpu(powernow_data, cpu) = data;
+
+	return 0;
+
+err_out_exit_acpi:
+	powernow_k8_cpu_exit_acpi(data);
+
+err_out:
+	kfree(data);
+	return -ENODEV;
+}
+
+static int powernowk8_cpu_exit(struct cpufreq_policy *pol)
+{
+	struct powernow_k8_data *data = per_cpu(powernow_data, pol->cpu);
+	int cpu;
+
+	if (!data)
+		return -EINVAL;
+
+	powernow_k8_cpu_exit_acpi(data);
+
+	kfree(data->powernow_table);
+	kfree(data);
+	/* pol->cpus will be empty here, use related_cpus instead. */
+	for_each_cpu(cpu, pol->related_cpus)
+		per_cpu(powernow_data, cpu) = NULL;
+
+	return 0;
+}
+
+static void query_values_on_cpu(void *_err)
+{
+	int *err = _err;
+	struct powernow_k8_data *data = __this_cpu_read(powernow_data);
+
+	*err = query_current_values_with_pending_wait(data);
+}
+
+static unsigned int powernowk8_get(unsigned int cpu)
+{
+	struct powernow_k8_data *data = per_cpu(powernow_data, cpu);
+	unsigned int khz = 0;
+	int err;
+
+	if (!data)
+		return 0;
+
+	smp_call_function_single(cpu, query_values_on_cpu, &err, true);
+	if (err)
+		goto out;
+
+	khz = find_khz_freq_from_fid(data->currfid);
+
+
+out:
+	return khz;
+}
+
+static struct cpufreq_driver cpufreq_amd64_driver = {
+	.flags		= CPUFREQ_ASYNC_NOTIFICATION,
+	.verify		= cpufreq_generic_frequency_table_verify,
+	.target_index	= powernowk8_target,
+	.bios_limit	= acpi_processor_get_bios_limit,
+	.init		= powernowk8_cpu_init,
+	.exit		= powernowk8_cpu_exit,
+	.get		= powernowk8_get,
+	.name		= "powernow-k8",
+	.attr		= cpufreq_generic_attr,
+};
+
+static void __request_acpi_cpufreq(void)
+{
+	const char *cur_drv, *drv = "acpi-cpufreq";
+
+	cur_drv = cpufreq_get_current_driver();
+	if (!cur_drv)
+		goto request;
+
+	if (strncmp(cur_drv, drv, min_t(size_t, strlen(cur_drv), strlen(drv))))
+		pr_warn("WTF driver: %s\n", cur_drv);
+
+	return;
+
+ request:
+	pr_warn("This CPU is not supported anymore, using acpi-cpufreq instead.\n");
+	request_module(drv);
+}
+
+/* driver entry point for init */
+static int powernowk8_init(void)
+{
+	unsigned int i, supported_cpus = 0;
+	int ret;
+
+	if (static_cpu_has(X86_FEATURE_HW_PSTATE)) {
+		__request_acpi_cpufreq();
+		return -ENODEV;
+	}
+
+	if (!x86_match_cpu(powernow_k8_ids))
+		return -ENODEV;
+
+	get_online_cpus();
+	for_each_online_cpu(i) {
+		smp_call_function_single(i, check_supported_cpu, &ret, 1);
+		if (!ret)
+			supported_cpus++;
+	}
+
+	if (supported_cpus != num_online_cpus()) {
+		put_online_cpus();
+		return -ENODEV;
+	}
+	put_online_cpus();
+
+	ret = cpufreq_register_driver(&cpufreq_amd64_driver);
+	if (ret)
+		return ret;
+
+	pr_info("Found %d %s (%d cpu cores) (" VERSION ")\n",
+		num_online_nodes(), boot_cpu_data.x86_model_id, supported_cpus);
+
+	return ret;
+}
+
+/* driver entry point for term */
+static void __exit powernowk8_exit(void)
+{
+	pr_debug("exit\n");
+
+	cpufreq_unregister_driver(&cpufreq_amd64_driver);
+}
+
+MODULE_AUTHOR("Paul Devriendt <paul.devriendt@amd.com>");
+MODULE_AUTHOR("Mark Langsdorf <mark.langsdorf@amd.com>");
+MODULE_DESCRIPTION("AMD Athlon 64 and Opteron processor frequency driver.");
+MODULE_LICENSE("GPL");
+
+late_initcall(powernowk8_init);
+module_exit(powernowk8_exit);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       /*
+ *  (c) 2003-2006 Advanced Micro Devices, Inc.
+ *  Your use of this code is subject to the terms and conditions of the
+ *  GNU general public license version 2. See "COPYING" or
+ *  http://www.gnu.org/licenses/gpl.html
  */
 
-#include "e1000.h"
+struct powernow_k8_data {
+	unsigned int cpu;
 
-static s32 e1000_wait_autoneg(struct e1000_hw *hw);
-static s32 e1000_access_phy_wakeup_reg_bm(struct e1000_hw *hw, u32 offset,
-					  u16 *data, bool read, bool page_set);
-static u32 e1000_get_phy_addr_for_hv_page(u32 page);
-static s32 e1000_access_phy_debug_regs_hv(struct e1000_hw *hw, u32 offset,
-					  u16 *data, bool read);
+	u32 numps;  /* number of p-states */
+	u32 batps;  /* number of p-states supported on battery */
 
-/* Cable length tables */
-static const u16 e1000_m88_cable_length_table[] = {
-	0, 50, 80, 110, 140, 140, E1000_CABLE_LENGTH_UNDEFINED
+	/* these values are constant when the PSB is used to determine
+	 * vid/fid pairings, but are modified during the ->target() call
+	 * when ACPI is used */
+	u32 rvo;     /* ramp voltage offset */
+	u32 irt;     /* isochronous relief time */
+	u32 vidmvs;  /* usable value calculated from mvs */
+	u32 vstable; /* voltage stabilization time, units 20 us */
+	u32 plllock; /* pll lock time, units 1 us */
+	u32 exttype; /* extended interface = 1 */
+
+	/* keep track of the current fid / vid or pstate */
+	u32 currvid;
+	u32 currfid;
+
+	/* the powernow_table includes all frequency and vid/fid pairings:
+	 * fid are the lower 8 bits of the index, vid are the upper 8 bits.
+	 * frequency is in kHz */
+	struct cpufreq_frequency_table  *powernow_table;
+
+	/* the acpi table needs to be kept. it's only available if ACPI was
+	 * used to determine valid frequency/vid/fid states */
+	struct acpi_processor_performance acpi_data;
+
+	/* we need to keep track of associated cores, but let cpufreq
+	 * handle hotplug events - so just point at cpufreq pol->cpus
+	 * structure */
+	struct cpumask *available_cores;
 };
 
-#define M88E1000_CABLE_LENGTH_TABLE_SIZE \
-		ARRAY_SIZE(e1000_m88_cable_length_table)
+/* processor's cpuid instruction support */
+#define CPUID_PROCESSOR_SIGNATURE	1	/* function 1 */
+#define CPUID_XFAM			0x0ff00000	/* extended family */
+#define CPUID_XFAM_K8			0
+#define CPUID_XMOD			0x000f0000	/* extended model */
+#define CPUID_XMOD_REV_MASK		0x000c0000
+#define CPUID_XFAM_10H			0x00100000	/* family 0x10 */
+#define CPUID_USE_XFAM_XMOD		0x00000f00
+#define CPUID_GET_MAX_CAPABILITIES	0x80000000
+#define CPUID_FREQ_VOLT_CAPABILITIES	0x80000007
+#define P_STATE_TRANSITION_CAPABLE	6
 
-static const u16 e1000_igp_2_cable_length_table[] = {
-	0, 0, 0, 0, 0, 0, 0, 0, 3, 5, 8, 11, 13, 16, 18, 21, 0, 0, 0, 3,
-	6, 10, 13, 16, 19, 23, 26, 29, 32, 35, 38, 41, 6, 10, 14, 18, 22,
-	26, 30, 33, 37, 41, 44, 48, 51, 54, 58, 61, 21, 26, 31, 35, 40,
-	44, 49, 53, 57, 61, 65, 68, 72, 75, 79, 82, 40, 45, 51, 56, 61,
-	66, 70, 75, 79, 83, 87, 91, 94, 98, 101, 104, 60, 66, 72, 77, 82,
-	87, 92, 96, 100, 104, 108, 111, 114, 117, 119, 121, 83, 89, 95,
-	100, 105, 109, 113, 116, 119, 122, 124, 104, 109, 114, 118, 121,
-	124
+/* Model Specific Registers for p-state transitions. MSRs are 64-bit. For     */
+/* writes (wrmsr - opcode 0f 30), the register number is placed in ecx, and   */
+/* the value to write is placed in edx:eax. For reads (rdmsr - opcode 0f 32), */
+/* the register number is placed in ecx, and the data is returned in edx:eax. */
+
+#define MSR_FIDVID_CTL      0xc0010041
+#define MSR_FIDVID_STATUS   0xc0010042
+
+/* Field definitions within the FID VID Low Control MSR : */
+#define MSR_C_LO_INIT_FID_VID     0x00010000
+#define MSR_C_LO_NEW_VID          0x00003f00
+#define MSR_C_LO_NEW_FID          0x0000003f
+#define MSR_C_LO_VID_SHIFT        8
+
+/* Field definitions within the FID VID High Control MSR : */
+#define MSR_C_HI_STP_GNT_TO	  0x000fffff
+
+/* Field definitions within the FID VID Low Status MSR : */
+#define MSR_S_LO_CHANGE_PENDING   0x80000000   /* cleared when completed */
+#define MSR_S_LO_MAX_RAMP_VID     0x3f000000
+#define MSR_S_LO_MAX_FID          0x003f0000
+#define MSR_S_LO_START_FID        0x00003f00
+#define MSR_S_LO_CURRENT_FID      0x0000003f
+
+/* Field definitions within the FID VID High Status MSR : */
+#define MSR_S_HI_MIN_WORKING_VID  0x3f000000
+#define MSR_S_HI_MAX_WORKING_VID  0x003f0000
+#define MSR_S_HI_START_VID        0x00003f00
+#define MSR_S_HI_CURRENT_VID      0x0000003f
+#define MSR_C_HI_STP_GNT_BENIGN	  0x00000001
+
+/*
+ * There are restrictions frequencies have to follow:
+ * - only 1 entry in the low fid table ( <=1.4GHz )
+ * - lowest entry in the high fid table must be >= 2 * the entry in the
+ *   low fid table
+ * - lowest entry in the high fid table must be a <= 200MHz + 2 * the entry
+ *   in the low fid table
+ * - the parts can only step at <= 200 MHz intervals, odd fid values are
+ *   supported in revision G and later revisions.
+ * - lowest frequency must be >= interprocessor hypertransport link speed
+ *   (only applies to MP systems obviously)
+ */
+
+/* fids (frequency identifiers) are arranged in 2 tables - lo and hi */
+#define LO_FID_TABLE_TOP     7	/* fid values marking the boundary    */
+#define HI_FID_TABLE_BOTTOM  8	/* between the low and high tables    */
+
+#define LO_VCOFREQ_TABLE_TOP    1400	/* corresponding vco frequency values */
+#define HI_VCOFREQ_TABLE_BOTTOM 1600
+
+#define MIN_FREQ_RESOLUTION  200 /* fids jump by 2 matching freq jumps by 200 */
+
+#define MAX_FID 0x2a	/* Spec only gives FID values as far as 5 GHz */
+#define LEAST_VID 0x3e	/* Lowest (numerically highest) useful vid value */
+
+#define MIN_FREQ 800	/* Min and max freqs, per spec */
+#define MAX_FREQ 5000
+
+#define INVALID_FID_MASK 0xffffffc0  /* not a valid fid if these bits are set */
+#define INVALID_VID_MASK 0xffffffc0  /* not a valid vid if these bits are set */
+
+#define VID_OFF 0x3f
+
+#define STOP_GRANT_5NS 1 /* min poss memory access latency for voltage change */
+
+#define PLL_LOCK_CONVERSION (1000/5) /* ms to ns, then divide by clock period */
+
+#define MAXIMUM_VID_STEPS 1  /* Current cpus only allow a single step of 25mV */
+#define VST_UNITS_20US 20   /* Voltage Stabilization Time is in units of 20us */
+
+/*
+ * Most values of interest are encoded in a single field of the _PSS
+ * entries: the "control" value.
+ */
+
+#define IRT_SHIFT      30
+#define RVO_SHIFT      28
+#define EXT_TYPE_SHIFT 27
+#define PLL_L_SHIFT    20
+#define MVS_SHIFT      18
+#define VST_SHIFT      11
+#define VID_SHIFT       6
+#define IRT_MASK        3
+#define RVO_MASK        3
+#define EXT_TYPE_MASK   1
+#define PLL_L_MASK   0x7f
+#define MVS_MASK        3
+#define VST_MASK     0x7f
+#define VID_MASK     0x1f
+#define FID_MASK     0x1f
+#define EXT_VID_MASK 0x3f
+#define EXT_FID_MASK 0x3f
+
+
+/*
+ * Version 1.4 of the PSB table. This table is constructed by BIOS and is
+ * to tell the OS's power management driver which VIDs and FIDs are
+ * supported by this particular processor.
+ * If the data in the PSB / PST is wrong, then this driver will program the
+ * wrong values into hardware, which is very likely to lead to a crash.
+ */
+
+#define PSB_ID_STRING      "AMDK7PNOW!"
+#define PSB_ID_STRING_LEN  10
+
+#define PSB_VERSION_1_4  0x14
+
+struct psb_s {
+	u8 signature[10];
+	u8 tableversion;
+	u8 flags1;
+	u16 vstable;
+	u8 flags2;
+	u8 num_tables;
+	u32 cpuid;
+	u8 plllocktime;
+	u8 maxfid;
+	u8 maxvid;
+	u8 numps;
 };
 
-#define IGP02E1000_CABLE_LENGTH_TABLE_SIZE \
-		ARRAY_SIZE(e1000_igp_2_cable_length_table)
+/* Pairs of fid/vid values are appended to the version 1.4 PSB table. */
+struct pst_s {
+	u8 fid;
+	u8 vid;
+};
 
-/**
- *  e1000e_check_reset_block_generic - Check if PHY reset is blocked
- *  @hw: pointer to the HW structure
+static int core_voltage_pre_transition(struct powernow_k8_data *data,
+	u32 reqvid, u32 regfid);
+static int core_voltage_post_transition(struct powernow_k8_data *data, u32 reqvid);
+static int core_frequency_transition(struct powernow_k8_data *data, u32 reqfid);
+
+static void powernow_k8_acpi_pst_values(struct powernow_k8_data *data, unsigned int index);
+
+static int fill_powernow_table_fidvid(struct powernow_k8_data *data, struct cpufreq_frequency_table *powernow_table);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           /*
+ * POWERNV cpufreq driver for the IBM POWER processors
  *
- *  Read the PHY management control register and check whether a PHY reset
- *  is blocked.  If a reset is not blocked return 0, otherwise
- *  return E1000_BLK_PHY_RESET (12).
- **/
-s32 e1000e_check_reset_block_generic(struct e1000_hw *hw)
-{
-	u32 manc;
-
-	manc = er32(MANC);
-
-	return (manc & E1000_MANC_BLK_PHY_RST_ON_IDE) ? E1000_BLK_PHY_RESET : 0;
-}
-
-/**
- *  e1000e_get_phy_id - Retrieve the PHY ID and revision
- *  @hw: pointer to the HW structure
+ * (C) Copyright IBM 2014
  *
- *  Reads the PHY registers and stores the PHY ID and possibly the PHY
- *  revision in the hardware structure.
- **/
-s32 e1000e_get_phy_id(struct e1000_hw *hw)
+ * Author: Vaidyanathan Srinivasan <svaidy at linux.vnet.ibm.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ */
+
+#define pr_fmt(fmt)	"powernv-cpufreq: " fmt
+
+#include <linux/kernel.h>
+#include <linux/sysfs.h>
+#include <linux/cpumask.h>
+#include <linux/module.h>
+#include <linux/cpufreq.h>
+#include <linux/smp.h>
+#include <linux/of.h>
+#include <linux/reboot.h>
+#include <linux/slab.h>
+
+#include <asm/cputhreads.h>
+#include <asm/firmware.h>
+#include <asm/reg.h>
+#include <asm/smp.h> /* Required for cpu_sibling_mask() in UP configs */
+#include <asm/opal.h>
+
+#define POWERNV_MAX_PSTATES	256
+#define PMSR_PSAFE_ENABLE	(1UL << 30)
+#define PMSR_SPR_EM_DISABLE	(1UL << 31)
+#define PMSR_MAX(x)		((x >> 32) & 0xFF)
+
+static struct cpufreq_frequency_table powernv_freqs[POWERNV_MAX_PSTATES+1];
+static bool rebooting, throttled, occ_reset;
+
+static struct chip {
+	unsigned int id;
+	bool throttled;
+	cpumask_t mask;
+	struct work_struct throttle;
+	bool restore;
+} *chips;
+
+static int nr_chips;
+
+/*
+ * Note: The set of pstates consists of contiguous integers, the
+ * smallest of which is indicated by powernv_pstate_info.min, the
+ * largest of which is indicated by powernv_pstate_info.max.
+ *
+ * The nominal pstate is the highest non-turbo pstate in this
+ * platform. This is indicated by powernv_pstate_info.nominal.
+ */
+static struct powernv_pstate_info {
+	int min;
+	int max;
+	int nominal;
+	int nr_pstates;
+} powernv_pstate_info;
+
+/*
+ * Initialize the freq table based on data obtained
+ * from the firmware passed via device-tree
+ */
+static int init_powernv_pstates(void)
 {
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val = 0;
-	u16 phy_id;
-	u16 retry_count = 0;
+	struct device_node *power_mgt;
+	int i, pstate_min, pstate_max, pstate_nominal, nr_pstates = 0;
+	const __be32 *pstate_ids, *pstate_freqs;
+	u32 len_ids, len_freqs;
 
-	if (!phy->ops.read_reg)
-		return 0;
-
-	while (retry_count < 2) {
-		ret_val = e1e_rphy(hw, MII_PHYSID1, &phy_id);
-		if (ret_val)
-			return ret_val;
-
-		phy->id = (u32)(phy_id << 16);
-		usleep_range(20, 40);
-		ret_val = e1e_rphy(hw, MII_PHYSID2, &phy_id);
-		if (ret_val)
-			return ret_val;
-
-		phy->id |= (u32)(phy_id & PHY_REVISION_MASK);
-		phy->revision = (u32)(phy_id & ~PHY_REVISION_MASK);
-
-		if (phy->id != 0 && phy->id != PHY_REVISION_MASK)
-			return 0;
-
-		retry_count++;
+	power_mgt = of_find_node_by_path("/ibm,opal/power-mgt");
+	if (!power_mgt) {
+		pr_warn("power-mgt node not found\n");
+		return -ENODEV;
 	}
+
+	if (of_property_read_u32(power_mgt, "ibm,pstate-min", &pstate_min)) {
+		pr_warn("ibm,pstate-min node not found\n");
+		return -ENODEV;
+	}
+
+	if (of_property_read_u32(power_mgt, "ibm,pstate-max", &pstate_max)) {
+		pr_warn("ibm,pstate-max node not found\n");
+		return -ENODEV;
+	}
+
+	if (of_property_read_u32(power_mgt, "ibm,pstate-nominal",
+				 &pstate_nominal)) {
+		pr_warn("ibm,pstate-nominal not found\n");
+		return -ENODEV;
+	}
+	pr_info("cpufreq pstate min %d nominal %d max %d\n", pstate_min,
+		pstate_nominal, pstate_max);
+
+	pstate_ids = of_get_property(power_mgt, "ibm,pstate-ids", &len_ids);
+	if (!pstate_ids) {
+		pr_warn("ibm,pstate-ids not found\n");
+		return -ENODEV;
+	}
+
+	pstate_freqs = of_get_property(power_mgt, "ibm,pstate-frequencies-mhz",
+				      &len_freqs);
+	if (!pstate_freqs) {
+		pr_warn("ibm,pstate-frequencies-mhz not found\n");
+		return -ENODEV;
+	}
+
+	if (len_ids != len_freqs) {
+		pr_warn("Entries in ibm,pstate-ids and "
+			"ibm,pstate-frequencies-mhz does not match\n");
+	}
+
+	nr_pstates = min(len_ids, len_freqs) / sizeof(u32);
+	if (!nr_pstates) {
+		pr_warn("No PStates found\n");
+		return -ENODEV;
+	}
+
+	pr_debug("NR PStates %d\n", nr_pstates);
+	for (i = 0; i < nr_pstates; i++) {
+		u32 id = be32_to_cpu(pstate_ids[i]);
+		u32 freq = be32_to_cpu(pstate_freqs[i]);
+
+		pr_debug("PState id %d freq %d MHz\n", id, freq);
+		powernv_freqs[i].frequency = freq * 1000; /* kHz */
+		powernv_freqs[i].driver_data = id;
+	}
+	/* End of list marker entry */
+	powernv_freqs[i].frequency = CPUFREQ_TABLE_END;
+
+	powernv_pstate_info.min = pstate_min;
+	powernv_pstate_info.max = pstate_max;
+	powernv_pstate_info.nominal = pstate_nominal;
+	powernv_pstate_info.nr_pstates = nr_pstates;
 
 	return 0;
 }
 
-/**
- *  e1000e_phy_reset_dsp - Reset PHY DSP
- *  @hw: pointer to the HW structure
- *
- *  Reset the digital signal processor.
- **/
-s32 e1000e_phy_reset_dsp(struct e1000_hw *hw)
+/* Returns the CPU frequency corresponding to the pstate_id. */
+static unsigned int pstate_id_to_freq(int pstate_id)
 {
-	s32 ret_val;
+	int i;
 
-	ret_val = e1e_wphy(hw, M88E1000_PHY_GEN_CONTROL, 0xC1);
-	if (ret_val)
-		return ret_val;
-
-	return e1e_wphy(hw, M88E1000_PHY_GEN_CONTROL, 0);
-}
-
-/**
- *  e1000e_read_phy_reg_mdic - Read MDI control register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Reads the MDI control register in the PHY at offset and stores the
- *  information read to data.
- **/
-s32 e1000e_read_phy_reg_mdic(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	u32 i, mdic = 0;
-
-	if (offset > MAX_PHY_REG_ADDRESS) {
-		e_dbg("PHY Address %d is out of range\n", offset);
-		return -E1000_ERR_PARAM;
+	i = powernv_pstate_info.max - pstate_id;
+	if (i >= powernv_pstate_info.nr_pstates || i < 0) {
+		pr_warn("PState id %d outside of PState table, "
+			"reporting nominal id %d instead\n",
+			pstate_id, powernv_pstate_info.nominal);
+		i = powernv_pstate_info.max - powernv_pstate_info.nominal;
 	}
 
-	/* Set up Op-code, Phy Address, and register offset in the MDI
-	 * Control register.  The MAC will take care of interfacing with the
-	 * PHY to retrieve the desired data.
-	 */
-	mdic = ((offset << E1000_MDIC_REG_SHIFT) |
-		(phy->addr << E1000_MDIC_PHY_SHIFT) |
-		(E1000_MDIC_OP_READ));
+	return powernv_freqs[i].frequency;
+}
 
-	ew32(MDIC, mdic);
+/*
+ * cpuinfo_nominal_freq_show - Show the nominal CPU frequency as indicated by
+ * the firmware
+ */
+static ssize_t cpuinfo_nominal_freq_show(struct cpufreq_policy *policy,
+					char *buf)
+{
+	return sprintf(buf, "%u\n",
+		pstate_id_to_freq(powernv_pstate_info.nominal));
+}
 
-	/* Poll the ready bit to see if the MDI read completed
-	 * Increasing the time out as testing showed failures with
-	 * the lower time out
+struct freq_attr cpufreq_freq_attr_cpuinfo_nominal_freq =
+	__ATTR_RO(cpuinfo_nominal_freq);
+
+static struct freq_attr *powernv_cpu_freq_attr[] = {
+	&cpufreq_freq_attr_scaling_available_freqs,
+	&cpufreq_freq_attr_cpuinfo_nominal_freq,
+	NULL,
+};
+
+/* Helper routines */
+
+/* Access helpers to power mgt SPR */
+
+static inline unsigned long get_pmspr(unsigned long sprn)
+{
+	switch (sprn) {
+	case SPRN_PMCR:
+		return mfspr(SPRN_PMCR);
+
+	case SPRN_PMICR:
+		return mfspr(SPRN_PMICR);
+
+	case SPRN_PMSR:
+		return mfspr(SPRN_PMSR);
+	}
+	BUG();
+}
+
+static inline void set_pmspr(unsigned long sprn, unsigned long val)
+{
+	switch (sprn) {
+	case SPRN_PMCR:
+		mtspr(SPRN_PMCR, val);
+		return;
+
+	case SPRN_PMICR:
+		mtspr(SPRN_PMICR, val);
+		return;
+	}
+	BUG();
+}
+
+/*
+ * Use objects of this type to query/update
+ * pstates on a remote CPU via smp_call_function.
+ */
+struct powernv_smp_call_data {
+	unsigned int freq;
+	int pstate_id;
+};
+
+/*
+ * powernv_read_cpu_freq: Reads the current frequency on this CPU.
+ *
+ * Called via smp_call_function.
+ *
+ * Note: The caller of the smp_call_function should pass an argument of
+ * the type 'struct powernv_smp_call_data *' along with this function.
+ *
+ * The current frequency on this CPU will be returned via
+ * ((struct powernv_smp_call_data *)arg)->freq;
+ */
+static void powernv_read_cpu_freq(void *arg)
+{
+	unsigned long pmspr_val;
+	s8 local_pstate_id;
+	struct powernv_smp_call_data *freq_data = arg;
+
+	pmspr_val = get_pmspr(SPRN_PMSR);
+
+	/*
+	 * The local pstate id corresponds bits 48..55 in the PMSR.
+	 * Note: Watch out for the sign!
 	 */
-	for (i = 0; i < (E1000_GEN_POLL_TIMEOUT * 3); i++) {
-		udelay(50);
-		mdic = er32(MDIC);
-		if (mdic & E1000_MDIC_READY)
+	local_pstate_id = (pmspr_val >> 48) & 0xFF;
+	freq_data->pstate_id = local_pstate_id;
+	freq_data->freq = pstate_id_to_freq(freq_data->pstate_id);
+
+	pr_debug("cpu %d pmsr %016lX pstate_id %d frequency %d kHz\n",
+		raw_smp_processor_id(), pmspr_val, freq_data->pstate_id,
+		freq_data->freq);
+}
+
+/*
+ * powernv_cpufreq_get: Returns the CPU frequency as reported by the
+ * firmware for CPU 'cpu'. This value is reported through the sysfs
+ * file cpuinfo_cur_freq.
+ */
+static unsigned int powernv_cpufreq_get(unsigned int cpu)
+{
+	struct powernv_smp_call_data freq_data;
+
+	smp_call_function_any(cpu_sibling_mask(cpu), powernv_read_cpu_freq,
+			&freq_data, 1);
+
+	return freq_data.freq;
+}
+
+/*
+ * set_pstate: Sets the pstate on this CPU.
+ *
+ * This is called via an smp_call_function.
+ *
+ * The caller must ensure that freq_data is of the type
+ * (struct powernv_smp_call_data *) and the pstate_id which needs to be set
+ * on this CPU should be present in freq_data->pstate_id.
+ */
+static void set_pstate(void *freq_data)
+{
+	unsigned long val;
+	unsigned long pstate_ul =
+		((struct powernv_smp_call_data *) freq_data)->pstate_id;
+
+	val = get_pmspr(SPRN_PMCR);
+	val = val & 0x0000FFFFFFFFFFFFULL;
+
+	pstate_ul = pstate_ul & 0xFF;
+
+	/* Set both global(bits 56..63) and local(bits 48..55) PStates */
+	val = val | (pstate_ul << 56) | (pstate_ul << 48);
+
+	pr_debug("Setting cpu %d pmcr to %016lX\n",
+			raw_smp_processor_id(), val);
+	set_pmspr(SPRN_PMCR, val);
+}
+
+/*
+ * get_nominal_index: Returns the index corresponding to the nominal
+ * pstate in the cpufreq table
+ */
+static inline unsigned int get_nominal_index(void)
+{
+	return powernv_pstate_info.max - powernv_pstate_info.nominal;
+}
+
+static void powernv_cpufreq_throttle_check(void *data)
+{
+	unsigned int cpu = smp_processor_id();
+	unsigned long pmsr;
+	int pmsr_pmax, i;
+
+	pmsr = get_pmspr(SPRN_PMSR);
+
+	for (i = 0; i < nr_chips; i++)
+		if (chips[i].id == cpu_to_chip_id(cpu))
 			break;
-	}
-	if (!(mdic & E1000_MDIC_READY)) {
-		e_dbg("MDI Read did not complete\n");
-		return -E1000_ERR_PHY;
-	}
-	if (mdic & E1000_MDIC_ERROR) {
-		e_dbg("MDI Error\n");
-		return -E1000_ERR_PHY;
-	}
-	if (((mdic & E1000_MDIC_REG_MASK) >> E1000_MDIC_REG_SHIFT) != offset) {
-		e_dbg("MDI Read offset error - requested %d, returned %d\n",
-		      offset,
-		      (mdic & E1000_MDIC_REG_MASK) >> E1000_MDIC_REG_SHIFT);
-		return -E1000_ERR_PHY;
-	}
-	*data = (u16)mdic;
 
-	/* Allow some time after each MDIC transaction to avoid
-	 * reading duplicate data in the next MDIC transaction.
-	 */
-	if (hw->mac.type == e1000_pch2lan)
-		udelay(100);
-
-	return 0;
-}
-
-/**
- *  e1000e_write_phy_reg_mdic - Write MDI control register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write to register at offset
- *
- *  Writes data to MDI control register in the PHY at offset.
- **/
-s32 e1000e_write_phy_reg_mdic(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	u32 i, mdic = 0;
-
-	if (offset > MAX_PHY_REG_ADDRESS) {
-		e_dbg("PHY Address %d is out of range\n", offset);
-		return -E1000_ERR_PARAM;
-	}
-
-	/* Set up Op-code, Phy Address, and register offset in the MDI
-	 * Control register.  The MAC will take care of interfacing with the
-	 * PHY to retrieve the desired data.
-	 */
-	mdic = (((u32)data) |
-		(offset << E1000_MDIC_REG_SHIFT) |
-		(phy->addr << E1000_MDIC_PHY_SHIFT) |
-		(E1000_MDIC_OP_WRITE));
-
-	ew32(MDIC, mdic);
-
-	/* Poll the ready bit to see if the MDI read completed
-	 * Increasing the time out as testing showed failures with
-	 * the lower time out
-	 */
-	for (i = 0; i < (E1000_GEN_POLL_TIMEOUT * 3); i++) {
-		udelay(50);
-		mdic = er32(MDIC);
-		if (mdic & E1000_MDIC_READY)
-			break;
-	}
-	if (!(mdic & E1000_MDIC_READY)) {
-		e_dbg("MDI Write did not complete\n");
-		return -E1000_ERR_PHY;
-	}
-	if (mdic & E1000_MDIC_ERROR) {
-		e_dbg("MDI Error\n");
-		return -E1000_ERR_PHY;
-	}
-	if (((mdic & E1000_MDIC_REG_MASK) >> E1000_MDIC_REG_SHIFT) != offset) {
-		e_dbg("MDI Write offset error - requested %d, returned %d\n",
-		      offset,
-		      (mdic & E1000_MDIC_REG_MASK) >> E1000_MDIC_REG_SHIFT);
-		return -E1000_ERR_PHY;
-	}
-
-	/* Allow some time after each MDIC transaction to avoid
-	 * reading duplicate data in the next MDIC transaction.
-	 */
-	if (hw->mac.type == e1000_pch2lan)
-		udelay(100);
-
-	return 0;
-}
-
-/**
- *  e1000e_read_phy_reg_m88 - Read m88 PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Acquires semaphore, if necessary, then reads the PHY register at offset
- *  and storing the retrieved information in data.  Release any acquired
- *  semaphores before exiting.
- **/
-s32 e1000e_read_phy_reg_m88(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	s32 ret_val;
-
-	ret_val = hw->phy.ops.acquire(hw);
-	if (ret_val)
-		return ret_val;
-
-	ret_val = e1000e_read_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS & offset,
-					   data);
-
-	hw->phy.ops.release(hw);
-
-	return ret_val;
-}
-
-/**
- *  e1000e_write_phy_reg_m88 - Write m88 PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Acquires semaphore, if necessary, then writes the data to PHY register
- *  at the offset.  Release any acquired semaphores before exiting.
- **/
-s32 e1000e_write_phy_reg_m88(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	s32 ret_val;
-
-	ret_val = hw->phy.ops.acquire(hw);
-	if (ret_val)
-		return ret_val;
-
-	ret_val = e1000e_write_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS & offset,
-					    data);
-
-	hw->phy.ops.release(hw);
-
-	return ret_val;
-}
-
-/**
- *  e1000_set_page_igp - Set page as on IGP-like PHY(s)
- *  @hw: pointer to the HW structure
- *  @page: page to set (shifted left when necessary)
- *
- *  Sets PHY page required for PHY register access.  Assumes semaphore is
- *  already acquired.  Note, this function sets phy.addr to 1 so the caller
- *  must set it appropriately (if necessary) after this function returns.
- **/
-s32 e1000_set_page_igp(struct e1000_hw *hw, u16 page)
-{
-	e_dbg("Setting page 0x%x\n", page);
-
-	hw->phy.addr = 1;
-
-	return e1000e_write_phy_reg_mdic(hw, IGP01E1000_PHY_PAGE_SELECT, page);
-}
-
-/**
- *  __e1000e_read_phy_reg_igp - Read igp PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *  @locked: semaphore has already been acquired or not
- *
- *  Acquires semaphore, if necessary, then reads the PHY register at offset
- *  and stores the retrieved information in data.  Release any acquired
- *  semaphores before exiting.
- **/
-static s32 __e1000e_read_phy_reg_igp(struct e1000_hw *hw, u32 offset, u16 *data,
-				     bool locked)
-{
-	s32 ret_val = 0;
-
-	if (!locked) {
-		if (!hw->phy.ops.acquire)
-			return 0;
-
-		ret_val = hw->phy.ops.acquire(hw);
-		if (ret_val)
-			return ret_val;
-	}
-
-	if (offset > MAX_PHY_MULTI_PAGE_REG)
-		ret_val = e1000e_write_phy_reg_mdic(hw,
-						    IGP01E1000_PHY_PAGE_SELECT,
-						    (u16)offset);
-	if (!ret_val)
-		ret_val = e1000e_read_phy_reg_mdic(hw,
-						   MAX_PHY_REG_ADDRESS & offset,
-						   data);
-	if (!locked)
-		hw->phy.ops.release(hw);
-
-	return ret_val;
-}
-
-/**
- *  e1000e_read_phy_reg_igp - Read igp PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Acquires semaphore then reads the PHY register at offset and stores the
- *  retrieved information in data.
- *  Release the acquired semaphore before exiting.
- **/
-s32 e1000e_read_phy_reg_igp(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	return __e1000e_read_phy_reg_igp(hw, offset, data, false);
-}
-
-/**
- *  e1000e_read_phy_reg_igp_locked - Read igp PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Reads the PHY register at offset and stores the retrieved information
- *  in data.  Assumes semaphore already acquired.
- **/
-s32 e1000e_read_phy_reg_igp_locked(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	return __e1000e_read_phy_reg_igp(hw, offset, data, true);
-}
-
-/**
- *  e1000e_write_phy_reg_igp - Write igp PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *  @locked: semaphore has already been acquired or not
- *
- *  Acquires semaphore, if necessary, then writes the data to PHY register
- *  at the offset.  Release any acquired semaphores before exiting.
- **/
-static s32 __e1000e_write_phy_reg_igp(struct e1000_hw *hw, u32 offset, u16 data,
-				      bool locked)
-{
-	s32 ret_val = 0;
-
-	if (!locked) {
-		if (!hw->phy.ops.acquire)
-			return 0;
-
-		ret_val = hw->phy.ops.acquire(hw);
-		if (ret_val)
-			return ret_val;
-	}
-
-	if (offset > MAX_PHY_MULTI_PAGE_REG)
-		ret_val = e1000e_write_phy_reg_mdic(hw,
-						    IGP01E1000_PHY_PAGE_SELECT,
-						    (u16)offset);
-	if (!ret_val)
-		ret_val = e1000e_write_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS &
-						    offset, data);
-	if (!locked)
-		hw->phy.ops.release(hw);
-
-	return ret_val;
-}
-
-/**
- *  e1000e_write_phy_reg_igp - Write igp PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Acquires semaphore then writes the data to PHY register
- *  at the offset.  Release any acquired semaphores before exiting.
- **/
-s32 e1000e_write_phy_reg_igp(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	return __e1000e_write_phy_reg_igp(hw, offset, data, false);
-}
-
-/**
- *  e1000e_write_phy_reg_igp_locked - Write igp PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Writes the data to PHY register at the offset.
- *  Assumes semaphore already acquired.
- **/
-s32 e1000e_write_phy_reg_igp_locked(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	return __e1000e_write_phy_reg_igp(hw, offset, data, true);
-}
-
-/**
- *  __e1000_read_kmrn_reg - Read kumeran register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *  @locked: semaphore has already been acquired or not
- *
- *  Acquires semaphore, if necessary.  Then reads the PHY register at offset
- *  using the kumeran interface.  The information retrieved is stored in data.
- *  Release any acquired semaphores before exiting.
- **/
-static s32 __e1000_read_kmrn_reg(struct e1000_hw *hw, u32 offset, u16 *data,
-				 bool locked)
-{
-	u32 kmrnctrlsta;
-
-	if (!locked) {
-		s32 ret_val = 0;
-
-		if (!hw->phy.ops.acquire)
-			return 0;
-
-		ret_val = hw->phy.ops.acquire(hw);
-		if (ret_val)
-			return ret_val;
-	}
-
-	kmrnctrlsta = ((offset << E1000_KMRNCTRLSTA_OFFSET_SHIFT) &
-		       E1000_KMRNCTRLSTA_OFFSET) | E1000_KMRNCTRLSTA_REN;
-	ew32(KMRNCTRLSTA, kmrnctrlsta);
-	e1e_flush();
-
-	udelay(2);
-
-	kmrnctrlsta = er32(KMRNCTRLSTA);
-	*data = (u16)kmrnctrlsta;
-
-	if (!locked)
-		hw->phy.ops.release(hw);
-
-	return 0;
-}
-
-/**
- *  e1000e_read_kmrn_reg -  Read kumeran register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Acquires semaphore then reads the PHY register at offset using the
- *  kumeran interface.  The information retrieved is stored in data.
- *  Release the acquired semaphore before exiting.
- **/
-s32 e1000e_read_kmrn_reg(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	return __e1000_read_kmrn_reg(hw, offset, data, false);
-}
-
-/**
- *  e1000e_read_kmrn_reg_locked -  Read kumeran register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Reads the PHY register at offset using the kumeran interface.  The
- *  information retrieved is stored in data.
- *  Assumes semaphore already acquired.
- **/
-s32 e1000e_read_kmrn_reg_locked(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	return __e1000_read_kmrn_reg(hw, offset, data, true);
-}
-
-/**
- *  __e1000_write_kmrn_reg - Write kumeran register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *  @locked: semaphore has already been acquired or not
- *
- *  Acquires semaphore, if necessary.  Then write the data to PHY register
- *  at the offset using the kumeran interface.  Release any acquired semaphores
- *  before exiting.
- **/
-static s32 __e1000_write_kmrn_reg(struct e1000_hw *hw, u32 offset, u16 data,
-				  bool locked)
-{
-	u32 kmrnctrlsta;
-
-	if (!locked) {
-		s32 ret_val = 0;
-
-		if (!hw->phy.ops.acquire)
-			return 0;
-
-		ret_val = hw->phy.ops.acquire(hw);
-		if (ret_val)
-			return ret_val;
-	}
-
-	kmrnctrlsta = ((offset << E1000_KMRNCTRLSTA_OFFSET_SHIFT) &
-		       E1000_KMRNCTRLSTA_OFFSET) | data;
-	ew32(KMRNCTRLSTA, kmrnctrlsta);
-	e1e_flush();
-
-	udelay(2);
-
-	if (!locked)
-		hw->phy.ops.release(hw);
-
-	return 0;
-}
-
-/**
- *  e1000e_write_kmrn_reg -  Write kumeran register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Acquires semaphore then writes the data to the PHY register at the offset
- *  using the kumeran interface.  Release the acquired semaphore before exiting.
- **/
-s32 e1000e_write_kmrn_reg(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	return __e1000_write_kmrn_reg(hw, offset, data, false);
-}
-
-/**
- *  e1000e_write_kmrn_reg_locked -  Write kumeran register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Write the data to PHY register at the offset using the kumeran interface.
- *  Assumes semaphore already acquired.
- **/
-s32 e1000e_write_kmrn_reg_locked(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	return __e1000_write_kmrn_reg(hw, offset, data, true);
-}
-
-/**
- *  e1000_set_master_slave_mode - Setup PHY for Master/slave mode
- *  @hw: pointer to the HW structure
- *
- *  Sets up Master/slave mode
- **/
-static s32 e1000_set_master_slave_mode(struct e1000_hw *hw)
-{
-	s32 ret_val;
-	u16 phy_data;
-
-	/* Resolve Master/Slave mode */
-	ret_val = e1e_rphy(hw, MII_CTRL1000, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	/* load defaults for future use */
-	hw->phy.original_ms_type = (phy_data & CTL1000_ENABLE_MASTER) ?
-	    ((phy_data & CTL1000_AS_MASTER) ?
-	     e1000_ms_force_master : e1000_ms_force_slave) : e1000_ms_auto;
-
-	switch (hw->phy.ms_type) {
-	case e1000_ms_force_master:
-		phy_data |= (CTL1000_ENABLE_MASTER | CTL1000_AS_MASTER);
-		break;
-	case e1000_ms_force_slave:
-		phy_data |= CTL1000_ENABLE_MASTER;
-		phy_data &= ~(CTL1000_AS_MASTER);
-		break;
-	case e1000_ms_auto:
-		phy_data &= ~CTL1000_ENABLE_MASTER;
-		/* fall-through */
-	default:
-		break;
-	}
-
-	return e1e_wphy(hw, MII_CTRL1000, phy_data);
-}
-
-/**
- *  e1000_copper_link_setup_82577 - Setup 82577 PHY for copper link
- *  @hw: pointer to the HW structure
- *
- *  Sets up Carrier-sense on Transmit and downshift values.
- **/
-s32 e1000_copper_link_setup_82577(struct e1000_hw *hw)
-{
-	s32 ret_val;
-	u16 phy_data;
-
-	/* Enable CRS on Tx. This must be set for half-duplex operation. */
-	ret_val = e1e_rphy(hw, I82577_CFG_REG, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	phy_data |= I82577_CFG_ASSERT_CRS_ON_TX;
-
-	/* Enable downshift */
-	phy_data |= I82577_CFG_ENABLE_DOWNSHIFT;
-
-	ret_val = e1e_wphy(hw, I82577_CFG_REG, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	/* Set MDI/MDIX mode */
-	ret_val = e1e_rphy(hw, I82577_PHY_CTRL_2, &phy_data);
-	if (ret_val)
-		return ret_val;
-	phy_data &= ~I82577_PHY_CTRL2_MDIX_CFG_MASK;
-	/* Options:
-	 *   0 - Auto (default)
-	 *   1 - MDI mode
-	 *   2 - MDI-X mode
-	 */
-	switch (hw->phy.mdix) {
-	case 1:
-		break;
-	case 2:
-		phy_data |= I82577_PHY_CTRL2_MANUAL_MDIX;
-		break;
-	case 0:
-	default:
-		phy_data |= I82577_PHY_CTRL2_AUTO_MDI_MDIX;
-		break;
-	}
-	ret_val = e1e_wphy(hw, I82577_PHY_CTRL_2, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	return e1000_set_master_slave_mode(hw);
-}
-
-/**
- *  e1000e_copper_link_setup_m88 - Setup m88 PHY's for copper link
- *  @hw: pointer to the HW structure
- *
- *  Sets up MDI/MDI-X and polarity for m88 PHY's.  If necessary, transmit clock
- *  and downshift values are set also.
- **/
-s32 e1000e_copper_link_setup_m88(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data;
-
-	/* Enable CRS on Tx. This must be set for half-duplex operation. */
-	ret_val = e1e_rphy(hw, M88E1000_PHY_SPEC_CTRL, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	/* For BM PHY this bit is downshift enable */
-	if (phy->type != e1000_phy_bm)
-		phy_data |= M88E1000_PSCR_ASSERT_CRS_ON_TX;
-
-	/* Options:
-	 *   MDI/MDI-X = 0 (default)
-	 *   0 - Auto for all speeds
-	 *   1 - MDI mode
-	 *   2 - MDI-X mode
-	 *   3 - Auto for 1000Base-T only (MDI-X for 10/100Base-T modes)
-	 */
-	phy_data &= ~M88E1000_PSCR_AUTO_X_MODE;
-
-	switch (phy->mdix) {
-	case 1:
-		phy_data |= M88E1000_PSCR_MDI_MANUAL_MODE;
-		break;
-	case 2:
-		phy_data |= M88E1000_PSCR_MDIX_MANUAL_MODE;
-		break;
-	case 3:
-		phy_data |= M88E1000_PSCR_AUTO_X_1000T;
-		break;
-	case 0:
-	default:
-		phy_data |= M88E1000_PSCR_AUTO_X_MODE;
-		break;
-	}
-
-	/* Options:
-	 *   disable_polarity_correction = 0 (default)
-	 *       Automatic Correction for Reversed Cable Polarity
-	 *   0 - Disabled
-	 *   1 - Enabled
-	 */
-	phy_data &= ~M88E1000_PSCR_POLARITY_REVERSAL;
-	if (phy->disable_polarity_correction)
-		phy_data |= M88E1000_PSCR_POLARITY_REVERSAL;
-
-	/* Enable downshift on BM (disabled by default) */
-	if (phy->type == e1000_phy_bm) {
-		/* For 82574/82583, first disable then enable downshift */
-		if (phy->id == BME1000_E_PHY_ID_R2) {
-			phy_data &= ~BME1000_PSCR_ENABLE_DOWNSHIFT;
-			ret_val = e1e_wphy(hw, M88E1000_PHY_SPEC_CTRL,
-					   phy_data);
-			if (ret_val)
-				return ret_val;
-			/* Commit the changes. */
-			ret_val = phy->ops.commit(hw);
-			if (ret_val) {
-				e_dbg("Error committing the PHY changes\n");
-				return ret_val;
-			}
-		}
-
-		phy_data |= BME1000_PSCR_ENABLE_DOWNSHIFT;
-	}
-
-	ret_val = e1e_wphy(hw, M88E1000_PHY_SPEC_CTRL, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	if ((phy->type == e1000_phy_m88) &&
-	    (phy->revision < E1000_REVISION_4) &&
-	    (phy->id != BME1000_E_PHY_ID_R2)) {
-		/* Force TX_CLK in the Extended PHY Specific Control Register
-		 * to 25MHz clock.
-		 */
-		ret_val = e1e_rphy(hw, M88E1000_EXT_PHY_SPEC_CTRL, &phy_data);
-		if (ret_val)
-			return ret_val;
-
-		phy_data |= M88E1000_EPSCR_TX_CLK_25;
-
-		if ((phy->revision == 2) && (phy->id == M88E1111_I_PHY_ID)) {
-			/* 82573L PHY - set the downshift counter to 5x. */
-			phy_data &= ~M88EC018_EPSCR_DOWNSHIFT_COUNTER_MASK;
-			phy_data |= M88EC018_EPSCR_DOWNSHIFT_COUNTER_5X;
-		} else {
-			/* Configure Master and Slave downshift values */
-			phy_data &= ~(M88E1000_EPSCR_MASTER_DOWNSHIFT_MASK |
-				      M88E1000_EPSCR_SLAVE_DOWNSHIFT_MASK);
-			phy_data |= (M88E1000_EPSCR_MASTER_DOWNSHIFT_1X |
-				     M88E1000_EPSCR_SLAVE_DOWNSHIFT_1X);
-		}
-		ret_val = e1e_wphy(hw, M88E1000_EXT_PHY_SPEC_CTRL, phy_data);
-		if (ret_val)
-			return ret_val;
-	}
-
-	if ((phy->type == e1000_phy_bm) && (phy->id == BME1000_E_PHY_ID_R2)) {
-		/* Set PHY page 0, register 29 to 0x0003 */
-		ret_val = e1e_wphy(hw, 29, 0x0003);
-		if (ret_val)
-			return ret_val;
-
-		/* Set PHY page 0, register 30 to 0x0000 */
-		ret_val = e1e_wphy(hw, 30, 0x0000);
-		if (ret_val)
-			return ret_val;
-	}
-
-	/* Commit the changes. */
-	if (phy->ops.commit) {
-		ret_val = phy->ops.commit(hw);
-		if (ret_val) {
-			e_dbg("Error committing the PHY changes\n");
-			return ret_val;
-		}
-	}
-
-	if (phy->type == e1000_phy_82578) {
-		ret_val = e1e_rphy(hw, M88E1000_EXT_PHY_SPEC_CTRL, &phy_data);
-		if (ret_val)
-			return ret_val;
-
-		/* 82578 PHY - set the downshift count to 1x. */
-		phy_data |= I82578_EPSCR_DOWNSHIFT_ENABLE;
-		phy_data &= ~I82578_EPSCR_DOWNSHIFT_COUNTER_MASK;
-		ret_val = e1e_wphy(hw, M88E1000_EXT_PHY_SPEC_CTRL, phy_data);
-		if (ret_val)
-			return ret_val;
-	}
-
-	return 0;
-}
-
-/**
- *  e1000e_copper_link_setup_igp - Setup igp PHY's for copper link
- *  @hw: pointer to the HW structure
- *
- *  Sets up LPLU, MDI/MDI-X, polarity, Smartspeed and Master/Slave config for
- *  igp PHY's.
- **/
-s32 e1000e_copper_link_setup_igp(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data;
-
-	ret_val = e1000_phy_hw_reset(hw);
-	if (ret_val) {
-		e_dbg("Error resetting the PHY.\n");
-		return ret_val;
-	}
-
-	/* Wait 100ms for MAC to configure PHY from NVM settings, to avoid
-	 * timeout issues when LFS is enabled.
-	 */
-	msleep(100);
-
-	/* disable lplu d0 during driver init */
-	if (hw->phy.ops.set_d0_lplu_state) {
-		ret_val = hw->phy.ops.set_d0_lplu_state(hw, false);
-		if (ret_val) {
-			e_dbg("Error Disabling LPLU D0\n");
-			return ret_val;
-		}
-	}
-	/* Configure mdi-mdix settings */
-	ret_val = e1e_rphy(hw, IGP01E1000_PHY_PORT_CTRL, &data);
-	if (ret_val)
-		return ret_val;
-
-	data &= ~IGP01E1000_PSCR_AUTO_MDIX;
-
-	switch (phy->mdix) {
-	case 1:
-		data &= ~IGP01E1000_PSCR_FORCE_MDI_MDIX;
-		break;
-	case 2:
-		data |= IGP01E1000_PSCR_FORCE_MDI_MDIX;
-		break;
-	case 0:
-	default:
-		data |= IGP01E1000_PSCR_AUTO_MDIX;
-		break;
-	}
-	ret_val = e1e_wphy(hw, IGP01E1000_PHY_PORT_CTRL, data);
-	if (ret_val)
-		return ret_val;
-
-	/* set auto-master slave resolution settings */
-	if (hw->mac.autoneg) {
-		/* when autonegotiation advertisement is only 1000Mbps then we
-		 * should disable SmartSpeed and enable Auto MasterSlave
-		 * resolution as hardware default.
-		 */
-		if (phy->autoneg_advertised == ADVERTISE_1000_FULL) {
-			/* Disable SmartSpeed */
-			ret_val = e1e_rphy(hw, IGP01E1000_PHY_PORT_CONFIG,
-					   &data);
-			if (ret_val)
-				return ret_val;
-
-			data &= ~IGP01E1000_PSCFR_SMART_SPEED;
-			ret_val = e1e_wphy(hw, IGP01E1000_PHY_PORT_CONFIG,
-					   data);
-			if (ret_val)
-				return ret_val;
-
-			/* Set auto Master/Slave resolution process */
-			ret_val = e1e_rphy(hw, MII_CTRL1000, &data);
-			if (ret_val)
-				return ret_val;
-
-			data &= ~CTL1000_ENABLE_MASTER;
-			ret_val = e1e_wphy(hw, MII_CTRL1000, data);
-			if (ret_val)
-				return ret_val;
-		}
-
-		ret_val = e1000_set_master_slave_mode(hw);
-	}
-
-	return ret_val;
-}
-
-/**
- *  e1000_phy_setup_autoneg - Configure PHY for auto-negotiation
- *  @hw: pointer to the HW structure
- *
- *  Reads the MII auto-neg advertisement register and/or the 1000T control
- *  register and if the PHY is already setup for auto-negotiation, then
- *  return successful.  Otherwise, setup advertisement and flow control to
- *  the appropriate values for the wanted auto-negotiation.
- **/
-static s32 e1000_phy_setup_autoneg(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 mii_autoneg_adv_reg;
-	u16 mii_1000t_ctrl_reg = 0;
-
-	phy->autoneg_advertised &= phy->autoneg_mask;
-
-	/* Read the MII Auto-Neg Advertisement Register (Address 4). */
-	ret_val = e1e_rphy(hw, MII_ADVERTISE, &mii_autoneg_adv_reg);
-	if (ret_val)
-		return ret_val;
-
-	if (phy->autoneg_mask & ADVERTISE_1000_FULL) {
-		/* Read the MII 1000Base-T Control Register (Address 9). */
-		ret_val = e1e_rphy(hw, MII_CTRL1000, &mii_1000t_ctrl_reg);
-		if (ret_val)
-			return ret_val;
-	}
-
-	/* Need to parse both autoneg_advertised and fc and set up
-	 * the appropriate PHY registers.  First we will parse for
-	 * autoneg_advertised software override.  Since we can advertise
-	 * a plethora of combinations, we need to check each bit
-	 * individually.
-	 */
-
-	/* First we clear all the 10/100 mb speed bits in the Auto-Neg
-	 * Advertisement Register (Address 4) and the 1000 mb speed bits in
-	 * the  1000Base-T Control Register (Address 9).
-	 */
-	mii_autoneg_adv_reg &= ~(ADVERTISE_100FULL |
-				 ADVERTISE_100HALF |
-				 ADVERTISE_10FULL | ADVERTISE_10HALF);
-	mii_1000t_ctrl_reg &= ~(ADVERTISE_1000HALF | ADVERTISE_1000FULL);
-
-	e_dbg("autoneg_advertised %x\n", phy->autoneg_advertised);
-
-	/* Do we want to advertise 10 Mb Half Duplex? */
-	if (phy->autoneg_advertised & ADVERTISE_10_HALF) {
-		e_dbg("Advertise 10mb Half duplex\n");
-		mii_autoneg_adv_reg |= ADVERTISE_10HALF;
-	}
-
-	/* Do we want to advertise 10 Mb Full Duplex? */
-	if (phy->autoneg_advertised & ADVERTISE_10_FULL) {
-		e_dbg("Advertise 10mb Full duplex\n");
-		mii_autoneg_adv_reg |= ADVERTISE_10FULL;
-	}
-
-	/* Do we want to advertise 100 Mb Half Duplex? */
-	if (phy->autoneg_advertised & ADVERTISE_100_HALF) {
-		e_dbg("Advertise 100mb Half duplex\n");
-		mii_autoneg_adv_reg |= ADVERTISE_100HALF;
-	}
-
-	/* Do we want to advertise 100 Mb Full Duplex? */
-	if (phy->autoneg_advertised & ADVERTISE_100_FULL) {
-		e_dbg("Advertise 100mb Full duplex\n");
-		mii_autoneg_adv_reg |= ADVERTISE_100FULL;
-	}
-
-	/* We do not allow the Phy to advertise 1000 Mb Half Duplex */
-	if (phy->autoneg_advertised & ADVERTISE_1000_HALF)
-		e_dbg("Advertise 1000mb Half duplex request denied!\n");
-
-	/* Do we want to advertise 1000 Mb Full Duplex? */
-	if (phy->autoneg_advertised & ADVERTISE_1000_FULL) {
-		e_dbg("Advertise 1000mb Full duplex\n");
-		mii_1000t_ctrl_reg |= ADVERTISE_1000FULL;
-	}
-
-	/* Check for a software override of the flow control settings, and
-	 * setup the PHY advertisement registers accordingly.  If
-	 * auto-negotiation is enabled, then software will have to set the
-	 * "PAUSE" bits to the correct value in the Auto-Negotiation
-	 * Advertisement Register (MII_ADVERTISE) and re-start auto-
-	 * negotiation.
-	 *
-	 * The possible values of the "fc" parameter are:
-	 *      0:  Flow control is completely disabled
-	 *      1:  Rx flow control is enabled (we can receive pause frames
-	 *          but not send pause frames).
-	 *      2:  Tx flow control is enabled (we can send pause frames
-	 *          but we do not support receiving pause frames).
-	 *      3:  Both Rx and Tx flow control (symmetric) are enabled.
-	 *  other:  No software override.  The flow control configuration
-	 *          in the EEPROM is used.
-	 */
-	switch (hw->fc.current_mode) {
-	case e1000_fc_none:
-		/* Flow control (Rx & Tx) is completely disabled by a
-		 * software over-ride.
-		 */
-		mii_autoneg_adv_reg &=
-		    ~(ADVERTISE_PAUSE_ASYM | ADVERTISE_PAUSE_CAP);
-		break;
-	case e1000_fc_rx_pause:
-		/* Rx Flow control is enabled, and Tx Flow control is
-		 * disabled, by a software over-ride.
-		 *
-		 * Since there really isn't a way to advertise that we are
-		 * capable of Rx Pause ONLY, we will advertise that we
-		 * support both symmetric and asymmetric Rx PAUSE.  Later
-		 * (in e1000e_config_fc_after_link_up) we will disable the
-		 * hw's ability to send PAUSE frames.
-		 */
-		mii_autoneg_adv_reg |=
-		    (ADVERTISE_PAUSE_ASYM | ADVERTISE_PAUSE_CAP);
-		break;
-	case e1000_fc_tx_pause:
-		/* Tx Flow control is enabled, and Rx Flow control is
-		 * disabled, by a software over-ride.
-		 */
-		mii_autoneg_adv_reg |= ADVERTISE_PAUSE_ASYM;
-		mii_autoneg_adv_reg &= ~ADVERTISE_PAUSE_CAP;
-		break;
-	case e1000_fc_full:
-		/* Flow control (both Rx and Tx) is enabled by a software
-		 * over-ride.
-		 */
-		mii_autoneg_adv_reg |=
-		    (ADVERTISE_PAUSE_ASYM | ADVERTISE_PAUSE_CAP);
-		break;
-	default:
-		e_dbg("Flow control param set incorrectly\n");
-		return -E1000_ERR_CONFIG;
-	}
-
-	ret_val = e1e_wphy(hw, MII_ADVERTISE, mii_autoneg_adv_reg);
-	if (ret_val)
-		return ret_val;
-
-	e_dbg("Auto-Neg Advertising %x\n", mii_autoneg_adv_reg);
-
-	if (phy->autoneg_mask & ADVERTISE_1000_FULL)
-		ret_val = e1e_wphy(hw, MII_CTRL1000, mii_1000t_ctrl_reg);
-
-	return ret_val;
-}
-
-/**
- *  e1000_copper_link_autoneg - Setup/Enable autoneg for copper link
- *  @hw: pointer to the HW structure
- *
- *  Performs initial bounds checking on autoneg advertisement parameter, then
- *  configure to advertise the full capability.  Setup the PHY to autoneg
- *  and restart the negotiation process between the link partner.  If
- *  autoneg_wait_to_complete, then wait for autoneg to complete before exiting.
- **/
-static s32 e1000_copper_link_autoneg(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_ctrl;
-
-	/* Perform some bounds checking on the autoneg advertisement
-	 * parameter.
-	 */
-	phy->autoneg_advertised &= phy->autoneg_mask;
-
-	/* If autoneg_advertised is zero, we assume it was not defaulted
-	 * by the calling code so we set to advertise full capability.
-	 */
-	if (!phy->autoneg_advertised)
-		phy->autoneg_advertised = phy->autoneg_mask;
-
-	e_dbg("Reconfiguring auto-neg advertisement params\n");
-	ret_val = e1000_phy_setup_autoneg(hw);
-	if (ret_val) {
-		e_dbg("Error Setting up Auto-Negotiation\n");
-		return ret_val;
-	}
-	e_dbg("Restarting Auto-Neg\n");
-
-	/* Restart auto-negotiation by setting the Auto Neg Enable bit and
-	 * the Auto Neg Restart bit in the PHY control register.
-	 */
-	ret_val = e1e_rphy(hw, MII_BMCR, &phy_ctrl);
-	if (ret_val)
-		return ret_val;
-
-	phy_ctrl |= (BMCR_ANENABLE | BMCR_ANRESTART);
-	ret_val = e1e_wphy(hw, MII_BMCR, phy_ctrl);
-	if (ret_val)
-		return ret_val;
-
-	/* Does the user want to wait for Auto-Neg to complete here, or
-	 * check at a later time (for example, callback routine).
-	 */
-	if (phy->autoneg_wait_to_complete) {
-		ret_val = e1000_wait_autoneg(hw);
-		if (ret_val) {
-			e_dbg("Error while waiting for autoneg to complete\n");
-			return ret_val;
-		}
-	}
-
-	hw->mac.get_link_status = true;
-
-	return ret_val;
-}
-
-/**
- *  e1000e_setup_copper_link - Configure copper link settings
- *  @hw: pointer to the HW structure
- *
- *  Calls the appropriate function to configure the link for auto-neg or forced
- *  speed and duplex.  Then we check for link, once link is established calls
- *  to configure collision distance and flow control are called.  If link is
- *  not established, we return -E1000_ERR_PHY (-2).
- **/
-s32 e1000e_setup_copper_link(struct e1000_hw *hw)
-{
-	s32 ret_val;
-	bool link;
-
-	if (hw->mac.autoneg) {
-		/* Setup autoneg and flow control advertisement and perform
-		 * autonegotiation.
-		 */
-		ret_val = e1000_copper_link_autoneg(hw);
-		if (ret_val)
-			return ret_val;
-	} else {
-		/* PHY will be set to 10H, 10F, 100H or 100F
-		 * depending on user settings.
-		 */
-		e_dbg("Forcing Speed and Duplex\n");
-		ret_val = hw->phy.ops.force_speed_duplex(hw);
-		if (ret_val) {
-			e_dbg("Error Forcing Speed and Duplex\n");
-			return ret_val;
-		}
-	}
-
-	/* Check link status. Wait up to 100 microseconds for link to become
-	 * valid.
-	 */
-	ret_val = e1000e_phy_has_link_generic(hw, COPPER_LINK_UP_LIMIT, 10,
-					      &link);
-	if (ret_val)
-		return ret_val;
-
-	if (link) {
-		e_dbg("Valid link established!!!\n");
-		hw->mac.ops.config_collision_dist(hw);
-		ret_val = e1000e_config_fc_after_link_up(hw);
-	} else {
-		e_dbg("Unable to establish link!!!\n");
-	}
-
-	return ret_val;
-}
-
-/**
- *  e1000e_phy_force_speed_duplex_igp - Force speed/duplex for igp PHY
- *  @hw: pointer to the HW structure
- *
- *  Calls the PHY setup function to force speed and duplex.  Clears the
- *  auto-crossover to force MDI manually.  Waits for link and returns
- *  successful if link up is successful, else -E1000_ERR_PHY (-2).
- **/
-s32 e1000e_phy_force_speed_duplex_igp(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data;
-	bool link;
-
-	ret_val = e1e_rphy(hw, MII_BMCR, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	e1000e_phy_force_speed_duplex_setup(hw, &phy_data);
-
-	ret_val = e1e_wphy(hw, MII_BMCR, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	/* Clear Auto-Crossover to force MDI manually.  IGP requires MDI
-	 * forced whenever speed and duplex are forced.
-	 */
-	ret_val = e1e_rphy(hw, IGP01E1000_PHY_PORT_CTRL, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	phy_data &= ~IGP01E1000_PSCR_AUTO_MDIX;
-	phy_data &= ~IGP01E1000_PSCR_FORCE_MDI_MDIX;
-
-	ret_val = e1e_wphy(hw, IGP01E1000_PHY_PORT_CTRL, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	e_dbg("IGP PSCR: %X\n", phy_data);
-
-	udelay(1);
-
-	if (phy->autoneg_wait_to_complete) {
-		e_dbg("Waiting for forced speed/duplex link on IGP phy.\n");
-
-		ret_val = e1000e_phy_has_link_generic(hw, PHY_FORCE_LIMIT,
-						      100000, &link);
-		if (ret_val)
-			return ret_val;
-
-		if (!link)
-			e_dbg("Link taking longer than expected.\n");
-
-		/* Try once more */
-		ret_val = e1000e_phy_has_link_generic(hw, PHY_FORCE_LIMIT,
-						      100000, &link);
-	}
-
-	return ret_val;
-}
-
-/**
- *  e1000e_phy_force_speed_duplex_m88 - Force speed/duplex for m88 PHY
- *  @hw: pointer to the HW structure
- *
- *  Calls the PHY setup function to force speed and duplex.  Clears the
- *  auto-crossover to force MDI manually.  Resets the PHY to commit the
- *  changes.  If time expires while waiting for link up, we reset the DSP.
- *  After reset, TX_CLK and CRS on Tx must be set.  Return successful upon
- *  successful completion, else return corresponding error code.
- **/
-s32 e1000e_phy_force_speed_duplex_m88(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data;
-	bool link;
-
-	/* Clear Auto-Crossover to force MDI manually.  M88E1000 requires MDI
-	 * forced whenever speed and duplex are forced.
-	 */
-	ret_val = e1e_rphy(hw, M88E1000_PHY_SPEC_CTRL, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	phy_data &= ~M88E1000_PSCR_AUTO_X_MODE;
-	ret_val = e1e_wphy(hw, M88E1000_PHY_SPEC_CTRL, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	e_dbg("M88E1000 PSCR: %X\n", phy_data);
-
-	ret_val = e1e_rphy(hw, MII_BMCR, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	e1000e_phy_force_speed_duplex_setup(hw, &phy_data);
-
-	ret_val = e1e_wphy(hw, MII_BMCR, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	/* Reset the phy to commit changes. */
-	if (hw->phy.ops.commit) {
-		ret_val = hw->phy.ops.commit(hw);
-		if (ret_val)
-			return ret_val;
-	}
-
-	if (phy->autoneg_wait_to_complete) {
-		e_dbg("Waiting for forced speed/duplex link on M88 phy.\n");
-
-		ret_val = e1000e_phy_has_link_generic(hw, PHY_FORCE_LIMIT,
-						      100000, &link);
-		if (ret_val)
-			return ret_val;
-
-		if (!link) {
-			if (hw->phy.type != e1000_phy_m88) {
-				e_dbg("Link taking longer than expected.\n");
-			} else {
-				/* We didn't get link.
-				 * Reset the DSP and cross our fingers.
-				 */
-				ret_val = e1e_wphy(hw, M88E1000_PHY_PAGE_SELECT,
-						   0x001d);
-				if (ret_val)
-					return ret_val;
-				ret_val = e1000e_phy_reset_dsp(hw);
-				if (ret_val)
-					return ret_val;
-			}
-		}
-
-		/* Try once more */
-		ret_val = e1000e_phy_has_link_generic(hw, PHY_FORCE_LIMIT,
-						      100000, &link);
-		if (ret_val)
-			return ret_val;
-	}
-
-	if (hw->phy.type != e1000_phy_m88)
-		return 0;
-
-	ret_val = e1e_rphy(hw, M88E1000_EXT_PHY_SPEC_CTRL, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	/* Resetting the phy means we need to re-force TX_CLK in the
-	 * Extended PHY Specific Control Register to 25MHz clock from
-	 * the reset value of 2.5MHz.
-	 */
-	phy_data |= M88E1000_EPSCR_TX_CLK_25;
-	ret_val = e1e_wphy(hw, M88E1000_EXT_PHY_SPEC_CTRL, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	/* In addition, we must re-enable CRS on Tx for both half and full
-	 * duplex.
-	 */
-	ret_val = e1e_rphy(hw, M88E1000_PHY_SPEC_CTRL, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	phy_data |= M88E1000_PSCR_ASSERT_CRS_ON_TX;
-	ret_val = e1e_wphy(hw, M88E1000_PHY_SPEC_CTRL, phy_data);
-
-	return ret_val;
-}
-
-/**
- *  e1000_phy_force_speed_duplex_ife - Force PHY speed & duplex
- *  @hw: pointer to the HW structure
- *
- *  Forces the speed and duplex settings of the PHY.
- *  This is a function pointer entry point only called by
- *  PHY setup routines.
- **/
-s32 e1000_phy_force_speed_duplex_ife(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data;
-	bool link;
-
-	ret_val = e1e_rphy(hw, MII_BMCR, &data);
-	if (ret_val)
-		return ret_val;
-
-	e1000e_phy_force_speed_duplex_setup(hw, &data);
-
-	ret_val = e1e_wphy(hw, MII_BMCR, data);
-	if (ret_val)
-		return ret_val;
-
-	/* Disable MDI-X support for 10/100 */
-	ret_val = e1e_rphy(hw, IFE_PHY_MDIX_CONTROL, &data);
-	if (ret_val)
-		return ret_val;
-
-	data &= ~IFE_PMC_AUTO_MDIX;
-	data &= ~IFE_PMC_FORCE_MDIX;
-
-	ret_val = e1e_wphy(hw, IFE_PHY_MDIX_CONTROL, data);
-	if (ret_val)
-		return ret_val;
-
-	e_dbg("IFE PMC: %X\n", data);
-
-	udelay(1);
-
-	if (phy->autoneg_wait_to_complete) {
-		e_dbg("Waiting for forced speed/duplex link on IFE phy.\n");
-
-		ret_val = e1000e_phy_has_link_generic(hw, PHY_FORCE_LIMIT,
-						      100000, &link);
-		if (ret_val)
-			return ret_val;
-
-		if (!link)
-			e_dbg("Link taking longer than expected.\n");
-
-		/* Try once more */
-		ret_val = e1000e_phy_has_link_generic(hw, PHY_FORCE_LIMIT,
-						      100000, &link);
-		if (ret_val)
-			return ret_val;
-	}
-
-	return 0;
-}
-
-/**
- *  e1000e_phy_force_speed_duplex_setup - Configure forced PHY speed/duplex
- *  @hw: pointer to the HW structure
- *  @phy_ctrl: pointer to current value of MII_BMCR
- *
- *  Forces speed and duplex on the PHY by doing the following: disable flow
- *  control, force speed/duplex on the MAC, disable auto speed detection,
- *  disable auto-negotiation, configure duplex, configure speed, configure
- *  the collision distance, write configuration to CTRL register.  The
- *  caller must write to the MII_BMCR register for these settings to
- *  take affect.
- **/
-void e1000e_phy_force_speed_duplex_setup(struct e1000_hw *hw, u16 *phy_ctrl)
-{
-	struct e1000_mac_info *mac = &hw->mac;
-	u32 ctrl;
-
-	/* Turn off flow control when forcing speed/duplex */
-	hw->fc.current_mode = e1000_fc_none;
-
-	/* Force speed/duplex on the mac */
-	ctrl = er32(CTRL);
-	ctrl |= (E1000_CTRL_FRCSPD | E1000_CTRL_FRCDPX);
-	ctrl &= ~E1000_CTRL_SPD_SEL;
-
-	/* Disable Auto Speed Detection */
-	ctrl &= ~E1000_CTRL_ASDE;
-
-	/* Disable autoneg on the phy */
-	*phy_ctrl &= ~BMCR_ANENABLE;
-
-	/* Forcing Full or Half Duplex? */
-	if (mac->forced_speed_duplex & E1000_ALL_HALF_DUPLEX) {
-		ctrl &= ~E1000_CTRL_FD;
-		*phy_ctrl &= ~BMCR_FULLDPLX;
-		e_dbg("Half Duplex\n");
-	} else {
-		ctrl |= E1000_CTRL_FD;
-		*phy_ctrl |= BMCR_FULLDPLX;
-		e_dbg("Full Duplex\n");
-	}
-
-	/* Forcing 10mb or 100mb? */
-	if (mac->forced_speed_duplex & E1000_ALL_100_SPEED) {
-		ctrl |= E1000_CTRL_SPD_100;
-		*phy_ctrl |= BMCR_SPEED100;
-		*phy_ctrl &= ~BMCR_SPEED1000;
-		e_dbg("Forcing 100mb\n");
-	} else {
-		ctrl &= ~(E1000_CTRL_SPD_1000 | E1000_CTRL_SPD_100);
-		*phy_ctrl &= ~(BMCR_SPEED1000 | BMCR_SPEED100);
-		e_dbg("Forcing 10mb\n");
-	}
-
-	hw->mac.ops.config_collision_dist(hw);
-
-	ew32(CTRL, ctrl);
-}
-
-/**
- *  e1000e_set_d3_lplu_state - Sets low power link up state for D3
- *  @hw: pointer to the HW structure
- *  @active: boolean used to enable/disable lplu
- *
- *  Success returns 0, Failure returns 1
- *
- *  The low power link up (lplu) state is set to the power management level D3
- *  and SmartSpeed is disabled when active is true, else clear lplu for D3
- *  and enable Smartspeed.  LPLU and Smartspeed are mutually exclusive.  LPLU
- *  is used during Dx states where the power conservation is most important.
- *  During driver activity, SmartSpeed should be enabled so performance is
- *  maintained.
- **/
-s32 e1000e_set_d3_lplu_state(struct e1000_hw *hw, bool active)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data;
-
-	ret_val = e1e_rphy(hw, IGP02E1000_PHY_POWER_MGMT, &data);
-	if (ret_val)
-		return ret_val;
-
-	if (!active) {
-		data &= ~IGP02E1000_PM_D3_LPLU;
-		ret_val = e1e_wphy(hw, IGP02E1000_PHY_POWER_MGMT, data);
-		if (ret_val)
-			return ret_val;
-		/* LPLU and SmartSpeed are mutually exclusive.  LPLU is used
-		 * during Dx states where the power conservation is most
-		 * important.  During driver activity we should enable
-		 * SmartSpeed, so performance is maintained.
-		 */
-		if (phy->smart_speed == e1000_smart_speed_on) {
-			ret_val = e1e_rphy(hw, IGP01E1000_PHY_PORT_CONFIG,
-					   &data);
-			if (ret_val)
-				return ret_val;
-
-			data |= IGP01E1000_PSCFR_SMART_SPEED;
-			ret_val = e1e_wphy(hw, IGP01E1000_PHY_PORT_CONFIG,
-					   data);
-			if (ret_val)
-				return ret_val;
-		} else if (phy->smart_speed == e1000_smart_speed_off) {
-			ret_val = e1e_rphy(hw, IGP01E1000_PHY_PORT_CONFIG,
-					   &data);
-			if (ret_val)
-				return ret_val;
-
-			data &= ~IGP01E1000_PSCFR_SMART_SPEED;
-			ret_val = e1e_wphy(hw, IGP01E1000_PHY_PORT_CONFIG,
-					   data);
-			if (ret_val)
-				return ret_val;
-		}
-	} else if ((phy->autoneg_advertised == E1000_ALL_SPEED_DUPLEX) ||
-		   (phy->autoneg_advertised == E1000_ALL_NOT_GIG) ||
-		   (phy->autoneg_advertised == E1000_ALL_10_SPEED)) {
-		data |= IGP02E1000_PM_D3_LPLU;
-		ret_val = e1e_wphy(hw, IGP02E1000_PHY_POWER_MGMT, data);
-		if (ret_val)
-			return ret_val;
-
-		/* When LPLU is enabled, we should disable SmartSpeed */
-		ret_val = e1e_rphy(hw, IGP01E1000_PHY_PORT_CONFIG, &data);
-		if (ret_val)
-			return ret_val;
-
-		data &= ~IGP01E1000_PSCFR_SMART_SPEED;
-		ret_val = e1e_wphy(hw, IGP01E1000_PHY_PORT_CONFIG, data);
-	}
-
-	return ret_val;
-}
-
-/**
- *  e1000e_check_downshift - Checks whether a downshift in speed occurred
- *  @hw: pointer to the HW structure
- *
- *  Success returns 0, Failure returns 1
- *
- *  A downshift is detected by querying the PHY link health.
- **/
-s32 e1000e_check_downshift(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data, offset, mask;
-
-	switch (phy->type) {
-	case e1000_phy_m88:
-	case e1000_phy_gg82563:
-	case e1000_phy_bm:
-	case e1000_phy_82578:
-		offset = M88E1000_PHY_SPEC_STATUS;
-		mask = M88E1000_PSSR_DOWNSHIFT;
-		break;
-	case e1000_phy_igp_2:
-	case e1000_phy_igp_3:
-		offset = IGP01E1000_PHY_LINK_HEALTH;
-		mask = IGP01E1000_PLHR_SS_DOWNGRADE;
-		break;
-	default:
-		/* speed downshift not supported */
-		phy->speed_downgraded = false;
-		return 0;
-	}
-
-	ret_val = e1e_rphy(hw, offset, &phy_data);
-
-	if (!ret_val)
-		phy->speed_downgraded = !!(phy_data & mask);
-
-	return ret_val;
-}
-
-/**
- *  e1000_check_polarity_m88 - Checks the polarity.
- *  @hw: pointer to the HW structure
- *
- *  Success returns 0, Failure returns -E1000_ERR_PHY (-2)
- *
- *  Polarity is determined based on the PHY specific status register.
- **/
-s32 e1000_check_polarity_m88(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data;
-
-	ret_val = e1e_rphy(hw, M88E1000_PHY_SPEC_STATUS, &data);
-
-	if (!ret_val)
-		phy->cable_polarity = ((data & M88E1000_PSSR_REV_POLARITY)
-				       ? e1000_rev_polarity_reversed
-				       : e1000_rev_polarity_normal);
-
-	return ret_val;
-}
-
-/**
- *  e1000_check_polarity_igp - Checks the polarity.
- *  @hw: pointer to the HW structure
- *
- *  Success returns 0, Failure returns -E1000_ERR_PHY (-2)
- *
- *  Polarity is determined based on the PHY port status register, and the
- *  current speed (since there is no polarity at 100Mbps).
- **/
-s32 e1000_check_polarity_igp(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data, offset, mask;
-
-	/* Polarity is determined based on the speed of
-	 * our connection.
-	 */
-	ret_val = e1e_rphy(hw, IGP01E1000_PHY_PORT_STATUS, &data);
-	if (ret_val)
-		return ret_val;
-
-	if ((data & IGP01E1000_PSSR_SPEED_MASK) ==
-	    IGP01E1000_PSSR_SPEED_1000MBPS) {
-		offset = IGP01E1000_PHY_PCS_INIT_REG;
-		mask = IGP01E1000_PHY_POLARITY_MASK;
-	} else {
-		/* This really only applies to 10Mbps since
-		 * there is no polarity for 100Mbps (always 0).
-		 */
-		offset = IGP01E1000_PHY_PORT_STATUS;
-		mask = IGP01E1000_PSSR_POLARITY_REVERSED;
-	}
-
-	ret_val = e1e_rphy(hw, offset, &data);
-
-	if (!ret_val)
-		phy->cable_polarity = ((data & mask)
-				       ? e1000_rev_polarity_reversed
-				       : e1000_rev_polarity_normal);
-
-	return ret_val;
-}
-
-/**
- *  e1000_check_polarity_ife - Check cable polarity for IFE PHY
- *  @hw: pointer to the HW structure
- *
- *  Polarity is determined on the polarity reversal feature being enabled.
- **/
-s32 e1000_check_polarity_ife(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data, offset, mask;
-
-	/* Polarity is determined based on the reversal feature being enabled.
-	 */
-	if (phy->polarity_correction) {
-		offset = IFE_PHY_EXTENDED_STATUS_CONTROL;
-		mask = IFE_PESC_POLARITY_REVERSED;
-	} else {
-		offset = IFE_PHY_SPECIAL_CONTROL;
-		mask = IFE_PSC_FORCE_POLARITY;
-	}
-
-	ret_val = e1e_rphy(hw, offset, &phy_data);
-
-	if (!ret_val)
-		phy->cable_polarity = ((phy_data & mask)
-				       ? e1000_rev_polarity_reversed
-				       : e1000_rev_polarity_normal);
-
-	return ret_val;
-}
-
-/**
- *  e1000_wait_autoneg - Wait for auto-neg completion
- *  @hw: pointer to the HW structure
- *
- *  Waits for auto-negotiation to complete or for the auto-negotiation time
- *  limit to expire, which ever happens first.
- **/
-static s32 e1000_wait_autoneg(struct e1000_hw *hw)
-{
-	s32 ret_val = 0;
-	u16 i, phy_status;
-
-	/* Break after autoneg completes or PHY_AUTO_NEG_LIMIT expires. */
-	for (i = PHY_AUTO_NEG_LIMIT; i > 0; i--) {
-		ret_val = e1e_rphy(hw, MII_BMSR, &phy_status);
-		if (ret_val)
-			break;
-		ret_val = e1e_rphy(hw, MII_BMSR, &phy_status);
-		if (ret_val)
-			break;
-		if (phy_status & BMSR_ANEGCOMPLETE)
-			break;
-		msleep(100);
-	}
-
-	/* PHY_AUTO_NEG_TIME expiration doesn't guarantee auto-negotiation
-	 * has completed.
-	 */
-	return ret_val;
-}
-
-/**
- *  e1000e_phy_has_link_generic - Polls PHY for link
- *  @hw: pointer to the HW structure
- *  @iterations: number of times to poll for link
- *  @usec_interval: delay between polling attempts
- *  @success: pointer to whether polling was successful or not
- *
- *  Polls the PHY status register for link, 'iterations' number of times.
- **/
-s32 e1000e_phy_has_link_generic(struct e1000_hw *hw, u32 iterations,
-				u32 usec_interval, bool *success)
-{
-	s32 ret_val = 0;
-	u16 i, phy_status;
-
-	*success = false;
-	for (i = 0; i < iterations; i++) {
-		/* Some PHYs require the MII_BMSR register to be read
-		 * twice due to the link bit being sticky.  No harm doing
-		 * it across the board.
-		 */
-		ret_val = e1e_rphy(hw, MII_BMSR, &phy_status);
-		if (ret_val) {
-			/* If the first read fails, another entity may have
-			 * ownership of the resources, wait and try again to
-			 * see if they have relinquished the resources yet.
-			 */
-			if (usec_interval >= 1000)
-				msleep(usec_interval / 1000);
-			else
-				udelay(usec_interval);
-		}
-		ret_val = e1e_rphy(hw, MII_BMSR, &phy_status);
-		if (ret_val)
-			break;
-		if (phy_status & BMSR_LSTATUS) {
-			*success = true;
-			break;
-		}
-		if (usec_interval >= 1000)
-			msleep(usec_interval / 1000);
+	/* Check for Pmax Capping */
+	pmsr_pmax = (s8)PMSR_MAX(pmsr);
+	if (pmsr_pmax != powernv_pstate_info.max) {
+		if (chips[i].throttled)
+			goto next;
+		chips[i].throttled = true;
+		if (pmsr_pmax < powernv_pstate_info.nominal)
+			pr_crit("CPU %d on Chip %u has Pmax reduced below nominal frequency (%d < %d)\n",
+				cpu, chips[i].id, pmsr_pmax,
+				powernv_pstate_info.nominal);
 		else
-			udelay(usec_interval);
+			pr_info("CPU %d on Chip %u has Pmax reduced below turbo frequency (%d < %d)\n",
+				cpu, chips[i].id, pmsr_pmax,
+				powernv_pstate_info.max);
+	} else if (chips[i].throttled) {
+		chips[i].throttled = false;
+		pr_info("CPU %d on Chip %u has Pmax restored to %d\n", cpu,
+			chips[i].id, pmsr_pmax);
 	}
 
-	return ret_val;
+	/* Check if Psafe_mode_active is set in PMSR. */
+next:
+	if (pmsr & PMSR_PSAFE_ENABLE) {
+		throttled = true;
+		pr_info("Pstate set to safe frequency\n");
+	}
+
+	/* Check if SPR_EM_DISABLE is set in PMSR */
+	if (pmsr & PMSR_SPR_EM_DISABLE) {
+		throttled = true;
+		pr_info("Frequency Control disabled from OS\n");
+	}
+
+	if (throttled) {
+		pr_info("PMSR = %16lx\n", pmsr);
+		pr_crit("CPU Frequency could be throttled\n");
+	}
 }
 
-/**
- *  e1000e_get_cable_length_m88 - Determine cable length for m88 PHY
- *  @hw: pointer to the HW structure
- *
- *  Reads the PHY specific status register to retrieve the cable length
- *  information.  The cable length is determined by averaging the minimum and
- *  maximum values to get the "average" cable length.  The m88 PHY has four
- *  possible cable length values, which are:
- *	Register Value		Cable Length
- *	0			< 50 meters
- *	1			50 - 80 meters
- *	2			80 - 110 meters
- *	3			110 - 140 meters
- *	4			> 140 meters
- **/
-s32 e1000e_get_cable_length_m88(struct e1000_hw *hw)
+/*
+ * powernv_cpufreq_target_index: Sets the frequency corresponding to
+ * the cpufreq table entry indexed by new_index on the cpus in the
+ * mask policy->cpus
+ */
+static int powernv_cpufreq_target_index(struct cpufreq_policy *policy,
+					unsigned int new_index)
 {
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data, index;
+	struct powernv_smp_call_data freq_data;
 
-	ret_val = e1e_rphy(hw, M88E1000_PHY_SPEC_STATUS, &phy_data);
-	if (ret_val)
-		return ret_val;
+	if (unlikely(rebooting) && new_index != get_nominal_index())
+		return 0;
 
-	index = ((phy_data & M88E1000_PSSR_CABLE_LENGTH) >>
-		 M88E1000_PSSR_CABLE_LENGTH_SHIFT);
-
-	if (index >= M88E1000_CABLE_LENGTH_TABLE_SIZE - 1)
-		return -E1000_ERR_PHY;
-
-	phy->min_cable_length = e1000_m88_cable_length_table[index];
-	phy->max_cable_length = e1000_m88_cable_length_table[index + 1];
-
-	phy->cable_length = (phy->min_cable_length + phy->max_cable_length) / 2;
-
-	return 0;
-}
-
-/**
- *  e1000e_get_cable_length_igp_2 - Determine cable length for igp2 PHY
- *  @hw: pointer to the HW structure
- *
- *  The automatic gain control (agc) normalizes the amplitude of the
- *  received signal, adjusting for the attenuation produced by the
- *  cable.  By reading the AGC registers, which represent the
- *  combination of coarse and fine gain value, the value can be put
- *  into a lookup table to obtain the approximate cable length
- *  for each channel.
- **/
-s32 e1000e_get_cable_length_igp_2(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data, i, agc_value = 0;
-	u16 cur_agc_index, max_agc_index = 0;
-	u16 min_agc_index = IGP02E1000_CABLE_LENGTH_TABLE_SIZE - 1;
-	static const u16 agc_reg_array[IGP02E1000_PHY_CHANNEL_NUM] = {
-		IGP02E1000_PHY_AGC_A,
-		IGP02E1000_PHY_AGC_B,
-		IGP02E1000_PHY_AGC_C,
-		IGP02E1000_PHY_AGC_D
-	};
-
-	/* Read the AGC registers for all channels */
-	for (i = 0; i < IGP02E1000_PHY_CHANNEL_NUM; i++) {
-		ret_val = e1e_rphy(hw, agc_reg_array[i], &phy_data);
-		if (ret_val)
-			return ret_val;
-
-		/* Getting bits 15:9, which represent the combination of
-		 * coarse and fine gain values.  The result is a number
-		 * that can be put into the lookup table to obtain the
-		 * approximate cable length.
+	if (!throttled) {
+		/* we don't want to be preempted while
+		 * checking if the CPU frequency has been throttled
 		 */
-		cur_agc_index = ((phy_data >> IGP02E1000_AGC_LENGTH_SHIFT) &
-				 IGP02E1000_AGC_LENGTH_MASK);
-
-		/* Array index bound check. */
-		if ((cur_agc_index >= IGP02E1000_CABLE_LENGTH_TABLE_SIZE) ||
-		    (cur_agc_index == 0))
-			return -E1000_ERR_PHY;
-
-		/* Remove min & max AGC values from calculation. */
-		if (e1000_igp_2_cable_length_table[min_agc_index] >
-		    e1000_igp_2_cable_length_table[cur_agc_index])
-			min_agc_index = cur_agc_index;
-		if (e1000_igp_2_cable_length_table[max_agc_index] <
-		    e1000_igp_2_cable_length_table[cur_agc_index])
-			max_agc_index = cur_agc_index;
-
-		agc_value += e1000_igp_2_cable_length_table[cur_agc_index];
+		preempt_disable();
+		powernv_cpufreq_throttle_check(NULL);
+		preempt_enable();
 	}
 
-	agc_value -= (e1000_igp_2_cable_length_table[min_agc_index] +
-		      e1000_igp_2_cable_length_table[max_agc_index]);
-	agc_value /= (IGP02E1000_PHY_CHANNEL_NUM - 2);
+	freq_data.pstate_id = powernv_freqs[new_index].driver_data;
 
-	/* Calculate cable length with the error range of +/- 10 meters. */
-	phy->min_cable_length = (((agc_value - IGP02E1000_AGC_RANGE) > 0) ?
-				 (agc_value - IGP02E1000_AGC_RANGE) : 0);
-	phy->max_cable_length = agc_value + IGP02E1000_AGC_RANGE;
-
-	phy->cable_length = (phy->min_cable_length + phy->max_cable_length) / 2;
+	/*
+	 * Use smp_call_function to send IPI and execute the
+	 * mtspr on target CPU.  We could do that without IPI
+	 * if current CPU is within policy->cpus (core)
+	 */
+	smp_call_function_any(policy->cpus, set_pstate, &freq_data, 1);
 
 	return 0;
 }
 
-/**
- *  e1000e_get_phy_info_m88 - Retrieve PHY information
- *  @hw: pointer to the HW structure
- *
- *  Valid for only copper links.  Read the PHY status register (sticky read)
- *  to verify that link is up.  Read the PHY special control register to
- *  determine the polarity and 10base-T extended distance.  Read the PHY
- *  special status register to determine MDI/MDIx and current speed.  If
- *  speed is 1000, then determine cable length, local and remote receiver.
- **/
-s32 e1000e_get_phy_info_m88(struct e1000_hw *hw)
+static int powernv_cpufreq_cpu_init(struct cpufreq_policy *policy)
 {
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data;
-	bool link;
+	int base, i;
 
-	if (phy->media_type != e1000_media_type_copper) {
-		e_dbg("Phy info is only valid for copper media\n");
-		return -E1000_ERR_CONFIG;
-	}
+	base = cpu_first_thread_sibling(policy->cpu);
 
-	ret_val = e1000e_phy_has_link_generic(hw, 1, 0, &link);
-	if (ret_val)
-		return ret_val;
+	for (i = 0; i < threads_per_core; i++)
+		cpumask_set_cpu(base + i, policy->cpus);
 
-	if (!link) {
-		e_dbg("Phy info is only valid if link is up\n");
-		return -E1000_ERR_CONFIG;
-	}
-
-	ret_val = e1e_rphy(hw, M88E1000_PHY_SPEC_CTRL, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	phy->polarity_correction = !!(phy_data &
-				      M88E1000_PSCR_POLARITY_REVERSAL);
-
-	ret_val = e1000_check_polarity_m88(hw);
-	if (ret_val)
-		return ret_val;
-
-	ret_val = e1e_rphy(hw, M88E1000_PHY_SPEC_STATUS, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	phy->is_mdix = !!(phy_data & M88E1000_PSSR_MDIX);
-
-	if ((phy_data & M88E1000_PSSR_SPEED) == M88E1000_PSSR_1000MBS) {
-		ret_val = hw->phy.ops.get_cable_length(hw);
-		if (ret_val)
-			return ret_val;
-
-		ret_val = e1e_rphy(hw, MII_STAT1000, &phy_data);
-		if (ret_val)
-			return ret_val;
-
-		phy->local_rx = (phy_data & LPA_1000LOCALRXOK)
-		    ? e1000_1000t_rx_status_ok : e1000_1000t_rx_status_not_ok;
-
-		phy->remote_rx = (phy_data & LPA_1000REMRXOK)
-		    ? e1000_1000t_rx_status_ok : e1000_1000t_rx_status_not_ok;
-	} else {
-		/* Set values to "undefined" */
-		phy->cable_length = E1000_CABLE_LENGTH_UNDEFINED;
-		phy->local_rx = e1000_1000t_rx_status_undefined;
-		phy->remote_rx = e1000_1000t_rx_status_undefined;
-	}
-
-	return ret_val;
+	return cpufreq_table_validate_and_show(policy, powernv_freqs);
 }
 
-/**
- *  e1000e_get_phy_info_igp - Retrieve igp PHY information
- *  @hw: pointer to the HW structure
- *
- *  Read PHY status to determine if link is up.  If link is up, then
- *  set/determine 10base-T extended distance and polarity correction.  Read
- *  PHY port status to determine MDI/MDIx and speed.  Based on the speed,
- *  determine on the cable length, local and remote receiver.
- **/
-s32 e1000e_get_phy_info_igp(struct e1000_hw *hw)
+static int powernv_cpufreq_reboot_notifier(struct notifier_block *nb,
+				unsigned long action, void *unused)
 {
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data;
-	bool link;
+	int cpu;
+	struct cpufreq_policy *cpu_policy;
 
-	ret_val = e1000e_phy_has_link_generic(hw, 1, 0, &link);
-	if (ret_val)
-		return ret_val;
-
-	if (!link) {
-		e_dbg("Phy info is only valid if link is up\n");
-		return -E1000_ERR_CONFIG;
+	rebooting = true;
+	for_each_online_cpu(cpu) {
+		cpu_policy = cpufreq_cpu_get(cpu);
+		if (!cpu_policy)
+			continue;
+		powernv_cpufreq_target_index(cpu_policy, get_nominal_index());
+		cpufreq_cpu_put(cpu_policy);
 	}
 
-	phy->polarity_correction = true;
-
-	ret_val = e1000_check_polarity_igp(hw);
-	if (ret_val)
-		return ret_val;
-
-	ret_val = e1e_rphy(hw, IGP01E1000_PHY_PORT_STATUS, &data);
-	if (ret_val)
-		return ret_val;
-
-	phy->is_mdix = !!(data & IGP01E1000_PSSR_MDIX);
-
-	if ((data & IGP01E1000_PSSR_SPEED_MASK) ==
-	    IGP01E1000_PSSR_SPEED_1000MBPS) {
-		ret_val = phy->ops.get_cable_length(hw);
-		if (ret_val)
-			return ret_val;
-
-		ret_val = e1e_rphy(hw, MII_STAT1000, &data);
-		if (ret_val)
-			return ret_val;
-
-		phy->local_rx = (data & LPA_1000LOCALRXOK)
-		    ? e1000_1000t_rx_status_ok : e1000_1000t_rx_status_not_ok;
-
-		phy->remote_rx = (data & LPA_1000REMRXOK)
-		    ? e1000_1000t_rx_status_ok : e1000_1000t_rx_status_not_ok;
-	} else {
-		phy->cable_length = E1000_CABLE_LENGTH_UNDEFINED;
-		phy->local_rx = e1000_1000t_rx_status_undefined;
-		phy->remote_rx = e1000_1000t_rx_status_undefined;
-	}
-
-	return ret_val;
+	return NOTIFY_DONE;
 }
 
-/**
- *  e1000_get_phy_info_ife - Retrieves various IFE PHY states
- *  @hw: pointer to the HW structure
- *
- *  Populates "phy" structure with various feature states.
- **/
-s32 e1000_get_phy_info_ife(struct e1000_hw *hw)
+static struct notifier_block powernv_cpufreq_reboot_nb = {
+	.notifier_call = powernv_cpufreq_reboot_notifier,
+};
+
+void powernv_cpufreq_work_fn(struct work_struct *work)
 {
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data;
-	bool link;
+	struct chip *chip = container_of(work, struct chip, throttle);
+	unsigned int cpu;
+	cpumask_var_t mask;
 
-	ret_val = e1000e_phy_has_link_generic(hw, 1, 0, &link);
-	if (ret_val)
-		return ret_val;
+	smp_call_function_any(&chip->mask,
+			      powernv_cpufreq_throttle_check, NULL, 0);
 
-	if (!link) {
-		e_dbg("Phy info is only valid if link is up\n");
-		return -E1000_ERR_CONFIG;
+	if (!chip->restore)
+		return;
+
+	chip->restore = false;
+	cpumask_copy(mask, &chip->mask);
+	for_each_cpu_and(cpu, mask, cpu_online_mask) {
+		int index, tcpu;
+		struct cpufreq_policy policy;
+
+		cpufreq_get_policy(&policy, cpu);
+		cpufreq_frequency_table_target(&policy, policy.freq_table,
+					       policy.cur,
+					       CPUFREQ_RELATION_C, &index);
+		powernv_cpufreq_target_index(&policy, index);
+		for_each_cpu(tcpu, policy.cpus)
+			cpumask_clear_cpu(tcpu, mask);
 	}
-
-	ret_val = e1e_rphy(hw, IFE_PHY_SPECIAL_CONTROL, &data);
-	if (ret_val)
-		return ret_val;
-	phy->polarity_correction = !(data & IFE_PSC_AUTO_POLARITY_DISABLE);
-
-	if (phy->polarity_correction) {
-		ret_val = e1000_check_polarity_ife(hw);
-		if (ret_val)
-			return ret_val;
-	} else {
-		/* Polarity is forced */
-		phy->cable_polarity = ((data & IFE_PSC_FORCE_POLARITY)
-				       ? e1000_rev_polarity_reversed
-				       : e1000_rev_polarity_normal);
-	}
-
-	ret_val = e1e_rphy(hw, IFE_PHY_MDIX_CONTROL, &data);
-	if (ret_val)
-		return ret_val;
-
-	phy->is_mdix = !!(data & IFE_PMC_MDIX_STATUS);
-
-	/* The following parameters are undefined for 10/100 operation. */
-	phy->cable_length = E1000_CABLE_LENGTH_UNDEFINED;
-	phy->local_rx = e1000_1000t_rx_status_undefined;
-	phy->remote_rx = e1000_1000t_rx_status_undefined;
-
-	return 0;
 }
 
-/**
- *  e1000e_phy_sw_reset - PHY software reset
- *  @hw: pointer to the HW structure
- *
- *  Does a software reset of the PHY by reading the PHY control register and
- *  setting/write the control register reset bit to the PHY.
- **/
-s32 e1000e_phy_sw_reset(struct e1000_hw *hw)
+static char throttle_reason[][30] = {
+					"No throttling",
+					"Power Cap",
+					"Processor Over Temperature",
+					"Power Supply Failure",
+					"Over Current",
+					"OCC Reset"
+				     };
+
+static int powernv_cpufreq_occ_msg(struct notifier_block *nb,
+				   unsigned long msg_type, void *_msg)
 {
-	s32 ret_val;
-	u16 phy_ctrl;
+	struct opal_msg *msg = _msg;
+	struct opal_occ_msg omsg;
+	int i;
 
-	ret_val = e1e_rphy(hw, MII_BMCR, &phy_ctrl);
-	if (ret_val)
-		return ret_val;
+	if (msg_type != OPAL_MSG_OCC)
+		return 0;
 
-	phy_ctrl |= BMCR_RESET;
-	ret_val = e1e_wphy(hw, MII_BMCR, phy_ctrl);
-	if (ret_val)
-		return ret_val;
+	omsg.type = be64_to_cpu(msg->params[0]);
 
-	udelay(1);
+	switch (omsg.type) {
+	case OCC_RESET:
+		occ_reset = true;
+		pr_info("OCC (On Chip Controller - enforces hard thermal/power limits) Resetting\n");
+		/*
+		 * powernv_cpufreq_throttle_check() is called in
+		 * target() callback which can detect the throttle state
+		 * for governors like ondemand.
+		 * But static governors will not call target() often thus
+		 * report throttling here.
+		 */
+		if (!throttled) {
+			throttled = true;
+			pr_crit("CPU frequency is throttled for duration\n");
+		}
 
-	return ret_val;
-}
+		break;
+	case OCC_LOAD:
+		pr_info("OCC Loading, CPU frequency is throttled until OCC is started\n");
+		break;
+	case OCC_THROTTLE:
+		omsg.chip = be64_to_cpu(msg->params[1]);
+		omsg.throttle_status = be64_to_cpu(msg->params[2]);
 
-/**
- *  e1000e_phy_hw_reset_generic - PHY hardware reset
- *  @hw: pointer to the HW structure
- *
- *  Verify the reset block is not blocking us from resetting.  Acquire
- *  semaphore (if necessary) and read/set/write the device control reset
- *  bit in the PHY.  Wait the appropriate delay time for the device to
- *  reset and release the semaphore (if necessary).
- **/
-s32 e1000e_phy_hw_reset_generic(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u32 ctrl;
+		if (occ_reset) {
+			occ_reset = false;
+			throttled = false;
+			pr_info("OCC Active, CPU frequency is no longer throttled\n");
 
-	if (phy->ops.check_reset_block) {
-		ret_val = phy->ops.check_reset_block(hw);
-		if (ret_val)
+			for (i = 0; i < nr_chips; i++) {
+				chips[i].restore = true;
+				schedule_work(&chips[i].throttle);
+			}
+
 			return 0;
+		}
+
+		if (omsg.throttle_status &&
+		    omsg.throttle_status <= OCC_MAX_THROTTLE_STATUS)
+			pr_info("OCC: Chip %u Pmax reduced due to %s\n",
+				(unsigned int)omsg.chip,
+				throttle_reason[omsg.throttle_status]);
+		else if (!omsg.throttle_status)
+			pr_info("OCC: Chip %u %s\n", (unsigned int)omsg.chip,
+				throttle_reason[omsg.throttle_status]);
+		else
+			return 0;
+
+		for (i = 0; i < nr_chips; i++)
+			if (chips[i].id == omsg.chip) {
+				if (!omsg.throttle_status)
+					chips[i].restore = true;
+				schedule_work(&chips[i].throttle);
+			}
 	}
-
-	ret_val = phy->ops.acquire(hw);
-	if (ret_val)
-		return ret_val;
-
-	ctrl = er32(CTRL);
-	ew32(CTRL, ctrl | E1000_CTRL_PHY_RST);
-	e1e_flush();
-
-	udelay(phy->reset_delay_us);
-
-	ew32(CTRL, ctrl);
-	e1e_flush();
-
-	usleep_range(150, 300);
-
-	phy->ops.release(hw);
-
-	return phy->ops.get_cfg_done(hw);
+	return 0;
 }
 
-/**
- *  e1000e_get_cfg_done_generic - Generic configuration done
- *  @hw: pointer to the HW structure
- *
- *  Generic function to wait 10 milli-seconds for configuration to complete
- *  and return success.
- **/
-s32 e1000e_get_cfg_done_generic(struct e1000_hw __always_unused *hw)
+static struct notifier_block powernv_cpufreq_opal_nb = {
+	.notifier_call	= powernv_cpufreq_occ_msg,
+	.next		= NULL,
+	.priority	= 0,
+};
+
+static void powernv_cpufreq_stop_cpu(struct cpufreq_policy *policy)
 {
-	mdelay(10);
+	struct powernv_smp_call_data freq_data;
+
+	freq_data.pstate_id = powernv_pstate_info.min;
+	smp_call_function_single(policy->cpu, set_pstate, &freq_data, 1);
+}
+
+static struct cpufreq_driver powernv_cpufreq_driver = {
+	.name		= "powernv-cpufreq",
+	.flags		= CPUFREQ_CONST_LOOPS,
+	.init		= powernv_cpufreq_cpu_init,
+	.verify		= cpufreq_generic_frequency_table_verify,
+	.target_index	= powernv_cpufreq_target_index,
+	.get		= powernv_cpufreq_get,
+	.stop_cpu	= powernv_cpufreq_stop_cpu,
+	.attr		= powernv_cpu_freq_attr,
+};
+
+static int init_chip_info(void)
+{
+	unsigned int chip[256];
+	unsigned int cpu, i;
+	unsigned int prev_chip_id = UINT_MAX;
+
+	for_each_possible_cpu(cpu) {
+		unsigned int id = cpu_to_chip_id(cpu);
+
+		if (prev_chip_id != id) {
+			prev_chip_id = id;
+			chip[nr_chips++] = id;
+		}
+	}
+
+	chips = kmalloc_array(nr_chips, sizeof(struct chip), GFP_KERNEL);
+	if (!chips)
+		return -ENOMEM;
+
+	for (i = 0; i < nr_chips; i++) {
+		chips[i].id = chip[i];
+		chips[i].throttled = false;
+		cpumask_copy(&chips[i].mask, cpumask_of_node(chip[i]));
+		INIT_WORK(&chips[i].throttle, powernv_cpufreq_work_fn);
+		chips[i].restore = false;
+	}
 
 	return 0;
 }
 
-/**
- *  e1000e_phy_init_script_igp3 - Inits the IGP3 PHY
- *  @hw: pointer to the HW structure
- *
- *  Initializes a Intel Gigabit PHY3 when an EEPROM is not present.
- **/
-s32 e1000e_phy_init_script_igp3(struct e1000_hw *hw)
+static int __init powernv_cpufreq_init(void)
 {
-	e_dbg("Running IGP 3 PHY init script\n");
+	int rc = 0;
 
-	/* PHY init IGP 3 */
-	/* Enable rise/fall, 10-mode work in class-A */
-	e1e_wphy(hw, 0x2F5B, 0x9018);
-	/* Remove all caps from Replica path filter */
-	e1e_wphy(hw, 0x2F52, 0x0000);
-	/* Bias trimming for ADC, AFE and Driver (Default) */
-	e1e_wphy(hw, 0x2FB1, 0x8B24);
-	/* Increase Hybrid poly bias */
-	e1e_wphy(hw, 0x2FB2, 0xF8F0);
-	/* Add 4% to Tx amplitude in Gig mode */
-	e1e_wphy(hw, 0x2010, 0x10B0);
-	/* Disable trimming (TTT) */
-	e1e_wphy(hw, 0x2011, 0x0000);
-	/* Poly DC correction to 94.6% + 2% for all channels */
-	e1e_wphy(hw, 0x20DD, 0x249A);
-	/* ABS DC correction to 95.9% */
-	e1e_wphy(hw, 0x20DE, 0x00D3);
-	/* BG temp curve trim */
-	e1e_wphy(hw, 0x28B4, 0x04CE);
-	/* Increasing ADC OPAMP stage 1 currents to max */
-	e1e_wphy(hw, 0x2F70, 0x29E4);
-	/* Force 1000 ( required for enabling PHY regs configuration) */
-	e1e_wphy(hw, 0x0000, 0x0140);
-	/* Set upd_freq to 6 */
-	e1e_wphy(hw, 0x1F30, 0x1606);
-	/* Disable NPDFE */
-	e1e_wphy(hw, 0x1F31, 0xB814);
-	/* Disable adaptive fixed FFE (Default) */
-	e1e_wphy(hw, 0x1F35, 0x002A);
-	/* Enable FFE hysteresis */
-	e1e_wphy(hw, 0x1F3E, 0x0067);
-	/* Fixed FFE for short cable lengths */
-	e1e_wphy(hw, 0x1F54, 0x0065);
-	/* Fixed FFE for medium cable lengths */
-	e1e_wphy(hw, 0x1F55, 0x002A);
-	/* Fixed FFE for long cable lengths */
-	e1e_wphy(hw, 0x1F56, 0x002A);
-	/* Enable Adaptive Clip Threshold */
-	e1e_wphy(hw, 0x1F72, 0x3FB0);
-	/* AHT reset limit to 1 */
-	e1e_wphy(hw, 0x1F76, 0xC0FF);
-	/* Set AHT master delay to 127 msec */
-	e1e_wphy(hw, 0x1F77, 0x1DEC);
-	/* Set scan bits for AHT */
-	e1e_wphy(hw, 0x1F78, 0xF9EF);
-	/* Set AHT Preset bits */
-	e1e_wphy(hw, 0x1F79, 0x0210);
-	/* Change integ_factor of channel A to 3 */
-	e1e_wphy(hw, 0x1895, 0x0003);
-	/* Change prop_factor of channels BCD to 8 */
-	e1e_wphy(hw, 0x1796, 0x0008);
-	/* Change cg_icount + enable integbp for channels BCD */
-	e1e_wphy(hw, 0x1798, 0xD008);
-	/* Change cg_icount + enable integbp + change prop_factor_master
-	 * to 8 for channel A
-	 */
-	e1e_wphy(hw, 0x1898, 0xD918);
-	/* Disable AHT in Slave mode on channel A */
-	e1e_wphy(hw, 0x187A, 0x0800);
-	/* Enable LPLU and disable AN to 1000 in non-D0a states,
-	 * Enable SPD+B2B
-	 */
-	e1e_wphy(hw, 0x0019, 0x008D);
-	/* Enable restart AN on an1000_dis change */
-	e1e_wphy(hw, 0x001B, 0x2080);
-	/* Enable wh_fifo read clock in 10/100 modes */
-	e1e_wphy(hw, 0x0014, 0x0045);
-	/* Restart AN, Speed selection is 1000 */
-	e1e_wphy(hw, 0x0000, 0x1340);
+	/* Don't probe on pseries (guest) platforms */
+	if (!firmware_has_feature(FW_FEATURE_OPAL))
+		return -ENODEV;
 
-	return 0;
+	/* Discover pstates from device tree and init */
+	rc = init_powernv_pstates();
+	if (rc) {
+		pr_info("powernv-cpufreq disabled. System does not support PState control\n");
+		return rc;
+	}
+
+	/* Populate chip info */
+	rc = init_chip_info();
+	if (rc)
+		return rc;
+
+	register_reboot_notifier(&powernv_cpufreq_reboot_nb);
+	opal_message_notifier_register(OPAL_MSG_OCC, &powernv_cpufreq_opal_nb);
+	return cpufreq_register_driver(&powernv_cpufreq_driver);
 }
+module_init(powernv_cpufreq_init);
 
-/**
- *  e1000e_get_phy_type_from_id - Get PHY type from id
- *  @phy_id: phy_id read from the phy
- *
- *  Returns the phy type from the id.
- **/
-enum e1000_phy_type e1000e_get_phy_type_from_id(u32 phy_id)
+static void __exit powernv_cpufreq_exit(void)
 {
-	enum e1000_phy_type phy_type = e1000_phy_unknown;
-
-	switch (phy_id) {
-	case M88E1000_I_PHY_ID:
-	case M88E1000_E_PHY_ID:
-	case M88E1111_I_PHY_ID:
-	case M88E1011_I_PHY_ID:
-		phy_type = e1000_phy_m88;
-		break;
-	case IGP01E1000_I_PHY_ID:	/* IGP 1 & 2 share this */
-		phy_type = e1000_phy_igp_2;
-		break;
-	case GG82563_E_PHY_ID:
-		phy_type = e1000_phy_gg82563;
-		break;
-	case IGP03E1000_E_PHY_ID:
-		phy_type = e1000_phy_igp_3;
-		break;
-	case IFE_E_PHY_ID:
-	case IFE_PLUS_E_PHY_ID:
-	case IFE_C_E_PHY_ID:
-		phy_type = e1000_phy_ife;
-		break;
-	case BME1000_E_PHY_ID:
-	case BME1000_E_PHY_ID_R2:
-		phy_type = e1000_phy_bm;
-		break;
-	case I82578_E_PHY_ID:
-		phy_type = e1000_phy_82578;
-		break;
-	case I82577_E_PHY_ID:
-		phy_type = e1000_phy_82577;
-		break;
-	case I82579_E_PHY_ID:
-		phy_type = e1000_phy_82579;
-		break;
-	case I217_E_PHY_ID:
-		phy_type = e1000_phy_i217;
-		break;
-	default:
-		phy_type = e1000_phy_unknown;
-		break;
-	}
-	return phy_type;
+	unregister_reboot_notifier(&powernv_cpufreq_reboot_nb);
+	opal_message_notifier_unregister(OPAL_MSG_OCC,
+					 &powernv_cpufreq_opal_nb);
+	cpufreq_unregister_driver(&powernv_cpufreq_driver);
 }
+module_exit(powernv_cpufreq_exit);
 
-/**
- *  e1000e_determine_phy_address - Determines PHY address.
- *  @hw: pointer to the HW structure
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Vaidyanathan Srinivasan <svaidy at linux.vnet.ibm.com>");
+                                                                                                                                                         /*
+ * cpufreq driver for the cell processor
  *
- *  This uses a trial and error method to loop through possible PHY
- *  addresses. It tests each by reading the PHY ID registers and
- *  checking for a match.
- **/
-s32 e1000e_determine_phy_address(struct e1000_hw *hw)
+ * (C) Copyright IBM Deutschland Entwicklung GmbH 2005-2007
+ *
+ * Author: Christian Krafft <krafft@de.ibm.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
+
+#include <linux/cpufreq.h>
+#include <linux/module.h>
+#include <linux/of_platform.h>
+
+#include <asm/machdep.h>
+#include <asm/prom.h>
+#include <asm/cell-regs.h>
+
+#include "ppc_cbe_cpufreq.h"
+
+/* the CBE supports an 8 step frequency scaling */
+static struct cpufreq_frequency_table cbe_freqs[] = {
+	{0, 1,	0},
+	{0, 2,	0},
+	{0, 3,	0},
+	{0, 4,	0},
+	{0, 5,	0},
+	{0, 6,	0},
+	{0, 8,	0},
+	{0, 10,	0},
+	{0, 0,	CPUFREQ_TABLE_END},
+};
+
+/*
+ * hardware specific functions
+ */
+
+static int set_pmode(unsigned int cpu, unsigned int slow_mode)
 {
-	u32 phy_addr = 0;
-	u32 i;
-	enum e1000_phy_type phy_type = e1000_phy_unknown;
+	int rc;
 
-	hw->phy.id = phy_type;
-
-	for (phy_addr = 0; phy_addr < E1000_MAX_PHY_ADDR; phy_addr++) {
-		hw->phy.addr = phy_addr;
-		i = 0;
-
-		do {
-			e1000e_get_phy_id(hw);
-			phy_type = e1000e_get_phy_type_from_id(hw->phy.id);
-
-			/* If phy_type is valid, break - we found our
-			 * PHY address
-			 */
-			if (phy_type != e1000_phy_unknown)
-				return 0;
-
-			usleep_range(1000, 2000);
-			i++;
-		} while (i < 10);
-	}
-
-	return -E1000_ERR_PHY_TYPE;
-}
-
-/**
- *  e1000_get_phy_addr_for_bm_page - Retrieve PHY page address
- *  @page: page to access
- *
- *  Returns the phy address for the page requested.
- **/
-static u32 e1000_get_phy_addr_for_bm_page(u32 page, u32 reg)
-{
-	u32 phy_addr = 2;
-
-	if ((page >= 768) || (page == 0 && reg == 25) || (reg == 31))
-		phy_addr = 1;
-
-	return phy_addr;
-}
-
-/**
- *  e1000e_write_phy_reg_bm - Write BM PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Acquires semaphore, if necessary, then writes the data to PHY register
- *  at the offset.  Release any acquired semaphores before exiting.
- **/
-s32 e1000e_write_phy_reg_bm(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	s32 ret_val;
-	u32 page = offset >> IGP_PAGE_SHIFT;
-
-	ret_val = hw->phy.ops.acquire(hw);
-	if (ret_val)
-		return ret_val;
-
-	/* Page 800 works differently than the rest so it has its own func */
-	if (page == BM_WUC_PAGE) {
-		ret_val = e1000_access_phy_wakeup_reg_bm(hw, offset, &data,
-							 false, false);
-		goto release;
-	}
-
-	hw->phy.addr = e1000_get_phy_addr_for_bm_page(page, offset);
-
-	if (offset > MAX_PHY_MULTI_PAGE_REG) {
-		u32 page_shift, page_select;
-
-		/* Page select is register 31 for phy address 1 and 22 for
-		 * phy address 2 and 3. Page select is shifted only for
-		 * phy address 1.
-		 */
-		if (hw->phy.addr == 1) {
-			page_shift = IGP_PAGE_SHIFT;
-			page_select = IGP01E1000_PHY_PAGE_SELECT;
-		} else {
-			page_shift = 0;
-			page_select = BM_PHY_PAGE_SELECT;
-		}
-
-		/* Page is shifted left, PHY expects (page x 32) */
-		ret_val = e1000e_write_phy_reg_mdic(hw, page_select,
-						    (page << page_shift));
-		if (ret_val)
-			goto release;
-	}
-
-	ret_val = e1000e_write_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS & offset,
-					    data);
-
-release:
-	hw->phy.ops.release(hw);
-	return ret_val;
-}
-
-/**
- *  e1000e_read_phy_reg_bm - Read BM PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Acquires semaphore, if necessary, then reads the PHY register at offset
- *  and storing the retrieved information in data.  Release any acquired
- *  semaphores before exiting.
- **/
-s32 e1000e_read_phy_reg_bm(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	s32 ret_val;
-	u32 page = offset >> IGP_PAGE_SHIFT;
-
-	ret_val = hw->phy.ops.acquire(hw);
-	if (ret_val)
-		return ret_val;
-
-	/* Page 800 works differently than the rest so it has its own func */
-	if (page == BM_WUC_PAGE) {
-		ret_val = e1000_access_phy_wakeup_reg_bm(hw, offset, data,
-							 true, false);
-		goto release;
-	}
-
-	hw->phy.addr = e1000_get_phy_addr_for_bm_page(page, offset);
-
-	if (offset > MAX_PHY_MULTI_PAGE_REG) {
-		u32 page_shift, page_select;
-
-		/* Page select is register 31 for phy address 1 and 22 for
-		 * phy address 2 and 3. Page select is shifted only for
-		 * phy address 1.
-		 */
-		if (hw->phy.addr == 1) {
-			page_shift = IGP_PAGE_SHIFT;
-			page_select = IGP01E1000_PHY_PAGE_SELECT;
-		} else {
-			page_shift = 0;
-			page_select = BM_PHY_PAGE_SELECT;
-		}
-
-		/* Page is shifted left, PHY expects (page x 32) */
-		ret_val = e1000e_write_phy_reg_mdic(hw, page_select,
-						    (page << page_shift));
-		if (ret_val)
-			goto release;
-	}
-
-	ret_val = e1000e_read_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS & offset,
-					   data);
-release:
-	hw->phy.ops.release(hw);
-	return ret_val;
-}
-
-/**
- *  e1000e_read_phy_reg_bm2 - Read BM PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Acquires semaphore, if necessary, then reads the PHY register at offset
- *  and storing the retrieved information in data.  Release any acquired
- *  semaphores before exiting.
- **/
-s32 e1000e_read_phy_reg_bm2(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	s32 ret_val;
-	u16 page = (u16)(offset >> IGP_PAGE_SHIFT);
-
-	ret_val = hw->phy.ops.acquire(hw);
-	if (ret_val)
-		return ret_val;
-
-	/* Page 800 works differently than the rest so it has its own func */
-	if (page == BM_WUC_PAGE) {
-		ret_val = e1000_access_phy_wakeup_reg_bm(hw, offset, data,
-							 true, false);
-		goto release;
-	}
-
-	hw->phy.addr = 1;
-
-	if (offset > MAX_PHY_MULTI_PAGE_REG) {
-		/* Page is shifted left, PHY expects (page x 32) */
-		ret_val = e1000e_write_phy_reg_mdic(hw, BM_PHY_PAGE_SELECT,
-						    page);
-
-		if (ret_val)
-			goto release;
-	}
-
-	ret_val = e1000e_read_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS & offset,
-					   data);
-release:
-	hw->phy.ops.release(hw);
-	return ret_val;
-}
-
-/**
- *  e1000e_write_phy_reg_bm2 - Write BM PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Acquires semaphore, if necessary, then writes the data to PHY register
- *  at the offset.  Release any acquired semaphores before exiting.
- **/
-s32 e1000e_write_phy_reg_bm2(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	s32 ret_val;
-	u16 page = (u16)(offset >> IGP_PAGE_SHIFT);
-
-	ret_val = hw->phy.ops.acquire(hw);
-	if (ret_val)
-		return ret_val;
-
-	/* Page 800 works differently than the rest so it has its own func */
-	if (page == BM_WUC_PAGE) {
-		ret_val = e1000_access_phy_wakeup_reg_bm(hw, offset, &data,
-							 false, false);
-		goto release;
-	}
-
-	hw->phy.addr = 1;
-
-	if (offset > MAX_PHY_MULTI_PAGE_REG) {
-		/* Page is shifted left, PHY expects (page x 32) */
-		ret_val = e1000e_write_phy_reg_mdic(hw, BM_PHY_PAGE_SELECT,
-						    page);
-
-		if (ret_val)
-			goto release;
-	}
-
-	ret_val = e1000e_write_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS & offset,
-					    data);
-
-release:
-	hw->phy.ops.release(hw);
-	return ret_val;
-}
-
-/**
- *  e1000_enable_phy_wakeup_reg_access_bm - enable access to BM wakeup registers
- *  @hw: pointer to the HW structure
- *  @phy_reg: pointer to store original contents of BM_WUC_ENABLE_REG
- *
- *  Assumes semaphore already acquired and phy_reg points to a valid memory
- *  address to store contents of the BM_WUC_ENABLE_REG register.
- **/
-s32 e1000_enable_phy_wakeup_reg_access_bm(struct e1000_hw *hw, u16 *phy_reg)
-{
-	s32 ret_val;
-	u16 temp;
-
-	/* All page select, port ctrl and wakeup registers use phy address 1 */
-	hw->phy.addr = 1;
-
-	/* Select Port Control Registers page */
-	ret_val = e1000_set_page_igp(hw, (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT));
-	if (ret_val) {
-		e_dbg("Could not set Port Control page\n");
-		return ret_val;
-	}
-
-	ret_val = e1000e_read_phy_reg_mdic(hw, BM_WUC_ENABLE_REG, phy_reg);
-	if (ret_val) {
-		e_dbg("Could not read PHY register %d.%d\n",
-		      BM_PORT_CTRL_PAGE, BM_WUC_ENABLE_REG);
-		return ret_val;
-	}
-
-	/* Enable both PHY wakeup mode and Wakeup register page writes.
-	 * Prevent a power state change by disabling ME and Host PHY wakeup.
-	 */
-	temp = *phy_reg;
-	temp |= BM_WUC_ENABLE_BIT;
-	temp &= ~(BM_WUC_ME_WU_BIT | BM_WUC_HOST_WU_BIT);
-
-	ret_val = e1000e_write_phy_reg_mdic(hw, BM_WUC_ENABLE_REG, temp);
-	if (ret_val) {
-		e_dbg("Could not write PHY register %d.%d\n",
-		      BM_PORT_CTRL_PAGE, BM_WUC_ENABLE_REG);
-		return ret_val;
-	}
-
-	/* Select Host Wakeup Registers page - caller now able to write
-	 * registers on the Wakeup registers page
-	 */
-	return e1000_set_page_igp(hw, (BM_WUC_PAGE << IGP_PAGE_SHIFT));
-}
-
-/**
- *  e1000_disable_phy_wakeup_reg_access_bm - disable access to BM wakeup regs
- *  @hw: pointer to the HW structure
- *  @phy_reg: pointer to original contents of BM_WUC_ENABLE_REG
- *
- *  Restore BM_WUC_ENABLE_REG to its original value.
- *
- *  Assumes semaphore already acquired and *phy_reg is the contents of the
- *  BM_WUC_ENABLE_REG before register(s) on BM_WUC_PAGE were accessed by
- *  caller.
- **/
-s32 e1000_disable_phy_wakeup_reg_access_bm(struct e1000_hw *hw, u16 *phy_reg)
-{
-	s32 ret_val;
-
-	/* Select Port Control Registers page */
-	ret_val = e1000_set_page_igp(hw, (BM_PORT_CTRL_PAGE << IGP_PAGE_SHIFT));
-	if (ret_val) {
-		e_dbg("Could not set Port Control page\n");
-		return ret_val;
-	}
-
-	/* Restore 769.17 to its original value */
-	ret_val = e1000e_write_phy_reg_mdic(hw, BM_WUC_ENABLE_REG, *phy_reg);
-	if (ret_val)
-		e_dbg("Could not restore PHY register %d.%d\n",
-		      BM_PORT_CTRL_PAGE, BM_WUC_ENABLE_REG);
-
-	return ret_val;
-}
-
-/**
- *  e1000_access_phy_wakeup_reg_bm - Read/write BM PHY wakeup register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read or written
- *  @data: pointer to the data to read or write
- *  @read: determines if operation is read or write
- *  @page_set: BM_WUC_PAGE already set and access enabled
- *
- *  Read the PHY register at offset and store the retrieved information in
- *  data, or write data to PHY register at offset.  Note the procedure to
- *  access the PHY wakeup registers is different than reading the other PHY
- *  registers. It works as such:
- *  1) Set 769.17.2 (page 769, register 17, bit 2) = 1
- *  2) Set page to 800 for host (801 if we were manageability)
- *  3) Write the address using the address opcode (0x11)
- *  4) Read or write the data using the data opcode (0x12)
- *  5) Restore 769.17.2 to its original value
- *
- *  Steps 1 and 2 are done by e1000_enable_phy_wakeup_reg_access_bm() and
- *  step 5 is done by e1000_disable_phy_wakeup_reg_access_bm().
- *
- *  Assumes semaphore is already acquired.  When page_set==true, assumes
- *  the PHY page is set to BM_WUC_PAGE (i.e. a function in the call stack
- *  is responsible for calls to e1000_[enable|disable]_phy_wakeup_reg_bm()).
- **/
-static s32 e1000_access_phy_wakeup_reg_bm(struct e1000_hw *hw, u32 offset,
-					  u16 *data, bool read, bool page_set)
-{
-	s32 ret_val;
-	u16 reg = BM_PHY_REG_NUM(offset);
-	u16 page = BM_PHY_REG_PAGE(offset);
-	u16 phy_reg = 0;
-
-	/* Gig must be disabled for MDIO accesses to Host Wakeup reg page */
-	if ((hw->mac.type == e1000_pchlan) &&
-	    (!(er32(PHY_CTRL) & E1000_PHY_CTRL_GBE_DISABLE)))
-		e_dbg("Attempting to access page %d while gig enabled.\n",
-		      page);
-
-	if (!page_set) {
-		/* Enable access to PHY wakeup registers */
-		ret_val = e1000_enable_phy_wakeup_reg_access_bm(hw, &phy_reg);
-		if (ret_val) {
-			e_dbg("Could not enable PHY wakeup reg access\n");
-			return ret_val;
-		}
-	}
-
-	e_dbg("Accessing PHY page %d reg 0x%x\n", page, reg);
-
-	/* Write the Wakeup register page offset value using opcode 0x11 */
-	ret_val = e1000e_write_phy_reg_mdic(hw, BM_WUC_ADDRESS_OPCODE, reg);
-	if (ret_val) {
-		e_dbg("Could not write address opcode to page %d\n", page);
-		return ret_val;
-	}
-
-	if (read) {
-		/* Read the Wakeup register page value using opcode 0x12 */
-		ret_val = e1000e_read_phy_reg_mdic(hw, BM_WUC_DATA_OPCODE,
-						   data);
-	} else {
-		/* Write the Wakeup register page value using opcode 0x12 */
-		ret_val = e1000e_write_phy_reg_mdic(hw, BM_WUC_DATA_OPCODE,
-						    *data);
-	}
-
-	if (ret_val) {
-		e_dbg("Could not access PHY reg %d.%d\n", page, reg);
-		return ret_val;
-	}
-
-	if (!page_set)
-		ret_val = e1000_disable_phy_wakeup_reg_access_bm(hw, &phy_reg);
-
-	return ret_val;
-}
-
-/**
- * e1000_power_up_phy_copper - Restore copper link in case of PHY power down
- * @hw: pointer to the HW structure
- *
- * In the case of a PHY power down to save power, or to turn off link during a
- * driver unload, or wake on lan is not enabled, restore the link to previous
- * settings.
- **/
-void e1000_power_up_phy_copper(struct e1000_hw *hw)
-{
-	u16 mii_reg = 0;
-
-	/* The PHY will retain its settings across a power down/up cycle */
-	e1e_rphy(hw, MII_BMCR, &mii_reg);
-	mii_reg &= ~BMCR_PDOWN;
-	e1e_wphy(hw, MII_BMCR, mii_reg);
-}
-
-/**
- * e1000_power_down_phy_copper - Restore copper link in case of PHY power down
- * @hw: pointer to the HW structure
- *
- * In the case of a PHY power down to save power, or to turn off link during a
- * driver unload, or wake on lan is not enabled, restore the link to previous
- * settings.
- **/
-void e1000_power_down_phy_copper(struct e1000_hw *hw)
-{
-	u16 mii_reg = 0;
-
-	/* The PHY will retain its settings across a power down/up cycle */
-	e1e_rphy(hw, MII_BMCR, &mii_reg);
-	mii_reg |= BMCR_PDOWN;
-	e1e_wphy(hw, MII_BMCR, mii_reg);
-	usleep_range(1000, 2000);
-}
-
-/**
- *  __e1000_read_phy_reg_hv -  Read HV PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *  @locked: semaphore has already been acquired or not
- *
- *  Acquires semaphore, if necessary, then reads the PHY register at offset
- *  and stores the retrieved information in data.  Release any acquired
- *  semaphore before exiting.
- **/
-static s32 __e1000_read_phy_reg_hv(struct e1000_hw *hw, u32 offset, u16 *data,
-				   bool locked, bool page_set)
-{
-	s32 ret_val;
-	u16 page = BM_PHY_REG_PAGE(offset);
-	u16 reg = BM_PHY_REG_NUM(offset);
-	u32 phy_addr = hw->phy.addr = e1000_get_phy_addr_for_hv_page(page);
-
-	if (!locked) {
-		ret_val = hw->phy.ops.acquire(hw);
-		if (ret_val)
-			return ret_val;
-	}
-
-	/* Page 800 works differently than the rest so it has its own func */
-	if (page == BM_WUC_PAGE) {
-		ret_val = e1000_access_phy_wakeup_reg_bm(hw, offset, data,
-							 true, page_set);
-		goto out;
-	}
-
-	if (page > 0 && page < HV_INTC_FC_PAGE_START) {
-		ret_val = e1000_access_phy_debug_regs_hv(hw, offset,
-							 data, true);
-		goto out;
-	}
-
-	if (!page_set) {
-		if (page == HV_INTC_FC_PAGE_START)
-			page = 0;
-
-		if (reg > MAX_PHY_MULTI_PAGE_REG) {
-			/* Page is shifted left, PHY expects (page x 32) */
-			ret_val = e1000_set_page_igp(hw,
-						     (page << IGP_PAGE_SHIFT));
-
-			hw->phy.addr = phy_addr;
-
-			if (ret_val)
-				goto out;
-		}
-	}
-
-	e_dbg("reading PHY page %d (or 0x%x shifted) reg 0x%x\n", page,
-	      page << IGP_PAGE_SHIFT, reg);
-
-	ret_val = e1000e_read_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS & reg, data);
-out:
-	if (!locked)
-		hw->phy.ops.release(hw);
-
-	return ret_val;
-}
-
-/**
- *  e1000_read_phy_reg_hv -  Read HV PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Acquires semaphore then reads the PHY register at offset and stores
- *  the retrieved information in data.  Release the acquired semaphore
- *  before exiting.
- **/
-s32 e1000_read_phy_reg_hv(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	return __e1000_read_phy_reg_hv(hw, offset, data, false, false);
-}
-
-/**
- *  e1000_read_phy_reg_hv_locked -  Read HV PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read
- *  @data: pointer to the read data
- *
- *  Reads the PHY register at offset and stores the retrieved information
- *  in data.  Assumes semaphore already acquired.
- **/
-s32 e1000_read_phy_reg_hv_locked(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	return __e1000_read_phy_reg_hv(hw, offset, data, true, false);
-}
-
-/**
- *  e1000_read_phy_reg_page_hv - Read HV PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Reads the PHY register at offset and stores the retrieved information
- *  in data.  Assumes semaphore already acquired and page already set.
- **/
-s32 e1000_read_phy_reg_page_hv(struct e1000_hw *hw, u32 offset, u16 *data)
-{
-	return __e1000_read_phy_reg_hv(hw, offset, data, true, true);
-}
-
-/**
- *  __e1000_write_phy_reg_hv - Write HV PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *  @locked: semaphore has already been acquired or not
- *
- *  Acquires semaphore, if necessary, then writes the data to PHY register
- *  at the offset.  Release any acquired semaphores before exiting.
- **/
-static s32 __e1000_write_phy_reg_hv(struct e1000_hw *hw, u32 offset, u16 data,
-				    bool locked, bool page_set)
-{
-	s32 ret_val;
-	u16 page = BM_PHY_REG_PAGE(offset);
-	u16 reg = BM_PHY_REG_NUM(offset);
-	u32 phy_addr = hw->phy.addr = e1000_get_phy_addr_for_hv_page(page);
-
-	if (!locked) {
-		ret_val = hw->phy.ops.acquire(hw);
-		if (ret_val)
-			return ret_val;
-	}
-
-	/* Page 800 works differently than the rest so it has its own func */
-	if (page == BM_WUC_PAGE) {
-		ret_val = e1000_access_phy_wakeup_reg_bm(hw, offset, &data,
-							 false, page_set);
-		goto out;
-	}
-
-	if (page > 0 && page < HV_INTC_FC_PAGE_START) {
-		ret_val = e1000_access_phy_debug_regs_hv(hw, offset,
-							 &data, false);
-		goto out;
-	}
-
-	if (!page_set) {
-		if (page == HV_INTC_FC_PAGE_START)
-			page = 0;
-
-		/* Workaround MDIO accesses being disabled after entering IEEE
-		 * Power Down (when bit 11 of the PHY Control register is set)
-		 */
-		if ((hw->phy.type == e1000_phy_82578) &&
-		    (hw->phy.revision >= 1) &&
-		    (hw->phy.addr == 2) &&
-		    !(MAX_PHY_REG_ADDRESS & reg) && (data & (1 << 11))) {
-			u16 data2 = 0x7EFF;
-
-			ret_val = e1000_access_phy_debug_regs_hv(hw,
-								 (1 << 6) | 0x3,
-								 &data2, false);
-			if (ret_val)
-				goto out;
-		}
-
-		if (reg > MAX_PHY_MULTI_PAGE_REG) {
-			/* Page is shifted left, PHY expects (page x 32) */
-			ret_val = e1000_set_page_igp(hw,
-						     (page << IGP_PAGE_SHIFT));
-
-			hw->phy.addr = phy_addr;
-
-			if (ret_val)
-				goto out;
-		}
-	}
-
-	e_dbg("writing PHY page %d (or 0x%x shifted) reg 0x%x\n", page,
-	      page << IGP_PAGE_SHIFT, reg);
-
-	ret_val = e1000e_write_phy_reg_mdic(hw, MAX_PHY_REG_ADDRESS & reg,
-					    data);
-
-out:
-	if (!locked)
-		hw->phy.ops.release(hw);
-
-	return ret_val;
-}
-
-/**
- *  e1000_write_phy_reg_hv - Write HV PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Acquires semaphore then writes the data to PHY register at the offset.
- *  Release the acquired semaphores before exiting.
- **/
-s32 e1000_write_phy_reg_hv(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	return __e1000_write_phy_reg_hv(hw, offset, data, false, false);
-}
-
-/**
- *  e1000_write_phy_reg_hv_locked - Write HV PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Writes the data to PHY register at the offset.  Assumes semaphore
- *  already acquired.
- **/
-s32 e1000_write_phy_reg_hv_locked(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	return __e1000_write_phy_reg_hv(hw, offset, data, true, false);
-}
-
-/**
- *  e1000_write_phy_reg_page_hv - Write HV PHY register
- *  @hw: pointer to the HW structure
- *  @offset: register offset to write to
- *  @data: data to write at register offset
- *
- *  Writes the data to PHY register at the offset.  Assumes semaphore
- *  already acquired and page already set.
- **/
-s32 e1000_write_phy_reg_page_hv(struct e1000_hw *hw, u32 offset, u16 data)
-{
-	return __e1000_write_phy_reg_hv(hw, offset, data, true, true);
-}
-
-/**
- *  e1000_get_phy_addr_for_hv_page - Get PHY address based on page
- *  @page: page to be accessed
- **/
-static u32 e1000_get_phy_addr_for_hv_page(u32 page)
-{
-	u32 phy_addr = 2;
-
-	if (page >= HV_INTC_FC_PAGE_START)
-		phy_addr = 1;
-
-	return phy_addr;
-}
-
-/**
- *  e1000_access_phy_debug_regs_hv - Read HV PHY vendor specific high registers
- *  @hw: pointer to the HW structure
- *  @offset: register offset to be read or written
- *  @data: pointer to the data to be read or written
- *  @read: determines if operation is read or write
- *
- *  Reads the PHY register at offset and stores the retreived information
- *  in data.  Assumes semaphore already acquired.  Note that the procedure
- *  to access these regs uses the address port and data port to read/write.
- *  These accesses done with PHY address 2 and without using pages.
- **/
-static s32 e1000_access_phy_debug_regs_hv(struct e1000_hw *hw, u32 offset,
-					  u16 *data, bool read)
-{
-	s32 ret_val;
-	u32 addr_reg;
-	u32 data_reg;
-
-	/* This takes care of the difference with desktop vs mobile phy */
-	addr_reg = ((hw->phy.type == e1000_phy_82578) ?
-		    I82578_ADDR_REG : I82577_ADDR_REG);
-	data_reg = addr_reg + 1;
-
-	/* All operations in this function are phy address 2 */
-	hw->phy.addr = 2;
-
-	/* masking with 0x3F to remove the page from offset */
-	ret_val = e1000e_write_phy_reg_mdic(hw, addr_reg, (u16)offset & 0x3F);
-	if (ret_val) {
-		e_dbg("Could not write the Address Offset port register\n");
-		return ret_val;
-	}
-
-	/* Read or write the data value next */
-	if (read)
-		ret_val = e1000e_read_phy_reg_mdic(hw, data_reg, data);
+	if (cbe_cpufreq_has_pmi)
+		rc = cbe_cpufreq_set_pmode_pmi(cpu, slow_mode);
 	else
-		ret_val = e1000e_write_phy_reg_mdic(hw, data_reg, *data);
+		rc = cbe_cpufreq_set_pmode(cpu, slow_mode);
 
-	if (ret_val)
-		e_dbg("Could not access the Data port register\n");
+	pr_debug("register contains slow mode %d\n", cbe_cpufreq_get_pmode(cpu));
 
-	return ret_val;
+	return rc;
 }
 
-/**
- *  e1000_link_stall_workaround_hv - Si workaround
- *  @hw: pointer to the HW structure
- *
- *  This function works around a Si bug where the link partner can get
- *  a link up indication before the PHY does.  If small packets are sent
- *  by the link partner they can be placed in the packet buffer without
- *  being properly accounted for by the PHY and will stall preventing
- *  further packets from being received.  The workaround is to clear the
- *  packet buffer after the PHY detects link up.
- **/
-s32 e1000_link_stall_workaround_hv(struct e1000_hw *hw)
+/*
+ * cpufreq functions
+ */
+
+static int cbe_cpufreq_cpu_init(struct cpufreq_policy *policy)
 {
-	s32 ret_val = 0;
-	u16 data;
+	struct cpufreq_frequency_table *pos;
+	const u32 *max_freqp;
+	u32 max_freq;
+	int cur_pmode;
+	struct device_node *cpu;
 
-	if (hw->phy.type != e1000_phy_82578)
-		return 0;
+	cpu = of_get_cpu_node(policy->cpu, NULL);
 
-	/* Do not apply workaround if in PHY loopback bit 14 set */
-	e1e_rphy(hw, MII_BMCR, &data);
-	if (data & BMCR_LOOPBACK)
-		return 0;
+	if (!cpu)
+		return -ENODEV;
 
-	/* check if link is up and at 1Gbps */
-	ret_val = e1e_rphy(hw, BM_CS_STATUS, &data);
-	if (ret_val)
-		return ret_val;
+	pr_debug("init cpufreq on CPU %d\n", policy->cpu);
 
-	data &= (BM_CS_STATUS_LINK_UP | BM_CS_STATUS_RESOLVED |
-		 BM_CS_STATUS_SPEED_MASK);
-
-	if (data != (BM_CS_STATUS_LINK_UP | BM_CS_STATUS_RESOLVED |
-		     BM_CS_STATUS_SPEED_1000))
-		return 0;
-
-	msleep(200);
-
-	/* flush the packets in the fifo buffer */
-	ret_val = e1e_wphy(hw, HV_MUX_DATA_CTRL,
-			   (HV_MUX_DATA_CTRL_GEN_TO_MAC |
-			    HV_MUX_DATA_CTRL_FORCE_SPEED));
-	if (ret_val)
-		return ret_val;
-
-	return e1e_wphy(hw, HV_MUX_DATA_CTRL, HV_MUX_DATA_CTRL_GEN_TO_MAC);
-}
-
-/**
- *  e1000_check_polarity_82577 - Checks the polarity.
- *  @hw: pointer to the HW structure
- *
- *  Success returns 0, Failure returns -E1000_ERR_PHY (-2)
- *
- *  Polarity is determined based on the PHY specific status register.
- **/
-s32 e1000_check_polarity_82577(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data;
-
-	ret_val = e1e_rphy(hw, I82577_PHY_STATUS_2, &data);
-
-	if (!ret_val)
-		phy->cable_polarity = ((data & I82577_PHY_STATUS2_REV_POLARITY)
-				       ? e1000_rev_polarity_reversed
-				       : e1000_rev_polarity_normal);
-
-	return ret_val;
-}
-
-/**
- *  e1000_phy_force_speed_duplex_82577 - Force speed/duplex for I82577 PHY
- *  @hw: pointer to the HW structure
- *
- *  Calls the PHY setup function to force speed and duplex.
- **/
-s32 e1000_phy_force_speed_duplex_82577(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data;
-	bool link;
-
-	ret_val = e1e_rphy(hw, MII_BMCR, &phy_data);
-	if (ret_val)
-		return ret_val;
-
-	e1000e_phy_force_speed_duplex_setup(hw, &phy_data);
-
-	ret_val = e1e_wphy(hw, MII_BMCR, phy_data);
-	if (ret_val)
-		return ret_val;
-
-	udelay(1);
-
-	if (phy->autoneg_wait_to_complete) {
-		e_dbg("Waiting for forced speed/duplex link on 82577 phy\n");
-
-		ret_val = e1000e_phy_has_link_generic(hw, PHY_FORCE_LIMIT,
-						      100000, &link);
-		if (ret_val)
-			return ret_val;
-
-		if (!link)
-			e_dbg("Link taking longer than expected.\n");
-
-		/* Try once more */
-		ret_val = e1000e_phy_has_link_generic(hw, PHY_FORCE_LIMIT,
-						      100000, &link);
+	/*
+	 * Let's check we can actually get to the CELL regs
+	 */
+	if (!cbe_get_cpu_pmd_regs(policy->cpu) ||
+	    !cbe_get_cpu_mic_tm_regs(policy->cpu)) {
+		pr_info("invalid CBE regs pointers for cpufreq\n");
+		of_node_put(cpu);
+		return -EINVAL;
 	}
 
-	return ret_val;
-}
+	max_freqp = of_get_property(cpu, "clock-frequency", NULL);
 
-/**
- *  e1000_get_phy_info_82577 - Retrieve I82577 PHY information
- *  @hw: pointer to the HW structure
- *
- *  Read PHY status to determine if link is up.  If link is up, then
- *  set/determine 10base-T extended distance and polarity correction.  Read
- *  PHY port status to determine MDI/MDIx and speed.  Based on the speed,
- *  determine on the cable length, local and remote receiver.
- **/
-s32 e1000_get_phy_info_82577(struct e1000_hw *hw)
-{
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 data;
-	bool link;
+	of_node_put(cpu);
 
-	ret_val = e1000e_phy_has_link_generic(hw, 1, 0, &link);
-	if (ret_val)
-		return ret_val;
+	if (!max_freqp)
+		return -EINVAL;
 
-	if (!link) {
-		e_dbg("Phy info is only valid if link is up\n");
-		return -E1000_ERR_CONFIG;
+	/* we need the freq in kHz */
+	max_freq = *max_freqp / 1000;
+
+	pr_debug("max clock-frequency is at %u kHz\n", max_freq);
+	pr_debug("initializing frequency table\n");
+
+	/* initialize frequency table */
+	cpufreq_for_each_entry(pos, cbe_freqs) {
+		pos->frequency = max_freq / pos->driver_data;
+		pr_debug("%d: %d\n", (int)(pos - cbe_freqs), pos->frequency);
 	}
 
-	phy->polarity_correction = true;
+	/* if DEBUG is enabled set_pmode() measures the latency
+	 * of a transition */
+	policy->cpuinfo.transition_latency = 25000;
 
-	ret_val = e1000_check_polarity_82577(hw);
-	if (ret_val)
-		return ret_val;
+	cur_pmode = cbe_cpufreq_get_pmode(policy->cpu);
+	pr_debug("current pmode is at %d\n",cur_pmode);
 
-	ret_val = e1e_rphy(hw, I82577_PHY_STATUS_2, &data);
-	if (ret_val)
-		return ret_val;
+	policy->cur = cbe_freqs[cur_pmode].frequency;
 
-	phy->is_mdix = !!(data & I82577_PHY_STATUS2_MDIX);
+#ifdef CONFIG_SMP
+	cpumask_copy(policy->cpus, cpu_sibling_mask(policy->cpu));
+#endif
 
-	if ((data & I82577_PHY_STATUS2_SPEED_MASK) ==
-	    I82577_PHY_STATUS2_SPEED_1000MBPS) {
-		ret_val = hw->phy.ops.get_cable_length(hw);
-		if (ret_val)
-			return ret_val;
+	/* this ensures that policy->cpuinfo_min
+	 * and policy->cpuinfo_max are set correctly */
+	return cpufreq_table_validate_and_show(policy, cbe_freqs);
+}
 
-		ret_val = e1e_rphy(hw, MII_STAT1000, &data);
-		if (ret_val)
-			return ret_val;
+static int cbe_cpufreq_target(struct cpufreq_policy *policy,
+			      unsigned int cbe_pmode_new)
+{
+	pr_debug("setting frequency for cpu %d to %d kHz, " \
+		 "1/%d of max frequency\n",
+		 policy->cpu,
+		 cbe_freqs[cbe_pmode_new].frequency,
+		 cbe_freqs[cbe_pmode_new].driver_data);
 
-		phy->local_rx = (data & LPA_1000LOCALRXOK)
-		    ? e1000_1000t_rx_status_ok : e1000_1000t_rx_status_not_ok;
+	return set_pmode(policy->cpu, cbe_pmode_new);
+}
 
-		phy->remote_rx = (data & LPA_1000REMRXOK)
-		    ? e1000_1000t_rx_status_ok : e1000_1000t_rx_status_not_ok;
+static struct cpufreq_driver cbe_cpufreq_driver = {
+	.verify		= cpufreq_generic_frequency_table_verify,
+	.target_index	= cbe_cpufreq_target,
+	.init		= cbe_cpufreq_cpu_init,
+	.name		= "cbe-cpufreq",
+	.flags		= CPUFREQ_CONST_LOOPS,
+};
+
+/*
+ * module init and destoy
+ */
+
+static int __init cbe_cpufreq_init(void)
+{
+	if (!machine_is(cell))
+		return -ENODEV;
+
+	return cpufreq_register_driver(&cbe_cpufreq_driver);
+}
+
+static void __exit cbe_cpufreq_exit(void)
+{
+	cpufreq_unregister_driver(&cbe_cpufreq_driver);
+}
+
+module_init(cbe_cpufreq_init);
+module_exit(cbe_cpufreq_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Christian Krafft <krafft@de.ibm.com>");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            /*
+ * ppc_cbe_cpufreq.h
+ *
+ * This file contains the definitions used by the cbe_cpufreq driver.
+ *
+ * (C) Copyright IBM Deutschland Entwicklung GmbH 2005-2007
+ *
+ * Author: Christian Krafft <krafft@de.ibm.com>
+ *
+ */
+
+#include <linux/cpufreq.h>
+#include <linux/types.h>
+
+int cbe_cpufreq_set_pmode(int cpu, unsigned int pmode);
+int cbe_cpufreq_get_pmode(int cpu);
+
+int cbe_cpufreq_set_pmode_pmi(int cpu, unsigned int pmode);
+
+#if defined(CONFIG_CPU_FREQ_CBE_PMI) || defined(CONFIG_CPU_FREQ_CBE_PMI_MODULE)
+extern bool cbe_cpufreq_has_pmi;
+#else
+#define cbe_cpufreq_has_pmi (0)
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+ * pervasive backend for the cbe_cpufreq driver
+ *
+ * This driver makes use of the pervasive unit to
+ * engage the desired frequency.
+ *
+ * (C) Copyright IBM Deutschland Entwicklung GmbH 2005-2007
+ *
+ * Author: Christian Krafft <krafft@de.ibm.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
+
+#include <linux/io.h>
+#include <linux/kernel.h>
+#include <linux/time.h>
+#include <asm/machdep.h>
+#include <asm/hw_irq.h>
+#include <asm/cell-regs.h>
+
+#include "ppc_cbe_cpufreq.h"
+
+/* to write to MIC register */
+static u64 MIC_Slow_Fast_Timer_table[] = {
+	[0 ... 7] = 0x007fc00000000000ull,
+};
+
+/* more values for the MIC */
+static u64 MIC_Slow_Next_Timer_table[] = {
+	0x0000240000000000ull,
+	0x0000268000000000ull,
+	0x000029C000000000ull,
+	0x00002D0000000000ull,
+	0x0000300000000000ull,
+	0x0000334000000000ull,
+	0x000039C000000000ull,
+	0x00003FC000000000ull,
+};
+
+
+int cbe_cpufreq_set_pmode(int cpu, unsigned int pmode)
+{
+	struct cbe_pmd_regs __iomem *pmd_regs;
+	struct cbe_mic_tm_regs __iomem *mic_tm_regs;
+	unsigned long flags;
+	u64 value;
+#ifdef DEBUG
+	long time;
+#endif
+
+	local_irq_save(flags);
+
+	mic_tm_regs = cbe_get_cpu_mic_tm_regs(cpu);
+	pmd_regs = cbe_get_cpu_pmd_regs(cpu);
+
+#ifdef DEBUG
+	time = jiffies;
+#endif
+
+	out_be64(&mic_tm_regs->slow_fast_timer_0, MIC_Slow_Fast_Timer_table[pmode]);
+	out_be64(&mic_tm_regs->slow_fast_timer_1, MIC_Slow_Fast_Timer_table[pmode]);
+
+	out_be64(&mic_tm_regs->slow_next_timer_0, MIC_Slow_Next_Timer_table[pmode]);
+	out_be64(&mic_tm_regs->slow_next_timer_1, MIC_Slow_Next_Timer_table[pmode]);
+
+	value = in_be64(&pmd_regs->pmcr);
+	/* set bits to zero */
+	value &= 0xFFFFFFFFFFFFFFF8ull;
+	/* set bits to next pmode */
+	value |= pmode;
+
+	out_be64(&pmd_regs->pmcr, value);
+
+#ifdef DEBUG
+	/* wait until new pmode appears in status register */
+	value = in_be64(&pmd_regs->pmsr) & 0x07;
+	while (value != pmode) {
+		cpu_relax();
+		value = in_be64(&pmd_regs->pmsr) & 0x07;
+	}
+
+	time = jiffies  - time;
+	time = jiffies_to_msecs(time);
+	pr_debug("had to wait %lu ms for a transition using " \
+		 "pervasive unit\n", time);
+#endif
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+
+int cbe_cpufreq_get_pmode(int cpu)
+{
+	int ret;
+	struct cbe_pmd_regs __iomem *pmd_regs;
+
+	pmd_regs = cbe_get_cpu_pmd_regs(cpu);
+	ret = in_be64(&pmd_regs->pmsr) & 0x07;
+
+	return ret;
+}
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                /*
+ * pmi backend for the cbe_cpufreq driver
+ *
+ * (C) Copyright IBM Deutschland Entwicklung GmbH 2005-2007
+ *
+ * Author: Christian Krafft <krafft@de.ibm.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ */
+
+#include <linux/kernel.h>
+#include <linux/types.h>
+#include <linux/timer.h>
+#include <linux/module.h>
+#include <linux/of_platform.h>
+
+#include <asm/processor.h>
+#include <asm/prom.h>
+#include <asm/pmi.h>
+#include <asm/cell-regs.h>
+
+#ifdef DEBUG
+#include <asm/time.h>
+#endif
+
+#include "ppc_cbe_cpufreq.h"
+
+static u8 pmi_slow_mode_limit[MAX_CBE];
+
+bool cbe_cpufreq_has_pmi = false;
+EXPORT_SYMBOL_GPL(cbe_cpufreq_has_pmi);
+
+/*
+ * hardware specific functions
+ */
+
+int cbe_cpufreq_set_pmode_pmi(int cpu, unsigned int pmode)
+{
+	int ret;
+	pmi_message_t pmi_msg;
+#ifdef DEBUG
+	long time;
+#endif
+	pmi_msg.type = PMI_TYPE_FREQ_CHANGE;
+	pmi_msg.data1 =	cbe_cpu_to_node(cpu);
+	pmi_msg.data2 = pmode;
+
+#ifdef DEBUG
+	time = jiffies;
+#endif
+	pmi_send_message(pmi_msg);
+
+#ifdef DEBUG
+	time = jiffies  - time;
+	time = jiffies_to_msecs(time);
+	pr_debug("had to wait %lu ms for a transition using " \
+		 "PMI\n", time);
+#endif
+	ret = pmi_msg.data2;
+	pr_debug("PMI returned slow mode %d\n", ret);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cbe_cpufreq_set_pmode_pmi);
+
+
+static void cbe_cpufreq_handle_pmi(pmi_message_t pmi_msg)
+{
+	u8 node, slow_mode;
+
+	BUG_ON(pmi_msg.type != PMI_TYPE_FREQ_CHANGE);
+
+	node = pmi_msg.data1;
+	slow_mode = pmi_msg.data2;
+
+	pmi_slow_mode_limit[node] = slow_mode;
+
+	pr_debug("cbe_handle_pmi: node: %d max_freq: %d\n", node, slow_mode);
+}
+
+static int pmi_notifier(struct notifier_block *nb,
+				       unsigned long event, void *data)
+{
+	struct cpufreq_policy *policy = data;
+	struct cpufreq_frequency_table *cbe_freqs;
+	u8 node;
+
+	/* Should this really be called for CPUFREQ_ADJUST and CPUFREQ_NOTIFY
+	 * policy events?)
+	 */
+	if (event == CPUFREQ_START)
+		return 0;
+
+	cbe_freqs = cpufreq_frequency_get_table(policy->cpu);
+	node = cbe_cpu_to_node(policy->cpu);
+
+	pr_debug("got notified, event=%lu, node=%u\n", event, node);
+
+	if (pmi_slow_mode_limit[node] != 0) {
+		pr_debug("limiting node %d to slow mode %d\n",
+			 node, pmi_slow_mode_limit[node]);
+
+		cpufreq_verify_within_limits(policy, 0,
+
+			cbe_freqs[pmi_slow_mode_limit[node]].frequency);
+	}
+
+	return 0;
+}
+
+static struct notifier_block pmi_notifier_block = {
+	.notifier_call = pmi_notifier,
+};
+
+static struct pmi_handler cbe_pmi_handler = {
+	.type			= PMI_TYPE_FREQ_CHANGE,
+	.handle_pmi_message	= cbe_cpufreq_handle_pmi,
+};
+
+
+
+static int __init cbe_cpufreq_pmi_init(void)
+{
+	cbe_cpufreq_has_pmi = pmi_register_handler(&cbe_pmi_handler) == 0;
+
+	if (!cbe_cpufreq_has_pmi)
+		return -ENODEV;
+
+	cpufreq_register_notifier(&pmi_notifier_block, CPUFREQ_POLICY_NOTIFIER);
+
+	return 0;
+}
+
+static void __exit cbe_cpufreq_pmi_exit(void)
+{
+	cpufreq_unregister_notifier(&pmi_notifier_block, CPUFREQ_POLICY_NOTIFIER);
+	pmi_unregister_handler(&cbe_pmi_handler);
+}
+
+module_init(cbe_cpufreq_pmi_init);
+module_exit(cbe_cpufreq_pmi_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Christian Krafft <krafft@de.ibm.com>");
+                                                                                                                                                                                                                                                                                                                                                                                                         /*
+ *  Copyright (C) 2002,2003 Intrinsyc Software
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ * History:
+ *   31-Jul-2002 : Initial version [FB]
+ *   29-Jan-2003 : added PXA255 support [FB]
+ *   20-Apr-2003 : ported to v2.5 (Dustin McIntire, Sensoria Corp.)
+ *
+ * Note:
+ *   This driver may change the memory bus clock rate, but will not do any
+ *   platform specific access timing changes... for example if you have flash
+ *   memory connected to CS0, you will need to register a platform specific
+ *   notifier which will adjust the memory access strobes to maintain a
+ *   minimum strobe width.
+ *
+ */
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/init.h>
+#include <linux/cpufreq.h>
+#include <linux/err.h>
+#include <linux/regulator/consumer.h>
+#include <linux/io.h>
+
+#include <mach/pxa2xx-regs.h>
+#include <mach/smemc.h>
+
+#ifdef DEBUG
+static unsigned int freq_debug;
+module_param(freq_debug, uint, 0);
+MODULE_PARM_DESC(freq_debug, "Set the debug messages to on=1/off=0");
+#else
+#define freq_debug  0
+#endif
+
+static struct regulator *vcc_core;
+
+static unsigned int pxa27x_maxfreq;
+module_param(pxa27x_maxfreq, uint, 0);
+MODULE_PARM_DESC(pxa27x_maxfreq, "Set the pxa27x maxfreq in MHz"
+		 "(typically 624=>pxa270, 416=>pxa271, 520=>pxa272)");
+
+struct pxa_freqs {
+	unsigned int khz;
+	unsigned int membus;
+	unsigned int cccr;
+	unsigned int div2;
+	unsigned int cclkcfg;
+	int vmin;
+	int vmax;
+};
+
+/* Define the refresh period in mSec for the SDRAM and the number of rows */
+#define SDRAM_TREF	64	/* standard 64ms SDRAM */
+static unsigned int sdram_rows;
+
+#define CCLKCFG_TURBO		0x1
+#define CCLKCFG_FCS		0x2
+#define CCLKCFG_HALFTURBO	0x4
+#define CCLKCFG_FASTBUS		0x8
+#define MDREFR_DB2_MASK		(MDREFR_K2DB2 | MDREFR_K1DB2)
+#define MDREFR_DRI_MASK		0xFFF
+
+#define MDCNFG_DRAC2(mdcnfg) (((mdcnfg) >> 21) & 0x3)
+#define MDCNFG_DRAC0(mdcnfg) (((mdcnfg) >> 5) & 0x3)
+
+/*
+ * PXA255 definitions
+ */
+/* Use the run mode frequencies for the CPUFREQ_POLICY_PERFORMANCE policy */
+#define CCLKCFG			CCLKCFG_TURBO | CCLKCFG_FCS
+
+static const struct pxa_freqs pxa255_run_freqs[] =
+{
+	/* CPU   MEMBUS  CCCR  DIV2 CCLKCFG	           run  turbo PXbus SDRAM */
+	{ 99500,  99500, 0x121, 1,  CCLKCFG, -1, -1},	/*  99,   99,   50,   50  */
+	{132700, 132700, 0x123, 1,  CCLKCFG, -1, -1},	/* 133,  133,   66,   66  */
+	{199100,  99500, 0x141, 0,  CCLKCFG, -1, -1},	/* 199,  199,   99,   99  */
+	{265400, 132700, 0x143, 1,  CCLKCFG, -1, -1},	/* 265,  265,  133,   66  */
+	{331800, 165900, 0x145, 1,  CCLKCFG, -1, -1},	/* 331,  331,  166,   83  */
+	{398100,  99500, 0x161, 0,  CCLKCFG, -1, -1},	/* 398,  398,  196,   99  */
+};
+
+/* Use the turbo mode frequencies for the CPUFREQ_POLICY_POWERSAVE policy */
+static const struct pxa_freqs pxa255_turbo_freqs[] =
+{
+	/* CPU   MEMBUS  CCCR  DIV2 CCLKCFG	   run  turbo PXbus SDRAM */
+	{ 99500, 99500,  0x121, 1,  CCLKCFG, -1, -1},	/*  99,   99,   50,   50  */
+	{199100, 99500,  0x221, 0,  CCLKCFG, -1, -1},	/*  99,  199,   50,   99  */
+	{298500, 99500,  0x321, 0,  CCLKCFG, -1, -1},	/*  99,  287,   50,   99  */
+	{298600, 99500,  0x1c1, 0,  CCLKCFG, -1, -1},	/* 199,  287,   99,   99  */
+	{398100, 99500,  0x241, 0,  CCLKCFG, -1, -1},	/* 199,  398,   99,   99  */
+};
+
+#define NUM_PXA25x_RUN_FREQS ARRAY_SIZE(pxa255_run_freqs)
+#define NUM_PXA25x_TURBO_FREQS ARRAY_SIZE(pxa255_turbo_freqs)
+
+static struct cpufreq_frequency_table
+	pxa255_run_freq_table[NUM_PXA25x_RUN_FREQS+1];
+static struct cpufreq_frequency_table
+	pxa255_turbo_freq_table[NUM_PXA25x_TURBO_FREQS+1];
+
+static unsigned int pxa255_turbo_table;
+module_param(pxa255_turbo_table, uint, 0);
+MODULE_PARM_DESC(pxa255_turbo_table, "Selects the frequency table (0 = run table, !0 = turbo table)");
+
+/*
+ * PXA270 definitions
+ *
+ * For the PXA27x:
+ * Control variables are A, L, 2N for CCCR; B, HT, T for CLKCFG.
+ *
+ * A = 0 => memory controller clock from table 3-7,
+ * A = 1 => memory controller clock = system bus clock
+ * Run mode frequency	= 13 MHz * L
+ * Turbo mode frequency = 13 MHz * L * N
+ * System bus frequency = 13 MHz * L / (B + 1)
+ *
+ * In CCCR:
+ * A = 1
+ * L = 16	  oscillator to run mode ratio
+ * 2N = 6	  2 * (turbo mode to run mode ratio)
+ *
+ * In CCLKCFG:
+ * B = 1	  Fast bus mode
+ * HT = 0	  Half-Turbo mode
+ * T = 1	  Turbo mode
+ *
+ * For now, just support some of the combinations in table 3-7 of
+ * PXA27x Processor Family Developer's Manual to simplify frequency
+ * change sequences.
+ */
+#define PXA27x_CCCR(A, L, N2) (A << 25 | N2 << 7 | L)
+#define CCLKCFG2(B, HT, T) \
+  (CCLKCFG_FCS | \
+   ((B)  ? CCLKCFG_FASTBUS : 0) | \
+   ((HT) ? CCLKCFG_HALFTURBO : 0) | \
+   ((T)  ? CCLKCFG_TURBO : 0))
+
+static struct pxa_freqs pxa27x_freqs[] = {
+	{104000, 104000, PXA27x_CCCR(1,	 8, 2), 0, CCLKCFG2(1, 0, 1),  900000, 1705000 },
+	{156000, 104000, PXA27x_CCCR(1,	 8, 3), 0, CCLKCFG2(1, 0, 1), 1000000, 1705000 },
+	{208000, 208000, PXA27x_CCCR(0, 16, 2), 1, CCLKCFG2(0, 0, 1), 1180000, 1705000 },
+	{312000, 208000, PXA27x_CCCR(1, 16, 3), 1, CCLKCFG2(1, 0, 1), 1250000, 1705000 },
+	{416000, 208000, PXA27x_CCCR(1, 16, 4), 1, CCLKCFG2(1, 0, 1), 1350000, 1705000 },
+	{520000, 208000, PXA27x_CCCR(1, 16, 5), 1, CCLKCFG2(1, 0, 1), 1450000, 1705000 },
+	{624000, 208000, PXA27x_CCCR(1, 16, 6), 1, CCLKCFG2(1, 0, 1), 1550000, 1705000 }
+};
+
+#define NUM_PXA27x_FREQS ARRAY_SIZE(pxa27x_freqs)
+static struct cpufreq_frequency_table
+	pxa27x_freq_table[NUM_PXA27x_FREQS+1];
+
+extern unsigned get_clk_frequency_khz(int info);
+
+#ifdef CONFIG_REGULATOR
+
+static int pxa_cpufreq_change_voltage(const struct pxa_freqs *pxa_freq)
+{
+	int ret = 0;
+	int vmin, vmax;
+
+	if (!cpu_is_pxa27x())
+		return 0;
+
+	vmin = pxa_freq->vmin;
+	vmax = pxa_freq->vmax;
+	if ((vmin == -1) || (vmax == -1))
+		return 0;
+
+	ret = regulator_set_voltage(vcc_core, vmin, vmax);
+	if (ret)
+		pr_err("cpufreq: Failed to set vcc_core in [%dmV..%dmV]\n",
+		       vmin, vmax);
+	return ret;
+}
+
+static void pxa_cpufreq_init_voltages(void)
+{
+	vcc_core = regulator_get(NULL, "vcc_core");
+	if (IS_ERR(vcc_core)) {
+		pr_info("cpufreq: Didn't find vcc_core regulator\n");
+		vcc_core = NULL;
 	} else {
-		phy->cable_length = E1000_CABLE_LENGTH_UNDEFINED;
-		phy->local_rx = e1000_1000t_rx_status_undefined;
-		phy->remote_rx = e1000_1000t_rx_status_undefined;
+		pr_info("cpufreq: Found vcc_core regulator\n");
+	}
+}
+#else
+static int pxa_cpufreq_change_voltage(const struct pxa_freqs *pxa_freq)
+{
+	return 0;
+}
+
+static void pxa_cpufreq_init_voltages(void) { }
+#endif
+
+static void find_freq_tables(struct cpufreq_frequency_table **freq_table,
+			     const struct pxa_freqs **pxa_freqs)
+{
+	if (cpu_is_pxa25x()) {
+		if (!pxa255_turbo_table) {
+			*pxa_freqs = pxa255_run_freqs;
+			*freq_table = pxa255_run_freq_table;
+		} else {
+			*pxa_freqs = pxa255_turbo_freqs;
+			*freq_table = pxa255_turbo_freq_table;
+		}
+	} else if (cpu_is_pxa27x()) {
+		*pxa_freqs = pxa27x_freqs;
+		*freq_table = pxa27x_freq_table;
+	} else {
+		BUG();
+	}
+}
+
+static void pxa27x_guess_max_freq(void)
+{
+	if (!pxa27x_maxfreq) {
+		pxa27x_maxfreq = 416000;
+		printk(KERN_INFO "PXA CPU 27x max frequency not defined "
+		       "(pxa27x_maxfreq), assuming pxa271 with %dkHz maxfreq\n",
+		       pxa27x_maxfreq);
+	} else {
+		pxa27x_maxfreq *= 1000;
+	}
+}
+
+static void init_sdram_rows(void)
+{
+	uint32_t mdcnfg = __raw_readl(MDCNFG);
+	unsigned int drac2 = 0, drac0 = 0;
+
+	if (mdcnfg & (MDCNFG_DE2 | MDCNFG_DE3))
+		drac2 = MDCNFG_DRAC2(mdcnfg);
+
+	if (mdcnfg & (MDCNFG_DE0 | MDCNFG_DE1))
+		drac0 = MDCNFG_DRAC0(mdcnfg);
+
+	sdram_rows = 1 << (11 + max(drac0, drac2));
+}
+
+static u32 mdrefr_dri(unsigned int freq)
+{
+	u32 interval = freq * SDRAM_TREF / sdram_rows;
+
+	return (interval - (cpu_is_pxa27x() ? 31 : 0)) / 32;
+}
+
+static unsigned int pxa_cpufreq_get(unsigned int cpu)
+{
+	return get_clk_frequency_khz(0);
+}
+
+static int pxa_set_target(struct cpufreq_policy *policy, unsigned int idx)
+{
+	struct cpufreq_frequency_table *pxa_freqs_table;
+	const struct pxa_freqs *pxa_freq_settings;
+	unsigned long flags;
+	unsigned int new_freq_cpu, new_freq_mem;
+	unsigned int unused, preset_mdrefr, postset_mdrefr, cclkcfg;
+	int ret = 0;
+
+	/* Get the current policy */
+	find_freq_tables(&pxa_freqs_table, &pxa_freq_settings);
+
+	new_freq_cpu = pxa_freq_settings[idx].khz;
+	new_freq_mem = pxa_freq_settings[idx].membus;
+
+	if (freq_debug)
+		pr_debug("Changing CPU frequency to %d Mhz, (SDRAM %d Mhz)\n",
+			 new_freq_cpu / 1000, (pxa_freq_settings[idx].div2) ?
+			 (new_freq_mem / 2000) : (new_freq_mem / 1000));
+
+	if (vcc_core && new_freq_cpu > policy->cur) {
+		ret = pxa_cpufreq_change_voltage(&pxa_freq_settings[idx]);
+		if (ret)
+			return ret;
 	}
 
+	/* Calculate the next MDREFR.  If we're slowing down the SDRAM clock
+	 * we need to preset the smaller DRI before the change.	 If we're
+	 * speeding up we need to set the larger DRI value after the change.
+	 */
+	preset_mdrefr = postset_mdrefr = __raw_readl(MDREFR);
+	if ((preset_mdrefr & MDREFR_DRI_MASK) > mdrefr_dri(new_freq_mem)) {
+		preset_mdrefr = (preset_mdrefr & ~MDREFR_DRI_MASK);
+		preset_mdrefr |= mdrefr_dri(new_freq_mem);
+	}
+	postset_mdrefr =
+		(postset_mdrefr & ~MDREFR_DRI_MASK) | mdrefr_dri(new_freq_mem);
+
+	/* If we're dividing the memory clock by two for the SDRAM clock, this
+	 * must be set prior to the change.  Clearing the divide must be done
+	 * after the change.
+	 */
+	if (pxa_freq_settings[idx].div2) {
+		preset_mdrefr  |= MDREFR_DB2_MASK;
+		postset_mdrefr |= MDREFR_DB2_MASK;
+	} else {
+		postset_mdrefr &= ~MDREFR_DB2_MASK;
+	}
+
+	local_irq_save(flags);
+
+	/* Set new the CCCR and prepare CCLKCFG */
+	CCCR = pxa_freq_settings[idx].cccr;
+	cclkcfg = pxa_freq_settings[idx].cclkcfg;
+
+	asm volatile("							\n\
+		ldr	r4, [%1]		/* load MDREFR */	\n\
+		b	2f						\n\
+		.align	5						\n\
+1:									\n\
+		str	%3, [%1]		/* preset the MDREFR */	\n\
+		mcr	p14, 0, %2, c6, c0, 0	/* set CCLKCFG[FCS] */	\n\
+		str	%4, [%1]		/* postset the MDREFR */ \n\
+									\n\
+		b	3f						\n\
+2:		b	1b						\n\
+3:		nop							\n\
+	  "
+		     : "=&r" (unused)
+		     : "r" (MDREFR), "r" (cclkcfg),
+		       "r" (preset_mdrefr), "r" (postset_mdrefr)
+		     : "r4", "r5");
+	local_irq_restore(flags);
+
+	/*
+	 * Even if voltage setting fails, we don't report it, as the frequency
+	 * change succeeded. The voltage reduction is not a critical failure,
+	 * only power savings will suffer from this.
+	 *
+	 * Note: if the voltage change fails, and a return value is returned, a
+	 * bug is triggered (seems a deadlock). Should anybody find out where,
+	 * the "return 0" should become a "return ret".
+	 */
+	if (vcc_core && new_freq_cpu < policy->cur)
+		ret = pxa_cpufreq_change_voltage(&pxa_freq_settings[idx]);
+
 	return 0;
 }
 
-/**
- *  e1000_get_cable_length_82577 - Determine cable length for 82577 PHY
- *  @hw: pointer to the HW structure
- *
- * Reads the diagnostic status register and verifies result is valid before
- * placing it in the phy_cable_length field.
- **/
-s32 e1000_get_cable_length_82577(struct e1000_hw *hw)
+static int pxa_cpufreq_init(struct cpufreq_policy *policy)
 {
-	struct e1000_phy_info *phy = &hw->phy;
-	s32 ret_val;
-	u16 phy_data, length;
+	int i;
+	unsigned int freq;
+	struct cpufreq_frequency_table *pxa255_freq_table;
+	const struct pxa_freqs *pxa255_freqs;
 
-	ret_val = e1e_rphy(hw, I82577_PHY_DIAG_STATUS, &phy_data);
-	if (ret_val)
-		return ret_val;
+	/* try to guess pxa27x cpu */
+	if (cpu_is_pxa27x())
+		pxa27x_guess_max_freq();
 
-	length = ((phy_data & I82577_DSTATUS_CABLE_LENGTH) >>
-		  I82577_DSTATUS_CABLE_LENGTH_SHIFT);
+	pxa_cpufreq_init_voltages();
 
-	if (length == E1000_CABLE_LENGTH_UNDEFINED)
-		return -E1000_ERR_PHY;
+	init_sdram_rows();
 
-	phy->cable_length = length;
+	/* set default policy and cpuinfo */
+	policy->cpuinfo.transition_latency = 1000; /* FIXME: 1 ms, assumed */
+
+	/* Generate pxa25x the run cpufreq_frequency_table struct */
+	for (i = 0; i < NUM_PXA25x_RUN_FREQS; i++) {
+		pxa255_run_freq_table[i].frequency = pxa255_run_freqs[i].khz;
+		pxa255_run_freq_table[i].driver_data = i;
+	}
+	pxa255_run_freq_table[i].frequency = CPUFREQ_TABLE_END;
+
+	/* Generate pxa25x the turbo cpufreq_frequency_table struct */
+	for (i = 0; i < NUM_PXA25x_TURBO_FREQS; i++) {
+		pxa255_turbo_freq_table[i].frequency =
+			pxa255_turbo_freqs[i].khz;
+		pxa255_turbo_freq_table[i].driver_data = i;
+	}
+	pxa255_turbo_freq_table[i].frequency = CPUFREQ_TABLE_END;
+
+	pxa255_turbo_table = !!pxa255_turbo_table;
+
+	/* Generate the pxa27x cpufreq_frequency_table struct */
+	for (i = 0; i < NUM_PXA27x_FREQS; i++) {
+		freq = pxa27x_freqs[i].khz;
+		if (freq > pxa27x_maxfreq)
+			break;
+		pxa27x_freq_table[i].frequency = freq;
+		pxa27x_freq_table[i].driver_data = i;
+	}
+	pxa27x_freq_table[i].driver_data = i;
+	pxa27x_freq_table[i].frequency = CPUFREQ_TABLE_END;
+
+	/*
+	 * Set the policy's minimum and maximum frequencies from the tables
+	 * just constructed.  This sets cpuinfo.mxx_freq, min and max.
+	 */
+	if (cpu_is_pxa25x()) {
+		find_freq_tables(&pxa255_freq_table, &pxa255_freqs);
+		pr_info("PXA255 cpufreq using %s frequency table\n",
+			pxa255_turbo_table ? "turbo" : "run");
+
+		cpufreq_table_validate_and_show(policy, pxa255_freq_table);
+	}
+	else if (cpu_is_pxa27x()) {
+		cpufreq_table_validate_and_show(policy, pxa27x_freq_table);
+	}
+
+	printk(KERN_INFO "PXA CPU frequency change support initialized\n");
 
 	return 0;
 }
+
+static struct cpufreq_driver pxa_cpufreq_driver = {
+	.flags	= CPUFREQ_NEED_INITIAL_FREQ_CHECK,
+	.verify	= cpufreq_generic_frequency_table_verify,
+	.target_index = pxa_set_target,
+	.init	= pxa_cpufreq_init,
+	.get	= pxa_cpufreq_get,
+	.name	= "PXA2xx",
+};
+
+static int __init pxa_cpu_init(void)
+{
+	int ret = -ENODEV;
+	if (cpu_is_pxa25x() || cpu_is_pxa27x())
+		ret = cpufreq_register_driver(&pxa_cpufreq_driver);
+	return ret;
+}
+
+static void __exit pxa_cpu_exit(void)
+{
+	cpufreq_unregister_driver(&pxa_cpufreq_driver);
+}
+
+
+MODULE_AUTHOR("Intrinsyc Software Inc.");
+MODULE_DESCRIPTION("CPU frequency changing driver for the PXA architecture");
+MODULE_LICENSE("GPL");
+module_init(pxa_cpu_init);
+module_exit(pxa_cpu_exit);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  /*
+ * Copyright (C) 2008 Marvell International Ltd.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ */
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/sched.h>
+#include <linux/init.h>
+#include <linux/cpufreq.h>
+#include <linux/slab.h>
+#include <linux/io.h>
+
+#include <mach/generic.h>
+#include <mach/pxa3xx-regs.h>
+
+#define HSS_104M	(0)
+#define HSS_156M	(1)
+#define HSS_208M	(2)
+#define HSS_312M	(3)
+
+#define SMCFS_78M	(0)
+#define SMCFS_104M	(2)
+#define SMCFS_208M	(5)
+
+#define SFLFS_104M	(0)
+#define SFLFS_156M	(1)
+#define SFLFS_208M	(2)
+#define SFLFS_312M	(3)
+
+#define XSPCLK_156M	(0)
+#define XSPCLK_NONE	(3)
+
+#define DMCFS_26M	(0)
+#define DMCFS_260M	(3)
+
+struct pxa3xx_freq_info {
+	unsigned int cpufreq_mhz;
+	unsigned int core_xl : 5;
+	unsigned int core_xn : 3;
+	unsigned int hss : 2;
+	unsigned int dmcfs : 2;
+	unsigned int smcfs : 3;
+	unsigned int sflfs : 2;
+	unsigned int df_clkdiv : 3;
+
+	int	vcc_core;	/* in mV */
+	int	vcc_sram;	/* in mV */
+};
+
+#define OP(cpufreq, _xl, _xn, _hss, _dmc, _smc, _sfl, _dfi, vcore, vsram) \
+{									\
+	.cpufreq_mhz	= cpufreq,					\
+	.core_xl	= _xl,						\
+	.core_xn	= _xn,						\
+	.hss		= HSS_##_hss##M,				\
+	.dmcfs		= DMCFS_##_dmc##M,				\
+	.smcfs		= SMCFS_##_smc##M,				\
+	.sflfs		= SFLFS_##_sfl##M,				\
+	.df_clkdiv	= _dfi,						\
+	.vcc_core	= vcore,					\
+	.vcc_sram	= vsram,					\
+}
+
+static struct pxa3xx_freq_info pxa300_freqs[] = {
+	/*  CPU XL XN  HSS DMEM SMEM SRAM DFI VCC_CORE VCC_SRAM */
+	OP(104,  8, 1, 104, 260,  78, 104, 3, 1000, 1100), /* 104MHz */
+	OP(208, 16, 1, 104, 260, 104, 156, 2, 1000, 1100), /* 208MHz */
+	OP(416, 16, 2, 156, 260, 104, 208, 2, 1100, 1200), /* 416MHz */
+	OP(624, 24, 2, 208, 260, 208, 312, 3, 1375, 1400), /* 624MHz */
+};
+
+static struct pxa3xx_freq_info pxa320_freqs[] = {
+	/*  CPU XL XN  HSS DMEM SMEM SRAM DFI VCC_CORE VCC_SRAM */
+	OP(104,  8, 1, 104, 260,  78, 104, 3, 1000, 1100), /* 104MHz */
+	OP(208, 16, 1, 104, 260, 104, 156, 2, 1000, 1100), /* 208MHz */
+	OP(416, 16, 2, 156, 260, 104, 208, 2, 1100, 1200), /* 416MHz */
+	OP(624, 24, 2, 208, 260, 208, 312, 3, 1375, 1400), /* 624MHz */
+	OP(806, 31, 2, 208, 260, 208, 312, 3, 1400, 1400), /* 806MHz */
+};
+
+static unsigned int pxa3xx_freqs_num;
+static struct pxa3xx_freq_info *pxa3xx_freqs;
+static struct cpufreq_frequency_table *pxa3xx_freqs_table;
+
+static int setup_freqs_table(struct cpufreq_policy *policy,
+			     struct pxa3xx_freq_info *freqs, int num)
+{
+	struct cpufreq_frequency_table *table;
+	int i;
+
+	table = kzalloc((num + 1) * sizeof(*table), GFP_KERNEL);
+	if (table == NULL)
+		return -ENOMEM;
+
+	for (i = 0; i < num; i++) {
+		table[i].driver_data = i;
+		table[i].frequency = freqs[i].cpufreq_mhz * 1000;
+	}
+	table[num].driver_data = i;
+	table[num].frequency = CPUFREQ_TABLE_END;
+
+	pxa3xx_freqs = freqs;
+	pxa3xx_freqs_num = num;
+	pxa3xx_freqs_table = table;
+
+	return cpufreq_table_validate_and_show(policy, table);
+}
+
+static void __update_core_freq(struct pxa3xx_freq_info *info)
+{
+	uint32_t mask = ACCR_XN_MASK | ACCR_XL_MASK;
+	uint32_t accr = ACCR;
+	uint32_t xclkcfg;
+
+	accr &= ~(ACCR_XN_MASK | ACCR_XL_MASK | ACCR_XSPCLK_MASK);
+	accr |= ACCR_XN(info->core_xn) | ACCR_XL(info->core_xl);
+
+	/* No clock until core PLL is re-locked */
+	accr |= ACCR_XSPCLK(XSPCLK_NONE);
+
+	xclkcfg = (info->core_xn == 2) ? 0x3 : 0x2;	/* turbo bit */
+
+	ACCR = accr;
+	__asm__("mcr p14, 0, %0, c6, c0, 0\n" : : "r"(xclkcfg));
+
+	while ((ACSR & mask) != (accr & mask))
+		cpu_relax();
+}
+
+static void __update_bus_freq(struct pxa3xx_freq_info *info)
+{
+	uint32_t mask;
+	uint32_t accr = ACCR;
+
+	mask = ACCR_SMCFS_MASK | ACCR_SFLFS_MASK | ACCR_HSS_MASK |
+		ACCR_DMCFS_MASK;
+
+	accr &= ~mask;
+	accr |= ACCR_SMCFS(info->smcfs) | ACCR_SFLFS(info->sflfs) |
+		ACCR_HSS(info->hss) | ACCR_DMCFS(info->dmcfs);
+
+	ACCR = accr;
+
+	while ((ACSR & mask) != (accr & mask))
+		cpu_relax();
+}
+
+static unsigned int pxa3xx_cpufreq_get(unsigned int cpu)
+{
+	return pxa3xx_get_clk_frequency_khz(0);
+}
+
+static int pxa3xx_cpufreq_set(struct cpufreq_policy *policy, unsigned int index)
+{
+	struct pxa3xx_freq_info *next;
+	unsigned long flags;
+
+	if (policy->cpu != 0)
+		return -EINVAL;
+
+	next = &pxa3xx_freqs[index];
+
+	local_irq_save(flags);
+	__update_core_freq(next);
+	__update_bus_freq(next);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+static int pxa3xx_cpufreq_init(struct cpufreq_policy *policy)
+{
+	int ret = -EINVAL;
+
+	/* set default policy and cpuinfo */
+	policy->min = policy->cpuinfo.min_freq = 104000;
+	policy->max = policy->cpuinfo.max_freq =
+		(cpu_is_pxa320()) ? 806000 : 624000;
+	policy->cpuinfo.transition_latency = 1000; /* FIXME: 1 ms, assumed */
+
+	if (cpu_is_pxa300() || cpu_is_pxa310())
+		ret = setup_freqs_table(policy, pxa300_freqs,
+					ARRAY_SIZE(pxa300_freqs));
+
+	if (cpu_is_pxa320())
+		ret = setup_freqs_table(policy, pxa320_freqs,
+					ARRAY_SIZE(pxa320_freqs));
+
+	if (ret) {
+		pr_err("failed to setup frequency table\n");
+		return ret;
+	}
+
+	pr_info("CPUFREQ support for PXA3xx initialized\n");
+	return 0;
+}
+
+static struct cpufreq_driver pxa3xx_cpufreq_driver = {
+	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK,
+	.verify		= cpufreq_generic_frequency_table_verify,
+	.target_index	= pxa3xx_cpufreq_set,
+	.init		= pxa3xx_cpufreq_init,
+	.get		= pxa3xx_cpufreq_get,
+	.name		= "pxa3xx-cpufreq",
+};
+
+static int __init cpufreq_init(void)
+{
+	if (cpu_is_pxa3xx())
+		return cpufreq_register_driver(&pxa3xx_cpufreq_driver);
+
+	return 0;
+}
+module_init(cpufreq_init);
+
+static void __exit cpufreq_exit(void)
+{
+	cpufreq_unregister_driver(&pxa3xx_cpufreq_driver);
+}
+module_exit(cpufreq_exit);
+
+MODULE_DESCRIPTION("CPU frequency scaling driver for PXA3xx");
+MODULE_LICENSE("GPL");
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     

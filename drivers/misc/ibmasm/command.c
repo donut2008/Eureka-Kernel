@@ -1,187 +1,73 @@
-
-/*
- * IBM ASM Service Processor Device Driver
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
- *
- * Copyright (C) IBM Corporation, 2004
- *
- * Author: Max Asböck <amax@us.ibm.com>
- *
- */
-
-#include <linux/sched.h>
-#include <linux/slab.h>
-#include "ibmasm.h"
-#include "lowlevel.h"
-
-static void exec_next_command(struct service_processor *sp);
-
-static atomic_t command_count = ATOMIC_INIT(0);
-
-struct command *ibmasm_new_command(struct service_processor *sp, size_t buffer_size)
-{
-	struct command *cmd;
-
-	if (buffer_size > IBMASM_CMD_MAX_BUFFER_SIZE)
-		return NULL;
-
-	cmd = kzalloc(sizeof(struct command), GFP_KERNEL);
-	if (cmd == NULL)
-		return NULL;
-
-
-	cmd->buffer = kzalloc(buffer_size, GFP_KERNEL);
-	if (cmd->buffer == NULL) {
-		kfree(cmd);
-		return NULL;
-	}
-	cmd->buffer_size = buffer_size;
-
-	kref_init(&cmd->kref);
-	cmd->lock = &sp->lock;
-
-	cmd->status = IBMASM_CMD_PENDING;
-	init_waitqueue_head(&cmd->wait);
-	INIT_LIST_HEAD(&cmd->queue_node);
-
-	atomic_inc(&command_count);
-	dbg("command count: %d\n", atomic_read(&command_count));
-
-	return cmd;
-}
-
-void ibmasm_free_command(struct kref *kref)
-{
-	struct command *cmd = to_command(kref);
-
-	list_del(&cmd->queue_node);
-	atomic_dec(&command_count);
-	dbg("command count: %d\n", atomic_read(&command_count));
-	kfree(cmd->buffer);
-	kfree(cmd);
-}
-
-static void enqueue_command(struct service_processor *sp, struct command *cmd)
-{
-	list_add_tail(&cmd->queue_node, &sp->command_queue);
-}
-
-static struct command *dequeue_command(struct service_processor *sp)
-{
-	struct command *cmd;
-	struct list_head *next;
-
-	if (list_empty(&sp->command_queue))
-		return NULL;
-
-	next = sp->command_queue.next;
-	list_del_init(next);
-	cmd = list_entry(next, struct command, queue_node);
-
-	return cmd;
-}
-
-static inline void do_exec_command(struct service_processor *sp)
-{
-	char tsbuf[32];
-
-	dbg("%s:%d at %s\n", __func__, __LINE__, get_timestamp(tsbuf));
-
-	if (ibmasm_send_i2o_message(sp)) {
-		sp->current_command->status = IBMASM_CMD_FAILED;
-		wake_up(&sp->current_command->wait);
-		command_put(sp->current_command);
-		exec_next_command(sp);
-	}
-}
-
-/**
- * exec_command
- * send a command to a service processor
- * Commands are executed sequentially. One command (sp->current_command)
- * is sent to the service processor. Once the interrupt handler gets a
- * message of type command_response, the message is copied into
- * the current commands buffer,
- */
-void ibmasm_exec_command(struct service_processor *sp, struct command *cmd)
-{
-	unsigned long flags;
-	char tsbuf[32];
-
-	dbg("%s:%d at %s\n", __func__, __LINE__, get_timestamp(tsbuf));
-
-	spin_lock_irqsave(&sp->lock, flags);
-
-	if (!sp->current_command) {
-		sp->current_command = cmd;
-		command_get(sp->current_command);
-		spin_unlock_irqrestore(&sp->lock, flags);
-		do_exec_command(sp);
-	} else {
-		enqueue_command(sp, cmd);
-		spin_unlock_irqrestore(&sp->lock, flags);
-	}
-}
-
-static void exec_next_command(struct service_processor *sp)
-{
-	unsigned long flags;
-	char tsbuf[32];
-
-	dbg("%s:%d at %s\n", __func__, __LINE__, get_timestamp(tsbuf));
-
-	spin_lock_irqsave(&sp->lock, flags);
-	sp->current_command = dequeue_command(sp);
-	if (sp->current_command) {
-		command_get(sp->current_command);
-		spin_unlock_irqrestore(&sp->lock, flags);
-		do_exec_command(sp);
-	} else {
-		spin_unlock_irqrestore(&sp->lock, flags);
-	}
-}
-
-/**
- * Sleep until a command has failed or a response has been received
- * and the command status been updated by the interrupt handler.
- * (see receive_response).
- */
-void ibmasm_wait_for_response(struct command *cmd, int timeout)
-{
-	wait_event_interruptible_timeout(cmd->wait,
-				cmd->status == IBMASM_CMD_COMPLETE ||
-				cmd->status == IBMASM_CMD_FAILED,
-				timeout * HZ);
-}
-
-/**
- * receive_command_response
- * called by the interrupt handler when a dot command of type command_response
- * was received.
- */
-void ibmasm_receive_command_response(struct service_processor *sp, void *response, size_t size)
-{
-	struct command *cmd = sp->current_command;
-
-	if (!sp->current_command)
-		return;
-
-	memcpy_fromio(cmd->buffer, response, min(size, cmd->buffer_size));
-	cmd->status = IBMASM_CMD_COMPLETE;
-	wake_up(&sp->current_command->wait);
-	command_put(sp->current_command);
-	exec_next_command(sp);
-}
+_TAP_SEL_OVRD_EN_MASK 0x100
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_DRVX_TAP_SEL_OVRD_EN__SHIFT 0x8
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_PLLCLK_SEL_OVRD_VAL_MASK 0x200
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_PLLCLK_SEL_OVRD_VAL__SHIFT 0x9
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_PLLCLK_SEL_OVRD_EN_MASK 0x400
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_PLLCLK_SEL_OVRD_EN__SHIFT 0xa
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_TCLK_DIV_OVRD_VAL_MASK 0x800
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_TCLK_DIV_OVRD_VAL__SHIFT 0xb
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_TCLK_DIV_OVRD_EN_MASK 0x1000
+#define PB0_TX_GLB_OVRD_REG1__TX_CFG_TCLK_DIV_OVRD_EN__SHIFT 0xc
+#define PB0_TX_GLB_OVRD_REG1__TX_CMDET_EN_OVRD_VAL_MASK 0x2000
+#define PB0_TX_GLB_OVRD_REG1__TX_CMDET_EN_OVRD_VAL__SHIFT 0xd
+#define PB0_TX_GLB_OVRD_REG1__TX_CMDET_EN_OVRD_EN_MASK 0x4000
+#define PB0_TX_GLB_OVRD_REG1__TX_CMDET_EN_OVRD_EN__SHIFT 0xe
+#define PB0_TX_GLB_OVRD_REG1__TX_DATA_IN_OVRD_VAL_MASK 0x1ff8000
+#define PB0_TX_GLB_OVRD_REG1__TX_DATA_IN_OVRD_VAL__SHIFT 0xf
+#define PB0_TX_GLB_OVRD_REG1__TX_DATA_IN_OVRD_EN_MASK 0x2000000
+#define PB0_TX_GLB_OVRD_REG1__TX_DATA_IN_OVRD_EN__SHIFT 0x19
+#define PB0_TX_GLB_OVRD_REG1__TX_RPTR_RSTN_OVRD_VAL_MASK 0x4000000
+#define PB0_TX_GLB_OVRD_REG1__TX_RPTR_RSTN_OVRD_VAL__SHIFT 0x1a
+#define PB0_TX_GLB_OVRD_REG1__TX_RPTR_RSTN_OVRD_EN_MASK 0x8000000
+#define PB0_TX_GLB_OVRD_REG1__TX_RPTR_RSTN_OVRD_EN__SHIFT 0x1b
+#define PB0_TX_GLB_OVRD_REG1__TX_RXDET_EN_OVRD_VAL_MASK 0x10000000
+#define PB0_TX_GLB_OVRD_REG1__TX_RXDET_EN_OVRD_VAL__SHIFT 0x1c
+#define PB0_TX_GLB_OVRD_REG1__TX_RXDET_EN_OVRD_EN_MASK 0x20000000
+#define PB0_TX_GLB_OVRD_REG1__TX_RXDET_EN_OVRD_EN__SHIFT 0x1d
+#define PB0_TX_GLB_OVRD_REG1__TX_WPTR_RSTN_OVRD_VAL_MASK 0x40000000
+#define PB0_TX_GLB_OVRD_REG1__TX_WPTR_RSTN_OVRD_VAL__SHIFT 0x1e
+#define PB0_TX_GLB_OVRD_REG1__TX_WPTR_RSTN_OVRD_EN_MASK 0x80000000
+#define PB0_TX_GLB_OVRD_REG1__TX_WPTR_RSTN_OVRD_EN__SHIFT 0x1f
+#define PB0_TX_GLB_OVRD_REG2__TX_WRITE_EN_OVRD_VAL_MASK 0x1
+#define PB0_TX_GLB_OVRD_REG2__TX_WRITE_EN_OVRD_VAL__SHIFT 0x0
+#define PB0_TX_GLB_OVRD_REG2__TX_WRITE_EN_OVRD_EN_MASK 0x2
+#define PB0_TX_GLB_OVRD_REG2__TX_WRITE_EN_OVRD_EN__SHIFT 0x1
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX1_EN_OVRD_VAL_MASK 0x4
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX1_EN_OVRD_VAL__SHIFT 0x2
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX1_EN_OVRD_EN_MASK 0x8
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX1_EN_OVRD_EN__SHIFT 0x3
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX2_EN_OVRD_VAL_MASK 0x10
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX2_EN_OVRD_VAL__SHIFT 0x4
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX2_EN_OVRD_EN_MASK 0x20
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX2_EN_OVRD_EN__SHIFT 0x5
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX4_EN_OVRD_VAL_MASK 0x40
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX4_EN_OVRD_VAL__SHIFT 0x6
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX4_EN_OVRD_EN_MASK 0x80
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX4_EN_OVRD_EN__SHIFT 0x7
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX8_EN_OVRD_VAL_MASK 0x100
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX8_EN_OVRD_VAL__SHIFT 0x8
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX8_EN_OVRD_EN_MASK 0x200
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX8_EN_OVRD_EN__SHIFT 0x9
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX16_EN_OVRD_VAL_MASK 0x400
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX16_EN_OVRD_VAL__SHIFT 0xa
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX16_EN_OVRD_EN_MASK 0x800
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_GROUPX16_EN_OVRD_EN__SHIFT 0xb
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_DRV0_EN_GEN2_OVRD_VAL_MASK 0xf000
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_DRV0_EN_GEN2_OVRD_VAL__SHIFT 0xc
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_DRV0_TAP_SEL_GEN2_OVRD_VAL_MASK 0xf0000
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_DRV0_TAP_SEL_GEN2_OVRD_VAL__SHIFT 0x10
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_DRV1_EN_GEN2_OVRD_VAL_MASK 0x1f00000
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_DRV1_EN_GEN2_OVRD_VAL__SHIFT 0x14
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_DRV1_TAP_SEL_GEN2_OVRD_VAL_MASK 0x3e000000
+#define PB0_TX_GLB_OVRD_REG2__TX_CFG_DRV1_TAP_SEL_GEN2_OVRD_VAL__SHIFT 0x19
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRV2_EN_GEN2_OVRD_VAL_MASK 0xf
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRV2_EN_GEN2_OVRD_VAL__SHIFT 0x0
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRV2_TAP_SEL_GEN2_OVRD_VAL_MASK 0xf0
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRV2_TAP_SEL_GEN2_OVRD_VAL__SHIFT 0x4
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRVX_EN_GEN2_OVRD_VAL_MASK 0x100
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRVX_EN_GEN2_OVRD_VAL__SHIFT 0x8
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRVX_TAP_SEL_GEN2_OVRD_VAL_MASK 0x200
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRVX_TAP_SEL_GEN2_OVRD_VAL__SHIFT 0x9
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRV0_EN_GEN3_OVRD_VAL_MASK 0x3c00
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRV0_EN_GEN3_OVRD_VAL__SHIFT 0xa
+#define PB0_TX_GLB_OVRD_REG3__TX_CFG_DRV0_TAP_

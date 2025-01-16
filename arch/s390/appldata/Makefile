@@ -1,8 +1,13 @@
-#
-# Makefile for the Linux - z/VM Monitor Stream.
-#
+/*
+ * ia64 implementation of the mutex fastpath.
+ *
+ * Copyright (C) 2006 Ken Chen <kenneth.w.chen@intel.com>
+ *
+ */
 
-obj-$(CONFIG_APPLDATA_BASE) += appldata_base.o
-obj-$(CONFIG_APPLDATA_MEM) += appldata_mem.o
-obj-$(CONFIG_APPLDATA_OS) += appldata_os.o
-obj-$(CONFIG_APPLDATA_NET_SUM) += appldata_net_sum.o
+#ifndef _ASM_MUTEX_H
+#define _ASM_MUTEX_H
+
+/**
+ *  __mutex_fastpath_lock - try to take the lock by moving the count
+ *     

@@ -1,177 +1,169 @@
-/proc/sys/net/netfilter/nf_conntrack_* Variables:
+/*
+ * Radisys 82600 Embedded chipset Memory Controller kernel module
+ * (C) 2005 EADS Astrium
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
+ *
+ * Written by Tim Small <tim@buttersideup.com>, based on work by Thayne
+ * Harbaugh, Dan Hollis <goemon at anime dot net> and others.
+ *
+ * $Id: edac_r82600.c,v 1.1.2.6 2005/10/05 00:43:44 dsp_llnl Exp $
+ *
+ * Written with reference to 82600 High Integration Dual PCI System
+ * Controller Data Book:
+ * www.radisys.com/files/support_downloads/007-01277-0002.82600DataBook.pdf
+ * references to this document given in []
+ */
 
-nf_conntrack_acct - BOOLEAN
-	0 - disabled (default)
-	not 0 - enabled
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/pci.h>
+#include <linux/pci_ids.h>
+#include <linux/edac.h>
+#include "edac_core.h"
 
-	Enable connection tracking flow accounting. 64-bit byte and packet
-	counters per flow are added.
+#define R82600_REVISION	" Ver: 2.0.2"
+#define EDAC_MOD_STR	"r82600_edac"
 
-nf_conntrack_buckets - INTEGER (read-only)
-	Size of hash table. If not specified as parameter during module
-	loading, the default size is calculated by dividing total memory
-	by 16384 to determine the number of buckets but the hash table will
-	never have fewer than 32 and limited to 16384 buckets. For systems
-	with more than 4GB of memory it will be 65536 buckets.
+#define r82600_printk(level, fmt, arg...) \
+	edac_printk(level, "r82600", fmt, ##arg)
 
-nf_conntrack_checksum - BOOLEAN
-	0 - disabled
-	not 0 - enabled (default)
+#define r82600_mc_printk(mci, level, fmt, arg...) \
+	edac_mc_chipset_printk(mci, level, "r82600", fmt, ##arg)
 
-	Verify checksum of incoming packets. Packets with bad checksums are
-	in INVALID state. If this is enabled, such packets will not be
-	considered for connection tracking.
+/* Radisys say "The 82600 integrates a main memory SDRAM controller that
+ * supports up to four banks of memory. The four banks can support a mix of
+ * sizes of 64 bit wide (72 bits with ECC) Synchronous DRAM (SDRAM) DIMMs,
+ * each of which can be any size from 16MB to 512MB. Both registered (control
+ * signals buffered) and unbuffered DIMM types are supported. Mixing of
+ * registered and unbuffered DIMMs as well as mixing of ECC and non-ECC DIMMs
+ * is not allowed. The 82600 SDRAM interface operates at the same frequency as
+ * the CPU bus, 66MHz, 100MHz or 133MHz."
+ */
 
-nf_conntrack_count - INTEGER (read-only)
-	Number of currently allocated flow entries.
+#define R82600_NR_CSROWS 4
+#define R82600_NR_CHANS  1
+#define R82600_NR_DIMMS  4
 
-nf_conntrack_events - BOOLEAN
-	0 - disabled
-	not 0 - enabled (default)
+#define R82600_BRIDGE_ID  0x8200
 
-	If this option is enabled, the connection tracking code will
-	provide userspace with connection tracking events via ctnetlink.
+/* Radisys 82600 register addresses - device 0 function 0 - PCI bridge */
+#define R82600_DRAMC	0x57	/* Various SDRAM related control bits
+				 * all bits are R/W
+				 *
+				 * 7    SDRAM ISA Hole Enable
+				 * 6    Flash Page Mode Enable
+				 * 5    ECC Enable: 1=ECC 0=noECC
+				 * 4    DRAM DIMM Type: 1=
+				 * 3    BIOS Alias Disable
+				 * 2    SDRAM BIOS Flash Write Enable
+				 * 1:0  SDRAM Refresh Rate: 00=Disabled
+				 *          01=7.8usec (256Mbit SDRAMs)
+				 *          10=15.6us 11=125usec
+				 */
 
-nf_conntrack_events_retry_timeout - INTEGER (seconds)
-	default 15
+#define R82600_SDRAMC	0x76	/* "SDRAM Control Register"
+				 * More SDRAM related control bits
+				 * all bits are R/W
+				 *
+				 * 15:8 Reserved.
+				 *
+				 * 7:5  Special SDRAM Mode Select
+				 *
+				 * 4    Force ECC
+				 *
+				 *        1=Drive ECC bits to 0 during
+				 *          write cycles (i.e. ECC test mode)
+				 *
+				 *        0=Normal ECC functioning
+				 *
+				 * 3    Enhanced Paging Enable
+				 *
+				 * 2    CAS# Latency 0=3clks 1=2clks
+				 *
+				 * 1    RAS# to CAS# Delay 0=3 1=2
+				 *
+				 * 0    RAS# Precharge     0=3 1=2
+				 */
 
-	This option is only relevant when "reliable connection tracking
-	events" are used.  Normally, ctnetlink is "lossy", that is,
-	events are normally dropped when userspace listeners can't keep up.
+#define R82600_EAP	0x80	/* ECC Error Address Pointer Register
+				 *
+				 * 31    Disable Hardware Scrubbing (RW)
+				 *        0=Scrub on corrected read
+				 *        1=Don't scrub on corrected read
+				 *
+				 * 30:12 Error Address Pointer (RO)
+				 *        Upper 19 bits of error address
+				 *
+				 * 11:4  Syndrome Bits (RO)
+				 *
+				 * 3     BSERR# on multibit error (RW)
+				 *        1=enable 0=disable
+				 *
+				 * 2     NMI on Single Bit Eror (RW)
+				 *        1=NMI triggered by SBE n.b. other
+				 *          prerequeists
+				 *        0=NMI not triggered
+				 *
+				 * 1     MBE (R/WC)
+				 *        read 1=MBE at EAP (see above)
+				 *        read 0=no MBE, or SBE occurred first
+				 *        write 1=Clear MBE status (must also
+				 *          clear SBE)
+				 *        write 0=NOP
+				 *
+				 * 1     SBE (R/WC)
+				 *        read 1=SBE at EAP (see above)
+				 *        read 0=no SBE, or MBE occurred first
+				 *        write 1=Clear SBE status (must also
+				 *          clear MBE)
+				 *        write 0=NOP
+				 */
 
-	Userspace can request "reliable event mode".  When this mode is
-	active, the conntrack will only be destroyed after the event was
-	delivered.  If event delivery fails, the kernel periodically
-	re-tries to send the event to userspace.
+#define R82600_DRBA	0x60	/* + 0x60..0x63 SDRAM Row Boundary Address
+				 *  Registers
+				 *
+				 * 7:0  Address lines 30:24 - upper limit of
+				 * each row [p57]
+				 */
 
-	This is the maximum interval the kernel should use when re-trying
-	to deliver the destroy event.
+struct r82600_error_info {
+	u32 eapr;
+};
 
-	A higher number means there will be fewer delivery retries and it
-	will take longer for a backlog to be processed.
+static bool disable_hardware_scrub;
 
-nf_conntrack_expect_max - INTEGER
-	Maximum size of expectation table.  Default value is
-	nf_conntrack_buckets / 256. Minimum is 1.
+static struct edac_pci_ctl_info *r82600_pci;
 
-nf_conntrack_frag6_high_thresh - INTEGER
-	default 262144
+static void r82600_get_error_info(struct mem_ctl_info *mci,
+				struct r82600_error_info *info)
+{
+	struct pci_dev *pdev;
 
-	Maximum memory used to reassemble IPv6 fragments.  When
-	nf_conntrack_frag6_high_thresh bytes of memory is allocated for this
-	purpose, the fragment handler will toss packets until
-	nf_conntrack_frag6_low_thresh is reached.
+	pdev = to_pci_dev(mci->pdev);
+	pci_read_config_dword(pdev, R82600_EAP, &info->eapr);
 
-nf_conntrack_frag6_low_thresh - INTEGER
-	default 196608
+	if (info->eapr & BIT(0))
+		/* Clear error to allow next error to be reported [p.62] */
+		pci_write_bits32(pdev, R82600_EAP,
+				 ((u32) BIT(0) & (u32) BIT(1)),
+				 ((u32) BIT(0) & (u32) BIT(1)));
 
-	See nf_conntrack_frag6_low_thresh
+	if (info->eapr & BIT(1))
+		/* Clear error to allow next error to be reported [p.62] */
+		pci_write_bits32(pdev, R82600_EAP,
+				 ((u32) BIT(0) & (u32) BIT(1)),
+				 ((u32) BIT(0) & (u32) BIT(1)));
+}
 
-nf_conntrack_frag6_timeout - INTEGER (seconds)
-	default 60
+static int r82600_process_error_info(struct mem_ctl_info *mci,
+				struct r82600_error_info *info,
+				int handle_errors)
+{
+	int error_found;
+	u32 eapaddr, page;
+	u32 syndrome;
 
-	Time to keep an IPv6 fragment in memory.
+	error_found = 0;
 
-nf_conntrack_generic_timeout - INTEGER (seconds)
-	default 600
-
-	Default for generic timeout.  This refers to layer 4 unknown/unsupported
-	protocols.
-
-nf_conntrack_helper - BOOLEAN
-	0 - disabled
-	not 0 - enabled (default)
-
-	Enable automatic conntrack helper assignment.
-
-nf_conntrack_icmp_timeout - INTEGER (seconds)
-	default 30
-
-	Default for ICMP timeout.
-
-nf_conntrack_icmpv6_timeout - INTEGER (seconds)
-	default 30
-
-	Default for ICMP6 timeout.
-
-nf_conntrack_log_invalid - INTEGER
-	0   - disable (default)
-	1   - log ICMP packets
-	6   - log TCP packets
-	17  - log UDP packets
-	33  - log DCCP packets
-	41  - log ICMPv6 packets
-	136 - log UDPLITE packets
-	255 - log packets of any protocol
-
-	Log invalid packets of a type specified by value.
-
-nf_conntrack_max - INTEGER
-	Size of connection tracking table.  Default value is
-	nf_conntrack_buckets value * 4.
-
-nf_conntrack_tcp_be_liberal - BOOLEAN
-	0 - disabled (default)
-	not 0 - enabled
-
-	Be conservative in what you do, be liberal in what you accept from others.
-	If it's non-zero, we mark only out of window RST segments as INVALID.
-
-nf_conntrack_tcp_loose - BOOLEAN
-	0 - disabled
-	not 0 - enabled (default)
-
-	If it is set to zero, we disable picking up already established
-	connections.
-
-nf_conntrack_tcp_max_retrans - INTEGER
-	default 3
-
-	Maximum number of packets that can be retransmitted without
-	received an (acceptable) ACK from the destination. If this number
-	is reached, a shorter timer will be started.
-
-nf_conntrack_tcp_timeout_close - INTEGER (seconds)
-	default 10
-
-nf_conntrack_tcp_timeout_close_wait - INTEGER (seconds)
-	default 60
-
-nf_conntrack_tcp_timeout_established - INTEGER (seconds)
-	default 432000 (5 days)
-
-nf_conntrack_tcp_timeout_fin_wait - INTEGER (seconds)
-	default 120
-
-nf_conntrack_tcp_timeout_last_ack - INTEGER (seconds)
-	default 30
-
-nf_conntrack_tcp_timeout_max_retrans - INTEGER (seconds)
-	default 300
-
-nf_conntrack_tcp_timeout_syn_recv - INTEGER (seconds)
-	default 60
-
-nf_conntrack_tcp_timeout_syn_sent - INTEGER (seconds)
-	default 120
-
-nf_conntrack_tcp_timeout_time_wait - INTEGER (seconds)
-	default 120
-
-nf_conntrack_tcp_timeout_unacknowledged - INTEGER (seconds)
-	default 300
-
-nf_conntrack_timestamp - BOOLEAN
-	0 - disabled (default)
-	not 0 - enabled
-
-	Enable connection tracking flow timestamping.
-
-nf_conntrack_udp_timeout - INTEGER (seconds)
-	default 30
-
-nf_conntrack_udp_timeout_stream2 - INTEGER (seconds)
-	default 180
-
-	This extended timeout will be used in case there is an UDP stream
-	detected.
+	/*

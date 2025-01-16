@@ -1,9 +1,8 @@
-#
-# Makefile for s390-specific library files..
-#
+device;
+	void            (*handler)(struct ib_event_handler *, struct ib_event *);
+	struct list_head  list;
+};
 
-lib-y += delay.o string.o uaccess.o find.o
-obj-y += mem.o
-lib-$(CONFIG_SMP) += spinlock.o
-lib-$(CONFIG_KPROBES) += probes.o
-lib-$(CONFIG_UPROBES) += probes.o
+#define INIT_IB_EVENT_HANDLER(_ptr, _device, _handler)		\
+	do {							\
+		(_ptr)->device  = _dev

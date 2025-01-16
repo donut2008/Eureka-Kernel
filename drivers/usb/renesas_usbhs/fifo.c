@@ -1,1497 +1,709 @@
-/*
- * Renesas USB driver
- *
- * Copyright (C) 2011 Renesas Solutions Corp.
- * Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
- *
- */
-#include <linux/delay.h>
-#include <linux/io.h>
-#include <linux/scatterlist.h>
-#include "common.h"
-#include "pipe.h"
-
-#define usbhsf_get_cfifo(p)	(&((p)->fifo_info.cfifo))
-#define usbhsf_is_cfifo(p, f)	(usbhsf_get_cfifo(p) == f)
-
-#define usbhsf_fifo_is_busy(f)	((f)->pipe) /* see usbhs_pipe_select_fifo */
-
-/*
- *		packet initialize
- */
-void usbhs_pkt_init(struct usbhs_pkt *pkt)
-{
-	INIT_LIST_HEAD(&pkt->node);
-}
-
-/*
- *		packet control function
- */
-static int usbhsf_null_handle(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pkt->pipe);
-	struct device *dev = usbhs_priv_to_dev(priv);
-
-	dev_err(dev, "null handler\n");
-
-	return -EINVAL;
-}
-
-static struct usbhs_pkt_handle usbhsf_null_handler = {
-	.prepare = usbhsf_null_handle,
-	.try_run = usbhsf_null_handle,
-};
-
-void usbhs_pkt_push(struct usbhs_pipe *pipe, struct usbhs_pkt *pkt,
-		    void (*done)(struct usbhs_priv *priv,
-				 struct usbhs_pkt *pkt),
-		    void *buf, int len, int zero, int sequence)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct device *dev = usbhs_priv_to_dev(priv);
-	unsigned long flags;
-
-	if (!done) {
-		dev_err(dev, "no done function\n");
-		return;
-	}
-
-	/********************  spin lock ********************/
-	usbhs_lock(priv, flags);
-
-	if (!pipe->handler) {
-		dev_err(dev, "no handler function\n");
-		pipe->handler = &usbhsf_null_handler;
-	}
-
-	list_move_tail(&pkt->node, &pipe->list);
-
-	/*
-	 * each pkt must hold own handler.
-	 * because handler might be changed by its situation.
-	 * dma handler -> pio handler.
-	 */
-	pkt->pipe	= pipe;
-	pkt->buf	= buf;
-	pkt->handler	= pipe->handler;
-	pkt->length	= len;
-	pkt->zero	= zero;
-	pkt->actual	= 0;
-	pkt->done	= done;
-	pkt->sequence	= sequence;
-
-	usbhs_unlock(priv, flags);
-	/********************  spin unlock ******************/
-}
-
-static void __usbhsf_pkt_del(struct usbhs_pkt *pkt)
-{
-	list_del_init(&pkt->node);
-}
-
-struct usbhs_pkt *__usbhsf_pkt_get(struct usbhs_pipe *pipe)
-{
-	if (list_empty(&pipe->list))
-		return NULL;
-
-	return list_first_entry(&pipe->list, struct usbhs_pkt, node);
-}
-
-static void usbhsf_fifo_clear(struct usbhs_pipe *pipe,
-			      struct usbhs_fifo *fifo);
-static void usbhsf_fifo_unselect(struct usbhs_pipe *pipe,
-				 struct usbhs_fifo *fifo);
-static struct dma_chan *usbhsf_dma_chan_get(struct usbhs_fifo *fifo,
-					    struct usbhs_pkt *pkt);
-#define usbhsf_dma_map(p)	__usbhsf_dma_map_ctrl(p, 1)
-#define usbhsf_dma_unmap(p)	__usbhsf_dma_map_ctrl(p, 0)
-static int __usbhsf_dma_map_ctrl(struct usbhs_pkt *pkt, int map);
-static void usbhsf_tx_irq_ctrl(struct usbhs_pipe *pipe, int enable);
-static void usbhsf_rx_irq_ctrl(struct usbhs_pipe *pipe, int enable);
-struct usbhs_pkt *usbhs_pkt_pop(struct usbhs_pipe *pipe, struct usbhs_pkt *pkt)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo = usbhs_pipe_to_fifo(pipe);
-	unsigned long flags;
-
-	/********************  spin lock ********************/
-	usbhs_lock(priv, flags);
-
-	usbhs_pipe_disable(pipe);
-
-	if (!pkt)
-		pkt = __usbhsf_pkt_get(pipe);
-
-	if (pkt) {
-		struct dma_chan *chan = NULL;
-
-		if (fifo)
-			chan = usbhsf_dma_chan_get(fifo, pkt);
-		if (chan) {
-			dmaengine_terminate_all(chan);
-			usbhsf_fifo_clear(pipe, fifo);
-			usbhsf_dma_unmap(pkt);
-		} else {
-			if (usbhs_pipe_is_dir_in(pipe))
-				usbhsf_rx_irq_ctrl(pipe, 0);
-			else
-				usbhsf_tx_irq_ctrl(pipe, 0);
-		}
-
-		usbhs_pipe_running(pipe, 0);
-
-		__usbhsf_pkt_del(pkt);
-	}
-
-	if (fifo)
-		usbhsf_fifo_unselect(pipe, fifo);
-
-	usbhs_unlock(priv, flags);
-	/********************  spin unlock ******************/
-
-	return pkt;
-}
-
-enum {
-	USBHSF_PKT_PREPARE,
-	USBHSF_PKT_TRY_RUN,
-	USBHSF_PKT_DMA_DONE,
-};
-
-static int usbhsf_pkt_handler(struct usbhs_pipe *pipe, int type)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_pkt *pkt;
-	struct device *dev = usbhs_priv_to_dev(priv);
-	int (*func)(struct usbhs_pkt *pkt, int *is_done);
-	unsigned long flags;
-	int ret = 0;
-	int is_done = 0;
-
-	/********************  spin lock ********************/
-	usbhs_lock(priv, flags);
-
-	pkt = __usbhsf_pkt_get(pipe);
-	if (!pkt)
-		goto __usbhs_pkt_handler_end;
-
-	switch (type) {
-	case USBHSF_PKT_PREPARE:
-		func = pkt->handler->prepare;
-		break;
-	case USBHSF_PKT_TRY_RUN:
-		func = pkt->handler->try_run;
-		break;
-	case USBHSF_PKT_DMA_DONE:
-		func = pkt->handler->dma_done;
-		break;
-	default:
-		dev_err(dev, "unknown pkt handler\n");
-		goto __usbhs_pkt_handler_end;
-	}
-
-	if (likely(func))
-		ret = func(pkt, &is_done);
-
-	if (is_done)
-		__usbhsf_pkt_del(pkt);
-
-__usbhs_pkt_handler_end:
-	usbhs_unlock(priv, flags);
-	/********************  spin unlock ******************/
-
-	if (is_done) {
-		pkt->done(priv, pkt);
-		usbhs_pkt_start(pipe);
-	}
-
-	return ret;
-}
-
-void usbhs_pkt_start(struct usbhs_pipe *pipe)
-{
-	usbhsf_pkt_handler(pipe, USBHSF_PKT_PREPARE);
-}
-
-/*
- *		irq enable/disable function
- */
-#define usbhsf_irq_empty_ctrl(p, e) usbhsf_irq_callback_ctrl(p, irq_bempsts, e)
-#define usbhsf_irq_ready_ctrl(p, e) usbhsf_irq_callback_ctrl(p, irq_brdysts, e)
-#define usbhsf_irq_callback_ctrl(pipe, status, enable)			\
-	({								\
-		struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);	\
-		struct usbhs_mod *mod = usbhs_mod_get_current(priv);	\
-		u16 status = (1 << usbhs_pipe_number(pipe));		\
-		if (!mod)						\
-			return;						\
-		if (enable)						\
-			mod->status |= status;				\
-		else							\
-			mod->status &= ~status;				\
-		usbhs_irq_callback_update(priv, mod);			\
-	})
-
-static void usbhsf_tx_irq_ctrl(struct usbhs_pipe *pipe, int enable)
-{
-	/*
-	 * And DCP pipe can NOT use "ready interrupt" for "send"
-	 * it should use "empty" interrupt.
-	 * see
-	 *   "Operation" - "Interrupt Function" - "BRDY Interrupt"
-	 *
-	 * on the other hand, normal pipe can use "ready interrupt" for "send"
-	 * even though it is single/double buffer
-	 */
-	if (usbhs_pipe_is_dcp(pipe))
-		usbhsf_irq_empty_ctrl(pipe, enable);
-	else
-		usbhsf_irq_ready_ctrl(pipe, enable);
-}
-
-static void usbhsf_rx_irq_ctrl(struct usbhs_pipe *pipe, int enable)
-{
-	usbhsf_irq_ready_ctrl(pipe, enable);
-}
-
-/*
- *		FIFO ctrl
- */
-static void usbhsf_send_terminator(struct usbhs_pipe *pipe,
-				   struct usbhs_fifo *fifo)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-
-	usbhs_bset(priv, fifo->ctr, BVAL, BVAL);
-}
-
-static int usbhsf_fifo_barrier(struct usbhs_priv *priv,
-			       struct usbhs_fifo *fifo)
-{
-	int timeout = 1024;
-
-	do {
-		/* The FIFO port is accessible */
-		if (usbhs_read(priv, fifo->ctr) & FRDY)
-			return 0;
-
-		udelay(10);
-	} while (timeout--);
-
-	return -EBUSY;
-}
-
-static void usbhsf_fifo_clear(struct usbhs_pipe *pipe,
-			      struct usbhs_fifo *fifo)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	int ret = 0;
-
-	if (!usbhs_pipe_is_dcp(pipe)) {
-		/*
-		 * This driver checks the pipe condition first to avoid -EBUSY
-		 * from usbhsf_fifo_barrier() with about 10 msec delay in
-		 * the interrupt handler if the pipe is RX direction and empty.
-		 */
-		if (usbhs_pipe_is_dir_in(pipe))
-			ret = usbhs_pipe_is_accessible(pipe);
-		if (!ret)
-			ret = usbhsf_fifo_barrier(priv, fifo);
-	}
-
-	/*
-	 * if non-DCP pipe, this driver should set BCLR when
-	 * usbhsf_fifo_barrier() returns 0.
-	 */
-	if (!ret)
-		usbhs_write(priv, fifo->ctr, BCLR);
-}
-
-static int usbhsf_fifo_rcv_len(struct usbhs_priv *priv,
-			       struct usbhs_fifo *fifo)
-{
-	return usbhs_read(priv, fifo->ctr) & DTLN_MASK;
-}
-
-static void usbhsf_fifo_unselect(struct usbhs_pipe *pipe,
-				 struct usbhs_fifo *fifo)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-
-	usbhs_pipe_select_fifo(pipe, NULL);
-	usbhs_write(priv, fifo->sel, 0);
-}
-
-static int usbhsf_fifo_select(struct usbhs_pipe *pipe,
-			      struct usbhs_fifo *fifo,
-			      int write)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct device *dev = usbhs_priv_to_dev(priv);
-	int timeout = 1024;
-	u16 mask = ((1 << 5) | 0xF);		/* mask of ISEL | CURPIPE */
-	u16 base = usbhs_pipe_number(pipe);	/* CURPIPE */
-
-	if (usbhs_pipe_is_busy(pipe) ||
-	    usbhsf_fifo_is_busy(fifo))
-		return -EBUSY;
-
-	if (usbhs_pipe_is_dcp(pipe)) {
-		base |= (1 == write) << 5;	/* ISEL */
-
-		if (usbhs_mod_is_host(priv))
-			usbhs_dcp_dir_for_host(pipe, write);
-	}
-
-	/* "base" will be used below  */
-	if (usbhs_get_dparam(priv, has_sudmac) && !usbhsf_is_cfifo(priv, fifo))
-		usbhs_write(priv, fifo->sel, base);
-	else
-		usbhs_write(priv, fifo->sel, base | MBW_32);
-
-	/* check ISEL and CURPIPE value */
-	while (timeout--) {
-		if (base == (mask & usbhs_read(priv, fifo->sel))) {
-			usbhs_pipe_select_fifo(pipe, fifo);
-			return 0;
-		}
-		udelay(10);
-	}
-
-	dev_err(dev, "fifo select error\n");
-
-	return -EIO;
-}
-
-/*
- *		DCP status stage
- */
-static int usbhs_dcp_dir_switch_to_write(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo = usbhsf_get_cfifo(priv); /* CFIFO */
-	struct device *dev = usbhs_priv_to_dev(priv);
-	int ret;
-
-	usbhs_pipe_disable(pipe);
-
-	ret = usbhsf_fifo_select(pipe, fifo, 1);
-	if (ret < 0) {
-		dev_err(dev, "%s() faile\n", __func__);
-		return ret;
-	}
-
-	usbhs_pipe_sequence_data1(pipe); /* DATA1 */
-
-	usbhsf_fifo_clear(pipe, fifo);
-	usbhsf_send_terminator(pipe, fifo);
-
-	usbhsf_fifo_unselect(pipe, fifo);
-
-	usbhsf_tx_irq_ctrl(pipe, 1);
-	usbhs_pipe_enable(pipe);
-
-	return ret;
-}
-
-static int usbhs_dcp_dir_switch_to_read(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo = usbhsf_get_cfifo(priv); /* CFIFO */
-	struct device *dev = usbhs_priv_to_dev(priv);
-	int ret;
-
-	usbhs_pipe_disable(pipe);
-
-	ret = usbhsf_fifo_select(pipe, fifo, 0);
-	if (ret < 0) {
-		dev_err(dev, "%s() fail\n", __func__);
-		return ret;
-	}
-
-	usbhs_pipe_sequence_data1(pipe); /* DATA1 */
-	usbhsf_fifo_clear(pipe, fifo);
-
-	usbhsf_fifo_unselect(pipe, fifo);
-
-	usbhsf_rx_irq_ctrl(pipe, 1);
-	usbhs_pipe_enable(pipe);
-
-	return ret;
-
-}
-
-static int usbhs_dcp_dir_switch_done(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-
-	if (pkt->handler == &usbhs_dcp_status_stage_in_handler)
-		usbhsf_tx_irq_ctrl(pipe, 0);
-	else
-		usbhsf_rx_irq_ctrl(pipe, 0);
-
-	pkt->actual = pkt->length;
-	*is_done = 1;
-
-	return 0;
-}
-
-struct usbhs_pkt_handle usbhs_dcp_status_stage_in_handler = {
-	.prepare = usbhs_dcp_dir_switch_to_write,
-	.try_run = usbhs_dcp_dir_switch_done,
-};
-
-struct usbhs_pkt_handle usbhs_dcp_status_stage_out_handler = {
-	.prepare = usbhs_dcp_dir_switch_to_read,
-	.try_run = usbhs_dcp_dir_switch_done,
-};
-
-/*
- *		DCP data stage (push)
- */
-static int usbhsf_dcp_data_stage_try_push(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-
-	usbhs_pipe_sequence_data1(pipe); /* DATA1 */
-
-	/*
-	 * change handler to PIO push
-	 */
-	pkt->handler = &usbhs_fifo_pio_push_handler;
-
-	return pkt->handler->prepare(pkt, is_done);
-}
-
-struct usbhs_pkt_handle usbhs_dcp_data_stage_out_handler = {
-	.prepare = usbhsf_dcp_data_stage_try_push,
-};
-
-/*
- *		DCP data stage (pop)
- */
-static int usbhsf_dcp_data_stage_prepare_pop(struct usbhs_pkt *pkt,
-					     int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo = usbhsf_get_cfifo(priv);
-
-	if (usbhs_pipe_is_busy(pipe))
-		return 0;
-
-	/*
-	 * prepare pop for DCP should
-	 *  - change DCP direction,
-	 *  - clear fifo
-	 *  - DATA1
-	 */
-	usbhs_pipe_disable(pipe);
-
-	usbhs_pipe_sequence_data1(pipe); /* DATA1 */
-
-	usbhsf_fifo_select(pipe, fifo, 0);
-	usbhsf_fifo_clear(pipe, fifo);
-	usbhsf_fifo_unselect(pipe, fifo);
-
-	/*
-	 * change handler to PIO pop
-	 */
-	pkt->handler = &usbhs_fifo_pio_pop_handler;
-
-	return pkt->handler->prepare(pkt, is_done);
-}
-
-struct usbhs_pkt_handle usbhs_dcp_data_stage_in_handler = {
-	.prepare = usbhsf_dcp_data_stage_prepare_pop,
-};
-
-/*
- *		PIO push handler
- */
-static int usbhsf_pio_try_push(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct device *dev = usbhs_priv_to_dev(priv);
-	struct usbhs_fifo *fifo = usbhsf_get_cfifo(priv); /* CFIFO */
-	void __iomem *addr = priv->base + fifo->port;
-	u8 *buf;
-	int maxp = usbhs_pipe_get_maxpacket(pipe);
-	int total_len;
-	int i, ret, len;
-	int is_short;
-
-	usbhs_pipe_data_sequence(pipe, pkt->sequence);
-	pkt->sequence = -1; /* -1 sequence will be ignored */
-
-	usbhs_pipe_set_trans_count_if_bulk(pipe, pkt->length);
-
-	ret = usbhsf_fifo_select(pipe, fifo, 1);
-	if (ret < 0)
-		return 0;
-
-	ret = usbhs_pipe_is_accessible(pipe);
-	if (ret < 0) {
-		/* inaccessible pipe is not an error */
-		ret = 0;
-		goto usbhs_fifo_write_busy;
-	}
-
-	ret = usbhsf_fifo_barrier(priv, fifo);
-	if (ret < 0)
-		goto usbhs_fifo_write_busy;
-
-	buf		= pkt->buf    + pkt->actual;
-	len		= pkt->length - pkt->actual;
-	len		= min(len, maxp);
-	total_len	= len;
-	is_short	= total_len < maxp;
-
-	/*
-	 * FIXME
-	 *
-	 * 32-bit access only
-	 */
-	if (len >= 4 && !((unsigned long)buf & 0x03)) {
-		iowrite32_rep(addr, buf, len / 4);
-		len %= 4;
-		buf += total_len - len;
-	}
-
-	/* the rest operation */
-	for (i = 0; i < len; i++)
-		iowrite8(buf[i], addr + (0x03 - (i & 0x03)));
-
-	/*
-	 * variable update
-	 */
-	pkt->actual += total_len;
-
-	if (pkt->actual < pkt->length)
-		*is_done = 0;		/* there are remainder data */
-	else if (is_short)
-		*is_done = 1;		/* short packet */
-	else
-		*is_done = !pkt->zero;	/* send zero packet ? */
-
-	/*
-	 * pipe/irq handling
-	 */
-	if (is_short)
-		usbhsf_send_terminator(pipe, fifo);
-
-	usbhsf_tx_irq_ctrl(pipe, !*is_done);
-	usbhs_pipe_running(pipe, !*is_done);
-	usbhs_pipe_enable(pipe);
-
-	dev_dbg(dev, "  send %d (%d/ %d/ %d/ %d)\n",
-		usbhs_pipe_number(pipe),
-		pkt->length, pkt->actual, *is_done, pkt->zero);
-
-	usbhsf_fifo_unselect(pipe, fifo);
-
-	return 0;
-
-usbhs_fifo_write_busy:
-	usbhsf_fifo_unselect(pipe, fifo);
-
-	/*
-	 * pipe is busy.
-	 * retry in interrupt
-	 */
-	usbhsf_tx_irq_ctrl(pipe, 1);
-	usbhs_pipe_running(pipe, 1);
-
-	return ret;
-}
-
-static int usbhsf_pio_prepare_push(struct usbhs_pkt *pkt, int *is_done)
-{
-	if (usbhs_pipe_is_running(pkt->pipe))
-		return 0;
-
-	return usbhsf_pio_try_push(pkt, is_done);
-}
-
-struct usbhs_pkt_handle usbhs_fifo_pio_push_handler = {
-	.prepare = usbhsf_pio_prepare_push,
-	.try_run = usbhsf_pio_try_push,
-};
-
-/*
- *		PIO pop handler
- */
-static int usbhsf_prepare_pop(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo = usbhsf_get_cfifo(priv);
-
-	if (usbhs_pipe_is_busy(pipe))
-		return 0;
-
-	if (usbhs_pipe_is_running(pipe))
-		return 0;
-
-	/*
-	 * pipe enable to prepare packet receive
-	 */
-	usbhs_pipe_data_sequence(pipe, pkt->sequence);
-	pkt->sequence = -1; /* -1 sequence will be ignored */
-
-	if (usbhs_pipe_is_dcp(pipe))
-		usbhsf_fifo_clear(pipe, fifo);
-
-	usbhs_pipe_set_trans_count_if_bulk(pipe, pkt->length);
-	usbhs_pipe_enable(pipe);
-	usbhs_pipe_running(pipe, 1);
-	usbhsf_rx_irq_ctrl(pipe, 1);
-
-	return 0;
-}
-
-static int usbhsf_pio_try_pop(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct device *dev = usbhs_priv_to_dev(priv);
-	struct usbhs_fifo *fifo = usbhsf_get_cfifo(priv); /* CFIFO */
-	void __iomem *addr = priv->base + fifo->port;
-	u8 *buf;
-	u32 data = 0;
-	int maxp = usbhs_pipe_get_maxpacket(pipe);
-	int rcv_len, len;
-	int i, ret;
-	int total_len = 0;
-
-	ret = usbhsf_fifo_select(pipe, fifo, 0);
-	if (ret < 0)
-		return 0;
-
-	ret = usbhsf_fifo_barrier(priv, fifo);
-	if (ret < 0)
-		goto usbhs_fifo_read_busy;
-
-	rcv_len = usbhsf_fifo_rcv_len(priv, fifo);
-
-	buf		= pkt->buf    + pkt->actual;
-	len		= pkt->length - pkt->actual;
-	len		= min(len, rcv_len);
-	total_len	= len;
-
-	/*
-	 * update actual length first here to decide disable pipe.
-	 * if this pipe keeps BUF status and all data were popped,
-	 * then, next interrupt/token will be issued again
-	 */
-	pkt->actual += total_len;
-
-	if ((pkt->actual == pkt->length) ||	/* receive all data */
-	    (total_len < maxp)) {		/* short packet */
-		*is_done = 1;
-		usbhsf_rx_irq_ctrl(pipe, 0);
-		usbhs_pipe_running(pipe, 0);
-		/*
-		 * If function mode, since this controller is possible to enter
-		 * Control Write status stage at this timing, this driver
-		 * should not disable the pipe. If such a case happens, this
-		 * controller is not able to complete the status stage.
-		 */
-		if (!usbhs_mod_is_host(priv) && !usbhs_pipe_is_dcp(pipe))
-			usbhs_pipe_disable(pipe);	/* disable pipe first */
-	}
-
-	/*
-	 * Buffer clear if Zero-Length packet
-	 *
-	 * see
-	 * "Operation" - "FIFO Buffer Memory" - "FIFO Port Function"
-	 */
-	if (0 == rcv_len) {
-		pkt->zero = 1;
-		usbhsf_fifo_clear(pipe, fifo);
-		goto usbhs_fifo_read_end;
-	}
-
-	/*
-	 * FIXME
-	 *
-	 * 32-bit access only
-	 */
-	if (len >= 4 && !((unsigned long)buf & 0x03)) {
-		ioread32_rep(addr, buf, len / 4);
-		len %= 4;
-		buf += total_len - len;
-	}
-
-	/* the rest operation */
-	for (i = 0; i < len; i++) {
-		if (!(i & 0x03))
-			data = ioread32(addr);
-
-		buf[i] = (data >> ((i & 0x03) * 8)) & 0xff;
-	}
-
-usbhs_fifo_read_end:
-	dev_dbg(dev, "  recv %d (%d/ %d/ %d/ %d)\n",
-		usbhs_pipe_number(pipe),
-		pkt->length, pkt->actual, *is_done, pkt->zero);
-
-usbhs_fifo_read_busy:
-	usbhsf_fifo_unselect(pipe, fifo);
-
-	return ret;
-}
-
-struct usbhs_pkt_handle usbhs_fifo_pio_pop_handler = {
-	.prepare = usbhsf_prepare_pop,
-	.try_run = usbhsf_pio_try_pop,
-};
-
-/*
- *		DCP ctrol statge handler
- */
-static int usbhsf_ctrl_stage_end(struct usbhs_pkt *pkt, int *is_done)
-{
-	usbhs_dcp_control_transfer_done(pkt->pipe);
-
-	*is_done = 1;
-
-	return 0;
-}
-
-struct usbhs_pkt_handle usbhs_ctrl_stage_end_handler = {
-	.prepare = usbhsf_ctrl_stage_end,
-	.try_run = usbhsf_ctrl_stage_end,
-};
-
-/*
- *		DMA fifo functions
- */
-static struct dma_chan *usbhsf_dma_chan_get(struct usbhs_fifo *fifo,
-					    struct usbhs_pkt *pkt)
-{
-	if (&usbhs_fifo_dma_push_handler == pkt->handler)
-		return fifo->tx_chan;
-
-	if (&usbhs_fifo_dma_pop_handler == pkt->handler)
-		return fifo->rx_chan;
-
-	return NULL;
-}
-
-static struct usbhs_fifo *usbhsf_get_dma_fifo(struct usbhs_priv *priv,
-					      struct usbhs_pkt *pkt)
-{
-	struct usbhs_fifo *fifo;
-	int i;
-
-	usbhs_for_each_dfifo(priv, fifo, i) {
-		if (usbhsf_dma_chan_get(fifo, pkt) &&
-		    !usbhsf_fifo_is_busy(fifo))
-			return fifo;
-	}
-
-	return NULL;
-}
-
-#define usbhsf_dma_start(p, f)	__usbhsf_dma_ctrl(p, f, DREQE)
-#define usbhsf_dma_stop(p, f)	__usbhsf_dma_ctrl(p, f, 0)
-static void __usbhsf_dma_ctrl(struct usbhs_pipe *pipe,
-			      struct usbhs_fifo *fifo,
-			      u16 dreqe)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-
-	usbhs_bset(priv, fifo->sel, DREQE, dreqe);
-}
-
-static int __usbhsf_dma_map_ctrl(struct usbhs_pkt *pkt, int map)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_pipe_info *info = usbhs_priv_to_pipeinfo(priv);
-
-	return info->dma_map_ctrl(pkt, map);
-}
-
-static void usbhsf_dma_complete(void *arg);
-static void usbhsf_dma_xfer_preparing(struct usbhs_pkt *pkt)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_fifo *fifo;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct dma_async_tx_descriptor *desc;
-	struct dma_chan *chan;
-	struct device *dev = usbhs_priv_to_dev(priv);
-	enum dma_transfer_direction dir;
-
-	fifo = usbhs_pipe_to_fifo(pipe);
-	if (!fifo)
-		return;
-
-	chan = usbhsf_dma_chan_get(fifo, pkt);
-	dir = usbhs_pipe_is_dir_in(pipe) ? DMA_DEV_TO_MEM : DMA_MEM_TO_DEV;
-
-	desc = dmaengine_prep_slave_single(chan, pkt->dma + pkt->actual,
-					pkt->trans, dir,
-					DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
-	if (!desc)
-		return;
-
-	desc->callback		= usbhsf_dma_complete;
-	desc->callback_param	= pipe;
-
-	pkt->cookie = dmaengine_submit(desc);
-	if (pkt->cookie < 0) {
-		dev_err(dev, "Failed to submit dma descriptor\n");
-		return;
-	}
-
-	dev_dbg(dev, "  %s %d (%d/ %d)\n",
-		fifo->name, usbhs_pipe_number(pipe), pkt->length, pkt->zero);
-
-	usbhs_pipe_running(pipe, 1);
-	usbhs_pipe_set_trans_count_if_bulk(pipe, pkt->trans);
-	dma_async_issue_pending(chan);
-	usbhsf_dma_start(pipe, fifo);
-	usbhs_pipe_enable(pipe);
-}
-
-static void xfer_work(struct work_struct *work)
-{
-	struct usbhs_pkt *pkt = container_of(work, struct usbhs_pkt, work);
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	unsigned long flags;
-
-	usbhs_lock(priv, flags);
-	usbhsf_dma_xfer_preparing(pkt);
-	usbhs_unlock(priv, flags);
-}
-
-/*
- *		DMA push handler
- */
-static int usbhsf_dma_prepare_push(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo;
-	int len = pkt->length - pkt->actual;
-	int ret;
-	uintptr_t align_mask;
-
-	if (usbhs_pipe_is_busy(pipe))
-		return 0;
-
-	/* use PIO if packet is less than pio_dma_border or pipe is DCP */
-	if ((len < usbhs_get_dparam(priv, pio_dma_border)) ||
-	    usbhs_pipe_type_is(pipe, USB_ENDPOINT_XFER_ISOC))
-		goto usbhsf_pio_prepare_push;
-
-	/* check data length if this driver don't use USB-DMAC */
-	if (!usbhs_get_dparam(priv, has_usb_dmac) && len & 0x7)
-		goto usbhsf_pio_prepare_push;
-
-	/* check buffer alignment */
-	align_mask = usbhs_get_dparam(priv, has_usb_dmac) ?
-					USBHS_USB_DMAC_XFER_SIZE - 1 : 0x7;
-	if ((uintptr_t)(pkt->buf + pkt->actual) & align_mask)
-		goto usbhsf_pio_prepare_push;
-
-	/* return at this time if the pipe is running */
-	if (usbhs_pipe_is_running(pipe))
-		return 0;
-
-	/* get enable DMA fifo */
-	fifo = usbhsf_get_dma_fifo(priv, pkt);
-	if (!fifo)
-		goto usbhsf_pio_prepare_push;
-
-	if (usbhsf_dma_map(pkt) < 0)
-		goto usbhsf_pio_prepare_push;
-
-	ret = usbhsf_fifo_select(pipe, fifo, 0);
-	if (ret < 0)
-		goto usbhsf_pio_prepare_push_unmap;
-
-	pkt->trans = len;
-
-	usbhsf_tx_irq_ctrl(pipe, 0);
-	/* FIXME: Workaound for usb dmac that driver can be used in atomic */
-	if (usbhs_get_dparam(priv, has_usb_dmac)) {
-		usbhsf_dma_xfer_preparing(pkt);
-	} else {
-		INIT_WORK(&pkt->work, xfer_work);
-		schedule_work(&pkt->work);
-	}
-
-	return 0;
-
-usbhsf_pio_prepare_push_unmap:
-	usbhsf_dma_unmap(pkt);
-usbhsf_pio_prepare_push:
-	/*
-	 * change handler to PIO
-	 */
-	pkt->handler = &usbhs_fifo_pio_push_handler;
-
-	return pkt->handler->prepare(pkt, is_done);
-}
-
-static int usbhsf_dma_push_done(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	int is_short = pkt->trans % usbhs_pipe_get_maxpacket(pipe);
-
-	pkt->actual += pkt->trans;
-
-	if (pkt->actual < pkt->length)
-		*is_done = 0;		/* there are remainder data */
-	else if (is_short)
-		*is_done = 1;		/* short packet */
-	else
-		*is_done = !pkt->zero;	/* send zero packet? */
-
-	usbhs_pipe_running(pipe, !*is_done);
-
-	usbhsf_dma_stop(pipe, pipe->fifo);
-	usbhsf_dma_unmap(pkt);
-	usbhsf_fifo_unselect(pipe, pipe->fifo);
-
-	if (!*is_done) {
-		/* change handler to PIO */
-		pkt->handler = &usbhs_fifo_pio_push_handler;
-		return pkt->handler->try_run(pkt, is_done);
-	}
-
-	return 0;
-}
-
-struct usbhs_pkt_handle usbhs_fifo_dma_push_handler = {
-	.prepare	= usbhsf_dma_prepare_push,
-	.dma_done	= usbhsf_dma_push_done,
-};
-
-/*
- *		DMA pop handler
- */
-
-static int usbhsf_dma_prepare_pop_with_rx_irq(struct usbhs_pkt *pkt,
-					      int *is_done)
-{
-	return usbhsf_prepare_pop(pkt, is_done);
-}
-
-static int usbhsf_dma_prepare_pop_with_usb_dmac(struct usbhs_pkt *pkt,
-						int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo;
-	int ret;
-
-	if (usbhs_pipe_is_busy(pipe))
-		return 0;
-
-	/* use PIO if packet is less than pio_dma_border or pipe is DCP */
-	if ((pkt->length < usbhs_get_dparam(priv, pio_dma_border)) ||
-	    usbhs_pipe_type_is(pipe, USB_ENDPOINT_XFER_ISOC))
-		goto usbhsf_pio_prepare_pop;
-
-	fifo = usbhsf_get_dma_fifo(priv, pkt);
-	if (!fifo)
-		goto usbhsf_pio_prepare_pop;
-
-	if ((uintptr_t)pkt->buf & (USBHS_USB_DMAC_XFER_SIZE - 1))
-		goto usbhsf_pio_prepare_pop;
-
-	/* return at this time if the pipe is running */
-	if (usbhs_pipe_is_running(pipe))
-		return 0;
-
-	usbhs_pipe_config_change_bfre(pipe, 1);
-
-	ret = usbhsf_fifo_select(pipe, fifo, 0);
-	if (ret < 0)
-		goto usbhsf_pio_prepare_pop;
-
-	if (usbhsf_dma_map(pkt) < 0)
-		goto usbhsf_pio_prepare_pop_unselect;
-
-	/* DMA */
-
-	/*
-	 * usbhs_fifo_dma_pop_handler :: prepare
-	 * enabled irq to come here.
-	 * but it is no longer needed for DMA. disable it.
-	 */
-	usbhsf_rx_irq_ctrl(pipe, 0);
-
-	pkt->trans = pkt->length;
-
-	usbhsf_dma_xfer_preparing(pkt);
-
-	return 0;
-
-usbhsf_pio_prepare_pop_unselect:
-	usbhsf_fifo_unselect(pipe, fifo);
-usbhsf_pio_prepare_pop:
-
-	/*
-	 * change handler to PIO
-	 */
-	pkt->handler = &usbhs_fifo_pio_pop_handler;
-	usbhs_pipe_config_change_bfre(pipe, 0);
-
-	return pkt->handler->prepare(pkt, is_done);
-}
-
-static int usbhsf_dma_prepare_pop(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pkt->pipe);
-
-	if (usbhs_get_dparam(priv, has_usb_dmac))
-		return usbhsf_dma_prepare_pop_with_usb_dmac(pkt, is_done);
-	else
-		return usbhsf_dma_prepare_pop_with_rx_irq(pkt, is_done);
-}
-
-static int usbhsf_dma_try_pop_with_rx_irq(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo;
-	int len, ret;
-
-	if (usbhs_pipe_is_busy(pipe))
-		return 0;
-
-	if (usbhs_pipe_is_dcp(pipe))
-		goto usbhsf_pio_prepare_pop;
-
-	/* get enable DMA fifo */
-	fifo = usbhsf_get_dma_fifo(priv, pkt);
-	if (!fifo)
-		goto usbhsf_pio_prepare_pop;
-
-	if ((uintptr_t)(pkt->buf + pkt->actual) & 0x7) /* 8byte alignment */
-		goto usbhsf_pio_prepare_pop;
-
-	ret = usbhsf_fifo_select(pipe, fifo, 0);
-	if (ret < 0)
-		goto usbhsf_pio_prepare_pop;
-
-	/* use PIO if packet is less than pio_dma_border */
-	len = usbhsf_fifo_rcv_len(priv, fifo);
-	len = min(pkt->length - pkt->actual, len);
-	if (len & 0x7) /* 8byte alignment */
-		goto usbhsf_pio_prepare_pop_unselect;
-
-	if (len < usbhs_get_dparam(priv, pio_dma_border))
-		goto usbhsf_pio_prepare_pop_unselect;
-
-	ret = usbhsf_fifo_barrier(priv, fifo);
-	if (ret < 0)
-		goto usbhsf_pio_prepare_pop_unselect;
-
-	if (usbhsf_dma_map(pkt) < 0)
-		goto usbhsf_pio_prepare_pop_unselect;
-
-	/* DMA */
-
-	/*
-	 * usbhs_fifo_dma_pop_handler :: prepare
-	 * enabled irq to come here.
-	 * but it is no longer needed for DMA. disable it.
-	 */
-	usbhsf_rx_irq_ctrl(pipe, 0);
-
-	pkt->trans = len;
-
-	INIT_WORK(&pkt->work, xfer_work);
-	schedule_work(&pkt->work);
-
-	return 0;
-
-usbhsf_pio_prepare_pop_unselect:
-	usbhsf_fifo_unselect(pipe, fifo);
-usbhsf_pio_prepare_pop:
-
-	/*
-	 * change handler to PIO
-	 */
-	pkt->handler = &usbhs_fifo_pio_pop_handler;
-
-	return pkt->handler->try_run(pkt, is_done);
-}
-
-static int usbhsf_dma_try_pop(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pkt->pipe);
-
-	BUG_ON(usbhs_get_dparam(priv, has_usb_dmac));
-
-	return usbhsf_dma_try_pop_with_rx_irq(pkt, is_done);
-}
-
-static int usbhsf_dma_pop_done_with_rx_irq(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	int maxp = usbhs_pipe_get_maxpacket(pipe);
-
-	usbhsf_dma_stop(pipe, pipe->fifo);
-	usbhsf_dma_unmap(pkt);
-	usbhsf_fifo_unselect(pipe, pipe->fifo);
-
-	pkt->actual += pkt->trans;
-
-	if ((pkt->actual == pkt->length) ||	/* receive all data */
-	    (pkt->trans < maxp)) {		/* short packet */
-		*is_done = 1;
-		usbhs_pipe_running(pipe, 0);
-	} else {
-		/* re-enable */
-		usbhs_pipe_running(pipe, 0);
-		usbhsf_prepare_pop(pkt, is_done);
-	}
-
-	return 0;
-}
-
-static size_t usbhs_dma_calc_received_size(struct usbhs_pkt *pkt,
-					   struct dma_chan *chan, int dtln)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct dma_tx_state state;
-	size_t received_size;
-	int maxp = usbhs_pipe_get_maxpacket(pipe);
-
-	dmaengine_tx_status(chan, pkt->cookie, &state);
-	received_size = pkt->length - state.residue;
-
-	if (dtln) {
-		received_size -= USBHS_USB_DMAC_XFER_SIZE;
-		received_size &= ~(maxp - 1);
-		received_size += dtln;
-	}
-
-	return received_size;
-}
-
-static int usbhsf_dma_pop_done_with_usb_dmac(struct usbhs_pkt *pkt,
-					     int *is_done)
-{
-	struct usbhs_pipe *pipe = pkt->pipe;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo = usbhs_pipe_to_fifo(pipe);
-	struct dma_chan *chan = usbhsf_dma_chan_get(fifo, pkt);
-	int rcv_len;
-
-	/*
-	 * Since the driver disables rx_irq in DMA mode, the interrupt handler
-	 * cannot the BRDYSTS. So, the function clears it here because the
-	 * driver may use PIO mode next time.
-	 */
-	usbhs_xxxsts_clear(priv, BRDYSTS, usbhs_pipe_number(pipe));
-
-	rcv_len = usbhsf_fifo_rcv_len(priv, fifo);
-	usbhsf_fifo_clear(pipe, fifo);
-	pkt->actual = usbhs_dma_calc_received_size(pkt, chan, rcv_len);
-
-	usbhs_pipe_running(pipe, 0);
-	usbhsf_dma_stop(pipe, fifo);
-	usbhsf_dma_unmap(pkt);
-	usbhsf_fifo_unselect(pipe, pipe->fifo);
-
-	/* The driver can assume the rx transaction is always "done" */
-	*is_done = 1;
-
-	return 0;
-}
-
-static int usbhsf_dma_pop_done(struct usbhs_pkt *pkt, int *is_done)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pkt->pipe);
-
-	if (usbhs_get_dparam(priv, has_usb_dmac))
-		return usbhsf_dma_pop_done_with_usb_dmac(pkt, is_done);
-	else
-		return usbhsf_dma_pop_done_with_rx_irq(pkt, is_done);
-}
-
-struct usbhs_pkt_handle usbhs_fifo_dma_pop_handler = {
-	.prepare	= usbhsf_dma_prepare_pop,
-	.try_run	= usbhsf_dma_try_pop,
-	.dma_done	= usbhsf_dma_pop_done
-};
-
-/*
- *		DMA setting
- */
-static bool usbhsf_dma_filter(struct dma_chan *chan, void *param)
-{
-	struct sh_dmae_slave *slave = param;
-
-	/*
-	 * FIXME
-	 *
-	 * usbhs doesn't recognize id = 0 as valid DMA
-	 */
-	if (0 == slave->shdma_slave.slave_id)
-		return false;
-
-	chan->private = slave;
-
-	return true;
-}
-
-static void usbhsf_dma_quit(struct usbhs_priv *priv, struct usbhs_fifo *fifo)
-{
-	if (fifo->tx_chan)
-		dma_release_channel(fifo->tx_chan);
-	if (fifo->rx_chan)
-		dma_release_channel(fifo->rx_chan);
-
-	fifo->tx_chan = NULL;
-	fifo->rx_chan = NULL;
-}
-
-static void usbhsf_dma_init_pdev(struct usbhs_fifo *fifo)
-{
-	dma_cap_mask_t mask;
-
-	dma_cap_zero(mask);
-	dma_cap_set(DMA_SLAVE, mask);
-	fifo->tx_chan = dma_request_channel(mask, usbhsf_dma_filter,
-					    &fifo->tx_slave);
-
-	dma_cap_zero(mask);
-	dma_cap_set(DMA_SLAVE, mask);
-	fifo->rx_chan = dma_request_channel(mask, usbhsf_dma_filter,
-					    &fifo->rx_slave);
-}
-
-static void usbhsf_dma_init_dt(struct device *dev, struct usbhs_fifo *fifo,
-			       int channel)
-{
-	char name[16];
-
-	/*
-	 * To avoid complex handing for DnFIFOs, the driver uses each
-	 * DnFIFO as TX or RX direction (not bi-direction).
-	 * So, the driver uses odd channels for TX, even channels for RX.
-	 */
-	snprintf(name, sizeof(name), "ch%d", channel);
-	if (channel & 1) {
-		fifo->tx_chan = dma_request_slave_channel_reason(dev, name);
-		if (IS_ERR(fifo->tx_chan))
-			fifo->tx_chan = NULL;
-	} else {
-		fifo->rx_chan = dma_request_slave_channel_reason(dev, name);
-		if (IS_ERR(fifo->rx_chan))
-			fifo->rx_chan = NULL;
-	}
-}
-
-static void usbhsf_dma_init(struct usbhs_priv *priv, struct usbhs_fifo *fifo,
-			    int channel)
-{
-	struct device *dev = usbhs_priv_to_dev(priv);
-
-	if (dev->of_node)
-		usbhsf_dma_init_dt(dev, fifo, channel);
-	else
-		usbhsf_dma_init_pdev(fifo);
-
-	if (fifo->tx_chan || fifo->rx_chan)
-		dev_dbg(dev, "enable DMAEngine (%s%s%s)\n",
-			 fifo->name,
-			 fifo->tx_chan ? "[TX]" : "    ",
-			 fifo->rx_chan ? "[RX]" : "    ");
-}
-
-/*
- *		irq functions
- */
-static int usbhsf_irq_empty(struct usbhs_priv *priv,
-			    struct usbhs_irq_state *irq_state)
-{
-	struct usbhs_pipe *pipe;
-	struct device *dev = usbhs_priv_to_dev(priv);
-	int i, ret;
-
-	if (!irq_state->bempsts) {
-		dev_err(dev, "debug %s !!\n", __func__);
-		return -EIO;
-	}
-
-	dev_dbg(dev, "irq empty [0x%04x]\n", irq_state->bempsts);
-
-	/*
-	 * search interrupted "pipe"
-	 * not "uep".
-	 */
-	usbhs_for_each_pipe_with_dcp(pipe, priv, i) {
-		if (!(irq_state->bempsts & (1 << i)))
-			continue;
-
-		ret = usbhsf_pkt_handler(pipe, USBHSF_PKT_TRY_RUN);
-		if (ret < 0)
-			dev_err(dev, "irq_empty run_error %d : %d\n", i, ret);
-	}
-
-	return 0;
-}
-
-static int usbhsf_irq_ready(struct usbhs_priv *priv,
-			    struct usbhs_irq_state *irq_state)
-{
-	struct usbhs_pipe *pipe;
-	struct device *dev = usbhs_priv_to_dev(priv);
-	int i, ret;
-
-	if (!irq_state->brdysts) {
-		dev_err(dev, "debug %s !!\n", __func__);
-		return -EIO;
-	}
-
-	dev_dbg(dev, "irq ready [0x%04x]\n", irq_state->brdysts);
-
-	/*
-	 * search interrupted "pipe"
-	 * not "uep".
-	 */
-	usbhs_for_each_pipe_with_dcp(pipe, priv, i) {
-		if (!(irq_state->brdysts & (1 << i)))
-			continue;
-
-		ret = usbhsf_pkt_handler(pipe, USBHSF_PKT_TRY_RUN);
-		if (ret < 0)
-			dev_err(dev, "irq_ready run_error %d : %d\n", i, ret);
-	}
-
-	return 0;
-}
-
-static void usbhsf_dma_complete(void *arg)
-{
-	struct usbhs_pipe *pipe = arg;
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct device *dev = usbhs_priv_to_dev(priv);
-	int ret;
-
-	ret = usbhsf_pkt_handler(pipe, USBHSF_PKT_DMA_DONE);
-	if (ret < 0)
-		dev_err(dev, "dma_complete run_error %d : %d\n",
-			usbhs_pipe_number(pipe), ret);
-}
-
-void usbhs_fifo_clear_dcp(struct usbhs_pipe *pipe)
-{
-	struct usbhs_priv *priv = usbhs_pipe_to_priv(pipe);
-	struct usbhs_fifo *fifo = usbhsf_get_cfifo(priv); /* CFIFO */
-
-	/* clear DCP FIFO of transmission */
-	if (usbhsf_fifo_select(pipe, fifo, 1) < 0)
-		return;
-	usbhsf_fifo_clear(pipe, fifo);
-	usbhsf_fifo_unselect(pipe, fifo);
-
-	/* clear DCP FIFO of reception */
-	if (usbhsf_fifo_select(pipe, fifo, 0) < 0)
-		return;
-	usbhsf_fifo_clear(pipe, fifo);
-	usbhsf_fifo_unselect(pipe, fifo);
-}
-
-/*
- *		fifo init
- */
-void usbhs_fifo_init(struct usbhs_priv *priv)
-{
-	struct usbhs_mod *mod = usbhs_mod_get_current(priv);
-	struct usbhs_fifo *cfifo = usbhsf_get_cfifo(priv);
-	struct usbhs_fifo *dfifo;
-	int i;
-
-	mod->irq_empty		= usbhsf_irq_empty;
-	mod->irq_ready		= usbhsf_irq_ready;
-	mod->irq_bempsts	= 0;
-	mod->irq_brdysts	= 0;
-
-	cfifo->pipe	= NULL;
-	usbhs_for_each_dfifo(priv, dfifo, i)
-		dfifo->pipe	= NULL;
-}
-
-void usbhs_fifo_quit(struct usbhs_priv *priv)
-{
-	struct usbhs_mod *mod = usbhs_mod_get_current(priv);
-
-	mod->irq_empty		= NULL;
-	mod->irq_ready		= NULL;
-	mod->irq_bempsts	= 0;
-	mod->irq_brdysts	= 0;
-}
-
-#define __USBHS_DFIFO_INIT(priv, fifo, channel, fifo_port)		\
-do {									\
-	fifo = usbhsf_get_dnfifo(priv, channel);			\
-	fifo->name	= "D"#channel"FIFO";				\
-	fifo->port	= fifo_port;					\
-	fifo->sel	= D##channel##FIFOSEL;				\
-	fifo->ctr	= D##channel##FIFOCTR;				\
-	fifo->tx_slave.shdma_slave.slave_id =				\
-			usbhs_get_dparam(priv, d##channel##_tx_id);	\
-	fifo->rx_slave.shdma_slave.slave_id =				\
-			usbhs_get_dparam(priv, d##channel##_rx_id);	\
-	usbhsf_dma_init(priv, fifo, channel);				\
-} while (0)
-
-#define USBHS_DFIFO_INIT(priv, fifo, channel)				\
-		__USBHS_DFIFO_INIT(priv, fifo, channel, D##channel##FIFO)
-#define USBHS_DFIFO_INIT_NO_PORT(priv, fifo, channel)			\
-		__USBHS_DFIFO_INIT(priv, fifo, channel, 0)
-
-int usbhs_fifo_probe(struct usbhs_priv *priv)
-{
-	struct usbhs_fifo *fifo;
-
-	/* CFIFO */
-	fifo = usbhsf_get_cfifo(priv);
-	fifo->name	= "CFIFO";
-	fifo->port	= CFIFO;
-	fifo->sel	= CFIFOSEL;
-	fifo->ctr	= CFIFOCTR;
-
-	/* DFIFO */
-	USBHS_DFIFO_INIT(priv, fifo, 0);
-	USBHS_DFIFO_INIT(priv, fifo, 1);
-	USBHS_DFIFO_INIT_NO_PORT(priv, fifo, 2);
-	USBHS_DFIFO_INIT_NO_PORT(priv, fifo, 3);
-
-	return 0;
-}
-
-void usbhs_fifo_remove(struct usbhs_priv *priv)
-{
-	struct usbhs_fifo *fifo;
-	int i;
-
-	usbhs_for_each_dfifo(priv, fifo, i)
-		usbhsf_dma_quit(priv, fifo);
-}
+ISTERS_TABLE_51__data_2_value_1__SHIFT 0x0
+#define MC_REGISTERS_TABLE_52__data_2_value_2_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_52__data_2_value_2__SHIFT 0x0
+#define MC_REGISTERS_TABLE_53__data_2_value_3_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_53__data_2_value_3__SHIFT 0x0
+#define MC_REGISTERS_TABLE_54__data_2_value_4_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_54__data_2_value_4__SHIFT 0x0
+#define MC_REGISTERS_TABLE_55__data_2_value_5_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_55__data_2_value_5__SHIFT 0x0
+#define MC_REGISTERS_TABLE_56__data_2_value_6_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_56__data_2_value_6__SHIFT 0x0
+#define MC_REGISTERS_TABLE_57__data_2_value_7_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_57__data_2_value_7__SHIFT 0x0
+#define MC_REGISTERS_TABLE_58__data_2_value_8_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_58__data_2_value_8__SHIFT 0x0
+#define MC_REGISTERS_TABLE_59__data_2_value_9_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_59__data_2_value_9__SHIFT 0x0
+#define MC_REGISTERS_TABLE_60__data_2_value_10_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_60__data_2_value_10__SHIFT 0x0
+#define MC_REGISTERS_TABLE_61__data_2_value_11_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_61__data_2_value_11__SHIFT 0x0
+#define MC_REGISTERS_TABLE_62__data_2_value_12_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_62__data_2_value_12__SHIFT 0x0
+#define MC_REGISTERS_TABLE_63__data_2_value_13_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_63__data_2_value_13__SHIFT 0x0
+#define MC_REGISTERS_TABLE_64__data_2_value_14_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_64__data_2_value_14__SHIFT 0x0
+#define MC_REGISTERS_TABLE_65__data_2_value_15_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_65__data_2_value_15__SHIFT 0x0
+#define MC_REGISTERS_TABLE_66__data_3_value_0_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_66__data_3_value_0__SHIFT 0x0
+#define MC_REGISTERS_TABLE_67__data_3_value_1_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_67__data_3_value_1__SHIFT 0x0
+#define MC_REGISTERS_TABLE_68__data_3_value_2_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_68__data_3_value_2__SHIFT 0x0
+#define MC_REGISTERS_TABLE_69__data_3_value_3_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_69__data_3_value_3__SHIFT 0x0
+#define MC_REGISTERS_TABLE_70__data_3_value_4_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_70__data_3_value_4__SHIFT 0x0
+#define MC_REGISTERS_TABLE_71__data_3_value_5_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_71__data_3_value_5__SHIFT 0x0
+#define MC_REGISTERS_TABLE_72__data_3_value_6_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_72__data_3_value_6__SHIFT 0x0
+#define MC_REGISTERS_TABLE_73__data_3_value_7_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_73__data_3_value_7__SHIFT 0x0
+#define MC_REGISTERS_TABLE_74__data_3_value_8_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_74__data_3_value_8__SHIFT 0x0
+#define MC_REGISTERS_TABLE_75__data_3_value_9_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_75__data_3_value_9__SHIFT 0x0
+#define MC_REGISTERS_TABLE_76__data_3_value_10_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_76__data_3_value_10__SHIFT 0x0
+#define MC_REGISTERS_TABLE_77__data_3_value_11_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_77__data_3_value_11__SHIFT 0x0
+#define MC_REGISTERS_TABLE_78__data_3_value_12_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_78__data_3_value_12__SHIFT 0x0
+#define MC_REGISTERS_TABLE_79__data_3_value_13_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_79__data_3_value_13__SHIFT 0x0
+#define MC_REGISTERS_TABLE_80__data_3_value_14_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_80__data_3_value_14__SHIFT 0x0
+#define MC_REGISTERS_TABLE_81__data_3_value_15_MASK 0xffffffff
+#define MC_REGISTERS_TABLE_81__data_3_value_15__SHIFT 0x0
+#define FAN_TABLE_1__TempMin_MASK 0xffff
+#define FAN_TABLE_1__TempMin__SHIFT 0x0
+#define FAN_TABLE_1__FdoMode_MASK 0xffff0000
+#define FAN_TABLE_1__FdoMode__SHIFT 0x10
+#define FAN_TABLE_2__TempMax_MASK 0xffff
+#define FAN_TABLE_2__TempMax__SHIFT 0x0
+#define FAN_TABLE_2__TempMed_MASK 0xffff0000
+#define FAN_TABLE_2__TempMed__SHIFT 0x10
+#define FAN_TABLE_3__Slope2_MASK 0xffff
+#define FAN_TABLE_3__Slope2__SHIFT 0x0
+#define FAN_TABLE_3__Slope1_MASK 0xffff0000
+#define FAN_TABLE_3__Slope1__SHIFT 0x10
+#define FAN_TABLE_4__HystUp_MASK 0xffff
+#define FAN_TABLE_4__HystUp__SHIFT 0x0
+#define FAN_TABLE_4__FdoMin_MASK 0xffff0000
+#define FAN_TABLE_4__FdoMin__SHIFT 0x10
+#define FAN_TABLE_5__HystSlope_MASK 0xffff
+#define FAN_TABLE_5__HystSlope__SHIFT 0x0
+#define FAN_TABLE_5__HystDown_MASK 0xffff0000
+#define FAN_TABLE_5__HystDown__SHIFT 0x10
+#define FAN_TABLE_6__TempCurr_MASK 0xffff
+#define FAN_TABLE_6__TempCurr__SHIFT 0x0
+#define FAN_TABLE_6__TempRespLim_MASK 0xffff0000
+#define FAN_TABLE_6__TempRespLim__SHIFT 0x10
+#define FAN_TABLE_7__PwmCurr_MASK 0xffff
+#define FAN_TABLE_7__PwmCurr__SHIFT 0x0
+#define FAN_TABLE_7__SlopeCurr_MASK 0xffff0000
+#define FAN_TABLE_7__SlopeCurr__SHIFT 0x10
+#define FAN_TABLE_8__RefreshPeriod_MASK 0xffffffff
+#define FAN_TABLE_8__RefreshPeriod__SHIFT 0x0
+#define FAN_TABLE_9__Padding_MASK 0xff
+#define FAN_TABLE_9__Padding__SHIFT 0x0
+#define FAN_TABLE_9__TempSrc_MASK 0xff00
+#define FAN_TABLE_9__TempSrc__SHIFT 0x8
+#define FAN_TABLE_9__FdoMax_MASK 0xffff0000
+#define FAN_TABLE_9__FdoMax__SHIFT 0x10
+#define SOFT_REGISTERS_TABLE_1__RefClockFrequency_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_1__RefClockFrequency__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_2__PmTimerPeriod_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_2__PmTimerPeriod__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_3__FeatureEnables_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_3__FeatureEnables__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_4__PreVBlankGap_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_4__PreVBlankGap__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_5__VBlankTimeout_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_5__VBlankTimeout__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_6__TrainTimeGap_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_6__TrainTimeGap__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_7__MvddSwitchTime_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_7__MvddSwitchTime__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_8__LongestAcpiTrainTime_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_8__LongestAcpiTrainTime__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_9__AcpiDelay_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_9__AcpiDelay__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_10__G5TrainTime_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_10__G5TrainTime__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_11__DelayMpllPwron_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_11__DelayMpllPwron__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_12__VoltageChangeTimeout_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_12__VoltageChangeTimeout__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_13__HandshakeDisables_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_13__HandshakeDisables__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_14__DisplayPhy4Config_MASK 0xff
+#define SOFT_REGISTERS_TABLE_14__DisplayPhy4Config__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_14__DisplayPhy3Config_MASK 0xff00
+#define SOFT_REGISTERS_TABLE_14__DisplayPhy3Config__SHIFT 0x8
+#define SOFT_REGISTERS_TABLE_14__DisplayPhy2Config_MASK 0xff0000
+#define SOFT_REGISTERS_TABLE_14__DisplayPhy2Config__SHIFT 0x10
+#define SOFT_REGISTERS_TABLE_14__DisplayPhy1Config_MASK 0xff000000
+#define SOFT_REGISTERS_TABLE_14__DisplayPhy1Config__SHIFT 0x18
+#define SOFT_REGISTERS_TABLE_15__DisplayPhy8Config_MASK 0xff
+#define SOFT_REGISTERS_TABLE_15__DisplayPhy8Config__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_15__DisplayPhy7Config_MASK 0xff00
+#define SOFT_REGISTERS_TABLE_15__DisplayPhy7Config__SHIFT 0x8
+#define SOFT_REGISTERS_TABLE_15__DisplayPhy6Config_MASK 0xff0000
+#define SOFT_REGISTERS_TABLE_15__DisplayPhy6Config__SHIFT 0x10
+#define SOFT_REGISTERS_TABLE_15__DisplayPhy5Config_MASK 0xff000000
+#define SOFT_REGISTERS_TABLE_15__DisplayPhy5Config__SHIFT 0x18
+#define SOFT_REGISTERS_TABLE_16__AverageGraphicsActivity_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_16__AverageGraphicsActivity__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_17__AverageMemoryActivity_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_17__AverageMemoryActivity__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_18__AverageGioActivity_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_18__AverageGioActivity__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_19__PCIeDpmEnabledLevels_MASK 0xff
+#define SOFT_REGISTERS_TABLE_19__PCIeDpmEnabledLevels__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_19__LClkDpmEnabledLevels_MASK 0xff00
+#define SOFT_REGISTERS_TABLE_19__LClkDpmEnabledLevels__SHIFT 0x8
+#define SOFT_REGISTERS_TABLE_19__MClkDpmEnabledLevels_MASK 0xff0000
+#define SOFT_REGISTERS_TABLE_19__MClkDpmEnabledLevels__SHIFT 0x10
+#define SOFT_REGISTERS_TABLE_19__SClkDpmEnabledLevels_MASK 0xff000000
+#define SOFT_REGISTERS_TABLE_19__SClkDpmEnabledLevels__SHIFT 0x18
+#define SOFT_REGISTERS_TABLE_20__VCEDpmEnabledLevels_MASK 0xff
+#define SOFT_REGISTERS_TABLE_20__VCEDpmEnabledLevels__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_20__ACPDpmEnabledLevels_MASK 0xff00
+#define SOFT_REGISTERS_TABLE_20__ACPDpmEnabledLevels__SHIFT 0x8
+#define SOFT_REGISTERS_TABLE_20__SAMUDpmEnabledLevels_MASK 0xff0000
+#define SOFT_REGISTERS_TABLE_20__SAMUDpmEnabledLevels__SHIFT 0x10
+#define SOFT_REGISTERS_TABLE_20__UVDDpmEnabledLevels_MASK 0xff000000
+#define SOFT_REGISTERS_TABLE_20__UVDDpmEnabledLevels__SHIFT 0x18
+#define SOFT_REGISTERS_TABLE_21__DRAM_LOG_ADDR_H_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_21__DRAM_LOG_ADDR_H__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_22__DRAM_LOG_ADDR_L_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_22__DRAM_LOG_ADDR_L__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_23__DRAM_LOG_PHY_ADDR_H_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_23__DRAM_LOG_PHY_ADDR_H__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_24__DRAM_LOG_PHY_ADDR_L_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_24__DRAM_LOG_PHY_ADDR_L__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_25__DRAM_LOG_BUFF_SIZE_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_25__DRAM_LOG_BUFF_SIZE__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_26__UlvEnterCount_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_26__UlvEnterCount__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_27__UlvTime_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_27__UlvTime__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_28__UcodeLoadStatus_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_28__UcodeLoadStatus__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_29__Reserved_0_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_29__Reserved_0__SHIFT 0x0
+#define SOFT_REGISTERS_TABLE_30__Reserved_1_MASK 0xffffffff
+#define SOFT_REGISTERS_TABLE_30__Reserved_1__SHIFT 0x0
+#define PM_FUSES_1__SviLoadLineOffsetVddC_MASK 0xff
+#define PM_FUSES_1__SviLoadLineOffsetVddC__SHIFT 0x0
+#define PM_FUSES_1__SviLoadLineTrimVddC_MASK 0xff00
+#define PM_FUSES_1__SviLoadLineTrimVddC__SHIFT 0x8
+#define PM_FUSES_1__SviLoadLineVddC_MASK 0xff0000
+#define PM_FUSES_1__SviLoadLineVddC__SHIFT 0x10
+#define PM_FUSES_1__SviLoadLineEn_MASK 0xff000000
+#define PM_FUSES_1__SviLoadLineEn__SHIFT 0x18
+#define PM_FUSES_2__TDC_MAWt_MASK 0xff
+#define PM_FUSES_2__TDC_MAWt__SHIFT 0x0
+#define PM_FUSES_2__TDC_VDDC_ThrottleReleaseLimitPerc_MASK 0xff00
+#define PM_FUSES_2__TDC_VDDC_ThrottleReleaseLimitPerc__SHIFT 0x8
+#define PM_FUSES_2__TDC_VDDC_PkgLimit_MASK 0xffff0000
+#define PM_FUSES_2__TDC_VDDC_PkgLimit__SHIFT 0x10
+#define PM_FUSES_3__Reserved_MASK 0xff
+#define PM_FUSES_3__Reserved__SHIFT 0x0
+#define PM_FUSES_3__LPMLTemperatureMax_MASK 0xff00
+#define PM_FUSES_3__LPMLTemperatureMax__SHIFT 0x8
+#define PM_FUSES_3__LPMLTemperatureMin_MASK 0xff0000
+#define PM_FUSES_3__LPMLTemperatureMin__SHIFT 0x10
+#define PM_FUSES_3__TdcWaterfallCtl_MASK 0xff000000
+#define PM_FUSES_3__TdcWaterfallCtl__SHIFT 0x18
+#define PM_FUSES_4__LPMLTemperatureScaler_3_MASK 0xff
+#define PM_FUSES_4__LPMLTemperatureScaler_3__SHIFT 0x0
+#define PM_FUSES_4__LPMLTemperatureScaler_2_MASK 0xff00
+#define PM_FUSES_4__LPMLTemperatureScaler_2__SHIFT 0x8
+#define PM_FUSES_4__LPMLTemperatureScaler_1_MASK 0xff0000
+#define PM_FUSES_4__LPMLTemperatureScaler_1__SHIFT 0x10
+#define PM_FUSES_4__LPMLTemperatureScaler_0_MASK 0xff000000
+#define PM_FUSES_4__LPMLTemperatureScaler_0__SHIFT 0x18
+#define PM_FUSES_5__LPMLTemperatureScaler_7_MASK 0xff
+#define PM_FUSES_5__LPMLTemperatureScaler_7__SHIFT 0x0
+#define PM_FUSES_5__LPMLTemperatureScaler_6_MASK 0xff00
+#define PM_FUSES_5__LPMLTemperatureScaler_6__SHIFT 0x8
+#define PM_FUSES_5__LPMLTemperatureScaler_5_MASK 0xff0000
+#define PM_FUSES_5__LPMLTemperatureScaler_5__SHIFT 0x10
+#define PM_FUSES_5__LPMLTemperatureScaler_4_MASK 0xff000000
+#define PM_FUSES_5__LPMLTemperatureScaler_4__SHIFT 0x18
+#define PM_FUSES_6__LPMLTemperatureScaler_11_MASK 0xff
+#define PM_FUSES_6__LPMLTemperatureScaler_11__SHIFT 0x0
+#define PM_FUSES_6__LPMLTemperatureScaler_10_MASK 0xff00
+#define PM_FUSES_6__LPMLTemperatureScaler_10__SHIFT 0x8
+#define PM_FUSES_6__LPMLTemperatureScaler_9_MASK 0xff0000
+#define PM_FUSES_6__LPMLTemperatureScaler_9__SHIFT 0x10
+#define PM_FUSES_6__LPMLTemperatureScaler_8_MASK 0xff000000
+#define PM_FUSES_6__LPMLTemperatureScaler_8__SHIFT 0x18
+#define PM_FUSES_7__LPMLTemperatureScaler_15_MASK 0xff
+#define PM_FUSES_7__LPMLTemperatureScaler_15__SHIFT 0x0
+#define PM_FUSES_7__LPMLTemperatureScaler_14_MASK 0xff00
+#define PM_FUSES_7__LPMLTemperatureScaler_14__SHIFT 0x8
+#define PM_FUSES_7__LPMLTemperatureScaler_13_MASK 0xff0000
+#define PM_FUSES_7__LPMLTemperatureScaler_13__SHIFT 0x10
+#define PM_FUSES_7__LPMLTemperatureScaler_12_MASK 0xff000000
+#define PM_FUSES_7__LPMLTemperatureScaler_12__SHIFT 0x18
+#define PM_FUSES_8__FuzzyFan_ErrorRateSetDelta_MASK 0xffff
+#define PM_FUSES_8__FuzzyFan_ErrorRateSetDelta__SHIFT 0x0
+#define PM_FUSES_8__FuzzyFan_ErrorSetDelta_MASK 0xffff0000
+#define PM_FUSES_8__FuzzyFan_ErrorSetDelta__SHIFT 0x10
+#define PM_FUSES_9__Reserved6_MASK 0xffff
+#define PM_FUSES_9__Reserved6__SHIFT 0x0
+#define PM_FUSES_9__FuzzyFan_PwmSetDelta_MASK 0xffff0000
+#define PM_FUSES_9__FuzzyFan_PwmSetDelta__SHIFT 0x10
+#define PM_FUSES_10__GnbLPML_3_MASK 0xff
+#define PM_FUSES_10__GnbLPML_3__SHIFT 0x0
+#define PM_FUSES_10__GnbLPML_2_MASK 0xff00
+#define PM_FUSES_10__GnbLPML_2__SHIFT 0x8
+#define PM_FUSES_10__GnbLPML_1_MASK 0xff0000
+#define PM_FUSES_10__GnbLPML_1__SHIFT 0x10
+#define PM_FUSES_10__GnbLPML_0_MASK 0xff000000
+#define PM_FUSES_10__GnbLPML_0__SHIFT 0x18
+#define PM_FUSES_11__GnbLPML_7_MASK 0xff
+#define PM_FUSES_11__GnbLPML_7__SHIFT 0x0
+#define PM_FUSES_11__GnbLPML_6_MASK 0xff00
+#define PM_FUSES_11__GnbLPML_6__SHIFT 0x8
+#define PM_FUSES_11__GnbLPML_5_MASK 0xff0000
+#define PM_FUSES_11__GnbLPML_5__SHIFT 0x10
+#define PM_FUSES_11__GnbLPML_4_MASK 0xff000000
+#define PM_FUSES_11__GnbLPML_4__SHIFT 0x18
+#define PM_FUSES_12__GnbLPML_11_MASK 0xff
+#define PM_FUSES_12__GnbLPML_11__SHIFT 0x0
+#define PM_FUSES_12__GnbLPML_10_MASK 0xff00
+#define PM_FUSES_12__GnbLPML_10__SHIFT 0x8
+#define PM_FUSES_12__GnbLPML_9_MASK 0xff0000
+#define PM_FUSES_12__GnbLPML_9__SHIFT 0x10
+#define PM_FUSES_12__GnbLPML_8_MASK 0xff000000
+#define PM_FUSES_12__GnbLPML_8__SHIFT 0x18
+#define PM_FUSES_13__GnbLPML_15_MASK 0xff
+#define PM_FUSES_13__GnbLPML_15__SHIFT 0x0
+#define PM_FUSES_13__GnbLPML_14_MASK 0xff00
+#define PM_FUSES_13__GnbLPML_14__SHIFT 0x8
+#define PM_FUSES_13__GnbLPML_13_MASK 0xff0000
+#define PM_FUSES_13__GnbLPML_13__SHIFT 0x10
+#define PM_FUSES_13__GnbLPML_12_MASK 0xff000000
+#define PM_FUSES_13__GnbLPML_12__SHIFT 0x18
+#define PM_FUSES_14__Reserved1_1_MASK 0xff
+#define PM_FUSES_14__Reserved1_1__SHIFT 0x0
+#define PM_FUSES_14__Reserved1_0_MASK 0xff00
+#define PM_FUSES_14__Reserved1_0__SHIFT 0x8
+#define PM_FUSES_14__GnbLPMLMinVid_MASK 0xff0000
+#define PM_FUSES_14__GnbLPMLMinVid__SHIFT 0x10
+#define PM_FUSES_14__GnbLPMLMaxVid_MASK 0xff000000
+#define PM_FUSES_14__GnbLPMLMaxVid__SHIFT 0x18
+#define PM_FUSES_15__BapmVddCBaseLeakageLoSidd_MASK 0xffff
+#define PM_FUSES_15__BapmVddCBaseLeakageLoSidd__SHIFT 0x0
+#define PM_FUSES_15__BapmVddCBaseLeakageHiSidd_MASK 0xffff0000
+#define PM_FUSES_15__BapmVddCBaseLeakageHiSidd__SHIFT 0x10
+#define SMU_PM_STATUS_0__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_0__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_1__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_1__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_2__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_2__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_3__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_3__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_4__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_4__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_5__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_5__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_6__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_6__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_7__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_7__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_8__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_8__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_9__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_9__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_10__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_10__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_11__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_11__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_12__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_12__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_13__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_13__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_14__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_14__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_15__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_15__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_16__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_16__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_17__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_17__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_18__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_18__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_19__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_19__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_20__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_20__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_21__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_21__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_22__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_22__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_23__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_23__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_24__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_24__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_25__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_25__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_26__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_26__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_27__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_27__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_28__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_28__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_29__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_29__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_30__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_30__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_31__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_31__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_32__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_32__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_33__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_33__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_34__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_34__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_35__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_35__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_36__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_36__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_37__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_37__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_38__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_38__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_39__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_39__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_40__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_40__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_41__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_41__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_42__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_42__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_43__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_43__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_44__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_44__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_45__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_45__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_46__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_46__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_47__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_47__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_48__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_48__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_49__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_49__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_50__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_50__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_51__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_51__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_52__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_52__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_53__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_53__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_54__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_54__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_55__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_55__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_56__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_56__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_57__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_57__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_58__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_58__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_59__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_59__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_60__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_60__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_61__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_61__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_62__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_62__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_63__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_63__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_64__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_64__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_65__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_65__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_66__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_66__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_67__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_67__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_68__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_68__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_69__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_69__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_70__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_70__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_71__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_71__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_72__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_72__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_73__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_73__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_74__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_74__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_75__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_75__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_76__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_76__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_77__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_77__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_78__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_78__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_79__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_79__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_80__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_80__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_81__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_81__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_82__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_82__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_83__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_83__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_84__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_84__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_85__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_85__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_86__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_86__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_87__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_87__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_88__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_88__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_89__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_89__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_90__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_90__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_91__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_91__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_92__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_92__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_93__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_93__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_94__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_94__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_95__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_95__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_96__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_96__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_97__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_97__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_98__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_98__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_99__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_99__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_100__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_100__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_101__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_101__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_102__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_102__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_103__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_103__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_104__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_104__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_105__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_105__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_106__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_106__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_107__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_107__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_108__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_108__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_109__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_109__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_110__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_110__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_111__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_111__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_112__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_112__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_113__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_113__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_114__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_114__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_115__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_115__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_116__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_116__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_117__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_117__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_118__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_118__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_119__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_119__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_120__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_120__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_121__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_121__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_122__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_122__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_123__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_123__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_124__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_124__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_125__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_125__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_126__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_126__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_127__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_127__DATA__SHIFT 0x0
+#define CG_THERMAL_INT_ENA__THERM_INTH_SET_MASK 0x1
+#define CG_THERMAL_INT_ENA__THERM_INTH_SET__SHIFT 0x0
+#define CG_THERMAL_INT_ENA__THERM_INTL_SET_MASK 0x2
+#define CG_THERMAL_INT_ENA__THERM_INTL_SET__SHIFT 0x1
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_SET_MASK 0x4
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_SET__SHIFT 0x2
+#define CG_THERMAL_INT_ENA__THERM_INTH_CLR_MASK 0x8
+#define CG_THERMAL_INT_ENA__THERM_INTH_CLR__SHIFT 0x3
+#define CG_THERMAL_INT_ENA__THERM_INTL_CLR_MASK 0x10
+#define CG_THERMAL_INT_ENA__THERM_INTL_CLR__SHIFT 0x4
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_CLR_MASK 0x20
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_CLR__SHIFT 0x5
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTH_MASK 0xff
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTH__SHIFT 0x0
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTL_MASK 0xff00
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTL__SHIFT 0x8
+#define CG_THERMAL_INT_CTRL__GNB_TEMP_THRESHOLD_MASK 0xff0000
+#define CG_THERMAL_INT_CTRL__GNB_TEMP_THRESHOLD__SHIFT 0x10
+#define CG_THERMAL_INT_CTRL__THERM_INTH_MASK_MASK 0x1000000
+#define CG_THERMAL_INT_CTRL__THERM_INTH_MASK__SHIFT 0x18
+#define CG_THERMAL_INT_CTRL__THERM_INTL_MASK_MASK 0x2000000
+#define CG_THERMAL_INT_CTRL__THERM_INTL_MASK__SHIFT 0x19
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_MASK_MASK 0x4000000
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_MASK__SHIFT 0x1a
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_CNB_MASK_MASK 0x8000000
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_CNB_MASK__SHIFT 0x1b
+#define CG_THERMAL_INT_CTRL__THERM_GNB_HW_ENA_MASK 0x10000000
+#define CG_THERMAL_INT_CTRL__THERM_GNB_HW_ENA__SHIFT 0x1c
+#define CG_THERMAL_INT_STATUS__THERM_INTH_DETECT_MASK 0x1
+#define CG_THERMAL_INT_STATUS__THERM_INTH_DETECT__SHIFT 0x0
+#define CG_THERMAL_INT_STATUS__THERM_INTL_DETECT_MASK 0x2
+#define CG_THERMAL_INT_STATUS__THERM_INTL_DETECT__SHIFT 0x1
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_DETECT_MASK 0x4
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_DETECT__SHIFT 0x2
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_CNB_DETECT_MASK 0x8
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_CNB_DETECT__SHIFT 0x3
+#define CG_THERMAL_CTRL__DPM_EVENT_SRC_MASK 0x7
+#define CG_THERMAL_CTRL__DPM_EVENT_SRC__SHIFT 0x0
+#define CG_THERMAL_CTRL__THERM_INC_CLK_MASK 0x8
+#define CG_THERMAL_CTRL__THERM_INC_CLK__SHIFT 0x3
+#define CG_THERMAL_CTRL__SPARE_MASK 0x3ff0
+#define CG_THERMAL_CTRL__SPARE__SHIFT 0x4
+#define CG_THERMAL_CTRL__DIG_THERM_DPM_MASK 0x3fc000
+#define CG_THERMAL_CTRL__DIG_THERM_DPM__SHIFT 0xe
+#define CG_THERMAL_CTRL__RESERVED_MASK 0x1c00000
+#define CG_THERMAL_CTRL__RESERVED__SHIFT 0x16
+#define CG_THERMAL_CTRL__CTF_PAD_POLARITY_MASK 0x2000000
+#define CG_THERMAL_CTRL__CTF_PAD_POLARITY__SHIFT 0x19
+#define CG_THERMAL_CTRL__CTF_PAD_EN_MASK 0x4000000
+#define CG_THERMAL_CTRL__CTF_PAD_EN__SHIFT 0x1a
+#define CG_THERMAL_STATUS__SPARE_MASK 0x1ff
+#define CG_THERMAL_STATUS__SPARE__SHIFT 0x0
+#define CG_THERMAL_STATUS__FDO_PWM_DUTY_MASK 0x1fe00
+#define CG_THERMAL_STATUS__FDO_PWM_DUTY__SHIFT 0x9
+#define CG_THERMAL_STATUS__THERM_ALERT_MASK 0x20000
+#define CG_THERMAL_STATUS__THERM_ALERT__SHIFT 0x11
+#define CG_THERMAL_STATUS__GEN_STATUS_MASK 0x3c0000
+#define CG_THERMAL_STATUS__GEN_STATUS__SHIFT 0x12
+#define CG_THERMAL_INT__DIG_THERM_CTF_MASK 0xff
+#define CG_THERMAL_INT__DIG_THERM_CTF__SHIFT 0x0
+#define CG_THERMAL_INT__DIG_THERM_INTH_MASK 0xff00
+#define CG_THERMAL_INT__DIG_THERM_INTH__SHIFT 0x8
+#define CG_THERMAL_INT__DIG_THERM_INTL_MASK 0xff0000
+#define CG_THERMAL_INT__DIG_THERM_INTL__SHIFT 0x10
+#define CG_THERMAL_INT__THERM_INT_MASK_MASK 0xf000000
+#define CG_THERMAL_INT__THERM_INT_MASK__SHIFT 0x18
+#define CG_MULT_THERMAL_CTRL__TS_FILTER_MASK 0xf
+#define CG_MULT_THERMAL_CTRL__TS_FILTER__SHIFT 0x0
+#define CG_MULT_THERMAL_CTRL__UNUSED_MASK 0x1f0
+#define CG_MULT_THERMAL_CTRL__UNUSED__SHIFT 0x4
+#define CG_MULT_THERMAL_CTRL__THERMAL_RANGE_RST_MASK 0x200
+#define CG_MULT_THERMAL_CTRL__THERMAL_RANGE_RST__SHIFT 0x9
+#define CG_MULT_THERMAL_CTRL__TEMP_SEL_MASK 0xff00000
+#define CG_MULT_THERMAL_CTRL__TEMP_SEL__SHIFT 0x14
+#define CG_MULT_THERMAL_CTRL__THM_READY_CLEAR_MASK 0x10000000
+#define CG_MULT_THERMAL_CTRL__THM_READY_CLEAR__SHIFT 0x1c
+#define CG_MULT_THERMAL_STATUS__ASIC_MAX_TEMP_MASK 0x1ff
+#define CG_MULT_THERMAL_STATUS__ASIC_MAX_TEMP__SHIFT 0x0
+#define CG_MULT_THERMAL_STATUS__CTF_TEMP_MASK 0x3fe00
+#define CG_MULT_THERMAL_STATUS__CTF_TEMP__SHIFT 0x9
+#define CG_FDO_CTRL0__FDO_STATIC_DUTY_MASK 0xff
+#define CG_FDO_CTRL0__FDO_STATIC_DUTY__SHIFT 0x0
+#define CG_FDO_CTRL0__FAN_SPINUP_DUTY_MASK 0xff00
+#define CG_FDO_CTRL0__FAN_SPINUP_DUTY__SHIFT 0x8
+#define CG_FDO_CTRL0__FDO_PWM_MANUAL_MASK 0x10000
+#define CG_FDO_CTRL0__FDO_PWM_MANUAL__SHIFT 0x10
+#define CG_FDO_CTRL0__FDO_PWM_HYSTER_MASK 0x7e0000
+#define CG_FDO_CTRL0__FDO_PWM_HYSTER__SHIFT 0x11
+#define CG_FDO_CTRL0__FDO_PWM_RAMP_EN_MASK 0x800000
+#define CG_FDO_CTRL0__FDO_PWM_RAMP_EN__SHIFT 0x17
+#define CG_FDO_CTRL0__FDO_PWM_RAMP_MASK 0xff000000
+#define CG_FDO_CTRL0__FDO_PWM_RAMP__SHIFT 0x18
+#define CG_FDO_CTRL1__FMAX_DUTY100_MASK 0xff
+#define CG_FDO_CTRL1__FMAX_DUTY100__SHIFT 0x0
+#define CG_FDO_CTRL1__FMIN_DUTY_MASK 0xff00
+#define CG_FDO_CTRL1__FMIN_DUTY__SHIFT 0x8
+#define CG_FDO_CTRL1__M_MASK 0xff0000
+#define CG_FDO_CTRL1__M__SHIFT 0x10
+#define CG_FDO_CTRL1__RESERVED_MASK 0x3f000000
+#define CG_FDO_CTRL1__RESERVED__SHIFT 0x18
+#define CG_FDO_CTRL1__FDO_PWRDNB_MASK 0x40000000
+#define CG_FDO_CTRL1__FDO_PWRDNB__SHIFT 0x1e
+#define CG_FDO_CTRL2__TMIN_MASK 0xff
+#define CG_FDO_CTRL2__TMIN__SHIFT 0x0
+#define CG_FDO_CTRL2__FAN_SPINUP_TIME_MASK 0x700
+#define CG_FDO_CTRL2__FAN_SPINUP_TIME__SHIFT 0x8
+#define CG_FDO_CTRL2__FDO_PWM_MODE_MASK 0x3800
+#define CG_FDO_CTRL2__FDO_PWM_MODE__SHIFT 0xb
+#define CG_FDO_CTRL2__TMIN_HYSTER_MASK 0x1c000
+#define CG_FDO_CTRL2__TMIN_HYSTER__SHIFT 0xe
+#define CG_FDO_CTRL2__TMAX_MASK 0x1fe0000
+#define CG_FDO_CTRL2__TMAX__SHIFT 0x11
+#define CG_FDO_CTRL2__TACH_PWM_RESP_RATE_MASK 0xfe000000
+#define CG_FDO_CTRL2__TACH_PWM_RESP_RATE__SHIFT 0x19
+#define CG_TACH_CTRL__EDGE_PER_REV_MASK 0x7
+#define CG_TACH_CTRL__EDGE_PER_REV__SHIFT 0x0
+#define CG_TACH_CTRL__TARGET_PERIOD_MASK 0xfffffff8
+#define CG_TACH_CTRL__TARGET_PERIOD__SHIFT 0x3
+#define CG_TACH_STATUS__TACH_PERIOD_MASK 0xffffffff
+#define CG_TACH_STATUS__TACH_PERIOD__SHIFT 0x0
+#define CC_THM_STRAPS0__TMON0_BGADJ_MASK 0x1fe
+#define CC_THM_STRAPS0__TMON0_BGADJ__SHIFT 0x1
+#define CC_THM_STRAPS0__TMON1_BGADJ_MASK 0x1fe00
+#define CC_THM_STRAPS0__TMON1_BGADJ__SHIFT 0x9
+#define CC_THM_STRAPS0__TMON_CMON_FUSE_SEL_MASK 0x20000
+#define CC_THM_STRAPS0__TMON_CMON_FUSE_SEL__SHIFT 0x11
+#define CC_THM_STRAPS0__NUM_ACQ_MASK 0x1c0000
+#define CC_THM_STRAPS0__NUM_ACQ__SHIFT 0x12
+#define CC_THM_STRAPS0__TMON_CLK_SEL_MASK 0xe00000
+#define CC_THM_STRAPS0__TMON_CLK_SEL__SHIFT 0x15
+#define CC_THM_STRAPS0__TMON_CONFIG_SOURCE_MASK 0x1000000
+#define CC_THM_STRAPS0__TMON_CONFIG_SOURCE__SHIFT 0x18
+#define CC_THM_STRAPS0__CTF_DISABLE_MASK 0x2000000
+#define CC_THM_STRAPS0__CTF_DISABLE__SHIFT 0x19
+#define CC_THM_STRAPS0__TMON0_DISABLE_MASK 0x4000000
+#define CC_THM_STRAPS0__TMON0_DISABLE__SHIFT 0x1a
+#define CC_THM_STRAPS0__TMON1_DISABLE_MASK 0x8000000
+#define CC_THM_STRAPS0__TMON1_DISABLE__SHIFT 0x1b
+#define CC_THM_STRAPS0__TMON2_DISABLE_MASK 0x10000000
+#define CC_THM_STRAPS0__TMON2_DISABLE__SHIFT 0x1c
+#define CC_THM_STRAPS0__TMON3_DISABLE_MASK 0x20000000
+#define CC_THM_STRAPS0__TMON3_DISABLE__SHIFT 0x1d
+#define CC_THM_STRAPS0__UNUSED_MASK 0x80000000
+#define CC_THM_STRAPS0__UNUSED__SHIFT 0x1f
+#define THM_TMON0_RDIL0_DATA__Z_MASK 0x7ff
+#define THM_TMON0_RDIL0_DATA__Z__SHIFT 0x0
+#define THM_TMON0_RDIL0_DATA__VALID_MASK 0x800
+#define THM_TMON0_RDIL0_DATA__VALID__SHIFT 0xb
+#define THM_TMON0_RDIL0_DATA__TEMP_MASK 0xfff000
+#define THM_TMON0_RDIL0_DATA__TEMP__SHIFT 0xc
+#define THM_TMON0_RDIL1_DATA__Z_MASK 0x7ff
+#define THM_TMON0_RDIL1_DATA__Z__SHIFT 0x0
+#define THM_TMON0_RDIL1_DATA__VALID_MASK 0x800
+#define THM_TMON0_RDIL1_DATA__VALID__SHIFT 0xb
+#define THM_TMON0_RDIL1_DATA__TEMP_MASK 0xfff000
+#define THM_TMON0_RDIL1_DATA__TEMP__SHIFT 0xc
+#define THM_TMON0_RDIL2_DATA__Z_MASK 0x7ff
+#define THM_TMON0_RDIL2_DATA__Z__SHIFT 0x0
+#define THM_TMON0_RDIL2_DATA__VALID_MASK 0x800
+#define THM_TMON0_RDIL2_DATA__VALID__SHIFT 0xb
+#define THM_TMON0_RDIL2_DATA__TEMP_MASK 0xfff000
+#define THM_TMON0_RDIL2_DATA__TEMP__SHIFT 0xc
+#define THM_TMON0_RDIL3_DATA__Z_MASK 0x7ff
+#define THM_TMON0_RDIL3_DATA__Z__SHIFT 0x0
+#define THM_TMON0_RDIL3_DATA__VALID_MASK 0x800
+#define THM_TMON0_RDIL3_DATA__V

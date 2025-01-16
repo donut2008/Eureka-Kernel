@@ -1,87 +1,53 @@
-/*
- * Copyright (C) 2007 by Analog Devices, Inc.
- *
- * The Inventra Controller Driver for Linux is free software; you
- * can redistribute it and/or modify it under the terms of the GNU
- * General Public License version 2 as published by the Free Software
- * Foundation.
- */
+Reservd;
+  ULONG               ulReserved[2];
+}ATOM_LCD_INFO_V13;
 
-#ifndef __MUSB_BLACKFIN_H__
-#define __MUSB_BLACKFIN_H__
+#define ATOM_LCD_INFO_LAST  ATOM_LCD_INFO_V13
 
-/*
- * Blackfin specific definitions
- */
+//Definitions for ucLCD_Misc
+#define ATOM_PANEL_MISC_V13_DUAL                   0x00000001
+#define ATOM_PANEL_MISC_V13_FPDI                   0x00000002
+#define ATOM_PANEL_MISC_V13_GREY_LEVEL             0x0000000C
+#define ATOM_PANEL_MISC_V13_GREY_LEVEL_SHIFT       2
+#define ATOM_PANEL_MISC_V13_COLOR_BIT_DEPTH_MASK   0x70
+#define ATOM_PANEL_MISC_V13_6BIT_PER_COLOR         0x10
+#define ATOM_PANEL_MISC_V13_8BIT_PER_COLOR         0x20
 
-/* Anomalies notes:
- *
- *  05000450 - USB DMA Mode 1 Short Packet Data Corruption:
- *             MUSB driver is designed to transfer buffer of N * maxpacket size
- *             in DMA mode 1 and leave the rest of the data to the next
- *             transfer in DMA mode 0, so we never transmit a short packet in
- *             DMA mode 1.
- *
- *  05000463 - This anomaly doesn't affect this driver since it
- *             never uses L1 or L2 memory as data destination.
- *
- *  05000464 - This anomaly doesn't affect this driver since it
- *             never uses L1 or L2 memory as data source.
- *
- *  05000465 - The anomaly can be seen when SCLK is over 100 MHz, and there is
- *             no way to workaround for bulk endpoints.  Since the wMaxPackSize
- *             of bulk is less than or equal to 512, while the fifo size of
- *             endpoint 5, 6, 7 is 1024, the double buffer mode is enabled
- *             automatically when these endpoints are used for bulk OUT.
- *
- *  05000466 - This anomaly doesn't affect this driver since it never mixes
- *             concurrent DMA and core accesses to the TX endpoint FIFOs.
- *
- *  05000467 - The workaround for this anomaly will introduce another
- *             anomaly - 05000465.
- */
+//Color Bit Depth definition in EDID V1.4 @BYTE 14h
+//Bit 6  5  4
+                              //      0  0  0  -  Color bit depth is undefined
+                              //      0  0  1  -  6 Bits per Primary Color
+                              //      0  1  0  -  8 Bits per Primary Color
+                              //      0  1  1  - 10 Bits per Primary Color
+                              //      1  0  0  - 12 Bits per Primary Color
+                              //      1  0  1  - 14 Bits per Primary Color
+                              //      1  1  0  - 16 Bits per Primary Color
+                              //      1  1  1  - Reserved
 
-/* The Mentor USB DMA engine on BF52x (silicon v0.0 and v0.1) seems to be
- * unstable in host mode.  This may be caused by Anomaly 05000380.  After
- * digging out the root cause, we will change this number accordingly.
- * So, need to either use silicon v0.2+ or disable DMA mode in MUSB.
- */
-#if ANOMALY_05000380 && defined(CONFIG_BF52x) && \
-	!defined(CONFIG_MUSB_PIO_ONLY)
-# error "Please use PIO mode in MUSB driver on bf52x chip v0.0 and v0.1"
-#endif
+//Definitions for ucLCDPanel_SpecialHandlingCap:
 
-#undef DUMP_FIFO_DATA
-#ifdef DUMP_FIFO_DATA
-static void dump_fifo_data(u8 *buf, u16 len)
+//Once DAL sees this CAP is set, it will read EDID from LCD on its own instead of using sLCDTiming in ATOM_LVDS_INFO_V12.
+//Other entries in ATOM_LVDS_INFO_V12 are still valid/useful to DAL
+#define   LCDPANEL_CAP_V13_READ_EDID              0x1        // = LCDPANEL_CAP_READ_EDID no change comparing to previous version
+
+//If a design supports DRR (dynamic refresh rate) on internal panels (LVDS or EDP), this cap is set in ucLCDPanel_SpecialHandlingCap together
+//with multiple supported refresh rates@usSupportedRefreshRate. This cap should not be set when only slow refresh rate is supported (static
+//refresh rate switch by SW. This is only valid from ATOM_LVDS_INFO_V12
+#define   LCDPANEL_CAP_V13_DRR_SUPPORTED          0x2        // = LCDPANEL_CAP_DRR_SUPPORTED no change comparing to previous version
+
+//Use this cap bit for a quick reference whether an embadded panel (LCD1 ) is LVDS or eDP.
+#define   LCDPANEL_CAP_V13_eDP                    0x4        // = LCDPANEL_CAP_eDP no change comparing to previous version
+
+//uceDPToLVDSRxId
+#define eDP_TO_LVDS_RX_DISABLE                  0x00       // no eDP->LVDS translator chip
+#define eDP_TO_LVDS_COMMON_ID                   0x01       // common eDP->LVDS translator chip without AMD SW init
+#define eDP_TO_LVDS_RT_ID                       0x02       // RT tansaltor which require AMD SW init
+
+typedef struct  _ATOM_PATCH_RECORD_MODE
 {
-	u8 *tmp = buf;
-	int i;
+  UCHAR     ucRecordType;
+  USHORT    usHDisp;
+  USHORT    usVDisp;
+}ATOM_PATCH_RECORD_MODE;
 
-	for (i = 0; i < len; i++) {
-		if (!(i % 16) && i)
-			pr_debug("\n");
-		pr_debug("%02x ", *tmp++);
-	}
-	pr_debug("\n");
-}
-#else
-#define dump_fifo_data(buf, len)	do {} while (0)
-#endif
-
-
-#define USB_DMA_BASE		USB_DMA_INTERRUPT
-#define USB_DMAx_CTRL		0x04
-#define USB_DMAx_ADDR_LOW	0x08
-#define USB_DMAx_ADDR_HIGH	0x0C
-#define USB_DMAx_COUNT_LOW	0x10
-#define USB_DMAx_COUNT_HIGH	0x14
-
-#define USB_DMA_REG(ep, reg)	(USB_DMA_BASE + 0x20 * ep + reg)
-
-/* Almost 1 second */
-#define TIMER_DELAY	(1 * HZ)
-
-static struct timer_list musb_conn_timer;
-
-#endif	/* __MUSB_BLACKFIN_H__ */
+typedef struct  _ATOM_LCD

@@ -1,147 +1,158 @@
-/*
- * 88pm860x_onkey.c - Marvell 88PM860x ONKEY driver
- *
- * Copyright (C) 2009-2010 Marvell International Ltd.
- *      Haojian Zhuang <haojian.zhuang@marvell.com>
- *
- * This file is subject to the terms and conditions of the GNU General
- * Public License. See the file "COPYING" in the main directory of this
- * archive for more details.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- */
+te);
+#endif
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/i2c.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/mfd/88pm860x.h>
-#include <linux/slab.h>
-#include <linux/device.h>
-
-#define PM8607_WAKEUP		0x0b
-
-#define LONG_ONKEY_EN		(1 << 1)
-#define ONKEY_STATUS		(1 << 0)
-
-struct pm860x_onkey_info {
-	struct input_dev	*idev;
-	struct pm860x_chip	*chip;
-	struct i2c_client	*i2c;
-	struct device		*dev;
-	int			irq;
+static struct attribute *sec_touchkey_attributes[] = {
+	&dev_attr_touchkey_threshold.attr,
+	&dev_attr_brightness.attr,
+#ifdef CONFIG_TOUCHKEY_GRIP
+	&dev_attr_touchkey_grip_threshold.attr,
+	&dev_attr_touchkey_total_cap.attr,
+	&dev_attr_sar_enable.attr,
+	&dev_attr_sw_reset.attr,
+	&dev_attr_touchkey_earjack.attr,
+	&dev_attr_touchkey_grip.attr,
+	&dev_attr_touchkey_grip_baseline.attr,
+	&dev_attr_touchkey_grip_raw.attr,
+	&dev_attr_touchkey_grip_gain.attr,
+	&dev_attr_touchkey_grip_check.attr,
+#ifndef CONFIG_SAMSUNG_PRODUCT_SHIP
+	&dev_attr_touchkey_sar_only_mode.attr,
+	&dev_attr_touchkey_sar_press_threshold.attr,
+	&dev_attr_touchkey_sar_release_threshold.attr,
+#endif
+#endif
+	&dev_attr_touchkey_recent.attr,
+	&dev_attr_touchkey_back.attr,
+	&dev_attr_touchkey_recent_raw.attr,
+	&dev_attr_touchkey_back_raw.attr,
+	&dev_attr_touchkey_chip_name.attr,
+	&dev_attr_touchkey_firm_version_phone.attr,
+	&dev_attr_touchkey_firm_version_panel.attr,
+	&dev_attr_touchkey_firm_update.attr,
+	&dev_attr_touchkey_firm_update_status.attr,
+	&dev_attr_glove_mode.attr,
+	&dev_attr_keyboard_mode.attr,
+	&dev_attr_flip_mode.attr,
+#ifdef CONFIG_TOUCHKEY_LIGHT_EFS
+	&dev_attr_touchkey_light_version.attr,
+	&dev_attr_touchkey_light_update.attr,
+	&dev_attr_touchkey_light_id_compare.attr,
+	&dev_attr_touchkey_light_table_write.attr,
+#endif
+	NULL,
 };
 
-/* 88PM860x gives us an interrupt when ONKEY is held */
-static irqreturn_t pm860x_onkey_handler(int irq, void *data)
+static struct attribute_group sec_touchkey_attr_group = {
+	.attrs = sec_touchkey_attributes,
+};
+
+extern int get_samsung_lcd_attached(void);
+
+static int abov_tk_fw_check(struct abov_tk_info *info)
 {
-	struct pm860x_onkey_info *info = data;
-	int ret;
+	struct i2c_client *client = info->client;
+	int ret, fw_update=0;
+	u8 buf;
 
-	ret = pm860x_reg_read(info->i2c, PM8607_STATUS_2);
-	ret &= ONKEY_STATUS;
-	input_report_key(info->idev, KEY_POWER, ret);
-	input_sync(info->idev);
-
-	/* Enable 8-second long onkey detection */
-	pm860x_set_bits(info->i2c, PM8607_WAKEUP, 3, LONG_ONKEY_EN);
-	return IRQ_HANDLED;
-}
-
-static int pm860x_onkey_probe(struct platform_device *pdev)
-{
-	struct pm860x_chip *chip = dev_get_drvdata(pdev->dev.parent);
-	struct pm860x_onkey_info *info;
-	int irq, ret;
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(&pdev->dev, "No IRQ resource!\n");
-		return -EINVAL;
+	if (info->pdata->bringup) {
+		input_info(true, &client->dev, "%s: firmware update skip, bring up\n", __func__);
+		return 0;
 	}
 
-	info = devm_kzalloc(&pdev->dev, sizeof(struct pm860x_onkey_info),
-			    GFP_KERNEL);
-	if (!info)
-		return -ENOMEM;
-	info->chip = chip;
-	info->i2c = (chip->id == CHIP_PM8607) ? chip->client : chip->companion;
-	info->dev = &pdev->dev;
-	info->irq = irq;
-
-	info->idev = devm_input_allocate_device(&pdev->dev);
-	if (!info->idev) {
-		dev_err(chip->dev, "Failed to allocate input dev\n");
-		return -ENOMEM;
-	}
-
-	info->idev->name = "88pm860x_on";
-	info->idev->phys = "88pm860x_on/input0";
-	info->idev->id.bustype = BUS_I2C;
-	info->idev->dev.parent = &pdev->dev;
-	info->idev->evbit[0] = BIT_MASK(EV_KEY);
-	info->idev->keybit[BIT_WORD(KEY_POWER)] = BIT_MASK(KEY_POWER);
-
-	ret = input_register_device(info->idev);
+	ret = abov_load_fw(info, BUILT_IN);
 	if (ret) {
-		dev_err(chip->dev, "Can't register input device: %d\n", ret);
+		input_err(true, &client->dev,
+			"%s fw load fail\n", __func__);
 		return ret;
 	}
 
-	ret = devm_request_threaded_irq(&pdev->dev, info->irq, NULL,
-					pm860x_onkey_handler, IRQF_ONESHOT,
-					"onkey", info);
+	ret = get_tk_fw_version(info, true);
+
+#ifdef LED_TWINKLE_BOOTING
+	if(ret)
+		input_err(true, &client->dev,
+			"%s: i2c fail...[%d], addr[%d]\n",
+			__func__, ret, info->client->addr);
+		input_err(true, &client->dev,
+			"%s: touchkey driver unload\n", __func__);
+
+		if (get_samsung_lcd_attached() == 0) {
+			input_err(true, &client->dev, "%s : get_samsung_lcd_attached()=0 \n", __func__);
+			abov_release_fw(info, BUILT_IN);
+			return ret;
+		}
+#endif
+
+	//Check Model No.
+	ret = abov_tk_i2c_read(client, ABOV_MODEL_NUMBER, &buf, 1);
 	if (ret < 0) {
-		dev_err(chip->dev, "Failed to request IRQ: #%d: %d\n",
-			info->irq, ret);
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+	}
+	if(info->fw_model_number != buf){
+		input_info(true, &client->dev, "fw model number = %x ic model number = %x \n", info->fw_model_number, buf);
+		fw_update = 1;
+		goto flash_fw;
+	}
+
+	if ((info->fw_ver == 0) || info->fw_ver < info->fw_ver_bin){
+		input_info(true, &client->dev, "excute tk firmware update (0x%x -> 0x%x\n",
+			info->fw_ver, info->fw_ver_bin);
+		fw_update = 1;
+	}
+
+#ifdef CONFIG_SAMSUNG_PRODUCT_SHIP
+	if(info->fw_ver >= 0xd0){		//test firmware
+		input_info(true, &client->dev, "excute tk firmware update (0x%x -> 0x%x\n",
+			info->fw_ver, info->fw_ver_bin);
+		fw_update = 1;
+	}
+#endif
+
+flash_fw:
+	if(fw_update){
+		ret = abov_flash_fw(info, true, BUILT_IN);
+		if (ret) {
+			input_err(true, &client->dev,
+				"failed to abov_flash_fw (%d)\n", ret);
+		} else {
+			input_info(true, &client->dev,
+				"fw update success\n");
+		}
+	}
+
+	abov_release_fw(info, BUILT_IN);
+
+	return ret;
+}
+
+static int abov_led_power(void *data, bool on)
+{
+	struct abov_tk_info *info = (struct abov_tk_info *)data;
+	struct i2c_client *client = info->client;
+
+	int ret = 0;
+
+	info->pdata->avdd_vreg = regulator_get(NULL, "vtouch_3.3v");
+	if (IS_ERR(info->pdata->avdd_vreg)) {
+		info->pdata->avdd_vreg = NULL;
 		return ret;
 	}
 
-	platform_set_drvdata(pdev, info);
-	device_init_wakeup(&pdev->dev, 1);
 
-	return 0;
-}
+	if(regulator_is_enabled(info->pdata->avdd_vreg)==on){
+		input_info(true, &client->dev, "%s %s skip\n", __func__, on ? "on" : "off");
+		return ret;
+	}
 
-static int __maybe_unused pm860x_onkey_suspend(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct pm860x_chip *chip = dev_get_drvdata(pdev->dev.parent);
 
-	if (device_may_wakeup(dev))
-		chip->wakeup_flag |= 1 << PM8607_IRQ_ONKEY;
-	return 0;
-}
-static int __maybe_unused pm860x_onkey_resume(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct pm860x_chip *chip = dev_get_drvdata(pdev->dev.parent);
-
-	if (device_may_wakeup(dev))
-		chip->wakeup_flag &= ~(1 << PM8607_IRQ_ONKEY);
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(pm860x_onkey_pm_ops, pm860x_onkey_suspend, pm860x_onkey_resume);
-
-static struct platform_driver pm860x_onkey_driver = {
-	.driver		= {
-		.name	= "88pm860x-onkey",
-		.pm	= &pm860x_onkey_pm_ops,
-	},
-	.probe		= pm860x_onkey_probe,
-};
-module_platform_driver(pm860x_onkey_driver);
-
-MODULE_DESCRIPTION("Marvell 88PM860x ONKEY driver");
-MODULE_AUTHOR("Haojian Zhuang <haojian.zhuang@marvell.com>");
-MODULE_LICENSE("GPL");
+	if (on) {
+		if (info->pdata->avdd_vreg) {
+			ret = regulator_enable(info->pdata->avdd_vreg);
+			if(ret){
+				input_err(true, &client->dev, "%s : avdd reg enable fail\n", __func__);
+				return ret;
+			}
+		}
+	} else {
+		if (info->pdata->avdd_vreg) {
+			input_info(true, &client->dev, "%s 1\

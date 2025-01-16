@@ -1,137 +1,109 @@
 /*
- * arch/sh/mm/ioremap.c
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
  *
- * (C) Copyright 1995 1996 Linus Torvalds
- * (C) Copyright 2005 - 2010  Paul Mundt
- *
- * Re-map IO memory to kernel address space so that we can access it.
- * This is needed for high PCI addresses that aren't mapped in the
- * 640k-1MB IO memory area on PC's
- *
- * This file is subject to the terms and conditions of the GNU General
- * Public License. See the file "COPYING" in the main directory of this
- * archive for more details.
+ * Copyright (c) 2000-2007 Silicon Graphics, Inc.  All Rights Reserved.
  */
-#include <linux/vmalloc.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/mm.h>
-#include <linux/pci.h>
-#include <linux/io.h>
-#include <asm/page.h>
-#include <asm/pgalloc.h>
-#include <asm/addrspace.h>
-#include <asm/cacheflush.h>
-#include <asm/tlbflush.h>
-#include <asm/mmu.h>
+
+
+#ifndef _ASM_IA64_SN_BTE_H
+#define _ASM_IA64_SN_BTE_H
+
+#include <linux/timer.h>
+#include <linux/spinlock.h>
+#include <linux/cache.h>
+#include <asm/sn/pda.h>
+#include <asm/sn/types.h>
+#include <asm/sn/shub_mmr.h>
+
+#define IBCT_NOTIFY             (0x1UL << 4)
+#define IBCT_ZFIL_MODE          (0x1UL << 0)
+
+/* #define BTE_DEBUG */
+/* #define BTE_DEBUG_VERBOSE */
+
+#ifdef BTE_DEBUG
+#  define BTE_PRINTK(x) printk x	/* Terse */
+#  ifdef BTE_DEBUG_VERBOSE
+#    define BTE_PRINTKV(x) printk x	/* Verbose */
+#  else
+#    define BTE_PRINTKV(x)
+#  endif /* BTE_DEBUG_VERBOSE */
+#else
+#  define BTE_PRINTK(x)
+#  define BTE_PRINTKV(x)
+#endif	/* BTE_DEBUG */
+
+
+/* BTE status register only supports 16 bits for length field */
+#define BTE_LEN_BITS (16)
+#define BTE_LEN_MASK ((1 << BTE_LEN_BITS) - 1)
+#define BTE_MAX_XFER (BTE_LEN_MASK << L1_CACHE_SHIFT)
+
+
+/* Define hardware */
+#define BTES_PER_NODE (is_shub2() ? 4 : 2)
+#define MAX_BTES_PER_NODE 4
+
+#define BTE2OFF_CTRL	0
+#define BTE2OFF_SRC	(SH2_BT_ENG_SRC_ADDR_0 - SH2_BT_ENG_CSR_0)
+#define BTE2OFF_DEST	(SH2_BT_ENG_DEST_ADDR_0 - SH2_BT_ENG_CSR_0)
+#define BTE2OFF_NOTIFY	(SH2_BT_ENG_NOTIF_ADDR_0 - SH2_BT_ENG_CSR_0)
+
+#define BTE_BASE_ADDR(interface) 				\
+    (is_shub2() ? (interface == 0) ? SH2_BT_ENG_CSR_0 :		\
+		  (interface == 1) ? SH2_BT_ENG_CSR_1 :		\
+		  (interface == 2) ? SH2_BT_ENG_CSR_2 :		\
+		  		     SH2_BT_ENG_CSR_3 		\
+		: (interface == 0) ? IIO_IBLS0 : IIO_IBLS1)
+
+#define BTE_SOURCE_ADDR(base)					\
+    (is_shub2() ? base + (BTE2OFF_SRC/8) 			\
+		: base + (BTEOFF_SRC/8))
+
+#define BTE_DEST_ADDR(base)					\
+    (is_shub2() ? base + (BTE2OFF_DEST/8) 			\
+		: base + (BTEOFF_DEST/8))
+
+#define BTE_CTRL_ADDR(base)					\
+    (is_shub2() ? base + (BTE2OFF_CTRL/8) 			\
+		: base + (BTEOFF_CTRL/8))
+
+#define BTE_NOTIF_ADDR(base)					\
+    (is_shub2() ? base + (BTE2OFF_NOTIFY/8) 			\
+		: base + (BTEOFF_NOTIFY/8))
+
+/* Define hardware modes */
+#define BTE_NOTIFY IBCT_NOTIFY
+#define BTE_NORMAL BTE_NOTIFY
+#define BTE_ZERO_FILL (BTE_NOTIFY | IBCT_ZFIL_MODE)
+/* Use a reserved bit to let the caller specify a wait for any BTE */
+#define BTE_WACQUIRE 0x4000
+/* Use the BTE on the node with the destination memory */
+#define BTE_USE_DEST (BTE_WACQUIRE << 1)
+/* Use any available BTE interface on any node for the transfer */
+#define BTE_USE_ANY (BTE_USE_DEST << 1)
+/* macro to force the IBCT0 value valid */
+#define BTE_VALID_MODE(x) ((x) & (IBCT_NOTIFY | IBCT_ZFIL_MODE))
+
+#define BTE_ACTIVE		(IBLS_BUSY | IBLS_ERROR)
+#define BTE_WORD_AVAILABLE	(IBLS_BUSY << 1)
+#define BTE_WORD_BUSY		(~BTE_WORD_AVAILABLE)
 
 /*
- * Remap an arbitrary physical address space into the kernel virtual
- * address space. Needed when the kernel wants to access high addresses
- * directly.
- *
- * NOTE! We need to allow non-page-aligned mappings too: we will obviously
- * have to convert them into an offset in a page-aligned mapping, but the
- * caller shouldn't need to know that small detail.
+ * Some macros to simplify reading.
+ * Start with macros to locate the BTE control registers.
  */
-void __iomem * __init_refok
-__ioremap_caller(phys_addr_t phys_addr, unsigned long size,
-		 pgprot_t pgprot, void *caller)
-{
-	struct vm_struct *area;
-	unsigned long offset, last_addr, addr, orig_addr;
-	void __iomem *mapped;
-
-	/* Don't allow wraparound or zero size */
-	last_addr = phys_addr + size - 1;
-	if (!size || last_addr < phys_addr)
-		return NULL;
-
-	/*
-	 * If we can't yet use the regular approach, go the fixmap route.
-	 */
-	if (!mem_init_done)
-		return ioremap_fixed(phys_addr, size, pgprot);
-
-	/*
-	 * First try to remap through the PMB.
-	 * PMB entries are all pre-faulted.
-	 */
-	mapped = pmb_remap_caller(phys_addr, size, pgprot, caller);
-	if (mapped && !IS_ERR(mapped))
-		return mapped;
-
-	/*
-	 * Mappings have to be page-aligned
-	 */
-	offset = phys_addr & ~PAGE_MASK;
-	phys_addr &= PAGE_MASK;
-	size = PAGE_ALIGN(last_addr+1) - phys_addr;
-
-	/*
-	 * Ok, go for it..
-	 */
-	area = get_vm_area_caller(size, VM_IOREMAP, caller);
-	if (!area)
-		return NULL;
-	area->phys_addr = phys_addr;
-	orig_addr = addr = (unsigned long)area->addr;
-
-	if (ioremap_page_range(addr, addr + size, phys_addr, pgprot)) {
-		vunmap((void *)orig_addr);
-		return NULL;
-	}
-
-	return (void __iomem *)(offset + (char *)orig_addr);
-}
-EXPORT_SYMBOL(__ioremap_caller);
-
-/*
- * Simple checks for non-translatable mappings.
- */
-static inline int iomapping_nontranslatable(unsigned long offset)
-{
-#ifdef CONFIG_29BIT
-	/*
-	 * In 29-bit mode this includes the fixed P1/P2 areas, as well as
-	 * parts of P3.
-	 */
-	if (PXSEG(offset) < P3SEG || offset >= P3_ADDR_MAX)
-		return 1;
-#endif
-
-	return 0;
-}
-
-void __iounmap(void __iomem *addr)
-{
-	unsigned long vaddr = (unsigned long __force)addr;
-	struct vm_struct *p;
-
-	/*
-	 * Nothing to do if there is no translatable mapping.
-	 */
-	if (iomapping_nontranslatable(vaddr))
-		return;
-
-	/*
-	 * There's no VMA if it's from an early fixed mapping.
-	 */
-	if (iounmap_fixed(addr) == 0)
-		return;
-
-	/*
-	 * If the PMB handled it, there's nothing else to do.
-	 */
-	if (pmb_unmap(addr) == 0)
-		return;
-
-	p = remove_vm_area((void *)(vaddr & PAGE_MASK));
-	if (!p) {
-		printk(KERN_ERR "%s: bad address %p\n", __func__, addr);
-		return;
-	}
-
-	kfree(p);
-}
-EXPORT_SYMBOL(__iounmap);
+#define BTE_LNSTAT_LOAD(_bte)						\
+			HUB_L(_bte->bte_base_addr)
+#define BTE_LNSTAT_STORE(_bte, _x)					\
+			HUB_S(_bte->bte_base_addr, (_x))
+#define BTE_SRC_STORE(_bte, _x)						\
+({									\
+		u64 __addr = ((_x) & ~AS_MASK);				\
+		if (is_shub2()) 					\
+			__addr = SH2_TIO_PHYS_TO_DMA(__addr);		\
+		HUB_S(_bte->bte_source_addr, __addr);			\
+})
+#define BTE_DEST_STORE(_bte, _x)

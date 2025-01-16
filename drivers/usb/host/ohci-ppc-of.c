@@ -1,236 +1,62 @@
-/*
- * OHCI HCD (Host Controller Driver) for USB.
- *
- * (C) Copyright 1999 Roman Weissgaerber <weissg@vienna.at>
- * (C) Copyright 2000-2002 David Brownell <dbrownell@users.sourceforge.net>
- * (C) Copyright 2002 Hewlett-Packard Company
- * (C) Copyright 2006 Sylvain Munaut <tnt@246tNt.com>
- *
- * Bus glue for OHCI HC on the of_platform bus
- *
- * Modified for of_platform bus from ohci-sa1111.c
- *
- * This file is licenced under the GPL.
- */
-
-#include <linux/signal.h>
-#include <linux/of_address.h>
-#include <linux/of_irq.h>
-#include <linux/of_platform.h>
-
-#include <asm/prom.h>
-
-
-static int
-ohci_ppc_of_start(struct usb_hcd *hcd)
-{
-	struct ohci_hcd	*ohci = hcd_to_ohci(hcd);
-	int		ret;
-
-	if ((ret = ohci_init(ohci)) < 0)
-		return ret;
-
-	if ((ret = ohci_run(ohci)) < 0) {
-		dev_err(hcd->self.controller, "can't start %s\n",
-			hcd->self.bus_name);
-		ohci_stop(hcd);
-		return ret;
-	}
-
-	return 0;
-}
-
-static const struct hc_driver ohci_ppc_of_hc_driver = {
-	.description =		hcd_name,
-	.product_desc =		"OF OHCI",
-	.hcd_priv_size =	sizeof(struct ohci_hcd),
-
-	/*
-	 * generic hardware linkage
-	 */
-	.irq =			ohci_irq,
-	.flags =		HCD_USB11 | HCD_MEMORY,
-
-	/*
-	 * basic lifecycle operations
-	 */
-	.start =		ohci_ppc_of_start,
-	.stop =			ohci_stop,
-	.shutdown = 		ohci_shutdown,
-
-	/*
-	 * managing i/o requests and associated device resources
-	 */
-	.urb_enqueue =		ohci_urb_enqueue,
-	.urb_dequeue =		ohci_urb_dequeue,
-	.endpoint_disable =	ohci_endpoint_disable,
-
-	/*
-	 * scheduling support
-	 */
-	.get_frame_number =	ohci_get_frame,
-
-	/*
-	 * root hub support
-	 */
-	.hub_status_data =	ohci_hub_status_data,
-	.hub_control =		ohci_hub_control,
-#ifdef	CONFIG_PM
-	.bus_suspend =		ohci_bus_suspend,
-	.bus_resume =		ohci_bus_resume,
-#endif
-	.start_port_reset =	ohci_start_port_reset,
-};
-
-
-static int ohci_hcd_ppc_of_probe(struct platform_device *op)
-{
-	struct device_node *dn = op->dev.of_node;
-	struct usb_hcd *hcd;
-	struct ohci_hcd	*ohci;
-	struct resource res;
-	int irq;
-
-	int rv;
-	int is_bigendian;
-	struct device_node *np;
-
-	if (usb_disabled())
-		return -ENODEV;
-
-	is_bigendian =
-		of_device_is_compatible(dn, "ohci-bigendian") ||
-		of_device_is_compatible(dn, "ohci-be");
-
-	dev_dbg(&op->dev, "initializing PPC-OF USB Controller\n");
-
-	rv = of_address_to_resource(dn, 0, &res);
-	if (rv)
-		return rv;
-
-	hcd = usb_create_hcd(&ohci_ppc_of_hc_driver, &op->dev, "PPC-OF USB");
-	if (!hcd)
-		return -ENOMEM;
-
-	hcd->rsrc_start = res.start;
-	hcd->rsrc_len = resource_size(&res);
-
-	hcd->regs = devm_ioremap_resource(&op->dev, &res);
-	if (IS_ERR(hcd->regs)) {
-		rv = PTR_ERR(hcd->regs);
-		goto err_rmr;
-	}
-
-	irq = irq_of_parse_and_map(dn, 0);
-	if (irq == NO_IRQ) {
-		dev_err(&op->dev, "%s: irq_of_parse_and_map failed\n",
-			__FILE__);
-		rv = -EBUSY;
-		goto err_rmr;
-	}
-
-	ohci = hcd_to_ohci(hcd);
-	if (is_bigendian) {
-		ohci->flags |= OHCI_QUIRK_BE_MMIO | OHCI_QUIRK_BE_DESC;
-		if (of_device_is_compatible(dn, "fsl,mpc5200-ohci"))
-			ohci->flags |= OHCI_QUIRK_FRAME_NO;
-		if (of_device_is_compatible(dn, "mpc5200-ohci"))
-			ohci->flags |= OHCI_QUIRK_FRAME_NO;
-	}
-
-	ohci_hcd_init(ohci);
-
-	rv = usb_add_hcd(hcd, irq, 0);
-	if (rv == 0) {
-		device_wakeup_enable(hcd->self.controller);
-		return 0;
-	}
-
-	/* by now, 440epx is known to show usb_23 erratum */
-	np = of_find_compatible_node(NULL, NULL, "ibm,usb-ehci-440epx");
-
-	/* Work around - At this point ohci_run has executed, the
-	* controller is running, everything, the root ports, etc., is
-	* set up.  If the ehci driver is loaded, put the ohci core in
-	* the suspended state.  The ehci driver will bring it out of
-	* suspended state when / if a non-high speed USB device is
-	* attached to the USB Host port.  If the ehci driver is not
-	* loaded, do nothing. request_mem_region is used to test if
-	* the ehci driver is loaded.
-	*/
-	if (np !=  NULL) {
-		if (!of_address_to_resource(np, 0, &res)) {
-			if (!request_mem_region(res.start, 0x4, hcd_name)) {
-				writel_be((readl_be(&ohci->regs->control) |
-					OHCI_USB_SUSPEND), &ohci->regs->control);
-					(void) readl_be(&ohci->regs->control);
-			} else
-				release_mem_region(res.start, 0x4);
-		} else
-			pr_debug("%s: cannot get ehci offset from fdt\n", __FILE__);
-		of_node_put(np);
-	}
-
-	irq_dispose_mapping(irq);
-err_rmr:
- 	usb_put_hcd(hcd);
-
-	return rv;
-}
-
-static int ohci_hcd_ppc_of_remove(struct platform_device *op)
-{
-	struct usb_hcd *hcd = platform_get_drvdata(op);
-
-	dev_dbg(&op->dev, "stopping PPC-OF USB Controller\n");
-
-	usb_remove_hcd(hcd);
-
-	irq_dispose_mapping(hcd->irq);
-
-	usb_put_hcd(hcd);
-
-	return 0;
-}
-
-static const struct of_device_id ohci_hcd_ppc_of_match[] = {
-#ifdef CONFIG_USB_OHCI_HCD_PPC_OF_BE
-	{
-		.name = "usb",
-		.compatible = "ohci-bigendian",
-	},
-	{
-		.name = "usb",
-		.compatible = "ohci-be",
-	},
-#endif
-#ifdef CONFIG_USB_OHCI_HCD_PPC_OF_LE
-	{
-		.name = "usb",
-		.compatible = "ohci-littledian",
-	},
-	{
-		.name = "usb",
-		.compatible = "ohci-le",
-	},
-#endif
-	{},
-};
-MODULE_DEVICE_TABLE(of, ohci_hcd_ppc_of_match);
-
-#if	!defined(CONFIG_USB_OHCI_HCD_PPC_OF_BE) && \
-	!defined(CONFIG_USB_OHCI_HCD_PPC_OF_LE)
-#error "No endianness selected for ppc-of-ohci"
-#endif
-
-
-static struct platform_driver ohci_hcd_ppc_of_driver = {
-	.probe		= ohci_hcd_ppc_of_probe,
-	.remove		= ohci_hcd_ppc_of_remove,
-	.shutdown	= usb_hcd_platform_shutdown,
-	.driver = {
-		.name = "ppc-of-ohci",
-		.of_match_table = ohci_hcd_ppc_of_match,
-	},
-};
-
+                              0x4020
+#define mmDCP4_OVL_SURFACE_ADDRESS                                              0x4220
+#define mmDCP5_OVL_SURFACE_ADDRESS                                              0x4420
+#define mmOVL_PITCH                                                             0x1a21
+#define mmDCP0_OVL_PITCH                                                        0x1a21
+#define mmDCP1_OVL_PITCH                                                        0x1c21
+#define mmDCP2_OVL_PITCH                                                        0x1e21
+#define mmDCP3_OVL_PITCH                                                        0x4021
+#define mmDCP4_OVL_PITCH                                                        0x4221
+#define mmDCP5_OVL_PITCH                                                        0x4421
+#define mmOVL_SURFACE_ADDRESS_HIGH                                              0x1a22
+#define mmDCP0_OVL_SURFACE_ADDRESS_HIGH                                         0x1a22
+#define mmDCP1_OVL_SURFACE_ADDRESS_HIGH                                         0x1c22
+#define mmDCP2_OVL_SURFACE_ADDRESS_HIGH                                         0x1e22
+#define mmDCP3_OVL_SURFACE_ADDRESS_HIGH                                         0x4022
+#define mmDCP4_OVL_SURFACE_ADDRESS_HIGH                                         0x4222
+#define mmDCP5_OVL_SURFACE_ADDRESS_HIGH                                         0x4422
+#define mmOVL_SURFACE_OFFSET_X                                                  0x1a23
+#define mmDCP0_OVL_SURFACE_OFFSET_X                                             0x1a23
+#define mmDCP1_OVL_SURFACE_OFFSET_X                                             0x1c23
+#define mmDCP2_OVL_SURFACE_OFFSET_X                                             0x1e23
+#define mmDCP3_OVL_SURFACE_OFFSET_X                                             0x4023
+#define mmDCP4_OVL_SURFACE_OFFSET_X                                             0x4223
+#define mmDCP5_OVL_SURFACE_OFFSET_X                                             0x4423
+#define mmOVL_SURFACE_OFFSET_Y                                                  0x1a24
+#define mmDCP0_OVL_SURFACE_OFFSET_Y                                             0x1a24
+#define mmDCP1_OVL_SURFACE_OFFSET_Y                                             0x1c24
+#define mmDCP2_OVL_SURFACE_OFFSET_Y                                             0x1e24
+#define mmDCP3_OVL_SURFACE_OFFSET_Y                                             0x4024
+#define mmDCP4_OVL_SURFACE_OFFSET_Y                                             0x4224
+#define mmDCP5_OVL_SURFACE_OFFSET_Y                                             0x4424
+#define mmOVL_START                                                             0x1a25
+#define mmDCP0_OVL_START                                                        0x1a25
+#define mmDCP1_OVL_START                                                        0x1c25
+#define mmDCP2_OVL_START                                                        0x1e25
+#define mmDCP3_OVL_START                                                        0x4025
+#define mmDCP4_OVL_START                                                        0x4225
+#define mmDCP5_OVL_START                                                        0x4425
+#define mmOVL_END                                                               0x1a26
+#define mmDCP0_OVL_END                                                          0x1a26
+#define mmDCP1_OVL_END                                                          0x1c26
+#define mmDCP2_OVL_END                                                          0x1e26
+#define mmDCP3_OVL_END                                                          0x4026
+#define mmDCP4_OVL_END                                                          0x4226
+#define mmDCP5_OVL_END                                                          0x4426
+#define mmOVL_UPDATE                                                            0x1a27
+#define mmDCP0_OVL_UPDATE                                                       0x1a27
+#define mmDCP1_OVL_UPDATE                                                       0x1c27
+#define mmDCP2_OVL_UPDATE                                                       0x1e27
+#define mmDCP3_OVL_UPDATE                                                       0x4027
+#define mmDCP4_OVL_UPDATE                                                       0x4227
+#define mmDCP5_OVL_UPDATE                                                       0x4427
+#define mmOVL_SURFACE_ADDRESS_INUSE                                             0x1a28
+#define mmDCP0_OVL_SURFACE_ADDRESS_INUSE                                        0x1a28
+#define mmDCP1_OVL_SURFACE_ADDRESS_INUSE                                        0x1c28
+#define mmDCP2_OVL_SURFACE_ADDRESS_INUSE                                        0x1e28
+#define mmDCP3_OVL_SURFACE_ADDRESS_INUSE                                        0x4028
+#define mmDCP4_OVL_SURFACE_ADDRESS_INUSE                                        0x4228
+#define mmDCP5_OVL_SURFACE_ADDRESS_INUSE                                        0x4428
+#define mmOVL_DFQ_CONTROL                                                       0x1a29
+#define mmDCP0_OVL_DFQ_CONTROL                                                  0x1a29
+#define mmDCP1_OVL_DFQ_CONTROL                                  

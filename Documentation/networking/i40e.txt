@@ -1,118 +1,80 @@
-Linux Base Driver for the Intel(R) Ethernet Controller XL710 Family
-===================================================================
-
-Intel i40e Linux driver.
-Copyright(c) 2013 Intel Corporation.
-
-Contents
-========
-
-- Identifying Your Adapter
-- Additional Configurations
-- Performance Tuning
-- Known Issues
-- Support
-
-
-Identifying Your Adapter
-========================
-
-The driver in this release is compatible with the Intel Ethernet
-Controller XL710 Family.
-
-For more information on how to identify your adapter, go to the Adapter &
-Driver ID Guide at:
-
-    http://support.intel.com/support/network/sb/CS-012904.htm
-
-
-Enabling the driver
-===================
-
-The driver is enabled via the standard kernel configuration system,
-using the make command:
-
-     Make oldconfig/silentoldconfig/menuconfig/etc.
-
-The driver is located in the menu structure at:
-
-	-> Device Drivers
-	  -> Network device support (NETDEVICES [=y])
-	    -> Ethernet driver support
-	      -> Intel devices
-	        -> Intel(R) Ethernet Controller XL710 Family
-
-Additional Configurations
-=========================
-
-  Generic Receive Offload (GRO)
-  -----------------------------
-  The driver supports the in-kernel software implementation of GRO.  GRO has
-  shown that by coalescing Rx traffic into larger chunks of data, CPU
-  utilization can be significantly reduced when under large Rx load.  GRO is
-  an evolution of the previously-used LRO interface.  GRO is able to coalesce
-  other protocols besides TCP.  It's also safe to use with configurations that
-  are problematic for LRO, namely bridging and iSCSI.
-
-  Ethtool
-  -------
-  The driver utilizes the ethtool interface for driver configuration and
-  diagnostics, as well as displaying statistical information. The latest
-  ethtool version is required for this functionality.
-
-  The latest release of ethtool can be found from
-  https://www.kernel.org/pub/software/network/ethtool
-
-  Data Center Bridging (DCB)
-  --------------------------
-  DCB configuration is not currently supported.
-
-  FCoE
-  ----
-  The driver supports Fiber Channel over Ethernet (FCoE) and Data Center
-  Bridging (DCB) functionality. Configuring DCB and FCoE is outside the scope
-  of this driver doc. Refer to http://www.open-fcoe.org/ for FCoE project
-  information and http://www.open-lldp.org/ or email list
-  e1000-eedc@lists.sourceforge.net for DCB information.
-
-  MAC and VLAN anti-spoofing feature
-  ----------------------------------
-  When a malicious driver attempts to send a spoofed packet, it is dropped by
-  the hardware and not transmitted.  An interrupt is sent to the PF driver
-  notifying it of the spoof attempt.
-
-  When a spoofed packet is detected the PF driver will send the following
-  message to the system log (displayed by  the "dmesg" command):
-
-  Spoof event(s) detected on VF (n)
-
-  Where n=the VF that attempted to do the spoofing.
-
-
-Performance Tuning
-==================
-
-An excellent article on performance tuning can be found at:
-
-http://www.redhat.com/promo/summit/2008/downloads/pdf/Thursday/Mark_Wagner.pdf
-
-
-Known Issues
-============
-
-
-Support
-=======
-
-For general information, go to the Intel support website at:
-
-    http://support.intel.com
-
-or the Intel Wired Networking project hosted by Sourceforge at:
-
-    http://e1000.sourceforge.net
-
-If an issue is identified with the released source code on the supported
-kernel with a supported adapter, email the specific information related
-to the issue to e1000-devel@lists.sourceforge.net and copy
-netdev@vger.kernel.org.
+te Console (IRC)"
+CPQA020 "Compaq Integrated CD Rom Adapter"
+CPQA030 "Compaq Integrated CD Rom Adapter"
+CPQA040 "Compaq Automatic Server Recovery (ASR)"
+CPQA045 "Compaq Integrated Management Display Information"
+CPQF000 "Compaq Fixed Disk Drive Feature"
+CPQF100 "Compaq Ethernet 16TP Controller"
+CPQF110 "Compaq Token Ring 16TR Controller"
+CPQF120 "Compaq NetFlex-3/E Controller"
+CPQF140 "Compaq NetFlex-3/E Controller"
+CPQFA0D "Compaq SYSTEMPRO 4-Socket System Memory Board"
+CPQFA0E "Compaq SYSTEMPRO 6-Socket System Memory Board"
+CPQFA0F "Compaq DESKPRO 486/25 System Memory Board"
+CPQFA1A "Compaq DESKPRO 3-Socket System Memory Board"
+CPQFA1B "Compaq DESKPRO 486/50 System Memory Board"
+CPQFA1C "Compaq System Memory Expansion Board"
+CPQFA1D "Compaq SYSTEMPRO/XL Memory Expansion Board"
+CPQFA1E "Compaq Memory Expansion Board"
+CPQFB03 "Compaq Async/Parallel Printer Intf Assy 000990"
+CPQFB07 "Compaq DESKPRO 2400 Baud Modem"
+CPQFB09 "Compaq SpeedPaq 144/I Modem"
+CPQFB11 "Compaq Internal 28.8/33.6 Data+Fax Modem"
+CPQFC0B "Compaq Advanced Graphics 1024 Board"
+CPQFD08 "Compaq 135Mb, 150/250Mb Tape Adapter"
+CPQFD13 "Compaq 15MHz ESDI Fixed Disk Controller 001283"
+CPQFD17 "Compaq SCSI Tape Adapter"
+CPX0301 "Universal 10/100VG Selectable EISA LAN Adapter"
+CRS3203 "Crescendo 320 FDDI/CDDI EISA Adapter"
+CRS3204 "Cisco CDDI/FDDI EISA Adapter"
+CSI0690 "CSI F70X9 EISA FDDI DNI adapter card"
+CUI0000 "CUI Examples -- Virtual Board"
+DBI0101 "Digi C/X Host Adapter - EISA"
+DBI0102 "Digi C/X Host Adapter - EISA"
+DBI0201 "Digi EISA/Xem Host Adapter"
+DBI0301 "Digi EPC/X Host Adapter - EISA"
+DBI0501 "Digi Ports/Xem Host Adapter - ISA"
+DBI0601 "Digi EPC/X Host Adapter - ISA"
+DBI0701 "Digi C/X Host Adapter - ISA"
+DBI0801 "Digi PC/Xr - ISA"
+DBI0901 "Digi PC/Xt - ISA"
+DBI0C01 "Digi DataFire - ISA"
+DBI0D01 "Digi DataFire/4 - ISA"
+DBI0E01 "Digi PC IMAC - ISA"
+DBI0F01 "Digi PC IMAC/4 - ISA"
+DBI1001 "Digi PC/Xe - ISA"
+DBI1101 "Digi ES/4 Host Adapter - EISA"
+DBI1201 "Digi Acceleport Xr 920 - ISA"
+DEC1011 "Digital EISA Video Controller (EVC-1)"
+DEC1021 "Digital EISA SCSI Controller (ESC-1)"
+DEC1031 "DECpc MTE Series System Board"
+DEC2030 "Digital Ethernet Controller (DE203)"
+DEC2040 "Digital Ethernet Controller (DE204)"
+DEC2050 "Digital Ethernet Controller (DE205)"
+DEC2400 "DECpc AXP/150 System Board"
+DEC2500 "DEC EISA NVRAM for Alpha AXP"
+DEC2A01 "Digital AlphaServer 2100 Family System Board"
+DEC2E00 "Digital KFESA DSSI EISA Host Adapter"
+DEC2F00 "Digital WANcontroller/EISA (DNSES)"
+DEC3001 "DEC FDDIcontroller/EISA Adapter"
+DEC3002 "DEC FDDIcontroller/EISA Adapter"
+DEC3003 "DEC FDDIcontroller/EISA Adapter"
+DEC3004 "DEC FDDI Controller"
+DEC4220 "Digital EISA Ethernet Controller (DE422-SA)"
+DEC4250 "Digital EtherWORKS Turbo EISA (DE425-AA)"
+DEC5000 "Digital AlphaServer 1000, 1000A and AlphaStation 600A System Board"
+DEC5100 "Digital AlphaStation 600 Family System Board"
+DEC5301 "Digital 800 AlphaServer Family System Board"
+DEC6000 "Digital AlphaServer 8200 and 8400 Family System Board"
+DEC6400 "Digital AlphaServer 4100 System Board"
+DEC8101 "DEC VGA 1024 Graphics Adapter"
+DEC8102 "DEC 8514/A-Compatible Graphics Adapter"
+DEC8103 "DECpc VGA 1024 NI Graphics Adapter"
+DEC8300 "DEC DEPCA LC Ethernet Controller"
+DEC8301 "DEC DEPCA TURBO Ethernet Controller"
+DEL0000 "Generic ISA Board"
+DEL0001 "Dell System(R) 425E(TM) System Board"
+DEL0002 "Dell System(R) 433E(TM) System Board"
+DEL0003 "Dell System(R) 425TE(TM) System Board"
+DEL0004 "Dell System(R) 433TE(TM) System Board"
+DEL0005 "Dell Powerline(TM) W

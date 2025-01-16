@@ -1,619 +1,486 @@
-/*
- * USB Compaq iPAQ driver
- *
- *	Copyright (C) 2001 - 2002
- *	    Ganesh Varadarajan <ganesh@veritas.com>
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License as published by
- *	the Free Software Foundation; either version 2 of the License, or
- *	(at your option) any later version.
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/spinlock.h>
-#include <linux/uaccess.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-
-#define KP_RETRIES	100
-
-#define DRIVER_AUTHOR "Ganesh Varadarajan <ganesh@veritas.com>"
-#define DRIVER_DESC "USB PocketPC PDA driver"
-
-static int connect_retries = KP_RETRIES;
-static int initial_wait;
-
-/* Function prototypes for an ipaq */
-static int  ipaq_open(struct tty_struct *tty,
-			struct usb_serial_port *port);
-static int  ipaq_calc_num_ports(struct usb_serial *serial);
-static int  ipaq_startup(struct usb_serial *serial);
-
-static const struct usb_device_id ipaq_id_table[] = {
-	{ USB_DEVICE(0x0104, 0x00BE) }, /* Socket USB Sync */
-	{ USB_DEVICE(0x03F0, 0x1016) }, /* HP USB Sync */
-	{ USB_DEVICE(0x03F0, 0x1116) }, /* HP USB Sync 1611 */
-	{ USB_DEVICE(0x03F0, 0x1216) }, /* HP USB Sync 1612 */
-	{ USB_DEVICE(0x03F0, 0x2016) }, /* HP USB Sync 1620 */
-	{ USB_DEVICE(0x03F0, 0x2116) }, /* HP USB Sync 1621 */
-	{ USB_DEVICE(0x03F0, 0x2216) }, /* HP USB Sync 1622 */
-	{ USB_DEVICE(0x03F0, 0x3016) }, /* HP USB Sync 1630 */
-	{ USB_DEVICE(0x03F0, 0x3116) }, /* HP USB Sync 1631 */
-	{ USB_DEVICE(0x03F0, 0x3216) }, /* HP USB Sync 1632 */
-	{ USB_DEVICE(0x03F0, 0x4016) }, /* HP USB Sync 1640 */
-	{ USB_DEVICE(0x03F0, 0x4116) }, /* HP USB Sync 1641 */
-	{ USB_DEVICE(0x03F0, 0x4216) }, /* HP USB Sync 1642 */
-	{ USB_DEVICE(0x03F0, 0x5016) }, /* HP USB Sync 1650 */
-	{ USB_DEVICE(0x03F0, 0x5116) }, /* HP USB Sync 1651 */
-	{ USB_DEVICE(0x03F0, 0x5216) }, /* HP USB Sync 1652 */
-	{ USB_DEVICE(0x0409, 0x00D5) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x0409, 0x00D6) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x0409, 0x00D7) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x0409, 0x8024) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x0409, 0x8025) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x043E, 0x9C01) }, /* LGE USB Sync */
-	{ USB_DEVICE(0x045E, 0x00CE) }, /* Microsoft USB Sync */
-	{ USB_DEVICE(0x045E, 0x0400) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0401) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0402) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0403) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0404) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0405) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0406) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0407) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0408) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0409) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x040A) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x040B) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x040C) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x040D) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x040E) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x040F) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0410) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0411) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0412) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0413) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0414) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0415) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0416) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0417) }, /* Windows Powered Pocket PC 2002 */
-	{ USB_DEVICE(0x045E, 0x0432) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0433) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0434) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0435) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0436) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0437) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0438) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0439) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x043A) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x043B) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x043C) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x043D) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x043E) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x043F) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0440) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0441) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0442) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0443) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0444) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0445) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0446) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0447) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0448) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0449) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x044A) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x044B) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x044C) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x044D) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x044E) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x044F) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0450) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0451) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0452) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0453) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0454) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0455) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0456) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0457) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0458) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0459) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x045A) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x045B) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x045C) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x045D) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x045E) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x045F) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0460) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0461) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0462) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0463) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0464) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0465) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0466) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0467) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0468) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0469) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x046A) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x046B) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x046C) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x046D) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x046E) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x046F) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0470) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0471) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0472) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0473) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0474) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0475) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0476) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0477) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0478) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x0479) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x047A) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x047B) }, /* Windows Powered Pocket PC 2003 */
-	{ USB_DEVICE(0x045E, 0x04C8) }, /* Windows Powered Smartphone 2002 */
-	{ USB_DEVICE(0x045E, 0x04C9) }, /* Windows Powered Smartphone 2002 */
-	{ USB_DEVICE(0x045E, 0x04CA) }, /* Windows Powered Smartphone 2002 */
-	{ USB_DEVICE(0x045E, 0x04CB) }, /* Windows Powered Smartphone 2002 */
-	{ USB_DEVICE(0x045E, 0x04CC) }, /* Windows Powered Smartphone 2002 */
-	{ USB_DEVICE(0x045E, 0x04CD) }, /* Windows Powered Smartphone 2002 */
-	{ USB_DEVICE(0x045E, 0x04CE) }, /* Windows Powered Smartphone 2002 */
-	{ USB_DEVICE(0x045E, 0x04D7) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04D8) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04D9) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04DA) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04DB) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04DC) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04DD) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04DE) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04DF) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E0) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E1) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E2) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E3) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E4) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E5) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E6) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E7) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E8) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04E9) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x045E, 0x04EA) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x049F, 0x0003) }, /* Compaq iPAQ USB Sync */
-	{ USB_DEVICE(0x049F, 0x0032) }, /* Compaq iPAQ USB Sync */
-	{ USB_DEVICE(0x04A4, 0x0014) }, /* Hitachi USB Sync */
-	{ USB_DEVICE(0x04AD, 0x0301) }, /* USB Sync 0301 */
-	{ USB_DEVICE(0x04AD, 0x0302) }, /* USB Sync 0302 */
-	{ USB_DEVICE(0x04AD, 0x0303) }, /* USB Sync 0303 */
-	{ USB_DEVICE(0x04AD, 0x0306) }, /* GPS Pocket PC USB Sync */
-	{ USB_DEVICE(0x04B7, 0x0531) }, /* MyGuide 7000 XL USB Sync */
-	{ USB_DEVICE(0x04C5, 0x1058) }, /* FUJITSU USB Sync */
-	{ USB_DEVICE(0x04C5, 0x1079) }, /* FUJITSU USB Sync */
-	{ USB_DEVICE(0x04DA, 0x2500) }, /* Panasonic USB Sync */
-	{ USB_DEVICE(0x04DD, 0x9102) }, /* SHARP WS003SH USB Modem */
-	{ USB_DEVICE(0x04DD, 0x9121) }, /* SHARP WS004SH USB Modem */
-	{ USB_DEVICE(0x04DD, 0x9123) }, /* SHARP WS007SH USB Modem */
-	{ USB_DEVICE(0x04DD, 0x9151) }, /* SHARP S01SH USB Modem */
-	{ USB_DEVICE(0x04DD, 0x91AC) }, /* SHARP WS011SH USB Modem */
-	{ USB_DEVICE(0x04E8, 0x5F00) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x5F01) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x5F02) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x5F03) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x5F04) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6611) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6613) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6615) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6617) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6619) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x661B) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x662E) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6630) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6632) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04f1, 0x3011) }, /* JVC USB Sync */
-	{ USB_DEVICE(0x04F1, 0x3012) }, /* JVC USB Sync */
-	{ USB_DEVICE(0x0502, 0x1631) }, /* c10 Series */
-	{ USB_DEVICE(0x0502, 0x1632) }, /* c20 Series */
-	{ USB_DEVICE(0x0502, 0x16E1) }, /* Acer n10 Handheld USB Sync */
-	{ USB_DEVICE(0x0502, 0x16E2) }, /* Acer n20 Handheld USB Sync */
-	{ USB_DEVICE(0x0502, 0x16E3) }, /* Acer n30 Handheld USB Sync */
-	{ USB_DEVICE(0x0536, 0x01A0) }, /* HHP PDT */
-	{ USB_DEVICE(0x0543, 0x0ED9) }, /* ViewSonic Color Pocket PC V35 */
-	{ USB_DEVICE(0x0543, 0x1527) }, /* ViewSonic Color Pocket PC V36 */
-	{ USB_DEVICE(0x0543, 0x1529) }, /* ViewSonic Color Pocket PC V37 */
-	{ USB_DEVICE(0x0543, 0x152B) }, /* ViewSonic Color Pocket PC V38 */
-	{ USB_DEVICE(0x0543, 0x152E) }, /* ViewSonic Pocket PC */
-	{ USB_DEVICE(0x0543, 0x1921) }, /* ViewSonic Communicator Pocket PC */
-	{ USB_DEVICE(0x0543, 0x1922) }, /* ViewSonic Smartphone */
-	{ USB_DEVICE(0x0543, 0x1923) }, /* ViewSonic Pocket PC V30 */
-	{ USB_DEVICE(0x05E0, 0x2000) }, /* Symbol USB Sync */
-	{ USB_DEVICE(0x05E0, 0x2001) }, /* Symbol USB Sync 0x2001 */
-	{ USB_DEVICE(0x05E0, 0x2002) }, /* Symbol USB Sync 0x2002 */
-	{ USB_DEVICE(0x05E0, 0x2003) }, /* Symbol USB Sync 0x2003 */
-	{ USB_DEVICE(0x05E0, 0x2004) }, /* Symbol USB Sync 0x2004 */
-	{ USB_DEVICE(0x05E0, 0x2005) }, /* Symbol USB Sync 0x2005 */
-	{ USB_DEVICE(0x05E0, 0x2006) }, /* Symbol USB Sync 0x2006 */
-	{ USB_DEVICE(0x05E0, 0x2007) }, /* Symbol USB Sync 0x2007 */
-	{ USB_DEVICE(0x05E0, 0x2008) }, /* Symbol USB Sync 0x2008 */
-	{ USB_DEVICE(0x05E0, 0x2009) }, /* Symbol USB Sync 0x2009 */
-	{ USB_DEVICE(0x05E0, 0x200A) }, /* Symbol USB Sync 0x200A */
-	{ USB_DEVICE(0x067E, 0x1001) }, /* Intermec Mobile Computer */
-	{ USB_DEVICE(0x07CF, 0x2001) }, /* CASIO USB Sync 2001 */
-	{ USB_DEVICE(0x07CF, 0x2002) }, /* CASIO USB Sync 2002 */
-	{ USB_DEVICE(0x07CF, 0x2003) }, /* CASIO USB Sync 2003 */
-	{ USB_DEVICE(0x0930, 0x0700) }, /* TOSHIBA USB Sync 0700 */
-	{ USB_DEVICE(0x0930, 0x0705) }, /* TOSHIBA Pocket PC e310 */
-	{ USB_DEVICE(0x0930, 0x0706) }, /* TOSHIBA Pocket PC e740 */
-	{ USB_DEVICE(0x0930, 0x0707) }, /* TOSHIBA Pocket PC e330 Series */
-	{ USB_DEVICE(0x0930, 0x0708) }, /* TOSHIBA Pocket PC e350 Series */
-	{ USB_DEVICE(0x0930, 0x0709) }, /* TOSHIBA Pocket PC e750 Series */
-	{ USB_DEVICE(0x0930, 0x070A) }, /* TOSHIBA Pocket PC e400 Series */
-	{ USB_DEVICE(0x0930, 0x070B) }, /* TOSHIBA Pocket PC e800 Series */
-	{ USB_DEVICE(0x094B, 0x0001) }, /* Linkup Systems USB Sync */
-	{ USB_DEVICE(0x0960, 0x0065) }, /* BCOM USB Sync 0065 */
-	{ USB_DEVICE(0x0960, 0x0066) }, /* BCOM USB Sync 0066 */
-	{ USB_DEVICE(0x0960, 0x0067) }, /* BCOM USB Sync 0067 */
-	{ USB_DEVICE(0x0961, 0x0010) }, /* Portatec USB Sync */
-	{ USB_DEVICE(0x099E, 0x0052) }, /* Trimble GeoExplorer */
-	{ USB_DEVICE(0x099E, 0x4000) }, /* TDS Data Collector */
-	{ USB_DEVICE(0x0B05, 0x4200) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x4201) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x4202) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x420F) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x9200) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x9202) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x00CE) }, /* HTC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x00CF) }, /* HTC USB Modem */
-	{ USB_DEVICE(0x0BB4, 0x0A01) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A02) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A03) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A04) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A05) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A06) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A07) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A08) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A09) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A0A) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A0B) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A0C) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A0D) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A0E) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A0F) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A10) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A11) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A12) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A13) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A14) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A15) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A16) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A17) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A18) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A19) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A1A) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A1B) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A1C) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A1D) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A1E) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A1F) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A20) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A21) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A22) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A23) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A24) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A25) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A26) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A27) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A28) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A29) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A2A) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A2B) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A2C) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A2D) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A2E) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A2F) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A30) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A31) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A32) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A33) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A34) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A35) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A36) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A37) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A38) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A39) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A3A) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A3B) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A3C) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A3D) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A3E) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A3F) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A40) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A41) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A42) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A43) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A44) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A45) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A46) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A47) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A48) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A49) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A4A) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A4B) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A4C) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A4D) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A4E) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A4F) }, /* PocketPC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A50) }, /* HTC SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A51) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A52) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A53) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A54) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A55) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A56) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A57) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A58) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A59) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A5A) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A5B) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A5C) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A5D) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A5E) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A5F) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A60) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A61) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A62) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A63) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A64) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A65) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A66) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A67) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A68) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A69) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A6A) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A6B) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A6C) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A6D) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A6E) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A6F) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A70) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A71) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A72) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A73) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A74) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A75) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A76) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A77) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A78) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A79) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A7A) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A7B) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A7C) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A7D) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A7E) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A7F) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A80) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A81) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A82) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A83) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A84) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A85) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A86) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A87) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A88) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A89) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A8A) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A8B) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A8C) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A8D) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A8E) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A8F) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A90) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A91) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A92) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A93) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A94) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A95) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A96) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A97) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A98) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A99) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A9A) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A9B) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A9C) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A9D) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A9E) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0A9F) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0BCE) }, /* "High Tech Computer Corp" */
-	{ USB_DEVICE(0x0BF8, 0x1001) }, /* Fujitsu Siemens Computers USB Sync */
-	{ USB_DEVICE(0x0C44, 0x03A2) }, /* Motorola iDEN Smartphone */
-	{ USB_DEVICE(0x0C8E, 0x6000) }, /* Cesscom Luxian Series */
-	{ USB_DEVICE(0x0CAD, 0x9001) }, /* Motorola PowerPad Pocket PC Device */
-	{ USB_DEVICE(0x0F4E, 0x0200) }, /* Freedom Scientific USB Sync */
-	{ USB_DEVICE(0x0F98, 0x0201) }, /* Cyberbank USB Sync */
-	{ USB_DEVICE(0x0FB8, 0x3001) }, /* Wistron USB Sync */
-	{ USB_DEVICE(0x0FB8, 0x3002) }, /* Wistron USB Sync */
-	{ USB_DEVICE(0x0FB8, 0x3003) }, /* Wistron USB Sync */
-	{ USB_DEVICE(0x0FB8, 0x4001) }, /* Wistron USB Sync */
-	{ USB_DEVICE(0x1066, 0x00CE) }, /* E-TEN USB Sync */
-	{ USB_DEVICE(0x1066, 0x0300) }, /* E-TEN P3XX Pocket PC */
-	{ USB_DEVICE(0x1066, 0x0500) }, /* E-TEN P5XX Pocket PC */
-	{ USB_DEVICE(0x1066, 0x0600) }, /* E-TEN P6XX Pocket PC */
-	{ USB_DEVICE(0x1066, 0x0700) }, /* E-TEN P7XX Pocket PC */
-	{ USB_DEVICE(0x1114, 0x0001) }, /* Psion Teklogix Sync 753x */
-	{ USB_DEVICE(0x1114, 0x0004) }, /* Psion Teklogix Sync netBookPro */
-	{ USB_DEVICE(0x1114, 0x0006) }, /* Psion Teklogix Sync 7525 */
-	{ USB_DEVICE(0x1182, 0x1388) }, /* VES USB Sync */
-	{ USB_DEVICE(0x11D9, 0x1002) }, /* Rugged Pocket PC 2003 */
-	{ USB_DEVICE(0x11D9, 0x1003) }, /* Rugged Pocket PC 2003 */
-	{ USB_DEVICE(0x1231, 0xCE01) }, /* USB Sync 03 */
-	{ USB_DEVICE(0x1231, 0xCE02) }, /* USB Sync 03 */
-	{ USB_DEVICE(0x1690, 0x0601) }, /* Askey USB Sync */
-	{ USB_DEVICE(0x22B8, 0x4204) }, /* Motorola MPx200 Smartphone */
-	{ USB_DEVICE(0x22B8, 0x4214) }, /* Motorola MPc GSM */
-	{ USB_DEVICE(0x22B8, 0x4224) }, /* Motorola MPx220 Smartphone */
-	{ USB_DEVICE(0x22B8, 0x4234) }, /* Motorola MPc CDMA */
-	{ USB_DEVICE(0x22B8, 0x4244) }, /* Motorola MPx100 Smartphone */
-	{ USB_DEVICE(0x3340, 0x011C) }, /* Mio DigiWalker PPC StrongARM */
-	{ USB_DEVICE(0x3340, 0x0326) }, /* Mio DigiWalker 338 */
-	{ USB_DEVICE(0x3340, 0x0426) }, /* Mio DigiWalker 338 */
-	{ USB_DEVICE(0x3340, 0x043A) }, /* Mio DigiWalker USB Sync */
-	{ USB_DEVICE(0x3340, 0x051C) }, /* MiTAC USB Sync 528 */
-	{ USB_DEVICE(0x3340, 0x053A) }, /* Mio DigiWalker SmartPhone USB Sync */
-	{ USB_DEVICE(0x3340, 0x071C) }, /* MiTAC USB Sync */
-	{ USB_DEVICE(0x3340, 0x0B1C) }, /* Generic PPC StrongARM */
-	{ USB_DEVICE(0x3340, 0x0E3A) }, /* Generic PPC USB Sync */
-	{ USB_DEVICE(0x3340, 0x0F1C) }, /* Itautec USB Sync */
-	{ USB_DEVICE(0x3340, 0x0F3A) }, /* Generic SmartPhone USB Sync */
-	{ USB_DEVICE(0x3340, 0x1326) }, /* Itautec USB Sync */
-	{ USB_DEVICE(0x3340, 0x191C) }, /* YAKUMO USB Sync */
-	{ USB_DEVICE(0x3340, 0x2326) }, /* Vobis USB Sync */
-	{ USB_DEVICE(0x3340, 0x3326) }, /* MEDION Winodws Moble USB Sync */
-	{ USB_DEVICE(0x3708, 0x20CE) }, /* Legend USB Sync */
-	{ USB_DEVICE(0x3708, 0x21CE) }, /* Lenovo USB Sync */
-	{ USB_DEVICE(0x4113, 0x0210) }, /* Mobile Media Technology USB Sync */
-	{ USB_DEVICE(0x4113, 0x0211) }, /* Mobile Media Technology USB Sync */
-	{ USB_DEVICE(0x4113, 0x0400) }, /* Mobile Media Technology USB Sync */
-	{ USB_DEVICE(0x4113, 0x0410) }, /* Mobile Media Technology USB Sync */
-	{ USB_DEVICE(0x413C, 0x4001) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4002) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4003) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4004) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4005) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4006) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4007) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4008) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4009) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x4505, 0x0010) }, /* Smartphone */
-	{ USB_DEVICE(0x5E04, 0xCE00) }, /* SAGEM Wireless Assistant */
-	{ }                             /* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, ipaq_id_table);
-
-
-/* All of the device info needed for the Compaq iPAQ */
-static struct usb_serial_driver ipaq_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"ipaq",
-	},
-	.description =		"PocketPC PDA",
-	.id_table =		ipaq_id_table,
-	.bulk_in_size =		256,
-	.bulk_out_size =	256,
-	.open =			ipaq_open,
-	.attach =		ipaq_startup,
-	.calc_num_ports =	ipaq_calc_num_ports,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&ipaq_device, NULL
-};
-
-static int ipaq_open(struct tty_struct *tty,
-			struct usb_serial_port *port)
-{
-	struct usb_serial	*serial = port->serial;
-	int			result = 0;
-	int			retries = connect_retries;
-
-	msleep(1000*initial_wait);
-
-	/*
-	 * Send out control message observed in win98 sniffs. Not sure what
-	 * it does, but from empirical observations, it seems that the device
-	 * will start the chat sequence once one of these messages gets
-	 * through. Since this has a reasonably high failure rate, we retry
-	 * several times.
-	 */
-	while (retries) {
-		retries--;
-		result = usb_control_msg(serial->dev,
-				usb_sndctrlpipe(serial->dev, 0), 0x22, 0x21,
-				0x1, 0, NULL, 0, 100);
-		if (!result)
-			break;
-
-		msleep(1000);
-	}
-	if (!retries && result) {
-		dev_err(&port->dev, "%s - failed doing control urb, error %d\n",
-							__func__, result);
-		return result;
-	}
-
-	return usb_serial_generic_open(tty, port);
-}
-
-static int ipaq_calc_num_ports(struct usb_serial *serial)
-{
-	/*
-	 * some devices have 3 endpoints, the 3rd of which
-	 * must be ignored as it would make the core
-	 * create a second port which oopses when used
-	 */
-	int ipaq_num_ports = 1;
-
-	dev_dbg(&serial->dev->dev, "%s - numberofendpoints: %d\n", __func__,
-		(int)serial->interface->cur_altsetting->desc.bNumEndpoints);
-
-	/*
-	 * a few devices have 4 endpoints, seemingly Yakuma devices,
-	 * and we need the second pair, so let them have 2 ports
-	 *
-	 * TODO: can we drop port 1 ?
-	 */
-	if (serial->interface->cur_altsetting->desc.bNumEndpoints > 3) {
-		ipaq_num_ports = 2;
-	}
-
-	return ipaq_num_ports;
-}
-
-
-static int ipaq_startup(struct usb_serial *serial)
-{
-	/* Some of the devices in ipaq_id_table[] are composite, and we
-	 * shouldn't bind to all the interfaces.  This test will rule out
-	 * some obviously invalid possibilities.
-	 */
-	if (serial->num_bulk_in < serial->num_ports ||
-			serial->num_bulk_out < serial->num_ports)
-		return -ENODEV;
-
-	if (serial->dev->actconfig->desc.bConfigurationValue != 1) {
-		/*
-		 * FIXME: HP iPaq rx3715, possibly others, have 1 config that
-		 * is labeled as 2
-		 */
-
-		dev_err(&serial->dev->dev, "active config #%d != 1 ??\n",
-			serial->dev->actconfig->desc.bConfigurationValue);
-		return -ENODEV;
-	}
-
-	dev_dbg(&serial->dev->dev,
-		"%s - iPAQ module configured for %d ports\n", __func__,
-		serial->num_ports);
-
-	return usb_reset_configuration(serial->dev);
-}
-
-module_usb_serial_driver(serial_drivers, ipaq_id_table);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
-
-module_param(connect_retries, int, S_IRUGO|S_IWUSR);
-MODULE_PARM_DESC(connect_retries,
-		"Maximum number of connect retries (one second each)");
-
-module_param(initial_wait, int, S_IRUGO|S_IWUSR);
-MODULE_PARM_DESC(initial_wait,
-		"Time to wait before attempting a connection (in seconds)");
+define D3F3_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1_MASK 0x700000
+#define D3F3_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_NP_VC1__SHIFT 0x14
+#define D3F3_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1_MASK 0x7000000
+#define D3F3_PCIE_TX_CREDITS_FCU_THRESHOLD__TX_FCU_THRESHOLD_CPL_VC1__SHIFT 0x18
+#define D3F3_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL_MASK 0x1
+#define D3F3_PCIE_P_PORT_LANE_STATUS__PORT_LANE_REVERSAL__SHIFT 0x0
+#define D3F3_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH_MASK 0x7e
+#define D3F3_PCIE_P_PORT_LANE_STATUS__PHY_LINK_WIDTH__SHIFT 0x1
+#define D3F3_PCIE_FC_P__PD_CREDITS_MASK 0xff
+#define D3F3_PCIE_FC_P__PD_CREDITS__SHIFT 0x0
+#define D3F3_PCIE_FC_P__PH_CREDITS_MASK 0xff00
+#define D3F3_PCIE_FC_P__PH_CREDITS__SHIFT 0x8
+#define D3F3_PCIE_FC_NP__NPD_CREDITS_MASK 0xff
+#define D3F3_PCIE_FC_NP__NPD_CREDITS__SHIFT 0x0
+#define D3F3_PCIE_FC_NP__NPH_CREDITS_MASK 0xff00
+#define D3F3_PCIE_FC_NP__NPH_CREDITS__SHIFT 0x8
+#define D3F3_PCIE_FC_CPL__CPLD_CREDITS_MASK 0xff
+#define D3F3_PCIE_FC_CPL__CPLD_CREDITS__SHIFT 0x0
+#define D3F3_PCIE_FC_CPL__CPLH_CREDITS_MASK 0xff00
+#define D3F3_PCIE_FC_CPL__CPLH_CREDITS__SHIFT 0x8
+#define D3F3_PCIE_ERR_CNTL__ERR_REPORTING_DIS_MASK 0x1
+#define D3F3_PCIE_ERR_CNTL__ERR_REPORTING_DIS__SHIFT 0x0
+#define D3F3_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG_MASK 0x2
+#define D3F3_PCIE_ERR_CNTL__STRAP_FIRST_RCVD_ERR_LOG__SHIFT 0x1
+#define D3F3_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES_MASK 0x4
+#define D3F3_PCIE_ERR_CNTL__RX_DROP_ECRC_FAILURES__SHIFT 0x2
+#define D3F3_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR_MASK 0x10
+#define D3F3_PCIE_ERR_CNTL__TX_GENERATE_LCRC_ERR__SHIFT 0x4
+#define D3F3_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR_MASK 0x20
+#define D3F3_PCIE_ERR_CNTL__RX_GENERATE_LCRC_ERR__SHIFT 0x5
+#define D3F3_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR_MASK 0x40
+#define D3F3_PCIE_ERR_CNTL__TX_GENERATE_ECRC_ERR__SHIFT 0x6
+#define D3F3_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR_MASK 0x80
+#define D3F3_PCIE_ERR_CNTL__RX_GENERATE_ECRC_ERR__SHIFT 0x7
+#define D3F3_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT_MASK 0x700
+#define D3F3_PCIE_ERR_CNTL__AER_HDR_LOG_TIMEOUT__SHIFT 0x8
+#define D3F3_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED_MASK 0x800
+#define D3F3_PCIE_ERR_CNTL__AER_HDR_LOG_F0_TIMER_EXPIRED__SHIFT 0xb
+#define D3F3_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS_MASK 0x4000
+#define D3F3_PCIE_ERR_CNTL__CI_P_SLV_BUF_RD_HALT_STATUS__SHIFT 0xe
+#define D3F3_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS_MASK 0x8000
+#define D3F3_PCIE_ERR_CNTL__CI_NP_SLV_BUF_RD_HALT_STATUS__SHIFT 0xf
+#define D3F3_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET_MASK 0x10000
+#define D3F3_PCIE_ERR_CNTL__CI_SLV_BUF_HALT_RESET__SHIFT 0x10
+#define D3F3_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY_MASK 0x20000
+#define D3F3_PCIE_ERR_CNTL__SEND_ERR_MSG_IMMEDIATELY__SHIFT 0x11
+#define D3F3_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL_MASK 0x40000
+#define D3F3_PCIE_ERR_CNTL__STRAP_POISONED_ADVISORY_NONFATAL__SHIFT 0x12
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_IO_ERR_MASK 0x1
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_IO_ERR__SHIFT 0x0
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_BE_ERR_MASK 0x2
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_BE_ERR__SHIFT 0x1
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR_MASK 0x4
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_MSG_ERR__SHIFT 0x2
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR_MASK 0x8
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CRC_ERR__SHIFT 0x3
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR_MASK 0x10
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CFG_ERR__SHIFT 0x4
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR_MASK 0x20
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CPL_ERR__SHIFT 0x5
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_EP_ERR_MASK 0x40
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_EP_ERR__SHIFT 0x6
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR_MASK 0x80
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_LEN_MISMATCH_ERR__SHIFT 0x7
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR_MASK 0x100
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_MAX_PAYLOAD_ERR__SHIFT 0x8
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_TC_ERR_MASK 0x200
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_TC_ERR__SHIFT 0x9
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CFG_UR_MASK 0x400
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CFG_UR__SHIFT 0xa
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_IO_UR_MASK 0x800
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_IO_UR__SHIFT 0xb
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_AT_ERR_MASK 0x1000
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_AT_ERR__SHIFT 0xc
+#define D3F3_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL_MASK 0x2000
+#define D3F3_PCIE_RX_CNTL__RX_NAK_IF_FIFO_FULL__SHIFT 0xd
+#define D3F3_PCIE_RX_CNTL__RX_GEN_ONE_NAK_MASK 0x4000
+#define D3F3_PCIE_RX_CNTL__RX_GEN_ONE_NAK__SHIFT 0xe
+#define D3F3_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG_MASK 0x8000
+#define D3F3_PCIE_RX_CNTL__RX_FC_INIT_FROM_REG__SHIFT 0xf
+#define D3F3_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MASK 0x70000
+#define D3F3_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT__SHIFT 0x10
+#define D3F3_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE_MASK 0x80000
+#define D3F3_PCIE_RX_CNTL__RX_RCB_CPL_TIMEOUT_MODE__SHIFT 0x13
+#define D3F3_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS_MASK 0x100000
+#define D3F3_PCIE_RX_CNTL__RX_PCIE_CPL_TIMEOUT_DIS__SHIFT 0x14
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR_MASK 0x200000
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_SHORTPREFIX_ERR__SHIFT 0x15
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR_MASK 0x400000
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_MAXPREFIX_ERR__SHIFT 0x16
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR_MASK 0x800000
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_CPLPREFIX_ERR__SHIFT 0x17
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR_MASK 0x1000000
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_INVALIDPASID_ERR__SHIFT 0x18
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR_MASK 0x2000000
+#define D3F3_PCIE_RX_CNTL__RX_IGNORE_NOT_PASID_UR__SHIFT 0x19
+#define D3F3_PCIE_RX_CNTL__RX_TPH_DIS_MASK 0x4000000
+#define D3F3_PCIE_RX_CNTL__RX_TPH_DIS__SHIFT 0x1a
+#define D3F3_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS_MASK 0x8000000
+#define D3F3_PCIE_RX_CNTL__RX_RCB_FLR_TIMEOUT_DIS__SHIFT 0x1b
+#define D3F3_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM_MASK 0xfff
+#define D3F3_PCIE_RX_EXPECTED_SEQNUM__RX_EXPECTED_SEQNUM__SHIFT 0x0
+#define D3F3_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA_MASK 0xffffff
+#define D3F3_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_DATA__SHIFT 0x0
+#define D3F3_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS_MASK 0x1000000
+#define D3F3_PCIE_RX_VENDOR_SPECIFIC__RX_VENDOR_STATUS__SHIFT 0x18
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR_MASK 0x1
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMRDPASID_UR__SHIFT 0x0
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR_MASK 0x2
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_TRANSMWRPASID_UR__SHIFT 0x1
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR_MASK 0x4
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_PRGRESPMSG_UR__SHIFT 0x2
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR_MASK 0x8
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_INVREQ_UR__SHIFT 0x3
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR_MASK 0x10
+#define D3F3_PCIE_RX_CNTL3__RX_IGNORE_RC_INVCPLPASID_UR__SHIFT 0x4
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD_MASK 0xfff
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PD__SHIFT 0x0
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH_MASK 0xff0000
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_P__RX_CREDITS_ALLOCATED_PH__SHIFT 0x10
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD_MASK 0xfff
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPD__SHIFT 0x0
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH_MASK 0xff0000
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_NP__RX_CREDITS_ALLOCATED_NPH__SHIFT 0x10
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD_MASK 0xfff
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLD__SHIFT 0x0
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH_MASK 0xff0000
+#define D3F3_PCIE_RX_CREDITS_ALLOCATED_CPL__RX_CREDITS_ALLOCATED_CPLH__SHIFT 0x10
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR_MASK 0x3
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LANE_ERR__SHIFT 0x0
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR_MASK 0xc
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_FRAMING_ERR__SHIFT 0x2
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP_MASK 0x30
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_PARITY_IN_SKP__SHIFT 0x4
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP_MASK 0xc0
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_LFSR_IN_SKP__SHIFT 0x6
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW_MASK 0x300
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_UFLOW__SHIFT 0x8
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW_MASK 0xc00
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_LOOPBACK_OFLOW__SHIFT 0xa
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR_MASK 0x3000
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_DESKEW_ERR__SHIFT 0xc
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR_MASK 0xc000
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DISPARITY_ERR__SHIFT 0xe
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR_MASK 0x30000
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_8B10B_DECODE_ERR__SHIFT 0x10
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR_MASK 0xc0000
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_SKP_OS_ERROR__SHIFT 0x12
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER_MASK 0x300000
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_INV_OS_IDENTIFIER__SHIFT 0x14
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER_MASK 0xc00000
+#define D3F3_PCIEP_ERROR_INJECT_PHYSICAL__ERROR_INJECT_PL_BAD_SYNC_HEADER__SHIFT 0x16
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR_MASK 0x3
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_FLOW_CTL_ERR__SHIFT 0x0
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER_MASK 0xc
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_REPLAY_NUM_ROLLOVER__SHIFT 0x2
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP_MASK 0x30
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_DLLP__SHIFT 0x4
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP_MASK 0xc0
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_BAD_TLP__SHIFT 0x6
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNSUPPORTED_REQ_MASK 0x300
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNSUPPORTED_REQ__SHIFT 0x8
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_ECRC_ERROR_MASK 0xc00
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_ECRC_ERROR__SHIFT 0xa
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_MALFORMED_TLP_MASK 0x3000
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_MALFORMED_TLP__SHIFT 0xc
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNEXPECTED_CMPLT_MASK 0xc000
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_UNEXPECTED_CMPLT__SHIFT 0xe
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETER_ABORT_MASK 0x30000
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETER_ABORT__SHIFT 0x10
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETION_TIMEOUT_MASK 0xc0000
+#define D3F3_PCIEP_ERROR_INJECT_TRANSACTION__ERROR_INJECT_TL_COMPLETION_TIMEOUT__SHIFT 0x12
+#define D3F3_PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0_MASK 0x2
+#define D3F3_PCIE_LC_CNTL__LC_DONT_ENTER_L23_IN_D0__SHIFT 0x1
+#define D3F3_PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN_MASK 0x4
+#define D3F3_PCIE_LC_CNTL__LC_RESET_L_IDLE_COUNT_EN__SHIFT 0x2
+#define D3F3_PCIE_LC_CNTL__LC_RESET_LINK_MASK 0x8
+#define D3F3_PCIE_LC_CNTL__LC_RESET_LINK__SHIFT 0x3
+#define D3F3_PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE_MASK 0xf0
+#define D3F3_PCIE_LC_CNTL__LC_16X_CLEAR_TX_PIPE__SHIFT 0x4
+#define D3F3_PCIE_LC_CNTL__LC_L0S_INACTIVITY_MASK 0xf00
+#define D3F3_PCIE_LC_CNTL__LC_L0S_INACTIVITY__SHIFT 0x8
+#define D3F3_PCIE_LC_CNTL__LC_L1_INACTIVITY_MASK 0xf000
+#define D3F3_PCIE_LC_CNTL__LC_L1_INACTIVITY__SHIFT 0xc
+#define D3F3_PCIE_LC_CNTL__LC_PMI_TO_L1_DIS_MASK 0x10000
+#define D3F3_PCIE_LC_CNTL__LC_PMI_TO_L1_DIS__SHIFT 0x10
+#define D3F3_PCIE_LC_CNTL__LC_INC_N_FTS_EN_MASK 0x20000
+#define D3F3_PCIE_LC_CNTL__LC_INC_N_FTS_EN__SHIFT 0x11
+#define D3F3_PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23_MASK 0xc0000
+#define D3F3_PCIE_LC_CNTL__LC_LOOK_FOR_IDLE_IN_L1L23__SHIFT 0x12
+#define D3F3_PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC_MASK 0x100000
+#define D3F3_PCIE_LC_CNTL__LC_FACTOR_IN_EXT_SYNC__SHIFT 0x14
+#define D3F3_PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS_MASK 0x200000
+#define D3F3_PCIE_LC_CNTL__LC_WAIT_FOR_PM_ACK_DIS__SHIFT 0x15
+#define D3F3_PCIE_LC_CNTL__LC_WAKE_FROM_L23_MASK 0x400000
+#define D3F3_PCIE_LC_CNTL__LC_WAKE_FROM_L23__SHIFT 0x16
+#define D3F3_PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK_MASK 0x800000
+#define D3F3_PCIE_LC_CNTL__LC_L1_IMMEDIATE_ACK__SHIFT 0x17
+#define D3F3_PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS_MASK 0x1000000
+#define D3F3_PCIE_LC_CNTL__LC_ASPM_TO_L1_DIS__SHIFT 0x18
+#define D3F3_PCIE_LC_CNTL__LC_DELAY_COUNT_MASK 0x6000000
+#define D3F3_PCIE_LC_CNTL__LC_DELAY_COUNT__SHIFT 0x19
+#define D3F3_PCIE_LC_CNTL__LC_DELAY_L0S_EXIT_MASK 0x8000000
+#define D3F3_PCIE_LC_CNTL__LC_DELAY_L0S_EXIT__SHIFT 0x1b
+#define D3F3_PCIE_LC_CNTL__LC_DELAY_L1_EXIT_MASK 0x10000000
+#define D3F3_PCIE_LC_CNTL__LC_DELAY_L1_EXIT__SHIFT 0x1c
+#define D3F3_PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE_MASK 0x20000000
+#define D3F3_PCIE_LC_CNTL__LC_EXTEND_WAIT_FOR_EL_IDLE__SHIFT 0x1d
+#define D3F3_PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN_MASK 0x40000000
+#define D3F3_PCIE_LC_CNTL__LC_ESCAPE_L1L23_EN__SHIFT 0x1e
+#define D3F3_PCIE_LC_CNTL__LC_GATE_RCVR_IDLE_MASK 0x80000000
+#define D3F3_PCIE_LC_CNTL__LC_GATE_RCVR_IDLE__SHIFT 0x1f
+#define D3F3_PCIE_LC_CNTL2__LC_TIMED_OUT_STATE_MASK 0x3f
+#define D3F3_PCIE_LC_CNTL2__LC_TIMED_OUT_STATE__SHIFT 0x0
+#define D3F3_PCIE_LC_CNTL2__LC_STATE_TIMED_OUT_MASK 0x40
+#define D3F3_PCIE_LC_CNTL2__LC_STATE_TIMED_OUT__SHIFT 0x6
+#define D3F3_PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION_MASK 0x80
+#define D3F3_PCIE_LC_CNTL2__LC_LOOK_FOR_BW_REDUCTION__SHIFT 0x7
+#define D3F3_PCIE_LC_CNTL2__LC_MORE_TS2_EN_MASK 0x100
+#define D3F3_PCIE_LC_CNTL2__LC_MORE_TS2_EN__SHIFT 0x8
+#define D3F3_PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS_MASK 0x200
+#define D3F3_PCIE_LC_CNTL2__LC_X12_NEGOTIATION_DIS__SHIFT 0x9
+#define D3F3_PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN_MASK 0x400
+#define D3F3_PCIE_LC_CNTL2__LC_LINK_UP_REVERSAL_EN__SHIFT 0xa
+#define D3F3_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_MASK 0x800
+#define D3F3_PCIE_LC_CNTL2__LC_ILLEGAL_STATE__SHIFT 0xb
+#define D3F3_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN_MASK 0x1000
+#define D3F3_PCIE_LC_CNTL2__LC_ILLEGAL_STATE_RESTART_EN__SHIFT 0xc
+#define D3F3_PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE_MASK 0x2000
+#define D3F3_PCIE_LC_CNTL2__LC_WAIT_FOR_OTHER_LANES_MODE__SHIFT 0xd
+#define D3F3_PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE_MASK 0xc000
+#define D3F3_PCIE_LC_CNTL2__LC_ELEC_IDLE_MODE__SHIFT 0xe
+#define D3F3_PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET_MASK 0x10000
+#define D3F3_PCIE_LC_CNTL2__LC_DISABLE_INFERRED_ELEC_IDLE_DET__SHIFT 0x10
+#define D3F3_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1_MASK 0x20000
+#define D3F3_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L1__SHIFT 0x11
+#define D3F3_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L23_MASK 0x40000
+#define D3F3_PCIE_LC_CNTL2__LC_ALLOW_PDWN_IN_L23__SHIFT 0x12
+#define D3F3_PCIE_LC_CNTL2__LC_DEASSERT_RX_EN_IN_L0S_MASK 0x80000
+#define D3F3_PCIE_LC_CNTL2__LC_DEASSERT_RX_EN_IN_L0S__SHIFT 0x13
+#define D3F3_PCIE_LC_CNTL2__LC_BLOCK_EL_IDLE_IN_L0_MASK 0x100000
+#define D3F3_PCIE_LC_CNTL2__LC_BLOCK_EL_IDLE_IN_L0__SHIFT 0x14
+#define D3F3_PCIE_LC_CNTL2__LC_RCV_L0_TO_RCV_L0S_DIS_MASK 0x200000
+#define D3F3_PCIE_LC_CNTL2__LC_RCV_L0_TO_RCV_L0S_DIS__SHIFT 0x15
+#define D3F3_PCIE_LC_CNTL2__LC_ASSERT_INACTIVE_DURING_HOLD_MASK 0x400000
+#define D3F3_PCIE_LC_CNTL2__LC_ASSERT_INACTIVE_DURING_HOLD__SHIFT 0x16
+#define D3F3_PCIE_LC_CNTL2__LC_WAIT_FOR_LANES_IN_LW_NEG_MASK 0x1800000
+#define D3F3_PCIE_LC_CNTL2__LC_WAIT_FOR_LANES_IN_LW_NEG__SHIFT 0x17
+#define D3F3_PCIE_LC_CNTL2__LC_PWR_DOWN_NEG_OFF_LANES_MASK 0x2000000
+#define D3F3_PCIE_LC_CNTL2__LC_PWR_DOWN_NEG_OFF_LANES__SHIFT 0x19
+#define D3F3_PCIE_LC_CNTL2__LC_DISABLE_LOST_SYM_LOCK_ARCS_MASK 0x4000000
+#define D3F3_PCIE_LC_CNTL2__LC_DISABLE_LOST_SYM_LOCK_ARCS__SHIFT 0x1a
+#define D3F3_PCIE_LC_CNTL2__LC_LINK_BW_NOTIFICATION_DIS_MASK 0x8000000
+#define D3F3_PCIE_LC_CNTL2__LC_LINK_BW_NOTIFICATION_DIS__SHIFT 0x1b
+#define D3F3_PCIE_LC_CNTL2__LC_PMI_L1_WAIT_FOR_SLV_IDLE_MASK 0x10000000
+#define D3F3_PCIE_LC_CNTL2__LC_PMI_L1_WAIT_FOR_SLV_IDLE__SHIFT 0x1c
+#define D3F3_PCIE_LC_CNTL2__LC_TEST_TIMER_SEL_MASK 0x60000000
+#define D3F3_PCIE_LC_CNTL2__LC_TEST_TIMER_SEL__SHIFT 0x1d
+#define D3F3_PCIE_LC_CNTL2__LC_ENABLE_INFERRED_ELEC_IDLE_FOR_PI_MASK 0x80000000
+#define D3F3_PCIE_LC_CNTL2__LC_ENABLE_INFERRED_ELEC_IDLE_FOR_PI__SHIFT 0x1f
+#define D3F3_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_MASK 0x1
+#define D3F3_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS__SHIFT 0x0
+#define D3F3_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_CNTL_MASK 0x6
+#define D3F3_PCIE_LC_CNTL3__LC_SELECT_DEEMPHASIS_CNTL__SHIFT 0x1
+#define D3F3_PCIE_LC_CNTL3__LC_RCVD_DEEMPHASIS_MASK 0x8
+#define D3F3_PCIE_LC_CNTL3__LC_RCVD_DEEMPHASIS__SHIFT 0x3
+#define D3F3_PCIE_LC_CNTL3__LC_COMP_TO_DETECT_MASK 0x10
+#define D3F3_PCIE_LC_CNTL3__LC_COMP_TO_DETECT__SHIFT 0x4
+#define D3F3_PCIE_LC_CNTL3__LC_RESET_TSX_CNT_IN_RLOCK_EN_MASK 0x20
+#define D3F3_PCIE_LC_CNTL3__LC_RESET_TSX_CNT_IN_RLOCK_EN__SHIFT 0x5
+#define D3F3_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK 0xc0
+#define D3F3_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPTS_ALLOWED__SHIFT 0x6
+#define D3F3_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPT_FAILED_MASK 0x100
+#define D3F3_PCIE_LC_CNTL3__LC_AUTO_SPEED_CHANGE_ATTEMPT_FAILED__SHIFT 0x8
+#define D3F3_PCIE_LC_CNTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT_MASK 0x200
+#define D3F3_PCIE_LC_CNTL3__LC_CLR_FAILED_AUTO_SPD_CHANGE_CNT__SHIFT 0x9
+#define D3F3_PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN_MASK 0x400
+#define D3F3_PCIE_LC_CNTL3__LC_ENHANCED_HOT_PLUG_EN__SHIFT 0xa
+#define D3F3_PCIE_LC_CNTL3__LC_RCVR_DET_EN_OVERRIDE_MASK 0x800
+#define D3F3_PCIE_LC_CNTL3__LC_RCVR_DET_EN_OVERRIDE__SHIFT 0xb
+#define D3F3_PCIE_LC_CNTL3__LC_EHP_RX_PHY_CMD_MASK 0x3000
+#define D3F3_PCIE_LC_CNTL3__LC_EHP_RX_PHY_CMD__SHIFT 0xc
+#define D3F3_PCIE_LC_CNTL3__LC_EHP_TX_PHY_CMD_MASK 0xc000
+#define D3F3_PCIE_LC_CNTL3__LC_EHP_TX_PHY_CMD__SHIFT 0xe
+#define D3F3_PCIE_LC_CNTL3__LC_CHIP_BIF_USB_IDLE_EN_MASK 0x10000
+#define D3F3_PCIE_LC_CNTL3__LC_CHIP_BIF_USB_IDLE_EN__SHIFT 0x10
+#define D3F3_PCIE_LC_CNTL3__LC_L1_BLOCK_RECONFIG_EN_MASK 0x20000
+#define D3F3_PCIE_LC_CNTL3__LC_L1_BLOCK_RECONFIG_EN__SHIFT 0x11
+#define D3F3_PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_EN_MASK 0x40000
+#define D3F3_PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_EN__SHIFT 0x12
+#define D3F3_PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_MAX_FAIL_SEL_MASK 0x180000
+#define D3F3_PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_MAX_FAIL_SEL__SHIFT 0x13
+#define D3F3_PCIE_LC_CNTL3__LC_FAST_L1_ENTRY_EXIT_EN_MASK 0x200000
+#define D3F3_PCIE_LC_CNTL3__LC_FAST_L1_ENTRY_EXIT_EN__SHIFT 0x15
+#define D3F3_PCIE_LC_CNTL3__LC_RXPHYCMD_INACTIVE_EN_MODE_MASK 0x400000
+#define D3F3_PCIE_LC_CNTL3__LC_RXPHYCMD_INACTIVE_EN_MODE__SHIFT 0x16
+#define D3F3_PCIE_LC_CNTL3__LC_DSC_DONT_ENTER_L23_AFTER_PME_ACK_MASK 0x800000
+#define D3F3_PCIE_LC_CNTL3__LC_DSC_DONT_ENTER_L23_AFTER_PME_ACK__SHIFT 0x17
+#define D3F3_PCIE_LC_CNTL3__LC_HW_VOLTAGE_IF_CONTROL_MASK 0x3000000
+#define D3F3_PCIE_LC_CNTL3__LC_HW_VOLTAGE_IF_CONTROL__SHIFT 0x18
+#define D3F3_PCIE_LC_CNTL3__LC_VOLTAGE_TIMER_SEL_MASK 0x3c000000
+#define D3F3_PCIE_LC_CNTL3__LC_VOLTAGE_TIMER_SEL__SHIFT 0x1a
+#define D3F3_PCIE_LC_CNTL3__LC_GO_TO_RECOVERY_MASK 0x40000000
+#define D3F3_PCIE_LC_CNTL3__LC_GO_TO_RECOVERY__SHIFT 0x1e
+#define D3F3_PCIE_LC_CNTL3__LC_N_EIE_SEL_MASK 0x80000000
+#define D3F3_PCIE_LC_CNTL3__LC_N_EIE_SEL__SHIFT 0x1f
+#define D3F3_PCIE_LC_CNTL4__LC_TX_ENABLE_BEHAVIOUR_MASK 0x3
+#define D3F3_PCIE_LC_CNTL4__LC_TX_ENABLE_BEHAVIOUR__SHIFT 0x0
+#define D3F3_PCIE_LC_CNTL4__LC_DIS_CONTIG_END_SET_CHECK_MASK 0x4
+#define D3F3_PCIE_LC_CNTL4__LC_DIS_CONTIG_END_SET_CHECK__SHIFT 0x2
+#define D3F3_PCIE_LC_CNTL4__LC_DIS_ASPM_L1_IN_SPEED_CHANGE_MASK 0x8
+#define D3F3_PCIE_LC_CNTL4__LC_DIS_ASPM_L1_IN_SPEED_CHANGE__SHIFT 0x3
+#define D3F3_PCIE_LC_CNTL4__LC_BYPASS_EQ_MASK 0x10
+#define D3F3_PCIE_LC_CNTL4__LC_BYPASS_EQ__SHIFT 0x4
+#define D3F3_PCIE_LC_CNTL4__LC_REDO_EQ_MASK 0x20
+#define D3F3_PCIE_LC_CNTL4__LC_REDO_EQ__SHIFT 0x5
+#define D3F3_PCIE_LC_CNTL4__LC_EXTEND_EIEOS_MASK 0x40
+#define D3F3_PCIE_LC_CNTL4__LC_EXTEND_EIEOS__SHIFT 0x6
+#define D3F3_PCIE_LC_CNTL4__LC_IGNORE_PARITY_MASK 0x80
+#define D3F3_PCIE_LC_CNTL4__LC_IGNORE_PARITY__SHIFT 0x7
+#define D3F3_PCIE_LC_CNTL4__LC_EQ_SEARCH_MODE_MASK 0x300
+#define D3F3_PCIE_LC_CNTL4__LC_EQ_SEARCH_MODE__SHIFT 0x8
+#define D3F3_PCIE_LC_CNTL4__LC_DSC_CHECK_COEFFS_IN_RLOCK_MASK 0x400
+#define D3F3_PCIE_LC_CNTL4__LC_DSC_CHECK_COEFFS_IN_RLOCK__SHIFT 0xa
+#define D3F3_PCIE_LC_CNTL4__LC_USC_EQ_NOT_REQD_MASK 0x800
+#define D3F3_PCIE_LC_CNTL4__LC_USC_EQ_NOT_REQD__SHIFT 0xb
+#define D3F3_PCIE_LC_CNTL4__LC_USC_GO_TO_EQ_MASK 0x1000
+#define D3F3_PCIE_LC_CNTL4__LC_USC_GO_TO_EQ__SHIFT 0xc
+#define D3F3_PCIE_LC_CNTL4__LC_SET_QUIESCE_MASK 0x2000
+#define D3F3_PCIE_LC_CNTL4__LC_SET_QUIESCE__SHIFT 0xd
+#define D3F3_PCIE_LC_CNTL4__LC_QUIESCE_RCVD_MASK 0x4000
+#define D3F3_PCIE_LC_CNTL4__LC_QUIESCE_RCVD__SHIFT 0xe
+#define D3F3_PCIE_LC_CNTL4__LC_UNEXPECTED_COEFFS_RCVD_MASK 0x8000
+#define D3F3_PCIE_LC_CNTL4__LC_UNEXPECTED_COEFFS_RCVD__SHIFT 0xf
+#define D3F3_PCIE_LC_CNTL4__LC_BYPASS_EQ_REQ_PHASE_MASK 0x10000
+#define D3F3_PCIE_LC_CNTL4__LC_BYPASS_EQ_REQ_PHASE__SHIFT 0x10
+#define D3F3_PCIE_LC_CNTL4__LC_FORCE_PRESET_IN_EQ_REQ_PHASE_MASK 0x20000
+#define D3F3_PCIE_LC_CNTL4__LC_FORCE_PRESET_IN_EQ_REQ_PHASE__SHIFT 0x11
+#define D3F3_PCIE_LC_CNTL4__LC_FORCE_PRESET_VALUE_MASK 0x3c0000
+#define D3F3_PCIE_LC_CNTL4__LC_FORCE_PRESET_VALUE__SHIFT 0x12
+#define D3F3_PCIE_LC_CNTL4__LC_USC_DELAY_DLLPS_MASK 0x400000
+#define D3F3_PCIE_LC_CNTL4__LC_USC_DELAY_DLLPS__SHIFT 0x16
+#define D3F3_PCIE_LC_CNTL4__LC_PCIE_TX_FULL_SWING_MASK 0x800000
+#define D3F3_PCIE_LC_CNTL4__LC_PCIE_TX_FULL_SWING__SHIFT 0x17
+#define D3F3_PCIE_LC_CNTL4__LC_EQ_WAIT_FOR_EVAL_DONE_MASK 0x1000000
+#define D3F3_PCIE_LC_CNTL4__LC_EQ_WAIT_FOR_EVAL_DONE__SHIFT 0x18
+#define D3F3_PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN_MASK 0x2000000
+#define D3F3_PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN__SHIFT 0x19
+#define D3F3_PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK_MASK 0xfc000000
+#define D3F3_PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK__SHIFT 0x1a
+#define D3F3_PCIE_LC_CNTL5__LC_EQ_FS_0_MASK 0x3f
+#define D3F3_PCIE_LC_CNTL5__LC_EQ_FS_0__SHIFT 0x0
+#define D3F3_PCIE_LC_CNTL5__LC_EQ_FS_8_MASK 0xfc0
+#define D3F3_PCIE_LC_CNTL5__LC_EQ_FS_8__SHIFT 0x6
+#define D3F3_PCIE_LC_CNTL5__LC_EQ_LF_0_MASK 0x3f000
+#define D3F3_PCIE_LC_CNTL5__LC_EQ_LF_0__SHIFT 0xc
+#define D3F3_PCIE_LC_CNTL5__LC_EQ_LF_8_MASK 0xfc0000
+#define D3F3_PCIE_LC_CNTL5__LC_EQ_LF_8__SHIFT 0x12
+#define D3F3_PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS_MASK 0x1000000
+#define D3F3_PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS__SHIFT 0x18
+#define D3F3_PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT_MASK 0x1
+#define D3F3_PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT__SHIFT 0x0
+#define D3F3_PCIE_LC_CNTL6__LC_SPC_MODE_5GT_MASK 0x4
+#define D3F3_PCIE_LC_CNTL6__LC_SPC_MODE_5GT__SHIFT 0x2
+#define D3F3_PCIE_LC_CNTL6__LC_SPC_MODE_8GT_MASK 0x10
+#define D3F3_PCIE_LC_CNTL6__LC_SPC_MODE_8GT__SHIFT 0x4
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN_MASK 0x1
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN__SHIFT 0x0
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE_MASK 0x2
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE__SHIFT 0x1
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE_MASK 0x4
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE__SHIFT 0x2
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE_MASK 0x8
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE__SHIFT 0x3
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE_MASK 0x10
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE__SHIFT 0x4
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_FAILED_SPEED_NEG_MASK 0x20
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_FAILED_SPEED_NEG__SHIFT 0x5
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_LONG_LW_CHANGE_MASK 0x40
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_LONG_LW_CHANGE__SHIFT 0x6
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_SHORT_LW_CHANGE_MASK 0x80
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_SHORT_LW_CHANGE__SHIFT 0x7
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_OTHER_MASK 0x100
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_OTHER__SHIFT 0x8
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED_MASK 0x200
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED__SHIFT 0x9
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE_MASK 0x400
+#define D3F3_PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE__SHIFT 0xa
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL_MASK 0xf
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL__SHIFT 0x0
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE_MASK 0x10
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE__SHIFT 0x4
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1_MASK 0x20
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1__SHIFT 0x5
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN_MASK 0x40
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN__SHIFT 0x6
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN_MASK 0x80
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN__SHIFT 0x7
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_POWER_STATE_MASK 0x700
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_POWER_STATE__SHIFT 0x8
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED_MASK 0x800
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED__SHIFT 0xb
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN_MASK 0x1000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN__SHIFT 0xc
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH_MASK 0x2000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH__SHIFT 0xd
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG_MASK 0x4000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG__SHIFT 0xe
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN_MASK 0x8000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN__SHIFT 0xf
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP_MASK 0x10000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP__SHIFT 0x10
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF_MASK 0x20000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF__SHIFT 0x11
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF_MASK 0x40000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF__SHIFT 0x12
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN_MASK 0x80000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN__SHIFT 0x13
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW_MASK 0x100000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW__SHIFT 0x14
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN_MASK 0x200000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN__SHIFT 0x15
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL_MASK 0xc00000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL__SHIFT 0x16
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED_MASK 0x1000000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED__SHIFT 0x18
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST_MASK 0x2000000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST__SHIFT 0x19
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_RESET_ASPM_L1_NAK_TIMER_MASK 0x4000000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_RESET_ASPM_L1_NAK_TIMER__SHIFT 0x1a
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_SHORT_RCFG_TIMEOUT_MASK 0x8000000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_SHORT_RCFG_TIMEOUT__SHIFT 0x1b
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_ALLOW_TX_L1_CONTROL_MASK 0x10000000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_ALLOW_TX_L1_CONTROL__SHIFT 0x1c
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_FOM_VALID_AFTER_TRACK_MASK 0x20000000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_FOM_VALID_AFTER_TRACK__SHIFT 0x1d
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_EXTEND_EQ_REQ_TIME_MASK 0xc0000000
+#define D3F3_PCIE_LC_TRAINING_CNTL__LC_EXTEND_EQ_REQ_TIME__SHIFT 0x1e
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_MASK 0x7
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH__SHIFT 0x0
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_RD_MASK 0x70
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_RD__SHIFT 0x4
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_ARC_MISSING_ESCAPE_MASK 0x80
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_ARC_MISSING_ESCAPE__SHIFT 0x7
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_NOW_MASK 0x100
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_NOW__SHIFT 0x8
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATION_SUPPORT_MASK 0x200
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATION_SUPPORT__SHIFT 0x9
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATE_EN_MASK 0x400
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATE_EN__SHIFT 0xa
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_SHORT_RECONFIG_EN_MASK 0x800
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_SHORT_RECONFIG_EN__SHIFT 0xb
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_SUPPORT_MASK 0x1000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_SUPPORT__SHIFT 0xc
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_DIS_MASK 0x2000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_DIS__SHIFT 0xd
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_WAIT_FOR_RCVR_DIS_MASK 0x4000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_WAIT_FOR_RCVR_DIS__SHIFT 0xe
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_TIMER_SEL_MASK 0x8000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_TIMER_SEL__SHIFT 0xf
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_DEASSERT_TX_PDNB_MASK 0x10000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_DEASSERT_TX_PDNB__SHIFT 0x10
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_L1_RECONFIG_EN_MASK 0x20000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_L1_RECONFIG_EN__SHIFT 0x11
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_DYNLINK_MST_EN_MASK 0x40000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_DYNLINK_MST_EN__SHIFT 0x12
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_DUAL_END_RECONFIG_EN_MASK 0x80000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_DUAL_END_RECONFIG_EN__SHIFT 0x13
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_CAPABLE_MASK 0x100000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_CAPABLE__SHIFT 0x14
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_DYN_LANES_PWR_STATE_MASK 0x600000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_DYN_LANES_PWR_STATE__SHIFT 0x15
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_EQ_REVERSAL_LOGIC_EN_MASK 0x800000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_EQ_REVERSAL_LOGIC_EN__SHIFT 0x17
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_MULT_REVERSE_ATTEMP_EN_MASK 0x1000000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_MULT_REVERSE_ATTEMP_EN__SHIFT 0x18
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RESET_TSX_CNT_IN_RCONFIG_EN_MASK 0x2000000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_RESET_TSX_CNT_IN_RCONFIG_EN__SHIFT 0x19
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_L_IDLE_IN_R_IDLE_MASK 0x4000000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_L_IDLE_IN_R_IDLE__SHIFT 0x1a
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_NON_EI_ON_RXL0S_EXIT_MASK 0x8000000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_NON_EI_ON_RXL0S_EXIT__SHIFT 0x1b
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE_MASK 0x10000000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE__SHIFT 0x1c
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI_MASK 0x20000000
+#define D3F3_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI__S

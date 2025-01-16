@@ -1,132 +1,59 @@
-/*
- * Copyright 2014 IBM Corp.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
- */
-
-#include <linux/debugfs.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-
-#include "cxl.h"
-
-static struct dentry *cxl_debugfs;
-
-void cxl_stop_trace(struct cxl *adapter)
-{
-	int slice;
-
-	/* Stop the trace */
-	cxl_p1_write(adapter, CXL_PSL_TRACE, 0x8000000000000017LL);
-
-	/* Stop the slice traces */
-	spin_lock(&adapter->afu_list_lock);
-	for (slice = 0; slice < adapter->slices; slice++) {
-		if (adapter->afu[slice])
-			cxl_p1n_write(adapter->afu[slice], CXL_PSL_SLICE_TRACE, 0x8000000000000000LL);
-	}
-	spin_unlock(&adapter->afu_list_lock);
-}
-
-/* Helpers to export CXL mmaped IO registers via debugfs */
-static int debugfs_io_u64_get(void *data, u64 *val)
-{
-	*val = in_be64((u64 __iomem *)data);
-	return 0;
-}
-
-static int debugfs_io_u64_set(void *data, u64 val)
-{
-	out_be64((u64 __iomem *)data, val);
-	return 0;
-}
-DEFINE_SIMPLE_ATTRIBUTE(fops_io_x64, debugfs_io_u64_get, debugfs_io_u64_set, "0x%016llx\n");
-
-static struct dentry *debugfs_create_io_x64(const char *name, umode_t mode,
-					    struct dentry *parent, u64 __iomem *value)
-{
-	return debugfs_create_file(name, mode, parent, (void __force *)value, &fops_io_x64);
-}
-
-int cxl_debugfs_adapter_add(struct cxl *adapter)
-{
-	struct dentry *dir;
-	char buf[32];
-
-	if (!cxl_debugfs)
-		return -ENODEV;
-
-	snprintf(buf, 32, "card%i", adapter->adapter_num);
-	dir = debugfs_create_dir(buf, cxl_debugfs);
-	if (IS_ERR(dir))
-		return PTR_ERR(dir);
-	adapter->debugfs = dir;
-
-	debugfs_create_io_x64("fir1",     S_IRUSR, dir, _cxl_p1_addr(adapter, CXL_PSL_FIR1));
-	debugfs_create_io_x64("fir2",     S_IRUSR, dir, _cxl_p1_addr(adapter, CXL_PSL_FIR2));
-	debugfs_create_io_x64("fir_cntl", S_IRUSR, dir, _cxl_p1_addr(adapter, CXL_PSL_FIR_CNTL));
-	debugfs_create_io_x64("err_ivte", S_IRUSR, dir, _cxl_p1_addr(adapter, CXL_PSL_ErrIVTE));
-
-	debugfs_create_io_x64("trace", S_IRUSR | S_IWUSR, dir, _cxl_p1_addr(adapter, CXL_PSL_TRACE));
-
-	return 0;
-}
-
-void cxl_debugfs_adapter_remove(struct cxl *adapter)
-{
-	debugfs_remove_recursive(adapter->debugfs);
-}
-
-int cxl_debugfs_afu_add(struct cxl_afu *afu)
-{
-	struct dentry *dir;
-	char buf[32];
-
-	if (!afu->adapter->debugfs)
-		return -ENODEV;
-
-	snprintf(buf, 32, "psl%i.%i", afu->adapter->adapter_num, afu->slice);
-	dir = debugfs_create_dir(buf, afu->adapter->debugfs);
-	if (IS_ERR(dir))
-		return PTR_ERR(dir);
-	afu->debugfs = dir;
-
-	debugfs_create_io_x64("fir",        S_IRUSR, dir, _cxl_p1n_addr(afu, CXL_PSL_FIR_SLICE_An));
-	debugfs_create_io_x64("serr",       S_IRUSR, dir, _cxl_p1n_addr(afu, CXL_PSL_SERR_An));
-	debugfs_create_io_x64("afu_debug",  S_IRUSR, dir, _cxl_p1n_addr(afu, CXL_AFU_DEBUG_An));
-	debugfs_create_io_x64("sr",         S_IRUSR, dir, _cxl_p1n_addr(afu, CXL_PSL_SR_An));
-
-	debugfs_create_io_x64("dsisr",      S_IRUSR, dir, _cxl_p2n_addr(afu, CXL_PSL_DSISR_An));
-	debugfs_create_io_x64("dar",        S_IRUSR, dir, _cxl_p2n_addr(afu, CXL_PSL_DAR_An));
-	debugfs_create_io_x64("sstp0",      S_IRUSR, dir, _cxl_p2n_addr(afu, CXL_SSTP0_An));
-	debugfs_create_io_x64("sstp1",      S_IRUSR, dir, _cxl_p2n_addr(afu, CXL_SSTP1_An));
-	debugfs_create_io_x64("err_status", S_IRUSR, dir, _cxl_p2n_addr(afu, CXL_PSL_ErrStat_An));
-
-	debugfs_create_io_x64("trace", S_IRUSR | S_IWUSR, dir, _cxl_p1n_addr(afu, CXL_PSL_SLICE_TRACE));
-
-	return 0;
-}
-
-void cxl_debugfs_afu_remove(struct cxl_afu *afu)
-{
-	debugfs_remove_recursive(afu->debugfs);
-}
-
-int __init cxl_debugfs_init(void)
-{
-	struct dentry *ent;
-	ent = debugfs_create_dir("cxl", NULL);
-	if (IS_ERR(ent))
-		return PTR_ERR(ent);
-	cxl_debugfs = ent;
-
-	return 0;
-}
-
-void cxl_debugfs_exit(void)
-{
-	debugfs_remove_recursive(cxl_debugfs);
-}
+DE_9__RX_PDNB_OVERRIDE_VAL_9_MASK 0xe0
+#define PB1_PIF_PDNB_OVERRIDE_9__RX_PDNB_OVERRIDE_VAL_9__SHIFT 0x5
+#define PB1_PIF_PDNB_OVERRIDE_9__RXEN_OVERRIDE_EN_9_MASK 0x100
+#define PB1_PIF_PDNB_OVERRIDE_9__RXEN_OVERRIDE_EN_9__SHIFT 0x8
+#define PB1_PIF_PDNB_OVERRIDE_9__RXEN_OVERRIDE_VAL_9_MASK 0x200
+#define PB1_PIF_PDNB_OVERRIDE_9__RXEN_OVERRIDE_VAL_9__SHIFT 0x9
+#define PB1_PIF_PDNB_OVERRIDE_9__TXPWR_OVERRIDE_EN_9_MASK 0x400
+#define PB1_PIF_PDNB_OVERRIDE_9__TXPWR_OVERRIDE_EN_9__SHIFT 0xa
+#define PB1_PIF_PDNB_OVERRIDE_9__TXPWR_OVERRIDE_VAL_9_MASK 0x3800
+#define PB1_PIF_PDNB_OVERRIDE_9__TXPWR_OVERRIDE_VAL_9__SHIFT 0xb
+#define PB1_PIF_PDNB_OVERRIDE_9__RXPWR_OVERRIDE_EN_9_MASK 0x4000
+#define PB1_PIF_PDNB_OVERRIDE_9__RXPWR_OVERRIDE_EN_9__SHIFT 0xe
+#define PB1_PIF_PDNB_OVERRIDE_9__RXPWR_OVERRIDE_VAL_9_MASK 0x38000
+#define PB1_PIF_PDNB_OVERRIDE_9__RXPWR_OVERRIDE_VAL_9__SHIFT 0xf
+#define PB1_PIF_PDNB_OVERRIDE_10__TX_PDNB_OVERRIDE_EN_10_MASK 0x1
+#define PB1_PIF_PDNB_OVERRIDE_10__TX_PDNB_OVERRIDE_EN_10__SHIFT 0x0
+#define PB1_PIF_PDNB_OVERRIDE_10__TX_PDNB_OVERRIDE_VAL_10_MASK 0xe
+#define PB1_PIF_PDNB_OVERRIDE_10__TX_PDNB_OVERRIDE_VAL_10__SHIFT 0x1
+#define PB1_PIF_PDNB_OVERRIDE_10__RX_PDNB_OVERRIDE_EN_10_MASK 0x10
+#define PB1_PIF_PDNB_OVERRIDE_10__RX_PDNB_OVERRIDE_EN_10__SHIFT 0x4
+#define PB1_PIF_PDNB_OVERRIDE_10__RX_PDNB_OVERRIDE_VAL_10_MASK 0xe0
+#define PB1_PIF_PDNB_OVERRIDE_10__RX_PDNB_OVERRIDE_VAL_10__SHIFT 0x5
+#define PB1_PIF_PDNB_OVERRIDE_10__RXEN_OVERRIDE_EN_10_MASK 0x100
+#define PB1_PIF_PDNB_OVERRIDE_10__RXEN_OVERRIDE_EN_10__SHIFT 0x8
+#define PB1_PIF_PDNB_OVERRIDE_10__RXEN_OVERRIDE_VAL_10_MASK 0x200
+#define PB1_PIF_PDNB_OVERRIDE_10__RXEN_OVERRIDE_VAL_10__SHIFT 0x9
+#define PB1_PIF_PDNB_OVERRIDE_10__TXPWR_OVERRIDE_EN_10_MASK 0x400
+#define PB1_PIF_PDNB_OVERRIDE_10__TXPWR_OVERRIDE_EN_10__SHIFT 0xa
+#define PB1_PIF_PDNB_OVERRIDE_10__TXPWR_OVERRIDE_VAL_10_MASK 0x3800
+#define PB1_PIF_PDNB_OVERRIDE_10__TXPWR_OVERRIDE_VAL_10__SHIFT 0xb
+#define PB1_PIF_PDNB_OVERRIDE_10__RXPWR_OVERRIDE_EN_10_MASK 0x4000
+#define PB1_PIF_PDNB_OVERRIDE_10__RXPWR_OVERRIDE_EN_10__SHIFT 0xe
+#define PB1_PIF_PDNB_OVERRIDE_10__RXPWR_OVERRIDE_VAL_10_MASK 0x38000
+#define PB1_PIF_PDNB_OVERRIDE_10__RXPWR_OVERRIDE_VAL_10__SHIFT 0xf
+#define PB1_PIF_PDNB_OVERRIDE_11__TX_PDNB_OVERRIDE_EN_11_MASK 0x1
+#define PB1_PIF_PDNB_OVERRIDE_11__TX_PDNB_OVERRIDE_EN_11__SHIFT 0x0
+#define PB1_PIF_PDNB_OVERRIDE_11__TX_PDNB_OVERRIDE_VAL_11_MASK 0xe
+#define PB1_PIF_PDNB_OVERRIDE_11__TX_PDNB_OVERRIDE_VAL_11__SHIFT 0x1
+#define PB1_PIF_PDNB_OVERRIDE_11__RX_PDNB_OVERRIDE_EN_11_MASK 0x10
+#define PB1_PIF_PDNB_OVERRIDE_11__RX_PDNB_OVERRIDE_EN_11__SHIFT 0x4
+#define PB1_PIF_PDNB_OVERRIDE_11__RX_PDNB_OVERRIDE_VAL_11_MASK 0xe0
+#define PB1_PIF_PDNB_OVERRIDE_11__RX_PDNB_OVERRIDE_VAL_11__SHIFT 0x5
+#define PB1_PIF_PDNB_OVERRIDE_11__RXEN_OVERRIDE_EN_11_MASK 0x100
+#define PB1_PIF_PDNB_OVERRIDE_11__RXEN_OVERRIDE_EN_11__SHIFT 0x8
+#define PB1_PIF_PDNB_OVERRIDE_11__RXEN_OVERRIDE_VAL_11_MASK 0x200
+#define PB1_PIF_PDNB_OVERRIDE_11__RXEN_OVERRIDE_VAL_11__SHIFT 0x9
+#define PB1_PIF_PDNB_OVERRIDE_11__TXPWR_OVERRIDE_EN_11_MASK 0x400
+#define PB1_PIF_PDNB_OVERRIDE_11__TXPWR_OVERRIDE_EN_11__SHIFT 0xa
+#define PB1_PIF_PDNB_OVERRIDE_11__TXPWR_OVERRIDE_VAL_11_MASK 0x3800
+#define PB1_PIF_PDNB_OVERRIDE_11__TXPWR_OVERRIDE_VAL_11__SHIFT 0xb
+#define PB1_PIF_PDNB_OVERRIDE_11__RXPWR_OVERRIDE_EN_11_MASK 0x4000
+#define PB1_PIF_PDNB_OVERRIDE_11__RXPWR_OVERRIDE_EN_11__SHIFT 0xe
+#define PB1_PIF_PDNB_OVERRIDE_11__RXPWR_OVERRIDE_VAL_11_MASK 0x38000
+#define PB1_PIF_PDNB_OVERRIDE_11__RXPWR_OVERRIDE_VAL_11__SHIFT 0xf
+#define PB1_PIF_PDNB_OVERRIDE_12__TX_PDNB_OVERRIDE_EN_12_MASK 0x1
+#define PB1_PIF_PDNB_OVERRIDE_12__TX_PDNB_OVERRIDE_EN_12__SHIFT 0x0
+#define PB1_PIF_PDNB_OVERRIDE_12__TX_PDNB_OVERRIDE_VAL_12_MASK 0xe
+#define PB1_PIF_PDNB_OVERRIDE_12__TX_PDNB_OVERRIDE_VAL_12__SHIFT 0x1
+#define PB1_PIF_PDNB_OVER

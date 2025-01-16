@@ -1,2148 +1,920 @@
-/*
- * MUSB OTG driver peripheral support
- *
- * Copyright 2005 Mentor Graphics Corporation
- * Copyright (C) 2005-2006 by Texas Instruments
- * Copyright (C) 2006-2007 Nokia Corporation
- * Copyright (C) 2009 MontaVista Software, Inc. <source@mvista.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- */
+YTE_HW_I2C_DATA_PS_ALLOCATION   sReserved;     //Caller doesn't need to init this portion
+}ENABLE_EXTERNAL_TMDS_ENCODER_PS_ALLOCATION;
 
-#include <linux/kernel.h>
-#include <linux/list.h>
-#include <linux/timer.h>
-#include <linux/module.h>
-#include <linux/smp.h>
-#include <linux/spinlock.h>
-#include <linux/delay.h>
-#include <linux/dma-mapping.h>
-#include <linux/slab.h>
-
-#include "musb_core.h"
-
-
-/* ----------------------------------------------------------------------- */
-
-#define is_buffer_mapped(req) (is_dma_capable() && \
-					(req->map_state != UN_MAPPED))
-
-/* Maps the buffer to dma  */
-
-static inline void map_dma_buffer(struct musb_request *request,
-			struct musb *musb, struct musb_ep *musb_ep)
+#define ENABLE_EXTERNAL_TMDS_ENCODER_PARAMETERS_V2  LVDS_ENCODER_CONTROL_PARAMETERS_V2
+typedef struct _ENABLE_EXTERNAL_TMDS_ENCODER_PS_ALLOCATION_V2
 {
-	int compatible = true;
-	struct dma_controller *dma = musb->dma_controller;
+  ENABLE_EXTERNAL_TMDS_ENCODER_PARAMETERS_V2    sXTmdsEncoder;
+  WRITE_ONE_BYTE_HW_I2C_DATA_PS_ALLOCATION      sReserved;     //Caller doesn't need to init this portion
+}ENABLE_EXTERNAL_TMDS_ENCODER_PS_ALLOCATION_V2;
 
-	request->map_state = UN_MAPPED;
-
-	if (!is_dma_capable() || !musb_ep->dma)
-		return;
-
-	/* Check if DMA engine can handle this request.
-	 * DMA code must reject the USB request explicitly.
-	 * Default behaviour is to map the request.
-	 */
-	if (dma->is_compatible)
-		compatible = dma->is_compatible(musb_ep->dma,
-				musb_ep->packet_sz, request->request.buf,
-				request->request.length);
-	if (!compatible)
-		return;
-
-	if (request->request.dma == DMA_ADDR_INVALID) {
-		dma_addr_t dma_addr;
-		int ret;
-
-		dma_addr = dma_map_single(
-				musb->controller,
-				request->request.buf,
-				request->request.length,
-				request->tx
-					? DMA_TO_DEVICE
-					: DMA_FROM_DEVICE);
-		ret = dma_mapping_error(musb->controller, dma_addr);
-		if (ret)
-			return;
-
-		request->request.dma = dma_addr;
-		request->map_state = MUSB_MAPPED;
-	} else {
-		dma_sync_single_for_device(musb->controller,
-			request->request.dma,
-			request->request.length,
-			request->tx
-				? DMA_TO_DEVICE
-				: DMA_FROM_DEVICE);
-		request->map_state = PRE_MAPPED;
-	}
-}
-
-/* Unmap the buffer from dma and maps it back to cpu */
-static inline void unmap_dma_buffer(struct musb_request *request,
-				struct musb *musb)
+typedef struct _EXTERNAL_ENCODER_CONTROL_PS_ALLOCATION
 {
-	struct musb_ep *musb_ep = request->ep;
+  DIG_ENCODER_CONTROL_PARAMETERS            sDigEncoder;
+  WRITE_ONE_BYTE_HW_I2C_DATA_PS_ALLOCATION sReserved;
+}EXTERNAL_ENCODER_CONTROL_PS_ALLOCATION;
 
-	if (!is_buffer_mapped(request) || !musb_ep->dma)
-		return;
+/****************************************************************************/
+// Structures used by DVOEncoderControlTable
+/****************************************************************************/
+//ucTableFormatRevision=1,ucTableContentRevision=3
+//ucDVOConfig:
+#define DVO_ENCODER_CONFIG_RATE_SEL                     0x01
+#define DVO_ENCODER_CONFIG_DDR_SPEED                  0x00
+#define DVO_ENCODER_CONFIG_SDR_SPEED                  0x01
+#define DVO_ENCODER_CONFIG_OUTPUT_SEL                  0x0c
+#define DVO_ENCODER_CONFIG_LOW12BIT                     0x00
+#define DVO_ENCODER_CONFIG_UPPER12BIT                  0x04
+#define DVO_ENCODER_CONFIG_24BIT                        0x08
 
-	if (request->request.dma == DMA_ADDR_INVALID) {
-		dev_vdbg(musb->controller,
-				"not unmapping a never mapped buffer\n");
-		return;
-	}
-	if (request->map_state == MUSB_MAPPED) {
-		dma_unmap_single(musb->controller,
-			request->request.dma,
-			request->request.length,
-			request->tx
-				? DMA_TO_DEVICE
-				: DMA_FROM_DEVICE);
-		request->request.dma = DMA_ADDR_INVALID;
-	} else { /* PRE_MAPPED */
-		dma_sync_single_for_cpu(musb->controller,
-			request->request.dma,
-			request->request.length,
-			request->tx
-				? DMA_TO_DEVICE
-				: DMA_FROM_DEVICE);
-	}
-	request->map_state = UN_MAPPED;
-}
-
-/*
- * Immediately complete a request.
- *
- * @param request the request to complete
- * @param status the status to complete the request with
- * Context: controller locked, IRQs blocked.
- */
-void musb_g_giveback(
-	struct musb_ep		*ep,
-	struct usb_request	*request,
-	int			status)
-__releases(ep->musb->lock)
-__acquires(ep->musb->lock)
+typedef struct _DVO_ENCODER_CONTROL_PARAMETERS_V3
 {
-	struct musb_request	*req;
-	struct musb		*musb;
-	int			busy = ep->busy;
+  USHORT usPixelClock;
+  UCHAR  ucDVOConfig;
+  UCHAR  ucAction;                                          //ATOM_ENABLE/ATOM_DISABLE/ATOM_HPD_INIT
+  UCHAR  ucReseved[4];
+}DVO_ENCODER_CONTROL_PARAMETERS_V3;
+#define DVO_ENCODER_CONTROL_PS_ALLOCATION_V3   DVO_ENCODER_CONTROL_PARAMETERS_V3
 
-	req = to_musb_request(request);
-
-	list_del(&req->list);
-	if (req->request.status == -EINPROGRESS)
-		req->request.status = status;
-	musb = req->musb;
-
-	ep->busy = 1;
-	spin_unlock(&musb->lock);
-
-	if (!dma_mapping_error(&musb->g.dev, request->dma))
-		unmap_dma_buffer(req, musb);
-
-	if (request->status == 0)
-		dev_dbg(musb->controller, "%s done request %p,  %d/%d\n",
-				ep->end_point.name, request,
-				req->request.actual, req->request.length);
-	else
-		dev_dbg(musb->controller, "%s request %p, %d/%d fault %d\n",
-				ep->end_point.name, request,
-				req->request.actual, req->request.length,
-				request->status);
-	usb_gadget_giveback_request(&req->ep->end_point, &req->request);
-	spin_lock(&musb->lock);
-	ep->busy = busy;
-}
-
-/* ----------------------------------------------------------------------- */
-
-/*
- * Abort requests queued to an endpoint using the status. Synchronous.
- * caller locked controller and blocked irqs, and selected this ep.
- */
-static void nuke(struct musb_ep *ep, const int status)
+typedef struct _DVO_ENCODER_CONTROL_PARAMETERS_V1_4
 {
-	struct musb		*musb = ep->musb;
-	struct musb_request	*req = NULL;
-	void __iomem *epio = ep->musb->endpoints[ep->current_epnum].regs;
+  USHORT usPixelClock;
+  UCHAR  ucDVOConfig;
+  UCHAR  ucAction;                                          //ATOM_ENABLE/ATOM_DISABLE/ATOM_HPD_INIT
+  UCHAR  ucBitPerColor;                       //please refer to definition of PANEL_xBIT_PER_COLOR
+  UCHAR  ucReseved[3];
+}DVO_ENCODER_CONTROL_PARAMETERS_V1_4;
+#define DVO_ENCODER_CONTROL_PS_ALLOCATION_V1_4   DVO_ENCODER_CONTROL_PARAMETERS_V1_4
 
-	ep->busy = 1;
 
-	if (is_dma_capable() && ep->dma) {
-		struct dma_controller	*c = ep->musb->dma_controller;
-		int value;
+//ucTableFormatRevision=1
+//ucTableContentRevision=3 structure is not changed but usMisc add bit 1 as another input for
+// bit1=0: non-coherent mode
+//     =1: coherent mode
 
-		if (ep->is_in) {
-			/*
-			 * The programming guide says that we must not clear
-			 * the DMAMODE bit before DMAENAB, so we only
-			 * clear it in the second write...
-			 */
-			musb_writew(epio, MUSB_TXCSR,
-				    MUSB_TXCSR_DMAMODE | MUSB_TXCSR_FLUSHFIFO);
-			musb_writew(epio, MUSB_TXCSR,
-					0 | MUSB_TXCSR_FLUSHFIFO);
-		} else {
-			musb_writew(epio, MUSB_RXCSR,
-					0 | MUSB_RXCSR_FLUSHFIFO);
-			musb_writew(epio, MUSB_RXCSR,
-					0 | MUSB_RXCSR_FLUSHFIFO);
-		}
+//==========================================================================================
+//Only change is here next time when changing encoder parameter definitions again!
+#define LVDS_ENCODER_CONTROL_PARAMETERS_LAST     LVDS_ENCODER_CONTROL_PARAMETERS_V3
+#define LVDS_ENCODER_CONTROL_PS_ALLOCATION_LAST  LVDS_ENCODER_CONTROL_PARAMETERS_LAST
 
-		value = c->channel_abort(ep->dma);
-		dev_dbg(musb->controller, "%s: abort DMA --> %d\n",
-				ep->name, value);
-		c->channel_release(ep->dma);
-		ep->dma = NULL;
-	}
+#define TMDS1_ENCODER_CONTROL_PARAMETERS_LAST    LVDS_ENCODER_CONTROL_PARAMETERS_V3
+#define TMDS1_ENCODER_CONTROL_PS_ALLOCATION_LAST TMDS1_ENCODER_CONTROL_PARAMETERS_LAST
 
-	while (!list_empty(&ep->req_list)) {
-		req = list_first_entry(&ep->req_list, struct musb_request, list);
-		musb_g_giveback(ep, &req->request, status);
-	}
-}
+#define TMDS2_ENCODER_CONTROL_PARAMETERS_LAST    LVDS_ENCODER_CONTROL_PARAMETERS_V3
+#define TMDS2_ENCODER_CONTROL_PS_ALLOCATION_LAST TMDS2_ENCODER_CONTROL_PARAMETERS_LAST
 
-/* ----------------------------------------------------------------------- */
+#define DVO_ENCODER_CONTROL_PARAMETERS_LAST      DVO_ENCODER_CONTROL_PARAMETERS
+#define DVO_ENCODER_CONTROL_PS_ALLOCATION_LAST   DVO_ENCODER_CONTROL_PS_ALLOCATION
 
-/* Data transfers - pure PIO, pure DMA, or mixed mode */
+//==========================================================================================
+#define PANEL_ENCODER_MISC_DUAL                0x01
+#define PANEL_ENCODER_MISC_COHERENT            0x02
+#define   PANEL_ENCODER_MISC_TMDS_LINKB                0x04
+#define   PANEL_ENCODER_MISC_HDMI_TYPE                0x08
 
-/*
- * This assumes the separate CPPI engine is responding to DMA requests
- * from the usb core ... sequenced a bit differently from mentor dma.
- */
+#define PANEL_ENCODER_ACTION_DISABLE           ATOM_DISABLE
+#define PANEL_ENCODER_ACTION_ENABLE            ATOM_ENABLE
+#define PANEL_ENCODER_ACTION_COHERENTSEQ       (ATOM_ENABLE+1)
 
-static inline int max_ep_writesize(struct musb *musb, struct musb_ep *ep)
+#define PANEL_ENCODER_TRUNCATE_EN              0x01
+#define PANEL_ENCODER_TRUNCATE_DEPTH           0x10
+#define PANEL_ENCODER_SPATIAL_DITHER_EN        0x01
+#define PANEL_ENCODER_SPATIAL_DITHER_DEPTH     0x10
+#define PANEL_ENCODER_TEMPORAL_DITHER_EN       0x01
+#define PANEL_ENCODER_TEMPORAL_DITHER_DEPTH    0x10
+#define PANEL_ENCODER_TEMPORAL_LEVEL_4         0x20
+#define PANEL_ENCODER_25FRC_MASK               0x10
+#define PANEL_ENCODER_25FRC_E                  0x00
+#define PANEL_ENCODER_25FRC_F                  0x10
+#define PANEL_ENCODER_50FRC_MASK               0x60
+#define PANEL_ENCODER_50FRC_A                  0x00
+#define PANEL_ENCODER_50FRC_B                  0x20
+#define PANEL_ENCODER_50FRC_C                  0x40
+#define PANEL_ENCODER_50FRC_D                  0x60
+#define PANEL_ENCODER_75FRC_MASK               0x80
+#define PANEL_ENCODER_75FRC_E                  0x00
+#define PANEL_ENCODER_75FRC_F                  0x80
+
+/****************************************************************************/
+// Structures used by SetVoltageTable
+/****************************************************************************/
+#define SET_VOLTAGE_TYPE_ASIC_VDDC             1
+#define SET_VOLTAGE_TYPE_ASIC_MVDDC            2
+#define SET_VOLTAGE_TYPE_ASIC_MVDDQ            3
+#define SET_VOLTAGE_TYPE_ASIC_VDDCI            4
+#define SET_VOLTAGE_INIT_MODE                  5
+#define SET_VOLTAGE_GET_MAX_VOLTAGE            6               //Gets the Max. voltage for the soldered Asic
+
+#define SET_ASIC_VOLTAGE_MODE_ALL_SOURCE       0x1
+#define SET_ASIC_VOLTAGE_MODE_SOURCE_A         0x2
+#define SET_ASIC_VOLTAGE_MODE_SOURCE_B         0x4
+
+#define   SET_ASIC_VOLTAGE_MODE_SET_VOLTAGE      0x0
+#define   SET_ASIC_VOLTAGE_MODE_GET_GPIOVAL      0x1
+#define   SET_ASIC_VOLTAGE_MODE_GET_GPIOMASK     0x2
+
+typedef struct   _SET_VOLTAGE_PARAMETERS
 {
-	if (can_bulk_split(musb, ep->type))
-		return ep->hw_ep->max_packet_sz_tx;
-	else
-		return ep->packet_sz;
-}
+  UCHAR    ucVoltageType;               // To tell which voltage to set up, VDDC/MVDDC/MVDDQ
+  UCHAR    ucVoltageMode;               // To set all, to set source A or source B or ...
+  UCHAR    ucVoltageIndex;              // An index to tell which voltage level
+  UCHAR    ucReserved;
+}SET_VOLTAGE_PARAMETERS;
 
-/*
- * An endpoint is transmitting data. This can be called either from
- * the IRQ routine or from ep.queue() to kickstart a request on an
- * endpoint.
- *
- * Context: controller locked, IRQs blocked, endpoint selected
- */
-static void txstate(struct musb *musb, struct musb_request *req)
+typedef struct   _SET_VOLTAGE_PARAMETERS_V2
 {
-	u8			epnum = req->epnum;
-	struct musb_ep		*musb_ep;
-	void __iomem		*epio = musb->endpoints[epnum].regs;
-	struct usb_request	*request;
-	u16			fifo_count = 0, csr;
-	int			use_dma = 0;
+  UCHAR    ucVoltageType;               // To tell which voltage to set up, VDDC/MVDDC/MVDDQ
+  UCHAR    ucVoltageMode;               // Not used, maybe use for state machine for differen power mode
+  USHORT   usVoltageLevel;              // real voltage level
+}SET_VOLTAGE_PARAMETERS_V2;
 
-	musb_ep = req->ep;
-
-	/* Check if EP is disabled */
-	if (!musb_ep->desc) {
-		dev_dbg(musb->controller, "ep:%s disabled - ignore request\n",
-						musb_ep->end_point.name);
-		return;
-	}
-
-	/* we shouldn't get here while DMA is active ... but we do ... */
-	if (dma_channel_status(musb_ep->dma) == MUSB_DMA_STATUS_BUSY) {
-		dev_dbg(musb->controller, "dma pending...\n");
-		return;
-	}
-
-	/* read TXCSR before */
-	csr = musb_readw(epio, MUSB_TXCSR);
-
-	request = &req->request;
-	fifo_count = min(max_ep_writesize(musb, musb_ep),
-			(int)(request->length - request->actual));
-
-	if (csr & MUSB_TXCSR_TXPKTRDY) {
-		dev_dbg(musb->controller, "%s old packet still ready , txcsr %03x\n",
-				musb_ep->end_point.name, csr);
-		return;
-	}
-
-	if (csr & MUSB_TXCSR_P_SENDSTALL) {
-		dev_dbg(musb->controller, "%s stalling, txcsr %03x\n",
-				musb_ep->end_point.name, csr);
-		return;
-	}
-
-	dev_dbg(musb->controller, "hw_ep%d, maxpacket %d, fifo count %d, txcsr %03x\n",
-			epnum, musb_ep->packet_sz, fifo_count,
-			csr);
-
-#ifndef	CONFIG_MUSB_PIO_ONLY
-	if (is_buffer_mapped(req)) {
-		struct dma_controller	*c = musb->dma_controller;
-		size_t request_size;
-
-		/* setup DMA, then program endpoint CSR */
-		request_size = min_t(size_t, request->length - request->actual,
-					musb_ep->dma->max_len);
-
-		use_dma = (request->dma != DMA_ADDR_INVALID && request_size);
-
-		/* MUSB_TXCSR_P_ISO is still set correctly */
-
-		if (musb_dma_inventra(musb) || musb_dma_ux500(musb)) {
-			if (request_size < musb_ep->packet_sz)
-				musb_ep->dma->desired_mode = 0;
-			else
-				musb_ep->dma->desired_mode = 1;
-
-			use_dma = use_dma && c->channel_program(
-					musb_ep->dma, musb_ep->packet_sz,
-					musb_ep->dma->desired_mode,
-					request->dma + request->actual, request_size);
-			if (use_dma) {
-				if (musb_ep->dma->desired_mode == 0) {
-					/*
-					 * We must not clear the DMAMODE bit
-					 * before the DMAENAB bit -- and the
-					 * latter doesn't always get cleared
-					 * before we get here...
-					 */
-					csr &= ~(MUSB_TXCSR_AUTOSET
-						| MUSB_TXCSR_DMAENAB);
-					musb_writew(epio, MUSB_TXCSR, csr
-						| MUSB_TXCSR_P_WZC_BITS);
-					csr &= ~MUSB_TXCSR_DMAMODE;
-					csr |= (MUSB_TXCSR_DMAENAB |
-							MUSB_TXCSR_MODE);
-					/* against programming guide */
-				} else {
-					csr |= (MUSB_TXCSR_DMAENAB
-							| MUSB_TXCSR_DMAMODE
-							| MUSB_TXCSR_MODE);
-					/*
-					 * Enable Autoset according to table
-					 * below
-					 * bulk_split hb_mult	Autoset_Enable
-					 *	0	0	Yes(Normal)
-					 *	0	>0	No(High BW ISO)
-					 *	1	0	Yes(HS bulk)
-					 *	1	>0	Yes(FS bulk)
-					 */
-					if (!musb_ep->hb_mult ||
-						(musb_ep->hb_mult &&
-						 can_bulk_split(musb,
-						    musb_ep->type)))
-						csr |= MUSB_TXCSR_AUTOSET;
-				}
-				csr &= ~MUSB_TXCSR_P_UNDERRUN;
-
-				musb_writew(epio, MUSB_TXCSR, csr);
-			}
-		}
-
-		if (is_cppi_enabled(musb)) {
-			/* program endpoint CSR first, then setup DMA */
-			csr &= ~(MUSB_TXCSR_P_UNDERRUN | MUSB_TXCSR_TXPKTRDY);
-			csr |= MUSB_TXCSR_DMAENAB | MUSB_TXCSR_DMAMODE |
-				MUSB_TXCSR_MODE;
-			musb_writew(epio, MUSB_TXCSR, (MUSB_TXCSR_P_WZC_BITS &
-						~MUSB_TXCSR_P_UNDERRUN) | csr);
-
-			/* ensure writebuffer is empty */
-			csr = musb_readw(epio, MUSB_TXCSR);
-
-			/*
-			 * NOTE host side sets DMAENAB later than this; both are
-			 * OK since the transfer dma glue (between CPPI and
-			 * Mentor fifos) just tells CPPI it could start. Data
-			 * only moves to the USB TX fifo when both fifos are
-			 * ready.
-			 */
-			/*
-			 * "mode" is irrelevant here; handle terminating ZLPs
-			 * like PIO does, since the hardware RNDIS mode seems
-			 * unreliable except for the
-			 * last-packet-is-already-short case.
-			 */
-			use_dma = use_dma && c->channel_program(
-					musb_ep->dma, musb_ep->packet_sz,
-					0,
-					request->dma + request->actual,
-					request_size);
-			if (!use_dma) {
-				c->channel_release(musb_ep->dma);
-				musb_ep->dma = NULL;
-				csr &= ~MUSB_TXCSR_DMAENAB;
-				musb_writew(epio, MUSB_TXCSR, csr);
-				/* invariant: prequest->buf is non-null */
-			}
-		} else if (tusb_dma_omap(musb))
-			use_dma = use_dma && c->channel_program(
-					musb_ep->dma, musb_ep->packet_sz,
-					request->zero,
-					request->dma + request->actual,
-					request_size);
-	}
-#endif
-
-	if (!use_dma) {
-		/*
-		 * Unmap the dma buffer back to cpu if dma channel
-		 * programming fails
-		 */
-		unmap_dma_buffer(req, musb);
-
-		musb_write_fifo(musb_ep->hw_ep, fifo_count,
-				(u8 *) (request->buf + request->actual));
-		request->actual += fifo_count;
-		csr |= MUSB_TXCSR_TXPKTRDY;
-		csr &= ~MUSB_TXCSR_P_UNDERRUN;
-		musb_writew(epio, MUSB_TXCSR, csr);
-	}
-
-	/* host may already have the data when this message shows... */
-	dev_dbg(musb->controller, "%s TX/IN %s len %d/%d, txcsr %04x, fifo %d/%d\n",
-			musb_ep->end_point.name, use_dma ? "dma" : "pio",
-			request->actual, request->length,
-			musb_readw(epio, MUSB_TXCSR),
-			fifo_count,
-			musb_readw(epio, MUSB_TXMAXP));
-}
-
-/*
- * FIFO state update (e.g. data ready).
- * Called from IRQ,  with controller locked.
- */
-void musb_g_tx(struct musb *musb, u8 epnum)
+// used by both SetVoltageTable v1.3 and v1.4
+typedef struct   _SET_VOLTAGE_PARAMETERS_V1_3
 {
-	u16			csr;
-	struct musb_request	*req;
-	struct usb_request	*request;
-	u8 __iomem		*mbase = musb->mregs;
-	struct musb_ep		*musb_ep = &musb->endpoints[epnum].ep_in;
-	void __iomem		*epio = musb->endpoints[epnum].regs;
-	struct dma_channel	*dma;
+  UCHAR    ucVoltageType;               // To tell which voltage to set up, VDDC/MVDDC/MVDDQ/VDDCI
+  UCHAR    ucVoltageMode;               // Indicate action: Set voltage level
+  USHORT   usVoltageLevel;              // real voltage level in unit of mv or Voltage Phase (0, 1, 2, .. )
+}SET_VOLTAGE_PARAMETERS_V1_3;
 
-	musb_ep_select(mbase, epnum);
-	req = next_request(musb_ep);
-	request = &req->request;
+//ucVoltageType
+#define VOLTAGE_TYPE_VDDC                    1
+#define VOLTAGE_TYPE_MVDDC                   2
+#define VOLTAGE_TYPE_MVDDQ                   3
+#define VOLTAGE_TYPE_VDDCI                   4
+#define VOLTAGE_TYPE_VDDGFX                  5
+#define VOLTAGE_TYPE_PCC                     6
 
-	csr = musb_readw(epio, MUSB_TXCSR);
-	dev_dbg(musb->controller, "<== %s, txcsr %04x\n", musb_ep->end_point.name, csr);
+#define VOLTAGE_TYPE_GENERIC_I2C_1           0x11
+#define VOLTAGE_TYPE_GENERIC_I2C_2           0x12
+#define VOLTAGE_TYPE_GENERIC_I2C_3           0x13
+#define VOLTAGE_TYPE_GENERIC_I2C_4           0x14
+#define VOLTAGE_TYPE_GENERIC_I2C_5           0x15
+#define VOLTAGE_TYPE_GENERIC_I2C_6           0x16
+#define VOLTAGE_TYPE_GENERIC_I2C_7           0x17
+#define VOLTAGE_TYPE_GENERIC_I2C_8           0x18
+#define VOLTAGE_TYPE_GENERIC_I2C_9           0x19
+#define VOLTAGE_TYPE_GENERIC_I2C_10          0x1A
 
-	dma = is_dma_capable() ? musb_ep->dma : NULL;
+//SET_VOLTAGE_PARAMETERS_V3.ucVoltageMode
+#define ATOM_SET_VOLTAGE                     0        //Set voltage Level
+#define ATOM_INIT_VOLTAGE_REGULATOR          3        //Init Regulator
+#define ATOM_SET_VOLTAGE_PHASE               4        //Set Vregulator Phase, only for SVID/PVID regulator
+#define ATOM_GET_MAX_VOLTAGE                 6        //Get Max Voltage, not used from SetVoltageTable v1.3
+#define ATOM_GET_VOLTAGE_LEVEL               6        //Get Voltage level from vitual voltage ID, not used for SetVoltage v1.4
+#define ATOM_GET_LEAKAGE_ID                  8        //Get Leakage Voltage Id ( starting from SMU7x IP ), SetVoltage v1.4
 
-	/*
-	 * REVISIT: for high bandwidth, MUSB_TXCSR_P_INCOMPTX
-	 * probably rates reporting as a host error.
-	 */
-	if (csr & MUSB_TXCSR_P_SENTSTALL) {
-		csr |=	MUSB_TXCSR_P_WZC_BITS;
-		csr &= ~MUSB_TXCSR_P_SENTSTALL;
-		musb_writew(epio, MUSB_TXCSR, csr);
-		return;
-	}
+// define vitual voltage id in usVoltageLevel
+#define ATOM_VIRTUAL_VOLTAGE_ID0             0xff01
+#define ATOM_VIRTUAL_VOLTAGE_ID1             0xff02
+#define ATOM_VIRTUAL_VOLTAGE_ID2             0xff03
+#define ATOM_VIRTUAL_VOLTAGE_ID3             0xff04
+#define ATOM_VIRTUAL_VOLTAGE_ID4             0xff05
+#define ATOM_VIRTUAL_VOLTAGE_ID5             0xff06
+#define ATOM_VIRTUAL_VOLTAGE_ID6             0xff07
+#define ATOM_VIRTUAL_VOLTAGE_ID7             0xff08
 
-	if (csr & MUSB_TXCSR_P_UNDERRUN) {
-		/* We NAKed, no big deal... little reason to care. */
-		csr |=	 MUSB_TXCSR_P_WZC_BITS;
-		csr &= ~(MUSB_TXCSR_P_UNDERRUN | MUSB_TXCSR_TXPKTRDY);
-		musb_writew(epio, MUSB_TXCSR, csr);
-		dev_vdbg(musb->controller, "underrun on ep%d, req %p\n",
-				epnum, request);
-	}
-
-	if (dma_channel_status(dma) == MUSB_DMA_STATUS_BUSY) {
-		/*
-		 * SHOULD NOT HAPPEN... has with CPPI though, after
-		 * changing SENDSTALL (and other cases); harmless?
-		 */
-		dev_dbg(musb->controller, "%s dma still busy?\n", musb_ep->end_point.name);
-		return;
-	}
-
-	if (request) {
-		u8	is_dma = 0;
-		bool	short_packet = false;
-
-		if (dma && (csr & MUSB_TXCSR_DMAENAB)) {
-			is_dma = 1;
-			csr |= MUSB_TXCSR_P_WZC_BITS;
-			csr &= ~(MUSB_TXCSR_DMAENAB | MUSB_TXCSR_P_UNDERRUN |
-				 MUSB_TXCSR_TXPKTRDY | MUSB_TXCSR_AUTOSET);
-			musb_writew(epio, MUSB_TXCSR, csr);
-			/* Ensure writebuffer is empty. */
-			csr = musb_readw(epio, MUSB_TXCSR);
-			request->actual += musb_ep->dma->actual_len;
-			dev_dbg(musb->controller, "TXCSR%d %04x, DMA off, len %zu, req %p\n",
-				epnum, csr, musb_ep->dma->actual_len, request);
-		}
-
-		/*
-		 * First, maybe a terminating short packet. Some DMA
-		 * engines might handle this by themselves.
-		 */
-		if ((request->zero && request->length)
-			&& (request->length % musb_ep->packet_sz == 0)
-			&& (request->actual == request->length))
-				short_packet = true;
-
-		if ((musb_dma_inventra(musb) || musb_dma_ux500(musb)) &&
-			(is_dma && (!dma->desired_mode ||
-				(request->actual &
-					(musb_ep->packet_sz - 1)))))
-				short_packet = true;
-
-		if (short_packet) {
-			/*
-			 * On DMA completion, FIFO may not be
-			 * available yet...
-			 */
-			if (csr & MUSB_TXCSR_TXPKTRDY)
-				return;
-
-			dev_dbg(musb->controller, "sending zero pkt\n");
-			musb_writew(epio, MUSB_TXCSR, MUSB_TXCSR_MODE
-					| MUSB_TXCSR_TXPKTRDY);
-			request->zero = 0;
-		}
-
-		if (request->actual == request->length) {
-			musb_g_giveback(musb_ep, request, 0);
-			/*
-			 * In the giveback function the MUSB lock is
-			 * released and acquired after sometime. During
-			 * this time period the INDEX register could get
-			 * changed by the gadget_queue function especially
-			 * on SMP systems. Reselect the INDEX to be sure
-			 * we are reading/modifying the right registers
-			 */
-			musb_ep_select(mbase, epnum);
-			req = musb_ep->desc ? next_request(musb_ep) : NULL;
-			if (!req) {
-				dev_dbg(musb->controller, "%s idle now\n",
-					musb_ep->end_point.name);
-				return;
-			}
-		}
-
-		txstate(musb, req);
-	}
-}
-
-/* ------------------------------------------------------------ */
-
-/*
- * Context: controller locked, IRQs blocked, endpoint selected
- */
-static void rxstate(struct musb *musb, struct musb_request *req)
+typedef struct _SET_VOLTAGE_PS_ALLOCATION
 {
-	const u8		epnum = req->epnum;
-	struct usb_request	*request = &req->request;
-	struct musb_ep		*musb_ep;
-	void __iomem		*epio = musb->endpoints[epnum].regs;
-	unsigned		len = 0;
-	u16			fifo_count;
-	u16			csr = musb_readw(epio, MUSB_RXCSR);
-	struct musb_hw_ep	*hw_ep = &musb->endpoints[epnum];
-	u8			use_mode_1;
+  SET_VOLTAGE_PARAMETERS sASICSetVoltage;
+  WRITE_ONE_BYTE_HW_I2C_DATA_PS_ALLOCATION sReserved;
+}SET_VOLTAGE_PS_ALLOCATION;
 
-	if (hw_ep->is_shared_fifo)
-		musb_ep = &hw_ep->ep_in;
-	else
-		musb_ep = &hw_ep->ep_out;
-
-	fifo_count = musb_ep->packet_sz;
-
-	/* Check if EP is disabled */
-	if (!musb_ep->desc) {
-		dev_dbg(musb->controller, "ep:%s disabled - ignore request\n",
-						musb_ep->end_point.name);
-		return;
-	}
-
-	/* We shouldn't get here while DMA is active, but we do... */
-	if (dma_channel_status(musb_ep->dma) == MUSB_DMA_STATUS_BUSY) {
-		dev_dbg(musb->controller, "DMA pending...\n");
-		return;
-	}
-
-	if (csr & MUSB_RXCSR_P_SENDSTALL) {
-		dev_dbg(musb->controller, "%s stalling, RXCSR %04x\n",
-		    musb_ep->end_point.name, csr);
-		return;
-	}
-
-	if (is_cppi_enabled(musb) && is_buffer_mapped(req)) {
-		struct dma_controller	*c = musb->dma_controller;
-		struct dma_channel	*channel = musb_ep->dma;
-
-		/* NOTE:  CPPI won't actually stop advancing the DMA
-		 * queue after short packet transfers, so this is almost
-		 * always going to run as IRQ-per-packet DMA so that
-		 * faults will be handled correctly.
-		 */
-		if (c->channel_program(channel,
-				musb_ep->packet_sz,
-				!request->short_not_ok,
-				request->dma + request->actual,
-				request->length - request->actual)) {
-
-			/* make sure that if an rxpkt arrived after the irq,
-			 * the cppi engine will be ready to take it as soon
-			 * as DMA is enabled
-			 */
-			csr &= ~(MUSB_RXCSR_AUTOCLEAR
-					| MUSB_RXCSR_DMAMODE);
-			csr |= MUSB_RXCSR_DMAENAB | MUSB_RXCSR_P_WZC_BITS;
-			musb_writew(epio, MUSB_RXCSR, csr);
-			return;
-		}
-	}
-
-	if (csr & MUSB_RXCSR_RXPKTRDY) {
-		fifo_count = musb_readw(epio, MUSB_RXCOUNT);
-
-		/*
-		 * Enable Mode 1 on RX transfers only when short_not_ok flag
-		 * is set. Currently short_not_ok flag is set only from
-		 * file_storage and f_mass_storage drivers
-		 */
-
-		if (request->short_not_ok && fifo_count == musb_ep->packet_sz)
-			use_mode_1 = 1;
-		else
-			use_mode_1 = 0;
-
-		if (request->actual < request->length) {
-			if (!is_buffer_mapped(req))
-				goto buffer_aint_mapped;
-
-			if (musb_dma_inventra(musb)) {
-				struct dma_controller	*c;
-				struct dma_channel	*channel;
-				int			use_dma = 0;
-				unsigned int transfer_size;
-
-				c = musb->dma_controller;
-				channel = musb_ep->dma;
-
-	/* We use DMA Req mode 0 in rx_csr, and DMA controller operates in
-	 * mode 0 only. So we do not get endpoint interrupts due to DMA
-	 * completion. We only get interrupts from DMA controller.
-	 *
-	 * We could operate in DMA mode 1 if we knew the size of the tranfer
-	 * in advance. For mass storage class, request->length = what the host
-	 * sends, so that'd work.  But for pretty much everything else,
-	 * request->length is routinely more than what the host sends. For
-	 * most these gadgets, end of is signified either by a short packet,
-	 * or filling the last byte of the buffer.  (Sending extra data in
-	 * that last pckate should trigger an overflow fault.)  But in mode 1,
-	 * we don't get DMA completion interrupt for short packets.
-	 *
-	 * Theoretically, we could enable DMAReq irq (MUSB_RXCSR_DMAMODE = 1),
-	 * to get endpoint interrupt on every DMA req, but that didn't seem
-	 * to work reliably.
-	 *
-	 * REVISIT an updated g_file_storage can set req->short_not_ok, which
-	 * then becomes usable as a runtime "use mode 1" hint...
-	 */
-
-				/* Experimental: Mode1 works with mass storage use cases */
-				if (use_mode_1) {
-					csr |= MUSB_RXCSR_AUTOCLEAR;
-					musb_writew(epio, MUSB_RXCSR, csr);
-					csr |= MUSB_RXCSR_DMAENAB;
-					musb_writew(epio, MUSB_RXCSR, csr);
-
-					/*
-					 * this special sequence (enabling and then
-					 * disabling MUSB_RXCSR_DMAMODE) is required
-					 * to get DMAReq to activate
-					 */
-					musb_writew(epio, MUSB_RXCSR,
-						csr | MUSB_RXCSR_DMAMODE);
-					musb_writew(epio, MUSB_RXCSR, csr);
-
-					transfer_size = min_t(unsigned int,
-							request->length -
-							request->actual,
-							channel->max_len);
-					musb_ep->dma->desired_mode = 1;
-				} else {
-					if (!musb_ep->hb_mult &&
-						musb_ep->hw_ep->rx_double_buffered)
-						csr |= MUSB_RXCSR_AUTOCLEAR;
-					csr |= MUSB_RXCSR_DMAENAB;
-					musb_writew(epio, MUSB_RXCSR, csr);
-
-					transfer_size = min(request->length - request->actual,
-							(unsigned)fifo_count);
-					musb_ep->dma->desired_mode = 0;
-				}
-
-				use_dma = c->channel_program(
-						channel,
-						musb_ep->packet_sz,
-						channel->desired_mode,
-						request->dma
-						+ request->actual,
-						transfer_size);
-
-				if (use_dma)
-					return;
-			}
-
-			if ((musb_dma_ux500(musb)) &&
-				(request->actual < request->length)) {
-
-				struct dma_controller *c;
-				struct dma_channel *channel;
-				unsigned int transfer_size = 0;
-
-				c = musb->dma_controller;
-				channel = musb_ep->dma;
-
-				/* In case first packet is short */
-				if (fifo_count < musb_ep->packet_sz)
-					transfer_size = fifo_count;
-				else if (request->short_not_ok)
-					transfer_size =	min_t(unsigned int,
-							request->length -
-							request->actual,
-							channel->max_len);
-				else
-					transfer_size = min_t(unsigned int,
-							request->length -
-							request->actual,
-							(unsigned)fifo_count);
-
-				csr &= ~MUSB_RXCSR_DMAMODE;
-				csr |= (MUSB_RXCSR_DMAENAB |
-					MUSB_RXCSR_AUTOCLEAR);
-
-				musb_writew(epio, MUSB_RXCSR, csr);
-
-				if (transfer_size <= musb_ep->packet_sz) {
-					musb_ep->dma->desired_mode = 0;
-				} else {
-					musb_ep->dma->desired_mode = 1;
-					/* Mode must be set after DMAENAB */
-					csr |= MUSB_RXCSR_DMAMODE;
-					musb_writew(epio, MUSB_RXCSR, csr);
-				}
-
-				if (c->channel_program(channel,
-							musb_ep->packet_sz,
-							channel->desired_mode,
-							request->dma
-							+ request->actual,
-							transfer_size))
-
-					return;
-			}
-
-			len = request->length - request->actual;
-			dev_dbg(musb->controller, "%s OUT/RX pio fifo %d/%d, maxpacket %d\n",
-					musb_ep->end_point.name,
-					fifo_count, len,
-					musb_ep->packet_sz);
-
-			fifo_count = min_t(unsigned, len, fifo_count);
-
-			if (tusb_dma_omap(musb)) {
-				struct dma_controller *c = musb->dma_controller;
-				struct dma_channel *channel = musb_ep->dma;
-				u32 dma_addr = request->dma + request->actual;
-				int ret;
-
-				ret = c->channel_program(channel,
-						musb_ep->packet_sz,
-						channel->desired_mode,
-						dma_addr,
-						fifo_count);
-				if (ret)
-					return;
-			}
-
-			/*
-			 * Unmap the dma buffer back to cpu if dma channel
-			 * programming fails. This buffer is mapped if the
-			 * channel allocation is successful
-			 */
-			unmap_dma_buffer(req, musb);
-
-			/*
-			 * Clear DMAENAB and AUTOCLEAR for the
-			 * PIO mode transfer
-			 */
-			csr &= ~(MUSB_RXCSR_DMAENAB | MUSB_RXCSR_AUTOCLEAR);
-			musb_writew(epio, MUSB_RXCSR, csr);
-
-buffer_aint_mapped:
-			fifo_count = min_t(unsigned int,
-					request->length - request->actual,
-					(unsigned int)fifo_count);
-			musb_read_fifo(musb_ep->hw_ep, fifo_count, (u8 *)
-					(request->buf + request->actual));
-			request->actual += fifo_count;
-
-			/* REVISIT if we left anything in the fifo, flush
-			 * it and report -EOVERFLOW
-			 */
-
-			/* ack the read! */
-			csr |= MUSB_RXCSR_P_WZC_BITS;
-			csr &= ~MUSB_RXCSR_RXPKTRDY;
-			musb_writew(epio, MUSB_RXCSR, csr);
-		}
-	}
-
-	/* reach the end or short packet detected */
-	if (request->actual == request->length ||
-	    fifo_count < musb_ep->packet_sz)
-		musb_g_giveback(musb_ep, request, 0);
-}
-
-/*
- * Data ready for a request; called from IRQ
- */
-void musb_g_rx(struct musb *musb, u8 epnum)
+// New Added from SI for GetVoltageInfoTable, input parameter structure
+typedef struct  _GET_VOLTAGE_INFO_INPUT_PARAMETER_V1_1
 {
-	u16			csr;
-	struct musb_request	*req;
-	struct usb_request	*request;
-	void __iomem		*mbase = musb->mregs;
-	struct musb_ep		*musb_ep;
-	void __iomem		*epio = musb->endpoints[epnum].regs;
-	struct dma_channel	*dma;
-	struct musb_hw_ep	*hw_ep = &musb->endpoints[epnum];
+  UCHAR    ucVoltageType;               // Input: To tell which voltage to set up, VDDC/MVDDC/MVDDQ/VDDCI
+  UCHAR    ucVoltageMode;               // Input: Indicate action: Get voltage info
+  USHORT   usVoltageLevel;              // Input: real voltage level in unit of mv or Voltage Phase (0, 1, 2, .. ) or Leakage Id
+  ULONG    ulReserved;
+}GET_VOLTAGE_INFO_INPUT_PARAMETER_V1_1;
 
-	if (hw_ep->is_shared_fifo)
-		musb_ep = &hw_ep->ep_in;
-	else
-		musb_ep = &hw_ep->ep_out;
-
-	musb_ep_select(mbase, epnum);
-
-	req = next_request(musb_ep);
-	if (!req)
-		return;
-
-	request = &req->request;
-
-	csr = musb_readw(epio, MUSB_RXCSR);
-	dma = is_dma_capable() ? musb_ep->dma : NULL;
-
-	dev_dbg(musb->controller, "<== %s, rxcsr %04x%s %p\n", musb_ep->end_point.name,
-			csr, dma ? " (dma)" : "", request);
-
-	if (csr & MUSB_RXCSR_P_SENTSTALL) {
-		csr |= MUSB_RXCSR_P_WZC_BITS;
-		csr &= ~MUSB_RXCSR_P_SENTSTALL;
-		musb_writew(epio, MUSB_RXCSR, csr);
-		return;
-	}
-
-	if (csr & MUSB_RXCSR_P_OVERRUN) {
-		/* csr |= MUSB_RXCSR_P_WZC_BITS; */
-		csr &= ~MUSB_RXCSR_P_OVERRUN;
-		musb_writew(epio, MUSB_RXCSR, csr);
-
-		dev_dbg(musb->controller, "%s iso overrun on %p\n", musb_ep->name, request);
-		if (request->status == -EINPROGRESS)
-			request->status = -EOVERFLOW;
-	}
-	if (csr & MUSB_RXCSR_INCOMPRX) {
-		/* REVISIT not necessarily an error */
-		dev_dbg(musb->controller, "%s, incomprx\n", musb_ep->end_point.name);
-	}
-
-	if (dma_channel_status(dma) == MUSB_DMA_STATUS_BUSY) {
-		/* "should not happen"; likely RXPKTRDY pending for DMA */
-		dev_dbg(musb->controller, "%s busy, csr %04x\n",
-			musb_ep->end_point.name, csr);
-		return;
-	}
-
-	if (dma && (csr & MUSB_RXCSR_DMAENAB)) {
-		csr &= ~(MUSB_RXCSR_AUTOCLEAR
-				| MUSB_RXCSR_DMAENAB
-				| MUSB_RXCSR_DMAMODE);
-		musb_writew(epio, MUSB_RXCSR,
-			MUSB_RXCSR_P_WZC_BITS | csr);
-
-		request->actual += musb_ep->dma->actual_len;
-
-		dev_dbg(musb->controller, "RXCSR%d %04x, dma off, %04x, len %zu, req %p\n",
-			epnum, csr,
-			musb_readw(epio, MUSB_RXCSR),
-			musb_ep->dma->actual_len, request);
-
-#if defined(CONFIG_USB_INVENTRA_DMA) || defined(CONFIG_USB_TUSB_OMAP_DMA) || \
-	defined(CONFIG_USB_UX500_DMA)
-		/* Autoclear doesn't clear RxPktRdy for short packets */
-		if ((dma->desired_mode == 0 && !hw_ep->rx_double_buffered)
-				|| (dma->actual_len
-					& (musb_ep->packet_sz - 1))) {
-			/* ack the read! */
-			csr &= ~MUSB_RXCSR_RXPKTRDY;
-			musb_writew(epio, MUSB_RXCSR, csr);
-		}
-
-		/* incomplete, and not short? wait for next IN packet */
-		if ((request->actual < request->length)
-				&& (musb_ep->dma->actual_len
-					== musb_ep->packet_sz)) {
-			/* In double buffer case, continue to unload fifo if
- 			 * there is Rx packet in FIFO.
- 			 **/
-			csr = musb_readw(epio, MUSB_RXCSR);
-			if ((csr & MUSB_RXCSR_RXPKTRDY) &&
-				hw_ep->rx_double_buffered)
-				goto exit;
-			return;
-		}
-#endif
-		musb_g_giveback(musb_ep, request, 0);
-		/*
-		 * In the giveback function the MUSB lock is
-		 * released and acquired after sometime. During
-		 * this time period the INDEX register could get
-		 * changed by the gadget_queue function especially
-		 * on SMP systems. Reselect the INDEX to be sure
-		 * we are reading/modifying the right registers
-		 */
-		musb_ep_select(mbase, epnum);
-
-		req = next_request(musb_ep);
-		if (!req)
-			return;
-	}
-#if defined(CONFIG_USB_INVENTRA_DMA) || defined(CONFIG_USB_TUSB_OMAP_DMA) || \
-	defined(CONFIG_USB_UX500_DMA)
-exit:
-#endif
-	/* Analyze request */
-	rxstate(musb, req);
-}
-
-/* ------------------------------------------------------------ */
-
-static int musb_gadget_enable(struct usb_ep *ep,
-			const struct usb_endpoint_descriptor *desc)
+// New Added from SI for GetVoltageInfoTable, output parameter structure when ucVotlageMode == ATOM_GET_VOLTAGE_VID
+typedef struct  _GET_VOLTAGE_INFO_OUTPUT_PARAMETER_V1_1
 {
-	unsigned long		flags;
-	struct musb_ep		*musb_ep;
-	struct musb_hw_ep	*hw_ep;
-	void __iomem		*regs;
-	struct musb		*musb;
-	void __iomem	*mbase;
-	u8		epnum;
-	u16		csr;
-	unsigned	tmp;
-	int		status = -EINVAL;
+  ULONG    ulVotlageGpioState;
+  ULONG    ulVoltageGPioMask;
+}GET_VOLTAGE_INFO_OUTPUT_PARAMETER_V1_1;
 
-	if (!ep || !desc)
-		return -EINVAL;
-
-	musb_ep = to_musb_ep(ep);
-	hw_ep = musb_ep->hw_ep;
-	regs = hw_ep->regs;
-	musb = musb_ep->musb;
-	mbase = musb->mregs;
-	epnum = musb_ep->current_epnum;
-
-	spin_lock_irqsave(&musb->lock, flags);
-
-	if (musb_ep->desc) {
-		status = -EBUSY;
-		goto fail;
-	}
-	musb_ep->type = usb_endpoint_type(desc);
-
-	/* check direction and (later) maxpacket size against endpoint */
-	if (usb_endpoint_num(desc) != epnum)
-		goto fail;
-
-	/* REVISIT this rules out high bandwidth periodic transfers */
-	tmp = usb_endpoint_maxp(desc);
-	if (tmp & ~0x07ff) {
-		int ok;
-
-		if (usb_endpoint_dir_in(desc))
-			ok = musb->hb_iso_tx;
-		else
-			ok = musb->hb_iso_rx;
-
-		if (!ok) {
-			dev_dbg(musb->controller, "no support for high bandwidth ISO\n");
-			goto fail;
-		}
-		musb_ep->hb_mult = (tmp >> 11) & 3;
-	} else {
-		musb_ep->hb_mult = 0;
-	}
-
-	musb_ep->packet_sz = tmp & 0x7ff;
-	tmp = musb_ep->packet_sz * (musb_ep->hb_mult + 1);
-
-	/* enable the interrupts for the endpoint, set the endpoint
-	 * packet size (or fail), set the mode, clear the fifo
-	 */
-	musb_ep_select(mbase, epnum);
-	if (usb_endpoint_dir_in(desc)) {
-
-		if (hw_ep->is_shared_fifo)
-			musb_ep->is_in = 1;
-		if (!musb_ep->is_in)
-			goto fail;
-
-		if (tmp > hw_ep->max_packet_sz_tx) {
-			dev_dbg(musb->controller, "packet size beyond hardware FIFO size\n");
-			goto fail;
-		}
-
-		musb->intrtxe |= (1 << epnum);
-		musb_writew(mbase, MUSB_INTRTXE, musb->intrtxe);
-
-		/* REVISIT if can_bulk_split(), use by updating "tmp";
-		 * likewise high bandwidth periodic tx
-		 */
-		/* Set TXMAXP with the FIFO size of the endpoint
-		 * to disable double buffering mode.
-		 */
-		if (musb->double_buffer_not_ok) {
-			musb_writew(regs, MUSB_TXMAXP, hw_ep->max_packet_sz_tx);
-		} else {
-			if (can_bulk_split(musb, musb_ep->type))
-				musb_ep->hb_mult = (hw_ep->max_packet_sz_tx /
-							musb_ep->packet_sz) - 1;
-			musb_writew(regs, MUSB_TXMAXP, musb_ep->packet_sz
-					| (musb_ep->hb_mult << 11));
-		}
-
-		csr = MUSB_TXCSR_MODE | MUSB_TXCSR_CLRDATATOG;
-		if (musb_readw(regs, MUSB_TXCSR)
-				& MUSB_TXCSR_FIFONOTEMPTY)
-			csr |= MUSB_TXCSR_FLUSHFIFO;
-		if (musb_ep->type == USB_ENDPOINT_XFER_ISOC)
-			csr |= MUSB_TXCSR_P_ISO;
-
-		/* set twice in case of double buffering */
-		musb_writew(regs, MUSB_TXCSR, csr);
-		/* REVISIT may be inappropriate w/o FIFONOTEMPTY ... */
-		musb_writew(regs, MUSB_TXCSR, csr);
-
-	} else {
-
-		if (hw_ep->is_shared_fifo)
-			musb_ep->is_in = 0;
-		if (musb_ep->is_in)
-			goto fail;
-
-		if (tmp > hw_ep->max_packet_sz_rx) {
-			dev_dbg(musb->controller, "packet size beyond hardware FIFO size\n");
-			goto fail;
-		}
-
-		musb->intrrxe |= (1 << epnum);
-		musb_writew(mbase, MUSB_INTRRXE, musb->intrrxe);
-
-		/* REVISIT if can_bulk_combine() use by updating "tmp"
-		 * likewise high bandwidth periodic rx
-		 */
-		/* Set RXMAXP with the FIFO size of the endpoint
-		 * to disable double buffering mode.
-		 */
-		if (musb->double_buffer_not_ok)
-			musb_writew(regs, MUSB_RXMAXP, hw_ep->max_packet_sz_tx);
-		else
-			musb_writew(regs, MUSB_RXMAXP, musb_ep->packet_sz
-					| (musb_ep->hb_mult << 11));
-
-		/* force shared fifo to OUT-only mode */
-		if (hw_ep->is_shared_fifo) {
-			csr = musb_readw(regs, MUSB_TXCSR);
-			csr &= ~(MUSB_TXCSR_MODE | MUSB_TXCSR_TXPKTRDY);
-			musb_writew(regs, MUSB_TXCSR, csr);
-		}
-
-		csr = MUSB_RXCSR_FLUSHFIFO | MUSB_RXCSR_CLRDATATOG;
-		if (musb_ep->type == USB_ENDPOINT_XFER_ISOC)
-			csr |= MUSB_RXCSR_P_ISO;
-		else if (musb_ep->type == USB_ENDPOINT_XFER_INT)
-			csr |= MUSB_RXCSR_DISNYET;
-
-		/* set twice in case of double buffering */
-		musb_writew(regs, MUSB_RXCSR, csr);
-		musb_writew(regs, MUSB_RXCSR, csr);
-	}
-
-	/* NOTE:  all the I/O code _should_ work fine without DMA, in case
-	 * for some reason you run out of channels here.
-	 */
-	if (is_dma_capable() && musb->dma_controller) {
-		struct dma_controller	*c = musb->dma_controller;
-
-		musb_ep->dma = c->channel_alloc(c, hw_ep,
-				(desc->bEndpointAddress & USB_DIR_IN));
-	} else
-		musb_ep->dma = NULL;
-
-	musb_ep->desc = desc;
-	musb_ep->busy = 0;
-	musb_ep->wedged = 0;
-	status = 0;
-
-	pr_debug("%s periph: enabled %s for %s %s, %smaxpacket %d\n",
-			musb_driver_name, musb_ep->end_point.name,
-			({ char *s; switch (musb_ep->type) {
-			case USB_ENDPOINT_XFER_BULK:	s = "bulk"; break;
-			case USB_ENDPOINT_XFER_INT:	s = "int"; break;
-			default:			s = "iso"; break;
-			} s; }),
-			musb_ep->is_in ? "IN" : "OUT",
-			musb_ep->dma ? "dma, " : "",
-			musb_ep->packet_sz);
-
-	schedule_work(&musb->irq_work);
-
-fail:
-	spin_unlock_irqrestore(&musb->lock, flags);
-	return status;
-}
-
-/*
- * Disable an endpoint flushing all requests queued.
- */
-static int musb_gadget_disable(struct usb_ep *ep)
+// New Added from SI for GetVoltageInfoTable, output parameter structure when ucVotlageMode == ATOM_GET_VOLTAGE_STATEx_LEAKAGE_VID
+typedef struct  _GET_LEAKAGE_VOLTAGE_INFO_OUTPUT_PARAMETER_V1_1
 {
-	unsigned long	flags;
-	struct musb	*musb;
-	u8		epnum;
-	struct musb_ep	*musb_ep;
-	void __iomem	*epio;
-	int		status = 0;
+  USHORT   usVoltageLevel;
+  USHORT   usVoltageId;                                  // Voltage Id programmed in Voltage Regulator
+  ULONG    ulReseved;
+}GET_LEAKAGE_VOLTAGE_INFO_OUTPUT_PARAMETER_V1_1;
 
-	musb_ep = to_musb_ep(ep);
-	musb = musb_ep->musb;
-	epnum = musb_ep->current_epnum;
-	epio = musb->endpoints[epnum].regs;
+// GetVoltageInfo v1.1 ucVoltageMode
+#define ATOM_GET_VOLTAGE_VID                0x00
+#define ATOM_GET_VOTLAGE_INIT_SEQ           0x03
+#define ATOM_GET_VOLTTAGE_PHASE_PHASE_VID   0x04
+#define ATOM_GET_VOLTAGE_SVID2              0x07        //Get SVI2 Regulator Info
 
-	spin_lock_irqsave(&musb->lock, flags);
-	musb_ep_select(musb->mregs, epnum);
+// for SI, this state map to 0xff02 voltage state in Power Play table, which is power boost state
+#define   ATOM_GET_VOLTAGE_STATE0_LEAKAGE_VID 0x10
+// for SI, this state map to 0xff01 voltage state in Power Play table, which is performance state
+#define   ATOM_GET_VOLTAGE_STATE1_LEAKAGE_VID 0x11
 
-	/* zero the endpoint sizes */
-	if (musb_ep->is_in) {
-		musb->intrtxe &= ~(1 << epnum);
-		musb_writew(musb->mregs, MUSB_INTRTXE, musb->intrtxe);
-		musb_writew(epio, MUSB_TXMAXP, 0);
-	} else {
-		musb->intrrxe &= ~(1 << epnum);
-		musb_writew(musb->mregs, MUSB_INTRRXE, musb->intrrxe);
-		musb_writew(epio, MUSB_RXMAXP, 0);
-	}
+#define   ATOM_GET_VOLTAGE_STATE2_LEAKAGE_VID 0x12
+#define   ATOM_GET_VOLTAGE_STATE3_LEAKAGE_VID 0x13
 
-	musb_ep->desc = NULL;
-	musb_ep->end_point.desc = NULL;
 
-	/* abort all pending DMA and requests */
-	nuke(musb_ep, -ESHUTDOWN);
-
-	schedule_work(&musb->irq_work);
-
-	spin_unlock_irqrestore(&(musb->lock), flags);
-
-	dev_dbg(musb->controller, "%s\n", musb_ep->end_point.name);
-
-	return status;
-}
-
-/*
- * Allocate a request for an endpoint.
- * Reused by ep0 code.
- */
-struct usb_request *musb_alloc_request(struct usb_ep *ep, gfp_t gfp_flags)
+// New Added from CI Hawaii for GetVoltageInfoTable, input parameter structure
+typedef struct  _GET_VOLTAGE_INFO_INPUT_PARAMETER_V1_2
 {
-	struct musb_ep		*musb_ep = to_musb_ep(ep);
-	struct musb		*musb = musb_ep->musb;
-	struct musb_request	*request = NULL;
+  UCHAR    ucVoltageType;               // Input: To tell which voltage to set up, VDDC/MVDDC/MVDDQ/VDDCI
+  UCHAR    ucVoltageMode;               // Input: Indicate action: Get voltage info
+  USHORT   usVoltageLevel;              // Input: real voltage level in unit of mv or Voltage Phase (0, 1, 2, .. ) or Leakage Id
+  ULONG    ulSCLKFreq;                  // Input: when ucVoltageMode= ATOM_GET_VOLTAGE_EVV_VOLTAGE, DPM state SCLK frequency, Define in PPTable SCLK/Voltage dependence table
+}GET_VOLTAGE_INFO_INPUT_PARAMETER_V1_2;
 
-	request = kzalloc(sizeof *request, gfp_flags);
-	if (!request) {
-		dev_dbg(musb->controller, "not enough memory\n");
-		return NULL;
-	}
+// New in GetVoltageInfo v1.2 ucVoltageMode
+#define ATOM_GET_VOLTAGE_EVV_VOLTAGE        0x09
 
-	request->request.dma = DMA_ADDR_INVALID;
-	request->epnum = musb_ep->current_epnum;
-	request->ep = musb_ep;
-
-	return &request->request;
-}
-
-/*
- * Free a request
- * Reused by ep0 code.
- */
-void musb_free_request(struct usb_ep *ep, struct usb_request *req)
+// New Added from CI Hawaii for EVV feature
+typedef struct  _GET_EVV_VOLTAGE_INFO_OUTPUT_PARAMETER_V1_2
 {
-	kfree(to_musb_request(req));
-}
+  USHORT   usVoltageLevel;                               // real voltage level in unit of mv
+  USHORT   usVoltageId;                                  // Voltage Id programmed in Voltage Regulator
+  USHORT   usTDP_Current;                                // TDP_Current in unit of  0.01A
+  USHORT   usTDP_Power;                                  // TDP_Current in unit  of 0.1W
+}GET_EVV_VOLTAGE_INFO_OUTPUT_PARAMETER_V1_2;
 
-static LIST_HEAD(buffers);
-
-struct free_record {
-	struct list_head	list;
-	struct device		*dev;
-	unsigned		bytes;
-	dma_addr_t		dma;
-};
-
-/*
- * Context: controller locked, IRQs blocked.
- */
-void musb_ep_restart(struct musb *musb, struct musb_request *req)
+/****************************************************************************/
+// Structures used by TVEncoderControlTable
+/****************************************************************************/
+typedef struct _TV_ENCODER_CONTROL_PARAMETERS
 {
-	dev_dbg(musb->controller, "<== %s request %p len %u on hw_ep%d\n",
-		req->tx ? "TX/IN" : "RX/OUT",
-		&req->request, req->request.length, req->epnum);
+  USHORT usPixelClock;                // in 10KHz; for bios convenient
+  UCHAR  ucTvStandard;                // See definition "ATOM_TV_NTSC ..."
+  UCHAR  ucAction;                    // 0: turn off encoder
+                                      // 1: setup and turn on encoder
+}TV_ENCODER_CONTROL_PARAMETERS;
 
-	musb_ep_select(musb->mregs, req->epnum);
-	if (req->tx)
-		txstate(musb, req);
-	else
-		rxstate(musb, req);
-}
-
-static int musb_gadget_queue(struct usb_ep *ep, struct usb_request *req,
-			gfp_t gfp_flags)
+typedef struct _TV_ENCODER_CONTROL_PS_ALLOCATION
 {
-	struct musb_ep		*musb_ep;
-	struct musb_request	*request;
-	struct musb		*musb;
-	int			status = 0;
-	unsigned long		lockflags;
+  TV_ENCODER_CONTROL_PARAMETERS sTVEncoder;
+  WRITE_ONE_BYTE_HW_I2C_DATA_PS_ALLOCATION    sReserved; // Don't set this one
+}TV_ENCODER_CONTROL_PS_ALLOCATION;
 
-	if (!ep || !req)
-		return -EINVAL;
-	if (!req->buf)
-		return -ENODATA;
+//==============================Data Table Portion====================================
 
-	musb_ep = to_musb_ep(ep);
-	musb = musb_ep->musb;
 
-	request = to_musb_request(req);
-	request->musb = musb;
-
-	if (request->ep != musb_ep)
-		return -EINVAL;
-
-	dev_dbg(musb->controller, "<== to %s request=%p\n", ep->name, req);
-
-	/* request is mine now... */
-	request->request.actual = 0;
-	request->request.status = -EINPROGRESS;
-	request->epnum = musb_ep->current_epnum;
-	request->tx = musb_ep->is_in;
-
-	map_dma_buffer(request, musb, musb_ep);
-
-	spin_lock_irqsave(&musb->lock, lockflags);
-
-	/* don't queue if the ep is down */
-	if (!musb_ep->desc) {
-		dev_dbg(musb->controller, "req %p queued to %s while ep %s\n",
-				req, ep->name, "disabled");
-		status = -ESHUTDOWN;
-		unmap_dma_buffer(request, musb);
-		goto unlock;
-	}
-
-	/* add request to the list */
-	list_add_tail(&request->list, &musb_ep->req_list);
-
-	/* it this is the head of the queue, start i/o ... */
-	if (!musb_ep->busy && &request->list == musb_ep->req_list.next)
-		musb_ep_restart(musb, request);
-
-unlock:
-	spin_unlock_irqrestore(&musb->lock, lockflags);
-	return status;
-}
-
-static int musb_gadget_dequeue(struct usb_ep *ep, struct usb_request *request)
+/****************************************************************************/
+// Structure used in Data.mtb
+/****************************************************************************/
+typedef struct _ATOM_MASTER_LIST_OF_DATA_TABLES
 {
-	struct musb_ep		*musb_ep = to_musb_ep(ep);
-	struct musb_request	*req = to_musb_request(request);
-	struct musb_request	*r;
-	unsigned long		flags;
-	int			status = 0;
-	struct musb		*musb = musb_ep->musb;
+  USHORT        UtilityPipeLine;          // Offest for the utility to get parser info,Don't change this position!
+  USHORT        MultimediaCapabilityInfo; // Only used by MM Lib,latest version 1.1, not configuable from Bios, need to include the table to build Bios
+  USHORT        MultimediaConfigInfo;     // Only used by MM Lib,latest version 2.1, not configuable from Bios, need to include the table to build Bios
+  USHORT        StandardVESA_Timing;      // Only used by Bios
+  USHORT        FirmwareInfo;             // Shared by various SW components,latest version 1.4
+  USHORT        PaletteData;              // Only used by BIOS
+  USHORT        LCD_Info;                 // Shared by various SW components,latest version 1.3, was called LVDS_Info
+  USHORT        DIGTransmitterInfo;       // Internal used by VBIOS only version 3.1
+  USHORT        AnalogTV_Info;            // Shared by various SW components,latest version 1.1
+  USHORT        SupportedDevicesInfo;     // Will be obsolete from R600
+  USHORT        GPIO_I2C_Info;            // Shared by various SW components,latest version 1.2 will be used from R600
+  USHORT        VRAM_UsageByFirmware;     // Shared by various SW components,latest version 1.3 will be used from R600
+  USHORT        GPIO_Pin_LUT;             // Shared by various SW components,latest version 1.1
+  USHORT        VESA_ToInternalModeLUT;   // Only used by Bios
+  USHORT        ComponentVideoInfo;       // Shared by various SW components,latest version 2.1 will be used from R600
+  USHORT        PowerPlayInfo;            // Shared by various SW components,latest version 2.1,new design from R600
+  USHORT        GPUVirtualizationInfo;    // Will be obsolete from R600
+  USHORT        SaveRestoreInfo;          // Only used by Bios
+  USHORT        PPLL_SS_Info;             // Shared by various SW components,latest version 1.2, used to call SS_Info, change to new name because of int ASIC SS info
+  USHORT        OemInfo;                  // Defined and used by external SW, should be obsolete soon
+  USHORT        XTMDS_Info;               // Will be obsolete from R600
+  USHORT        MclkSS_Info;              // Shared by various SW components,latest version 1.1, only enabled when ext SS chip is used
+  USHORT        Object_Header;            // Shared by various SW components,latest version 1.1
+  USHORT        IndirectIOAccess;         // Only used by Bios,this table position can't change at all!!
+  USHORT        MC_InitParameter;         // Only used by command table
+  USHORT        ASIC_VDDC_Info;           // Will be obsolete from R600
+  USHORT        ASIC_InternalSS_Info;     // New tabel name from R600, used to be called "ASIC_MVDDC_Info"
+  USHORT        TV_VideoMode;             // Only used by command table
+  USHORT        VRAM_Info;                // Only used by command table, latest version 1.3
+  USHORT        MemoryTrainingInfo;       // Used for VBIOS and Diag utility for memory training purpose since R600. the new table rev start from 2.1
+  USHORT        IntegratedSystemInfo;     // Shared by various SW components
+  USHORT        ASIC_ProfilingInfo;       // New table name from R600, used to be called "ASIC_VDDCI_Info" for pre-R600
+  USHORT        VoltageObjectInfo;        // Shared by various SW components, latest version 1.1
+  USHORT        PowerSourceInfo;          // Shared by various SW components, latest versoin 1.1
+  USHORT	      ServiceInfo;
+}ATOM_MASTER_LIST_OF_DATA_TABLES;
 
-	if (!ep || !request || to_musb_request(request)->ep != musb_ep)
-		return -EINVAL;
-
-	spin_lock_irqsave(&musb->lock, flags);
-
-	list_for_each_entry(r, &musb_ep->req_list, list) {
-		if (r == req)
-			break;
-	}
-	if (r != req) {
-		dev_dbg(musb->controller, "request %p not queued to %s\n", request, ep->name);
-		status = -EINVAL;
-		goto done;
-	}
-
-	/* if the hardware doesn't have the request, easy ... */
-	if (musb_ep->req_list.next != &req->list || musb_ep->busy)
-		musb_g_giveback(musb_ep, request, -ECONNRESET);
-
-	/* ... else abort the dma transfer ... */
-	else if (is_dma_capable() && musb_ep->dma) {
-		struct dma_controller	*c = musb->dma_controller;
-
-		musb_ep_select(musb->mregs, musb_ep->current_epnum);
-		if (c->channel_abort)
-			status = c->channel_abort(musb_ep->dma);
-		else
-			status = -EBUSY;
-		if (status == 0)
-			musb_g_giveback(musb_ep, request, -ECONNRESET);
-	} else {
-		/* NOTE: by sticking to easily tested hardware/driver states,
-		 * we leave counting of in-flight packets imprecise.
-		 */
-		musb_g_giveback(musb_ep, request, -ECONNRESET);
-	}
-
-done:
-	spin_unlock_irqrestore(&musb->lock, flags);
-	return status;
-}
-
-/*
- * Set or clear the halt bit of an endpoint. A halted enpoint won't tx/rx any
- * data but will queue requests.
- *
- * exported to ep0 code
- */
-static int musb_gadget_set_halt(struct usb_ep *ep, int value)
+typedef struct _ATOM_MASTER_DATA_TABLE
 {
-	struct musb_ep		*musb_ep = to_musb_ep(ep);
-	u8			epnum = musb_ep->current_epnum;
-	struct musb		*musb = musb_ep->musb;
-	void __iomem		*epio = musb->endpoints[epnum].regs;
-	void __iomem		*mbase;
-	unsigned long		flags;
-	u16			csr;
-	struct musb_request	*request;
-	int			status = 0;
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  ATOM_MASTER_LIST_OF_DATA_TABLES   ListOfDataTables;
+}ATOM_MASTER_DATA_TABLE;
 
-	if (!ep)
-		return -EINVAL;
-	mbase = musb->mregs;
+// For backward compatible
+#define LVDS_Info                LCD_Info
+#define DAC_Info                 PaletteData
+#define TMDS_Info                DIGTransmitterInfo
+#define CompassionateData        GPUVirtualizationInfo
 
-	spin_lock_irqsave(&musb->lock, flags);
-
-	if ((USB_ENDPOINT_XFER_ISOC == musb_ep->type)) {
-		status = -EINVAL;
-		goto done;
-	}
-
-	musb_ep_select(mbase, epnum);
-
-	request = next_request(musb_ep);
-	if (value) {
-		if (request) {
-			dev_dbg(musb->controller, "request in progress, cannot halt %s\n",
-			    ep->name);
-			status = -EAGAIN;
-			goto done;
-		}
-		/* Cannot portably stall with non-empty FIFO */
-		if (musb_ep->is_in) {
-			csr = musb_readw(epio, MUSB_TXCSR);
-			if (csr & MUSB_TXCSR_FIFONOTEMPTY) {
-				dev_dbg(musb->controller, "FIFO busy, cannot halt %s\n", ep->name);
-				status = -EAGAIN;
-				goto done;
-			}
-		}
-	} else
-		musb_ep->wedged = 0;
-
-	/* set/clear the stall and toggle bits */
-	dev_dbg(musb->controller, "%s: %s stall\n", ep->name, value ? "set" : "clear");
-	if (musb_ep->is_in) {
-		csr = musb_readw(epio, MUSB_TXCSR);
-		csr |= MUSB_TXCSR_P_WZC_BITS
-			| MUSB_TXCSR_CLRDATATOG;
-		if (value)
-			csr |= MUSB_TXCSR_P_SENDSTALL;
-		else
-			csr &= ~(MUSB_TXCSR_P_SENDSTALL
-				| MUSB_TXCSR_P_SENTSTALL);
-		csr &= ~MUSB_TXCSR_TXPKTRDY;
-		musb_writew(epio, MUSB_TXCSR, csr);
-	} else {
-		csr = musb_readw(epio, MUSB_RXCSR);
-		csr |= MUSB_RXCSR_P_WZC_BITS
-			| MUSB_RXCSR_FLUSHFIFO
-			| MUSB_RXCSR_CLRDATATOG;
-		if (value)
-			csr |= MUSB_RXCSR_P_SENDSTALL;
-		else
-			csr &= ~(MUSB_RXCSR_P_SENDSTALL
-				| MUSB_RXCSR_P_SENTSTALL);
-		musb_writew(epio, MUSB_RXCSR, csr);
-	}
-
-	/* maybe start the first request in the queue */
-	if (!musb_ep->busy && !value && request) {
-		dev_dbg(musb->controller, "restarting the request\n");
-		musb_ep_restart(musb, request);
-	}
-
-done:
-	spin_unlock_irqrestore(&musb->lock, flags);
-	return status;
-}
-
-/*
- * Sets the halt feature with the clear requests ignored
- */
-static int musb_gadget_set_wedge(struct usb_ep *ep)
+/****************************************************************************/
+// Structure used in MultimediaCapabilityInfoTable
+/****************************************************************************/
+typedef struct _ATOM_MULTIMEDIA_CAPABILITY_INFO
 {
-	struct musb_ep		*musb_ep = to_musb_ep(ep);
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  ULONG                    ulSignature;      // HW info table signature string "$ATI"
+  UCHAR                    ucI2C_Type;       // I2C type (normal GP_IO, ImpactTV GP_IO, Dedicated I2C pin, etc)
+  UCHAR                    ucTV_OutInfo;     // Type of TV out supported (3:0) and video out crystal frequency (6:4) and TV data port (7)
+  UCHAR                    ucVideoPortInfo;  // Provides the video port capabilities
+  UCHAR                    ucHostPortInfo;   // Provides host port configuration information
+}ATOM_MULTIMEDIA_CAPABILITY_INFO;
 
-	if (!ep)
-		return -EINVAL;
 
-	musb_ep->wedged = 1;
-
-	return usb_ep_set_halt(ep);
-}
-
-static int musb_gadget_fifo_status(struct usb_ep *ep)
+/****************************************************************************/
+// Structure used in MultimediaConfigInfoTable
+/****************************************************************************/
+typedef struct _ATOM_MULTIMEDIA_CONFIG_INFO
 {
-	struct musb_ep		*musb_ep = to_musb_ep(ep);
-	void __iomem		*epio = musb_ep->hw_ep->regs;
-	int			retval = -EINVAL;
+  ATOM_COMMON_TABLE_HEADER sHeader;
+  ULONG                    ulSignature;      // MM info table signature sting "$MMT"
+  UCHAR                    ucTunerInfo;      // Type of tuner installed on the adapter (4:0) and video input for tuner (7:5)
+  UCHAR                    ucAudioChipInfo;  // List the audio chip type (3:0) product type (4) and OEM revision (7:5)
+  UCHAR                    ucProductID;      // Defines as OEM ID or ATI board ID dependent on product type setting
+  UCHAR                    ucMiscInfo1;      // Tuner voltage (1:0) HW teletext support (3:2) FM audio decoder (5:4) reserved (6) audio scrambling (7)
+  UCHAR                    ucMiscInfo2;      // I2S input config (0) I2S output config (1) I2S Audio Chip (4:2) SPDIF Output Config (5) reserved (7:6)
+  UCHAR                    ucMiscInfo3;      // Video Decoder Type (3:0) Video In Standard/Crystal (7:4)
+  UCHAR                    ucMiscInfo4;      // Video Decoder Host Config (2:0) reserved (7:3)
+  UCHAR                    ucVideoInput0Info;// Video Input 0 Type (1:0) F/B setting (2) physical connector ID (5:3) reserved (7:6)
+  UCHAR                    ucVideoInput1Info;// Video Input 1 Type (1:0) F/B setting (2) physical connector ID (5:3) reserved (7:6)
+  UCHAR                    ucVideoInput2Info;// Video Input 2 Type (1:0) F/B setting (2) physical connector ID (5:3) reserved (7:6)
+  UCHAR                    ucVideoInput3Info;// Video Input 3 Type (1:0) F/B setting (2) physical connector ID (5:3) reserved (7:6)
+  UCHAR                    ucVideoInput4Info;// Video Input 4 Type (1:0) F/B setting (2) physical connector ID (5:3) reserved (7:6)
+}ATOM_MULTIMEDIA_CONFIG_INFO;
 
-	if (musb_ep->desc && !musb_ep->is_in) {
-		struct musb		*musb = musb_ep->musb;
-		int			epnum = musb_ep->current_epnum;
-		void __iomem		*mbase = musb->mregs;
-		unsigned long		flags;
 
-		spin_lock_irqsave(&musb->lock, flags);
+/****************************************************************************/
+// Structures used in FirmwareInfoTable
+/****************************************************************************/
 
-		musb_ep_select(mbase, epnum);
-		/* FIXME return zero unless RXPKTRDY is set */
-		retval = musb_readw(epio, MUSB_RXCOUNT);
+// usBIOSCapability Defintion:
+// Bit 0 = 0: Bios image is not Posted, =1:Bios image is Posted;
+// Bit 1 = 0: Dual CRTC is not supported, =1: Dual CRTC is supported;
+// Bit 2 = 0: Extended Desktop is not supported, =1: Extended Desktop is supported;
+// Others: Reserved
+#define ATOM_BIOS_INFO_ATOM_FIRMWARE_POSTED         0x0001
+#define ATOM_BIOS_INFO_DUAL_CRTC_SUPPORT            0x0002
+#define ATOM_BIOS_INFO_EXTENDED_DESKTOP_SUPPORT     0x0004
+#define ATOM_BIOS_INFO_MEMORY_CLOCK_SS_SUPPORT      0x0008      // (valid from v1.1 ~v1.4):=1: memclk SS enable, =0 memclk SS disable.
+#define ATOM_BIOS_INFO_ENGINE_CLOCK_SS_SUPPORT      0x0010      // (valid from v1.1 ~v1.4):=1: engclk SS enable, =0 engclk SS disable.
+#define ATOM_BIOS_INFO_BL_CONTROLLED_BY_GPU         0x0020
+#define ATOM_BIOS_INFO_WMI_SUPPORT                  0x0040
+#define ATOM_BIOS_INFO_PPMODE_ASSIGNGED_BY_SYSTEM   0x0080
+#define ATOM_BIOS_INFO_HYPERMEMORY_SUPPORT          0x0100
+#define ATOM_BIOS_INFO_HYPERMEMORY_SIZE_MASK        0x1E00
+#define ATOM_BIOS_INFO_VPOST_WITHOUT_FIRST_MODE_SET 0x2000
+#define ATOM_BIOS_INFO_BIOS_SCRATCH6_SCL2_REDEFINE  0x4000
+#define ATOM_BIOS_INFO_MEMORY_CLOCK_EXT_SS_SUPPORT  0x0008      // (valid from v2.1 ): =1: memclk ss enable with external ss chip
+#define ATOM_BIOS_INFO_ENGINE_CLOCK_EXT_SS_SUPPORT  0x0010      // (valid from v2.1 ): =1: engclk ss enable with external ss chip
 
-		spin_unlock_irqrestore(&musb->lock, flags);
-	}
-	return retval;
-}
 
-static void musb_gadget_fifo_flush(struct usb_ep *ep)
+#ifndef _H2INC
+
+//Please don't add or expand this bitfield structure below, this one will retire soon.!
+typedef struct _ATOM_FIRMWARE_CAPABILITY
 {
-	struct musb_ep	*musb_ep = to_musb_ep(ep);
-	struct musb	*musb = musb_ep->musb;
-	u8		epnum = musb_ep->current_epnum;
-	void __iomem	*epio = musb->endpoints[epnum].regs;
-	void __iomem	*mbase;
-	unsigned long	flags;
-	u16		csr;
-
-	mbase = musb->mregs;
-
-	spin_lock_irqsave(&musb->lock, flags);
-	musb_ep_select(mbase, (u8) epnum);
-
-	/* disable interrupts */
-	musb_writew(mbase, MUSB_INTRTXE, musb->intrtxe & ~(1 << epnum));
-
-	if (musb_ep->is_in) {
-		csr = musb_readw(epio, MUSB_TXCSR);
-		if (csr & MUSB_TXCSR_FIFONOTEMPTY) {
-			csr |= MUSB_TXCSR_FLUSHFIFO | MUSB_TXCSR_P_WZC_BITS;
-			/*
-			 * Setting both TXPKTRDY and FLUSHFIFO makes controller
-			 * to interrupt current FIFO loading, but not flushing
-			 * the already loaded ones.
-			 */
-			csr &= ~MUSB_TXCSR_TXPKTRDY;
-			musb_writew(epio, MUSB_TXCSR, csr);
-			/* REVISIT may be inappropriate w/o FIFONOTEMPTY ... */
-			musb_writew(epio, MUSB_TXCSR, csr);
-		}
-	} else {
-		csr = musb_readw(epio, MUSB_RXCSR);
-		csr |= MUSB_RXCSR_FLUSHFIFO | MUSB_RXCSR_P_WZC_BITS;
-		musb_writew(epio, MUSB_RXCSR, csr);
-		musb_writew(epio, MUSB_RXCSR, csr);
-	}
-
-	/* re-enable interrupt */
-	musb_writew(mbase, MUSB_INTRTXE, musb->intrtxe);
-	spin_unlock_irqrestore(&musb->lock, flags);
-}
-
-static const struct usb_ep_ops musb_ep_ops = {
-	.enable		= musb_gadget_enable,
-	.disable	= musb_gadget_disable,
-	.alloc_request	= musb_alloc_request,
-	.free_request	= musb_free_request,
-	.queue		= musb_gadget_queue,
-	.dequeue	= musb_gadget_dequeue,
-	.set_halt	= musb_gadget_set_halt,
-	.set_wedge	= musb_gadget_set_wedge,
-	.fifo_status	= musb_gadget_fifo_status,
-	.fifo_flush	= musb_gadget_fifo_flush
-};
-
-/* ----------------------------------------------------------------------- */
-
-static int musb_gadget_get_frame(struct usb_gadget *gadget)
-{
-	struct musb	*musb = gadget_to_musb(gadget);
-
-	return (int)musb_readw(musb->mregs, MUSB_FRAME);
-}
-
-static int musb_gadget_wakeup(struct usb_gadget *gadget)
-{
-	struct musb	*musb = gadget_to_musb(gadget);
-	void __iomem	*mregs = musb->mregs;
-	unsigned long	flags;
-	int		status = -EINVAL;
-	u8		power, devctl;
-	int		retries;
-
-	spin_lock_irqsave(&musb->lock, flags);
-
-	switch (musb->xceiv->otg->state) {
-	case OTG_STATE_B_PERIPHERAL:
-		/* NOTE:  OTG state machine doesn't include B_SUSPENDED;
-		 * that's part of the standard usb 1.1 state machine, and
-		 * doesn't affect OTG transitions.
-		 */
-		if (musb->may_wakeup && musb->is_suspended)
-			break;
-		goto done;
-	case OTG_STATE_B_IDLE:
-		/* Start SRP ... OTG not required. */
-		devctl = musb_readb(mregs, MUSB_DEVCTL);
-		dev_dbg(musb->controller, "Sending SRP: devctl: %02x\n", devctl);
-		devctl |= MUSB_DEVCTL_SESSION;
-		musb_writeb(mregs, MUSB_DEVCTL, devctl);
-		devctl = musb_readb(mregs, MUSB_DEVCTL);
-		retries = 100;
-		while (!(devctl & MUSB_DEVCTL_SESSION)) {
-			devctl = musb_readb(mregs, MUSB_DEVCTL);
-			if (retries-- < 1)
-				break;
-		}
-		retries = 10000;
-		while (devctl & MUSB_DEVCTL_SESSION) {
-			devctl = musb_readb(mregs, MUSB_DEVCTL);
-			if (retries-- < 1)
-				break;
-		}
-
-		spin_unlock_irqrestore(&musb->lock, flags);
-		otg_start_srp(musb->xceiv->otg);
-		spin_lock_irqsave(&musb->lock, flags);
-
-		/* Block idling for at least 1s */
-		musb_platform_try_idle(musb,
-			jiffies + msecs_to_jiffies(1 * HZ));
-
-		status = 0;
-		goto done;
-	default:
-		dev_dbg(musb->controller, "Unhandled wake: %s\n",
-			usb_otg_state_string(musb->xceiv->otg->state));
-		goto done;
-	}
-
-	status = 0;
-
-	power = musb_readb(mregs, MUSB_POWER);
-	power |= MUSB_POWER_RESUME;
-	musb_writeb(mregs, MUSB_POWER, power);
-	dev_dbg(musb->controller, "issue wakeup\n");
-
-	/* FIXME do this next chunk in a timer callback, no udelay */
-	mdelay(2);
-
-	power = musb_readb(mregs, MUSB_POWER);
-	power &= ~MUSB_POWER_RESUME;
-	musb_writeb(mregs, MUSB_POWER, power);
-done:
-	spin_unlock_irqrestore(&musb->lock, flags);
-	return status;
-}
-
-static int
-musb_gadget_set_self_powered(struct usb_gadget *gadget, int is_selfpowered)
-{
-	gadget->is_selfpowered = !!is_selfpowered;
-	return 0;
-}
-
-static void musb_pullup(struct musb *musb, int is_on)
-{
-	u8 power;
-
-	power = musb_readb(musb->mregs, MUSB_POWER);
-	if (is_on)
-		power |= MUSB_POWER_SOFTCONN;
-	else
-		power &= ~MUSB_POWER_SOFTCONN;
-
-	/* FIXME if on, HdrcStart; if off, HdrcStop */
-
-	dev_dbg(musb->controller, "gadget D+ pullup %s\n",
-		is_on ? "on" : "off");
-	musb_writeb(musb->mregs, MUSB_POWER, power);
-}
-
-#if 0
-static int musb_gadget_vbus_session(struct usb_gadget *gadget, int is_active)
-{
-	dev_dbg(musb->controller, "<= %s =>\n", __func__);
-
-	/*
-	 * FIXME iff driver's softconnect flag is set (as it is during probe,
-	 * though that can clear it), just musb_pullup().
-	 */
-
-	return -EINVAL;
-}
-#endif
-
-static int musb_gadget_vbus_draw(struct usb_gadget *gadget, unsigned mA)
-{
-	struct musb	*musb = gadget_to_musb(gadget);
-
-	if (!musb->xceiv->set_power)
-		return -EOPNOTSUPP;
-	return usb_phy_set_power(musb->xceiv, mA);
-}
-
-static int musb_gadget_pullup(struct usb_gadget *gadget, int is_on)
-{
-	struct musb	*musb = gadget_to_musb(gadget);
-	unsigned long	flags;
-
-	is_on = !!is_on;
-
-	pm_runtime_get_sync(musb->controller);
-
-	/* NOTE: this assumes we are sensing vbus; we'd rather
-	 * not pullup unless the B-session is active.
-	 */
-	spin_lock_irqsave(&musb->lock, flags);
-	if (is_on != musb->softconnect) {
-		musb->softconnect = is_on;
-		musb_pullup(musb, is_on);
-	}
-	spin_unlock_irqrestore(&musb->lock, flags);
-
-	pm_runtime_put(musb->controller);
-
-	return 0;
-}
-
-#ifdef CONFIG_BLACKFIN
-static struct usb_ep *musb_match_ep(struct usb_gadget *g,
-		struct usb_endpoint_descriptor *desc,
-		struct usb_ss_ep_comp_descriptor *ep_comp)
-{
-	struct usb_ep *ep = NULL;
-
-	switch (usb_endpoint_type(desc)) {
-	case USB_ENDPOINT_XFER_ISOC:
-	case USB_ENDPOINT_XFER_BULK:
-		if (usb_endpoint_dir_in(desc))
-			ep = gadget_find_ep_by_name(g, "ep5in");
-		else
-			ep = gadget_find_ep_by_name(g, "ep6out");
-		break;
-	case USB_ENDPOINT_XFER_INT:
-		if (usb_endpoint_dir_in(desc))
-			ep = gadget_find_ep_by_name(g, "ep1in");
-		else
-			ep = gadget_find_ep_by_name(g, "ep2out");
-		break;
-	default:
-		break;
-	}
-
-	if (ep && usb_gadget_ep_match_desc(g, ep, desc, ep_comp))
-		return ep;
-
-	return NULL;
-}
+#if ATOM_BIG_ENDIAN
+  USHORT Reserved:1;
+  USHORT SCL2Redefined:1;
+  USHORT PostWithoutModeSet:1;
+  USHORT HyperMemory_Size:4;
+  USHORT HyperMemory_Support:1;
+  USHORT PPMode_Assigned:1;
+  USHORT WMI_SUPPORT:1;
+  USHORT GPUControlsBL:1;
+  USHORT EngineClockSS_Support:1;
+  USHORT MemoryClockSS_Support:1;
+  USHORT ExtendedDesktopSupport:1;
+  USHORT DualCRTC_Support:1;
+  USHORT FirmwarePosted:1;
 #else
-#define musb_match_ep NULL
+  USHORT FirmwarePosted:1;
+  USHORT DualCRTC_Support:1;
+  USHORT ExtendedDesktopSupport:1;
+  USHORT MemoryClockSS_Support:1;
+  USHORT EngineClockSS_Support:1;
+  USHORT GPUControlsBL:1;
+  USHORT WMI_SUPPORT:1;
+  USHORT PPMode_Assigned:1;
+  USHORT HyperMemory_Support:1;
+  USHORT HyperMemory_Size:4;
+  USHORT PostWithoutModeSet:1;
+  USHORT SCL2Redefined:1;
+  USHORT Reserved:1;
+#endif
+}ATOM_FIRMWARE_CAPABILITY;
+
+typedef union _ATOM_FIRMWARE_CAPABILITY_ACCESS
+{
+  ATOM_FIRMWARE_CAPABILITY sbfAccess;
+  USHORT                   susAccess;
+}ATOM_FIRMWARE_CAPABILITY_ACCESS;
+
+#else
+
+typedef union _ATOM_FIRMWARE_CAPABILITY_ACCESS
+{
+  USHORT                   susAccess;
+}ATOM_FIRMWARE_CAPABILITY_ACCESS;
+
 #endif
 
-static int musb_gadget_start(struct usb_gadget *g,
-		struct usb_gadget_driver *driver);
-static int musb_gadget_stop(struct usb_gadget *g);
-
-static const struct usb_gadget_ops musb_gadget_operations = {
-	.get_frame		= musb_gadget_get_frame,
-	.wakeup			= musb_gadget_wakeup,
-	.set_selfpowered	= musb_gadget_set_self_powered,
-	/* .vbus_session		= musb_gadget_vbus_session, */
-	.vbus_draw		= musb_gadget_vbus_draw,
-	.pullup			= musb_gadget_pullup,
-	.udc_start		= musb_gadget_start,
-	.udc_stop		= musb_gadget_stop,
-	.match_ep		= musb_match_ep,
-};
-
-/* ----------------------------------------------------------------------- */
-
-/* Registration */
-
-/* Only this registration code "knows" the rule (from USB standards)
- * about there being only one external upstream port.  It assumes
- * all peripheral ports are external...
- */
-
-static void
-init_peripheral_ep(struct musb *musb, struct musb_ep *ep, u8 epnum, int is_in)
+typedef struct _ATOM_FIRMWARE_INFO
 {
-	struct musb_hw_ep	*hw_ep = musb->endpoints + epnum;
+  ATOM_COMMON_TABLE_HEADER        sHeader;
+  ULONG                           ulFirmwareRevision;
+  ULONG                           ulDefaultEngineClock;       //In 10Khz unit
+  ULONG                           ulDefaultMemoryClock;       //In 10Khz unit
+  ULONG                           ulDriverTargetEngineClock;  //In 10Khz unit
+  ULONG                           ulDriverTargetMemoryClock;  //In 10Khz unit
+  ULONG                           ulMaxEngineClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxMemoryClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxPixelClockPLL_Output;  //In 10Khz unit
+  ULONG                           ulASICMaxEngineClock;       //In 10Khz unit
+  ULONG                           ulASICMaxMemoryClock;       //In 10Khz unit
+  UCHAR                           ucASICMaxTemperature;
+  UCHAR                           ucPadding[3];               //Don't use them
+  ULONG                           aulReservedForBIOS[3];      //Don't use them
+  USHORT                          usMinEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Output; //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Output; //In 10Khz unit
+  USHORT                          usMaxPixelClock;            //In 10Khz unit, Max.  Pclk
+  USHORT                          usMinPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMaxPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMinPixelClockPLL_Output;  //In 10Khz unit, the definitions above can't change!!!
+  ATOM_FIRMWARE_CAPABILITY_ACCESS usFirmwareCapability;
+  USHORT                          usReferenceClock;           //In 10Khz unit
+  USHORT                          usPM_RTS_Location;          //RTS PM4 starting location in ROM in 1Kb unit
+  UCHAR                           ucPM_RTS_StreamSize;        //RTS PM4 packets in Kb unit
+  UCHAR                           ucDesign_ID;                //Indicate what is the board design
+  UCHAR                           ucMemoryModule_ID;          //Indicate what is the board design
+}ATOM_FIRMWARE_INFO;
 
-	memset(ep, 0, sizeof *ep);
+typedef struct _ATOM_FIRMWARE_INFO_V1_2
+{
+  ATOM_COMMON_TABLE_HEADER        sHeader;
+  ULONG                           ulFirmwareRevision;
+  ULONG                           ulDefaultEngineClock;       //In 10Khz unit
+  ULONG                           ulDefaultMemoryClock;       //In 10Khz unit
+  ULONG                           ulDriverTargetEngineClock;  //In 10Khz unit
+  ULONG                           ulDriverTargetMemoryClock;  //In 10Khz unit
+  ULONG                           ulMaxEngineClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxMemoryClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxPixelClockPLL_Output;  //In 10Khz unit
+  ULONG                           ulASICMaxEngineClock;       //In 10Khz unit
+  ULONG                           ulASICMaxMemoryClock;       //In 10Khz unit
+  UCHAR                           ucASICMaxTemperature;
+  UCHAR                           ucMinAllowedBL_Level;
+  UCHAR                           ucPadding[2];               //Don't use them
+  ULONG                           aulReservedForBIOS[2];      //Don't use them
+  ULONG                           ulMinPixelClockPLL_Output;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Output; //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Output; //In 10Khz unit
+  USHORT                          usMaxPixelClock;            //In 10Khz unit, Max.  Pclk
+  USHORT                          usMinPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMaxPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMinPixelClockPLL_Output;  //In 10Khz unit - lower 16bit of ulMinPixelClockPLL_Output
+  ATOM_FIRMWARE_CAPABILITY_ACCESS usFirmwareCapability;
+  USHORT                          usReferenceClock;           //In 10Khz unit
+  USHORT                          usPM_RTS_Location;          //RTS PM4 starting location in ROM in 1Kb unit
+  UCHAR                           ucPM_RTS_StreamSize;        //RTS PM4 packets in Kb unit
+  UCHAR                           ucDesign_ID;                //Indicate what is the board design
+  UCHAR                           ucMemoryModule_ID;          //Indicate what is the board design
+}ATOM_FIRMWARE_INFO_V1_2;
 
-	ep->current_epnum = epnum;
-	ep->musb = musb;
-	ep->hw_ep = hw_ep;
-	ep->is_in = is_in;
+typedef struct _ATOM_FIRMWARE_INFO_V1_3
+{
+  ATOM_COMMON_TABLE_HEADER        sHeader;
+  ULONG                           ulFirmwareRevision;
+  ULONG                           ulDefaultEngineClock;       //In 10Khz unit
+  ULONG                           ulDefaultMemoryClock;       //In 10Khz unit
+  ULONG                           ulDriverTargetEngineClock;  //In 10Khz unit
+  ULONG                           ulDriverTargetMemoryClock;  //In 10Khz unit
+  ULONG                           ulMaxEngineClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxMemoryClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxPixelClockPLL_Output;  //In 10Khz unit
+  ULONG                           ulASICMaxEngineClock;       //In 10Khz unit
+  ULONG                           ulASICMaxMemoryClock;       //In 10Khz unit
+  UCHAR                           ucASICMaxTemperature;
+  UCHAR                           ucMinAllowedBL_Level;
+  UCHAR                           ucPadding[2];               //Don't use them
+  ULONG                           aulReservedForBIOS;         //Don't use them
+  ULONG                           ul3DAccelerationEngineClock;//In 10Khz unit
+  ULONG                           ulMinPixelClockPLL_Output;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Output; //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Output; //In 10Khz unit
+  USHORT                          usMaxPixelClock;            //In 10Khz unit, Max.  Pclk
+  USHORT                          usMinPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMaxPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMinPixelClockPLL_Output;  //In 10Khz unit - lower 16bit of ulMinPixelClockPLL_Output
+  ATOM_FIRMWARE_CAPABILITY_ACCESS usFirmwareCapability;
+  USHORT                          usReferenceClock;           //In 10Khz unit
+  USHORT                          usPM_RTS_Location;          //RTS PM4 starting location in ROM in 1Kb unit
+  UCHAR                           ucPM_RTS_StreamSize;        //RTS PM4 packets in Kb unit
+  UCHAR                           ucDesign_ID;                //Indicate what is the board design
+  UCHAR                           ucMemoryModule_ID;          //Indicate what is the board design
+}ATOM_FIRMWARE_INFO_V1_3;
 
-	INIT_LIST_HEAD(&ep->req_list);
+typedef struct _ATOM_FIRMWARE_INFO_V1_4
+{
+  ATOM_COMMON_TABLE_HEADER        sHeader;
+  ULONG                           ulFirmwareRevision;
+  ULONG                           ulDefaultEngineClock;       //In 10Khz unit
+  ULONG                           ulDefaultMemoryClock;       //In 10Khz unit
+  ULONG                           ulDriverTargetEngineClock;  //In 10Khz unit
+  ULONG                           ulDriverTargetMemoryClock;  //In 10Khz unit
+  ULONG                           ulMaxEngineClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxMemoryClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxPixelClockPLL_Output;  //In 10Khz unit
+  ULONG                           ulASICMaxEngineClock;       //In 10Khz unit
+  ULONG                           ulASICMaxMemoryClock;       //In 10Khz unit
+  UCHAR                           ucASICMaxTemperature;
+  UCHAR                           ucMinAllowedBL_Level;
+  USHORT                          usBootUpVDDCVoltage;        //In MV unit
+  USHORT                          usLcdMinPixelClockPLL_Output; // In MHz unit
+  USHORT                          usLcdMaxPixelClockPLL_Output; // In MHz unit
+  ULONG                           ul3DAccelerationEngineClock;//In 10Khz unit
+  ULONG                           ulMinPixelClockPLL_Output;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Output; //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Output; //In 10Khz unit
+  USHORT                          usMaxPixelClock;            //In 10Khz unit, Max.  Pclk
+  USHORT                          usMinPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMaxPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMinPixelClockPLL_Output;  //In 10Khz unit - lower 16bit of ulMinPixelClockPLL_Output
+  ATOM_FIRMWARE_CAPABILITY_ACCESS usFirmwareCapability;
+  USHORT                          usReferenceClock;           //In 10Khz unit
+  USHORT                          usPM_RTS_Location;          //RTS PM4 starting location in ROM in 1Kb unit
+  UCHAR                           ucPM_RTS_StreamSize;        //RTS PM4 packets in Kb unit
+  UCHAR                           ucDesign_ID;                //Indicate what is the board design
+  UCHAR                           ucMemoryModule_ID;          //Indicate what is the board design
+}ATOM_FIRMWARE_INFO_V1_4;
 
-	sprintf(ep->name, "ep%d%s", epnum,
-			(!epnum || hw_ep->is_shared_fifo) ? "" : (
-				is_in ? "in" : "out"));
-	ep->end_point.name = ep->name;
-	INIT_LIST_HEAD(&ep->end_point.ep_list);
-	if (!epnum) {
-		usb_ep_set_maxpacket_limit(&ep->end_point, 64);
-		ep->end_point.caps.type_control = true;
-		ep->end_point.ops = &musb_g_ep0_ops;
-		musb->g.ep0 = &ep->end_point;
-	} else {
-		if (is_in)
-			usb_ep_set_maxpacket_limit(&ep->end_point, hw_ep->max_packet_sz_tx);
-		else
-			usb_ep_set_maxpacket_limit(&ep->end_point, hw_ep->max_packet_sz_rx);
-		ep->end_point.caps.type_iso = true;
-		ep->end_point.caps.type_bulk = true;
-		ep->end_point.caps.type_int = true;
-		ep->end_point.ops = &musb_ep_ops;
-		list_add_tail(&ep->end_point.ep_list, &musb->g.ep_list);
-	}
+//the structure below to be used from Cypress
+typedef struct _ATOM_FIRMWARE_INFO_V2_1
+{
+  ATOM_COMMON_TABLE_HEADER        sHeader;
+  ULONG                           ulFirmwareRevision;
+  ULONG                           ulDefaultEngineClock;       //In 10Khz unit
+  ULONG                           ulDefaultMemoryClock;       //In 10Khz unit
+  ULONG                           ulReserved1;
+  ULONG                           ulReserved2;
+  ULONG                           ulMaxEngineClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxMemoryClockPLL_Output; //In 10Khz unit
+  ULONG                           ulMaxPixelClockPLL_Output;  //In 10Khz unit
+  ULONG                           ulBinaryAlteredInfo;        //Was ulASICMaxEngineClock
+  ULONG                           ulDefaultDispEngineClkFreq; //In 10Khz unit
+  UCHAR                           ucReserved1;                //Was ucASICMaxTemperature;
+  UCHAR                           ucMinAllowedBL_Level;
+  USHORT                          usBootUpVDDCVoltage;        //In MV unit
+  USHORT                          usLcdMinPixelClockPLL_Output; // In MHz unit
+  USHORT                          usLcdMaxPixelClockPLL_Output; // In MHz unit
+  ULONG                           ulReserved4;                //Was ulAsicMaximumVoltage
+  ULONG                           ulMinPixelClockPLL_Output;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxEngineClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinEngineClockPLL_Output; //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMaxMemoryClockPLL_Input;  //In 10Khz unit
+  USHORT                          usMinMemoryClockPLL_Output; //In 10Khz unit
+  USHORT                          usMaxPixelClock;            //In 10Khz unit, Max.  Pclk
+  USHORT                          usMinPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMaxPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMinPixelClockPLL_Output;  //In 10Khz unit - lower 16bit of ulMinPixelClockPLL_Output
+  ATOM_FIRMWARE_CAPABILITY_ACCESS usFirmwareCapability;
+  USHORT                          usCoreReferenceClock;       //In 10Khz unit
+  USHORT                          usMemoryReferenceClock;     //In 10Khz unit
+  USHORT                          usUniphyDPModeExtClkFreq;   //In 10Khz unit, if it is 0, In DP Mode Uniphy Input clock from internal PPLL, otherwise Input clock from external Spread clock
+  UCHAR                           ucMemoryModule_ID;          //Indicate what is the board design
+  UCHAR                           ucReserved4[3];
 
-	if (!epnum || hw_ep->is_shared_fifo) {
-		ep->end_point.caps.dir_in = true;
-		ep->end_point.caps.dir_out = true;
-	} else if (is_in)
-		ep->end_point.caps.dir_in = true;
-	else
-		ep->end_point.caps.dir_out = true;
-}
+}ATOM_FIRMWARE_INFO_V2_1;
+
+//the structure below to be used from NI
+//ucTableFormatRevision=2
+//ucTableContentRevision=2
+
+typedef struct _PRODUCT_BRANDING
+{
+    UCHAR     ucEMBEDDED_CAP:2;          // Bit[1:0] Embedded feature level
+    UCHAR     ucReserved:2;              // Bit[3:2] Reserved
+    UCHAR     ucBRANDING_ID:4;           // Bit[7:4] Branding ID
+}PRODUCT_BRANDING;
+
+typedef struct _ATOM_FIRMWARE_INFO_V2_2
+{
+  ATOM_COMMON_TABLE_HEADER        sHeader;
+  ULONG                           ulFirmwareRevision;
+  ULONG                           ulDefaultEngineClock;       //In 10Khz unit
+  ULONG                           ulDefaultMemoryClock;       //In 10Khz unit
+  ULONG                           ulSPLL_OutputFreq;          //In 10Khz unit
+  ULONG                           ulGPUPLL_OutputFreq;        //In 10Khz unit
+  ULONG                           ulReserved1;                //Was ulMaxEngineClockPLL_Output; //In 10Khz unit*
+  ULONG                           ulReserved2;                //Was ulMaxMemoryClockPLL_Output; //In 10Khz unit*
+  ULONG                           ulMaxPixelClockPLL_Output;  //In 10Khz unit
+  ULONG                           ulBinaryAlteredInfo;        //Was ulASICMaxEngineClock  ?
+  ULONG                           ulDefaultDispEngineClkFreq; //In 10Khz unit. This is the frequency before DCDTO, corresponding to usBootUpVDDCVoltage.
+  UCHAR                           ucReserved3;                //Was ucASICMaxTemperature;
+  UCHAR                           ucMinAllowedBL_Level;
+  USHORT                          usBootUpVDDCVoltage;        //In MV unit
+  USHORT                          usLcdMinPixelClockPLL_Output; // In MHz unit
+  USHORT                          usLcdMaxPixelClockPLL_Output; // In MHz unit
+  ULONG                           ulReserved4;                //Was ulAsicMaximumVoltage
+  ULONG                           ulMinPixelClockPLL_Output;  //In 10Khz unit
+  UCHAR                           ucRemoteDisplayConfig;
+  UCHAR                           ucReserved5[3];             //Was usMinEngineClockPLL_Input and usMaxEngineClockPLL_Input
+  ULONG                           ulReserved6;                //Was usMinEngineClockPLL_Output and usMinMemoryClockPLL_Input
+  ULONG                           ulReserved7;                //Was usMaxMemoryClockPLL_Input and usMinMemoryClockPLL_Output
+  USHORT                          usReserved11;               //Was usMaxPixelClock;  //In 10Khz unit, Max.  Pclk used only for DAC
+  USHORT                          usMinPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usMaxPixelClockPLL_Input;   //In 10Khz unit
+  USHORT                          usBootUpVDDCIVoltage;       //In unit of mv; Was usMinPixelClockPLL_Output;
+  ATOM_FIRMWARE_CAPABILITY_ACCESS usFirmwareCapability;
+  USHORT                          usCoreReferenceClock;       //In 10Khz unit
+  USHORT                          usMemoryReferenceClock;     //In 10Khz unit
+  USHORT                          usUniphyDPModeExtClkFreq;   //In 10Khz unit, if it is 0, In DP Mode Uniphy Input clock from internal PPLL, otherwise Input clock from external Spread clock
+  UCHAR                           ucMemoryModule_ID;          //Indicate what is the board design
+  UCHAR                           ucCoolingSolution_ID;       //0: Air cooling; 1: Liquid cooling ... [COOLING_SOLUTION]
+  PRODUCT_BRANDING                ucProductBranding;          // Bit[7:4]ucBRANDING_ID: Branding ID, Bit[3:2]ucReserved: Reserved, Bit[1:0]ucEMBEDDED_CAP: Embedded feature level.
+  UCHAR                           ucReserved9;
+  USHORT                          usBootUpMVDDCVoltage;       //In unit of mv; Was usMinPixelClockPLL_Output;
+  USHORT                          usBootUpVDDGFXVoltage;      //In unit of mv;
+  ULONG                           ulReserved10[3];            // New added comparing to previous version
+}ATOM_FIRMWARE_INFO_V2_2;
+
+#define ATOM_FIRMWARE_INFO_LAST  ATOM_FIRMWARE_INFO_V2_2
+
+
+// definition of ucRemoteDisplayConfig
+#define REMOTE_DISPLAY_DISABLE                   0x00
+#define REMOTE_DISPLAY_ENABLE                    0x01
+
+/****************************************************************************/
+// Structures used in IntegratedSystemInfoTable
+/****************************************************************************/
+#define IGP_CAP_FLAG_DYNAMIC_CLOCK_EN      0x2
+#define IGP_CAP_FLAG_AC_CARD               0x4
+#define IGP_CAP_FLAG_SDVO_CARD             0x8
+#define IGP_CAP_FLAG_POSTDIV_BY_2_MODE     0x10
+
+typedef struct _ATOM_INTEGRATED_SYSTEM_INFO
+{
+  ATOM_COMMON_TABLE_HEADER        sHeader;
+  ULONG                           ulBootUpEngineClock;          //in 10kHz unit
+  ULONG                           ulBootUpMemoryClock;          //in 10kHz unit
+  ULONG                           ulMaxSystemMemoryClock;       //in 10kHz unit
+  ULONG                           ulMinSystemMemoryClock;       //in 10kHz unit
+  UCHAR                           ucNumberOfCyclesInPeriodHi;
+  UCHAR                           ucLCDTimingSel;             //=0:not valid.!=0 sel this timing descriptor from LCD EDID.
+  USHORT                          usReserved1;
+  USHORT                          usInterNBVoltageLow;        //An intermidiate PMW value to set the voltage
+  USHORT                          usInterNBVoltageHigh;       //Another intermidiate PMW value to set the voltage
+  ULONG                           ulReserved[2];
+
+  USHORT                          usFSBClock;                     //In MHz unit
+  USHORT                          usCapabilityFlag;              //Bit0=1 indicates the fake HDMI support,Bit1=0/1 for Dynamic clocking dis/enable
+                                                                              //Bit[3:2]== 0:No PCIE card, 1:AC card, 2:SDVO card
+                                                              //Bit[4]==1: P/2 mode, ==0: P/1 mode
+  USHORT                          usPCIENBCfgReg7;                //bit[7:0]=MUX_Sel, bit[9:8]=MUX_SEL_LEVEL2, bit[10]=Lane_Reversal
+  USHORT                          usK8MemoryClock;            //in MHz unit
+  USHORT                          usK8SyncStartDelay;         //in 0.01 us unit
+  USHORT                          usK8DataReturnTime;         //in 0.01 us unit
+  UCHAR                           ucMaxNBVoltage;
+  UCHAR                           ucMinNBVoltage;
+  UCHAR                           ucMemoryType;                     //[7:4]=1:DDR1;=2:DDR2;=3:DDR3.[3:0] is reserved
+  UCHAR                           ucNumberOfCyclesInPeriod;      //CG.FVTHROT_PWM_CTRL_REG0.NumberOfCyclesInPeriod
+  UCHAR                           ucStartingPWM_HighTime;     //CG.FVTHROT_PWM_CTRL_REG0.StartingPWM_HighTime
+  UCHAR                           ucHTLinkWidth;              //16 bit vs. 8 bit
+  UCHAR                           ucMaxNBVoltageHigh;
+  UCHAR                           ucMinNBVoltageHigh;
+}ATOM_INTEGRATED_SYSTEM_INFO;
+
+/* Explanation on entries in ATOM_INTEGRATED_SYSTEM_INFO
+ulBootUpMemoryClock:    For Intel IGP,it's the UMA system memory clock
+                        For AMD IGP,it's 0 if no SidePort memory installed or it's the boot-up SidePort memory clock
+ulMaxSystemMemoryClock: For Intel IGP,it's the Max freq from memory SPD if memory runs in ASYNC mode or otherwise (SYNC mode) it's 0
+                        For AMD IGP,for now this can be 0
+ulMinSystemMemoryClock: For Intel IGP,it's 133MHz if memory runs in ASYNC mode or otherwise (SYNC mode) it's 0
+                        For AMD IGP,for now this can be 0
+
+usFSBClock:             For Intel IGP,it's FSB Freq
+                        For AMD IGP,it's HT Link Speed
+
+usK8MemoryClock:        For AMD IGP only. For RevF CPU, set it to 200
+usK8SyncStartDelay:     For AMD IGP only. Memory access latency in K8, required for watermark calculation
+usK8DataReturnTime:     For AMD IGP only. Memory access latency in K8, required for watermark calculation
+
+VC:Voltage Control
+ucMaxNBVoltage:         Voltage regulator dependent PWM value. Low 8 bits of the value for the max voltage.Set this one to 0xFF if VC without PWM. Set this to 0x0 if no VC at all.
+ucMinNBVoltage:         Voltage regulator dependent PWM value. Low 8 bits of the value for the min voltage.Set this one to 0x00 if VC without PWM or no VC at all.
+
+ucNumberOfCyclesInPeriod:   Indicate how many cycles when PWM duty is 100%. low 8 bits of the value.
+ucNumberOfCyclesInPeriodHi: Indicate how many cycles when PWM duty is 100%. high 8 bits of the value.If the PWM has an inverter,set bit [7]==1,otherwise set it 0
+
+ucMaxNBVoltageHigh:     Voltage regulator dependent PWM value. High 8 bits of  the value for the max voltage.Set this one to 0xFF if VC without PWM. Set this to 0x0 if no VC at all.
+ucMinNBVoltageHigh:     Voltage regulator dependent PWM value. High 8 bits of the value for the min voltage.Set this one to 0x00 if VC without PWM or no VC at all.
+
+
+usInterNBVoltageLow:    Voltage regulator dependent PWM value. The value makes the the voltage >=Min NB voltage but <=InterNBVoltageHigh. Set this to 0x0000 if VC without PWM or no VC at all.
+usInterNBVoltageHigh:   Voltage regulator dependent PWM value. The value makes the the voltage >=InterNBVoltageLow but <=Max NB voltage.Set this to 0x0000 if VC without PWM or no VC at all.
+*/
+
 
 /*
- * Initialize the endpoints exposed to peripheral drivers, with backlinks
- * to the rest of the driver state.
- */
-static inline void musb_g_init_endpoints(struct musb *musb)
+The following IGP table is introduced from RS780, which is supposed to be put by SBIOS in FB before IGP VBIOS starts VPOST;
+Then VBIOS will copy the whole structure to its image so all GPU SW components can access this data structure to get whatever they need.
+The enough reservation should allow us to never change table revisions. Whenever needed, a GPU SW component can use reserved portion for new data entries.
+
+SW components can access the IGP system infor structure in the same way as before
+*/
+
+
+typedef struct _ATOM_INTEGRATED_SYSTEM_INFO_V2
 {
-	u8			epnum;
-	struct musb_hw_ep	*hw_ep;
-	unsigned		count = 0;
-
-	/* initialize endpoint list just once */
-	INIT_LIST_HEAD(&(musb->g.ep_list));
-
-	for (epnum = 0, hw_ep = musb->endpoints;
-			epnum < musb->nr_endpoints;
-			epnum++, hw_ep++) {
-		if (hw_ep->is_shared_fifo /* || !epnum */) {
-			init_peripheral_ep(musb, &hw_ep->ep_in, epnum, 0);
-			count++;
-		} else {
-			if (hw_ep->max_packet_sz_tx) {
-				init_peripheral_ep(musb, &hw_ep->ep_in,
-							epnum, 1);
-				count++;
-			}
-			if (hw_ep->max_packet_sz_rx) {
-				init_peripheral_ep(musb, &hw_ep->ep_out,
-							epnum, 0);
-				count++;
-			}
-		}
-	}
-}
-
-/* called once during driver setup to initialize and link into
- * the driver model; memory is zeroed.
- */
-int musb_gadget_setup(struct musb *musb)
-{
-	int status;
-
-	/* REVISIT minor race:  if (erroneously) setting up two
-	 * musb peripherals at the same time, only the bus lock
-	 * is probably held.
-	 */
-
-	musb->g.ops = &musb_gadget_operations;
-	musb->g.max_speed = USB_SPEED_HIGH;
-	musb->g.speed = USB_SPEED_UNKNOWN;
-
-	MUSB_DEV_MODE(musb);
-	musb->xceiv->otg->default_a = 0;
-	musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-
-	/* this "gadget" abstracts/virtualizes the controller */
-	musb->g.name = musb_driver_name;
-#if IS_ENABLED(CONFIG_USB_MUSB_DUAL_ROLE)
-	musb->g.is_otg = 1;
-#elif IS_ENABLED(CONFIG_USB_MUSB_GADGET)
-	musb->g.is_otg = 0;
-#endif
-
-	musb_g_init_endpoints(musb);
-
-	musb->is_active = 0;
-	musb_platform_try_idle(musb, 0);
-
-	status = usb_add_gadget_udc(musb->controller, &musb->g);
-	if (status)
-		goto err;
-
-	return 0;
-err:
-	musb->g.dev.parent = NULL;
-	device_unregister(&musb->g.dev);
-	return status;
-}
-
-void musb_gadget_cleanup(struct musb *musb)
-{
-	if (musb->port_mode == MUSB_PORT_MODE_HOST)
-		return;
-	usb_del_gadget_udc(&musb->g);
-}
+  ATOM_COMMON_TABLE_HEADER   sHeader;
+  ULONG                      ulBootUpEngineClock;       //in 10kHz unit
+  ULONG                      ulReserved1[2];            //must be 0x0 for the reserved
+  ULONG                      ulBootUpUMAClock;          //in 10kHz unit
+  ULONG                      ulBootUpSidePortClock;     //in 10kHz unit
+  ULONG                      ulMinSidePortClock;        //in 10kHz unit
+  ULONG                      ulReserved2[6];            //must be 0x0 for the reserved
+  ULONG                      ulSystemConfig;            //see explanation below
+  ULONG                      ulBootUpReqDisplayVector;
+  ULONG                      ulOtherDisplayMisc;
+  ULONG                      ulDDISlot1Config;
+  ULONG                      ulDDISlot2Config;
+  UCHAR                      ucMemoryType;              //[3:0]=1:DDR1;=2:DDR2;=3:DDR3.[7:4] is reserved
+  UCHAR                      ucUMAChannelNumber;
+  UCHAR                      ucDockingPinBit;
+  UCHAR                      ucDockingPinPolarity;
+  ULONG                      ulDockingPinCFGInfo;
+  ULONG                      ulCPUCapInfo;
+  USHORT                     usNumberOfCyclesInPeriod;
+  USHORT                     usMaxNBVoltage;
+  USHORT                     usMinNBVoltage;
+  USHORT                     usBootUpNBVoltage;
+  ULONG                      ulHTLinkFreq;              //in 10Khz
+  USHORT                     usMinHTLinkWidth;
+  USHORT                     usMaxHTLinkWidth;
+  USHORT                     usUMASyncStartDelay;
+  USHORT                     usUMADataReturnTime;
+  USHORT                     usLinkStatusZeroTime;
+  USHORT                     usDACEfuse;            //for storing badgap value (for RS880 only)
+  ULONG                      ulHighVoltageHTLinkFreq;     // in 10Khz
+  ULONG                      ulLowVoltageHTLinkFreq;      // in 10Khz
+  USHORT                     usMaxUpStreamHTLinkWidth;
+  USHORT                     usMaxDownStreamHTLinkWidth;
+  USHORT                     usMinUpStreamHTLinkWidth;
+  USHORT                     usMinDownStreamHTLinkWidth;
+  USHORT                     usFirmwareVersion;         //0 means FW is not supported. Otherwise it's the FW version loaded by SBIOS and driver should enable FW.
+  USHORT                     usFullT0Time;             // Input to calculate minimum HT link change time required by NB P-State. Unit is 0.01us.
+  ULONG                      ulReserved3[96];          //must be 0x0
+}ATOM_INTEGRATED_SYSTEM_INFO_V2;
 
 /*
- * Register the gadget driver. Used by gadget drivers when
- * registering themselves with the controller.
- *
- * -EINVAL something went wrong (not driver)
- * -EBUSY another gadget is already using the controller
- * -ENOMEM no memory to perform the operation
- *
- * @param driver the gadget driver
- * @return <0 if error, 0 if everything is fine
- */
-static int musb_gadget_start(struct usb_gadget *g,
-		struct usb_gadget_driver *driver)
-{
-	struct musb		*musb = gadget_to_musb(g);
-	struct usb_otg		*otg = musb->xceiv->otg;
-	unsigned long		flags;
-	int			retval = 0;
+ulBootUpEngineClock:   Boot-up Engine Clock in 10Khz;
+ulBootUpUMAClock:      Boot-up UMA Clock in 10Khz; it must be 0x0 when UMA is not present
+ulBootUpSidePortClock: Boot-up SidePort Clock in 10Khz; it must be 0x0 when SidePort Memory is not present,this could be equal to or less than maximum supported Sideport memory clock
 
-	if (driver->max_speed < USB_SPEED_HIGH) {
-		retval = -EINVAL;
-		goto err;
-	}
+ulSystemConfig:
+Bit[0]=1: PowerExpress mode =0 Non-PowerExpress mode;
+Bit[1]=1: system boots up at AMD overdrived state or user customized  mode. In this case, driver will just stick to this boot-up mode. No other PowerPlay state
+      =0: system boots up at driver control state. Power state depends on PowerPlay table.
+Bit[2]=1: PWM method is used on NB voltage control. =0: GPIO method is used.
+Bit[3]=1: Only one power state(Performance) will be supported.
+      =0: Multiple power states supported from PowerPlay table.
+Bit[4]=1: CLMC is supported and enabled on current system.
+      =0: CLMC is not supported or enabled on current system. SBIOS need to support HT link/freq change through ATIF interface.
+Bit[5]=1: Enable CDLW for all driver control power states. Max HT width is from SBIOS, while Min HT width is determined by display requirement.
+      =0: CDLW is disabled. If CLMC is enabled case, Min HT width will be set equal to Max HT width. If CLMC disabled case, Max HT width will be applied.
+Bit[6]=1: High Voltage requested for all power states. In this case, voltage will be forced at 1.1v and powerplay table voltage drop/throttling request will be ignored.
+      =0: Voltage settings is determined by powerplay table.
+Bit[7]=1: Enable CLMC as hybrid Mode. CDLD and CILR will be disabled in this case and we're using legacy C1E. This is workaround for CPU(Griffin) performance issue.
+      =0: Enable CLMC as regular mode, CDLD and CILR will be enabled.
+Bit[8]=1: CDLF is supported and enabled on current system.
+      =0: CDLF is not supported or enabled on current system.
+Bit[9]=1: DLL Shut Down feature is enabled on current system.
+      =0: DLL Shut Down feature is not enabled or supported on current system.
 
-	pm_runtime_get_sync(musb->controller);
+ulBootUpReqDisplayVector: This dword is a bit vector indicates what display devices are requested during boot-up. Refer to ATOM_DEVICE_xxx_SUPPORT for the bit vector definitions.
 
-	musb->softconnect = 0;
-	musb->gadget_driver = driver;
+ulOtherDisplayMisc: [15:8]- Bootup LCD Expansion selection; 0-center, 1-full panel size expansion;
+                       [7:0] - BootupTV standard selection; This is a bit vector to indicate what TV standards are supported by the system. Refer to ucTVSuppportedStd definition;
 
-	spin_lock_irqsave(&musb->lock, flags);
-	musb->is_active = 1;
+ulDDISlot1Config: Describes the PCIE lane configuration on this DDI PCIE slot (ADD2 card) or connector (Mobile design).
+      [3:0]  - Bit vector to indicate PCIE lane config of the DDI slot/connector on chassis (bit 0=1 lane 3:0; bit 1=1 lane 7:4; bit 2=1 lane 11:8; bit 3=1 lane 15:12)
+         [7:4]  - Bit vector to indicate PCIE lane config of the same DDI slot/connector on docking station (bit 4=1 lane 3:0; bit 5=1 lane 7:4; bit 6=1 lane 11:8; bit 7=1 lane 15:12)
+      When a DDI connector is not "paired" (meaming two connections mutualexclusive on chassis or docking, only one of them can be connected at one time.
+      in both chassis and docking, SBIOS has to duplicate the same PCIE lane info from chassis to docking or vice versa. For example:
+      one DDI connector is only populated in docking with PCIE lane 8-11, but there is no paired connection on chassis, SBIOS has to copy bit 6 to bit 2.
 
-	otg_set_peripheral(otg, &musb->g);
-	musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-	spin_unlock_irqrestore(&musb->lock, flags);
+         [15:8] - Lane configuration attribute;
+      [23:16]- Connector type, possible value:
+               CONNECTOR_OBJECT_ID_SINGLE_LINK_DVI_D
+               CONNECTOR_OBJECT_ID_DUAL_LINK_DVI_D
+               CONNECTOR_OBJECT_ID_HDMI_TYPE_A
+               CONNECTOR_OBJECT_ID_DISPLAYPORT
+               CONNECTOR_OBJECT_ID_eDP
+         [31:24]- Reserved
 
-	musb_start(musb);
+ulDDISlot2Config: Same as Slot1.
+ucMemoryType: SidePort memory type, set it to 0x0 when Sideport memory is not installed. Driver needs this info to change sideport memory clock. Not for display in CCC.
+For IGP, Hypermemory is the only memory type showed in CCC.
 
-	/* REVISIT:  funcall to other code, which also
-	 * handles power budgeting ... this way also
-	 * ensures HdrcStart is indirectly called.
-	 */
-	if (musb->xceiv->last_event == USB_EVENT_ID)
-		musb_platform_set_vbus(musb, 1);
+ucUMAChannelNumber:  how many channels for the UMA;
 
-	if (musb->xceiv->last_event == USB_EVENT_NONE)
-		pm_runtime_put(musb->controller);
+ulDockingPinCFGInfo: [15:0]-Bus/Device/Function # to CFG to read this Docking Pin; [31:16]-reg offset in CFG to read this pin
+ucDockingPinBit:     which bit in this register to read the pin status;
+ucDockingPinPolarity:Polarity of the pin when docked;
 
-	return 0;
+ulCPUCapInfo:        [7:0]=1:Griffin;[7:0]=2:Greyhound;[7:0]=3:K8, [7:0]=4:Pharaoh, other bits reserved for now and must be 0x0
 
-err:
-	return retval;
-}
+usNumberOfCyclesInPeriod:Indicate how many cycles when PWM duty is 100%.
 
-/*
- * Unregister the gadget driver. Used by gadget drivers when
- * unregistering themselves from the controller.
- *
- * @param driver the gadget driver to unregister
- */
-static int musb_gadget_stop(struct usb_gadget *g)
-{
-	struct musb	*musb = gadget_to_musb(g);
-	unsigned long	flags;
+usMaxNBVoltage:Max. voltage control value in either PWM or GPIO mode.
+usMinNBVoltage:Min. voltage control value in either PWM or GPIO mode.
+                    GPIO mode: both usMaxNBVoltage & usMinNBVoltage have a valid value ulSystemConfig.SYSTEM_CONFIG_USE_PWM_ON_VOLTAGE=0
+                    PWM mode: both usMaxNBVoltage & usMinNBVoltage have a valid value ulSystemConfig.SYSTEM_CONFIG_USE_PWM_ON_VOLTAGE=1
+                    GPU SW don't control mode: usMaxNBVoltage & usMinNBVoltage=0 and no care about ulSystemConfig.SYSTEM_CONFIG_USE_PWM_ON_VOLTAGE
 
-	if (musb->xceiv->last_event == USB_EVENT_NONE)
-		pm_runtime_get_sync(musb->controller);
-
-	/*
-	 * REVISIT always use otg_set_peripheral() here too;
-	 * this needs to shut down the OTG engine.
-	 */
-
-	spin_lock_irqsave(&musb->lock, flags);
-
-	musb_hnp_stop(musb);
-
-	(void) musb_gadget_vbus_draw(&musb->g, 0);
-
-	musb->xceiv->otg->state = OTG_STATE_UNDEFINED;
-	musb_stop(musb);
-	otg_set_peripheral(musb->xceiv->otg, NULL);
-
-	musb->is_active = 0;
-	musb->gadget_driver = NULL;
-	musb_platform_try_idle(musb, 0);
-	spin_unlock_irqrestore(&musb->lock, flags);
-
-	/*
-	 * FIXME we need to be able to register another
-	 * gadget driver here and have everything work;
-	 * that currently misbehaves.
-	 */
-
-	pm_runtime_put(musb->controller);
-
-	return 0;
-}
-
-/* ----------------------------------------------------------------------- */
-
-/* lifecycle operations called through plat_uds.c */
-
-void musb_g_resume(struct musb *musb)
-{
-	musb->is_suspended = 0;
-	switch (musb->xceiv->otg->state) {
-	case OTG_STATE_B_IDLE:
-		break;
-	case OTG_STATE_B_WAIT_ACON:
-	case OTG_STATE_B_PERIPHERAL:
-		musb->is_active = 1;
-		if (musb->gadget_driver && musb->gadget_driver->resume) {
-			spin_unlock(&musb->lock);
-			musb->gadget_driver->resume(&musb->g);
-			spin_lock(&musb->lock);
-		}
-		break;
-	default:
-		WARNING("unhandled RESUME transition (%s)\n",
-				usb_otg_state_string(musb->xceiv->otg->state));
-	}
-}
-
-/* called when SOF packets stop for 3+ msec */
-void musb_g_suspend(struct musb *musb)
-{
-	u8	devctl;
-
-	devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
-	dev_dbg(musb->controller, "devctl %02x\n", devctl);
-
-	switch (musb->xceiv->otg->state) {
-	case OTG_STATE_B_IDLE:
-		if ((devctl & MUSB_DEVCTL_VBUS) == MUSB_DEVCTL_VBUS)
-			musb->xceiv->otg->state = OTG_STATE_B_PERIPHERAL;
-		break;
-	case OTG_STATE_B_PERIPHERAL:
-		musb->is_suspended = 1;
-		if (musb->gadget_driver && musb->gadget_driver->suspend) {
-			spin_unlock(&musb->lock);
-			musb->gadget_driver->suspend(&musb->g);
-			spin_lock(&musb->lock);
-		}
-		break;
-	default:
-		/* REVISIT if B_HOST, clear DEVCTL.HOSTREQ;
-		 * A_PERIPHERAL may need care too
-		 */
-		WARNING("unhandled SUSPEND transition (%s)\n",
-				usb_otg_state_string(musb->xceiv->otg->state));
-	}
-}
-
-/* Called during SRP */
-void musb_g_wakeup(struct musb *musb)
-{
-	musb_gadget_wakeup(&musb->g);
-}
-
-/* called when VBUS drops below session threshold, and in other cases */
-void musb_g_disconnect(struct musb *musb)
-{
-	void __iomem	*mregs = musb->mregs;
-	u8	devctl = musb_readb(mregs, MUSB_DEVCTL);
-
-	dev_dbg(musb->controller, "devctl %02x\n", devctl);
-
-	/* clear HR */
-	musb_writeb(mregs, MUSB_DEVCTL, devctl & MUSB_DEVCTL_SESSION);
-
-	/* don't draw vbus until new b-default session */
-	(void) musb_gadget_vbus_draw(&musb->g, 0);
-
-	musb->g.speed = USB_SPEED_UNKNOWN;
-	if (musb->gadget_driver && musb->gadget_driver->disconnect) {
-		spin_unlock(&musb->lock);
-		musb->gadget_driver->disconnect(&musb->g);
-		spin_lock(&musb->lock);
-	}
-
-	switch (musb->xceiv->otg->state) {
-	default:
-		dev_dbg(musb->controller, "Unhandled disconnect %s, setting a_idle\n",
-			usb_otg_state_string(musb->xceiv->otg->state));
-		musb->xceiv->otg->state = OTG_STATE_A_IDLE;
-		MUSB_HST_MODE(musb);
-		break;
-	case OTG_STATE_A_PERIPHERAL:
-		musb->xceiv->otg->state = OTG_STATE_A_WAIT_BCON;
-		MUSB_HST_MODE(musb);
-		break;
-	case OTG_STATE_B_WAIT_ACON:
-	case OTG_STATE_B_HOST:
-	case OTG_STATE_B_PERIPHERAL:
-	case OTG_STATE_B_IDLE:
-		musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-		break;
-	case OTG_STATE_B_SRP_INIT:
-		break;
-	}
-
-	musb->is_active = 0;
-}
-
-void musb_g_reset(struct musb *musb)
-__releases(musb->lock)
-__acquires(musb->lock)
-{
-	void __iomem	*mbase = musb->mregs;
-	u8		devctl = musb_readb(mbase, MUSB_DEVCTL);
-	u8		power;
-
-	dev_dbg(musb->controller, "<== %s driver '%s'\n",
-			(devctl & MUSB_DEVCTL_BDEVICE)
-				? "B-Device" : "A-Device",
-			musb->gadget_driver
-				? musb->gadget_driver->driver.name
-				: NULL
-			);
-
-	/* report reset, if we didn't already (flushing EP state) */
-	if (musb->gadget_driver && musb->g.speed != USB_SPEED_UNKNOWN) {
-		spin_unlock(&musb->lock);
-		usb_gadget_udc_reset(&musb->g, musb->gadget_driver);
-		spin_lock(&musb->lock);
-	}
-
-	/* clear HR */
-	else if (devctl & MUSB_DEVCTL_HR)
-		musb_writeb(mbase, MUSB_DEVCTL, MUSB_DEVCTL_SESSION);
+usBootUpNBVoltage:Boot-up voltage regulator dependent PWM value.
 
 
-	/* what speed did we negotiate? */
-	power = musb_readb(mbase, MUSB_POWER);
-	musb->g.speed = (power & MUSB_POWER_HSMODE)
-			? USB_SPEED_HIGH : USB_SPEED_FULL;
+ulHTLinkFreq:       Bootup HT link Frequency in 10Khz.
+usMinHTLinkWidth:   Bootup minimum HT link width. If CDLW disabled, this is equal to usMaxHTLinkWidth.
+                    If CDLW enabled, both upstream and downstream width should be the same during bootup.
+usMaxHTLinkWidth:   Bootup maximum HT link width. If CDLW disabled, this is equal to usMinHTLinkWidth.
+                    If CDLW enabled, both upstream and downstream width should be the same during bootup.
 
-	/* start in USB_STATE_DEFAULT */
-	musb->is_active = 1;
-	musb->is_suspended = 0;
-	MUSB_DEV_MODE(musb);
-	musb->address = 0;
-	musb->ep0_state = MUSB_EP0_STAGE_SETUP;
+usUMASyncStartDelay: Memory access latency, required for watermark calculation
+usUMADataReturnTime: Memory access latency, required for watermark calculation
+usLinkStatusZeroTime:Memory access latency required for watermark calculation, set this to 0x0 for K8 CPU, set a proper value in 0.01 the unit of us
+for Griffin or Greyhound. SBIOS needs to convert to actual time by:
+                     if T0Ttime [5:4]=00b, then usLinkStatusZeroTime=T0Ttime [3:0]*0.1us (0.0 to 1.5us)
+                     if T0Ttime [5:4]=01b, then usLinkStatusZeroTime=T0Ttime [3:0]*0.5us (0.0 to 7.5us)
+                     if T0Ttime [5:4]=10b, then usLinkStatusZeroTime=T0Ttime [3:0]*2.0us (0.0 to 30us)
+                     if T0Ttime [5:4]=11b, and T0Ttime [3:0]=0x0 to 0xa, then usLinkStatusZeroTime=T0Ttime [3:0]*20us (0.0 to 200us)
 
-	musb->may_wakeup = 0;
-	musb->g.b_hnp_enable = 0;
-	musb->g.a_alt_hnp_support = 0;
-	musb->g.a_hnp_support = 0;
-	musb->g.quirk_zlp_not_supp = 1;
+ulHighVoltageHTLinkFreq:     HT link frequency for power state with low voltage. If boot up runs in HT1, this must be 0.
+                             This must be less than or equal to ulHTLinkFreq(bootup frequency).
+ulLowVoltageHTLinkFreq:      HT link frequency for power state with low voltage or voltage scaling 1.0v~1.1v. If boot up runs in HT1, this must be 0.
+                             This must be less than or equal to ulHighVoltageHTLinkFreq.
 
-	/* Normal reset, as B-Device;
-	 * or else after HNP, as A-Device
-	 */
-	if (!musb->g.is_otg) {
-		/* USB device controllers that are not OTG compatible
-		 * may not have DEVCTL register in silicon.
-		 * In that case, do not rely on devctl for setting
-		 * peripheral mode.
-		 */
-		musb->xceiv->otg->state = OTG_STATE_B_PERIPHERAL;
-		musb->g.is_a_peripheral = 0;
-	} else if (devctl & MUSB_DEVCTL_BDEVICE) {
-		musb->xceiv->otg->state = OTG_STATE_B_PERIPHERAL;
-		musb->g.is_a_peripheral = 0;
-	} else {
-		musb->xceiv->otg->state = OTG_STATE_A_PERIPHERAL;
-		musb->g.is_a_peripheral = 1;
-	}
+usMaxUpStreamHTLinkWidth:    Asymmetric link width support in the future, to replace usMaxHTLinkWidth. Not used for now.
+usMaxDownStreamHTLinkWidth:  same as above.
+usMinUpStreamHTLinkWidth:    Asymmetric link width support in the future, to replace usMinHTLinkWidth. Not used for now.
+usMinDownStreamHTLinkWidth:  same as above.
+*/
 
-	/* start with default limits on VBUS power draw */
-	(void) musb_gadget_vbus_draw(&musb->g, 8);
-}
+// ATOM_INTEGRATED_SYSTEM_INFO::ulCPUCapInfo  - CPU type definition
+#define    INTEGRATED_SYSTEM_INFO__UNKNOWN_CPU             0
+#define    INTEGRATED_SYSTEM_INFO__AMD_CPU__GRIFFIN        1
+#define    INTEGRATED_SYSTEM_INFO__AMD_CPU__GREYHOUND      2
+#define    INTEGRATED_SYSTEM_INFO__AMD_CPU__K8             3
+#define    INTEGRATED_SYSTEM_INFO__AMD_CPU__PHARAOH        4
+#define    INTEGRATED_SYSTEM_INFO__AMD_CPU__OROCHI         5
+
+#define    INTEGRATED_SYSTEM_INFO__AMD_CPU__MAX_CODE       INTEGRATED_SYSTEM_INFO__AMD_CPU__OROCHI    // this deff reflects max defined CPU code
+
+#define SYSTEM_CONFIG_POWEREXPRESS_ENABLE                 0x00000001
+#define SYSTEM_CONFIG_RUN_AT_OVERDRIVE_ENGINE             0x00000002
+#define SYSTEM_CONFIG_USE_PWM_ON_VOLTAGE                  0x00000004
+#define SYSTEM_CONFIG_PERFORMANCE_POWERSTATE_ONLY         0x00000008
+#define SYSTEM_CONFIG_CLMC_ENABLED                        0x00000010
+#define SYSTEM_CONFIG_CDLW_ENABLED                        0x00000020
+#define SYSTEM_CONFIG_HIGH_VOLTAGE_REQUESTED              0x00000040
+#define SYSTEM_CONFIG_CLMC_HYBRID_MODE_ENABLED            0x00000080
+#define SYSTEM_CONFIG_CDLF_ENABLED                        0x00000100
+#define SYSTEM_CONFIG_DLL_SHUTDOWN_ENABLED                0x00000200
+
+#define IGP_DDI_SLOT_LANE_CONFIG_MASK                     0x000000FF
+
+#define b0IGP_DDI_SLOT_LANE_MAP_MASK                      0x0F
+#define b0IGP_DDI_SLOT_DOCKING_LANE_MAP_MASK              0xF0
+#define b0IGP_DDI_SLOT_CONFIG_LANE_0_3                    0x01
+#define b0IGP_DDI_SLOT_CONFIG_LANE_4_7                    0x02
+#define b0IGP_DDI_SLOT_CONFIG_LANE_8_11                   0x04
+#define b0IGP_DDI_SLOT_CONFIG_LANE_12_15                  0x08
+
+#define IGP_DDI_SLOT_ATTRIBUTE_MASK                       0x0000FF00
+#define IGP_DDI_SLOT_CONFIG_REVERSED              

@@ -1,885 +1,419 @@
-/*
- * OMAP3/4 - specific DPLL control functions
- *
- * Copyright (C) 2009-2010 Texas Instruments, Inc.
- * Copyright (C) 2009-2010 Nokia Corporation
- *
- * Written by Paul Walmsley
- * Testing and integration fixes by Jouni Högander
- *
- * 36xx support added by Vishwanath BS, Richard Woodruff, and Nishanth
- * Menon
- *
- * Parts of this code are based on code written by
- * Richard Woodruff, Tony Lindgren, Tuukka Tikkanen, Karthik Dasu
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/kernel.h>
-#include <linux/device.h>
-#include <linux/list.h>
-#include <linux/errno.h>
-#include <linux/delay.h>
-#include <linux/clk.h>
-#include <linux/io.h>
-#include <linux/bitops.h>
-#include <linux/clkdev.h>
-#include <linux/clk/ti.h>
-
-#include "clock.h"
-
-/* CM_AUTOIDLE_PLL*.AUTO_* bit values */
-#define DPLL_AUTOIDLE_DISABLE			0x0
-#define DPLL_AUTOIDLE_LOW_POWER_STOP		0x1
-
-#define MAX_DPLL_WAIT_TRIES		1000000
-
-#define OMAP3XXX_EN_DPLL_LOCKED		0x7
-
-/* Forward declarations */
-static u32 omap3_dpll_autoidle_read(struct clk_hw_omap *clk);
-static void omap3_dpll_deny_idle(struct clk_hw_omap *clk);
-static void omap3_dpll_allow_idle(struct clk_hw_omap *clk);
-
-/* Private functions */
-
-/* _omap3_dpll_write_clken - write clken_bits arg to a DPLL's enable bits */
-static void _omap3_dpll_write_clken(struct clk_hw_omap *clk, u8 clken_bits)
-{
-	const struct dpll_data *dd;
-	u32 v;
-
-	dd = clk->dpll_data;
-
-	v = ti_clk_ll_ops->clk_readl(dd->control_reg);
-	v &= ~dd->enable_mask;
-	v |= clken_bits << __ffs(dd->enable_mask);
-	ti_clk_ll_ops->clk_writel(v, dd->control_reg);
-}
-
-/* _omap3_wait_dpll_status: wait for a DPLL to enter a specific state */
-static int _omap3_wait_dpll_status(struct clk_hw_omap *clk, u8 state)
-{
-	const struct dpll_data *dd;
-	int i = 0;
-	int ret = -EINVAL;
-	const char *clk_name;
-
-	dd = clk->dpll_data;
-	clk_name = clk_hw_get_name(&clk->hw);
-
-	state <<= __ffs(dd->idlest_mask);
-
-	while (((ti_clk_ll_ops->clk_readl(dd->idlest_reg) & dd->idlest_mask)
-		!= state) && i < MAX_DPLL_WAIT_TRIES) {
-		i++;
-		udelay(1);
-	}
-
-	if (i == MAX_DPLL_WAIT_TRIES) {
-		pr_err("clock: %s failed transition to '%s'\n",
-		       clk_name, (state) ? "locked" : "bypassed");
-	} else {
-		pr_debug("clock: %s transition to '%s' in %d loops\n",
-			 clk_name, (state) ? "locked" : "bypassed", i);
-
-		ret = 0;
-	}
-
-	return ret;
-}
-
-/* From 3430 TRM ES2 4.7.6.2 */
-static u16 _omap3_dpll_compute_freqsel(struct clk_hw_omap *clk, u8 n)
-{
-	unsigned long fint;
-	u16 f = 0;
-
-	fint = clk_get_rate(clk->dpll_data->clk_ref) / n;
-
-	pr_debug("clock: fint is %lu\n", fint);
-
-	if (fint >= 750000 && fint <= 1000000)
-		f = 0x3;
-	else if (fint > 1000000 && fint <= 1250000)
-		f = 0x4;
-	else if (fint > 1250000 && fint <= 1500000)
-		f = 0x5;
-	else if (fint > 1500000 && fint <= 1750000)
-		f = 0x6;
-	else if (fint > 1750000 && fint <= 2100000)
-		f = 0x7;
-	else if (fint > 7500000 && fint <= 10000000)
-		f = 0xB;
-	else if (fint > 10000000 && fint <= 12500000)
-		f = 0xC;
-	else if (fint > 12500000 && fint <= 15000000)
-		f = 0xD;
-	else if (fint > 15000000 && fint <= 17500000)
-		f = 0xE;
-	else if (fint > 17500000 && fint <= 21000000)
-		f = 0xF;
-	else
-		pr_debug("clock: unknown freqsel setting for %d\n", n);
-
-	return f;
-}
-
-/*
- * _omap3_noncore_dpll_lock - instruct a DPLL to lock and wait for readiness
- * @clk: pointer to a DPLL struct clk
- *
- * Instructs a non-CORE DPLL to lock.  Waits for the DPLL to report
- * readiness before returning.  Will save and restore the DPLL's
- * autoidle state across the enable, per the CDP code.  If the DPLL
- * locked successfully, return 0; if the DPLL did not lock in the time
- * allotted, or DPLL3 was passed in, return -EINVAL.
- */
-static int _omap3_noncore_dpll_lock(struct clk_hw_omap *clk)
-{
-	const struct dpll_data *dd;
-	u8 ai;
-	u8 state = 1;
-	int r = 0;
-
-	pr_debug("clock: locking DPLL %s\n", clk_hw_get_name(&clk->hw));
-
-	dd = clk->dpll_data;
-	state <<= __ffs(dd->idlest_mask);
-
-	/* Check if already locked */
-	if ((ti_clk_ll_ops->clk_readl(dd->idlest_reg) & dd->idlest_mask) ==
-	    state)
-		goto done;
-
-	ai = omap3_dpll_autoidle_read(clk);
-
-	if (ai)
-		omap3_dpll_deny_idle(clk);
-
-	_omap3_dpll_write_clken(clk, DPLL_LOCKED);
-
-	r = _omap3_wait_dpll_status(clk, 1);
-
-	if (ai)
-		omap3_dpll_allow_idle(clk);
-
-done:
-	return r;
-}
-
-/*
- * _omap3_noncore_dpll_bypass - instruct a DPLL to bypass and wait for readiness
- * @clk: pointer to a DPLL struct clk
- *
- * Instructs a non-CORE DPLL to enter low-power bypass mode.  In
- * bypass mode, the DPLL's rate is set equal to its parent clock's
- * rate.  Waits for the DPLL to report readiness before returning.
- * Will save and restore the DPLL's autoidle state across the enable,
- * per the CDP code.  If the DPLL entered bypass mode successfully,
- * return 0; if the DPLL did not enter bypass in the time allotted, or
- * DPLL3 was passed in, or the DPLL does not support low-power bypass,
- * return -EINVAL.
- */
-static int _omap3_noncore_dpll_bypass(struct clk_hw_omap *clk)
-{
-	int r;
-	u8 ai;
-
-	if (!(clk->dpll_data->modes & (1 << DPLL_LOW_POWER_BYPASS)))
-		return -EINVAL;
-
-	pr_debug("clock: configuring DPLL %s for low-power bypass\n",
-		 clk_hw_get_name(&clk->hw));
-
-	ai = omap3_dpll_autoidle_read(clk);
-
-	_omap3_dpll_write_clken(clk, DPLL_LOW_POWER_BYPASS);
-
-	r = _omap3_wait_dpll_status(clk, 0);
-
-	if (ai)
-		omap3_dpll_allow_idle(clk);
-
-	return r;
-}
-
-/*
- * _omap3_noncore_dpll_stop - instruct a DPLL to stop
- * @clk: pointer to a DPLL struct clk
- *
- * Instructs a non-CORE DPLL to enter low-power stop. Will save and
- * restore the DPLL's autoidle state across the stop, per the CDP
- * code.  If DPLL3 was passed in, or the DPLL does not support
- * low-power stop, return -EINVAL; otherwise, return 0.
- */
-static int _omap3_noncore_dpll_stop(struct clk_hw_omap *clk)
-{
-	u8 ai;
-
-	if (!(clk->dpll_data->modes & (1 << DPLL_LOW_POWER_STOP)))
-		return -EINVAL;
-
-	pr_debug("clock: stopping DPLL %s\n", clk_hw_get_name(&clk->hw));
-
-	ai = omap3_dpll_autoidle_read(clk);
-
-	_omap3_dpll_write_clken(clk, DPLL_LOW_POWER_STOP);
-
-	if (ai)
-		omap3_dpll_allow_idle(clk);
-
-	return 0;
-}
-
-/**
- * _lookup_dco - Lookup DCO used by j-type DPLL
- * @clk: pointer to a DPLL struct clk
- * @dco: digital control oscillator selector
- * @m: DPLL multiplier to set
- * @n: DPLL divider to set
- *
- * See 36xx TRM section 3.5.3.3.3.2 "Type B DPLL (Low-Jitter)"
- *
- * XXX This code is not needed for 3430/AM35xx; can it be optimized
- * out in non-multi-OMAP builds for those chips?
- */
-static void _lookup_dco(struct clk_hw_omap *clk, u8 *dco, u16 m, u8 n)
-{
-	unsigned long fint, clkinp; /* watch out for overflow */
-
-	clkinp = clk_hw_get_rate(clk_hw_get_parent(&clk->hw));
-	fint = (clkinp / n) * m;
-
-	if (fint < 1000000000)
-		*dco = 2;
-	else
-		*dco = 4;
-}
-
-/**
- * _lookup_sddiv - Calculate sigma delta divider for j-type DPLL
- * @clk: pointer to a DPLL struct clk
- * @sd_div: target sigma-delta divider
- * @m: DPLL multiplier to set
- * @n: DPLL divider to set
- *
- * See 36xx TRM section 3.5.3.3.3.2 "Type B DPLL (Low-Jitter)"
- *
- * XXX This code is not needed for 3430/AM35xx; can it be optimized
- * out in non-multi-OMAP builds for those chips?
- */
-static void _lookup_sddiv(struct clk_hw_omap *clk, u8 *sd_div, u16 m, u8 n)
-{
-	unsigned long clkinp, sd; /* watch out for overflow */
-	int mod1, mod2;
-
-	clkinp = clk_hw_get_rate(clk_hw_get_parent(&clk->hw));
-
-	/*
-	 * target sigma-delta to near 250MHz
-	 * sd = ceil[(m/(n+1)) * (clkinp_MHz / 250)]
-	 */
-	clkinp /= 100000; /* shift from MHz to 10*Hz for 38.4 and 19.2 */
-	mod1 = (clkinp * m) % (250 * n);
-	sd = (clkinp * m) / (250 * n);
-	mod2 = sd % 10;
-	sd /= 10;
-
-	if (mod1 || mod2)
-		sd++;
-	*sd_div = sd;
-}
-
-/*
- * _omap3_noncore_dpll_program - set non-core DPLL M,N values directly
- * @clk:	struct clk * of DPLL to set
- * @freqsel:	FREQSEL value to set
- *
- * Program the DPLL with the last M, N values calculated, and wait for
- * the DPLL to lock. Returns -EINVAL upon error, or 0 upon success.
- */
-static int omap3_noncore_dpll_program(struct clk_hw_omap *clk, u16 freqsel)
-{
-	struct dpll_data *dd = clk->dpll_data;
-	u8 dco, sd_div;
-	u32 v;
-
-	/* 3430 ES2 TRM: 4.7.6.9 DPLL Programming Sequence */
-	_omap3_noncore_dpll_bypass(clk);
-
-	/*
-	 * Set jitter correction. Jitter correction applicable for OMAP343X
-	 * only since freqsel field is no longer present on other devices.
-	 */
-	if (ti_clk_get_features()->flags & TI_CLK_DPLL_HAS_FREQSEL) {
-		v = ti_clk_ll_ops->clk_readl(dd->control_reg);
-		v &= ~dd->freqsel_mask;
-		v |= freqsel << __ffs(dd->freqsel_mask);
-		ti_clk_ll_ops->clk_writel(v, dd->control_reg);
-	}
-
-	/* Set DPLL multiplier, divider */
-	v = ti_clk_ll_ops->clk_readl(dd->mult_div1_reg);
-
-	/* Handle Duty Cycle Correction */
-	if (dd->dcc_mask) {
-		if (dd->last_rounded_rate >= dd->dcc_rate)
-			v |= dd->dcc_mask; /* Enable DCC */
-		else
-			v &= ~dd->dcc_mask; /* Disable DCC */
-	}
-
-	v &= ~(dd->mult_mask | dd->div1_mask);
-	v |= dd->last_rounded_m << __ffs(dd->mult_mask);
-	v |= (dd->last_rounded_n - 1) << __ffs(dd->div1_mask);
-
-	/* Configure dco and sd_div for dplls that have these fields */
-	if (dd->dco_mask) {
-		_lookup_dco(clk, &dco, dd->last_rounded_m, dd->last_rounded_n);
-		v &= ~(dd->dco_mask);
-		v |= dco << __ffs(dd->dco_mask);
-	}
-	if (dd->sddiv_mask) {
-		_lookup_sddiv(clk, &sd_div, dd->last_rounded_m,
-			      dd->last_rounded_n);
-		v &= ~(dd->sddiv_mask);
-		v |= sd_div << __ffs(dd->sddiv_mask);
-	}
-
-	ti_clk_ll_ops->clk_writel(v, dd->mult_div1_reg);
-
-	/* Set 4X multiplier and low-power mode */
-	if (dd->m4xen_mask || dd->lpmode_mask) {
-		v = ti_clk_ll_ops->clk_readl(dd->control_reg);
-
-		if (dd->m4xen_mask) {
-			if (dd->last_rounded_m4xen)
-				v |= dd->m4xen_mask;
-			else
-				v &= ~dd->m4xen_mask;
-		}
-
-		if (dd->lpmode_mask) {
-			if (dd->last_rounded_lpmode)
-				v |= dd->lpmode_mask;
-			else
-				v &= ~dd->lpmode_mask;
-		}
-
-		ti_clk_ll_ops->clk_writel(v, dd->control_reg);
-	}
-
-	/* We let the clock framework set the other output dividers later */
-
-	/* REVISIT: Set ramp-up delay? */
-
-	_omap3_noncore_dpll_lock(clk);
-
-	return 0;
-}
-
-/* Public functions */
-
-/**
- * omap3_dpll_recalc - recalculate DPLL rate
- * @clk: DPLL struct clk
- *
- * Recalculate and propagate the DPLL rate.
- */
-unsigned long omap3_dpll_recalc(struct clk_hw *hw, unsigned long parent_rate)
-{
-	struct clk_hw_omap *clk = to_clk_hw_omap(hw);
-
-	return omap2_get_dpll_rate(clk);
-}
-
-/* Non-CORE DPLL (e.g., DPLLs that do not control SDRC) clock functions */
-
-/**
- * omap3_noncore_dpll_enable - instruct a DPLL to enter bypass or lock mode
- * @clk: pointer to a DPLL struct clk
- *
- * Instructs a non-CORE DPLL to enable, e.g., to enter bypass or lock.
- * The choice of modes depends on the DPLL's programmed rate: if it is
- * the same as the DPLL's parent clock, it will enter bypass;
- * otherwise, it will enter lock.  This code will wait for the DPLL to
- * indicate readiness before returning, unless the DPLL takes too long
- * to enter the target state.  Intended to be used as the struct clk's
- * enable function.  If DPLL3 was passed in, or the DPLL does not
- * support low-power stop, or if the DPLL took too long to enter
- * bypass or lock, return -EINVAL; otherwise, return 0.
- */
-int omap3_noncore_dpll_enable(struct clk_hw *hw)
-{
-	struct clk_hw_omap *clk = to_clk_hw_omap(hw);
-	int r;
-	struct dpll_data *dd;
-	struct clk_hw *parent;
-
-	dd = clk->dpll_data;
-	if (!dd)
-		return -EINVAL;
-
-	if (clk->clkdm) {
-		r = ti_clk_ll_ops->clkdm_clk_enable(clk->clkdm, hw->clk);
-		if (r) {
-			WARN(1,
-			     "%s: could not enable %s's clockdomain %s: %d\n",
-			     __func__, clk_hw_get_name(hw),
-			     clk->clkdm_name, r);
-			return r;
-		}
-	}
-
-	parent = clk_hw_get_parent(hw);
-
-	if (clk_hw_get_rate(hw) ==
-	    clk_hw_get_rate(__clk_get_hw(dd->clk_bypass))) {
-		WARN_ON(parent != __clk_get_hw(dd->clk_bypass));
-		r = _omap3_noncore_dpll_bypass(clk);
-	} else {
-		WARN_ON(parent != __clk_get_hw(dd->clk_ref));
-		r = _omap3_noncore_dpll_lock(clk);
-	}
-
-	return r;
-}
-
-/**
- * omap3_noncore_dpll_disable - instruct a DPLL to enter low-power stop
- * @clk: pointer to a DPLL struct clk
- *
- * Instructs a non-CORE DPLL to enter low-power stop.  This function is
- * intended for use in struct clkops.  No return value.
- */
-void omap3_noncore_dpll_disable(struct clk_hw *hw)
-{
-	struct clk_hw_omap *clk = to_clk_hw_omap(hw);
-
-	_omap3_noncore_dpll_stop(clk);
-	if (clk->clkdm)
-		ti_clk_ll_ops->clkdm_clk_disable(clk->clkdm, hw->clk);
-}
-
-/* Non-CORE DPLL rate set code */
-
-/**
- * omap3_noncore_dpll_determine_rate - determine rate for a DPLL
- * @hw: pointer to the clock to determine rate for
- * @req: target rate request
- *
- * Determines which DPLL mode to use for reaching a desired target rate.
- * Checks whether the DPLL shall be in bypass or locked mode, and if
- * locked, calculates the M,N values for the DPLL via round-rate.
- * Returns a 0 on success, negative error value in failure.
- */
-int omap3_noncore_dpll_determine_rate(struct clk_hw *hw,
-				      struct clk_rate_request *req)
-{
-	struct clk_hw_omap *clk = to_clk_hw_omap(hw);
-	struct dpll_data *dd;
-
-	if (!req->rate)
-		return -EINVAL;
-
-	dd = clk->dpll_data;
-	if (!dd)
-		return -EINVAL;
-
-	if (clk_get_rate(dd->clk_bypass) == req->rate &&
-	    (dd->modes & (1 << DPLL_LOW_POWER_BYPASS))) {
-		req->best_parent_hw = __clk_get_hw(dd->clk_bypass);
-	} else {
-		req->rate = omap2_dpll_round_rate(hw, req->rate,
-					  &req->best_parent_rate);
-		req->best_parent_hw = __clk_get_hw(dd->clk_ref);
-	}
-
-	req->best_parent_rate = req->rate;
-
-	return 0;
-}
-
-/**
- * omap3_noncore_dpll_set_parent - set parent for a DPLL clock
- * @hw: pointer to the clock to set parent for
- * @index: parent index to select
- *
- * Sets parent for a DPLL clock. This sets the DPLL into bypass or
- * locked mode. Returns 0 with success, negative error value otherwise.
- */
-int omap3_noncore_dpll_set_parent(struct clk_hw *hw, u8 index)
-{
-	struct clk_hw_omap *clk = to_clk_hw_omap(hw);
-	int ret;
-
-	if (!hw)
-		return -EINVAL;
-
-	if (index)
-		ret = _omap3_noncore_dpll_bypass(clk);
-	else
-		ret = _omap3_noncore_dpll_lock(clk);
-
-	return ret;
-}
-
-/**
- * omap3_noncore_dpll_set_rate - set rate for a DPLL clock
- * @hw: pointer to the clock to set parent for
- * @rate: target rate for the clock
- * @parent_rate: rate of the parent clock
- *
- * Sets rate for a DPLL clock. First checks if the clock parent is
- * reference clock (in bypass mode, the rate of the clock can't be
- * changed) and proceeds with the rate change operation. Returns 0
- * with success, negative error value otherwise.
- */
-int omap3_noncore_dpll_set_rate(struct clk_hw *hw, unsigned long rate,
-				unsigned long parent_rate)
-{
-	struct clk_hw_omap *clk = to_clk_hw_omap(hw);
-	struct dpll_data *dd;
-	u16 freqsel = 0;
-	int ret;
-
-	if (!hw || !rate)
-		return -EINVAL;
-
-	dd = clk->dpll_data;
-	if (!dd)
-		return -EINVAL;
-
-	if (clk_hw_get_parent(hw) != __clk_get_hw(dd->clk_ref))
-		return -EINVAL;
-
-	if (dd->last_rounded_rate == 0)
-		return -EINVAL;
-
-	/* Freqsel is available only on OMAP343X devices */
-	if (ti_clk_get_features()->flags & TI_CLK_DPLL_HAS_FREQSEL) {
-		freqsel = _omap3_dpll_compute_freqsel(clk, dd->last_rounded_n);
-		WARN_ON(!freqsel);
-	}
-
-	pr_debug("%s: %s: set rate: locking rate to %lu.\n", __func__,
-		 clk_hw_get_name(hw), rate);
-
-	ret = omap3_noncore_dpll_program(clk, freqsel);
-
-	return ret;
-}
-
-/**
- * omap3_noncore_dpll_set_rate_and_parent - set rate and parent for a DPLL clock
- * @hw: pointer to the clock to set rate and parent for
- * @rate: target rate for the DPLL
- * @parent_rate: clock rate of the DPLL parent
- * @index: new parent index for the DPLL, 0 - reference, 1 - bypass
- *
- * Sets rate and parent for a DPLL clock. If new parent is the bypass
- * clock, only selects the parent. Otherwise proceeds with a rate
- * change, as this will effectively also change the parent as the
- * DPLL is put into locked mode. Returns 0 with success, negative error
- * value otherwise.
- */
-int omap3_noncore_dpll_set_rate_and_parent(struct clk_hw *hw,
-					   unsigned long rate,
-					   unsigned long parent_rate,
-					   u8 index)
-{
-	int ret;
-
-	if (!hw || !rate)
-		return -EINVAL;
-
-	/*
-	 * clk-ref at index[0], in which case we only need to set rate,
-	 * the parent will be changed automatically with the lock sequence.
-	 * With clk-bypass case we only need to change parent.
-	 */
-	if (index)
-		ret = omap3_noncore_dpll_set_parent(hw, index);
-	else
-		ret = omap3_noncore_dpll_set_rate(hw, rate, parent_rate);
-
-	return ret;
-}
-
-/* DPLL autoidle read/set code */
-
-/**
- * omap3_dpll_autoidle_read - read a DPLL's autoidle bits
- * @clk: struct clk * of the DPLL to read
- *
- * Return the DPLL's autoidle bits, shifted down to bit 0.  Returns
- * -EINVAL if passed a null pointer or if the struct clk does not
- * appear to refer to a DPLL.
- */
-static u32 omap3_dpll_autoidle_read(struct clk_hw_omap *clk)
-{
-	const struct dpll_data *dd;
-	u32 v;
-
-	if (!clk || !clk->dpll_data)
-		return -EINVAL;
-
-	dd = clk->dpll_data;
-
-	if (!dd->autoidle_reg)
-		return -EINVAL;
-
-	v = ti_clk_ll_ops->clk_readl(dd->autoidle_reg);
-	v &= dd->autoidle_mask;
-	v >>= __ffs(dd->autoidle_mask);
-
-	return v;
-}
-
-/**
- * omap3_dpll_allow_idle - enable DPLL autoidle bits
- * @clk: struct clk * of the DPLL to operate on
- *
- * Enable DPLL automatic idle control.  This automatic idle mode
- * switching takes effect only when the DPLL is locked, at least on
- * OMAP3430.  The DPLL will enter low-power stop when its downstream
- * clocks are gated.  No return value.
- */
-static void omap3_dpll_allow_idle(struct clk_hw_omap *clk)
-{
-	const struct dpll_data *dd;
-	u32 v;
-
-	if (!clk || !clk->dpll_data)
-		return;
-
-	dd = clk->dpll_data;
-
-	if (!dd->autoidle_reg)
-		return;
-
-	/*
-	 * REVISIT: CORE DPLL can optionally enter low-power bypass
-	 * by writing 0x5 instead of 0x1.  Add some mechanism to
-	 * optionally enter this mode.
-	 */
-	v = ti_clk_ll_ops->clk_readl(dd->autoidle_reg);
-	v &= ~dd->autoidle_mask;
-	v |= DPLL_AUTOIDLE_LOW_POWER_STOP << __ffs(dd->autoidle_mask);
-	ti_clk_ll_ops->clk_writel(v, dd->autoidle_reg);
-}
-
-/**
- * omap3_dpll_deny_idle - prevent DPLL from automatically idling
- * @clk: struct clk * of the DPLL to operate on
- *
- * Disable DPLL automatic idle control.  No return value.
- */
-static void omap3_dpll_deny_idle(struct clk_hw_omap *clk)
-{
-	const struct dpll_data *dd;
-	u32 v;
-
-	if (!clk || !clk->dpll_data)
-		return;
-
-	dd = clk->dpll_data;
-
-	if (!dd->autoidle_reg)
-		return;
-
-	v = ti_clk_ll_ops->clk_readl(dd->autoidle_reg);
-	v &= ~dd->autoidle_mask;
-	v |= DPLL_AUTOIDLE_DISABLE << __ffs(dd->autoidle_mask);
-	ti_clk_ll_ops->clk_writel(v, dd->autoidle_reg);
-}
-
-/* Clock control for DPLL outputs */
-
-/* Find the parent DPLL for the given clkoutx2 clock */
-static struct clk_hw_omap *omap3_find_clkoutx2_dpll(struct clk_hw *hw)
-{
-	struct clk_hw_omap *pclk = NULL;
-
-	/* Walk up the parents of clk, looking for a DPLL */
-	do {
-		do {
-			hw = clk_hw_get_parent(hw);
-		} while (hw && (clk_hw_get_flags(hw) & CLK_IS_BASIC));
-		if (!hw)
-			break;
-		pclk = to_clk_hw_omap(hw);
-	} while (pclk && !pclk->dpll_data);
-
-	/* clk does not have a DPLL as a parent?  error in the clock data */
-	if (!pclk) {
-		WARN_ON(1);
-		return NULL;
-	}
-
-	return pclk;
-}
-
-/**
- * omap3_clkoutx2_recalc - recalculate DPLL X2 output virtual clock rate
- * @clk: DPLL output struct clk
- *
- * Using parent clock DPLL data, look up DPLL state.  If locked, set our
- * rate to the dpll_clk * 2; otherwise, just use dpll_clk.
- */
-unsigned long omap3_clkoutx2_recalc(struct clk_hw *hw,
-				    unsigned long parent_rate)
-{
-	const struct dpll_data *dd;
-	unsigned long rate;
-	u32 v;
-	struct clk_hw_omap *pclk = NULL;
-
-	if (!parent_rate)
-		return 0;
-
-	pclk = omap3_find_clkoutx2_dpll(hw);
-
-	if (!pclk)
-		return 0;
-
-	dd = pclk->dpll_data;
-
-	WARN_ON(!dd->enable_mask);
-
-	v = ti_clk_ll_ops->clk_readl(dd->control_reg) & dd->enable_mask;
-	v >>= __ffs(dd->enable_mask);
-	if ((v != OMAP3XXX_EN_DPLL_LOCKED) || (dd->flags & DPLL_J_TYPE))
-		rate = parent_rate;
-	else
-		rate = parent_rate * 2;
-	return rate;
-}
-
-/* OMAP3/4 non-CORE DPLL clkops */
-const struct clk_hw_omap_ops clkhwops_omap3_dpll = {
-	.allow_idle	= omap3_dpll_allow_idle,
-	.deny_idle	= omap3_dpll_deny_idle,
-};
-
-/**
- * omap3_dpll4_set_rate - set rate for omap3 per-dpll
- * @hw: clock to change
- * @rate: target rate for clock
- * @parent_rate: rate of the parent clock
- *
- * Check if the current SoC supports the per-dpll reprogram operation
- * or not, and then do the rate change if supported. Returns -EINVAL
- * if not supported, 0 for success, and potential error codes from the
- * clock rate change.
- */
-int omap3_dpll4_set_rate(struct clk_hw *hw, unsigned long rate,
-			 unsigned long parent_rate)
-{
-	/*
-	 * According to the 12-5 CDP code from TI, "Limitation 2.5"
-	 * on 3430ES1 prevents us from changing DPLL multipliers or dividers
-	 * on DPLL4.
-	 */
-	if (ti_clk_get_features()->flags & TI_CLK_DPLL4_DENY_REPROGRAM) {
-		pr_err("clock: DPLL4 cannot change rate due to silicon 'Limitation 2.5' on 3430ES1.\n");
-		return -EINVAL;
-	}
-
-	return omap3_noncore_dpll_set_rate(hw, rate, parent_rate);
-}
-
-/**
- * omap3_dpll4_set_rate_and_parent - set rate and parent for omap3 per-dpll
- * @hw: clock to change
- * @rate: target rate for clock
- * @parent_rate: rate of the parent clock
- * @index: parent index, 0 - reference clock, 1 - bypass clock
- *
- * Check if the current SoC support the per-dpll reprogram operation
- * or not, and then do the rate + parent change if supported. Returns
- * -EINVAL if not supported, 0 for success, and potential error codes
- * from the clock rate change.
- */
-int omap3_dpll4_set_rate_and_parent(struct clk_hw *hw, unsigned long rate,
-				    unsigned long parent_rate, u8 index)
-{
-	if (ti_clk_get_features()->flags & TI_CLK_DPLL4_DENY_REPROGRAM) {
-		pr_err("clock: DPLL4 cannot change rate due to silicon 'Limitation 2.5' on 3430ES1.\n");
-		return -EINVAL;
-	}
-
-	return omap3_noncore_dpll_set_rate_and_parent(hw, rate, parent_rate,
-						      index);
-}
-
-/* Apply DM3730 errata sprz319 advisory 2.1. */
-static bool omap3_dpll5_apply_errata(struct clk_hw *hw,
-				     unsigned long parent_rate)
-{
-	struct omap3_dpll5_settings {
-		unsigned int rate, m, n;
-	};
-
-	static const struct omap3_dpll5_settings precomputed[] = {
-		/*
-		 * From DM3730 errata advisory 2.1, table 35 and 36.
-		 * The N value is increased by 1 compared to the tables as the
-		 * errata lists register values while last_rounded_field is the
-		 * real divider value.
-		 */
-		{ 12000000,  80,  0 + 1 },
-		{ 13000000, 443,  5 + 1 },
-		{ 19200000,  50,  0 + 1 },
-		{ 26000000, 443, 11 + 1 },
-		{ 38400000,  25,  0 + 1 }
-	};
-
-	const struct omap3_dpll5_settings *d;
-	struct clk_hw_omap *clk = to_clk_hw_omap(hw);
-	struct dpll_data *dd;
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(precomputed); ++i) {
-		if (parent_rate == precomputed[i].rate)
-			break;
-	}
-
-	if (i == ARRAY_SIZE(precomputed))
-		return false;
-
-	d = &precomputed[i];
-
-	/* Update the M, N and rounded rate values and program the DPLL. */
-	dd = clk->dpll_data;
-	dd->last_rounded_m = d->m;
-	dd->last_rounded_n = d->n;
-	dd->last_rounded_rate = div_u64((u64)parent_rate * d->m, d->n);
-	omap3_noncore_dpll_program(clk, 0);
-
-	return true;
-}
-
-/**
- * omap3_dpll5_set_rate - set rate for omap3 dpll5
- * @hw: clock to change
- * @rate: target rate for clock
- * @parent_rate: rate of the parent clock
- *
- * Set rate for the DPLL5 clock. Apply the sprz319 advisory 2.1 on OMAP36xx if
- * the DPLL is used for USB host (detected through the requested rate).
- */
-int omap3_dpll5_set_rate(struct clk_hw *hw, unsigned long rate,
-			 unsigned long parent_rate)
-{
-	if (rate == OMAP3_DPLL5_FREQ_FOR_USBHOST * 8) {
-		if (omap3_dpll5_apply_errata(hw, parent_rate))
-			return 0;
-	}
-
-	return omap3_noncore_dpll_set_rate(hw, rate, parent_rate);
-}
+DIV_MASK 0xff
+#define PLL_SS_CNTL__PLL_SS_AMOUNT_FBDIV__SHIFT 0x0
+#define PLL_SS_CNTL__PLL_SS_AMOUNT_NFRAC_SLIP_MASK 0xf00
+#define PLL_SS_CNTL__PLL_SS_AMOUNT_NFRAC_SLIP__SHIFT 0x8
+#define PLL_SS_CNTL__PLL_SS_EN_MASK 0x1000
+#define PLL_SS_CNTL__PLL_SS_EN__SHIFT 0xc
+#define PLL_SS_CNTL__PLL_SS_MODE_MASK 0x2000
+#define PLL_SS_CNTL__PLL_SS_MODE__SHIFT 0xd
+#define PLL_SS_CNTL__PLL_SS_STEP_SIZE_DSFRAC_MASK 0xffff0000
+#define PLL_SS_CNTL__PLL_SS_STEP_SIZE_DSFRAC__SHIFT 0x10
+#define PLL_DS_CNTL__PLL_DS_FRAC_MASK 0xffff
+#define PLL_DS_CNTL__PLL_DS_FRAC__SHIFT 0x0
+#define PLL_DS_CNTL__PLL_DS_ORDER_MASK 0x30000
+#define PLL_DS_CNTL__PLL_DS_ORDER__SHIFT 0x10
+#define PLL_DS_CNTL__PLL_DS_MODE_MASK 0x40000
+#define PLL_DS_CNTL__PLL_DS_MODE__SHIFT 0x12
+#define PLL_DS_CNTL__PLL_DS_PRBS_EN_MASK 0x80000
+#define PLL_DS_CNTL__PLL_DS_PRBS_EN__SHIFT 0x13
+#define PLL_IDCLK_CNTL__PLL_LTDP_IDCLK_EN_MASK 0x1
+#define PLL_IDCLK_CNTL__PLL_LTDP_IDCLK_EN__SHIFT 0x0
+#define PLL_IDCLK_CNTL__PLL_LTDP_IDCLK_DIFF_EN_MASK 0x2
+#define PLL_IDCLK_CNTL__PLL_LTDP_IDCLK_DIFF_EN__SHIFT 0x1
+#define PLL_IDCLK_CNTL__PLL_TMDP_IDCLK_EN_MASK 0x4
+#define PLL_IDCLK_CNTL__PLL_TMDP_IDCLK_EN__SHIFT 0x2
+#define PLL_IDCLK_CNTL__PLL_TMDP_IDCLK_DIFF_EN_MASK 0x8
+#define PLL_IDCLK_CNTL__PLL_TMDP_IDCLK_DIFF_EN__SHIFT 0x3
+#define PLL_IDCLK_CNTL__PLL_IDCLK_EN_MASK 0x10
+#define PLL_IDCLK_CNTL__PLL_IDCLK_EN__SHIFT 0x4
+#define PLL_IDCLK_CNTL__PLL_DIFF_POST_DIV_RESET_MASK 0x100
+#define PLL_IDCLK_CNTL__PLL_DIFF_POST_DIV_RESET__SHIFT 0x8
+#define PLL_IDCLK_CNTL__PLL_DIFF_POST_DIV_SELECT_MASK 0x1000
+#define PLL_IDCLK_CNTL__PLL_DIFF_POST_DIV_SELECT__SHIFT 0xc
+#define PLL_IDCLK_CNTL__PLL_DIFF_POST_DIV_MASK 0xf0000
+#define PLL_IDCLK_CNTL__PLL_DIFF_POST_DIV__SHIFT 0x10
+#define PLL_IDCLK_CNTL__PLL_CUR_LTDP_MASK 0x300000
+#define PLL_IDCLK_CNTL__PLL_CUR_LTDP__SHIFT 0x14
+#define PLL_IDCLK_CNTL__PLL_CUR_PREDRV_MASK 0xc00000
+#define PLL_IDCLK_CNTL__PLL_CUR_PREDRV__SHIFT 0x16
+#define PLL_IDCLK_CNTL__PLL_CUR_TMDP_MASK 0x3000000
+#define PLL_IDCLK_CNTL__PLL_CUR_TMDP__SHIFT 0x18
+#define PLL_IDCLK_CNTL__PLL_CML_A_DRVSTR_MASK 0xc000000
+#define PLL_IDCLK_CNTL__PLL_CML_A_DRVSTR__SHIFT 0x1a
+#define PLL_IDCLK_CNTL__PLL_CML_B_DRVSTR_MASK 0x30000000
+#define PLL_IDCLK_CNTL__PLL_CML_B_DRVSTR__SHIFT 0x1c
+#define PLL_CNTL__PLL_RESET_MASK 0x1
+#define PLL_CNTL__PLL_RESET__SHIFT 0x0
+#define PLL_CNTL__PLL_POWER_DOWN_MASK 0x2
+#define PLL_CNTL__PLL_POWER_DOWN__SHIFT 0x1
+#define PLL_CNTL__PLL_BYPASS_CAL_MASK 0x4
+#define PLL_CNTL__PLL_BYPASS_CAL__SHIFT 0x2
+#define PLL_CNTL__PLL_POST_DIV_SRC_MASK 0x8
+#define PLL_CNTL__PLL_POST_DIV_SRC__SHIFT 0x3
+#define PLL_CNTL__PLL_VCOREF_MASK 0x30
+#define PLL_CNTL__PLL_VCOREF__SHIFT 0x4
+#define PLL_CNTL__PLL_PCIE_REFCLK_SEL_MASK 0x40
+#define PLL_CNTL__PLL_PCIE_REFCLK_SEL__SHIFT 0x6
+#define PLL_CNTL__PLL_ANTIGLITCH_RESETB_MASK 0x80
+#define PLL_CNTL__PLL_ANTIGLITCH_RESETB__SHIFT 0x7
+#define PLL_CNTL__PLL_CALREF_MASK 0x300
+#define PLL_CNTL__PLL_CALREF__SHIFT 0x8
+#define PLL_CNTL__PLL_CAL_BYPASS_REFDIV_MASK 0x400
+#define PLL_CNTL__PLL_CAL_BYPASS_REFDIV__SHIFT 0xa
+#define PLL_CNTL__PLL_REFCLK_SEL_MASK 0x1800
+#define PLL_CNTL__PLL_REFCLK_SEL__SHIFT 0xb
+#define PLL_CNTL__PLL_ANTI_GLITCH_RESET_MASK 0x2000
+#define PLL_CNTL__PLL_ANTI_GLITCH_RESET__SHIFT 0xd
+#define PLL_CNTL__PLL_XOCLK_DRV_R_EN_MASK 0x4000
+#define PLL_CNTL__PLL_XOCLK_DRV_R_EN__SHIFT 0xe
+#define PLL_CNTL__PLL_REF_DIV_SRC_MASK 0x70000
+#define PLL_CNTL__PLL_REF_DIV_SRC__SHIFT 0x10
+#define PLL_CNTL__PLL_LOCK_FREQ_SEL_MASK 0x80000
+#define PLL_CNTL__PLL_LOCK_FREQ_SEL__SHIFT 0x13
+#define PLL_CNTL__PLL_CALIB_DONE_MASK 0x100000
+#define PLL_CNTL__PLL_CALIB_DONE__SHIFT 0x14
+#define PLL_CNTL__PLL_LOCKED_MASK 0x200000
+#define PLL_CNTL__PLL_LOCKED__SHIFT 0x15
+#define PLL_CNTL__PLL_REFCLK_RECV_EN_MASK 0x400000
+#define PLL_CNTL__PLL_REFCLK_RECV_EN__SHIFT 0x16
+#define PLL_CNTL__PLL_REFCLK_RECV_SEL_MASK 0x800000
+#define PLL_CNTL__PLL_REFCLK_RECV_SEL__SHIFT 0x17
+#define PLL_CNTL__PLL_TIMING_MODE_STATUS_MASK 0x3000000
+#define PLL_CNTL__PLL_TIMING_MODE_STATUS__SHIFT 0x18
+#define PLL_CNTL__PLL_DIG_SPARE_MASK 0xfc000000
+#define PLL_CNTL__PLL_DIG_SPARE__SHIFT 0x1a
+#define PLL_ANALOG__PLL_CAL_MODE_MASK 0x1f
+#define PLL_ANALOG__PLL_CAL_MODE__SHIFT 0x0
+#define PLL_ANALOG__PLL_PFD_PULSE_SEL_MASK 0x60
+#define PLL_ANALOG__PLL_PFD_PULSE_SEL__SHIFT 0x5
+#define PLL_ANALOG__PLL_CP_MASK 0xf00
+#define PLL_ANALOG__PLL_CP__SHIFT 0x8
+#define PLL_ANALOG__PLL_LF_MODE_MASK 0x1ff000
+#define PLL_ANALOG__PLL_LF_MODE__SHIFT 0xc
+#define PLL_ANALOG__PLL_VREG_FB_TRIM_MASK 0xe00000
+#define PLL_ANALOG__PLL_VREG_FB_TRIM__SHIFT 0x15
+#define PLL_ANALOG__PLL_IBIAS_MASK 0xff000000
+#define PLL_ANALOG__PLL_IBIAS__SHIFT 0x18
+#define PLL_VREG_CNTL__PLL_VREG_CNTL_MASK 0xfffff
+#define PLL_VREG_CNTL__PLL_VREG_CNTL__SHIFT 0x0
+#define PLL_VREG_CNTL__PLL_BG_VREG_BIAS_MASK 0x300000
+#define PLL_VREG_CNTL__PLL_BG_VREG_BIAS__SHIFT 0x14
+#define PLL_VREG_CNTL__PLL_VREF_SEL_MASK 0x4000000
+#define PLL_VREG_CNTL__PLL_VREF_SEL__SHIFT 0x1a
+#define PLL_VREG_CNTL__PLL_VREG_BIAS_MASK 0xf0000000
+#define PLL_VREG_CNTL__PLL_VREG_BIAS__SHIFT 0x1c
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCK_DETECT_ENABLE_MASK 0x1
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCK_DETECT_ENABLE__SHIFT 0x0
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCK_DET_RES100_SELECT_MASK 0x2
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCK_DET_RES100_SELECT__SHIFT 0x1
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCK_STICKY_STATUS_MASK 0x4
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCK_STICKY_STATUS__SHIFT 0x2
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCK_DET_COUNT_MASK 0x70
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCK_DET_COUNT__SHIFT 0x4
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCKED_STICKY_RST_TEST_MASK 0x80
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCKED_STICKY_RST_TEST__SHIFT 0x7
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCKED_STICKY_TEST_READBACK_MASK 0x100
+#define PLL_UNLOCK_DETECT_CNTL__PLL_UNLOCKED_STICKY_TEST_READBACK__SHIFT 0x8
+#define PLL_DEBUG_CNTL__PLL_DEBUG_SIGNALS_ENABLE_MASK 0x1
+#define PLL_DEBUG_CNTL__PLL_DEBUG_SIGNALS_ENABLE__SHIFT 0x0
+#define PLL_DEBUG_CNTL__PLL_DEBUG_MUXOUT_SEL_MASK 0xf0
+#define PLL_DEBUG_CNTL__PLL_DEBUG_MUXOUT_SEL__SHIFT 0x4
+#define PLL_DEBUG_CNTL__PLL_DEBUG_CLK_SEL_MASK 0x1f00
+#define PLL_DEBUG_CNTL__PLL_DEBUG_CLK_SEL__SHIFT 0x8
+#define PLL_DEBUG_CNTL__PLL_DEBUG_ADC_CNTL_MASK 0xff0000
+#define PLL_DEBUG_CNTL__PLL_DEBUG_ADC_CNTL__SHIFT 0x10
+#define PLL_DEBUG_CNTL__PLL_DEBUG_ADC_READBACK_MASK 0x7000000
+#define PLL_DEBUG_CNTL__PLL_DEBUG_ADC_READBACK__SHIFT 0x18
+#define PLL_DEBUG_CNTL__PLL_DEBUG_ADC_EN_MASK 0x8000000
+#define PLL_DEBUG_CNTL__PLL_DEBUG_ADC_EN__SHIFT 0x1b
+#define PLL_UPDATE_LOCK__PLL_UPDATE_LOCK_MASK 0x1
+#define PLL_UPDATE_LOCK__PLL_UPDATE_LOCK__SHIFT 0x0
+#define PLL_UPDATE_CNTL__PLL_UPDATE_PENDING_MASK 0x1
+#define PLL_UPDATE_CNTL__PLL_UPDATE_PENDING__SHIFT 0x0
+#define PLL_UPDATE_CNTL__PLL_UPDATE_POINT_MASK 0x100
+#define PLL_UPDATE_CNTL__PLL_UPDATE_POINT__SHIFT 0x8
+#define PLL_UPDATE_CNTL__PLL_AUTO_RESET_DISABLE_MASK 0x10000
+#define PLL_UPDATE_CNTL__PLL_AUTO_RESET_DISABLE__SHIFT 0x10
+#define PLL_XOR_LOCK__PLL_XOR_LOCK_MASK 0x1
+#define PLL_XOR_LOCK__PLL_XOR_LOCK__SHIFT 0x0
+#define PLL_XOR_LOCK__PLL_XOR_LOCK_READBACK_MASK 0x2
+#define PLL_XOR_LOCK__PLL_XOR_LOCK_READBACK__SHIFT 0x1
+#define PLL_XOR_LOCK__PLL_SPARE_MASK 0x3f00
+#define PLL_XOR_LOCK__PLL_SPARE__SHIFT 0x8
+#define PLL_XOR_LOCK__PLL_LOCK_COUNT_SEL_MASK 0xf0000
+#define PLL_XOR_LOCK__PLL_LOCK_COUNT_SEL__SHIFT 0x10
+#define PLL_XOR_LOCK__PLL_LOCK_DETECTOR_RESOLUTION_FREF_MASK 0x700000
+#define PLL_XOR_LOCK__PLL_LOCK_DETECTOR_RESOLUTION_FREF__SHIFT 0x14
+#define PLL_XOR_LOCK__PLL_LOCK_DETECTOR_RESOLUTION_FFB_MASK 0x3800000
+#define PLL_XOR_LOCK__PLL_LOCK_DETECTOR_RESOLUTION_FFB__SHIFT 0x17
+#define PLL_XOR_LOCK__PLL_LOCK_DETECTOR_OPAMP_BIAS_MASK 0xc000000
+#define PLL_XOR_LOCK__PLL_LOCK_DETECTOR_OPAMP_BIAS__SHIFT 0x1a
+#define PLL_XOR_LOCK__PLL_FAST_LOCK_MODE_EN_MASK 0x10000000
+#define PLL_XOR_LOCK__PLL_FAST_LOCK_MODE_EN__SHIFT 0x1c
+#define PLL_ANALOG_CNTL__PLL_ANALOG_TEST_EN_MASK 0x1
+#define PLL_ANALOG_CNTL__PLL_ANALOG_TEST_EN__SHIFT 0x0
+#define PLL_ANALOG_CNTL__PLL_ANALOG_MUX_CNTL_MASK 0x1e
+#define PLL_ANALOG_CNTL__PLL_ANALOG_MUX_CNTL__SHIFT 0x1
+#define PLL_ANALOG_CNTL__PLL_ANALOGOUT_MUX_CNTL_MASK 0x1e0
+#define PLL_ANALOG_CNTL__PLL_ANALOGOUT_MUX_CNTL__SHIFT 0x5
+#define PLL_ANALOG_CNTL__PLL_REGREF_TRIM_MASK 0x3e00
+#define PLL_ANALOG_CNTL__PLL_REGREF_TRIM__SHIFT 0x9
+#define PLL_ANALOG_CNTL__PLL_CALIB_FBDIV_MASK 0x1c000
+#define PLL_ANALOG_CNTL__PLL_CALIB_FBDIV__SHIFT 0xe
+#define PLL_ANALOG_CNTL__PLL_CALIB_FASTCAL_MASK 0x20000
+#define PLL_ANALOG_CNTL__PLL_CALIB_FASTCAL__SHIFT 0x11
+#define PLL_ANALOG_CNTL__PLL_TEST_SSAMP_EN_MASK 0x40000
+#define PLL_ANALOG_CNTL__PLL_TEST_SSAMP_EN__SHIFT 0x12
+#define VGA25_PPLL_REF_DIV__VGA25_PPLL_REF_DIV_MASK 0x3ff
+#define VGA25_PPLL_REF_DIV__VGA25_PPLL_REF_DIV__SHIFT 0x0
+#define VGA28_PPLL_REF_DIV__VGA28_PPLL_REF_DIV_MASK 0x3ff
+#define VGA28_PPLL_REF_DIV__VGA28_PPLL_REF_DIV__SHIFT 0x0
+#define VGA41_PPLL_REF_DIV__VGA41_PPLL_REF_DIV_MASK 0x3ff
+#define VGA41_PPLL_REF_DIV__VGA41_PPLL_REF_DIV__SHIFT 0x0
+#define VGA25_PPLL_FB_DIV__VGA25_PPLL_FB_DIV_FRACTION_MASK 0xf
+#define VGA25_PPLL_FB_DIV__VGA25_PPLL_FB_DIV_FRACTION__SHIFT 0x0
+#define VGA25_PPLL_FB_DIV__VGA25_PPLL_FB_DIV_FRACTION_CNTL_MASK 0x30
+#define VGA25_PPLL_FB_DIV__VGA25_PPLL_FB_DIV_FRACTION_CNTL__SHIFT 0x4
+#define VGA25_PPLL_FB_DIV__VGA25_PPLL_FB_DIV_MASK 0x7ff0000
+#define VGA25_PPLL_FB_DIV__VGA25_PPLL_FB_DIV__SHIFT 0x10
+#define VGA28_PPLL_FB_DIV__VGA28_PPLL_FB_DIV_FRACTION_MASK 0xf
+#define VGA28_PPLL_FB_DIV__VGA28_PPLL_FB_DIV_FRACTION__SHIFT 0x0
+#define VGA28_PPLL_FB_DIV__VGA28_PPLL_FB_DIV_FRACTION_CNTL_MASK 0x30
+#define VGA28_PPLL_FB_DIV__VGA28_PPLL_FB_DIV_FRACTION_CNTL__SHIFT 0x4
+#define VGA28_PPLL_FB_DIV__VGA28_PPLL_FB_DIV_MASK 0x7ff0000
+#define VGA28_PPLL_FB_DIV__VGA28_PPLL_FB_DIV__SHIFT 0x10
+#define VGA41_PPLL_FB_DIV__VGA41_PPLL_FB_DIV_FRACTION_MASK 0xf
+#define VGA41_PPLL_FB_DIV__VGA41_PPLL_FB_DIV_FRACTION__SHIFT 0x0
+#define VGA41_PPLL_FB_DIV__VGA41_PPLL_FB_DIV_FRACTION_CNTL_MASK 0x30
+#define VGA41_PPLL_FB_DIV__VGA41_PPLL_FB_DIV_FRACTION_CNTL__SHIFT 0x4
+#define VGA41_PPLL_FB_DIV__VGA41_PPLL_FB_DIV_MASK 0x7ff0000
+#define VGA41_PPLL_FB_DIV__VGA41_PPLL_FB_DIV__SHIFT 0x10
+#define VGA25_PPLL_POST_DIV__VGA25_PPLL_POST_DIV_PIXCLK_MASK 0x7f
+#define VGA25_PPLL_POST_DIV__VGA25_PPLL_POST_DIV_PIXCLK__SHIFT 0x0
+#define VGA25_PPLL_POST_DIV__VGA25_PPLL_POST_DIV_DVOCLK_MASK 0x7f00
+#define VGA25_PPLL_POST_DIV__VGA25_PPLL_POST_DIV_DVOCLK__SHIFT 0x8
+#define VGA25_PPLL_POST_DIV__VGA25_PPLL_POST_DIV_IDCLK_MASK 0x7f0000
+#define VGA25_PPLL_POST_DIV__VGA25_PPLL_POST_DIV_IDCLK__SHIFT 0x10
+#define VGA28_PPLL_POST_DIV__VGA28_PPLL_POST_DIV_PIXCLK_MASK 0x7f
+#define VGA28_PPLL_POST_DIV__VGA28_PPLL_POST_DIV_PIXCLK__SHIFT 0x0
+#define VGA28_PPLL_POST_DIV__VGA28_PPLL_POST_DIV_DVOCLK_MASK 0x7f00
+#define VGA28_PPLL_POST_DIV__VGA28_PPLL_POST_DIV_DVOCLK__SHIFT 0x8
+#define VGA28_PPLL_POST_DIV__VGA28_PPLL_POST_DIV_IDCLK_MASK 0x7f0000
+#define VGA28_PPLL_POST_DIV__VGA28_PPLL_POST_DIV_IDCLK__SHIFT 0x10
+#define VGA41_PPLL_POST_DIV__VGA41_PPLL_POST_DIV_PIXCLK_MASK 0x7f
+#define VGA41_PPLL_POST_DIV__VGA41_PPLL_POST_DIV_PIXCLK__SHIFT 0x0
+#define VGA41_PPLL_POST_DIV__VGA41_PPLL_POST_DIV_DVOCLK_MASK 0x7f00
+#define VGA41_PPLL_POST_DIV__VGA41_PPLL_POST_DIV_DVOCLK__SHIFT 0x8
+#define VGA41_PPLL_POST_DIV__VGA41_PPLL_POST_DIV_IDCLK_MASK 0x7f0000
+#define VGA41_PPLL_POST_DIV__VGA41_PPLL_POST_DIV_IDCLK__SHIFT 0x10
+#define VGA25_PPLL_ANALOG__VGA25_CAL_MODE_MASK 0x1f
+#define VGA25_PPLL_ANALOG__VGA25_CAL_MODE__SHIFT 0x0
+#define VGA25_PPLL_ANALOG__VGA25_PPLL_PFD_PULSE_SEL_MASK 0x60
+#define VGA25_PPLL_ANALOG__VGA25_PPLL_PFD_PULSE_SEL__SHIFT 0x5
+#define VGA25_PPLL_ANALOG__VGA25_PPLL_CP_MASK 0xf00
+#define VGA25_PPLL_ANALOG__VGA25_PPLL_CP__SHIFT 0x8
+#define VGA25_PPLL_ANALOG__VGA25_PPLL_LF_MODE_MASK 0x1ff000
+#define VGA25_PPLL_ANALOG__VGA25_PPLL_LF_MODE__SHIFT 0xc
+#define VGA25_PPLL_ANALOG__VGA25_PPLL_IBIAS_MASK 0xff000000
+#define VGA25_PPLL_ANALOG__VGA25_PPLL_IBIAS__SHIFT 0x18
+#define VGA28_PPLL_ANALOG__VGA28_CAL_MODE_MASK 0x1f
+#define VGA28_PPLL_ANALOG__VGA28_CAL_MODE__SHIFT 0x0
+#define VGA28_PPLL_ANALOG__VGA28_PPLL_PFD_PULSE_SEL_MASK 0x60
+#define VGA28_PPLL_ANALOG__VGA28_PPLL_PFD_PULSE_SEL__SHIFT 0x5
+#define VGA28_PPLL_ANALOG__VGA28_PPLL_CP_MASK 0xf00
+#define VGA28_PPLL_ANALOG__VGA28_PPLL_CP__SHIFT 0x8
+#define VGA28_PPLL_ANALOG__VGA28_PPLL_LF_MODE_MASK 0x1ff000
+#define VGA28_PPLL_ANALOG__VGA28_PPLL_LF_MODE__SHIFT 0xc
+#define VGA28_PPLL_ANALOG__VGA28_PPLL_IBIAS_MASK 0xff000000
+#define VGA28_PPLL_ANALOG__VGA28_PPLL_IBIAS__SHIFT 0x18
+#define VGA41_PPLL_ANALOG__VGA41_CAL_MODE_MASK 0x1f
+#define VGA41_PPLL_ANALOG__VGA41_CAL_MODE__SHIFT 0x0
+#define VGA41_PPLL_ANALOG__VGA41_PPLL_PFD_PULSE_SEL_MASK 0x60
+#define VGA41_PPLL_ANALOG__VGA41_PPLL_PFD_PULSE_SEL__SHIFT 0x5
+#define VGA41_PPLL_ANALOG__VGA41_PPLL_CP_MASK 0xf00
+#define VGA41_PPLL_ANALOG__VGA41_PPLL_CP__SHIFT 0x8
+#define VGA41_PPLL_ANALOG__VGA41_PPLL_LF_MODE_MASK 0x1ff000
+#define VGA41_PPLL_ANALOG__VGA41_PPLL_LF_MODE__SHIFT 0xc
+#define VGA41_PPLL_ANALOG__VGA41_PPLL_IBIAS_MASK 0xff000000
+#define VGA41_PPLL_ANALOG__VGA41_PPLL_IBIAS__SHIFT 0x18
+#define DISPPLL_BG_CNTL__DISPPLL_BG_PDN_MASK 0x1
+#define DISPPLL_BG_CNTL__DISPPLL_BG_PDN__SHIFT 0x0
+#define DISPPLL_BG_CNTL__DISPPLL_BG_ADJ_MASK 0xf0
+#define DISPPLL_BG_CNTL__DISPPLL_BG_ADJ__SHIFT 0x4
+#define PPLL_DIV_UPDATE_DEBUG__PLL_REF_DIV_CHANGED_MASK 0x1
+#define PPLL_DIV_UPDATE_DEBUG__PLL_REF_DIV_CHANGED__SHIFT 0x0
+#define PPLL_DIV_UPDATE_DEBUG__PLL_FB_DIV_CHANGED_MASK 0x2
+#define PPLL_DIV_UPDATE_DEBUG__PLL_FB_DIV_CHANGED__SHIFT 0x1
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_PENDING_MASK 0x4
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_PENDING__SHIFT 0x2
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_CURRENT_STATE_MASK 0x18
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_CURRENT_STATE__SHIFT 0x3
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_ENABLE_MASK 0x20
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_ENABLE__SHIFT 0x5
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_REQ_MASK 0x40
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_REQ__SHIFT 0x6
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_ACK_MASK 0x80
+#define PPLL_DIV_UPDATE_DEBUG__PLL_UPDATE_ACK__SHIFT 0x7
+#define PPLL_STATUS_DEBUG__PLL_DEBUG_BUS_MASK 0xffff
+#define PPLL_STATUS_DEBUG__PLL_DEBUG_BUS__SHIFT 0x0
+#define PPLL_STATUS_DEBUG__PLL_UNLOCK_MASK 0x10000
+#define PPLL_STATUS_DEBUG__PLL_UNLOCK__SHIFT 0x10
+#define PPLL_STATUS_DEBUG__PLL_CAL_RESULT_MASK 0x1e0000
+#define PPLL_STATUS_DEBUG__PLL_CAL_RESULT__SHIFT 0x11
+#define PPLL_STATUS_DEBUG__PLL_POWERGOOD_ISO_ENB_MASK 0x1000000
+#define PPLL_STATUS_DEBUG__PLL_POWERGOOD_ISO_ENB__SHIFT 0x18
+#define PPLL_STATUS_DEBUG__PLL_POWERGOOD_S_MASK 0x2000000
+#define PPLL_STATUS_DEBUG__PLL_POWERGOOD_S__SHIFT 0x19
+#define PPLL_STATUS_DEBUG__PLL_POWERGOOD_V_MASK 0x4000000
+#define PPLL_STATUS_DEBUG__PLL_POWERGOOD_V__SHIFT 0x1a
+#define PPLL_DEBUG_MUX_CNTL__DEBUG_BUS_MUX_SEL_MASK 0x1f
+#define PPLL_DEBUG_MUX_CNTL__DEBUG_BUS_MUX_SEL__SHIFT 0x0
+#define PPLL_SPARE0__PLL_SPARE0_MASK 0xffffffff
+#define PPLL_SPARE0__PLL_SPARE0__SHIFT 0x0
+#define PPLL_SPARE1__PLL_SPARE1_MASK 0xffffffff
+#define PPLL_SPARE1__PLL_SPARE1__SHIFT 0x0
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR0_MASK 0x7
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR0__SHIFT 0x0
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR1_MASK 0x70
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR1__SHIFT 0x4
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR2_MASK 0x700
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR2__SHIFT 0x8
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR3_MASK 0x7000
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR3__SHIFT 0xc
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR4_MASK 0x70000
+#define UNIPHY_TX_CONTROL1__UNIPHY_PREMPH_STR4__SHIFT 0x10
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS0_MASK 0x300000
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS0__SHIFT 0x14
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS1_MASK 0xc00000
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS1__SHIFT 0x16
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS2_MASK 0x3000000
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS2__SHIFT 0x18
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS3_MASK 0xc000000
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS3__SHIFT 0x1a
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS4_MASK 0x30000000
+#define UNIPHY_TX_CONTROL1__UNIPHY_TX_VS4__SHIFT 0x1c
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH0_PC_MASK 0x3
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH0_PC__SHIFT 0x0
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH1_PC_MASK 0x30
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH1_PC__SHIFT 0x4
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH2_PC_MASK 0x300
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH2_PC__SHIFT 0x8
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH3_PC_MASK 0x3000
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH3_PC__SHIFT 0xc
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH4_PC_MASK 0x30000
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH4_PC__SHIFT 0x10
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH_SEL_MASK 0x100000
+#define UNIPHY_TX_CONTROL2__UNIPHY_PREMPH_SEL__SHIFT 0x14
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT0_CPSEL_MASK 0x600000
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT0_CPSEL__SHIFT 0x15
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT1_CPSEL_MASK 0x1800000
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT1_CPSEL__SHIFT 0x17
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT2_CPSEL_MASK 0x6000000
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT2_CPSEL__SHIFT 0x19
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT3_CPSEL_MASK 0x18000000
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT3_CPSEL__SHIFT 0x1b
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT4_CPSEL_MASK 0x60000000
+#define UNIPHY_TX_CONTROL2__UNIPHY_RT4_CPSEL__SHIFT 0x1d
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_PW_CLK_MASK 0x3
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_PW_CLK__SHIFT 0x0
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_PW_DAT_MASK 0xc
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_PW_DAT__SHIFT 0x2
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_CS_CLK_MASK 0xf0
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_CS_CLK__SHIFT 0x4
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_CS_DAT_MASK 0xf00
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_CS_DAT__SHIFT 0x8
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_STR_CLK_MASK 0xf000
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_STR_CLK__SHIFT 0xc
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_STR_DAT_MASK 0xf0000
+#define UNIPHY_TX_CONTROL3__UNIPHY_PREMPH_STR_DAT__SHIFT 0x10
+#define UNIPHY_TX_CONTROL3__UNIPHY_PESEL0_MASK 0x100000
+#define UNIPHY_TX_CONTROL3__UNIPHY_PESEL0__SHIFT 0x14
+#define UNIPHY_TX_CONTROL3__UNIPHY_PESEL1_MASK 0x200000
+#define UNIPHY_TX_CONTROL3__UNIPHY_PESEL1__SHIFT 0x15
+#define UNIPHY_TX_CONTROL3__UNIPHY_PESEL2_MASK 0x400000
+#define UNIPHY_TX_CONTROL3__UNIPHY_PESEL2__SHIFT 0x16
+#define UNIPHY_TX_CONTROL3__UNIPHY_PESEL3_MASK 0x800000
+#define UNIPHY_TX_CONTROL3__UNIPHY_PESEL3__SHIFT 0x17
+#define UNIPHY_TX_CONTROL3__UNIPHY_TX_VS_ADJ_MASK 0x1f000000
+#define UNIPHY_TX_CONTROL3__UNIPHY_TX_VS_ADJ__SHIFT 0x18
+#define UNIPHY_TX_CONTROL3__UNIPHY_LVDS_PULLDWN_MASK 0x80000000
+#define UNIPHY_TX_CONTROL3__UNIPHY_LVDS_PULLDWN__SHIFT 0x1f
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_NVS_CLK_MASK 0x1f
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_NVS_CLK__SHIFT 0x0
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_NVS_DAT_MASK 0x3e0
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_NVS_DAT__SHIFT 0x5
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_PVS_CLK_MASK 0x1f000
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_PVS_CLK__SHIFT 0xc
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_PVS_DAT_MASK 0x3e0000
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_PVS_DAT__SHIFT 0x11
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_OP_CLK_MASK 0x7000000
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_OP_CLK__SHIFT 0x18
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_OP_DAT_MASK 0x70000000
+#define UNIPHY_TX_CONTROL4__UNIPHY_TX_OP_DAT__SHIFT 0x1c
+#define UNIPHY_POWER_CONTROL__UNIPHY_BGPDN_MASK 0x1
+#define UNIPHY_POWER_CONTROL__UNIPHY_BGPDN__SHIFT 0x0
+#define UNIPHY_POWER_CONTROL__UNIPHY_RST_LOGIC_MASK 0x2
+#define UNIPHY_POWER_CONTROL__UNIPHY_RST_LOGIC__SHIFT 0x1
+#define UNIPHY_POWER_CONTROL__UNIPHY_BIASREF_SEL_MASK 0xc
+#define UNIPHY_POWER_CONTROL__UNIPHY_BIASREF_SEL__SHIFT 0x2
+#define UNIPHY_POWER_CONTROL__UNIPHY_BGADJ1P00_MASK 0xf00
+#define UNIPHY_POWER_CONTROL__UNIPHY_BGADJ1P00__SHIFT 0x8
+#define UNIPHY_POWER_CONTROL__UNIPHY_BGADJ1P25_MASK 0xf000
+#define UNIPHY_POWER_CONTROL__UNIPHY_BGADJ1P25__SHIFT 0xc
+#define UNIPHY_POWER_CONTROL__UNIPHY_BGADJ0P45_MASK 0xf0000
+#define UNIPHY_POWER_CONTROL__UNIPHY_BGADJ0P45__SHIFT 0x10
+#define UNIPHY_PLL_FBDIV__UNIPHY_PLL_FBDIV_FRACTION_MASK 0xfffc
+#define UNIPHY_PLL_FBDIV__UNIPHY_PLL_FBDIV_FRACTION__SHIFT 0x2
+#define UNIPHY_PLL_FBDIV__UNIPHY_PLL_FBDIV_MASK 0xfff0000
+#define UNIPHY_PLL_FBDIV__UNIPHY_PLL_FBDIV__SHIFT 0x10
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_ENABLE_MASK 0x1
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_ENABLE__SHIFT 0x0
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_RESET_MASK 0x2
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_RESET__SHIFT 0x1
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_EXT_RESET_EN_MASK 0x4
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_EXT_RESET_EN__SHIFT 0x2
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_CLK_EN_MASK 0x8
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_CLK_EN__SHIFT 0x3
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_CLKPH_EN_MASK 0xf0
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_CLKPH_EN__SHIFT 0x4
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_LF_CNTL_MASK 0x7f00
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_LF_CNTL__SHIFT 0x8
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_BW_CNTL_MASK 0xff0000
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_BW_CNTL__SHIFT 0x10
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_TEST_BYPCLK_SRC_MASK 0x1000000
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_TEST_BYPCLK_SRC__SHIFT 0x18
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_TEST_BYPCLK_EN_MASK 0x2000000
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_TEST_BYPCLK_EN__SHIFT 0x19
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_TEST_VCTL_ADC_EN_MASK 0x4000000
+#define UNIPHY_PLL_CONTROL1__UNIPHY_PLL_TEST_VCTL_ADC_EN__SHIFT 0x1a
+#define UNIPHY_PLL_CONTROL1__UNIPHY_VCO_MODE_MASK 0x30000000
+#define UNIPHY_PLL_CONTROL1__UNIPHY_VCO_MODE__SHIFT 0x1c
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_DISPCLK_MODE_MASK 0x3
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_DISPCLK_MODE__SHIFT 0x0
+#define UNIPHY_PLL_CONTROL2__UNIPHY_DPLLSEL_MASK 0xc
+#define UNIPHY_PLL_CONTROL2__UNIPHY_DPLLSEL__SHIFT 0x2
+#define UNIPHY_PLL_CONTROL2__UNIPHY_IDCLK_SEL_MASK 0x10
+#define UNIPHY_PLL_CONTROL2__UNIPHY_IDCLK_SEL__SHIFT 0x4
+#define UNIPHY_PLL_CONTROL2__UNIPHY_IPCIE_REFCLK_SEL_MASK 0x20
+#define UNIPHY_PLL_CONTROL2__UNIPHY_IPCIE_REFCLK_SEL__SHIFT 0x5
+#define UNIPHY_PLL_CONTROL2__UNIPHY_IXTALIN_SEL_MASK 0x40
+#define UNIPHY_PLL_CONTROL2__UNIPHY_IXTALIN_SEL__SHIFT 0x6
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_REFCLK_SRC_MASK 0x700
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_REFCLK_SRC__SHIFT 0x8
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PCIEREF_CLK_EN_MASK 0x800
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PCIEREF_CLK_EN__SHIFT 0xb
+#define UNIPHY_PLL_CONTROL2__UNIPHY_IDCLK_EN_MASK 0x1000
+#define UNIPHY_PLL_CONTROL2__UNIPHY_IDCLK_EN__SHIFT 0xc
+#define UNIPHY_PLL_CONTROL2__UNIPHY_CLKINV_MASK 0x2000
+#define UNIPHY_PLL_CONTROL2__UNIPHY_CLKINV__SHIFT 0xd
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_VTOI_BIAS_CNTL_MASK 0x10000
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_VTOI_BIAS_CNTL__SHIFT 0x10
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_TEST_FBDIV_FRAC_BYPASS_MASK 0x80000
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_TEST_FBDIV_FRAC_BYPASS__SHIFT 0x13
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PDIVFRAC_SEL_MASK 0x100000
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PDIVFRAC_SEL__SHIFT 0x14
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_REFDIV_MASK 0x1f000000
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PLL_REFDIV__SHIFT 0x18
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PDIV_SEL_MASK 0xe0000000
+#define UNIPHY_PLL_CONTROL2__UNIPHY_PDIV_SEL__SHIFT 0x1d
+#define UNIPHY_PLL_SS_STEP_SIZE__UNIPHY_PLL_SS_STEP_SIZE_MASK 0x3ffff

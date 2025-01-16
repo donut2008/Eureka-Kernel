@@ -1,986 +1,602 @@
+#ifndef _ASM_IA64_SN_TIO_TIOCA_H
+#define _ASM_IA64_SN_TIO_TIOCA_H
+
 /*
- * Cryptographic API.
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
  *
- * s390 implementation of the AES Cipher Algorithm.
- *
- * s390 Version:
- *   Copyright IBM Corp. 2005, 2007
- *   Author(s): Jan Glauber (jang@de.ibm.com)
- *		Sebastian Siewior (sebastian@breakpoint.cc> SW-Fallback
- *
- * Derived from "crypto/aes_generic.c"
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option)
- * any later version.
- *
+ * Copyright (c) 2003-2005 Silicon Graphics, Inc. All rights reserved.
  */
 
-#define KMSG_COMPONENT "aes_s390"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
-#include <crypto/aes.h>
-#include <crypto/algapi.h>
-#include <linux/err.h>
-#include <linux/module.h>
-#include <linux/cpufeature.h>
-#include <linux/init.h>
-#include <linux/spinlock.h>
-#include "crypt_s390.h"
+#define TIOCA_PART_NUM	0xE020
+#define TIOCA_MFGR_NUM	0x24
+#define TIOCA_REV_A	0x1
 
-#define AES_KEYLEN_128		1
-#define AES_KEYLEN_192		2
-#define AES_KEYLEN_256		4
+/*
+ * Register layout for TIO:CA.  See below for bitmasks for each register.
+ */
 
-static u8 *ctrblk;
-static DEFINE_SPINLOCK(ctrblk_lock);
-static char keylen_flag;
+struct tioca {
+	u64	ca_id;				/* 0x000000 */
+	u64	ca_control1;			/* 0x000008 */
+	u64	ca_control2;			/* 0x000010 */
+	u64	ca_status1;			/* 0x000018 */
+	u64	ca_status2;			/* 0x000020 */
+	u64	ca_gart_aperature;		/* 0x000028 */
+	u64	ca_gfx_detach;			/* 0x000030 */
+	u64	ca_inta_dest_addr;		/* 0x000038 */
+	u64	ca_intb_dest_addr;		/* 0x000040 */
+	u64	ca_err_int_dest_addr;		/* 0x000048 */
+	u64	ca_int_status;			/* 0x000050 */
+	u64	ca_int_status_alias;		/* 0x000058 */
+	u64	ca_mult_error;			/* 0x000060 */
+	u64	ca_mult_error_alias;		/* 0x000068 */
+	u64	ca_first_error;			/* 0x000070 */
+	u64	ca_int_mask;			/* 0x000078 */
+	u64	ca_crm_pkterr_type;		/* 0x000080 */
+	u64	ca_crm_pkterr_type_alias;	/* 0x000088 */
+	u64	ca_crm_ct_error_detail_1;	/* 0x000090 */
+	u64	ca_crm_ct_error_detail_2;	/* 0x000098 */
+	u64	ca_crm_tnumto;			/* 0x0000A0 */
+	u64	ca_gart_err;			/* 0x0000A8 */
+	u64	ca_pcierr_type;			/* 0x0000B0 */
+	u64	ca_pcierr_addr;			/* 0x0000B8 */
 
-struct s390_aes_ctx {
-	u8 key[AES_MAX_KEY_SIZE];
-	long enc;
-	long dec;
-	int key_len;
-	union {
-		struct crypto_blkcipher *blk;
-		struct crypto_cipher *cip;
-	} fallback;
-};
+	u64	ca_pad_0000C0[3];		/* 0x0000{C0..D0} */
 
-struct pcc_param {
-	u8 key[32];
-	u8 tweak[16];
-	u8 block[16];
-	u8 bit[16];
-	u8 xts[16];
-};
+	u64	ca_pci_rd_buf_flush;		/* 0x0000D8 */
+	u64	ca_pci_dma_addr_extn;		/* 0x0000E0 */
+	u64	ca_agp_dma_addr_extn;		/* 0x0000E8 */
+	u64	ca_force_inta;			/* 0x0000F0 */
+	u64	ca_force_intb;			/* 0x0000F8 */
+	u64	ca_debug_vector_sel;		/* 0x000100 */
+	u64	ca_debug_mux_core_sel;		/* 0x000108 */
+	u64	ca_debug_mux_pci_sel;		/* 0x000110 */
+	u64	ca_debug_domain_sel;		/* 0x000118 */
 
-struct s390_xts_ctx {
-	u8 key[32];
-	u8 pcc_key[32];
-	long enc;
-	long dec;
-	int key_len;
-	struct crypto_blkcipher *fallback;
+	u64	ca_pad_000120[28];		/* 0x0001{20..F8} */
+
+	u64	ca_gart_ptr_table;		/* 0x200 */
+	u64	ca_gart_tlb_addr[8];		/* 0x2{08..40} */
 };
 
 /*
- * Check if the key_len is supported by the HW.
- * Returns 0 if it is, a positive number if it is not and software fallback is
- * required or a negative number in case the key size is not valid
+ * Mask/shift definitions for TIO:CA registers.  The convention here is
+ * to mainly use the names as they appear in the "TIO AEGIS Programmers'
+ * Reference" with a CA_ prefix added.  Some exceptions were made to fix
+ * duplicate field names or to generalize fields that are common to
+ * different registers (ca_debug_mux_core_sel and ca_debug_mux_pci_sel for
+ * example).
+ *
+ * Fields consisting of a single bit have a single #define have a single
+ * macro declaration to mask the bit.  Fields consisting of multiple bits
+ * have two declarations: one to mask the proper bits in a register, and 
+ * a second with the suffix "_SHFT" to identify how far the mask needs to
+ * be shifted right to get its base value.
  */
-static int need_fallback(unsigned int key_len)
-{
-	switch (key_len) {
-	case 16:
-		if (!(keylen_flag & AES_KEYLEN_128))
-			return 1;
-		break;
-	case 24:
-		if (!(keylen_flag & AES_KEYLEN_192))
-			return 1;
-		break;
-	case 32:
-		if (!(keylen_flag & AES_KEYLEN_256))
-			return 1;
-		break;
-	default:
-		return -1;
-		break;
-	}
-	return 0;
-}
-
-static int setkey_fallback_cip(struct crypto_tfm *tfm, const u8 *in_key,
-		unsigned int key_len)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-	int ret;
-
-	sctx->fallback.cip->base.crt_flags &= ~CRYPTO_TFM_REQ_MASK;
-	sctx->fallback.cip->base.crt_flags |= (tfm->crt_flags &
-			CRYPTO_TFM_REQ_MASK);
-
-	ret = crypto_cipher_setkey(sctx->fallback.cip, in_key, key_len);
-	if (ret) {
-		tfm->crt_flags &= ~CRYPTO_TFM_RES_MASK;
-		tfm->crt_flags |= (sctx->fallback.cip->base.crt_flags &
-				CRYPTO_TFM_RES_MASK);
-	}
-	return ret;
-}
-
-static int aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
-		       unsigned int key_len)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-	u32 *flags = &tfm->crt_flags;
-	int ret;
-
-	ret = need_fallback(key_len);
-	if (ret < 0) {
-		*flags |= CRYPTO_TFM_RES_BAD_KEY_LEN;
-		return -EINVAL;
-	}
-
-	sctx->key_len = key_len;
-	if (!ret) {
-		memcpy(sctx->key, in_key, key_len);
-		return 0;
-	}
-
-	return setkey_fallback_cip(tfm, in_key, key_len);
-}
-
-static void aes_encrypt(struct crypto_tfm *tfm, u8 *out, const u8 *in)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-
-	if (unlikely(need_fallback(sctx->key_len))) {
-		crypto_cipher_encrypt_one(sctx->fallback.cip, out, in);
-		return;
-	}
-
-	switch (sctx->key_len) {
-	case 16:
-		crypt_s390_km(KM_AES_128_ENCRYPT, &sctx->key, out, in,
-			      AES_BLOCK_SIZE);
-		break;
-	case 24:
-		crypt_s390_km(KM_AES_192_ENCRYPT, &sctx->key, out, in,
-			      AES_BLOCK_SIZE);
-		break;
-	case 32:
-		crypt_s390_km(KM_AES_256_ENCRYPT, &sctx->key, out, in,
-			      AES_BLOCK_SIZE);
-		break;
-	}
-}
-
-static void aes_decrypt(struct crypto_tfm *tfm, u8 *out, const u8 *in)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-
-	if (unlikely(need_fallback(sctx->key_len))) {
-		crypto_cipher_decrypt_one(sctx->fallback.cip, out, in);
-		return;
-	}
-
-	switch (sctx->key_len) {
-	case 16:
-		crypt_s390_km(KM_AES_128_DECRYPT, &sctx->key, out, in,
-			      AES_BLOCK_SIZE);
-		break;
-	case 24:
-		crypt_s390_km(KM_AES_192_DECRYPT, &sctx->key, out, in,
-			      AES_BLOCK_SIZE);
-		break;
-	case 32:
-		crypt_s390_km(KM_AES_256_DECRYPT, &sctx->key, out, in,
-			      AES_BLOCK_SIZE);
-		break;
-	}
-}
-
-static int fallback_init_cip(struct crypto_tfm *tfm)
-{
-	const char *name = tfm->__crt_alg->cra_name;
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-
-	sctx->fallback.cip = crypto_alloc_cipher(name, 0,
-			CRYPTO_ALG_ASYNC | CRYPTO_ALG_NEED_FALLBACK);
-
-	if (IS_ERR(sctx->fallback.cip)) {
-		pr_err("Allocating AES fallback algorithm %s failed\n",
-		       name);
-		return PTR_ERR(sctx->fallback.cip);
-	}
-
-	return 0;
-}
-
-static void fallback_exit_cip(struct crypto_tfm *tfm)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-
-	crypto_free_cipher(sctx->fallback.cip);
-	sctx->fallback.cip = NULL;
-}
-
-static struct crypto_alg aes_alg = {
-	.cra_name		=	"aes",
-	.cra_driver_name	=	"aes-s390",
-	.cra_priority		=	CRYPT_S390_PRIORITY,
-	.cra_flags		=	CRYPTO_ALG_TYPE_CIPHER |
-					CRYPTO_ALG_NEED_FALLBACK,
-	.cra_blocksize		=	AES_BLOCK_SIZE,
-	.cra_ctxsize		=	sizeof(struct s390_aes_ctx),
-	.cra_module		=	THIS_MODULE,
-	.cra_init               =       fallback_init_cip,
-	.cra_exit               =       fallback_exit_cip,
-	.cra_u			=	{
-		.cipher = {
-			.cia_min_keysize	=	AES_MIN_KEY_SIZE,
-			.cia_max_keysize	=	AES_MAX_KEY_SIZE,
-			.cia_setkey		=	aes_set_key,
-			.cia_encrypt		=	aes_encrypt,
-			.cia_decrypt		=	aes_decrypt,
-		}
-	}
-};
-
-static int setkey_fallback_blk(struct crypto_tfm *tfm, const u8 *key,
-		unsigned int len)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-	unsigned int ret;
-
-	sctx->fallback.blk->base.crt_flags &= ~CRYPTO_TFM_REQ_MASK;
-	sctx->fallback.blk->base.crt_flags |= (tfm->crt_flags &
-			CRYPTO_TFM_REQ_MASK);
-
-	ret = crypto_blkcipher_setkey(sctx->fallback.blk, key, len);
-	if (ret) {
-		tfm->crt_flags &= ~CRYPTO_TFM_RES_MASK;
-		tfm->crt_flags |= (sctx->fallback.blk->base.crt_flags &
-				CRYPTO_TFM_RES_MASK);
-	}
-	return ret;
-}
-
-static int fallback_blk_dec(struct blkcipher_desc *desc,
-		struct scatterlist *dst, struct scatterlist *src,
-		unsigned int nbytes)
-{
-	unsigned int ret;
-	struct crypto_blkcipher *tfm;
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-
-	tfm = desc->tfm;
-	desc->tfm = sctx->fallback.blk;
-
-	ret = crypto_blkcipher_decrypt_iv(desc, dst, src, nbytes);
-
-	desc->tfm = tfm;
-	return ret;
-}
-
-static int fallback_blk_enc(struct blkcipher_desc *desc,
-		struct scatterlist *dst, struct scatterlist *src,
-		unsigned int nbytes)
-{
-	unsigned int ret;
-	struct crypto_blkcipher *tfm;
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-
-	tfm = desc->tfm;
-	desc->tfm = sctx->fallback.blk;
-
-	ret = crypto_blkcipher_encrypt_iv(desc, dst, src, nbytes);
-
-	desc->tfm = tfm;
-	return ret;
-}
-
-static int ecb_aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
-			   unsigned int key_len)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-	int ret;
-
-	ret = need_fallback(key_len);
-	if (ret > 0) {
-		sctx->key_len = key_len;
-		return setkey_fallback_blk(tfm, in_key, key_len);
-	}
-
-	switch (key_len) {
-	case 16:
-		sctx->enc = KM_AES_128_ENCRYPT;
-		sctx->dec = KM_AES_128_DECRYPT;
-		break;
-	case 24:
-		sctx->enc = KM_AES_192_ENCRYPT;
-		sctx->dec = KM_AES_192_DECRYPT;
-		break;
-	case 32:
-		sctx->enc = KM_AES_256_ENCRYPT;
-		sctx->dec = KM_AES_256_DECRYPT;
-		break;
-	}
-
-	return aes_set_key(tfm, in_key, key_len);
-}
-
-static int ecb_aes_crypt(struct blkcipher_desc *desc, long func, void *param,
-			 struct blkcipher_walk *walk)
-{
-	int ret = blkcipher_walk_virt(desc, walk);
-	unsigned int nbytes;
-
-	while ((nbytes = walk->nbytes)) {
-		/* only use complete blocks */
-		unsigned int n = nbytes & ~(AES_BLOCK_SIZE - 1);
-		u8 *out = walk->dst.virt.addr;
-		u8 *in = walk->src.virt.addr;
-
-		ret = crypt_s390_km(func, param, out, in, n);
-		if (ret < 0 || ret != n)
-			return -EIO;
-
-		nbytes &= AES_BLOCK_SIZE - 1;
-		ret = blkcipher_walk_done(desc, walk, nbytes);
-	}
-
-	return ret;
-}
-
-static int ecb_aes_encrypt(struct blkcipher_desc *desc,
-			   struct scatterlist *dst, struct scatterlist *src,
-			   unsigned int nbytes)
-{
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-	struct blkcipher_walk walk;
-
-	if (unlikely(need_fallback(sctx->key_len)))
-		return fallback_blk_enc(desc, dst, src, nbytes);
-
-	blkcipher_walk_init(&walk, dst, src, nbytes);
-	return ecb_aes_crypt(desc, sctx->enc, sctx->key, &walk);
-}
-
-static int ecb_aes_decrypt(struct blkcipher_desc *desc,
-			   struct scatterlist *dst, struct scatterlist *src,
-			   unsigned int nbytes)
-{
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-	struct blkcipher_walk walk;
-
-	if (unlikely(need_fallback(sctx->key_len)))
-		return fallback_blk_dec(desc, dst, src, nbytes);
-
-	blkcipher_walk_init(&walk, dst, src, nbytes);
-	return ecb_aes_crypt(desc, sctx->dec, sctx->key, &walk);
-}
-
-static int fallback_init_blk(struct crypto_tfm *tfm)
-{
-	const char *name = tfm->__crt_alg->cra_name;
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-
-	sctx->fallback.blk = crypto_alloc_blkcipher(name, 0,
-			CRYPTO_ALG_ASYNC | CRYPTO_ALG_NEED_FALLBACK);
-
-	if (IS_ERR(sctx->fallback.blk)) {
-		pr_err("Allocating AES fallback algorithm %s failed\n",
-		       name);
-		return PTR_ERR(sctx->fallback.blk);
-	}
-
-	return 0;
-}
-
-static void fallback_exit_blk(struct crypto_tfm *tfm)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-
-	crypto_free_blkcipher(sctx->fallback.blk);
-	sctx->fallback.blk = NULL;
-}
-
-static struct crypto_alg ecb_aes_alg = {
-	.cra_name		=	"ecb(aes)",
-	.cra_driver_name	=	"ecb-aes-s390",
-	.cra_priority		=	CRYPT_S390_COMPOSITE_PRIORITY,
-	.cra_flags		=	CRYPTO_ALG_TYPE_BLKCIPHER |
-					CRYPTO_ALG_NEED_FALLBACK,
-	.cra_blocksize		=	AES_BLOCK_SIZE,
-	.cra_ctxsize		=	sizeof(struct s390_aes_ctx),
-	.cra_type		=	&crypto_blkcipher_type,
-	.cra_module		=	THIS_MODULE,
-	.cra_init		=	fallback_init_blk,
-	.cra_exit		=	fallback_exit_blk,
-	.cra_u			=	{
-		.blkcipher = {
-			.min_keysize		=	AES_MIN_KEY_SIZE,
-			.max_keysize		=	AES_MAX_KEY_SIZE,
-			.setkey			=	ecb_aes_set_key,
-			.encrypt		=	ecb_aes_encrypt,
-			.decrypt		=	ecb_aes_decrypt,
-		}
-	}
-};
-
-static int cbc_aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
-			   unsigned int key_len)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-	int ret;
-
-	ret = need_fallback(key_len);
-	if (ret > 0) {
-		sctx->key_len = key_len;
-		return setkey_fallback_blk(tfm, in_key, key_len);
-	}
-
-	switch (key_len) {
-	case 16:
-		sctx->enc = KMC_AES_128_ENCRYPT;
-		sctx->dec = KMC_AES_128_DECRYPT;
-		break;
-	case 24:
-		sctx->enc = KMC_AES_192_ENCRYPT;
-		sctx->dec = KMC_AES_192_DECRYPT;
-		break;
-	case 32:
-		sctx->enc = KMC_AES_256_ENCRYPT;
-		sctx->dec = KMC_AES_256_DECRYPT;
-		break;
-	}
-
-	return aes_set_key(tfm, in_key, key_len);
-}
-
-static int cbc_aes_crypt(struct blkcipher_desc *desc, long func,
-			 struct blkcipher_walk *walk)
-{
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-	int ret = blkcipher_walk_virt(desc, walk);
-	unsigned int nbytes = walk->nbytes;
-	struct {
-		u8 iv[AES_BLOCK_SIZE];
-		u8 key[AES_MAX_KEY_SIZE];
-	} param;
-
-	if (!nbytes)
-		goto out;
-
-	memcpy(param.iv, walk->iv, AES_BLOCK_SIZE);
-	memcpy(param.key, sctx->key, sctx->key_len);
-	do {
-		/* only use complete blocks */
-		unsigned int n = nbytes & ~(AES_BLOCK_SIZE - 1);
-		u8 *out = walk->dst.virt.addr;
-		u8 *in = walk->src.virt.addr;
-
-		ret = crypt_s390_kmc(func, &param, out, in, n);
-		if (ret < 0 || ret != n)
-			return -EIO;
-
-		nbytes &= AES_BLOCK_SIZE - 1;
-		ret = blkcipher_walk_done(desc, walk, nbytes);
-	} while ((nbytes = walk->nbytes));
-	memcpy(walk->iv, param.iv, AES_BLOCK_SIZE);
-
-out:
-	return ret;
-}
-
-static int cbc_aes_encrypt(struct blkcipher_desc *desc,
-			   struct scatterlist *dst, struct scatterlist *src,
-			   unsigned int nbytes)
-{
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-	struct blkcipher_walk walk;
-
-	if (unlikely(need_fallback(sctx->key_len)))
-		return fallback_blk_enc(desc, dst, src, nbytes);
-
-	blkcipher_walk_init(&walk, dst, src, nbytes);
-	return cbc_aes_crypt(desc, sctx->enc, &walk);
-}
-
-static int cbc_aes_decrypt(struct blkcipher_desc *desc,
-			   struct scatterlist *dst, struct scatterlist *src,
-			   unsigned int nbytes)
-{
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-	struct blkcipher_walk walk;
-
-	if (unlikely(need_fallback(sctx->key_len)))
-		return fallback_blk_dec(desc, dst, src, nbytes);
-
-	blkcipher_walk_init(&walk, dst, src, nbytes);
-	return cbc_aes_crypt(desc, sctx->dec, &walk);
-}
-
-static struct crypto_alg cbc_aes_alg = {
-	.cra_name		=	"cbc(aes)",
-	.cra_driver_name	=	"cbc-aes-s390",
-	.cra_priority		=	CRYPT_S390_COMPOSITE_PRIORITY,
-	.cra_flags		=	CRYPTO_ALG_TYPE_BLKCIPHER |
-					CRYPTO_ALG_NEED_FALLBACK,
-	.cra_blocksize		=	AES_BLOCK_SIZE,
-	.cra_ctxsize		=	sizeof(struct s390_aes_ctx),
-	.cra_type		=	&crypto_blkcipher_type,
-	.cra_module		=	THIS_MODULE,
-	.cra_init		=	fallback_init_blk,
-	.cra_exit		=	fallback_exit_blk,
-	.cra_u			=	{
-		.blkcipher = {
-			.min_keysize		=	AES_MIN_KEY_SIZE,
-			.max_keysize		=	AES_MAX_KEY_SIZE,
-			.ivsize			=	AES_BLOCK_SIZE,
-			.setkey			=	cbc_aes_set_key,
-			.encrypt		=	cbc_aes_encrypt,
-			.decrypt		=	cbc_aes_decrypt,
-		}
-	}
-};
-
-static int xts_fallback_setkey(struct crypto_tfm *tfm, const u8 *key,
-				   unsigned int len)
-{
-	struct s390_xts_ctx *xts_ctx = crypto_tfm_ctx(tfm);
-	unsigned int ret;
-
-	xts_ctx->fallback->base.crt_flags &= ~CRYPTO_TFM_REQ_MASK;
-	xts_ctx->fallback->base.crt_flags |= (tfm->crt_flags &
-			CRYPTO_TFM_REQ_MASK);
-
-	ret = crypto_blkcipher_setkey(xts_ctx->fallback, key, len);
-	if (ret) {
-		tfm->crt_flags &= ~CRYPTO_TFM_RES_MASK;
-		tfm->crt_flags |= (xts_ctx->fallback->base.crt_flags &
-				CRYPTO_TFM_RES_MASK);
-	}
-	return ret;
-}
-
-static int xts_fallback_decrypt(struct blkcipher_desc *desc,
-		struct scatterlist *dst, struct scatterlist *src,
-		unsigned int nbytes)
-{
-	struct s390_xts_ctx *xts_ctx = crypto_blkcipher_ctx(desc->tfm);
-	struct crypto_blkcipher *tfm;
-	unsigned int ret;
-
-	tfm = desc->tfm;
-	desc->tfm = xts_ctx->fallback;
-
-	ret = crypto_blkcipher_decrypt_iv(desc, dst, src, nbytes);
-
-	desc->tfm = tfm;
-	return ret;
-}
-
-static int xts_fallback_encrypt(struct blkcipher_desc *desc,
-		struct scatterlist *dst, struct scatterlist *src,
-		unsigned int nbytes)
-{
-	struct s390_xts_ctx *xts_ctx = crypto_blkcipher_ctx(desc->tfm);
-	struct crypto_blkcipher *tfm;
-	unsigned int ret;
-
-	tfm = desc->tfm;
-	desc->tfm = xts_ctx->fallback;
-
-	ret = crypto_blkcipher_encrypt_iv(desc, dst, src, nbytes);
-
-	desc->tfm = tfm;
-	return ret;
-}
-
-static int xts_aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
-			   unsigned int key_len)
-{
-	struct s390_xts_ctx *xts_ctx = crypto_tfm_ctx(tfm);
-	u32 *flags = &tfm->crt_flags;
-
-	switch (key_len) {
-	case 32:
-		xts_ctx->enc = KM_XTS_128_ENCRYPT;
-		xts_ctx->dec = KM_XTS_128_DECRYPT;
-		memcpy(xts_ctx->key + 16, in_key, 16);
-		memcpy(xts_ctx->pcc_key + 16, in_key + 16, 16);
-		break;
-	case 48:
-		xts_ctx->enc = 0;
-		xts_ctx->dec = 0;
-		xts_fallback_setkey(tfm, in_key, key_len);
-		break;
-	case 64:
-		xts_ctx->enc = KM_XTS_256_ENCRYPT;
-		xts_ctx->dec = KM_XTS_256_DECRYPT;
-		memcpy(xts_ctx->key, in_key, 32);
-		memcpy(xts_ctx->pcc_key, in_key + 32, 32);
-		break;
-	default:
-		*flags |= CRYPTO_TFM_RES_BAD_KEY_LEN;
-		return -EINVAL;
-	}
-	xts_ctx->key_len = key_len;
-	return 0;
-}
-
-static int xts_aes_crypt(struct blkcipher_desc *desc, long func,
-			 struct s390_xts_ctx *xts_ctx,
-			 struct blkcipher_walk *walk)
-{
-	unsigned int offset = (xts_ctx->key_len >> 1) & 0x10;
-	int ret = blkcipher_walk_virt(desc, walk);
-	unsigned int nbytes = walk->nbytes;
-	unsigned int n;
-	u8 *in, *out;
-	struct pcc_param pcc_param;
-	struct {
-		u8 key[32];
-		u8 init[16];
-	} xts_param;
-
-	if (!nbytes)
-		goto out;
-
-	memset(pcc_param.block, 0, sizeof(pcc_param.block));
-	memset(pcc_param.bit, 0, sizeof(pcc_param.bit));
-	memset(pcc_param.xts, 0, sizeof(pcc_param.xts));
-	memcpy(pcc_param.tweak, walk->iv, sizeof(pcc_param.tweak));
-	memcpy(pcc_param.key, xts_ctx->pcc_key, 32);
-	ret = crypt_s390_pcc(func, &pcc_param.key[offset]);
-	if (ret < 0)
-		return -EIO;
-
-	memcpy(xts_param.key, xts_ctx->key, 32);
-	memcpy(xts_param.init, pcc_param.xts, 16);
-	do {
-		/* only use complete blocks */
-		n = nbytes & ~(AES_BLOCK_SIZE - 1);
-		out = walk->dst.virt.addr;
-		in = walk->src.virt.addr;
-
-		ret = crypt_s390_km(func, &xts_param.key[offset], out, in, n);
-		if (ret < 0 || ret != n)
-			return -EIO;
-
-		nbytes &= AES_BLOCK_SIZE - 1;
-		ret = blkcipher_walk_done(desc, walk, nbytes);
-	} while ((nbytes = walk->nbytes));
-out:
-	return ret;
-}
-
-static int xts_aes_encrypt(struct blkcipher_desc *desc,
-			   struct scatterlist *dst, struct scatterlist *src,
-			   unsigned int nbytes)
-{
-	struct s390_xts_ctx *xts_ctx = crypto_blkcipher_ctx(desc->tfm);
-	struct blkcipher_walk walk;
-
-	if (unlikely(xts_ctx->key_len == 48))
-		return xts_fallback_encrypt(desc, dst, src, nbytes);
-
-	blkcipher_walk_init(&walk, dst, src, nbytes);
-	return xts_aes_crypt(desc, xts_ctx->enc, xts_ctx, &walk);
-}
-
-static int xts_aes_decrypt(struct blkcipher_desc *desc,
-			   struct scatterlist *dst, struct scatterlist *src,
-			   unsigned int nbytes)
-{
-	struct s390_xts_ctx *xts_ctx = crypto_blkcipher_ctx(desc->tfm);
-	struct blkcipher_walk walk;
-
-	if (unlikely(xts_ctx->key_len == 48))
-		return xts_fallback_decrypt(desc, dst, src, nbytes);
-
-	blkcipher_walk_init(&walk, dst, src, nbytes);
-	return xts_aes_crypt(desc, xts_ctx->dec, xts_ctx, &walk);
-}
-
-static int xts_fallback_init(struct crypto_tfm *tfm)
-{
-	const char *name = tfm->__crt_alg->cra_name;
-	struct s390_xts_ctx *xts_ctx = crypto_tfm_ctx(tfm);
-
-	xts_ctx->fallback = crypto_alloc_blkcipher(name, 0,
-			CRYPTO_ALG_ASYNC | CRYPTO_ALG_NEED_FALLBACK);
-
-	if (IS_ERR(xts_ctx->fallback)) {
-		pr_err("Allocating XTS fallback algorithm %s failed\n",
-		       name);
-		return PTR_ERR(xts_ctx->fallback);
-	}
-	return 0;
-}
-
-static void xts_fallback_exit(struct crypto_tfm *tfm)
-{
-	struct s390_xts_ctx *xts_ctx = crypto_tfm_ctx(tfm);
-
-	crypto_free_blkcipher(xts_ctx->fallback);
-	xts_ctx->fallback = NULL;
-}
-
-static struct crypto_alg xts_aes_alg = {
-	.cra_name		=	"xts(aes)",
-	.cra_driver_name	=	"xts-aes-s390",
-	.cra_priority		=	CRYPT_S390_COMPOSITE_PRIORITY,
-	.cra_flags		=	CRYPTO_ALG_TYPE_BLKCIPHER |
-					CRYPTO_ALG_NEED_FALLBACK,
-	.cra_blocksize		=	AES_BLOCK_SIZE,
-	.cra_ctxsize		=	sizeof(struct s390_xts_ctx),
-	.cra_type		=	&crypto_blkcipher_type,
-	.cra_module		=	THIS_MODULE,
-	.cra_init		=	xts_fallback_init,
-	.cra_exit		=	xts_fallback_exit,
-	.cra_u			=	{
-		.blkcipher = {
-			.min_keysize		=	2 * AES_MIN_KEY_SIZE,
-			.max_keysize		=	2 * AES_MAX_KEY_SIZE,
-			.ivsize			=	AES_BLOCK_SIZE,
-			.setkey			=	xts_aes_set_key,
-			.encrypt		=	xts_aes_encrypt,
-			.decrypt		=	xts_aes_decrypt,
-		}
-	}
-};
-
-static int xts_aes_alg_reg;
-
-static int ctr_aes_set_key(struct crypto_tfm *tfm, const u8 *in_key,
-			   unsigned int key_len)
-{
-	struct s390_aes_ctx *sctx = crypto_tfm_ctx(tfm);
-
-	switch (key_len) {
-	case 16:
-		sctx->enc = KMCTR_AES_128_ENCRYPT;
-		sctx->dec = KMCTR_AES_128_DECRYPT;
-		break;
-	case 24:
-		sctx->enc = KMCTR_AES_192_ENCRYPT;
-		sctx->dec = KMCTR_AES_192_DECRYPT;
-		break;
-	case 32:
-		sctx->enc = KMCTR_AES_256_ENCRYPT;
-		sctx->dec = KMCTR_AES_256_DECRYPT;
-		break;
-	}
-
-	return aes_set_key(tfm, in_key, key_len);
-}
-
-static unsigned int __ctrblk_init(u8 *ctrptr, unsigned int nbytes)
-{
-	unsigned int i, n;
-
-	/* only use complete blocks, max. PAGE_SIZE */
-	n = (nbytes > PAGE_SIZE) ? PAGE_SIZE : nbytes & ~(AES_BLOCK_SIZE - 1);
-	for (i = AES_BLOCK_SIZE; i < n; i += AES_BLOCK_SIZE) {
-		memcpy(ctrptr + i, ctrptr + i - AES_BLOCK_SIZE,
-		       AES_BLOCK_SIZE);
-		crypto_inc(ctrptr + i, AES_BLOCK_SIZE);
-	}
-	return n;
-}
-
-static int ctr_aes_crypt(struct blkcipher_desc *desc, long func,
-			 struct s390_aes_ctx *sctx, struct blkcipher_walk *walk)
-{
-	int ret = blkcipher_walk_virt_block(desc, walk, AES_BLOCK_SIZE);
-	unsigned int n, nbytes;
-	u8 buf[AES_BLOCK_SIZE], ctrbuf[AES_BLOCK_SIZE];
-	u8 *out, *in, *ctrptr = ctrbuf;
-
-	if (!walk->nbytes)
-		return ret;
-
-	if (spin_trylock(&ctrblk_lock))
-		ctrptr = ctrblk;
-
-	memcpy(ctrptr, walk->iv, AES_BLOCK_SIZE);
-	while ((nbytes = walk->nbytes) >= AES_BLOCK_SIZE) {
-		out = walk->dst.virt.addr;
-		in = walk->src.virt.addr;
-		while (nbytes >= AES_BLOCK_SIZE) {
-			if (ctrptr == ctrblk)
-				n = __ctrblk_init(ctrptr, nbytes);
-			else
-				n = AES_BLOCK_SIZE;
-			ret = crypt_s390_kmctr(func, sctx->key, out, in,
-					       n, ctrptr);
-			if (ret < 0 || ret != n) {
-				if (ctrptr == ctrblk)
-					spin_unlock(&ctrblk_lock);
-				return -EIO;
-			}
-			if (n > AES_BLOCK_SIZE)
-				memcpy(ctrptr, ctrptr + n - AES_BLOCK_SIZE,
-				       AES_BLOCK_SIZE);
-			crypto_inc(ctrptr, AES_BLOCK_SIZE);
-			out += n;
-			in += n;
-			nbytes -= n;
-		}
-		ret = blkcipher_walk_done(desc, walk, nbytes);
-	}
-	if (ctrptr == ctrblk) {
-		if (nbytes)
-			memcpy(ctrbuf, ctrptr, AES_BLOCK_SIZE);
-		else
-			memcpy(walk->iv, ctrptr, AES_BLOCK_SIZE);
-		spin_unlock(&ctrblk_lock);
-	} else {
-		if (!nbytes)
-			memcpy(walk->iv, ctrptr, AES_BLOCK_SIZE);
-	}
-	/*
-	 * final block may be < AES_BLOCK_SIZE, copy only nbytes
-	 */
-	if (nbytes) {
-		out = walk->dst.virt.addr;
-		in = walk->src.virt.addr;
-		ret = crypt_s390_kmctr(func, sctx->key, buf, in,
-				       AES_BLOCK_SIZE, ctrbuf);
-		if (ret < 0 || ret != AES_BLOCK_SIZE)
-			return -EIO;
-		memcpy(out, buf, nbytes);
-		crypto_inc(ctrbuf, AES_BLOCK_SIZE);
-		ret = blkcipher_walk_done(desc, walk, 0);
-		memcpy(walk->iv, ctrbuf, AES_BLOCK_SIZE);
-	}
-
-	return ret;
-}
-
-static int ctr_aes_encrypt(struct blkcipher_desc *desc,
-			   struct scatterlist *dst, struct scatterlist *src,
-			   unsigned int nbytes)
-{
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-	struct blkcipher_walk walk;
-
-	blkcipher_walk_init(&walk, dst, src, nbytes);
-	return ctr_aes_crypt(desc, sctx->enc, sctx, &walk);
-}
-
-static int ctr_aes_decrypt(struct blkcipher_desc *desc,
-			   struct scatterlist *dst, struct scatterlist *src,
-			   unsigned int nbytes)
-{
-	struct s390_aes_ctx *sctx = crypto_blkcipher_ctx(desc->tfm);
-	struct blkcipher_walk walk;
-
-	blkcipher_walk_init(&walk, dst, src, nbytes);
-	return ctr_aes_crypt(desc, sctx->dec, sctx, &walk);
-}
-
-static struct crypto_alg ctr_aes_alg = {
-	.cra_name		=	"ctr(aes)",
-	.cra_driver_name	=	"ctr-aes-s390",
-	.cra_priority		=	CRYPT_S390_COMPOSITE_PRIORITY,
-	.cra_flags		=	CRYPTO_ALG_TYPE_BLKCIPHER,
-	.cra_blocksize		=	1,
-	.cra_ctxsize		=	sizeof(struct s390_aes_ctx),
-	.cra_type		=	&crypto_blkcipher_type,
-	.cra_module		=	THIS_MODULE,
-	.cra_u			=	{
-		.blkcipher = {
-			.min_keysize		=	AES_MIN_KEY_SIZE,
-			.max_keysize		=	AES_MAX_KEY_SIZE,
-			.ivsize			=	AES_BLOCK_SIZE,
-			.setkey			=	ctr_aes_set_key,
-			.encrypt		=	ctr_aes_encrypt,
-			.decrypt		=	ctr_aes_decrypt,
-		}
-	}
-};
-
-static int ctr_aes_alg_reg;
-
-static int __init aes_s390_init(void)
-{
-	int ret;
-
-	if (crypt_s390_func_available(KM_AES_128_ENCRYPT, CRYPT_S390_MSA))
-		keylen_flag |= AES_KEYLEN_128;
-	if (crypt_s390_func_available(KM_AES_192_ENCRYPT, CRYPT_S390_MSA))
-		keylen_flag |= AES_KEYLEN_192;
-	if (crypt_s390_func_available(KM_AES_256_ENCRYPT, CRYPT_S390_MSA))
-		keylen_flag |= AES_KEYLEN_256;
-
-	if (!keylen_flag)
-		return -EOPNOTSUPP;
-
-	/* z9 109 and z9 BC/EC only support 128 bit key length */
-	if (keylen_flag == AES_KEYLEN_128)
-		pr_info("AES hardware acceleration is only available for"
-			" 128-bit keys\n");
-
-	ret = crypto_register_alg(&aes_alg);
-	if (ret)
-		goto aes_err;
-
-	ret = crypto_register_alg(&ecb_aes_alg);
-	if (ret)
-		goto ecb_aes_err;
-
-	ret = crypto_register_alg(&cbc_aes_alg);
-	if (ret)
-		goto cbc_aes_err;
-
-	if (crypt_s390_func_available(KM_XTS_128_ENCRYPT,
-			CRYPT_S390_MSA | CRYPT_S390_MSA4) &&
-	    crypt_s390_func_available(KM_XTS_256_ENCRYPT,
-			CRYPT_S390_MSA | CRYPT_S390_MSA4)) {
-		ret = crypto_register_alg(&xts_aes_alg);
-		if (ret)
-			goto xts_aes_err;
-		xts_aes_alg_reg = 1;
-	}
-
-	if (crypt_s390_func_available(KMCTR_AES_128_ENCRYPT,
-				CRYPT_S390_MSA | CRYPT_S390_MSA4) &&
-	    crypt_s390_func_available(KMCTR_AES_192_ENCRYPT,
-				CRYPT_S390_MSA | CRYPT_S390_MSA4) &&
-	    crypt_s390_func_available(KMCTR_AES_256_ENCRYPT,
-				CRYPT_S390_MSA | CRYPT_S390_MSA4)) {
-		ctrblk = (u8 *) __get_free_page(GFP_KERNEL);
-		if (!ctrblk) {
-			ret = -ENOMEM;
-			goto ctr_aes_err;
-		}
-		ret = crypto_register_alg(&ctr_aes_alg);
-		if (ret) {
-			free_page((unsigned long) ctrblk);
-			goto ctr_aes_err;
-		}
-		ctr_aes_alg_reg = 1;
-	}
-
-out:
-	return ret;
-
-ctr_aes_err:
-	crypto_unregister_alg(&xts_aes_alg);
-xts_aes_err:
-	crypto_unregister_alg(&cbc_aes_alg);
-cbc_aes_err:
-	crypto_unregister_alg(&ecb_aes_alg);
-ecb_aes_err:
-	crypto_unregister_alg(&aes_alg);
-aes_err:
-	goto out;
-}
-
-static void __exit aes_s390_fini(void)
-{
-	if (ctr_aes_alg_reg) {
-		crypto_unregister_alg(&ctr_aes_alg);
-		free_page((unsigned long) ctrblk);
-	}
-	if (xts_aes_alg_reg)
-		crypto_unregister_alg(&xts_aes_alg);
-	crypto_unregister_alg(&cbc_aes_alg);
-	crypto_unregister_alg(&ecb_aes_alg);
-	crypto_unregister_alg(&aes_alg);
-}
-
-module_cpu_feature_match(MSA, aes_s390_init);
-module_exit(aes_s390_fini);
-
-MODULE_ALIAS_CRYPTO("aes-all");
-
-MODULE_DESCRIPTION("Rijndael (AES) Cipher Algorithm");
-MODULE_LICENSE("GPL");
+
+/* ==== ca_control1 */
+#define CA_SYS_BIG_END			(1ull << 0)
+#define CA_DMA_AGP_SWAP			(1ull << 1)
+#define CA_DMA_PCI_SWAP			(1ull << 2)
+#define CA_PIO_IO_SWAP			(1ull << 3)
+#define CA_PIO_MEM_SWAP			(1ull << 4)
+#define CA_GFX_WR_SWAP			(1ull << 5)
+#define CA_AGP_FW_ENABLE		(1ull << 6)
+#define CA_AGP_CAL_CYCLE		(0x7ull << 7)
+#define CA_AGP_CAL_CYCLE_SHFT		7
+#define CA_AGP_CAL_PRSCL_BYP		(1ull << 10)
+#define CA_AGP_INIT_CAL_ENB		(1ull << 11)
+#define CA_INJ_ADDR_PERR		(1ull << 12)
+#define CA_INJ_DATA_PERR		(1ull << 13)
+	/* bits 15:14 unused */
+#define CA_PCIM_IO_NBE_AD		(0x7ull << 16)
+#define CA_PCIM_IO_NBE_AD_SHFT		16
+#define CA_PCIM_FAST_BTB_ENB		(1ull << 19)
+	/* bits 23:20 unused */
+#define CA_PIO_ADDR_OFFSET		(0xffull << 24)
+#define CA_PIO_ADDR_OFFSET_SHFT		24
+	/* bits 35:32 unused */
+#define CA_AGPDMA_OP_COMBDELAY		(0x1full << 36)
+#define CA_AGPDMA_OP_COMBDELAY_SHFT	36
+	/* bit 41 unused */
+#define CA_AGPDMA_OP_ENB_COMBDELAY	(1ull << 42)
+#define	CA_PCI_INT_LPCNT		(0xffull << 44)
+#define CA_PCI_INT_LPCNT_SHFT		44
+	/* bits 63:52 unused */
+
+/* ==== ca_control2 */
+#define CA_AGP_LATENCY_TO		(0xffull << 0)
+#define CA_AGP_LATENCY_TO_SHFT		0
+#define CA_PCI_LATENCY_TO		(0xffull << 8)
+#define CA_PCI_LATENCY_TO_SHFT		8
+#define CA_PCI_MAX_RETRY		(0x3ffull << 16)
+#define CA_PCI_MAX_RETRY_SHFT		16
+	/* bits 27:26 unused */
+#define CA_RT_INT_EN			(0x3ull << 28)
+#define CA_RT_INT_EN_SHFT			28
+#define CA_MSI_INT_ENB			(1ull << 30)
+#define CA_PCI_ARB_ERR_ENB		(1ull << 31)
+#define CA_GART_MEM_PARAM		(0x3ull << 32)
+#define CA_GART_MEM_PARAM_SHFT		32
+#define CA_GART_RD_PREFETCH_ENB		(1ull << 34)
+#define CA_GART_WR_PREFETCH_ENB		(1ull << 35)
+#define CA_GART_FLUSH_TLB		(1ull << 36)
+	/* bits 39:37 unused */
+#define CA_CRM_TNUMTO_PERIOD		(0x1fffull << 40)
+#define CA_CRM_TNUMTO_PERIOD_SHFT	40
+	/* bits 55:53 unused */
+#define CA_CRM_TNUMTO_ENB		(1ull << 56)
+#define CA_CRM_PRESCALER_BYP		(1ull << 57)
+	/* bits 59:58 unused */
+#define CA_CRM_MAX_CREDIT		(0x7ull << 60)
+#define CA_CRM_MAX_CREDIT_SHFT		60
+	/* bit 63 unused */
+
+/* ==== ca_status1 */
+#define CA_CORELET_ID			(0x3ull << 0)
+#define CA_CORELET_ID_SHFT		0
+#define CA_INTA_N			(1ull << 2)
+#define CA_INTB_N			(1ull << 3)
+#define CA_CRM_CREDIT_AVAIL		(0x7ull << 4)
+#define CA_CRM_CREDIT_AVAIL_SHFT	4
+	/* bit 7 unused */
+#define CA_CRM_SPACE_AVAIL		(0x7full << 8)
+#define CA_CRM_SPACE_AVAIL_SHFT		8
+	/* bit 15 unused */
+#define CA_GART_TLB_VAL			(0xffull << 16)
+#define CA_GART_TLB_VAL_SHFT		16
+	/* bits 63:24 unused */
+
+/* ==== ca_status2 */
+#define CA_GFX_CREDIT_AVAIL		(0xffull << 0)
+#define CA_GFX_CREDIT_AVAIL_SHFT	0
+#define CA_GFX_OPQ_AVAIL		(0xffull << 8)
+#define CA_GFX_OPQ_AVAIL_SHFT		8
+#define CA_GFX_WRBUFF_AVAIL		(0xffull << 16)
+#define CA_GFX_WRBUFF_AVAIL_SHFT	16
+#define CA_ADMA_OPQ_AVAIL		(0xffull << 24)
+#define CA_ADMA_OPQ_AVAIL_SHFT		24
+#define CA_ADMA_WRBUFF_AVAIL		(0xffull << 32)
+#define CA_ADMA_WRBUFF_AVAIL_SHFT	32
+#define CA_ADMA_RDBUFF_AVAIL		(0x7full << 40)
+#define CA_ADMA_RDBUFF_AVAIL_SHFT	40
+#define CA_PCI_PIO_OP_STAT		(1ull << 47)
+#define CA_PDMA_OPQ_AVAIL		(0xfull << 48)
+#define CA_PDMA_OPQ_AVAIL_SHFT		48
+#define CA_PDMA_WRBUFF_AVAIL		(0xfull << 52)
+#define CA_PDMA_WRBUFF_AVAIL_SHFT	52
+#define CA_PDMA_RDBUFF_AVAIL		(0x3ull << 56)
+#define CA_PDMA_RDBUFF_AVAIL_SHFT	56
+	/* bits 63:58 unused */
+
+/* ==== ca_gart_aperature */
+#define CA_GART_AP_ENB_AGP		(1ull << 0)
+#define CA_GART_PAGE_SIZE		(1ull << 1)
+#define CA_GART_AP_ENB_PCI		(1ull << 2)
+	/* bits 11:3 unused */
+#define CA_GART_AP_SIZE			(0x3ffull << 12)
+#define CA_GART_AP_SIZE_SHFT		12
+#define CA_GART_AP_BASE			(0x3ffffffffffull << 22)
+#define CA_GART_AP_BASE_SHFT		22
+
+/* ==== ca_inta_dest_addr
+   ==== ca_intb_dest_addr 
+   ==== ca_err_int_dest_addr */
+	/* bits 2:0 unused */
+#define CA_INT_DEST_ADDR		(0x7ffffffffffffull << 3)
+#define CA_INT_DEST_ADDR_SHFT		3
+	/* bits 55:54 unused */
+#define CA_INT_DEST_VECT		(0xffull << 56)
+#define CA_INT_DEST_VECT_SHFT		56
+
+/* ==== ca_int_status */
+/* ==== ca_int_status_alias */
+/* ==== ca_mult_error */
+/* ==== ca_mult_error_alias */
+/* ==== ca_first_error */
+/* ==== ca_int_mask */
+#define CA_PCI_ERR			(1ull << 0)
+	/* bits 3:1 unused */
+#define CA_GART_FETCH_ERR		(1ull << 4)
+#define CA_GFX_WR_OVFLW			(1ull << 5)
+#define CA_PIO_REQ_OVFLW		(1ull << 6)
+#define CA_CRM_PKTERR			(1ull << 7)
+#define CA_CRM_DVERR			(1ull << 8)
+#define CA_TNUMTO			(1ull << 9)
+#define CA_CXM_RSP_CRED_OVFLW		(1ull << 10)
+#define CA_CXM_REQ_CRED_OVFLW		(1ull << 11)
+#define CA_PIO_INVALID_ADDR		(1ull << 12)
+#define CA_PCI_ARB_TO			(1ull << 13)
+#define CA_AGP_REQ_OFLOW		(1ull << 14)
+#define CA_SBA_TYPE1_ERR		(1ull << 15)
+	/* bit 16 unused */
+#define CA_INTA				(1ull << 17)
+#define CA_INTB				(1ull << 18)
+#define CA_MULT_INTA			(1ull << 19)
+#define CA_MULT_INTB			(1ull << 20)
+#define CA_GFX_CREDIT_OVFLW		(1ull << 21)
+	/* bits 63:22 unused */
+
+/* ==== ca_crm_pkterr_type */
+/* ==== ca_crm_pkterr_type_alias */
+#define CA_CRM_PKTERR_SBERR_HDR		(1ull << 0)
+#define CA_CRM_PKTERR_DIDN		(1ull << 1)
+#define CA_CRM_PKTERR_PACTYPE		(1ull << 2)
+#define CA_CRM_PKTERR_INV_TNUM		(1ull << 3)
+#define CA_CRM_PKTERR_ADDR_RNG		(1ull << 4)
+#define CA_CRM_PKTERR_ADDR_ALGN		(1ull << 5)
+#define CA_CRM_PKTERR_HDR_PARAM		(1ull << 6)
+#define CA_CRM_PKTERR_CW_ERR		(1ull << 7)
+#define CA_CRM_PKTERR_SBERR_NH		(1ull << 8)
+#define CA_CRM_PKTERR_EARLY_TERM	(1ull << 9)
+#define CA_CRM_PKTERR_EARLY_TAIL	(1ull << 10)
+#define CA_CRM_PKTERR_MSSNG_TAIL	(1ull << 11)
+#define CA_CRM_PKTERR_MSSNG_HDR		(1ull << 12)
+	/* bits 15:13 unused */
+#define CA_FIRST_CRM_PKTERR_SBERR_HDR	(1ull << 16)
+#define CA_FIRST_CRM_PKTERR_DIDN	(1ull << 17)
+#define CA_FIRST_CRM_PKTERR_PACTYPE	(1ull << 18)
+#define CA_FIRST_CRM_PKTERR_INV_TNUM	(1ull << 19)
+#define CA_FIRST_CRM_PKTERR_ADDR_RNG	(1ull << 20)
+#define CA_FIRST_CRM_PKTERR_ADDR_ALGN	(1ull << 21)
+#define CA_FIRST_CRM_PKTERR_HDR_PARAM	(1ull << 22)
+#define CA_FIRST_CRM_PKTERR_CW_ERR	(1ull << 23)
+#define CA_FIRST_CRM_PKTERR_SBERR_NH	(1ull << 24)
+#define CA_FIRST_CRM_PKTERR_EARLY_TERM	(1ull << 25)
+#define CA_FIRST_CRM_PKTERR_EARLY_TAIL	(1ull << 26)
+#define CA_FIRST_CRM_PKTERR_MSSNG_TAIL	(1ull << 27)
+#define CA_FIRST_CRM_PKTERR_MSSNG_HDR	(1ull << 28)
+	/* bits 63:29 unused */
+
+/* ==== ca_crm_ct_error_detail_1 */
+#define CA_PKT_TYPE			(0xfull << 0)
+#define CA_PKT_TYPE_SHFT		0
+#define CA_SRC_ID			(0x3ull << 4)
+#define CA_SRC_ID_SHFT			4
+#define CA_DATA_SZ			(0x3ull << 6)
+#define CA_DATA_SZ_SHFT			6
+#define CA_TNUM				(0xffull << 8)
+#define CA_TNUM_SHFT			8
+#define CA_DW_DATA_EN			(0xffull << 16)
+#define CA_DW_DATA_EN_SHFT		16
+#define CA_GFX_CRED			(0xffull << 24)
+#define CA_GFX_CRED_SHFT		24
+#define CA_MEM_RD_PARAM			(0x3ull << 32)
+#define CA_MEM_RD_PARAM_SHFT		32
+#define CA_PIO_OP			(1ull << 34)
+#define CA_CW_ERR			(1ull << 35)
+	/* bits 62:36 unused */
+#define CA_VALID			(1ull << 63)
+
+/* ==== ca_crm_ct_error_detail_2 */
+	/* bits 2:0 unused */
+#define CA_PKT_ADDR			(0x1fffffffffffffull << 3)
+#define CA_PKT_ADDR_SHFT		3
+	/* bits 63:56 unused */
+
+/* ==== ca_crm_tnumto */
+#define CA_CRM_TNUMTO_VAL		(0xffull << 0)
+#define CA_CRM_TNUMTO_VAL_SHFT		0
+#define CA_CRM_TNUMTO_WR		(1ull << 8)
+	/* bits 63:9 unused */
+
+/* ==== ca_gart_err */
+#define CA_GART_ERR_SOURCE		(0x3ull << 0)
+#define CA_GART_ERR_SOURCE_SHFT		0
+	/* bits 3:2 unused */
+#define CA_GART_ERR_ADDR		(0xfffffffffull << 4)
+#define CA_GART_ERR_ADDR_SHFT		4
+	/* bits 63:40 unused */
+
+/* ==== ca_pcierr_type */
+#define CA_PCIERR_DATA			(0xffffffffull << 0)
+#define CA_PCIERR_DATA_SHFT		0
+#define CA_PCIERR_ENB			(0xfull << 32)
+#define CA_PCIERR_ENB_SHFT		32
+#define CA_PCIERR_CMD			(0xfull << 36)
+#define CA_PCIERR_CMD_SHFT		36
+#define CA_PCIERR_A64			(1ull << 40)
+#define CA_PCIERR_SLV_SERR		(1ull << 41)
+#define CA_PCIERR_SLV_WR_PERR		(1ull << 42)
+#define CA_PCIERR_SLV_RD_PERR		(1ull << 43)
+#define CA_PCIERR_MST_SERR		(1ull << 44)
+#define CA_PCIERR_MST_WR_PERR		(1ull << 45)
+#define CA_PCIERR_MST_RD_PERR		(1ull << 46)
+#define CA_PCIERR_MST_MABT		(1ull << 47)
+#define CA_PCIERR_MST_TABT		(1ull << 48)
+#define CA_PCIERR_MST_RETRY_TOUT	(1ull << 49)
+
+#define CA_PCIERR_TYPES \
+	(CA_PCIERR_A64|CA_PCIERR_SLV_SERR| \
+	 CA_PCIERR_SLV_WR_PERR|CA_PCIERR_SLV_RD_PERR| \
+	 CA_PCIERR_MST_SERR|CA_PCIERR_MST_WR_PERR|CA_PCIERR_MST_RD_PERR| \
+	 CA_PCIERR_MST_MABT|CA_PCIERR_MST_TABT|CA_PCIERR_MST_RETRY_TOUT)
+
+	/* bits 63:50 unused */
+
+/* ==== ca_pci_dma_addr_extn */
+#define CA_UPPER_NODE_OFFSET		(0x3full << 0)
+#define CA_UPPER_NODE_OFFSET_SHFT	0
+	/* bits 7:6 unused */
+#define CA_CHIPLET_ID			(0x3ull << 8)
+#define CA_CHIPLET_ID_SHFT		8
+	/* bits 11:10 unused */
+#define CA_PCI_DMA_NODE_ID		(0xffffull << 12)
+#define CA_PCI_DMA_NODE_ID_SHFT		12
+	/* bits 27:26 unused */
+#define CA_PCI_DMA_PIO_MEM_TYPE		(1ull << 28)
+	/* bits 63:29 unused */
+
+
+/* ==== ca_agp_dma_addr_extn */
+	/* bits 19:0 unused */
+#define CA_AGP_DMA_NODE_ID		(0xffffull << 20)
+#define CA_AGP_DMA_NODE_ID_SHFT		20
+	/* bits 27:26 unused */
+#define CA_AGP_DMA_PIO_MEM_TYPE		(1ull << 28)
+	/* bits 63:29 unused */
+
+/* ==== ca_debug_vector_sel */
+#define CA_DEBUG_MN_VSEL		(0xfull << 0)
+#define CA_DEBUG_MN_VSEL_SHFT		0
+#define CA_DEBUG_PP_VSEL		(0xfull << 4)
+#define CA_DEBUG_PP_VSEL_SHFT		4
+#define CA_DEBUG_GW_VSEL		(0xfull << 8)
+#define CA_DEBUG_GW_VSEL_SHFT		8
+#define CA_DEBUG_GT_VSEL		(0xfull << 12)
+#define CA_DEBUG_GT_VSEL_SHFT		12
+#define CA_DEBUG_PD_VSEL		(0xfull << 16)
+#define CA_DEBUG_PD_VSEL_SHFT		16
+#define CA_DEBUG_AD_VSEL		(0xfull << 20)
+#define CA_DEBUG_AD_VSEL_SHFT		20
+#define CA_DEBUG_CX_VSEL		(0xfull << 24)
+#define CA_DEBUG_CX_VSEL_SHFT		24
+#define CA_DEBUG_CR_VSEL		(0xfull << 28)
+#define CA_DEBUG_CR_VSEL_SHFT		28
+#define CA_DEBUG_BA_VSEL		(0xfull << 32)
+#define CA_DEBUG_BA_VSEL_SHFT		32
+#define CA_DEBUG_PE_VSEL		(0xfull << 36)
+#define CA_DEBUG_PE_VSEL_SHFT		36
+#define CA_DEBUG_BO_VSEL		(0xfull << 40)
+#define CA_DEBUG_BO_VSEL_SHFT		40
+#define CA_DEBUG_BI_VSEL		(0xfull << 44)
+#define CA_DEBUG_BI_VSEL_SHFT		44
+#define CA_DEBUG_AS_VSEL		(0xfull << 48)
+#define CA_DEBUG_AS_VSEL_SHFT		48
+#define CA_DEBUG_PS_VSEL		(0xfull << 52)
+#define CA_DEBUG_PS_VSEL_SHFT		52
+#define CA_DEBUG_PM_VSEL		(0xfull << 56)
+#define CA_DEBUG_PM_VSEL_SHFT		56
+	/* bits 63:60 unused */
+
+/* ==== ca_debug_mux_core_sel */
+/* ==== ca_debug_mux_pci_sel */
+#define CA_DEBUG_MSEL0			(0x7ull << 0)
+#define CA_DEBUG_MSEL0_SHFT		0
+	/* bit 3 unused */
+#define CA_DEBUG_NSEL0			(0x7ull << 4)
+#define CA_DEBUG_NSEL0_SHFT		4
+	/* bit 7 unused */
+#define CA_DEBUG_MSEL1			(0x7ull << 8)
+#define CA_DEBUG_MSEL1_SHFT		8
+	/* bit 11 unused */
+#define CA_DEBUG_NSEL1			(0x7ull << 12)
+#define CA_DEBUG_NSEL1_SHFT		12
+	/* bit 15 unused */
+#define CA_DEBUG_MSEL2			(0x7ull << 16)
+#define CA_DEBUG_MSEL2_SHFT		16
+	/* bit 19 unused */
+#define CA_DEBUG_NSEL2			(0x7ull << 20)
+#define CA_DEBUG_NSEL2_SHFT		20
+	/* bit 23 unused */
+#define CA_DEBUG_MSEL3			(0x7ull << 24)
+#define CA_DEBUG_MSEL3_SHFT		24
+	/* bit 27 unused */
+#define CA_DEBUG_NSEL3			(0x7ull << 28)
+#define CA_DEBUG_NSEL3_SHFT		28
+	/* bit 31 unused */
+#define CA_DEBUG_MSEL4			(0x7ull << 32)
+#define CA_DEBUG_MSEL4_SHFT		32
+	/* bit 35 unused */
+#define CA_DEBUG_NSEL4			(0x7ull << 36)
+#define CA_DEBUG_NSEL4_SHFT		36
+	/* bit 39 unused */
+#define CA_DEBUG_MSEL5			(0x7ull << 40)
+#define CA_DEBUG_MSEL5_SHFT		40
+	/* bit 43 unused */
+#define CA_DEBUG_NSEL5			(0x7ull << 44)
+#define CA_DEBUG_NSEL5_SHFT		44
+	/* bit 47 unused */
+#define CA_DEBUG_MSEL6			(0x7ull << 48)
+#define CA_DEBUG_MSEL6_SHFT		48
+	/* bit 51 unused */
+#define CA_DEBUG_NSEL6			(0x7ull << 52)
+#define CA_DEBUG_NSEL6_SHFT		52
+	/* bit 55 unused */
+#define CA_DEBUG_MSEL7			(0x7ull << 56)
+#define CA_DEBUG_MSEL7_SHFT		56
+	/* bit 59 unused */
+#define CA_DEBUG_NSEL7			(0x7ull << 60)
+#define CA_DEBUG_NSEL7_SHFT		60
+	/* bit 63 unused */
+
+
+/* ==== ca_debug_domain_sel */
+#define CA_DEBUG_DOMAIN_L		(1ull << 0)
+#define CA_DEBUG_DOMAIN_H		(1ull << 1)
+	/* bits 63:2 unused */
+
+/* ==== ca_gart_ptr_table */
+#define CA_GART_PTR_VAL			(1ull << 0)
+	/* bits 11:1 unused */
+#define CA_GART_PTR_ADDR		(0xfffffffffffull << 12)
+#define CA_GART_PTR_ADDR_SHFT		12
+	/* bits 63:56 unused */
+
+/* ==== ca_gart_tlb_addr[0-7] */
+#define CA_GART_TLB_ADDR		(0xffffffffffffffull << 0)
+#define CA_GART_TLB_ADDR_SHFT		0
+	/* bits 62:56 unused */
+#define CA_GART_TLB_ENTRY_VAL		(1ull << 63)
+
+/*
+ * PIO address space ranges for TIO:CA
+ */
+
+/* CA internal registers */
+#define CA_PIO_ADMIN			0x00000000
+#define CA_PIO_ADMIN_LEN		0x00010000
+
+/* GFX Write Buffer - Diagnostics */
+#define CA_PIO_GFX			0x00010000
+#define CA_PIO_GFX_LEN			0x00010000
+
+/* AGP DMA Write Buffer - Diagnostics */
+#define CA_PIO_AGP_DMAWRITE		0x00020000
+#define CA_PIO_AGP_DMAWRITE_LEN		0x00010000
+
+/* AGP DMA READ Buffer - Diagnostics */
+#define CA_PIO_AGP_DMAREAD		0x00030000
+#define CA_PIO_AGP_DMAREAD_LEN		0x00010000
+
+/* PCI Config Type 0 */
+#define CA_PIO_PCI_TYPE0_CONFIG		0x01000000
+#define CA_PIO_PCI_TYPE0_CONFIG_LEN	0x01000000
+
+/* PCI Config Type 1 */
+#define CA_PIO_PCI_TYPE1_CONFIG		0x02000000
+#define CA_PIO_PCI_TYPE1_CONFIG_LEN	0x01000000
+
+/* PCI I/O Cycles - mapped to PCI Address 0x00000000-0x04ffffff */
+#define CA_PIO_PCI_IO			0x03000000
+#define CA_PIO_PCI_IO_LEN		0x05000000
+
+/* PCI MEM Cycles - mapped to PCI with CA_PIO_ADDR_OFFSET of ca_control1 */
+/*	use Fast Write if enabled and coretalk packet type is a GFX request */
+#define CA_PIO_PCI_MEM_OFFSET		0x08000000
+#define CA_PIO_PCI_MEM_OFFSET_LEN	0x08000000
+
+/* PCI MEM Cycles - mapped to PCI Address 0x00000000-0xbfffffff */
+/*	use Fast Write if enabled and coretalk packet type is a GFX request */
+#define CA_PIO_PCI_MEM			0x40000000
+#define CA_PIO_PCI_MEM_LEN		0xc0000000
+
+/*
+ * DMA space
+ *
+ * The CA aperature (ie. bus address range) mapped by the GART is segmented into
+ * two parts.  The lower portion of the aperature is used for mapping 32 bit
+ * PCI addresses which are managed by the dma interfaces in this file.  The
+ * upper poprtion of the aperature is used for mapping 48 bit AGP addresses.
+ * The AGP portion of the aperature is managed by the agpgart_be.c driver
+ * in drivers/linux/agp.  There are ca-specific hooks in that driver to
+ * manipulate the gart, but management of the AGP portion of the aperature
+ * is the responsibility of that driver.
+ *
+ * CA allows three main types of DMA mapping:
+ *
+ * PCI 64-bit	Managed by this driver
+ * PCI 32-bit 	Managed by this driver
+ * AGP 48-bit	Managed by hooks in the /dev/agpgart driver
+ *
+ * All of the above can optionally be remapped through the GART.  The following
+ * table lists the combinations of addressing types and GART remapping that
+ * is currently supported by the driver (h/w supports all, s/w limits this):
+ *
+ *		PCI64		PCI32		AGP48
+ * GART		no		yes		yes
+ * Direct	yes		yes		no
+ *
+ * GART remapping of PCI64 is not done because there is no need to.  The
+ * 64 bit PCI address holds all of the information necessary to target any
+ * memory in the system.
+ *
+ * AGP48 is always mapped through the GART.  Management of the AGP48 portion
+ * of the aperature is the responsibility of code in the agpgart_be driver.
+ *
+ * The non-64 bit bus address space will currently be partitioned like this:
+ *
+ *	0xffff_ffff_ffff	+--------
+ *				| AGP48 direct
+ *				| Space managed by this driver
+ *	CA_AGP_DIRECT_BASE	+--------
+ *				| AGP GART mapped (gfx aperature)
+ *				| Space managed by /dev/agpgart driver
+ *				| This range is exposed to the agpgart
+ * 				| driver as the "graphics aperature"
+ *	CA_AGP_MAPPED_BASE	+-----
+ *				| PCI GART mapped
+ *				| Space managed by this driver		
+ *	CA_PCI32_MAPPED_BASE	+----
+ *				| PCI32 direct
+ *				| Space managed by this driver
+ *	0xC000_0000		+--------
+ *	(CA_PCI32_DIRECT_BASE)
+ *
+ * The bus address range CA_PCI32_MAPPED_BASE through CA_AGP_DIRECT_BASE
+ * is what we call the CA aperature.  Addresses falling in this range will
+ * be remapped using the GART.
+ *
+ * The bus address range CA_AGP_MAPPED_BASE through CA_AGP_DIRECT_BASE
+ * is what we call the graphics aperature.  This is a subset of the CA
+ * aperature and is under the control of the agpgart_be driver.
+ *
+ * CA_PCI32_MAPPED_BASE, CA_AGP_MAPPED_BASE, and CA_AGP_DIRECT_BASE are
+ * somewhat arbitrary values.  The known constraints on choosing these is:
+ *
+ * 1)  CA_AGP_DIRECT_BASE-CA_PCI32_MAPPED_BASE+1 (the CA aperature size)
+ *     must be one of the values supported by the ca_gart_aperature register.
+ *     Currently valid values are: 4MB through 4096MB in powers of 2 increments
+ *
+ * 2)  CA_AGP_DIRECT_BASE-CA_AGP_MAPPED_BASE+1 (the gfx aperature size)
+ *     must be in MB units since that's what the agpgart driver assumes.
+ */
+
+/*
+ * Define Bus DMA ranges.  These are configurable (see constraints above)
+ * and will probably need tuning based on experience.
+ */
+
+
+/*
+ * 11/24/03
+ * CA has an addressing glitch w.r.t. PCI direct 32 bit DMA that makes it
+ * generally unusable.  The problem is that for PCI direct 32 
+ * DMA's, all 32 bits of the bus address are used to form the lower 32 bits
+ * of the coretalk address, and coretalk bits 38:32 come from a register.
+ * Since only PCI bus addresses 0xC0000000-0xFFFFFFFF (1GB) are available
+ * for DMA (the rest is allocated to PIO), host node addresses need to be
+ * such that their lower 32 bits fall in the 0xC0000000-0xffffffff range
+ * as well.  So there can be no PCI32 direct DMA below 3GB!!  For this
+ * reason we set the CA_PCI32_DIRECT_SIZE to 0 which essentially makes
+ * tioca_dma_direct32() a noop but preserves the code flow should this issue
+ * be fixed in a respin.
+ *
+ * For now, all PCI32 DMA's must be mapped through the GART.
+ */
+
+#define CA_PCI32_DIRECT_BASE	0xC0000000UL	/* BASE not configurable */
+#define CA_PCI32_DIRECT_SIZE	0x00000000UL	/* 0 MB */
+
+#define CA_PCI32_MAPPED_BASE	0xC0000000UL
+#define CA_PCI32_MAPPED_SIZE	0x40000000UL	/* 2GB */
+
+#define CA_AGP_MAPPED_BASE	0x80000000UL
+#define CA_AGP_MAPPED_SIZE	0x40000000UL	/* 2GB */
+
+#define CA_AGP_DIRECT_BASE	0x40000000UL	/* 2GB */
+#define CA_AGP_DIRECT_SIZE	0x40000000UL
+
+#define CA_APERATURE_BASE	(CA_AGP_MAPPED_BASE)
+#define CA_APERATURE_SIZE	(CA_AGP_MAPPED_SIZE+CA_PCI32_MAPPED_SIZE)
+
+#endif  /* _ASM_IA64_SN_TIO_TIOCA_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        /*
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
+ *
+ * Copyright (c) 2003-2005 Silicon 

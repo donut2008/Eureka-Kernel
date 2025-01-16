@@ -1,128 +1,119 @@
-/*
- *    Precise Delay Loops for S390
- *
- *    Copyright IBM Corp. 1999, 2008
- *    Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>,
- *		 Heiko Carstens <heiko.carstens@de.ibm.com>,
- */
+ruct list_head	xrcd_list;
+	struct list_head	rule_list;
+	int			closing;
 
-#include <linux/sched.h>
-#include <linux/delay.h>
-#include <linux/timex.h>
-#include <linux/module.h>
-#include <linux/irqflags.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <asm/vtimer.h>
-#include <asm/div64.h>
-#include <asm/idle.h>
+	struct pid             *tgid;
+#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+	struct rb_root      umem_tree;
+	/*
+	 * Protects .umem_rbroot and tree, as well as odp_mrs_count and
+	 * mmu notifiers registration.
+	 */
+	struct rw_semaphore	umem_rwsem;
+	void (*invalidate_range)(struct ib_umem *umem,
+				 unsigned long start, unsigned long end);
 
-void __delay(unsigned long loops)
-{
-        /*
-         * To end the bloody studid and useless discussion about the
-         * BogoMips number I took the liberty to define the __delay
-         * function in a way that that resulting BogoMips number will
-         * yield the megahertz number of the cpu. The important function
-         * is udelay and that is done using the tod clock. -- martin.
-         */
-	asm volatile("0: brct %0,0b" : : "d" ((loops/2) + 1));
-}
-EXPORT_SYMBOL(__delay);
+	struct mmu_notifier	mn;
+	atomic_t		notifier_count;
+	/* A list of umems that don't have private mmu notifier counters yet. */
+	struct list_head	no_private_counters;
+	int                     odp_mrs_count;
+#endif
+};
 
-static void __udelay_disabled(unsigned long long usecs)
-{
-	unsigned long cr0, cr0_new, psw_mask;
-	struct s390_idle_data idle;
-	u64 end;
+struct ib_uobject {
+	u64			user_handle;	/* handle given to us by userspace */
+	struct ib_ucontext     *context;	/* associated user context */
+	void		       *object;		/* containing object */
+	struct list_head	list;		/* link to context's list */
+	int			id;		/* index into kernel idr */
+	struct kref		ref;
+	struct rw_semaphore	mutex;		/* protects .live */
+	struct rcu_head		rcu;		/* kfree_rcu() overhead */
+	int			live;
+};
 
-	end = get_tod_clock() + (usecs << 12);
-	__ctl_store(cr0, 0, 0);
-	cr0_new = cr0 & ~CR0_IRQ_SUBCLASS_MASK;
-	cr0_new |= (1UL << (63 - 52)); /* enable clock comparator irq */
-	__ctl_load(cr0_new, 0, 0);
-	psw_mask = __extract_psw() | PSW_MASK_EXT | PSW_MASK_WAIT;
-	set_clock_comparator(end);
-	set_cpu_flag(CIF_IGNORE_IRQ);
-	psw_idle(&idle, psw_mask);
-	clear_cpu_flag(CIF_IGNORE_IRQ);
-	set_clock_comparator(S390_lowcore.clock_comparator);
-	__ctl_load(cr0, 0, 0);
-}
+struct ib_udata {
+	const void __user *inbuf;
+	void __user *outbuf;
+	size_t       inlen;
+	size_t       outlen;
+};
 
-static void __udelay_enabled(unsigned long long usecs)
-{
-	u64 clock_saved, end;
+struct ib_pd {
+	u32			local_dma_lkey;
+	struct ib_device       *device;
+	struct ib_uobject      *uobject;
+	atomic_t          	usecnt; /* count all resources */
+	struct ib_mr	       *local_mr;
+};
 
-	end = get_tod_clock_fast() + (usecs << 12);
-	do {
-		clock_saved = 0;
-		if (end < S390_lowcore.clock_comparator) {
-			clock_saved = local_tick_disable();
-			set_clock_comparator(end);
-		}
-		enabled_wait();
-		if (clock_saved)
-			local_tick_enable(clock_saved);
-	} while (get_tod_clock_fast() < end);
-}
+struct ib_xrcd {
+	struct ib_device       *device;
+	atomic_t		usecnt; /* count all exposed resources */
+	struct inode	       *inode;
 
-/*
- * Waits for 'usecs' microseconds using the TOD clock comparator.
- */
-void __udelay(unsigned long long usecs)
-{
-	unsigned long flags;
+	struct mutex		tgt_qp_mutex;
+	struct list_head	tgt_qp_list;
+};
 
-	preempt_disable();
-	local_irq_save(flags);
-	if (in_irq()) {
-		__udelay_disabled(usecs);
-		goto out;
-	}
-	if (in_softirq()) {
-		if (raw_irqs_disabled_flags(flags))
-			__udelay_disabled(usecs);
-		else
-			__udelay_enabled(usecs);
-		goto out;
-	}
-	if (raw_irqs_disabled_flags(flags)) {
-		local_bh_disable();
-		__udelay_disabled(usecs);
-		_local_bh_enable();
-		goto out;
-	}
-	__udelay_enabled(usecs);
-out:
-	local_irq_restore(flags);
-	preempt_enable();
-}
-EXPORT_SYMBOL(__udelay);
+struct ib_ah {
+	struct ib_device	*device;
+	struct ib_pd		*pd;
+	struct ib_uobject	*uobject;
+};
 
-/*
- * Simple udelay variant. To be used on startup and reboot
- * when the interrupt handler isn't working.
- */
-void udelay_simple(unsigned long long usecs)
-{
-	u64 end;
+typedef void (*ib_comp_handler)(struct ib_cq *cq, void *cq_context);
 
-	end = get_tod_clock_fast() + (usecs << 12);
-	while (get_tod_clock_fast() < end)
-		cpu_relax();
-}
+struct ib_cq {
+	struct ib_device       *device;
+	struct ib_uobject      *uobject;
+	ib_comp_handler   	comp_handler;
+	void                  (*event_handler)(struct ib_event *, void *);
+	void                   *cq_context;
+	int               	cqe;
+	atomic_t          	usecnt; /* count number of work queues */
+};
 
-void __ndelay(unsigned long long nsecs)
-{
-	u64 end;
+struct ib_srq {
+	struct ib_device       *device;
+	struct ib_pd	       *pd;
+	struct ib_uobject      *uobject;
+	void		      (*event_handler)(struct ib_event *, void *);
+	void		       *srq_context;
+	enum ib_srq_type	srq_type;
+	atomic_t		usecnt;
 
-	nsecs <<= 9;
-	do_div(nsecs, 125);
-	end = get_tod_clock_fast() + nsecs;
-	if (nsecs & ~0xfffUL)
-		__udelay(nsecs >> 12);
-	while (get_tod_clock_fast() < end)
-		barrier();
-}
-EXPORT_SYMBOL(__ndelay);
+	union {
+		struct {
+			struct ib_xrcd *xrcd;
+			struct ib_cq   *cq;
+			u32		srq_num;
+		} xrc;
+	} ext;
+};
+
+struct ib_qp {
+	struct ib_device       *device;
+	struct ib_pd	       *pd;
+	struct ib_cq	       *send_cq;
+	struct ib_cq	       *recv_cq;
+	struct ib_srq	       *srq;
+	struct ib_xrcd	       *xrcd; /* XRC TGT QPs only */
+	struct list_head	xrcd_list;
+	/* count times opened, mcast attaches, flow attaches */
+	atomic_t		usecnt;
+	struct list_head	open_list;
+	struct ib_qp           *real_qp;
+	struct ib_uobject      *uobject;
+	void                  (*event_handler)(struct ib_event *, void *);
+	void		       *qp_context;
+	u32			qp_num;
+	enum ib_qp_type		qp_type;
+};
+
+struct ib_mr {
+	struct ib_device  *device;
+	struct ib_pd	  *pd;
+	struct ib_uobject *uobject;
+	u32		   lkey

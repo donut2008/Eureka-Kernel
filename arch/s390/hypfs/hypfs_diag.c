@@ -1,777 +1,571 @@
-/*
- *    Hypervisor filesystem for Linux on s390. Diag 204 and 224
- *    implementation.
+upt */
+#define IMR_MRTC	(1 << RTC_IRQ_NUM)	/* Mask RTC interrupt */
+#define	IMR_MKB		(1 << KB_IRQ_NUM)	/* Mask Keyboard Interrupt */
+#define IMR_MPWM	(1 << PWM_IRQ_NUM)	/* Mask Pulse-Width Modulator int. */
+#define	IMR_MINT0	(1 << INT0_IRQ_NUM)	/* Mask External INT0 */
+#define	IMR_MINT1	(1 << INT1_IRQ_NUM)	/* Mask External INT1 */
+#define	IMR_MINT2	(1 << INT2_IRQ_NUM)	/* Mask External INT2 */
+#define	IMR_MINT3	(1 << INT3_IRQ_NUM)	/* Mask External INT3 */
+#define IMR_MIRQ1	(1 << IRQ1_IRQ_NUM)	/* Mask IRQ1 */
+#define IMR_MIRQ2	(1 << IRQ2_IRQ_NUM)	/* Mask IRQ2 */
+#define IMR_MIRQ3	(1 << IRQ3_IRQ_NUM)	/* Mask IRQ3 */
+#define IMR_MIRQ6	(1 << IRQ6_IRQ_NUM)	/* Mask IRQ6 */
+#define IMR_MIRQ5	(1 << IRQ5_IRQ_NUM)	/* Mask IRQ5 */
+#define IMR_MSAM	(1 << SAM_IRQ_NUM)	/* Mask Sampling Timer for RTC */
+#define IMR_MEMIQ	(1 << EMIQ_IRQ_NUM)	/* Mask Emulator Interrupt */
+
+/* '328-compatible definitions */
+#define IMR_MSPIM	IMR_MSPI
+#define IMR_MTMR1	IMR_MTMR
+
+/* 
+ * Interrupt Status Register 
+ */
+#define ISR_ADDR	0xfffff30c
+#define ISR		LONG_REF(ISR_ADDR)
+
+#define ISR_SPI 	(1 << SPI_IRQ_NUM)	/* SPI interrupt */
+#define	ISR_TMR		(1 << TMR_IRQ_NUM)	/* Timer interrupt */
+#define ISR_UART	(1 << UART_IRQ_NUM)	/* UART interrupt */	
+#define	ISR_WDT		(1 << WDT_IRQ_NUM)	/* Watchdog Timer interrupt */
+#define ISR_RTC		(1 << RTC_IRQ_NUM)	/* RTC interrupt */
+#define	ISR_KB		(1 << KB_IRQ_NUM)	/* Keyboard Interrupt */
+#define ISR_PWM		(1 << PWM_IRQ_NUM)	/* Pulse-Width Modulator interrupt */
+#define	ISR_INT0	(1 << INT0_IRQ_NUM)	/* External INT0 */
+#define	ISR_INT1	(1 << INT1_IRQ_NUM)	/* External INT1 */
+#define	ISR_INT2	(1 << INT2_IRQ_NUM)	/* External INT2 */
+#define	ISR_INT3	(1 << INT3_IRQ_NUM)	/* External INT3 */
+#define ISR_IRQ1	(1 << IRQ1_IRQ_NUM)	/* IRQ1 */
+#define ISR_IRQ2	(1 << IRQ2_IRQ_NUM)	/* IRQ2 */
+#define ISR_IRQ3	(1 << IRQ3_IRQ_NUM)	/* IRQ3 */
+#define ISR_IRQ6	(1 << IRQ6_IRQ_NUM)	/* IRQ6 */
+#define ISR_IRQ5	(1 << IRQ5_IRQ_NUM)	/* IRQ5 */
+#define ISR_SAM		(1 << SAM_IRQ_NUM)	/* Sampling Timer for RTC */
+#define ISR_EMIQ	(1 << EMIQ_IRQ_NUM)	/* Emulator Interrupt */
+
+/* '328-compatible definitions */
+#define ISR_SPIM	ISR_SPI
+#define ISR_TMR1	ISR_TMR
+
+/* 
+ * Interrupt Pending Register 
+ */
+#define IPR_ADDR	0xfffff30c
+#define IPR		LONG_REF(IPR_ADDR)
+
+#define IPR_SPI 	(1 << SPI_IRQ_NUM)	/* SPI interrupt */
+#define	IPR_TMR		(1 << TMR_IRQ_NUM)	/* Timer interrupt */
+#define IPR_UART	(1 << UART_IRQ_NUM)	/* UART interrupt */	
+#define	IPR_WDT		(1 << WDT_IRQ_NUM)	/* Watchdog Timer interrupt */
+#define IPR_RTC		(1 << RTC_IRQ_NUM)	/* RTC interrupt */
+#define	IPR_KB		(1 << KB_IRQ_NUM)	/* Keyboard Interrupt */
+#define IPR_PWM		(1 << PWM_IRQ_NUM)	/* Pulse-Width Modulator interrupt */
+#define	IPR_INT0	(1 << INT0_IRQ_NUM)	/* External INT0 */
+#define	IPR_INT1	(1 << INT1_IRQ_NUM)	/* External INT1 */
+#define	IPR_INT2	(1 << INT2_IRQ_NUM)	/* External INT2 */
+#define	IPR_INT3	(1 << INT3_IRQ_NUM)	/* External INT3 */
+#define IPR_IRQ1	(1 << IRQ1_IRQ_NUM)	/* IRQ1 */
+#define IPR_IRQ2	(1 << IRQ2_IRQ_NUM)	/* IRQ2 */
+#define IPR_IRQ3	(1 << IRQ3_IRQ_NUM)	/* IRQ3 */
+#define IPR_IRQ6	(1 << IRQ6_IRQ_NUM)	/* IRQ6 */
+#define IPR_IRQ5	(1 << IRQ5_IRQ_NUM)	/* IRQ5 */
+#define IPR_SAM		(1 << SAM_IRQ_NUM)	/* Sampling Timer for RTC */
+#define IPR_EMIQ	(1 << EMIQ_IRQ_NUM)	/* Emulator Interrupt */
+
+/* '328-compatible definitions */
+#define IPR_SPIM	IPR_SPI
+#define IPR_TMR1	IPR_TMR
+
+/**********
  *
- *    Copyright IBM Corp. 2006, 2008
- *    Author(s): Michael Holzheu <holzheu@de.ibm.com>
- */
-
-#define KMSG_COMPONENT "hypfs"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
-
-#include <linux/types.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/string.h>
-#include <linux/vmalloc.h>
-#include <linux/mm.h>
-#include <asm/diag.h>
-#include <asm/ebcdic.h>
-#include "hypfs.h"
-
-#define LPAR_NAME_LEN 8		/* lpar name len in diag 204 data */
-#define CPU_NAME_LEN 16		/* type name len of cpus in diag224 name table */
-#define TMP_SIZE 64		/* size of temporary buffers */
-
-#define DBFS_D204_HDR_VERSION	0
-
-/* diag 204 subcodes */
-enum diag204_sc {
-	SUBC_STIB4 = 4,
-	SUBC_RSI = 5,
-	SUBC_STIB6 = 6,
-	SUBC_STIB7 = 7
-};
-
-/* The two available diag 204 data formats */
-enum diag204_format {
-	INFO_SIMPLE = 0,
-	INFO_EXT = 0x00010000
-};
-
-/* bit is set in flags, when physical cpu info is included in diag 204 data */
-#define LPAR_PHYS_FLG  0x80
-
-static char *diag224_cpu_names;			/* diag 224 name table */
-static enum diag204_sc diag204_store_sc;	/* used subcode for store */
-static enum diag204_format diag204_info_type;	/* used diag 204 data format */
-
-static void *diag204_buf;		/* 4K aligned buffer for diag204 data */
-static void *diag204_buf_vmalloc;	/* vmalloc pointer for diag204 data */
-static int diag204_buf_pages;		/* number of pages for diag204 data */
-
-static struct dentry *dbfs_d204_file;
-
-/*
- * DIAG 204 data structures and member access functions.
+ * 0xFFFFF4xx -- Parallel Ports
  *
- * Since we have two different diag 204 data formats for old and new s390
- * machines, we do not access the structs directly, but use getter functions for
- * each struct member instead. This should make the code more readable.
- */
-
-/* Time information block */
-
-struct info_blk_hdr {
-	__u8  npar;
-	__u8  flags;
-	__u16 tslice;
-	__u16 phys_cpus;
-	__u16 this_part;
-	__u64 curtod;
-} __attribute__ ((packed));
-
-struct x_info_blk_hdr {
-	__u8  npar;
-	__u8  flags;
-	__u16 tslice;
-	__u16 phys_cpus;
-	__u16 this_part;
-	__u64 curtod1;
-	__u64 curtod2;
-	char reserved[40];
-} __attribute__ ((packed));
-
-static inline int info_blk_hdr__size(enum diag204_format type)
-{
-	if (type == INFO_SIMPLE)
-		return sizeof(struct info_blk_hdr);
-	else /* INFO_EXT */
-		return sizeof(struct x_info_blk_hdr);
-}
-
-static inline __u8 info_blk_hdr__npar(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct info_blk_hdr *)hdr)->npar;
-	else /* INFO_EXT */
-		return ((struct x_info_blk_hdr *)hdr)->npar;
-}
-
-static inline __u8 info_blk_hdr__flags(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct info_blk_hdr *)hdr)->flags;
-	else /* INFO_EXT */
-		return ((struct x_info_blk_hdr *)hdr)->flags;
-}
-
-static inline __u16 info_blk_hdr__pcpus(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct info_blk_hdr *)hdr)->phys_cpus;
-	else /* INFO_EXT */
-		return ((struct x_info_blk_hdr *)hdr)->phys_cpus;
-}
-
-/* Partition header */
-
-struct part_hdr {
-	__u8 pn;
-	__u8 cpus;
-	char reserved[6];
-	char part_name[LPAR_NAME_LEN];
-} __attribute__ ((packed));
-
-struct x_part_hdr {
-	__u8  pn;
-	__u8  cpus;
-	__u8  rcpus;
-	__u8  pflag;
-	__u32 mlu;
-	char  part_name[LPAR_NAME_LEN];
-	char  lpc_name[8];
-	char  os_name[8];
-	__u64 online_cs;
-	__u64 online_es;
-	__u8  upid;
-	char  reserved1[3];
-	__u32 group_mlu;
-	char  group_name[8];
-	char  reserved2[32];
-} __attribute__ ((packed));
-
-static inline int part_hdr__size(enum diag204_format type)
-{
-	if (type == INFO_SIMPLE)
-		return sizeof(struct part_hdr);
-	else /* INFO_EXT */
-		return sizeof(struct x_part_hdr);
-}
-
-static inline __u8 part_hdr__rcpus(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct part_hdr *)hdr)->cpus;
-	else /* INFO_EXT */
-		return ((struct x_part_hdr *)hdr)->rcpus;
-}
-
-static inline void part_hdr__part_name(enum diag204_format type, void *hdr,
-				       char *name)
-{
-	if (type == INFO_SIMPLE)
-		memcpy(name, ((struct part_hdr *)hdr)->part_name,
-		       LPAR_NAME_LEN);
-	else /* INFO_EXT */
-		memcpy(name, ((struct x_part_hdr *)hdr)->part_name,
-		       LPAR_NAME_LEN);
-	EBCASC(name, LPAR_NAME_LEN);
-	name[LPAR_NAME_LEN] = 0;
-	strim(name);
-}
-
-struct cpu_info {
-	__u16 cpu_addr;
-	char  reserved1[2];
-	__u8  ctidx;
-	__u8  cflag;
-	__u16 weight;
-	__u64 acc_time;
-	__u64 lp_time;
-} __attribute__ ((packed));
-
-struct x_cpu_info {
-	__u16 cpu_addr;
-	char  reserved1[2];
-	__u8  ctidx;
-	__u8  cflag;
-	__u16 weight;
-	__u64 acc_time;
-	__u64 lp_time;
-	__u16 min_weight;
-	__u16 cur_weight;
-	__u16 max_weight;
-	char  reseved2[2];
-	__u64 online_time;
-	__u64 wait_time;
-	__u32 pma_weight;
-	__u32 polar_weight;
-	char  reserved3[40];
-} __attribute__ ((packed));
-
-/* CPU info block */
-
-static inline int cpu_info__size(enum diag204_format type)
-{
-	if (type == INFO_SIMPLE)
-		return sizeof(struct cpu_info);
-	else /* INFO_EXT */
-		return sizeof(struct x_cpu_info);
-}
-
-static inline __u8 cpu_info__ctidx(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct cpu_info *)hdr)->ctidx;
-	else /* INFO_EXT */
-		return ((struct x_cpu_info *)hdr)->ctidx;
-}
-
-static inline __u16 cpu_info__cpu_addr(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct cpu_info *)hdr)->cpu_addr;
-	else /* INFO_EXT */
-		return ((struct x_cpu_info *)hdr)->cpu_addr;
-}
-
-static inline __u64 cpu_info__acc_time(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct cpu_info *)hdr)->acc_time;
-	else /* INFO_EXT */
-		return ((struct x_cpu_info *)hdr)->acc_time;
-}
-
-static inline __u64 cpu_info__lp_time(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct cpu_info *)hdr)->lp_time;
-	else /* INFO_EXT */
-		return ((struct x_cpu_info *)hdr)->lp_time;
-}
-
-static inline __u64 cpu_info__online_time(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return 0;	/* online_time not available in simple info */
-	else /* INFO_EXT */
-		return ((struct x_cpu_info *)hdr)->online_time;
-}
-
-/* Physical header */
-
-struct phys_hdr {
-	char reserved1[1];
-	__u8 cpus;
-	char reserved2[6];
-	char mgm_name[8];
-} __attribute__ ((packed));
-
-struct x_phys_hdr {
-	char reserved1[1];
-	__u8 cpus;
-	char reserved2[6];
-	char mgm_name[8];
-	char reserved3[80];
-} __attribute__ ((packed));
-
-static inline int phys_hdr__size(enum diag204_format type)
-{
-	if (type == INFO_SIMPLE)
-		return sizeof(struct phys_hdr);
-	else /* INFO_EXT */
-		return sizeof(struct x_phys_hdr);
-}
-
-static inline __u8 phys_hdr__cpus(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct phys_hdr *)hdr)->cpus;
-	else /* INFO_EXT */
-		return ((struct x_phys_hdr *)hdr)->cpus;
-}
-
-/* Physical CPU info block */
-
-struct phys_cpu {
-	__u16 cpu_addr;
-	char  reserved1[2];
-	__u8  ctidx;
-	char  reserved2[3];
-	__u64 mgm_time;
-	char  reserved3[8];
-} __attribute__ ((packed));
-
-struct x_phys_cpu {
-	__u16 cpu_addr;
-	char  reserved1[2];
-	__u8  ctidx;
-	char  reserved2[3];
-	__u64 mgm_time;
-	char  reserved3[80];
-} __attribute__ ((packed));
-
-static inline int phys_cpu__size(enum diag204_format type)
-{
-	if (type == INFO_SIMPLE)
-		return sizeof(struct phys_cpu);
-	else /* INFO_EXT */
-		return sizeof(struct x_phys_cpu);
-}
-
-static inline __u16 phys_cpu__cpu_addr(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct phys_cpu *)hdr)->cpu_addr;
-	else /* INFO_EXT */
-		return ((struct x_phys_cpu *)hdr)->cpu_addr;
-}
-
-static inline __u64 phys_cpu__mgm_time(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct phys_cpu *)hdr)->mgm_time;
-	else /* INFO_EXT */
-		return ((struct x_phys_cpu *)hdr)->mgm_time;
-}
-
-static inline __u64 phys_cpu__ctidx(enum diag204_format type, void *hdr)
-{
-	if (type == INFO_SIMPLE)
-		return ((struct phys_cpu *)hdr)->ctidx;
-	else /* INFO_EXT */
-		return ((struct x_phys_cpu *)hdr)->ctidx;
-}
-
-/* Diagnose 204 functions */
-
-static inline int __diag204(unsigned long subcode, unsigned long size, void *addr)
-{
-	register unsigned long _subcode asm("0") = subcode;
-	register unsigned long _size asm("1") = size;
-
-	asm volatile(
-		"	diag	%2,%0,0x204\n"
-		"0:\n"
-		EX_TABLE(0b,0b)
-		: "+d" (_subcode), "+d" (_size) : "d" (addr) : "memory");
-	if (_subcode)
-		return -1;
-	return _size;
-}
-
-static int diag204(unsigned long subcode, unsigned long size, void *addr)
-{
-	diag_stat_inc(DIAG_STAT_X204);
-	return __diag204(subcode, size, addr);
-}
+ **********/
 
 /*
- * For the old diag subcode 4 with simple data format we have to use real
- * memory. If we use subcode 6 or 7 with extended data format, we can (and
- * should) use vmalloc, since we need a lot of memory in that case. Currently
- * up to 93 pages!
+ * Port A
  */
+#define PADIR_ADDR	0xfffff400		/* Port A direction reg */
+#define PADATA_ADDR	0xfffff401		/* Port A data register */
+#define PAPUEN_ADDR	0xfffff402		/* Port A Pull-Up enable reg */
 
-static void diag204_free_buffer(void)
-{
-	if (!diag204_buf)
-		return;
-	if (diag204_buf_vmalloc) {
-		vfree(diag204_buf_vmalloc);
-		diag204_buf_vmalloc = NULL;
-	} else {
-		free_pages((unsigned long) diag204_buf, 0);
-	}
-	diag204_buf = NULL;
-}
+#define PADIR		BYTE_REF(PADIR_ADDR)
+#define PADATA		BYTE_REF(PADATA_ADDR)
+#define PAPUEN		BYTE_REF(PAPUEN_ADDR)
 
-static void *page_align_ptr(void *ptr)
-{
-	return (void *) PAGE_ALIGN((unsigned long) ptr);
-}
+#define PA(x)		(1 << (x))
 
-static void *diag204_alloc_vbuf(int pages)
-{
-	/* The buffer has to be page aligned! */
-	diag204_buf_vmalloc = vmalloc(PAGE_SIZE * (pages + 1));
-	if (!diag204_buf_vmalloc)
-		return ERR_PTR(-ENOMEM);
-	diag204_buf = page_align_ptr(diag204_buf_vmalloc);
-	diag204_buf_pages = pages;
-	return diag204_buf;
-}
+/* 
+ * Port B
+ */
+#define PBDIR_ADDR	0xfffff408		/* Port B direction reg */
+#define PBDATA_ADDR	0xfffff409		/* Port B data register */
+#define PBPUEN_ADDR	0xfffff40a		/* Port B Pull-Up enable reg */
+#define PBSEL_ADDR	0xfffff40b		/* Port B Select Register */
 
-static void *diag204_alloc_rbuf(void)
-{
-	diag204_buf = (void*)__get_free_pages(GFP_KERNEL,0);
-	if (!diag204_buf)
-		return ERR_PTR(-ENOMEM);
-	diag204_buf_pages = 1;
-	return diag204_buf;
-}
+#define PBDIR		BYTE_REF(PBDIR_ADDR)
+#define PBDATA		BYTE_REF(PBDATA_ADDR)
+#define PBPUEN		BYTE_REF(PBPUEN_ADDR)
+#define PBSEL		BYTE_REF(PBSEL_ADDR)
 
-static void *diag204_get_buffer(enum diag204_format fmt, int *pages)
-{
-	if (diag204_buf) {
-		*pages = diag204_buf_pages;
-		return diag204_buf;
-	}
-	if (fmt == INFO_SIMPLE) {
-		*pages = 1;
-		return diag204_alloc_rbuf();
-	} else {/* INFO_EXT */
-		*pages = diag204((unsigned long)SUBC_RSI |
-				 (unsigned long)INFO_EXT, 0, NULL);
-		if (*pages <= 0)
-			return ERR_PTR(-ENOSYS);
-		else
-			return diag204_alloc_vbuf(*pages);
-	}
-}
+#define PB(x)		(1 << (x))
+
+#define PB_CSB0		0x01	/* Use CSB0      as PB[0] */
+#define PB_CSB1		0x02	/* Use CSB1      as PB[1] */
+#define PB_CSC0_RAS0	0x04    /* Use CSC0/RAS0 as PB[2] */	
+#define PB_CSC1_RAS1	0x08    /* Use CSC1/RAS1 as PB[3] */	
+#define PB_CSD0_CAS0	0x10    /* Use CSD0/CAS0 as PB[4] */	
+#define PB_CSD1_CAS1	0x20    /* Use CSD1/CAS1 as PB[5] */
+#define PB_TIN_TOUT	0x40	/* Use TIN/TOUT  as PB[6] */
+#define PB_PWMO		0x80	/* Use PWMO      as PB[7] */
+
+/* 
+ * Port C
+ */
+#define PCDIR_ADDR	0xfffff410		/* Port C direction reg */
+#define PCDATA_ADDR	0xfffff411		/* Port C data register */
+#define PCPDEN_ADDR	0xfffff412		/* Port C Pull-Down enb. reg */
+#define PCSEL_ADDR	0xfffff413		/* Port C Select Register */
+
+#define PCDIR		BYTE_REF(PCDIR_ADDR)
+#define PCDATA		BYTE_REF(PCDATA_ADDR)
+#define PCPDEN		BYTE_REF(PCPDEN_ADDR)
+#define PCSEL		BYTE_REF(PCSEL_ADDR)
+
+#define PC(x)		(1 << (x))
+
+#define PC_LD0		0x01	/* Use LD0  as PC[0] */
+#define PC_LD1		0x02	/* Use LD1  as PC[1] */
+#define PC_LD2		0x04	/* Use LD2  as PC[2] */
+#define PC_LD3		0x08	/* Use LD3  as PC[3] */
+#define PC_LFLM		0x10	/* Use LFLM as PC[4] */
+#define PC_LLP 		0x20	/* Use LLP  as PC[5] */
+#define PC_LCLK		0x40	/* Use LCLK as PC[6] */
+#define PC_LACD		0x80	/* Use LACD as PC[7] */
+
+/* 
+ * Port D
+ */
+#define PDDIR_ADDR	0xfffff418		/* Port D direction reg */
+#define PDDATA_ADDR	0xfffff419		/* Port D data register */
+#define PDPUEN_ADDR	0xfffff41a		/* Port D Pull-Up enable reg */
+#define PDSEL_ADDR	0xfffff41b		/* Port D Select Register */
+#define PDPOL_ADDR	0xfffff41c		/* Port D Polarity Register */
+#define PDIRQEN_ADDR	0xfffff41d		/* Port D IRQ enable register */
+#define PDKBEN_ADDR	0xfffff41e		/* Port D Keyboard Enable reg */
+#define	PDIQEG_ADDR	0xfffff41f		/* Port D IRQ Edge Register */
+
+#define PDDIR		BYTE_REF(PDDIR_ADDR)
+#define PDDATA		BYTE_REF(PDDATA_ADDR)
+#define PDPUEN		BYTE_REF(PDPUEN_ADDR)
+#define PDSEL		BYTE_REF(PDSEL_ADDR)
+#define	PDPOL		BYTE_REF(PDPOL_ADDR)
+#define PDIRQEN		BYTE_REF(PDIRQEN_ADDR)
+#define PDKBEN		BYTE_REF(PDKBEN_ADDR)
+#define PDIQEG		BYTE_REF(PDIQEG_ADDR)
+
+#define PD(x)		(1 << (x))
+
+#define PD_INT0		0x01	/* Use INT0 as PD[0] */
+#define PD_INT1		0x02	/* Use INT1 as PD[1] */
+#define PD_INT2		0x04	/* Use INT2 as PD[2] */
+#define PD_INT3		0x08	/* Use INT3 as PD[3] */
+#define PD_IRQ1		0x10	/* Use IRQ1 as PD[4] */
+#define PD_IRQ2		0x20	/* Use IRQ2 as PD[5] */
+#define PD_IRQ3		0x40	/* Use IRQ3 as PD[6] */
+#define PD_IRQ6		0x80	/* Use IRQ6 as PD[7] */
+
+/* 
+ * Port E
+ */
+#define PEDIR_ADDR	0xfffff420		/* Port E direction reg */
+#define PEDATA_ADDR	0xfffff421		/* Port E data register */
+#define PEPUEN_ADDR	0xfffff422		/* Port E Pull-Up enable reg */
+#define PESEL_ADDR	0xfffff423		/* Port E Select Register */
+
+#define PEDIR		BYTE_REF(PEDIR_ADDR)
+#define PEDATA		BYTE_REF(PEDATA_ADDR)
+#define PEPUEN		BYTE_REF(PEPUEN_ADDR)
+#define PESEL		BYTE_REF(PESEL_ADDR)
+
+#define PE(x)		(1 << (x))
+
+#define PE_SPMTXD	0x01	/* Use SPMTXD as PE[0] */
+#define PE_SPMRXD	0x02	/* Use SPMRXD as PE[1] */
+#define PE_SPMCLK	0x04	/* Use SPMCLK as PE[2] */
+#define PE_DWE		0x08	/* Use DWE    as PE[3] */
+#define PE_RXD		0x10	/* Use RXD    as PE[4] */
+#define PE_TXD		0x20	/* Use TXD    as PE[5] */
+#define PE_RTS		0x40	/* Use RTS    as PE[6] */
+#define PE_CTS		0x80	/* Use CTS    as PE[7] */
+
+/* 
+ * Port F
+ */
+#define PFDIR_ADDR	0xfffff428		/* Port F direction reg */
+#define PFDATA_ADDR	0xfffff429		/* Port F data register */
+#define PFPUEN_ADDR	0xfffff42a		/* Port F Pull-Up enable reg */
+#define PFSEL_ADDR	0xfffff42b		/* Port F Select Register */
+
+#define PFDIR		BYTE_REF(PFDIR_ADDR)
+#define PFDATA		BYTE_REF(PFDATA_ADDR)
+#define PFPUEN		BYTE_REF(PFPUEN_ADDR)
+#define PFSEL		BYTE_REF(PFSEL_ADDR)
+
+#define PF(x)		(1 << (x))
+
+#define PF_LCONTRAST	0x01	/* Use LCONTRAST as PF[0] */
+#define PF_IRQ5         0x02    /* Use IRQ5      as PF[1] */
+#define PF_CLKO         0x04    /* Use CLKO      as PF[2] */
+#define PF_A20          0x08    /* Use A20       as PF[3] */
+#define PF_A21          0x10    /* Use A21       as PF[4] */
+#define PF_A22          0x20    /* Use A22       as PF[5] */
+#define PF_A23          0x40    /* Use A23       as PF[6] */
+#define PF_CSA1		0x80    /* Use CSA1      as PF[7] */
+
+/* 
+ * Port G
+ */
+#define PGDIR_ADDR	0xfffff430		/* Port G direction reg */
+#define PGDATA_ADDR	0xfffff431		/* Port G data register */
+#define PGPUEN_ADDR	0xfffff432		/* Port G Pull-Up enable reg */
+#define PGSEL_ADDR	0xfffff433		/* Port G Select Register */
+
+#define PGDIR		BYTE_REF(PGDIR_ADDR)
+#define PGDATA		BYTE_REF(PGDATA_ADDR)
+#define PGPUEN		BYTE_REF(PGPUEN_ADDR)
+#define PGSEL		BYTE_REF(PGSEL_ADDR)
+
+#define PG(x)		(1 << (x))
+
+#define PG_BUSW_DTACK	0x01	/* Use BUSW/DTACK as PG[0] */
+#define PG_A0		0x02	/* Use A0         as PG[1] */
+#define PG_EMUIRQ	0x04	/* Use EMUIRQ     as PG[2] */
+#define PG_HIZ_P_D	0x08	/* Use HIZ/P/D    as PG[3] */
+#define PG_EMUCS        0x10	/* Use EMUCS      as PG[4] */
+#define PG_EMUBRK	0x20	/* Use EMUBRK     as PG[5] */
+
+/* 
+ * Port J
+ */
+#define PJDIR_ADDR	0xfffff438		/* Port J direction reg */
+#define PJDATA_ADDR	0xfffff439		/* Port J data register */
+#define PJPUEN_ADDR	0xfffff43A		/* Port J Pull-Up enb. reg */
+#define PJSEL_ADDR	0xfffff43B		/* Port J Select Register */
+
+#define PJDIR		BYTE_REF(PJDIR_ADDR)
+#define PJDATA		BYTE_REF(PJDATA_ADDR)
+#define PJPUEN		BYTE_REF(PJPUEN_ADDR)
+#define PJSEL		BYTE_REF(PJSEL_ADDR)
+
+#define PJ(x)		(1 << (x))
 
 /*
- * diag204_probe() has to find out, which type of diagnose 204 implementation
- * we have on our machine. Currently there are three possible scanarios:
- *   - subcode 4   + simple data format (only one page)
- *   - subcode 4-6 + extended data format
- *   - subcode 4-7 + extended data format
+ * Port K
+ */
+#define PKDIR_ADDR	0xfffff440		/* Port K direction reg */
+#define PKDATA_ADDR	0xfffff441		/* Port K data register */
+#define PKPUEN_ADDR	0xfffff442		/* Port K Pull-Up enb. reg */
+#define PKSEL_ADDR	0xfffff443		/* Port K Select Register */
+
+#define PKDIR		BYTE_REF(PKDIR_ADDR)
+#define PKDATA		BYTE_REF(PKDATA_ADDR)
+#define PKPUEN		BYTE_REF(PKPUEN_ADDR)
+#define PKSEL		BYTE_REF(PKSEL_ADDR)
+
+#define PK(x)		(1 << (x))
+
+#define PK_DATAREADY		0x01	/* Use ~DATA_READY  as PK[0] */
+#define PK_PWM2		0x01	/* Use PWM2  as PK[0] */
+#define PK_R_W		0x02	/* Use R/W  as PK[1] */
+#define PK_LDS		0x04	/* Use /LDS  as PK[2] */
+#define PK_UDS		0x08	/* Use /UDS  as PK[3] */
+#define PK_LD4		0x10	/* Use LD4 as PK[4] */
+#define PK_LD5 		0x20	/* Use LD5  as PK[5] */
+#define PK_LD6		0x40	/* Use LD6 as PK[6] */
+#define PK_LD7		0x80	/* Use LD7 as PK[7] */
+
+#define PJDIR_ADDR	0xfffff438		/* Port J direction reg */
+#define PJDATA_ADDR	0xfffff439		/* Port J data register */
+#define PJPUEN_ADDR	0xfffff43A		/* Port J Pull-Up enable reg */
+#define PJSEL_ADDR	0xfffff43B		/* Port J Select Register */
+
+#define PJDIR		BYTE_REF(PJDIR_ADDR)
+#define PJDATA		BYTE_REF(PJDATA_ADDR)
+#define PJPUEN		BYTE_REF(PJPUEN_ADDR)
+#define PJSEL		BYTE_REF(PJSEL_ADDR)
+
+#define PJ(x)		(1 << (x))
+
+#define PJ_MOSI 	0x01	/* Use MOSI       as PJ[0] */
+#define PJ_MISO		0x02	/* Use MISO       as PJ[1] */
+#define PJ_SPICLK1  	0x04	/* Use SPICLK1    as PJ[2] */
+#define PJ_SS   	0x08	/* Use SS         as PJ[3] */
+#define PJ_RXD2         0x10	/* Use RXD2       as PJ[4] */
+#define PJ_TXD2  	0x20	/* Use TXD2       as PJ[5] */
+#define PJ_RTS2  	0x40	/* Use RTS2       as PJ[5] */
+#define PJ_CTS2  	0x80	/* Use CTS2       as PJ[5] */
+
+/*
+ * Port M
+ */
+#define PMDIR_ADDR	0xfffff448		/* Port M direction reg */
+#define PMDATA_ADDR	0xfffff449		/* Port M data register */
+#define PMPUEN_ADDR	0xfffff44a		/* Port M Pull-Up enable reg */
+#define PMSEL_ADDR	0xfffff44b		/* Port M Select Register */
+
+#define PMDIR		BYTE_REF(PMDIR_ADDR)
+#define PMDATA		BYTE_REF(PMDATA_ADDR)
+#define PMPUEN		BYTE_REF(PMPUEN_ADDR)
+#define PMSEL		BYTE_REF(PMSEL_ADDR)
+
+#define PM(x)		(1 << (x))
+
+#define PM_SDCLK	0x01	/* Use SDCLK      as PM[0] */
+#define PM_SDCE		0x02	/* Use SDCE       as PM[1] */
+#define PM_DQMH 	0x04	/* Use DQMH       as PM[2] */
+#define PM_DQML 	0x08	/* Use DQML       as PM[3] */
+#define PM_SDA10        0x10	/* Use SDA10      as PM[4] */
+#define PM_DMOE 	0x20	/* Use DMOE       as PM[5] */
+
+/**********
  *
- * Subcode 5 is used to retrieve the size of the data, provided by subcodes
- * 6 and 7. Subcode 7 basically has the same function as subcode 6. In addition
- * to subcode 6 it provides also information about secondary cpus.
- * In order to get as much information as possible, we first try
- * subcode 7, then 6 and if both fail, we use subcode 4.
- */
-
-static int diag204_probe(void)
-{
-	void *buf;
-	int pages, rc;
-
-	buf = diag204_get_buffer(INFO_EXT, &pages);
-	if (!IS_ERR(buf)) {
-		if (diag204((unsigned long)SUBC_STIB7 |
-			    (unsigned long)INFO_EXT, pages, buf) >= 0) {
-			diag204_store_sc = SUBC_STIB7;
-			diag204_info_type = INFO_EXT;
-			goto out;
-		}
-		if (diag204((unsigned long)SUBC_STIB6 |
-			    (unsigned long)INFO_EXT, pages, buf) >= 0) {
-			diag204_store_sc = SUBC_STIB6;
-			diag204_info_type = INFO_EXT;
-			goto out;
-		}
-		diag204_free_buffer();
-	}
-
-	/* subcodes 6 and 7 failed, now try subcode 4 */
-
-	buf = diag204_get_buffer(INFO_SIMPLE, &pages);
-	if (IS_ERR(buf)) {
-		rc = PTR_ERR(buf);
-		goto fail_alloc;
-	}
-	if (diag204((unsigned long)SUBC_STIB4 |
-		    (unsigned long)INFO_SIMPLE, pages, buf) >= 0) {
-		diag204_store_sc = SUBC_STIB4;
-		diag204_info_type = INFO_SIMPLE;
-		goto out;
-	} else {
-		rc = -ENOSYS;
-		goto fail_store;
-	}
-out:
-	rc = 0;
-fail_store:
-	diag204_free_buffer();
-fail_alloc:
-	return rc;
-}
-
-static int diag204_do_store(void *buf, int pages)
-{
-	int rc;
-
-	rc = diag204((unsigned long) diag204_store_sc |
-		     (unsigned long) diag204_info_type, pages, buf);
-	return rc < 0 ? -ENOSYS : 0;
-}
-
-static void *diag204_store(void)
-{
-	void *buf;
-	int pages, rc;
-
-	buf = diag204_get_buffer(diag204_info_type, &pages);
-	if (IS_ERR(buf))
-		goto out;
-	rc = diag204_do_store(buf, pages);
-	if (rc)
-		return ERR_PTR(rc);
-out:
-	return buf;
-}
-
-/* Diagnose 224 functions */
-
-static int diag224(void *ptr)
-{
-	int rc = -EOPNOTSUPP;
-
-	diag_stat_inc(DIAG_STAT_X224);
-	asm volatile(
-		"	diag	%1,%2,0x224\n"
-		"0:	lhi	%0,0x0\n"
-		"1:\n"
-		EX_TABLE(0b,1b)
-		: "+d" (rc) :"d" (0), "d" (ptr) : "memory");
-	return rc;
-}
-
-static int diag224_get_name_table(void)
-{
-	/* memory must be below 2GB */
-	diag224_cpu_names = (char *) __get_free_page(GFP_KERNEL | GFP_DMA);
-	if (!diag224_cpu_names)
-		return -ENOMEM;
-	if (diag224(diag224_cpu_names)) {
-		free_page((unsigned long) diag224_cpu_names);
-		return -EOPNOTSUPP;
-	}
-	EBCASC(diag224_cpu_names + 16, (*diag224_cpu_names + 1) * 16);
-	return 0;
-}
-
-static void diag224_delete_name_table(void)
-{
-	free_page((unsigned long) diag224_cpu_names);
-}
-
-static int diag224_idx2name(int index, char *name)
-{
-	memcpy(name, diag224_cpu_names + ((index + 1) * CPU_NAME_LEN),
-		CPU_NAME_LEN);
-	name[CPU_NAME_LEN] = 0;
-	strim(name);
-	return 0;
-}
-
-struct dbfs_d204_hdr {
-	u64	len;		/* Length of d204 buffer without header */
-	u16	version;	/* Version of header */
-	u8	sc;		/* Used subcode */
-	char	reserved[53];
-} __attribute__ ((packed));
-
-struct dbfs_d204 {
-	struct dbfs_d204_hdr	hdr;	/* 64 byte header */
-	char			buf[];	/* d204 buffer */
-} __attribute__ ((packed));
-
-static int dbfs_d204_create(void **data, void **data_free_ptr, size_t *size)
-{
-	struct dbfs_d204 *d204;
-	int rc, buf_size;
-	void *base;
-
-	buf_size = PAGE_SIZE * (diag204_buf_pages + 1) + sizeof(d204->hdr);
-	base = vzalloc(buf_size);
-	if (!base)
-		return -ENOMEM;
-	d204 = page_align_ptr(base + sizeof(d204->hdr)) - sizeof(d204->hdr);
-	rc = diag204_do_store(d204->buf, diag204_buf_pages);
-	if (rc) {
-		vfree(base);
-		return rc;
-	}
-	d204->hdr.version = DBFS_D204_HDR_VERSION;
-	d204->hdr.len = PAGE_SIZE * diag204_buf_pages;
-	d204->hdr.sc = diag204_store_sc;
-	*data = d204;
-	*data_free_ptr = base;
-	*size = d204->hdr.len + sizeof(struct dbfs_d204_hdr);
-	return 0;
-}
-
-static struct hypfs_dbfs_file dbfs_file_d204 = {
-	.name		= "diag_204",
-	.data_create	= dbfs_d204_create,
-	.data_free	= vfree,
-};
-
-__init int hypfs_diag_init(void)
-{
-	int rc;
-
-	if (diag204_probe()) {
-		pr_info("The hardware system does not support hypfs\n");
-		return -ENODATA;
-	}
-	if (diag204_info_type == INFO_EXT) {
-		rc = hypfs_dbfs_create_file(&dbfs_file_d204);
-		if (rc)
-			return rc;
-	}
-	if (MACHINE_IS_LPAR) {
-		rc = diag224_get_name_table();
-		if (rc) {
-			pr_err("The hardware system does not provide all "
-			       "functions required by hypfs\n");
-			debugfs_remove(dbfs_d204_file);
-			return rc;
-		}
-	}
-	return 0;
-}
-
-void hypfs_diag_exit(void)
-{
-	debugfs_remove(dbfs_d204_file);
-	diag224_delete_name_table();
-	diag204_free_buffer();
-	hypfs_dbfs_remove_file(&dbfs_file_d204);
-}
+ * 0xFFFFF5xx -- Pulse-Width Modulator (PWM)
+ *
+ **********/
 
 /*
- * Functions to create the directory structure
- * *******************************************
+ * PWM Control Register
+ */
+#define PWMC_ADDR	0xfffff500
+#define PWMC		WORD_REF(PWMC_ADDR)
+
+#define PWMC_CLKSEL_MASK	0x0003	/* Clock Selection */
+#define PWMC_CLKSEL_SHIFT	0
+#define PWMC_REPEAT_MASK	0x000c	/* Sample Repeats */
+#define PWMC_REPEAT_SHIFT	2
+#define PWMC_EN			0x0010	/* Enable PWM */
+#define PMNC_FIFOAV		0x0020	/* FIFO Available */
+#define PWMC_IRQEN		0x0040	/* Interrupt Request Enable */
+#define PWMC_IRQ		0x0080	/* Interrupt Request (FIFO empty) */
+#define PWMC_PRESCALER_MASK	0x7f00	/* Incoming Clock prescaler */
+#define PWMC_PRESCALER_SHIFT	8
+#define PWMC_CLKSRC		0x8000	/* Clock Source Select */
+
+/* '328-compatible definitions */
+#define PWMC_PWMEN	PWMC_EN
+
+/*
+ * PWM Sample Register 
+ */
+#define PWMS_ADDR	0xfffff502
+#define PWMS		WORD_REF(PWMS_ADDR)
+
+/*
+ * PWM Period Register
+ */
+#define PWMP_ADDR	0xfffff504
+#define PWMP		BYTE_REF(PWMP_ADDR)
+
+/*
+ * PWM Counter Register
+ */
+#define PWMCNT_ADDR	0xfffff505
+#define PWMCNT		BYTE_REF(PWMCNT_ADDR)
+
+/**********
+ *
+ * 0xFFFFF6xx -- General-Purpose Timer
+ *
+ **********/
+
+/* 
+ * Timer Control register
+ */
+#define TCTL_ADDR	0xfffff600
+#define TCTL		WORD_REF(TCTL_ADDR)
+
+#define	TCTL_TEN		0x0001	/* Timer Enable  */
+#define TCTL_CLKSOURCE_MASK 	0x000e	/* Clock Source: */
+#define   TCTL_CLKSOURCE_STOP	   0x0000	/* Stop count (disabled)    */
+#define   TCTL_CLKSOURCE_SYSCLK	   0x0002	/* SYSCLK to prescaler      */
+#define   TCTL_CLKSOURCE_SYSCLK_16 0x0004	/* SYSCLK/16 to prescaler   */
+#define   TCTL_CLKSOURCE_TIN	   0x0006	/* TIN to prescaler         */
+#define   TCTL_CLKSOURCE_32KHZ	   0x0008	/* 32kHz clock to prescaler */
+#define TCTL_IRQEN		0x0010	/* IRQ Enable    */
+#define TCTL_OM			0x0020	/* Output Mode   */
+#define TCTL_CAP_MASK		0x00c0	/* Capture Edge: */
+#define	  TCTL_CAP_RE		0x0040		/* Capture on rizing edge   */
+#define   TCTL_CAP_FE		0x0080		/* Capture on falling edge  */
+#define TCTL_FRR		0x0010	/* Free-Run Mode */
+
+/* '328-compatible definitions */
+#define TCTL1_ADDR	TCTL_ADDR
+#define TCTL1		TCTL
+
+/*
+ * Timer Prescaler Register
+ */
+#define TPRER_ADDR	0xfffff602
+#define TPRER		WORD_REF(TPRER_ADDR)
+
+/* '328-compatible definitions */
+#define TPRER1_ADDR	TPRER_ADDR
+#define TPRER1		TPRER
+
+/*
+ * Timer Compare Register
+ */
+#define TCMP_ADDR	0xfffff604
+#define TCMP		WORD_REF(TCMP_ADDR)
+
+/* '328-compatible definitions */
+#define TCMP1_ADDR	TCMP_ADDR
+#define TCMP1		TCMP
+
+/*
+ * Timer Capture register
+ */
+#define TCR_ADDR	0xfffff606
+#define TCR		WORD_REF(TCR_ADDR)
+
+/* '328-compatible definitions */
+#define TCR1_ADDR	TCR_ADDR
+#define TCR1		TCR
+
+/*
+ * Timer Counter Register
+ */
+#define TCN_ADDR	0xfffff608
+#define TCN		WORD_REF(TCN_ADDR)
+
+/* '328-compatible definitions */
+#define TCN1_ADDR	TCN_ADDR
+#define TCN1		TCN
+
+/*
+ * Timer Status Register
+ */
+#define TSTAT_ADDR	0xfffff60a
+#define TSTAT		WORD_REF(TSTAT_ADDR)
+
+#define TSTAT_COMP	0x0001		/* Compare Event occurred */
+#define TSTAT_CAPT	0x0001		/* Capture Event occurred */
+
+/* '328-compatible definitions */
+#define TSTAT1_ADDR	TSTAT_ADDR
+#define TSTAT1		TSTAT
+
+/**********
+ *
+ * 0xFFFFF8xx -- Serial Periferial Interface Master (SPIM)
+ *
+ **********/
+
+/*
+ * SPIM Data Register
+ */
+#define SPIMDATA_ADDR	0xfffff800
+#define SPIMDATA	WORD_REF(SPIMDATA_ADDR)
+
+/*
+ * SPIM Control/Status Register
+ */
+#define SPIMCONT_ADDR	0xfffff802
+#define SPIMCONT	WORD_REF(SPIMCONT_ADDR)
+
+#define SPIMCONT_BIT_COUNT_MASK	 0x000f	/* Transfer Length in Bytes */
+#define SPIMCONT_BIT_COUNT_SHIFT 0
+#define SPIMCONT_POL		 0x0010	/* SPMCLK Signel Polarity */
+#define	SPIMCONT_PHA		 0x0020	/* Clock/Data phase relationship */
+#define SPIMCONT_IRQEN		 0x0040 /* IRQ Enable */
+#define SPIMCONT_IRQ		 0x0080	/* Interrupt Request */
+#define SPIMCONT_XCH		 0x0100	/* Exchange */
+#define SPIMCONT_ENABLE		 0x0200	/* Enable SPIM */
+#define SPIMCONT_DATA_RATE_MASK	 0xe000	/* SPIM Data Rate */
+#define SPIMCONT_DATA_RATE_SHIFT 13
+
+/* '328-compatible definitions */
+#define SPIMCONT_SPIMIRQ	SPIMCONT_IRQ
+#define SPIMCONT_SPIMEN		SPIMCONT_ENABLE
+
+/**********
+ *
+ * 0xFFFFF9xx -- UART
+ *
+ **********/
+
+/*
+ * UART Status/Control Register
  */
 
-static int hypfs_create_cpu_files(struct dentry *cpus_dir, void *cpu_info)
-{
-	struct dentry *cpu_dir;
-	char buffer[TMP_SIZE];
-	void *rc;
+#define USTCNT_ADDR	0xfffff900
+#define USTCNT		WORD_REF(USTCNT_ADDR)
 
-	snprintf(buffer, TMP_SIZE, "%d", cpu_info__cpu_addr(diag204_info_type,
-							    cpu_info));
-	cpu_dir = hypfs_mkdir(cpus_dir, buffer);
-	rc = hypfs_create_u64(cpu_dir, "mgmtime",
-			      cpu_info__acc_time(diag204_info_type, cpu_info) -
-			      cpu_info__lp_time(diag204_info_type, cpu_info));
-	if (IS_ERR(rc))
-		return PTR_ERR(rc);
-	rc = hypfs_create_u64(cpu_dir, "cputime",
-			      cpu_info__lp_time(diag204_info_type, cpu_info));
-	if (IS_ERR(rc))
-		return PTR_ERR(rc);
-	if (diag204_info_type == INFO_EXT) {
-		rc = hypfs_create_u64(cpu_dir, "onlinetime",
-				      cpu_info__online_time(diag204_info_type,
-							    cpu_info));
-		if (IS_ERR(rc))
-			return PTR_ERR(rc);
-	}
-	diag224_idx2name(cpu_info__ctidx(diag204_info_type, cpu_info), buffer);
-	rc = hypfs_create_str(cpu_dir, "type", buffer);
-	return PTR_RET(rc);
-}
+#define USTCNT_TXAE	0x0001	/* Transmitter Available Interrupt Enable */
+#define USTCNT_TXHE	0x0002	/* Transmitter Half Empty Enable */
+#define USTCNT_TXEE	0x0004	/* Transmitter Empty Interrupt Enable */
+#define USTCNT_RXRE	0x0008	/* Receiver Ready Interrupt Enable */
+#define USTCNT_RXHE	0x0010	/* Receiver Half-Full Interrupt Enable */
+#define USTCNT_RXFE	0x0020	/* Receiver Full Interrupt Enable */
+#define USTCNT_CTSD	0x0040	/* CTS Delta Interrupt Enable */
+#define USTCNT_ODEN	0x0080	/* Old Data Interrupt Enable */
+#define USTCNT_8_7	0x0100	/* Eight or seven-bit transmission */
+#define USTCNT_STOP	0x0200	/* Stop bit transmission */
+#define USTCNT_ODD	0x0400	/* Odd Parity */
+#define	USTCNT_PEN	0x0800	/* Parity Enable */
+#define USTCNT_CLKM	0x1000	/* Clock Mode Select */
+#define	USTCNT_TXEN	0x2000	/* Transmitter Enable */
+#define USTCNT_RXEN	0x4000	/* Receiver Enable */
+#define USTCNT_UEN	0x8000	/* UART Enable */
 
-static void *hypfs_create_lpar_files(struct dentry *systems_dir, void *part_hdr)
-{
-	struct dentry *cpus_dir;
-	struct dentry *lpar_dir;
-	char lpar_name[LPAR_NAME_LEN + 1];
-	void *cpu_info;
-	int i;
+/* '328-compatible definitions */
+#define USTCNT_TXAVAILEN	USTCNT_TXAE
+#define USTCNT_TXHALFEN		USTCNT_TXHE
+#define USTCNT_TXEMPTYEN	USTCNT_TXEE
+#define USTCNT_RXREADYEN	USTCNT_RXRE
+#define USTCNT_RXHALFEN		USTCNT_RXHE
+#define USTCNT_RXFULLEN		USTCNT_RXFE
+#define USTCNT_CTSDELTAEN	USTCNT_CTSD
+#define USTCNT_ODD_EVEN		USTCNT_ODD
+#define USTCNT_PARITYEN		USTCNT_PEN
+#define USTCNT_CLKMODE		USTCNT_CLKM
+#define USTCNT_UARTEN		USTCNT_UEN
 
-	part_hdr__part_name(diag204_info_type, part_hdr, lpar_name);
-	lpar_name[LPAR_NAME_LEN] = 0;
-	lpar_dir = hypfs_mkdir(systems_dir, lpar_name);
-	if (IS_ERR(lpar_dir))
-		return lpar_dir;
-	cpus_dir = hypfs_mkdir(lpar_dir, "cpus");
-	if (IS_ERR(cpus_dir))
-		return cpus_dir;
-	cpu_info = part_hdr + part_hdr__size(diag204_info_type);
-	for (i = 0; i < part_hdr__rcpus(diag204_info_type, part_hdr); i++) {
-		int rc;
-		rc = hypfs_create_cpu_files(cpus_dir, cpu_info);
-		if (rc)
-			return ERR_PTR(rc);
-		cpu_info += cpu_info__size(diag204_info_type);
-	}
-	return cpu_info;
-}
+/*
+ * UART Baud Control Register
+ */
+#define UBAUD_ADDR	0xfffff902
+#define UBAUD		WORD_REF(UBAUD_ADDR)
 
-static int hypfs_create_phys_cpu_files(struct dentry *cpus_dir, void *cpu_info)
-{
-	struct dentry *cpu_dir;
-	char buffer[TMP_SIZE];
-	void *rc;
+#define UBAUD_PRESCALER_MASK	0x003f	/* Actual divisor is 65 - PRESCALER */
+#define UBAUD_PRESCALER_SHIFT	0
+#define UBAUD_DIVIDE_MASK	0x0700	/* Baud Rate freq. divizor */
+#define UBAUD_DIVIDE_SHIFT	8
+#define UBAUD_BAUD_SRC		0x0800	/* Baud Rate Source */
+#define UBAUD_UCLKDIR		0x2000	/* UCLK Direction */
 
-	snprintf(buffer, TMP_SIZE, "%i", phys_cpu__cpu_addr(diag204_info_type,
-							    cpu_info));
-	cpu_dir = hypfs_mkdir(cpus_dir, buffer);
-	if (IS_ERR(cpu_dir))
-		return PTR_ERR(cpu_dir);
-	rc = hypfs_create_u64(cpu_dir, "mgmtime",
-			      phys_cpu__mgm_time(diag204_info_type, cpu_info));
-	if (IS_ERR(rc))
-		return PTR_ERR(rc);
-	diag224_idx2name(phys_cpu__ctidx(diag204_info_type, cpu_info), buffer);
-	rc = hypfs_create_str(cpu_dir, "type", buffer);
-	return PTR_RET(rc);
-}
+/*
+ * UART Receiver Register 
+ */
+#define URX_ADDR	0xfffff904
+#define URX		WORD_REF(URX_ADDR)
 
-static void *hypfs_create_phys_files(struct dentry *parent_dir, void *phys_hdr)
-{
-	int i;
-	void *cpu_info;
-	struct dentry *cpus_dir;
+#define URX_RXDATA_ADDR	0xfffff905
+#define URX_RXDATA	BYTE_REF(URX_RXDATA_ADDR)
 
-	cpus_dir = hypfs_mkdir(parent_dir, "cpus");
-	if (IS_ERR(cpus_dir))
-		return cpus_dir;
-	cpu_info = phys_hdr + phys_hdr__size(diag204_info_type);
-	for (i = 0; i < phys_hdr__cpus(diag204_info_type, phys_hdr); i++) {
-		int rc;
-		rc = hypfs_create_phys_cpu_files(cpus_dir, cpu_info);
-		if (rc)
-			return ERR_PTR(rc);
-		cpu_info += phys_cpu__size(diag204_info_type);
-	}
-	return cpu_info;
-}
+#define URX_RXDATA_MASK	 0x00ff	/* Received data */
+#define URX_RXDATA_SHIFT 0
+#define URX_PARITY_ERROR 0x0100	/* Parity Error */
+#define URX_BREAK	 0x0200	/* Break Detected */
+#define URX_FRAME_ERROR	 0x0400	/* Framing Error */
+#define URX_OVRUN	 0x0800	/* Serial Overrun */
+#define URX_OLD_DATA	 0x1000	/* Old data in FIFO */
+#define URX_DATA_READY	 0x2000	/* Data Ready (FIFO not empty) */
+#define URX_FIFO_HALF	 0x4000 /* FIFO is Half-Full */
+#define URX_FIFO_FULL	 0x8000	/* FIFO is Full */
 
-int hypfs_diag_create_files(struct dentry *root)
-{
-	struct dentry *systems_dir, *hyp_dir;
-	void *time_hdr, *part_hdr;
-	int i, rc;
-	void *buffer, *ptr;
-
-	buffer = diag204_store();
-	if (IS_ERR(buffer))
-		return PTR_ERR(buffer);
-
-	systems_dir = hypfs_mkdir(root, "systems");
-	if (IS_ERR(systems_dir)) {
-		rc = PTR_ERR(systems_dir);
-		goto err_out;
-	}
-	time_hdr = (struct x_info_blk_hdr *)buffer;
-	part_hdr = time_hdr + info_blk_hdr__size(diag204_info_type);
-	for (i = 0; i < info_blk_hdr__npar(diag204_info_type, time_hdr); i++) {
-		part_hdr = hypfs_create_lpar_files(systems_dir, part_hdr);
-		if (IS_ERR(part_hdr)) {
-			rc = PTR_ERR(part_hdr);
-			goto err_out;
-		}
-	}
-	if (info_blk_hdr__flags(diag204_info_type, time_hdr) & LPAR_PHYS_FLG) {
-		ptr = hypfs_create_phys_files(root, part_hdr);
-		if (IS_ERR(ptr)) {
-			rc = PTR_ERR(ptr);
-			goto err_out;
-		}
-	}
-	hyp_dir = hypfs_mkdir(root, "hyp");
-	if (IS_ERR(hyp_dir)) {
-		rc = PTR_ERR(hyp_dir);
-		goto err_out;
-	}
-	ptr = hypfs_create_str(hyp_dir, "type", "LPAR Hypervisor");
-	if (IS_ERR(ptr)) {
-		rc = PTR_ERR(ptr);
-		goto err_out;
-	}
-	rc = 0;
-
-err_out:
-	return rc;
-}
+/*
+ * UART Transmitter Register 
+ */
+#define UTX_ADDR	0xfffff9

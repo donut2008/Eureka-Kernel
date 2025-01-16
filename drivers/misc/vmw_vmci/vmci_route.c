@@ -1,226 +1,118 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#include <linux/vmw_vmci_defs.h>
-#include <linux/vmw_vmci_api.h>
-
-#include "vmci_context.h"
-#include "vmci_driver.h"
-#include "vmci_route.h"
-
-/*
- * Make a routing decision for the given source and destination handles.
- * This will try to determine the route using the handles and the available
- * devices.  Will set the source context if it is invalid.
- */
-int vmci_route(struct vmci_handle *src,
-	       const struct vmci_handle *dst,
-	       bool from_guest,
-	       enum vmci_route *route)
-{
-	bool has_host_device = vmci_host_code_active();
-	bool has_guest_device = vmci_guest_code_active();
-
-	*route = VMCI_ROUTE_NONE;
-
-	/*
-	 * "from_guest" is only ever set to true by
-	 * IOCTL_VMCI_DATAGRAM_SEND (or by the vmkernel equivalent),
-	 * which comes from the VMX, so we know it is coming from a
-	 * guest.
-	 *
-	 * To avoid inconsistencies, test these once.  We will test
-	 * them again when we do the actual send to ensure that we do
-	 * not touch a non-existent device.
-	 */
-
-	/* Must have a valid destination context. */
-	if (VMCI_INVALID_ID == dst->context)
-		return VMCI_ERROR_INVALID_ARGS;
-
-	/* Anywhere to hypervisor. */
-	if (VMCI_HYPERVISOR_CONTEXT_ID == dst->context) {
-
-		/*
-		 * If this message already came from a guest then we
-		 * cannot send it to the hypervisor.  It must come
-		 * from a local client.
-		 */
-		if (from_guest)
-			return VMCI_ERROR_DST_UNREACHABLE;
-
-		/*
-		 * We must be acting as a guest in order to send to
-		 * the hypervisor.
-		 */
-		if (!has_guest_device)
-			return VMCI_ERROR_DEVICE_NOT_FOUND;
-
-		/* And we cannot send if the source is the host context. */
-		if (VMCI_HOST_CONTEXT_ID == src->context)
-			return VMCI_ERROR_INVALID_ARGS;
-
-		/*
-		 * If the client passed the ANON source handle then
-		 * respect it (both context and resource are invalid).
-		 * However, if they passed only an invalid context,
-		 * then they probably mean ANY, in which case we
-		 * should set the real context here before passing it
-		 * down.
-		 */
-		if (VMCI_INVALID_ID == src->context &&
-		    VMCI_INVALID_ID != src->resource)
-			src->context = vmci_get_context_id();
-
-		/* Send from local client down to the hypervisor. */
-		*route = VMCI_ROUTE_AS_GUEST;
-		return VMCI_SUCCESS;
-	}
-
-	/* Anywhere to local client on host. */
-	if (VMCI_HOST_CONTEXT_ID == dst->context) {
-		/*
-		 * If it is not from a guest but we are acting as a
-		 * guest, then we need to send it down to the host.
-		 * Note that if we are also acting as a host then this
-		 * will prevent us from sending from local client to
-		 * local client, but we accept that restriction as a
-		 * way to remove any ambiguity from the host context.
-		 */
-		if (src->context == VMCI_HYPERVISOR_CONTEXT_ID) {
-			/*
-			 * If the hypervisor is the source, this is
-			 * host local communication. The hypervisor
-			 * may send vmci event datagrams to the host
-			 * itself, but it will never send datagrams to
-			 * an "outer host" through the guest device.
-			 */
-
-			if (has_host_device) {
-				*route = VMCI_ROUTE_AS_HOST;
-				return VMCI_SUCCESS;
-			} else {
-				return VMCI_ERROR_DEVICE_NOT_FOUND;
-			}
-		}
-
-		if (!from_guest && has_guest_device) {
-			/* If no source context then use the current. */
-			if (VMCI_INVALID_ID == src->context)
-				src->context = vmci_get_context_id();
-
-			/* Send it from local client down to the host. */
-			*route = VMCI_ROUTE_AS_GUEST;
-			return VMCI_SUCCESS;
-		}
-
-		/*
-		 * Otherwise we already received it from a guest and
-		 * it is destined for a local client on this host, or
-		 * it is from another local client on this host.  We
-		 * must be acting as a host to service it.
-		 */
-		if (!has_host_device)
-			return VMCI_ERROR_DEVICE_NOT_FOUND;
-
-		if (VMCI_INVALID_ID == src->context) {
-			/*
-			 * If it came from a guest then it must have a
-			 * valid context.  Otherwise we can use the
-			 * host context.
-			 */
-			if (from_guest)
-				return VMCI_ERROR_INVALID_ARGS;
-
-			src->context = VMCI_HOST_CONTEXT_ID;
-		}
-
-		/* Route to local client. */
-		*route = VMCI_ROUTE_AS_HOST;
-		return VMCI_SUCCESS;
-	}
-
-	/*
-	 * If we are acting as a host then this might be destined for
-	 * a guest.
-	 */
-	if (has_host_device) {
-		/* It will have a context if it is meant for a guest. */
-		if (vmci_ctx_exists(dst->context)) {
-			if (VMCI_INVALID_ID == src->context) {
-				/*
-				 * If it came from a guest then it
-				 * must have a valid context.
-				 * Otherwise we can use the host
-				 * context.
-				 */
-
-				if (from_guest)
-					return VMCI_ERROR_INVALID_ARGS;
-
-				src->context = VMCI_HOST_CONTEXT_ID;
-			} else if (VMCI_CONTEXT_IS_VM(src->context) &&
-				   src->context != dst->context) {
-				/*
-				 * VM to VM communication is not
-				 * allowed. Since we catch all
-				 * communication destined for the host
-				 * above, this must be destined for a
-				 * VM since there is a valid context.
-				 */
-
-				return VMCI_ERROR_DST_UNREACHABLE;
-			}
-
-			/* Pass it up to the guest. */
-			*route = VMCI_ROUTE_AS_HOST;
-			return VMCI_SUCCESS;
-		} else if (!has_guest_device) {
-			/*
-			 * The host is attempting to reach a CID
-			 * without an active context, and we can't
-			 * send it down, since we have no guest
-			 * device.
-			 */
-
-			return VMCI_ERROR_DST_UNREACHABLE;
-		}
-	}
-
-	/*
-	 * We must be a guest trying to send to another guest, which means
-	 * we need to send it down to the host. We do not filter out VM to
-	 * VM communication here, since we want to be able to use the guest
-	 * driver on older versions that do support VM to VM communication.
-	 */
-	if (!has_guest_device) {
-		/*
-		 * Ending up here means we have neither guest nor host
-		 * device.
-		 */
-		return VMCI_ERROR_DEVICE_NOT_FOUND;
-	}
-
-	/* If no source context then use the current context. */
-	if (VMCI_INVALID_ID == src->context)
-		src->context = vmci_get_context_id();
-
-	/*
-	 * Send it from local client down to the host, which will
-	 * route it to the other guest for us.
-	 */
-	*route = VMCI_ROUTE_AS_GUEST;
-	return VMCI_SUCCESS;
-}
+DGFX_FB_VGA_STALL_EN_MASK 0x20
+#define BIF_VDDGFX_FB_CMP__VDDGFX_FB_VGA_STALL_EN__SHIFT 0x5
+#define BIF_SMU_INDEX__BIF_SMU_INDEX_MASK 0x7fffc
+#define BIF_SMU_INDEX__BIF_SMU_INDEX__SHIFT 0x2
+#define BIF_SMU_DATA__BIF_SMU_DATA_MASK 0x7fffc
+#define BIF_SMU_DATA__BIF_SMU_DATA__SHIFT 0x2
+#define BIF_DOORBELL_GBLAPER1_LOWER__DOORBELL_GBLAPER1_LOWER_MASK 0xffc
+#define BIF_DOORBELL_GBLAPER1_LOWER__DOORBELL_GBLAPER1_LOWER__SHIFT 0x2
+#define BIF_DOORBELL_GBLAPER1_LOWER__DOORBELL_GBLAPER1_EN_MASK 0x80000000
+#define BIF_DOORBELL_GBLAPER1_LOWER__DOORBELL_GBLAPER1_EN__SHIFT 0x1f
+#define BIF_DOORBELL_GBLAPER1_UPPER__DOORBELL_GBLAPER1_UPPER_MASK 0xffc
+#define BIF_DOORBELL_GBLAPER1_UPPER__DOORBELL_GBLAPER1_UPPER__SHIFT 0x2
+#define BIF_DOORBELL_GBLAPER2_LOWER__DOORBELL_GBLAPER2_LOWER_MASK 0xffc
+#define BIF_DOORBELL_GBLAPER2_LOWER__DOORBELL_GBLAPER2_LOWER__SHIFT 0x2
+#define BIF_DOORBELL_GBLAPER2_LOWER__DOORBELL_GBLAPER2_EN_MASK 0x80000000
+#define BIF_DOORBELL_GBLAPER2_LOWER__DOORBELL_GBLAPER2_EN__SHIFT 0x1f
+#define BIF_DOORBELL_GBLAPER2_UPPER__DOORBELL_GBLAPER2_UPPER_MASK 0xffc
+#define BIF_DOORBELL_GBLAPER2_UPPER__DOORBELL_GBLAPER2_UPPER__SHIFT 0x2
+#define IMPCTL_RESET__IMP_SW_RESET_MASK 0x1
+#define IMPCTL_RESET__IMP_SW_RESET__SHIFT 0x0
+#define GARLIC_FLUSH_CNTL__CP_RB0_WPTR_MASK 0x1
+#define GARLIC_FLUSH_CNTL__CP_RB0_WPTR__SHIFT 0x0
+#define GARLIC_FLUSH_CNTL__CP_RB1_WPTR_MASK 0x2
+#define GARLIC_FLUSH_CNTL__CP_RB1_WPTR__SHIFT 0x1
+#define GARLIC_FLUSH_CNTL__CP_RB2_WPTR_MASK 0x4
+#define GARLIC_FLUSH_CNTL__CP_RB2_WPTR__SHIFT 0x2
+#define GARLIC_FLUSH_CNTL__UVD_RBC_RB_WPTR_MASK 0x8
+#define GARLIC_FLUSH_CNTL__UVD_RBC_RB_WPTR__SHIFT 0x3
+#define GARLIC_FLUSH_CNTL__SDMA0_GFX_RB_WPTR_MASK 0x10
+#define GARLIC_FLUSH_CNTL__SDMA0_GFX_RB_WPTR__SHIFT 0x4
+#define GARLIC_FLUSH_CNTL__SDMA1_GFX_RB_WPTR_MASK 0x20
+#define GARLIC_FLUSH_CNTL__SDMA1_GFX_RB_WPTR__SHIFT 0x5
+#define GARLIC_FLUSH_CNTL__CP_DMA_ME_COMMAND_MASK 0x40
+#define GARLIC_FLUSH_CNTL__CP_DMA_ME_COMMAND__SHIFT 0x6
+#define GARLIC_FLUSH_CNTL__CP_DMA_PFP_COMMAND_MASK 0x80
+#define GARLIC_FLUSH_CNTL__CP_DMA_PFP_COMMAND__SHIFT 0x7
+#define GARLIC_FLUSH_CNTL__SAM_SAB_RBI_WPTR_MASK 0x100
+#define GARLIC_FLUSH_CNTL__SAM_SAB_RBI_WPTR__SHIFT 0x8
+#define GARLIC_FLUSH_CNTL__SAM_SAB_RBO_WPTR_MASK 0x200
+#define GARLIC_FLUSH_CNTL__SAM_SAB_RBO_WPTR__SHIFT 0x9
+#define GARLIC_FLUSH_CNTL__VCE_OUT_RB_WPTR_MASK 0x400
+#define GARLIC_FLUSH_CNTL__VCE_OUT_RB_WPTR__SHIFT 0xa
+#define GARLIC_FLUSH_CNTL__VCE_RB_WPTR2_MASK 0x800
+#define GARLIC_FLUSH_CNTL__VCE_RB_WPTR2__SHIFT 0xb
+#define GARLIC_FLUSH_CNTL__VCE_RB_WPTR_MASK 0x1000
+#define GARLIC_FLUSH_CNTL__VCE_RB_WPTR__SHIFT 0xc
+#define GARLIC_FLUSH_CNTL__HOST_DOORBELL_MASK 0x2000
+#define GARLIC_FLUSH_CNTL__HOST_DOORBELL__SHIFT 0xd
+#define GARLIC_FLUSH_CNTL__SELFRING_DOORBELL_MASK 0x4000
+#define GARLIC_FLUSH_CNTL__SELFRING_DOORBELL__SHIFT 0xe
+#define GARLIC_FLUSH_CNTL__CP_DMA_PIO_COMMAND_MASK 0x8000
+#define GARLIC_FLUSH_CNTL__CP_DMA_PIO_COMMAND__SHIFT 0xf
+#define GARLIC_FLUSH_CNTL__DISPLAY_MASK 0x10000
+#define GARLIC_FLUSH_CNTL__DISPLAY__SHIFT 0x10
+#define GARLIC_FLUSH_CNTL__SDMA2_GFX_RB_WPTR_MASK 0x20000
+#define GARLIC_FLUSH_CNTL__SDMA2_GFX_RB_WPTR__SHIFT 0x11
+#define GARLIC_FLUSH_CNTL__SDMA3_GFX_RB_WPTR_MASK 0x40000
+#define GARLIC_FLUSH_CNTL__SDMA3_GFX_RB_WPTR__SHIFT 0x12
+#define GARLIC_FLUSH_CNTL__IGNORE_MC_DISABLE_MASK 0x40000000
+#define GARLIC_FLUSH_CNTL__IGNORE_MC_DISABLE__SHIFT 0x1e
+#define GARLIC_FLUSH_CNTL__DISABLE_ALL_MASK 0x80000000
+#define GARLIC_FLUSH_CNTL__DISABLE_ALL__SHIFT 0x1f
+#define GARLIC_FLUSH_ADDR_START_0__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_0__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_0__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_0__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_0__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_0__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_1__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_1__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_1__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_1__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_1__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_1__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_2__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_2__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_2__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_2__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_2__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_2__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_3__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_3__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_3__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_3__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_3__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_3__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_4__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_4__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_4__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_4__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_4__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_4__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_5__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_5__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_5__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_5__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_5__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_5__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_6__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_6__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_6__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_6__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_6__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_6__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_START_7__ENABLE_MASK 0x1
+#define GARLIC_FLUSH_ADDR_START_7__ENABLE__SHIFT 0x0
+#define GARLIC_FLUSH_ADDR_START_7__MODE_MASK 0x2
+#define GARLIC_FLUSH_ADDR_START_7__MODE__SHIFT 0x1
+#define GARLIC_FLUSH_ADDR_START_7__ADDR_START_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_START_7__ADDR_START__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_0__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_0__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_1__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_1__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_2__ADDR_END_MASK 0xfffffffc
+#define GARLIC_FLUSH_ADDR_END_2__ADDR_END__SHIFT 0x2
+#define GARLIC_FLUSH_ADDR_END_3__ADDR_END_MASK 0xfffffffc
+#de

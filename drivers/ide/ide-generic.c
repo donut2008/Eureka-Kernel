@@ -1,149 +1,155 @@
-/*
- * generic/default IDE host driver
- *
- * Copyright (C) 2004, 2008-2009 Bartlomiej Zolnierkiewicz
- * This code was split off from ide.c.  See it for original copyrights.
- *
- * May be copied or modified under the terms of the GNU General Public License.
+eturn true;
+}
+
+/**
+ * ioat_check_space_lock - verify space and grab ring producer lock
+ * @ioat: ioat,3 channel (ring) to operate on
+ * @num_descs: allocation length
  */
-
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/ide.h>
-#include <linux/pci_ids.h>
-
-/* FIXME: convert arm and m32r to use ide_platform host driver */
-#ifdef CONFIG_ARM
-#include <asm/irq.h>
-#endif
-#ifdef CONFIG_M32R
-#include <asm/m32r.h>
-#endif
-
-#define DRV_NAME	"ide_generic"
-
-static int probe_mask;
-module_param(probe_mask, int, 0);
-MODULE_PARM_DESC(probe_mask, "probe mask for legacy ISA IDE ports");
-
-static const struct ide_port_info ide_generic_port_info = {
-	.host_flags		= IDE_HFLAG_NO_DMA,
-	.chipset		= ide_generic,
-};
-
-#ifdef CONFIG_ARM
-static const u16 legacy_bases[] = { 0x1f0 };
-static const int legacy_irqs[]  = { IRQ_HARDDISK };
-#elif defined(CONFIG_PLAT_M32700UT) || defined(CONFIG_PLAT_MAPPI2) || \
-      defined(CONFIG_PLAT_OPSPUT)
-static const u16 legacy_bases[] = { 0x1f0 };
-static const int legacy_irqs[]  = { PLD_IRQ_CFIREQ };
-#elif defined(CONFIG_PLAT_MAPPI3)
-static const u16 legacy_bases[] = { 0x1f0, 0x170 };
-static const int legacy_irqs[]  = { PLD_IRQ_CFIREQ, PLD_IRQ_IDEIREQ };
-#elif defined(CONFIG_ALPHA)
-static const u16 legacy_bases[] = { 0x1f0, 0x170, 0x1e8, 0x168 };
-static const int legacy_irqs[]  = { 14, 15, 11, 10 };
-#else
-static const u16 legacy_bases[] = { 0x1f0, 0x170, 0x1e8, 0x168, 0x1e0, 0x160 };
-static const int legacy_irqs[]  = { 14, 15, 11, 10, 8, 12 };
-#endif
-
-static void ide_generic_check_pci_legacy_iobases(int *primary, int *secondary)
+int ioat_check_space_lock(struct ioatdma_chan *ioat_chan, int num_descs)
+	__acquires(&ioat_chan->prep_lock)
 {
-#ifdef CONFIG_PCI
-	struct pci_dev *p = NULL;
-	u16 val;
+	bool retry;
 
-	for_each_pci_dev(p) {
-		if (pci_resource_start(p, 0) == 0x1f0)
-			*primary = 1;
-		if (pci_resource_start(p, 2) == 0x170)
-			*secondary = 1;
-
-		/* Cyrix CS55{1,2}0 pre SFF MWDMA ATA on the bridge */
-		if (p->vendor == PCI_VENDOR_ID_CYRIX &&
-		    (p->device == PCI_DEVICE_ID_CYRIX_5510 ||
-		     p->device == PCI_DEVICE_ID_CYRIX_5520))
-			*primary = *secondary = 1;
-
-		/* Intel MPIIX - PIO ATA on non PCI side of bridge */
-		if (p->vendor == PCI_VENDOR_ID_INTEL &&
-		    p->device == PCI_DEVICE_ID_INTEL_82371MX) {
-			pci_read_config_word(p, 0x6C, &val);
-			if (val & 0x8000) {
-				/* ATA port enabled */
-				if (val & 0x4000)
-					*secondary = 1;
-				else
-					*primary = 1;
-			}
-		}
+ retry:
+	spin_lock_bh(&ioat_chan->prep_lock);
+	/* never allow the last descriptor to be consumed, we need at
+	 * least one free at all times to allow for on-the-fly ring
+	 * resizing.
+	 */
+	if (likely(ioat_ring_space(ioat_chan) > num_descs)) {
+		dev_dbg(to_dev(ioat_chan), "%s: num_descs: %d (%x:%x:%x)\n",
+			__func__, num_descs, ioat_chan->head,
+			ioat_chan->tail, ioat_chan->issued);
+		ioat_chan->produce = num_descs;
+		return 0;  /* with ioat->prep_lock held */
 	}
-#endif
-}
+	retry = test_and_set_bit(IOAT_RESHAPE_PENDING, &ioat_chan->state);
+	spin_unlock_bh(&ioat_chan->prep_lock);
 
-static int __init ide_generic_init(void)
-{
-	struct ide_hw hw, *hws[] = { &hw };
-	unsigned long io_addr;
-	int i, rc = 0, primary = 0, secondary = 0;
+	/* is another cpu already trying to expand the ring? */
+	if (retry)
+		goto retry;
 
-	ide_generic_check_pci_legacy_iobases(&primary, &secondary);
+	spin_lock_bh(&ioat_chan->cleanup_lock);
+	spin_lock_bh(&ioat_chan->prep_lock);
+	retry = reshape_ring(ioat_chan, ioat_chan->alloc_order + 1);
+	clear_bit(IOAT_RESHAPE_PENDING, &ioat_chan->state);
+	spin_unlock_bh(&ioat_chan->prep_lock);
+	spin_unlock_bh(&ioat_chan->cleanup_lock);
 
-	if (!probe_mask) {
-		printk(KERN_INFO DRV_NAME ": please use \"probe_mask=0x3f\" "
-		     "module parameter for probing all legacy ISA IDE ports\n");
+	/* if we were able to expand the ring retry the allocation */
+	if (retry)
+		goto retry;
 
-		if (primary == 0)
-			probe_mask |= 0x1;
+	dev_dbg_ratelimited(to_dev(ioat_chan),
+			    "%s: ring full! num_descs: %d (%x:%x:%x)\n",
+			    __func__, num_descs, ioat_chan->head,
+			    ioat_chan->tail, ioat_chan->issued);
 
-		if (secondary == 0)
-			probe_mask |= 0x2;
-	} else
-		printk(KERN_INFO DRV_NAME ": enforcing probing of I/O ports "
-			"upon user request\n");
-
-	for (i = 0; i < ARRAY_SIZE(legacy_bases); i++) {
-		io_addr = legacy_bases[i];
-
-		if ((probe_mask & (1 << i)) && io_addr) {
-			if (!request_region(io_addr, 8, DRV_NAME)) {
-				printk(KERN_ERR "%s: I/O resource 0x%lX-0x%lX "
-						"not free.\n",
-						DRV_NAME, io_addr, io_addr + 7);
-				rc = -EBUSY;
-				continue;
-			}
-
-			if (!request_region(io_addr + 0x206, 1, DRV_NAME)) {
-				printk(KERN_ERR "%s: I/O resource 0x%lX "
-						"not free.\n",
-						DRV_NAME, io_addr + 0x206);
-				release_region(io_addr, 8);
-				rc = -EBUSY;
-				continue;
-			}
-
-			memset(&hw, 0, sizeof(hw));
-			ide_std_init_ports(&hw, io_addr, io_addr + 0x206);
-#ifdef CONFIG_IA64
-			hw.irq = isa_irq_to_vector(legacy_irqs[i]);
-#else
-			hw.irq = legacy_irqs[i];
-#endif
-			rc = ide_host_add(&ide_generic_port_info, hws, 1, NULL);
-			if (rc) {
-				release_region(io_addr + 0x206, 1);
-				release_region(io_addr, 8);
-			}
-		}
+	/* progress reclaim in the allocation failure case we may be
+	 * called under bh_disabled so we need to trigger the timer
+	 * event directly
+	 */
+	if (time_is_before_jiffies(ioat_chan->timer.expires)
+	    && timer_pending(&ioat_chan->timer)) {
+		mod_timer(&ioat_chan->timer, jiffies + COMPLETION_TIMEOUT);
+		ioat_timer_event((unsigned long)ioat_chan);
 	}
 
-	return rc;
+	return -ENOMEM;
 }
 
-module_init(ide_generic_init);
+static bool desc_has_ext(struct ioat_ring_ent *desc)
+{
+	struct ioat_dma_descriptor *hw = desc->hw;
 
-MODULE_LICENSE("GPL");
+	if (hw->ctl_f.op == IOAT_OP_XOR ||
+	    hw->ctl_f.op == IOAT_OP_XOR_VAL) {
+		struct ioat_xor_descriptor *xor = desc->xor;
+
+		if (src_cnt_to_sw(xor->ctl_f.src_cnt) > 5)
+			return true;
+	} else if (hw->ctl_f.op == IOAT_OP_PQ ||
+		   hw->ctl_f.op == IOAT_OP_PQ_VAL) {
+		struct ioat_pq_descriptor *pq = desc->pq;
+
+		if (src_cnt_to_sw(pq->ctl_f.src_cnt) > 3)
+			return true;
+	}
+
+	return false;
+}
+
+static void
+ioat_free_sed(struct ioatdma_device *ioat_dma, struct ioat_sed_ent *sed)
+{
+	if (!sed)
+		return;
+
+	dma_pool_free(ioat_dma->sed_hw_pool[sed->hw_pool], sed->hw, sed->dma);
+	kmem_cache_free(ioat_sed_cache, sed);
+}
+
+static u64 ioat_get_current_completion(struct ioatdma_chan *ioat_chan)
+{
+	u64 phys_complete;
+	u64 completion;
+
+	completion = *ioat_chan->completion;
+	phys_complete = ioat_chansts_to_addr(completion);
+
+	dev_dbg(to_dev(ioat_chan), "%s: phys_complete: %#llx\n", __func__,
+		(unsigned long long) phys_complete);
+
+	return phys_complete;
+}
+
+static bool ioat_cleanup_preamble(struct ioatdma_chan *ioat_chan,
+				   u64 *phys_complete)
+{
+	*phys_complete = ioat_get_current_completion(ioat_chan);
+	if (*phys_complete == ioat_chan->last_completion)
+		return false;
+
+	clear_bit(IOAT_COMPLETION_ACK, &ioat_chan->state);
+	mod_timer(&ioat_chan->timer, jiffies + COMPLETION_TIMEOUT);
+
+	return true;
+}
+
+static void
+desc_get_errstat(struct ioatdma_chan *ioat_chan, struct ioat_ring_ent *desc)
+{
+	struct ioat_dma_descriptor *hw = desc->hw;
+
+	switch (hw->ctl_f.op) {
+	case IOAT_OP_PQ_VAL:
+	case IOAT_OP_PQ_VAL_16S:
+	{
+		struct ioat_pq_descriptor *pq = desc->pq;
+
+		/* check if there's error written */
+		if (!pq->dwbes_f.wbes)
+			return;
+
+		/* need to set a chanerr var for checking to clear later */
+
+		if (pq->dwbes_f.p_val_err)
+			*desc->result |= SUM_CHECK_P_RESULT;
+
+		if (pq->dwbes_f.q_val_err)
+			*desc->result |= SUM_CHECK_Q_RESULT;
+
+		return;
+	}
+	default:
+		return;
+	}
+}
+
+/**
+ * __cleanup - reclaim used descriptors
+ * @ioat: channel (ring) to clean
+ */
+static void __clean

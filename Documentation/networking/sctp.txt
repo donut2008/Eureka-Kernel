@@ -1,35 +1,47 @@
-Linux Kernel SCTP 
+/*
+ * Synopsys DDR ECC Driver
+ * This driver is based on ppc4xx_edac.c drivers
+ *
+ * Copyright (C) 2012 - 2014 Xilinx, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details
+ */
 
-This is the current BETA release of the Linux Kernel SCTP reference
-implementation.  
+#include <linux/edac.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
 
-SCTP (Stream Control Transmission Protocol) is a IP based, message oriented,
-reliable transport protocol, with congestion control, support for
-transparent multi-homing, and multiple ordered streams of messages.
-RFC2960 defines the core protocol.  The IETF SIGTRAN working group originally
-developed the SCTP protocol and later handed the protocol over to the 
-Transport Area (TSVWG) working group for the continued evolvement of SCTP as a 
-general purpose transport.  
+#include "edac_core.h"
 
-See the IETF website (http://www.ietf.org) for further documents on SCTP. 
-See http://www.ietf.org/rfc/rfc2960.txt 
+/* Number of cs_rows needed per memory controller */
+#define SYNPS_EDAC_NR_CSROWS	1
 
-The initial project goal is to create an Linux kernel reference implementation
-of SCTP that is RFC 2960 compliant and provides an programming interface 
-referred to as the  UDP-style API of the Sockets Extensions for SCTP, as 
-proposed in IETF Internet-Drafts.    
+/* Number of channels per memory controller */
+#define SYNPS_EDAC_NR_CHANS	1
 
-Caveats:  
+/* Granularity of reported error in bytes */
+#define SYNPS_EDAC_ERR_GRAIN	1
 
--lksctp can be built as statically or as a module.  However, be aware that 
-module removal of lksctp is not yet a safe activity.   
+#define SYNPS_EDAC_MSG_SIZE	256
 
--There is tentative support for IPv6, but most work has gone towards 
-implementation and testing lksctp on IPv4.   
+#define SYNPS_EDAC_MOD_STRING	"synps_edac"
+#define SYNPS_EDAC_MOD_VER	"1"
 
+/* Synopsys DDR memory controller registers that are relevant to ECC */
+#define CTRL_OFST		0x0
+#define T_ZQ_OFST		0xA4
 
-For more information, please visit the lksctp project website:
-   http://www.sf.net/projects/lksctp
-
-Or contact the lksctp developers through the mailing list:
-   <linux-sctp@vger.kernel.org>
+/* ECC control register */
+#d

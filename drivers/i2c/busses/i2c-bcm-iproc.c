@@ -1,517 +1,256 @@
-/*
- * Copyright (C) 2014 Broadcom Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation version 2.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/delay.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
-
-#define CFG_OFFSET                   0x00
-#define CFG_RESET_SHIFT              31
-#define CFG_EN_SHIFT                 30
-#define CFG_M_RETRY_CNT_SHIFT        16
-#define CFG_M_RETRY_CNT_MASK         0x0f
-
-#define TIM_CFG_OFFSET               0x04
-#define TIM_CFG_MODE_400_SHIFT       31
-
-#define M_FIFO_CTRL_OFFSET           0x0c
-#define M_FIFO_RX_FLUSH_SHIFT        31
-#define M_FIFO_TX_FLUSH_SHIFT        30
-#define M_FIFO_RX_CNT_SHIFT          16
-#define M_FIFO_RX_CNT_MASK           0x7f
-#define M_FIFO_RX_THLD_SHIFT         8
-#define M_FIFO_RX_THLD_MASK          0x3f
-
-#define M_CMD_OFFSET                 0x30
-#define M_CMD_START_BUSY_SHIFT       31
-#define M_CMD_STATUS_SHIFT           25
-#define M_CMD_STATUS_MASK            0x07
-#define M_CMD_STATUS_SUCCESS         0x0
-#define M_CMD_STATUS_LOST_ARB        0x1
-#define M_CMD_STATUS_NACK_ADDR       0x2
-#define M_CMD_STATUS_NACK_DATA       0x3
-#define M_CMD_STATUS_TIMEOUT         0x4
-#define M_CMD_PROTOCOL_SHIFT         9
-#define M_CMD_PROTOCOL_MASK          0xf
-#define M_CMD_PROTOCOL_BLK_WR        0x7
-#define M_CMD_PROTOCOL_BLK_RD        0x8
-#define M_CMD_PEC_SHIFT              8
-#define M_CMD_RD_CNT_SHIFT           0
-#define M_CMD_RD_CNT_MASK            0xff
-
-#define IE_OFFSET                    0x38
-#define IE_M_RX_FIFO_FULL_SHIFT      31
-#define IE_M_RX_THLD_SHIFT           30
-#define IE_M_START_BUSY_SHIFT        28
-
-#define IS_OFFSET                    0x3c
-#define IS_M_RX_FIFO_FULL_SHIFT      31
-#define IS_M_RX_THLD_SHIFT           30
-#define IS_M_START_BUSY_SHIFT        28
-
-#define M_TX_OFFSET                  0x40
-#define M_TX_WR_STATUS_SHIFT         31
-#define M_TX_DATA_SHIFT              0
-#define M_TX_DATA_MASK               0xff
-
-#define M_RX_OFFSET                  0x44
-#define M_RX_STATUS_SHIFT            30
-#define M_RX_STATUS_MASK             0x03
-#define M_RX_PEC_ERR_SHIFT           29
-#define M_RX_DATA_SHIFT              0
-#define M_RX_DATA_MASK               0xff
-
-#define I2C_TIMEOUT_MESC             100
-#define M_TX_RX_FIFO_SIZE            64
-
-enum bus_speed_index {
-	I2C_SPD_100K = 0,
-	I2C_SPD_400K,
-};
-
-struct bcm_iproc_i2c_dev {
-	struct device *device;
-	int irq;
-
-	void __iomem *base;
-
-	struct i2c_adapter adapter;
-	unsigned int bus_speed;
-
-	struct completion done;
-	int xfer_is_done;
-};
-
-/*
- * Can be expanded in the future if more interrupt status bits are utilized
- */
-#define ISR_MASK (1 << IS_M_START_BUSY_SHIFT)
-
-static irqreturn_t bcm_iproc_i2c_isr(int irq, void *data)
-{
-	struct bcm_iproc_i2c_dev *iproc_i2c = data;
-	u32 status = readl(iproc_i2c->base + IS_OFFSET);
-
-	status &= ISR_MASK;
-
-	if (!status)
-		return IRQ_NONE;
-
-	writel(status, iproc_i2c->base + IS_OFFSET);
-	iproc_i2c->xfer_is_done = 1;
-	complete_all(&iproc_i2c->done);
-
-	return IRQ_HANDLED;
-}
-
-static int bcm_iproc_i2c_check_status(struct bcm_iproc_i2c_dev *iproc_i2c,
-				      struct i2c_msg *msg)
-{
-	u32 val;
-
-	val = readl(iproc_i2c->base + M_CMD_OFFSET);
-	val = (val >> M_CMD_STATUS_SHIFT) & M_CMD_STATUS_MASK;
-
-	switch (val) {
-	case M_CMD_STATUS_SUCCESS:
-		return 0;
-
-	case M_CMD_STATUS_LOST_ARB:
-		dev_dbg(iproc_i2c->device, "lost bus arbitration\n");
-		return -EAGAIN;
-
-	case M_CMD_STATUS_NACK_ADDR:
-		dev_dbg(iproc_i2c->device, "NAK addr:0x%02x\n", msg->addr);
-		return -ENXIO;
-
-	case M_CMD_STATUS_NACK_DATA:
-		dev_dbg(iproc_i2c->device, "NAK data\n");
-		return -ENXIO;
-
-	case M_CMD_STATUS_TIMEOUT:
-		dev_dbg(iproc_i2c->device, "bus timeout\n");
-		return -ETIMEDOUT;
-
-	default:
-		dev_dbg(iproc_i2c->device, "unknown error code=%d\n", val);
-		return -EIO;
-	}
-}
-
-static int bcm_iproc_i2c_xfer_single_msg(struct bcm_iproc_i2c_dev *iproc_i2c,
-					 struct i2c_msg *msg)
-{
-	int ret, i;
-	u8 addr;
-	u32 val;
-	unsigned long time_left = msecs_to_jiffies(I2C_TIMEOUT_MESC);
-
-	/* check if bus is busy */
-	if (!!(readl(iproc_i2c->base + M_CMD_OFFSET) &
-	       BIT(M_CMD_START_BUSY_SHIFT))) {
-		dev_warn(iproc_i2c->device, "bus is busy\n");
-		return -EBUSY;
-	}
-
-	/* format and load slave address into the TX FIFO */
-	addr = msg->addr << 1 | (msg->flags & I2C_M_RD ? 1 : 0);
-	writel(addr, iproc_i2c->base + M_TX_OFFSET);
-
-	/* for a write transaction, load data into the TX FIFO */
-	if (!(msg->flags & I2C_M_RD)) {
-		for (i = 0; i < msg->len; i++) {
-			val = msg->buf[i];
-
-			/* mark the last byte */
-			if (i == msg->len - 1)
-				val |= 1 << M_TX_WR_STATUS_SHIFT;
-
-			writel(val, iproc_i2c->base + M_TX_OFFSET);
-		}
-	}
-
-	/* mark as incomplete before starting the transaction */
-	reinit_completion(&iproc_i2c->done);
-	iproc_i2c->xfer_is_done = 0;
-
-	/*
-	 * Enable the "start busy" interrupt, which will be triggered after the
-	 * transaction is done, i.e., the internal start_busy bit, transitions
-	 * from 1 to 0.
-	 */
-	writel(1 << IE_M_START_BUSY_SHIFT, iproc_i2c->base + IE_OFFSET);
-
-	/*
-	 * Now we can activate the transfer. For a read operation, specify the
-	 * number of bytes to read
-	 */
-	val = 1 << M_CMD_START_BUSY_SHIFT;
-	if (msg->flags & I2C_M_RD) {
-		val |= (M_CMD_PROTOCOL_BLK_RD << M_CMD_PROTOCOL_SHIFT) |
-		       (msg->len << M_CMD_RD_CNT_SHIFT);
-	} else {
-		val |= (M_CMD_PROTOCOL_BLK_WR << M_CMD_PROTOCOL_SHIFT);
-	}
-	writel(val, iproc_i2c->base + M_CMD_OFFSET);
-
-	time_left = wait_for_completion_timeout(&iproc_i2c->done, time_left);
-
-	/* disable all interrupts */
-	writel(0, iproc_i2c->base + IE_OFFSET);
-	/* read it back to flush the write */
-	readl(iproc_i2c->base + IE_OFFSET);
-
-	/* make sure the interrupt handler isn't running */
-	synchronize_irq(iproc_i2c->irq);
-
-	if (!time_left && !iproc_i2c->xfer_is_done) {
-		dev_err(iproc_i2c->device, "transaction timed out\n");
-
-		/* flush FIFOs */
-		val = (1 << M_FIFO_RX_FLUSH_SHIFT) |
-		      (1 << M_FIFO_TX_FLUSH_SHIFT);
-		writel(val, iproc_i2c->base + M_FIFO_CTRL_OFFSET);
-		return -ETIMEDOUT;
-	}
-
-	ret = bcm_iproc_i2c_check_status(iproc_i2c, msg);
-	if (ret) {
-		/* flush both TX/RX FIFOs */
-		val = (1 << M_FIFO_RX_FLUSH_SHIFT) |
-		      (1 << M_FIFO_TX_FLUSH_SHIFT);
-		writel(val, iproc_i2c->base + M_FIFO_CTRL_OFFSET);
-		return ret;
-	}
-
-	/*
-	 * For a read operation, we now need to load the data from FIFO
-	 * into the memory buffer
-	 */
-	if (msg->flags & I2C_M_RD) {
-		for (i = 0; i < msg->len; i++) {
-			msg->buf[i] = (readl(iproc_i2c->base + M_RX_OFFSET) >>
-				      M_RX_DATA_SHIFT) & M_RX_DATA_MASK;
-		}
-	}
-
-	return 0;
-}
-
-static int bcm_iproc_i2c_xfer(struct i2c_adapter *adapter,
-			      struct i2c_msg msgs[], int num)
-{
-	struct bcm_iproc_i2c_dev *iproc_i2c = i2c_get_adapdata(adapter);
-	int ret, i;
-
-	/* go through all messages */
-	for (i = 0; i < num; i++) {
-		ret = bcm_iproc_i2c_xfer_single_msg(iproc_i2c, &msgs[i]);
-		if (ret) {
-			dev_dbg(iproc_i2c->device, "xfer failed\n");
-			return ret;
-		}
-	}
-
-	return num;
-}
-
-static uint32_t bcm_iproc_i2c_functionality(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static const struct i2c_algorithm bcm_iproc_algo = {
-	.master_xfer = bcm_iproc_i2c_xfer,
-	.functionality = bcm_iproc_i2c_functionality,
-};
-
-static struct i2c_adapter_quirks bcm_iproc_i2c_quirks = {
-	/* need to reserve one byte in the FIFO for the slave address */
-	.max_read_len = M_TX_RX_FIFO_SIZE - 1,
-	.max_write_len = M_TX_RX_FIFO_SIZE - 1,
-};
-
-static int bcm_iproc_i2c_cfg_speed(struct bcm_iproc_i2c_dev *iproc_i2c)
-{
-	unsigned int bus_speed;
-	u32 val;
-	int ret = of_property_read_u32(iproc_i2c->device->of_node,
-				       "clock-frequency", &bus_speed);
-	if (ret < 0) {
-		dev_info(iproc_i2c->device,
-			"unable to interpret clock-frequency DT property\n");
-		bus_speed = 100000;
-	}
-
-	if (bus_speed < 100000) {
-		dev_err(iproc_i2c->device, "%d Hz bus speed not supported\n",
-			bus_speed);
-		dev_err(iproc_i2c->device,
-			"valid speeds are 100khz and 400khz\n");
-		return -EINVAL;
-	} else if (bus_speed < 400000) {
-		bus_speed = 100000;
-	} else {
-		bus_speed = 400000;
-	}
-
-	iproc_i2c->bus_speed = bus_speed;
-	val = readl(iproc_i2c->base + TIM_CFG_OFFSET);
-	val &= ~(1 << TIM_CFG_MODE_400_SHIFT);
-	val |= (bus_speed == 400000) << TIM_CFG_MODE_400_SHIFT;
-	writel(val, iproc_i2c->base + TIM_CFG_OFFSET);
-
-	dev_info(iproc_i2c->device, "bus set to %u Hz\n", bus_speed);
-
-	return 0;
-}
-
-static int bcm_iproc_i2c_init(struct bcm_iproc_i2c_dev *iproc_i2c)
-{
-	u32 val;
-
-	/* put controller in reset */
-	val = readl(iproc_i2c->base + CFG_OFFSET);
-	val |= 1 << CFG_RESET_SHIFT;
-	val &= ~(1 << CFG_EN_SHIFT);
-	writel(val, iproc_i2c->base + CFG_OFFSET);
-
-	/* wait 100 usec per spec */
-	udelay(100);
-
-	/* bring controller out of reset */
-	val &= ~(1 << CFG_RESET_SHIFT);
-	writel(val, iproc_i2c->base + CFG_OFFSET);
-
-	/* flush TX/RX FIFOs and set RX FIFO threshold to zero */
-	val = (1 << M_FIFO_RX_FLUSH_SHIFT) | (1 << M_FIFO_TX_FLUSH_SHIFT);
-	writel(val, iproc_i2c->base + M_FIFO_CTRL_OFFSET);
-
-	/* disable all interrupts */
-	writel(0, iproc_i2c->base + IE_OFFSET);
-
-	/* clear all pending interrupts */
-	writel(0xffffffff, iproc_i2c->base + IS_OFFSET);
-
-	return 0;
-}
-
-static void bcm_iproc_i2c_enable_disable(struct bcm_iproc_i2c_dev *iproc_i2c,
-					 bool enable)
-{
-	u32 val;
-
-	val = readl(iproc_i2c->base + CFG_OFFSET);
-	if (enable)
-		val |= BIT(CFG_EN_SHIFT);
-	else
-		val &= ~BIT(CFG_EN_SHIFT);
-	writel(val, iproc_i2c->base + CFG_OFFSET);
-}
-
-static int bcm_iproc_i2c_probe(struct platform_device *pdev)
-{
-	int irq, ret = 0;
-	struct bcm_iproc_i2c_dev *iproc_i2c;
-	struct i2c_adapter *adap;
-	struct resource *res;
-
-	iproc_i2c = devm_kzalloc(&pdev->dev, sizeof(*iproc_i2c),
-				 GFP_KERNEL);
-	if (!iproc_i2c)
-		return -ENOMEM;
-
-	platform_set_drvdata(pdev, iproc_i2c);
-	iproc_i2c->device = &pdev->dev;
-	init_completion(&iproc_i2c->done);
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	iproc_i2c->base = devm_ioremap_resource(iproc_i2c->device, res);
-	if (IS_ERR(iproc_i2c->base))
-		return PTR_ERR(iproc_i2c->base);
-
-	ret = bcm_iproc_i2c_init(iproc_i2c);
-	if (ret)
-		return ret;
-
-	ret = bcm_iproc_i2c_cfg_speed(iproc_i2c);
-	if (ret)
-		return ret;
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq <= 0) {
-		dev_err(iproc_i2c->device, "no irq resource\n");
-		return irq;
-	}
-	iproc_i2c->irq = irq;
-
-	ret = devm_request_irq(iproc_i2c->device, irq, bcm_iproc_i2c_isr, 0,
-			       pdev->name, iproc_i2c);
-	if (ret < 0) {
-		dev_err(iproc_i2c->device, "unable to request irq %i\n", irq);
-		return ret;
-	}
-
-	bcm_iproc_i2c_enable_disable(iproc_i2c, true);
-
-	adap = &iproc_i2c->adapter;
-	i2c_set_adapdata(adap, iproc_i2c);
-	strlcpy(adap->name, "Broadcom iProc I2C adapter", sizeof(adap->name));
-	adap->algo = &bcm_iproc_algo;
-	adap->quirks = &bcm_iproc_i2c_quirks;
-	adap->dev.parent = &pdev->dev;
-	adap->dev.of_node = pdev->dev.of_node;
-
-	ret = i2c_add_adapter(adap);
-	if (ret) {
-		dev_err(iproc_i2c->device, "failed to add adapter\n");
-		return ret;
-	}
-
-	return 0;
-}
-
-static int bcm_iproc_i2c_remove(struct platform_device *pdev)
-{
-	struct bcm_iproc_i2c_dev *iproc_i2c = platform_get_drvdata(pdev);
-
-	/* make sure there's no pending interrupt when we remove the adapter */
-	writel(0, iproc_i2c->base + IE_OFFSET);
-	readl(iproc_i2c->base + IE_OFFSET);
-	synchronize_irq(iproc_i2c->irq);
-
-	i2c_del_adapter(&iproc_i2c->adapter);
-	bcm_iproc_i2c_enable_disable(iproc_i2c, false);
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-
-static int bcm_iproc_i2c_suspend(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct bcm_iproc_i2c_dev *iproc_i2c = platform_get_drvdata(pdev);
-
-	/* make sure there's no pending interrupt when we go into suspend */
-	writel(0, iproc_i2c->base + IE_OFFSET);
-	readl(iproc_i2c->base + IE_OFFSET);
-	synchronize_irq(iproc_i2c->irq);
-
-	/* now disable the controller */
-	bcm_iproc_i2c_enable_disable(iproc_i2c, false);
-
-	return 0;
-}
-
-static int bcm_iproc_i2c_resume(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct bcm_iproc_i2c_dev *iproc_i2c = platform_get_drvdata(pdev);
-	int ret;
-	u32 val;
-
-	/*
-	 * Power domain could have been shut off completely in system deep
-	 * sleep, so re-initialize the block here
-	 */
-	ret = bcm_iproc_i2c_init(iproc_i2c);
-	if (ret)
-		return ret;
-
-	/* configure to the desired bus speed */
-	val = readl(iproc_i2c->base + TIM_CFG_OFFSET);
-	val &= ~(1 << TIM_CFG_MODE_400_SHIFT);
-	val |= (iproc_i2c->bus_speed == 400000) << TIM_CFG_MODE_400_SHIFT;
-	writel(val, iproc_i2c->base + TIM_CFG_OFFSET);
-
-	bcm_iproc_i2c_enable_disable(iproc_i2c, true);
-
-	return 0;
-}
-
-static const struct dev_pm_ops bcm_iproc_i2c_pm_ops = {
-	.suspend_late = &bcm_iproc_i2c_suspend,
-	.resume_early = &bcm_iproc_i2c_resume
-};
-
-#define BCM_IPROC_I2C_PM_OPS (&bcm_iproc_i2c_pm_ops)
-#else
-#define BCM_IPROC_I2C_PM_OPS NULL
-#endif /* CONFIG_PM_SLEEP */
-
-static const struct of_device_id bcm_iproc_i2c_of_match[] = {
-	{ .compatible = "brcm,iproc-i2c" },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, bcm_iproc_i2c_of_match);
-
-static struct platform_driver bcm_iproc_i2c_driver = {
-	.driver = {
-		.name = "bcm-iproc-i2c",
-		.of_match_table = bcm_iproc_i2c_of_match,
-		.pm = BCM_IPROC_I2C_PM_OPS,
-	},
-	.probe = bcm_iproc_i2c_probe,
-	.remove = bcm_iproc_i2c_remove,
-};
-module_platform_driver(bcm_iproc_i2c_driver);
-
-MODULE_AUTHOR("Ray Jui <rjui@broadcom.com>");
-MODULE_DESCRIPTION("Broadcom iProc I2C Driver");
-MODULE_LICENSE("GPL v2");
+_WR__ST_MODE_MASK 0x3000
+#define MC_ARB_HARSH_CTL_WR__ST_MODE__SHIFT 0xc
+#define MC_ARB_HARSH_CTL_WR__FORCE_STALL_MASK 0x3fc000
+#define MC_ARB_HARSH_CTL_WR__FORCE_STALL__SHIFT 0xe
+#define MC_ARB_HARSH_CTL_WR__PERF_MON_SEL_MASK 0x1c00000
+#define MC_ARB_HARSH_CTL_WR__PERF_MON_SEL__SHIFT 0x16
+#define MC_ARB_GRUB_PRIORITY1_RD__CB0_MASK 0x3
+#define MC_ARB_GRUB_PRIORITY1_RD__CB0__SHIFT 0x0
+#define MC_ARB_GRUB_PRIORITY1_RD__CBCMASK0_MASK 0xc
+#define MC_ARB_GRUB_PRIORITY1_RD__CBCMASK0__SHIFT 0x2
+#define MC_ARB_GRUB_PRIORITY1_RD__CBFMASK0_MASK 0x30
+#define MC_ARB_GRUB_PRIORITY1_RD__CBFMASK0__SHIFT 0x4
+#define MC_ARB_GRUB_PRIORITY1_RD__DB0_MASK 0xc0
+#define MC_ARB_GRUB_PRIORITY1_RD__DB0__SHIFT 0x6
+#define MC_ARB_GRUB_PRIORITY1_RD__DBHTILE0_MASK 0x300
+#define MC_ARB_GRUB_PRIORITY1_RD__DBHTILE0__SHIFT 0x8
+#define MC_ARB_GRUB_PRIORITY1_RD__DBSTEN0_MASK 0xc00
+#define MC_ARB_GRUB_PRIORITY1_RD__DBSTEN0__SHIFT 0xa
+#define MC_ARB_GRUB_PRIORITY1_RD__TC0_MASK 0x3000
+#define MC_ARB_GRUB_PRIORITY1_RD__TC0__SHIFT 0xc
+#define MC_ARB_GRUB_PRIORITY1_RD__ACPG_MASK 0xc000
+#define MC_ARB_GRUB_PRIORITY1_RD__ACPG__SHIFT 0xe
+#define MC_ARB_GRUB_PRIORITY1_RD__ACPO_MASK 0x30000
+#define MC_ARB_GRUB_PRIORITY1_RD__ACPO__SHIFT 0x10
+#define MC_ARB_GRUB_PRIORITY1_RD__DMIF_MASK 0xc0000
+#define MC_ARB_GRUB_PRIORITY1_RD__DMIF__SHIFT 0x12
+#define MC_ARB_GRUB_PRIORITY1_RD__DMIF_EXT0_MASK 0x300000
+#define MC_ARB_GRUB_PRIORITY1_RD__DMIF_EXT0__SHIFT 0x14
+#define MC_ARB_GRUB_PRIORITY1_RD__DMIF_EXT1_MASK 0xc00000
+#define MC_ARB_GRUB_PRIORITY1_RD__DMIF_EXT1__SHIFT 0x16
+#define MC_ARB_GRUB_PRIORITY1_RD__DMIF_TW_MASK 0x3000000
+#define MC_ARB_GRUB_PRIORITY1_RD__DMIF_TW__SHIFT 0x18
+#define MC_ARB_GRUB_PRIORITY1_RD__MCIF_MASK 0xc000000
+#define MC_ARB_GRUB_PRIORITY1_RD__MCIF__SHIFT 0x1a
+#define MC_ARB_GRUB_PRIORITY1_RD__RLC_MASK 0x30000000
+#define MC_ARB_GRUB_PRIORITY1_RD__RLC__SHIFT 0x1c
+#define MC_ARB_GRUB_PRIORITY1_RD__VMC_MASK 0xc0000000
+#define MC_ARB_GRUB_PRIORITY1_RD__VMC__SHIFT 0x1e
+#define MC_ARB_GRUB_PRIORITY1_WR__CB0_MASK 0x3
+#define MC_ARB_GRUB_PRIORITY1_WR__CB0__SHIFT 0x0
+#define MC_ARB_GRUB_PRIORITY1_WR__CBCMASK0_MASK 0xc
+#define MC_ARB_GRUB_PRIORITY1_WR__CBCMASK0__SHIFT 0x2
+#define MC_ARB_GRUB_PRIORITY1_WR__CBFMASK0_MASK 0x30
+#define MC_ARB_GRUB_PRIORITY1_WR__CBFMASK0__SHIFT 0x4
+#define MC_ARB_GRUB_PRIORITY1_WR__CBIMMED0_MASK 0xc0
+#define MC_ARB_GRUB_PRIORITY1_WR__CBIMMED0__SHIFT 0x6
+#define MC_ARB_GRUB_PRIORITY1_WR__DB0_MASK 0x300
+#define MC_ARB_GRUB_PRIORITY1_WR__DB0__SHIFT 0x8
+#define MC_ARB_GRUB_PRIORITY1_WR__DBHTILE0_MASK 0xc00
+#define MC_ARB_GRUB_PRIORITY1_WR__DBHTILE0__SHIFT 0xa
+#define MC_ARB_GRUB_PRIORITY1_WR__DBSTEN0_MASK 0x3000
+#define MC_ARB_GRUB_PRIORITY1_WR__DBSTEN0__SHIFT 0xc
+#define MC_ARB_GRUB_PRIORITY1_WR__TC0_MASK 0xc000
+#define MC_ARB_GRUB_PRIORITY1_WR__TC0__SHIFT 0xe
+#define MC_ARB_GRUB_PRIORITY1_WR__SH_MASK 0x30000
+#define MC_ARB_GRUB_PRIORITY1_WR__SH__SHIFT 0x10
+#define MC_ARB_GRUB_PRIORITY1_WR__ACPG_MASK 0xc0000
+#define MC_ARB_GRUB_PRIORITY1_WR__ACPG__SHIFT 0x12
+#define MC_ARB_GRUB_PRIORITY1_WR__ACPO_MASK 0x300000
+#define MC_ARB_GRUB_PRIORITY1_WR__ACPO__SHIFT 0x14
+#define MC_ARB_GRUB_PRIORITY1_WR__MCIF_MASK 0xc00000
+#define MC_ARB_GRUB_PRIORITY1_WR__MCIF__SHIFT 0x16
+#define MC_ARB_GRUB_PRIORITY1_WR__RLC_MASK 0x3000000
+#define MC_ARB_GRUB_PRIORITY1_WR__RLC__SHIFT 0x18
+#define MC_ARB_GRUB_PRIORITY1_WR__SDMA1_MASK 0xc000000
+#define MC_ARB_GRUB_PRIORITY1_WR__SDMA1__SHIFT 0x1a
+#define MC_ARB_GRUB_PRIORITY1_WR__SMU_MASK 0x30000000
+#define MC_ARB_GRUB_PRIORITY1_WR__SMU__SHIFT 0x1c
+#define MC_ARB_GRUB_PRIORITY1_WR__VCE0_MASK 0xc0000000
+#define MC_ARB_GRUB_PRIORITY1_WR__VCE0__SHIFT 0x1e
+#define MC_ARB_GRUB_PRIORITY2_RD__SDMA1_MASK 0x3
+#define MC_ARB_GRUB_PRIORITY2_RD__SDMA1__SHIFT 0x0
+#define MC_ARB_GRUB_PRIORITY2_RD__SMU_MASK 0xc
+#define MC_ARB_GRUB_PRIORITY2_RD__SMU__SHIFT 0x2
+#define MC_ARB_GRUB_PRIORITY2_RD__VCE0_MASK 0x30
+#define MC_ARB_GRUB_PRIORITY2_RD__VCE0__SHIFT 0x4
+#define MC_ARB_GRUB_PRIORITY2_RD__VCE1_MASK 0xc0
+#define MC_ARB_GRUB_PRIORITY2_RD__VCE1__SHIFT 0x6
+#define MC_ARB_GRUB_PRIORITY2_RD__XDMAM_MASK 0x300
+#define MC_ARB_GRUB_PRIORITY2_RD__XDMAM__SHIFT 0x8
+#define MC_ARB_GRUB_PRIORITY2_RD__SDMA0_MASK 0xc00
+#define MC_ARB_GRUB_PRIORITY2_RD__SDMA0__SHIFT 0xa
+#define MC_ARB_GRUB_PRIORITY2_RD__HDP_MASK 0x3000
+#define MC_ARB_GRUB_PRIORITY2_RD__HDP__SHIFT 0xc
+#define MC_ARB_GRUB_PRIORITY2_RD__UMC_MASK 0xc000
+#define MC_ARB_GRUB_PRIORITY2_RD__UMC__SHIFT 0xe
+#define MC_ARB_GRUB_PRIORITY2_RD__UVD_MASK 0x30000
+#define MC_ARB_GRUB_PRIORITY2_RD__UVD__SHIFT 0x10
+#define MC_ARB_GRUB_PRIORITY2_RD__UVD_EXT0_MASK 0xc0000
+#define MC_ARB_GRUB_PRIORITY2_RD__UVD_EXT0__SHIFT 0x12
+#define MC_ARB_GRUB_PRIORITY2_RD__UVD_EXT1_MASK 0x300000
+#define MC_ARB_GRUB_PRIORITY2_RD__UVD_EXT1__SHIFT 0x14
+#define MC_ARB_GRUB_PRIORITY2_RD__SEM_MASK 0xc00000
+#define MC_ARB_GRUB_PRIORITY2_RD__SEM__SHIFT 0x16
+#define MC_ARB_GRUB_PRIORITY2_RD__SAMMSP_MASK 0x3000000
+#define MC_ARB_GRUB_PRIORITY2_RD__SAMMSP__SHIFT 0x18
+#define MC_ARB_GRUB_PRIORITY2_RD__VP8_MASK 0xc000000
+#define MC_ARB_GRUB_PRIORITY2_RD__VP8__SHIFT 0x1a
+#define MC_ARB_GRUB_PRIORITY2_RD__ISP_MASK 0x30000000
+#define MC_ARB_GRUB_PRIORITY2_RD__ISP__SHIFT 0x1c
+#define MC_ARB_GRUB_PRIORITY2_RD__RSV2_MASK 0xc0000000
+#define MC_ARB_GRUB_PRIORITY2_RD__RSV2__SHIFT 0x1e
+#define MC_ARB_GRUB_PRIORITY2_WR__VCE1_MASK 0x3
+#define MC_ARB_GRUB_PRIORITY2_WR__VCE1__SHIFT 0x0
+#define MC_ARB_GRUB_PRIORITY2_WR__SAMMSP_MASK 0xc
+#define MC_ARB_GRUB_PRIORITY2_WR__SAMMSP__SHIFT 0x2
+#define MC_ARB_GRUB_PRIORITY2_WR__XDMA_MASK 0x30
+#define MC_ARB_GRUB_PRIORITY2_WR__XDMA__SHIFT 0x4
+#define MC_ARB_GRUB_PRIORITY2_WR__XDMAM_MASK 0xc0
+#define MC_ARB_GRUB_PRIORITY2_WR__XDMAM__SHIFT 0x6
+#define MC_ARB_GRUB_PRIORITY2_WR__SDMA0_MASK 0x300
+#define MC_ARB_GRUB_PRIORITY2_WR__SDMA0__SHIFT 0x8
+#define MC_ARB_GRUB_PRIORITY2_WR__HDP_MASK 0xc00
+#define MC_ARB_GRUB_PRIORITY2_WR__HDP__SHIFT 0xa
+#define MC_ARB_GRUB_PRIORITY2_WR__UMC_MASK 0x3000
+#define MC_ARB_GRUB_PRIORITY2_WR__UMC__SHIFT 0xc
+#define MC_ARB_GRUB_PRIORITY2_WR__UVD_MASK 0xc000
+#define MC_ARB_GRUB_PRIORITY2_WR__UVD__SHIFT 0xe
+#define MC_ARB_GRUB_PRIORITY2_WR__UVD_EXT0_MASK 0x30000
+#define MC_ARB_GRUB_PRIORITY2_WR__UVD_EXT0__SHIFT 0x10
+#define MC_ARB_GRUB_PRIORITY2_WR__UVD_EXT1_MASK 0xc0000
+#define MC_ARB_GRUB_PRIORITY2_WR__UVD_EXT1__SHIFT 0x12
+#define MC_ARB_GRUB_PRIORITY2_WR__XDP_MASK 0x300000
+#define MC_ARB_GRUB_PRIORITY2_WR__XDP__SHIFT 0x14
+#define MC_ARB_GRUB_PRIORITY2_WR__SEM_MASK 0xc00000
+#define MC_ARB_GRUB_PRIORITY2_WR__SEM__SHIFT 0x16
+#define MC_ARB_GRUB_PRIORITY2_WR__IH_MASK 0x3000000
+#define MC_ARB_GRUB_PRIORITY2_WR__IH__SHIFT 0x18
+#define MC_ARB_GRUB_PRIORITY2_WR__VP8_MASK 0xc000000
+#define MC_ARB_GRUB_PRIORITY2_WR__VP8__SHIFT 0x1a
+#define MC_ARB_GRUB_PRIORITY2_WR__ISP_MASK 0x30000000
+#define MC_ARB_GRUB_PRIORITY2_WR__ISP__SHIFT 0x1c
+#define MC_ARB_GRUB_PRIORITY2_WR__VIN0_MASK 0xc0000000
+#define MC_ARB_GRUB_PRIORITY2_WR__VIN0__SHIFT 0x1e
+#define MC_FUS_DRAM0_CS0_BASE__CSENABLE_MASK 0x1
+#define MC_FUS_DRAM0_CS0_BASE__CSENABLE__SHIFT 0x0
+#define MC_FUS_DRAM0_CS0_BASE__BASEADDR21_11_MASK 0xffe0
+#define MC_FUS_DRAM0_CS0_BASE__BASEADDR21_11__SHIFT 0x5
+#define MC_FUS_DRAM0_CS0_BASE__BASEADDR38_27_MASK 0x7ff80000
+#define MC_FUS_DRAM0_CS0_BASE__BASEADDR38_27__SHIFT 0x13
+#define MC_FUS_DRAM1_CS0_BASE__CSENABLE_MASK 0x1
+#define MC_FUS_DRAM1_CS0_BASE__CSENABLE__SHIFT 0x0
+#define MC_FUS_DRAM1_CS0_BASE__BASEADDR21_11_MASK 0xffe0
+#define MC_FUS_DRAM1_CS0_BASE__BASEADDR21_11__SHIFT 0x5
+#define MC_FUS_DRAM1_CS0_BASE__BASEADDR38_27_MASK 0x7ff80000
+#define MC_FUS_DRAM1_CS0_BASE__BASEADDR38_27__SHIFT 0x13
+#define MC_FUS_DRAM0_CS1_BASE__CSENABLE_MASK 0x1
+#define MC_FUS_DRAM0_CS1_BASE__CSENABLE__SHIFT 0x0
+#define MC_FUS_DRAM0_CS1_BASE__BASEADDR21_11_MASK 0xffe0
+#define MC_FUS_DRAM0_CS1_BASE__BASEADDR21_11__SHIFT 0x5
+#define MC_FUS_DRAM0_CS1_BASE__BASEADDR38_27_MASK 0x7ff80000
+#define MC_FUS_DRAM0_CS1_BASE__BASEADDR38_27__SHIFT 0x13
+#define MC_FUS_DRAM1_CS1_BASE__CSENABLE_MASK 0x1
+#define MC_FUS_DRAM1_CS1_BASE__CSENABLE__SHIFT 0x0
+#define MC_FUS_DRAM1_CS1_BASE__BASEADDR21_11_MASK 0xffe0
+#define MC_FUS_DRAM1_CS1_BASE__BASEADDR21_11__SHIFT 0x5
+#define MC_FUS_DRAM1_CS1_BASE__BASEADDR38_27_MASK 0x7ff80000
+#define MC_FUS_DRAM1_CS1_BASE__BASEADDR38_27__SHIFT 0x13
+#define MC_FUS_DRAM0_CS2_BASE__CSENABLE_MASK 0x1
+#define MC_FUS_DRAM0_CS2_BASE__CSENABLE__SHIFT 0x0
+#define MC_FUS_DRAM0_CS2_BASE__BASEADDR21_11_MASK 0xffe0
+#define MC_FUS_DRAM0_CS2_BASE__BASEADDR21_11__SHIFT 0x5
+#define MC_FUS_DRAM0_CS2_BASE__BASEADDR38_27_MASK 0x7ff80000
+#define MC_FUS_DRAM0_CS2_BASE__BASEADDR38_27__SHIFT 0x13
+#define MC_FUS_DRAM1_CS2_BASE__CSENABLE_MASK 0x1
+#define MC_FUS_DRAM1_CS2_BASE__CSENABLE__SHIFT 0x0
+#define MC_FUS_DRAM1_CS2_BASE__BASEADDR21_11_MASK 0xffe0
+#define MC_FUS_DRAM1_CS2_BASE__BASEADDR21_11__SHIFT 0x5
+#define MC_FUS_DRAM1_CS2_BASE__BASEADDR38_27_MASK 0x7ff80000
+#define MC_FUS_DRAM1_CS2_BASE__BASEADDR38_27__SHIFT 0x13
+#define MC_FUS_DRAM0_CS3_BASE__CSENABLE_MASK 0x1
+#define MC_FUS_DRAM0_CS3_BASE__CSENABLE__SHIFT 0x0
+#define MC_FUS_DRAM0_CS3_BASE__BASEADDR21_11_MASK 0xffe0
+#define MC_FUS_DRAM0_CS3_BASE__BASEADDR21_11__SHIFT 0x5
+#define MC_FUS_DRAM0_CS3_BASE__BASEADDR38_27_MASK 0x7ff80000
+#define MC_FUS_DRAM0_CS3_BASE__BASEADDR38_27__SHIFT 0x13
+#define MC_FUS_DRAM1_CS3_BASE__CSENABLE_MASK 0x1
+#define MC_FUS_DRAM1_CS3_BASE__CSENABLE__SHIFT 0x0
+#define MC_FUS_DRAM1_CS3_BASE__BASEADDR21_11_MASK 0xffe0
+#define MC_FUS_DRAM1_CS3_BASE__BASEADDR21_11__SHIFT 0x5
+#define MC_FUS_DRAM1_CS3_BASE__BASEADDR38_27_MASK 0x7ff80000
+#define MC_FUS_DRAM1_CS3_BASE__BASEADDR38_27__SHIFT 0x13
+#define MC_FUS_DRAM0_BANK_ADDR_MAPPING__DIMM0ADDRMAP_MASK 0xf
+#define MC_FUS_DRAM0_BANK_ADDR_MAPPING__DIMM0ADDRMAP__SHIFT 0x0
+#define MC_FUS_DRAM0_BANK_ADDR_MAPPING__DIMM1ADDRMAP_MASK 0xf0
+#define MC_FUS_DRAM0_BANK_ADDR_MAPPING__DIMM1ADDRMAP__SHIFT 0x4
+#define MC_FUS_DRAM0_BANK_ADDR_MAPPING__BANKSWIZZLEMODE_MASK 0x100
+#define MC_FUS_DRAM0_BANK_ADDR_MAPPING__BANKSWIZZLEMODE__SHIFT 0x8
+#define MC_FUS_DRAM0_BANK_ADDR_MAPPING__BANKSWAP_MASK 0x200
+#define MC_FUS_DRAM0_BANK_ADDR_MAPPING__BANKSWAP__SHIFT 0x9
+#define MC_FUS_DRAM1_BANK_ADDR_MAPPING__DIMM0ADDRMAP_MASK 0xf
+#define MC_FUS_DRAM1_BANK_ADDR_MAPPING__DIMM0ADDRMAP__SHIFT 0x0
+#define MC_FUS_DRAM1_BANK_ADDR_MAPPING__DIMM1ADDRMAP_MASK 0xf0
+#define MC_FUS_DRAM1_BANK_ADDR_MAPPING__DIMM1ADDRMAP__SHIFT 0x4
+#define MC_FUS_DRAM1_BANK_ADDR_MAPPING__BANKSWIZZLEMODE_MASK 0x100
+#define MC_FUS_DRAM1_BANK_ADDR_MAPPING__BANKSWIZZLEMODE__SHIFT 0x8
+#define MC_FUS_DRAM1_BANK_ADDR_MAPPING__BANKSWAP_MASK 0x200
+#define MC_FUS_DRAM1_BANK_ADDR_MAPPING__BANKSWAP__SHIFT 0x9
+#define MC_FUS_DRAM0_CTL_BASE__DCTSEL_MASK 0x7
+#define MC_FUS_DRAM0_CTL_BASE__DCTSEL__SHIFT 0x0
+#define MC_FUS_DRAM0_CTL_BASE__DCTINTLVEN_MASK 0x78
+#define MC_FUS_DRAM0_CTL_BASE__DCTINTLVEN__SHIFT 0x3
+#define MC_FUS_DRAM0_CTL_BASE__DCTBASEADDR_MASK 0xfffff80
+#define MC_FUS_DRAM0_CTL_BASE__DCTBASEADDR__SHIFT 0x7
+#define MC_FUS_DRAM0_CTL_BASE__DCTOFFSETEN_MASK 0x10000000
+#define MC_FUS_DRAM0_CTL_BASE__DCTOFFSETEN__SHIFT 0x1c
+#define MC_FUS_DRAM1_CTL_BASE__DCTSEL_MASK 0x7
+#define MC_FUS_DRAM1_CTL_BASE__DCTSEL__SHIFT 0x0
+#define MC_FUS_DRAM1_CTL_BASE__DCTINTLVEN_MASK 0x78
+#define MC_FUS_DRAM1_CTL_BASE__DCTINTLVEN__SHIFT 0x3
+#define MC_FUS_DRAM1_CTL_BASE__DCTBASEADDR_MASK 0xfffff80
+#define MC_FUS_DRAM1_CTL_BASE__DCTBASEADDR__SHIFT 0x7
+#define MC_FUS_DRAM1_CTL_BASE__DCTOFFSETEN_MASK 0x10000000
+#define MC_FUS_DRAM1_CTL_BASE__DCTOFFSETEN__SHIFT 0x1c
+#define MC_FUS_DRAM0_CTL_LIMIT__DCTLIMITADDR_MASK 0x1fffff
+#define MC_FUS_DRAM0_CTL_LIMIT__DCTLIMITADDR__SHIFT 0x0
+#define MC_FUS_DRAM0_CTL_LIMIT__DRAMHOLEVALID_MASK 0x200000
+#define MC_FUS_DRAM0_CTL_LIMIT__DRAMHOLEVALID__SHIFT 0x15
+#define MC_FUS_DRAM1_CTL_LIMIT__DCTLIMITADDR_MASK 0x1fffff
+#define MC_FUS_DRAM1_CTL_LIMIT__DCTLIMITADDR__SHIFT 0x0
+#define MC_FUS_DRAM1_CTL_LIMIT__DRAMHOLEVALID_MASK 0x200000
+#define MC_FUS_DRAM1_CTL_LIMIT__DRAMHOLEVALID__SHIFT 0x15
+#define MC_FUS_DRAM_CTL_HIGH_01__DCTHIGHADDROFF0_MASK 0xfff
+#define MC_FUS_DRAM_CTL_HIGH_01__DCTHIGHADDROFF0__SHIFT 0x0
+#define MC_FUS_DRAM_CTL_HIGH_01__DCTHIGHADDROFF1_MASK 0xfff000
+#define MC_FUS_DRAM_CTL_HIGH_01__DCTHIGHADDROFF1__SHIFT 0xc
+#define MC_FUS_DRAM_CTL_HIGH_23__DCTHIGHADDROFF2_MASK 0xfff
+#define MC_FUS_DRAM_CTL_HIGH_23__DCTHIGHADDROFF2__SHIFT 0x0
+#define MC_FUS_DRAM_CTL_HIGH_23__DCTHIGHADDROFF3_MASK 0xfff000
+#define MC_FUS_DRAM_CTL_HIGH_23__DCTHIGHADDROFF3__SHIFT 0xc
+#define MC_FUS_DRAM_MODE__DCTSELINTLVADDR_MASK 0x7
+#define MC_FUS_DRAM_MODE__DCTSELINTLVADDR__SHIFT 0x0
+#define MC_FUS_DRAM_MODE__DRAMTYPE_MASK 0x38
+#define MC_FUS_DRAM_MODE__DRAMTYPE__SHIFT 0x3
+#define MC_FUS_DRAM_MODE__DRAMHOLEOFFSET_MASK 0x7fc0
+#define MC_FUS_DRAM_MODE__DRAMHOLEOFFSET__SHIFT 0x6
+#define MC_FUS_DRAM_MODE__DDR3LPX32_MASK 0x8000
+#define MC_FUS_DRAM_MODE__DDR3LPX32__SHIFT 0xf
+#define MC_FUS_DRAM_MODE__BANKGROUPSWAP_MASK 0x10000
+#define MC_FUS_DRAM_MODE__BANKGROUPSWAP__SHIFT 0x10
+#define MC_FUS_DRAM_APER_BASE__BASE_MASK 0xfffff
+#define MC_FUS_DRAM_APER_BASE__BASE__SHIFT 0x0
+#define MC_FUS_DRAM_APER_TOP__TOP_MASK 0xfffff
+#define MC_FUS_DRAM_APER_TOP__TOP__SHIFT 0x0
+#define MC_FUS_DRAM_APER_DEF__DEF_MASK 0xfffffff
+#define MC_FUS_DRAM_APER_DEF__DEF__SHIFT 0x0
+#define MC_FUS_DRAM_APER_DEF__LOCK_MC_FUS_DRAM_REGS_MASK 0x10000000
+#define MC_FUS_DRAM_APER_DEF__LOCK_MC_FUS_DRAM_REGS__SHIFT 0x1c
+#define MC_FUS_ARB_GARLIC_ISOC_PRI__DMIF_RD_TOKURG_EN_MASK 0x1
+#define MC_FUS_ARB_GARLIC_ISOC_PRI__DMIF_RD_TOKURG_EN__SHIFT 0x0
+#define MC_FUS_ARB_GARLIC_ISOC_PRI__UVD_RD_TOKURG_EN_MASK 0x2
+#define MC_FUS_ARB_GARLIC_ISOC_PRI__UVD_RD_TOKURG_EN__SHIFT 0x1
+#define MC_FUS_ARB_GARLIC_ISOC_PRI__VCE_RD_TOKURG_EN_MASK 0x4
+#define MC_FUS_ARB_GARLIC_ISOC_PRI__VCE_RD_TOKURG_EN__SHIFT 0x2
+#define MC_FUS_ARB_GARLIC_ISOC_PRI__ACP_RD_TOKURG_EN_MASK 0x8
+#define MC_FUS_ARB_GARLIC_ISOC_PRI__ACP_RD_TOKURG_EN__SHIFT 0

@@ -1,101 +1,48 @@
-
-/*
- * IBM ASM Service Processor Device Driver
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
- *
- * Copyright (C) IBM Corporation, 2004
- *
- * Author: Max Asböck <amax@us.ibm.com>
- *
- */
-
-#include <linux/notifier.h>
-#include "ibmasm.h"
-#include "dot_command.h"
-#include "lowlevel.h"
-
-static int suspend_heartbeats = 0;
-
-/*
- * Once the driver indicates to the service processor that it is running
- * - see send_os_state() - the service processor sends periodic heartbeats
- * to the driver. The driver must respond to the heartbeats or else the OS
- * will be rebooted.
- * In the case of a panic the interrupt handler continues to work and thus
- * continues to respond to heartbeats, making the service processor believe
- * the OS is still running and thus preventing a reboot.
- * To prevent this from happening a callback is added the panic_notifier_list.
- * Before responding to a heartbeat the driver checks if a panic has happened,
- * if yes it suspends heartbeat, causing the service processor to reboot as
- * expected.
- */
-static int panic_happened(struct notifier_block *n, unsigned long val, void *v)
-{
-	suspend_heartbeats = 1;
-	return 0;
-}
-
-static struct notifier_block panic_notifier = { panic_happened, NULL, 1 };
-
-void ibmasm_register_panic_notifier(void)
-{
-	atomic_notifier_chain_register(&panic_notifier_list, &panic_notifier);
-}
-
-void ibmasm_unregister_panic_notifier(void)
-{
-	atomic_notifier_chain_unregister(&panic_notifier_list,
-			&panic_notifier);
-}
-
-
-int ibmasm_heartbeat_init(struct service_processor *sp)
-{
-	sp->heartbeat = ibmasm_new_command(sp, HEARTBEAT_BUFFER_SIZE);
-	if (sp->heartbeat == NULL)
-		return -ENOMEM;
-
-	return 0;
-}
-
-void ibmasm_heartbeat_exit(struct service_processor *sp)
-{
-	char tsbuf[32];
-
-	dbg("%s:%d at %s\n", __func__, __LINE__, get_timestamp(tsbuf));
-	ibmasm_wait_for_response(sp->heartbeat, IBMASM_CMD_TIMEOUT_NORMAL);
-	dbg("%s:%d at %s\n", __func__, __LINE__, get_timestamp(tsbuf));
-	suspend_heartbeats = 1;
-	command_put(sp->heartbeat);
-}
-
-void ibmasm_receive_heartbeat(struct service_processor *sp,  void *message, size_t size)
-{
-	struct command *cmd = sp->heartbeat;
-	struct dot_command_header *header = (struct dot_command_header *)cmd->buffer;
-	char tsbuf[32];
-
-	dbg("%s:%d at %s\n", __func__, __LINE__, get_timestamp(tsbuf));
-	if (suspend_heartbeats)
-		return;
-
-	/* return the received dot command to sender */
-	cmd->status = IBMASM_CMD_PENDING;
-	size = min(size, cmd->buffer_size);
-	memcpy_fromio(cmd->buffer, message, size);
-	header->type = sp_write;
-	ibmasm_exec_command(sp, cmd);
-}
+LL_LC2_SCI_STAT_OVRD_REG0__PLL_LC2_IGNR_PLLPWR_CBI_UPDT__SHIFT 0x0
+#define PB0_PLL_LC2_SCI_STAT_OVRD_REG0__PLL_LC2_PLLPWR_MASK 0x70
+#define PB0_PLL_LC2_SCI_STAT_OVRD_REG0__PLL_LC2_PLLPWR__SHIFT 0x4
+#define PB0_PLL_LC3_SCI_STAT_OVRD_REG0__PLL_LC3_IGNR_PLLPWR_CBI_UPDT_MASK 0x1
+#define PB0_PLL_LC3_SCI_STAT_OVRD_REG0__PLL_LC3_IGNR_PLLPWR_CBI_UPDT__SHIFT 0x0
+#define PB0_PLL_LC3_SCI_STAT_OVRD_REG0__PLL_LC3_PLLPWR_MASK 0x70
+#define PB0_PLL_LC3_SCI_STAT_OVRD_REG0__PLL_LC3_PLLPWR__SHIFT 0x4
+#define PB0_RX_GLB_CTRL_REG0__RX_CFG_ADAPT_MODE_GEN1_MASK 0x3ff
+#define PB0_RX_GLB_CTRL_REG0__RX_CFG_ADAPT_MODE_GEN1__SHIFT 0x0
+#define PB0_RX_GLB_CTRL_REG0__RX_CFG_ADAPT_MODE_GEN2_MASK 0xffc00
+#define PB0_RX_GLB_CTRL_REG0__RX_CFG_ADAPT_MODE_GEN2__SHIFT 0xa
+#define PB0_RX_GLB_CTRL_REG0__RX_CFG_ADAPT_MODE_GEN3_MASK 0x3ff00000
+#define PB0_RX_GLB_CTRL_REG0__RX_CFG_ADAPT_MODE_GEN3__SHIFT 0x14
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_FR_GAIN_GEN1_MASK 0xf
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_FR_GAIN_GEN1__SHIFT 0x0
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_FR_GAIN_GEN2_MASK 0xf0
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_FR_GAIN_GEN2__SHIFT 0x4
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_FR_GAIN_GEN3_MASK 0xf00
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_FR_GAIN_GEN3__SHIFT 0x8
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PH_GAIN_GEN1_MASK 0xf000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PH_GAIN_GEN1__SHIFT 0xc
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PH_GAIN_GEN2_MASK 0xf0000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PH_GAIN_GEN2__SHIFT 0x10
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PH_GAIN_GEN3_MASK 0xf00000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PH_GAIN_GEN3__SHIFT 0x14
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PI_STPSZ_GEN1_MASK 0x1000000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PI_STPSZ_GEN1__SHIFT 0x18
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PI_STPSZ_GEN2_MASK 0x2000000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PI_STPSZ_GEN2__SHIFT 0x19
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PI_STPSZ_GEN3_MASK 0x4000000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_CDR_PI_STPSZ_GEN3__SHIFT 0x1a
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_LEQ_DCATTN_BYP_EN_GEN1_MASK 0x8000000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_LEQ_DCATTN_BYP_EN_GEN1__SHIFT 0x1b
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_LEQ_DCATTN_BYP_EN_GEN2_MASK 0x10000000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_LEQ_DCATTN_BYP_EN_GEN2__SHIFT 0x1c
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_LEQ_DCATTN_BYP_EN_GEN3_MASK 0x20000000
+#define PB0_RX_GLB_CTRL_REG1__RX_CFG_LEQ_DCATTN_BYP_EN_GEN3__SHIFT 0x1d
+#define PB0_RX_GLB_CTRL_REG1__RX_ADAPT_HLD_ASRT_TO_DCLK_EN_MASK 0xc0000000
+#define PB0_RX_GLB_CTRL_REG1__RX_ADAPT_HLD_ASRT_TO_DCLK_EN__SHIFT 0x1e
+#define PB0_RX_GLB_CTRL_REG2__RX_CFG_CDR_TIME_GEN1_MASK 0xf000
+#define PB0_RX_GLB_CTRL_REG2__RX_CFG_CDR_TIME_GEN1__SHIFT 0xc
+#define PB0_RX_GLB_CTRL_REG2__RX_CFG_CDR_TIME_GEN2_MASK 0xf0000
+#define PB0_RX_GLB_CTRL_REG2__RX_CFG_CDR_TIME_GEN2__SHIFT 0x10
+#define PB0_RX_GLB_CTRL_REG2__RX_CFG_CDR_TIME_GEN3_MASK 0xf00000
+#define PB0_RX_GLB_CTRL_REG2__RX_CFG_CDR_TIME_GEN3__SHIFT 0x14
+#define PB0_RX_GLB_CTRL_REG2__RX_CFG_LEQ_LOOP_GAIN_GEN1_MASK 0x3000000
+#define PB0_RX_GLB_CTRL_REG2__RX_CFG_LEQ_LOOP_GAIN_GEN1__SHIFT 0x18
+#define PB0_RX_GLB_CTRL

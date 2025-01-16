@@ -1,622 +1,249 @@
-/*
- * KLSI KL5KUSB105 chip RS232 converter driver
- *
- *   Copyright (C) 2010 Johan Hovold <jhovold@gmail.com>
- *   Copyright (C) 2001 Utz-Uwe Haus <haus@uuhaus.de>
- *
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
- *
- * All information about the device was acquired using SniffUSB ans snoopUSB
- * on Windows98.
- * It was written out of frustration with the PalmConnect USB Serial adapter
- * sold by Palm Inc.
- * Neither Palm, nor their contractor (MCCI) or their supplier (KLSI) provided
- * information that was not already available.
- *
- * It seems that KLSI bought some silicon-design information from ScanLogic,
- * whose SL11R processor is at the core of the KL5KUSB chipset from KLSI.
- * KLSI has firmware available for their devices; it is probable that the
- * firmware differs from that used by KLSI in their products. If you have an
- * original KLSI device and can provide some information on it, I would be
- * most interested in adding support for it here. If you have any information
- * on the protocol used (or find errors in my reverse-engineered stuff), please
- * let me know.
- *
- * The code was only tested with a PalmConnect USB adapter; if you
- * are adventurous, try it with any KLSI-based device and let me know how it
- * breaks so that I can fix it!
- */
-
-/* TODO:
- *	check modem line signals
- *	implement handshaking or decide that we do not support it
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/tty.h>
-#include <linux/tty_driver.h>
-#include <linux/tty_flip.h>
-#include <linux/module.h>
-#include <linux/uaccess.h>
-#include <asm/unaligned.h>
-#include <linux/usb.h>
-#include <linux/usb/serial.h>
-#include "kl5kusb105.h"
-
-#define DRIVER_AUTHOR "Utz-Uwe Haus <haus@uuhaus.de>, Johan Hovold <jhovold@gmail.com>"
-#define DRIVER_DESC "KLSI KL5KUSB105 chipset USB->Serial Converter driver"
-
-
-/*
- * Function prototypes
- */
-static int klsi_105_port_probe(struct usb_serial_port *port);
-static int klsi_105_port_remove(struct usb_serial_port *port);
-static int  klsi_105_open(struct tty_struct *tty, struct usb_serial_port *port);
-static void klsi_105_close(struct usb_serial_port *port);
-static void klsi_105_set_termios(struct tty_struct *tty,
-			struct usb_serial_port *port, struct ktermios *old);
-static int  klsi_105_tiocmget(struct tty_struct *tty);
-static void klsi_105_process_read_urb(struct urb *urb);
-static int klsi_105_prepare_write_buffer(struct usb_serial_port *port,
-						void *dest, size_t size);
-
-/*
- * All of the device info needed for the KLSI converters.
- */
-static const struct usb_device_id id_table[] = {
-	{ USB_DEVICE(PALMCONNECT_VID, PALMCONNECT_PID) },
-	{ USB_DEVICE(KLSI_VID, KLSI_KL5KUSB105D_PID) },
-	{ }		/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE(usb, id_table);
-
-static struct usb_serial_driver kl5kusb105d_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"kl5kusb105d",
-	},
-	.description =		"KL5KUSB105D / PalmConnect",
-	.id_table =		id_table,
-	.num_ports =		1,
-	.bulk_out_size =	64,
-	.open =			klsi_105_open,
-	.close =		klsi_105_close,
-	.set_termios =		klsi_105_set_termios,
-	/*.break_ctl =		klsi_105_break_ctl,*/
-	.tiocmget =		klsi_105_tiocmget,
-	.port_probe =		klsi_105_port_probe,
-	.port_remove =		klsi_105_port_remove,
-	.throttle =		usb_serial_generic_throttle,
-	.unthrottle =		usb_serial_generic_unthrottle,
-	.process_read_urb =	klsi_105_process_read_urb,
-	.prepare_write_buffer =	klsi_105_prepare_write_buffer,
-};
-
-static struct usb_serial_driver * const serial_drivers[] = {
-	&kl5kusb105d_device, NULL
-};
-
-struct klsi_105_port_settings {
-	__u8	pktlen;		/* always 5, it seems */
-	__u8	baudrate;
-	__u8	databits;
-	__u8	unknown1;
-	__u8	unknown2;
-} __attribute__ ((packed));
-
-struct klsi_105_private {
-	struct klsi_105_port_settings	cfg;
-	struct ktermios			termios;
-	unsigned long			line_state; /* modem line settings */
-	spinlock_t			lock;
-};
-
-
-/*
- * Handle vendor specific USB requests
- */
-
-
-#define KLSI_TIMEOUT	 5000 /* default urb timeout */
-
-static int klsi_105_chg_port_settings(struct usb_serial_port *port,
-				      struct klsi_105_port_settings *settings)
-{
-	int rc;
-
-	rc = usb_control_msg(port->serial->dev,
-			usb_sndctrlpipe(port->serial->dev, 0),
-			KL5KUSB105A_SIO_SET_DATA,
-			USB_TYPE_VENDOR | USB_DIR_OUT | USB_RECIP_INTERFACE,
-			0, /* value */
-			0, /* index */
-			settings,
-			sizeof(struct klsi_105_port_settings),
-			KLSI_TIMEOUT);
-	if (rc < 0)
-		dev_err(&port->dev,
-			"Change port settings failed (error = %d)\n", rc);
-	dev_info(&port->serial->dev->dev,
-		 "%d byte block, baudrate %x, databits %d, u1 %d, u2 %d\n",
-		 settings->pktlen, settings->baudrate, settings->databits,
-		 settings->unknown1, settings->unknown2);
-	return rc;
-}
-
-/* translate a 16-bit status value from the device to linux's TIO bits */
-static unsigned long klsi_105_status2linestate(const __u16 status)
-{
-	unsigned long res = 0;
-
-	res =   ((status & KL5KUSB105A_DSR) ? TIOCM_DSR : 0)
-	      | ((status & KL5KUSB105A_CTS) ? TIOCM_CTS : 0)
-	      ;
-
-	return res;
-}
-
-/*
- * Read line control via vendor command and return result through
- * *line_state_p
- */
-/* It seems that the status buffer has always only 2 bytes length */
-#define KLSI_STATUSBUF_LEN	2
-static int klsi_105_get_line_state(struct usb_serial_port *port,
-				   unsigned long *line_state_p)
-{
-	int rc;
-	u8 *status_buf;
-	__u16 status;
-
-	dev_info(&port->serial->dev->dev, "sending SIO Poll request\n");
-
-	status_buf = kmalloc(KLSI_STATUSBUF_LEN, GFP_KERNEL);
-	if (!status_buf)
-		return -ENOMEM;
-
-	status_buf[0] = 0xff;
-	status_buf[1] = 0xff;
-	rc = usb_control_msg(port->serial->dev,
-			     usb_rcvctrlpipe(port->serial->dev, 0),
-			     KL5KUSB105A_SIO_POLL,
-			     USB_TYPE_VENDOR | USB_DIR_IN,
-			     0, /* value */
-			     0, /* index */
-			     status_buf, KLSI_STATUSBUF_LEN,
-			     10000
-			     );
-	if (rc != KLSI_STATUSBUF_LEN) {
-		dev_err(&port->dev, "reading line status failed: %d\n", rc);
-		if (rc >= 0)
-			rc = -EIO;
-	} else {
-		status = get_unaligned_le16(status_buf);
-
-		dev_info(&port->serial->dev->dev, "read status %x %x\n",
-			 status_buf[0], status_buf[1]);
-
-		*line_state_p = klsi_105_status2linestate(status);
-	}
-
-	kfree(status_buf);
-	return rc;
-}
-
-
-/*
- * Driver's tty interface functions
- */
-
-static int klsi_105_port_probe(struct usb_serial_port *port)
-{
-	struct klsi_105_private *priv;
-
-	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	/* set initial values for control structures */
-	priv->cfg.pktlen    = 5;
-	priv->cfg.baudrate  = kl5kusb105a_sio_b9600;
-	priv->cfg.databits  = kl5kusb105a_dtb_8;
-	priv->cfg.unknown1  = 0;
-	priv->cfg.unknown2  = 1;
-
-	priv->line_state    = 0;
-
-	spin_lock_init(&priv->lock);
-
-	/* priv->termios is left uninitialized until port opening */
-
-	usb_set_serial_port_data(port, priv);
-
-	return 0;
-}
-
-static int klsi_105_port_remove(struct usb_serial_port *port)
-{
-	struct klsi_105_private *priv;
-
-	priv = usb_get_serial_port_data(port);
-	kfree(priv);
-
-	return 0;
-}
-
-static int  klsi_105_open(struct tty_struct *tty, struct usb_serial_port *port)
-{
-	struct klsi_105_private *priv = usb_get_serial_port_data(port);
-	int retval = 0;
-	int rc;
-	int i;
-	unsigned long line_state;
-	struct klsi_105_port_settings *cfg;
-	unsigned long flags;
-
-	/* Do a defined restart:
-	 * Set up sane default baud rate and send the 'READ_ON'
-	 * vendor command.
-	 * FIXME: set modem line control (how?)
-	 * Then read the modem line control and store values in
-	 * priv->line_state.
-	 */
-	cfg = kmalloc(sizeof(*cfg), GFP_KERNEL);
-	if (!cfg)
-		return -ENOMEM;
-
-	cfg->pktlen   = 5;
-	cfg->baudrate = kl5kusb105a_sio_b9600;
-	cfg->databits = kl5kusb105a_dtb_8;
-	cfg->unknown1 = 0;
-	cfg->unknown2 = 1;
-	klsi_105_chg_port_settings(port, cfg);
-
-	/* set up termios structure */
-	spin_lock_irqsave(&priv->lock, flags);
-	priv->termios.c_iflag = tty->termios.c_iflag;
-	priv->termios.c_oflag = tty->termios.c_oflag;
-	priv->termios.c_cflag = tty->termios.c_cflag;
-	priv->termios.c_lflag = tty->termios.c_lflag;
-	for (i = 0; i < NCCS; i++)
-		priv->termios.c_cc[i] = tty->termios.c_cc[i];
-	priv->cfg.pktlen   = cfg->pktlen;
-	priv->cfg.baudrate = cfg->baudrate;
-	priv->cfg.databits = cfg->databits;
-	priv->cfg.unknown1 = cfg->unknown1;
-	priv->cfg.unknown2 = cfg->unknown2;
-	spin_unlock_irqrestore(&priv->lock, flags);
-
-	kfree(cfg);
-
-	/* READ_ON and urb submission */
-	rc = usb_serial_generic_open(tty, port);
-	if (rc)
-		return rc;
-
-	rc = usb_control_msg(port->serial->dev,
-			     usb_sndctrlpipe(port->serial->dev, 0),
-			     KL5KUSB105A_SIO_CONFIGURE,
-			     USB_TYPE_VENDOR|USB_DIR_OUT|USB_RECIP_INTERFACE,
-			     KL5KUSB105A_SIO_CONFIGURE_READ_ON,
-			     0, /* index */
-			     NULL,
-			     0,
-			     KLSI_TIMEOUT);
-	if (rc < 0) {
-		dev_err(&port->dev, "Enabling read failed (error = %d)\n", rc);
-		retval = rc;
-		goto err_generic_close;
-	} else
-		dev_dbg(&port->dev, "%s - enabled reading\n", __func__);
-
-	rc = klsi_105_get_line_state(port, &line_state);
-	if (rc < 0) {
-		retval = rc;
-		goto err_disable_read;
-	}
-
-	spin_lock_irqsave(&priv->lock, flags);
-	priv->line_state = line_state;
-	spin_unlock_irqrestore(&priv->lock, flags);
-	dev_dbg(&port->dev, "%s - read line state 0x%lx\n", __func__,
-			line_state);
-
-	return 0;
-
-err_disable_read:
-	usb_control_msg(port->serial->dev,
-			     usb_sndctrlpipe(port->serial->dev, 0),
-			     KL5KUSB105A_SIO_CONFIGURE,
-			     USB_TYPE_VENDOR | USB_DIR_OUT,
-			     KL5KUSB105A_SIO_CONFIGURE_READ_OFF,
-			     0, /* index */
-			     NULL, 0,
-			     KLSI_TIMEOUT);
-err_generic_close:
-	usb_serial_generic_close(port);
-
-	return retval;
-}
-
-static void klsi_105_close(struct usb_serial_port *port)
-{
-	int rc;
-
-	/* send READ_OFF */
-	rc = usb_control_msg(port->serial->dev,
-			     usb_sndctrlpipe(port->serial->dev, 0),
-			     KL5KUSB105A_SIO_CONFIGURE,
-			     USB_TYPE_VENDOR | USB_DIR_OUT,
-			     KL5KUSB105A_SIO_CONFIGURE_READ_OFF,
-			     0, /* index */
-			     NULL, 0,
-			     KLSI_TIMEOUT);
-	if (rc < 0)
-		dev_err(&port->dev, "failed to disable read: %d\n", rc);
-
-	/* shutdown our bulk reads and writes */
-	usb_serial_generic_close(port);
-}
-
-/* We need to write a complete 64-byte data block and encode the
- * number actually sent in the first double-byte, LSB-order. That
- * leaves at most 62 bytes of payload.
- */
-#define KLSI_HDR_LEN		2
-static int klsi_105_prepare_write_buffer(struct usb_serial_port *port,
-						void *dest, size_t size)
-{
-	unsigned char *buf = dest;
-	int count;
-
-	count = kfifo_out_locked(&port->write_fifo, buf + KLSI_HDR_LEN, size,
-								&port->lock);
-	put_unaligned_le16(count, buf);
-
-	return count + KLSI_HDR_LEN;
-}
-
-/* The data received is preceded by a length double-byte in LSB-first order.
- */
-static void klsi_105_process_read_urb(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	unsigned char *data = urb->transfer_buffer;
-	unsigned len;
-
-	/* empty urbs seem to happen, we ignore them */
-	if (!urb->actual_length)
-		return;
-
-	if (urb->actual_length <= KLSI_HDR_LEN) {
-		dev_dbg(&port->dev, "%s - malformed packet\n", __func__);
-		return;
-	}
-
-	len = get_unaligned_le16(data);
-	if (len > urb->actual_length - KLSI_HDR_LEN) {
-		dev_dbg(&port->dev, "%s - packet length mismatch\n", __func__);
-		len = urb->actual_length - KLSI_HDR_LEN;
-	}
-
-	tty_insert_flip_string(&port->port, data + KLSI_HDR_LEN, len);
-	tty_flip_buffer_push(&port->port);
-}
-
-static void klsi_105_set_termios(struct tty_struct *tty,
-				 struct usb_serial_port *port,
-				 struct ktermios *old_termios)
-{
-	struct klsi_105_private *priv = usb_get_serial_port_data(port);
-	struct device *dev = &port->dev;
-	unsigned int iflag = tty->termios.c_iflag;
-	unsigned int old_iflag = old_termios->c_iflag;
-	unsigned int cflag = tty->termios.c_cflag;
-	unsigned int old_cflag = old_termios->c_cflag;
-	struct klsi_105_port_settings *cfg;
-	unsigned long flags;
-	speed_t baud;
-
-	cfg = kmalloc(sizeof(*cfg), GFP_KERNEL);
-	if (!cfg)
-		return;
-
-	/* lock while we are modifying the settings */
-	spin_lock_irqsave(&priv->lock, flags);
-
-	/*
-	 * Update baud rate
-	 */
-	baud = tty_get_baud_rate(tty);
-
-	if ((cflag & CBAUD) != (old_cflag & CBAUD)) {
-		/* reassert DTR and (maybe) RTS on transition from B0 */
-		if ((old_cflag & CBAUD) == B0) {
-			dev_dbg(dev, "%s: baud was B0\n", __func__);
-#if 0
-			priv->control_state |= TIOCM_DTR;
-			/* don't set RTS if using hardware flow control */
-			if (!(old_cflag & CRTSCTS))
-				priv->control_state |= TIOCM_RTS;
-			mct_u232_set_modem_ctrl(serial, priv->control_state);
-#endif
-		}
-	}
-	switch (baud) {
-	case 0: /* handled below */
-		break;
-	case 1200:
-		priv->cfg.baudrate = kl5kusb105a_sio_b1200;
-		break;
-	case 2400:
-		priv->cfg.baudrate = kl5kusb105a_sio_b2400;
-		break;
-	case 4800:
-		priv->cfg.baudrate = kl5kusb105a_sio_b4800;
-		break;
-	case 9600:
-		priv->cfg.baudrate = kl5kusb105a_sio_b9600;
-		break;
-	case 19200:
-		priv->cfg.baudrate = kl5kusb105a_sio_b19200;
-		break;
-	case 38400:
-		priv->cfg.baudrate = kl5kusb105a_sio_b38400;
-		break;
-	case 57600:
-		priv->cfg.baudrate = kl5kusb105a_sio_b57600;
-		break;
-	case 115200:
-		priv->cfg.baudrate = kl5kusb105a_sio_b115200;
-		break;
-	default:
-		dev_dbg(dev, "unsupported baudrate, using 9600\n");
-		priv->cfg.baudrate = kl5kusb105a_sio_b9600;
-		baud = 9600;
-		break;
-	}
-	if ((cflag & CBAUD) == B0) {
-		dev_dbg(dev, "%s: baud is B0\n", __func__);
-		/* Drop RTS and DTR */
-		/* maybe this should be simulated by sending read
-		 * disable and read enable messages?
-		 */
-		;
-#if 0
-		priv->control_state &= ~(TIOCM_DTR | TIOCM_RTS);
-		mct_u232_set_modem_ctrl(serial, priv->control_state);
-#endif
-	}
-	tty_encode_baud_rate(tty, baud, baud);
-
-	if ((cflag & CSIZE) != (old_cflag & CSIZE)) {
-		/* set the number of data bits */
-		switch (cflag & CSIZE) {
-		case CS5:
-			dev_dbg(dev, "%s - 5 bits/byte not supported\n", __func__);
-			spin_unlock_irqrestore(&priv->lock, flags);
-			goto err;
-		case CS6:
-			dev_dbg(dev, "%s - 6 bits/byte not supported\n", __func__);
-			spin_unlock_irqrestore(&priv->lock, flags);
-			goto err;
-		case CS7:
-			priv->cfg.databits = kl5kusb105a_dtb_7;
-			break;
-		case CS8:
-			priv->cfg.databits = kl5kusb105a_dtb_8;
-			break;
-		default:
-			dev_err(dev, "CSIZE was not CS5-CS8, using default of 8\n");
-			priv->cfg.databits = kl5kusb105a_dtb_8;
-			break;
-		}
-	}
-
-	/*
-	 * Update line control register (LCR)
-	 */
-	if ((cflag & (PARENB|PARODD)) != (old_cflag & (PARENB|PARODD))
-	    || (cflag & CSTOPB) != (old_cflag & CSTOPB)) {
-		/* Not currently supported */
-		tty->termios.c_cflag &= ~(PARENB|PARODD|CSTOPB);
-#if 0
-		priv->last_lcr = 0;
-
-		/* set the parity */
-		if (cflag & PARENB)
-			priv->last_lcr |= (cflag & PARODD) ?
-				MCT_U232_PARITY_ODD : MCT_U232_PARITY_EVEN;
-		else
-			priv->last_lcr |= MCT_U232_PARITY_NONE;
-
-		/* set the number of stop bits */
-		priv->last_lcr |= (cflag & CSTOPB) ?
-			MCT_U232_STOP_BITS_2 : MCT_U232_STOP_BITS_1;
-
-		mct_u232_set_line_ctrl(serial, priv->last_lcr);
-#endif
-		;
-	}
-	/*
-	 * Set flow control: well, I do not really now how to handle DTR/RTS.
-	 * Just do what we have seen with SniffUSB on Win98.
-	 */
-	if ((iflag & IXOFF) != (old_iflag & IXOFF)
-	    || (iflag & IXON) != (old_iflag & IXON)
-	    ||  (cflag & CRTSCTS) != (old_cflag & CRTSCTS)) {
-		/* Not currently supported */
-		tty->termios.c_cflag &= ~CRTSCTS;
-		/* Drop DTR/RTS if no flow control otherwise assert */
-#if 0
-		if ((iflag & IXOFF) || (iflag & IXON) || (cflag & CRTSCTS))
-			priv->control_state |= TIOCM_DTR | TIOCM_RTS;
-		else
-			priv->control_state &= ~(TIOCM_DTR | TIOCM_RTS);
-		mct_u232_set_modem_ctrl(serial, priv->control_state);
-#endif
-		;
-	}
-	memcpy(cfg, &priv->cfg, sizeof(*cfg));
-	spin_unlock_irqrestore(&priv->lock, flags);
-
-	/* now commit changes to device */
-	klsi_105_chg_port_settings(port, cfg);
-err:
-	kfree(cfg);
-}
-
-#if 0
-static void mct_u232_break_ctl(struct tty_struct *tty, int break_state)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct usb_serial *serial = port->serial;
-	struct mct_u232_private *priv =
-				(struct mct_u232_private *)port->private;
-	unsigned char lcr = priv->last_lcr;
-
-	dev_dbg(&port->dev, "%s - state=%d\n", __func__, break_state);
-
-	/* LOCKING */
-	if (break_state)
-		lcr |= MCT_U232_SET_BREAK;
-
-	mct_u232_set_line_ctrl(serial, lcr);
-}
-#endif
-
-static int klsi_105_tiocmget(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
-	struct klsi_105_private *priv = usb_get_serial_port_data(port);
-	unsigned long flags;
-	int rc;
-	unsigned long line_state;
-
-	rc = klsi_105_get_line_state(port, &line_state);
-	if (rc < 0) {
-		dev_err(&port->dev,
-			"Reading line control failed (error = %d)\n", rc);
-		/* better return value? EAGAIN? */
-		return rc;
-	}
-
-	spin_lock_irqsave(&priv->lock, flags);
-	priv->line_state = line_state;
-	spin_unlock_irqrestore(&priv->lock, flags);
-	dev_dbg(&port->dev, "%s - read line state 0x%lx\n", __func__, line_state);
-	return (int)line_state;
-}
-
-module_usb_serial_driver(serial_drivers, id_table);
-
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_LICENSE("GPL");
+E_EN_MODE_MASK 0x400000
+#define D3F5_PCIE_LC_CNTL3__LC_RXPHYCMD_INACTIVE_EN_MODE__SHIFT 0x16
+#define D3F5_PCIE_LC_CNTL3__LC_DSC_DONT_ENTER_L23_AFTER_PME_ACK_MASK 0x800000
+#define D3F5_PCIE_LC_CNTL3__LC_DSC_DONT_ENTER_L23_AFTER_PME_ACK__SHIFT 0x17
+#define D3F5_PCIE_LC_CNTL3__LC_HW_VOLTAGE_IF_CONTROL_MASK 0x3000000
+#define D3F5_PCIE_LC_CNTL3__LC_HW_VOLTAGE_IF_CONTROL__SHIFT 0x18
+#define D3F5_PCIE_LC_CNTL3__LC_VOLTAGE_TIMER_SEL_MASK 0x3c000000
+#define D3F5_PCIE_LC_CNTL3__LC_VOLTAGE_TIMER_SEL__SHIFT 0x1a
+#define D3F5_PCIE_LC_CNTL3__LC_GO_TO_RECOVERY_MASK 0x40000000
+#define D3F5_PCIE_LC_CNTL3__LC_GO_TO_RECOVERY__SHIFT 0x1e
+#define D3F5_PCIE_LC_CNTL3__LC_N_EIE_SEL_MASK 0x80000000
+#define D3F5_PCIE_LC_CNTL3__LC_N_EIE_SEL__SHIFT 0x1f
+#define D3F5_PCIE_LC_CNTL4__LC_TX_ENABLE_BEHAVIOUR_MASK 0x3
+#define D3F5_PCIE_LC_CNTL4__LC_TX_ENABLE_BEHAVIOUR__SHIFT 0x0
+#define D3F5_PCIE_LC_CNTL4__LC_DIS_CONTIG_END_SET_CHECK_MASK 0x4
+#define D3F5_PCIE_LC_CNTL4__LC_DIS_CONTIG_END_SET_CHECK__SHIFT 0x2
+#define D3F5_PCIE_LC_CNTL4__LC_DIS_ASPM_L1_IN_SPEED_CHANGE_MASK 0x8
+#define D3F5_PCIE_LC_CNTL4__LC_DIS_ASPM_L1_IN_SPEED_CHANGE__SHIFT 0x3
+#define D3F5_PCIE_LC_CNTL4__LC_BYPASS_EQ_MASK 0x10
+#define D3F5_PCIE_LC_CNTL4__LC_BYPASS_EQ__SHIFT 0x4
+#define D3F5_PCIE_LC_CNTL4__LC_REDO_EQ_MASK 0x20
+#define D3F5_PCIE_LC_CNTL4__LC_REDO_EQ__SHIFT 0x5
+#define D3F5_PCIE_LC_CNTL4__LC_EXTEND_EIEOS_MASK 0x40
+#define D3F5_PCIE_LC_CNTL4__LC_EXTEND_EIEOS__SHIFT 0x6
+#define D3F5_PCIE_LC_CNTL4__LC_IGNORE_PARITY_MASK 0x80
+#define D3F5_PCIE_LC_CNTL4__LC_IGNORE_PARITY__SHIFT 0x7
+#define D3F5_PCIE_LC_CNTL4__LC_EQ_SEARCH_MODE_MASK 0x300
+#define D3F5_PCIE_LC_CNTL4__LC_EQ_SEARCH_MODE__SHIFT 0x8
+#define D3F5_PCIE_LC_CNTL4__LC_DSC_CHECK_COEFFS_IN_RLOCK_MASK 0x400
+#define D3F5_PCIE_LC_CNTL4__LC_DSC_CHECK_COEFFS_IN_RLOCK__SHIFT 0xa
+#define D3F5_PCIE_LC_CNTL4__LC_USC_EQ_NOT_REQD_MASK 0x800
+#define D3F5_PCIE_LC_CNTL4__LC_USC_EQ_NOT_REQD__SHIFT 0xb
+#define D3F5_PCIE_LC_CNTL4__LC_USC_GO_TO_EQ_MASK 0x1000
+#define D3F5_PCIE_LC_CNTL4__LC_USC_GO_TO_EQ__SHIFT 0xc
+#define D3F5_PCIE_LC_CNTL4__LC_SET_QUIESCE_MASK 0x2000
+#define D3F5_PCIE_LC_CNTL4__LC_SET_QUIESCE__SHIFT 0xd
+#define D3F5_PCIE_LC_CNTL4__LC_QUIESCE_RCVD_MASK 0x4000
+#define D3F5_PCIE_LC_CNTL4__LC_QUIESCE_RCVD__SHIFT 0xe
+#define D3F5_PCIE_LC_CNTL4__LC_UNEXPECTED_COEFFS_RCVD_MASK 0x8000
+#define D3F5_PCIE_LC_CNTL4__LC_UNEXPECTED_COEFFS_RCVD__SHIFT 0xf
+#define D3F5_PCIE_LC_CNTL4__LC_BYPASS_EQ_REQ_PHASE_MASK 0x10000
+#define D3F5_PCIE_LC_CNTL4__LC_BYPASS_EQ_REQ_PHASE__SHIFT 0x10
+#define D3F5_PCIE_LC_CNTL4__LC_FORCE_PRESET_IN_EQ_REQ_PHASE_MASK 0x20000
+#define D3F5_PCIE_LC_CNTL4__LC_FORCE_PRESET_IN_EQ_REQ_PHASE__SHIFT 0x11
+#define D3F5_PCIE_LC_CNTL4__LC_FORCE_PRESET_VALUE_MASK 0x3c0000
+#define D3F5_PCIE_LC_CNTL4__LC_FORCE_PRESET_VALUE__SHIFT 0x12
+#define D3F5_PCIE_LC_CNTL4__LC_USC_DELAY_DLLPS_MASK 0x400000
+#define D3F5_PCIE_LC_CNTL4__LC_USC_DELAY_DLLPS__SHIFT 0x16
+#define D3F5_PCIE_LC_CNTL4__LC_PCIE_TX_FULL_SWING_MASK 0x800000
+#define D3F5_PCIE_LC_CNTL4__LC_PCIE_TX_FULL_SWING__SHIFT 0x17
+#define D3F5_PCIE_LC_CNTL4__LC_EQ_WAIT_FOR_EVAL_DONE_MASK 0x1000000
+#define D3F5_PCIE_LC_CNTL4__LC_EQ_WAIT_FOR_EVAL_DONE__SHIFT 0x18
+#define D3F5_PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN_MASK 0x2000000
+#define D3F5_PCIE_LC_CNTL4__LC_8GT_SKIP_ORDER_EN__SHIFT 0x19
+#define D3F5_PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK_MASK 0xfc000000
+#define D3F5_PCIE_LC_CNTL4__LC_WAIT_FOR_MORE_TS_IN_RLOCK__SHIFT 0x1a
+#define D3F5_PCIE_LC_CNTL5__LC_EQ_FS_0_MASK 0x3f
+#define D3F5_PCIE_LC_CNTL5__LC_EQ_FS_0__SHIFT 0x0
+#define D3F5_PCIE_LC_CNTL5__LC_EQ_FS_8_MASK 0xfc0
+#define D3F5_PCIE_LC_CNTL5__LC_EQ_FS_8__SHIFT 0x6
+#define D3F5_PCIE_LC_CNTL5__LC_EQ_LF_0_MASK 0x3f000
+#define D3F5_PCIE_LC_CNTL5__LC_EQ_LF_0__SHIFT 0xc
+#define D3F5_PCIE_LC_CNTL5__LC_EQ_LF_8_MASK 0xfc0000
+#define D3F5_PCIE_LC_CNTL5__LC_EQ_LF_8__SHIFT 0x12
+#define D3F5_PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS_MASK 0x1000000
+#define D3F5_PCIE_LC_CNTL5__LC_DSC_EQ_FS_LF_INVALID_TO_PRESETS__SHIFT 0x18
+#define D3F5_PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT_MASK 0x1
+#define D3F5_PCIE_LC_CNTL6__LC_SPC_MODE_2P5GT__SHIFT 0x0
+#define D3F5_PCIE_LC_CNTL6__LC_SPC_MODE_5GT_MASK 0x4
+#define D3F5_PCIE_LC_CNTL6__LC_SPC_MODE_5GT__SHIFT 0x2
+#define D3F5_PCIE_LC_CNTL6__LC_SPC_MODE_8GT_MASK 0x10
+#define D3F5_PCIE_LC_CNTL6__LC_SPC_MODE_8GT__SHIFT 0x4
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN_MASK 0x1
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_BW_CHANGE_INT_EN__SHIFT 0x0
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE_MASK 0x2
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_HW_INIT_SPEED_CHANGE__SHIFT 0x1
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE_MASK 0x4
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_SW_INIT_SPEED_CHANGE__SHIFT 0x2
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE_MASK 0x8
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_OTHER_INIT_SPEED_CHANGE__SHIFT 0x3
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE_MASK 0x10
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_RELIABILITY_SPEED_CHANGE__SHIFT 0x4
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_FAILED_SPEED_NEG_MASK 0x20
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_FAILED_SPEED_NEG__SHIFT 0x5
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_LONG_LW_CHANGE_MASK 0x40
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_LONG_LW_CHANGE__SHIFT 0x6
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_SHORT_LW_CHANGE_MASK 0x80
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_SHORT_LW_CHANGE__SHIFT 0x7
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_OTHER_MASK 0x100
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_OTHER__SHIFT 0x8
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED_MASK 0x200
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_LW_CHANGE_FAILED__SHIFT 0x9
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE_MASK 0x400
+#define D3F5_PCIE_LC_BW_CHANGE_CNTL__LC_LINK_BW_NOTIFICATION_DETECT_MODE__SHIFT 0xa
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL_MASK 0xf
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_TRAINING_CNTL__SHIFT 0x0
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE_MASK 0x10
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_COMPLIANCE_RECEIVE__SHIFT 0x4
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1_MASK 0x20
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_LOOK_FOR_MORE_NON_MATCHING_TS1__SHIFT 0x5
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN_MASK 0x40
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_L0S_L1_TRAINING_CNTL_EN__SHIFT 0x6
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN_MASK 0x80
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_L1_LONG_WAKE_FIX_EN__SHIFT 0x7
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_POWER_STATE_MASK 0x700
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_POWER_STATE__SHIFT 0x8
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED_MASK 0x800
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_DONT_GO_TO_L0S_IF_L1_ARMED__SHIFT 0xb
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN_MASK 0x1000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_INIT_SPD_CHG_WITH_CSR_EN__SHIFT 0xc
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH_MASK 0x2000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_DISABLE_TRAINING_BIT_ARCH__SHIFT 0xd
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG_MASK 0x4000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_SETS_IN_RCFG__SHIFT 0xe
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN_MASK 0x8000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_HOT_RESET_QUICK_EXIT_EN__SHIFT 0xf
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP_MASK 0x10000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_EXTEND_WAIT_FOR_SKP__SHIFT 0x10
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF_MASK 0x20000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_AUTONOMOUS_CHANGE_OFF__SHIFT 0x11
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF_MASK 0x40000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_UPCONFIGURE_CAP_OFF__SHIFT 0x12
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN_MASK 0x80000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_HW_LINK_DIS_EN__SHIFT 0x13
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW_MASK 0x100000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_LINK_DIS_BY_HW__SHIFT 0x14
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN_MASK 0x200000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_STATIC_TX_PIPE_COUNT_EN__SHIFT 0x15
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL_MASK 0xc00000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_ASPM_L1_NAK_TIMER_SEL__SHIFT 0x16
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED_MASK 0x1000000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_R_SPEED__SHIFT 0x18
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST_MASK 0x2000000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_DONT_DEASSERT_RX_EN_IN_TEST__SHIFT 0x19
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_RESET_ASPM_L1_NAK_TIMER_MASK 0x4000000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_RESET_ASPM_L1_NAK_TIMER__SHIFT 0x1a
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_SHORT_RCFG_TIMEOUT_MASK 0x8000000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_SHORT_RCFG_TIMEOUT__SHIFT 0x1b
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_ALLOW_TX_L1_CONTROL_MASK 0x10000000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_ALLOW_TX_L1_CONTROL__SHIFT 0x1c
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_FOM_VALID_AFTER_TRACK_MASK 0x20000000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_WAIT_FOR_FOM_VALID_AFTER_TRACK__SHIFT 0x1d
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_EXTEND_EQ_REQ_TIME_MASK 0xc0000000
+#define D3F5_PCIE_LC_TRAINING_CNTL__LC_EXTEND_EQ_REQ_TIME__SHIFT 0x1e
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_MASK 0x7
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH__SHIFT 0x0
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_RD_MASK 0x70
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_LINK_WIDTH_RD__SHIFT 0x4
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_ARC_MISSING_ESCAPE_MASK 0x80
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_ARC_MISSING_ESCAPE__SHIFT 0x7
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_NOW_MASK 0x100
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RECONFIG_NOW__SHIFT 0x8
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATION_SUPPORT_MASK 0x200
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATION_SUPPORT__SHIFT 0x9
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATE_EN_MASK 0x400
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RENEGOTIATE_EN__SHIFT 0xa
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_SHORT_RECONFIG_EN_MASK 0x800
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_SHORT_RECONFIG_EN__SHIFT 0xb
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_SUPPORT_MASK 0x1000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_SUPPORT__SHIFT 0xc
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_DIS_MASK 0x2000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_DIS__SHIFT 0xd
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_WAIT_FOR_RCVR_DIS_MASK 0x4000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_WAIT_FOR_RCVR_DIS__SHIFT 0xe
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_TIMER_SEL_MASK 0x8000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCFG_TIMER_SEL__SHIFT 0xf
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_DEASSERT_TX_PDNB_MASK 0x10000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_DEASSERT_TX_PDNB__SHIFT 0x10
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_L1_RECONFIG_EN_MASK 0x20000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_L1_RECONFIG_EN__SHIFT 0x11
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_DYNLINK_MST_EN_MASK 0x40000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_DYNLINK_MST_EN__SHIFT 0x12
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_DUAL_END_RECONFIG_EN_MASK 0x80000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_DUAL_END_RECONFIG_EN__SHIFT 0x13
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_CAPABLE_MASK 0x100000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_UPCONFIGURE_CAPABLE__SHIFT 0x14
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_DYN_LANES_PWR_STATE_MASK 0x600000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_DYN_LANES_PWR_STATE__SHIFT 0x15
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_EQ_REVERSAL_LOGIC_EN_MASK 0x800000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_EQ_REVERSAL_LOGIC_EN__SHIFT 0x17
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_MULT_REVERSE_ATTEMP_EN_MASK 0x1000000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_MULT_REVERSE_ATTEMP_EN__SHIFT 0x18
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RESET_TSX_CNT_IN_RCONFIG_EN_MASK 0x2000000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_RESET_TSX_CNT_IN_RCONFIG_EN__SHIFT 0x19
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_L_IDLE_IN_R_IDLE_MASK 0x4000000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_L_IDLE_IN_R_IDLE__SHIFT 0x1a
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_NON_EI_ON_RXL0S_EXIT_MASK 0x8000000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_WAIT_FOR_NON_EI_ON_RXL0S_EXIT__SHIFT 0x1b
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE_MASK 0x10000000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_HOLD_EI_FOR_RSPEED_CMD_CHANGE__SHIFT 0x1c
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI_MASK 0x20000000
+#define D3F5_PCIE_LC_LINK_WIDTH_CNTL__LC_BYPASS_RXL0S_ON_SHORT_EI__SHIFT 0x1d
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_MASK 0xff
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS__SHIFT 0x0
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_OVERRIDE_EN_MASK 0x100
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_OVERRIDE_EN__SHIFT 0x8
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_XMIT_FTS_BEFORE_RECOVERY_MASK 0x200
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_XMIT_FTS_BEFORE_RECOVERY__SHIFT 0x9
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_LIMIT_MASK 0xff0000
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_XMIT_N_FTS_LIMIT__SHIFT 0x10
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_N_FTS_MASK 0xff000000
+#define D3F5_PCIE_LC_N_FTS_CNTL__LC_N_FTS__SHIFT 0x18
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_GEN2_EN_STRAP_MASK 0x1
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_GEN2_EN_STRAP__SHIFT 0x0
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_GEN3_EN_STRAP_MASK 0x2
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_GEN3_EN_STRAP__SHIFT 0x1
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_EN_MASK 0x4
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_EN__SHIFT 0x2
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE_MASK 0x18
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_TARGET_LINK_SPEED_OVERRIDE__SHIFT 0x3
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_SW_SPEED_CHANGE_MASK 0x20
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_SW_SPEED_CHANGE__SHIFT 0x5
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_SW_SPEED_CHANGE_MASK 0x40
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_SW_SPEED_CHANGE__SHIFT 0x6
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_HW_SPEED_CHANGE_MASK 0x80
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_FORCE_EN_HW_SPEED_CHANGE__SHIFT 0x7
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_HW_SPEED_CHANGE_MASK 0x100
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_FORCE_DIS_HW_SPEED_CHANGE__SHIFT 0x8
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_INITIATE_LINK_SPEED_CHANGE_MASK 0x200
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_INITIATE_LINK_SPEED_CHANGE__SHIFT 0x9
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK 0xc00
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPTS_ALLOWED__SHIFT 0xa
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPT_FAILED_MASK 0x1000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_ATTEMPT_FAILED__SHIFT 0xc
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_CURRENT_DATA_RATE_MASK 0x6000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_CURRENT_DATA_RATE__SHIFT 0xd
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_DONT_CLR_TARGET_SPD_CHANGE_STATUS_MASK 0x8000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_DONT_CLR_TARGET_SPD_CHANGE_STATUS__SHIFT 0xf
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_CLR_FAILED_SPD_CHANGE_CNT_MASK 0x10000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_CLR_FAILED_SPD_CHANGE_CNT__SHIFT 0x10
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_1_OR_MORE_TS2_SPEED_ARC_EN_MASK 0x20000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_1_OR_MORE_TS2_SPEED_ARC_EN__SHIFT 0x11
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN2_MASK 0x40000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN2__SHIFT 0x12
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN2_MASK 0x80000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN2__SHIFT 0x13
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN3_MASK 0x100000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_EVER_SENT_GEN3__SHIFT 0x14
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3_MASK 0x200000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3__SHIFT 0x15
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS_MASK 0x400000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS__SHIFT 0x16
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS_MASK 0x800000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS__SHIFT 0x17
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED_MASK 0x3000000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED__SHIFT 0x18
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE_MASK 0x4000000
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE__SHIFT 0x1a
+#define D3F5_PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN_MASK 0x800

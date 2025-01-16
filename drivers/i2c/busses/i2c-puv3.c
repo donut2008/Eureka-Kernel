@@ -1,281 +1,131 @@
-/*
- * I2C driver for PKUnity-v3 SoC
- * Code specific to PKUnity SoC and UniCore ISA
- *
- *	Maintained by GUAN Xue-tao <gxt@mprc.pku.edu.cn>
- *	Copyright (C) 2001-2010 Guan Xuetao
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/err.h>
-#include <linux/slab.h>
-#include <linux/types.h>
-#include <linux/delay.h>
-#include <linux/i2c.h>
-#include <linux/clk.h>
-#include <linux/platform_device.h>
-#include <linux/io.h>
-#include <mach/hardware.h>
-
-/*
- * Poll the i2c status register until the specified bit is set.
- * Returns 0 if timed out (100 msec).
- */
-static short poll_status(unsigned long bit)
-{
-	int loop_cntr = 1000;
-
-	if (bit & I2C_STATUS_TFNF) {
-		do {
-			udelay(10);
-		} while (!(readl(I2C_STATUS) & bit) && (--loop_cntr > 0));
-	} else {
-		/* RXRDY handler */
-		do {
-			if (readl(I2C_TAR) == I2C_TAR_EEPROM)
-				msleep(20);
-			else
-				udelay(10);
-		} while (!(readl(I2C_RXFLR) & 0xf) && (--loop_cntr > 0));
-	}
-
-	return (loop_cntr > 0);
-}
-
-static int xfer_read(struct i2c_adapter *adap, unsigned char *buf, int length)
-{
-	int i2c_reg = *buf;
-
-	/* Read data */
-	while (length--) {
-		if (!poll_status(I2C_STATUS_TFNF)) {
-			dev_dbg(&adap->dev, "Tx FIFO Not Full timeout\n");
-			return -ETIMEDOUT;
-		}
-
-		/* send addr */
-		writel(i2c_reg | I2C_DATACMD_WRITE, I2C_DATACMD);
-
-		/* get ready to next write */
-		i2c_reg++;
-
-		/* send read CMD */
-		writel(I2C_DATACMD_READ, I2C_DATACMD);
-
-		/* wait until the Rx FIFO have available */
-		if (!poll_status(I2C_STATUS_RFNE)) {
-			dev_dbg(&adap->dev, "RXRDY timeout\n");
-			return -ETIMEDOUT;
-		}
-
-		/* read the data to buf */
-		*buf = (readl(I2C_DATACMD) & I2C_DATACMD_DAT_MASK);
-		buf++;
-	}
-
-	return 0;
-}
-
-static int xfer_write(struct i2c_adapter *adap, unsigned char *buf, int length)
-{
-	int i2c_reg = *buf;
-
-	/* Do nothing but storing the reg_num to a static variable */
-	if (i2c_reg == -1) {
-		printk(KERN_WARNING "Error i2c reg\n");
-		return -ETIMEDOUT;
-	}
-
-	if (length == 1)
-		return 0;
-
-	buf++;
-	length--;
-	while (length--) {
-		/* send addr */
-		writel(i2c_reg | I2C_DATACMD_WRITE, I2C_DATACMD);
-
-		/* send write CMD */
-		writel(*buf | I2C_DATACMD_WRITE, I2C_DATACMD);
-
-		/* wait until the Rx FIFO have available */
-		msleep(20);
-
-		/* read the data to buf */
-		i2c_reg++;
-		buf++;
-	}
-
-	return 0;
-}
-
-/*
- * Generic i2c master transfer entrypoint.
- *
- */
-static int puv3_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *pmsg,
-		int num)
-{
-	int i, ret;
-	unsigned char swap;
-
-	/* Disable i2c */
-	writel(I2C_ENABLE_DISABLE, I2C_ENABLE);
-
-	/* Set the work mode and speed*/
-	writel(I2C_CON_MASTER | I2C_CON_SPEED_STD | I2C_CON_SLAVEDISABLE, I2C_CON);
-
-	writel(pmsg->addr, I2C_TAR);
-
-	/* Enable i2c */
-	writel(I2C_ENABLE_ENABLE, I2C_ENABLE);
-
-	dev_dbg(&adap->dev, "puv3_i2c_xfer: processing %d messages:\n", num);
-
-	for (i = 0; i < num; i++) {
-		dev_dbg(&adap->dev, " #%d: %sing %d byte%s %s 0x%02x\n", i,
-			pmsg->flags & I2C_M_RD ? "read" : "writ",
-			pmsg->len, pmsg->len > 1 ? "s" : "",
-			pmsg->flags & I2C_M_RD ? "from" : "to",	pmsg->addr);
-
-		if (pmsg->len && pmsg->buf) {	/* sanity check */
-			if (pmsg->flags & I2C_M_RD)
-				ret = xfer_read(adap, pmsg->buf, pmsg->len);
-			else
-				ret = xfer_write(adap, pmsg->buf, pmsg->len);
-
-			if (ret)
-				return ret;
-
-		}
-		dev_dbg(&adap->dev, "transfer complete\n");
-		pmsg++;		/* next message */
-	}
-
-	/* XXX: fixup be16_to_cpu in bq27x00_battery.c */
-	if (pmsg->addr == I2C_TAR_PWIC) {
-		swap = pmsg->buf[0];
-		pmsg->buf[0] = pmsg->buf[1];
-		pmsg->buf[1] = swap;
-	}
-
-	return i;
-}
-
-/*
- * Return list of supported functionality.
- */
-static u32 puv3_i2c_func(struct i2c_adapter *adapter)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static struct i2c_algorithm puv3_i2c_algorithm = {
-	.master_xfer	= puv3_i2c_xfer,
-	.functionality	= puv3_i2c_func,
-};
-
-/*
- * Main initialization routine.
- */
-static int puv3_i2c_probe(struct platform_device *pdev)
-{
-	struct i2c_adapter *adapter;
-	struct resource *mem;
-	int rc;
-
-	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!mem)
-		return -ENODEV;
-
-	if (!request_mem_region(mem->start, resource_size(mem), "puv3_i2c"))
-		return -EBUSY;
-
-	adapter = kzalloc(sizeof(struct i2c_adapter), GFP_KERNEL);
-	if (adapter == NULL) {
-		dev_err(&pdev->dev, "can't allocate interface!\n");
-		rc = -ENOMEM;
-		goto fail_nomem;
-	}
-	snprintf(adapter->name, sizeof(adapter->name), "PUV3-I2C at 0x%08x",
-			mem->start);
-	adapter->algo = &puv3_i2c_algorithm;
-	adapter->class = I2C_CLASS_HWMON;
-	adapter->dev.parent = &pdev->dev;
-
-	platform_set_drvdata(pdev, adapter);
-
-	adapter->nr = pdev->id;
-	rc = i2c_add_numbered_adapter(adapter);
-	if (rc) {
-		dev_err(&pdev->dev, "Adapter '%s' registration failed\n",
-				adapter->name);
-		goto fail_add_adapter;
-	}
-
-	dev_info(&pdev->dev, "PKUnity v3 i2c bus adapter.\n");
-	return 0;
-
-fail_add_adapter:
-	kfree(adapter);
-fail_nomem:
-	release_mem_region(mem->start, resource_size(mem));
-
-	return rc;
-}
-
-static int puv3_i2c_remove(struct platform_device *pdev)
-{
-	struct i2c_adapter *adapter = platform_get_drvdata(pdev);
-	struct resource *mem;
-
-	i2c_del_adapter(adapter);
-
-	put_device(&pdev->dev);
-
-	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	release_mem_region(mem->start, resource_size(mem));
-
-	return 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int puv3_i2c_suspend(struct device *dev)
-{
-	int poll_count;
-	/* Disable the IIC */
-	writel(I2C_ENABLE_DISABLE, I2C_ENABLE);
-	for (poll_count = 0; poll_count < 50; poll_count++) {
-		if (readl(I2C_ENSTATUS) & I2C_ENSTATUS_ENABLE)
-			udelay(25);
-	}
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(puv3_i2c_pm, puv3_i2c_suspend, NULL);
-#define PUV3_I2C_PM	(&puv3_i2c_pm)
-
-#else
-#define PUV3_I2C_PM	NULL
-#endif
-
-static struct platform_driver puv3_i2c_driver = {
-	.probe		= puv3_i2c_probe,
-	.remove		= puv3_i2c_remove,
-	.driver		= {
-		.name	= "PKUnity-v3-I2C",
-		.pm	= PUV3_I2C_PM,
-	}
-};
-
-module_platform_driver(puv3_i2c_driver);
-
-MODULE_DESCRIPTION("PKUnity v3 I2C driver");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:puv3_i2c");
+ALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_113__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_113__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_113__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_113__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_113__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_114__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_114__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_114__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_114__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_114__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_114__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_114__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_114__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_115__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_115__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_115__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_115__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_115__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_115__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_115__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_115__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_116__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_116__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_116__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_116__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_116__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_116__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_116__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_116__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_117__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_117__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_117__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_117__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_117__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_117__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_117__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_117__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_118__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_118__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_118__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_118__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_118__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_118__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_118__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_118__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_119__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_119__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_119__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_119__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_119__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_119__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_119__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_119__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_120__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_120__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_120__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_120__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_120__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_120__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_120__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_120__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_121__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_121__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_121__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_121__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_121__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_121__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_121__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_121__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_122__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_122__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_122__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_122__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_122__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_122__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_122__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_122__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_123__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_123__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_123__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_123__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_123__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_123__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_123__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_123__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_124__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_124__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_124__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_124__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_124__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_124__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_124__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_124__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_125__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_125__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_125__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_125__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_125__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_125__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_125__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_125__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_126__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_126__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_126__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_126__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_126__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_126__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_126__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_126__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_127__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_127__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_127__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_127__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_127__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_127__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_127__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_127__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_128__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_128__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_128__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_128__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_128__VALUE2_MASK 0xff0000
+#define MC_IO_DEBUG_UP_128__VALUE2__SHIFT 0x10
+#define MC_IO_DEBUG_UP_128__VALUE3_MASK 0xff000000
+#define MC_IO_DEBUG_UP_128__VALUE3__SHIFT 0x18
+#define MC_IO_DEBUG_UP_129__VALUE0_MASK 0xff
+#define MC_IO_DEBUG_UP_129__VALUE0__SHIFT 0x0
+#define MC_IO_DEBUG_UP_129__VALUE1_MASK 0xff00
+#define MC_IO_DEBUG_UP_129__VALUE1__SHIFT 0x8
+#define MC_IO_DEBUG_UP_129__VALUE2

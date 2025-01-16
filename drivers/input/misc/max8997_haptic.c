@@ -1,414 +1,359 @@
-/*
- * MAX8997-haptic controller driver
- *
- * Copyright (C) 2012 Samsung Electronics
- * Donggeun Kim <dg77.kim@samsung.com>
- *
- * This program is not provided / owned by Maxim Integrated Products.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- *
- */
+st_rcv
+		- ibp->z_multicast_rcv);
 
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/platform_device.h>
-#include <linux/err.h>
-#include <linux/pwm.h>
-#include <linux/input.h>
-#include <linux/mfd/max8997-private.h>
-#include <linux/mfd/max8997.h>
-#include <linux/regulator/consumer.h>
+bail:
+	return reply((struct ib_smp *) pmp);
+}
 
-/* Haptic configuration 2 register */
-#define MAX8997_MOTOR_TYPE_SHIFT	7
-#define MAX8997_ENABLE_SHIFT		6
-#define MAX8997_MODE_SHIFT		5
-
-/* Haptic driver configuration register */
-#define MAX8997_CYCLE_SHIFT		6
-#define MAX8997_SIG_PERIOD_SHIFT	4
-#define MAX8997_SIG_DUTY_SHIFT		2
-#define MAX8997_PWM_DUTY_SHIFT		0
-
-struct max8997_haptic {
-	struct device *dev;
-	struct i2c_client *client;
-	struct input_dev *input_dev;
-	struct regulator *regulator;
-
-	struct work_struct work;
-	struct mutex mutex;
-
-	bool enabled;
-	unsigned int level;
-
-	struct pwm_device *pwm;
-	unsigned int pwm_period;
-	enum max8997_haptic_pwm_divisor pwm_divisor;
-
-	enum max8997_haptic_motor_type type;
-	enum max8997_haptic_pulse_mode mode;
-
-	unsigned int internal_mode_pattern;
-	unsigned int pattern_cycle;
-	unsigned int pattern_signal_period;
-};
-
-static int max8997_haptic_set_duty_cycle(struct max8997_haptic *chip)
+static int pma_set_portcounters(struct ib_pma_mad *pmp,
+				struct ib_device *ibdev, u8 port)
 {
-	int ret = 0;
+	struct ib_pma_portcounters *p = (struct ib_pma_portcounters *)
+		pmp->data;
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	struct qib_verbs_counters cntrs;
 
-	if (chip->mode == MAX8997_EXTERNAL_MODE) {
-		unsigned int duty = chip->pwm_period * chip->level / 100;
-		ret = pwm_config(chip->pwm, duty, chip->pwm_period);
-	} else {
-		int i;
-		u8 duty_index = 0;
+	/*
+	 * Since the HW doesn't support clearing counters, we save the
+	 * current count and subtract it from future responses.
+	 */
+	qib_get_counters(ppd, &cntrs);
 
-		for (i = 0; i <= 64; i++) {
-			if (chip->level <= i * 100 / 64) {
-				duty_index = i;
-				break;
-			}
-		}
-		switch (chip->internal_mode_pattern) {
-		case 0:
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_SIGPWMDC1, duty_index);
-			break;
-		case 1:
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_SIGPWMDC2, duty_index);
-			break;
-		case 2:
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_SIGPWMDC3, duty_index);
-			break;
-		case 3:
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_SIGPWMDC4, duty_index);
-			break;
-		default:
-			break;
-		}
+	if (p->counter_select & IB_PMA_SEL_SYMBOL_ERROR)
+		ibp->z_symbol_error_counter = cntrs.symbol_error_counter;
+
+	if (p->counter_select & IB_PMA_SEL_LINK_ERROR_RECOVERY)
+		ibp->z_link_error_recovery_counter =
+			cntrs.link_error_recovery_counter;
+
+	if (p->counter_select & IB_PMA_SEL_LINK_DOWNED)
+		ibp->z_link_downed_counter = cntrs.link_downed_counter;
+
+	if (p->counter_select & IB_PMA_SEL_PORT_RCV_ERRORS)
+		ibp->z_port_rcv_errors = cntrs.port_rcv_errors;
+
+	if (p->counter_select & IB_PMA_SEL_PORT_RCV_REMPHYS_ERRORS)
+		ibp->z_port_rcv_remphys_errors =
+			cntrs.port_rcv_remphys_errors;
+
+	if (p->counter_select & IB_PMA_SEL_PORT_XMIT_DISCARDS)
+		ibp->z_port_xmit_discards = cntrs.port_xmit_discards;
+
+	if (p->counter_select & IB_PMA_SEL_LOCAL_LINK_INTEGRITY_ERRORS)
+		ibp->z_local_link_integrity_errors =
+			cntrs.local_link_integrity_errors;
+
+	if (p->counter_select & IB_PMA_SEL_EXCESSIVE_BUFFER_OVERRUNS)
+		ibp->z_excessive_buffer_overrun_errors =
+			cntrs.excessive_buffer_overrun_errors;
+
+	if (p->counter_select & IB_PMA_SEL_PORT_VL15_DROPPED) {
+		ibp->n_vl15_dropped = 0;
+		ibp->z_vl15_dropped = cntrs.vl15_dropped;
 	}
+
+	if (p->counter_select & IB_PMA_SEL_PORT_XMIT_DATA)
+		ibp->z_port_xmit_data = cntrs.port_xmit_data;
+
+	if (p->counter_select & IB_PMA_SEL_PORT_RCV_DATA)
+		ibp->z_port_rcv_data = cntrs.port_rcv_data;
+
+	if (p->counter_select & IB_PMA_SEL_PORT_XMIT_PACKETS)
+		ibp->z_port_xmit_packets = cntrs.port_xmit_packets;
+
+	if (p->counter_select & IB_PMA_SEL_PORT_RCV_PACKETS)
+		ibp->z_port_rcv_packets = cntrs.port_rcv_packets;
+
+	return pma_get_portcounters(pmp, ibdev, port);
+}
+
+static int pma_set_portcounters_cong(struct ib_pma_mad *pmp,
+				     struct ib_device *ibdev, u8 port)
+{
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	struct qib_devdata *dd = dd_from_ppd(ppd);
+	struct qib_verbs_counters cntrs;
+	u32 counter_select = (be32_to_cpu(pmp->mad_hdr.attr_mod) >> 24) & 0xFF;
+	int ret = 0;
+	unsigned long flags;
+
+	qib_get_counters(ppd, &cntrs);
+	/* Get counter values before we save them */
+	ret = pma_get_portcounters_cong(pmp, ibdev, port);
+
+	if (counter_select & IB_PMA_SEL_CONG_XMIT) {
+		spin_lock_irqsave(&ppd->ibport_data.lock, flags);
+		ppd->cong_stats.counter = 0;
+		dd->f_set_cntr_sample(ppd, QIB_CONG_TIMER_PSINTERVAL,
+				      0x0);
+		spin_unlock_irqrestore(&ppd->ibport_data.lock, flags);
+	}
+	if (counter_select & IB_PMA_SEL_CONG_PORT_DATA) {
+		ibp->z_port_xmit_data = cntrs.port_xmit_data;
+		ibp->z_port_rcv_data = cntrs.port_rcv_data;
+		ibp->z_port_xmit_packets = cntrs.port_xmit_packets;
+		ibp->z_port_rcv_packets = cntrs.port_rcv_packets;
+	}
+	if (counter_select & IB_PMA_SEL_CONG_ALL) {
+		ibp->z_symbol_error_counter =
+			cntrs.symbol_error_counter;
+		ibp->z_link_error_recovery_counter =
+			cntrs.link_error_recovery_counter;
+		ibp->z_link_downed_counter =
+			cntrs.link_downed_counter;
+		ibp->z_port_rcv_errors = cntrs.port_rcv_errors;
+		ibp->z_port_rcv_remphys_errors =
+			cntrs.port_rcv_remphys_errors;
+		ibp->z_port_xmit_discards =
+			cntrs.port_xmit_discards;
+		ibp->z_local_link_integrity_errors =
+			cntrs.local_link_integrity_errors;
+		ibp->z_excessive_buffer_overrun_errors =
+			cntrs.excessive_buffer_overrun_errors;
+		ibp->n_vl15_dropped = 0;
+		ibp->z_vl15_dropped = cntrs.vl15_dropped;
+	}
+
 	return ret;
 }
 
-static void max8997_haptic_configure(struct max8997_haptic *chip)
+static int pma_set_portcounters_ext(struct ib_pma_mad *pmp,
+				    struct ib_device *ibdev, u8 port)
 {
-	u8 value;
+	struct ib_pma_portcounters *p = (struct ib_pma_portcounters *)
+		pmp->data;
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	u64 swords, rwords, spkts, rpkts, xwait;
+	struct qib_pma_counters pma;
 
-	value = chip->type << MAX8997_MOTOR_TYPE_SHIFT |
-		chip->enabled << MAX8997_ENABLE_SHIFT |
-		chip->mode << MAX8997_MODE_SHIFT | chip->pwm_divisor;
-	max8997_write_reg(chip->client, MAX8997_HAPTIC_REG_CONF2, value);
+	qib_snapshot_counters(ppd, &swords, &rwords, &spkts, &rpkts, &xwait);
 
-	if (chip->mode == MAX8997_INTERNAL_MODE && chip->enabled) {
-		value = chip->internal_mode_pattern << MAX8997_CYCLE_SHIFT |
-			chip->internal_mode_pattern << MAX8997_SIG_PERIOD_SHIFT |
-			chip->internal_mode_pattern << MAX8997_SIG_DUTY_SHIFT |
-			chip->internal_mode_pattern << MAX8997_PWM_DUTY_SHIFT;
-		max8997_write_reg(chip->client,
-			MAX8997_HAPTIC_REG_DRVCONF, value);
+	if (p->counter_select & IB_PMA_SELX_PORT_XMIT_DATA)
+		ibp->z_port_xmit_data = swords;
 
-		switch (chip->internal_mode_pattern) {
-		case 0:
-			value = chip->pattern_cycle << 4;
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_CYCLECONF1, value);
-			value = chip->pattern_signal_period;
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_SIGCONF1, value);
-			break;
+	if (p->counter_select & IB_PMA_SELX_PORT_RCV_DATA)
+		ibp->z_port_rcv_data = rwords;
 
-		case 1:
-			value = chip->pattern_cycle;
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_CYCLECONF1, value);
-			value = chip->pattern_signal_period;
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_SIGCONF2, value);
-			break;
+	if (p->counter_select & IB_PMA_SELX_PORT_XMIT_PACKETS)
+		ibp->z_port_xmit_packets = spkts;
 
-		case 2:
-			value = chip->pattern_cycle << 4;
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_CYCLECONF2, value);
-			value = chip->pattern_signal_period;
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_SIGCONF3, value);
-			break;
+	if (p->counter_select & IB_PMA_SELX_PORT_RCV_PACKETS)
+		ibp->z_port_rcv_packets = rpkts;
 
-		case 3:
-			value = chip->pattern_cycle;
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_CYCLECONF2, value);
-			value = chip->pattern_signal_period;
-			max8997_write_reg(chip->client,
-				MAX8997_HAPTIC_REG_SIGCONF4, value);
-			break;
+	qib_snapshot_pmacounters(ibp, &pma);
 
-		default:
-			break;
-		}
-	}
+	if (p->counter_select & IB_PMA_SELX_PORT_UNI_XMIT_PACKETS)
+		ibp->z_unicast_xmit = pma.n_unicast_xmit;
+
+	if (p->counter_select & IB_PMA_SELX_PORT_UNI_RCV_PACKETS)
+		ibp->z_unicast_rcv = pma.n_unicast_rcv;
+
+	if (p->counter_select & IB_PMA_SELX_PORT_MULTI_XMIT_PACKETS)
+		ibp->z_multicast_xmit = pma.n_multicast_xmit;
+
+	if (p->counter_select & IB_PMA_SELX_PORT_MULTI_RCV_PACKETS)
+		ibp->z_multicast_rcv = pma.n_multicast_rcv;
+
+	return pma_get_portcounters_ext(pmp, ibdev, port);
 }
 
-static void max8997_haptic_enable(struct max8997_haptic *chip)
+static int process_subn(struct ib_device *ibdev, int mad_flags,
+			u8 port, const struct ib_mad *in_mad,
+			struct ib_mad *out_mad)
 {
-	int error;
+	struct ib_smp *smp = (struct ib_smp *)out_mad;
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	int ret;
 
-	mutex_lock(&chip->mutex);
-
-	error = max8997_haptic_set_duty_cycle(chip);
-	if (error) {
-		dev_err(chip->dev, "set_pwm_cycle failed, error: %d\n", error);
-		goto out;
+	*out_mad = *in_mad;
+	if (smp->class_version != 1) {
+		smp->status |= IB_SMP_UNSUP_VERSION;
+		ret = reply(smp);
+		goto bail;
 	}
 
-	if (!chip->enabled) {
-		error = regulator_enable(chip->regulator);
-		if (error) {
-			dev_err(chip->dev, "Failed to enable regulator\n");
-			goto out;
-		}
-		max8997_haptic_configure(chip);
-		if (chip->mode == MAX8997_EXTERNAL_MODE) {
-			error = pwm_enable(chip->pwm);
-			if (error) {
-				dev_err(chip->dev, "Failed to enable PWM\n");
-				regulator_disable(chip->regulator);
-				goto out;
+	ret = check_mkey(ibp, smp, mad_flags);
+	if (ret) {
+		u32 port_num = be32_to_cpu(smp->attr_mod);
+
+		/*
+		 * If this is a get/set portinfo, we already check the
+		 * M_Key if the MAD is for another port and the M_Key
+		 * is OK on the receiving port. This check is needed
+		 * to increment the error counters when the M_Key
+		 * fails to match on *both* ports.
+		 */
+		if (in_mad->mad_hdr.attr_id == IB_SMP_ATTR_PORT_INFO &&
+		    (smp->method == IB_MGMT_METHOD_GET ||
+		     smp->method == IB_MGMT_METHOD_SET) &&
+		    port_num && port_num <= ibdev->phys_port_cnt &&
+		    port != port_num)
+			(void) check_mkey(to_iport(ibdev, port_num), smp, 0);
+		ret = IB_MAD_RESULT_FAILURE;
+		goto bail;
+	}
+
+	switch (smp->method) {
+	case IB_MGMT_METHOD_GET:
+		switch (smp->attr_id) {
+		case IB_SMP_ATTR_NODE_DESC:
+			ret = subn_get_nodedescription(smp, ibdev);
+			goto bail;
+		case IB_SMP_ATTR_NODE_INFO:
+			ret = subn_get_nodeinfo(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_GUID_INFO:
+			ret = subn_get_guidinfo(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_PORT_INFO:
+			ret = subn_get_portinfo(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_PKEY_TABLE:
+			ret = subn_get_pkeytable(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_SL_TO_VL_TABLE:
+			ret = subn_get_sl_to_vl(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_VL_ARB_TABLE:
+			ret = subn_get_vl_arb(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_SM_INFO:
+			if (ibp->port_cap_flags & IB_PORT_SM_DISABLED) {
+				ret = IB_MAD_RESULT_SUCCESS |
+					IB_MAD_RESULT_CONSUMED;
+				goto bail;
 			}
+			if (ibp->port_cap_flags & IB_PORT_SM) {
+				ret = IB_MAD_RESULT_SUCCESS;
+				goto bail;
+			}
+			/* FALLTHROUGH */
+		default:
+			smp->status |= IB_SMP_UNSUP_METH_ATTR;
+			ret = reply(smp);
+			goto bail;
 		}
-		chip->enabled = true;
-	}
 
-out:
-	mutex_unlock(&chip->mutex);
-}
-
-static void max8997_haptic_disable(struct max8997_haptic *chip)
-{
-	mutex_lock(&chip->mutex);
-
-	if (chip->enabled) {
-		chip->enabled = false;
-		max8997_haptic_configure(chip);
-		if (chip->mode == MAX8997_EXTERNAL_MODE)
-			pwm_disable(chip->pwm);
-		regulator_disable(chip->regulator);
-	}
-
-	mutex_unlock(&chip->mutex);
-}
-
-static void max8997_haptic_play_effect_work(struct work_struct *work)
-{
-	struct max8997_haptic *chip =
-			container_of(work, struct max8997_haptic, work);
-
-	if (chip->level)
-		max8997_haptic_enable(chip);
-	else
-		max8997_haptic_disable(chip);
-}
-
-static int max8997_haptic_play_effect(struct input_dev *dev, void *data,
-				  struct ff_effect *effect)
-{
-	struct max8997_haptic *chip = input_get_drvdata(dev);
-
-	chip->level = effect->u.rumble.strong_magnitude;
-	if (!chip->level)
-		chip->level = effect->u.rumble.weak_magnitude;
-
-	schedule_work(&chip->work);
-
-	return 0;
-}
-
-static void max8997_haptic_close(struct input_dev *dev)
-{
-	struct max8997_haptic *chip = input_get_drvdata(dev);
-
-	cancel_work_sync(&chip->work);
-	max8997_haptic_disable(chip);
-}
-
-static int max8997_haptic_probe(struct platform_device *pdev)
-{
-	struct max8997_dev *iodev = dev_get_drvdata(pdev->dev.parent);
-	const struct max8997_platform_data *pdata =
-					dev_get_platdata(iodev->dev);
-	const struct max8997_haptic_platform_data *haptic_pdata = NULL;
-	struct max8997_haptic *chip;
-	struct input_dev *input_dev;
-	int error;
-
-	if (pdata)
-		haptic_pdata = pdata->haptic_pdata;
-
-	if (!haptic_pdata) {
-		dev_err(&pdev->dev, "no haptic platform data\n");
-		return -EINVAL;
-	}
-
-	chip = kzalloc(sizeof(struct max8997_haptic), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!chip || !input_dev) {
-		dev_err(&pdev->dev, "unable to allocate memory\n");
-		error = -ENOMEM;
-		goto err_free_mem;
-	}
-
-	INIT_WORK(&chip->work, max8997_haptic_play_effect_work);
-	mutex_init(&chip->mutex);
-
-	chip->client = iodev->haptic;
-	chip->dev = &pdev->dev;
-	chip->input_dev = input_dev;
-	chip->pwm_period = haptic_pdata->pwm_period;
-	chip->type = haptic_pdata->type;
-	chip->mode = haptic_pdata->mode;
-	chip->pwm_divisor = haptic_pdata->pwm_divisor;
-
-	switch (chip->mode) {
-	case MAX8997_INTERNAL_MODE:
-		chip->internal_mode_pattern =
-				haptic_pdata->internal_mode_pattern;
-		chip->pattern_cycle = haptic_pdata->pattern_cycle;
-		chip->pattern_signal_period =
-				haptic_pdata->pattern_signal_period;
-		break;
-
-	case MAX8997_EXTERNAL_MODE:
-		chip->pwm = pwm_request(haptic_pdata->pwm_channel_id,
-					"max8997-haptic");
-		if (IS_ERR(chip->pwm)) {
-			error = PTR_ERR(chip->pwm);
-			dev_err(&pdev->dev,
-				"unable to request PWM for haptic, error: %d\n",
-				error);
-			goto err_free_mem;
+	case IB_MGMT_METHOD_SET:
+		switch (smp->attr_id) {
+		case IB_SMP_ATTR_GUID_INFO:
+			ret = subn_set_guidinfo(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_PORT_INFO:
+			ret = subn_set_portinfo(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_PKEY_TABLE:
+			ret = subn_set_pkeytable(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_SL_TO_VL_TABLE:
+			ret = subn_set_sl_to_vl(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_VL_ARB_TABLE:
+			ret = subn_set_vl_arb(smp, ibdev, port);
+			goto bail;
+		case IB_SMP_ATTR_SM_INFO:
+			if (ibp->port_cap_flags & IB_PORT_SM_DISABLED) {
+				ret = IB_MAD_RESULT_SUCCESS |
+					IB_MAD_RESULT_CONSUMED;
+				goto bail;
+			}
+			if (ibp->port_cap_flags & IB_PORT_SM) {
+				ret = IB_MAD_RESULT_SUCCESS;
+				goto bail;
+			}
+			/* FALLTHROUGH */
+		default:
+			smp->status |= IB_SMP_UNSUP_METH_ATTR;
+			ret = reply(smp);
+			goto bail;
 		}
-		break;
+
+	case IB_MGMT_METHOD_TRAP_REPRESS:
+		if (smp->attr_id == IB_SMP_ATTR_NOTICE)
+			ret = subn_trap_repress(smp, ibdev, port);
+		else {
+			smp->status |= IB_SMP_UNSUP_METH_ATTR;
+			ret = reply(smp);
+		}
+		goto bail;
+
+	case IB_MGMT_METHOD_TRAP:
+	case IB_MGMT_METHOD_REPORT:
+	case IB_MGMT_METHOD_REPORT_RESP:
+	case IB_MGMT_METHOD_GET_RESP:
+		/*
+		 * The ib_mad module will call us to process responses
+		 * before checking for other consumers.
+		 * Just tell the caller to process it normally.
+		 */
+		ret = IB_MAD_RESULT_SUCCESS;
+		goto bail;
+
+	case IB_MGMT_METHOD_SEND:
+		if (ib_get_smp_direction(smp) &&
+		    smp->attr_id == QIB_VENDOR_IPG) {
+			ppd->dd->f_set_ib_cfg(ppd, QIB_IB_CFG_PORT,
+					      smp->data[0]);
+			ret = IB_MAD_RESULT_SUCCESS | IB_MAD_RESULT_CONSUMED;
+		} else
+			ret = IB_MAD_RESULT_SUCCESS;
+		goto bail;
 
 	default:
-		dev_err(&pdev->dev,
-			"Invalid chip mode specified (%d)\n", chip->mode);
-		error = -EINVAL;
-		goto err_free_mem;
+		smp->status |= IB_SMP_UNSUP_METHOD;
+		ret = reply(smp);
 	}
 
-	chip->regulator = regulator_get(&pdev->dev, "inmotor");
-	if (IS_ERR(chip->regulator)) {
-		error = PTR_ERR(chip->regulator);
-		dev_err(&pdev->dev,
-			"unable to get regulator, error: %d\n",
-			error);
-		goto err_free_pwm;
-	}
-
-	input_dev->name = "max8997-haptic";
-	input_dev->id.version = 1;
-	input_dev->dev.parent = &pdev->dev;
-	input_dev->close = max8997_haptic_close;
-	input_set_drvdata(input_dev, chip);
-	input_set_capability(input_dev, EV_FF, FF_RUMBLE);
-
-	error = input_ff_create_memless(input_dev, NULL,
-				max8997_haptic_play_effect);
-	if (error) {
-		dev_err(&pdev->dev,
-			"unable to create FF device, error: %d\n",
-			error);
-		goto err_put_regulator;
-	}
-
-	error = input_register_device(input_dev);
-	if (error) {
-		dev_err(&pdev->dev,
-			"unable to register input device, error: %d\n",
-			error);
-		goto err_destroy_ff;
-	}
-
-	platform_set_drvdata(pdev, chip);
-	return 0;
-
-err_destroy_ff:
-	input_ff_destroy(input_dev);
-err_put_regulator:
-	regulator_put(chip->regulator);
-err_free_pwm:
-	if (chip->mode == MAX8997_EXTERNAL_MODE)
-		pwm_free(chip->pwm);
-err_free_mem:
-	input_free_device(input_dev);
-	kfree(chip);
-
-	return error;
+bail:
+	return ret;
 }
 
-static int max8997_haptic_remove(struct platform_device *pdev)
+static int process_perf(struct ib_device *ibdev, u8 port,
+			const struct ib_mad *in_mad,
+			struct ib_mad *out_mad)
 {
-	struct max8997_haptic *chip = platform_get_drvdata(pdev);
+	struct ib_pma_mad *pmp = (struct ib_pma_mad *)out_mad;
+	int ret;
 
-	input_unregister_device(chip->input_dev);
-	regulator_put(chip->regulator);
+	*out_mad = *in_mad;
+	if (pmp->mad_hdr.class_version != 1) {
+		pmp->mad_hdr.status |= IB_SMP_UNSUP_VERSION;
+		ret = reply((struct ib_smp *) pmp);
+		goto bail;
+	}
 
-	if (chip->mode == MAX8997_EXTERNAL_MODE)
-		pwm_free(chip->pwm);
+	switch (pmp->mad_hdr.method) {
+	case IB_MGMT_METHOD_GET:
+		switch (pmp->mad_hdr.attr_id) {
+		case IB_PMA_CLASS_PORT_INFO:
+			ret = pma_get_classportinfo(pmp, ibdev);
+			goto bail;
+		case IB_PMA_PORT_SAMPLES_CONTROL:
+			ret = pma_get_portsamplescontrol(pmp, ibdev, port);
+			goto bail;
+		case IB_PMA_PORT_SAMPLES_RESULT:
+			ret = pma_get_portsamplesresult(pmp, ibdev, port);
+			goto bail;
+		case IB_PMA_PORT_SAMPLES_RESULT_EXT:
+			ret = pma_get_portsamplesresult_ext(pmp, ibdev, port);
+			goto bail;
+		case IB_PMA_PORT_COUNTERS:
+			ret = pma_get_portcounters(pmp, ibdev, port);
+			goto bail;
+		case IB_PMA_PORT_COUNTERS_EXT:
+			ret = pma_get_portcounters_ext(pmp, ibdev, port);
+			goto bail;
+		case IB_PMA_PORT_COUNTERS_CONG:
+			ret = pma_get_portcounters_cong(pmp, ibdev, port);
+			goto bail;
+		default:
+			pmp->mad_hdr.status |= IB_SMP_UNSUP_METH_ATTR;
+			ret = reply((struct ib_smp *) pmp);
+			goto bail;
+		}
 
-	kfree(chip);
-
-	return 0;
-}
-
-static int __maybe_unused max8997_haptic_suspend(struct device *dev)
-{
-	struct platform_device *pdev = to_platform_device(dev);
-	struct max8997_haptic *chip = platform_get_drvdata(pdev);
-
-	max8997_haptic_disable(chip);
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(max8997_haptic_pm_ops, max8997_haptic_suspend, NULL);
-
-static const struct platform_device_id max8997_haptic_id[] = {
-	{ "max8997-haptic", 0 },
-	{ },
-};
-MODULE_DEVICE_TABLE(platform, max8997_haptic_id);
-
-static struct platform_driver max8997_haptic_driver = {
-	.driver	= {
-		.name	= "max8997-haptic",
-		.pm	= &max8997_haptic_pm_ops,
-	},
-	.probe		= max8997_haptic_probe,
-	.remove		= max8997_haptic_remove,
-	.id_table	= max8997_haptic_id,
-};
-module_platform_driver(max8997_haptic_driver);
-
-MODULE_AUTHOR("Donggeun Kim <dg77.kim@samsung.com>");
-MODULE_DESCRIPTION("max8997_haptic driver");
-MODULE_LICENSE("GPL");
+	case IB_MGMT_METHOD_

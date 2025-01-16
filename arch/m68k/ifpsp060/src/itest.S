@@ -1,6386 +1,1835 @@
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-MOTOROLA MICROPROCESSOR & MEMORY TECHNOLOGY GROUP
-M68000 Hi-Performance Microprocessor Division
-M68060 Software Package
-Production Release P1.00 -- October 10, 1994
-
-M68060 Software Package Copyright © 1993, 1994 Motorola Inc.  All rights reserved.
-
-THE SOFTWARE is provided on an "AS IS" basis and without warranty.
-To the maximum extent permitted by applicable law,
-MOTOROLA DISCLAIMS ALL WARRANTIES WHETHER EXPRESS OR IMPLIED,
-INCLUDING IMPLIED WARRANTIES OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE
-and any warranty against infringement with regard to the SOFTWARE
-(INCLUDING ANY MODIFIED VERSIONS THEREOF) and any accompanying written materials.
-
-To the maximum extent permitted by applicable law,
-IN NO EVENT SHALL MOTOROLA BE LIABLE FOR ANY DAMAGES WHATSOEVER
-(INCLUDING WITHOUT LIMITATION, DAMAGES FOR LOSS OF BUSINESS PROFITS,
-BUSINESS INTERRUPTION, LOSS OF BUSINESS INFORMATION, OR OTHER PECUNIARY LOSS)
-ARISING OF THE USE OR INABILITY TO USE THE SOFTWARE.
-Motorola assumes no responsibility for the maintenance and support of the SOFTWARE.
-
-You are hereby granted a copyright license to use, modify, and distribute the SOFTWARE
-so long as this entire notice is retained without alteration in any modified and/or
-redistributed versions, and that such modified versions are clearly identified as such.
-No licenses are granted by implication, estoppel or otherwise under any patents
-or trademarks of Motorola, Inc.
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#############################################
-set	SREGS,		-64
-set	IREGS,		-128
-set	SCCR,		-130
-set	ICCR,		-132
-set	TESTCTR,	-136
-set	EAMEM,		-140
-set	EASTORE,	-144
-set	DATA,		-160
-
-#############################################
-TESTTOP:
-	bra.l		_060TESTS_
-
-start_str:
-	string		"Testing 68060 ISP started:\n"
-
-pass_str:
-	string		"passed\n"
-fail_str:
-	string		" failed\n"
-
-	align		0x4
-chk_test:
-	tst.l		%d0
-	bne.b		test_fail
-test_pass:
-	pea		pass_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-	rts
-test_fail:
-	mov.l		%d1,-(%sp)
-	bsr.l		_print_num
-	addq.l		&0x4,%sp
-
-	pea		fail_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-	rts
-
-#############################################
-_060TESTS_:
-	link		%a6,&-160
-
-	movm.l		&0x3f3c,-(%sp)
-
-	pea		start_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-
-### mul
-	clr.l		TESTCTR(%a6)
-	pea		mulul_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-
-	bsr.l		mulul_0
-
-	bsr.l		chk_test
-
-### div
-	clr.l		TESTCTR(%a6)
-	pea		divul_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-
-	bsr.l		divul_0
-
-	bsr.l		chk_test
-
-### cmp2
-	clr.l		TESTCTR(%a6)
-	pea		cmp2_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-
-	bsr.l		cmp2_1
-
-	bsr.l		chk_test
-
-### movp
-	clr.l		TESTCTR(%a6)
-	pea		movp_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-
-	bsr.l		movp_0
-
-	bsr.l		chk_test
-
-### ea
-	clr.l		TESTCTR(%a6)
-	pea		ea_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-
-	mov.l		&0x2,EAMEM(%a6)
-	bsr.l		ea_0
-
-	bsr.l		chk_test
-
-### cas
-	clr.l		TESTCTR(%a6)
-	pea		cas_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-
-	bsr.l		cas0
-
-	bsr.l		chk_test
-
-### cas2
-	clr.l		TESTCTR(%a6)
-	pea		cas2_str(%pc)
-	bsr.l		_print_str
-	addq.l		&0x4,%sp
-
-	bsr.l		cas20
-
-	bsr.l		chk_test
-
-###
-	movm.l		(%sp)+,&0x3cfc
-
-	unlk		%a6
-	rts
-
-#############################################
-#############################################
-
-mulul_str:
-	string		"\t64-bit multiply..."
-
-	align		0x4
-mulul_0:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d1
-	mov.l		&0x99999999,%d2
-	mov.l		&0x88888888,%d3
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	clr.l		IREGS+0x8(%a6)
-	clr.l		IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-mulul_1:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x77777777,%d1
-	mov.l		&0x99999999,%d2
-	mov.l		&0x00000000,%d3
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	clr.l		IREGS+0x8(%a6)
-	clr.l		IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-mulul_2:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x00000010,%d1
-	mov.l		&0x66666666,%d2
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		%d1,%d2:%d2
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000006,IREGS+0x8(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-mulul_3:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x55555555,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0x00000003,%d3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000000,IREGS+0x8(%a6)
-	mov.l		&0xffffffff,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-mulul_4:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x40000000,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0x00000004,%d3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000001,IREGS+0x8(%a6)
-	mov.l		&0x00000000,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-mulul_5:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xffffffff,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0xffffffff,%d3
-
-	mov.w		&0x0008,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0xfffffffe,IREGS+0x8(%a6)
-	mov.l		&0x00000001,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-mulul_6:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x80000000,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0xffffffff,%d3
-
-	mov.w		&0x00000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	muls.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000000,IREGS+0x8(%a6)
-	mov.l		&0x80000000,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-mulul_7:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x80000000,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0x00000001,%d3
-
-	mov.w		&0x0008,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	muls.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0xffffffff,IREGS+0x8(%a6)
-	mov.l		&0x80000000,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-mulul_8:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x00000001,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0x80000000,%d3
-
-	mov.w		&0x0008,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	muls.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0xffffffff,IREGS+0x8(%a6)
-	mov.l		&0x80000000,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-	mov.l		TESTCTR(%a6),%d1
-	clr.l		%d0
-	rts
-
-#############################################
-
-movp_str:
-	string	"\tmovep..."
-
-	align	0x4
-###############################
-# movep.w	%d0,(0x0,%a0) #
-###############################
-movp_0:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.w	&0xaaaa,%d0
-	clr.b	0x0(%a0)
-	clr.b	0x2(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	%d0,(0x0,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x2(%a0),%d1
-	lsl.w	&0x8,%d1
-	mov.b	0x0(%a0),%d1
-
-	cmp.w	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.w	%d0,(0x0,%a0) #
-###############################
-movp_1:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA+0x4(%a6),%a0
-	mov.w	&0xaaaa,%d0
-	clr.l	-0x4(%a0)
-	clr.l	(%a0)
-	clr.l	0x4(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	%d0,(0x0,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	tst.l	-0x4(%a0)
-	bne.l	error
-	tst.l	0x4(%a0)
-	bne.l	error
-	cmpi.l	(%a0),&0xaa00aa00
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-#####################################################
-# movep.w	%d0,(0x0,%a0)			    #
-#	- this test has %cc initially equal to zero #
-#####################################################
-movp_2:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.w	&0xaaaa,%d0
-	clr.b	0x0(%a0)
-	clr.b	0x2(%a0)
-
-	mov.w	&0x0000,ICCR(%a6)
-	mov.w	&0x0000,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	%d0,(0x0,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x2(%a0),%d1
-	lsl.w	&0x8,%d1
-	mov.b	0x0(%a0),%d1
-
-	cmp.w	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.w	(0x0,%a0),%d0 #
-###############################
-movp_3:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.b	&0xaa,0x0(%a0)
-	mov.b	&0xaa,0x2(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	(0x0,%a0),%d0
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-	mov.w	&0xaaaa,IREGS+0x2(%a6)
-
-	mov.w	&0xaaaa,%d1
-
-	cmp.w	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.l	%d0,(0x0,%a0) #
-###############################
-movp_4:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.l	&0xaaaaaaaa,%d0
-	clr.b	0x0(%a0)
-	clr.b	0x2(%a0)
-	clr.b	0x4(%a0)
-	clr.b	0x6(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.l	%d0,(0x0,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x6(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x4(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x2(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x0(%a0),%d1
-
-	cmp.l	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.l	%d0,(0x0,%a0) #
-###############################
-movp_5:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA+0x4(%a6),%a0
-	mov.l	&0xaaaaaaaa,%d0
-	clr.l	-0x4(%a0)
-	clr.l	(%a0)
-	clr.l	0x4(%a0)
-	clr.l	0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.l	%d0,(0x0,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	tst.l	-0x4(%a0)
-	bne.l	error
-	tst.l	0x8(%a0)
-	bne.l	error
-	cmpi.l	(%a0),&0xaa00aa00
-	bne.l	error
-	cmpi.l	0x4(%a0),&0xaa00aa00
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.l	(0x0,%a0),%d0 #
-###############################
-movp_6:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.b	&0xaa,0x0(%a0)
-	mov.b	&0xaa,0x2(%a0)
-	mov.b	&0xaa,0x4(%a0)
-	mov.b	&0xaa,0x6(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.l	(0x0,%a0),%d0
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-	mov.l	&0xaaaaaaaa,IREGS(%a6)
-
-	mov.l	&0xaaaaaaaa,%d1
-
-	cmp.l	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.w	%d7,(0x0,%a0) #
-###############################
-movp_7:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.w	&0xaaaa,%d7
-	clr.b	0x0(%a0)
-	clr.b	0x2(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	%d7,(0x0,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x2(%a0),%d1
-	lsl.w	&0x8,%d1
-	mov.b	0x0(%a0),%d1
-
-	cmp.w	%d7,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.w	(0x0,%a0),%d7 #
-###############################
-movp_8:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.b	&0xaa,0x0(%a0)
-	mov.b	&0xaa,0x2(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	(0x0,%a0),%d7
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-	mov.w	&0xaaaa,IREGS+30(%a6)
-
-	mov.w	&0xaaaa,%d1
-
-	cmp.w	%d7,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.w	%d0,(0x0,%a0) #
-###############################
-movp_9:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.w	&0xaaaa,%d0
-	clr.b	0x0(%a0)
-	clr.b	0x2(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x001f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	%d0,(0x0,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x2(%a0),%d1
-	lsl.w	&0x8,%d1
-	mov.b	0x0(%a0),%d1
-
-	cmp.w	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.w	%d0,(0x8,%a0) #
-###############################
-movp_10:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.w	&0xaaaa,%d0
-	clr.b	0x0+0x8(%a0)
-	clr.b	0x2+0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x1f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	%d0,(0x8,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x2+0x8(%a0),%d1
-	lsl.w	&0x8,%d1
-	mov.b	0x0+0x8(%a0),%d1
-
-	cmp.w	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.w	(0x8,%a0),%d0 #
-###############################
-movp_11:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.b	&0xaa,0x0+0x8(%a0)
-	mov.b	&0xaa,0x2+0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x1f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	(0x8,%a0),%d0
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-	mov.w	&0xaaaa,IREGS+0x2(%a6)
-
-	mov.w	&0xaaaa,%d1
-
-	cmp.w	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.l	%d0,(0x8,%a0) #
-###############################
-movp_12:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.l	&0xaaaaaaaa,%d0
-	clr.b	0x0+0x8(%a0)
-	clr.b	0x2+0x8(%a0)
-	clr.b	0x4+0x8(%a0)
-	clr.b	0x6+0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x1f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.l	%d0,(0x8,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x6+0x8(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x4+0x8(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x2+0x8(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x0+0x8(%a0),%d1
-
-	cmp.l	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-###############################
-# movep.l	(0x8,%a0),%d0 #
-###############################
-movp_13:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA(%a6),%a0
-	mov.b	&0xaa,0x0+0x8(%a0)
-	mov.b	&0xaa,0x2+0x8(%a0)
-	mov.b	&0xaa,0x4+0x8(%a0)
-	mov.b	&0xaa,0x6+0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x1f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.l	(0x8,%a0),%d0
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-	mov.l	&0xaaaaaaaa,IREGS(%a6)
-
-	mov.l	&0xaaaaaaaa,%d1
-
-	cmp.l	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-################################
-# movep.w	%d0,(-0x8,%a0) #
-################################
-movp_14:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA+0x8(%a6),%a0
-	mov.w	&0xaaaa,%d0
-	clr.b	0x0-0x8(%a0)
-	clr.b	0x2-0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x1f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	%d0,(-0x8,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x2-0x8(%a0),%d1
-	lsl.w	&0x8,%d1
-	mov.b	0x0-0x8(%a0),%d1
-
-	cmp.w	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-################################
-# movep.w	(-0x8,%a0),%d0 #
-################################
-movp_15:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA+0x8(%a6),%a0
-	mov.b	&0xaa,0x0-0x8(%a0)
-	mov.b	&0xaa,0x2-0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x1f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.w	(-0x8,%a0),%d0
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-	mov.w	&0xaaaa,IREGS+0x2(%a6)
-
-	mov.w	&0xaaaa,%d1
-
-	cmp.w	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-################################
-# movep.l	%d0,(-0x8,%a0) #
-################################
-movp_16:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA+0x8(%a6),%a0
-	mov.l	&0xaaaaaaaa,%d0
-	clr.b	0x0-0x8(%a0)
-	clr.b	0x2-0x8(%a0)
-	clr.b	0x4-0x8(%a0)
-	clr.b	0x8-0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x1f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.l	%d0,(-0x8,%a0)
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-
-	mov.b	0x6-0x8(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x4-0x8(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x2-0x8(%a0),%d1
-	lsl.l	&0x8,%d1
-	mov.b	0x0-0x8(%a0),%d1
-
-	cmp.l	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-################################
-# movep.l	(-0x8,%a0),%d0 #
-################################
-movp_17:
-	addq.l	&0x1,TESTCTR(%a6)
-
-	movm.l	DEF_REGS(%pc),&0x3fff
-
-	lea	DATA+0x8(%a6),%a0
-	mov.b	&0xaa,0x0-0x8(%a0)
-	mov.b	&0xaa,0x2-0x8(%a0)
-	mov.b	&0xaa,0x4-0x8(%a0)
-	mov.b	&0xaa,0x8-0x8(%a0)
-
-	mov.w	&0x001f,ICCR(%a6)
-	mov.w	&0x1f,%cc
-	movm.l	&0x7fff,IREGS(%a6)
-
-	movp.l	(-0x8,%a0),%d0
-
-	mov.w	%cc,SCCR(%a6)
-	movm.l	&0x7fff,SREGS(%a6)
-	mov.l	&0xaaaaaaaa,IREGS(%a6)
-
-	mov.l	&0xaaaaaaaa,%d1
-
-	cmp.l	%d0,%d1
-	bne.l	error
-
-	bsr.l	chkregs
-	tst.b	%d0
-	bne.l	error
-
-	mov.l	TESTCTR(%a6),%d1
-	clr.l	%d0
-	rts
-
-###########################################################
-
-divul_str:
-	string		"\t64-bit divide..."
-
-	align		0x4
-divul_0:
-	addq.l		&0x1,TESTCTR(%a6)
-
-#	movm.l		DEF_REGS(%pc),&0x3fff
-
-#	clr.l		%d1
-#	mov.l		&0x99999999,%d2
-#	mov.l		&0x88888888,%d3
-
-#	mov.w		&0x001e,ICCR(%a6)
-#	mov.w		&0x001f,%cc
-#	movm.l		&0x7fff,IREGS(%a6)
-
-#	divu.l		%d1,%d2:%d3
-
-#	mov.w		%cc,SCCR(%a6)
-#	movm.l		&0x7fff,SREGS(%a6)
-
-#	bsr.l		chkregs
-#	tst.b		%d0
-#	bne.l		error
-
-divul_1:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x00000001,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0x00000000,%d3
-
-	mov.w		&0x0014,ICCR(%a6)
-	mov.w		&0x001f,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_2:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x44444444,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0x55555555,%d3
-
-	mov.w		&0x0010,ICCR(%a6)
-	mov.w		&0x001f,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x11111111,IREGS+0x8(%a6)
-	mov.l		&0x00000001,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_3:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x55555555,%d1
-	mov.l		&0x00000000,%d2
-	mov.l		&0x44444444,%d3
-
-	mov.w		&0x0014,ICCR(%a6)
-	mov.w		&0x001f,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x44444444,IREGS+0x8(%a6)
-	mov.l		&0x00000000,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_4:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x11111111,%d1
-	mov.l		&0x44444444,%d2
-	mov.l		&0x44444444,%d3
-
-	mov.w		&0x001e,ICCR(%a6)
-	mov.w		&0x001d,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_5:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xfffffffe,%d1
-	mov.l		&0x00000001,%d2
-	mov.l		&0x00000002,%d3
-
-	mov.w		&0x001e,ICCR(%a6)
-	mov.w		&0x001d,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divs.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_6:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xfffffffe,%d1
-	mov.l		&0x00000001,%d2
-	mov.l		&0x00000000,%d3
-
-	mov.w		&0x0018,ICCR(%a6)
-	mov.w		&0x001d,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divs.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000000,IREGS+0x8(%a6)
-	mov.l		&0x80000000,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_7:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x00000002,%d1
-	mov.l		&0x00000001,%d2
-	mov.l		&0x00000000,%d3
-
-	mov.w		&0x001e,ICCR(%a6)
-	mov.w		&0x001d,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divs.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_8:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xffffffff,%d1
-	mov.l		&0xfffffffe,%d2
-	mov.l		&0xffffffff,%d3
-
-	mov.w		&0x0008,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_9:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xffffffff,%d1
-	mov.l		&0xfffffffe,%d2
-	mov.l		&0xffffffff,%d3
-
-	mov.w		&0x0008,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divu.l		&0xffffffff,%d2:%d2
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0xffffffff,IREGS+0x8(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-divul_10:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x0000ffff,%d1
-	mov.l		&0x00000001,%d2
-	mov.l		&0x55555555,%d3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	divu.l		%d1,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x0000aaab,IREGS+0x8(%a6)
-	mov.l		&0x00015556,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-	mov.l		TESTCTR(%a6),%d1
-	clr.l		%d0
-	rts
-
-###########################################################
-
-cas_str:
-	string		"\tcas..."
-
-	align		0x4
-cas0:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-
-	mov.w		&0xaaaa,(%a0)
-
-	mov.w		&0xaaaa,%d1
-	mov.w		&0xbbbb,%d2
-
-	mov.w		&0x0014,ICCR(%a6)
-	mov.w		&0x0010,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas.w		%d1,%d2,(%a0)			# Dc,Du,<ea>
-
-	mov.w		%cc,SCCR(%a6)
-	mov.w		(%a0),%d3
-	mov.w		&0xbbbb,IREGS+0xc+0x2(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas1:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-
-	mov.w		&0xeeee,(%a0)
-
-	mov.w		&0x0000aaaa,%d1
-	mov.w		&0x0000bbbb,%d2
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas.w		%d1,%d2,(%a0)			# Dc,Du,<ea>
-
-	mov.w		%cc,SCCR(%a6)
-	mov.w		(%a0),%d3
-	mov.w		&0xeeee,IREGS+0x4+0x2(%a6)
-	mov.w		&0xeeee,IREGS+0xc+0x2(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas2:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x2(%a6),%a0
-
-	mov.l		&0xaaaaaaaa,(%a0)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas.l		%d1,%d2,(%a0)			# Dc,Du,<ea>
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d3
-	mov.l		&0xbbbbbbbb,IREGS+0xc(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas3:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x2(%a6),%a0
-
-	mov.l		&0xeeeeeeee,(%a0)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas.l		%d1,%d2,(%a0)			# Dc,Du,<ea>
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d3
-	mov.l		&0xeeeeeeee,IREGS+0x4(%a6)
-	mov.l		&0xeeeeeeee,IREGS+0xc(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas4:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-
-	mov.l		&0xaaaaaaaa,(%a0)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas.l		%d1,%d2,(%a0)			# Dc,Du,<ea>
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d3
-	mov.l		&0xbbbbbbbb,IREGS+0xc(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas5:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-
-	mov.l		&0x7fffffff,(%a0)
-
-	mov.l		&0x80000000,%d1
-	mov.l		&0xbbbbbbbb,%d2
-
-	mov.w		&0x001b,ICCR(%a6)
-	mov.w		&0x0010,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas.l		%d1,%d2,(%a0)			# Dc,Du,<ea>
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d3
-	mov.l		&0x7fffffff,IREGS+0x4(%a6)
-	mov.l		&0x7fffffff,IREGS+0xc(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-	mov.l		TESTCTR(%a6),%d1
-	clr.l		%d0
-	rts
-
-###########################################################
-
-cas2_str:
-	string		"\tcas2..."
-
-	align		0x4
-cas20:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x0(%a6),%a0
-	lea		DATA+0x4(%a6),%a1
-
-	mov.l		&0xaaaaaaaa,(%a0)
-	mov.l		&0xbbbbbbbb,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x0014,ICCR(%a6)
-	mov.w		&0x0010,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xcccccccc,IREGS+0x14(%a6)
-	mov.l		&0xdddddddd,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas21:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-	lea		DATA+0x5(%a6),%a1
-
-	mov.l		&0xaaaaaaaa,(%a0)
-	mov.l		&0xbbbbbbbb,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x0014,ICCR(%a6)
-	mov.w		&0x0010,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xcccccccc,IREGS+0x14(%a6)
-	mov.l		&0xdddddddd,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas22:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x2(%a6),%a0
-	lea		DATA+0x6(%a6),%a1
-
-	mov.l		&0xaaaaaaaa,(%a0)
-	mov.l		&0xbbbbbbbb,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x0014,ICCR(%a6)
-	mov.w		&0x0010,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xcccccccc,IREGS+0x14(%a6)
-	mov.l		&0xdddddddd,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas23:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x0(%a6),%a0
-	lea		DATA+0x4(%a6),%a1
-
-	mov.l		&0xeeeeeeee,(%a0)
-	mov.l		&0xbbbbbbbb,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xeeeeeeee,IREGS+0x4(%a6)
-	mov.l		&0xbbbbbbbb,IREGS+0x8(%a6)
-	mov.l		&0xeeeeeeee,IREGS+0x14(%a6)
-	mov.l		&0xbbbbbbbb,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas24:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-	lea		DATA+0x5(%a6),%a1
-
-	mov.l		&0xeeeeeeee,(%a0)
-	mov.l		&0xbbbbbbbb,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xeeeeeeee,IREGS+0x4(%a6)
-	mov.l		&0xbbbbbbbb,IREGS+0x8(%a6)
-	mov.l		&0xeeeeeeee,IREGS+0x14(%a6)
-	mov.l		&0xbbbbbbbb,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas25:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x2(%a6),%a0
-	lea		DATA+0x6(%a6),%a1
-
-	mov.l		&0xeeeeeeee,(%a0)
-	mov.l		&0xbbbbbbbb,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xeeeeeeee,IREGS+0x4(%a6)
-	mov.l		&0xbbbbbbbb,IREGS+0x8(%a6)
-	mov.l		&0xeeeeeeee,IREGS+0x14(%a6)
-	mov.l		&0xbbbbbbbb,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas26:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x0(%a6),%a0
-	lea		DATA+0x4(%a6),%a1
-
-	mov.l		&0xaaaaaaaa,(%a0)
-	mov.l		&0xeeeeeeee,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xaaaaaaaa,IREGS+0x4(%a6)
-	mov.l		&0xeeeeeeee,IREGS+0x8(%a6)
-	mov.l		&0xaaaaaaaa,IREGS+0x14(%a6)
-	mov.l		&0xeeeeeeee,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas27:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-	lea		DATA+0x5(%a6),%a1
-
-	mov.l		&0xaaaaaaaa,(%a0)
-	mov.l		&0xeeeeeeee,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0xbbbbbbbb,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xaaaaaaaa,IREGS+0x4(%a6)
-	mov.l		&0xeeeeeeee,IREGS+0x8(%a6)
-	mov.l		&0xaaaaaaaa,IREGS+0x14(%a6)
-	mov.l		&0xeeeeeeee,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas28:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x2(%a6),%a0
-	lea		DATA+0x6(%a6),%a1
-
-	mov.l		&0xaaaaaaaa,(%a0)
-	mov.l		&0x7fffffff,(%a1)
-
-	mov.l		&0xaaaaaaaa,%d1
-	mov.l		&0x80000000,%d2
-	mov.l		&0xcccccccc,%d3
-	mov.l		&0xdddddddd,%d4
-
-	mov.w		&0x000b,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.l		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.l		(%a0),%d5
-	mov.l		(%a1),%d6
-	mov.l		&0xaaaaaaaa,IREGS+0x4(%a6)
-	mov.l		&0x7fffffff,IREGS+0x8(%a6)
-	mov.l		&0xaaaaaaaa,IREGS+0x14(%a6)
-	mov.l		&0x7fffffff,IREGS+0x18(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-##################################
-cas29:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x0(%a6),%a0
-	lea		DATA+0x4(%a6),%a1
-
-	mov.w		&0xaaaa,(%a0)
-	mov.w		&0xbbbb,(%a1)
-
-	mov.w		&0xaaaa,%d1
-	mov.w		&0xbbbb,%d2
-	mov.w		&0xcccc,%d3
-	mov.w		&0xdddd,%d4
-
-	mov.w		&0x0014,ICCR(%a6)
-	mov.w		&0x0010,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.w		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.w		(%a0),%d5
-	mov.w		(%a1),%d6
-	mov.w		&0xcccc,IREGS+0x14+0x2(%a6)
-	mov.w		&0xdddd,IREGS+0x18+0x2(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas210:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-	lea		DATA+0x5(%a6),%a1
-
-	mov.w		&0xaaaa,(%a0)
-	mov.w		&0xbbbb,(%a1)
-
-	mov.w		&0xaaaa,%d1
-	mov.w		&0xbbbb,%d2
-	mov.w		&0xcccc,%d3
-	mov.w		&0xdddd,%d4
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.w		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.w		(%a0),%d5
-	mov.w		(%a1),%d6
-	mov.w		&0xcccc,IREGS+0x14+0x2(%a6)
-	mov.w		&0xdddd,IREGS+0x18+0x2(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas211:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x0(%a6),%a0
-	lea		DATA+0x4(%a6),%a1
-
-	mov.w		&0xeeee,(%a0)
-	mov.w		&0xbbbb,(%a1)
-
-	mov.w		&0xaaaa,%d1
-	mov.w		&0xbbbb,%d2
-	mov.w		&0xcccc,%d3
-	mov.w		&0xdddd,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.w		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.w		(%a0),%d5
-	mov.w		(%a1),%d6
-	mov.w		&0xeeee,IREGS+0x4+0x2(%a6)
-	mov.w		&0xbbbb,IREGS+0x8+0x2(%a6)
-	mov.w		&0xeeee,IREGS+0x14+0x2(%a6)
-	mov.w		&0xbbbb,IREGS+0x18+0x2(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas212:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-	lea		DATA+0x5(%a6),%a1
-
-	mov.w		&0xeeee,(%a0)
-	mov.w		&0xbbbb,(%a1)
-
-	mov.w		&0xaaaa,%d1
-	mov.w		&0xbbbb,%d2
-	mov.w		&0xcccc,%d3
-	mov.w		&0xdddd,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.w		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.w		(%a0),%d5
-	mov.w		(%a1),%d6
-	mov.w		&0xeeee,IREGS+0x4+0x2(%a6)
-	mov.w		&0xbbbb,IREGS+0x8+0x2(%a6)
-	mov.w		&0xeeee,IREGS+0x14+0x2(%a6)
-	mov.w		&0xbbbb,IREGS+0x18+0x2(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas213:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x0(%a6),%a0
-	lea		DATA+0x4(%a6),%a1
-
-	mov.w		&0xaaaa,(%a0)
-	mov.w		&0xeeee,(%a1)
-
-	mov.w		&0xaaaa,%d1
-	mov.w		&0xbbbb,%d2
-	mov.w		&0xcccc,%d3
-	mov.w		&0xdddd,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.w		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.w		(%a0),%d5
-	mov.w		(%a1),%d6
-	mov.w		&0xaaaa,IREGS+0x4+0x2(%a6)
-	mov.w		&0xeeee,IREGS+0x8+0x2(%a6)
-	mov.w		&0xaaaa,IREGS+0x14+0x2(%a6)
-	mov.w		&0xeeee,IREGS+0x18+0x2(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cas214:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	lea		DATA+0x1(%a6),%a0
-	lea		DATA+0x5(%a6),%a1
-
-	mov.w		&0xaaaa,(%a0)
-	mov.w		&0x7fff,(%a1)
-
-	mov.w		&0xaaaa,%d1
-	mov.w		&0x8000,%d2
-	mov.w		&0xcccc,%d3
-	mov.w		&0xdddd,%d4
-
-	mov.w		&0x001b,ICCR(%a6)
-	mov.w		&0x0010,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cas2.w		%d1:%d2,%d3:%d4,(%a0):(%a1)	# Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
-
-	mov.w		%cc,SCCR(%a6)
-	mov.w		(%a0),%d5
-	mov.w		(%a1),%d6
-	mov.w		&0xaaaa,IREGS+0x4+0x2(%a6)
-	mov.w		&0x7fff,IREGS+0x8+0x2(%a6)
-	mov.w		&0xaaaa,IREGS+0x14+0x2(%a6)
-	mov.w		&0x7fff,IREGS+0x18+0x2(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-	mov.l		TESTCTR(%a6),%d1
-	clr.l		%d0
-	rts
-
-###########################################################
-
-cmp2_str:
-	string		"\tcmp2,chk2..."
-
-	align		0x4
-# unsigned - small,small
-cmp2_1:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0x2040,DATA(%a6)
-	mov.l		&0x11111120,%d1
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_2:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0x2040,DATA(%a6)
-	mov.l		&0x00000040,%a1
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_3:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0x2040,DATA(%a6)
-	mov.l		&0x11111130,%d1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	chk2.b		DATA(%a6),%d1
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_4:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0x2040,DATA(%a6)
-	mov.l		&0x00000010,%a1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_5:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0x2040,DATA(%a6)
-	mov.l		&0x11111150,%d1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_6:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0x2040,DATA(%a6)
-	mov.l		&0x00000090,%a1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-# unsigned - small,large
-cmp2_7:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x2000a000,DATA(%a6)
-	mov.l		&0x11112000,%d1
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.w		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_8:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x2000a000,DATA(%a6)
-	mov.l		&0xffffa000,%a1
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.w		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_9:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x2000a000,DATA(%a6)
-	mov.l		&0x11113000,%d1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	chk2.w		DATA(%a6),%d1
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_10:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x2000a000,DATA(%a6)
-	mov.l		&0xffff9000,%a1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.w		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_11:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x2000a000,DATA(%a6)
-	mov.l		&0x11111000,%d1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.w		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_12:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0x2000a000,DATA(%a6)
-	mov.l		&0xffffb000,%a1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.w		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-# unsigned - large,large
-cmp2_13:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xa0000000,DATA(%a6)
-	mov.l		&0xc0000000,DATA+0x4(%a6)
-	mov.l		&0xa0000000,%d1
-
-	mov.w		&0x000c,ICCR(%a6)
-	mov.w		&0x0008,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.l		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_14:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xa0000000,DATA(%a6)
-	mov.l		&0xc0000000,DATA+0x4(%a6)
-	mov.l		&0xc0000000,%a1
-
-	mov.w		&0x000c,ICCR(%a6)
-	mov.w		&0x0008,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.l		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_15:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xa0000000,DATA(%a6)
-	mov.l		&0xc0000000,DATA+0x4(%a6)
-	mov.l		&0xb0000000,%d1
-
-	mov.w		&0x0008,ICCR(%a6)
-	mov.w		&0x0008,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	chk2.l		DATA(%a6),%d1
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_16:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xa0000000,DATA(%a6)
-	mov.l		&0xc0000000,DATA+0x4(%a6)
-	mov.l		&0x10000000,%a1
-
-	mov.w		&0x0009,ICCR(%a6)
-	mov.w		&0x0008,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.l		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_17:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xa0000000,DATA(%a6)
-	mov.l		&0xc0000000,DATA+0x4(%a6)
-	mov.l		&0x90000000,%d1
-
-	mov.w		&0x0009,ICCR(%a6)
-	mov.w		&0x0008,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.l		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_18:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		&0xa0000000,DATA(%a6)
-	mov.l		&0xc0000000,DATA+0x4(%a6)
-	mov.l		&0xd0000000,%a1
-
-	mov.w		&0x0009,ICCR(%a6)
-	mov.w		&0x0008,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.l		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-# signed - negative,positive
-cmp2_19:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa040,DATA(%a6)
-	mov.l		&0x111111a0,%d1
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_20:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa040,DATA(%a6)
-	mov.l		&0x00000040,%a1
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	chk2.b		DATA(%a6),%a1
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_21:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa040,DATA(%a6)
-	mov.l		&0x111111b0,%d1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_22:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa040,DATA(%a6)
-	mov.l		&0x00000010,%a1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_23:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa040,DATA(%a6)
-	mov.l		&0x11111190,%d1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_24:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa040,DATA(%a6)
-	mov.l		&0x00000050,%a1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-# signed - negative,negative
-cmp2_25:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa0c0,DATA(%a6)
-	mov.l		&0x111111a0,%d1
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_26:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa0c0,DATA(%a6)
-	mov.l		&0xffffffc0,%a1
-
-	mov.w		&0x0004,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_27:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa0c0,DATA(%a6)
-	mov.l		&0x111111b0,%d1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	chk2.b		DATA(%a6),%d1
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_28:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa0c0,DATA(%a6)
-	mov.l		&0x11111190,%a1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_29:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa0c0,DATA(%a6)
-	mov.l		&0x111111d0,%d1
-
-	mov.w		&0x0001,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%d1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-cmp2_30:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.w		&0xa0c0,DATA(%a6)
-	mov.l		&0x00000050,%a1
-
-	mov.w		&0x001b,ICCR(%a6)
-	mov.w		&0x001f,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	cmp2.b		%a1,DATA(%a6)
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-	mov.l		TESTCTR(%a6),%d1
-	clr.l		%d0
-	rts
-
-###########################################################
-
-ea_str:
-	string		"\tEffective addresses..."
-
-	align		0x4
-ea_0:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a0),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_1:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a0)+,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM+0x4(%a6),%a0
-	mov.l		%a0,IREGS+0x20(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_2:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x4(%a6),%a0
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		-(%a0),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM(%a6),%a0
-	mov.l		%a0,IREGS+0x20(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_3:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x1000(%a6),%a0
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(-0x1000,%a0),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_4:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a0
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x1000,%a0),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_5:
-	addq.l		&0x1,TESTCTR(%a6)
-
-#	movm.l		DEF_REGS(%pc),&0x3fff
-
-#	clr.l		%d2
-#	mov.l		&0x00000002,%d3
-
-#	mov.w		&0x0000,ICCR(%a6)
-#	mov.w		&0x0000,%cc
-#	movm.l		&0xffff,IREGS(%a6)
-
-#	mulu.l		EAMEM.w,%d2:%d3
-
-#	mov.w		%cc,SCCR(%a6)
-#	movm.l		&0xffff,SREGS(%a6)
-#	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-#	bsr.l		chkregs
-#	tst.b		%d0
-#	bne.l		error
-
-ea_6:
-	addq.l		&0x1,TESTCTR(%a6)
-
-#	movm.l		DEF_REGS(%pc),&0x3fff
-
-#	clr.l		%d2
-#	mov.l		&0x00000002,%d3
-
-#	mov.w		&0x0000,ICCR(%a6)
-#	mov.w		&0x0000,%cc
-#	movm.l		&0xffff,IREGS(%a6)
-
-#	mulu.l		EAMEM.l,%d2:%d3
-
-#	mov.w		%cc,SCCR(%a6)
-#	movm.l		&0xffff,SREGS(%a6)
-#	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-#	bsr.l		chkregs
-#	tst.b		%d0
-#	bne.l		error
-
-ea_7:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		&0x00000002,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_8:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_8_next
-ea_8_mem:
-	long		0x00000002
-ea_8_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_8_mem.w,%pc),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_9:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x4(%a6),%a1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		-(%a1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM(%a6),%a0
-	mov.l		%a0,IREGS+0x24(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_10:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x4(%a6),%a2
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		-(%a2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM(%a6),%a0
-	mov.l		%a0,IREGS+0x28(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_11:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x4(%a6),%a3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		-(%a3),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM(%a6),%a0
-	mov.l		%a0,IREGS+0x2c(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_12:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x4(%a6),%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		-(%a4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM(%a6),%a0
-	mov.l		%a0,IREGS+0x30(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_13:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x4(%a6),%a5
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		-(%a5),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM(%a6),%a0
-	mov.l		%a0,IREGS+0x34(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_14:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a6,%a1
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x4(%a1),%a6
-
-	mov.w		&0x0000,ICCR(%a1)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a1)
-
-	mulu.l		-(%a6),%d2:%d3
-
-	mov.w		%cc,SCCR(%a1)
-	movm.l		&0xffff,SREGS(%a1)
-	mov.l		&0x00000004,IREGS+0xc(%a1)
-	lea		EAMEM(%a1),%a0
-	mov.l		%a0,IREGS+0x38(%a1)
-
-	mov.l		%a1,%a6
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_15:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	mov.l		%a7,%a0
-	lea		EAMEM+0x4(%a6),%a7
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		-(%a7),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM(%a6),%a1
-	mov.l		%a1,IREGS+0x3c(%a6)
-
-	mov.l		%a0,%a7
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_16:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_17:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%d4.w*2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_18:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%d4.w*4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_19:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%d4.w*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_20:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%d4.l*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_21:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%d4.l*2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_22:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%d4.l*4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_23:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%d4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_24:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x2,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a0,%a4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_25:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&0x2,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(-0x10.b,%a0,%a4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_26:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a1
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a1,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_27:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a2
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a2,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_28:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a3,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_29:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a4
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a4,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_30:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a5
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a5,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_31:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a6,%a1
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a1),%a6
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a1)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a1)
-
-	mulu.l		(0x10.b,%a6,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a1)
-	movm.l		&0xffff,SREGS(%a1)
-	mov.l		&0x00000004,IREGS+0xc(%a1)
-
-	mov.l		%a1,%a6
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_32:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	mov.l		%a7,%a0
-	lea		EAMEM(%a6),%a7
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.b,%a7,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	mov.l		%a0,%a7
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_33:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_34:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a2
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_35:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a3),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_36:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_37:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a5
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a5),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_38:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a6,%a1
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a1),%a6
-
-	mov.w		&0x0000,ICCR(%a1)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a1)
-
-	mulu.l		(%a6),%d2:%d3
-
-	mov.w		%cc,SCCR(%a1)
-	movm.l		&0xffff,SREGS(%a1)
-	mov.l		&0x00000004,IREGS+0xc(%a1)
-
-	mov.l		%a1,%a6
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_39:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	mov.l		%a7,%a0
-	lea		EAMEM(%a6),%a7
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a7),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	mov.l		%a0,%a7
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_40:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a1)+,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM+0x4(%a6),%a0
-	mov.l		%a0,IREGS+0x24(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_41:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a2
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a2)+,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM+0x4(%a6),%a0
-	mov.l		%a0,IREGS+0x28(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_42:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a3)+,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM+0x4(%a6),%a0
-	mov.l		%a0,IREGS+0x2c(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_43:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a4)+,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM+0x4(%a6),%a0
-	mov.l		%a0,IREGS+0x30(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_44:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a5
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a5)+,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM+0x4(%a6),%a0
-	mov.l		%a0,IREGS+0x34(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_45:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a6,%a1
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a1),%a6
-
-	mov.w		&0x0000,ICCR(%a1)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a1)
-
-	mulu.l		(%a6)+,%d2:%d3
-
-	mov.w		%cc,SCCR(%a1)
-	movm.l		&0xffff,SREGS(%a1)
-	mov.l		&0x00000004,IREGS+0xc(%a1)
-	lea		EAMEM+0x4(%a1),%a0
-	mov.l		%a0,IREGS+0x38(%a1)
-
-	mov.l		%a1,%a6
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_46:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	mov.l		%a7,%a0
-	lea		EAMEM(%a6),%a7
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(%a7)+,%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-	lea		EAMEM+0x4(%a6),%a1
-	mov.l		%a1,IREGS+0x3c(%a6)
-
-	mov.l		%a0,%a7
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_47:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a1
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x1000,%a1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_48:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a2
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x1000,%a2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_49:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x1000,%a3),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_50:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x1000,%a4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_51:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a5
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x1000,%a5),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_52:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a6,%a1
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a1),%a6
-
-	mov.w		&0x0000,ICCR(%a1)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a1)
-
-	mulu.l		(0x1000,%a6),%d2:%d3
-
-	mov.w		%cc,SCCR(%a1)
-	movm.l		&0xffff,SREGS(%a1)
-	mov.l		&0x00000004,IREGS+0xc(%a1)
-
-	mov.l		%a1,%a6
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_53:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	mov.l		%a7,%a0
-	lea		EAMEM-0x1000(%a6),%a7
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x1000,%a7),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	mov.l		%a0,%a7
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_54:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x1000(%a6),%a0
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(-0x1000,%a0),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_55:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_55_next
-
-ea_55_data:
-	long		0x00000002
-ea_55_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_55_data.w,%pc),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_56:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.w,%a3,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_57:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.w,%a3,%d4.w*2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_58:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.w,%a3,%d4.w*4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_59:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.w,%a3,%d4.w*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_60:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.w,%a3,%d4.l*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_61:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.w,%a3,%d4.l*2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_62:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.w,%a3,%d4.l*4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_63:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x10.w,%a3,%d4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_64:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&0x2,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(-0x10.w,%a3,%a4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_65:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&0x2,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(0x00.w,%a3,%za4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_66:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		%a3,%a4
-	add.l		&0x10,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(-0x10.w,%za3,%a4.l*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_67:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&0x2,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(-0x10.l,%a3,%a4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_68:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_68_next
-ea_68_mem:
-	long		0x00000002
-ea_68_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_68_mem+0x10.w,%pc,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_69:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_69_next
-ea_69_mem:
-	long		0x00000002
-ea_69_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		(ea_69_mem+0x10.w,%pc,%d4.w*2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_70:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_70_next
-ea_70_mem:
-	long		0x00000002
-ea_70_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		(ea_70_mem+0x10.w,%pc,%d4.w*4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_71:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_71_next
-ea_71_mem:
-	long		0x00000002
-ea_71_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		(ea_71_mem+0x10.w,%pc,%d4.w*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_72:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_72_next
-ea_72_mem:
-	long		0x00000002
-ea_72_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		(ea_72_mem+0x10.w,%pc,%d4.l*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_73:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_73_next
-ea_73_mem:
-	long		0x00000002
-ea_73_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		(ea_73_mem+0x10.w,%pc,%d4.l*2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_74:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_74_next
-ea_74_mem:
-	long		0x00000002
-ea_74_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		(ea_74_mem+0x10.w,%pc,%d4.l*4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_75:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_75_next
-ea_75_mem:
-	long		0x00000002
-ea_75_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0x7fff,IREGS(%a6)
-
-	mulu.l		(ea_75_mem+0x10.w,%pc,%d4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0x7fff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_76:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_76_next
-ea_76_mem:
-	long		0x00000002
-ea_76_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&-0x2,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_76_mem+0x10.w,%pc,%a4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_77:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_77_next
-ea_77_mem:
-	long		0x00000002
-ea_77_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a3
-	mov.l		&0x2,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_77_mem+0x00.w,%pc,%za4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_78:
-	addq.l		&0x1,TESTCTR(%a6)
-
-#	movm.l		DEF_REGS(%pc),&0x3fff
-
-#	clr.l		%d2
-#	mov.l		&0x00000002,%d3
-#	lea		EAMEM,%a3
-#	mov.l		%a3,%a4
-#	add.l		&0x10,%a4
-
-#	mov.w		&0x0000,ICCR(%a6)
-#	mov.w		&0x0000,%cc
-#	movm.l		&0xffff,IREGS(%a6)
-
-#	mulu.l		(EAMEM-0x10.w,%zpc,%a4.l*1),%d2:%d3
-
-#	mov.w		%cc,SCCR(%a6)
-#	movm.l		&0xffff,SREGS(%a6)
-#	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-#	bsr.l		chkregs
-#	tst.b		%d0
-#	bne.l		error
-
-ea_79:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM,%a3
-	mov.l		&0x2,%a4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_79_mem-0x10.l,%pc,%a4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bra.b		ea_79_next
-ea_79_mem:
-	long		0x00000002
-ea_79_next:
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_80:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_80_next
-ea_80_mem:
-	long		0x00000002
-ea_80_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a1
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_80_mem+0x10.b,%pc,%d4.w*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_81:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_81_next
-ea_81_mem:
-	long		0x00000002
-ea_81_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_81_mem+0x10.b,%pc,%d4.w*2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_82:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_82_next
-ea_82_mem:
-	long		0x00000002
-ea_82_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_82_mem+0x10.b,%pc,%d4.w*4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_83:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_83_next
-ea_83_mem:
-	long		0x00000002
-ea_83_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_83_mem+0x10.b,%pc,%d4.w*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_84:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_84_next
-ea_84_mem:
-	long		0x00000002
-ea_84_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_84_mem+0x10.b,%pc,%d4.l*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_85:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_85_next
-ea_85_mem:
-	long		0x00000002
-ea_85_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_85_mem+0x10.b,%pc,%d4.l*2),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_86:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_86_next
-ea_86_mem:
-	long		0x00000002
-ea_86_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_86_mem+0x10.b,%pc,%d4.l*4),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_87:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	bra.b		ea_87_next
-ea_87_mem:
-	long		0x00000002
-ea_87_next:
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_87_mem+0x10.b,%pc,%d4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_88:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a6),%a0
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		(ea_88_mem+0x10.b,%pc,%d4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bra.b		ea_88_next
-ea_88_mem:
-	long		0x00000002
-ea_88_next:
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_89:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4,%d4.w*1],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_90:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4,%d4.w*2],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_91:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4,%d4.w*4],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_92:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4,%d4.w*8],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_93:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4,%d4.l*1],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_94:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4,%d4.l*2],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_95:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4,%d4.l*4],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_96:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4,%d4.l*8],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_97:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.l,%a4,%d4.l*8],0x1000.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_98:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x00.l,%a4,%zd4.l*8],0x1000.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_99:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([%a4,%zd4.l*8],0x1000.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_100:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x10,%d4
-	add.l		%a4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.l,%za4,%d4.l*1],0x1000.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_101:
-	addq.l		&0x1,TESTCTR(%a6)
-
-#	movm.l		DEF_REGS(%pc),&0x3fff
-
-#	clr.l		%d2
-#	mov.l		&0x00000002,%d3
-#	lea		EAMEM(%a6),%a3
-#	lea		EASTORE(%a6),%a4
-#	mov.l		%a3,(%a4)
-#	mov.l		&-0x10,%d4
-
-#	mov.w		&0x0000,ICCR(%a6)
-#	mov.w		&0x0000,%cc
-#	movm.l		&0xffff,IREGS(%a6)
-
-#	mulu.l		([EASTORE.l,%za4,%zd4.l*1]),%d2:%d3
-
-#	mov.w		%cc,SCCR(%a6)
-#	movm.l		&0xffff,SREGS(%a6)
-#	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-#	bsr.l		chkregs
-#	tst.b		%d0
-#	bne.l		error
-
-ea_102:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a6,%a1
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x1000(%a1),%a3
-	lea		EASTORE(%a1),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%a6
-
-	mov.w		&0x0000,ICCR(%a1)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a1)
-
-	mulu.l		([0x10.w,%a4,%a6.l*8],-0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a1)
-	movm.l		&0xffff,SREGS(%a1)
-	mov.l		&0x00000004,IREGS+0xc(%a1)
-
-	mov.l		%a1,%a6
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_103:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a6,%a1
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x1000(%a1),%a3
-	lea		EASTORE(%a1),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&0x2,%a6
-
-	mov.w		&0x0000,ICCR(%a1)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a1)
-
-	mulu.l		([-0x10.w,%a4,%a6.l*8],-0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a1)
-	movm.l		&0xffff,SREGS(%a1)
-	mov.l		&0x00000004,IREGS+0xc(%a1)
-
-	mov.l		%a1,%a6
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_104:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4],%d4.w*1,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_105:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4],%d4.w*2,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_106:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4],%d4.w*4,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_107:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4],%d4.w*8,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_108:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4],%d4.l*1,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_109:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4],%d4.w*2,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_110:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4],%d4.l*4,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_111:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.w,%a4],%d4.l*8,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_112:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.l,%a4],%d4.l*8,0x10.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_113:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x00.l,%a4],%zd4.l*8,0x20.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_114:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a7,%a0
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%a6),%a3
-	lea		EASTORE(%a6),%a7
-	mov.l		%a3,(%a7)
-	mov.l		&0x20,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([%a7],%d4.l*1),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	mov.l		%a0,%a7
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_115:
-	addq.l		&0x1,TESTCTR(%a6)
-
-#	movm.l		DEF_REGS(%pc),&0x3fff
-
-#	clr.l		%d2
-#	mov.l		&0x00000002,%d3
-#	lea		EAMEM-0x20(%pc),%a3
-#	lea		EASTORE(%pc),%a4
-#	mov.l		%a3,(%a4)
-#	mov.l		&0x2,%d4
-
-#	mov.w		&0x0000,ICCR(%a6)
-#	mov.w		&0x0000,%cc
-#	movm.l		&0xffff,IREGS(%a6)
-
-#	mulu.l		([EASTORE.l,%za4],%zd4.l*8,0x20.l),%d2:%d3
-
-#	mov.w		%cc,SCCR(%a6)
-#	movm.l		&0xffff,SREGS(%a6)
-#	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-#	bsr.l		chkregs
-#	tst.b		%d0
-#	bne.l		error
-
-ea_116:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a6,%a1
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%a1),%a3
-	lea		EASTORE(%a1),%a6
-	mov.l		%a3,(%a6)
-	add.l		&0x10,%a6
-	mov.l		&-0x2,%a5
-
-	mov.w		&0x0000,ICCR(%a1)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a1)
-
-	mulu.l		([-0x10.w,%a6],%a5.l*8,0x10.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a1)
-	movm.l		&0xffff,SREGS(%a1)
-	mov.l		&0x00000004,IREGS+0xc(%a1)
-
-	mov.l		%a1,%a6
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-	mov.l		TESTCTR(%a6),%d1
-	clr.l		%d0
-	rts
-
-ea_117:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x10.w,%pc,%d4.w*1],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_118:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x10.w,%pc,%d4.w*2],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_119:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x10.w,%pc,%d4.w*4],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_120:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x10.w,%pc,%d4.w*8],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_121:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x10.w,%pc,%d4.l*1],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_122:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x10.w,%pc,%d4.l*2],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_123:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x10.w,%pc,%d4.l*4],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_124:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x10.w,%pc,%d4.l*8],0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_125:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-	mulu.l		([EASTORE+0x10.l,%pc,%d4.l*8],0x1000.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_126:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE+0x00.l,%pc,%zd4.l*8],0x1000.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_127:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		%a4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([%zpc,%d4.l*1],0x1000.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_128:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x10,%d4
-	add.l		%a4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([0x10.l,%zpc,%d4.l*1],0x1000.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_129:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&-0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.l,%zpc,%zd4.l*1]),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_130:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&0x2,%a6
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE-0x10.w,%pc,%a6.l*8],-0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_131:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a7,%a0
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM+0x1000(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&0x2,%a7
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE-0x10.w,%pc,%a7.l*8],-0x1000.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	mov.l		%a0,%a7
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_132:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%d4.w*1,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_133:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%d4.w*2,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_134:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%d4.w*4,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_135:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%d4.w*8,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_136:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x10,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%d4.l*1,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_137:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x8,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%d4.w*2,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_138:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%d4.l*4,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_139:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%d4.l*8,0x10.w),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_140:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	sub.l		&0x10,%a4
-	mov.l		&0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.l,%pc],%d4.l*8,0x10.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_141:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&0x2,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.l,%pc],%zd4.l*8,0x20.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_142:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM-0x20(%pc),%a3
-	lea		EASTORE(%pc),%a4
-	mov.l		%a3,(%a4)
-	mov.l		&0x4,%d4
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.l,%zpc],%d4.l*8),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-ea_143:
-	addq.l		&0x1,TESTCTR(%a6)
-
-	movm.l		DEF_REGS(%pc),&0x3fff
-
-	mov.l		%a7,%a0
-	clr.l		%d2
-	mov.l		&0x00000002,%d3
-	lea		EAMEM(%pc),%a3
-	lea		EASTORE(%pc),%a6
-	mov.l		%a3,(%a6)
-	add.l		&0x10,%a6
-	mov.l		&-0x2,%a7
-
-	mov.w		&0x0000,ICCR(%a6)
-	mov.w		&0x0000,%cc
-	movm.l		&0xffff,IREGS(%a6)
-
-	mulu.l		([EASTORE.w,%pc],%a7.l*8,0x10.l),%d2:%d3
-
-	mov.w		%cc,SCCR(%a6)
-	movm.l		&0xffff,SREGS(%a6)
-	mov.l		&0x00000004,IREGS+0xc(%a6)
-
-	mov.l		%a0,%a7
-	bsr.l		chkregs
-	tst.b		%d0
-	bne.l		error
-
-	clr.l		%d0
-	rts
-
-###########################################################
-###########################################################
-chkregs:
-	lea		IREGS(%a6),%a0
-	lea		SREGS(%a6),%a1
-	mov.l		&14,%d0
-chkregs_loop:
-	cmp.l		(%a0)+,(%a1)+
-	bne.l		chkregs_error
-	dbra.w		%d0,chkregs_loop
-
-	mov.w		ICCR(%a6),%d0
-	mov.w		SCCR(%a6),%d1
-	cmp.w		%d0,%d1
-	bne.l		chkregs_error
-
-	clr.l		%d0
-	rts
-
-chkregs_error:
-	movq.l		&0x1,%d0
-	rts
-
-error:
-	mov.l		TESTCTR(%a6),%d1
-	movq.l		&0x1,%d0
-	rts
-
-DEF_REGS:
-	long		0xacacacac, 0xacacacac, 0xacacacac, 0xacacacac
-	long		0xacacacac, 0xacacacac, 0xacacacac, 0xacacacac
-
-	long		0xacacacac, 0xacacacac, 0xacacacac, 0xacacacac
-	long		0xacacacac, 0xacacacac, 0xacacacac, 0xacacacac
-
-############################################################
-
-_print_str:
-	mov.l		%d0,-(%sp)
-	mov.l		(TESTTOP-0x80+0x0,%pc),%d0
-	pea		(TESTTOP-0x80,%pc,%d0)
-	mov.l		0x4(%sp),%d0
-	rtd		&0x4
-
-_print_num:
-	mov.l		%d0,-(%sp)
-	mov.l		(TESTTOP-0x80+0x4,%pc),%d0
-	pea		(TESTTOP-0x80,%pc,%d0)
-	mov.l		0x4(%sp),%d0
-	rtd		&0x4
-
-############################################################
+E_SUPPORTED_MASK 0xf
+#define DEVICE_CAP2__CPL_TIMEOUT_RANGE_SUPPORTED__SHIFT 0x0
+#define DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED_MASK 0x10
+#define DEVICE_CAP2__CPL_TIMEOUT_DIS_SUPPORTED__SHIFT 0x4
+#define DEVICE_CAP2__ARI_FORWARDING_SUPPORTED_MASK 0x20
+#define DEVICE_CAP2__ARI_FORWARDING_SUPPORTED__SHIFT 0x5
+#define DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING_MASK 0x400
+#define DEVICE_CAP2__NO_RO_ENABLED_P2P_PASSING__SHIFT 0xa
+#define DEVICE_CAP2__LTR_SUPPORTED_MASK 0x800
+#define DEVICE_CAP2__LTR_SUPPORTED__SHIFT 0xb
+#define DEVICE_CAP2__TPH_CPLR_SUPPORTED_MASK 0x3000
+#define DEVICE_CAP2__TPH_CPLR_SUPPORTED__SHIFT 0xc
+#define DEVICE_CAP2__OBFF_SUPPORTED_MASK 0xc0000
+#define DEVICE_CAP2__OBFF_SUPPORTED__SHIFT 0x12
+#define DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED_MASK 0x100000
+#define DEVICE_CAP2__EXTENDED_FMT_FIELD_SUPPORTED__SHIFT 0x14
+#define DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED_MASK 0x200000
+#define DEVICE_CAP2__END_END_TLP_PREFIX_SUPPORTED__SHIFT 0x15
+#define DEVICE_CAP2__MAX_END_END_TLP_PREFIXES_MASK 0xc00000
+#define DEVICE_CAP2__MAX_END_END_TLP_PREFIXES__SHIFT 0x16
+#define DEVICE_CNTL2__CPL_TIMEOUT_VALUE_MASK 0xf
+#define DEVICE_CNTL2__CPL_TIMEOUT_VALUE__SHIFT 0x0
+#define DEVICE_CNTL2__CPL_TIMEOUT_DIS_MASK 0x10
+#define DEVICE_CNTL2__CPL_TIMEOUT_DIS__SHIFT 0x4
+#define DEVICE_CNTL2__ARI_FORWARDING_EN_MASK 0x20
+#define DEVICE_CNTL2__ARI_FORWARDING_EN__SHIFT 0x5
+#define DEVICE_CNTL2__IDO_REQUEST_ENABLE_MASK 0x100
+#define DEVICE_CNTL2__IDO_REQUEST_ENABLE__SHIFT 0x8
+#define DEVICE_CNTL2__IDO_COMPLETION_ENABLE_MASK 0x200
+#define DEVICE_CNTL2__IDO_COMPLETION_ENABLE__SHIFT 0x9
+#define DEVICE_CNTL2__LTR_EN_MASK 0x400
+#define DEVICE_CNTL2__LTR_EN__SHIFT 0xa
+#define DEVICE_CNTL2__OBFF_EN_MASK 0x6000
+#define DEVICE_CNTL2__OBFF_EN__SHIFT 0xd
+#define DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING_MASK 0x8000
+#define DEVICE_CNTL2__END_END_TLP_PREFIX_BLOCKING__SHIFT 0xf
+#define DEVICE_STATUS2__RESERVED_MASK 0xffff
+#define DEVICE_STATUS2__RESERVED__SHIFT 0x0
+#define LINK_CAP2__SUPPORTED_LINK_SPEED_MASK 0xfe
+#define LINK_CAP2__SUPPORTED_LINK_SPEED__SHIFT 0x1
+#define LINK_CAP2__CROSSLINK_SUPPORTED_MASK 0x100
+#define LINK_CAP2__CROSSLINK_SUPPORTED__SHIFT 0x8
+#define LINK_CAP2__RESERVED_MASK 0xfffffe00
+#define LINK_CAP2__RESERVED__SHIFT 0x9
+#define LINK_CNTL2__TARGET_LINK_SPEED_MASK 0xf
+#define LINK_CNTL2__TARGET_LINK_SPEED__SHIFT 0x0
+#define LINK_CNTL2__ENTER_COMPLIANCE_MASK 0x10
+#define LINK_CNTL2__ENTER_COMPLIANCE__SHIFT 0x4
+#define LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE_MASK 0x20
+#define LINK_CNTL2__HW_AUTONOMOUS_SPEED_DISABLE__SHIFT 0x5
+#define LINK_CNTL2__SELECTABLE_DEEMPHASIS_MASK 0x40
+#define LINK_CNTL2__SELECTABLE_DEEMPHASIS__SHIFT 0x6
+#define LINK_CNTL2__XMIT_MARGIN_MASK 0x380
+#define LINK_CNTL2__XMIT_MARGIN__SHIFT 0x7
+#define LINK_CNTL2__ENTER_MOD_COMPLIANCE_MASK 0x400
+#define LINK_CNTL2__ENTER_MOD_COMPLIANCE__SHIFT 0xa
+#define LINK_CNTL2__COMPLIANCE_SOS_MASK 0x800
+#define LINK_CNTL2__COMPLIANCE_SOS__SHIFT 0xb
+#define LINK_CNTL2__COMPLIANCE_DEEMPHASIS_MASK 0xf000
+#define LINK_CNTL2__COMPLIANCE_DEEMPHASIS__SHIFT 0xc
+#define LINK_STATUS2__CUR_DEEMPHASIS_LEVEL_MASK 0x1
+#define LINK_STATUS2__CUR_DEEMPHASIS_LEVEL__SHIFT 0x0
+#define LINK_STATUS2__EQUALIZATION_COMPLETE_MASK 0x2
+#define LINK_STATUS2__EQUALIZATION_COMPLETE__SHIFT 0x1
+#define LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS_MASK 0x4
+#define LINK_STATUS2__EQUALIZATION_PHASE1_SUCCESS__SHIFT 0x2
+#define LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS_MASK 0x8
+#define LINK_STATUS2__EQUALIZATION_PHASE2_SUCCESS__SHIFT 0x3
+#define LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS_MASK 0x10
+#define LINK_STATUS2__EQUALIZATION_PHASE3_SUCCESS__SHIFT 0x4
+#define LINK_STATUS2__LINK_EQUALIZATION_REQUEST_MASK 0x20
+#define LINK_STATUS2__LINK_EQUALIZATION_REQUEST__SHIFT 0x5
+#define MSI_CAP_LIST__CAP_ID_MASK 0xff
+#define MSI_CAP_LIST__CAP_ID__SHIFT 0x0
+#define MSI_CAP_LIST__NEXT_PTR_MASK 0xff00
+#define MSI_CAP_LIST__NEXT_PTR__SHIFT 0x8
+#define MSI_MSG_CNTL__MSI_EN_MASK 0x1
+#define MSI_MSG_CNTL__MSI_EN__SHIFT 0x0
+#define MSI_MSG_CNTL__MSI_MULTI_CAP_MASK 0xe
+#define MSI_MSG_CNTL__MSI_MULTI_CAP__SHIFT 0x1
+#define MSI_MSG_CNTL__MSI_MULTI_EN_MASK 0x70
+#define MSI_MSG_CNTL__MSI_MULTI_EN__SHIFT 0x4
+#define MSI_MSG_CNTL__MSI_64BIT_MASK 0x80
+#define MSI_MSG_CNTL__MSI_64BIT__SHIFT 0x7
+#define MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO_MASK 0xfffffffc
+#define MSI_MSG_ADDR_LO__MSI_MSG_ADDR_LO__SHIFT 0x2
+#define MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI_MASK 0xffffffff
+#define MSI_MSG_ADDR_HI__MSI_MSG_ADDR_HI__SHIFT 0x0
+#define MSI_MSG_DATA_64__MSI_DATA_64_MASK 0xffff
+#define MSI_MSG_DATA_64__MSI_DATA_64__SHIFT 0x0
+#define MSI_MSG_DATA__MSI_DATA_MASK 0xffff
+#define MSI_MSG_DATA__MSI_DATA__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_VENDOR_SPECIFIC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID_MASK 0xffff
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_ID__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV_MASK 0xf0000
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_REV__SHIFT 0x10
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH_MASK 0xfff00000
+#define PCIE_VENDOR_SPECIFIC_HDR__VSEC_LENGTH__SHIFT 0x14
+#define PCIE_VENDOR_SPECIFIC1__SCRATCH_MASK 0xffffffff
+#define PCIE_VENDOR_SPECIFIC1__SCRATCH__SHIFT 0x0
+#define PCIE_VENDOR_SPECIFIC2__SCRATCH_MASK 0xffffffff
+#define PCIE_VENDOR_SPECIFIC2__SCRATCH__SHIFT 0x0
+#define PCIE_VC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_VC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_VC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_VC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_VC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_VC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT_MASK 0x7
+#define PCIE_PORT_VC_CAP_REG1__EXT_VC_COUNT__SHIFT 0x0
+#define PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT_MASK 0x70
+#define PCIE_PORT_VC_CAP_REG1__LOW_PRIORITY_EXT_VC_COUNT__SHIFT 0x4
+#define PCIE_PORT_VC_CAP_REG1__REF_CLK_MASK 0x300
+#define PCIE_PORT_VC_CAP_REG1__REF_CLK__SHIFT 0x8
+#define PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE_MASK 0xc00
+#define PCIE_PORT_VC_CAP_REG1__PORT_ARB_TABLE_ENTRY_SIZE__SHIFT 0xa
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP_MASK 0xff
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_CAP__SHIFT 0x0
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_PORT_VC_CAP_REG2__VC_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE_MASK 0x1
+#define PCIE_PORT_VC_CNTL__LOAD_VC_ARB_TABLE__SHIFT 0x0
+#define PCIE_PORT_VC_CNTL__VC_ARB_SELECT_MASK 0xe
+#define PCIE_PORT_VC_CNTL__VC_ARB_SELECT__SHIFT 0x1
+#define PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_PORT_VC_STATUS__VC_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define PCIE_VC0_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define PCIE_VC0_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_VC0_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define PCIE_VC0_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define PCIE_VC0_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define PCIE_VC0_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define PCIE_VC0_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define PCIE_VC0_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define PCIE_VC0_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define PCIE_VC0_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_VC0_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x2
+#define PCIE_VC0_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x1
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP_MASK 0xff
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_CAP__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS_MASK 0x8000
+#define PCIE_VC1_RESOURCE_CAP__REJECT_SNOOP_TRANS__SHIFT 0xf
+#define PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS_MASK 0x3f0000
+#define PCIE_VC1_RESOURCE_CAP__MAX_TIME_SLOTS__SHIFT 0x10
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET_MASK 0xff000000
+#define PCIE_VC1_RESOURCE_CAP__PORT_ARB_TABLE_OFFSET__SHIFT 0x18
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0_MASK 0x1
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC0__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7_MASK 0xfe
+#define PCIE_VC1_RESOURCE_CNTL__TC_VC_MAP_TC1_7__SHIFT 0x1
+#define PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE_MASK 0x10000
+#define PCIE_VC1_RESOURCE_CNTL__LOAD_PORT_ARB_TABLE__SHIFT 0x10
+#define PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT_MASK 0xe0000
+#define PCIE_VC1_RESOURCE_CNTL__PORT_ARB_SELECT__SHIFT 0x11
+#define PCIE_VC1_RESOURCE_CNTL__VC_ID_MASK 0x7000000
+#define PCIE_VC1_RESOURCE_CNTL__VC_ID__SHIFT 0x18
+#define PCIE_VC1_RESOURCE_CNTL__VC_ENABLE_MASK 0x80000000
+#define PCIE_VC1_RESOURCE_CNTL__VC_ENABLE__SHIFT 0x1f
+#define PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS_MASK 0x1
+#define PCIE_VC1_RESOURCE_STATUS__PORT_ARB_TABLE_STATUS__SHIFT 0x0
+#define PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING_MASK 0x2
+#define PCIE_VC1_RESOURCE_STATUS__VC_NEGOTIATION_PENDING__SHIFT 0x1
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_DEV_SERIAL_NUM_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO_MASK 0xffffffff
+#define PCIE_DEV_SERIAL_NUM_DW1__SERIAL_NUMBER_LO__SHIFT 0x0
+#define PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI_MASK 0xffffffff
+#define PCIE_DEV_SERIAL_NUM_DW2__SERIAL_NUMBER_HI__SHIFT 0x0
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_ADV_ERR_RPT_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS_MASK 0x10
+#define PCIE_UNCORR_ERR_STATUS__DLP_ERR_STATUS__SHIFT 0x4
+#define PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS_MASK 0x20
+#define PCIE_UNCORR_ERR_STATUS__SURPDN_ERR_STATUS__SHIFT 0x5
+#define PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS_MASK 0x1000
+#define PCIE_UNCORR_ERR_STATUS__PSN_ERR_STATUS__SHIFT 0xc
+#define PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS_MASK 0x2000
+#define PCIE_UNCORR_ERR_STATUS__FC_ERR_STATUS__SHIFT 0xd
+#define PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS_MASK 0x4000
+#define PCIE_UNCORR_ERR_STATUS__CPL_TIMEOUT_STATUS__SHIFT 0xe
+#define PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS_MASK 0x8000
+#define PCIE_UNCORR_ERR_STATUS__CPL_ABORT_ERR_STATUS__SHIFT 0xf
+#define PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS_MASK 0x10000
+#define PCIE_UNCORR_ERR_STATUS__UNEXP_CPL_STATUS__SHIFT 0x10
+#define PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS_MASK 0x20000
+#define PCIE_UNCORR_ERR_STATUS__RCV_OVFL_STATUS__SHIFT 0x11
+#define PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS_MASK 0x40000
+#define PCIE_UNCORR_ERR_STATUS__MAL_TLP_STATUS__SHIFT 0x12
+#define PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS_MASK 0x80000
+#define PCIE_UNCORR_ERR_STATUS__ECRC_ERR_STATUS__SHIFT 0x13
+#define PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS_MASK 0x100000
+#define PCIE_UNCORR_ERR_STATUS__UNSUPP_REQ_ERR_STATUS__SHIFT 0x14
+#define PCIE_UNCORR_ERR_STATUS__ACS_VIOLATION_STATUS_MASK 0x200000
+#define PCIE_UNCORR_ERR_STATUS__ACS_VIOLATION_STATUS__SHIFT 0x15
+#define PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS_MASK 0x400000
+#define PCIE_UNCORR_ERR_STATUS__UNCORR_INT_ERR_STATUS__SHIFT 0x16
+#define PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS_MASK 0x800000
+#define PCIE_UNCORR_ERR_STATUS__MC_BLOCKED_TLP_STATUS__SHIFT 0x17
+#define PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS_MASK 0x1000000
+#define PCIE_UNCORR_ERR_STATUS__ATOMICOP_EGRESS_BLOCKED_STATUS__SHIFT 0x18
+#define PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS_MASK 0x2000000
+#define PCIE_UNCORR_ERR_STATUS__TLP_PREFIX_BLOCKED_ERR_STATUS__SHIFT 0x19
+#define PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK_MASK 0x10
+#define PCIE_UNCORR_ERR_MASK__DLP_ERR_MASK__SHIFT 0x4
+#define PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK_MASK 0x20
+#define PCIE_UNCORR_ERR_MASK__SURPDN_ERR_MASK__SHIFT 0x5
+#define PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK_MASK 0x1000
+#define PCIE_UNCORR_ERR_MASK__PSN_ERR_MASK__SHIFT 0xc
+#define PCIE_UNCORR_ERR_MASK__FC_ERR_MASK_MASK 0x2000
+#define PCIE_UNCORR_ERR_MASK__FC_ERR_MASK__SHIFT 0xd
+#define PCIE_UNCORR_ERR_MASK__CPL_TIMEOUT_MASK_MASK 0x4000
+#define PCIE_UNCORR_ERR_MASK__CPL_TIMEOUT_MASK__SHIFT 0xe
+#define PCIE_UNCORR_ERR_MASK__CPL_ABORT_ERR_MASK_MASK 0x8000
+#define PCIE_UNCORR_ERR_MASK__CPL_ABORT_ERR_MASK__SHIFT 0xf
+#define PCIE_UNCORR_ERR_MASK__UNEXP_CPL_MASK_MASK 0x10000
+#define PCIE_UNCORR_ERR_MASK__UNEXP_CPL_MASK__SHIFT 0x10
+#define PCIE_UNCORR_ERR_MASK__RCV_OVFL_MASK_MASK 0x20000
+#define PCIE_UNCORR_ERR_MASK__RCV_OVFL_MASK__SHIFT 0x11
+#define PCIE_UNCORR_ERR_MASK__MAL_TLP_MASK_MASK 0x40000
+#define PCIE_UNCORR_ERR_MASK__MAL_TLP_MASK__SHIFT 0x12
+#define PCIE_UNCORR_ERR_MASK__ECRC_ERR_MASK_MASK 0x80000
+#define PCIE_UNCORR_ERR_MASK__ECRC_ERR_MASK__SHIFT 0x13
+#define PCIE_UNCORR_ERR_MASK__UNSUPP_REQ_ERR_MASK_MASK 0x100000
+#define PCIE_UNCORR_ERR_MASK__UNSUPP_REQ_ERR_MASK__SHIFT 0x14
+#define PCIE_UNCORR_ERR_MASK__ACS_VIOLATION_MASK_MASK 0x200000
+#define PCIE_UNCORR_ERR_MASK__ACS_VIOLATION_MASK__SHIFT 0x15
+#define PCIE_UNCORR_ERR_MASK__UNCORR_INT_ERR_MASK_MASK 0x400000
+#define PCIE_UNCORR_ERR_MASK__UNCORR_INT_ERR_MASK__SHIFT 0x16
+#define PCIE_UNCORR_ERR_MASK__MC_BLOCKED_TLP_MASK_MASK 0x800000
+#define PCIE_UNCORR_ERR_MASK__MC_BLOCKED_TLP_MASK__SHIFT 0x17
+#define PCIE_UNCORR_ERR_MASK__ATOMICOP_EGRESS_BLOCKED_MASK_MASK 0x1000000
+#define PCIE_UNCORR_ERR_MASK__ATOMICOP_EGRESS_BLOCKED_MASK__SHIFT 0x18
+#define PCIE_UNCORR_ERR_MASK__TLP_PREFIX_BLOCKED_ERR_MASK_MASK 0x2000000
+#define PCIE_UNCORR_ERR_MASK__TLP_PREFIX_BLOCKED_ERR_MASK__SHIFT 0x19
+#define PCIE_UNCORR_ERR_SEVERITY__DLP_ERR_SEVERITY_MASK 0x10
+#define PCIE_UNCORR_ERR_SEVERITY__DLP_ERR_SEVERITY__SHIFT 0x4
+#define PCIE_UNCORR_ERR_SEVERITY__SURPDN_ERR_SEVERITY_MASK 0x20
+#define PCIE_UNCORR_ERR_SEVERITY__SURPDN_ERR_SEVERITY__SHIFT 0x5
+#define PCIE_UNCORR_ERR_SEVERITY__PSN_ERR_SEVERITY_MASK 0x1000
+#define PCIE_UNCORR_ERR_SEVERITY__PSN_ERR_SEVERITY__SHIFT 0xc
+#define PCIE_UNCORR_ERR_SEVERITY__FC_ERR_SEVERITY_MASK 0x2000
+#define PCIE_UNCORR_ERR_SEVERITY__FC_ERR_SEVERITY__SHIFT 0xd
+#define PCIE_UNCORR_ERR_SEVERITY__CPL_TIMEOUT_SEVERITY_MASK 0x4000
+#define PCIE_UNCORR_ERR_SEVERITY__CPL_TIMEOUT_SEVERITY__SHIFT 0xe
+#define PCIE_UNCORR_ERR_SEVERITY__CPL_ABORT_ERR_SEVERITY_MASK 0x8000
+#define PCIE_UNCORR_ERR_SEVERITY__CPL_ABORT_ERR_SEVERITY__SHIFT 0xf
+#define PCIE_UNCORR_ERR_SEVERITY__UNEXP_CPL_SEVERITY_MASK 0x10000
+#define PCIE_UNCORR_ERR_SEVERITY__UNEXP_CPL_SEVERITY__SHIFT 0x10
+#define PCIE_UNCORR_ERR_SEVERITY__RCV_OVFL_SEVERITY_MASK 0x20000
+#define PCIE_UNCORR_ERR_SEVERITY__RCV_OVFL_SEVERITY__SHIFT 0x11
+#define PCIE_UNCORR_ERR_SEVERITY__MAL_TLP_SEVERITY_MASK 0x40000
+#define PCIE_UNCORR_ERR_SEVERITY__MAL_TLP_SEVERITY__SHIFT 0x12
+#define PCIE_UNCORR_ERR_SEVERITY__ECRC_ERR_SEVERITY_MASK 0x80000
+#define PCIE_UNCORR_ERR_SEVERITY__ECRC_ERR_SEVERITY__SHIFT 0x13
+#define PCIE_UNCORR_ERR_SEVERITY__UNSUPP_REQ_ERR_SEVERITY_MASK 0x100000
+#define PCIE_UNCORR_ERR_SEVERITY__UNSUPP_REQ_ERR_SEVERITY__SHIFT 0x14
+#define PCIE_UNCORR_ERR_SEVERITY__ACS_VIOLATION_SEVERITY_MASK 0x200000
+#define PCIE_UNCORR_ERR_SEVERITY__ACS_VIOLATION_SEVERITY__SHIFT 0x15
+#define PCIE_UNCORR_ERR_SEVERITY__UNCORR_INT_ERR_SEVERITY_MASK 0x400000
+#define PCIE_UNCORR_ERR_SEVERITY__UNCORR_INT_ERR_SEVERITY__SHIFT 0x16
+#define PCIE_UNCORR_ERR_SEVERITY__MC_BLOCKED_TLP_SEVERITY_MASK 0x800000
+#define PCIE_UNCORR_ERR_SEVERITY__MC_BLOCKED_TLP_SEVERITY__SHIFT 0x17
+#define PCIE_UNCORR_ERR_SEVERITY__ATOMICOP_EGRESS_BLOCKED_SEVERITY_MASK 0x1000000
+#define PCIE_UNCORR_ERR_SEVERITY__ATOMICOP_EGRESS_BLOCKED_SEVERITY__SHIFT 0x18
+#define PCIE_UNCORR_ERR_SEVERITY__TLP_PREFIX_BLOCKED_ERR_SEVERITY_MASK 0x2000000
+#define PCIE_UNCORR_ERR_SEVERITY__TLP_PREFIX_BLOCKED_ERR_SEVERITY__SHIFT 0x19
+#define PCIE_CORR_ERR_STATUS__RCV_ERR_STATUS_MASK 0x1
+#define PCIE_CORR_ERR_STATUS__RCV_ERR_STATUS__SHIFT 0x0
+#define PCIE_CORR_ERR_STATUS__BAD_TLP_STATUS_MASK 0x40
+#define PCIE_CORR_ERR_STATUS__BAD_TLP_STATUS__SHIFT 0x6
+#define PCIE_CORR_ERR_STATUS__BAD_DLLP_STATUS_MASK 0x80
+#define PCIE_CORR_ERR_STATUS__BAD_DLLP_STATUS__SHIFT 0x7
+#define PCIE_CORR_ERR_STATUS__REPLAY_NUM_ROLLOVER_STATUS_MASK 0x100
+#define PCIE_CORR_ERR_STATUS__REPLAY_NUM_ROLLOVER_STATUS__SHIFT 0x8
+#define PCIE_CORR_ERR_STATUS__REPLAY_TIMER_TIMEOUT_STATUS_MASK 0x1000
+#define PCIE_CORR_ERR_STATUS__REPLAY_TIMER_TIMEOUT_STATUS__SHIFT 0xc
+#define PCIE_CORR_ERR_STATUS__ADVISORY_NONFATAL_ERR_STATUS_MASK 0x2000
+#define PCIE_CORR_ERR_STATUS__ADVISORY_NONFATAL_ERR_STATUS__SHIFT 0xd
+#define PCIE_CORR_ERR_STATUS__CORR_INT_ERR_STATUS_MASK 0x4000
+#define PCIE_CORR_ERR_STATUS__CORR_INT_ERR_STATUS__SHIFT 0xe
+#define PCIE_CORR_ERR_STATUS__HDR_LOG_OVFL_STATUS_MASK 0x8000
+#define PCIE_CORR_ERR_STATUS__HDR_LOG_OVFL_STATUS__SHIFT 0xf
+#define PCIE_CORR_ERR_MASK__RCV_ERR_MASK_MASK 0x1
+#define PCIE_CORR_ERR_MASK__RCV_ERR_MASK__SHIFT 0x0
+#define PCIE_CORR_ERR_MASK__BAD_TLP_MASK_MASK 0x40
+#define PCIE_CORR_ERR_MASK__BAD_TLP_MASK__SHIFT 0x6
+#define PCIE_CORR_ERR_MASK__BAD_DLLP_MASK_MASK 0x80
+#define PCIE_CORR_ERR_MASK__BAD_DLLP_MASK__SHIFT 0x7
+#define PCIE_CORR_ERR_MASK__REPLAY_NUM_ROLLOVER_MASK_MASK 0x100
+#define PCIE_CORR_ERR_MASK__REPLAY_NUM_ROLLOVER_MASK__SHIFT 0x8
+#define PCIE_CORR_ERR_MASK__REPLAY_TIMER_TIMEOUT_MASK_MASK 0x1000
+#define PCIE_CORR_ERR_MASK__REPLAY_TIMER_TIMEOUT_MASK__SHIFT 0xc
+#define PCIE_CORR_ERR_MASK__ADVISORY_NONFATAL_ERR_MASK_MASK 0x2000
+#define PCIE_CORR_ERR_MASK__ADVISORY_NONFATAL_ERR_MASK__SHIFT 0xd
+#define PCIE_CORR_ERR_MASK__CORR_INT_ERR_MASK_MASK 0x4000
+#define PCIE_CORR_ERR_MASK__CORR_INT_ERR_MASK__SHIFT 0xe
+#define PCIE_CORR_ERR_MASK__HDR_LOG_OVFL_MASK_MASK 0x8000
+#define PCIE_CORR_ERR_MASK__HDR_LOG_OVFL_MASK__SHIFT 0xf
+#define PCIE_ADV_ERR_CAP_CNTL__FIRST_ERR_PTR_MASK 0x1f
+#define PCIE_ADV_ERR_CAP_CNTL__FIRST_ERR_PTR__SHIFT 0x0
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_CAP_MASK 0x20
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_CAP__SHIFT 0x5
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_EN_MASK 0x40
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_GEN_EN__SHIFT 0x6
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_CAP_MASK 0x80
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_CAP__SHIFT 0x7
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_EN_MASK 0x100
+#define PCIE_ADV_ERR_CAP_CNTL__ECRC_CHECK_EN__SHIFT 0x8
+#define PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_CAP_MASK 0x200
+#define PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_CAP__SHIFT 0x9
+#define PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_EN_MASK 0x400
+#define PCIE_ADV_ERR_CAP_CNTL__MULTI_HDR_RECD_EN__SHIFT 0xa
+#define PCIE_ADV_ERR_CAP_CNTL__TLP_PREFIX_LOG_PRESENT_MASK 0x800
+#define PCIE_ADV_ERR_CAP_CNTL__TLP_PREFIX_LOG_PRESENT__SHIFT 0xb
+#define PCIE_HDR_LOG0__TLP_HDR_MASK 0xffffffff
+#define PCIE_HDR_LOG0__TLP_HDR__SHIFT 0x0
+#define PCIE_HDR_LOG1__TLP_HDR_MASK 0xffffffff
+#define PCIE_HDR_LOG1__TLP_HDR__SHIFT 0x0
+#define PCIE_HDR_LOG2__TLP_HDR_MASK 0xffffffff
+#define PCIE_HDR_LOG2__TLP_HDR__SHIFT 0x0
+#define PCIE_HDR_LOG3__TLP_HDR_MASK 0xffffffff
+#define PCIE_HDR_LOG3__TLP_HDR__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG0__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG0__TLP_PREFIX__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG1__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG1__TLP_PREFIX__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG2__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG2__TLP_PREFIX__SHIFT 0x0
+#define PCIE_TLP_PREFIX_LOG3__TLP_PREFIX_MASK 0xffffffff
+#define PCIE_TLP_PREFIX_LOG3__TLP_PREFIX__SHIFT 0x0
+#define PCIE_BAR_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_BAR_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_BAR_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_BAR_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_BAR_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_BAR_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_BAR1_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR1_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR1_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR1_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR1_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR1_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR1_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR1_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR2_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR2_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR2_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR2_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR2_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR2_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR2_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR2_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR3_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR3_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR3_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR3_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR3_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR3_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR3_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR3_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR4_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR4_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR4_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR4_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR4_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR4_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR4_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR4_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR5_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR5_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR5_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR5_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR5_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR5_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR5_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR5_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_BAR6_CAP__BAR_SIZE_SUPPORTED_MASK 0xfffff0
+#define PCIE_BAR6_CAP__BAR_SIZE_SUPPORTED__SHIFT 0x4
+#define PCIE_BAR6_CNTL__BAR_INDEX_MASK 0x7
+#define PCIE_BAR6_CNTL__BAR_INDEX__SHIFT 0x0
+#define PCIE_BAR6_CNTL__BAR_TOTAL_NUM_MASK 0xe0
+#define PCIE_BAR6_CNTL__BAR_TOTAL_NUM__SHIFT 0x5
+#define PCIE_BAR6_CNTL__BAR_SIZE_MASK 0x1f00
+#define PCIE_BAR6_CNTL__BAR_SIZE__SHIFT 0x8
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_PWR_BUDGET_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_PWR_BUDGET_DATA_SELECT__DATA_SELECT_MASK 0xff
+#define PCIE_PWR_BUDGET_DATA_SELECT__DATA_SELECT__SHIFT 0x0
+#define PCIE_PWR_BUDGET_DATA__BASE_POWER_MASK 0xff
+#define PCIE_PWR_BUDGET_DATA__BASE_POWER__SHIFT 0x0
+#define PCIE_PWR_BUDGET_DATA__DATA_SCALE_MASK 0x300
+#define PCIE_PWR_BUDGET_DATA__DATA_SCALE__SHIFT 0x8
+#define PCIE_PWR_BUDGET_DATA__PM_SUB_STATE_MASK 0x1c00
+#define PCIE_PWR_BUDGET_DATA__PM_SUB_STATE__SHIFT 0xa
+#define PCIE_PWR_BUDGET_DATA__PM_STATE_MASK 0x6000
+#define PCIE_PWR_BUDGET_DATA__PM_STATE__SHIFT 0xd
+#define PCIE_PWR_BUDGET_DATA__TYPE_MASK 0x38000
+#define PCIE_PWR_BUDGET_DATA__TYPE__SHIFT 0xf
+#define PCIE_PWR_BUDGET_DATA__POWER_RAIL_MASK 0x1c0000
+#define PCIE_PWR_BUDGET_DATA__POWER_RAIL__SHIFT 0x12
+#define PCIE_PWR_BUDGET_CAP__SYSTEM_ALLOCATED_MASK 0x1
+#define PCIE_PWR_BUDGET_CAP__SYSTEM_ALLOCATED__SHIFT 0x0
+#define PCIE_DPA_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_DPA_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_DPA_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_DPA_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_DPA_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_DPA_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_DPA_CAP__SUBSTATE_MAX_MASK 0x1f
+#define PCIE_DPA_CAP__SUBSTATE_MAX__SHIFT 0x0
+#define PCIE_DPA_CAP__TRANS_LAT_UNIT_MASK 0x300
+#define PCIE_DPA_CAP__TRANS_LAT_UNIT__SHIFT 0x8
+#define PCIE_DPA_CAP__PWR_ALLOC_SCALE_MASK 0x3000
+#define PCIE_DPA_CAP__PWR_ALLOC_SCALE__SHIFT 0xc
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_0_MASK 0xff0000
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_0__SHIFT 0x10
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_1_MASK 0xff000000
+#define PCIE_DPA_CAP__TRANS_LAT_VAL_1__SHIFT 0x18
+#define PCIE_DPA_LATENCY_INDICATOR__TRANS_LAT_INDICATOR_BITS_MASK 0xff
+#define PCIE_DPA_LATENCY_INDICATOR__TRANS_LAT_INDICATOR_BITS__SHIFT 0x0
+#define PCIE_DPA_STATUS__SUBSTATE_STATUS_MASK 0x1f
+#define PCIE_DPA_STATUS__SUBSTATE_STATUS__SHIFT 0x0
+#define PCIE_DPA_STATUS__SUBSTATE_CNTL_ENABLED_MASK 0x100
+#define PCIE_DPA_STATUS__SUBSTATE_CNTL_ENABLED__SHIFT 0x8
+#define PCIE_DPA_CNTL__SUBSTATE_CNTL_MASK 0x1f
+#define PCIE_DPA_CNTL__SUBSTATE_CNTL__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_0__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_0__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_1__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_2__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_3__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_4__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_5__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_6__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_7__SUBSTATE_PWR_ALLOC_MASK 0xff
+#define PCIE_DPA_SUBSTATE_PWR_ALLOC_7__SUBSTATE_PWR_ALLOC__SHIFT 0x0
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_SECONDARY_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_SECONDARY_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_LINK_CNTL3__PERFORM_EQUALIZATION_MASK 0x1
+#define PCIE_LINK_CNTL3__PERFORM_EQUALIZATION__SHIFT 0x0
+#define PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN_MASK 0x2
+#define PCIE_LINK_CNTL3__LINK_EQUALIZATION_REQ_INT_EN__SHIFT 0x1
+#define PCIE_LINK_CNTL3__RESERVED_MASK 0xfffffffc
+#define PCIE_LINK_CNTL3__RESERVED__SHIFT 0x2
+#define PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS_MASK 0xffff
+#define PCIE_LANE_ERROR_STATUS__LANE_ERROR_STATUS_BITS__SHIFT 0x0
+#define PCIE_LANE_ERROR_STATUS__RESERVED_MASK 0xffff0000
+#define PCIE_LANE_ERROR_STATUS__RESERVED__SHIFT 0x10
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_0_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_0_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_0_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_1_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_1_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_1_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_2_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_2_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_2_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_3_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_3_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_3_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_4_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_4_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_4_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_5_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_5_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_5_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_6_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_6_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_6_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_7_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_7_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_7_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_8_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_8_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_8_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_9_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_9_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_9_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_9_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_10_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_10_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_10_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_10_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_11_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_11_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_11_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_11_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_12_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_12_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_12_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_13_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_13_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_13_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_14_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_14_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_14_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET_MASK 0xf
+#define PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_TX_PRESET__SHIFT 0x0
+#define PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT_MASK 0x70
+#define PCIE_LANE_15_EQUALIZATION_CNTL__DOWNSTREAM_PORT_RX_PRESET_HINT__SHIFT 0x4
+#define PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET_MASK 0xf00
+#define PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_TX_PRESET__SHIFT 0x8
+#define PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT_MASK 0x7000
+#define PCIE_LANE_15_EQUALIZATION_CNTL__UPSTREAM_PORT_RX_PRESET_HINT__SHIFT 0xc
+#define PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED_MASK 0x8000
+#define PCIE_LANE_15_EQUALIZATION_CNTL__RESERVED__SHIFT 0xf
+#define PCIE_ACS_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_ACS_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_ACS_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_ACS_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_ACS_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_ACS_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_ACS_CAP__SOURCE_VALIDATION_MASK 0x1
+#define PCIE_ACS_CAP__SOURCE_VALIDATION__SHIFT 0x0
+#define PCIE_ACS_CAP__TRANSLATION_BLOCKING_MASK 0x2
+#define PCIE_ACS_CAP__TRANSLATION_BLOCKING__SHIFT 0x1
+#define PCIE_ACS_CAP__P2P_REQUEST_REDIRECT_MASK 0x4
+#define PCIE_ACS_CAP__P2P_REQUEST_REDIRECT__SHIFT 0x2
+#define PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT_MASK 0x8
+#define PCIE_ACS_CAP__P2P_COMPLETION_REDIRECT__SHIFT 0x3
+#define PCIE_ACS_CAP__UPSTREAM_FORWARDING_MASK 0x10
+#define PCIE_ACS_CAP__UPSTREAM_FORWARDING__SHIFT 0x4
+#define PCIE_ACS_CAP__P2P_EGRESS_CONTROL_MASK 0x20
+#define PCIE_ACS_CAP__P2P_EGRESS_CONTROL__SHIFT 0x5
+#define PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P_MASK 0x40
+#define PCIE_ACS_CAP__DIRECT_TRANSLATED_P2P__SHIFT 0x6
+#define PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE_MASK 0xff00
+#define PCIE_ACS_CAP__EGRESS_CONTROL_VECTOR_SIZE__SHIFT 0x8
+#define PCIE_ACS_CNTL__SOURCE_VALIDATION_EN_MASK 0x1
+#define PCIE_ACS_CNTL__SOURCE_VALIDATION_EN__SHIFT 0x0
+#define PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN_MASK 0x2
+#define PCIE_ACS_CNTL__TRANSLATION_BLOCKING_EN__SHIFT 0x1
+#define PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN_MASK 0x4
+#define PCIE_ACS_CNTL__P2P_REQUEST_REDIRECT_EN__SHIFT 0x2
+#define PCIE_ACS_CNTL__P2P_COMPLETION_REDIRECT_EN_MASK 0x8
+#define PCIE_ACS_CNTL__P2P_COMPLETION_REDIRECT_EN__SHIFT 0x3
+#define PCIE_ACS_CNTL__UPSTREAM_FORWARDING_EN_MASK 0x10
+#define PCIE_ACS_CNTL__UPSTREAM_FORWARDING_EN__SHIFT 0x4
+#define PCIE_ACS_CNTL__P2P_EGRESS_CONTROL_EN_MASK 0x20
+#define PCIE_ACS_CNTL__P2P_EGRESS_CONTROL_EN__SHIFT 0x5
+#define PCIE_ACS_CNTL__DIRECT_TRANSLATED_P2P_EN_MASK 0x40
+#define PCIE_ACS_CNTL__DIRECT_TRANSLATED_P2P_EN__SHIFT 0x6
+#define PCIE_ATS_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_ATS_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_ATS_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_ATS_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_ATS_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_ATS_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_ATS_CAP__INVALIDATE_Q_DEPTH_MASK 0x1f
+#define PCIE_ATS_CAP__INVALIDATE_Q_DEPTH__SHIFT 0x0
+#define PCIE_ATS_CAP__PAGE_ALIGNED_REQUEST_MASK 0x20
+#define PCIE_ATS_CAP__PAGE_ALIGNED_REQUEST__SHIFT 0x5
+#define PCIE_ATS_CAP__GLOBAL_INVALIDATE_SUPPORTED_MASK 0x40
+#define PCIE_ATS_CAP__GLOBAL_INVALIDATE_SUPPORTED__SHIFT 0x6
+#define PCIE_ATS_CNTL__STU_MASK 0x1f
+#define PCIE_ATS_CNTL__STU__SHIFT 0x0
+#define PCIE_ATS_CNTL__ATC_ENABLE_MASK 0x8000
+#define PCIE_ATS_CNTL__ATC_ENABLE__SHIFT 0xf
+#define PCIE_PAGE_REQ_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_PAGE_REQ_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_PAGE_REQ_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_PAGE_REQ_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_PAGE_REQ_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_PAGE_REQ_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_PAGE_REQ_CNTL__PRI_ENABLE_MASK 0x1
+#define PCIE_PAGE_REQ_CNTL__PRI_ENABLE__SHIFT 0x0
+#define PCIE_PAGE_REQ_CNTL__PRI_RESET_MASK 0x2
+#define PCIE_PAGE_REQ_CNTL__PRI_RESET__SHIFT 0x1
+#define PCIE_PAGE_REQ_STATUS__RESPONSE_FAILURE_MASK 0x1
+#define PCIE_PAGE_REQ_STATUS__RESPONSE_FAILURE__SHIFT 0x0
+#define PCIE_PAGE_REQ_STATUS__UNEXPECTED_PAGE_REQ_GRP_INDEX_MASK 0x2
+#define PCIE_PAGE_REQ_STATUS__UNEXPECTED_PAGE_REQ_GRP_INDEX__SHIFT 0x1
+#define PCIE_PAGE_REQ_STATUS__STOPPED_MASK 0x100
+#define PCIE_PAGE_REQ_STATUS__STOPPED__SHIFT 0x8
+#define PCIE_PAGE_REQ_STATUS__PRG_RESPONSE_PASID_REQUIRED_MASK 0x8000
+#define PCIE_PAGE_REQ_STATUS__PRG_RESPONSE_PASID_REQUIRED__SHIFT 0xf
+#define PCIE_OUTSTAND_PAGE_REQ_CAPACITY__OUTSTAND_PAGE_REQ_CAPACITY_MASK 0xffffffff
+#define PCIE_OUTSTAND_PAGE_REQ_CAPACITY__OUTSTAND_PAGE_REQ_CAPACITY__SHIFT 0x0
+#define PCIE_OUTSTAND_PAGE_REQ_ALLOC__OUTSTAND_PAGE_REQ_ALLOC_MASK 0xffffffff
+#define PCIE_OUTSTAND_PAGE_REQ_ALLOC__OUTSTAND_PAGE_REQ_ALLOC__SHIFT 0x0
+#define PCIE_PASID_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_PASID_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_PASID_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_PASID_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_PASID_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_PASID_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_PASID_CAP__PASID_EXE_PERMISSION_SUPPORTED_MASK 0x2
+#define PCIE_PASID_CAP__PASID_EXE_PERMISSION_SUPPORTED__SHIFT 0x1
+#define PCIE_PASID_CAP__PASID_PRIV_MODE_SUPPORTED_MASK 0x4
+#define PCIE_PASID_CAP__PASID_PRIV_MODE_SUPPORTED__SHIFT 0x2
+#define PCIE_PASID_CAP__MAX_PASID_WIDTH_MASK 0x1f00
+#define PCIE_PASID_CAP__MAX_PASID_WIDTH__SHIFT 0x8
+#define PCIE_PASID_CNTL__PASID_ENABLE_MASK 0x1
+#define PCIE_PASID_CNTL__PASID_ENABLE__SHIFT 0x0
+#define PCIE_PASID_CNTL__PASID_EXE_PERMISSION_ENABLE_MASK 0x2
+#define PCIE_PASID_CNTL__PASID_EXE_PERMISSION_ENABLE__SHIFT 0x1
+#define PCIE_PASID_CNTL__PASID_PRIV_MODE_SUPPORTED_ENABLE_MASK 0x4
+#define PCIE_PASID_CNTL__PASID_PRIV_MODE_SUPPORTED_ENABLE__SHIFT 0x2
+#define PCIE_TPH_REQR_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_TPH_REQR_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_TPH_REQR_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_TPH_REQR_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_TPH_REQR_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_TPH_REQR_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_TPH_REQR_CAP__TPH_REQR_NO_ST_MODE_SUPPORTED_MASK 0x1
+#define PCIE_TPH_REQR_CAP__TPH_REQR_NO_ST_MODE_SUPPORTED__SHIFT 0x0
+#define PCIE_TPH_REQR_CAP__TPH_REQR_INT_VEC_MODE_SUPPORTED_MASK 0x2
+#define PCIE_TPH_REQR_CAP__TPH_REQR_INT_VEC_MODE_SUPPORTED__SHIFT 0x1
+#define PCIE_TPH_REQR_CAP__TPH_REQR_DEV_SPC_MODE_SUPPORTED_MASK 0x4
+#define PCIE_TPH_REQR_CAP__TPH_REQR_DEV_SPC_MODE_SUPPORTED__SHIFT 0x2
+#define PCIE_TPH_REQR_CAP__TPH_REQR_EXTND_TPH_REQR_SUPPORED_MASK 0x100
+#define PCIE_TPH_REQR_CAP__TPH_REQR_EXTND_TPH_REQR_SUPPORED__SHIFT 0x8
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_LOCATION_MASK 0x600
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_LOCATION__SHIFT 0x9
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_SIZE_MASK 0x7ff0000
+#define PCIE_TPH_REQR_CAP__TPH_REQR_ST_TABLE_SIZE__SHIFT 0x10
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_ST_MODE_SEL_MASK 0x7
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_ST_MODE_SEL__SHIFT 0x0
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_EN_MASK 0x300
+#define PCIE_TPH_REQR_CNTL__TPH_REQR_EN__SHIFT 0x8
+#define PCIE_MC_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_MC_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_MC_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_MC_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_MC_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_MC_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_MC_CAP__MC_MAX_GROUP_MASK 0x3f
+#define PCIE_MC_CAP__MC_MAX_GROUP__SHIFT 0x0
+#define PCIE_MC_CAP__MC_WIN_SIZE_REQ_MASK 0x3f00
+#define PCIE_MC_CAP__MC_WIN_SIZE_REQ__SHIFT 0x8
+#define PCIE_MC_CAP__MC_ECRC_REGEN_SUPP_MASK 0x8000
+#define PCIE_MC_CAP__MC_ECRC_REGEN_SUPP__SHIFT 0xf
+#define PCIE_MC_CNTL__MC_NUM_GROUP_MASK 0x3f
+#define PCIE_MC_CNTL__MC_NUM_GROUP__SHIFT 0x0
+#define PCIE_MC_CNTL__MC_ENABLE_MASK 0x8000
+#define PCIE_MC_CNTL__MC_ENABLE__SHIFT 0xf
+#define PCIE_MC_ADDR0__MC_INDEX_POS_MASK 0x3f
+#define PCIE_MC_ADDR0__MC_INDEX_POS__SHIFT 0x0
+#define PCIE_MC_ADDR0__MC_BASE_ADDR_0_MASK 0xfffff000
+#define PCIE_MC_ADDR0__MC_BASE_ADDR_0__SHIFT 0xc
+#define PCIE_MC_ADDR1__MC_BASE_ADDR_1_MASK 0xffffffff
+#define PCIE_MC_ADDR1__MC_BASE_ADDR_1__SHIFT 0x0
+#define PCIE_MC_RCV0__MC_RECEIVE_0_MASK 0xffffffff
+#define PCIE_MC_RCV0__MC_RECEIVE_0__SHIFT 0x0
+#define PCIE_MC_RCV1__MC_RECEIVE_1_MASK 0xffffffff
+#define PCIE_MC_RCV1__MC_RECEIVE_1__SHIFT 0x0
+#define PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0_MASK 0xffffffff
+#define PCIE_MC_BLOCK_ALL0__MC_BLOCK_ALL_0__SHIFT 0x0
+#define PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1_MASK 0xffffffff
+#define PCIE_MC_BLOCK_ALL1__MC_BLOCK_ALL_1__SHIFT 0x0
+#define PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0_MASK 0xffffffff
+#define PCIE_MC_BLOCK_UNTRANSLATED_0__MC_BLOCK_UNTRANSLATED_0__SHIFT 0x0
+#define PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1_MASK 0xffffffff
+#define PCIE_MC_BLOCK_UNTRANSLATED_1__MC_BLOCK_UNTRANSLATED_1__SHIFT 0x0
+#define PCIE_LTR_ENH_CAP_LIST__CAP_ID_MASK 0xffff
+#define PCIE_LTR_ENH_CAP_LIST__CAP_ID__SHIFT 0x0
+#define PCIE_LTR_ENH_CAP_LIST__CAP_VER_MASK 0xf0000
+#define PCIE_LTR_ENH_CAP_LIST__CAP_VER__SHIFT 0x10
+#define PCIE_LTR_ENH_CAP_LIST__NEXT_PTR_MASK 0xfff00000
+#define PCIE_LTR_ENH_CAP_LIST__NEXT_PTR__SHIFT 0x14
+#define PCIE_LTR_CAP__LTR_MAX_S_LATENCY_VALUE_MASK 0x3ff
+#define PCIE_LTR_CAP__LTR_MAX_S_LATENCY_VALUE__SHIFT 0x0
+#define PCIE_LTR_CAP__LTR_MAX_S_LATENCY_SCALE_MASK 0x1c00
+#define PCIE_LTR_CAP__LTR_MAX_S_LATENCY_SCALE__SHIFT 0xa
+#define PCIE_LTR_CAP__LTR_MAX_NS_LATENCY_VALUE_MASK 0x3ff0000
+#define PCIE_LTR_CAP__LTR_MAX_NS_LATENCY_VALUE__SHIFT 0x10
+#define PCIE_LTR_CAP__LTR_MAX_NS_LATENCY_SCALE_MASK 0x1c000000
+#define PCIE_LTR_CAP__LTR_MAX_NS_LATENCY_SCALE__SHIFT 0x1a
+#define MM_INDEX_IND__MM_OFFSET_MASK 0x7fffffff
+#define MM_INDEX_IND__MM_OFFSET__SHIFT 0x0
+#define MM_INDEX_IND__MM_APER_MASK 0x80000000
+#define MM_INDEX_IND__MM_APER__SHIFT 0x1f
+#define MM_INDEX_HI_IND__MM_OFFSET_HI_MASK 0xffffffff
+#define MM_INDEX_HI_IND__MM_OFFSET_HI__SHIFT 0x0
+#define MM_DATA_IND__MM_DATA_MASK 0xffffffff
+#define MM_DATA_IND__MM_DATA__SHIFT 0x0
+#define BIF_MM_INDACCESS_CNTL_IND__MM_INDACCESS_DIS_MASK 0x2
+#define BIF_MM_INDACCESS_CNTL_IND__MM_INDACCESS_DIS__SHIFT 0x1
+#define BUS_CNTL_IND__BIOS_ROM_WRT_EN_MASK 0x1
+#define BUS_CNTL_IND__BIOS_ROM_WRT_EN__SHIFT 0x0
+#define BUS_CNTL_IND__BIOS_ROM_DIS_MASK 0x2
+#define BUS_CNTL_IND__BIOS_ROM_DIS__SHIFT 0x1
+#define BUS_CNTL_IND__PMI_IO_DIS_MASK 0x4
+#define BUS_CNTL_IND__PMI_IO_DIS__SHIFT 0x2
+#define BUS_CNTL_IND__PMI_MEM_DIS_MASK 0x8
+#define BUS_CNTL_IND__PMI_MEM_DIS__SHIFT 0x3
+#define BUS_CNTL_IND__PMI_BM_DIS_MASK 0x10
+#define BUS_CNTL_IND__PMI_BM_DIS__SHIFT 0x4
+#define BUS_CNTL_IND__PMI_INT_DIS_MASK 0x20
+#define BUS_CNTL_IND__PMI_INT_DIS__SHIFT 0x5
+#define BUS_CNTL_IND__VGA_REG_COHERENCY_DIS_MASK 0x40
+#define BUS_CNTL_IND__VGA_REG_COHERENCY_DIS__SHIFT 0x6
+#define BUS_CNTL_IND__VGA_MEM_COHERENCY_DIS_MASK 0x80
+#define BUS_CNTL_IND__VGA_MEM_COHERENCY_DIS__SHIFT 0x7
+#define BUS_CNTL_IND__BIF_ERR_RTR_BKPRESSURE_EN_MASK 0x100
+#define BUS_CNTL_IND__BIF_ERR_RTR_BKPRESSURE_EN__SHIFT 0x8
+#define BUS_CNTL_IND__SET_AZ_TC_MASK 0x1c00
+#define BUS_CNTL_IND__SET_AZ_TC__SHIFT 0xa
+#define BUS_CNTL_IND__SET_MC_TC_MASK 0xe000
+#define BUS_CNTL_IND__SET_MC_TC__SHIFT 0xd
+#define BUS_CNTL_IND__ZERO_BE_WR_EN_MASK 0x10000
+#define BUS_CNTL_IND__ZERO_BE_WR_EN__SHIFT 0x10
+#define BUS_CNTL_IND__ZERO_BE_RD_EN_MASK 0x20000
+#define BUS_CNTL_IND__ZERO_BE_RD_EN__SHIFT 0x11
+#define BUS_CNTL_IND__RD_STALL_IO_WR_MASK 0x40000
+#define BUS_CNTL_IND__RD_STALL_IO_WR__SHIFT 0x12
+#define CONFIG_CNTL_IND__CFG_VGA_RAM_EN_MASK 0x1
+#define CONFIG_CNTL_IND__CFG_VGA_RAM_EN__SHIFT 0x0
+#define CONFIG_CNTL_IND__VGA_DIS_MASK 0x2
+#define CONFIG_CNTL_IND__VGA_DIS__SHIFT 0x1
+#define CONFIG_CNTL_IND__GENMO_MONO_ADDRESS_B_MASK 0x4
+#define CONFIG_CNTL_IND__GENMO_MONO_ADDRESS_B__SHIFT 0x2
+#define CONFIG_CNTL_IND__GRPH_ADRSEL_MASK 0x18
+#define CONFIG_CNTL_IND__GRPH_ADRSEL__SHIFT 0x3
+#define CONFIG_MEMSIZE_IND__CONFIG_MEMSIZE_MASK 0xffffffff
+#define CONFIG_MEMSIZE_IND__CONFIG_MEMSIZE__SHIFT 0x0
+#define CONFIG_F0_BASE_IND__F0_BASE_MASK 0xffffffff
+#define CONFIG_F0_BASE_IND__F0_BASE__SHIFT 0x0
+#define CONFIG_APER_SIZE_IND__APER_SIZE_MASK 0xffffffff
+#define CONFIG_APER_SIZE_IND__APER_SIZE__SHIFT 0x0
+#define CONFIG_REG_APER_SIZE_IND__REG_APER_SIZE_MASK 0xfffff
+#define CONFIG_REG_APER_SIZE_IND__REG_APER_SIZE__SHIFT 0x0
+#define BIF_SCRATCH0_IND__BIF_SCRATCH0_MASK 0xffffffff
+#define BIF_SCRATCH0_IND__BIF_SCRATCH0__SHIFT 0x0
+#define BIF_SCRATCH1_IND__BIF_SCRATCH1_MASK 0xffffffff
+#define BIF_SCRATCH1_IND__BIF_SCRATCH1__SHIFT 0x0
+#define BX_RESET_EN_IND__COR_RESET_EN_MASK 0x1
+#define BX_RESET_EN_IND__COR_RESET_EN__SHIFT 0x0
+#define BX_RESET_EN_IND__REG_RESET_EN_MASK 0x2
+#define BX_RESET_EN_IND__REG_RESET_EN__SHIFT 0x1
+#define BX_RESET_EN_IND__STY_RESET_EN_MASK 0x4
+#define BX_RESET_EN_IND__STY_RESET_EN__SHIFT 0x2
+#define MM_CFGREGS_CNTL_IND__MM_CFG_FUNC_SEL_MASK 0x7
+#define MM_CFGREGS_CNTL_IND__MM_CFG_FUNC_SEL__SHIFT 0x0
+#define MM_CFGREGS_CNTL_IND__MM_WR_TO_CFG_EN_MASK 0x8
+#define MM_CFGREGS_CNTL_IND__MM_WR_TO_CFG_EN__SHIFT 0x3
+#define HW_DEBUG_IND__HW_00_DEBUG_MASK 0x1
+#define HW_DEBUG_IND__HW_00_DEBUG__SHIFT 0x0
+#define HW_DEBUG_IND__HW_01_DEBUG_MASK 0x2
+#define HW_DEBUG_IND__HW_01_DEBUG__SHIFT 0x1
+#define HW_DEBUG_IND__HW_02_DEBUG_MASK 0x4
+#define HW_DEBUG_IND__HW_02_DEBUG__SHIFT 0x2
+#define HW_DEBUG_IND__HW_03_DEBUG_MASK 0x8
+#define HW_DEBUG_IND__HW_03_DEBUG__SHIFT 0x3
+#define HW_DEBUG_IND__HW_04_DEBUG_MASK 0x10
+#define HW_DEBUG_IND__HW_04_DEBUG__SHIFT 0x4
+#define HW_DEBUG_IND__HW_05_DEBUG_MASK 0x20
+#define HW_DEBUG_IND__HW_05_DEBUG__SHIFT 0x5
+#define HW_DEBUG_IND__HW_06_DEBUG_MASK 0x40
+#define HW_DEBUG_IND__HW_06_DEBUG__SHIFT 0x6
+#define HW_DEBUG_IND__HW_07_DEBUG_MASK 0x80
+#define HW_DEBUG_IND__HW_07_DEBUG__SHIFT 0x7
+#define HW_DEBUG_IND__HW_08_DEBUG_MASK 0x100
+#define HW_DEBUG_IND__HW_08_DEBUG__SHIFT 0x8
+#define HW_DEBUG_IND__HW_09_DEBUG_MASK 0x200
+#define HW_DEBUG_IND__HW_09_DEBUG__SHIFT 0x9
+#define HW_DEBUG_IND__HW_10_DEBUG_MASK 0x400
+#define HW_DEBUG_IND__HW_10_DEBUG__SHIFT 0xa
+#define HW_DEBUG_IND__HW_11_DEBUG_MASK 0x800
+#define HW_DEBUG_IND__HW_11_DEBUG__SHIFT 0xb
+#define HW_DEBUG_IND__HW_12_DEBUG_MASK 0x1000
+#define HW_DEBUG_IND__HW_12_DEBUG__SHIFT 0xc
+#define HW_DEBUG_IND__HW_13_DEBUG_MASK 0x2000
+#define HW_DEBUG_IND__HW_13_DEBUG__SHIFT 0xd
+#define HW_DEBUG_IND__HW_14_DEBUG_MASK 0x4000
+#define HW_DEBUG_IND__HW_14_DEBUG__SHIFT 0xe
+#define HW_DEBUG_IND__HW_15_DEBUG_MASK 0x8000
+#define HW_DEBUG_IND__HW_15_DEBUG__SHIFT 0xf
+#define HW_DEBUG_IND__HW_16_DEBUG_MASK 0x10000
+#define HW_DEBUG_IND__HW_16_DEBUG__SHIFT 0x10
+#define HW_DEBUG_IND__HW_17_DEBUG_MASK 0x20000
+#define HW_DEBUG_IND__HW_17_DEBUG__SHIFT 0x11
+#define HW_DEBUG_IND__HW_18_DEBUG_MASK 0x40000
+#define HW_DEBUG_IND__HW_18_DEBUG__SHIFT 0x12
+#define HW_DEBUG_IND__HW_19_DEBUG_MASK 0x80000
+#define HW_DEBUG_IND__HW_19_DEBUG__SHIFT 0x13
+#define HW_DEBUG_IND__HW_20_DEBUG_MASK 0x100000
+#define HW_DEBUG_IND__HW_20_DEBUG__SHIFT 0x14
+#define HW_DEBUG_IND__HW_21_DEBUG_MASK 0x200000
+#define HW_DEBUG_IND__HW_21_DEBUG__SHIFT 0x15
+#define HW_DEBUG_IND__HW_22_DEBUG_MASK 0x400000
+#define HW_DEBUG_IND__HW_22_DEBUG__SHIFT 0x16
+#define HW_DEBUG_IND__HW_23_DEBUG_MASK 0x800000
+#define HW_DEBUG_IND__HW_23_DEBUG__SHIFT 0x17
+#define HW_DEBUG_IND__HW_24_DEBUG_MASK 0x1000000
+#define HW_DEBUG_IND__HW_24_DEBUG__SHIFT 0x18
+#define HW_DEBUG_IND__HW_25_DEBUG_MASK 0x2000000
+#define HW_DEBUG_IND__HW_25_DEBUG__SHIFT 0x19
+#define HW_DEBUG_IND__HW_26_DEBUG_MASK 0x4000000
+#define HW_DEBUG_IND__HW_26_DEBUG__SHIFT 0x1a
+#define HW_DEBUG_IND__HW_27_DEBUG_MASK 0x8000000
+#define HW_DEBUG_IND__HW_27_DEBUG__SHIFT 0x1b
+#define HW_DEBUG_IND__HW_28_DEBUG_MASK 0x10000000
+#define HW_DEBUG_IND__HW_28_DEBUG__SHIFT 0x1c
+#define HW_DEBUG_IND__HW_29_DEBUG_MASK 0x20000000
+#define HW_DEBUG_IND__HW_29_DEBUG__SHIFT 0x1d
+#define HW_DEBUG_IND__HW_30_DEBUG_MASK 0x40000000
+#define HW_DEBUG_IND__HW_30_DEBUG__SHIFT 0x1e
+#define HW_DEBUG_IND__HW_31_DEBUG_MASK 0x80000000
+#define HW_DEBUG_IND__HW_31_DEBUG__SHIFT 0x1f
+#define MASTER_CREDIT_CNTL_IND__BIF_MC_RDRET_CREDIT_MASK 0x7f
+#define MASTER_CREDIT_CNTL_IND__BIF_MC_RDRET_CREDIT__SHIFT 0x0
+#define MASTER_CREDIT_CNTL_IND__BIF_AZ_RDRET_CREDIT_MASK 0x3f0000
+#define MASTER_CREDIT_CNTL_IND__BIF_AZ_RDRET_CREDIT__SHIFT 0x10
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_SRBM_REQ_CREDIT_MASK 0x1f
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_SRBM_REQ_CREDIT__SHIFT 0x0
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_VGA_REQ_CREDIT_MASK 0x1e0
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_VGA_REQ_CREDIT__SHIFT 0x5
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_HDP_REQ_CREDIT_MASK 0x7c00
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_HDP_REQ_CREDIT__SHIFT 0xa
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_ROM_REQ_CREDIT_MASK 0x8000
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_ROM_REQ_CREDIT__SHIFT 0xf
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_AZ_REQ_CREDIT_MASK 0x100000
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_AZ_REQ_CREDIT__SHIFT 0x14
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_XDMA_REQ_CREDIT_MASK 0x7e000000
+#define SLAVE_REQ_CREDIT_CNTL_IND__BIF_XDMA_REQ_CREDIT__SHIFT 0x19
+#define BX_RESET_CNTL_IND__LINK_TRAIN_EN_MASK 0x1
+#define BX_RESET_CNTL_IND__LINK_TRAIN_EN__SHIFT 0x0
+#define INTERRUPT_CNTL_IND__IH_DUMMY_RD_OVERRIDE_MASK 0x1
+#define INTERRUPT_CNTL_IND__IH_DUMMY_RD_OVERRIDE__SHIFT 0x0
+#define INTERRUPT_CNTL_IND__IH_DUMMY_RD_EN_MASK 0x2
+#define INTERRUPT_CNTL_IND__IH_DUMMY_RD_EN__SHIFT 0x1
+#define INTERRUPT_CNTL_IND__IH_REQ_NONSNOOP_EN_MASK 0x8
+#define INTERRUPT_CNTL_IND__IH_REQ_NONSNOOP_EN__SHIFT 0x3
+#define INTERRUPT_CNTL_IND__IH_INTR_DLY_CNTR_MASK 0xf0
+#define INTERRUPT_CNTL_IND__IH_INTR_DLY_CNTR__SHIFT 0x4
+#define INTERRUPT_CNTL_IND__GEN_IH_INT_EN_MASK 0x100
+#define INTERRUPT_CNTL_IND__GEN_IH_INT_EN__SHIFT 0x8
+#define INTERRUPT_CNTL_IND__GEN_GPIO_INT_EN_MASK 0x1e00
+#define INTERRUPT_CNTL_IND__GEN_GPIO_INT_EN__SHIFT 0x9
+#define INTERRUPT_CNTL_IND__SELECT_INT_GPIO_OUTPUT_MASK 0x6000
+#define INTERRUPT_CNTL_IND__SELECT_INT_GPIO_OUTPUT__SHIFT 0xd
+#define INTERRUPT_CNTL_IND__BIF_RB_REQ_NONSNOOP_EN_MASK 0x8000
+#define INTERRUPT_CNTL_IND__BIF_RB_REQ_NONSNOOP_EN__SHIFT 0xf
+#define INTERRUPT_CNTL2_IND__IH_DUMMY_RD_ADDR_MASK 0xffffffff
+#define INTERRUPT_CNTL2_IND__IH_DUMMY_RD_ADDR__SHIFT 0x0
+#define BIF_DEBUG_CNTL_IND__DEBUG_EN_MASK 0x1
+#define BIF_DEBUG_CNTL_IND__DEBUG_EN__SHIFT 0x0
+#define BIF_DEBUG_CNTL_IND__DEBUG_MULTIBLOCKEN_MASK 0x2
+#define BIF_DEBUG_CNTL_IND__DEBUG_MULTIBLOCKEN__SHIFT 0x1
+#define BIF_DEBUG_CNTL_IND__DEBUG_OUT_EN_MASK 0x4
+#define BIF_DEBUG_CNTL_IND__DEBUG_OUT_EN__SHIFT 0x2
+#define BIF_DEBUG_CNTL_IND__DEBUG_PAD_SEL_MASK 0x8
+#define BIF_DEBUG_CNTL_IND__DEBUG_PAD_SEL__SHIFT 0x3
+#define BIF_DEBUG_CNTL_IND__DEBUG_BYTESEL_BLK1_MASK 0x10
+#define BIF_DEBUG_CNTL_IND__DEBUG_BYTESEL_BLK1__SHIFT 0x4
+#define BIF_DEBUG_CNTL_IND__DEBUG_BYTESEL_BLK2_MASK 0x20
+#define BIF_DEBUG_CNTL_IND__DEBUG_BYTESEL_BLK2__SHIFT 0x5
+#define BIF_DEBUG_CNTL_IND__DEBUG_SYNC_EN_MASK 0x40
+#define BIF_DEBUG_CNTL_IND__DEBUG_SYNC_EN__SHIFT 0x6
+#define BIF_DEBUG_CNTL_IND__DEBUG_SWAP_MASK 0x80
+#define BIF_DEBUG_CNTL_IND__DEBUG_SWAP__SHIFT 0x7
+#define BIF_DEBUG_CNTL_IND__DEBUG_IDSEL_BLK1_MASK 0x1f00
+#define BIF_DEBUG_CNTL_IND__DEBUG_IDSEL_BLK1__SHIFT 0x8
+#define BIF_DEBUG_CNTL_IND__DEBUG_IDSEL_BLK2_MASK 0x1f0000
+#define BIF_DEBUG_CNTL_IND__DEBUG_IDSEL_BLK2__SHIFT 0x10
+#define BIF_DEBUG_CNTL_IND__DEBUG_IDSEL_XSP_MASK 0x1000000
+#define BIF_DEBUG_CNTL_IND__DEBUG_IDSEL_XSP__SHIFT 0x18
+#define BIF_DEBUG_CNTL_IND__DEBUG_SYNC_CLKSEL_MASK 0xc0000000
+#define BIF_DEBUG_CNTL_IND__DEBUG_SYNC_CLKSEL__SHIFT 0x1e
+#define BIF_DEBUG_MUX_IND__DEBUG_MUX_BLK1_MASK 0x3f
+#define BIF_DEBUG_MUX_IND__DEBUG_MUX_BLK1__SHIFT 0x0
+#define BIF_DEBUG_MUX_IND__DEBUG_MUX_BLK2_MASK 0x3f00
+#define BIF_DEBUG_MUX_IND__DEBUG_MUX_BLK2__SHIFT 0x8
+#define BIF_DEBUG_OUT_IND__DEBUG_OUTPUT_MASK 0x1ffff
+#define BIF_DEBUG_OUT_IND__DEBUG_OUTPUT__SHIFT 0x0
+#define HDP_REG_COHERENCY_FLUSH_CNTL_IND__HDP_REG_FLUSH_ADDR_MASK 0x1
+#define HDP_REG_COHERENCY_FLUSH_CNTL_IND__HDP_REG_FLUSH_ADDR__SHIFT 0x0
+#define HDP_MEM_COHERENCY_FLUSH_CNTL_IND__HDP_MEM_FLUSH_ADDR_MASK 0x1
+#define HDP_MEM_COHERENCY_FLUSH_CNTL_IND__HDP_MEM_FLUSH_ADDR__SHIFT 0x0
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_A_MASK 0x1
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_A__SHIFT 0x0
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SEL_MASK 0x2
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SEL__SHIFT 0x1
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_MODE_MASK 0x4
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_MODE__SHIFT 0x2
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SPARE_MASK 0x18
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SPARE__SHIFT 0x3
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SN0_MASK 0x20
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SN0__SHIFT 0x5
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SN1_MASK 0x40
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SN1__SHIFT 0x6
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SN2_MASK 0x80
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SN2__SHIFT 0x7
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SN3_MASK 0x100
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SN3__SHIFT 0x8
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SLEWN_MASK 0x200
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SLEWN__SHIFT 0x9
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_WAKE_MASK 0x400
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_WAKE__SHIFT 0xa
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SCHMEN_MASK 0x800
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_SCHMEN__SHIFT 0xb
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_CNTL_EN_MASK 0x1000
+#define CLKREQB_PAD_CNTL_IND__CLKREQB_PAD_CNTL_EN__SHIFT 0xc
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_A_MASK 0x1
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_A__SHIFT 0x0
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SEL_MASK 0x2
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SEL__SHIFT 0x1
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_MODE_MASK 0x4
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_MODE__SHIFT 0x2
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SPARE_MASK 0x18
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SPARE__SHIFT 0x3
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SN0_MASK 0x20
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SN0__SHIFT 0x5
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SN1_MASK 0x40
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SN1__SHIFT 0x6
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SN2_MASK 0x80
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SN2__SHIFT 0x7
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SN3_MASK 0x100
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SN3__SHIFT 0x8
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SLEWN_MASK 0x200
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SLEWN__SHIFT 0x9
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_WAKE_MASK 0x400
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_WAKE__SHIFT 0xa
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SCHMEN_MASK 0x800
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_SCHMEN__SHIFT 0xb
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_CNTL_EN_MASK 0x1000
+#define SMBDAT_PAD_CNTL_IND__SMBDAT_PAD_CNTL_EN__SHIFT 0xc
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_A_MASK 0x1
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_A__SHIFT 0x0
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SEL_MASK 0x2
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SEL__SHIFT 0x1
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_MODE_MASK 0x4
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_MODE__SHIFT 0x2
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SPARE_MASK 0x18
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SPARE__SHIFT 0x3
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SN0_MASK 0x20
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SN0__SHIFT 0x5
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SN1_MASK 0x40
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SN1__SHIFT 0x6
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SN2_MASK 0x80
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SN2__SHIFT 0x7
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SN3_MASK 0x100
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SN3__SHIFT 0x8
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SLEWN_MASK 0x200
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SLEWN__SHIFT 0x9
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_WAKE_MASK 0x400
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_WAKE__SHIFT 0xa
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SCHMEN_MASK 0x800
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_SCHMEN__SHIFT 0xb
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_CNTL_EN_MASK 0x1000
+#define SMBCLK_PAD_CNTL_IND__SMBCLK_PAD_CNTL_EN__SHIFT 0xc
+#define BIF_XDMA_LO_IND__BIF_XDMA_LOWER_BOUND_MASK 0x1fffffff
+#define BIF_XDMA_LO_IND__BIF_XDMA_LOWER_BOUND__SHIFT 0x0
+#define BIF_XDMA_LO_IND__BIF_XDMA_APER_EN_MASK 0x80000000
+#define BIF_XDMA_LO_IND__BIF_XDMA_APER_EN__SHIFT 0x1f
+#define BIF_XDMA_HI_IND__BIF_XDMA_UPPER_BOUND_MASK 0x1fffffff
+#define BIF_XDMA_HI_IND__BIF_XDMA_UPPER_BOUND__SHIFT 0x0
+#define BIF_FEATURES_CONTROL_MISC_IND__MST_BIF_REQ_EP_DIS_MASK 0x1
+#define BIF_FEATURES_CONTROL_MISC_IND__MST_BIF_REQ_EP_DIS__SHIFT 0x0
+#define BIF_FEATURES_CONTROL_MISC_IND__SLV_BIF_CPL_EP_DIS_MASK 0x2
+#define BIF_FEATURES_CONTROL_MISC_IND__SLV_BIF_CPL_EP_DIS__SHIFT 0x1
+#define BIF_FEATURES_CONTROL_MISC_IND__BIF_SLV_REQ_EP_DIS_MASK 0x4
+#define BIF_FEATURES_CONTROL_MISC_IND__BIF_SLV_REQ_EP_DIS__SHIFT 0x2
+#define BIF_FEATURES_CONTROL_MISC_IND__BIF_MST_CPL_EP_DIS_MASK 0x8
+#define BIF_FEATURES_CONTROL_MISC_IND__BIF_MST_CPL_EP_DIS__SHIFT 0x3
+#define BIF_FEATURES_CONTROL_MISC_IND__UR_PSN_PKT_REPORT_POISON_DIS_MASK 0x10
+#define BIF_FEATURES_CONTROL_MISC_IND__UR_PSN_PKT_REPORT_POISON_DIS__SHIFT 0x4
+#define BIF_FEATURES_CONTROL_MISC_IND__POST_PSN_ONLY_PKT_REPORT_UR_ALL_DIS_MASK 0x20
+#define BIF_FEATURES_CONTROL_MISC_IND__POST_PSN_ONLY_PKT_REPORT_UR_ALL_DIS__SHIFT 0x5
+#define BIF_FEATURES_CONTROL_MISC_IND__POST_PSN_ONLY_PKT_REPORT_UR_PART_DIS_MASK 0x40
+#define BIF_FEATURES_CONTROL_MISC_IND__POST_PSN_ONLY_PKT_REPORT_UR_PART_DIS__SHIFT 0x6
+#define BIF_FEATURES_CONTROL_MISC_IND__PLL_SWITCH_IMPCTL_CAL_DONE_DIS_MASK 0x80
+#define BIF_FEATURES_CONTROL_MISC_IND__PLL_SWITCH_IMPCTL_CAL_DONE_DIS__SHIFT 0x7
+#define BIF_FEATURES_CONTROL_MISC_IND__IGNORE_BE_CHECK_GASKET_COMB_DIS_MASK 0x100
+#define BIF_FEATURES_CONTROL_MISC_IND__IGNORE_BE_CHECK_GASKET_COMB_DIS__SHIFT 0x8
+#define BIF_FEATURES_CONTROL_MISC_IND__MC_BIF_REQ_ID_ROUTING_DIS_MASK 0x200
+#define BIF_FEATURES_CONTROL_MISC_IND__MC_BIF_REQ_ID_ROUTING_DIS__SHIFT 0x9
+#define BIF_FEATURES_CONTROL_MISC_IND__AZ_BIF_REQ_ID_ROUTING_DIS_MASK 0x400
+#define BIF_FEATURES_CONTROL_MISC_IND__AZ_BIF_REQ_ID_ROUTING_DIS__SHIFT 0xa
+#define BIF_FEATURES_CONTROL_MISC_IND__ATC_PRG_RESP_PASID_UR_EN_MASK 0x800
+#define BIF_FEATURES_CONTROL_MISC_IND__ATC_PRG_RESP_PASID_UR_EN__SHIFT 0xb
+#define BIF_FEATURES_CONTROL_MISC_IND__BIF_RB_SET_OVERFLOW_EN_MASK 0x1000
+#define BIF_FEATURES_CONTROL_MISC_IND__BIF_RB_SET_OVERFLOW_EN__SHIFT 0xc
+#define BIF_DOORBELL_CNTL_IND__SELF_RING_DIS_MASK 0x1
+#define BIF_DOORBELL_CNTL_IND__SELF_RING_DIS__SHIFT 0x0
+#define BIF_DOORBELL_CNTL_IND__TRANS_CHECK_DIS_MASK 0x2
+#define BIF_DOORBELL_CNTL_IND__TRANS_CHECK_DIS__SHIFT 0x1
+#define BIF_DOORBELL_CNTL_IND__UNTRANS_LBACK_EN_MASK 0x4
+#define BIF_DOORBELL_CNTL_IND__UNTRANS_LBACK_EN__SHIFT 0x2
+#define BIF_DOORBELL_CNTL_IND__NON_CONSECUTIVE_BE_ZERO_DIS_MASK 0x8
+#define BIF_DOORBELL_CNTL_IND__NON_CONSECUTIVE_BE_ZERO_DIS__SHIFT 0x3
+#define BIF_DOORBELL_CNTL_IND__DOORBELL_MONITOR_EN_MASK 0x10
+#define BIF_DOORBELL_CNTL_IND__DOORBELL_MONITOR_EN__SHIFT 0x4
+#define BIF_DOORBELL_CNTL_IND__DOORBELL_INTERRUPT_STATUS_MASK 0x20
+#define BIF_DOORBELL_CNTL_IND__DOORBELL_INTERRUPT_STATUS__SHIFT 0x5
+#define BIF_DOORBELL_CNTL_IND__DOORBELL_INTERRUPT_CLEAR_MASK 0x10000
+#define BIF_DOORBELL_CNTL_IND__DOORBELL_INTERRUPT_CLEAR__SHIFT 0x10
+#define BIF_SLVARB_MODE_IND__SLVARB_MODE_MASK 0x3
+#define BIF_SLVARB_MODE_IND__SLVARB_MODE__SHIFT 0x0
+#define BIF_FB_EN_IND__FB_READ_EN_MASK 0x1
+#define BIF_FB_EN_IND__FB_READ_EN__SHIFT 0x0
+#define BIF_FB_EN_IND__FB_WRITE_EN_MASK 0x2
+#define BIF_FB_EN_IND__FB_WRITE_EN__SHIFT 0x1
+#define BIF_BUSNUM_CNTL1_IND__ID_MASK_MASK 0xff
+#define BIF_BUSNUM_CNTL1_IND__ID_MASK__SHIFT 0x0
+#define BIF_BUSNUM_LIST0_IND__ID0_MASK 0xff
+#define BIF_BUSNUM_LIST0_IND__ID0__SHIFT 0x0
+#define BIF_BUSNUM_LIST0_IND__ID1_MASK 0xff00
+#define BIF_BUSNUM_LIST0_IND__ID1__SHIFT 0x8
+#define BIF_BUSNUM_LIST0_IND__ID2_MASK 0xff0000
+#define BIF_BUSNUM_LIST0_IND__ID2__SHIFT 0x10
+#define BIF_BUSNUM_LIST0_IND__ID3_MASK 0xff000000
+#define BIF_BUSNUM_LIST0_IND__ID3__SHIFT 0x18
+#define BIF_BUSNUM_LIST1_IND__ID4_MASK 0xff
+#define BIF_BUSNUM_LIST1_IND__ID4__SHIFT 0x0
+#define BIF_BUSNUM_LIST1_IND__ID5_MASK 0xff00
+#define BIF_BUSNUM_LIST1_IND__ID5__SHIFT 0x8
+#define BIF_BUSNUM_LIST1_IND__ID6_MASK 0xff0000
+#define BIF_BUSNUM_LIST1_IND__ID6__SHIFT 0x10
+#define BIF_BUSNUM_LIST1_IND__ID7_MASK 0xff000000
+#define BIF_BUSNUM_LIST1_IND__ID7__SHIFT 0x18
+#define BIF_BUSNUM_CNTL2_IND__AUTOUPDATE_SEL_MASK 0xff
+#define BIF_BUSNUM_CNTL2_IND__AUTOUPDATE_SEL__SHIFT 0x0
+#define BIF_BUSNUM_CNTL2_IND__AUTOUPDATE_EN_MASK 0x100
+#define BIF_BUSNUM_CNTL2_IND__AUTOUPDATE_EN__SHIFT 0x8
+#define BIF_BUSNUM_CNTL2_IND__HDPREG_CNTL_MASK 0x10000
+#define BIF_BUSNUM_CNTL2_IND__HDPREG_CNTL__SHIFT 0x10
+#define BIF_BUSNUM_CNTL2_IND__ERROR_MULTIPLE_ID_MATCH_MASK 0x20000
+#define BIF_BUSNUM_CNTL2_IND__ERROR_MULTIPLE_ID_MATCH__SHIFT 0x11
+#define BIF_BUSY_DELAY_CNTR_IND__DELAY_CNT_MASK 0x3f
+#define BIF_BUSY_DELAY_CNTR_IND__DELAY_CNT__SHIFT 0x0
+#define BIF_PERFMON_CNTL_IND__PERFCOUNTER_EN_MASK 0x1
+#define BIF_PERFMON_CNTL_IND__PERFCOUNTER_EN__SHIFT 0x0
+#define BIF_PERFMON_CNTL_IND__PERFCOUNTER_RESET0_MASK 0x2
+#define BIF_PERFMON_CNTL_IND__PERFCOUNTER_RESET0__SHIFT 0x1
+#define BIF_PERFMON_CNTL_IND__PERFCOUNTER_RESET1_MASK 0x4
+#define BIF_PERFMON_CNTL_IND__PERFCOUNTER_RESET1__SHIFT 0x2
+#define BIF_PERFMON_CNTL_IND__PERF_SEL0_MASK 0x1f00
+#define BIF_PERFMON_CNTL_IND__PERF_SEL0__SHIFT 0x8
+#define BIF_PERFMON_CNTL_IND__PERF_SEL1_MASK 0x3e000
+#define BIF_PERFMON_CNTL_IND__PERF_SEL1__SHIFT 0xd
+#define BIF_PERFCOUNTER0_RESULT_IND__PERFCOUNTER_RESULT_MASK 0xffffffff
+#define BIF_PERFCOUNTER0_RESULT_IND__PERFCOUNTER_RESULT__SHIFT 0x0
+#define BIF_PERFCOUNTER1_RESULT_IND__PERFCOUNTER_RESULT_MASK 0xffffffff
+#define BIF_PERFCOUNTER1_RESULT_IND__PERFCOUNTER_RESULT__SHIFT 0x0
+#define SLAVE_HANG_PROTECTION_CNTL_IND__HANG_PROTECTION_TIMER_SEL_MASK 0xe
+#define SLAVE_HANG_PROTECTION_CNTL_IND__HANG_PROTECTION_TIMER_SEL__SHIFT 0x1
+#define GPU_HDP_FLUSH_REQ_IND__CP0_MASK 0x1
+#define GPU_HDP_FLUSH_REQ_IND__CP0__SHIFT 0x0
+#define GPU_HDP_FLUSH_REQ_IND__CP1_MASK 0x2
+#define GPU_HDP_FLUSH_REQ_IND__CP1__SHIFT 0x1
+#define GPU_HDP_FLUSH_REQ_IND__CP2_MASK 0x4
+#define GPU_HDP_FLUSH_REQ_IND__CP2__SHIFT 0x2
+#define GPU_HDP_FLUSH_REQ_IND__CP3_MASK 0x8
+#define GPU_HDP_FLUSH_REQ_IND__CP3__SHIFT 0x3
+#define GPU_HDP_FLUSH_REQ_IND__CP4_MASK 0x10
+#define GPU_HDP_FLUSH_REQ_IND__CP4__SHIFT 0x4
+#define GPU_HDP_FLUSH_REQ_IND__CP5_MASK 0x20
+#define GPU_HDP_FLUSH_REQ_IND__CP5__SHIFT 0x5
+#define GPU_HDP_FLUSH_REQ_IND__CP6_MASK 0x40
+#define GPU_HDP_FLUSH_REQ_IND__CP6__SHIFT 0x6
+#define GPU_HDP_FLUSH_REQ_IND__CP7_MASK 0x80
+#define GPU_HDP_FLUSH_REQ_IND__CP7__SHIFT 0x7
+#define GPU_HDP_FLUSH_REQ_IND__CP8_MASK 0x100
+#define GPU_HDP_FLUSH_REQ_IND__CP8__SHIFT 0x8
+#define GPU_HDP_FLUSH_REQ_IND__CP9_MASK 0x200
+#define GPU_HDP_FLUSH_REQ_IND__CP9__SHIFT 0x9
+#define GPU_HDP_FLUSH_REQ_IND__SDMA0_MASK 0x400
+#define GPU_HDP_FLUSH_REQ_IND__SDMA0__SHIFT 0xa
+#define GPU_HDP_FLUSH_REQ_IND__SDMA1_MASK 0x800
+#define GPU_HDP_FLUSH_REQ_IND__SDMA1__SHIFT 0xb
+#define GPU_HDP_FLUSH_DONE_IND__CP0_MASK 0x1
+#define GPU_HDP_FLUSH_DONE_IND__CP0__SHIFT 0x0
+#define GPU_HDP_FLUSH_DONE_IND__CP1_MASK 0x2
+#define GPU_HDP_FLUSH_DONE_IND__CP1__SHIFT 0x1
+#define GPU_HDP_FLUSH_DONE_IND__CP2_MASK 0x4
+#define GPU_HDP_FLUSH_DONE_IND__CP2__SHIFT 0x2
+#define GPU_HDP_FLUSH_DONE_IND__CP3_MASK 0x8
+#define GPU_HDP_FLUSH_DONE_IND__CP3__SHIFT 0x3
+#define GPU_HDP_FLUSH_DONE_IND__CP4_MASK 0x10
+#define GPU_HDP_FLUSH_DONE_IND__CP4__SHIFT 0x4
+#define GPU_HDP_FLUSH_DONE_IND__CP5_MASK 0x20
+#define GPU_HDP_FLUSH_DONE_IND__CP5__SHIFT 0x5
+#define GPU_HDP_FLUSH_DONE_IND__CP6_MASK 0x40
+#define GPU_HDP_FLUSH_DONE_IND__CP6__SHIFT 0x6
+#define GPU_HDP_FLUSH_DONE_IND__CP7_MASK 0x80
+#define GPU_HDP_FLUSH_DONE_IND__CP7__SHIFT 0x7
+#define GPU_HDP_FLUSH_DONE_IND__CP8_MASK 0x100
+#define GPU_HDP_FLUSH_DONE_IND__CP8__SHIFT 0x8
+#define GPU_HDP_FLUSH_DONE_IND__CP9_MASK 0x200
+#define GPU_HDP_FLUSH_DONE_IND__CP9__SHIFT 0x9
+#define GPU_HDP_FLUSH_DONE_IND__SDMA0_MASK 0x400
+#define GPU_HDP_FLUSH_DONE_IND__SDMA0__SHIFT 0xa
+#define GPU_HDP_FLUSH_DONE_IND__SDMA1_MASK 0x800
+#define GPU_HDP_FLUSH_DONE_IND__SDMA1__SHIFT 0xb
+#define SLAVE_HANG_ERROR_IND__SRBM_HANG_ERROR_MASK 0x1
+#define SLAVE_HANG_ERROR_IND__SRBM_HANG_ERROR__SHIFT 0x0
+#define SLAVE_HANG_ERROR_IND__HDP_HANG_ERROR_MASK 0x2
+#define SLAVE_HANG_ERROR_IND__HDP_HANG_ERROR__SHIFT 0x1
+#define SLAVE_HANG_ERROR_IND__VGA_HANG_ERROR_MASK 0x4
+#define SLAVE_HANG_ERROR_IND__VGA_HANG_ERROR__SHIFT 0x2
+#define SLAVE_HANG_ERROR_IND__ROM_HANG_ERROR_MASK 0x8
+#define SLAVE_HANG_ERROR_IND__ROM_HANG_ERROR__SHIFT 0x3
+#define SLAVE_HANG_ERROR_IND__AUDIO_HANG_ERROR_MASK 0x10
+#define SLAVE_HANG_ERROR_IND__AUDIO_HANG_ERROR__SHIFT 0x4
+#define SLAVE_HANG_ERROR_IND__CEC_HANG_ERROR_MASK 0x20
+#define SLAVE_HANG_ERROR_IND__CEC_HANG_ERROR__SHIFT 0x5
+#define SLAVE_HANG_ERROR_IND__XDMA_HANG_ERROR_MASK 0x80
+#define SLAVE_HANG_ERROR_IND__XDMA_HANG_ERROR__SHIFT 0x7
+#define SLAVE_HANG_ERROR_IND__DOORBELL_HANG_ERROR_MASK 0x100
+#define SLAVE_HANG_ERROR_IND__DOORBELL_HANG_ERROR__SHIFT 0x8
+#define SLAVE_HANG_ERROR_IND__GARLIC_HANG_ERROR_MASK 0x200
+#define SLAVE_HANG_ERROR_IND__GARLIC_HANG_ERROR__SHIFT 0x9
+#define CAPTURE_HOST_BUSNUM_IND__CHECK_EN_MASK 0x1
+#define CAPTURE_HOST_BUSNUM_IND__CHECK_EN__SHIFT 0x0
+#define HOST_BUSNUM_IND__HOST_ID_MASK 0xffff
+#define HOST_BUSNUM_IND__HOST_ID__SHIFT 0x0
+#define PEER_REG_RANGE0_IND__START_ADDR_MASK 0xffff
+#define PEER_REG_RANGE0_IND__START_ADDR__SHIFT 0x0
+#define PEER_REG_RANGE0_IND__END_ADDR_MASK 0xffff0000
+#define PEER_REG_RANGE0_IND__END_ADDR__SHIFT 0x10
+#define PEER_REG_RANGE1_IND__START_ADDR_MASK 0xffff
+#define PEER_REG_RANGE1_IND__START_ADDR__SHIFT 0x0
+#define PEER_REG_RANGE1_IND__END_ADDR_MASK 0xffff0000
+#define PEER_REG_RANGE1_IND__END_ADDR__SHIFT 0x10
+#define PEER0_FB_OFFSET_HI_IND__PEER0_FB_OFFSET_HI_MASK 0xfffff
+#define PEER0_FB_OFFSET_HI_IND__PEER0_FB_OFFSET_HI__SHIFT 0x0
+#define PEER0_FB_OFFSET_LO_IND__PEER0_FB_OFFSET_LO_MASK 0xfffff
+#define PEER0_FB_OFFSET_LO_IND__PEER0_FB_OFFSET_LO__SHIFT 0x0
+#define PEER0_FB_OFFSET_LO_IND__PEER0_FB_EN_MASK 0x80000000
+#define PEER0_FB_OFFSET_LO_IND__PEER0_FB_EN__SHIFT 0x1f
+#define PEER1_FB_OFFSET_HI_IND__PEER1_FB_OFFSET_HI_MASK 0xfffff
+#define PEER1_FB_OFFSET_HI_IND__PEER1_FB_OFFSET_HI__SHIFT 0x0
+#define PEER1_FB_OFFSET_LO_IND__PEER1_FB_OFFSET_LO_MASK 0xfffff
+#define PEER1_FB_OFFSET_LO_IND__PEER1_FB_OFFSET_LO__SHIFT 0x0
+#define PEER1_FB_OFFSET_LO_IND__PEER1_FB_EN_MASK 0x80000000
+#define PEER1_FB_OFFSET_LO_IND__PEER1_FB_EN__SHIFT 0x1f
+#define PEER2_FB_OFFSET_HI_IND__PEER2_FB_OFFSET_HI_MASK 0xfffff
+#define PEER2_FB_OFFSET_HI_IND__PEER2_FB_OFFSET_HI__SHIFT 0x0
+#define PEER2_FB_OFFSET_LO_IND__PEER2_FB_OFFSET_LO_MASK 0xfffff
+#define PEER2_FB_OFFSET_LO_IND__PEER2_FB_OFFSET_LO__SHIFT 0x0
+#define PEER2_FB_OFFSET_LO_IND__PEER2_FB_EN_MASK 0x80000000
+#define PEER2_FB_OFFSET_LO_IND__PEER2_FB_EN__SHIFT 0x1f
+#define PEER3_FB_OFFSET_HI_IND__PEER3_FB_OFFSET_HI_MASK 0xfffff
+#define PEER3_FB_OFFSET_HI_IND__PEER3_FB_OFFSET_HI__SHIFT 0x0
+#define PEER3_FB_OFFSET_LO_IND__PEER3_FB_OFFSET_LO_MASK 0xfffff
+#define PEER3_FB_OFFSET_LO_IND__PEER3_FB_OFFSET_LO__SHIFT 0x0
+#define PEER3_FB_OFFSET_LO_IND__PEER3_FB_EN_MASK 0x80000000
+#define PEER3_FB_OFFSET_LO_IND__PEER3_FB_EN__SHIFT 0x1f
+#define DBG_BYPASS_SRBM_ACCESS_IND__DBG_BYPASS_SRBM_ACCESS_EN_MASK 0x1
+#define DBG_BYPASS_SRBM_ACCESS_IND__DBG_BYPASS_SRBM_ACCESS_EN__SHIFT 0x0
+#define DBG_BYPASS_SRBM_ACCESS_IND__DBG_APER_AD_MASK 0x1e
+#define DBG_BYPASS_SRBM_ACCESS_IND__DBG_APER_AD__SHIFT 0x1
+#define SMBUS_BACO_DUMMY_IND__SMBUS_BACO_DUMMY_DATA_MASK 0xffffffff
+#define SMBUS_BACO_DUMMY_IND__SMBUS_BACO_DUMMY_DATA__SHIFT 0x0
+#define BIF_DEVFUNCNUM_LIST0_IND__DEVFUNC_ID0_MASK 0xff
+#define BIF_DEVFUNCNUM_LIST0_IND__DEVFUNC_ID0__SHIFT 0x0
+#define BIF_DEVFUNCNUM_LIST0_IND__DEVFUNC_ID1_MASK 0xff00
+#define BIF_DEVFUNCNUM_LIST0_IND__DEVFUNC_ID1__SHIFT 0x8
+#define BIF_DEVFUNCNUM_LIST0_IND__DEVFUNC_ID2_MASK 0xff0000
+#define BIF_DEVFUNCNUM_LIST0_IND__DEVFUNC_ID2__SHIFT 0x10
+#define BIF_DEVFUNCNUM_LIST0_IND__DEVFUNC_ID3_MASK 0xff000000
+#define BIF_DEVFUNCNUM_LIST0_IND__DEVFUNC_ID3__SHIFT 0x18
+#define BIF_DEVFUNCNUM_LIST1_IND__DEVFUNC_ID4_MASK 0xff
+#define BIF_DEVFUNCNUM_LIST1_IND__DEVFUNC_ID4__SHIFT 0x0
+#define BIF_DEVFUNCNUM_LIST1_IND__DEVFUNC_ID5_MASK 0xff00
+#define BIF_DEVFUNCNUM_LIST1_IND__DEVFUNC_ID5__SHIFT 0x8
+#define BIF_DEVFUNCNUM_LIST1_IND__DEVFUNC_ID6_MASK 0xff0000
+#define BIF_DEVFUNCNUM_LIST1_IND__DEVFUNC_ID6__SHIFT 0x10
+#define BIF_DEVFUNCNUM_LIST1_IND__DEVFUNC_ID7_MASK 0xff000000
+#define BIF_DEVFUNCNUM_LIST1_IND__DEVFUNC_ID7__SHIFT 0x18
+#define BACO_CNTL_IND__BACO_EN_MASK 0x1
+#define BACO_CNTL_IND__BACO_EN__SHIFT 0x0
+#define BACO_CNTL_IND__BACO_BCLK_OFF_MASK 0x2
+#define BACO_CNTL_IND__BACO_BCLK_OFF__SHIFT 0x1
+#define BACO_CNTL_IND__BACO_ISO_DIS_MASK 0x4
+#define BACO_CNTL_IND__BACO_ISO_DIS__SHIFT 0x2
+#define BACO_CNTL_IND__BACO_POWER_OFF_MASK 0x8
+#define BACO_CNTL_IND__BACO_POWER_OFF__SHIFT 0x3
+#define BACO_CNTL_IND__BACO_RESET_EN_MASK 0x10
+#define BACO_CNTL_IND__BACO_RESET_EN__SHIFT 0x4
+#define BACO_CNTL_IND__BACO_HANG_PROTECTION_EN_MASK 0x20
+#define BACO_CNTL_IND__BACO_HANG_PROTECTION_EN__SHIFT 0x5
+#define BACO_CNTL_IND__BACO_MODE_MASK 0x40
+#define BACO_CNTL_IND__BACO_MODE__SHIFT 0x6
+#define BACO_CNTL_IND__BACO_ANA_ISO_DIS_MASK 0x80
+#define BACO_CNTL_IND__BACO_ANA_ISO_DIS__SHIFT 0x7
+#define BACO_CNTL_IND__RCU_BIF_CONFIG_DONE_MASK 0x100
+#define BACO_CNTL_IND__RCU_BIF_CONFIG_DONE__SHIFT 0x8
+#define BACO_CNTL_IND__PWRGOOD_BF_MASK 0x200
+#define BACO_CNTL_IND__PWRGOOD_BF__SHIFT 0x9
+#define BACO_CNTL_IND__PWRGOOD_GPIO_MASK 0x400
+#define BACO_CNTL_IND__PWRGOOD_GPIO__SHIFT 0xa
+#define BACO_CNTL_IND__PWRGOOD_MEM_MASK 0x800
+#define BACO_CNTL_IND__PWRGOOD_MEM__SHIFT 0xb
+#define BACO_CNTL_IND__PWRGOOD_DVO_MASK 0x1000
+#define BACO_CNTL_IND__PWRGOOD_DVO__SHIFT 0xc
+#define BACO_CNTL_IND__PWRGOOD_IDSC_MASK 0x2000
+#define BACO_CNTL_IND__PWRGOOD_IDSC__SHIFT 0xd
+#define BACO_CNTL_IND__BACO_POWER_OFF_DRAM_MASK 0x10000
+#define BACO_CNTL_IND__BACO_POWER_OFF_DRAM__SHIFT 0x10
+#define BACO_CNTL_IND__BACO_BF_MEM_PHY_ISO_CNTRL_MASK 0x20000
+#define BACO_CNTL_IND__BACO_BF_MEM_PHY_ISO_CNTRL__SHIFT 0x11
+#define BF_ANA_ISO_CNTL_IND__BF_ANA_ISO_DIS_MASK_MASK 0x1
+#define BF_ANA_ISO_CNTL_IND__BF_ANA_ISO_DIS_MASK__SHIFT 0x0
+#define BF_ANA_ISO_CNTL_IND__BF_VDDC_ISO_DIS_MASK_MASK 0x2
+#define BF_ANA_ISO_CNTL_IND__BF_VDDC_ISO_DIS_MASK__SHIFT 0x1
+#define MEM_TYPE_CNTL_IND__BF_MEM_PHY_G5_G3_MASK 0x1
+#define MEM_TYPE_CNTL_IND__BF_MEM_PHY_G5_G3__SHIFT 0x0
+#define BIF_BACO_DEBUG_IND__BIF_BACO_SCANDUMP_FLG_MASK 0x1
+#define BIF_BACO_DEBUG_IND__BIF_BACO_SCANDUMP_FLG__SHIFT 0x0
+#define BIF_BACO_DEBUG_LATCH_IND__BIF_BACO_LATCH_FLG_MASK 0x1
+#define BIF_BACO_DEBUG_LATCH_IND__BIF_BACO_LATCH_FLG__SHIFT 0x0
+#define BACO_CNTL_MISC_IND__BIF_ROM_REQ_DIS_MASK 0x1
+#define BACO_CNTL_MISC_IND__BIF_ROM_REQ_DIS__SHIFT 0x0
+#define BACO_CNTL_MISC_IND__BIF_AZ_REQ_DIS_MASK 0x2
+#define BACO_CNTL_MISC_IND__BIF_AZ_REQ_DIS__SHIFT 0x1
+#define BACO_CNTL_MISC_IND__BACO_LINK_RST_WIDTH_SEL_MASK 0xc
+#define BACO_CNTL_MISC_IND__BACO_LINK_RST_WIDTH_SEL__SHIFT 0x2
+#define SMU_BIF_VDDGFX_PWR_STATUS_IND__VDDGFX_GFX_PWR_OFF_MASK 0x1
+#define SMU_BIF_VDDGFX_PWR_STATUS_IND__VDDGFX_GFX_PWR_OFF__SHIFT 0x0
+#define BIF_VDDGFX_GFX0_LOWER_IND__VDDGFX_GFX0_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX0_LOWER_IND__VDDGFX_GFX0_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_GFX0_LOWER_IND__VDDGFX_GFX0_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_GFX0_LOWER_IND__VDDGFX_GFX0_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_GFX0_LOWER_IND__VDDGFX_GFX0_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_GFX0_LOWER_IND__VDDGFX_GFX0_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_GFX0_UPPER_IND__VDDGFX_GFX0_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX0_UPPER_IND__VDDGFX_GFX0_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_GFX1_LOWER_IND__VDDGFX_GFX1_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX1_LOWER_IND__VDDGFX_GFX1_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_GFX1_LOWER_IND__VDDGFX_GFX1_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_GFX1_LOWER_IND__VDDGFX_GFX1_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_GFX1_LOWER_IND__VDDGFX_GFX1_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_GFX1_LOWER_IND__VDDGFX_GFX1_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_GFX1_UPPER_IND__VDDGFX_GFX1_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX1_UPPER_IND__VDDGFX_GFX1_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_GFX2_LOWER_IND__VDDGFX_GFX2_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX2_LOWER_IND__VDDGFX_GFX2_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_GFX2_LOWER_IND__VDDGFX_GFX2_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_GFX2_LOWER_IND__VDDGFX_GFX2_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_GFX2_LOWER_IND__VDDGFX_GFX2_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_GFX2_LOWER_IND__VDDGFX_GFX2_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_GFX2_UPPER_IND__VDDGFX_GFX2_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX2_UPPER_IND__VDDGFX_GFX2_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_GFX3_LOWER_IND__VDDGFX_GFX3_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX3_LOWER_IND__VDDGFX_GFX3_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_GFX3_LOWER_IND__VDDGFX_GFX3_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_GFX3_LOWER_IND__VDDGFX_GFX3_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_GFX3_LOWER_IND__VDDGFX_GFX3_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_GFX3_LOWER_IND__VDDGFX_GFX3_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_GFX3_UPPER_IND__VDDGFX_GFX3_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX3_UPPER_IND__VDDGFX_GFX3_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_GFX4_LOWER_IND__VDDGFX_GFX4_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX4_LOWER_IND__VDDGFX_GFX4_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_GFX4_LOWER_IND__VDDGFX_GFX4_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_GFX4_LOWER_IND__VDDGFX_GFX4_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_GFX4_LOWER_IND__VDDGFX_GFX4_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_GFX4_LOWER_IND__VDDGFX_GFX4_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_GFX4_UPPER_IND__VDDGFX_GFX4_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX4_UPPER_IND__VDDGFX_GFX4_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_GFX5_LOWER_IND__VDDGFX_GFX5_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX5_LOWER_IND__VDDGFX_GFX5_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_GFX5_LOWER_IND__VDDGFX_GFX5_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_GFX5_LOWER_IND__VDDGFX_GFX5_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_GFX5_LOWER_IND__VDDGFX_GFX5_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_GFX5_LOWER_IND__VDDGFX_GFX5_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_GFX5_UPPER_IND__VDDGFX_GFX5_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_GFX5_UPPER_IND__VDDGFX_GFX5_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_RSV1_LOWER_IND__VDDGFX_RSV1_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_RSV1_LOWER_IND__VDDGFX_RSV1_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_RSV1_LOWER_IND__VDDGFX_RSV1_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_RSV1_LOWER_IND__VDDGFX_RSV1_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_RSV1_LOWER_IND__VDDGFX_RSV1_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_RSV1_LOWER_IND__VDDGFX_RSV1_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_RSV1_UPPER_IND__VDDGFX_RSV1_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_RSV1_UPPER_IND__VDDGFX_RSV1_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_RSV2_LOWER_IND__VDDGFX_RSV2_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_RSV2_LOWER_IND__VDDGFX_RSV2_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_RSV2_LOWER_IND__VDDGFX_RSV2_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_RSV2_LOWER_IND__VDDGFX_RSV2_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_RSV2_LOWER_IND__VDDGFX_RSV2_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_RSV2_LOWER_IND__VDDGFX_RSV2_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_RSV2_UPPER_IND__VDDGFX_RSV2_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_RSV2_UPPER_IND__VDDGFX_RSV2_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_RSV3_LOWER_IND__VDDGFX_RSV3_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_RSV3_LOWER_IND__VDDGFX_RSV3_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_RSV3_LOWER_IND__VDDGFX_RSV3_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_RSV3_LOWER_IND__VDDGFX_RSV3_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_RSV3_LOWER_IND__VDDGFX_RSV3_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_RSV3_LOWER_IND__VDDGFX_RSV3_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_RSV3_UPPER_IND__VDDGFX_RSV3_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_RSV3_UPPER_IND__VDDGFX_RSV3_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_RSV4_LOWER_IND__VDDGFX_RSV4_REG_LOWER_MASK 0x3fffc
+#define BIF_VDDGFX_RSV4_LOWER_IND__VDDGFX_RSV4_REG_LOWER__SHIFT 0x2
+#define BIF_VDDGFX_RSV4_LOWER_IND__VDDGFX_RSV4_REG_CMP_EN_MASK 0x40000000
+#define BIF_VDDGFX_RSV4_LOWER_IND__VDDGFX_RSV4_REG_CMP_EN__SHIFT 0x1e
+#define BIF_VDDGFX_RSV4_LOWER_IND__VDDGFX_RSV4_REG_STALL_EN_MASK 0x80000000
+#define BIF_VDDGFX_RSV4_LOWER_IND__VDDGFX_RSV4_REG_STALL_EN__SHIFT 0x1f
+#define BIF_VDDGFX_RSV4_UPPER_IND__VDDGFX_RSV4_REG_UPPER_MASK 0x3fffc
+#define BIF_VDDGFX_RSV4_UPPER_IND__VDDGFX_RSV4_REG_UPPER__SHIFT 0x2
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_HDP_CMP_EN_MASK 0x1
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_HDP_CMP_EN__SHIFT 0x0
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_HDP_STALL_EN_MASK 0x2
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_HDP_STALL_EN__SHIFT 0x1
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_XDMA_CMP_EN_MASK 0x4
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_XDMA_CMP_EN__SHIFT 0x2
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_XDMA_STALL_EN_MASK 0x8
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_XDMA_STALL_EN__SHIFT 0x3
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_VGA_CMP_EN_MASK 0x10
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_VGA_CMP_EN__SHIFT 0x4
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_VGA_STALL_EN_MASK 0x20
+#define BIF_VDDGFX_FB_CMP_IND__VDDGFX_FB_VGA_STALL_EN__SHIFT 0x5
+#define BIF_DOORBELL_GBLAPER1_LOWER_IND__DOORBELL_GBLAPER1_LOWER_MASK 0xffc
+#define BIF_DOORBELL_GBLAPER1_LOWER_IND__DOORBELL_GBLAPER1_LOWER__SHIFT 0x2
+#define BIF_DOORBELL_GBLAPER1_LOWER_IND__DOORBELL_GBLAPER1_EN_MASK 0x80000000
+#define BIF_DOORBELL_GBLAPER1_LOWER_IND__DOORBELL_GBLAPER1_EN__SHIFT 0x1f
+#define BIF_DOORBELL_GBLAPER1_UPPER_IND__DOORBELL_GBLAPER1_UPPER_MASK 0xffc
+#define BIF_DOORBELL_GBLAPER1_UPPER_IND__DOORBELL_GBLAPER1_UPPER__SHIFT 0x2
+#define BIF_DOORBELL_GBLAPER2_LOWER_IND__DOORBELL_GBLAPER2_LOWER_MASK 0xffc
+#define BIF_DOORBELL_GBLAPER2_LOWER_IND__DOORBELL_GBLAPER2_LOWER__SHIFT 0x2
+#define BIF_DOORBELL_GBLAPER2_LOWER_IND__DOORBELL_GBLAPER2_EN_MASK 0x80000000
+#define BIF_DOORBELL_GBLAPER2_LOWER_IND__DOORBELL_GBLAPER2_EN__SHIFT 0x1f
+#define BIF_DOORBELL_GBLAPER2_UPPER_IND__DOORBELL_GBLAPER2_UPPER_MASK 0xffc
+#define BIF_DOORBELL_GBLAPER2_UPPER_IND__DOORBELL_GBLAPER2_UPPER__SHIFT 0x2
+#define BIF_SMU_INDEX_IND__BIF_SMU_INDEX_MASK 0x7fffc
+#define BIF_SMU_INDEX_IND__BIF_SMU_INDEX__SHIFT 0x2
+#define BIF_SMU_DATA_IND__BIF_SMU_DATA_MASK 0x7fffc
+#define BIF_SMU_DATA_IND__BIF_SMU_DATA__SHIFT 0x2
+#define IMPCTL_RESET_IND__IMP_SW_RESET_MASK 0x1
+#define IMPCTL_RESET_IND__IMP_SW_RESET__SHIFT 0x0
+#define GARLIC_FLUSH_CNTL_IND__CP_RB0_WPTR_MASK 0x1
+#define GARLIC_FLUSH_CNTL_IND__CP_RB0_WPTR__SHIFT 0x0
+#define GARLIC_FLUSH_CNTL_IND__CP_RB1_WPTR_MASK 0x2
+#define GARLIC_FLUSH_CNTL_IND__CP_RB1_WPTR__SHIFT 0x1
+#define GARLIC_FLUSH_CNTL_IND__CP_RB2_WPTR_MASK 0x4
+#define GARLIC_FLUSH_CNTL_IND__CP_RB2_WPTR__SHIFT 0x2
+#define GARLIC_FLUSH_CNTL_IND__UVD_RBC_RB_WPTR_MASK 0x8
+#define GARLIC_FLUSH_CNTL_IND__UVD_RBC_RB_WPTR__SHIFT 0x3
+#define GARLIC_FLUSH_CNTL_IND__SDMA0_GFX_RB_WPTR_MASK 0x10
+#define GARLIC_FLUSH_CNTL_IND__SDMA0_GFX_RB_WPTR__SHIFT 0x4
+#define GARLIC_FLUSH_CNTL_IND__SDMA1_GFX_RB_WPTR_MASK 0x20
+#define GARLIC_FLUSH_CNTL_IND__SDMA1_GFX_RB_WPTR__SHIFT 0x5
+#define GARLIC_FLUSH_CNTL_IND__CP_DMA_ME_COMMAND_MASK 0x40
+#define GARLIC_FLUSH_CNTL_IND__CP_DMA_ME_COMMAND__SHIFT 0x6
+#define GARLIC_FLUSH_CNTL_IND__CP_DMA_PFP_COMMAND_MASK 0x80
+#define GARLIC_FLUSH_CNTL_IND__CP_DMA_PFP_COMMAND__SHIFT 0x7
+#define GARLIC_FLUSH_CNTL_IND__SAM_SAB_RBI_WPTR_MASK 0x100
+#define GARLIC_FLUSH_CNTL_IND__SAM_SAB_RBI_WPTR__SHIFT 0x8
+#define GARLIC_FLUSH_CNTL_IND__SAM_SAB_RBO_WPTR_MASK 0x200
+#define GARLIC_FLUSH_CNTL_IND__SAM_SAB_RBO_WPTR__SHIFT 0x9
+#define GARLIC_FLUSH_CNTL_IND__VCE_OUT_RB_WPTR_MASK 0x400
+#define GARLIC_FLUSH_CNTL_IND__VCE_OUT_RB_WPTR__SHIFT 0xa
+#define GARLIC_FLUSH_CNTL_IND__VCE_RB_WPTR2_MASK 0x800
+#define GARLIC_FLUSH_CNTL_IND__VCE_RB_WPTR2__SHIFT 0xb
+#define GARLIC_FLUSH_CNTL_IND__VCE_RB_WPTR_MASK 0x1000
+#define GARLIC_FLUSH_CNTL_IND__VCE_RB_WPTR__SHIFT 0xc
+#define GARLIC_FLUSH_CNTL_IND__HOST_DOORBELL_MASK 0x2000
+#define GARLIC_FLUSH_CNTL_IND__HOST_DOORBELL__SHIFT 0xd
+#define GARLIC_FLUSH_CNTL_IND__SELFRING_DOORBELL_MASK 0x4000
+#define GARLIC_FLUSH_CNTL_IND__SELFRING_DOORBELL__SHIFT 0xe
+#define GARLIC_FLUSH_CNTL_IND__CP_DMA_PIO_COMMAND_MASK 0x8000
+#define GARLIC_FLUSH_CNTL_IND__CP_DMA_PIO_COMMAND__SHIFT 0xf
+#define GARLIC_FLUSH_CNTL_IND__DISPLAY_MASK 0x10000
+#define GARLIC_FLUSH_CNTL_IND__DISPLAY__SHIFT 0x10
+#define GARLIC_FLUSH_CNTL_IND__SDMA2_GFX_RB_WPTR_MASK 0x20000
+#define GARLIC_FLUSH_CNTL_IND__SDMA2_GFX_RB_WPTR__SHIFT 0x11
+#define GARLIC_FLUSH_CNTL_IND__SDMA3_GFX_RB_WPTR_MASK 0x40000
+#define GARLIC_FLUSH_CNTL_IND__SDMA3_GFX_RB_WPTR__SHIFT 0x12
+#define GARLIC_FLUSH_CNTL_IND__IGNORE_MC_DISABLE_MASK 0x40000000
+#define GARLIC_FLUSH_CNTL_IND__IGNORE_MC_DISABLE__SHIFT 0x1e
+#define GARLIC_FLUSH_CNTL_IND__DISABLE_ALL_MASK 0x80000000
+#define GARLIC_FLUSH_CNTL_IND__DISABLE_ALL__SHIFT 0x1f
+#define GARLIC_FLUSH_REQ_IND__FLUSH_REQ_MASK 0x1
+#define GARLIC_FLUSH_REQ_IND__FLUSH_REQ__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_REQ_IND__CP0_MASK 0x1
+#define GPU_GARLIC_FLUSH_REQ_IND__CP0__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_REQ_IND__CP1_MASK 0x2
+#define GPU_GARLIC_FLUSH_REQ_IND__CP1__SHIFT 0x1
+#define GPU_GARLIC_FLUSH_REQ_IND__CP2_MASK 0x4
+#define GPU_GARLIC_FLUSH_REQ_IND__CP2__SHIFT 0x2
+#define GPU_GARLIC_FLUSH_REQ_IND__CP3_MASK 0x8
+#define GPU_GARLIC_FLUSH_REQ_IND__CP3__SHIFT 0x3
+#define GPU_GARLIC_FLUSH_REQ_IND__CP4_MASK 0x10
+#define GPU_GARLIC_FLUSH_REQ_IND__CP4__SHIFT 0x4
+#define GPU_GARLIC_FLUSH_REQ_IND__CP5_MASK 0x20
+#define GPU_GARLIC_FLUSH_REQ_IND__CP5__SHIFT 0x5
+#define GPU_GARLIC_FLUSH_REQ_IND__CP6_MASK 0x40
+#define GPU_GARLIC_FLUSH_REQ_IND__CP6__SHIFT 0x6
+#define GPU_GARLIC_FLUSH_REQ_IND__CP7_MASK 0x80
+#define GPU_GARLIC_FLUSH_REQ_IND__CP7__SHIFT 0x7
+#define GPU_GARLIC_FLUSH_REQ_IND__CP8_MASK 0x100
+#define GPU_GARLIC_FLUSH_REQ_IND__CP8__SHIFT 0x8
+#define GPU_GARLIC_FLUSH_REQ_IND__CP9_MASK 0x200
+#define GPU_GARLIC_FLUSH_REQ_IND__CP9__SHIFT 0x9
+#define GPU_GARLIC_FLUSH_REQ_IND__SDMA0_MASK 0x400
+#define GPU_GARLIC_FLUSH_REQ_IND__SDMA0__SHIFT 0xa
+#define GPU_GARLIC_FLUSH_REQ_IND__SDMA1_MASK 0x800
+#define GPU_GARLIC_FLUSH_REQ_IND__SDMA1__SHIFT 0xb
+#define GPU_GARLIC_FLUSH_REQ_IND__SDMA2_MASK 0x1000
+#define GPU_GARLIC_FLUSH_REQ_IND__SDMA2__SHIFT 0xc
+#define GPU_GARLIC_FLUSH_REQ_IND__SDMA3_MASK 0x2000
+#define GPU_GARLIC_FLUSH_REQ_IND__SDMA3__SHIFT 0xd
+#define GPU_GARLIC_FLUSH_DONE_IND__CP0_MASK 0x1
+#define GPU_GARLIC_FLUSH_DONE_IND__CP0__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_DONE_IND__CP1_MASK 0x2
+#define GPU_GARLIC_FLUSH_DONE_IND__CP1__SHIFT 0x1
+#define GPU_GARLIC_FLUSH_DONE_IND__CP2_MASK 0x4
+#define GPU_GARLIC_FLUSH_DONE_IND__CP2__SHIFT 0x2
+#define GPU_GARLIC_FLUSH_DONE_IND__CP3_MASK 0x8
+#define GPU_GARLIC_FLUSH_DONE_IND__CP3__SHIFT 0x3
+#define GPU_GARLIC_FLUSH_DONE_IND__CP4_MASK 0x10
+#define GPU_GARLIC_FLUSH_DONE_IND__CP4__SHIFT 0x4
+#define GPU_GARLIC_FLUSH_DONE_IND__CP5_MASK 0x20
+#define GPU_GARLIC_FLUSH_DONE_IND__CP5__SHIFT 0x5
+#define GPU_GARLIC_FLUSH_DONE_IND__CP6_MASK 0x40
+#define GPU_GARLIC_FLUSH_DONE_IND__CP6__SHIFT 0x6
+#define GPU_GARLIC_FLUSH_DONE_IND__CP7_MASK 0x80
+#define GPU_GARLIC_FLUSH_DONE_IND__CP7__SHIFT 0x7
+#define GPU_GARLIC_FLUSH_DONE_IND__CP8_MASK 0x100
+#define GPU_GARLIC_FLUSH_DONE_IND__CP8__SHIFT 0x8
+#define GPU_GARLIC_FLUSH_DONE_IND__CP9_MASK 0x200
+#define GPU_GARLIC_FLUSH_DONE_IND__CP9__SHIFT 0x9
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA0_MASK 0x400
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA0__SHIFT 0xa
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA1_MASK 0x800
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA1__SHIFT 0xb
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA2_MASK 0x1000
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA2__SHIFT 0xc
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA3_MASK 0x2000
+#define GPU_GARLIC_FLUSH_DONE_IND__SDMA3__SHIFT 0xd
+#define GARLIC_COHE_CP_RB0_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB0_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_RB1_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB1_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_RB2_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_RB2_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_UVD_RBC_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_UVD_RBC_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA0_GFX_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA0_GFX_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA1_GFX_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA1_GFX_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_DMA_ME_COMMAND_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_DMA_ME_COMMAND_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_DMA_PFP_COMMAND_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_DMA_PFP_COMMAND_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SAM_SAB_RBI_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SAM_SAB_RBI_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SAM_SAB_RBO_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SAM_SAB_RBO_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_OUT_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_OUT_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_RB_WPTR2_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_RB_WPTR2_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_VCE_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_VCE_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA2_GFX_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA2_GFX_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_SDMA3_GFX_RB_WPTR_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_SDMA3_GFX_RB_WPTR_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_CP_DMA_PIO_COMMAND_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_CP_DMA_PIO_COMMAND_IND__ADDRESS__SHIFT 0x2
+#define GARLIC_COHE_GARLIC_FLUSH_REQ_IND__ADDRESS_MASK 0x7fffc
+#define GARLIC_COHE_GARLIC_FLUSH_REQ_IND__ADDRESS__SHIFT 0x2
+#define REMAP_HDP_MEM_FLUSH_CNTL_IND__ADDRESS_MASK 0x7fffc
+#define REMAP_HDP_MEM_FLUSH_CNTL_IND__ADDRESS__SHIFT 0x2
+#define REMAP_HDP_REG_FLUSH_CNTL_IND__ADDRESS_MASK 0x7fffc
+#define REMAP_HDP_REG_FLUSH_CNTL_IND__ADDRESS__SHIFT 0x2
+#define BIOS_SCRATCH_0_IND__BIOS_SCRATCH_0_MASK 0xffffffff
+#define BIOS_SCRATCH_0_IND__BIOS_SCRATCH_0__SHIFT 0x0
+#define BIOS_SCRATCH_1_IND__BIOS_SCRATCH_1_MASK 0xffffffff
+#define BIOS_SCRATCH_1_IND__BIOS_SCRATCH_1__SHIFT 0x0
+#define BIOS_SCRATCH_2_IND__BIOS_SCRATCH_2_MASK 0xffffffff
+#define BIOS_SCRATCH_2_IND__BIOS_SCRATCH_2__SHIFT 0x0
+#define BIOS_SCRATCH_3_IND__BIOS_SCRATCH_3_MASK 0xffffffff
+#define BIOS_SCRATCH_3_IND__BIOS_SCRATCH_3__SHIFT 0x0
+#define BIOS_SCRATCH_4_IND__BIOS_SCRATCH_4_MASK 0xffffffff
+#define BIOS_SCRATCH_4_IND__BIOS_SCRATCH_4__SHIFT 0x0
+#define BIOS_SCRATCH_5_IND__BIOS_SCRATCH_5_MASK 0xffffffff
+#define BIOS_SCRATCH_5_IND__BIOS_SCRATCH_5__SHIFT 0x0
+#define BIOS_SCRATCH_6_IND__BIOS_SCRATCH_6_MASK 0xffffffff
+#define BIOS_SCRATCH_6_IND__BIOS_SCRATCH_6__SHIFT 0x0
+#define BIOS_SCRATCH_7_IND__BIOS_SCRATCH_7_MASK 0xffffffff
+#define BIOS_SCRATCH_7_IND__BIOS_SCRATCH_7__SHIFT 0x0
+#define BIOS_SCRATCH_8_IND__BIOS_SCRATCH_8_MASK 0xffffffff
+#define BIOS_SCRATCH_8_IND__BIOS_SCRATCH_8__SHIFT 0x0
+#define BIOS_SCRATCH_9_IND__BIOS_SCRATCH_9_MASK 0xffffffff
+#define BIOS_SCRATCH_9_IND__BIOS_SCRATCH_9__SHIFT 0x0
+#define BIOS_SCRATCH_10_IND__BIOS_SCRATCH_10_MASK 0xffffffff
+#define BIOS_SCRATCH_10_IND__BIOS_SCRATCH_10__SHIFT 0x0
+#define BIOS_SCRATCH_11_IND__BIOS_SCRATCH_11_MASK 0xffffffff
+#define BIOS_SCRATCH_11_IND__BIOS_SCRATCH_11__SHIFT 0x0
+#define BIOS_SCRATCH_12_IND__BIOS_SCRATCH_12_MASK 0xffffffff
+#define BIOS_SCRATCH_12_IND__BIOS_SCRATCH_12__SHIFT 0x0
+#define BIOS_SCRATCH_13_IND__BIOS_SCRATCH_13_MASK 0xffffffff
+#define BIOS_SCRATCH_13_IND__BIOS_SCRATCH_13__SHIFT 0x0
+#define BIOS_SCRATCH_14_IND__BIOS_SCRATCH_14_MASK 0xffffffff
+#define BIOS_SCRATCH_14_IND__BIOS_SCRATCH_14__SHIFT 0x0
+#define BIOS_SCRATCH_15_IND__BIOS_SCRATCH_15_MASK 0xffffffff
+#define BIOS_SCRATCH_15_IND__BIOS_SCRATCH_15__SHIFT 0x0
+#define BIF_RB_CNTL_IND__RB_ENABLE_MASK 0x1
+#define BIF_RB_CNTL_IND__RB_ENABLE__SHIFT 0x0
+#define BIF_RB_CNTL_IND__RB_SIZE_MASK 0x3e
+#define BIF_RB_CNTL_IND__RB_SIZE__SHIFT 0x1
+#define BIF_RB_CNTL_IND__WPTR_WRITEBACK_ENABLE_MASK 0x100
+#define BIF_RB_CNTL_IND__WPTR_WRITEBACK_ENABLE__SHIFT 0x8
+#define BIF_RB_CNTL_IND__WPTR_WRITEBACK_TIMER_MASK 0x3e00
+#define BIF_RB_CNTL_IND__WPTR_WRITEBACK_TIMER__SHIFT 0x9
+#define BIF_RB_CNTL_IND__BIF_RB_TRAN_MASK 0x20000
+#define BIF_RB_CNTL_IND__BIF_RB_TRAN__SHIFT 0x11
+#define BIF_RB_CNTL_IND__WPTR_OVERFLOW_CLEAR_MASK 0x80000000
+#define BIF_RB_CNTL_IND__WPTR_OVERFLOW_CLEAR__SHIFT 0x1f
+#define BIF_RB_BASE_IND__ADDR_MASK 0xffffffff
+#define BIF_RB_BASE_IND__ADDR__SHIFT 0x0
+#define BIF_RB_RPTR_IND__OFFSET_MASK 0x3fffc
+#define BIF_RB_RPTR_IND__OFFSET__SHIFT 0x2
+#define BIF_RB_WPTR_IND__BIF_RB_OVERFLOW_MASK 0x1
+#define BIF_RB_WPTR_IND__BIF_RB_OVERFLOW__SHIFT 0x0
+#define BIF_RB_WPTR_IND__OFFSET_MASK 0x3fffc
+#define BIF_RB_WPTR_IND__OFFSET__SHIFT 0x2
+#define BIF_RB_WPTR_ADDR_HI_IND__ADDR_MASK 0xff
+#define BIF_RB_WPTR_ADDR_HI_IND__ADDR__SHIFT 0x0
+#define BIF_RB_WPTR_ADDR_LO_IND__ADDR_MASK 0xfffffffc
+#define BIF_RB_WPTR_ADDR_LO_IND__ADDR__SHIFT 0x2
+#define NB_GBIF_INDEX__NB_GBIF_IND_ADDR_MASK 0xffffffff
+#define NB_GBIF_INDEX__NB_GBIF_IND_ADDR__SHIFT 0x0
+#define NB_GBIF_DATA__NB_GBIF_DATA_MASK 0xffffffff
+#define NB_GBIF_DATA__NB_GBIF_DATA__SHIFT 0x0
+#define PCIE_INDEX__PCIE_INDEX_MASK 0xffffffff
+#define PCIE_INDEX__PCIE_INDEX__SHIFT 0x0
+#define PCIE_DATA__PCIE_DATA_MASK 0xffffffff
+#define PCIE_DATA__PCIE_DATA__SHIFT 0x0
+#define PCIE_INDEX_2__PCIE_INDEX_MASK 0xffffffff
+#define PCIE_INDEX_2__PCIE_INDEX__SHIFT 0x0
+#define PCIE_DATA_2__PCIE_DATA_MASK 0xffffffff
+#define PCIE_DATA_2__PCIE_DATA__SHIFT 0x0
+#define PCIE_RESERVED__PCIE_RESERVED_MASK 0xffffffff
+#define PCIE_RESERVED__PCIE_RESERVED__SHIFT 0x0
+#define PCIE_SCRATCH__PCIE_SCRATCH_MASK 0xffffffff
+#define PCIE_SCRATCH__PCIE_SCRATCH__SHIFT 0x0
+#define PCIE_HW_DEBUG__HW_00_DEBUG_MASK 0x1
+#define PCIE_HW_DEBUG__HW_00_DEBUG__SHIFT 0x0
+#define PCIE_HW_DEBUG__HW_01_DEBUG_MASK 0x2
+#define PCIE_HW_DEBUG__HW_01_DEBUG__SHIFT 0x1
+#define PCIE_HW_DEBUG__HW_02_DEBUG_MASK 0x4
+#define PCIE_HW_DEBUG__HW_02_DEBUG__SHIFT 0x2
+#define PCIE_HW_DEBUG__HW_03_DEBUG_MASK 0x8
+#define PCIE_HW_DEBUG__HW_03_DEBUG__SHIFT 0x3
+#define PCIE_HW_DEBUG__HW_04_DEBUG_MASK 0x10
+#define PCIE_HW_DEBUG__HW_04_DEBUG__SHIFT 0x4
+#define PCIE_HW_DEBUG__HW_05_DEBUG_MASK 0x20
+#define PCIE_HW_DEBUG__HW_05_DEBUG__SHIFT 0x5
+#define PCIE_HW_DEBUG__HW_06_DEBUG_MASK 0x40
+#define PCIE_HW_DEBUG__HW_06_DEBUG__SHIFT 0x6
+#define PCIE_HW_DEBUG__HW_07_DEBUG_MASK 0x80
+#define PCIE_HW_DEBUG__HW_07_DEBUG__SHIFT 0x7
+#define PCIE_HW_DEBUG__HW_08_DEBUG_MASK 0x100
+#define PCIE_HW_DEBUG__HW_08_DEBUG__SHIFT 0x8
+#define PCIE_HW_DEBUG__HW_09_DEBUG_MASK 0x200
+#define PCIE_HW_DEBUG__HW_09_DEBUG__SHIFT 0x9
+#define PCIE_HW_DEBUG__HW_10_DEBUG_MASK 0x400
+#define PCIE_HW_DEBUG__HW_10_DEBUG__SHIFT 0xa
+#define PCIE_HW_DEBUG__HW_11_DEBUG_MASK 0x800
+#define PCIE_HW_DEBUG__HW_11_DEBUG__SHIFT 0xb
+#define PCIE_HW_DEBUG__HW_12_DEBUG_MASK 0x1000
+#define PCIE_HW_DEBUG__HW_12_DEBUG__SHIFT 0xc
+#define PCIE_HW_DEBUG__HW_13_DEBUG_MASK 0x2000
+#define PCIE_HW_DEBUG__HW_13_DEBUG__SHIFT 0xd
+#define PCIE_HW_DEBUG__HW_14_DEBUG_MASK 0x4000
+#define PCIE_HW_DEBUG__HW_14_DEBUG__SHIFT 0xe
+#define PCIE_HW_DEBUG__HW_15_DEBUG_MASK 0x8000
+#define PCIE_HW_DEBUG__HW_15_DEBUG__SHIFT 0xf
+#define PCIE_RX_NUM_NAK__RX_NUM_NAK_MASK 0xffffffff
+#define PCIE_RX_NUM_NAK__RX_NUM_NAK__SHIFT 0x0
+#define PCIE_RX_NUM_NAK_GENERATED__RX_NUM_NAK_GENERATED_MASK 0xffffffff
+#define PCIE_RX_NUM_NAK_GENERATED__RX_NUM_NAK_GENERATED__SHIFT 0x0
+#define PCIE_CNTL__HWINIT_WR_LOCK_MASK 0x1
+#define PCIE_CNTL__HWINIT_WR_LOCK__SHIFT 0x0
+#define PCIE_CNTL__LC_HOT_PLUG_DELAY_SEL_MASK 0xe
+#define PCIE_CNTL__LC_HOT_PLUG_DELAY_SEL__SHIFT 0x1
+#define PCIE_CNTL__UR_ERR_REPORT_DIS_MASK 0x80
+#define PCIE_CNTL__UR_ERR_REPORT_DIS__SHIFT 0x7
+#define PCIE_CNTL__PCIE_MALFORM_ATOMIC_OPS_MASK 0x100
+#define PCIE_CNTL__PCIE_MALFORM_ATOMIC_OPS__SHIFT 0x8
+#define PCIE_CNTL__PCIE_HT_NP_MEM_WRITE_MASK 0x200
+#define PCIE_CNTL__PCIE_HT_NP_MEM_WRITE__SHIFT 0x9
+#define PCIE_CNTL__RX_SB_ADJ_PAYLOAD_SIZE_MASK 0x1c00
+#define PCIE_CNTL__RX_SB_ADJ_PAYLOAD_SIZE__SHIFT 0xa
+#define PCIE_CNTL__RX_RCB_ATS_UC_DIS_MASK 0x8000
+#define PCIE_CNTL__RX_RCB_ATS_UC_DIS__SHIFT 0xf
+#define PCIE_CNTL__RX_RCB_REORDER_EN_MASK 0x10000
+#define PCIE_CNTL__RX_RCB_REORDER_EN__SHIFT 0x10
+#define PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS_MASK 0x20000
+#define PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS__SHIFT 0x11
+#define PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS_MASK 0x40000
+#define PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS__SHIFT 0x12
+#define PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE_MASK 0x80000
+#define PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE__SHIFT 0x13
+#define PCIE_CNTL__RX_RCB_CHANNEL_ORDERING_MASK 0x100000
+#define PCIE_CNTL__RX_RCB_CHANNEL_ORDERING__SHIFT 0x14
+#define PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS_MASK 0x200000
+#define PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS__SHIFT 0x15
+#define PCIE_CNTL__RX_RCB_WRONG_FUNCNUM_DIS_MASK 0x400000
+#define PCIE_CNTL__RX_RCB_WRONG_FUNCNUM_DIS__SHIFT 0x16
+#define PCIE_CNTL__RX_ATS_TRAN_CPL_SPLIT_DIS_MASK 0x800000
+#define PCIE_CNTL__RX_ATS_TRAN_CPL_SPLIT_DIS__SHIFT 0x17
+#define PCIE_CNTL__TX_CPL_DEBUG_MASK 0x3f000000
+#define PCIE_CNTL__TX_CPL_DEBUG__SHIFT 0x18
+#define PCIE_CNTL__RX_IGNORE_LTR_MSG_UR_MASK 0x40000000
+#define PCIE_CNTL__RX_IGNORE_LTR_MSG_UR__SHIFT 0x1e
+#define PCIE_CNTL__RX_CPL_POSTED_REQ_ORD_EN_MASK 0x80000000
+#define PCIE_CNTL__RX_CPL_POSTED_REQ_ORD_EN__SHIFT 0x1f
+#define PCIE_CONFIG_CNTL__DYN_CLK_LATENCY_MASK 0xf
+#define PCIE_CONFIG_CNTL__DYN_CLK_LATENCY__SHIFT 0x0
+#define PCIE_CONFIG_CNTL__CI_MAX_PAYLOAD_SIZE_MODE_MASK 0x10000
+#define PCIE_CONFIG_CNTL__CI_MAX_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_PAYLOAD_SIZE_MASK 0xe0000
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_PAYLOAD_SIZE__SHIFT 0x11
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_REQUEST_SIZE_MODE_MASK 0x100000
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_REQUEST_SIZE_MODE__SHIFT 0x14
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_READ_REQUEST_SIZE_MASK 0xe00000
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_READ_REQUEST_SIZE__SHIFT 0x15
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_SAFE_MODE_MASK 0x1000000
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_SAFE_MODE__SHIFT 0x18
+#define PCIE_CONFIG_CNTL__CI_EXTENDED_TAG_EN_OVERRIDE_MASK 0x6000000
+#define PCIE_CONFIG_CNTL__CI_EXTENDED_TAG_EN_OVERRIDE__SHIFT 0x19
+#define PCIE_DEBUG_CNTL__DEBUG_PORT_EN_MASK 0xff
+#define PCIE_DEBUG_CNTL__DEBUG_PORT_EN__SHIFT 0x0
+#define PCIE_DEBUG_CNTL__DEBUG_SELECT_MASK 0x100
+#define PCIE_DEBUG_CNTL__DEBUG_SELECT__SHIFT 0x8
+#define PCIE_DEBUG_CNTL__DEBUG_LANE_EN_MASK 0xffff0000
+#define PCIE_DEBUG_CNTL__DEBUG_LANE_EN__SHIFT 0x10
+#define PCIE_INT_CNTL__CORR_ERR_INT_EN_MASK 0x1
+#define PCIE_INT_CNTL__CORR_ERR_INT_EN__SHIFT 0x0
+#define PCIE_INT_CNTL__NON_FATAL_ERR_INT_EN_MASK 0x2
+#define PCIE_INT_CNTL__NON_FATAL_ERR_INT_EN__SHIFT 0x1
+#define PCIE_INT_CNTL__FATAL_ERR_INT_EN_MASK 0x4
+#define PCIE_INT_CNTL__FATAL_ERR_INT_EN__SHIFT 0x2
+#define PCIE_INT_CNTL__USR_DETECTED_INT_EN_MASK 0x8
+#define PCIE_INT_CNTL__USR_DETECTED_INT_EN__SHIFT 0x3
+#define PCIE_INT_CNTL__MISC_ERR_INT_EN_MASK 0x10
+#define PCIE_INT_CNTL__MISC_ERR_INT_EN__SHIFT 0x4
+#define PCIE_INT_CNTL__POWER_STATE_CHG_INT_EN_MASK 0x40
+#define PCIE_INT_CNTL__POWER_STATE_CHG_INT_EN__SHIFT 0x6
+#define PCIE_INT_CNTL__LINK_BW_INT_EN_MASK 0x80
+#define PCIE_INT_CNTL__LINK_BW_INT_EN__SHIFT 0x7
+#define PCIE_INT_CNTL__QUIESCE_RCVD_INT_EN_MASK 0x100
+#define PCIE_INT_CNTL__QUIESCE_RCVD_INT_EN__SHIFT 0x8
+#define PCIE_INT_STATUS__CORR_ERR_INT_STATUS_MASK 0x1
+#define PCIE_INT_STATUS__CORR_ERR_INT_STATUS__SHIFT 0x0
+#define PCIE_INT_STATUS__NON_FATAL_ERR_INT_STATUS_MASK 0x2
+#define PCIE_INT_STATUS__NON_FATAL_ERR_INT_STATUS__SHIFT 0x1
+#define PCIE_INT_STATUS__FATAL_ERR_INT_STATUS_MASK 0x4
+#define PCIE_INT_STATUS__FATAL_ERR_INT_STATUS__SHIFT 0x2
+#define PCIE_INT_STATUS__USR_DETECTED_INT_STATUS_MASK 0x8
+#define PCIE_INT_STATUS__USR_DETECTED_INT_STATUS__SHIFT 0x3
+#define PCIE_INT_STATUS__MISC_ERR_INT_STATUS_MASK 0x10
+#define PCIE_INT_STATUS__MISC_ERR_INT_STATUS__SHIFT 0x4
+#define PCIE_INT_STATUS__POWER_STATE_CHG_INT_STATUS_MASK 0x40
+#define PCIE_INT_STATUS__POWER_STATE_CHG_INT_STATUS__SHIFT 0x6
+#define PCIE_INT_STATUS__LINK_BW_INT_STATUS_MASK 0x80
+#define PCIE_INT_STATUS__LINK_BW_INT_STATUS__SHIFT 0x7
+#define PCIE_INT_STATUS__QUIESCE_RCVD_INT_STATUS_MASK 0x100
+#define PCIE_INT_STATUS__QUIESCE_RCVD_INT_STATUS__SHIFT 0x8
+#define PCIE_CNTL2__TX_ARB_ROUND_ROBIN_EN_MASK 0x1
+#define PCIE_CNTL2__TX_ARB_ROUND_ROBIN_EN__SHIFT 0x0
+#define PCIE_CNTL2__TX_ARB_SLV_LIMIT_MASK 0x3e
+#define PCIE_CNTL2__TX_ARB_SLV_LIMIT__SHIFT 0x1
+#define PCIE_CNTL2__TX_ARB_MST_LIMIT_MASK 0x7c0
+#define PCIE_CNTL2__TX_ARB_MST_LIMIT__SHIFT 0x6
+#define PCIE_CNTL2__TX_BLOCK_TLP_ON_PM_DIS_MASK 0x800
+#define PCIE_CNTL2__TX_BLOCK_TLP_ON_PM_DIS__SHIFT 0xb
+#define PCIE_CNTL2__SLV_MEM_LS_EN_MASK 0x10000
+#define PCIE_CNTL2__SLV_MEM_LS_EN__SHIFT 0x10
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN_MASK 0x20000
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN__SHIFT 0x11
+#define PCIE_CNTL2__MST_MEM_LS_EN_MASK 0x40000
+#define PCIE_CNTL2__MST_MEM_LS_EN__SHIFT 0x12
+#define PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK 0x80000
+#define PCIE_CNTL2__REPLAY_MEM_LS_EN__SHIFT 0x13
+#define PCIE_CNTL2__SLV_MEM_SD_EN_MASK 0x100000
+#define PCIE_CNTL2__SLV_MEM_SD_EN__SHIFT 0x14
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN_MASK 0x200000
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN__SHIFT 0x15
+#define PCIE_CNTL2__MST_MEM_SD_EN_MASK 0x400000
+#define PCIE_CNTL2__MST_MEM_SD_EN__SHIFT 0x16
+#define PCIE_CNTL2__REPLAY_MEM_SD_EN_MASK 0x800000
+#define PCIE_CNTL2__REPLAY_MEM_SD_EN__SHIFT 0x17
+#define PCIE_CNTL2__RX_NP_MEM_WRITE_ENCODING_MASK 0x1f000000
+#define PCIE_CNTL2__RX_NP_MEM_WRITE_ENCODING__SHIFT 0x18
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVALIDPASID_UR_MASK 0x1
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVALIDPASID_UR__SHIFT 0x0
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMRD_UR_MASK 0x2
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMRD_UR__SHIFT 0x1
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMWR_UR_MASK 0x4
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMWR_UR__SHIFT 0x2
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_ATSTRANSREQ_UR_MASK 0x8
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_ATSTRANSREQ_UR__SHIFT 0x3
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_PAGEREQMSG_UR_MASK 0x10
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_PAGEREQMSG_UR__SHIFT 0x4
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVCPL_UR_MASK 0

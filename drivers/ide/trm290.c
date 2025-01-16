@@ -1,374 +1,426 @@
 /*
- *  Copyright (c) 1997-1998  Mark Lord
- *  Copyright (c) 2007       MontaVista Software, Inc. <source@mvista.com>
+ * Intel I/OAT DMA Linux driver
+ * Copyright(c) 2004 - 2015 Intel Corporation.
  *
- *  May be copied or modified under the terms of the GNU General Public License
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
  *
- *  June 22, 2004 - get rid of check_region
- *                   - Jesper Juhl
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * The full GNU General Public License is included in this distribution in
+ * the file called "COPYING".
  *
  */
 
 /*
- * This module provides support for the bus-master IDE DMA function
- * of the Tekram TRM290 chip, used on a variety of PCI IDE add-on boards,
- * including a "Precision Instruments" board.  The TRM290 pre-dates
- * the sff-8038 standard (ide-dma.c) by a few months, and differs
- * significantly enough to warrant separate routines for some functions,
- * while re-using others from ide-dma.c.
- *
- * EXPERIMENTAL!  It works for me (a sample of one).
- *
- * Works reliably for me in DMA mode (READs only),
- * DMA WRITEs are disabled by default (see #define below);
- *
- * DMA is not enabled automatically for this chipset,
- * but can be turned on manually (with "hdparm -d1") at run time.
- *
- * I need volunteers with "spare" drives for further testing
- * and development, and maybe to help figure out the peculiarities.
- * Even knowing the registers (below), some things behave strangely.
+ * This driver supports an Intel I/OAT DMA engine, which does asynchronous
+ * copy operations.
  */
 
-#define TRM290_NO_DMA_WRITES	/* DMA writes seem unreliable sometimes */
-
-/*
- * TRM-290 PCI-IDE2 Bus Master Chip
- * ================================
- * The configuration registers are addressed in normal I/O port space
- * and are used as follows:
- *
- * trm290_base depends on jumper settings, and is probed for by ide-dma.c
- *
- * trm290_base+2 when WRITTEN: chiptest register (byte, write-only)
- *	bit7 must always be written as "1"
- *	bits6-2 undefined
- *	bit1 1=legacy_compatible_mode, 0=native_pci_mode
- *	bit0 1=test_mode, 0=normal(default)
- *
- * trm290_base+2 when READ: status register (byte, read-only)
- *	bits7-2 undefined
- *	bit1 channel0 busmaster interrupt status 0=none, 1=asserted
- *	bit0 channel0 interrupt status 0=none, 1=asserted
- *
- * trm290_base+3 Interrupt mask register
- *	bits7-5 undefined
- *	bit4 legacy_header: 1=present, 0=absent
- *	bit3 channel1 busmaster interrupt status 0=none, 1=asserted (read only)
- *	bit2 channel1 interrupt status 0=none, 1=asserted (read only)
- *	bit1 channel1 interrupt mask: 1=masked, 0=unmasked(default)
- *	bit0 channel0 interrupt mask: 1=masked, 0=unmasked(default)
- *
- * trm290_base+1 "CPR" Config Pointer Register (byte)
- *	bit7 1=autoincrement CPR bits 2-0 after each access of CDR
- *	bit6 1=min. 1 wait-state posted write cycle (default), 0=0 wait-state
- *	bit5 0=enabled master burst access (default), 1=disable  (write only)
- *	bit4 PCI DEVSEL# timing select: 1=medium(default), 0=fast
- *	bit3 0=primary IDE channel, 1=secondary IDE channel
- *	bits2-0 register index for accesses through CDR port
- *
- * trm290_base+0 "CDR" Config Data Register (word)
- *	two sets of seven config registers,
- *	selected by CPR bit 3 (channel) and CPR bits 2-0 (index 0 to 6),
- *	each index defined below:
- *
- * Index-0 Base address register for command block (word)
- *	defaults: 0x1f0 for primary, 0x170 for secondary
- *
- * Index-1 general config register (byte)
- *	bit7 1=DMA enable, 0=DMA disable
- *	bit6 1=activate IDE_RESET, 0=no action (default)
- *	bit5 1=enable IORDY, 0=disable IORDY (default)
- *	bit4 0=16-bit data port(default), 1=8-bit (XT) data port
- *	bit3 interrupt polarity: 1=active_low, 0=active_high(default)
- *	bit2 power-saving-mode(?): 1=enable, 0=disable(default) (write only)
- *	bit1 bus_master_mode(?): 1=enable, 0=disable(default)
- *	bit0 enable_io_ports: 1=enable(default), 0=disable
- *
- * Index-2 read-ahead counter preload bits 0-7 (byte, write only)
- *	bits7-0 bits7-0 of readahead count
- *
- * Index-3 read-ahead config register (byte, write only)
- *	bit7 1=enable_readahead, 0=disable_readahead(default)
- *	bit6 1=clear_FIFO, 0=no_action
- *	bit5 undefined
- *	bit4 mode4 timing control: 1=enable, 0=disable(default)
- *	bit3 undefined
- *	bit2 undefined
- *	bits1-0 bits9-8 of read-ahead count
- *
- * Index-4 base address register for control block (word)
- *	defaults: 0x3f6 for primary, 0x376 for secondary
- *
- * Index-5 data port timings (shared by both drives) (byte)
- *	standard PCI "clk" (clock) counts, default value = 0xf5
- *
- *	bits7-6 setup time:  00=1clk, 01=2clk, 10=3clk, 11=4clk
- *	bits5-3 hold time:	000=1clk, 001=2clk, 010=3clk,
- *				011=4clk, 100=5clk, 101=6clk,
- *				110=8clk, 111=12clk
- *	bits2-0 active time:	000=2clk, 001=3clk, 010=4clk,
- *				011=5clk, 100=6clk, 101=8clk,
- *				110=12clk, 111=16clk
- *
- * Index-6 command/control port timings (shared by both drives) (byte)
- *	same layout as Index-5, default value = 0xde
- *
- * Suggested CDR programming for PIO mode0 (600ns):
- *	0x01f0,0x21,0xff,0x80,0x03f6,0xf5,0xde	; primary
- *	0x0170,0x21,0xff,0x80,0x0376,0xf5,0xde	; secondary
- *
- * Suggested CDR programming for PIO mode3 (180ns):
- *	0x01f0,0x21,0xff,0x80,0x03f6,0x09,0xde	; primary
- *	0x0170,0x21,0xff,0x80,0x0376,0x09,0xde	; secondary
- *
- * Suggested CDR programming for PIO mode4 (120ns):
- *	0x01f0,0x21,0xff,0x80,0x03f6,0x00,0xde	; primary
- *	0x0170,0x21,0xff,0x80,0x0376,0x00,0xde	; secondary
- *
- */
-
-#include <linux/types.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/ioport.h>
-#include <linux/interrupt.h>
-#include <linux/blkdev.h>
 #include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/pci.h>
-#include <linux/ide.h>
+#include <linux/interrupt.h>
+#include <linux/dmaengine.h>
+#include <linux/delay.h>
+#include <linux/dma-mapping.h>
+#include <linux/workqueue.h>
+#include <linux/prefetch.h>
+#include "dma.h"
+#include "registers.h"
+#include "hw.h"
 
-#include <asm/io.h>
+#include "../dmaengine.h"
 
-#define DRV_NAME "trm290"
+static void ioat_eh(struct ioatdma_chan *ioat_chan);
 
-static void trm290_prepare_drive (ide_drive_t *drive, unsigned int use_dma)
+/**
+ * ioat_dma_do_interrupt - handler used for single vector interrupt mode
+ * @irq: interrupt id
+ * @data: interrupt data
+ */
+irqreturn_t ioat_dma_do_interrupt(int irq, void *data)
 {
-	ide_hwif_t *hwif = drive->hwif;
-	u16 reg = 0;
-	unsigned long flags;
+	struct ioatdma_device *instance = data;
+	struct ioatdma_chan *ioat_chan;
+	unsigned long attnstatus;
+	int bit;
+	u8 intrctrl;
 
-	/* select PIO or DMA */
-	reg = use_dma ? (0x21 | 0x82) : (0x21 & ~0x82);
+	intrctrl = readb(instance->reg_base + IOAT_INTRCTRL_OFFSET);
 
-	local_irq_save(flags);
+	if (!(intrctrl & IOAT_INTRCTRL_MASTER_INT_EN))
+		return IRQ_NONE;
 
-	if (reg != hwif->select_data) {
-		hwif->select_data = reg;
-		/* set PIO/DMA */
-		outb(0x51 | (hwif->channel << 3), hwif->config_data + 1);
-		outw(reg & 0xff, hwif->config_data);
+	if (!(intrctrl & IOAT_INTRCTRL_INT_STATUS)) {
+		writeb(intrctrl, instance->reg_base + IOAT_INTRCTRL_OFFSET);
+		return IRQ_NONE;
 	}
 
-	/* enable IRQ if not probing */
-	if (drive->dev_flags & IDE_DFLAG_PRESENT) {
-		reg = inw(hwif->config_data + 3);
-		reg &= 0x13;
-		reg &= ~(1 << hwif->channel);
-		outw(reg, hwif->config_data + 3);
+	attnstatus = readl(instance->reg_base + IOAT_ATTNSTATUS_OFFSET);
+	for_each_set_bit(bit, &attnstatus, BITS_PER_LONG) {
+		ioat_chan = ioat_chan_by_index(instance, bit);
+		if (test_bit(IOAT_RUN, &ioat_chan->state))
+			tasklet_schedule(&ioat_chan->cleanup_task);
 	}
 
-	local_irq_restore(flags);
+	writeb(intrctrl, instance->reg_base + IOAT_INTRCTRL_OFFSET);
+	return IRQ_HANDLED;
 }
 
-static void trm290_dev_select(ide_drive_t *drive)
+/**
+ * ioat_dma_do_interrupt_msix - handler used for vector-per-channel interrupt mode
+ * @irq: interrupt id
+ * @data: interrupt data
+ */
+irqreturn_t ioat_dma_do_interrupt_msix(int irq, void *data)
 {
-	trm290_prepare_drive(drive, !!(drive->dev_flags & IDE_DFLAG_USING_DMA));
+	struct ioatdma_chan *ioat_chan = data;
 
-	outb(drive->select | ATA_DEVICE_OBS, drive->hwif->io_ports.device_addr);
+	if (test_bit(IOAT_RUN, &ioat_chan->state))
+		tasklet_schedule(&ioat_chan->cleanup_task);
+
+	return IRQ_HANDLED;
 }
 
-static int trm290_dma_check(ide_drive_t *drive, struct ide_cmd *cmd)
+void ioat_stop(struct ioatdma_chan *ioat_chan)
 {
-	if (cmd->tf_flags & IDE_TFLAG_WRITE) {
-#ifdef TRM290_NO_DMA_WRITES
-		/* always use PIO for writes */
-		return 1;
-#endif
-	}
-	return 0;
-}
+	struct ioatdma_device *ioat_dma = ioat_chan->ioat_dma;
+	struct pci_dev *pdev = ioat_dma->pdev;
+	int chan_id = chan_num(ioat_chan);
+	struct msix_entry *msix;
 
-static int trm290_dma_setup(ide_drive_t *drive, struct ide_cmd *cmd)
-{
-	ide_hwif_t *hwif = drive->hwif;
-	unsigned int count, rw = (cmd->tf_flags & IDE_TFLAG_WRITE) ? 1 : 2;
-
-	count = ide_build_dmatable(drive, cmd);
-	if (count == 0)
-		/* try PIO instead of DMA */
-		return 1;
-
-	outl(hwif->dmatable_dma | rw, hwif->dma_base);
-	/* start DMA */
-	outw(count * 2 - 1, hwif->dma_base + 2);
-
-	return 0;
-}
-
-static void trm290_dma_start(ide_drive_t *drive)
-{
-	trm290_prepare_drive(drive, 1);
-}
-
-static int trm290_dma_end(ide_drive_t *drive)
-{
-	u16 status = inw(drive->hwif->dma_base + 2);
-
-	trm290_prepare_drive(drive, 0);
-
-	return status != 0x00ff;
-}
-
-static int trm290_dma_test_irq(ide_drive_t *drive)
-{
-	u16 status = inw(drive->hwif->dma_base + 2);
-
-	return status == 0x00ff;
-}
-
-static void trm290_dma_host_set(ide_drive_t *drive, int on)
-{
-}
-
-static void init_hwif_trm290(ide_hwif_t *hwif)
-{
-	struct pci_dev *dev	= to_pci_dev(hwif->dev);
-	unsigned int  cfg_base	= pci_resource_start(dev, 4);
-	unsigned long flags;
-	u8 reg = 0;
-
-	if ((dev->class & 5) && cfg_base)
-		printk(KERN_INFO DRV_NAME " %s: chip", pci_name(dev));
-	else {
-		cfg_base = 0x3df0;
-		printk(KERN_INFO DRV_NAME " %s: using default", pci_name(dev));
-	}
-	printk(KERN_CONT " config base at 0x%04x\n", cfg_base);
-	hwif->config_data = cfg_base;
-	hwif->dma_base = (cfg_base + 4) ^ (hwif->channel ? 0x80 : 0);
-
-	printk(KERN_INFO "    %s: BM-DMA at 0x%04lx-0x%04lx\n",
-	       hwif->name, hwif->dma_base, hwif->dma_base + 3);
-
-	if (ide_allocate_dma_engine(hwif))
-		return;
-
-	local_irq_save(flags);
-	/* put config reg into first byte of hwif->select_data */
-	outb(0x51 | (hwif->channel << 3), hwif->config_data + 1);
-	/* select PIO as default */
-	hwif->select_data = 0x21;
-	outb(hwif->select_data, hwif->config_data);
-	/* get IRQ info */
-	reg = inb(hwif->config_data + 3);
-	/* mask IRQs for both ports */
-	reg = (reg & 0x10) | 0x03;
-	outb(reg, hwif->config_data + 3);
-	local_irq_restore(flags);
-
-	if (reg & 0x10)
-		/* legacy mode */
-		hwif->irq = hwif->channel ? 15 : 14;
-
-#if 1
-	{
-	/*
-	 * My trm290-based card doesn't seem to work with all possible values
-	 * for the control basereg, so this kludge ensures that we use only
-	 * values that are known to work.  Ugh.		-ml
+	/* 1/ stop irq from firing tasklets
+	 * 2/ stop the tasklet from re-arming irqs
 	 */
-		u16 new, old, compat = hwif->channel ? 0x374 : 0x3f4;
-		static u16 next_offset = 0;
-		u8 old_mask;
+	clear_bit(IOAT_RUN, &ioat_chan->state);
 
-		outb(0x54 | (hwif->channel << 3), hwif->config_data + 1);
-		old = inw(hwif->config_data);
-		old &= ~1;
-		old_mask = inb(old + 2);
-		if (old != compat && old_mask == 0xff) {
-			/* leave lower 10 bits untouched */
-			compat += (next_offset += 0x400);
-			hwif->io_ports.ctl_addr = compat + 2;
-			outw(compat | 1, hwif->config_data);
-			new = inw(hwif->config_data);
-			printk(KERN_INFO "%s: control basereg workaround: "
-				"old=0x%04x, new=0x%04x\n",
-				hwif->name, old, new & ~1);
-		}
+	/* flush inflight interrupts */
+	switch (ioat_dma->irq_mode) {
+	case IOAT_MSIX:
+		msix = &ioat_dma->msix_entries[chan_id];
+		synchronize_irq(msix->vector);
+		break;
+	case IOAT_MSI:
+	case IOAT_INTX:
+		synchronize_irq(pdev->irq);
+		break;
+	default:
+		break;
 	}
-#endif
+
+	/* flush inflight timers */
+	del_timer_sync(&ioat_chan->timer);
+
+	/* flush inflight tasklet runs */
+	tasklet_kill(&ioat_chan->cleanup_task);
+
+	/* final cleanup now that everything is quiesced and can't re-arm */
+	ioat_cleanup_event((unsigned long)&ioat_chan->dma_chan);
 }
 
-static const struct ide_tp_ops trm290_tp_ops = {
-	.exec_command		= ide_exec_command,
-	.read_status		= ide_read_status,
-	.read_altstatus		= ide_read_altstatus,
-	.write_devctl		= ide_write_devctl,
-
-	.dev_select		= trm290_dev_select,
-	.tf_load		= ide_tf_load,
-	.tf_read		= ide_tf_read,
-
-	.input_data		= ide_input_data,
-	.output_data		= ide_output_data,
-};
-
-static struct ide_dma_ops trm290_dma_ops = {
-	.dma_host_set		= trm290_dma_host_set,
-	.dma_setup 		= trm290_dma_setup,
-	.dma_start 		= trm290_dma_start,
-	.dma_end		= trm290_dma_end,
-	.dma_test_irq		= trm290_dma_test_irq,
-	.dma_lost_irq		= ide_dma_lost_irq,
-	.dma_check		= trm290_dma_check,
-};
-
-static const struct ide_port_info trm290_chipset = {
-	.name		= DRV_NAME,
-	.init_hwif	= init_hwif_trm290,
-	.tp_ops 	= &trm290_tp_ops,
-	.dma_ops	= &trm290_dma_ops,
-	.host_flags	= IDE_HFLAG_TRM290 |
-			  IDE_HFLAG_NO_ATAPI_DMA |
-#if 0 /* play it safe for now */
-			  IDE_HFLAG_TRUST_BIOS_FOR_DMA |
-#endif
-			  IDE_HFLAG_NO_AUTODMA |
-			  IDE_HFLAG_NO_LBA48,
-};
-
-static int trm290_init_one(struct pci_dev *dev, const struct pci_device_id *id)
+static void __ioat_issue_pending(struct ioatdma_chan *ioat_chan)
 {
-	return ide_pci_init_one(dev, &trm290_chipset, NULL);
+	ioat_chan->dmacount += ioat_ring_pending(ioat_chan);
+	ioat_chan->issued = ioat_chan->head;
+	writew(ioat_chan->dmacount,
+	       ioat_chan->reg_base + IOAT_CHAN_DMACOUNT_OFFSET);
+	dev_dbg(to_dev(ioat_chan),
+		"%s: head: %#x tail: %#x issued: %#x count: %#x\n",
+		__func__, ioat_chan->head, ioat_chan->tail,
+		ioat_chan->issued, ioat_chan->dmacount);
 }
 
-static const struct pci_device_id trm290_pci_tbl[] = {
-	{ PCI_VDEVICE(TEKRAM, PCI_DEVICE_ID_TEKRAM_DC290), 0 },
-	{ 0, },
-};
-MODULE_DEVICE_TABLE(pci, trm290_pci_tbl);
-
-static struct pci_driver trm290_pci_driver = {
-	.name		= "TRM290_IDE",
-	.id_table	= trm290_pci_tbl,
-	.probe		= trm290_init_one,
-	.remove		= ide_pci_remove,
-};
-
-static int __init trm290_ide_init(void)
+void ioat_issue_pending(struct dma_chan *c)
 {
-	return ide_pci_register_driver(&trm290_pci_driver);
+	struct ioatdma_chan *ioat_chan = to_ioat_chan(c);
+
+	if (ioat_ring_pending(ioat_chan)) {
+		spin_lock_bh(&ioat_chan->prep_lock);
+		__ioat_issue_pending(ioat_chan);
+		spin_unlock_bh(&ioat_chan->prep_lock);
+	}
 }
 
-static void __exit trm290_ide_exit(void)
+/**
+ * ioat_update_pending - log pending descriptors
+ * @ioat: ioat+ channel
+ *
+ * Check if the number of unsubmitted descriptors has exceeded the
+ * watermark.  Called with prep_lock held
+ */
+static void ioat_update_pending(struct ioatdma_chan *ioat_chan)
 {
-	pci_unregister_driver(&trm290_pci_driver);
+	if (ioat_ring_pending(ioat_chan) > ioat_pending_level)
+		__ioat_issue_pending(ioat_chan);
 }
 
-module_init(trm290_ide_init);
-module_exit(trm290_ide_exit);
+static void __ioat_start_null_desc(struct ioatdma_chan *ioat_chan)
+{
+	struct ioat_ring_ent *desc;
+	struct ioat_dma_descriptor *hw;
 
-MODULE_AUTHOR("Mark Lord");
-MODULE_DESCRIPTION("PCI driver module for Tekram TRM290 IDE");
-MODULE_LICENSE("GPL");
+	if (ioat_ring_space(ioat_chan) < 1) {
+		dev_err(to_dev(ioat_chan),
+			"Unable to start null desc - ring full\n");
+		return;
+	}
+
+	dev_dbg(to_dev(ioat_chan),
+		"%s: head: %#x tail: %#x issued: %#x\n",
+		__func__, ioat_chan->head, ioat_chan->tail, ioat_chan->issued);
+	desc = ioat_get_ring_ent(ioat_chan, ioat_chan->head);
+
+	hw = desc->hw;
+	hw->ctl = 0;
+	hw->ctl_f.null = 1;
+	hw->ctl_f.int_en = 1;
+	hw->ctl_f.compl_write = 1;
+	/* set size to non-zero value (channel returns error when size is 0) */
+	hw->size = NULL_DESC_BUFFER_SIZE;
+	hw->src_addr = 0;
+	hw->dst_addr = 0;
+	async_tx_ack(&desc->txd);
+	ioat_set_chainaddr(ioat_chan, desc->txd.phys);
+	dump_desc_dbg(ioat_chan, desc);
+	/* make sure descriptors are written before we submit */
+	wmb();
+	ioat_chan->head += 1;
+	__ioat_issue_pending(ioat_chan);
+}
+
+void ioat_start_null_desc(struct ioatdma_chan *ioat_chan)
+{
+	spin_lock_bh(&ioat_chan->prep_lock);
+	if (!test_bit(IOAT_CHAN_DOWN, &ioat_chan->state))
+		__ioat_start_null_desc(ioat_chan);
+	spin_unlock_bh(&ioat_chan->prep_lock);
+}
+
+static void __ioat_restart_chan(struct ioatdma_chan *ioat_chan)
+{
+	/* set the tail to be re-issued */
+	ioat_chan->issued = ioat_chan->tail;
+	ioat_chan->dmacount = 0;
+	mod_timer(&ioat_chan->timer, jiffies + COMPLETION_TIMEOUT);
+
+	dev_dbg(to_dev(ioat_chan),
+		"%s: head: %#x tail: %#x issued: %#x count: %#x\n",
+		__func__, ioat_chan->head, ioat_chan->tail,
+		ioat_chan->issued, ioat_chan->dmacount);
+
+	if (ioat_ring_pending(ioat_chan)) {
+		struct ioat_ring_ent *desc;
+
+		desc = ioat_get_ring_ent(ioat_chan, ioat_chan->tail);
+		ioat_set_chainaddr(ioat_chan, desc->txd.phys);
+		__ioat_issue_pending(ioat_chan);
+	} else
+		__ioat_start_null_desc(ioat_chan);
+}
+
+static int ioat_quiesce(struct ioatdma_chan *ioat_chan, unsigned long tmo)
+{
+	unsigned long end = jiffies + tmo;
+	int err = 0;
+	u32 status;
+
+	status = ioat_chansts(ioat_chan);
+	if (is_ioat_active(status) || is_ioat_idle(status))
+		ioat_suspend(ioat_chan);
+	while (is_ioat_active(status) || is_ioat_idle(status)) {
+		if (tmo && time_after(jiffies, end)) {
+			err = -ETIMEDOUT;
+			break;
+		}
+		status = ioat_chansts(ioat_chan);
+		cpu_relax();
+	}
+
+	return err;
+}
+
+static int ioat_reset_sync(struct ioatdma_chan *ioat_chan, unsigned long tmo)
+{
+	unsigned long end = jiffies + tmo;
+	int err = 0;
+
+	ioat_reset(ioat_chan);
+	while (ioat_reset_pending(ioat_chan)) {
+		if (end && time_after(jiffies, end)) {
+			err = -ETIMEDOUT;
+			break;
+		}
+		cpu_relax();
+	}
+
+	return err;
+}
+
+static dma_cookie_t ioat_tx_submit_unlock(struct dma_async_tx_descriptor *tx)
+	__releases(&ioat_chan->prep_lock)
+{
+	struct dma_chan *c = tx->chan;
+	struct ioatdma_chan *ioat_chan = to_ioat_chan(c);
+	dma_cookie_t cookie;
+
+	cookie = dma_cookie_assign(tx);
+	dev_dbg(to_dev(ioat_chan), "%s: cookie: %d\n", __func__, cookie);
+
+	if (!test_and_set_bit(IOAT_CHAN_ACTIVE, &ioat_chan->state))
+		mod_timer(&ioat_chan->timer, jiffies + COMPLETION_TIMEOUT);
+
+	/* make descriptor updates visible before advancing ioat->head,
+	 * this is purposefully not smp_wmb() since we are also
+	 * publishing the descriptor updates to a dma device
+	 */
+	wmb();
+
+	ioat_chan->head += ioat_chan->produce;
+
+	ioat_update_pending(ioat_chan);
+	spin_unlock_bh(&ioat_chan->prep_lock);
+
+	return cookie;
+}
+
+static struct ioat_ring_ent *
+ioat_alloc_ring_ent(struct dma_chan *chan, gfp_t flags)
+{
+	struct ioat_dma_descriptor *hw;
+	struct ioat_ring_ent *desc;
+	struct ioatdma_device *ioat_dma;
+	dma_addr_t phys;
+
+	ioat_dma = to_ioatdma_device(chan->device);
+	hw = pci_pool_alloc(ioat_dma->dma_pool, flags, &phys);
+	if (!hw)
+		return NULL;
+	memset(hw, 0, sizeof(*hw));
+
+	desc = kmem_cache_zalloc(ioat_cache, flags);
+	if (!desc) {
+		pci_pool_free(ioat_dma->dma_pool, hw, phys);
+		return NULL;
+	}
+
+	dma_async_tx_descriptor_init(&desc->txd, chan);
+	desc->txd.tx_submit = ioat_tx_submit_unlock;
+	desc->hw = hw;
+	desc->txd.phys = phys;
+	return desc;
+}
+
+void ioat_free_ring_ent(struct ioat_ring_ent *desc, struct dma_chan *chan)
+{
+	struct ioatdma_device *ioat_dma;
+
+	ioat_dma = to_ioatdma_device(chan->device);
+	pci_pool_free(ioat_dma->dma_pool, desc->hw, desc->txd.phys);
+	kmem_cache_free(ioat_cache, desc);
+}
+
+struct ioat_ring_ent **
+ioat_alloc_ring(struct dma_chan *c, int order, gfp_t flags)
+{
+	struct ioat_ring_ent **ring;
+	int descs = 1 << order;
+	int i;
+
+	if (order > ioat_get_max_alloc_order())
+		return NULL;
+
+	/* allocate the array to hold the software ring */
+	ring = kcalloc(descs, sizeof(*ring), flags);
+	if (!ring)
+		return NULL;
+	for (i = 0; i < descs; i++) {
+		ring[i] = ioat_alloc_ring_ent(c, flags);
+		if (!ring[i]) {
+			while (i--)
+				ioat_free_ring_ent(ring[i], c);
+			kfree(ring);
+			return NULL;
+		}
+		set_desc_id(ring[i], i);
+	}
+
+	/* link descs */
+	for (i = 0; i < descs-1; i++) {
+		struct ioat_ring_ent *next = ring[i+1];
+		struct ioat_dma_descriptor *hw = ring[i]->hw;
+
+		hw->next = next->txd.phys;
+	}
+	ring[i]->hw->next = ring[0]->txd.phys;
+
+	return ring;
+}
+
+static bool reshape_ring(struct ioatdma_chan *ioat_chan, int order)
+{
+	/* reshape differs from normal ring allocation in that we want
+	 * to allocate a new software ring while only
+	 * extending/truncating the hardware ring
+	 */
+	struct dma_chan *c = &ioat_chan->dma_chan;
+	const u32 curr_size = ioat_ring_size(ioat_chan);
+	const u16 active = ioat_ring_active(ioat_chan);
+	const u32 new_size = 1 << order;
+	struct ioat_ring_ent **ring;
+	u32 i;
+
+	if (order > ioat_get_max_alloc_order())
+		return false;
+
+	/* double check that we have at least 1 free descriptor */
+	if (active == curr_size)
+		return false;
+
+	/* when shrinking, verify that we can hold the current active
+	 * set in the new ring
+	 */
+	if (active >= new_size)
+		return false;
+
+	/* allocate the array to hold the software ring */
+	ring = kcalloc(new_size, sizeof(*ring), GFP_NOWAIT);
+	if (!ring)
+		return false;
+
+	/* allocate/trim descriptors as needed */
+	if (new_size > curr_size) {
+		/* copy current descriptors to the new ring */
+		for (i = 0; i < curr_size; i++) {
+			u16 curr_idx = (ioat_chan->tail+i) & (curr_size-1);
+			u16 new_idx = (ioat_chan->tail+i) & (new_size-1);
+
+			ring[new_idx] = ioat_chan->ring[curr_idx];
+			set_desc_id(ring[new_idx], new_idx);
+		}
+
+		/* add new descriptors to the ring */
+		for (i = curr_size; i < new_size; i++) {
+			u16 new_idx = (ioat_chan->tail+i) & (new_size-1);
+
+			ring[new_idx] = ioat_alloc_ring_ent(c, GFP_NOWAIT);
+			if (!ring[new_idx]) {
+				while (i--) {
+					u16 new_idx = (ioat_chan->tail+i) &
+						       (new_size-1);
+
+					ioat_free_ring_ent(ring[new_idx], c);
+				}
+				kfree(ring);
+				return false;
+			}
+			set_desc_id(ring[new_idx], new_idx);
+		}
+
+		/* hw link new descriptors */
+		for (i = curr_size-1; i <

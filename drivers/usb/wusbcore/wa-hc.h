@@ -1,481 +1,249 @@
-/*
- * HWA Host Controller Driver
- * Wire Adapter Control/Data Streaming Iface (WUSB1.0[8])
- *
- * Copyright (C) 2005-2006 Intel Corporation
- * Inaky Perez-Gonzalez <inaky.perez-gonzalez@intel.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
- *
- *
- * This driver implements a USB Host Controller (struct usb_hcd) for a
- * Wireless USB Host Controller based on the Wireless USB 1.0
- * Host-Wire-Adapter specification (in layman terms, a USB-dongle that
- * implements a Wireless USB host).
- *
- * Check out the Design-overview.txt file in the source documentation
- * for other details on the implementation.
- *
- * Main blocks:
- *
- *  driver     glue with the driver API, workqueue daemon
- *
- *  lc         RC instance life cycle management (create, destroy...)
- *
- *  hcd        glue with the USB API Host Controller Interface API.
- *
- *  nep        Notification EndPoint management: collect notifications
- *             and queue them with the workqueue daemon.
- *
- *             Handle notifications as coming from the NEP. Sends them
- *             off others to their respective modules (eg: connect,
- *             disconnect and reset go to devconnect).
- *
- *  rpipe      Remote Pipe management; rpipe is what we use to write
- *             to an endpoint on a WUSB device that is connected to a
- *             HWA RC.
- *
- *  xfer       Transfer management -- this is all the code that gets a
- *             buffer and pushes it to a device (or viceversa). *
- *
- * Some day a lot of this code will be shared between this driver and
- * the drivers for DWA (xfer, rpipe).
- *
- * All starts at driver.c:hwahc_probe(), when one of this guys is
- * connected. hwahc_disconnect() stops it.
- *
- * During operation, the main driver is devices connecting or
- * disconnecting. They cause the HWA RC to send notifications into
- * nep.c:hwahc_nep_cb() that will dispatch them to
- * notif.c:wa_notif_dispatch(). From there they will fan to cause
- * device connects, disconnects, etc.
- *
- * Note much of the activity is difficult to follow. For example a
- * device connect goes to devconnect, which will cause the "fake" root
- * hub port to show a connect and stop there. Then hub_wq will notice
- * and call into the rh.c:hwahc_rc_port_reset() code to authenticate
- * the device (and this might require user intervention) and enable
- * the port.
- *
- * We also have a timer workqueue going from devconnect.c that
- * schedules in hwahc_devconnect_create().
- *
- * The rest of the traffic is in the usual entry points of a USB HCD,
- * which are hooked up in driver.c:hwahc_rc_driver, and defined in
- * hcd.c.
- */
-
-#ifndef __HWAHC_INTERNAL_H__
-#define __HWAHC_INTERNAL_H__
-
-#include <linux/completion.h>
-#include <linux/usb.h>
-#include <linux/mutex.h>
-#include <linux/spinlock.h>
-#include <linux/uwb.h>
-#include <linux/usb/wusb.h>
-#include <linux/usb/wusb-wa.h>
-
-struct wusbhc;
-struct wahc;
-extern void wa_urb_enqueue_run(struct work_struct *ws);
-extern void wa_process_errored_transfers_run(struct work_struct *ws);
-
-/**
- * RPipe instance
- *
- * @descr's fields are kept in LE, as we need to send it back and
- * forth.
- *
- * @wa is referenced when set
- *
- * @segs_available is the number of requests segments that still can
- *                 be submitted to the controller without overloading
- *                 it. It is initialized to descr->wRequests when
- *                 aiming.
- *
- * A rpipe supports a max of descr->wRequests at the same time; before
- * submitting seg_lock has to be taken. If segs_avail > 0, then we can
- * submit; if not, we have to queue them.
- */
-struct wa_rpipe {
-	struct kref refcnt;
-	struct usb_rpipe_descriptor descr;
-	struct usb_host_endpoint *ep;
-	struct wahc *wa;
-	spinlock_t seg_lock;
-	struct list_head seg_list;
-	struct list_head list_node;
-	atomic_t segs_available;
-	u8 buffer[1];	/* For reads/writes on USB */
-};
-
-
-enum wa_dti_state {
-	WA_DTI_TRANSFER_RESULT_PENDING,
-	WA_DTI_ISOC_PACKET_STATUS_PENDING,
-	WA_DTI_BUF_IN_DATA_PENDING
-};
-
-enum wa_quirks {
-	/*
-	 * The Alereon HWA expects the data frames in isochronous transfer
-	 * requests to be concatenated and not sent as separate packets.
-	 */
-	WUSB_QUIRK_ALEREON_HWA_CONCAT_ISOC	= 0x01,
-	/*
-	 * The Alereon HWA can be instructed to not send transfer notifications
-	 * as an optimization.
-	 */
-	WUSB_QUIRK_ALEREON_HWA_DISABLE_XFER_NOTIFICATIONS	= 0x02,
-};
-
-enum wa_vendor_specific_requests {
-	WA_REQ_ALEREON_DISABLE_XFER_NOTIFICATIONS = 0x4C,
-	WA_REQ_ALEREON_FEATURE_SET = 0x01,
-	WA_REQ_ALEREON_FEATURE_CLEAR = 0x00,
-};
-
-#define WA_MAX_BUF_IN_URBS	4
-/**
- * Instance of a HWA Host Controller
- *
- * Except where a more specific lock/mutex applies or atomic, all
- * fields protected by @mutex.
- *
- * @wa_descr  Can be accessed without locking because it is in
- *            the same area where the device descriptors were
- *            read, so it is guaranteed to exist unmodified while
- *            the device exists.
- *
- *            Endianess has been converted to CPU's.
- *
- * @nep_* can be accessed without locking as its processing is
- *        serialized; we submit a NEP URB and it comes to
- *        hwahc_nep_cb(), which won't issue another URB until it is
- *        done processing it.
- *
- * @xfer_list:
- *
- *   List of active transfers to verify existence from a xfer id
- *   gotten from the xfer result message. Can't use urb->list because
- *   it goes by endpoint, and we don't know the endpoint at the time
- *   when we get the xfer result message. We can't really rely on the
- *   pointer (will have to change for 64 bits) as the xfer id is 32 bits.
- *
- * @xfer_delayed_list:   List of transfers that need to be started
- *                       (with a workqueue, because they were
- *                       submitted from an atomic context).
- *
- * FIXME: this needs to be layered up: a wusbhc layer (for sharing
- *        commonalities with WHCI), a wa layer (for sharing
- *        commonalities with DWA-RC).
- */
-struct wahc {
-	struct usb_device *usb_dev;
-	struct usb_interface *usb_iface;
-
-	/* HC to deliver notifications */
-	union {
-		struct wusbhc *wusb;
-		struct dwahc *dwa;
-	};
-
-	const struct usb_endpoint_descriptor *dto_epd, *dti_epd;
-	const struct usb_wa_descriptor *wa_descr;
-
-	struct urb *nep_urb;		/* Notification EndPoint [lockless] */
-	struct edc nep_edc;
-	void *nep_buffer;
-	size_t nep_buffer_size;
-
-	atomic_t notifs_queued;
-
-	u16 rpipes;
-	unsigned long *rpipe_bm;	/* rpipe usage bitmap */
-	struct list_head rpipe_delayed_list;	/* delayed RPIPES. */
-	spinlock_t rpipe_lock;	/* protect rpipe_bm and delayed list */
-	struct mutex rpipe_mutex;	/* assigning resources to endpoints */
-
-	/*
-	 * dti_state is used to track the state of the dti_urb. When dti_state
-	 * is WA_DTI_ISOC_PACKET_STATUS_PENDING, dti_isoc_xfer_in_progress and
-	 * dti_isoc_xfer_seg identify which xfer the incoming isoc packet
-	 * status refers to.
-	 */
-	enum wa_dti_state dti_state;
-	u32 dti_isoc_xfer_in_progress;
-	u8  dti_isoc_xfer_seg;
-	struct urb *dti_urb;		/* URB for reading xfer results */
-					/* URBs for reading data in */
-	struct urb buf_in_urbs[WA_MAX_BUF_IN_URBS];
-	int active_buf_in_urbs;		/* number of buf_in_urbs active. */
-	struct edc dti_edc;		/* DTI error density counter */
-	void *dti_buf;
-	size_t dti_buf_size;
-
-	unsigned long dto_in_use;	/* protect dto endoint serialization */
-
-	s32 status;			/* For reading status */
-
-	struct list_head xfer_list;
-	struct list_head xfer_delayed_list;
-	struct list_head xfer_errored_list;
-	/*
-	 * lock for the above xfer lists.  Can be taken while a xfer->lock is
-	 * held but not in the reverse order.
-	 */
-	spinlock_t xfer_list_lock;
-	struct work_struct xfer_enqueue_work;
-	struct work_struct xfer_error_work;
-	atomic_t xfer_id_count;
-
-	kernel_ulong_t	quirks;
-};
-
-
-extern int wa_create(struct wahc *wa, struct usb_interface *iface,
-	kernel_ulong_t);
-extern void __wa_destroy(struct wahc *wa);
-extern int wa_dti_start(struct wahc *wa);
-void wa_reset_all(struct wahc *wa);
-
-
-/* Miscellaneous constants */
-enum {
-	/** Max number of EPROTO errors we tolerate on the NEP in a
-	 * period of time */
-	HWAHC_EPROTO_MAX = 16,
-	/** Period of time for EPROTO errors (in jiffies) */
-	HWAHC_EPROTO_PERIOD = 4 * HZ,
-};
-
-
-/* Notification endpoint handling */
-extern int wa_nep_create(struct wahc *, struct usb_interface *);
-extern void wa_nep_destroy(struct wahc *);
-
-static inline int wa_nep_arm(struct wahc *wa, gfp_t gfp_mask)
-{
-	struct urb *urb = wa->nep_urb;
-	urb->transfer_buffer = wa->nep_buffer;
-	urb->transfer_buffer_length = wa->nep_buffer_size;
-	return usb_submit_urb(urb, gfp_mask);
-}
-
-static inline void wa_nep_disarm(struct wahc *wa)
-{
-	usb_kill_urb(wa->nep_urb);
-}
-
-
-/* RPipes */
-static inline void wa_rpipe_init(struct wahc *wa)
-{
-	INIT_LIST_HEAD(&wa->rpipe_delayed_list);
-	spin_lock_init(&wa->rpipe_lock);
-	mutex_init(&wa->rpipe_mutex);
-}
-
-static inline void wa_init(struct wahc *wa)
-{
-	int index;
-
-	edc_init(&wa->nep_edc);
-	atomic_set(&wa->notifs_queued, 0);
-	wa->dti_state = WA_DTI_TRANSFER_RESULT_PENDING;
-	wa_rpipe_init(wa);
-	edc_init(&wa->dti_edc);
-	INIT_LIST_HEAD(&wa->xfer_list);
-	INIT_LIST_HEAD(&wa->xfer_delayed_list);
-	INIT_LIST_HEAD(&wa->xfer_errored_list);
-	spin_lock_init(&wa->xfer_list_lock);
-	INIT_WORK(&wa->xfer_enqueue_work, wa_urb_enqueue_run);
-	INIT_WORK(&wa->xfer_error_work, wa_process_errored_transfers_run);
-	wa->dto_in_use = 0;
-	atomic_set(&wa->xfer_id_count, 1);
-	/* init the buf in URBs */
-	for (index = 0; index < WA_MAX_BUF_IN_URBS; ++index)
-		usb_init_urb(&(wa->buf_in_urbs[index]));
-	wa->active_buf_in_urbs = 0;
-}
-
-/**
- * Destroy a pipe (when refcount drops to zero)
- *
- * Assumes it has been moved to the "QUIESCING" state.
- */
-struct wa_xfer;
-extern void rpipe_destroy(struct kref *_rpipe);
-static inline
-void __rpipe_get(struct wa_rpipe *rpipe)
-{
-	kref_get(&rpipe->refcnt);
-}
-extern int rpipe_get_by_ep(struct wahc *, struct usb_host_endpoint *,
-			   struct urb *, gfp_t);
-static inline void rpipe_put(struct wa_rpipe *rpipe)
-{
-	kref_put(&rpipe->refcnt, rpipe_destroy);
-
-}
-extern void rpipe_ep_disable(struct wahc *, struct usb_host_endpoint *);
-extern void rpipe_clear_feature_stalled(struct wahc *,
-			struct usb_host_endpoint *);
-extern int wa_rpipes_create(struct wahc *);
-extern void wa_rpipes_destroy(struct wahc *);
-static inline void rpipe_avail_dec(struct wa_rpipe *rpipe)
-{
-	atomic_dec(&rpipe->segs_available);
-}
-
-/**
- * Returns true if the rpipe is ready to submit more segments.
- */
-static inline int rpipe_avail_inc(struct wa_rpipe *rpipe)
-{
-	return atomic_inc_return(&rpipe->segs_available) > 0
-		&& !list_empty(&rpipe->seg_list);
-}
-
-
-/* Transferring data */
-extern int wa_urb_enqueue(struct wahc *, struct usb_host_endpoint *,
-			  struct urb *, gfp_t);
-extern int wa_urb_dequeue(struct wahc *, struct urb *, int);
-extern void wa_handle_notif_xfer(struct wahc *, struct wa_notif_hdr *);
-
-
-/* Misc
- *
- * FIXME: Refcounting for the actual @hwahc object is not correct; I
- *        mean, this should be refcounting on the HCD underneath, but
- *        it is not. In any case, the semantics for HCD refcounting
- *        are *weird*...on refcount reaching zero it just frees
- *        it...no RC specific function is called...unless I miss
- *        something.
- *
- * FIXME: has to go away in favour of a 'struct' hcd based solution
- */
-static inline struct wahc *wa_get(struct wahc *wa)
-{
-	usb_get_intf(wa->usb_iface);
-	return wa;
-}
-
-static inline void wa_put(struct wahc *wa)
-{
-	usb_put_intf(wa->usb_iface);
-}
-
-
-static inline int __wa_feature(struct wahc *wa, unsigned op, u16 feature)
-{
-	return usb_control_msg(wa->usb_dev, usb_sndctrlpipe(wa->usb_dev, 0),
-			op ? USB_REQ_SET_FEATURE : USB_REQ_CLEAR_FEATURE,
-			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			feature,
-			wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
-			NULL, 0, USB_CTRL_SET_TIMEOUT);
-}
-
-
-static inline int __wa_set_feature(struct wahc *wa, u16 feature)
-{
-	return  __wa_feature(wa, 1, feature);
-}
-
-
-static inline int __wa_clear_feature(struct wahc *wa, u16 feature)
-{
-	return __wa_feature(wa, 0, feature);
-}
-
-
-/**
- * Return the status of a Wire Adapter
- *
- * @wa:		Wire Adapter instance
- * @returns     < 0 errno code on error, or status bitmap as described
- *              in WUSB1.0[8.3.1.6].
- *
- * NOTE: need malloc, some arches don't take USB from the stack
- */
-static inline
-s32 __wa_get_status(struct wahc *wa)
-{
-	s32 result;
-	result = usb_control_msg(
-		wa->usb_dev, usb_rcvctrlpipe(wa->usb_dev, 0),
-		USB_REQ_GET_STATUS,
-		USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-		0, wa->usb_iface->cur_altsetting->desc.bInterfaceNumber,
-		&wa->status, sizeof(wa->status), USB_CTRL_GET_TIMEOUT);
-	if (result >= 0)
-		result = wa->status;
-	return result;
-}
-
-
-/**
- * Waits until the Wire Adapter's status matches @mask/@value
- *
- * @wa:		Wire Adapter instance.
- * @returns     < 0 errno code on error, otherwise status.
- *
- * Loop until the WAs status matches the mask and value (status & mask
- * == value). Timeout if it doesn't happen.
- *
- * FIXME: is there an official specification on how long status
- *        changes can take?
- */
-static inline s32 __wa_wait_status(struct wahc *wa, u32 mask, u32 value)
-{
-	s32 result;
-	unsigned loops = 10;
-	do {
-		msleep(50);
-		result = __wa_get_status(wa);
-		if ((result & mask) == value)
-			break;
-		if (loops-- == 0) {
-			result = -ETIMEDOUT;
-			break;
-		}
-	} while (result >= 0);
-	return result;
-}
-
-
-/** Command @hwahc to stop, @returns 0 if ok, < 0 errno code on error */
-static inline int __wa_stop(struct wahc *wa)
-{
-	int result;
-	struct device *dev = &wa->usb_iface->dev;
-
-	result = __wa_clear_feature(wa, WA_ENABLE);
-	if (result < 0 && result != -ENODEV) {
-		dev_err(dev, "error commanding HC to stop: %d\n", result);
-		goto out;
-	}
-	result = __wa_wait_status(wa, WA_ENABLE, 0);
-	if (result < 0 && result != -ENODEV)
-		dev_err(dev, "error waiting for HC to stop: %d\n", result);
-out:
-	return 0;
-}
-
-
-#endif /* #ifndef __HWAHC_INTERNAL_H__ */
+0
+#define PCIE_LC_SPEED_CNTL__LC_OTHER_SIDE_SUPPORTS_GEN3__SHIFT 0x15
+#define PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS_MASK 0x400000
+#define PCIE_LC_SPEED_CNTL__LC_AUTO_RECOVERY_DIS__SHIFT 0x16
+#define PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS_MASK 0x800000
+#define PCIE_LC_SPEED_CNTL__LC_SPEED_CHANGE_STATUS__SHIFT 0x17
+#define PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED_MASK 0x3000000
+#define PCIE_LC_SPEED_CNTL__LC_DATA_RATE_ADVERTISED__SHIFT 0x18
+#define PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE_MASK 0x4000000
+#define PCIE_LC_SPEED_CNTL__LC_CHECK_DATA_RATE__SHIFT 0x1a
+#define PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN_MASK 0x8000000
+#define PCIE_LC_SPEED_CNTL__LC_MULT_UPSTREAM_AUTO_SPD_CHNG_EN__SHIFT 0x1b
+#define PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN_MASK 0x10000000
+#define PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L0s_EN__SHIFT 0x1c
+#define PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN_MASK 0x20000000
+#define PCIE_LC_SPEED_CNTL__LC_INIT_SPEED_NEG_IN_L1_EN__SHIFT 0x1d
+#define PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG_MASK 0x40000000
+#define PCIE_LC_SPEED_CNTL__LC_DONT_CHECK_EQTS_IN_RCFG__SHIFT 0x1e
+#define PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS_MASK 0x80000000
+#define PCIE_LC_SPEED_CNTL__LC_DELAY_COEFF_UPDATE_DIS__SHIFT 0x1f
+#define PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF_MASK 0xfff
+#define PCIE_LC_CDR_CNTL__LC_CDR_TEST_OFF__SHIFT 0x0
+#define PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS_MASK 0xfff000
+#define PCIE_LC_CDR_CNTL__LC_CDR_TEST_SETS__SHIFT 0xc
+#define PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE_MASK 0x3000000
+#define PCIE_LC_CDR_CNTL__LC_CDR_SET_TYPE__SHIFT 0x18
+#define PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES_MASK 0xffff
+#define PCIE_LC_LANE_CNTL__LC_CORRUPTED_LANES__SHIFT 0x0
+#define PCIE_LC_LANE_CNTL__LC_LANE_DIS_MASK 0xffff0000
+#define PCIE_LC_LANE_CNTL__LC_LANE_DIS__SHIFT 0x10
+#define PCIE_LC_FORCE_COEFF__LC_FORCE_COEFF_MASK 0x1
+#define PCIE_LC_FORCE_COEFF__LC_FORCE_COEFF__SHIFT 0x0
+#define PCIE_LC_FORCE_COEFF__LC_FORCE_PRE_CURSOR_MASK 0x7e
+#define PCIE_LC_FORCE_COEFF__LC_FORCE_PRE_CURSOR__SHIFT 0x1
+#define PCIE_LC_FORCE_COEFF__LC_FORCE_CURSOR_MASK 0x1f80
+#define PCIE_LC_FORCE_COEFF__LC_FORCE_CURSOR__SHIFT 0x7
+#define PCIE_LC_FORCE_COEFF__LC_FORCE_POST_CURSOR_MASK 0x7e000
+#define PCIE_LC_FORCE_COEFF__LC_FORCE_POST_CURSOR__SHIFT 0xd
+#define PCIE_LC_FORCE_COEFF__LC_3X3_COEFF_SEARCH_EN_MASK 0x80000
+#define PCIE_LC_FORCE_COEFF__LC_3X3_COEFF_SEARCH_EN__SHIFT 0x13
+#define PCIE_LC_FORCE_COEFF__LC_PRESET_10_EN_MASK 0x100000
+#define PCIE_LC_FORCE_COEFF__LC_PRESET_10_EN__SHIFT 0x14
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRESET_MASK 0xf
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRESET__SHIFT 0x0
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRECURSOR_MASK 0x3f0
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_PRECURSOR__SHIFT 0x4
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_CURSOR_MASK 0xfc00
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_CURSOR__SHIFT 0xa
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_POSTCURSOR_MASK 0x3f0000
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_POSTCURSOR__SHIFT 0x10
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_FOM_MASK 0x3fc00000
+#define PCIE_LC_BEST_EQ_SETTINGS__LC_BEST_FOM__SHIFT 0x16
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_COEFF_IN_EQ_REQ_PHASE_MASK 0x1
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_COEFF_IN_EQ_REQ_PHASE__SHIFT 0x0
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_PRE_CURSOR_REQ_MASK 0x7e
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_PRE_CURSOR_REQ__SHIFT 0x1
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_CURSOR_REQ_MASK 0x1f80
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_CURSOR_REQ__SHIFT 0x7
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_POST_CURSOR_REQ_MASK 0x7e000
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FORCE_POST_CURSOR_REQ__SHIFT 0xd
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END_MASK 0x1f80000
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_FS_OTHER_END__SHIFT 0x13
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END_MASK 0x7e000000
+#define PCIE_LC_FORCE_EQ_REQ_COEFF__LC_LF_OTHER_END__SHIFT 0x19
+#define PCIE_LC_STATE0__LC_CURRENT_STATE_MASK 0x3f
+#define PCIE_LC_STATE0__LC_CURRENT_STATE__SHIFT 0x0
+#define PCIE_LC_STATE0__LC_PREV_STATE1_MASK 0x3f00
+#define PCIE_LC_STATE0__LC_PREV_STATE1__SHIFT 0x8
+#define PCIE_LC_STATE0__LC_PREV_STATE2_MASK 0x3f0000
+#define PCIE_LC_STATE0__LC_PREV_STATE2__SHIFT 0x10
+#define PCIE_LC_STATE0__LC_PREV_STATE3_MASK 0x3f000000
+#define PCIE_LC_STATE0__LC_PREV_STATE3__SHIFT 0x18
+#define PCIE_LC_STATE1__LC_PREV_STATE4_MASK 0x3f
+#define PCIE_LC_STATE1__LC_PREV_STATE4__SHIFT 0x0
+#define PCIE_LC_STATE1__LC_PREV_STATE5_MASK 0x3f00
+#define PCIE_LC_STATE1__LC_PREV_STATE5__SHIFT 0x8
+#define PCIE_LC_STATE1__LC_PREV_STATE6_MASK 0x3f0000
+#define PCIE_LC_STATE1__LC_PREV_STATE6__SHIFT 0x10
+#define PCIE_LC_STATE1__LC_PREV_STATE7_MASK 0x3f000000
+#define PCIE_LC_STATE1__LC_PREV_STATE7__SHIFT 0x18
+#define PCIE_LC_STATE2__LC_PREV_STATE8_MASK 0x3f
+#define PCIE_LC_STATE2__LC_PREV_STATE8__SHIFT 0x0
+#define PCIE_LC_STATE2__LC_PREV_STATE9_MASK 0x3f00
+#define PCIE_LC_STATE2__LC_PREV_STATE9__SHIFT 0x8
+#define PCIE_LC_STATE2__LC_PREV_STATE10_MASK 0x3f0000
+#define PCIE_LC_STATE2__LC_PREV_STATE10__SHIFT 0x10
+#define PCIE_LC_STATE2__LC_PREV_STATE11_MASK 0x3f000000
+#define PCIE_LC_STATE2__LC_PREV_STATE11__SHIFT 0x18
+#define PCIE_LC_STATE3__LC_PREV_STATE12_MASK 0x3f
+#define PCIE_LC_STATE3__LC_PREV_STATE12__SHIFT 0x0
+#define PCIE_LC_STATE3__LC_PREV_STATE13_MASK 0x3f00
+#define PCIE_LC_STATE3__LC_PREV_STATE13__SHIFT 0x8
+#define PCIE_LC_STATE3__LC_PREV_STATE14_MASK 0x3f0000
+#define PCIE_LC_STATE3__LC_PREV_STATE14__SHIFT 0x10
+#define PCIE_LC_STATE3__LC_PREV_STATE15_MASK 0x3f000000
+#define PCIE_LC_STATE3__LC_PREV_STATE15__SHIFT 0x18
+#define PCIE_LC_STATE4__LC_PREV_STATE16_MASK 0x3f
+#define PCIE_LC_STATE4__LC_PREV_STATE16__SHIFT 0x0
+#define PCIE_LC_STATE4__LC_PREV_STATE17_MASK 0x3f00
+#define PCIE_LC_STATE4__LC_PREV_STATE17__SHIFT 0x8
+#define PCIE_LC_STATE4__LC_PREV_STATE18_MASK 0x3f0000
+#define PCIE_LC_STATE4__LC_PREV_STATE18__SHIFT 0x10
+#define PCIE_LC_STATE4__LC_PREV_STATE19_MASK 0x3f000000
+#define PCIE_LC_STATE4__LC_PREV_STATE19__SHIFT 0x18
+#define PCIE_LC_STATE5__LC_PREV_STATE20_MASK 0x3f
+#define PCIE_LC_STATE5__LC_PREV_STATE20__SHIFT 0x0
+#define PCIE_LC_STATE5__LC_PREV_STATE21_MASK 0x3f00
+#define PCIE_LC_STATE5__LC_PREV_STATE21__SHIFT 0x8
+#define PCIE_LC_STATE5__LC_PREV_STATE22_MASK 0x3f0000
+#define PCIE_LC_STATE5__LC_PREV_STATE22__SHIFT 0x10
+#define PCIE_LC_STATE5__LC_PREV_STATE23_MASK 0x3f000000
+#define PCIE_LC_STATE5__LC_PREV_STATE23__SHIFT 0x18
+#define PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT_MASK 0x3
+#define PCIEP_STRAP_LC__STRAP_FTS_yTSx_COUNT__SHIFT 0x0
+#define PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT_MASK 0xc
+#define PCIEP_STRAP_LC__STRAP_LONG_yTSx_COUNT__SHIFT 0x2
+#define PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT_MASK 0x30
+#define PCIEP_STRAP_LC__STRAP_MED_yTSx_COUNT__SHIFT 0x4
+#define PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT_MASK 0xc0
+#define PCIEP_STRAP_LC__STRAP_SHORT_yTSx_COUNT__SHIFT 0x6
+#define PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL_MASK 0x700
+#define PCIEP_STRAP_LC__STRAP_SKIP_INTERVAL__SHIFT 0x8
+#define PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET_MASK 0x800
+#define PCIEP_STRAP_LC__STRAP_BYPASS_RCVR_DET__SHIFT 0xb
+#define PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS_MASK 0x1000
+#define PCIEP_STRAP_LC__STRAP_COMPLIANCE_DIS__SHIFT 0xc
+#define PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE_MASK 0x2000
+#define PCIEP_STRAP_LC__STRAP_FORCE_COMPLIANCE__SHIFT 0xd
+#define PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES_MASK 0x4000
+#define PCIEP_STRAP_LC__STRAP_REVERSE_LC_LANES__SHIFT 0xe
+#define PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS_MASK 0x8000
+#define PCIEP_STRAP_LC__STRAP_AUTO_RC_SPEED_NEGOTIATION_DIS__SHIFT 0xf
+#define PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION_MASK 0x70000
+#define PCIEP_STRAP_LC__STRAP_LANE_NEGOTIATION__SHIFT 0x10
+#define PCIEP_STRAP_MISC__STRAP_REVERSE_LANES_MASK 0x1
+#define PCIEP_STRAP_MISC__STRAP_REVERSE_LANES__SHIFT 0x0
+#define PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN_MASK 0x2
+#define PCIEP_STRAP_MISC__STRAP_E2E_PREFIX_EN__SHIFT 0x1
+#define PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED_MASK 0x4
+#define PCIEP_STRAP_MISC__STRAP_EXTENDED_FMT_SUPPORTED__SHIFT 0x2
+#define PCIEP_STRAP_MISC__STRAP_OBFF_SUPPORTED_MASK 0x18
+#define PCIEP_STRAP_MISC__STRAP_OBFF_SUPPORTED__SHIFT 0x3
+#define PCIEP_STRAP_MISC__STRAP_LTR_SUPPORTED_MASK 0x20
+#define PCIEP_STRAP_MISC__STRAP_LTR_SUPPORTED__SHIFT 0x5
+#define PCIEP_BCH_ECC_CNTL__STRAP_BCH_ECC_EN_MASK 0x1
+#define PCIEP_BCH_ECC_CNTL__STRAP_BCH_ECC_EN__SHIFT 0x0
+#define PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD_MASK 0xff00
+#define PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_THRESHOLD__SHIFT 0x8
+#define PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS_MASK 0xffff0000
+#define PCIEP_BCH_ECC_CNTL__BCH_ECC_ERROR_STATUS__SHIFT 0x10
+#define PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE_MASK 0x8
+#define PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_CHANGED_PRIVATE__SHIFT 0x3
+#define PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE_MASK 0x40
+#define PCIEP_HPGI_PRIVATE__PRESENCE_DETECT_STATE_PRIVATE__SHIFT 0x6
+#define PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN_MASK 0x1
+#define PCIEP_HPGI__REG_HPGI_ASSERT_TO_SMI_EN__SHIFT 0x0
+#define PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN_MASK 0x2
+#define PCIEP_HPGI__REG_HPGI_ASSERT_TO_SCI_EN__SHIFT 0x1
+#define PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN_MASK 0x4
+#define PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SMI_EN__SHIFT 0x2
+#define PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN_MASK 0x8
+#define PCIEP_HPGI__REG_HPGI_DEASSERT_TO_SCI_EN__SHIFT 0x3
+#define PCIEP_HPGI__REG_HPGI_HOOK_MASK 0x80
+#define PCIEP_HPGI__REG_HPGI_HOOK__SHIFT 0x7
+#define PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS_MASK 0x100
+#define PCIEP_HPGI__HPGI_REG_ASSERT_TO_SMI_STATUS__SHIFT 0x8
+#define PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS_MASK 0x200
+#define PCIEP_HPGI__HPGI_REG_ASSERT_TO_SCI_STATUS__SHIFT 0x9
+#define PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS_MASK 0x400
+#define PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SMI_STATUS__SHIFT 0xa
+#define PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS_MASK 0x800
+#define PCIEP_HPGI__HPGI_REG_DEASSERT_TO_SCI_STATUS__SHIFT 0xb
+#define PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS_MASK 0x8000
+#define PCIEP_HPGI__HPGI_REG_PRESENCE_DETECT_STATE_CHANGE_STATUS__SHIFT 0xf
+#define PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN_MASK 0x10000
+#define PCIEP_HPGI__REG_HPGI_PRESENCE_DETECT_STATE_CHANGE_EN__SHIFT 0x10
+#define PCIEMSIX_VECT0_ADDR_LO__MSG_ADDR_LO_MASK 0xfffffffc
+#define PCIEMSIX_VECT0_ADDR_LO__MSG_ADDR_LO__SHIFT 0x2
+#define PCIEMSIX_VECT0_ADDR_HI__MSG_ADDR_HI_MASK 0xffffffff
+#define PCIEMSIX_VECT0_ADDR_HI__MSG_ADDR_HI__SHIFT 0x0
+#define PCIEMSIX_VECT0_MSG_DATA__MSG_DATA_MASK 0xffffffff
+#define PCIEMSIX_VECT0_MSG_DATA__MSG_DATA__SHIFT 0x0
+#define PCIEMSIX_VECT0_CONTROL__MASK_BIT_MASK 0x1
+#define PCIEMSIX_VECT0_CONTROL__MASK_BIT__SHIFT 0x0
+#define PCIEMSIX_VECT1_ADDR_LO__MSG_ADDR_LO_MASK 0xfffffffc
+#define PCIEMSIX_VECT1_ADDR_LO__MSG_ADDR_LO__SHIFT 0x2
+#define PCIEMSIX_VECT1_ADDR_HI__MSG_ADDR_HI_MASK 0xffffffff
+#define PCIEMSIX_VECT1_ADDR_HI__MSG_ADDR_HI__SHIFT 0x0
+#define PCIEMSIX_VECT1_MSG_DATA__MSG_DATA_MASK 0xffffffff
+#define PCIEMSIX_VECT1_MSG_DATA__MSG_DATA__SHIFT 0x0
+#define PCIEMSIX_VECT1_CONTROL__MASK_BIT_MASK 0x1
+#define PCIEMSIX_VECT1_CONTROL__MASK_BIT__SHIFT 0x0
+#define PCIEMSIX_VECT2_ADDR_LO__MSG_ADDR_LO_MASK 0xfffffffc
+#define PCIEMSIX_VECT2_ADDR_LO__MSG_ADDR_LO__SHIFT 0x2
+#define PCIEMSIX_VECT2_ADDR_HI__MSG_ADDR_HI_MASK 0xffffffff
+#define PCIEMSIX_VECT2_ADDR_HI__MSG_ADDR_HI__SHIFT 0x0
+#define PCIEMSIX_VECT2_MSG_DATA__MSG_DATA_MASK 0xffffffff
+#define PCIEMSIX_VECT2_MSG_DATA__MSG_DATA__SHIFT 0x0
+#define PCIEMSIX_VECT2_CONTROL__MASK_BIT_MASK 0x1
+#define PCIEMSIX_VECT2_CONTROL__MASK_BIT__SHIFT 0x0
+#define PCIEMSIX_VECT3_ADDR_LO__MSG_ADDR_LO_MASK 0xfffffffc
+#define PCIEMSIX_VECT3_ADDR_LO__MSG_ADDR_LO__SHIFT 0x2
+#define PCIEMSIX_VECT3_ADDR_HI__MSG_ADDR_HI_MASK 0xffffffff
+#define PCIEMSIX_VECT3_ADDR_HI__MSG_ADDR_HI__SHIFT 0x0
+#define PCIEMSIX_VECT3_MSG_DATA__MSG_DATA_MASK 0xffffffff
+#define PCIEMSIX_VECT3_MSG_DATA__MSG_DATA__SHIFT 0x0
+#define PCIEMSIX_VECT3_CONTROL__MASK_BIT_MASK 0x1
+#define PCIEMSIX_VECT3_CONTROL__MASK_BIT__SHIFT 0x0
+#define PCIEMSIX_PBA__MSIX_PENDING_BITS_MASK 0xf
+#define PCIEMSIX_PBA__MSIX_PENDING_BITS__SHIFT 0x0
+#define BIF_RFE_SNOOP_REG__REG_SNOOP_ARBITER_MASK 0x1
+#define BIF_RFE_SNOOP_REG__REG_SNOOP_ARBITER__SHIFT 0x0
+#define BIF_RFE_SNOOP_REG__REG_SNOOP_ALLMASTER_MASK 0x2
+#define BIF_RFE_SNOOP_REG__REG_SNOOP_ALLMASTER__SHIFT 0x1
+#define BIF_RFE_WARMRST_CNTL__REG_RST_warmRstRfeEn_MASK 0x1
+#define BIF_RFE_WARMRST_CNTL__REG_RST_warmRstRfeEn__SHIFT 0x0
+#define BIF_RFE_WARMRST_CNTL__REG_RST_warmRstImpEn_MASK 0x2
+#define BIF_RFE_WARMRST_CNTL__REG_RST_warmRstImpEn__SHIFT 0x1
+#define BIF_RFE_SOFTRST_CNTL__REG_RST_rstTimer_MASK 0xffff
+#define BIF_RFE_SOFTRST_CNTL__REG_RST_rstTimer__SHIFT 0x0
+#define BIF_RFE_SOFTRST_CNTL__REG_RST_softRstPropEn_MASK 0x40000000
+#define BIF_RFE_SOFTRST_CNTL__REG_RST_softRstPropEn__SHIFT 0x1e
+#define BIF_RFE_SOFTRST_CNTL__SoftRstReg_MASK 0x80000000
+#define BIF_RFE_SOFTRST_CNTL__SoftRstReg__SHIFT 0x1f
+#define BIF_RFE_IMPRST_CNTL__REG_RST_impEn_MASK 0x1
+#define BIF_RFE_IMPRST_CNTL__REG_RST_impEn__SHIFT 0x0
+#define BIF_RFE_CLIENT_SOFTRST_TRIGGER__CLIENT0_RFE_RFEWDBIF_rst_MASK 0x1
+#define BIF_RFE_CLIENT_SOFTRST_TRIGGER__CLIENT0_RFE_RFEWDBIF_rst__SHIFT 0x0
+#define BIF_RFE_CLIENT_SOFTRST_TRIGGER__CLIENT1_RFE_RFEWDBIF_rst_MASK 0x2
+#define BIF_RFE_CLIENT_SOFTRST_TRIGGER__CLIENT1_RFE_RFEWDBIF_rst__SHIFT 0x1
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__BU_rst_MASK 0x1
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__BU_rst__SHIFT 0x0
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__RWREG_RFEWDBIF_rst_MASK 0x2
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__RWREG_RFEWDBIF_rst__SHIFT 0x1
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__SMBUS_rst_MASK 0x4
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__SMBUS_rst__SHIFT 0x2
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__BX_rst_MASK 0x8
+#define BIF_RFE_MASTER_SOFTRST_TRIGGER__BX_rst__SHIFT 0x3
+#define BIF_PWDN_COMMAND__REG_BU_pw_cmd_MASK 0x1
+#define BIF_PWDN_COMMAND__REG_BU_pw_cmd__SHIFT 0x0
+#define BIF_PWDN_COMMAND__REG_RWREG_RFEWDBIF_pw_cmd_MASK 0x2
+#define BIF_PWDN_COMMAND__REG_RWREG_RFEWDBIF_pw_cmd__SHIFT 0x1
+#define BIF_PWDN_COMMAND__REG_SMBUS_pw_cmd_MASK 0x4
+#define BIF_PWDN_COMMAND__REG_SMBUS_pw_cmd__SHIFT 0x2
+#define BIF_PWDN_COMMAND__REG_BX_pw_cmd_MASK 0x8
+#define BIF_PWDN_COMMAND__REG_BX_pw_cmd__SHIFT 0x3
+#define BIF_PWDN_STATUS__BU_REG_pw_status_MASK 0x1
+#define BIF_PWDN_STATUS__BU_REG_pw_status__SHIFT 0x0
+#define BIF_PWDN_ST

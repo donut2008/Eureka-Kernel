@@ -1,209 +1,203 @@
-/*
- * isl9305 - Intersil ISL9305 DCDC regulator
- *
- * Copyright 2014 Linaro Ltd
- *
- * Author: Mark Brown <broonie@kernel.org>
- *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the  License, or (at your
- *  option) any later version.
- */
-
-#include <linux/module.h>
-#include <linux/err.h>
-#include <linux/i2c.h>
-#include <linux/of.h>
-#include <linux/platform_data/isl9305.h>
-#include <linux/regmap.h>
-#include <linux/regulator/driver.h>
-#include <linux/regulator/of_regulator.h>
-#include <linux/slab.h>
-
-/*
- * Registers
- */
-#define ISL9305_DCD1OUT          0x0
-#define ISL9305_DCD2OUT          0x1
-#define ISL9305_LDO1OUT          0x2
-#define ISL9305_LDO2OUT          0x3
-#define ISL9305_DCD_PARAMETER    0x4
-#define ISL9305_SYSTEM_PARAMETER 0x5
-#define ISL9305_DCD_SRCTL        0x6
-
-#define ISL9305_MAX_REG ISL9305_DCD_SRCTL
-
-/*
- * DCD_PARAMETER
- */
-#define ISL9305_DCD_PHASE   0x40
-#define ISL9305_DCD2_ULTRA  0x20
-#define ISL9305_DCD1_ULTRA  0x10
-#define ISL9305_DCD2_BLD    0x08
-#define ISL9305_DCD1_BLD    0x04
-#define ISL9305_DCD2_MODE   0x02
-#define ISL9305_DCD1_MODE   0x01
-
-/*
- * SYSTEM_PARAMETER
- */
-#define ISL9305_I2C_EN      0x40
-#define ISL9305_DCDPOR_MASK 0x30
-#define ISL9305_LDO2_EN     0x08
-#define ISL9305_LDO1_EN     0x04
-#define ISL9305_DCD2_EN     0x02
-#define ISL9305_DCD1_EN     0x01
-
-/*
- * DCD_SRCTL
- */
-#define ISL9305_DCD2SR_MASK 0xc0
-#define ISL9305_DCD1SR_MASK 0x07
-
-static const struct regulator_ops isl9305_ops = {
-	.enable = regulator_enable_regmap,
-	.disable = regulator_disable_regmap,
-	.is_enabled = regulator_is_enabled_regmap,
-	.list_voltage = regulator_list_voltage_linear,
-	.get_voltage_sel = regulator_get_voltage_sel_regmap,
-	.set_voltage_sel = regulator_set_voltage_sel_regmap,
-};
-
-static const struct regulator_desc isl9305_regulators[] = {
-	[ISL9305_DCD1] = {
-		.name =		"DCD1",
-		.of_match =	of_match_ptr("dcd1"),
-		.regulators_node = of_match_ptr("regulators"),
-		.n_voltages =	0x70,
-		.min_uV =	825000,
-		.uV_step =	25000,
-		.vsel_reg =	ISL9305_DCD1OUT,
-		.vsel_mask =	0x7f,
-		.enable_reg =	ISL9305_SYSTEM_PARAMETER,
-		.enable_mask =	ISL9305_DCD1_EN,
-		.supply_name =	"VINDCD1",
-		.ops =		&isl9305_ops,
-	},
-	[ISL9305_DCD2] = {
-		.name =		"DCD2",
-		.of_match =	of_match_ptr("dcd2"),
-		.regulators_node = of_match_ptr("regulators"),
-		.n_voltages =	0x70,
-		.min_uV =	825000,
-		.uV_step =	25000,
-		.vsel_reg =	ISL9305_DCD2OUT,
-		.vsel_mask =	0x7f,
-		.enable_reg =	ISL9305_SYSTEM_PARAMETER,
-		.enable_mask =	ISL9305_DCD2_EN,
-		.supply_name =	"VINDCD2",
-		.ops =		&isl9305_ops,
-	},
-	[ISL9305_LDO1] = {
-		.name =		"LDO1",
-		.of_match =	of_match_ptr("ldo1"),
-		.regulators_node = of_match_ptr("regulators"),
-		.n_voltages =	0x37,
-		.min_uV =	900000,
-		.uV_step =	50000,
-		.vsel_reg =	ISL9305_LDO1OUT,
-		.vsel_mask =	0x3f,
-		.enable_reg =	ISL9305_SYSTEM_PARAMETER,
-		.enable_mask =	ISL9305_LDO1_EN,
-		.supply_name =	"VINLDO1",
-		.ops =		&isl9305_ops,
-	},
-	[ISL9305_LDO2] = {
-		.name =		"LDO2",
-		.of_match =	of_match_ptr("ldo2"),
-		.regulators_node = of_match_ptr("regulators"),
-		.n_voltages =	0x37,
-		.min_uV =	900000,
-		.uV_step =	50000,
-		.vsel_reg =	ISL9305_LDO2OUT,
-		.vsel_mask =	0x3f,
-		.enable_reg =	ISL9305_SYSTEM_PARAMETER,
-		.enable_mask =	ISL9305_LDO2_EN,
-		.supply_name =	"VINLDO2",
-		.ops =		&isl9305_ops,
-	},
-};
-
-static const struct regmap_config isl9305_regmap = {
-	.reg_bits = 8,
-	.val_bits = 8,
-
-	.max_register = ISL9305_MAX_REG,
-	.cache_type = REGCACHE_RBTREE,
-};
-
-static int isl9305_i2c_probe(struct i2c_client *i2c,
-			     const struct i2c_device_id *id)
-{
-	struct regulator_config config = { };
-	struct isl9305_pdata *pdata = i2c->dev.platform_data;
-	struct regulator_dev *rdev;
-	struct regmap *regmap;
-	int i, ret;
-
-	regmap = devm_regmap_init_i2c(i2c, &isl9305_regmap);
-	if (IS_ERR(regmap)) {
-		ret = PTR_ERR(regmap);
-		dev_err(&i2c->dev, "Failed to create regmap: %d\n", ret);
-		return ret;
+turn true;
 	}
 
-	config.dev = &i2c->dev;
+	return false;
+}
 
-	for (i = 0; i < ARRAY_SIZE(isl9305_regulators); i++) {
-		if (pdata)
-			config.init_data = pdata->init_data[i];
-		else
-			config.init_data = NULL;
+struct variable_validate {
+	efi_guid_t vendor;
+	char *name;
+	bool (*validate)(efi_char16_t *var_name, int match, u8 *data,
+			 unsigned long len);
+};
 
-		rdev = devm_regulator_register(&i2c->dev,
-					       &isl9305_regulators[i],
-					       &config);
-		if (IS_ERR(rdev)) {
-			ret = PTR_ERR(rdev);
-			dev_err(&i2c->dev, "Failed to register %s: %d\n",
-				isl9305_regulators[i].name, ret);
-			return ret;
+/*
+ * This is the list of variables we need to validate, as well as the
+ * whitelist for what we think is safe not to default to immutable.
+ *
+ * If it has a validate() method that's not NULL, it'll go into the
+ * validation routine.  If not, it is assumed valid, but still used for
+ * whitelisting.
+ *
+ * Note that it's sorted by {vendor,name}, but globbed names must come after
+ * any other name with the same prefix.
+ */
+static const struct variable_validate variable_validate[] = {
+	{ EFI_GLOBAL_VARIABLE_GUID, "BootNext", validate_uint16 },
+	{ EFI_GLOBAL_VARIABLE_GUID, "BootOrder", validate_boot_order },
+	{ EFI_GLOBAL_VARIABLE_GUID, "Boot*", validate_load_option },
+	{ EFI_GLOBAL_VARIABLE_GUID, "DriverOrder", validate_boot_order },
+	{ EFI_GLOBAL_VARIABLE_GUID, "Driver*", validate_load_option },
+	{ EFI_GLOBAL_VARIABLE_GUID, "ConIn", validate_device_path },
+	{ EFI_GLOBAL_VARIABLE_GUID, "ConInDev", validate_device_path },
+	{ EFI_GLOBAL_VARIABLE_GUID, "ConOut", validate_device_path },
+	{ EFI_GLOBAL_VARIABLE_GUID, "ConOutDev", validate_device_path },
+	{ EFI_GLOBAL_VARIABLE_GUID, "ErrOut", validate_device_path },
+	{ EFI_GLOBAL_VARIABLE_GUID, "ErrOutDev", validate_device_path },
+	{ EFI_GLOBAL_VARIABLE_GUID, "Lang", validate_ascii_string },
+	{ EFI_GLOBAL_VARIABLE_GUID, "OsIndications", NULL },
+	{ EFI_GLOBAL_VARIABLE_GUID, "PlatformLang", validate_ascii_string },
+	{ EFI_GLOBAL_VARIABLE_GUID, "Timeout", validate_uint16 },
+	{ LINUX_EFI_CRASH_GUID, "*", NULL },
+	{ NULL_GUID, "", NULL },
+};
+
+/*
+ * Check if @var_name matches the pattern given in @match_name.
+ *
+ * @var_name: an array of @len non-NUL characters.
+ * @match_name: a NUL-terminated pattern string, optionally ending in "*". A
+ *              final "*" character matches any trailing characters @var_name,
+ *              including the case when there are none left in @var_name.
+ * @match: on output, the number of non-wildcard characters in @match_name
+ *         that @var_name matches, regardless of the return value.
+ * @return: whether @var_name fully matches @match_name.
+ */
+static bool
+variable_matches(const char *var_name, size_t len, const char *match_name,
+		 int *match)
+{
+	for (*match = 0; ; (*match)++) {
+		char c = match_name[*match];
+
+		switch (c) {
+		case '*':
+			/* Wildcard in @match_name means we've matched. */
+			return true;
+
+		case '\0':
+			/* @match_name has ended. Has @var_name too? */
+			return (*match == len);
+
+		default:
+			/*
+			 * We've reached a non-wildcard char in @match_name.
+			 * Continue only if there's an identical character in
+			 * @var_name.
+			 */
+			if (*match < len && c == var_name[*match])
+				continue;
+			return false;
+		}
+	}
+}
+
+bool
+efivar_validate(efi_guid_t vendor, efi_char16_t *var_name, u8 *data,
+		unsigned long data_size)
+{
+	int i;
+	unsigned long utf8_size;
+	u8 *utf8_name;
+
+	utf8_size = ucs2_utf8size(var_name);
+	utf8_name = kmalloc(utf8_size + 1, GFP_KERNEL);
+	if (!utf8_name)
+		return false;
+
+	ucs2_as_utf8(utf8_name, var_name, utf8_size);
+	utf8_name[utf8_size] = '\0';
+
+	for (i = 0; variable_validate[i].name[0] != '\0'; i++) {
+		const char *name = variable_validate[i].name;
+		int match = 0;
+
+		if (efi_guidcmp(vendor, variable_validate[i].vendor))
+			continue;
+
+		if (variable_matches(utf8_name, utf8_size+1, name, &match)) {
+			if (variable_validate[i].validate == NULL)
+				break;
+			kfree(utf8_name);
+			return variable_validate[i].validate(var_name, match,
+							     data, data_size);
+		}
+	}
+	kfree(utf8_name);
+	return true;
+}
+EXPORT_SYMBOL_GPL(efivar_validate);
+
+bool
+efivar_variable_is_removable(efi_guid_t vendor, const char *var_name,
+			     size_t len)
+{
+	int i;
+	bool found = false;
+	int match = 0;
+
+	/*
+	 * Check if our variable is in the validated variables list
+	 */
+	for (i = 0; variable_validate[i].name[0] != '\0'; i++) {
+		if (efi_guidcmp(variable_validate[i].vendor, vendor))
+			continue;
+
+		if (variable_matches(var_name, len,
+				     variable_validate[i].name, &match)) {
+			found = true;
+			break;
 		}
 	}
 
-	return 0;
+	/*
+	 * If it's in our list, it is removable.
+	 */
+	return found;
+}
+EXPORT_SYMBOL_GPL(efivar_variable_is_removable);
+
+static efi_status_t
+check_var_size(u32 attributes, unsigned long size)
+{
+	const struct efivar_operations *fops = __efivars->ops;
+
+	if (!fops->query_variable_store)
+		return EFI_UNSUPPORTED;
+
+	return fops->query_variable_store(attributes, size);
 }
 
-#ifdef CONFIG_OF
-static const struct of_device_id isl9305_dt_ids[] = {
-	{ .compatible = "isl,isl9305" }, /* for backward compat., don't use */
-	{ .compatible = "isil,isl9305" },
-	{ .compatible = "isl,isl9305h" }, /* for backward compat., don't use */
-	{ .compatible = "isil,isl9305h" },
-	{},
-};
-MODULE_DEVICE_TABLE(of, isl9305_dt_ids);
-#endif
+static int efi_status_to_err(efi_status_t status)
+{
+	int err;
 
-static const struct i2c_device_id isl9305_i2c_id[] = {
-	{ "isl9305", },
-	{ "isl9305h", },
-	{ }
-};
-MODULE_DEVICE_TABLE(i2c, isl9305_i2c_id);
+	switch (status) {
+	case EFI_SUCCESS:
+		err = 0;
+		break;
+	case EFI_INVALID_PARAMETER:
+		err = -EINVAL;
+		break;
+	case EFI_OUT_OF_RESOURCES:
+		err = -ENOSPC;
+		break;
+	case EFI_DEVICE_ERROR:
+		err = -EIO;
+		break;
+	case EFI_WRITE_PROTECTED:
+		err = -EROFS;
+		break;
+	case EFI_SECURITY_VIOLATION:
+		err = -EACCES;
+		break;
+	case EFI_NOT_FOUND:
+		err = -ENOENT;
+		break;
+	default:
+		err = -EINVAL;
+	}
 
-static struct i2c_driver isl9305_regulator_driver = {
-	.driver = {
-		.name = "isl9305",
-		.of_match_table	= of_match_ptr(isl9305_dt_ids),
-	},
-	.probe = isl9305_i2c_probe,
-	.id_table = isl9305_i2c_id,
-};
+	return err;
+}
 
-module_i2c_driver(isl9305_regulator_driver);
+static bool variable_is_present(efi_char16_t *variable_name, efi_guid_t *vendor,
+				struct list_head *head)
+{
+	struct efivar_entry *entry, *n;
+	unsigned long strsize1, strsize2;
+	bool found = false;
 
-MODULE_AUTHOR("Mark Brown");
-MODULE_DESCRIPTION("Intersil ISL9305 DCDC regulator");
-MODULE_LICENSE("GPL");
+	strsize1 = ucs2_strsize(variable_name, 1024);
+	list_for_each_entry_safe(entry, n, head, list) {
+		strsiz

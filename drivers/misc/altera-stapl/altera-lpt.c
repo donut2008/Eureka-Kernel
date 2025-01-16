@@ -1,70 +1,39 @@
 /*
- * altera-lpt.c
+ * BIF_4_1 Register documentation
  *
- * altera FPGA driver
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
  *
- * Copyright (C) Altera Corporation 1998-2001
- * Copyright (C) 2010 NetUP Inc.
- * Copyright (C) 2010 Abylay Ospan <aospan@netup.ru>
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include "altera-exprt.h"
+#ifndef BIF_4_1_SH_MASK_H
+#define BIF_4_1_SH_MASK_H
 
-static int lpt_hardware_initialized;
-
-static void byteblaster_write(int port, int data)
-{
-	outb((u8)data, (u16)(port + 0x378));
-};
-
-static int byteblaster_read(int port)
-{
-	int data = 0;
-	data = inb((u16)(port + 0x378));
-	return data & 0xff;
-};
-
-int netup_jtag_io_lpt(void *device, int tms, int tdi, int read_tdo)
-{
-	int data = 0;
-	int tdo = 0;
-	int initial_lpt_ctrl = 0;
-
-	if (!lpt_hardware_initialized) {
-		initial_lpt_ctrl = byteblaster_read(2);
-		byteblaster_write(2, (initial_lpt_ctrl | 0x02) & 0xdf);
-		lpt_hardware_initialized = 1;
-	}
-
-	data = ((tdi ? 0x40 : 0) | (tms ? 0x02 : 0));
-
-	byteblaster_write(0, data);
-
-	if (read_tdo) {
-		tdo = byteblaster_read(1);
-		tdo = ((tdo & 0x80) ? 0 : 1);
-	}
-
-	byteblaster_write(0, data | 0x01);
-
-	byteblaster_write(0, data);
-
-	return tdo;
-}
+#define MM_INDEX__MM_OFFSET_MASK 0x7fffffff
+#define MM_INDEX__MM_OFFSET__SHIFT 0x0
+#define MM_INDEX__MM_APER_MASK 0x80000000
+#define MM_INDEX__MM_APER__SHIFT 0x1f
+#define MM_INDEX_HI__MM_OFFSET_HI_MASK 0xffffffff
+#define MM_INDEX_HI__MM_OFFSET_HI__SHIFT 0x0
+#define MM_DATA__MM_DATA_MASK 0xffffffff
+#define MM_DATA__MM_DATA__SHIFT 0x0
+#define BUS_CNTL__BIOS_ROM_WRT_EN_MASK 0x1
+#define BUS_CNTL__BIOS_ROM_WRT_EN__SHIFT 0x0
+#define BUS_CNTL__BIOS_ROM_DIS_MASK 0x2
+#define BUS_CNTL__BIOS_ROM_DIS__SHIFT 0x1
+#define BUS_CNTL__PMI_IO_DIS

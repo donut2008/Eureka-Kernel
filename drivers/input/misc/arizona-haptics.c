@@ -1,216 +1,232 @@
-/*
- * Arizona haptics driver
- *
- * Copyright 2012 Wolfson Microelectronics plc
- *
- * Author: Mark Brown <broonie@opensource.wolfsonmicro.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
+IG_TOUCHKEY_GRIP
+	grip_data = (buf >> 4) & 0x03;
+	grip_press = !(grip_data % 2);
+#endif
 
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/input.h>
-#include <linux/slab.h>
+	press = (menu_data ? menu_press : 0) || (back_data ? back_press : 0);
 
-#include <sound/soc.h>
-#include <sound/soc-dapm.h>
+	if (menu_data)
+		input_report_key(info->input_dev,
+			touchkey_keycode[1], menu_press);
+	if (back_data)
+		input_report_key(info->input_dev,
+			touchkey_keycode[2], back_press);
+#ifdef CONFIG_TOUCHKEY_GRIP
+	if (grip_data) {
+		input_report_key(info->input_dev,
+				touchkey_keycode[3], grip_press);
+		info->grip_event =  grip_press;
+	}
+#ifdef CONFIG_SEC_FACTORY
+	ret = abov_tk_i2c_read(info->client, CMD_SAR_DIFFDATA, r_buf, 2);
+	if (ret < 0) {
+		retry = 3;
+		while (retry--) {
+			input_err(true, &client->dev, "%s read fail(%d)\n",
+				__func__, retry);
+			ret = abov_tk_i2c_read(info->client, CMD_SAR_DIFFDATA, r_buf, 2);
+			if (ret == 0)
+				break;
 
-#include <linux/mfd/arizona/core.h>
-#include <linux/mfd/arizona/pdata.h>
-#include <linux/mfd/arizona/registers.h>
+			usleep_range(10 * 1000, 10 * 1000);
+		}
+	}
+	
+	info->diff = (r_buf[0] << 8) | r_buf[1];
+	if (info->abnormal_mode) {
+		if (info->grip_event) {
+			if (info->max_diff < info->diff)
+				info->max_diff = info->diff;
+			info->irq_count++;
+		}
+	}
+#endif
+#endif
 
-struct arizona_haptics {
-	struct arizona *arizona;
-	struct input_dev *input_dev;
-	struct work_struct work;
+	input_sync(info->input_dev);
 
-	struct mutex mutex;
-	u8 intensity;
-};
+#ifdef CONFIG_SAMSUNG_PRODUCT_SHIP
+	input_info(true, &client->dev,
+		"key %s%s ver0x%02x\n",
+		menu_data ? (menu_press ? "P" : "R") : "",
+		back_data ? (back_press ? "P" : "R") : "",
+		info->fw_ver);
+#else
+	input_info(true, &client->dev,
+		"%s%s%x ver0x%02x\n",
+		menu_data ? (menu_press ? "menu P " : "menu R ") : "",
+		back_data ? (back_press ? "back P " : "back R ") : "",
+		buf, info->fw_ver);
+#endif
 
-static void arizona_haptics_work(struct work_struct *work)
+#ifdef CONFIG_TOUCHKEY_GRIP
+	if (grip_data) {
+		input_info(true, &client->dev, "grip %s %x, TA %d\n",
+			grip_press ? "P " : "R ", buf, ta_connected);
+	}
+	wake_unlock(&info->touchkey_wake_lock);
+#endif
+
+	return IRQ_HANDLED;
+}
+
+static int touchkey_led_set(struct abov_tk_info *info, int data)
 {
-	struct arizona_haptics *haptics = container_of(work,
-						       struct arizona_haptics,
-						       work);
-	struct arizona *arizona = haptics->arizona;
+	u8 cmd;
 	int ret;
 
-	if (!haptics->arizona->dapm) {
-		dev_err(arizona->dev, "No DAPM context\n");
+	if (data == 1)
+		cmd = CMD_LED_ON;
+	else
+		cmd = CMD_LED_OFF;
+
+	if (!info->enabled)
+		goto out;
+
+	ret = abov_tk_i2c_write(info->client, ABOV_LED_CONTROL, &cmd, 1);
+	if (ret < 0) {
+		input_err(true, &info->client->dev, "%s fail(%d)\n", __func__, ret);
+		goto out;
+	}
+
+	return 0;
+out:
+	abov_touchled_cmd_reserved = 1;
+	abov_touchkey_led_status = cmd;
+	return 1;
+}
+
+static ssize_t touchkey_led_control(struct device *dev,
+		 struct device_attribute *attr, const char *buf,
+		 size_t count)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	int data;
+	int ret;
+
+	ret = sscanf(buf, "%d", &data);
+	if (ret != 1) {
+		input_err(true, &client->dev, "%s: cmd read err\n", __func__);
+		return count;
+	}
+
+	if (!(data == 0 || data == 1)) {
+		input_err(true, &client->dev, "%s: wrong command(%d)\n",
+			__func__, data);
+		return count;
+	}
+
+#ifdef LED_TWINKLE_BOOTING
+	if (info->led_twinkle_check == 1) {
+		info->led_twinkle_check = 0;
+		cancel_delayed_work(&info->led_twinkle_work);
+	}
+#endif
+
+	if (touchkey_led_set(info, data))
+		return count;
+
+	msleep(20);
+
+	abov_touchled_cmd_reserved = 0;
+	input_info(true, &client->dev, "%s data(%d)\n", __func__,data);
+
+	return count;
+}
+
+static ssize_t touchkey_threshold_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	u8 r_buf;
+	int ret;
+
+	ret = abov_tk_i2c_read(client, ABOV_THRESHOLD, &r_buf, 1);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		r_buf = 0;
+	}
+	return snprintf(buf, PAGE_SIZE, "%d\n", r_buf);
+}
+
+static void get_diff_data(struct abov_tk_info *info)
+{
+	struct i2c_client *client = info->client;
+	u8 r_buf[4];
+	int ret;
+
+	ret = abov_tk_i2c_read(client, ABOV_DIFFDATA, r_buf, 4);
+	if (ret < 0) {
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		info->menu_s = 0;
+		info->back_s = 0;
 		return;
 	}
 
-	if (haptics->intensity) {
-		ret = regmap_update_bits(arizona->regmap,
-					 ARIZONA_HAPTICS_PHASE_2_INTENSITY,
-					 ARIZONA_PHASE2_INTENSITY_MASK,
-					 haptics->intensity);
-		if (ret != 0) {
-			dev_err(arizona->dev, "Failed to set intensity: %d\n",
-				ret);
-			return;
-		}
-
-		/* This enable sequence will be a noop if already enabled */
-		ret = regmap_update_bits(arizona->regmap,
-					 ARIZONA_HAPTICS_CONTROL_1,
-					 ARIZONA_HAP_CTRL_MASK,
-					 1 << ARIZONA_HAP_CTRL_SHIFT);
-		if (ret != 0) {
-			dev_err(arizona->dev, "Failed to start haptics: %d\n",
-				ret);
-			return;
-		}
-
-		ret = snd_soc_dapm_enable_pin(arizona->dapm, "HAPTICS");
-		if (ret != 0) {
-			dev_err(arizona->dev, "Failed to start HAPTICS: %d\n",
-				ret);
-			return;
-		}
-
-		ret = snd_soc_dapm_sync(arizona->dapm);
-		if (ret != 0) {
-			dev_err(arizona->dev, "Failed to sync DAPM: %d\n",
-				ret);
-			return;
-		}
-	} else {
-		/* This disable sequence will be a noop if already enabled */
-		ret = snd_soc_dapm_disable_pin(arizona->dapm, "HAPTICS");
-		if (ret != 0) {
-			dev_err(arizona->dev, "Failed to disable HAPTICS: %d\n",
-				ret);
-			return;
-		}
-
-		ret = snd_soc_dapm_sync(arizona->dapm);
-		if (ret != 0) {
-			dev_err(arizona->dev, "Failed to sync DAPM: %d\n",
-				ret);
-			return;
-		}
-
-		ret = regmap_update_bits(arizona->regmap,
-					 ARIZONA_HAPTICS_CONTROL_1,
-					 ARIZONA_HAP_CTRL_MASK, 0);
-		if (ret != 0) {
-			dev_err(arizona->dev, "Failed to stop haptics: %d\n",
-				ret);
-			return;
-		}
-	}
+	info->menu_s = (r_buf[0] << 8) | r_buf[1];
+	info->back_s = (r_buf[2] << 8) | r_buf[3];
 }
 
-static int arizona_haptics_play(struct input_dev *input, void *data,
-				struct ff_effect *effect)
+static ssize_t touchkey_menu_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
-	struct arizona_haptics *haptics = input_get_drvdata(input);
-	struct arizona *arizona = haptics->arizona;
+	struct abov_tk_info *info = dev_get_drvdata(dev);
 
-	if (!arizona->dapm) {
-		dev_err(arizona->dev, "No DAPM context\n");
-		return -EBUSY;
-	}
+	get_diff_data(info);
 
-	if (effect->u.rumble.strong_magnitude) {
-		/* Scale the magnitude into the range the device supports */
-		if (arizona->pdata.hap_act) {
-			haptics->intensity =
-				effect->u.rumble.strong_magnitude >> 9;
-			if (effect->direction < 0x8000)
-				haptics->intensity += 0x7f;
-		} else {
-			haptics->intensity =
-				effect->u.rumble.strong_magnitude >> 8;
-		}
-	} else {
-		haptics->intensity = 0;
-	}
-
-	schedule_work(&haptics->work);
-
-	return 0;
+	return sprintf(buf, "%d\n", info->menu_s);
 }
 
-static void arizona_haptics_close(struct input_dev *input)
+static ssize_t touchkey_back_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
-	struct arizona_haptics *haptics = input_get_drvdata(input);
+	struct abov_tk_info *info = dev_get_drvdata(dev);
 
-	cancel_work_sync(&haptics->work);
+	get_diff_data(info);
 
-	if (haptics->arizona->dapm)
-		snd_soc_dapm_disable_pin(haptics->arizona->dapm, "HAPTICS");
+	return sprintf(buf, "%d\n", info->back_s);
 }
 
-static int arizona_haptics_probe(struct platform_device *pdev)
+static void get_raw_data(struct abov_tk_info *info)
 {
-	struct arizona *arizona = dev_get_drvdata(pdev->dev.parent);
-	struct arizona_haptics *haptics;
+	struct i2c_client *client = info->client;
+	u8 r_buf[4];
 	int ret;
 
-	haptics = devm_kzalloc(&pdev->dev, sizeof(*haptics), GFP_KERNEL);
-	if (!haptics)
-		return -ENOMEM;
-
-	haptics->arizona = arizona;
-
-	ret = regmap_update_bits(arizona->regmap, ARIZONA_HAPTICS_CONTROL_1,
-				 ARIZONA_HAP_ACT, arizona->pdata.hap_act);
-	if (ret != 0) {
-		dev_err(arizona->dev, "Failed to set haptics actuator: %d\n",
-			ret);
-		return ret;
-	}
-
-	INIT_WORK(&haptics->work, arizona_haptics_work);
-
-	haptics->input_dev = devm_input_allocate_device(&pdev->dev);
-	if (!haptics->input_dev) {
-		dev_err(arizona->dev, "Failed to allocate input device\n");
-		return -ENOMEM;
-	}
-
-	input_set_drvdata(haptics->input_dev, haptics);
-
-	haptics->input_dev->name = "arizona:haptics";
-	haptics->input_dev->dev.parent = pdev->dev.parent;
-	haptics->input_dev->close = arizona_haptics_close;
-	__set_bit(FF_RUMBLE, haptics->input_dev->ffbit);
-
-	ret = input_ff_create_memless(haptics->input_dev, NULL,
-				      arizona_haptics_play);
+	ret = abov_tk_i2c_read(client, ABOV_RAWDATA, r_buf, 4);
 	if (ret < 0) {
-		dev_err(arizona->dev, "input_ff_create_memless() failed: %d\n",
-			ret);
-		return ret;
+		input_err(true, &client->dev, "%s fail(%d)\n", __func__, ret);
+		info->menu_raw = 0;
+		info->back_raw = 0;
+		return;
 	}
 
-	ret = input_register_device(haptics->input_dev);
-	if (ret < 0) {
-		dev_err(arizona->dev, "couldn't register input device: %d\n",
-			ret);
-		return ret;
-	}
-
-	platform_set_drvdata(pdev, haptics);
-
-	return 0;
+	info->menu_raw = (r_buf[0] << 8) | r_buf[1];
+	info->back_raw = (r_buf[2] << 8) | r_buf[3];
 }
 
-static struct platform_driver arizona_haptics_driver = {
-	.probe		= arizona_haptics_probe,
-	.driver		= {
-		.name	= "arizona-haptics",
-	},
-};
-module_platform_driver(arizona_haptics_driver);
+static ssize_t touchkey_menu_raw_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
 
-MODULE_ALIAS("platform:arizona-haptics");
-MODULE_DESCRIPTION("Arizona haptics driver");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Mark Brown <broonie@opensource.wolfsonmicro.com>");
+	get_raw_data(info);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", info->menu_raw);
+}
+
+static ssize_t touchkey_back_raw_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+
+	get_raw_data(info);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", info->back_raw);
+}
+
+#ifdef CONFIG_TOUCHKEY_GRIP
+static ssize_t touchkey_sar_enable(struct device *dev,
+		 struct device_attribute *attr, const c

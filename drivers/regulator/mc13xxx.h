@@ -1,112 +1,103 @@
 /*
- * mc13xxx.h - regulators for the Freescale mc13xxx PMIC
+ * Intel e7xxx Memory Controller kernel module
+ * (C) 2003 Linux Networx (http://lnxi.com)
+ * This file may be distributed under the terms of the
+ * GNU General Public License.
  *
- *  Copyright (C) 2010 Yong Shen <yong.shen@linaro.org>
+ * See "enum e7xxx_chips" below for supported chipsets
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * Written by Thayne Harbaugh
+ * Based on work by Dan Hollis <goemon at anime dot net> and others.
+ *	http://www.anime.net/~goemon/linux-ecc/
+ *
+ * Datasheet:
+ *	http://www.intel.com/content/www/us/en/chipsets/e7501-chipset-memory-controller-hub-datasheet.html
+ *
+ * Contributors:
+ *	Eric Biederman (Linux Networx)
+ *	Tom Zimmerman (Linux Networx)
+ *	Jim Garlick (Lawrence Livermore National Labs)
+ *	Dave Peterson (Lawrence Livermore National Labs)
+ *	That One Guy (Some other place)
+ *	Wang Zhenyu (intel.com)
+ *
+ * $Id: edac_e7xxx.c,v 1.5.2.9 2005/10/05 00:43:44 dsp_llnl Exp $
+ *
  */
 
-#ifndef __LINUX_REGULATOR_MC13XXX_H
-#define __LINUX_REGULATOR_MC13XXX_H
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/pci.h>
+#include <linux/pci_ids.h>
+#include <linux/edac.h>
+#include "edac_core.h"
 
-#include <linux/regulator/driver.h>
+#define	E7XXX_REVISION " Ver: 2.0.2"
+#define	EDAC_MOD_STR	"e7xxx_edac"
 
-struct mc13xxx_regulator {
-	struct regulator_desc desc;
-	int reg;
-	int enable_bit;
-	int vsel_reg;
-	int vsel_shift;
-	int vsel_mask;
-};
+#define e7xxx_printk(level, fmt, arg...) \
+	edac_printk(level, "e7xxx", fmt, ##arg)
 
-struct mc13xxx_regulator_priv {
-	struct mc13xxx *mc13xxx;
-	u32 powermisc_pwgt_state;
-	struct mc13xxx_regulator *mc13xxx_regulators;
-	int num_regulators;
-	struct regulator_dev *regulators[];
-};
+#define e7xxx_mc_printk(mci, level, fmt, arg...) \
+	edac_mc_chipset_printk(mci, level, "e7xxx", fmt, ##arg)
 
-extern int mc13xxx_fixed_regulator_set_voltage(struct regulator_dev *rdev,
-		int min_uV, int max_uV, unsigned *selector);
+#ifndef PCI_DEVICE_ID_INTEL_7205_0
+#define PCI_DEVICE_ID_INTEL_7205_0	0x255d
+#endif				/* PCI_DEVICE_ID_INTEL_7205_0 */
 
-#ifdef CONFIG_OF
-extern int mc13xxx_get_num_regulators_dt(struct platform_device *pdev);
-extern struct mc13xxx_regulator_init_data *mc13xxx_parse_regulators_dt(
-	struct platform_device *pdev, struct mc13xxx_regulator *regulators,
-	int num_regulators);
-#else
-static inline int mc13xxx_get_num_regulators_dt(struct platform_device *pdev)
-{
-	return -ENODEV;
-}
+#ifndef PCI_DEVICE_ID_INTEL_7205_1_ERR
+#define PCI_DEVICE_ID_INTEL_7205_1_ERR	0x2551
+#endif				/* PCI_DEVICE_ID_INTEL_7205_1_ERR */
 
-static inline struct mc13xxx_regulator_init_data *mc13xxx_parse_regulators_dt(
-	struct platform_device *pdev, struct mc13xxx_regulator *regulators,
-	int num_regulators)
-{
-	return NULL;
-}
-#endif
+#ifndef PCI_DEVICE_ID_INTEL_7500_0
+#define PCI_DEVICE_ID_INTEL_7500_0	0x2540
+#endif				/* PCI_DEVICE_ID_INTEL_7500_0 */
 
-extern struct regulator_ops mc13xxx_regulator_ops;
-extern struct regulator_ops mc13xxx_fixed_regulator_ops;
+#ifndef PCI_DEVICE_ID_INTEL_7500_1_ERR
+#define PCI_DEVICE_ID_INTEL_7500_1_ERR	0x2541
+#endif				/* PCI_DEVICE_ID_INTEL_7500_1_ERR */
 
-#define MC13xxx_DEFINE(prefix, _name, _reg, _vsel_reg, _voltages, _ops)	\
-	[prefix ## _name] = {				\
-		.desc = {						\
-			.name = #_name,					\
-			.n_voltages = ARRAY_SIZE(_voltages),		\
-			.volt_table =  _voltages,			\
-			.ops = &_ops,			\
-			.type = REGULATOR_VOLTAGE,			\
-			.id = prefix ## _name,		\
-			.owner = THIS_MODULE,				\
-		},							\
-		.reg = prefix ## _reg,				\
-		.enable_bit = prefix ## _reg ## _ ## _name ## EN,	\
-		.vsel_reg = prefix ## _vsel_reg,			\
-		.vsel_shift = prefix ## _vsel_reg ## _ ## _name ## VSEL,\
-		.vsel_mask = prefix ## _vsel_reg ## _ ## _name ## VSEL_M,\
-	}
+#ifndef PCI_DEVICE_ID_INTEL_7501_0
+#define PCI_DEVICE_ID_INTEL_7501_0	0x254c
+#endif				/* PCI_DEVICE_ID_INTEL_7501_0 */
 
-#define MC13xxx_FIXED_DEFINE(prefix, _name, _reg, _voltages, _ops)	\
-	[prefix ## _name] = {				\
-		.desc = {						\
-			.name = #_name,					\
-			.n_voltages = ARRAY_SIZE(_voltages),		\
-			.volt_table =  _voltages,			\
-			.ops = &_ops,		\
-			.type = REGULATOR_VOLTAGE,			\
-			.id = prefix ## _name,		\
-			.owner = THIS_MODULE,				\
-		},							\
-		.reg = prefix ## _reg,				\
-		.enable_bit = prefix ## _reg ## _ ## _name ## EN,	\
-	}
+#ifndef PCI_DEVICE_ID_INTEL_7501_1_ERR
+#define PCI_DEVICE_ID_INTEL_7501_1_ERR	0x2541
+#endif				/* PCI_DEVICE_ID_INTEL_7501_1_ERR */
 
-#define MC13xxx_GPO_DEFINE(prefix, _name, _reg,  _voltages, _ops)	\
-	[prefix ## _name] = {				\
-		.desc = {						\
-			.name = #_name,					\
-			.n_voltages = ARRAY_SIZE(_voltages),		\
-			.volt_table =  _voltages,			\
-			.ops = &_ops,		\
-			.type = REGULATOR_VOLTAGE,			\
-			.id = prefix ## _name,		\
-			.owner = THIS_MODULE,				\
-		},							\
-		.reg = prefix ## _reg,				\
-		.enable_bit = prefix ## _reg ## _ ## _name ## EN,	\
-	}
+#ifndef PCI_DEVICE_ID_INTEL_7505_0
+#define PCI_DEVICE_ID_INTEL_7505_0	0x2550
+#endif				/* PCI_DEVICE_ID_INTEL_7505_0 */
 
-#define MC13xxx_DEFINE_SW(_name, _reg, _vsel_reg, _voltages, ops)	\
-	MC13xxx_DEFINE(SW, _name, _reg, _vsel_reg, _voltages, ops)
-#define MC13xxx_DEFINE_REGU(_name, _reg, _vsel_reg, _voltages, ops)	\
-	MC13xxx_DEFINE(REGU, _name, _reg, _vsel_reg, _voltages, ops)
+#ifndef PCI_DEVICE_ID_INTEL_7505_1_ERR
+#define PCI_DEVICE_ID_INTEL_7505_1_ERR	0x2551
+#endif				/* PCI_DEVICE_ID_INTEL_7505_1_ERR */
 
-#endif
+#define E7XXX_NR_CSROWS		8	/* number of csrows */
+#define E7XXX_NR_DIMMS		8	/* 2 channels, 4 dimms/channel */
+
+/* E7XXX register addresses - device 0 function 0 */
+#define E7XXX_DRB		0x60	/* DRAM row boundary register (8b) */
+#define E7XXX_DRA		0x70	/* DRAM row attribute register (8b) */
+					/*
+					 * 31   Device width row 7 0=x8 1=x4
+					 * 27   Device width row 6
+					 * 23   Device width row 5
+					 * 19   Device width row 4
+					 * 15   Device width row 3
+					 * 11   Device width row 2
+					 *  7   Device width row 1
+					 *  3   Device width row 0
+					 */
+#define E7XXX_DRC		0x7C	/* DRAM controller mode reg (32b) */
+					/*
+					 * 22    Number channels 0=1,1=2
+					 * 19:18 DRB Granularity 32/64MB
+					 */
+#define E7XXX_TOLM		0xC4	/* DRAM top of low memory reg (16b) */
+#define E7XXX_REMAPBASE		0xC6	/* DRAM remap base address reg (16b) */
+#define E7XXX_REMAPLIMIT	0xC8	/* DRAM remap limit address reg (16b) */
+
+/* E7XXX register addresses - device 0 function 1 */
+#define E7XXX_DRAM_FERR		0x80	/* DRAM first error register (8b) */
+#define E7XXX_DRA

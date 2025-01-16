@@ -1,4 +1,2 @@
-obj-y += b2c2/ saa7146/ siano/
-obj-$(CONFIG_VIDEO_CX2341X) += cx2341x.o
-obj-$(CONFIG_VIDEO_TVEEPROM) += tveeprom.o
-obj-$(CONFIG_CYPRESS_FIRMWARE) += cypress_firmware.o
+*Pω<+΅κK€\‹‘‰½Φλ->jT–™Ριϊÿ4az#ΓOμ?ΧφτιΥπiκ0»ΉH±EΣΟι"  Θr•jdgφB™ª~gΩAl+‡ΛM·
+^Β²Λd®Ϋl¨&}^S@+jz°<;ΐφΕ#Λ‹ί	Tτ%B”1v5_—‰rqfζΪ+‚t™h7£χΕΦm"L

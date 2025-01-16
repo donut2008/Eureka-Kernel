@@ -1,2 +1,4 @@
-obj-$(CONFIG_NTB_PINGPONG) += ntb_pingpong.o
-obj-$(CONFIG_NTB_TOOL) += ntb_tool.o
+V_OK) {
+		spin_lock(&dev->pending_lock);
+		if (list_empty(&qp->iowait)) {
+			dev->

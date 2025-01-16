@@ -1,2887 +1,2458 @@
-/******************************************************************************
+/*
+ * Copyright 2011 Advanced Micro Devices, Inc.
  *
- * Copyright(c) 2007 - 2017 Realtek Corporation.
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of version 2 of the GNU General Public License as
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: Alex Deucher
+ */
+#ifndef SI_H
+#define SI_H
+
+#define TAHITI_RB_BITMAP_WIDTH_PER_SH  2
+
+#define TAHITI_GB_ADDR_CONFIG_GOLDEN        0x12011003
+#define VERDE_GB_ADDR_CONFIG_GOLDEN         0x12010002
+#define HAINAN_GB_ADDR_CONFIG_GOLDEN        0x02010001
+
+#define SI_MAX_SH_GPRS           256
+#define SI_MAX_TEMP_GPRS         16
+#define SI_MAX_SH_THREADS        256
+#define SI_MAX_SH_STACK_ENTRIES  4096
+#define SI_MAX_FRC_EOV_CNT       16384
+#define SI_MAX_BACKENDS          8
+#define SI_MAX_BACKENDS_MASK     0xFF
+#define SI_MAX_BACKENDS_PER_SE_MASK     0x0F
+#define SI_MAX_SIMDS             12
+#define SI_MAX_SIMDS_MASK        0x0FFF
+#define SI_MAX_SIMDS_PER_SE_MASK        0x00FF
+#define SI_MAX_PIPES             8
+#define SI_MAX_PIPES_MASK        0xFF
+#define SI_MAX_PIPES_PER_SIMD_MASK      0x3F
+#define SI_MAX_LDS_NUM           0xFFFF
+#define SI_MAX_TCC               16
+#define SI_MAX_TCC_MASK          0xFFFF
+
+/* SMC IND accessor regs */
+#define SMC_IND_INDEX_0                              0x200
+#define SMC_IND_DATA_0                               0x204
+
+#define SMC_IND_ACCESS_CNTL                          0x228
+#       define AUTO_INCREMENT_IND_0                  (1 << 0)
+#define SMC_MESSAGE_0                                0x22c
+#define SMC_RESP_0                                   0x230
+
+/* CG IND registers are accessed via SMC indirect space + SMC_CG_IND_START */
+#define SMC_CG_IND_START                    0xc0030000
+#define SMC_CG_IND_END                      0xc0040000
+
+#define	CG_CGTT_LOCAL_0				0x400
+#define	CG_CGTT_LOCAL_1				0x401
+
+/* SMC IND registers */
+#define	SMC_SYSCON_RESET_CNTL				0x80000000
+#       define RST_REG                                  (1 << 0)
+#define	SMC_SYSCON_CLOCK_CNTL_0				0x80000004
+#       define CK_DISABLE                               (1 << 0)
+#       define CKEN                                     (1 << 24)
+
+#define VGA_HDP_CONTROL  				0x328
+#define		VGA_MEMORY_DISABLE				(1 << 4)
+
+#define DCCG_DISP_SLOW_SELECT_REG                       0x4fc
+#define		DCCG_DISP1_SLOW_SELECT(x)		((x) << 0)
+#define		DCCG_DISP1_SLOW_SELECT_MASK		(7 << 0)
+#define		DCCG_DISP1_SLOW_SELECT_SHIFT		0
+#define		DCCG_DISP2_SLOW_SELECT(x)		((x) << 4)
+#define		DCCG_DISP2_SLOW_SELECT_MASK		(7 << 4)
+#define		DCCG_DISP2_SLOW_SELECT_SHIFT		4
+
+#define	CG_SPLL_FUNC_CNTL				0x600
+#define		SPLL_RESET				(1 << 0)
+#define		SPLL_SLEEP				(1 << 1)
+#define		SPLL_BYPASS_EN				(1 << 3)
+#define		SPLL_REF_DIV(x)				((x) << 4)
+#define		SPLL_REF_DIV_MASK			(0x3f << 4)
+#define		SPLL_PDIV_A(x)				((x) << 20)
+#define		SPLL_PDIV_A_MASK			(0x7f << 20)
+#define		SPLL_PDIV_A_SHIFT			20
+#define	CG_SPLL_FUNC_CNTL_2				0x604
+#define		SCLK_MUX_SEL(x)				((x) << 0)
+#define		SCLK_MUX_SEL_MASK			(0x1ff << 0)
+#define		SPLL_CTLREQ_CHG				(1 << 23)
+#define		SCLK_MUX_UPDATE				(1 << 26)
+#define	CG_SPLL_FUNC_CNTL_3				0x608
+#define		SPLL_FB_DIV(x)				((x) << 0)
+#define		SPLL_FB_DIV_MASK			(0x3ffffff << 0)
+#define		SPLL_FB_DIV_SHIFT			0
+#define		SPLL_DITHEN				(1 << 28)
+#define	CG_SPLL_FUNC_CNTL_4				0x60c
+
+#define	SPLL_STATUS					0x614
+#define		SPLL_CHG_STATUS				(1 << 1)
+#define	SPLL_CNTL_MODE					0x618
+#define		SPLL_SW_DIR_CONTROL			(1 << 0)
+#	define SPLL_REFCLK_SEL(x)			((x) << 26)
+#	define SPLL_REFCLK_SEL_MASK			(3 << 26)
+
+#define	CG_SPLL_SPREAD_SPECTRUM				0x620
+#define		SSEN					(1 << 0)
+#define		CLK_S(x)				((x) << 4)
+#define		CLK_S_MASK				(0xfff << 4)
+#define		CLK_S_SHIFT				4
+#define	CG_SPLL_SPREAD_SPECTRUM_2			0x624
+#define		CLK_V(x)				((x) << 0)
+#define		CLK_V_MASK				(0x3ffffff << 0)
+#define		CLK_V_SHIFT				0
+
+#define	CG_SPLL_AUTOSCALE_CNTL				0x62c
+#       define AUTOSCALE_ON_SS_CLEAR                    (1 << 9)
+
+/* discrete uvd clocks */
+#define	CG_UPLL_FUNC_CNTL				0x634
+#	define UPLL_RESET_MASK				0x00000001
+#	define UPLL_SLEEP_MASK				0x00000002
+#	define UPLL_BYPASS_EN_MASK			0x00000004
+#	define UPLL_CTLREQ_MASK				0x00000008
+#	define UPLL_VCO_MODE_MASK			0x00000600
+#	define UPLL_REF_DIV_MASK			0x003F0000
+#	define UPLL_CTLACK_MASK				0x40000000
+#	define UPLL_CTLACK2_MASK			0x80000000
+#define	CG_UPLL_FUNC_CNTL_2				0x638
+#	define UPLL_PDIV_A(x)				((x) << 0)
+#	define UPLL_PDIV_A_MASK				0x0000007F
+#	define UPLL_PDIV_B(x)				((x) << 8)
+#	define UPLL_PDIV_B_MASK				0x00007F00
+#	define VCLK_SRC_SEL(x)				((x) << 20)
+#	define VCLK_SRC_SEL_MASK			0x01F00000
+#	define DCLK_SRC_SEL(x)				((x) << 25)
+#	define DCLK_SRC_SEL_MASK			0x3E000000
+#define	CG_UPLL_FUNC_CNTL_3				0x63C
+#	define UPLL_FB_DIV(x)				((x) << 0)
+#	define UPLL_FB_DIV_MASK				0x01FFFFFF
+#define	CG_UPLL_FUNC_CNTL_4                             0x644
+#	define UPLL_SPARE_ISPARE9			0x00020000
+#define	CG_UPLL_FUNC_CNTL_5				0x648
+#	define RESET_ANTI_MUX_MASK			0x00000200
+#define	CG_UPLL_SPREAD_SPECTRUM				0x650
+#	define SSEN_MASK				0x00000001
+
+#define	MPLL_BYPASSCLK_SEL				0x65c
+#	define MPLL_CLKOUT_SEL(x)			((x) << 8)
+#	define MPLL_CLKOUT_SEL_MASK			0xFF00
+
+#define CG_CLKPIN_CNTL                                    0x660
+#       define XTALIN_DIVIDE                              (1 << 1)
+#       define BCLK_AS_XCLK                               (1 << 2)
+#define CG_CLKPIN_CNTL_2                                  0x664
+#       define FORCE_BIF_REFCLK_EN                        (1 << 3)
+#       define MUX_TCLK_TO_XCLK                           (1 << 8)
+
+#define	THM_CLK_CNTL					0x66c
+#	define CMON_CLK_SEL(x)				((x) << 0)
+#	define CMON_CLK_SEL_MASK			0xFF
+#	define TMON_CLK_SEL(x)				((x) << 8)
+#	define TMON_CLK_SEL_MASK			0xFF00
+#define	MISC_CLK_CNTL					0x670
+#	define DEEP_SLEEP_CLK_SEL(x)			((x) << 0)
+#	define DEEP_SLEEP_CLK_SEL_MASK			0xFF
+#	define ZCLK_SEL(x)				((x) << 8)
+#	define ZCLK_SEL_MASK				0xFF00
+
+#define	CG_THERMAL_CTRL					0x700
+#define 	DPM_EVENT_SRC(x)			((x) << 0)
+#define 	DPM_EVENT_SRC_MASK			(7 << 0)
+#define		DIG_THERM_DPM(x)			((x) << 14)
+#define		DIG_THERM_DPM_MASK			0x003FC000
+#define		DIG_THERM_DPM_SHIFT			14
+#define	CG_THERMAL_STATUS				0x704
+#define		FDO_PWM_DUTY(x)				((x) << 9)
+#define		FDO_PWM_DUTY_MASK			(0xff << 9)
+#define		FDO_PWM_DUTY_SHIFT			9
+#define	CG_THERMAL_INT					0x708
+#define		DIG_THERM_INTH(x)			((x) << 8)
+#define		DIG_THERM_INTH_MASK			0x0000FF00
+#define		DIG_THERM_INTH_SHIFT			8
+#define		DIG_THERM_INTL(x)			((x) << 16)
+#define		DIG_THERM_INTL_MASK			0x00FF0000
+#define		DIG_THERM_INTL_SHIFT			16
+#define 	THERM_INT_MASK_HIGH			(1 << 24)
+#define 	THERM_INT_MASK_LOW			(1 << 25)
+
+#define	CG_MULT_THERMAL_CTRL					0x710
+#define		TEMP_SEL(x)					((x) << 20)
+#define		TEMP_SEL_MASK					(0xff << 20)
+#define		TEMP_SEL_SHIFT					20
+#define	CG_MULT_THERMAL_STATUS					0x714
+#define		ASIC_MAX_TEMP(x)				((x) << 0)
+#define		ASIC_MAX_TEMP_MASK				0x000001ff
+#define		ASIC_MAX_TEMP_SHIFT				0
+#define		CTF_TEMP(x)					((x) << 9)
+#define		CTF_TEMP_MASK					0x0003fe00
+#define		CTF_TEMP_SHIFT					9
+
+#define	CG_FDO_CTRL0					0x754
+#define		FDO_STATIC_DUTY(x)			((x) << 0)
+#define		FDO_STATIC_DUTY_MASK			0x000000FF
+#define		FDO_STATIC_DUTY_SHIFT			0
+#define	CG_FDO_CTRL1					0x758
+#define		FMAX_DUTY100(x)				((x) << 0)
+#define		FMAX_DUTY100_MASK			0x000000FF
+#define		FMAX_DUTY100_SHIFT			0
+#define	CG_FDO_CTRL2					0x75C
+#define		TMIN(x)					((x) << 0)
+#define		TMIN_MASK				0x000000FF
+#define		TMIN_SHIFT				0
+#define		FDO_PWM_MODE(x)				((x) << 11)
+#define		FDO_PWM_MODE_MASK			(7 << 11)
+#define		FDO_PWM_MODE_SHIFT			11
+#define		TACH_PWM_RESP_RATE(x)			((x) << 25)
+#define		TACH_PWM_RESP_RATE_MASK			(0x7f << 25)
+#define		TACH_PWM_RESP_RATE_SHIFT		25
+
+#define CG_TACH_CTRL                                    0x770
+#       define EDGE_PER_REV(x)                          ((x) << 0)
+#       define EDGE_PER_REV_MASK                        (0x7 << 0)
+#       define EDGE_PER_REV_SHIFT                       0
+#       define TARGET_PERIOD(x)                         ((x) << 3)
+#       define TARGET_PERIOD_MASK                       0xfffffff8
+#       define TARGET_PERIOD_SHIFT                      3
+#define CG_TACH_STATUS                                  0x774
+#       define TACH_PERIOD(x)                           ((x) << 0)
+#       define TACH_PERIOD_MASK                         0xffffffff
+#       define TACH_PERIOD_SHIFT                        0
+
+#define GENERAL_PWRMGT                                  0x780
+#       define GLOBAL_PWRMGT_EN                         (1 << 0)
+#       define STATIC_PM_EN                             (1 << 1)
+#       define THERMAL_PROTECTION_DIS                   (1 << 2)
+#       define THERMAL_PROTECTION_TYPE                  (1 << 3)
+#       define SW_SMIO_INDEX(x)                         ((x) << 6)
+#       define SW_SMIO_INDEX_MASK                       (1 << 6)
+#       define SW_SMIO_INDEX_SHIFT                      6
+#       define VOLT_PWRMGT_EN                           (1 << 10)
+#       define DYN_SPREAD_SPECTRUM_EN                   (1 << 23)
+#define CG_TPC                                            0x784
+#define SCLK_PWRMGT_CNTL                                  0x788
+#       define SCLK_PWRMGT_OFF                            (1 << 0)
+#       define SCLK_LOW_D1                                (1 << 1)
+#       define FIR_RESET                                  (1 << 4)
+#       define FIR_FORCE_TREND_SEL                        (1 << 5)
+#       define FIR_TREND_MODE                             (1 << 6)
+#       define DYN_GFX_CLK_OFF_EN                         (1 << 7)
+#       define GFX_CLK_FORCE_ON                           (1 << 8)
+#       define GFX_CLK_REQUEST_OFF                        (1 << 9)
+#       define GFX_CLK_FORCE_OFF                          (1 << 10)
+#       define GFX_CLK_OFF_ACPI_D1                        (1 << 11)
+#       define GFX_CLK_OFF_ACPI_D2                        (1 << 12)
+#       define GFX_CLK_OFF_ACPI_D3                        (1 << 13)
+#       define DYN_LIGHT_SLEEP_EN                         (1 << 14)
+
+#define TARGET_AND_CURRENT_PROFILE_INDEX                  0x798
+#       define CURRENT_STATE_INDEX_MASK                   (0xf << 4)
+#       define CURRENT_STATE_INDEX_SHIFT                  4
+
+#define CG_FTV                                            0x7bc
+
+#define CG_FFCT_0                                         0x7c0
+#       define UTC_0(x)                                   ((x) << 0)
+#       define UTC_0_MASK                                 (0x3ff << 0)
+#       define DTC_0(x)                                   ((x) << 10)
+#       define DTC_0_MASK                                 (0x3ff << 10)
+
+#define CG_BSP                                          0x7fc
+#       define BSP(x)					((x) << 0)
+#       define BSP_MASK					(0xffff << 0)
+#       define BSU(x)					((x) << 16)
+#       define BSU_MASK					(0xf << 16)
+#define CG_AT                                           0x800
+#       define CG_R(x)					((x) << 0)
+#       define CG_R_MASK				(0xffff << 0)
+#       define CG_L(x)					((x) << 16)
+#       define CG_L_MASK				(0xffff << 16)
+
+#define CG_GIT                                          0x804
+#       define CG_GICST(x)                              ((x) << 0)
+#       define CG_GICST_MASK                            (0xffff << 0)
+#       define CG_GIPOT(x)                              ((x) << 16)
+#       define CG_GIPOT_MASK                            (0xffff << 16)
+
+#define CG_SSP                                            0x80c
+#       define SST(x)                                     ((x) << 0)
+#       define SST_MASK                                   (0xffff << 0)
+#       define SSTU(x)                                    ((x) << 16)
+#       define SSTU_MASK                                  (0xf << 16)
+
+#define CG_DISPLAY_GAP_CNTL                               0x828
+#       define DISP1_GAP(x)                               ((x) << 0)
+#       define DISP1_GAP_MASK                             (3 << 0)
+#       define DISP2_GAP(x)                               ((x) << 2)
+#       define DISP2_GAP_MASK                             (3 << 2)
+#       define VBI_TIMER_COUNT(x)                         ((x) << 4)
+#       define VBI_TIMER_COUNT_MASK                       (0x3fff << 4)
+#       define VBI_TIMER_UNIT(x)                          ((x) << 20)
+#       define VBI_TIMER_UNIT_MASK                        (7 << 20)
+#       define DISP1_GAP_MCHG(x)                          ((x) << 24)
+#       define DISP1_GAP_MCHG_MASK                        (3 << 24)
+#       define DISP2_GAP_MCHG(x)                          ((x) << 26)
+#       define DISP2_GAP_MCHG_MASK                        (3 << 26)
+
+#define	CG_ULV_CONTROL					0x878
+#define	CG_ULV_PARAMETER				0x87c
+
+#define	SMC_SCRATCH0					0x884
+
+#define	CG_CAC_CTRL					0x8b8
+#	define CAC_WINDOW(x)				((x) << 0)
+#	define CAC_WINDOW_MASK				0x00ffffff
+
+#define DMIF_ADDR_CONFIG  				0xBD4
+
+#define DMIF_ADDR_CALC  				0xC00
+
+#define	PIPE0_DMIF_BUFFER_CONTROL			  0x0ca0
+#       define DMIF_BUFFERS_ALLOCATED(x)                  ((x) << 0)
+#       define DMIF_BUFFERS_ALLOCATED_COMPLETED           (1 << 4)
+
+#define	SRBM_STATUS				        0xE50
+#define		GRBM_RQ_PENDING 			(1 << 5)
+#define		VMC_BUSY 				(1 << 8)
+#define		MCB_BUSY 				(1 << 9)
+#define		MCB_NON_DISPLAY_BUSY 			(1 << 10)
+#define		MCC_BUSY 				(1 << 11)
+#define		MCD_BUSY 				(1 << 12)
+#define		SEM_BUSY 				(1 << 14)
+#define		IH_BUSY 				(1 << 17)
+
+#define	SRBM_SOFT_RESET				        0x0E60
+#define		SOFT_RESET_BIF				(1 << 1)
+#define		SOFT_RESET_DC				(1 << 5)
+#define		SOFT_RESET_DMA1				(1 << 6)
+#define		SOFT_RESET_GRBM				(1 << 8)
+#define		SOFT_RESET_HDP				(1 << 9)
+#define		SOFT_RESET_IH				(1 << 10)
+#define		SOFT_RESET_MC				(1 << 11)
+#define		SOFT_RESET_ROM				(1 << 14)
+#define		SOFT_RESET_SEM				(1 << 15)
+#define		SOFT_RESET_VMC				(1 << 17)
+#define		SOFT_RESET_DMA				(1 << 20)
+#define		SOFT_RESET_TST				(1 << 21)
+#define		SOFT_RESET_REGBB			(1 << 22)
+#define		SOFT_RESET_ORB				(1 << 23)
+
+#define	CC_SYS_RB_BACKEND_DISABLE			0xe80
+#define	GC_USER_SYS_RB_BACKEND_DISABLE			0xe84
+
+#define SRBM_READ_ERROR					0xE98
+#define SRBM_INT_CNTL					0xEA0
+#define SRBM_INT_ACK					0xEA8
+
+#define	SRBM_STATUS2				        0x0EC4
+#define		DMA_BUSY 				(1 << 5)
+#define		DMA1_BUSY 				(1 << 6)
+
+#define VM_L2_CNTL					0x1400
+#define		ENABLE_L2_CACHE					(1 << 0)
+#define		ENABLE_L2_FRAGMENT_PROCESSING			(1 << 1)
+#define		L2_CACHE_PTE_ENDIAN_SWAP_MODE(x)		((x) << 2)
+#define		L2_CACHE_PDE_ENDIAN_SWAP_MODE(x)		((x) << 4)
+#define		ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE		(1 << 9)
+#define		ENABLE_L2_PDE0_CACHE_LRU_UPDATE_BY_WRITE	(1 << 10)
+#define		EFFECTIVE_L2_QUEUE_SIZE(x)			(((x) & 7) << 15)
+#define		CONTEXT1_IDENTITY_ACCESS_MODE(x)		(((x) & 3) << 19)
+#define VM_L2_CNTL2					0x1404
+#define		INVALIDATE_ALL_L1_TLBS				(1 << 0)
+#define		INVALIDATE_L2_CACHE				(1 << 1)
+#define		INVALIDATE_CACHE_MODE(x)			((x) << 26)
+#define			INVALIDATE_PTE_AND_PDE_CACHES		0
+#define			INVALIDATE_ONLY_PTE_CACHES		1
+#define			INVALIDATE_ONLY_PDE_CACHES		2
+#define VM_L2_CNTL3					0x1408
+#define		BANK_SELECT(x)					((x) << 0)
+#define		L2_CACHE_UPDATE_MODE(x)				((x) << 6)
+#define		L2_CACHE_BIGK_FRAGMENT_SIZE(x)			((x) << 15)
+#define		L2_CACHE_BIGK_ASSOCIATIVITY			(1 << 20)
+#define	VM_L2_STATUS					0x140C
+#define		L2_BUSY						(1 << 0)
+#define VM_CONTEXT0_CNTL				0x1410
+#define		ENABLE_CONTEXT					(1 << 0)
+#define		PAGE_TABLE_DEPTH(x)				(((x) & 3) << 1)
+#define		RANGE_PROTECTION_FAULT_ENABLE_INTERRUPT		(1 << 3)
+#define		RANGE_PROTECTION_FAULT_ENABLE_DEFAULT		(1 << 4)
+#define		DUMMY_PAGE_PROTECTION_FAULT_ENABLE_INTERRUPT	(1 << 6)
+#define		DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT	(1 << 7)
+#define		PDE0_PROTECTION_FAULT_ENABLE_INTERRUPT		(1 << 9)
+#define		PDE0_PROTECTION_FAULT_ENABLE_DEFAULT		(1 << 10)
+#define		VALID_PROTECTION_FAULT_ENABLE_INTERRUPT		(1 << 12)
+#define		VALID_PROTECTION_FAULT_ENABLE_DEFAULT		(1 << 13)
+#define		READ_PROTECTION_FAULT_ENABLE_INTERRUPT		(1 << 15)
+#define		READ_PROTECTION_FAULT_ENABLE_DEFAULT		(1 << 16)
+#define		WRITE_PROTECTION_FAULT_ENABLE_INTERRUPT		(1 << 18)
+#define		WRITE_PROTECTION_FAULT_ENABLE_DEFAULT		(1 << 19)
+#define		PAGE_TABLE_BLOCK_SIZE(x)			(((x) & 0xF) << 24)
+#define VM_CONTEXT1_CNTL				0x1414
+#define VM_CONTEXT0_CNTL2				0x1430
+#define VM_CONTEXT1_CNTL2				0x1434
+#define	VM_CONTEXT8_PAGE_TABLE_BASE_ADDR		0x1438
+#define	VM_CONTEXT9_PAGE_TABLE_BASE_ADDR		0x143c
+#define	VM_CONTEXT10_PAGE_TABLE_BASE_ADDR		0x1440
+#define	VM_CONTEXT11_PAGE_TABLE_BASE_ADDR		0x1444
+#define	VM_CONTEXT12_PAGE_TABLE_BASE_ADDR		0x1448
+#define	VM_CONTEXT13_PAGE_TABLE_BASE_ADDR		0x144c
+#define	VM_CONTEXT14_PAGE_TABLE_BASE_ADDR		0x1450
+#define	VM_CONTEXT15_PAGE_TABLE_BASE_ADDR		0x1454
+
+#define	VM_CONTEXT1_PROTECTION_FAULT_ADDR		0x14FC
+#define	VM_CONTEXT1_PROTECTION_FAULT_STATUS		0x14DC
+#define		PROTECTIONS_MASK			(0xf << 0)
+#define		PROTECTIONS_SHIFT			0
+		/* bit 0: range
+		 * bit 1: pde0
+		 * bit 2: valid
+		 * bit 3: read
+		 * bit 4: write
+		 */
+#define		MEMORY_CLIENT_ID_MASK			(0xff << 12)
+#define		MEMORY_CLIENT_ID_SHIFT			12
+#define		MEMORY_CLIENT_RW_MASK			(1 << 24)
+#define		MEMORY_CLIENT_RW_SHIFT			24
+#define		FAULT_VMID_MASK				(0xf << 25)
+#define		FAULT_VMID_SHIFT			25
+
+#define VM_INVALIDATE_REQUEST				0x1478
+#define VM_INVALIDATE_RESPONSE				0x147c
+
+#define VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR	0x1518
+#define VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR	0x151c
+
+#define	VM_CONTEXT0_PAGE_TABLE_BASE_ADDR		0x153c
+#define	VM_CONTEXT1_PAGE_TABLE_BASE_ADDR		0x1540
+#define	VM_CONTEXT2_PAGE_TABLE_BASE_ADDR		0x1544
+#define	VM_CONTEXT3_PAGE_TABLE_BASE_ADDR		0x1548
+#define	VM_CONTEXT4_PAGE_TABLE_BASE_ADDR		0x154c
+#define	VM_CONTEXT5_PAGE_TABLE_BASE_ADDR		0x1550
+#define	VM_CONTEXT6_PAGE_TABLE_BASE_ADDR		0x1554
+#define	VM_CONTEXT7_PAGE_TABLE_BASE_ADDR		0x1558
+#define	VM_CONTEXT0_PAGE_TABLE_START_ADDR		0x155c
+#define	VM_CONTEXT1_PAGE_TABLE_START_ADDR		0x1560
+
+#define	VM_CONTEXT0_PAGE_TABLE_END_ADDR			0x157C
+#define	VM_CONTEXT1_PAGE_TABLE_END_ADDR			0x1580
+
+#define VM_L2_CG           				0x15c0
+#define		MC_CG_ENABLE				(1 << 18)
+#define		MC_LS_ENABLE				(1 << 19)
+
+#define MC_SHARED_CHMAP						0x2004
+#define		NOOFCHAN_SHIFT					12
+#define		NOOFCHAN_MASK					0x0000f000
+#define MC_SHARED_CHREMAP					0x2008
+
+#define	MC_VM_FB_LOCATION				0x2024
+#define	MC_VM_AGP_TOP					0x2028
+#define	MC_VM_AGP_BOT					0x202C
+#define	MC_VM_AGP_BASE					0x2030
+#define	MC_VM_SYSTEM_APERTURE_LOW_ADDR			0x2034
+#define	MC_VM_SYSTEM_APERTURE_HIGH_ADDR			0x2038
+#define	MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR		0x203C
+
+#define	MC_VM_MX_L1_TLB_CNTL				0x2064
+#define		ENABLE_L1_TLB					(1 << 0)
+#define		ENABLE_L1_FRAGMENT_PROCESSING			(1 << 1)
+#define		SYSTEM_ACCESS_MODE_PA_ONLY			(0 << 3)
+#define		SYSTEM_ACCESS_MODE_USE_SYS_MAP			(1 << 3)
+#define		SYSTEM_ACCESS_MODE_IN_SYS			(2 << 3)
+#define		SYSTEM_ACCESS_MODE_NOT_IN_SYS			(3 << 3)
+#define		SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU	(0 << 5)
+#define		ENABLE_ADVANCED_DRIVER_MODEL			(1 << 6)
+
+#define MC_SHARED_BLACKOUT_CNTL           		0x20ac
+
+#define MC_HUB_MISC_HUB_CG           			0x20b8
+#define MC_HUB_MISC_VM_CG           			0x20bc
+
+#define MC_HUB_MISC_SIP_CG           			0x20c0
+
+#define MC_XPB_CLK_GAT           			0x2478
+
+#define MC_CITF_MISC_RD_CG           			0x2648
+#define MC_CITF_MISC_WR_CG           			0x264c
+#define MC_CITF_MISC_VM_CG           			0x2650
+
+#define	MC_ARB_RAMCFG					0x2760
+#define		NOOFBANK_SHIFT					0
+#define		NOOFBANK_MASK					0x00000003
+#define		NOOFRANK_SHIFT					2
+#define		NOOFRANK_MASK					0x00000004
+#define		NOOFROWS_SHIFT					3
+#define		NOOFROWS_MASK					0x00000038
+#define		NOOFCOLS_SHIFT					6
+#define		NOOFCOLS_MASK					0x000000C0
+#define		CHANSIZE_SHIFT					8
+#define		CHANSIZE_MASK					0x00000100
+#define		CHANSIZE_OVERRIDE				(1 << 11)
+#define		NOOFGROUPS_SHIFT				12
+#define		NOOFGROUPS_MASK					0x00001000
+
+#define	MC_ARB_DRAM_TIMING				0x2774
+#define	MC_ARB_DRAM_TIMING2				0x2778
+
+#define MC_ARB_BURST_TIME                               0x2808
+#define		STATE0(x)				((x) << 0)
+#define		STATE0_MASK				(0x1f << 0)
+#define		STATE0_SHIFT				0
+#define		STATE1(x)				((x) << 5)
+#define		STATE1_MASK				(0x1f << 5)
+#define		STATE1_SHIFT				5
+#define		STATE2(x)				((x) << 10)
+#define		STATE2_MASK				(0x1f << 10)
+#define		STATE2_SHIFT				10
+#define		STATE3(x)				((x) << 15)
+#define		STATE3_MASK				(0x1f << 15)
+#define		STATE3_SHIFT				15
+
+#define	MC_SEQ_TRAIN_WAKEUP_CNTL			0x28e8
+#define		TRAIN_DONE_D0      			(1 << 30)
+#define		TRAIN_DONE_D1      			(1 << 31)
+
+#define MC_SEQ_SUP_CNTL           			0x28c8
+#define		RUN_MASK      				(1 << 0)
+#define MC_SEQ_SUP_PGM           			0x28cc
+#define MC_PMG_AUTO_CMD           			0x28d0
+
+#define MC_IO_PAD_CNTL_D0           			0x29d0
+#define		MEM_FALL_OUT_CMD      			(1 << 8)
+
+#define MC_SEQ_RAS_TIMING                               0x28a0
+#define MC_SEQ_CAS_TIMING                               0x28a4
+#define MC_SEQ_MISC_TIMING                              0x28a8
+#define MC_SEQ_MISC_TIMING2                             0x28ac
+#define MC_SEQ_PMG_TIMING                               0x28b0
+#define MC_SEQ_RD_CTL_D0                                0x28b4
+#define MC_SEQ_RD_CTL_D1                                0x28b8
+#define MC_SEQ_WR_CTL_D0                                0x28bc
+#define MC_SEQ_WR_CTL_D1                                0x28c0
+
+#define MC_SEQ_MISC0           				0x2a00
+#define 	MC_SEQ_MISC0_VEN_ID_SHIFT               8
+#define 	MC_SEQ_MISC0_VEN_ID_MASK                0x00000f00
+#define 	MC_SEQ_MISC0_VEN_ID_VALUE               3
+#define 	MC_SEQ_MISC0_REV_ID_SHIFT               12
+#define 	MC_SEQ_MISC0_REV_ID_MASK                0x0000f000
+#define 	MC_SEQ_MISC0_REV_ID_VALUE               1
+#define 	MC_SEQ_MISC0_GDDR5_SHIFT                28
+#define 	MC_SEQ_MISC0_GDDR5_MASK                 0xf0000000
+#define 	MC_SEQ_MISC0_GDDR5_VALUE                5
+#define MC_SEQ_MISC1                                    0x2a04
+#define MC_SEQ_RESERVE_M                                0x2a08
+#define MC_PMG_CMD_EMRS                                 0x2a0c
+
+#define MC_SEQ_IO_DEBUG_INDEX           		0x2a44
+#define MC_SEQ_IO_DEBUG_DATA           			0x2a48
+
+#define MC_SEQ_MISC5                                    0x2a54
+#define MC_SEQ_MISC6                                    0x2a58
+
+#define MC_SEQ_MISC7                                    0x2a64
+
+#define MC_SEQ_RAS_TIMING_LP                            0x2a6c
+#define MC_SEQ_CAS_TIMING_LP                            0x2a70
+#define MC_SEQ_MISC_TIMING_LP                           0x2a74
+#define MC_SEQ_MISC_TIMING2_LP                          0x2a78
+#define MC_SEQ_WR_CTL_D0_LP                             0x2a7c
+#define MC_SEQ_WR_CTL_D1_LP                             0x2a80
+#define MC_SEQ_PMG_CMD_EMRS_LP                          0x2a84
+#define MC_SEQ_PMG_CMD_MRS_LP                           0x2a88
+
+#define MC_PMG_CMD_MRS                                  0x2aac
+
+#define MC_SEQ_RD_CTL_D0_LP                             0x2b1c
+#define MC_SEQ_RD_CTL_D1_LP                             0x2b20
+
+#define MC_PMG_CMD_MRS1                                 0x2b44
+#define MC_SEQ_PMG_CMD_MRS1_LP                          0x2b48
+#define MC_SEQ_PMG_TIMING_LP                            0x2b4c
+
+#define MC_SEQ_WR_CTL_2                                 0x2b54
+#define MC_SEQ_WR_CTL_2_LP                              0x2b58
+#define MC_PMG_CMD_MRS2                                 0x2b5c
+#define MC_SEQ_PMG_CMD_MRS2_LP                          0x2b60
+
+#define	MCLK_PWRMGT_CNTL				0x2ba0
+#       define DLL_SPEED(x)				((x) << 0)
+#       define DLL_SPEED_MASK				(0x1f << 0)
+#       define DLL_READY                                (1 << 6)
+#       define MC_INT_CNTL                              (1 << 7)
+#       define MRDCK0_PDNB                              (1 << 8)
+#       define MRDCK1_PDNB                              (1 << 9)
+#       define MRDCK0_RESET                             (1 << 16)
+#       define MRDCK1_RESET                             (1 << 17)
+#       define DLL_READY_READ                           (1 << 24)
+#define	DLL_CNTL					0x2ba4
+#       define MRDCK0_BYPASS                            (1 << 24)
+#       define MRDCK1_BYPASS                            (1 << 25)
+
+#define	MPLL_CNTL_MODE					0x2bb0
+#       define MPLL_MCLK_SEL                            (1 << 11)
+#define	MPLL_FUNC_CNTL					0x2bb4
+#define		BWCTRL(x)				((x) << 20)
+#define		BWCTRL_MASK				(0xff << 20)
+#define	MPLL_FUNC_CNTL_1				0x2bb8
+#define		VCO_MODE(x)				((x) << 0)
+#define		VCO_MODE_MASK				(3 << 0)
+#define		CLKFRAC(x)				((x) << 4)
+#define		CLKFRAC_MASK				(0xfff << 4)
+#define		CLKF(x)					((x) << 16)
+#define		CLKF_MASK				(0xfff << 16)
+#define	MPLL_FUNC_CNTL_2				0x2bbc
+#define	MPLL_AD_FUNC_CNTL				0x2bc0
+#define		YCLK_POST_DIV(x)			((x) << 0)
+#define		YCLK_POST_DIV_MASK			(7 << 0)
+#define	MPLL_DQ_FUNC_CNTL				0x2bc4
+#define		YCLK_SEL(x)				((x) << 4)
+#define		YCLK_SEL_MASK				(1 << 4)
+
+#define	MPLL_SS1					0x2bcc
+#define		CLKV(x)					((x) << 0)
+#define		CLKV_MASK				(0x3ffffff << 0)
+#define	MPLL_SS2					0x2bd0
+#define		CLKS(x)					((x) << 0)
+#define		CLKS_MASK				(0xfff << 0)
+
+#define	HDP_HOST_PATH_CNTL				0x2C00
+#define 	CLOCK_GATING_DIS			(1 << 23)
+#define	HDP_NONSURFACE_BASE				0x2C04
+#define	HDP_NONSURFACE_INFO				0x2C08
+#define	HDP_NONSURFACE_SIZE				0x2C0C
+
+#define HDP_ADDR_CONFIG  				0x2F48
+#define HDP_MISC_CNTL					0x2F4C
+#define 	HDP_FLUSH_INVALIDATE_CACHE			(1 << 0)
+#define HDP_MEM_POWER_LS				0x2F50
+#define 	HDP_LS_ENABLE				(1 << 0)
+
+#define ATC_MISC_CG           				0x3350
+
+#define IH_RB_CNTL                                        0x3e00
+#       define IH_RB_ENABLE                               (1 << 0)
+#       define IH_IB_SIZE(x)                              ((x) << 1) /* log2 */
+#       define IH_RB_FULL_DRAIN_ENABLE                    (1 << 6)
+#       define IH_WPTR_WRITEBACK_ENABLE                   (1 << 8)
+#       define IH_WPTR_WRITEBACK_TIMER(x)                 ((x) << 9) /* log2 */
+#       define IH_WPTR_OVERFLOW_ENABLE                    (1 << 16)
+#       define IH_WPTR_OVERFLOW_CLEAR                     (1 << 31)
+#define IH_RB_BASE                                        0x3e04
+#define IH_RB_RPTR                                        0x3e08
+#define IH_RB_WPTR                                        0x3e0c
+#       define RB_OVERFLOW                                (1 << 0)
+#       define WPTR_OFFSET_MASK                           0x3fffc
+#define IH_RB_WPTR_ADDR_HI                                0x3e10
+#define IH_RB_WPTR_ADDR_LO                                0x3e14
+#define IH_CNTL                                           0x3e18
+#       define ENABLE_INTR                                (1 << 0)
+#       define IH_MC_SWAP(x)                              ((x) << 1)
+#       define IH_MC_SWAP_NONE                            0
+#       define IH_MC_SWAP_16BIT                           1
+#       define IH_MC_SWAP_32BIT                           2
+#       define IH_MC_SWAP_64BIT                           3
+#       define RPTR_REARM                                 (1 << 4)
+#       define MC_WRREQ_CREDIT(x)                         ((x) << 15)
+#       define MC_WR_CLEAN_CNT(x)                         ((x) << 20)
+#       define MC_VMID(x)                                 ((x) << 25)
+
+#define	CONFIG_MEMSIZE					0x5428
+
+#define INTERRUPT_CNTL                                    0x5468
+#       define IH_DUMMY_RD_OVERRIDE                       (1 << 0)
+#       define IH_DUMMY_RD_EN                             (1 << 1)
+#       define IH_REQ_NONSNOOP_EN                         (1 << 3)
+#       define GEN_IH_INT_EN                              (1 << 8)
+#define INTERRUPT_CNTL2                                   0x546c
+
+#define HDP_MEM_COHERENCY_FLUSH_CNTL			0x5480
+
+#define	BIF_FB_EN						0x5490
+#define		FB_READ_EN					(1 << 0)
+#define		FB_WRITE_EN					(1 << 1)
+
+#define HDP_REG_COHERENCY_FLUSH_CNTL			0x54A0
+
+/* DCE6 ELD audio interface */
+#define AZ_F0_CODEC_ENDPOINT_INDEX                       0x5E00
+#       define AZ_ENDPOINT_REG_INDEX(x)                  (((x) & 0xff) << 0)
+#       define AZ_ENDPOINT_REG_WRITE_EN                  (1 << 8)
+#define AZ_F0_CODEC_ENDPOINT_DATA                        0x5E04
+
+#define AZ_F0_CODEC_PIN_CONTROL_CHANNEL_SPEAKER          0x25
+#define		SPEAKER_ALLOCATION(x)			(((x) & 0x7f) << 0)
+#define		SPEAKER_ALLOCATION_MASK			(0x7f << 0)
+#define		SPEAKER_ALLOCATION_SHIFT		0
+#define		HDMI_CONNECTION				(1 << 16)
+#define		DP_CONNECTION				(1 << 17)
+
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR0        0x28 /* LPCM */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR1        0x29 /* AC3 */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR2        0x2A /* MPEG1 */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR3        0x2B /* MP3 */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR4        0x2C /* MPEG2 */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR5        0x2D /* AAC */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR6        0x2E /* DTS */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR7        0x2F /* ATRAC */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR8        0x30 /* one bit audio - leave at 0 (default) */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR9        0x31 /* Dolby Digital */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR10       0x32 /* DTS-HD */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR11       0x33 /* MAT-MLP */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR12       0x34 /* DTS */
+#define AZ_F0_CODEC_PIN_CONTROL_AUDIO_DESCRIPTOR13       0x35 /* WMA Pro */
+#       define MAX_CHANNELS(x)                            (((x) & 0x7) << 0)
+/* max channels minus one.  7 = 8 channels */
+#       define SUPPORTED_FREQUENCIES(x)                   (((x) & 0xff) << 8)
+#       define DESCRIPTOR_BYTE_2(x)                       (((x) & 0xff) << 16)
+#       define SUPPORTED_FREQUENCIES_STEREO(x)            (((x) & 0xff) << 24) /* LPCM only */
+/* SUPPORTED_FREQUENCIES, SUPPORTED_FREQUENCIES_STEREO
+ * bit0 = 32 kHz
+ * bit1 = 44.1 kHz
+ * bit2 = 48 kHz
+ * bit3 = 88.2 kHz
+ * bit4 = 96 kHz
+ * bit5 = 176.4 kHz
+ * bit6 = 192 kHz
+ */
+
+#define AZ_F0_CODEC_PIN_CONTROL_RESPONSE_LIPSYNC         0x37
+#       define VIDEO_LIPSYNC(x)                           (((x) & 0xff) << 0)
+#       define AUDIO_LIPSYNC(x)                           (((x) & 0xff) << 8)
+/* VIDEO_LIPSYNC, AUDIO_LIPSYNC
+ * 0   = invalid
+ * x   = legal delay value
+ * 255 = sync not supported
+ */
+#define AZ_F0_CODEC_PIN_CONTROL_RESPONSE_HBR             0x38
+#       define HBR_CAPABLE                                (1 << 0) /* enabled by default */
+
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO0               0x3a
+#       define MANUFACTURER_ID(x)                        (((x) & 0xffff) << 0)
+#       define PRODUCT_ID(x)                             (((x) & 0xffff) << 16)
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO1               0x3b
+#       define SINK_DESCRIPTION_LEN(x)                   (((x) & 0xff) << 0)
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO2               0x3c
+#       define PORT_ID0(x)                               (((x) & 0xffffffff) << 0)
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO3               0x3d
+#       define PORT_ID1(x)                               (((x) & 0xffffffff) << 0)
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO4               0x3e
+#       define DESCRIPTION0(x)                           (((x) & 0xff) << 0)
+#       define DESCRIPTION1(x)                           (((x) & 0xff) << 8)
+#       define DESCRIPTION2(x)                           (((x) & 0xff) << 16)
+#       define DESCRIPTION3(x)                           (((x) & 0xff) << 24)
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO5               0x3f
+#       define DESCRIPTION4(x)                           (((x) & 0xff) << 0)
+#       define DESCRIPTION5(x)                           (((x) & 0xff) << 8)
+#       define DESCRIPTION6(x)                           (((x) & 0xff) << 16)
+#       define DESCRIPTION7(x)                           (((x) & 0xff) << 24)
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO6               0x40
+#       define DESCRIPTION8(x)                           (((x) & 0xff) << 0)
+#       define DESCRIPTION9(x)                           (((x) & 0xff) << 8)
+#       define DESCRIPTION10(x)                          (((x) & 0xff) << 16)
+#       define DESCRIPTION11(x)                          (((x) & 0xff) << 24)
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO7               0x41
+#       define DESCRIPTION12(x)                          (((x) & 0xff) << 0)
+#       define DESCRIPTION13(x)                          (((x) & 0xff) << 8)
+#       define DESCRIPTION14(x)                          (((x) & 0xff) << 16)
+#       define DESCRIPTION15(x)                          (((x) & 0xff) << 24)
+#define AZ_F0_CODEC_PIN_CONTROL_SINK_INFO8               0x42
+#       define DESCRIPTION16(x)                          (((x) & 0xff) << 0)
+#       define DESCRIPTION17(x)                          (((x) & 0xff) << 8)
+
+#define AZ_F0_CODEC_PIN_CONTROL_HOT_PLUG_CONTROL         0x54
+#       define AUDIO_ENABLED                             (1 << 31)
+
+#define AZ_F0_CODEC_PIN_CONTROL_RESPONSE_CONFIGURATION_DEFAULT  0x56
+#define		PORT_CONNECTIVITY_MASK				(3 << 30)
+#define		PORT_CONNECTIVITY_SHIFT				30
+
+#define	DC_LB_MEMORY_SPLIT					0x6b0c
+#define		DC_LB_MEMORY_CONFIG(x)				((x) << 20)
+
+#define	PRIORITY_A_CNT						0x6b18
+#define		PRIORITY_MARK_MASK				0x7fff
+#define		PRIORITY_OFF					(1 << 16)
+#define		PRIORITY_ALWAYS_ON				(1 << 20)
+#define	PRIORITY_B_CNT						0x6b1c
+
+#define	DPG_PIPE_ARBITRATION_CONTROL3				0x6cc8
+#       define LATENCY_WATERMARK_MASK(x)			((x) << 16)
+#define	DPG_PIPE_LATENCY_CONTROL				0x6ccc
+#       define LATENCY_LOW_WATERMARK(x)				((x) << 0)
+#       define LATENCY_HIGH_WATERMARK(x)			((x) << 16)
+
+/* 0x6bb8, 0x77b8, 0x103b8, 0x10fb8, 0x11bb8, 0x127b8 */
+#define VLINE_STATUS                                    0x6bb8
+#       define VLINE_OCCURRED                           (1 << 0)
+#       define VLINE_ACK                                (1 << 4)
+#       define VLINE_STAT                               (1 << 12)
+#       define VLINE_INTERRUPT                          (1 << 16)
+#       define VLINE_INTERRUPT_TYPE                     (1 << 17)
+/* 0x6bbc, 0x77bc, 0x103bc, 0x10fbc, 0x11bbc, 0x127bc */
+#define VBLANK_STATUS                                   0x6bbc
+#       define VBLANK_OCCURRED                          (1 << 0)
+#       define VBLANK_ACK                               (1 << 4)
+#       define VBLANK_STAT                              (1 << 12)
+#       define VBLANK_INTERRUPT                         (1 << 16)
+#       define VBLANK_INTERRUPT_TYPE                    (1 << 17)
+
+/* 0x6b40, 0x7740, 0x10340, 0x10f40, 0x11b40, 0x12740 */
+#define INT_MASK                                        0x6b40
+#       define VBLANK_INT_MASK                          (1 << 0)
+#       define VLINE_INT_MASK                           (1 << 4)
+
+#define DISP_INTERRUPT_STATUS                           0x60f4
+#       define LB_D1_VLINE_INTERRUPT                    (1 << 2)
+#       define LB_D1_VBLANK_INTERRUPT                   (1 << 3)
+#       define DC_HPD1_INTERRUPT                        (1 << 17)
+#       define DC_HPD1_RX_INTERRUPT                     (1 << 18)
+#       define DACA_AUTODETECT_INTERRUPT                (1 << 22)
+#       define DACB_AUTODETECT_INTERRUPT                (1 << 23)
+#       define DC_I2C_SW_DONE_INTERRUPT                 (1 << 24)
+#       define DC_I2C_HW_DONE_INTERRUPT                 (1 << 25)
+#define DISP_INTERRUPT_STATUS_CONTINUE                  0x60f8
+#       define LB_D2_VLINE_INTERRUPT                    (1 << 2)
+#       define LB_D2_VBLANK_INTERRUPT                   (1 << 3)
+#       define DC_HPD2_INTERRUPT                        (1 << 17)
+#       define DC_HPD2_RX_INTERRUPT                     (1 << 18)
+#       define DISP_TIMER_INTERRUPT                     (1 << 24)
+#define DISP_INTERRUPT_STATUS_CONTINUE2                 0x60fc
+#       define LB_D3_VLINE_INTERRUPT                    (1 << 2)
+#       define LB_D3_VBLANK_INTERRUPT                   (1 << 3)
+#       define DC_HPD3_INTERRUPT                        (1 << 17)
+#       define DC_HPD3_RX_INTERRUPT                     (1 << 18)
+#define DISP_INTERRUPT_STATUS_CONTINUE3                 0x6100
+#       define LB_D4_VLINE_INTERRUPT                    (1 << 2)
+#       define LB_D4_VBLANK_INTERRUPT                   (1 << 3)
+#       define DC_HPD4_INTERRUPT                        (1 << 17)
+#       define DC_HPD4_RX_INTERRUPT                     (1 << 18)
+#define DISP_INTERRUPT_STATUS_CONTINUE4                 0x614c
+#       define LB_D5_VLINE_INTERRUPT                    (1 << 2)
+#       define LB_D5_VBLANK_INTERRUPT                   (1 << 3)
+#       define DC_HPD5_INTERRUPT                        (1 << 17)
+#       define DC_HPD5_RX_INTERRUPT                     (1 << 18)
+#define DISP_INTERRUPT_STATUS_CONTINUE5                 0x6150
+#       define LB_D6_VLINE_INTERRUPT                    (1 << 2)
+#       define LB_D6_VBLANK_INTERRUPT                   (1 << 3)
+#       define DC_HPD6_INTERRUPT                        (1 << 17)
+#       define DC_HPD6_RX_INTERRUPT                     (1 << 18)
+
+/* 0x6858, 0x7458, 0x10058, 0x10c58, 0x11858, 0x12458 */
+#define GRPH_INT_STATUS                                 0x6858
+#       define GRPH_PFLIP_INT_OCCURRED                  (1 << 0)
+#       define GRPH_PFLIP_INT_CLEAR                     (1 << 8)
+/* 0x685c, 0x745c, 0x1005c, 0x10c5c, 0x1185c, 0x1245c */
+#define	GRPH_INT_CONTROL			        0x685c
+#       define GRPH_PFLIP_INT_MASK                      (1 << 0)
+#       define GRPH_PFLIP_INT_TYPE                      (1 << 8)
+
+#define	DAC_AUTODETECT_INT_CONTROL			0x67c8
+
+#define DC_HPD1_INT_STATUS                              0x601c
+#define DC_HPD2_INT_STATUS                              0x6028
+#define DC_HPD3_INT_STATUS                              0x6034
+#define DC_HPD4_INT_STATUS                              0x6040
+#define DC_HPD5_INT_STATUS                              0x604c
+#define DC_HPD6_INT_STATUS                              0x6058
+#       define DC_HPDx_INT_STATUS                       (1 << 0)
+#       define DC_HPDx_SENSE                            (1 << 1)
+#       define DC_HPDx_RX_INT_STATUS                    (1 << 8)
+
+#define DC_HPD1_INT_CONTROL                             0x6020
+#define DC_HPD2_INT_CONTROL                             0x602c
+#define DC_HPD3_INT_CONTROL                             0x6038
+#define DC_HPD4_INT_CONTROL                             0x6044
+#define DC_HPD5_INT_CONTROL                             0x6050
+#define DC_HPD6_INT_CONTROL                             0x605c
+#       define DC_HPDx_INT_ACK                          (1 << 0)
+#       define DC_HPDx_INT_POLARITY                     (1 << 8)
+#       define DC_HPDx_INT_EN                           (1 << 16)
+#       define DC_HPDx_RX_INT_ACK                       (1 << 20)
+#       define DC_HPDx_RX_INT_EN                        (1 << 24)
+
+#define DC_HPD1_CONTROL                                   0x6024
+#define DC_HPD2_CONTROL                                   0x6030
+#define DC_HPD3_CONTROL                                   0x603c
+#define DC_HPD4_CONTROL                                   0x6048
+#define DC_HPD5_CONTROL                                   0x6054
+#define DC_HPD6_CONTROL                                   0x6060
+#       define DC_HPDx_CONNECTION_TIMER(x)                ((x) << 0)
+#       define DC_HPDx_RX_INT_TIMER(x)                    ((x) << 16)
+#       define DC_HPDx_EN                                 (1 << 28)
+
+#define DPG_PIPE_STUTTER_CONTROL                          0x6cd4
+#       define STUTTER_ENABLE                             (1 << 0)
+
+/* 0x6e98, 0x7a98, 0x10698, 0x11298, 0x11e98, 0x12a98 */
+#define CRTC_STATUS_FRAME_COUNT                         0x6e98
+
+/* Audio clocks */
+#define DCCG_AUDIO_DTO_SOURCE                           0x05ac
+#       define DCCG_AUDIO_DTO0_SOURCE_SEL(x) ((x) << 0) /* crtc0 - crtc5 */
+#       define DCCG_AUDIO_DTO_SEL            (1 << 4)   /* 0=dto0 1=dto1 */
+
+#define DCCG_AUDIO_DTO0_PHASE                           0x05b0
+#define DCCG_AUDIO_DTO0_MODULE                          0x05b4
+#define DCCG_AUDIO_DTO1_PHASE                           0x05c0
+#define DCCG_AUDIO_DTO1_MODULE                          0x05c4
+
+#define DENTIST_DISPCLK_CNTL				0x0490
+#	define DENTIST_DPREFCLK_WDIVIDER(x)		(((x) & 0x7f) << 24)
+#	define DENTIST_DPREFCLK_WDIVIDER_MASK		(0x7f << 24)
+#	define DENTIST_DPREFCLK_WDIVIDER_SHIFT		24
+
+#define AFMT_AUDIO_SRC_CONTROL                          0x713c
+#define		AFMT_AUDIO_SRC_SELECT(x)		(((x) & 7) << 0)
+/* AFMT_AUDIO_SRC_SELECT
+ * 0 = stream0
+ * 1 = stream1
+ * 2 = stream2
+ * 3 = stream3
+ * 4 = stream4
+ * 5 = stream5
+ */
+
+#define	GRBM_CNTL					0x8000
+#define		GRBM_READ_TIMEOUT(x)				((x) << 0)
+
+#define	GRBM_STATUS2					0x8008
+#define		RLC_RQ_PENDING 					(1 << 0)
+#define		RLC_BUSY 					(1 << 8)
+#define		TC_BUSY 					(1 << 9)
+
+#define	GRBM_STATUS					0x8010
+#define		CMDFIFO_AVAIL_MASK				0x0000000F
+#define		RING2_RQ_PENDING				(1 << 4)
+#define		SRBM_RQ_PENDING					(1 << 5)
+#define		RING1_RQ_PENDING				(1 << 6)
+#define		CF_RQ_PENDING					(1 << 7)
+#define		PF_RQ_PENDING					(1 << 8)
+#define		GDS_DMA_RQ_PENDING				(1 << 9)
+#define		GRBM_EE_BUSY					(1 << 10)
+#define		DB_CLEAN					(1 << 12)
+#define		CB_CLEAN					(1 << 13)
+#define		TA_BUSY 					(1 << 14)
+#define		GDS_BUSY 					(1 << 15)
+#define		VGT_BUSY					(1 << 17)
+#define		IA_BUSY_NO_DMA					(1 << 18)
+#define		IA_BUSY						(1 << 19)
+#define		SX_BUSY 					(1 << 20)
+#define		SPI_BUSY					(1 << 22)
+#define		BCI_BUSY					(1 << 23)
+#define		SC_BUSY 					(1 << 24)
+#define		PA_BUSY 					(1 << 25)
+#define		DB_BUSY 					(1 << 26)
+#define		CP_COHERENCY_BUSY      				(1 << 28)
+#define		CP_BUSY 					(1 << 29)
+#define		CB_BUSY 					(1 << 30)
+#define		GUI_ACTIVE					(1 << 31)
+#define	GRBM_STATUS_SE0					0x8014
+#define	GRBM_STATUS_SE1					0x8018
+#define		SE_DB_CLEAN					(1 << 1)
+#define		SE_CB_CLEAN					(1 << 2)
+#define		SE_BCI_BUSY					(1 << 22)
+#define		SE_VGT_BUSY					(1 << 23)
+#define		SE_PA_BUSY					(1 << 24)
+#define		SE_TA_BUSY					(1 << 25)
+#define		SE_SX_BUSY					(1 << 26)
+#define		SE_SPI_BUSY					(1 << 27)
+#define		SE_SC_BUSY					(1 << 29)
+#define		SE_DB_BUSY					(1 << 30)
+#define		SE_CB_BUSY					(1 << 31)
+
+#define	GRBM_SOFT_RESET					0x8020
+#define		SOFT_RESET_CP					(1 << 0)
+#define		SOFT_RESET_CB					(1 << 1)
+#define		SOFT_RESET_RLC					(1 << 2)
+#define		SOFT_RESET_DB					(1 << 3)
+#define		SOFT_RESET_GDS					(1 << 4)
+#define		SOFT_RESET_PA					(1 << 5)
+#define		SOFT_RESET_SC					(1 << 6)
+#define		SOFT_RESET_BCI					(1 << 7)
+#define		SOFT_RESET_SPI					(1 << 8)
+#define		SOFT_RESET_SX					(1 << 10)
+#define		SOFT_RESET_TC					(1 << 11)
+#define		SOFT_RESET_TA					(1 << 12)
+#define		SOFT_RESET_VGT					(1 << 14)
+#define		SOFT_RESET_IA					(1 << 15)
+
+#define GRBM_GFX_INDEX          			0x802C
+#define		INSTANCE_INDEX(x)			((x) << 0)
+#define		SH_INDEX(x)     			((x) << 8)
+#define		SE_INDEX(x)     			((x) << 16)
+#define		SH_BROADCAST_WRITES      		(1 << 29)
+#define		INSTANCE_BROADCAST_WRITES      		(1 << 30)
+#define		SE_BROADCAST_WRITES      		(1 << 31)
+
+#define GRBM_INT_CNTL                                   0x8060
+#       define RDERR_INT_ENABLE                         (1 << 0)
+#       define GUI_IDLE_INT_ENABLE                      (1 << 19)
+
+#define	CP_STRMOUT_CNTL					0x84FC
+#define	SCRATCH_REG0					0x8500
+#define	SCRATCH_REG1					0x8504
+#define	SCRATCH_REG2					0x8508
+#define	SCRATCH_REG3					0x850C
+#define	SCRATCH_REG4					0x8510
+#define	SCRATCH_REG5					0x8514
+#define	SCRATCH_REG6					0x8518
+#define	SCRATCH_REG7					0x851C
+
+#define	SCRATCH_UMSK					0x8540
+#define	SCRATCH_ADDR					0x8544
+
+#define	CP_SEM_WAIT_TIMER				0x85BC
+
+#define	CP_SEM_INCOMPLETE_TIMER_CNTL			0x85C8
+
+#define CP_ME_CNTL					0x86D8
+#define		CP_CE_HALT					(1 << 24)
+#define		CP_PFP_HALT					(1 << 26)
+#define		CP_ME_HALT					(1 << 28)
+
+#define	CP_COHER_CNTL2					0x85E8
+
+#define	CP_RB2_RPTR					0x86f8
+#define	CP_RB1_RPTR					0x86fc
+#define	CP_RB0_RPTR					0x8700
+#define	CP_RB_WPTR_DELAY				0x8704
+
+#define	CP_QUEUE_THRESHOLDS				0x8760
+#define		ROQ_IB1_START(x)				((x) << 0)
+#define		ROQ_IB2_START(x)				((x) << 8)
+#define CP_MEQ_THRESHOLDS				0x8764
+#define		MEQ1_START(x)				((x) << 0)
+#define		MEQ2_START(x)				((x) << 8)
+
+#define	CP_PERFMON_CNTL					0x87FC
+
+#define	VGT_VTX_VECT_EJECT_REG				0x88B0
+
+#define	VGT_CACHE_INVALIDATION				0x88C4
+#define		CACHE_INVALIDATION(x)				((x) << 0)
+#define			VC_ONLY						0
+#define			TC_ONLY						1
+#define			VC_AND_TC					2
+#define		AUTO_INVLD_EN(x)				((x) << 6)
+#define			NO_AUTO						0
+#define			ES_AUTO						1
+#define			GS_AUTO						2
+#define			ES_AND_GS_AUTO					3
+#define	VGT_ESGS_RING_SIZE				0x88C8
+#define	VGT_GSVS_RING_SIZE				0x88CC
+
+#define	VGT_GS_VERTEX_REUSE				0x88D4
+
+#define	VGT_PRIMITIVE_TYPE				0x8958
+#define	VGT_INDEX_TYPE					0x895C
+
+#define	VGT_NUM_INDICES					0x8970
+#define	VGT_NUM_INSTANCES				0x8974
+
+#define	VGT_TF_RING_SIZE				0x8988
+
+#define	VGT_HS_OFFCHIP_PARAM				0x89B0
+
+#define	VGT_TF_MEMORY_BASE				0x89B8
+
+#define CC_GC_SHADER_ARRAY_CONFIG			0x89bc
+#define		INACTIVE_CUS_MASK			0xFFFF0000
+#define		INACTIVE_CUS_SHIFT			16
+#define GC_USER_SHADER_ARRAY_CONFIG			0x89c0
+
+#define	PA_CL_ENHANCE					0x8A14
+#define		CLIP_VTX_REORDER_ENA				(1 << 0)
+#define		NUM_CLIP_SEQ(x)					((x) << 1)
+
+#define	PA_SU_LINE_STIPPLE_VALUE			0x8A60
+
+#define	PA_SC_LINE_STIPPLE_STATE			0x8B10
+
+#define	PA_SC_FORCE_EOV_MAX_CNTS			0x8B24
+#define		FORCE_EOV_MAX_CLK_CNT(x)			((x) << 0)
+#define		FORCE_EOV_MAX_REZ_CNT(x)			((x) << 16)
+
+#define	PA_SC_FIFO_SIZE					0x8BCC
+#define		SC_FRONTEND_PRIM_FIFO_SIZE(x)			((x) << 0)
+#define		SC_BACKEND_PRIM_FIFO_SIZE(x)			((x) << 6)
+#define		SC_HIZ_TILE_FIFO_SIZE(x)			((x) << 15)
+#define		SC_EARLYZ_TILE_FIFO_SIZE(x)			((x) << 23)
+
+#define	PA_SC_ENHANCE					0x8BF0
+
+#define	SQ_CONFIG					0x8C00
+
+#define	SQC_CACHES					0x8C08
+
+#define SQ_POWER_THROTTLE                               0x8e58
+#define		MIN_POWER(x)				((x) << 0)
+#define		MIN_POWER_MASK				(0x3fff << 0)
+#define		MIN_POWER_SHIFT				0
+#define		MAX_POWER(x)				((x) << 16)
+#define		MAX_POWER_MASK				(0x3fff << 16)
+#define		MAX_POWER_SHIFT				0
+#define SQ_POWER_THROTTLE2                              0x8e5c
+#define		MAX_POWER_DELTA(x)			((x) << 0)
+#define		MAX_POWER_DELTA_MASK			(0x3fff << 0)
+#define		MAX_POWER_DELTA_SHIFT			0
+#define		STI_SIZE(x)				((x) << 16)
+#define		STI_SIZE_MASK				(0x3ff << 16)
+#define		STI_SIZE_SHIFT				16
+#define		LTI_RATIO(x)				((x) << 27)
+#define		LTI_RATIO_MASK				(0xf << 27)
+#define		LTI_RATIO_SHIFT				27
+
+#define	SX_DEBUG_1					0x9060
+
+#define	SPI_STATIC_THREAD_MGMT_1			0x90E0
+#define	SPI_STATIC_THREAD_MGMT_2			0x90E4
+#define	SPI_STATIC_THREAD_MGMT_3			0x90E8
+#define	SPI_PS_MAX_WAVE_ID				0x90EC
+
+#define	SPI_CONFIG_CNTL					0x9100
+
+#define	SPI_CONFIG_CNTL_1				0x913C
+#define		VTX_DONE_DELAY(x)				((x) << 0)
+#define		INTERP_ONE_PRIM_PER_ROW				(1 << 4)
+
+#define	CGTS_TCC_DISABLE				0x9148
+#define	CGTS_USER_TCC_DISABLE				0x914C
+#define		TCC_DISABLE_MASK				0xFFFF0000
+#define		TCC_DISABLE_SHIFT				16
+#define	CGTS_SM_CTRL_REG				0x9150
+#define		OVERRIDE				(1 << 21)
+#define		LS_OVERRIDE				(1 << 22)
+
+#define	SPI_LB_CU_MASK					0x9354
+
+#define	TA_CNTL_AUX					0x9508
+
+#define CC_RB_BACKEND_DISABLE				0x98F4
+#define		BACKEND_DISABLE(x)     			((x) << 16)
+#define GB_ADDR_CONFIG  				0x98F8
+#define		NUM_PIPES(x)				((x) << 0)
+#define		NUM_PIPES_MASK				0x00000007
+#define		NUM_PIPES_SHIFT				0
+#define		PIPE_INTERLEAVE_SIZE(x)			((x) << 4)
+#define		PIPE_INTERLEAVE_SIZE_MASK		0x00000070
+#define		PIPE_INTERLEAVE_SIZE_SHIFT		4
+#define		NUM_SHADER_ENGINES(x)			((x) << 12)
+#define		NUM_SHADER_ENGINES_MASK			0x00003000
+#define		NUM_SHADER_ENGINES_SHIFT		12
+#define		SHADER_ENGINE_TILE_SIZE(x)     		((x) << 16)
+#define		SHADER_ENGINE_TILE_SIZE_MASK		0x00070000
+#define		SHADER_ENGINE_TILE_SIZE_SHIFT		16
+#define		NUM_GPUS(x)     			((x) << 20)
+#define		NUM_GPUS_MASK				0x00700000
+#define		NUM_GPUS_SHIFT				20
+#define		MULTI_GPU_TILE_SIZE(x)     		((x) << 24)
+#define		MULTI_GPU_TILE_SIZE_MASK		0x03000000
+#define		MULTI_GPU_TILE_SIZE_SHIFT		24
+#define		ROW_SIZE(x)             		((x) << 28)
+#define		ROW_SIZE_MASK				0x30000000
+#define		ROW_SIZE_SHIFT				28
+
+#define	GB_TILE_MODE0					0x9910
+#       define MICRO_TILE_MODE(x)				((x) << 0)
+#              define	ADDR_SURF_DISPLAY_MICRO_TILING		0
+#              define	ADDR_SURF_THIN_MICRO_TILING		1
+#              define	ADDR_SURF_DEPTH_MICRO_TILING		2
+#       define ARRAY_MODE(x)					((x) << 2)
+#              define	ARRAY_LINEAR_GENERAL			0
+#              define	ARRAY_LINEAR_ALIGNED			1
+#              define	ARRAY_1D_TILED_THIN1			2
+#              define	ARRAY_2D_TILED_THIN1			4
+#       define PIPE_CONFIG(x)					((x) << 6)
+#              define	ADDR_SURF_P2				0
+#              define	ADDR_SURF_P4_8x16			4
+#              define	ADDR_SURF_P4_16x16			5
+#              define	ADDR_SURF_P4_16x32			6
+#              define	ADDR_SURF_P4_32x32			7
+#              define	ADDR_SURF_P8_16x16_8x16			8
+#              define	ADDR_SURF_P8_16x32_8x16			9
+#              define	ADDR_SURF_P8_32x32_8x16			10
+#              define	ADDR_SURF_P8_16x32_16x16		11
+#              define	ADDR_SURF_P8_32x32_16x16		12
+#              define	ADDR_SURF_P8_32x32_16x32		13
+#              define	ADDR_SURF_P8_32x64_32x32		14
+#       define TILE_SPLIT(x)					((x) << 11)
+#              define	ADDR_SURF_TILE_SPLIT_64B		0
+#              define	ADDR_SURF_TILE_SPLIT_128B		1
+#              define	ADDR_SURF_TILE_SPLIT_256B		2
+#              define	ADDR_SURF_TILE_SPLIT_512B		3
+#              define	ADDR_SURF_TILE_SPLIT_1KB		4
+#              define	ADDR_SURF_TILE_SPLIT_2KB		5
+#              define	ADDR_SURF_TILE_SPLIT_4KB		6
+#       define BANK_WIDTH(x)					((x) << 14)
+#              define	ADDR_SURF_BANK_WIDTH_1			0
+#              define	ADDR_SURF_BANK_WIDTH_2			1
+#              define	ADDR_SURF_BANK_WIDTH_4			2
+#              define	ADDR_SURF_BANK_WIDTH_8			3
+#       define BANK_HEIGHT(x)					((x) << 16)
+#              define	ADDR_SURF_BANK_HEIGHT_1			0
+#              define	ADDR_SURF_BANK_HEIGHT_2			1
+#              define	ADDR_SURF_BANK_HEIGHT_4			2
+#              define	ADDR_SURF_BANK_HEIGHT_8			3
+#       define MACRO_TILE_ASPECT(x)				((x) << 18)
+#              define	ADDR_SURF_MACRO_ASPECT_1		0
+#              define	ADDR_SURF_MACRO_ASPECT_2		1
+#              define	ADDR_SURF_MACRO_ASPECT_4		2
+#              define	ADDR_SURF_MACRO_ASPECT_8		3
+#       define NUM_BANKS(x)					((x) << 20)
+#              define	ADDR_SURF_2_BANK			0
+#              define	ADDR_SURF_4_BANK			1
+#              define	ADDR_SURF_8_BANK			2
+#              define	ADDR_SURF_16_BANK			3
+
+#define	CB_PERFCOUNTER0_SELECT0				0x9a20
+#define	CB_PERFCOUNTER0_SELECT1				0x9a24
+#define	CB_PERFCOUNTER1_SELECT0				0x9a28
+#define	CB_PERFCOUNTER1_SELECT1				0x9a2c
+#define	CB_PERFCOUNTER2_SELECT0				0x9a30
+#define	CB_PERFCOUNTER2_SELECT1				0x9a34
+#define	CB_PERFCOUNTER3_SELECT0				0x9a38
+#define	CB_PERFCOUNTER3_SELECT1				0x9a3c
+
+#define	CB_CGTT_SCLK_CTRL				0x9a60
+
+#define	GC_USER_RB_BACKEND_DISABLE			0x9B7C
+#define		BACKEND_DISABLE_MASK			0x00FF0000
+#define		BACKEND_DISABLE_SHIFT			16
+
+#define	TCP_CHAN_STEER_LO				0xac0c
+#define	TCP_CHAN_STEER_HI				0xac10
+
+#define	CP_RB0_BASE					0xC100
+#define	CP_RB0_CNTL					0xC104
+#define		RB_BUFSZ(x)					((x) << 0)
+#define		RB_BLKSZ(x)					((x) << 8)
+#define		BUF_SWAP_32BIT					(2 << 16)
+#define		RB_NO_UPDATE					(1 << 27)
+#define		RB_RPTR_WR_ENA					(1 << 31)
+
+#define	CP_RB0_RPTR_ADDR				0xC10C
+#define	CP_RB0_RPTR_ADDR_HI				0xC110
+#define	CP_RB0_WPTR					0xC114
+
+#define	CP_PFP_UCODE_ADDR				0xC150
+#define	CP_PFP_UCODE_DATA				0xC154
+#define	CP_ME_RAM_RADDR					0xC158
+#define	CP_ME_RAM_WADDR					0xC15C
+#define	CP_ME_RAM_DATA					0xC160
+
+#define	CP_CE_UCODE_ADDR				0xC168
+#define	CP_CE_UCODE_DATA				0xC16C
+
+#define	CP_RB1_BASE					0xC180
+#define	CP_RB1_CNTL					0xC184
+#define	CP_RB1_RPTR_ADDR				0xC188
+#define	CP_RB1_RPTR_ADDR_HI				0xC18C
+#define	CP_RB1_WPTR					0xC190
+#define	CP_RB2_BASE					0xC194
+#define	CP_RB2_CNTL					0xC198
+#define	CP_RB2_RPTR_ADDR				0xC19C
+#define	CP_RB2_RPTR_ADDR_HI				0xC1A0
+#define	CP_RB2_WPTR					0xC1A4
+#define CP_INT_CNTL_RING0                               0xC1A8
+#define CP_INT_CNTL_RING1                               0xC1AC
+#define CP_INT_CNTL_RING2                               0xC1B0
+#       define CNTX_BUSY_INT_ENABLE                     (1 << 19)
+#       define CNTX_EMPTY_INT_ENABLE                    (1 << 20)
+#       define WAIT_MEM_SEM_INT_ENABLE                  (1 << 21)
+#       define TIME_STAMP_INT_ENABLE                    (1 << 26)
+#       define CP_RINGID2_INT_ENABLE                    (1 << 29)
+#       define CP_RINGID1_INT_ENABLE                    (1 << 30)
+#       define CP_RINGID0_INT_ENABLE                    (1 << 31)
+#define CP_INT_STATUS_RING0                             0xC1B4
+#define CP_INT_STATUS_RING1                             0xC1B8
+#define CP_INT_STATUS_RING2                             0xC1BC
+#       define WAIT_MEM_SEM_INT_STAT                    (1 << 21)
+#       define TIME_STAMP_INT_STAT                      (1 << 26)
+#       define CP_RINGID2_INT_STAT                      (1 << 29)
+#       define CP_RINGID1_INT_STAT                      (1 << 30)
+#       define CP_RINGID0_INT_STAT                      (1 << 31)
+
+#define	CP_MEM_SLP_CNTL					0xC1E4
+#       define CP_MEM_LS_EN                             (1 << 0)
+
+#define	CP_DEBUG					0xC1FC
+
+#define RLC_CNTL                                          0xC300
+#       define RLC_ENABLE                                 (1 << 0)
+#define RLC_RL_BASE                                       0xC304
+#define RLC_RL_SIZE                                       0xC308
+#define RLC_LB_CNTL                                       0xC30C
+#       define LOAD_BALANCE_ENABLE                        (1 << 0)
+#define RLC_SAVE_AND_RESTORE_BASE                         0xC310
+#define RLC_LB_CNTR_MAX                                   0xC314
+#define RLC_LB_CNTR_INIT                                  0xC318
+
+#define RLC_CLEAR_STATE_RESTORE_BASE                      0xC320
+
+#define RLC_UCODE_ADDR                                    0xC32C
+#define RLC_UCODE_DATA                                    0xC330
+
+#define RLC_GPU_CLOCK_COUNT_LSB                           0xC338
+#define RLC_GPU_CLOCK_COUNT_MSB                           0xC33C
+#define RLC_CAPTURE_GPU_CLOCK_COUNT                       0xC340
+#define RLC_MC_CNTL                                       0xC344
+#define RLC_UCODE_CNTL                                    0xC348
+#define RLC_STAT                                          0xC34C
+#       define RLC_BUSY_STATUS                            (1 << 0)
+#       define GFX_POWER_STATUS                           (1 << 1)
+#       define GFX_CLOCK_STATUS                           (1 << 2)
+#       define GFX_LS_STATUS                              (1 << 3)
+
+#define	RLC_PG_CNTL					0xC35C
+#	define GFX_PG_ENABLE				(1 << 0)
+#	define GFX_PG_SRC				(1 << 1)
+
+#define	RLC_CGTT_MGCG_OVERRIDE				0xC400
+#define	RLC_CGCG_CGLS_CTRL				0xC404
+#	define CGCG_EN					(1 << 0)
+#	define CGLS_EN					(1 << 1)
+
+#define	RLC_TTOP_D					0xC414
+#	define RLC_PUD(x)				((x) << 0)
+#	define RLC_PUD_MASK				(0xff << 0)
+#	define RLC_PDD(x)				((x) << 8)
+#	define RLC_PDD_MASK				(0xff << 8)
+#	define RLC_TTPD(x)				((x) << 16)
+#	define RLC_TTPD_MASK				(0xff << 16)
+#	define RLC_MSD(x)				((x) << 24)
+#	define RLC_MSD_MASK				(0xff << 24)
+
+#define RLC_LB_INIT_CU_MASK                               0xC41C
+
+#define	RLC_PG_AO_CU_MASK				0xC42C
+#define	RLC_MAX_PG_CU					0xC430
+#	define MAX_PU_CU(x)				((x) << 0)
+#	define MAX_PU_CU_MASK				(0xff << 0)
+#define	RLC_AUTO_PG_CTRL				0xC434
+#	define AUTO_PG_EN				(1 << 0)
+#	define GRBM_REG_SGIT(x)				((x) << 3)
+#	define GRBM_REG_SGIT_MASK			(0xffff << 3)
+#	define PG_AFTER_GRBM_REG_ST(x)			((x) << 19)
+#	define PG_AFTER_GRBM_REG_ST_MASK		(0x1fff << 19)
+
+#define RLC_SERDES_WR_MASTER_MASK_0                       0xC454
+#define RLC_SERDES_WR_MASTER_MASK_1                       0xC458
+#define RLC_SERDES_WR_CTRL                                0xC45C
+
+#define RLC_SERDES_MASTER_BUSY_0                          0xC464
+#define RLC_SERDES_MASTER_BUSY_1                          0xC468
+
+#define RLC_GCPM_GENERAL_3                                0xC478
+
+#define	DB_RENDER_CONTROL				0x28000
+
+#define DB_DEPTH_INFO                                   0x2803c
+
+#define PA_SC_RASTER_CONFIG                             0x28350
+#       define RASTER_CONFIG_RB_MAP_0                   0
+#       define RASTER_CONFIG_RB_MAP_1                   1
+#       define RASTER_CONFIG_RB_MAP_2                   2
+#       define RASTER_CONFIG_RB_MAP_3                   3
+
+#define VGT_EVENT_INITIATOR                             0x28a90
+#       define SAMPLE_STREAMOUTSTATS1                   (1 << 0)
+#       define SAMPLE_STREAMOUTSTATS2                   (2 << 0)
+#       define SAMPLE_STREAMOUTSTATS3                   (3 << 0)
+#       define CACHE_FLUSH_TS                           (4 << 0)
+#       define CACHE_FLUSH                              (6 << 0)
+#       define CS_PARTIAL_FLUSH                         (7 << 0)
+#       define VGT_STREAMOUT_RESET                      (10 << 0)
+#       define END_OF_PIPE_INCR_DE                      (11 << 0)
+#       define END_OF_PIPE_IB_END                       (12 << 0)
+#       define RST_PIX_CNT                              (13 << 0)
+#       define VS_PARTIAL_FLUSH                         (15 << 0)
+#       define PS_PARTIAL_FLUSH                         (16 << 0)
+#       define CACHE_FLUSH_AND_INV_TS_EVENT             (20 << 0)
+#       define ZPASS_DONE                               (21 << 0)
+#       define CACHE_FLUSH_AND_INV_EVENT                (22 << 0)
+#       define PERFCOUNTER_START                        (23 << 0)
+#       define PERFCOUNTER_STOP                         (24 << 0)
+#       define PIPELINESTAT_START                       (25 << 0)
+#       define PIPELINESTAT_STOP                        (26 << 0)
+#       define PERFCOUNTER_SAMPLE                       (27 << 0)
+#       define SAMPLE_PIPELINESTAT                      (30 << 0)
+#       define SAMPLE_STREAMOUTSTATS                    (32 << 0)
+#       define RESET_VTX_CNT                            (33 << 0)
+#       define VGT_FLUSH                                (36 << 0)
+#       define BOTTOM_OF_PIPE_TS                        (40 << 0)
+#       define DB_CACHE_FLUSH_AND_INV                   (42 << 0)
+#       define FLUSH_AND_INV_DB_DATA_TS                 (43 << 0)
+#       define FLUSH_AND_INV_DB_META                    (44 << 0)
+#       define FLUSH_AND_INV_CB_DATA_TS                 (45 << 0)
+#       define FLUSH_AND_INV_CB_META                    (46 << 0)
+#       define CS_DONE                                  (47 << 0)
+#       define PS_DONE                                  (48 << 0)
+#       define FLUSH_AND_INV_CB_PIXEL_DATA              (49 << 0)
+#       define THREAD_TRACE_START                       (51 << 0)
+#       define THREAD_TRACE_STOP                        (52 << 0)
+#       define THREAD_TRACE_FLUSH                       (54 << 0)
+#       define THREAD_TRACE_FINISH                      (55 << 0)
+
+/* PIF PHY0 registers idx/data 0x8/0xc */
+#define PB0_PIF_CNTL                                      0x10
+#       define LS2_EXIT_TIME(x)                           ((x) << 17)
+#       define LS2_EXIT_TIME_MASK                         (0x7 << 17)
+#       define LS2_EXIT_TIME_SHIFT                        17
+#define PB0_PIF_PAIRING                                   0x11
+#       define MULTI_PIF                                  (1 << 25)
+#define PB0_PIF_PWRDOWN_0                                 0x12
+#       define PLL_POWER_STATE_IN_TXS2_0(x)               ((x) << 7)
+#       define PLL_POWER_STATE_IN_TXS2_0_MASK             (0x7 << 7)
+#       define PLL_POWER_STATE_IN_TXS2_0_SHIFT            7
+#       define PLL_POWER_STATE_IN_OFF_0(x)                ((x) << 10)
+#       define PLL_POWER_STATE_IN_OFF_0_MASK              (0x7 << 10)
+#       define PLL_POWER_STATE_IN_OFF_0_SHIFT             10
+#       define PLL_RAMP_UP_TIME_0(x)                      ((x) << 24)
+#       define PLL_RAMP_UP_TIME_0_MASK                    (0x7 << 24)
+#       define PLL_RAMP_UP_TIME_0_SHIFT                   24
+#define PB0_PIF_PWRDOWN_1                                 0x13
+#       define PLL_POWER_STATE_IN_TXS2_1(x)               ((x) << 7)
+#       define PLL_POWER_STATE_IN_TXS2_1_MASK             (0x7 << 7)
+#       define PLL_POWER_STATE_IN_TXS2_1_SHIFT            7
+#       define PLL_POWER_STATE_IN_OFF_1(x)                ((x) << 10)
+#       define PLL_POWER_STATE_IN_OFF_1_MASK              (0x7 << 10)
+#       define PLL_POWER_STATE_IN_OFF_1_SHIFT             10
+#       define PLL_RAMP_UP_TIME_1(x)                      ((x) << 24)
+#       define PLL_RAMP_UP_TIME_1_MASK                    (0x7 << 24)
+#       define PLL_RAMP_UP_TIME_1_SHIFT                   24
+
+#define PB0_PIF_PWRDOWN_2                                 0x17
+#       define PLL_POWER_STATE_IN_TXS2_2(x)               ((x) << 7)
+#       define PLL_POWER_STATE_IN_TXS2_2_MASK             (0x7 << 7)
+#       define PLL_POWER_STATE_IN_TXS2_2_SHIFT            7
+#       define PLL_POWER_STATE_IN_OFF_2(x)                ((x) << 10)
+#       define PLL_POWER_STATE_IN_OFF_2_MASK              (0x7 << 10)
+#       define PLL_POWER_STATE_IN_OFF_2_SHIFT             10
+#       define PLL_RAMP_UP_TIME_2(x)                      ((x) << 24)
+#       define PLL_RAMP_UP_TIME_2_MASK                    (0x7 << 24)
+#       define PLL_RAMP_UP_TIME_2_SHIFT                   24
+#define PB0_PIF_PWRDOWN_3                                 0x18
+#       define PLL_POWER_STATE_IN_TXS2_3(x)               ((x) << 7)
+#       define PLL_POWER_STATE_IN_TXS2_3_MASK             (0x7 << 7)
+#       define PLL_POWER_STATE_IN_TXS2_3_SHIFT            7
+#       define PLL_POWER_STATE_IN_OFF_3(x)                ((x) << 10)
+#       define PLL_POWER_STATE_IN_OFF_3_MASK              (0x7 << 10)
+#       define PLL_POWER_STATE_IN_OFF_3_SHIFT             10
+#       define PLL_RAMP_UP_TIME_3(x)                      ((x) << 24)
+#       define PLL_RAMP_UP_TIME_3_MASK                    (0x7 << 24)
+#       define PLL_RAMP_UP_TIME_3_SHIFT                   24
+/* PIF PHY1 registers idx/data 0x10/0x14 */
+#define PB1_PIF_CNTL                                      0x10
+#define PB1_PIF_PAIRING                                   0x11
+#define PB1_PIF_PWRDOWN_0                                 0x12
+#define PB1_PIF_PWRDOWN_1                                 0x13
+
+#define PB1_PIF_PWRDOWN_2                                 0x17
+#define PB1_PIF_PWRDOWN_3                                 0x18
+/* PCIE registers idx/data 0x30/0x34 */
+#define PCIE_CNTL2                                        0x1c /* PCIE */
+#       define SLV_MEM_LS_EN                              (1 << 16)
+#       define SLV_MEM_AGGRESSIVE_LS_EN                   (1 << 17)
+#       define MST_MEM_LS_EN                              (1 << 18)
+#       define REPLAY_MEM_LS_EN                           (1 << 19)
+#define PCIE_LC_STATUS1                                   0x28 /* PCIE */
+#       define LC_REVERSE_RCVR                            (1 << 0)
+#       define LC_REVERSE_XMIT                            (1 << 1)
+#       define LC_OPERATING_LINK_WIDTH_MASK               (0x7 << 2)
+#       define LC_OPERATING_LINK_WIDTH_SHIFT              2
+#       define LC_DETECTED_LINK_WIDTH_MASK                (0x7 << 5)
+#       define LC_DETECTED_LINK_WIDTH_SHIFT               5
+
+#define PCIE_P_CNTL                                       0x40 /* PCIE */
+#       define P_IGNORE_EDB_ERR                           (1 << 6)
+
+/* PCIE PORT registers idx/data 0x38/0x3c */
+#define PCIE_LC_CNTL                                      0xa0
+#       define LC_L0S_INACTIVITY(x)                       ((x) << 8)
+#       define LC_L0S_INACTIVITY_MASK                     (0xf << 8)
+#       define LC_L0S_INACTIVITY_SHIFT                    8
+#       define LC_L1_INACTIVITY(x)                        ((x) << 12)
+#       define LC_L1_INACTIVITY_MASK                      (0xf << 12)
+#       define LC_L1_INACTIVITY_SHIFT                     12
+#       define LC_PMI_TO_L1_DIS                           (1 << 16)
+#       define LC_ASPM_TO_L1_DIS                          (1 << 24)
+#define PCIE_LC_LINK_WIDTH_CNTL                           0xa2 /* PCIE_P */
+#       define LC_LINK_WIDTH_SHIFT                        0
+#       define LC_LINK_WIDTH_MASK                         0x7
+#       define LC_LINK_WIDTH_X0                           0
+#       define LC_LINK_WIDTH_X1                           1
+#       define LC_LINK_WIDTH_X2                           2
+#       define LC_LINK_WIDTH_X4                           3
+#       define LC_LINK_WIDTH_X8                           4
+#       define LC_LINK_WIDTH_X16                          6
+#       define LC_LINK_WIDTH_RD_SHIFT                     4
+#       define LC_LINK_WIDTH_RD_MASK                      0x70
+#       define LC_RECONFIG_ARC_MISSING_ESCAPE             (1 << 7)
+#       define LC_RECONFIG_NOW                            (1 << 8)
+#       define LC_RENEGOTIATION_SUPPORT                   (1 << 9)
+#       define LC_RENEGOTIATE_EN                          (1 << 10)
+#       define LC_SHORT_RECONFIG_EN                       (1 << 11)
+#       define LC_UPCONFIGURE_SUPPORT                     (1 << 12)
+#       define LC_UPCONFIGURE_DIS                         (1 << 13)
+#       define LC_DYN_LANES_PWR_STATE(x)                  ((x) << 21)
+#       define LC_DYN_LANES_PWR_STATE_MASK                (0x3 << 21)
+#       define LC_DYN_LANES_PWR_STATE_SHIFT               21
+#define PCIE_LC_N_FTS_CNTL                                0xa3 /* PCIE_P */
+#       define LC_XMIT_N_FTS(x)                           ((x) << 0)
+#       define LC_XMIT_N_FTS_MASK                         (0xff << 0)
+#       define LC_XMIT_N_FTS_SHIFT                        0
+#       define LC_XMIT_N_FTS_OVERRIDE_EN                  (1 << 8)
+#       define LC_N_FTS_MASK                              (0xff << 24)
+#define PCIE_LC_SPEED_CNTL                                0xa4 /* PCIE_P */
+#       define LC_GEN2_EN_STRAP                           (1 << 0)
+#       define LC_GEN3_EN_STRAP                           (1 << 1)
+#       define LC_TARGET_LINK_SPEED_OVERRIDE_EN           (1 << 2)
+#       define LC_TARGET_LINK_SPEED_OVERRIDE_MASK         (0x3 << 3)
+#       define LC_TARGET_LINK_SPEED_OVERRIDE_SHIFT        3
+#       define LC_FORCE_EN_SW_SPEED_CHANGE                (1 << 5)
+#       define LC_FORCE_DIS_SW_SPEED_CHANGE               (1 << 6)
+#       define LC_FORCE_EN_HW_SPEED_CHANGE                (1 << 7)
+#       define LC_FORCE_DIS_HW_SPEED_CHANGE               (1 << 8)
+#       define LC_INITIATE_LINK_SPEED_CHANGE              (1 << 9)
+#       define LC_SPEED_CHANGE_ATTEMPTS_ALLOWED_MASK      (0x3 << 10)
+#       define LC_SPEED_CHANGE_ATTEMPTS_ALLOWED_SHIFT     10
+#       define LC_CURRENT_DATA_RATE_MASK                  (0x3 << 13) /* 0/1/2 = gen1/2/3 */
+#       define LC_CURRENT_DATA_RATE_SHIFT                 13
+#       define LC_CLR_FAILED_SPD_CHANGE_CNT               (1 << 16)
+#       define LC_OTHER_SIDE_EVER_SENT_GEN2               (1 << 18)
+#       define LC_OTHER_SIDE_SUPPORTS_GEN2                (1 << 19)
+#       define LC_OTHER_SIDE_EVER_SENT_GEN3               (1 << 20)
+#       define LC_OTHER_SIDE_SUPPORTS_GEN3                (1 << 21)
+
+#define PCIE_LC_CNTL2                                     0xb1
+#       define LC_ALLOW_PDWN_IN_L1                        (1 << 17)
+#       define LC_ALLOW_PDWN_IN_L23                       (1 << 18)
+
+#define PCIE_LC_CNTL3                                     0xb5 /* PCIE_P */
+#       define LC_GO_TO_RECOVERY                          (1 << 30)
+#define PCIE_LC_CNTL4                                     0xb6 /* PCIE_P */
+#       define LC_REDO_EQ                                 (1 << 5)
+#       define LC_SET_QUIESCE                             (1 << 13)
+
+/*
+ * UVD
+ */
+#define UVD_UDEC_ADDR_CONFIG				0xEF4C
+#define UVD_UDEC_DB_ADDR_CONFIG				0xEF50
+#define UVD_UDEC_DBW_ADDR_CONFIG			0xEF54
+#define UVD_RBC_RB_RPTR					0xF690
+#define UVD_RBC_RB_WPTR					0xF694
+#define UVD_STATUS					0xf6bc
+
+#define	UVD_CGC_CTRL					0xF4B0
+#	define DCM					(1 << 0)
+#	define CG_DT(x)					((x) << 2)
+#	define CG_DT_MASK				(0xf << 2)
+#	define CLK_OD(x)				((x) << 6)
+#	define CLK_OD_MASK				(0x1f << 6)
+
+ /* UVD CTX indirect */
+#define	UVD_CGC_MEM_CTRL				0xC0
+#define	UVD_CGC_CTRL2					0xC1
+#	define DYN_OR_EN				(1 << 0)
+#	define DYN_RR_EN				(1 << 1)
+#	define G_DIV_ID(x)				((x) << 2)
+#	define G_DIV_ID_MASK				(0x7 << 2)
+
+/*
+ * PM4
+ */
+#define PACKET0(reg, n)	((RADEON_PACKET_TYPE0 << 30) |			\
+			 (((reg) >> 2) & 0xFFFF) |			\
+			 ((n) & 0x3FFF) << 16)
+#define CP_PACKET2			0x80000000
+#define		PACKET2_PAD_SHIFT		0
+#define		PACKET2_PAD_MASK		(0x3fffffff << 0)
+
+#define PACKET2(v)	(CP_PACKET2 | REG_SET(PACKET2_PAD, (v)))
+
+#define PACKET3(op, n)	((RADEON_PACKET_TYPE3 << 30) |			\
+			 (((op) & 0xFF) << 8) |				\
+			 ((n) & 0x3FFF) << 16)
+
+#define PACKET3_COMPUTE(op, n) (PACKET3(op, n) | 1 << 1)
+
+/* Packet 3 types */
+#define	PACKET3_NOP					0x10
+#define	PACKET3_SET_BASE				0x11
+#define		PACKET3_BASE_INDEX(x)                  ((x) << 0)
+#define			GDS_PARTITION_BASE		2
+#define			CE_PARTITION_BASE		3
+#define	PACKET3_CLEAR_STATE				0x12
+#define	PACKET3_INDEX_BUFFER_SIZE			0x13
+#define	PACKET3_DISPATCH_DIRECT				0x15
+#define	PACKET3_DISPATCH_INDIRECT			0x16
+#define	PACKET3_ALLOC_GDS				0x1B
+#define	PACKET3_WRITE_GDS_RAM				0x1C
+#define	PACKET3_ATOMIC_GDS				0x1D
+#define	PACKET3_ATOMIC					0x1E
+#define	PACKET3_OCCLUSION_QUERY				0x1F
+#define	PACKET3_SET_PREDICATION				0x20
+#define	PACKET3_REG_RMW					0x21
+#define	PACKET3_COND_EXEC				0x22
+#define	PACKET3_PRED_EXEC				0x23
+#define	PACKET3_DRAW_INDIRECT				0x24
+#define	PACKET3_DRAW_INDEX_INDIRECT			0x25
+#define	PACKET3_INDEX_BASE				0x26
+#define	PACKET3_DRAW_INDEX_2				0x27
+#define	PACKET3_CONTEXT_CONTROL				0x28
+#define	PACKET3_INDEX_TYPE				0x2A
+#define	PACKET3_DRAW_INDIRECT_MULTI			0x2C
+#define	PACKET3_DRAW_INDEX_AUTO				0x2D
+#define	PACKET3_DRAW_INDEX_IMMD				0x2E
+#define	PACKET3_NUM_INSTANCES				0x2F
+#define	PACKET3_DRAW_INDEX_MULTI_AUTO			0x30
+#define	PACKET3_INDIRECT_BUFFER_CONST			0x31
+#define	PACKET3_INDIRECT_BUFFER				0x32
+#define	PACKET3_STRMOUT_BUFFER_UPDATE			0x34
+#define	PACKET3_DRAW_INDEX_OFFSET_2			0x35
+#define	PACKET3_DRAW_INDEX_MULTI_ELEMENT		0x36
+#define	PACKET3_WRITE_DATA				0x37
+#define		WRITE_DATA_DST_SEL(x)                   ((x) << 8)
+                /* 0 - register
+		 * 1 - memory (sync - via GRBM)
+		 * 2 - tc/l2
+		 * 3 - gds
+		 * 4 - reserved
+		 * 5 - memory (async - direct)
+		 */
+#define		WR_ONE_ADDR                             (1 << 16)
+#define		WR_CONFIRM                              (1 << 20)
+#define		WRITE_DATA_ENGINE_SEL(x)                ((x) << 30)
+                /* 0 - me
+		 * 1 - pfp
+		 * 2 - ce
+		 */
+#define	PACKET3_DRAW_INDEX_INDIRECT_MULTI		0x38
+#define	PACKET3_MEM_SEMAPHORE				0x39
+#define	PACKET3_MPEG_INDEX				0x3A
+#define	PACKET3_COPY_DW					0x3B
+#define	PACKET3_WAIT_REG_MEM				0x3C
+#define		WAIT_REG_MEM_FUNCTION(x)                ((x) << 0)
+                /* 0 - always
+		 * 1 - <
+		 * 2 - <=
+		 * 3 - ==
+		 * 4 - !=
+		 * 5 - >=
+		 * 6 - >
+		 */
+#define		WAIT_REG_MEM_MEM_SPACE(x)               ((x) << 4)
+                /* 0 - reg
+		 * 1 - mem
+		 */
+#define		WAIT_REG_MEM_ENGINE(x)                  ((x) << 8)
+                /* 0 - me
+		 * 1 - pfp
+		 */
+#define	PACKET3_MEM_WRITE				0x3D
+#define	PACKET3_COPY_DATA				0x40
+#define	PACKET3_CP_DMA					0x41
+/* 1. header
+ * 2. SRC_ADDR_LO or DATA [31:0]
+ * 3. CP_SYNC [31] | SRC_SEL [30:29] | ENGINE [27] | DST_SEL [21:20] |
+ *    SRC_ADDR_HI [7:0]
+ * 4. DST_ADDR_LO [31:0]
+ * 5. DST_ADDR_HI [7:0]
+ * 6. COMMAND [30:21] | BYTE_COUNT [20:0]
+ */
+#              define PACKET3_CP_DMA_DST_SEL(x)    ((x) << 20)
+                /* 0 - DST_ADDR
+		 * 1 - GDS
+		 */
+#              define PACKET3_CP_DMA_ENGINE(x)     ((x) << 27)
+                /* 0 - ME
+		 * 1 - PFP
+		 */
+#              define PACKET3_CP_DMA_SRC_SEL(x)    ((x) << 29)
+                /* 0 - SRC_ADDR
+		 * 1 - GDS
+		 * 2 - DATA
+		 */
+#              define PACKET3_CP_DMA_CP_SYNC       (1 << 31)
+/* COMMAND */
+#              define PACKET3_CP_DMA_DIS_WC        (1 << 21)
+#              define PACKET3_CP_DMA_CMD_SRC_SWAP(x) ((x) << 22)
+                /* 0 - none
+		 * 1 - 8 in 16
+		 * 2 - 8 in 32
+		 * 3 - 8 in 64
+		 */
+#              define PACKET3_CP_DMA_CMD_DST_SWAP(x) ((x) << 24)
+                /* 0 - none
+		 * 1 - 8 in 16
+		 * 2 - 8 in 32
+		 * 3 - 8 in 64
+		 */
+#              define PACKET3_CP_DMA_CMD_SAS       (1 << 26)
+                /* 0 - memory
+		 * 1 - register
+		 */
+#              define PACKET3_CP_DMA_CMD_DAS       (1 << 27)
+                /* 0 - memory
+		 * 1 - register
+		 */
+#              define PACKET3_CP_DMA_CMD_SAIC      (1 << 28)
+#              define PACKET3_CP_DMA_CMD_DAIC      (1 << 29)
+#              define PACKET3_CP_DMA_CMD_RAW_WAIT  (1 << 30)
+#define	PACKET3_PFP_SYNC_ME				0x42
+#define	PACKET3_SURFACE_SYNC				0x43
+#              define PACKET3_DEST_BASE_0_ENA      (1 << 0)
+#              define PACKET3_DEST_BASE_1_ENA      (1 << 1)
+#              define PACKET3_CB0_DEST_BASE_ENA    (1 << 6)
+#              define PACKET3_CB1_DEST_BASE_ENA    (1 << 7)
+#              define PACKET3_CB2_DEST_BASE_ENA    (1 << 8)
+#              define PACKET3_CB3_DEST_BASE_ENA    (1 << 9)
+#              define PACKET3_CB4_DEST_BASE_ENA    (1 << 10)
+#              define PACKET3_CB5_DEST_BASE_ENA    (1 << 11)
+#              define PACKET3_CB6_DEST_BASE_ENA    (1 << 12)
+#              define PACKET3_CB7_DEST_BASE_ENA    (1 << 13)
+#              define PACKET3_DB_DEST_BASE_ENA     (1 << 14)
+#              define PACKET3_DEST_BASE_2_ENA      (1 << 19)
+#              define PACKET3_DEST_BASE_3_ENA      (1 << 21)
+#              define PACKET3_TCL1_ACTION_ENA      (1 << 22)
+#              define PACKET3_TC_ACTION_ENA        (1 << 23)
+#              define PACKET3_CB_ACTION_ENA        (1 << 25)
+#              define PACKET3_DB_ACTION_ENA        (1 << 26)
+#              define PACKET3_SH_KCACHE_ACTION_ENA (1 << 27)
+#              define PACKET3_SH_ICACHE_ACTION_ENA (1 << 29)
+#define	PACKET3_ME_INITIALIZE				0x44
+#define		PACKET3_ME_INITIALIZE_DEVICE_ID(x) ((x) << 16)
+#define	PACKET3_COND_WRITE				0x45
+#define	PACKET3_EVENT_WRITE				0x46
+#define		EVENT_TYPE(x)                           ((x) << 0)
+#define		EVENT_INDEX(x)                          ((x) << 8)
+                /* 0 - any non-TS event
+		 * 1 - ZPASS_DONE
+		 * 2 - SAMPLE_PIPELINESTAT
+		 * 3 - SAMPLE_STREAMOUTSTAT*
+		 * 4 - *S_PARTIAL_FLUSH
+		 * 5 - EOP events
+		 * 6 - EOS events
+		 * 7 - CACHE_FLUSH, CACHE_FLUSH_AND_INV_EVENT
+		 */
+#define		INV_L2                                  (1 << 20)
+                /* INV TC L2 cache when EVENT_INDEX = 7 */
+#define	PACKET3_EVENT_WRITE_EOP				0x47
+#define		DATA_SEL(x)                             ((x) << 29)
+                /* 0 - discard
+		 * 1 - send low 32bit data
+		 * 2 - send 64bit data
+		 * 3 - send 64bit counter value
+		 */
+#define		INT_SEL(x)                              ((x) << 24)
+                /* 0 - none
+		 * 1 - interrupt only (DATA_SEL = 0)
+		 * 2 - interrupt when data write is confirmed
+		 */
+#define	PACKET3_EVENT_WRITE_EOS				0x48
+#define	PACKET3_PREAMBLE_CNTL				0x4A
+#              define PACKET3_PREAMBLE_BEGIN_CLEAR_STATE     (2 << 28)
+#              define PACKET3_PREAMBLE_END_CLEAR_STATE       (3 << 28)
+#define	PACKET3_ONE_REG_WRITE				0x57
+#define	PACKET3_LOAD_CONFIG_REG				0x5F
+#define	PACKET3_LOAD_CONTEXT_REG			0x60
+#define	PACKET3_LOAD_SH_REG				0x61
+#define	PACKET3_SET_CONFIG_REG				0x68
+#define		PACKET3_SET_CONFIG_REG_START			0x00008000
+#define		PACKET3_SET_CONFIG_REG_END			0x0000b000
+#define	PACKET3_SET_CONTEXT_REG				0x69
+#define		PACKET3_SET_CONTEXT_REG_START			0x00028000
+#define		PACKET3_SET_CONTEXT_REG_END			0x00029000
+#define	PACKET3_SET_CONTEXT_REG_INDIRECT		0x73
+#define	PACKET3_SET_RESOURCE_INDIRECT			0x74
+#define	PACKET3_SET_SH_REG				0x76
+#define		PACKET3_SET_SH_REG_START			0x0000b000
+#define		PACKET3_SET_SH_REG_END				0x0000c000
+#define	PACKET3_SET_SH_REG_OFFSET			0x77
+#define	PACKET3_ME_WRITE				0x7A
+#define	PACKET3_SCRATCH_RAM_WRITE			0x7D
+#define	PACKET3_SCRATCH_RAM_READ			0x7E
+#define	PACKET3_CE_WRITE				0x7F
+#define	PACKET3_LOAD_CONST_RAM				0x80
+#define	PACKET3_WRITE_CONST_RAM				0x81
+#define	PACKET3_WRITE_CONST_RAM_OFFSET			0x82
+#define	PACKET3_DUMP_CONST_RAM				0x83
+#define	PACKET3_INCREMENT_CE_COUNTER			0x84
+#define	PACKET3_INCREMENT_DE_COUNTER			0x85
+#define	PACKET3_WAIT_ON_CE_COUNTER			0x86
+#define	PACKET3_WAIT_ON_DE_COUNTER			0x87
+#define	PACKET3_WAIT_ON_DE_COUNTER_DIFF			0x88
+#define	PACKET3_SET_CE_DE_COUNTERS			0x89
+#define	PACKET3_WAIT_ON_AVAIL_BUFFER			0x8A
+#define	PACKET3_SWITCH_BUFFER				0x8B
+
+/* ASYNC DMA - first instance at 0xd000, second at 0xd800 */
+#define DMA0_REGISTER_OFFSET                              0x0 /* not a register */
+#define DMA1_REGISTER_OFFSET                              0x800 /* not a register */
+
+#define DMA_RB_CNTL                                       0xd000
+#       define DMA_RB_ENABLE                              (1 << 0)
+#       define DMA_RB_SIZE(x)                             ((x) << 1) /* log2 */
+#       define DMA_RB_SWAP_ENABLE                         (1 << 9) /* 8IN32 */
+#       define DMA_RPTR_WRITEBACK_ENABLE                  (1 << 12)
+#       define DMA_RPTR_WRITEBACK_SWAP_ENABLE             (1 << 13)  /* 8IN32 */
+#       define DMA_RPTR_WRITEBACK_TIMER(x)                ((x) << 16) /* log2 */
+#define DMA_RB_BASE                                       0xd004
+#define DMA_RB_RPTR                                       0xd008
+#define DMA_RB_WPTR                                       0xd00c
+
+#define DMA_RB_RPTR_ADDR_HI                               0xd01c
+#define DMA_RB_RPTR_ADDR_LO                               0xd020
+
+#define DMA_IB_CNTL                                       0xd024
+#       define DMA_IB_ENABLE                              (1 << 0)
+#       define DMA_IB_SWAP_ENABLE                         (1 << 4)
+#define DMA_IB_RPTR                                       0xd028
+#define DMA_CNTL                                          0xd02c
+#       define TRAP_ENABLE                                (1 << 0)
+#       define SEM_INCOMPLETE_INT_ENABLE                  (1 << 1)
+#       define SEM_WAIT_INT_ENABLE                        (1 << 2)
+#       define DATA_SWAP_ENABLE                           (1 << 3)
+#       define FENCE_SWAP_ENABLE                          (1 << 4)
+#       define CTXEMPTY_INT_ENABLE                        (1 << 28)
+#define DMA_STATUS_REG                                    0xd034
+#       define DMA_IDLE                                   (1 << 0)
+#define DMA_TILING_CONFIG  				  0xd0b8
+
+#define	DMA_POWER_CNTL					0xd0bc
+#       define MEM_POWER_OVERRIDE                       (1 << 8)
+#define	DMA_CLK_CTRL					0xd0c0
+
+#define	DMA_PG						0xd0d4
+#	define PG_CNTL_ENABLE				(1 << 0)
+#define	DMA_PGFSM_CONFIG				0xd0d8
+#define	DMA_PGFSM_WRITE					0xd0dc
+
+#define DMA_PACKET(cmd, b, t, s, n)	((((cmd) & 0xF) << 28) |	\
+					 (((b) & 0x1) << 26) |		\
+					 (((t) & 0x1) << 23) |		\
+					 (((s) & 0x1) << 22) |		\
+					 (((n) & 0xFFFFF) << 0))
+
+#define DMA_IB_PACKET(cmd, vmid, n)	((((cmd) & 0xF) << 28) |	\
+					 (((vmid) & 0xF) << 20) |	\
+					 (((n) & 0xFFFFF) << 0))
+
+#define DMA_PTE_PDE_PACKET(n)		((2 << 28) |			\
+					 (1 << 26) |			\
+					 (1 << 21) |			\
+					 (((n) & 0xFFFFF) << 0))
+
+/* async DMA Packet types */
+#define	DMA_PACKET_WRITE				  0x2
+#define	DMA_PACKET_COPY					  0x3
+#define	DMA_PACKET_INDIRECT_BUFFER			  0x4
+#define	DMA_PACKET_SEMAPHORE				  0x5
+#define	DMA_PACKET_FENCE				  0x6
+#define	DMA_PACKET_TRAP					  0x7
+#define	DMA_PACKET_SRBM_WRITE				  0x9
+#define	DMA_PACKET_CONSTANT_FILL			  0xd
+#define	DMA_PACKET_POLL_REG_MEM				  0xe
+#define	DMA_PACKET_NOP					  0xf
+
+#define VCE_STATUS					0x20004
+#define VCE_VCPU_CNTL					0x20014
+#define		VCE_CLK_EN				(1 << 0)
+#define VCE_VCPU_CACHE_OFFSET0				0x20024
+#define VCE_VCPU_CACHE_SIZE0				0x20028
+#define VCE_VCPU_CACHE_OFFSET1				0x2002c
+#define VCE_VCPU_CACHE_SIZE1				0x20030
+#define VCE_VCPU_CACHE_OFFSET2				0x20034
+#define VCE_VCPU_CACHE_SIZE2				0x20038
+#define VCE_VCPU_SCRATCH7				0x200dc
+#define VCE_SOFT_RESET					0x20120
+#define 	VCE_ECPU_SOFT_RESET			(1 << 0)
+#define 	VCE_FME_SOFT_RESET			(1 << 2)
+#define VCE_RB_BASE_LO2					0x2016c
+#define VCE_RB_BASE_HI2					0x20170
+#define VCE_RB_SIZE2					0x20174
+#define VCE_RB_RPTR2					0x20178
+#define VCE_RB_WPTR2					0x2017c
+#define VCE_RB_BASE_LO					0x20180
+#define VCE_RB_BASE_HI					0x20184
+#define VCE_RB_SIZE					0x20188
+#define VCE_RB_RPTR					0x2018c
+#define VCE_RB_WPTR					0x20190
+#define VCE_CLOCK_GATING_A				0x202f8
+#	define CGC_DYN_CLOCK_MODE			(1 << 16)
+#define VCE_CLOCK_GATING_B				0x202fc
+#define VCE_UENC_CLOCK_GATING				0x205bc
+#define VCE_UENC_REG_CLOCK_GATING			0x205c0
+#define VCE_FW_REG_STATUS				0x20e10
+#	define VCE_FW_REG_STATUS_BUSY			(1 << 0)
+#	define VCE_FW_REG_STATUS_PASS			(1 << 3)
+#	define VCE_FW_REG_STATUS_DONE			(1 << 11)
+#define VCE_LMI_FW_START_KEYSEL				0x20e18
+#define VCE_LMI_FW_PERIODIC_CTRL			0x20e20
+#define VCE_LMI_CTRL2					0x20e74
+#define VCE_LMI_CTRL					0x20e98
+#define VCE_LMI_VM_CTRL					0x20ea0
+#define VCE_LMI_SWAP_CNTL				0x20eb4
+#define VCE_LMI_SWAP_CNTL1				0x20eb8
+#define VCE_LMI_CACHE_CTRL				0x20ef4
+
+#define VCE_CMD_NO_OP					0x00000000
+#define VCE_CMD_END					0x00000001
+#define VCE_CMD_IB					0x00000002
+#define VCE_CMD_FENCE					0x00000003
+#define VCE_CMD_TRAP					0x00000004
+#define VCE_CMD_IB_AUTO					0x00000005
+#define VCE_CMD_SEMAPHORE				0x00000006
+
+/* discrete vce clocks */
+#define	CG_VCEPLL_FUNC_CNTL				0xc0030600
+#	define VCEPLL_RESET_MASK			0x00000001
+#	define VCEPLL_SLEEP_MASK			0x00000002
+#	define VCEPLL_BYPASS_EN_MASK			0x00000004
+#	define VCEPLL_CTLREQ_MASK			0x00000008
+#	define VCEPLL_VCO_MODE_MASK			0x00000600
+#	define VCEPLL_REF_DIV_MASK			0x003F0000
+#	define VCEPLL_CTLACK_MASK			0x40000000
+#	define VCEPLL_CTLACK2_MASK			0x80000000
+#define	CG_VCEPLL_FUNC_CNTL_2				0xc0030601
+#	define VCEPLL_PDIV_A(x)				((x) << 0)
+#	define VCEPLL_PDIV_A_MASK			0x0000007F
+#	define VCEPLL_PDIV_B(x)				((x) << 8)
+#	define VCEPLL_PDIV_B_MASK			0x00007F00
+#	define EVCLK_SRC_SEL(x)				((x) << 20)
+#	define EVCLK_SRC_SEL_MASK			0x01F00000
+#	define ECCLK_SRC_SEL(x)				((x) << 25)
+#	define ECCLK_SRC_SEL_MASK			0x3E000000
+#define	CG_VCEPLL_FUNC_CNTL_3				0xc0030602
+#	define VCEPLL_FB_DIV(x)				((x) << 0)
+#	define VCEPLL_FB_DIV_MASK			0x01FFFFFF
+#define	CG_VCEPLL_FUNC_CNTL_4				0xc0030603
+#define	CG_VCEPLL_FUNC_CNTL_5				0xc0030604
+#define	CG_VCEPLL_SPREAD_SPECTRUM			0xc0030606
+#	define VCEPLL_SSEN_MASK				0x00000001
+
+#endif
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              /*
+ * Copyright (C) 2013 NVIDIA Corporation
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
- * more details.
- *
- *****************************************************************************/
+ */
 
-#include "../../mp_precomp.h"
+#include <linux/clk.h>
+#include <linux/debugfs.h>
+#include <linux/gpio.h>
+#include <linux/io.h>
+#include <linux/of_device.h>
+#include <linux/platform_device.h>
+#include <linux/regulator/consumer.h>
+#include <linux/reset.h>
 
-#if RT_PLATFORM==PLATFORM_MACOSX
-#include "phydm_precomp.h"
+#include <soc/tegra/pmc.h>
+
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_dp_helper.h>
+#include <drm/drm_panel.h>
+
+#include "dc.h"
+#include "drm.h"
+#include "sor.h"
+
+#define SOR_REKEY 0x38
+
+struct tegra_sor_hdmi_settings {
+	unsigned long frequency;
+
+	u8 vcocap;
+	u8 ichpmp;
+	u8 loadadj;
+	u8 termadj;
+	u8 tx_pu;
+	u8 bg_vref;
+
+	u8 drive_current[4];
+	u8 preemphasis[4];
+};
+
+#if 1
+static const struct tegra_sor_hdmi_settings tegra210_sor_hdmi_defaults[] = {
+	{
+		.frequency = 54000000,
+		.vcocap = 0x0,
+		.ichpmp = 0x1,
+		.loadadj = 0x3,
+		.termadj = 0x9,
+		.tx_pu = 0x10,
+		.bg_vref = 0x8,
+		.drive_current = { 0x33, 0x3a, 0x3a, 0x3a },
+		.preemphasis = { 0x00, 0x00, 0x00, 0x00 },
+	}, {
+		.frequency = 75000000,
+		.vcocap = 0x3,
+		.ichpmp = 0x1,
+		.loadadj = 0x3,
+		.termadj = 0x9,
+		.tx_pu = 0x40,
+		.bg_vref = 0x8,
+		.drive_current = { 0x33, 0x3a, 0x3a, 0x3a },
+		.preemphasis = { 0x00, 0x00, 0x00, 0x00 },
+	}, {
+		.frequency = 150000000,
+		.vcocap = 0x3,
+		.ichpmp = 0x1,
+		.loadadj = 0x3,
+		.termadj = 0x9,
+		.tx_pu = 0x66,
+		.bg_vref = 0x8,
+		.drive_current = { 0x33, 0x3a, 0x3a, 0x3a },
+		.preemphasis = { 0x00, 0x00, 0x00, 0x00 },
+	}, {
+		.frequency = 300000000,
+		.vcocap = 0x3,
+		.ichpmp = 0x1,
+		.loadadj = 0x3,
+		.termadj = 0x9,
+		.tx_pu = 0x66,
+		.bg_vref = 0xa,
+		.drive_current = { 0x33, 0x3f, 0x3f, 0x3f },
+		.preemphasis = { 0x00, 0x17, 0x17, 0x17 },
+	}, {
+		.frequency = 600000000,
+		.vcocap = 0x3,
+		.ichpmp = 0x1,
+		.loadadj = 0x3,
+		.termadj = 0x9,
+		.tx_pu = 0x66,
+		.bg_vref = 0x8,
+		.drive_current = { 0x33, 0x3f, 0x3f, 0x3f },
+		.preemphasis = { 0x00, 0x00, 0x00, 0x00 },
+	},
+};
 #else
-#include "../phydm_precomp.h"
-#endif
-
-#if (RTL8812A_SUPPORT == 1)
-
-/*---------------------------Define Local Constant---------------------------*/
-/* 2010/04/25 MH Define the max tx power tracking tx agc power. */
-#define		ODM_TXPWRTRACK_MAX_IDX8812A		6
-
-/*---------------------------Define Local Constant---------------------------*/
-
-/* 3============================================================
- * 3 Tx Power Tracking
- * 3============================================================ */
-
-void halrf_rf_lna_setting_8812a(
-	struct dm_struct	*dm,
-	enum halrf_lna_set type
-)
-{
-	/*phydm_disable_lna*/
-	if (type == HALRF_LNA_DISABLE) {
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0xef, 0x80000, 0x1);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x30, 0xfffff, 0x18000);	/*select Rx mode*/
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x31, 0xfffff, 0x3f7ff);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x32, 0xfffff, 0xc22bf);	/*disable LNA*/
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0xef, 0x80000, 0x0);
-		if (dm->rf_type > RF_1T1R) {
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0xef, 0x80000, 0x1);
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0x30, 0xfffff, 0x18000);	/*select Rx mode*/
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0x31, 0xfffff, 0x3f7ff);
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0x32, 0xfffff, 0xc22bf);	/*disable LNA*/
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0xef, 0x80000, 0x0);
-		}
-	} else if (type == HALRF_LNA_ENABLE) {
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0xef, 0x80000, 0x1);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x30, 0xfffff, 0x18000);	/*select Rx mode*/
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x31, 0xfffff, 0x3f7ff);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x32, 0xfffff, 0xc26bf);	/*disable LNA*/
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0xef, 0x80000, 0x0);
-		if (dm->rf_type > RF_1T1R) {
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0xef, 0x80000, 0x1);
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0x30, 0xfffff, 0x18000);	/*select Rx mode*/
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0x31, 0xfffff, 0x3f7ff);
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0x32, 0xfffff, 0xc26bf);	/*disable LNA*/
-			odm_set_rf_reg(dm, RF_PATH_B, RF_0xef, 0x80000, 0x0);
-		}
-	}
-}
-
-
-void do_iqk_8812a(
-	void		*dm_void,
-	u8		delta_thermal_index,
-	u8		thermal_value,
-	u8		threshold
-)
-{
-	struct dm_struct	*dm = (struct dm_struct *)dm_void;
-	odm_reset_iqk_result(dm);
-	dm->rf_calibrate_info.thermal_value_iqk = thermal_value;
-	halrf_iqk_trigger(dm, false);
-}
-
-/*-----------------------------------------------------------------------------
- * Function:	odm_TxPwrTrackSetPwr88E()
- *
- * Overview:	88E change all channel tx power accordign to flag.
- *				OFDM & CCK are all different.
- *
- * Input:		NONE
- *
- * Output:		NONE
- *
- * Return:		NONE
- *
- * Revised History:
- *	When		Who		Remark
- *	04/23/2012	MHC		Create version 0.
- *
- *---------------------------------------------------------------------------*/
-void
-odm_tx_pwr_track_set_pwr8812a(
-	void		*dm_void,
-	enum pwrtrack_method	method,
-	u8				rf_path,
-	u8				channel_mapped_index
-)
-{
-	u32	final_bb_swing_idx[2];
-	struct dm_struct	*dm = (struct dm_struct *)dm_void;
-	struct _ADAPTER *adapter = dm->adapter;
-	u8			pwr_tracking_limit = 26; /* +1.0dB */
-	u8			tx_rate = 0xFF;
-	u8			final_ofdm_swing_index = 0;
-	u8			final_cck_swing_index = 0;
-	struct dm_rf_calibration_struct	*cali_info = &(dm->rf_calibrate_info);
-
-	if (*(dm->mp_mode) == true) {
-#if (DM_ODM_SUPPORT_TYPE & (ODM_WIN | ODM_CE))
-#if (DM_ODM_SUPPORT_TYPE & ODM_WIN)
-#if (MP_DRIVER == 1)
-		PMPT_CONTEXT p_mpt_ctx = &(adapter->MptCtx);
-
-		tx_rate = MptToMgntRate(p_mpt_ctx->MptRateIndex);
-#endif
-#elif (DM_ODM_SUPPORT_TYPE & ODM_CE)
-#ifdef CONFIG_MP_INCLUDED
-		PMPT_CONTEXT p_mpt_ctx = &(adapter->mppriv.mpt_ctx);
-
-		tx_rate = mpt_to_mgnt_rate(p_mpt_ctx->mpt_rate_index);
-#endif
-#endif
-#endif
-	} else {
-		u16	rate	 = *(dm->forced_data_rate);
-
-		if (!rate) { /*auto rate*/
-#if (DM_ODM_SUPPORT_TYPE & ODM_WIN)
-			tx_rate = ((PADAPTER)adapter)->HalFunc.GetHwRateFromMRateHandler(dm->tx_rate);
-#elif (DM_ODM_SUPPORT_TYPE & ODM_CE)
-			tx_rate = hw_rate_to_m_rate(dm->tx_rate);
-#endif
-		} else   /*force rate*/
-			tx_rate = (u8)rate;
-	}
-
-	RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "Power Tracking tx_rate=0x%X\n", tx_rate);
-	RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "===>odm_tx_pwr_track_set_pwr8812a\n");
-
-	if (tx_rate != 0xFF) { /* 20130429 Mimic Modify High rate BBSwing Limit. */
-		/* 2 CCK */
-		if (((tx_rate >= MGN_1M) && (tx_rate <= MGN_5_5M)) || (tx_rate == MGN_11M))
-			pwr_tracking_limit = 32; /*+4dB*/
-		/*2 OFDM*/
-		else if ((tx_rate >= MGN_6M) && (tx_rate <= MGN_48M))
-			pwr_tracking_limit = 30; /* +3dB */
-		else if (tx_rate == MGN_54M)
-			pwr_tracking_limit = 28; /* +2dB */
-
-		/* 2 HT */
-		else if ((tx_rate >= MGN_MCS0) && (tx_rate <= MGN_MCS2)) /* QPSK/BPSK */
-			pwr_tracking_limit = 34; /* +5dB */
-		else if ((tx_rate >= MGN_MCS3) && (tx_rate <= MGN_MCS4)) /* 16QAM */
-			pwr_tracking_limit = 30; /* +3dB */
-		else if ((tx_rate >= MGN_MCS5) && (tx_rate <= MGN_MCS7)) /* 64QAM */
-			pwr_tracking_limit = 28; /* +2dB */
-
-		else if ((tx_rate >= MGN_MCS8) && (tx_rate <= MGN_MCS10)) /* QPSK/BPSK */
-			pwr_tracking_limit = 34; /* +5dB */
-		else if ((tx_rate >= MGN_MCS11) && (tx_rate <= MGN_MCS12)) /* 16QAM */
-			pwr_tracking_limit = 30; /* +3dB */
-		else if ((tx_rate >= MGN_MCS13) && (tx_rate <= MGN_MCS15)) /* 64QAM */
-			pwr_tracking_limit = 28; /* +2dB */
-
-		/* 2 VHT */
-		else if ((tx_rate >= MGN_VHT1SS_MCS0) && (tx_rate <= MGN_VHT1SS_MCS2)) /* QPSK/BPSK */
-			pwr_tracking_limit = 34; /* +5dB */
-		else if ((tx_rate >= MGN_VHT1SS_MCS3) && (tx_rate <= MGN_VHT1SS_MCS4)) /* 16QAM */
-			pwr_tracking_limit = 30; /* +3dB */
-		else if ((tx_rate >= MGN_VHT1SS_MCS5) && (tx_rate <= MGN_VHT1SS_MCS6)) /* 64QAM */
-			pwr_tracking_limit = 28; /* +2dB */
-		else if (tx_rate == MGN_VHT1SS_MCS7) /* 64QAM */
-			pwr_tracking_limit = 26; /* +1dB */
-		else if (tx_rate == MGN_VHT1SS_MCS8) /* 256QAM */
-			pwr_tracking_limit = 24; /* +0dB */
-		else if (tx_rate == MGN_VHT1SS_MCS9) /* 256QAM */
-			pwr_tracking_limit = 22; /* -1dB */
-
-		else if ((tx_rate >= MGN_VHT2SS_MCS0) && (tx_rate <= MGN_VHT2SS_MCS2)) /* QPSK/BPSK */
-			pwr_tracking_limit = 34; /* +5dB */
-		else if ((tx_rate >= MGN_VHT2SS_MCS3) && (tx_rate <= MGN_VHT2SS_MCS4)) /* 16QAM */
-			pwr_tracking_limit = 30; /* +3dB */
-		else if ((tx_rate >= MGN_VHT2SS_MCS5) && (tx_rate <= MGN_VHT2SS_MCS6)) /* 64QAM */
-			pwr_tracking_limit = 28; /* +2dB */
-		else if (tx_rate == MGN_VHT2SS_MCS7) /* 64QAM */
-			pwr_tracking_limit = 26; /* +1dB */
-		else if (tx_rate == MGN_VHT2SS_MCS8) /* 256QAM */
-			pwr_tracking_limit = 24; /* +0dB */
-		else if (tx_rate == MGN_VHT2SS_MCS9) /* 256QAM */
-			pwr_tracking_limit = 22; /* -1dB */
-
-		else
-			pwr_tracking_limit = 24;
-	}
-	RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "tx_rate=0x%x, pwr_tracking_limit=%d\n", tx_rate, pwr_tracking_limit);
-
-
-	if (method == BBSWING) {
-		RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "===>odm_tx_pwr_track_set_pwr8812a\n");
-
-		if (rf_path == RF_PATH_A) {
-			final_bb_swing_idx[RF_PATH_A] = (cali_info->OFDM_index[RF_PATH_A] > pwr_tracking_limit) ? pwr_tracking_limit : cali_info->OFDM_index[RF_PATH_A];
-			RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "cali_info->OFDM_index[RF_PATH_A]=%d, dm->RealBbSwingIdx[RF_PATH_A]=%d\n",
-				cali_info->OFDM_index[RF_PATH_A], final_bb_swing_idx[RF_PATH_A]);
-
-			odm_set_bb_reg(dm, REG_A_TX_SCALE_JAGUAR, 0xFFE00000, tx_scaling_table_jaguar[final_bb_swing_idx[RF_PATH_A]]);
-		} else {
-			final_bb_swing_idx[RF_PATH_B] = (cali_info->OFDM_index[RF_PATH_B] > pwr_tracking_limit) ? pwr_tracking_limit : cali_info->OFDM_index[RF_PATH_B];
-			RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "cali_info->OFDM_index[RF_PATH_B]=%d, dm->RealBbSwingIdx[RF_PATH_B]=%d\n",
-				cali_info->OFDM_index[RF_PATH_B], final_bb_swing_idx[RF_PATH_B]);
-
-			odm_set_bb_reg(dm, REG_B_TX_SCALE_JAGUAR, 0xFFE00000, tx_scaling_table_jaguar[final_bb_swing_idx[RF_PATH_B]]);
-		}
-	}
-
-	else if (method == MIX_MODE) {
-		RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "cali_info->default_ofdm_index=%d, cali_info->absolute_ofdm_swing_idx[rf_path]=%d, rf_path = %d\n",
-			cali_info->default_ofdm_index, cali_info->absolute_ofdm_swing_idx[rf_path], rf_path);
-
-		final_cck_swing_index = cali_info->default_cck_index + cali_info->absolute_ofdm_swing_idx[rf_path];
-		final_ofdm_swing_index = cali_info->default_ofdm_index + cali_info->absolute_ofdm_swing_idx[rf_path];
-
-		if (rf_path == RF_PATH_A) {
-
-			if (final_ofdm_swing_index > pwr_tracking_limit) {  /* BBSwing higher then Limit */
-				cali_info->remnant_cck_swing_idx = final_cck_swing_index - pwr_tracking_limit;           /* CCK Follow the same compensate value as path A */
-				cali_info->remnant_ofdm_swing_idx[rf_path] = final_ofdm_swing_index - pwr_tracking_limit;
-
-				odm_set_bb_reg(dm, REG_A_TX_SCALE_JAGUAR, 0xFFE00000, tx_scaling_table_jaguar[pwr_tracking_limit]);
-
-				cali_info->modify_tx_agc_flag_path_a = true;
-
-				PHY_SetTxPowerLevelByPath(adapter, *dm->channel, RF_PATH_A);
-
-				RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "******Path_A Over BBSwing Limit, pwr_tracking_limit = %d, Remnant tx_agc value = %d\n", pwr_tracking_limit, cali_info->remnant_ofdm_swing_idx[rf_path]);
-			} else if (final_ofdm_swing_index < 0) {
-				cali_info->remnant_cck_swing_idx = final_cck_swing_index;           /* CCK Follow the same compensate value as path A */
-				cali_info->remnant_ofdm_swing_idx[rf_path] = final_ofdm_swing_index;
-
-				odm_set_bb_reg(dm, REG_A_TX_SCALE_JAGUAR, 0xFFE00000, tx_scaling_table_jaguar[0]);
-
-				cali_info->modify_tx_agc_flag_path_a = true;
-
-				PHY_SetTxPowerLevelByPath(adapter, *dm->channel, RF_PATH_A);
-
-				RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "******Path_A Lower then BBSwing lower bound  0, Remnant tx_agc value = %d\n", cali_info->remnant_ofdm_swing_idx[rf_path]);
-			} else {
-				odm_set_bb_reg(dm, REG_A_TX_SCALE_JAGUAR, 0xFFE00000, tx_scaling_table_jaguar[final_ofdm_swing_index]);
-
-				RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "******Path_A Compensate with BBSwing, final_ofdm_swing_index = %d\n", final_ofdm_swing_index);
-
-				if (cali_info->modify_tx_agc_flag_path_a) { /* If tx_agc has changed, reset tx_agc again */
-					cali_info->remnant_cck_swing_idx = 0;
-					cali_info->remnant_ofdm_swing_idx[rf_path] = 0;
-
-					PHY_SetTxPowerLevelByPath(adapter, *dm->channel, RF_PATH_A);
-
-					cali_info->modify_tx_agc_flag_path_a = false;
-
-					RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "******Path_A dm->Modify_TxAGC_Flag = false\n");
-				}
-			}
-		}
-
-		if (rf_path == RF_PATH_B) {
-			if (final_ofdm_swing_index > pwr_tracking_limit) {  /* BBSwing higher then Limit */
-				cali_info->remnant_ofdm_swing_idx[rf_path] = final_ofdm_swing_index - pwr_tracking_limit;
-
-				odm_set_bb_reg(dm, REG_B_TX_SCALE_JAGUAR, 0xFFE00000, tx_scaling_table_jaguar[pwr_tracking_limit]);
-
-				cali_info->modify_tx_agc_flag_path_b = true;
-
-				PHY_SetTxPowerLevelByPath(adapter, *dm->channel, RF_PATH_B);
-
-				RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "******Path_B Over BBSwing Limit, pwr_tracking_limit = %d, Remnant tx_agc value = %d\n", pwr_tracking_limit, cali_info->remnant_ofdm_swing_idx[rf_path]);
-			} else if (final_ofdm_swing_index < 0) {
-				cali_info->remnant_ofdm_swing_idx[rf_path] = final_ofdm_swing_index;
-
-				odm_set_bb_reg(dm, REG_B_TX_SCALE_JAGUAR, 0xFFE00000, tx_scaling_table_jaguar[0]);
-
-				cali_info->modify_tx_agc_flag_path_b = true;
-
-				PHY_SetTxPowerLevelByPath(adapter, *dm->channel, RF_PATH_B);
-
-				RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "******Path_B Lower then BBSwing lower bound  0, Remnant tx_agc value = %d\n", cali_info->remnant_ofdm_swing_idx[rf_path]);
-			} else {
-				odm_set_bb_reg(dm, REG_B_TX_SCALE_JAGUAR, 0xFFE00000, tx_scaling_table_jaguar[final_ofdm_swing_index]);
-
-				RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "******Path_B Compensate with BBSwing, final_ofdm_swing_index = %d\n", final_ofdm_swing_index);
-
-				if (cali_info->modify_tx_agc_flag_path_b) { /* If tx_agc has changed, reset tx_agc again */
-					cali_info->remnant_ofdm_swing_idx[rf_path] = 0;
-
-					PHY_SetTxPowerLevelByPath(adapter, *dm->channel, RF_PATH_B);
-
-					cali_info->modify_tx_agc_flag_path_b = false;
-
-					RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "******Path_B dm->Modify_TxAGC_Flag = false\n");
-				}
-			}
-		}
-
-	} else
-		return;
-}
-
-void
-get_delta_swing_table_8812a(
-	void		*dm_void,
-	u8 **temperature_up_a,
-	u8 **temperature_down_a,
-	u8 **temperature_up_b,
-	u8 **temperature_down_b
-)
-{
-	struct dm_struct	*dm = (struct dm_struct *)dm_void;
-	struct _ADAPTER *adapter = dm->adapter;
-	struct dm_rf_calibration_struct	*cali_info = &(dm->rf_calibrate_info);
-	u8		tx_rate			= 0xFF;
-	u8	channel		 = *dm->channel;
-
-
-	if (*(dm->mp_mode) == true) {
-#if (DM_ODM_SUPPORT_TYPE & (ODM_WIN | ODM_CE))
-#if (DM_ODM_SUPPORT_TYPE & ODM_WIN)
-#if (MP_DRIVER == 1)
-		PMPT_CONTEXT p_mpt_ctx = &(adapter->MptCtx);
-
-		tx_rate = MptToMgntRate(p_mpt_ctx->MptRateIndex);
-#endif
-#elif (DM_ODM_SUPPORT_TYPE & ODM_CE)
-#ifdef CONFIG_MP_INCLUDED
-		PMPT_CONTEXT p_mpt_ctx = &(adapter->mppriv.mpt_ctx);
-
-		tx_rate = mpt_to_mgnt_rate(p_mpt_ctx->mpt_rate_index);
-#endif
-#endif
-#endif
-	} else {
-		u16	rate	 = *(dm->forced_data_rate);
-
-		if (!rate) { /*auto rate*/
-#if (DM_ODM_SUPPORT_TYPE & ODM_WIN)
-			tx_rate = ((PADAPTER)adapter)->HalFunc.GetHwRateFromMRateHandler(dm->tx_rate);
-#elif (DM_ODM_SUPPORT_TYPE & ODM_CE)
-			tx_rate = hw_rate_to_m_rate(dm->tx_rate);
-#endif
-		} else   /*force rate*/
-			tx_rate = (u8)rate;
-	}
-
-	RF_DBG(dm, DBG_RF_TX_PWR_TRACK, "Power Tracking tx_rate=0x%X\n", tx_rate);
-
-	if (1 <= channel && channel <= 14) {
-		if (IS_CCK_RATE(tx_rate)) {
-			*temperature_up_a   = cali_info->delta_swing_table_idx_2g_cck_a_p;
-			*temperature_down_a = cali_info->delta_swing_table_idx_2g_cck_a_n;
-			*temperature_up_b   = cali_info->delta_swing_table_idx_2g_cck_b_p;
-			*temperature_down_b = cali_info->delta_swing_table_idx_2g_cck_b_n;
-		} else {
-			*temperature_up_a   = cali_info->delta_swing_table_idx_2ga_p;
-			*temperature_down_a = cali_info->delta_swing_table_idx_2ga_n;
-			*temperature_up_b   = cali_info->delta_swing_table_idx_2gb_p;
-			*temperature_down_b = cali_info->delta_swing_table_idx_2gb_n;
-		}
-	} else if (36 <= channel && channel <= 64) {
-		*temperature_up_a   = cali_info->delta_swing_table_idx_5ga_p[0];
-		*temperature_down_a = cali_info->delta_swing_table_idx_5ga_n[0];
-		*temperature_up_b   = cali_info->delta_swing_table_idx_5gb_p[0];
-		*temperature_down_b = cali_info->delta_swing_table_idx_5gb_n[0];
-	} else if (100 <= channel && channel <= 144) {
-		*temperature_up_a   = cali_info->delta_swing_table_idx_5ga_p[1];
-		*temperature_down_a = cali_info->delta_swing_table_idx_5ga_n[1];
-		*temperature_up_b   = cali_info->delta_swing_table_idx_5gb_p[1];
-		*temperature_down_b = cali_info->delta_swing_table_idx_5gb_n[1];
-	} else if (149 <= channel && channel <= 177) {
-		*temperature_up_a   = cali_info->delta_swing_table_idx_5ga_p[2];
-		*temperature_down_a = cali_info->delta_swing_table_idx_5ga_n[2];
-		*temperature_up_b   = cali_info->delta_swing_table_idx_5gb_p[2];
-		*temperature_down_b = cali_info->delta_swing_table_idx_5gb_n[2];
-	} else {
-		*temperature_up_a   = (u8 *)delta_swing_table_idx_2ga_p_8188e;
-		*temperature_down_a = (u8 *)delta_swing_table_idx_2ga_n_8188e;
-		*temperature_up_b   = (u8 *)delta_swing_table_idx_2ga_p_8188e;
-		*temperature_down_b = (u8 *)delta_swing_table_idx_2ga_n_8188e;
-	}
-
-
-	return;
-}
-
-void configure_txpower_track_8812a(
-	struct txpwrtrack_cfg	*config
-)
-{
-	config->swing_table_size_cck = TXSCALE_TABLE_SIZE;
-	config->swing_table_size_ofdm = TXSCALE_TABLE_SIZE;
-	config->threshold_iqk = IQK_THRESHOLD;
-	config->threshold_dpk = DPK_THRESHOLD;
-	config->average_thermal_num = AVG_THERMAL_NUM_8812A;
-	config->rf_path_count = MAX_PATH_NUM_8812A;
-	config->thermal_reg_addr = RF_T_METER_8812A;
-
-	config->odm_tx_pwr_track_set_pwr = odm_tx_pwr_track_set_pwr8812a;
-	config->do_iqk = do_iqk_8812a;
-	config->phy_lc_calibrate = halrf_lck_trigger;
-	config->get_delta_swing_table = get_delta_swing_table_8812a;
-}
-
-
-#define BW_20M	0
-#define	BW_40M  1
-#define	BW_80M	2
-
-void _iqk_rx_fill_iqc_8812a(
-	struct dm_struct			*dm,
-	enum rf_path	path,
-	unsigned int			RX_X,
-	unsigned int			RX_Y
-)
-{
-	switch (path) {
-	case RF_PATH_A:
+static const struct tegra_sor_hdmi_settings tegra210_sor_hdmi_defaults[] = {
 	{
-		odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-		if (RX_X >> 1 >= 0x112 || (RX_Y >> 1 >= 0x12 && RX_Y >> 1 <= 0x3ee)) {
-			odm_set_bb_reg(dm, R_0xc10, 0x000003ff, 0x100);
-			odm_set_bb_reg(dm, R_0xc10, 0x03ff0000, 0);
-			RF_DBG(dm, DBG_RF_IQK, "RX_X = %x;;RX_Y = %x ====>fill to IQC\n", RX_X >> 1 & 0x000003ff, RX_Y >> 1 & 0x000003ff);
-		} else {
-			odm_set_bb_reg(dm, R_0xc10, 0x000003ff, RX_X >> 1);
-			odm_set_bb_reg(dm, R_0xc10, 0x03ff0000, RX_Y >> 1);
-			RF_DBG(dm, DBG_RF_IQK, "RX_X = %x;;RX_Y = %x ====>fill to IQC\n", RX_X >> 1 & 0x000003ff, RX_Y >> 1 & 0x000003ff);
-			RF_DBG(dm, DBG_RF_IQK, "0xc10 = %x ====>fill to IQC\n", odm_read_4byte(dm, 0xc10));
-		}
-	}
-	break;
-	case RF_PATH_B:
-	{
-		odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-		if (RX_X >> 1 >= 0x112 || (RX_Y >> 1 >= 0x12 && RX_Y >> 1 <= 0x3ee)) {
-			odm_set_bb_reg(dm, R_0xe10, 0x000003ff, 0x100);
-			odm_set_bb_reg(dm, R_0xe10, 0x03ff0000, 0);
-			RF_DBG(dm, DBG_RF_IQK, "RX_X = %x;;RX_Y = %x ====>fill to IQC\n", RX_X >> 1 & 0x000003ff, RX_Y >> 1 & 0x000003ff);
-		} else {
-			odm_set_bb_reg(dm, R_0xe10, 0x000003ff, RX_X >> 1);
-			odm_set_bb_reg(dm, R_0xe10, 0x03ff0000, RX_Y >> 1);
-			RF_DBG(dm, DBG_RF_IQK, "RX_X = %x;;RX_Y = %x====>fill to IQC\n ", RX_X >> 1 & 0x000003ff, RX_Y >> 1 & 0x000003ff);
-			RF_DBG(dm, DBG_RF_IQK, "0xe10 = %x====>fill to IQC\n", odm_read_4byte(dm, 0xe10));
-		}
-	}
-	break;
-	default:
-		break;
-	};
+		.frequency = 75000000,
+		.vcocap = 0x3,
+		.ichpmp = 0x1,
+		.loadadj = 0x3,
+		.termadj = 0x9,
+		.tx_pu = 0x40,
+		.bg_vref = 0x8,
+		.drive_current = { 0x29, 0x29, 0x29, 0x29 },
+		.preemphasis = { 0x00, 0x00, 0x00, 0x00 },
+	}, {
+		.frequency = 150000000,
+		.vcocap = 0x3,
+		.ichpmp = 0x1,
+		.loadadj = 0x3,
+		.termadj = 0x9,
+		.tx_pu = 0x66,
+		.bg_vref = 0x8,
+		.drive_current = { 0x30, 0x37, 0x37, 0x37 },
+		.preemphasis = { 0x01, 0x02, 0x02, 0x02 },
+	}, {
+		.frequency = 300000000,
+		.vcocap = 0x3,
+		.ichpmp = 0x6,
+		.loadadj = 0x3,
+		.termadj = 0x9,
+		.tx_pu = 0x66,
+		.bg_vref = 0xf,
+		.drive_current = { 0x30, 0x37, 0x37, 0x37 },
+		.preemphasis = { 0x10, 0x3e, 0x3e, 0x3e },
+	}, {
+		.frequency = 600000000,
+		.vcocap = 0x3,
+		.ichpmp = 0xa,
+		.loadadj = 0x3,
+		.termadj = 0xb,
+		.tx_pu = 0x66,
+		.bg_vref = 0xe,
+		.drive_current = { 0x35, 0x3e, 0x3e, 0x3e },
+		.preemphasis = { 0x02, 0x3f, 0x3f, 0x3f },
+	},
+};
+#endif
+
+struct tegra_sor_soc {
+	bool supports_edp;
+	bool supports_lvds;
+	bool supports_hdmi;
+	bool supports_dp;
+
+	const struct tegra_sor_hdmi_settings *settings;
+	unsigned int num_settings;
+};
+
+struct tegra_sor;
+
+struct tegra_sor_ops {
+	const char *name;
+	int (*probe)(struct tegra_sor *sor);
+	int (*remove)(struct tegra_sor *sor);
+};
+
+struct tegra_sor {
+	struct host1x_client client;
+	struct tegra_output output;
+	struct device *dev;
+
+	const struct tegra_sor_soc *soc;
+	void __iomem *regs;
+
+	struct reset_control *rst;
+	struct clk *clk_parent;
+	struct clk *clk_safe;
+	struct clk *clk_dp;
+	struct clk *clk;
+
+	struct tegra_dpaux *dpaux;
+
+	struct drm_info_list *debugfs_files;
+	struct drm_minor *minor;
+	struct dentry *debugfs;
+
+	const struct tegra_sor_ops *ops;
+
+	/* for HDMI 2.0 */
+	struct tegra_sor_hdmi_settings *settings;
+	unsigned int num_settings;
+
+	struct regulator *avdd_io_supply;
+	struct regulator *vdd_pll_supply;
+	struct regulator *hdmi_supply;
+};
+
+struct tegra_sor_config {
+	u32 bits_per_pixel;
+
+	u32 active_polarity;
+	u32 active_count;
+	u32 tu_size;
+	u32 active_frac;
+	u32 watermark;
+
+	u32 hblank_symbols;
+	u32 vblank_symbols;
+};
+
+static inline struct tegra_sor *
+host1x_client_to_sor(struct host1x_client *client)
+{
+	return container_of(client, struct tegra_sor, client);
 }
 
-void _iqk_tx_fill_iqc_8812a(
-	struct dm_struct			*dm,
-	enum rf_path	path,
-	unsigned int			TX_X,
-	unsigned int			TX_Y
-)
+static inline struct tegra_sor *to_sor(struct tegra_output *output)
 {
-	struct _hal_rf_		*rf = &(dm->rf_table);
-	
-	switch (path) {
-	case RF_PATH_A:
-	{
-		odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-		odm_set_bb_reg(dm, R_0xc90, BIT(7), 0x1);
-		odm_set_bb_reg(dm, R_0xcc4, BIT(18), 0x1);
-		if (!rf->dpk_done)
-			odm_set_bb_reg(dm, R_0xcc4, BIT(29), 0x1);
-		odm_set_bb_reg(dm, R_0xcc8, BIT(29), 0x1);
-		odm_set_bb_reg(dm, R_0xccc, 0x000007ff, TX_Y);
-		odm_set_bb_reg(dm, R_0xcd4, 0x000007ff, TX_X);
-		RF_DBG(dm, DBG_RF_IQK, "TX_X = %x;;TX_Y = %x =====> fill to IQC\n", TX_X & 0x000007ff, TX_Y & 0x000007ff);
-		RF_DBG(dm, DBG_RF_IQK, "0xcd4 = %x;;0xccc = %x ====>fill to IQC\n", odm_get_bb_reg(dm, R_0xcd4, 0x000007ff), odm_get_bb_reg(dm, R_0xccc, 0x000007ff));
-	}
-	break;
-	case RF_PATH_B:
-	{
-		odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-		odm_set_bb_reg(dm, R_0xe90, BIT(7), 0x1);
-		odm_set_bb_reg(dm, R_0xec4, BIT(18), 0x1);
-		if (!rf->dpk_done)
-			odm_set_bb_reg(dm, R_0xec4, BIT(29), 0x1);
-		odm_set_bb_reg(dm, R_0xec8, BIT(29), 0x1);
-		odm_set_bb_reg(dm, R_0xecc, 0x000007ff, TX_Y);
-		odm_set_bb_reg(dm, R_0xed4, 0x000007ff, TX_X);
-		RF_DBG(dm, DBG_RF_IQK, "TX_X = %x;;TX_Y = %x =====> fill to IQC\n", TX_X & 0x000007ff, TX_Y & 0x000007ff);
-		RF_DBG(dm, DBG_RF_IQK, "0xed4 = %x;;0xecc = %x ====>fill to IQC\n", odm_get_bb_reg(dm, R_0xed4, 0x000007ff), odm_get_bb_reg(dm, R_0xecc, 0x000007ff));
-	}
-	break;
-	default:
-		break;
-	};
+	return container_of(output, struct tegra_sor, output);
 }
 
-void _iqk_backup_mac_bb_8812a(
-	struct dm_struct	*dm,
-	u32		*MACBB_backup,
-	u32		*backup_macbb_reg,
-	u32		MACBB_NUM
-)
+static inline u32 tegra_sor_readl(struct tegra_sor *sor, unsigned long offset)
 {
-	u32 i;
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	/* save MACBB default value */
-	for (i = 0; i < MACBB_NUM; i++)
-		MACBB_backup[i] = odm_read_4byte(dm, backup_macbb_reg[i]);
-
-	RF_DBG(dm, DBG_RF_IQK, "BackupMacBB Success!!!!\n");
-}
-void _iqk_backup_rf_8812a(
-	struct dm_struct	*dm,
-	u32		*RFA_backup,
-	u32		*RFB_backup,
-	u32		*backup_rf_reg,
-	u32		RF_NUM
-)
-{
-
-	u32 i;
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	/* Save RF Parameters */
-	for (i = 0; i < RF_NUM; i++) {
-		RFA_backup[i] = odm_get_rf_reg(dm, RF_PATH_A, backup_rf_reg[i], MASKDWORD);
-		RFB_backup[i] = odm_get_rf_reg(dm, RF_PATH_B, backup_rf_reg[i], MASKDWORD);
-	}
-	RF_DBG(dm, DBG_RF_IQK, "BackupRF Success!!!!\n");
-}
-void _iqk_backup_afe_8812a(
-	struct dm_struct		*dm,
-	u32		*AFE_backup,
-	u32		*backup_afe_reg,
-	u32		AFE_NUM
-)
-{
-	u32 i;
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	/* Save AFE Parameters */
-	for (i = 0; i < AFE_NUM; i++)
-		AFE_backup[i] = odm_read_4byte(dm, backup_afe_reg[i]);
-	RF_DBG(dm, DBG_RF_IQK, "BackupAFE Success!!!!\n");
-}
-void _iqk_restore_mac_bb_8812a(
-	struct dm_struct		*dm,
-	u32		*MACBB_backup,
-	u32		*backup_macbb_reg,
-	u32		MACBB_NUM
-)
-{
-	u32 i;
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	/* Reload MacBB Parameters */
-	for (i = 0; i < MACBB_NUM; i++)
-		odm_write_4byte(dm, backup_macbb_reg[i], MACBB_backup[i]);
-	RF_DBG(dm, DBG_RF_IQK, "RestoreMacBB Success!!!!\n");
-}
-void _iqk_restore_rf_8812a(
-	struct dm_struct			*dm,
-	enum rf_path	path,
-	u32			*backup_rf_reg,
-	u32			*RF_backup,
-	u32			RF_REG_NUM
-)
-{
-	u32 i;
-
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	for (i = 0; i < RF_REG_NUM; i++)
-		odm_set_rf_reg(dm, (enum rf_path)path, backup_rf_reg[i], RFREGOFFSETMASK, RF_backup[i]);
-
-	odm_set_rf_reg(dm, (enum rf_path)path, RF_0xef, RFREGOFFSETMASK, 0x0);
-
-	switch (path) {
-	case RF_PATH_A:
-	{
-		RF_DBG(dm, DBG_RF_IQK, "RestoreRF path A Success!!!!\n");
-	}
-	break;
-	case RF_PATH_B:
-	{
-		RF_DBG(dm, DBG_RF_IQK, "RestoreRF path B Success!!!!\n");
-	}
-	break;
-	default:
-		break;
-	}
-}
-void _iqk_restore_afe_8812a(
-	struct dm_struct		*dm,
-	u32		*AFE_backup,
-	u32		*backup_afe_reg,
-	u32		AFE_NUM
-)
-{
-	struct _hal_rf_		*rf = &(dm->rf_table);
-	u32 i;
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	/* Reload AFE Parameters */
-	for (i = 0; i < AFE_NUM; i++)
-		odm_write_4byte(dm, backup_afe_reg[i], AFE_backup[i]);
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-	odm_write_4byte(dm, 0xc80, 0x0);
-	odm_write_4byte(dm, 0xc84, 0x0);
-	odm_write_4byte(dm, 0xc88, 0x0);
-	odm_write_4byte(dm, 0xc8c, 0x3c000000);
-	odm_set_bb_reg(dm, R_0xc90, BIT(7), 0x1);
-	odm_set_bb_reg(dm, R_0xcc4, BIT(18), 0x1);
-	if (!rf->dpk_done)
-		odm_set_bb_reg(dm, R_0xcc4, BIT(29), 0x1);
-	odm_set_bb_reg(dm, R_0xcc8, BIT(29), 0x1);
-	/* odm_write_4byte(dm, 0xcb8, 0x0); */
-	odm_write_4byte(dm, 0xe80, 0x0);
-	odm_write_4byte(dm, 0xe84, 0x0);
-	odm_write_4byte(dm, 0xe88, 0x0);
-	odm_write_4byte(dm, 0xe8c, 0x3c000000);
-	odm_set_bb_reg(dm, R_0xe90, BIT(7), 0x1);
-	odm_set_bb_reg(dm, R_0xec4, BIT(18), 0x1);
-	if (!rf->dpk_done)
-		odm_set_bb_reg(dm, R_0xec4, BIT(29), 0x1);
-	odm_set_bb_reg(dm, R_0xec8, BIT(29), 0x1);
-	/* odm_write_4byte(dm, 0xeb8, 0x0); */
-	RF_DBG(dm, DBG_RF_IQK, "RestoreAFE Success!!!!\n");
+	return readl(sor->regs + (offset << 2));
 }
 
-
-void _iqk_configure_mac_8812a(
-	struct dm_struct		*dm
-)
+static inline void tegra_sor_writel(struct tegra_sor *sor, u32 value,
+				    unsigned long offset)
 {
-	/* ========MAC register setting======== */
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	odm_write_1byte(dm, 0x522, 0x3f);
-	odm_set_bb_reg(dm, R_0x550, BIT(11) | BIT(3), 0x0);
-	odm_write_1byte(dm, 0x808, 0x00);		/*		RX ante off */
-	odm_set_bb_reg(dm, R_0x838, 0xf, 0xc);		/*		CCA off */
-	odm_write_1byte(dm, 0xa07, 0xf);		/*		CCK RX path off */
+	writel(value, sor->regs + (offset << 2));
 }
 
-#define cal_num 10
-
-void _iqk_tx_8812a(
-	struct dm_struct		*dm,
-	u8 chnl_idx
-)
+static int tegra_sor_dp_train_fast(struct tegra_sor *sor,
+				   struct drm_dp_link *link)
 {
-	u8		delay_count;
-	u8		cal0_retry, cal1_retry, tx0_average = 0, tx1_average = 0, rx0_average = 0, rx1_average = 0;
-	int			TX_IQC_temp[10][4], TX_IQC[4];		/* TX_IQC = [TX0_X, TX0_Y,TX1_X,TX1_Y]; for 3 times */
-	int			RX_IQC_temp[10][4], RX_IQC[4];		/* RX_IQC = [RX0_X, RX0_Y,RX1_X,RX1_Y]; for 3 times */
-	boolean	TX0_fail = true, RX0_fail = true, IQK0_ready = false, TX0_finish = false, RX0_finish = false;
-	boolean	TX1_fail = true, RX1_fail = true, IQK1_ready = false, TX1_finish = false, RX1_finish = false;
-	int			i, ii, dx = 0, dy = 0;
+	unsigned int i;
+	u8 pattern;
+	u32 value;
+	int err;
 
-	RF_DBG(dm, DBG_RF_IQK, "band_width = %d, ext_pa_5g = %d, ExtPA2G = %d\n", *dm->band_width, dm->ext_pa_5g, dm->ext_pa);
-	RF_DBG(dm, DBG_RF_IQK, "Interface = %d, RFE_Type = %d\n", dm->support_interface, dm->rfe_type);
+	/* setup lane parameters */
+	value = SOR_LANE_DRIVE_CURRENT_LANE3(0x40) |
+		SOR_LANE_DRIVE_CURRENT_LANE2(0x40) |
+		SOR_LANE_DRIVE_CURRENT_LANE1(0x40) |
+		SOR_LANE_DRIVE_CURRENT_LANE0(0x40);
+	tegra_sor_writel(sor, value, SOR_LANE_DRIVE_CURRENT0);
 
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
+	value = SOR_LANE_PREEMPHASIS_LANE3(0x0f) |
+		SOR_LANE_PREEMPHASIS_LANE2(0x0f) |
+		SOR_LANE_PREEMPHASIS_LANE1(0x0f) |
+		SOR_LANE_PREEMPHASIS_LANE0(0x0f);
+	tegra_sor_writel(sor, value, SOR_LANE_PREEMPHASIS0);
 
-	if (dm->rfe_type == 1) {
-		odm_write_4byte(dm, 0xcb0, 0x77777777);
-		odm_write_4byte(dm, 0xcb4, 0x00000077);
-		odm_write_4byte(dm, 0xeb0, 0x77777777);
-		odm_write_4byte(dm, 0xeb4, 0x00000077);
-	}
-	else{
-		odm_write_4byte(dm, 0xcb0, 0x77777717);
-		odm_write_4byte(dm, 0xcb4, 0x02000077);
-		odm_write_4byte(dm, 0xeb0, 0x77777717);
-		odm_write_4byte(dm, 0xeb4, 0x02000077);
-	}
+	value = SOR_LANE_POSTCURSOR_LANE3(0x00) |
+		SOR_LANE_POSTCURSOR_LANE2(0x00) |
+		SOR_LANE_POSTCURSOR_LANE1(0x00) |
+		SOR_LANE_POSTCURSOR_LANE0(0x00);
+	tegra_sor_writel(sor, value, SOR_LANE_POSTCURSOR0);
 
-	/* ========path-A AFE all on======== */
-	/* Port 0 DAC/ADC on */
-	odm_write_4byte(dm, 0xc60, 0x77777777);
-	odm_write_4byte(dm, 0xc64, 0x77777777);
+	/* disable LVDS mode */
+	tegra_sor_writel(sor, 0, SOR_LVDS);
 
-	/* Port 1 DAC/ADC on */
-	odm_write_4byte(dm, 0xe60, 0x77777777);
-	odm_write_4byte(dm, 0xe64, 0x77777777);
+	value = tegra_sor_readl(sor, SOR_DP_PADCTL0);
+	value |= SOR_DP_PADCTL_TX_PU_ENABLE;
+	value &= ~SOR_DP_PADCTL_TX_PU_MASK;
+	value |= SOR_DP_PADCTL_TX_PU(2); /* XXX: don't hardcode? */
+	tegra_sor_writel(sor, value, SOR_DP_PADCTL0);
 
-	odm_write_4byte(dm, 0xc68, 0x19791979);
-	odm_write_4byte(dm, 0xe68, 0x19791979);
-	odm_set_bb_reg(dm, R_0xc00, 0xf, 0x4);/*	hardware 3-wire off */
-	odm_set_bb_reg(dm, R_0xe00, 0xf, 0x4);/*	hardware 3-wire off */
+	value = tegra_sor_readl(sor, SOR_DP_PADCTL0);
+	value |= SOR_DP_PADCTL_CM_TXD_3 | SOR_DP_PADCTL_CM_TXD_2 |
+		 SOR_DP_PADCTL_CM_TXD_1 | SOR_DP_PADCTL_CM_TXD_0;
+	tegra_sor_writel(sor, value, SOR_DP_PADCTL0);
 
-	/* DAC/ADC sampling rate (160 MHz) */
-	odm_set_bb_reg(dm, R_0xc5c, BIT(26) | BIT(25) | BIT(24), 0x7);
-	odm_set_bb_reg(dm, R_0xe5c, BIT(26) | BIT(25) | BIT(24), 0x7);
+	usleep_range(10, 100);
 
-	/* ====== path A TX IQK RF setting ====== */
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0xef, RFREGOFFSETMASK, 0x80002);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x30, RFREGOFFSETMASK, 0x20000);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x31, RFREGOFFSETMASK, 0x3fffd);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x32, RFREGOFFSETMASK, 0xfe83f);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x65, RFREGOFFSETMASK, 0x931d5);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x8f, RFREGOFFSETMASK, 0x8a001);
-	/* ====== path B TX IQK RF setting ====== */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0xef, RFREGOFFSETMASK, 0x80002);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x30, RFREGOFFSETMASK, 0x20000);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x31, RFREGOFFSETMASK, 0x3fffd);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x32, RFREGOFFSETMASK, 0xfe83f);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x65, RFREGOFFSETMASK, 0x931d5);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x8f, RFREGOFFSETMASK, 0x8a001);
-	odm_write_4byte(dm, 0x90c, 0x00008000);
-	odm_set_bb_reg(dm, R_0xc94, BIT(0), 0x1);
-	odm_set_bb_reg(dm, R_0xe94, BIT(0), 0x1);
-	odm_write_4byte(dm, 0x978, 0x29002000);/* TX (X,Y) */
-	odm_write_4byte(dm, 0x97c, 0xa9002000);/* RX (X,Y) */
-	odm_write_4byte(dm, 0x984, 0x00462910);/* [0]:AGC_en, [15]:idac_K_Mask */
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
+	value = tegra_sor_readl(sor, SOR_DP_PADCTL0);
+	value &= ~(SOR_DP_PADCTL_CM_TXD_3 | SOR_DP_PADCTL_CM_TXD_2 |
+		   SOR_DP_PADCTL_CM_TXD_1 | SOR_DP_PADCTL_CM_TXD_0);
+	tegra_sor_writel(sor, value, SOR_DP_PADCTL0);
 
-	if (dm->ext_pa_5g) {
-		if (dm->rfe_type == 1) {
-			odm_write_4byte(dm, 0xc88, 0x821403e3);
-			odm_write_4byte(dm, 0xe88, 0x821403e3);
-		} else {
-			odm_write_4byte(dm, 0xc88, 0x821403f7);
-			odm_write_4byte(dm, 0xe88, 0x821403f7);
-		}
-	} else {
-		odm_write_4byte(dm, 0xc88, 0x821403f1);
-		odm_write_4byte(dm, 0xe88, 0x821403f1);
-	}
-	if (*dm->band_type == ODM_BAND_5G) {
-		odm_write_4byte(dm, 0xc8c, 0x68163e96);
-		odm_write_4byte(dm, 0xe8c, 0x68163e96);
-	} else {
-		odm_write_4byte(dm, 0xc8c, 0x28163e96);
-		odm_write_4byte(dm, 0xe8c, 0x28163e96);
-		if (dm->rfe_type == 3) {
-			if (dm->ext_pa)
-				odm_write_4byte(dm, 0xc88, 0x821403e3);
-			else
-				odm_write_4byte(dm, 0xc88, 0x821403f7);
-		}
+	err = tegra_dpaux_prepare(sor->dpaux, DP_SET_ANSI_8B10B);
+	if (err < 0)
+		return err;
+
+	for (i = 0, value = 0; i < link->num_lanes; i++) {
+		unsigned long lane = SOR_DP_TPG_CHANNEL_CODING |
+				     SOR_DP_TPG_SCRAMBLER_NONE |
+				     SOR_DP_TPG_PATTERN_TRAIN1;
+		value = (value << 8) | lane;
 	}
 
+	tegra_sor_writel(sor, value, SOR_DP_TPG);
 
-	odm_write_4byte(dm, 0xc80, 0x18008c10);/* TX_Tone_idx[9:0], TxK_Mask[29] TX_Tone = 16 */
-	odm_write_4byte(dm, 0xc84, 0x38008c10);/* RX_Tone_idx[9:0], RxK_Mask[29] */
-	odm_write_4byte(dm, 0xce8, 0x00000000);
-	odm_write_4byte(dm, 0xe80, 0x18008c10);/* TX_Tone_idx[9:0], TxK_Mask[29] TX_Tone = 16 */
-	odm_write_4byte(dm, 0xe84, 0x38008c10);/* RX_Tone_idx[9:0], RxK_Mask[29] */
-	odm_write_4byte(dm, 0xee8, 0x00000000);
+	pattern = DP_TRAINING_PATTERN_1;
 
-	cal0_retry = 0;
-	cal1_retry = 0;
-	while (1) {
-		/* one shot */
-		odm_write_4byte(dm, 0xcb8, 0x00100000);
-		odm_write_4byte(dm, 0xeb8, 0x00100000);
-		odm_write_4byte(dm, 0x980, 0xfa000000);
-		odm_write_4byte(dm, 0x980, 0xf8000000);
+	err = tegra_dpaux_train(sor->dpaux, link, pattern);
+	if (err < 0)
+		return err;
 
-		ODM_delay_ms(10); /* delay 10ms */
-		odm_write_4byte(dm, 0xcb8, 0x00000000);
-		odm_write_4byte(dm, 0xeb8, 0x00000000);
-		delay_count = 0;
-		while (1) {
-			if (!TX0_finish)
-				IQK0_ready = (boolean) odm_get_bb_reg(dm, R_0xd00, BIT(10));
-			if (!TX1_finish)
-				IQK1_ready = (boolean) odm_get_bb_reg(dm, R_0xd40, BIT(10));
-			if ((IQK0_ready && IQK1_ready) || (delay_count > 20))
-				break;
-			else {
-				ODM_delay_ms(1);
-				delay_count++;
-			}
-		}
-		RF_DBG(dm, DBG_RF_IQK, "TX delay_count = %d\n", delay_count);
-		if (delay_count < 20) {							/* If 20ms No Result, then cal_retry++ */
-			/* ============TXIQK Check============== */
-			TX0_fail = (boolean) odm_get_bb_reg(dm, R_0xd00, BIT(12));
-			TX1_fail = (boolean) odm_get_bb_reg(dm, R_0xd40, BIT(12));
-			if (!(TX0_fail || TX0_finish)) {
-				odm_write_4byte(dm, 0xcb8, 0x02000000);
-				TX_IQC_temp[tx0_average][0] = odm_get_bb_reg(dm, R_0xd00, 0x07ff0000) << 21;
-				odm_write_4byte(dm, 0xcb8, 0x04000000);
-				TX_IQC_temp[tx0_average][1] = odm_get_bb_reg(dm, R_0xd00, 0x07ff0000) << 21;
-				RF_DBG(dm, DBG_RF_IQK, "TX_X0[%d] = %x ;; TX_Y0[%d] = %x\n", tx0_average, (TX_IQC_temp[tx0_average][0]) >> 21 & 0x000007ff, tx0_average, (TX_IQC_temp[tx0_average][1]) >> 21 & 0x000007ff);
-				/*
+	value = tegra_sor_readl(sor, SOR_DP_SPARE0);
+	value |= SOR_DP_SPARE_SEQ_ENABLE;
+	value &= ~SOR_DP_SPARE_PANEL_INTERNAL;
+	value |= SOR_DP_SPARE_MACRO_SOR_CLK;
+	tegra_sor_writel(sor, value, SOR_DP_SPARE0);
 
-				odm_write_4byte(dm, 0xcb8, 0x01000000);
-				reg1 = odm_get_bb_reg(dm, R_0xd00, 0xffffffff);
-				odm_write_4byte(dm, 0xcb8, 0x02000000);
-				reg2 = odm_get_bb_reg(dm, R_0xd00, 0x0000001f);
-				image_power = (reg2<<32)+reg1;
-				dbg_print("Before PW = %d\n", image_power);
-				odm_write_4byte(dm, 0xcb8, 0x03000000);
-				reg1 = odm_get_bb_reg(dm, R_0xd00, 0xffffffff);
-				odm_write_4byte(dm, 0xcb8, 0x04000000);
-				reg2 = odm_get_bb_reg(dm, R_0xd00, 0x0000001f);
-				image_power = (reg2<<32)+reg1;
-				dbg_print("After PW = %d\n", image_power);
-				*/
-				tx0_average++;
-			} else {
-				cal0_retry++;
-				if (cal0_retry == 10)
-					break;
-			}
-			if (!(TX1_fail || TX1_finish)) {
-				odm_write_4byte(dm, 0xeb8, 0x02000000);
-				TX_IQC_temp[tx1_average][2] = odm_get_bb_reg(dm, R_0xd40, 0x07ff0000) << 21;
-				odm_write_4byte(dm, 0xeb8, 0x04000000);
-				TX_IQC_temp[tx1_average][3] = odm_get_bb_reg(dm, R_0xd40, 0x07ff0000) << 21;
-				RF_DBG(dm, DBG_RF_IQK, "TX_X1[%d] = %x ;; TX_Y1[%d] = %x\n", tx1_average, (TX_IQC_temp[tx1_average][2]) >> 21 & 0x000007ff, tx1_average, (TX_IQC_temp[tx1_average][3]) >> 21 & 0x000007ff);
-				/*
-				int			reg1 = 0, reg2 = 0, image_power = 0;
-				odm_write_4byte(dm, 0xeb8, 0x01000000);
-				reg1 = odm_get_bb_reg(dm, R_0xd40, 0xffffffff);
-				odm_write_4byte(dm, 0xeb8, 0x02000000);
-				reg2 = odm_get_bb_reg(dm, R_0xd40, 0x0000001f);
-				image_power = (reg2<<32)+reg1;
-				dbg_print("Before PW = %d\n", image_power);
-				odm_write_4byte(dm, 0xeb8, 0x03000000);
-				reg1 = odm_get_bb_reg(dm, R_0xd40, 0xffffffff);
-				odm_write_4byte(dm, 0xeb8, 0x04000000);
-				reg2 = odm_get_bb_reg(dm, R_0xd40, 0x0000001f);
-				image_power = (reg2<<32)+reg1;
-				dbg_print("After PW = %d\n", image_power);
-				*/
-				tx1_average++;
-			} else {
-				cal1_retry++;
-				if (cal1_retry == 10)
-					break;
-			}
-		} else {
-			cal0_retry++;
-			cal1_retry++;
-			RF_DBG(dm, DBG_RF_IQK, "delay 20ms TX IQK Not Ready!!!!!\n");
-			if (cal0_retry == 10)
-				break;
-		}
-		if (tx0_average >= 2) {
-			for (i = 0; i < tx0_average; i++) {
-				for (ii = i + 1; ii < tx0_average; ii++) {
-					dx = (TX_IQC_temp[i][0] >> 21) - (TX_IQC_temp[ii][0] >> 21);
-					if (dx < 4 && dx > -4) {
-						dy = (TX_IQC_temp[i][1] >> 21) - (TX_IQC_temp[ii][1] >> 21);
-						if (dy < 4 && dy > -4) {
-							TX_IQC[0] = ((TX_IQC_temp[i][0] >> 21) + (TX_IQC_temp[ii][0] >> 21)) / 2;
-							TX_IQC[1] = ((TX_IQC_temp[i][1] >> 21) + (TX_IQC_temp[ii][1] >> 21)) / 2;
-							RF_DBG(dm, DBG_RF_IQK, "TXA_X = %x;;TXA_Y = %x\n", TX_IQC[0] & 0x000007ff, TX_IQC[1] & 0x000007ff);
-							TX0_finish = true;
-						}
-					}
-				}
-			}
-		}
-		if (tx1_average >= 2) {
-			for (i = 0; i < tx1_average; i++) {
-				for (ii = i + 1; ii < tx1_average; ii++) {
-					dx = (TX_IQC_temp[i][2] >> 21) - (TX_IQC_temp[ii][2] >> 21);
-					if (dx < 4 && dx > -4) {
-						dy = (TX_IQC_temp[i][3] >> 21) - (TX_IQC_temp[ii][3] >> 21);
-						if (dy < 4 && dy > -4) {
-							TX_IQC[2] = ((TX_IQC_temp[i][2] >> 21) + (TX_IQC_temp[ii][2] >> 21)) / 2;
-							TX_IQC[3] = ((TX_IQC_temp[i][3] >> 21) + (TX_IQC_temp[ii][3] >> 21)) / 2;
-							RF_DBG(dm, DBG_RF_IQK, "TXB_X = %x;;TXB_Y = %x\n", TX_IQC[2] & 0x000007ff, TX_IQC[3] & 0x000007ff);
-							TX1_finish = true;
-						}
-					}
-				}
-			}
-		}
-		RF_DBG(dm, DBG_RF_IQK, "tx0_average = %d, tx1_average = %d\n", tx0_average, tx1_average);
-		RF_DBG(dm, DBG_RF_IQK, "TX0_finish = %d, TX1_finish = %d\n", TX0_finish, TX1_finish);
-		if (TX0_finish && TX1_finish)
-			break;
-		if ((cal0_retry + tx0_average) >= 10 || (cal1_retry + tx1_average) >= 10)
-			break;
-	}
-	RF_DBG(dm, DBG_RF_IQK, "TXA_cal_retry = %d\n", cal0_retry);
-	RF_DBG(dm, DBG_RF_IQK, "TXB_cal_retry = %d\n", cal1_retry);
-
-
-
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x58, 0x7fe00, odm_get_rf_reg(dm, RF_PATH_A, RF_0x8, 0xffc00)); /* Load LOK */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x58, 0x7fe00, odm_get_rf_reg(dm, RF_PATH_B, RF_0x8, 0xffc00)); /* Load LOK */
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	if (TX0_finish) {
-		/* ====== path A RX IQK RF setting====== */
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0xef, RFREGOFFSETMASK, 0x80000);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x30, RFREGOFFSETMASK, 0x30000);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x31, RFREGOFFSETMASK, 0x3f7ff);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x32, RFREGOFFSETMASK, 0xfe7bf);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x8f, RFREGOFFSETMASK, 0x88001);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x65, RFREGOFFSETMASK, 0x931d1);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0xef, RFREGOFFSETMASK, 0x00000);
-	}
-	if (TX1_finish) {
-		/* ====== path B RX IQK RF setting====== */
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0xef, RFREGOFFSETMASK, 0x80000);
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x30, RFREGOFFSETMASK, 0x30000);
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x31, RFREGOFFSETMASK, 0x3f7ff);
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x32, RFREGOFFSETMASK, 0xfe7bf);
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x8f, RFREGOFFSETMASK, 0x88001);
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x65, RFREGOFFSETMASK, 0x931d1);
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0xef, RFREGOFFSETMASK, 0x00000);
-	}
-	odm_set_bb_reg(dm, R_0x978, BIT(31), 0x1);
-	odm_set_bb_reg(dm, R_0x97c, BIT(31), 0x0);
-	odm_write_4byte(dm, 0x90c, 0x00008000);
-	if (dm->support_interface == ODM_ITRF_PCIE)
-		odm_write_4byte(dm, 0x984, 0x0046a911);
-	else
-		odm_write_4byte(dm, 0x984, 0x0046a890);
-	/* odm_write_4byte(dm, 0x984, 0x0046a890); */
-	if (dm->rfe_type == 1) {
-		odm_write_4byte(dm, 0xcb0, 0x77777777);
-		odm_write_4byte(dm, 0xcb4, 0x00000077);
-		odm_write_4byte(dm, 0xeb0, 0x77777777);
-		odm_write_4byte(dm, 0xeb4, 0x00000077);
-	} else {
-		odm_write_4byte(dm, 0xcb0, 0x77777717);
-		odm_write_4byte(dm, 0xcb4, 0x02000077);
-		odm_write_4byte(dm, 0xeb0, 0x77777717);
-		odm_write_4byte(dm, 0xeb4, 0x02000077);
+	for (i = 0, value = 0; i < link->num_lanes; i++) {
+		unsigned long lane = SOR_DP_TPG_CHANNEL_CODING |
+				     SOR_DP_TPG_SCRAMBLER_NONE |
+				     SOR_DP_TPG_PATTERN_TRAIN2;
+		value = (value << 8) | lane;
 	}
 
+	tegra_sor_writel(sor, value, SOR_DP_TPG);
 
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-	if (TX0_finish) {
-		odm_write_4byte(dm, 0xc80, 0x38008c10);/* TX_Tone_idx[9:0], TxK_Mask[29] TX_Tone = 16 */
-		odm_write_4byte(dm, 0xc84, 0x18008c10);/* RX_Tone_idx[9:0], RxK_Mask[29] */
-		odm_write_4byte(dm, 0xc88, 0x82140119);
+	pattern = DP_LINK_SCRAMBLING_DISABLE | DP_TRAINING_PATTERN_2;
+
+	err = tegra_dpaux_train(sor->dpaux, link, pattern);
+	if (err < 0)
+		return err;
+
+	for (i = 0, value = 0; i < link->num_lanes; i++) {
+		unsigned long lane = SOR_DP_TPG_CHANNEL_CODING |
+				     SOR_DP_TPG_SCRAMBLER_GALIOS |
+				     SOR_DP_TPG_PATTERN_NONE;
+		value = (value << 8) | lane;
 	}
-	if (TX1_finish) {
-		odm_write_4byte(dm, 0xe80, 0x38008c10);/* TX_Tone_idx[9:0], TxK_Mask[29] TX_Tone = 16 */
-		odm_write_4byte(dm, 0xe84, 0x18008c10);/* RX_Tone_idx[9:0], RxK_Mask[29] */
-		odm_write_4byte(dm, 0xe88, 0x82140119);
-	}
-	cal0_retry = 0;
-	cal1_retry = 0;
-	while (1) {
-		/* one shot */
-		odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-		if (TX0_finish) {
-			odm_set_bb_reg(dm, R_0x978, 0x03FF8000, (TX_IQC[0]) & 0x000007ff);
-			odm_set_bb_reg(dm, R_0x978, 0x000007FF, (TX_IQC[1]) & 0x000007ff);
-			odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-			if (dm->rfe_type == 1)
-				odm_write_4byte(dm, 0xc8c, 0x28161500);
-			else
-				odm_write_4byte(dm, 0xc8c, 0x28160cc0);
-			odm_write_4byte(dm, 0xcb8, 0x00300000);
-			odm_write_4byte(dm, 0xcb8, 0x00100000);
-			ODM_delay_ms(5); /* delay 5ms */
-			odm_write_4byte(dm, 0xc8c, 0x3c000000);
-			odm_write_4byte(dm, 0xcb8, 0x00000000);
-		}
-		if (TX1_finish) {
-			odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-			odm_set_bb_reg(dm, R_0x978, 0x03FF8000, (TX_IQC[2]) & 0x000007ff);
-			odm_set_bb_reg(dm, R_0x978, 0x000007FF, (TX_IQC[3]) & 0x000007ff);
-			odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-			if (dm->rfe_type == 1)
-				odm_write_4byte(dm, 0xe8c, 0x28161500);
-			else
-				odm_write_4byte(dm, 0xe8c, 0x28160ca0);
-			odm_write_4byte(dm, 0xeb8, 0x00300000);
-			odm_write_4byte(dm, 0xeb8, 0x00100000);
-			ODM_delay_ms(5); /* delay 5ms */
-			odm_write_4byte(dm, 0xe8c, 0x3c000000);
-			odm_write_4byte(dm, 0xeb8, 0x00000000);
-		}
-		delay_count = 0;
-		while (1) {
-			if (!RX0_finish && TX0_finish)
-				IQK0_ready = (boolean) odm_get_bb_reg(dm, R_0xd00, BIT(10));
-			if (!RX1_finish && TX1_finish)
-				IQK1_ready = (boolean) odm_get_bb_reg(dm, R_0xd40, BIT(10));
-			if ((IQK0_ready && IQK1_ready) || (delay_count > 20))
-				break;
-			else {
-				ODM_delay_ms(1);
-				delay_count++;
-			}
-		}
-		RF_DBG(dm, DBG_RF_IQK, "RX delay_count = %d\n", delay_count);
-		if (delay_count < 20) {	/* If 20ms No Result, then cal_retry++ */
-			/* ============RXIQK Check============== */
-			RX0_fail = (boolean) odm_get_bb_reg(dm, R_0xd00, BIT(11));
-			RX1_fail = (boolean) odm_get_bb_reg(dm, R_0xd40, BIT(11));
-			if (!(RX0_fail || RX0_finish) && TX0_finish) {
-				odm_write_4byte(dm, 0xcb8, 0x06000000);
-				RX_IQC_temp[rx0_average][0] = odm_get_bb_reg(dm, R_0xd00, 0x07ff0000) << 21;
-				odm_write_4byte(dm, 0xcb8, 0x08000000);
-				RX_IQC_temp[rx0_average][1] = odm_get_bb_reg(dm, R_0xd00, 0x07ff0000) << 21;
-				RF_DBG(dm, DBG_RF_IQK, "RX_X0[%d] = %x ;; RX_Y0[%d] = %x\n", rx0_average, (RX_IQC_temp[rx0_average][0]) >> 21 & 0x000007ff, rx0_average, (RX_IQC_temp[rx0_average][1]) >> 21 & 0x000007ff);
-				/*
-									odm_write_4byte(dm, 0xcb8, 0x05000000);
-									reg1 = odm_get_bb_reg(dm, R_0xd00, 0xffffffff);
-									odm_write_4byte(dm, 0xcb8, 0x06000000);
-									reg2 = odm_get_bb_reg(dm, R_0xd00, 0x0000001f);
-									dbg_print("reg1 = %d, reg2 = %d", reg1, reg2);
-									image_power = (reg2<<32)+reg1;
-									dbg_print("Before PW = %d\n", image_power);
-									odm_write_4byte(dm, 0xcb8, 0x07000000);
-									reg1 = odm_get_bb_reg(dm, R_0xd00, 0xffffffff);
-									odm_write_4byte(dm, 0xcb8, 0x08000000);
-									reg2 = odm_get_bb_reg(dm, R_0xd00, 0x0000001f);
-									image_power = (reg2<<32)+reg1;
-									dbg_print("After PW = %d\n", image_power);
-				*/
-				rx0_average++;
-			} else {
-				RF_DBG(dm, DBG_RF_IQK, "1. RXA_cal_retry = %d\n", cal0_retry);
-				cal0_retry++;
-				if (cal0_retry == 10)
-					break;
-			}
-			if (!(RX1_fail || RX1_finish) && TX1_finish) {
-				odm_write_4byte(dm, 0xeb8, 0x06000000);
-				RX_IQC_temp[rx1_average][2] = odm_get_bb_reg(dm, R_0xd40, 0x07ff0000) << 21;
-				odm_write_4byte(dm, 0xeb8, 0x08000000);
-				RX_IQC_temp[rx1_average][3] = odm_get_bb_reg(dm, R_0xd40, 0x07ff0000) << 21;
-				RF_DBG(dm, DBG_RF_IQK, "RX_X1[%d] = %x ;; RX_Y1[%d] = %x\n", rx1_average, (RX_IQC_temp[rx1_average][2]) >> 21 & 0x000007ff, rx1_average, (RX_IQC_temp[rx1_average][3]) >> 21 & 0x000007ff);
-				/*
-									odm_write_4byte(dm, 0xeb8, 0x05000000);
-									reg1 = odm_get_bb_reg(dm, R_0xd40, 0xffffffff);
-									odm_write_4byte(dm, 0xeb8, 0x06000000);
-									reg2 = odm_get_bb_reg(dm, R_0xd40, 0x0000001f);
-									dbg_print("reg1 = %d, reg2 = %d", reg1, reg2);
-									image_power = (reg2<<32)+reg1;
-									dbg_print("Before PW = %d\n", image_power);
-									odm_write_4byte(dm, 0xeb8, 0x07000000);
-									reg1 = odm_get_bb_reg(dm, R_0xd40, 0xffffffff);
-									odm_write_4byte(dm, 0xeb8, 0x08000000);
-									reg2 = odm_get_bb_reg(dm, R_0xd40, 0x0000001f);
-									image_power = (reg2<<32)+reg1;
-									dbg_print("After PW = %d\n", image_power);
-				*/
-				rx1_average++;
-			} else {
-				cal1_retry++;
-				if (cal1_retry == 10)
-					break;
-			}
 
-		} else {
-			RF_DBG(dm, DBG_RF_IQK, "2. RXA_cal_retry = %d\n", cal0_retry);
-			cal0_retry++;
-			cal1_retry++;
-			RF_DBG(dm, DBG_RF_IQK, "delay 20ms RX IQK Not Ready!!!!!\n");
-			if (cal0_retry == 10)
-				break;
-		}
-		RF_DBG(dm, DBG_RF_IQK, "3. RXA_cal_retry = %d\n", cal0_retry);
-		if (rx0_average >= 2) {
-			for (i = 0; i < rx0_average; i++) {
-				for (ii = i + 1; ii < rx0_average; ii++) {
-					dx = (RX_IQC_temp[i][0] >> 21) - (RX_IQC_temp[ii][0] >> 21);
-					if (dx < 4 && dx > -4) {
-						dy = (RX_IQC_temp[i][1] >> 21) - (RX_IQC_temp[ii][1] >> 21);
-						if (dy < 4 && dy > -4) {
-							RX_IQC[0] = ((RX_IQC_temp[i][0] >> 21) + (RX_IQC_temp[ii][0] >> 21)) / 2;
-							RX_IQC[1] = ((RX_IQC_temp[i][1] >> 21) + (RX_IQC_temp[ii][1] >> 21)) / 2;
-							RX0_finish = true;
-							break;
-						}
-					}
-				}
-			}
-		}
-		if (rx1_average >= 2) {
-			for (i = 0; i < rx1_average; i++) {
-				for (ii = i + 1; ii < rx1_average; ii++) {
-					dx = (RX_IQC_temp[i][2] >> 21) - (RX_IQC_temp[ii][2] >> 21);
-					if (dx < 4 && dx > -4) {
-						dy = (RX_IQC_temp[i][3] >> 21) - (RX_IQC_temp[ii][3] >> 21);
-						if (dy < 4 && dy > -4) {
-							RX_IQC[2] = ((RX_IQC_temp[i][2] >> 21) + (RX_IQC_temp[ii][2] >> 21)) / 2;
-							RX_IQC[3] = ((RX_IQC_temp[i][3] >> 21) + (RX_IQC_temp[ii][3] >> 21)) / 2;
-							RX1_finish = true;
-							break;
-						}
-					}
-				}
-			}
-		}
-		RF_DBG(dm, DBG_RF_IQK, "rx0_average = %d, rx1_average = %d\n", rx0_average, rx1_average);
-		RF_DBG(dm, DBG_RF_IQK, "RX0_finish = %d, RX1_finish = %d\n", RX0_finish, RX1_finish);
-		if ((RX0_finish || !TX0_finish) && (RX1_finish || !TX1_finish))
-			break;
-		if ((cal0_retry + rx0_average) >= 10 || (cal1_retry + rx1_average) >= 10 || rx0_average == 3 || rx1_average == 3)
-			break;
-	}
-	RF_DBG(dm, DBG_RF_IQK, "RXA_cal_retry = %d\n", cal0_retry);
-	RF_DBG(dm, DBG_RF_IQK, "RXB_cal_retry = %d\n", cal1_retry);
+	tegra_sor_writel(sor, value, SOR_DP_TPG);
 
+	pattern = DP_TRAINING_PATTERN_DISABLE;
 
-	/* FillIQK Result */
-	RF_DBG(dm, DBG_RF_IQK, "========Path_A =======\n");
-
-	if (TX0_finish)
-		_iqk_tx_fill_iqc_8812a(dm, RF_PATH_A, TX_IQC[0], TX_IQC[1]);
-	else
-		_iqk_tx_fill_iqc_8812a(dm, RF_PATH_A, 0x200, 0x0);
-
-
-
-	if (RX0_finish)
-		_iqk_rx_fill_iqc_8812a(dm, RF_PATH_A, RX_IQC[0], RX_IQC[1]);
-	else
-		_iqk_rx_fill_iqc_8812a(dm, RF_PATH_A, 0x200, 0x0);
-
-	RF_DBG(dm, DBG_RF_IQK, "========Path_B =======\n");
-
-	if (TX1_finish)
-		_iqk_tx_fill_iqc_8812a(dm, RF_PATH_B, TX_IQC[2], TX_IQC[3]);
-	else
-		_iqk_tx_fill_iqc_8812a(dm, RF_PATH_B, 0x200, 0x0);
-
-
-
-	if (RX1_finish)
-		_iqk_rx_fill_iqc_8812a(dm, RF_PATH_B, RX_IQC[2], RX_IQC[3]);
-	else
-		_iqk_rx_fill_iqc_8812a(dm, RF_PATH_B, 0x200, 0x0);
-
-
-
-}
-
-#define TARGET_CHNL_NUM_2G_5G	59
-
-u8 get_right_chnl_place_for_iqk(u8 chnl)
-{
-	u8	channel_all[TARGET_CHNL_NUM_2G_5G] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 100,
-		102, 104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 149, 151, 153, 155, 157, 159, 161, 163, 165
-						};
-	u8	place = chnl;
-
-
-	if (chnl > 14) {
-		for (place = 14; place < sizeof(channel_all); place++) {
-			if (channel_all[place] == chnl)
-				return place - 13;
-		}
-	}
+	err = tegra_dpaux_train(sor->dpaux, link, pattern);
+	if (err < 0)
+		return err;
 
 	return 0;
 }
 
-#define MACBB_REG_NUM 9
-#define AFE_REG_NUM 12
-#define RF_REG_NUM 3
-
-/* Maintained by BB James. */
-void
-_phy_iq_calibrate_8812a(
-	struct dm_struct		*dm,
-	u8		channel
-)
+static void tegra_sor_dp_term_calibrate(struct tegra_sor *sor)
 {
-	u32	MACBB_backup[MACBB_REG_NUM], AFE_backup[AFE_REG_NUM], RFA_backup[RF_REG_NUM], RFB_backup[RF_REG_NUM];
-	u32	backup_macbb_reg[MACBB_REG_NUM] = {0x520, 0x550, 0x808, 0xa04, 0x90c, 0xc00, 0xe00, 0x838,  0x82c};
-	u32	backup_afe_reg[AFE_REG_NUM] = {0xc5c, 0xc60, 0xc64, 0xc68, 0xcb0, 0xcb4,
-				       0xe5c, 0xe60, 0xe64, 0xe68, 0xeb0, 0xeb4
-					  };
-	u32	reg_c1b8, reg_e1b8;
-	u32	backup_rf_reg[RF_REG_NUM] = {0x65, 0x8f, 0x0};
-	u8	chnl_idx = get_right_chnl_place_for_iqk(channel);
+	u32 mask = 0x08, adj = 0, value;
 
-	_iqk_backup_mac_bb_8812a(dm, MACBB_backup, backup_macbb_reg, MACBB_REG_NUM);
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1);
-	reg_c1b8 = odm_read_4byte(dm, 0xcb8);
-	reg_e1b8 = odm_read_4byte(dm, 0xeb8);
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0);
-	_iqk_backup_afe_8812a(dm, AFE_backup, backup_afe_reg, AFE_REG_NUM);
-	_iqk_backup_rf_8812a(dm, RFA_backup, RFB_backup, backup_rf_reg, RF_REG_NUM);
+	/* enable pad calibration logic */
+	value = tegra_sor_readl(sor, SOR_DP_PADCTL0);
+	value &= ~SOR_DP_PADCTL_PAD_CAL_PD;
+	tegra_sor_writel(sor, value, SOR_DP_PADCTL0);
 
-	_iqk_configure_mac_8812a(dm);
-	_iqk_tx_8812a(dm, chnl_idx);
-	_iqk_restore_rf_8812a(dm, RF_PATH_A, backup_rf_reg, RFA_backup, RF_REG_NUM);
-	_iqk_restore_rf_8812a(dm, RF_PATH_B, backup_rf_reg, RFB_backup, RF_REG_NUM);
+	value = tegra_sor_readl(sor, SOR_PLL1);
+	value |= SOR_PLL1_TMDS_TERM;
+	tegra_sor_writel(sor, value, SOR_PLL1);
 
-	_iqk_restore_afe_8812a(dm, AFE_backup, backup_afe_reg, AFE_REG_NUM);
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1);
-	odm_write_4byte(dm, 0xcb8, reg_c1b8);
-	odm_write_4byte(dm, 0xeb8, reg_e1b8);
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0);
-	_iqk_restore_mac_bb_8812a(dm, MACBB_backup, backup_macbb_reg, MACBB_REG_NUM);
+	while (mask) {
+		adj |= mask;
 
+		value = tegra_sor_readl(sor, SOR_PLL1);
+		value &= ~SOR_PLL1_TMDS_TERMADJ_MASK;
+		value |= SOR_PLL1_TMDS_TERMADJ(adj);
+		tegra_sor_writel(sor, value, SOR_PLL1);
 
-}
+		usleep_range(100, 200);
 
-void
-_phy_lc_calibrate_8812a(
-	struct dm_struct	*dm,
-	boolean		is2T
-)
-{
-	u32	/*rf_amode=0, rf_bmode=0,*/ lc_cal = 0, tmp = 0, cnt;
+		value = tegra_sor_readl(sor, SOR_PLL1);
+		if (value & SOR_PLL1_TERM_COMPOUT)
+			adj &= ~mask;
 
-	/* Check continuous TX and Packet TX */
-	u32	reg0x914 = odm_read_4byte(dm, REG_SINGLE_TONE_CONT_TX_JAGUAR);;
-
-	/* Backup RF reg18. */
-	lc_cal = odm_get_rf_reg(dm, RF_PATH_A, RF_CHNLBW, RFREGOFFSETMASK);
-
-	if ((reg0x914 & 0x70000) != 0)	/* If contTx, disable all continuous TX. 0x914[18:16] */
-		/* <20121121, Kordan> A workaround: If we set 0x914[18:16] as zero, BB turns off ContTx */
-		/* until another packet comes in. To avoid ContTx being turned off, we skip this step. */
-		;/* odm_write_4byte(dm, REG_SINGLE_TONE_CONT_TX_JAGUAR, reg0x914 & (~0x70000)); */
-	else							/* If packet Tx-ing, pause Tx. */
-		odm_write_1byte(dm, REG_TXPAUSE_8812A, 0xFF);
-
-
-#if 0
-	/* 3 1. Read original RF mode */
-	rf_amode = odm_get_rf_reg(dm, RF_PATH_A, RF_AC, RFREGOFFSETMASK);
-	if (is2T)
-		rf_bmode = odm_get_rf_reg(dm, RF_PATH_B, RF_AC, RFREGOFFSETMASK);
-
-
-	/* 3 2. Set RF mode = standby mode */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_AC, RFREGOFFSETMASK, (rf_amode & 0x8FFFF) | 0x10000);
-	if (is2T)
-		odm_set_rf_reg(dm, RF_PATH_B, RF_AC, RFREGOFFSETMASK, (rf_bmode & 0x8FFFF) | 0x10000);
-#endif
-
-	/* Enter LCK mode */
-	tmp = odm_get_rf_reg(dm, RF_PATH_A, RF_LCK, RFREGOFFSETMASK);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_LCK, RFREGOFFSETMASK, tmp | BIT(14));
-
-	/* 3 3. Read RF reg18 */
-	lc_cal = odm_get_rf_reg(dm, RF_PATH_A, RF_CHNLBW, RFREGOFFSETMASK);
-
-	/* 3 4. Set LC calibration begin bit15 */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_CHNLBW, RFREGOFFSETMASK, lc_cal | 0x08000);
-	ODM_delay_ms(150);		/* suggest by RFSI Binson */
-	for (cnt = 0; cnt < 5; cnt++) {
-		if (odm_get_rf_reg(dm, RF_PATH_A, RF_CHNLBW, 0x8000) != 0x1)
-			break;
-		ODM_delay_ms(10);
-	}
-	if (cnt == 5)
-		RF_DBG(dm, DBG_RF_LCK, "LCK time out\n");
-	odm_set_rf_reg(dm, RF_PATH_A, RF_CHNLBW, RFREGOFFSETMASK, lc_cal);
-	/* Leave LCK mode */
-	tmp = odm_get_rf_reg(dm, RF_PATH_A, RF_LCK, RFREGOFFSETMASK);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_LCK, RFREGOFFSETMASK, tmp & ~BIT(14));
-
-	/* 3 Restore original situation */
-	if ((reg0x914 & 70000) != 0) {	/* Deal with contisuous TX case, 0x914[18:16] */
-		/* <20121121, Kordan> A workaround: If we set 0x914[18:16] as zero, BB turns off ContTx */
-		/* until another packet comes in. To avoid ContTx being turned off, we skip this step. */
-		/* odm_write_4byte(dm, REG_SINGLE_TONE_CONT_TX_JAGUAR, reg0x914); */
-	} else /* Deal with Packet TX case */
-		odm_write_1byte(dm, REG_TXPAUSE_8812A, 0x00);
-
-	/* Recover channel number */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_CHNLBW, RFREGOFFSETMASK, lc_cal);
-
-	/*
-	odm_set_rf_reg(dm, RF_PATH_A, RF_AC, RFREGOFFSETMASK, rf_amode);
-	if(is2T)
-		odm_set_rf_reg(dm, RF_PATH_B, RF_AC, RFREGOFFSETMASK, rf_bmode);
-		*/
-
-}
-
-void
-phy_reload_iqk_setting_8812a(
-	struct dm_struct	*dm,
-	u8		channel
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-
-	u8 chnl_idx = get_right_chnl_place_for_iqk(channel);
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-	odm_set_bb_reg(dm, R_0xccc, 0x000007ff, cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][0] & 0x7ff);
-	odm_set_bb_reg(dm, R_0xcd4, 0x000007ff, (cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][0] & 0x7ff0000) >> 16);
-	odm_set_bb_reg(dm, R_0xecc, 0x000007ff, cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][2] & 0x7ff);
-	odm_set_bb_reg(dm, R_0xed4, 0x000007ff, (cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][2] & 0x7ff0000) >> 16);
-
-	if (*dm->band_width != 2) {
-		odm_write_4byte(dm, 0xce8, 0x0);
-		odm_write_4byte(dm, 0xee8, 0x0);
-	} else {
-		odm_write_4byte(dm, 0xce8, cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][4]);
-		odm_write_4byte(dm, 0xee8, cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][5]);
-	}
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	odm_set_bb_reg(dm, R_0xc10, 0x000003ff, (cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][1] & 0x7ff0000) >> 17);
-	odm_set_bb_reg(dm, R_0xc10, 0x03ff0000, (cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][1] & 0x7ff) >> 1);
-	odm_set_bb_reg(dm, R_0xe10, 0x000003ff, (cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][3] & 0x7ff0000) >> 17);
-	odm_set_bb_reg(dm, R_0xe10, 0x03ff0000, (cali_info->iqk_matrix_reg_setting[chnl_idx].value[*dm->band_width][3] & 0x7ff) >> 1);
-
-
-}
-
-void
-phy_reset_iqk_result_8812a(
-	struct dm_struct	*dm
-)
-{
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x1); /* [31] = 1 --> Page C1 */
-	odm_set_bb_reg(dm, R_0xccc, 0x000007ff, 0x0);
-	odm_set_bb_reg(dm, R_0xcd4, 0x000007ff, 0x200);
-	odm_set_bb_reg(dm, R_0xecc, 0x000007ff, 0x0);
-	odm_set_bb_reg(dm, R_0xed4, 0x000007ff, 0x200);
-	odm_write_4byte(dm, 0xce8, 0x0);
-	odm_write_4byte(dm, 0xee8, 0x0);
-	odm_set_bb_reg(dm, R_0x82c, BIT(31), 0x0); /* [31] = 0 --> Page C */
-	odm_set_bb_reg(dm, R_0xc10, 0x000003ff, 0x100);
-	odm_set_bb_reg(dm, R_0xe10, 0x000003ff, 0x100);
-}
-
-void
-_phy_iq_calibrate_by_fw_8812a(
-	struct dm_struct	*dm
-)
-{
-	u8			iqk_cmd[3] = { *dm->channel, 0x0, 0x0};
-	u8			buf1 = 0x0;
-	u8			buf2 = 0x0;
-
-	/* Byte 2, Bit 4 ~ Bit 5 : band_type */
-	if (*dm->band_type == ODM_BAND_5G)
-		buf1 = 0x2 << 4;
-	else
-		buf1 = 0x1 << 4;
-
-	/* Byte 2, Bit 0 ~ Bit 3 : bandwidth */
-	if (*dm->band_width == CHANNEL_WIDTH_20)
-		buf2 = 0x1;
-	else if (*dm->band_width == CHANNEL_WIDTH_40)
-		buf2 = 0x1 << 1;
-	else if (*dm->band_width == CHANNEL_WIDTH_80)
-		buf2 = 0x1 << 2;
-	else
-		buf2 = 0x1 << 3;
-
-	iqk_cmd[1] = buf1 | buf2;
-	iqk_cmd[2] =  dm->ext_pa_5g | dm->ext_pa << 1 | dm->support_interface << 2 | dm->rfe_type << 5;
-
-	odm_fill_h2c_cmd(dm, ODM_H2C_IQ_CALIBRATION, 3, iqk_cmd);
-}
-
-void
-phy_iq_calibrate_8812a(
-	void		*dm_void,
-	boolean	is_recovery
-)
-{
-	struct dm_struct	*dm = (struct dm_struct *)dm_void;
-	struct dm_rf_calibration_struct	*cali_info = &(dm->rf_calibrate_info);
-	u32			counter = 0;
-
-	if (dm->fw_offload_ability & PHYDM_RF_IQK_OFFLOAD) {
-		_phy_iq_calibrate_by_fw_8812a(dm);
-		for (counter = 0; counter < 10; counter++) {
-			RF_DBG(dm, DBG_RF_IQK, "== FW IQK PROGRESS == #%d\n", counter);
-			delay_ms(50);
-			if (!cali_info->is_iqk_in_progress) {
-				RF_DBG(dm, DBG_RF_IQK, "== FW IQK RETURN FROM WAITING ==\n");
-				break;
-			}
-		}
-		if (cali_info->is_iqk_in_progress)
-			RF_DBG(dm, DBG_RF_IQK, "== FW IQK TIMEOUT (Still in progress after 500ms) ==\n");
-	} else
-		_phy_iq_calibrate_8812a(dm, *dm->channel);
-}
-
-
-void
-phy_lc_calibrate_8812a(
-	void		*dm_void
-)
-{
-	struct dm_struct	*dm = (struct dm_struct *)dm_void;
-
-	_phy_lc_calibrate_8812a(dm, true);
-}
-
-void _phy_set_rf_path_switch_8812a(
-#if (DM_ODM_SUPPORT_TYPE & ODM_AP)
-	struct dm_struct		*dm,
-#else
-	void	*adapter,
-#endif
-	boolean		is_main,
-	boolean		is2T
-)
-{
-#if !(DM_ODM_SUPPORT_TYPE & ODM_AP)
-	HAL_DATA_TYPE	*hal_data = GET_HAL_DATA(((PADAPTER)adapter));
-#if (DM_ODM_SUPPORT_TYPE == ODM_CE)
-	struct dm_struct		*dm = &hal_data->odmpriv;
-#elif (DM_ODM_SUPPORT_TYPE == ODM_WIN)
-	struct dm_struct		*dm = &hal_data->DM_OutSrc;
-#endif
-
-#endif
-
-	if (IS_HARDWARE_TYPE_8821(adapter)) {
-		if (is_main)
-			odm_set_bb_reg(dm, REG_A_RFE_PINMUX_JAGUAR + 4, BIT(29) | BIT28, 0x1);	/* Main */
-		else
-			odm_set_bb_reg(dm, REG_A_RFE_PINMUX_JAGUAR + 4, BIT(29) | BIT28, 0x2);	/* Aux */
-	} else if (dm->support_ic_type & ODM_RTL8812) {
-		if (dm->rfe_type == 5) {
-			if (is_main) {
-				/* WiFi */
-				odm_set_bb_reg(dm, REG_ANTSEL_SW_JAGUAR, BIT(1) | BIT(0), 0x2);
-				odm_set_bb_reg(dm, REG_ANTSEL_SW_JAGUAR, BIT(9) | BIT(8), 0x3);
-			} else {
-				/* BT */
-				odm_set_bb_reg(dm, REG_ANTSEL_SW_JAGUAR, BIT(1) | BIT(0), 0x1);
-				odm_set_bb_reg(dm, REG_ANTSEL_SW_JAGUAR, BIT(9) | BIT(8), 0x3);
-			}
-		} else if (dm->rfe_type == 1) {
-			/* <131224, VincentL> When rfe_type == 1 also Set 0x900, suggested by RF Binson. */
-			if (is_main) {
-				/* WiFi */
-				odm_set_bb_reg(dm, REG_ANTSEL_SW_JAGUAR, BIT(1) | BIT(0), 0x2);
-				odm_set_bb_reg(dm, REG_ANTSEL_SW_JAGUAR, BIT(9) | BIT(8), 0x3);
-			} else {
-				/* BT */
-				odm_set_bb_reg(dm, REG_ANTSEL_SW_JAGUAR, BIT(1) | BIT(0), 0x1);
-				odm_set_bb_reg(dm, REG_ANTSEL_SW_JAGUAR, BIT(9) | BIT(8), 0x3);
-			}
-		}
-
+		mask >>= 1;
 	}
 
-}
-void phy_set_rf_path_switch_8812a(
-#if (DM_ODM_SUPPORT_TYPE & ODM_AP)
-	struct dm_struct		*dm,
-#else
-	void	*adapter,
-#endif
-	boolean		is_main
-)
-{
+	value = tegra_sor_readl(sor, SOR_PLL1);
+	value &= ~SOR_PLL1_TMDS_TERMADJ_MASK;
+	value |= SOR_PLL1_TMDS_TERMADJ(adj);
+	tegra_sor_writel(sor, value, SOR_PLL1);
 
-#if DISABLE_BB_RF
-	return;
-#endif
-
-#if !(DM_ODM_SUPPORT_TYPE & ODM_AP)
-
-	_phy_set_rf_path_switch_8812a(adapter, is_main, true);
-
-#endif
+	/* disable pad calibration logic */
+	value = tegra_sor_readl(sor, SOR_DP_PADCTL0);
+	value |= SOR_DP_PADCTL_PAD_CAL_PD;
+	tegra_sor_writel(sor, value, SOR_DP_PADCTL0);
 }
 
-#if 0
-s32
-_sign(
-	u32 number
-)
+static void tegra_sor_super_update(struct tegra_sor *sor)
 {
-	if ((number & BIT(10)) == BIT10) {/* Negative */
-		number &= (~0xFFFFFC00);         /* [9:0] */
-		number = ~number;
-		number &= (~0xFFFFFC00);         /* [9:0] */
-		number += 1;
-		number &= (~0xFFFFF800);		  /* [10:0] */
-		return -1 * number;
-	} else   /* Positive */
-		return (s32)number;
+	tegra_sor_writel(sor, 0, SOR_SUPER_STATE0);
+	tegra_sor_writel(sor, 1, SOR_SUPER_STATE0);
+	tegra_sor_writel(sor, 0, SOR_SUPER_STATE0);
 }
 
-
-void
-_dpk_mac_bb_backup_path_a(
-	struct dm_struct	*dm,
-	u32		*backup_reg_addr,
-	u32		*backup_reg_data,
-	u32		number
-)
+static void tegra_sor_update(struct tegra_sor *sor)
 {
-	u32 i;
-
-	for (i = 0; i < number; i++)
-		backup_reg_data[i] = odm_read_4byte(dm, backup_reg_addr[i]);
-}
-void
-_dpk_mac_bb_restore_path_a(
-	struct dm_struct	*dm,
-	u32		*backup_reg_addr,
-	u32		*backup_reg_data,
-	u32		number
-)
-{
-	u32 i;
-
-	for (i = 0; i < number; i++)
-		odm_write_4byte(dm, backup_reg_addr[i], backup_reg_data[i]);
+	tegra_sor_writel(sor, 0, SOR_STATE0);
+	tegra_sor_writel(sor, 1, SOR_STATE0);
+	tegra_sor_writel(sor, 0, SOR_STATE0);
 }
 
-
-void
-_dpk_rf_backup_path_a(
-	struct dm_struct	*dm,
-	u32				*backup_reg_addr,
-	enum rf_path	rf_path,
-	u32				*backup_reg_data,
-	u32		        number
-)
+static int tegra_sor_setup_pwm(struct tegra_sor *sor, unsigned long timeout)
 {
-	u32 i;
-
-	for (i = 0; i < number; i++)
-		backup_reg_data[i] = odm_get_rf_reg(dm, (enum rf_path)rf_path, backup_reg_addr[i], RFREGOFFSETMASK);
-}
-
-void
-_dpk_rf_restore_path_a(
-	struct dm_struct	*dm,
-	u32				*backup_reg_addr,
-	enum rf_path	rf_path,
-	u32		*backup_reg_data,
-	u32		        number
-)
-{
-	u32 i;
-
-	for (i = 0; i < number; i++)
-		odm_set_rf_reg(dm, (enum rf_path)rf_path, backup_reg_addr[i], RFREGOFFSETMASK, backup_reg_data[i]);
-}
-
-
-
-s32
-_compute_loop_back_gain_path_a(
-	struct dm_struct			*dm
-)
-{
-	/* compute loopback gain */
-	/* 計算tmp_lb_gain 用到的function hex2dec() 是將 twos complement的十六進位轉成十進位, 十六進位的格式為s11.10
-	* 舉例1, d00[10:0] = h'3ff, 經過 hex2dec(h'3ff) = 1023,
-	* 舉例2, d00[10:0] = h'400, 經過 hex2dec(h'400) = -1024,
-	* 舉例3, d00[10:0] = h'0A9, 經過 hex2dec(h'0A9) = 169,
-	* 舉例4, d00[10:0] = h'54c, 經過 hex2dec(h'54c) = -692,
-	* 舉例5, d00[10:0] = h'7ff, 經過 hex2dec(h'7ff) = -1, */
-	u32 reg0xd00_26_16 = odm_get_bb_reg(dm, R_0xd00, 0x7FF0000);
-	u32 reg0xd00_10_0  = odm_get_bb_reg(dm, R_0xd00, 0x7FF);
-
-	s32 tmp_lb_gain = _sign(reg0xd00_26_16) * _sign(reg0xd00_26_16) + _sign(reg0xd00_10_0) * _sign(reg0xd00_10_0);
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _compute_loop_back_gain_path_a, tmp_lb_gain = 0x%X\n", tmp_lb_gain);
-
-	return tmp_lb_gain;
-}
-
-
-boolean
-_fine_tune_loop_back_gain_path_a(
-	struct dm_struct			*dm,
-	u32				dpk_tx_agc
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	s32 tmp_lb_gain = 0;
-
-	u32 rf0x64_orig = odm_get_rf_reg(dm, RF_PATH_A, RF_0x64, 0x7);
-	u32 rf0x64_new = rf0x64_orig;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _FineTuneLoopBackGain\n");
-
-	do {
-		/* RF setting */
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, dpk_tx_agc);
-		odm_write_4byte(dm, 0x82c, 0x802083dd);
-		/* 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-		odm_write_4byte(dm, 0xc90, 0x0101f018);
-
-		/* one shot */
-		odm_write_4byte(dm, 0xcc8, 0x800c5599);
-		odm_write_4byte(dm, 0xcc8, 0x000c5599);
-		/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-		delay_ms(50);
-
-		/* reg82c[31] = 0 --> 切到 page C */
-		odm_write_4byte(dm, 0x82c, 0x002083dd);
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, 0x33d8d);
-
-		tmp_lb_gain = _compute_loop_back_gain_path_a(dm);
-
-		if ((rf0x64_new == (BIT(2) | BIT(1) | BIT(0))) || (rf0x64_new == 0)) {
-			/* printf('DPK Phase 1 failed'); */
-			cali_info->is_dpk_fail = true;
-			break;
-			/* Go to DPK Phase 5 */
-		} else {
-			if (tmp_lb_gain < 263390) {/* fine tune loopback path gain: newReg64[2:0] = reg64[2:0] - 3b'001 */
-				rf0x64_new -= 1;
-				odm_set_rf_reg(dm, RF_PATH_A, RF_0x64, 0x7, rf0x64_new);
-
-			} else if (tmp_lb_gain > 661607) {/* fine tune loopback path gain: newReg64 [2:0] = reg64[2:0] + 3b'001 */
-				rf0x64_new += 1;
-				odm_set_rf_reg(dm, RF_PATH_A, RF_0x64, 0x7, rf0x64_new);
-
-			} else
-				cali_info->is_dpk_fail = false;
-		}
-
-	} while (tmp_lb_gain < 263390 || 661607 < tmp_lb_gain);
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _FineTuneLoopBackGain\n");
-
-	return cali_info->is_dpk_fail ? false : true;
-
-}
-
-
-
-void
-_dpk_init_path_a(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_Init\n");
-
-	/* TX pause */
-	odm_write_1byte(dm, 0x522, 0x7f);
-
-	/* reg82c[31] = b'0, 切換到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-
-	/* AFE setting */
-	odm_write_4byte(dm, 0xc68, 0x19791979);
-	odm_write_4byte(dm, 0xc60, 0x77777777);
-	odm_write_4byte(dm, 0xc64, 0x77777777);
-
-	/* external TRSW 切到 T */
-	odm_write_4byte(dm, 0xcb0, 0x77777777);
-	odm_write_4byte(dm, 0xcb4, 0x01000077);
-
-	/* hardware 3-wire off */
-	odm_write_4byte(dm, 0xc00, 0x00000004);
-
-	/* CCA off */
-	odm_write_4byte(dm, 0x838, 0x16C89B4c);
-
-	/* 90c[15]: dac fifo reset by CSWU */
-	odm_write_4byte(dm, 0x90c, 0x00008000);
-
-	/* r_gothrough_iqkdpk */
-	odm_write_4byte(dm, 0xc94, 0x0100005D);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* IQK Amp off */
-	odm_write_4byte(dm, 0xc8c, 0x3c000000);
-
-	/* tx_amp */
-	odm_write_4byte(dm, 0xc98, 0x41382e21);
-	odm_write_4byte(dm, 0xc9c, 0x5b554f48);
-	odm_write_4byte(dm, 0xca0, 0x6f6b6661);
-	odm_write_4byte(dm, 0xca4, 0x817d7874);
-	odm_write_4byte(dm, 0xca8, 0x908c8884);
-	odm_write_4byte(dm, 0xcac, 0x9d9a9793);
-	odm_write_4byte(dm, 0xcb0, 0xaaa7a4a1);
-	odm_write_4byte(dm, 0xcb4, 0xb6b3b0ad);
-
-	/* tx_inverse */
-	odm_write_4byte(dm, 0xc40, 0x02ce03e9);
-	odm_write_4byte(dm, 0xc44, 0x01fd0249);
-	odm_write_4byte(dm, 0xc48, 0x01a101c9);
-	odm_write_4byte(dm, 0xc4c, 0x016a0181);
-	odm_write_4byte(dm, 0xc50, 0x01430155);
-	odm_write_4byte(dm, 0xc54, 0x01270135);
-	odm_write_4byte(dm, 0xc58, 0x0112011c);
-	odm_write_4byte(dm, 0xc5c, 0x01000108);
-	odm_write_4byte(dm, 0xc60, 0x00f100f8);
-	odm_write_4byte(dm, 0xc64, 0x00e500eb);
-	odm_write_4byte(dm, 0xc68, 0x00db00e0);
-	odm_write_4byte(dm, 0xc6c, 0x00d100d5);
-	odm_write_4byte(dm, 0xc70, 0x00c900cd);
-	odm_write_4byte(dm, 0xc74, 0x00c200c5);
-	odm_write_4byte(dm, 0xc78, 0x00bb00be);
-	odm_write_4byte(dm, 0xc7c, 0x00b500b8);
-
-	/* reg82c[31] = b'0, 切換到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-
-	cali_info->is_dpk_fail = false;
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_Init\n");
-
-}
-
-
-boolean
-_dpk_adjust_rf_gain_path_a(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	s32 tmp_lb_gain = 0;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_AdjustRFGain\n");
-
-	/* RF setting */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, 0x50bfc);
-	/* Attn: A mode @ reg64[2:0], G mode @ reg56 */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x64, RFREGOFFSETMASK, 0x19aac);
-	/* PGA gain: RF reg8f[14:13] */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x8f, RFREGOFFSETMASK, 0x8a001);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* DPK setting */
-	odm_write_4byte(dm, 0xc94, 0xf76c9f84);
-	odm_write_4byte(dm, 0xcc8, 0x000c5599);
-	odm_write_4byte(dm, 0xcc4, 0x11838000);
-	odm_set_bb_reg(dm, R_0xcd4, 0xFFF000, 0x100);  /* 將cd4[23:12] 改成 h'100, 其它位元請保留原值不要寫到
-     * 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-	odm_write_4byte(dm, 0xc90, 0x0101f018);
-
-	/* one shot */
-	odm_write_4byte(dm, 0xcc8, 0x800c5599);
-	odm_write_4byte(dm, 0xcc8, 0x000c5599);
-	/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-	delay_ms(50);
-
-	/* read back Loopback Gain */
-	odm_write_4byte(dm, 0xcb8, 0x09000000);
-
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, 0x33d8d);
-
-	tmp_lb_gain = _compute_loop_back_gain_path_a(dm);
-
-	/* coarse tune loopback gain by RF reg8f[14:13] = 2b'11 */
-	if (tmp_lb_gain < 263390) {
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x8f, RFREGOFFSETMASK, 0x8e001);
-		_fine_tune_loop_back_gain_path_a(dm, 0x50bfc);
-
-	} else if (tmp_lb_gain > 661607) {
-		/* coarse tune loopback gain by RF reg8f[14:13] = 2b'00 */
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x8f, RFREGOFFSETMASK, 0x88001);
-		_fine_tune_loop_back_gain_path_a(dm, 0x50bfc);
-	} else
-		cali_info->is_dpk_fail = false;
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_AdjustRFGain\n");
-
-	return cali_info->is_dpk_fail ? false : true;
-
-}
-
-
-
-void
-_dpk_gain_loss_to_find_tx_agc_path_a(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	u32 reg0xd00 = 0;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_GainLossToFindTxAGC\n");
-
-	/* RF setting */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, 0x50bfc);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* regc20[15:13] = dB sel, 告訴 Gain Loss function 去尋找 dB_sel 所設定的PA gain loss目標所對應的 Tx AGC 為何. */
-	/* dB_sel = b'000 ' 1.0 dB PA gain loss */
-	/* dB_sel = b'001 ' 1.5 dB PA gain loss */
-	/* dB_sel = b'010 ' 2.0 dB PA gain loss */
-	/* dB_sel = b'011 ' 2.5 dB PA gain loss */
-	/* dB_sel = b'100 ' 3.0 dB PA gain loss */
-	/* dB_sel = b'101 ' 3.5 dB PA gain loss */
-	/* dB_sel = b'110 ' 4.0 dB PA gain loss */
-	odm_write_4byte(dm, 0xc20, 0x00002000);
-
-	/* DPK setting */
-	odm_write_4byte(dm, 0xc94, 0xf76c9f84);
-	odm_write_4byte(dm, 0xcc8, 0x000c5599);
-	odm_write_4byte(dm, 0xcc4, 0x148b8000);
-
-	/* 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-	odm_write_4byte(dm, 0xc90, 0x0401f018);
-
-	/* one shot */
-	odm_write_4byte(dm, 0xcc8, 0x800c5599);
-	odm_write_4byte(dm, 0xcc8, 0x000c5599);
-	/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-	delay_ms(50);
-
-	/* read back Loopback Gain */
-	/* 可以在 d00[3:0] 中讀回, dB_sel 中所設定的 gain loss 會落在哪一個 Tx AGC 設定 */
-	/* 讀回d00[3:0] = h'1 ' Tx AGC = h'13 */
-	/* 讀回d00[3:0] = h'2 ' Tx AGC = h'14 */
-	/* 讀回d00[3:0] = h'3 ' Tx AGC = h'15 */
-	/* 讀回d00[3:0] = h'4 ' Tx AGC = h'16 */
-	/* 讀回d00[3:0] = h'5 ' Tx AGC = h'17 */
-	/* 讀回d00[3:0] = h'6 ' Tx AGC = h'18 */
-	/* 讀回d00[3:0] = h'7 ' Tx AGC = h'19 */
-	/* 讀回d00[3:0] = h'8 ' Tx AGC = h'1a */
-	/* 讀回d00[3:0] = h'9 ' Tx AGC = h'1b */
-	/* 讀回d00[3:0] = h'a ' Tx AGC = h'1c */
-	/*  */
-	reg0xd00 = odm_read_4byte(dm, 0xd00);
-	switch (odm_read_4byte(dm, 0xd00) & (BIT(3) | BIT(2) | BIT(1) | BIT(0))) {
-	case 0x0:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x2;
-		break;
-	case 0x1:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x3;
-		break;
-	case 0x2:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x4;
-		break;
-	case 0x3:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x5;
-		break;
-	case 0x4:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x6;
-		break;
-	case 0x5:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x7;
-		break;
-	case 0x6:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x8;
-		break;
-	case 0x7:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x9;
-		break;
-	case 0x8:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0xa;
-		break;
-	case 0x9:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0xb;
-		break;
-	case 0xa:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0xc;
-		break;
-	}
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, 0x33d8d);
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_GainLossToFindTxAGC\n");
-}
-
-
-boolean
-_dpk_adjust_rf_gain_by_found_tx_agc_path_a
-(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	s32 tmp_lb_gain = 0;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_AdjustRFGainByFoundTxAGC\n");
-
-	/* RF setting, 重新設定RF reg00, 舉例用DPK Phase 2得到的 d00[3:0] = 0x6 ' TX AGC= 0x18 ' RF reg00[4:0] = 0x18 */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, cali_info->dpk_tx_agc);
-	/* Attn: A mode @ reg64[2:0], G mode @ reg56 */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x64, RFREGOFFSETMASK, 0x19aac);
-	/* PGA gain: RF reg8f[14:13] */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x8f, RFREGOFFSETMASK, 0x8a001);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* DPK setting */
-	odm_write_4byte(dm, 0xc94, 0xf76c9f84);
-	odm_write_4byte(dm, 0xcc8, 0x000c5599);
-	odm_write_4byte(dm, 0xcc4, 0x11838000);
-
-	/* 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-	odm_write_4byte(dm, 0xc90, 0x0101f018);
-
-	/* one shot */
-	odm_write_4byte(dm, 0xcc8, 0x800c5599);
-	odm_write_4byte(dm, 0xcc8, 0x000c5599);
-	/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-	delay_ms(50);
-
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, 0x33d8d);
-
-
-	tmp_lb_gain = _compute_loop_back_gain_path_a(dm);
-
-	if (tmp_lb_gain < 263390) {
-		/* coarse tune loopback gain by RF reg8f[14:13] = 2b'11 */
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x8f, RFREGOFFSETMASK, 0x8e001);
-		_fine_tune_loop_back_gain_path_a(dm, cali_info->dpk_tx_agc);
-	} else if (tmp_lb_gain > 661607) {
-		/* coarse tune loopback gain by RF reg8f[14:13] = 2b'00 */
-		odm_set_rf_reg(dm, RF_PATH_A, RF_0x8f, RFREGOFFSETMASK, 0x88001);
-		_fine_tune_loop_back_gain_path_a(dm, cali_info->dpk_tx_agc);
-	} else
-		cali_info->is_dpk_fail = false;/* Go to DPK Phase 4 */
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_AdjustRFGainByFoundTxAGC\n");
-
-	return cali_info->is_dpk_fail ? false : true;
-
-}
-
-
-void
-_dpk_do_auto_dpk_path_a(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	u32 tmp_lb_gain = 0, reg0xd00 = 0;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_DoAutoDPK\n");
-
-
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	/* RF setting, 此處RF reg00, 與 DPK Phase 3 一致 */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, cali_info->dpk_tx_agc);
-	/* Baseband data rate setting */
-	odm_write_4byte(dm, 0xc20, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc24, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc28, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc2c, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc30, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc34, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc38, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc3c, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc40, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc44, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc48, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xc4c, 0x3c3c3c3c);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* DPK setting */
-	odm_write_4byte(dm, 0xc94, 0xf76C9f84);
-	odm_write_4byte(dm, 0xcc8, 0x400C5599);
-	odm_write_4byte(dm, 0xcc4, 0x11938080);    /* 0xcc4[9:4]= DPk fail threshold */
-
-	if (36 <= *(dm->channel) && *(dm->channel) <= 53) /* Channelchannel at low band) */
-		/* r_agc */
-		odm_write_4byte(dm, 0xcbc, 0x00022a1f);
-	else
-		/* r_agc */
-		odm_write_4byte(dm, 0xcbc, 0x00009dbf);
-
-	/* 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-	odm_write_4byte(dm, 0xc90, 0x0101f018); /* TODO: 0xC90(rA_LSSIWrite_Jaguar) can not be overwritten. */
-
-	/* one shot */
-	odm_write_4byte(dm, 0xcc8, 0xc00c5599);
-	odm_write_4byte(dm, 0xcc8, 0x400c5599);
-	/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-	delay_ms(50);
-
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	/* T-meter RFReg42[17] = 1 to enable read T-meter, [15:10] ' T-meter value */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x42, BIT(17), 1);
-	cali_info->dpk_thermal[RF_PATH_A] = odm_get_rf_reg(dm, RF_PATH_A, RF_0x42, 0xFC00);					/* 讀出42[15:10] 值並存到變數TMeter */
-	dbg_print("cali_info->dpk_thermal[RF_PATH_A] = 0x%X\n", cali_info->dpk_thermal[RF_PATH_A]);
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x00, RFREGOFFSETMASK, 0x33D8D);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-	/* read back dp_fail report */
-	odm_write_4byte(dm, 0xcb8, 0x00000000);
-	/* dp_fail這個bit在d00[6], 當 d00[6] = 1, 表示calibration失敗. */
-	reg0xd00 = odm_read_4byte(dm, 0xd00);
-
-	if ((reg0xd00 & BIT(6)) == BIT(6)) {
-		/* printf('DPK fail') */
-		cali_info->is_dpk_fail = true;
-		/* Go to DPK Phase 5 */
-	} else {
-		/* printf('DPK success') */
+	u32 value;
+
+	value = tegra_sor_readl(sor, SOR_PWM_DIV);
+	value &= ~SOR_PWM_DIV_MASK;
+	value |= 0x400; /* period */
+	tegra_sor_writel(sor, value, SOR_PWM_DIV);
+
+	value = tegra_sor_readl(sor, SOR_PWM_CTL);
+	value &= ~SOR_PWM_CTL_DUTY_CYCLE_MASK;
+	value |= 0x400; /* duty cycle */
+	value &= ~SOR_PWM_CTL_CLK_SEL; /* clock source: PCLK */
+	value |= SOR_PWM_CTL_TRIGGER;
+	tegra_sor_writel(sor, value, SOR_PWM_CTL);
+
+	timeout = jiffies + msecs_to_jiffies(timeout);
+
+	while (time_before(jiffies, timeout)) {
+		value = tegra_sor_readl(sor, SOR_PWM_CTL);
+		if ((value & SOR_PWM_CTL_TRIGGER) == 0)
+			return 0;
+
+		usleep_range(25, 100);
 	}
 
-
-	/* read back */
-	odm_write_4byte(dm, 0xc90, 0x0201f01f);
-	odm_write_4byte(dm, 0xcb8, 0x0c000000);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-
-	/* 計算tmpGainLoss 用到的function hex2dec() 是將 twos complement的十六進位轉成十進位, 十六進位的格式為s11.9 */
-	/* 舉例1, d00[10:0] = h'3ff, 經過 hex2dec(h'3ff) = 1023, */
-	/* 舉例2, d00[10:0] = h'400, 經過 hex2dec(h'400) = -1024, */
-	/* 舉例3, d00[10:0] = h'0A9, 經過 hex2dec(h'0A9) = 169, */
-	/* 舉例4, d00[10:0] = h'54c, 經過 hex2dec(h'54c) = -692, */
-	/* 舉例4, d00[10:0] = h'7ff, 經過 hex2dec(h'7ff) = -1, */
-	tmp_lb_gain = _compute_loop_back_gain_path_a(dm);
-
-
-	/* Gain Scaling */
-	if (227007 < tmp_lb_gain)
-		cali_info->dpk_gain = 0x43ca43ca;
-	else if (214309 < tmp_lb_gain && tmp_lb_gain <= 227007)
-		cali_info->dpk_gain = 0x45c545c5;
-	else if (202321 < tmp_lb_gain && tmp_lb_gain <= 214309)
-		cali_info->dpk_gain = 0x47cf47cf;
-	else if (191003 < tmp_lb_gain && tmp_lb_gain <= 202321)
-		cali_info->dpk_gain = 0x49e749e7;
-	else if (180318 < tmp_lb_gain && tmp_lb_gain <= 191003)
-		cali_info->dpk_gain = 0x4c104c10;
-	else if (170231 < tmp_lb_gain && tmp_lb_gain <= 180318)
-		cali_info->dpk_gain = 0x4e494e49;
-	else if (160709 < tmp_lb_gain && tmp_lb_gain <= 170231)
-		cali_info->dpk_gain = 0x50925092;
-	else if (151719 < tmp_lb_gain && tmp_lb_gain <= 160709)
-		cali_info->dpk_gain = 0x52ec52ec;
-	else if (151719 <= tmp_lb_gain)
-		cali_info->dpk_gain = 0x55585558;
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_DoAutoDPK\n");
+	return -ETIMEDOUT;
 }
 
-
-void
-_dpk_enable_dp_path_a(
-	struct dm_struct	*dm
-)
+static int tegra_sor_attach(struct tegra_sor *sor)
 {
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _dpk_enable_dp\n");
-
-	/* [31] = 1 --> switch to page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* enable IQC matrix --> 因為 BB 信號會先經過 predistortion module, 才經過 IQC matrix 到 DAC 打出去 */
-	/* 所以要先 enable predistortion module {c90[7] = 1 (enable_predis) cc4[18] = 1 (確定讓 IQK/DPK module 有clock), cc8[29] = 1 (一個IQK/DPK module 裡的mux, 確認 data path 走IQK/DPK)} */
-	odm_write_4byte(dm, 0xc90, 0x0000f098);
-	odm_write_4byte(dm, 0xc94, 0x776d9f84);
-	odm_write_4byte(dm, 0xcc8, 0x20000000);
-	odm_write_4byte(dm, 0xc8c, 0x3c000000);
-	/* r_bnd */
-	odm_write_4byte(dm, 0xcb8, 0x000fffff);
-
-	if (cali_info->is_dpk_fail) {
-		/* cc4[29] = 1 (bypass DP LUT) */
-		odm_write_4byte(dm, 0xc98, 0x40004000);
-		odm_write_4byte(dm, 0xcc4, 0x28840000);
-	} else {
-		odm_write_4byte(dm, 0xc98, cali_info->dpk_gain);
-		odm_write_4byte(dm, 0xcc4, 0x08840000);
-
-		/* PWSF */
-		/* 寫PWSF table in 1st SRAM for PA = 11 use */
-		odm_write_4byte(dm, 0xc20, 0x00000800);
-
-		/* ******************************************************* */
-		/* 0xce4[0]是write enable，0xce4[7:1]是address，0xce4[15:8]和0xce4[23:16]對應到TX index， */
-		/* 若位置為0(0xce4[7:1] = 0x0)此時0xce4[15:8]對應到的TX RF index 是0x1f,， */
-		/* 0xce4[23:16]對應到的是0x1e，若位置為1(0xce4[7:1] = 0x1)，此時0xce4 [15:8]對應到0x1d， */
-		/* 0xce4[23:16]對應0x1c，其他依此類推，每個data欄位都是相差1dB。若gainloss找到的RF TX index=0x18， */
-		/* 則在0xce4 address對應到0x18的地方要填0x40(也就是0dB)，其他則照下面table的順序每格1dB依序排列 */
-		/* 將所有的0xce4c的data欄位都填入相對應的值。 */
-		/* ************************************************************* */
-
-		{
-			const s32 LEN = 25;
-			u32 base_idx = 6; /* 0 dB: 0x40 */
-			u32 table_pwsf[] = {
-				0xff, 0xca, 0xa1, 0x80, 0x65, 0x51, 0x40/* 0 dB */,
-				0x33, 0x28, 0x20, 0x19, 0x14, 0x10,
-				0x0d, 0x0a, 0x08, 0x06, 0x05, 0x04,
-				0x03, 0x03, 0x02, 0x02, 0x01, 0x01
-			};
-
-			u32 center_tx_idx = cali_info->dpk_tx_agc & 0x1F;
-			u32 center_addr = (0x1F - center_tx_idx) / 2;
-			s32 i = 0, j = 0, value = 0, start_idx = 0;
-
-			/* Upper */
-			start_idx = (((0x1F - center_tx_idx) % 2 == 0) ? base_idx + 1 : base_idx);
-
-			for (i = start_idx, j = 0; (center_addr - j + 1) >= 1; i -= 2, j++) {
-				if (i - 1 < 0)
-					value = (table_pwsf[0] << 16) | (table_pwsf[0] << 8) | ((center_addr - j) << 1) | 0x1;
-				else
-					value = (table_pwsf[i] << 16) | (table_pwsf[i - 1] << 8) | ((center_addr - j) << 1) | 0x1;
-
-				odm_write_4byte(dm, 0xce4, value);
-				odm_write_1byte(dm, 0xce4, 0x0);		/* write disable */
-			}
-
-			/* Lower */
-			start_idx = (((0x1F - center_tx_idx) % 2 == 0) ? base_idx + 2 : base_idx + 1);
-			center_addr++; /* Skip center_tx_idx */
-			for (i = start_idx, j = 0; (center_addr + j) < 16; i += 2, j++) { /* Total: 16*2 = 32 values (Upper+Lower) */
-				if (i + 1 >= LEN)
-					value = (table_pwsf[LEN - 1] << 16) | (table_pwsf[LEN - 1] << 8) | ((center_addr + j) << 1) | 0x1;
-				else
-					value = (table_pwsf[i + 1] << 16) | (table_pwsf[i] << 8) | ((center_addr + j) << 1) | 0x1;
-				odm_write_4byte(dm, 0xce4, value);
-				odm_write_1byte(dm, 0xce4, 0x0);		/* write disable */
-			}
-		}
-	}
-	/* [31] = 0 --> switch to page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _dpk_enable_dp\n");
-
-}
-
-
-
-
-
-void
-_phy_dp_calibrate_path_a_8812a(
-	struct dm_struct	*dm
-)
-{
-	u32 backup_mac_bb_reg_addrs[] = {
-		0xC60, 0xC64, 0xC68, 0x82C, 0x838, 0x90C, 0x522, 0xC00, 0xC20, 0xC24, /* 10 */
-		0xC28, 0xC2C, 0xC30, 0xC34, 0xC38, 0xC3C, 0xC40, 0xC44, 0xC48, 0xC4C, /* 20 */
-		0xC94, 0xCB0, 0xCB4
-	};
-	u32 backup_rf_reg_addrs[] = {0x00, 0x64, 0x8F};
-
-	u32 backup_mac_bb_reg_data[sizeof(backup_mac_bb_reg_addrs) / sizeof(u32)];
-	u32 backup_rf_reg_data_a[sizeof(backup_rf_reg_addrs) / sizeof(u32)];
-	/* u32 backupRFRegData_B[sizeof(backup_rf_reg_addrs)/sizeof(u32)]; */
-
-
-	_dpk_mac_bb_backup_path_a(dm, backup_mac_bb_reg_addrs, backup_mac_bb_reg_data, sizeof(backup_mac_bb_reg_addrs) / sizeof(u32));
-	_dpk_rf_backup_path_a(dm, backup_rf_reg_addrs, RF_PATH_A, backup_rf_reg_data_a, sizeof(backup_rf_reg_addrs) / sizeof(u32));
-
-	_dpk_init_path_a(dm);
-
-	if (_dpk_adjust_rf_gain_path_a(dm)) {               /* Phase 1 */
-		_dpk_gain_loss_to_find_tx_agc_path_a(dm);          /* Phase 2 */
-		if (_dpk_adjust_rf_gain_by_found_tx_agc_path_a(dm)) /* Phase 3 */
-			_dpk_do_auto_dpk_path_a(dm);                /* Phase 4 */
-	}
-	_dpk_enable_dp_path_a(dm);                         /* Phase 5 */
-
-	_dpk_mac_bb_restore_path_a(dm, backup_mac_bb_reg_addrs, backup_mac_bb_reg_data, sizeof(backup_mac_bb_reg_addrs) / sizeof(u32));
-	_dpk_rf_restore_path_a(dm, backup_rf_reg_addrs, RF_PATH_A, backup_rf_reg_data_a, sizeof(backup_rf_reg_addrs) / sizeof(u32));
-}
-
-
-void
-_dpk_mac_bb_backup_path_b(
-	struct dm_struct	*dm,
-	u32		*backup_reg_addr,
-	u32		*backup_reg_data,
-	u32		number
-)
-{
-	u32 i;
-
-	for (i = 0; i < number; i++)
-		backup_reg_data[i] = odm_read_4byte(dm, backup_reg_addr[i]);
-}
-
-void
-_dpk_mac_bb_restore_path_b(
-	struct dm_struct	*dm,
-	u32		*backup_reg_addr,
-	u32		*backup_reg_data,
-	u32		number
-)
-{
-	u32 i;
-
-	for (i = 0; i < number; i++)
-		odm_write_4byte(dm, backup_reg_addr[i], backup_reg_data[i]);
-}
-
-
-void
-_dpk_rf_backup_path_b(
-	struct dm_struct	*dm,
-	u32				*backup_reg_addr,
-	enum rf_path	rf_path,
-	u32				*backup_reg_data,
-	u32		        number
-)
-{
-	u32 i;
-
-	for (i = 0; i < number; i++)
-		backup_reg_data[i] = odm_get_rf_reg(dm, (enum rf_path)rf_path, backup_reg_addr[i], RFREGOFFSETMASK);
-}
-
-void
-_dpk_rf_restore_path_b(
-	struct dm_struct	*dm,
-	u32				*backup_reg_addr,
-	enum rf_path	rf_path,
-	u32		*backup_reg_data,
-	u32		        number
-)
-{
-	u32 i;
-
-	for (i = 0; i < number; i++)
-		odm_set_rf_reg(dm, (enum rf_path)rf_path, backup_reg_addr[i], RFREGOFFSETMASK, backup_reg_data[i]);
-}
-
-
-
-s32
-_compute_loop_back_gain_path_b(
-	struct dm_struct			*dm
-)
-{
-	/* compute loopback gain */
-	/* 計算tmp_lb_gain 用到的function hex2dec() 是將 twos complement的十六進位轉成十進位, 十六進位的格式為s11.10
-	* 舉例1, d00[10:0] = h'3ff, 經過 hex2dec(h'3ff) = 1023,
-	* 舉例2, d00[10:0] = h'400, 經過 hex2dec(h'400) = -1024,
-	* 舉例3, d00[10:0] = h'0A9, 經過 hex2dec(h'0A9) = 169,
-	* 舉例4, d00[10:0] = h'54c, 經過 hex2dec(h'54c) = -692,
-	* 舉例5, d00[10:0] = h'7ff, 經過 hex2dec(h'7ff) = -1, */
-	u32 reg0xd40_26_16 = odm_get_bb_reg(dm, R_0xd40, 0x7FF0000);
-	u32 reg0xd40_10_0  = odm_get_bb_reg(dm, R_0xd40, 0x7FF);
-
-	s32 tmp_lb_gain = _sign(reg0xd40_26_16) * _sign(reg0xd40_26_16) + _sign(reg0xd40_10_0) * _sign(reg0xd40_10_0);
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _compute_loop_back_gain_path_b, tmp_lb_gain = 0x%X\n", tmp_lb_gain);
-
-	return tmp_lb_gain;
-}
-
-
-boolean
-_fine_tune_loop_back_gain_path_b(
-	struct dm_struct			*dm,
-	u32				dpk_tx_agc
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	s32 tmp_lb_gain = 0;
-
-	u32 rf0x64_orig = odm_get_rf_reg(dm, RF_PATH_B, RF_0x64, 0x7);
-	u32 rf0x64_new = rf0x64_orig;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _fine_tune_loop_back_gain_path_b\n");
-
-	do {
-		/* RF setting */
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, dpk_tx_agc);
-		odm_write_4byte(dm, 0x82c, 0x802083dd);
-		/* 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-		odm_write_4byte(dm, 0xe90, 0x0101f018);
-
-		/* one shot */
-		odm_write_4byte(dm, 0xec8, 0x800c5599);
-		odm_write_4byte(dm, 0xec8, 0x000c5599);
-		/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-		delay_ms(50);
-
-		/* reg82c[31] = 0 --> 切到 page C */
-		odm_write_4byte(dm, 0x82c, 0x002083dd);
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, 0x33d8d);
-
-		tmp_lb_gain = _compute_loop_back_gain_path_b(dm);
-
-		if ((rf0x64_new == (BIT(2) | BIT(1) | BIT(0))) || (rf0x64_new == 0)) {
-			/* printf('DPK Phase 1 failed'); */
-			cali_info->is_dpk_fail = true;
-			break;
-			/* Go to DPK Phase 5 */
-		} else {
-			if (tmp_lb_gain < 263390) {/* fine tune loopback path gain: newReg64[2:0] = reg64[2:0] - 3b'001 */
-				rf0x64_new -= 1;
-				odm_set_rf_reg(dm, RF_PATH_B, RF_0x64, 0x7, rf0x64_new);
-
-			} else if (tmp_lb_gain > 661607) {/* fine tune loopback path gain: newReg64 [2:0] = reg64[2:0] + 3b'001 */
-				rf0x64_new += 1;
-				odm_set_rf_reg(dm, RF_PATH_B, RF_0x64, 0x7, rf0x64_new);
-
-			} else
-				cali_info->is_dpk_fail = false;
-		}
-
-	} while (tmp_lb_gain < 263390 || 661607 < tmp_lb_gain);
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _fine_tune_loop_back_gain_path_b\n");
-
-	return cali_info->is_dpk_fail ? false : true;
-
-}
-
-
-
-void
-_dpk_init_path_b(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_Init\n");
-
-	/* TX pause */
-	odm_write_1byte(dm, 0x522, 0x7f);
-
-	/* reg82c[31] = b'0, 切換到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-
-	/* AFE setting */
-	odm_write_4byte(dm, 0xc68, 0x59791979);
-	odm_write_4byte(dm, 0xe60, 0x77777777);
-	odm_write_4byte(dm, 0xe64, 0x77777777);
-
-	/* external TRSW 切到 T */
-	odm_write_4byte(dm, 0xeb0, 0x77777777);
-	odm_write_4byte(dm, 0xeb4, 0x01000077);
-
-	/* hardware 3-wire off */
-	odm_write_4byte(dm, 0xe00, 0x00000004);
-
-	/* CCA off */
-	odm_write_4byte(dm, 0x838, 0x16C89B4c);
-
-	/* 90c[15]: dac fifo reset by CSWU */
-	odm_write_4byte(dm, 0x90c, 0x00008000);
-
-	/* r_gothrough_iqkdpk */
-	odm_write_4byte(dm, 0xe94, 0x0100005D);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* IQK Amp off */
-	odm_write_4byte(dm, 0xe8c, 0x3c000000);
-
-	/* tx_amp */
-	odm_write_4byte(dm, 0xe98, 0x41382e21);
-	odm_write_4byte(dm, 0xe9c, 0x5b554f48);
-	odm_write_4byte(dm, 0xea0, 0x6f6b6661);
-	odm_write_4byte(dm, 0xea4, 0x817d7874);
-	odm_write_4byte(dm, 0xea8, 0x908c8884);
-	odm_write_4byte(dm, 0xeac, 0x9d9a9793);
-	odm_write_4byte(dm, 0xeb0, 0xaaa7a4a1);
-	odm_write_4byte(dm, 0xeb4, 0xb6b3b0ad);
-
-	/* tx_inverse */
-	odm_write_4byte(dm, 0xe40, 0x02ce03e9);
-	odm_write_4byte(dm, 0xe44, 0x01fd0249);
-	odm_write_4byte(dm, 0xe48, 0x01a101c9);
-	odm_write_4byte(dm, 0xe4c, 0x016a0181);
-	odm_write_4byte(dm, 0xe50, 0x01430155);
-	odm_write_4byte(dm, 0xe54, 0x01270135);
-	odm_write_4byte(dm, 0xe58, 0x0112011c);
-	odm_write_4byte(dm, 0xe5c, 0x01000108);
-	odm_write_4byte(dm, 0xe60, 0x00f100f8);
-	odm_write_4byte(dm, 0xe64, 0x00e500eb);
-	odm_write_4byte(dm, 0xe68, 0x00db00e0);
-	odm_write_4byte(dm, 0xe6c, 0x00d100d5);
-	odm_write_4byte(dm, 0xe70, 0x00c900cd);
-	odm_write_4byte(dm, 0xe74, 0x00c200c5);
-	odm_write_4byte(dm, 0xe78, 0x00bb00be);
-	odm_write_4byte(dm, 0xe7c, 0x00b500b8);
-
-	/* reg82c[31] = b'0, 切換到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-
-	cali_info->is_dpk_fail = false;
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_Init\n");
-
-}
-
-
-boolean
-_dpk_adjust_rf_gain_path_b(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	s32 tmp_lb_gain = 0;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_AdjustRFGain\n");
-
-	/* RF setting */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, 0x50bfc);
-	/* Attn: A mode @ reg64[2:0], G mode @ reg56 */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x64, RFREGOFFSETMASK, 0x19aac);
-	/* PGA gain: RF reg8f[14:13] */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x8f, RFREGOFFSETMASK, 0x8a001);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* DPK setting */
-	odm_write_4byte(dm, 0xe94, 0xf76c9f84);
-	odm_write_4byte(dm, 0xec8, 0x000c5599);
-	odm_write_4byte(dm, 0xec4, 0x11838000);
-	odm_set_bb_reg(dm, R_0xed4, 0xFFF000, 0x100);  /* 將cd4[23:12] 改成 h'100, 其它位元請保留原值不要寫到
-     * 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-	odm_write_4byte(dm, 0xe90, 0x0101f018);
-
-	/* one shot */
-	odm_write_4byte(dm, 0xec8, 0x800c5599);
-	odm_write_4byte(dm, 0xec8, 0x000c5599);
-	/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-	delay_ms(50);
-
-	/* read back Loopback Gain */
-	odm_write_4byte(dm, 0xeb8, 0x09000000);
-
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, 0x33d8d);
-
-	tmp_lb_gain = _compute_loop_back_gain_path_b(dm);
-
-	/* coarse tune loopback gain by RF reg8f[14:13] = 2b'11 */
-	if (tmp_lb_gain < 263390) {
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x8f, RFREGOFFSETMASK, 0x8e001);
-		_fine_tune_loop_back_gain_path_b(dm, 0x50bfc);
-
-	} else if (tmp_lb_gain > 661607) {
-		/* coarse tune loopback gain by RF reg8f[14:13] = 2b'00 */
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x8f, RFREGOFFSETMASK, 0x88001);
-		_fine_tune_loop_back_gain_path_b(dm, 0x50bfc);
-	} else
-		cali_info->is_dpk_fail = false;
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_AdjustRFGain\n");
-
-	return cali_info->is_dpk_fail ? false : true;
-
-}
-
-
-
-void
-_dpk_gain_loss_to_find_tx_agc_path_b(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	u32 reg0xd40 = 0;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_GainLossToFindTxAGC\n");
-
-	/* RF setting */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, 0x50bfc);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* regc20[15:13] = dB sel, 告訴 Gain Loss function 去尋找 dB_sel 所設定的PA gain loss目標所對應的 Tx AGC 為何. */
-	/* dB_sel = b'000 ' 1.0 dB PA gain loss */
-	/* dB_sel = b'001 ' 1.5 dB PA gain loss */
-	/* dB_sel = b'010 ' 2.0 dB PA gain loss */
-	/* dB_sel = b'011 ' 2.5 dB PA gain loss */
-	/* dB_sel = b'100 ' 3.0 dB PA gain loss */
-	/* dB_sel = b'101 ' 3.5 dB PA gain loss */
-	/* dB_sel = b'110 ' 4.0 dB PA gain loss */
-	odm_write_4byte(dm, 0xe20, 0x00002000);
-
-	/* DPK setting */
-	odm_write_4byte(dm, 0xe94, 0xf76c9f84);
-	odm_write_4byte(dm, 0xec8, 0x000c5599);
-	odm_write_4byte(dm, 0xec4, 0x148b8000);
-
-	/* 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-	odm_write_4byte(dm, 0xe90, 0x0401f018);
-
-	/* one shot */
-	odm_write_4byte(dm, 0xec8, 0x800c5599);
-	odm_write_4byte(dm, 0xec8, 0x000c5599);
-	/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-	delay_ms(50);
-
-	/* read back Loopback Gain */
-	/* 可以在 d40[3:0] 中讀回, dB_sel 中所設定的 gain loss 會落在哪一個 Tx AGC 設定 */
-	/* 讀回d00[3:0] = h'1 ' Tx AGC = h'13 */
-	/* 讀回d00[3:0] = h'2 ' Tx AGC = h'14 */
-	/* 讀回d00[3:0] = h'3 ' Tx AGC = h'15 */
-	/* 讀回d00[3:0] = h'4 ' Tx AGC = h'16 */
-	/* 讀回d00[3:0] = h'5 ' Tx AGC = h'17 */
-	/* 讀回d00[3:0] = h'6 ' Tx AGC = h'18 */
-	/* 讀回d00[3:0] = h'7 ' Tx AGC = h'19 */
-	/* 讀回d00[3:0] = h'8 ' Tx AGC = h'1a */
-	/* 讀回d00[3:0] = h'9 ' Tx AGC = h'1b */
-	/* 讀回d00[3:0] = h'a ' Tx AGC = h'1c */
-	/*  */
-	reg0xd40 = odm_read_4byte(dm, 0xd40);
-	switch (odm_read_4byte(dm, 0xd40) & (BIT(3) | BIT(2) | BIT(1) | BIT(0))) {
-	case 0x0:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x2;
-		break;
-	case 0x1:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x3;
-		break;
-	case 0x2:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x4;
-		break;
-	case 0x3:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x5;
-		break;
-	case 0x4:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x6;
-		break;
-	case 0x5:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x7;
-		break;
-	case 0x6:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x8;
-		break;
-	case 0x7:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0x9;
-		break;
-	case 0x8:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0xa;
-		break;
-	case 0x9:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0xb;
-		break;
-	case 0xa:
-		cali_info->dpk_tx_agc = 0x50bf0 | 0xc;
-		break;
-	}
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, 0x33d8d);
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_GainLossToFindTxAGC\n");
-}
-
-
-boolean
-_dpk_adjust_rf_gain_by_found_tx_agc_path_b
-(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	s32 tmp_lb_gain = 0;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_AdjustRFGainByFoundTxAGC\n");
-
-	/* RF setting, 重新設定RF reg00, 舉例用DPK Phase 2得到的 d40[3:0] = 0x6 ' TX AGC= 0x18 ' RF reg00[4:0] = 0x18 */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, cali_info->dpk_tx_agc);
-	/* Attn: A mode @ reg64[2:0], G mode @ reg56 */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x64, RFREGOFFSETMASK, 0x19aac);
-	/* PGA gain: RF reg8f[14:13] */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x8f, RFREGOFFSETMASK, 0x8a001);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* DPK setting */
-	odm_write_4byte(dm, 0xe94, 0xf76c9f84);
-	odm_write_4byte(dm, 0xec8, 0x000c5599);
-	odm_write_4byte(dm, 0xec4, 0x11838000);
-
-	/* 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-	odm_write_4byte(dm, 0xe90, 0x0101f018);
-
-	/* one shot */
-	odm_write_4byte(dm, 0xec8, 0x800c5599);
-	odm_write_4byte(dm, 0xec8, 0x000c5599);
-	/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-	delay_ms(50);
-
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, 0x33d8d);
-
-
-	tmp_lb_gain = _compute_loop_back_gain_path_b(dm);
-
-	if (tmp_lb_gain < 263390) {
-		/* coarse tune loopback gain by RF reg8f[14:13] = 2b'11 */
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x8f, RFREGOFFSETMASK, 0x8e001);
-		_fine_tune_loop_back_gain_path_b(dm, cali_info->dpk_tx_agc);
-	} else if (tmp_lb_gain > 661607) {
-		/* coarse tune loopback gain by RF reg8f[14:13] = 2b'00 */
-		odm_set_rf_reg(dm, RF_PATH_B, RF_0x8f, RFREGOFFSETMASK, 0x88001);
-		_fine_tune_loop_back_gain_path_b(dm, cali_info->dpk_tx_agc);
-	} else
-		cali_info->is_dpk_fail = false;/* Go to DPK Phase 4 */
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_AdjustRFGainByFoundTxAGC\n");
-
-	return cali_info->is_dpk_fail ? false : true;
-
-}
-
-
-void
-_dpk_do_auto_dpk_path_b(
-	struct dm_struct	*dm
-)
-{
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
-	u32 tmp_lb_gain = 0, reg0xd40 = 0;
-
-	RF_DBG(dm, DBG_RF_IQK, "===> _DPK_DoAutoDPK\n");
-
-
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	/* RF setting, 此處RF reg00, 與 DPK Phase 3 一致 */
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, cali_info->dpk_tx_agc);
-	/* Baseband data rate setting */
-	odm_write_4byte(dm, 0xe20, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe24, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe28, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe2c, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe30, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe34, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe38, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe3c, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe40, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe44, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe48, 0x3c3c3c3c);
-	odm_write_4byte(dm, 0xe4c, 0x3c3c3c3c);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-
-	/* DPK setting */
-	odm_write_4byte(dm, 0xe94, 0xf76C9f84);
-	odm_write_4byte(dm, 0xec8, 0x400C5599);
-	odm_write_4byte(dm, 0xec4, 0x11938080);    /* 0xec4[9:4]= DPk fail threshold */
-
-	if (36 <= *(dm->channel) && *(dm->channel) <= 53) /* Channelchannel at low band) */
-		/* r_agc */
-		odm_write_4byte(dm, 0xebc, 0x00022a1f);
-	else
-		/* r_agc */
-		odm_write_4byte(dm, 0xebc, 0x00009dbf);
-
-	/* 注意page c1的c90在DPK過程中千萬不能被其他thread or process改寫成page c的c90值 */
-	odm_write_4byte(dm, 0xe90, 0x0101f018); /* TODO: 0xe90(rA_LSSIWrite_Jaguar) can not be overwritten. */
-
-	/* one shot */
-	odm_write_4byte(dm, 0xec8, 0xc00c5599);
-	odm_write_4byte(dm, 0xec8, 0x400c5599);
-	/* delay 50 ms,讓 delay 時間長一點, 確定 PA Scan function 有做完 */
-	delay_ms(50);
-
-	/* reg82c[31] = 0 --> 切到 page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-	/* T-meter RFReg42[17] = 1 to enable read T-meter, [15:10] ' T-meter value */
-	odm_set_rf_reg(dm, RF_PATH_A, RF_0x42, BIT(17), 1);
-	cali_info->dpk_thermal[RF_PATH_B] = odm_get_rf_reg(dm, RF_PATH_A, RF_0x42, 0xFC00);					/* 讀出42[15:10] 值並存到變數TMeter */
-	dbg_print("cali_info->dpk_thermal[RF_PATH_B] = 0x%X\n", cali_info->dpk_thermal[RF_PATH_B]);
-	odm_set_rf_reg(dm, RF_PATH_B, RF_0x00, RFREGOFFSETMASK, 0x33D8D);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
-	/* read back dp_fail report */
-	odm_write_4byte(dm, 0xeb8, 0x00000000);
-	/* dp_fail這個bit在d40[6], 當 d40[6] = 1, 表示calibration失敗. */
-	reg0xd40 = odm_read_4byte(dm, 0xd40);
-
-	if ((reg0xd40 & BIT(6)) == BIT(6)) {
-		/* printf('DPK fail') */
-		cali_info->is_dpk_fail = true;
-		/* Go to DPK Phase 5 */
-	} else {
-		/* printf('DPK success') */
+	unsigned long value, timeout;
+
+	/* wake up in normal mode */
+	value = tegra_sor_readl(sor, SOR_SUPER_STATE1);
+	value |= SOR_SUPER_STATE_HEAD_MODE_AWAKE;
+	value |= SOR_SUPER_STATE_MODE_NORMAL;
+	tegra_sor_writel(sor, value, SOR_SUPER_STATE1);
+	tegra_sor_super_update(sor);
+
+	/* attach */
+	value = tegra_sor_readl(sor, SOR_SUPER_STATE1);
+	value |= SOR_SUPER_STATE_ATTACHED;
+	tegra_sor_writel(sor, value, SOR_SUPER_STATE1);
+	tegra_sor_super_update(sor);
+
+	timeout = jiffies + msecs_to_jiffies(250);
+
+	while (time_before(jiffies, timeout)) {
+		value = tegra_sor_readl(sor, SOR_TEST);
+		if ((value & SOR_TEST_ATTACHED) != 0)
+			return 0;
+
+		usleep_range(25, 100);
 	}
 
-
-	/* read back */
-	odm_write_4byte(dm, 0xe90, 0x0201f01f);
-	odm_write_4byte(dm, 0xeb8, 0x0c000000);
-
-	/* reg82c[31] = 1 --> 切到 page C1 */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
-
-	/* 計算tmpGainLoss 用到的function hex2dec() 是將 twos complement的十六進位轉成十進位, 十六進位的格式為s11.9 */
-	/* 舉例1, d00[10:0] = h'3ff, 經過 hex2dec(h'3ff) = 1023, */
-	/* 舉例2, d00[10:0] = h'400, 經過 hex2dec(h'400) = -1024, */
-	/* 舉例3, d00[10:0] = h'0A9, 經過 hex2dec(h'0A9) = 169, */
-	/* 舉例4, d00[10:0] = h'54c, 經過 hex2dec(h'54c) = -692, */
-	/* 舉例4, d00[10:0] = h'7ff, 經過 hex2dec(h'7ff) = -1, */
-	tmp_lb_gain = _compute_loop_back_gain_path_b(dm);
-
-
-	/* Gain Scaling */
-	if (227007 < tmp_lb_gain)
-		cali_info->dpk_gain = 0x43ca43ca;
-	else if (214309 < tmp_lb_gain && tmp_lb_gain <= 227007)
-		cali_info->dpk_gain = 0x45c545c5;
-	else if (202321 < tmp_lb_gain && tmp_lb_gain <= 214309)
-		cali_info->dpk_gain = 0x47cf47cf;
-	else if (191003 < tmp_lb_gain && tmp_lb_gain <= 202321)
-		cali_info->dpk_gain = 0x49e749e7;
-	else if (180318 < tmp_lb_gain && tmp_lb_gain <= 191003)
-		cali_info->dpk_gain = 0x4c104c10;
-	else if (170231 < tmp_lb_gain && tmp_lb_gain <= 180318)
-		cali_info->dpk_gain = 0x4e494e49;
-	else if (160709 < tmp_lb_gain && tmp_lb_gain <= 170231)
-		cali_info->dpk_gain = 0x50925092;
-	else if (151719 < tmp_lb_gain && tmp_lb_gain <= 160709)
-		cali_info->dpk_gain = 0x52ec52ec;
-	else if (151719 <= tmp_lb_gain)
-		cali_info->dpk_gain = 0x55585558;
-
-	RF_DBG(dm, DBG_RF_IQK, "<=== _DPK_DoAutoDPK\n");
+	return -ETIMEDOUT;
 }
 
-
-void
-_dpk_enable_dp_path_b(
-	struct dm_struct	*dm
-)
+static int tegra_sor_wakeup(struct tegra_sor *sor)
 {
-	struct dm_rf_calibration_struct  *cali_info = &(dm->rf_calibrate_info);
+	unsigned long value, timeout;
 
-	RF_DBG(dm, DBG_RF_IQK, "===> _dpk_enable_dp\n");
+	timeout = jiffies + msecs_to_jiffies(250);
 
-	/* [31] = 1 --> switch to page C1 */
-	odm_write_4byte(dm, 0x82c, 0x802083dd);
+	/* wait for head to wake up */
+	while (time_before(jiffies, timeout)) {
+		value = tegra_sor_readl(sor, SOR_TEST);
+		value &= SOR_TEST_HEAD_MODE_MASK;
 
-	/* enable IQC matrix --> 因為 BB 信號會先經過 predistortion module, 才經過 IQC matrix 到 DAC 打出去 */
-	/* 所以要先 enable predistortion module {c90[7] = 1 (enable_predis) cc4[18] = 1 (確定讓 IQK/DPK module 有clock), cc8[29] = 1 (一個IQK/DPK module 裡的mux, 確認 data path 走IQK/DPK)} */
-	odm_write_4byte(dm, 0xe90, 0x0000f098);
-	odm_write_4byte(dm, 0xe94, 0x776d9f84);
-	odm_write_4byte(dm, 0xec8, 0x20000000);
-	odm_write_4byte(dm, 0xe8c, 0x3c000000);
-	/* r_bnd */
-	odm_write_4byte(dm, 0xeb8, 0x000fffff);
+		if (value == SOR_TEST_HEAD_MODE_AWAKE)
+			return 0;
 
-	if (cali_info->is_dpk_fail) {
-		/* cc4[29] = 1 (bypass DP LUT) */
-		odm_write_4byte(dm, 0xe98, 0x40004000);
-		odm_write_4byte(dm, 0xec4, 0x28840000);
-	} else {
-		odm_write_4byte(dm, 0xe98, cali_info->dpk_gain);
-		odm_write_4byte(dm, 0xec4, 0x08840000);
-
-		/* PWSF */
-		/* 寫PWSF table in 1st SRAM for PA = 11 use */
-		odm_write_4byte(dm, 0xe20, 0x00000800);
-
-		/* ******************************************************* */
-		/* 0xee4[0]是write enable，0xee4[7:1]是address，0xee4[15:8]和0xee4[23:16]對應到TX index， */
-		/* 若位置為0(0xee4[7:1] = 0x0)此時0xee4[15:8]對應到的TX RF index 是0x1f,， */
-		/* 0xee4[23:16]對應到的是0x1e，若位置為1(0xee4[7:1] = 0x1)，此時0xee4 [15:8]對應到0x1d， */
-		/* 0xee4[23:16]對應0x1c，其他依此類推，每個data欄位都是相差1dB。若gainloss找到的RF TX index=0x18， */
-		/* 則在0xee4 address對應到0x18的地方要填0x40(也就是0dB)，其他則照下面table的順序每格1dB依序排列 */
-		/* 將所有的0xee4c的data欄位都填入相對應的值。 */
-		/* ************************************************************* */
-
-		{
-			const s32 LEN = 25;
-			u32 base_idx = 6; /* 0 dB: 0x40 */
-			u32 table_pwsf[] = {
-				0xff, 0xca, 0xa1, 0x80, 0x65, 0x51, 0x40/* 0 dB */,
-				0x33, 0x28, 0x20, 0x19, 0x14, 0x10,
-				0x0d, 0x0a, 0x08, 0x06, 0x05, 0x04,
-				0x03, 0x03, 0x02, 0x02, 0x01, 0x01
-			};
-
-			u32 center_tx_idx = cali_info->dpk_tx_agc & 0x1F;
-			u32 center_addr = (0x1F - center_tx_idx) / 2;
-			s32 i = 0, j = 0, value = 0, start_idx = 0;
-
-			/* Upper */
-			start_idx = (((0x1F - center_tx_idx) % 2 == 0) ? base_idx + 1 : base_idx);
-
-			for (i = start_idx, j = 0; (center_addr - j + 1) >= 1; i -= 2, j++) {
-				if (i - 1 < 0)
-					value = (table_pwsf[0] << 16) | (table_pwsf[0] << 8) | ((center_addr - j) << 1) | 0x1;
-				else
-					value = (table_pwsf[i] << 16) | (table_pwsf[i - 1] << 8) | ((center_addr - j) << 1) | 0x1;
-
-				odm_write_4byte(dm, 0xee4, value);
-				odm_write_1byte(dm, 0xee4, 0x0);		/* write disable */
-			}
-
-			/* Lower */
-			start_idx = (((0x1F - center_tx_idx) % 2 == 0) ? base_idx + 2 : base_idx + 1);
-			center_addr++; /* Skip center_tx_idx */
-			for (i = start_idx, j = 0; (center_addr + j) < 16; i += 2, j++) { /* Total: 16*2 = 32 values (Upper+Lower) */
-				if (i + 1 >= LEN)
-					value = (table_pwsf[LEN - 1] << 16) | (table_pwsf[LEN - 1] << 8) | ((center_addr + j) << 1) | 0x1;
-				else
-					value = (table_pwsf[i + 1] << 16) | (table_pwsf[i] << 8) | ((center_addr + j) << 1) | 0x1;
-				odm_write_4byte(dm, 0xee4, value);
-				odm_write_1byte(dm, 0xee4, 0x0);		/* write disable */
-			}
-		}
+		usleep_range(25, 100);
 	}
-	/* [31] = 0 --> switch to page C */
-	odm_write_4byte(dm, 0x82c, 0x002083dd);
 
-	RF_DBG(dm, DBG_RF_IQK, "<=== _dpk_enable_dp\n");
-
+	return -ETIMEDOUT;
 }
 
-
-
-
-
-void
-_phy_dp_calibrate_path_b_8812a(
-	struct dm_struct	*dm
-)
+static int tegra_sor_power_up(struct tegra_sor *sor, unsigned long timeout)
 {
-	u32 backup_mac_bb_reg_addrs[] = {
-		0xE60, 0xE64, 0xC68, 0x82C, 0x838, 0x90C, 0x522, 0xE00, 0xE20, 0xE24, /* 10 */
-		0xE28, 0xE2C, 0xE30, 0xE34, 0xE38, 0xE3C, 0xE40, 0xE44, 0xE48, 0xE4C, /* 20 */
-		0xE94, 0xEB0, 0xEB4
-	};
-	u32 backup_rf_reg_addrs[] = {0x00, 0x64, 0x8F};
+	u32 value;
 
-	u32 backup_mac_bb_reg_data[sizeof(backup_mac_bb_reg_addrs) / sizeof(u32)];
-	u32 backup_rf_reg_data_a[sizeof(backup_rf_reg_addrs) / sizeof(u32)];
-	/* u32 backupRFRegData_B[sizeof(backup_rf_reg_addrs)/sizeof(u32)]; */
+	value = tegra_sor_readl(sor, SOR_PWR);
+	value |= SOR_PWR_TRIGGER | SOR_PWR_NORMAL_STATE_PU;
+	tegra_sor_writel(sor, value, SOR_PWR);
 
+	timeout = jiffies + msecs_to_jiffies(timeout);
 
-	_dpk_mac_bb_backup_path_b(dm, backup_mac_bb_reg_addrs, backup_mac_bb_reg_data, sizeof(backup_mac_bb_reg_addrs) / sizeof(u32));
-	_dpk_rf_backup_path_b(dm, backup_rf_reg_addrs, RF_PATH_B, backup_rf_reg_data_a, sizeof(backup_rf_reg_addrs) / sizeof(u32));
+	while (time_before(jiffies, timeout)) {
+		value = tegra_sor_readl(sor, SOR_PWR);
+		if ((value & SOR_PWR_TRIGGER) == 0)
+			return 0;
 
-	_dpk_init_path_b(dm);
-
-	if (_dpk_adjust_rf_gain_path_b(dm)) {               /* Phase 1 */
-		_dpk_gain_loss_to_find_tx_agc_path_b(dm);          /* Phase 2 */
-		if (_dpk_adjust_rf_gain_by_found_tx_agc_path_b(dm)) /* Phase 3 */
-			_dpk_do_auto_dpk_path_b(dm);                /* Phase 4 */
+		usleep_range(25, 100);
 	}
-	_dpk_enable_dp_path_b(dm);                         /* Phase 5 */
 
-	_dpk_mac_bb_restore_path_b(dm, backup_mac_bb_reg_addrs, backup_mac_bb_reg_data, sizeof(backup_mac_bb_reg_addrs) / sizeof(u32));
-	_dpk_rf_restore_path_b(dm, backup_rf_reg_addrs, RF_PATH_B, backup_rf_reg_data_a, sizeof(backup_rf_reg_addrs) / sizeof(u32));
+	return -ETIMEDOUT;
 }
-#endif
-void
-phy_dp_calibrate_8812a(
-	struct dm_struct	*dm
-)
-{
-#if 0	
 
-	struct _hal_rf_		*rf = &(dm->rf_table);
-	
-	rf->dpk_done = true;
-	RF_DBG(dm, DBG_RF_IQK, "===> phy_dp_calibrate_8812a\n");
-	_phy_dp_calibrate_path_a_8812a(dm);
-	_phy_dp_calibrate_path_b_8812a(dm);
-	RF_DBG(dm, DBG_RF_IQK, "<=== phy_dp_calibrate_8812a\n");
-#endif
-}
-#endif
+struct tegra_sor_params {
+	/* number of link clocks per line */
+	unsigned int num_clocks;
+	/* ratio between input and output */
+	u64 ratio;
+	/* precision factor */
+	u64 precision;
+
+	unsigned int active_polarity;
+	unsigned int active_count;
+	unsigned int active_frac;
+	unsigned int tu_size;
+	unsigned int error;
+};
+
+static int tegra_sor_compute_params(s

@@ -1,1805 +1,1173 @@
+>index;
+	unsigned long val;
+	int err;
+	u16 speed;
+
+	err = kstrtoul(buf, 10, &val);
+	if (err < 0)
+		return err;
+
+	val = clamp_val(val, 0, 1350000U);
+	speed = fan_to_reg(val, data->fan_div[nr]);
+
+	mutex_lock(&data->update_lock);
+	data->target_speed[nr] = speed;
+	pwm_update_registers(data, nr);
+	mutex_unlock(&data->update_lock);
+	return count;
+}
+
+static ssize_t
+show_temp_tolerance(struct device *dev, struct device_attribute *attr,
+		    char *buf)
+{
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int index = sattr->index;
+
+	return sprintf(buf, "%d\n", data->temp_tolerance[index][nr] * 1000);
+}
+
+static ssize_t
+store_temp_tolerance(struct device *dev, struct device_attribute *attr,
+		     const char *buf, size_t count)
+{
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int index = sattr->index;
+	unsigned long val;
+	int err;
+
+	err = kstrtoul(buf, 10, &val);
+	if (err < 0)
+		return err;
+
+	/* Limit tolerance as needed */
+	val = clamp_val(DIV_ROUND_CLOSEST(val, 1000), 0, data->tolerance_mask);
+
+	mutex_lock(&data->update_lock);
+	data->temp_tolerance[index][nr] = val;
+	if (index)
+		pwm_update_registers(data, nr);
+	else
+		nct6775_write_value(data,
+				    data->REG_CRITICAL_TEMP_TOLERANCE[nr],
+				    val);
+	mutex_unlock(&data->update_lock);
+	return count;
+}
+
 /*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2003-2012, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
+ * Fan speed tolerance is a tricky beast, since the associated register is
+ * a tick counter, but the value is reported and configured as rpm.
+ * Compute resulting low and high rpm values and report the difference.
  */
-
-#include <linux/sched.h>
-#include <linux/wait.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
-#include <linux/pm_runtime.h>
-
-#include <linux/mei.h>
-
-#include "mei_dev.h"
-#include "hbm.h"
-#include "client.h"
-
-/**
- * mei_me_cl_init - initialize me client
- *
- * @me_cl: me client
- */
-void mei_me_cl_init(struct mei_me_client *me_cl)
+static ssize_t
+show_speed_tolerance(struct device *dev, struct device_attribute *attr,
+		     char *buf)
 {
-	INIT_LIST_HEAD(&me_cl->list);
-	kref_init(&me_cl->refcnt);
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
+	int nr = sattr->index;
+	int low = data->target_speed[nr] - data->target_speed_tolerance[nr];
+	int high = data->target_speed[nr] + data->target_speed_tolerance[nr];
+	int tolerance;
+
+	if (low <= 0)
+		low = 1;
+	if (high > 0xffff)
+		high = 0xffff;
+	if (high < low)
+		high = low;
+
+	tolerance = (fan_from_reg16(low, data->fan_div[nr])
+		     - fan_from_reg16(high, data->fan_div[nr])) / 2;
+
+	return sprintf(buf, "%d\n", tolerance);
 }
 
-/**
- * mei_me_cl_get - increases me client refcount
- *
- * @me_cl: me client
- *
- * Locking: called under "dev->device_lock" lock
- *
- * Return: me client or NULL
- */
-struct mei_me_client *mei_me_cl_get(struct mei_me_client *me_cl)
+static ssize_t
+store_speed_tolerance(struct device *dev, struct device_attribute *attr,
+		      const char *buf, size_t count)
 {
-	if (me_cl && kref_get_unless_zero(&me_cl->refcnt))
-		return me_cl;
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
+	int nr = sattr->index;
+	unsigned long val;
+	int err;
+	int low, high;
 
-	return NULL;
+	err = kstrtoul(buf, 10, &val);
+	if (err < 0)
+		return err;
+
+	high = fan_from_reg16(data->target_speed[nr],
+			      data->fan_div[nr]) + val;
+	low = fan_from_reg16(data->target_speed[nr],
+			     data->fan_div[nr]) - val;
+	if (low <= 0)
+		low = 1;
+	if (high < low)
+		high = low;
+
+	val = (fan_to_reg(low, data->fan_div[nr]) -
+	       fan_to_reg(high, data->fan_div[nr])) / 2;
+
+	/* Limit tolerance as needed */
+	val = clamp_val(val, 0, data->speed_tolerance_limit);
+
+	mutex_lock(&data->update_lock);
+	data->target_speed_tolerance[nr] = val;
+	pwm_update_registers(data, nr);
+	mutex_unlock(&data->update_lock);
+	return count;
 }
 
-/**
- * mei_me_cl_release - free me client
- *
- * Locking: called under "dev->device_lock" lock
- *
- * @ref: me_client refcount
- */
-static void mei_me_cl_release(struct kref *ref)
-{
-	struct mei_me_client *me_cl =
-		container_of(ref, struct mei_me_client, refcnt);
+SENSOR_TEMPLATE_2(pwm, "pwm%d", S_IWUSR | S_IRUGO, show_pwm, store_pwm, 0, 0);
+SENSOR_TEMPLATE(pwm_mode, "pwm%d_mode", S_IWUSR | S_IRUGO, show_pwm_mode,
+		store_pwm_mode, 0);
+SENSOR_TEMPLATE(pwm_enable, "pwm%d_enable", S_IWUSR | S_IRUGO, show_pwm_enable,
+		store_pwm_enable, 0);
+SENSOR_TEMPLATE(pwm_temp_sel, "pwm%d_temp_sel", S_IWUSR | S_IRUGO,
+		show_pwm_temp_sel, store_pwm_temp_sel, 0);
+SENSOR_TEMPLATE(pwm_target_temp, "pwm%d_target_temp", S_IWUSR | S_IRUGO,
+		show_target_temp, store_target_temp, 0);
+SENSOR_TEMPLATE(fan_target, "fan%d_target", S_IWUSR | S_IRUGO,
+		show_target_speed, store_target_speed, 0);
+SENSOR_TEMPLATE(fan_tolerance, "fan%d_tolerance", S_IWUSR | S_IRUGO,
+		show_speed_tolerance, store_speed_tolerance, 0);
 
-	kfree(me_cl);
+/* Smart Fan registers */
+
+static ssize_t
+show_weight_temp(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int index = sattr->index;
+
+	return sprintf(buf, "%d\n", data->weight_temp[index][nr] * 1000);
 }
 
-/**
- * mei_me_cl_put - decrease me client refcount and free client if necessary
- *
- * Locking: called under "dev->device_lock" lock
- *
- * @me_cl: me client
- */
-void mei_me_cl_put(struct mei_me_client *me_cl)
+static ssize_t
+store_weight_temp(struct device *dev, struct device_attribute *attr,
+		  const char *buf, size_t count)
 {
-	if (me_cl)
-		kref_put(&me_cl->refcnt, mei_me_cl_release);
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int index = sattr->index;
+	unsigned long val;
+	int err;
+
+	err = kstrtoul(buf, 10, &val);
+	if (err < 0)
+		return err;
+
+	val = clamp_val(DIV_ROUND_CLOSEST(val, 1000), 0, 255);
+
+	mutex_lock(&data->update_lock);
+	data->weight_temp[index][nr] = val;
+	nct6775_write_value(data, data->REG_WEIGHT_TEMP[index][nr], val);
+	mutex_unlock(&data->update_lock);
+	return count;
 }
 
-/**
- * __mei_me_cl_del  - delete me client from the list and decrease
- *     reference counter
- *
- * @dev: mei device
- * @me_cl: me client
- *
- * Locking: dev->me_clients_rwsem
- */
-static void __mei_me_cl_del(struct mei_device *dev, struct mei_me_client *me_cl)
-{
-	if (!me_cl)
-		return;
+SENSOR_TEMPLATE(pwm_weight_temp_sel, "pwm%d_weight_temp_sel", S_IWUSR | S_IRUGO,
+		  show_pwm_weight_temp_sel, store_pwm_weight_temp_sel, 0);
+SENSOR_TEMPLATE_2(pwm_weight_temp_step, "pwm%d_weight_temp_step",
+		  S_IWUSR | S_IRUGO, show_weight_temp, store_weight_temp, 0, 0);
+SENSOR_TEMPLATE_2(pwm_weight_temp_step_tol, "pwm%d_weight_temp_step_tol",
+		  S_IWUSR | S_IRUGO, show_weight_temp, store_weight_temp, 0, 1);
+SENSOR_TEMPLATE_2(pwm_weight_temp_step_base, "pwm%d_weight_temp_step_base",
+		  S_IWUSR | S_IRUGO, show_weight_temp, store_weight_temp, 0, 2);
+SENSOR_TEMPLATE_2(pwm_weight_duty_step, "pwm%d_weight_duty_step",
+		  S_IWUSR | S_IRUGO, show_pwm, store_pwm, 0, 5);
+SENSOR_TEMPLATE_2(pwm_weight_duty_base, "pwm%d_weight_duty_base",
+		  S_IWUSR | S_IRUGO, show_pwm, store_pwm, 0, 6);
 
-	list_del_init(&me_cl->list);
-	mei_me_cl_put(me_cl);
+static ssize_t
+show_fan_time(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int index = sattr->index;
+
+	return sprintf(buf, "%d\n",
+		       step_time_from_reg(data->fan_time[index][nr],
+					  data->pwm_mode[nr]));
 }
 
-/**
- * mei_me_cl_del - delete me client from the list and decrease
- *     reference counter
- *
- * @dev: mei device
- * @me_cl: me client
- */
-void mei_me_cl_del(struct mei_device *dev, struct mei_me_client *me_cl)
+static ssize_t
+store_fan_time(struct device *dev, struct device_attribute *attr,
+	       const char *buf, size_t count)
 {
-	down_write(&dev->me_clients_rwsem);
-	__mei_me_cl_del(dev, me_cl);
-	up_write(&dev->me_clients_rwsem);
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int index = sattr->index;
+	unsigned long val;
+	int err;
+
+	err = kstrtoul(buf, 10, &val);
+	if (err < 0)
+		return err;
+
+	val = step_time_to_reg(val, data->pwm_mode[nr]);
+	mutex_lock(&data->update_lock);
+	data->fan_time[index][nr] = val;
+	nct6775_write_value(data, data->REG_FAN_TIME[index][nr], val);
+	mutex_unlock(&data->update_lock);
+	return count;
 }
 
-/**
- * mei_me_cl_add - add me client to the list
- *
- * @dev: mei device
- * @me_cl: me client
- */
-void mei_me_cl_add(struct mei_device *dev, struct mei_me_client *me_cl)
+static ssize_t
+show_auto_pwm(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	down_write(&dev->me_clients_rwsem);
-	list_add(&me_cl->list, &dev->me_clients);
-	up_write(&dev->me_clients_rwsem);
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+
+	return sprintf(buf, "%d\n", data->auto_pwm[sattr->nr][sattr->index]);
 }
 
-/**
- * __mei_me_cl_by_uuid - locate me client by uuid
- *	increases ref count
- *
- * @dev: mei device
- * @uuid: me client uuid
- *
- * Return: me client or NULL if not found
- *
- * Locking: dev->me_clients_rwsem
- */
-static struct mei_me_client *__mei_me_cl_by_uuid(struct mei_device *dev,
-					const uuid_le *uuid)
+static ssize_t
+store_auto_pwm(struct device *dev, struct device_attribute *attr,
+	       const char *buf, size_t count)
 {
-	struct mei_me_client *me_cl;
-	const uuid_le *pn;
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int point = sattr->index;
+	unsigned long val;
+	int err;
+	u8 reg;
 
-	WARN_ON(!rwsem_is_locked(&dev->me_clients_rwsem));
+	err = kstrtoul(buf, 10, &val);
+	if (err < 0)
+		return err;
+	if (val > 255)
+		return -EINVAL;
 
-	list_for_each_entry(me_cl, &dev->me_clients, list) {
-		pn = &me_cl->props.protocol_name;
-		if (uuid_le_cmp(*uuid, *pn) == 0)
-			return mei_me_cl_get(me_cl);
+	if (point == data->auto_pwm_num) {
+		if (data->kind != nct6775 && !val)
+			return -EINVAL;
+		if (data->kind != nct6779 && val)
+			val = 0xff;
 	}
 
-	return NULL;
-}
-
-/**
- * mei_me_cl_by_uuid - locate me client by uuid
- *	increases ref count
- *
- * @dev: mei device
- * @uuid: me client uuid
- *
- * Return: me client or NULL if not found
- *
- * Locking: dev->me_clients_rwsem
- */
-struct mei_me_client *mei_me_cl_by_uuid(struct mei_device *dev,
-					const uuid_le *uuid)
-{
-	struct mei_me_client *me_cl;
-
-	down_read(&dev->me_clients_rwsem);
-	me_cl = __mei_me_cl_by_uuid(dev, uuid);
-	up_read(&dev->me_clients_rwsem);
-
-	return me_cl;
-}
-
-/**
- * mei_me_cl_by_id - locate me client by client id
- *	increases ref count
- *
- * @dev: the device structure
- * @client_id: me client id
- *
- * Return: me client or NULL if not found
- *
- * Locking: dev->me_clients_rwsem
- */
-struct mei_me_client *mei_me_cl_by_id(struct mei_device *dev, u8 client_id)
-{
-
-	struct mei_me_client *__me_cl, *me_cl = NULL;
-
-	down_read(&dev->me_clients_rwsem);
-	list_for_each_entry(__me_cl, &dev->me_clients, list) {
-		if (__me_cl->client_id == client_id) {
-			me_cl = mei_me_cl_get(__me_cl);
+	mutex_lock(&data->update_lock);
+	data->auto_pwm[nr][point] = val;
+	if (point < data->auto_pwm_num) {
+		nct6775_write_value(data,
+				    NCT6775_AUTO_PWM(data, nr, point),
+				    data->auto_pwm[nr][point]);
+	} else {
+		switch (data->kind) {
+		case nct6775:
+			/* disable if needed (pwm == 0) */
+			reg = nct6775_read_value(data,
+						 NCT6775_REG_CRITICAL_ENAB[nr]);
+			if (val)
+				reg |= 0x02;
+			else
+				reg &= ~0x02;
+			nct6775_write_value(data, NCT6775_REG_CRITICAL_ENAB[nr],
+					    reg);
+			break;
+		case nct6776:
+			break; /* always enabled, nothing to do */
+		case nct6106:
+		case nct6779:
+		case nct6791:
+		case nct6792:
+		case nct6793:
+			nct6775_write_value(data, data->REG_CRITICAL_PWM[nr],
+					    val);
+			reg = nct6775_read_value(data,
+					data->REG_CRITICAL_PWM_ENABLE[nr]);
+			if (val == 255)
+				reg &= ~data->CRITICAL_PWM_ENABLE_MASK;
+			else
+				reg |= data->CRITICAL_PWM_ENABLE_MASK;
+			nct6775_write_value(data,
+					    data->REG_CRITICAL_PWM_ENABLE[nr],
+					    reg);
 			break;
 		}
 	}
-	up_read(&dev->me_clients_rwsem);
-
-	return me_cl;
+	mutex_unlock(&data->update_lock);
+	return count;
 }
 
-/**
- * __mei_me_cl_by_uuid_id - locate me client by client id and uuid
- *	increases ref count
- *
- * @dev: the device structure
- * @uuid: me client uuid
- * @client_id: me client id
- *
- * Return: me client or null if not found
- *
- * Locking: dev->me_clients_rwsem
- */
-static struct mei_me_client *__mei_me_cl_by_uuid_id(struct mei_device *dev,
-					   const uuid_le *uuid, u8 client_id)
+static ssize_t
+show_auto_temp(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	struct mei_me_client *me_cl;
-	const uuid_le *pn;
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int point = sattr->index;
 
-	WARN_ON(!rwsem_is_locked(&dev->me_clients_rwsem));
-
-	list_for_each_entry(me_cl, &dev->me_clients, list) {
-		pn = &me_cl->props.protocol_name;
-		if (uuid_le_cmp(*uuid, *pn) == 0 &&
-		    me_cl->client_id == client_id)
-			return mei_me_cl_get(me_cl);
-	}
-
-	return NULL;
+	/*
+	 * We don't know for sure if the temperature is signed or unsigned.
+	 * Assume it is unsigned.
+	 */
+	return sprintf(buf, "%d\n", data->auto_temp[nr][point] * 1000);
 }
 
-
-/**
- * mei_me_cl_by_uuid_id - locate me client by client id and uuid
- *	increases ref count
- *
- * @dev: the device structure
- * @uuid: me client uuid
- * @client_id: me client id
- *
- * Return: me client or null if not found
- */
-struct mei_me_client *mei_me_cl_by_uuid_id(struct mei_device *dev,
-					   const uuid_le *uuid, u8 client_id)
+static ssize_t
+store_auto_temp(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
 {
-	struct mei_me_client *me_cl;
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
+	int nr = sattr->nr;
+	int point = sattr->index;
+	unsigned long val;
+	int err;
 
-	down_read(&dev->me_clients_rwsem);
-	me_cl = __mei_me_cl_by_uuid_id(dev, uuid, client_id);
-	up_read(&dev->me_clients_rwsem);
-
-	return me_cl;
-}
-
-/**
- * mei_me_cl_rm_by_uuid - remove all me clients matching uuid
- *
- * @dev: the device structure
- * @uuid: me client uuid
- *
- * Locking: called under "dev->device_lock" lock
- */
-void mei_me_cl_rm_by_uuid(struct mei_device *dev, const uuid_le *uuid)
-{
-	struct mei_me_client *me_cl;
-
-	dev_dbg(dev->dev, "remove %pUl\n", uuid);
-
-	down_write(&dev->me_clients_rwsem);
-	me_cl = __mei_me_cl_by_uuid(dev, uuid);
-	__mei_me_cl_del(dev, me_cl);
-	mei_me_cl_put(me_cl);
-	up_write(&dev->me_clients_rwsem);
-}
-
-/**
- * mei_me_cl_rm_by_uuid_id - remove all me clients matching client id
- *
- * @dev: the device structure
- * @uuid: me client uuid
- * @id: me client id
- *
- * Locking: called under "dev->device_lock" lock
- */
-void mei_me_cl_rm_by_uuid_id(struct mei_device *dev, const uuid_le *uuid, u8 id)
-{
-	struct mei_me_client *me_cl;
-
-	dev_dbg(dev->dev, "remove %pUl %d\n", uuid, id);
-
-	down_write(&dev->me_clients_rwsem);
-	me_cl = __mei_me_cl_by_uuid_id(dev, uuid, id);
-	__mei_me_cl_del(dev, me_cl);
-	mei_me_cl_put(me_cl);
-	up_write(&dev->me_clients_rwsem);
-}
-
-/**
- * mei_me_cl_rm_all - remove all me clients
- *
- * @dev: the device structure
- *
- * Locking: called under "dev->device_lock" lock
- */
-void mei_me_cl_rm_all(struct mei_device *dev)
-{
-	struct mei_me_client *me_cl, *next;
-
-	down_write(&dev->me_clients_rwsem);
-	list_for_each_entry_safe(me_cl, next, &dev->me_clients, list)
-		__mei_me_cl_del(dev, me_cl);
-	up_write(&dev->me_clients_rwsem);
-}
-
-/**
- * mei_cl_cmp_id - tells if the clients are the same
- *
- * @cl1: host client 1
- * @cl2: host client 2
- *
- * Return: true  - if the clients has same host and me ids
- *         false - otherwise
- */
-static inline bool mei_cl_cmp_id(const struct mei_cl *cl1,
-				const struct mei_cl *cl2)
-{
-	return cl1 && cl2 &&
-		(cl1->host_client_id == cl2->host_client_id) &&
-		(mei_cl_me_id(cl1) == mei_cl_me_id(cl2));
-}
-
-/**
- * mei_io_cb_free - free mei_cb_private related memory
- *
- * @cb: mei callback struct
- */
-void mei_io_cb_free(struct mei_cl_cb *cb)
-{
-	if (cb == NULL)
-		return;
-
-	list_del(&cb->list);
-	kfree(cb->buf.data);
-	kfree(cb);
-}
-
-/**
- * mei_io_cb_init - allocate and initialize io callback
- *
- * @cl: mei client
- * @type: operation type
- * @fp: pointer to file structure
- *
- * Return: mei_cl_cb pointer or NULL;
- */
-struct mei_cl_cb *mei_io_cb_init(struct mei_cl *cl, enum mei_cb_file_ops type,
-				 struct file *fp)
-{
-	struct mei_cl_cb *cb;
-
-	cb = kzalloc(sizeof(struct mei_cl_cb), GFP_KERNEL);
-	if (!cb)
-		return NULL;
-
-	INIT_LIST_HEAD(&cb->list);
-	cb->file_object = fp;
-	cb->cl = cl;
-	cb->buf_idx = 0;
-	cb->fop_type = type;
-	return cb;
-}
-
-/**
- * __mei_io_list_flush - removes and frees cbs belonging to cl.
- *
- * @list:  an instance of our list structure
- * @cl:    host client, can be NULL for flushing the whole list
- * @free:  whether to free the cbs
- */
-static void __mei_io_list_flush(struct mei_cl_cb *list,
-				struct mei_cl *cl, bool free)
-{
-	struct mei_cl_cb *cb, *next;
-
-	/* enable removing everything if no cl is specified */
-	list_for_each_entry_safe(cb, next, &list->list, list) {
-		if (!cl || mei_cl_cmp_id(cl, cb->cl)) {
-			list_del_init(&cb->list);
-			if (free)
-				mei_io_cb_free(cb);
-		}
-	}
-}
-
-/**
- * mei_io_list_flush - removes list entry belonging to cl.
- *
- * @list:  An instance of our list structure
- * @cl: host client
- */
-void mei_io_list_flush(struct mei_cl_cb *list, struct mei_cl *cl)
-{
-	__mei_io_list_flush(list, cl, false);
-}
-
-/**
- * mei_io_list_free - removes cb belonging to cl and free them
- *
- * @list:  An instance of our list structure
- * @cl: host client
- */
-static inline void mei_io_list_free(struct mei_cl_cb *list, struct mei_cl *cl)
-{
-	__mei_io_list_flush(list, cl, true);
-}
-
-/**
- * mei_io_cb_alloc_buf - allocate callback buffer
- *
- * @cb: io callback structure
- * @length: size of the buffer
- *
- * Return: 0 on success
- *         -EINVAL if cb is NULL
- *         -ENOMEM if allocation failed
- */
-int mei_io_cb_alloc_buf(struct mei_cl_cb *cb, size_t length)
-{
-	if (!cb)
+	err = kstrtoul(buf, 10, &val);
+	if (err)
+		return err;
+	if (val > 255000)
 		return -EINVAL;
 
-	if (length == 0)
+	mutex_lock(&data->update_lock);
+	data->auto_temp[nr][point] = DIV_ROUND_CLOSEST(val, 1000);
+	if (point < data->auto_pwm_num) {
+		nct6775_write_value(data,
+				    NCT6775_AUTO_TEMP(data, nr, point),
+				    data->auto_temp[nr][point]);
+	} else {
+		nct6775_write_value(data, data->REG_CRITICAL_TEMP[nr],
+				    data->auto_temp[nr][point]);
+	}
+	mutex_unlock(&data->update_lock);
+	return count;
+}
+
+static umode_t nct6775_pwm_is_visible(struct kobject *kobj,
+				      struct attribute *attr, int index)
+{
+	struct device *dev = container_of(kobj, struct device, kobj);
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	int pwm = index / 36;	/* pwm index */
+	int nr = index % 36;	/* attribute index */
+
+	if (!(data->has_pwm & (1 << pwm)))
 		return 0;
 
-	cb->buf.data = kmalloc(length, GFP_KERNEL);
-	if (!cb->buf.data)
-		return -ENOMEM;
-	cb->buf.size = length;
-	return 0;
-}
+	if ((nr >= 14 && nr <= 18) || nr == 21)   /* weight */
+		if (!data->REG_WEIGHT_TEMP_SEL[pwm])
+			return 0;
+	if (nr == 19 && data->REG_PWM[3] == NULL) /* pwm_max */
+		return 0;
+	if (nr == 20 && data->REG_PWM[4] == NULL) /* pwm_step */
+		return 0;
+	if (nr == 21 && data->REG_PWM[6] == NULL) /* weight_duty_base */
+		return 0;
 
-/**
- * mei_cl_alloc_cb - a convenient wrapper for allocating read cb
- *
- * @cl: host client
- * @length: size of the buffer
- * @type: operation type
- * @fp: associated file pointer (might be NULL)
- *
- * Return: cb on success and NULL on failure
- */
-struct mei_cl_cb *mei_cl_alloc_cb(struct mei_cl *cl, size_t length,
-				  enum mei_cb_file_ops type, struct file *fp)
-{
-	struct mei_cl_cb *cb;
+	if (nr >= 22 && nr <= 35) {		/* auto point */
+		int api = (nr - 22) / 2;	/* auto point index */
 
-	cb = mei_io_cb_init(cl, type, fp);
-	if (!cb)
-		return NULL;
-
-	if (mei_io_cb_alloc_buf(cb, length)) {
-		mei_io_cb_free(cb);
-		return NULL;
+		if (api > data->auto_pwm_num)
+			return 0;
 	}
-
-	return cb;
+	return attr->mode;
 }
 
-/**
- * mei_cl_read_cb - find this cl's callback in the read list
- *     for a specific file
- *
- * @cl: host client
- * @fp: file pointer (matching cb file object), may be NULL
- *
- * Return: cb on success, NULL if cb is not found
+SENSOR_TEMPLATE_2(pwm_stop_time, "pwm%d_stop_time", S_IWUSR | S_IRUGO,
+		  show_fan_time, store_fan_time, 0, 0);
+SENSOR_TEMPLATE_2(pwm_step_up_time, "pwm%d_step_up_time", S_IWUSR | S_IRUGO,
+		  show_fan_time, store_fan_time, 0, 1);
+SENSOR_TEMPLATE_2(pwm_step_down_time, "pwm%d_step_down_time", S_IWUSR | S_IRUGO,
+		  show_fan_time, store_fan_time, 0, 2);
+SENSOR_TEMPLATE_2(pwm_start, "pwm%d_start", S_IWUSR | S_IRUGO, show_pwm,
+		  store_pwm, 0, 1);
+SENSOR_TEMPLATE_2(pwm_floor, "pwm%d_floor", S_IWUSR | S_IRUGO, show_pwm,
+		  store_pwm, 0, 2);
+SENSOR_TEMPLATE_2(pwm_temp_tolerance, "pwm%d_temp_tolerance", S_IWUSR | S_IRUGO,
+		  show_temp_tolerance, store_temp_tolerance, 0, 0);
+SENSOR_TEMPLATE_2(pwm_crit_temp_tolerance, "pwm%d_crit_temp_tolerance",
+		  S_IWUSR | S_IRUGO, show_temp_tolerance, store_temp_tolerance,
+		  0, 1);
+
+SENSOR_TEMPLATE_2(pwm_max, "pwm%d_max", S_IWUSR | S_IRUGO, show_pwm, store_pwm,
+		  0, 3);
+
+SENSOR_TEMPLATE_2(pwm_step, "pwm%d_step", S_IWUSR | S_IRUGO, show_pwm,
+		  store_pwm, 0, 4);
+
+SENSOR_TEMPLATE_2(pwm_auto_point1_pwm, "pwm%d_auto_point1_pwm",
+		  S_IWUSR | S_IRUGO, show_auto_pwm, store_auto_pwm, 0, 0);
+SENSOR_TEMPLATE_2(pwm_auto_point1_temp, "pwm%d_auto_point1_temp",
+		  S_IWUSR | S_IRUGO, show_auto_temp, store_auto_temp, 0, 0);
+
+SENSOR_TEMPLATE_2(pwm_auto_point2_pwm, "pwm%d_auto_point2_pwm",
+		  S_IWUSR | S_IRUGO, show_auto_pwm, store_auto_pwm, 0, 1);
+SENSOR_TEMPLATE_2(pwm_auto_point2_temp, "pwm%d_auto_point2_temp",
+		  S_IWUSR | S_IRUGO, show_auto_temp, store_auto_temp, 0, 1);
+
+SENSOR_TEMPLATE_2(pwm_auto_point3_pwm, "pwm%d_auto_point3_pwm",
+		  S_IWUSR | S_IRUGO, show_auto_pwm, store_auto_pwm, 0, 2);
+SENSOR_TEMPLATE_2(pwm_auto_point3_temp, "pwm%d_auto_point3_temp",
+		  S_IWUSR | S_IRUGO, show_auto_temp, store_auto_temp, 0, 2);
+
+SENSOR_TEMPLATE_2(pwm_auto_point4_pwm, "pwm%d_auto_point4_pwm",
+		  S_IWUSR | S_IRUGO, show_auto_pwm, store_auto_pwm, 0, 3);
+SENSOR_TEMPLATE_2(pwm_auto_point4_temp, "pwm%d_auto_point4_temp",
+		  S_IWUSR | S_IRUGO, show_auto_temp, store_auto_temp, 0, 3);
+
+SENSOR_TEMPLATE_2(pwm_auto_point5_pwm, "pwm%d_auto_point5_pwm",
+		  S_IWUSR | S_IRUGO, show_auto_pwm, store_auto_pwm, 0, 4);
+SENSOR_TEMPLATE_2(pwm_auto_point5_temp, "pwm%d_auto_point5_temp",
+		  S_IWUSR | S_IRUGO, show_auto_temp, store_auto_temp, 0, 4);
+
+SENSOR_TEMPLATE_2(pwm_auto_point6_pwm, "pwm%d_auto_point6_pwm",
+		  S_IWUSR | S_IRUGO, show_auto_pwm, store_auto_pwm, 0, 5);
+SENSOR_TEMPLATE_2(pwm_auto_point6_temp, "pwm%d_auto_point6_temp",
+		  S_IWUSR | S_IRUGO, show_auto_temp, store_auto_temp, 0, 5);
+
+SENSOR_TEMPLATE_2(pwm_auto_point7_pwm, "pwm%d_auto_point7_pwm",
+		  S_IWUSR | S_IRUGO, show_auto_pwm, store_auto_pwm, 0, 6);
+SENSOR_TEMPLATE_2(pwm_auto_point7_temp, "pwm%d_auto_point7_temp",
+		  S_IWUSR | S_IRUGO, show_auto_temp, store_auto_temp, 0, 6);
+
+/*
+ * nct6775_pwm_is_visible uses the index into the following array
+ * to determine if attributes should be created or not.
+ * Any change in order or content must be matched.
  */
-struct mei_cl_cb *mei_cl_read_cb(const struct mei_cl *cl, const struct file *fp)
+static struct sensor_device_template *nct6775_attributes_pwm_template[] = {
+	&sensor_dev_template_pwm,
+	&sensor_dev_template_pwm_mode,
+	&sensor_dev_template_pwm_enable,
+	&sensor_dev_template_pwm_temp_sel,
+	&sensor_dev_template_pwm_temp_tolerance,
+	&sensor_dev_template_pwm_crit_temp_tolerance,
+	&sensor_dev_template_pwm_target_temp,
+	&sensor_dev_template_fan_target,
+	&sensor_dev_template_fan_tolerance,
+	&sensor_dev_template_pwm_stop_time,
+	&sensor_dev_template_pwm_step_up_time,
+	&sensor_dev_template_pwm_step_down_time,
+	&sensor_dev_template_pwm_start,
+	&sensor_dev_template_pwm_floor,
+	&sensor_dev_template_pwm_weight_temp_sel,	/* 14 */
+	&sensor_dev_template_pwm_weight_temp_step,
+	&sensor_dev_template_pwm_weight_temp_step_tol,
+	&sensor_dev_template_pwm_weight_temp_step_base,
+	&sensor_dev_template_pwm_weight_duty_step,	/* 18 */
+	&sensor_dev_template_pwm_max,			/* 19 */
+	&sensor_dev_template_pwm_step,			/* 20 */
+	&sensor_dev_template_pwm_weight_duty_base,	/* 21 */
+	&sensor_dev_template_pwm_auto_point1_pwm,	/* 22 */
+	&sensor_dev_template_pwm_auto_point1_temp,
+	&sensor_dev_template_pwm_auto_point2_pwm,
+	&sensor_dev_template_pwm_auto_point2_temp,
+	&sensor_dev_template_pwm_auto_point3_pwm,
+	&sensor_dev_template_pwm_auto_point3_temp,
+	&sensor_dev_template_pwm_auto_point4_pwm,
+	&sensor_dev_template_pwm_auto_point4_temp,
+	&sensor_dev_template_pwm_auto_point5_pwm,
+	&sensor_dev_template_pwm_auto_point5_temp,
+	&sensor_dev_template_pwm_auto_point6_pwm,
+	&sensor_dev_template_pwm_auto_point6_temp,
+	&sensor_dev_template_pwm_auto_point7_pwm,
+	&sensor_dev_template_pwm_auto_point7_temp,	/* 35 */
+
+	NULL
+};
+
+static struct sensor_template_group nct6775_pwm_template_group = {
+	.templates = nct6775_attributes_pwm_template,
+	.is_visible = nct6775_pwm_is_visible,
+	.base = 1,
+};
+
+static ssize_t
+show_vid(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	struct mei_cl_cb *cb;
+	struct nct6775_data *data = dev_get_drvdata(dev);
 
-	list_for_each_entry(cb, &cl->rd_completed, list)
-		if (!fp || fp == cb->file_object)
-			return cb;
-
-	return NULL;
+	return sprintf(buf, "%d\n", vid_from_reg(data->vid, data->vrm));
 }
 
-/**
- * mei_cl_read_cb_flush - free client's read pending and completed cbs
- *   for a specific file
- *
- * @cl: host client
- * @fp: file pointer (matching cb file object), may be NULL
- */
-void mei_cl_read_cb_flush(const struct mei_cl *cl, const struct file *fp)
+static DEVICE_ATTR(cpu0_vid, S_IRUGO, show_vid, NULL);
+
+/* Case open detection */
+
+static ssize_t
+clear_caseopen(struct device *dev, struct device_attribute *attr,
+	       const char *buf, size_t count)
 {
-	struct mei_cl_cb *cb, *next;
+	struct nct6775_data *data = dev_get_drvdata(dev);
+	int nr = to_sensor_dev_attr(attr)->index - INTRUSION_ALARM_BASE;
+	unsigned long val;
+	u8 reg;
+	int ret;
 
-	list_for_each_entry_safe(cb, next, &cl->rd_completed, list)
-		if (!fp || fp == cb->file_object)
-			mei_io_cb_free(cb);
-
-
-	list_for_each_entry_safe(cb, next, &cl->rd_pending, list)
-		if (!fp || fp == cb->file_object)
-			mei_io_cb_free(cb);
-}
-
-/**
- * mei_cl_flush_queues - flushes queue lists belonging to cl.
- *
- * @cl: host client
- * @fp: file pointer (matching cb file object), may be NULL
- *
- * Return: 0 on success, -EINVAL if cl or cl->dev is NULL.
- */
-int mei_cl_flush_queues(struct mei_cl *cl, const struct file *fp)
-{
-	struct mei_device *dev;
-
-	if (WARN_ON(!cl || !cl->dev))
+	if (kstrtoul(buf, 10, &val) || val != 0)
 		return -EINVAL;
 
-	dev = cl->dev;
+	mutex_lock(&data->update_lock);
 
-	cl_dbg(dev, cl, "remove list entry belonging to cl\n");
-	mei_io_list_free(&cl->dev->write_list, cl);
-	mei_io_list_free(&cl->dev->write_waiting_list, cl);
-	mei_io_list_flush(&cl->dev->ctrl_wr_list, cl);
-	mei_io_list_flush(&cl->dev->ctrl_rd_list, cl);
-	mei_io_list_flush(&cl->dev->amthif_cmd_list, cl);
-	mei_io_list_flush(&cl->dev->amthif_rd_complete_list, cl);
-
-	mei_cl_read_cb_flush(cl, fp);
-
-	return 0;
-}
-
-
-/**
- * mei_cl_init - initializes cl.
- *
- * @cl: host client to be initialized
- * @dev: mei device
- */
-void mei_cl_init(struct mei_cl *cl, struct mei_device *dev)
-{
-	memset(cl, 0, sizeof(struct mei_cl));
-	init_waitqueue_head(&cl->wait);
-	init_waitqueue_head(&cl->rx_wait);
-	init_waitqueue_head(&cl->tx_wait);
-	init_waitqueue_head(&cl->ev_wait);
-	INIT_LIST_HEAD(&cl->rd_completed);
-	INIT_LIST_HEAD(&cl->rd_pending);
-	INIT_LIST_HEAD(&cl->link);
-	cl->writing_state = MEI_IDLE;
-	cl->state = MEI_FILE_INITIALIZING;
-	cl->dev = dev;
-}
-
-/**
- * mei_cl_allocate - allocates cl  structure and sets it up.
- *
- * @dev: mei device
- * Return:  The allocated file or NULL on failure
- */
-struct mei_cl *mei_cl_allocate(struct mei_device *dev)
-{
-	struct mei_cl *cl;
-
-	cl = kmalloc(sizeof(struct mei_cl), GFP_KERNEL);
-	if (!cl)
-		return NULL;
-
-	mei_cl_init(cl, dev);
-
-	return cl;
-}
-
-/**
- * mei_cl_link - allocate host id in the host map
- *
- * @cl: host client
- * @id: fixed host id or MEI_HOST_CLIENT_ID_ANY (-1) for generic one
- *
- * Return: 0 on success
- *	-EINVAL on incorrect values
- *	-EMFILE if open count exceeded.
- */
-int mei_cl_link(struct mei_cl *cl, int id)
-{
-	struct mei_device *dev;
-	long open_handle_count;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -EINVAL;
-
-	dev = cl->dev;
-
-	/* If Id is not assigned get one*/
-	if (id == MEI_HOST_CLIENT_ID_ANY)
-		id = find_first_zero_bit(dev->host_clients_map,
-					MEI_CLIENTS_MAX);
-
-	if (id >= MEI_CLIENTS_MAX) {
-		dev_err(dev->dev, "id exceeded %d", MEI_CLIENTS_MAX);
-		return -EMFILE;
+	/*
+	 * Use CR registers to clear caseopen status.
+	 * The CR registers are the same for all chips, and not all chips
+	 * support clearing the caseopen status through "regular" registers.
+	 */
+	ret = superio_enter(data->sioreg);
+	if (ret) {
+		count = ret;
+		goto error;
 	}
 
-	open_handle_count = dev->open_handle_count + dev->iamthif_open_count;
-	if (open_handle_count >= MEI_MAX_OPEN_HANDLE_COUNT) {
-		dev_err(dev->dev, "open_handle_count exceeded %d",
-			MEI_MAX_OPEN_HANDLE_COUNT);
-		return -EMFILE;
-	}
+	superio_select(data->sioreg, NCT6775_LD_ACPI);
+	reg = superio_inb(data->sioreg, NCT6775_REG_CR_CASEOPEN_CLR[nr]);
+	reg |= NCT6775_CR_CASEOPEN_CLR_MASK[nr];
+	superio_outb(data->sioreg, NCT6775_REG_CR_CASEOPEN_CLR[nr], reg);
+	reg &= ~NCT6775_CR_CASEOPEN_CLR_MASK[nr];
+	superio_outb(data->sioreg, NCT6775_REG_CR_CASEOPEN_CLR[nr], reg);
+	superio_exit(data->sioreg);
 
-	dev->open_handle_count++;
-
-	cl->host_client_id = id;
-	list_add_tail(&cl->link, &dev->file_list);
-
-	set_bit(id, dev->host_clients_map);
-
-	cl->state = MEI_FILE_INITIALIZING;
-
-	cl_dbg(dev, cl, "link cl\n");
-	return 0;
+	data->valid = false;	/* Force cache refresh */
+error:
+	mutex_unlock(&data->update_lock);
+	return count;
 }
 
-/**
- * mei_cl_unlink - remove host client from the list
- *
- * @cl: host client
- *
- * Return: always 0
- */
-int mei_cl_unlink(struct mei_cl *cl)
-{
-	struct mei_device *dev;
+static SENSOR_DEVICE_ATTR(intrusion0_alarm, S_IWUSR | S_IRUGO, show_alarm,
+			  clear_caseopen, INTRUSION_ALARM_BASE);
+static SENSOR_DEVICE_ATTR(intrusion1_alarm, S_IWUSR | S_IRUGO, show_alarm,
+			  clear_caseopen, INTRUSION_ALARM_BASE + 1);
+static SENSOR_DEVICE_ATTR(intrusion0_beep, S_IWUSR | S_IRUGO, show_beep,
+			  store_beep, INTRUSION_ALARM_BASE);
+static SENSOR_DEVICE_ATTR(intrusion1_beep, S_IWUSR | S_IRUGO, show_beep,
+			  store_beep, INTRUSION_ALARM_BASE + 1);
+static SENSOR_DEVICE_ATTR(beep_enable, S_IWUSR | S_IRUGO, show_beep,
+			  store_beep, BEEP_ENABLE_BASE);
 
-	/* don't shout on error exit path */
-	if (!cl)
+static umode_t nct6775_other_is_visible(struct kobject *kobj,
+					struct attribute *attr, int index)
+{
+	struct device *dev = container_of(kobj, struct device, kobj);
+	struct nct6775_data *data = dev_get_drvdata(dev);
+
+	if (index == 0 && !data->have_vid)
 		return 0;
 
-	/* wd and amthif might not be initialized */
-	if (!cl->dev)
-		return 0;
-
-	dev = cl->dev;
-
-	cl_dbg(dev, cl, "unlink client");
-
-	if (dev->open_handle_count > 0)
-		dev->open_handle_count--;
-
-	/* never clear the 0 bit */
-	if (cl->host_client_id)
-		clear_bit(cl->host_client_id, dev->host_clients_map);
-
-	list_del_init(&cl->link);
-
-	cl->state = MEI_FILE_INITIALIZING;
-
-	return 0;
-}
-
-
-void mei_host_client_init(struct work_struct *work)
-{
-	struct mei_device *dev =
-		container_of(work, struct mei_device, init_work);
-	struct mei_me_client *me_cl;
-
-	mutex_lock(&dev->device_lock);
-
-
-	me_cl = mei_me_cl_by_uuid(dev, &mei_amthif_guid);
-	if (me_cl)
-		mei_amthif_host_init(dev, me_cl);
-	mei_me_cl_put(me_cl);
-
-	me_cl = mei_me_cl_by_uuid(dev, &mei_wd_guid);
-	if (me_cl)
-		mei_wd_host_init(dev, me_cl);
-	mei_me_cl_put(me_cl);
-
-	dev->dev_state = MEI_DEV_ENABLED;
-	dev->reset_count = 0;
-	mutex_unlock(&dev->device_lock);
-
-	mei_cl_bus_rescan(dev);
-
-	pm_runtime_mark_last_busy(dev->dev);
-	dev_dbg(dev->dev, "rpm: autosuspend\n");
-	pm_request_autosuspend(dev->dev);
-}
-
-/**
- * mei_hbuf_acquire - try to acquire host buffer
- *
- * @dev: the device structure
- * Return: true if host buffer was acquired
- */
-bool mei_hbuf_acquire(struct mei_device *dev)
-{
-	if (mei_pg_state(dev) == MEI_PG_ON ||
-	    mei_pg_in_transition(dev)) {
-		dev_dbg(dev->dev, "device is in pg\n");
-		return false;
+	if (index == 1 || index == 2) {
+		if (data->ALARM_BITS[INTRUSION_ALARM_BASE + index - 1] < 0)
+			return 0;
 	}
 
-	if (!dev->hbuf_is_ready) {
-		dev_dbg(dev->dev, "hbuf is not ready\n");
-		return false;
+	if (index == 3 || index == 4) {
+		if (data->BEEP_BITS[INTRUSION_ALARM_BASE + index - 3] < 0)
+			return 0;
 	}
 
-	dev->hbuf_is_ready = false;
-
-	return true;
-}
-
-/**
- * mei_cl_set_disconnected - set disconnected state and clear
- *   associated states and resources
- *
- * @cl: host client
- */
-void mei_cl_set_disconnected(struct mei_cl *cl)
-{
-	struct mei_device *dev = cl->dev;
-
-	if (cl->state == MEI_FILE_DISCONNECTED ||
-	    cl->state == MEI_FILE_INITIALIZING)
-		return;
-
-	cl->state = MEI_FILE_DISCONNECTED;
-	mei_io_list_flush(&dev->ctrl_rd_list, cl);
-	mei_io_list_flush(&dev->ctrl_wr_list, cl);
-	cl->mei_flow_ctrl_creds = 0;
-	cl->timer_count = 0;
-
-	if (!cl->me_cl)
-		return;
-
-	if (!WARN_ON(cl->me_cl->connect_count == 0))
-		cl->me_cl->connect_count--;
-
-	if (cl->me_cl->connect_count == 0)
-		cl->me_cl->mei_flow_ctrl_creds = 0;
-
-	mei_me_cl_put(cl->me_cl);
-	cl->me_cl = NULL;
-}
-
-static int mei_cl_set_connecting(struct mei_cl *cl, struct mei_me_client *me_cl)
-{
-	if (!mei_me_cl_get(me_cl))
-		return -ENOENT;
-
-	/* only one connection is allowed for fixed address clients */
-	if (me_cl->props.fixed_address) {
-		if (me_cl->connect_count) {
-			mei_me_cl_put(me_cl);
-			return -EBUSY;
-		}
-	}
-
-	cl->me_cl = me_cl;
-	cl->state = MEI_FILE_CONNECTING;
-	cl->me_cl->connect_count++;
-
-	return 0;
+	return attr->mode;
 }
 
 /*
- * mei_cl_send_disconnect - send disconnect request
- *
- * @cl: host client
- * @cb: callback block
- *
- * Return: 0, OK; otherwise, error.
+ * nct6775_other_is_visible uses the index into the following array
+ * to determine if attributes should be created or not.
+ * Any change in order or content must be matched.
  */
-static int mei_cl_send_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb)
+static struct attribute *nct6775_attributes_other[] = {
+	&dev_attr_cpu0_vid.attr,				/* 0 */
+	&sensor_dev_attr_intrusion0_alarm.dev_attr.attr,	/* 1 */
+	&sensor_dev_attr_intrusion1_alarm.dev_attr.attr,	/* 2 */
+	&sensor_dev_attr_intrusion0_beep.dev_attr.attr,		/* 3 */
+	&sensor_dev_attr_intrusion1_beep.dev_attr.attr,		/* 4 */
+	&sensor_dev_attr_beep_enable.dev_attr.attr,		/* 5 */
+
+	NULL
+};
+
+static const struct attribute_group nct6775_group_other = {
+	.attrs = nct6775_attributes_other,
+	.is_visible = nct6775_other_is_visible,
+};
+
+static inline void nct6775_init_device(struct nct6775_data *data)
 {
-	struct mei_device *dev;
-	int ret;
+	int i;
+	u8 tmp, diode;
 
-	dev = cl->dev;
-
-	ret = mei_hbm_cl_disconnect_req(dev, cl);
-	cl->status = ret;
-	if (ret) {
-		cl->state = MEI_FILE_DISCONNECT_REPLY;
-		return ret;
+	/* Start monitoring if needed */
+	if (data->REG_CONFIG) {
+		tmp = nct6775_read_value(data, data->REG_CONFIG);
+		if (!(tmp & 0x01))
+			nct6775_write_value(data, data->REG_CONFIG, tmp | 0x01);
 	}
 
-	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
-	cl->timer_count = MEI_CONNECT_TIMEOUT;
+	/* Enable temperature sensors if needed */
+	for (i = 0; i < NUM_TEMP; i++) {
+		if (!(data->have_temp & (1 << i)))
+			continue;
+		if (!data->reg_temp_config[i])
+			continue;
+		tmp = nct6775_read_value(data, data->reg_temp_config[i]);
+		if (tmp & 0x01)
+			nct6775_write_value(data, data->reg_temp_config[i],
+					    tmp & 0xfe);
+	}
 
-	return 0;
+	/* Enable VBAT monitoring if needed */
+	tmp = nct6775_read_value(data, data->REG_VBAT);
+	if (!(tmp & 0x01))
+		nct6775_write_value(data, data->REG_VBAT, tmp | 0x01);
+
+	diode = nct6775_read_value(data, data->REG_DIODE);
+
+	for (i = 0; i < data->temp_fixed_num; i++) {
+		if (!(data->have_temp_fixed & (1 << i)))
+			continue;
+		if ((tmp & (data->DIODE_MASK << i)))	/* diode */
+			data->temp_type[i]
+			  = 3 - ((diode >> i) & data->DIODE_MASK);
+		else				/* thermistor */
+			data->temp_type[i] = 4;
+	}
 }
 
-/**
- * mei_cl_irq_disconnect - processes close related operation from
- *	interrupt thread context - send disconnect request
- *
- * @cl: client
- * @cb: callback block.
- * @cmpl_list: complete list.
- *
- * Return: 0, OK; otherwise, error.
- */
-int mei_cl_irq_disconnect(struct mei_cl *cl, struct mei_cl_cb *cb,
-			    struct mei_cl_cb *cmpl_list)
+static void
+nct6775_check_fan_inputs(struct nct6775_data *data)
 {
-	struct mei_device *dev = cl->dev;
-	u32 msg_slots;
-	int slots;
-	int ret;
+	bool fan3pin, fan4pin, fan4min, fan5pin, fan6pin;
+	bool pwm3pin, pwm4pin, pwm5pin, pwm6pin;
+	int sioreg = data->sioreg;
+	int regval;
 
-	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
-	slots = mei_hbuf_empty_slots(dev);
+	/* Store SIO_REG_ENABLE for use during resume */
+	superio_select(sioreg, NCT6775_LD_HWM);
+	data->sio_reg_enable = superio_inb(sioreg, SIO_REG_ENABLE);
 
-	if (slots < msg_slots)
-		return -EMSGSIZE;
+	/* fan4 and fan5 share some pins with the GPIO and serial flash */
+	if (data->kind == nct6775) {
+		regval = superio_inb(sioreg, 0x2c);
 
-	ret = mei_cl_send_disconnect(cl, cb);
-	if (ret)
-		list_move_tail(&cb->list, &cmpl_list->list);
+		fan3pin = regval & (1 << 6);
+		pwm3pin = regval & (1 << 7);
 
-	return ret;
-}
+		/* On NCT6775, fan4 shares pins with the fdc interface */
+		fan4pin = !(superio_inb(sioreg, 0x2A) & 0x80);
+		fan4min = false;
+		fan5pin = false;
+		fan6pin = false;
+		pwm4pin = false;
+		pwm5pin = false;
+		pwm6pin = false;
+	} else if (data->kind == nct6776) {
+		bool gpok = superio_inb(sioreg, 0x27) & 0x80;
+		const char *board_vendor, *board_name;
 
-/**
- * __mei_cl_disconnect - disconnect host client from the me one
- *     internal function runtime pm has to be already acquired
- *
- * @cl: host client
- *
- * Return: 0 on success, <0 on failure.
- */
-static int __mei_cl_disconnect(struct mei_cl *cl)
-{
-	struct mei_device *dev;
-	struct mei_cl_cb *cb;
-	int rets;
+		board_vendor = dmi_get_system_info(DMI_BOARD_VENDOR);
+		board_name = dmi_get_system_info(DMI_BOARD_NAME);
 
-	dev = cl->dev;
+		if (board_name && board_vendor &&
+		    !strcmp(board_vendor, "ASRock")) {
+			/*
+			 * Auxiliary fan monitoring is not enabled on ASRock
+			 * Z77 Pro4-M if booted in UEFI Ultra-FastBoot mode.
+			 * Observed with BIOS version 2.00.
+			 */
+			if (!strcmp(board_name, "Z77 Pro4-M")) {
+				if ((data->sio_reg_enable & 0xe0) != 0xe0) {
+					data->sio_reg_enable |= 0xe0;
+					superio_outb(sioreg, SIO_REG_ENABLE,
+						     data->sio_reg_enable);
+				}
+			}
+		}
 
-	cl->state = MEI_FILE_DISCONNECTING;
+		if (data->sio_reg_enable & 0x80)
+			fan3pin = gpok;
+		else
+			fan3pin = !(superio_inb(sioreg, 0x24) & 0x40);
 
-	cb = mei_io_cb_init(cl, MEI_FOP_DISCONNECT, NULL);
-	rets = cb ? 0 : -ENOMEM;
-	if (rets)
-		goto out;
+		if (data->sio_reg_enable & 0x40)
+			fan4pin = gpok;
+		else
+			fan4pin = superio_inb(sioreg, 0x1C) & 0x01;
 
-	cl_dbg(dev, cl, "add disconnect cb to control write list\n");
-	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
+		if (data->sio_reg_enable & 0x20)
+			fan5pin = gpok;
+		else
+			fan5pin = superio_inb(sioreg, 0x1C) & 0x02;
 
-	if (mei_hbuf_acquire(dev)) {
-		rets = mei_cl_send_disconnect(cl, cb);
-		if (rets) {
-			cl_err(dev, cl, "failed to disconnect.\n");
-			goto out;
+		fan4min = fan4pin;
+		fan6pin = false;
+		pwm3pin = fan3pin;
+		pwm4pin = false;
+		pwm5pin = false;
+		pwm6pin = false;
+	} else if (data->kind == nct6106) {
+		regval = superio_inb(sioreg, 0x24);
+		fan3pin = !(regval & 0x80);
+		pwm3pin = regval & 0x08;
+
+		fan4pin = false;
+		fan4min = false;
+		fan5pin = false;
+		fan6pin = false;
+		pwm4pin = false;
+		pwm5pin = false;
+		pwm6pin = false;
+	} else {	/* NCT6779D, NCT6791D, NCT6792D, or NCT6793D */
+		regval = superio_inb(sioreg, 0x1c);
+
+		fan3pin = !(regval & (1 << 5));
+		fan4pin = !(regval & (1 << 6));
+		fan5pin = !(regval & (1 << 7));
+
+		pwm3pin = !(regval & (1 << 0));
+		pwm4pin = !(regval & (1 << 1));
+		pwm5pin = !(regval & (1 << 2));
+
+		fan4min = fan4pin;
+
+		if (data->kind == nct6791 || data->kind == nct6792 ||
+		    data->kind == nct6793) {
+			regval = superio_inb(sioreg, 0x2d);
+			fan6pin = (regval & (1 << 1));
+			pwm6pin = (regval & (1 << 0));
+		} else {	/* NCT6779D */
+			fan6pin = false;
+			pwm6pin = false;
 		}
 	}
 
-	mutex_unlock(&dev->device_lock);
-	wait_event_timeout(cl->wait, cl->state == MEI_FILE_DISCONNECT_REPLY,
-			   mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
-	mutex_lock(&dev->device_lock);
-
-	rets = cl->status;
-	if (cl->state != MEI_FILE_DISCONNECT_REPLY) {
-		cl_dbg(dev, cl, "timeout on disconnect from FW client.\n");
-		rets = -ETIME;
-	}
-
-out:
-	/* we disconnect also on error */
-	mei_cl_set_disconnected(cl);
-	if (!rets)
-		cl_dbg(dev, cl, "successfully disconnected from FW client.\n");
-
-	mei_io_cb_free(cb);
-	return rets;
+	/* fan 1 and 2 (0x03) are always present */
+	data->has_fan = 0x03 | (fan3pin << 2) | (fan4pin << 3) |
+		(fan5pin << 4) | (fan6pin << 5);
+	data->has_fan_min = 0x03 | (fan3pin << 2) | (fan4min << 3) |
+		(fan5pin << 4);
+	data->has_pwm = 0x03 | (pwm3pin << 2) | (pwm4pin << 3) |
+		(pwm5pin << 4) | (pwm6pin << 5);
 }
 
-/**
- * mei_cl_disconnect - disconnect host client from the me one
- *
- * @cl: host client
- *
- * Locking: called under "dev->device_lock" lock
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_cl_disconnect(struct mei_cl *cl)
+static void add_temp_sensors(struct nct6775_data *data, const u16 *regp,
+			     int *available, int *mask)
 {
-	struct mei_device *dev;
-	int rets;
+	int i;
+	u8 src;
 
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
+	for (i = 0; i < data->pwm_num && *available; i++) {
+		int index;
 
-	dev = cl->dev;
+		if (!regp[i])
+			continue;
+		src = nct6775_read_value(data, regp[i]);
+		src &= 0x1f;
+		if (!src || (*mask & (1 << src)))
+			continue;
+		if (src >= data->temp_label_num ||
+		    !strlen(data->temp_label[src]))
+			continue;
 
-	cl_dbg(dev, cl, "disconnecting");
-
-	if (!mei_cl_is_connected(cl))
-		return 0;
-
-	if (mei_cl_is_fixed_address(cl)) {
-		mei_cl_set_disconnected(cl);
-		return 0;
+		index = __ffs(*available);
+		nct6775_write_value(data, data->REG_TEMP_SOURCE[index], src);
+		*available &= ~(1 << index);
+		*mask |= 1 << src;
 	}
-
-	rets = pm_runtime_get(dev->dev);
-	if (rets < 0 && rets != -EINPROGRESS) {
-		pm_runtime_put_noidle(dev->dev);
-		cl_err(dev, cl, "rpm: get failed %d\n", rets);
-		return rets;
-	}
-
-	rets = __mei_cl_disconnect(cl);
-
-	cl_dbg(dev, cl, "rpm: autosuspend\n");
-	pm_runtime_mark_last_busy(dev->dev);
-	pm_runtime_put_autosuspend(dev->dev);
-
-	return rets;
 }
 
-
-/**
- * mei_cl_is_other_connecting - checks if other
- *    client with the same me client id is connecting
- *
- * @cl: private data of the file object
- *
- * Return: true if other client is connected, false - otherwise.
- */
-static bool mei_cl_is_other_connecting(struct mei_cl *cl)
+static int nct6775_probe(struct platform_device *pdev)
 {
-	struct mei_device *dev;
-	struct mei_cl_cb *cb;
-
-	dev = cl->dev;
-
-	list_for_each_entry(cb, &dev->ctrl_rd_list.list, list) {
-		if (cb->fop_type == MEI_FOP_CONNECT &&
-		    mei_cl_me_id(cl) == mei_cl_me_id(cb->cl))
-			return true;
-	}
-
-	return false;
-}
-
-/**
- * mei_cl_send_connect - send connect request
- *
- * @cl: host client
- * @cb: callback block
- *
- * Return: 0, OK; otherwise, error.
- */
-static int mei_cl_send_connect(struct mei_cl *cl, struct mei_cl_cb *cb)
-{
-	struct mei_device *dev;
-	int ret;
-
-	dev = cl->dev;
-
-	ret = mei_hbm_cl_connect_req(dev, cl);
-	cl->status = ret;
-	if (ret) {
-		cl->state = MEI_FILE_DISCONNECT_REPLY;
-		return ret;
-	}
-
-	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
-	cl->timer_count = MEI_CONNECT_TIMEOUT;
-	return 0;
-}
-
-/**
- * mei_cl_irq_connect - send connect request in irq_thread context
- *
- * @cl: host client
- * @cb: callback block
- * @cmpl_list: complete list
- *
- * Return: 0, OK; otherwise, error.
- */
-int mei_cl_irq_connect(struct mei_cl *cl, struct mei_cl_cb *cb,
-			      struct mei_cl_cb *cmpl_list)
-{
-	struct mei_device *dev = cl->dev;
-	u32 msg_slots;
-	int slots;
-	int rets;
-
-	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
-	slots = mei_hbuf_empty_slots(dev);
-
-	if (mei_cl_is_other_connecting(cl))
-		return 0;
-
-	if (slots < msg_slots)
-		return -EMSGSIZE;
-
-	rets = mei_cl_send_connect(cl, cb);
-	if (rets)
-		list_move_tail(&cb->list, &cmpl_list->list);
-
-	return rets;
-}
-
-/**
- * mei_cl_connect - connect host client to the me one
- *
- * @cl: host client
- * @me_cl: me client
- * @file: pointer to file structure
- *
- * Locking: called under "dev->device_lock" lock
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_cl_connect(struct mei_cl *cl, struct mei_me_client *me_cl,
-		   struct file *file)
-{
-	struct mei_device *dev;
-	struct mei_cl_cb *cb;
-	int rets;
-
-	if (WARN_ON(!cl || !cl->dev || !me_cl))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	rets = mei_cl_set_connecting(cl, me_cl);
-	if (rets)
-		return rets;
-
-	if (mei_cl_is_fixed_address(cl)) {
-		cl->state = MEI_FILE_CONNECTED;
-		return 0;
-	}
-
-	rets = pm_runtime_get(dev->dev);
-	if (rets < 0 && rets != -EINPROGRESS) {
-		pm_runtime_put_noidle(dev->dev);
-		cl_err(dev, cl, "rpm: get failed %d\n", rets);
-		goto nortpm;
-	}
-
-	cb = mei_io_cb_init(cl, MEI_FOP_CONNECT, file);
-	rets = cb ? 0 : -ENOMEM;
-	if (rets)
-		goto out;
-
-	list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
-
-	/* run hbuf acquire last so we don't have to undo */
-	if (!mei_cl_is_other_connecting(cl) && mei_hbuf_acquire(dev)) {
-		rets = mei_cl_send_connect(cl, cb);
-		if (rets)
-			goto out;
-	}
-
-	mutex_unlock(&dev->device_lock);
-	wait_event_timeout(cl->wait,
-			(cl->state == MEI_FILE_CONNECTED ||
-			 cl->state == MEI_FILE_DISCONNECT_REQUIRED ||
-			 cl->state == MEI_FILE_DISCONNECT_REPLY),
-			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
-	mutex_lock(&dev->device_lock);
-
-	if (!mei_cl_is_connected(cl)) {
-		if (cl->state == MEI_FILE_DISCONNECT_REQUIRED) {
-			mei_io_list_flush(&dev->ctrl_rd_list, cl);
-			mei_io_list_flush(&dev->ctrl_wr_list, cl);
-			 /* ignore disconnect return valuue;
-			  * in case of failure reset will be invoked
-			  */
-			__mei_cl_disconnect(cl);
-			rets = -EFAULT;
-			goto out;
-		}
-
-		/* timeout or something went really wrong */
-		if (!cl->status)
-			cl->status = -EFAULT;
-	}
-
-	rets = cl->status;
-out:
-	cl_dbg(dev, cl, "rpm: autosuspend\n");
-	pm_runtime_mark_last_busy(dev->dev);
-	pm_runtime_put_autosuspend(dev->dev);
-
-	mei_io_cb_free(cb);
-
-nortpm:
-	if (!mei_cl_is_connected(cl))
-		mei_cl_set_disconnected(cl);
-
-	return rets;
-}
-
-/**
- * mei_cl_alloc_linked - allocate and link host client
- *
- * @dev: the device structure
- * @id: fixed host id or MEI_HOST_CLIENT_ID_ANY (-1) for generic one
- *
- * Return: cl on success ERR_PTR on failure
- */
-struct mei_cl *mei_cl_alloc_linked(struct mei_device *dev, int id)
-{
-	struct mei_cl *cl;
-	int ret;
-
-	cl = mei_cl_allocate(dev);
-	if (!cl) {
-		ret = -ENOMEM;
-		goto err;
-	}
-
-	ret = mei_cl_link(cl, id);
-	if (ret)
-		goto err;
-
-	return cl;
-err:
-	kfree(cl);
-	return ERR_PTR(ret);
-}
-
-
-
-/**
- * mei_cl_flow_ctrl_creds - checks flow_control credits for cl.
- *
- * @cl: private data of the file object
- *
- * Return: 1 if mei_flow_ctrl_creds >0, 0 - otherwise.
- */
-int mei_cl_flow_ctrl_creds(struct mei_cl *cl)
-{
-	int rets;
-
-	if (WARN_ON(!cl || !cl->me_cl))
-		return -EINVAL;
-
-	if (cl->mei_flow_ctrl_creds > 0)
-		return 1;
-
-	if (mei_cl_is_fixed_address(cl)) {
-		rets = mei_cl_read_start(cl, mei_cl_mtu(cl), NULL);
-		if (rets && rets != -EBUSY)
-			return rets;
-		return 1;
-	}
-
-	if (mei_cl_is_single_recv_buf(cl)) {
-		if (cl->me_cl->mei_flow_ctrl_creds > 0)
-			return 1;
-	}
-	return 0;
-}
-
-/**
- * mei_cl_flow_ctrl_reduce - reduces flow_control.
- *
- * @cl: private data of the file object
- *
- * Return:
- *	0 on success
- *	-EINVAL when ctrl credits are <= 0
- */
-int mei_cl_flow_ctrl_reduce(struct mei_cl *cl)
-{
-	if (WARN_ON(!cl || !cl->me_cl))
-		return -EINVAL;
-
-	if (mei_cl_is_fixed_address(cl))
-		return 0;
-
-	if (mei_cl_is_single_recv_buf(cl)) {
-		if (WARN_ON(cl->me_cl->mei_flow_ctrl_creds <= 0))
-			return -EINVAL;
-		cl->me_cl->mei_flow_ctrl_creds--;
-	} else {
-		if (WARN_ON(cl->mei_flow_ctrl_creds <= 0))
-			return -EINVAL;
-		cl->mei_flow_ctrl_creds--;
-	}
-	return 0;
-}
-
-/**
- *  mei_cl_notify_fop2req - convert fop to proper request
- *
- * @fop: client notification start response command
- *
- * Return:  MEI_HBM_NOTIFICATION_START/STOP
- */
-u8 mei_cl_notify_fop2req(enum mei_cb_file_ops fop)
-{
-	if (fop == MEI_FOP_NOTIFY_START)
-		return MEI_HBM_NOTIFICATION_START;
-	else
-		return MEI_HBM_NOTIFICATION_STOP;
-}
-
-/**
- *  mei_cl_notify_req2fop - convert notification request top file operation type
- *
- * @req: hbm notification request type
- *
- * Return:  MEI_FOP_NOTIFY_START/STOP
- */
-enum mei_cb_file_ops mei_cl_notify_req2fop(u8 req)
-{
-	if (req == MEI_HBM_NOTIFICATION_START)
-		return MEI_FOP_NOTIFY_START;
-	else
-		return MEI_FOP_NOTIFY_STOP;
-}
-
-/**
- * mei_cl_irq_notify - send notification request in irq_thread context
- *
- * @cl: client
- * @cb: callback block.
- * @cmpl_list: complete list.
- *
- * Return: 0 on such and error otherwise.
- */
-int mei_cl_irq_notify(struct mei_cl *cl, struct mei_cl_cb *cb,
-		      struct mei_cl_cb *cmpl_list)
-{
-	struct mei_device *dev = cl->dev;
-	u32 msg_slots;
-	int slots;
-	int ret;
-	bool request;
-
-	msg_slots = mei_data2slots(sizeof(struct hbm_client_connect_request));
-	slots = mei_hbuf_empty_slots(dev);
-
-	if (slots < msg_slots)
-		return -EMSGSIZE;
-
-	request = mei_cl_notify_fop2req(cb->fop_type);
-	ret = mei_hbm_cl_notify_req(dev, cl, request);
-	if (ret) {
-		cl->status = ret;
-		list_move_tail(&cb->list, &cmpl_list->list);
-		return ret;
-	}
-
-	list_move_tail(&cb->list, &dev->ctrl_rd_list.list);
-	return 0;
-}
-
-/**
- * mei_cl_notify_request - send notification stop/start request
- *
- * @cl: host client
- * @file: associate request with file
- * @request: 1 for start or 0 for stop
- *
- * Locking: called under "dev->device_lock" lock
- *
- * Return: 0 on such and error otherwise.
- */
-int mei_cl_notify_request(struct mei_cl *cl, struct file *file, u8 request)
-{
-	struct mei_device *dev;
-	struct mei_cl_cb *cb;
-	enum mei_cb_file_ops fop_type;
-	int rets;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	if (!dev->hbm_f_ev_supported) {
-		cl_dbg(dev, cl, "notifications not supported\n");
-		return -EOPNOTSUPP;
-	}
-
-	if (!mei_cl_is_connected(cl))
-		return -ENODEV;
-
-	rets = pm_runtime_get(dev->dev);
-	if (rets < 0 && rets != -EINPROGRESS) {
-		pm_runtime_put_noidle(dev->dev);
-		cl_err(dev, cl, "rpm: get failed %d\n", rets);
-		return rets;
-	}
-
-	fop_type = mei_cl_notify_req2fop(request);
-	cb = mei_io_cb_init(cl, fop_type, file);
-	if (!cb) {
-		rets = -ENOMEM;
-		goto out;
-	}
-
-	if (mei_hbuf_acquire(dev)) {
-		if (mei_hbm_cl_notify_req(dev, cl, request)) {
-			rets = -ENODEV;
-			goto out;
-		}
-		list_add_tail(&cb->list, &dev->ctrl_rd_list.list);
-	} else {
-		list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
-	}
-
-	mutex_unlock(&dev->device_lock);
-	wait_event_timeout(cl->wait, cl->notify_en == request,
-			mei_secs_to_jiffies(MEI_CL_CONNECT_TIMEOUT));
-	mutex_lock(&dev->device_lock);
-
-	if (cl->notify_en != request) {
-		mei_io_list_flush(&dev->ctrl_rd_list, cl);
-		mei_io_list_flush(&dev->ctrl_wr_list, cl);
-		if (!cl->status)
-			cl->status = -EFAULT;
-	}
-
-	rets = cl->status;
-
-out:
-	cl_dbg(dev, cl, "rpm: autosuspend\n");
-	pm_runtime_mark_last_busy(dev->dev);
-	pm_runtime_put_autosuspend(dev->dev);
-
-	mei_io_cb_free(cb);
-	return rets;
-}
-
-/**
- * mei_cl_notify - raise notification
- *
- * @cl: host client
- *
- * Locking: called under "dev->device_lock" lock
- */
-void mei_cl_notify(struct mei_cl *cl)
-{
-	struct mei_device *dev;
-
-	if (!cl || !cl->dev)
-		return;
-
-	dev = cl->dev;
-
-	if (!cl->notify_en)
-		return;
-
-	cl_dbg(dev, cl, "notify event");
-	cl->notify_ev = true;
-	wake_up_interruptible_all(&cl->ev_wait);
-
-	if (cl->ev_async)
-		kill_fasync(&cl->ev_async, SIGIO, POLL_PRI);
-
-	mei_cl_bus_notify_event(cl);
-}
-
-/**
- * mei_cl_notify_get - get or wait for notification event
- *
- * @cl: host client
- * @block: this request is blocking
- * @notify_ev: true if notification event was received
- *
- * Locking: called under "dev->device_lock" lock
- *
- * Return: 0 on such and error otherwise.
- */
-int mei_cl_notify_get(struct mei_cl *cl, bool block, bool *notify_ev)
-{
-	struct mei_device *dev;
-	int rets;
-
-	*notify_ev = false;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	if (!mei_cl_is_connected(cl))
-		return -ENODEV;
-
-	if (cl->notify_ev)
-		goto out;
-
-	if (!block)
-		return -EAGAIN;
-
-	mutex_unlock(&dev->device_lock);
-	rets = wait_event_interruptible(cl->ev_wait, cl->notify_ev);
-	mutex_lock(&dev->device_lock);
-
-	if (rets < 0)
-		return rets;
-
-out:
-	*notify_ev = cl->notify_ev;
-	cl->notify_ev = false;
-	return 0;
-}
-
-/**
- * mei_cl_read_start - the start read client message function.
- *
- * @cl: host client
- * @length: number of bytes to read
- * @fp: pointer to file structure
- *
- * Return: 0 on success, <0 on failure.
- */
-int mei_cl_read_start(struct mei_cl *cl, size_t length, struct file *fp)
-{
-	struct mei_device *dev;
-	struct mei_cl_cb *cb;
-	int rets;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	if (!mei_cl_is_connected(cl))
-		return -ENODEV;
-
-	/* HW currently supports only one pending read */
-	if (!list_empty(&cl->rd_pending))
+	struct device *dev = &pdev->dev;
+	struct nct6775_sio_data *sio_data = dev_get_platdata(dev);
+	struct nct6775_data *data;
+	struct resource *res;
+	int i, s, err = 0;
+	int src, mask, available;
+	const u16 *reg_temp, *reg_temp_over, *reg_temp_hyst, *reg_temp_config;
+	const u16 *reg_temp_mon, *reg_temp_alternate, *reg_temp_crit;
+	const u16 *reg_temp_crit_l = NULL, *reg_temp_crit_h = NULL;
+	int num_reg_temp, num_reg_temp_mon;
+	u8 cr2a;
+	struct attribute_group *group;
+	struct device *hwmon_dev;
+	int num_attr_groups = 0;
+
+	res = platform_get_resource(pdev, IORESOURCE_IO, 0);
+	if (!devm_request_region(&pdev->dev, res->start, IOREGION_LENGTH,
+				 DRVNAME))
 		return -EBUSY;
 
-	if (!mei_me_cl_is_active(cl->me_cl)) {
-		cl_err(dev, cl, "no such me client\n");
-		return  -ENOTTY;
-	}
-
-	/* always allocate at least client max message */
-	length = max_t(size_t, length, mei_cl_mtu(cl));
-	cb = mei_cl_alloc_cb(cl, length, MEI_FOP_READ, fp);
-	if (!cb)
+	data = devm_kzalloc(&pdev->dev, sizeof(struct nct6775_data),
+			    GFP_KERNEL);
+	if (!data)
 		return -ENOMEM;
 
-	if (mei_cl_is_fixed_address(cl)) {
-		list_add_tail(&cb->list, &cl->rd_pending);
-		return 0;
-	}
+	data->kind = sio_data->kind;
+	data->sioreg = sio_data->sioreg;
+	data->addr = res->start;
+	mutex_init(&data->update_lock);
+	data->name = nct6775_device_names[data->kind];
+	data->bank = 0xff;		/* Force initial bank selection */
+	platform_set_drvdata(pdev, data);
 
-	rets = pm_runtime_get(dev->dev);
-	if (rets < 0 && rets != -EINPROGRESS) {
-		pm_runtime_put_noidle(dev->dev);
-		cl_err(dev, cl, "rpm: get failed %d\n", rets);
-		goto nortpm;
-	}
+	switch (data->kind) {
+	case nct6106:
+		data->in_num = 9;
+		data->pwm_num = 3;
+		data->auto_pwm_num = 4;
+		data->temp_fixed_num = 3;
+		data->num_temp_alarms = 6;
+		data->num_temp_beeps = 6;
 
-	if (mei_hbuf_acquire(dev)) {
-		rets = mei_hbm_cl_flow_control_req(dev, cl);
-		if (rets < 0)
-			goto out;
+		data->fan_from_reg = fan_from_reg13;
+		data->fan_from_reg_min = fan_from_reg13;
 
-		list_add_tail(&cb->list, &cl->rd_pending);
-	} else {
-		rets = 0;
-		list_add_tail(&cb->list, &dev->ctrl_wr_list.list);
-	}
+		data->temp_label = nct6776_temp_label;
+		data->temp_label_num = ARRAY_SIZE(nct6776_temp_label);
 
-out:
-	cl_dbg(dev, cl, "rpm: autosuspend\n");
-	pm_runtime_mark_last_busy(dev->dev);
-	pm_runtime_put_autosuspend(dev->dev);
-nortpm:
-	if (rets)
-		mei_io_cb_free(cb);
+		data->REG_VBAT = NCT6106_REG_VBAT;
+		data->REG_DIODE = NCT6106_REG_DIODE;
+		data->DIODE_MASK = NCT6106_DIODE_MASK;
+		data->REG_VIN = NCT6106_REG_IN;
+		data->REG_IN_MINMAX[0] = NCT6106_REG_IN_MIN;
+		data->REG_IN_MINMAX[1] = NCT6106_REG_IN_MAX;
+		data->REG_TARGET = NCT6106_REG_TARGET;
+		data->REG_FAN = NCT6106_REG_FAN;
+		data->REG_FAN_MODE = NCT6106_REG_FAN_MODE;
+		data->REG_FAN_MIN = NCT6106_REG_FAN_MIN;
+		data->REG_FAN_PULSES = NCT6106_REG_FAN_PULSES;
+		data->FAN_PULSE_SHIFT = NCT6106_FAN_PULSE_SHIFT;
+		data->REG_FAN_TIME[0] = NCT6106_REG_FAN_STOP_TIME;
+		data->REG_FAN_TIME[1] = NCT6106_REG_FAN_STEP_UP_TIME;
+		data->REG_FAN_TIME[2] = NCT6106_REG_FAN_STEP_DOWN_TIME;
+		data->REG_TOLERANCE_H = NCT6106_REG_TOLERANCE_H;
+		data->REG_PWM[0] = NCT6106_REG_PWM;
+		data->REG_PWM[1] = NCT6106_REG_FAN_START_OUTPUT;
+		data->REG_PWM[2] = NCT6106_REG_FAN_STOP_OUTPUT;
+		data->REG_PWM[5] = NCT6106_REG_WEIGHT_DUTY_STEP;
+		data->REG_PWM[6] = NCT6106_REG_WEIGHT_DUTY_BASE;
+		data->REG_PWM_READ = NCT6106_REG_PWM_READ;
+		data->REG_PWM_MODE = NCT6106_REG_PWM_MODE;
+		data->PWM_MODE_MASK = NCT6106_PWM_MODE_MASK;
+		data->REG_AUTO_TEMP = NCT6106_REG_AUTO_TEMP;
+		data->REG_AUTO_PWM = NCT6106_REG_AUTO_PWM;
+		data->REG_CRITICAL_TEMP = NCT6106_REG_CRITICAL_TEMP;
+		data->REG_CRITICAL_TEMP_TOLERANCE
+		  = NCT6106_REG_CRITICAL_TEMP_TOLERANCE;
+		data->REG_CRITICAL_PWM_ENABLE = NCT6106_REG_CRITICAL_PWM_ENABLE;
+		data->CRITICAL_PWM_ENABLE_MASK
+		  = NCT6106_CRITICAL_PWM_ENABLE_MASK;
+		data->REG_CRITICAL_PWM = NCT6106_REG_CRITICAL_PWM;
+		data->REG_TEMP_OFFSET = NCT6106_REG_TEMP_OFFSET;
+		data->REG_TEMP_SOURCE = NCT6106_REG_TEMP_SOURCE;
+		data->REG_TEMP_SEL = NCT6106_REG_TEMP_SEL;
+		data->REG_WEIGHT_TEMP_SEL = NCT6106_REG_WEIGHT_TEMP_SEL;
+		data->REG_WEIGHT_TEMP[0] = NCT6106_REG_WEIGHT_TEMP_STEP;
+		data->REG_WEIGHT_TEMP[1] = NCT6106_REG_WEIGHT_TEMP_STEP_TOL;
+		data->REG_WEIGHT_TEMP[2] = NCT6106_REG_WEIGHT_TEMP_BASE;
+		data->REG_ALARM = NCT6106_REG_ALARM;
+		data->ALARM_BITS = NCT6106_ALARM_BITS;
+		data->REG_BEEP = NCT6106_REG_BEEP;
+		data->BEEP_BITS = NCT6106_BEEP_BITS;
 
-	return rets;
-}
-
-/**
- * mei_cl_irq_write - write a message to device
- *	from the interrupt thread context
- *
- * @cl: client
- * @cb: callback block.
- * @cmpl_list: complete list.
- *
- * Return: 0, OK; otherwise error.
- */
-int mei_cl_irq_write(struct mei_cl *cl, struct mei_cl_cb *cb,
-		     struct mei_cl_cb *cmpl_list)
-{
-	struct mei_device *dev;
-	struct mei_msg_data *buf;
-	struct mei_msg_hdr mei_hdr;
-	size_t len;
-	u32 msg_slots;
-	int slots;
-	int rets;
-	bool first_chunk;
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	dev = cl->dev;
-
-	buf = &cb->buf;
-
-	first_chunk = cb->buf_idx == 0;
-
-	rets = first_chunk ? mei_cl_flow_ctrl_creds(cl) : 1;
-	if (rets < 0)
-		return rets;
-
-	if (rets == 0) {
-		cl_dbg(dev, cl, "No flow control credentials: not sending.\n");
-		return 0;
-	}
-
-	slots = mei_hbuf_empty_slots(dev);
-	len = buf->size - cb->buf_idx;
-	msg_slots = mei_data2slots(len);
-
-	mei_hdr.host_addr = mei_cl_host_addr(cl);
-	mei_hdr.me_addr = mei_cl_me_id(cl);
-	mei_hdr.reserved = 0;
-	mei_hdr.internal = cb->internal;
-
-	if (slots >= msg_slots) {
-		mei_hdr.length = len;
-		mei_hdr.msg_complete = 1;
-	/* Split the message only if we can write the whole host buffer */
-	} else if (slots == dev->hbuf_depth) {
-		msg_slots = slots;
-		len = (slots * sizeof(u32)) - sizeof(struct mei_msg_hdr);
-		mei_hdr.length = len;
-		mei_hdr.msg_complete = 0;
-	} else {
-		/* wait for next time the host buffer is empty */
-		return 0;
-	}
-
-	cl_dbg(dev, cl, "buf: size = %d idx = %lu\n",
-			cb->buf.size, cb->buf_idx);
-
-	rets = mei_write_message(dev, &mei_hdr, buf->data + cb->buf_idx);
-	if (rets) {
-		cl->status = rets;
-		list_move_tail(&cb->list, &cmpl_list->list);
-		return rets;
-	}
-
-	cl->status = 0;
-	cl->writing_state = MEI_WRITING;
-	cb->buf_idx += mei_hdr.length;
-	cb->completed = mei_hdr.msg_complete == 1;
-
-	if (first_chunk) {
-		if (mei_cl_flow_ctrl_reduce(cl))
-			return -EIO;
-	}
-
-	if (mei_hdr.msg_complete)
-		list_move_tail(&cb->list, &dev->write_waiting_list.list);
-
-	return 0;
-}
-
-/**
- * mei_cl_write - submit a write cb to mei device
- *	assumes device_lock is locked
- *
- * @cl: host client
- * @cb: write callback with filled data
- * @blocking: block until completed
- *
- * Return: number of bytes sent on success, <0 on failure.
- */
-int mei_cl_write(struct mei_cl *cl, struct mei_cl_cb *cb, bool blocking)
-{
-	struct mei_device *dev;
-	struct mei_msg_data *buf;
-	struct mei_msg_hdr mei_hdr;
-	int size;
-	int rets;
-
-
-	if (WARN_ON(!cl || !cl->dev))
-		return -ENODEV;
-
-	if (WARN_ON(!cb))
-		return -EINVAL;
-
-	dev = cl->dev;
-
-	buf = &cb->buf;
-	size = buf->size;
-
-	cl_dbg(dev, cl, "size=%d\n", size);
-
-	rets = pm_runtime_get(dev->dev);
-	if (rets < 0 && rets != -EINPROGRESS) {
-		pm_runtime_put_noidle(dev->dev);
-		cl_err(dev, cl, "rpm: get failed %d\n", rets);
-		return rets;
-	}
-
-	cb->buf_idx = 0;
-	cl->writing_state = MEI_IDLE;
-
-	mei_hdr.host_addr = mei_cl_host_addr(cl);
-	mei_hdr.me_addr = mei_cl_me_id(cl);
-	mei_hdr.reserved = 0;
-	mei_hdr.msg_complete = 0;
-	mei_hdr.internal = cb->internal;
-
-	rets = mei_cl_flow_ctrl_creds(cl);
-	if (rets < 0)
-		goto err;
-
-	if (rets == 0) {
-		cl_dbg(dev, cl, "No flow control credentials: not sending.\n");
-		rets = size;
-		goto out;
-	}
-	if (!mei_hbuf_acquire(dev)) {
-		cl_dbg(dev, cl, "Cannot acquire the host buffer: not sending.\n");
-		rets = size;
-		goto out;
-	}
-
-	/* Check for a maximum length */
-	if (size > mei_hbuf_max_len(dev)) {
-		mei_hdr.length = mei_hbuf_max_len(dev);
-		mei_hdr.msg_complete = 0;
-	} else {
-		mei_hdr.length = size;
-		mei_hdr.msg_complete = 1;
-	}
-
-	rets = mei_write_message(dev, &mei_hdr, buf->data);
-	if (rets)
-		goto err;
-
-	rets = mei_cl_flow_ctrl_reduce(cl);
-	if (rets)
-		goto err;
-
-	cl->writing_state = MEI_WRITING;
-	cb->buf_idx = mei_hdr.length;
-	cb->completed = mei_hdr.msg_complete == 1;
-
-out:
-	if (mei_hdr.msg_complete)
-		list_add_tail(&cb->list, &dev->write_waiting_list.list);
-	else
-		list_add_tail(&cb->list, &dev->write_list.list);
-
-	cb = NULL;
-	if (blocking && cl->writing_state != MEI_WRITE_COMPLETE) {
-
-		mutex_unlock(&dev->device_lock);
-		rets = wait_event_interruptible(cl->tx_wait,
-				cl->writing_state == MEI_WRITE_COMPLETE);
-		mutex_lock(&dev->device_lock);
-		/* wait_event_interruptible returns -ERESTARTSYS */
-		if (rets) {
-			if (signal_pending(current))
-				rets = -EINTR;
-			goto err;
-		}
-	}
-
-	rets = size;
-err:
-	cl_dbg(dev, cl, "rpm: autosuspend\n");
-	pm_runtime_mark_last_busy(dev->dev);
-	pm_runtime_put_autosuspend(dev->dev);
-
-	return rets;
-}
-
-
-/**
- * mei_cl_complete - processes completed operation for a client
- *
- * @cl: private data of the file object.
- * @cb: callback block.
- */
-void mei_cl_complete(struct mei_cl *cl, struct mei_cl_cb *cb)
-{
-	struct mei_device *dev = cl->dev;
-
-	switch (cb->fop_type) {
-	case MEI_FOP_WRITE:
-		mei_io_cb_free(cb);
-		cl->writing_state = MEI_WRITE_COMPLETE;
-		if (waitqueue_active(&cl->tx_wait)) {
-			wake_up_interruptible(&cl->tx_wait);
-		} else {
-			pm_runtime_mark_last_busy(dev->dev);
-			pm_request_autosuspend(dev->dev);
-		}
-		break;
-
-	case MEI_FOP_READ:
-		list_add_tail(&cb->list, &cl->rd_completed);
-		if (waitqueue_active(&cl->rx_wait))
-			wake_up_interruptible_all(&cl->rx_wait);
-		else
-			mei_cl_bus_rx_event(cl);
-		break;
-
-	case MEI_FOP_CONNECT:
-	case MEI_FOP_DISCONNECT:
-	case MEI_FOP_NOTIFY_STOP:
-	case MEI_FOP_NOTIFY_START:
-		if (waitqueue_active(&cl->wait))
-			wake_up(&cl->wait);
+		reg_temp = NCT6106_REG_TEMP;
+		reg_temp_mon = NCT6106_REG_TEMP_MON;
+		num_reg_temp = ARRAY_SIZE(NCT6106_REG_TEMP);
+		num_reg_temp_mon = ARRAY_SIZE(NCT6106_REG_TEMP_MON);
+		reg_temp_over = NCT6106_REG_TEMP_OVER;
+		reg_temp_hyst = NCT6106_REG_TEMP_HYST;
+		reg_temp_config = NCT6106_REG_TEMP_CONFIG;
+		reg_temp_alternate = NCT6106_REG_TEMP_ALTERNATE;
+		reg_temp_crit = NCT6106_REG_TEMP_CRIT;
+		reg_temp_crit_l = NCT6106_REG_TEMP_CRIT_L;
+		reg_temp_crit_h = NCT6106_REG_TEMP_CRIT_H;
 
 		break;
-	case MEI_FOP_DISCONNECT_RSP:
-		mei_io_cb_free(cb);
-		mei_cl_set_disconnected(cl);
+	case nct6775:
+		data->in_num = 9;
+		data->pwm_num = 3;
+		data->auto_pwm_num = 6;
+		data->has_fan_div = true;
+		data->temp_fixed_num = 3;
+		data->num_temp_alarms = 3;
+		data->num_temp_beeps = 3;
+
+		data->ALARM_BITS = NCT6775_ALARM_BITS;
+		data->BEEP_BITS = NCT6775_BEEP_BITS;
+
+		data->fan_from_reg = fan_from_reg16;
+		data->fan_from_reg_min = fan_from_reg8;
+		data->target_temp_mask = 0x7f;
+		data->tolerance_mask = 0x0f;
+		data->speed_tolerance_limit = 15;
+
+		data->temp_label = nct6775_temp_label;
+		data->temp_label_num = ARRAY_SIZE(nct6775_temp_label);
+
+		data->REG_CONFIG = NCT6775_REG_CONFIG;
+		data->REG_VBAT = NCT6775_REG_VBAT;
+		data->REG_DIODE = NCT6775_REG_DIODE;
+		data->DIODE_MASK = NCT6775_DIODE_MASK;
+		data->REG_VIN = NCT6775_REG_IN;
+		data->REG_IN_MINMAX[0] = NCT6775_REG_IN_MIN;
+		data->REG_IN_MINMAX[1] = NCT6775_REG_IN_MAX;
+		data->REG_TARGET = NCT6775_REG_TARGET;
+		data->REG_FAN = NCT6775_REG_FAN;
+		data->REG_FAN_MODE = NCT6775_REG_FAN_MODE;
+		data->REG_FAN_MIN = NCT6775_REG_FAN_MIN;
+		data->REG_FAN_PULSES = NCT6775_REG_FAN_PULSES;
+		data->FAN_PULSE_SHIFT = NCT6775_FAN_PULSE_SHIFT;
+		data->REG_FAN_TIME[0] = NCT6775_REG_FAN_STOP_TIME;
+		data->REG_FAN_TIME[1] = NCT6775_REG_FAN_STEP_UP_TIME;
+		data->REG_FAN_TIME[2] = NCT6775_REG_FAN_STEP_DOWN_TIME;
+		data->REG_PWM[0] = NCT6775_REG_PWM;
+		data->REG_PWM[1] = NCT6775_REG_FAN_START_OUTPUT;
+		data->REG_PWM[2] = NCT6775_REG_FAN_STOP_OUTPUT;
+		data->REG_PWM[3] = NCT6775_REG_FAN_MAX_OUTPUT;
+		data->REG_PWM[4] = NCT6775_REG_FAN_STEP_OUTPUT;
+		data->REG_PWM[5] = NCT6775_REG_WEIGHT_DUTY_STEP;
+		data->REG_PWM_READ = NCT6775_REG_PWM_READ;
+		data->REG_PWM_MODE = NCT6775_REG_PWM_MODE;
+		data->PWM_MODE_MASK = NCT6775_PWM_MODE_MASK;
+		data->REG_AUTO_TEMP = NCT6775_REG_AUTO_TEMP;
+		data->REG_AUTO_PWM = NCT6775_REG_AUTO_PWM;
+		data->REG_CRITICAL_TEMP = NCT6775_REG_CRITICAL_TEMP;
+		data->REG_CRITICAL_TEMP_TOLERANCE
+		  = NCT6775_REG_CRITICAL_TEMP_TOLERANCE;
+		data->REG_TEMP_OFFSET = NCT6775_REG_TEMP_OFFSET;
+		data->REG_TEMP_SOURCE = NCT6775_REG_TEMP_SOURCE;
+		data->REG_TEMP_SEL = NCT6775_REG_TEMP_SEL;
+		data->REG_WEIGHT_TEMP_SEL = NCT6775_REG_WEIGHT_TEMP_SEL;
+		data->REG_WEIGHT_TEMP[0] = NCT6775_REG_WEIGHT_TEMP_STEP;
+		data->REG_WEIGHT_TEMP[1] = NCT6775_REG_WEIGHT_TEMP_STEP_TOL;
+		data->REG_WEIGHT_TEMP[2] = NCT6775_REG_WEIGHT_TEMP_BASE;
+		data->REG_ALARM = NCT6775_REG_ALARM;
+		data->REG_BEEP = NCT6775_REG_BEEP;
+
+		reg_temp = NCT6775_REG_TEMP;
+		reg_temp_mon = NCT6775_REG_TEMP_MON;
+		num_reg_temp = ARRAY_SIZE(NCT6775_REG_TEMP);
+		num_reg_temp_mon = ARRAY_SIZE(NCT6775_REG_TEMP_MON);
+		reg_temp_over = NCT6775_REG_TEMP_OVER;
+		reg_temp_hyst = NCT6775_REG_TEMP_HYST;
+		reg_temp_config = NCT6775_REG_TEMP_CONFIG;
+		reg_temp_alternate = NCT6775_REG_TEMP_ALTERNATE;
+		reg_temp_crit = NCT6775_REG_TEMP_CRIT;
+
 		break;
-	default:
-		BUG_ON(0);
-	}
-}
+	case nct6776:
+		data->in_num = 9;
+		data->pwm_num = 3;
+		data->auto_pwm_num = 4;
+		data->has_fan_div = false;
+		data->temp_fixed_num = 3;
+		data->num_temp_alarms = 3;
+		data->num_temp_beeps = 6;
 
+		data->ALARM_BITS = NCT6776_ALARM_BITS;
+		data->BEEP_BITS = NCT6776_BEEP_BITS;
 
-/**
- * mei_cl_all_disconnect - disconnect forcefully all connected clients
- *
- * @dev: mei device
- */
-void mei_cl_all_disconnect(struct mei_device *dev)
-{
-	struct mei_cl *cl;
+		data->fan_from_reg = fan_from_reg13;
+		data->fan_from_reg_min = fan_from_reg13;
+		data->target_temp_mask = 0xff;
+		data->tolerance_mask = 0x07;
+		data->speed_tolerance_limit = 63;
 
-	list_for_each_entry(cl, &dev->file_list, link)
-		mei_cl_set_disconnected(cl);
-}
+		data->temp_label = nct6776_temp_label;
+		data->temp_label_num = ARRAY_SIZE(nct6776_temp_label);
 
+		data->REG_CONFIG = NCT6775_REG_CONFIG;
+		data->REG_VBAT = NCT6775_REG_VBAT;
+		data->REG_DIODE = NCT6775_REG_DIODE;
+		data->DIODE_MASK = NCT6775_DIODE_MASK;
+		data->REG_VIN = NCT6775_REG_IN;
+		data->REG_IN_MINMAX[0] = NCT6775_REG_IN_MIN;
+		data->REG_IN_MINMAX[1] = NCT6775_REG_IN_MAX;
+		data->REG_TARGET = NCT6775_REG_TARGET;
+		data->REG_FAN = NCT6775_REG_FAN;
+		data->REG_FAN_MODE = NCT6775_REG_FAN_MODE;
+		data->REG_FAN_MIN = NCT6776_REG_FAN_MIN;
+		data->REG_FAN_PULSES = NCT6776_REG_FAN_PULSES;
+		data->FAN_PULSE_SHIFT = NCT6775_FAN_PULSE_SHIFT;
+		data->REG_FAN_TIME[0] = NCT6775_REG_FAN_STOP_TIME;
+		data->REG_FAN_TIME[1] = NCT6776_REG_FAN_STEP_UP_TIME;
+		data->REG_FAN_TIME[2] = NCT6776_REG_FAN_STEP_DOWN_TIME;
+		data->REG_TOLERANCE_H = NCT6776_REG_TOLERANCE_H;
+		data->REG_PWM[0] = NCT6775_REG_PWM;
+		data->REG_PWM[1] = NCT6775_REG_FAN_START_OUTPUT;
+		data->REG_PWM[2] = NCT6775_REG_FAN_STOP_OUTPUT;
+		data->REG_PWM[5] = NCT6775_REG_WEIGHT_DUTY_STEP;
+		data->REG_PWM[6] = NCT6776_REG_WEIGHT_DUTY_BASE;
+		data->REG_PWM_READ = NCT6775_REG_PWM_READ;
+		data->REG_PWM_MODE = NCT6776_REG_PWM_MODE;
+		data->PWM_MODE_MASK = NCT6776_PWM_MODE_MASK;
+		data->REG_AUTO_TEMP = NCT6775_REG_AUTO_TEMP;
+		data->REG_AUTO_PWM = NCT6775_REG_AUTO_PWM;
+		data->REG_CRITICAL_TEMP = NCT6775_REG_CRITICAL_TEMP;
+		data->REG_CRITICAL_TEMP_TOLERANCE
+		  = NCT6775_REG_CRITICAL_TEMP_TOLERANCE;
+		data->REG_TEMP_OFFSET = NCT6775_REG_TEMP_OFFSET;
+		data->REG_TEMP_SOURCE = NCT6775_REG_TEMP_SOURCE;
+		data->REG_TEMP_SEL = NCT6775_REG_TEMP_SEL;
+		data->REG_WEIGHT_TEMP_SEL = NCT6775_REG_WEIGHT_TEMP_SEL;
+		data->REG_WEIGHT_TEMP[0] = NCT6775_REG_WEIGHT_TEMP_STEP;
+		data->REG_WEIGHT_TEMP[1] = NCT6775_REG_WEIGHT_TEMP_STEP_TOL;
+		data->REG_WEIGHT_TEMP[2] = NCT6775_REG_WEIGHT_TEMP_BASE;
+		data->REG_ALARM = NCT6775_REG_ALARM;
+		data->REG_BEEP = NCT6776_REG_BEEP;
 
-/**
- * mei_cl_all_wakeup  - wake up all readers and writers they can be interrupted
- *
- * @dev: mei device
- */
-void mei_cl_all_wakeup(struct mei_device *dev)
-{
-	struct mei_cl *cl;
+		reg_temp = NCT6775_REG_TEMP;
+		reg_temp_mon = NCT6775_REG_TEMP_MON;
+		num_reg_temp = ARRAY_SIZE(NCT6775_REG_TEMP);
+		num_reg_temp_mon = ARRAY_SIZE(NCT6775_REG_TEMP_MON);
+		reg_temp_over = NCT6775_REG_TEMP_OVER;
+		reg_temp_hyst = NCT6775_REG_TEMP_HYST;
+		reg_temp_config = NCT6776_REG_TEMP_CONFIG;
+		reg_temp_alternate = NCT6776_REG_TEMP_ALTERNATE;
+		reg_temp_crit = NCT6776_REG_TEMP_CRIT;
 
-	list_for_each_entry(cl, &dev->file_list, link) {
-		if (waitqueue_active(&cl->rx_wait)) {
-			cl_dbg(dev, cl, "Waking up reading client!\n");
-			wake_up_interruptible(&cl->rx_wait);
+		break;
+	case nct6779:
+		data->in_num = 15;
+		data->pwm_num = 5;
+		data->auto_pwm_num = 4;
+		data->has_fan_div = false;
+		data->temp_fixed_num = 6;
+		data->num_temp_alarms = 2;
+		data->num_temp_beeps = 2;
+
+		data->ALARM_BITS = NCT6779_ALARM_BITS;
+		data->BEEP_BITS = NCT6779_BEEP_BITS;
+
+		data->fan_from_reg = fan_from_reg13;
+		data->fan_from_reg_min = fan_from_reg13;
+		data->target_temp_mask = 0xff;
+		data->tolerance_mask = 0x07;
+		data->speed_tolerance_limit = 63;
+
+		data->temp_label = nct6779_temp_label;
+		data->temp_label_num = NCT6779_NUM_LABELS;
+
+		data->REG_CONFIG = NCT6775_REG_CONFIG;
+		data->REG_VBAT = NCT6775_REG_VBAT;
+		data->REG_DIODE = NCT6775_REG_DIODE;
+		data->DIODE_MASK = NCT6775_DIODE_MASK;
+		data->REG_VIN = NCT6779_REG_IN;
+		data->REG_IN_MINMAX[0] = NCT6775_REG_IN_MIN;
+		data->REG_IN_MINMAX[1] = NCT6775_REG_IN_MAX;
+		data->REG_TARGET = NCT6775_REG_TARGET;
+		data->REG_FAN = NCT6779_REG_FAN;
+		data->REG_FAN_MODE = NCT6775_REG_FAN_MODE;
+		data->REG_FAN_MIN = NCT6776_REG_FAN_MIN;
+		data->REG_FAN_PULSES = NCT6779_REG_FAN_PULSES;
+		data->FAN_PULSE_SHIFT = NCT6775_FAN_PULSE_SHIFT;
+		data->REG_FAN_TIME[0] = NCT6775_REG_FAN_STOP_TIME;
+		data->REG_FAN_TIME[1] = NCT6776_REG_FAN_STEP_UP_TIME;
+		data->REG_FAN_TIME[2] = NCT6776_REG_FAN_STEP_DOWN_TIME;
+		data->REG_TOLERANCE_H = NCT6776_REG_TOLERANCE_H;
+		data->REG_PWM[0] = NCT6775_REG_PWM;
+		data->REG_PWM[1] = NCT6775_REG_FAN_START_OUTPUT;
+		data->REG_PWM[2] = NCT6775_REG_FAN_STOP_OUTPUT;
+		data->REG_PWM[5] = NCT6775_REG_WEIGHT_DUTY_STEP;
+		data->REG_PWM[6] = NCT6776_REG_WEIGHT_DUTY_BASE;
+		data->REG_PWM_READ = NCT6775_REG_PWM_READ;
+		data->REG_PWM_MODE = NCT6776_REG_PWM_MODE;
+		data->PWM_MODE_MASK = NCT6776_PWM_MODE_MASK;
+		data->REG_AUTO_TEMP = NCT6775_REG_AUTO_TEMP;
+		data->REG_AUTO_PWM = NCT6775_REG_AUTO_PWM;
+		data->REG_CRITICAL_TEMP = NCT6775_REG_CRITICAL_TEMP;
+		data->REG_CRITICAL_TEMP_TOLERANCE
+		  = NCT6775_REG_CRITICAL_TEMP_TOLERANCE;
+		data->REG_CRITICAL_PWM_ENABLE = NCT6779_REG_CRITICAL_PWM_ENABLE;
+		data->CRITICAL_PWM_ENABLE_MASK
+		  = NCT6779_CRITICAL_PWM_ENABLE_MASK;
+		data->REG_CRITICAL_PWM = NCT6779_REG_CRITICAL_PWM;
+		data->REG_TEMP_OFFSET = NCT6779_REG_TEMP_OFFSET;
+		data->REG_TEMP_SOURCE = NCT6775_REG_TEMP_SOURCE;
+		data->REG_TEMP_SEL = NCT6775_REG_TEMP_SEL;
+		data->REG_WEIGHT_TEMP_SEL = NCT6775_REG_WEIGHT_TEMP_SEL;
+		data->REG_WEIGHT_TEMP[0] = NCT6775_REG_WEIGHT_TEMP_STEP;
+		data->REG_WEIGHT_TEMP[1] = NCT6775_REG_WEIGHT_TEMP_STEP_TOL;
+		data->REG_WEIGHT_TEMP[2] = NCT6775_REG_WEIGHT_TEMP_BASE;
+		data->REG_ALARM = NCT6779_REG_ALARM;
+		data->REG_BEEP = NCT6776_REG_BEEP;
+
+		reg_temp = NCT6779_REG_TEMP;
+		reg_temp_mon = NCT6779_REG_TEMP_MON;
+		num_reg_temp = ARRAY_SIZE(NCT6779_REG_TEMP);
+		num_reg_temp_mon = ARRAY_SIZE(NCT6779_REG_TEMP_MON);
+		reg_temp_over = NCT6779_REG_TEMP_OVER;
+		reg_temp_hyst = NCT6779_REG_TEMP_HYST;
+		reg_temp_config = NCT6779_REG_TEMP_CONFIG;
+		reg_temp_alternate = NCT6779_REG_TEMP_ALTERNATE;
+		reg_temp_crit = NCT6779_REG_TEMP_CRIT;
+
+		break;
+	case nct6791:
+	case nct6792:
+	case nct6793:
+		data->in_num = 15;
+		data->pwm_num = 6;
+		data->auto_pwm_num = 4;
+		data->has_fan_div = false;
+		data->temp_fixed_num = 6;
+		data->num_temp_alarms = 2;
+		data->num_temp_beeps = 2;
+
+		data->ALARM_BITS = NCT6791_ALARM_BITS;
+		data->BEEP_BITS = NCT6779_BEEP_BITS;
+
+		data->fan_from_reg = fan_from_reg13;
+		data->fan_from_reg_min = fan_from_reg13;
+		data->target_temp_mask = 0xff;
+		data->tolerance_mask = 0x07;
+		data->speed_tolerance_limit = 63;
+
+		switch (data->kind) {
+		default:
+		case nct6791:
+			data->temp_label = nct6779_temp_label;
+			break;
+		case nct6792:
+			data->temp_label = nct6792_temp_label;
+			break;
+		case nct6793:
+			data->temp_label = nct6793_temp_label;
+			break;
 		}
-		if (waitqueue_active(&cl->tx_wait)) {
-			cl_dbg(dev, cl, "Waking up writing client!\n");
-			wake_up_interruptible(&cl->tx_wait);
-		}
+		data->temp_label_num = NCT6791_NUM_LABELS;
 
-		/* synchronized under device mutex */
-		if (waitqueue_active(&cl->ev_wait)) {
-			cl_dbg(dev, cl, "Waking up waiting for event clients!\n");
-			wake_up_interruptible(&cl->ev_wait);
-		}
-	}
-}
-
-/**
- * mei_cl_all_write_clear - clear all pending writes
- *
- * @dev: mei device
- */
-void mei_cl_all_write_clear(struct mei_device *dev)
-{
-	mei_io_list_free(&dev->write_list, NULL);
-	mei_io_list_free(&dev->write_waiting_list, NULL);
-}
-
-
+		data->REG_CONFIG = NCT6775_REG_CONFIG;
+		data->REG_VBAT = NCT6775_REG_VBAT;
+		data->REG_DIODE = NCT6775_REG_DIODE;
+		data->DIODE_MASK = NCT6775_DIODE_MASK;
+		data->REG_VIN = NCT6779_REG_IN;
+		data->REG_IN_MINMAX[0] = NCT6775_REG_IN_MIN;
+		data->REG_IN_MINMAX[1] = NCT6775_REG_IN_MAX;
+		data->REG_TARGET = NCT6775_REG_TARGET;
+		data->REG_FAN = NCT6779_REG_FAN;
+		data->REG_FAN_MODE = NCT6775_REG_FAN_MODE;
+		data->REG_FAN_MIN = NCT6776_REG_FAN_MIN;
+		data->REG_FAN_PULSES = NCT6779_REG_FAN_PULSES;
+		data->FAN_PULSE_SHIFT = NCT6775_FAN_PULSE_SHIFT;
+		data->REG_FAN_TIME[0] = NCT6775_REG_FAN_STOP_TIME;
+		data->REG_FAN_TIME[1] = NCT6776_REG_FAN_STEP_UP_TIME;
+		data->REG_FAN_TIME[2] = NCT6776_REG_FAN_STEP_DOWN_TIME;
+		data->REG_TOLERANCE_H = NCT6776_REG_TOLERANCE_H;
+		data->REG_PWM[0] = NCT6775_REG_PWM;
+		data->REG_PWM[1] = NCT6775_REG_FAN_START_OUTPUT;
+		data->REG_PWM[2] = NCT6775_REG_FAN_STOP_OUTPUT;
+		data->REG_PWM[5] = NCT6791_REG_WEIGHT_DUTY_STEP;
+		data->REG_PWM[6] = NCT6791_REG_WEIGHT_DUTY_BASE;
+		data->REG_PWM_READ = NCT6775_REG_PWM_READ;
+		data->REG_PWM_MODE = NCT6776_REG_PWM_MODE;
+		data->PWM_MODE_MASK = NCT6776_PWM_MODE_MASK;
+		data->REG_AUTO_TEMP = NCT6775_REG_AUTO_TEMP;
+		data->REG_AUTO_PWM = NCT6775_REG_AUTO_PWM;
+		data->REG_CRITICAL_TEMP = NCT6775_REG_CRITICAL_TEMP;
+		data->REG_CRITICAL_TEMP_TOLERANCE
+		  = NCT6775_REG_CRITICAL_TEMP_TOLERANCE;
+		data->REG_C

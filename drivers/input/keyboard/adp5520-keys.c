@@ -1,196 +1,96 @@
-/*
- * Keypad driver for Analog Devices ADP5520 MFD PMICs
- *
- * Copyright 2009 Analog Devices Inc.
- *
- * Licensed under the GPL-2 or later.
- */
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/platform_device.h>
-#include <linux/input.h>
-#include <linux/mfd/adp5520.h>
-#include <linux/slab.h>
-#include <linux/device.h>
-
-struct adp5520_keys {
-	struct input_dev *input;
-	struct notifier_block notifier;
-	struct device *master;
-	unsigned short keycode[ADP5520_KEYMAPSIZE];
-};
-
-static void adp5520_keys_report_event(struct adp5520_keys *dev,
-					unsigned short keymask, int value)
-{
-	int i;
-
-	for (i = 0; i < ADP5520_MAXKEYS; i++)
-		if (keymask & (1 << i))
-			input_report_key(dev->input, dev->keycode[i], value);
-
-	input_sync(dev->input);
-}
-
-static int adp5520_keys_notifier(struct notifier_block *nb,
-				 unsigned long event, void *data)
-{
-	struct adp5520_keys *dev;
-	uint8_t reg_val_lo, reg_val_hi;
-	unsigned short keymask;
-
-	dev = container_of(nb, struct adp5520_keys, notifier);
-
-	if (event & ADP5520_KP_INT) {
-		adp5520_read(dev->master, ADP5520_KP_INT_STAT_1, &reg_val_lo);
-		adp5520_read(dev->master, ADP5520_KP_INT_STAT_2, &reg_val_hi);
-
-		keymask = (reg_val_hi << 8) | reg_val_lo;
-		/* Read twice to clear */
-		adp5520_read(dev->master, ADP5520_KP_INT_STAT_1, &reg_val_lo);
-		adp5520_read(dev->master, ADP5520_KP_INT_STAT_2, &reg_val_hi);
-		keymask |= (reg_val_hi << 8) | reg_val_lo;
-		adp5520_keys_report_event(dev, keymask, 1);
-	}
-
-	if (event & ADP5520_KR_INT) {
-		adp5520_read(dev->master, ADP5520_KR_INT_STAT_1, &reg_val_lo);
-		adp5520_read(dev->master, ADP5520_KR_INT_STAT_2, &reg_val_hi);
-
-		keymask = (reg_val_hi << 8) | reg_val_lo;
-		/* Read twice to clear */
-		adp5520_read(dev->master, ADP5520_KR_INT_STAT_1, &reg_val_lo);
-		adp5520_read(dev->master, ADP5520_KR_INT_STAT_2, &reg_val_hi);
-		keymask |= (reg_val_hi << 8) | reg_val_lo;
-		adp5520_keys_report_event(dev, keymask, 0);
-	}
-
-	return 0;
-}
-
-static int adp5520_keys_probe(struct platform_device *pdev)
-{
-	struct adp5520_keys_platform_data *pdata = dev_get_platdata(&pdev->dev);
-	struct input_dev *input;
-	struct adp5520_keys *dev;
-	int ret, i;
-	unsigned char en_mask, ctl_mask = 0;
-
-	if (pdev->id != ID_ADP5520) {
-		dev_err(&pdev->dev, "only ADP5520 supports Keypad\n");
-		return -EINVAL;
-	}
-
-	if (!pdata) {
-		dev_err(&pdev->dev, "missing platform data\n");
-		return -EINVAL;
-	}
-
-	if (!(pdata->rows_en_mask && pdata->cols_en_mask))
-		return -EINVAL;
-
-	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
-	if (!dev) {
-		dev_err(&pdev->dev, "failed to alloc memory\n");
-		return -ENOMEM;
-	}
-
-	input = devm_input_allocate_device(&pdev->dev);
-	if (!input)
-		return -ENOMEM;
-
-	dev->master = pdev->dev.parent;
-	dev->input = input;
-
-	input->name = pdev->name;
-	input->phys = "adp5520-keys/input0";
-	input->dev.parent = &pdev->dev;
-
-	input_set_drvdata(input, dev);
-
-	input->id.bustype = BUS_I2C;
-	input->id.vendor = 0x0001;
-	input->id.product = 0x5520;
-	input->id.version = 0x0001;
-
-	input->keycodesize = sizeof(dev->keycode[0]);
-	input->keycodemax = pdata->keymapsize;
-	input->keycode = dev->keycode;
-
-	memcpy(dev->keycode, pdata->keymap,
-		pdata->keymapsize * input->keycodesize);
-
-	/* setup input device */
-	__set_bit(EV_KEY, input->evbit);
-
-	if (pdata->repeat)
-		__set_bit(EV_REP, input->evbit);
-
-	for (i = 0; i < input->keycodemax; i++)
-		__set_bit(dev->keycode[i], input->keybit);
-	__clear_bit(KEY_RESERVED, input->keybit);
-
-	ret = input_register_device(input);
-	if (ret) {
-		dev_err(&pdev->dev, "unable to register input device\n");
-		return ret;
-	}
-
-	en_mask = pdata->rows_en_mask | pdata->cols_en_mask;
-
-	ret = adp5520_set_bits(dev->master, ADP5520_GPIO_CFG_1, en_mask);
-
-	if (en_mask & ADP5520_COL_C3)
-		ctl_mask |= ADP5520_C3_MODE;
-
-	if (en_mask & ADP5520_ROW_R3)
-		ctl_mask |= ADP5520_R3_MODE;
-
-	if (ctl_mask)
-		ret |= adp5520_set_bits(dev->master, ADP5520_LED_CONTROL,
-			ctl_mask);
-
-	ret |= adp5520_set_bits(dev->master, ADP5520_GPIO_PULLUP,
-		pdata->rows_en_mask);
-
-	if (ret) {
-		dev_err(&pdev->dev, "failed to write\n");
-		return -EIO;
-	}
-
-	dev->notifier.notifier_call = adp5520_keys_notifier;
-	ret = adp5520_register_notifier(dev->master, &dev->notifier,
-			ADP5520_KP_IEN | ADP5520_KR_IEN);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to register notifier\n");
-		return ret;
-	}
-
-	platform_set_drvdata(pdev, dev);
-	return 0;
-}
-
-static int adp5520_keys_remove(struct platform_device *pdev)
-{
-	struct adp5520_keys *dev = platform_get_drvdata(pdev);
-
-	adp5520_unregister_notifier(dev->master, &dev->notifier,
-				ADP5520_KP_IEN | ADP5520_KR_IEN);
-
-	return 0;
-}
-
-static struct platform_driver adp5520_keys_driver = {
-	.driver	= {
-		.name	= "adp5520-keys",
-	},
-	.probe		= adp5520_keys_probe,
-	.remove		= adp5520_keys_remove,
-};
-module_platform_driver(adp5520_keys_driver);
-
-MODULE_AUTHOR("Michael Hennerich <hennerich@blackfin.uclinux.org>");
-MODULE_DESCRIPTION("Keys ADP5520 Driver");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:adp5520-keys");
+x1
+#define MC_XPB_RTR_DEST_MAP1__NMR__SHIFT 0x0
+#define MC_XPB_RTR_DEST_MAP1__DEST_OFFSET_MASK 0xffffe
+#define MC_XPB_RTR_DEST_MAP1__DEST_OFFSET__SHIFT 0x1
+#define MC_XPB_RTR_DEST_MAP1__DEST_SEL_MASK 0xf00000
+#define MC_XPB_RTR_DEST_MAP1__DEST_SEL__SHIFT 0x14
+#define MC_XPB_RTR_DEST_MAP1__DEST_SEL_RPB_MASK 0x1000000
+#define MC_XPB_RTR_DEST_MAP1__DEST_SEL_RPB__SHIFT 0x18
+#define MC_XPB_RTR_DEST_MAP1__SIDE_OK_MASK 0x2000000
+#define MC_XPB_RTR_DEST_MAP1__SIDE_OK__SHIFT 0x19
+#define MC_XPB_RTR_DEST_MAP1__APRTR_SIZE_MASK 0x7c000000
+#define MC_XPB_RTR_DEST_MAP1__APRTR_SIZE__SHIFT 0x1a
+#define MC_XPB_RTR_DEST_MAP2__NMR_MASK 0x1
+#define MC_XPB_RTR_DEST_MAP2__NMR__SHIFT 0x0
+#define MC_XPB_RTR_DEST_MAP2__DEST_OFFSET_MASK 0xffffe
+#define MC_XPB_RTR_DEST_MAP2__DEST_OFFSET__SHIFT 0x1
+#define MC_XPB_RTR_DEST_MAP2__DEST_SEL_MASK 0xf00000
+#define MC_XPB_RTR_DEST_MAP2__DEST_SEL__SHIFT 0x14
+#define MC_XPB_RTR_DEST_MAP2__DEST_SEL_RPB_MASK 0x1000000
+#define MC_XPB_RTR_DEST_MAP2__DEST_SEL_RPB__SHIFT 0x18
+#define MC_XPB_RTR_DEST_MAP2__SIDE_OK_MASK 0x2000000
+#define MC_XPB_RTR_DEST_MAP2__SIDE_OK__SHIFT 0x19
+#define MC_XPB_RTR_DEST_MAP2__APRTR_SIZE_MASK 0x7c000000
+#define MC_XPB_RTR_DEST_MAP2__APRTR_SIZE__SHIFT 0x1a
+#define MC_XPB_RTR_DEST_MAP3__NMR_MASK 0x1
+#define MC_XPB_RTR_DEST_MAP3__NMR__SHIFT 0x0
+#define MC_XPB_RTR_DEST_MAP3__DEST_OFFSET_MASK 0xffffe
+#define MC_XPB_RTR_DEST_MAP3__DEST_OFFSET__SHIFT 0x1
+#define MC_XPB_RTR_DEST_MAP3__DEST_SEL_MASK 0xf00000
+#define MC_XPB_RTR_DEST_MAP3__DEST_SEL__SHIFT 0x14
+#define MC_XPB_RTR_DEST_MAP3__DEST_SEL_RPB_MASK 0x1000000
+#define MC_XPB_RTR_DEST_MAP3__DEST_SEL_RPB__SHIFT 0x18
+#define MC_XPB_RTR_DEST_MAP3__SIDE_OK_MASK 0x2000000
+#define MC_XPB_RTR_DEST_MAP3__SIDE_OK__SHIFT 0x19
+#define MC_XPB_RTR_DEST_MAP3__APRTR_SIZE_MASK 0x7c000000
+#define MC_XPB_RTR_DEST_MAP3__APRTR_SIZE__SHIFT 0x1a
+#define MC_XPB_RTR_DEST_MAP4__NMR_MASK 0x1
+#define MC_XPB_RTR_DEST_MAP4__NMR__SHIFT 0x0
+#define MC_XPB_RTR_DEST_MAP4__DEST_OFFSET_MASK 0xffffe
+#define MC_XPB_RTR_DEST_MAP4__DEST_OFFSET__SHIFT 0x1
+#define MC_XPB_RTR_DEST_MAP4__DEST_SEL_MASK 0xf00000
+#define MC_XPB_RTR_DEST_MAP4__DEST_SEL__SHIFT 0x14
+#define MC_XPB_RTR_DEST_MAP4__DEST_SEL_RPB_MASK 0x1000000
+#define MC_XPB_RTR_DEST_MAP4__DEST_SEL_RPB__SHIFT 0x18
+#define MC_XPB_RTR_DEST_MAP4__SIDE_OK_MASK 0x2000000
+#define MC_XPB_RTR_DEST_MAP4__SIDE_OK__SHIFT 0x19
+#define MC_XPB_RTR_DEST_MAP4__APRTR_SIZE_MASK 0x7c000000
+#define MC_XPB_RTR_DEST_MAP4__APRTR_SIZE__SHIFT 0x1a
+#define MC_XPB_RTR_DEST_MAP5__NMR_MASK 0x1
+#define MC_XPB_RTR_DEST_MAP5__NMR__SHIFT 0x0
+#define MC_XPB_RTR_DEST_MAP5__DEST_OFFSET_MASK 0xffffe
+#define MC_XPB_RTR_DEST_MAP5__DEST_OFFSET__SHIFT 0x1
+#define MC_XPB_RTR_DEST_MAP5__DEST_SEL_MASK 0xf00000
+#define MC_XPB_RTR_DEST_MAP5__DEST_SEL__SHIFT 0x14
+#define MC_XPB_RTR_DEST_MAP5__DEST_SEL_RPB_MASK 0x1000000
+#define MC_XPB_RTR_DEST_MAP5__DEST_SEL_RPB__SHIFT 0x18
+#define MC_XPB_RTR_DEST_MAP5__SIDE_OK_MASK 0x2000000
+#define MC_XPB_RTR_DEST_MAP5__SIDE_OK__SHIFT 0x19
+#define MC_XPB_RTR_DEST_MAP5__APRTR_SIZE_MASK 0x7c000000
+#define MC_XPB_RTR_DEST_MAP5__APRTR_SIZE__SHIFT 0x1a
+#define MC_XPB_RTR_DEST_MAP6__NMR_MASK 0x1
+#define MC_XPB_RTR_DEST_MAP6__NMR__SHIFT 0x0
+#define MC_XPB_RTR_DEST_MAP6__DEST_OFFSET_MASK 0xffffe
+#define MC_XPB_RTR_DEST_MAP6__DEST_OFFSET__SHIFT 0x1
+#define MC_XPB_RTR_DEST_MAP6__DEST_SEL_MASK 0xf00000
+#define MC_XPB_RTR_DEST_MAP6__DEST_SEL__SHIFT 0x14
+#define MC_XPB_RTR_DEST_MAP6__DEST_SEL_RPB_MASK 0x1000000
+#define MC_XPB_RTR_DEST_MAP6__DEST_SEL_RPB__SHIFT 0x18
+#define MC_XPB_RTR_DEST_MAP6__SIDE_OK_MASK 0x2000000
+#define MC_XPB_RTR_DEST_MAP6__SIDE_OK__SHIFT 0x19
+#define MC_XPB_RTR_DEST_MAP6__APRTR_SIZE_MASK 0x7c000000
+#define MC_XPB_RTR_DEST_MAP6__APRTR_SIZE__SHIFT 0x1a
+#define MC_XPB_RTR_DEST_MAP7__NMR_MASK 0x1
+#define MC_XPB_RTR_DEST_MAP7__NMR__SHIFT 0x0
+#define MC_XPB_RTR_DEST_MAP7__DEST_OFFSET_MASK 0xffffe
+#define MC_XPB_RTR_DEST_MAP7__DEST_OFFSET__SHIFT 0x1
+#define MC_XPB_RTR_DEST_MAP7__DEST_SEL_MASK 0xf00000
+#define MC_XPB_RTR_DEST_MAP7__DEST_SEL__SHIFT 0x14
+#define MC_XPB_RTR_DEST_MAP7__DEST_SEL_RPB_MASK 0x1000000
+#define MC_XPB_RTR_DEST_MAP7__DEST_SEL_RPB__SHIFT 0x18
+#define MC_XPB_RTR_DEST_MAP7__SIDE_OK_MASK 0x2000000
+#define MC_XPB_RTR_DEST_MAP7__SIDE_OK__SHIFT 0x19
+#define MC_XPB_RTR_DEST_MAP7__APRTR_SIZE_MASK 0x7c000000
+#define MC_XPB_RTR_DEST_MAP7__APRTR_SIZE__SHIFT 0x1a
+#define MC_XPB_RTR_DEST_MAP8__NMR_MASK 0x1
+#define MC_XPB_RTR_DEST_MAP8__NMR__SHIFT 0x0
+#define MC_XPB_RTR_DEST_MAP8__DEST_OFFSET_MASK 0xffffe
+#define MC_XPB_RTR_DEST_MAP8__DEST_OFFSET__SHIFT 0x1
+#define MC_XPB_RTR_DEST_MAP8__DEST_SEL_MASK 0xf00000
+#define MC_XPB_RTR_DEST_MAP8__DEST_SEL__SHIFT 0x14
+#define MC_XPB_RTR_DEST_MAP8__DEST_SEL_RPB_MASK 0x1000000
+#define MC_XPB_RTR_DEST_MAP8__DEST_SEL_RPB__SHIFT 0x18
+#define MC_XPB_RTR_DEST_MAP8__SIDE_OK_MASK 0x2000000
+#define MC_XPB_RTR_DEST_MAP8__SIDE_OK__SHIFT 0x19
+#define MC_XPB_RTR_DEST_MAP8__APRTR_SIZE_MASK 0x7c000000
+#define MC_XPB_RTR_DEST_MAP8__AP

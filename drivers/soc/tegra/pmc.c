@@ -1,1151 +1,440 @@
-/*
- * drivers/soc/tegra/pmc.c
+STAT__SHIFT 0x1c
+#define PWR_DISP_TIMER_13_CONTROL__DISP_TIMER_INT_STAT_AK_MASK 0x20000000
+#define PWR_DISP_TIMER_13_CONTROL__DISP_TIMER_INT_STAT_AK__SHIFT 0x1d
+#define PWR_DISP_TIMER_13_CONTROL__DISP_TIMER_INT_MASK 0x40000000
+#define PWR_DISP_TIMER_13_CONTROL__DISP_TIMER_INT__SHIFT 0x1e
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_COUNT_MASK 0x1ffffff
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_COUNT__SHIFT 0x0
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_ENABLE_MASK 0x2000000
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_ENABLE__SHIFT 0x19
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_RUNNING_MASK 0x4000000
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_RUNNING__SHIFT 0x1a
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_MASK_MASK 0x8000000
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_MASK__SHIFT 0x1b
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_STAT_MASK 0x10000000
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_STAT__SHIFT 0x1c
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_STAT_AK_MASK 0x20000000
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_STAT_AK__SHIFT 0x1d
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT_MASK 0x40000000
+#define PWR_DISP_TIMER_14_CONTROL__DISP_TIMER_INT__SHIFT 0x1e
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_COUNT_MASK 0x1ffffff
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_COUNT__SHIFT 0x0
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_ENABLE_MASK 0x2000000
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_ENABLE__SHIFT 0x19
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_RUNNING_MASK 0x4000000
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_RUNNING__SHIFT 0x1a
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_MASK_MASK 0x8000000
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_MASK__SHIFT 0x1b
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_STAT_MASK 0x10000000
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_STAT__SHIFT 0x1c
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_STAT_AK_MASK 0x20000000
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_STAT_AK__SHIFT 0x1d
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT_MASK 0x40000000
+#define PWR_DISP_TIMER_15_CONTROL__DISP_TIMER_INT__SHIFT 0x1e
+#define PWR_DISP_TIMER_CONTROL2__DISP_TIMER_PULSE_WIDTH_MASK 0x3ff
+#define PWR_DISP_TIMER_CONTROL2__DISP_TIMER_PULSE_WIDTH__SHIFT 0x0
+#define VDDGFX_IDLE_PARAMETER__VDDGFX_IDLE_THRESHOLD_MASK 0xffff
+#define VDDGFX_IDLE_PARAMETER__VDDGFX_IDLE_THRESHOLD__SHIFT 0x0
+#define VDDGFX_IDLE_PARAMETER__VDDGFX_IDLE_THRESHOLD_UNIT_MASK 0xf0000
+#define VDDGFX_IDLE_PARAMETER__VDDGFX_IDLE_THRESHOLD_UNIT__SHIFT 0x10
+#define VDDGFX_IDLE_CONTROL__VDDGFX_IDLE_EN_MASK 0x1
+#define VDDGFX_IDLE_CONTROL__VDDGFX_IDLE_EN__SHIFT 0x0
+#define VDDGFX_IDLE_CONTROL__VDDGFX_IDLE_DETECT_MASK 0x2
+#define VDDGFX_IDLE_CONTROL__VDDGFX_IDLE_DETECT__SHIFT 0x1
+#define VDDGFX_IDLE_CONTROL__FORCE_VDDGFX_IDLE_EXIT_MASK 0x4
+#define VDDGFX_IDLE_CONTROL__FORCE_VDDGFX_IDLE_EXIT__SHIFT 0x2
+#define VDDGFX_IDLE_CONTROL__SMC_VDDGFX_IDLE_STATE_MASK 0x8
+#define VDDGFX_IDLE_CONTROL__SMC_VDDGFX_IDLE_STATE__SHIFT 0x3
+#define VDDGFX_IDLE_EXIT__BIF_EXIT_REQ_MASK 0x1
+#define VDDGFX_IDLE_EXIT__BIF_EXIT_REQ__SHIFT 0x0
+#define LCAC_MC0_CNTL__MC0_ENABLE_MASK 0x1
+#define LCAC_MC0_CNTL__MC0_ENABLE__SHIFT 0x0
+#define LCAC_MC0_CNTL__MC0_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC0_CNTL__MC0_THRESHOLD__SHIFT 0x1
+#define LCAC_MC0_CNTL__MC0_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC0_CNTL__MC0_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC0_CNTL__MC0_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC0_CNTL__MC0_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC0_OVR_SEL__MC0_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC0_OVR_SEL__MC0_OVR_SEL__SHIFT 0x0
+#define LCAC_MC0_OVR_VAL__MC0_OVR_VAL_MASK 0xffffffff
+#define LCAC_MC0_OVR_VAL__MC0_OVR_VAL__SHIFT 0x0
+#define LCAC_MC1_CNTL__MC1_ENABLE_MASK 0x1
+#define LCAC_MC1_CNTL__MC1_ENABLE__SHIFT 0x0
+#define LCAC_MC1_CNTL__MC1_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC1_CNTL__MC1_THRESHOLD__SHIFT 0x1
+#define LCAC_MC1_CNTL__MC1_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC1_CNTL__MC1_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC1_CNTL__MC1_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC1_CNTL__MC1_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC1_OVR_SEL__MC1_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC1_OVR_SEL__MC1_OVR_SEL__SHIFT 0x0
+#define LCAC_MC1_OVR_VAL__MC1_OVR_VAL_MASK 0xffffffff
+#define LCAC_MC1_OVR_VAL__MC1_OVR_VAL__SHIFT 0x0
+#define LCAC_MC2_CNTL__MC2_ENABLE_MASK 0x1
+#define LCAC_MC2_CNTL__MC2_ENABLE__SHIFT 0x0
+#define LCAC_MC2_CNTL__MC2_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC2_CNTL__MC2_THRESHOLD__SHIFT 0x1
+#define LCAC_MC2_CNTL__MC2_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC2_CNTL__MC2_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC2_CNTL__MC2_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC2_CNTL__MC2_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC2_OVR_SEL__MC2_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC2_OVR_SEL__MC2_OVR_SEL__SHIFT 0x0
+#define LCAC_MC2_OVR_VAL__MC2_OVR_VAL_MASK 0xffffffff
+#define LCAC_MC2_OVR_VAL__MC2_OVR_VAL__SHIFT 0x0
+#define LCAC_MC3_CNTL__MC3_ENABLE_MASK 0x1
+#define LCAC_MC3_CNTL__MC3_ENABLE__SHIFT 0x0
+#define LCAC_MC3_CNTL__MC3_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC3_CNTL__MC3_THRESHOLD__SHIFT 0x1
+#define LCAC_MC3_CNTL__MC3_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC3_CNTL__MC3_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC3_CNTL__MC3_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC3_CNTL__MC3_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC3_OVR_SEL__MC3_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC3_OVR_SEL__MC3_OVR_SEL__SHIFT 0x0
+#define LCAC_MC3_OVR_VAL__MC3_OVR_VAL_MASK 0xffffffff
+#define LCAC_MC3_OVR_VAL__MC3_OVR_VAL__SHIFT 0x0
+#define LCAC_CPL_CNTL__CPL_ENABLE_MASK 0x1
+#define LCAC_CPL_CNTL__CPL_ENABLE__SHIFT 0x0
+#define LCAC_CPL_CNTL__CPL_THRESHOLD_MASK 0x1fffe
+#define LCAC_CPL_CNTL__CPL_THRESHOLD__SHIFT 0x1
+#define LCAC_CPL_CNTL__CPL_BLOCK_ID_MASK 0x3e0000
+#define LCAC_CPL_CNTL__CPL_BLOCK_ID__SHIFT 0x11
+#define LCAC_CPL_CNTL__CPL_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_CPL_CNTL__CPL_SIGNAL_ID__SHIFT 0x16
+#define LCAC_CPL_OVR_SEL__CPL_OVR_SEL_MASK 0xffffffff
+#define LCAC_CPL_OVR_SEL__CPL_OVR_SEL__SHIFT 0x0
+#define LCAC_CPL_OVR_VAL__CPL_OVR_VAL_MASK 0xffffffff
+#define LCAC_CPL_OVR_VAL__CPL_OVR_VAL__SHIFT 0x0
+#define ROM_SMC_IND_INDEX__SMC_IND_ADDR_MASK 0xffffffff
+#define ROM_SMC_IND_INDEX__SMC_IND_ADDR__SHIFT 0x0
+#define ROM_SMC_IND_DATA__SMC_IND_DATA_MASK 0xffffffff
+#define ROM_SMC_IND_DATA__SMC_IND_DATA__SHIFT 0x0
+#define ROM_CNTL__SCK_OVERWRITE_MASK 0x2
+#define ROM_CNTL__SCK_OVERWRITE__SHIFT 0x1
+#define ROM_CNTL__CLOCK_GATING_EN_MASK 0x4
+#define ROM_CNTL__CLOCK_GATING_EN__SHIFT 0x2
+#define ROM_CNTL__CSB_ACTIVE_TO_SCK_SETUP_TIME_MASK 0xff00
+#define ROM_CNTL__CSB_ACTIVE_TO_SCK_SETUP_TIME__SHIFT 0x8
+#define ROM_CNTL__CSB_ACTIVE_TO_SCK_HOLD_TIME_MASK 0xff0000
+#define ROM_CNTL__CSB_ACTIVE_TO_SCK_HOLD_TIME__SHIFT 0x10
+#define ROM_CNTL__SCK_PRESCALE_REFCLK_MASK 0xf000000
+#define ROM_CNTL__SCK_PRESCALE_REFCLK__SHIFT 0x18
+#define ROM_CNTL__SCK_PRESCALE_CRYSTAL_CLK_MASK 0xf0000000
+#define ROM_CNTL__SCK_PRESCALE_CRYSTAL_CLK__SHIFT 0x1c
+#define PAGE_MIRROR_CNTL__PAGE_MIRROR_BASE_ADDR_MASK 0xffffff
+#define PAGE_MIRROR_CNTL__PAGE_MIRROR_BASE_ADDR__SHIFT 0x0
+#define PAGE_MIRROR_CNTL__PAGE_MIRROR_INVALIDATE_MASK 0x1000000
+#define PAGE_MIRROR_CNTL__PAGE_MIRROR_INVALIDATE__SHIFT 0x18
+#define PAGE_MIRROR_CNTL__PAGE_MIRROR_ENABLE_MASK 0x2000000
+#define PAGE_MIRROR_CNTL__PAGE_MIRROR_ENABLE__SHIFT 0x19
+#define PAGE_MIRROR_CNTL__PAGE_MIRROR_USAGE_MASK 0xc000000
+#define PAGE_MIRROR_CNTL__PAGE_MIRROR_USAGE__SHIFT 0x1a
+#define ROM_STATUS__ROM_BUSY_MASK 0x1
+#define ROM_STATUS__ROM_BUSY__SHIFT 0x0
+#define CGTT_ROM_CLK_CTRL0__ON_DELAY_MASK 0xf
+#define CGTT_ROM_CLK_CTRL0__ON_DELAY__SHIFT 0x0
+#define CGTT_ROM_CLK_CTRL0__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_ROM_CLK_CTRL0__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_ROM_CLK_CTRL0__SOFT_OVERRIDE1_MASK 0x40000000
+#define CGTT_ROM_CLK_CTRL0__SOFT_OVERRIDE1__SHIFT 0x1e
+#define CGTT_ROM_CLK_CTRL0__SOFT_OVERRIDE0_MASK 0x80000000
+#define CGTT_ROM_CLK_CTRL0__SOFT_OVERRIDE0__SHIFT 0x1f
+#define ROM_INDEX__ROM_INDEX_MASK 0xffffff
+#define ROM_INDEX__ROM_INDEX__SHIFT 0x0
+#define ROM_DATA__ROM_DATA_MASK 0xffffffff
+#define ROM_DATA__ROM_DATA__SHIFT 0x0
+#define ROM_START__ROM_START_MASK 0xffffff
+#define ROM_START__ROM_START__SHIFT 0x0
+#define ROM_SW_CNTL__DATA_SIZE_MASK 0xffff
+#define ROM_SW_CNTL__DATA_SIZE__SHIFT 0x0
+#define ROM_SW_CNTL__COMMAND_SIZE_MASK 0x30000
+#define ROM_SW_CNTL__COMMAND_SIZE__SHIFT 0x10
+#define ROM_SW_CNTL__ROM_SW_RETURN_DATA_ENABLE_MASK 0x40000
+#define ROM_SW_CNTL__ROM_SW_RETURN_DATA_ENABLE__SHIFT 0x12
+#define ROM_SW_STATUS__ROM_SW_DONE_MASK 0x1
+#define ROM_SW_STATUS__ROM_SW_DONE__SHIFT 0x0
+#define ROM_SW_COMMAND__ROM_SW_INSTRUCTION_MASK 0xff
+#define ROM_SW_COMMAND__ROM_SW_INSTRUCTION__SHIFT 0x0
+#define ROM_SW_COMMAND__ROM_SW_ADDRESS_MASK 0xffffff00
+#define ROM_SW_COMMAND__ROM_SW_ADDRESS__SHIFT 0x8
+#define ROM_SW_DATA_1__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_1__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_2__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_2__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_3__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_3__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_4__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_4__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_5__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_5__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_6__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_6__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_7__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_7__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_8__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_8__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_9__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_9__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_10__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_10__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_11__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_11__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_12__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_12__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_13__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_13__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_14__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_14__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_15__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_15__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_16__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_16__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_17__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_17__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_18__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_18__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_19__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_19__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_20__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_20__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_21__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_21__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_22__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_22__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_23__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_23__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_24__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_24__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_25__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_25__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_26__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_26__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_27__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_27__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_28__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_28__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_29__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_29__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_30__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_30__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_31__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_31__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_32__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_32__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_33__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_33__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_34__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_34__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_35__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_35__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_36__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_36__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_37__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_37__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_38__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_38__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_39__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_39__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_40__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_40__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_41__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_41__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_42__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_42__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_43__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_43__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_44__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_44__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_45__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_45__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_46__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_46__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_47__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_47__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_48__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_48__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_49__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_49__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_50__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_50__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_51__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_51__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_52__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_52__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_53__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_53__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_54__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_54__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_55__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_55__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_56__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_56__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_57__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_57__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_58__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_58__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_59__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_59__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_60__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_60__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_61__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_61__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_62__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_62__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_63__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_63__ROM_SW_DATA__SHIFT 0x0
+#define ROM_SW_DATA_64__ROM_SW_DATA_MASK 0xffffffff
+#define ROM_SW_DATA_64__ROM_SW_DATA__SHIFT 0x0
+
+#endif /* SMU_7_1_1_SH_MASK_H */
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     /*
+ * SMU_7_1_2 Register documentation
  *
- * Copyright (c) 2010 Google, Inc
+ * Copyright (C) 2014  Advanced Micro Devices, Inc.
  *
- * Author:
- *	Colin Cross <ccross@google.com>
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+ * AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#define pr_fmt(fmt) "tegra-pmc: " fmt
-
-#include <linux/kernel.h>
-#include <linux/clk.h>
-#include <linux/clk/tegra.h>
-#include <linux/debugfs.h>
-#include <linux/delay.h>
-#include <linux/err.h>
-#include <linux/export.h>
-#include <linux/init.h>
-#include <linux/io.h>
-#include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/platform_device.h>
-#include <linux/reboot.h>
-#include <linux/reset.h>
-#include <linux/seq_file.h>
-#include <linux/spinlock.h>
-
-#include <soc/tegra/common.h>
-#include <soc/tegra/fuse.h>
-#include <soc/tegra/pmc.h>
-
-#define PMC_CNTRL			0x0
-#define  PMC_CNTRL_SYSCLK_POLARITY	(1 << 10)  /* sys clk polarity */
-#define  PMC_CNTRL_SYSCLK_OE		(1 << 11)  /* system clock enable */
-#define  PMC_CNTRL_SIDE_EFFECT_LP0	(1 << 14)  /* LP0 when CPU pwr gated */
-#define  PMC_CNTRL_CPU_PWRREQ_POLARITY	(1 << 15)  /* CPU pwr req polarity */
-#define  PMC_CNTRL_CPU_PWRREQ_OE	(1 << 16)  /* CPU pwr req enable */
-#define  PMC_CNTRL_INTR_POLARITY	(1 << 17)  /* inverts INTR polarity */
-
-#define DPD_SAMPLE			0x020
-#define  DPD_SAMPLE_ENABLE		(1 << 0)
-#define  DPD_SAMPLE_DISABLE		(0 << 0)
-
-#define PWRGATE_TOGGLE			0x30
-#define  PWRGATE_TOGGLE_START		(1 << 8)
-
-#define REMOVE_CLAMPING			0x34
-
-#define PWRGATE_STATUS			0x38
-
-#define PMC_SCRATCH0			0x50
-#define  PMC_SCRATCH0_MODE_RECOVERY	(1 << 31)
-#define  PMC_SCRATCH0_MODE_BOOTLOADER	(1 << 30)
-#define  PMC_SCRATCH0_MODE_RCM		(1 << 1)
-#define  PMC_SCRATCH0_MODE_MASK		(PMC_SCRATCH0_MODE_RECOVERY | \
-					 PMC_SCRATCH0_MODE_BOOTLOADER | \
-					 PMC_SCRATCH0_MODE_RCM)
-
-#define PMC_CPUPWRGOOD_TIMER		0xc8
-#define PMC_CPUPWROFF_TIMER		0xcc
-
-#define PMC_SCRATCH41			0x140
-
-#define PMC_SENSOR_CTRL			0x1b0
-#define PMC_SENSOR_CTRL_SCRATCH_WRITE	(1 << 2)
-#define PMC_SENSOR_CTRL_ENABLE_RST	(1 << 1)
-
-#define IO_DPD_REQ			0x1b8
-#define  IO_DPD_REQ_CODE_IDLE		(0 << 30)
-#define  IO_DPD_REQ_CODE_OFF		(1 << 30)
-#define  IO_DPD_REQ_CODE_ON		(2 << 30)
-#define  IO_DPD_REQ_CODE_MASK		(3 << 30)
-
-#define IO_DPD_STATUS			0x1bc
-#define IO_DPD2_REQ			0x1c0
-#define IO_DPD2_STATUS			0x1c4
-#define SEL_DPD_TIM			0x1c8
-
-#define PMC_SCRATCH54			0x258
-#define PMC_SCRATCH54_DATA_SHIFT	8
-#define PMC_SCRATCH54_ADDR_SHIFT	0
-
-#define PMC_SCRATCH55			0x25c
-#define PMC_SCRATCH55_RESET_TEGRA	(1 << 31)
-#define PMC_SCRATCH55_CNTRL_ID_SHIFT	27
-#define PMC_SCRATCH55_PINMUX_SHIFT	24
-#define PMC_SCRATCH55_16BITOP		(1 << 15)
-#define PMC_SCRATCH55_CHECKSUM_SHIFT	16
-#define PMC_SCRATCH55_I2CSLV1_SHIFT	0
-
-#define GPU_RG_CNTRL			0x2d4
-
-struct tegra_pmc_soc {
-	unsigned int num_powergates;
-	const char *const *powergates;
-	unsigned int num_cpu_powergates;
-	const u8 *cpu_powergates;
-
-	bool has_tsense_reset;
-	bool has_gpu_clamps;
-};
-
-/**
- * struct tegra_pmc - NVIDIA Tegra PMC
- * @base: pointer to I/O remapped register region
- * @clk: pointer to pclk clock
- * @rate: currently configured rate of pclk
- * @suspend_mode: lowest suspend mode available
- * @cpu_good_time: CPU power good time (in microseconds)
- * @cpu_off_time: CPU power off time (in microsecends)
- * @core_osc_time: core power good OSC time (in microseconds)
- * @core_pmu_time: core power good PMU time (in microseconds)
- * @core_off_time: core power off time (in microseconds)
- * @corereq_high: core power request is active-high
- * @sysclkreq_high: system clock request is active-high
- * @combined_req: combined power request for CPU & core
- * @cpu_pwr_good_en: CPU power good signal is enabled
- * @lp0_vec_phys: physical base address of the LP0 warm boot code
- * @lp0_vec_size: size of the LP0 warm boot code
- * @powergates_lock: mutex for power gate register access
- */
-struct tegra_pmc {
-	struct device *dev;
-	void __iomem *base;
-	struct clk *clk;
-
-	const struct tegra_pmc_soc *soc;
-
-	unsigned long rate;
-
-	enum tegra_suspend_mode suspend_mode;
-	u32 cpu_good_time;
-	u32 cpu_off_time;
-	u32 core_osc_time;
-	u32 core_pmu_time;
-	u32 core_off_time;
-	bool corereq_high;
-	bool sysclkreq_high;
-	bool combined_req;
-	bool cpu_pwr_good_en;
-	u32 lp0_vec_phys;
-	u32 lp0_vec_size;
-
-	struct mutex powergates_lock;
-};
-
-static struct tegra_pmc *pmc = &(struct tegra_pmc) {
-	.base = NULL,
-	.suspend_mode = TEGRA_SUSPEND_NONE,
-};
-
-static u32 tegra_pmc_readl(unsigned long offset)
-{
-	return readl(pmc->base + offset);
-}
-
-static void tegra_pmc_writel(u32 value, unsigned long offset)
-{
-	writel(value, pmc->base + offset);
-}
-
-/**
- * tegra_powergate_set() - set the state of a partition
- * @id: partition ID
- * @new_state: new state of the partition
- */
-static int tegra_powergate_set(int id, bool new_state)
-{
-	bool status;
-
-	mutex_lock(&pmc->powergates_lock);
-
-	status = tegra_pmc_readl(PWRGATE_STATUS) & (1 << id);
-
-	if (status == new_state) {
-		mutex_unlock(&pmc->powergates_lock);
-		return 0;
-	}
-
-	tegra_pmc_writel(PWRGATE_TOGGLE_START | id, PWRGATE_TOGGLE);
-
-	mutex_unlock(&pmc->powergates_lock);
-
-	return 0;
-}
-
-/**
- * tegra_powergate_power_on() - power on partition
- * @id: partition ID
- */
-int tegra_powergate_power_on(int id)
-{
-	if (!pmc->soc || id < 0 || id >= pmc->soc->num_powergates)
-		return -EINVAL;
-
-	return tegra_powergate_set(id, true);
-}
-
-/**
- * tegra_powergate_power_off() - power off partition
- * @id: partition ID
- */
-int tegra_powergate_power_off(int id)
-{
-	if (!pmc->soc || id < 0 || id >= pmc->soc->num_powergates)
-		return -EINVAL;
-
-	return tegra_powergate_set(id, false);
-}
-EXPORT_SYMBOL(tegra_powergate_power_off);
-
-/**
- * tegra_powergate_is_powered() - check if partition is powered
- * @id: partition ID
- */
-int tegra_powergate_is_powered(int id)
-{
-	u32 status;
-
-	if (!pmc->soc || id < 0 || id >= pmc->soc->num_powergates)
-		return -EINVAL;
-
-	status = tegra_pmc_readl(PWRGATE_STATUS) & (1 << id);
-	return !!status;
-}
-
-/**
- * tegra_powergate_remove_clamping() - remove power clamps for partition
- * @id: partition ID
- */
-int tegra_powergate_remove_clamping(int id)
-{
-	u32 mask;
-
-	if (!pmc->soc || id < 0 || id >= pmc->soc->num_powergates)
-		return -EINVAL;
-
-	/*
-	 * On Tegra124 and later, the clamps for the GPU are controlled by a
-	 * separate register (with different semantics).
-	 */
-	if (id == TEGRA_POWERGATE_3D) {
-		if (pmc->soc->has_gpu_clamps) {
-			tegra_pmc_writel(0, GPU_RG_CNTRL);
-			return 0;
-		}
-	}
-
-	/*
-	 * Tegra 2 has a bug where PCIE and VDE clamping masks are
-	 * swapped relatively to the partition ids
-	 */
-	if (id == TEGRA_POWERGATE_VDEC)
-		mask = (1 << TEGRA_POWERGATE_PCIE);
-	else if (id == TEGRA_POWERGATE_PCIE)
-		mask = (1 << TEGRA_POWERGATE_VDEC);
-	else
-		mask = (1 << id);
-
-	tegra_pmc_writel(mask, REMOVE_CLAMPING);
-
-	return 0;
-}
-EXPORT_SYMBOL(tegra_powergate_remove_clamping);
-
-/**
- * tegra_powergate_sequence_power_up() - power up partition
- * @id: partition ID
- * @clk: clock for partition
- * @rst: reset for partition
- *
- * Must be called with clk disabled, and returns with clk enabled.
- */
-int tegra_powergate_sequence_power_up(int id, struct clk *clk,
-				      struct reset_control *rst)
-{
-	int ret;
-
-	reset_control_assert(rst);
-
-	ret = tegra_powergate_power_on(id);
-	if (ret)
-		goto err_power;
-
-	ret = clk_prepare_enable(clk);
-	if (ret)
-		goto err_clk;
-
-	usleep_range(10, 20);
-
-	ret = tegra_powergate_remove_clamping(id);
-	if (ret)
-		goto err_clamp;
-
-	usleep_range(10, 20);
-	reset_control_deassert(rst);
-
-	return 0;
-
-err_clamp:
-	clk_disable_unprepare(clk);
-err_clk:
-	tegra_powergate_power_off(id);
-err_power:
-	return ret;
-}
-EXPORT_SYMBOL(tegra_powergate_sequence_power_up);
-
-#ifdef CONFIG_SMP
-/**
- * tegra_get_cpu_powergate_id() - convert from CPU ID to partition ID
- * @cpuid: CPU partition ID
- *
- * Returns the partition ID corresponding to the CPU partition ID or a
- * negative error code on failure.
- */
-static int tegra_get_cpu_powergate_id(int cpuid)
-{
-	if (pmc->soc && cpuid > 0 && cpuid < pmc->soc->num_cpu_powergates)
-		return pmc->soc->cpu_powergates[cpuid];
-
-	return -EINVAL;
-}
-
-/**
- * tegra_pmc_cpu_is_powered() - check if CPU partition is powered
- * @cpuid: CPU partition ID
- */
-bool tegra_pmc_cpu_is_powered(int cpuid)
-{
-	int id;
-
-	id = tegra_get_cpu_powergate_id(cpuid);
-	if (id < 0)
-		return false;
-
-	return tegra_powergate_is_powered(id);
-}
-
-/**
- * tegra_pmc_cpu_power_on() - power on CPU partition
- * @cpuid: CPU partition ID
- */
-int tegra_pmc_cpu_power_on(int cpuid)
-{
-	int id;
-
-	id = tegra_get_cpu_powergate_id(cpuid);
-	if (id < 0)
-		return id;
-
-	return tegra_powergate_set(id, true);
-}
-
-/**
- * tegra_pmc_cpu_remove_clamping() - remove power clamps for CPU partition
- * @cpuid: CPU partition ID
- */
-int tegra_pmc_cpu_remove_clamping(int cpuid)
-{
-	int id;
-
-	id = tegra_get_cpu_powergate_id(cpuid);
-	if (id < 0)
-		return id;
-
-	return tegra_powergate_remove_clamping(id);
-}
-#endif /* CONFIG_SMP */
-
-static int tegra_pmc_restart_notify(struct notifier_block *this,
-				    unsigned long action, void *data)
-{
-	const char *cmd = data;
-	u32 value;
-
-	value = tegra_pmc_readl(PMC_SCRATCH0);
-	value &= ~PMC_SCRATCH0_MODE_MASK;
-
-	if (cmd) {
-		if (strcmp(cmd, "recovery") == 0)
-			value |= PMC_SCRATCH0_MODE_RECOVERY;
-
-		if (strcmp(cmd, "bootloader") == 0)
-			value |= PMC_SCRATCH0_MODE_BOOTLOADER;
-
-		if (strcmp(cmd, "forced-recovery") == 0)
-			value |= PMC_SCRATCH0_MODE_RCM;
-	}
-
-	tegra_pmc_writel(value, PMC_SCRATCH0);
-
-	value = tegra_pmc_readl(0);
-	value |= 0x10;
-	tegra_pmc_writel(value, 0);
-
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block tegra_pmc_restart_handler = {
-	.notifier_call = tegra_pmc_restart_notify,
-	.priority = 128,
-};
-
-static int powergate_show(struct seq_file *s, void *data)
-{
-	unsigned int i;
-
-	seq_printf(s, " powergate powered\n");
-	seq_printf(s, "------------------\n");
-
-	for (i = 0; i < pmc->soc->num_powergates; i++) {
-		if (!pmc->soc->powergates[i])
-			continue;
-
-		seq_printf(s, " %9s %7s\n", pmc->soc->powergates[i],
-			   tegra_powergate_is_powered(i) ? "yes" : "no");
-	}
-
-	return 0;
-}
-
-static int powergate_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, powergate_show, inode->i_private);
-}
-
-static const struct file_operations powergate_fops = {
-	.open = powergate_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-static int tegra_powergate_debugfs_init(void)
-{
-	struct dentry *d;
-
-	d = debugfs_create_file("powergate", S_IRUGO, NULL, NULL,
-				&powergate_fops);
-	if (!d)
-		return -ENOMEM;
-
-	return 0;
-}
-
-static int tegra_io_rail_prepare(int id, unsigned long *request,
-				 unsigned long *status, unsigned int *bit)
-{
-	unsigned long rate, value;
-
-	*bit = id % 32;
-
-	/*
-	 * There are two sets of 30 bits to select IO rails, but bits 30 and
-	 * 31 are control bits rather than IO rail selection bits.
-	 */
-	if (id > 63 || *bit == 30 || *bit == 31)
-		return -EINVAL;
-
-	if (id < 32) {
-		*status = IO_DPD_STATUS;
-		*request = IO_DPD_REQ;
-	} else {
-		*status = IO_DPD2_STATUS;
-		*request = IO_DPD2_REQ;
-	}
-
-	rate = clk_get_rate(pmc->clk);
-
-	tegra_pmc_writel(DPD_SAMPLE_ENABLE, DPD_SAMPLE);
-
-	/* must be at least 200 ns, in APB (PCLK) clock cycles */
-	value = DIV_ROUND_UP(1000000000, rate);
-	value = DIV_ROUND_UP(200, value);
-	tegra_pmc_writel(value, SEL_DPD_TIM);
-
-	return 0;
-}
-
-static int tegra_io_rail_poll(unsigned long offset, unsigned long mask,
-			      unsigned long val, unsigned long timeout)
-{
-	unsigned long value;
-
-	timeout = jiffies + msecs_to_jiffies(timeout);
-
-	while (time_after(timeout, jiffies)) {
-		value = tegra_pmc_readl(offset);
-		if ((value & mask) == val)
-			return 0;
-
-		usleep_range(250, 1000);
-	}
-
-	return -ETIMEDOUT;
-}
-
-static void tegra_io_rail_unprepare(void)
-{
-	tegra_pmc_writel(DPD_SAMPLE_DISABLE, DPD_SAMPLE);
-}
-
-int tegra_io_rail_power_on(int id)
-{
-	unsigned long request, status, value;
-	unsigned int bit, mask;
-	int err;
-
-	err = tegra_io_rail_prepare(id, &request, &status, &bit);
-	if (err < 0)
-		return err;
-
-	mask = 1 << bit;
-
-	value = tegra_pmc_readl(request);
-	value |= mask;
-	value &= ~IO_DPD_REQ_CODE_MASK;
-	value |= IO_DPD_REQ_CODE_OFF;
-	tegra_pmc_writel(value, request);
-
-	err = tegra_io_rail_poll(status, mask, 0, 250);
-	if (err < 0) {
-		pr_info("tegra_io_rail_poll() failed: %d\n", err);
-		return err;
-	}
-
-	tegra_io_rail_unprepare();
-
-	return 0;
-}
-EXPORT_SYMBOL(tegra_io_rail_power_on);
-
-int tegra_io_rail_power_off(int id)
-{
-	unsigned long request, status, value;
-	unsigned int bit, mask;
-	int err;
-
-	err = tegra_io_rail_prepare(id, &request, &status, &bit);
-	if (err < 0) {
-		pr_info("tegra_io_rail_prepare() failed: %d\n", err);
-		return err;
-	}
-
-	mask = 1 << bit;
-
-	value = tegra_pmc_readl(request);
-	value |= mask;
-	value &= ~IO_DPD_REQ_CODE_MASK;
-	value |= IO_DPD_REQ_CODE_ON;
-	tegra_pmc_writel(value, request);
-
-	err = tegra_io_rail_poll(status, mask, mask, 250);
-	if (err < 0)
-		return err;
-
-	tegra_io_rail_unprepare();
-
-	return 0;
-}
-EXPORT_SYMBOL(tegra_io_rail_power_off);
-
-#ifdef CONFIG_PM_SLEEP
-enum tegra_suspend_mode tegra_pmc_get_suspend_mode(void)
-{
-	return pmc->suspend_mode;
-}
-
-void tegra_pmc_set_suspend_mode(enum tegra_suspend_mode mode)
-{
-	if (mode < TEGRA_SUSPEND_NONE || mode >= TEGRA_MAX_SUSPEND_MODE)
-		return;
-
-	pmc->suspend_mode = mode;
-}
-
-void tegra_pmc_enter_suspend_mode(enum tegra_suspend_mode mode)
-{
-	unsigned long long rate = 0;
-	u32 value;
-
-	switch (mode) {
-	case TEGRA_SUSPEND_LP1:
-		rate = 32768;
-		break;
-
-	case TEGRA_SUSPEND_LP2:
-		rate = clk_get_rate(pmc->clk);
-		break;
-
-	default:
-		break;
-	}
-
-	if (WARN_ON_ONCE(rate == 0))
-		rate = 100000000;
-
-	if (rate != pmc->rate) {
-		u64 ticks;
-
-		ticks = pmc->cpu_good_time * rate + USEC_PER_SEC - 1;
-		do_div(ticks, USEC_PER_SEC);
-		tegra_pmc_writel(ticks, PMC_CPUPWRGOOD_TIMER);
-
-		ticks = pmc->cpu_off_time * rate + USEC_PER_SEC - 1;
-		do_div(ticks, USEC_PER_SEC);
-		tegra_pmc_writel(ticks, PMC_CPUPWROFF_TIMER);
-
-		wmb();
-
-		pmc->rate = rate;
-	}
-
-	value = tegra_pmc_readl(PMC_CNTRL);
-	value &= ~PMC_CNTRL_SIDE_EFFECT_LP0;
-	value |= PMC_CNTRL_CPU_PWRREQ_OE;
-	tegra_pmc_writel(value, PMC_CNTRL);
-}
-#endif
-
-static int tegra_pmc_parse_dt(struct tegra_pmc *pmc, struct device_node *np)
-{
-	u32 value, values[2];
-
-	if (of_property_read_u32(np, "nvidia,suspend-mode", &value)) {
-	} else {
-		switch (value) {
-		case 0:
-			pmc->suspend_mode = TEGRA_SUSPEND_LP0;
-			break;
-
-		case 1:
-			pmc->suspend_mode = TEGRA_SUSPEND_LP1;
-			break;
-
-		case 2:
-			pmc->suspend_mode = TEGRA_SUSPEND_LP2;
-			break;
-
-		default:
-			pmc->suspend_mode = TEGRA_SUSPEND_NONE;
-			break;
-		}
-	}
-
-	pmc->suspend_mode = tegra_pm_validate_suspend_mode(pmc->suspend_mode);
-
-	if (of_property_read_u32(np, "nvidia,cpu-pwr-good-time", &value))
-		pmc->suspend_mode = TEGRA_SUSPEND_NONE;
-
-	pmc->cpu_good_time = value;
-
-	if (of_property_read_u32(np, "nvidia,cpu-pwr-off-time", &value))
-		pmc->suspend_mode = TEGRA_SUSPEND_NONE;
-
-	pmc->cpu_off_time = value;
-
-	if (of_property_read_u32_array(np, "nvidia,core-pwr-good-time",
-				       values, ARRAY_SIZE(values)))
-		pmc->suspend_mode = TEGRA_SUSPEND_NONE;
-
-	pmc->core_osc_time = values[0];
-	pmc->core_pmu_time = values[1];
-
-	if (of_property_read_u32(np, "nvidia,core-pwr-off-time", &value))
-		pmc->suspend_mode = TEGRA_SUSPEND_NONE;
-
-	pmc->core_off_time = value;
-
-	pmc->corereq_high = of_property_read_bool(np,
-				"nvidia,core-power-req-active-high");
-
-	pmc->sysclkreq_high = of_property_read_bool(np,
-				"nvidia,sys-clock-req-active-high");
-
-	pmc->combined_req = of_property_read_bool(np,
-				"nvidia,combined-power-req");
-
-	pmc->cpu_pwr_good_en = of_property_read_bool(np,
-				"nvidia,cpu-pwr-good-en");
-
-	if (of_property_read_u32_array(np, "nvidia,lp0-vec", values,
-				       ARRAY_SIZE(values)))
-		if (pmc->suspend_mode == TEGRA_SUSPEND_LP0)
-			pmc->suspend_mode = TEGRA_SUSPEND_LP1;
-
-	pmc->lp0_vec_phys = values[0];
-	pmc->lp0_vec_size = values[1];
-
-	return 0;
-}
-
-static void tegra_pmc_init(struct tegra_pmc *pmc)
-{
-	u32 value;
-
-	/* Always enable CPU power request */
-	value = tegra_pmc_readl(PMC_CNTRL);
-	value |= PMC_CNTRL_CPU_PWRREQ_OE;
-	tegra_pmc_writel(value, PMC_CNTRL);
-
-	value = tegra_pmc_readl(PMC_CNTRL);
-
-	if (pmc->sysclkreq_high)
-		value &= ~PMC_CNTRL_SYSCLK_POLARITY;
-	else
-		value |= PMC_CNTRL_SYSCLK_POLARITY;
-
-	/* configure the output polarity while the request is tristated */
-	tegra_pmc_writel(value, PMC_CNTRL);
-
-	/* now enable the request */
-	value = tegra_pmc_readl(PMC_CNTRL);
-	value |= PMC_CNTRL_SYSCLK_OE;
-	tegra_pmc_writel(value, PMC_CNTRL);
-}
-
-void tegra_pmc_init_tsense_reset(struct tegra_pmc *pmc)
-{
-	static const char disabled[] = "emergency thermal reset disabled";
-	u32 pmu_addr, ctrl_id, reg_addr, reg_data, pinmux;
-	struct device *dev = pmc->dev;
-	struct device_node *np;
-	u32 value, checksum;
-
-	if (!pmc->soc->has_tsense_reset)
-		return;
-
-	np = of_get_child_by_name(pmc->dev->of_node, "i2c-thermtrip");
-	if (!np) {
-		dev_warn(dev, "i2c-thermtrip node not found, %s.\n", disabled);
-		return;
-	}
-
-	if (of_property_read_u32(np, "nvidia,i2c-controller-id", &ctrl_id)) {
-		dev_err(dev, "I2C controller ID missing, %s.\n", disabled);
-		goto out;
-	}
-
-	if (of_property_read_u32(np, "nvidia,bus-addr", &pmu_addr)) {
-		dev_err(dev, "nvidia,bus-addr missing, %s.\n", disabled);
-		goto out;
-	}
-
-	if (of_property_read_u32(np, "nvidia,reg-addr", &reg_addr)) {
-		dev_err(dev, "nvidia,reg-addr missing, %s.\n", disabled);
-		goto out;
-	}
-
-	if (of_property_read_u32(np, "nvidia,reg-data", &reg_data)) {
-		dev_err(dev, "nvidia,reg-data missing, %s.\n", disabled);
-		goto out;
-	}
-
-	if (of_property_read_u32(np, "nvidia,pinmux-id", &pinmux))
-		pinmux = 0;
-
-	value = tegra_pmc_readl(PMC_SENSOR_CTRL);
-	value |= PMC_SENSOR_CTRL_SCRATCH_WRITE;
-	tegra_pmc_writel(value, PMC_SENSOR_CTRL);
-
-	value = (reg_data << PMC_SCRATCH54_DATA_SHIFT) |
-		(reg_addr << PMC_SCRATCH54_ADDR_SHIFT);
-	tegra_pmc_writel(value, PMC_SCRATCH54);
-
-	value = PMC_SCRATCH55_RESET_TEGRA;
-	value |= ctrl_id << PMC_SCRATCH55_CNTRL_ID_SHIFT;
-	value |= pinmux << PMC_SCRATCH55_PINMUX_SHIFT;
-	value |= pmu_addr << PMC_SCRATCH55_I2CSLV1_SHIFT;
-
-	/*
-	 * Calculate checksum of SCRATCH54, SCRATCH55 fields. Bits 23:16 will
-	 * contain the checksum and are currently zero, so they are not added.
-	 */
-	checksum = reg_addr + reg_data + (value & 0xff) + ((value >> 8) & 0xff)
-		+ ((value >> 24) & 0xff);
-	checksum &= 0xff;
-	checksum = 0x100 - checksum;
-
-	value |= checksum << PMC_SCRATCH55_CHECKSUM_SHIFT;
-
-	tegra_pmc_writel(value, PMC_SCRATCH55);
-
-	value = tegra_pmc_readl(PMC_SENSOR_CTRL);
-	value |= PMC_SENSOR_CTRL_ENABLE_RST;
-	tegra_pmc_writel(value, PMC_SENSOR_CTRL);
-
-	dev_info(pmc->dev, "emergency thermal reset enabled\n");
-
-out:
-	of_node_put(np);
-}
-
-static int tegra_pmc_probe(struct platform_device *pdev)
-{
-	void __iomem *base = pmc->base;
-	struct resource *res;
-	int err;
-
-	err = tegra_pmc_parse_dt(pmc, pdev->dev.of_node);
-	if (err < 0)
-		return err;
-
-	/* take over the memory region from the early initialization */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	pmc->base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(pmc->base))
-		return PTR_ERR(pmc->base);
-
-	iounmap(base);
-
-	pmc->clk = devm_clk_get(&pdev->dev, "pclk");
-	if (IS_ERR(pmc->clk)) {
-		err = PTR_ERR(pmc->clk);
-		dev_err(&pdev->dev, "failed to get pclk: %d\n", err);
-		return err;
-	}
-
-	pmc->dev = &pdev->dev;
-
-	tegra_pmc_init(pmc);
-
-	tegra_pmc_init_tsense_reset(pmc);
-
-	if (IS_ENABLED(CONFIG_DEBUG_FS)) {
-		err = tegra_powergate_debugfs_init();
-		if (err < 0)
-			return err;
-	}
-
-	err = register_restart_handler(&tegra_pmc_restart_handler);
-	if (err) {
-		dev_err(&pdev->dev, "unable to register restart handler, %d\n",
-			err);
-		return err;
-	}
-
-	return 0;
-}
-
-#if defined(CONFIG_PM_SLEEP) && defined(CONFIG_ARM)
-static int tegra_pmc_suspend(struct device *dev)
-{
-	tegra_pmc_writel(virt_to_phys(tegra_resume), PMC_SCRATCH41);
-
-	return 0;
-}
-
-static int tegra_pmc_resume(struct device *dev)
-{
-	tegra_pmc_writel(0x0, PMC_SCRATCH41);
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(tegra_pmc_pm_ops, tegra_pmc_suspend, tegra_pmc_resume);
-
-#endif
-
-static const char * const tegra20_powergates[] = {
-	[TEGRA_POWERGATE_CPU] = "cpu",
-	[TEGRA_POWERGATE_3D] = "3d",
-	[TEGRA_POWERGATE_VENC] = "venc",
-	[TEGRA_POWERGATE_VDEC] = "vdec",
-	[TEGRA_POWERGATE_PCIE] = "pcie",
-	[TEGRA_POWERGATE_L2] = "l2",
-	[TEGRA_POWERGATE_MPE] = "mpe",
-};
-
-static const struct tegra_pmc_soc tegra20_pmc_soc = {
-	.num_powergates = ARRAY_SIZE(tegra20_powergates),
-	.powergates = tegra20_powergates,
-	.num_cpu_powergates = 0,
-	.cpu_powergates = NULL,
-	.has_tsense_reset = false,
-	.has_gpu_clamps = false,
-};
-
-static const char * const tegra30_powergates[] = {
-	[TEGRA_POWERGATE_CPU] = "cpu0",
-	[TEGRA_POWERGATE_3D] = "3d0",
-	[TEGRA_POWERGATE_VENC] = "venc",
-	[TEGRA_POWERGATE_VDEC] = "vdec",
-	[TEGRA_POWERGATE_PCIE] = "pcie",
-	[TEGRA_POWERGATE_L2] = "l2",
-	[TEGRA_POWERGATE_MPE] = "mpe",
-	[TEGRA_POWERGATE_HEG] = "heg",
-	[TEGRA_POWERGATE_SATA] = "sata",
-	[TEGRA_POWERGATE_CPU1] = "cpu1",
-	[TEGRA_POWERGATE_CPU2] = "cpu2",
-	[TEGRA_POWERGATE_CPU3] = "cpu3",
-	[TEGRA_POWERGATE_CELP] = "celp",
-	[TEGRA_POWERGATE_3D1] = "3d1",
-};
-
-static const u8 tegra30_cpu_powergates[] = {
-	TEGRA_POWERGATE_CPU,
-	TEGRA_POWERGATE_CPU1,
-	TEGRA_POWERGATE_CPU2,
-	TEGRA_POWERGATE_CPU3,
-};
-
-static const struct tegra_pmc_soc tegra30_pmc_soc = {
-	.num_powergates = ARRAY_SIZE(tegra30_powergates),
-	.powergates = tegra30_powergates,
-	.num_cpu_powergates = ARRAY_SIZE(tegra30_cpu_powergates),
-	.cpu_powergates = tegra30_cpu_powergates,
-	.has_tsense_reset = true,
-	.has_gpu_clamps = false,
-};
-
-static const char * const tegra114_powergates[] = {
-	[TEGRA_POWERGATE_CPU] = "crail",
-	[TEGRA_POWERGATE_3D] = "3d",
-	[TEGRA_POWERGATE_VENC] = "venc",
-	[TEGRA_POWERGATE_VDEC] = "vdec",
-	[TEGRA_POWERGATE_MPE] = "mpe",
-	[TEGRA_POWERGATE_HEG] = "heg",
-	[TEGRA_POWERGATE_CPU1] = "cpu1",
-	[TEGRA_POWERGATE_CPU2] = "cpu2",
-	[TEGRA_POWERGATE_CPU3] = "cpu3",
-	[TEGRA_POWERGATE_CELP] = "celp",
-	[TEGRA_POWERGATE_CPU0] = "cpu0",
-	[TEGRA_POWERGATE_C0NC] = "c0nc",
-	[TEGRA_POWERGATE_C1NC] = "c1nc",
-	[TEGRA_POWERGATE_DIS] = "dis",
-	[TEGRA_POWERGATE_DISB] = "disb",
-	[TEGRA_POWERGATE_XUSBA] = "xusba",
-	[TEGRA_POWERGATE_XUSBB] = "xusbb",
-	[TEGRA_POWERGATE_XUSBC] = "xusbc",
-};
-
-static const u8 tegra114_cpu_powergates[] = {
-	TEGRA_POWERGATE_CPU0,
-	TEGRA_POWERGATE_CPU1,
-	TEGRA_POWERGATE_CPU2,
-	TEGRA_POWERGATE_CPU3,
-};
-
-static const struct tegra_pmc_soc tegra114_pmc_soc = {
-	.num_powergates = ARRAY_SIZE(tegra114_powergates),
-	.powergates = tegra114_powergates,
-	.num_cpu_powergates = ARRAY_SIZE(tegra114_cpu_powergates),
-	.cpu_powergates = tegra114_cpu_powergates,
-	.has_tsense_reset = true,
-	.has_gpu_clamps = false,
-};
-
-static const char * const tegra124_powergates[] = {
-	[TEGRA_POWERGATE_CPU] = "crail",
-	[TEGRA_POWERGATE_3D] = "3d",
-	[TEGRA_POWERGATE_VENC] = "venc",
-	[TEGRA_POWERGATE_PCIE] = "pcie",
-	[TEGRA_POWERGATE_VDEC] = "vdec",
-	[TEGRA_POWERGATE_L2] = "l2",
-	[TEGRA_POWERGATE_MPE] = "mpe",
-	[TEGRA_POWERGATE_HEG] = "heg",
-	[TEGRA_POWERGATE_SATA] = "sata",
-	[TEGRA_POWERGATE_CPU1] = "cpu1",
-	[TEGRA_POWERGATE_CPU2] = "cpu2",
-	[TEGRA_POWERGATE_CPU3] = "cpu3",
-	[TEGRA_POWERGATE_CELP] = "celp",
-	[TEGRA_POWERGATE_CPU0] = "cpu0",
-	[TEGRA_POWERGATE_C0NC] = "c0nc",
-	[TEGRA_POWERGATE_C1NC] = "c1nc",
-	[TEGRA_POWERGATE_SOR] = "sor",
-	[TEGRA_POWERGATE_DIS] = "dis",
-	[TEGRA_POWERGATE_DISB] = "disb",
-	[TEGRA_POWERGATE_XUSBA] = "xusba",
-	[TEGRA_POWERGATE_XUSBB] = "xusbb",
-	[TEGRA_POWERGATE_XUSBC] = "xusbc",
-	[TEGRA_POWERGATE_VIC] = "vic",
-	[TEGRA_POWERGATE_IRAM] = "iram",
-};
-
-static const u8 tegra124_cpu_powergates[] = {
-	TEGRA_POWERGATE_CPU0,
-	TEGRA_POWERGATE_CPU1,
-	TEGRA_POWERGATE_CPU2,
-	TEGRA_POWERGATE_CPU3,
-};
-
-static const struct tegra_pmc_soc tegra124_pmc_soc = {
-	.num_powergates = ARRAY_SIZE(tegra124_powergates),
-	.powergates = tegra124_powergates,
-	.num_cpu_powergates = ARRAY_SIZE(tegra124_cpu_powergates),
-	.cpu_powergates = tegra124_cpu_powergates,
-	.has_tsense_reset = true,
-	.has_gpu_clamps = true,
-};
-
-static const char * const tegra210_powergates[] = {
-	[TEGRA_POWERGATE_CPU] = "crail",
-	[TEGRA_POWERGATE_3D] = "3d",
-	[TEGRA_POWERGATE_VENC] = "venc",
-	[TEGRA_POWERGATE_PCIE] = "pcie",
-	[TEGRA_POWERGATE_L2] = "l2",
-	[TEGRA_POWERGATE_MPE] = "mpe",
-	[TEGRA_POWERGATE_HEG] = "heg",
-	[TEGRA_POWERGATE_SATA] = "sata",
-	[TEGRA_POWERGATE_CPU1] = "cpu1",
-	[TEGRA_POWERGATE_CPU2] = "cpu2",
-	[TEGRA_POWERGATE_CPU3] = "cpu3",
-	[TEGRA_POWERGATE_CELP] = "celp",
-	[TEGRA_POWERGATE_CPU0] = "cpu0",
-	[TEGRA_POWERGATE_C0NC] = "c0nc",
-	[TEGRA_POWERGATE_C1NC] = "c1nc",
-	[TEGRA_POWERGATE_SOR] = "sor",
-	[TEGRA_POWERGATE_DIS] = "dis",
-	[TEGRA_POWERGATE_DISB] = "disb",
-	[TEGRA_POWERGATE_XUSBA] = "xusba",
-	[TEGRA_POWERGATE_XUSBB] = "xusbb",
-	[TEGRA_POWERGATE_XUSBC] = "xusbc",
-	[TEGRA_POWERGATE_VIC] = "vic",
-	[TEGRA_POWERGATE_IRAM] = "iram",
-	[TEGRA_POWERGATE_NVDEC] = "nvdec",
-	[TEGRA_POWERGATE_NVJPG] = "nvjpg",
-	[TEGRA_POWERGATE_AUD] = "aud",
-	[TEGRA_POWERGATE_DFD] = "dfd",
-	[TEGRA_POWERGATE_VE2] = "ve2",
-};
-
-static const u8 tegra210_cpu_powergates[] = {
-	TEGRA_POWERGATE_CPU0,
-	TEGRA_POWERGATE_CPU1,
-	TEGRA_POWERGATE_CPU2,
-	TEGRA_POWERGATE_CPU3,
-};
-
-static const struct tegra_pmc_soc tegra210_pmc_soc = {
-	.num_powergates = ARRAY_SIZE(tegra210_powergates),
-	.powergates = tegra210_powergates,
-	.num_cpu_powergates = ARRAY_SIZE(tegra210_cpu_powergates),
-	.cpu_powergates = tegra210_cpu_powergates,
-	.has_tsense_reset = true,
-	.has_gpu_clamps = true,
-};
-
-static const struct of_device_id tegra_pmc_match[] = {
-	{ .compatible = "nvidia,tegra210-pmc", .data = &tegra210_pmc_soc },
-	{ .compatible = "nvidia,tegra132-pmc", .data = &tegra124_pmc_soc },
-	{ .compatible = "nvidia,tegra124-pmc", .data = &tegra124_pmc_soc },
-	{ .compatible = "nvidia,tegra114-pmc", .data = &tegra114_pmc_soc },
-	{ .compatible = "nvidia,tegra30-pmc", .data = &tegra30_pmc_soc },
-	{ .compatible = "nvidia,tegra20-pmc", .data = &tegra20_pmc_soc },
-	{ }
-};
-
-static struct platform_driver tegra_pmc_driver = {
-	.driver = {
-		.name = "tegra-pmc",
-		.suppress_bind_attrs = true,
-		.of_match_table = tegra_pmc_match,
-#if defined(CONFIG_PM_SLEEP) && defined(CONFIG_ARM)
-		.pm = &tegra_pmc_pm_ops,
-#endif
-	},
-	.probe = tegra_pmc_probe,
-};
-builtin_platform_driver(tegra_pmc_driver);
-
-/*
- * Early initialization to allow access to registers in the very early boot
- * process.
- */
-static int __init tegra_pmc_early_init(void)
-{
-	const struct of_device_id *match;
-	struct device_node *np;
-	struct resource regs;
-	bool invert;
-	u32 value;
-
-	np = of_find_matching_node_and_match(NULL, tegra_pmc_match, &match);
-	if (!np) {
-		/*
-		 * Fall back to legacy initialization for 32-bit ARM only. All
-		 * 64-bit ARM device tree files for Tegra are required to have
-		 * a PMC node.
-		 *
-		 * This is for backwards-compatibility with old device trees
-		 * that didn't contain a PMC node. Note that in this case the
-		 * SoC data can't be matched and therefore powergating is
-		 * disabled.
-		 */
-		if (IS_ENABLED(CONFIG_ARM) && soc_is_tegra()) {
-			pr_warn("DT node not found, powergating disabled\n");
-
-			regs.start = 0x7000e400;
-			regs.end = 0x7000e7ff;
-			regs.flags = IORESOURCE_MEM;
-
-			pr_warn("Using memory region %pR\n", &regs);
-		} else {
-			/*
-			 * At this point we're not running on Tegra, so play
-			 * nice with multi-platform kernels.
-			 */
-			return 0;
-		}
-	} else {
-		/*
-		 * Extract information from the device tree if we've found a
-		 * matching node.
-		 */
-		if (of_address_to_resource(np, 0, &regs) < 0) {
-			pr_err("failed to get PMC registers\n");
-			return -ENXIO;
-		}
-
-		pmc->soc = match->data;
-	}
-
-	pmc->base = ioremap_nocache(regs.start, resource_size(&regs));
-	if (!pmc->base) {
-		pr_err("failed to map PMC registers\n");
-		return -ENXIO;
-	}
-
-	mutex_init(&pmc->powergates_lock);
-
-	/*
-	 * Invert the interrupt polarity if a PMC device tree node exists and
-	 * contains the nvidia,invert-interrupt property.
-	 */
-	invert = of_property_read_bool(np, "nvidia,invert-interrupt");
-
-	value = tegra_pmc_readl(PMC_CNTRL);
-
-	if (invert)
-		value |= PMC_CNTRL_INTR_POLARITY;
-	else
-		value &= ~PMC_CNTRL_INTR_POLARITY;
-
-	tegra_pmc_writel(value, PMC_CNTRL);
-
-	return 0;
-}
-early_initcall(tegra_pmc_early_init);
+#ifndef SMU_7_1_2_D_H
+#define SMU_7_1_2_D_H
+
+#define mmGCK_SMC_IND_INDEX                                                     0x80
+#define mmGCK0_GCK_SMC_IND_INDEX                                                0x80
+#define mmGCK1_GCK_SMC_IND_INDEX                                                0x82
+#define mmGCK2_GCK_SMC_IND_INDEX                                                0x84
+#define mmGCK3_GCK_SMC_IND_INDEX                                                0x86
+#define mmGCK_SMC_IND_DATA                                                      0x81
+#define mmGCK0_GCK_SMC_IND_DATA                                                 0x81
+#define mmGCK1_GCK_SMC_IND_DATA                                                 0x83
+#define mmGCK2_GCK_SMC_IND_DATA                                                 0x85
+#define mmGCK3_GCK_SMC_IND_DATA                                                 0x87
+#define ixCG_DCLK_CNTL                                                          0xc050009c
+#define ixCG_DCLK_STATUS                                                        0xc05000a0
+#define ixCG_VCLK_CNTL                                                          0xc05000a4
+#define ixCG_VCLK_STATUS                                                        0xc05000a8
+#define ixCG_ECLK_CNTL                                                          0xc05000ac
+#define ixCG_ECLK_STATUS                                                        0xc05000b0
+#define ixCG_ACLK_CNTL                                                          0xc05000dc
+#define ixGCK_DFS_BYPASS_CNTL                                                   0xc0500118
+#define ixCG_SPLL_FUNC_CNTL                                                     0xc0500140
+#define ixCG_SPLL_FUNC_CNTL_2                                                   0xc0500144
+#define ixCG_SPLL_FUNC_CNTL_3                                                   0xc0500148
+#define ixCG_SPLL_FUNC_CNTL_4                                                   0xc050014c
+#define ixCG_SPLL_FUNC_CNTL_5                                                   0xc0500150
+#define ixCG_SPLL_FUNC_CNTL_6                                                   0xc0500154
+#define ixCG_SPLL_FUNC_CNTL_7                                                   0xc0500158
+#define ixSPLL_CNTL_MODE                                                        0xc0500160
+#define ixCG_SPLL_SPREAD_SPECTRUM                                               0xc0500164
+#define ixCG_SPLL_SPREAD_SPECTRUM_2                                             0xc0500168
+#define ixMPLL_BYPASSCLK_SEL                                                    0xc050019c
+#define ixCG_CLKPIN_CNTL                                                        0xc05001a0
+#define ixCG_CLKPIN_CNTL_2                                                      0xc05001a4
+#define ixCG_CLKPIN_CNTL_DC                                                     0xc0500204
+#define ixTHM_CLK_CNTL                                                          0xc05001a8
+#define ixMISC_CLK_CTRL                                                         0xc05001ac
+#define ixGCK_PLL_TEST_CNTL                                                     0xc05001c0
+#define ixGCK_PLL_TEST_CNTL_2                                                   0xc05001c4
+#define ixGCK_ADFS_CLK_BYPASS_CNTL1                                             0xc05001c8
+#define mmSMC_IND_INDEX                                                         0x80
+#define mmSMC0_SMC_IND_INDEX                                                    0x80
+#define mmSMC1_SMC_IND_INDEX                                                    0x82
+#define mmSMC2_SMC_IND_INDEX                                                    0x84
+#define mmSMC3_SMC_IND_INDEX                                                    0x86
+#define mmSMC_IND_DATA                                                          0x81
+#define mmSMC0_SMC_IND_DATA                                                     0x81
+#define mmSMC1_SMC_IND_DATA                                                     0x83
+#define mmSMC2_SMC_IND_DATA                                                     0x85
+#define mmSMC3_SMC_IND_DATA                                                     0x87
+#define mmSMC_IND_INDEX_0                                                       0x80
+#define mmSMC_IND_DATA_0                                                        0x81
+#define mmSMC_IND_INDEX_1                                                       0x82
+#define mmSMC_IND_DATA_1                                                        0x83
+#define mmSMC_IND_INDEX_2                                                       0x84
+#define mmSMC_IND_DATA_2                                                        0x85
+#define mmSMC_IND_INDEX_3                                                       0x86
+#define mmSMC_IND_DATA_3                                                        0x87
+#define mmSMC_IND_INDEX_4                                                       0x88
+#define mmSMC_IND_DATA_4                                                        0x89
+#define mmSMC_IND_INDEX_5                                                       0x8a
+#define mmSMC_IND_DATA_5                                                        0x8b
+#define mmSMC_IND_INDEX_6                                                       0x8c
+#define mmSMC_IND_DATA_6                                                        0x8d
+#define mmSMC_IND_INDEX_7                                                       0x8e
+#define mmSMC_IND_DATA_7                                                        0x8f
+#define mmSMC_IND_ACCESS_CNTL                                                   0x92
+#define mmSMC_MESSAGE_0                                                         0x94
+#define mmSMC_RESP_0                                                            0x95
+#define mmSMC_MESSAGE_1                                                         0x96
+#define mmSMC_RESP_1                                                            0x97
+#define mmSMC_MESSAGE_2                                                         0x98
+#define mmSMC_RESP_2                                                            0x99
+#define mmSMC_MESSAGE_3                                                         0x9a
+#define mmSMC_RESP_3                                                            0x9b
+#define mmSMC_MESSAGE_4                                                         0x9c
+#define mmSMC_RESP_4                                                            0x9d
+#define mmSMC_MESSAGE_5                                                         0x9e
+#define mmSMC_RESP_5                                                            0x9f
+#define mmSMC_MESSAGE_6                                                         0xa0
+#define mmSMC_RESP_6                                                            0xa1
+#define mmSMC_MESSAGE_7                                                         0xa2
+#define mmSMC_RESP_7                                                            0xa3
+#define mmSMC_MSG_ARG_0                                                         0xa4
+#define mmSMC_MSG_ARG_1                                                         0xa5
+#define mmSMC_MSG_ARG_2                                                         0xa6
+#define mmSMC_MSG_ARG_3                                                         0xa7
+#define mmSMC_MSG_ARG_4                                                         0xa8
+#define mmSMC_MSG_ARG_5                                                         0xa9
+#define mmSMC_MSG_ARG_6                                                         0xaa
+#define mmSMC_MSG_ARG_7                                                         0xab
+#define mmSMC_MESSAGE_8                                                         0xb5
+#define mmSMC_RESP_8                                                            0xb6
+#define mmSMC_MESSAGE_9                                                         0xb7
+#define mmSMC_RESP_9                                                            0xb8
+#define mmSMC_MESSAGE_10                                                        0xb9
+#define mmSMC_RESP_10                                                           0xba
+#define mmSMC_MESSAGE_11                                                        0xbb
+#define mmSMC_RESP_11                                                           0xbc
+#define mmSMC_MSG_ARG_8                                                         0xbd
+#define mmSMC_MSG_ARG_9                                                         0xbe
+#define mmSMC_MSG_ARG_10                                                        0xbf
+#define mmSMC_MSG_ARG_11                                                        0x93
+#define ixSMC_SYSCON_RESET_CNTL                                                 0x80000000
+#define ixSMC_SYSCON_CLOCK_CNTL_0                                               0x80000004
+#define ixSMC_SYSCON_CLOCK_CNTL_1                                               0x80000008
+#define ixSMC_SYSCON_CLOCK_CNTL_2                                               0x8000000c
+#define ixSMC_SYSCON_MISC_CNTL                                                  0x80000010
+#define ixSMC_SYSCON_MSG_ARG_0                                                  0x80000068
+#define ixSMC_PC_C                                                              0x80000370
+#define ixSMC_SCRATCH9                                                          0x80000424
+#define mmGPIOPAD_SW_INT_STAT                                                   0x180
+#define mmGPIOPAD_STRENGTH                                                      0x181
+#define mmGPIOPAD_MASK                                                          0x182
+#define mmGPIOPAD_A                                                             0x183
+#define mmGPIOPAD_EN                                                            0x184
+#define mmGPIOPAD_Y                                                             0x185
+#define mmGPIOPAD_PINSTRAPS                                                     0x186
+#define mmGPIOPAD_INT_STAT_EN                                                   0x187
+#define mmGPIOPAD_INT_STAT                                                      0x188
+#define mmGPIOPAD_INT_STAT_AK                                                   0x189
+#define mmGPIOPAD_INT_EN                                                        0x18a
+#define mmGPIOPAD_INT_TYPE                                                      0x18b
+#define mmGPIOPAD_INT_POLARITY                                                  0x18c
+#define mmGPIOPAD_EXTERN_TRIG_CNTL                                              0x18d
+#define mmGPIOPAD_RCVR_SEL              

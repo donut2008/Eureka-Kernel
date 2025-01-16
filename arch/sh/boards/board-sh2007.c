@@ -1,145 +1,102 @@
-/*
- * SH-2007 board support.
- *
- * Copyright (C) 2003, 2004  SUGIOKA Toshinobu
- * Copyright (C) 2010  Hitoshi Mitake <mitake@dcl.info.waseda.ac.jp>
+y regions.
+ * @fmr_list: A linked list of fast memory regions to unmap.
  */
-#include <linux/init.h>
-#include <linux/irq.h>
-#include <linux/regulator/fixed.h>
-#include <linux/regulator/machine.h>
-#include <linux/smsc911x.h>
-#include <linux/platform_device.h>
-#include <linux/ata_platform.h>
-#include <linux/io.h>
-#include <asm/machvec.h>
-#include <mach/sh2007.h>
+int ib_unmap_fmr(struct list_head *fmr_list);
 
-/* Dummy supplies, where voltage doesn't matter */
-static struct regulator_consumer_supply dummy_supplies[] = {
-	REGULATOR_SUPPLY("vddvario", "smsc911x.0"),
-	REGULATOR_SUPPLY("vdd33a", "smsc911x.0"),
-	REGULATOR_SUPPLY("vddvario", "smsc911x.1"),
-	REGULATOR_SUPPLY("vdd33a", "smsc911x.1"),
-};
+/**
+ * ib_dealloc_fmr - Deallocates a fast memory region.
+ * @fmr: The fast memory region to deallocate.
+ */
+int ib_dealloc_fmr(struct ib_fmr *fmr);
 
-struct smsc911x_platform_config smc911x_info = {
-	.flags		= SMSC911X_USE_32BIT,
-	.irq_polarity	= SMSC911X_IRQ_POLARITY_ACTIVE_LOW,
-	.irq_type	= SMSC911X_IRQ_TYPE_PUSH_PULL,
-};
+/**
+ * ib_attach_mcast - Attaches the specified QP to a multicast group.
+ * @qp: QP to attach to the multicast group.  The QP must be type
+ *   IB_QPT_UD.
+ * @gid: Multicast group GID.
+ * @lid: Multicast group LID in host byte order.
+ *
+ * In order to send and receive multicast packets, subnet
+ * administration must have created the multicast group and configured
+ * the fabric appropriately.  The port associated with the specified
+ * QP must also be a member of the multicast group.
+ */
+int ib_attach_mcast(struct ib_qp *qp, union ib_gid *gid, u16 lid);
 
-static struct resource smsc9118_0_resources[] = {
-	[0] = {
-		.start	= SMC0_BASE,
-		.end	= SMC0_BASE + 0xff,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= evt2irq(0x240),
-		.end	= evt2irq(0x240),
-		.flags	= IORESOURCE_IRQ,
-	}
-};
+/**
+ * ib_detach_mcast - Detaches the specified QP from a multicast group.
+ * @qp: QP to detach from the multicast group.
+ * @gid: Multicast group GID.
+ * @lid: Multicast group LID in host byte order.
+ */
+int ib_detach_mcast(struct ib_qp *qp, union ib_gid *gid, u16 lid);
 
-static struct resource smsc9118_1_resources[] = {
-	[0] = {
-		.start	= SMC1_BASE,
-		.end	= SMC1_BASE + 0xff,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= evt2irq(0x280),
-		.end	= evt2irq(0x280),
-		.flags	= IORESOURCE_IRQ,
-	}
-};
+/**
+ * ib_alloc_xrcd - Allocates an XRC domain.
+ * @device: The device on which to allocate the XRC domain.
+ */
+struct ib_xrcd *ib_alloc_xrcd(struct ib_device *device);
 
-static struct platform_device smsc9118_0_device = {
-	.name		= "smsc911x",
-	.id		= 0,
-	.num_resources	= ARRAY_SIZE(smsc9118_0_resources),
-	.resource	= smsc9118_0_resources,
-	.dev = {
-		.platform_data = &smc911x_info,
-	},
-};
+/**
+ * ib_dealloc_xrcd - Deallocates an XRC domain.
+ * @xrcd: The XRC domain to deallocate.
+ */
+int ib_dealloc_xrcd(struct ib_xrcd *xrcd);
 
-static struct platform_device smsc9118_1_device = {
-	.name		= "smsc911x",
-	.id		= 1,
-	.num_resources	= ARRAY_SIZE(smsc9118_1_resources),
-	.resource	= smsc9118_1_resources,
-	.dev = {
-		.platform_data = &smc911x_info,
-	},
-};
+struct ib_flow *ib_create_flow(struct ib_qp *qp,
+			       struct ib_flow_attr *flow_attr, int domain);
+int ib_destroy_flow(struct ib_flow *flow_id);
 
-static struct resource cf_resources[] = {
-	[0] = {
-		.start	= CF_BASE + CF_OFFSET,
-		.end	= CF_BASE + CF_OFFSET + 0x0f,
-		.flags	= IORESOURCE_MEM,
-	},
-	[1] = {
-		.start	= CF_BASE + CF_OFFSET + 0x206,
-		.end	= CF_BASE + CF_OFFSET + 0x20f,
-		.flags	= IORESOURCE_MEM,
-	},
-	[2] = {
-		.start	= evt2irq(0x2c0),
-		.end	= evt2irq(0x2c0),
-		.flags	= IORESOURCE_IRQ,
-	},
-};
-
-static struct platform_device cf_device  = {
-	.name		= "pata_platform",
-	.id		= 0,
-	.num_resources	= ARRAY_SIZE(cf_resources),
-	.resource	= cf_resources,
-};
-
-static struct platform_device *sh2007_devices[] __initdata = {
-	&smsc9118_0_device,
-	&smsc9118_1_device,
-	&cf_device,
-};
-
-static int __init sh2007_io_init(void)
+static inline int ib_check_mr_access(int flags)
 {
-	regulator_register_fixed(0, dummy_supplies, ARRAY_SIZE(dummy_supplies));
+	/*
+	 * Local write permission is required if remote write or
+	 * remote atomic permission is also requested.
+	 */
+	if (flags & (IB_ACCESS_REMOTE_ATOMIC | IB_ACCESS_REMOTE_WRITE) &&
+	    !(flags & IB_ACCESS_LOCAL_WRITE))
+		return -EINVAL;
 
-	platform_add_devices(sh2007_devices, ARRAY_SIZE(sh2007_devices));
 	return 0;
 }
-subsys_initcall(sh2007_io_init);
 
-static void __init sh2007_init_irq(void)
+static inline bool ib_access_writable(int access_flags)
 {
-	plat_irq_setup_pins(IRQ_MODE_IRQ);
+	/*
+	 * We have writable memory backing the MR if any of the following
+	 * access flags are set.  "Local write" and "remote write" obviously
+	 * require write access.  "Remote atomic" can do things like fetch and
+	 * add, which will modify memory, and "MW bind" can change permissions
+	 * by binding a window.
+	 */
+	return access_flags &
+		(IB_ACCESS_LOCAL_WRITE   | IB_ACCESS_REMOTE_WRITE |
+		 IB_ACCESS_REMOTE_ATOMIC | IB_ACCESS_MW_BIND);
 }
 
-/*
- * Initialize the board
+/**
+ * ib_check_mr_status: lightweight check of MR status.
+ *     This routine may provide status checks on a selected
+ *     ib_mr. first use is for signature status check.
+ *
+ * @mr: A memory region.
+ * @check_mask: Bitmask of which checks to perform from
+ *     ib_mr_status_check enumeration.
+ * @mr_status: The container of relevant status checks.
+ *     failed checks will be indicated in the status bitmask
+ *     and the relevant info shall be in the error item.
  */
-static void __init sh2007_setup(char **cmdline_p)
-{
-	printk(KERN_INFO "SH-2007 Setup...");
+int ib_check_mr_status(struct ib_mr *mr, u32 check_mask,
+		       struct ib_mr_status *mr_status);
 
-	/* setup wait control registers for area 5 */
-	__raw_writel(CS5BCR_D, CS5BCR);
-	__raw_writel(CS5WCR_D, CS5WCR);
-	__raw_writel(CS5PCR_D, CS5PCR);
+struct net_device *ib_get_net_dev_by_params(struct ib_device *dev, u8 port,
+					    u16 pkey, const union ib_gid *gid,
+					    const struct sockaddr *addr);
 
-	printk(KERN_INFO " done.\n");
-}
+int ib_map_mr_sg(struct ib_mr *mr,
+		 struct scatterlist *sg,
+		 int sg_nents,
+		 unsigned int page_size);
 
-/*
- * The Machine Vector
- */
-struct sh_machine_vector mv_sh2007 __initmv = {
-	.mv_setup		= sh2007_setup,
-	.mv_name		= "sh2007",
-	.mv_init_irq		= sh2007_init_irq,
-};
+static inline int
+ib_map_mr_sg_zbva

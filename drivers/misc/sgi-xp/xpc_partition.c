@@ -1,541 +1,508 @@
-/*
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
- *
- * Copyright (c) 2004-2008 Silicon Graphics, Inc.  All Rights Reserved.
- */
+ \
+	POSTING_READ(GEN8_##type##_IIR(which)); \
+	I915_WRITE(GEN8_##type##_IIR(which), 0xffffffff); \
+	POSTING_READ(GEN8_##type##_IIR(which)); \
+} while (0)
+
+#define GEN5_IRQ_RESET(type) do { \
+	I915_WRITE(type##IMR, 0xffffffff); \
+	POSTING_READ(type##IMR); \
+	I915_WRITE(type##IER, 0); \
+	I915_WRITE(type##IIR, 0xffffffff); \
+	POSTING_READ(type##IIR); \
+	I915_WRITE(type##IIR, 0xffffffff); \
+	POSTING_READ(type##IIR); \
+} while (0)
 
 /*
- * Cross Partition Communication (XPC) partition support.
- *
- *	This is the part of XPC that detects the presence/absence of
- *	other partitions. It provides a heartbeat and monitors the
- *	heartbeats of other partitions.
- *
+ * We should clear IMR at preinstall/uninstall, and just check at postinstall.
  */
-
-#include <linux/device.h>
-#include <linux/hardirq.h>
-#include <linux/slab.h>
-#include "xpc.h"
-#include <asm/uv/uv_hub.h>
-
-/* XPC is exiting flag */
-int xpc_exiting;
-
-/* this partition's reserved page pointers */
-struct xpc_rsvd_page *xpc_rsvd_page;
-static unsigned long *xpc_part_nasids;
-unsigned long *xpc_mach_nasids;
-
-static int xpc_nasid_mask_nbytes;	/* #of bytes in nasid mask */
-int xpc_nasid_mask_nlongs;	/* #of longs in nasid mask */
-
-struct xpc_partition *xpc_partitions;
-
-/*
- * Guarantee that the kmalloc'd memory is cacheline aligned.
- */
-void *
-xpc_kmalloc_cacheline_aligned(size_t size, gfp_t flags, void **base)
+static void gen5_assert_iir_is_zero(struct drm_i915_private *dev_priv, u32 reg)
 {
-	/* see if kmalloc will give us cachline aligned memory by default */
-	*base = kmalloc(size, flags);
-	if (*base == NULL)
-		return NULL;
+	u32 val = I915_READ(reg);
 
-	if ((u64)*base == L1_CACHE_ALIGN((u64)*base))
-		return *base;
+	if (val == 0)
+		return;
 
-	kfree(*base);
-
-	/* nope, we'll have to do it ourselves */
-	*base = kmalloc(size + L1_CACHE_BYTES, flags);
-	if (*base == NULL)
-		return NULL;
-
-	return (void *)L1_CACHE_ALIGN((u64)*base);
+	WARN(1, "Interrupt register 0x%x is not zero: 0x%08x\n",
+	     reg, val);
+	I915_WRITE(reg, 0xffffffff);
+	POSTING_READ(reg);
+	I915_WRITE(reg, 0xffffffff);
+	POSTING_READ(reg);
 }
 
-/*
- * Given a nasid, get the physical address of the  partition's reserved page
- * for that nasid. This function returns 0 on any error.
- */
-static unsigned long
-xpc_get_rsvd_page_pa(int nasid)
+#define GEN8_IRQ_INIT_NDX(type, which, imr_val, ier_val) do { \
+	gen5_assert_iir_is_zero(dev_priv, GEN8_##type##_IIR(which)); \
+	I915_WRITE(GEN8_##type##_IER(which), (ier_val)); \
+	I915_WRITE(GEN8_##type##_IMR(which), (imr_val)); \
+	POSTING_READ(GEN8_##type##_IMR(which)); \
+} while (0)
+
+#define GEN5_IRQ_INIT(type, imr_val, ier_val) do { \
+	gen5_assert_iir_is_zero(dev_priv, type##IIR); \
+	I915_WRITE(type##IER, (ier_val)); \
+	I915_WRITE(type##IMR, (imr_val)); \
+	POSTING_READ(type##IMR); \
+} while (0)
+
+static void gen6_rps_irq_handler(struct drm_i915_private *dev_priv, u32 pm_iir);
+
+/* For display hotplug interrupt */
+static inline void
+i915_hotplug_interrupt_update_locked(struct drm_i915_private *dev_priv,
+				     uint32_t mask,
+				     uint32_t bits)
 {
-	enum xp_retval ret;
-	u64 cookie = 0;
-	unsigned long rp_pa = nasid;	/* seed with nasid */
-	size_t len = 0;
-	size_t buf_len = 0;
-	void *buf = NULL;
-	void *buf_base = NULL;
-	enum xp_retval (*get_partition_rsvd_page_pa)
-		(void *, u64 *, unsigned long *, size_t *) =
-		xpc_arch_ops.get_partition_rsvd_page_pa;
+	uint32_t val;
 
-	while (1) {
+	assert_spin_locked(&dev_priv->irq_lock);
+	WARN_ON(bits & ~mask);
 
-		/* !!! rp_pa will need to be _gpa on UV.
-		 * ??? So do we save it into the architecture specific parts
-		 * ??? of the xpc_partition structure? Do we rename this
-		 * ??? function or have two versions? Rename rp_pa for UV to
-		 * ??? rp_gpa?
-		 */
-		ret = get_partition_rsvd_page_pa(buf, &cookie, &rp_pa, &len);
-
-		dev_dbg(xpc_part, "SAL returned with ret=%d, cookie=0x%016lx, "
-			"address=0x%016lx, len=0x%016lx\n", ret,
-			(unsigned long)cookie, rp_pa, len);
-
-		if (ret != xpNeedMoreInfo)
-			break;
-
-		/* !!! L1_CACHE_ALIGN() is only a sn2-bte_copy requirement */
-		if (is_shub())
-			len = L1_CACHE_ALIGN(len);
-
-		if (len > buf_len) {
-			if (buf_base != NULL)
-				kfree(buf_base);
-			buf_len = L1_CACHE_ALIGN(len);
-			buf = xpc_kmalloc_cacheline_aligned(buf_len, GFP_KERNEL,
-							    &buf_base);
-			if (buf_base == NULL) {
-				dev_err(xpc_part, "unable to kmalloc "
-					"len=0x%016lx\n", buf_len);
-				ret = xpNoMemory;
-				break;
-			}
-		}
-
-		ret = xp_remote_memcpy(xp_pa(buf), rp_pa, len);
-		if (ret != xpSuccess) {
-			dev_dbg(xpc_part, "xp_remote_memcpy failed %d\n", ret);
-			break;
-		}
-	}
-
-	kfree(buf_base);
-
-	if (ret != xpSuccess)
-		rp_pa = 0;
-
-	dev_dbg(xpc_part, "reserved page at phys address 0x%016lx\n", rp_pa);
-	return rp_pa;
+	val = I915_READ(PORT_HOTPLUG_EN);
+	val &= ~mask;
+	val |= bits;
+	I915_WRITE(PORT_HOTPLUG_EN, val);
 }
 
-/*
- * Fill the partition reserved page with the information needed by
- * other partitions to discover we are alive and establish initial
- * communications.
+/**
+ * i915_hotplug_interrupt_update - update hotplug interrupt enable
+ * @dev_priv: driver private
+ * @mask: bits to update
+ * @bits: bits to enable
+ * NOTE: the HPD enable bits are modified both inside and outside
+ * of an interrupt context. To avoid that read-modify-write cycles
+ * interfer, these bits are protected by a spinlock. Since this
+ * function is usually not called from a context where the lock is
+ * held already, this function acquires the lock itself. A non-locking
+ * version is also available.
  */
-int
-xpc_setup_rsvd_page(void)
+void i915_hotplug_interrupt_update(struct drm_i915_private *dev_priv,
+				   uint32_t mask,
+				   uint32_t bits)
 {
-	int ret;
-	struct xpc_rsvd_page *rp;
-	unsigned long rp_pa;
-	unsigned long new_ts_jiffies;
+	spin_lock_irq(&dev_priv->irq_lock);
+	i915_hotplug_interrupt_update_locked(dev_priv, mask, bits);
+	spin_unlock_irq(&dev_priv->irq_lock);
+}
 
-	/* get the local reserved page's address */
+/**
+ * ilk_update_display_irq - update DEIMR
+ * @dev_priv: driver private
+ * @interrupt_mask: mask of interrupt bits to update
+ * @enabled_irq_mask: mask of interrupt bits to enable
+ */
+static void ilk_update_display_irq(struct drm_i915_private *dev_priv,
+				   uint32_t interrupt_mask,
+				   uint32_t enabled_irq_mask)
+{
+	uint32_t new_val;
 
-	preempt_disable();
-	rp_pa = xpc_get_rsvd_page_pa(xp_cpu_to_nasid(smp_processor_id()));
-	preempt_enable();
-	if (rp_pa == 0) {
-		dev_err(xpc_part, "SAL failed to locate the reserved page\n");
-		return -ESRCH;
+	assert_spin_locked(&dev_priv->irq_lock);
+
+	WARN_ON(enabled_irq_mask & ~interrupt_mask);
+
+	if (WARN_ON(!intel_irqs_enabled(dev_priv)))
+		return;
+
+	new_val = dev_priv->irq_mask;
+	new_val &= ~interrupt_mask;
+	new_val |= (~enabled_irq_mask & interrupt_mask);
+
+	if (new_val != dev_priv->irq_mask) {
+		dev_priv->irq_mask = new_val;
+		I915_WRITE(DEIMR, dev_priv->irq_mask);
+		POSTING_READ(DEIMR);
 	}
-	rp = (struct xpc_rsvd_page *)__va(xp_socket_pa(rp_pa));
+}
 
-	if (rp->SAL_version < 3) {
-		/* SAL_versions < 3 had a SAL_partid defined as a u8 */
-		rp->SAL_partid &= 0xff;
+void
+ironlake_enable_display_irq(struct drm_i915_private *dev_priv, u32 mask)
+{
+	ilk_update_display_irq(dev_priv, mask, mask);
+}
+
+void
+ironlake_disable_display_irq(struct drm_i915_private *dev_priv, u32 mask)
+{
+	ilk_update_display_irq(dev_priv, mask, 0);
+}
+
+/**
+ * ilk_update_gt_irq - update GTIMR
+ * @dev_priv: driver private
+ * @interrupt_mask: mask of interrupt bits to update
+ * @enabled_irq_mask: mask of interrupt bits to enable
+ */
+static void ilk_update_gt_irq(struct drm_i915_private *dev_priv,
+			      uint32_t interrupt_mask,
+			      uint32_t enabled_irq_mask)
+{
+	assert_spin_locked(&dev_priv->irq_lock);
+
+	WARN_ON(enabled_irq_mask & ~interrupt_mask);
+
+	if (WARN_ON(!intel_irqs_enabled(dev_priv)))
+		return;
+
+	dev_priv->gt_irq_mask &= ~interrupt_mask;
+	dev_priv->gt_irq_mask |= (~enabled_irq_mask & interrupt_mask);
+	I915_WRITE(GTIMR, dev_priv->gt_irq_mask);
+	POSTING_READ(GTIMR);
+}
+
+void gen5_enable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask)
+{
+	ilk_update_gt_irq(dev_priv, mask, mask);
+}
+
+void gen5_disable_gt_irq(struct drm_i915_private *dev_priv, uint32_t mask)
+{
+	ilk_update_gt_irq(dev_priv, mask, 0);
+}
+
+static u32 gen6_pm_iir(struct drm_i915_private *dev_priv)
+{
+	return INTEL_INFO(dev_priv)->gen >= 8 ? GEN8_GT_IIR(2) : GEN6_PMIIR;
+}
+
+static u32 gen6_pm_imr(struct drm_i915_private *dev_priv)
+{
+	return INTEL_INFO(dev_priv)->gen >= 8 ? GEN8_GT_IMR(2) : GEN6_PMIMR;
+}
+
+static u32 gen6_pm_ier(struct drm_i915_private *dev_priv)
+{
+	return INTEL_INFO(dev_priv)->gen >= 8 ? GEN8_GT_IER(2) : GEN6_PMIER;
+}
+
+/**
+  * snb_update_pm_irq - update GEN6_PMIMR
+  * @dev_priv: driver private
+  * @interrupt_mask: mask of interrupt bits to update
+  * @enabled_irq_mask: mask of interrupt bits to enable
+  */
+static void snb_update_pm_irq(struct drm_i915_private *dev_priv,
+			      uint32_t interrupt_mask,
+			      uint32_t enabled_irq_mask)
+{
+	uint32_t new_val;
+
+	WARN_ON(enabled_irq_mask & ~interrupt_mask);
+
+	assert_spin_locked(&dev_priv->irq_lock);
+
+	new_val = dev_priv->pm_irq_mask;
+	new_val &= ~interrupt_mask;
+	new_val |= (~enabled_irq_mask & interrupt_mask);
+
+	if (new_val != dev_priv->pm_irq_mask) {
+		dev_priv->pm_irq_mask = new_val;
+		I915_WRITE(gen6_pm_imr(dev_priv), dev_priv->pm_irq_mask);
+		POSTING_READ(gen6_pm_imr(dev_priv));
 	}
-	BUG_ON(rp->SAL_partid != xp_partition_id);
+}
 
-	if (rp->SAL_partid < 0 || rp->SAL_partid >= xp_max_npartitions) {
-		dev_err(xpc_part, "the reserved page's partid of %d is outside "
-			"supported range (< 0 || >= %d)\n", rp->SAL_partid,
-			xp_max_npartitions);
-		return -EINVAL;
+void gen6_enable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask)
+{
+	if (WARN_ON(!intel_irqs_enabled(dev_priv)))
+		return;
+
+	snb_update_pm_irq(dev_priv, mask, mask);
+}
+
+static void __gen6_disable_pm_irq(struct drm_i915_private *dev_priv,
+				  uint32_t mask)
+{
+	snb_update_pm_irq(dev_priv, mask, 0);
+}
+
+void gen6_disable_pm_irq(struct drm_i915_private *dev_priv, uint32_t mask)
+{
+	if (WARN_ON(!intel_irqs_enabled(dev_priv)))
+		return;
+
+	__gen6_disable_pm_irq(dev_priv, mask);
+}
+
+void gen6_reset_rps_interrupts(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	uint32_t reg = gen6_pm_iir(dev_priv);
+
+	spin_lock_irq(&dev_priv->irq_lock);
+	I915_WRITE(reg, dev_priv->pm_rps_events);
+	I915_WRITE(reg, dev_priv->pm_rps_events);
+	POSTING_READ(reg);
+	dev_priv->rps.pm_iir = 0;
+	spin_unlock_irq(&dev_priv->irq_lock);
+}
+
+void gen6_enable_rps_interrupts(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	spin_lock_irq(&dev_priv->irq_lock);
+
+	WARN_ON(dev_priv->rps.pm_iir);
+	WARN_ON(I915_READ(gen6_pm_iir(dev_priv)) & dev_priv->pm_rps_events);
+	dev_priv->rps.interrupts_enabled = true;
+	I915_WRITE(gen6_pm_ier(dev_priv), I915_READ(gen6_pm_ier(dev_priv)) |
+				dev_priv->pm_rps_events);
+	gen6_enable_pm_irq(dev_priv, dev_priv->pm_rps_events);
+
+	spin_unlock_irq(&dev_priv->irq_lock);
+}
+
+u32 gen6_sanitize_rps_pm_mask(struct drm_i915_private *dev_priv, u32 mask)
+{
+	/*
+	 * SNB,IVB can while VLV,CHV may hard hang on looping batchbuffer
+	 * if GEN6_PM_UP_EI_EXPIRED is masked.
+	 *
+	 * TODO: verify if this can be reproduced on VLV,CHV.
+	 */
+	if (INTEL_INFO(dev_priv)->gen <= 7 && !IS_HASWELL(dev_priv))
+		mask &= ~GEN6_PM_RP_UP_EI_EXPIRED;
+
+	if (INTEL_INFO(dev_priv)->gen >= 8)
+		mask &= ~GEN8_PMINTR_REDIRECT_TO_NON_DISP;
+
+	return mask;
+}
+
+void gen6_disable_rps_interrupts(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
+
+	spin_lock_irq(&dev_priv->irq_lock);
+	dev_priv->rps.interrupts_enabled = false;
+	spin_unlock_irq(&dev_priv->irq_lock);
+
+	cancel_work_sync(&dev_priv->rps.work);
+
+	spin_lock_irq(&dev_priv->irq_lock);
+
+	I915_WRITE(GEN6_PMINTRMSK, gen6_sanitize_rps_pm_mask(dev_priv, ~0));
+
+	__gen6_disable_pm_irq(dev_priv, dev_priv->pm_rps_events);
+	I915_WRITE(gen6_pm_ier(dev_priv), I915_READ(gen6_pm_ier(dev_priv)) &
+				~dev_priv->pm_rps_events);
+
+	spin_unlock_irq(&dev_priv->irq_lock);
+
+	synchronize_irq(dev->irq);
+}
+
+/**
+  * bdw_update_port_irq - update DE port interrupt
+  * @dev_priv: driver private
+  * @interrupt_mask: mask of interrupt bits to update
+  * @enabled_irq_mask: mask of interrupt bits to enable
+  */
+static void bdw_update_port_irq(struct drm_i915_private *dev_priv,
+				uint32_t interrupt_mask,
+				uint32_t enabled_irq_mask)
+{
+	uint32_t new_val;
+	uint32_t old_val;
+
+	assert_spin_locked(&dev_priv->irq_lock);
+
+	WARN_ON(enabled_irq_mask & ~interrupt_mask);
+
+	if (WARN_ON(!intel_irqs_enabled(dev_priv)))
+		return;
+
+	old_val = I915_READ(GEN8_DE_PORT_IMR);
+
+	new_val = old_val;
+	new_val &= ~interrupt_mask;
+	new_val |= (~enabled_irq_mask & interrupt_mask);
+
+	if (new_val != old_val) {
+		I915_WRITE(GEN8_DE_PORT_IMR, new_val);
+		POSTING_READ(GEN8_DE_PORT_IMR);
 	}
+}
 
-	rp->version = XPC_RP_VERSION;
-	rp->max_npartitions = xp_max_npartitions;
+/**
+ * ibx_display_interrupt_update - update SDEIMR
+ * @dev_priv: driver private
+ * @interrupt_mask: mask of interrupt bits to update
+ * @enabled_irq_mask: mask of interrupt bits to enable
+ */
+void ibx_display_interrupt_update(struct drm_i915_private *dev_priv,
+				  uint32_t interrupt_mask,
+				  uint32_t enabled_irq_mask)
+{
+	uint32_t sdeimr = I915_READ(SDEIMR);
+	sdeimr &= ~interrupt_mask;
+	sdeimr |= (~enabled_irq_mask & interrupt_mask);
 
-	/* establish the actual sizes of the nasid masks */
-	if (rp->SAL_version == 1) {
-		/* SAL_version 1 didn't set the nasids_size field */
-		rp->SAL_nasids_size = 128;
-	}
-	xpc_nasid_mask_nbytes = rp->SAL_nasids_size;
-	xpc_nasid_mask_nlongs = BITS_TO_LONGS(rp->SAL_nasids_size *
-					      BITS_PER_BYTE);
+	WARN_ON(enabled_irq_mask & ~interrupt_mask);
 
-	/* setup the pointers to the various items in the reserved page */
-	xpc_part_nasids = XPC_RP_PART_NASIDS(rp);
-	xpc_mach_nasids = XPC_RP_MACH_NASIDS(rp);
+	assert_spin_locked(&dev_priv->irq_lock);
 
-	ret = xpc_arch_ops.setup_rsvd_page(rp);
-	if (ret != 0)
-		return ret;
+	if (WARN_ON(!intel_irqs_enabled(dev_priv)))
+		return;
+
+	I915_WRITE(SDEIMR, sdeimr);
+	POSTING_READ(SDEIMR);
+}
+
+static void
+__i915_enable_pipestat(struct drm_i915_private *dev_priv, enum pipe pipe,
+		       u32 enable_mask, u32 status_mask)
+{
+	u32 reg = PIPESTAT(pipe);
+	u32 pipestat = I915_READ(reg) & PIPESTAT_INT_ENABLE_MASK;
+
+	assert_spin_locked(&dev_priv->irq_lock);
+	WARN_ON(!intel_irqs_enabled(dev_priv));
+
+	if (WARN_ONCE(enable_mask & ~PIPESTAT_INT_ENABLE_MASK ||
+		      status_mask & ~PIPESTAT_INT_STATUS_MASK,
+		      "pipe %c: enable_mask=0x%x, status_mask=0x%x\n",
+		      pipe_name(pipe), enable_mask, status_mask))
+		return;
+
+	if ((pipestat & enable_mask) == enable_mask)
+		return;
+
+	dev_priv->pipestat_irq_mask[pipe] |= status_mask;
+
+	/* Enable the interrupt, clear any pending status */
+	pipestat |= enable_mask | status_mask;
+	I915_WRITE(reg, pipestat);
+	POSTING_READ(reg);
+}
+
+static void
+__i915_disable_pipestat(struct drm_i915_private *dev_priv, enum pipe pipe,
+		        u32 enable_mask, u32 status_mask)
+{
+	u32 reg = PIPESTAT(pipe);
+	u32 pipestat = I915_READ(reg) & PIPESTAT_INT_ENABLE_MASK;
+
+	assert_spin_locked(&dev_priv->irq_lock);
+	WARN_ON(!intel_irqs_enabled(dev_priv));
+
+	if (WARN_ONCE(enable_mask & ~PIPESTAT_INT_ENABLE_MASK ||
+		      status_mask & ~PIPESTAT_INT_STATUS_MASK,
+		      "pipe %c: enable_mask=0x%x, status_mask=0x%x\n",
+		      pipe_name(pipe), enable_mask, status_mask))
+		return;
+
+	if ((pipestat & enable_mask) == 0)
+		return;
+
+	dev_priv->pipestat_irq_mask[pipe] &= ~status_mask;
+
+	pipestat &= ~enable_mask;
+	I915_WRITE(reg, pipestat);
+	POSTING_READ(reg);
+}
+
+static u32 vlv_get_pipestat_enable_mask(struct drm_device *dev, u32 status_mask)
+{
+	u32 enable_mask = status_mask << 16;
 
 	/*
-	 * Set timestamp of when reserved page was setup by XPC.
-	 * This signifies to the remote partition that our reserved
-	 * page is initialized.
+	 * On pipe A we don't support the PSR interrupt yet,
+	 * on pipe B and C the same bit MBZ.
 	 */
-	new_ts_jiffies = jiffies;
-	if (new_ts_jiffies == 0 || new_ts_jiffies == rp->ts_jiffies)
-		new_ts_jiffies++;
-	rp->ts_jiffies = new_ts_jiffies;
-
-	xpc_rsvd_page = rp;
-	return 0;
-}
-
-void
-xpc_teardown_rsvd_page(void)
-{
-	/* a zero timestamp indicates our rsvd page is not initialized */
-	xpc_rsvd_page->ts_jiffies = 0;
-}
-
-/*
- * Get a copy of a portion of the remote partition's rsvd page.
- *
- * remote_rp points to a buffer that is cacheline aligned for BTE copies and
- * is large enough to contain a copy of their reserved page header and
- * part_nasids mask.
- */
-enum xp_retval
-xpc_get_remote_rp(int nasid, unsigned long *discovered_nasids,
-		  struct xpc_rsvd_page *remote_rp, unsigned long *remote_rp_pa)
-{
-	int l;
-	enum xp_retval ret;
-
-	/* get the reserved page's physical address */
-
-	*remote_rp_pa = xpc_get_rsvd_page_pa(nasid);
-	if (*remote_rp_pa == 0)
-		return xpNoRsvdPageAddr;
-
-	/* pull over the reserved page header and part_nasids mask */
-	ret = xp_remote_memcpy(xp_pa(remote_rp), *remote_rp_pa,
-			       XPC_RP_HEADER_SIZE + xpc_nasid_mask_nbytes);
-	if (ret != xpSuccess)
-		return ret;
-
-	if (discovered_nasids != NULL) {
-		unsigned long *remote_part_nasids =
-		    XPC_RP_PART_NASIDS(remote_rp);
-
-		for (l = 0; l < xpc_nasid_mask_nlongs; l++)
-			discovered_nasids[l] |= remote_part_nasids[l];
-	}
-
-	/* zero timestamp indicates the reserved page has not been setup */
-	if (remote_rp->ts_jiffies == 0)
-		return xpRsvdPageNotSet;
-
-	if (XPC_VERSION_MAJOR(remote_rp->version) !=
-	    XPC_VERSION_MAJOR(XPC_RP_VERSION)) {
-		return xpBadVersion;
-	}
-
-	/* check that both remote and local partids are valid for each side */
-	if (remote_rp->SAL_partid < 0 ||
-	    remote_rp->SAL_partid >= xp_max_npartitions ||
-	    remote_rp->max_npartitions <= xp_partition_id) {
-		return xpInvalidPartid;
-	}
-
-	if (remote_rp->SAL_partid == xp_partition_id)
-		return xpLocalPartid;
-
-	return xpSuccess;
-}
-
-/*
- * See if the other side has responded to a partition deactivate request
- * from us. Though we requested the remote partition to deactivate with regard
- * to us, we really only need to wait for the other side to disengage from us.
- */
-int
-xpc_partition_disengaged(struct xpc_partition *part)
-{
-	short partid = XPC_PARTID(part);
-	int disengaged;
-
-	disengaged = !xpc_arch_ops.partition_engaged(partid);
-	if (part->disengage_timeout) {
-		if (!disengaged) {
-			if (time_is_after_jiffies(part->disengage_timeout)) {
-				/* timelimit hasn't been reached yet */
-				return 0;
-			}
-
-			/*
-			 * Other side hasn't responded to our deactivate
-			 * request in a timely fashion, so assume it's dead.
-			 */
-
-			dev_info(xpc_part, "deactivate request to remote "
-				 "partition %d timed out\n", partid);
-			xpc_disengage_timedout = 1;
-			xpc_arch_ops.assume_partition_disengaged(partid);
-			disengaged = 1;
-		}
-		part->disengage_timeout = 0;
-
-		/* cancel the timer function, provided it's not us */
-		if (!in_interrupt())
-			del_singleshot_timer_sync(&part->disengage_timer);
-
-		DBUG_ON(part->act_state != XPC_P_AS_DEACTIVATING &&
-			part->act_state != XPC_P_AS_INACTIVE);
-		if (part->act_state != XPC_P_AS_INACTIVE)
-			xpc_wakeup_channel_mgr(part);
-
-		xpc_arch_ops.cancel_partition_deactivation_request(part);
-	}
-	return disengaged;
-}
-
-/*
- * Mark specified partition as active.
- */
-enum xp_retval
-xpc_mark_partition_active(struct xpc_partition *part)
-{
-	unsigned long irq_flags;
-	enum xp_retval ret;
-
-	dev_dbg(xpc_part, "setting partition %d to ACTIVE\n", XPC_PARTID(part));
-
-	spin_lock_irqsave(&part->act_lock, irq_flags);
-	if (part->act_state == XPC_P_AS_ACTIVATING) {
-		part->act_state = XPC_P_AS_ACTIVE;
-		ret = xpSuccess;
-	} else {
-		DBUG_ON(part->reason == xpSuccess);
-		ret = part->reason;
-	}
-	spin_unlock_irqrestore(&part->act_lock, irq_flags);
-
-	return ret;
-}
-
-/*
- * Start the process of deactivating the specified partition.
- */
-void
-xpc_deactivate_partition(const int line, struct xpc_partition *part,
-			 enum xp_retval reason)
-{
-	unsigned long irq_flags;
-
-	spin_lock_irqsave(&part->act_lock, irq_flags);
-
-	if (part->act_state == XPC_P_AS_INACTIVE) {
-		XPC_SET_REASON(part, reason, line);
-		spin_unlock_irqrestore(&part->act_lock, irq_flags);
-		if (reason == xpReactivating) {
-			/* we interrupt ourselves to reactivate partition */
-			xpc_arch_ops.request_partition_reactivation(part);
-		}
-		return;
-	}
-	if (part->act_state == XPC_P_AS_DEACTIVATING) {
-		if ((part->reason == xpUnloading && reason != xpUnloading) ||
-		    reason == xpReactivating) {
-			XPC_SET_REASON(part, reason, line);
-		}
-		spin_unlock_irqrestore(&part->act_lock, irq_flags);
-		return;
-	}
-
-	part->act_state = XPC_P_AS_DEACTIVATING;
-	XPC_SET_REASON(part, reason, line);
-
-	spin_unlock_irqrestore(&part->act_lock, irq_flags);
-
-	/* ask remote partition to deactivate with regard to us */
-	xpc_arch_ops.request_partition_deactivation(part);
-
-	/* set a timelimit on the disengage phase of the deactivation request */
-	part->disengage_timeout = jiffies + (xpc_disengage_timelimit * HZ);
-	part->disengage_timer.expires = part->disengage_timeout;
-	add_timer(&part->disengage_timer);
-
-	dev_dbg(xpc_part, "bringing partition %d down, reason = %d\n",
-		XPC_PARTID(part), reason);
-
-	xpc_partition_going_down(part, reason);
-}
-
-/*
- * Mark specified partition as inactive.
- */
-void
-xpc_mark_partition_inactive(struct xpc_partition *part)
-{
-	unsigned long irq_flags;
-
-	dev_dbg(xpc_part, "setting partition %d to INACTIVE\n",
-		XPC_PARTID(part));
-
-	spin_lock_irqsave(&part->act_lock, irq_flags);
-	part->act_state = XPC_P_AS_INACTIVE;
-	spin_unlock_irqrestore(&part->act_lock, irq_flags);
-	part->remote_rp_pa = 0;
-}
-
-/*
- * SAL has provided a partition and machine mask.  The partition mask
- * contains a bit for each even nasid in our partition.  The machine
- * mask contains a bit for each even nasid in the entire machine.
- *
- * Using those two bit arrays, we can determine which nasids are
- * known in the machine.  Each should also have a reserved page
- * initialized if they are available for partitioning.
- */
-void
-xpc_discovery(void)
-{
-	void *remote_rp_base;
-	struct xpc_rsvd_page *remote_rp;
-	unsigned long remote_rp_pa;
-	int region;
-	int region_size;
-	int max_regions;
-	int nasid;
-	struct xpc_rsvd_page *rp;
-	unsigned long *discovered_nasids;
-	enum xp_retval ret;
-
-	remote_rp = xpc_kmalloc_cacheline_aligned(XPC_RP_HEADER_SIZE +
-						  xpc_nasid_mask_nbytes,
-						  GFP_KERNEL, &remote_rp_base);
-	if (remote_rp == NULL)
-		return;
-
-	discovered_nasids = kzalloc(sizeof(long) * xpc_nasid_mask_nlongs,
-				    GFP_KERNEL);
-	if (discovered_nasids == NULL) {
-		kfree(remote_rp_base);
-		return;
-	}
-
-	rp = (struct xpc_rsvd_page *)xpc_rsvd_page;
-
+	if (WARN_ON_ONCE(status_mask & PIPE_A_PSR_STATUS_VLV))
+		return 0;
 	/*
-	 * The term 'region' in this context refers to the minimum number of
-	 * nodes that can comprise an access protection grouping. The access
-	 * protection is in regards to memory, IOI and IPI.
+	 * On pipe B and C we don't support the PSR interrupt yet, on pipe
+	 * A the same bit is for perf counters which we don't use either.
 	 */
-	region_size = xp_region_size;
+	if (WARN_ON_ONCE(status_mask & PIPE_B_PSR_STATUS_VLV))
+		return 0;
 
-	if (is_uv())
-		max_regions = 256;
-	else {
-		max_regions = 64;
+	enable_mask &= ~(PIPE_FIFO_UNDERRUN_STATUS |
+			 SPRITE0_FLIP_DONE_INT_EN_VLV |
+			 SPRITE1_FLIP_DONE_INT_EN_VLV);
+	if (status_mask & SPRITE0_FLIP_DONE_INT_STATUS_VLV)
+		enable_mask |= SPRITE0_FLIP_DONE_INT_EN_VLV;
+	if (status_mask & SPRITE1_FLIP_DONE_INT_STATUS_VLV)
+		enable_mask |= SPRITE1_FLIP_DONE_INT_EN_VLV;
 
-		switch (region_size) {
-		case 128:
-			max_regions *= 2;
-		case 64:
-			max_regions *= 2;
-		case 32:
-			max_regions *= 2;
-			region_size = 16;
-			DBUG_ON(!is_shub2());
-		}
-	}
+	return enable_mask;
+}
 
-	for (region = 0; region < max_regions; region++) {
+void
+i915_enable_pipestat(struct drm_i915_private *dev_priv, enum pipe pipe,
+		     u32 status_mask)
+{
+	u32 enable_mask;
 
-		if (xpc_exiting)
-			break;
+	if (IS_VALLEYVIEW(dev_priv->dev))
+		enable_mask = vlv_get_pipestat_enable_mask(dev_priv->dev,
+							   status_mask);
+	else
+		enable_mask = status_mask << 16;
+	__i915_enable_pipestat(dev_priv, pipe, enable_mask, status_mask);
+}
 
-		dev_dbg(xpc_part, "searching region %d\n", region);
+void
+i915_disable_pipestat(struct drm_i915_private *dev_priv, enum pipe pipe,
+		      u32 status_mask)
+{
+	u32 enable_mask;
 
-		for (nasid = (region * region_size * 2);
-		     nasid < ((region + 1) * region_size * 2); nasid += 2) {
+	if (IS_VALLEYVIEW(dev_priv->dev))
+		enable_mask = vlv_get_pipestat_enable_mask(dev_priv->dev,
+							   status_mask);
+	else
+		enable_mask = status_mask << 16;
+	__i915_disable_pipestat(dev_priv, pipe, enable_mask, status_mask);
+}
 
-			if (xpc_exiting)
-				break;
+/**
+ * i915_enable_asle_pipestat - enable ASLE pipestat for OpRegion
+ * @dev: drm device
+ */
+static void i915_enable_asle_pipestat(struct drm_device *dev)
+{
+	struct drm_i915_private *dev_priv = dev->dev_private;
 
-			dev_dbg(xpc_part, "checking nasid %d\n", nasid);
+	if (!dev_priv->opregion.asle || !IS_MOBILE(dev))
+		return;
 
-			if (test_bit(nasid / 2, xpc_part_nasids)) {
-				dev_dbg(xpc_part, "PROM indicates Nasid %d is "
-					"part of the local partition; skipping "
-					"region\n", nasid);
-				break;
-			}
+	spin_lock_irq(&dev_priv->irq_lock);
 
-			if (!(test_bit(nasid / 2, xpc_mach_nasids))) {
-				dev_dbg(xpc_part, "PROM indicates Nasid %d was "
-					"not on Numa-Link network at reset\n",
-					nasid);
-				continue;
-			}
+	i915_enable_pipestat(dev_priv, PIPE_B, PIPE_LEGACY_BLC_EVENT_STATUS);
+	if (INTEL_INFO(dev)->gen >= 4)
+		i915_enable_pipestat(dev_priv, PIPE_A,
+				     PIPE_LEGACY_BLC_EVENT_STATUS);
 
-			if (test_bit(nasid / 2, discovered_nasids)) {
-				dev_dbg(xpc_part, "Nasid %d is part of a "
-					"partition which was previously "
-					"discovered\n", nasid);
-				continue;
-			}
-
-			/* pull over the rsvd page header & part_nasids mask */
-
-			ret = xpc_get_remote_rp(nasid, discovered_nasids,
-						remote_rp, &remote_rp_pa);
-			if (ret != xpSuccess) {
-				dev_dbg(xpc_part, "unable to get reserved page "
-					"from nasid %d, reason=%d\n", nasid,
-					ret);
-
-				if (ret == xpLocalPartid)
-					break;
-
-				continue;
-			}
-
-			xpc_arch_ops.request_partition_activation(remote_rp,
-							 remote_rp_pa, nasid);
-		}
-	}
-
-	kfree(discovered_nasids);
-	kfree(remote_rp_base);
+	spin_unlock_irq(&dev_priv->irq_lock);
 }
 
 /*
- * Given a partid, get the nasids owned by that partition from the
- * remote partition's reserved page.
- */
-enum xp_retval
-xpc_initiate_partid_to_nasids(short partid, void *nasid_mask)
-{
-	struct xpc_partition *part;
-	unsigned long part_nasid_pa;
-
-	part = &xpc_partitions[partid];
-	if (part->remote_rp_pa == 0)
-		return xpPartitionDown;
-
-	memset(nasid_mask, 0, xpc_nasid_mask_nbytes);
-
-	part_nasid_pa = (unsigned long)XPC_RP_PART_NASIDS(part->remote_rp_pa);
-
-	return xp_remote_memcpy(xp_pa(nasid_mask), part_nasid_pa,
-				xpc_nasid_mask_nbytes);
-}
+ * This timing diagram depicts the video signal in and
+ * around the vertical blanking period.
+ *
+ * Assumptions about the fictitious mode used in this example:
+ *  vblank_start >= 3
+ *  vsync_start = vblank_start + 1
+ *  vsync_end = vblank_start + 2
+ *  vtotal = vblank_start + 3
+ *
+ *           start of vblank:
+ *           latch double buffered registers
+ *           increment frame counter (ctg+)
+ *           generate start of vblank interrupt (gen4+)
+ *           |
+ *           |          frame start:
+ *           |          generate frame start interrupt (aka. vblank interrupt) (gmch)
+ *           |          may be shifted forward 1-3 extra lines via PIPECONF
+ *           |          |
+ *           |          |  start of vsync:
+ *           |          |  generate vsync interrupt
+ *           |          |  |
+ * ___xxxx___    ___xxxx___    ___xxxx___    ___xxxx___    ___xxxx___    ___xxxx
+ *       .   \hs/   .      \hs/          \hs/          \hs/   .      \hs/
+ * ----va---> <-----------------vb--------------------> <------

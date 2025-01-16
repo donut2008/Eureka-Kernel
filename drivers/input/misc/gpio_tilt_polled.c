@@ -1,210 +1,103 @@
-/*
- *  Driver for tilt switches connected via GPIO lines
- *  not capable of generating interrupts
- *
- *  Copyright (C) 2011 Heiko Stuebner <heiko@sntech.de>
- *
- *  based on: drivers/input/keyboard/gpio_keys_polled.c
- *
- *  Copyright (C) 2007-2010 Gabor Juhos <juhosg@openwrt.org>
- *  Copyright (C) 2010 Nuno Goncalves <nunojpg@gmail.com>
- *
- *  This program is free software; you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License version 2 as
- *  published by the Free Software Foundation.
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/input.h>
-#include <linux/input-polldev.h>
-#include <linux/ioport.h>
-#include <linux/platform_device.h>
-#include <linux/gpio.h>
-#include <linux/input/gpio_tilt.h>
-
-#define DRV_NAME	"gpio-tilt-polled"
-
-struct gpio_tilt_polled_dev {
-	struct input_polled_dev *poll_dev;
-	struct device *dev;
-	const struct gpio_tilt_platform_data *pdata;
-
-	int last_state;
-
-	int threshold;
-	int count;
-};
-
-static void gpio_tilt_polled_poll(struct input_polled_dev *dev)
-{
-	struct gpio_tilt_polled_dev *tdev = dev->private;
-	const struct gpio_tilt_platform_data *pdata = tdev->pdata;
-	struct input_dev *input = dev->input;
-	struct gpio_tilt_state *tilt_state = NULL;
-	int state, i;
-
-	if (tdev->count < tdev->threshold) {
-		tdev->count++;
-	} else {
-		state = 0;
-		for (i = 0; i < pdata->nr_gpios; i++)
-			state |= (!!gpio_get_value(pdata->gpios[i].gpio) << i);
-
-		if (state != tdev->last_state) {
-			for (i = 0; i < pdata->nr_states; i++)
-				if (pdata->states[i].gpios == state)
-					tilt_state = &pdata->states[i];
-
-			if (tilt_state) {
-				for (i = 0; i < pdata->nr_axes; i++)
-					input_report_abs(input,
-							 pdata->axes[i].axis,
-							 tilt_state->axes[i]);
-
-				input_sync(input);
+D >= 0) { // ***************** Checking Touch Event's ID whethere it is same with previous ID.
+						if(!input_events[i].value && input_events[iTouchID].value < 0) {  // If this event is 'Release'
+							for(j=0;j<MAX_MULTI_TOUCH_EVENTS;j++) {
+								TouchIDs[j] = -1;
+							}
+						}
+					}
+					break;
+				case BTN_TOOL_PEN :
+					if(input_events[i].value && !hover_booster.multi_events) {
+						pr_debug("[Input Booster] PEN EVENT - HOVER ON\n");
+						RUN_BOOSTER(hover, BOOSTER_ON);
+						DetectedCategory = true;
+					} else if(!input_events[i].value && hover_booster.multi_events) {
+						pr_debug("[Input Booster] PEN EVENT - HOVER OFF\n");
+						RUN_BOOSTER(hover, BOOSTER_OFF);
+						DetectedCategory = true;
+					}
+					break;
+				case KEY_BACK : // ***************** Checking Key & Touch key Event
+					if(key_back != input_events[i].value) {
+						key_back = input_events[i].value;
+						pr_debug("[Input Booster] TOUCHKEY EVENT - %s\n", (input_events[i].value) ? "PRESS" : "RELEASE");
+						RUN_BOOSTER(touchkey, (input_events[i].value) ? BOOSTER_ON : BOOSTER_OFF );
+						DetectedCategory = true;
+					}
+					break;
+				case KEY_HOMEPAGE :
+					if(key_home != input_events[i].value) {
+						key_home = input_events[i].value;
+						pr_debug("[Input Booster] TOUCHKEY EVENT - %s\n", (input_events[i].value) ? "PRESS" : "RELEASE");
+						RUN_BOOSTER(touchkey, (input_events[i].value) ? BOOSTER_ON : BOOSTER_OFF );
+						DetectedCategory = true;
+					}
+					break;
+				case KEY_RECENT :
+					if(key_recent != input_events[i].value) {
+						key_recent = input_events[i].value;
+						pr_debug("[Input Booster] TOUCHKEY EVENT - %s\n", (input_events[i].value) ? "PRESS" : "RELEASE");
+						RUN_BOOSTER(touchkey, (input_events[i].value) ? BOOSTER_ON : BOOSTER_OFF );
+						DetectedCategory = true;
+					}
+					break;
+				case KEY_VOLUMEUP :
+				case KEY_VOLUMEDOWN :
+				case KEY_POWER :
+					pr_debug("[Input Booster] KEY EVENT - %s\n", (input_events[i].value) ? "PRESS" : "RELEASE");
+					RUN_BOOSTER(key, (input_events[i].value) ? BOOSTER_ON : BOOSTER_OFF );
+					DetectedCategory = true;
+					break;
+				case KEY_WINK :
+					pr_debug("[Input Booster] key_two KEY EVENT - %s\n", (input_events[i].value) ? "PRESS" : "RELEASE");
+					RUN_BOOSTER(key_two, (input_events[i].value) ? BOOSTER_ON : BOOSTER_OFF );
+					DetectedCategory = true;
+					break;
+				default :
+					break;
 			}
-
-			tdev->count = 0;
-			tdev->last_state = state;
-		}
-	}
-}
-
-static void gpio_tilt_polled_open(struct input_polled_dev *dev)
-{
-	struct gpio_tilt_polled_dev *tdev = dev->private;
-	const struct gpio_tilt_platform_data *pdata = tdev->pdata;
-
-	if (pdata->enable)
-		pdata->enable(tdev->dev);
-
-	/* report initial state of the axes */
-	tdev->last_state = -1;
-	tdev->count = tdev->threshold;
-	gpio_tilt_polled_poll(tdev->poll_dev);
-}
-
-static void gpio_tilt_polled_close(struct input_polled_dev *dev)
-{
-	struct gpio_tilt_polled_dev *tdev = dev->private;
-	const struct gpio_tilt_platform_data *pdata = tdev->pdata;
-
-	if (pdata->disable)
-		pdata->disable(tdev->dev);
-}
-
-static int gpio_tilt_polled_probe(struct platform_device *pdev)
-{
-	const struct gpio_tilt_platform_data *pdata =
-			dev_get_platdata(&pdev->dev);
-	struct device *dev = &pdev->dev;
-	struct gpio_tilt_polled_dev *tdev;
-	struct input_polled_dev *poll_dev;
-	struct input_dev *input;
-	int error, i;
-
-	if (!pdata || !pdata->poll_interval)
-		return -EINVAL;
-
-	tdev = kzalloc(sizeof(struct gpio_tilt_polled_dev), GFP_KERNEL);
-	if (!tdev) {
-		dev_err(dev, "no memory for private data\n");
-		return -ENOMEM;
-	}
-
-	error = gpio_request_array(pdata->gpios, pdata->nr_gpios);
-	if (error) {
-		dev_err(dev,
-			"Could not request tilt GPIOs: %d\n", error);
-		goto err_free_tdev;
-	}
-
-	poll_dev = input_allocate_polled_device();
-	if (!poll_dev) {
-		dev_err(dev, "no memory for polled device\n");
-		error = -ENOMEM;
-		goto err_free_gpios;
-	}
-
-	poll_dev->private = tdev;
-	poll_dev->poll = gpio_tilt_polled_poll;
-	poll_dev->poll_interval = pdata->poll_interval;
-	poll_dev->open = gpio_tilt_polled_open;
-	poll_dev->close = gpio_tilt_polled_close;
-
-	input = poll_dev->input;
-
-	input->name = pdev->name;
-	input->phys = DRV_NAME"/input0";
-	input->dev.parent = &pdev->dev;
-
-	input->id.bustype = BUS_HOST;
-	input->id.vendor = 0x0001;
-	input->id.product = 0x0001;
-	input->id.version = 0x0100;
-
-	__set_bit(EV_ABS, input->evbit);
-	for (i = 0; i < pdata->nr_axes; i++)
-		input_set_abs_params(input, pdata->axes[i].axis,
-				     pdata->axes[i].min, pdata->axes[i].max,
-				     pdata->axes[i].fuzz, pdata->axes[i].flat);
-
-	tdev->threshold = DIV_ROUND_UP(pdata->debounce_interval,
-				       pdata->poll_interval);
-
-	tdev->poll_dev = poll_dev;
-	tdev->dev = dev;
-	tdev->pdata = pdata;
-
-	error = input_register_polled_device(poll_dev);
-	if (error) {
-		dev_err(dev, "unable to register polled device, err=%d\n",
-			error);
-		goto err_free_polldev;
-	}
-
-	platform_set_drvdata(pdev, tdev);
-
-	return 0;
-
-err_free_polldev:
-	input_free_polled_device(poll_dev);
-err_free_gpios:
-	gpio_free_array(pdata->gpios, pdata->nr_gpios);
-err_free_tdev:
-	kfree(tdev);
-
-	return error;
-}
-
-static int gpio_tilt_polled_remove(struct platform_device *pdev)
-{
-	struct gpio_tilt_polled_dev *tdev = platform_get_drvdata(pdev);
-	const struct gpio_tilt_platform_data *pdata = tdev->pdata;
-
-	input_unregister_polled_device(tdev->poll_dev);
-	input_free_polled_device(tdev->poll_dev);
-
-	gpio_free_array(pdata->gpios, pdata->nr_gpios);
-
-	kfree(tdev);
-
-	return 0;
-}
-
-static struct platform_driver gpio_tilt_polled_driver = {
-	.probe	= gpio_tilt_polled_probe,
-	.remove	= gpio_tilt_polled_remove,
-	.driver	= {
-		.name	= DRV_NAME,
-	},
-};
-
-module_platform_driver(gpio_tilt_polled_driver);
-
-MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR("Heiko Stuebner <heiko@sntech.de>");
-MODULE_DESCRIPTION("Polled GPIO tilt driver");
-MODULE_ALIAS("platform:" DRV_NAME);
+		} else if (input_events[i].type == EV_ABS) {
+			if (input_events[i].code == ABS_MT_TRACKING_ID) {
+				iTouchID = i;
+				if(iTouchSlot >= 0 && iTouchSlot <= MAX_EVENTS) {
+					if(input_events[iTouchSlot].value < MAX_MULTI_TOUCH_EVENTS && input_events[iTouchSlot].value >= 0 && iTouchID < MAX_EVENTS) {
+						if(TouchIDs[input_events[iTouchSlot].value] < 0 && input_events[iTouchID].value >= 0) {
+							TouchIDs[input_events[iTouchSlot].value] = input_events[iTouchID].value;
+							if((input_events[iTouchSlot].value >= 0 && touch_booster.multi_events <= 0) || (input_events[iTouchSlot].value == 0 && TouchIDs[1] < 0)) {
+								touch_booster.multi_events = 0;
+								pr_debug("[Input Booster] TOUCH EVENT - PRESS - ID: 0x%x, Slot: 0x%x, multi : %d\n", input_events[iTouchID].value, input_events[iTouchSlot].value, touch_booster.multi_events);
+								RUN_BOOSTER(touch, BOOSTER_ON );
+							} else {
+								pr_debug("[Input Booster] MULTI-TOUCH EVENT - PRESS - ID: 0x%x, Slot: 0x%x, multi : %d\n", input_events[iTouchID].value, input_events[iTouchSlot].value, touch_booster.multi_events);
+								touch_booster.multi_events++;
+								RUN_BOOSTER(multitouch, BOOSTER_ON );
+/*
+								if(delayed_work_pending(&touch_booster.input_booster_timeout_work[0])) {
+									int temp_hmp_boost = touch_booster.param[0].hmp_boost, temp_index = touch_booster.index;
+									pr_debug("[Input Booster] ****             cancel the pending touch booster workqueue\n");
+									cancel_delayed_work(&touch_booster.input_booster_timeout_work[0]);
+									touch_booster.param[0].hmp_boost = multitouch_booster.param[0].hmp_boost;
+									touch_booster.index = 1;
+									TIMEOUT_FUNC(touch)(NULL);
+									touch_booster.param[0].hmp_boost = temp_hmp_boost;
+									touch_booster.index = ( temp_index >= 2 ? 1 : temp_index );
+								}
+*/
+							}
+						} else if(TouchIDs[input_events[iTouchSlot].value] >= 0 && input_events[iTouchID].value < 0) {
+							TouchIDs[input_events[iTouchSlot].value] = input_events[iTouchID].value;
+							if(touch_booster.multi_events <= 1) {
+								pr_debug("[Input Booster] TOUCH EVENT - RELEASE - ID: 0x%x, Slot: 0x%x, multi : %d\n", input_events[iTouchID].value, input_events[iTouchSlot].value, touch_booster.multi_events);
+								RUN_BOOSTER(touch, BOOSTER_OFF );
+							} else {
+								pr_debug("[Input Booster] MULTI-TOUCH EVENT - RELEASE - ID: 0x%x, Slot: 0x%x, multi : %d\n", input_events[iTouchID].value, input_events[iTouchSlot].value, touch_booster.multi_events);
+								touch_booster.multi_events--;
+								RUN_BOOSTER(multitouch, BOOSTER_OFF );
+							}
+						}
+					}
+				}
+			} else if (input_events[i].code == ABS_MT_SLOT) {
+				iTouchSlot = i;
+#if defined(CONFIG_SOC_EXYNOS7420) // This code should be working properly in Exynos7420(Noble & Zero2) only.
+				if(input_events[iTouchSlot + 1].value <

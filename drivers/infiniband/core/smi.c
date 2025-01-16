@@ -1,338 +1,117 @@
-/*
- * Copyright (c) 2004, 2005 Mellanox Technologies Ltd.  All rights reserved.
- * Copyright (c) 2004, 2005 Infinicon Corporation.  All rights reserved.
- * Copyright (c) 2004, 2005 Intel Corporation.  All rights reserved.
- * Copyright (c) 2004, 2005 Topspin Corporation.  All rights reserved.
- * Copyright (c) 2004-2007 Voltaire Corporation.  All rights reserved.
- * Copyright (c) 2005 Sun Microsystems, Inc. All rights reserved.
- * Copyright (c) 2014 Intel Corporation.  All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *        copyright notice, this list of conditions and the following
- *        disclaimer in the documentation and/or other materials
- *        provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
- */
-
-#include <rdma/ib_smi.h>
-#include "smi.h"
-#include "opa_smi.h"
-
-static enum smi_action __smi_handle_dr_smp_send(bool is_switch, int port_num,
-						u8 *hop_ptr, u8 hop_cnt,
-						const u8 *initial_path,
-						const u8 *return_path,
-						u8 direction,
-						bool dr_dlid_is_permissive,
-						bool dr_slid_is_permissive)
-{
-	/* See section 14.2.2.2, Vol 1 IB spec */
-	/* C14-6 -- valid hop_cnt values are from 0 to 63 */
-	if (hop_cnt >= IB_SMP_MAX_PATH_HOPS)
-		return IB_SMI_DISCARD;
-
-	if (!direction) {
-		/* C14-9:1 */
-		if (hop_cnt && *hop_ptr == 0) {
-			(*hop_ptr)++;
-			return (initial_path[*hop_ptr] ==
-				port_num ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-9:2 */
-		if (*hop_ptr && *hop_ptr < hop_cnt) {
-			if (!is_switch)
-				return IB_SMI_DISCARD;
-
-			/* return_path set when received */
-			(*hop_ptr)++;
-			return (initial_path[*hop_ptr] ==
-				port_num ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-9:3 -- We're at the end of the DR segment of path */
-		if (*hop_ptr == hop_cnt) {
-			/* return_path set when received */
-			(*hop_ptr)++;
-			return (is_switch ||
-				dr_dlid_is_permissive ?
-				IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-9:4 -- hop_ptr = hop_cnt + 1 -> give to SMA/SM */
-		/* C14-9:5 -- Fail unreasonable hop pointer */
-		return (*hop_ptr == hop_cnt + 1 ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-
-	} else {
-		/* C14-13:1 */
-		if (hop_cnt && *hop_ptr == hop_cnt + 1) {
-			(*hop_ptr)--;
-			return (return_path[*hop_ptr] ==
-				port_num ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-13:2 */
-		if (2 <= *hop_ptr && *hop_ptr <= hop_cnt) {
-			if (!is_switch)
-				return IB_SMI_DISCARD;
-
-			(*hop_ptr)--;
-			return (return_path[*hop_ptr] ==
-				port_num ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-13:3 -- at the end of the DR segment of path */
-		if (*hop_ptr == 1) {
-			(*hop_ptr)--;
-			/* C14-13:3 -- SMPs destined for SM shouldn't be here */
-			return (is_switch ||
-				dr_slid_is_permissive ?
-				IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-13:4 -- hop_ptr = 0 -> should have gone to SM */
-		if (*hop_ptr == 0)
-			return IB_SMI_HANDLE;
-
-		/* C14-13:5 -- Check for unreasonable hop pointer */
-		return IB_SMI_DISCARD;
-	}
-}
-
-/*
- * Fixup a directed route SMP for sending
- * Return IB_SMI_DISCARD if the SMP should be discarded
- */
-enum smi_action smi_handle_dr_smp_send(struct ib_smp *smp,
-				       bool is_switch, int port_num)
-{
-	return __smi_handle_dr_smp_send(is_switch, port_num,
-					&smp->hop_ptr, smp->hop_cnt,
-					smp->initial_path,
-					smp->return_path,
-					ib_get_smp_direction(smp),
-					smp->dr_dlid == IB_LID_PERMISSIVE,
-					smp->dr_slid == IB_LID_PERMISSIVE);
-}
-
-enum smi_action opa_smi_handle_dr_smp_send(struct opa_smp *smp,
-				       bool is_switch, int port_num)
-{
-	return __smi_handle_dr_smp_send(is_switch, port_num,
-					&smp->hop_ptr, smp->hop_cnt,
-					smp->route.dr.initial_path,
-					smp->route.dr.return_path,
-					opa_get_smp_direction(smp),
-					smp->route.dr.dr_dlid ==
-					OPA_LID_PERMISSIVE,
-					smp->route.dr.dr_slid ==
-					OPA_LID_PERMISSIVE);
-}
-
-static enum smi_action __smi_handle_dr_smp_recv(bool is_switch, int port_num,
-						int phys_port_cnt,
-						u8 *hop_ptr, u8 hop_cnt,
-						const u8 *initial_path,
-						u8 *return_path,
-						u8 direction,
-						bool dr_dlid_is_permissive,
-						bool dr_slid_is_permissive)
-{
-	/* See section 14.2.2.2, Vol 1 IB spec */
-	/* C14-6 -- valid hop_cnt values are from 0 to 63 */
-	if (hop_cnt >= IB_SMP_MAX_PATH_HOPS)
-		return IB_SMI_DISCARD;
-
-	if (!direction) {
-		/* C14-9:1 -- sender should have incremented hop_ptr */
-		if (hop_cnt && *hop_ptr == 0)
-			return IB_SMI_DISCARD;
-
-		/* C14-9:2 -- intermediate hop */
-		if (*hop_ptr && *hop_ptr < hop_cnt) {
-			if (!is_switch)
-				return IB_SMI_DISCARD;
-
-			return_path[*hop_ptr] = port_num;
-			/* hop_ptr updated when sending */
-			return (initial_path[*hop_ptr+1] <= phys_port_cnt ?
-				IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-9:3 -- We're at the end of the DR segment of path */
-		if (*hop_ptr == hop_cnt) {
-			if (hop_cnt)
-				return_path[*hop_ptr] = port_num;
-			/* hop_ptr updated when sending */
-
-			return (is_switch ||
-				dr_dlid_is_permissive ?
-				IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-9:4 -- hop_ptr = hop_cnt + 1 -> give to SMA/SM */
-		/* C14-9:5 -- fail unreasonable hop pointer */
-		return (*hop_ptr == hop_cnt + 1 ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-
-	} else {
-
-		/* C14-13:1 */
-		if (hop_cnt && *hop_ptr == hop_cnt + 1) {
-			(*hop_ptr)--;
-			return (return_path[*hop_ptr] ==
-				port_num ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-13:2 */
-		if (2 <= *hop_ptr && *hop_ptr <= hop_cnt) {
-			if (!is_switch)
-				return IB_SMI_DISCARD;
-
-			/* hop_ptr updated when sending */
-			return (return_path[*hop_ptr-1] <= phys_port_cnt ?
-				IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-13:3 -- We're at the end of the DR segment of path */
-		if (*hop_ptr == 1) {
-			if (dr_slid_is_permissive) {
-				/* giving SMP to SM - update hop_ptr */
-				(*hop_ptr)--;
-				return IB_SMI_HANDLE;
-			}
-			/* hop_ptr updated when sending */
-			return (is_switch ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-		}
-
-		/* C14-13:4 -- hop_ptr = 0 -> give to SM */
-		/* C14-13:5 -- Check for unreasonable hop pointer */
-		return (*hop_ptr == 0 ? IB_SMI_HANDLE : IB_SMI_DISCARD);
-	}
-}
-
-/*
- * Adjust information for a received SMP
- * Return IB_SMI_DISCARD if the SMP should be dropped
- */
-enum smi_action smi_handle_dr_smp_recv(struct ib_smp *smp, bool is_switch,
-				       int port_num, int phys_port_cnt)
-{
-	return __smi_handle_dr_smp_recv(is_switch, port_num, phys_port_cnt,
-					&smp->hop_ptr, smp->hop_cnt,
-					smp->initial_path,
-					smp->return_path,
-					ib_get_smp_direction(smp),
-					smp->dr_dlid == IB_LID_PERMISSIVE,
-					smp->dr_slid == IB_LID_PERMISSIVE);
-}
-
-/*
- * Adjust information for a received SMP
- * Return IB_SMI_DISCARD if the SMP should be dropped
- */
-enum smi_action opa_smi_handle_dr_smp_recv(struct opa_smp *smp, bool is_switch,
-					   int port_num, int phys_port_cnt)
-{
-	return __smi_handle_dr_smp_recv(is_switch, port_num, phys_port_cnt,
-					&smp->hop_ptr, smp->hop_cnt,
-					smp->route.dr.initial_path,
-					smp->route.dr.return_path,
-					opa_get_smp_direction(smp),
-					smp->route.dr.dr_dlid ==
-					OPA_LID_PERMISSIVE,
-					smp->route.dr.dr_slid ==
-					OPA_LID_PERMISSIVE);
-}
-
-static enum smi_forward_action __smi_check_forward_dr_smp(u8 hop_ptr, u8 hop_cnt,
-							  u8 direction,
-							  bool dr_dlid_is_permissive,
-							  bool dr_slid_is_permissive)
-{
-	if (!direction) {
-		/* C14-9:2 -- intermediate hop */
-		if (hop_ptr && hop_ptr < hop_cnt)
-			return IB_SMI_FORWARD;
-
-		/* C14-9:3 -- at the end of the DR segment of path */
-		if (hop_ptr == hop_cnt)
-			return (dr_dlid_is_permissive ?
-				IB_SMI_SEND : IB_SMI_LOCAL);
-
-		/* C14-9:4 -- hop_ptr = hop_cnt + 1 -> give to SMA/SM */
-		if (hop_ptr == hop_cnt + 1)
-			return IB_SMI_SEND;
-	} else {
-		/* C14-13:2  -- intermediate hop */
-		if (2 <= hop_ptr && hop_ptr <= hop_cnt)
-			return IB_SMI_FORWARD;
-
-		/* C14-13:3 -- at the end of the DR segment of path */
-		if (hop_ptr == 1)
-			return (!dr_slid_is_permissive ?
-				IB_SMI_SEND : IB_SMI_LOCAL);
-	}
-	return IB_SMI_LOCAL;
-
-}
-
-enum smi_forward_action smi_check_forward_dr_smp(struct ib_smp *smp)
-{
-	return __smi_check_forward_dr_smp(smp->hop_ptr, smp->hop_cnt,
-					  ib_get_smp_direction(smp),
-					  smp->dr_dlid == IB_LID_PERMISSIVE,
-					  smp->dr_slid == IB_LID_PERMISSIVE);
-}
-
-enum smi_forward_action opa_smi_check_forward_dr_smp(struct opa_smp *smp)
-{
-	return __smi_check_forward_dr_smp(smp->hop_ptr, smp->hop_cnt,
-					  opa_get_smp_direction(smp),
-					  smp->route.dr.dr_dlid ==
-					  OPA_LID_PERMISSIVE,
-					  smp->route.dr.dr_slid ==
-					  OPA_LID_PERMISSIVE);
-}
-
-/*
- * Return the forwarding port number from initial_path for outgoing SMP and
- * from return_path for returning SMP
- */
-int smi_get_fwd_port(struct ib_smp *smp)
-{
-	return (!ib_get_smp_direction(smp) ? smp->initial_path[smp->hop_ptr+1] :
-		smp->return_path[smp->hop_ptr-1]);
-}
-
-/*
- * Return the forwarding port number from initial_path for outgoing SMP and
- * from return_path for returning SMP
- */
-int opa_smi_get_fwd_port(struct opa_smp *smp)
-{
-	return !opa_get_smp_direction(smp) ? smp->route.dr.initial_path[smp->hop_ptr+1] :
-		smp->route.dr.return_path[smp->hop_ptr-1];
-}
+                           0x4f7b
+#define mmDIG6_DIG_TEST_DEBUG_DATA                                              0x547b
+#define mmDIG7_DIG_TEST_DEBUG_DATA                                              0x567b
+#define mmDIG8_DIG_TEST_DEBUG_DATA                                              0x577b
+#define mmDIG_FE_TEST_DEBUG_INDEX                                               0x4a7c
+#define mmDIG0_DIG_FE_TEST_DEBUG_INDEX                                          0x4a7c
+#define mmDIG1_DIG_FE_TEST_DEBUG_INDEX                                          0x4b7c
+#define mmDIG2_DIG_FE_TEST_DEBUG_INDEX                                          0x4c7c
+#define mmDIG3_DIG_FE_TEST_DEBUG_INDEX                                          0x4d7c
+#define mmDIG4_DIG_FE_TEST_DEBUG_INDEX                                          0x4e7c
+#define mmDIG5_DIG_FE_TEST_DEBUG_INDEX                                          0x4f7c
+#define mmDIG6_DIG_FE_TEST_DEBUG_INDEX                                          0x547c
+#define mmDIG7_DIG_FE_TEST_DEBUG_INDEX                                          0x567c
+#define mmDIG8_DIG_FE_TEST_DEBUG_INDEX                                          0x577c
+#define mmDIG_FE_TEST_DEBUG_DATA                                                0x4a7d
+#define mmDIG0_DIG_FE_TEST_DEBUG_DATA                                           0x4a7d
+#define mmDIG1_DIG_FE_TEST_DEBUG_DATA                                           0x4b7d
+#define mmDIG2_DIG_FE_TEST_DEBUG_DATA                                           0x4c7d
+#define mmDIG3_DIG_FE_TEST_DEBUG_DATA                                           0x4d7d
+#define mmDIG4_DIG_FE_TEST_DEBUG_DATA                                           0x4e7d
+#define mmDIG5_DIG_FE_TEST_DEBUG_DATA                                           0x4f7d
+#define mmDIG6_DIG_FE_TEST_DEBUG_DATA                                           0x547d
+#define mmDIG7_DIG_FE_TEST_DEBUG_DATA                                           0x567d
+#define mmDIG8_DIG_FE_TEST_DEBUG_DATA                                           0x577d
+#define mmDMCU_CTRL                                                             0x1600
+#define mmDMCU_STATUS                                                           0x1601
+#define mmDMCU_PC_START_ADDR                                                    0x1602
+#define mmDMCU_FW_START_ADDR                                                    0x1603
+#define mmDMCU_FW_END_ADDR                                                      0x1604
+#define mmDMCU_FW_ISR_START_ADDR                                                0x1605
+#define mmDMCU_FW_CS_HI                                                         0x1606
+#define mmDMCU_FW_CS_LO                                                         0x1607
+#define mmDMCU_RAM_ACCESS_CTRL                                                  0x1608
+#define mmDMCU_ERAM_WR_CTRL                                                     0x1609
+#define mmDMCU_ERAM_WR_DATA                                                     0x160a
+#define mmDMCU_ERAM_RD_CTRL                                                     0x160b
+#define mmDMCU_ERAM_RD_DATA                                                     0x160c
+#define mmDMCU_IRAM_WR_CTRL                                                     0x160d
+#define mmDMCU_IRAM_WR_DATA                                                     0x160e
+#define mmDMCU_IRAM_RD_CTRL                                                     0x160f
+#define mmDMCU_IRAM_RD_DATA                                                     0x1610
+#define mmDMCU_EVENT_TRIGGER                                                    0x1611
+#define mmDMCU_UC_INTERNAL_INT_STATUS                                           0x1612
+#define mmDMCU_SS_INTERRUPT_CNTL_STATUS                                         0x1613
+#define mmDMCU_INTERRUPT_STATUS                                                 0x1614
+#define mmDMCU_INTERRUPT_TO_HOST_EN_MASK                                        0x1615
+#define mmDMCU_INTERRUPT_TO_UC_EN_MASK                                          0x1616
+#define mmDMCU_INTERRUPT_TO_UC_EN_MASK_1                                        0x1631
+#define mmDMCU_INTERRUPT_TO_UC_XIRQ_IRQ_SEL                                     0x1617
+#define mmDMCU_INTERRUPT_TO_UC_XIRQ_IRQ_SEL_1                                   0x1632
+#define mmDC_DMCU_SCRATCH                                                       0x1618
+#define mmDMCU_INT_CNT                                                          0x1619
+#define mmDMCU_FW_CHECKSUM_SMPL_BYTE_POS                                        0x161a
+#define mmDMCU_UC_CLK_GATING_CNTL                                               0x161b
+#define mmMASTER_COMM_DATA_REG1                                                 0x161c
+#define mmMASTER_COMM_DATA_REG2                                                 0x161d
+#define mmMASTER_COMM_DATA_REG3                                                 0x161e
+#define mmMASTER_COMM_CMD_REG                                                   0x161f
+#define mmMASTER_COMM_CNTL_REG                                                  0x1620
+#define mmSLAVE_COMM_DATA_REG1                                                  0x1621
+#define mmSLAVE_COMM_DATA_REG2                                                  0x1622
+#define mmSLAVE_COMM_DATA_REG3                                                  0x1623
+#define mmSLAVE_COMM_CMD_REG                                                    0x1624
+#define mmSLAVE_COMM_CNTL_REG                                                   0x1625
+#define mmDMCU_TEST_DEBUG_INDEX                                                 0x1626
+#define mmDMCU_TEST_DEBUG_DATA                                                  0x1627
+#define mmDMCU_PERFMON_INTERRUPT_STATUS1                                        0x1644
+#define mmDMCU_PERFMON_INTERRUPT_STATUS2                                        0x1645
+#define mmDMCU_PERFMON_INTERRUPT_STATUS3                                        0x1646
+#define mmDMCU_PERFMON_INTERRUPT_STATUS4                                        0x1647
+#define mmDMCU_PERFMON_INTERRUPT_STATUS5                                        0x1642
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_EN_MASK1                                 0x1674
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_EN_MASK2                                 0x1675
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_EN_MASK3                                 0x1676
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_EN_MASK4                                 0x1677
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_EN_MASK5                                 0x1643
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_XIRQ_IRQ_SEL1                            0x1678
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_XIRQ_IRQ_SEL2                            0x1679
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_XIRQ_IRQ_SEL3                            0x167a
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_XIRQ_IRQ_SEL4                            0x167b
+#define mmDMCU_PERFMON_INTERRUPT_TO_UC_XIRQ_IRQ_SEL5                            0x1673
+#define mmDMCU_DPRX_INTERRUPT_STATUS1                                           0x1634
+#define mmDMCU_DPRX_INTERRUPT_TO_UC_EN_MASK1                                    0x1635
+#define mmDMCU_DPRX_INTERRUPT_TO_UC_XIRQ_IRQ_SEL1                               0x1636
+#define mmDP_LINK_CNTL                                                          0x4aa0
+#define mmDP0_DP_LINK_CNTL                                                      0x4aa0
+#define mmDP1_DP_LINK_CNTL                                                      0x4ba0
+#define mmDP2_DP_LINK_CNTL                                                      0x4ca0
+#define mmDP3_DP_LINK_CNTL                                                      0x4da0
+#define mmDP4_DP_LINK_CNTL                                                      0x4ea0
+#define mmDP5_DP_LINK_CNTL                                                      0x4fa0
+#define mmDP6_DP_LINK_CNTL                                                      0x54a0
+#define mmDP7_DP_LINK_CNTL                                                      0x56a0
+#define mmDP8_DP_LINK_CNTL                                                      0x57a0
+#define mmDP_PIXEL_FORMAT                                                       0x4aa1
+#define mmDP0_DP_PIXEL_FORMAT                                                   0x4aa1
+#define mmDP1_DP_PIXEL_FORMAT                                                   0x4ba1
+#define mmDP2_DP_PIXEL_FORMAT                                                   0x4ca1
+#define mmDP3_DP_PIXEL_FORMAT                                                   0x4da1
+#define mmDP4_DP_PIXEL_FORMAT                                                   0x4ea1
+#define mmDP5_DP_PIXEL_FORMAT                                                   0x4fa1
+#define mmDP6_DP_PIXEL_FORMAT                                                   0x54a1
+#define mmDP7_DP_PIXEL_FORMAT                                                   0x56a1
+#define mmDP8_DP_PIXEL_FORMAT                                                   0x57a1
+#define mmDP_MSA_COLORIMETRY                                                    0x4aa2
+#define mmDP0_DP_MSA_COLORIMETRY                                                0x4aa2
+#define mmDP1_DP_MSA_COLORIMETRY                                                0x4ba2
+#define mmDP2_DP_MSA_COLORIMETRY                                                0x4ca2
+#define mmDP3_DP_MSA_COLORIMETRY                                                0x4da2
+#define mmDP4_DP_MSA_COLORIMETRY                                                0x4ea2
+#define mmDP5_DP_MSA_COLORIMETRY                                                0x4fa2
+#define mmDP6_DP_MSA_COLORIMETRY                                                0x54a2
+#define mmDP7_DP_MSA_COLORIMETRY                                                0x56a2
+#define mmDP8_DP_MSA_COLORIMETRY                                                0x57a2
+#define mmDP_CONFIG                                                             0x4aa3
+#define mmDP0_DP_CONFIG                                                         0x4aa3
+#define mmDP1_DP_CONFIG                                                         0x4b

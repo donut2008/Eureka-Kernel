@@ -1,33 +1,16 @@
-/*
- * Copyright © 2014 NVIDIA Corporation
- * Copyright © 2015 Broadcom Corporation
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
-
-#include <linux/of.h>
-
-#include <soc/brcmstb/common.h>
-
-static const struct of_device_id brcmstb_machine_match[] = {
-	{ .compatible = "brcm,brcmstb", },
-	{ }
-};
-
-bool soc_is_brcmstb(void)
-{
-	struct device_node *root;
-
-	root = of_find_node_by_path("/");
-	if (!root)
-		return false;
-
-	return of_match_node(brcmstb_machine_match, root) != NULL;
-}
+f0000
+#define DPM_TABLE_376__UvdLevel_4_MinVddc__SHIFT 0x10
+#define DPM_TABLE_377__UvdLevel_4_padding_2_MASK 0xff
+#define DPM_TABLE_377__UvdLevel_4_padding_2__SHIFT 0x0
+#define DPM_TABLE_377__UvdLevel_4_padding_1_MASK 0xff00
+#define DPM_TABLE_377__UvdLevel_4_padding_1__SHIFT 0x8
+#define DPM_TABLE_377__UvdLevel_4_padding_0_MASK 0xff0000
+#define DPM_TABLE_377__UvdLevel_4_padding_0__SHIFT 0x10
+#define DPM_TABLE_377__UvdLevel_4_DclkDivider_MASK 0xff000000
+#define DPM_TABLE_377__UvdLevel_4_DclkDivider__SHIFT 0x18
+#define DPM_TABLE_378__UvdLevel_5_VclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_378__UvdLevel_5_VclkFrequency__SHIFT 0x0
+#define DPM_TABLE_379__UvdLevel_5_DclkFrequency_MASK 0xffffffff
+#define DPM_TABLE_379__UvdLevel_5_DclkFrequency__SHIFT 0x0
+#define DPM_TABLE_380__UvdLevel_5_VclkDivider_MASK 0xff
+#define DPM_TABLE_380__UvdLevel_5_VclkDivider__SHIFT 0x0

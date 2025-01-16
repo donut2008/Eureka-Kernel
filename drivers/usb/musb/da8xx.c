@@ -1,600 +1,307 @@
-/*
- * Texas Instruments DA8xx/OMAP-L1x "glue layer"
- *
- * Copyright (c) 2008-2009 MontaVista Software, Inc. <source@mvista.com>
- *
- * Based on the DaVinci "glue layer" code.
- * Copyright (C) 2005-2006 by Texas Instruments
- *
- * This file is part of the Inventra Controller Driver for Linux.
- *
- * The Inventra Controller Driver for Linux is free software; you
- * can redistribute it and/or modify it under the terms of the GNU
- * General Public License version 2 as published by the Free Software
- * Foundation.
- *
- * The Inventra Controller Driver for Linux is distributed in
- * the hope that it will be useful, but WITHOUT ANY WARRANTY;
- * without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
- * License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with The Inventra Controller Driver for Linux ; if not,
- * write to the Free Software Foundation, Inc., 59 Temple Place,
- * Suite 330, Boston, MA  02111-1307  USA
- *
- */
-
-#include <linux/module.h>
-#include <linux/clk.h>
-#include <linux/err.h>
-#include <linux/io.h>
-#include <linux/platform_device.h>
-#include <linux/dma-mapping.h>
-#include <linux/usb/usb_phy_generic.h>
-
-#include <mach/da8xx.h>
-#include <linux/platform_data/usb-davinci.h>
-
-#include "musb_core.h"
-
-/*
- * DA8XX specific definitions
- */
-
-/* USB 2.0 OTG module registers */
-#define DA8XX_USB_REVISION_REG	0x00
-#define DA8XX_USB_CTRL_REG	0x04
-#define DA8XX_USB_STAT_REG	0x08
-#define DA8XX_USB_EMULATION_REG 0x0c
-#define DA8XX_USB_MODE_REG	0x10	/* Transparent, CDC, [Generic] RNDIS */
-#define DA8XX_USB_AUTOREQ_REG	0x14
-#define DA8XX_USB_SRP_FIX_TIME_REG 0x18
-#define DA8XX_USB_TEARDOWN_REG	0x1c
-#define DA8XX_USB_INTR_SRC_REG	0x20
-#define DA8XX_USB_INTR_SRC_SET_REG 0x24
-#define DA8XX_USB_INTR_SRC_CLEAR_REG 0x28
-#define DA8XX_USB_INTR_MASK_REG 0x2c
-#define DA8XX_USB_INTR_MASK_SET_REG 0x30
-#define DA8XX_USB_INTR_MASK_CLEAR_REG 0x34
-#define DA8XX_USB_INTR_SRC_MASKED_REG 0x38
-#define DA8XX_USB_END_OF_INTR_REG 0x3c
-#define DA8XX_USB_GENERIC_RNDIS_EP_SIZE_REG(n) (0x50 + (((n) - 1) << 2))
-
-/* Control register bits */
-#define DA8XX_SOFT_RESET_MASK	1
-
-#define DA8XX_USB_TX_EP_MASK	0x1f		/* EP0 + 4 Tx EPs */
-#define DA8XX_USB_RX_EP_MASK	0x1e		/* 4 Rx EPs */
-
-/* USB interrupt register bits */
-#define DA8XX_INTR_USB_SHIFT	16
-#define DA8XX_INTR_USB_MASK	(0x1ff << DA8XX_INTR_USB_SHIFT) /* 8 Mentor */
-					/* interrupts and DRVVBUS interrupt */
-#define DA8XX_INTR_DRVVBUS	0x100
-#define DA8XX_INTR_RX_SHIFT	8
-#define DA8XX_INTR_RX_MASK	(DA8XX_USB_RX_EP_MASK << DA8XX_INTR_RX_SHIFT)
-#define DA8XX_INTR_TX_SHIFT	0
-#define DA8XX_INTR_TX_MASK	(DA8XX_USB_TX_EP_MASK << DA8XX_INTR_TX_SHIFT)
-
-#define DA8XX_MENTOR_CORE_OFFSET 0x400
-
-#define CFGCHIP2	IO_ADDRESS(DA8XX_SYSCFG0_BASE + DA8XX_CFGCHIP2_REG)
-
-struct da8xx_glue {
-	struct device		*dev;
-	struct platform_device	*musb;
-	struct platform_device	*phy;
-	struct clk		*clk;
-};
-
-/*
- * REVISIT (PM): we should be able to keep the PHY in low power mode most
- * of the time (24 MHz oscillator and PLL off, etc.) by setting POWER.D0
- * and, when in host mode, autosuspending idle root ports... PHY_PLLON
- * (overriding SUSPENDM?) then likely needs to stay off.
- */
-
-static inline void phy_on(void)
-{
-	u32 cfgchip2 = __raw_readl(CFGCHIP2);
-
-	/*
-	 * Start the on-chip PHY and its PLL.
-	 */
-	cfgchip2 &= ~(CFGCHIP2_RESET | CFGCHIP2_PHYPWRDN | CFGCHIP2_OTGPWRDN);
-	cfgchip2 |= CFGCHIP2_PHY_PLLON;
-	__raw_writel(cfgchip2, CFGCHIP2);
-
-	pr_info("Waiting for USB PHY clock good...\n");
-	while (!(__raw_readl(CFGCHIP2) & CFGCHIP2_PHYCLKGD))
-		cpu_relax();
-}
-
-static inline void phy_off(void)
-{
-	u32 cfgchip2 = __raw_readl(CFGCHIP2);
-
-	/*
-	 * Ensure that USB 1.1 reference clock is not being sourced from
-	 * USB 2.0 PHY.  Otherwise do not power down the PHY.
-	 */
-	if (!(cfgchip2 & CFGCHIP2_USB1PHYCLKMUX) &&
-	     (cfgchip2 & CFGCHIP2_USB1SUSPENDM)) {
-		pr_warning("USB 1.1 clocked from USB 2.0 PHY -- "
-			   "can't power it down\n");
-		return;
-	}
-
-	/*
-	 * Power down the on-chip PHY.
-	 */
-	cfgchip2 |= CFGCHIP2_PHYPWRDN | CFGCHIP2_OTGPWRDN;
-	__raw_writel(cfgchip2, CFGCHIP2);
-}
-
-/*
- * Because we don't set CTRL.UINT, it's "important" to:
- *	- not read/write INTRUSB/INTRUSBE (except during
- *	  initial setup, as a workaround);
- *	- use INTSET/INTCLR instead.
- */
-
-/**
- * da8xx_musb_enable - enable interrupts
- */
-static void da8xx_musb_enable(struct musb *musb)
-{
-	void __iomem *reg_base = musb->ctrl_base;
-	u32 mask;
-
-	/* Workaround: setup IRQs through both register sets. */
-	mask = ((musb->epmask & DA8XX_USB_TX_EP_MASK) << DA8XX_INTR_TX_SHIFT) |
-	       ((musb->epmask & DA8XX_USB_RX_EP_MASK) << DA8XX_INTR_RX_SHIFT) |
-	       DA8XX_INTR_USB_MASK;
-	musb_writel(reg_base, DA8XX_USB_INTR_MASK_SET_REG, mask);
-
-	/* Force the DRVVBUS IRQ so we can start polling for ID change. */
-	musb_writel(reg_base, DA8XX_USB_INTR_SRC_SET_REG,
-			DA8XX_INTR_DRVVBUS << DA8XX_INTR_USB_SHIFT);
-}
-
-/**
- * da8xx_musb_disable - disable HDRC and flush interrupts
- */
-static void da8xx_musb_disable(struct musb *musb)
-{
-	void __iomem *reg_base = musb->ctrl_base;
-
-	musb_writel(reg_base, DA8XX_USB_INTR_MASK_CLEAR_REG,
-		    DA8XX_INTR_USB_MASK |
-		    DA8XX_INTR_TX_MASK | DA8XX_INTR_RX_MASK);
-	musb_writeb(musb->mregs, MUSB_DEVCTL, 0);
-	musb_writel(reg_base, DA8XX_USB_END_OF_INTR_REG, 0);
-}
-
-#define portstate(stmt)		stmt
-
-static void da8xx_musb_set_vbus(struct musb *musb, int is_on)
-{
-	WARN_ON(is_on && is_peripheral_active(musb));
-}
-
-#define	POLL_SECONDS	2
-
-static struct timer_list otg_workaround;
-
-static void otg_timer(unsigned long _musb)
-{
-	struct musb		*musb = (void *)_musb;
-	void __iomem		*mregs = musb->mregs;
-	u8			devctl;
-	unsigned long		flags;
-
-	/*
-	 * We poll because DaVinci's won't expose several OTG-critical
-	 * status change events (from the transceiver) otherwise.
-	 */
-	devctl = musb_readb(mregs, MUSB_DEVCTL);
-	dev_dbg(musb->controller, "Poll devctl %02x (%s)\n", devctl,
-		usb_otg_state_string(musb->xceiv->otg->state));
-
-	spin_lock_irqsave(&musb->lock, flags);
-	switch (musb->xceiv->otg->state) {
-	case OTG_STATE_A_WAIT_BCON:
-		devctl &= ~MUSB_DEVCTL_SESSION;
-		musb_writeb(musb->mregs, MUSB_DEVCTL, devctl);
-
-		devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
-		if (devctl & MUSB_DEVCTL_BDEVICE) {
-			musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-			MUSB_DEV_MODE(musb);
-		} else {
-			musb->xceiv->otg->state = OTG_STATE_A_IDLE;
-			MUSB_HST_MODE(musb);
-		}
-		break;
-	case OTG_STATE_A_WAIT_VFALL:
-		/*
-		 * Wait till VBUS falls below SessionEnd (~0.2 V); the 1.3
-		 * RTL seems to mis-handle session "start" otherwise (or in
-		 * our case "recover"), in routine "VBUS was valid by the time
-		 * VBUSERR got reported during enumeration" cases.
-		 */
-		if (devctl & MUSB_DEVCTL_VBUS) {
-			mod_timer(&otg_workaround, jiffies + POLL_SECONDS * HZ);
-			break;
-		}
-		musb->xceiv->otg->state = OTG_STATE_A_WAIT_VRISE;
-		musb_writel(musb->ctrl_base, DA8XX_USB_INTR_SRC_SET_REG,
-			    MUSB_INTR_VBUSERROR << DA8XX_INTR_USB_SHIFT);
-		break;
-	case OTG_STATE_B_IDLE:
-		/*
-		 * There's no ID-changed IRQ, so we have no good way to tell
-		 * when to switch to the A-Default state machine (by setting
-		 * the DEVCTL.Session bit).
-		 *
-		 * Workaround:  whenever we're in B_IDLE, try setting the
-		 * session flag every few seconds.  If it works, ID was
-		 * grounded and we're now in the A-Default state machine.
-		 *
-		 * NOTE: setting the session flag is _supposed_ to trigger
-		 * SRP but clearly it doesn't.
-		 */
-		musb_writeb(mregs, MUSB_DEVCTL, devctl | MUSB_DEVCTL_SESSION);
-		devctl = musb_readb(mregs, MUSB_DEVCTL);
-		if (devctl & MUSB_DEVCTL_BDEVICE)
-			mod_timer(&otg_workaround, jiffies + POLL_SECONDS * HZ);
-		else
-			musb->xceiv->otg->state = OTG_STATE_A_IDLE;
-		break;
-	default:
-		break;
-	}
-	spin_unlock_irqrestore(&musb->lock, flags);
-}
-
-static void da8xx_musb_try_idle(struct musb *musb, unsigned long timeout)
-{
-	static unsigned long last_timer;
-
-	if (timeout == 0)
-		timeout = jiffies + msecs_to_jiffies(3);
-
-	/* Never idle if active, or when VBUS timeout is not set as host */
-	if (musb->is_active || (musb->a_wait_bcon == 0 &&
-				musb->xceiv->otg->state == OTG_STATE_A_WAIT_BCON)) {
-		dev_dbg(musb->controller, "%s active, deleting timer\n",
-			usb_otg_state_string(musb->xceiv->otg->state));
-		del_timer(&otg_workaround);
-		last_timer = jiffies;
-		return;
-	}
-
-	if (time_after(last_timer, timeout) && timer_pending(&otg_workaround)) {
-		dev_dbg(musb->controller, "Longer idle timer already pending, ignoring...\n");
-		return;
-	}
-	last_timer = timeout;
-
-	dev_dbg(musb->controller, "%s inactive, starting idle timer for %u ms\n",
-		usb_otg_state_string(musb->xceiv->otg->state),
-		jiffies_to_msecs(timeout - jiffies));
-	mod_timer(&otg_workaround, timeout);
-}
-
-static irqreturn_t da8xx_musb_interrupt(int irq, void *hci)
-{
-	struct musb		*musb = hci;
-	void __iomem		*reg_base = musb->ctrl_base;
-	struct usb_otg		*otg = musb->xceiv->otg;
-	unsigned long		flags;
-	irqreturn_t		ret = IRQ_NONE;
-	u32			status;
-
-	spin_lock_irqsave(&musb->lock, flags);
-
-	/*
-	 * NOTE: DA8XX shadows the Mentor IRQs.  Don't manage them through
-	 * the Mentor registers (except for setup), use the TI ones and EOI.
-	 */
-
-	/* Acknowledge and handle non-CPPI interrupts */
-	status = musb_readl(reg_base, DA8XX_USB_INTR_SRC_MASKED_REG);
-	if (!status)
-		goto eoi;
-
-	musb_writel(reg_base, DA8XX_USB_INTR_SRC_CLEAR_REG, status);
-	dev_dbg(musb->controller, "USB IRQ %08x\n", status);
-
-	musb->int_rx = (status & DA8XX_INTR_RX_MASK) >> DA8XX_INTR_RX_SHIFT;
-	musb->int_tx = (status & DA8XX_INTR_TX_MASK) >> DA8XX_INTR_TX_SHIFT;
-	musb->int_usb = (status & DA8XX_INTR_USB_MASK) >> DA8XX_INTR_USB_SHIFT;
-
-	/*
-	 * DRVVBUS IRQs are the only proxy we have (a very poor one!) for
-	 * DA8xx's missing ID change IRQ.  We need an ID change IRQ to
-	 * switch appropriately between halves of the OTG state machine.
-	 * Managing DEVCTL.Session per Mentor docs requires that we know its
-	 * value but DEVCTL.BDevice is invalid without DEVCTL.Session set.
-	 * Also, DRVVBUS pulses for SRP (but not at 5 V)...
-	 */
-	if (status & (DA8XX_INTR_DRVVBUS << DA8XX_INTR_USB_SHIFT)) {
-		int drvvbus = musb_readl(reg_base, DA8XX_USB_STAT_REG);
-		void __iomem *mregs = musb->mregs;
-		u8 devctl = musb_readb(mregs, MUSB_DEVCTL);
-		int err;
-
-		err = musb->int_usb & MUSB_INTR_VBUSERROR;
-		if (err) {
-			/*
-			 * The Mentor core doesn't debounce VBUS as needed
-			 * to cope with device connect current spikes. This
-			 * means it's not uncommon for bus-powered devices
-			 * to get VBUS errors during enumeration.
-			 *
-			 * This is a workaround, but newer RTL from Mentor
-			 * seems to allow a better one: "re"-starting sessions
-			 * without waiting for VBUS to stop registering in
-			 * devctl.
-			 */
-			musb->int_usb &= ~MUSB_INTR_VBUSERROR;
-			musb->xceiv->otg->state = OTG_STATE_A_WAIT_VFALL;
-			mod_timer(&otg_workaround, jiffies + POLL_SECONDS * HZ);
-			WARNING("VBUS error workaround (delay coming)\n");
-		} else if (drvvbus) {
-			MUSB_HST_MODE(musb);
-			otg->default_a = 1;
-			musb->xceiv->otg->state = OTG_STATE_A_WAIT_VRISE;
-			portstate(musb->port1_status |= USB_PORT_STAT_POWER);
-			del_timer(&otg_workaround);
-		} else if (!(musb->int_usb & MUSB_INTR_BABBLE)){
-			/*
-			 * When babble condition happens, drvvbus interrupt
-			 * is also generated. Ignore this drvvbus interrupt
-			 * and let babble interrupt handler recovers the
-			 * controller; otherwise, the host-mode flag is lost
-			 * due to the MUSB_DEV_MODE() call below and babble
-			 * recovery logic will not called.
-			 */
-			musb->is_active = 0;
-			MUSB_DEV_MODE(musb);
-			otg->default_a = 0;
-			musb->xceiv->otg->state = OTG_STATE_B_IDLE;
-			portstate(musb->port1_status &= ~USB_PORT_STAT_POWER);
-		}
-
-		dev_dbg(musb->controller, "VBUS %s (%s)%s, devctl %02x\n",
-				drvvbus ? "on" : "off",
-				usb_otg_state_string(musb->xceiv->otg->state),
-				err ? " ERROR" : "",
-				devctl);
-		ret = IRQ_HANDLED;
-	}
-
-	if (musb->int_tx || musb->int_rx || musb->int_usb)
-		ret |= musb_interrupt(musb);
-
- eoi:
-	/* EOI needs to be written for the IRQ to be re-asserted. */
-	if (ret == IRQ_HANDLED || status)
-		musb_writel(reg_base, DA8XX_USB_END_OF_INTR_REG, 0);
-
-	/* Poll for ID change */
-	if (musb->xceiv->otg->state == OTG_STATE_B_IDLE)
-		mod_timer(&otg_workaround, jiffies + POLL_SECONDS * HZ);
-
-	spin_unlock_irqrestore(&musb->lock, flags);
-
-	return ret;
-}
-
-static int da8xx_musb_set_mode(struct musb *musb, u8 musb_mode)
-{
-	u32 cfgchip2 = __raw_readl(CFGCHIP2);
-
-	cfgchip2 &= ~CFGCHIP2_OTGMODE;
-	switch (musb_mode) {
-	case MUSB_HOST:		/* Force VBUS valid, ID = 0 */
-		cfgchip2 |= CFGCHIP2_FORCE_HOST;
-		break;
-	case MUSB_PERIPHERAL:	/* Force VBUS valid, ID = 1 */
-		cfgchip2 |= CFGCHIP2_FORCE_DEVICE;
-		break;
-	case MUSB_OTG:		/* Don't override the VBUS/ID comparators */
-		cfgchip2 |= CFGCHIP2_NO_OVERRIDE;
-		break;
-	default:
-		dev_dbg(musb->controller, "Trying to set unsupported mode %u\n", musb_mode);
-	}
-
-	__raw_writel(cfgchip2, CFGCHIP2);
-	return 0;
-}
-
-static int da8xx_musb_init(struct musb *musb)
-{
-	void __iomem *reg_base = musb->ctrl_base;
-	u32 rev;
-	int ret = -ENODEV;
-
-	musb->mregs += DA8XX_MENTOR_CORE_OFFSET;
-
-	/* Returns zero if e.g. not clocked */
-	rev = musb_readl(reg_base, DA8XX_USB_REVISION_REG);
-	if (!rev)
-		goto fail;
-
-	musb->xceiv = usb_get_phy(USB_PHY_TYPE_USB2);
-	if (IS_ERR_OR_NULL(musb->xceiv)) {
-		ret = -EPROBE_DEFER;
-		goto fail;
-	}
-
-	setup_timer(&otg_workaround, otg_timer, (unsigned long)musb);
-
-	/* Reset the controller */
-	musb_writel(reg_base, DA8XX_USB_CTRL_REG, DA8XX_SOFT_RESET_MASK);
-
-	/* Start the on-chip PHY and its PLL. */
-	phy_on();
-
-	msleep(5);
-
-	/* NOTE: IRQs are in mixed mode, not bypass to pure MUSB */
-	pr_debug("DA8xx OTG revision %08x, PHY %03x, control %02x\n",
-		 rev, __raw_readl(CFGCHIP2),
-		 musb_readb(reg_base, DA8XX_USB_CTRL_REG));
-
-	musb->isr = da8xx_musb_interrupt;
-	return 0;
-fail:
-	return ret;
-}
-
-static int da8xx_musb_exit(struct musb *musb)
-{
-	del_timer_sync(&otg_workaround);
-
-	phy_off();
-
-	usb_put_phy(musb->xceiv);
-
-	return 0;
-}
-
-static const struct musb_platform_ops da8xx_ops = {
-	.quirks		= MUSB_INDEXED_EP,
-	.init		= da8xx_musb_init,
-	.exit		= da8xx_musb_exit,
-
-	.fifo_mode	= 2,
-	.enable		= da8xx_musb_enable,
-	.disable	= da8xx_musb_disable,
-
-	.set_mode	= da8xx_musb_set_mode,
-	.try_idle	= da8xx_musb_try_idle,
-
-	.set_vbus	= da8xx_musb_set_vbus,
-};
-
-static const struct platform_device_info da8xx_dev_info = {
-	.name		= "musb-hdrc",
-	.id		= PLATFORM_DEVID_AUTO,
-	.dma_mask	= DMA_BIT_MASK(32),
-};
-
-static int da8xx_probe(struct platform_device *pdev)
-{
-	struct resource musb_resources[2];
-	struct musb_hdrc_platform_data	*pdata = dev_get_platdata(&pdev->dev);
-	struct platform_device		*musb;
-	struct da8xx_glue		*glue;
-	struct platform_device_info	pinfo;
-	struct clk			*clk;
-
-	int				ret = -ENOMEM;
-
-	glue = kzalloc(sizeof(*glue), GFP_KERNEL);
-	if (!glue) {
-		dev_err(&pdev->dev, "failed to allocate glue context\n");
-		goto err0;
-	}
-
-	clk = clk_get(&pdev->dev, "usb20");
-	if (IS_ERR(clk)) {
-		dev_err(&pdev->dev, "failed to get clock\n");
-		ret = PTR_ERR(clk);
-		goto err3;
-	}
-
-	ret = clk_enable(clk);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to enable clock\n");
-		goto err4;
-	}
-
-	glue->dev			= &pdev->dev;
-	glue->clk			= clk;
-
-	pdata->platform_ops		= &da8xx_ops;
-
-	glue->phy = usb_phy_generic_register();
-	if (IS_ERR(glue->phy)) {
-		ret = PTR_ERR(glue->phy);
-		goto err5;
-	}
-	platform_set_drvdata(pdev, glue);
-
-	memset(musb_resources, 0x00, sizeof(*musb_resources) *
-			ARRAY_SIZE(musb_resources));
-
-	musb_resources[0].name = pdev->resource[0].name;
-	musb_resources[0].start = pdev->resource[0].start;
-	musb_resources[0].end = pdev->resource[0].end;
-	musb_resources[0].flags = pdev->resource[0].flags;
-
-	musb_resources[1].name = pdev->resource[1].name;
-	musb_resources[1].start = pdev->resource[1].start;
-	musb_resources[1].end = pdev->resource[1].end;
-	musb_resources[1].flags = pdev->resource[1].flags;
-
-	pinfo = da8xx_dev_info;
-	pinfo.parent = &pdev->dev;
-	pinfo.res = musb_resources;
-	pinfo.num_res = ARRAY_SIZE(musb_resources);
-	pinfo.data = pdata;
-	pinfo.size_data = sizeof(*pdata);
-
-	glue->musb = musb = platform_device_register_full(&pinfo);
-	if (IS_ERR(musb)) {
-		ret = PTR_ERR(musb);
-		dev_err(&pdev->dev, "failed to register musb device: %d\n", ret);
-		goto err6;
-	}
-
-	return 0;
-
-err6:
-	usb_phy_generic_unregister(glue->phy);
-
-err5:
-	clk_disable(clk);
-
-err4:
-	clk_put(clk);
-
-err3:
-	kfree(glue);
-
-err0:
-	return ret;
-}
-
-static int da8xx_remove(struct platform_device *pdev)
-{
-	struct da8xx_glue		*glue = platform_get_drvdata(pdev);
-
-	platform_device_unregister(glue->musb);
-	usb_phy_generic_unregister(glue->phy);
-	clk_disable(glue->clk);
-	clk_put(glue->clk);
-	kfree(glue);
-
-	return 0;
-}
-
-static struct platform_driver da8xx_driver = {
-	.probe		= da8xx_probe,
-	.remove		= da8xx_remove,
-	.driver		= {
-		.name	= "musb-da8xx",
-	},
-};
-
-MODULE_DESCRIPTION("DA8xx/OMAP-L1x MUSB Glue Layer");
-MODULE_AUTHOR("Sergei Shtylyov <sshtylyov@ru.mvista.com>");
-MODULE_LICENSE("GPL v2");
-module_platform_driver(da8xx_driver);
+define SCLK_DEEP_SLEEP_CNTL2__REG_SCLK_DEEP_SLEEP_MASK__SHIFT 0x17
+#define SCLK_DEEP_SLEEP_CNTL2__INOUT_CUSHION_MASK 0xff000000
+#define SCLK_DEEP_SLEEP_CNTL2__INOUT_CUSHION__SHIFT 0x18
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_0_SMU_BUSY_MASK_MASK 0x1
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_0_SMU_BUSY_MASK__SHIFT 0x0
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_1_SMU_BUSY_MASK_MASK 0x2
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_1_SMU_BUSY_MASK__SHIFT 0x1
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_2_SMU_BUSY_MASK_MASK 0x4
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_2_SMU_BUSY_MASK__SHIFT 0x2
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_3_SMU_BUSY_MASK_MASK 0x8
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_3_SMU_BUSY_MASK__SHIFT 0x3
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_4_SMU_BUSY_MASK_MASK 0x10
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_4_SMU_BUSY_MASK__SHIFT 0x4
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_5_SMU_BUSY_MASK_MASK 0x20
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_5_SMU_BUSY_MASK__SHIFT 0x5
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_6_SMU_BUSY_MASK_MASK 0x40
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_6_SMU_BUSY_MASK__SHIFT 0x6
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_7_SMU_BUSY_MASK_MASK 0x80
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_7_SMU_BUSY_MASK__SHIFT 0x7
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_8_SMU_BUSY_MASK_MASK 0x100
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_8_SMU_BUSY_MASK__SHIFT 0x8
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_9_SMU_BUSY_MASK_MASK 0x200
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_9_SMU_BUSY_MASK__SHIFT 0x9
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_10_SMU_BUSY_MASK_MASK 0x400
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_10_SMU_BUSY_MASK__SHIFT 0xa
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_11_SMU_BUSY_MASK_MASK 0x800
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_11_SMU_BUSY_MASK__SHIFT 0xb
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_12_SMU_BUSY_MASK_MASK 0x1000
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_12_SMU_BUSY_MASK__SHIFT 0xc
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_13_SMU_BUSY_MASK_MASK 0x2000
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_13_SMU_BUSY_MASK__SHIFT 0xd
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_14_SMU_BUSY_MASK_MASK 0x4000
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_14_SMU_BUSY_MASK__SHIFT 0xe
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_15_SMU_BUSY_MASK_MASK 0x8000
+#define SCLK_DEEP_SLEEP_CNTL3__GRBM_15_SMU_BUSY_MASK__SHIFT 0xf
+#define SCLK_DEEP_SLEEP_CNTL3__SMUIF_SLAVE_SCLK_BUSY_MASK_MASK 0x10000
+#define SCLK_DEEP_SLEEP_CNTL3__SMUIF_SLAVE_SCLK_BUSY_MASK__SHIFT 0x10
+#define SCLK_DEEP_SLEEP_CNTL3__SMUIF_MASTER_SCLK_BUSY_MASK_MASK 0x20000
+#define SCLK_DEEP_SLEEP_CNTL3__SMUIF_MASTER_SCLK_BUSY_MASK__SHIFT 0x11
+#define SCLK_DEEP_SLEEP_MISC_CNTL__DPM_DS_DIV_ID_MASK 0x7
+#define SCLK_DEEP_SLEEP_MISC_CNTL__DPM_DS_DIV_ID__SHIFT 0x0
+#define SCLK_DEEP_SLEEP_MISC_CNTL__DPM_SS_DIV_ID_MASK 0x38
+#define SCLK_DEEP_SLEEP_MISC_CNTL__DPM_SS_DIV_ID__SHIFT 0x3
+#define SCLK_DEEP_SLEEP_MISC_CNTL__OCP_ENABLE_MASK 0x10000
+#define SCLK_DEEP_SLEEP_MISC_CNTL__OCP_ENABLE__SHIFT 0x10
+#define SCLK_DEEP_SLEEP_MISC_CNTL__OCP_DS_DIV_ID_MASK 0xe0000
+#define SCLK_DEEP_SLEEP_MISC_CNTL__OCP_DS_DIV_ID__SHIFT 0x11
+#define SCLK_DEEP_SLEEP_MISC_CNTL__OCP_SS_DIV_ID_MASK 0x700000
+#define SCLK_DEEP_SLEEP_MISC_CNTL__OCP_SS_DIV_ID__SHIFT 0x14
+#define LCLK_DEEP_SLEEP_CNTL__DIV_ID_MASK 0x7
+#define LCLK_DEEP_SLEEP_CNTL__DIV_ID__SHIFT 0x0
+#define LCLK_DEEP_SLEEP_CNTL__RAMP_DIS_MASK 0x8
+#define LCLK_DEEP_SLEEP_CNTL__RAMP_DIS__SHIFT 0x3
+#define LCLK_DEEP_SLEEP_CNTL__HYSTERESIS_MASK 0xfff0
+#define LCLK_DEEP_SLEEP_CNTL__HYSTERESIS__SHIFT 0x4
+#define LCLK_DEEP_SLEEP_CNTL__RESERVED_MASK 0x7fff0000
+#define LCLK_DEEP_SLEEP_CNTL__RESERVED__SHIFT 0x10
+#define LCLK_DEEP_SLEEP_CNTL__ENABLE_DS_MASK 0x80000000
+#define LCLK_DEEP_SLEEP_CNTL__ENABLE_DS__SHIFT 0x1f
+#define LCLK_DEEP_SLEEP_CNTL2__RFE_BUSY_MASK_MASK 0x1
+#define LCLK_DEEP_SLEEP_CNTL2__RFE_BUSY_MASK__SHIFT 0x0
+#define LCLK_DEEP_SLEEP_CNTL2__BIF_CG_LCLK_BUSY_MASK_MASK 0x2
+#define LCLK_DEEP_SLEEP_CNTL2__BIF_CG_LCLK_BUSY_MASK__SHIFT 0x1
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMU_SMU_IDLE_MASK_MASK 0x4
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMU_SMU_IDLE_MASK__SHIFT 0x2
+#define LCLK_DEEP_SLEEP_CNTL2__RESERVED_BIT3_MASK 0x8
+#define LCLK_DEEP_SLEEP_CNTL2__RESERVED_BIT3__SHIFT 0x3
+#define LCLK_DEEP_SLEEP_CNTL2__SCLK_RUNNING_MASK_MASK 0x10
+#define LCLK_DEEP_SLEEP_CNTL2__SCLK_RUNNING_MASK__SHIFT 0x4
+#define LCLK_DEEP_SLEEP_CNTL2__SMU_BUSY_MASK_MASK 0x20
+#define LCLK_DEEP_SLEEP_CNTL2__SMU_BUSY_MASK__SHIFT 0x5
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE1_MASK_MASK 0x40
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE1_MASK__SHIFT 0x6
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE2_MASK_MASK 0x80
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE2_MASK__SHIFT 0x7
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE3_MASK_MASK 0x100
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE3_MASK__SHIFT 0x8
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE4_MASK_MASK 0x200
+#define LCLK_DEEP_SLEEP_CNTL2__PCIE_LCLK_IDLE4_MASK__SHIFT 0x9
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUGPP_IDLE_MASK_MASK 0x400
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUGPP_IDLE_MASK__SHIFT 0xa
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUGPPSB_IDLE_MASK_MASK 0x800
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUGPPSB_IDLE_MASK__SHIFT 0xb
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUBIF_IDLE_MASK_MASK 0x1000
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUBIF_IDLE_MASK__SHIFT 0xc
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUINTGEN_IDLE_MASK_MASK 0x2000
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUINTGEN_IDLE_MASK__SHIFT 0xd
+#define LCLK_DEEP_SLEEP_CNTL2__L2IMU_IDLE_MASK_MASK 0x4000
+#define LCLK_DEEP_SLEEP_CNTL2__L2IMU_IDLE_MASK__SHIFT 0xe
+#define LCLK_DEEP_SLEEP_CNTL2__ORB_IDLE_MASK_MASK 0x8000
+#define LCLK_DEEP_SLEEP_CNTL2__ORB_IDLE_MASK__SHIFT 0xf
+#define LCLK_DEEP_SLEEP_CNTL2__ON_INB_WAKE_MASK_MASK 0x10000
+#define LCLK_DEEP_SLEEP_CNTL2__ON_INB_WAKE_MASK__SHIFT 0x10
+#define LCLK_DEEP_SLEEP_CNTL2__ON_INB_WAKE_ACK_MASK_MASK 0x20000
+#define LCLK_DEEP_SLEEP_CNTL2__ON_INB_WAKE_ACK_MASK__SHIFT 0x11
+#define LCLK_DEEP_SLEEP_CNTL2__ON_OUTB_WAKE_MASK_MASK 0x40000
+#define LCLK_DEEP_SLEEP_CNTL2__ON_OUTB_WAKE_MASK__SHIFT 0x12
+#define LCLK_DEEP_SLEEP_CNTL2__ON_OUTB_WAKE_ACK_MASK_MASK 0x80000
+#define LCLK_DEEP_SLEEP_CNTL2__ON_OUTB_WAKE_ACK_MASK__SHIFT 0x13
+#define LCLK_DEEP_SLEEP_CNTL2__DMAACTIVE_MASK_MASK 0x100000
+#define LCLK_DEEP_SLEEP_CNTL2__DMAACTIVE_MASK__SHIFT 0x14
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUPCIE0_IDLE_MASK_MASK 0x200000
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUPCIE0_IDLE_MASK__SHIFT 0x15
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUPCIE1_IDLE_MASK_MASK 0x400000
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUPCIE1_IDLE_MASK__SHIFT 0x16
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUIOAGR_IDLE_MASK_MASK 0x800000
+#define LCLK_DEEP_SLEEP_CNTL2__L1IMUIOAGR_IDLE_MASK__SHIFT 0x17
+#define LCLK_DEEP_SLEEP_CNTL2__SPG_SMU_IDLE_MASK_MASK 0x1000000
+#define LCLK_DEEP_SLEEP_CNTL2__SPG_SMU_IDLE_MASK__SHIFT 0x18
+#define LCLK_DEEP_SLEEP_CNTL2__APG_SMU_IDLE_MASK_MASK 0x2000000
+#define LCLK_DEEP_SLEEP_CNTL2__APG_SMU_IDLE_MASK__SHIFT 0x19
+#define LCLK_DEEP_SLEEP_CNTL2__IP_SMU_IDLE0_MASK_MASK 0x4000000
+#define LCLK_DEEP_SLEEP_CNTL2__IP_SMU_IDLE0_MASK__SHIFT 0x1a
+#define LCLK_DEEP_SLEEP_CNTL2__IP_SMU_IDLE1_MASK_MASK 0x8000000
+#define LCLK_DEEP_SLEEP_CNTL2__IP_SMU_IDLE1_MASK__SHIFT 0x1b
+#define LCLK_DEEP_SLEEP_CNTL2__IP_SMU_IDLE2_MASK_MASK 0x10000000
+#define LCLK_DEEP_SLEEP_CNTL2__IP_SMU_IDLE2_MASK__SHIFT 0x1c
+#define LCLK_DEEP_SLEEP_CNTL2__IP_SMU_IDLE3_MASK_MASK 0x20000000
+#define LCLK_DEEP_SLEEP_CNTL2__IP_SMU_IDLE3_MASK__SHIFT 0x1d
+#define LCLK_DEEP_SLEEP_CNTL2__RESERVED_MASK 0xc0000000
+#define LCLK_DEEP_SLEEP_CNTL2__RESERVED__SHIFT 0x1e
+#define SMU_VOLTAGE_STATUS__SMU_VOLTAGE_STATUS_MASK 0x1
+#define SMU_VOLTAGE_STATUS__SMU_VOLTAGE_STATUS__SHIFT 0x0
+#define SMU_VOLTAGE_STATUS__SMU_VOLTAGE_CURRENT_LEVEL_MASK 0x1fe
+#define SMU_VOLTAGE_STATUS__SMU_VOLTAGE_CURRENT_LEVEL__SHIFT 0x1
+#define CG_ULV_PARAMETER__ULV_THRESHOLD_MASK 0xffff
+#define CG_ULV_PARAMETER__ULV_THRESHOLD__SHIFT 0x0
+#define CG_ULV_PARAMETER__ULV_THRESHOLD_UNIT_MASK 0xf0000
+#define CG_ULV_PARAMETER__ULV_THRESHOLD_UNIT__SHIFT 0x10
+#define PWR_DC_RESP__RESPONSE_MASK 0x1
+#define PWR_DC_RESP__RESPONSE__SHIFT 0x0
+#define PWR_VCE_RESP__RESPONSE_MASK 0xffffffff
+#define PWR_VCE_RESP__RESPONSE__SHIFT 0x0
+#define PWR_UVD_RESP__RESPONSE_MASK 0xffffffff
+#define PWR_UVD_RESP__RESPONSE__SHIFT 0x0
+#define PWR_ACP_RESP__RESPONSE_MASK 0xffffffff
+#define PWR_ACP_RESP__RESPONSE__SHIFT 0x0
+#define PWR_DC_REQ__REQUEST_MASK 0x1
+#define PWR_DC_REQ__REQUEST__SHIFT 0x0
+#define SCLK_MIN_DIV__FRACV_MASK 0xfff
+#define SCLK_MIN_DIV__FRACV__SHIFT 0x0
+#define SCLK_MIN_DIV__INTV_MASK 0x7f000
+#define SCLK_MIN_DIV__INTV__SHIFT 0xc
+#define PCIE_PGFSM_CONFIG__FSM_ADDR_MASK 0xff
+#define PCIE_PGFSM_CONFIG__FSM_ADDR__SHIFT 0x0
+#define PCIE_PGFSM_CONFIG__Power_Down_MASK 0x100
+#define PCIE_PGFSM_CONFIG__Power_Down__SHIFT 0x8
+#define PCIE_PGFSM_CONFIG__Power_Up_MASK 0x200
+#define PCIE_PGFSM_CONFIG__Power_Up__SHIFT 0x9
+#define PCIE_PGFSM_CONFIG__P1_Select_MASK 0x400
+#define PCIE_PGFSM_CONFIG__P1_Select__SHIFT 0xa
+#define PCIE_PGFSM_CONFIG__P2_Select_MASK 0x800
+#define PCIE_PGFSM_CONFIG__P2_Select__SHIFT 0xb
+#define PCIE_PGFSM_CONFIG__Write_Op_MASK 0x1000
+#define PCIE_PGFSM_CONFIG__Write_Op__SHIFT 0xc
+#define PCIE_PGFSM_CONFIG__Read_Op_MASK 0x2000
+#define PCIE_PGFSM_CONFIG__Read_Op__SHIFT 0xd
+#define PCIE_PGFSM_CONFIG__Reserved_MASK 0xfffc000
+#define PCIE_PGFSM_CONFIG__Reserved__SHIFT 0xe
+#define PCIE_PGFSM_CONFIG__REG_ADDR_MASK 0xf0000000
+#define PCIE_PGFSM_CONFIG__REG_ADDR__SHIFT 0x1c
+#define PCIE_PGFSM_WRITE__Write_value_MASK 0xffffffff
+#define PCIE_PGFSM_WRITE__Write_value__SHIFT 0x0
+#define SERDES_BUSY__PCIE_SERDES_BUSY_MASK 0x1
+#define SERDES_BUSY__PCIE_SERDES_BUSY__SHIFT 0x0
+#define PCIE_PGFSM2_CONFIG__FSM_ADDR_MASK 0xff
+#define PCIE_PGFSM2_CONFIG__FSM_ADDR__SHIFT 0x0
+#define PCIE_PGFSM2_CONFIG__Power_Down_MASK 0x100
+#define PCIE_PGFSM2_CONFIG__Power_Down__SHIFT 0x8
+#define PCIE_PGFSM2_CONFIG__Power_Up_MASK 0x200
+#define PCIE_PGFSM2_CONFIG__Power_Up__SHIFT 0x9
+#define PCIE_PGFSM2_CONFIG__P1_Select_MASK 0x400
+#define PCIE_PGFSM2_CONFIG__P1_Select__SHIFT 0xa
+#define PCIE_PGFSM2_CONFIG__P2_Select_MASK 0x800
+#define PCIE_PGFSM2_CONFIG__P2_Select__SHIFT 0xb
+#define PCIE_PGFSM2_CONFIG__Write_Op_MASK 0x1000
+#define PCIE_PGFSM2_CONFIG__Write_Op__SHIFT 0xc
+#define PCIE_PGFSM2_CONFIG__Read_Op_MASK 0x2000
+#define PCIE_PGFSM2_CONFIG__Read_Op__SHIFT 0xd
+#define PCIE_PGFSM2_CONFIG__Reserved_MASK 0xfffc000
+#define PCIE_PGFSM2_CONFIG__Reserved__SHIFT 0xe
+#define PCIE_PGFSM2_CONFIG__REG_ADDR_MASK 0xf0000000
+#define PCIE_PGFSM2_CONFIG__REG_ADDR__SHIFT 0x1c
+#define PCIE_PGFSM2_WRITE__Write_value_MASK 0xffffffff
+#define PCIE_PGFSM2_WRITE__Write_value__SHIFT 0x0
+#define SERDES2_BUSY__PCIE_SERDES_BUSY_MASK 0x1
+#define SERDES2_BUSY__PCIE_SERDES_BUSY__SHIFT 0x0
+#define PCIE_PGFSM_0_READ__Read_value_MASK 0xffffff
+#define PCIE_PGFSM_0_READ__Read_value__SHIFT 0x0
+#define PCIE_PGFSM_0_READ__Read_valid_MASK 0x1000000
+#define PCIE_PGFSM_0_READ__Read_valid__SHIFT 0x18
+#define PCIE_PGFSM_1_READ__Read_value_MASK 0xffffff
+#define PCIE_PGFSM_1_READ__Read_value__SHIFT 0x0
+#define PCIE_PGFSM_1_READ__Read_valid_MASK 0x1000000
+#define PCIE_PGFSM_1_READ__Read_valid__SHIFT 0x18
+#define PWR_ACPI_INTERRUPT__BIF_CG_req_MASK 0x1
+#define PWR_ACPI_INTERRUPT__BIF_CG_req__SHIFT 0x0
+#define PWR_ACPI_INTERRUPT__AZ_CG_req_MASK 0x2
+#define PWR_ACPI_INTERRUPT__AZ_CG_req__SHIFT 0x1
+#define PWR_ACPI_INTERRUPT__AZ_CG_resp_MASK 0x4
+#define PWR_ACPI_INTERRUPT__AZ_CG_resp__SHIFT 0x2
+#define VDDGFX_IDLE_PARAMETER__VDDGFX_IDLE_THRESHOLD_MASK 0xffff
+#define VDDGFX_IDLE_PARAMETER__VDDGFX_IDLE_THRESHOLD__SHIFT 0x0
+#define VDDGFX_IDLE_PARAMETER__VDDGFX_IDLE_THRESHOLD_UNIT_MASK 0xf0000
+#define VDDGFX_IDLE_PARAMETER__VDDGFX_IDLE_THRESHOLD_UNIT__SHIFT 0x10
+#define VDDGFX_IDLE_CONTROL__VDDGFX_IDLE_EN_MASK 0x1
+#define VDDGFX_IDLE_CONTROL__VDDGFX_IDLE_EN__SHIFT 0x0
+#define VDDGFX_IDLE_CONTROL__VDDGFX_IDLE_DETECT_MASK 0x2
+#define VDDGFX_IDLE_CONTROL__VDDGFX_IDLE_DETECT__SHIFT 0x1
+#define VDDGFX_IDLE_CONTROL__FORCE_VDDGFX_IDLE_EXIT_MASK 0x4
+#define VDDGFX_IDLE_CONTROL__FORCE_VDDGFX_IDLE_EXIT__SHIFT 0x2
+#define VDDGFX_IDLE_CONTROL__SMC_VDDGFX_IDLE_STATE_MASK 0x8
+#define VDDGFX_IDLE_CONTROL__SMC_VDDGFX_IDLE_STATE__SHIFT 0x3
+#define VDDGFX_IDLE_EXIT__BIF_EXIT_REQ_MASK 0x1
+#define VDDGFX_IDLE_EXIT__BIF_EXIT_REQ__SHIFT 0x0
+#define REG_SCLK_DEEP_SLEEP_EXIT__REG_sclk_deep_sleep_exit_MASK 0x1
+#define REG_SCLK_DEEP_SLEEP_EXIT__REG_sclk_deep_sleep_exit__SHIFT 0x0
+#define CAC_WEIGHT_LKG_DC_3__WEIGHT_LKG_DC_SIG4_MASK 0xffff
+#define CAC_WEIGHT_LKG_DC_3__WEIGHT_LKG_DC_SIG4__SHIFT 0x0
+#define CAC_WEIGHT_LKG_DC_3__WEIGHT_LKG_DC_SIG5_MASK 0xffff0000
+#define CAC_WEIGHT_LKG_DC_3__WEIGHT_LKG_DC_SIG5__SHIFT 0x10
+#define LCAC_MC0_CNTL__MC0_ENABLE_MASK 0x1
+#define LCAC_MC0_CNTL__MC0_ENABLE__SHIFT 0x0
+#define LCAC_MC0_CNTL__MC0_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC0_CNTL__MC0_THRESHOLD__SHIFT 0x1
+#define LCAC_MC0_CNTL__MC0_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC0_CNTL__MC0_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC0_CNTL__MC0_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC0_CNTL__MC0_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC0_OVR_SEL__MC0_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC0_OVR_SEL__MC0_OVR_SEL__SHIFT 0x0
+#define LCAC_MC0_OVR_VAL__MC0_OVR_VAL_MASK 0xffffffff
+#define LCAC_MC0_OVR_VAL__MC0_OVR_VAL__SHIFT 0x0
+#define LCAC_MC1_CNTL__MC1_ENABLE_MASK 0x1
+#define LCAC_MC1_CNTL__MC1_ENABLE__SHIFT 0x0
+#define LCAC_MC1_CNTL__MC1_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC1_CNTL__MC1_THRESHOLD__SHIFT 0x1
+#define LCAC_MC1_CNTL__MC1_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC1_CNTL__MC1_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC1_CNTL__MC1_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC1_CNTL__MC1_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC1_OVR_SEL__MC1_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC1_OVR_SEL__MC1_OVR_SEL__SHIFT 0x0
+#define LCAC_MC1_OVR_VAL__MC1_OVR_VAL_MASK 0xffffffff
+#define LCAC_MC1_OVR_VAL__MC1_OVR_VAL__SHIFT 0x0
+#define LCAC_MC2_CNTL__MC2_ENABLE_MASK 0x1
+#define LCAC_MC2_CNTL__MC2_ENABLE__SHIFT 0x0
+#define LCAC_MC2_CNTL__MC2_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC2_CNTL__MC2_THRESHOLD__SHIFT 0x1
+#define LCAC_MC2_CNTL__MC2_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC2_CNTL__MC2_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC2_CNTL__MC2_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC2_CNTL__MC2_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC2_OVR_SEL__MC2_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC2_OVR_SEL__MC2_OVR_SEL__SHIFT 0x0
+#define LCAC_MC2_OVR_VAL__MC2_OVR_VAL_MASK 0xffffffff
+#define LCAC_MC2_OVR_VAL__MC2_OVR_VAL__SHIFT 0x0
+#define LCAC_MC3_CNTL__MC3_ENABLE_MASK 0x1
+#define LCAC_MC3_CNTL__MC3_ENABLE__SHIFT 0x0
+#define LCAC_MC3_CNTL__MC3_THRESHOLD_MASK 0x1fffe
+#define LCAC_MC3_CNTL__MC3_THRESHOLD__SHIFT 0x1
+#define LCAC_MC3_CNTL__MC3_BLOCK_ID_MASK 0x3e0000
+#define LCAC_MC3_CNTL__MC3_BLOCK_ID__SHIFT 0x11
+#define LCAC_MC3_CNTL__MC3_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_MC3_CNTL__MC3_SIGNAL_ID__SHIFT 0x16
+#define LCAC_MC3_OVR_SEL__MC3_OVR_SEL_MASK 0xffffffff
+#define LCAC_MC3_OVR_SEL__MC3_OVR_SEL__SHIFT 0x0
+#define LCAC_MC3_OVR_VAL__MC3_OVR_VAL_MASK 0xffffffff
+#define LCAC_MC3_OVR_VAL__MC3_OVR_VAL__SHIFT 0x0
+#define LCAC_CPL_CNTL__CPL_ENABLE_MASK 0x1
+#define LCAC_CPL_CNTL__CPL_ENABLE__SHIFT 0x0
+#define LCAC_CPL_CNTL__CPL_THRESHOLD_MASK 0x1fffe
+#define LCAC_CPL_CNTL__CPL_THRESHOLD__SHIFT 0x1
+#define LCAC_CPL_CNTL__CPL_BLOCK_ID_MASK 0x3e0000
+#define LCAC_CPL_CNTL__CPL_BLOCK_ID__SHIFT 0x11
+#define LCAC_CPL_CNTL__CPL_SIGNAL_ID_MASK 0x3fc00000
+#define LCAC_CPL_CNTL__CPL_SIGNAL_ID__SHIFT 0x16
+#define LCAC_CPL_OVR_SEL__CPL_OVR_SEL_MASK 0xffffffff
+#define LCAC_CPL_OVR_SEL__CPL_OVR_SEL__SHIFT 0x0
+#define LCAC_CPL_OVR_VAL__CPL_OVR_VAL_MASK 0xffffffff
+#define LCAC_CPL_OVR_VAL__CPL_OVR_VAL__SHIFT 0x0
+#define MISC_UNB_PWRMGT_CFG0__TARGET_ADDR_MASK 0xffffffff
+#define MISC_UNB_PWRMGT_CFG0__TARGET_ADDR__SHIFT 0x0
+#define MISC_UNB_PWRMGT_CFG1__TIMER_EN_MASK 0x1
+#define MISC_UNB_PWRMGT_CFG1__TIMER_EN__SHIFT 0x0
+#define MISC_UNB_PWRMGT_CFG1__TIMER_INTERVAL_MASK 0x1fffe
+#define MISC_UNB_PWRMGT_CFG1__TIMER_INTERVAL__SHIFT 0x1
+#define MISC_UNB_PWRMGT_CFG1__INT_GEN_EN_MASK 0x20000
+#define MISC_UNB_PWRMGT_CFG1__INT_GEN_EN__SHIFT 0x11
+#define MISC_UNB_PWRMGT_DATA__NB_CROSS_TRIGGER_MASK 0xf
+#define MISC_UNB_PWRMGT_DATA__NB_CROSS_TRIGGER__SHIFT 0x0
+#define MISC_UNB_PWRMGT_DATA__NB_PRE_SELF_REFRESH_MASK 0x10
+#define MISC_UNB_PWRMGT_DATA__NB_PRE_SELF_REFRESH__SHIFT 0x4
+#define MISC_UNB_PWRMGT_DATA__NB_REQ_NB_PSTATE_MASK 0x20
+#define MISC_UNB_PWRMGT_DATA__NB_REQ_NB_PSTATE__SHIFT 0x5
+#define MISC_UNB_PWRMGT_DATA__NB_FLUSH_ACK_TOGGLE_MASK 0x40
+#define MISC_UNB_PWRMGT_DATA__NB_FLUSH_ACK_TOGGLE__SHIFT 0x6
+#define MISC_UNB_PWRMGT_DATA__NB_ON_INB_WAKE_ACK_MASK 0x80
+#define MISC_UNB_PWRMGT_DATA__NB_ON_INB_WAKE_ACK__SHIFT 0x7
+#define MISC_UNB_PWRMGT_DATA__NB_ON3_CH0LINK_WAKE_ACK_MASK 0x100
+#define MISC_UNB_PWRMGT_DATA__NB_ON3_CH0LINK_WAKE_ACK__SHIFT 0x8
+#define MISC_UNB_PWRMGT_DATA__NB_ON3_CH1LINK_WAKE_ACK_MASK 0x200
+#define MISC_UNB_PWRMGT_DATA__NB_ON3_CH1LINK_WAKE_ACK__SHIFT 0x9
+#define GNBPM_SMU_PWRMGT_DATA__UNBPM_AllCpusInCC6_MASK 0x1
+#define GNBPM_SMU_PWRMGT_DATA__UNBPM_AllCpusInCC6__SHIFT 0x0
+#define GNBPM_SMU_PWRMGT_DATA__UNBPM_HtcActive_MASK 0x2
+#define GNBPM_SMU_PWRMGT_DATA__UNBPM_HtcActive__SHIFT 

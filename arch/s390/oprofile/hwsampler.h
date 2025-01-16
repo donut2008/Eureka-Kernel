@@ -1,63 +1,105 @@
+VECTOR));
+
+			/*
+			 * Corrected errors will still be corrected, but
+			 * make sure there's a log somewhere that indicates
+			 * something is generating more than we can handle.
+			 */
+			printk(KERN_WARNING "WARNING: Switching to polling CPE handler; error records may be lost\n");
+
+			mod_timer(&cpe_poll_timer, jiffies + MIN_CPE_POLL_INTERVAL);
+
+			/* lock already released, get out now */
+			goto out;
+		} else {
+			cpe_history[index++] = now;
+			if (index == CPE_HISTORY_LENGTH)
+				index = 0;
+		}
+	}
+	spin_unlock(&cpe_history_lock);
+out:
+	/* Get the CPE error record and log it */
+	ia64_mca_log_sal_error_record(SAL_INFO_TYPE_CPE);
+
+	local_irq_disable();
+
+	return IRQ_HANDLED;
+}
+
+#endif /* CONFIG_ACPI */
+
+#ifdef CONFIG_ACPI
 /*
- * CPUMF HW sampler functions and internal structures
+ * ia64_mca_register_cpev
  *
- *    Copyright IBM Corp. 2010
- *    Author(s): Heinz Graalfs <graalfs@de.ibm.com>
+ *  Register the corrected platform error vector with SAL.
+ *
+ *  Inputs
+ *      cpev        Corrected Platform Error Vector number
+ *
+ *  Outputs
+ *      None
  */
+void
+ia64_mca_register_cpev (int cpev)
+{
+	/* Register the CPE interrupt vector with SAL */
+	struct ia64_sal_retval isrv;
 
-#ifndef HWSAMPLER_H_
-#define HWSAMPLER_H_
+	isrv = ia64_sal_mc_set_params(SAL_MC_PARAM_CPE_INT, SAL_MC_PARAM_MECHANISM_INT, cpev, 0, 0);
+	if (isrv.status) {
+		printk(KERN_ERR "Failed to register Corrected Platform "
+		       "Error interrupt vector with SAL (status %ld)\n", isrv.status);
+		return;
+	}
 
-#include <linux/workqueue.h>
-#include <asm/cpu_mf.h>
+	IA64_MCA_DEBUG("%s: corrected platform error "
+		       "vector %#x registered\n", __func__, cpev);
+}
+#endif /* CONFIG_ACPI */
 
-struct hws_ssctl_request_block     /* SET SAMPLING CONTROLS req block   */
-{ /* bytes 0 - 7  Bit(s) */
-	unsigned int s:1;           /* 0: maximum buffer indicator       */
-	unsigned int h:1;           /* 1: part. level reserved for VM use*/
-	unsigned long b2_53:52;     /* 2-53: zeros                       */
-	unsigned int es:1;          /* 54: sampling enable control       */
-	unsigned int b55_61:7;      /* 55-61: - zeros                    */
-	unsigned int cs:1;          /* 62: sampling activation control   */
-	unsigned int b63:1;         /* 63: zero                          */
-	unsigned long interval;     /* 8-15: sampling interval           */
-	unsigned long tear;         /* 16-23: TEAR contents              */
-	unsigned long dear;         /* 24-31: DEAR contents              */
-	/* 32-63:                                                        */
-	unsigned long rsvrd1;       /* reserved                          */
-	unsigned long rsvrd2;       /* reserved                          */
-	unsigned long rsvrd3;       /* reserved                          */
-	unsigned long rsvrd4;       /* reserved                          */
-};
+/*
+ * ia64_mca_cmc_vector_setup
+ *
+ *  Setup the corrected machine check vector register in the processor.
+ *  (The interrupt is masked on boot. ia64_mca_late_init unmask this.)
+ *  This function is invoked on a per-processor basis.
+ *
+ * Inputs
+ *      None
+ *
+ * Outputs
+ *	None
+ */
+void
+ia64_mca_cmc_vector_setup (void)
+{
+	cmcv_reg_t	cmcv;
 
-struct hws_cpu_buffer {
-	unsigned long first_sdbt;       /* @ of 1st SDB-Table for this CP*/
-	unsigned long worker_entry;
-	unsigned long sample_overflow;  /* taken from SDB ...            */
-	struct hws_qsi_info_block qsi;
-	struct hws_ssctl_request_block ssctl;
-	struct work_struct worker;
-	atomic_t ext_params;
-	unsigned long req_alert;
-	unsigned long loss_of_sample_data;
-	unsigned long invalid_entry_address;
-	unsigned long incorrect_sdbt_entry;
-	unsigned long sample_auth_change_alert;
-	unsigned int finish:1;
-	unsigned int oom:1;
-	unsigned int stop_mode:1;
-};
+	cmcv.cmcv_regval	= 0;
+	cmcv.cmcv_mask		= 1;        /* Mask/disable interrupt at first */
+	cmcv.cmcv_vector	= IA64_CMC_VECTOR;
+	ia64_setreg(_IA64_REG_CR_CMCV, cmcv.cmcv_regval);
 
-int hwsampler_setup(void);
-int hwsampler_shutdown(void);
-int hwsampler_allocate(unsigned long sdbt, unsigned long sdb);
-int hwsampler_deallocate(void);
-unsigned long hwsampler_query_min_interval(void);
-unsigned long hwsampler_query_max_interval(void);
-int hwsampler_start_all(unsigned long interval);
-int hwsampler_stop_all(void);
-int hwsampler_deactivate(unsigned int cpu);
-int hwsampler_activate(unsigned int cpu);
-unsigned long hwsampler_get_sample_overflow_count(unsigned int cpu);
+	IA64_MCA_DEBUG("%s: CPU %d corrected machine check vector %#x registered.\n",
+		       __func__, smp_processor_id(), IA64_CMC_VECTOR);
 
-#endif /*HWSAMPLER_H_*/
+	IA64_MCA_DEBUG("%s: CPU %d CMCV = %#016lx\n",
+		       __func__, smp_processor_id(), ia64_getreg(_IA64_REG_CR_CMCV));
+}
+
+/*
+ * ia64_mca_cmc_vector_disable
+ *
+ *  Mask the corrected machine check vector register in the processor.
+ *  This function is invoked on a per-processor basis.
+ *
+ * Inputs
+ *      dummy(unused)
+ *
+ * Outputs
+ *	None
+ */
+static void
+ia64_mc

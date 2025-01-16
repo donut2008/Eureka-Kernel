@@ -1,237 +1,135 @@
-/**
- * dwc3-pci.c - PCI Specific glue layer
- *
- * Copyright (C) 2010-2011 Texas Instruments Incorporated - http://www.ti.com
- *
- * Authors: Felipe Balbi <balbi@ti.com>,
- *	    Sebastian Andrzej Siewior <bigeasy@linutronix.de>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2  of
- * the License as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/pci.h>
-#include <linux/platform_device.h>
-#include <linux/gpio/consumer.h>
-#include <linux/acpi.h>
-
-#include "platform_data.h"
-
-#define PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3		0xabcd
-#define PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3_AXI	0xabce
-#define PCI_DEVICE_ID_SYNOPSYS_HAPSUSB31	0xabcf
-#define PCI_DEVICE_ID_INTEL_BYT			0x0f37
-#define PCI_DEVICE_ID_INTEL_MRFLD		0x119e
-#define PCI_DEVICE_ID_INTEL_BSW			0x22b7
-#define PCI_DEVICE_ID_INTEL_SPTLP		0x9d30
-#define PCI_DEVICE_ID_INTEL_SPTH		0xa130
-#define PCI_DEVICE_ID_INTEL_BXT			0x0aaa
-#define PCI_DEVICE_ID_INTEL_APL			0x5aaa
-#define PCI_DEVICE_ID_INTEL_KBP			0xa2b0
-#define PCI_DEVICE_ID_INTEL_GLK			0x31aa
-
-static const struct acpi_gpio_params reset_gpios = { 0, 0, false };
-static const struct acpi_gpio_params cs_gpios = { 1, 0, false };
-
-static const struct acpi_gpio_mapping acpi_dwc3_byt_gpios[] = {
-	{ "reset-gpios", &reset_gpios, 1 },
-	{ "cs-gpios", &cs_gpios, 1 },
-	{ },
-};
-
-static int dwc3_pci_quirks(struct pci_dev *pdev)
-{
-	if (pdev->vendor == PCI_VENDOR_ID_AMD &&
-	    pdev->device == PCI_DEVICE_ID_AMD_NL_USB) {
-		struct dwc3_platform_data pdata;
-
-		memset(&pdata, 0, sizeof(pdata));
-
-		pdata.has_lpm_erratum = true;
-		pdata.lpm_nyet_threshold = 0xf;
-
-		pdata.u2exit_lfps_quirk = true;
-		pdata.u2ss_inp3_quirk = true;
-		pdata.req_p1p2p3_quirk = true;
-		pdata.del_p1p2p3_quirk = true;
-		pdata.del_phy_power_chg_quirk = true;
-		pdata.lfps_filter_quirk = true;
-		pdata.rx_detect_poll_quirk = true;
-
-		pdata.tx_de_emphasis_quirk = true;
-		pdata.tx_de_emphasis = 1;
-
-		/*
-		 * FIXME these quirks should be removed when AMD NL
-		 * taps out
-		 */
-		pdata.disable_scramble_quirk = true;
-		pdata.dis_u3_susphy_quirk = true;
-		pdata.dis_u2_susphy_quirk = true;
-
-		return platform_device_add_data(pci_get_drvdata(pdev), &pdata,
-						sizeof(pdata));
-	}
-
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
-	    pdev->device == PCI_DEVICE_ID_INTEL_BYT) {
-		struct gpio_desc *gpio;
-
-		acpi_dev_add_driver_gpios(ACPI_COMPANION(&pdev->dev),
-					  acpi_dwc3_byt_gpios);
-
-		/*
-		 * These GPIOs will turn on the USB2 PHY. Note that we have to
-		 * put the gpio descriptors again here because the phy driver
-		 * might want to grab them, too.
-		 */
-		gpio = gpiod_get_optional(&pdev->dev, "cs", GPIOD_OUT_LOW);
-		if (IS_ERR(gpio))
-			return PTR_ERR(gpio);
-
-		gpiod_set_value_cansleep(gpio, 1);
-		gpiod_put(gpio);
-
-		gpio = gpiod_get_optional(&pdev->dev, "reset", GPIOD_OUT_LOW);
-		if (IS_ERR(gpio))
-			return PTR_ERR(gpio);
-
-		if (gpio) {
-			gpiod_set_value_cansleep(gpio, 1);
-			gpiod_put(gpio);
-			usleep_range(10000, 11000);
-		}
-	}
-
-	if (pdev->vendor == PCI_VENDOR_ID_SYNOPSYS &&
-	    (pdev->device == PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3 ||
-	     pdev->device == PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3_AXI ||
-	     pdev->device == PCI_DEVICE_ID_SYNOPSYS_HAPSUSB31)) {
-
-		struct dwc3_platform_data pdata;
-
-		memset(&pdata, 0, sizeof(pdata));
-		pdata.usb3_lpm_capable = true;
-		pdata.has_lpm_erratum = true;
-		pdata.dis_enblslpm_quirk = true;
-
-		return platform_device_add_data(pci_get_drvdata(pdev), &pdata,
-						sizeof(pdata));
-	}
-
-	return 0;
-}
-
-static int dwc3_pci_probe(struct pci_dev *pci,
-		const struct pci_device_id *id)
-{
-	struct resource		res[2];
-	struct platform_device	*dwc3;
-	int			ret;
-	struct device		*dev = &pci->dev;
-
-	ret = pcim_enable_device(pci);
-	if (ret) {
-		dev_err(dev, "failed to enable pci device\n");
-		return -ENODEV;
-	}
-
-	pci_set_master(pci);
-
-	dwc3 = platform_device_alloc("dwc3", PLATFORM_DEVID_AUTO);
-	if (!dwc3) {
-		dev_err(dev, "couldn't allocate dwc3 device\n");
-		return -ENOMEM;
-	}
-
-	memset(res, 0x00, sizeof(struct resource) * ARRAY_SIZE(res));
-
-	res[0].start	= pci_resource_start(pci, 0);
-	res[0].end	= pci_resource_end(pci, 0);
-	res[0].name	= "dwc_usb3";
-	res[0].flags	= IORESOURCE_MEM;
-
-	res[1].start	= pci->irq;
-	res[1].name	= "dwc_usb3";
-	res[1].flags	= IORESOURCE_IRQ;
-
-	ret = platform_device_add_resources(dwc3, res, ARRAY_SIZE(res));
-	if (ret) {
-		dev_err(dev, "couldn't add resources to dwc3 device\n");
-		goto err;
-	}
-
-	pci_set_drvdata(pci, dwc3);
-	ret = dwc3_pci_quirks(pci);
-	if (ret)
-		goto err;
-
-	dwc3->dev.parent = dev;
-	ACPI_COMPANION_SET(&dwc3->dev, ACPI_COMPANION(dev));
-
-	ret = platform_device_add(dwc3);
-	if (ret) {
-		dev_err(dev, "failed to register dwc3 device\n");
-		goto err;
-	}
-
-	return 0;
-err:
-	platform_device_put(dwc3);
-	return ret;
-}
-
-static void dwc3_pci_remove(struct pci_dev *pci)
-{
-	acpi_dev_remove_driver_gpios(ACPI_COMPANION(&pci->dev));
-	platform_device_unregister(pci_get_drvdata(pci));
-}
-
-static const struct pci_device_id dwc3_pci_id_table[] = {
-	{
-		PCI_DEVICE(PCI_VENDOR_ID_SYNOPSYS,
-				PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3),
-	},
-	{
-		PCI_DEVICE(PCI_VENDOR_ID_SYNOPSYS,
-				PCI_DEVICE_ID_SYNOPSYS_HAPSUSB3_AXI),
-	},
-	{
-		PCI_DEVICE(PCI_VENDOR_ID_SYNOPSYS,
-				PCI_DEVICE_ID_SYNOPSYS_HAPSUSB31),
-	},
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_BSW), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_BYT), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_MRFLD), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_SPTLP), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_SPTH), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_BXT), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_APL), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_KBP), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_GLK), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_NL_USB), },
-	{  }	/* Terminating Entry */
-};
-MODULE_DEVICE_TABLE(pci, dwc3_pci_id_table);
-
-static struct pci_driver dwc3_pci_driver = {
-	.name		= "dwc3-pci",
-	.id_table	= dwc3_pci_id_table,
-	.probe		= dwc3_pci_probe,
-	.remove		= dwc3_pci_remove,
-};
-
-MODULE_AUTHOR("Felipe Balbi <balbi@ti.com>");
-MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("DesignWare USB3 PCI Glue Layer");
-
-module_pci_driver(dwc3_pci_driver);
+ffffffff
+#define SMU_PM_STATUS_90__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_91__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_91__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_92__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_92__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_93__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_93__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_94__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_94__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_95__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_95__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_96__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_96__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_97__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_97__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_98__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_98__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_99__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_99__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_100__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_100__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_101__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_101__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_102__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_102__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_103__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_103__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_104__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_104__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_105__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_105__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_106__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_106__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_107__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_107__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_108__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_108__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_109__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_109__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_110__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_110__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_111__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_111__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_112__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_112__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_113__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_113__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_114__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_114__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_115__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_115__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_116__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_116__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_117__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_117__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_118__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_118__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_119__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_119__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_120__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_120__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_121__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_121__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_122__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_122__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_123__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_123__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_124__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_124__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_125__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_125__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_126__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_126__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_127__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_127__DATA__SHIFT 0x0
+#define CG_THERMAL_INT_ENA__THERM_INTH_SET_MASK 0x1
+#define CG_THERMAL_INT_ENA__THERM_INTH_SET__SHIFT 0x0
+#define CG_THERMAL_INT_ENA__THERM_INTL_SET_MASK 0x2
+#define CG_THERMAL_INT_ENA__THERM_INTL_SET__SHIFT 0x1
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_SET_MASK 0x4
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_SET__SHIFT 0x2
+#define CG_THERMAL_INT_ENA__THERM_INTH_CLR_MASK 0x8
+#define CG_THERMAL_INT_ENA__THERM_INTH_CLR__SHIFT 0x3
+#define CG_THERMAL_INT_ENA__THERM_INTL_CLR_MASK 0x10
+#define CG_THERMAL_INT_ENA__THERM_INTL_CLR__SHIFT 0x4
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_CLR_MASK 0x20
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_CLR__SHIFT 0x5
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTH_MASK 0xff
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTH__SHIFT 0x0
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTL_MASK 0xff00
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTL__SHIFT 0x8
+#define CG_THERMAL_INT_CTRL__GNB_TEMP_THRESHOLD_MASK 0xff0000
+#define CG_THERMAL_INT_CTRL__GNB_TEMP_THRESHOLD__SHIFT 0x10
+#define CG_THERMAL_INT_CTRL__THERM_INTH_MASK_MASK 0x1000000
+#define CG_THERMAL_INT_CTRL__THERM_INTH_MASK__SHIFT 0x18
+#define CG_THERMAL_INT_CTRL__THERM_INTL_MASK_MASK 0x2000000
+#define CG_THERMAL_INT_CTRL__THERM_INTL_MASK__SHIFT 0x19
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_MASK_MASK 0x4000000
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_MASK__SHIFT 0x1a
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_CNB_MASK_MASK 0x8000000
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_CNB_MASK__SHIFT 0x1b
+#define CG_THERMAL_INT_CTRL__THERM_GNB_HW_ENA_MASK 0x10000000
+#define CG_THERMAL_INT_CTRL__THERM_GNB_HW_ENA__SHIFT 0x1c
+#define CG_THERMAL_INT_STATUS__THERM_INTH_DETECT_MASK 0x1
+#define CG_THERMAL_INT_STATUS__THERM_INTH_DETECT__SHIFT 0x0
+#define CG_THERMAL_INT_STATUS__THERM_INTL_DETECT_MASK 0x2
+#define CG_THERMAL_INT_STATUS__THERM_INTL_DETECT__SHIFT 0x1
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_DETECT_MASK 0x4
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_DETECT__SHIFT 0x2
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_CNB_DETECT_MASK 0x8
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_CNB_DETECT__SHIFT 0x3
+#define CG_THERMAL_CTRL__DPM_EVENT_SRC_MASK 0x7
+#define CG_THERMAL_CTRL__DPM_EVENT_SRC__SHIFT 0x0
+#define CG_THERMAL_CTRL__THERM_INC_CLK_MASK 0x8
+#define CG_THERMAL_CTRL__THERM_INC_CLK__SHIFT 0x3
+#define CG_THERMAL_CTRL__SPARE_MASK 0x3ff0
+#define CG_THERMAL_CTRL__SPARE__SHIFT 0x4
+#define CG_THERMAL_CTRL__DIG_THERM_DPM_MASK 0x3fc000
+#define CG_THERMAL_CTRL__DIG_THERM_DPM__SHIFT 0xe
+#define CG_THERMAL_CTRL__RESERVED_MASK 0x1c00000
+#define CG_THERMAL_CTRL__RESERVED__SHIFT 0x16
+#define CG_THERMAL_CTRL__CTF_PAD_POLARITY_MASK 0x2000000
+#define CG_THERMAL_CTRL__CTF_PAD_POLARITY__SHIFT 0x19
+#define CG_THERMAL_CTRL__CTF_PAD_EN_MASK 0x4000000
+#define CG_THERMAL_CTRL__CTF_PAD_EN__SHIFT 0x1a
+#define CG_THERMAL_STATUS__SPARE_MASK 0x1ff
+#define CG_THERMAL_STATUS__SPARE__SHIFT 0x0
+#define CG_THERMAL_STATUS__FDO_PWM_DUTY_MASK 0x1fe00
+#define CG_THERMAL_STATUS__FDO_PWM_DUTY__SHIFT 0x9
+#define CG_THERMAL_STATUS__THERM_ALERT_MASK 0x20000
+#define CG_THERMAL_STATUS__THERM_ALERT__SHIFT 0x11
+#define CG_THERMAL_STATUS__GEN_STATUS_MASK 0x3c0000
+#define CG_THERMAL_STATUS__GEN_STATUS__SHIFT 0x12
+#define CG_THERMAL_INT__DIG_THERM_CTF_

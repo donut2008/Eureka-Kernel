@@ -1,34 +1,33 @@
-#
-# C2 port devices
-#
+et_last_connected_port_to_mstb(mstb->port_parent->parent);
+}
 
-menuconfig C2PORT
-	tristate "Silicon Labs C2 port support"
-	default n
-	help
-	  This option enables support for Silicon Labs C2 port used to
-	  program Silicon micro controller chips (and other 8051 compatible).
+static struct drm_dp_mst_branch *drm_dp_get_last_connected_port_and_mstb(struct drm_dp_mst_topology_mgr *mgr,
+									 struct drm_dp_mst_branch *mstb,
+									 int *port_num)
+{
+	struct drm_dp_mst_branch *rmstb = NULL;
+	struct drm_dp_mst_port *found_port;
+	mutex_lock(&mgr->lock);
+	if (mgr->mst_primary) {
+		found_port = drm_dp_get_last_connected_port_to_mstb(mstb);
 
-	  If your board have no such micro controllers you don't need this
-	  interface at all.
+		if (found_port) {
+			rmstb = found_port->parent;
+			kref_get(&rmstb->kref);
+			*port_num = found_port->port_num;
+		}
+	}
+	mutex_unlock(&mgr->lock);
+	return rmstb;
+}
 
-	  To compile this driver as a module, choose M here: the module will
-	  be called c2port_core. Note that you also need a client module
-	  usually called c2port-*.
+static int drm_dp_payload_send_msg(struct drm_dp_mst_topology_mgr *mgr,
+				   struct drm_dp_mst_port *port,
+				   int id,
+				   int pbn)
+{
+	struct drm_dp_sideband_msg_tx *txmsg;
+	struct drm_dp_mst_branch *mstb;
+	int len, ret, port_num;
 
-	  If you are not sure, say N here.
-
-if C2PORT
-
-config C2PORT_DURAMAR_2150
-	tristate "C2 port support for Eurotech's Duramar 2150"
-	depends on X86
-	default n
-	help
-	  This option enables C2 support for the Eurotech's Duramar 2150
-	  on board micro controller.
-
-	  To compile this driver as a module, choose M here: the module will
-	  be called c2port-duramar2150.
-
-endif # C2PORT
+	port = drm_dp_get_validated_por

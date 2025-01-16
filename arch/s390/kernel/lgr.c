@@ -1,186 +1,149 @@
 /*
- * Linux Guest Relocation (LGR) detection
+ * arch/ia64/kernel/entry.S
  *
- * Copyright IBM Corp. 2012
- * Author(s): Michael Holzheu <holzheu@linux.vnet.ibm.com>
+ * Kernel entry points.
+ *
+ * Copyright (C) 1998-2003, 2005 Hewlett-Packard Co
+ *	David Mosberger-Tang <davidm@hpl.hp.com>
+ * Copyright (C) 1999, 2002-2003
+ *	Asit Mallick <Asit.K.Mallick@intel.com>
+ * 	Don Dugger <Don.Dugger@intel.com>
+ *	Suresh Siddha <suresh.b.siddha@intel.com>
+ *	Fenghua Yu <fenghua.yu@intel.com>
+ * Copyright (C) 1999 VA Linux Systems
+ * Copyright (C) 1999 Walt Drummond <drummond@valinux.com>
+ */
+/*
+ * ia64_switch_to now places correct virtual mapping in in TR2 for
+ * kernel stack. This allows us to handle interrupts without changing
+ * to physical mode.
+ *
+ * Jonathan Nicklin	<nicklin@missioncriticallinux.com>
+ * Patrick O'Rourke	<orourke@missioncriticallinux.com>
+ * 11/07/2000
+ */
+/*
+ * Copyright (c) 2008 Isaku Yamahata <yamahata at valinux co jp>
+ *                    VA Linux Systems Japan K.K.
+ *                    pv_ops.
+ */
+/*
+ * Global (preserved) predicate usage on syscall entry/exit path:
+ *
+ *	pKStk:		See entry.h.
+ *	pUStk:		See entry.h.
+ *	pSys:		See entry.h.
+ *	pNonSys:	!pSys
  */
 
-#include <linux/module.h>
-#include <linux/timer.h>
-#include <linux/slab.h>
-#include <asm/facility.h>
-#include <asm/sysinfo.h>
-#include <asm/ebcdic.h>
-#include <asm/debug.h>
-#include <asm/ipl.h>
 
-#define LGR_TIMER_INTERVAL_SECS (30 * 60)
-#define VM_LEVEL_MAX 2 /* Maximum is 8, but we only record two levels */
+#include <asm/asmmacro.h>
+#include <asm/cache.h>
+#include <asm/errno.h>
+#include <asm/kregs.h>
+#include <asm/asm-offsets.h>
+#include <asm/pgtable.h>
+#include <asm/percpu.h>
+#include <asm/processor.h>
+#include <asm/thread_info.h>
+#include <asm/unistd.h>
+#include <asm/ftrace.h>
+
+#include "minstate.h"
+
+	/*
+	 * execve() is special because in case of success, we need to
+	 * setup a null register window frame.
+	 */
+ENTRY(ia64_execve)
+	/*
+	 * Allocate 8 input registers since ptrace() may clobber them
+	 */
+	.prologue ASM_UNW_PRLG_RP|ASM_UNW_PRLG_PFS, ASM_UNW_PRLG_GRSAVE(8)
+	alloc loc1=ar.pfs,8,2,3,0
+	mov loc0=rp
+	.body
+	mov out0=in0			// filename
+	;;				// stop bit between alloc and call
+	mov out1=in1			// argv
+	mov out2=in2			// envp
+	br.call.sptk.many rp=sys_execve
+.ret0:
+	cmp4.ge p6,p7=r8,r0
+	mov ar.pfs=loc1			// restore ar.pfs
+	sxt4 r8=r8			// return 64-bit result
+	;;
+	stf.spill [sp]=f0
+	mov rp=loc0
+(p6)	mov ar.pfs=r0			// clear ar.pfs on success
+(p7)	br.ret.sptk.many rp
+
+	/*
+	 * In theory, we'd have to zap this state only to prevent leaking of
+	 * security sensitive state (e.g., if current->mm->dumpable is zero).  However,
+	 * this executes in less than 20 cycles even on Itanium, so it's not worth
+	 * optimizing for...).
+	 */
+	mov ar.unat=0; 		mov ar.lc=0
+	mov r4=0;		mov f2=f0;		mov b1=r0
+	mov r5=0;		mov f3=f0;		mov b2=r0
+	mov r6=0;		mov f4=f0;		mov b3=r0
+	mov r7=0;		mov f5=f0;		mov b4=r0
+	ldf.fill f12=[sp];	mov f13=f0;		mov b5=r0
+	ldf.fill f14=[sp];	ldf.fill f15=[sp];	mov f16=f0
+	ldf.fill f17=[sp];	ldf.fill f18=[sp];	mov f19=f0
+	ldf.fill f20=[sp];	ldf.fill f21=[sp];	mov f22=f0
+	ldf.fill f23=[sp];	ldf.fill f24=[sp];	mov f25=f0
+	ldf.fill f26=[sp];	ldf.fill f27=[sp];	mov f28=f0
+	ldf.fill f29=[sp];	ldf.fill f30=[sp];	mov f31=f0
+	br.ret.sptk.many rp
+END(ia64_execve)
 
 /*
- * LGR info: Contains stfle and stsi data
+ * sys_clone2(u64 flags, u64 ustack_base, u64 ustack_size, u64 parent_tidptr, u64 child_tidptr,
+ *	      u64 tls)
  */
-struct lgr_info {
-	/* Bit field with facility information: 4 DWORDs are stored */
-	u64 stfle_fac_list[4];
-	/* Level of system (1 = CEC, 2 = LPAR, 3 = z/VM */
-	u32 level;
-	/* Level 1: CEC info (stsi 1.1.1) */
-	char manufacturer[16];
-	char type[4];
-	char sequence[16];
-	char plant[4];
-	char model[16];
-	/* Level 2: LPAR info (stsi 2.2.2) */
-	u16 lpar_number;
-	char name[8];
-	/* Level 3: VM info (stsi 3.2.2) */
-	u8 vm_count;
-	struct {
-		char name[8];
-		char cpi[16];
-	} vm[VM_LEVEL_MAX];
-} __packed __aligned(8);
+GLOBAL_ENTRY(sys_clone2)
+	/*
+	 * Allocate 8 input registers since ptrace() may clobber them
+	 */
+	.prologue ASM_UNW_PRLG_RP|ASM_UNW_PRLG_PFS, ASM_UNW_PRLG_GRSAVE(8)
+	alloc r16=ar.pfs,8,2,6,0
+	DO_SAVE_SWITCH_STACK
+	adds r2=PT(R16)+IA64_SWITCH_STACK_SIZE+16,sp
+	mov loc0=rp
+	mov loc1=r16				// save ar.pfs across do_fork
+	.body
+	mov out1=in1
+	mov out2=in2
+	tbit.nz p6,p0=in0,CLONE_SETTLS_BIT
+	mov out3=in3	// parent_tidptr: valid only w/CLONE_PARENT_SETTID
+	;;
+(p6)	st8 [r2]=in5				// store TLS in r16 for copy_thread()
+	mov out4=in4	// child_tidptr:  valid only w/CLONE_CHILD_SETTID or CLONE_CHILD_CLEARTID
+	mov out0=in0				// out0 = clone_flags
+	br.call.sptk.many rp=do_fork
+.ret1:	.restore sp
+	adds sp=IA64_SWITCH_STACK_SIZE,sp	// pop the switch stack
+	mov ar.pfs=loc1
+	mov rp=loc0
+	br.ret.sptk.many rp
+END(sys_clone2)
 
 /*
- * LGR globals
+ * sys_clone(u64 flags, u64 ustack_base, u64 parent_tidptr, u64 child_tidptr, u64 tls)
+ *	Deprecated.  Use sys_clone2() instead.
  */
-static char lgr_page[PAGE_SIZE] __aligned(PAGE_SIZE);
-static struct lgr_info lgr_info_last;
-static struct lgr_info lgr_info_cur;
-static struct debug_info *lgr_dbf;
-
-/*
- * Copy buffer and then convert it to ASCII
- */
-static void cpascii(char *dst, char *src, int size)
-{
-	memcpy(dst, src, size);
-	EBCASC(dst, size);
-}
-
-/*
- * Fill LGR info with 1.1.1 stsi data
- */
-static void lgr_stsi_1_1_1(struct lgr_info *lgr_info)
-{
-	struct sysinfo_1_1_1 *si = (void *) lgr_page;
-
-	if (stsi(si, 1, 1, 1))
-		return;
-	cpascii(lgr_info->manufacturer, si->manufacturer,
-		sizeof(si->manufacturer));
-	cpascii(lgr_info->type, si->type, sizeof(si->type));
-	cpascii(lgr_info->model, si->model, sizeof(si->model));
-	cpascii(lgr_info->sequence, si->sequence, sizeof(si->sequence));
-	cpascii(lgr_info->plant, si->plant, sizeof(si->plant));
-}
-
-/*
- * Fill LGR info with 2.2.2 stsi data
- */
-static void lgr_stsi_2_2_2(struct lgr_info *lgr_info)
-{
-	struct sysinfo_2_2_2 *si = (void *) lgr_page;
-
-	if (stsi(si, 2, 2, 2))
-		return;
-	cpascii(lgr_info->name, si->name, sizeof(si->name));
-	memcpy(&lgr_info->lpar_number, &si->lpar_number,
-	       sizeof(lgr_info->lpar_number));
-}
-
-/*
- * Fill LGR info with 3.2.2 stsi data
- */
-static void lgr_stsi_3_2_2(struct lgr_info *lgr_info)
-{
-	struct sysinfo_3_2_2 *si = (void *) lgr_page;
-	int i;
-
-	if (stsi(si, 3, 2, 2))
-		return;
-	for (i = 0; i < min_t(u8, si->count, VM_LEVEL_MAX); i++) {
-		cpascii(lgr_info->vm[i].name, si->vm[i].name,
-			sizeof(si->vm[i].name));
-		cpascii(lgr_info->vm[i].cpi, si->vm[i].cpi,
-			sizeof(si->vm[i].cpi));
-	}
-	lgr_info->vm_count = si->count;
-}
-
-/*
- * Fill LGR info with current data
- */
-static void lgr_info_get(struct lgr_info *lgr_info)
-{
-	int level;
-
-	memset(lgr_info, 0, sizeof(*lgr_info));
-	stfle(lgr_info->stfle_fac_list, ARRAY_SIZE(lgr_info->stfle_fac_list));
-	level = stsi(NULL, 0, 0, 0);
-	lgr_info->level = level;
-	if (level >= 1)
-		lgr_stsi_1_1_1(lgr_info);
-	if (level >= 2)
-		lgr_stsi_2_2_2(lgr_info);
-	if (level >= 3)
-		lgr_stsi_3_2_2(lgr_info);
-}
-
-/*
- * Check if LGR info has changed and if yes log new LGR info to s390dbf
- */
-void lgr_info_log(void)
-{
-	static DEFINE_SPINLOCK(lgr_info_lock);
-	unsigned long flags;
-
-	if (!spin_trylock_irqsave(&lgr_info_lock, flags))
-		return;
-	lgr_info_get(&lgr_info_cur);
-	if (memcmp(&lgr_info_last, &lgr_info_cur, sizeof(lgr_info_cur)) != 0) {
-		debug_event(lgr_dbf, 1, &lgr_info_cur, sizeof(lgr_info_cur));
-		lgr_info_last = lgr_info_cur;
-	}
-	spin_unlock_irqrestore(&lgr_info_lock, flags);
-}
-EXPORT_SYMBOL_GPL(lgr_info_log);
-
-static void lgr_timer_set(void);
-
-/*
- * LGR timer callback
- */
-static void lgr_timer_fn(unsigned long ignored)
-{
-	lgr_info_log();
-	lgr_timer_set();
-}
-
-static struct timer_list lgr_timer =
-	TIMER_DEFERRED_INITIALIZER(lgr_timer_fn, 0, 0);
-
-/*
- * Setup next LGR timer
- */
-static void lgr_timer_set(void)
-{
-	mod_timer(&lgr_timer, jiffies + LGR_TIMER_INTERVAL_SECS * HZ);
-}
-
-/*
- * Initialize LGR: Add s390dbf, write initial lgr_info and setup timer
- */
-static int __init lgr_init(void)
-{
-	lgr_dbf = debug_register("lgr", 1, 1, sizeof(struct lgr_info));
-	if (!lgr_dbf)
-		return -ENOMEM;
-	debug_register_view(lgr_dbf, &debug_hex_ascii_view);
-	lgr_info_get(&lgr_info_last);
-	debug_event(lgr_dbf, 1, &lgr_info_last, sizeof(lgr_info_last));
-	lgr_timer_set();
-	return 0;
-}
-module_init(lgr_init);
+GLOBAL_ENTRY(sys_clone)
+	/*
+	 * Allocate 8 input registers since ptrace() may clobber them
+	 */
+	.prologue ASM_UNW_PRLG_RP|ASM_UNW_PRLG_PFS, ASM_UNW_PRLG_GRSAVE(8)
+	alloc r16=ar.pfs,8,2,6,0
+	DO_SAVE_SWITCH_STACK
+	adds r2=PT(R16)+IA64_SWITCH_STACK_SIZE+16,sp
+	mov loc0=rp
+	mov loc1=r16				// save ar.pfs across do_fork
+	.body
+	mov out1=in1
+	mov out2=16				// stacksize (compensates for 16-byte scratch a

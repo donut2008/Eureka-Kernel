@@ -1,241 +1,92 @@
-/*
- * bcache stats code
- *
- * Copyright 2012 Google, Inc.
- */
-
-#include "bcache.h"
-#include "stats.h"
-#include "btree.h"
-#include "sysfs.h"
-
-/*
- * We keep absolute totals of various statistics, and addionally a set of three
- * rolling averages.
- *
- * Every so often, a timer goes off and rescales the rolling averages.
- * accounting_rescale[] is how many times the timer has to go off before we
- * rescale each set of numbers; that gets us half lives of 5 minutes, one hour,
- * and one day.
- *
- * accounting_delay is how often the timer goes off - 22 times in 5 minutes,
- * and accounting_weight is what we use to rescale:
- *
- * pow(31 / 32, 22) ~= 1/2
- *
- * So that we don't have to increment each set of numbers every time we (say)
- * get a cache hit, we increment a single atomic_t in acc->collector, and when
- * the rescale function runs it resets the atomic counter to 0 and adds its
- * old value to each of the exported numbers.
- *
- * To reduce rounding error, the numbers in struct cache_stats are all
- * stored left shifted by 16, and scaled back in the sysfs show() function.
- */
-
-static const unsigned DAY_RESCALE		= 288;
-static const unsigned HOUR_RESCALE		= 12;
-static const unsigned FIVE_MINUTE_RESCALE	= 1;
-static const unsigned accounting_delay		= (HZ * 300) / 22;
-static const unsigned accounting_weight		= 32;
-
-/* sysfs reading/writing */
-
-read_attribute(cache_hits);
-read_attribute(cache_misses);
-read_attribute(cache_bypass_hits);
-read_attribute(cache_bypass_misses);
-read_attribute(cache_hit_ratio);
-read_attribute(cache_readaheads);
-read_attribute(cache_miss_collisions);
-read_attribute(bypassed);
-
-SHOW(bch_stats)
-{
-	struct cache_stats *s =
-		container_of(kobj, struct cache_stats, kobj);
-#define var(stat)		(s->stat >> 16)
-	var_print(cache_hits);
-	var_print(cache_misses);
-	var_print(cache_bypass_hits);
-	var_print(cache_bypass_misses);
-
-	sysfs_print(cache_hit_ratio,
-		    DIV_SAFE(var(cache_hits) * 100,
-			     var(cache_hits) + var(cache_misses)));
-
-	var_print(cache_readaheads);
-	var_print(cache_miss_collisions);
-	sysfs_hprint(bypassed,	var(sectors_bypassed) << 9);
-#undef var
-	return 0;
-}
-
-STORE(bch_stats)
-{
-	return size;
-}
-
-static void bch_stats_release(struct kobject *k)
-{
-}
-
-static struct attribute *bch_stats_files[] = {
-	&sysfs_cache_hits,
-	&sysfs_cache_misses,
-	&sysfs_cache_bypass_hits,
-	&sysfs_cache_bypass_misses,
-	&sysfs_cache_hit_ratio,
-	&sysfs_cache_readaheads,
-	&sysfs_cache_miss_collisions,
-	&sysfs_bypassed,
-	NULL
-};
-static KTYPE(bch_stats);
-
-int bch_cache_accounting_add_kobjs(struct cache_accounting *acc,
-				   struct kobject *parent)
-{
-	int ret = kobject_add(&acc->total.kobj, parent,
-			      "stats_total");
-	ret = ret ?: kobject_add(&acc->five_minute.kobj, parent,
-				 "stats_five_minute");
-	ret = ret ?: kobject_add(&acc->hour.kobj, parent,
-				 "stats_hour");
-	ret = ret ?: kobject_add(&acc->day.kobj, parent,
-				 "stats_day");
-	return ret;
-}
-
-void bch_cache_accounting_clear(struct cache_accounting *acc)
-{
-	memset(&acc->total.cache_hits,
-	       0,
-	       sizeof(unsigned long) * 7);
-}
-
-void bch_cache_accounting_destroy(struct cache_accounting *acc)
-{
-	kobject_put(&acc->total.kobj);
-	kobject_put(&acc->five_minute.kobj);
-	kobject_put(&acc->hour.kobj);
-	kobject_put(&acc->day.kobj);
-
-	atomic_set(&acc->closing, 1);
-	if (del_timer_sync(&acc->timer))
-		closure_return(&acc->cl);
-}
-
-/* EWMA scaling */
-
-static void scale_stat(unsigned long *stat)
-{
-	*stat =  ewma_add(*stat, 0, accounting_weight, 0);
-}
-
-static void scale_stats(struct cache_stats *stats, unsigned long rescale_at)
-{
-	if (++stats->rescale == rescale_at) {
-		stats->rescale = 0;
-		scale_stat(&stats->cache_hits);
-		scale_stat(&stats->cache_misses);
-		scale_stat(&stats->cache_bypass_hits);
-		scale_stat(&stats->cache_bypass_misses);
-		scale_stat(&stats->cache_readaheads);
-		scale_stat(&stats->cache_miss_collisions);
-		scale_stat(&stats->sectors_bypassed);
-	}
-}
-
-static void scale_accounting(unsigned long data)
-{
-	struct cache_accounting *acc = (struct cache_accounting *) data;
-
-#define move_stat(name) do {						\
-	unsigned t = atomic_xchg(&acc->collector.name, 0);		\
-	t <<= 16;							\
-	acc->five_minute.name += t;					\
-	acc->hour.name += t;						\
-	acc->day.name += t;						\
-	acc->total.name += t;						\
-} while (0)
-
-	move_stat(cache_hits);
-	move_stat(cache_misses);
-	move_stat(cache_bypass_hits);
-	move_stat(cache_bypass_misses);
-	move_stat(cache_readaheads);
-	move_stat(cache_miss_collisions);
-	move_stat(sectors_bypassed);
-
-	scale_stats(&acc->total, 0);
-	scale_stats(&acc->day, DAY_RESCALE);
-	scale_stats(&acc->hour, HOUR_RESCALE);
-	scale_stats(&acc->five_minute, FIVE_MINUTE_RESCALE);
-
-	acc->timer.expires += accounting_delay;
-
-	if (!atomic_read(&acc->closing))
-		add_timer(&acc->timer);
-	else
-		closure_return(&acc->cl);
-}
-
-static void mark_cache_stats(struct cache_stat_collector *stats,
-			     bool hit, bool bypass)
-{
-	if (!bypass)
-		if (hit)
-			atomic_inc(&stats->cache_hits);
-		else
-			atomic_inc(&stats->cache_misses);
-	else
-		if (hit)
-			atomic_inc(&stats->cache_bypass_hits);
-		else
-			atomic_inc(&stats->cache_bypass_misses);
-}
-
-void bch_mark_cache_accounting(struct cache_set *c, struct bcache_device *d,
-			       bool hit, bool bypass)
-{
-	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
-	mark_cache_stats(&dc->accounting.collector, hit, bypass);
-	mark_cache_stats(&c->accounting.collector, hit, bypass);
-}
-
-void bch_mark_cache_readahead(struct cache_set *c, struct bcache_device *d)
-{
-	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
-	atomic_inc(&dc->accounting.collector.cache_readaheads);
-	atomic_inc(&c->accounting.collector.cache_readaheads);
-}
-
-void bch_mark_cache_miss_collision(struct cache_set *c, struct bcache_device *d)
-{
-	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
-	atomic_inc(&dc->accounting.collector.cache_miss_collisions);
-	atomic_inc(&c->accounting.collector.cache_miss_collisions);
-}
-
-void bch_mark_sectors_bypassed(struct cache_set *c, struct cached_dev *dc,
-			       int sectors)
-{
-	atomic_add(sectors, &dc->accounting.collector.sectors_bypassed);
-	atomic_add(sectors, &c->accounting.collector.sectors_bypassed);
-}
-
-void bch_cache_accounting_init(struct cache_accounting *acc,
-			       struct closure *parent)
-{
-	kobject_init(&acc->total.kobj,		&bch_stats_ktype);
-	kobject_init(&acc->five_minute.kobj,	&bch_stats_ktype);
-	kobject_init(&acc->hour.kobj,		&bch_stats_ktype);
-	kobject_init(&acc->day.kobj,		&bch_stats_ktype);
-
-	closure_init(&acc->cl, parent);
-	init_timer(&acc->timer);
-	acc->timer.expires	= jiffies + accounting_delay;
-	acc->timer.data		= (unsigned long) acc;
-	acc->timer.function	= scale_accounting;
-	add_timer(&acc->timer);
-}
+cArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_13__entries_0_4_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_14__entries_0_4_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_14__entries_0_4_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_15__entries_0_4_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_15__entries_0_4_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_15__entries_0_4_padding_1_MASK 0xff00
+#define MCARB_DRAM_TIMING_TABLE_15__entries_0_4_padding_1__SHIFT 0x8
+#define MCARB_DRAM_TIMING_TABLE_15__entries_0_4_padding_0_MASK 0xff0000
+#define MCARB_DRAM_TIMING_TABLE_15__entries_0_4_padding_0__SHIFT 0x10
+#define MCARB_DRAM_TIMING_TABLE_15__entries_0_4_McArbBurstTime_MASK 0xff000000
+#define MCARB_DRAM_TIMING_TABLE_15__entries_0_4_McArbBurstTime__SHIFT 0x18
+#define MCARB_DRAM_TIMING_TABLE_16__entries_0_5_McArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_16__entries_0_5_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_17__entries_0_5_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_17__entries_0_5_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_18__entries_0_5_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_18__entries_0_5_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_18__entries_0_5_padding_1_MASK 0xff00
+#define MCARB_DRAM_TIMING_TABLE_18__entries_0_5_padding_1__SHIFT 0x8
+#define MCARB_DRAM_TIMING_TABLE_18__entries_0_5_padding_0_MASK 0xff0000
+#define MCARB_DRAM_TIMING_TABLE_18__entries_0_5_padding_0__SHIFT 0x10
+#define MCARB_DRAM_TIMING_TABLE_18__entries_0_5_McArbBurstTime_MASK 0xff000000
+#define MCARB_DRAM_TIMING_TABLE_18__entries_0_5_McArbBurstTime__SHIFT 0x18
+#define MCARB_DRAM_TIMING_TABLE_19__entries_1_0_McArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_19__entries_1_0_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_20__entries_1_0_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_20__entries_1_0_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_21__entries_1_0_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_21__entries_1_0_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_21__entries_1_0_padding_1_MASK 0xff00
+#define MCARB_DRAM_TIMING_TABLE_21__entries_1_0_padding_1__SHIFT 0x8
+#define MCARB_DRAM_TIMING_TABLE_21__entries_1_0_padding_0_MASK 0xff0000
+#define MCARB_DRAM_TIMING_TABLE_21__entries_1_0_padding_0__SHIFT 0x10
+#define MCARB_DRAM_TIMING_TABLE_21__entries_1_0_McArbBurstTime_MASK 0xff000000
+#define MCARB_DRAM_TIMING_TABLE_21__entries_1_0_McArbBurstTime__SHIFT 0x18
+#define MCARB_DRAM_TIMING_TABLE_22__entries_1_1_McArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_22__entries_1_1_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_23__entries_1_1_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_23__entries_1_1_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_24__entries_1_1_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_24__entries_1_1_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_24__entries_1_1_padding_1_MASK 0xff00
+#define MCARB_DRAM_TIMING_TABLE_24__entries_1_1_padding_1__SHIFT 0x8
+#define MCARB_DRAM_TIMING_TABLE_24__entries_1_1_padding_0_MASK 0xff0000
+#define MCARB_DRAM_TIMING_TABLE_24__entries_1_1_padding_0__SHIFT 0x10
+#define MCARB_DRAM_TIMING_TABLE_24__entries_1_1_McArbBurstTime_MASK 0xff000000
+#define MCARB_DRAM_TIMING_TABLE_24__entries_1_1_McArbBurstTime__SHIFT 0x18
+#define MCARB_DRAM_TIMING_TABLE_25__entries_1_2_McArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_25__entries_1_2_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_26__entries_1_2_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_26__entries_1_2_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_27__entries_1_2_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_27__entries_1_2_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_27__entries_1_2_padding_1_MASK 0xff00
+#define MCARB_DRAM_TIMING_TABLE_27__entries_1_2_padding_1__SHIFT 0x8
+#define MCARB_DRAM_TIMING_TABLE_27__entries_1_2_padding_0_MASK 0xff0000
+#define MCARB_DRAM_TIMING_TABLE_27__entries_1_2_padding_0__SHIFT 0x10
+#define MCARB_DRAM_TIMING_TABLE_27__entries_1_2_McArbBurstTime_MASK 0xff000000
+#define MCARB_DRAM_TIMING_TABLE_27__entries_1_2_McArbBurstTime__SHIFT 0x18
+#define MCARB_DRAM_TIMING_TABLE_28__entries_1_3_McArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_28__entries_1_3_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_29__entries_1_3_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_29__entries_1_3_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_30__entries_1_3_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_30__entries_1_3_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_30__entries_1_3_padding_1_MASK 0xff00
+#define MCARB_DRAM_TIMING_TABLE_30__entries_1_3_padding_1__SHIFT 0x8
+#define MCARB_DRAM_TIMING_TABLE_30__entries_1_3_padding_0_MASK 0xff0000
+#define MCARB_DRAM_TIMING_TABLE_30__entries_1_3_padding_0__SHIFT 0x10
+#define MCARB_DRAM_TIMING_TABLE_30__entries_1_3_McArbBurstTime_MASK 0xff000000
+#define MCARB_DRAM_TIMING_TABLE_30__entries_1_3_McArbBurstTime__SHIFT 0x18
+#define MCARB_DRAM_TIMING_TABLE_31__entries_1_4_McArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_31__entries_1_4_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_32__entries_1_4_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_32__entries_1_4_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_33__entries_1_4_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_33__entries_1_4_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_33__entries_1_4_padding_1_MASK 0xff00
+#define MCARB_DRAM_TIMING_TABLE_33__entries_1_4_padding_1__SHIFT 0x8
+#define MCARB_DRAM_TIMING_TABLE_33__entries_1_4_padding_0_MASK 0xff0000
+#define MCARB_DRAM_TIMING_TABLE_33__entries_1_4_padding_0__SHIFT 0x10
+#define MCARB_DRAM_TIMING_TABLE_33__entries_1_4_McArbBurstTime_MASK 0xff000000
+#define MCARB_DRAM_TIMING_TABLE_33__entries_1_4_McArbBurstTime__SHIFT 0x18
+#define MCARB_DRAM_TIMING_TABLE_34__entries_1_5_McArbDramTiming_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_34__entries_1_5_McArbDramTiming__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_35__entries_1_5_McArbDramTiming2_MASK 0xffffffff
+#define MCARB_DRAM_TIMING_TABLE_35__entries_1_5_McArbDramTiming2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_36__entries_1_5_padding_2_MASK 0xff
+#define MCARB_DRAM_TIMING_TABLE_36__entries_1_5_padding_2__SHIFT 0x0
+#define MCARB_DRAM_TIMING_TABLE_36__entries_1_5_padding_1_MASK 0xff00
+#define MCARB_DRA

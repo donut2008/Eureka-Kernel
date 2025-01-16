@@ -1,513 +1,479 @@
-/*
- * Copyright (C) 2011 NXP Semiconductors
- *
- * Code portions referenced from the i2x-pxa and i2c-pnx drivers
- *
- * Make SMBus byte and word transactions work on LPC178x/7x
- * Copyright (c) 2012
- * Alexander Potashev, Emcraft Systems, aspotashev@emcraft.com
- * Anton Protopopov, Emcraft Systems, antonp@emcraft.com
- *
- * Copyright (C) 2015 Joachim Eastwood <manabian@gmail.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- */
-
-#include <linux/clk.h>
-#include <linux/errno.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/platform_device.h>
-#include <linux/sched.h>
-#include <linux/time.h>
-
-/* LPC24xx register offsets and bits */
-#define LPC24XX_I2CONSET	0x00
-#define LPC24XX_I2STAT		0x04
-#define LPC24XX_I2DAT		0x08
-#define LPC24XX_I2ADDR		0x0c
-#define LPC24XX_I2SCLH		0x10
-#define LPC24XX_I2SCLL		0x14
-#define LPC24XX_I2CONCLR	0x18
-
-#define LPC24XX_AA		BIT(2)
-#define LPC24XX_SI		BIT(3)
-#define LPC24XX_STO		BIT(4)
-#define LPC24XX_STA		BIT(5)
-#define LPC24XX_I2EN		BIT(6)
-
-#define LPC24XX_STO_AA		(LPC24XX_STO | LPC24XX_AA)
-#define LPC24XX_CLEAR_ALL	(LPC24XX_AA | LPC24XX_SI | LPC24XX_STO | \
-				 LPC24XX_STA | LPC24XX_I2EN)
-
-/* I2C SCL clock has different duty cycle depending on mode */
-#define I2C_STD_MODE_DUTY		46
-#define I2C_FAST_MODE_DUTY		36
-#define I2C_FAST_MODE_PLUS_DUTY		38
-
-/*
- * 26 possible I2C status codes, but codes applicable only
- * to master are listed here and used in this driver
- */
-enum {
-	M_BUS_ERROR		= 0x00,
-	M_START			= 0x08,
-	M_REPSTART		= 0x10,
-	MX_ADDR_W_ACK		= 0x18,
-	MX_ADDR_W_NACK		= 0x20,
-	MX_DATA_W_ACK		= 0x28,
-	MX_DATA_W_NACK		= 0x30,
-	M_DATA_ARB_LOST		= 0x38,
-	MR_ADDR_R_ACK		= 0x40,
-	MR_ADDR_R_NACK		= 0x48,
-	MR_DATA_R_ACK		= 0x50,
-	MR_DATA_R_NACK		= 0x58,
-	M_I2C_IDLE		= 0xf8,
-};
-
-struct lpc2k_i2c {
-	void __iomem		*base;
-	struct clk		*clk;
-	int			irq;
-	wait_queue_head_t	wait;
-	struct i2c_adapter	adap;
-	struct i2c_msg		*msg;
-	int			msg_idx;
-	int			msg_status;
-	int			is_last;
-};
-
-static void i2c_lpc2k_reset(struct lpc2k_i2c *i2c)
-{
-	/* Will force clear all statuses */
-	writel(LPC24XX_CLEAR_ALL, i2c->base + LPC24XX_I2CONCLR);
-	writel(0, i2c->base + LPC24XX_I2ADDR);
-	writel(LPC24XX_I2EN, i2c->base + LPC24XX_I2CONSET);
-}
-
-static int i2c_lpc2k_clear_arb(struct lpc2k_i2c *i2c)
-{
-	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
-
-	/*
-	 * If the transfer needs to abort for some reason, we'll try to
-	 * force a stop condition to clear any pending bus conditions
-	 */
-	writel(LPC24XX_STO, i2c->base + LPC24XX_I2CONSET);
-
-	/* Wait for status change */
-	while (readl(i2c->base + LPC24XX_I2STAT) != M_I2C_IDLE) {
-		if (time_after(jiffies, timeout)) {
-			/* Bus was not idle, try to reset adapter */
-			i2c_lpc2k_reset(i2c);
-			return -EBUSY;
+fter the BTH */
+			ohdr->u.imm_data = wqe->wr.ex.imm_data;
+			hwords += 1;
+			if (wqe->wr.send_flags & IB_SEND_SOLICITED)
+				bth0 |= IB_BTH_SOLICITED;
 		}
-
-		cpu_relax();
-	}
-
-	return 0;
-}
-
-static void i2c_lpc2k_pump_msg(struct lpc2k_i2c *i2c)
-{
-	unsigned char data;
-	u32 status;
-
-	/*
-	 * I2C in the LPC2xxx series is basically a state machine.
-	 * Just run through the steps based on the current status.
-	 */
-	status = readl(i2c->base + LPC24XX_I2STAT);
-
-	switch (status) {
-	case M_START:
-	case M_REPSTART:
-		/* Start bit was just sent out, send out addr and dir */
-		data = i2c->msg->addr << 1;
-		if (i2c->msg->flags & I2C_M_RD)
-			data |= 1;
-
-		writel(data, i2c->base + LPC24XX_I2DAT);
-		writel(LPC24XX_STA, i2c->base + LPC24XX_I2CONCLR);
+		bth2 |= IB_BTH_REQ_ACK;
+		qp->s_cur++;
+		if (qp->s_cur >= qp->s_size)
+			qp->s_cur = 0;
 		break;
 
-	case MX_ADDR_W_ACK:
-	case MX_DATA_W_ACK:
+	case OP(RDMA_READ_RESPONSE_MIDDLE):
 		/*
-		 * Address or data was sent out with an ACK. If there is more
-		 * data to send, send it now
+		 * qp->s_state is normally set to the opcode of the
+		 * last packet constructed for new requests and therefore
+		 * is never set to RDMA read response.
+		 * RDMA_READ_RESPONSE_MIDDLE is used by the ACK processing
+		 * thread to indicate a RDMA read needs to be restarted from
+		 * an earlier PSN without interferring with the sending thread.
+		 * See qib_restart_rc().
 		 */
-		if (i2c->msg_idx < i2c->msg->len) {
-			writel(i2c->msg->buf[i2c->msg_idx],
-			       i2c->base + LPC24XX_I2DAT);
-		} else if (i2c->is_last) {
-			/* Last message, send stop */
-			writel(LPC24XX_STO_AA, i2c->base + LPC24XX_I2CONSET);
-			writel(LPC24XX_SI, i2c->base + LPC24XX_I2CONCLR);
-			i2c->msg_status = 0;
-			disable_irq_nosync(i2c->irq);
-		} else {
-			i2c->msg_status = 0;
-			disable_irq_nosync(i2c->irq);
-		}
-
-		i2c->msg_idx++;
-		break;
-
-	case MR_ADDR_R_ACK:
-		/* Receive first byte from slave */
-		if (i2c->msg->len == 1) {
-			/* Last byte, return NACK */
-			writel(LPC24XX_AA, i2c->base + LPC24XX_I2CONCLR);
-		} else {
-			/* Not last byte, return ACK */
-			writel(LPC24XX_AA, i2c->base + LPC24XX_I2CONSET);
-		}
-
-		writel(LPC24XX_STA, i2c->base + LPC24XX_I2CONCLR);
-		break;
-
-	case MR_DATA_R_NACK:
-		/*
-		 * The I2C shows NACK status on reads, so we need to accept
-		 * the NACK as an ACK here. This should be ok, as the real
-		 * BACK would of been caught on the address write.
-		 */
-	case MR_DATA_R_ACK:
-		/* Data was received */
-		if (i2c->msg_idx < i2c->msg->len) {
-			i2c->msg->buf[i2c->msg_idx] =
-					readl(i2c->base + LPC24XX_I2DAT);
-		}
-
-		/* If transfer is done, send STOP */
-		if (i2c->msg_idx >= i2c->msg->len - 1 && i2c->is_last) {
-			writel(LPC24XX_STO_AA, i2c->base + LPC24XX_I2CONSET);
-			writel(LPC24XX_SI, i2c->base + LPC24XX_I2CONCLR);
-			i2c->msg_status = 0;
-		}
-
-		/* Message is done */
-		if (i2c->msg_idx >= i2c->msg->len - 1) {
-			i2c->msg_status = 0;
-			disable_irq_nosync(i2c->irq);
-		}
-
-		/*
-		 * One pre-last data input, send NACK to tell the slave that
-		 * this is going to be the last data byte to be transferred.
-		 */
-		if (i2c->msg_idx >= i2c->msg->len - 2) {
-			/* One byte left to receive - NACK */
-			writel(LPC24XX_AA, i2c->base + LPC24XX_I2CONCLR);
-		} else {
-			/* More than one byte left to receive - ACK */
-			writel(LPC24XX_AA, i2c->base + LPC24XX_I2CONSET);
-		}
-
-		writel(LPC24XX_STA, i2c->base + LPC24XX_I2CONCLR);
-		i2c->msg_idx++;
-		break;
-
-	case MX_ADDR_W_NACK:
-	case MX_DATA_W_NACK:
-	case MR_ADDR_R_NACK:
-		/* NACK processing is done */
-		writel(LPC24XX_STO_AA, i2c->base + LPC24XX_I2CONSET);
-		i2c->msg_status = -ENXIO;
-		disable_irq_nosync(i2c->irq);
-		break;
-
-	case M_DATA_ARB_LOST:
-		/* Arbitration lost */
-		i2c->msg_status = -EAGAIN;
-
-		/* Release the I2C bus */
-		writel(LPC24XX_STA | LPC24XX_STO, i2c->base + LPC24XX_I2CONCLR);
-		disable_irq_nosync(i2c->irq);
-		break;
-
-	default:
-		/* Unexpected statuses */
-		i2c->msg_status = -EIO;
-		disable_irq_nosync(i2c->irq);
+		len = ((qp->s_psn - wqe->psn) & QIB_PSN_MASK) * pmtu;
+		ohdr->u.rc.reth.vaddr =
+			cpu_to_be64(wqe->rdma_wr.remote_addr + len);
+		ohdr->u.rc.reth.rkey =
+			cpu_to_be32(wqe->rdma_wr.rkey);
+		ohdr->u.rc.reth.length = cpu_to_be32(wqe->length - len);
+		qp->s_state = OP(RDMA_READ_REQUEST);
+		hwords += sizeof(ohdr->u.rc.reth) / sizeof(u32);
+		bth2 = (qp->s_psn & QIB_PSN_MASK) | IB_BTH_REQ_ACK;
+		qp->s_psn = wqe->lpsn + 1;
+		ss = NULL;
+		len = 0;
+		qp->s_cur++;
+		if (qp->s_cur == qp->s_size)
+			qp->s_cur = 0;
 		break;
 	}
-
-	/* Exit on failure or all bytes transferred */
-	if (i2c->msg_status != -EBUSY)
-		wake_up(&i2c->wait);
-
-	/*
-	 * If `msg_status` is zero, then `lpc2k_process_msg()`
-	 * is responsible for clearing the SI flag.
-	 */
-	if (i2c->msg_status != 0)
-		writel(LPC24XX_SI, i2c->base + LPC24XX_I2CONCLR);
-}
-
-static int lpc2k_process_msg(struct lpc2k_i2c *i2c, int msgidx)
-{
-	/* A new transfer is kicked off by initiating a start condition */
-	if (!msgidx) {
-		writel(LPC24XX_STA, i2c->base + LPC24XX_I2CONSET);
-	} else {
-		/*
-		 * A multi-message I2C transfer continues where the
-		 * previous I2C transfer left off and uses the
-		 * current condition of the I2C adapter.
-		 */
-		if (unlikely(i2c->msg->flags & I2C_M_NOSTART)) {
-			WARN_ON(i2c->msg->len == 0);
-
-			if (!(i2c->msg->flags & I2C_M_RD)) {
-				/* Start transmit of data */
-				writel(i2c->msg->buf[0],
-				       i2c->base + LPC24XX_I2DAT);
-				i2c->msg_idx++;
-			}
-		} else {
-			/* Start or repeated start */
-			writel(LPC24XX_STA, i2c->base + LPC24XX_I2CONSET);
-		}
-
-		writel(LPC24XX_SI, i2c->base + LPC24XX_I2CONCLR);
+	qp->s_sending_hpsn = bth2;
+	delta = (((int) bth2 - (int) wqe->psn) << 8) >> 8;
+	if (delta && delta % QIB_PSN_CREDIT == 0)
+		bth2 |= IB_BTH_REQ_ACK;
+	if (qp->s_flags & QIB_S_SEND_ONE) {
+		qp->s_flags &= ~QIB_S_SEND_ONE;
+		qp->s_flags |= QIB_S_WAIT_ACK;
+		bth2 |= IB_BTH_REQ_ACK;
 	}
+	qp->s_len -= len;
+	qp->s_hdrwords = hwords;
+	qp->s_cur_sge = ss;
+	qp->s_cur_size = len;
+	qib_make_ruc_header(qp, ohdr, bth0 | (qp->s_state << 24), bth2);
+done:
+	ret = 1;
+	goto unlock;
 
-	enable_irq(i2c->irq);
-
-	/* Wait for transfer completion */
-	if (wait_event_timeout(i2c->wait, i2c->msg_status != -EBUSY,
-			       msecs_to_jiffies(1000)) == 0) {
-		disable_irq_nosync(i2c->irq);
-
-		return -ETIMEDOUT;
-	}
-
-	return i2c->msg_status;
-}
-
-static int i2c_lpc2k_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
-			  int msg_num)
-{
-	struct lpc2k_i2c *i2c = i2c_get_adapdata(adap);
-	int ret, i;
-	u32 stat;
-
-	/* Check for bus idle condition */
-	stat = readl(i2c->base + LPC24XX_I2STAT);
-	if (stat != M_I2C_IDLE) {
-		/* Something is holding the bus, try to clear it */
-		return i2c_lpc2k_clear_arb(i2c);
-	}
-
-	/* Process a single message at a time */
-	for (i = 0; i < msg_num; i++) {
-		/* Save message pointer and current message data index */
-		i2c->msg = &msgs[i];
-		i2c->msg_idx = 0;
-		i2c->msg_status = -EBUSY;
-		i2c->is_last = (i == (msg_num - 1));
-
-		ret = lpc2k_process_msg(i2c, i);
-		if (ret)
-			return ret;
-	}
-
-	return msg_num;
-}
-
-static irqreturn_t i2c_lpc2k_handler(int irq, void *dev_id)
-{
-	struct lpc2k_i2c *i2c = dev_id;
-
-	if (readl(i2c->base + LPC24XX_I2CONSET) & LPC24XX_SI) {
-		i2c_lpc2k_pump_msg(i2c);
-		return IRQ_HANDLED;
-	}
-
-	return IRQ_NONE;
-}
-
-static u32 i2c_lpc2k_functionality(struct i2c_adapter *adap)
-{
-	/* Only emulated SMBus for now */
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static const struct i2c_algorithm i2c_lpc2k_algorithm = {
-	.master_xfer	= i2c_lpc2k_xfer,
-	.functionality	= i2c_lpc2k_functionality,
-};
-
-static int i2c_lpc2k_probe(struct platform_device *pdev)
-{
-	struct lpc2k_i2c *i2c;
-	struct resource *res;
-	u32 bus_clk_rate;
-	u32 scl_high;
-	u32 clkrate;
-	int ret;
-
-	i2c = devm_kzalloc(&pdev->dev, sizeof(*i2c), GFP_KERNEL);
-	if (!i2c)
-		return -ENOMEM;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	i2c->base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(i2c->base))
-		return PTR_ERR(i2c->base);
-
-	i2c->irq = platform_get_irq(pdev, 0);
-	if (i2c->irq < 0) {
-		dev_err(&pdev->dev, "can't get interrupt resource\n");
-		return i2c->irq;
-	}
-
-	init_waitqueue_head(&i2c->wait);
-
-	i2c->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(i2c->clk)) {
-		dev_err(&pdev->dev, "error getting clock\n");
-		return PTR_ERR(i2c->clk);
-	}
-
-	ret = clk_prepare_enable(i2c->clk);
-	if (ret) {
-		dev_err(&pdev->dev, "unable to enable clock.\n");
-		return ret;
-	}
-
-	ret = devm_request_irq(&pdev->dev, i2c->irq, i2c_lpc2k_handler, 0,
-			       dev_name(&pdev->dev), i2c);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "can't request interrupt.\n");
-		goto fail_clk;
-	}
-
-	disable_irq_nosync(i2c->irq);
-
-	/* Place controller is a known state */
-	i2c_lpc2k_reset(i2c);
-
-	ret = of_property_read_u32(pdev->dev.of_node, "clock-frequency",
-				   &bus_clk_rate);
-	if (ret)
-		bus_clk_rate = 100000; /* 100 kHz default clock rate */
-
-	clkrate = clk_get_rate(i2c->clk);
-	if (clkrate == 0) {
-		dev_err(&pdev->dev, "can't get I2C base clock\n");
-		ret = -EINVAL;
-		goto fail_clk;
-	}
-
-	/* Setup I2C dividers to generate clock with proper duty cycle */
-	clkrate = clkrate / bus_clk_rate;
-	if (bus_clk_rate <= 100000)
-		scl_high = (clkrate * I2C_STD_MODE_DUTY) / 100;
-	else if (bus_clk_rate <= 400000)
-		scl_high = (clkrate * I2C_FAST_MODE_DUTY) / 100;
-	else
-		scl_high = (clkrate * I2C_FAST_MODE_PLUS_DUTY) / 100;
-
-	writel(scl_high, i2c->base + LPC24XX_I2SCLH);
-	writel(clkrate - scl_high, i2c->base + LPC24XX_I2SCLL);
-
-	platform_set_drvdata(pdev, i2c);
-
-	i2c_set_adapdata(&i2c->adap, i2c);
-	i2c->adap.owner = THIS_MODULE;
-	strlcpy(i2c->adap.name, "LPC2K I2C adapter", sizeof(i2c->adap.name));
-	i2c->adap.algo = &i2c_lpc2k_algorithm;
-	i2c->adap.dev.parent = &pdev->dev;
-	i2c->adap.dev.of_node = pdev->dev.of_node;
-
-	ret = i2c_add_adapter(&i2c->adap);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "failed to add adapter!\n");
-		goto fail_clk;
-	}
-
-	dev_info(&pdev->dev, "LPC2K I2C adapter\n");
-
-	return 0;
-
-fail_clk:
-	clk_disable_unprepare(i2c->clk);
+bail:
+	qp->s_flags &= ~QIB_S_BUSY;
+unlock:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
 	return ret;
 }
 
-static int i2c_lpc2k_remove(struct platform_device *dev)
+/**
+ * qib_send_rc_ack - Construct an ACK packet and send it
+ * @qp: a pointer to the QP
+ *
+ * This is called from qib_rc_rcv() and qib_kreceive().
+ * Note that RDMA reads and atomics are handled in the
+ * send side QP state and tasklet.
+ */
+void qib_send_rc_ack(struct qib_qp *qp)
 {
-	struct lpc2k_i2c *i2c = platform_get_drvdata(dev);
+	struct qib_devdata *dd = dd_from_ibdev(qp->ibqp.device);
+	struct qib_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	u64 pbc;
+	u16 lrh0;
+	u32 bth0;
+	u32 hwords;
+	u32 pbufn;
+	u32 __iomem *piobuf;
+	struct qib_ib_header hdr;
+	struct qib_other_headers *ohdr;
+	u32 control;
+	unsigned long flags;
 
-	i2c_del_adapter(&i2c->adap);
-	clk_disable_unprepare(i2c->clk);
+	spin_lock_irqsave(&qp->s_lock, flags);
 
-	return 0;
+	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK))
+		goto unlock;
+
+	/* Don't send ACK or NAK if a RDMA read or atomic is pending. */
+	if ((qp->s_flags & QIB_S_RESP_PENDING) || qp->s_rdma_ack_cnt)
+		goto queue_ack;
+
+	/* Construct the header with s_lock held so APM doesn't change it. */
+	ohdr = &hdr.u.oth;
+	lrh0 = QIB_LRH_BTH;
+	/* header size in 32-bit words LRH+BTH+AETH = (8+12+4)/4. */
+	hwords = 6;
+	if (unlikely(qp->remote_ah_attr.ah_flags & IB_AH_GRH)) {
+		hwords += qib_make_grh(ibp, &hdr.u.l.grh,
+				       &qp->remote_ah_attr.grh, hwords, 0);
+		ohdr = &hdr.u.l.oth;
+		lrh0 = QIB_LRH_GRH;
+	}
+	/* read pkey_index w/o lock (its atomic) */
+	bth0 = qib_get_pkey(ibp, qp->s_pkey_index) | (OP(ACKNOWLEDGE) << 24);
+	if (qp->s_mig_state == IB_MIG_MIGRATED)
+		bth0 |= IB_BTH_MIG_REQ;
+	if (qp->r_nak_state)
+		ohdr->u.aeth = cpu_to_be32((qp->r_msn & QIB_MSN_MASK) |
+					    (qp->r_nak_state <<
+					     QIB_AETH_CREDIT_SHIFT));
+	else
+		ohdr->u.aeth = qib_compute_aeth(qp);
+	lrh0 |= ibp->sl_to_vl[qp->remote_ah_attr.sl] << 12 |
+		qp->remote_ah_attr.sl << 4;
+	hdr.lrh[0] = cpu_to_be16(lrh0);
+	hdr.lrh[1] = cpu_to_be16(qp->remote_ah_attr.dlid);
+	hdr.lrh[2] = cpu_to_be16(hwords + SIZE_OF_CRC);
+	hdr.lrh[3] = cpu_to_be16(ppd->lid | qp->remote_ah_attr.src_path_bits);
+	ohdr->bth[0] = cpu_to_be32(bth0);
+	ohdr->bth[1] = cpu_to_be32(qp->remote_qpn);
+	ohdr->bth[2] = cpu_to_be32(qp->r_ack_psn & QIB_PSN_MASK);
+
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+
+	/* Don't try to send ACKs if the link isn't ACTIVE */
+	if (!(ppd->lflags & QIBL_LINKACTIVE))
+		goto done;
+
+	control = dd->f_setpbc_control(ppd, hwords + SIZE_OF_CRC,
+				       qp->s_srate, lrh0 >> 12);
+	/* length is + 1 for the control dword */
+	pbc = ((u64) control << 32) | (hwords + 1);
+
+	piobuf = dd->f_getsendbuf(ppd, pbc, &pbufn);
+	if (!piobuf) {
+		/*
+		 * We are out of PIO buffers at the moment.
+		 * Pass responsibility for sending the ACK to the
+		 * send tasklet so that when a PIO buffer becomes
+		 * available, the ACK is sent ahead of other outgoing
+		 * packets.
+		 */
+		spin_lock_irqsave(&qp->s_lock, flags);
+		goto queue_ack;
+	}
+
+	/*
+	 * Write the pbc.
+	 * We have to flush after the PBC for correctness
+	 * on some cpus or WC buffer can be written out of order.
+	 */
+	writeq(pbc, piobuf);
+
+	if (dd->flags & QIB_PIO_FLUSH_WC) {
+		u32 *hdrp = (u32 *) &hdr;
+
+		qib_flush_wc();
+		qib_pio_copy(piobuf + 2, hdrp, hwords - 1);
+		qib_flush_wc();
+		__raw_writel(hdrp[hwords - 1], piobuf + hwords + 1);
+	} else
+		qib_pio_copy(piobuf + 2, (u32 *) &hdr, hwords);
+
+	if (dd->flags & QIB_USE_SPCL_TRIG) {
+		u32 spcl_off = (pbufn >= dd->piobcnt2k) ? 2047 : 1023;
+
+		qib_flush_wc();
+		__raw_writel(0xaebecede, piobuf + spcl_off);
+	}
+
+	qib_flush_wc();
+	qib_sendbuf_done(dd, pbufn);
+
+	this_cpu_inc(ibp->pmastats->n_unicast_xmit);
+	goto done;
+
+queue_ack:
+	if (ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK) {
+		ibp->n_rc_qacks++;
+		qp->s_flags |= QIB_S_ACK_PENDING | QIB_S_RESP_PENDING;
+		qp->s_nak_state = qp->r_nak_state;
+		qp->s_ack_psn = qp->r_ack_psn;
+
+		/* Schedule the send tasklet. */
+		qib_schedule_send(qp);
+	}
+unlock:
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+done:
+	return;
 }
 
-#ifdef CONFIG_PM
-static int i2c_lpc2k_suspend(struct device *dev)
+/**
+ * reset_psn - reset the QP state to send starting from PSN
+ * @qp: the QP
+ * @psn: the packet sequence number to restart at
+ *
+ * This is called from qib_rc_rcv() to process an incoming RC ACK
+ * for the given QP.
+ * Called at interrupt level with the QP s_lock held.
+ */
+static void reset_psn(struct qib_qp *qp, u32 psn)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct lpc2k_i2c *i2c = platform_get_drvdata(pdev);
+	u32 n = qp->s_acked;
+	struct qib_swqe *wqe = get_swqe_ptr(qp, n);
+	u32 opcode;
 
-	clk_disable(i2c->clk);
+	qp->s_cur = n;
 
-	return 0;
+	/*
+	 * If we are starting the request from the beginning,
+	 * let the normal send code handle initialization.
+	 */
+	if (qib_cmp24(psn, wqe->psn) <= 0) {
+		qp->s_state = OP(SEND_LAST);
+		goto done;
+	}
+
+	/* Find the work request opcode corresponding to the given PSN. */
+	opcode = wqe->wr.opcode;
+	for (;;) {
+		int diff;
+
+		if (++n == qp->s_size)
+			n = 0;
+		if (n == qp->s_tail)
+			break;
+		wqe = get_swqe_ptr(qp, n);
+		diff = qib_cmp24(psn, wqe->psn);
+		if (diff < 0)
+			break;
+		qp->s_cur = n;
+		/*
+		 * If we are starting the request from the beginning,
+		 * let the normal send code handle initialization.
+		 */
+		if (diff == 0) {
+			qp->s_state = OP(SEND_LAST);
+			goto done;
+		}
+		opcode = wqe->wr.opcode;
+	}
+
+	/*
+	 * Set the state to restart in the middle of a request.
+	 * Don't change the s_sge, s_cur_sge, or s_cur_size.
+	 * See qib_make_rc_req().
+	 */
+	switch (opcode) {
+	case IB_WR_SEND:
+	case IB_WR_SEND_WITH_IMM:
+		qp->s_state = OP(RDMA_READ_RESPONSE_FIRST);
+		break;
+
+	case IB_WR_RDMA_WRITE:
+	case IB_WR_RDMA_WRITE_WITH_IMM:
+		qp->s_state = OP(RDMA_READ_RESPONSE_LAST);
+		break;
+
+	case IB_WR_RDMA_READ:
+		qp->s_state = OP(RDMA_READ_RESPONSE_MIDDLE);
+		break;
+
+	default:
+		/*
+		 * This case shouldn't happen since its only
+		 * one PSN per req.
+		 */
+		qp->s_state = OP(SEND_LAST);
+	}
+done:
+	qp->s_psn = psn;
+	/*
+	 * Set QIB_S_WAIT_PSN as qib_rc_complete() may start the timer
+	 * asynchronously before the send tasklet can get scheduled.
+	 * Doing it in qib_make_rc_req() is too late.
+	 */
+	if ((qib_cmp24(qp->s_psn, qp->s_sending_hpsn) <= 0) &&
+	    (qib_cmp24(qp->s_sending_psn, qp->s_sending_hpsn) <= 0))
+		qp->s_flags |= QIB_S_WAIT_PSN;
 }
 
-static int i2c_lpc2k_resume(struct device *dev)
+/*
+ * Back up requester to resend the last un-ACKed request.
+ * The QP r_lock and s_lock should be held and interrupts disabled.
+ */
+static void qib_restart_rc(struct qib_qp *qp, u32 psn, int wait)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct lpc2k_i2c *i2c = platform_get_drvdata(pdev);
+	struct qib_swqe *wqe = get_swqe_ptr(qp, qp->s_acked);
+	struct qib_ibport *ibp;
 
-	clk_enable(i2c->clk);
-	i2c_lpc2k_reset(i2c);
+	if (qp->s_retry == 0) {
+		if (qp->s_mig_state == IB_MIG_ARMED) {
+			qib_migrate_qp(qp);
+			qp->s_retry = qp->s_retry_cnt;
+		} else if (qp->s_last == qp->s_acked) {
+			qib_send_complete(qp, wqe, IB_WC_RETRY_EXC_ERR);
+			qib_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+			return;
+		} else /* XXX need to handle delayed completion */
+			return;
+	} else
+		qp->s_retry--;
 
-	return 0;
+	ibp = to_iport(qp->ibqp.device, qp->port_num);
+	if (wqe->wr.opcode == IB_WR_RDMA_READ)
+		ibp->n_rc_resends++;
+	else
+		ibp->n_rc_resends += (qp->s_psn - psn) & QIB_PSN_MASK;
+
+	qp->s_flags &= ~(QIB_S_WAIT_FENCE | QIB_S_WAIT_RDMAR |
+			 QIB_S_WAIT_SSN_CREDIT | QIB_S_WAIT_PSN |
+			 QIB_S_WAIT_ACK);
+	if (wait)
+		qp->s_flags |= QIB_S_SEND_ONE;
+	reset_psn(qp, psn);
 }
 
-static const struct dev_pm_ops i2c_lpc2k_dev_pm_ops = {
-	.suspend_noirq = i2c_lpc2k_suspend,
-	.resume_noirq = i2c_lpc2k_resume,
-};
+/*
+ * This is called from s_timer for missing responses.
+ */
+static void rc_timeout(unsigned long arg)
+{
+	struct qib_qp *qp = (struct qib_qp *)arg;
+	struct qib_ibport *ibp;
+	unsigned long flags;
 
-#define I2C_LPC2K_DEV_PM_OPS (&i2c_lpc2k_dev_pm_ops)
-#else
-#define I2C_LPC2K_DEV_PM_OPS NULL
-#endif
+	spin_lock_irqsave(&qp->r_lock, flags);
+	spin_lock(&qp->s_lock);
+	if (qp->s_flags & QIB_S_TIMER) {
+		ibp = to_iport(qp->ibqp.device, qp->port_num);
+		ibp->n_rc_timeouts++;
+		qp->s_flags &= ~QIB_S_TIMER;
+		del_timer(&qp->s_timer);
+		qib_restart_rc(qp, qp->s_last_psn + 1, 1);
+		qib_schedule_send(qp);
+	}
+	spin_unlock(&qp->s_lock);
+	spin_unlock_irqrestore(&qp->r_lock, flags);
+}
 
-static const struct of_device_id lpc2k_i2c_match[] = {
-	{ .compatible = "nxp,lpc1788-i2c" },
-	{},
-};
-MODULE_DEVICE_TABLE(of, lpc2k_i2c_match);
+/*
+ * This is called from s_timer for RNR timeouts.
+ */
+void qib_rc_rnr_retry(unsigned long arg)
+{
+	struct qib_qp *qp = (struct qib_qp *)arg;
+	unsigned long flags;
 
-static struct platform_driver i2c_lpc2k_driver = {
-	.probe	= i2c_lpc2k_probe,
-	.remove	= i2c_lpc2k_remove,
-	.driver	= {
-		.name		= "lpc2k-i2c",
-		.pm		= I2C_LPC2K_DEV_PM_OPS,
-		.of_match_table	= lpc2k_i2c_match,
-	},
-};
-module_platform_driver(i2c_lpc2k_driver);
+	spin_lock_irqsave(&qp->s_lock, flags);
+	if (qp->s_flags & QIB_S_WAIT_RNR) {
+		qp->s_flags &= ~QIB_S_WAIT_RNR;
+		del_timer(&qp->s_timer);
+		qib_schedule_send(qp);
+	}
+	spin_unlock_irqrestore(&qp->s_lock, flags);
+}
 
-MODULE_AUTHOR("Kevin Wells <kevin.wells@nxp.com>");
-MODULE_DESCRIPTION("I2C driver for LPC2xxx devices");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:lpc2k-i2c");
+/*
+ * Set qp->s_sending_psn to the next PSN after the given one.
+ * This would be psn+1 except when RDMA reads are present.
+ */
+static void reset_sending_psn(struct qib_qp *qp, u32 psn)
+{
+	struct qib_swqe *wqe;
+	u32 n = qp->s_last;
+
+	/* Find the work request corresponding to the given PSN. */
+	for (;;) {
+		wqe = get_swqe_ptr(qp, n);
+		if (qib_cmp24(psn, wqe->lpsn) <= 0) {
+			if (wqe->wr.opcode == IB_WR_RDMA_READ)
+				qp->s_sending_psn = wqe->lpsn + 1;
+			else
+				qp->s_sending_psn = psn + 1;
+			break;
+		}
+		if (++n == qp->s_size)
+			n = 0;
+		if (n == qp->s_tail)
+			break;
+	}
+}
+
+/*
+ * This should be called with the QP s_lock held and interrupts disabled.
+ */
+void qib_rc_send_complete(struct qib_qp *qp, struct qib_ib_header *hdr)
+{
+	struct qib_other_headers *ohdr;
+	struct qib_swqe *wqe;
+	struct ib_wc wc;
+	unsigned i;
+	u32 opcode;
+	u32 psn;
+
+	if (!(ib_qib_state_ops[qp->state] & QIB_PROCESS_OR_FLUSH_SEND))
+		return;
+
+	/* Find out where the BTH is */
+	if ((be16_to_cpu(hdr->lrh[0]) & 3) == QIB_LRH_BTH)
+		ohdr = &hdr->u.oth;
+	else
+		ohdr = &hdr->u.l.oth;
+
+	opcode = be32_to_cpu(ohdr->bth[0]) >> 24;
+	if (opcode >= OP(RDMA_READ_RESPONSE_FIRST) &&
+	    opcode <= OP(ATOMIC_ACKNOWLEDGE)) {
+		WARN_ON(!qp->s_rdma_ack_cnt);
+		qp->s_rdma_ack_cnt--;
+		return;
+	}
+
+	psn = be32_to_cpu(ohdr->bth[2]);
+	reset_sending_psn(qp, psn);
+
+	/*
+	 * Start timer after a packet requesting an ACK has been sent and
+	 * there are still requests that haven't been acked.
+	 */
+	if ((psn & IB_BTH_REQ_ACK) && qp->s_acked != qp->s_tail &&
+	    !(qp->s_flags & (QIB_S_TIMER | QIB_S_WAIT_RNR | QIB_S_WAIT_PSN)) &&
+	    (ib_qib_state_ops[qp->state] & QIB_PROCESS_RECV_OK))
+		start_timer(qp);
+
+	while (qp->s_last != qp->s_acked) {
+		wqe = get_swqe_ptr(qp, qp->s_last);
+		if (qib_cmp24(wqe->lpsn, qp->s_sending_psn) >= 0 &&
+		    qib_cmp24(qp->s_sending_psn, qp->s_sending_hpsn) <= 0)
+			break;
+		for (i = 0; i < wqe->wr.num_sge; i++) {
+			struct qib_sge *sge = &wqe->sg_list[i];
+
+			qib_put_mr(sge->mr);
+		}
+		/* Post a send completion queue entry if requested. */
+		if (!(qp->s_flags & QIB_S_SIGNAL_REQ_WR) ||
+		    (wqe->wr.send_flags & IB_SEND_SIGNALED)) {
+			memset(&wc, 0, sizeof(wc));
+			wc.wr_id = wqe->wr.wr_id;
+			wc.status = IB_WC_SUCCESS;
+			wc.opcode = ib_qib_wc_opcode[wqe->wr.opcode];
+			wc.byte_len = wqe->length;
+			wc.qp = &qp->ibqp;
+			qib_cq_enter(to_icq(qp->ibqp.send_cq), &wc, 0);
+		}
+		if (++qp->s_last >= qp->s_size)
+			qp->s_last = 0;
+	}
+	/*
+	 * If we were waiting for sends to complete before resending,
+	 * and they are now complete, restart sending.
+	 */
+	if (qp->s_flags & QIB_S_WAIT_PSN &&
+	    qib_cmp24(qp->s_sending_psn, qp->s_sending_hpsn) > 0) {
+		qp->s_flags &= ~QIB_S_WAIT_PSN;
+		qp->s_sending_psn = qp->s_psn;
+		qp->s_sending_hpsn = qp->s_psn - 1;
+		qib_schedule_send(qp);
+	}
+}
+
+static inline void update_last_psn(struct qib_qp *qp, u32 psn)
+{
+	qp->s_last_psn = psn;
+}
+
+/*
+ * Generate a SWQE completion.
+ * This is similar to qib_send_complete but has to check to be sure
+ * that the SGEs are not being referenced if the SWQE is being resent.
+ */
+static struct qib_swqe *do_rc_completion(st

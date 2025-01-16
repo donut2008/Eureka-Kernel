@@ -1,915 +1,747 @@
-/*
- * guest access functions
- *
- * Copyright IBM Corp. 2014
- *
- */
-
-#include <linux/vmalloc.h>
-#include <linux/err.h>
-#include <asm/pgtable.h>
-#include "kvm-s390.h"
-#include "gaccess.h"
-#include <asm/switch_to.h>
-
-union asce {
-	unsigned long val;
-	struct {
-		unsigned long origin : 52; /* Region- or Segment-Table Origin */
-		unsigned long	 : 2;
-		unsigned long g  : 1; /* Subspace Group Control */
-		unsigned long p  : 1; /* Private Space Control */
-		unsigned long s  : 1; /* Storage-Alteration-Event Control */
-		unsigned long x  : 1; /* Space-Switch-Event Control */
-		unsigned long r  : 1; /* Real-Space Control */
-		unsigned long	 : 1;
-		unsigned long dt : 2; /* Designation-Type Control */
-		unsigned long tl : 2; /* Region- or Segment-Table Length */
-	};
-};
-
-enum {
-	ASCE_TYPE_SEGMENT = 0,
-	ASCE_TYPE_REGION3 = 1,
-	ASCE_TYPE_REGION2 = 2,
-	ASCE_TYPE_REGION1 = 3
-};
-
-union region1_table_entry {
-	unsigned long val;
-	struct {
-		unsigned long rto: 52;/* Region-Table Origin */
-		unsigned long	 : 2;
-		unsigned long p  : 1; /* DAT-Protection Bit */
-		unsigned long	 : 1;
-		unsigned long tf : 2; /* Region-Second-Table Offset */
-		unsigned long i  : 1; /* Region-Invalid Bit */
-		unsigned long	 : 1;
-		unsigned long tt : 2; /* Table-Type Bits */
-		unsigned long tl : 2; /* Region-Second-Table Length */
-	};
-};
-
-union region2_table_entry {
-	unsigned long val;
-	struct {
-		unsigned long rto: 52;/* Region-Table Origin */
-		unsigned long	 : 2;
-		unsigned long p  : 1; /* DAT-Protection Bit */
-		unsigned long	 : 1;
-		unsigned long tf : 2; /* Region-Third-Table Offset */
-		unsigned long i  : 1; /* Region-Invalid Bit */
-		unsigned long	 : 1;
-		unsigned long tt : 2; /* Table-Type Bits */
-		unsigned long tl : 2; /* Region-Third-Table Length */
-	};
-};
-
-struct region3_table_entry_fc0 {
-	unsigned long sto: 52;/* Segment-Table Origin */
-	unsigned long	 : 1;
-	unsigned long fc : 1; /* Format-Control */
-	unsigned long p  : 1; /* DAT-Protection Bit */
-	unsigned long	 : 1;
-	unsigned long tf : 2; /* Segment-Table Offset */
-	unsigned long i  : 1; /* Region-Invalid Bit */
-	unsigned long cr : 1; /* Common-Region Bit */
-	unsigned long tt : 2; /* Table-Type Bits */
-	unsigned long tl : 2; /* Segment-Table Length */
-};
-
-struct region3_table_entry_fc1 {
-	unsigned long rfaa : 33; /* Region-Frame Absolute Address */
-	unsigned long	 : 14;
-	unsigned long av : 1; /* ACCF-Validity Control */
-	unsigned long acc: 4; /* Access-Control Bits */
-	unsigned long f  : 1; /* Fetch-Protection Bit */
-	unsigned long fc : 1; /* Format-Control */
-	unsigned long p  : 1; /* DAT-Protection Bit */
-	unsigned long co : 1; /* Change-Recording Override */
-	unsigned long	 : 2;
-	unsigned long i  : 1; /* Region-Invalid Bit */
-	unsigned long cr : 1; /* Common-Region Bit */
-	unsigned long tt : 2; /* Table-Type Bits */
-	unsigned long	 : 2;
-};
-
-union region3_table_entry {
-	unsigned long val;
-	struct region3_table_entry_fc0 fc0;
-	struct region3_table_entry_fc1 fc1;
-	struct {
-		unsigned long	 : 53;
-		unsigned long fc : 1; /* Format-Control */
-		unsigned long	 : 4;
-		unsigned long i  : 1; /* Region-Invalid Bit */
-		unsigned long cr : 1; /* Common-Region Bit */
-		unsigned long tt : 2; /* Table-Type Bits */
-		unsigned long	 : 2;
-	};
-};
-
-struct segment_entry_fc0 {
-	unsigned long pto: 53;/* Page-Table Origin */
-	unsigned long fc : 1; /* Format-Control */
-	unsigned long p  : 1; /* DAT-Protection Bit */
-	unsigned long	 : 3;
-	unsigned long i  : 1; /* Segment-Invalid Bit */
-	unsigned long cs : 1; /* Common-Segment Bit */
-	unsigned long tt : 2; /* Table-Type Bits */
-	unsigned long	 : 2;
-};
-
-struct segment_entry_fc1 {
-	unsigned long sfaa : 44; /* Segment-Frame Absolute Address */
-	unsigned long	 : 3;
-	unsigned long av : 1; /* ACCF-Validity Control */
-	unsigned long acc: 4; /* Access-Control Bits */
-	unsigned long f  : 1; /* Fetch-Protection Bit */
-	unsigned long fc : 1; /* Format-Control */
-	unsigned long p  : 1; /* DAT-Protection Bit */
-	unsigned long co : 1; /* Change-Recording Override */
-	unsigned long	 : 2;
-	unsigned long i  : 1; /* Segment-Invalid Bit */
-	unsigned long cs : 1; /* Common-Segment Bit */
-	unsigned long tt : 2; /* Table-Type Bits */
-	unsigned long	 : 2;
-};
-
-union segment_table_entry {
-	unsigned long val;
-	struct segment_entry_fc0 fc0;
-	struct segment_entry_fc1 fc1;
-	struct {
-		unsigned long	 : 53;
-		unsigned long fc : 1; /* Format-Control */
-		unsigned long	 : 4;
-		unsigned long i  : 1; /* Segment-Invalid Bit */
-		unsigned long cs : 1; /* Common-Segment Bit */
-		unsigned long tt : 2; /* Table-Type Bits */
-		unsigned long	 : 2;
-	};
-};
-
-enum {
-	TABLE_TYPE_SEGMENT = 0,
-	TABLE_TYPE_REGION3 = 1,
-	TABLE_TYPE_REGION2 = 2,
-	TABLE_TYPE_REGION1 = 3
-};
-
-union page_table_entry {
-	unsigned long val;
-	struct {
-		unsigned long pfra : 52; /* Page-Frame Real Address */
-		unsigned long z  : 1; /* Zero Bit */
-		unsigned long i  : 1; /* Page-Invalid Bit */
-		unsigned long p  : 1; /* DAT-Protection Bit */
-		unsigned long co : 1; /* Change-Recording Override */
-		unsigned long	 : 8;
-	};
-};
-
-/*
- * vaddress union in order to easily decode a virtual address into its
- * region first index, region second index etc. parts.
- */
-union vaddress {
-	unsigned long addr;
-	struct {
-		unsigned long rfx : 11;
-		unsigned long rsx : 11;
-		unsigned long rtx : 11;
-		unsigned long sx  : 11;
-		unsigned long px  : 8;
-		unsigned long bx  : 12;
-	};
-	struct {
-		unsigned long rfx01 : 2;
-		unsigned long	    : 9;
-		unsigned long rsx01 : 2;
-		unsigned long	    : 9;
-		unsigned long rtx01 : 2;
-		unsigned long	    : 9;
-		unsigned long sx01  : 2;
-		unsigned long	    : 29;
-	};
-};
-
-/*
- * raddress union which will contain the result (real or absolute address)
- * after a page table walk. The rfaa, sfaa and pfra members are used to
- * simply assign them the value of a region, segment or page table entry.
- */
-union raddress {
-	unsigned long addr;
-	unsigned long rfaa : 33; /* Region-Frame Absolute Address */
-	unsigned long sfaa : 44; /* Segment-Frame Absolute Address */
-	unsigned long pfra : 52; /* Page-Frame Real Address */
-};
-
-union alet {
-	u32 val;
-	struct {
-		u32 reserved : 7;
-		u32 p        : 1;
-		u32 alesn    : 8;
-		u32 alen     : 16;
-	};
-};
-
-union ald {
-	u32 val;
-	struct {
-		u32     : 1;
-		u32 alo : 24;
-		u32 all : 7;
-	};
-};
-
-struct ale {
-	unsigned long i      : 1; /* ALEN-Invalid Bit */
-	unsigned long        : 5;
-	unsigned long fo     : 1; /* Fetch-Only Bit */
-	unsigned long p      : 1; /* Private Bit */
-	unsigned long alesn  : 8; /* Access-List-Entry Sequence Number */
-	unsigned long aleax  : 16; /* Access-List-Entry Authorization Index */
-	unsigned long        : 32;
-	unsigned long        : 1;
-	unsigned long asteo  : 25; /* ASN-Second-Table-Entry Origin */
-	unsigned long        : 6;
-	unsigned long astesn : 32; /* ASTE Sequence Number */
-} __packed;
-
-struct aste {
-	unsigned long i      : 1; /* ASX-Invalid Bit */
-	unsigned long ato    : 29; /* Authority-Table Origin */
-	unsigned long        : 1;
-	unsigned long b      : 1; /* Base-Space Bit */
-	unsigned long ax     : 16; /* Authorization Index */
-	unsigned long atl    : 12; /* Authority-Table Length */
-	unsigned long        : 2;
-	unsigned long ca     : 1; /* Controlled-ASN Bit */
-	unsigned long ra     : 1; /* Reusable-ASN Bit */
-	unsigned long asce   : 64; /* Address-Space-Control Element */
-	unsigned long ald    : 32;
-	unsigned long astesn : 32;
-	/* .. more fields there */
-} __packed;
-
-int ipte_lock_held(struct kvm_vcpu *vcpu)
-{
-	union ipte_control *ic = &vcpu->kvm->arch.sca->ipte_control;
-
-	if (vcpu->arch.sie_block->eca & 1)
-		return ic->kh != 0;
-	return vcpu->kvm->arch.ipte_lock_count != 0;
-}
-
-static void ipte_lock_simple(struct kvm_vcpu *vcpu)
-{
-	union ipte_control old, new, *ic;
-
-	mutex_lock(&vcpu->kvm->arch.ipte_mutex);
-	vcpu->kvm->arch.ipte_lock_count++;
-	if (vcpu->kvm->arch.ipte_lock_count > 1)
-		goto out;
-	ic = &vcpu->kvm->arch.sca->ipte_control;
-	do {
-		old = READ_ONCE(*ic);
-		while (old.k) {
-			cond_resched();
-			old = READ_ONCE(*ic);
-		}
-		new = old;
-		new.k = 1;
-	} while (cmpxchg(&ic->val, old.val, new.val) != old.val);
-out:
-	mutex_unlock(&vcpu->kvm->arch.ipte_mutex);
-}
-
-static void ipte_unlock_simple(struct kvm_vcpu *vcpu)
-{
-	union ipte_control old, new, *ic;
-
-	mutex_lock(&vcpu->kvm->arch.ipte_mutex);
-	vcpu->kvm->arch.ipte_lock_count--;
-	if (vcpu->kvm->arch.ipte_lock_count)
-		goto out;
-	ic = &vcpu->kvm->arch.sca->ipte_control;
-	do {
-		old = READ_ONCE(*ic);
-		new = old;
-		new.k = 0;
-	} while (cmpxchg(&ic->val, old.val, new.val) != old.val);
-	wake_up(&vcpu->kvm->arch.ipte_wq);
-out:
-	mutex_unlock(&vcpu->kvm->arch.ipte_mutex);
-}
-
-static void ipte_lock_siif(struct kvm_vcpu *vcpu)
-{
-	union ipte_control old, new, *ic;
-
-	ic = &vcpu->kvm->arch.sca->ipte_control;
-	do {
-		old = READ_ONCE(*ic);
-		while (old.kg) {
-			cond_resched();
-			old = READ_ONCE(*ic);
-		}
-		new = old;
-		new.k = 1;
-		new.kh++;
-	} while (cmpxchg(&ic->val, old.val, new.val) != old.val);
-}
-
-static void ipte_unlock_siif(struct kvm_vcpu *vcpu)
-{
-	union ipte_control old, new, *ic;
-
-	ic = &vcpu->kvm->arch.sca->ipte_control;
-	do {
-		old = READ_ONCE(*ic);
-		new = old;
-		new.kh--;
-		if (!new.kh)
-			new.k = 0;
-	} while (cmpxchg(&ic->val, old.val, new.val) != old.val);
-	if (!new.kh)
-		wake_up(&vcpu->kvm->arch.ipte_wq);
-}
-
-void ipte_lock(struct kvm_vcpu *vcpu)
-{
-	if (vcpu->arch.sie_block->eca & 1)
-		ipte_lock_siif(vcpu);
-	else
-		ipte_lock_simple(vcpu);
-}
-
-void ipte_unlock(struct kvm_vcpu *vcpu)
-{
-	if (vcpu->arch.sie_block->eca & 1)
-		ipte_unlock_siif(vcpu);
-	else
-		ipte_unlock_simple(vcpu);
-}
-
-static int ar_translation(struct kvm_vcpu *vcpu, union asce *asce, ar_t ar,
-			  int write)
-{
-	union alet alet;
-	struct ale ale;
-	struct aste aste;
-	unsigned long ald_addr, authority_table_addr;
-	union ald ald;
-	int eax, rc;
-	u8 authority_table;
-
-	if (ar >= NUM_ACRS)
-		return -EINVAL;
-
-	save_access_regs(vcpu->run->s.regs.acrs);
-	alet.val = vcpu->run->s.regs.acrs[ar];
-
-	if (ar == 0 || alet.val == 0) {
-		asce->val = vcpu->arch.sie_block->gcr[1];
-		return 0;
-	} else if (alet.val == 1) {
-		asce->val = vcpu->arch.sie_block->gcr[7];
-		return 0;
-	}
-
-	if (alet.reserved)
-		return PGM_ALET_SPECIFICATION;
-
-	if (alet.p)
-		ald_addr = vcpu->arch.sie_block->gcr[5];
-	else
-		ald_addr = vcpu->arch.sie_block->gcr[2];
-	ald_addr &= 0x7fffffc0;
-
-	rc = read_guest_real(vcpu, ald_addr + 16, &ald.val, sizeof(union ald));
-	if (rc)
-		return rc;
-
-	if (alet.alen / 8 > ald.all)
-		return PGM_ALEN_TRANSLATION;
-
-	if (0x7fffffff - ald.alo * 128 < alet.alen * 16)
-		return PGM_ADDRESSING;
-
-	rc = read_guest_real(vcpu, ald.alo * 128 + alet.alen * 16, &ale,
-			     sizeof(struct ale));
-	if (rc)
-		return rc;
-
-	if (ale.i == 1)
-		return PGM_ALEN_TRANSLATION;
-	if (ale.alesn != alet.alesn)
-		return PGM_ALE_SEQUENCE;
-
-	rc = read_guest_real(vcpu, ale.asteo * 64, &aste, sizeof(struct aste));
-	if (rc)
-		return rc;
-
-	if (aste.i)
-		return PGM_ASTE_VALIDITY;
-	if (aste.astesn != ale.astesn)
-		return PGM_ASTE_SEQUENCE;
-
-	if (ale.p == 1) {
-		eax = (vcpu->arch.sie_block->gcr[8] >> 16) & 0xffff;
-		if (ale.aleax != eax) {
-			if (eax / 16 > aste.atl)
-				return PGM_EXTENDED_AUTHORITY;
-
-			authority_table_addr = aste.ato * 4 + eax / 4;
-
-			rc = read_guest_real(vcpu, authority_table_addr,
-					     &authority_table,
-					     sizeof(u8));
-			if (rc)
-				return rc;
-
-			if ((authority_table & (0x40 >> ((eax & 3) * 2))) == 0)
-				return PGM_EXTENDED_AUTHORITY;
-		}
-	}
-
-	if (ale.fo == 1 && write)
-		return PGM_PROTECTION;
-
-	asce->val = aste.asce;
-	return 0;
-}
-
-struct trans_exc_code_bits {
-	unsigned long addr : 52; /* Translation-exception Address */
-	unsigned long fsi  : 2;  /* Access Exception Fetch/Store Indication */
-	unsigned long	   : 6;
-	unsigned long b60  : 1;
-	unsigned long b61  : 1;
-	unsigned long as   : 2;  /* ASCE Identifier */
-};
-
-enum {
-	FSI_UNKNOWN = 0, /* Unknown wether fetch or store */
-	FSI_STORE   = 1, /* Exception was due to store operation */
-	FSI_FETCH   = 2  /* Exception was due to fetch operation */
-};
-
-static int get_vcpu_asce(struct kvm_vcpu *vcpu, union asce *asce,
-			 ar_t ar, int write)
-{
-	int rc;
-	psw_t *psw = &vcpu->arch.sie_block->gpsw;
-	struct kvm_s390_pgm_info *pgm = &vcpu->arch.pgm;
-	struct trans_exc_code_bits *tec_bits;
-
-	memset(pgm, 0, sizeof(*pgm));
-	tec_bits = (struct trans_exc_code_bits *)&pgm->trans_exc_code;
-	tec_bits->fsi = write ? FSI_STORE : FSI_FETCH;
-	tec_bits->as = psw_bits(*psw).as;
-
-	if (!psw_bits(*psw).t) {
-		asce->val = 0;
-		asce->r = 1;
-		return 0;
-	}
-
-	switch (psw_bits(vcpu->arch.sie_block->gpsw).as) {
-	case PSW_AS_PRIMARY:
-		asce->val = vcpu->arch.sie_block->gcr[1];
-		return 0;
-	case PSW_AS_SECONDARY:
-		asce->val = vcpu->arch.sie_block->gcr[7];
-		return 0;
-	case PSW_AS_HOME:
-		asce->val = vcpu->arch.sie_block->gcr[13];
-		return 0;
-	case PSW_AS_ACCREG:
-		rc = ar_translation(vcpu, asce, ar, write);
-		switch (rc) {
-		case PGM_ALEN_TRANSLATION:
-		case PGM_ALE_SEQUENCE:
-		case PGM_ASTE_VALIDITY:
-		case PGM_ASTE_SEQUENCE:
-		case PGM_EXTENDED_AUTHORITY:
-			vcpu->arch.pgm.exc_access_id = ar;
-			break;
-		case PGM_PROTECTION:
-			tec_bits->b60 = 1;
-			tec_bits->b61 = 1;
-			break;
-		}
-		if (rc > 0)
-			pgm->code = rc;
-		return rc;
-	}
-	return 0;
-}
-
-static int deref_table(struct kvm *kvm, unsigned long gpa, unsigned long *val)
-{
-	return kvm_read_guest(kvm, gpa, val, sizeof(*val));
-}
-
-/**
- * guest_translate - translate a guest virtual into a guest absolute address
- * @vcpu: virtual cpu
- * @gva: guest virtual address
- * @gpa: points to where guest physical (absolute) address should be stored
- * @asce: effective asce
- * @write: indicates if access is a write access
- *
- * Translate a guest virtual address into a guest absolute address by means
- * of dynamic address translation as specified by the architecture.
- * If the resulting absolute address is not available in the configuration
- * an addressing exception is indicated and @gpa will not be changed.
- *
- * Returns: - zero on success; @gpa contains the resulting absolute address
- *	    - a negative value if guest access failed due to e.g. broken
- *	      guest mapping
- *	    - a positve value if an access exception happened. In this case
- *	      the returned value is the program interruption code as defined
- *	      by the architecture
- */
-static unsigned long guest_translate(struct kvm_vcpu *vcpu, unsigned long gva,
-				     unsigned long *gpa, const union asce asce,
-				     int write)
-{
-	union vaddress vaddr = {.addr = gva};
-	union raddress raddr = {.addr = gva};
-	union page_table_entry pte;
-	int dat_protection = 0;
-	union ctlreg0 ctlreg0;
-	unsigned long ptr;
-	int edat1, edat2;
-
-	ctlreg0.val = vcpu->arch.sie_block->gcr[0];
-	edat1 = ctlreg0.edat && test_kvm_facility(vcpu->kvm, 8);
-	edat2 = edat1 && test_kvm_facility(vcpu->kvm, 78);
-	if (asce.r)
-		goto real_address;
-	ptr = asce.origin * 4096;
-	switch (asce.dt) {
-	case ASCE_TYPE_REGION1:
-		if (vaddr.rfx01 > asce.tl)
-			return PGM_REGION_FIRST_TRANS;
-		ptr += vaddr.rfx * 8;
-		break;
-	case ASCE_TYPE_REGION2:
-		if (vaddr.rfx)
-			return PGM_ASCE_TYPE;
-		if (vaddr.rsx01 > asce.tl)
-			return PGM_REGION_SECOND_TRANS;
-		ptr += vaddr.rsx * 8;
-		break;
-	case ASCE_TYPE_REGION3:
-		if (vaddr.rfx || vaddr.rsx)
-			return PGM_ASCE_TYPE;
-		if (vaddr.rtx01 > asce.tl)
-			return PGM_REGION_THIRD_TRANS;
-		ptr += vaddr.rtx * 8;
-		break;
-	case ASCE_TYPE_SEGMENT:
-		if (vaddr.rfx || vaddr.rsx || vaddr.rtx)
-			return PGM_ASCE_TYPE;
-		if (vaddr.sx01 > asce.tl)
-			return PGM_SEGMENT_TRANSLATION;
-		ptr += vaddr.sx * 8;
-		break;
-	}
-	switch (asce.dt) {
-	case ASCE_TYPE_REGION1:	{
-		union region1_table_entry rfte;
-
-		if (kvm_is_error_gpa(vcpu->kvm, ptr))
-			return PGM_ADDRESSING;
-		if (deref_table(vcpu->kvm, ptr, &rfte.val))
-			return -EFAULT;
-		if (rfte.i)
-			return PGM_REGION_FIRST_TRANS;
-		if (rfte.tt != TABLE_TYPE_REGION1)
-			return PGM_TRANSLATION_SPEC;
-		if (vaddr.rsx01 < rfte.tf || vaddr.rsx01 > rfte.tl)
-			return PGM_REGION_SECOND_TRANS;
-		if (edat1)
-			dat_protection |= rfte.p;
-		ptr = rfte.rto * 4096 + vaddr.rsx * 8;
-	}
-		/* fallthrough */
-	case ASCE_TYPE_REGION2: {
-		union region2_table_entry rste;
-
-		if (kvm_is_error_gpa(vcpu->kvm, ptr))
-			return PGM_ADDRESSING;
-		if (deref_table(vcpu->kvm, ptr, &rste.val))
-			return -EFAULT;
-		if (rste.i)
-			return PGM_REGION_SECOND_TRANS;
-		if (rste.tt != TABLE_TYPE_REGION2)
-			return PGM_TRANSLATION_SPEC;
-		if (vaddr.rtx01 < rste.tf || vaddr.rtx01 > rste.tl)
-			return PGM_REGION_THIRD_TRANS;
-		if (edat1)
-			dat_protection |= rste.p;
-		ptr = rste.rto * 4096 + vaddr.rtx * 8;
-	}
-		/* fallthrough */
-	case ASCE_TYPE_REGION3: {
-		union region3_table_entry rtte;
-
-		if (kvm_is_error_gpa(vcpu->kvm, ptr))
-			return PGM_ADDRESSING;
-		if (deref_table(vcpu->kvm, ptr, &rtte.val))
-			return -EFAULT;
-		if (rtte.i)
-			return PGM_REGION_THIRD_TRANS;
-		if (rtte.tt != TABLE_TYPE_REGION3)
-			return PGM_TRANSLATION_SPEC;
-		if (rtte.cr && asce.p && edat2)
-			return PGM_TRANSLATION_SPEC;
-		if (rtte.fc && edat2) {
-			dat_protection |= rtte.fc1.p;
-			raddr.rfaa = rtte.fc1.rfaa;
-			goto absolute_address;
-		}
-		if (vaddr.sx01 < rtte.fc0.tf)
-			return PGM_SEGMENT_TRANSLATION;
-		if (vaddr.sx01 > rtte.fc0.tl)
-			return PGM_SEGMENT_TRANSLATION;
-		if (edat1)
-			dat_protection |= rtte.fc0.p;
-		ptr = rtte.fc0.sto * 4096 + vaddr.sx * 8;
-	}
-		/* fallthrough */
-	case ASCE_TYPE_SEGMENT: {
-		union segment_table_entry ste;
-
-		if (kvm_is_error_gpa(vcpu->kvm, ptr))
-			return PGM_ADDRESSING;
-		if (deref_table(vcpu->kvm, ptr, &ste.val))
-			return -EFAULT;
-		if (ste.i)
-			return PGM_SEGMENT_TRANSLATION;
-		if (ste.tt != TABLE_TYPE_SEGMENT)
-			return PGM_TRANSLATION_SPEC;
-		if (ste.cs && asce.p)
-			return PGM_TRANSLATION_SPEC;
-		if (ste.fc && edat1) {
-			dat_protection |= ste.fc1.p;
-			raddr.sfaa = ste.fc1.sfaa;
-			goto absolute_address;
-		}
-		dat_protection |= ste.fc0.p;
-		ptr = ste.fc0.pto * 2048 + vaddr.px * 8;
-	}
-	}
-	if (kvm_is_error_gpa(vcpu->kvm, ptr))
-		return PGM_ADDRESSING;
-	if (deref_table(vcpu->kvm, ptr, &pte.val))
-		return -EFAULT;
-	if (pte.i)
-		return PGM_PAGE_TRANSLATION;
-	if (pte.z)
-		return PGM_TRANSLATION_SPEC;
-	if (pte.co && !edat1)
-		return PGM_TRANSLATION_SPEC;
-	dat_protection |= pte.p;
-	raddr.pfra = pte.pfra;
-real_address:
-	raddr.addr = kvm_s390_real_to_abs(vcpu, raddr.addr);
-absolute_address:
-	if (write && dat_protection)
-		return PGM_PROTECTION;
-	if (kvm_is_error_gpa(vcpu->kvm, raddr.addr))
-		return PGM_ADDRESSING;
-	*gpa = raddr.addr;
-	return 0;
-}
-
-static inline int is_low_address(unsigned long ga)
-{
-	/* Check for address ranges 0..511 and 4096..4607 */
-	return (ga & ~0x11fful) == 0;
-}
-
-static int low_address_protection_enabled(struct kvm_vcpu *vcpu,
-					  const union asce asce)
-{
-	union ctlreg0 ctlreg0 = {.val = vcpu->arch.sie_block->gcr[0]};
-	psw_t *psw = &vcpu->arch.sie_block->gpsw;
-
-	if (!ctlreg0.lap)
-		return 0;
-	if (psw_bits(*psw).t && asce.p)
-		return 0;
-	return 1;
-}
-
-static int guest_page_range(struct kvm_vcpu *vcpu, unsigned long ga,
-			    unsigned long *pages, unsigned long nr_pages,
-			    const union asce asce, int write)
-{
-	struct kvm_s390_pgm_info *pgm = &vcpu->arch.pgm;
-	psw_t *psw = &vcpu->arch.sie_block->gpsw;
-	struct trans_exc_code_bits *tec_bits;
-	int lap_enabled, rc;
-
-	tec_bits = (struct trans_exc_code_bits *)&pgm->trans_exc_code;
-	lap_enabled = low_address_protection_enabled(vcpu, asce);
-	while (nr_pages) {
-		ga = kvm_s390_logical_to_effective(vcpu, ga);
-		tec_bits->addr = ga >> PAGE_SHIFT;
-		if (write && lap_enabled && is_low_address(ga)) {
-			pgm->code = PGM_PROTECTION;
-			return pgm->code;
-		}
-		ga &= PAGE_MASK;
-		if (psw_bits(*psw).t) {
-			rc = guest_translate(vcpu, ga, pages, asce, write);
-			if (rc < 0)
-				return rc;
-			if (rc == PGM_PROTECTION)
-				tec_bits->b61 = 1;
-			if (rc)
-				pgm->code = rc;
-		} else {
-			*pages = kvm_s390_real_to_abs(vcpu, ga);
-			if (kvm_is_error_gpa(vcpu->kvm, *pages))
-				pgm->code = PGM_ADDRESSING;
-		}
-		if (pgm->code)
-			return pgm->code;
-		ga += PAGE_SIZE;
-		pages++;
-		nr_pages--;
-	}
-	return 0;
-}
-
-int access_guest(struct kvm_vcpu *vcpu, unsigned long ga, ar_t ar, void *data,
-		 unsigned long len, int write)
-{
-	psw_t *psw = &vcpu->arch.sie_block->gpsw;
-	unsigned long _len, nr_pages, gpa, idx;
-	unsigned long pages_array[2];
-	unsigned long *pages;
-	int need_ipte_lock;
-	union asce asce;
-	int rc;
-
-	if (!len)
-		return 0;
-	rc = get_vcpu_asce(vcpu, &asce, ar, write);
-	if (rc)
-		return rc;
-	nr_pages = (((ga & ~PAGE_MASK) + len - 1) >> PAGE_SHIFT) + 1;
-	pages = pages_array;
-	if (nr_pages > ARRAY_SIZE(pages_array))
-		pages = vmalloc(nr_pages * sizeof(unsigned long));
-	if (!pages)
-		return -ENOMEM;
-	need_ipte_lock = psw_bits(*psw).t && !asce.r;
-	if (need_ipte_lock)
-		ipte_lock(vcpu);
-	rc = guest_page_range(vcpu, ga, pages, nr_pages, asce, write);
-	for (idx = 0; idx < nr_pages && !rc; idx++) {
-		gpa = *(pages + idx) + (ga & ~PAGE_MASK);
-		_len = min(PAGE_SIZE - (gpa & ~PAGE_MASK), len);
-		if (write)
-			rc = kvm_write_guest(vcpu->kvm, gpa, data, _len);
-		else
-			rc = kvm_read_guest(vcpu->kvm, gpa, data, _len);
-		len -= _len;
-		ga += _len;
-		data += _len;
-	}
-	if (need_ipte_lock)
-		ipte_unlock(vcpu);
-	if (nr_pages > ARRAY_SIZE(pages_array))
-		vfree(pages);
-	return rc;
-}
-
-int access_guest_real(struct kvm_vcpu *vcpu, unsigned long gra,
-		      void *data, unsigned long len, int write)
-{
-	unsigned long _len, gpa;
-	int rc = 0;
-
-	while (len && !rc) {
-		gpa = kvm_s390_real_to_abs(vcpu, gra);
-		_len = min(PAGE_SIZE - (gpa & ~PAGE_MASK), len);
-		if (write)
-			rc = write_guest_abs(vcpu, gpa, data, _len);
-		else
-			rc = read_guest_abs(vcpu, gpa, data, _len);
-		len -= _len;
-		gra += _len;
-		data += _len;
-	}
-	return rc;
-}
-
-/**
- * guest_translate_address - translate guest logical into guest absolute address
- *
- * Parameter semantics are the same as the ones from guest_translate.
- * The memory contents at the guest address are not changed.
- *
- * Note: The IPTE lock is not taken during this function, so the caller
- * has to take care of this.
- */
-int guest_translate_address(struct kvm_vcpu *vcpu, unsigned long gva, ar_t ar,
-			    unsigned long *gpa, int write)
-{
-	struct kvm_s390_pgm_info *pgm = &vcpu->arch.pgm;
-	psw_t *psw = &vcpu->arch.sie_block->gpsw;
-	struct trans_exc_code_bits *tec;
-	union asce asce;
-	int rc;
-
-	gva = kvm_s390_logical_to_effective(vcpu, gva);
-	tec = (struct trans_exc_code_bits *)&pgm->trans_exc_code;
-	rc = get_vcpu_asce(vcpu, &asce, ar, write);
-	tec->addr = gva >> PAGE_SHIFT;
-	if (rc)
-		return rc;
-	if (is_low_address(gva) && low_address_protection_enabled(vcpu, asce)) {
-		if (write) {
-			rc = pgm->code = PGM_PROTECTION;
-			return rc;
-		}
-	}
-
-	if (psw_bits(*psw).t && !asce.r) {	/* Use DAT? */
-		rc = guest_translate(vcpu, gva, gpa, asce, write);
-		if (rc > 0) {
-			if (rc == PGM_PROTECTION)
-				tec->b61 = 1;
-			pgm->code = rc;
-		}
-	} else {
-		rc = 0;
-		*gpa = kvm_s390_real_to_abs(vcpu, gva);
-		if (kvm_is_error_gpa(vcpu->kvm, *gpa))
-			rc = pgm->code = PGM_ADDRESSING;
-	}
-
-	return rc;
-}
-
-/**
- * check_gva_range - test a range of guest virtual addresses for accessibility
- */
-int check_gva_range(struct kvm_vcpu *vcpu, unsigned long gva, ar_t ar,
-		    unsigned long length, int is_write)
-{
-	unsigned long gpa;
-	unsigned long currlen;
-	int rc = 0;
-
-	ipte_lock(vcpu);
-	while (length > 0 && !rc) {
-		currlen = min(length, PAGE_SIZE - (gva % PAGE_SIZE));
-		rc = guest_translate_address(vcpu, gva, ar, &gpa, is_write);
-		gva += currlen;
-		length -= currlen;
-	}
-	ipte_unlock(vcpu);
-
-	return rc;
-}
-
-/**
- * kvm_s390_check_low_addr_prot_real - check for low-address protection
- * @gra: Guest real address
- *
- * Checks whether an address is subject to low-address protection and set
- * up vcpu->arch.pgm accordingly if necessary.
- *
- * Return: 0 if no protection exception, or PGM_PROTECTION if protected.
- */
-int kvm_s390_check_low_addr_prot_real(struct kvm_vcpu *vcpu, unsigned long gra)
-{
-	struct kvm_s390_pgm_info *pgm = &vcpu->arch.pgm;
-	psw_t *psw = &vcpu->arch.sie_block->gpsw;
-	struct trans_exc_code_bits *tec_bits;
-	union ctlreg0 ctlreg0 = {.val = vcpu->arch.sie_block->gcr[0]};
-
-	if (!ctlreg0.lap || !is_low_address(gra))
-		return 0;
-
-	memset(pgm, 0, sizeof(*pgm));
-	tec_bits = (struct trans_exc_code_bits *)&pgm->trans_exc_code;
-	tec_bits->fsi = FSI_STORE;
-	tec_bits->as = psw_bits(*psw).as;
-	tec_bits->addr = gra >> PAGE_SHIFT;
-	pgm->code = PGM_PROTECTION;
-
-	return pgm->code;
-}
+,	-16
+
+##########
+# divs.l #
+##########
+	global		_060LSP__idivs64_
+_060LSP__idivs64_:
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-16
+	movm.l		&0x3f00,-(%sp)		# save d2-d7
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,DIV64_CC(%a6)
+	st		POSNEG(%a6)		# signed operation
+	bra.b		ldiv64_cont
+
+##########
+# divu.l #
+##########
+	global		_060LSP__idivu64_
+_060LSP__idivu64_:
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-16
+	movm.l		&0x3f00,-(%sp)		# save d2-d7
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,DIV64_CC(%a6)
+	sf		POSNEG(%a6)		# unsigned operation
+
+ldiv64_cont:
+	mov.l		0x8(%a6),%d7		# fetch divisor
+
+	beq.w		ldiv64eq0		# divisor is = 0!!!
+
+	mov.l		0xc(%a6), %d5		# get dividend hi
+	mov.l		0x10(%a6), %d6		# get dividend lo
+
+# separate signed and unsigned divide
+	tst.b		POSNEG(%a6)		# signed or unsigned?
+	beq.b		ldspecialcases		# use positive divide
+
+# save the sign of the divisor
+# make divisor unsigned if it's negative
+	tst.l		%d7			# chk sign of divisor
+	slt		NDIVISOR(%a6)		# save sign of divisor
+	bpl.b		ldsgndividend
+	neg.l		%d7			# complement negative divisor
+
+# save the sign of the dividend
+# make dividend unsigned if it's negative
+ldsgndividend:
+	tst.l		%d5			# chk sign of hi(dividend)
+	slt		NDIVIDEND(%a6)		# save sign of dividend
+	bpl.b		ldspecialcases
+
+	mov.w		&0x0, %cc		# clear 'X' cc bit
+	negx.l		%d6			# complement signed dividend
+	negx.l		%d5
+
+# extract some special cases:
+#	- is (dividend == 0) ?
+#	- is (hi(dividend) == 0 && (divisor <= lo(dividend))) ? (32-bit div)
+ldspecialcases:
+	tst.l		%d5			# is (hi(dividend) == 0)
+	bne.b		ldnormaldivide		# no, so try it the long way
+
+	tst.l		%d6			# is (lo(dividend) == 0), too
+	beq.w		lddone			# yes, so (dividend == 0)
+
+	cmp.l		%d7,%d6			# is (divisor <= lo(dividend))
+	bls.b		ld32bitdivide		# yes, so use 32 bit divide
+
+	exg		%d5,%d6			# q = 0, r = dividend
+	bra.w		ldivfinish		# can't divide, we're done.
+
+ld32bitdivide:
+	tdivu.l		%d7, %d5:%d6		# it's only a 32/32 bit div!
+
+	bra.b		ldivfinish
+
+ldnormaldivide:
+# last special case:
+#	- is hi(dividend) >= divisor ? if yes, then overflow
+	cmp.l		%d7,%d5
+	bls.b		lddovf			# answer won't fit in 32 bits
+
+# perform the divide algorithm:
+	bsr.l		ldclassical		# do int divide
+
+# separate into signed and unsigned finishes.
+ldivfinish:
+	tst.b		POSNEG(%a6)		# do divs, divu separately
+	beq.b		lddone			# divu has no processing!!!
+
+# it was a divs.l, so ccode setting is a little more complicated...
+	tst.b		NDIVIDEND(%a6)		# remainder has same sign
+	beq.b		ldcc			# as dividend.
+	neg.l		%d5			# sgn(rem) = sgn(dividend)
+ldcc:
+	mov.b		NDIVISOR(%a6), %d0
+	eor.b		%d0, NDIVIDEND(%a6)	# chk if quotient is negative
+	beq.b		ldqpos			# branch to quot positive
+
+# 0x80000000 is the largest number representable as a 32-bit negative
+# number. the negative of 0x80000000 is 0x80000000.
+	cmpi.l		%d6, &0x80000000	# will (-quot) fit in 32 bits?
+	bhi.b		lddovf
+
+	neg.l		%d6			# make (-quot) 2's comp
+
+	bra.b		lddone
+
+ldqpos:
+	btst		&0x1f, %d6		# will (+quot) fit in 32 bits?
+	bne.b		lddovf
+
+lddone:
+# if the register numbers are the same, only the quotient gets saved.
+# so, if we always save the quotient second, we save ourselves a cmp&beq
+	andi.w		&0x10,DIV64_CC(%a6)
+	mov.w		DIV64_CC(%a6),%cc
+	tst.l		%d6			# may set 'N' ccode bit
+
+# here, the result is in d1 and d0. the current strategy is to save
+# the values at the location pointed to by a0.
+# use movm here to not disturb the condition codes.
+ldexit:
+	movm.l		&0x0060,([0x14,%a6])	# save result
+
+# EPILOGUE BEGIN ########################################################
+#	fmovm.l		(%sp)+,&0x0		# restore no fpregs
+	movm.l		(%sp)+,&0x00fc		# restore d2-d7
+	unlk		%a6
+# EPILOGUE END ##########################################################
+
+	rts
+
+# the result should be the unchanged dividend
+lddovf:
+	mov.l		0xc(%a6), %d5		# get dividend hi
+	mov.l		0x10(%a6), %d6		# get dividend lo
+
+	andi.w		&0x1c,DIV64_CC(%a6)
+	ori.w		&0x02,DIV64_CC(%a6)	# set 'V' ccode bit
+	mov.w		DIV64_CC(%a6),%cc
+
+	bra.b		ldexit
+
+ldiv64eq0:
+	mov.l		0xc(%a6),([0x14,%a6])
+	mov.l		0x10(%a6),([0x14,%a6],0x4)
+
+	mov.w		DIV64_CC(%a6),%cc
+
+# EPILOGUE BEGIN ########################################################
+#	fmovm.l		(%sp)+,&0x0		# restore no fpregs
+	movm.l		(%sp)+,&0x00fc		# restore d2-d7
+	unlk		%a6
+# EPILOGUE END ##########################################################
+
+	divu.w		&0x0,%d0		# force a divbyzero exception
+	rts
+
+###########################################################################
+#########################################################################
+# This routine uses the 'classical' Algorithm D from Donald Knuth's	#
+# Art of Computer Programming, vol II, Seminumerical Algorithms.	#
+# For this implementation b=2**16, and the target is U1U2U3U4/V1V2,	#
+# where U,V are words of the quadword dividend and longword divisor,	#
+# and U1, V1 are the most significant words.				#
+#									#
+# The most sig. longword of the 64 bit dividend must be in %d5, least	#
+# in %d6. The divisor must be in the variable ddivisor, and the		#
+# signed/unsigned flag ddusign must be set (0=unsigned,1=signed).	#
+# The quotient is returned in %d6, remainder in %d5, unless the		#
+# v (overflow) bit is set in the saved %ccr. If overflow, the dividend	#
+# is unchanged.								#
+#########################################################################
+ldclassical:
+# if the divisor msw is 0, use simpler algorithm then the full blown
+# one at ddknuth:
+
+	cmpi.l		%d7, &0xffff
+	bhi.b		lddknuth		# go use D. Knuth algorithm
+
+# Since the divisor is only a word (and larger than the mslw of the dividend),
+# a simpler algorithm may be used :
+# In the general case, four quotient words would be created by
+# dividing the divisor word into each dividend word. In this case,
+# the first two quotient words must be zero, or overflow would occur.
+# Since we already checked this case above, we can treat the most significant
+# longword of the dividend as (0) remainder (see Knuth) and merely complete
+# the last two divisions to get a quotient longword and word remainder:
+
+	clr.l		%d1
+	swap		%d5			# same as r*b if previous step rqd
+	swap		%d6			# get u3 to lsw position
+	mov.w		%d6, %d5		# rb + u3
+
+	divu.w		%d7, %d5
+
+	mov.w		%d5, %d1		# first quotient word
+	swap		%d6			# get u4
+	mov.w		%d6, %d5		# rb + u4
+
+	divu.w		%d7, %d5
+
+	swap		%d1
+	mov.w		%d5, %d1		# 2nd quotient 'digit'
+	clr.w		%d5
+	swap		%d5			# now remainder
+	mov.l		%d1, %d6		# and quotient
+
+	rts
+
+lddknuth:
+# In this algorithm, the divisor is treated as a 2 digit (word) number
+# which is divided into a 3 digit (word) dividend to get one quotient
+# digit (word). After subtraction, the dividend is shifted and the
+# process repeated. Before beginning, the divisor and quotient are
+# 'normalized' so that the process of estimating the quotient digit
+# will yield verifiably correct results..
+
+	clr.l		DDNORMAL(%a6)		# count of shifts for normalization
+	clr.b		DDSECOND(%a6)		# clear flag for quotient digits
+	clr.l		%d1			# %d1 will hold trial quotient
+lddnchk:
+	btst		&31, %d7		# must we normalize? first word of
+	bne.b		lddnormalized		# divisor (V1) must be >= 65536/2
+	addq.l		&0x1, DDNORMAL(%a6)	# count normalization shifts
+	lsl.l		&0x1, %d7		# shift the divisor
+	lsl.l		&0x1, %d6		# shift u4,u3 with overflow to u2
+	roxl.l		&0x1, %d5		# shift u1,u2
+	bra.w		lddnchk
+lddnormalized:
+
+# Now calculate an estimate of the quotient words (msw first, then lsw).
+# The comments use subscripts for the first quotient digit determination.
+	mov.l		%d7, %d3		# divisor
+	mov.l		%d5, %d2		# dividend mslw
+	swap		%d2
+	swap		%d3
+	cmp.w		%d2, %d3		# V1 = U1 ?
+	bne.b		lddqcalc1
+	mov.w		&0xffff, %d1		# use max trial quotient word
+	bra.b		lddadj0
+lddqcalc1:
+	mov.l		%d5, %d1
+
+	divu.w		%d3, %d1		# use quotient of mslw/msw
+
+	andi.l		&0x0000ffff, %d1	# zero any remainder
+lddadj0:
+
+# now test the trial quotient and adjust. This step plus the
+# normalization assures (according to Knuth) that the trial
+# quotient will be at worst 1 too large.
+	mov.l		%d6, -(%sp)
+	clr.w		%d6			# word u3 left
+	swap		%d6			# in lsw position
+lddadj1: mov.l		%d7, %d3
+	mov.l		%d1, %d2
+	mulu.w		%d7, %d2		# V2q
+	swap		%d3
+	mulu.w		%d1, %d3		# V1q
+	mov.l		%d5, %d4		# U1U2
+	sub.l		%d3, %d4		# U1U2 - V1q
+
+	swap		%d4
+
+	mov.w		%d4,%d0
+	mov.w		%d6,%d4			# insert lower word (U3)
+
+	tst.w		%d0			# is upper word set?
+	bne.w		lddadjd1
+
+#	add.l		%d6, %d4		# (U1U2 - V1q) + U3
+
+	cmp.l		%d2, %d4
+	bls.b		lddadjd1		# is V2q > (U1U2-V1q) + U3 ?
+	subq.l		&0x1, %d1		# yes, decrement and recheck
+	bra.b		lddadj1
+lddadjd1:
+# now test the word by multiplying it by the divisor (V1V2) and comparing
+# the 3 digit (word) result with the current dividend words
+	mov.l		%d5, -(%sp)		# save %d5 (%d6 already saved)
+	mov.l		%d1, %d6
+	swap		%d6			# shift answer to ms 3 words
+	mov.l		%d7, %d5
+	bsr.l		ldmm2
+	mov.l		%d5, %d2		# now %d2,%d3 are trial*divisor
+	mov.l		%d6, %d3
+	mov.l		(%sp)+, %d5		# restore dividend
+	mov.l		(%sp)+, %d6
+	sub.l		%d3, %d6
+	subx.l		%d2, %d5		# subtract double precision
+	bcc		ldd2nd			# no carry, do next quotient digit
+	subq.l		&0x1, %d1		# q is one too large
+# need to add back divisor longword to current ms 3 digits of dividend
+# - according to Knuth, this is done only 2 out of 65536 times for random
+# divisor, dividend selection.
+	clr.l		%d2
+	mov.l		%d7, %d3
+	swap		%d3
+	clr.w		%d3			# %d3 now ls word of divisor
+	add.l		%d3, %d6		# aligned with 3rd word of dividend
+	addx.l		%d2, %d5
+	mov.l		%d7, %d3
+	clr.w		%d3			# %d3 now ms word of divisor
+	swap		%d3			# aligned with 2nd word of dividend
+	add.l		%d3, %d5
+ldd2nd:
+	tst.b		DDSECOND(%a6)	# both q words done?
+	bne.b		lddremain
+# first quotient digit now correct. store digit and shift the
+# (subtracted) dividend
+	mov.w		%d1, DDQUOTIENT(%a6)
+	clr.l		%d1
+	swap		%d5
+	swap		%d6
+	mov.w		%d6, %d5
+	clr.w		%d6
+	st		DDSECOND(%a6)		# second digit
+	bra.w		lddnormalized
+lddremain:
+# add 2nd word to quotient, get the remainder.
+	mov.w		%d1, DDQUOTIENT+2(%a6)
+# shift down one word/digit to renormalize remainder.
+	mov.w		%d5, %d6
+	swap		%d6
+	swap		%d5
+	mov.l		DDNORMAL(%a6), %d7	# get norm shift count
+	beq.b		lddrn
+	subq.l		&0x1, %d7		# set for loop count
+lddnlp:
+	lsr.l		&0x1, %d5		# shift into %d6
+	roxr.l		&0x1, %d6
+	dbf		%d7, lddnlp
+lddrn:
+	mov.l		%d6, %d5		# remainder
+	mov.l		DDQUOTIENT(%a6), %d6	# quotient
+
+	rts
+ldmm2:
+# factors for the 32X32->64 multiplication are in %d5 and %d6.
+# returns 64 bit result in %d5 (hi) %d6(lo).
+# destroys %d2,%d3,%d4.
+
+# multiply hi,lo words of each factor to get 4 intermediate products
+	mov.l		%d6, %d2
+	mov.l		%d6, %d3
+	mov.l		%d5, %d4
+	swap		%d3
+	swap		%d4
+	mulu.w		%d5, %d6		# %d6 <- lsw*lsw
+	mulu.w		%d3, %d5		# %d5 <- msw-dest*lsw-source
+	mulu.w		%d4, %d2		# %d2 <- msw-source*lsw-dest
+	mulu.w		%d4, %d3		# %d3 <- msw*msw
+# now use swap and addx to consolidate to two longwords
+	clr.l		%d4
+	swap		%d6
+	add.w		%d5, %d6		# add msw of l*l to lsw of m*l product
+	addx.w		%d4, %d3		# add any carry to m*m product
+	add.w		%d2, %d6		# add in lsw of other m*l product
+	addx.w		%d4, %d3		# add any carry to m*m product
+	swap		%d6			# %d6 is low 32 bits of final product
+	clr.w		%d5
+	clr.w		%d2			# lsw of two mixed products used,
+	swap		%d5			# now use msws of longwords
+	swap		%d2
+	add.l		%d2, %d5
+	add.l		%d3, %d5	# %d5 now ms 32 bits of final product
+	rts
+
+#########################################################################
+# XDEF ****************************************************************	#
+#	_060LSP__imulu64_(): Emulate 64-bit unsigned mul instruction	#
+#	_060LSP__imuls64_(): Emulate 64-bit signed mul instruction.	#
+#									#
+#	This is the library version which is accessed as a subroutine	#
+#	and therefore does not work exactly like the 680X0 mul{s,u}.l	#
+#	64-bit multiply instruction.					#
+#									#
+# XREF ****************************************************************	#
+#	None								#
+#									#
+# INPUT ***************************************************************	#
+#	0x4(sp) = multiplier						#
+#	0x8(sp) = multiplicand						#
+#	0xc(sp) = pointer to location to place 64-bit result		#
+#									#
+# OUTPUT **************************************************************	#
+#	0xc(sp) = points to location of 64-bit result			#
+#									#
+# ALGORITHM ***********************************************************	#
+#	Perform the multiply in pieces using 16x16->32 unsigned		#
+# multiplies and "add" instructions.					#
+#	Set the condition codes as appropriate before performing an	#
+# "rts".								#
+#									#
+#########################################################################
+
+set MUL64_CC, -4
+
+	global		_060LSP__imulu64_
+_060LSP__imulu64_:
+
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-4
+	movm.l		&0x3800,-(%sp)		# save d2-d4
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,MUL64_CC(%a6)	# save incoming ccodes
+
+	mov.l		0x8(%a6),%d0		# store multiplier in d0
+	beq.w		mulu64_zero		# handle zero separately
+
+	mov.l		0xc(%a6),%d1		# get multiplicand in d1
+	beq.w		mulu64_zero		# handle zero separately
+
+#########################################################################
+#	63			   32				0	#
+#	----------------------------					#
+#	| hi(mplier) * hi(mplicand)|					#
+#	----------------------------					#
+#		     -----------------------------			#
+#		     | hi(mplier) * lo(mplicand) |			#
+#		     -----------------------------			#
+#		     -----------------------------			#
+#		     | lo(mplier) * hi(mplicand) |			#
+#		     -----------------------------			#
+#	  |			   -----------------------------	#
+#	--|--			   | lo(mplier) * lo(mplicand) |	#
+#	  |			   -----------------------------	#
+#	========================================================	#
+#	--------------------------------------------------------	#
+#	|	hi(result)	   |	    lo(result)         |	#
+#	--------------------------------------------------------	#
+#########################################################################
+mulu64_alg:
+# load temp registers with operands
+	mov.l		%d0,%d2			# mr in d2
+	mov.l		%d0,%d3			# mr in d3
+	mov.l		%d1,%d4			# md in d4
+	swap		%d3			# hi(mr) in lo d3
+	swap		%d4			# hi(md) in lo d4
+
+# complete necessary multiplies:
+	mulu.w		%d1,%d0			# [1] lo(mr) * lo(md)
+	mulu.w		%d3,%d1			# [2] hi(mr) * lo(md)
+	mulu.w		%d4,%d2			# [3] lo(mr) * hi(md)
+	mulu.w		%d4,%d3			# [4] hi(mr) * hi(md)
+
+# add lo portions of [2],[3] to hi portion of [1].
+# add carries produced from these adds to [4].
+# lo([1]) is the final lo 16 bits of the result.
+	clr.l		%d4			# load d4 w/ zero value
+	swap		%d0			# hi([1]) <==> lo([1])
+	add.w		%d1,%d0			# hi([1]) + lo([2])
+	addx.l		%d4,%d3			#    [4]  + carry
+	add.w		%d2,%d0			# hi([1]) + lo([3])
+	addx.l		%d4,%d3			#    [4]  + carry
+	swap		%d0			# lo([1]) <==> hi([1])
+
+# lo portions of [2],[3] have been added in to final result.
+# now, clear lo, put hi in lo reg, and add to [4]
+	clr.w		%d1			# clear lo([2])
+	clr.w		%d2			# clear hi([3])
+	swap		%d1			# hi([2]) in lo d1
+	swap		%d2			# hi([3]) in lo d2
+	add.l		%d2,%d1			#    [4]  + hi([2])
+	add.l		%d3,%d1			#    [4]  + hi([3])
+
+# now, grab the condition codes. only one that can be set is 'N'.
+# 'N' CAN be set if the operation is unsigned if bit 63 is set.
+	mov.w		MUL64_CC(%a6),%d4
+	andi.b		&0x10,%d4		# keep old 'X' bit
+	tst.l		%d1			# may set 'N' bit
+	bpl.b		mulu64_ddone
+	ori.b		&0x8,%d4		# set 'N' bit
+mulu64_ddone:
+	mov.w		%d4,%cc
+
+# here, the result is in d1 and d0. the current strategy is to save
+# the values at the location pointed to by a0.
+# use movm here to not disturb the condition codes.
+mulu64_end:
+	exg		%d1,%d0
+	movm.l		&0x0003,([0x10,%a6])		# save result
+
+# EPILOGUE BEGIN ########################################################
+#	fmovm.l		(%sp)+,&0x0		# restore no fpregs
+	movm.l		(%sp)+,&0x001c		# restore d2-d4
+	unlk		%a6
+# EPILOGUE END ##########################################################
+
+	rts
+
+# one or both of the operands is zero so the result is also zero.
+# save the zero result to the register file and set the 'Z' ccode bit.
+mulu64_zero:
+	clr.l		%d0
+	clr.l		%d1
+
+	mov.w		MUL64_CC(%a6),%d4
+	andi.b		&0x10,%d4
+	ori.b		&0x4,%d4
+	mov.w		%d4,%cc			# set 'Z' ccode bit
+
+	bra.b		mulu64_end
+
+##########
+# muls.l #
+##########
+	global		_060LSP__imuls64_
+_060LSP__imuls64_:
+
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-4
+	movm.l		&0x3c00,-(%sp)		# save d2-d5
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,MUL64_CC(%a6)	# save incoming ccodes
+
+	mov.l		0x8(%a6),%d0		# store multiplier in d0
+	beq.b		mulu64_zero		# handle zero separately
+
+	mov.l		0xc(%a6),%d1		# get multiplicand in d1
+	beq.b		mulu64_zero		# handle zero separately
+
+	clr.b		%d5			# clear sign tag
+	tst.l		%d0			# is multiplier negative?
+	bge.b		muls64_chk_md_sgn	# no
+	neg.l		%d0			# make multiplier positive
+
+	ori.b		&0x1,%d5		# save multiplier sgn
+
+# the result sign is the exclusive or of the operand sign bits.
+muls64_chk_md_sgn:
+	tst.l		%d1			# is multiplicand negative?
+	bge.b		muls64_alg		# no
+	neg.l		%d1			# make multiplicand positive
+
+	eori.b		&0x1,%d5		# calculate correct sign
+
+#########################################################################
+#	63			   32				0	#
+#	----------------------------					#
+#	| hi(mplier) * hi(mplicand)|					#
+#	----------------------------					#
+#		     -----------------------------			#
+#		     | hi(mplier) * lo(mplicand) |			#
+#		     -----------------------------			#
+#		     -----------------------------			#
+#		     | lo(mplier) * hi(mplicand) |			#
+#		     -----------------------------			#
+#	  |			   -----------------------------	#
+#	--|--			   | lo(mplier) * lo(mplicand) |	#
+#	  |			   -----------------------------	#
+#	========================================================	#
+#	--------------------------------------------------------	#
+#	|	hi(result)	   |	    lo(result)         |	#
+#	--------------------------------------------------------	#
+#########################################################################
+muls64_alg:
+# load temp registers with operands
+	mov.l		%d0,%d2			# mr in d2
+	mov.l		%d0,%d3			# mr in d3
+	mov.l		%d1,%d4			# md in d4
+	swap		%d3			# hi(mr) in lo d3
+	swap		%d4			# hi(md) in lo d4
+
+# complete necessary multiplies:
+	mulu.w		%d1,%d0			# [1] lo(mr) * lo(md)
+	mulu.w		%d3,%d1			# [2] hi(mr) * lo(md)
+	mulu.w		%d4,%d2			# [3] lo(mr) * hi(md)
+	mulu.w		%d4,%d3			# [4] hi(mr) * hi(md)
+
+# add lo portions of [2],[3] to hi portion of [1].
+# add carries produced from these adds to [4].
+# lo([1]) is the final lo 16 bits of the result.
+	clr.l		%d4			# load d4 w/ zero value
+	swap		%d0			# hi([1]) <==> lo([1])
+	add.w		%d1,%d0			# hi([1]) + lo([2])
+	addx.l		%d4,%d3			#    [4]  + carry
+	add.w		%d2,%d0			# hi([1]) + lo([3])
+	addx.l		%d4,%d3			#    [4]  + carry
+	swap		%d0			# lo([1]) <==> hi([1])
+
+# lo portions of [2],[3] have been added in to final result.
+# now, clear lo, put hi in lo reg, and add to [4]
+	clr.w		%d1			# clear lo([2])
+	clr.w		%d2			# clear hi([3])
+	swap		%d1			# hi([2]) in lo d1
+	swap		%d2			# hi([3]) in lo d2
+	add.l		%d2,%d1			#    [4]  + hi([2])
+	add.l		%d3,%d1			#    [4]  + hi([3])
+
+	tst.b		%d5			# should result be signed?
+	beq.b		muls64_done		# no
+
+# result should be a signed negative number.
+# compute 2's complement of the unsigned number:
+#   -negate all bits and add 1
+muls64_neg:
+	not.l		%d0			# negate lo(result) bits
+	not.l		%d1			# negate hi(result) bits
+	addq.l		&1,%d0			# add 1 to lo(result)
+	addx.l		%d4,%d1			# add carry to hi(result)
+
+muls64_done:
+	mov.w		MUL64_CC(%a6),%d4
+	andi.b		&0x10,%d4		# keep old 'X' bit
+	tst.l		%d1			# may set 'N' bit
+	bpl.b		muls64_ddone
+	ori.b		&0x8,%d4		# set 'N' bit
+muls64_ddone:
+	mov.w		%d4,%cc
+
+# here, the result is in d1 and d0. the current strategy is to save
+# the values at the location pointed to by a0.
+# use movm here to not disturb the condition codes.
+muls64_end:
+	exg		%d1,%d0
+	movm.l		&0x0003,([0x10,%a6])	# save result at (a0)
+
+# EPILOGUE BEGIN ########################################################
+#	fmovm.l		(%sp)+,&0x0		# restore no fpregs
+	movm.l		(%sp)+,&0x003c		# restore d2-d5
+	unlk		%a6
+# EPILOGUE END ##########################################################
+
+	rts
+
+# one or both of the operands is zero so the result is also zero.
+# save the zero result to the register file and set the 'Z' ccode bit.
+muls64_zero:
+	clr.l		%d0
+	clr.l		%d1
+
+	mov.w		MUL64_CC(%a6),%d4
+	andi.b		&0x10,%d4
+	ori.b		&0x4,%d4
+	mov.w		%d4,%cc			# set 'Z' ccode bit
+
+	bra.b		muls64_end
+
+#########################################################################
+# XDEF ****************************************************************	#
+#	_060LSP__cmp2_Ab_(): Emulate "cmp2.b An,<ea>".			#
+#	_060LSP__cmp2_Aw_(): Emulate "cmp2.w An,<ea>".			#
+#	_060LSP__cmp2_Al_(): Emulate "cmp2.l An,<ea>".			#
+#	_060LSP__cmp2_Db_(): Emulate "cmp2.b Dn,<ea>".			#
+#	_060LSP__cmp2_Dw_(): Emulate "cmp2.w Dn,<ea>".			#
+#	_060LSP__cmp2_Dl_(): Emulate "cmp2.l Dn,<ea>".			#
+#									#
+#	This is the library version which is accessed as a subroutine	#
+#	and therefore does not work exactly like the 680X0 "cmp2"	#
+#	instruction.							#
+#									#
+# XREF ****************************************************************	#
+#	None								#
+#									#
+# INPUT ***************************************************************	#
+#	0x4(sp) = Rn							#
+#	0x8(sp) = pointer to boundary pair				#
+#									#
+# OUTPUT **************************************************************	#
+#	cc = condition codes are set correctly				#
+#									#
+# ALGORITHM ***********************************************************	#
+#	In the interest of simplicity, all operands are converted to	#
+# longword size whether the operation is byte, word, or long. The	#
+# bounds are sign extended accordingly. If Rn is a data regsiter, Rn is #
+# also sign extended. If Rn is an address register, it need not be sign #
+# extended since the full register is always used.			#
+#	The condition codes are set correctly before the final "rts".	#
+#									#
+#########################################################################
+
+set	CMP2_CC,	-4
+
+	global		_060LSP__cmp2_Ab_
+_060LSP__cmp2_Ab_:
+
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-4
+	movm.l		&0x3800,-(%sp)		# save d2-d4
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,CMP2_CC(%a6)
+	mov.l		0x8(%a6), %d2		# get regval
+
+	mov.b		([0xc,%a6],0x0),%d0
+	mov.b		([0xc,%a6],0x1),%d1
+
+	extb.l		%d0			# sign extend lo bnd
+	extb.l		%d1			# sign extend hi bnd
+	bra.w		l_cmp2_cmp		# go do the compare emulation
+
+	global		_060LSP__cmp2_Aw_
+_060LSP__cmp2_Aw_:
+
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-4
+	movm.l		&0x3800,-(%sp)		# save d2-d4
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,CMP2_CC(%a6)
+	mov.l		0x8(%a6), %d2		# get regval
+
+	mov.w		([0xc,%a6],0x0),%d0
+	mov.w		([0xc,%a6],0x2),%d1
+
+	ext.l		%d0			# sign extend lo bnd
+	ext.l		%d1			# sign extend hi bnd
+	bra.w		l_cmp2_cmp		# go do the compare emulation
+
+	global		_060LSP__cmp2_Al_
+_060LSP__cmp2_Al_:
+
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-4
+	movm.l		&0x3800,-(%sp)		# save d2-d4
+#	fmovm.l		&0x0,-(%sp)		# save no fpregs
+# PROLOGUE END ##########################################################
+
+	mov.w		%cc,CMP2_CC(%a6)
+	mov.l		0x8(%a6), %d2		# get regval
+
+	mov.l		([0xc,%a6],0x0),%d0
+	mov.l		([0xc,%a6],0x4),%d1
+	bra.w		l_cmp2_cmp		# go do the compare emulation
+
+	global		_060LSP__cmp2_Db_
+_060LSP__cmp2_Db_:
+
+# PROLOGUE BEGIN ########################################################
+	link.w		%a6,&-4
+	movm.l		&0x3800,-(%sp)		# save d2-d4
+#	fmovm.l		&0x0,-(%sp)		# s

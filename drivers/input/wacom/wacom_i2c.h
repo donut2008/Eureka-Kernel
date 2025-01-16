@@ -1,43 +1,43 @@
-#ifndef _LINUX_WACOM_I2C_H_
-#define _LINUX_WACOM_I2C_H_
+state)
+{
+	if (!(dev->flags & OCRDMA_FLAGS_LINK_STATUS_INIT)) {
+		dev->flags |= OCRDMA_FLAGS_LINK_STATUS_INIT;
+		if (!lstate)
+			return;
+	}
 
-/*sec_class sysfs*/
-extern struct class *sec_class;
+	if (!lstate)
+		ocrdma_dispatch_port_error(dev);
+	else
+		ocrdma_dispatch_port_active(dev);
+}
 
-#ifdef CONFIG_BATTERY_SAMSUNG
-extern unsigned int lpcharge;
-#endif
-
-struct wacom_g5_platform_data {
-	int irq_gpio;
-	int pdct_gpio;
-	int fwe_gpio;
-	int boot_addr;
-	int irq_type;
-	int x_invert;
-	int y_invert;
-	int xy_switch;
-	bool use_dt_coord;
-	u32 origin[2];
-	int max_x;
-	int max_y;
-	int max_pressure;
-	int max_x_tilt;
-	int max_y_tilt;
-	int max_height;
-	const char *fw_path;
-#ifdef CONFIG_SEC_FACTORY
-	const char *fw_fac_path;
-#endif
-	u32 ic_type;
-	const char *project_name;
-	const char *model_name;
-	bool use_virtual_softkey;
-	bool use_garage;
-	bool support_dex;
-	bool support_aot;
-	u32 dex_rate;
-	bool table_swap;
+static struct ocrdma_driver ocrdma_drv = {
+	.name			= "ocrdma_driver",
+	.add			= ocrdma_add,
+	.remove			= ocrdma_remove,
+	.state_change_handler	= ocrdma_event_handler,
+	.be_abi_version		= OCRDMA_BE_ROCE_ABI_VERSION,
 };
 
-#endif /* _LINUX_WACOM_I2C_H */
+static int __init ocrdma_init_module(void)
+{
+	int status;
+
+	ocrdma_init_debugfs();
+
+	status = be_roce_register_driver(&ocrdma_drv);
+	if (status)
+		goto err_be_reg;
+
+	return 0;
+
+err_be_reg:
+
+	return status;
+}
+
+static void __exit ocrdma_exit_module(void)
+{
+	be_roce_unregister_driver(&ocrdma_drv);
+	ocrdma_rem_

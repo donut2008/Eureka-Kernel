@@ -1,6 +1,2 @@
-#ifndef _MUIC_STATE_
-#define _MUIC_STATE_
-
-extern void muic_detect_dev(muic_data_t *pmuic, int irq);
-
-#endif
+M_TABLE_213__MemoryLevel_0_DisplayWatermark__SHIFT 0x8
+#define DPM_TABLE_213__MemoryLevel_0_ActivityLevel_MAS

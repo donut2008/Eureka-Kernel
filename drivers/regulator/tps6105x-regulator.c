@@ -1,185 +1,188 @@
-/*
- * Driver for TPS61050/61052 boost converters, typically used for white LEDs
- * or audio amplifiers.
- *
- * Copyright (C) 2011 ST-Ericsson SA
- * Written on behalf of Linaro for ST-Ericsson
- *
- * Author: Linus Walleij <linus.walleij@linaro.org>
- *
- * License terms: GNU General Public License (GPL) version 2
- */
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/err.h>
-#include <linux/regmap.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/driver.h>
-#include <linux/mfd/core.h>
-#include <linux/mfd/tps6105x.h>
-
-static const unsigned int tps6105x_voltages[] = {
-	4500000,
-	5000000,
-	5250000,
-	5000000, /* There is an additional 5V */
-};
-
-static int tps6105x_regulator_enable(struct regulator_dev *rdev)
-{
-	struct tps6105x *tps6105x = rdev_get_drvdata(rdev);
-	int ret;
-
-	/* Activate voltage mode */
-	ret = regmap_update_bits(tps6105x->regmap, TPS6105X_REG_0,
-		TPS6105X_REG0_MODE_MASK,
-		TPS6105X_REG0_MODE_VOLTAGE << TPS6105X_REG0_MODE_SHIFT);
-	if (ret)
-		return ret;
-
-	return 0;
+_handle_ce(edac_dev, 0, 0, edac_dev->ctl_name);
 }
 
-static int tps6105x_regulator_disable(struct regulator_dev *rdev)
-{
-	struct tps6105x *tps6105x = rdev_get_drvdata(rdev);
-	int ret;
-
-	/* Set into shutdown mode */
-	ret = regmap_update_bits(tps6105x->regmap, TPS6105X_REG_0,
-		TPS6105X_REG0_MODE_MASK,
-		TPS6105X_REG0_MODE_SHUTDOWN << TPS6105X_REG0_MODE_SHIFT);
-	if (ret)
-		return ret;
-
-	return 0;
-}
-
-static int tps6105x_regulator_is_enabled(struct regulator_dev *rdev)
-{
-	struct tps6105x *tps6105x = rdev_get_drvdata(rdev);
-	unsigned int regval;
-	int ret;
-
-	ret = regmap_read(tps6105x->regmap, TPS6105X_REG_0, &regval);
-	if (ret)
-		return ret;
-	regval &= TPS6105X_REG0_MODE_MASK;
-	regval >>= TPS6105X_REG0_MODE_SHIFT;
-
-	if (regval == TPS6105X_REG0_MODE_VOLTAGE)
-		return 1;
-
-	return 0;
-}
-
-static int tps6105x_regulator_get_voltage_sel(struct regulator_dev *rdev)
-{
-	struct tps6105x *tps6105x = rdev_get_drvdata(rdev);
-	unsigned int regval;
-	int ret;
-
-	ret = regmap_read(tps6105x->regmap, TPS6105X_REG_0, &regval);
-	if (ret)
-		return ret;
-
-	regval &= TPS6105X_REG0_VOLTAGE_MASK;
-	regval >>= TPS6105X_REG0_VOLTAGE_SHIFT;
-	return (int) regval;
-}
-
-static int tps6105x_regulator_set_voltage_sel(struct regulator_dev *rdev,
-					      unsigned selector)
-{
-	struct tps6105x *tps6105x = rdev_get_drvdata(rdev);
-	int ret;
-
-	ret = regmap_update_bits(tps6105x->regmap, TPS6105X_REG_0,
-				    TPS6105X_REG0_VOLTAGE_MASK,
-				    selector << TPS6105X_REG0_VOLTAGE_SHIFT);
-	if (ret)
-		return ret;
-
-	return 0;
-}
-
-static struct regulator_ops tps6105x_regulator_ops = {
-	.enable		= tps6105x_regulator_enable,
-	.disable	= tps6105x_regulator_disable,
-	.is_enabled	= tps6105x_regulator_is_enabled,
-	.get_voltage_sel = tps6105x_regulator_get_voltage_sel,
-	.set_voltage_sel = tps6105x_regulator_set_voltage_sel,
-	.list_voltage	= regulator_list_voltage_table,
-};
-
-static const struct regulator_desc tps6105x_regulator_desc = {
-	.name		= "tps6105x-boost",
-	.ops		= &tps6105x_regulator_ops,
-	.type		= REGULATOR_VOLTAGE,
-	.id		= 0,
-	.owner		= THIS_MODULE,
-	.n_voltages	= ARRAY_SIZE(tps6105x_voltages),
-	.volt_table	= tps6105x_voltages,
-};
-
-/*
- * Registers the chip as a voltage regulator
- */
-static int tps6105x_regulator_probe(struct platform_device *pdev)
-{
-	struct tps6105x *tps6105x = dev_get_platdata(&pdev->dev);
-	struct tps6105x_platform_data *pdata = tps6105x->pdata;
-	struct regulator_config config = { };
-	int ret;
-
-	/* This instance is not set for regulator mode so bail out */
-	if (pdata->mode != TPS6105X_MODE_VOLTAGE) {
-		dev_info(&pdev->dev,
-			"chip not in voltage mode mode, exit probe\n");
-		return 0;
-	}
-
-	config.dev = &tps6105x->client->dev;
-	config.init_data = pdata->regulator_data;
-	config.driver_data = tps6105x;
-
-	/* Register regulator with framework */
-	tps6105x->regulator = devm_regulator_register(&pdev->dev,
-						      &tps6105x_regulator_desc,
-						      &config);
-	if (IS_ERR(tps6105x->regulator)) {
-		ret = PTR_ERR(tps6105x->regulator);
-		dev_err(&tps6105x->client->dev,
-			"failed to register regulator\n");
-		return ret;
-	}
-	platform_set_drvdata(pdev, tps6105x);
-
-	return 0;
-}
-
-static struct platform_driver tps6105x_regulator_driver = {
-	.driver = {
-		.name  = "tps6105x-regulator",
+static struct cpc925_dev_info cpc925_devs[] = {
+	{
+	.ctl_name = CPC925_CPU_ERR_DEV,
+	.init = cpc925_cpu_init,
+	.exit = cpc925_cpu_exit,
+	.check = cpc925_cpu_check,
 	},
-	.probe = tps6105x_regulator_probe,
+	{
+	.ctl_name = CPC925_HT_LINK_DEV,
+	.init = cpc925_htlink_init,
+	.exit = cpc925_htlink_exit,
+	.check = cpc925_htlink_check,
+	},
+	{ }
 };
 
-static __init int tps6105x_regulator_init(void)
+/*
+ * Add CPU Err detection and HyperTransport Link Err detection
+ * as common "edac_device", they have no corresponding device
+ * nodes in the Open Firmware DTB and we have to add platform
+ * devices for them. Also, they will share the MMIO with that
+ * of memory controller.
+ */
+static void cpc925_add_edac_devices(void __iomem *vbase)
 {
-	return platform_driver_register(&tps6105x_regulator_driver);
-}
-subsys_initcall(tps6105x_regulator_init);
+	struct cpc925_dev_info *dev_info;
 
-static __exit void tps6105x_regulator_exit(void)
+	if (!vbase) {
+		cpc925_printk(KERN_ERR, "MMIO not established yet\n");
+		return;
+	}
+
+	for (dev_info = &cpc925_devs[0]; dev_info->init; dev_info++) {
+		dev_info->vbase = vbase;
+		dev_info->pdev = platform_device_register_simple(
+					dev_info->ctl_name, 0, NULL, 0);
+		if (IS_ERR(dev_info->pdev)) {
+			cpc925_printk(KERN_ERR,
+				"Can't register platform device for %s\n",
+				dev_info->ctl_name);
+			continue;
+		}
+
+		/*
+		 * Don't have to allocate private structure but
+		 * make use of cpc925_devs[] instead.
+		 */
+		dev_info->edac_idx = edac_device_alloc_index();
+		dev_info->edac_dev =
+			edac_device_alloc_ctl_info(0, dev_info->ctl_name,
+				1, NULL, 0, 0, NULL, 0, dev_info->edac_idx);
+		if (!dev_info->edac_dev) {
+			cpc925_printk(KERN_ERR, "No memory for edac device\n");
+			goto err1;
+		}
+
+		dev_info->edac_dev->pvt_info = dev_info;
+		dev_info->edac_dev->dev = &dev_info->pdev->dev;
+		dev_info->edac_dev->ctl_name = dev_info->ctl_name;
+		dev_info->edac_dev->mod_name = CPC925_EDAC_MOD_STR;
+		dev_info->edac_dev->dev_name = dev_name(&dev_info->pdev->dev);
+
+		if (edac_op_state == EDAC_OPSTATE_POLL)
+			dev_info->edac_dev->edac_check = dev_info->check;
+
+		if (dev_info->init)
+			dev_info->init(dev_info);
+
+		if (edac_device_add_device(dev_info->edac_dev) > 0) {
+			cpc925_printk(KERN_ERR,
+				"Unable to add edac device for %s\n",
+				dev_info->ctl_name);
+			goto err2;
+		}
+
+		edac_dbg(0, "Successfully added edac device for %s\n",
+			 dev_info->ctl_name);
+
+		continue;
+
+err2:
+		if (dev_info->exit)
+			dev_info->exit(dev_info);
+		edac_device_free_ctl_info(dev_info->edac_dev);
+err1:
+		platform_device_unregister(dev_info->pdev);
+	}
+}
+
+/*
+ * Delete the common "edac_device" for CPU Err Detection
+ * and HyperTransport Link Err Detection
+ */
+static void cpc925_del_edac_devices(void)
 {
-	platform_driver_unregister(&tps6105x_regulator_driver);
-}
-module_exit(tps6105x_regulator_exit);
+	struct cpc925_dev_info *dev_info;
 
-MODULE_AUTHOR("Linus Walleij <linus.walleij@linaro.org>");
-MODULE_DESCRIPTION("TPS6105x regulator driver");
-MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("platform:tps6105x-regulator");
+	for (dev_info = &cpc925_devs[0]; dev_info->init; dev_info++) {
+		if (dev_info->edac_dev) {
+			edac_device_del_device(dev_info->edac_dev->dev);
+			edac_device_free_ctl_info(dev_info->edac_dev);
+			platform_device_unregister(dev_info->pdev);
+		}
+
+		if (dev_info->exit)
+			dev_info->exit(dev_info);
+
+		edac_dbg(0, "Successfully deleted edac device for %s\n",
+			 dev_info->ctl_name);
+	}
+}
+
+/* Convert current back-ground scrub rate into byte/sec bandwidth */
+static int cpc925_get_sdram_scrub_rate(struct mem_ctl_info *mci)
+{
+	struct cpc925_mc_pdata *pdata = mci->pvt_info;
+	int bw;
+	u32 mscr;
+	u8 si;
+
+	mscr = __raw_readl(pdata->vbase + REG_MSCR_OFFSET);
+	si = (mscr & MSCR_SI_MASK) >> MSCR_SI_SHIFT;
+
+	edac_dbg(0, "Mem Scrub Ctrl Register 0x%x\n", mscr);
+
+	if (((mscr & MSCR_SCRUB_MOD_MASK) != MSCR_BACKGR_SCRUB) ||
+	    (si == 0)) {
+		cpc925_mc_printk(mci, KERN_INFO, "Scrub mode not enabled\n");
+		bw = 0;
+	} else
+		bw = CPC925_SCRUB_BLOCK_SIZE * 0xFA67 / si;
+
+	return bw;
+}
+
+/* Return 0 for single channel; 1 for dual channel */
+static int cpc925_mc_get_channels(void __iomem *vbase)
+{
+	int dual = 0;
+	u32 mbcr;
+
+	mbcr = __raw_readl(vbase + REG_MBCR_OFFSET);
+
+	/*
+	 * Dual channel only when 128-bit wide physical bus
+	 * and 128-bit configuration.
+	 */
+	if (((mbcr & MBCR_64BITCFG_MASK) == 0) &&
+	    ((mbcr & MBCR_64BITBUS_MASK) == 0))
+		dual = 1;
+
+	edac_dbg(0, "%s channel\n", (dual > 0) ? "Dual" : "Single");
+
+	return dual;
+}
+
+static int cpc925_probe(struct platform_device *pdev)
+{
+	static int edac_mc_idx;
+	struct mem_ctl_info *mci;
+	struct edac_mc_layer layers[2];
+	void __iomem *vbase;
+	struct cpc925_mc_pdata *pdata;
+	struct resource *r;
+	int res = 0, nr_channels;
+
+	edac_dbg(0, "%s platform device found!\n", pdev->name);
+
+	if (!devres_open_group(&pdev->dev, cpc925_probe, GFP_KERNEL)) {
+		res = -ENOMEM;
+		goto out;
+	}
+
+	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!r) {
+		cpc925_printk(KERN_ERR, "Unable to get resource\n");
+		res = -ENOENT;
+		goto err1;
+	}
+
+	if (!devm_request_mem_region(&pdev->dev,
+				     r->start,
+				     resource_size(r),
+				     pdev->name)) {
+		cpc925_printk(KERN_ERR, "Unable to request mem region\n"

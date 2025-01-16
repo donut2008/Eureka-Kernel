@@ -1,44 +1,41 @@
 /*
- * arch/sh/mm/cache-shx3.c - SH-X3 optimized cache ops
- *
- * Copyright (C) 2010  Paul Mundt
- *
  * This file is subject to the terms and conditions of the GNU General Public
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
+ *
+ * Copyright (c) 2000 Silicon Graphics, Inc.  All rights reserved.
+ * Copyright (c) 2002 NEC Corp.
+ * Copyright (c) 2002 Erich Focht <efocht@ess.nec.de>
+ * Copyright (c) 2002 Kimio Suganuma <k-suganuma@da.jp.nec.com>
  */
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/io.h>
-#include <asm/cache.h>
+#ifndef _ASM_IA64_NODEDATA_H
+#define _ASM_IA64_NODEDATA_H
 
-#define CCR_CACHE_SNM	0x40000		/* Hardware-assisted synonym avoidance */
-#define CCR_CACHE_IBE	0x1000000	/* ICBI broadcast */
+#include <linux/numa.h>
 
-void __init shx3_cache_init(void)
-{
-	unsigned int ccr;
+#include <asm/percpu.h>
+#include <asm/mmzone.h>
 
-	ccr = __raw_readl(SH_CCR);
+#ifdef CONFIG_NUMA
 
-	/*
-	 * If we've got cache aliases, resolve them in hardware.
-	 */
-	if (boot_cpu_data.dcache.n_aliases || boot_cpu_data.icache.n_aliases) {
-		ccr |= CCR_CACHE_SNM;
+/*
+ * Node Data. One of these structures is located on each node of a NUMA system.
+ */
 
-		boot_cpu_data.icache.n_aliases = 0;
-		boot_cpu_data.dcache.n_aliases = 0;
+struct pglist_data;
+struct ia64_node_data {
+	short			active_cpu_count;
+	short			node;
+	struct pglist_data	*pg_data_ptrs[MAX_NUMNODES];
+};
 
-		pr_info("Enabling hardware synonym avoidance\n");
-	}
 
-#ifdef CONFIG_SMP
-	/*
-	 * Broadcast I-cache block invalidations by default.
-	 */
-	ccr |= CCR_CACHE_IBE;
-#endif
+/*
+ * Return a pointer to the node_data structure for the executing cpu.
+ */
+#define local_node_data		(local_cpu_data->node_data)
 
-	writel_uncached(ccr, SH_CCR);
-}
+/*
+ * Given a node id, return a pointer to the pg_data_t for the node.
+ *
+ * NODE_DATA 	- should be used in all co

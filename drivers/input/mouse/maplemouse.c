@@ -1,150 +1,61 @@
-/*
- *	SEGA Dreamcast mouse driver
- *	Based on drivers/usb/usbmouse.c
- *
- *	Copyright (c) Yaegashi Takeshi, 2001
- *	Copyright (c) Adrian McMenamin, 2008 - 2009
- */
-
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/input.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/timer.h>
-#include <linux/maple.h>
-
-MODULE_AUTHOR("Adrian McMenamin <adrian@mcmen.demon.co.uk>");
-MODULE_DESCRIPTION("SEGA Dreamcast mouse driver");
-MODULE_LICENSE("GPL");
-
-struct dc_mouse {
-	struct input_dev *dev;
-	struct maple_device *mdev;
-};
-
-static void dc_mouse_callback(struct mapleq *mq)
-{
-	int buttons, relx, rely, relz;
-	struct maple_device *mapledev = mq->dev;
-	struct dc_mouse *mse = maple_get_drvdata(mapledev);
-	struct input_dev *dev = mse->dev;
-	unsigned char *res = mq->recvbuf->buf;
-
-	buttons = ~res[8];
-	relx = *(unsigned short *)(res + 12) - 512;
-	rely = *(unsigned short *)(res + 14) - 512;
-	relz = *(unsigned short *)(res + 16) - 512;
-
-	input_report_key(dev, BTN_LEFT,   buttons & 4);
-	input_report_key(dev, BTN_MIDDLE, buttons & 9);
-	input_report_key(dev, BTN_RIGHT,  buttons & 2);
-	input_report_rel(dev, REL_X,      relx);
-	input_report_rel(dev, REL_Y,      rely);
-	input_report_rel(dev, REL_WHEEL,  relz);
-	input_sync(dev);
-}
-
-static int dc_mouse_open(struct input_dev *dev)
-{
-	struct dc_mouse *mse = maple_get_drvdata(to_maple_dev(&dev->dev));
-
-	maple_getcond_callback(mse->mdev, dc_mouse_callback, HZ/50,
-		MAPLE_FUNC_MOUSE);
-
-	return 0;
-}
-
-static void dc_mouse_close(struct input_dev *dev)
-{
-	struct dc_mouse *mse = maple_get_drvdata(to_maple_dev(&dev->dev));
-
-	maple_getcond_callback(mse->mdev, dc_mouse_callback, 0,
-		MAPLE_FUNC_MOUSE);
-}
-
-/* allow the mouse to be used */
-static int probe_maple_mouse(struct device *dev)
-{
-	struct maple_device *mdev = to_maple_dev(dev);
-	struct maple_driver *mdrv = to_maple_driver(dev->driver);
-	int error;
-	struct input_dev *input_dev;
-	struct dc_mouse *mse;
-
-	mse = kzalloc(sizeof(struct dc_mouse), GFP_KERNEL);
-	if (!mse) {
-		error = -ENOMEM;
-		goto fail;
-	}
-
-	input_dev = input_allocate_device();
-	if (!input_dev) {
-		error = -ENOMEM;
-		goto fail_nomem;
-	}
-
-	mse->dev = input_dev;
-	mse->mdev = mdev;
-
-	input_set_drvdata(input_dev, mse);
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REL);
-	input_dev->keybit[BIT_WORD(BTN_MOUSE)] = BIT_MASK(BTN_LEFT) |
-		BIT_MASK(BTN_RIGHT) | BIT_MASK(BTN_MIDDLE);
-	input_dev->relbit[0] = BIT_MASK(REL_X) | BIT_MASK(REL_Y) |
-		BIT_MASK(REL_WHEEL);
-	input_dev->open = dc_mouse_open;
-	input_dev->close = dc_mouse_close;
-	input_dev->name = mdev->product_name;
-	input_dev->id.bustype = BUS_HOST;
-	error =	input_register_device(input_dev);
-	if (error)
-		goto fail_register;
-
-	mdev->driver = mdrv;
-	maple_set_drvdata(mdev, mse);
-
-	return error;
-
-fail_register:
-	input_free_device(input_dev);
-fail_nomem:
-	kfree(mse);
-fail:
-	return error;
-}
-
-static int remove_maple_mouse(struct device *dev)
-{
-	struct maple_device *mdev = to_maple_dev(dev);
-	struct dc_mouse *mse = maple_get_drvdata(mdev);
-
-	mdev->callback = NULL;
-	input_unregister_device(mse->dev);
-	maple_set_drvdata(mdev, NULL);
-	kfree(mse);
-
-	return 0;
-}
-
-static struct maple_driver dc_mouse_driver = {
-	.function =	MAPLE_FUNC_MOUSE,
-	.drv = {
-		.name = "Dreamcast_mouse",
-		.probe = probe_maple_mouse,
-		.remove = remove_maple_mouse,
-	},
-};
-
-static int __init dc_mouse_init(void)
-{
-	return maple_driver_register(&dc_mouse_driver);
-}
-
-static void __exit dc_mouse_exit(void)
-{
-	maple_driver_unregister(&dc_mouse_driver);
-}
-
-module_init(dc_mouse_init);
-module_exit(dc_mouse_exit);
+ODE_CNTL_0__MSAA_ENABLE_MASK 0x1
+#define PA_SC_MODE_CNTL_0__MSAA_ENABLE__SHIFT 0x0
+#define PA_SC_MODE_CNTL_0__VPORT_SCISSOR_ENABLE_MASK 0x2
+#define PA_SC_MODE_CNTL_0__VPORT_SCISSOR_ENABLE__SHIFT 0x1
+#define PA_SC_MODE_CNTL_0__LINE_STIPPLE_ENABLE_MASK 0x4
+#define PA_SC_MODE_CNTL_0__LINE_STIPPLE_ENABLE__SHIFT 0x2
+#define PA_SC_MODE_CNTL_0__SEND_UNLIT_STILES_TO_PKR_MASK 0x8
+#define PA_SC_MODE_CNTL_0__SEND_UNLIT_STILES_TO_PKR__SHIFT 0x3
+#define PA_SC_MODE_CNTL_1__WALK_SIZE_MASK 0x1
+#define PA_SC_MODE_CNTL_1__WALK_SIZE__SHIFT 0x0
+#define PA_SC_MODE_CNTL_1__WALK_ALIGNMENT_MASK 0x2
+#define PA_SC_MODE_CNTL_1__WALK_ALIGNMENT__SHIFT 0x1
+#define PA_SC_MODE_CNTL_1__WALK_ALIGN8_PRIM_FITS_ST_MASK 0x4
+#define PA_SC_MODE_CNTL_1__WALK_ALIGN8_PRIM_FITS_ST__SHIFT 0x2
+#define PA_SC_MODE_CNTL_1__WALK_FENCE_ENABLE_MASK 0x8
+#define PA_SC_MODE_CNTL_1__WALK_FENCE_ENABLE__SHIFT 0x3
+#define PA_SC_MODE_CNTL_1__WALK_FENCE_SIZE_MASK 0x70
+#define PA_SC_MODE_CNTL_1__WALK_FENCE_SIZE__SHIFT 0x4
+#define PA_SC_MODE_CNTL_1__SUPERTILE_WALK_ORDER_ENABLE_MASK 0x80
+#define PA_SC_MODE_CNTL_1__SUPERTILE_WALK_ORDER_ENABLE__SHIFT 0x7
+#define PA_SC_MODE_CNTL_1__TILE_WALK_ORDER_ENABLE_MASK 0x100
+#define PA_SC_MODE_CNTL_1__TILE_WALK_ORDER_ENABLE__SHIFT 0x8
+#define PA_SC_MODE_CNTL_1__TILE_COVER_DISABLE_MASK 0x200
+#define PA_SC_MODE_CNTL_1__TILE_COVER_DISABLE__SHIFT 0x9
+#define PA_SC_MODE_CNTL_1__TILE_COVER_NO_SCISSOR_MASK 0x400
+#define PA_SC_MODE_CNTL_1__TILE_COVER_NO_SCISSOR__SHIFT 0xa
+#define PA_SC_MODE_CNTL_1__ZMM_LINE_EXTENT_MASK 0x800
+#define PA_SC_MODE_CNTL_1__ZMM_LINE_EXTENT__SHIFT 0xb
+#define PA_SC_MODE_CNTL_1__ZMM_LINE_OFFSET_MASK 0x1000
+#define PA_SC_MODE_CNTL_1__ZMM_LINE_OFFSET__SHIFT 0xc
+#define PA_SC_MODE_CNTL_1__ZMM_RECT_EXTENT_MASK 0x2000
+#define PA_SC_MODE_CNTL_1__ZMM_RECT_EXTENT__SHIFT 0xd
+#define PA_SC_MODE_CNTL_1__KILL_PIX_POST_HI_Z_MASK 0x4000
+#define PA_SC_MODE_CNTL_1__KILL_PIX_POST_HI_Z__SHIFT 0xe
+#define PA_SC_MODE_CNTL_1__KILL_PIX_POST_DETAIL_MASK_MASK 0x8000
+#define PA_SC_MODE_CNTL_1__KILL_PIX_POST_DETAIL_MASK__SHIFT 0xf
+#define PA_SC_MODE_CNTL_1__PS_ITER_SAMPLE_MASK 0x10000
+#define PA_SC_MODE_CNTL_1__PS_ITER_SAMPLE__SHIFT 0x10
+#define PA_SC_MODE_CNTL_1__MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE_MASK 0x20000
+#define PA_SC_MODE_CNTL_1__MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE__SHIFT 0x11
+#define PA_SC_MODE_CNTL_1__MULTI_GPU_SUPERTILE_ENABLE_MASK 0x40000
+#define PA_SC_MODE_CNTL_1__MULTI_GPU_SUPERTILE_ENABLE__SHIFT 0x12
+#define PA_SC_MODE_CNTL_1__GPU_ID_OVERRIDE_ENABLE_MASK 0x80000
+#define PA_SC_MODE_CNTL_1__GPU_ID_OVERRIDE_ENABLE__SHIFT 0x13
+#define PA_SC_MODE_CNTL_1__GPU_ID_OVERRIDE_MASK 0xf00000
+#define PA_SC_MODE_CNTL_1__GPU_ID_OVERRIDE__SHIFT 0x14
+#define PA_SC_MODE_CNTL_1__MULTI_GPU_PRIM_DISCARD_ENABLE_MASK 0x1000000
+#define PA_SC_MODE_CNTL_1__MULTI_GPU_PRIM_DISCARD_ENABLE__SHIFT 0x18
+#define PA_SC_MODE_CNTL_1__FORCE_EOV_CNTDWN_ENABLE_MASK 0x2000000
+#define PA_SC_MODE_CNTL_1__FORCE_EOV_CNTDWN_ENABLE__SHIFT 0x19
+#define PA_SC_MODE_CNTL_1__FORCE_EOV_REZ_ENABLE_MASK 0x4000000
+#define PA_SC_MODE_CNTL_1__FORCE_EOV_REZ_ENABLE__SHIFT 0x1a
+#define PA_SC_MODE_CNTL_1__OUT_OF_ORDER_PRIMITIVE_ENABLE_MASK 0x8000000
+#define PA_SC_MODE_CNTL_1__OUT_OF_ORDER_PRIMITIVE_ENABLE__SHIFT 0x1b
+#define PA_SC_MODE_CNTL_1__OUT_OF_ORDER_WATER_MARK_MASK 0x70000000
+#define PA_SC_MODE_CNTL_1__OUT_OF_ORDER_WATER_MARK__SHIFT 0x1c
+#define PA_SC_RASTER_CONFIG__RB_MAP_PKR0_MASK 0x3
+#define PA_SC_RASTER_CONFIG__RB_MAP_PKR0__SHIFT 0x0
+#define PA_SC_RASTER_CONFIG__RB_MAP_PKR1_MASK 0xc
+#define PA_SC_RASTER_CONFIG__RB_MAP_PKR1__SHIFT 0x2
+#de

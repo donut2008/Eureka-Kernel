@@ -1,289 +1,354 @@
-/*
- * drivers/hwmon/lis3lv02d_i2c.c
- *
- * Implements I2C interface for lis3lv02d (STMicroelectronics) accelerometer.
- * Driver is based on corresponding SPI driver written by Daniel Mack
- * (lis3lv02d_spi.c (C) 2009 Daniel Mack <daniel@caiaq.de> ).
- *
- * Copyright (C) 2009 Nokia Corporation and/or its subsidiary(-ies).
- *
- * Contact: Samu Onkalo <samu.p.onkalo@nokia.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- */
+__x) {return expm1(__x);}
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/err.h>
-#include <linux/i2c.h>
-#include <linux/pm_runtime.h>
-#include <linux/delay.h>
-#include <linux/of.h>
-#include <linux/of_platform.h>
-#include <linux/of_device.h>
+static long double
+    _TG_ATTRS
+    __tg_expm1(long double __x) {return expm1l(__x);}
 
-#include "lis3lv02d.h"
+#undef expm1
+#define expm1(__x) __tg_expm1(__tg_promote1((__x))(__x))
 
-#define DRV_NAME	"lis3lv02d_i2c"
+// fdim
 
-static const char reg_vdd[]    = "Vdd";
-static const char reg_vdd_io[] = "Vdd_IO";
+static float
+    _TG_ATTRS
+    __tg_fdim(float __x, float __y) {return fdimf(__x, __y);}
 
-static int lis3_reg_ctrl(struct lis3lv02d *lis3, bool state)
-{
-	int ret;
-	if (state == LIS3_REG_OFF) {
-		ret = regulator_bulk_disable(ARRAY_SIZE(lis3->regulators),
-					lis3->regulators);
-	} else {
-		ret = regulator_bulk_enable(ARRAY_SIZE(lis3->regulators),
-					lis3->regulators);
-		/* Chip needs time to wakeup. Not mentioned in datasheet */
-		usleep_range(10000, 20000);
-	}
-	return ret;
-}
+static double
+    _TG_ATTRS
+    __tg_fdim(double __x, double __y) {return fdim(__x, __y);}
 
-static inline s32 lis3_i2c_write(struct lis3lv02d *lis3, int reg, u8 value)
-{
-	struct i2c_client *c = lis3->bus_priv;
-	return i2c_smbus_write_byte_data(c, reg, value);
-}
+static long double
+    _TG_ATTRS
+    __tg_fdim(long double __x, long double __y) {return fdiml(__x, __y);}
 
-static inline s32 lis3_i2c_read(struct lis3lv02d *lis3, int reg, u8 *v)
-{
-	struct i2c_client *c = lis3->bus_priv;
-	*v = i2c_smbus_read_byte_data(c, reg);
-	return 0;
-}
+#undef fdim
+#define fdim(__x, __y) __tg_fdim(__tg_promote2((__x), (__y))(__x), \
+                                 __tg_promote2((__x), (__y))(__y))
 
-static inline s32 lis3_i2c_blockread(struct lis3lv02d *lis3, int reg, int len,
-				u8 *v)
-{
-	struct i2c_client *c = lis3->bus_priv;
-	reg |= (1 << 7); /* 7th bit enables address auto incrementation */
-	return i2c_smbus_read_i2c_block_data(c, reg, len, v);
-}
+// floor
 
-static int lis3_i2c_init(struct lis3lv02d *lis3)
-{
-	u8 reg;
-	int ret;
+static float
+    _TG_ATTRS
+    __tg_floor(float __x) {return floorf(__x);}
 
-	lis3_reg_ctrl(lis3, LIS3_REG_ON);
+static double
+    _TG_ATTRS
+    __tg_floor(double __x) {return floor(__x);}
 
-	lis3->read(lis3, WHO_AM_I, &reg);
-	if (reg != lis3->whoami)
-		printk(KERN_ERR "lis3: power on failure\n");
+static long double
+    _TG_ATTRS
+    __tg_floor(long double __x) {return floorl(__x);}
 
-	/* power up the device */
-	ret = lis3->read(lis3, CTRL_REG1, &reg);
-	if (ret < 0)
-		return ret;
+#undef floor
+#define floor(__x) __tg_floor(__tg_promote1((__x))(__x))
 
-	if (lis3->whoami == WAI_3DLH)
-		reg |= CTRL1_PM0 | CTRL1_Xen | CTRL1_Yen | CTRL1_Zen;
-	else
-		reg |= CTRL1_PD0 | CTRL1_Xen | CTRL1_Yen | CTRL1_Zen;
+// fma
 
-	return lis3->write(lis3, CTRL_REG1, reg);
-}
+static float
+    _TG_ATTRS
+    __tg_fma(float __x, float __y, float __z)
+    {return fmaf(__x, __y, __z);}
 
-/* Default axis mapping but it can be overwritten by platform data */
-static union axis_conversion lis3lv02d_axis_map =
-	{ .as_array = { LIS3_DEV_X, LIS3_DEV_Y, LIS3_DEV_Z } };
+static double
+    _TG_ATTRS
+    __tg_fma(double __x, double __y, double __z)
+    {return fma(__x, __y, __z);}
 
-#ifdef CONFIG_OF
-static const struct of_device_id lis3lv02d_i2c_dt_ids[] = {
-	{ .compatible = "st,lis3lv02d" },
-	{}
-};
-MODULE_DEVICE_TABLE(of, lis3lv02d_i2c_dt_ids);
-#endif
+static long double
+    _TG_ATTRS
+    __tg_fma(long double __x,long double __y, long double __z)
+    {return fmal(__x, __y, __z);}
 
-static int lis3lv02d_i2c_probe(struct i2c_client *client,
-					const struct i2c_device_id *id)
-{
-	int ret = 0;
-	struct lis3lv02d_platform_data *pdata = client->dev.platform_data;
+#undef fma
+#define fma(__x, __y, __z)                                \
+        __tg_fma(__tg_promote3((__x), (__y), (__z))(__x), \
+                 __tg_promote3((__x), (__y), (__z))(__y), \
+                 __tg_promote3((__x), (__y), (__z))(__z))
 
-#ifdef CONFIG_OF
-	if (of_match_device(lis3lv02d_i2c_dt_ids, &client->dev)) {
-		lis3_dev.of_node = client->dev.of_node;
-		ret = lis3lv02d_init_dt(&lis3_dev);
-		if (ret)
-			return ret;
-		pdata = lis3_dev.pdata;
-	}
-#endif
+// fmax
 
-	if (pdata) {
-		if ((pdata->driver_features & LIS3_USE_BLOCK_READ) &&
-			(i2c_check_functionality(client->adapter,
-						I2C_FUNC_SMBUS_I2C_BLOCK)))
-			lis3_dev.blkread  = lis3_i2c_blockread;
+static float
+    _TG_ATTRS
+    __tg_fmax(float __x, float __y) {return fmaxf(__x, __y);}
 
-		if (pdata->axis_x)
-			lis3lv02d_axis_map.x = pdata->axis_x;
+static double
+    _TG_ATTRS
+    __tg_fmax(double __x, double __y) {return fmax(__x, __y);}
 
-		if (pdata->axis_y)
-			lis3lv02d_axis_map.y = pdata->axis_y;
+static long double
+    _TG_ATTRS
+    __tg_fmax(long double __x, long double __y) {return fmaxl(__x, __y);}
 
-		if (pdata->axis_z)
-			lis3lv02d_axis_map.z = pdata->axis_z;
+#undef fmax
+#define fmax(__x, __y) __tg_fmax(__tg_promote2((__x), (__y))(__x), \
+                                 __tg_promote2((__x), (__y))(__y))
 
-		if (pdata->setup_resources)
-			ret = pdata->setup_resources();
+// fmin
 
-		if (ret)
-			goto fail;
-	}
+static float
+    _TG_ATTRS
+    __tg_fmin(float __x, float __y) {return fminf(__x, __y);}
 
-	lis3_dev.regulators[0].supply = reg_vdd;
-	lis3_dev.regulators[1].supply = reg_vdd_io;
-	ret = regulator_bulk_get(&client->dev,
-				 ARRAY_SIZE(lis3_dev.regulators),
-				 lis3_dev.regulators);
-	if (ret < 0)
-		goto fail;
+static double
+    _TG_ATTRS
+    __tg_fmin(double __x, double __y) {return fmin(__x, __y);}
 
-	lis3_dev.pdata	  = pdata;
-	lis3_dev.bus_priv = client;
-	lis3_dev.init	  = lis3_i2c_init;
-	lis3_dev.read	  = lis3_i2c_read;
-	lis3_dev.write	  = lis3_i2c_write;
-	lis3_dev.irq	  = client->irq;
-	lis3_dev.ac	  = lis3lv02d_axis_map;
-	lis3_dev.pm_dev	  = &client->dev;
+static long double
+    _TG_ATTRS
+    __tg_fmin(long double __x, long double __y) {return fminl(__x, __y);}
 
-	i2c_set_clientdata(client, &lis3_dev);
+#undef fmin
+#define fmin(__x, __y) __tg_fmin(__tg_promote2((__x), (__y))(__x), \
+                                 __tg_promote2((__x), (__y))(__y))
 
-	/* Provide power over the init call */
-	lis3_reg_ctrl(&lis3_dev, LIS3_REG_ON);
+// fmod
 
-	ret = lis3lv02d_init_device(&lis3_dev);
+static float
+    _TG_ATTRS
+    __tg_fmod(float __x, float __y) {return fmodf(__x, __y);}
 
-	lis3_reg_ctrl(&lis3_dev, LIS3_REG_OFF);
+static double
+    _TG_ATTRS
+    __tg_fmod(double __x, double __y) {return fmod(__x, __y);}
 
-	if (ret)
-		goto fail2;
-	return 0;
+static long double
+    _TG_ATTRS
+    __tg_fmod(long double __x, long double __y) {return fmodl(__x, __y);}
 
-fail2:
-	regulator_bulk_free(ARRAY_SIZE(lis3_dev.regulators),
-				lis3_dev.regulators);
-fail:
-	if (pdata && pdata->release_resources)
-		pdata->release_resources();
-	return ret;
-}
+#undef fmod
+#define fmod(__x, __y) __tg_fmod(__tg_promote2((__x), (__y))(__x), \
+                                 __tg_promote2((__x), (__y))(__y))
 
-static int lis3lv02d_i2c_remove(struct i2c_client *client)
-{
-	struct lis3lv02d *lis3 = i2c_get_clientdata(client);
-	struct lis3lv02d_platform_data *pdata = client->dev.platform_data;
+// frexp
 
-	if (pdata && pdata->release_resources)
-		pdata->release_resources();
+static float
+    _TG_ATTRS
+    __tg_frexp(float __x, int* __y) {return frexpf(__x, __y);}
 
-	lis3lv02d_joystick_disable(lis3);
-	lis3lv02d_remove_fs(&lis3_dev);
+static double
+    _TG_ATTRS
+    __tg_frexp(double __x, int* __y) {return frexp(__x, __y);}
 
-	regulator_bulk_free(ARRAY_SIZE(lis3->regulators),
-			    lis3_dev.regulators);
-	return 0;
-}
+static long double
+    _TG_ATTRS
+    __tg_frexp(long double __x, int* __y) {return frexpl(__x, __y);}
 
-#ifdef CONFIG_PM_SLEEP
-static int lis3lv02d_i2c_suspend(struct device *dev)
-{
-	struct i2c_client *client = container_of(dev, struct i2c_client, dev);
-	struct lis3lv02d *lis3 = i2c_get_clientdata(client);
+#undef frexp
+#define frexp(__x, __y) __tg_frexp(__tg_promote1((__x))(__x), __y)
 
-	if (!lis3->pdata || !lis3->pdata->wakeup_flags)
-		lis3lv02d_poweroff(lis3);
-	return 0;
-}
+// hypot
 
-static int lis3lv02d_i2c_resume(struct device *dev)
-{
-	struct i2c_client *client = container_of(dev, struct i2c_client, dev);
-	struct lis3lv02d *lis3 = i2c_get_clientdata(client);
+static float
+    _TG_ATTRS
+    __tg_hypot(float __x, float __y) {return hypotf(__x, __y);}
 
-	/*
-	 * pm_runtime documentation says that devices should always
-	 * be powered on at resume. Pm_runtime turns them off after system
-	 * wide resume is complete.
-	 */
-	if (!lis3->pdata || !lis3->pdata->wakeup_flags ||
-		pm_runtime_suspended(dev))
-		lis3lv02d_poweron(lis3);
+static double
+    _TG_ATTRS
+    __tg_hypot(double __x, double __y) {return hypot(__x, __y);}
 
-	return 0;
-}
-#endif /* CONFIG_PM_SLEEP */
+static long double
+    _TG_ATTRS
+    __tg_hypot(long double __x, long double __y) {return hypotl(__x, __y);}
 
-#ifdef CONFIG_PM
-static int lis3_i2c_runtime_suspend(struct device *dev)
-{
-	struct i2c_client *client = container_of(dev, struct i2c_client, dev);
-	struct lis3lv02d *lis3 = i2c_get_clientdata(client);
+#undef hypot
+#define hypot(__x, __y) __tg_hypot(__tg_promote2((__x), (__y))(__x), \
+                                   __tg_promote2((__x), (__y))(__y))
 
-	lis3lv02d_poweroff(lis3);
-	return 0;
-}
+// ilogb
 
-static int lis3_i2c_runtime_resume(struct device *dev)
-{
-	struct i2c_client *client = container_of(dev, struct i2c_client, dev);
-	struct lis3lv02d *lis3 = i2c_get_clientdata(client);
+static int
+    _TG_ATTRS
+    __tg_ilogb(float __x) {return ilogbf(__x);}
 
-	lis3lv02d_poweron(lis3);
-	return 0;
-}
-#endif /* CONFIG_PM */
+static int
+    _TG_ATTRS
+    __tg_ilogb(double __x) {return ilogb(__x);}
 
-static const struct i2c_device_id lis3lv02d_id[] = {
-	{"lis3lv02d", LIS3LV02D},
-	{"lis331dlh", LIS331DLH},
-	{}
-};
+static int
+    _TG_ATTRS
+    __tg_ilogb(long double __x) {return ilogbl(__x);}
 
-MODULE_DEVICE_TABLE(i2c, lis3lv02d_id);
+#undef ilogb
+#define ilogb(__x) __tg_ilogb(__tg_promote1((__x))(__x))
 
-static const struct dev_pm_ops lis3_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(lis3lv02d_i2c_suspend,
-				lis3lv02d_i2c_resume)
-	SET_RUNTIME_PM_OPS(lis3_i2c_runtime_suspend,
-			   lis3_i2c_runtime_resume,
-			   NULL)
-};
+// ldexp
 
-static struct i2c_driver lis3lv02d_i2c_driver = {
-	.driver	 = {
-		.name   = DRV_NAME,
-		.pm     = &lis3_pm_ops,
-		.of_match_table = of_match_ptr(lis3lv02d_i2c_dt_ids),
-	},
-	.probe	= lis3lv02d_i2c_probe,
-	.remove	= lis3lv02d_i2c_remove,
-	.id_table = lis3lv02d_id,
-};
+static float
+    _TG_ATTRS
+    __tg_ldexp(float __x, int __y) {return ldexpf(__x, __y);}
 
-module_i2c_driver(lis3lv02d_i2c_driver);
+static double
+    _TG_ATTRS
+    __tg_ldexp(double __x, int __y) {return ldexp(__x, __y);}
 
-MODULE_AUTHOR("Nokia Corporation");
-MODULE_DESCRIPTION("lis3lv02d I2C interface");
-MODULE_LICENSE("GPL");
+static long double
+    _TG_ATTRS
+    __tg_ldexp(long double __x, int __y) {return ldexpl(__x, __y);}
+
+#undef ldexp
+#define ldexp(__x, __y) __tg_ldexp(__tg_promote1((__x))(__x), __y)
+
+// lgamma
+
+static float
+    _TG_ATTRS
+    __tg_lgamma(float __x) {return lgammaf(__x);}
+
+static double
+    _TG_ATTRS
+    __tg_lgamma(double __x) {return lgamma(__x);}
+
+static long double
+    _TG_ATTRS
+    __tg_lgamma(long double __x) {return lgammal(__x);}
+
+#undef lgamma
+#define lgamma(__x) __tg_lgamma(__tg_promote1((__x))(__x))
+
+// llrint
+
+static long long
+    _TG_ATTRS
+    __tg_llrint(float __x) {return llrintf(__x);}
+
+static long long
+    _TG_ATTRS
+    __tg_llrint(double __x) {return llrint(__x);}
+
+static long long
+    _TG_ATTRS
+    __tg_llrint(long double __x) {return llrintl(__x);}
+
+#undef llrint
+#define llrint(__x) __tg_llrint(__tg_promote1((__x))(__x))
+
+// llround
+
+static long long
+    _TG_ATTRS
+    __tg_llround(float __x) {return llroundf(__x);}
+
+static long long
+    _TG_ATTRS
+    __tg_llround(double __x) {return llround(__x);}
+
+static long long
+    _TG_ATTRS
+    __tg_llround(long double __x) {return llroundl(__x);}
+
+#undef llround
+#define llround(__x) __tg_llround(__tg_promote1((__x))(__x))
+
+// log10
+
+static float
+    _TG_ATTRS
+    __tg_log10(float __x) {return log10f(__x);}
+
+static double
+    _TG_ATTRS
+    __tg_log10(double __x) {return log10(__x);}
+
+static long double
+    _TG_ATTRS
+    __tg_log10(long double __x) {return log10l(__x);}
+
+#undef log10
+#define log10(__x) __tg_log10(__tg_promote1((__x))(__x))
+
+// log1p
+
+static float
+    _TG_ATTRS
+    __tg_log1p(float __x) {return log1pf(__x);}
+
+static double
+    _TG_ATTRS
+    __tg_log1p(double __x) {return log1p(__x);}
+
+static long double
+    _TG_ATTRS
+    __tg_log1p(long double __x) {return log1pl(__x);}
+
+#undef log1p
+#define log1p(__x) __tg_log1p(__tg_promote1((__x))(__x))
+
+// log2
+
+static float
+    _TG_ATTRS
+    __tg_log2(float __x) {return log2f(__x);}
+
+static double
+    _TG_ATTRS
+    __tg_log2(double __x) {return log2(__x);}
+
+static long double
+    _TG_ATTRS
+    __tg_log2(long double __x) {return log2l(__x);}
+
+#undef log2
+#define log2(__x) __tg_log2(__tg_promote1((__x))(__x))
+
+// logb
+
+static float
+    _TG_ATTRS
+    __tg_logb(float __x) {return logbf(__x);}
+
+static double
+    _TG_ATTRS
+    __tg_logb(double __x) {return logb(__x);}
+
+static long double
+    _TG_ATTRS
+    __tg_logb(long double __x) {return logbl(__x);}
+
+#undef logb
+#define logb(__x) __tg_logb(__tg_promote1((__x))(__x))
+
+// lrint
+
+static long
+    _TG_ATTRS
+    __tg_lrint(float __x) {return lrintf(__x);}
+
+static long
+    _TG_ATTRS
+    __tg_lrint(double __x) {return lrint(__x);}
+
+static long
+    _TG_ATTRS
+    __tg_lrint(long double __x) {return lrintl(__x);}
+
+#undef lrint
+#define lrint(__x) __tg_lrint(__tg_promote1((__x))(__x))
+
+// lround
+
+static long
+    _TG_ATTRS
+    __tg_lround(float __x) {return lroundf(__x);}
+
+static long
+    _TG_ATTRS
+    __tg_lround(double __x) {return lround(__x);}
+
+static long
+    _TG_ATTRS
+    __tg_lround(long double __x) {return lroundl(__x);}
+
+#undef lround
+#define lround(__x) __tg_lround(__tg_promote1((__x))(__x))
+
+// nearbyint
+
+static float
+    _TG_ATTRS
+    __tg_nearbyint(float __x) {return nearbyintf(__x);}
+
+static double
+    _TG_ATTRS
+    __tg_nearbyint(double __x) {return nearbyint(__x);}
+
+sta

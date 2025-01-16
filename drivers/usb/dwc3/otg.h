@@ -1,105 +1,59 @@
-/**
- * otg.c - DesignWare USB3 DRD Controller OTG
- *
- * Copyright (c) 2012, Code Aurora Forum. All rights reserved.
- * Copyright (c) 2013 Samsung Electronics Co., Ltd.
- *		http://www.samsung.com
- *
- * Authors: Ido Shayevitz <idos@codeaurora.org>
- *	    Anton Tikhomirov <av.tikhomirov@samsung.com>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2  of
- * the License as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#ifndef __LINUX_USB_DWC3_OTG_H
-#define __LINUX_USB_DWC3_OTG_H
-#include <linux/wakelock.h>
-#include <linux/usb/otg-fsm.h>
-
-struct dwc3_ext_otg_ops {
-	int	(*setup)(struct device *dev, struct otg_fsm *fsm);
-	void	(*exit)(struct device *dev);
-	int	(*start) (struct device *dev);
-	void	(*stop)(struct device *dev);
-};
-
-/**
- * struct dwc3_otg: OTG driver data. Shared by HCD and DCD.
- * @otg: USB OTG Transceiver structure.
- * @fsm: OTG Final State Machine.
- * @dwc: pointer to our controller context structure.
- * @irq: IRQ number assigned for HSUSB controller.
- * @regs: ioremapped register base address.
- * @wakelock: prevents the system from entering suspend while
- *		host or peripheral mode is active.
- * @vbus_reg: Vbus regulator.
- * @ready: is one when OTG is ready for operation.
- * @ext_otg_ops: external OTG engine ops.
- */
-struct dwc3_otg {
-	struct usb_otg          otg;
-	struct otg_fsm		fsm;
-	struct dwc3             *dwc;
-	int                     irq;
-	void __iomem            *regs;
-	struct wake_lock	wakelock;
-
-	unsigned		ready:1;
-
-	struct regulator	*vbus_reg;
-
-	struct dwc3_ext_otg_ops *ext_otg_ops;
-};
-
-static inline int dwc3_ext_otg_setup(struct dwc3_otg *dotg)
-{
-	struct device *dev = dotg->dwc->dev->parent;
-
-	if (!dotg->ext_otg_ops->setup)
-		return -EOPNOTSUPP;
-	return dotg->ext_otg_ops->setup(dev, &dotg->fsm);
-}
-
-static inline int dwc3_ext_otg_exit(struct dwc3_otg *dotg)
-{
-	struct device *dev = dotg->dwc->dev->parent;
-
-	if (!dotg->ext_otg_ops->exit)
-		return -EOPNOTSUPP;
-	dotg->ext_otg_ops->exit(dev);
-	return 0;
-}
-
-static inline int dwc3_ext_otg_start(struct dwc3_otg *dotg)
-{
-	struct device *dev = dotg->dwc->dev->parent;
-
-	if (!dotg->ext_otg_ops->start)
-		return -EOPNOTSUPP;
-	return dotg->ext_otg_ops->start(dev);
-}
-
-static inline int dwc3_ext_otg_stop(struct dwc3_otg *dotg)
-{
-	struct device *dev = dotg->dwc->dev->parent;
-
-	if (!dotg->ext_otg_ops->stop)
-		return -EOPNOTSUPP;
-	dotg->ext_otg_ops->stop(dev);
-	return 0;
-}
-
-bool dwc3_exynos_rsw_available(struct device *dev);
-int dwc3_exynos_rsw_setup(struct device *dev, struct otg_fsm *fsm);
-void dwc3_exynos_rsw_exit(struct device *dev);
-int dwc3_exynos_rsw_start(struct device *dev);
-void dwc3_exynos_rsw_stop(struct device *dev);
-
-#endif /* __LINUX_USB_DWC3_OTG_H */
+FT 0x16
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__exe_MASK 0x800000
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__exe__SHIFT 0x17
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__snoop_MASK 0x1000000
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__snoop__SHIFT 0x18
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__shared_MASK 0x2000000
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__shared__SHIFT 0x19
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__vf_MASK 0x4000000
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__vf__SHIFT 0x1a
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__vfid_MASK 0xf8000000
+#define MP_DRAM_CNTL_RDREQ_CNTL_1__vfid__SHIFT 0x1b
+#define MP_DRAM_CNTL_RDRET_VALID__vld_0_MASK 0x1
+#define MP_DRAM_CNTL_RDRET_VALID__vld_0__SHIFT 0x0
+#define MP_DRAM_CNTL_RDRET_VALID__vld_1_MASK 0x2
+#define MP_DRAM_CNTL_RDRET_VALID__vld_1__SHIFT 0x1
+#define MP_DRAM_CNTL_RDRET_VALID__vld_2_MASK 0x4
+#define MP_DRAM_CNTL_RDRET_VALID__vld_2__SHIFT 0x2
+#define MP_DRAM_CNTL_RDRET_VALID__vld_3_MASK 0x8
+#define MP_DRAM_CNTL_RDRET_VALID__vld_3__SHIFT 0x3
+#define MP_DRAM_CNTL_RDRET_VALID__vld_4_MASK 0x10
+#define MP_DRAM_CNTL_RDRET_VALID__vld_4__SHIFT 0x4
+#define MP_DRAM_CNTL_RDRET_VALID__vld_5_MASK 0x20
+#define MP_DRAM_CNTL_RDRET_VALID__vld_5__SHIFT 0x5
+#define MP_DRAM_CNTL_RDRET_VALID__vld_6_MASK 0x40
+#define MP_DRAM_CNTL_RDRET_VALID__vld_6__SHIFT 0x6
+#define MP_DRAM_CNTL_RDRET_VALID__vld_7_MASK 0x80
+#define MP_DRAM_CNTL_RDRET_VALID__vld_7__SHIFT 0x7
+#define MP_DRAM_CNTL_RDRET_VALID__reserved_MASK 0xffff00
+#define MP_DRAM_CNTL_RDRET_VALID__reserved__SHIFT 0x8
+#define MP_DRAM_CNTL_RDRET_VALID__atomic_MASK 0xff000000
+#define MP_DRAM_CNTL_RDRET_VALID__atomic__SHIFT 0x18
+#define MP_DRAM_CNTL_RDRET_NACK__nack_0_MASK 0x3
+#define MP_DRAM_CNTL_RDRET_NACK__nack_0__SHIFT 0x0
+#define MP_DRAM_CNTL_RDRET_NACK__nack_1_MASK 0xc
+#define MP_DRAM_CNTL_RDRET_NACK__nack_1__SHIFT 0x2
+#define MP_DRAM_CNTL_RDRET_NACK__nack_2_MASK 0x30
+#define MP_DRAM_CNTL_RDRET_NACK__nack_2__SHIFT 0x4
+#define MP_DRAM_CNTL_RDRET_NACK__nack_3_MASK 0xc0
+#define MP_DRAM_CNTL_RDRET_NACK__nack_3__SHIFT 0x6
+#define MP_DRAM_CNTL_RDRET_NACK__nack_4_MASK 0x300
+#define MP_DRAM_CNTL_RDRET_NACK__nack_4__SHIFT 0x8
+#define MP_DRAM_CNTL_RDRET_NACK__nack_5_MASK 0xc00
+#define MP_DRAM_CNTL_RDRET_NACK__nack_5__SHIFT 0xa
+#define MP_DRAM_CNTL_RDRET_NACK__nack_6_MASK 0x3000
+#define MP_DRAM_CNTL_RDRET_NACK__nack_6__SHIFT 0xc
+#define MP_DRAM_CNTL_RDRET_NACK__nack_7_MASK 0xc000
+#define MP_DRAM_CNTL_RDRET_NACK__nack_7__SHIFT 0xe
+#define MP_DRAM_CNTL_RDRET_NACK__reserved_MASK 0xffff0000
+#define MP_DRAM_CNTL_RDRET_NACK__reserved__SHIFT 0x10
+#define MP_DRAM_CNTL_RDRET_DATA_0__DATA_MASK 0xffffffff
+#define MP_DRAM_CNTL_RDRET_DATA_0__DATA__SHIFT 0x0
+#define MP_DRAM_CNTL_RDRET_DATA_1__DATA_MASK 0xffffffff
+#define MP_DRAM_CNTL_RDRET_DATA_1__DATA__SHIFT 0x0
+#define MP_DRAM_CNTL_RDRET_DATA_2__DATA_MASK 0xffffffff
+#define MP_DRAM_CNTL_RDRET_DATA_2__DATA__SHIFT 0x0
+#define MP_DRAM_CNTL_RDRET_DATA_3__DATA_MASK 0xffffffff
+#define MP_DRAM_CNTL_RDRET_DATA_3__DATA__SHIFT 0x0
+#define MP_DRAM_CNTL_RDRET_DATA_4__DATA_MASK 0xffffffff
+#define MP_DRAM_CNTL_RDRET_DA

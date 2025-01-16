@@ -1,421 +1,394 @@
-/*
- * MAXIM MAX77693/MAX77843 Haptic device driver
+ IB_SMP_INVALID_FIELD;
+	}
+
+	if (clientrereg) {
+		event.event = IB_EVENT_CLIENT_REREGISTER;
+		ib_dispatch_event(&event);
+	}
+
+	ret = subn_get_portinfo(smp, ibdev, port);
+
+	/* restore re-reg bit per o14-12.2.1 */
+	pip->clientrereg_resv_subnetto |= clientrereg;
+
+	goto get_only;
+
+err:
+	smp->status |= IB_SMP_INVALID_FIELD;
+get_only:
+	ret = subn_get_portinfo(smp, ibdev, port);
+done:
+	return ret;
+}
+
+/**
+ * rm_pkey - decrecment the reference count for the given PKEY
+ * @dd: the qlogic_ib device
+ * @key: the PKEY index
  *
- * Copyright (C) 2014,2015 Samsung Electronics
- * Jaewon Kim <jaewon02.kim@samsung.com>
- * Krzysztof Kozlowski <k.kozlowski@samsung.com>
- *
- * This program is not provided / owned by Maxim Integrated Products.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * Return true if this was the last reference and the hardware table entry
+ * needs to be changed.
  */
-
-#include <linux/err.h>
-#include <linux/init.h>
-#include <linux/i2c.h>
-#include <linux/regmap.h>
-#include <linux/input.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/pwm.h>
-#include <linux/slab.h>
-#include <linux/workqueue.h>
-#include <linux/regulator/consumer.h>
-#include <linux/mfd/max77693.h>
-#include <linux/mfd/max77693-common.h>
-#include <linux/mfd/max77693-private.h>
-#include <linux/mfd/max77843-private.h>
-
-#define MAX_MAGNITUDE_SHIFT	16
-
-enum max77693_haptic_motor_type {
-	MAX77693_HAPTIC_ERM = 0,
-	MAX77693_HAPTIC_LRA,
-};
-
-enum max77693_haptic_pulse_mode {
-	MAX77693_HAPTIC_EXTERNAL_MODE = 0,
-	MAX77693_HAPTIC_INTERNAL_MODE,
-};
-
-enum max77693_haptic_pwm_divisor {
-	MAX77693_HAPTIC_PWM_DIVISOR_32 = 0,
-	MAX77693_HAPTIC_PWM_DIVISOR_64,
-	MAX77693_HAPTIC_PWM_DIVISOR_128,
-	MAX77693_HAPTIC_PWM_DIVISOR_256,
-};
-
-struct max77693_haptic {
-	enum max77693_types dev_type;
-
-	struct regmap *regmap_pmic;
-	struct regmap *regmap_haptic;
-	struct device *dev;
-	struct input_dev *input_dev;
-	struct pwm_device *pwm_dev;
-	struct regulator *motor_reg;
-
-	bool enabled;
-	bool suspend_state;
-	unsigned int magnitude;
-	unsigned int pwm_duty;
-	enum max77693_haptic_motor_type type;
-	enum max77693_haptic_pulse_mode mode;
-
-	struct work_struct work;
-};
-
-static int max77693_haptic_set_duty_cycle(struct max77693_haptic *haptic)
+static int rm_pkey(struct qib_pportdata *ppd, u16 key)
 {
-	int delta = (haptic->pwm_dev->period + haptic->pwm_duty) / 2;
-	int error;
+	int i;
+	int ret;
 
-	error = pwm_config(haptic->pwm_dev, delta, haptic->pwm_dev->period);
-	if (error) {
-		dev_err(haptic->dev, "failed to configure pwm: %d\n", error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int max77843_haptic_bias(struct max77693_haptic *haptic, bool on)
-{
-	int error;
-
-	if (haptic->dev_type != TYPE_MAX77843)
-		return 0;
-
-	error = regmap_update_bits(haptic->regmap_haptic,
-				   MAX77843_SYS_REG_MAINCTRL1,
-				   MAX77843_MAINCTRL1_BIASEN_MASK,
-				   on << MAINCTRL1_BIASEN_SHIFT);
-	if (error) {
-		dev_err(haptic->dev, "failed to %s bias: %d\n",
-			on ? "enable" : "disable", error);
-		return error;
-	}
-
-	return 0;
-}
-
-static int max77693_haptic_configure(struct max77693_haptic *haptic,
-				     bool enable)
-{
-	unsigned int value, config_reg;
-	int error;
-
-	switch (haptic->dev_type) {
-	case TYPE_MAX77693:
-		value = ((haptic->type << MAX77693_CONFIG2_MODE) |
-			(enable << MAX77693_CONFIG2_MEN) |
-			(haptic->mode << MAX77693_CONFIG2_HTYP) |
-			MAX77693_HAPTIC_PWM_DIVISOR_128);
-		config_reg = MAX77693_HAPTIC_REG_CONFIG2;
+	for (i = 0; i < ARRAY_SIZE(ppd->pkeys); i++) {
+		if (ppd->pkeys[i] != key)
+			continue;
+		if (atomic_dec_and_test(&ppd->pkeyrefs[i])) {
+			ppd->pkeys[i] = 0;
+			ret = 1;
+			goto bail;
+		}
 		break;
-	case TYPE_MAX77843:
-		value = (haptic->type << MCONFIG_MODE_SHIFT) |
-			(enable << MCONFIG_MEN_SHIFT) |
-			MAX77693_HAPTIC_PWM_DIVISOR_128;
-		config_reg = MAX77843_HAP_REG_MCONFIG;
-		break;
-	default:
-		return -EINVAL;
 	}
 
-	error = regmap_write(haptic->regmap_haptic,
-			     config_reg, value);
-	if (error) {
-		dev_err(haptic->dev,
-			"failed to update haptic config: %d\n", error);
-		return error;
+	ret = 0;
+
+bail:
+	return ret;
+}
+
+/**
+ * add_pkey - add the given PKEY to the hardware table
+ * @dd: the qlogic_ib device
+ * @key: the PKEY
+ *
+ * Return an error code if unable to add the entry, zero if no change,
+ * or 1 if the hardware PKEY register needs to be updated.
+ */
+static int add_pkey(struct qib_pportdata *ppd, u16 key)
+{
+	int i;
+	u16 lkey = key & 0x7FFF;
+	int any = 0;
+	int ret;
+
+	if (lkey == 0x7FFF) {
+		ret = 0;
+		goto bail;
 	}
 
-	return 0;
-}
-
-static int max77693_haptic_lowsys(struct max77693_haptic *haptic, bool enable)
-{
-	int error;
-
-	if (haptic->dev_type != TYPE_MAX77693)
-		return 0;
-
-	error = regmap_update_bits(haptic->regmap_pmic,
-				   MAX77693_PMIC_REG_LSCNFG,
-				   MAX77693_PMIC_LOW_SYS_MASK,
-				   enable << MAX77693_PMIC_LOW_SYS_SHIFT);
-	if (error) {
-		dev_err(haptic->dev, "cannot update pmic regmap: %d\n", error);
-		return error;
+	/* Look for an empty slot or a matching PKEY. */
+	for (i = 0; i < ARRAY_SIZE(ppd->pkeys); i++) {
+		if (!ppd->pkeys[i]) {
+			any++;
+			continue;
+		}
+		/* If it matches exactly, try to increment the ref count */
+		if (ppd->pkeys[i] == key) {
+			if (atomic_inc_return(&ppd->pkeyrefs[i]) > 1) {
+				ret = 0;
+				goto bail;
+			}
+			/* Lost the race. Look for an empty slot below. */
+			atomic_dec(&ppd->pkeyrefs[i]);
+			any++;
+		}
+		/*
+		 * It makes no sense to have both the limited and unlimited
+		 * PKEY set at the same time since the unlimited one will
+		 * disable the limited one.
+		 */
+		if ((ppd->pkeys[i] & 0x7FFF) == lkey) {
+			ret = -EEXIST;
+			goto bail;
+		}
 	}
-
-	return 0;
-}
-
-static void max77693_haptic_enable(struct max77693_haptic *haptic)
-{
-	int error;
-
-	if (haptic->enabled)
-		return;
-
-	error = pwm_enable(haptic->pwm_dev);
-	if (error) {
-		dev_err(haptic->dev,
-			"failed to enable haptic pwm device: %d\n", error);
-		return;
+	if (!any) {
+		ret = -EBUSY;
+		goto bail;
 	}
-
-	error = max77693_haptic_lowsys(haptic, true);
-	if (error)
-		goto err_enable_lowsys;
-
-	error = max77693_haptic_configure(haptic, true);
-	if (error)
-		goto err_enable_config;
-
-	haptic->enabled = true;
-
-	return;
-
-err_enable_config:
-	max77693_haptic_lowsys(haptic, false);
-err_enable_lowsys:
-	pwm_disable(haptic->pwm_dev);
-}
-
-static void max77693_haptic_disable(struct max77693_haptic *haptic)
-{
-	int error;
-
-	if (!haptic->enabled)
-		return;
-
-	error = max77693_haptic_configure(haptic, false);
-	if (error)
-		return;
-
-	error = max77693_haptic_lowsys(haptic, false);
-	if (error)
-		goto err_disable_lowsys;
-
-	pwm_disable(haptic->pwm_dev);
-	haptic->enabled = false;
-
-	return;
-
-err_disable_lowsys:
-	max77693_haptic_configure(haptic, true);
-}
-
-static void max77693_haptic_play_work(struct work_struct *work)
-{
-	struct max77693_haptic *haptic =
-			container_of(work, struct max77693_haptic, work);
-	int error;
-
-	error = max77693_haptic_set_duty_cycle(haptic);
-	if (error) {
-		dev_err(haptic->dev, "failed to set duty cycle: %d\n", error);
-		return;
+	for (i = 0; i < ARRAY_SIZE(ppd->pkeys); i++) {
+		if (!ppd->pkeys[i] &&
+		    atomic_inc_return(&ppd->pkeyrefs[i]) == 1) {
+			/* for qibstats, etc. */
+			ppd->pkeys[i] = key;
+			ret = 1;
+			goto bail;
+		}
 	}
+	ret = -EBUSY;
 
-	if (haptic->magnitude)
-		max77693_haptic_enable(haptic);
-	else
-		max77693_haptic_disable(haptic);
+bail:
+	return ret;
 }
 
-static int max77693_haptic_play_effect(struct input_dev *dev, void *data,
-				       struct ff_effect *effect)
+/**
+ * set_pkeys - set the PKEY table for ctxt 0
+ * @dd: the qlogic_ib device
+ * @port: the IB port number
+ * @pkeys: the PKEY table
+ */
+static int set_pkeys(struct qib_devdata *dd, u8 port, u16 *pkeys)
 {
-	struct max77693_haptic *haptic = input_get_drvdata(dev);
-	u64 period_mag_multi;
-
-	haptic->magnitude = effect->u.rumble.strong_magnitude;
-	if (!haptic->magnitude)
-		haptic->magnitude = effect->u.rumble.weak_magnitude;
+	struct qib_pportdata *ppd;
+	struct qib_ctxtdata *rcd;
+	int i;
+	int changed = 0;
 
 	/*
-	 * The magnitude comes from force-feedback interface.
-	 * The formula to convert magnitude to pwm_duty as follows:
-	 * - pwm_duty = (magnitude * pwm_period) / MAX_MAGNITUDE(0xFFFF)
+	 * IB port one/two always maps to context zero/one,
+	 * always a kernel context, no locking needed
+	 * If we get here with ppd setup, no need to check
+	 * that rcd is valid.
 	 */
-	period_mag_multi = (u64)haptic->pwm_dev->period * haptic->magnitude;
-	haptic->pwm_duty = (unsigned int)(period_mag_multi >>
-						MAX_MAGNITUDE_SHIFT);
+	ppd = dd->pport + (port - 1);
+	rcd = dd->rcd[ppd->hw_pidx];
 
-	schedule_work(&haptic->work);
+	for (i = 0; i < ARRAY_SIZE(rcd->pkeys); i++) {
+		u16 key = pkeys[i];
+		u16 okey = rcd->pkeys[i];
 
+		if (key == okey)
+			continue;
+		/*
+		 * The value of this PKEY table entry is changing.
+		 * Remove the old entry in the hardware's array of PKEYs.
+		 */
+		if (okey & 0x7FFF)
+			changed |= rm_pkey(ppd, okey);
+		if (key & 0x7FFF) {
+			int ret = add_pkey(ppd, key);
+
+			if (ret < 0)
+				key = 0;
+			else
+				changed |= ret;
+		}
+		rcd->pkeys[i] = key;
+	}
+	if (changed) {
+		struct ib_event event;
+
+		(void) dd->f_set_ib_cfg(ppd, QIB_IB_CFG_PKEYS, 0);
+
+		event.event = IB_EVENT_PKEY_CHANGE;
+		event.device = &dd->verbs_dev.ibdev;
+		event.element.port_num = port;
+		ib_dispatch_event(&event);
+	}
 	return 0;
 }
 
-static int max77693_haptic_open(struct input_dev *dev)
+static int subn_set_pkeytable(struct ib_smp *smp, struct ib_device *ibdev,
+			      u8 port)
 {
-	struct max77693_haptic *haptic = input_get_drvdata(dev);
-	int error;
+	u32 startpx = 32 * (be32_to_cpu(smp->attr_mod) & 0xffff);
+	__be16 *p = (__be16 *) smp->data;
+	u16 *q = (u16 *) smp->data;
+	struct qib_devdata *dd = dd_from_ibdev(ibdev);
+	unsigned i, n = qib_get_npkeys(dd);
 
-	error = max77843_haptic_bias(haptic, true);
-	if (error)
-		return error;
+	for (i = 0; i < n; i++)
+		q[i] = be16_to_cpu(p[i]);
 
-	error = regulator_enable(haptic->motor_reg);
-	if (error) {
-		dev_err(haptic->dev,
-			"failed to enable regulator: %d\n", error);
-		return error;
-	}
+	if (startpx != 0 || set_pkeys(dd, port, q) != 0)
+		smp->status |= IB_SMP_INVALID_FIELD;
 
-	return 0;
+	return subn_get_pkeytable(smp, ibdev, port);
 }
 
-static void max77693_haptic_close(struct input_dev *dev)
+static int subn_get_sl_to_vl(struct ib_smp *smp, struct ib_device *ibdev,
+			     u8 port)
 {
-	struct max77693_haptic *haptic = input_get_drvdata(dev);
-	int error;
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	u8 *p = (u8 *) smp->data;
+	unsigned i;
 
-	cancel_work_sync(&haptic->work);
-	max77693_haptic_disable(haptic);
+	memset(smp->data, 0, sizeof(smp->data));
 
-	error = regulator_disable(haptic->motor_reg);
-	if (error)
-		dev_err(haptic->dev,
-			"failed to disable regulator: %d\n", error);
+	if (!(ibp->port_cap_flags & IB_PORT_SL_MAP_SUP))
+		smp->status |= IB_SMP_UNSUP_METHOD;
+	else
+		for (i = 0; i < ARRAY_SIZE(ibp->sl_to_vl); i += 2)
+			*p++ = (ibp->sl_to_vl[i] << 4) | ibp->sl_to_vl[i + 1];
 
-	max77843_haptic_bias(haptic, false);
+	return reply(smp);
 }
 
-static int max77693_haptic_probe(struct platform_device *pdev)
+static int subn_set_sl_to_vl(struct ib_smp *smp, struct ib_device *ibdev,
+			     u8 port)
 {
-	struct max77693_dev *max77693 = dev_get_drvdata(pdev->dev.parent);
-	struct max77693_haptic *haptic;
-	int error;
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	u8 *p = (u8 *) smp->data;
+	unsigned i;
 
-	haptic = devm_kzalloc(&pdev->dev, sizeof(*haptic), GFP_KERNEL);
-	if (!haptic)
-		return -ENOMEM;
-
-	haptic->regmap_pmic = max77693->regmap;
-	haptic->dev = &pdev->dev;
-	haptic->type = MAX77693_HAPTIC_LRA;
-	haptic->mode = MAX77693_HAPTIC_EXTERNAL_MODE;
-	haptic->suspend_state = false;
-
-	/* Variant-specific init */
-	haptic->dev_type = platform_get_device_id(pdev)->driver_data;
-	switch (haptic->dev_type) {
-	case TYPE_MAX77693:
-		haptic->regmap_haptic = max77693->regmap_haptic;
-		break;
-	case TYPE_MAX77843:
-		haptic->regmap_haptic = max77693->regmap;
-		break;
-	default:
-		dev_err(&pdev->dev, "unsupported device type: %u\n",
-			haptic->dev_type);
-		return -EINVAL;
+	if (!(ibp->port_cap_flags & IB_PORT_SL_MAP_SUP)) {
+		smp->status |= IB_SMP_UNSUP_METHOD;
+		return reply(smp);
 	}
 
-	INIT_WORK(&haptic->work, max77693_haptic_play_work);
-
-	/* Get pwm and regulatot for haptic device */
-	haptic->pwm_dev = devm_pwm_get(&pdev->dev, NULL);
-	if (IS_ERR(haptic->pwm_dev)) {
-		dev_err(&pdev->dev, "failed to get pwm device\n");
-		return PTR_ERR(haptic->pwm_dev);
+	for (i = 0; i < ARRAY_SIZE(ibp->sl_to_vl); i += 2, p++) {
+		ibp->sl_to_vl[i] = *p >> 4;
+		ibp->sl_to_vl[i + 1] = *p & 0xF;
 	}
+	qib_set_uevent_bits(ppd_from_ibp(to_iport(ibdev, port)),
+			    _QIB_EVENT_SL2VL_CHANGE_BIT);
 
-	haptic->motor_reg = devm_regulator_get(&pdev->dev, "haptic");
-	if (IS_ERR(haptic->motor_reg)) {
-		dev_err(&pdev->dev, "failed to get regulator\n");
-		return PTR_ERR(haptic->motor_reg);
-	}
-
-	/* Initialize input device for haptic device */
-	haptic->input_dev = devm_input_allocate_device(&pdev->dev);
-	if (!haptic->input_dev) {
-		dev_err(&pdev->dev, "failed to allocate input device\n");
-		return -ENOMEM;
-	}
-
-	haptic->input_dev->name = "max77693-haptic";
-	haptic->input_dev->id.version = 1;
-	haptic->input_dev->dev.parent = &pdev->dev;
-	haptic->input_dev->open = max77693_haptic_open;
-	haptic->input_dev->close = max77693_haptic_close;
-	input_set_drvdata(haptic->input_dev, haptic);
-	input_set_capability(haptic->input_dev, EV_FF, FF_RUMBLE);
-
-	error = input_ff_create_memless(haptic->input_dev, NULL,
-				max77693_haptic_play_effect);
-	if (error) {
-		dev_err(&pdev->dev, "failed to create force-feedback\n");
-		return error;
-	}
-
-	error = input_register_device(haptic->input_dev);
-	if (error) {
-		dev_err(&pdev->dev, "failed to register input device\n");
-		return error;
-	}
-
-	platform_set_drvdata(pdev, haptic);
-
-	return 0;
+	return subn_get_sl_to_vl(smp, ibdev, port);
 }
 
-static int __maybe_unused max77693_haptic_suspend(struct device *dev)
+static int subn_get_vl_arb(struct ib_smp *smp, struct ib_device *ibdev,
+			   u8 port)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct max77693_haptic *haptic = platform_get_drvdata(pdev);
+	unsigned which = be32_to_cpu(smp->attr_mod) >> 16;
+	struct qib_pportdata *ppd = ppd_from_ibp(to_iport(ibdev, port));
 
-	if (haptic->enabled) {
-		max77693_haptic_disable(haptic);
-		haptic->suspend_state = true;
-	}
+	memset(smp->data, 0, sizeof(smp->data));
 
-	return 0;
+	if (ppd->vls_supported == IB_VL_VL0)
+		smp->status |= IB_SMP_UNSUP_METHOD;
+	else if (which == IB_VLARB_LOWPRI_0_31)
+		(void) ppd->dd->f_get_ib_table(ppd, QIB_IB_TBL_VL_LOW_ARB,
+						   smp->data);
+	else if (which == IB_VLARB_HIGHPRI_0_31)
+		(void) ppd->dd->f_get_ib_table(ppd, QIB_IB_TBL_VL_HIGH_ARB,
+						   smp->data);
+	else
+		smp->status |= IB_SMP_INVALID_FIELD;
+
+	return reply(smp);
 }
 
-static int __maybe_unused max77693_haptic_resume(struct device *dev)
+static int subn_set_vl_arb(struct ib_smp *smp, struct ib_device *ibdev,
+			   u8 port)
 {
-	struct platform_device *pdev = to_platform_device(dev);
-	struct max77693_haptic *haptic = platform_get_drvdata(pdev);
+	unsigned which = be32_to_cpu(smp->attr_mod) >> 16;
+	struct qib_pportdata *ppd = ppd_from_ibp(to_iport(ibdev, port));
 
-	if (haptic->suspend_state) {
-		max77693_haptic_enable(haptic);
-		haptic->suspend_state = false;
-	}
+	if (ppd->vls_supported == IB_VL_VL0)
+		smp->status |= IB_SMP_UNSUP_METHOD;
+	else if (which == IB_VLARB_LOWPRI_0_31)
+		(void) ppd->dd->f_set_ib_table(ppd, QIB_IB_TBL_VL_LOW_ARB,
+						   smp->data);
+	else if (which == IB_VLARB_HIGHPRI_0_31)
+		(void) ppd->dd->f_set_ib_table(ppd, QIB_IB_TBL_VL_HIGH_ARB,
+						   smp->data);
+	else
+		smp->status |= IB_SMP_INVALID_FIELD;
 
-	return 0;
+	return subn_get_vl_arb(smp, ibdev, port);
 }
 
-static SIMPLE_DEV_PM_OPS(max77693_haptic_pm_ops,
-			 max77693_haptic_suspend, max77693_haptic_resume);
+static int subn_trap_repress(struct ib_smp *smp, struct ib_device *ibdev,
+			     u8 port)
+{
+	/*
+	 * For now, we only send the trap once so no need to process this.
+	 * o13-6, o13-7,
+	 * o14-3.a4 The SMA shall not send any message in response to a valid
+	 * SubnTrapRepress() message.
+	 */
+	return IB_MAD_RESULT_SUCCESS | IB_MAD_RESULT_CONSUMED;
+}
 
-static const struct platform_device_id max77693_haptic_id[] = {
-	{ "max77693-haptic", TYPE_MAX77693 },
-	{ "max77843-haptic", TYPE_MAX77843 },
-	{},
-};
-MODULE_DEVICE_TABLE(platform, max77693_haptic_id);
+static int pma_get_classportinfo(struct ib_pma_mad *pmp,
+				 struct ib_device *ibdev)
+{
+	struct ib_class_port_info *p =
+		(struct ib_class_port_info *)pmp->data;
+	struct qib_devdata *dd = dd_from_ibdev(ibdev);
 
-static struct platform_driver max77693_haptic_driver = {
-	.driver		= {
-		.name	= "max77693-haptic",
-		.pm	= &max77693_haptic_pm_ops,
-	},
-	.probe		= max77693_haptic_probe,
-	.id_table	= max77693_haptic_id,
-};
-module_platform_driver(max77693_haptic_driver);
+	memset(pmp->data, 0, sizeof(pmp->data));
 
-MODULE_AUTHOR("Jaewon Kim <jaewon02.kim@samsung.com>");
-MODULE_AUTHOR("Krzysztof Kozlowski <k.kozlowski@samsung.com>");
-MODULE_DESCRIPTION("MAXIM 77693/77843 Haptic driver");
-MODULE_ALIAS("platform:max77693-haptic");
-MODULE_LICENSE("GPL");
+	if (pmp->mad_hdr.attr_mod != 0)
+		pmp->mad_hdr.status |= IB_SMP_INVALID_FIELD;
+
+	/* Note that AllPortSelect is not valid */
+	p->base_version = 1;
+	p->class_version = 1;
+	p->capability_mask = IB_PMA_CLASS_CAP_EXT_WIDTH;
+	/*
+	 * Set the most significant bit of CM2 to indicate support for
+	 * congestion statistics
+	 */
+	p->reserved[0] = dd->psxmitwait_supported << 7;
+	/*
+	 * Expected response time is 4.096 usec. * 2^18 == 1.073741824 sec.
+	 */
+	p->resp_time_value = 18;
+
+	return reply((struct ib_smp *) pmp);
+}
+
+static int pma_get_portsamplescontrol(struct ib_pma_mad *pmp,
+				      struct ib_device *ibdev, u8 port)
+{
+	struct ib_pma_portsamplescontrol *p =
+		(struct ib_pma_portsamplescontrol *)pmp->data;
+	struct qib_ibdev *dev = to_idev(ibdev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	unsigned long flags;
+	u8 port_select = p->port_select;
+
+	memset(pmp->data, 0, sizeof(pmp->data));
+
+	p->port_select = port_select;
+	if (pmp->mad_hdr.attr_mod != 0 || port_select != port) {
+		pmp->mad_hdr.status |= IB_SMP_INVALID_FIELD;
+		goto bail;
+	}
+	spin_lock_irqsave(&ibp->lock, flags);
+	p->tick = dd->f_get_ib_cfg(ppd, QIB_IB_CFG_PMA_TICKS);
+	p->sample_status = dd->f_portcntr(ppd, QIBPORTCNTR_PSSTAT);
+	p->counter_width = 4;   /* 32 bit counters */
+	p->counter_mask0_9 = COUNTER_MASK0_9;
+	p->sample_start = cpu_to_be32(ibp->pma_sample_start);
+	p->sample_interval = cpu_to_be32(ibp->pma_sample_interval);
+	p->tag = cpu_to_be16(ibp->pma_tag);
+	p->counter_select[0] = ibp->pma_counter_select[0];
+	p->counter_select[1] = ibp->pma_counter_select[1];
+	p->counter_select[2] = ibp->pma_counter_select[2];
+	p->counter_select[3] = ibp->pma_counter_select[3];
+	p->counter_select[4] = ibp->pma_counter_select[4];
+	spin_unlock_irqrestore(&ibp->lock, flags);
+
+bail:
+	return reply((struct ib_smp *) pmp);
+}
+
+static int pma_set_portsamplescontrol(struct ib_pma_mad *pmp,
+				      struct ib_device *ibdev, u8 port)
+{
+	struct ib_pma_portsamplescontrol *p =
+		(struct ib_pma_portsamplescontrol *)pmp->data;
+	struct qib_ibdev *dev = to_idev(ibdev);
+	struct qib_devdata *dd = dd_from_dev(dev);
+	struct qib_ibport *ibp = to_iport(ibdev, port);
+	struct qib_pportdata *ppd = ppd_from_ibp(ibp);
+	unsigned long flags;
+	u8 status, xmit_flags;
+	int ret;
+
+	if (pmp->mad_hdr.attr_mod != 0 || p->port_select != port) {
+		pmp->mad_hdr.status |= IB_SMP_INVALID_FIELD;
+		ret = reply((struct ib_smp *) pmp);
+		goto bail;
+	}
+
+	spin_lock_irqsave(&ibp->lock, flags);
+
+	/* Port Sampling code owns the PS* HW counters */
+	xmit_flags = ppd->cong_stats.flags;
+	ppd->cong_stats.flags = IB_PMA_CONG_HW_CONTROL_SAMPLE;
+	status = dd->f_portcntr(ppd, QIBPORTCNTR_PSSTAT);
+	if (status == IB_PMA_SAMPLE_STATUS_DONE ||
+	    (status == IB_PMA_SAMPLE_STATUS_RUNNING &&
+	     xmit_flags == IB_PMA_CONG_HW_CONTROL_TIMER)) {
+		ibp->pma_sample_start = be32_to_cpu(p->sample_start);
+		ibp->pma_sample_interval = be32_to_cpu(p->sample_interval);
+		ibp->pma_tag = be16_to_cpu(p->tag);
+		ibp->pma_counter_select[0] = p->counter_select[0];
+		ibp->pma_counter_select[1] = p->counter_select[1];
+		ibp->pma_counter_select[2] = p->counter_select[2];
+		ibp->pma_counter_select[3] = p->counter_select[3];
+		ibp->pma_counter_select[4] = p->counter_select[4];
+		dd->f_set_cntr_sample(ppd, ibp->pma_sample_interval,
+				      ibp->pma_sample_start);
+	}
+	spin_unlock_irqrestore(&ibp->loc

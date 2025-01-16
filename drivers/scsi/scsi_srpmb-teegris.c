@@ -1,590 +1,608 @@
-/*
- * Secure RPMB Driver for Exynos scsi rpmb
- *
- * Copyright (C) 2016 Samsung Electronics Co., Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- */
+ channel statue machine */
+	bool byte_align;
 
-#include <linux/cdev.h>
-#include <linux/completion.h>
-#include <linux/delay.h>
-#include <linux/dma-mapping.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/jiffies.h>
-#include <linux/kthread.h>
-#include <linux/module.h>
-#include <linux/of_irq.h>
-#include <linux/platform_device.h>
-#include <linux/pm_wakeup.h>
-#include <linux/slab.h>
-#include <linux/smc.h>
-#include <linux/suspend.h>
-
-#include <scsi/scsi_cmnd.h>
-#include <scsi/scsi_device.h>
-#include <scsi/scsi_ioctl.h>
-
-#include "scsi_srpmb.h"
-
-#include "../misc/tzdev/tz_iwsock.h"
-
-#define SRPMB_DEVICE_PROPNAME	"samsung,ufs-srpmb"
-
-#define RPMB_SOCKET_NAME	"rpmb_socket"
-#define RPMB_REQUEST_MAGIC	0x44444444
-#define RPMB_REPLY_MAGIC	0x66666666
-
-struct scsi_srpmb_ctx {
-	struct platform_device *pdev;
-	struct wakeup_source wakesrc;
-	Rpmb_Req *req;
-	dma_addr_t wsm_phyaddr;
-	void *wsm_virtaddr;
-	spinlock_t lock;
-	irq_hw_number_t hwirq;
-	int irq;
+	struct dma_pool *desc_pool;	/* Descriptors pool */
 };
 
-static DECLARE_COMPLETION(scsi_srpmb_sdev_ready);
-static struct scsi_device *scsi_srpmb_sdev;
-static struct task_struct *scsi_srpmb_kthread;
+struct mmp_pdma_phy {
+	int idx;
+	void __iomem *base;
+	struct mmp_pdma_chan *vchan;
+};
 
-/*
- * This function is public API of SCSI RPMB driver.
- * It called from SD subsystem init that provide actual SCSI device to work.
- */
-int init_wsm(struct device *dev)
+struct mmp_pdma_device {
+	int				dma_channels;
+	void __iomem			*base;
+	struct device			*dev;
+	struct dma_device		device;
+	struct mmp_pdma_phy		*phy;
+	spinlock_t phy_lock; /* protect alloc/free phy channels */
+};
+
+#define tx_to_mmp_pdma_desc(tx)					\
+	container_of(tx, struct mmp_pdma_desc_sw, async_tx)
+#define to_mmp_pdma_desc(lh)					\
+	container_of(lh, struct mmp_pdma_desc_sw, node)
+#define to_mmp_pdma_chan(dchan)					\
+	container_of(dchan, struct mmp_pdma_chan, chan)
+#define to_mmp_pdma_dev(dmadev)					\
+	container_of(dmadev, struct mmp_pdma_device, device)
+
+static void set_desc(struct mmp_pdma_phy *phy, dma_addr_t addr)
 {
-	if (!dev) {
-		dev_err(dev, "Invalid device passed to init_wsm\n");
-		return -EINVAL;
-	}
+	u32 reg = (phy->idx << 4) + DDADR;
 
-	if (!scsi_is_sdev_device(dev)) {
-		dev_err(dev, "Device is not SCSI device\n");
-		return -ENODEV;
-	}
+	writel(addr, phy->base + reg);
+}
 
-	if (scsi_srpmb_sdev) {
-		dev_err(dev, "Another SCSI device already assigned\n");
-		return -EBUSY;
-	}
+static void enable_chan(struct mmp_pdma_phy *phy)
+{
+	u32 reg, dalgn;
 
-	scsi_srpmb_sdev = to_scsi_device(dev);
-	complete(&scsi_srpmb_sdev_ready);
+	if (!phy->vchan)
+		return;
+
+	reg = DRCMR(phy->vchan->drcmr);
+	writel(DRCMR_MAPVLD | phy->idx, phy->base + reg);
+
+	dalgn = readl(phy->base + DALGN);
+	if (phy->vchan->byte_align)
+		dalgn |= 1 << phy->idx;
+	else
+		dalgn &= ~(1 << phy->idx);
+	writel(dalgn, phy->base + DALGN);
+
+	reg = (phy->idx << 2) + DCSR;
+	writel(readl(phy->base + reg) | DCSR_RUN, phy->base + reg);
+}
+
+static void disable_chan(struct mmp_pdma_phy *phy)
+{
+	u32 reg;
+
+	if (!phy)
+		return;
+
+	reg = (phy->idx << 2) + DCSR;
+	writel(readl(phy->base + reg) & ~DCSR_RUN, phy->base + reg);
+}
+
+static int clear_chan_irq(struct mmp_pdma_phy *phy)
+{
+	u32 dcsr;
+	u32 dint = readl(phy->base + DINT);
+	u32 reg = (phy->idx << 2) + DCSR;
+
+	if (!(dint & BIT(phy->idx)))
+		return -EAGAIN;
+
+	/* clear irq */
+	dcsr = readl(phy->base + reg);
+	writel(dcsr, phy->base + reg);
+	if ((dcsr & DCSR_BUSERR) && (phy->vchan))
+		dev_warn(phy->vchan->dev, "DCSR_BUSERR\n");
 
 	return 0;
 }
 
-static int srpmb_scsi_ioctl_helper(struct scsi_device *sdev, Rpmb_Req *req){
-	int ret;
-	ret = srpmb_scsi_ioctl(sdev, req);
-
-	/* unit attention status. need to call again */
-	if (ret == 0x08000002) 
-		ret = srpmb_scsi_ioctl(sdev, req);
-	return ret;
-}
-
-static void swap_packet(void *src, void *dst)
+static irqreturn_t mmp_pdma_chan_handler(int irq, void *dev_id)
 {
-	unsigned int i;
-	char *src_buf = (char *)src;
-	char *dst_buf = (char *)dst;
+	struct mmp_pdma_phy *phy = dev_id;
 
-	for (i = 0; i < RPMB_PACKET_SIZE; i++)
-		dst_buf[i] = src_buf[RPMB_PACKET_SIZE - 1 - i];
-}
+	if (clear_chan_irq(phy) != 0)
+		return IRQ_NONE;
 
-static void scsi_srpmb_update_status_flag(struct scsi_srpmb_ctx *ctx, unsigned int status)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&ctx->lock, flags);
-	ctx->req->status_flag = status;
-	spin_unlock_irqrestore(&ctx->lock, flags);
-}
-
-static void scsi_srpmb_get_write_counter(struct scsi_srpmb_ctx *ctx)
-{
-	struct device *dev = &ctx->pdev->dev;
-	unsigned int status;
-	int ret;
-
-	__pm_stay_awake(&ctx->wakesrc);
-
-	if (ctx->req->data_len != RPMB_PACKET_SIZE) {
-		dev_err(dev, "write counter data len is invalid\n");
-		status = WRITE_COUTNER_DATA_LEN_ERROR;
-		goto out;
-	}
-
-	ctx->req->cmd = SCSI_IOCTL_SECURITY_PROTOCOL_OUT;
-	ctx->req->outlen = RPMB_PACKET_SIZE;
-
-	ret = srpmb_scsi_ioctl_helper(scsi_srpmb_sdev, ctx->req);
-	if (ret < 0) {
-		dev_err(dev, "write counter ioctl read error: %x\n", ret);
-		status = WRITE_COUTNER_SECURITY_OUT_ERROR;
-		goto out;
-	}
-
-	memset(ctx->req->rpmb_data, 0x0, ctx->req->data_len);
-	ctx->req->cmd = SCSI_IOCTL_SECURITY_PROTOCOL_IN;
-	ctx->req->inlen = ctx->req->data_len;
-
-	ret = srpmb_scsi_ioctl_helper(scsi_srpmb_sdev, ctx->req);
-	if (ret < 0) {
-		dev_err(dev, "write counter ioctl write error: %x\n", ret);
-		status = WRITE_COUTNER_SECURITY_IN_ERROR;
-		goto out;
-	}
-
-	status = RPMB_PASSED;
-
-out:
-	scsi_srpmb_update_status_flag(ctx, status);
-	__pm_relax(&ctx->wakesrc);
-}
-
-static void scsi_srpmb_write(struct scsi_srpmb_ctx *ctx)
-{
-	struct device *dev = &ctx->pdev->dev;
-	struct rpmb_packet packet;
-	unsigned int status;
-	int ret;
-
-	__pm_stay_awake(&ctx->wakesrc);
-
-	if (ctx->req->data_len < RPMB_PACKET_SIZE || ctx->req->data_len > RPMB_PACKET_SIZE * 64) {
-		dev_err(dev, "write data len is invalid\n");
-		status = WRITE_DATA_LEN_ERROR;
-		goto out;
-	}
-
-	ctx->req->cmd = SCSI_IOCTL_SECURITY_PROTOCOL_OUT;
-	ctx->req->outlen = ctx->req->data_len;
-
-	ret = srpmb_scsi_ioctl_helper(scsi_srpmb_sdev, ctx->req);
-	if (ret < 0) {
-		dev_err(dev, "ioctl write data error: %x\n", ret);
-		status = WRITE_DATA_SECURITY_OUT_ERROR;
-		goto out;
-	}
-
-	memset(ctx->req->rpmb_data, 0x0, ctx->req->data_len);
-	memset(&packet, 0x0, RPMB_PACKET_SIZE);
-
-	packet.request = RESULT_READ_REQ;
-	swap_packet(&packet, ctx->req->rpmb_data);
-	ctx->req->cmd = SCSI_IOCTL_SECURITY_PROTOCOL_OUT;
-	ctx->req->outlen = RPMB_PACKET_SIZE;
-
-	ret = srpmb_scsi_ioctl_helper(scsi_srpmb_sdev, ctx->req);
-	if (ret < 0) {
-		dev_err(dev, "ioctl write_data result error: %x\n", ret);
-		status = WRITE_DATA_RESULT_SECURITY_OUT_ERROR;
-		goto out;
-	}
-
-	memset(ctx->req->rpmb_data, 0x0, ctx->req->data_len);
-	ctx->req->cmd = SCSI_IOCTL_SECURITY_PROTOCOL_IN;
-	ctx->req->inlen = RPMB_PACKET_SIZE;
-
-	ret = srpmb_scsi_ioctl_helper(scsi_srpmb_sdev, ctx->req);
-	if (ret < 0) {
-		dev_err(dev, "ioctl write_data result error: %x\n", ret);
-		status = WRITE_DATA_SECURITY_IN_ERROR;
-		goto out;
-	}
-
-	swap_packet(ctx->req->rpmb_data, &packet);
-	if (packet.result) {
-		dev_err(dev, "packet result error: %x\n", packet.result);
-		status = packet.result;
-		goto out;
-	}
-
-	status = RPMB_PASSED;
-
-out:
-	scsi_srpmb_update_status_flag(ctx, status);
-	__pm_relax(&ctx->wakesrc);
-}
-
-static void scsi_srpmb_read(struct scsi_srpmb_ctx *ctx)
-{
-	struct device *dev = &ctx->pdev->dev;
-	unsigned int status;
-	int ret;
-
-	__pm_stay_awake(&ctx->wakesrc);
-
-	if (ctx->req->data_len < RPMB_PACKET_SIZE || ctx->req->data_len > RPMB_PACKET_SIZE * 64) {
-		dev_err(dev, "read data len is invalid\n");
-		status = READ_LEN_ERROR;
-		goto out;
-	}
-
-	ctx->req->cmd = SCSI_IOCTL_SECURITY_PROTOCOL_OUT;
-	ctx->req->outlen = RPMB_PACKET_SIZE;
-
-	ret = srpmb_scsi_ioctl_helper(scsi_srpmb_sdev, ctx->req);
-	if (ret < 0) {
-		dev_err(dev, "ioctl read data error: %x\n", ret);
-		status = READ_DATA_SECURITY_OUT_ERROR;
-		goto out;
-	}
-
-	memset(ctx->req->rpmb_data, 0x0, ctx->req->data_len);
-	ctx->req->cmd = SCSI_IOCTL_SECURITY_PROTOCOL_IN;
-	ctx->req->inlen = ctx->req->data_len;
-
-	ret = srpmb_scsi_ioctl_helper(scsi_srpmb_sdev, ctx->req);
-	if (ret < 0) {
-		dev_err(dev, "ioctl result read data error : %x\n", ret);
-		status = READ_DATA_SECURITY_IN_ERROR;
-		goto out;
-	}
-
-	status = RPMB_PASSED;
-
-out:
-	scsi_srpmb_update_status_flag(ctx, status);
-	__pm_relax(&ctx->wakesrc);
-}
-
-static struct sock_desc *scsi_srpmb_accept_swd_connection(struct device *dev)
-{
-	int ret;
-	struct sock_desc *srpmb_conn;
-	struct sock_desc *srpmb_listen;
-
-	srpmb_listen = tz_iwsock_socket(1);
-	if (IS_ERR(srpmb_listen)) {
-		dev_err(dev, "failed to create iwd socket, err = %ld\n", PTR_ERR(srpmb_listen));
-		return srpmb_listen;
-	}
-
-	ret = tz_iwsock_listen(srpmb_listen, RPMB_SOCKET_NAME);
-	if (ret) {
-		dev_err(dev, "failed make iwd socket listening, err = %d\n", ret);
-		srpmb_conn = ERR_PTR(ret);
-		goto out;
-	}
-
-	srpmb_conn = tz_iwsock_accept(srpmb_listen);
-	if (IS_ERR(srpmb_conn)) {
-		dev_err(dev, "failed to accept connection, err = %ld\n", PTR_ERR(srpmb_conn));
-		goto out;
-	}
-
-out:
-	tz_iwsock_release(srpmb_listen);
-
-	return srpmb_conn;
-}
-
-static void scsi_srpmb_release_connection(struct sock_desc *srpmb_conn)
-{
-	tz_iwsock_release(srpmb_conn);
-}
-
-static int scsi_srpmb_send_reply(struct sock_desc *srpmb_conn, struct device *dev)
-{
-	unsigned int sock_data = RPMB_REPLY_MAGIC;
-	ssize_t len;
-	int ret;
-
-	len = tz_iwsock_write(srpmb_conn, &sock_data, sizeof(sock_data), 0);
-	if (len != sizeof(sock_data)) {
-		ret = len >= 0 ? -EMSGSIZE : len;
-		dev_err(dev, "failed to send reply, err = %d\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static int scsi_srpmb_wait_request(struct sock_desc *srpmb_conn, struct device *dev)
-{
-	int ret;
-	ssize_t len;
-	unsigned int sock_data;
-
-	len = tz_iwsock_read(srpmb_conn, &sock_data, sizeof(sock_data), 0);
-	if (len > 0 && len != sizeof(sock_data)) {
-		dev_err(dev, "failed to receive request, invalid len = %zd\n", len);
-		return -EMSGSIZE;
-	} else if (!len) {
-		dev_err(dev, "connection was reset by peer\n");
-		return -ECONNRESET;
-	} else if (len < 0) {
-		ret = len;
-		dev_err(dev, "error while receiving request from SWd, err = %u\n", ret);
-		return ret;
-	}
-
-	if (sock_data != RPMB_REQUEST_MAGIC) {
-		dev_err(dev, "received invalid request, data = %u\n", sock_data);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int scsi_srpmb_kthread_work(void *data)
-{
-	struct scsi_srpmb_ctx *ctx = (struct scsi_srpmb_ctx *)data;
-	struct device *dev = &ctx->pdev->dev;
-	struct sock_desc *srpmb_conn;
-	int ret;
-
-	srpmb_conn = scsi_srpmb_accept_swd_connection(dev);
-	if (IS_ERR(srpmb_conn))
-		return PTR_ERR(srpmb_conn);
-
-	if (!wait_for_completion_timeout(&scsi_srpmb_sdev_ready, msecs_to_jiffies(500))) {
-		dev_err(dev, "timeout occurred while waiting for scsi device\n");
-		ret = -ETIMEDOUT;
-		goto out;
-	}
-
-	while (!kthread_should_stop()) {
-		ret = scsi_srpmb_wait_request(srpmb_conn, dev);
-		if (ret)
-			goto out;
-
-		switch(ctx->req->type) {
-		case GET_WRITE_COUNTER:
-			scsi_srpmb_get_write_counter(ctx);
-			break;
-		case WRITE_DATA:
-			scsi_srpmb_write(ctx);
-			break;
-		case READ_DATA:
-			scsi_srpmb_read(ctx);
-			break;
-		default:
-			dev_err(dev, "Received unsupported request: %x\n", ctx->req->type);
-			ret = -EINVAL;
-			goto out;
-		}
-
-		ret = scsi_srpmb_send_reply(srpmb_conn, dev);
-		if (ret)
-			goto out;
-	}
-
-out:
-	scsi_srpmb_release_connection(srpmb_conn);
-
-	return ret;
-}
-
-static struct scsi_srpmb_ctx *scsi_srpmb_create_ctx(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct scsi_srpmb_ctx *ctx;
-
-	ctx = kzalloc(sizeof(struct scsi_srpmb_ctx), GFP_KERNEL);
-	if (!ctx) {
-		dev_err(dev, "Fail to alloc for scsi rpmb context\n");
-		return ERR_PTR(-ENOMEM);
-	}
-
-	ctx->pdev = pdev;
-
-	spin_lock_init(&ctx->lock);
-	wakeup_source_init(&ctx->wakesrc, "srpmb");
-
-	return ctx;
-}
-
-static void scsi_srpmb_destroy_ctx(struct scsi_srpmb_ctx *ctx)
-{
-	wakeup_source_trash(&ctx->wakesrc);
-	kfree(ctx);
-}
-
-static int scsi_srpmb_init_wsm(struct scsi_srpmb_ctx *ctx)
-{
-	struct device *dev = &ctx->pdev->dev;
-
-	ctx->wsm_virtaddr = dma_alloc_coherent(dev,
-			sizeof(Rpmb_Req) + RPMB_BUF_MAX_SIZE,
-			&ctx->wsm_phyaddr, GFP_KERNEL);
-	if (!ctx->wsm_virtaddr || !ctx->wsm_phyaddr) {
-		dev_err(dev, "Fail to alloc for srpmb wsm (world shared memory)\n");
-		return -ENOMEM;
-	}
-
-	ctx->req = (Rpmb_Req *)ctx->wsm_virtaddr;
-
-	return 0;
-}
-
-static void scsi_srpmb_release_wsm(struct scsi_srpmb_ctx *ctx)
-{
-	struct device *dev = &ctx->pdev->dev;
-
-	dma_free_coherent(dev, RPMB_BUF_MAX_SIZE, ctx->wsm_virtaddr, ctx->wsm_phyaddr);
-}
-
-static irqreturn_t scsi_srpmb_interrupt(int intr, void *arg)
-{
+	tasklet_schedule(&phy->vchan->tasklet);
 	return IRQ_HANDLED;
 }
 
-int scsi_srpmb_init_irq(struct scsi_srpmb_ctx *ctx)
+static irqreturn_t mmp_pdma_int_handler(int irq, void *dev_id)
 {
-	struct device *dev = &ctx->pdev->dev;
-	struct irq_data *rpmb_irqd;
-	int ret;
+	struct mmp_pdma_device *pdev = dev_id;
+	struct mmp_pdma_phy *phy;
+	u32 dint = readl(pdev->base + DINT);
+	int i, ret;
+	int irq_num = 0;
 
-	ctx->irq = irq_of_parse_and_map(dev->of_node, 0);
-	if (ctx->irq <= 0) {
-		dev_err(dev, "Fail to get irq number for scsi rpmb\n");
-		return -ENOENT;
+	while (dint) {
+		i = __ffs(dint);
+		/* only handle interrupts belonging to pdma driver*/
+		if (i >= pdev->dma_channels)
+			break;
+		dint &= (dint - 1);
+		phy = &pdev->phy[i];
+		ret = mmp_pdma_chan_handler(irq, phy);
+		if (ret == IRQ_HANDLED)
+			irq_num++;
 	}
 
-	/* Get irq_data from irq number */
-	rpmb_irqd = irq_get_irq_data(ctx->irq);
-	if (!rpmb_irqd) {
-		dev_err(dev, "Fail to get irq_data from irq number\n");
-		return -ENOENT;
-	}
+	if (irq_num)
+		return IRQ_HANDLED;
 
-	/* Get hwirq from irq_data */
-	ctx->hwirq = irqd_to_hwirq(rpmb_irqd);
-
-	ret = request_irq(ctx->irq, scsi_srpmb_interrupt,
-			IRQF_TRIGGER_RISING, ctx->pdev->name, ctx);
-	if (ret) {
-		dev_err(dev, "Fail to request irq handler for scsi srpmb, error=%d\n", ret);
-		return ret;
-	}
-
-	return 0;
+	return IRQ_NONE;
 }
 
-static void scsi_srpmb_release_irq(struct scsi_srpmb_ctx *ctx)
+/* lookup free phy channel as descending priority */
+static struct mmp_pdma_phy *lookup_phy(struct mmp_pdma_chan *pchan)
 {
-	free_irq(ctx->irq, ctx);
-}
+	int prio, i;
+	struct mmp_pdma_device *pdev = to_mmp_pdma_dev(pchan->chan.device);
+	struct mmp_pdma_phy *phy, *found = NULL;
+	unsigned long flags;
 
-static int scsi_srpmb_register_resources(struct scsi_srpmb_ctx *ctx)
-{
-	struct device *dev = &ctx->pdev->dev;
-	int ret;
+	/*
+	 * dma channel priorities
+	 * ch 0 - 3,  16 - 19  <--> (0)
+	 * ch 4 - 7,  20 - 23  <--> (1)
+	 * ch 8 - 11, 24 - 27  <--> (2)
+	 * ch 12 - 15, 28 - 31  <--> (3)
+	 */
 
-	/* Smc call to transfer wsm address to secure world */
-	ret = exynos_smc(SMC_SRPMB_WSM, ctx->wsm_phyaddr, ctx->hwirq, 0);
-	if (ret)
-		dev_err(dev, "Fail to smc call to registed scsi srpmb resources: error=%d\n", ret);
-
-	return ret;
-}
-
-static int scsi_srpmb_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct scsi_srpmb_ctx *ctx;
-	int ret;
-
-	BUILD_BUG_ON(sizeof(struct rpmb_packet) != RPMB_PACKET_SIZE);
-
-	ctx = scsi_srpmb_create_ctx(pdev);
-	if (IS_ERR(ctx)) {
-		dev_err(dev, "Fail to alloc context: error=%ld\n", PTR_ERR(ctx));
-		return PTR_ERR(ctx);
+	spin_lock_irqsave(&pdev->phy_lock, flags);
+	for (prio = 0; prio <= ((pdev->dma_channels - 1) & 0xf) >> 2; prio++) {
+		for (i = 0; i < pdev->dma_channels; i++) {
+			if (prio != (i & 0xf) >> 2)
+				continue;
+			phy = &pdev->phy[i];
+			if (!phy->vchan) {
+				phy->vchan = pchan;
+				found = phy;
+				goto out_unlock;
+			}
+		}
 	}
 
-	ret = scsi_srpmb_init_wsm(ctx);
-	if (ret) {
-		dev_err(dev, "Fail to initialize wsm\n");
-		goto destroy_ctx;
-	}
-
-	ret = scsi_srpmb_init_irq(ctx);
-	if (ret) {
-		dev_err(dev, "Fail to initialize irq\n");
-		goto release_wsm;
-	}
-
-	ret = scsi_srpmb_register_resources(ctx);
-	if (ret) {
-		dev_err(dev, "Fail to register resources\n");
-		goto release_irq;
-	}
-
-	platform_set_drvdata(pdev, ctx);
-
-	scsi_srpmb_kthread = kthread_run(scsi_srpmb_kthread_work, ctx, "scsi_srpmb_worker");
-	if (IS_ERR(scsi_srpmb_kthread)) {
-		/* Here we can't release IRQ or WSM due to ATF
-		 * doesn't support such option, so system can crash
-		 * if we release IRQ or WSM here without releasing it in ATF */
-		return PTR_ERR(scsi_srpmb_kthread);
-	}
-
-	return 0;
-
-release_irq:
-	scsi_srpmb_release_irq(ctx);
-release_wsm:
-	scsi_srpmb_release_wsm(ctx);
-destroy_ctx:
-	scsi_srpmb_destroy_ctx(ctx);
-
-	return ret;
+out_unlock:
+	spin_unlock_irqrestore(&pdev->phy_lock, flags);
+	return found;
 }
 
-static int scsi_srpmb_remove(struct platform_device *pdev)
+static void mmp_pdma_free_phy(struct mmp_pdma_chan *pchan)
 {
-	struct scsi_srpmb_ctx *ctx = platform_get_drvdata(pdev);
+	struct mmp_pdma_device *pdev = to_mmp_pdma_dev(pchan->chan.device);
+	unsigned long flags;
+	u32 reg;
 
-	kthread_stop(scsi_srpmb_kthread);
+	if (!pchan->phy)
+		return;
 
-	scsi_srpmb_release_irq(ctx);
-	scsi_srpmb_release_wsm(ctx);
-	scsi_srpmb_destroy_ctx(ctx);
+	/* clear the channel mapping in DRCMR */
+	reg = DRCMR(pchan->drcmr);
+	writel(0, pchan->phy->base + reg);
 
-	return 0;
+	spin_lock_irqsave(&pdev->phy_lock, flags);
+	pchan->phy->vchan = NULL;
+	pchan->phy = NULL;
+	spin_unlock_irqrestore(&pdev->phy_lock, flags);
 }
 
-static const struct of_device_id of_match_table[] = {
-	{ .compatible = SRPMB_DEVICE_PROPNAME },
-	{ }
-};
-
-static struct platform_driver scsi_srpmb_plat_driver = {
-	.probe = scsi_srpmb_probe,
-	.driver = {
-		.name = "exynos-ufs-srpmb",
-		.owner = THIS_MODULE,
-		.of_match_table = of_match_table,
-	},
-	.remove = scsi_srpmb_remove,
-};
-
-static int __init scsi_srpmb_init(void)
+/**
+ * start_pending_queue - transfer any pending transactions
+ * pending list ==> running list
+ */
+static void start_pending_queue(struct mmp_pdma_chan *chan)
 {
-	return platform_driver_register(&scsi_srpmb_plat_driver);
+	struct mmp_pdma_desc_sw *desc;
+
+	/* still in running, irq will start the pending list */
+	if (!chan->idle) {
+		dev_dbg(chan->dev, "DMA controller still busy\n");
+		return;
+	}
+
+	if (list_empty(&chan->chain_pending)) {
+		/* chance to re-fetch phy channel with higher prio */
+		mmp_pdma_free_phy(chan);
+		dev_dbg(chan->dev, "no pending list\n");
+		return;
+	}
+
+	if (!chan->phy) {
+		chan->phy = lookup_phy(chan);
+		if (!chan->phy) {
+			dev_dbg(chan->dev, "no free dma channel\n");
+			return;
+		}
+	}
+
+	/*
+	 * pending -> running
+	 * reintilize pending list
+	 */
+	desc = list_first_entry(&chan->chain_pending,
+				struct mmp_pdma_desc_sw, node);
+	list_splice_tail_init(&chan->chain_pending, &chan->chain_running);
+
+	/*
+	 * Program the descriptor's address into the DMA controller,
+	 * then start the DMA transaction
+	 */
+	set_desc(chan->phy, desc->async_tx.phys);
+	enable_chan(chan->phy);
+	chan->idle = false;
 }
 
-static void __exit scsi_srpmb_exit(void)
+
+/* desc->tx_list ==> pending list */
+static dma_cookie_t mmp_pdma_tx_submit(struct dma_async_tx_descriptor *tx)
 {
-	platform_driver_unregister(&scsi_srpmb_plat_driver);
+	struct mmp_pdma_chan *chan = to_mmp_pdma_chan(tx->chan);
+	struct mmp_pdma_desc_sw *desc = tx_to_mmp_pdma_desc(tx);
+	struct mmp_pdma_desc_sw *child;
+	unsigned long flags;
+	dma_cookie_t cookie = -EBUSY;
+
+	spin_lock_irqsave(&chan->desc_lock, flags);
+
+	list_for_each_entry(child, &desc->tx_list, node) {
+		cookie = dma_cookie_assign(&child->async_tx);
+	}
+
+	/* softly link to pending list - desc->tx_list ==> pending list */
+	list_splice_tail_init(&desc->tx_list, &chan->chain_pending);
+
+	spin_unlock_irqrestore(&chan->desc_lock, flags);
+
+	return cookie;
 }
 
-subsys_initcall(scsi_srpmb_init);
-module_exit(scsi_srpmb_exit);
+static struct mmp_pdma_desc_sw *
+mmp_pdma_alloc_descriptor(struct mmp_pdma_chan *chan)
+{
+	struct mmp_pdma_desc_sw *desc;
+	dma_addr_t pdesc;
 
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("UFS SRPMB driver");
+	desc = dma_pool_alloc(chan->desc_pool, GFP_ATOMIC, &pdesc);
+	if (!desc) {
+		dev_err(chan->dev, "out of memory for link descriptor\n");
+		return NULL;
+	}
+
+	memset(desc, 0, sizeof(*desc));
+	INIT_LIST_HEAD(&desc->tx_list);
+	dma_async_tx_descriptor_init(&desc->async_tx, &chan->chan);
+	/* each desc has submit */
+	desc->async_tx.tx_submit = mmp_pdma_tx_submit;
+	desc->async_tx.phys = pdesc;
+
+	return desc;
+}
+
+/**
+ * mmp_pdma_alloc_chan_resources - Allocate resources for DMA channel.
+ *
+ * This function will create a dma pool for descriptor allocation.
+ * Request irq only when channel is requested
+ * Return - The number of allocated descriptors.
+ */
+
+static int mmp_pdma_alloc_chan_resources(struct dma_chan *dchan)
+{
+	struct mmp_pdma_chan *chan = to_mmp_pdma_chan(dchan);
+
+	if (chan->desc_pool)
+		return 1;
+
+	chan->desc_pool = dma_pool_create(dev_name(&dchan->dev->device),
+					  chan->dev,
+					  sizeof(struct mmp_pdma_desc_sw),
+					  __alignof__(struct mmp_pdma_desc_sw),
+					  0);
+	if (!chan->desc_pool) {
+		dev_err(chan->dev, "unable to allocate descriptor pool\n");
+		return -ENOMEM;
+	}
+
+	mmp_pdma_free_phy(chan);
+	chan->idle = true;
+	chan->dev_addr = 0;
+	return 1;
+}
+
+static void mmp_pdma_free_desc_list(struct mmp_pdma_chan *chan,
+				    struct list_head *list)
+{
+	struct mmp_pdma_desc_sw *desc, *_desc;
+
+	list_for_each_entry_safe(desc, _desc, list, node) {
+		list_del(&desc->node);
+		dma_pool_free(chan->desc_pool, desc, desc->async_tx.phys);
+	}
+}
+
+static void mmp_pdma_free_chan_resources(struct dma_chan *dchan)
+{
+	struct mmp_pdma_chan *chan = to_mmp_pdma_chan(dchan);
+	unsigned long flags;
+
+	spin_lock_irqsave(&chan->desc_lock, flags);
+	mmp_pdma_free_desc_list(chan, &chan->chain_pending);
+	mmp_pdma_free_desc_list(chan, &chan->chain_running);
+	spin_unlock_irqrestore(&chan->desc_lock, flags);
+
+	dma_pool_destroy(chan->desc_pool);
+	chan->desc_pool = NULL;
+	chan->idle = true;
+	chan->dev_addr = 0;
+	mmp_pdma_free_phy(chan);
+	return;
+}
+
+static struct dma_async_tx_descriptor *
+mmp_pdma_prep_memcpy(struct dma_chan *dchan,
+		     dma_addr_t dma_dst, dma_addr_t dma_src,
+		     size_t len, unsigned long flags)
+{
+	struct mmp_pdma_chan *chan;
+	struct mmp_pdma_desc_sw *first = NULL, *prev = NULL, *new;
+	size_t copy = 0;
+
+	if (!dchan)
+		return NULL;
+
+	if (!len)
+		return NULL;
+
+	chan = to_mmp_pdma_chan(dchan);
+	chan->byte_align = false;
+
+	if (!chan->dir) {
+		chan->dir = DMA_MEM_TO_MEM;
+		chan->dcmd = DCMD_INCTRGADDR | DCMD_INCSRCADDR;
+		chan->dcmd |= DCMD_BURST32;
+	}
+
+	do {
+		/* Allocate the link descriptor from DMA pool */
+		new = mmp_pdma_alloc_descriptor(chan);
+		if (!new) {
+			dev_err(chan->dev, "no memory for desc\n");
+			goto fail;
+		}
+
+		copy = min_t(size_t, len, PDMA_MAX_DESC_BYTES);
+		if (dma_src & 0x7 || dma_dst & 0x7)
+			chan->byte_align = true;
+
+		new->desc.dcmd = chan->dcmd | (DCMD_LENGTH & copy);
+		new->desc.dsadr = dma_src;
+		new->desc.dtadr = dma_dst;
+
+		if (!first)
+			first = new;
+		else
+			prev->desc.ddadr = new->async_tx.phys;
+
+		new->async_tx.cookie = 0;
+		async_tx_ack(&new->async_tx);
+
+		prev = new;
+		len -= copy;
+
+		if (chan->dir == DMA_MEM_TO_DEV) {
+			dma_src += copy;
+		} else if (chan->dir == DMA_DEV_TO_MEM) {
+			dma_dst += copy;
+		} else if (chan->dir == DMA_MEM_TO_MEM) {
+			dma_src += copy;
+			dma_dst += copy;
+		}
+
+		/* Insert the link descriptor to the LD ring */
+		list_add_tail(&new->node, &first->tx_list);
+	} while (len);
+
+	first->async_tx.flags = flags; /* client is in control of this ack */
+	first->async_tx.cookie = -EBUSY;
+
+	/* last desc and fire IRQ */
+	new->desc.ddadr = DDADR_STOP;
+	new->desc.dcmd |= DCMD_ENDIRQEN;
+
+	chan->cyclic_first = NULL;
+
+	return &first->async_tx;
+
+fail:
+	if (first)
+		mmp_pdma_free_desc_list(chan, &first->tx_list);
+	return NULL;
+}
+
+static struct dma_async_tx_descriptor *
+mmp_pdma_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
+		       unsigned int sg_len, enum dma_transfer_direction dir,
+		       unsigned long flags, void *context)
+{
+	struct mmp_pdma_chan *chan = to_mmp_pdma_chan(dchan);
+	struct mmp_pdma_desc_sw *first = NULL, *prev = NULL, *new = NULL;
+	size_t len, avail;
+	struct scatterlist *sg;
+	dma_addr_t addr;
+	int i;
+
+	if ((sgl == NULL) || (sg_len == 0))
+		return NULL;
+
+	chan->byte_align = false;
+
+	for_each_sg(sgl, sg, sg_len, i) {
+		addr = sg_dma_address(sg);
+		avail = sg_dma_len(sgl);
+
+		do {
+			len = min_t(size_t, avail, PDMA_MAX_DESC_BYTES);
+			if (addr & 0x7)
+				chan->byte_align = true;
+
+			/* allocate and populate the descriptor */
+			new = mmp_pdma_alloc_descriptor(chan);
+			if (!new) {
+				dev_err(chan->dev, "no memory for desc\n");
+				goto fail;
+			}
+
+			new->desc.dcmd = chan->dcmd | (DCMD_LENGTH & len);
+			if (dir == DMA_MEM_TO_DEV) {
+				new->desc.dsadr = addr;
+				new->desc.dtadr = chan->dev_addr;
+			} else {
+				new->desc.dsadr = chan->dev_addr;
+				new->desc.dtadr = addr;
+			}
+
+			if (!first)
+				first = new;
+			else
+				prev->desc.ddadr = new->async_tx.phys;
+
+			new->async_tx.cookie = 0;
+			async_tx_ack(&new->async_tx);
+			prev = new;
+
+			/* Insert the link descriptor to the LD ring */
+			list_add_tail(&new->node, &first->tx_list);
+
+			/* update metadata */
+			addr += len;
+			avail -= len;
+		} while (avail);
+	}
+
+	first->async_tx.cookie = -EBUSY;
+	first->async_tx.flags = flags;
+
+	/* last desc and fire IRQ */
+	new->desc.ddadr = DDADR_STOP;
+	new->desc.dcmd |= DCMD_ENDIRQEN;
+
+	chan->dir = dir;
+	chan->cyclic_first = NULL;
+
+	return &first->async_tx;
+
+fail:
+	if (first)
+		mmp_pdma_free_desc_list(chan, &first->tx_list);
+	return NULL;
+}
+
+static struct dma_async_tx_descriptor *
+mmp_pdma_prep_dma_cyclic(struct dma_chan *dchan,
+			 dma_addr_t buf_addr, size_t len, size_t period_len,
+			 enum dma_transfer_direction direction,
+			 unsigned long flags, void *context)
+{
+	struct mmp_pdma_chan *chan;
+	struct mmp_pdma_desc_sw *first = NULL, *prev = NULL, *new;
+	dma_addr_t dma_src, dma_dst;
+
+	if (!dchan || !len || !period_len)
+		return NULL;
+
+	/* the buffer length must be a multiple of period_len */
+	if (len % period_len != 0)
+		return NULL;
+
+	if (period_len > PDMA_MAX_DESC_BYTES)
+		return NULL;
+
+	chan = to_mmp_pdma_chan(dchan);
+
+	switch (direction) {
+	case DMA_MEM_TO_DEV:
+		dma_src = buf_addr;
+		dma_dst = chan->dev_addr;
+		break;
+	case DMA_DEV_TO_MEM:
+		dma_dst = buf_addr;
+		dma_src = chan->dev_addr;
+		break;
+	default:
+		dev_err(chan->dev, "Unsupported direction for cyclic DMA\n");
+		return NULL;
+	}
+
+	chan->dir = direction;
+
+	do {
+		/* Allocate the link descriptor from DMA pool */
+		new = mmp_pdma_alloc_descriptor(chan);
+		if (!new) {
+			dev_err(chan->dev, "no memory for desc\n");
+			goto fail;
+		}
+
+		new->desc.dcmd = (chan->dcmd | DCMD_ENDIRQEN |
+				  (DCMD_LENGTH & period_len));
+		new->desc.dsadr = dma_src;
+		new->desc.dtadr = dma_dst;
+
+		if (!first)
+			first = new;
+		else
+			prev->desc.ddadr = new->async_tx.phys;
+
+		new->async_tx.cookie = 0;
+		async_tx_ack(&new->async_tx);
+
+		prev = new;
+		len -= period_len;
+
+		if (chan->dir == DMA_MEM_TO_DEV)
+			dma_src += period_len;
+		else
+			dma_dst += period_len;
+
+		/* Insert the link descriptor to the LD ring */
+		list_add_tail(&new->node, &first->tx_list);
+	} while (len);
+
+	first->async_tx.flags = flags; /* client is in control of this ack */
+	first->async_tx.cookie = -EBUSY;
+
+	/* make the cyclic link */
+	new->desc.ddadr = first->async_tx.phys;
+	chan->cyclic_first = first;
+
+	return &first->async_tx;
+
+fail:
+	if (first)
+		mmp_pdma_free_desc_list(chan, &first->tx_list);
+	return NULL;
+}
+
+static int mmp_pdma_config(struct dma_chan *dchan,
+			   struct dma_slave_config *cfg)
+{
+	struct mmp_pdma_chan *chan = to_mmp_pdma_chan(dchan);
+	u32 maxburst = 0, addr = 0;
+	enum dma_slave_buswidth width = DMA_SLAVE_BUSWIDTH_UNDEFINED;
+
+	if (!dchan)
+		return -EINVAL;
+
+	if (cfg->direction == DMA_DEV_TO_MEM) {
+		chan->dcmd = DCMD_INCTRGADDR | DCMD_FLOWSRC;
+		maxburst = cfg->src_maxburst;
+		width = cfg->src_addr_width;
+		addr = cfg->src_addr;
+	} else if (cfg->direction == DMA_MEM_TO_DEV) {
+		chan->dcmd = DCMD_INCSRCADDR | DCMD_FLOWTRG;
+		maxburst = cfg->dst_maxburst;
+		width = cfg->dst_addr_width;
+		addr = cfg->dst_addr;
+	}
+
+	if (width == DMA_SLAVE_BUSWIDTH_1_BYTE)
+		chan->dcmd |= DCMD_WIDTH1;
+	else if (width == DMA_SLAVE_BUSWIDTH_2_BYTES)
+		chan->dcmd |= DCMD_WIDTH2;
+	else if (width == DMA_SLAVE_BUSWIDTH_4_BYTES)
+		chan->dcmd |= DCMD_WIDTH4;
+
+	if (maxburst == 8)
+		chan->dcmd |= DCMD_BURST8;
+	else if (maxburst == 16)
+		chan->dcmd |=

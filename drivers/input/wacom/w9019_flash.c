@@ -1,687 +1,690 @@
-/*
- * Wacom Penabled Driver for I2C
- *
- * Copyright (c) 2011-2014 Tatsunosuke Tobita, Wacom.
- * <tobita.tatsunosuke@wacom.co.jp>
- *
- * This program is free software; you can redistribute it
- * and/or modify it under the terms of the GNU General
- * Public License as published by the Free Software
- * Foundation; either version of 2 of the License,
- * or (at your option) any later version.
- */
- 
-#include <linux/kernel.h>
-#include <linux/i2c.h>
-#include <linux/delay.h>
-#include <linux/slab.h>
- 
-#include "wacom.h"
-#include "w9019_flash.h"
+it_waitqueue_head(&cqp_request->waitq);
+		cqp_request->waiting = 0;
+		cqp_request->request_done = 0;
+		cqp_request->callback = 0;
+		init_waitqueue_head(&cqp_request->waitq);
+		nes_debug(NES_DBG_CQP, "Got cqp request %p from the available list \n",
+				cqp_request);
+	} else
+		printk(KERN_ERR PFX "%s: Could not allocated a CQP request.\n",
+			   __func__);
 
-bool wacom_i2c_set_feature(struct wacom_i2c *wac_i2c, u8 report_id, unsigned int buf_size, u8 *data,
-			   u16 cmdreg, u16 datareg)
+	return cqp_request;
+}
+
+void nes_free_cqp_request(struct nes_device *nesdev,
+			  struct nes_cqp_request *cqp_request)
 {
-	int i, ret = -1;
-	int total = SFEATURE_SIZE + buf_size;
-	u8 *sFeature = NULL;
-	bool bRet = false;
+	unsigned long flags;
 
-	sFeature = kzalloc(sizeof(u8) * total, GFP_KERNEL);
-	if (!sFeature) {
-		printk(KERN_DEBUG"%s cannot preserve memory \n", __func__);
-		goto out;
-	}
-	memset(sFeature, 0, sizeof(u8) * total);
+	nes_debug(NES_DBG_CQP, "CQP request %p (opcode 0x%02X) freed.\n",
+		  cqp_request,
+		  le32_to_cpu(cqp_request->cqp_wqe.wqe_words[NES_CQP_WQE_OPCODE_IDX]) & 0x3f);
 
-	sFeature[0] = (u8)(cmdreg & 0x00ff);
-	sFeature[1] = (u8)((cmdreg & 0xff00) >> 8);
-	sFeature[2] = (RTYPE_FEATURE << 4) | report_id;
-	sFeature[3] = CMD_SET_FEATURE;
-	sFeature[4] = (u8)(datareg & 0x00ff);
-	sFeature[5] = (u8)((datareg & 0xff00) >> 8);
-
-	if ( (buf_size + 2) > 255) {
-		sFeature[6] = (u8)((buf_size + 2) & 0x00ff);
-		sFeature[7] = (u8)(( (buf_size + 2) & 0xff00) >> 8);
+	if (cqp_request->dynamic) {
+		kfree(cqp_request);
 	} else {
-		sFeature[6] = (u8)(buf_size + 2);
-		sFeature[7] = (u8)(0x00);
+		spin_lock_irqsave(&nesdev->cqp.lock, flags);
+		list_add_tail(&cqp_request->list, &nesdev->cqp_avail_reqs);
+		spin_unlock_irqrestore(&nesdev->cqp.lock, flags);
 	}
-
-	for (i = 0; i < buf_size; i++)
-		sFeature[i + SFEATURE_SIZE] = *(data + i);
-
-//	ret = wacom_i2c_master_send(client, sFeature, total, WACOM_FLASH_W9014);
-	ret = wacom_i2c_send(wac_i2c, sFeature, total, WACOM_I2C_MODE_BOOT);
-	if (ret != total) {
-		printk(KERN_DEBUG "Sending Set_Feature failed sent bytes: %d \n", ret);
-		goto err;
-	}
-
-	usleep_range(60, 61);
-	bRet = true;
- err:
-	kfree(sFeature);
-	sFeature = NULL;
-
- out:
-	return bRet;
 }
 
-bool wacom_i2c_get_feature(struct wacom_i2c *wac_i2c, u8 report_id, unsigned int buf_size, u8 *data,
-			   u16 cmdreg, u16 datareg, int delay)
+void nes_put_cqp_request(struct nes_device *nesdev,
+			 struct nes_cqp_request *cqp_request)
 {
-	int ret = -1;
-	u8 *recv = NULL;
-	bool bRet = false;
-	u8 gFeature[] = {
-		(u8)(cmdreg & 0x00ff),
-		(u8)((cmdreg & 0xff00) >> 8),
-		(RTYPE_FEATURE << 4) | report_id,
-		CMD_GET_FEATURE,
-		(u8)(datareg & 0x00ff),
-		(u8)((datareg & 0xff00) >> 8)
-	};
-
-	/*"+ 2", adding 2 more spaces for organizeing again later in the passed data, "data"*/
-	recv = kzalloc(sizeof(u8) * (buf_size + 0), GFP_KERNEL);
-	if (!recv) {
-		printk(KERN_DEBUG"%s cannot preserve memory \n", __func__);
-		goto out;
-	}
-
-	memset(recv, 0, sizeof(u8) * (buf_size + 0)); /*Append 2 bytes for length low and high of the byte*/
-
-//	ret = wacom_i2c_master_send(client, gFeature, GFEATURE_SIZE, WACOM_FLASH_W9014);
-	ret = wacom_i2c_send(wac_i2c, gFeature, GFEATURE_SIZE, WACOM_I2C_MODE_BOOT);
-	if (ret != GFEATURE_SIZE) {
-		printk(KERN_NOTICE"%s Sending Get_Feature failed; sent bytes: %d \n", __func__, ret);
-		goto err;
-	}
-
-	udelay(delay);
-
-//	ret = wacom_i2c_master_recv(client, recv, (buf_size), WACOM_FLASH_W9014);
-	ret = wacom_i2c_recv(wac_i2c, recv, buf_size,WACOM_I2C_MODE_BOOT);
-	if (ret != buf_size) {
-		printk(KERN_NOTICE"%s Receiving data failed; recieved bytes: %d \n", __func__, ret);
-		goto err;
-	}
-
-	/*Coppy data pointer, subtracting the first two bytes of the length*/
-	memcpy(data, (recv + 0), buf_size);
-
-	bRet = true;
- err:
-	kfree(recv);
-	recv = NULL;
-
- out:
-	return bRet;
-}
-
-static int wacom_flash_cmd(struct wacom_i2c *wac_i2c)
-{
-	u8 command[10];
-	int len = 0;
-	int ret = -1;
-
-	command[len++] = 0x0d;
-	command[len++] = FLASH_START0;
-	command[len++] = FLASH_START1;
-	command[len++] = FLASH_START2;
-	command[len++] = FLASH_START3;
-	command[len++] = FLASH_START4;
-	command[len++] = FLASH_START5;
-	command[len++] = 0x0d;
-
-//	ret = i2c_master_send(wac_i2c->client, command, len);
-	ret = wacom_i2c_send(wac_i2c, command, len, WACOM_I2C_MODE_BOOT);
-	if(ret < 0){
-		printk("Sending flash command failed\n");
-		return -EXIT_FAIL;
-	}
-
-	msleep(300);
-
-	return 0;
-}
-
-int flash_query_w9014(struct wacom_i2c *wac_i2c)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	u8 response[RSP_SIZE];
-	int ECH, len = 0;
-
-	command[len++] = BOOT_CMD_REPORT_ID;	                /* Report:ReportID */
-	command[len++] = BOOT_QUERY;				/* Report:Boot Query command */
-	command[len++] = ECH = 7;				/* Report:echo */
-
-	bRet = wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG, DATA_REG);
-	if (!bRet) {
-		printk("%s failed to set feature \n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	bRet = wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, RSP_SIZE, response, COMM_REG, DATA_REG, (10 * 1000));
-	if (!bRet) {
-		printk("%s failed to get feature \n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	if ( (response[3] != QUERY_CMD) ||
-	     (response[4] != ECH) ) {
-		printk("%s res3:%x res4:%x \n", __func__, response[3], response[4]);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	if (response[5] != QUERY_RSP) {
-		printk("%s res5:%x \n", __func__, response[5]);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	printk("QUERY SUCCEEDED \n");
-	return 0;
-}
-
-static bool flash_blver_w9014(struct wacom_i2c *wac_i2c, int *blver)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	u8 response[RSP_SIZE];
-	int ECH, len = 0;
-
-	command[len++] = BOOT_CMD_REPORT_ID;	/* Report:ReportID */
-	command[len++] = BOOT_BLVER;					/* Report:Boot Version command */
-	command[len++] = ECH = 7;							/* Report:echo */
-
-	bRet = wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG, DATA_REG);
-	if (!bRet) {
-		printk("%s failed to set feature1\n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	bRet = wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, RSP_SIZE, response, COMM_REG, DATA_REG, (10 * 1000));
-	if (!bRet) {
-		printk("%s 2 failed to set feature\n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	if ( (response[3] != BOOT_CMD) ||
-	     (response[4] != ECH) ) {
-		printk("%s res3:%x res4:%x \n", __func__, response[3], response[4]);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	if (response[5] != QUERY_RSP) {
-		printk("%s res5:%x \n", __func__, response[5]);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	*blver = (int)response[5];
-
-	return true;
-}
-
-static bool flash_mputype_w9014(struct wacom_i2c *wac_i2c, int* pMpuType)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	u8 response[RSP_SIZE];
-	int ECH, len = 0;
-
-	command[len++] = BOOT_CMD_REPORT_ID;	                        /* Report:ReportID */
-	command[len++] = BOOT_MPU;					/* Report:Boot Query command */
-	command[len++] = ECH = 7;					/* Report:echo */
-
-	bRet = wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG, DATA_REG);
-	if (!bRet) {
-		printk("%s failed to set feature \n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	bRet = wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, RSP_SIZE, response, COMM_REG, DATA_REG, (10 * 1000));
-	if (!bRet) {
-		printk("%s failed to get feature \n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	if ( (response[3] != MPU_CMD) ||
-	     (response[4] != ECH) ) {
-		printk("%s res3:%x res4:%x \n", __func__, response[3], response[4]);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	*pMpuType = (int)response[5];
-	return true;
-}
-
-static bool flash_end_w9014(struct wacom_i2c *wac_i2c)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	int ECH, len = 0;
-
-	command[len++] = BOOT_CMD_REPORT_ID;
-	command[len++] = BOOT_EXIT;
-	command[len++] = ECH = 7;
-
-	bRet = wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG, DATA_REG);
-	if (!bRet) {
-		printk("%s failed to set feature 1\n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	return true;
+	if (atomic_dec_and_test(&cqp_request->refcount))
+		nes_free_cqp_request(nesdev, cqp_request);
 }
 
 
-#ifdef PARTIAL_ERASE
-static bool erase_datamem(struct wacom_i2c *wac_i2c)
+/**
+ * nes_post_cqp_request
+ */
+void nes_post_cqp_request(struct nes_device *nesdev,
+			  struct nes_cqp_request *cqp_request)
 {
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	u8 response[BOOT_RSP_SIZE];
-	unsigned char sum = 0;
-	unsigned char cmd_chksum;
-	int ECH, j;
-	int len = 0;
+	struct nes_hw_cqp_wqe *cqp_wqe;
+	unsigned long flags;
+	u32 cqp_head;
+	u64 u64temp;
+	u32 opcode;
+	int ctx_index = NES_CQP_WQE_COMP_CTX_LOW_IDX;
 
-	command[len++] = BOOT_CMD_REPORT_ID;                 	/* Report:ReportID */
-	command[len++] = BOOT_ERASE_DATAMEM;			        /* Report:erase datamem command */
-	command[len++] = ECH = BOOT_ERASE_DATAMEM;					/* Report:echo */
-	command[len++] = DATAMEM_SECTOR0;				/* Report:erased block No. */
+	spin_lock_irqsave(&nesdev->cqp.lock, flags);
 
-	/*Preliminarily store the data that cannnot appear here, but in wacom_set_feature()*/	
-	sum = 0;
-	sum += 0x05;
-	sum += 0x07;
-	for (j = 0; j < 4; j++)
-		sum += command[j];
+	if (((((nesdev->cqp.sq_tail+(nesdev->cqp.sq_size*2))-nesdev->cqp.sq_head) &
+			(nesdev->cqp.sq_size - 1)) != 1)
+			&& (list_empty(&nesdev->cqp_pending_reqs))) {
+		cqp_head = nesdev->cqp.sq_head++;
+		nesdev->cqp.sq_head &= nesdev->cqp.sq_size-1;
+		cqp_wqe = &nesdev->cqp.sq_vbase[cqp_head];
+		memcpy(cqp_wqe, &cqp_request->cqp_wqe, sizeof(*cqp_wqe));
+		opcode = le32_to_cpu(cqp_wqe->wqe_words[NES_CQP_WQE_OPCODE_IDX]);
+		if ((opcode & NES_CQP_OPCODE_MASK) == NES_CQP_DOWNLOAD_SEGMENT)
+			ctx_index = NES_CQP_WQE_DL_COMP_CTX_LOW_IDX;
+		barrier();
+		u64temp = (unsigned long)cqp_request;
+		set_wqe_64bit_value(cqp_wqe->wqe_words, ctx_index, u64temp);
+		nes_debug(NES_DBG_CQP, "CQP request (opcode 0x%02X), line 1 = 0x%08X put on CQPs SQ,"
+			" request = %p, cqp_head = %u, cqp_tail = %u, cqp_size = %u,"
+			" waiting = %d, refcount = %d.\n",
+			opcode & NES_CQP_OPCODE_MASK,
+			le32_to_cpu(cqp_wqe->wqe_words[NES_CQP_WQE_ID_IDX]), cqp_request,
+			nesdev->cqp.sq_head, nesdev->cqp.sq_tail, nesdev->cqp.sq_size,
+			cqp_request->waiting, atomic_read(&cqp_request->refcount));
 
-	cmd_chksum = ~sum + 1;					/* Report:check sum */
-	command[len++] = cmd_chksum;
+		barrier();
 
-	bRet = wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG, DATA_REG);
-	if (!bRet) {
-		printk("epen - %s failed to set feature 1 \n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
+		/* Ring doorbell (1 WQEs) */
+		nes_write32(nesdev->regs+NES_WQE_ALLOC, 0x01800000 | nesdev->cqp.qp_id);
+
+		barrier();
+	} else {
+		nes_debug(NES_DBG_CQP, "CQP request %p (opcode 0x%02X), line 1 = 0x%08X"
+				" put on the pending queue.\n",
+				cqp_request,
+				le32_to_cpu(cqp_request->cqp_wqe.wqe_words[NES_CQP_WQE_OPCODE_IDX])&0x3f,
+				le32_to_cpu(cqp_request->cqp_wqe.wqe_words[NES_CQP_WQE_ID_IDX]));
+		list_add_tail(&cqp_request->list, &nesdev->cqp_pending_reqs);
 	}
-	
-	udelay(50);
 
-	do {
+	spin_unlock_irqrestore(&nesdev->cqp.lock, flags);
 
-		bRet = wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, BOOT_RSP_SIZE, response, COMM_REG, DATA_REG, 50);
-		if (!bRet) {
-			printk("%s failed to get feature \n", __func__);
-			return -EXIT_FAIL_SEND_QUERY_COMMAND;
-		}
-		if ((response[3] != 0x0e || response[4] != ECH) || (response[5] != 0xff && response[5] != 0x00)) {
-			printk("epen - %s failing resp3: %x resp4: %x resp5: %x \n",
-				__func__, response[3], response[4], response[5]);
-			return false;
+	return;
+}
+
+/**
+ * nes_arp_table
+ */
+int nes_arp_table(struct nes_device *nesdev, u32 ip_addr, u8 *mac_addr, u32 action)
+{
+	struct nes_adapter *nesadapter = nesdev->nesadapter;
+	int arp_index;
+	int err = 0;
+	__be32 tmp_addr;
+
+	for (arp_index = 0; (u32) arp_index < nesadapter->arp_table_size; arp_index++) {
+		if (nesadapter->arp_table[arp_index].ip_addr == ip_addr)
+			break;
+	}
+
+	if (action == NES_ARP_ADD) {
+		if (arp_index != nesadapter->arp_table_size) {
+			return -1;
 		}
 
-	} while (response[3] == 0x0e && response[4] == ECH && response[5] == 0xff);
-
-
-	return true;
-}
-
-static bool erase_codemem(struct wacom_i2c *wac_i2c, int *eraseBlock, int num)
-{
-	bool bRet = false;
-	u8 command[CMD_SIZE];
-	u8 response[BOOT_RSP_SIZE];
-	unsigned char sum = 0;
-	unsigned char cmd_chksum;
-	int ECH, len = 0;
-	int i, j;
-
-	for (i = 0; i < num; i++) {
-
-		len = 0;		
-		command[len++] = BOOT_CMD_REPORT_ID;                 	/* Report:ReportID */
-		command[len++] = BOOT_ERASE_FLASH;			        /* Report:erase command */
-		command[len++] = ECH = i;					/* Report:echo */
-		command[len++] = *eraseBlock;				/* Report:erased block No. */
-		eraseBlock++;
-		
-		/*Preliminarily store the data that cannnot appear here, but in wacom_set_feature()*/	
-		sum = 0;
-		sum += 0x05;
-		sum += 0x07;
-		for (j = 0; j < 4; j++)
-			sum += command[j];
-
-		cmd_chksum = ~sum + 1;					/* Report:check sum */
-		command[len++] = cmd_chksum;
-	
-		bRet = wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG, DATA_REG);
-		if (!bRet) {
-			printk("epen - %s failed to set feature \n", __func__);
-			return -EXIT_FAIL_SEND_QUERY_COMMAND;
-		}	
-
-		udelay(50);
-
-		do {	
-
-			bRet = wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, BOOT_RSP_SIZE, response, COMM_REG, DATA_REG, 50);
-			if (!bRet) {
-				printk("epen - %s failed to get feature \n", __func__);
-				return -EXIT_FAIL_SEND_QUERY_COMMAND;
-			}			
-			if ((response[3] != 0x00 || response[4] != ECH) || (response[5] != 0xff && response[5] != 0x00)) {
-				printk("epen - %s failing resp3: %x resp4: %x resp5: %x \n",
-						__func__, response[3], response[4], response[5]);
-				return false;
-			}
-			
-		} while (response[3] == 0x00 && response[4] == ECH && response[5] == 0xff);
-	}
-
-	return true;
-}
-
-static bool flash_erase_w9019(struct wacom_i2c *wac_i2c, int *eraseBlock, int num)
-{
-	bool ret;
-
-	ret = erase_datamem(wac_i2c);
-	if (!ret) {
-		printk("epen - %s erasing datamem failed \n", __func__);
-		return false;
-	}
-
-	ret = erase_codemem(wac_i2c, eraseBlock, num);
-	if (!ret) {
-		printk("epen - %s erasing codemem failed \n", __func__);
-		return false;
-	}
-
-	return true;
-}
-#else
-static bool flash_erase_all(struct wacom_i2c *wac_i2c)
-{
-	bool bRet = false;
-	u8 command[BOOT_CMD_SIZE];
-	u8 response[BOOT_RSP_SIZE];
-	int i, len = 0;
-	int ECH, sum = 0;
-
-	command[len++] = 7;
-	command[len++] = 16;
-	command[len++] = ECH = 2;
-	command[len++] = 3;
-
-	/*Preliminarily store the data that cannnot appear here, but in wacom_set_feature()*/
-	sum += 0x05;
-	sum += 0x07;
-	for (i = 0; i < len; i++)
-		sum += command[i];
-
-	command[len++] = ~sum + 1;
-
-	bRet = wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, len, command, COMM_REG, DATA_REG);
-	if (!bRet) {
-		printk("%s failed to set feature \n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	do {
-
-
-		bRet = wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, BOOT_RSP_SIZE, response, COMM_REG, DATA_REG, 0);
-		if (!bRet) {
-			printk("%s failed to set feature \n", __func__);
-			return -EXIT_FAIL_SEND_QUERY_COMMAND;
+		arp_index = 0;
+		err = nes_alloc_resource(nesadapter, nesadapter->allocated_arps,
+				nesadapter->arp_table_size, (u32 *)&arp_index, &nesadapter->next_arp_index, NES_RESOURCE_ARP);
+		if (err) {
+			nes_debug(NES_DBG_NETDEV, "nes_alloc_resource returned error = %u\n", err);
+			return err;
 		}
-		if (!(response[3] & 0x10) || !(response[4] & ECH) ||
-		    (!(response[5] & 0xff) && response[5] & 0x00)) {
-			printk("%s failing 4 resp1: %x resp2: %x resp3: %x \n",
-			       __func__, response[3], response[4], response[5]);
-			return false;
-		}
+		nes_debug(NES_DBG_NETDEV, "ADD, arp_index=%d\n", arp_index);
 
-		mdelay(200);
-
-	} while(response[3] == 0x10 && response[4] == ECH && response[5] == 0xff);
-
-	return true;
-}
-#endif
-
-static bool flash_write_block_w9014(struct wacom_i2c *wac_i2c, char *flash_data,
-				    unsigned long ulAddress, u8 *pcommand_id, int *ECH)
-{
-	const int MAX_COM_SIZE = (8 + FLASH_BLOCK_SIZE + 2); //8: num of command[0] to command[7]
-                                                              //FLASH_BLOCK_SIZE: unit to erase the block
-                                                              //Num of Last 2 checksums
-	bool bRet = false;
-	u8 command[300];
-	unsigned char sum = 0;
-	int i;
-
-	command[0] = BOOT_CMD_REPORT_ID;	                /* Report:ReportID */
-	command[1] = BOOT_WRITE_FLASH;			        /* Report:program  command */
-	command[2] = *ECH = ++(*pcommand_id);		        /* Report:echo */
-	command[3] = ulAddress & 0x000000ff;
-	command[4] = (ulAddress & 0x0000ff00) >> 8;
-	command[5] = (ulAddress & 0x00ff0000) >> 16;
-	command[6] = (ulAddress & 0xff000000) >> 24;			/* Report:address(4bytes) */
-	command[7] = 8;						/* Report:size(8*8=64) */
-
-	/*Preliminarily store the data that cannnot appear here, but in wacom_set_feature()*/
-	sum = 0;
-	sum += 0x05;
-	sum += 0x4c;
-	for (i = 0; i < 8; i++)
-		sum += command[i];
-	command[MAX_COM_SIZE - 2] = ~sum + 1;					/* Report:command checksum */
-
-	sum = 0;
-	for (i = 8; i < (FLASH_BLOCK_SIZE + 8); i++){
-		command[i] = flash_data[ulAddress+(i - 8)];
-		sum += flash_data[ulAddress+(i - 8)];
+		nesadapter->arp_table[arp_index].ip_addr = ip_addr;
+		memcpy(nesadapter->arp_table[arp_index].mac_addr, mac_addr, ETH_ALEN);
+		return arp_index;
 	}
 
-	command[MAX_COM_SIZE - 1] = ~sum+1;				/* Report:data checksum */
-
-	/*Subtract 8 for the first 8 bytes*/
-	bRet = wacom_i2c_set_feature(wac_i2c, REPORT_ID_1, (BOOT_CMD_SIZE + 4 - 8), command, COMM_REG, DATA_REG);
-	if (!bRet) {
-		printk("%s failed to set feature \n", __func__);
-		return -EXIT_FAIL_SEND_QUERY_COMMAND;
-	}
-
-	udelay(50);
-
-	return true;
-}
-
-static bool flash_write_w9014(struct wacom_i2c *wac_i2c, unsigned char *flash_data,
-			      unsigned long start_address, unsigned long *max_address)
-{
-	bool bRet = false;
-	u8 command_id = 0;
-	u8 response[BOOT_RSP_SIZE];
-	int i, j, ECH = 0, ECH_len = 0;
-	int ECH_ARRAY[3];
-	unsigned long ulAddress;
-
-	j = 0;
-	for (ulAddress = start_address; ulAddress < *max_address; ulAddress += FLASH_BLOCK_SIZE) {
-		for (i = 0; i < FLASH_BLOCK_SIZE; i++) {
-			if (flash_data[ulAddress+i] != 0xFF)
-				break;
-		}
-		if (i == (FLASH_BLOCK_SIZE))
-			continue;
-
-		/* for debug */
-		//printk(KERN_DEBUG"epen:write data %#x\n", (unsigned int)ulAddress);
-
-		bRet = flash_write_block_w9014(wac_i2c, flash_data, ulAddress, &command_id, &ECH);
-		if(!bRet)
-			return false;
-		if (ECH_len == 3)
-			ECH_len = 0;
-
-		ECH_ARRAY[ECH_len++] = ECH;
-		if (ECH_len == 3) {
-			for (j = 0; j < 3; j++) {
-				do {
-
-					bRet = wacom_i2c_get_feature(wac_i2c, REPORT_ID_2, BOOT_RSP_SIZE, response, COMM_REG, DATA_REG, 50);
-					if (!bRet) {
-						printk("%s failed to set feature \n", __func__);
-						return -EXIT_FAIL_SEND_QUERY_COMMAND;
-					}
-
-					if ((response[3] != 0x01 || response[4] != ECH_ARRAY[j]) || (response[5] != 0xff && response[5] != 0x00)) {
-						printk("%s mismatched echo array \n", __func__);
-//						printk("addr: %x res:%x \n", ulAddress, response[5]);
-						return false;
-					}
-				} while (response[3] == 0x01 && response[4] == ECH_ARRAY[j] && response[5] == 0xff);
-			}
-		}
-	}
-	return true;
-}
-
-int wacom_i2c_flash_w9014(struct wacom_i2c *wac_i2c, unsigned char *fw_data)
-{
-	bool bRet = false;
-	int result, i;
-	int eraseBlock[200], eraseBlockNum;
-	int iBLVer = 0, iMpuType = 0;
-	unsigned long max_address = 0;			/* Max.address of Load data */
-	unsigned long start_address = 0x2000;	        /* Start.address of Load data */
-
-	/*Obtain boot loader version*/
-	if (!flash_blver_w9014(wac_i2c, &iBLVer)) {
-		printk("epen : %s failed to get Boot Loader version \n", __func__);
-		return -EXIT_FAIL_GET_BOOT_LOADER_VERSION;
-	}
-	printk("epen : BL version: %x \n", iBLVer);
-
-	/*Obtain MPU type: this can be manually done in user space*/
-	if (!flash_mputype_w9014(wac_i2c, &iMpuType)) {
-		printk("epen : %s failed to get MPU type \n", __func__);
-		return -EXIT_FAIL_GET_MPU_TYPE;
-	}
-//	if (iMpuType != MPU_W9014 || iMpuType != MPU_W9019) {
-	if (iMpuType != MPU_W9019) {
-		printk("epen : MPU is not suitable : %x \n", iMpuType);
-		return -EXIT_FAIL_GET_MPU_TYPE;
-	}
-	printk("epen : MPU type: %x \n", iMpuType);
-
-	/*-----------------------------------*/
-	/*Flashing operation starts from here*/
-
-	/*Set start and end address and block numbers*/
-	eraseBlockNum = 0;
-	start_address = W9014_START_ADDR;
-	max_address = W9014_END_ADDR;
-	for (i = BLOCK_NUM; i >= 8; i--) {
-		eraseBlock[eraseBlockNum] = i;
-		eraseBlockNum++;
-	}
-
-	msleep(300);
-
-	/*Erase the old program*/
-	printk("epen - %s erasing the current firmware \n", __func__);
-#ifdef PARTIAL_ERASE
-	bRet = flash_erase_w9019(wac_i2c, eraseBlock,  eraseBlockNum);
-	if (!bRet) {
-		printk("epen - %s failed to erase the user program \n", __func__);
-		result = -EXIT_FAIL_ERASE;
-		goto fail;
-	}
-#else
-	bRet = flash_erase_all(wac_i2c);
-	if (!bRet) {
-		printk("epen - %s failed to erase the user program \n", __func__);
-		result = -EXIT_FAIL_ERASE;
-		goto fail;
-	}
-#endif
-
-	/*Write the new program*/
-	printk(KERN_DEBUG"epen:%s writing new firmware \n", __func__);
-	bRet = flash_write_w9014(wac_i2c, fw_data, start_address, &max_address);
-	if (!bRet) {
-		printk("epen : %s failed to write firmware \n", __func__);
-		result = -EXIT_FAIL_WRITE_FIRMWARE;
-		goto fail;
-	}
-
-	/*Return to the user mode*/
-	printk("epen : %s closing the boot mode \n", __func__);
-	bRet = flash_end_w9014(wac_i2c);
-	if (!bRet) {
-		printk("epen : %s closing boot mode failed  \n", __func__);
-		result = -EXIT_FAIL_WRITING_MARK_NOT_SET;
-		goto fail;
-	}
-
-	printk("epen : %s write and verify completed \n", __func__);
-	result = EXIT_OK;
-
- fail:
-	return result;
-}
-
-int wacom_i2c_flash(struct wacom_i2c *wac_i2c)
-{
-	int ret;
-
-	if (wac_i2c->fw_data == NULL) {
-		printk(KERN_ERR "epen:Data is NULL. Exit.\n");
+	/* DELETE or RESOLVE */
+	if (arp_index == nesadapter->arp_table_size) {
+		tmp_addr = cpu_to_be32(ip_addr);
+		nes_debug(NES_DBG_NETDEV, "MAC for %pI4 not in ARP table - cannot %s\n",
+			  &tmp_addr, action == NES_ARP_RESOLVE ? "resolve" : "delete");
 		return -1;
 	}
 
-	wacom_compulsory_flash_mode(wac_i2c, true);
-	wacom_reset_hw(wac_i2c);
-	msleep(200);
-
-
-	ret = wacom_flash_cmd(wac_i2c);
-	if (ret < 0) {
-		printk(KERN_NOTICE"epen:%s cannot send flash command \n", __func__);
+	if (action == NES_ARP_RESOLVE) {
+		nes_debug(NES_DBG_NETDEV, "RESOLVE, arp_index=%d\n", arp_index);
+		return arp_index;
 	}
 
-	printk(KERN_NOTICE"epen:%s pass wacom_flash_cmd \n", __func__);
-
-	ret = flash_query_w9014(wac_i2c);
-	if(ret < 0) {
-		printk(KERN_NOTICE"epen:%s Error: cannot send query \n", __func__);
-		ret = -EXIT_FAIL;
-		goto end_wacom_flash;
+	if (action == NES_ARP_DELETE) {
+		nes_debug(NES_DBG_NETDEV, "DELETE, arp_index=%d\n", arp_index);
+		nesadapter->arp_table[arp_index].ip_addr = 0;
+		memset(nesadapter->arp_table[arp_index].mac_addr, 0x00, ETH_ALEN);
+		nes_free_resource(nesadapter, nesadapter->allocated_arps, arp_index);
+		return arp_index;
 	}
 
-	printk(KERN_NOTICE"epen:%s pass flash_query_w9014 \n", __func__);
-
-	ret = wacom_i2c_flash_w9014(wac_i2c, wac_i2c->fw_data);
-	if (ret < 0) {
-		printk(KERN_NOTICE"epen:%s Error: flash failed \n", __func__);
-		ret = -EXIT_FAIL;
-		goto end_wacom_flash;
-	}
-
-	msleep(200);
- end_wacom_flash:
-	wacom_compulsory_flash_mode(wac_i2c, false);
-	wacom_reset_hw(wac_i2c);
-	msleep(200);
-
-	return ret;
+	return -1;
 }
+
+
+/**
+ * nes_mh_fix
+ */
+void nes_mh_fix(unsigned long parm)
+{
+	unsigned long flags;
+	struct nes_device *nesdev = (struct nes_device *)parm;
+	struct nes_adapter *nesadapter = nesdev->nesadapter;
+	struct nes_vnic *nesvnic;
+	u32 used_chunks_tx;
+	u32 temp_used_chunks_tx;
+	u32 temp_last_used_chunks_tx;
+	u32 used_chunks_mask;
+	u32 mac_tx_frames_low;
+	u32 mac_tx_frames_high;
+	u32 mac_tx_pauses;
+	u32 serdes_status;
+	u32 reset_value;
+	u32 tx_control;
+	u32 tx_config;
+	u32 tx_pause_quanta;
+	u32 rx_control;
+	u32 rx_config;
+	u32 mac_exact_match;
+	u32 mpp_debug;
+	u32 i=0;
+	u32 chunks_tx_progress = 0;
+
+	spin_lock_irqsave(&nesadapter->phy_lock, flags);
+	if ((nesadapter->mac_sw_state[0] != NES_MAC_SW_IDLE) || (nesadapter->mac_link_down[0])) {
+		spin_unlock_irqrestore(&nesadapter->phy_lock, flags);
+		goto no_mh_work;
+	}
+	nesadapter->mac_sw_state[0] = NES_MAC_SW_MH;
+	spin_unlock_irqrestore(&nesadapter->phy_lock, flags);
+	do {
+		mac_tx_frames_low = nes_read_indexed(nesdev, NES_IDX_MAC_TX_FRAMES_LOW);
+		mac_tx_frames_high = nes_read_indexed(nesdev, NES_IDX_MAC_TX_FRAMES_HIGH);
+		mac_tx_pauses = nes_read_indexed(nesdev, NES_IDX_MAC_TX_PAUSE_FRAMES);
+		used_chunks_tx = nes_read_indexed(nesdev, NES_IDX_USED_CHUNKS_TX);
+		nesdev->mac_pause_frames_sent += mac_tx_pauses;
+		used_chunks_mask = 0;
+		temp_used_chunks_tx = used_chunks_tx;
+		temp_last_used_chunks_tx = nesdev->last_used_chunks_tx;
+
+		if (nesdev->netdev[0]) {
+			nesvnic = netdev_priv(nesdev->netdev[0]);
+		} else {
+			break;
+		}
+
+		for (i=0; i<4; i++) {
+			used_chunks_mask <<= 8;
+			if (nesvnic->qp_nic_index[i] != 0xff) {
+				used_chunks_mask |= 0xff;
+				if ((temp_used_chunks_tx&0xff)<(temp_last_used_chunks_tx&0xff)) {
+					chunks_tx_progress = 1;
+				}
+			}
+			temp_used_chunks_tx >>= 8;
+			temp_last_used_chunks_tx >>= 8;
+		}
+		if ((mac_tx_frames_low) || (mac_tx_frames_high) ||
+			(!(used_chunks_tx&used_chunks_mask)) ||
+			(!(nesdev->last_used_chunks_tx&used_chunks_mask)) ||
+			(chunks_tx_progress) ) {
+			nesdev->last_used_chunks_tx = used_chunks_tx;
+			break;
+		}
+		nesdev->last_used_chunks_tx = used_chunks_tx;
+		barrier();
+
+		nes_write_indexed(nesdev, NES_IDX_MAC_TX_CONTROL, 0x00000005);
+		mh_pauses_sent++;
+		mac_tx_pauses = nes_read_indexed(nesdev, NES_IDX_MAC_TX_PAUSE_FRAMES);
+		if (mac_tx_pauses) {
+			nesdev->mac_pause_frames_sent += mac_tx_pauses;
+			break;
+		}
+
+		tx_control = nes_read_indexed(nesdev, NES_IDX_MAC_TX_CONTROL);
+		tx_config = nes_read_indexed(nesdev, NES_IDX_MAC_TX_CONFIG);
+		tx_pause_quanta = nes_read_indexed(nesdev, NES_IDX_MAC_TX_PAUSE_QUANTA);
+		rx_control = nes_read_indexed(nesdev, NES_IDX_MAC_RX_CONTROL);
+		rx_config = nes_read_indexed(nesdev, NES_IDX_MAC_RX_CONFIG);
+		mac_exact_match = nes_read_indexed(nesdev, NES_IDX_MAC_EXACT_MATCH_BOTTOM);
+		mpp_debug = nes_read_indexed(nesdev, NES_IDX_MPP_DEBUG);
+
+		/* one last ditch effort to avoid a false positive */
+		mac_tx_pauses = nes_read_indexed(nesdev, NES_IDX_MAC_TX_PAUSE_FRAMES);
+		if (mac_tx_pauses) {
+			nesdev->last_mac_tx_pauses = nesdev->mac_pause_frames_sent;
+			nes_debug(NES_DBG_HW, "failsafe caught slow outbound pause\n");
+			break;
+		}
+		mh_detected++;
+
+		nes_write_indexed(nesdev, NES_IDX_MAC_TX_CONTROL, 0x00000000);
+		nes_write_indexed(nesdev, NES_IDX_MAC_TX_CONFIG, 0x00000000);
+		reset_value = nes_read32(nesdev->regs+NES_SOFTWARE_RESET);
+
+		nes_write32(nesdev->regs+NES_SOFTWARE_RESET, reset_value | 0x0000001d);
+
+		while (((nes_read32(nesdev->regs+NES_SOFTWARE_RESET)
+				& 0x00000040) != 0x00000040) && (i++ < 5000)) {
+			/* mdelay(1); */
+		}
+
+		nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_COMMON_CONTROL0, 0x00000008);
+		serdes_status = nes_read_indexed(nesdev, NES_IDX_ETH_SERDES_COMMON_STATUS0);
+
+		nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_TX_EMP0, 0x000bdef7);
+		nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_TX_DRIVE0, 0x9ce73000);
+		nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_RX_MODE0, 0x0ff00000);
+		nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_RX_SIGDET0, 0x00000000);
+		nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_BYPASS0, 0x00000000);
+		nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_LOOPBACK_CONTROL0, 0x00000000);
+		if (nesadapter->OneG_Mode) {
+			nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_RX_EQ_CONTROL0, 0xf0182222);
+		} else {
+			nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_RX_EQ_CONTROL0, 0xf0042222);
+		}
+		serdes_status = nes_read_indexed(nesdev, NES_IDX_ETH_SERDES_RX_EQ_STATUS0);
+		nes_write_indexed(nesdev, NES_IDX_ETH_SERDES_CDR_CONTROL0, 0x000000ff);
+
+		nes_write_indexed(nesdev, NES_IDX_MAC_TX_CONTROL, tx_control);
+		nes_write_indexed(nesdev, NES_IDX_MAC_TX_CONFIG, tx_config);
+		nes_write_indexed(nesdev, NES_IDX_MAC_TX_PAUSE_QUANTA, tx_pause_quanta);
+		nes_write_indexed(nesdev, NES_IDX_MAC_RX_CONTROL, rx_control);
+		nes_write_indexed(nesdev, NES_IDX_MAC_RX_CONFIG, rx_config);
+		nes_write_indexed(nesdev, NES_IDX_MAC_EXACT_MATCH_BOTTOM, mac_exact_match);
+		nes_write_indexed(nesdev, NES_IDX_MPP_DEBUG, mpp_debug);
+
+	} while (0);
+
+	nesadapter->mac_sw_state[0] = NES_MAC_SW_IDLE;
+no_mh_work:
+	nesdev->nesadapter->mh_timer.expires = jiffies + (HZ/5);
+	add_timer(&nesdev->nesadapter->mh_timer);
+}
+
+/**
+ * nes_clc
+ */
+void nes_clc(unsigned long parm)
+{
+	unsigned long flags;
+	struct nes_device *nesdev = (struct nes_device *)parm;
+	struct nes_adapter *nesadapter = nesdev->nesadapter;
+
+	spin_lock_irqsave(&nesadapter->phy_lock, flags);
+    nesadapter->link_interrupt_count[0] = 0;
+    nesadapter->link_interrupt_count[1] = 0;
+    nesadapter->link_interrupt_count[2] = 0;
+    nesadapter->link_interrupt_count[3] = 0;
+	spin_unlock_irqrestore(&nesadapter->phy_lock, flags);
+
+	nesadapter->lc_timer.expires = jiffies + 3600 * HZ;  /* 1 hour */
+	add_timer(&nesadapter->lc_timer);
+}
+
+
+/**
+ * nes_dump_mem
+ */
+void nes_dump_mem(unsigned int dump_debug_level, void *addr, int length)
+{
+	char  xlate[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+		'a', 'b', 'c', 'd', 'e', 'f'};
+	char  *ptr;
+	char  hex_buf[80];
+	char  ascii_buf[20];
+	int   num_char;
+	int   num_ascii;
+	int   num_hex;
+
+	if (!(nes_debug_level & dump_debug_level)) {
+		return;
+	}
+
+	ptr = addr;
+	if (length > 0x100) {
+		nes_debug(dump_debug_level, "Length truncated from %x to %x\n", length, 0x100);
+		length = 0x100;
+	}
+	nes_debug(dump_debug_level, "Address=0x%p, length=0x%x (%d)\n", ptr, length, length);
+
+	memset(ascii_buf, 0, 20);
+	memset(hex_buf, 0, 80);
+
+	num_ascii = 0;
+	num_hex = 0;
+	for (num_char = 0; num_char < length; num_char++) {
+		if (num_ascii == 8) {
+			ascii_buf[num_ascii++] = ' ';
+			hex_buf[num_hex++] = '-';
+			hex_buf[num_hex++] = ' ';
+		}
+
+		if (*ptr < 0x20 || *ptr > 0x7e)
+			ascii_buf[num_ascii++] = '.';
+		else
+			ascii_buf[num_ascii++] = *ptr;
+		hex_buf[num_hex++] = xlate[((*ptr & 0xf0) >> 4)];
+		hex_buf[num_hex++] = xlate[*ptr & 0x0f];
+		hex_buf[num_hex++] = ' ';
+		ptr++;
+
+		if (num_ascii >= 17) {
+			/* output line and reset */
+			nes_debug(dump_debug_level, "   %s |  %s\n", hex_buf, ascii_buf);
+			memset(ascii_buf, 0, 20);
+			memset(hex_buf, 0, 80);
+			num_ascii = 0;
+			num_hex = 0;
+		}
+	}
+
+	/* output the rest */
+	if (num_ascii) {
+		while (num_ascii < 17) {
+			if (num_ascii == 8) {
+				hex_buf[num_hex++] = ' ';
+				hex_buf[num_hex++] = ' ';
+			}
+			hex_buf[num_hex++] = ' ';
+			hex_buf[num_hex++] = ' ';
+			hex_buf[num_hex++] = ' ';
+			num_ascii++;
+		}
+
+		nes_debug(dump_debug_level, "   %s |  %s\n", hex_buf, ascii_buf);
+	}
+}
+                                                                                                                                                                                                                         /* This file is part of the Emulex RoCE Device Driver for
+ * RoCE (RDMA over Converged Ethernet) adapters.
+ * Copyright (C) 2012-2015 Emulex. All rights reserved.
+ * EMULEX and SLI are trademarks of Emulex.
+ * www.emulex.com
+ *
+ * This software is available to you under a choice of one of two licenses.
+ * You may choose to be licensed under the terms of the GNU General Public
+ * License (GPL) Version 2, available from the file COPYING in the main
+ * directory of this source tree, or the BSD license below:
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * - Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ *
+ * - Redistributions in binary form must reproduce the above copyright
+ *   notice, this list of conditions and the following disclaimer in
+ *   the documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Contact Information:
+ * linux-drivers@emulex.com
+ *
+ * Emulex
+ * 3333 Susan Street
+ * Costa Mesa, CA 92626
+ */
+
+#ifndef __OCRDMA_H__
+#define __OCRDMA_H__
+
+#include <linux/mutex.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
+#include <linux/pci.h>
+
+#include <rdma/ib_verbs.h>
+#include <rdma/ib_user_verbs.h>
+#include <rdma/ib_addr.h>
+
+#include <be_roce.h>
+#include "ocrdma_sli.h"
+
+#define OCRDMA_ROCE_DRV_VERSION "11.0.0.0"
+
+#define OCRDMA_ROCE_DRV_DESC "Emulex OneConnect RoCE Driver"
+#define OCRDMA_NODE_DESC "Emulex OneConnect RoCE HCA"
+
+#define OC_NAME_SH	OCRDMA_NODE_DESC "(Skyhawk)"
+#define OC_NAME_UNKNOWN OCRDMA_NODE_DESC "(Unknown)"
+
+#define OC_SKH_DEVICE_PF 0x720
+#define OC_SKH_DEVICE_VF 0x728
+#define OCRDMA_MAX_AH 512
+
+#define OCRDMA_UVERBS(CMD_NAME) (1ull << IB_USER_VERBS_CMD_##CMD_NAME)
+
+#define convert_to_64bit(lo, hi) ((u64)hi << 32 | (u64)lo)
+#define EQ_INTR_PER_SEC_THRSH_HI 150000
+#define EQ_INTR_PER_SEC_THRSH_LOW 100000
+#define EQ_AIC_MAX_EQD 20
+#define EQ_AIC_MIN_EQD 0
+
+void ocrdma_eqd_set_task(struct work_struct *work);
+
+struct ocrdma_dev_attr {
+	u8 fw_ver[32];
+	u32 vendor_id;
+	u32 device_id;
+	u16 max_pd;
+	u16 max_dpp_pds;
+	u16 max_cq;
+	u16 max_cqe;
+	u16 max_qp;
+	u16 max_wqe;
+	u16 max_rqe;
+	u16 max_srq;
+	u32 max_inline_data;
+	int max_send_sge;
+	int max_recv_sge;
+	int max_srq_sge;
+	int max_rdma_sge;
+	int max_mr;
+	u64 max_mr_size;
+	u32 max_num_mr_pbl;
+	int max_mw;
+	int max_fmr;
+	int max_map_per_fmr;
+	int max_pages_per_frmr;
+	u16 max_ord_per_qp;
+	u16 max_ird_per_qp;
+
+	int device_cap_flags;
+	u8 cq_overflow_detect;
+	u8 srq_supported;
+
+	u32 wqe_size;
+	u32 rqe_size;
+	u32 ird_page_size;
+	u8 local_ca_ack_delay;
+	u8 ird;
+	u8 num_ird_pages;
+};
+
+struct ocrdma_dma_mem {
+	void *va;
+	dma_addr_t pa;
+	u32 size;
+};
+
+struct ocrdma_pbl {
+	void *va;
+	dma_addr_t pa;
+};
+
+struct ocrdma_queue_info {
+	void *va;
+	dma_addr_t dma;
+	u32 size;
+	u16 len;
+	u16 entry_size;		/* Size of an element in the queue */
+	u16 id;			/* qid, where to ring the doorbell. */
+	u16 head, tail;
+	bool created;
+};
+
+struct ocrdma_aic_obj {         /* Adaptive interrupt coalescing (AIC) info */
+	u32 prev_eqd;
+	u64 eq_intr_cnt;
+	u64 prev_eq_intr_cnt;
+};
+
+struct ocrdma_eq {
+	struct ocrdma_queue_info q;
+	u32 vector;
+	int cq_cnt;
+	struct ocrdma_dev *dev;
+	char irq_name[32];
+	struct ocrdma_aic_obj aic_obj;
+};
+
+struct ocrdma_mq {
+	struct ocrdma_queue_info sq;
+	struct ocrdma_queue_info cq;
+	bool rearm_cq;
+};
+
+struct mqe_ctx {
+	struct mutex lock; /* for serializing mailbox commands on MQ */
+	wait_queue_head_t cmd_wait;
+	u32 tag;
+	u16 cqe_status;
+	u16 ext_status;
+	bool cmd_done;
+	bool fw_error_state;
+};
+
+struct ocrdma_hw_mr {
+	u32 lkey;
+	u8 fr_mr;
+	u8 remote_atomic;
+	u8 remote_rd;
+	u8 remote_wr;
+	u8 local_rd;
+	u8 local_wr;
+	u8 mw_bind;
+	u8 rsvd;
+	u64 len;
+	struct ocrdma_pbl *pbl_table;
+	u32 num_pbls;
+	u32 num_pbes;
+	u32 pbl_size;
+	u32 pbe_size;
+	u64 fbo;
+	u64 va;
+};
+
+struct ocrdma_mr {
+	struct ib_mr ibmr;
+	struct ib_umem *umem;
+	struct ocrdma_hw_mr hwmr;
+	u64 *pages;
+	u32 npages;
+};
+
+struct ocrdma_stats {
+	u8 type;
+	struct ocrdma_dev *dev;
+};
+
+struct ocrdma_pd_resource_mgr {
+	u32 pd_norm_start;
+	u16 pd_norm_count;
+	u16 pd_norm_thrsh;
+	u16 max_normal_pd;
+	u32 pd_dpp_start;
+	u16 pd_dpp_count;
+	u16 pd_dpp_thrsh;
+	u16 max_dpp_pd;
+	u16 dpp_page_index;
+	unsigned long *pd_norm_bitmap;
+	unsigned long *pd_dpp_bitmap;
+	bool pd_prealloc_valid;
+};
+
+struct stats_mem {
+	struct ocrdma_mqe mqe;
+	void *va;
+	dma_addr_t pa;
+	u32 size;
+	char *debugfs_mem;
+};
+
+struct phy_info {
+	u16 auto_speeds_supported;
+	u16 fixed_speeds_supported;
+	u16 phy_type;
+	u16 interface_type;
+};
+
+enum ocrdma_flags {
+	OCRDMA_FLAGS_LINK_STATUS_INIT = 0x01
+};
+
+struct ocrdma_dev {
+	struct ib_device ibdev;
+	struct ocrdma_dev_attr attr;
+
+	struct mutex dev_lock; /* provides syncronise access to device data */
+	spinlock_t flush_q_lock ____cacheline_aligned;
+
+	struct ocrdma_cq **cq_tbl;
+	struct ocrdma_qp **qp_tbl;
+
+	struct ocrdma_eq *eq_tbl;
+	int eq_cnt;
+	struct delayed_work eqd_work;
+	u16 base_eqid;
+	u16 max_eq;
+
+	/* provided synchronization to sgid table for
+	 * updating gid entries triggered by notifier.
+	 */
+	spinlock_t sgid_lock;
+
+	int gsi_qp_created;
+	struct ocrdma_cq *gsi_sqcq;
+	struct ocrdma_cq *gsi_rqcq;
+
+	struct {
+		struct ocrdma_av *va;
+		dma_addr_t pa;
+		u32 size;
+		u32 num_ah;
+		/* provide synchronization for av
+		 * entry allocations.
+		 */
+		spinlock_t lock;
+		u32 ahid;
+		struct ocrdma_pbl pbl;
+	} av_tbl;
+
+	void *mbx_cmd;
+	struct ocrdma_mq mq;
+	struct mqe_ctx mqe_ctx;
+
+	struct be_dev_info nic_info;
+	struct phy_info phy;
+	char model_number[32];
+	u32 hba_port_num;
+
+	struct list_head entry;
+	int id;
+	u64 *stag_arr;
+	u8 sl; /* service level */
+	bool pfc_state;
+	atomic_t update_sl;
+	u16 pvid;
+	u32 asic_id;
+	u32 flags;
+
+	ulong last_stats_time;
+	struct mutex stats_lock; /* provide synch for debugfs operations */
+	struct stats_mem stats_mem;
+	struct ocrdma_stats rsrc_stats;
+	struct ocrdma_stats rx_stats;
+	struct ocrdma_stats wqe_st

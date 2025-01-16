@@ -1,1009 +1,901 @@
-/*
- *  Silicon Labs C2 port core Linux support
- *
- *  Copyright (c) 2007 Rodolfo Giometti <giometti@linux.it>
- *  Copyright (c) 2007 Eurotech S.p.A. <info@eurotech.it>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation
- */
-
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/device.h>
-#include <linux/errno.h>
-#include <linux/err.h>
-#include <linux/kernel.h>
-#include <linux/kmemcheck.h>
-#include <linux/ctype.h>
-#include <linux/delay.h>
-#include <linux/idr.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
-
-#include <linux/c2port.h>
-
-#define DRIVER_NAME             "c2port"
-#define DRIVER_VERSION          "0.51.0"
-
-static DEFINE_SPINLOCK(c2port_idr_lock);
-static DEFINE_IDR(c2port_idr);
-
-/*
- * Local variables
- */
-
-static struct class *c2port_class;
-
-/*
- * C2 registers & commands defines
- */
-
-/* C2 registers */
-#define C2PORT_DEVICEID		0x00
-#define C2PORT_REVID		0x01
-#define C2PORT_FPCTL		0x02
-#define C2PORT_FPDAT		0xB4
-
-/* C2 interface commands */
-#define C2PORT_GET_VERSION	0x01
-#define C2PORT_DEVICE_ERASE	0x03
-#define C2PORT_BLOCK_READ	0x06
-#define C2PORT_BLOCK_WRITE	0x07
-#define C2PORT_PAGE_ERASE	0x08
-
-/* C2 status return codes */
-#define C2PORT_INVALID_COMMAND	0x00
-#define C2PORT_COMMAND_FAILED	0x02
-#define C2PORT_COMMAND_OK	0x0d
-
-/*
- * C2 port low level signal managements
- */
-
-static void c2port_reset(struct c2port_device *dev)
-{
-	struct c2port_ops *ops = dev->ops;
-
-	/* To reset the device we have to keep clock line low for at least
-	 * 20us.
-	 */
-	local_irq_disable();
-	ops->c2ck_set(dev, 0);
-	udelay(25);
-	ops->c2ck_set(dev, 1);
-	local_irq_enable();
-
-	udelay(1);
+&req, msg);
+	msg->path_msg = true;
+	return 0;
 }
 
-static void c2port_strobe_ck(struct c2port_device *dev)
+static int drm_dp_mst_assign_payload_id(struct drm_dp_mst_topology_mgr *mgr,
+					struct drm_dp_vcpi *vcpi)
 {
-	struct c2port_ops *ops = dev->ops;
+	int ret, vcpi_ret;
 
-	/* During hi-low-hi transition we disable local IRQs to avoid
-	 * interructions since C2 port specification says that it must be
-	 * shorter than 5us, otherwise the microcontroller may consider
-	 * it as a reset signal!
-	 */
-	local_irq_disable();
-	ops->c2ck_set(dev, 0);
-	udelay(1);
-	ops->c2ck_set(dev, 1);
-	local_irq_enable();
+	mutex_lock(&mgr->payload_lock);
+	ret = find_first_zero_bit(&mgr->payload_mask, mgr->max_payloads + 1);
+	if (ret > mgr->max_payloads) {
+		ret = -EINVAL;
+		DRM_DEBUG_KMS("out of payload ids %d\n", ret);
+		goto out_unlock;
+	}
 
-	udelay(1);
+	vcpi_ret = find_first_zero_bit(&mgr->vcpi_mask, mgr->max_payloads + 1);
+	if (vcpi_ret > mgr->max_payloads) {
+		ret = -EINVAL;
+		DRM_DEBUG_KMS("out of vcpi ids %d\n", ret);
+		goto out_unlock;
+	}
+
+	set_bit(ret, &mgr->payload_mask);
+	set_bit(vcpi_ret, &mgr->vcpi_mask);
+	vcpi->vcpi = vcpi_ret + 1;
+	mgr->proposed_vcpis[ret - 1] = vcpi;
+out_unlock:
+	mutex_unlock(&mgr->payload_lock);
+	return ret;
 }
 
-/*
- * C2 port basic functions
- */
-
-static void c2port_write_ar(struct c2port_device *dev, u8 addr)
+static void drm_dp_mst_put_payload_id(struct drm_dp_mst_topology_mgr *mgr,
+				      int vcpi)
 {
-	struct c2port_ops *ops = dev->ops;
 	int i;
-
-	/* START field */
-	c2port_strobe_ck(dev);
-
-	/* INS field (11b, LSB first) */
-	ops->c2d_dir(dev, 0);
-	ops->c2d_set(dev, 1);
-	c2port_strobe_ck(dev);
-	ops->c2d_set(dev, 1);
-	c2port_strobe_ck(dev);
-
-	/* ADDRESS field */
-	for (i = 0; i < 8; i++) {
-		ops->c2d_set(dev, addr & 0x01);
-		c2port_strobe_ck(dev);
-
-		addr >>= 1;
-	}
-
-	/* STOP field */
-	ops->c2d_dir(dev, 1);
-	c2port_strobe_ck(dev);
-}
-
-static int c2port_read_ar(struct c2port_device *dev, u8 *addr)
-{
-	struct c2port_ops *ops = dev->ops;
-	int i;
-
-	/* START field */
-	c2port_strobe_ck(dev);
-
-	/* INS field (10b, LSB first) */
-	ops->c2d_dir(dev, 0);
-	ops->c2d_set(dev, 0);
-	c2port_strobe_ck(dev);
-	ops->c2d_set(dev, 1);
-	c2port_strobe_ck(dev);
-
-	/* ADDRESS field */
-	ops->c2d_dir(dev, 1);
-	*addr = 0;
-	for (i = 0; i < 8; i++) {
-		*addr >>= 1;	/* shift in 8-bit ADDRESS field LSB first */
-
-		c2port_strobe_ck(dev);
-		if (ops->c2d_get(dev))
-			*addr |= 0x80;
-	}
-
-	/* STOP field */
-	c2port_strobe_ck(dev);
-
-	return 0;
-}
-
-static int c2port_write_dr(struct c2port_device *dev, u8 data)
-{
-	struct c2port_ops *ops = dev->ops;
-	int timeout, i;
-
-	/* START field */
-	c2port_strobe_ck(dev);
-
-	/* INS field (01b, LSB first) */
-	ops->c2d_dir(dev, 0);
-	ops->c2d_set(dev, 1);
-	c2port_strobe_ck(dev);
-	ops->c2d_set(dev, 0);
-	c2port_strobe_ck(dev);
-
-	/* LENGTH field (00b, LSB first -> 1 byte) */
-	ops->c2d_set(dev, 0);
-	c2port_strobe_ck(dev);
-	ops->c2d_set(dev, 0);
-	c2port_strobe_ck(dev);
-
-	/* DATA field */
-	for (i = 0; i < 8; i++) {
-		ops->c2d_set(dev, data & 0x01);
-		c2port_strobe_ck(dev);
-
-		data >>= 1;
-	}
-
-	/* WAIT field */
-	ops->c2d_dir(dev, 1);
-	timeout = 20;
-	do {
-		c2port_strobe_ck(dev);
-		if (ops->c2d_get(dev))
-			break;
-
-		udelay(1);
-	} while (--timeout > 0);
-	if (timeout == 0)
-		return -EIO;
-
-	/* STOP field */
-	c2port_strobe_ck(dev);
-
-	return 0;
-}
-
-static int c2port_read_dr(struct c2port_device *dev, u8 *data)
-{
-	struct c2port_ops *ops = dev->ops;
-	int timeout, i;
-
-	/* START field */
-	c2port_strobe_ck(dev);
-
-	/* INS field (00b, LSB first) */
-	ops->c2d_dir(dev, 0);
-	ops->c2d_set(dev, 0);
-	c2port_strobe_ck(dev);
-	ops->c2d_set(dev, 0);
-	c2port_strobe_ck(dev);
-
-	/* LENGTH field (00b, LSB first -> 1 byte) */
-	ops->c2d_set(dev, 0);
-	c2port_strobe_ck(dev);
-	ops->c2d_set(dev, 0);
-	c2port_strobe_ck(dev);
-
-	/* WAIT field */
-	ops->c2d_dir(dev, 1);
-	timeout = 20;
-	do {
-		c2port_strobe_ck(dev);
-		if (ops->c2d_get(dev))
-			break;
-
-		udelay(1);
-	} while (--timeout > 0);
-	if (timeout == 0)
-		return -EIO;
-
-	/* DATA field */
-	*data = 0;
-	for (i = 0; i < 8; i++) {
-		*data >>= 1;	/* shift in 8-bit DATA field LSB first */
-
-		c2port_strobe_ck(dev);
-		if (ops->c2d_get(dev))
-			*data |= 0x80;
-	}
-
-	/* STOP field */
-	c2port_strobe_ck(dev);
-
-	return 0;
-}
-
-static int c2port_poll_in_busy(struct c2port_device *dev)
-{
-	u8 addr;
-	int ret, timeout = 20;
-
-	do {
-		ret = (c2port_read_ar(dev, &addr));
-		if (ret < 0)
-			return -EIO;
-
-		if (!(addr & 0x02))
-			break;
-
-		udelay(1);
-	} while (--timeout > 0);
-	if (timeout == 0)
-		return -EIO;
-
-	return 0;
-}
-
-static int c2port_poll_out_ready(struct c2port_device *dev)
-{
-	u8 addr;
-	int ret, timeout = 10000; /* erase flash needs long time... */
-
-	do {
-		ret = (c2port_read_ar(dev, &addr));
-		if (ret < 0)
-			return -EIO;
-
-		if (addr & 0x01)
-			break;
-
-		udelay(1);
-	} while (--timeout > 0);
-	if (timeout == 0)
-		return -EIO;
-
-	return 0;
-}
-
-/*
- * sysfs methods
- */
-
-static ssize_t c2port_show_name(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-
-	return sprintf(buf, "%s\n", c2dev->name);
-}
-static DEVICE_ATTR(name, 0444, c2port_show_name, NULL);
-
-static ssize_t c2port_show_flash_blocks_num(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-	struct c2port_ops *ops = c2dev->ops;
-
-	return sprintf(buf, "%d\n", ops->blocks_num);
-}
-static DEVICE_ATTR(flash_blocks_num, 0444, c2port_show_flash_blocks_num, NULL);
-
-static ssize_t c2port_show_flash_block_size(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-	struct c2port_ops *ops = c2dev->ops;
-
-	return sprintf(buf, "%d\n", ops->block_size);
-}
-static DEVICE_ATTR(flash_block_size, 0444, c2port_show_flash_block_size, NULL);
-
-static ssize_t c2port_show_flash_size(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-	struct c2port_ops *ops = c2dev->ops;
-
-	return sprintf(buf, "%d\n", ops->blocks_num * ops->block_size);
-}
-static DEVICE_ATTR(flash_size, 0444, c2port_show_flash_size, NULL);
-
-static ssize_t access_show(struct device *dev, struct device_attribute *attr,
-			   char *buf)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-
-	return sprintf(buf, "%d\n", c2dev->access);
-}
-
-static ssize_t access_store(struct device *dev, struct device_attribute *attr,
-			    const char *buf, size_t count)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-	struct c2port_ops *ops = c2dev->ops;
-	int status, ret;
-
-	ret = sscanf(buf, "%d", &status);
-	if (ret != 1)
-		return -EINVAL;
-
-	mutex_lock(&c2dev->mutex);
-
-	c2dev->access = !!status;
-
-	/* If access is "on" clock should be HIGH _before_ setting the line
-	 * as output and data line should be set as INPUT anyway */
-	if (c2dev->access)
-		ops->c2ck_set(c2dev, 1);
-	ops->access(c2dev, c2dev->access);
-	if (c2dev->access)
-		ops->c2d_dir(c2dev, 1);
-
-	mutex_unlock(&c2dev->mutex);
-
-	return count;
-}
-static DEVICE_ATTR_RW(access);
-
-static ssize_t c2port_store_reset(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-
-	/* Check the device access status */
-	if (!c2dev->access)
-		return -EBUSY;
-
-	mutex_lock(&c2dev->mutex);
-
-	c2port_reset(c2dev);
-	c2dev->flash_access = 0;
-
-	mutex_unlock(&c2dev->mutex);
-
-	return count;
-}
-static DEVICE_ATTR(reset, 0200, NULL, c2port_store_reset);
-
-static ssize_t __c2port_show_dev_id(struct c2port_device *dev, char *buf)
-{
-	u8 data;
-	int ret;
-
-	/* Select DEVICEID register for C2 data register accesses */
-	c2port_write_ar(dev, C2PORT_DEVICEID);
-
-	/* Read and return the device ID register */
-	ret = c2port_read_dr(dev, &data);
-	if (ret < 0)
-		return ret;
-
-	return sprintf(buf, "%d\n", data);
-}
-
-static ssize_t c2port_show_dev_id(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-	ssize_t ret;
-
-	/* Check the device access status */
-	if (!c2dev->access)
-		return -EBUSY;
-
-	mutex_lock(&c2dev->mutex);
-	ret = __c2port_show_dev_id(c2dev, buf);
-	mutex_unlock(&c2dev->mutex);
-
-	if (ret < 0)
-		dev_err(dev, "cannot read from %s\n", c2dev->name);
-
-	return ret;
-}
-static DEVICE_ATTR(dev_id, 0444, c2port_show_dev_id, NULL);
-
-static ssize_t __c2port_show_rev_id(struct c2port_device *dev, char *buf)
-{
-	u8 data;
-	int ret;
-
-	/* Select REVID register for C2 data register accesses */
-	c2port_write_ar(dev, C2PORT_REVID);
-
-	/* Read and return the revision ID register */
-	ret = c2port_read_dr(dev, &data);
-	if (ret < 0)
-		return ret;
-
-	return sprintf(buf, "%d\n", data);
-}
-
-static ssize_t c2port_show_rev_id(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-	ssize_t ret;
-
-	/* Check the device access status */
-	if (!c2dev->access)
-		return -EBUSY;
-
-	mutex_lock(&c2dev->mutex);
-	ret = __c2port_show_rev_id(c2dev, buf);
-	mutex_unlock(&c2dev->mutex);
-
-	if (ret < 0)
-		dev_err(c2dev->dev, "cannot read from %s\n", c2dev->name);
-
-	return ret;
-}
-static DEVICE_ATTR(rev_id, 0444, c2port_show_rev_id, NULL);
-
-static ssize_t c2port_show_flash_access(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-
-	return sprintf(buf, "%d\n", c2dev->flash_access);
-}
-
-static ssize_t __c2port_store_flash_access(struct c2port_device *dev,
-						int status)
-{
-	int ret;
-
-	/* Check the device access status */
-	if (!dev->access)
-		return -EBUSY;
-
-	dev->flash_access = !!status;
-
-	/* If flash_access is off we have nothing to do... */
-	if (dev->flash_access == 0)
-		return 0;
-
-	/* Target the C2 flash programming control register for C2 data
-	 * register access */
-	c2port_write_ar(dev, C2PORT_FPCTL);
-
-	/* Write the first keycode to enable C2 Flash programming */
-	ret = c2port_write_dr(dev, 0x02);
-	if (ret < 0)
-		return ret;
-
-	/* Write the second keycode to enable C2 Flash programming */
-	ret = c2port_write_dr(dev, 0x01);
-	if (ret < 0)
-		return ret;
-
-	/* Delay for at least 20ms to ensure the target is ready for
-	 * C2 flash programming */
-	mdelay(25);
-
-	return 0;
-}
-
-static ssize_t c2port_store_flash_access(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-	int status;
-	ssize_t ret;
-
-	ret = sscanf(buf, "%d", &status);
-	if (ret != 1)
-		return -EINVAL;
-
-	mutex_lock(&c2dev->mutex);
-	ret = __c2port_store_flash_access(c2dev, status);
-	mutex_unlock(&c2dev->mutex);
-
-	if (ret < 0) {
-		dev_err(c2dev->dev, "cannot enable %s flash programming\n",
-			c2dev->name);
-		return ret;
-	}
-
-	return count;
-}
-static DEVICE_ATTR(flash_access, 0644, c2port_show_flash_access,
-		   c2port_store_flash_access);
-
-static ssize_t __c2port_write_flash_erase(struct c2port_device *dev)
-{
-	u8 status;
-	int ret;
-
-	/* Target the C2 flash programming data register for C2 data register
-	 * access.
-	 */
-	c2port_write_ar(dev, C2PORT_FPDAT);
-
-	/* Send device erase command */
-	c2port_write_dr(dev, C2PORT_DEVICE_ERASE);
-
-	/* Wait for input acknowledge */
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Should check status before starting FLASH access sequence */
-
-	/* Wait for status information */
-	ret = c2port_poll_out_ready(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Read flash programming interface status */
-	ret = c2port_read_dr(dev, &status);
-	if (ret < 0)
-		return ret;
-	if (status != C2PORT_COMMAND_OK)
-		return -EBUSY;
-
-	/* Send a three-byte arming sequence to enable the device erase.
-	 * If the sequence is not received correctly, the command will be
-	 * ignored.
-	 * Sequence is: 0xde, 0xad, 0xa5.
-	 */
-	c2port_write_dr(dev, 0xde);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-	c2port_write_dr(dev, 0xad);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-	c2port_write_dr(dev, 0xa5);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	ret = c2port_poll_out_ready(dev);
-	if (ret < 0)
-		return ret;
-
-	return 0;
-}
-
-static ssize_t c2port_store_flash_erase(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct c2port_device *c2dev = dev_get_drvdata(dev);
-	int ret;
-
-	/* Check the device and flash access status */
-	if (!c2dev->access || !c2dev->flash_access)
-		return -EBUSY;
-
-	mutex_lock(&c2dev->mutex);
-	ret = __c2port_write_flash_erase(c2dev);
-	mutex_unlock(&c2dev->mutex);
-
-	if (ret < 0) {
-		dev_err(c2dev->dev, "cannot erase %s flash\n", c2dev->name);
-		return ret;
-	}
-
-	return count;
-}
-static DEVICE_ATTR(flash_erase, 0200, NULL, c2port_store_flash_erase);
-
-static ssize_t __c2port_read_flash_data(struct c2port_device *dev,
-				char *buffer, loff_t offset, size_t count)
-{
-	struct c2port_ops *ops = dev->ops;
-	u8 status, nread = 128;
-	int i, ret;
-
-	/* Check for flash end */
-	if (offset >= ops->block_size * ops->blocks_num)
-		return 0;
-
-	if (ops->block_size * ops->blocks_num - offset < nread)
-		nread = ops->block_size * ops->blocks_num - offset;
-	if (count < nread)
-		nread = count;
-	if (nread == 0)
-		return nread;
-
-	/* Target the C2 flash programming data register for C2 data register
-	 * access */
-	c2port_write_ar(dev, C2PORT_FPDAT);
-
-	/* Send flash block read command */
-	c2port_write_dr(dev, C2PORT_BLOCK_READ);
-
-	/* Wait for input acknowledge */
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Should check status before starting FLASH access sequence */
-
-	/* Wait for status information */
-	ret = c2port_poll_out_ready(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Read flash programming interface status */
-	ret = c2port_read_dr(dev, &status);
-	if (ret < 0)
-		return ret;
-	if (status != C2PORT_COMMAND_OK)
-		return -EBUSY;
-
-	/* Send address high byte */
-	c2port_write_dr(dev, offset >> 8);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Send address low byte */
-	c2port_write_dr(dev, offset & 0x00ff);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Send address block size */
-	c2port_write_dr(dev, nread);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Should check status before reading FLASH block */
-
-	/* Wait for status information */
-	ret = c2port_poll_out_ready(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Read flash programming interface status */
-	ret = c2port_read_dr(dev, &status);
-	if (ret < 0)
-		return ret;
-	if (status != C2PORT_COMMAND_OK)
-		return -EBUSY;
-
-	/* Read flash block */
-	for (i = 0; i < nread; i++) {
-		ret = c2port_poll_out_ready(dev);
-		if (ret < 0)
-			return ret;
-
-		ret = c2port_read_dr(dev, buffer+i);
-		if (ret < 0)
-			return ret;
-	}
-
-	return nread;
-}
-
-static ssize_t c2port_read_flash_data(struct file *filp, struct kobject *kobj,
-				struct bin_attribute *attr,
-				char *buffer, loff_t offset, size_t count)
-{
-	struct c2port_device *c2dev =
-			dev_get_drvdata(container_of(kobj,
-						struct device, kobj));
-	ssize_t ret;
-
-	/* Check the device and flash access status */
-	if (!c2dev->access || !c2dev->flash_access)
-		return -EBUSY;
-
-	mutex_lock(&c2dev->mutex);
-	ret = __c2port_read_flash_data(c2dev, buffer, offset, count);
-	mutex_unlock(&c2dev->mutex);
-
-	if (ret < 0)
-		dev_err(c2dev->dev, "cannot read %s flash\n", c2dev->name);
-
-	return ret;
-}
-
-static ssize_t __c2port_write_flash_data(struct c2port_device *dev,
-				char *buffer, loff_t offset, size_t count)
-{
-	struct c2port_ops *ops = dev->ops;
-	u8 status, nwrite = 128;
-	int i, ret;
-
-	if (nwrite > count)
-		nwrite = count;
-	if (ops->block_size * ops->blocks_num - offset < nwrite)
-		nwrite = ops->block_size * ops->blocks_num - offset;
-
-	/* Check for flash end */
-	if (offset >= ops->block_size * ops->blocks_num)
-		return -EINVAL;
-
-	/* Target the C2 flash programming data register for C2 data register
-	 * access */
-	c2port_write_ar(dev, C2PORT_FPDAT);
-
-	/* Send flash block write command */
-	c2port_write_dr(dev, C2PORT_BLOCK_WRITE);
-
-	/* Wait for input acknowledge */
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Should check status before starting FLASH access sequence */
-
-	/* Wait for status information */
-	ret = c2port_poll_out_ready(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Read flash programming interface status */
-	ret = c2port_read_dr(dev, &status);
-	if (ret < 0)
-		return ret;
-	if (status != C2PORT_COMMAND_OK)
-		return -EBUSY;
-
-	/* Send address high byte */
-	c2port_write_dr(dev, offset >> 8);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Send address low byte */
-	c2port_write_dr(dev, offset & 0x00ff);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Send address block size */
-	c2port_write_dr(dev, nwrite);
-	ret = c2port_poll_in_busy(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Should check status before writing FLASH block */
-
-	/* Wait for status information */
-	ret = c2port_poll_out_ready(dev);
-	if (ret < 0)
-		return ret;
-
-	/* Read flash programming interface status */
-	ret = c2port_read_dr(dev, &status);
-	if (ret < 0)
-		return ret;
-	if (status != C2PORT_COMMAND_OK)
-		return -EBUSY;
-
-	/* Write flash block */
-	for (i = 0; i < nwrite; i++) {
-		ret = c2port_write_dr(dev, *(buffer+i));
-		if (ret < 0)
-			return ret;
-
-		ret = c2port_poll_in_busy(dev);
-		if (ret < 0)
-			return ret;
-
-	}
-
-	/* Wait for last flash write to complete */
-	ret = c2port_poll_out_ready(dev);
-	if (ret < 0)
-		return ret;
-
-	return nwrite;
-}
-
-static ssize_t c2port_write_flash_data(struct file *filp, struct kobject *kobj,
-				struct bin_attribute *attr,
-				char *buffer, loff_t offset, size_t count)
-{
-	struct c2port_device *c2dev =
-			dev_get_drvdata(container_of(kobj,
-						struct device, kobj));
-	int ret;
-
-	/* Check the device access status */
-	if (!c2dev->access || !c2dev->flash_access)
-		return -EBUSY;
-
-	mutex_lock(&c2dev->mutex);
-	ret = __c2port_write_flash_data(c2dev, buffer, offset, count);
-	mutex_unlock(&c2dev->mutex);
-
-	if (ret < 0)
-		dev_err(c2dev->dev, "cannot write %s flash\n", c2dev->name);
-
-	return ret;
-}
-/* size is computed at run-time */
-static BIN_ATTR(flash_data, 0644, c2port_read_flash_data,
-		c2port_write_flash_data, 0);
-
-/*
- * Class attributes
- */
-static struct attribute *c2port_attrs[] = {
-	&dev_attr_name.attr,
-	&dev_attr_flash_blocks_num.attr,
-	&dev_attr_flash_block_size.attr,
-	&dev_attr_flash_size.attr,
-	&dev_attr_access.attr,
-	&dev_attr_reset.attr,
-	&dev_attr_dev_id.attr,
-	&dev_attr_rev_id.attr,
-	&dev_attr_flash_access.attr,
-	&dev_attr_flash_erase.attr,
-	NULL,
-};
-
-static struct bin_attribute *c2port_bin_attrs[] = {
-	&bin_attr_flash_data,
-	NULL,
-};
-
-static const struct attribute_group c2port_group = {
-	.attrs = c2port_attrs,
-	.bin_attrs = c2port_bin_attrs,
-};
-
-static const struct attribute_group *c2port_groups[] = {
-	&c2port_group,
-	NULL,
-};
-
-/*
- * Exported functions
- */
-
-struct c2port_device *c2port_device_register(char *name,
-					struct c2port_ops *ops, void *devdata)
-{
-	struct c2port_device *c2dev;
-	int ret;
-
-	if (unlikely(!ops) || unlikely(!ops->access) || \
-		unlikely(!ops->c2d_dir) || unlikely(!ops->c2ck_set) || \
-		unlikely(!ops->c2d_get) || unlikely(!ops->c2d_set))
-		return ERR_PTR(-EINVAL);
-
-	c2dev = kmalloc(sizeof(struct c2port_device), GFP_KERNEL);
-	kmemcheck_annotate_bitfield(c2dev, flags);
-	if (unlikely(!c2dev))
-		return ERR_PTR(-ENOMEM);
-
-	idr_preload(GFP_KERNEL);
-	spin_lock_irq(&c2port_idr_lock);
-	ret = idr_alloc(&c2port_idr, c2dev, 0, 0, GFP_NOWAIT);
-	spin_unlock_irq(&c2port_idr_lock);
-	idr_preload_end();
-
-	if (ret < 0)
-		goto error_idr_alloc;
-	c2dev->id = ret;
-
-	bin_attr_flash_data.size = ops->blocks_num * ops->block_size;
-
-	c2dev->dev = device_create(c2port_class, NULL, 0, c2dev,
-				   "c2port%d", c2dev->id);
-	if (IS_ERR(c2dev->dev)) {
-		ret = PTR_ERR(c2dev->dev);
-		goto error_device_create;
-	}
-	dev_set_drvdata(c2dev->dev, c2dev);
-
-	strncpy(c2dev->name, name, C2PORT_NAME_LEN);
-	c2dev->ops = ops;
-	mutex_init(&c2dev->mutex);
-
-	/* By default C2 port access is off */
-	c2dev->access = c2dev->flash_access = 0;
-	ops->access(c2dev, 0);
-
-	dev_info(c2dev->dev, "C2 port %s added\n", name);
-	dev_info(c2dev->dev, "%s flash has %d blocks x %d bytes "
-				"(%d bytes total)\n",
-				name, ops->blocks_num, ops->block_size,
-				ops->blocks_num * ops->block_size);
-
-	return c2dev;
-
-error_device_create:
-	spin_lock_irq(&c2port_idr_lock);
-	idr_remove(&c2port_idr, c2dev->id);
-	spin_unlock_irq(&c2port_idr_lock);
-
-error_idr_alloc:
-	kfree(c2dev);
-
-	return ERR_PTR(ret);
-}
-EXPORT_SYMBOL(c2port_device_register);
-
-void c2port_device_unregister(struct c2port_device *c2dev)
-{
-	if (!c2dev)
+	if (vcpi == 0)
 		return;
 
-	dev_info(c2dev->dev, "C2 port %s removed\n", c2dev->name);
+	mutex_lock(&mgr->payload_lock);
+	DRM_DEBUG_KMS("putting payload %d\n", vcpi);
+	clear_bit(vcpi - 1, &mgr->vcpi_mask);
 
-	spin_lock_irq(&c2port_idr_lock);
-	idr_remove(&c2port_idr, c2dev->id);
-	spin_unlock_irq(&c2port_idr_lock);
-
-	device_destroy(c2port_class, c2dev->id);
-
-	kfree(c2dev);
+	for (i = 0; i < mgr->max_payloads; i++) {
+		if (mgr->proposed_vcpis[i])
+			if (mgr->proposed_vcpis[i]->vcpi == vcpi) {
+				mgr->proposed_vcpis[i] = NULL;
+				clear_bit(i + 1, &mgr->payload_mask);
+			}
+	}
+	mutex_unlock(&mgr->payload_lock);
 }
-EXPORT_SYMBOL(c2port_device_unregister);
+
+static bool check_txmsg_state(struct drm_dp_mst_topology_mgr *mgr,
+			      struct drm_dp_sideband_msg_tx *txmsg)
+{
+	bool ret;
+
+	/*
+	 * All updates to txmsg->state are protected by mgr->qlock, and the two
+	 * cases we check here are terminal states. For those the barriers
+	 * provided by the wake_up/wait_event pair are enough.
+	 */
+	ret = (txmsg->state == DRM_DP_SIDEBAND_TX_RX ||
+	       txmsg->state == DRM_DP_SIDEBAND_TX_TIMEOUT);
+	return ret;
+}
+
+static int drm_dp_mst_wait_tx_reply(struct drm_dp_mst_branch *mstb,
+				    struct drm_dp_sideband_msg_tx *txmsg)
+{
+	struct drm_dp_mst_topology_mgr *mgr = mstb->mgr;
+	int ret;
+
+	ret = wait_event_timeout(mgr->tx_waitq,
+				 check_txmsg_state(mgr, txmsg),
+				 (4 * HZ));
+	mutex_lock(&mstb->mgr->qlock);
+	if (ret > 0) {
+		if (txmsg->state == DRM_DP_SIDEBAND_TX_TIMEOUT) {
+			ret = -EIO;
+			goto out;
+		}
+	} else {
+		DRM_DEBUG_KMS("timedout msg send %p %d %d\n", txmsg, txmsg->state, txmsg->seqno);
+
+		/* dump some state */
+		ret = -EIO;
+
+		/* remove from q */
+		if (txmsg->state == DRM_DP_SIDEBAND_TX_QUEUED ||
+		    txmsg->state == DRM_DP_SIDEBAND_TX_START_SEND) {
+			list_del(&txmsg->next);
+		}
+
+		if (txmsg->state == DRM_DP_SIDEBAND_TX_START_SEND ||
+		    txmsg->state == DRM_DP_SIDEBAND_TX_SENT) {
+			mstb->tx_slots[txmsg->seqno] = NULL;
+		}
+	}
+out:
+	mutex_unlock(&mgr->qlock);
+
+	return ret;
+}
+
+static struct drm_dp_mst_branch *drm_dp_add_mst_branch_device(u8 lct, u8 *rad)
+{
+	struct drm_dp_mst_branch *mstb;
+
+	mstb = kzalloc(sizeof(*mstb), GFP_KERNEL);
+	if (!mstb)
+		return NULL;
+
+	mstb->lct = lct;
+	if (lct > 1)
+		memcpy(mstb->rad, rad, lct / 2);
+	INIT_LIST_HEAD(&mstb->ports);
+	kref_init(&mstb->kref);
+	return mstb;
+}
+
+static void drm_dp_free_mst_port(struct kref *kref);
+
+static void drm_dp_free_mst_branch_device(struct kref *kref)
+{
+	struct drm_dp_mst_branch *mstb = container_of(kref, struct drm_dp_mst_branch, kref);
+	if (mstb->port_parent) {
+		if (list_empty(&mstb->port_parent->next))
+			kref_put(&mstb->port_parent->kref, drm_dp_free_mst_port);
+	}
+	kfree(mstb);
+}
+
+static void drm_dp_destroy_mst_branch_device(struct kref *kref)
+{
+	struct drm_dp_mst_branch *mstb = container_of(kref, struct drm_dp_mst_branch, kref);
+	struct drm_dp_mst_port *port, *tmp;
+	bool wake_tx = false;
+
+	/*
+	 * init kref again to be used by ports to remove mst branch when it is
+	 * not needed anymore
+	 */
+	kref_init(kref);
+
+	if (mstb->port_parent && list_empty(&mstb->port_parent->next))
+		kref_get(&mstb->port_parent->kref);
+
+	/*
+	 * destroy all ports - don't need lock
+	 * as there are no more references to the mst branch
+	 * device at this point.
+	 */
+	list_for_each_entry_safe(port, tmp, &mstb->ports, next) {
+		list_del(&port->next);
+		drm_dp_put_port(port);
+	}
+
+	/* drop any tx slots msg */
+	mutex_lock(&mstb->mgr->qlock);
+	if (mstb->tx_slots[0]) {
+		mstb->tx_slots[0]->state = DRM_DP_SIDEBAND_TX_TIMEOUT;
+		mstb->tx_slots[0] = NULL;
+		wake_tx = true;
+	}
+	if (mstb->tx_slots[1]) {
+		mstb->tx_slots[1]->state = DRM_DP_SIDEBAND_TX_TIMEOUT;
+		mstb->tx_slots[1] = NULL;
+		wake_tx = true;
+	}
+	mutex_unlock(&mstb->mgr->qlock);
+
+	if (wake_tx)
+		wake_up(&mstb->mgr->tx_waitq);
+
+	kref_put(kref, drm_dp_free_mst_branch_device);
+}
+
+static void drm_dp_put_mst_branch_device(struct drm_dp_mst_branch *mstb)
+{
+	kref_put(&mstb->kref, drm_dp_destroy_mst_branch_device);
+}
+
+
+static void drm_dp_port_teardown_pdt(struct drm_dp_mst_port *port, int old_pdt)
+{
+	struct drm_dp_mst_branch *mstb;
+
+	switch (old_pdt) {
+	case DP_PEER_DEVICE_DP_LEGACY_CONV:
+	case DP_PEER_DEVICE_SST_SINK:
+		/* remove i2c over sideband */
+		drm_dp_mst_unregister_i2c_bus(&port->aux);
+		break;
+	case DP_PEER_DEVICE_MST_BRANCHING:
+		mstb = port->mstb;
+		port->mstb = NULL;
+		drm_dp_put_mst_branch_device(mstb);
+		break;
+	}
+}
+
+static void drm_dp_destroy_port(struct kref *kref)
+{
+	struct drm_dp_mst_port *port = container_of(kref, struct drm_dp_mst_port, kref);
+	struct drm_dp_mst_topology_mgr *mgr = port->mgr;
+
+	if (!port->input) {
+		port->vcpi.num_slots = 0;
+
+		kfree(port->cached_edid);
+
+		/*
+		 * The only time we don't have a connector
+		 * on an output port is if the connector init
+		 * fails.
+		 */
+		if (port->connector) {
+			/* we can't destroy the connector here, as
+			 * we might be holding the mode_config.mutex
+			 * from an EDID retrieval */
+
+			mutex_lock(&mgr->destroy_connector_lock);
+			kref_get(&port->parent->kref);
+			list_add(&port->next, &mgr->destroy_connector_list);
+			mutex_unlock(&mgr->destroy_connector_lock);
+			schedule_work(&mgr->destroy_connector_work);
+			return;
+		}
+		/* no need to clean up vcpi
+		 * as if we have no connector we never setup a vcpi */
+		drm_dp_port_teardown_pdt(port, port->pdt);
+		port->pdt = DP_PEER_DEVICE_NONE;
+	}
+	kfree(port);
+}
+
+static void drm_dp_put_port(struct drm_dp_mst_port *port)
+{
+	kref_put(&port->kref, drm_dp_destroy_port);
+}
+
+static struct drm_dp_mst_branch *drm_dp_mst_get_validated_mstb_ref_locked(struct drm_dp_mst_branch *mstb, struct drm_dp_mst_branch *to_find)
+{
+	struct drm_dp_mst_port *port;
+	struct drm_dp_mst_branch *rmstb;
+	if (to_find == mstb) {
+		kref_get(&mstb->kref);
+		return mstb;
+	}
+	list_for_each_entry(port, &mstb->ports, next) {
+		if (port->mstb) {
+			rmstb = drm_dp_mst_get_validated_mstb_ref_locked(port->mstb, to_find);
+			if (rmstb)
+				return rmstb;
+		}
+	}
+	return NULL;
+}
+
+static struct drm_dp_mst_branch *drm_dp_get_validated_mstb_ref(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_branch *mstb)
+{
+	struct drm_dp_mst_branch *rmstb = NULL;
+	mutex_lock(&mgr->lock);
+	if (mgr->mst_primary)
+		rmstb = drm_dp_mst_get_validated_mstb_ref_locked(mgr->mst_primary, mstb);
+	mutex_unlock(&mgr->lock);
+	return rmstb;
+}
+
+static struct drm_dp_mst_port *drm_dp_mst_get_port_ref_locked(struct drm_dp_mst_branch *mstb, struct drm_dp_mst_port *to_find)
+{
+	struct drm_dp_mst_port *port, *mport;
+
+	list_for_each_entry(port, &mstb->ports, next) {
+		if (port == to_find) {
+			kref_get(&port->kref);
+			return port;
+		}
+		if (port->mstb) {
+			mport = drm_dp_mst_get_port_ref_locked(port->mstb, to_find);
+			if (mport)
+				return mport;
+		}
+	}
+	return NULL;
+}
+
+static struct drm_dp_mst_port *drm_dp_get_validated_port_ref(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port)
+{
+	struct drm_dp_mst_port *rport = NULL;
+	mutex_lock(&mgr->lock);
+	if (mgr->mst_primary)
+		rport = drm_dp_mst_get_port_ref_locked(mgr->mst_primary, port);
+	mutex_unlock(&mgr->lock);
+	return rport;
+}
+
+static struct drm_dp_mst_port *drm_dp_get_port(struct drm_dp_mst_branch *mstb, u8 port_num)
+{
+	struct drm_dp_mst_port *port;
+
+	list_for_each_entry(port, &mstb->ports, next) {
+		if (port->port_num == port_num) {
+			kref_get(&port->kref);
+			return port;
+		}
+	}
+
+	return NULL;
+}
 
 /*
- * Module stuff
+ * calculate a new RAD for this MST branch device
+ * if parent has an LCT of 2 then it has 1 nibble of RAD,
+ * if parent has an LCT of 3 then it has 2 nibbles of RAD,
  */
-
-static int __init c2port_init(void)
+static u8 drm_dp_calculate_rad(struct drm_dp_mst_port *port,
+				 u8 *rad)
 {
-	printk(KERN_INFO "Silicon Labs C2 port support v. " DRIVER_VERSION
-		" - (C) 2007 Rodolfo Giometti\n");
+	int parent_lct = port->parent->lct;
+	int shift = 4;
+	int idx = (parent_lct - 1) / 2;
+	if (parent_lct > 1) {
+		memcpy(rad, port->parent->rad, idx + 1);
+		shift = (parent_lct % 2) ? 4 : 0;
+	} else
+		rad[0] = 0;
 
-	c2port_class = class_create(THIS_MODULE, "c2port");
-	if (IS_ERR(c2port_class)) {
-		printk(KERN_ERR "c2port: failed to allocate class\n");
-		return PTR_ERR(c2port_class);
+	rad[idx] |= port->port_num << shift;
+	return parent_lct + 1;
+}
+
+/*
+ * return sends link address for new mstb
+ */
+static bool drm_dp_port_setup_pdt(struct drm_dp_mst_port *port)
+{
+	int ret;
+	u8 rad[6], lct;
+	bool send_link = false;
+	switch (port->pdt) {
+	case DP_PEER_DEVICE_DP_LEGACY_CONV:
+	case DP_PEER_DEVICE_SST_SINK:
+		/* add i2c over sideband */
+		ret = drm_dp_mst_register_i2c_bus(&port->aux);
+		break;
+	case DP_PEER_DEVICE_MST_BRANCHING:
+		lct = drm_dp_calculate_rad(port, rad);
+
+		port->mstb = drm_dp_add_mst_branch_device(lct, rad);
+		if (port->mstb) {
+			port->mstb->mgr = port->mgr;
+			port->mstb->port_parent = port;
+
+			send_link = true;
+		}
+		break;
 	}
-	c2port_class->dev_groups = c2port_groups;
+	return send_link;
+}
+
+static void drm_dp_check_mstb_guid(struct drm_dp_mst_branch *mstb, u8 *guid)
+{
+	int ret;
+
+	memcpy(mstb->guid, guid, 16);
+
+	if (!drm_dp_validate_guid(mstb->mgr, mstb->guid)) {
+		if (mstb->port_parent) {
+			ret = drm_dp_send_dpcd_write(
+					mstb->mgr,
+					mstb->port_parent,
+					DP_GUID,
+					16,
+					mstb->guid);
+		} else {
+
+			ret = drm_dp_dpcd_write(
+					mstb->mgr->aux,
+					DP_GUID,
+					mstb->guid,
+					16);
+		}
+	}
+}
+
+static void build_mst_prop_path(const struct drm_dp_mst_branch *mstb,
+				int pnum,
+				char *proppath,
+				size_t proppath_size)
+{
+	int i;
+	char temp[8];
+	snprintf(proppath, proppath_size, "mst:%d", mstb->mgr->conn_base_id);
+	for (i = 0; i < (mstb->lct - 1); i++) {
+		int shift = (i % 2) ? 0 : 4;
+		int port_num = (mstb->rad[i / 2] >> shift) & 0xf;
+		snprintf(temp, sizeof(temp), "-%d", port_num);
+		strlcat(proppath, temp, proppath_size);
+	}
+	snprintf(temp, sizeof(temp), "-%d", pnum);
+	strlcat(proppath, temp, proppath_size);
+}
+
+static void drm_dp_add_port(struct drm_dp_mst_branch *mstb,
+			    struct device *dev,
+			    struct drm_dp_link_addr_reply_port *port_msg)
+{
+	struct drm_dp_mst_port *port;
+	bool ret;
+	bool created = false;
+	int old_pdt = 0;
+	int old_ddps = 0;
+	port = drm_dp_get_port(mstb, port_msg->port_number);
+	if (!port) {
+		port = kzalloc(sizeof(*port), GFP_KERNEL);
+		if (!port)
+			return;
+		kref_init(&port->kref);
+		port->parent = mstb;
+		port->port_num = port_msg->port_number;
+		port->mgr = mstb->mgr;
+		port->aux.name = "DPMST";
+		port->aux.dev = dev;
+		created = true;
+	} else {
+		old_pdt = port->pdt;
+		old_ddps = port->ddps;
+	}
+
+	port->pdt = port_msg->peer_device_type;
+	port->input = port_msg->input_port;
+	port->mcs = port_msg->mcs;
+	port->ddps = port_msg->ddps;
+	port->ldps = port_msg->legacy_device_plug_status;
+	port->dpcd_rev = port_msg->dpcd_revision;
+	port->num_sdp_streams = port_msg->num_sdp_streams;
+	port->num_sdp_stream_sinks = port_msg->num_sdp_stream_sinks;
+
+	/* manage mstb port lists with mgr lock - take a reference
+	   for this list */
+	if (created) {
+		mutex_lock(&mstb->mgr->lock);
+		kref_get(&port->kref);
+		list_add(&port->next, &mstb->ports);
+		mutex_unlock(&mstb->mgr->lock);
+	}
+
+	if (old_ddps != port->ddps) {
+		if (port->ddps) {
+			if (!port->input)
+				drm_dp_send_enum_path_resources(mstb->mgr, mstb, port);
+		} else {
+			port->available_pbn = 0;
+			}
+	}
+
+	if (old_pdt != port->pdt && !port->input) {
+		drm_dp_port_teardown_pdt(port, old_pdt);
+
+		ret = drm_dp_port_setup_pdt(port);
+		if (ret == true)
+			drm_dp_send_link_address(mstb->mgr, port->mstb);
+	}
+
+	if (created && !port->input) {
+		char proppath[255];
+
+		build_mst_prop_path(mstb, port->port_num, proppath, sizeof(proppath));
+		port->connector = (*mstb->mgr->cbs->add_connector)(mstb->mgr, port, proppath);
+		if (!port->connector) {
+			/* remove it from the port list */
+			mutex_lock(&mstb->mgr->lock);
+			list_del(&port->next);
+			mutex_unlock(&mstb->mgr->lock);
+			/* drop port list reference */
+			drm_dp_put_port(port);
+			goto out;
+		}
+		if ((port->pdt == DP_PEER_DEVICE_DP_LEGACY_CONV ||
+		     port->pdt == DP_PEER_DEVICE_SST_SINK) &&
+		    port->port_num >= DP_MST_LOGICAL_PORT_0) {
+			port->cached_edid = drm_get_edid(port->connector, &port->aux.ddc);
+			drm_mode_connector_set_tile_property(port->connector);
+		}
+		(*mstb->mgr->cbs->register_connector)(port->connector);
+	}
+
+out:
+	/* put reference to this port */
+	drm_dp_put_port(port);
+}
+
+static void drm_dp_update_port(struct drm_dp_mst_branch *mstb,
+			       struct drm_dp_connection_status_notify *conn_stat)
+{
+	struct drm_dp_mst_port *port;
+	int old_pdt;
+	int old_ddps;
+	bool dowork = false;
+	port = drm_dp_get_port(mstb, conn_stat->port_number);
+	if (!port)
+		return;
+
+	old_ddps = port->ddps;
+	old_pdt = port->pdt;
+	port->pdt = conn_stat->peer_device_type;
+	port->mcs = conn_stat->message_capability_status;
+	port->ldps = conn_stat->legacy_device_plug_status;
+	port->ddps = conn_stat->displayport_device_plug_status;
+
+	if (old_ddps != port->ddps) {
+		if (port->ddps) {
+			dowork = true;
+		} else {
+			port->available_pbn = 0;
+		}
+	}
+	if (old_pdt != port->pdt && !port->input) {
+		drm_dp_port_teardown_pdt(port, old_pdt);
+
+		if (drm_dp_port_setup_pdt(port))
+			dowork = true;
+	}
+
+	drm_dp_put_port(port);
+	if (dowork)
+		queue_work(system_long_wq, &mstb->mgr->work);
+
+}
+
+static struct drm_dp_mst_branch *drm_dp_get_mst_branch_device(struct drm_dp_mst_topology_mgr *mgr,
+							       u8 lct, u8 *rad)
+{
+	struct drm_dp_mst_branch *mstb;
+	struct drm_dp_mst_port *port;
+	int i;
+	/* find the port by iterating down */
+
+	mutex_lock(&mgr->lock);
+	mstb = mgr->mst_primary;
+
+	if (!mstb)
+		goto out;
+
+	for (i = 0; i < lct - 1; i++) {
+		int shift = (i % 2) ? 0 : 4;
+		int port_num = (rad[i / 2] >> shift) & 0xf;
+
+		list_for_each_entry(port, &mstb->ports, next) {
+			if (port->port_num == port_num) {
+				mstb = port->mstb;
+				if (!mstb) {
+					DRM_ERROR("failed to lookup MSTB with lct %d, rad %02x\n", lct, rad[0]);
+					goto out;
+				}
+
+				break;
+			}
+		}
+	}
+	kref_get(&mstb->kref);
+out:
+	mutex_unlock(&mgr->lock);
+	return mstb;
+}
+
+static struct drm_dp_mst_branch *get_mst_branch_device_by_guid_helper(
+	struct drm_dp_mst_branch *mstb,
+	uint8_t *guid)
+{
+	struct drm_dp_mst_branch *found_mstb;
+	struct drm_dp_mst_port *port;
+
+	if (!mstb)
+		return NULL;
+
+	if (memcmp(mstb->guid, guid, 16) == 0)
+		return mstb;
+
+
+	list_for_each_entry(port, &mstb->ports, next) {
+		found_mstb = get_mst_branch_device_by_guid_helper(port->mstb, guid);
+
+		if (found_mstb)
+			return found_mstb;
+	}
+
+	return NULL;
+}
+
+static struct drm_dp_mst_branch *drm_dp_get_mst_branch_device_by_guid(
+	struct drm_dp_mst_topology_mgr *mgr,
+	uint8_t *guid)
+{
+	struct drm_dp_mst_branch *mstb;
+
+	/* find the port by iterating down */
+	mutex_lock(&mgr->lock);
+
+	mstb = get_mst_branch_device_by_guid_helper(mgr->mst_primary, guid);
+
+	if (mstb)
+		kref_get(&mstb->kref);
+
+	mutex_unlock(&mgr->lock);
+	return mstb;
+}
+
+static void drm_dp_check_and_send_link_address(struct drm_dp_mst_topology_mgr *mgr,
+					       struct drm_dp_mst_branch *mstb)
+{
+	struct drm_dp_mst_port *port;
+	struct drm_dp_mst_branch *mstb_child;
+	if (!mstb->link_address_sent)
+		drm_dp_send_link_address(mgr, mstb);
+
+	list_for_each_entry(port, &mstb->ports, next) {
+		if (port->input)
+			continue;
+
+		if (!port->ddps)
+			continue;
+
+		if (!port->available_pbn)
+			drm_dp_send_enum_path_resources(mgr, mstb, port);
+
+		if (port->mstb) {
+			mstb_child = drm_dp_get_validated_mstb_ref(mgr, port->mstb);
+			if (mstb_child) {
+				drm_dp_check_and_send_link_address(mgr, mstb_child);
+				drm_dp_put_mst_branch_device(mstb_child);
+			}
+		}
+	}
+}
+
+static void drm_dp_mst_link_probe_work(struct work_struct *work)
+{
+	struct drm_dp_mst_topology_mgr *mgr = container_of(work, struct drm_dp_mst_topology_mgr, work);
+	struct drm_dp_mst_branch *mstb;
+
+	mutex_lock(&mgr->lock);
+	mstb = mgr->mst_primary;
+	if (mstb) {
+		kref_get(&mstb->kref);
+	}
+	mutex_unlock(&mgr->lock);
+	if (mstb) {
+		drm_dp_check_and_send_link_address(mgr, mstb);
+		drm_dp_put_mst_branch_device(mstb);
+	}
+}
+
+static bool drm_dp_validate_guid(struct drm_dp_mst_topology_mgr *mgr,
+				 u8 *guid)
+{
+	static u8 zero_guid[16];
+
+	if (!memcmp(guid, zero_guid, 16)) {
+		u64 salt = get_jiffies_64();
+		memcpy(&guid[0], &salt, sizeof(u64));
+		memcpy(&guid[8], &salt, sizeof(u64));
+		return false;
+	}
+	return true;
+}
+
+#if 0
+static int build_dpcd_read(struct drm_dp_sideband_msg_tx *msg, u8 port_num, u32 offset, u8 num_bytes)
+{
+	struct drm_dp_sideband_msg_req_body req;
+
+	req.req_type = DP_REMOTE_DPCD_READ;
+	req.u.dpcd_read.port_number = port_num;
+	req.u.dpcd_read.dpcd_address = offset;
+	req.u.dpcd_read.num_bytes = num_bytes;
+	drm_dp_encode_sideband_req(&req, msg);
 
 	return 0;
 }
+#endif
 
-static void __exit c2port_exit(void)
+static int drm_dp_send_sideband_msg(struct drm_dp_mst_topology_mgr *mgr,
+				    bool up, u8 *msg, int len)
 {
-	class_destroy(c2port_class);
+	int ret;
+	int regbase = up ? DP_SIDEBAND_MSG_UP_REP_BASE : DP_SIDEBAND_MSG_DOWN_REQ_BASE;
+	int tosend, total, offset;
+	int retries = 0;
+
+retry:
+	total = len;
+	offset = 0;
+	do {
+		tosend = min3(mgr->max_dpcd_transaction_bytes, 16, total);
+
+		ret = drm_dp_dpcd_write(mgr->aux, regbase + offset,
+					&msg[offset],
+					tosend);
+		if (ret != tosend) {
+			if (ret == -EIO && retries < 5) {
+				retries++;
+				goto retry;
+			}
+			DRM_DEBUG_KMS("failed to dpcd write %d %d\n", tosend, ret);
+
+			return -EIO;
+		}
+		offset += tosend;
+		total -= tosend;
+	} while (total > 0);
+	return 0;
 }
 
-module_init(c2port_init);
-module_exit(c2port_exit);
+static int set_hdr_from_dst_qlock(struct drm_dp_sideband_msg_hdr *hdr,
+				  struct drm_dp_sideband_msg_tx *txmsg)
+{
+	struct drm_dp_mst_branch *mstb = txmsg->dst;
+	u8 req_type;
 
-MODULE_AUTHOR("Rodolfo Giometti <giometti@linux.it>");
-MODULE_DESCRIPTION("Silicon Labs C2 port support v. " DRIVER_VERSION);
-MODULE_LICENSE("GPL");
+	/* both msg slots are full */
+	if (txmsg->seqno == -1) {
+		if (mstb->tx_slots[0] && mstb->tx_slots[1]) {
+			DRM_DEBUG_KMS("%s: failed to find slot\n", __func__);
+			return -EAGAIN;
+		}
+		if (mstb->tx_slots[0] == NULL && mstb->tx_slots[1] == NULL) {
+			txmsg->seqno = mstb->last_seqno;
+			mstb->last_seqno ^= 1;
+		} else if (mstb->tx_slots[0] == NULL)
+			txmsg->seqno = 0;
+		else
+			txmsg->seqno = 1;
+		mstb->tx_slots[txmsg->seqno] = txmsg;
+	}
+
+	req_type = txmsg->msg[0] & 0x7f;
+	if (req_type == DP_CONNECTION_STATUS_NOTIFY ||
+		req_type == DP_RESOURCE_STATUS_NOTIFY)
+		hdr->broadcast = 1;
+	else
+		hdr->broadcast = 0;
+	hdr->path_msg = txmsg->path_msg;
+	hdr->lct = mstb->lct;
+	hdr->lcr = mstb->lct - 1;
+	if (mstb->lct > 1)
+		memcpy(hdr->rad, mstb->rad, mstb->lct / 2);
+	hdr->seqno = txmsg->seqno;
+	return 0;
+}
+/*
+ * process a single block of the next message in the sideband queue
+ */
+static int process_single_tx_qlock(struct drm_dp_mst_topology_mgr *mgr,
+				   struct drm_dp_sideband_msg_tx *txmsg,
+				   bool up)
+{
+	u8 chunk[48];
+	struct drm_dp_sideband_msg_hdr hdr;
+	int len, space, idx, tosend;
+	int ret;
+
+	memset(&hdr, 0, sizeof(struct drm_dp_sideband_msg_hdr));
+
+	if (txmsg->state == DRM_DP_SIDEBAND_TX_QUEUED) {
+		txmsg->seqno = -1;
+		txmsg->state = DRM_DP_SIDEBAND_TX_START_SEND;
+	}
+
+	/* make hdr from dst mst - for replies use seqno
+	   otherwise assign one */
+	ret = set_hdr_from_dst_qlock(&hdr, txmsg);
+	if (ret < 0)
+		return ret;
+
+	/* amount left to send in this message */
+	len = txmsg->cur_len - txmsg->cur_offset;
+
+	/* 48 - sideband msg size - 1 byte for data CRC, x header bytes */
+	space = 48 - 1 - drm_dp_calc_sb_hdr_size(&hdr);
+
+	tosend = min(len, space);
+	if (len == txmsg->cur_len)
+		hdr.somt = 1;
+	if (space >= len)
+		hdr.eomt = 1;
+
+
+	hdr.msg_len = tosend + 1;
+	drm_dp_encode_sideband_msg_hdr(&hdr, chunk, &idx);
+	memcpy(&chunk[idx], &txmsg->msg[txmsg->cur_offset], tosend);
+	/* add crc at end */
+	drm_dp_crc_sideband_chunk_req(&chunk[idx], tosend);
+	idx += tosend + 1;
+
+	ret = drm_dp_send_sideband_msg(mgr, up, chunk, idx);
+	if (ret) {
+		DRM_DEBUG_KMS("sideband msg failed to send\n");
+		return ret;
+	}
+
+	txmsg->cur_offset += tosend;
+	if (txmsg->cur_offset == txmsg->cur_len) {
+		txmsg->state = DRM_DP_SIDEBAND_TX_SENT;
+		return 1;
+	}
+	return 0;
+}
+
+static void process_single_down_tx_qlock(struct drm_dp_mst_topology_mgr *mgr)
+{
+	struct drm_dp_sideband_msg_tx *txmsg;
+	int ret;
+
+	WARN_ON(!mutex_is_locked(&mgr->qlock));
+
+	/* construct a chunk from the first msg in the tx_msg queue */
+	if (list_empty(&mgr->tx_msg_downq)) {
+		mgr->tx_down_in_progress = false;
+		return;
+	}
+	mgr->tx_down_in_progress = true;
+
+	txmsg = list_first_entry(&mgr->tx_msg_downq, struct drm_dp_sideband_msg_tx, next);
+	ret = process_single_tx_qlock(mgr, txmsg, false);
+	if (ret == 1) {
+		/* txmsg is sent it should be in the slots now */
+		list_del(&txmsg->next);
+	} else if (ret) {
+		DRM_DEBUG_KMS("failed to send msg in q %d\n", ret);
+		list_del(&txmsg->next);
+		if (txmsg->seqno != -1)
+			txmsg->dst->tx_slots[txmsg->seqno] = NULL;
+		txmsg->state = DRM_DP_SIDEBAND_TX_TIMEOUT;
+		wake_up(&mgr->tx_waitq);
+	}
+	if (list_empty(&mgr->tx_msg_downq)) {
+		mgr->tx_down_in_progress = false;
+		return;
+	}
+}
+
+/* called holding qlock */
+static void process_single_up_tx_qlock(struct drm_dp_mst_topology_mgr *mgr,
+				       struct drm_dp_sideband_msg_tx *txmsg)
+{
+	int ret;
+
+	/* construct a chunk from the first msg in the tx_msg queue */
+	ret = process_single_tx_qlock(mgr, txmsg, true);
+
+	if (ret != 1)
+		DRM_DEBUG_KMS("failed to send msg in q %d\n", ret);
+
+	if (txmsg->seqno != -1) {
+		WARN_ON((unsigned int)txmsg->seqno >
+			ARRAY_SIZE(txmsg->dst->tx_slots));
+		txmsg->dst->tx_slots[txmsg->seqno] = NULL;
+	}
+}
+
+static void drm_dp_queue_down_tx(struct drm_dp_mst_topology_mgr *mgr,
+				 struct drm_dp_sideband_msg_tx *txmsg)
+{
+	mutex_lock(&mgr->qlock);
+	list_add_tail(&txmsg->next, &mgr->tx_msg_downq);
+	if (!mgr->tx_down_in_progress)
+		process_single_down_tx_qlock(mgr);
+	mutex_unlock(&mgr->qlock);
+}
+
+static void drm_dp_send_link_address(struct drm_dp_mst_topology_mgr *mgr,
+				     struct drm_dp_mst_branch *mstb)
+{
+	int len;
+	struct drm_dp_sideband_msg_tx *txmsg;
+	int ret;
+
+	txmsg = kzalloc(sizeof(*txmsg), GFP_KERNEL);
+	if (!txmsg)
+		return;
+
+	txmsg->dst = mstb;
+	len = build_link_address(txmsg);
+
+	mstb->link_address_sent = true;
+	drm_dp_queue_down_tx(mgr, txmsg);
+
+	ret = drm_dp_mst_wait_tx_reply(mstb, txmsg);
+	if (ret > 0) {
+		int i;
+
+		if (txmsg->reply.reply_type == 1)
+			DRM_DEBUG_KMS("link address nak received\n");
+		else {
+			DRM_DEBUG_KMS("link address reply: %d\n", txmsg->reply.u.l

@@ -1,12 +1,7 @@
-obj-$(CONFIG_DM_PERSISTENT_DATA) += dm-persistent-data.o
-dm-persistent-data-objs := \
-	dm-array.o \
-	dm-bitset.o \
-	dm-block-manager.o \
-	dm-space-map-common.o \
-	dm-space-map-disk.o \
-	dm-space-map-metadata.o \
-	dm-transaction-manager.o \
-	dm-btree.o \
-	dm-btree-remove.o \
-	dm-btree-spine.o
+SMC_IND_INDEX__SMC_IND_ADDR_MASK 0xffffffff
+#define SMC_IND_INDEX__SMC_IND_ADDR__SHIFT 0x0
+#define SMC_IND_DATA__SMC_IND_DATA_MASK 0xffffffff
+#define SMC_IND_DATA__SMC_IND_DATA__SHIFT 0x0
+#define SMC_IND_INDEX_0__SMC_IND_ADDR_MASK 0xffffffff
+#define SMC_IND_INDEX_0__SMC_IND_ADDR__SHIFT 0x0
+#d

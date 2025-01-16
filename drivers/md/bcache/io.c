@@ -1,145 +1,70 @@
-/*
- * Some low level IO code, and hacks for various block layer limitations
- *
- * Copyright 2010, 2011 Kent Overstreet <kent.overstreet@gmail.com>
- * Copyright 2012 Google, Inc.
- */
-
-#include "bcache.h"
-#include "bset.h"
-#include "debug.h"
-
-#include <linux/blkdev.h>
-
-/* Bios with headers */
-
-void bch_bbio_free(struct bio *bio, struct cache_set *c)
-{
-	struct bbio *b = container_of(bio, struct bbio, bio);
-	mempool_free(b, c->bio_meta);
-}
-
-struct bio *bch_bbio_alloc(struct cache_set *c)
-{
-	struct bbio *b = mempool_alloc(c->bio_meta, GFP_NOIO);
-	struct bio *bio = &b->bio;
-
-	bio_init(bio);
-	bio->bi_flags		|= BIO_POOL_NONE << BIO_POOL_OFFSET;
-	bio->bi_max_vecs	 = bucket_pages(c);
-	bio->bi_io_vec		 = bio->bi_inline_vecs;
-
-	return bio;
-}
-
-void __bch_submit_bbio(struct bio *bio, struct cache_set *c)
-{
-	struct bbio *b = container_of(bio, struct bbio, bio);
-
-	bio->bi_iter.bi_sector	= PTR_OFFSET(&b->key, 0);
-	bio->bi_bdev		= PTR_CACHE(c, &b->key, 0)->bdev;
-
-	b->submit_time_us = local_clock_us();
-	closure_bio_submit(bio, bio->bi_private);
-}
-
-void bch_submit_bbio(struct bio *bio, struct cache_set *c,
-		     struct bkey *k, unsigned ptr)
-{
-	struct bbio *b = container_of(bio, struct bbio, bio);
-	bch_bkey_copy_single_ptr(&b->key, k, ptr);
-	__bch_submit_bbio(bio, c);
-}
-
-/* IO errors */
-
-void bch_count_io_errors(struct cache *ca, int error, const char *m)
-{
-	/*
-	 * The halflife of an error is:
-	 * log2(1/2)/log2(127/128) * refresh ~= 88 * refresh
-	 */
-
-	if (ca->set->error_decay) {
-		unsigned count = atomic_inc_return(&ca->io_count);
-
-		while (count > ca->set->error_decay) {
-			unsigned errors;
-			unsigned old = count;
-			unsigned new = count - ca->set->error_decay;
-
-			/*
-			 * First we subtract refresh from count; each time we
-			 * succesfully do so, we rescale the errors once:
-			 */
-
-			count = atomic_cmpxchg(&ca->io_count, old, new);
-
-			if (count == old) {
-				count = new;
-
-				errors = atomic_read(&ca->io_errors);
-				do {
-					old = errors;
-					new = ((uint64_t) errors * 127) / 128;
-					errors = atomic_cmpxchg(&ca->io_errors,
-								old, new);
-				} while (old != errors);
-			}
-		}
-	}
-
-	if (error) {
-		char buf[BDEVNAME_SIZE];
-		unsigned errors = atomic_add_return(1 << IO_ERROR_SHIFT,
-						    &ca->io_errors);
-		errors >>= IO_ERROR_SHIFT;
-
-		if (errors < ca->set->error_limit)
-			pr_err("%s: IO error on %s, recovering",
-			       bdevname(ca->bdev, buf), m);
-		else
-			bch_cache_set_error(ca->set,
-					    "%s: too many IO errors %s",
-					    bdevname(ca->bdev, buf), m);
-	}
-}
-
-void bch_bbio_count_io_errors(struct cache_set *c, struct bio *bio,
-			      int error, const char *m)
-{
-	struct bbio *b = container_of(bio, struct bbio, bio);
-	struct cache *ca = PTR_CACHE(c, &b->key, 0);
-
-	unsigned threshold = bio->bi_rw & REQ_WRITE
-		? c->congested_write_threshold_us
-		: c->congested_read_threshold_us;
-
-	if (threshold) {
-		unsigned t = local_clock_us();
-
-		int us = t - b->submit_time_us;
-		int congested = atomic_read(&c->congested);
-
-		if (us > (int) threshold) {
-			int ms = us / 1024;
-			c->congested_last_us = t;
-
-			ms = min(ms, CONGESTED_MAX + congested);
-			atomic_sub(ms, &c->congested);
-		} else if (congested < 0)
-			atomic_inc(&c->congested);
-	}
-
-	bch_count_io_errors(ca, error, m);
-}
-
-void bch_bbio_endio(struct cache_set *c, struct bio *bio,
-		    int error, const char *m)
-{
-	struct closure *cl = bio->bi_private;
-
-	bch_bbio_count_io_errors(c, bio, error, m);
-	bio_put(bio);
-	closure_put(cl);
-}
+ES_1__BapmVddCVidHiSidd_2_MASK 0xff00
+#define PM_FUSES_1__BapmVddCVidHiSidd_2__SHIFT 0x8
+#define PM_FUSES_1__BapmVddCVidHiSidd_1_MASK 0xff0000
+#define PM_FUSES_1__BapmVddCVidHiSidd_1__SHIFT 0x10
+#define PM_FUSES_1__BapmVddCVidHiSidd_0_MASK 0xff000000
+#define PM_FUSES_1__BapmVddCVidHiSidd_0__SHIFT 0x18
+#define PM_FUSES_2__BapmVddCVidHiSidd_7_MASK 0xff
+#define PM_FUSES_2__BapmVddCVidHiSidd_7__SHIFT 0x0
+#define PM_FUSES_2__BapmVddCVidHiSidd_6_MASK 0xff00
+#define PM_FUSES_2__BapmVddCVidHiSidd_6__SHIFT 0x8
+#define PM_FUSES_2__BapmVddCVidHiSidd_5_MASK 0xff0000
+#define PM_FUSES_2__BapmVddCVidHiSidd_5__SHIFT 0x10
+#define PM_FUSES_2__BapmVddCVidHiSidd_4_MASK 0xff000000
+#define PM_FUSES_2__BapmVddCVidHiSidd_4__SHIFT 0x18
+#define PM_FUSES_3__BapmVddCVidLoSidd_3_MASK 0xff
+#define PM_FUSES_3__BapmVddCVidLoSidd_3__SHIFT 0x0
+#define PM_FUSES_3__BapmVddCVidLoSidd_2_MASK 0xff00
+#define PM_FUSES_3__BapmVddCVidLoSidd_2__SHIFT 0x8
+#define PM_FUSES_3__BapmVddCVidLoSidd_1_MASK 0xff0000
+#define PM_FUSES_3__BapmVddCVidLoSidd_1__SHIFT 0x10
+#define PM_FUSES_3__BapmVddCVidLoSidd_0_MASK 0xff000000
+#define PM_FUSES_3__BapmVddCVidLoSidd_0__SHIFT 0x18
+#define PM_FUSES_4__BapmVddCVidLoSidd_7_MASK 0xff
+#define PM_FUSES_4__BapmVddCVidLoSidd_7__SHIFT 0x0
+#define PM_FUSES_4__BapmVddCVidLoSidd_6_MASK 0xff00
+#define PM_FUSES_4__BapmVddCVidLoSidd_6__SHIFT 0x8
+#define PM_FUSES_4__BapmVddCVidLoSidd_5_MASK 0xff0000
+#define PM_FUSES_4__BapmVddCVidLoSidd_5__SHIFT 0x10
+#define PM_FUSES_4__BapmVddCVidLoSidd_4_MASK 0xff000000
+#define PM_FUSES_4__BapmVddCVidLoSidd_4__SHIFT 0x18
+#define PM_FUSES_5__VddCVid_3_MASK 0xff
+#define PM_FUSES_5__VddCVid_3__SHIFT 0x0
+#define PM_FUSES_5__VddCVid_2_MASK 0xff00
+#define PM_FUSES_5__VddCVid_2__SHIFT 0x8
+#define PM_FUSES_5__VddCVid_1_MASK 0xff0000
+#define PM_FUSES_5__VddCVid_1__SHIFT 0x10
+#define PM_FUSES_5__VddCVid_0_MASK 0xff000000
+#define PM_FUSES_5__VddCVid_0__SHIFT 0x18
+#define PM_FUSES_6__VddCVid_7_MASK 0xff
+#define PM_FUSES_6__VddCVid_7__SHIFT 0x0
+#define PM_FUSES_6__VddCVid_6_MASK 0xff00
+#define PM_FUSES_6__VddCVid_6__SHIFT 0x8
+#define PM_FUSES_6__VddCVid_5_MASK 0xff0000
+#define PM_FUSES_6__VddCVid_5__SHIFT 0x10
+#define PM_FUSES_6__VddCVid_4_MASK 0xff000000
+#define PM_FUSES_6__VddCVid_4__SHIFT 0x18
+#define PM_FUSES_7__SviLoadLineOffsetVddC_MASK 0xff
+#define PM_FUSES_7__SviLoadLineOffsetVddC__SHIFT 0x0
+#define PM_FUSES_7__SviLoadLineTrimVddC_MASK 0xff00
+#define PM_FUSES_7__SviLoadLineTrimVddC__SHIFT 0x8
+#define PM_FUSES_7__SviLoadLineVddC_MASK 0xff0000
+#define PM_FUSES_7__SviLoadLineVddC__SHIFT 0x10
+#define PM_FUSES_7__SviLoadLineEn_MASK 0xff000000
+#define PM_FUSES_7__SviLoadLineEn__SHIFT 0x18
+#define PM_FUSES_8__TDC_MAWt_MASK 0xff
+#define PM_FUSES_8__TDC_MAWt__SHIFT 0x0
+#define PM_FUSES_8__TDC_VDDC_ThrottleReleaseLimitPerc_MASK 0xff00
+#define PM_FUSES_8__TDC_VDDC_ThrottleReleaseLimitPerc__SHIFT 0x8
+#define PM_FUSES_8__TDC_VDDC_PkgLimit_MASK 0xffff0000
+#define PM_FUSES_8__TDC_VDDC_PkgLimit__SHIFT 0x10
+#define PM_FUSES_9__Reserved_MASK 0xff
+#define PM_FUSES_9__Reserved__SHIFT 0x0
+#define PM_FUSES_9__LPMLTemperatureMax_MASK 0xff00
+#define PM_FUSES_9__LPMLTemperatureMax__SHIFT 0x8
+#define PM_FUSES_9__LPMLTemperatureMin_MASK 0xff0000
+#define PM_FUSES_9__LPMLTemperatureMin__SHIFT 0x10
+#define PM_FUSES_9__TdcWaterfallCtl_MASK 0xff000000
+#define PM_FUSES_9__TdcWaterfallCtl__SHIFT 0x18
+#define PM_FUSES_10__LPMLTemperatureScaler_3_MASK 0xff
+#define PM_FUSES_10__LPMLTemperatureScaler_3__SHIFT 0x0

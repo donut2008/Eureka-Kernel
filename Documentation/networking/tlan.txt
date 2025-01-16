@@ -1,117 +1,130 @@
-(C) 1997-1998 Caldera, Inc.
-(C) 1998 James Banks
-(C) 1999-2001 Torben Mathiasen <tmm@image.dk, torben.mathiasen@compaq.com>
+vm_request_mem_region(&op->dev, r.start, resource_size(&r),
+				     pdata->name)) {
+		printk(KERN_ERR "%s: Error while requesting mem region\n",
+		       __func__);
+		res = -EBUSY;
+		goto err;
+	}
 
-For driver information/updates visit http://www.compaq.com
+	pdata->l2_vbase = devm_ioremap(&op->dev, r.start, resource_size(&r));
+	if (!pdata->l2_vbase) {
+		printk(KERN_ERR "%s: Unable to setup L2 err regs\n", __func__);
+		res = -ENOMEM;
+		goto err;
+	}
 
+	out_be32(pdata->l2_vbase + MPC85XX_L2_ERRDET, ~0);
 
-TLAN driver for Linux, version 1.14a
-README
+	orig_l2_err_disable = in_be32(pdata->l2_vbase + MPC85XX_L2_ERRDIS);
 
+	/* clear the err_dis */
+	out_be32(pdata->l2_vbase + MPC85XX_L2_ERRDIS, 0);
 
-I.  Supported Devices.
+	edac_dev->mod_name = EDAC_MOD_STR;
 
-    Only PCI devices will work with this driver.
+	if (edac_op_state == EDAC_OPSTATE_POLL)
+		edac_dev->edac_check = mpc85xx_l2_check;
 
-    Supported:
-    Vendor ID	Device ID	Name
-    0e11	ae32		Compaq Netelligent 10/100 TX PCI UTP
-    0e11	ae34		Compaq Netelligent 10 T PCI UTP
-    0e11	ae35		Compaq Integrated NetFlex 3/P
-    0e11	ae40		Compaq Netelligent Dual 10/100 TX PCI UTP
-    0e11	ae43		Compaq Netelligent Integrated 10/100 TX UTP
-    0e11	b011		Compaq Netelligent 10/100 TX Embedded UTP
-    0e11	b012		Compaq Netelligent 10 T/2 PCI UTP/Coax
-    0e11	b030		Compaq Netelligent 10/100 TX UTP
-    0e11	f130		Compaq NetFlex 3/P
-    0e11	f150		Compaq NetFlex 3/P
-    108d	0012		Olicom OC-2325	
-    108d	0013		Olicom OC-2183
-    108d	0014		Olicom OC-2326	
+	mpc85xx_set_l2_sysfs_attributes(edac_dev);
 
+	pdata->edac_idx = edac_dev_idx++;
 
-    Caveats:
-    
-    I am not sure if 100BaseTX daughterboards (for those cards which
-    support such things) will work.  I haven't had any solid evidence
-    either way.
+	if (edac_device_add_device(edac_dev) > 0) {
+		edac_dbg(3, "failed edac_device_add_device()\n");
+		goto err;
+	}
 
-    However, if a card supports 100BaseTx without requiring an add
-    on daughterboard, it should work with 100BaseTx.
+	if (edac_op_state == EDAC_OPSTATE_INT) {
+		pdata->irq = irq_of_parse_and_map(op->dev.of_node, 0);
+		res = devm_request_irq(&op->dev, pdata->irq,
+				       mpc85xx_l2_isr, IRQF_SHARED,
+				       "[EDAC] L2 err", edac_dev);
+		if (res < 0) {
+			printk(KERN_ERR
+			       "%s: Unable to request irq %d for "
+			       "MPC85xx L2 err\n", __func__, pdata->irq);
+			irq_dispose_mapping(pdata->irq);
+			res = -ENODEV;
+			goto err2;
+		}
 
-    The "Netelligent 10 T/2 PCI UTP/Coax" (b012) device is untested,
-    but I do not expect any problems.
-    
+		printk(KERN_INFO EDAC_MOD_STR " acquired irq %d for L2 Err\n",
+		       pdata->irq);
 
-II.   Driver Options
-	1. You can append debug=x to the end of the insmod line to get
-           debug messages, where x is a bit field where the bits mean
-	   the following:
-	   
-	   0x01		Turn on general debugging messages.
-	   0x02		Turn on receive debugging messages.
-	   0x04		Turn on transmit debugging messages.
-	   0x08		Turn on list debugging messages.
+		edac_dev->op_state = OP_RUNNING_INTERRUPT;
 
-	2. You can append aui=1 to the end of the insmod line to cause
-           the adapter to use the AUI interface instead of the 10 Base T
-           interface.  This is also what to do if you want to use the BNC
-	   connector on a TLAN based device.  (Setting this option on a
-	   device that does not have an AUI/BNC connector will probably
-	   cause it to not function correctly.)
+		out_be32(pdata->l2_vbase + MPC85XX_L2_ERRINTEN, L2_EIE_MASK);
+	}
 
-	3. You can set duplex=1 to force half duplex, and duplex=2 to
-	   force full duplex.
+	devres_remove_group(&op->dev, mpc85xx_l2_err_probe);
 
-	4. You can set speed=10 to force 10Mbs operation, and speed=100
-	   to force 100Mbs operation. (I'm not sure what will happen
-	   if a card which only supports 10Mbs is forced into 100Mbs
-	   mode.)
+	edac_dbg(3, "success\n");
+	printk(KERN_INFO EDAC_MOD_STR " L2 err registered\n");
 
-	5. You have to use speed=X duplex=Y together now. If you just
-	   do "insmod tlan.o speed=100" the driver will do Auto-Neg.
-	   To force a 10Mbps Half-Duplex link do "insmod tlan.o speed=10 
-	   duplex=1".
+	return 0;
 
-	6. If the driver is built into the kernel, you can use the 3rd
-	   and 4th parameters to set aui and debug respectively.  For
-	   example:
+err2:
+	edac_device_del_device(&op->dev);
+err:
+	devres_release_group(&op->dev, mpc85xx_l2_err_probe);
+	edac_device_free_ctl_info(edac_dev);
+	return res;
+}
 
-	   ether=0,0,0x1,0x7,eth0
+static int mpc85xx_l2_err_remove(struct platform_device *op)
+{
+	struct edac_device_ctl_info *edac_dev = dev_get_drvdata(&op->dev);
+	struct mpc85xx_l2_pdata *pdata = edac_dev->pvt_info;
 
-	   This sets aui to 0x1 and debug to 0x7, assuming eth0 is a
-	   supported TLAN device.
+	edac_dbg(0, "\n");
 
-	   The bits in the third byte are assigned as follows:
+	if (edac_op_state == EDAC_OPSTATE_INT) {
+		out_be32(pdata->l2_vbase + MPC85XX_L2_ERRINTEN, 0);
+		irq_dispose_mapping(pdata->irq);
+	}
 
-		0x01 = aui
-		0x02 = use half duplex
-		0x04 = use full duplex
-		0x08 = use 10BaseT
-		0x10 = use 100BaseTx
+	out_be32(pdata->l2_vbase + MPC85XX_L2_ERRDIS, orig_l2_err_disable);
+	edac_device_del_device(&op->dev);
+	edac_device_free_ctl_info(edac_dev);
+	return 0;
+}
 
-	   You also need to set both speed and duplex settings when forcing
-	   speeds with kernel-parameters. 
-	   ether=0,0,0x12,0,eth0 will force link to 100Mbps Half-Duplex.
+static const struct of_device_id mpc85xx_l2_err_of_match[] = {
+/* deprecate the fsl,85.. forms in the future, 2.6.30? */
+	{ .compatible = "fsl,8540-l2-cache-controller", },
+	{ .compatible = "fsl,8541-l2-cache-controller", },
+	{ .compatible = "fsl,8544-l2-cache-controller", },
+	{ .compatible = "fsl,8548-l2-cache-controller", },
+	{ .compatible = "fsl,8555-l2-cache-controller", },
+	{ .compatible = "fsl,8568-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8536-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8540-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8541-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8544-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8548-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8555-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8560-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8568-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8569-l2-cache-controller", },
+	{ .compatible = "fsl,mpc8572-l2-cache-controller", },
+	{ .compatible = "fsl,p1020-l2-cache-controller", },
+	{ .compatible = "fsl,p1021-l2-cache-controller", },
+	{ .compatible = "fsl,p2020-l2-cache-controller", },
+	{},
+};
+MODULE_DEVICE_TABLE(of, mpc85xx_l2_err_of_match);
 
-	7. If you have more than one tlan adapter in your system, you can
-	   use the above options on a per adapter basis. To force a 100Mbit/HD
-	   link with your eth1 adapter use:
-	   
-	   insmod tlan speed=0,100 duplex=0,1
+static struct platform_driver mpc85xx_l2_err_driver = {
+	.probe = mpc85xx_l2_err_probe,
+	.remove = mpc85xx_l2_err_remove,
+	.driver = {
+		.name = "mpc85xx_l2_err",
+		.of_match_table = mpc85xx_l2_err_of_match,
+	},
+};
 
-	   Now eth0 will use auto-neg and eth1 will be forced to 100Mbit/HD.
-	   Note that the tlan driver supports a maximum of 8 adapters.
+/**************************** MC Err device ***************************/
 
-
-III.  Things to try if you have problems.
-	1. Make sure your card's PCI id is among those listed in
-	   section I, above.
-	2. Make sure routing is correct.
-	3. Try forcing different speed/duplex settings
-
-
-There is also a tlan mailing list which you can join by sending "subscribe tlan"
-in the body of an email to majordomo@vuser.vu.union.edu.
-There is also a tlan website at http://www.compaq.com
-
+/*
+ * Taken from table 8-55 in the MPC8641 User's Manual and/or 9-61 in the
+ * MPC8572 User's

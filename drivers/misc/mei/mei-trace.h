@@ -1,74 +1,76 @@
-/*
- *
- * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2015, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- */
+		sel = i + 1;
+			break;
+		}
+	}
 
-#if !defined(_MEI_TRACE_H_) || defined(TRACE_HEADER_MULTI_READ)
-#define _MEI_TRACE_H_
+	return sprintf(buf, "%d\n", sel);
+}
 
-#include <linux/stringify.h>
-#include <linux/types.h>
-#include <linux/tracepoint.h>
+static ssize_t
+show_pwm_temp_sel(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
+	int index = sattr->index;
 
-#include <linux/device.h>
+	return show_pwm_temp_sel_common(data, buf, data->pwm_temp_sel[index]);
+}
 
-#undef TRACE_SYSTEM
-#define TRACE_SYSTEM mei
+static ssize_t
+store_pwm_temp_sel(struct device *dev, struct device_attribute *attr,
+		   const char *buf, size_t count)
+{
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
+	int nr = sattr->index;
+	unsigned long val;
+	int err, reg, src;
 
-TRACE_EVENT(mei_reg_read,
-	TP_PROTO(const struct device *dev, const char *reg, u32 offs, u32 val),
-	TP_ARGS(dev, reg, offs, val),
-	TP_STRUCT__entry(
-		__string(dev, dev_name(dev))
-		__field(const char *, reg)
-		__field(u32, offs)
-		__field(u32, val)
-	),
-	TP_fast_assign(
-		__assign_str(dev, dev_name(dev))
-		__entry->reg  = reg;
-		__entry->offs = offs;
-		__entry->val = val;
-	),
-	TP_printk("[%s] read %s:[%#x] = %#x",
-		  __get_str(dev), __entry->reg, __entry->offs, __entry->val)
-);
+	err = kstrtoul(buf, 10, &val);
+	if (err < 0)
+		return err;
+	if (val == 0 || val > NUM_TEMP)
+		return -EINVAL;
+	if (!(data->have_temp & (1 << (val - 1))) || !data->temp_src[val - 1])
+		return -EINVAL;
 
-TRACE_EVENT(mei_reg_write,
-	TP_PROTO(const struct device *dev, const char *reg, u32 offs, u32 val),
-	TP_ARGS(dev, reg, offs, val),
-	TP_STRUCT__entry(
-		__string(dev, dev_name(dev))
-		__field(const char *, reg)
-		__field(u32, offs)
-		__field(u32, val)
-	),
-	TP_fast_assign(
-		__assign_str(dev, dev_name(dev))
-		__entry->reg = reg;
-		__entry->offs = offs;
-		__entry->val = val;
-	),
-	TP_printk("[%s] write %s[%#x] = %#x)",
-		  __get_str(dev), __entry->reg,  __entry->offs, __entry->val)
-);
+	mutex_lock(&data->update_lock);
+	src = data->temp_src[val - 1];
+	data->pwm_temp_sel[nr] = src;
+	reg = nct6775_read_value(data, data->REG_TEMP_SEL[nr]);
+	reg &= 0xe0;
+	reg |= src;
+	nct6775_write_value(data, data->REG_TEMP_SEL[nr], reg);
+	mutex_unlock(&data->update_lock);
 
-#endif /* _MEI_TRACE_H_ */
+	return count;
+}
 
-/* This part must be outside protection */
-#undef TRACE_INCLUDE_PATH
-#undef TRACE_INCLUDE_FILE
-#define TRACE_INCLUDE_PATH .
-#define TRACE_INCLUDE_FILE mei-trace
-#include <trace/define_trace.h>
+static ssize_t
+show_pwm_weight_temp_sel(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
+	int index = sattr->index;
+
+	return show_pwm_temp_sel_common(data, buf,
+					data->pwm_weight_temp_sel[index]);
+}
+
+static ssize_t
+store_pwm_weight_temp_sel(struct device *dev, struct device_attribute *attr,
+			  const char *buf, size_t count)
+{
+	struct nct6775_data *data = nct6775_update_device(dev);
+	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
+	int nr = sattr->index;
+	unsigned long val;
+	int err, reg, src;
+
+	err = kstrtoul(buf, 10, &val);
+	if (err < 0)
+		return err;
+	if (val > NUM_TEMP)
+		return -EINVAL;
+	if (val && (!(data->have_temp & (1 << (va

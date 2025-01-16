@@ -1,1364 +1,36 @@
-/*
- * Copyright (c) 2014 Open Grid Computing, Inc. All rights reserved.
- * Copyright (c) 2005-2007 Network Appliance, Inc. All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the BSD-type
- * license below:
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- *      Redistributions of source code must retain the above copyright
- *      notice, this list of conditions and the following disclaimer.
- *
- *      Redistributions in binary form must reproduce the above
- *      copyright notice, this list of conditions and the following
- *      disclaimer in the documentation and/or other materials provided
- *      with the distribution.
- *
- *      Neither the name of the Network Appliance, Inc. nor the names of
- *      its contributors may be used to endorse or promote products
- *      derived from this software without specific prior written
- *      permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Author: Tom Tucker <tom@opengridcomputing.com>
- */
-
-#include <linux/sunrpc/svc_xprt.h>
-#include <linux/sunrpc/debug.h>
-#include <linux/sunrpc/rpc_rdma.h>
-#include <linux/interrupt.h>
-#include <linux/sched.h>
-#include <linux/slab.h>
-#include <linux/spinlock.h>
-#include <linux/workqueue.h>
-#include <rdma/ib_verbs.h>
-#include <rdma/rdma_cm.h>
-#include <linux/sunrpc/svc_rdma.h>
-#include <linux/export.h>
-#include "xprt_rdma.h"
-
-#define RPCDBG_FACILITY	RPCDBG_SVCXPRT
-
-static struct svcxprt_rdma *rdma_create_xprt(struct svc_serv *, int);
-static struct svc_xprt *svc_rdma_create(struct svc_serv *serv,
-					struct net *net,
-					struct sockaddr *sa, int salen,
-					int flags);
-static struct svc_xprt *svc_rdma_accept(struct svc_xprt *xprt);
-static void svc_rdma_release_rqst(struct svc_rqst *);
-static void dto_tasklet_func(unsigned long data);
-static void svc_rdma_detach(struct svc_xprt *xprt);
-static void svc_rdma_free(struct svc_xprt *xprt);
-static int svc_rdma_has_wspace(struct svc_xprt *xprt);
-static int svc_rdma_secure_port(struct svc_rqst *);
-static void rq_cq_reap(struct svcxprt_rdma *xprt);
-static void sq_cq_reap(struct svcxprt_rdma *xprt);
-
-static DECLARE_TASKLET(dto_tasklet, dto_tasklet_func, 0UL);
-static DEFINE_SPINLOCK(dto_lock);
-static LIST_HEAD(dto_xprt_q);
-
-static struct svc_xprt_ops svc_rdma_ops = {
-	.xpo_create = svc_rdma_create,
-	.xpo_recvfrom = svc_rdma_recvfrom,
-	.xpo_sendto = svc_rdma_sendto,
-	.xpo_release_rqst = svc_rdma_release_rqst,
-	.xpo_detach = svc_rdma_detach,
-	.xpo_free = svc_rdma_free,
-	.xpo_prep_reply_hdr = svc_rdma_prep_reply_hdr,
-	.xpo_has_wspace = svc_rdma_has_wspace,
-	.xpo_accept = svc_rdma_accept,
-	.xpo_secure_port = svc_rdma_secure_port,
-};
-
-struct svc_xprt_class svc_rdma_class = {
-	.xcl_name = "rdma",
-	.xcl_owner = THIS_MODULE,
-	.xcl_ops = &svc_rdma_ops,
-	.xcl_max_payload = RPCSVC_MAXPAYLOAD_RDMA,
-	.xcl_ident = XPRT_TRANSPORT_RDMA,
-};
-
-#if defined(CONFIG_SUNRPC_BACKCHANNEL)
-static struct svc_xprt *svc_rdma_bc_create(struct svc_serv *, struct net *,
-					   struct sockaddr *, int, int);
-static void svc_rdma_bc_detach(struct svc_xprt *);
-static void svc_rdma_bc_free(struct svc_xprt *);
-
-static struct svc_xprt_ops svc_rdma_bc_ops = {
-	.xpo_create = svc_rdma_bc_create,
-	.xpo_detach = svc_rdma_bc_detach,
-	.xpo_free = svc_rdma_bc_free,
-	.xpo_prep_reply_hdr = svc_rdma_prep_reply_hdr,
-	.xpo_secure_port = svc_rdma_secure_port,
-};
-
-struct svc_xprt_class svc_rdma_bc_class = {
-	.xcl_name = "rdma-bc",
-	.xcl_owner = THIS_MODULE,
-	.xcl_ops = &svc_rdma_bc_ops,
-	.xcl_max_payload = (1024 - RPCRDMA_HDRLEN_MIN)
-};
-
-static struct svc_xprt *svc_rdma_bc_create(struct svc_serv *serv,
-					   struct net *net,
-					   struct sockaddr *sa, int salen,
-					   int flags)
-{
-	struct svcxprt_rdma *cma_xprt;
-	struct svc_xprt *xprt;
-
-	cma_xprt = rdma_create_xprt(serv, 0);
-	if (!cma_xprt)
-		return ERR_PTR(-ENOMEM);
-	xprt = &cma_xprt->sc_xprt;
-
-	svc_xprt_init(net, &svc_rdma_bc_class, xprt, serv);
-	serv->sv_bc_xprt = xprt;
-
-	dprintk("svcrdma: %s(%p)\n", __func__, xprt);
-	return xprt;
-}
-
-static void svc_rdma_bc_detach(struct svc_xprt *xprt)
-{
-	dprintk("svcrdma: %s(%p)\n", __func__, xprt);
-}
-
-static void svc_rdma_bc_free(struct svc_xprt *xprt)
-{
-	struct svcxprt_rdma *rdma =
-		container_of(xprt, struct svcxprt_rdma, sc_xprt);
-
-	dprintk("svcrdma: %s(%p)\n", __func__, xprt);
-	if (xprt)
-		kfree(rdma);
-}
-#endif	/* CONFIG_SUNRPC_BACKCHANNEL */
-
-struct svc_rdma_op_ctxt *svc_rdma_get_context(struct svcxprt_rdma *xprt)
-{
-	struct svc_rdma_op_ctxt *ctxt;
-
-	ctxt = kmem_cache_alloc(svc_rdma_ctxt_cachep,
-				GFP_KERNEL | __GFP_NOFAIL);
-	ctxt->xprt = xprt;
-	INIT_LIST_HEAD(&ctxt->dto_q);
-	ctxt->count = 0;
-	ctxt->frmr = NULL;
-	atomic_inc(&xprt->sc_ctxt_used);
-	return ctxt;
-}
-
-void svc_rdma_unmap_dma(struct svc_rdma_op_ctxt *ctxt)
-{
-	struct svcxprt_rdma *xprt = ctxt->xprt;
-	int i;
-	for (i = 0; i < ctxt->count && ctxt->sge[i].length; i++) {
-		/*
-		 * Unmap the DMA addr in the SGE if the lkey matches
-		 * the sc_dma_lkey, otherwise, ignore it since it is
-		 * an FRMR lkey and will be unmapped later when the
-		 * last WR that uses it completes.
-		 */
-		if (ctxt->sge[i].lkey == xprt->sc_dma_lkey) {
-			atomic_dec(&xprt->sc_dma_used);
-			ib_dma_unmap_page(xprt->sc_cm_id->device,
-					    ctxt->sge[i].addr,
-					    ctxt->sge[i].length,
-					    ctxt->direction);
-		}
-	}
-}
-
-void svc_rdma_put_context(struct svc_rdma_op_ctxt *ctxt, int free_pages)
-{
-	struct svcxprt_rdma *xprt;
-	int i;
-
-	xprt = ctxt->xprt;
-	if (free_pages)
-		for (i = 0; i < ctxt->count; i++)
-			put_page(ctxt->pages[i]);
-
-	kmem_cache_free(svc_rdma_ctxt_cachep, ctxt);
-	atomic_dec(&xprt->sc_ctxt_used);
-}
-
-/*
- * Temporary NFS req mappings are shared across all transport
- * instances. These are short lived and should be bounded by the number
- * of concurrent server threads * depth of the SQ.
- */
-struct svc_rdma_req_map *svc_rdma_get_req_map(void)
-{
-	struct svc_rdma_req_map *map;
-	map = kmem_cache_alloc(svc_rdma_map_cachep,
-			       GFP_KERNEL | __GFP_NOFAIL);
-	map->count = 0;
-	return map;
-}
-
-void svc_rdma_put_req_map(struct svc_rdma_req_map *map)
-{
-	kmem_cache_free(svc_rdma_map_cachep, map);
-}
-
-/* ib_cq event handler */
-static void cq_event_handler(struct ib_event *event, void *context)
-{
-	struct svc_xprt *xprt = context;
-	dprintk("svcrdma: received CQ event %s (%d), context=%p\n",
-		ib_event_msg(event->event), event->event, context);
-	set_bit(XPT_CLOSE, &xprt->xpt_flags);
-}
-
-/* QP event handler */
-static void qp_event_handler(struct ib_event *event, void *context)
-{
-	struct svc_xprt *xprt = context;
-
-	switch (event->event) {
-	/* These are considered benign events */
-	case IB_EVENT_PATH_MIG:
-	case IB_EVENT_COMM_EST:
-	case IB_EVENT_SQ_DRAINED:
-	case IB_EVENT_QP_LAST_WQE_REACHED:
-		dprintk("svcrdma: QP event %s (%d) received for QP=%p\n",
-			ib_event_msg(event->event), event->event,
-			event->element.qp);
-		break;
-	/* These are considered fatal events */
-	case IB_EVENT_PATH_MIG_ERR:
-	case IB_EVENT_QP_FATAL:
-	case IB_EVENT_QP_REQ_ERR:
-	case IB_EVENT_QP_ACCESS_ERR:
-	case IB_EVENT_DEVICE_FATAL:
-	default:
-		dprintk("svcrdma: QP ERROR event %s (%d) received for QP=%p, "
-			"closing transport\n",
-			ib_event_msg(event->event), event->event,
-			event->element.qp);
-		set_bit(XPT_CLOSE, &xprt->xpt_flags);
-		break;
-	}
-}
-
-/*
- * Data Transfer Operation Tasklet
- *
- * Walks a list of transports with I/O pending, removing entries as
- * they are added to the server's I/O pending list. Two bits indicate
- * if SQ, RQ, or both have I/O pending. The dto_lock is an irqsave
- * spinlock that serializes access to the transport list with the RQ
- * and SQ interrupt handlers.
- */
-static void dto_tasklet_func(unsigned long data)
-{
-	struct svcxprt_rdma *xprt;
-	unsigned long flags;
-
-	spin_lock_irqsave(&dto_lock, flags);
-	while (!list_empty(&dto_xprt_q)) {
-		xprt = list_entry(dto_xprt_q.next,
-				  struct svcxprt_rdma, sc_dto_q);
-		list_del_init(&xprt->sc_dto_q);
-		spin_unlock_irqrestore(&dto_lock, flags);
-
-		rq_cq_reap(xprt);
-		sq_cq_reap(xprt);
-
-		svc_xprt_put(&xprt->sc_xprt);
-		spin_lock_irqsave(&dto_lock, flags);
-	}
-	spin_unlock_irqrestore(&dto_lock, flags);
-}
-
-/*
- * Receive Queue Completion Handler
- *
- * Since an RQ completion handler is called on interrupt context, we
- * need to defer the handling of the I/O to a tasklet
- */
-static void rq_comp_handler(struct ib_cq *cq, void *cq_context)
-{
-	struct svcxprt_rdma *xprt = cq_context;
-	unsigned long flags;
-
-	/* Guard against unconditional flush call for destroyed QP */
-	if (atomic_read(&xprt->sc_xprt.xpt_ref.refcount)==0)
-		return;
-
-	/*
-	 * Set the bit regardless of whether or not it's on the list
-	 * because it may be on the list already due to an SQ
-	 * completion.
-	 */
-	set_bit(RDMAXPRT_RQ_PENDING, &xprt->sc_flags);
-
-	/*
-	 * If this transport is not already on the DTO transport queue,
-	 * add it
-	 */
-	spin_lock_irqsave(&dto_lock, flags);
-	if (list_empty(&xprt->sc_dto_q)) {
-		svc_xprt_get(&xprt->sc_xprt);
-		list_add_tail(&xprt->sc_dto_q, &dto_xprt_q);
-	}
-	spin_unlock_irqrestore(&dto_lock, flags);
-
-	/* Tasklet does all the work to avoid irqsave locks. */
-	tasklet_schedule(&dto_tasklet);
-}
-
-/*
- * rq_cq_reap - Process the RQ CQ.
- *
- * Take all completing WC off the CQE and enqueue the associated DTO
- * context on the dto_q for the transport.
- *
- * Note that caller must hold a transport reference.
- */
-static void rq_cq_reap(struct svcxprt_rdma *xprt)
-{
-	int ret;
-	struct ib_wc wc;
-	struct svc_rdma_op_ctxt *ctxt = NULL;
-
-	if (!test_and_clear_bit(RDMAXPRT_RQ_PENDING, &xprt->sc_flags))
-		return;
-
-	ib_req_notify_cq(xprt->sc_rq_cq, IB_CQ_NEXT_COMP);
-	atomic_inc(&rdma_stat_rq_poll);
-
-	while ((ret = ib_poll_cq(xprt->sc_rq_cq, 1, &wc)) > 0) {
-		ctxt = (struct svc_rdma_op_ctxt *)(unsigned long)wc.wr_id;
-		ctxt->wc_status = wc.status;
-		ctxt->byte_len = wc.byte_len;
-		svc_rdma_unmap_dma(ctxt);
-		if (wc.status != IB_WC_SUCCESS) {
-			/* Close the transport */
-			dprintk("svcrdma: transport closing putting ctxt %p\n", ctxt);
-			set_bit(XPT_CLOSE, &xprt->sc_xprt.xpt_flags);
-			svc_rdma_put_context(ctxt, 1);
-			svc_xprt_put(&xprt->sc_xprt);
-			continue;
-		}
-		spin_lock_bh(&xprt->sc_rq_dto_lock);
-		list_add_tail(&ctxt->dto_q, &xprt->sc_rq_dto_q);
-		spin_unlock_bh(&xprt->sc_rq_dto_lock);
-		svc_xprt_put(&xprt->sc_xprt);
-	}
-
-	if (ctxt)
-		atomic_inc(&rdma_stat_rq_prod);
-
-	set_bit(XPT_DATA, &xprt->sc_xprt.xpt_flags);
-	/*
-	 * If data arrived before established event,
-	 * don't enqueue. This defers RPC I/O until the
-	 * RDMA connection is complete.
-	 */
-	if (!test_bit(RDMAXPRT_CONN_PENDING, &xprt->sc_flags))
-		svc_xprt_enqueue(&xprt->sc_xprt);
-}
-
-/*
- * Process a completion context
- */
-static void process_context(struct svcxprt_rdma *xprt,
-			    struct svc_rdma_op_ctxt *ctxt)
-{
-	svc_rdma_unmap_dma(ctxt);
-
-	switch (ctxt->wr_op) {
-	case IB_WR_SEND:
-		if (ctxt->frmr)
-			pr_err("svcrdma: SEND: ctxt->frmr != NULL\n");
-		svc_rdma_put_context(ctxt, 1);
-		break;
-
-	case IB_WR_RDMA_WRITE:
-		if (ctxt->frmr)
-			pr_err("svcrdma: WRITE: ctxt->frmr != NULL\n");
-		svc_rdma_put_context(ctxt, 0);
-		break;
-
-	case IB_WR_RDMA_READ:
-	case IB_WR_RDMA_READ_WITH_INV:
-		svc_rdma_put_frmr(xprt, ctxt->frmr);
-		if (test_bit(RDMACTXT_F_LAST_CTXT, &ctxt->flags)) {
-			struct svc_rdma_op_ctxt *read_hdr = ctxt->read_hdr;
-			if (read_hdr) {
-				spin_lock_bh(&xprt->sc_rq_dto_lock);
-				set_bit(XPT_DATA, &xprt->sc_xprt.xpt_flags);
-				list_add_tail(&read_hdr->dto_q,
-					      &xprt->sc_read_complete_q);
-				spin_unlock_bh(&xprt->sc_rq_dto_lock);
-			} else {
-				pr_err("svcrdma: ctxt->read_hdr == NULL\n");
-			}
-			svc_xprt_enqueue(&xprt->sc_xprt);
-		}
-		svc_rdma_put_context(ctxt, 0);
-		break;
-
-	default:
-		printk(KERN_ERR "svcrdma: unexpected completion type, "
-		       "opcode=%d\n",
-		       ctxt->wr_op);
-		break;
-	}
-}
-
-/*
- * Send Queue Completion Handler - potentially called on interrupt context.
- *
- * Note that caller must hold a transport reference.
- */
-static void sq_cq_reap(struct svcxprt_rdma *xprt)
-{
-	struct svc_rdma_op_ctxt *ctxt = NULL;
-	struct ib_wc wc_a[6];
-	struct ib_wc *wc;
-	struct ib_cq *cq = xprt->sc_sq_cq;
-	int ret;
-
-	memset(wc_a, 0, sizeof(wc_a));
-
-	if (!test_and_clear_bit(RDMAXPRT_SQ_PENDING, &xprt->sc_flags))
-		return;
-
-	ib_req_notify_cq(xprt->sc_sq_cq, IB_CQ_NEXT_COMP);
-	atomic_inc(&rdma_stat_sq_poll);
-	while ((ret = ib_poll_cq(cq, ARRAY_SIZE(wc_a), wc_a)) > 0) {
-		int i;
-
-		for (i = 0; i < ret; i++) {
-			wc = &wc_a[i];
-			if (wc->status != IB_WC_SUCCESS) {
-				dprintk("svcrdma: sq wc err status %s (%d)\n",
-					ib_wc_status_msg(wc->status),
-					wc->status);
-
-				/* Close the transport */
-				set_bit(XPT_CLOSE, &xprt->sc_xprt.xpt_flags);
-			}
-
-			/* Decrement used SQ WR count */
-			atomic_dec(&xprt->sc_sq_count);
-			wake_up(&xprt->sc_send_wait);
-
-			ctxt = (struct svc_rdma_op_ctxt *)
-				(unsigned long)wc->wr_id;
-			if (ctxt)
-				process_context(xprt, ctxt);
-
-			svc_xprt_put(&xprt->sc_xprt);
-		}
-	}
-
-	if (ctxt)
-		atomic_inc(&rdma_stat_sq_prod);
-}
-
-static void sq_comp_handler(struct ib_cq *cq, void *cq_context)
-{
-	struct svcxprt_rdma *xprt = cq_context;
-	unsigned long flags;
-
-	/* Guard against unconditional flush call for destroyed QP */
-	if (atomic_read(&xprt->sc_xprt.xpt_ref.refcount)==0)
-		return;
-
-	/*
-	 * Set the bit regardless of whether or not it's on the list
-	 * because it may be on the list already due to an RQ
-	 * completion.
-	 */
-	set_bit(RDMAXPRT_SQ_PENDING, &xprt->sc_flags);
-
-	/*
-	 * If this transport is not already on the DTO transport queue,
-	 * add it
-	 */
-	spin_lock_irqsave(&dto_lock, flags);
-	if (list_empty(&xprt->sc_dto_q)) {
-		svc_xprt_get(&xprt->sc_xprt);
-		list_add_tail(&xprt->sc_dto_q, &dto_xprt_q);
-	}
-	spin_unlock_irqrestore(&dto_lock, flags);
-
-	/* Tasklet does all the work to avoid irqsave locks. */
-	tasklet_schedule(&dto_tasklet);
-}
-
-static struct svcxprt_rdma *rdma_create_xprt(struct svc_serv *serv,
-					     int listener)
-{
-	struct svcxprt_rdma *cma_xprt = kzalloc(sizeof *cma_xprt, GFP_KERNEL);
-
-	if (!cma_xprt)
-		return NULL;
-	svc_xprt_init(&init_net, &svc_rdma_class, &cma_xprt->sc_xprt, serv);
-	INIT_LIST_HEAD(&cma_xprt->sc_accept_q);
-	INIT_LIST_HEAD(&cma_xprt->sc_dto_q);
-	INIT_LIST_HEAD(&cma_xprt->sc_rq_dto_q);
-	INIT_LIST_HEAD(&cma_xprt->sc_read_complete_q);
-	INIT_LIST_HEAD(&cma_xprt->sc_frmr_q);
-	init_waitqueue_head(&cma_xprt->sc_send_wait);
-
-	spin_lock_init(&cma_xprt->sc_lock);
-	spin_lock_init(&cma_xprt->sc_rq_dto_lock);
-	spin_lock_init(&cma_xprt->sc_frmr_q_lock);
-
-	cma_xprt->sc_ord = svcrdma_ord;
-
-	cma_xprt->sc_max_req_size = svcrdma_max_req_size;
-	cma_xprt->sc_max_requests = svcrdma_max_requests;
-	cma_xprt->sc_sq_depth = svcrdma_max_requests * RPCRDMA_SQ_DEPTH_MULT;
-	atomic_set(&cma_xprt->sc_sq_count, 0);
-	atomic_set(&cma_xprt->sc_ctxt_used, 0);
-
-	if (listener)
-		set_bit(XPT_LISTENER, &cma_xprt->sc_xprt.xpt_flags);
-
-	return cma_xprt;
-}
-
-int svc_rdma_post_recv(struct svcxprt_rdma *xprt)
-{
-	struct ib_recv_wr recv_wr, *bad_recv_wr;
-	struct svc_rdma_op_ctxt *ctxt;
-	struct page *page;
-	dma_addr_t pa;
-	int sge_no;
-	int buflen;
-	int ret;
-
-	ctxt = svc_rdma_get_context(xprt);
-	buflen = 0;
-	ctxt->direction = DMA_FROM_DEVICE;
-	for (sge_no = 0; buflen < xprt->sc_max_req_size; sge_no++) {
-		if (sge_no >= xprt->sc_max_sge) {
-			pr_err("svcrdma: Too many sges (%d)\n", sge_no);
-			goto err_put_ctxt;
-		}
-		page = alloc_page(GFP_KERNEL | __GFP_NOFAIL);
-		ctxt->pages[sge_no] = page;
-		pa = ib_dma_map_page(xprt->sc_cm_id->device,
-				     page, 0, PAGE_SIZE,
-				     DMA_FROM_DEVICE);
-		if (ib_dma_mapping_error(xprt->sc_cm_id->device, pa))
-			goto err_put_ctxt;
-		atomic_inc(&xprt->sc_dma_used);
-		ctxt->sge[sge_no].addr = pa;
-		ctxt->sge[sge_no].length = PAGE_SIZE;
-		ctxt->sge[sge_no].lkey = xprt->sc_dma_lkey;
-		ctxt->count = sge_no + 1;
-		buflen += PAGE_SIZE;
-	}
-	recv_wr.next = NULL;
-	recv_wr.sg_list = &ctxt->sge[0];
-	recv_wr.num_sge = ctxt->count;
-	recv_wr.wr_id = (u64)(unsigned long)ctxt;
-
-	svc_xprt_get(&xprt->sc_xprt);
-	ret = ib_post_recv(xprt->sc_qp, &recv_wr, &bad_recv_wr);
-	if (ret) {
-		svc_rdma_unmap_dma(ctxt);
-		svc_rdma_put_context(ctxt, 1);
-		svc_xprt_put(&xprt->sc_xprt);
-	}
-	return ret;
-
- err_put_ctxt:
-	svc_rdma_unmap_dma(ctxt);
-	svc_rdma_put_context(ctxt, 1);
-	return -ENOMEM;
-}
-
-/*
- * This function handles the CONNECT_REQUEST event on a listening
- * endpoint. It is passed the cma_id for the _new_ connection. The context in
- * this cma_id is inherited from the listening cma_id and is the svc_xprt
- * structure for the listening endpoint.
- *
- * This function creates a new xprt for the new connection and enqueues it on
- * the accept queue for the listent xprt. When the listen thread is kicked, it
- * will call the recvfrom method on the listen xprt which will accept the new
- * connection.
- */
-static void handle_connect_req(struct rdma_cm_id *new_cma_id, size_t client_ird)
-{
-	struct svcxprt_rdma *listen_xprt = new_cma_id->context;
-	struct svcxprt_rdma *newxprt;
-	struct sockaddr *sa;
-
-	/* Create a new transport */
-	newxprt = rdma_create_xprt(listen_xprt->sc_xprt.xpt_server, 0);
-	if (!newxprt) {
-		dprintk("svcrdma: failed to create new transport\n");
-		return;
-	}
-	newxprt->sc_cm_id = new_cma_id;
-	new_cma_id->context = newxprt;
-	dprintk("svcrdma: Creating newxprt=%p, cm_id=%p, listenxprt=%p\n",
-		newxprt, newxprt->sc_cm_id, listen_xprt);
-
-	/* Save client advertised inbound read limit for use later in accept. */
-	newxprt->sc_ord = client_ird;
-
-	/* Set the local and remote addresses in the transport */
-	sa = (struct sockaddr *)&newxprt->sc_cm_id->route.addr.dst_addr;
-	svc_xprt_set_remote(&newxprt->sc_xprt, sa, svc_addr_len(sa));
-	sa = (struct sockaddr *)&newxprt->sc_cm_id->route.addr.src_addr;
-	svc_xprt_set_local(&newxprt->sc_xprt, sa, svc_addr_len(sa));
-
-	/*
-	 * Enqueue the new transport on the accept queue of the listening
-	 * transport
-	 */
-	spin_lock_bh(&listen_xprt->sc_lock);
-	list_add_tail(&newxprt->sc_accept_q, &listen_xprt->sc_accept_q);
-	spin_unlock_bh(&listen_xprt->sc_lock);
-
-	set_bit(XPT_CONN, &listen_xprt->sc_xprt.xpt_flags);
-	svc_xprt_enqueue(&listen_xprt->sc_xprt);
-}
-
-/*
- * Handles events generated on the listening endpoint. These events will be
- * either be incoming connect requests or adapter removal  events.
- */
-static int rdma_listen_handler(struct rdma_cm_id *cma_id,
-			       struct rdma_cm_event *event)
-{
-	struct svcxprt_rdma *xprt = cma_id->context;
-	int ret = 0;
-
-	switch (event->event) {
-	case RDMA_CM_EVENT_CONNECT_REQUEST:
-		dprintk("svcrdma: Connect request on cma_id=%p, xprt = %p, "
-			"event = %s (%d)\n", cma_id, cma_id->context,
-			rdma_event_msg(event->event), event->event);
-		handle_connect_req(cma_id,
-				   event->param.conn.initiator_depth);
-		break;
-
-	case RDMA_CM_EVENT_ESTABLISHED:
-		/* Accept complete */
-		dprintk("svcrdma: Connection completed on LISTEN xprt=%p, "
-			"cm_id=%p\n", xprt, cma_id);
-		break;
-
-	case RDMA_CM_EVENT_DEVICE_REMOVAL:
-		dprintk("svcrdma: Device removal xprt=%p, cm_id=%p\n",
-			xprt, cma_id);
-		if (xprt)
-			set_bit(XPT_CLOSE, &xprt->sc_xprt.xpt_flags);
-		break;
-
-	default:
-		dprintk("svcrdma: Unexpected event on listening endpoint %p, "
-			"event = %s (%d)\n", cma_id,
-			rdma_event_msg(event->event), event->event);
-		break;
-	}
-
-	return ret;
-}
-
-static int rdma_cma_handler(struct rdma_cm_id *cma_id,
-			    struct rdma_cm_event *event)
-{
-	struct svc_xprt *xprt = cma_id->context;
-	struct svcxprt_rdma *rdma =
-		container_of(xprt, struct svcxprt_rdma, sc_xprt);
-	switch (event->event) {
-	case RDMA_CM_EVENT_ESTABLISHED:
-		/* Accept complete */
-		svc_xprt_get(xprt);
-		dprintk("svcrdma: Connection completed on DTO xprt=%p, "
-			"cm_id=%p\n", xprt, cma_id);
-		clear_bit(RDMAXPRT_CONN_PENDING, &rdma->sc_flags);
-		svc_xprt_enqueue(xprt);
-		break;
-	case RDMA_CM_EVENT_DISCONNECTED:
-		dprintk("svcrdma: Disconnect on DTO xprt=%p, cm_id=%p\n",
-			xprt, cma_id);
-		if (xprt) {
-			set_bit(XPT_CLOSE, &xprt->xpt_flags);
-			svc_xprt_enqueue(xprt);
-			svc_xprt_put(xprt);
-		}
-		break;
-	case RDMA_CM_EVENT_DEVICE_REMOVAL:
-		dprintk("svcrdma: Device removal cma_id=%p, xprt = %p, "
-			"event = %s (%d)\n", cma_id, xprt,
-			rdma_event_msg(event->event), event->event);
-		if (xprt) {
-			set_bit(XPT_CLOSE, &xprt->xpt_flags);
-			svc_xprt_enqueue(xprt);
-			svc_xprt_put(xprt);
-		}
-		break;
-	default:
-		dprintk("svcrdma: Unexpected event on DTO endpoint %p, "
-			"event = %s (%d)\n", cma_id,
-			rdma_event_msg(event->event), event->event);
-		break;
-	}
-	return 0;
-}
-
-/*
- * Create a listening RDMA service endpoint.
- */
-static struct svc_xprt *svc_rdma_create(struct svc_serv *serv,
-					struct net *net,
-					struct sockaddr *sa, int salen,
-					int flags)
-{
-	struct rdma_cm_id *listen_id;
-	struct svcxprt_rdma *cma_xprt;
-	int ret;
-
-	dprintk("svcrdma: Creating RDMA socket\n");
-	if (sa->sa_family != AF_INET) {
-		dprintk("svcrdma: Address family %d is not supported.\n", sa->sa_family);
-		return ERR_PTR(-EAFNOSUPPORT);
-	}
-	cma_xprt = rdma_create_xprt(serv, 1);
-	if (!cma_xprt)
-		return ERR_PTR(-ENOMEM);
-
-	listen_id = rdma_create_id(&init_net, rdma_listen_handler, cma_xprt,
-				   RDMA_PS_TCP, IB_QPT_RC);
-	if (IS_ERR(listen_id)) {
-		ret = PTR_ERR(listen_id);
-		dprintk("svcrdma: rdma_create_id failed = %d\n", ret);
-		goto err0;
-	}
-
-	ret = rdma_bind_addr(listen_id, sa);
-	if (ret) {
-		dprintk("svcrdma: rdma_bind_addr failed = %d\n", ret);
-		goto err1;
-	}
-	cma_xprt->sc_cm_id = listen_id;
-
-	ret = rdma_listen(listen_id, RPCRDMA_LISTEN_BACKLOG);
-	if (ret) {
-		dprintk("svcrdma: rdma_listen failed = %d\n", ret);
-		goto err1;
-	}
-
-	/*
-	 * We need to use the address from the cm_id in case the
-	 * caller specified 0 for the port number.
-	 */
-	sa = (struct sockaddr *)&cma_xprt->sc_cm_id->route.addr.src_addr;
-	svc_xprt_set_local(&cma_xprt->sc_xprt, sa, salen);
-
-	return &cma_xprt->sc_xprt;
-
- err1:
-	rdma_destroy_id(listen_id);
- err0:
-	kfree(cma_xprt);
-	return ERR_PTR(ret);
-}
-
-static struct svc_rdma_fastreg_mr *rdma_alloc_frmr(struct svcxprt_rdma *xprt)
-{
-	struct ib_mr *mr;
-	struct scatterlist *sg;
-	struct svc_rdma_fastreg_mr *frmr;
-	u32 num_sg;
-
-	frmr = kmalloc(sizeof(*frmr), GFP_KERNEL);
-	if (!frmr)
-		goto err;
-
-	num_sg = min_t(u32, RPCSVC_MAXPAGES, xprt->sc_frmr_pg_list_len);
-	mr = ib_alloc_mr(xprt->sc_pd, IB_MR_TYPE_MEM_REG, num_sg);
-	if (IS_ERR(mr))
-		goto err_free_frmr;
-
-	sg = kcalloc(RPCSVC_MAXPAGES, sizeof(*sg), GFP_KERNEL);
-	if (!sg)
-		goto err_free_mr;
-
-	sg_init_table(sg, RPCSVC_MAXPAGES);
-
-	frmr->mr = mr;
-	frmr->sg = sg;
-	INIT_LIST_HEAD(&frmr->frmr_list);
-	return frmr;
-
- err_free_mr:
-	ib_dereg_mr(mr);
- err_free_frmr:
-	kfree(frmr);
- err:
-	return ERR_PTR(-ENOMEM);
-}
-
-static void rdma_dealloc_frmr_q(struct svcxprt_rdma *xprt)
-{
-	struct svc_rdma_fastreg_mr *frmr;
-
-	while (!list_empty(&xprt->sc_frmr_q)) {
-		frmr = list_entry(xprt->sc_frmr_q.next,
-				  struct svc_rdma_fastreg_mr, frmr_list);
-		list_del_init(&frmr->frmr_list);
-		kfree(frmr->sg);
-		ib_dereg_mr(frmr->mr);
-		kfree(frmr);
-	}
-}
-
-struct svc_rdma_fastreg_mr *svc_rdma_get_frmr(struct svcxprt_rdma *rdma)
-{
-	struct svc_rdma_fastreg_mr *frmr = NULL;
-
-	spin_lock_bh(&rdma->sc_frmr_q_lock);
-	if (!list_empty(&rdma->sc_frmr_q)) {
-		frmr = list_entry(rdma->sc_frmr_q.next,
-				  struct svc_rdma_fastreg_mr, frmr_list);
-		list_del_init(&frmr->frmr_list);
-		frmr->sg_nents = 0;
-	}
-	spin_unlock_bh(&rdma->sc_frmr_q_lock);
-	if (frmr)
-		return frmr;
-
-	return rdma_alloc_frmr(rdma);
-}
-
-void svc_rdma_put_frmr(struct svcxprt_rdma *rdma,
-		       struct svc_rdma_fastreg_mr *frmr)
-{
-	if (frmr) {
-		ib_dma_unmap_sg(rdma->sc_cm_id->device,
-				frmr->sg, frmr->sg_nents, frmr->direction);
-		atomic_dec(&rdma->sc_dma_used);
-		spin_lock_bh(&rdma->sc_frmr_q_lock);
-		WARN_ON_ONCE(!list_empty(&frmr->frmr_list));
-		list_add(&frmr->frmr_list, &rdma->sc_frmr_q);
-		spin_unlock_bh(&rdma->sc_frmr_q_lock);
-	}
-}
-
-/*
- * This is the xpo_recvfrom function for listening endpoints. Its
- * purpose is to accept incoming connections. The CMA callback handler
- * has already created a new transport and attached it to the new CMA
- * ID.
- *
- * There is a queue of pending connections hung on the listening
- * transport. This queue contains the new svc_xprt structure. This
- * function takes svc_xprt structures off the accept_q and completes
- * the connection.
- */
-static struct svc_xprt *svc_rdma_accept(struct svc_xprt *xprt)
-{
-	struct svcxprt_rdma *listen_rdma;
-	struct svcxprt_rdma *newxprt = NULL;
-	struct rdma_conn_param conn_param;
-	struct ib_cq_init_attr cq_attr = {};
-	struct ib_qp_init_attr qp_attr;
-	struct ib_device_attr devattr;
-	int uninitialized_var(dma_mr_acc);
-	int need_dma_mr = 0;
-	int ret;
-	int i;
-
-	listen_rdma = container_of(xprt, struct svcxprt_rdma, sc_xprt);
-	clear_bit(XPT_CONN, &xprt->xpt_flags);
-	/* Get the next entry off the accept list */
-	spin_lock_bh(&listen_rdma->sc_lock);
-	if (!list_empty(&listen_rdma->sc_accept_q)) {
-		newxprt = list_entry(listen_rdma->sc_accept_q.next,
-				     struct svcxprt_rdma, sc_accept_q);
-		list_del_init(&newxprt->sc_accept_q);
-	}
-	if (!list_empty(&listen_rdma->sc_accept_q))
-		set_bit(XPT_CONN, &listen_rdma->sc_xprt.xpt_flags);
-	spin_unlock_bh(&listen_rdma->sc_lock);
-	if (!newxprt)
-		return NULL;
-
-	dprintk("svcrdma: newxprt from accept queue = %p, cm_id=%p\n",
-		newxprt, newxprt->sc_cm_id);
-
-	ret = ib_query_device(newxprt->sc_cm_id->device, &devattr);
-	if (ret) {
-		dprintk("svcrdma: could not query device attributes on "
-			"device %p, rc=%d\n", newxprt->sc_cm_id->device, ret);
-		goto errout;
-	}
-
-	/* Qualify the transport resource defaults with the
-	 * capabilities of this particular device */
-	newxprt->sc_max_sge = min((size_t)devattr.max_sge,
-				  (size_t)RPCSVC_MAXPAGES);
-	newxprt->sc_max_sge_rd = min_t(size_t, devattr.max_sge_rd,
-				       RPCSVC_MAXPAGES);
-	newxprt->sc_max_requests = min((size_t)devattr.max_qp_wr,
-				   (size_t)svcrdma_max_requests);
-	newxprt->sc_sq_depth = RPCRDMA_SQ_DEPTH_MULT * newxprt->sc_max_requests;
-
-	/*
-	 * Limit ORD based on client limit, local device limit, and
-	 * configured svcrdma limit.
-	 */
-	newxprt->sc_ord = min_t(size_t, devattr.max_qp_rd_atom, newxprt->sc_ord);
-	newxprt->sc_ord = min_t(size_t,	svcrdma_ord, newxprt->sc_ord);
-
-	newxprt->sc_pd = ib_alloc_pd(newxprt->sc_cm_id->device);
-	if (IS_ERR(newxprt->sc_pd)) {
-		dprintk("svcrdma: error creating PD for connect request\n");
-		goto errout;
-	}
-	cq_attr.cqe = newxprt->sc_sq_depth;
-	newxprt->sc_sq_cq = ib_create_cq(newxprt->sc_cm_id->device,
-					 sq_comp_handler,
-					 cq_event_handler,
-					 newxprt,
-					 &cq_attr);
-	if (IS_ERR(newxprt->sc_sq_cq)) {
-		dprintk("svcrdma: error creating SQ CQ for connect request\n");
-		goto errout;
-	}
-	cq_attr.cqe = newxprt->sc_max_requests;
-	newxprt->sc_rq_cq = ib_create_cq(newxprt->sc_cm_id->device,
-					 rq_comp_handler,
-					 cq_event_handler,
-					 newxprt,
-					 &cq_attr);
-	if (IS_ERR(newxprt->sc_rq_cq)) {
-		dprintk("svcrdma: error creating RQ CQ for connect request\n");
-		goto errout;
-	}
-
-	memset(&qp_attr, 0, sizeof qp_attr);
-	qp_attr.event_handler = qp_event_handler;
-	qp_attr.qp_context = &newxprt->sc_xprt;
-	qp_attr.cap.max_send_wr = newxprt->sc_sq_depth;
-	qp_attr.cap.max_recv_wr = newxprt->sc_max_requests;
-	qp_attr.cap.max_send_sge = newxprt->sc_max_sge;
-	qp_attr.cap.max_recv_sge = newxprt->sc_max_sge;
-	qp_attr.sq_sig_type = IB_SIGNAL_REQ_WR;
-	qp_attr.qp_type = IB_QPT_RC;
-	qp_attr.send_cq = newxprt->sc_sq_cq;
-	qp_attr.recv_cq = newxprt->sc_rq_cq;
-	dprintk("svcrdma: newxprt->sc_cm_id=%p, newxprt->sc_pd=%p\n"
-		"    cm_id->device=%p, sc_pd->device=%p\n"
-		"    cap.max_send_wr = %d\n"
-		"    cap.max_recv_wr = %d\n"
-		"    cap.max_send_sge = %d\n"
-		"    cap.max_recv_sge = %d\n",
-		newxprt->sc_cm_id, newxprt->sc_pd,
-		newxprt->sc_cm_id->device, newxprt->sc_pd->device,
-		qp_attr.cap.max_send_wr,
-		qp_attr.cap.max_recv_wr,
-		qp_attr.cap.max_send_sge,
-		qp_attr.cap.max_recv_sge);
-
-	ret = rdma_create_qp(newxprt->sc_cm_id, newxprt->sc_pd, &qp_attr);
-	if (ret) {
-		dprintk("svcrdma: failed to create QP, ret=%d\n", ret);
-		goto errout;
-	}
-	newxprt->sc_qp = newxprt->sc_cm_id->qp;
-
-	/*
-	 * Use the most secure set of MR resources based on the
-	 * transport type and available memory management features in
-	 * the device. Here's the table implemented below:
-	 *
-	 *		Fast	Global	DMA	Remote WR
-	 *		Reg	LKEY	MR	Access
-	 *		Sup'd	Sup'd	Needed	Needed
-	 *
-	 * IWARP	N	N	Y	Y
-	 *		N	Y	Y	Y
-	 *		Y	N	Y	N
-	 *		Y	Y	N	-
-	 *
-	 * IB		N	N	Y	N
-	 *		N	Y	N	-
-	 *		Y	N	Y	N
-	 *		Y	Y	N	-
-	 *
-	 * NB:	iWARP requires remote write access for the data sink
-	 *	of an RDMA_READ. IB does not.
-	 */
-	newxprt->sc_reader = rdma_read_chunk_lcl;
-	if (devattr.device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS) {
-		newxprt->sc_frmr_pg_list_len =
-			devattr.max_fast_reg_page_list_len;
-		newxprt->sc_dev_caps |= SVCRDMA_DEVCAP_FAST_REG;
-		newxprt->sc_reader = rdma_read_chunk_frmr;
-	}
-
-	/*
-	 * Determine if a DMA MR is required and if so, what privs are required
-	 */
-	if (!rdma_protocol_iwarp(newxprt->sc_cm_id->device,
-				 newxprt->sc_cm_id->port_num) &&
-	    !rdma_ib_or_roce(newxprt->sc_cm_id->device,
-			     newxprt->sc_cm_id->port_num))
-		goto errout;
-
-	if (!(newxprt->sc_dev_caps & SVCRDMA_DEVCAP_FAST_REG) ||
-	    !(devattr.device_cap_flags & IB_DEVICE_LOCAL_DMA_LKEY)) {
-		need_dma_mr = 1;
-		dma_mr_acc = IB_ACCESS_LOCAL_WRITE;
-		if (rdma_protocol_iwarp(newxprt->sc_cm_id->device,
-					newxprt->sc_cm_id->port_num) &&
-		    !(newxprt->sc_dev_caps & SVCRDMA_DEVCAP_FAST_REG))
-			dma_mr_acc |= IB_ACCESS_REMOTE_WRITE;
-	}
-
-	if (rdma_protocol_iwarp(newxprt->sc_cm_id->device,
-				newxprt->sc_cm_id->port_num))
-		newxprt->sc_dev_caps |= SVCRDMA_DEVCAP_READ_W_INV;
-
-	/* Create the DMA MR if needed, otherwise, use the DMA LKEY */
-	if (need_dma_mr) {
-		/* Register all of physical memory */
-		newxprt->sc_phys_mr =
-			ib_get_dma_mr(newxprt->sc_pd, dma_mr_acc);
-		if (IS_ERR(newxprt->sc_phys_mr)) {
-			dprintk("svcrdma: Failed to create DMA MR ret=%d\n",
-				ret);
-			goto errout;
-		}
-		newxprt->sc_dma_lkey = newxprt->sc_phys_mr->lkey;
-	} else
-		newxprt->sc_dma_lkey =
-			newxprt->sc_cm_id->device->local_dma_lkey;
-
-	/* Post receive buffers */
-	for (i = 0; i < newxprt->sc_max_requests; i++) {
-		ret = svc_rdma_post_recv(newxprt);
-		if (ret) {
-			dprintk("svcrdma: failure posting receive buffers\n");
-			goto errout;
-		}
-	}
-
-	/* Swap out the handler */
-	newxprt->sc_cm_id->event_handler = rdma_cma_handler;
-
-	/*
-	 * Arm the CQs for the SQ and RQ before accepting so we can't
-	 * miss the first message
-	 */
-	ib_req_notify_cq(newxprt->sc_sq_cq, IB_CQ_NEXT_COMP);
-	ib_req_notify_cq(newxprt->sc_rq_cq, IB_CQ_NEXT_COMP);
-
-	/* Accept Connection */
-	set_bit(RDMAXPRT_CONN_PENDING, &newxprt->sc_flags);
-	memset(&conn_param, 0, sizeof conn_param);
-	conn_param.responder_resources = 0;
-	conn_param.initiator_depth = newxprt->sc_ord;
-	ret = rdma_accept(newxprt->sc_cm_id, &conn_param);
-	if (ret) {
-		dprintk("svcrdma: failed to accept new connection, ret=%d\n",
-		       ret);
-		goto errout;
-	}
-
-	dprintk("svcrdma: new connection %p accepted with the following "
-		"attributes:\n"
-		"    local_ip        : %pI4\n"
-		"    local_port	     : %d\n"
-		"    remote_ip       : %pI4\n"
-		"    remote_port     : %d\n"
-		"    max_sge         : %d\n"
-		"    max_sge_rd      : %d\n"
-		"    sq_depth        : %d\n"
-		"    max_requests    : %d\n"
-		"    ord             : %d\n",
-		newxprt,
-		&((struct sockaddr_in *)&newxprt->sc_cm_id->
-			 route.addr.src_addr)->sin_addr.s_addr,
-		ntohs(((struct sockaddr_in *)&newxprt->sc_cm_id->
-		       route.addr.src_addr)->sin_port),
-		&((struct sockaddr_in *)&newxprt->sc_cm_id->
-			 route.addr.dst_addr)->sin_addr.s_addr,
-		ntohs(((struct sockaddr_in *)&newxprt->sc_cm_id->
-		       route.addr.dst_addr)->sin_port),
-		newxprt->sc_max_sge,
-		newxprt->sc_max_sge_rd,
-		newxprt->sc_sq_depth,
-		newxprt->sc_max_requests,
-		newxprt->sc_ord);
-
-	return &newxprt->sc_xprt;
-
- errout:
-	dprintk("svcrdma: failure accepting new connection rc=%d.\n", ret);
-	/* Take a reference in case the DTO handler runs */
-	svc_xprt_get(&newxprt->sc_xprt);
-	if (newxprt->sc_qp && !IS_ERR(newxprt->sc_qp))
-		ib_destroy_qp(newxprt->sc_qp);
-	rdma_destroy_id(newxprt->sc_cm_id);
-	/* This call to put will destroy the transport */
-	svc_xprt_put(&newxprt->sc_xprt);
-	return NULL;
-}
-
-static void svc_rdma_release_rqst(struct svc_rqst *rqstp)
-{
-}
-
-/*
- * When connected, an svc_xprt has at least two references:
- *
- * - A reference held by the cm_id between the ESTABLISHED and
- *   DISCONNECTED events. If the remote peer disconnected first, this
- *   reference could be gone.
- *
- * - A reference held by the svc_recv code that called this function
- *   as part of close processing.
- *
- * At a minimum one references should still be held.
- */
-static void svc_rdma_detach(struct svc_xprt *xprt)
-{
-	struct svcxprt_rdma *rdma =
-		container_of(xprt, struct svcxprt_rdma, sc_xprt);
-	dprintk("svc: svc_rdma_detach(%p)\n", xprt);
-
-	/* Disconnect and flush posted WQE */
-	rdma_disconnect(rdma->sc_cm_id);
-}
-
-static void __svc_rdma_free(struct work_struct *work)
-{
-	struct svcxprt_rdma *rdma =
-		container_of(work, struct svcxprt_rdma, sc_work);
-	dprintk("svcrdma: svc_rdma_free(%p)\n", rdma);
-
-	/* We should only be called from kref_put */
-	if (atomic_read(&rdma->sc_xprt.xpt_ref.refcount) != 0)
-		pr_err("svcrdma: sc_xprt still in use? (%d)\n",
-		       atomic_read(&rdma->sc_xprt.xpt_ref.refcount));
-
-	/*
-	 * Destroy queued, but not processed read completions. Note
-	 * that this cleanup has to be done before destroying the
-	 * cm_id because the device ptr is needed to unmap the dma in
-	 * svc_rdma_put_context.
-	 */
-	while (!list_empty(&rdma->sc_read_complete_q)) {
-		struct svc_rdma_op_ctxt *ctxt;
-		ctxt = list_entry(rdma->sc_read_complete_q.next,
-				  struct svc_rdma_op_ctxt,
-				  dto_q);
-		list_del_init(&ctxt->dto_q);
-		svc_rdma_put_context(ctxt, 1);
-	}
-
-	/* Destroy queued, but not processed recv completions */
-	while (!list_empty(&rdma->sc_rq_dto_q)) {
-		struct svc_rdma_op_ctxt *ctxt;
-		ctxt = list_entry(rdma->sc_rq_dto_q.next,
-				  struct svc_rdma_op_ctxt,
-				  dto_q);
-		list_del_init(&ctxt->dto_q);
-		svc_rdma_put_context(ctxt, 1);
-	}
-
-	/* Warn if we leaked a resource or under-referenced */
-	if (atomic_read(&rdma->sc_ctxt_used) != 0)
-		pr_err("svcrdma: ctxt still in use? (%d)\n",
-		       atomic_read(&rdma->sc_ctxt_used));
-	if (atomic_read(&rdma->sc_dma_used) != 0)
-		pr_err("svcrdma: dma still in use? (%d)\n",
-		       atomic_read(&rdma->sc_dma_used));
-
-	/* De-allocate fastreg mr */
-	rdma_dealloc_frmr_q(rdma);
-
-	/* Destroy the QP if present (not a listener) */
-	if (rdma->sc_qp && !IS_ERR(rdma->sc_qp))
-		ib_destroy_qp(rdma->sc_qp);
-
-	if (rdma->sc_sq_cq && !IS_ERR(rdma->sc_sq_cq))
-		ib_destroy_cq(rdma->sc_sq_cq);
-
-	if (rdma->sc_rq_cq && !IS_ERR(rdma->sc_rq_cq))
-		ib_destroy_cq(rdma->sc_rq_cq);
-
-	if (rdma->sc_phys_mr && !IS_ERR(rdma->sc_phys_mr))
-		ib_dereg_mr(rdma->sc_phys_mr);
-
-	if (rdma->sc_pd && !IS_ERR(rdma->sc_pd))
-		ib_dealloc_pd(rdma->sc_pd);
-
-	/* Destroy the CM ID */
-	rdma_destroy_id(rdma->sc_cm_id);
-
-	kfree(rdma);
-}
-
-static void svc_rdma_free(struct svc_xprt *xprt)
-{
-	struct svcxprt_rdma *rdma =
-		container_of(xprt, struct svcxprt_rdma, sc_xprt);
-	INIT_WORK(&rdma->sc_work, __svc_rdma_free);
-	queue_work(svc_rdma_wq, &rdma->sc_work);
-}
-
-static int svc_rdma_has_wspace(struct svc_xprt *xprt)
-{
-	struct svcxprt_rdma *rdma =
-		container_of(xprt, struct svcxprt_rdma, sc_xprt);
-
-	/*
-	 * If there are already waiters on the SQ,
-	 * return false.
-	 */
-	if (waitqueue_active(&rdma->sc_send_wait))
-		return 0;
-
-	/* Otherwise return true. */
-	return 1;
-}
-
-static int svc_rdma_secure_port(struct svc_rqst *rqstp)
-{
-	return 1;
-}
-
-int svc_rdma_send(struct svcxprt_rdma *xprt, struct ib_send_wr *wr)
-{
-	struct ib_send_wr *bad_wr, *n_wr;
-	int wr_count;
-	int i;
-	int ret;
-
-	if (test_bit(XPT_CLOSE, &xprt->sc_xprt.xpt_flags))
-		return -ENOTCONN;
-
-	wr_count = 1;
-	for (n_wr = wr->next; n_wr; n_wr = n_wr->next)
-		wr_count++;
-
-	/* If the SQ is full, wait until an SQ entry is available */
-	while (1) {
-		spin_lock_bh(&xprt->sc_lock);
-		if (xprt->sc_sq_depth < atomic_read(&xprt->sc_sq_count) + wr_count) {
-			spin_unlock_bh(&xprt->sc_lock);
-			atomic_inc(&rdma_stat_sq_starve);
-
-			/* See if we can opportunistically reap SQ WR to make room */
-			sq_cq_reap(xprt);
-
-			/* Wait until SQ WR available if SQ still full */
-			wait_event(xprt->sc_send_wait,
-				   atomic_read(&xprt->sc_sq_count) <
-				   xprt->sc_sq_depth);
-			if (test_bit(XPT_CLOSE, &xprt->sc_xprt.xpt_flags))
-				return -ENOTCONN;
-			continue;
-		}
-		/* Take a transport ref for each WR posted */
-		for (i = 0; i < wr_count; i++)
-			svc_xprt_get(&xprt->sc_xprt);
-
-		/* Bump used SQ WR count and post */
-		atomic_add(wr_count, &xprt->sc_sq_count);
-		ret = ib_post_send(xprt->sc_qp, wr, &bad_wr);
-		if (ret) {
-			set_bit(XPT_CLOSE, &xprt->sc_xprt.xpt_flags);
-			atomic_sub(wr_count, &xprt->sc_sq_count);
-			for (i = 0; i < wr_count; i ++)
-				svc_xprt_put(&xprt->sc_xprt);
-			dprintk("svcrdma: failed to post SQ WR rc=%d, "
-			       "sc_sq_count=%d, sc_sq_depth=%d\n",
-			       ret, atomic_read(&xprt->sc_sq_count),
-			       xprt->sc_sq_depth);
-		}
-		spin_unlock_bh(&xprt->sc_lock);
-		if (ret)
-			wake_up(&xprt->sc_send_wait);
-		break;
-	}
-	return ret;
-}
-
-void svc_rdma_send_error(struct svcxprt_rdma *xprt, struct rpcrdma_msg *rmsgp,
-			 enum rpcrdma_errcode err)
-{
-	struct ib_send_wr err_wr;
-	struct page *p;
-	struct svc_rdma_op_ctxt *ctxt;
-	__be32 *va;
-	int length;
-	int ret;
-
-	p = alloc_page(GFP_KERNEL | __GFP_NOFAIL);
-	va = page_address(p);
-
-	/* XDR encode error */
-	length = svc_rdma_xdr_encode_error(xprt, rmsgp, err, va);
-
-	ctxt = svc_rdma_get_context(xprt);
-	ctxt->direction = DMA_FROM_DEVICE;
-	ctxt->count = 1;
-	ctxt->pages[0] = p;
-
-	/* Prepare SGE for local address */
-	ctxt->sge[0].addr = ib_dma_map_page(xprt->sc_cm_id->device,
-					    p, 0, length, DMA_FROM_DEVICE);
-	if (ib_dma_mapping_error(xprt->sc_cm_id->device, ctxt->sge[0].addr)) {
-		put_page(p);
-		svc_rdma_put_context(ctxt, 1);
-		return;
-	}
-	atomic_inc(&xprt->sc_dma_used);
-	ctxt->sge[0].lkey = xprt->sc_dma_lkey;
-	ctxt->sge[0].length = length;
-
-	/* Prepare SEND WR */
-	memset(&err_wr, 0, sizeof err_wr);
-	ctxt->wr_op = IB_WR_SEND;
-	err_wr.wr_id = (unsigned long)ctxt;
-	err_wr.sg_list = ctxt->sge;
-	err_wr.num_sge = 1;
-	err_wr.opcode = IB_WR_SEND;
-	err_wr.send_flags = IB_SEND_SIGNALED;
-
-	/* Post It */
-	ret = svc_rdma_send(xprt, &err_wr);
-	if (ret) {
-		dprintk("svcrdma: Error %d posting send for protocol error\n",
-			ret);
-		svc_rdma_unmap_dma(ctxt);
-		svc_rdma_put_context(ctxt, 1);
-	}
-}
+649ÄCOMPONENT-648ÄCOMPONENT-647ÄCOMPONENT-646ÄCOMPONENT-645ÄCOMPONENT-644ÄCOMPONENT-643ÄCOMPONENT-642ÄCOMPONENT-641ÄCOMPONENT-640ÄCOMPONENT-639ÄCOMPONENT-638ÄCOMPONENT-637ÄCOMPONENT-636ÄCOMPONENT-635ÄCOMPONENT-634ÄCOMPONENT-633ÄCOMPONENT-632ÄCOMPONENT-631ÄCOMPONENT-630ÄCOMPONENT-629ÄCOMPONENT-628ÄCOMPONENT-627ÄCOMPONENT-626ÄCOMPONENT-625ÄCOMPONENT-624ÄCOMPONENT-623ÄCOMPONENT-622ÄCOMPONENT-621ÄCOMPONENT-620ÄCOMPONENT-619ÄCOMPONENT-618ÄCOMPONENT-617ÄCOMPONENT-616ÄCOMPONENT-615ÄCOMPONENT-614ÄCOMPONENT-613ÄCOMPONENT-612ÄCOMPONENT-611ÄCOMPONENT-610ÄCOMPONENT-609ÄCOMPONENT-608ÄCOMPONENT-607ÄCOMPONENT-606ÄCOMPONENT-605ÄCOMPONENT-604ÄCOMPONENT-603ÄCOMPONENT-602ÄCOMPONENT-601ÄCOMPONENT-600ÄCOMPONENT-599ÄCOMPONENT-598ÄCOMPONENT-597ÄCOMPONENT-596ÄCOMPONENT-595ÄCOMPONENT-594ÄCOMPONENT-593ÄCOMPONENT-592ÄCOMPONENT-591ÄCOMPONENT-590ÄCOMPONENT-589ÄCOMPONENT-588ÄCOMPONENT-587ÄCOMPONENT-586ÄCOMPONENT-585ÄCOMPONENT-584ÄCOMPONENT-583ÄCOMPONENT-582ÄCOMPONENT-581ÄCOMPONENT-580ÄCOMPONENT-579ÄCOMPONENT-578ÄCOMPONENT-577ÄCOMPONENT-576ÄCOMPONENT-575ÄCOMPONENT-574ÄCOMPONENT-573ÄCOMPONENT-572ÄCOMPONENT-571ÄCOMPONENT-570ÄCOMPONENT-569ÄCOMPONENT-568ÄCOMPONENT-567ÄCOMPONENT-566ÄCOMPONENT-565ÄCOMPONENT-564ÄCOMPONENT-563ÄCOMPONENT-562ÄCOMPONENT-561ÄCOMPONENT-560ÄCOMPONENT-559ÄCOMPONENT-558ÄCOMPONENT-557ÄCOMPONENT-556ÄCOMPONENT-555ÄCOMPONENT-554ÄCOMPONENT-553ÄCOMPONENT-552ÄCOMPONENT-551ÄCOMPONENT-550ÄCOMPONENT-549ÄCOMPONENT-548ÄCOMPONENT-547ÄCOMPONENT-546ÄCOMPONENT-545ÄCOMPONENT-544ÄCOMPONENT-543ÄCOMPONENT-542ÄCOMPONENT-541ÄCOMPONENT-540ÄCOMPONENT-539ÄCOMPONENT-538ÄCOMPONENT-537ÄCOMPONENT-536ÄCOMPONENT-535ÄCOMPONENT-534ÄCOMPONENT-533ÄCOMPONENT-532ÄCOMPONENT-531ÄCOMPONENT-530ÄCOMPONENT-529ÄCOMPONENT-528ÄCOMPONENT-527ÄCOMPONENT-526ÄCOMPONENT-525ÄCOMPONENT-524ÄCOMPONENT-523ÄCOMPONENT-522ÄCOMPONENT-521ÄCOMPONENT-520ÄCOMPONENT-519ÄCOMPONENT-518ÄCOMPONENT-517ÄCOMPONENT-516ÄCOMPONENT-515ÄCOMPONENT-514ÄCOMPONENT-513ÄCOMPONENT-512ÄCOMPONENT-511ÄCOMPONENT-510ÄCOMPONENT-509ÄCOMPONENT-508ÄCOMPONENT-507ÄCOMPONENT-506ÄCOMPONENT-505ÄCOMPONENT-504ÄCOMPONENT-503ÄCOMPONENT-502ÄCOMPONENT-501ÄCOMPONENT-500ÄCOMPONENT-499ÄCOMPONENT-498ÄCOMPONENT-497ÄCOMPONENT-496ÄCOMPONENT-495ÄCOMPONENT-494ÄCOMPONENT-493ÄCOMPONENT-492ÄCOMPONENT-491ÄCOMPONENT-490ÄCOMPONENT-489ÄCOMPONENT-488ÄCOMPONENT-487ÄCOMPONENT-486ÄCOMPONENT-485ÄCOMPONENT-484ÄCOMPONENT-483ÄCOMPONENT-482ÄCOMPONENT-481ÄCOMPONENT-480ÄCOMPONENT-479ÄCOMPONENT-478ÄCOMPONENT-477ÄCOMPONENT-476ÄCOMPONENT-475ÄCOMPONENT-474ÄCOMPONENT-473ÄCOMPONENT-472ÄCOMPONENT-471ÄCOMPONENT-470ÄCOMPONENT-469ÄCOMPONENT-468ÄCOMPONENT-467ÄCOMPONENT-466ÄCOMPONENT-465ÄCOMPONENT-464ÄCOMPONENT-463ÄCOMPONENT-462ÄCOMPONENT-461ÄCOMPONENT-460ÄCOMPONENT-459ÄCOMPONENT-458ÄCOMPONENT-457ÄCOMPONENT-456ÄCOMPONENT-455ÄCOMPONENT-454ÄCOMPONENT-453ÄCOMPONENT-452ÄCOMPONENT-451ÄCOMPONENT-450ÄCOMPONENT-449ÄCOMPONENT-448ÄCOMPONENT-447ÄCOMPONENT-446ÄCOMPONENT-445ÄCOMPONENT-444ÄCOMPONENT-443ÄCOMPONENT-442ÄCOMPONENT-441ÄCOMPONENT-440ÄCOMPONENT-439ÄCOMPONENT-438ÄCOMPONENT-437ÄCOMPONENT-436ÄCOMPONENT-435ÄCOMPONENT-434ÄCOMPONENT-433ÄCOMPONENT-432ÄCOMPONENT-431ÄCOMPONENT-430ÄCOMPONENT-429ÄCOMPONENT-428ÄCOMPONENT-427ÄCOMPONENT-426ÄCOMPONENT-425ÄCOMPONENT-424ÄCOMPONENT-423ÄCOMPONENT-422ÄCOMPONENT-421ÄCOMPONENT-420ÄCOMPONENT-419ÄCOMPONENT-418ÄCOMPONENT-417ÄCOMPONENT-416ÄCOMPONENT-415ÄCOMPONENT-414ÄCOMPONENT-413ÄCOMPONENT-412ÄCOMPONENT-411ÄCOMPONENT-410ÄCOMPONENT-409ÄCOMPONENT-408ÄCOMPONENT-407ÄCOMPONENT-406ÄCOMPONENT-405ÄCOMPONENT-404ÄCOMPONENT-403ÄCOMPONENT-402ÄCOMPONENT-401ÄCOMPONENT-400ÄCOMPONENT-399ÄCOMPONENT-398ÄCOMPONENT-397ÄCOMPONENT-396ÄCOMPONENT-395ÄCOMPONENT-394ÄCOMPONENT-393ÄCOMPONENT-392ÄCOMPONENT-391ÄCOMPONENT-390ÄCOMPONENT-389ÄCOMPONENT-388ÄCOMPONENT-387ÄCOMPONENT-386ÄCOMPONENT-385ÄCOMPONENT-384ÄCOMPONENT-383ÄCOMPONENT-382ÄCOMPONENT-381ÄCOMPONENT-380ÄCOMPONENT-379ÄCOMPONENT-378ÄCOMPONENT-377ÄCOMPONENT-376ÄCOMPONENT-375ÄCOMPONENT-374ÄCOMPONENT-373ÄCOMPONENT-372ÄCOMPONENT-371ÄCOMPONENT-370ÄCOMPONENT-369ÄCOMPONENT-368ÄCOMPONENT-367ÄCOMPONENT-366ÄCOMPONENT-365ÄCOMPONENT-364ÄCOMPONENT-363ÄCOMPONENT-362ÄCOMPONENT-361ÄCOMPONENT-360ÄCOMPONENT-359ÄCOMPONENT-358ÄCOMPONENT-357ÄCOMPONENT-356ÄCOMPONENT-355ÄCOMPONENT-354ÄCOMPONENT-353ÄCOMPONENT-352ÄCOMPONENT-351ÄCOMPONENT-350ÄCOMPONENT-349ÄCOMPONENT-348ÄCOMPONENT-347ÄCOMPONENT-346ÄCOMPONENT-345ÄCOMPONENT-344ÄCOMPONENT-343ÄCOMPONENT-342ÄCOMPONENT-341ÄCOMPONENT-340ÄCOMPONENT-339ÄCOMPONENT-338ÄCOMPONENT-337ÄCOMPONENT-336ÄCOMPONENT-335ÄCOMPONENT-334ÄCOMPONENT-333ÄCOMPONENT-332ÄCOMPONENT-331ÄCOMPONENT-330ÄCOMPONENT-329ÄCOMPONENT-328ÄCOMPONENT-327ÄCOMPONENT-326ÄCOMPONENT-325ÄCOMPONENT-324ÄCOMPONENT-323ÄCOMPONENT-322ÄCOMPONENT-321ÄCOMPONENT-320ÄCOMPONENT-319ÄCOMPONENT-318ÄCOMPONENT-317ÄCOMPONENT-316ÄCOMPONENT-315ÄCOMPONENT-314ÄCOMPONENT-313ÄCOMPONENT-312ÄCOMPONENT-311ÄCOMPONENT-310ÄCOMPONENT-309ÄCOMPONENT-308ÄCOMPONENT-307ÄCOMPONENT-306ÄCOMPONENT-305ÄCOMPONENT-304ÄCOMPONENT-303ÄCOMPONENT-302ÄCOMPONENT-301ÄCOMPONENT-300ÄCOMPONENT-299ÄCOMPONENT-298ÄCOMPONENT-297ÄCOMPONENT-296ÄCOMPONENT-295ÄCOMPONENT-294ÄCOMPONENT-293ÄCOMPONENT-292ÄCOMPONENT-291ÄCOMPONENT-290ÄCOMPONENT-289ÄCOMPONENT-288ÄCOMPONENT-287ÄCOMPONENT-286ÄCOMPONENT-285ÄCOMPONENT-284ÄCOMPONENT-283ÄCOMPONENT-282ÄCOMPONENT-281ÄCOMPONENT-280ÄCOMPONENT-279ÄCOMPONENT-278ÄCOMPONENT-277ÄCOMPONENT-276ÄCOMPONENT-275ÄCOMPONENT-274ÄCOMPONENT-273ÄCOMPONENT-272ÄCOMPONENT-271ÄCOMPONENT-270ÄCOMPONENT-269ÄCOMPONENT-268ÄCOMPONENT-267ÄCOMPONENT-266ÄCOMPONENT-265ÄCOMPONENT-264ÄCOMPONENT-263ÄCOMPONENT-262ÄCOMPONENT-261ÄCOMPONENT-260ÄCOMPONENT-259ÄCOMPONENT-258ÄCOMPONENT-257ÄCOMPONENT-256ÄCOMPONENT-255ÄCOMPONENT-254ÄCOMPONENT-253ÄCOMPONENT-252ÄCOMPONENT-251ÄCOMPONENT-250ÄCOMPONENT-249ÄCOMPONENT-248ÄCOMPONENT-247ÄCOMPONENT-246ÄCOMPONENT-245ÄCOMPONENT-244ÄCOMPONENT-243ÄCOMPONENT-242ÄCOMPONENT-241ÄCOMPONENT-240ÄCOMPONENT-239ÄCOMPONENT-238ÄCOMPONENT-237ÄCOMPONENT-236ÄCOMPONENT-235ÄCOMPONENT-234ÄCOMPONENT-233ÄCOMPONENT-232ÄCOMPONENT-231ÄCOMPONENT-230ÄCOMPONENT-229ÄCOMPONENT-228ÄCOMPONENT-227ÄCOMPONENT-226ÄCOMPONENT-225ÄCOMPONENT-224ÄCOMPONENT-223ÄCOMPONENT-222ÄCOMPONENT-221ÄCOMPONENT-220ÄCOMPONENT-219ÄCOMPONENT-218ÄCOMPONENT-217ÄCOMPONENT-216ÄCOMPONENT-215ÄCOMPONENT-214ÄCOMPONENT-213ÄCOMPONENT-212ÄCOMPONENT-211ÄCOMPONENT-210ÄCOMPONENT-209ÄCOMPONENT-208ÄCOMPONENT-207ÄCOMPONENT-206ÄCOMPONENT-205ÄCOMPONENT-204ÄCOMPONENT-203ÄCOMPONENT-202ÄCOMPONENT-201ÄCOMPONENT-200ÄCOMPONENT-199ÄCOMPONENT-198ÄCOMPONENT-197ÄCOMPONENT-196ÄCOMPONENT-195ÄCOMPONENT-194ÄCOMPONENT-193ÄCOMPONENT-192ÄCOMPONENT-191ÄCOMPONENT-190ÄCOMPONENT-189ÄCOMPONENT-188ÄCOMPONENT-187ÄCOMPONENT-186ÄCOMPONENT-185ÄCOMPONENT-184ÄCOMPONENT-183ÄCOMPONENT-182ÄCOMPONENT-181ÄCOMPONENT-180ÄCOMPONENT-179ÄCOMPONENT-178ÄCOMPONENT-177ÄCOMPONENT-176ÄCOMPONENT-175ÄCOMPONENT-174ÄCOMPONENT-173ÄCOMPONENT-172ÄCOMPONENT-171ÄCOMPONENT-170ÄCOMPONENT-169ÄCOMPONENT-168ÄCOMPONENT-167ÄCOMPONENT-166ÄCOMPONENT-165ÄCOMPONENT-164ÄCOMPONENT-163ÄCOMPONENT-162ÄCOMPONENT-161ÄCOMPONENT-160ÄCOMPONENT-159ÄCOMPONENT-158ÄCOMPONENT-157ÄCOMPONENT-156ÄCOMPONENT-155ÄCOMPONENT-154ÄCOMPONENT-153ÄCOMPONENT-152ÄCOMPONENT-151ÄCOMPONENT-150ÄCOMPONENT-149ÄCOMPONENT-148ÄCOMPONENT-147ÄCOMPONENT-146ÄCOMPONENT-145ÄCOMPONENT-144ÄCOMPONENT-143ÄCOMPONENT-142ÄCOMPONENT-141ÄCOMPONENT-140ÄCOMPONENT-139ÄCOMPONENT-138ÄCOMPONENT-137ÄCOMPONENT-136ÄCOMPONENT-135ÄCOMPONENT-134ÄCOMPONENT-133ÄCOMPONENT-132ÄCOMPONENT-131ÄCOMPONENT-130ÄCOMPONENT-129ÄCOMPONENT-128ÄCOMPONENT-127ÄCOMPONENT-126ÄCOMPONENT-125ÄCOMPONENT-124ÄCOMPONENT-123ÄCOMPONENT-122ÄCOMPONENT-121ÄCOMPONENT-120ÄCOMPONENT-119ÄCOMPONENT-118ÄCOMPONENT-117ÄCOMPONENT-116ÄCOMPONENT-115ÄCOMPONENT-114ÄCOMPONENT-113ÄCOMPONENT-112ÄCOMPONENT-111ÄCOMPONENT-110ÄCOMPONENT-109ÄCOMPONENT-108ÄCOMPONENT-107ÄCOMPONENT-106ÄCOMPONENT-105ÄCOMPONENT-104ÄCOMPONENT-103ÄCOMPONENT-102ÄCOMPONENT-101ÄCOMPONENT-100ÄCOMPONENT-099ÄCOMPONENT-098ÄCOMPONENT-097ÄCOMPONENT-096ÄCOMPONENT-095ÄCOMPONENT-094ÄCOMPONENT-093ÄCOMPONENT-092ÄCOMPONENT-091ÄCOMPONENT-090ÄCOMPONENT-089ÄCOMPONENT-088ÄCOMPONENT-087ÄCOMPONENT-086ÄCOMPONENT-085ÄCOMPONENT-084ÄCOMPONENT-083ÄCOMPONENT-082ÄCOMPONENT-081ÄCOMPONENT-080ÄCOMPONENT-079ÄCOMPONENT-078ÄCOMPONENT-077ÄCOMPONENT-076ÄCOMPONENT-075ÄCOMPONENT-074ÄCOMPONENT-073ÄCOMPONENT-072ÄCOMPONENT-071ÄCOMPONENT-070ÄCOMPONENT-069ÄCOMPONENT-068ÄCOMPONENT-067ÄCOMPONENT-066ÄCOMPONENT-065ÄCOMPONENT-064ÄCOMPONENT-063ÄCOMPONENT-062ÄCOMPONENT-061ÄCOMPONENT-060ÄCOMPONENT-059ÄCOMPONENT-058ÄCOMPONENT-057ÄCOMPONENT-056ÄCOMPONENT-055ÄCOMPONENT-054ÄCOMPONENT-053ÄCOMPONENT-052ÄCOMPONENT-051ÄCOMPONENT-050ÄCOMPONENT-049ÄCOMPONENT-048ÄCOMPONENT-047ÄCOMPONENT-046ÄCOMPONENT-045ÄCOMPONENT-044ÄCOMPONENT-043ÄCOMPONENT-042ÄCOMPONENT-041ÄCOMPONENT-040ÄCOMPONENT-039ÄCOMPONENT-038ÄCOMPONENT-037ÄCOMPONENT-036ÄCOMPONENT-035ÄCOMPONENT-034ÄCOMPONENT-033ÄCOMPONENT-032ÄCOMPONENT-031ÄCOMPONENT-030ÄCOMPONENT-029ÄCOMPONENT-028ÄCOMPONENT-027ÄCOMPONENT-026ÄCOMPONENT-025ÄCOMPONENT-024ÄCOMPONENT-023ÄCOMPONENT-022ÄCOMPONENT-021ÄCOMPONENT-020ÄCOMPONENT-019ÄCOMPONENT-018ÄCOMPONENT-017ÄCOMPONENT-016ÄCOMPONENT-015ÄCOMPONENT-014ÄCOMPONENT-013ÄCOMPONENT-012ÄCOMPONENT-011ÄCOMPONENT-010ÄCOMPONENT-009ÄCOMPONENT-008ÄCOMPONENT-007ÄCOMPONENT-006ÄCOMPONENT-005ÄCOMPONENT-004ÄCOMPONENT-003ÄCOMPONENT-002ÄCOMPONENT-001ÄCOMPONEN‘COMPLIANCEÄCOMPLETIONÄCOMPLETEDÄCOMPLEMENTÄCOMPASSÄCOMPAREÄCOMMOŒCOMMERCIAÃCOMMANDÄCOMMAÄCOMM¡COMETÄCOMBINEDÄCOMBINATIONÄCOMBÄCOLUMNÄCOLORÄCOLLISIOŒCOLLÄCOLƒCOINÄCOFFINÄCOENGÄCOEN«CODAÄCOCONUTÄCOCKTAIÃCOCKROACHÄCOATÄCOASTERÄCOAÄCMÄCÕCLUSTER-INITIAÃCLUSTER-FINAÃCLUSTE“CLUBSÄCLUB-SPOKEƒCLUBÄCLU¬CLOWŒCLOVERÄCLOUDÄCLOUƒCLOTHESÄCLOTHÄCLOSETÄCLOSENESSÄCLOSEDÄCLOS≈CLOCKWIS≈CLOCÀCLIVISÄCLIPBOARDÄCLINKIN«CLINGIN«CLIMBINGÄCLIMACUSÄCLIFFÄCLICKÄCLEF-2ÄCLEF-1ÄCLEFÄCLE∆CLEAVERÄCLEA“CLASSICAÃCLAPPIN«CLAPPE“CLANÄCLAŒCLAMSHELÃCLAIMÄCLÄCIXÄCIVILIANÄCITYSCAPEÄCITYSCAP≈CIT…CITATIOŒCITÄCIRCU”CIRCUMFLEXÄCIRCUMFLEÿCIRCULATIOŒCIRCLINGÄCIRCLIN«CIRCLESÄCIRCLE”CIRCLEDÄCIPÄCINNABARÄCINEMAÄCIŒCIMÄCIÕCIIÄCIEXÄCIEUC-SSANGPIEUPÄCIEUC-PIEUPÄCIEUC-IEUNGÄCIEU√CIETÄCIEPÄCIEÄCHYXÄCHYTÄCHYRXÄCHYRÄCHYPÄCHWVÄCHUXÄCHURXÄCHURCHÄCHURÄCHUPÄCHUOXÄCHUOTÄCHUOPÄCHUOÄCHULAÄCHUÄCHRYSANTHEMUMÄCHRONOUÄCHRONONÄCHROM¡CHRO¡CHRIVIÄCHRISTMASÄCHRISTMA”CHOYÄCHOXÄCHOTÄCHOREVM¡CHORASMIAŒCHOPSTICKSÄCHOPÄCHOKEÄCHOEÄCHOCOLAT≈CHOAÄCHITUEUMSSANGSIOSÄCHITUEUMSSANGCIEUCÄCHITUEUMSIOSÄCHITUEUMCIEUCÄCHITUEUMCHIEUCHÄCHIRONÄCHIRETÄCHIPMUNKÄCHINOOÀCHINGÄCHINES≈CHINÄCHIMEÄCHIMÄCHILL’CHILDREŒCHILDÄCHILÄCHIK…CHIEUCH-KHIEUKHÄCHIEUCH-HIEUHÄCHIEUC»CHICKENÄCHICKÄCHIÄCH…CHHIMÄCHHAÄCHEXÄCHEVRONÄCHEVROŒCHETÄCHESTNUTÄCHESTÄCHES”CHERYÄCHERRŸCHERRIESÄCHEQUEREƒCHEPÄCHEINAPÄCHEIKHEIÄCHEIKHANÄCHEES≈CHEERIN«CHEEMÄCHEEK”CHEEKÄCHEEÄCHECKE“CHECKÄCHECÀCH≈CHAXÄCHAVIYANIÄCHATTAWAÄCHATÄCHARTÄCHAR‘CHARIOTÄCHARIO‘CHARACTERSÄCHARACTER-1B2FBÄCHARACTER-1B2FAÄCHARACTER-1B2F9ÄCHARACTER-1B2F8ÄCHARACTER-1B2F7ÄCHARACTER-1B2F6ÄCHARACTER-1B2F5ÄCHARACTER-1B2F4ÄCHARACTER-1B2F3ÄCHARACTER-1B2F2ÄCHARACTER-1B2F1ÄCHARACTER-1B2F0ÄCHARACTER-1B2EFÄCHARACTER-1B2EEÄCHARACTER-1B2EDÄCHARACTER-1B2ECÄCHARACTER-1B2EBÄCHARACTER-1B2EAÄCHARACTER-1B2E9ÄCHARACTER-1B2E8ÄCHARACTER-1B2E7ÄCHARACTER-1B2E6ÄCHARACTER-1B2E5ÄCHARACTER-1B2E4ÄCHARACTER-1B2E3ÄCHARACTER-1B2E2ÄCHARACTER-1B2E1ÄCHARACTER-1B2E0ÄCHARACTER-1B2DFÄCHARACTER-1B2DEÄCHARACTER-1B2DDÄCHARACTER-1B2DCÄCHARACTER-1B2DBÄCHARACTER-1B2DAÄCHARACTER-1B2D9ÄCHARACTER-1B2D8ÄCHARACTER-1B2D7ÄCHARACTER-1B2D6ÄCHARACTER-1B2D5ÄCHARACTER-1B2D4ÄCHARACTER-1B2D3ÄCHARACTER-1B2D2ÄCHARACTER-1B2D1ÄCHARACTER-1B2D0ÄCHARACTER-1B2CFÄCHARACTER-1B2CEÄCHARACTER-1B2CDÄCHARACTER-1B2CCÄCHARACTER-1B2CBÄCHARACTER-1B2CAÄCHARACTER-1B2C9ÄCHARACTER-1B2C8ÄCHARACTER-1B2C7ÄCHARACTER-1B2C6ÄCHARACTER-1B2C5ÄCHARACTER-1B2C4ÄCHARACTER-1B2C3ÄCHARACTER-1B2C2ÄCHARACTER-1B2C1ÄCHARACTER-1B2C0ÄCHARACTER-1B2BFÄCHARACTER-1B2BEÄCHARACTER-1B2BDÄCHARACTER-1B2BCÄCHARACTER-1B2BBÄCHARACTER-1B2BAÄCHARACTER-1B2B9ÄCHARACTER-1B2B8ÄCHARACTER-1B2B7ÄCHARACTER-1B2B6ÄCHARACTER-1B2B5ÄCHARACTER-1B2B4ÄCHARACTER-1B2B3ÄCHARACTER-1B2B2ÄCHARACTER-1B2B1ÄCHARACTER-1B2B0ÄCHARACTER-1B2AFÄCHARACTER-1B2AEÄCHARACTER-1B2ADÄCHARACTER-1B2ACÄCHARACTER-1B2ABÄCHARACTER-1B2AAÄCHARACTER-1B2A9ÄCHARACTER-1B2A8ÄCHARACTER-1B2A7ÄCHARACTER-1B2A6ÄCHARACTER-1B2A5ÄCHARACTER-1B2A4ÄCHARACTER-1B2A3ÄCHARACTER-1B2A2ÄCHARACTER-1B2A1ÄCHARACTER-1B2A0ÄCHARACTER-1B29FÄCHARACTER-1B29EÄCHARACTER-1B29DÄCHARACTER-1B29CÄCHARACTER-1B29BÄCHARACTER-1B29AÄCHARACTER-1B299ÄCHARACTER-1B298ÄCHARACTER-1B297ÄCHARACTER-1B296ÄCHARACTER-1B295ÄCHARACTER-1B294ÄCHARACTER-1B293ÄCHARACTER-1B292ÄCHARACTER-1B291ÄCHARACTER-1B290ÄCHARACTER-1B28FÄCHARACTER-1B28EÄCHARACTER-1B28DÄCHARACTER-1B28CÄCHARACTER-1B28BÄCHARACTER-1B28AÄCHARACTER-1B289ÄCHARACTER-1B288ÄCHARACTER-1B287ÄCHARACTER-1B286ÄCHARACTER-1B285ÄCHARACTER-1B284ÄCHARACTER-1B283ÄCHARACTER-1B282ÄCHARACTER-1B281ÄCHARACTER-1B280ÄCHARACTER-1B27FÄCHARACTER-1B27EÄCHARACTER-1B27DÄCHARACTER-1B27CÄCHARACTER-1B27BÄCHARACTER-1B27AÄCHARACTER-1B279ÄCHARACTER-1B278ÄCHARACTER-1B277ÄCHARACTER-1B276ÄCHARACTER-1B275ÄCHARACTER-1B274ÄCHARACTER-1B273ÄCHARACTER-1B272ÄCHARACTER-1B271ÄCHARACTER-1B270ÄCHARACTER-1B26FÄCHARACTER-1B26EÄCHARACTER-1B26DÄCHARACTER-1B26CÄCHARACTER-1B26BÄCHARACTER-1B26AÄCHARACTER-1B269ÄCHARACTER-1B268ÄCHARACTER-1B267ÄCHARACTER-1B266ÄCHARACTER-1B265ÄCHARACTER-1B264ÄCHARACTER-1B263ÄCHARACTER-1B262ÄCHARACTER-1B261ÄCHARACTER-1B260ÄCHARACTER-1B25FÄCHARACTER-1B25EÄCHARACTER-1B25DÄCHARACTER-1B25CÄCHARACTER-1B25BÄCHARACTER-1B25AÄCHARACTER-1B259ÄCHARACTER-1B258ÄCHARACTER-1B257ÄCHARACTER-1B256ÄCHARACTER-1B255ÄCHARACTER-1B254ÄCHARACTER-1B253ÄCHARACTER-1B252ÄCHARACTER-1B251ÄCHARACTER-1B250ÄCHARACTER-1B24FÄCHARACTER-1B24EÄCHARACTER-1B24DÄCHARACTER-1B24CÄCHARACTER-1B24BÄCHARACTER-1B24AÄCHARACTER-1B249ÄCHARACTER-1B248ÄCHARACTER-1B247ÄCHARACTER-1B246ÄCHARACTER-1B245ÄCHARACTER-1B244ÄCHARACTER-1B243ÄCHARACTER-1B242ÄCHARACTER-1B241ÄCHARACTER-1B240ÄCHARACTER-1B23FÄCHARACTER-1B23EÄCHARACTER-1B23DÄCHARACTER-1B23CÄCHARACTER-1B23BÄCHARACTER-1B23AÄCHARACTER-1B239ÄCHARACTER-1B238ÄCHARACTER-1B237ÄCHARACTER-1B236ÄCHARACTER-1B235ÄCHARACTER-1B234ÄCHARACTER-1B233ÄCHARACTER-1B232ÄCHARACTER-1B231ÄCHARACTER-1B230ÄCHARACTER-1B22FÄCHARACTER-1B22EÄCHARACTER-1B22DÄCHARACTER-1B22CÄCHARACTER-1B22BÄCHARACTER-1B22AÄCHARACTER-1B229ÄCHARACTER-1B228ÄCHARACTER-1B227ÄCHARACTER-1B226ÄCHARACTER-1B225ÄCHARACTER-1B224ÄCHARACTER-1B223ÄCHARACTER-1B222ÄCHARACTER-1B221ÄCHARACTER-1B220ÄCHARACTER-1B21FÄCHARACTER-1B21EÄCHARACTER-1B21DÄCHARACTER-1B21CÄCHARACTER-1B21BÄCHARACTER-1B21AÄCHARACTER-1B219ÄCHARACTER-1B218ÄCHARACTER-1B217ÄCHARACTER-1B216ÄCHARACTER-1B215ÄCHARACTER-1B214ÄCHARACTER-1B213ÄCHARACTER-1B212ÄCHARACTER-1B211ÄCHARACTER-1B210ÄCHARACTER-1B20FÄCHARACTER-1B20EÄCHARACTER-1B20DÄCHARACTER-1B20CÄCHARACTER-1B20BÄCHARACTER-1B20AÄCHARACTER-1B209ÄCHARACTER-1B208ÄCHARACTER-1B207ÄCHARACTER-1B206ÄCHARACTER-1B205ÄCHARACTER-1B204ÄCHARACTER-1B203ÄCHARACTER-1B202ÄCHARACTER-1B201ÄCHARACTER-1B200ÄCHARACTER-1B1FFÄCHARACTER-1B1FEÄCHARACTER-1B1FDÄCHARACTER-1B1FCÄCHARACTER-1B1FBÄCHARACTER-1B1FAÄCHARACTER-1B1F9ÄCHARACTER-1B1F8ÄCHARACTER-1B1F7ÄCHARACTER-1B1F6ÄCHARACTER-1B1F5ÄCHARACTER-1B1F4ÄCHARACTER-1B1F3ÄCHARACTER-1B1F2ÄCHARACTER-1B1F1ÄCHARACTER-1B1F0ÄCHARACTER-1B1EFÄCHARACTER-1B1EEÄCHARACTER-1B1EDÄCHARACTER-1B1ECÄCHARACTER-1B1EBÄCHARACTER-1B1EAÄCHARACTER-1B1E9ÄCHARACTER-1B1E8ÄCHARACTER-1B1E7ÄCHARACTER-1B1E6ÄCHARACTER-1B1E5ÄCHARACTER-1B1E4ÄCHARACTER-1B1E3ÄCHARACTER-1B1E2ÄCHARACTER-1B1E1ÄCHARACTER-1B1E0ÄCHARACTER-1B1DFÄCHARACTER-1B1DEÄCHARACTER-1B1DDÄCHARACTER-1B1DCÄCHARACTER-1B1DBÄCHARACTER-1B1DAÄCHARACTER-1B1D9ÄCHARACTER-1B1D8ÄCHARACTER-1B1D7ÄCHARACTER-1B1D6ÄCHARACTER-1B1D5ÄCHARACTER-1B1D4ÄCHARACTER-1B1D3ÄCHARACTER-1B1D2ÄCHARACTER-1B1D1ÄCHARACTER-1B1D0ÄCHARACTER-1B1CFÄCHARACTER-1B1CEÄCHARACTER-1B1CDÄCHARACTER-1B1CCÄCHARACTER-1B1CBÄCHARACTER-1B1CAÄCHARACTER-1B1C9ÄCHARACTER-1B1C8ÄCHARACTER-1B1C7ÄCHARACTER-1B1C6ÄCHARACTER-1B1C5ÄCHARACTER-1B1C4ÄCHARACTER-1B1C3ÄCHARACTER-1B1C2ÄCHARACTER-1B1C1ÄCHARACTER-1B1C0ÄCHARACTER-1B1BFÄCHARACTER-1B1BEÄCHARACTER-1B1BDÄCHARACTER-1B1BCÄCHARACTER-1B1BBÄCHARACTER-1B1BAÄCHARACTER-1B1B9ÄCHARACTER-1B1B8ÄCHARACTER-1B1B7ÄCHARACTER-1B1B6ÄCHARACTER-1B1B5ÄCHARACTER-1B1B4ÄCHARACTER-1B1B3ÄCHARACTER-1B1B2ÄCHARACTER-1B1B1ÄCHARACTER-1B1B0ÄCHARACTER-1B1AFÄCHARACTER-1B1AEÄCHARACTER-1B1ADÄCHARACTER-1B1ACÄCHARACTER-1B1ABÄCHARACTER-1B1AAÄCHARACTER-1B1A9ÄCHARACTER-1B1A8ÄCHARACTER-1B1A7ÄCHARACTER-1B1A6ÄCHARACTER-1B1A5ÄCHARACTER-1B1A4ÄCHARACTER-1B1A3ÄCHARACTER-1B1A2ÄCHARACTER-1B1A1ÄCHARACTER-1B1A0ÄCHARACTER-1B19FÄCHARACTER-1B19EÄCHARACTER-1B19DÄCHARACTER-1B19CÄCHARACTER-1B19BÄCHARACTER-1B19AÄCHARACTER-1B199ÄCHARACTER-1B198ÄCHARACTER-1B197ÄCHARACTER-1B196ÄCHARACTER-1B195ÄCHARACTER-1B194ÄCHARACTER-1B193ÄCHARACTER-1B192ÄCHARACTER-1B191ÄCHARACTER-1B190ÄCHARACTER-1B18FÄCHARACTER-1B18EÄCHARACTER-1B18DÄCHARACTER-1B18CÄCHARACTER-1B18BÄCHARACTER-1B18AÄCHARACTER-1B189ÄCHARACTER-1B188ÄCHARACTER-1B187ÄCHARACTER-1B186ÄCHARACTER-1B185ÄCHARACTER-1B184ÄCHARACTER-1B183ÄCHARACTER-1B182ÄCHARACTER-1B181ÄCHARACTER-1B180ÄCHARACTER-1B17FÄCHARACTER-1B17EÄCHARACTER-1B17DÄCHARACTER-1B17CÄCHARACTER-1B17BÄCHARACTER-1B17AÄCHARACTER-1B179ÄCHARACTER-1B178ÄCHARACTER-1B177ÄCHARACTER-1B176ÄCHARACTER-1B175ÄCHARACTER-1B174ÄCHARACTER-1B173ÄCHARACTER-1B172ÄCHARACTER-1B171ÄCHARACTER-1B170ÄCHARACTER-18CD5ÄCHARACTER-18CD4ÄCHARACTER-18CD3ÄCHARACTER-18CD2ÄCHARACTER-18CD1ÄCHARACTER-18CD0ÄCHARACTER-18CCFÄCHARACTER-18CCEÄCHARACTER-18CCDÄCHARACTER-18CCCÄCHARACTER-18CCBÄCHARACTER-18CCAÄCHARACTER-18CC9ÄCHARACTER-18CC8ÄCHARACTER-18CC7ÄCHARACTER-18CC6ÄCHARACTER-18CC5ÄCHARACTER-18CC4ÄCHARACTER-18CC3ÄCHARACTER-18CC2ÄCHARACTER-18CC1ÄCHARACTER-18CC0ÄCHARACTER-18CBFÄCHARACTER-18CBEÄCHARACTER-18CBDÄCHARACTER-18CBCÄCHARACTER-18CBBÄCHARACTER-18CBAÄCHARACTER-18CB9ÄCHARACTER-18CB8ÄCHARACTER-18CB7ÄCHARACTER-18CB6ÄCHARACTER-18CB5ÄCHARACTER-18CB4ÄCHARACTER-18CB3ÄCHARACTER-18CB2ÄCHARACTER-18CB1ÄCHARACTER-18CB0ÄCHARACTER-18CAFÄCHARACTER-18CAEÄCHARACTER-18CADÄCHARACTER-18CACÄCHARACTER-18CABÄCHARACTER-18CAAÄCHARACTER-18CA9ÄCHARACTER-18CA8ÄCHARACTER-18CA7ÄCHARACTER-18CA6ÄCHARACTER-18CA5ÄCHARACTER-18CA4ÄCHARACTER-18CA3ÄCHARACTER-18CA2ÄCHARACTER-18CA1ÄCHARACTER-18CA0ÄCHARACTER-18C9FÄCHARACTER-18C9EÄCHARACTER-18C9DÄCHARACTER-18C9CÄCHARACTER-18C9BÄCHARACTER-18C9AÄCHARACTER-18C99ÄCHARACTER-18C98ÄCHARACTER-18C97ÄCHARACTER-18C96ÄCHARACTER-18C95ÄCHARACTER-18C94ÄCHARACTER-18C93ÄCHARACTER-18C92ÄCHARACTER-18C91ÄCHARACTER-18C90ÄCHARACTER-18C8FÄCHARACTER-18C8EÄCHARACTER-18C8DÄCHARACTER-18C8CÄCHARACTER-18C8BÄCHARACTER-18C8AÄCHARACTER-18C89ÄCHARACTER-18C88ÄCHARACTER-18C87ÄCHARACTER-18C86ÄCHARACTER-18C85ÄCHARACTER-18C84ÄCHARACTER-18C83ÄCHARACTER-18C82ÄCHARACTER-18C81ÄCHARACTER-18C80ÄCHARACTER-18C7FÄCHARACTER-18C7EÄCHARACTER-18C7DÄCHARACTER-18C7CÄCHARACTER-18C7BÄCHARACTER-18C7AÄCHARACTER-18C79ÄCHARACTER-18C78ÄCHARACTER-18C77ÄCHARACTER-18C76ÄCHARACTER-18C75ÄCHARACTER-18C74ÄCHARACTER-18C73ÄCHARACTER-18C72ÄCHARACTER-18C71ÄCHARACTER-18C70ÄCHARACTER-18C6FÄCHARACTER-18C6EÄCHARACTER-18C6DÄCHARACTER-18C6CÄCHARACTER-18C6BÄCHARACTER-18C6AÄCHARACTER-18C69ÄCHARACTER-18C68ÄCHARACTER-18C67ÄCHARACTER-18C66ÄCHARACTER-18C65ÄCHARACTER-18C64ÄCHARACTER-18C63ÄCHARACTER-18C62ÄCHARACTER-18C61ÄCHARACTER-18C60ÄCHARACTER-18C5FÄCHARACTER-18C5EÄCHARACTER-18C5DÄCHARACTER-18C5CÄCHARACTER-18C5BÄCHARACTER-18C5AÄCHARACTER-18C59ÄCHARACTER-18C58ÄCHARACTER-18C57ÄCHARACTER-18C56ÄCHARACTER-18C55ÄCHARACTER-18C54ÄCHARACTER-18C53ÄCHARACTER-18C52ÄCHARACTER-18C51ÄCHARACTER-18C50ÄCHARACTER-18C4FÄCHARACTER-18C4EÄCHARACTER-18C4DÄCHARACTER-18C4CÄCHARACTER-18C4BÄCHARACTER-18C4AÄCHARACTER-18C49ÄCHARACTER-18C48ÄCHARACTER-18C47ÄCHARACTER-18C46ÄCHARACTER-18C45ÄCHARACTER-18C44ÄCHARACTER-18C43ÄCHARACTER-18C42ÄCHARACTER-18C41ÄCHARACTER-18C40ÄCHARACTER-18C3FÄCHARACTER-18C3EÄCHARACTER-18C3DÄCHARACTER-18C3CÄCHARACTER-18C3BÄCHARACTER-18C3AÄCHARACTER-18C39ÄCHARACTER-18C38ÄCHARACTER-18C37ÄCHARACTER-18C36ÄCHARACTER-18C35ÄCHARACTER-18C34ÄCHARACTER-18C33ÄCHARACTER-18C32ÄCHARACTER-18C31ÄCHARACTER-18C30ÄCHARACTER-18C2FÄCHARACTER-18C2EÄCHARACTER-18C2DÄCHARACTER-18C2CÄCHARACTER-18C2BÄCHARACTER-18C2AÄCHARACTER-18C29ÄCHARACTER-18C28ÄCHARACTER-18C27ÄCHARACTER-18C26ÄCHARACTER-18C25ÄCHARACTER-18C24ÄCHARACTER-18C23ÄCHARACTER-18C22ÄCHARACTER-18C21ÄCHARACTER-18C20ÄCHARACTER-18C1FÄCHARACTER-18C1EÄCHARACTER-18C1DÄCHARACTER-18C1CÄCHARACTER-18C1BÄCHARACTER-18C1AÄCHARACTER-18C19ÄCHARACTER-18C18ÄCHARACTER-18C17ÄCHARACTER-18C16ÄCHARACTER-18C15ÄCHARACTER-18C14ÄCHARACTER-18C13ÄCHARACTER-18C12ÄCHARACTER-18C11ÄCHARACTER-18C10ÄCHARACTER-18C0FÄCHARACTER-18C0EÄCHARACTER-18C0DÄCHARACTER-18C0CÄCHARACTER-18C0BÄCHARACTER-18C0AÄCHARACTER-18C09ÄCHARACTER-18C08ÄCHARACTER-18C07ÄCHARACTER-18C06ÄCHARACTER-18C05ÄCHARACTER-18C04ÄCHARACTER-18C03ÄCHARACTER-18C02ÄCHARACTER-18C01ÄCHARACTER-18C00ÄCHARACTER-18BFFÄCHARACTER-18BFEÄCHARACTER-18BFDÄCHARACTER-18BFCÄCHARACTER-18BFBÄCHARACTER-18BFAÄCHARACTER-18BF9ÄCHARACTER-18BF8ÄCHARACTER-18BF7ÄCHARACTER-18BF6ÄCHARACTER-18BF5ÄCHARACTER-18BF4ÄCHARACTER-18BF3ÄCHARACTER-18BF2ÄCHARACTER-18BF1ÄCHARACTER-18BF0ÄCHARACTER-18BEFÄCHARACTER-18BEEÄCHARACTER-18BEDÄCHARACTER-18BECÄCHARACTER-18BEBÄCHARACTER-18BEAÄCHARACTER-18BE9ÄCHARACTER-18BE8ÄCHARACTER-18BE7ÄCHARACTER-18BE6ÄCHARACTER-18BE5ÄCHARACTER-18BE4ÄCHARACTER-18BE3ÄCHARACTER-18BE2ÄCHARACTER-18BE1ÄCHARACTER-18BE0ÄCHARACTER-18BDFÄCHARACTER-18BDEÄCHARACTER-18BDDÄCHARACTER-18BDCÄCHARACTER-18BDBÄCHARACTER-18BDAÄCHARACTER-18BD9ÄCHARACTER-18BD8ÄCHARACTER-18BD7ÄCHARACTER-18BD6ÄCHARACTER-18BD5ÄCHARACTER-18BD4ÄCHARACTER-18BD3ÄCHARACTER-18BD2ÄCHARACTER-18BD1ÄCHARACTER-18BD0ÄCHARACTER-18BCFÄCHARACTER-18BCEÄCHARACTER-18BCDÄCHARACTER-18BCCÄCHARACTER-18BCBÄCHARACTER-18BCAÄCHARACTER-18BC9ÄCHARACTER-18BC8ÄCHARACTER-18BC7ÄCHARACTER-18BC6ÄCHARACTER-18BC5ÄCHARACTER-18BC4ÄCHARACTER-18BC3ÄCHARACTER-18BC2ÄCHARACTER-18BC1ÄCHARACTER-18BC0ÄCHARACTER-18BBFÄCHARACTER-18BBEÄCHARACTER-18BBDÄCHARACTER-18BBCÄCHARACTER-18BBBÄCHARACTER-18BBAÄCHARACTER-18BB9ÄCHARACTER-18BB8ÄCHARACTER-18BB7ÄCHARACTER-18BB6ÄCHARACTER-18BB5ÄCHARACTER-18BB4ÄCHARACTER-18BB3ÄCHARACTER-18BB2ÄCHARACTER-18BB1ÄCHARACTER-18BB0ÄCHARACTER-18BAFÄCHARACTER-18BAEÄCHARACTER-18BADÄCHARACTER-18BACÄCHARACTER-18BABÄCHARACTER-18BAAÄCHARACTER-18BA9ÄCHARACTER-18BA8ÄCHARACTER-18BA7ÄCHARACTER-18BA6ÄCHARACTER-18BA5ÄCHARACTER-18BA4ÄCHARACTER-18BA3ÄCHARACTER-18BA2ÄCHARACTER-18BA1ÄCHARACTER-18BA0ÄCHARACTER-18B9FÄCHARACTER-18B9EÄCHARACTER-18B9DÄCHARACTER-18B9CÄCHARACTER-18B9BÄCHARACTER-18B9AÄCHARACTER-18B99ÄCHARACTER-18B98ÄCHARACTER-18B97ÄCHARACTER-18B96ÄCHARACTER-18B95ÄCHARACTER-18B94ÄCHARACTER-18B93ÄCHARACTER-18B92ÄCHARACTER-18B91ÄCHARACTER-18B90ÄCHARACTER-18B8FÄCHARACTER-18B8EÄCHARACTER-18B8DÄCHARACTER-18B8CÄCHARACTER-18B8BÄCHARACTER-18B8AÄCHARACTER-18B89ÄCHARACTER-18B88ÄCHARACTER-18B87ÄCHARACTER-18B86ÄCHARACTER-18B85ÄCHARACTER-18B84ÄCHARACTER-18B83ÄCHARACTER-18B82ÄCHARACTER-18B81ÄCHARACTER-18B80ÄCHARACTER-18B7FÄCHARACTER-18B7EÄCHARACTER-18B7DÄCHARACTER-18B7CÄCHARACTER-18B7BÄCHARACTER-18B7AÄCHARACTER-18B79ÄCHARACTER-18B78ÄCHARACTER-18B77ÄCHARACTER-18B76ÄCHARACTER-18B75ÄCHARACTER-18B74ÄCHARACTER-18B73ÄCHARACTER-18B72ÄCHARACTER-18B71ÄCHARACTER-18B70ÄCHARACTER-18B6FÄCHARACTER-18B6EÄCHARACTER-18B6DÄCHARACTER-18B6CÄCHARACTER-18B6BÄCHARACTER-18B6AÄCHARACTER-18B69ÄCHARACTER-18B68ÄCHARACTER-18B67ÄCHARACTER-18B66ÄCHARACTER-18B65ÄCHARACTER-18B64ÄCHARACTER-18B63ÄCHARACTER-18B62ÄCHARACTER-18B61ÄCHARACTER-18B60ÄCHARACTER-18B5FÄCHARACTER-18B5EÄCHARACTER-18B5DÄCHARACTER-18B5CÄCHARACTER-18B5BÄCHARACTER-18B5AÄCHARACTER-18B59ÄCHARACTER-18B58ÄCHARACTER-18B57ÄCHARACTER-18B56ÄCHARACTER-18B55ÄCHARACTER-18B54ÄCHARACTER-18B53ÄCHARACTER-18B52ÄCHARACTER-18B51ÄCHARACTER-18B50ÄCHARACTER-18B4FÄCHARACTER-18B4EÄCHARACTER-18B4DÄCHARACTER-18B4CÄCHARACTER-18B4BÄCHARACTER-18B4AÄCHARACTER-18B49ÄCHARACTER-18B48ÄCHARACTER-18B47ÄCHARACTER-18B46ÄCHARACTER-18B45ÄCHARACTER-18B44ÄCHARACTER-18B43ÄCHARACTER-18B42ÄCHARACTER-18B41ÄCHARACTER-18B40ÄCHARACTER-18B3FÄCHARACTER-18B3EÄCHARACTER-18B3DÄCHARACTER-18B3CÄCHARACTER-18B3BÄCHARACTER-18B3AÄCHARACTER-18B39ÄCHARACTER-18B38ÄCHARACTER-18B37ÄCHARACTER-18B36ÄCHARACTER-18B35ÄCHARACTER-18B34ÄCHARACTER-18B33ÄCHARACTER-18B32ÄCHARACTER-18B31ÄCHARACTER-18B30ÄCHARACTER-18B2FÄCHARACTER-18B2EÄCHARACTER-18B2DÄCHARACTER-18B2CÄCHARACTER-18B2BÄCHARACTER-18B2AÄCHARACTER-18B29ÄCHARACTER-18B28ÄCHARACTER-18B27ÄCHARACTER-18B26ÄCHARACTER-18B25ÄCHARACTER-18B24ÄCHARACTER-18B23ÄCHARACTER-18B22ÄCHARACTER-18B21ÄCHARACTER-18B20ÄCHARACTER-18B1FÄCHARACTER-18B1EÄCHARACTER-18B1DÄCHARACTER-18B1CÄCHARACTER-18B1BÄCHARACTER-18B1AÄCHARACTER-18B19ÄCHARACTER-18B18ÄCHARACTER-18B17ÄCHARACTER-18B16ÄCHARACTER-18B15ÄCHARACTER-18B14ÄCHARACTER-18B13ÄCHARACTER-18B12ÄCHARACTER-18B11ÄCHARACTER-18B10ÄCHARACTER-18B0FÄCHARACTER-18B0EÄCHARACTER-18B0DÄCHARACTER-18B0CÄCHARACTER-18B0BÄCHARACTER-18B0AÄCHARACTER-18B09ÄCHARACTER-18B08ÄCHARACTER-18B07ÄCHARACTER-18B06ÄCHARACTER-18B05ÄCHARACTER-18B04ÄCHARACTER-18B03ÄCHARACTER-18B02ÄCHARACTER-18B01ÄCHARACTER-18B00ÄCHARACTERÄCHARACTE“CHARÄCHAPTERÄCHAPÄCHANGÄCHANÄCHAMKOÄCHAMILONÄCHAMILIÄCHAÕCHAKM¡CHAINSÄCHADAÄCHAƒCHAAÄCGJÄCEXÄCEVITUÄCERESÄCEREMONYÄCEREKÄCER-WAÄCEPÄCEONGCHIEUMSSANGSIOSÄCEONGCHIEUMSSANGCIEUCÄCEONGCHIEUMSIOSÄCEONGCHIEUMCIEUCÄCEONGCHIEUMCHIEUCHÄCENTURIAÃCENTRELIN≈CENTREDÄCENTREƒCENTREÄCENTR≈CENTRALIZATIOŒCENÄCELTI√CELSIUSÄCELEBRATIONÄCEIRTÄCEILINGÄCEILIN«CEEVÄCEEBÄCEEÄCEDILLAÄCEDILL¡CED…CECEKÄCECAKÄCECAÀCEALCÄCCUÄCCOÄCCIÄCCHUÄCCHOÄCCHIÄCCHHUÄCCHHOÄCCHHIÄCCHHEEÄCCHHEÄCCHHAAÄCCHHAÄCCHEEÄCCHEÄCCHAAÄCCHAÄCCHÄCCEEÄCCAAÄCAYNÄCAYANNAÄCAXÄCAVEÄCAUTIOŒCAULDRONÄCAUDAÄCAUCASIAŒCAUÄCATAWAÄCATÄCA‘CASTLEÄCASKE‘CARYSTIAŒCARTWHEELÄCARTRIDGEÄCARTÄCAR”CARROTÄCARRIAG≈CARPENTRŸCAR–CAROUSEÃCARONÄCAROŒCARIÀCARIAŒCARETÄCARE‘CAR≈CARDSÄCARƒCARÄCA“CAPU‘CAPTIVEÄCAPRICORNÄCAPPEƒCAPOÄCAPITULUMÄCAPITALÄCANTILLATIOŒCANOEÄCANNONÄCANNEƒCAN«CANEÄCANDYÄCANDRABINDUÄCANDRABIND’CANDRAÄCANDR¡CANDLEÄCANCERÄCANCELLATIOŒCANCELÄCANCEÃCANÄCAMPINGÄCAMNU√CAMERAÄCAMER¡CAMELÄCALYAÄCALY¡CALXÄCALLÄCALÃCALENDARÄCALENDA“CALCULATORÄCALCÄCAKRAÄCAK≈CAIÄCAHÄCAESURAÄCADUCEUSÄCAD¡CACTUSÄCABLEWAYÄCABINETÄCABBAGE-TREEÄCAANGÄCAAIÄC¡C024ÄC023ÄC022ÄC021ÄC020ÄC019ÄC018ÄC017ÄC016ÄC015ÄC014ÄC013ÄC012ÄC011ÄC010AÄC010ÄC009ÄC008ÄC007ÄC006ÄC005ÄC004ÄC003ÄC002CÄC002BÄC002AÄC002ÄC001ÄC-SIMPLIFIEƒC-39ÄC-18ÄBZUN«BZH…BYT≈BYELORUSSIAN-UKRAINIAŒBXGÄBWIÄBWEEÄBWEÄBWAÄBUUMISHÄBUTTONÄBUTTOŒBUTTERFLYÄBUTTERÄBU‘BUST”BUS‘BUSSYERUÄBUSINES”BU”BUR’BURRITOÄBUR2ÄBU“BUOXÄBUOPÄBUNNŸBUNGÄBUMPŸBULUGÄBULU«BULLSEYEÄBULL”BULLHORNÄBULLHORŒBULLETÄBULLE‘BULLÄBULBÄBUKYÄBUILDINGSÄBUILDINGÄBUILDIN«BUHIƒBUGINES≈BUGÄBUFFALOÄBUDÄBUCKLEÄBUCKETÄBUBBLESÄBUBBLEÄBUBBL≈BSTARÄBSKU“BSKA≠BSDU”BRUS»BROWŒBROOMÄBRONZEÄBROKEŒBROCCOLIÄBROAƒBRISTLEÄBRIGHTNES”BRIEFSÄBRIEFCASEÄBRIDG≈BRID≈BRICKÄBRIÄBREVISÄBREVE-MACRONÄBREV≈BREAT»BREAST-FEEDINGÄBREAKTHROUGHÄBRD¡BRANCHIN«BRANCHESÄBRANCHÄBRANC»BRAKCETÄBRAINÄBRACKETEƒBRACKE‘BRACEÄBQÄBPHÄBOY”BOYÄBOXIN«BOWTIEÄBOWTI≈BOWLINGÄBOWLÄBOWÃBOWIN«BO◊BOUQUETÄBOUQUE‘BOUNDARŸBOTTOM-SHADEƒBOTTOM-LIGHTEƒBOTTOMÄBOTTOÕBOTTLEÄBOTTL≈BOT»BORUTOÄBORAX-3ÄBORAX-2ÄBORAXÄBOPOMOFœBOOTSÄBOOTÄBOOMERANGÄBOOKSÄBOOKMARKÄBOOKMARÀBONEÄBOMBÄBOMÄBOLTÄBOL‘BOHAIRI√BODYÄBODŸBOARÄBOAÄBLUEBERRIESÄBLUEÄBLU≈BLOWIN«BLOWFISHÄBLO◊BLOSSOMÄBLOODÄBLONƒBLOCK-7ÄBLOCK-6ÄBLOCK-5ÄBLOCK-4ÄBLOCK-3ÄBLOCK-2ÄBLOCK-1358ÄBLOCKÄBLINÀBLANKÄBLANÀBLAD≈BLACKLETTE“BLACKFOO‘BLACK-LETTE“BLACK-FEATHEREƒBLACKÄBKA≠BITTERÄBITIN«BIT≈BITCOIŒBISONÄBISMUT»BISMILLA»BISHO–BISECTIN«BISAHÄBIRUÄBIRTHDAŸBIRGAÄBIRG¡BIRDÄBIOHAZARƒBINOVILEÄBINOCULA“BINDIN«BINDIÄBINARŸBILLIONSÄBILLIARDSÄBILLEƒBILABIAÃBIKINIÄBIGÄBI«BIETÄBIDENTAÃBIDAKUOŒBICYCLISTÄBICYCLESÄBICYCLEÄBICEPSÄBIBLE-CRE≈BIBÄB…BHUÄBHOOÄBHOÄBHIÄBHETHÄBHEEÄBHEÄBHATTIPROL’BHAMÄBHAIKSUK…BHAAÄBHAÄBEYYALÄBEXÄBEVERAGEÄBEVERAG≈BETWEENÄBETWEEŒBETHÄBETAÄBET¡BE‘BESID≈BERKANAŒBERBE“BEPÄBEOR√BENZEN≈BENTœBENTÄBEN‘BENGAL…BENDEÄBENDÄBENƒBEŒBELTÄBEL‘BELO◊BELLHO–BELLÄBELÃBELGTHO“BEITHÄBEHINƒBEHEHÄBEHE»BEHÄBE»BEGINNINGÄBEGINNERÄBEGIŒBEFOR≈BEETLEÄBEETAÄBEE“BEEHIVEÄBEEHÄBEE»BECAUSEÄBEAVERÄBEAVE“BEATIN«BEATÄBEARDEƒBEARÄBEA“BEANÄBEAMEƒBEADSÄBEAC»BCADÄBCAƒBBYXÄBBYTÄBBYPÄBBYÄBBUXÄBBUTÄBBURXÄBBURÄBBUPÄBBUOXÄBBUOPÄBBUOÄBBUÄBBOXÄBBOTÄBBOPÄBBOÄBBIXÄBBIPÄBBIEXÄBBIETÄBBIEPÄBBIEÄBBIÄBBEXÄBBEPÄBBEEÄBBAXÄBBATÄBBAPÄBBAAÄBAYANNAÄBAUÄBATTERYÄBATHTUBÄBATHAMASATÄBATHÄBAT»BATAÀBASSAÄBASS¡BASKETBALÃBASHKI“BASHÄBASELIN≈BASEBALLÄBASEÄBAS≈BARSÄBAR”BARRIERÄBARREKHÄBARREEÄBARRE≈BARLINEÄBARLEYÄBARIYOOSANÄBARBE“BARA2ÄBA“BANTOCÄBANKNOT≈BANKÄBANÀBANJOÄBANDÄBANANAÄBAN2ÄBAN≤BAMBOOSÄBAMBOOÄBALUDAÄBALLPOIN‘BALLOTÄBALLO‘BALLOON-SPOKEƒBALLOONÄBALLE‘BALDÄBALAGÄBALÄBAÃBAIRKANÄBAIMAIÄBAHTÄBAHIRGOMUKHAÄBAHAR2ÄBAHAR≤BAHÄBAGUETT≈BAGSÄBAGGAG≈BAGELÄBAGAÄBAG3ÄBA«BADMINTOŒBADGERÄBADGEÄBAƒBACTRIAŒBACONÄBACKWARDÄBACKSPACEÄBACKSLASHÄBACKSLAS»BACKSLANTEƒBACKHANƒBACK-TILTEƒBACKÄBACÀBABYÄBABŸBAARERUÄBA-2ÄB305ÄB25¥B24∑B24≥B24≤B24±B24∞B23≥B23±B23∞B22µB22∞B19±B17∂B17≥B169ÄB168ÄB167ÄB166ÄB165ÄB164ÄB16≥B16≤B161ÄB160ÄB15πB158ÄB157ÄB15∂B155ÄB154ÄB153ÄB152ÄB15±B150ÄB146ÄB14µB142ÄB14±B14∞B13µB13≥B132ÄB13±B13∞B12∏B12∑B12µB12≥B12≤B12±B12∞B109ÕB109∆B108ÕB108∆B107ÕB107∆B106ÕB106∆B105ÕB105∆B10µB10¥B10≤B10∞B09±B09∞B089ÄB08∑B086ÄB08µB083ÄB082ÄB08±B08∞B079ÄB07∏B07∑B07∂B07µB07¥B07≥B07≤B07±B07∞B06πB06∏B06∑B06∂B06µB064ÄB063ÄB06≤B06±B06∞B05πB05∏B05∑B056ÄB05µB05¥B05≥B05≤B05±B05∞B049ÄB04∏B047ÄB04∂B04µB04¥B04≥B04≤B04±B04∞B03πB03∏B03∑B03∂B034ÄB03≥B03≤B03±B03∞B02πB02∏B02∑B02∂B02µB02¥B02≥B022ÄB02±B02∞B019ÄB018ÄB01∑B01∂B01µB01¥B01≥B01≤B01±B01∞B009ÄB00πB008ÄB00∏B007ÄB00∑B006ÄB00∂B005AÄB005ÄB00µB004ÄB00¥B003ÄB00≥B002ÄB00≤B001ÄB00±AZUÄAYBÄAYAHÄAXEÄAWEÄAWAŸAVOCADOÄAVESTAŒAVERAG≈AVAKRAHASANYAÄAVAGRAHAÄAUYANNAÄAUTUMNÄAUTOMOBILEÄAUTOMATEƒAUTœAUSTRAÃAURIPIGMENTÄAURAMAZDAAHAÄAURAMAZDAA-2ÄAURAMAZDAAÄAUNNÄAUGUSTÄAUGMENTATIOŒAUEÄAUBERGINEÄATTI√ATTHACANÄATTENTIONÄATTAÀATTACHEƒATOÕATNA»ATMAAUÄATIYAÄATIUÄATIKRAMAÄATHLETI√ATHARVAVEDI√ATHAPASCAŒATH-THALATHAÄASZÄASYUR¡ASYMPTOTICALLŸASTRONOMICAÃASTROLOGICAÃASTRAEAÄASTONISHEƒASTERISMÄASTERISK”ASTERISKÄASTERISÀASTERISCUSÄASSYRIAŒASSERTIONÄASPIRATIONÄASPIRATEƒASPERÄASIA-AUSTRALIAÄASHGABÄASHESÄASH9ÄASH3ÄASH≤ASCI¡ASCENTÄASCENDIN«ASAL2ÄAS-SAJDAÄARUHUAÄART”ARTIS‘ARTICULATEƒARTAB≈ARTAÄARSEOSÄARSEO”ARSENICÄARROWSÄARROW”ARROWHEADSÄARROWHEAD-SHAPEƒARROWHEADÄARROWHEAƒARROW-TAILÄARRIVINGÄARRIVEÄARRAYÄARPEGGIATœAROUSIN«AROUR¡AROUND-PROFILEÄAROUNƒARMYÄARM”ARMOURÄARMENIAŒARMÄARÕARLAU«ARKTIKœARKABÄARKAANUÄARISTERAÄARISTER¡ARIESÄARGOTERIÄARGOSYNTHETONÄARGIÄAREPAÄAREAÄARDHAVISARGAÄARDHACANDRAÄARCHAIONÄARCHAIOŒARCHAI√ARC»ARCÄAR√ARAMAI√ARAEAEÄARAEA-UÄARAEA-IÄARAEA-EOÄARAEA-EÄARAEA-AÄARADÄARAƒARABIC-INDI√ARABIAŒAR-RUBÄAR-RAHMAŒAR-RAHEEMÄAQUARIUSÄAQUAFORTISÄAQU¡APUŒAPRILÄAPPROXIMATELŸAPPROXIMATEÄAPPROACHE”APPROACHÄAPPLICATIONÄAPPLICATIOŒAPOTHESÄAPOTHEMAÄAPOSTROPHEÄAPOSTROFOSÄAPOSTROFO”APOSTROFO…APOLLONÄAPODEXIAÄAPODERM¡APLOUNÄAPL…APÃAPINÄAPESœAPCÄAPARTÄAPAATOÄAOUÄAORÄANUSVARAYAÄANUSVARAÄANUSVAR¡ANUDATTAÄANUDATT¡ANTIRESTRICTIONÄANTIMONY-2ÄANTIMONYÄANTIMONŸANTIMONIATEÄANTIKENOMAÄANTIKENOKYLISMAÄANTIFONIAÄANTICLOCKWISE-ROTATEƒANTICLOCKWISEÄANTICLOCKWIS≈ANTENNAÄANTENN¡ANTARGOMUKHAÄANSU⁄ANSHEÄANPEAÄANœANNUITŸANNOTATIOŒANNAAUÄANKHÄANJIÄANIMALÄANHUÄANGULARÄANGUISHEƒANGSTROÕANGRŸANGLICAN¡ANGLEDÄANGLEƒANGKHANKHUÄANGKAÄANGE“ANGELÄANGEDÄANDAPÄANCORAÄANCHORÄANATRICHISMAÄANATOMICAÃANAPÄAN-NISFÄAMULETÄAMPSÄAMPHORAÄAMPERSANDÄAMPERSANƒAMOUN‘AMERICASÄAMERICAŒAMBULANCEÄAMB¡AMBÄAMARÄAMA“AMALGAMATIOŒAMALGAMÄALVEOLA“ALUMÄALTERNATIV≈ALTERNATIOŒALTERNATINGÄALTERNATIN«ALTERNATEÄALTERNAT≈ALTAÄALPHAÄALPH¡ALPAPRANAÄALPAPRAAN¡ALPAÄALMOS‘ALLOÄALLIANCEÄALL…ALLA»ALKALI-2ÄALKALIÄALIGNEƒALIFUÄALIFÄALI∆ALIENÄALIEŒALGI⁄ALFAÄALEU‘ALERTÄALEPHÄALEMBICÄALEFÄALBANIAŒALAYHEÄALAYH≈ALARÕALAPHÄAL-LAKUNAÄAKUR’AKTIESELSKABÄAKSAÄAKHMIMI√AKBA“AKARAÄAKAR¡AIYANNAÄAIVILIÀAIVAÄAITOŒAIRPLANEÄAIRPLAN≈AIN’AINNÄAILMÄAIKARAÄAIHVUSÄAHSDAÄAHSAÄAHOÕAHAN«AHAGGA“AHADÄAGUNGÄAGOG…AGGRAVATIONÄAGGRAVATEƒAGAINS‘AGAINÄAFTE“AFSAAQÄAFRICAŒAFOREMENTIONEDÄAFGHAN…AFFRICATIOŒAFFIÿAEYANNAÄAEYÄAESCULAPIUSÄAESCÄAESÄAERIAÃAERÄAELA-PILLAÄAELÄAEKÄAEGEAŒAEGÄAEEYANNAÄAEEÄAEDA-PILLAÄAEDÄAEBÄADVANTAGEÄADVANCEÄADULTÄADMISSIOŒADMETOSÄADLAÕADHESIV≈ADEGÄADE«ADDRESSEƒADDRES”ADDAKÄADAÀACUTE-MACRONÄACUTE-GRAVE-ACUTEÄACUT≈ACTUALLŸACTIVAT≈ACROPHONI√ACKNOWLEDGEÄACCUMULATIONÄACCOUN‘ACCORDIONÄACCOMMODATIONÄACCEPTÄACCENT-STACCATOÄACCENTÄACCEN‘ACADEMŸABYSMAÃABUNDANCEÄABKHASIAŒABBREVIATIOŒABAFILIÄABACUSÄAB≤AB191ÄAB188ÄAB180ÄAB171ÄAB164ÄAB131BÄAB131AÄAB123ÄAB122ÄAB120ÄAB118ÄAB087ÄAB086ÄAB085ÄAB082ÄAB081ÄAB080ÄAB079ÄAB078ÄAB077ÄAB076ÄAB074ÄAB073ÄAB070ÄAB069ÄAB067ÄAB066ÄAB065ÄAB061ÄAB060ÄAB059ÄAB058ÄAB057ÄAB056ÄAB055ÄAB054ÄAB053ÄAB051ÄAB050ÄAB049ÄAB048ÄAB047ÄAB046ÄAB045ÄAB044ÄAB041ÄAB040ÄAB039ÄAB038ÄAB037ÄAB034ÄAB031ÄAB030ÄAB029ÄAB028ÄAB027ÄAB026ÄAB024ÄAB023MÄAB023ÄAB022MÄAB022FÄAB022ÄAB021MÄAB021FÄAB021ÄAB020ÄAB017ÄAB016ÄAB013ÄAB011ÄAB010ÄAB009ÄAB008ÄAB007ÄAB006ÄAB005ÄAB004ÄAB003ÄAB002ÄAB001ÄAAZHAAKKUÄAAYINÄAAYANNAÄAAYÄAAWÄAAOÄAAJÄAABAAFILIÄAA032ÄAA031ÄAA030ÄAA029ÄAA028ÄAA027ÄAA026ÄAA025ÄAA024ÄAA023ÄAA022ÄAA021ÄAA020ÄAA019ÄAA018ÄAA017ÄAA016ÄAA015ÄAA014ÄAA013ÄAA012ÄAA011ÄAA010ÄAA009ÄAA008ÄAA007BÄAA007AÄAA007ÄAA006ÄAA005ÄAA004ÄAA003ÄAA002ÄAA001ÄA807ÄA806ÄA805ÄA804ÄA803ÄA802ÄA801ÄA800ÄA73≤A72∂A71∑A71µA71¥A71≥A71≤A71±A71∞A709-∂A709-¥A709-≥A709-≤A70πA70∏A70∑A70∂A70µA70¥A70≥A70≤A70±A664ÄA663ÄA662ÄA661ÄA660ÄA659ÄA658ÄA657ÄA656ÄA655ÄA654ÄA653ÄA652ÄA651ÄA649ÄA648ÄA646ÄA645ÄA644ÄA643ÄA642ÄA640ÄA638ÄA637ÄA634ÄA629ÄA628ÄA627ÄA626ÄA624ÄA623ÄA622ÄA621ÄA620ÄA619ÄA618ÄA617ÄA616ÄA615ÄA614ÄA613ÄA612ÄA611ÄA610ÄA609ÄA608ÄA606ÄA604ÄA603ÄA602ÄA601ÄA600ÄA598ÄA596ÄA595ÄA594ÄA592ÄA591ÄA589ÄA588ÄA587ÄA586ÄA585ÄA584ÄA583ÄA582ÄA581ÄA580ÄA579ÄA578ÄA577ÄA576ÄA575ÄA574ÄA573ÄA572ÄA571ÄA570ÄA569ÄA568ÄA566ÄA565ÄA564ÄA563ÄA559ÄA557ÄA556ÄA555ÄA554ÄA553ÄA552ÄA551ÄA550ÄA549ÄA548ÄA547ÄA545ÄA542ÄA541ÄA540ÄA539ÄA538ÄA537ÄA536ÄA535ÄA534ÄA532ÄA531ÄA530ÄA529ÄA528ÄA527ÄA526ÄA525ÄA524ÄA523ÄA522ÄA521ÄA520ÄA519ÄA518ÄA517ÄA516ÄA515ÄA514ÄA513ÄA512ÄA511ÄA510ÄA509ÄA508ÄA507ÄA506ÄA505ÄA504ÄA503ÄA502ÄA501ÄA497ÄA496ÄA495ÄA494ÄA493ÄA492ÄA491ÄA490ÄA489ÄA488ÄA487ÄA486ÄA485ÄA484ÄA483ÄA482ÄA481ÄA480ÄA479ÄA478ÄA477ÄA476ÄA475ÄA474ÄA473ÄA472ÄA471ÄA470ÄA469ÄA468ÄA467ÄA466ÄA465ÄA464ÄA463ÄA462ÄA461ÄA460ÄA459ÄA458ÄA457AÄA457ÄA456ÄA455ÄA454ÄA453ÄA452ÄA451ÄA450AÄA450ÄA449ÄA448ÄA447ÄA446ÄA445ÄA444ÄA443ÄA442ÄA441ÄA440ÄA439ÄA438ÄA437ÄA436ÄA435ÄA434ÄA433ÄA432ÄA431ÄA430ÄA429ÄA428ÄA427ÄA426ÄA425ÄA424ÄA423ÄA422ÄA421ÄA420ÄA419ÄA418-VASÄA418ÄA417-VASÄA417ÄA416-VASÄA416ÄA415-VASÄA415ÄA414-VASÄA414ÄA413-VASÄA413ÄA412-VASÄA412ÄA411-VASÄA411ÄA410¡A410-VASÄA41∞A409-VASÄA409ÄA408-VASÄA408ÄA407-VASÄA407ÄA406-VASÄA406ÄA405-VASÄA405ÄA404-VASÄA404ÄA403-VASÄA403ÄA402-VASÄA402ÄA401-VASÄA401ÄA400-VASÄA400ÄA399ÄA398ÄA397ÄA396ÄA395ÄA394ÄA39≥A392ÄA391ÄA390ÄA389ÄA388ÄA387ÄA386AÄA386ÄA385ÄA384ÄA383AÄA38≥A382ÄA381AÄA381ÄA380ÄA379ÄA378ÄA377ÄA376ÄA375ÄA374ÄA373ÄA372ÄA371AÄA371ÄA370ÄA369ÄA368AÄA368ÄA367ÄA366ÄA365ÄA364AÄA364ÄA363ÄA362ÄA361ÄA360ÄA359AÄA359ÄA358ÄA357ÄA356ÄA355ÄA354ÄA353ÄA352ÄA351ÄA350ÄA349ÄA348ÄA347ÄA346ÄA345ÄA344ÄA343ÄA342ÄA341ÄA340ÄA339ÄA338ÄA337ÄA336CÄA336BÄA336AÄA336ÄA335ÄA334ÄA333ÄA332CÄA332BÄA332AÄA332ÄA331ÄA330ÄA329AÄA329ÄA328ÄA327ÄA326ÄA325ÄA324ÄA323ÄA322ÄA321ÄA320ÄA319ÄA318ÄA317ÄA316ÄA315ÄA314ÄA313CÄA313BÄA313AÄA313ÄA312ÄA311ÄA310ÄA309CÄA309BÄA309AÄA309ÄA308ÄA307ÄA306ÄA305ÄA304ÄA303ÄA302ÄA301ÄA300ÄA299AÄA299ÄA298ÄA297ÄA296ÄA295ÄA294AÄA294ÄA293ÄA292ÄA291ÄA290ÄA289AÄA289ÄA288ÄA287ÄA286ÄA285ÄA284ÄA283ÄA282ÄA281ÄA280ÄA279ÄA278ÄA277ÄA276ÄA275ÄA274ÄA273ÄA272ÄA271ÄA270ÄA269ÄA268ÄA267AÄA267ÄA266ÄA265ÄA264ÄA263ÄA262ÄA261ÄA260ÄA259ÄA258ÄA257ÄA256ÄA255ÄA254ÄA253ÄA252ÄA251ÄA250ÄA249ÄA248ÄA247ÄA246ÄA245ÄA244ÄA243ÄA242ÄA241ÄA240ÄA239ÄA238ÄA237ÄA236ÄA235ÄA234ÄA233ÄA232ÄA231ÄA230ÄA229ÄA228ÄA227AÄA227ÄA226ÄA225ÄA224ÄA223ÄA222ÄA221ÄA220ÄA219ÄA218ÄA217ÄA216AÄA216ÄA215AÄA215ÄA214ÄA213ÄA212ÄA211ÄA210ÄA209AÄA209ÄA208ÄA207AÄA207ÄA206ÄA205ÄA204ÄA203ÄA202BÄA202AÄA202ÄA201ÄA200ÄA199ÄA198ÄA197ÄA196ÄA195ÄA194ÄA193ÄA192ÄA191ÄA190ÄA189ÄA188ÄA187ÄA186ÄA185ÄA184ÄA183ÄA182ÄA181ÄA180ÄA179ÄA178ÄA177ÄA176ÄA175ÄA174ÄA173ÄA172ÄA171ÄA170ÄA169ÄA168ÄA167ÄA166ÄA165ÄA164ÄA163ÄA162ÄA161ÄA160ÄA159ÄA158ÄA157ÄA156ÄA155ÄA154ÄA153ÄA152ÄA151ÄA150ÄA149ÄA148ÄA147ÄA146ÄA145ÄA144ÄA143ÄA142ÄA141ÄA140ÄA139ÄA138ÄA137ÄA136ÄA135AÄA135ÄA134ÄA133ÄA132ÄA131CÄA131ÄA130ÄA129ÄA128ÄA127ÄA126ÄA125AÄA125ÄA124ÄA123ÄA122ÄA121ÄA120BÄA120ÄA119ÄA118ÄA117ÄA116ÄA115AÄA115ÄA114ÄA113ÄA112ÄA111ÄA110BÄA110AÄA110ÄA109ÄA108ÄA107CÄA107BÄA107AÄA107ÄA106ÄA105BÄA105AÄA105ÄA104CÄA104BÄA104AÄA104ÄA103ÄA102AÄA102ÄA101AÄA101ÄA100AÄA100-102ÄA100ÄA099ÄA098AÄA098ÄA097AÄA097ÄA096ÄA095ÄA094ÄA093ÄA092ÄA091ÄA090ÄA089ÄA088ÄA087ÄA086ÄA085ÄA084ÄA083ÄA082ÄA081ÄA080ÄA079ÄA078ÄA077ÄA076ÄA075ÄA074ÄA073ÄA072ÄA071ÄA070ÄA069ÄA068ÄA067ÄA066CÄA066BÄA066AÄA066ÄA065ÄA064ÄA063ÄA062ÄA061ÄA060ÄA059ÄA058ÄA057ÄA056ÄA055ÄA054ÄA053ÄA052ÄA051ÄA050ÄA049ÄA048ÄA047ÄA046BÄA046AÄA046ÄA045AÄA045ÄA044ÄA043AÄA043ÄA042AÄA042ÄA041AÄA041ÄA040AÄA040ÄA039AÄA039ÄA038ÄA037ÄA036ÄA035ÄA034ÄA033ÄA032AÄA028BÄA026AÄA017AÄA014AÄA010AÄA006BÄA006AÄA005AÄA-WOÄA-EUÄ-UÕ-PHRUÄ-KHYUƒ-KHYILÄ-DZUƒ-CHA“-CHALÄ                                 "   ,   1   7   @   B   E   Q   Y   f   l   q   v   |   Å   â   í   ù   ¢   ß   ™   ∞   ¥   Ω   √   …   œ   ‘   ‹   „   Î   Ò   ˙   ±   ˝   ˛             !  (  2  8  =  B  E  K  Q  T  Y  _  i  n  s  x  ~  Ä  â  ê  ó  ô  ¢  ]  §  ¨  ¥  ∂  æ  ø  ƒ  «  Œ  –  ÷  ›  ‚  Í    ˜  ¸              $  )  0  3  ;  C  L  P  T  W  [  ^  c  m  t  {  Ç  â  é  ì  ú  û  ß  ´  ≤  ∫  æ  ∆       ”  ‡  ‰  È  Ó  Ù  ˆ       	           $  (  -  3  7  ?  B  K  T  \  d    o  t  y  Å  à  ã  ï  ô  ù  §  ß  ´  ≤  ∏  y  æ  ¡  ƒ  «  –  ‘  Ÿ  ‹  ‡  Ê  Î  Ó  Ò  ˆ  ¸          V    "  '  *  -  0  6  ;  @  F  K  P  U  Y  ^  d  i  n  r  x  }  Ç  á  ã  ê  ï  ö  †  ¶  ¨  ±  µ  ∫  ø  ƒ  »  Õ  “  ◊  ‹  7  <  A  G  L  ‡  V  Ê  Î    ˜  ˚  ˛    Z    _  e  j          !  '  +  o  .  0  y  5  9  ~  ?  É  C  G  N  à  R  W  [  ^  b  å  ë  g  m  ñ  y    Ö  ã  õ  ß  ≠  è  ì  ó  ö  ≤  û  †  •  ™  ∞  µ  ∫  æ  √  »  Õ  “  ÿ  ›  ‚  Ë  Ó  Û  ˜  ¸              !  %  *  /  4  9  =  @  G  L  Q  V  [  a  f  j  ∂  m  r  w  |  ª  Ä  Ñ  ã  ¿  í  ó  ≈  õ  ù  ¢  ≠  ≥  …  ∏  ¡  Œ  ∆  Ã  —  ”  ÷  ﬂ  ‰  Ë  Î    Ù  ¯  ¸  ˇ    ÿ    ›             &  ,  2  8  >  C  I  O  U  [  a  g  m  s  y  ~  É  à  ç  í  ó  ú  °  ¶  ´  ±  ∂  º  ¡  «  Õ  “  ÿ  ﬁ  ‰  Í  Ô  Ù  ˆ  ˜  ˚  ˇ                !  %  *  .  2  7  ;  >  B  H  V  Z  ^  b  e  j  n  r  u  y  ~  É  à  ç  ë  ï  ô  ù  °  ¶  ™  Ø  ≥  ∏  æ  ≈  À  –  ’  ⁄  ‡  Â  Î    ı  ˙  ˇ  	  	  		  H  	  	  	  &	  /	  =	  A	  E	  J	  W	  _	  b	  f	  i	  n	  r	  u	  y	  }	  Ç	  ®  á	  ã	  é	  í	  ò	  ü	  ¶	  ¨	  ±	  ∂	  º	  ¬	  «	  Ã	  —	  ÷	  €	  ‡	  ï	  Â	  ü  Á	  Ì	  Ò	  ˆ	  ˙	  ˛	  C  µ  
+  
+  
+  
+  
+  
+  
+  "
+  &
+  -
+  2
+  5
+  9
+  =
+  D
+  J
+  N
+  T
+  X
+  \
+  a
+  h
+  m
+  r
+  y
+  
+  Ö
+  ã
+  †
+  Æ
+  ø
+  Œ
+  ﬁ
+  Ô
+  ˛
+              *  1  7  ¡  =  D  J  N  Q  X  ^  c  g  l  p  t    x  }  Ç  Ü  ã  ì  ó  û  £  ß  ´  Ø  ¥  π  æ  ¬  «  Ã  –  ’  ⁄  ﬁ  ·  Â  È  Ò  ˆ  ˙  ˛               '  +  5  9  =  B  F  K  Q  V  Z  ^  b  ¢	  j  o  u  z  ~  É  à  å  í  ó    ù  £  ®  ≠  ≤  ∑  º  ¡  ∆  À  –  ’  ⁄  ﬂ  ‰  È  Ô  Ù  W  e   ˙  ˛                "  &  +  0  4  9  =  @  D  I  M  R  V  Y  [  _  c  h  l  o  |  Ä  Ñ  à  ç  ë  ï  ò  ú  †  •  ©  Æ  ≥  ∏  º  √  »  À  —  ‘  Ÿ  ﬂ  „  Á  Í  Ô  Û  ¯  ¸       	          #  )  /  4  9  >  C  “  ]  F  I  N  R  V  Z  ^  a  e  j  o  s  x  |  Å  Ö  â  ç  ì  ô  ú  ü  ñ   •  ™  ≥  ª  ƒ  Œ  ’  €  ‚  Á  

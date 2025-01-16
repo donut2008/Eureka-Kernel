@@ -1,7 +1,3 @@
-#
-# Makefile for GenWQE driver
-#
-
-obj-$(CONFIG_GENWQE) := genwqe_card.o
-genwqe_card-objs := card_base.o card_dev.o card_ddcb.o card_sysfs.o \
-	card_debugfs.o card_utils.o
+ PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_MAX_FAIL_SEL_MASK 0x180000
+#define PCIE_LC_CNTL3__LC_AUTO_DISABLE_SPEED_SUPPORT_MAX_FAIL_SEL__SHIFT 0x13
+#define PCIE_LC_CNTL

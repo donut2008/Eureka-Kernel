@@ -1,583 +1,352 @@
-#ifndef __CARD_BASE_H__
-#define __CARD_BASE_H__
-
-/**
- * IBM Accelerator Family 'GenWQE'
- *
- * (C) Copyright IBM Corp. 2013
- *
- * Author: Frank Haverkamp <haver@linux.vnet.ibm.com>
- * Author: Joerg-Stephan Vogt <jsvogt@de.ibm.com>
- * Author: Michael Jung <mijung@gmx.net>
- * Author: Michael Ruettger <michael@ibmra.de>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License (version 2 only)
- * as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- */
-
-/*
- * Interfaces within the GenWQE module. Defines genwqe_card and
- * ddcb_queue as well as ddcb_requ.
- */
-
-#include <linux/kernel.h>
-#include <linux/types.h>
-#include <linux/cdev.h>
-#include <linux/stringify.h>
-#include <linux/pci.h>
-#include <linux/semaphore.h>
-#include <linux/uaccess.h>
-#include <linux/io.h>
-#include <linux/debugfs.h>
-#include <linux/slab.h>
-
-#include <linux/genwqe/genwqe_card.h>
-#include "genwqe_driver.h"
-
-#define GENWQE_MSI_IRQS			4  /* Just one supported, no MSIx */
-#define GENWQE_FLAG_MSI_ENABLED		(1 << 0)
-
-#define GENWQE_MAX_VFS			15 /* maximum 15 VFs are possible */
-#define GENWQE_MAX_FUNCS		16 /* 1 PF and 15 VFs */
-#define GENWQE_CARD_NO_MAX		(16 * GENWQE_MAX_FUNCS)
-
-/* Compile parameters, some of them appear in debugfs for later adjustment */
-#define genwqe_ddcb_max			32 /* DDCBs on the work-queue */
-#define genwqe_polling_enabled		0  /* in case of irqs not working */
-#define genwqe_ddcb_software_timeout	10 /* timeout per DDCB in seconds */
-#define genwqe_kill_timeout		8  /* time until process gets killed */
-#define genwqe_vf_jobtimeout_msec	250  /* 250 msec */
-#define genwqe_pf_jobtimeout_msec	8000 /* 8 sec should be ok */
-#define genwqe_health_check_interval	4 /* <= 0: disabled */
-
-/* Sysfs attribute groups used when we create the genwqe device */
-extern const struct attribute_group *genwqe_attribute_groups[];
-
-/*
- * Config space for Genwqe5 A7:
- * 00:[14 10 4b 04]40 00 10 00[00 00 00 12]00 00 00 00
- * 10: 0c 00 00 f0 07 3c 00 00 00 00 00 00 00 00 00 00
- * 20: 00 00 00 00 00 00 00 00 00 00 00 00[14 10 4b 04]
- * 30: 00 00 00 00 50 00 00 00 00 00 00 00 00 00 00 00
- */
-#define PCI_DEVICE_GENWQE		0x044b /* Genwqe DeviceID */
-
-#define PCI_SUBSYSTEM_ID_GENWQE5	0x035f /* Genwqe A5 Subsystem-ID */
-#define PCI_SUBSYSTEM_ID_GENWQE5_NEW	0x044b /* Genwqe A5 Subsystem-ID */
-#define PCI_CLASSCODE_GENWQE5		0x1200 /* UNKNOWN */
-
-#define PCI_SUBVENDOR_ID_IBM_SRIOV	0x0000
-#define PCI_SUBSYSTEM_ID_GENWQE5_SRIOV	0x0000 /* Genwqe A5 Subsystem-ID */
-#define PCI_CLASSCODE_GENWQE5_SRIOV	0x1200 /* UNKNOWN */
-
-#define	GENWQE_SLU_ARCH_REQ		2 /* Required SLU architecture level */
-
-/**
- * struct genwqe_reg - Genwqe data dump functionality
- */
-struct genwqe_reg {
-	u32 addr;
-	u32 idx;
-	u64 val;
-};
-
-/*
- * enum genwqe_dbg_type - Specify chip unit to dump/debug
- */
-enum genwqe_dbg_type {
-	GENWQE_DBG_UNIT0 = 0,  /* captured before prev errs cleared */
-	GENWQE_DBG_UNIT1 = 1,
-	GENWQE_DBG_UNIT2 = 2,
-	GENWQE_DBG_UNIT3 = 3,
-	GENWQE_DBG_UNIT4 = 4,
-	GENWQE_DBG_UNIT5 = 5,
-	GENWQE_DBG_UNIT6 = 6,
-	GENWQE_DBG_UNIT7 = 7,
-	GENWQE_DBG_REGS  = 8,
-	GENWQE_DBG_DMA   = 9,
-	GENWQE_DBG_UNITS = 10, /* max number of possible debug units  */
-};
-
-/* Software error injection to simulate card failures */
-#define GENWQE_INJECT_HARDWARE_FAILURE	0x00000001 /* injects -1 reg reads */
-#define GENWQE_INJECT_BUS_RESET_FAILURE 0x00000002 /* pci_bus_reset fail */
-#define GENWQE_INJECT_GFIR_FATAL	0x00000004 /* GFIR = 0x0000ffff */
-#define GENWQE_INJECT_GFIR_INFO		0x00000008 /* GFIR = 0xffff0000 */
-
-/*
- * Genwqe card description and management data.
- *
- * Error-handling in case of card malfunction
- * ------------------------------------------
- *
- * If the card is detected to be defective the outside environment
- * will cause the PCI layer to call deinit (the cleanup function for
- * probe). This is the same effect like doing a unbind/bind operation
- * on the card.
- *
- * The genwqe card driver implements a health checking thread which
- * verifies the card function. If this detects a problem the cards
- * device is being shutdown and restarted again, along with a reset of
- * the card and queue.
- *
- * All functions accessing the card device return either -EIO or -ENODEV
- * code to indicate the malfunction to the user. The user has to close
- * the file descriptor and open a new one, once the card becomes
- * available again.
- *
- * If the open file descriptor is setup to receive SIGIO, the signal is
- * genereated for the application which has to provide a handler to
- * react on it. If the application does not close the open
- * file descriptor a SIGKILL is send to enforce freeing the cards
- * resources.
- *
- * I did not find a different way to prevent kernel problems due to
- * reference counters for the cards character devices getting out of
- * sync. The character device deallocation does not block, even if
- * there is still an open file descriptor pending. If this pending
- * descriptor is closed, the data structures used by the character
- * device is reinstantiated, which will lead to the reference counter
- * dropping below the allowed values.
- *
- * Card recovery
- * -------------
- *
- * To test the internal driver recovery the following command can be used:
- *   sudo sh -c 'echo 0xfffff > /sys/class/genwqe/genwqe0_card/err_inject'
- */
-
-
-/**
- * struct dma_mapping_type - Mapping type definition
- *
- * To avoid memcpying data arround we use user memory directly. To do
- * this we need to pin/swap-in the memory and request a DMA address
- * for it.
- */
-enum dma_mapping_type {
-	GENWQE_MAPPING_RAW = 0,		/* contignous memory buffer */
-	GENWQE_MAPPING_SGL_TEMP,	/* sglist dynamically used */
-	GENWQE_MAPPING_SGL_PINNED,	/* sglist used with pinning */
-};
-
-/**
- * struct dma_mapping - Information about memory mappings done by the driver
- */
-struct dma_mapping {
-	enum dma_mapping_type type;
-
-	void *u_vaddr;			/* user-space vaddr/non-aligned */
-	void *k_vaddr;			/* kernel-space vaddr/non-aligned */
-	dma_addr_t dma_addr;		/* physical DMA address */
-
-	struct page **page_list;	/* list of pages used by user buff */
-	dma_addr_t *dma_list;		/* list of dma addresses per page */
-	unsigned int nr_pages;		/* number of pages */
-	unsigned int size;		/* size in bytes */
-
-	struct list_head card_list;	/* list of usr_maps for card */
-	struct list_head pin_list;	/* list of pinned memory for dev */
-};
-
-static inline void genwqe_mapping_init(struct dma_mapping *m,
-				       enum dma_mapping_type type)
-{
-	memset(m, 0, sizeof(*m));
-	m->type = type;
-}
-
-/**
- * struct ddcb_queue - DDCB queue data
- * @ddcb_max:          Number of DDCBs on the queue
- * @ddcb_next:         Next free DDCB
- * @ddcb_act:          Next DDCB supposed to finish
- * @ddcb_seq:          Sequence number of last DDCB
- * @ddcbs_in_flight:   Currently enqueued DDCBs
- * @ddcbs_completed:   Number of already completed DDCBs
- * @return_on_busy:    Number of -EBUSY returns on full queue
- * @wait_on_busy:      Number of waits on full queue
- * @ddcb_daddr:        DMA address of first DDCB in the queue
- * @ddcb_vaddr:        Kernel virtual address of first DDCB in the queue
- * @ddcb_req:          Associated requests (one per DDCB)
- * @ddcb_waitqs:       Associated wait queues (one per DDCB)
- * @ddcb_lock:         Lock to protect queuing operations
- * @ddcb_waitq:        Wait on next DDCB finishing
- */
-
-struct ddcb_queue {
-	int ddcb_max;			/* amount of DDCBs  */
-	int ddcb_next;			/* next available DDCB num */
-	int ddcb_act;			/* DDCB to be processed */
-	u16 ddcb_seq;			/* slc seq num */
-	unsigned int ddcbs_in_flight;	/* number of ddcbs in processing */
-	unsigned int ddcbs_completed;
-	unsigned int ddcbs_max_in_flight;
-	unsigned int return_on_busy;    /* how many times -EBUSY? */
-	unsigned int wait_on_busy;
-
-	dma_addr_t ddcb_daddr;		/* DMA address */
-	struct ddcb *ddcb_vaddr;	/* kernel virtual addr for DDCBs */
-	struct ddcb_requ **ddcb_req;	/* ddcb processing parameter */
-	wait_queue_head_t *ddcb_waitqs; /* waitqueue per ddcb */
-
-	spinlock_t ddcb_lock;		/* exclusive access to queue */
-	wait_queue_head_t busy_waitq;   /* wait for ddcb processing */
-
-	/* registers or the respective queue to be used */
-	u32 IO_QUEUE_CONFIG;
-	u32 IO_QUEUE_STATUS;
-	u32 IO_QUEUE_SEGMENT;
-	u32 IO_QUEUE_INITSQN;
-	u32 IO_QUEUE_WRAP;
-	u32 IO_QUEUE_OFFSET;
-	u32 IO_QUEUE_WTIME;
-	u32 IO_QUEUE_ERRCNTS;
-	u32 IO_QUEUE_LRW;
-};
-
-/*
- * GFIR, SLU_UNITCFG, APP_UNITCFG
- *   8 Units with FIR/FEC + 64 * 2ndary FIRS/FEC.
- */
-#define GENWQE_FFDC_REGS	(3 + (8 * (2 + 2 * 64)))
-
-struct genwqe_ffdc {
-	unsigned int entries;
-	struct genwqe_reg *regs;
-};
-
-/**
- * struct genwqe_dev - GenWQE device information
- * @card_state:       Card operation state, see above
- * @ffdc:             First Failure Data Capture buffers for each unit
- * @card_thread:      Working thread to operate the DDCB queue
- * @card_waitq:       Wait queue used in card_thread
- * @queue:            DDCB queue
- * @health_thread:    Card monitoring thread (only for PFs)
- * @health_waitq:     Wait queue used in health_thread
- * @pci_dev:          Associated PCI device (function)
- * @mmio:             Base address of 64-bit register space
- * @mmio_len:         Length of register area
- * @file_lock:        Lock to protect access to file_list
- * @file_list:        List of all processes with open GenWQE file descriptors
- *
- * This struct contains all information needed to communicate with a
- * GenWQE card. It is initialized when a GenWQE device is found and
- * destroyed when it goes away. It holds data to maintain the queue as
- * well as data needed to feed the user interfaces.
- */
-struct genwqe_dev {
-	enum genwqe_card_state card_state;
-	spinlock_t print_lock;
-
-	int card_idx;			/* card index 0..CARD_NO_MAX-1 */
-	u64 flags;			/* general flags */
-
-	/* FFDC data gathering */
-	struct genwqe_ffdc ffdc[GENWQE_DBG_UNITS];
-
-	/* DDCB workqueue */
-	struct task_struct *card_thread;
-	wait_queue_head_t queue_waitq;
-	struct ddcb_queue queue;	/* genwqe DDCB queue */
-	unsigned int irqs_processed;
-
-	/* Card health checking thread */
-	struct task_struct *health_thread;
-	wait_queue_head_t health_waitq;
-
-	int use_platform_recovery;	/* use platform recovery mechanisms */
-
-	/* char device */
-	dev_t  devnum_genwqe;		/* major/minor num card */
-	struct class *class_genwqe;	/* reference to class object */
-	struct device *dev;		/* for device creation */
-	struct cdev cdev_genwqe;	/* char device for card */
-
-	struct dentry *debugfs_root;	/* debugfs card root directory */
-	struct dentry *debugfs_genwqe;	/* debugfs driver root directory */
-
-	/* pci resources */
-	struct pci_dev *pci_dev;	/* PCI device */
-	void __iomem *mmio;		/* BAR-0 MMIO start */
-	unsigned long mmio_len;
-	int num_vfs;
-	u32 vf_jobtimeout_msec[GENWQE_MAX_VFS];
-	int is_privileged;		/* access to all regs possible */
-
-	/* config regs which we need often */
-	u64 slu_unitcfg;
-	u64 app_unitcfg;
-	u64 softreset;
-	u64 err_inject;
-	u64 last_gfir;
-	char app_name[5];
-
-	spinlock_t file_lock;		/* lock for open files */
-	struct list_head file_list;	/* list of open files */
-
-	/* debugfs parameters */
-	int ddcb_software_timeout;	/* wait until DDCB times out */
-	int skip_recovery;		/* circumvention if recovery fails */
-	int kill_timeout;		/* wait after sending SIGKILL */
-};
-
-/**
- * enum genwqe_requ_state - State of a DDCB execution request
- */
-enum genwqe_requ_state {
-	GENWQE_REQU_NEW      = 0,
-	GENWQE_REQU_ENQUEUED = 1,
-	GENWQE_REQU_TAPPED   = 2,
-	GENWQE_REQU_FINISHED = 3,
-	GENWQE_REQU_STATE_MAX,
-};
-
-/**
- * struct genwqe_sgl - Scatter gather list describing user-space memory
- * @sgl:            scatter gather list needs to be 128 byte aligned
- * @sgl_dma_addr:   dma address of sgl
- * @sgl_size:       size of area used for sgl
- * @user_addr:      user-space address of memory area
- * @user_size:      size of user-space memory area
- * @page:           buffer for partial pages if needed
- * @page_dma_addr:  dma address partial pages
- */
-struct genwqe_sgl {
-	dma_addr_t sgl_dma_addr;
-	struct sg_entry *sgl;
-	size_t sgl_size;	/* size of sgl */
-
-	void __user *user_addr; /* user-space base-address */
-	size_t user_size;       /* size of memory area */
-
-	unsigned long nr_pages;
-	unsigned long fpage_offs;
-	size_t fpage_size;
-	size_t lpage_size;
-
-	void *fpage;
-	dma_addr_t fpage_dma_addr;
-
-	void *lpage;
-	dma_addr_t lpage_dma_addr;
-};
-
-int genwqe_alloc_sync_sgl(struct genwqe_dev *cd, struct genwqe_sgl *sgl,
-			  void __user *user_addr, size_t user_size);
-
-int genwqe_setup_sgl(struct genwqe_dev *cd, struct genwqe_sgl *sgl,
-		     dma_addr_t *dma_list);
-
-int genwqe_free_sync_sgl(struct genwqe_dev *cd, struct genwqe_sgl *sgl);
-
-/**
- * struct ddcb_requ - Kernel internal representation of the DDCB request
- * @cmd:          User space representation of the DDCB execution request
- */
-struct ddcb_requ {
-	/* kernel specific content */
-	enum genwqe_requ_state req_state; /* request status */
-	int num;			  /* ddcb_no for this request */
-	struct ddcb_queue *queue;	  /* associated queue */
-
-	struct dma_mapping  dma_mappings[DDCB_FIXUPS];
-	struct genwqe_sgl sgls[DDCB_FIXUPS];
-
-	/* kernel/user shared content */
-	struct genwqe_ddcb_cmd cmd;	/* ddcb_no for this request */
-	struct genwqe_debug_data debug_data;
-};
-
-/**
- * struct genwqe_file - Information for open GenWQE devices
- */
-struct genwqe_file {
-	struct genwqe_dev *cd;
-	struct genwqe_driver *client;
-	struct file *filp;
-
-	struct fasync_struct *async_queue;
-	struct pid *opener;
-	struct list_head list;		/* entry in list of open files */
-
-	spinlock_t map_lock;		/* lock for dma_mappings */
-	struct list_head map_list;	/* list of dma_mappings */
-
-	spinlock_t pin_lock;		/* lock for pinned memory */
-	struct list_head pin_list;	/* list of pinned memory */
-};
-
-int  genwqe_setup_service_layer(struct genwqe_dev *cd); /* for PF only */
-int  genwqe_finish_queue(struct genwqe_dev *cd);
-int  genwqe_release_service_layer(struct genwqe_dev *cd);
-
-/**
- * genwqe_get_slu_id() - Read Service Layer Unit Id
- * Return: 0x00: Development code
- *         0x01: SLC1 (old)
- *         0x02: SLC2 (sept2012)
- *         0x03: SLC2 (feb2013, generic driver)
- */
-static inline int genwqe_get_slu_id(struct genwqe_dev *cd)
-{
-	return (int)((cd->slu_unitcfg >> 32) & 0xff);
-}
-
-int  genwqe_ddcbs_in_flight(struct genwqe_dev *cd);
-
-u8   genwqe_card_type(struct genwqe_dev *cd);
-int  genwqe_card_reset(struct genwqe_dev *cd);
-int  genwqe_set_interrupt_capability(struct genwqe_dev *cd, int count);
-void genwqe_reset_interrupt_capability(struct genwqe_dev *cd);
-
-int  genwqe_device_create(struct genwqe_dev *cd);
-int  genwqe_device_remove(struct genwqe_dev *cd);
-
-/* debugfs */
-int  genwqe_init_debugfs(struct genwqe_dev *cd);
-void genqwe_exit_debugfs(struct genwqe_dev *cd);
-
-int  genwqe_read_softreset(struct genwqe_dev *cd);
-
-/* Hardware Circumventions */
-int  genwqe_recovery_on_fatal_gfir_required(struct genwqe_dev *cd);
-int  genwqe_flash_readback_fails(struct genwqe_dev *cd);
-
-/**
- * genwqe_write_vreg() - Write register in VF window
- * @cd:    genwqe device
- * @reg:   register address
- * @val:   value to write
- * @func:  0: PF, 1: VF0, ..., 15: VF14
- */
-int genwqe_write_vreg(struct genwqe_dev *cd, u32 reg, u64 val, int func);
-
-/**
- * genwqe_read_vreg() - Read register in VF window
- * @cd:    genwqe device
- * @reg:   register address
- * @func:  0: PF, 1: VF0, ..., 15: VF14
- *
- * Return: content of the register
- */
-u64 genwqe_read_vreg(struct genwqe_dev *cd, u32 reg, int func);
-
-/* FFDC Buffer Management */
-int  genwqe_ffdc_buff_size(struct genwqe_dev *cd, int unit_id);
-int  genwqe_ffdc_buff_read(struct genwqe_dev *cd, int unit_id,
-			   struct genwqe_reg *regs, unsigned int max_regs);
-int  genwqe_read_ffdc_regs(struct genwqe_dev *cd, struct genwqe_reg *regs,
-			   unsigned int max_regs, int all);
-int  genwqe_ffdc_dump_dma(struct genwqe_dev *cd,
-			  struct genwqe_reg *regs, unsigned int max_regs);
-
-int  genwqe_init_debug_data(struct genwqe_dev *cd,
-			    struct genwqe_debug_data *d);
-
-void genwqe_init_crc32(void);
-int  genwqe_read_app_id(struct genwqe_dev *cd, char *app_name, int len);
-
-/* Memory allocation/deallocation; dma address handling */
-int  genwqe_user_vmap(struct genwqe_dev *cd, struct dma_mapping *m,
-		      void *uaddr, unsigned long size,
-		      struct ddcb_requ *req);
-
-int  genwqe_user_vunmap(struct genwqe_dev *cd, struct dma_mapping *m,
-			struct ddcb_requ *req);
-
-static inline bool dma_mapping_used(struct dma_mapping *m)
-{
-	if (!m)
-		return 0;
-	return m->size != 0;
-}
-
-/**
- * __genwqe_execute_ddcb() - Execute DDCB request with addr translation
- *
- * This function will do the address translation changes to the DDCBs
- * according to the definitions required by the ATS field. It looks up
- * the memory allocation buffer or does vmap/vunmap for the respective
- * user-space buffers, inclusive page pinning and scatter gather list
- * buildup and teardown.
- */
-int  __genwqe_execute_ddcb(struct genwqe_dev *cd,
-			   struct genwqe_ddcb_cmd *cmd, unsigned int f_flags);
-
-/**
- * __genwqe_execute_raw_ddcb() - Execute DDCB request without addr translation
- *
- * This version will not do address translation or any modification of
- * the DDCB data. It is used e.g. for the MoveFlash DDCB which is
- * entirely prepared by the driver itself. That means the appropriate
- * DMA addresses are already in the DDCB and do not need any
- * modification.
- */
-int  __genwqe_execute_raw_ddcb(struct genwqe_dev *cd,
-			       struct genwqe_ddcb_cmd *cmd,
-			       unsigned int f_flags);
-int  __genwqe_enqueue_ddcb(struct genwqe_dev *cd,
-			   struct ddcb_requ *req,
-			   unsigned int f_flags);
-
-int  __genwqe_wait_ddcb(struct genwqe_dev *cd, struct ddcb_requ *req);
-int  __genwqe_purge_ddcb(struct genwqe_dev *cd, struct ddcb_requ *req);
-
-/* register access */
-int __genwqe_writeq(struct genwqe_dev *cd, u64 byte_offs, u64 val);
-u64 __genwqe_readq(struct genwqe_dev *cd, u64 byte_offs);
-int __genwqe_writel(struct genwqe_dev *cd, u64 byte_offs, u32 val);
-u32 __genwqe_readl(struct genwqe_dev *cd, u64 byte_offs);
-
-void *__genwqe_alloc_consistent(struct genwqe_dev *cd, size_t size,
-				 dma_addr_t *dma_handle);
-void __genwqe_free_consistent(struct genwqe_dev *cd, size_t size,
-			      void *vaddr, dma_addr_t dma_handle);
-
-/* Base clock frequency in MHz */
-int  genwqe_base_clock_frequency(struct genwqe_dev *cd);
-
-/* Before FFDC is captured the traps should be stopped. */
-void genwqe_stop_traps(struct genwqe_dev *cd);
-void genwqe_start_traps(struct genwqe_dev *cd);
-
-/* Hardware circumvention */
-bool genwqe_need_err_masking(struct genwqe_dev *cd);
-
-/**
- * genwqe_is_privileged() - Determine operation mode for PCI function
- *
- * On Intel with SRIOV support we see:
- *   PF: is_physfn = 1 is_virtfn = 0
- *   VF: is_physfn = 0 is_virtfn = 1
- *
- * On Systems with no SRIOV support _and_ virtualized systems we get:
- *       is_physfn = 0 is_virtfn = 0
- *
- * Other vendors have individual pci device ids to distinguish between
- * virtual function drivers and physical function drivers. GenWQE
- * unfortunately has just on pci device id for both, VFs and PF.
- *
- * The following code is used to distinguish if the card is running in
- * privileged mode, either as true PF or in a virtualized system with
- * full register access e.g. currently on PowerPC.
- *
- * if (pci_dev->is_virtfn)
- *          cd->is_privileged = 0;
- *  else
- *          cd->is_privileged = (__genwqe_readq(cd, IO_SLU_BITSTREAM)
- *				 != IO_ILLEGAL_VALUE);
- */
-static inline int genwqe_is_privileged(struct genwqe_dev *cd)
-{
-	return cd->is_privileged;
-}
-
-#endif	/* __CARD_BASE_H__ */
+ne PCIE_CNTL__RX_RCB_REORDER_EN__SHIFT 0x10
+#define PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS_MASK 0x20000
+#define PCIE_CNTL__RX_RCB_INVALID_SIZE_DIS__SHIFT 0x11
+#define PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS_MASK 0x40000
+#define PCIE_CNTL__RX_RCB_UNEXP_CPL_DIS__SHIFT 0x12
+#define PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE_MASK 0x80000
+#define PCIE_CNTL__RX_RCB_CPL_TIMEOUT_TEST_MODE__SHIFT 0x13
+#define PCIE_CNTL__RX_RCB_CHANNEL_ORDERING_MASK 0x100000
+#define PCIE_CNTL__RX_RCB_CHANNEL_ORDERING__SHIFT 0x14
+#define PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS_MASK 0x200000
+#define PCIE_CNTL__RX_RCB_WRONG_ATTR_DIS__SHIFT 0x15
+#define PCIE_CNTL__RX_RCB_WRONG_FUNCNUM_DIS_MASK 0x400000
+#define PCIE_CNTL__RX_RCB_WRONG_FUNCNUM_DIS__SHIFT 0x16
+#define PCIE_CNTL__RX_ATS_TRAN_CPL_SPLIT_DIS_MASK 0x800000
+#define PCIE_CNTL__RX_ATS_TRAN_CPL_SPLIT_DIS__SHIFT 0x17
+#define PCIE_CNTL__TX_CPL_DEBUG_MASK 0x3f000000
+#define PCIE_CNTL__TX_CPL_DEBUG__SHIFT 0x18
+#define PCIE_CNTL__RX_IGNORE_LTR_MSG_UR_MASK 0x40000000
+#define PCIE_CNTL__RX_IGNORE_LTR_MSG_UR__SHIFT 0x1e
+#define PCIE_CNTL__RX_CPL_POSTED_REQ_ORD_EN_MASK 0x80000000
+#define PCIE_CNTL__RX_CPL_POSTED_REQ_ORD_EN__SHIFT 0x1f
+#define PCIE_CONFIG_CNTL__DYN_CLK_LATENCY_MASK 0xf
+#define PCIE_CONFIG_CNTL__DYN_CLK_LATENCY__SHIFT 0x0
+#define PCIE_CONFIG_CNTL__CI_MAX_PAYLOAD_SIZE_MODE_MASK 0x10000
+#define PCIE_CONFIG_CNTL__CI_MAX_PAYLOAD_SIZE_MODE__SHIFT 0x10
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_PAYLOAD_SIZE_MASK 0xe0000
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_PAYLOAD_SIZE__SHIFT 0x11
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_REQUEST_SIZE_MODE_MASK 0x100000
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_REQUEST_SIZE_MODE__SHIFT 0x14
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_READ_REQUEST_SIZE_MASK 0xe00000
+#define PCIE_CONFIG_CNTL__CI_PRIV_MAX_READ_REQUEST_SIZE__SHIFT 0x15
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_SAFE_MODE_MASK 0x1000000
+#define PCIE_CONFIG_CNTL__CI_MAX_READ_SAFE_MODE__SHIFT 0x18
+#define PCIE_CONFIG_CNTL__CI_EXTENDED_TAG_EN_OVERRIDE_MASK 0x6000000
+#define PCIE_CONFIG_CNTL__CI_EXTENDED_TAG_EN_OVERRIDE__SHIFT 0x19
+#define PCIE_DEBUG_CNTL__DEBUG_PORT_EN_MASK 0xff
+#define PCIE_DEBUG_CNTL__DEBUG_PORT_EN__SHIFT 0x0
+#define PCIE_DEBUG_CNTL__DEBUG_SELECT_MASK 0x100
+#define PCIE_DEBUG_CNTL__DEBUG_SELECT__SHIFT 0x8
+#define PCIE_DEBUG_CNTL__DEBUG_LANE_EN_MASK 0xffff0000
+#define PCIE_DEBUG_CNTL__DEBUG_LANE_EN__SHIFT 0x10
+#define PCIE_INT_CNTL__CORR_ERR_INT_EN_MASK 0x1
+#define PCIE_INT_CNTL__CORR_ERR_INT_EN__SHIFT 0x0
+#define PCIE_INT_CNTL__NON_FATAL_ERR_INT_EN_MASK 0x2
+#define PCIE_INT_CNTL__NON_FATAL_ERR_INT_EN__SHIFT 0x1
+#define PCIE_INT_CNTL__FATAL_ERR_INT_EN_MASK 0x4
+#define PCIE_INT_CNTL__FATAL_ERR_INT_EN__SHIFT 0x2
+#define PCIE_INT_CNTL__USR_DETECTED_INT_EN_MASK 0x8
+#define PCIE_INT_CNTL__USR_DETECTED_INT_EN__SHIFT 0x3
+#define PCIE_INT_CNTL__MISC_ERR_INT_EN_MASK 0x10
+#define PCIE_INT_CNTL__MISC_ERR_INT_EN__SHIFT 0x4
+#define PCIE_INT_CNTL__POWER_STATE_CHG_INT_EN_MASK 0x40
+#define PCIE_INT_CNTL__POWER_STATE_CHG_INT_EN__SHIFT 0x6
+#define PCIE_INT_CNTL__LINK_BW_INT_EN_MASK 0x80
+#define PCIE_INT_CNTL__LINK_BW_INT_EN__SHIFT 0x7
+#define PCIE_INT_CNTL__QUIESCE_RCVD_INT_EN_MASK 0x100
+#define PCIE_INT_CNTL__QUIESCE_RCVD_INT_EN__SHIFT 0x8
+#define PCIE_INT_STATUS__CORR_ERR_INT_STATUS_MASK 0x1
+#define PCIE_INT_STATUS__CORR_ERR_INT_STATUS__SHIFT 0x0
+#define PCIE_INT_STATUS__NON_FATAL_ERR_INT_STATUS_MASK 0x2
+#define PCIE_INT_STATUS__NON_FATAL_ERR_INT_STATUS__SHIFT 0x1
+#define PCIE_INT_STATUS__FATAL_ERR_INT_STATUS_MASK 0x4
+#define PCIE_INT_STATUS__FATAL_ERR_INT_STATUS__SHIFT 0x2
+#define PCIE_INT_STATUS__USR_DETECTED_INT_STATUS_MASK 0x8
+#define PCIE_INT_STATUS__USR_DETECTED_INT_STATUS__SHIFT 0x3
+#define PCIE_INT_STATUS__MISC_ERR_INT_STATUS_MASK 0x10
+#define PCIE_INT_STATUS__MISC_ERR_INT_STATUS__SHIFT 0x4
+#define PCIE_INT_STATUS__POWER_STATE_CHG_INT_STATUS_MASK 0x40
+#define PCIE_INT_STATUS__POWER_STATE_CHG_INT_STATUS__SHIFT 0x6
+#define PCIE_INT_STATUS__LINK_BW_INT_STATUS_MASK 0x80
+#define PCIE_INT_STATUS__LINK_BW_INT_STATUS__SHIFT 0x7
+#define PCIE_INT_STATUS__QUIESCE_RCVD_INT_STATUS_MASK 0x100
+#define PCIE_INT_STATUS__QUIESCE_RCVD_INT_STATUS__SHIFT 0x8
+#define PCIE_CNTL2__TX_ARB_ROUND_ROBIN_EN_MASK 0x1
+#define PCIE_CNTL2__TX_ARB_ROUND_ROBIN_EN__SHIFT 0x0
+#define PCIE_CNTL2__TX_ARB_SLV_LIMIT_MASK 0x3e
+#define PCIE_CNTL2__TX_ARB_SLV_LIMIT__SHIFT 0x1
+#define PCIE_CNTL2__TX_ARB_MST_LIMIT_MASK 0x7c0
+#define PCIE_CNTL2__TX_ARB_MST_LIMIT__SHIFT 0x6
+#define PCIE_CNTL2__TX_BLOCK_TLP_ON_PM_DIS_MASK 0x800
+#define PCIE_CNTL2__TX_BLOCK_TLP_ON_PM_DIS__SHIFT 0xb
+#define PCIE_CNTL2__SLV_MEM_LS_EN_MASK 0x10000
+#define PCIE_CNTL2__SLV_MEM_LS_EN__SHIFT 0x10
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN_MASK 0x20000
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_LS_EN__SHIFT 0x11
+#define PCIE_CNTL2__MST_MEM_LS_EN_MASK 0x40000
+#define PCIE_CNTL2__MST_MEM_LS_EN__SHIFT 0x12
+#define PCIE_CNTL2__REPLAY_MEM_LS_EN_MASK 0x80000
+#define PCIE_CNTL2__REPLAY_MEM_LS_EN__SHIFT 0x13
+#define PCIE_CNTL2__SLV_MEM_SD_EN_MASK 0x100000
+#define PCIE_CNTL2__SLV_MEM_SD_EN__SHIFT 0x14
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN_MASK 0x200000
+#define PCIE_CNTL2__SLV_MEM_AGGRESSIVE_SD_EN__SHIFT 0x15
+#define PCIE_CNTL2__MST_MEM_SD_EN_MASK 0x400000
+#define PCIE_CNTL2__MST_MEM_SD_EN__SHIFT 0x16
+#define PCIE_CNTL2__REPLAY_MEM_SD_EN_MASK 0x800000
+#define PCIE_CNTL2__REPLAY_MEM_SD_EN__SHIFT 0x17
+#define PCIE_CNTL2__RX_NP_MEM_WRITE_ENCODING_MASK 0x1f000000
+#define PCIE_CNTL2__RX_NP_MEM_WRITE_ENCODING__SHIFT 0x18
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVALIDPASID_UR_MASK 0x1
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVALIDPASID_UR__SHIFT 0x0
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMRD_UR_MASK 0x2
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMRD_UR__SHIFT 0x1
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMWR_UR_MASK 0x4
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_TRANSMWR_UR__SHIFT 0x2
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_ATSTRANSREQ_UR_MASK 0x8
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_ATSTRANSREQ_UR__SHIFT 0x3
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_PAGEREQMSG_UR_MASK 0x10
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_PAGEREQMSG_UR__SHIFT 0x4
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVCPL_UR_MASK 0x20
+#define PCIE_RX_CNTL2__RX_IGNORE_EP_INVCPL_UR__SHIFT 0x5
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_EN_MASK 0x100
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_EN__SHIFT 0x8
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_SCALE_MASK 0xe00
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_SCALE__SHIFT 0x9
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_MAX_COUNT_MASK 0x3ff0000
+#define PCIE_RX_CNTL2__RX_RCB_LATENCY_MAX_COUNT__SHIFT 0x10
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_P_MASK 0x3
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_P__SHIFT 0x0
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_NP_MASK 0xc
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_NP__SHIFT 0x2
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_CPL_MASK 0x30
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_IDO_OVERRIDE_CPL__SHIFT 0x4
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_P_MASK 0xc0
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_P__SHIFT 0x6
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_NP_MASK 0x300
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_RO_OVERRIDE_NP__SHIFT 0x8
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_SNR_OVERRIDE_P_MASK 0xc00
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_SNR_OVERRIDE_P__SHIFT 0xa
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_SNR_OVERRIDE_NP_MASK 0x3000
+#define PCIE_TX_F0_ATTR_CNTL__TX_F0_SNR_OVERRIDE_NP__SHIFT 0xc
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_P_MASK 0x3
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_P__SHIFT 0x0
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_NP_MASK 0xc
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_NP__SHIFT 0x2
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_CPL_MASK 0x30
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_IDO_OVERRIDE_CPL__SHIFT 0x4
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_RO_OVERRIDE_P_MASK 0xc0
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_RO_OVERRIDE_P__SHIFT 0x6
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_RO_OVERRIDE_NP_MASK 0x300
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_RO_OVERRIDE_NP__SHIFT 0x8
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_SNR_OVERRIDE_P_MASK 0xc00
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_SNR_OVERRIDE_P__SHIFT 0xa
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_SNR_OVERRIDE_NP_MASK 0x3000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F1_SNR_OVERRIDE_NP__SHIFT 0xc
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_P_MASK 0x30000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_P__SHIFT 0x10
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_NP_MASK 0xc0000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_NP__SHIFT 0x12
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_CPL_MASK 0x300000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_IDO_OVERRIDE_CPL__SHIFT 0x14
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_RO_OVERRIDE_P_MASK 0xc00000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_RO_OVERRIDE_P__SHIFT 0x16
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_RO_OVERRIDE_NP_MASK 0x3000000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_RO_OVERRIDE_NP__SHIFT 0x18
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_SNR_OVERRIDE_P_MASK 0xc000000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_SNR_OVERRIDE_P__SHIFT 0x1a
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_SNR_OVERRIDE_NP_MASK 0x30000000
+#define PCIE_TX_F1_F2_ATTR_CNTL__TX_F2_SNR_OVERRIDE_NP__SHIFT 0x1c
+#define PCIE_CI_CNTL__CI_SLAVE_SPLIT_MODE_MASK 0x4
+#define PCIE_CI_CNTL__CI_SLAVE_SPLIT_MODE__SHIFT 0x2
+#define PCIE_CI_CNTL__CI_SLAVE_GEN_USR_DIS_MASK 0x8
+#define PCIE_CI_CNTL__CI_SLAVE_GEN_USR_DIS__SHIFT 0x3
+#define PCIE_CI_CNTL__CI_MST_CMPL_DUMMY_DATA_MASK 0x10
+#define PCIE_CI_CNTL__CI_MST_CMPL_DUMMY_DATA__SHIFT 0x4
+#define PCIE_CI_CNTL__CI_SLV_RC_RD_REQ_SIZE_MASK 0xc0
+#define PCIE_CI_CNTL__CI_SLV_RC_RD_REQ_SIZE__SHIFT 0x6
+#define PCIE_CI_CNTL__CI_SLV_ORDERING_DIS_MASK 0x100
+#define PCIE_CI_CNTL__CI_SLV_ORDERING_DIS__SHIFT 0x8
+#define PCIE_CI_CNTL__CI_RC_ORDERING_DIS_MASK 0x200
+#define PCIE_CI_CNTL__CI_RC_ORDERING_DIS__SHIFT 0x9
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_DIS_MASK 0x400
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_DIS__SHIFT 0xa
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_MODE_MASK 0x800
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_MODE__SHIFT 0xb
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_SOR_MASK 0x1000
+#define PCIE_CI_CNTL__CI_SLV_CPL_ALLOC_SOR__SHIFT 0xc
+#define PCIE_CI_CNTL__CI_MST_IGNORE_PAGE_ALIGNED_REQUEST_MASK 0x2000
+#define PCIE_CI_CNTL__CI_MST_IGNORE_PAGE_ALIGNED_REQUEST__SHIFT 0xd
+#define PCIE_BUS_CNTL__PMI_INT_DIS_MASK 0x40
+#define PCIE_BUS_CNTL__PMI_INT_DIS__SHIFT 0x6
+#define PCIE_BUS_CNTL__IMMEDIATE_PMI_DIS_MASK 0x80
+#define PCIE_BUS_CNTL__IMMEDIATE_PMI_DIS__SHIFT 0x7
+#define PCIE_BUS_CNTL__TRUE_PM_STATUS_EN_MASK 0x1000
+#define PCIE_BUS_CNTL__TRUE_PM_STATUS_EN__SHIFT 0xc
+#define PCIE_LC_STATE6__LC_PREV_STATE24_MASK 0x3f
+#define PCIE_LC_STATE6__LC_PREV_STATE24__SHIFT 0x0
+#define PCIE_LC_STATE6__LC_PREV_STATE25_MASK 0x3f00
+#define PCIE_LC_STATE6__LC_PREV_STATE25__SHIFT 0x8
+#define PCIE_LC_STATE6__LC_PREV_STATE26_MASK 0x3f0000
+#define PCIE_LC_STATE6__LC_PREV_STATE26__SHIFT 0x10
+#define PCIE_LC_STATE6__LC_PREV_STATE27_MASK 0x3f000000
+#define PCIE_LC_STATE6__LC_PREV_STATE27__SHIFT 0x18
+#define PCIE_LC_STATE7__LC_PREV_STATE28_MASK 0x3f
+#define PCIE_LC_STATE7__LC_PREV_STATE28__SHIFT 0x0
+#define PCIE_LC_STATE7__LC_PREV_STATE29_MASK 0x3f00
+#define PCIE_LC_STATE7__LC_PREV_STATE29__SHIFT 0x8
+#define PCIE_LC_STATE7__LC_PREV_STATE30_MASK 0x3f0000
+#define PCIE_LC_STATE7__LC_PREV_STATE30__SHIFT 0x10
+#define PCIE_LC_STATE7__LC_PREV_STATE31_MASK 0x3f000000
+#define PCIE_LC_STATE7__LC_PREV_STATE31__SHIFT 0x18
+#define PCIE_LC_STATE8__LC_PREV_STATE32_MASK 0x3f
+#define PCIE_LC_STATE8__LC_PREV_STATE32__SHIFT 0x0
+#define PCIE_LC_STATE8__LC_PREV_STATE33_MASK 0x3f00
+#define PCIE_LC_STATE8__LC_PREV_STATE33__SHIFT 0x8
+#define PCIE_LC_STATE8__LC_PREV_STATE34_MASK 0x3f0000
+#define PCIE_LC_STATE8__LC_PREV_STATE34__SHIFT 0x10
+#define PCIE_LC_STATE8__LC_PREV_STATE35_MASK 0x3f000000
+#define PCIE_LC_STATE8__LC_PREV_STATE35__SHIFT 0x18
+#define PCIE_LC_STATE9__LC_PREV_STATE36_MASK 0x3f
+#define PCIE_LC_STATE9__LC_PREV_STATE36__SHIFT 0x0
+#define PCIE_LC_STATE9__LC_PREV_STATE37_MASK 0x3f00
+#define PCIE_LC_STATE9__LC_PREV_STATE37__SHIFT 0x8
+#define PCIE_LC_STATE9__LC_PREV_STATE38_MASK 0x3f0000
+#define PCIE_LC_STATE9__LC_PREV_STATE38__SHIFT 0x10
+#define PCIE_LC_STATE9__LC_PREV_STATE39_MASK 0x3f000000
+#define PCIE_LC_STATE9__LC_PREV_STATE39__SHIFT 0x18
+#define PCIE_LC_STATE10__LC_PREV_STATE40_MASK 0x3f
+#define PCIE_LC_STATE10__LC_PREV_STATE40__SHIFT 0x0
+#define PCIE_LC_STATE10__LC_PREV_STATE41_MASK 0x3f00
+#define PCIE_LC_STATE10__LC_PREV_STATE41__SHIFT 0x8
+#define PCIE_LC_STATE10__LC_PREV_STATE42_MASK 0x3f0000
+#define PCIE_LC_STATE10__LC_PREV_STATE42__SHIFT 0x10
+#define PCIE_LC_STATE10__LC_PREV_STATE43_MASK 0x3f000000
+#define PCIE_LC_STATE10__LC_PREV_STATE43__SHIFT 0x18
+#define PCIE_LC_STATE11__LC_PREV_STATE44_MASK 0x3f
+#define PCIE_LC_STATE11__LC_PREV_STATE44__SHIFT 0x0
+#define PCIE_LC_STATE11__LC_PREV_STATE45_MASK 0x3f00
+#define PCIE_LC_STATE11__LC_PREV_STATE45__SHIFT 0x8
+#define PCIE_LC_STATE11__LC_PREV_STATE46_MASK 0x3f0000
+#define PCIE_LC_STATE11__LC_PREV_STATE46__SHIFT 0x10
+#define PCIE_LC_STATE11__LC_PREV_STATE47_MASK 0x3f000000
+#define PCIE_LC_STATE11__LC_PREV_STATE47__SHIFT 0x18
+#define PCIE_LC_STATUS1__LC_REVERSE_RCVR_MASK 0x1
+#define PCIE_LC_STATUS1__LC_REVERSE_RCVR__SHIFT 0x0
+#define PCIE_LC_STATUS1__LC_REVERSE_XMIT_MASK 0x2
+#define PCIE_LC_STATUS1__LC_REVERSE_XMIT__SHIFT 0x1
+#define PCIE_LC_STATUS1__LC_OPERATING_LINK_WIDTH_MASK 0x1c
+#define PCIE_LC_STATUS1__LC_OPERATING_LINK_WIDTH__SHIFT 0x2
+#define PCIE_LC_STATUS1__LC_DETECTED_LINK_WIDTH_MASK 0xe0
+#define PCIE_LC_STATUS1__LC_DETECTED_LINK_WIDTH__SHIFT 0x5
+#define PCIE_LC_STATUS2__LC_TOTAL_INACTIVE_LANES_MASK 0xffff
+#define PCIE_LC_STATUS2__LC_TOTAL_INACTIVE_LANES__SHIFT 0x0
+#define PCIE_LC_STATUS2__LC_TURN_ON_LANE_MASK 0xffff0000
+#define PCIE_LC_STATUS2__LC_TURN_ON_LANE__SHIFT 0x10
+#define PCIE_WPR_CNTL__WPR_RESET_HOT_RST_EN_MASK 0x1
+#define PCIE_WPR_CNTL__WPR_RESET_HOT_RST_EN__SHIFT 0x0
+#define PCIE_WPR_CNTL__WPR_RESET_LNK_DWN_EN_MASK 0x2
+#define PCIE_WPR_CNTL__WPR_RESET_LNK_DWN_EN__SHIFT 0x1
+#define PCIE_WPR_CNTL__WPR_RESET_LNK_DIS_EN_MASK 0x4
+#define PCIE_WPR_CNTL__WPR_RESET_LNK_DIS_EN__SHIFT 0x2
+#define PCIE_WPR_CNTL__WPR_RESET_COR_EN_MASK 0x8
+#define PCIE_WPR_CNTL__WPR_RESET_COR_EN__SHIFT 0x3
+#define PCIE_WPR_CNTL__WPR_RESET_REG_EN_MASK 0x10
+#define PCIE_WPR_CNTL__WPR_RESET_REG_EN__SHIFT 0x4
+#define PCIE_WPR_CNTL__WPR_RESET_STY_EN_MASK 0x20
+#define PCIE_WPR_CNTL__WPR_RESET_STY_EN__SHIFT 0x5
+#define PCIE_WPR_CNTL__WPR_RESET_PHY_EN_MASK 0x40
+#define PCIE_WPR_CNTL__WPR_RESET_PHY_EN__SHIFT 0x6
+#define PCIE_RX_LAST_TLP0__RX_LAST_TLP0_MASK 0xffffffff
+#define PCIE_RX_LAST_TLP0__RX_LAST_TLP0__SHIFT 0x0
+#define PCIE_RX_LAST_TLP1__RX_LAST_TLP1_MASK 0xffffffff
+#define PCIE_RX_LAST_TLP1__RX_LAST_TLP1__SHIFT 0x0
+#define PCIE_RX_LAST_TLP2__RX_LAST_TLP2_MASK 0xffffffff
+#define PCIE_RX_LAST_TLP2__RX_LAST_TLP2__SHIFT 0x0
+#define PCIE_RX_LAST_TLP3__RX_LAST_TLP3_MASK 0xffffffff
+#define PCIE_RX_LAST_TLP3__RX_LAST_TLP3__SHIFT 0x0
+#define PCIE_TX_LAST_TLP0__TX_LAST_TLP0_MASK 0xffffffff
+#define PCIE_TX_LAST_TLP0__TX_LAST_TLP0__SHIFT 0x0
+#define PCIE_TX_LAST_TLP1__TX_LAST_TLP1_MASK 0xffffffff
+#define PCIE_TX_LAST_TLP1__TX_LAST_TLP1__SHIFT 0x0
+#define PCIE_TX_LAST_TLP2__TX_LAST_TLP2_MASK 0xffffffff
+#define PCIE_TX_LAST_TLP2__TX_LAST_TLP2__SHIFT 0x0
+#define PCIE_TX_LAST_TLP3__TX_LAST_TLP3_MASK 0xffffffff
+#define PCIE_TX_LAST_TLP3__TX_LAST_TLP3__SHIFT 0x0
+#define PCIE_I2C_REG_ADDR_EXPAND__I2C_REG_ADDR_MASK 0x1ffff
+#define PCIE_I2C_REG_ADDR_EXPAND__I2C_REG_ADDR__SHIFT 0x0
+#define PCIE_I2C_REG_DATA__I2C_REG_DATA_MASK 0xffffffff
+#define PCIE_I2C_REG_DATA__I2C_REG_DATA__SHIFT 0x0
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_HIDDEN_REG_MASK 0x1
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_HIDDEN_REG__SHIFT 0x0
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_GEN2_HIDDEN_REG_MASK 0x2
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_GEN2_HIDDEN_REG__SHIFT 0x1
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_GEN3_HIDDEN_REG_MASK 0x4
+#define PCIE_CFG_CNTL__CFG_EN_DEC_TO_GEN3_HIDDEN_REG__SHIFT 0x2
+#define PCIE_P_CNTL__P_PWRDN_EN_MASK 0x1
+#define PCIE_P_CNTL__P_PWRDN_EN__SHIFT 0x0
+#define PCIE_P_CNTL__P_SYMALIGN_MODE_MASK 0x2
+#define PCIE_P_CNTL__P_SYMALIGN_MODE__SHIFT 0x1
+#define PCIE_P_CNTL__P_SYMALIGN_HW_DEBUG_MASK 0x4
+#define PCIE_P_CNTL__P_SYMALIGN_HW_DEBUG__SHIFT 0x2
+#define PCIE_P_CNTL__P_ELASTDESKEW_HW_DEBUG_MASK 0x8
+#define PCIE_P_CNTL__P_ELASTDESKEW_HW_DEBUG__SHIFT 0x3
+#define PCIE_P_CNTL__P_IGNORE_CRC_ERR_MASK 0x10
+#define PCIE_P_CNTL__P_IGNORE_CRC_ERR__SHIFT 0x4
+#define PCIE_P_CNTL__P_IGNORE_LEN_ERR_MASK 0x20
+#define PCIE_P_CNTL__P_IGNORE_LEN_ERR__SHIFT 0x5
+#define PCIE_P_CNTL__P_IGNORE_EDB_ERR_MASK 0x40
+#define PCIE_P_CNTL__P_IGNORE_EDB_ERR__SHIFT 0x6
+#define PCIE_P_CNTL__P_IGNORE_IDL_ERR_MASK 0x80
+#define PCIE_P_CNTL__P_IGNORE_IDL_ERR__SHIFT 0x7
+#define PCIE_P_CNTL__P_IGNORE_TOK_ERR_MASK 0x100
+#define PCIE_P_CNTL__P_IGNORE_TOK_ERR__SHIFT 0x8
+#define PCIE_P_CNTL__P_BLK_LOCK_MODE_MASK 0x1000
+#define PCIE_P_CNTL__P_BLK_LOCK_MODE__SHIFT 0xc
+#define PCIE_P_CNTL__P_ALWAYS_USE_FAST_TXCLK_MASK 0x2000
+#define PCIE_P_CNTL__P_ALWAYS_USE_FAST_TXCLK__SHIFT 0xd
+#define PCIE_P_CNTL__P_ELEC_IDLE_MODE_MASK 0xc000
+#define PCIE_P_CNTL__P_ELEC_IDLE_MODE__SHIFT 0xe
+#define PCIE_P_CNTL__DLP_IGNORE_IN_L1_EN_MASK 0x10000
+#define PCIE_P_CNTL__DLP_IGNORE_IN_L1_EN__SHIFT 0x10
+#define PCIE_P_BUF_STATUS__P_OVERFLOW_ERR_MASK 0xffff
+#define PCIE_P_BUF_STATUS__P_OVERFLOW_ERR__SHIFT 0x0
+#define PCIE_P_BUF_STATUS__P_UNDERFLOW_ERR_MASK 0xffff0000
+#define PCIE_P_BUF_STATUS__P_UNDERFLOW_ERR__SHIFT 0x10
+#define PCIE_P_DECODER_STATUS__P_DECODE_ERR_MASK 0xffff
+#define PCIE_P_DECODER_STATUS__P_DECODE_ERR__SHIFT 0x0
+#define PCIE_P_MISC_STATUS__P_DESKEW_ERR_MASK 0xff
+#define PCIE_P_MISC_STATUS__P_DESKEW_ERR__SHIFT 0x0
+#define PCIE_P_MISC_STATUS__P_SYMUNLOCK_ERR_MASK 0xffff0000
+#define PCIE_P_MISC_STATUS__P_SYMUNLOCK_ERR__SHIFT 0x10
+#define PCIE_P_RCV_L0S_FTS_DET__P_RCV_L0S_FTS_DET_MIN_MASK 0xff
+#define PCIE_P_RCV_L0S_FTS_DET__P_RCV_L0S_FTS_DET_MIN__SHIFT 0x0
+#define PCIE_P_RCV_L0S_FTS_DET__P_RCV_L0S_FTS_DET_MAX_MASK 0xff00
+#define PCIE_P_RCV_L0S_FTS_DET__P_RCV_L0S_FTS_DET_MAX__SHIFT 0x8
+#define PCIE_OBFF_CNTL__TX_OBFF_PRIV_DISABLE_MASK 0x1
+#define PCIE_OBFF_CNTL__TX_OBFF_PRIV_DISABLE__SHIFT 0x0
+#define PCIE_OBFF_CNTL__TX_OBFF_WAKE_SIMPLE_MODE_EN_MASK 0x2
+#define PCIE_OBFF_CNTL__TX_OBFF_WAKE_SIMPLE_MODE_EN__SHIFT 0x1
+#define PCIE_OBFF_CNTL__TX_OBFF_HOSTMEM_TO_ACTIVE_MASK 0x4
+#define PCIE_OBFF_CNTL__TX_OBFF_HOSTMEM_TO_ACTIVE__SHIFT 0x2
+#define PCIE_OBFF_CNTL__TX_OBFF_SLVCPL_TO_ACTIVE_MASK 0x8
+#define PCIE_OBFF_CNTL__TX_OBFF_SLVCPL_TO_ACTIVE__SHIFT 0x3
+#define PCIE_OBFF_CNTL__TX_OBFF_WAKE_MAX_PULSE_WIDTH_MASK 0xf0
+#define PCIE_OBFF_CNTL__TX_OBFF_WAKE_MAX_PULSE_WIDTH__SHIFT 0x4
+#define PCIE_OBFF_CNTL__TX_OBFF_WAKE_MAX_TWO_FALLING_WIDTH_MASK 0xf00
+#define PCIE_OBFF_CNTL__TX_OBFF_WAKE_MAX_TWO_FALLING_WIDTH__SHIFT 0x8
+#define PCIE_OBFF_CNTL__TX_OBFF_WAKE_SAMPLING_PERIOD_MASK 0xf000
+#define PCIE_OBFF_CNTL__TX_OBFF_WAKE_SAMPLING_PERIOD__SHIFT 0xc
+#define PCIE_OBFF_CNTL__TX_OBFF_INTR_TO_ACTIVE_MASK 0x10000
+#define PCIE_OBFF_CNTL__TX_OBFF_INTR_TO_ACTIVE__SHIFT 0x10
+#define PCIE_OBFF_CNTL__TX_OBFF_ERR_TO_ACTIVE_MASK 0x20000
+#define PCIE_OBFF_CNTL__TX_OBFF_ERR_TO_ACTIVE__SHIFT 0x11
+#define PCIE_OBFF_CNTL__TX_OBFF_ANY_MSG_TO_ACTIVE_MASK 0x40000
+#define PCIE_OBFF_CNTL__TX_OBFF_ANY_MSG_TO_ACTIVE__SHIFT 0x12
+#define PCIE_OBFF_CNTL__TX_OBFF_PENDING_REQ_TO_ACTIVE_MASK 0xf00000
+#define PCIE_OBFF_CNTL__TX_OBFF_PENDING_REQ_TO_ACTIVE__SHIFT 0x14
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_SHORT_VALUE_MASK 0x7
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_SHORT_VALUE__SHIFT 0x0
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_LONG_VALUE_MASK 0x38
+#define PCIE_TX_LTR_CNTL__LTR_PRIV_S_LONG_VALUE__SHIFT 0x3
+#define PCIE_TX_LTR_CNTL_

@@ -1,107 +1,104 @@
-/*
- * Support for the S1 button on Routerboard 532
+ == SRPT_STATE_DONE);
+	WARN_ON(new == SRPT_STATE_NEW);
+
+	spin_lock_irqsave(&ioctx->spinlock, flags);
+	previous = ioctx->state;
+	if (previous == old)
+		ioctx->state = new;
+	spin_unlock_irqrestore(&ioctx->spinlock, flags);
+	return previous == old;
+}
+
+/**
+ * srpt_post_recv() - Post an IB receive request.
+ */
+static int srpt_post_recv(struct srpt_device *sdev,
+			  struct srpt_recv_ioctx *ioctx)
+{
+	struct ib_sge list;
+	struct ib_recv_wr wr, *bad_wr;
+
+	BUG_ON(!sdev);
+	wr.wr_id = encode_wr_id(SRPT_RECV, ioctx->ioctx.index);
+
+	list.addr = ioctx->ioctx.dma;
+	list.length = srp_max_req_size;
+	list.lkey = sdev->pd->local_dma_lkey;
+
+	wr.next = NULL;
+	wr.sg_list = &list;
+	wr.num_sge = 1;
+
+	return ib_post_srq_recv(sdev->srq, &wr, &bad_wr);
+}
+
+/**
+ * srpt_post_send() - Post an IB send request.
  *
- * Copyright (C) 2009  Phil Sutter <n0-1@freewrt.org>
+ * Returns zero upon success and a non-zero value upon failure.
  */
-
-#include <linux/input-polldev.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/gpio.h>
-
-#include <asm/mach-rc32434/gpio.h>
-#include <asm/mach-rc32434/rb.h>
-
-#define DRV_NAME "rb532-button"
-
-#define RB532_BTN_RATE 100 /* msec */
-#define RB532_BTN_KSYM BTN_0
-
-/* The S1 button state is provided by GPIO pin 1. But as this
- * pin is also used for uart input as alternate function, the
- * operational modes must be switched first:
- * 1) disable uart using set_latch_u5()
- * 2) turn off alternate function implicitly through
- *    gpio_direction_input()
- * 3) read the GPIO's current value
- * 4) undo step 2 by enabling alternate function (in this
- *    mode the GPIO direction is fixed, so no change needed)
- * 5) turn on uart again
- * The GPIO value occurs to be inverted, so pin high means
- * button is not pressed.
- */
-static bool rb532_button_pressed(void)
+static int srpt_post_send(struct srpt_rdma_ch *ch,
+			  struct srpt_send_ioctx *ioctx, int len)
 {
-	int val;
+	struct ib_sge list;
+	struct ib_send_wr wr, *bad_wr;
+	struct srpt_device *sdev = ch->sport->sdev;
+	int ret;
 
-	set_latch_u5(0, LO_FOFF);
-	gpio_direction_input(GPIO_BTN_S1);
+	atomic_inc(&ch->req_lim);
 
-	val = gpio_get_value(GPIO_BTN_S1);
-
-	rb532_gpio_set_func(GPIO_BTN_S1);
-	set_latch_u5(LO_FOFF, 0);
-
-	return !val;
-}
-
-static void rb532_button_poll(struct input_polled_dev *poll_dev)
-{
-	input_report_key(poll_dev->input, RB532_BTN_KSYM,
-			 rb532_button_pressed());
-	input_sync(poll_dev->input);
-}
-
-static int rb532_button_probe(struct platform_device *pdev)
-{
-	struct input_polled_dev *poll_dev;
-	int error;
-
-	poll_dev = input_allocate_polled_device();
-	if (!poll_dev)
-		return -ENOMEM;
-
-	poll_dev->poll = rb532_button_poll;
-	poll_dev->poll_interval = RB532_BTN_RATE;
-
-	poll_dev->input->name = "rb532 button";
-	poll_dev->input->phys = "rb532/button0";
-	poll_dev->input->id.bustype = BUS_HOST;
-	poll_dev->input->dev.parent = &pdev->dev;
-
-	dev_set_drvdata(&pdev->dev, poll_dev);
-
-	input_set_capability(poll_dev->input, EV_KEY, RB532_BTN_KSYM);
-
-	error = input_register_polled_device(poll_dev);
-	if (error) {
-		input_free_polled_device(poll_dev);
-		return error;
+	ret = -ENOMEM;
+	if (unlikely(atomic_dec_return(&ch->sq_wr_avail) < 0)) {
+		pr_warn("IB send queue full (needed 1)\n");
+		goto out;
 	}
 
-	return 0;
+	ib_dma_sync_single_for_device(sdev->device, ioctx->ioctx.dma, len,
+				      DMA_TO_DEVICE);
+
+	list.addr = ioctx->ioctx.dma;
+	list.length = len;
+	list.lkey = sdev->pd->local_dma_lkey;
+
+	wr.next = NULL;
+	wr.wr_id = encode_wr_id(SRPT_SEND, ioctx->ioctx.index);
+	wr.sg_list = &list;
+	wr.num_sge = 1;
+	wr.opcode = IB_WR_SEND;
+	wr.send_flags = IB_SEND_SIGNALED;
+
+	ret = ib_post_send(ch->qp, &wr, &bad_wr);
+
+out:
+	if (ret < 0) {
+		atomic_inc(&ch->sq_wr_avail);
+		atomic_dec(&ch->req_lim);
+	}
+	return ret;
 }
 
-static int rb532_button_remove(struct platform_device *pdev)
+/**
+ * srpt_get_desc_tbl() - Parse the data descriptors of an SRP_CMD request.
+ * @ioctx: Pointer to the I/O context associated with the request.
+ * @srp_cmd: Pointer to the SRP_CMD request data.
+ * @dir: Pointer to the variable to which the transfer direction will be
+ *   written.
+ * @data_len: Pointer to the variable to which the total data length of all
+ *   descriptors in the SRP_CMD request will be written.
+ *
+ * This function initializes ioctx->nrbuf and ioctx->r_bufs.
+ *
+ * Returns -EINVAL when the SRP_CMD request contains inconsistent descriptors;
+ * -ENOMEM when memory allocation fails and zero upon success.
+ */
+static int srpt_get_desc_tbl(struct srpt_send_ioctx *ioctx,
+			     struct srp_cmd *srp_cmd,
+			     enum dma_data_direction *dir, u64 *data_len)
 {
-	struct input_polled_dev *poll_dev = dev_get_drvdata(&pdev->dev);
+	struct srp_indirect_buf *idb;
+	struct srp_direct_buf *db;
+	unsigned add_cdb_offset;
+	int ret;
 
-	input_unregister_polled_device(poll_dev);
-	input_free_polled_device(poll_dev);
-
-	return 0;
-}
-
-static struct platform_driver rb532_button_driver = {
-	.probe = rb532_button_probe,
-	.remove = rb532_button_remove,
-	.driver = {
-		.name = DRV_NAME,
-	},
-};
-module_platform_driver(rb532_button_driver);
-
-MODULE_AUTHOR("Phil Sutter <n0-1@freewrt.org>");
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Support for S1 button on Routerboard 532");
-MODULE_ALIAS("platform:" DRV_NAME);
+	/*
+	 * The pointer computations below will on

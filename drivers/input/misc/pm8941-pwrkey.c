@@ -1,293 +1,324 @@
-/*
- * Copyright (c) 2010-2011, Code Aurora Forum. All rights reserved.
- * Copyright (c) 2014, Sony Mobile Communications Inc.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
+data, 6);
+	abov_delay(5);
 
-#include <linux/delay.h>
-#include <linux/errno.h>
-#include <linux/input.h>
-#include <linux/interrupt.h>
-#include <linux/kernel.h>
-#include <linux/log2.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/reboot.h>
-#include <linux/regmap.h>
+	i2c_master_send(info->client, data2, 1);
+	abov_delay(5);
 
-#define PON_REV2			0x01
+	ret = abov_tk_i2c_read_data(info->client, checksum, 6);
 
-#define PON_RT_STS			0x10
-#define  PON_KPDPWR_N_SET		BIT(0)
+	input_info(true, &info->client->dev, "%s: ret:%d [%X][%X][%X][%X][%X]\n",
+			__func__, ret, checksum[0], checksum[1], checksum[2]
+			, checksum[4], checksum[5]);
+	info->checksum_h = checksum[4];
+	info->checksum_l = checksum[5];
+	return 0;
+}
 
-#define PON_PS_HOLD_RST_CTL		0x5a
-#define PON_PS_HOLD_RST_CTL2		0x5b
-#define  PON_PS_HOLD_ENABLE		BIT(7)
-#define  PON_PS_HOLD_TYPE_MASK		0x0f
-#define  PON_PS_HOLD_TYPE_SHUTDOWN	4
-#define  PON_PS_HOLD_TYPE_HARD_RESET	7
-
-#define PON_PULL_CTL			0x70
-#define  PON_KPDPWR_PULL_UP		BIT(1)
-
-#define PON_DBC_CTL			0x71
-#define  PON_DBC_DELAY_MASK		0x7
-
-
-struct pm8941_pwrkey {
-	struct device *dev;
-	int irq;
-	u32 baseaddr;
-	struct regmap *regmap;
-	struct input_dev *input;
-
-	unsigned int revision;
-	struct notifier_block reboot_notifier;
-};
-
-static int pm8941_reboot_notify(struct notifier_block *nb,
-				unsigned long code, void *unused)
+static int abov_tk_fw_write(struct abov_tk_info *info, unsigned char *addrH,
+						unsigned char *addrL, unsigned char *val)
 {
-	struct pm8941_pwrkey *pwrkey = container_of(nb, struct pm8941_pwrkey,
-						    reboot_notifier);
-	unsigned int enable_reg;
-	unsigned int reset_type;
-	int error;
+	int length = 36, ret = 0;
+	unsigned char data[36];
 
-	/* PMICs with revision 0 have the enable bit in same register as ctrl */
-	if (pwrkey->revision == 0)
-		enable_reg = PON_PS_HOLD_RST_CTL;
-	else
-		enable_reg = PON_PS_HOLD_RST_CTL2;
+	data[0] = 0xAC;
+	data[1] = 0x7A;
+	memcpy(&data[2], addrH, 1);
+	memcpy(&data[3], addrL, 1);
+	memcpy(&data[4], val, 32);
 
-	error = regmap_update_bits(pwrkey->regmap,
-				   pwrkey->baseaddr + enable_reg,
-				   PON_PS_HOLD_ENABLE,
-				   0);
-	if (error)
-		dev_err(pwrkey->dev,
-			"unable to clear ps hold reset enable: %d\n",
-			error);
+	ret = i2c_master_send(info->client, data, length);
+	if (ret != length) {
+		input_err(true, &info->client->dev,
+			"%s: write fail[%x%x], %d\n", __func__, *addrH, *addrL, ret);
+		return ret;
+	}
 
-	/*
-	 * Updates of PON_PS_HOLD_ENABLE requires 3 sleep cycles between
-	 * writes.
-	 */
-	usleep_range(100, 1000);
+	abov_delay(3);
 
-	switch (code) {
-	case SYS_HALT:
-	case SYS_POWER_OFF:
-		reset_type = PON_PS_HOLD_TYPE_SHUTDOWN;
+	abov_tk_check_busy(info);
+
+	return 0;
+}
+
+static int abov_tk_fw_mode_enter(struct abov_tk_info *info)
+{
+	unsigned char data[2] = {0xAC, 0x5B};
+	int ret = 0;
+
+	ret = i2c_master_send(info->client, data, 2);
+	if (ret != 2) {
+		input_err(true, &info->client->dev, "%s: write fail\n", __func__);
+		return -1;
+	}
+
+	return 0;
+
+}
+
+
+static int abov_tk_fw_mode_check(struct abov_tk_info *info)
+{
+	unsigned char buf[1] = {0};
+	int ret;
+
+	ret = abov_tk_i2c_read_data(info->client, buf, 1);
+	if (ret < 0){
+		input_err(true, &info->client->dev, "%s: write fail\n", __func__);
+		return 0;
+	}
+
+	input_info(true, &info->client->dev, "%s: ret:%02X\n",__func__, buf[0]);
+
+#ifdef CONFIG_KEYBOARD_ABOV_TOUCH_T316
+	if ((buf[0] == ABOV_FLASH_MODE) || (buf[0] == 0x32)) /* support T316, T326 */
+		return 1;
+#else
+	if (buf[0] == ABOV_FLASH_MODE)
+		return 1;
+#endif
+
+	input_err(true, &info->client->dev, "%s: flash mode does not match,  %X, %X\n",
+			__func__, ABOV_FLASH_MODE, buf[0]);
+
+	return 0;
+}
+
+static int abov_tk_flash_erase(struct abov_tk_info *info)
+{
+	unsigned char data[2] = {0xAC, 0x2D};
+	int ret = 0;
+
+	ret = i2c_master_send(info->client, data, 2);
+	if (ret != 2) {
+		input_err(true, &info->client->dev, "%s: write fail\n", __func__);
+		return -1;
+	}
+
+	return 0;
+
+}
+
+static int abov_tk_fw_mode_exit(struct abov_tk_info *info)
+{
+	unsigned char data[2] = {0xAC, 0xE1};
+	int ret = 0;
+
+	ret = i2c_master_send(info->client, data, 2);
+	if (ret != 2) {
+		input_err(true, &info->client->dev, "%s: write fail\n", __func__);
+		return -1;
+	}
+
+	return 0;
+
+}
+
+static int abov_tk_fw_update(struct abov_tk_info *info, u8 cmd)
+{
+	int ret, ii = 0;
+	int count;
+	unsigned short address;
+	unsigned char addrH, addrL;
+	unsigned char data[32] = {0, };
+
+
+	input_info(true, &info->client->dev, "%s start\n", __func__);
+
+	count = info->firm_size / 32;
+	address = 0x800;
+
+	input_info(true, &info->client->dev, "%s reset\n", __func__);
+	abov_tk_reset_for_bootmode(info);
+	abov_delay(ABOV_BOOT_DELAY);
+	ret = abov_tk_fw_mode_enter(info);
+	if(ret<0){
+		input_err(true, &info->client->dev,
+			"%s:abov_tk_fw_mode_enter fail\n", __func__);
+		return ret;
+	}
+	abov_delay(5);
+	input_info(true, &info->client->dev, "%s fw_mode_cmd sended\n", __func__);
+
+	if (abov_tk_fw_mode_check(info) != 1) {
+		input_err(true, &info->client->dev, "%s: err, flash mode is not: %d\n", __func__, ret);
+		return 0;
+	}
+
+	ret = abov_tk_flash_erase(info);
+	abov_delay(1400);
+	input_info(true, &info->client->dev, "%s fw_write start\n", __func__);
+
+	for (ii = 1; ii < count; ii++) {
+		/* first 32byte is header */
+		addrH = (unsigned char)((address >> 8) & 0xFF);
+		addrL = (unsigned char)(address & 0xFF);
+		if (cmd == BUILT_IN)
+			memcpy(data, &info->firm_data_bin->data[ii * 32], 32);
+		else if (cmd == SDCARD)
+			memcpy(data, &info->firm_data_ums[ii * 32], 32);
+
+		ret = abov_tk_fw_write(info, &addrH, &addrL, data);
+		if (ret < 0) {
+			input_err(true, &info->client->dev,
+				"%s: err, no device : %d\n", __func__, ret);
+			return ret;
+		}
+
+		address += 0x20;
+
+		memset(data, 0, 32);
+	}
+	ret = abov_tk_i2c_read_checksum(info);
+	input_info(true, &info->client->dev, "%s checksum readed\n", __func__);
+
+	ret = abov_tk_fw_mode_exit(info);
+	input_info(true, &info->client->dev, "%s fw_write end\n", __func__);
+
+	return ret;
+}
+
+static void abov_release_fw(struct abov_tk_info *info, u8 cmd)
+{
+	switch(cmd) {
+	case BUILT_IN:
+		release_firmware(info->firm_data_bin);
 		break;
-	case SYS_RESTART:
+
+	case SDCARD:
+		kfree(info->firm_data_ums);
+		break;
+
 	default:
-		reset_type = PON_PS_HOLD_TYPE_HARD_RESET;
+		break;
+	}
+}
+
+static int abov_flash_fw(struct abov_tk_info *info, bool probe, u8 cmd)
+{
+	struct i2c_client *client = info->client;
+	int retry = 2;
+	int ret;
+	int block_count;
+	const u8 *fw_data;
+
+	switch(cmd) {
+	case BUILT_IN:
+		fw_data = info->firm_data_bin->data;
+		break;
+
+	case SDCARD:
+		fw_data = info->firm_data_ums;
+		break;
+
+	default:
+		return -1;
 		break;
 	}
 
-	error = regmap_update_bits(pwrkey->regmap,
-				   pwrkey->baseaddr + PON_PS_HOLD_RST_CTL,
-				   PON_PS_HOLD_TYPE_MASK,
-				   reset_type);
-	if (error)
-		dev_err(pwrkey->dev, "unable to set ps hold reset type: %d\n",
-			error);
+	block_count = (int)(info->firm_size / 32);
 
-	error = regmap_update_bits(pwrkey->regmap,
-				   pwrkey->baseaddr + enable_reg,
-				   PON_PS_HOLD_ENABLE,
-				   PON_PS_HOLD_ENABLE);
-	if (error)
-		dev_err(pwrkey->dev, "unable to re-set enable: %d\n", error);
+	while (retry--) {
+		ret = abov_tk_fw_update(info, cmd);
+		if (ret < 0)
+			break;
+#if ABOV_ISP_FIRMUP_ROUTINE
+		abov_tk_reset_for_bootmode(info);
+		abov_fw_update(info, fw_data, block_count,
+			info->pdata->gpio_scl, info->pdata->gpio_sda);
+#endif
 
-	return NOTIFY_DONE;
+		if ((info->checksum_h != info->checksum_h_bin) ||
+			(info->checksum_l != info->checksum_l_bin)) {
+			input_err(true, &client->dev,
+				"%s checksum fail.(0x%x,0x%x),(0x%x,0x%x) retry:%d\n",
+				__func__, info->checksum_h, info->checksum_l,
+				info->checksum_h_bin, info->checksum_l_bin, retry);
+			ret = -1;
+			continue;
+		} else {
+			input_info(true, &client->dev,"%s checksum successed.\n",__func__);
+		}
+
+		abov_tk_reset_for_bootmode(info);
+		abov_delay(ABOV_RESET_DELAY);
+		ret = get_tk_fw_version(info, true);
+		if (ret) {
+			input_err(true, &client->dev, "%s fw version read fail\n", __func__);
+			ret = -1;
+			continue;
+		}
+
+		if (info->fw_ver == 0) {
+			input_err(true, &client->dev, "%s fw version fail (0x%x)\n",
+				__func__, info->fw_ver);
+			ret = -1;
+			continue;
+		}
+
+		if ((cmd == BUILT_IN) && (info->fw_ver != info->fw_ver_bin)){
+			input_err(true, &client->dev, "%s fw version fail 0x%x, 0x%x\n",
+				__func__, info->fw_ver, info->fw_ver_bin);
+			ret = -1;
+			continue;
+		}
+		ret = 0;
+		break;
+	}
+
+	return ret;
 }
 
-static irqreturn_t pm8941_pwrkey_irq(int irq, void *_data)
+static ssize_t touchkey_fw_update(struct device *dev,
+			struct device_attribute *attr, const char *buf, size_t count)
 {
-	struct pm8941_pwrkey *pwrkey = _data;
-	unsigned int sts;
-	int error;
+	struct abov_tk_info *info = dev_get_drvdata(dev);
+	struct i2c_client *client = info->client;
+	int ret;
+	u8 cmd;
 
-	error = regmap_read(pwrkey->regmap,
-			    pwrkey->baseaddr + PON_RT_STS, &sts);
-	if (error)
-		return IRQ_HANDLED;
-
-	input_report_key(pwrkey->input, KEY_POWER, !!(sts & PON_KPDPWR_N_SET));
-	input_sync(pwrkey->input);
-
-	return IRQ_HANDLED;
-}
-
-static int __maybe_unused pm8941_pwrkey_suspend(struct device *dev)
-{
-	struct pm8941_pwrkey *pwrkey = dev_get_drvdata(dev);
-
-	if (device_may_wakeup(dev))
-		enable_irq_wake(pwrkey->irq);
-
-	return 0;
-}
-
-static int __maybe_unused pm8941_pwrkey_resume(struct device *dev)
-{
-	struct pm8941_pwrkey *pwrkey = dev_get_drvdata(dev);
-
-	if (device_may_wakeup(dev))
-		disable_irq_wake(pwrkey->irq);
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(pm8941_pwr_key_pm_ops,
-			 pm8941_pwrkey_suspend, pm8941_pwrkey_resume);
-
-static int pm8941_pwrkey_probe(struct platform_device *pdev)
-{
-	struct pm8941_pwrkey *pwrkey;
-	bool pull_up;
-	u32 req_delay;
-	int error;
-
-	if (of_property_read_u32(pdev->dev.of_node, "debounce", &req_delay))
-		req_delay = 15625;
-
-	if (req_delay > 2000000 || req_delay == 0) {
-		dev_err(&pdev->dev, "invalid debounce time: %u\n", req_delay);
-		return -EINVAL;
+	switch(*buf) {
+	case 's':
+	case 'S':
+		cmd = BUILT_IN;
+		break;
+#ifndef CONFIG_SAMSUNG_PRODUCT_SHIP
+	case 'i':
+	case 'I':
+		cmd = SDCARD;
+		break;
+#endif
+	default:
+		info->fw_update_state = 2;
+		goto touchkey_fw_update_out;
 	}
 
-	pull_up = of_property_read_bool(pdev->dev.of_node, "bias-pull-up");
-
-	pwrkey = devm_kzalloc(&pdev->dev, sizeof(*pwrkey), GFP_KERNEL);
-	if (!pwrkey)
-		return -ENOMEM;
-
-	pwrkey->dev = &pdev->dev;
-
-	pwrkey->regmap = dev_get_regmap(pdev->dev.parent, NULL);
-	if (!pwrkey->regmap) {
-		dev_err(&pdev->dev, "failed to locate regmap\n");
-		return -ENODEV;
+	ret = abov_load_fw(info, cmd);
+	if (ret) {
+		input_err(true, &client->dev,
+			"%s fw load fail\n", __func__);
+		info->fw_update_state = 2;
+		goto touchkey_fw_update_out;
 	}
 
-	pwrkey->irq = platform_get_irq(pdev, 0);
-	if (pwrkey->irq < 0) {
-		dev_err(&pdev->dev, "failed to get irq\n");
-		return pwrkey->irq;
+	info->fw_update_state = 1;
+	disable_irq(info->irq);
+	info->enabled = false;
+	ret = abov_flash_fw(info, false, cmd);
+	if (info->flip_mode){
+		abov_mode_enable(client, ABOV_FLIP, CMD_FLIP_ON);
+	} else {
+		if (info->glovemode)
+			abov_mode_enable(client, ABOV_GLOVE, CMD_GLOVE_ON);
 	}
+	if (info->keyboard_mode)
+		abov_mode_enable(client, ABOV_KEYBOARD, CMD_MOBILE_KBD_ON);
 
-	error = of_property_read_u32(pdev->dev.of_node, "reg",
-				     &pwrkey->baseaddr);
-	if (error)
-		return error;
+	info->enabled = true;
+	enable_irq(info->irq);
+	if (ret) {
+		input_err(true, &client->dev, "%s fail\n", __func__);
+//		info->fw_update_state = 2;
+		info->fw_update_state = 0;
 
-	error = regmap_read(pwrkey->regmap, pwrkey->baseaddr + PON_REV2,
-			    &pwrkey->revision);
-	if (error) {
-		dev_err(&pdev->dev, "failed to set debounce: %d\n", error);
-		return error;
-	}
-
-	pwrkey->input = devm_input_allocate_device(&pdev->dev);
-	if (!pwrkey->input) {
-		dev_dbg(&pdev->dev, "unable to allocate input device\n");
-		return -ENOMEM;
-	}
-
-	input_set_capability(pwrkey->input, EV_KEY, KEY_POWER);
-
-	pwrkey->input->name = "pm8941_pwrkey";
-	pwrkey->input->phys = "pm8941_pwrkey/input0";
-
-	req_delay = (req_delay << 6) / USEC_PER_SEC;
-	req_delay = ilog2(req_delay);
-
-	error = regmap_update_bits(pwrkey->regmap,
-				   pwrkey->baseaddr + PON_DBC_CTL,
-				   PON_DBC_DELAY_MASK,
-				   req_delay);
-	if (error) {
-		dev_err(&pdev->dev, "failed to set debounce: %d\n", error);
-		return error;
-	}
-
-	error = regmap_update_bits(pwrkey->regmap,
-				   pwrkey->baseaddr + PON_PULL_CTL,
-				   PON_KPDPWR_PULL_UP,
-				   pull_up ? PON_KPDPWR_PULL_UP : 0);
-	if (error) {
-		dev_err(&pdev->dev, "failed to set pull: %d\n", error);
-		return error;
-	}
-
-	error = devm_request_threaded_irq(&pdev->dev, pwrkey->irq,
-					  NULL, pm8941_pwrkey_irq,
-					  IRQF_ONESHOT,
-					  "pm8941_pwrkey", pwrkey);
-	if (error) {
-		dev_err(&pdev->dev, "failed requesting IRQ: %d\n", error);
-		return error;
-	}
-
-	error = input_register_device(pwrkey->input);
-	if (error) {
-		dev_err(&pdev->dev, "failed to register input device: %d\n",
-			error);
-		return error;
-	}
-
-	pwrkey->reboot_notifier.notifier_call = pm8941_reboot_notify,
-	error = register_reboot_notifier(&pwrkey->reboot_notifier);
-	if (error) {
-		dev_err(&pdev->dev, "failed to register reboot notifier: %d\n",
-			error);
-		return error;
-	}
-
-	platform_set_drvdata(pdev, pwrkey);
-	device_init_wakeup(&pdev->dev, 1);
-
-	return 0;
-}
-
-static int pm8941_pwrkey_remove(struct platform_device *pdev)
-{
-	struct pm8941_pwrkey *pwrkey = platform_get_drvdata(pdev);
-
-	device_init_wakeup(&pdev->dev, 0);
-	unregister_reboot_notifier(&pwrkey->reboot_notifier);
-
-	return 0;
-}
-
-static const struct of_device_id pm8941_pwr_key_id_table[] = {
-	{ .compatible = "qcom,pm8941-pwrkey" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, pm8941_pwr_key_id_table);
-
-static struct platform_driver pm8941_pwrkey_driver = {
-	.probe = pm8941_pwrkey_probe,
-	.remove = pm8941_pwrkey_remove,
-	.driver = {
-		.name = "pm8941-pwrkey",
-		.pm = &pm8941_pwr_key_pm_ops,
-		.of_match_table = of_match_ptr(pm8941_pwr_key_id_table),
-	},
-};
-module_platform_driver(pm8941_pwrkey_driver);
-
-MODULE_DESCRIPTION("PM8941 Power Key driver");
-MODULE_LICENSE("GPL v2");
+	} else {
+		input_info(true, &client->dev, "%s success

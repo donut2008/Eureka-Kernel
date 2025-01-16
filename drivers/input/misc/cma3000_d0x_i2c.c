@@ -1,131 +1,112 @@
-/*
- * Implements I2C interface for VTI CMA300_D0x Accelerometer driver
- *
- * Copyright (C) 2010 Texas Instruments
- * Author: Hemanth V <hemanthv@ti.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program.  If not, see <http://www.gnu.org/licenses/>.
- */
-
-#include <linux/module.h>
-#include <linux/i2c.h>
-#include <linux/input/cma3000.h>
-#include "cma3000_d0x.h"
-
-static int cma3000_i2c_set(struct device *dev,
-			   u8 reg, u8 val, char *msg)
+tr,
+			   char *buf)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	int ret;
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	ret = i2c_smbus_write_byte_data(client, reg, val);
-	if (ret < 0)
-		dev_err(&client->dev,
-			"%s failed (%s, %d)\n", __func__, msg, ret);
-	return ret;
+	return sprintf(buf, "0x%016llx\n", be64_to_cpu(target->id_ext));
 }
 
-static int cma3000_i2c_read(struct device *dev, u8 reg, char *msg)
+static ssize_t show_ioc_guid(struct device *dev, struct device_attribute *attr,
+			     char *buf)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	int ret;
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	ret = i2c_smbus_read_byte_data(client, reg);
-	if (ret < 0)
-		dev_err(&client->dev,
-			"%s failed (%s, %d)\n", __func__, msg, ret);
-	return ret;
+	return sprintf(buf, "0x%016llx\n", be64_to_cpu(target->ioc_guid));
 }
 
-static const struct cma3000_bus_ops cma3000_i2c_bops = {
-	.bustype	= BUS_I2C,
-#define CMA3000_BUSI2C     (0 << 4)
-	.ctrl_mod	= CMA3000_BUSI2C,
-	.read		= cma3000_i2c_read,
-	.write		= cma3000_i2c_set,
-};
-
-static int cma3000_i2c_probe(struct i2c_client *client,
-					const struct i2c_device_id *id)
+static ssize_t show_service_id(struct device *dev,
+			       struct device_attribute *attr, char *buf)
 {
-	struct cma3000_accl_data *data;
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	data = cma3000_init(&client->dev, client->irq, &cma3000_i2c_bops);
-	if (IS_ERR(data))
-		return PTR_ERR(data);
-
-	i2c_set_clientdata(client, data);
-
-	return 0;
+	return sprintf(buf, "0x%016llx\n", be64_to_cpu(target->service_id));
 }
 
-static int cma3000_i2c_remove(struct i2c_client *client)
+static ssize_t show_pkey(struct device *dev, struct device_attribute *attr,
+			 char *buf)
 {
-	struct cma3000_accl_data *data = i2c_get_clientdata(client);
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	cma3000_exit(data);
-
-	return 0;
+	return sprintf(buf, "0x%04x\n", be16_to_cpu(target->pkey));
 }
 
-#ifdef CONFIG_PM
-static int cma3000_i2c_suspend(struct device *dev)
+static ssize_t show_sgid(struct device *dev, struct device_attribute *attr,
+			 char *buf)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct cma3000_accl_data *data = i2c_get_clientdata(client);
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	cma3000_suspend(data);
-
-	return 0;
+	return sprintf(buf, "%pI6\n", target->sgid.raw);
 }
 
-static int cma3000_i2c_resume(struct device *dev)
+static ssize_t show_dgid(struct device *dev, struct device_attribute *attr,
+			 char *buf)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct cma3000_accl_data *data = i2c_get_clientdata(client);
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
+	struct srp_rdma_ch *ch = &target->ch[0];
 
-	cma3000_resume(data);
-
-	return 0;
+	return sprintf(buf, "%pI6\n", ch->path.dgid.raw);
 }
 
-static const struct dev_pm_ops cma3000_i2c_pm_ops = {
-	.suspend	= cma3000_i2c_suspend,
-	.resume		= cma3000_i2c_resume,
-};
-#endif
+static ssize_t show_orig_dgid(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-static const struct i2c_device_id cma3000_i2c_id[] = {
-	{ "cma3000_d01", 0 },
-	{ },
-};
+	return sprintf(buf, "%pI6\n", target->orig_dgid.raw);
+}
 
-MODULE_DEVICE_TABLE(i2c, cma3000_i2c_id);
+static ssize_t show_req_lim(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
+	struct srp_rdma_ch *ch;
+	int i, req_lim = INT_MAX;
 
-static struct i2c_driver cma3000_i2c_driver = {
-	.probe		= cma3000_i2c_probe,
-	.remove		= cma3000_i2c_remove,
-	.id_table	= cma3000_i2c_id,
-	.driver = {
-		.name	= "cma3000_i2c_accl",
-#ifdef CONFIG_PM
-		.pm	= &cma3000_i2c_pm_ops,
-#endif
-	},
-};
+	for (i = 0; i < target->ch_count; i++) {
+		ch = &target->ch[i];
+		req_lim = min(req_lim, ch->req_lim);
+	}
+	return sprintf(buf, "%d\n", req_lim);
+}
 
-module_i2c_driver(cma3000_i2c_driver);
+static ssize_t show_zero_req_lim(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-MODULE_DESCRIPTION("CMA3000-D0x Accelerometer I2C Driver");
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Hemanth V <hemanthv@ti.com>");
+	return sprintf(buf, "%d\n", target->zero_req_lim);
+}
+
+static ssize_t show_local_ib_port(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
+
+	return sprintf(buf, "%d\n", target->srp_host->port);
+}
+
+static ssize_t show_local_ib_device(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
+
+	return sprintf(buf, "%s\n", target->srp_host->srp_dev->dev->name);
+}
+
+static ssize_t show_ch_count(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
+
+	return sprintf(buf, "%d\n", target->ch_count);
+}
+
+static ssize_t show_comp_vector(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct srp_target_port *target = host_to_target(class_to_shost(dev));
+
+	return sprintf(buf, "%d\n", target->comp_vector);
+}
+
+static ssize_t show_tl_retry_count(st

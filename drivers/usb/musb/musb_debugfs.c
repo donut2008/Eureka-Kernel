@@ -1,379 +1,211 @@
-/*
- * MUSB OTG driver debugfs support
- *
- * Copyright 2010 Nokia Corporation
- * Contact: Felipe Balbi <felipe.balbi@nokia.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- */
-
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
-
-#include <asm/uaccess.h>
-
-#include "musb_core.h"
-#include "musb_debug.h"
-
-struct musb_register_map {
-	char			*name;
-	unsigned		offset;
-	unsigned		size;
-};
-
-static const struct musb_register_map musb_regmap[] = {
-	{ "FAddr",	MUSB_FADDR,	8 },
-	{ "Power",	MUSB_POWER,	8 },
-	{ "Frame",	MUSB_FRAME,	16 },
-	{ "Index",	MUSB_INDEX,	8 },
-	{ "Testmode",	MUSB_TESTMODE,	8 },
-	{ "TxMaxPp",	MUSB_TXMAXP,	16 },
-	{ "TxCSRp",	MUSB_TXCSR,	16 },
-	{ "RxMaxPp",	MUSB_RXMAXP,	16 },
-	{ "RxCSR",	MUSB_RXCSR,	16 },
-	{ "RxCount",	MUSB_RXCOUNT,	16 },
-	{ "IntrRxE",	MUSB_INTRRXE,	16 },
-	{ "IntrTxE",	MUSB_INTRTXE,	16 },
-	{ "IntrUsbE",	MUSB_INTRUSBE,	8 },
-	{ "DevCtl",	MUSB_DEVCTL,	8 },
-	{ "VControl",	0x68,		32 },
-	{ "HWVers",	MUSB_HWVERS,	16 },
-	{ "LinkInfo",	MUSB_LINKINFO,	8 },
-	{ "VPLen",	MUSB_VPLEN,	8 },
-	{ "HS_EOF1",	MUSB_HS_EOF1,	8 },
-	{ "FS_EOF1",	MUSB_FS_EOF1,	8 },
-	{ "LS_EOF1",	MUSB_LS_EOF1,	8 },
-	{ "SOFT_RST",	0x7F,		8 },
-	{ "DMA_CNTLch0",	0x204,	16 },
-	{ "DMA_ADDRch0",	0x208,	32 },
-	{ "DMA_COUNTch0",	0x20C,	32 },
-	{ "DMA_CNTLch1",	0x214,	16 },
-	{ "DMA_ADDRch1",	0x218,	32 },
-	{ "DMA_COUNTch1",	0x21C,	32 },
-	{ "DMA_CNTLch2",	0x224,	16 },
-	{ "DMA_ADDRch2",	0x228,	32 },
-	{ "DMA_COUNTch2",	0x22C,	32 },
-	{ "DMA_CNTLch3",	0x234,	16 },
-	{ "DMA_ADDRch3",	0x238,	32 },
-	{ "DMA_COUNTch3",	0x23C,	32 },
-	{ "DMA_CNTLch4",	0x244,	16 },
-	{ "DMA_ADDRch4",	0x248,	32 },
-	{ "DMA_COUNTch4",	0x24C,	32 },
-	{ "DMA_CNTLch5",	0x254,	16 },
-	{ "DMA_ADDRch5",	0x258,	32 },
-	{ "DMA_COUNTch5",	0x25C,	32 },
-	{ "DMA_CNTLch6",	0x264,	16 },
-	{ "DMA_ADDRch6",	0x268,	32 },
-	{ "DMA_COUNTch6",	0x26C,	32 },
-	{ "DMA_CNTLch7",	0x274,	16 },
-	{ "DMA_ADDRch7",	0x278,	32 },
-	{ "DMA_COUNTch7",	0x27C,	32 },
-#ifndef CONFIG_BLACKFIN
-	{ "ConfigData",	MUSB_CONFIGDATA,8 },
-	{ "BabbleCtl",	MUSB_BABBLE_CTL,8 },
-	{ "TxFIFOsz",	MUSB_TXFIFOSZ,	8 },
-	{ "RxFIFOsz",	MUSB_RXFIFOSZ,	8 },
-	{ "TxFIFOadd",	MUSB_TXFIFOADD,	16 },
-	{ "RxFIFOadd",	MUSB_RXFIFOADD,	16 },
-	{ "EPInfo",	MUSB_EPINFO,	8 },
-	{ "RAMInfo",	MUSB_RAMINFO,	8 },
+s master link of dual link is B or D or F
+  UCHAR ucEncoderSel:1;             //bit3=0: Data/Clk path source from DIGA/C/E. =1: Data/clk path source from DIGB/D/F
+  UCHAR ucRefClkSource:2;           //bit5:4: PPLL1 =0, PPLL2=1, DCPLL=2, EXT_CLK=3   <= New
+  UCHAR ucTransmitterSel:2;         //bit7:6: =0 Dig Transmitter 1 ( Uniphy AB )
+                                    //        =1 Dig Transmitter 2 ( Uniphy CD )
+                                    //        =2 Dig Transmitter 3 ( Uniphy EF )
 #endif
-	{  }	/* Terminating Entry */
-};
+}ATOM_DIG_TRANSMITTER_CONFIG_V4;
 
-static int musb_regdump_show(struct seq_file *s, void *unused)
+typedef struct _DIG_TRANSMITTER_CONTROL_PARAMETERS_V4
 {
-	struct musb		*musb = s->private;
-	unsigned		i;
+  union
+  {
+    USHORT usPixelClock;      // in 10KHz; for bios convenient
+    USHORT usInitInfo;         // when init uniphy,lower 8bit is used for connector type defined in objectid.h
+    ATOM_DP_VS_MODE_V4 asMode; // DP Voltage swing mode     Redefined comparing to previous version
+  };
+  union
+  {
+  ATOM_DIG_TRANSMITTER_CONFIG_V4 acConfig;
+  UCHAR ucConfig;
+  };
+  UCHAR ucAction;                // define as ATOM_TRANSMITER_ACTION_XXX
+  UCHAR ucLaneNum;
+  UCHAR ucReserved[3];
+}DIG_TRANSMITTER_CONTROL_PARAMETERS_V4;
 
-	seq_printf(s, "MUSB (M)HDRC Register Dump\n");
+//ucConfig
+//Bit0
+#define ATOM_TRANSMITTER_CONFIG_V4_DUAL_LINK_CONNECTOR         0x01
+//Bit1
+#define ATOM_TRANSMITTER_CONFIG_V4_COHERENT                      0x02
+//Bit2
+#define ATOM_TRANSMITTER_CONFIG_V4_LINK_SEL_MASK              0x04
+#define ATOM_TRANSMITTER_CONFIG_V4_LINKA                       0x00
+#define ATOM_TRANSMITTER_CONFIG_V4_LINKB                        0x04
+// Bit3
+#define ATOM_TRANSMITTER_CONFIG_V4_ENCODER_SEL_MASK           0x08
+#define ATOM_TRANSMITTER_CONFIG_V4_DIG1_ENCODER                0x00
+#define ATOM_TRANSMITTER_CONFIG_V4_DIG2_ENCODER                0x08
+// Bit5:4
+#define ATOM_TRANSMITTER_CONFIG_V4_REFCLK_SEL_MASK            0x30
+#define ATOM_TRANSMITTER_CONFIG_V4_P1PLL                       0x00
+#define ATOM_TRANSMITTER_CONFIG_V4_P2PLL                      0x10
+#define ATOM_TRANSMITTER_CONFIG_V4_DCPLL                      0x20   // New in _V4
+#define ATOM_TRANSMITTER_CONFIG_V4_REFCLK_SRC_EXT           0x30   // Changed comparing to V3
+// Bit7:6
+#define ATOM_TRANSMITTER_CONFIG_V4_TRANSMITTER_SEL_MASK     0xC0
+#define ATOM_TRANSMITTER_CONFIG_V4_TRANSMITTER1              0x00   //AB
+#define ATOM_TRANSMITTER_CONFIG_V4_TRANSMITTER2              0x40   //CD
+#define ATOM_TRANSMITTER_CONFIG_V4_TRANSMITTER3              0x80   //EF
 
-	for (i = 0; i < ARRAY_SIZE(musb_regmap); i++) {
-		switch (musb_regmap[i].size) {
-		case 8:
-			seq_printf(s, "%-12s: %02x\n", musb_regmap[i].name,
-					musb_readb(musb->mregs, musb_regmap[i].offset));
-			break;
-		case 16:
-			seq_printf(s, "%-12s: %04x\n", musb_regmap[i].name,
-					musb_readw(musb->mregs, musb_regmap[i].offset));
-			break;
-		case 32:
-			seq_printf(s, "%-12s: %08x\n", musb_regmap[i].name,
-					musb_readl(musb->mregs, musb_regmap[i].offset));
-			break;
-		}
-	}
 
-	return 0;
-}
-
-static int musb_regdump_open(struct inode *inode, struct file *file)
+typedef struct _ATOM_DIG_TRANSMITTER_CONFIG_V5
 {
-	return single_open(file, musb_regdump_show, inode->i_private);
-}
+#if ATOM_BIG_ENDIAN
+  UCHAR ucReservd1:1;
+  UCHAR ucHPDSel:3;
+  UCHAR ucPhyClkSrcId:2;
+  UCHAR ucCoherentMode:1;
+  UCHAR ucReserved:1;
+#else
+  UCHAR ucReserved:1;
+  UCHAR ucCoherentMode:1;
+  UCHAR ucPhyClkSrcId:2;
+  UCHAR ucHPDSel:3;
+  UCHAR ucReservd1:1;
+#endif
+}ATOM_DIG_TRANSMITTER_CONFIG_V5;
 
-static int musb_test_mode_show(struct seq_file *s, void *unused)
+typedef struct _DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5
 {
-	struct musb		*musb = s->private;
-	unsigned		test;
+  USHORT usSymClock;              // Encoder Clock in 10kHz,(DP mode)= linkclock/10, (TMDS/LVDS/HDMI)= pixel clock,  (HDMI deep color), =pixel clock * deep_color_ratio
+  UCHAR  ucPhyId;                   // 0=UNIPHYA, 1=UNIPHYB, 2=UNIPHYC, 3=UNIPHYD, 4= UNIPHYE 5=UNIPHYF
+  UCHAR  ucAction;                // define as ATOM_TRANSMITER_ACTION_xxx
+  UCHAR  ucLaneNum;                 // indicate lane number 1-8
+  UCHAR  ucConnObjId;               // Connector Object Id defined in ObjectId.h
+  UCHAR  ucDigMode;                 // indicate DIG mode
+  union{
+  ATOM_DIG_TRANSMITTER_CONFIG_V5 asConfig;
+  UCHAR ucConfig;
+  };
+  UCHAR  ucDigEncoderSel;           // indicate DIG front end encoder
+  UCHAR  ucDPLaneSet;
+  UCHAR  ucReserved;
+  UCHAR  ucReserved1;
+}DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5;
 
-	test = musb_readb(musb->mregs, MUSB_TESTMODE);
+//ucPhyId
+#define ATOM_PHY_ID_UNIPHYA                                 0
+#define ATOM_PHY_ID_UNIPHYB                                 1
+#define ATOM_PHY_ID_UNIPHYC                                 2
+#define ATOM_PHY_ID_UNIPHYD                                 3
+#define ATOM_PHY_ID_UNIPHYE                                 4
+#define ATOM_PHY_ID_UNIPHYF                                 5
+#define ATOM_PHY_ID_UNIPHYG                                 6
 
-	if (test & MUSB_TEST_FORCE_HOST)
-		seq_printf(s, "force host\n");
+// ucDigEncoderSel
+#define ATOM_TRANMSITTER_V5__DIGA_SEL                       0x01
+#define ATOM_TRANMSITTER_V5__DIGB_SEL                       0x02
+#define ATOM_TRANMSITTER_V5__DIGC_SEL                       0x04
+#define ATOM_TRANMSITTER_V5__DIGD_SEL                       0x08
+#define ATOM_TRANMSITTER_V5__DIGE_SEL                       0x10
+#define ATOM_TRANMSITTER_V5__DIGF_SEL                       0x20
+#define ATOM_TRANMSITTER_V5__DIGG_SEL                       0x40
 
-	if (test & MUSB_TEST_FIFO_ACCESS)
-		seq_printf(s, "fifo access\n");
+// ucDigMode
+#define ATOM_TRANSMITTER_DIGMODE_V5_DP                      0
+#define ATOM_TRANSMITTER_DIGMODE_V5_LVDS                    1
+#define ATOM_TRANSMITTER_DIGMODE_V5_DVI                     2
+#define ATOM_TRANSMITTER_DIGMODE_V5_HDMI                    3
+#define ATOM_TRANSMITTER_DIGMODE_V5_SDVO                    4
+#define ATOM_TRANSMITTER_DIGMODE_V5_DP_MST                  5
 
-	if (test & MUSB_TEST_FORCE_FS)
-		seq_printf(s, "force full-speed\n");
+// ucDPLaneSet
+#define DP_LANE_SET__0DB_0_4V                               0x00
+#define DP_LANE_SET__0DB_0_6V                               0x01
+#define DP_LANE_SET__0DB_0_8V                               0x02
+#define DP_LANE_SET__0DB_1_2V                               0x03
+#define DP_LANE_SET__3_5DB_0_4V                             0x08
+#define DP_LANE_SET__3_5DB_0_6V                             0x09
+#define DP_LANE_SET__3_5DB_0_8V                             0x0a
+#define DP_LANE_SET__6DB_0_4V                               0x10
+#define DP_LANE_SET__6DB_0_6V                               0x11
+#define DP_LANE_SET__9_5DB_0_4V                             0x18
 
-	if (test & MUSB_TEST_FORCE_HS)
-		seq_printf(s, "force high-speed\n");
+// ATOM_DIG_TRANSMITTER_CONFIG_V5 asConfig;
+// Bit1
+#define ATOM_TRANSMITTER_CONFIG_V5_COHERENT                      0x02
 
-	if (test & MUSB_TEST_PACKET)
-		seq_printf(s, "test packet\n");
+// Bit3:2
+#define ATOM_TRANSMITTER_CONFIG_V5_REFCLK_SEL_MASK            0x0c
+#define ATOM_TRANSMITTER_CONFIG_V5_REFCLK_SEL_SHIFT          0x02
 
-	if (test & MUSB_TEST_K)
-		seq_printf(s, "test K\n");
+#define ATOM_TRANSMITTER_CONFIG_V5_P1PLL                       0x00
+#define ATOM_TRANSMITTER_CONFIG_V5_P2PLL                      0x04
+#define ATOM_TRANSMITTER_CONFIG_V5_P0PLL                      0x08
+#define ATOM_TRANSMITTER_CONFIG_V5_REFCLK_SRC_EXT           0x0c
+// Bit6:4
+#define ATOM_TRANSMITTER_CONFIG_V5_HPD_SEL_MASK                0x70
+#define ATOM_TRANSMITTER_CONFIG_V5_HPD_SEL_SHIFT            0x04
 
-	if (test & MUSB_TEST_J)
-		seq_printf(s, "test J\n");
+#define ATOM_TRANSMITTER_CONFIG_V5_NO_HPD_SEL                    0x00
+#define ATOM_TRANSMITTER_CONFIG_V5_HPD1_SEL                      0x10
+#define ATOM_TRANSMITTER_CONFIG_V5_HPD2_SEL                      0x20
+#define ATOM_TRANSMITTER_CONFIG_V5_HPD3_SEL                      0x30
+#define ATOM_TRANSMITTER_CONFIG_V5_HPD4_SEL                      0x40
+#define ATOM_TRANSMITTER_CONFIG_V5_HPD5_SEL                      0x50
+#define ATOM_TRANSMITTER_CONFIG_V5_HPD6_SEL                      0x60
 
-	if (test & MUSB_TEST_SE0_NAK)
-		seq_printf(s, "test SE0 NAK\n");
+#define DIG_TRANSMITTER_CONTROL_PS_ALLOCATION_V1_5            DIG_TRANSMITTER_CONTROL_PARAMETERS_V1_5
 
-	return 0;
-}
 
-static const struct file_operations musb_regdump_fops = {
-	.open			= musb_regdump_open,
-	.read			= seq_read,
-	.llseek			= seq_lseek,
-	.release		= single_release,
-};
+/****************************************************************************/
+// Structures used by ExternalEncoderControlTable V1.3
+// ASIC Families: Evergreen, Llano, NI
+// ucTableFormatRevision=1
+// ucTableContentRevision=3
+/****************************************************************************/
 
-static int musb_test_mode_open(struct inode *inode, struct file *file)
+typedef struct _EXTERNAL_ENCODER_CONTROL_PARAMETERS_V3
 {
-	return single_open(file, musb_test_mode_show, inode->i_private);
-}
+  union{
+  USHORT usPixelClock;      // pixel clock in 10Khz, valid when ucAction=SETUP/ENABLE_OUTPUT
+  USHORT usConnectorId;     // connector id, valid when ucAction = INIT
+  };
+  UCHAR  ucConfig;          // indicate which encoder, and DP link rate when ucAction = SETUP/ENABLE_OUTPUT
+  UCHAR  ucAction;          //
+  UCHAR  ucEncoderMode;     // encoder mode, only used when ucAction = SETUP/ENABLE_OUTPUT
+  UCHAR  ucLaneNum;         // lane number, only used when ucAction = SETUP/ENABLE_OUTPUT
+  UCHAR  ucBitPerColor;     // output bit per color, only valid when ucAction = SETUP/ENABLE_OUTPUT and ucEncodeMode= DP
+  UCHAR  ucReserved;
+}EXTERNAL_ENCODER_CONTROL_PARAMETERS_V3;
 
-static ssize_t musb_test_mode_write(struct file *file,
-		const char __user *ubuf, size_t count, loff_t *ppos)
+// ucAction
+#define EXTERANL_ENCODER_ACTION_V3_DISABLE_OUTPUT         0x00
+#define EXTERANL_ENCODER_ACTION_V3_ENABLE_OUTPUT          0x01
+#define EXTERNAL_ENCODER_ACTION_V3_ENCODER_INIT           0x07
+#define EXTERNAL_ENCODER_ACTION_V3_ENCODER_SETUP          0x0f
+#define EXTERNAL_ENCODER_ACTION_V3_ENCODER_BLANKING_OFF   0x10
+#define EXTERNAL_ENCODER_ACTION_V3_ENCODER_BLANKING       0x11
+#define EXTERNAL_ENCODER_ACTION_V3_DACLOAD_DETECTION      0x12
+#define EXTERNAL_ENCODER_ACTION_V3_DDC_SETUP              0x14
+
+// ucConfig
+#define EXTERNAL_ENCODER_CONFIG_V3_DPLINKRATE_MASK            0x03
+#define EXTERNAL_ENCODER_CONFIG_V3_DPLINKRATE_1_62GHZ        0x00
+#define EXTERNAL_ENCODER_CONFIG_V3_DPLINKRATE_2_70GHZ        0x01
+#define EXTERNAL_ENCODER_CONFIG_V3_DPLINKRATE_5_40GHZ        0x02
+#define EXTERNAL_ENCODER_CONFIG_V3_ENCODER_SEL_MAKS          0x70
+#define EXTERNAL_ENCODER_CONFIG_V3_ENCODER1                  0x00
+#define EXTERNAL_ENCODER_CONFIG_V3_ENCODER2                  0x10
+#define EXTERNAL_ENCODER_CONFIG_V3_ENCODER3                  0x20
+
+typedef struct _EXTERNAL_ENCODER_CONTROL_PS_ALLOCATION_V3
 {
-	struct seq_file		*s = file->private_data;
-	struct musb		*musb = s->private;
-	u8			test;
-	char			buf[18];
+  EXTERNAL_ENCODER_CONTROL_PARAMETERS_V3 sExtEncoder;
+  ULONG ulReserved[2];
+}EXTERNAL_ENCODER_CONTROL_PS_ALLOCATION_V3;
 
-	test = musb_readb(musb->mregs, MUSB_TESTMODE);
-	if (test) {
-		dev_err(musb->controller, "Error: test mode is already set. "
-			"Please do USB Bus Reset to start a new test.\n");
-		return count;
-	}
 
-	memset(buf, 0x00, sizeof(buf));
-
-	if (copy_from_user(buf, ubuf, min_t(size_t, sizeof(buf) - 1, count)))
-		return -EFAULT;
-
-	if (strstarts(buf, "force host"))
-		test = MUSB_TEST_FORCE_HOST;
-
-	if (strstarts(buf, "fifo access"))
-		test = MUSB_TEST_FIFO_ACCESS;
-
-	if (strstarts(buf, "force full-speed"))
-		test = MUSB_TEST_FORCE_FS;
-
-	if (strstarts(buf, "force high-speed"))
-		test = MUSB_TEST_FORCE_HS;
-
-	if (strstarts(buf, "test packet")) {
-		test = MUSB_TEST_PACKET;
-		musb_load_testpacket(musb);
-	}
-
-	if (strstarts(buf, "test K"))
-		test = MUSB_TEST_K;
-
-	if (strstarts(buf, "test J"))
-		test = MUSB_TEST_J;
-
-	if (strstarts(buf, "test SE0 NAK"))
-		test = MUSB_TEST_SE0_NAK;
-
-	musb_writeb(musb->mregs, MUSB_TESTMODE, test);
-
-	return count;
-}
-
-static const struct file_operations musb_test_mode_fops = {
-	.open			= musb_test_mode_open,
-	.write			= musb_test_mode_write,
-	.read			= seq_read,
-	.llseek			= seq_lseek,
-	.release		= single_release,
-};
-
-static int musb_softconnect_show(struct seq_file *s, void *unused)
+/****************************************************************************/
+// Structures used by DAC1OuputControlTable
+//                    DAC2OuputControlTable
+//                    LVTMAOutputControlTable  (Before DEC30)
+//                    TMDSAOutputControlTable  (Before DEC30)
+/****************************************************************************/
+typedef struct _DISPLAY_DEVICE_OUTPUT_CONTROL_PARAMETERS
 {
-	struct musb	*musb = s->private;
-	u8		reg;
-	int		connect;
-
-	switch (musb->xceiv->otg->state) {
-	case OTG_STATE_A_HOST:
-	case OTG_STATE_A_WAIT_BCON:
-		reg = musb_readb(musb->mregs, MUSB_DEVCTL);
-		connect = reg & MUSB_DEVCTL_SESSION ? 1 : 0;
-		break;
-	default:
-		connect = -1;
-	}
-
-	seq_printf(s, "%d\n", connect);
-
-	return 0;
-}
-
-static int musb_softconnect_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, musb_softconnect_show, inode->i_private);
-}
-
-static ssize_t musb_softconnect_write(struct file *file,
-		const char __user *ubuf, size_t count, loff_t *ppos)
-{
-	struct seq_file		*s = file->private_data;
-	struct musb		*musb = s->private;
-	char			buf[2];
-	u8			reg;
-
-	memset(buf, 0x00, sizeof(buf));
-
-	if (copy_from_user(&buf, ubuf, min_t(size_t, sizeof(buf) - 1, count)))
-		return -EFAULT;
-
-	if (!strncmp(buf, "0", 1)) {
-		switch (musb->xceiv->otg->state) {
-		case OTG_STATE_A_HOST:
-			musb_root_disconnect(musb);
-			reg = musb_readb(musb->mregs, MUSB_DEVCTL);
-			reg &= ~MUSB_DEVCTL_SESSION;
-			musb_writeb(musb->mregs, MUSB_DEVCTL, reg);
-			break;
-		default:
-			break;
-		}
-	} else if (!strncmp(buf, "1", 1)) {
-		switch (musb->xceiv->otg->state) {
-		case OTG_STATE_A_WAIT_BCON:
-			/*
-			 * musb_save_context() called in musb_runtime_suspend()
-			 * might cache devctl with SESSION bit cleared during
-			 * soft-disconnect, so specifically set SESSION bit
-			 * here to preserve it for musb_runtime_resume().
-			 */
-			musb->context.devctl |= MUSB_DEVCTL_SESSION;
-			reg = musb_readb(musb->mregs, MUSB_DEVCTL);
-			reg |= MUSB_DEVCTL_SESSION;
-			musb_writeb(musb->mregs, MUSB_DEVCTL, reg);
-			break;
-		default:
-			break;
-		}
-	}
-
-	return count;
-}
-
-/*
- * In host mode, connect/disconnect the bus without physically
- * remove the devices.
- */
-static const struct file_operations musb_softconnect_fops = {
-	.open			= musb_softconnect_open,
-	.write			= musb_softconnect_write,
-	.read			= seq_read,
-	.llseek			= seq_lseek,
-	.release		= single_release,
-};
-
-int musb_init_debugfs(struct musb *musb)
-{
-	struct dentry		*root;
-	struct dentry		*file;
-	int			ret;
-
-	root = debugfs_create_dir(dev_name(musb->controller), NULL);
-	if (!root) {
-		ret = -ENOMEM;
-		goto err0;
-	}
-
-	file = debugfs_create_file("regdump", S_IRUGO, root, musb,
-			&musb_regdump_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("testmode", S_IRUGO | S_IWUSR,
-			root, musb, &musb_test_mode_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("softconnect", S_IRUGO | S_IWUSR,
-			root, musb, &musb_softconnect_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	musb->debugfs_root = root;
-
-	return 0;
-
-err1:
-	debugfs_remove_recursive(root);
-
-err0:
-	return ret;
-}
-
-void /* __init_or_exit */ musb_exit_debugfs(struct musb *musb)
-{
-	debugfs_remove_recursive(musb->debugfs_root);
-}
+  UCHAR  ucAction;                    // Possible input:ATOM_ENABLE||ATOMDISABLE
+                                      // When the display is LCD, in addition to above

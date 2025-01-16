@@ -1,57 +1,32 @@
-/*
- * VMware VMCI Driver
- *
- * Copyright (C) 2012 VMware, Inc. All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation version 2 and no later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
- * for more details.
- */
-
-#ifndef _VMCI_DRIVER_H_
-#define _VMCI_DRIVER_H_
-
-#include <linux/vmw_vmci_defs.h>
-#include <linux/wait.h>
-
-#include "vmci_queue_pair.h"
-#include "vmci_context.h"
-
-enum vmci_obj_type {
-	VMCIOBJ_VMX_VM = 10,
-	VMCIOBJ_CONTEXT,
-	VMCIOBJ_SOCKET,
-	VMCIOBJ_NOT_SET,
-};
-
-/* For storing VMCI structures in file handles. */
-struct vmci_obj {
-	void *ptr;
-	enum vmci_obj_type type;
-};
-
-/*
- * Needed by other components of this module.  It's okay to have one global
- * instance of this because there can only ever be one VMCI device.  Our
- * virtual hardware enforces this.
- */
-extern struct pci_dev *vmci_pdev;
-
-u32 vmci_get_context_id(void);
-int vmci_send_datagram(struct vmci_datagram *dg);
-
-int vmci_host_init(void);
-void vmci_host_exit(void);
-bool vmci_host_code_active(void);
-
-int vmci_guest_init(void);
-void vmci_guest_exit(void);
-bool vmci_guest_code_active(void);
-u32 vmci_get_vm_context_id(void);
-
-#endif /* _VMCI_DRIVER_H_ */
+ GPU_GARLIC_FLUSH_REQ__SDMA2__SHIFT 0xc
+#define GPU_GARLIC_FLUSH_REQ__SDMA3_MASK 0x2000
+#define GPU_GARLIC_FLUSH_REQ__SDMA3__SHIFT 0xd
+#define GPU_GARLIC_FLUSH_DONE__CP0_MASK 0x1
+#define GPU_GARLIC_FLUSH_DONE__CP0__SHIFT 0x0
+#define GPU_GARLIC_FLUSH_DONE__CP1_MASK 0x2
+#define GPU_GARLIC_FLUSH_DONE__CP1__SHIFT 0x1
+#define GPU_GARLIC_FLUSH_DONE__CP2_MASK 0x4
+#define GPU_GARLIC_FLUSH_DONE__CP2__SHIFT 0x2
+#define GPU_GARLIC_FLUSH_DONE__CP3_MASK 0x8
+#define GPU_GARLIC_FLUSH_DONE__CP3__SHIFT 0x3
+#define GPU_GARLIC_FLUSH_DONE__CP4_MASK 0x10
+#define GPU_GARLIC_FLUSH_DONE__CP4__SHIFT 0x4
+#define GPU_GARLIC_FLUSH_DONE__CP5_MASK 0x20
+#define GPU_GARLIC_FLUSH_DONE__CP5__SHIFT 0x5
+#define GPU_GARLIC_FLUSH_DONE__CP6_MASK 0x40
+#define GPU_GARLIC_FLUSH_DONE__CP6__SHIFT 0x6
+#define GPU_GARLIC_FLUSH_DONE__CP7_MASK 0x80
+#define GPU_GARLIC_FLUSH_DONE__CP7__SHIFT 0x7
+#define GPU_GARLIC_FLUSH_DONE__CP8_MASK 0x100
+#define GPU_GARLIC_FLUSH_DONE__CP8__SHIFT 0x8
+#define GPU_GARLIC_FLUSH_DONE__CP9_MASK 0x200
+#define GPU_GARLIC_FLUSH_DONE__CP9__SHIFT 0x9
+#define GPU_GARLIC_FLUSH_DONE__SDMA0_MASK 0x400
+#define GPU_GARLIC_FLUSH_DONE__SDMA0__SHIFT 0xa
+#define GPU_GARLIC_FLUSH_DONE__SDMA1_MASK 0x800
+#define GPU_GARLIC_FLUSH_DONE__SDMA1__SHIFT 0xb
+#define GPU_GARLIC_FLUSH_DONE__SDMA2_MASK 0x1000
+#define GPU_GARLIC_FLUSH_DONE__SDMA2__SHIFT 0xc
+#define GPU_GARLIC_FLUSH_DONE__SDMA3_MASK 0x2000
+#define GPU_GARLIC_FLUSH_DONE__SDMA3__SHIFT 0xd
+#define REMAP_HDP_MEM_FLUSH_CNTL__ADDRESS_MA

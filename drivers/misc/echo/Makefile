@@ -1,1 +1,2 @@
-obj-$(CONFIG_ECHO) += echo.o
+_SPEED_DISABLE_MASK 0x20
+#def

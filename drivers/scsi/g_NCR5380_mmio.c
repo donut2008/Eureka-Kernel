@@ -1,10 +1,6 @@
-/*
- *	There is probably a nicer way to do this but this one makes
- *	pretty obvious what is happening. We rebuild the same file with
- *	different options for mmio versus pio.
- */
-
-#define SCSI_G_NCR5380_MEM
-
-#include "g_NCR5380.c"
-
+u8 dmaseei;		/* DMA set enable error interrupt */
+	u8 dmaceei;		/* DMA clear enable error interrupt */
+	/* 0x1c */
+	u8 dmacint;		/* DMA clear interrupt request */
+	u8 dmacerr;		/* DMA clear error */
+	u8 dmassrt;		/* DMA set start bi

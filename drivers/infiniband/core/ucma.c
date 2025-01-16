@@ -1,1797 +1,510 @@
-/*
- * Copyright (c) 2005-2006 Intel Corporation.  All rights reserved.
- *
- * This software is available to you under a choice of one of two
- * licenses.  You may choose to be licensed under the terms of the GNU
- * General Public License (GPL) Version 2, available from the file
- * COPYING in the main directory of this source tree, or the
- * OpenIB.org BSD license below:
- *
- *     Redistribution and use in source and binary forms, with or
- *     without modification, are permitted provided that the following
- *     conditions are met:
- *
- *      - Redistributions of source code must retain the above
- *	copyright notice, this list of conditions and the following
- *	disclaimer.
- *
- *      - Redistributions in binary form must reproduce the above
- *	copyright notice, this list of conditions and the following
- *	disclaimer in the documentation and/or other materials
- *	provided with the distribution.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- */
-
-#include <linux/completion.h>
-#include <linux/file.h>
-#include <linux/mutex.h>
-#include <linux/poll.h>
-#include <linux/sched.h>
-#include <linux/idr.h>
-#include <linux/in.h>
-#include <linux/in6.h>
-#include <linux/miscdevice.h>
-#include <linux/slab.h>
-#include <linux/sysctl.h>
-#include <linux/module.h>
-#include <linux/nsproxy.h>
-
-#include <linux/nospec.h>
-
-#include <rdma/rdma_user_cm.h>
-#include <rdma/ib_marshall.h>
-#include <rdma/rdma_cm.h>
-#include <rdma/rdma_cm_ib.h>
-#include <rdma/ib_addr.h>
-#include <rdma/ib.h>
-
-MODULE_AUTHOR("Sean Hefty");
-MODULE_DESCRIPTION("RDMA Userspace Connection Manager Access");
-MODULE_LICENSE("Dual BSD/GPL");
-
-static unsigned int max_backlog = 1024;
-
-static struct ctl_table_header *ucma_ctl_table_hdr;
-static struct ctl_table ucma_ctl_table[] = {
-	{
-		.procname	= "max_backlog",
-		.data		= &max_backlog,
-		.maxlen		= sizeof max_backlog,
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec,
-	},
-	{ }
-};
-
-struct ucma_file {
-	struct mutex		mut;
-	struct file		*filp;
-	struct list_head	ctx_list;
-	struct list_head	event_list;
-	wait_queue_head_t	poll_wait;
-	struct workqueue_struct	*close_wq;
-};
-
-struct ucma_context {
-	int			id;
-	struct completion	comp;
-	atomic_t		ref;
-	int			events_reported;
-	int			backlog;
-
-	struct ucma_file	*file;
-	struct rdma_cm_id	*cm_id;
-	u64			uid;
-
-	struct list_head	list;
-	struct list_head	mc_list;
-	/* mark that device is in process of destroying the internal HW
-	 * resources, protected by the global mut
-	 */
-	int			closing;
-	/* sync between removal event and id destroy, protected by file mut */
-	int			destroying;
-	struct work_struct	close_work;
-};
-
-struct ucma_multicast {
-	struct ucma_context	*ctx;
-	int			id;
-	int			events_reported;
-
-	u64			uid;
-	struct list_head	list;
-	struct sockaddr_storage	addr;
-};
-
-struct ucma_event {
-	struct ucma_context	*ctx;
-	struct ucma_multicast	*mc;
-	struct list_head	list;
-	struct rdma_cm_id	*cm_id;
-	struct rdma_ucm_event_resp resp;
-	struct work_struct	close_work;
-};
-
-static DEFINE_MUTEX(mut);
-static DEFINE_IDR(ctx_idr);
-static DEFINE_IDR(multicast_idr);
-
-static const struct file_operations ucma_fops;
-
-static inline struct ucma_context *_ucma_find_context(int id,
-						      struct ucma_file *file)
-{
-	struct ucma_context *ctx;
-
-	ctx = idr_find(&ctx_idr, id);
-	if (!ctx)
-		ctx = ERR_PTR(-ENOENT);
-	else if (ctx->file != file || !ctx->cm_id)
-		ctx = ERR_PTR(-EINVAL);
-	return ctx;
-}
-
-static struct ucma_context *ucma_get_ctx(struct ucma_file *file, int id)
-{
-	struct ucma_context *ctx;
-
-	mutex_lock(&mut);
-	ctx = _ucma_find_context(id, file);
-	if (!IS_ERR(ctx)) {
-		if (ctx->closing)
-			ctx = ERR_PTR(-EIO);
-		else
-			atomic_inc(&ctx->ref);
-	}
-	mutex_unlock(&mut);
-	return ctx;
-}
-
-static void ucma_put_ctx(struct ucma_context *ctx)
-{
-	if (atomic_dec_and_test(&ctx->ref))
-		complete(&ctx->comp);
-}
-
-static void ucma_close_event_id(struct work_struct *work)
-{
-	struct ucma_event *uevent_close =  container_of(work, struct ucma_event, close_work);
-
-	rdma_destroy_id(uevent_close->cm_id);
-	kfree(uevent_close);
-}
-
-static void ucma_close_id(struct work_struct *work)
-{
-	struct ucma_context *ctx =  container_of(work, struct ucma_context, close_work);
-
-	/* once all inflight tasks are finished, we close all underlying
-	 * resources. The context is still alive till its explicit destryoing
-	 * by its creator.
-	 */
-	ucma_put_ctx(ctx);
-	wait_for_completion(&ctx->comp);
-	/* No new events will be generated after destroying the id. */
-	rdma_destroy_id(ctx->cm_id);
-}
-
-static struct ucma_context *ucma_alloc_ctx(struct ucma_file *file)
-{
-	struct ucma_context *ctx;
-
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
-		return NULL;
-
-	INIT_WORK(&ctx->close_work, ucma_close_id);
-	atomic_set(&ctx->ref, 1);
-	init_completion(&ctx->comp);
-	INIT_LIST_HEAD(&ctx->mc_list);
-	ctx->file = file;
-
-	mutex_lock(&mut);
-	ctx->id = idr_alloc(&ctx_idr, ctx, 0, 0, GFP_KERNEL);
-	mutex_unlock(&mut);
-	if (ctx->id < 0)
-		goto error;
-
-	list_add_tail(&ctx->list, &file->ctx_list);
-	return ctx;
-
-error:
-	kfree(ctx);
-	return NULL;
-}
-
-static struct ucma_multicast* ucma_alloc_multicast(struct ucma_context *ctx)
-{
-	struct ucma_multicast *mc;
-
-	mc = kzalloc(sizeof(*mc), GFP_KERNEL);
-	if (!mc)
-		return NULL;
-
-	mutex_lock(&mut);
-	mc->id = idr_alloc(&multicast_idr, NULL, 0, 0, GFP_KERNEL);
-	mutex_unlock(&mut);
-	if (mc->id < 0)
-		goto error;
-
-	mc->ctx = ctx;
-	list_add_tail(&mc->list, &ctx->mc_list);
-	return mc;
-
-error:
-	kfree(mc);
-	return NULL;
-}
-
-static void ucma_copy_conn_event(struct rdma_ucm_conn_param *dst,
-				 struct rdma_conn_param *src)
-{
-	if (src->private_data_len)
-		memcpy(dst->private_data, src->private_data,
-		       src->private_data_len);
-	dst->private_data_len = src->private_data_len;
-	dst->responder_resources =src->responder_resources;
-	dst->initiator_depth = src->initiator_depth;
-	dst->flow_control = src->flow_control;
-	dst->retry_count = src->retry_count;
-	dst->rnr_retry_count = src->rnr_retry_count;
-	dst->srq = src->srq;
-	dst->qp_num = src->qp_num;
-}
-
-static void ucma_copy_ud_event(struct rdma_ucm_ud_param *dst,
-			       struct rdma_ud_param *src)
-{
-	if (src->private_data_len)
-		memcpy(dst->private_data, src->private_data,
-		       src->private_data_len);
-	dst->private_data_len = src->private_data_len;
-	ib_copy_ah_attr_to_user(&dst->ah_attr, &src->ah_attr);
-	dst->qp_num = src->qp_num;
-	dst->qkey = src->qkey;
-}
-
-static void ucma_set_event_context(struct ucma_context *ctx,
-				   struct rdma_cm_event *event,
-				   struct ucma_event *uevent)
-{
-	uevent->ctx = ctx;
-	switch (event->event) {
-	case RDMA_CM_EVENT_MULTICAST_JOIN:
-	case RDMA_CM_EVENT_MULTICAST_ERROR:
-		uevent->mc = (struct ucma_multicast *)
-			     event->param.ud.private_data;
-		uevent->resp.uid = uevent->mc->uid;
-		uevent->resp.id = uevent->mc->id;
-		break;
-	default:
-		uevent->resp.uid = ctx->uid;
-		uevent->resp.id = ctx->id;
-		break;
-	}
-}
-
-/* Called with file->mut locked for the relevant context. */
-static void ucma_removal_event_handler(struct rdma_cm_id *cm_id)
-{
-	struct ucma_context *ctx = cm_id->context;
-	struct ucma_event *con_req_eve;
-	int event_found = 0;
-
-	if (ctx->destroying)
-		return;
-
-	/* only if context is pointing to cm_id that it owns it and can be
-	 * queued to be closed, otherwise that cm_id is an inflight one that
-	 * is part of that context event list pending to be detached and
-	 * reattached to its new context as part of ucma_get_event,
-	 * handled separately below.
-	 */
-	if (ctx->cm_id == cm_id) {
-		mutex_lock(&mut);
-		ctx->closing = 1;
-		mutex_unlock(&mut);
-		queue_work(ctx->file->close_wq, &ctx->close_work);
-		return;
-	}
-
-	list_for_each_entry(con_req_eve, &ctx->file->event_list, list) {
-		if (con_req_eve->cm_id == cm_id &&
-		    con_req_eve->resp.event == RDMA_CM_EVENT_CONNECT_REQUEST) {
-			list_del(&con_req_eve->list);
-			INIT_WORK(&con_req_eve->close_work, ucma_close_event_id);
-			queue_work(ctx->file->close_wq, &con_req_eve->close_work);
-			event_found = 1;
-			break;
-		}
-	}
-	if (!event_found)
-		printk(KERN_ERR "ucma_removal_event_handler: warning: connect request event wasn't found\n");
-}
-
-static int ucma_event_handler(struct rdma_cm_id *cm_id,
-			      struct rdma_cm_event *event)
-{
-	struct ucma_event *uevent;
-	struct ucma_context *ctx = cm_id->context;
-	int ret = 0;
-
-	uevent = kzalloc(sizeof(*uevent), GFP_KERNEL);
-	if (!uevent)
-		return event->event == RDMA_CM_EVENT_CONNECT_REQUEST;
-
-	mutex_lock(&ctx->file->mut);
-	uevent->cm_id = cm_id;
-	ucma_set_event_context(ctx, event, uevent);
-	uevent->resp.event = event->event;
-	uevent->resp.status = event->status;
-	if (cm_id->qp_type == IB_QPT_UD)
-		ucma_copy_ud_event(&uevent->resp.param.ud, &event->param.ud);
-	else
-		ucma_copy_conn_event(&uevent->resp.param.conn,
-				     &event->param.conn);
-
-	if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
-		if (!ctx->backlog) {
-			ret = -ENOMEM;
-			kfree(uevent);
-			goto out;
-		}
-		ctx->backlog--;
-	} else if (!ctx->uid || ctx->cm_id != cm_id) {
-		/*
-		 * We ignore events for new connections until userspace has set
-		 * their context.  This can only happen if an error occurs on a
-		 * new connection before the user accepts it.  This is okay,
-		 * since the accept will just fail later. However, we do need
-		 * to release the underlying HW resources in case of a device
-		 * removal event.
-		 */
-		if (event->event == RDMA_CM_EVENT_DEVICE_REMOVAL)
-			ucma_removal_event_handler(cm_id);
-
-		kfree(uevent);
-		goto out;
-	}
-
-	list_add_tail(&uevent->list, &ctx->file->event_list);
-	wake_up_interruptible(&ctx->file->poll_wait);
-	if (event->event == RDMA_CM_EVENT_DEVICE_REMOVAL)
-		ucma_removal_event_handler(cm_id);
-out:
-	mutex_unlock(&ctx->file->mut);
-	return ret;
-}
-
-static ssize_t ucma_get_event(struct ucma_file *file, const char __user *inbuf,
-			      int in_len, int out_len)
-{
-	struct ucma_context *ctx;
-	struct rdma_ucm_get_event cmd;
-	struct ucma_event *uevent;
-	int ret = 0;
-
-	if (out_len < sizeof uevent->resp)
-		return -ENOSPC;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	mutex_lock(&file->mut);
-	while (list_empty(&file->event_list)) {
-		mutex_unlock(&file->mut);
-
-		if (file->filp->f_flags & O_NONBLOCK)
-			return -EAGAIN;
-
-		if (wait_event_interruptible(file->poll_wait,
-					     !list_empty(&file->event_list)))
-			return -ERESTARTSYS;
-
-		mutex_lock(&file->mut);
-	}
-
-	uevent = list_entry(file->event_list.next, struct ucma_event, list);
-
-	if (uevent->resp.event == RDMA_CM_EVENT_CONNECT_REQUEST) {
-		ctx = ucma_alloc_ctx(file);
-		if (!ctx) {
-			ret = -ENOMEM;
-			goto done;
-		}
-		uevent->ctx->backlog++;
-		ctx->cm_id = uevent->cm_id;
-		ctx->cm_id->context = ctx;
-		uevent->resp.id = ctx->id;
-	}
-
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
-			 &uevent->resp, sizeof uevent->resp)) {
-		ret = -EFAULT;
-		goto done;
-	}
-
-	list_del(&uevent->list);
-	uevent->ctx->events_reported++;
-	if (uevent->mc)
-		uevent->mc->events_reported++;
-	kfree(uevent);
-done:
-	mutex_unlock(&file->mut);
-	return ret;
-}
-
-static int ucma_get_qp_type(struct rdma_ucm_create_id *cmd, enum ib_qp_type *qp_type)
-{
-	switch (cmd->ps) {
-	case RDMA_PS_TCP:
-		*qp_type = IB_QPT_RC;
-		return 0;
-	case RDMA_PS_UDP:
-	case RDMA_PS_IPOIB:
-		*qp_type = IB_QPT_UD;
-		return 0;
-	case RDMA_PS_IB:
-		*qp_type = cmd->qp_type;
-		return 0;
-	default:
-		return -EINVAL;
-	}
-}
-
-static ssize_t ucma_create_id(struct ucma_file *file, const char __user *inbuf,
-			      int in_len, int out_len)
-{
-	struct rdma_ucm_create_id cmd;
-	struct rdma_ucm_create_id_resp resp;
-	struct ucma_context *ctx;
-	struct rdma_cm_id *cm_id;
-	enum ib_qp_type qp_type;
-	int ret;
-
-	if (out_len < sizeof(resp))
-		return -ENOSPC;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	ret = ucma_get_qp_type(&cmd, &qp_type);
-	if (ret)
-		return ret;
-
-	mutex_lock(&file->mut);
-	ctx = ucma_alloc_ctx(file);
-	mutex_unlock(&file->mut);
-	if (!ctx)
-		return -ENOMEM;
-
-	ctx->uid = cmd.uid;
-	cm_id = rdma_create_id(current->nsproxy->net_ns,
-			       ucma_event_handler, ctx, cmd.ps, qp_type);
-	if (IS_ERR(cm_id)) {
-		ret = PTR_ERR(cm_id);
-		goto err1;
-	}
-
-	resp.id = ctx->id;
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
-			 &resp, sizeof(resp))) {
-		ret = -EFAULT;
-		goto err2;
-	}
-
-	ctx->cm_id = cm_id;
-	return 0;
-
-err2:
-	rdma_destroy_id(cm_id);
-err1:
-	mutex_lock(&mut);
-	idr_remove(&ctx_idr, ctx->id);
-	mutex_unlock(&mut);
-	mutex_lock(&file->mut);
-	list_del(&ctx->list);
-	mutex_unlock(&file->mut);
-	kfree(ctx);
-	return ret;
-}
-
-static void ucma_cleanup_multicast(struct ucma_context *ctx)
-{
-	struct ucma_multicast *mc, *tmp;
-
-	mutex_lock(&mut);
-	list_for_each_entry_safe(mc, tmp, &ctx->mc_list, list) {
-		list_del(&mc->list);
-		idr_remove(&multicast_idr, mc->id);
-		kfree(mc);
-	}
-	mutex_unlock(&mut);
-}
-
-static void ucma_cleanup_mc_events(struct ucma_multicast *mc)
-{
-	struct ucma_event *uevent, *tmp;
-
-	list_for_each_entry_safe(uevent, tmp, &mc->ctx->file->event_list, list) {
-		if (uevent->mc != mc)
-			continue;
-
-		list_del(&uevent->list);
-		kfree(uevent);
-	}
-}
-
-/*
- * ucma_free_ctx is called after the underlying rdma CM-ID is destroyed. At
- * this point, no new events will be reported from the hardware. However, we
- * still need to cleanup the UCMA context for this ID. Specifically, there
- * might be events that have not yet been consumed by the user space software.
- * These might include pending connect requests which we have not completed
- * processing.  We cannot call rdma_destroy_id while holding the lock of the
- * context (file->mut), as it might cause a deadlock. We therefore extract all
- * relevant events from the context pending events list while holding the
- * mutex. After that we release them as needed.
- */
-static int ucma_free_ctx(struct ucma_context *ctx)
-{
-	int events_reported;
-	struct ucma_event *uevent, *tmp;
-	LIST_HEAD(list);
-
-
-	ucma_cleanup_multicast(ctx);
-
-	/* Cleanup events not yet reported to the user. */
-	mutex_lock(&ctx->file->mut);
-	list_for_each_entry_safe(uevent, tmp, &ctx->file->event_list, list) {
-		if (uevent->ctx == ctx)
-			list_move_tail(&uevent->list, &list);
-	}
-	list_del(&ctx->list);
-	mutex_unlock(&ctx->file->mut);
-
-	list_for_each_entry_safe(uevent, tmp, &list, list) {
-		list_del(&uevent->list);
-		if (uevent->resp.event == RDMA_CM_EVENT_CONNECT_REQUEST)
-			rdma_destroy_id(uevent->cm_id);
-		kfree(uevent);
-	}
-
-	events_reported = ctx->events_reported;
-	kfree(ctx);
-	return events_reported;
-}
-
-static ssize_t ucma_destroy_id(struct ucma_file *file, const char __user *inbuf,
-			       int in_len, int out_len)
-{
-	struct rdma_ucm_destroy_id cmd;
-	struct rdma_ucm_destroy_id_resp resp;
-	struct ucma_context *ctx;
-	int ret = 0;
-
-	if (out_len < sizeof(resp))
-		return -ENOSPC;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	mutex_lock(&mut);
-	ctx = _ucma_find_context(cmd.id, file);
-	if (!IS_ERR(ctx))
-		idr_remove(&ctx_idr, ctx->id);
-	mutex_unlock(&mut);
-
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	mutex_lock(&ctx->file->mut);
-	ctx->destroying = 1;
-	mutex_unlock(&ctx->file->mut);
-
-	flush_workqueue(ctx->file->close_wq);
-	/* At this point it's guaranteed that there is no inflight
-	 * closing task */
-	mutex_lock(&mut);
-	if (!ctx->closing) {
-		mutex_unlock(&mut);
-		ucma_put_ctx(ctx);
-		wait_for_completion(&ctx->comp);
-		rdma_destroy_id(ctx->cm_id);
-	} else {
-		mutex_unlock(&mut);
-	}
-
-	resp.events_reported = ucma_free_ctx(ctx);
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
-			 &resp, sizeof(resp)))
-		ret = -EFAULT;
-
-	return ret;
-}
-
-static ssize_t ucma_bind_ip(struct ucma_file *file, const char __user *inbuf,
-			      int in_len, int out_len)
-{
-	struct rdma_ucm_bind_ip cmd;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	if (!rdma_addr_size_in6(&cmd.addr))
-		return -EINVAL;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ret = rdma_bind_addr(ctx->cm_id, (struct sockaddr *) &cmd.addr);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_bind(struct ucma_file *file, const char __user *inbuf,
-			 int in_len, int out_len)
-{
-	struct rdma_ucm_bind cmd;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	if (cmd.reserved || !cmd.addr_size ||
-	    cmd.addr_size != rdma_addr_size_kss(&cmd.addr))
-		return -EINVAL;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ret = rdma_bind_addr(ctx->cm_id, (struct sockaddr *) &cmd.addr);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_resolve_ip(struct ucma_file *file,
-			       const char __user *inbuf,
-			       int in_len, int out_len)
-{
-	struct rdma_ucm_resolve_ip cmd;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	if ((cmd.src_addr.sin6_family && !rdma_addr_size_in6(&cmd.src_addr)) ||
-	    !rdma_addr_size_in6(&cmd.dst_addr))
-		return -EINVAL;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ret = rdma_resolve_addr(ctx->cm_id, (struct sockaddr *) &cmd.src_addr,
-				(struct sockaddr *) &cmd.dst_addr, cmd.timeout_ms);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_resolve_addr(struct ucma_file *file,
-				 const char __user *inbuf,
-				 int in_len, int out_len)
-{
-	struct rdma_ucm_resolve_addr cmd;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	if (cmd.reserved ||
-	    (cmd.src_size && (cmd.src_size != rdma_addr_size_kss(&cmd.src_addr))) ||
-	    !cmd.dst_size || (cmd.dst_size != rdma_addr_size_kss(&cmd.dst_addr)))
-		return -EINVAL;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ret = rdma_resolve_addr(ctx->cm_id, (struct sockaddr *) &cmd.src_addr,
-				(struct sockaddr *) &cmd.dst_addr, cmd.timeout_ms);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_resolve_route(struct ucma_file *file,
-				  const char __user *inbuf,
-				  int in_len, int out_len)
-{
-	struct rdma_ucm_resolve_route cmd;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ret = rdma_resolve_route(ctx->cm_id, cmd.timeout_ms);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static void ucma_copy_ib_route(struct rdma_ucm_query_route_resp *resp,
-			       struct rdma_route *route)
-{
-	struct rdma_dev_addr *dev_addr;
-
-	resp->num_paths = route->num_paths;
-	switch (route->num_paths) {
-	case 0:
-		dev_addr = &route->addr.dev_addr;
-		rdma_addr_get_dgid(dev_addr,
-				   (union ib_gid *) &resp->ib_route[0].dgid);
-		rdma_addr_get_sgid(dev_addr,
-				   (union ib_gid *) &resp->ib_route[0].sgid);
-		resp->ib_route[0].pkey = cpu_to_be16(ib_addr_get_pkey(dev_addr));
-		break;
-	case 2:
-		ib_copy_path_rec_to_user(&resp->ib_route[1],
-					 &route->path_rec[1]);
-		/* fall through */
-	case 1:
-		ib_copy_path_rec_to_user(&resp->ib_route[0],
-					 &route->path_rec[0]);
-		break;
-	default:
-		break;
-	}
-}
-
-static void ucma_copy_iboe_route(struct rdma_ucm_query_route_resp *resp,
-				 struct rdma_route *route)
-{
-
-	resp->num_paths = route->num_paths;
-	switch (route->num_paths) {
-	case 0:
-		rdma_ip2gid((struct sockaddr *)&route->addr.dst_addr,
-			    (union ib_gid *)&resp->ib_route[0].dgid);
-		rdma_ip2gid((struct sockaddr *)&route->addr.src_addr,
-			    (union ib_gid *)&resp->ib_route[0].sgid);
-		resp->ib_route[0].pkey = cpu_to_be16(0xffff);
-		break;
-	case 2:
-		ib_copy_path_rec_to_user(&resp->ib_route[1],
-					 &route->path_rec[1]);
-		/* fall through */
-	case 1:
-		ib_copy_path_rec_to_user(&resp->ib_route[0],
-					 &route->path_rec[0]);
-		break;
-	default:
-		break;
-	}
-}
-
-static void ucma_copy_iw_route(struct rdma_ucm_query_route_resp *resp,
-			       struct rdma_route *route)
-{
-	struct rdma_dev_addr *dev_addr;
-
-	dev_addr = &route->addr.dev_addr;
-	rdma_addr_get_dgid(dev_addr, (union ib_gid *) &resp->ib_route[0].dgid);
-	rdma_addr_get_sgid(dev_addr, (union ib_gid *) &resp->ib_route[0].sgid);
-}
-
-static ssize_t ucma_query_route(struct ucma_file *file,
-				const char __user *inbuf,
-				int in_len, int out_len)
-{
-	struct rdma_ucm_query cmd;
-	struct rdma_ucm_query_route_resp resp;
-	struct ucma_context *ctx;
-	struct sockaddr *addr;
-	int ret = 0;
-
-	if (out_len < sizeof(resp))
-		return -ENOSPC;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	memset(&resp, 0, sizeof resp);
-	addr = (struct sockaddr *) &ctx->cm_id->route.addr.src_addr;
-	memcpy(&resp.src_addr, addr, addr->sa_family == AF_INET ?
-				     sizeof(struct sockaddr_in) :
-				     sizeof(struct sockaddr_in6));
-	addr = (struct sockaddr *) &ctx->cm_id->route.addr.dst_addr;
-	memcpy(&resp.dst_addr, addr, addr->sa_family == AF_INET ?
-				     sizeof(struct sockaddr_in) :
-				     sizeof(struct sockaddr_in6));
-	if (!ctx->cm_id->device)
-		goto out;
-
-	resp.node_guid = (__force __u64) ctx->cm_id->device->node_guid;
-	resp.port_num = ctx->cm_id->port_num;
-
-	if (rdma_cap_ib_sa(ctx->cm_id->device, ctx->cm_id->port_num))
-		ucma_copy_ib_route(&resp, &ctx->cm_id->route);
-	else if (rdma_protocol_roce(ctx->cm_id->device, ctx->cm_id->port_num))
-		ucma_copy_iboe_route(&resp, &ctx->cm_id->route);
-	else if (rdma_protocol_iwarp(ctx->cm_id->device, ctx->cm_id->port_num))
-		ucma_copy_iw_route(&resp, &ctx->cm_id->route);
-
-out:
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
-			 &resp, sizeof(resp)))
-		ret = -EFAULT;
-
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static void ucma_query_device_addr(struct rdma_cm_id *cm_id,
-				   struct rdma_ucm_query_addr_resp *resp)
-{
-	if (!cm_id->device)
-		return;
-
-	resp->node_guid = (__force __u64) cm_id->device->node_guid;
-	resp->port_num = cm_id->port_num;
-	resp->pkey = (__force __u16) cpu_to_be16(
-		     ib_addr_get_pkey(&cm_id->route.addr.dev_addr));
-}
-
-static ssize_t ucma_query_addr(struct ucma_context *ctx,
-			       void __user *response, int out_len)
-{
-	struct rdma_ucm_query_addr_resp resp;
-	struct sockaddr *addr;
-	int ret = 0;
-
-	if (out_len < sizeof(resp))
-		return -ENOSPC;
-
-	memset(&resp, 0, sizeof resp);
-
-	addr = (struct sockaddr *) &ctx->cm_id->route.addr.src_addr;
-	resp.src_size = rdma_addr_size(addr);
-	memcpy(&resp.src_addr, addr, resp.src_size);
-
-	addr = (struct sockaddr *) &ctx->cm_id->route.addr.dst_addr;
-	resp.dst_size = rdma_addr_size(addr);
-	memcpy(&resp.dst_addr, addr, resp.dst_size);
-
-	ucma_query_device_addr(ctx->cm_id, &resp);
-
-	if (copy_to_user(response, &resp, sizeof(resp)))
-		ret = -EFAULT;
-
-	return ret;
-}
-
-static ssize_t ucma_query_path(struct ucma_context *ctx,
-			       void __user *response, int out_len)
-{
-	struct rdma_ucm_query_path_resp *resp;
-	int i, ret = 0;
-
-	if (out_len < sizeof(*resp))
-		return -ENOSPC;
-
-	resp = kzalloc(out_len, GFP_KERNEL);
-	if (!resp)
-		return -ENOMEM;
-
-	resp->num_paths = ctx->cm_id->route.num_paths;
-	for (i = 0, out_len -= sizeof(*resp);
-	     i < resp->num_paths && out_len > sizeof(struct ib_path_rec_data);
-	     i++, out_len -= sizeof(struct ib_path_rec_data)) {
-
-		resp->path_data[i].flags = IB_PATH_GMP | IB_PATH_PRIMARY |
-					   IB_PATH_BIDIRECTIONAL;
-		ib_sa_pack_path(&ctx->cm_id->route.path_rec[i],
-				&resp->path_data[i].path_rec);
-	}
-
-	if (copy_to_user(response, resp,
-			 sizeof(*resp) + (i * sizeof(struct ib_path_rec_data))))
-		ret = -EFAULT;
-
-	kfree(resp);
-	return ret;
-}
-
-static ssize_t ucma_query_gid(struct ucma_context *ctx,
-			      void __user *response, int out_len)
-{
-	struct rdma_ucm_query_addr_resp resp;
-	struct sockaddr_ib *addr;
-	int ret = 0;
-
-	if (out_len < sizeof(resp))
-		return -ENOSPC;
-
-	memset(&resp, 0, sizeof resp);
-
-	ucma_query_device_addr(ctx->cm_id, &resp);
-
-	addr = (struct sockaddr_ib *) &resp.src_addr;
-	resp.src_size = sizeof(*addr);
-	if (ctx->cm_id->route.addr.src_addr.ss_family == AF_IB) {
-		memcpy(addr, &ctx->cm_id->route.addr.src_addr, resp.src_size);
-	} else {
-		addr->sib_family = AF_IB;
-		addr->sib_pkey = (__force __be16) resp.pkey;
-		rdma_addr_get_sgid(&ctx->cm_id->route.addr.dev_addr,
-				   (union ib_gid *) &addr->sib_addr);
-		addr->sib_sid = rdma_get_service_id(ctx->cm_id, (struct sockaddr *)
-						    &ctx->cm_id->route.addr.src_addr);
-	}
-
-	addr = (struct sockaddr_ib *) &resp.dst_addr;
-	resp.dst_size = sizeof(*addr);
-	if (ctx->cm_id->route.addr.dst_addr.ss_family == AF_IB) {
-		memcpy(addr, &ctx->cm_id->route.addr.dst_addr, resp.dst_size);
-	} else {
-		addr->sib_family = AF_IB;
-		addr->sib_pkey = (__force __be16) resp.pkey;
-		rdma_addr_get_dgid(&ctx->cm_id->route.addr.dev_addr,
-				   (union ib_gid *) &addr->sib_addr);
-		addr->sib_sid = rdma_get_service_id(ctx->cm_id, (struct sockaddr *)
-						    &ctx->cm_id->route.addr.dst_addr);
-	}
-
-	if (copy_to_user(response, &resp, sizeof(resp)))
-		ret = -EFAULT;
-
-	return ret;
-}
-
-static ssize_t ucma_query(struct ucma_file *file,
-			  const char __user *inbuf,
-			  int in_len, int out_len)
-{
-	struct rdma_ucm_query cmd;
-	struct ucma_context *ctx;
-	void __user *response;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	response = (void __user *)(unsigned long) cmd.response;
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	switch (cmd.option) {
-	case RDMA_USER_CM_QUERY_ADDR:
-		ret = ucma_query_addr(ctx, response, out_len);
-		break;
-	case RDMA_USER_CM_QUERY_PATH:
-		ret = ucma_query_path(ctx, response, out_len);
-		break;
-	case RDMA_USER_CM_QUERY_GID:
-		ret = ucma_query_gid(ctx, response, out_len);
-		break;
-	default:
-		ret = -ENOSYS;
-		break;
-	}
-
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static void ucma_copy_conn_param(struct rdma_cm_id *id,
-				 struct rdma_conn_param *dst,
-				 struct rdma_ucm_conn_param *src)
-{
-	dst->private_data = src->private_data;
-	dst->private_data_len = src->private_data_len;
-	dst->responder_resources =src->responder_resources;
-	dst->initiator_depth = src->initiator_depth;
-	dst->flow_control = src->flow_control;
-	dst->retry_count = src->retry_count;
-	dst->rnr_retry_count = src->rnr_retry_count;
-	dst->srq = src->srq;
-	dst->qp_num = src->qp_num;
-	dst->qkey = (id->route.addr.src_addr.ss_family == AF_IB) ? src->qkey : 0;
-}
-
-static ssize_t ucma_connect(struct ucma_file *file, const char __user *inbuf,
-			    int in_len, int out_len)
-{
-	struct rdma_ucm_connect cmd;
-	struct rdma_conn_param conn_param;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	if (!cmd.conn_param.valid)
-		return -EINVAL;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ucma_copy_conn_param(ctx->cm_id, &conn_param, &cmd.conn_param);
-	ret = rdma_connect(ctx->cm_id, &conn_param);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_listen(struct ucma_file *file, const char __user *inbuf,
-			   int in_len, int out_len)
-{
-	struct rdma_ucm_listen cmd;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ctx->backlog = cmd.backlog > 0 && cmd.backlog < max_backlog ?
-		       cmd.backlog : max_backlog;
-	ret = rdma_listen(ctx->cm_id, ctx->backlog);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_accept(struct ucma_file *file, const char __user *inbuf,
-			   int in_len, int out_len)
-{
-	struct rdma_ucm_accept cmd;
-	struct rdma_conn_param conn_param;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	if (cmd.conn_param.valid) {
-		ucma_copy_conn_param(ctx->cm_id, &conn_param, &cmd.conn_param);
-		mutex_lock(&file->mut);
-		ret = rdma_accept(ctx->cm_id, &conn_param);
-		if (!ret)
-			ctx->uid = cmd.uid;
-		mutex_unlock(&file->mut);
-	} else
-		ret = rdma_accept(ctx->cm_id, NULL);
-
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_reject(struct ucma_file *file, const char __user *inbuf,
-			   int in_len, int out_len)
-{
-	struct rdma_ucm_reject cmd;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ret = rdma_reject(ctx->cm_id, cmd.private_data, cmd.private_data_len);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_disconnect(struct ucma_file *file, const char __user *inbuf,
-			       int in_len, int out_len)
-{
-	struct rdma_ucm_disconnect cmd;
-	struct ucma_context *ctx;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	ret = rdma_disconnect(ctx->cm_id);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_init_qp_attr(struct ucma_file *file,
-				 const char __user *inbuf,
-				 int in_len, int out_len)
-{
-	struct rdma_ucm_init_qp_attr cmd;
-	struct ib_uverbs_qp_attr resp;
-	struct ucma_context *ctx;
-	struct ib_qp_attr qp_attr;
-	int ret;
-
-	if (out_len < sizeof(resp))
-		return -ENOSPC;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	if (cmd.qp_state > IB_QPS_ERR)
-		return -EINVAL;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	if (!ctx->cm_id->device) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	resp.qp_attr_mask = 0;
-	memset(&qp_attr, 0, sizeof qp_attr);
-	qp_attr.qp_state = cmd.qp_state;
-	ret = rdma_init_qp_attr(ctx->cm_id, &qp_attr, &resp.qp_attr_mask);
-	if (ret)
-		goto out;
-
-	ib_copy_qp_attr_to_user(&resp, &qp_attr);
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
-			 &resp, sizeof(resp)))
-		ret = -EFAULT;
-
-out:
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static int ucma_set_option_id(struct ucma_context *ctx, int optname,
-			      void *optval, size_t optlen)
-{
-	int ret = 0;
-
-	switch (optname) {
-	case RDMA_OPTION_ID_TOS:
-		if (optlen != sizeof(u8)) {
-			ret = -EINVAL;
-			break;
-		}
-		rdma_set_service_type(ctx->cm_id, *((u8 *) optval));
-		break;
-	case RDMA_OPTION_ID_REUSEADDR:
-		if (optlen != sizeof(int)) {
-			ret = -EINVAL;
-			break;
-		}
-		ret = rdma_set_reuseaddr(ctx->cm_id, *((int *) optval) ? 1 : 0);
-		break;
-	case RDMA_OPTION_ID_AFONLY:
-		if (optlen != sizeof(int)) {
-			ret = -EINVAL;
-			break;
-		}
-		ret = rdma_set_afonly(ctx->cm_id, *((int *) optval) ? 1 : 0);
-		break;
-	default:
-		ret = -ENOSYS;
-	}
-
-	return ret;
-}
-
-static int ucma_set_ib_path(struct ucma_context *ctx,
-			    struct ib_path_rec_data *path_data, size_t optlen)
-{
-	struct ib_sa_path_rec sa_path;
-	struct rdma_cm_event event;
-	int ret;
-
-	if (optlen % sizeof(*path_data))
-		return -EINVAL;
-
-	for (; optlen; optlen -= sizeof(*path_data), path_data++) {
-		if (path_data->flags == (IB_PATH_GMP | IB_PATH_PRIMARY |
-					 IB_PATH_BIDIRECTIONAL))
-			break;
-	}
-
-	if (!optlen)
-		return -EINVAL;
-
-	if (!ctx->cm_id->device)
-		return -EINVAL;
-
-	memset(&sa_path, 0, sizeof(sa_path));
-
-	ib_sa_unpack_path(path_data->path_rec, &sa_path);
-	ret = rdma_set_ib_paths(ctx->cm_id, &sa_path, 1);
-	if (ret)
-		return ret;
-
-	memset(&event, 0, sizeof event);
-	event.event = RDMA_CM_EVENT_ROUTE_RESOLVED;
-	return ucma_event_handler(ctx->cm_id, &event);
-}
-
-static int ucma_set_option_ib(struct ucma_context *ctx, int optname,
-			      void *optval, size_t optlen)
-{
-	int ret;
-
-	switch (optname) {
-	case RDMA_OPTION_IB_PATH:
-		ret = ucma_set_ib_path(ctx, optval, optlen);
-		break;
-	default:
-		ret = -ENOSYS;
-	}
-
-	return ret;
-}
-
-static int ucma_set_option_level(struct ucma_context *ctx, int level,
-				 int optname, void *optval, size_t optlen)
-{
-	int ret;
-
-	switch (level) {
-	case RDMA_OPTION_ID:
-		ret = ucma_set_option_id(ctx, optname, optval, optlen);
-		break;
-	case RDMA_OPTION_IB:
-		ret = ucma_set_option_ib(ctx, optname, optval, optlen);
-		break;
-	default:
-		ret = -ENOSYS;
-	}
-
-	return ret;
-}
-
-static ssize_t ucma_set_option(struct ucma_file *file, const char __user *inbuf,
-			       int in_len, int out_len)
-{
-	struct rdma_ucm_set_option cmd;
-	struct ucma_context *ctx;
-	void *optval;
-	int ret;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	if (unlikely(cmd.optlen > KMALLOC_MAX_SIZE))
-		return -EINVAL;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	optval = memdup_user((void __user *) (unsigned long) cmd.optval,
-			     cmd.optlen);
-	if (IS_ERR(optval)) {
-		ret = PTR_ERR(optval);
-		goto out;
-	}
-
-	ret = ucma_set_option_level(ctx, cmd.level, cmd.optname, optval,
-				    cmd.optlen);
-	kfree(optval);
-
-out:
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_notify(struct ucma_file *file, const char __user *inbuf,
-			   int in_len, int out_len)
-{
-	struct rdma_ucm_notify cmd;
-	struct ucma_context *ctx;
-	int ret = -EINVAL;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	ctx = ucma_get_ctx(file, cmd.id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	if (ctx->cm_id->device)
-		ret = rdma_notify(ctx->cm_id, (enum ib_event_type)cmd.event);
-
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_process_join(struct ucma_file *file,
-				 struct rdma_ucm_join_mcast *cmd,  int out_len)
-{
-	struct rdma_ucm_create_id_resp resp;
-	struct ucma_context *ctx;
-	struct ucma_multicast *mc;
-	struct sockaddr *addr;
-	int ret;
-
-	if (out_len < sizeof(resp))
-		return -ENOSPC;
-
-	addr = (struct sockaddr *) &cmd->addr;
-	if (cmd->reserved || (cmd->addr_size != rdma_addr_size(addr)))
-		return -EINVAL;
-
-	ctx = ucma_get_ctx(file, cmd->id);
-	if (IS_ERR(ctx))
-		return PTR_ERR(ctx);
-
-	mutex_lock(&file->mut);
-	mc = ucma_alloc_multicast(ctx);
-	if (!mc) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	mc->uid = cmd->uid;
-	memcpy(&mc->addr, addr, cmd->addr_size);
-	ret = rdma_join_multicast(ctx->cm_id, (struct sockaddr *) &mc->addr, mc);
-	if (ret)
-		goto err2;
-
-	resp.id = mc->id;
-	if (copy_to_user((void __user *)(unsigned long) cmd->response,
-			 &resp, sizeof(resp))) {
-		ret = -EFAULT;
-		goto err3;
-	}
-
-	mutex_lock(&mut);
-	idr_replace(&multicast_idr, mc, mc->id);
-	mutex_unlock(&mut);
-
-	mutex_unlock(&file->mut);
-	ucma_put_ctx(ctx);
-	return 0;
-
-err3:
-	rdma_leave_multicast(ctx->cm_id, (struct sockaddr *) &mc->addr);
-	ucma_cleanup_mc_events(mc);
-err2:
-	mutex_lock(&mut);
-	idr_remove(&multicast_idr, mc->id);
-	mutex_unlock(&mut);
-	list_del(&mc->list);
-	kfree(mc);
-err1:
-	mutex_unlock(&file->mut);
-	ucma_put_ctx(ctx);
-	return ret;
-}
-
-static ssize_t ucma_join_ip_multicast(struct ucma_file *file,
-				      const char __user *inbuf,
-				      int in_len, int out_len)
-{
-	struct rdma_ucm_join_ip_mcast cmd;
-	struct rdma_ucm_join_mcast join_cmd;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	join_cmd.response = cmd.response;
-	join_cmd.uid = cmd.uid;
-	join_cmd.id = cmd.id;
-	join_cmd.addr_size = rdma_addr_size_in6(&cmd.addr);
-	if (!join_cmd.addr_size)
-		return -EINVAL;
-
-	join_cmd.reserved = 0;
-	memcpy(&join_cmd.addr, &cmd.addr, join_cmd.addr_size);
-
-	return ucma_process_join(file, &join_cmd, out_len);
-}
-
-static ssize_t ucma_join_multicast(struct ucma_file *file,
-				   const char __user *inbuf,
-				   int in_len, int out_len)
-{
-	struct rdma_ucm_join_mcast cmd;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	if (!rdma_addr_size_kss(&cmd.addr))
-		return -EINVAL;
-
-	return ucma_process_join(file, &cmd, out_len);
-}
-
-static ssize_t ucma_leave_multicast(struct ucma_file *file,
-				    const char __user *inbuf,
-				    int in_len, int out_len)
-{
-	struct rdma_ucm_destroy_id cmd;
-	struct rdma_ucm_destroy_id_resp resp;
-	struct ucma_multicast *mc;
-	int ret = 0;
-
-	if (out_len < sizeof(resp))
-		return -ENOSPC;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	mutex_lock(&mut);
-	mc = idr_find(&multicast_idr, cmd.id);
-	if (!mc)
-		mc = ERR_PTR(-ENOENT);
-	else if (mc->ctx->file != file)
-		mc = ERR_PTR(-EINVAL);
-	else if (!atomic_inc_not_zero(&mc->ctx->ref))
-		mc = ERR_PTR(-ENXIO);
-	else
-		idr_remove(&multicast_idr, mc->id);
-	mutex_unlock(&mut);
-
-	if (IS_ERR(mc)) {
-		ret = PTR_ERR(mc);
-		goto out;
-	}
-
-	rdma_leave_multicast(mc->ctx->cm_id, (struct sockaddr *) &mc->addr);
-	mutex_lock(&mc->ctx->file->mut);
-	ucma_cleanup_mc_events(mc);
-	list_del(&mc->list);
-	mutex_unlock(&mc->ctx->file->mut);
-
-	ucma_put_ctx(mc->ctx);
-	resp.events_reported = mc->events_reported;
-	kfree(mc);
-
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
-			 &resp, sizeof(resp)))
-		ret = -EFAULT;
-out:
-	return ret;
-}
-
-static void ucma_lock_files(struct ucma_file *file1, struct ucma_file *file2)
-{
-	/* Acquire mutex's based on pointer comparison to prevent deadlock. */
-	if (file1 < file2) {
-		mutex_lock(&file1->mut);
-		mutex_lock_nested(&file2->mut, SINGLE_DEPTH_NESTING);
-	} else {
-		mutex_lock(&file2->mut);
-		mutex_lock_nested(&file1->mut, SINGLE_DEPTH_NESTING);
-	}
-}
-
-static void ucma_unlock_files(struct ucma_file *file1, struct ucma_file *file2)
-{
-	if (file1 < file2) {
-		mutex_unlock(&file2->mut);
-		mutex_unlock(&file1->mut);
-	} else {
-		mutex_unlock(&file1->mut);
-		mutex_unlock(&file2->mut);
-	}
-}
-
-static void ucma_move_events(struct ucma_context *ctx, struct ucma_file *file)
-{
-	struct ucma_event *uevent, *tmp;
-
-	list_for_each_entry_safe(uevent, tmp, &ctx->file->event_list, list)
-		if (uevent->ctx == ctx)
-			list_move_tail(&uevent->list, &file->event_list);
-}
-
-static ssize_t ucma_migrate_id(struct ucma_file *new_file,
-			       const char __user *inbuf,
-			       int in_len, int out_len)
-{
-	struct rdma_ucm_migrate_id cmd;
-	struct rdma_ucm_migrate_resp resp;
-	struct ucma_context *ctx;
-	struct fd f;
-	struct ucma_file *cur_file;
-	int ret = 0;
-
-	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
-		return -EFAULT;
-
-	/* Get current fd to protect against it being closed */
-	f = fdget(cmd.fd);
-	if (!f.file)
-		return -ENOENT;
-	if (f.file->f_op != &ucma_fops) {
-		ret = -EINVAL;
-		goto file_put;
-	}
-
-	/* Validate current fd and prevent destruction of id. */
-	ctx = ucma_get_ctx(f.file->private_data, cmd.id);
-	if (IS_ERR(ctx)) {
-		ret = PTR_ERR(ctx);
-		goto file_put;
-	}
-
-	cur_file = ctx->file;
-	if (cur_file == new_file) {
-		resp.events_reported = ctx->events_reported;
-		goto response;
-	}
-
-	/*
-	 * Migrate events between fd's, maintaining order, and avoiding new
-	 * events being added before existing events.
-	 */
-	ucma_lock_files(cur_file, new_file);
-	mutex_lock(&mut);
-
-	list_move_tail(&ctx->list, &new_file->ctx_list);
-	ucma_move_events(ctx, new_file);
-	ctx->file = new_file;
-	resp.events_reported = ctx->events_reported;
-
-	mutex_unlock(&mut);
-	ucma_unlock_files(cur_file, new_file);
-
-response:
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
-			 &resp, sizeof(resp)))
-		ret = -EFAULT;
-
-	ucma_put_ctx(ctx);
-file_put:
-	fdput(f);
-	return ret;
-}
-
-static ssize_t (*ucma_cmd_table[])(struct ucma_file *file,
-				   const char __user *inbuf,
-				   int in_len, int out_len) = {
-	[RDMA_USER_CM_CMD_CREATE_ID] 	 = ucma_create_id,
-	[RDMA_USER_CM_CMD_DESTROY_ID]	 = ucma_destroy_id,
-	[RDMA_USER_CM_CMD_BIND_IP]	 = ucma_bind_ip,
-	[RDMA_USER_CM_CMD_RESOLVE_IP]	 = ucma_resolve_ip,
-	[RDMA_USER_CM_CMD_RESOLVE_ROUTE] = ucma_resolve_route,
-	[RDMA_USER_CM_CMD_QUERY_ROUTE]	 = ucma_query_route,
-	[RDMA_USER_CM_CMD_CONNECT]	 = ucma_connect,
-	[RDMA_USER_CM_CMD_LISTEN]	 = ucma_listen,
-	[RDMA_USER_CM_CMD_ACCEPT]	 = ucma_accept,
-	[RDMA_USER_CM_CMD_REJECT]	 = ucma_reject,
-	[RDMA_USER_CM_CMD_DISCONNECT]	 = ucma_disconnect,
-	[RDMA_USER_CM_CMD_INIT_QP_ATTR]	 = ucma_init_qp_attr,
-	[RDMA_USER_CM_CMD_GET_EVENT]	 = ucma_get_event,
-	[RDMA_USER_CM_CMD_GET_OPTION]	 = NULL,
-	[RDMA_USER_CM_CMD_SET_OPTION]	 = ucma_set_option,
-	[RDMA_USER_CM_CMD_NOTIFY]	 = ucma_notify,
-	[RDMA_USER_CM_CMD_JOIN_IP_MCAST] = ucma_join_ip_multicast,
-	[RDMA_USER_CM_CMD_LEAVE_MCAST]	 = ucma_leave_multicast,
-	[RDMA_USER_CM_CMD_MIGRATE_ID]	 = ucma_migrate_id,
-	[RDMA_USER_CM_CMD_QUERY]	 = ucma_query,
-	[RDMA_USER_CM_CMD_BIND]		 = ucma_bind,
-	[RDMA_USER_CM_CMD_RESOLVE_ADDR]	 = ucma_resolve_addr,
-	[RDMA_USER_CM_CMD_JOIN_MCAST]	 = ucma_join_multicast
-};
-
-static ssize_t ucma_write(struct file *filp, const char __user *buf,
-			  size_t len, loff_t *pos)
-{
-	struct ucma_file *file = filp->private_data;
-	struct rdma_ucm_cmd_hdr hdr;
-	ssize_t ret;
-
-	if (WARN_ON_ONCE(!ib_safe_file_access(filp)))
-		return -EACCES;
-
-	if (len < sizeof(hdr))
-		return -EINVAL;
-
-	if (copy_from_user(&hdr, buf, sizeof(hdr)))
-		return -EFAULT;
-
-	if (hdr.cmd >= ARRAY_SIZE(ucma_cmd_table))
-		return -EINVAL;
-	hdr.cmd = array_index_nospec(hdr.cmd, ARRAY_SIZE(ucma_cmd_table));
-
-	if (hdr.in + sizeof(hdr) > len)
-		return -EINVAL;
-
-	if (!ucma_cmd_table[hdr.cmd])
-		return -ENOSYS;
-
-	ret = ucma_cmd_table[hdr.cmd](file, buf + sizeof(hdr), hdr.in, hdr.out);
-	if (!ret)
-		ret = len;
-
-	return ret;
-}
-
-static unsigned int ucma_poll(struct file *filp, struct poll_table_struct *wait)
-{
-	struct ucma_file *file = filp->private_data;
-	unsigned int mask = 0;
-
-	poll_wait(filp, &file->poll_wait, wait);
-
-	if (!list_empty(&file->event_list))
-		mask = POLLIN | POLLRDNORM;
-
-	return mask;
-}
-
-/*
- * ucma_open() does not need the BKL:
- *
- *  - no global state is referred to;
- *  - there is no ioctl method to race against;
- *  - no further module initialization is required for open to work
- *    after the device is registered.
- */
-static int ucma_open(struct inode *inode, struct file *filp)
-{
-	struct ucma_file *file;
-
-	file = kmalloc(sizeof *file, GFP_KERNEL);
-	if (!file)
-		return -ENOMEM;
-
-	file->close_wq = create_singlethread_workqueue("ucma_close_id");
-	if (!file->close_wq) {
-		kfree(file);
-		return -ENOMEM;
-	}
-
-	INIT_LIST_HEAD(&file->event_list);
-	INIT_LIST_HEAD(&file->ctx_list);
-	init_waitqueue_head(&file->poll_wait);
-	mutex_init(&file->mut);
-
-	filp->private_data = file;
-	file->filp = filp;
-
-	return nonseekable_open(inode, filp);
-}
-
-static int ucma_close(struct inode *inode, struct file *filp)
-{
-	struct ucma_file *file = filp->private_data;
-	struct ucma_context *ctx, *tmp;
-
-	mutex_lock(&file->mut);
-	list_for_each_entry_safe(ctx, tmp, &file->ctx_list, list) {
-		ctx->destroying = 1;
-		mutex_unlock(&file->mut);
-
-		mutex_lock(&mut);
-		idr_remove(&ctx_idr, ctx->id);
-		mutex_unlock(&mut);
-
-		flush_workqueue(file->close_wq);
-		/* At that step once ctx was marked as destroying and workqueue
-		 * was flushed we are safe from any inflights handlers that
-		 * might put other closing task.
-		 */
-		mutex_lock(&mut);
-		if (!ctx->closing) {
-			mutex_unlock(&mut);
-			ucma_put_ctx(ctx);
-			wait_for_completion(&ctx->comp);
-			/* rdma_destroy_id ensures that no event handlers are
-			 * inflight for that id before releasing it.
-			 */
-			rdma_destroy_id(ctx->cm_id);
-		} else {
-			mutex_unlock(&mut);
-		}
-
-		ucma_free_ctx(ctx);
-		mutex_lock(&file->mut);
-	}
-	mutex_unlock(&file->mut);
-	destroy_workqueue(file->close_wq);
-	kfree(file);
-	return 0;
-}
-
-static const struct file_operations ucma_fops = {
-	.owner 	 = THIS_MODULE,
-	.open 	 = ucma_open,
-	.release = ucma_close,
-	.write	 = ucma_write,
-	.poll    = ucma_poll,
-	.llseek	 = no_llseek,
-};
-
-static struct miscdevice ucma_misc = {
-	.minor		= MISC_DYNAMIC_MINOR,
-	.name		= "rdma_cm",
-	.nodename	= "infiniband/rdma_cm",
-	.mode		= 0666,
-	.fops		= &ucma_fops,
-};
-
-static ssize_t show_abi_version(struct device *dev,
-				struct device_attribute *attr,
-				char *buf)
-{
-	return sprintf(buf, "%d\n", RDMA_USER_CM_ABI_VERSION);
-}
-static DEVICE_ATTR(abi_version, S_IRUGO, show_abi_version, NULL);
-
-static int __init ucma_init(void)
-{
-	int ret;
-
-	ret = misc_register(&ucma_misc);
-	if (ret)
-		return ret;
-
-	ret = device_create_file(ucma_misc.this_device, &dev_attr_abi_version);
-	if (ret) {
-		printk(KERN_ERR "rdma_ucm: couldn't create abi_version attr\n");
-		goto err1;
-	}
-
-	ucma_ctl_table_hdr = register_net_sysctl(&init_net, "net/rdma_ucm", ucma_ctl_table);
-	if (!ucma_ctl_table_hdr) {
-		printk(KERN_ERR "rdma_ucm: couldn't register sysctl paths\n");
-		ret = -ENOMEM;
-		goto err2;
-	}
-	return 0;
-err2:
-	device_remove_file(ucma_misc.this_device, &dev_attr_abi_version);
-err1:
-	misc_deregister(&ucma_misc);
-	return ret;
-}
-
-static void __exit ucma_cleanup(void)
-{
-	unregister_net_sysctl_table(ucma_ctl_table_hdr);
-	device_remove_file(ucma_misc.this_device, &dev_attr_abi_version);
-	misc_deregister(&ucma_misc);
-	idr_destroy(&ctx_idr);
-	idr_destroy(&multicast_idr);
-}
-
-module_init(ucma_init);
-module_exit(ucma_cleanup);
+x4dab
+#define mmDP4_DP_LINK_FRAMING_CNTL                                              0x4eab
+#define mmDP5_DP_LINK_FRAMING_CNTL                                              0x4fab
+#define mmDP6_DP_LINK_FRAMING_CNTL                                              0x54ab
+#define mmDP7_DP_LINK_FRAMING_CNTL                                              0x56ab
+#define mmDP8_DP_LINK_FRAMING_CNTL                                              0x57ab
+#define mmDP_HBR2_EYE_PATTERN                                                   0x4aac
+#define mmDP0_DP_HBR2_EYE_PATTERN                                               0x4aac
+#define mmDP1_DP_HBR2_EYE_PATTERN                                               0x4bac
+#define mmDP2_DP_HBR2_EYE_PATTERN                                               0x4cac
+#define mmDP3_DP_HBR2_EYE_PATTERN                                               0x4dac
+#define mmDP4_DP_HBR2_EYE_PATTERN                                               0x4eac
+#define mmDP5_DP_HBR2_EYE_PATTERN                                               0x4fac
+#define mmDP6_DP_HBR2_EYE_PATTERN                                               0x54ac
+#define mmDP7_DP_HBR2_EYE_PATTERN                                               0x56ac
+#define mmDP8_DP_HBR2_EYE_PATTERN                                               0x57ac
+#define mmDP_VID_MSA_VBID                                                       0x4aad
+#define mmDP0_DP_VID_MSA_VBID                                                   0x4aad
+#define mmDP1_DP_VID_MSA_VBID                                                   0x4bad
+#define mmDP2_DP_VID_MSA_VBID                                                   0x4cad
+#define mmDP3_DP_VID_MSA_VBID                                                   0x4dad
+#define mmDP4_DP_VID_MSA_VBID                                                   0x4ead
+#define mmDP5_DP_VID_MSA_VBID                                                   0x4fad
+#define mmDP6_DP_VID_MSA_VBID                                                   0x54ad
+#define mmDP7_DP_VID_MSA_VBID                                                   0x56ad
+#define mmDP8_DP_VID_MSA_VBID                                                   0x57ad
+#define mmDP_VID_INTERRUPT_CNTL                                                 0x4aae
+#define mmDP0_DP_VID_INTERRUPT_CNTL                                             0x4aae
+#define mmDP1_DP_VID_INTERRUPT_CNTL                                             0x4bae
+#define mmDP2_DP_VID_INTERRUPT_CNTL                                             0x4cae
+#define mmDP3_DP_VID_INTERRUPT_CNTL                                             0x4dae
+#define mmDP4_DP_VID_INTERRUPT_CNTL                                             0x4eae
+#define mmDP5_DP_VID_INTERRUPT_CNTL                                             0x4fae
+#define mmDP6_DP_VID_INTERRUPT_CNTL                                             0x54ae
+#define mmDP7_DP_VID_INTERRUPT_CNTL                                             0x56ae
+#define mmDP8_DP_VID_INTERRUPT_CNTL                                             0x57ae
+#define mmDP_DPHY_CNTL                                                          0x4aaf
+#define mmDP0_DP_DPHY_CNTL                                                      0x4aaf
+#define mmDP1_DP_DPHY_CNTL                                                      0x4baf
+#define mmDP2_DP_DPHY_CNTL                                                      0x4caf
+#define mmDP3_DP_DPHY_CNTL                                                      0x4daf
+#define mmDP4_DP_DPHY_CNTL                                                      0x4eaf
+#define mmDP5_DP_DPHY_CNTL                                                      0x4faf
+#define mmDP6_DP_DPHY_CNTL                                                      0x54af
+#define mmDP7_DP_DPHY_CNTL                                                      0x56af
+#define mmDP8_DP_DPHY_CNTL                                                      0x57af
+#define mmDP_DPHY_TRAINING_PATTERN_SEL                                          0x4ab0
+#define mmDP0_DP_DPHY_TRAINING_PATTERN_SEL                                      0x4ab0
+#define mmDP1_DP_DPHY_TRAINING_PATTERN_SEL                                      0x4bb0
+#define mmDP2_DP_DPHY_TRAINING_PATTERN_SEL                                      0x4cb0
+#define mmDP3_DP_DPHY_TRAINING_PATTERN_SEL                                      0x4db0
+#define mmDP4_DP_DPHY_TRAINING_PATTERN_SEL                                      0x4eb0
+#define mmDP5_DP_DPHY_TRAINING_PATTERN_SEL                                      0x4fb0
+#define mmDP6_DP_DPHY_TRAINING_PATTERN_SEL                                      0x54b0
+#define mmDP7_DP_DPHY_TRAINING_PATTERN_SEL                                      0x56b0
+#define mmDP8_DP_DPHY_TRAINING_PATTERN_SEL                                      0x57b0
+#define mmDP_DPHY_SYM0                                                          0x4ab1
+#define mmDP0_DP_DPHY_SYM0                                                      0x4ab1
+#define mmDP1_DP_DPHY_SYM0                                                      0x4bb1
+#define mmDP2_DP_DPHY_SYM0                                                      0x4cb1
+#define mmDP3_DP_DPHY_SYM0                                                      0x4db1
+#define mmDP4_DP_DPHY_SYM0                                                      0x4eb1
+#define mmDP5_DP_DPHY_SYM0                                                      0x4fb1
+#define mmDP6_DP_DPHY_SYM0                                                      0x54b1
+#define mmDP7_DP_DPHY_SYM0                                                      0x56b1
+#define mmDP8_DP_DPHY_SYM0                                                      0x57b1
+#define mmDP_DPHY_SYM1                                                          0x4ab2
+#define mmDP0_DP_DPHY_SYM1                                                      0x4ab2
+#define mmDP1_DP_DPHY_SYM1                                                      0x4bb2
+#define mmDP2_DP_DPHY_SYM1                                                      0x4cb2
+#define mmDP3_DP_DPHY_SYM1                                                      0x4db2
+#define mmDP4_DP_DPHY_SYM1                                                      0x4eb2
+#define mmDP5_DP_DPHY_SYM1                                                      0x4fb2
+#define mmDP6_DP_DPHY_SYM1                                                      0x54b2
+#define mmDP7_DP_DPHY_SYM1                                                      0x56b2
+#define mmDP8_DP_DPHY_SYM1                                                      0x57b2
+#define mmDP_DPHY_SYM2                                                          0x4ab3
+#define mmDP0_DP_DPHY_SYM2                                                      0x4ab3
+#define mmDP1_DP_DPHY_SYM2                                                      0x4bb3
+#define mmDP2_DP_DPHY_SYM2                                                      0x4cb3
+#define mmDP3_DP_DPHY_SYM2                                                      0x4db3
+#define mmDP4_DP_DPHY_SYM2                                                      0x4eb3
+#define mmDP5_DP_DPHY_SYM2                                                      0x4fb3
+#define mmDP6_DP_DPHY_SYM2                                                      0x54b3
+#define mmDP7_DP_DPHY_SYM2                                                      0x56b3
+#define mmDP8_DP_DPHY_SYM2                                                      0x57b3
+#define mmDP_DPHY_8B10B_CNTL                                                    0x4ab4
+#define mmDP0_DP_DPHY_8B10B_CNTL                                                0x4ab4
+#define mmDP1_DP_DPHY_8B10B_CNTL                                                0x4bb4
+#define mmDP2_DP_DPHY_8B10B_CNTL                                                0x4cb4
+#define mmDP3_DP_DPHY_8B10B_CNTL                                                0x4db4
+#define mmDP4_DP_DPHY_8B10B_CNTL                                                0x4eb4
+#define mmDP5_DP_DPHY_8B10B_CNTL                                                0x4fb4
+#define mmDP6_DP_DPHY_8B10B_CNTL                                                0x54b4
+#define mmDP7_DP_DPHY_8B10B_CNTL                                                0x56b4
+#define mmDP8_DP_DPHY_8B10B_CNTL                                                0x57b4
+#define mmDP_DPHY_PRBS_CNTL                                                     0x4ab5
+#define mmDP0_DP_DPHY_PRBS_CNTL                                                 0x4ab5
+#define mmDP1_DP_DPHY_PRBS_CNTL                                                 0x4bb5
+#define mmDP2_DP_DPHY_PRBS_CNTL                                                 0x4cb5
+#define mmDP3_DP_DPHY_PRBS_CNTL                                                 0x4db5
+#define mmDP4_DP_DPHY_PRBS_CNTL                                                 0x4eb5
+#define mmDP5_DP_DPHY_PRBS_CNTL                                                 0x4fb5
+#define mmDP6_DP_DPHY_PRBS_CNTL                                                 0x54b5
+#define mmDP7_DP_DPHY_PRBS_CNTL                                                 0x56b5
+#define mmDP8_DP_DPHY_PRBS_CNTL                                                 0x57b5
+#define mmDP_DPHY_BS_SR_SWAP_CNTL                                               0x4adc
+#define mmDP0_DP_DPHY_BS_SR_SWAP_CNTL                                           0x4adc
+#define mmDP1_DP_DPHY_BS_SR_SWAP_CNTL                                           0x4bdc
+#define mmDP2_DP_DPHY_BS_SR_SWAP_CNTL                                           0x4cdc
+#define mmDP3_DP_DPHY_BS_SR_SWAP_CNTL                                           0x4ddc
+#define mmDP4_DP_DPHY_BS_SR_SWAP_CNTL                                           0x4edc
+#define mmDP5_DP_DPHY_BS_SR_SWAP_CNTL                                           0x4fdc
+#define mmDP6_DP_DPHY_BS_SR_SWAP_CNTL                                           0x54dc
+#define mmDP7_DP_DPHY_BS_SR_SWAP_CNTL                                           0x56dc
+#define mmDP8_DP_DPHY_BS_SR_SWAP_CNTL                                           0x57dc
+#define mmDP_DPHY_CRC_EN                                                        0x4ab7
+#define mmDP0_DP_DPHY_CRC_EN                                                    0x4ab7
+#define mmDP1_DP_DPHY_CRC_EN                                                    0x4bb7
+#define mmDP2_DP_DPHY_CRC_EN                                                    0x4cb7
+#define mmDP3_DP_DPHY_CRC_EN                                                    0x4db7
+#define mmDP4_DP_DPHY_CRC_EN                                                    0x4eb7
+#define mmDP5_DP_DPHY_CRC_EN                                                    0x4fb7
+#define mmDP6_DP_DPHY_CRC_EN                                                    0x54b7
+#define mmDP7_DP_DPHY_CRC_EN                                                    0x56b7
+#define mmDP8_DP_DPHY_CRC_EN                                                    0x57b7
+#define mmDP_DPHY_CRC_CNTL                                                      0x4ab8
+#define mmDP0_DP_DPHY_CRC_CNTL                                                  0x4ab8
+#define mmDP1_DP_DPHY_CRC_CNTL                                                  0x4bb8
+#define mmDP2_DP_DPHY_CRC_CNTL                                                  0x4cb8
+#define mmDP3_DP_DPHY_CRC_CNTL                                                  0x4db8
+#define mmDP4_DP_DPHY_CRC_CNTL                                                  0x4eb8
+#define mmDP5_DP_DPHY_CRC_CNTL                                                  0x4fb8
+#define mmDP6_DP_DPHY_CRC_CNTL                                                  0x54b8
+#define mmDP7_DP_DPHY_CRC_CNTL                                                  0x56b8
+#define mmDP8_DP_DPHY_CRC_CNTL                                                  0x57b8
+#define mmDP_DPHY_CRC_RESULT                                                    0x4ab9
+#define mmDP0_DP_DPHY_CRC_RESULT                                                0x4ab9
+#define mmDP1_DP_DPHY_CRC_RESULT                                                0x4bb9
+#define mmDP2_DP_DPHY_CRC_RESULT                                                0x4cb9
+#define mmDP3_DP_DPHY_CRC_RESULT                                                0x4db9
+#define mmDP4_DP_DPHY_CRC_RESULT                                                0x4eb9
+#define mmDP5_DP_DPHY_CRC_RESULT                                                0x4fb9
+#define mmDP6_DP_DPHY_CRC_RESULT                                                0x54b9
+#define mmDP7_DP_DPHY_CRC_RESULT                                                0x56b9
+#define mmDP8_DP_DPHY_CRC_RESULT                                                0x57b9
+#define mmDP_DPHY_CRC_MST_CNTL                                                  0x4aba
+#define mmDP0_DP_DPHY_CRC_MST_CNTL                                              0x4aba
+#define mmDP1_DP_DPHY_CRC_MST_CNTL                                              0x4bba
+#define mmDP2_DP_DPHY_CRC_MST_CNTL                                              0x4cba
+#define mmDP3_DP_DPHY_CRC_MST_CNTL                                              0x4dba
+#define mmDP4_DP_DPHY_CRC_MST_CNTL                                              0x4eba
+#define mmDP5_DP_DPHY_CRC_MST_CNTL                                              0x4fba
+#define mmDP6_DP_DPHY_CRC_MST_CNTL                                              0x54ba
+#define mmDP7_DP_DPHY_CRC_MST_CNTL                                              0x56ba
+#define mmDP8_DP_DPHY_CRC_MST_CNTL                                              0x57ba
+#define mmDP_DPHY_CRC_MST_STATUS                                                0x4abb
+#define mmDP0_DP_DPHY_CRC_MST_STATUS                                            0x4abb
+#define mmDP1_DP_DPHY_CRC_MST_STATUS                                            0x4bbb
+#define mmDP2_DP_DPHY_CRC_MST_STATUS                                            0x4cbb
+#define mmDP3_DP_DPHY_CRC_MST_STATUS                                            0x4dbb
+#define mmDP4_DP_DPHY_CRC_MST_STATUS                                            0x4ebb
+#define mmDP5_DP_DPHY_CRC_MST_STATUS                                            0x4fbb
+#define mmDP6_DP_DPHY_CRC_MST_STATUS                                            0x54bb
+#define mmDP7_DP_DPHY_CRC_MST_STATUS                                            0x56bb
+#define mmDP8_DP_DPHY_CRC_MST_STATUS                                            0x57bb
+#define mmDP_DPHY_FAST_TRAINING                                                 0x4abc
+#define mmDP0_DP_DPHY_FAST_TRAINING                                             0x4abc
+#define mmDP1_DP_DPHY_FAST_TRAINING                                             0x4bbc
+#define mmDP2_DP_DPHY_FAST_TRAINING                                             0x4cbc
+#define mmDP3_DP_DPHY_FAST_TRAINING                                             0x4dbc
+#define mmDP4_DP_DPHY_FAST_TRAINING                                             0x4ebc
+#define mmDP5_DP_DPHY_FAST_TRAINING                                             0x4fbc
+#define mmDP6_DP_DPHY_FAST_TRAINING                                             0x54bc
+#define mmDP7_DP_DPHY_FAST_TRAINING                                             0x56bc
+#define mmDP8_DP_DPHY_FAST_TRAINING                                             0x57bc
+#define mmDP_DPHY_FAST_TRAINING_STATUS                                          0x4abd
+#define mmDP0_DP_DPHY_FAST_TRAINING_STATUS                                      0x4abd
+#define mmDP1_DP_DPHY_FAST_TRAINING_STATUS                                      0x4bbd
+#define mmDP2_DP_DPHY_FAST_TRAINING_STATUS                                      0x4cbd
+#define mmDP3_DP_DPHY_FAST_TRAINING_STATUS                                      0x4dbd
+#define mmDP4_DP_DPHY_FAST_TRAINING_STATUS                                      0x4ebd
+#define mmDP5_DP_DPHY_FAST_TRAINING_STATUS                                      0x4fbd
+#define mmDP6_DP_DPHY_FAST_TRAINING_STATUS                                      0x54bd
+#define mmDP7_DP_DPHY_FAST_TRAINING_STATUS                                      0x56bd
+#define mmDP8_DP_DPHY_FAST_TRAINING_STATUS                                      0x57bd
+#define mmDP_DPHY_HBR2_PATTERN_CONTROL                                          0x4add
+#define mmDP0_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x4add
+#define mmDP1_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x4bdd
+#define mmDP2_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x4cdd
+#define mmDP3_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x4ddd
+#define mmDP4_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x4edd
+#define mmDP5_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x4fdd
+#define mmDP6_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x54dd
+#define mmDP7_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x56dd
+#define mmDP8_DP_DPHY_HBR2_PATTERN_CONTROL                                      0x57dd
+#define mmDP_MSA_V_TIMING_OVERRIDE1                                             0x4abe
+#define mmDP0_DP_MSA_V_TIMING_OVERRIDE1                                         0x4abe
+#define mmDP1_DP_MSA_V_TIMING_OVERRIDE1                                         0x4bbe
+#define mmDP2_DP_MSA_V_TIMING_OVERRIDE1                                         0x4cbe
+#define mmDP3_DP_MSA_V_TIMING_OVERRIDE1                                         0x4dbe
+#define mmDP4_DP_MSA_V_TIMING_OVERRIDE1                                         0x4ebe
+#define mmDP5_DP_MSA_V_TIMING_OVERRIDE1                                         0x4fbe
+#define mmDP6_DP_MSA_V_TIMING_OVERRIDE1                                         0x54be
+#define mmDP7_DP_MSA_V_TIMING_OVERRIDE1                                         0x56be
+#define mmDP8_DP_MSA_V_TIMING_OVERRIDE1                                         0x57be
+#define mmDP_MSA_V_TIMING_OVERRIDE2                                             0x4abf
+#define mmDP0_DP_MSA_V_TIMING_OVERRIDE2                                         0x4abf
+#define mmDP1_DP_MSA_V_TIMING_OVERRIDE2                                         0x4bbf
+#define mmDP2_DP_MSA_V_TIMING_OVERRIDE2                                         0x4cbf
+#define mmDP3_DP_MSA_V_TIMING_OVERRIDE2                                         0x4dbf
+#define mmDP4_DP_MSA_V_TIMING_OVERRIDE2                                         0x4ebf
+#define mmDP5_DP_MSA_V_TIMING_OVERRIDE2                                         0x4fbf
+#define mmDP6_DP_MSA_V_TIMING_OVERRIDE2                                         0x54bf
+#define mmDP7_DP_MSA_V_TIMING_OVERRIDE2                                         0x56bf
+#define mmDP8_DP_MSA_V_TIMING_OVERRIDE2                                         0x57bf
+#define mmDP_SEC_CNTL                                                           0x4ac3
+#define mmDP0_DP_SEC_CNTL                                                       0x4ac3
+#define mmDP1_DP_SEC_CNTL                                                       0x4bc3
+#define mmDP2_DP_SEC_CNTL                                                       0x4cc3
+#define mmDP3_DP_SEC_CNTL                                                       0x4dc3
+#define mmDP4_DP_SEC_CNTL                                                       0x4ec3
+#define mmDP5_DP_SEC_CNTL                                                       0x4fc3
+#define mmDP6_DP_SEC_CNTL                                                       0x54c3
+#define mmDP7_DP_SEC_CNTL                                                       0x56c3
+#define mmDP8_DP_SEC_CNTL                                                       0x57c3
+#define mmDP_SEC_CNTL1                                                          0x4ac4
+#define mmDP0_DP_SEC_CNTL1                                                      0x4ac4
+#define mmDP1_DP_SEC_CNTL1                                                      0x4bc4
+#define mmDP2_DP_SEC_CNTL1                                                      0x4cc4
+#define mmDP3_DP_SEC_CNTL1                                                      0x4dc4
+#define mmDP4_DP_SEC_CNTL1                                                      0x4ec4
+#define mmDP5_DP_SEC_CNTL1                                                      0x4fc4
+#define mmDP6_DP_SEC_CNTL1                                                      0x54c4
+#define mmDP7_DP_SEC_CNTL1                                                      0x56c4
+#define mmDP8_DP_SEC_CNTL1                                                      0x57c4
+#define mmDP_SEC_FRAMING1                                                       0x4ac5
+#define mmDP0_DP_SEC_FRAMING1                                                   0x4ac5
+#define mmDP1_DP_SEC_FRAMING1                                                   0x4bc5
+#define mmDP2_DP_SEC_FRAMING1                                                   0x4cc5
+#define mmDP3_DP_SEC_FRAMING1                                                   0x4dc5
+#define mmDP4_DP_SEC_FRAMING1                                                   0x4ec5
+#define mmDP5_DP_SEC_FRAMING1                                                   0x4fc5
+#define mmDP6_DP_SEC_FRAMING1                                                   0x54c5
+#define mmDP7_DP_SEC_FRAMING1                                                   0x56c5
+#define mmDP8_DP_SEC_FRAMING1                                                   0x57c5
+#define mmDP_SEC_FRAMING2                                                       0x4ac6
+#define mmDP0_DP_SEC_FRAMING2                                                   0x4ac6
+#define mmDP1_DP_SEC_FRAMING2                                                   0x4bc6
+#define mmDP2_DP_SEC_FRAMING2                                                   0x4cc6
+#define mmDP3_DP_SEC_FRAMING2                                                   0x4dc6
+#define mmDP4_DP_SEC_FRAMING2                                                   0x4ec6
+#define mmDP5_DP_SEC_FRAMING2                                                   0x4fc6
+#define mmDP6_DP_SEC_FRAMING2                                                   0x54c6
+#define mmDP7_DP_SEC_FRAMING2                                                   0x56c6
+#define mmDP8_DP_SEC_FRAMING2                                                   0x57c6
+#define mmDP_SEC_FRAMING3                                                       0x4ac7
+#define mmDP0_DP_SEC_FRAMING3                                                   0x4ac7
+#define mmDP1_DP_SEC_FRAMING3                                                   0x4bc7
+#define mmDP2_DP_SEC_FRAMING3                                                   0x4cc7
+#define mmDP3_DP_SEC_FRAMING3                                                   0x4dc7
+#define mmDP4_DP_SEC_FRAMING3                                                   0x4ec7
+#define mmDP5_DP_SEC_FRAMING3                                                   0x4fc7
+#define mmDP6_DP_SEC_FRAMING3                                                   0x54c7
+#define mmDP7_DP_SEC_FRAMING3                                                   0x56c7
+#define mmDP8_DP_SEC_FRAMING3                                                   0x57c7
+#define mmDP_SEC_FRAMING4                                                       0x4ac8
+#define mmDP0_DP_SEC_FRAMING4                                                   0x4ac8
+#define mmDP1_DP_SEC_FRAMING4                                                   0x4bc8
+#define mmDP2_DP_SEC_FRAMING4                                                   0x4cc8
+#define mmDP3_DP_SEC_FRAMING4                                                   0x4dc8
+#define mmDP4_DP_SEC_FRAMING4                                                   0x4ec8
+#define mmDP5_DP_SEC_FRAMING4                                                   0x4fc8
+#define mmDP6_DP_SEC_FRAMING4                                                   0x54c8
+#define mmDP7_DP_SEC_FRAMING4                                                   0x56c8
+#define mmDP8_DP_SEC_FRAMING4                                                   0x57c8
+#define mmDP_SEC_AUD_N                                                          0x4ac9
+#define mmDP0_DP_SEC_AUD_N                                                      0x4ac9
+#define mmDP1_DP_SEC_AUD_N                                                      0x4bc9
+#define mmDP2_DP_SEC_AUD_N                                                      0x4cc9
+#define mmDP3_DP_SEC_AUD_N                                                      0x4dc9
+#define mmDP4_DP_SEC_AUD_N                                                      0x4ec9
+#define mmDP5_DP_SEC_AUD_N                                                      0x4fc9
+#define mmDP6_DP_SEC_AUD_N                                                      0x54c9
+#define mmDP7_DP_SEC_AUD_N                                                      0x56c9
+#define mmDP8_DP_SEC_AUD_N                                                      0x57c9
+#define mmDP_SEC_AUD_N_READBACK                                                 0x4aca
+#define mmDP0_DP_SEC_AUD_N_READBACK                                             0x4aca
+#define mmDP1_DP_SEC_AUD_N_READBACK                                             0x4bca
+#define mmDP2_DP_SEC_AUD_N_READBACK                                             0x4cca
+#define mmDP3_DP_SEC_AUD_N_READBACK                                             0x4dca
+#define mmDP4_DP_SEC_AUD_N_READBACK                                             0x4eca
+#define mmDP5_DP_SEC_AUD_N_READBACK                                             0x4fca
+#define mmDP6_DP_SEC_AUD_N_READBACK                                             0x54ca
+#define mmDP7_DP_SEC_AUD_N_READBACK                                             0x56ca
+#define mmDP8_DP_SEC_AUD_N_READBACK                                             0x57ca
+#define mmDP_SEC_AUD_M                                                          0x4acb
+#define mmDP0_DP_SEC_AUD_M                                                      0x4acb
+#define mmDP1_DP_SEC_AUD_M                                                      0x4bcb
+#define mmDP2_DP_SEC_AUD_M                                                      0x4ccb
+#define mmDP3_DP_SEC_AUD_M                                                      0x4dcb
+#define mmDP4_DP_SEC_AUD_M                                                      0x4ecb
+#define mmDP5_DP_SEC_AUD_M                                                      0x4fcb
+#define mmDP6_DP_SEC_AUD_M                                                      0x54cb
+#define mmDP7_DP_SEC_AUD_M                                                      0x56cb
+#define mmDP8_DP_SEC_AUD_M                                                      0x57cb
+#define mmDP_SEC_AUD_M_READBACK                                                 0x4acc
+#define mmDP0_DP_SEC_AUD_M_READBACK                                             0x4acc
+#define mmDP1_DP_SEC_AUD_M_READBACK                                             0x4bcc
+#define mmDP2_DP_SEC_AUD_M_READBACK                                             0x4ccc
+#define mmDP3_DP_SEC_AUD_M_READBACK                                             0x4dcc
+#define mmDP4_DP_SEC_AUD_M_READBACK                                             0x4ecc
+#define mmDP5_DP_SEC_AUD_M_READBACK                                             0x4fcc
+#define mmDP6_DP_SEC_AUD_M_READBACK                                             0x54cc
+#define mmDP7_DP_SEC_AUD_M_READBACK                                             0x56cc
+#define mmDP8_DP_SEC_AUD_M_READBACK                                             0x57cc
+#define mmDP_SEC_TIMESTAMP                                                      0x4acd
+#define mmDP0_DP_SEC_TIMESTAMP                                                  0x4acd
+#define mmDP1_DP_SEC_TIMESTAMP                                                  0x4bcd
+#define mmDP2_DP_SEC_TIMESTAMP                                                  0x4ccd
+#define mmDP3_DP_SEC_TIMESTAMP                                                  0x4dcd
+#define mmDP4_DP_SEC_TIMESTAMP                                                  0x4ecd
+#define mmDP5_DP_SEC_TIMESTAMP                                                  0x4fcd
+#define mmDP6_DP_SEC_TIMESTAMP                                                  0x54cd
+#define mmDP7_DP_SEC_TIMESTAMP                                                  0x56cd
+#define mmDP8_DP_SEC_TIMESTAMP                                                  0x57cd
+#define mmDP_SEC_PACKET_CNTL                                                    0x4ace
+#define mmDP0_DP_SEC_PACKET_CNTL                                                0x4ace
+#define mmDP1_DP_SEC_PACKET_CNTL                                                0x4bce
+#define mmDP2_DP_SEC_PACKET_CNTL                                                0x4cce
+#define mmDP3_DP_SEC_PACKET_CNTL                                                0x4dce
+#define mmDP4_DP_SEC_PACKET_CNTL                                                0x4ece
+#define mmDP5_DP_SEC_PACKET_CNTL                                                0x4fce
+#define mmDP6_DP_SEC_PACKET_CNTL                                                0x54ce
+#define mmDP7_DP_SEC_PACKET_CNTL                                                0x56ce
+#define mmDP8_DP_SEC_PACKET_CNTL                                                0x57ce
+#define mmDP_MSE_RATE_CNTL                                                      0x4acf
+#define mmDP0_DP_MSE_RATE_CNTL                                                  0x4acf
+#define mmDP1_DP_MSE_RATE_CNTL                                                  0x4bcf
+#define mmDP2_DP_MSE_RATE_CNTL                                                  0x4ccf
+#define mmDP3_DP_MSE_RATE_CNTL                                                  0x4dcf
+#define mmDP4_DP_MSE_RATE_CNTL                                                  0x4ecf
+#define mmDP5_DP_MSE_RATE_CNTL                                                  0x4fcf
+#define mmDP6_DP_MSE_RATE_CNTL                                                  0x54cf
+#define mmDP7_DP_MSE_RATE_CNTL                                                  0x56cf
+#define mmDP8_DP_MSE_RATE_CNTL                                                  0x57cf
+#define mmDP_MSE_RATE_UPDATE                                                    0x4ad1
+#define mmDP0_DP_MSE_RATE_UPDATE                                                0x4ad1
+#define mmDP1_DP_MSE_RATE_UPDATE                                                0x4bd1
+#define mmDP2_DP_MSE_RATE_UPDATE                                                0x4cd1
+#define mmDP3_DP_MSE_RATE_UPDATE                                                0x4dd1
+#define mmDP4_DP_MSE_RATE_UPDATE                                                0x4ed1
+#define mmDP5_DP_MSE_RATE_UPDATE                                                0x4fd1
+#define mmDP6_DP_MSE_RATE_UPDATE                                                0x54d1
+#define mmDP7_DP_MSE_RATE_UPDATE                                                0x56d1
+#define mmDP8_DP_MSE_RATE_UPDATE                                                0x57d1
+#define mmDP_MSE_SAT0                                                           0x4ad2
+#define mmDP0_DP_MSE_SAT0                                                       0x4ad2
+#define mmDP1_DP_MSE_SAT0                                                       0x4bd2
+#define mmDP2_DP_MSE_SAT0                                                       0x4cd2
+#define mmDP3_DP_MSE_SAT0                                                       0x4dd2
+#define mmDP4_DP_MSE_SAT0                                                       0x4ed2
+#define mmDP5_DP_MSE_SAT0                                                       0x4fd2
+#define mmDP6_DP_MSE_SAT0                                                       0x54d2
+#define mmDP7_DP_MSE_SAT0                                                       0x56d2
+#define mmDP8_DP_MSE_SAT0                                                       0x57d2
+#define mmDP_MSE_SAT1                                                           0x4ad3
+#define mmDP0_DP_MSE_SAT1                                                       0x4ad3
+#define mmDP1_DP_MSE_SAT1                                                       0x4bd3
+#define mmDP2_DP_MSE_SAT1                                                       0x4cd3
+#define mmDP3_DP_MSE_SAT1                                                       0x4dd3
+#define mmDP4_DP_MSE_SAT1                                                       0x4ed3
+#define mmDP5_DP_MSE_SAT1                                                       0x4fd3
+#define mmDP6_DP_MSE_SAT1                                                       0x54d3
+#define mmDP7_DP_MSE_SAT1                                                       0x56d3
+#define mmDP8_DP_MSE_SAT1                                                       0x57d3
+#define mmDP_MSE_SAT2                                                           0x4ad4
+#define mmDP0_DP_MSE_SAT2                                                       0x4ad4
+#define mmDP1_DP_MSE_SAT2                                                       0x4bd4
+#define mmDP2_DP_MSE_SAT2                                                       0x4cd4
+#define mmDP3_DP_MSE_SAT2                                                       0x4dd4
+#define mmDP4_DP_MSE_SAT2                                                       0x4ed4
+#define mmDP5_DP_MSE_SAT2                                                       0x4fd4
+#define mmDP6_DP_MSE_SAT2                                                       0x54d4
+#define mmDP7_DP_MSE_SAT2                                                       0x56d4
+#define mmDP8_DP_MSE_SAT2                                                       0x57d4
+#define mmDP_MSE_SAT_UPDATE                                                     0x4ad5
+#define mmDP0_DP_MSE_SAT_UPDATE                                                 0x4ad5
+#define mmDP1_DP_MSE_SAT_UPDATE                                                 0x4bd5
+#define mmDP2_DP_MSE_SAT_UPDATE                                                 0x4cd5
+#define mmDP3_DP_MSE_SAT_UPDATE                                                 0x4dd5
+#define mmDP4_DP_MSE_SAT_UPDATE                                                 0x4ed5
+#define mmDP5_DP_MSE_SAT_UPDATE                                                 0x4fd5
+#define mmDP6_DP_MSE_SAT_UPDATE                                                 0x54d5
+#define mmDP7_DP_MSE_SAT_UPDATE                                                 0x56d5
+#define mmDP8_DP_MSE_SAT_UPDATE                                                 0x57d5
+#define mmDP_MSE_LINK_TIMING                                                    0x4ad6
+#define mmDP0_DP_MSE_LINK_TIMING                                                0x4ad6
+#define mmDP1_DP_MSE_LINK_TIMING                                                0x4bd6
+#define mmDP2_DP_MSE_LINK_TIMING                                                0x4cd6
+#define mmDP3_DP_MSE_LINK_TIMING                                                0x4dd6
+#define mmDP4_DP_MSE_LINK_TIMING                                                0x4ed6
+#define mmDP5_DP_MSE_LINK_TIMING                                                0x4fd6
+#define mmDP6_DP_MSE_LINK_TIMING                                                0x54d6
+#define mmDP7_DP_MSE_LINK_TIMING                                                0x56d6
+#define mmDP8_DP_MSE_LINK_TIMING                                                0x57d6
+#define mmDP_MSE_MISC_CNTL                                                      0x4ad7
+#define mmDP0_DP_MSE_MISC_CNTL                                                  0x4ad7
+#define mmDP1_DP_MSE_MISC_CNTL                                                  0x4bd7
+#define mmDP2_DP_MSE_MISC_CNTL                                                  0x4cd7
+#define mmDP3_DP_MSE_MISC_CNTL                                                  0x4dd7
+#define mmDP4_DP_MSE_MISC_CNTL                                                  0x4ed7
+#define mmDP5_DP_MSE_MISC_CNTL                                                  0x4fd7
+#define mmDP6_DP_MSE_MISC_CNTL                                                  0x54d7
+#define mmDP7_DP_MSE_MISC_CNTL                                                  0x56d7
+#define mmDP8_DP_MSE_MISC_CNTL                                                  0x57d7
+#define mmDP_TEST_DEBUG_INDEX                                                   0x4ad8
+#define mmDP0_DP_TEST_DEBUG_INDEX                                               0x4ad8
+#define mmDP1_DP_TEST_DEBUG_INDEX                                               0x4bd8
+#define mmDP2_DP_TEST_DEBUG_INDEX                                               0x4cd8
+#define mmDP3_DP_TEST_DEBUG_INDEX                                               0x4dd8
+#define mmDP4_DP_TEST_DEBUG_INDEX                                               0x4ed8
+#define mmDP5_DP_TEST_DEBUG_INDEX                                               0x4fd8
+#define mmDP6_DP_TEST_DEBUG_INDEX                                               0x54d8
+#define mmDP7_DP_TEST_DEBUG_INDEX                                               0x56d8
+#define mmDP8_DP_TEST_DEBUG_INDEX                                               0x57d8
+#define mmDP_TEST_DEBUG_DATA                                                    0x4ad9
+#define mmDP0_DP_TEST_DEBUG_DATA                                                0x4ad9
+#define mmDP1_DP_TEST_DEBUG_DATA                                                0x4bd9
+#define mmDP2_DP_TEST_DEBUG_DATA                                                0x4cd9
+#define mmDP3_DP_TEST_DEBUG_DATA                                                0x4dd9
+#define mmDP4_DP_TEST_DEBUG_DATA                                                0x4ed9
+#define mmDP5_DP_TEST_DEBUG_DATA                                                0x4fd9
+#define mmDP6_DP_TEST_DEBUG_DATA                                                0x54d9
+#define mmDP7_DP_TEST_DEBUG_DATA                                                0x56d9
+#define mmDP8_DP_TEST_DEBUG_DATA                                                0x57d9
+#define mmDP_FE_TEST_DEBUG_INDEX                                                0x4ada
+#define mmDP0_DP_FE_TEST_DEBUG_INDEX                                            0x4ada
+#define mmDP1_DP_FE_TEST_DEBUG_INDEX                                            0x4bda
+#define mmDP2_DP_FE_TEST_DEBUG_INDEX                                            0x4cda
+#define mmDP3_DP_FE_TEST_DEBUG_INDEX                                            0x4dda
+#define mmDP4_DP_FE_TEST_DEBUG_INDEX                                            0x4eda
+#define mmDP5_DP_FE_TEST_DEBUG_INDEX                                            0x4fda
+#define mmDP6_DP_FE_TEST_DEBUG_INDEX                                            0x54da
+#define mmDP7_DP_FE_TEST_DEBUG_INDEX                                            0x56da
+#define mmDP8_DP_FE_TEST_DEBUG_INDEX                                            0x57da
+#define mmDP_FE_TEST_DEBUG_DATA                                                 0x4adb
+#define mmDP0_DP_FE_TEST_DEBUG_DATA                                             0x4adb
+#define mmDP1_DP_FE_TEST_DEBUG_DATA                                             0x4bdb
+#define mmDP2_DP_FE_TEST_DEBUG_DATA                                             0x4cdb
+#define mmDP3_DP_FE_TEST_DEBUG_DATA                                             0x4ddb
+#define mmDP4_DP_FE_TEST_DEBUG_DATA                                             0x4edb
+#define mmDP5_DP_FE_TEST_DEBUG_DATA                                             0x4fdb
+#define mmDP6_DP_FE_TEST_DEBUG_DATA                                             0x54db
+#define mmDP7_DP_FE_TEST_DEBUG_DATA                                             0x56db
+#define mmDP8_DP_FE_TEST_DEBUG_DATA                                             0x57db
+#define mmAUX_CONTROL                                                           0x5c00
+#define mmDP_AUX0_AUX_CONTROL                                                   0x5c00
+#define mmDP_AUX1_AUX_CONTROL                                                   0x5c1c
+#define mmDP_AUX2_AUX_CONTROL                                                   0x5c38
+#define mmDP_AUX3_AUX_CONTROL                                                   0x5c54
+#define mmDP_AUX4_AUX_CONTROL                                                   0x5c70
+#define mmDP_AUX5_AUX_CONTROL                                                   0x5c8c
+#define mmAUX_SW_CONTROL                                                        0x5c01
+#define mmDP_AUX0_AUX_SW_CONTROL                                                0x5c01
+#define mmDP_AUX1_AUX_SW_CONTROL                                                0x5c1d
+#define mmDP_AUX2_AUX_SW_CONTROL                                                0x5c39
+#define mmDP_AUX3_AUX_SW_CONTROL                                                0x5c55
+#define mmDP_AUX4_AUX_SW_CONTROL                                                0x5c71
+#define mmDP_AUX5_AUX_SW_CONTROL                                                0x5c8d
+#define mmAUX_ARB_CONTROL                                                       0x5c02
+#define mmDP_AUX0_AUX_ARB_CONTROL                                               0x5c02
+#define mmDP_AUX1_AUX_ARB_CONTROL                                               0x5c1e
+#define mmDP_AUX2_AUX_ARB_CONTROL                                               0x5c3a
+#define mmDP_AUX3_AUX_ARB_CONTROL                                               0x5c56
+#define mmDP_AUX4_AUX_ARB_CONTROL                                               0x5c72
+#define mmDP_AUX5_AUX_ARB_CONTROL                                               0x5c8e
+#define mmAUX_INTERRUPT_CONTROL                                                 0x5c03
+#define mmDP_AUX0_AUX_INTERRUPT_CONTROL                                         0x5c03
+#define mmDP_AUX1_AUX_INTERRUPT_CONTROL                                         0x5c1f
+#define mmDP_AUX2_AUX_INTERRUPT_CONTROL                                         0x5c3b
+#define mmDP_AUX3_AUX_INTERRUPT_CONTROL                                         0x5c57
+#define mmDP_AUX4_AUX_INTERRUPT_CONTROL                                         0x5c73
+#define mmDP_AUX5_AUX_INTERRUPT_CONTROL                                         0x5c8f
+#define mmAUX_SW_STATUS                                                         0x5c04
+#define mmDP_AUX0_AUX_SW_STATUS                                                 0x5c04
+#define mmDP_AUX1_AUX_SW_STATUS                                                 0x5c20
+#define mmDP_AUX2_AUX_SW_STATUS                                                 0x5c3c
+#define mmDP_AUX3_AUX_SW_STATUS                                                 0x5c58
+#define mmDP_AUX4_AUX_SW_STATUS                                                 0x5c74
+#define mmDP_AUX5_AUX_SW_STATUS                                                 0x5c90
+#define mmAUX_LS_STATUS                                                         0x5c05
+#define mmDP_AUX0_AUX_LS_STATUS                                                 0x5c05
+#define mmDP_AUX1_AUX_LS_STATUS                                                 0x5c21
+#define mmDP_AUX2_AUX_LS_STATUS                                                 0x5c3d
+#define mmDP_AUX3_AUX_LS_STATUS                                                 0x5c59
+#define mmDP_AUX4_AUX_LS_STATUS                                                 0x5c75
+#define mmDP_AUX5_AUX_LS_STATUS                                                 0x5c91
+#define mmAUX_SW_DATA                                                           0x5c06
+#define mmDP_AUX0_AUX_SW_DATA                                                   0x5c06
+#define mmDP_AUX1_AUX_SW_DATA                                                   0x5c22
+#define mmDP_AUX2_AUX_SW_DATA                                                   0x5c3e
+#define mmDP_AUX3_AUX_SW_DATA                                                   0x5c5a
+#define mmDP_AUX4_AUX_SW_DATA                                                   0x5c76
+#define mmDP_AUX5_AUX_SW_DATA                                                   0x5c92
+#define mmAUX_LS_DATA                                                           0x5c07
+#define mmDP_AUX0_AUX_LS_DATA                                                   0x5c07
+#define mmDP_AUX1_AUX_LS_DATA                                                   0x5c23
+#define mmDP_AUX2_AUX_LS_DATA                                                   0x5c3f
+#define mmDP_AUX3_AUX_LS_DATA              

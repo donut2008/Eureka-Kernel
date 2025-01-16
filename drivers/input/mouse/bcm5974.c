@@ -1,1047 +1,620 @@
-/*
- * Apple USB BCM5974 (Macbook Air and Penryn Macbook Pro) multitouch driver
- *
- * Copyright (C) 2008	   Henrik Rydberg (rydberg@euromail.se)
- * Copyright (C) 2015      John Horan (knasher@gmail.com)
- *
- * The USB initialization and package decoding was made by
- * Scott Shawcroft as part of the touchd user-space driver project:
- * Copyright (C) 2008	   Scott Shawcroft (scott.shawcroft@gmail.com)
- *
- * The BCM5974 driver is based on the appletouch driver:
- * Copyright (C) 2001-2004 Greg Kroah-Hartman (greg@kroah.com)
- * Copyright (C) 2005      Johannes Berg (johannes@sipsolutions.net)
- * Copyright (C) 2005	   Stelian Pop (stelian@popies.net)
- * Copyright (C) 2005	   Frank Arnold (frank@scirocco-5v-turbo.de)
- * Copyright (C) 2005	   Peter Osterlund (petero2@telia.com)
- * Copyright (C) 2005	   Michael Hanselmann (linux-kernel@hansmi.ch)
- * Copyright (C) 2006	   Nicolas Boichat (nicolas@boichat.ch)
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.	 See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- *
- */
-
-#include <linux/kernel.h>
-#include <linux/errno.h>
-#include <linux/slab.h>
-#include <linux/module.h>
-#include <linux/usb/input.h>
-#include <linux/hid.h>
-#include <linux/mutex.h>
-#include <linux/input/mt.h>
-
-#define USB_VENDOR_ID_APPLE		0x05ac
-
-/* MacbookAir, aka wellspring */
-#define USB_DEVICE_ID_APPLE_WELLSPRING_ANSI	0x0223
-#define USB_DEVICE_ID_APPLE_WELLSPRING_ISO	0x0224
-#define USB_DEVICE_ID_APPLE_WELLSPRING_JIS	0x0225
-/* MacbookProPenryn, aka wellspring2 */
-#define USB_DEVICE_ID_APPLE_WELLSPRING2_ANSI	0x0230
-#define USB_DEVICE_ID_APPLE_WELLSPRING2_ISO	0x0231
-#define USB_DEVICE_ID_APPLE_WELLSPRING2_JIS	0x0232
-/* Macbook5,1 (unibody), aka wellspring3 */
-#define USB_DEVICE_ID_APPLE_WELLSPRING3_ANSI	0x0236
-#define USB_DEVICE_ID_APPLE_WELLSPRING3_ISO	0x0237
-#define USB_DEVICE_ID_APPLE_WELLSPRING3_JIS	0x0238
-/* MacbookAir3,2 (unibody), aka wellspring5 */
-#define USB_DEVICE_ID_APPLE_WELLSPRING4_ANSI	0x023f
-#define USB_DEVICE_ID_APPLE_WELLSPRING4_ISO	0x0240
-#define USB_DEVICE_ID_APPLE_WELLSPRING4_JIS	0x0241
-/* MacbookAir3,1 (unibody), aka wellspring4 */
-#define USB_DEVICE_ID_APPLE_WELLSPRING4A_ANSI	0x0242
-#define USB_DEVICE_ID_APPLE_WELLSPRING4A_ISO	0x0243
-#define USB_DEVICE_ID_APPLE_WELLSPRING4A_JIS	0x0244
-/* Macbook8 (unibody, March 2011) */
-#define USB_DEVICE_ID_APPLE_WELLSPRING5_ANSI	0x0245
-#define USB_DEVICE_ID_APPLE_WELLSPRING5_ISO	0x0246
-#define USB_DEVICE_ID_APPLE_WELLSPRING5_JIS	0x0247
-/* MacbookAir4,1 (unibody, July 2011) */
-#define USB_DEVICE_ID_APPLE_WELLSPRING6A_ANSI	0x0249
-#define USB_DEVICE_ID_APPLE_WELLSPRING6A_ISO	0x024a
-#define USB_DEVICE_ID_APPLE_WELLSPRING6A_JIS	0x024b
-/* MacbookAir4,2 (unibody, July 2011) */
-#define USB_DEVICE_ID_APPLE_WELLSPRING6_ANSI	0x024c
-#define USB_DEVICE_ID_APPLE_WELLSPRING6_ISO	0x024d
-#define USB_DEVICE_ID_APPLE_WELLSPRING6_JIS	0x024e
-/* Macbook8,2 (unibody) */
-#define USB_DEVICE_ID_APPLE_WELLSPRING5A_ANSI	0x0252
-#define USB_DEVICE_ID_APPLE_WELLSPRING5A_ISO	0x0253
-#define USB_DEVICE_ID_APPLE_WELLSPRING5A_JIS	0x0254
-/* MacbookPro10,1 (unibody, June 2012) */
-#define USB_DEVICE_ID_APPLE_WELLSPRING7_ANSI	0x0262
-#define USB_DEVICE_ID_APPLE_WELLSPRING7_ISO	0x0263
-#define USB_DEVICE_ID_APPLE_WELLSPRING7_JIS	0x0264
-/* MacbookPro10,2 (unibody, October 2012) */
-#define USB_DEVICE_ID_APPLE_WELLSPRING7A_ANSI	0x0259
-#define USB_DEVICE_ID_APPLE_WELLSPRING7A_ISO	0x025a
-#define USB_DEVICE_ID_APPLE_WELLSPRING7A_JIS	0x025b
-/* MacbookAir6,2 (unibody, June 2013) */
-#define USB_DEVICE_ID_APPLE_WELLSPRING8_ANSI	0x0290
-#define USB_DEVICE_ID_APPLE_WELLSPRING8_ISO	0x0291
-#define USB_DEVICE_ID_APPLE_WELLSPRING8_JIS	0x0292
-/* MacbookPro12,1 (2015) */
-#define USB_DEVICE_ID_APPLE_WELLSPRING9_ANSI	0x0272
-#define USB_DEVICE_ID_APPLE_WELLSPRING9_ISO	0x0273
-#define USB_DEVICE_ID_APPLE_WELLSPRING9_JIS	0x0274
-
-#define BCM5974_DEVICE(prod) {					\
-	.match_flags = (USB_DEVICE_ID_MATCH_DEVICE |		\
-			USB_DEVICE_ID_MATCH_INT_CLASS |		\
-			USB_DEVICE_ID_MATCH_INT_PROTOCOL),	\
-	.idVendor = USB_VENDOR_ID_APPLE,			\
-	.idProduct = (prod),					\
-	.bInterfaceClass = USB_INTERFACE_CLASS_HID,		\
-	.bInterfaceProtocol = USB_INTERFACE_PROTOCOL_MOUSE	\
-}
-
-/* table of devices that work with this driver */
-static const struct usb_device_id bcm5974_table[] = {
-	/* MacbookAir1.1 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING_JIS),
-	/* MacbookProPenryn */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING2_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING2_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING2_JIS),
-	/* Macbook5,1 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING3_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING3_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING3_JIS),
-	/* MacbookAir3,2 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING4_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING4_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING4_JIS),
-	/* MacbookAir3,1 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING4A_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING4A_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING4A_JIS),
-	/* MacbookPro8 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING5_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING5_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING5_JIS),
-	/* MacbookAir4,1 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING6A_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING6A_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING6A_JIS),
-	/* MacbookAir4,2 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING6_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING6_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING6_JIS),
-	/* MacbookPro8,2 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING5A_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING5A_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING5A_JIS),
-	/* MacbookPro10,1 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING7_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING7_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING7_JIS),
-	/* MacbookPro10,2 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING7A_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING7A_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING7A_JIS),
-	/* MacbookAir6,2 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING8_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING8_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING8_JIS),
-	/* MacbookPro12,1 */
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING9_ANSI),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING9_ISO),
-	BCM5974_DEVICE(USB_DEVICE_ID_APPLE_WELLSPRING9_JIS),
-	/* Terminating entry */
-	{}
-};
-MODULE_DEVICE_TABLE(usb, bcm5974_table);
-
-MODULE_AUTHOR("Henrik Rydberg");
-MODULE_DESCRIPTION("Apple USB BCM5974 multitouch driver");
-MODULE_LICENSE("GPL");
-
-#define dprintk(level, format, a...)\
-	{ if (debug >= level) printk(KERN_DEBUG format, ##a); }
-
-static int debug = 1;
-module_param(debug, int, 0644);
-MODULE_PARM_DESC(debug, "Activate debugging output");
-
-/* button data structure */
-struct bt_data {
-	u8 unknown1;		/* constant */
-	u8 button;		/* left button */
-	u8 rel_x;		/* relative x coordinate */
-	u8 rel_y;		/* relative y coordinate */
-};
-
-/* trackpad header types */
-enum tp_type {
-	TYPE1,			/* plain trackpad */
-	TYPE2,			/* button integrated in trackpad */
-	TYPE3,			/* additional header fields since June 2013 */
-	TYPE4			/* additional header field for pressure data */
-};
-
-/* trackpad finger data offsets, le16-aligned */
-#define HEADER_TYPE1		(13 * sizeof(__le16))
-#define HEADER_TYPE2		(15 * sizeof(__le16))
-#define HEADER_TYPE3		(19 * sizeof(__le16))
-#define HEADER_TYPE4		(23 * sizeof(__le16))
-
-/* trackpad button data offsets */
-#define BUTTON_TYPE1		0
-#define BUTTON_TYPE2		15
-#define BUTTON_TYPE3		23
-#define BUTTON_TYPE4		31
-
-/* list of device capability bits */
-#define HAS_INTEGRATED_BUTTON	1
-
-/* trackpad finger data block size */
-#define FSIZE_TYPE1		(14 * sizeof(__le16))
-#define FSIZE_TYPE2		(14 * sizeof(__le16))
-#define FSIZE_TYPE3		(14 * sizeof(__le16))
-#define FSIZE_TYPE4		(15 * sizeof(__le16))
-
-/* offset from header to finger struct */
-#define DELTA_TYPE1		(0 * sizeof(__le16))
-#define DELTA_TYPE2		(0 * sizeof(__le16))
-#define DELTA_TYPE3		(0 * sizeof(__le16))
-#define DELTA_TYPE4		(1 * sizeof(__le16))
-
-/* usb control message mode switch data */
-#define USBMSG_TYPE1		8, 0x300, 0, 0, 0x1, 0x8
-#define USBMSG_TYPE2		8, 0x300, 0, 0, 0x1, 0x8
-#define USBMSG_TYPE3		8, 0x300, 0, 0, 0x1, 0x8
-#define USBMSG_TYPE4		2, 0x302, 2, 1, 0x1, 0x0
-
-/* Wellspring initialization constants */
-#define BCM5974_WELLSPRING_MODE_READ_REQUEST_ID		1
-#define BCM5974_WELLSPRING_MODE_WRITE_REQUEST_ID	9
-
-/* trackpad finger structure, le16-aligned */
-struct tp_finger {
-	__le16 origin;		/* zero when switching track finger */
-	__le16 abs_x;		/* absolute x coodinate */
-	__le16 abs_y;		/* absolute y coodinate */
-	__le16 rel_x;		/* relative x coodinate */
-	__le16 rel_y;		/* relative y coodinate */
-	__le16 tool_major;	/* tool area, major axis */
-	__le16 tool_minor;	/* tool area, minor axis */
-	__le16 orientation;	/* 16384 when point, else 15 bit angle */
-	__le16 touch_major;	/* touch area, major axis */
-	__le16 touch_minor;	/* touch area, minor axis */
-	__le16 unused[2];	/* zeros */
-	__le16 pressure;	/* pressure on forcetouch touchpad */
-	__le16 multi;		/* one finger: varies, more fingers: constant */
-} __attribute__((packed,aligned(2)));
-
-/* trackpad finger data size, empirically at least ten fingers */
-#define MAX_FINGERS		16
-#define MAX_FINGER_ORIENTATION	16384
-
-/* device-specific parameters */
-struct bcm5974_param {
-	int snratio;		/* signal-to-noise ratio */
-	int min;		/* device minimum reading */
-	int max;		/* device maximum reading */
-};
-
-/* device-specific configuration */
-struct bcm5974_config {
-	int ansi, iso, jis;	/* the product id of this device */
-	int caps;		/* device capability bitmask */
-	int bt_ep;		/* the endpoint of the button interface */
-	int bt_datalen;		/* data length of the button interface */
-	int tp_ep;		/* the endpoint of the trackpad interface */
-	enum tp_type tp_type;	/* type of trackpad interface */
-	int tp_header;		/* bytes in header block */
-	int tp_datalen;		/* data length of the trackpad interface */
-	int tp_button;		/* offset to button data */
-	int tp_fsize;		/* bytes in single finger block */
-	int tp_delta;		/* offset from header to finger struct */
-	int um_size;		/* usb control message length */
-	int um_req_val;		/* usb control message value */
-	int um_req_idx;		/* usb control message index */
-	int um_switch_idx;	/* usb control message mode switch index */
-	int um_switch_on;	/* usb control message mode switch on */
-	int um_switch_off;	/* usb control message mode switch off */
-	struct bcm5974_param p;	/* finger pressure limits */
-	struct bcm5974_param w;	/* finger width limits */
-	struct bcm5974_param x;	/* horizontal limits */
-	struct bcm5974_param y;	/* vertical limits */
-	struct bcm5974_param o;	/* orientation limits */
-};
-
-/* logical device structure */
-struct bcm5974 {
-	char phys[64];
-	struct usb_device *udev;	/* usb device */
-	struct usb_interface *intf;	/* our interface */
-	struct input_dev *input;	/* input dev */
-	struct bcm5974_config cfg;	/* device configuration */
-	struct mutex pm_mutex;		/* serialize access to open/suspend */
-	int opened;			/* 1: opened, 0: closed */
-	struct urb *bt_urb;		/* button usb request block */
-	struct bt_data *bt_data;	/* button transferred data */
-	struct urb *tp_urb;		/* trackpad usb request block */
-	u8 *tp_data;			/* trackpad transferred data */
-	const struct tp_finger *index[MAX_FINGERS];	/* finger index data */
-	struct input_mt_pos pos[MAX_FINGERS];		/* position array */
-	int slots[MAX_FINGERS];				/* slot assignments */
-};
-
-/* trackpad finger block data, le16-aligned */
-static const struct tp_finger *get_tp_finger(const struct bcm5974 *dev, int i)
-{
-	const struct bcm5974_config *c = &dev->cfg;
-	u8 *f_base = dev->tp_data + c->tp_header + c->tp_delta;
-
-	return (const struct tp_finger *)(f_base + i * c->tp_fsize);
-}
-
-#define DATAFORMAT(type)				\
-	type,						\
-	HEADER_##type,					\
-	HEADER_##type + (MAX_FINGERS) * (FSIZE_##type),	\
-	BUTTON_##type,					\
-	FSIZE_##type,					\
-	DELTA_##type,					\
-	USBMSG_##type
-
-/* logical signal quality */
-#define SN_PRESSURE	45		/* pressure signal-to-noise ratio */
-#define SN_WIDTH	25		/* width signal-to-noise ratio */
-#define SN_COORD	250		/* coordinate signal-to-noise ratio */
-#define SN_ORIENT	10		/* orientation signal-to-noise ratio */
-
-/* device constants */
-static const struct bcm5974_config bcm5974_config_table[] = {
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING_JIS,
-		0,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE1),
-		{ SN_PRESSURE, 0, 256 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4824, 5342 },
-		{ SN_COORD, -172, 5820 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING2_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING2_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING2_JIS,
-		0,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE1),
-		{ SN_PRESSURE, 0, 256 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4824, 4824 },
-		{ SN_COORD, -172, 4290 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING3_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING3_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING3_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4460, 5166 },
-		{ SN_COORD, -75, 6700 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING4_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING4_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING4_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4620, 5140 },
-		{ SN_COORD, -150, 6600 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING4A_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING4A_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING4A_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4616, 5112 },
-		{ SN_COORD, -142, 5234 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING5_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING5_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING5_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4415, 5050 },
-		{ SN_COORD, -55, 6680 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING6_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING6_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING6_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4620, 5140 },
-		{ SN_COORD, -150, 6600 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING5A_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING5A_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING5A_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4750, 5280 },
-		{ SN_COORD, -150, 6730 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING6A_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING6A_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING6A_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4620, 5140 },
-		{ SN_COORD, -150, 6600 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING7_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING7_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING7_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4750, 5280 },
-		{ SN_COORD, -150, 6730 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING7A_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING7A_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING7A_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0x84, sizeof(struct bt_data),
-		0x81, DATAFORMAT(TYPE2),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4750, 5280 },
-		{ SN_COORD, -150, 6730 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING8_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING8_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING8_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0, sizeof(struct bt_data),
-		0x83, DATAFORMAT(TYPE3),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4620, 5140 },
-		{ SN_COORD, -150, 6600 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{
-		USB_DEVICE_ID_APPLE_WELLSPRING9_ANSI,
-		USB_DEVICE_ID_APPLE_WELLSPRING9_ISO,
-		USB_DEVICE_ID_APPLE_WELLSPRING9_JIS,
-		HAS_INTEGRATED_BUTTON,
-		0, sizeof(struct bt_data),
-		0x83, DATAFORMAT(TYPE4),
-		{ SN_PRESSURE, 0, 300 },
-		{ SN_WIDTH, 0, 2048 },
-		{ SN_COORD, -4828, 5345 },
-		{ SN_COORD, -203, 6803 },
-		{ SN_ORIENT, -MAX_FINGER_ORIENTATION, MAX_FINGER_ORIENTATION }
-	},
-	{}
-};
-
-/* return the device-specific configuration by device */
-static const struct bcm5974_config *bcm5974_get_config(struct usb_device *udev)
-{
-	u16 id = le16_to_cpu(udev->descriptor.idProduct);
-	const struct bcm5974_config *cfg;
-
-	for (cfg = bcm5974_config_table; cfg->ansi; ++cfg)
-		if (cfg->ansi == id || cfg->iso == id || cfg->jis == id)
-			return cfg;
-
-	return bcm5974_config_table;
-}
-
-/* convert 16-bit little endian to signed integer */
-static inline int raw2int(__le16 x)
-{
-	return (signed short)le16_to_cpu(x);
-}
-
-static void set_abs(struct input_dev *input, unsigned int code,
-		    const struct bcm5974_param *p)
-{
-	int fuzz = p->snratio ? (p->max - p->min) / p->snratio : 0;
-	input_set_abs_params(input, code, p->min, p->max, fuzz, 0);
-}
-
-/* setup which logical events to report */
-static void setup_events_to_report(struct input_dev *input_dev,
-				   const struct bcm5974_config *cfg)
-{
-	__set_bit(EV_ABS, input_dev->evbit);
-
-	/* for synaptics only */
-	input_set_abs_params(input_dev, ABS_PRESSURE, 0, 256, 5, 0);
-	input_set_abs_params(input_dev, ABS_TOOL_WIDTH, 0, 16, 0, 0);
-
-	/* finger touch area */
-	set_abs(input_dev, ABS_MT_TOUCH_MAJOR, &cfg->w);
-	set_abs(input_dev, ABS_MT_TOUCH_MINOR, &cfg->w);
-	/* finger approach area */
-	set_abs(input_dev, ABS_MT_WIDTH_MAJOR, &cfg->w);
-	set_abs(input_dev, ABS_MT_WIDTH_MINOR, &cfg->w);
-	/* finger orientation */
-	set_abs(input_dev, ABS_MT_ORIENTATION, &cfg->o);
-	/* finger position */
-	set_abs(input_dev, ABS_MT_POSITION_X, &cfg->x);
-	set_abs(input_dev, ABS_MT_POSITION_Y, &cfg->y);
-
-	__set_bit(EV_KEY, input_dev->evbit);
-	__set_bit(BTN_LEFT, input_dev->keybit);
-
-	if (cfg->caps & HAS_INTEGRATED_BUTTON)
-		__set_bit(INPUT_PROP_BUTTONPAD, input_dev->propbit);
-
-	input_mt_init_slots(input_dev, MAX_FINGERS,
-		INPUT_MT_POINTER | INPUT_MT_DROP_UNUSED | INPUT_MT_TRACK);
-}
-
-/* report button data as logical button state */
-static int report_bt_state(struct bcm5974 *dev, int size)
-{
-	if (size != sizeof(struct bt_data))
-		return -EIO;
-
-	dprintk(7,
-		"bcm5974: button data: %x %x %x %x\n",
-		dev->bt_data->unknown1, dev->bt_data->button,
-		dev->bt_data->rel_x, dev->bt_data->rel_y);
-
-	input_report_key(dev->input, BTN_LEFT, dev->bt_data->button);
-	input_sync(dev->input);
-
-	return 0;
-}
-
-static void report_finger_data(struct input_dev *input, int slot,
-			       const struct input_mt_pos *pos,
-			       const struct tp_finger *f)
-{
-	input_mt_slot(input, slot);
-	input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
-
-	input_report_abs(input, ABS_MT_TOUCH_MAJOR,
-			 raw2int(f->touch_major) << 1);
-	input_report_abs(input, ABS_MT_TOUCH_MINOR,
-			 raw2int(f->touch_minor) << 1);
-	input_report_abs(input, ABS_MT_WIDTH_MAJOR,
-			 raw2int(f->tool_major) << 1);
-	input_report_abs(input, ABS_MT_WIDTH_MINOR,
-			 raw2int(f->tool_minor) << 1);
-	input_report_abs(input, ABS_MT_ORIENTATION,
-			 MAX_FINGER_ORIENTATION - raw2int(f->orientation));
-	input_report_abs(input, ABS_MT_POSITION_X, pos->x);
-	input_report_abs(input, ABS_MT_POSITION_Y, pos->y);
-}
-
-static void report_synaptics_data(struct input_dev *input,
-				  const struct bcm5974_config *cfg,
-				  const struct tp_finger *f, int raw_n)
-{
-	int abs_p = 0, abs_w = 0;
-
-	if (raw_n) {
-		int p = raw2int(f->touch_major);
-		int w = raw2int(f->tool_major);
-		if (p > 0 && raw2int(f->origin)) {
-			abs_p = clamp_val(256 * p / cfg->p.max, 0, 255);
-			abs_w = clamp_val(16 * w / cfg->w.max, 0, 15);
-		}
-	}
-
-	input_report_abs(input, ABS_PRESSURE, abs_p);
-	input_report_abs(input, ABS_TOOL_WIDTH, abs_w);
-}
-
-/* report trackpad data as logical trackpad state */
-static int report_tp_state(struct bcm5974 *dev, int size)
-{
-	const struct bcm5974_config *c = &dev->cfg;
-	const struct tp_finger *f;
-	struct input_dev *input = dev->input;
-	int raw_n, i, n = 0;
-
-	if (size < c->tp_header || (size - c->tp_header) % c->tp_fsize != 0)
-		return -EIO;
-
-	raw_n = (size - c->tp_header) / c->tp_fsize;
-
-	for (i = 0; i < raw_n; i++) {
-		f = get_tp_finger(dev, i);
-		if (raw2int(f->touch_major) == 0)
-			continue;
-		dev->pos[n].x = raw2int(f->abs_x);
-		dev->pos[n].y = c->y.min + c->y.max - raw2int(f->abs_y);
-		dev->index[n++] = f;
-	}
-
-	input_mt_assign_slots(input, dev->slots, dev->pos, n, 0);
-
-	for (i = 0; i < n; i++)
-		report_finger_data(input, dev->slots[i],
-				   &dev->pos[i], dev->index[i]);
-
-	input_mt_sync_frame(input);
-
-	report_synaptics_data(input, c, get_tp_finger(dev, 0), raw_n);
-
-	/* later types report button events via integrated button only */
-	if (c->caps & HAS_INTEGRATED_BUTTON) {
-		int ibt = raw2int(dev->tp_data[c->tp_button]);
-		input_report_key(input, BTN_LEFT, ibt);
-	}
-
-	input_sync(input);
-
-	return 0;
-}
-
-static int bcm5974_wellspring_mode(struct bcm5974 *dev, bool on)
-{
-	const struct bcm5974_config *c = &dev->cfg;
-	int retval = 0, size;
-	char *data;
-
-	/* Type 3 does not require a mode switch */
-	if (dev->cfg.tp_type == TYPE3)
-		return 0;
-
-	data = kmalloc(c->um_size, GFP_KERNEL);
-	if (!data) {
-		dev_err(&dev->intf->dev, "out of memory\n");
-		retval = -ENOMEM;
-		goto out;
-	}
-
-	/* read configuration */
-	size = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
-			BCM5974_WELLSPRING_MODE_READ_REQUEST_ID,
-			USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			c->um_req_val, c->um_req_idx, data, c->um_size, 5000);
-
-	if (size != c->um_size) {
-		dev_err(&dev->intf->dev, "could not read from device\n");
-		retval = -EIO;
-		goto out;
-	}
-
-	/* apply the mode switch */
-	data[c->um_switch_idx] = on ? c->um_switch_on : c->um_switch_off;
-
-	/* write configuration */
-	size = usb_control_msg(dev->udev, usb_sndctrlpipe(dev->udev, 0),
-			BCM5974_WELLSPRING_MODE_WRITE_REQUEST_ID,
-			USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
-			c->um_req_val, c->um_req_idx, data, c->um_size, 5000);
-
-	if (size != c->um_size) {
-		dev_err(&dev->intf->dev, "could not write to device\n");
-		retval = -EIO;
-		goto out;
-	}
-
-	dprintk(2, "bcm5974: switched to %s mode.\n",
-		on ? "wellspring" : "normal");
-
- out:
-	kfree(data);
-	return retval;
-}
-
-static void bcm5974_irq_button(struct urb *urb)
-{
-	struct bcm5974 *dev = urb->context;
-	struct usb_interface *intf = dev->intf;
-	int error;
-
-	switch (urb->status) {
-	case 0:
-		break;
-	case -EOVERFLOW:
-	case -ECONNRESET:
-	case -ENOENT:
-	case -ESHUTDOWN:
-		dev_dbg(&intf->dev, "button urb shutting down: %d\n",
-			urb->status);
-		return;
-	default:
-		dev_dbg(&intf->dev, "button urb status: %d\n", urb->status);
-		goto exit;
-	}
-
-	if (report_bt_state(dev, dev->bt_urb->actual_length))
-		dprintk(1, "bcm5974: bad button package, length: %d\n",
-			dev->bt_urb->actual_length);
-
-exit:
-	error = usb_submit_urb(dev->bt_urb, GFP_ATOMIC);
-	if (error)
-		dev_err(&intf->dev, "button urb failed: %d\n", error);
-}
-
-static void bcm5974_irq_trackpad(struct urb *urb)
-{
-	struct bcm5974 *dev = urb->context;
-	struct usb_interface *intf = dev->intf;
-	int error;
-
-	switch (urb->status) {
-	case 0:
-		break;
-	case -EOVERFLOW:
-	case -ECONNRESET:
-	case -ENOENT:
-	case -ESHUTDOWN:
-		dev_dbg(&intf->dev, "trackpad urb shutting down: %d\n",
-			urb->status);
-		return;
-	default:
-		dev_dbg(&intf->dev, "trackpad urb status: %d\n", urb->status);
-		goto exit;
-	}
-
-	/* control response ignored */
-	if (dev->tp_urb->actual_length == 2)
-		goto exit;
-
-	if (report_tp_state(dev, dev->tp_urb->actual_length))
-		dprintk(1, "bcm5974: bad trackpad package, length: %d\n",
-			dev->tp_urb->actual_length);
-
-exit:
-	error = usb_submit_urb(dev->tp_urb, GFP_ATOMIC);
-	if (error)
-		dev_err(&intf->dev, "trackpad urb failed: %d\n", error);
-}
-
-/*
- * The Wellspring trackpad, like many recent Apple trackpads, share
- * the usb device with the keyboard. Since keyboards are usually
- * handled by the HID system, the device ends up being handled by two
- * modules. Setting up the device therefore becomes slightly
- * complicated. To enable multitouch features, a mode switch is
- * required, which is usually applied via the control interface of the
- * device.  It can be argued where this switch should take place. In
- * some drivers, like appletouch, the switch is made during
- * probe. However, the hid module may also alter the state of the
- * device, resulting in trackpad malfunction under certain
- * circumstances. To get around this problem, there is at least one
- * example that utilizes the USB_QUIRK_RESET_RESUME quirk in order to
- * receive a reset_resume request rather than the normal resume.
- * Since the implementation of reset_resume is equal to mode switch
- * plus start_traffic, it seems easier to always do the switch when
- * starting traffic on the device.
- */
-static int bcm5974_start_traffic(struct bcm5974 *dev)
-{
-	int error;
-
-	error = bcm5974_wellspring_mode(dev, true);
-	if (error) {
-		dprintk(1, "bcm5974: mode switch failed\n");
-		goto err_out;
-	}
-
-	if (dev->bt_urb) {
-		error = usb_submit_urb(dev->bt_urb, GFP_KERNEL);
-		if (error)
-			goto err_reset_mode;
-	}
-
-	error = usb_submit_urb(dev->tp_urb, GFP_KERNEL);
-	if (error)
-		goto err_kill_bt;
-
-	return 0;
-
-err_kill_bt:
-	usb_kill_urb(dev->bt_urb);
-err_reset_mode:
-	bcm5974_wellspring_mode(dev, false);
-err_out:
-	return error;
-}
-
-static void bcm5974_pause_traffic(struct bcm5974 *dev)
-{
-	usb_kill_urb(dev->tp_urb);
-	usb_kill_urb(dev->bt_urb);
-	bcm5974_wellspring_mode(dev, false);
-}
-
-/*
- * The code below implements open/close and manual suspend/resume.
- * All functions may be called in random order.
- *
- * Opening a suspended device fails with EACCES - permission denied.
- *
- * Failing a resume leaves the device resumed but closed.
- */
-static int bcm5974_open(struct input_dev *input)
-{
-	struct bcm5974 *dev = input_get_drvdata(input);
-	int error;
-
-	error = usb_autopm_get_interface(dev->intf);
-	if (error)
-		return error;
-
-	mutex_lock(&dev->pm_mutex);
-
-	error = bcm5974_start_traffic(dev);
-	if (!error)
-		dev->opened = 1;
-
-	mutex_unlock(&dev->pm_mutex);
-
-	if (error)
-		usb_autopm_put_interface(dev->intf);
-
-	return error;
-}
-
-static void bcm5974_close(struct input_dev *input)
-{
-	struct bcm5974 *dev = input_get_drvdata(input);
-
-	mutex_lock(&dev->pm_mutex);
-
-	bcm5974_pause_traffic(dev);
-	dev->opened = 0;
-
-	mutex_unlock(&dev->pm_mutex);
-
-	usb_autopm_put_interface(dev->intf);
-}
-
-static int bcm5974_suspend(struct usb_interface *iface, pm_message_t message)
-{
-	struct bcm5974 *dev = usb_get_intfdata(iface);
-
-	mutex_lock(&dev->pm_mutex);
-
-	if (dev->opened)
-		bcm5974_pause_traffic(dev);
-
-	mutex_unlock(&dev->pm_mutex);
-
-	return 0;
-}
-
-static int bcm5974_resume(struct usb_interface *iface)
-{
-	struct bcm5974 *dev = usb_get_intfdata(iface);
-	int error = 0;
-
-	mutex_lock(&dev->pm_mutex);
-
-	if (dev->opened)
-		error = bcm5974_start_traffic(dev);
-
-	mutex_unlock(&dev->pm_mutex);
-
-	return error;
-}
-
-static int bcm5974_probe(struct usb_interface *iface,
-			 const struct usb_device_id *id)
-{
-	struct usb_device *udev = interface_to_usbdev(iface);
-	const struct bcm5974_config *cfg;
-	struct bcm5974 *dev;
-	struct input_dev *input_dev;
-	int error = -ENOMEM;
-
-	/* find the product index */
-	cfg = bcm5974_get_config(udev);
-
-	/* allocate memory for our device state and initialize it */
-	dev = kzalloc(sizeof(struct bcm5974), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!dev || !input_dev) {
-		dev_err(&iface->dev, "out of memory\n");
-		goto err_free_devs;
-	}
-
-	dev->udev = udev;
-	dev->intf = iface;
-	dev->input = input_dev;
-	dev->cfg = *cfg;
-	mutex_init(&dev->pm_mutex);
-
-	/* setup urbs */
-	if (cfg->tp_type == TYPE1) {
-		dev->bt_urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!dev->bt_urb)
-			goto err_free_devs;
-	}
-
-	dev->tp_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!dev->tp_urb)
-		goto err_free_bt_urb;
-
-	if (dev->bt_urb) {
-		dev->bt_data = usb_alloc_coherent(dev->udev,
-					  dev->cfg.bt_datalen, GFP_KERNEL,
-					  &dev->bt_urb->transfer_dma);
-		if (!dev->bt_data)
-			goto err_free_urb;
-	}
-
-	dev->tp_data = usb_alloc_coherent(dev->udev,
-					  dev->cfg.tp_datalen, GFP_KERNEL,
-					  &dev->tp_urb->transfer_dma);
-	if (!dev->tp_data)
-		goto err_free_bt_buffer;
-
-	if (dev->bt_urb) {
-		usb_fill_int_urb(dev->bt_urb, udev,
-				 usb_rcvintpipe(udev, cfg->bt_ep),
-				 dev->bt_data, dev->cfg.bt_datalen,
-				 bcm5974_irq_button, dev, 1);
-
-		dev->bt_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-	}
-
-	usb_fill_int_urb(dev->tp_urb, udev,
-			 usb_rcvintpipe(udev, cfg->tp_ep),
-			 dev->tp_data, dev->cfg.tp_datalen,
-			 bcm5974_irq_trackpad, dev, 1);
-
-	dev->tp_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-
-	/* create bcm5974 device */
-	usb_make_path(udev, dev->phys, sizeof(dev->phys));
-	strlcat(dev->phys, "/input0", sizeof(dev->phys));
-
-	input_dev->name = "bcm5974";
-	input_dev->phys = dev->phys;
-	usb_to_input_id(dev->udev, &input_dev->id);
-	/* report driver capabilities via the version field */
-	input_dev->id.version = cfg->caps;
-	input_dev->dev.parent = &iface->dev;
-
-	input_set_drvdata(input_dev, dev);
-
-	input_dev->open = bcm5974_open;
-	input_dev->close = bcm5974_close;
-
-	setup_events_to_report(input_dev, cfg);
-
-	error = input_register_device(dev->input);
-	if (error)
-		goto err_free_buffer;
-
-	/* save our data pointer in this interface device */
-	usb_set_intfdata(iface, dev);
-
-	return 0;
-
-err_free_buffer:
-	usb_free_coherent(dev->udev, dev->cfg.tp_datalen,
-		dev->tp_data, dev->tp_urb->transfer_dma);
-err_free_bt_buffer:
-	if (dev->bt_urb)
-		usb_free_coherent(dev->udev, dev->cfg.bt_datalen,
-				  dev->bt_data, dev->bt_urb->transfer_dma);
-err_free_urb:
-	usb_free_urb(dev->tp_urb);
-err_free_bt_urb:
-	usb_free_urb(dev->bt_urb);
-err_free_devs:
-	usb_set_intfdata(iface, NULL);
-	input_free_device(input_dev);
-	kfree(dev);
-	return error;
-}
-
-static void bcm5974_disconnect(struct usb_interface *iface)
-{
-	struct bcm5974 *dev = usb_get_intfdata(iface);
-
-	usb_set_intfdata(iface, NULL);
-
-	input_unregister_device(dev->input);
-	usb_free_coherent(dev->udev, dev->cfg.tp_datalen,
-			  dev->tp_data, dev->tp_urb->transfer_dma);
-	if (dev->bt_urb)
-		usb_free_coherent(dev->udev, dev->cfg.bt_datalen,
-				  dev->bt_data, dev->bt_urb->transfer_dma);
-	usb_free_urb(dev->tp_urb);
-	usb_free_urb(dev->bt_urb);
-	kfree(dev);
-}
-
-static struct usb_driver bcm5974_driver = {
-	.name			= "bcm5974",
-	.probe			= bcm5974_probe,
-	.disconnect		= bcm5974_disconnect,
-	.suspend		= bcm5974_suspend,
-	.resume			= bcm5974_resume,
-	.id_table		= bcm5974_table,
-	.supports_autosuspend	= 1,
-};
-
-module_usb_driver(bcm5974_driver);
+_RAST_STREAM_MASK_MASK 0xf00
+#define VGT_STRMOUT_CONFIG__RAST_STREAM_MASK__SHIFT 0x8
+#define VGT_STRMOUT_CONFIG__USE_RAST_STREAM_MASK_MASK 0x80000000
+#define VGT_STRMOUT_CONFIG__USE_RAST_STREAM_MASK__SHIFT 0x1f
+#define VGT_STRMOUT_BUFFER_SIZE_0__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_SIZE_0__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_SIZE_1__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_SIZE_1__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_SIZE_2__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_SIZE_2__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_SIZE_3__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_SIZE_3__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_OFFSET_0__OFFSET_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_OFFSET_0__OFFSET__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_OFFSET_1__OFFSET_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_OFFSET_1__OFFSET__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_OFFSET_2__OFFSET_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_OFFSET_2__OFFSET__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_OFFSET_3__OFFSET_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_OFFSET_3__OFFSET__SHIFT 0x0
+#define VGT_STRMOUT_VTX_STRIDE_0__STRIDE_MASK 0x3ff
+#define VGT_STRMOUT_VTX_STRIDE_0__STRIDE__SHIFT 0x0
+#define VGT_STRMOUT_VTX_STRIDE_1__STRIDE_MASK 0x3ff
+#define VGT_STRMOUT_VTX_STRIDE_1__STRIDE__SHIFT 0x0
+#define VGT_STRMOUT_VTX_STRIDE_2__STRIDE_MASK 0x3ff
+#define VGT_STRMOUT_VTX_STRIDE_2__STRIDE__SHIFT 0x0
+#define VGT_STRMOUT_VTX_STRIDE_3__STRIDE_MASK 0x3ff
+#define VGT_STRMOUT_VTX_STRIDE_3__STRIDE__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_CONFIG__STREAM_0_BUFFER_EN_MASK 0xf
+#define VGT_STRMOUT_BUFFER_CONFIG__STREAM_0_BUFFER_EN__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_CONFIG__STREAM_1_BUFFER_EN_MASK 0xf0
+#define VGT_STRMOUT_BUFFER_CONFIG__STREAM_1_BUFFER_EN__SHIFT 0x4
+#define VGT_STRMOUT_BUFFER_CONFIG__STREAM_2_BUFFER_EN_MASK 0xf00
+#define VGT_STRMOUT_BUFFER_CONFIG__STREAM_2_BUFFER_EN__SHIFT 0x8
+#define VGT_STRMOUT_BUFFER_CONFIG__STREAM_3_BUFFER_EN_MASK 0xf000
+#define VGT_STRMOUT_BUFFER_CONFIG__STREAM_3_BUFFER_EN__SHIFT 0xc
+#define VGT_STRMOUT_BUFFER_FILLED_SIZE_0__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_FILLED_SIZE_0__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_FILLED_SIZE_1__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_FILLED_SIZE_1__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_FILLED_SIZE_2__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_FILLED_SIZE_2__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_BUFFER_FILLED_SIZE_3__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_BUFFER_FILLED_SIZE_3__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_DRAW_OPAQUE_OFFSET__OFFSET_MASK 0xffffffff
+#define VGT_STRMOUT_DRAW_OPAQUE_OFFSET__OFFSET__SHIFT 0x0
+#define VGT_STRMOUT_DRAW_OPAQUE_BUFFER_FILLED_SIZE__SIZE_MASK 0xffffffff
+#define VGT_STRMOUT_DRAW_OPAQUE_BUFFER_FILLED_SIZE__SIZE__SHIFT 0x0
+#define VGT_STRMOUT_DRAW_OPAQUE_VERTEX_STRIDE__VERTEX_STRIDE_MASK 0x1ff
+#define VGT_STRMOUT_DRAW_OPAQUE_VERTEX_STRIDE__VERTEX_STRIDE__SHIFT 0x0
+#define VGT_GS_MAX_VERT_OUT__MAX_VERT_OUT_MASK 0x7ff
+#define VGT_GS_MAX_VERT_OUT__MAX_VERT_OUT__SHIFT 0x0
+#define VGT_SHADER_STAGES_EN__LS_EN_MASK 0x3
+#define VGT_SHADER_STAGES_EN__LS_EN__SHIFT 0x0
+#define VGT_SHADER_STAGES_EN__HS_EN_MASK 0x4
+#define VGT_SHADER_STAGES_EN__HS_EN__SHIFT 0x2
+#define VGT_SHADER_STAGES_EN__ES_EN_MASK 0x18
+#define VGT_SHADER_STAGES_EN__ES_EN__SHIFT 0x3
+#define VGT_SHADER_STAGES_EN__GS_EN_MASK 0x20
+#define VGT_SHADER_STAGES_EN__GS_EN__SHIFT 0x5
+#define VGT_SHADER_STAGES_EN__VS_EN_MASK 0xc0
+#define VGT_SHADER_STAGES_EN__VS_EN__SHIFT 0x6
+#define VGT_SHADER_STAGES_EN__DYNAMIC_HS_MASK 0x100
+#define VGT_SHADER_STAGES_EN__DYNAMIC_HS__SHIFT 0x8
+#define VGT_SHADER_STAGES_EN__DISPATCH_DRAW_EN_MASK 0x200
+#define VGT_SHADER_STAGES_EN__DISPATCH_DRAW_EN__SHIFT 0x9
+#define VGT_SHADER_STAGES_EN__DIS_DEALLOC_ACCUM_0_MASK 0x400
+#define VGT_SHADER_STAGES_EN__DIS_DEALLOC_ACCUM_0__SHIFT 0xa
+#define VGT_SHADER_STAGES_EN__DIS_DEALLOC_ACCUM_1_MASK 0x800
+#define VGT_SHADER_STAGES_EN__DIS_DEALLOC_ACCUM_1__SHIFT 0xb
+#define VGT_SHADER_STAGES_EN__VS_WAVE_ID_EN_MASK 0x1000
+#define VGT_SHADER_STAGES_EN__VS_WAVE_ID_EN__SHIFT 0xc
+#define VGT_DISPATCH_DRAW_INDEX__MATCH_INDEX_MASK 0xffffffff
+#define VGT_DISPATCH_DRAW_INDEX__MATCH_INDEX__SHIFT 0x0
+#define VGT_LS_HS_CONFIG__NUM_PATCHES_MASK 0xff
+#define VGT_LS_HS_CONFIG__NUM_PATCHES__SHIFT 0x0
+#define VGT_LS_HS_CONFIG__HS_NUM_INPUT_CP_MASK 0x3f00
+#define VGT_LS_HS_CONFIG__HS_NUM_INPUT_CP__SHIFT 0x8
+#define VGT_LS_HS_CONFIG__HS_NUM_OUTPUT_CP_MASK 0xfc000
+#define VGT_LS_HS_CONFIG__HS_NUM_OUTPUT_CP__SHIFT 0xe
+#define VGT_DMA_LS_HS_CONFIG__HS_NUM_INPUT_CP_MASK 0x3f00
+#define VGT_DMA_LS_HS_CONFIG__HS_NUM_INPUT_CP__SHIFT 0x8
+#define VGT_TF_PARAM__TYPE_MASK 0x3
+#define VGT_TF_PARAM__TYPE__SHIFT 0x0
+#define VGT_TF_PARAM__PARTITIONING_MASK 0x1c
+#define VGT_TF_PARAM__PARTITIONING__SHIFT 0x2
+#define VGT_TF_PARAM__TOPOLOGY_MASK 0xe0
+#define VGT_TF_PARAM__TOPOLOGY__SHIFT 0x5
+#define VGT_TF_PARAM__RESERVED_REDUC_AXIS_MASK 0x100
+#define VGT_TF_PARAM__RESERVED_REDUC_AXIS__SHIFT 0x8
+#define VGT_TF_PARAM__DEPRECATED_MASK 0x200
+#define VGT_TF_PARAM__DEPRECATED__SHIFT 0x9
+#define VGT_TF_PARAM__NUM_DS_WAVES_PER_SIMD_MASK 0x3c00
+#define VGT_TF_PARAM__NUM_DS_WAVES_PER_SIMD__SHIFT 0xa
+#define VGT_TF_PARAM__DISABLE_DONUTS_MASK 0x4000
+#define VGT_TF_PARAM__DISABLE_DONUTS__SHIFT 0xe
+#define VGT_TF_PARAM__RDREQ_POLICY_MASK 0x8000
+#define VGT_TF_PARAM__RDREQ_POLICY__SHIFT 0xf
+#define VGT_TF_PARAM__DISTRIBUTION_MODE_MASK 0x60000
+#define VGT_TF_PARAM__DISTRIBUTION_MODE__SHIFT 0x11
+#define VGT_TF_PARAM__MTYPE_MASK 0x180000
+#define VGT_TF_PARAM__MTYPE__SHIFT 0x13
+#define VGT_TESS_DISTRIBUTION__ACCUM_ISOLINE_MASK 0xff
+#define VGT_TESS_DISTRIBUTION__ACCUM_ISOLINE__SHIFT 0x0
+#define VGT_TESS_DISTRIBUTION__ACCUM_TRI_MASK 0xff00
+#define VGT_TESS_DISTRIBUTION__ACCUM_TRI__SHIFT 0x8
+#define VGT_TESS_DISTRIBUTION__ACCUM_QUAD_MASK 0xff0000
+#define VGT_TESS_DISTRIBUTION__ACCUM_QUAD__SHIFT 0x10
+#define VGT_TESS_DISTRIBUTION__DONUT_SPLIT_MASK 0xff000000
+#define VGT_TESS_DISTRIBUTION__DONUT_SPLIT__SHIFT 0x18
+#define VGT_TF_RING_SIZE__SIZE_MASK 0xffff
+#define VGT_TF_RING_SIZE__SIZE__SHIFT 0x0
+#define VGT_SYS_CONFIG__DUAL_CORE_EN_MASK 0x1
+#define VGT_SYS_CONFIG__DUAL_CORE_EN__SHIFT 0x0
+#define VGT_SYS_CONFIG__MAX_LS_HS_THDGRP_MASK 0x7e
+#define VGT_SYS_CONFIG__MAX_LS_HS_THDGRP__SHIFT 0x1
+#define VGT_SYS_CONFIG__ADC_EVENT_FILTER_DISABLE_MASK 0x80
+#define VGT_SYS_CONFIG__ADC_EVENT_FILTER_DISABLE__SHIFT 0x7
+#define VGT_HS_OFFCHIP_PARAM__OFFCHIP_BUFFERING_MASK 0x1ff
+#define VGT_HS_OFFCHIP_PARAM__OFFCHIP_BUFFERING__SHIFT 0x0
+#define VGT_HS_OFFCHIP_PARAM__OFFCHIP_GRANULARITY_MASK 0x600
+#define VGT_HS_OFFCHIP_PARAM__OFFCHIP_GRANULARITY__SHIFT 0x9
+#define VGT_TF_MEMORY_BASE__BASE_MASK 0xffffffff
+#define VGT_TF_MEMORY_BASE__BASE__SHIFT 0x0
+#define VGT_GS_INSTANCE_CNT__ENABLE_MASK 0x1
+#define VGT_GS_INSTANCE_CNT__ENABLE__SHIFT 0x0
+#define VGT_GS_INSTANCE_CNT__CNT_MASK 0x1fc
+#define VGT_GS_INSTANCE_CNT__CNT__SHIFT 0x2
+#define IA_MULTI_VGT_PARAM__PRIMGROUP_SIZE_MASK 0xffff
+#define IA_MULTI_VGT_PARAM__PRIMGROUP_SIZE__SHIFT 0x0
+#define IA_MULTI_VGT_PARAM__PARTIAL_VS_WAVE_ON_MASK 0x10000
+#define IA_MULTI_VGT_PARAM__PARTIAL_VS_WAVE_ON__SHIFT 0x10
+#define IA_MULTI_VGT_PARAM__SWITCH_ON_EOP_MASK 0x20000
+#define IA_MULTI_VGT_PARAM__SWITCH_ON_EOP__SHIFT 0x11
+#define IA_MULTI_VGT_PARAM__PARTIAL_ES_WAVE_ON_MASK 0x40000
+#define IA_MULTI_VGT_PARAM__PARTIAL_ES_WAVE_ON__SHIFT 0x12
+#define IA_MULTI_VGT_PARAM__SWITCH_ON_EOI_MASK 0x80000
+#define IA_MULTI_VGT_PARAM__SWITCH_ON_EOI__SHIFT 0x13
+#define IA_MULTI_VGT_PARAM__WD_SWITCH_ON_EOP_MASK 0x100000
+#define IA_MULTI_VGT_PARAM__WD_SWITCH_ON_EOP__SHIFT 0x14
+#define IA_MULTI_VGT_PARAM__MAX_PRIMGRP_IN_WAVE_MASK 0xf0000000
+#define IA_MULTI_VGT_PARAM__MAX_PRIMGRP_IN_WAVE__SHIFT 0x1c
+#define VGT_VS_MAX_WAVE_ID__MAX_WAVE_ID_MASK 0xfff
+#define VGT_VS_MAX_WAVE_ID__MAX_WAVE_ID__SHIFT 0x0
+#define VGT_ESGS_RING_SIZE__MEM_SIZE_MASK 0xffffffff
+#define VGT_ESGS_RING_SIZE__MEM_SIZE__SHIFT 0x0
+#define VGT_GSVS_RING_SIZE__MEM_SIZE_MASK 0xffffffff
+#define VGT_GSVS_RING_SIZE__MEM_SIZE__SHIFT 0x0
+#define VGT_GSVS_RING_OFFSET_1__OFFSET_MASK 0x7fff
+#define VGT_GSVS_RING_OFFSET_1__OFFSET__SHIFT 0x0
+#define VGT_GSVS_RING_OFFSET_2__OFFSET_MASK 0x7fff
+#define VGT_GSVS_RING_OFFSET_2__OFFSET__SHIFT 0x0
+#define VGT_GSVS_RING_OFFSET_3__OFFSET_MASK 0x7fff
+#define VGT_GSVS_RING_OFFSET_3__OFFSET__SHIFT 0x0
+#define VGT_ESGS_RING_ITEMSIZE__ITEMSIZE_MASK 0x7fff
+#define VGT_ESGS_RING_ITEMSIZE__ITEMSIZE__SHIFT 0x0
+#define VGT_GSVS_RING_ITEMSIZE__ITEMSIZE_MASK 0x7fff
+#define VGT_GSVS_RING_ITEMSIZE__ITEMSIZE__SHIFT 0x0
+#define VGT_GS_VERT_ITEMSIZE__ITEMSIZE_MASK 0x7fff
+#define VGT_GS_VERT_ITEMSIZE__ITEMSIZE__SHIFT 0x0
+#define VGT_GS_VERT_ITEMSIZE_1__ITEMSIZE_MASK 0x7fff
+#define VGT_GS_VERT_ITEMSIZE_1__ITEMSIZE__SHIFT 0x0
+#define VGT_GS_VERT_ITEMSIZE_2__ITEMSIZE_MASK 0x7fff
+#define VGT_GS_VERT_ITEMSIZE_2__ITEMSIZE__SHIFT 0x0
+#define VGT_GS_VERT_ITEMSIZE_3__ITEMSIZE_MASK 0x7fff
+#define VGT_GS_VERT_ITEMSIZE_3__ITEMSIZE__SHIFT 0x0
+#define WD_CNTL_STATUS__WD_BUSY_MASK 0x1
+#define WD_CNTL_STATUS__WD_BUSY__SHIFT 0x0
+#define WD_CNTL_STATUS__WD_SPL_DMA_BUSY_MASK 0x2
+#define WD_CNTL_STATUS__WD_SPL_DMA_BUSY__SHIFT 0x1
+#define WD_CNTL_STATUS__WD_SPL_DI_BUSY_MASK 0x4
+#define WD_CNTL_STATUS__WD_SPL_DI_BUSY__SHIFT 0x2
+#define WD_CNTL_STATUS__WD_ADC_BUSY_MASK 0x8
+#define WD_CNTL_STATUS__WD_ADC_BUSY__SHIFT 0x3
+#define WD_ENHANCE__MISC_MASK 0xffffffff
+#define WD_ENHANCE__MISC__SHIFT 0x0
+#define GFX_PIPE_CONTROL__HYSTERESIS_CNT_MASK 0x1fff
+#define GFX_PIPE_CONTROL__HYSTERESIS_CNT__SHIFT 0x0
+#define GFX_PIPE_CONTROL__RESERVED_MASK 0xe000
+#define GFX_PIPE_CONTROL__RESERVED__SHIFT 0xd
+#define GFX_PIPE_CONTROL__CONTEXT_SUSPEND_EN_MASK 0x10000
+#define GFX_PIPE_CONTROL__CONTEXT_SUSPEND_EN__SHIFT 0x10
+#define CGTT_VGT_CLK_CTRL__ON_DELAY_MASK 0xf
+#define CGTT_VGT_CLK_CTRL__ON_DELAY__SHIFT 0x0
+#define CGTT_VGT_CLK_CTRL__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_VGT_CLK_CTRL__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_VGT_CLK_CTRL__SOFT_OVERRIDE7_MASK 0x1000000
+#define CGTT_VGT_CLK_CTRL__SOFT_OVERRIDE7__SHIFT 0x18
+#define CGTT_VGT_CLK_CTRL__PERF_ENABLE_MASK 0x2000000
+#define CGTT_VGT_CLK_CTRL__PERF_ENABLE__SHIFT 0x19
+#define CGTT_VGT_CLK_CTRL__DBG_ENABLE_MASK 0x4000000
+#define CGTT_VGT_CLK_CTRL__DBG_ENABLE__SHIFT 0x1a
+#define CGTT_VGT_CLK_CTRL__SOFT_OVERRIDE4_MASK 0x8000000
+#define CGTT_VGT_CLK_CTRL__SOFT_OVERRIDE4__SHIFT 0x1b
+#define CGTT_VGT_CLK_CTRL__TESS_OVERRIDE_MASK 0x10000000
+#define CGTT_VGT_CLK_CTRL__TESS_OVERRIDE__SHIFT 0x1c
+#define CGTT_VGT_CLK_CTRL__GS_OVERRIDE_MASK 0x20000000
+#define CGTT_VGT_CLK_CTRL__GS_OVERRIDE__SHIFT 0x1d
+#define CGTT_VGT_CLK_CTRL__CORE_OVERRIDE_MASK 0x40000000
+#define CGTT_VGT_CLK_CTRL__CORE_OVERRIDE__SHIFT 0x1e
+#define CGTT_VGT_CLK_CTRL__REG_OVERRIDE_MASK 0x80000000
+#define CGTT_VGT_CLK_CTRL__REG_OVERRIDE__SHIFT 0x1f
+#define CGTT_IA_CLK_CTRL__ON_DELAY_MASK 0xf
+#define CGTT_IA_CLK_CTRL__ON_DELAY__SHIFT 0x0
+#define CGTT_IA_CLK_CTRL__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_IA_CLK_CTRL__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_IA_CLK_CTRL__SOFT_OVERRIDE7_MASK 0x1000000
+#define CGTT_IA_CLK_CTRL__SOFT_OVERRIDE7__SHIFT 0x18
+#define CGTT_IA_CLK_CTRL__PERF_ENABLE_MASK 0x2000000
+#define CGTT_IA_CLK_CTRL__PERF_ENABLE__SHIFT 0x19
+#define CGTT_IA_CLK_CTRL__DBG_ENABLE_MASK 0x4000000
+#define CGTT_IA_CLK_CTRL__DBG_ENABLE__SHIFT 0x1a
+#define CGTT_IA_CLK_CTRL__SOFT_OVERRIDE4_MASK 0x8000000
+#define CGTT_IA_CLK_CTRL__SOFT_OVERRIDE4__SHIFT 0x1b
+#define CGTT_IA_CLK_CTRL__SOFT_OVERRIDE3_MASK 0x10000000
+#define CGTT_IA_CLK_CTRL__SOFT_OVERRIDE3__SHIFT 0x1c
+#define CGTT_IA_CLK_CTRL__SOFT_OVERRIDE2_MASK 0x20000000
+#define CGTT_IA_CLK_CTRL__SOFT_OVERRIDE2__SHIFT 0x1d
+#define CGTT_IA_CLK_CTRL__CORE_OVERRIDE_MASK 0x40000000
+#define CGTT_IA_CLK_CTRL__CORE_OVERRIDE__SHIFT 0x1e
+#define CGTT_IA_CLK_CTRL__REG_OVERRIDE_MASK 0x80000000
+#define CGTT_IA_CLK_CTRL__REG_OVERRIDE__SHIFT 0x1f
+#define CGTT_WD_CLK_CTRL__ON_DELAY_MASK 0xf
+#define CGTT_WD_CLK_CTRL__ON_DELAY__SHIFT 0x0
+#define CGTT_WD_CLK_CTRL__OFF_HYSTERESIS_MASK 0xff0
+#define CGTT_WD_CLK_CTRL__OFF_HYSTERESIS__SHIFT 0x4
+#define CGTT_WD_CLK_CTRL__SOFT_OVERRIDE7_MASK 0x1000000
+#define CGTT_WD_CLK_CTRL__SOFT_OVERRIDE7__SHIFT 0x18
+#define CGTT_WD_CLK_CTRL__PERF_ENABLE_MASK 0x2000000
+#define CGTT_WD_CLK_CTRL__PERF_ENABLE__SHIFT 0x19
+#define CGTT_WD_CLK_CTRL__DBG_ENABLE_MASK 0x4000000
+#define CGTT_WD_CLK_CTRL__DBG_ENABLE__SHIFT 0x1a
+#define CGTT_WD_CLK_CTRL__SOFT_OVERRIDE4_MASK 0x8000000
+#define CGTT_WD_CLK_CTRL__SOFT_OVERRIDE4__SHIFT 0x1b
+#define CGTT_WD_CLK_CTRL__TESS_OVERRIDE_MASK 0x10000000
+#define CGTT_WD_CLK_CTRL__TESS_OVERRIDE__SHIFT 0x1c
+#define CGTT_WD_CLK_CTRL__CORE_OVERRIDE_MASK 0x20000000
+#define CGTT_WD_CLK_CTRL__CORE_OVERRIDE__SHIFT 0x1d
+#define CGTT_WD_CLK_CTRL__RBIU_INPUT_OVERRIDE_MASK 0x40000000
+#define CGTT_WD_CLK_CTRL__RBIU_INPUT_OVERRIDE__SHIFT 0x1e
+#define CGTT_WD_CLK_CTRL__REG_OVERRIDE_MASK 0x80000000
+#define CGTT_WD_CLK_CTRL__REG_OVERRIDE__SHIFT 0x1f
+#define VGT_DEBUG_CNTL__VGT_DEBUG_INDX_MASK 0x3f
+#define VGT_DEBUG_CNTL__VGT_DEBUG_INDX__SHIFT 0x0
+#define VGT_DEBUG_CNTL__VGT_DEBUG_SEL_BUS_B_MASK 0x40
+#define VGT_DEBUG_CNTL__VGT_DEBUG_SEL_BUS_B__SHIFT 0x6
+#define VGT_DEBUG_DATA__DATA_MASK 0xffffffff
+#define VGT_DEBUG_DATA__DATA__SHIFT 0x0
+#define IA_DEBUG_CNTL__IA_DEBUG_INDX_MASK 0x3f
+#define IA_DEBUG_CNTL__IA_DEBUG_INDX__SHIFT 0x0
+#define IA_DEBUG_CNTL__IA_DEBUG_SEL_BUS_B_MASK 0x40
+#define IA_DEBUG_CNTL__IA_DEBUG_SEL_BUS_B__SHIFT 0x6
+#define IA_DEBUG_DATA__DATA_MASK 0xffffffff
+#define IA_DEBUG_DATA__DATA__SHIFT 0x0
+#define VGT_CNTL_STATUS__VGT_BUSY_MASK 0x1
+#define VGT_CNTL_STATUS__VGT_BUSY__SHIFT 0x0
+#define VGT_CNTL_STATUS__VGT_OUT_INDX_BUSY_MASK 0x2
+#define VGT_CNTL_STATUS__VGT_OUT_INDX_BUSY__SHIFT 0x1
+#define VGT_CNTL_STATUS__VGT_OUT_BUSY_MASK 0x4
+#define VGT_CNTL_STATUS__VGT_OUT_BUSY__SHIFT 0x2
+#define VGT_CNTL_STATUS__VGT_PT_BUSY_MASK 0x8
+#define VGT_CNTL_STATUS__VGT_PT_BUSY__SHIFT 0x3
+#define VGT_CNTL_STATUS__VGT_TE_BUSY_MASK 0x10
+#define VGT_CNTL_STATUS__VGT_TE_BUSY__SHIFT 0x4
+#define VGT_CNTL_STATUS__VGT_VR_BUSY_MASK 0x20
+#define VGT_CNTL_STATUS__VGT_VR_BUSY__SHIFT 0x5
+#define VGT_CNTL_STATUS__VGT_PI_BUSY_MASK 0x40
+#define VGT_CNTL_STATUS__VGT_PI_BUSY__SHIFT 0x6
+#define VGT_CNTL_STATUS__VGT_GS_BUSY_MASK 0x80
+#define VGT_CNTL_STATUS__VGT_GS_BUSY__SHIFT 0x7
+#define VGT_CNTL_STATUS__VGT_HS_BUSY_MASK 0x100
+#define VGT_CNTL_STATUS__VGT_HS_BUSY__SHIFT 0x8
+#define VGT_CNTL_STATUS__VGT_TE11_BUSY_MASK 0x200
+#define VGT_CNTL_STATUS__VGT_TE11_BUSY__SHIFT 0x9
+#define WD_DEBUG_CNTL__WD_DEBUG_INDX_MASK 0x3f
+#define WD_DEBUG_CNTL__WD_DEBUG_INDX__SHIFT 0x0
+#define WD_DEBUG_CNTL__WD_DEBUG_SEL_BUS_B_MASK 0x40
+#define WD_DEBUG_CNTL__WD_DEBUG_SEL_BUS_B__SHIFT 0x6
+#define WD_DEBUG_DATA__DATA_MASK 0xffffffff
+#define WD_DEBUG_DATA__DATA__SHIFT 0x0
+#define WD_QOS__DRAW_STALL_MASK 0x1
+#define WD_QOS__DRAW_STALL__SHIFT 0x0
+#define CC_GC_PRIM_CONFIG__INACTIVE_IA_MASK 0x30000
+#define CC_GC_PRIM_CONFIG__INACTIVE_IA__SHIFT 0x10
+#define CC_GC_PRIM_CONFIG__INACTIVE_VGT_PA_MASK 0xf000000
+#define CC_GC_PRIM_CONFIG__INACTIVE_VGT_PA__SHIFT 0x18
+#define GC_USER_PRIM_CONFIG__INACTIVE_IA_MASK 0x30000
+#define GC_USER_PRIM_CONFIG__INACTIVE_IA__SHIFT 0x10
+#define GC_USER_PRIM_CONFIG__INACTIVE_VGT_PA_MASK 0xf000000
+#define GC_USER_PRIM_CONFIG__INACTIVE_VGT_PA__SHIFT 0x18
+#define WD_DEBUG_REG0__wd_busy_extended_MASK 0x1
+#define WD_DEBUG_REG0__wd_busy_extended__SHIFT 0x0
+#define WD_DEBUG_REG0__wd_nodma_busy_extended_MASK 0x2
+#define WD_DEBUG_REG0__wd_nodma_busy_extended__SHIFT 0x1
+#define WD_DEBUG_REG0__wd_busy_MASK 0x4
+#define WD_DEBUG_REG0__wd_busy__SHIFT 0x2
+#define WD_DEBUG_REG0__wd_nodma_busy_MASK 0x8
+#define WD_DEBUG_REG0__wd_nodma_busy__SHIFT 0x3
+#define WD_DEBUG_REG0__rbiu_busy_MASK 0x10
+#define WD_DEBUG_REG0__rbiu_busy__SHIFT 0x4
+#define WD_DEBUG_REG0__spl_dma_busy_MASK 0x20
+#define WD_DEBUG_REG0__spl_dma_busy__SHIFT 0x5
+#define WD_DEBUG_REG0__spl_di_busy_MASK 0x40
+#define WD_DEBUG_REG0__spl_di_busy__SHIFT 0x6
+#define WD_DEBUG_REG0__vgt0_active_q_MASK 0x80
+#define WD_DEBUG_REG0__vgt0_active_q__SHIFT 0x7
+#define WD_DEBUG_REG0__vgt1_active_q_MASK 0x100
+#define WD_DEBUG_REG0__vgt1_active_q__SHIFT 0x8
+#define WD_DEBUG_REG0__spl_dma_p1_busy_MASK 0x200
+#define WD_DEBUG_REG0__spl_dma_p1_busy__SHIFT 0x9
+#define WD_DEBUG_REG0__rbiu_dr_p1_fifo_busy_MASK 0x400
+#define WD_DEBUG_REG0__rbiu_dr_p1_fifo_busy__SHIFT 0xa
+#define WD_DEBUG_REG0__rbiu_di_p1_fifo_busy_MASK 0x800
+#define WD_DEBUG_REG0__rbiu_di_p1_fifo_busy__SHIFT 0xb
+#define WD_DEBUG_REG0__SPARE2_MASK 0x1000
+#define WD_DEBUG_REG0__SPARE2__SHIFT 0xc
+#define WD_DEBUG_REG0__rbiu_dr_fifo_busy_MASK 0x2000
+#define WD_DEBUG_REG0__rbiu_dr_fifo_busy__SHIFT 0xd
+#define WD_DEBUG_REG0__rbiu_spl_dr_valid_MASK 0x4000
+#define WD_DEBUG_REG0__rbiu_spl_dr_valid__SHIFT 0xe
+#define WD_DEBUG_REG0__spl_rbiu_dr_read_MASK 0x8000
+#define WD_DEBUG_REG0__spl_rbiu_dr_read__SHIFT 0xf
+#define WD_DEBUG_REG0__SPARE3_MASK 0x10000
+#define WD_DEBUG_REG0__SPARE3__SHIFT 0x10
+#define WD_DEBUG_REG0__rbiu_di_fifo_busy_MASK 0x20000
+#define WD_DEBUG_REG0__rbiu_di_fifo_busy__SHIFT 0x11
+#define WD_DEBUG_REG0__rbiu_spl_di_valid_MASK 0x40000
+#define WD_DEBUG_REG0__rbiu_spl_di_valid__SHIFT 0x12
+#define WD_DEBUG_REG0__spl_rbiu_di_read_MASK 0x80000
+#define WD_DEBUG_REG0__spl_rbiu_di_read__SHIFT 0x13
+#define WD_DEBUG_REG0__se0_synced_q_MASK 0x100000
+#define WD_DEBUG_REG0__se0_synced_q__SHIFT 0x14
+#define WD_DEBUG_REG0__se1_synced_q_MASK 0x200000
+#define WD_DEBUG_REG0__se1_synced_q__SHIFT 0x15
+#define WD_DEBUG_REG0__se2_synced_q_MASK 0x400000
+#define WD_DEBUG_REG0__se2_synced_q__SHIFT 0x16
+#define WD_DEBUG_REG0__se3_synced_q_MASK 0x800000
+#define WD_DEBUG_REG0__se3_synced_q__SHIFT 0x17
+#define WD_DEBUG_REG0__reg_clk_busy_MASK 0x1000000
+#define WD_DEBUG_REG0__reg_clk_busy__SHIFT 0x18
+#define WD_DEBUG_REG0__input_clk_busy_MASK 0x2000000
+#define WD_DEBUG_REG0__input_clk_busy__SHIFT 0x19
+#define WD_DEBUG_REG0__core_clk_busy_MASK 0x4000000
+#define WD_DEBUG_REG0__core_clk_busy__SHIFT 0x1a
+#define WD_DEBUG_REG0__vgt2_active_q_MASK 0x8000000
+#define WD_DEBUG_REG0__vgt2_active_q__SHIFT 0x1b
+#define WD_DEBUG_REG0__sclk_reg_vld_MASK 0x10000000
+#define WD_DEBUG_REG0__sclk_reg_vld__SHIFT 0x1c
+#define WD_DEBUG_REG0__sclk_input_vld_MASK 0x20000000
+#define WD_DEBUG_REG0__sclk_input_vld__SHIFT 0x1d
+#define WD_DEBUG_REG0__sclk_core_vld_MASK 0x40000000
+#define WD_DEBUG_REG0__sclk_core_vld__SHIFT 0x1e
+#define WD_DEBUG_REG0__vgt3_active_q_MASK 0x80000000
+#define WD_DEBUG_REG0__vgt3_active_q__SHIFT 0x1f
+#define WD_DEBUG_REG1__grbm_fifo_empty_MASK 0x1
+#define WD_DEBUG_REG1__grbm_fifo_empty__SHIFT 0x0
+#define WD_DEBUG_REG1__grbm_fifo_full_MASK 0x2
+#define WD_DEBUG_REG1__grbm_fifo_full__SHIFT 0x1
+#define WD_DEBUG_REG1__grbm_fifo_we_MASK 0x4
+#define WD_DEBUG_REG1__grbm_fifo_we__SHIFT 0x2
+#define WD_DEBUG_REG1__grbm_fifo_re_MASK 0x8
+#define WD_DEBUG_REG1__grbm_fifo_re__SHIFT 0x3
+#define WD_DEBUG_REG1__draw_initiator_valid_q_MASK 0x10
+#define WD_DEBUG_REG1__draw_initiator_valid_q__SHIFT 0x4
+#define WD_DEBUG_REG1__event_initiator_valid_q_MASK 0x20
+#define WD_DEBUG_REG1__event_initiator_valid_q__SHIFT 0x5
+#define WD_DEBUG_REG1__event_addr_valid_q_MASK 0x40
+#define WD_DEBUG_REG1__event_addr_valid_q__SHIFT 0x6
+#define WD_DEBUG_REG1__dma_request_valid_q_MASK 0x80
+#define WD_DEBUG_REG1__dma_request_valid_q__SHIFT 0x7
+#define WD_DEBUG_REG1__SPARE0_MASK 0x100
+#define WD_DEBUG_REG1__SPARE0__SHIFT 0x8
+#define WD_DEBUG_REG1__min_indx_valid_q_MASK 0x200
+#define WD_DEBUG_REG1__min_indx_valid_q__SHIFT 0x9
+#define WD_DEBUG_REG1__max_indx_valid_q_MASK 0x400
+#define WD_DEBUG_REG1__max_indx_valid_q__SHIFT 0xa
+#define WD_DEBUG_REG1__indx_offset_valid_q_MASK 0x800
+#define WD_DEBUG_REG1__indx_offset_valid_q__SHIFT 0xb
+#define WD_DEBUG_REG1__grbm_fifo_rdata_reg_id_MASK 0x1f000
+#define WD_DEBUG_REG1__grbm_fifo_rdata_reg_id__SHIFT 0xc
+#define WD_DEBUG_REG1__grbm_fifo_rdata_state_MASK 0xe0000
+#define WD_DEBUG_REG1__grbm_fifo_rdata_state__SHIFT 0x11
+#define WD_DEBUG_REG1__free_cnt_q_MASK 0x3f00000
+#define WD_DEBUG_REG1__free_cnt_q__SHIFT 0x14
+#define WD_DEBUG_REG1__rbiu_di_fifo_we_MASK 0x4000000
+#define WD_DEBUG_REG1__rbiu_di_fifo_we__SHIFT 0x1a
+#define WD_DEBUG_REG1__rbiu_dr_fifo_we_MASK 0x8000000
+#define WD_DEBUG_REG1__rbiu_dr_fifo_we__SHIFT 0x1b
+#define WD_DEBUG_REG1__rbiu_di_fifo_empty_MASK 0x10000000
+#define WD_DEBUG_REG1__rbiu_di_fifo_empty__SHIFT 0x1c
+#define WD_DEBUG_REG1__rbiu_di_fifo_full_MASK 0x20000000
+#define WD_DEBUG_REG1__rbiu_di_fifo_full__SHIFT 0x1d
+#define WD_DEBUG_REG1__rbiu_dr_fifo_empty_MASK 0x40000000
+#define WD_DEBUG_REG1__rbiu_dr_fifo_empty__SHIFT 0x1e
+#define WD_DEBUG_REG1__rbiu_dr_fifo_full_MASK 0x80000000
+#define WD_DEBUG_REG1__rbiu_dr_fifo_full__SHIFT 0x1f
+#define WD_DEBUG_REG2__p1_grbm_fifo_empty_MASK 0x1
+#define WD_DEBUG_REG2__p1_grbm_fifo_empty__SHIFT 0x0
+#define WD_DEBUG_REG2__p1_grbm_fifo_full_MASK 0x2
+#define WD_DEBUG_REG2__p1_grbm_fifo_full__SHIFT 0x1
+#define WD_DEBUG_REG2__p1_grbm_fifo_we_MASK 0x4
+#define WD_DEBUG_REG2__p1_grbm_fifo_we__SHIFT 0x2
+#define WD_DEBUG_REG2__p1_grbm_fifo_re_MASK 0x8
+#define WD_DEBUG_REG2__p1_grbm_fifo_re__SHIFT 0x3
+#define WD_DEBUG_REG2__p1_draw_initiator_valid_q_MASK 0x10
+#define WD_DEBUG_REG2__p1_draw_initiator_valid_q__SHIFT 0x4
+#define WD_DEBUG_REG2__p1_event_initiator_valid_q_MASK 0x20
+#define WD_DEBUG_REG2__p1_event_initiator_valid_q__SHIFT 0x5
+#define WD_DEBUG_REG2__p1_event_addr_valid_q_MASK 0x40
+#define WD_DEBUG_REG2__p1_event_addr_valid_q__SHIFT 0x6
+#define WD_DEBUG_REG2__p1_dma_request_valid_q_MASK 0x80
+#define WD_DEBUG_REG2__p1_dma_request_valid_q__SHIFT 0x7
+#define WD_DEBUG_REG2__SPARE0_MASK 0x100
+#define WD_DEBUG_REG2__SPARE0__SHIFT 0x8
+#define WD_DEBUG_REG2__p1_min_indx_valid_q_MASK 0x200
+#define WD_DEBUG_REG2__p1_min_indx_valid_q__SHIFT 0x9
+#define WD_DEBUG_REG2__p1_max_indx_valid_q_MASK 0x400
+#define WD_DEBUG_REG2__p1_max_indx_valid_q__SHIFT 0xa
+#define WD_DEBUG_REG2__p1_indx_offset_valid_q_MASK 0x800
+#define WD_DEBUG_REG2__p1_indx_offset_valid_q__SHIFT 0xb
+#define WD_DEBUG_REG2__p1_grbm_fifo_rdata_reg_id_MASK 0x1f000
+#define WD_DEBUG_REG2__p1_grbm_fifo_rdata_reg_id__SHIFT 0xc
+#define WD_DEBUG_REG2__p1_grbm_fifo_rdata_state_MASK 0xe0000
+#define WD_DEBUG_REG2__p1_grbm_fifo_rdata_state__SHIFT 0x11
+#define WD_DEBUG_REG2__p1_free_cnt_q_MASK 0x3f00000
+#define WD_DEBUG_REG2__p1_free_cnt_q__SHIFT 0x14
+#define WD_DEBUG_REG2__p1_rbiu_di_fifo_we_MASK 0x4000000
+#define WD_DEBUG_REG2__p1_rbiu_di_fifo_we__SHIFT 0x1a
+#define WD_DEBUG_REG2__p1_rbiu_dr_fifo_we_MASK 0x8000000
+#define WD_DEBUG_REG2__p1_rbiu_dr_fifo_we__SHIFT 0x1b
+#define WD_DEBUG_REG2__p1_rbiu_di_fifo_empty_MASK 0x10000000
+#define WD_DEBUG_REG2__p1_rbiu_di_fifo_empty__SHIFT 0x1c
+#define WD_DEBUG_REG2__p1_rbiu_di_fifo_full_MASK 0x20000000
+#define WD_DEBUG_REG2__p1_rbiu_di_fifo_full__SHIFT 0x1d
+#define WD_DEBUG_REG2__p1_rbiu_dr_fifo_empty_MASK 0x40000000
+#define WD_DEBUG_REG2__p1_rbiu_dr_fifo_empty__SHIFT 0x1e
+#define WD_DEBUG_REG2__p1_rbiu_dr_fifo_full_MASK 0x80000000
+#define WD_DEBUG_REG2__p1_rbiu_dr_fifo_full__SHIFT 0x1f
+#define WD_DEBUG_REG3__rbiu_spl_dr_valid_MASK 0x1
+#define WD_DEBUG_REG3__rbiu_spl_dr_valid__SHIFT 0x0
+#define WD_DEBUG_REG3__SPARE0_MASK 0x2
+#define WD_DEBUG_REG3__SPARE0__SHIFT 0x1
+#define WD_DEBUG_REG3__pipe0_dr_MASK 0x4
+#define WD_DEBUG_REG3__pipe0_dr__SHIFT 0x2
+#define WD_DEBUG_REG3__pipe0_rtr_MASK 0x8
+#define WD_DEBUG_REG3__pipe0_rtr__SHIFT 0x3
+#define WD_DEBUG_REG3__pipe1_dr_MASK 0x10
+#define WD_DEBUG_REG3__pipe1_dr__SHIFT 0x4
+#define WD_DEBUG_REG3__pipe1_rtr_MASK 0x20
+#define WD_DEBUG_REG3__pipe1_rtr__SHIFT 0x5
+#define WD_DEBUG_REG3__wd_subdma_fifo_empty_MASK 0x40
+#define WD_DEBUG_REG3__wd_subdma_fifo_empty__SHIFT 0x6
+#define WD_DEBUG_REG3__wd_subdma_fifo_full_MASK 0x80
+#define WD_DEBUG_REG3__wd_subdma_fifo_full__SHIFT 0x7
+#define WD_DEBUG_REG3__dma_buf_type_p0_q_MASK 0x300
+#define WD_DEBUG_REG3__dma_buf_type_p0_q__SHIFT 0x8
+#define WD_DEBUG_REG3__dma_zero_indices_p0_q_MASK 0x400
+#define WD_DEBUG_REG3__dma_zero_indices_p0_q__SHIFT 0xa
+#define WD_DEBUG_REG3__dma_req_path_p3_q_MASK 0x800
+#define WD_DEBUG_REG3__dma_req_path_p3_q__SHIFT 0xb
+#define WD_DEBUG_REG3__dma_not_eop_p1_q_MASK 0x1000
+#define WD_DEBUG_REG3__dma_not_eop_p1_q__SHIFT 0xc
+#define WD_DEBUG_REG3__out_of_range_p4_MASK 0x2000
+#define WD_DEBUG_REG3__out_of_range_p4__SHIFT 0xd
+#define WD_DEBUG_REG3__last_sub_dma_p3_q_MASK 0x4000
+#define WD_DEBUG_REG3__last_sub_dma_p3_q__SHIFT 0xe
+#define WD_DEBUG_REG3__last_rdreq_of_sub_dma_p4_MASK 0x8000
+#define WD_DEBUG_REG3__last_rdreq_of_sub_dma_p4__SHIFT 0xf
+#define WD_DEBUG_REG3__WD_IA_dma_send_d_MASK 0x10000
+#define WD_DEBUG_REG3__WD_IA_dma_send_d__SHIFT 0x10
+#define WD_DEBUG_REG3__WD_IA_dma_rtr_MASK 0x20000
+#define WD_DEBUG_REG3__WD_IA_dma_rtr__SHIFT 0x11
+#define WD_DEBUG_REG3__WD_IA1_dma_send_d_MASK 0x40000
+#define WD_DEBUG_REG3__WD_IA1_dma_send_d__SHIFT 0x12
+#define WD_DEBUG_REG3__WD_IA1_dma_rtr_MASK 0x80000
+#define WD_DEBUG_REG3__WD_IA1_dma_rtr__SHIFT 0x13
+#define WD_DEBUG_REG3__last_inst_of_dma_p2_MASK 0x100000
+#define WD_DEBUG_REG3__last_inst_of_dma_p2__SHIFT 0x14
+#define WD_DEBUG_REG3__last_sd_of_inst_p2_MASK 0x200000
+#define WD_DEBUG_REG3__last_sd_of_inst_p2__SHIFT 0x15
+#define WD_DEBUG_REG3__last_sd_of_dma_p2_MASK 0x400000
+#define WD_DEBUG_REG3__last_sd_of_dma_p2__SHIFT 0x16
+#define WD_DEBUG_REG3__SPARE1_MASK 0x800000
+#define WD_DEBUG_REG3__SPARE1__SHIFT 0x17
+#define WD_DEBUG_REG3__WD_IA_dma_busy_MASK 0x1000000
+#define WD_DEBUG_REG3__WD_IA_dma_busy__SHIFT 0x18
+#define WD_DEBUG_REG3__WD_IA1_dma_busy_MASK 0x2000000
+#define WD_DEBUG_REG3__WD_IA1_dma_busy__SHIFT 0x19
+#define WD_DEBUG_REG3__send_to_ia1_p3_q_MASK 0x4000000
+#define WD_DEBUG_REG3__send_to_ia1_p3_q__SHIFT 0x1a
+#define WD_DEBUG_REG3__dma_wd_switch_on_eop_p3_q_MASK 0x8000000
+#define WD_DEBUG_REG3__dma_wd_switch_on_eop_p3_q__SHIFT 0x1b
+#define WD_DEBUG_REG3__pipe3_dr_MASK 0x10000000
+#define WD_DEBUG_REG3__pipe3_dr__SHIFT 0x1c
+#define WD_DEBUG_REG3__pipe3_rtr_MASK 0x20000000
+#define WD_DEBUG_REG3__pipe3_rtr__SHIFT 0x1d
+#define WD_DEBUG_REG3__wd_dma2draw_fifo_empty_MASK 0x40000000
+#define WD_DEBUG_REG3__wd_dma2draw_fifo_empty__SHIFT 0x1e
+#define WD_DEBUG_REG3__wd_dma2draw_fifo_full_MASK 0x80000000
+#define WD_DEBUG_REG3__wd_dma2draw_fifo_full__SHIFT 0x1f
+#define WD_DEBUG_REG4__rbiu_spl_di_valid_MASK 0x1
+#define WD_DEBUG_REG4__rbiu_spl_di_valid__SHIFT 0x0
+#define WD_DEBUG_REG4__spl_rbiu_di_read_MASK 0x2
+#define WD_DEBUG_REG4__spl_rbiu_di_read__SHIFT 0x1
+#define WD_DEBUG_REG4__rbiu_spl_p1_di_valid_MASK 0x4
+#define WD_DEBUG_REG4__rbiu_spl_p1_di_valid__SHIFT 0x2
+#define WD_DEBUG_REG4__spl_rbiu_p1_di_read_MASK 0x8
+#define WD_DEBUG_REG4__spl_rbiu_p1_di_read__SHIFT 0x3
+#define WD_DEBUG_REG4__pipe0_dr_MASK 0x10
+#define WD_DEBUG_REG4__pipe0_dr__SHIFT 0x4
+#define WD_DEBUG_REG4__pipe0_rtr_MASK 0x20
+#define WD_DEBUG_REG4__pipe0_rtr__SHIFT 0x5
+#define WD_DEBUG_REG4__pipe1_dr_MASK 0x40
+#define WD_DEBUG_REG4__pipe1_dr__SHIFT 0x6
+#define WD_DEBUG_REG4__pipe1_rtr_MASK 0x80
+#define WD_DEBUG_REG4__pipe1_rtr__SHIFT 0x7
+#define WD_DEBUG_REG4__pipe2_dr_MASK 0x100
+#define WD_DEBUG_REG4__pipe2_dr__SHIFT 0x8
+#define WD_DEBUG_REG4__pipe2_rtr_MASK 0x200
+#define WD_DEBUG_REG4__pipe2_rtr__SHIFT 0x9
+#define WD_DEBUG_REG4__pipe3_ld_MASK 0x400
+#define WD_DEBUG_REG4__pipe3_ld__SHIFT 0xa
+#define WD_DEBUG_REG4__pipe3_rtr_MASK 0x800
+#define WD_DEBUG_REG4__pipe3_rtr__SHIFT 0xb
+#define WD_DEBUG_REG4__WD_IA_draw_send_d_MASK 0x1000
+#define WD_DEBUG_REG4__WD_IA_draw_send_d__SHIFT 0xc
+#define WD_DEBUG_REG4__WD_IA_draw_rtr_MASK 0x2000
+#define WD_DEBUG_REG4__WD_IA_draw_rtr__SHIFT 0xd
+#define WD_DEBUG_REG4__di_type_p0_MASK 0xc000
+#define WD_DEBUG_REG4__di_type_p0__SHIFT 0xe
+#define WD_DEBUG_REG4__di_state_sel_p1_q_MASK 0x70000
+#define WD_DEBUG_REG4__di_state_sel_p1_q__SHIFT 0x10
+#define WD_DEBUG_REG4__di_wd_switch_on_eop_p1_q_MASK 0x80000
+#define WD_DEBUG_REG4__di_wd_switch_on_eop_p1_q__SHIFT 0x13
+#define WD_DEBUG_REG4__rbiu_spl_pipe0_lockout_MASK 0x100000
+#define WD_DEBUG_REG4__rbiu_spl_pipe0_lockout__SHIFT 0x14
+#define WD_DEBUG_REG4__last_inst_of_di_p2_MASK 0x200000
+#define WD_DEBUG_REG4__last_inst_of_di_p2__SHIFT 0x15
+#define WD_DEBUG_REG4__last_sd_of_inst_p2_MASK 0x400000
+#define WD_DEBUG_REG4__last_sd_of_inst_p2__SHIFT 0x16
+#define WD_DEBUG_REG4__last_sd_of_di_p2_MASK 0x800000
+#define WD_DEBUG_REG4__last_sd_of_di_p2__SHIFT 0x17
+#define WD_DEBUG_REG4__not_eop_wait_p1_q_MASK 0x1000000
+#define WD_DEBUG_REG4__not_eop_wait_p1_q__SHIFT 0x18
+#define WD_DEBUG_REG4__not_eop_wait_q_MASK 0x2000000
+#define WD_DEBUG_REG4__not_eop_wait_q__SHIFT 0x19
+#define WD_DEBUG_REG4__ext_event_wait_p1_q_MASK 0x4000000
+#define WD_DEBUG_REG4__ext_event_wait_p1_q__SHIFT 0x1a
+#define WD_DEBUG_REG4__ext_event_wait_q_MASK 0x8000000
+#define WD_DEBUG_REG4__ext_event_wait_q__SHIFT 0x1b
+#define WD_DEBUG_REG4__WD_IA1_draw_send_d_MASK 0x10000000
+#define WD_DEBUG_REG4__WD_IA1_draw_send_d__SHIFT 0x1c
+#define WD_DEBUG_REG4__WD_IA1_draw_rtr_MASK 0x20000000
+#define WD_DEBUG_REG4__WD_IA1_draw_rtr__SHIFT 0x1d
+#define WD_DEBUG_REG4__send_to_ia1_q_MASK 0x40000000
+#define WD_DEBUG_REG4__send_to_ia1_q__SHIFT 0x1e
+#define WD_DEBUG_REG4__dual_ia_mode_MASK 0x80000000
+#define WD_DEBUG_REG4__dual_ia_mode__SHIFT 0x1f
+#define WD_DEBUG_REG5__p1_rbiu_spl_dr_valid_MASK 0x1
+#define WD_DEBUG_REG5__p1_rbiu_spl_dr_valid__SHIFT 0x0
+#define WD_DEBUG_REG5__SPARE0_MASK 0x2
+#define WD_DEBUG_REG5__SPARE0__SHIFT 0x1
+#define WD_DEBUG_REG5__p1_pipe0_dr_MASK 0x4
+#define WD_DEBUG_REG5__p1_pipe0_dr__SHIFT 0x2
+#define WD_DEBUG_REG5__p1_pipe0_rtr_MASK 0x8
+#define WD_DEBUG_REG5__p1_pipe0_rtr__SHIFT 0x3
+#define WD_DEBUG_REG5__p1_pipe1_dr_MASK 0x10
+#define WD_DEBUG_REG5__p1_pipe1_dr__SHIFT 0x4
+#define WD_DEBUG_REG5__p1_pipe1_rtr_MASK 0x20
+#define WD_DEBUG_REG5__p1_pipe1_rtr__SHIFT 0x5
+#define WD_DEBUG_REG5__p1_wd_subdma_fifo_empty_MASK 0x40
+#define WD_DEBUG_REG5__p1_wd_subdma_fifo_empty__SHIFT 0x6
+#define WD_DEBUG_REG5__p1_wd_subdma_fifo_full_MASK 0x80
+#define WD_DEBUG_REG5__p1_wd_subdma_fifo_full__SHIFT 0x7
+#define WD_DEBUG_REG5__p1_dma_buf_type_p0_q_MASK 0x300
+#define WD_DEBUG_REG5__p1_dma_buf_type_p0_q__SHIFT 0x8
+#define WD_DEBUG_REG5__p1_dma_zero_indices_p0_q_MASK 0x400
+#define WD_DEBUG_REG5__p1_dma_zero_indices_p0_q__SHIFT 0xa
+#define WD_DEBUG_REG5__p1_dma_req_path_p3_q_MASK 0x800
+#define WD_DEBUG_REG5__p1_dma_req_path_p3_q__SHIFT 0xb
+#define WD_DEBUG_REG5__p1_dma_not_eop_p1_q_MASK 0x1000
+#define WD_DEBUG_REG5__p1_dma_not_eop_p1_q__SHIFT 0xc
+#define WD_DEBUG_REG5__p1_out_of_range_p4_MASK 0x2000
+#define WD_DEBUG_REG5__p1_out_of_range_p4__SHIFT 0xd
+#define WD_DEBUG_REG5__p1_last_sub_dma_p3_q_MASK 0x4000
+#define WD_DEBUG_REG5__p1_last_sub_dma_p3_q__SHIFT 0xe
+#define WD_DEBUG_REG5__p1_last_rdreq_of_sub_dma_p4_MASK 0x8000
+#define WD_DEBUG_REG5__p1_last_rdreq_of_sub_dma_p4__SHIFT 0xf
+#define WD_DEBUG_REG5__p1_WD_IA_dma_send_d_MASK 0x10000
+#define WD_DEBUG_REG5__p1_WD_IA_dma_send_d__SHIFT 0x10
+#define WD_DEBUG_REG5__p1_WD_IA_dma_rtr_MASK 0x20000
+#define WD_DEBUG_REG5__p1_WD_IA_dma_rtr__SHIFT 0x11
+#define WD_DEBUG_REG5__p1_WD_IA1_dma_send_d_MASK 0x40000
+#define WD_DEBUG_REG5__p1_WD_IA1_dma_send_d__SHIFT 0x12
+#define WD_DEBUG_REG5__p1_WD_IA1_dma_rtr_MASK 0x80000
+#define WD_DEBUG_REG5__p1_WD_IA1_dma_rtr__SHIFT 0x13
+#define WD_DEBUG_REG5__p1_last_inst_of_dma_p2_MASK 0x100000
+#define WD_DEBUG_REG5__p1_last_inst_of_dma_p2__SHIFT 0x14
+#define WD_DEBUG_REG5__p1_last_sd_of_inst_p2_MASK 0x200000
+#define WD_DEBUG_REG5__p1_last_sd_of_inst_p2__SHIFT 0x15
+#define WD_DEBUG_REG5__p1_last_sd_of_dma_p2_MASK 0x400000
+#define WD_DEBUG_REG5__p1_last_sd_of_dma_p2__SHIFT 0x16
+#define WD_DEBUG_REG5__SPARE1_MASK 0x800000
+#define WD_DEBUG_REG5__SPARE1__SHIFT 0x17
+#define WD_DEBUG_REG5__p1_WD_IA_dma_busy_MASK 0x1000000
+#define WD_DEBUG_REG5__p1_WD_IA_dma_busy__SHIFT 0x18
+#define WD_DEBUG_REG5__p1_WD_IA1_dma_busy_MASK 0x2000000
+#define WD_DEBUG_REG5__p1_WD_IA1_dma_busy__SHIFT 0x19
+#define WD_DEBUG_REG5__p1_send_to_ia1_p3_q_MASK 0x4000000
+#define WD_DEBUG_REG5__p1_send_to_ia1_p3_q__SHIFT 0x1a
+#define WD_DEBUG_REG5__p1_dma_wd_switch_on_eop_p3_q_MASK 0x8000000
+#define WD_DEBUG_REG5__p1_dma_wd_switch_on_eop_p3_q__SHIFT 0x1b
+#define WD_DEBUG_REG5__p1_pipe3_dr_MASK 0x10000000
+#define WD_DEBUG_REG5__p1_pipe3_dr__SHIFT 0x1c
+#define WD_DEBUG_REG5__p1_pipe3_rtr_MASK 0x20000000
+#define WD_DEBUG_REG5__p1_pipe3_rtr__SHIFT 0x1d
+#define WD_DEBUG_REG5__p1_wd_dma2draw_fifo_empty_MASK 0x40000000
+#define WD_DEBUG_REG5__p1_wd_dma2draw_fifo_empty__SHIFT 0x1e
+#define WD_DEBUG_REG5__p1_wd_dma2draw_fifo_full_MASK 0x80000000
+#define WD_DEBUG_

@@ -1,137 +1,85 @@
+atch interrupt enable */
+#define RTCIENR_MIN	0x0002	/* 1-minute interrupt enable */
+#define RTCIENR_ALM	0x0004	/* Alarm interrupt enable */
+#define RTCIENR_DAY	0x0008	/* 24-hour rollover interrupt enable */
+#define RTCIENR_1HZ	0x0010	/* 1Hz interrupt enable */
+#define RTCIENR_HR	0x0020	/* 1-hour interrupt enable */
+#define RTCIENR_SAM0	0x0100	/*   4Hz /   4.6875Hz interrupt enable */ 
+#define RTCIENR_SAM1	0x0200	/*   8Hz /   9.3750Hz interrupt enable */ 
+#define RTCIENR_SAM2	0x0400	/*  16Hz /  18.7500Hz interrupt enable */ 
+#define RTCIENR_SAM3	0x0800	/*  32Hz /  37.5000Hz interrupt enable */ 
+#define RTCIENR_SAM4	0x1000	/*  64Hz /  75.0000Hz interrupt enable */ 
+#define RTCIENR_SAM5	0x2000	/* 128Hz / 150.0000Hz interrupt enable */ 
+#define RTCIENR_SAM6	0x4000	/* 256Hz / 300.0000Hz interrupt enable */ 
+#define RTCIENR_SAM7	0x8000	/* 512Hz / 600.0000Hz interrupt enable */ 
+
+/* 
+ * Stopwatch Minutes Register
+ */
+#define STPWCH_ADDR	0xfffffb12
+#define STPWCH		WORD_REF(STPWCH_ADDR)
+
+#define STPWCH_CNT_MASK	 0x003f	/* Stopwatch countdown value */
+#define SPTWCH_CNT_SHIFT 0
+
 /*
- * Hypervisor filesystem for Linux on s390
+ * RTC Day Count Register 
+ */
+#define DAYR_ADDR	0xfffffb1a
+#define DAYR		WORD_REF(DAYR_ADDR)
+
+#define DAYR_DAYS_MASK	0x1ff	/* Day Setting */
+#define DAYR_DAYS_SHIFT 0
+
+/*
+ * RTC Day Alarm Register 
+ */
+#define DAYALARM_ADDR	0xfffffb1c
+#define DAYALARM	WORD_REF(DAYALARM_ADDR)
+
+#define DAYALARM_DAYSAL_MASK	0x01ff	/* Day Setting of the Alarm */
+#define DAYALARM_DAYSAL_SHIFT 	0
+
+/**********
  *
- * Diag 0C implementation
+ * 0xFFFFFCxx -- DRAM Controller
  *
- * Copyright IBM Corp. 2014
- */
-
-#include <linux/slab.h>
-#include <linux/cpu.h>
-#include <asm/diag.h>
-#include <asm/hypfs.h>
-#include "hypfs.h"
-
-#define DBFS_D0C_HDR_VERSION 0
+ **********/
 
 /*
- * Execute diagnose 0c in 31 bit mode
+ * DRAM Memory Configuration Register 
  */
-static void diag0c(struct hypfs_diag0c_entry *entry)
-{
-	diag_stat_inc(DIAG_STAT_X00C);
-	asm volatile (
-		"	sam31\n"
-		"	diag	%0,%0,0x0c\n"
-		"	sam64\n"
-		: /* no output register */
-		: "a" (entry)
-		: "memory");
-}
+#define DRAMMC_ADDR	0xfffffc00
+#define DRAMMC		WORD_REF(DRAMMC_ADDR)
+
+#define DRAMMC_ROW12_MASK	0xc000	/* Row address bit for MD12 */
+#define   DRAMMC_ROW12_PA10	0x0000
+#define   DRAMMC_ROW12_PA21	0x4000	
+#define   DRAMMC_ROW12_PA23	0x8000
+#define	DRAMMC_ROW0_MASK	0x3000	/* Row address bit for MD0 */
+#define	  DRAMMC_ROW0_PA11	0x0000
+#define   DRAMMC_ROW0_PA22	0x1000
+#define   DRAMMC_ROW0_PA23	0x2000
+#define DRAMMC_ROW11		0x0800	/* Row address bit for MD11 PA20/PA22 */
+#define DRAMMC_ROW10		0x0400	/* Row address bit for MD10 PA19/PA21 */
+#define	DRAMMC_ROW9		0x0200	/* Row address bit for MD9  PA9/PA19  */
+#define DRAMMC_ROW8		0x0100	/* Row address bit for MD8  PA10/PA20 */
+#define DRAMMC_COL10		0x0080	/* Col address bit for MD10 PA11/PA0  */
+#define DRAMMC_COL9		0x0040	/* Col address bit for MD9  PA10/PA0  */
+#define DRAMMC_COL8		0x0020	/* Col address bit for MD8  PA9/PA0   */
+#define DRAMMC_REF_MASK		0x001f	/* Reresh Cycle */
+#define DRAMMC_REF_SHIFT	0
 
 /*
- * Get hypfs_diag0c_entry from CPU vector and store diag0c data
+ * DRAM Control Register
  */
-static void diag0c_fn(void *data)
-{
-	diag0c(((void **) data)[smp_processor_id()]);
-}
+#define DRAMC_ADDR	0xfffffc02
+#define DRAMC		WORD_REF(DRAMC_ADDR)
 
-/*
- * Allocate buffer and store diag 0c data
- */
-static void *diag0c_store(unsigned int *count)
-{
-	struct hypfs_diag0c_data *diag0c_data;
-	unsigned int cpu_count, cpu, i;
-	void **cpu_vec;
-
-	get_online_cpus();
-	cpu_count = num_online_cpus();
-	cpu_vec = kmalloc(sizeof(*cpu_vec) * num_possible_cpus(), GFP_KERNEL);
-	if (!cpu_vec)
-		goto fail_put_online_cpus;
-	/* Note: Diag 0c needs 8 byte alignment and real storage */
-	diag0c_data = kzalloc(sizeof(struct hypfs_diag0c_hdr) +
-			      cpu_count * sizeof(struct hypfs_diag0c_entry),
-			      GFP_KERNEL | GFP_DMA);
-	if (!diag0c_data)
-		goto fail_kfree_cpu_vec;
-	i = 0;
-	/* Fill CPU vector for each online CPU */
-	for_each_online_cpu(cpu) {
-		diag0c_data->entry[i].cpu = cpu;
-		cpu_vec[cpu] = &diag0c_data->entry[i++];
-	}
-	/* Collect data all CPUs */
-	on_each_cpu(diag0c_fn, cpu_vec, 1);
-	*count = cpu_count;
-	kfree(cpu_vec);
-	put_online_cpus();
-	return diag0c_data;
-
-fail_kfree_cpu_vec:
-	kfree(cpu_vec);
-fail_put_online_cpus:
-	put_online_cpus();
-	return ERR_PTR(-ENOMEM);
-}
-
-/*
- * Hypfs DBFS callback: Free diag 0c data
- */
-static void dbfs_diag0c_free(const void *data)
-{
-	kfree(data);
-}
-
-/*
- * Hypfs DBFS callback: Create diag 0c data
- */
-static int dbfs_diag0c_create(void **data, void **data_free_ptr, size_t *size)
-{
-	struct hypfs_diag0c_data *diag0c_data;
-	unsigned int count;
-
-	diag0c_data = diag0c_store(&count);
-	if (IS_ERR(diag0c_data))
-		return PTR_ERR(diag0c_data);
-	memset(&diag0c_data->hdr, 0, sizeof(diag0c_data->hdr));
-	get_tod_clock_ext(diag0c_data->hdr.tod_ext);
-	diag0c_data->hdr.len = count * sizeof(struct hypfs_diag0c_entry);
-	diag0c_data->hdr.version = DBFS_D0C_HDR_VERSION;
-	diag0c_data->hdr.count = count;
-	*data = diag0c_data;
-	*data_free_ptr = diag0c_data;
-	*size = diag0c_data->hdr.len + sizeof(struct hypfs_diag0c_hdr);
-	return 0;
-}
-
-/*
- * Hypfs DBFS file structure
- */
-static struct hypfs_dbfs_file dbfs_file_0c = {
-	.name		= "diag_0c",
-	.data_create	= dbfs_diag0c_create,
-	.data_free	= dbfs_diag0c_free,
-};
-
-/*
- * Initialize diag 0c interface for z/VM
- */
-int __init hypfs_diag0c_init(void)
-{
-	if (!MACHINE_IS_VM)
-		return 0;
-	return hypfs_dbfs_create_file(&dbfs_file_0c);
-}
-
-/*
- * Shutdown diag 0c interface for z/VM
- */
-void hypfs_diag0c_exit(void)
-{
-	if (!MACHINE_IS_VM)
-		return;
-	hypfs_dbfs_remove_file(&dbfs_file_0c);
-}
+#define DRAMC_DWE	   0x0001	/* DRAM Write Enable */
+#define DRAMC_RST	   0x0002	/* Reset Burst Refresh Enable */
+#define DRAMC_LPR	   0x0004	/* Low-Power Refresh Enable */
+#define DRAMC_SLW	   0x0008	/* Slow RAM */
+#define DRAMC_LSP	   0x0010	/* Light Sleep */
+#define DRAMC_MSW	   0x0020	/* Slow Multiplexing */
+#define DRAMC_WS_

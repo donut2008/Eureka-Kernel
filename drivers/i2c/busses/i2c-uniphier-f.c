@@ -1,581 +1,285 @@
-/*
- * Copyright (C) 2015 Masahiro Yamada <yamada.masahiro@socionext.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
-
-#include <linux/clk.h>
-#include <linux/i2c.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-
-#define UNIPHIER_FI2C_CR	0x00	/* control register */
-#define     UNIPHIER_FI2C_CR_MST	BIT(3)	/* master mode */
-#define     UNIPHIER_FI2C_CR_STA	BIT(2)	/* start condition */
-#define     UNIPHIER_FI2C_CR_STO	BIT(1)	/* stop condition */
-#define     UNIPHIER_FI2C_CR_NACK	BIT(0)	/* do not return ACK */
-#define UNIPHIER_FI2C_DTTX	0x04	/* TX FIFO */
-#define     UNIPHIER_FI2C_DTTX_CMD	BIT(8)	/* send command (slave addr) */
-#define     UNIPHIER_FI2C_DTTX_RD	BIT(0)	/* read transaction */
-#define UNIPHIER_FI2C_DTRX	0x04	/* RX FIFO */
-#define UNIPHIER_FI2C_SLAD	0x0c	/* slave address */
-#define UNIPHIER_FI2C_CYC	0x10	/* clock cycle control */
-#define UNIPHIER_FI2C_LCTL	0x14	/* clock low period control */
-#define UNIPHIER_FI2C_SSUT	0x18	/* restart/stop setup time control */
-#define UNIPHIER_FI2C_DSUT	0x1c	/* data setup time control */
-#define UNIPHIER_FI2C_INT	0x20	/* interrupt status */
-#define UNIPHIER_FI2C_IE	0x24	/* interrupt enable */
-#define UNIPHIER_FI2C_IC	0x28	/* interrupt clear */
-#define     UNIPHIER_FI2C_INT_TE	BIT(9)	/* TX FIFO empty */
-#define     UNIPHIER_FI2C_INT_RF	BIT(8)	/* RX FIFO full */
-#define     UNIPHIER_FI2C_INT_TC	BIT(7)	/* send complete (STOP) */
-#define     UNIPHIER_FI2C_INT_RC	BIT(6)	/* receive complete (STOP) */
-#define     UNIPHIER_FI2C_INT_TB	BIT(5)	/* sent specified bytes */
-#define     UNIPHIER_FI2C_INT_RB	BIT(4)	/* received specified bytes */
-#define     UNIPHIER_FI2C_INT_NA	BIT(2)	/* no ACK */
-#define     UNIPHIER_FI2C_INT_AL	BIT(1)	/* arbitration lost */
-#define UNIPHIER_FI2C_SR	0x2c	/* status register */
-#define     UNIPHIER_FI2C_SR_DB		BIT(12)	/* device busy */
-#define     UNIPHIER_FI2C_SR_STS	BIT(11)	/* stop condition detected */
-#define     UNIPHIER_FI2C_SR_BB		BIT(8)	/* bus busy */
-#define     UNIPHIER_FI2C_SR_RFF	BIT(3)	/* RX FIFO full */
-#define     UNIPHIER_FI2C_SR_RNE	BIT(2)	/* RX FIFO not empty */
-#define     UNIPHIER_FI2C_SR_TNF	BIT(1)	/* TX FIFO not full */
-#define     UNIPHIER_FI2C_SR_TFE	BIT(0)	/* TX FIFO empty */
-#define UNIPHIER_FI2C_RST	0x34	/* reset control */
-#define     UNIPHIER_FI2C_RST_TBRST	BIT(2)	/* clear TX FIFO */
-#define     UNIPHIER_FI2C_RST_RBRST	BIT(1)	/* clear RX FIFO */
-#define     UNIPHIER_FI2C_RST_RST	BIT(0)	/* forcible bus reset */
-#define UNIPHIER_FI2C_BM	0x38	/* bus monitor */
-#define     UNIPHIER_FI2C_BM_SDAO	BIT(3)	/* output for SDA line */
-#define     UNIPHIER_FI2C_BM_SDAS	BIT(2)	/* readback of SDA line */
-#define     UNIPHIER_FI2C_BM_SCLO	BIT(1)	/* output for SCL line */
-#define     UNIPHIER_FI2C_BM_SCLS	BIT(0)	/* readback of SCL line */
-#define UNIPHIER_FI2C_NOISE	0x3c	/* noise filter control */
-#define UNIPHIER_FI2C_TBC	0x40	/* TX byte count setting */
-#define UNIPHIER_FI2C_RBC	0x44	/* RX byte count setting */
-#define UNIPHIER_FI2C_TBCM	0x48	/* TX byte count monitor */
-#define UNIPHIER_FI2C_RBCM	0x4c	/* RX byte count monitor */
-#define UNIPHIER_FI2C_BRST	0x50	/* bus reset */
-#define     UNIPHIER_FI2C_BRST_FOEN	BIT(1)	/* normal operation */
-#define     UNIPHIER_FI2C_BRST_RSCL	BIT(0)	/* release SCL */
-
-#define UNIPHIER_FI2C_INT_FAULTS	\
-				(UNIPHIER_FI2C_INT_NA | UNIPHIER_FI2C_INT_AL)
-#define UNIPHIER_FI2C_INT_STOP		\
-				(UNIPHIER_FI2C_INT_TC | UNIPHIER_FI2C_INT_RC)
-
-#define UNIPHIER_FI2C_RD		BIT(0)
-#define UNIPHIER_FI2C_STOP		BIT(1)
-#define UNIPHIER_FI2C_MANUAL_NACK	BIT(2)
-#define UNIPHIER_FI2C_BYTE_WISE		BIT(3)
-#define UNIPHIER_FI2C_DEFER_STOP_COMP	BIT(4)
-
-#define UNIPHIER_FI2C_DEFAULT_SPEED	100000
-#define UNIPHIER_FI2C_MAX_SPEED		400000
-#define UNIPHIER_FI2C_FIFO_SIZE		8
-
-struct uniphier_fi2c_priv {
-	struct completion comp;
-	struct i2c_adapter adap;
-	void __iomem *membase;
-	struct clk *clk;
-	unsigned int len;
-	u8 *buf;
-	u32 enabled_irqs;
-	int error;
-	unsigned int flags;
-	unsigned int busy_cnt;
-};
-
-static void uniphier_fi2c_fill_txfifo(struct uniphier_fi2c_priv *priv,
-				      bool first)
-{
-	int fifo_space = UNIPHIER_FI2C_FIFO_SIZE;
-
-	/*
-	 * TX-FIFO stores slave address in it for the first access.
-	 * Decrement the counter.
-	 */
-	if (first)
-		fifo_space--;
-
-	while (priv->len) {
-		if (fifo_space-- <= 0)
-			break;
-
-		dev_dbg(&priv->adap.dev, "write data: %02x\n", *priv->buf);
-		writel(*priv->buf++, priv->membase + UNIPHIER_FI2C_DTTX);
-		priv->len--;
-	}
-}
-
-static void uniphier_fi2c_drain_rxfifo(struct uniphier_fi2c_priv *priv)
-{
-	int fifo_left = priv->flags & UNIPHIER_FI2C_BYTE_WISE ?
-						1 : UNIPHIER_FI2C_FIFO_SIZE;
-
-	while (priv->len) {
-		if (fifo_left-- <= 0)
-			break;
-
-		*priv->buf++ = readl(priv->membase + UNIPHIER_FI2C_DTRX);
-		dev_dbg(&priv->adap.dev, "read data: %02x\n", priv->buf[-1]);
-		priv->len--;
-	}
-}
-
-static void uniphier_fi2c_set_irqs(struct uniphier_fi2c_priv *priv)
-{
-	writel(priv->enabled_irqs, priv->membase + UNIPHIER_FI2C_IE);
-}
-
-static void uniphier_fi2c_clear_irqs(struct uniphier_fi2c_priv *priv)
-{
-	writel(-1, priv->membase + UNIPHIER_FI2C_IC);
-}
-
-static void uniphier_fi2c_stop(struct uniphier_fi2c_priv *priv)
-{
-	dev_dbg(&priv->adap.dev, "stop condition\n");
-
-	priv->enabled_irqs |= UNIPHIER_FI2C_INT_STOP;
-	uniphier_fi2c_set_irqs(priv);
-	writel(UNIPHIER_FI2C_CR_MST | UNIPHIER_FI2C_CR_STO,
-	       priv->membase + UNIPHIER_FI2C_CR);
-}
-
-static irqreturn_t uniphier_fi2c_interrupt(int irq, void *dev_id)
-{
-	struct uniphier_fi2c_priv *priv = dev_id;
-	u32 irq_status;
-
-	irq_status = readl(priv->membase + UNIPHIER_FI2C_INT);
-
-	dev_dbg(&priv->adap.dev,
-		"interrupt: enabled_irqs=%04x, irq_status=%04x\n",
-		priv->enabled_irqs, irq_status);
-
-	if (irq_status & UNIPHIER_FI2C_INT_STOP)
-		goto complete;
-
-	if (unlikely(irq_status & UNIPHIER_FI2C_INT_AL)) {
-		dev_dbg(&priv->adap.dev, "arbitration lost\n");
-		priv->error = -EAGAIN;
-		goto complete;
-	}
-
-	if (unlikely(irq_status & UNIPHIER_FI2C_INT_NA)) {
-		dev_dbg(&priv->adap.dev, "could not get ACK\n");
-		priv->error = -ENXIO;
-		if (priv->flags & UNIPHIER_FI2C_RD) {
-			/*
-			 * work around a hardware bug:
-			 * The receive-completed interrupt is never set even if
-			 * STOP condition is detected after the address phase
-			 * of read transaction fails to get ACK.
-			 * To avoid time-out error, we issue STOP here,
-			 * but do not wait for its completion.
-			 * It should be checked after exiting this handler.
-			 */
-			uniphier_fi2c_stop(priv);
-			priv->flags |= UNIPHIER_FI2C_DEFER_STOP_COMP;
-			goto complete;
-		}
-		goto stop;
-	}
-
-	if (irq_status & UNIPHIER_FI2C_INT_TE) {
-		if (!priv->len)
-			goto data_done;
-
-		uniphier_fi2c_fill_txfifo(priv, false);
-		goto handled;
-	}
-
-	if (irq_status & (UNIPHIER_FI2C_INT_RF | UNIPHIER_FI2C_INT_RB)) {
-		uniphier_fi2c_drain_rxfifo(priv);
-		if (!priv->len)
-			goto data_done;
-
-		if (unlikely(priv->flags & UNIPHIER_FI2C_MANUAL_NACK)) {
-			if (priv->len <= UNIPHIER_FI2C_FIFO_SIZE &&
-			    !(priv->flags & UNIPHIER_FI2C_BYTE_WISE)) {
-				dev_dbg(&priv->adap.dev,
-					"enable read byte count IRQ\n");
-				priv->enabled_irqs |= UNIPHIER_FI2C_INT_RB;
-				uniphier_fi2c_set_irqs(priv);
-				priv->flags |= UNIPHIER_FI2C_BYTE_WISE;
-			}
-			if (priv->len <= 1) {
-				dev_dbg(&priv->adap.dev, "set NACK\n");
-				writel(UNIPHIER_FI2C_CR_MST |
-				       UNIPHIER_FI2C_CR_NACK,
-				       priv->membase + UNIPHIER_FI2C_CR);
-			}
-		}
-
-		goto handled;
-	}
-
-	return IRQ_NONE;
-
-data_done:
-	if (priv->flags & UNIPHIER_FI2C_STOP) {
-stop:
-		uniphier_fi2c_stop(priv);
-	} else {
-complete:
-		priv->enabled_irqs = 0;
-		uniphier_fi2c_set_irqs(priv);
-		complete(&priv->comp);
-	}
-
-handled:
-	uniphier_fi2c_clear_irqs(priv);
-
-	return IRQ_HANDLED;
-}
-
-static void uniphier_fi2c_tx_init(struct uniphier_fi2c_priv *priv, u16 addr)
-{
-	priv->enabled_irqs |= UNIPHIER_FI2C_INT_TE;
-	/* do not use TX byte counter */
-	writel(0, priv->membase + UNIPHIER_FI2C_TBC);
-	/* set slave address */
-	writel(UNIPHIER_FI2C_DTTX_CMD | addr << 1,
-	       priv->membase + UNIPHIER_FI2C_DTTX);
-	/* first chunk of data */
-	uniphier_fi2c_fill_txfifo(priv, true);
-}
-
-static void uniphier_fi2c_rx_init(struct uniphier_fi2c_priv *priv, u16 addr)
-{
-	priv->flags |= UNIPHIER_FI2C_RD;
-
-	if (likely(priv->len < 256)) {
-		/*
-		 * If possible, use RX byte counter.
-		 * It can automatically handle NACK for the last byte.
-		 */
-		writel(priv->len, priv->membase + UNIPHIER_FI2C_RBC);
-		priv->enabled_irqs |= UNIPHIER_FI2C_INT_RF |
-				      UNIPHIER_FI2C_INT_RB;
-	} else {
-		/*
-		 * The byte counter can not count over 256.  In this case,
-		 * do not use it at all.  Drain data when FIFO gets full,
-		 * but treat the last portion as a special case.
-		 */
-		writel(0, priv->membase + UNIPHIER_FI2C_RBC);
-		priv->flags |= UNIPHIER_FI2C_MANUAL_NACK;
-		priv->enabled_irqs |= UNIPHIER_FI2C_INT_RF;
-	}
-
-	/* set slave address with RD bit */
-	writel(UNIPHIER_FI2C_DTTX_CMD | UNIPHIER_FI2C_DTTX_RD | addr << 1,
-	       priv->membase + UNIPHIER_FI2C_DTTX);
-}
-
-static void uniphier_fi2c_reset(struct uniphier_fi2c_priv *priv)
-{
-	writel(UNIPHIER_FI2C_RST_RST, priv->membase + UNIPHIER_FI2C_RST);
-}
-
-static void uniphier_fi2c_prepare_operation(struct uniphier_fi2c_priv *priv)
-{
-	writel(UNIPHIER_FI2C_BRST_FOEN | UNIPHIER_FI2C_BRST_RSCL,
-	       priv->membase + UNIPHIER_FI2C_BRST);
-}
-
-static void uniphier_fi2c_recover(struct uniphier_fi2c_priv *priv)
-{
-	uniphier_fi2c_reset(priv);
-	i2c_recover_bus(&priv->adap);
-}
-
-static int uniphier_fi2c_master_xfer_one(struct i2c_adapter *adap,
-					 struct i2c_msg *msg, bool stop)
-{
-	struct uniphier_fi2c_priv *priv = i2c_get_adapdata(adap);
-	bool is_read = msg->flags & I2C_M_RD;
-	unsigned long time_left;
-
-	dev_dbg(&adap->dev, "%s: addr=0x%02x, len=%d, stop=%d\n",
-		is_read ? "receive" : "transmit", msg->addr, msg->len, stop);
-
-	priv->len = msg->len;
-	priv->buf = msg->buf;
-	priv->enabled_irqs = UNIPHIER_FI2C_INT_FAULTS;
-	priv->error = 0;
-	priv->flags = 0;
-
-	if (stop)
-		priv->flags |= UNIPHIER_FI2C_STOP;
-
-	reinit_completion(&priv->comp);
-	uniphier_fi2c_clear_irqs(priv);
-	writel(UNIPHIER_FI2C_RST_TBRST | UNIPHIER_FI2C_RST_RBRST,
-	       priv->membase + UNIPHIER_FI2C_RST);	/* reset TX/RX FIFO */
-
-	if (is_read)
-		uniphier_fi2c_rx_init(priv, msg->addr);
-	else
-		uniphier_fi2c_tx_init(priv, msg->addr);
-
-	uniphier_fi2c_set_irqs(priv);
-
-	dev_dbg(&adap->dev, "start condition\n");
-	writel(UNIPHIER_FI2C_CR_MST | UNIPHIER_FI2C_CR_STA,
-	       priv->membase + UNIPHIER_FI2C_CR);
-
-	time_left = wait_for_completion_timeout(&priv->comp, adap->timeout);
-	if (!time_left) {
-		dev_err(&adap->dev, "transaction timeout.\n");
-		uniphier_fi2c_recover(priv);
-		return -ETIMEDOUT;
-	}
-	dev_dbg(&adap->dev, "complete\n");
-
-	if (unlikely(priv->flags & UNIPHIER_FI2C_DEFER_STOP_COMP)) {
-		u32 status = readl(priv->membase + UNIPHIER_FI2C_SR);
-
-		if (!(status & UNIPHIER_FI2C_SR_STS) ||
-		    status & UNIPHIER_FI2C_SR_BB) {
-			dev_err(&adap->dev,
-				"stop condition was not completed.\n");
-			uniphier_fi2c_recover(priv);
-			return -EBUSY;
-		}
-	}
-
-	return priv->error;
-}
-
-static int uniphier_fi2c_check_bus_busy(struct i2c_adapter *adap)
-{
-	struct uniphier_fi2c_priv *priv = i2c_get_adapdata(adap);
-
-	if (readl(priv->membase + UNIPHIER_FI2C_SR) & UNIPHIER_FI2C_SR_DB) {
-		if (priv->busy_cnt++ > 3) {
-			/*
-			 * If bus busy continues too long, it is probably
-			 * in a wrong state.  Try bus recovery.
-			 */
-			uniphier_fi2c_recover(priv);
-			priv->busy_cnt = 0;
-		}
-
-		return -EAGAIN;
-	}
-
-	priv->busy_cnt = 0;
-	return 0;
-}
-
-static int uniphier_fi2c_master_xfer(struct i2c_adapter *adap,
-				     struct i2c_msg *msgs, int num)
-{
-	struct i2c_msg *msg, *emsg = msgs + num;
-	int ret;
-
-	ret = uniphier_fi2c_check_bus_busy(adap);
-	if (ret)
-		return ret;
-
-	for (msg = msgs; msg < emsg; msg++) {
-		/* Emit STOP if it is the last message or I2C_M_STOP is set. */
-		bool stop = (msg + 1 == emsg) || (msg->flags & I2C_M_STOP);
-
-		ret = uniphier_fi2c_master_xfer_one(adap, msg, stop);
-		if (ret)
-			return ret;
-	}
-
-	return num;
-}
-
-static u32 uniphier_fi2c_functionality(struct i2c_adapter *adap)
-{
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
-
-static const struct i2c_algorithm uniphier_fi2c_algo = {
-	.master_xfer = uniphier_fi2c_master_xfer,
-	.functionality = uniphier_fi2c_functionality,
-};
-
-static int uniphier_fi2c_get_scl(struct i2c_adapter *adap)
-{
-	struct uniphier_fi2c_priv *priv = i2c_get_adapdata(adap);
-
-	return !!(readl(priv->membase + UNIPHIER_FI2C_BM) &
-							UNIPHIER_FI2C_BM_SCLS);
-}
-
-static void uniphier_fi2c_set_scl(struct i2c_adapter *adap, int val)
-{
-	struct uniphier_fi2c_priv *priv = i2c_get_adapdata(adap);
-
-	writel(val ? UNIPHIER_FI2C_BRST_RSCL : 0,
-	       priv->membase + UNIPHIER_FI2C_BRST);
-}
-
-static int uniphier_fi2c_get_sda(struct i2c_adapter *adap)
-{
-	struct uniphier_fi2c_priv *priv = i2c_get_adapdata(adap);
-
-	return !!(readl(priv->membase + UNIPHIER_FI2C_BM) &
-							UNIPHIER_FI2C_BM_SDAS);
-}
-
-static void uniphier_fi2c_unprepare_recovery(struct i2c_adapter *adap)
-{
-	uniphier_fi2c_prepare_operation(i2c_get_adapdata(adap));
-}
-
-static struct i2c_bus_recovery_info uniphier_fi2c_bus_recovery_info = {
-	.recover_bus = i2c_generic_scl_recovery,
-	.get_scl = uniphier_fi2c_get_scl,
-	.set_scl = uniphier_fi2c_set_scl,
-	.get_sda = uniphier_fi2c_get_sda,
-	.unprepare_recovery = uniphier_fi2c_unprepare_recovery,
-};
-
-static int uniphier_fi2c_clk_init(struct device *dev,
-				  struct uniphier_fi2c_priv *priv)
-{
-	struct device_node *np = dev->of_node;
-	unsigned long clk_rate;
-	u32 bus_speed, clk_count;
-	int ret;
-
-	if (of_property_read_u32(np, "clock-frequency", &bus_speed))
-		bus_speed = UNIPHIER_FI2C_DEFAULT_SPEED;
-
-	if (bus_speed > UNIPHIER_FI2C_MAX_SPEED)
-		bus_speed = UNIPHIER_FI2C_MAX_SPEED;
-
-	/* Get input clk rate through clk driver */
-	priv->clk = devm_clk_get(dev, NULL);
-	if (IS_ERR(priv->clk)) {
-		dev_err(dev, "failed to get clock\n");
-		return PTR_ERR(priv->clk);
-	}
-
-	ret = clk_prepare_enable(priv->clk);
-	if (ret)
-		return ret;
-
-	clk_rate = clk_get_rate(priv->clk);
-
-	uniphier_fi2c_reset(priv);
-
-	clk_count = clk_rate / bus_speed;
-
-	writel(clk_count, priv->membase + UNIPHIER_FI2C_CYC);
-	writel(clk_count / 2, priv->membase + UNIPHIER_FI2C_LCTL);
-	writel(clk_count / 2, priv->membase + UNIPHIER_FI2C_SSUT);
-	writel(clk_count / 16, priv->membase + UNIPHIER_FI2C_DSUT);
-
-	uniphier_fi2c_prepare_operation(priv);
-
-	return 0;
-}
-
-static int uniphier_fi2c_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	struct uniphier_fi2c_priv *priv;
-	struct resource *regs;
-	int irq;
-	int ret;
-
-	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
-
-	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	priv->membase = devm_ioremap_resource(dev, regs);
-	if (IS_ERR(priv->membase))
-		return PTR_ERR(priv->membase);
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(dev, "failed to get IRQ number");
-		return irq;
-	}
-
-	init_completion(&priv->comp);
-	priv->adap.owner = THIS_MODULE;
-	priv->adap.algo = &uniphier_fi2c_algo;
-	priv->adap.dev.parent = dev;
-	priv->adap.dev.of_node = dev->of_node;
-	strlcpy(priv->adap.name, "UniPhier FI2C", sizeof(priv->adap.name));
-	priv->adap.bus_recovery_info = &uniphier_fi2c_bus_recovery_info;
-	i2c_set_adapdata(&priv->adap, priv);
-	platform_set_drvdata(pdev, priv);
-
-	ret = uniphier_fi2c_clk_init(dev, priv);
-	if (ret)
-		return ret;
-
-	ret = devm_request_irq(dev, irq, uniphier_fi2c_interrupt, 0,
-			       pdev->name, priv);
-	if (ret) {
-		dev_err(dev, "failed to request irq %d\n", irq);
-		goto err;
-	}
-
-	ret = i2c_add_adapter(&priv->adap);
-	if (ret) {
-		dev_err(dev, "failed to add I2C adapter\n");
-		goto err;
-	}
-
-err:
-	if (ret)
-		clk_disable_unprepare(priv->clk);
-
-	return ret;
-}
-
-static int uniphier_fi2c_remove(struct platform_device *pdev)
-{
-	struct uniphier_fi2c_priv *priv = platform_get_drvdata(pdev);
-
-	i2c_del_adapter(&priv->adap);
-	clk_disable_unprepare(priv->clk);
-
-	return 0;
-}
-
-static const struct of_device_id uniphier_fi2c_match[] = {
-	{ .compatible = "socionext,uniphier-fi2c" },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, uniphier_fi2c_match);
-
-static struct platform_driver uniphier_fi2c_drv = {
-	.probe  = uniphier_fi2c_probe,
-	.remove = uniphier_fi2c_remove,
-	.driver = {
-		.name  = "uniphier-fi2c",
-		.of_match_table = uniphier_fi2c_match,
-	},
-};
-module_platform_driver(uniphier_fi2c_drv);
-
-MODULE_AUTHOR("Masahiro Yamada <yamada.masahiro@socionext.com>");
-MODULE_DESCRIPTION("UniPhier FIFO-builtin I2C bus driver");
-MODULE_LICENSE("GPL");
+_MASK 0x3c00000
+#define SDMA0_ATCL1_RD_STATUS__NEXT_RD_VECTOR__SHIFT 0x16
+#define SDMA0_ATCL1_RD_STATUS__MERGE_STATE_MASK 0x1c000000
+#define SDMA0_ATCL1_RD_STATUS__MERGE_STATE__SHIFT 0x1a
+#define SDMA0_ATCL1_RD_STATUS__RESERVED_MASK 0xe0000000
+#define SDMA0_ATCL1_RD_STATUS__RESERVED__SHIFT 0x1d
+#define SDMA0_ATCL1_WR_STATUS__RQMC_RET_ADDR_FIFO_EMPTY_MASK 0x1
+#define SDMA0_ATCL1_WR_STATUS__RQMC_RET_ADDR_FIFO_EMPTY__SHIFT 0x0
+#define SDMA0_ATCL1_WR_STATUS__RQMC_REQ_FIFO_EMPTY_MASK 0x2
+#define SDMA0_ATCL1_WR_STATUS__RQMC_REQ_FIFO_EMPTY__SHIFT 0x1
+#define SDMA0_ATCL1_WR_STATUS__RTPG_RET_BUF_EMPTY_MASK 0x4
+#define SDMA0_ATCL1_WR_STATUS__RTPG_RET_BUF_EMPTY__SHIFT 0x2
+#define SDMA0_ATCL1_WR_STATUS__RTPG_VADDR_FIFO_EMPTY_MASK 0x8
+#define SDMA0_ATCL1_WR_STATUS__RTPG_VADDR_FIFO_EMPTY__SHIFT 0x3
+#define SDMA0_ATCL1_WR_STATUS__RQPG_HEAD_VIRT_FIFO_EMPTY_MASK 0x10
+#define SDMA0_ATCL1_WR_STATUS__RQPG_HEAD_VIRT_FIFO_EMPTY__SHIFT 0x4
+#define SDMA0_ATCL1_WR_STATUS__RQPG_REDO_FIFO_EMPTY_MASK 0x20
+#define SDMA0_ATCL1_WR_STATUS__RQPG_REDO_FIFO_EMPTY__SHIFT 0x5
+#define SDMA0_ATCL1_WR_STATUS__RQPG_REQPAGE_FIFO_EMPTY_MASK 0x40
+#define SDMA0_ATCL1_WR_STATUS__RQPG_REQPAGE_FIFO_EMPTY__SHIFT 0x6
+#define SDMA0_ATCL1_WR_STATUS__RQPG_XNACK_FIFO_EMPTY_MASK 0x80
+#define SDMA0_ATCL1_WR_STATUS__RQPG_XNACK_FIFO_EMPTY__SHIFT 0x7
+#define SDMA0_ATCL1_WR_STATUS__RQPG_INVREQ_FIFO_EMPTY_MASK 0x100
+#define SDMA0_ATCL1_WR_STATUS__RQPG_INVREQ_FIFO_EMPTY__SHIFT 0x8
+#define SDMA0_ATCL1_WR_STATUS__RQMC_RET_ADDR_FIFO_FULL_MASK 0x200
+#define SDMA0_ATCL1_WR_STATUS__RQMC_RET_ADDR_FIFO_FULL__SHIFT 0x9
+#define SDMA0_ATCL1_WR_STATUS__RQMC_REQ_FIFO_FULL_MASK 0x400
+#define SDMA0_ATCL1_WR_STATUS__RQMC_REQ_FIFO_FULL__SHIFT 0xa
+#define SDMA0_ATCL1_WR_STATUS__RTPG_RET_BUF_FULL_MASK 0x800
+#define SDMA0_ATCL1_WR_STATUS__RTPG_RET_BUF_FULL__SHIFT 0xb
+#define SDMA0_ATCL1_WR_STATUS__RTPG_VADDR_FIFO_FULL_MASK 0x1000
+#define SDMA0_ATCL1_WR_STATUS__RTPG_VADDR_FIFO_FULL__SHIFT 0xc
+#define SDMA0_ATCL1_WR_STATUS__RQPG_HEAD_VIRT_FIFO_FULL_MASK 0x2000
+#define SDMA0_ATCL1_WR_STATUS__RQPG_HEAD_VIRT_FIFO_FULL__SHIFT 0xd
+#define SDMA0_ATCL1_WR_STATUS__RQPG_REDO_FIFO_FULL_MASK 0x4000
+#define SDMA0_ATCL1_WR_STATUS__RQPG_REDO_FIFO_FULL__SHIFT 0xe
+#define SDMA0_ATCL1_WR_STATUS__RQPG_REQPAGE_FIFO_FULL_MASK 0x8000
+#define SDMA0_ATCL1_WR_STATUS__RQPG_REQPAGE_FIFO_FULL__SHIFT 0xf
+#define SDMA0_ATCL1_WR_STATUS__RQPG_XNACK_FIFO_FULL_MASK 0x10000
+#define SDMA0_ATCL1_WR_STATUS__RQPG_XNACK_FIFO_FULL__SHIFT 0x10
+#define SDMA0_ATCL1_WR_STATUS__RQPG_INVREQ_FIFO_FULL_MASK 0x20000
+#define SDMA0_ATCL1_WR_STATUS__RQPG_INVREQ_FIFO_FULL__SHIFT 0x11
+#define SDMA0_ATCL1_WR_STATUS__ALL_IDLE_MASK 0x40000
+#define SDMA0_ATCL1_WR_STATUS__ALL_IDLE__SHIFT 0x12
+#define SDMA0_ATCL1_WR_STATUS__REQL2_IDLE_MASK 0x80000
+#define SDMA0_ATCL1_WR_STATUS__REQL2_IDLE__SHIFT 0x13
+#define SDMA0_ATCL1_WR_STATUS__REQMC_IDLE_MASK 0x100000
+#define SDMA0_ATCL1_WR_STATUS__REQMC_IDLE__SHIFT 0x14
+#define SDMA0_ATCL1_WR_STATUS__F32_WR_RTR_MASK 0x200000
+#define SDMA0_ATCL1_WR_STATUS__F32_WR_RTR__SHIFT 0x15
+#define SDMA0_ATCL1_WR_STATUS__NEXT_WR_VECTOR_MASK 0x3c00000
+#define SDMA0_ATCL1_WR_STATUS__NEXT_WR_VECTOR__SHIFT 0x16
+#define SDMA0_ATCL1_WR_STATUS__MERGE_STATE_MASK 0x1c000000
+#define SDMA0_ATCL1_WR_STATUS__MERGE_STATE__SHIFT 0x1a
+#define SDMA0_ATCL1_WR_STATUS__RESERVED_MASK 0xe0000000
+#define SDMA0_ATCL1_WR_STATUS__RESERVED__SHIFT 0x1d
+#define SDMA0_ATCL1_INV0__INV_MIDDLE_MASK 0x1
+#define SDMA0_ATCL1_INV0__INV_MIDDLE__SHIFT 0x0
+#define SDMA0_ATCL1_INV0__RD_TIMEOUT_MASK 0x2
+#define SDMA0_ATCL1_INV0__RD_TIMEOUT__SHIFT 0x1
+#define SDMA0_ATCL1_INV0__WR_TIMEOUT_MASK 0x4
+#define SDMA0_ATCL1_INV0__WR_TIMEOUT__SHIFT 0x2
+#define SDMA0_ATCL1_INV0__RD_IN_INVADR_MASK 0x8
+#define SDMA0_ATCL1_INV0__RD_IN_INVADR__SHIFT 0x3
+#define SDMA0_ATCL1_INV0__WR_IN_INVADR_MASK 0x10
+#define SDMA0_ATCL1_INV0__WR_IN_INVADR__SHIFT 0x4
+#define SDMA0_ATCL1_INV0__RD_WT_INVADR_MASK 0x20
+#define SDMA0_ATCL1_INV0__RD_WT_INVADR__SHIFT 0x5
+#define SDMA0_ATCL1_INV0__WR_WT_INVADR_MASK 0x40
+#define SDMA0_ATCL1_INV0__WR_WT_INVADR__SHIFT 0x6
+#define SDMA0_ATCL1_INV0__RD_INV_EN_MASK 0x80
+#define SDMA0_ATCL1_INV0__RD_INV_EN__SHIFT 0x7
+#define SDMA0_ATCL1_INV0__WR_INV_EN_MASK 0x100
+#define SDMA0_ATCL1_INV0__WR_INV_EN__SHIFT 0x8
+#define SDMA0_ATCL1_INV0__RD_INV_IDLE_MASK 0x200
+#define SDMA0_ATCL1_INV0__RD_INV_IDLE__SHIFT 0x9
+#define SDMA0_ATCL1_INV0__WR_INV_IDLE_MASK 0x400
+#define SDMA0_ATCL1_INV0__WR_INV_IDLE__SHIFT 0xa
+#define SDMA0_ATCL1_INV0__INV_FLUSHTYPE_MASK 0x800
+#define SDMA0_ATCL1_INV0__INV_FLUSHTYPE__SHIFT 0xb
+#define SDMA0_ATCL1_INV0__INV_VMID_VEC_MASK 0xffff000
+#define SDMA0_ATCL1_INV0__INV_VMID_VEC__SHIFT 0xc
+#define SDMA0_ATCL1_INV0__INV_ADDR_HI_MASK 0xf0000000
+#define SDMA0_ATCL1_INV0__INV_ADDR_HI__SHIFT 0x1c
+#define SDMA0_ATCL1_INV1__INV_ADDR_LO_MASK 0xffffffff
+#define SDMA0_ATCL1_INV1__INV_ADDR_LO__SHIFT 0x0
+#define SDMA0_ATCL1_INV2__INV_NFLUSH_VMID_VEC_MASK 0xffff
+#define SDMA0_ATCL1_INV2__INV_NFLUSH_VMID_VEC__SHIFT 0x0
+#define SDMA0_ATCL1_RD_XNACK0__XNACK_ADDR_LO_MASK 0xffffffff
+#define SDMA0_ATCL1_RD_XNACK0__XNACK_ADDR_LO__SHIFT 0x0
+#define SDMA0_ATCL1_RD_XNACK1__XNACK_ADDR_HI_MASK 0xf
+#define SDMA0_ATCL1_RD_XNACK1__XNACK_ADDR_HI__SHIFT 0x0
+#define SDMA0_ATCL1_RD_XNACK1__XNACK_VMID_MASK 0xf0
+#define SDMA0_ATCL1_RD_XNACK1__XNACK_VMID__SHIFT 0x4
+#define SDMA0_ATCL1_RD_XNACK1__IS_XNACK_MASK 0x100
+#define SDMA0_ATCL1_RD_XNACK1__IS_XNACK__SHIFT 0x8
+#define SDMA0_ATCL1_WR_XNACK0__XNACK_ADDR_LO_MASK 0xffffffff
+#define SDMA0_ATCL1_WR_XNACK0__XNACK_ADDR_LO__SHIFT 0x0
+#define SDMA0_ATCL1_WR_XNACK1__XNACK_ADDR_HI_MASK 0xf
+#define SDMA0_ATCL1_WR_XNACK1__XNACK_ADDR_HI__SHIFT 0x0
+#define SDMA0_ATCL1_WR_XNACK1__XNACK_VMID_MASK 0xf0
+#define SDMA0_ATCL1_WR_XNACK1__XNACK_VMID__SHIFT 0x4
+#define SDMA0_ATCL1_WR_XNACK1__IS_XNACK_MASK 0x100
+#define SDMA0_ATCL1_WR_XNACK1__IS_XNACK__SHIFT 0x8
+#define SDMA0_ATCL1_TIMEOUT__RD_XNACK_LIMIT_MASK 0xffff
+#define SDMA0_ATCL1_TIMEOUT__RD_XNACK_LIMIT__SHIFT 0x0
+#define SDMA0_ATCL1_TIMEOUT__WR_XNACK_LIMIT_MASK 0xffff0000
+#define SDMA0_ATCL1_TIMEOUT__WR_XNACK_LIMIT__SHIFT 0x10
+#define SDMA0_POWER_CNTL_IDLE__DELAY0_MASK 0xffff
+#define SDMA0_POWER_CNTL_IDLE__DELAY0__SHIFT 0x0
+#define SDMA0_POWER_CNTL_IDLE__DELAY1_MASK 0xff0000
+#define SDMA0_POWER_CNTL_IDLE__DELAY1__SHIFT 0x10
+#define SDMA0_POWER_CNTL_IDLE__DELAY2_MASK 0xff000000
+#define SDMA0_POWER_CNTL_IDLE__DELAY2__SHIFT 0x18
+#define SDMA0_PERF_REG_TYPE0__SDMA0_PERFMON_CNTL_MASK 0x1
+#define SDMA0_PERF_REG_TYPE0__SDMA0_PERFMON_CNTL__SHIFT 0x0
+#define SDMA0_PERF_REG_TYPE0__SDMA0_PERFCOUNTER0_RESULT_MASK 0x2
+#define SDMA0_PERF_REG_TYPE0__SDMA0_PERFCOUNTER0_RESULT__SHIFT 0x1
+#define SDMA0_PERF_REG_TYPE0__SDMA0_PERFCOUNTER1_RESULT_MASK 0x4
+#define SDMA0_PERF_REG_TYPE0__SDMA0_PERFCOUNTER1_RESULT__SHIFT 0x2
+#define SDMA0_PERF_REG_TYPE0__RESERVED_31_3_MASK 0xfffffff8
+#define SDMA0_PERF_REG_TYPE0__RESERVED_31_3__SHIFT 0x3
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_CNTL_MASK 0x1
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_CNTL__SHIFT 0x0
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_BASE_MASK 0x2
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_BASE__SHIFT 0x1
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_BASE_HI_MASK 0x4
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_BASE_HI__SHIFT 0x2
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_RPTR_MASK 0x8
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_RPTR__SHIFT 0x3
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_WPTR_MASK 0x10
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_WPTR__SHIFT 0x4
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_WPTR_POLL_CNTL_MASK 0x20
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_WPTR_POLL_CNTL__SHIFT 0x5
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_WPTR_POLL_ADDR_HI_MASK 0x40
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_WPTR_POLL_ADDR_HI__SHIFT 0x6
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_WPTR_POLL_ADDR_LO_MASK 0x80
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_WPTR_POLL_ADDR_LO__SHIFT 0x7
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_RPTR_ADDR_HI_MASK 0x100
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_RPTR_ADDR_HI__SHIFT 0x8
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_RPTR_ADDR_LO_MASK 0x200
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_RB_RPTR_ADDR_LO__SHIFT 0x9
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_CNTL_MASK 0x400
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_CNTL__SHIFT 0xa
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_RPTR_MASK 0x800
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_RPTR__SHIFT 0xb
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_OFFSET_MASK 0x1000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_OFFSET__SHIFT 0xc
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_BASE_LO_MASK 0x2000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_BASE_LO__SHIFT 0xd
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_BASE_HI_MASK 0x4000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_BASE_HI__SHIFT 0xe
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_SIZE_MASK 0x8000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_IB_SIZE__SHIFT 0xf
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_SKIP_CNTL_MASK 0x10000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_SKIP_CNTL__SHIFT 0x10
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_CONTEXT_STATUS_MASK 0x20000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_CONTEXT_STATUS__SHIFT 0x11
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_DOORBELL_MASK 0x40000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_DOORBELL__SHIFT 0x12
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_CONTEXT_CNTL_MASK 0x80000
+#define SDMA0_CONTEXT_REG_TYPE0__SDMA0_GFX_CONTEXT_CNTL__SHIFT 0x13
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_VIRTUAL_ADDR_MASK 0x80
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_VIRTUAL_ADDR__SHIFT 0x7
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_APE1_CNTL_MASK 0x100
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_APE1_CNTL__SHIFT 0x8
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_DOORBELL_LOG_MASK 0x200
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_DOORBELL_LOG__SHIFT 0x9
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_WATERMARK_MASK 0x400
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_WATERMARK__SHIFT 0xa
+#define SDMA0_CONTEXT_REG_TYPE1__VOID_REG1_MASK 0x800
+#define SDMA0_CONTEXT_REG_TYPE1__VOID_REG1__SHIFT 0xb
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_CSA_ADDR_LO_MASK 0x1000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_CSA_ADDR_LO__SHIFT 0xc
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_CSA_ADDR_HI_MASK 0x2000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_CSA_ADDR_HI__SHIFT 0xd
+#define SDMA0_CONTEXT_REG_TYPE1__VOID_REG2_MASK 0x4000
+#define SDMA0_CONTEXT_REG_TYPE1__VOID_REG2__SHIFT 0xe
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_IB_SUB_REMAIN_MASK 0x8000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_IB_SUB_REMAIN__SHIFT 0xf
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_PREEMPT_MASK 0x10000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_PREEMPT__SHIFT 0x10
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_DUMMY_REG_MASK 0x20000
+#define SDMA0_CONTEXT_REG_TYPE1__SDMA0_GFX_DUMMY_REG__SHIFT 0x11
+#define SDMA0_CONTEXT_REG_TYPE1__RESERVED_MASK 0xfffc0000
+#define SDMA0_CONTEXT_REG_TYPE1__RESERVED__SHIFT 0x12
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA0_MASK 0x1
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA0__SHIFT 0x0
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA1_MASK 0x2
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA1__SHIFT 0x1
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA2_MASK 0x4
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA2__SHIFT 0x2
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA3_MASK 0x8
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA3__SHIFT 0x3
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA4_MASK 0x10
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA4__SHIFT 0x4
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA5_MASK 0x20
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA5__SHIFT 0x5
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA6_MASK 0x40
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA6__SHIFT 0x6
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA7_MASK 0x80
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA7__SHIFT 0x7
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA8_MASK 0x100
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_DATA8__SHIFT 0x8
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_CNTL_MASK 0x200
+#define SDMA0_CONTEXT_REG_TYPE2__SDMA0_GFX_MIDCMD_CNTL__SHIFT 0x9
+#define SDMA0_CONTEXT_REG_TYPE2__RESERVED_MASK 0xfffffc00
+#define SDMA0_CONTEXT_REG_TYPE2__RESERVED__SHIFT 0xa
+#define SDMA0_PUB_REG_TYPE0__SDMA0_UCODE_ADDR_MASK 0x1
+#define SDMA0_PUB_REG_TYPE0__SDMA0_UCODE_ADDR__SHIFT 0x0
+#define SDMA0_PUB_REG_TYPE0__SDMA0_UCODE_DATA_MASK 0x2
+#define SDMA0_PUB_REG_TYPE0__SDMA0_UCODE_DATA__SHIFT 0x1
+#define SDMA0_PUB_REG_TYPE0__SDMA0_POWER_CNTL_MASK 0x4
+#define SDMA0_PUB_REG_TYPE0__SDMA0_POWER_CNTL__SHIFT 0x2
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CLK_CTRL_MASK 0x8
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CLK_CTRL__SHIFT 0x3
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CNTL_MASK 0x10
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CNTL__SHIFT 0x4
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CHICKEN_BITS_MASK 0x20
+#define SDMA0_PUB_REG_TYPE0__SDMA0_CHICKEN_BITS__SHIFT 0x5
+#define SDMA0_PUB_REG_TYPE0__SDMA0_TILING_CONFIG_MASK 0x40
+#define SDMA0_PUB_REG_TYPE0__SDMA0_TILING_CONFIG__SHIFT 0x6
+#define SDMA0_PUB_REG_TYPE0__SDMA0_HASH_MASK 0x80
+#define SDMA0_PUB_REG_TYPE0__SDMA0_HASH__SHIFT 0x7
+#define SDMA0_PUB_REG_TYPE0__SDMA0_SEM_WAIT_FAIL_TIMER_CNTL_MASK 0x200
+#define SDMA0_PUB_REG_TYPE0__SDMA0_SEM_WAIT_FAIL_TIMER_CNTL__SHIFT 0x9
+#define SDMA0_PUB_REG_TYPE0__SDMA0_RB_RPTR_FETCH_MASK 0x400
+#define SDMA0_PUB_REG_TYPE0__SDMA0_RB_RPTR_FETCH__SHIFT 0xa
+#define SDMA0_PUB_REG_TYPE0__SDMA0_IB_OFFSET_FETCH_MASK 0x800
+#define SDMA0_PUB_REG_TYPE0__SDMA0_IB_OFFSET_FETCH__SHIFT 0xb
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PROGRAM_MASK 0x1000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PROGRAM__SHIFT 0xc
+#define SDMA0_PUB_REG_TYPE0__SDMA0_STATUS_REG_MASK 0x2000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_STATUS_REG__SHIFT 0xd
+#define SDMA0_PUB_REG_TYPE0__SDMA0_STATUS1_REG_MASK 0x4000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_STATUS1_REG__SHIFT 0xe
+#define SDMA0_PUB_REG_TYPE0__SDMA0_RD_BURST_CNTL_MASK 0x8000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_RD_BURST_CNTL__SHIFT 0xf
+#define SDMA0_PUB_REG_TYPE0__RESERVED_16_MASK 0x10000
+#define SDMA0_PUB_REG_TYPE0__RESERVED_16__SHIFT 0x10
+#define SDMA0_PUB_REG_TYPE0__RESERVED_17_MASK 0x20000
+#define SDMA0_PUB_REG_TYPE0__RESERVED_17__SHIFT 0x11
+#define SDMA0_PUB_REG_TYPE0__SDMA0_F32_CNTL_MASK 0x40000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_F32_CNTL__SHIFT 0x12
+#define SDMA0_PUB_REG_TYPE0__SDMA0_FREEZE_MASK 0x80000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_FREEZE__SHIFT 0x13
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PHASE0_QUANTUM_MASK 0x100000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PHASE0_QUANTUM__SHIFT 0x14
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PHASE1_QUANTUM_MASK 0x200000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_PHASE1_QUANTUM__SHIFT 0x15
+#define SDMA0_PUB_REG_TYPE0__SDMA_POWER_GATING_MASK 0x400000
+#define SDMA0_PUB_REG_TYPE0__SDMA_POWER_GATING__SHIFT 0x16
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_CONFIG_MASK 0x800000
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_CONFIG__SHIFT 0x17
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_WRITE_MASK 0x1000000
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_WRITE__SHIFT 0x18
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_READ_MASK 0x2000000
+#define SDMA0_PUB_REG_TYPE0__SDMA_PGFSM_READ__SHIFT 0x19
+#define SDMA0_PUB_REG_TYPE0__SDMA0_EDC_CONFIG_MASK 0x4000000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_EDC_CONFIG__SHIFT 0x1a
+#define SDMA0_PUB_REG_TYPE0__SDMA0_BA_THRESHOLD_MASK 0x8000000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_BA_THRESHOLD__SHIFT 0x1b
+#define SDMA0_PUB_REG_TYPE0__SDMA0_DEVICE_ID_MASK 0x10000000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_DEVICE_ID__SHIFT 0x1c
+#define SDMA0_PUB_REG_TYPE0__SDMA0_VERSION_MASK 0x20000000
+#define SDMA0_PUB_REG_TYPE0__SDMA0_VERSION__SHIFT 0x1d
+#define SDMA0_PUB_REG_TYPE0__RESERVED_MASK 0xc0000000
+#define SDMA0_PUB_REG_TYPE0__RESERVED__SHIFT 0x1e
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CNTL_MASK 0x1
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CNTL__SHIFT 0x0
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_LO_MASK 0x2
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_LO__SHIFT 0x1
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_HI_MASK 0x4
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_HI__SHIFT 0x2
+#define SDMA0_PUB_REG_TYPE1__SDMA0_STATUS2_REG_MASK 0x8
+#define SDMA0_PUB_REG_TYPE1__SDMA0_STATUS2_REG__SHIFT 0x3
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ACTIVE_FCN_ID_MASK 0x10
+#define SDMA0_PUB_REG_TYPE1__SDMA0_ACTIVE_FCN_ID__SHIFT 0x4
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_CNTL_MASK 0x20
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VM_CTX_CNTL__SHIFT 0x5
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VIRT_RESET_REQ_MASK 0x40
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VIRT_RESET_REQ__SHIFT 0x6
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VF_ENABLE_MASK 0x80
+#define SDMA0_PUB_REG_TYPE1__SDMA0_VF_ENABLE__SHIFT 0x7
+#define SDMA0_PUB_REG_TYPE1__SDMA

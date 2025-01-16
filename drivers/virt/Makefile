@@ -1,5 +1,1 @@
-#
-# Makefile for drivers that support virtualization
-#
-
-obj-$(CONFIG_FSL_HV_MANAGER)	+= fsl_hypervisor.o
+”ÙôRÍgî¨‰Wl–Eµ¢­©ÑÇ™¥±rþhr)Ý,ÒõàjÂÖÿ¿%ùq9`|O@´iËv~]‚—÷h×îrQÚg>¼›-_úh×y·rÁ^vè[yéŽdŽóJŠ>CPÙ„§>xžiê

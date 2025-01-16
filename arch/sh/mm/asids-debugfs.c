@@ -1,75 +1,80 @@
-/*
- * debugfs ops for process ASIDs
- *
- *  Copyright (C) 2000, 2001  Paolo Alberelli
- *  Copyright (C) 2003 - 2008  Paul Mundt
- *  Copyright (C) 2003, 2004  Richard Curnow
- *
- * Provides a debugfs file that lists out the ASIDs currently associated
- * with the processes.
- *
- * In the SH-5 case, if the DM.PC register is examined through the debug
- * link, this shows ASID + PC. To make use of this, the PID->ASID
- * relationship needs to be known. This is primarily for debugging.
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
+ible.
  */
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
-#include <linux/spinlock.h>
-#include <asm/processor.h>
-#include <asm/mmu_context.h>
+typedef struct ia64_ptce_info_s {
+	unsigned long	base;
+	u32		count[2];
+	u32		stride[2];
+} ia64_ptce_info_t;
 
-static int asids_seq_show(struct seq_file *file, void *iter)
+/* Return the information required for the architected loop used to purge
+ * (initialize) the entire TC
+ */
+static inline s64
+ia64_get_ptce (ia64_ptce_info_t *ptce)
 {
-	struct task_struct *p;
+	struct ia64_pal_retval iprv;
 
-	read_lock(&tasklist_lock);
+	if (!ptce)
+		return -1;
 
-	for_each_process(p) {
-		int pid = p->pid;
-
-		if (unlikely(!pid))
-			continue;
-
-		if (p->mm)
-			seq_printf(file, "%5d : %04lx\n", pid,
-				   cpu_asid(smp_processor_id(), p->mm));
+	PAL_CALL(iprv, PAL_PTCE_INFO, 0, 0, 0);
+	if (iprv.status == 0) {
+		ptce->base = iprv.v0;
+		ptce->count[0] = iprv.v1 >> 32;
+		ptce->count[1] = iprv.v1 & 0xffffffff;
+		ptce->stride[0] = iprv.v2 >> 32;
+		ptce->stride[1] = iprv.v2 & 0xffffffff;
 	}
-
-	read_unlock(&tasklist_lock);
-
-	return 0;
+	return iprv.status;
 }
 
-static int asids_debugfs_open(struct inode *inode, struct file *file)
+/* Return info about implemented application and control registers. */
+static inline s64
+ia64_pal_register_info (u64 info_request, u64 *reg_info_1, u64 *reg_info_2)
 {
-	return single_open(file, asids_seq_show, inode->i_private);
+	struct ia64_pal_retval iprv;
+	PAL_CALL(iprv, PAL_REGISTER_INFO, info_request, 0, 0);
+	if (reg_info_1)
+		*reg_info_1 = iprv.v0;
+	if (reg_info_2)
+		*reg_info_2 = iprv.v1;
+	return iprv.status;
 }
 
-static const struct file_operations asids_debugfs_fops = {
-	.owner		= THIS_MODULE,
-	.open		= asids_debugfs_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
+typedef union pal_hints_u {
+	unsigned long		ph_data;
+	struct {
+	       unsigned long	si		: 1,
+				li		: 1,
+				reserved	: 62;
+	} pal_hints_s;
+} pal_hints_u_t;
 
-static int __init asids_debugfs_init(void)
+/* Return information about the register stack and RSE for this processor
+ * implementation.
+ */
+static inline long ia64_pal_rse_info(unsigned long *num_phys_stacked,
+							pal_hints_u_t *hints)
 {
-	struct dentry *asids_dentry;
-
-	asids_dentry = debugfs_create_file("asids", S_IRUSR, arch_debugfs_dir,
-					   NULL, &asids_debugfs_fops);
-	if (!asids_dentry)
-		return -ENOMEM;
-
-	return PTR_ERR_OR_ZERO(asids_dentry);
+	struct ia64_pal_retval iprv;
+	PAL_CALL(iprv, PAL_RSE_INFO, 0, 0, 0);
+	if (num_phys_stacked)
+		*num_phys_stacked = iprv.v0;
+	if (hints)
+		hints->ph_data = iprv.v1;
+	return iprv.status;
 }
-module_init(asids_debugfs_init);
 
-MODULE_LICENSE("GPL v2");
+/*
+ * Set the current hardware resource sharing policy of the processor
+ */
+static inline s64
+ia64_pal_set_hw_policy (u64 policy)
+{
+	struct ia64_pal_retval iprv;
+	PAL_CALL(iprv, PAL_SET_HW_POLICY, policy, 0, 0);
+	return iprv.status;
+}
+
+/* Cause the processor to enter	SHUTDOWN state, where prefetching and execution are
+ * sus

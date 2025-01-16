@@ -1,349 +1,257 @@
 /*
- * reg-virtual-consumer.c
+ * runtime-wrappers.c - Runtime Services function call wrappers
  *
- * Copyright 2008 Wolfson Microelectronics PLC.
+ * Copyright (C) 2014 Linaro Ltd. <ard.biesheuvel@linaro.org>
  *
- * Author: Mark Brown <broonie@opensource.wolfsonmicro.com>
+ * Split off from arch/x86/platform/efi/efi.c
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation; either version 2 of the
- * License, or (at your option) any later version.
+ * Copyright (C) 1999 VA Linux Systems
+ * Copyright (C) 1999 Walt Drummond <drummond@valinux.com>
+ * Copyright (C) 1999-2002 Hewlett-Packard Co.
+ * Copyright (C) 2005-2008 Intel Co.
+ * Copyright (C) 2013 SuSE Labs
+ *
+ * This file is released under the GPLv2.
  */
 
-#include <linux/err.h>
+#include <linux/bug.h>
+#include <linux/efi.h>
 #include <linux/mutex.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/consumer.h>
-#include <linux/slab.h>
-#include <linux/module.h>
+#include <linux/spinlock.h>
+#include <asm/efi.h>
 
-struct virtual_consumer_data {
-	struct mutex lock;
-	struct regulator *regulator;
-	bool enabled;
-	int min_uV;
-	int max_uV;
-	int min_uA;
-	int max_uA;
-	unsigned int mode;
-};
+/*
+ * According to section 7.1 of the UEFI spec, Runtime Services are not fully
+ * reentrant, and there are particular combinations of calls that need to be
+ * serialized. (source: UEFI Specification v2.4A)
+ *
+ * Table 31. Rules for Reentry Into Runtime Services
+ * +------------------------------------+-------------------------------+
+ * | If previous call is busy in	| Forbidden to call		|
+ * +------------------------------------+-------------------------------+
+ * | Any				| SetVirtualAddressMap()	|
+ * +------------------------------------+-------------------------------+
+ * | ConvertPointer()			| ConvertPointer()		|
+ * +------------------------------------+-------------------------------+
+ * | SetVariable()			| ResetSystem()			|
+ * | UpdateCapsule()			|				|
+ * | SetTime()				|				|
+ * | SetWakeupTime()			|				|
+ * | GetNextHighMonotonicCount()	|				|
+ * +------------------------------------+-------------------------------+
+ * | GetVariable()			| GetVariable()			|
+ * | GetNextVariableName()		| GetNextVariableName()		|
+ * | SetVariable()			| SetVariable()			|
+ * | QueryVariableInfo()		| QueryVariableInfo()		|
+ * | UpdateCapsule()			| UpdateCapsule()		|
+ * | QueryCapsuleCapabilities()		| QueryCapsuleCapabilities()	|
+ * | GetNextHighMonotonicCount()	| GetNextHighMonotonicCount()	|
+ * +------------------------------------+-------------------------------+
+ * | GetTime()				| GetTime()			|
+ * | SetTime()				| SetTime()			|
+ * | GetWakeupTime()			| GetWakeupTime()		|
+ * | SetWakeupTime()			| SetWakeupTime()		|
+ * +------------------------------------+-------------------------------+
+ *
+ * Due to the fact that the EFI pstore may write to the variable store in
+ * interrupt context, we need to use a spinlock for at least the groups that
+ * contain SetVariable() and QueryVariableInfo(). That leaves little else, as
+ * none of the remaining functions are actually ever called at runtime.
+ * So let's just use a single spinlock to serialize all Runtime Services calls.
+ */
+static DEFINE_SPINLOCK(efi_runtime_lock);
 
-static void update_voltage_constraints(struct device *dev,
-				       struct virtual_consumer_data *data)
+/*
+ * Some runtime services calls can be reentrant under NMI, even if the table
+ * above says they are not. (source: UEFI Specification v2.4A)
+ *
+ * Table 32. Functions that may be called after Machine Check, INIT and NMI
+ * +----------------------------+------------------------------------------+
+ * | Function			| Called after Machine Check, INIT and NMI |
+ * +----------------------------+------------------------------------------+
+ * | GetTime()			| Yes, even if previously busy.		   |
+ * | GetVariable()		| Yes, even if previously busy		   |
+ * | GetNextVariableName()	| Yes, even if previously busy		   |
+ * | QueryVariableInfo()	| Yes, even if previously busy		   |
+ * | SetVariable()		| Yes, even if previously busy		   |
+ * | UpdateCapsule()		| Yes, even if previously busy		   |
+ * | QueryCapsuleCapabilities()	| Yes, even if previously busy		   |
+ * | ResetSystem()		| Yes, even if previously busy		   |
+ * +----------------------------+------------------------------------------+
+ *
+ * In order to prevent deadlocks under NMI, the wrappers for these functions
+ * may only grab the efi_runtime_lock or rtc_lock spinlocks if !efi_in_nmi().
+ * However, not all of the services listed are reachable through NMI code paths,
+ * so the the special handling as suggested by the UEFI spec is only implemented
+ * for QueryVariableInfo() and SetVariable(), as these can be reached in NMI
+ * context through efi_pstore_write().
+ */
+
+/*
+ * As per commit ef68c8f87ed1 ("x86: Serialize EFI time accesses on rtc_lock"),
+ * the EFI specification requires that callers of the time related runtime
+ * functions serialize with other CMOS accesses in the kernel, as the EFI time
+ * functions may choose to also use the legacy CMOS RTC.
+ */
+__weak DEFINE_SPINLOCK(rtc_lock);
+
+static efi_status_t virt_efi_get_time(efi_time_t *tm, efi_time_cap_t *tc)
 {
-	int ret;
+	unsigned long flags;
+	efi_status_t status;
 
-	if (data->min_uV && data->max_uV
-	    && data->min_uV <= data->max_uV) {
-		dev_dbg(dev, "Requesting %d-%duV\n",
-			data->min_uV, data->max_uV);
-		ret = regulator_set_voltage(data->regulator,
-					data->min_uV, data->max_uV);
-		if (ret != 0) {
-			dev_err(dev,
-				"regulator_set_voltage() failed: %d\n", ret);
-			return;
-		}
-	}
-
-	if (data->min_uV && data->max_uV && !data->enabled) {
-		dev_dbg(dev, "Enabling regulator\n");
-		ret = regulator_enable(data->regulator);
-		if (ret == 0)
-			data->enabled = true;
-		else
-			dev_err(dev, "regulator_enable() failed: %d\n",
-				ret);
-	}
-
-	if (!(data->min_uV && data->max_uV) && data->enabled) {
-		dev_dbg(dev, "Disabling regulator\n");
-		ret = regulator_disable(data->regulator);
-		if (ret == 0)
-			data->enabled = false;
-		else
-			dev_err(dev, "regulator_disable() failed: %d\n",
-				ret);
-	}
+	spin_lock_irqsave(&rtc_lock, flags);
+	spin_lock(&efi_runtime_lock);
+	status = efi_call_virt(get_time, tm, tc);
+	spin_unlock(&efi_runtime_lock);
+	spin_unlock_irqrestore(&rtc_lock, flags);
+	return status;
 }
 
-static void update_current_limit_constraints(struct device *dev,
-					  struct virtual_consumer_data *data)
+static efi_status_t virt_efi_set_time(efi_time_t *tm)
 {
-	int ret;
+	unsigned long flags;
+	efi_status_t status;
 
-	if (data->max_uA
-	    && data->min_uA <= data->max_uA) {
-		dev_dbg(dev, "Requesting %d-%duA\n",
-			data->min_uA, data->max_uA);
-		ret = regulator_set_current_limit(data->regulator,
-					data->min_uA, data->max_uA);
-		if (ret != 0) {
-			dev_err(dev,
-				"regulator_set_current_limit() failed: %d\n",
-				ret);
-			return;
-		}
-	}
-
-	if (data->max_uA && !data->enabled) {
-		dev_dbg(dev, "Enabling regulator\n");
-		ret = regulator_enable(data->regulator);
-		if (ret == 0)
-			data->enabled = true;
-		else
-			dev_err(dev, "regulator_enable() failed: %d\n",
-				ret);
-	}
-
-	if (!(data->min_uA && data->max_uA) && data->enabled) {
-		dev_dbg(dev, "Disabling regulator\n");
-		ret = regulator_disable(data->regulator);
-		if (ret == 0)
-			data->enabled = false;
-		else
-			dev_err(dev, "regulator_disable() failed: %d\n",
-				ret);
-	}
+	spin_lock_irqsave(&rtc_lock, flags);
+	spin_lock(&efi_runtime_lock);
+	status = efi_call_virt(set_time, tm);
+	spin_unlock(&efi_runtime_lock);
+	spin_unlock_irqrestore(&rtc_lock, flags);
+	return status;
 }
 
-static ssize_t show_min_uV(struct device *dev,
-			   struct device_attribute *attr, char *buf)
+static efi_status_t virt_efi_get_wakeup_time(efi_bool_t *enabled,
+					     efi_bool_t *pending,
+					     efi_time_t *tm)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	return sprintf(buf, "%d\n", data->min_uV);
+	unsigned long flags;
+	efi_status_t status;
+
+	spin_lock_irqsave(&rtc_lock, flags);
+	spin_lock(&efi_runtime_lock);
+	status = efi_call_virt(get_wakeup_time, enabled, pending, tm);
+	spin_unlock(&efi_runtime_lock);
+	spin_unlock_irqrestore(&rtc_lock, flags);
+	return status;
 }
 
-static ssize_t set_min_uV(struct device *dev, struct device_attribute *attr,
-			  const char *buf, size_t count)
+static efi_status_t virt_efi_set_wakeup_time(efi_bool_t enabled, efi_time_t *tm)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	long val;
+	unsigned long flags;
+	efi_status_t status;
 
-	if (kstrtol(buf, 10, &val) != 0)
-		return count;
-
-	mutex_lock(&data->lock);
-
-	data->min_uV = val;
-	update_voltage_constraints(dev, data);
-
-	mutex_unlock(&data->lock);
-
-	return count;
+	spin_lock_irqsave(&rtc_lock, flags);
+	spin_lock(&efi_runtime_lock);
+	status = efi_call_virt(set_wakeup_time, enabled, tm);
+	spin_unlock(&efi_runtime_lock);
+	spin_unlock_irqrestore(&rtc_lock, flags);
+	return status;
 }
 
-static ssize_t show_max_uV(struct device *dev,
-			   struct device_attribute *attr, char *buf)
+static efi_status_t virt_efi_get_variable(efi_char16_t *name,
+					  efi_guid_t *vendor,
+					  u32 *attr,
+					  unsigned long *data_size,
+					  void *data)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	return sprintf(buf, "%d\n", data->max_uV);
+	unsigned long flags;
+	efi_status_t status;
+
+	spin_lock_irqsave(&efi_runtime_lock, flags);
+	status = efi_call_virt(get_variable, name, vendor, attr, data_size,
+			       data);
+	spin_unlock_irqrestore(&efi_runtime_lock, flags);
+	return status;
 }
 
-static ssize_t set_max_uV(struct device *dev, struct device_attribute *attr,
-			  const char *buf, size_t count)
+static efi_status_t virt_efi_get_next_variable(unsigned long *name_size,
+					       efi_char16_t *name,
+					       efi_guid_t *vendor)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	long val;
+	unsigned long flags;
+	efi_status_t status;
 
-	if (kstrtol(buf, 10, &val) != 0)
-		return count;
-
-	mutex_lock(&data->lock);
-
-	data->max_uV = val;
-	update_voltage_constraints(dev, data);
-
-	mutex_unlock(&data->lock);
-
-	return count;
+	spin_lock_irqsave(&efi_runtime_lock, flags);
+	status = efi_call_virt(get_next_variable, name_size, name, vendor);
+	spin_unlock_irqrestore(&efi_runtime_lock, flags);
+	return status;
 }
 
-static ssize_t show_min_uA(struct device *dev,
-			   struct device_attribute *attr, char *buf)
+static efi_status_t virt_efi_set_variable(efi_char16_t *name,
+					  efi_guid_t *vendor,
+					  u32 attr,
+					  unsigned long data_size,
+					  void *data)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	return sprintf(buf, "%d\n", data->min_uA);
+	unsigned long flags;
+	efi_status_t status;
+
+	spin_lock_irqsave(&efi_runtime_lock, flags);
+	status = efi_call_virt(set_variable, name, vendor, attr, data_size,
+			       data);
+	spin_unlock_irqrestore(&efi_runtime_lock, flags);
+	return status;
 }
 
-static ssize_t set_min_uA(struct device *dev, struct device_attribute *attr,
-			  const char *buf, size_t count)
+static efi_status_t
+virt_efi_set_variable_nonblocking(efi_char16_t *name, efi_guid_t *vendor,
+				  u32 attr, unsigned long data_size,
+				  void *data)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	long val;
+	unsigned long flags;
+	efi_status_t status;
 
-	if (kstrtol(buf, 10, &val) != 0)
-		return count;
+	if (!spin_trylock_irqsave(&efi_runtime_lock, flags))
+		return EFI_NOT_READY;
 
-	mutex_lock(&data->lock);
-
-	data->min_uA = val;
-	update_current_limit_constraints(dev, data);
-
-	mutex_unlock(&data->lock);
-
-	return count;
+	status = efi_call_virt(set_variable, name, vendor, attr, data_size,
+			       data);
+	spin_unlock_irqrestore(&efi_runtime_lock, flags);
+	return status;
 }
 
-static ssize_t show_max_uA(struct device *dev,
-			   struct device_attribute *attr, char *buf)
+
+static efi_status_t virt_efi_query_variable_info(u32 attr,
+						 u64 *storage_space,
+						 u64 *remaining_space,
+						 u64 *max_variable_size)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	return sprintf(buf, "%d\n", data->max_uA);
+	unsigned long flags;
+	efi_status_t status;
+
+	if (efi.runtime_version < EFI_2_00_SYSTEM_TABLE_REVISION)
+		return EFI_UNSUPPORTED;
+
+	spin_lock_irqsave(&efi_runtime_lock, flags);
+	status = efi_call_virt(query_variable_info, attr, storage_space,
+			       remaining_space, max_variable_size);
+	spin_unlock_irqrestore(&efi_runtime_lock, flags);
+	return status;
 }
 
-static ssize_t set_max_uA(struct device *dev, struct device_attribute *attr,
-			  const char *buf, size_t count)
+static efi_status_t virt_efi_get_next_high_mono_count(u32 *count)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	long val;
+	unsigned long flags;
+	efi_status_t status;
 
-	if (kstrtol(buf, 10, &val) != 0)
-		return count;
-
-	mutex_lock(&data->lock);
-
-	data->max_uA = val;
-	update_current_limit_constraints(dev, data);
-
-	mutex_unlock(&data->lock);
-
-	return count;
+	spin_lock_irqsave(&efi_runtime_lock, flags);
+	status = efi_call_virt(get_next_high_mono_count, count);
+	spin_unlock_irqrestore(&efi_runtime_lock, flags);
+	return status;
 }
 
-static ssize_t show_mode(struct device *dev,
-			 struct device_attribute *attr, char *buf)
+static void virt_efi_reset_system(int reset_type,
+				  efi_status_t status,
+				  unsigned long data_size,
+				  efi_char16_t *data)
 {
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
+	unsigned long flags;
 
-	switch (data->mode) {
-	case REGULATOR_MODE_FAST:
-		return sprintf(buf, "fast\n");
-	case REGULATOR_MODE_NORMAL:
-		return sprintf(buf, "normal\n");
-	case REGULATOR_MODE_IDLE:
-		return sprintf(buf, "idle\n");
-	case REGULATOR_MODE_STANDBY:
-		return sprintf(buf, "standby\n");
-	default:
-		return sprintf(buf, "unknown\n");
-	}
+	spin_lock_irqsave(&efi_runtime_lock, flags);
+	__efi_call_virt(reset_system, reset_type, status, data_size, data);
+	spin_unlock_irqrestore(&efi_runtime_lock, flags);
 }
 
-static ssize_t set_mode(struct device *dev, struct device_attribute *attr,
-			const char *buf, size_t count)
-{
-	struct virtual_consumer_data *data = dev_get_drvdata(dev);
-	unsigned int mode;
-	int ret;
-
-	/*
-	 * sysfs_streq() doesn't need the \n's, but we add them so the strings
-	 * will be shared with show_mode(), above.
-	 */
-	if (sysfs_streq(buf, "fast\n"))
-		mode = REGULATOR_MODE_FAST;
-	else if (sysfs_streq(buf, "normal\n"))
-		mode = REGULATOR_MODE_NORMAL;
-	else if (sysfs_streq(buf, "idle\n"))
-		mode = REGULATOR_MODE_IDLE;
-	else if (sysfs_streq(buf, "standby\n"))
-		mode = REGULATOR_MODE_STANDBY;
-	else {
-		dev_err(dev, "Configuring invalid mode\n");
-		return count;
-	}
-
-	mutex_lock(&data->lock);
-	ret = regulator_set_mode(data->regulator, mode);
-	if (ret == 0)
-		data->mode = mode;
-	else
-		dev_err(dev, "Failed to configure mode: %d\n", ret);
-	mutex_unlock(&data->lock);
-
-	return count;
-}
-
-static DEVICE_ATTR(min_microvolts, 0664, show_min_uV, set_min_uV);
-static DEVICE_ATTR(max_microvolts, 0664, show_max_uV, set_max_uV);
-static DEVICE_ATTR(min_microamps, 0664, show_min_uA, set_min_uA);
-static DEVICE_ATTR(max_microamps, 0664, show_max_uA, set_max_uA);
-static DEVICE_ATTR(mode, 0664, show_mode, set_mode);
-
-static struct attribute *regulator_virtual_attributes[] = {
-	&dev_attr_min_microvolts.attr,
-	&dev_attr_max_microvolts.attr,
-	&dev_attr_min_microamps.attr,
-	&dev_attr_max_microamps.attr,
-	&dev_attr_mode.attr,
-	NULL
-};
-
-static const struct attribute_group regulator_virtual_attr_group = {
-	.attrs	= regulator_virtual_attributes,
-};
-
-static int regulator_virtual_probe(struct platform_device *pdev)
-{
-	char *reg_id = dev_get_platdata(&pdev->dev);
-	struct virtual_consumer_data *drvdata;
-	int ret;
-
-	drvdata = devm_kzalloc(&pdev->dev, sizeof(struct virtual_consumer_data),
-			       GFP_KERNEL);
-	if (drvdata == NULL)
-		return -ENOMEM;
-
-	mutex_init(&drvdata->lock);
-
-	drvdata->regulator = devm_regulator_get(&pdev->dev, reg_id);
-	if (IS_ERR(drvdata->regulator)) {
-		ret = PTR_ERR(drvdata->regulator);
-		dev_err(&pdev->dev, "Failed to obtain supply '%s': %d\n",
-			reg_id, ret);
-		return ret;
-	}
-
-	ret = sysfs_create_group(&pdev->dev.kobj,
-				 &regulator_virtual_attr_group);
-	if (ret != 0) {
-		dev_err(&pdev->dev,
-			"Failed to create attribute group: %d\n", ret);
-		return ret;
-	}
-
-	drvdata->mode = regulator_get_mode(drvdata->regulator);
-
-	platform_set_drvdata(pdev, drvdata);
-
-	return 0;
-}
-
-static int regulator_virtual_remove(struct platform_device *pdev)
-{
-	struct virtual_consumer_data *drvdata = platform_get_drvdata(pdev);
-
-	sysfs_remove_group(&pdev->dev.kobj, &regulator_virtual_attr_group);
-
-	if (drvdata->enabled)
-		regulator_disable(drvdata->regulator);
-
-	return 0;
-}
-
-static struct platform_driver regulator_virtual_consumer_driver = {
-	.probe		= regulator_virtual_probe,
-	.remove		= regulator_virtual_remove,
-	.driver		= {
-		.name		= "reg-virt-consumer",
-	},
-};
-
-module_platform_driver(regulator_virtual_consumer_driver);
-
-MODULE_AUTHOR("Mark Brown <broonie@opensource.wolfsonmicro.com>");
-MODULE_DESCRIPTION("Virtual regulator consumer");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:reg-virt-consumer");
+static efi_status_t virt_efi_update_capsule(efi_capsule_header_t **capsules,
+					    unsigned l

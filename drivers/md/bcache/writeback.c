@@ -1,561 +1,293 @@
-/*
- * background writeback - scan btree for dirty data and write it to the backing
- * device
- *
- * Copyright 2010, 2011 Kent Overstreet <kent.overstreet@gmail.com>
- * Copyright 2012 Google, Inc.
- */
-
-#include "bcache.h"
-#include "btree.h"
-#include "debug.h"
-#include "writeback.h"
-
-#include <linux/delay.h>
-#include <linux/freezer.h>
-#include <linux/kthread.h>
-#include <trace/events/bcache.h>
-
-/* Rate limiting */
-
-static void __update_writeback_rate(struct cached_dev *dc)
-{
-	struct cache_set *c = dc->disk.c;
-	uint64_t cache_sectors = c->nbuckets * c->sb.bucket_size -
-				bcache_flash_devs_sectors_dirty(c);
-	uint64_t cache_dirty_target =
-		div_u64(cache_sectors * dc->writeback_percent, 100);
-
-	int64_t target = div64_u64(cache_dirty_target * bdev_sectors(dc->bdev),
-				   c->cached_dev_sectors);
-
-	/* PD controller */
-
-	int64_t dirty = bcache_dev_sectors_dirty(&dc->disk);
-	int64_t derivative = dirty - dc->disk.sectors_dirty_last;
-	int64_t proportional = dirty - target;
-	int64_t change;
-
-	dc->disk.sectors_dirty_last = dirty;
-
-	/* Scale to sectors per second */
-
-	proportional *= dc->writeback_rate_update_seconds;
-	proportional = div_s64(proportional, dc->writeback_rate_p_term_inverse);
-
-	derivative = div_s64(derivative, dc->writeback_rate_update_seconds);
-
-	derivative = ewma_add(dc->disk.sectors_dirty_derivative, derivative,
-			      (dc->writeback_rate_d_term /
-			       dc->writeback_rate_update_seconds) ?: 1, 0);
-
-	derivative *= dc->writeback_rate_d_term;
-	derivative = div_s64(derivative, dc->writeback_rate_p_term_inverse);
-
-	change = proportional + derivative;
-
-	/* Don't increase writeback rate if the device isn't keeping up */
-	if (change > 0 &&
-	    time_after64(local_clock(),
-			 dc->writeback_rate.next + NSEC_PER_MSEC))
-		change = 0;
-
-	dc->writeback_rate.rate =
-		clamp_t(int64_t, (int64_t) dc->writeback_rate.rate + change,
-			1, NSEC_PER_MSEC);
-
-	dc->writeback_rate_proportional = proportional;
-	dc->writeback_rate_derivative = derivative;
-	dc->writeback_rate_change = change;
-	dc->writeback_rate_target = target;
-}
-
-static void update_writeback_rate(struct work_struct *work)
-{
-	struct cached_dev *dc = container_of(to_delayed_work(work),
-					     struct cached_dev,
-					     writeback_rate_update);
-
-	down_read(&dc->writeback_lock);
-
-	if (atomic_read(&dc->has_dirty) &&
-	    dc->writeback_percent)
-		__update_writeback_rate(dc);
-
-	up_read(&dc->writeback_lock);
-
-	schedule_delayed_work(&dc->writeback_rate_update,
-			      dc->writeback_rate_update_seconds * HZ);
-}
-
-static unsigned writeback_delay(struct cached_dev *dc, unsigned sectors)
-{
-	if (test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) ||
-	    !dc->writeback_percent)
-		return 0;
-
-	return bch_next_delay(&dc->writeback_rate, sectors);
-}
-
-struct dirty_io {
-	struct closure		cl;
-	struct cached_dev	*dc;
-	struct bio		bio;
-};
-
-static void dirty_init(struct keybuf_key *w)
-{
-	struct dirty_io *io = w->private;
-	struct bio *bio = &io->bio;
-
-	bio_init(bio);
-	if (!io->dc->writeback_percent)
-		bio_set_prio(bio, IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0));
-
-	bio->bi_iter.bi_size	= KEY_SIZE(&w->key) << 9;
-	bio->bi_max_vecs	= DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS);
-	bio->bi_private		= w;
-	bio->bi_io_vec		= bio->bi_inline_vecs;
-	bch_bio_map(bio, NULL);
-}
-
-static void dirty_io_destructor(struct closure *cl)
-{
-	struct dirty_io *io = container_of(cl, struct dirty_io, cl);
-	kfree(io);
-}
-
-static void write_dirty_finish(struct closure *cl)
-{
-	struct dirty_io *io = container_of(cl, struct dirty_io, cl);
-	struct keybuf_key *w = io->bio.bi_private;
-	struct cached_dev *dc = io->dc;
-	struct bio_vec *bv;
-	int i;
-
-	bio_for_each_segment_all(bv, &io->bio, i)
-		__free_page(bv->bv_page);
-
-	/* This is kind of a dumb way of signalling errors. */
-	if (KEY_DIRTY(&w->key)) {
-		int ret;
-		unsigned i;
-		struct keylist keys;
-
-		bch_keylist_init(&keys);
-
-		bkey_copy(keys.top, &w->key);
-		SET_KEY_DIRTY(keys.top, false);
-		bch_keylist_push(&keys);
-
-		for (i = 0; i < KEY_PTRS(&w->key); i++)
-			atomic_inc(&PTR_BUCKET(dc->disk.c, &w->key, i)->pin);
-
-		ret = bch_btree_insert(dc->disk.c, &keys, NULL, &w->key);
-
-		if (ret)
-			trace_bcache_writeback_collision(&w->key);
-
-		atomic_long_inc(ret
-				? &dc->disk.c->writeback_keys_failed
-				: &dc->disk.c->writeback_keys_done);
-	}
-
-	bch_keybuf_del(&dc->writeback_keys, w);
-	up(&dc->in_flight);
-
-	closure_return_with_destructor(cl, dirty_io_destructor);
-}
-
-static void dirty_endio(struct bio *bio)
-{
-	struct keybuf_key *w = bio->bi_private;
-	struct dirty_io *io = w->private;
-
-	if (bio->bi_error)
-		SET_KEY_DIRTY(&w->key, false);
-
-	closure_put(&io->cl);
-}
-
-static void write_dirty(struct closure *cl)
-{
-	struct dirty_io *io = container_of(cl, struct dirty_io, cl);
-	struct keybuf_key *w = io->bio.bi_private;
-
-	dirty_init(w);
-	io->bio.bi_rw		= WRITE;
-	io->bio.bi_iter.bi_sector = KEY_START(&w->key);
-	io->bio.bi_bdev		= io->dc->bdev;
-	io->bio.bi_end_io	= dirty_endio;
-
-	closure_bio_submit(&io->bio, cl);
-
-	continue_at(cl, write_dirty_finish, io->dc->writeback_write_wq);
-}
-
-static void read_dirty_endio(struct bio *bio)
-{
-	struct keybuf_key *w = bio->bi_private;
-	struct dirty_io *io = w->private;
-
-	bch_count_io_errors(PTR_CACHE(io->dc->disk.c, &w->key, 0),
-			    bio->bi_error, "reading dirty data from cache");
-
-	dirty_endio(bio);
-}
-
-static void read_dirty_submit(struct closure *cl)
-{
-	struct dirty_io *io = container_of(cl, struct dirty_io, cl);
-
-	closure_bio_submit(&io->bio, cl);
-
-	continue_at(cl, write_dirty, io->dc->writeback_write_wq);
-}
-
-static void read_dirty(struct cached_dev *dc)
-{
-	unsigned delay = 0;
-	struct keybuf_key *w;
-	struct dirty_io *io;
-	struct closure cl;
-
-	closure_init_stack(&cl);
-
-	/*
-	 * XXX: if we error, background writeback just spins. Should use some
-	 * mempools.
-	 */
-
-	while (!kthread_should_stop()) {
-		try_to_freeze();
-
-		w = bch_keybuf_next(&dc->writeback_keys);
-		if (!w)
-			break;
-
-		BUG_ON(ptr_stale(dc->disk.c, &w->key, 0));
-
-		if (KEY_START(&w->key) != dc->last_read ||
-		    jiffies_to_msecs(delay) > 50)
-			while (!kthread_should_stop() && delay)
-				delay = schedule_timeout_interruptible(delay);
-
-		dc->last_read	= KEY_OFFSET(&w->key);
-
-		io = kzalloc(sizeof(struct dirty_io) + sizeof(struct bio_vec)
-			     * DIV_ROUND_UP(KEY_SIZE(&w->key), PAGE_SECTORS),
-			     GFP_KERNEL);
-		if (!io)
-			goto err;
-
-		w->private	= io;
-		io->dc		= dc;
-
-		dirty_init(w);
-		io->bio.bi_iter.bi_sector = PTR_OFFSET(&w->key, 0);
-		io->bio.bi_bdev		= PTR_CACHE(dc->disk.c,
-						    &w->key, 0)->bdev;
-		io->bio.bi_rw		= READ;
-		io->bio.bi_end_io	= read_dirty_endio;
-
-		if (bio_alloc_pages(&io->bio, GFP_KERNEL))
-			goto err_free;
-
-		trace_bcache_writeback(&w->key);
-
-		down(&dc->in_flight);
-		closure_call(&io->cl, read_dirty_submit, NULL, &cl);
-
-		delay = writeback_delay(dc, KEY_SIZE(&w->key));
-	}
-
-	if (0) {
-err_free:
-		kfree(w->private);
-err:
-		bch_keybuf_del(&dc->writeback_keys, w);
-	}
-
-	/*
-	 * Wait for outstanding writeback IOs to finish (and keybuf slots to be
-	 * freed) before refilling again
-	 */
-	closure_sync(&cl);
-}
-
-/* Scan for dirty data */
-
-void bcache_dev_sectors_dirty_add(struct cache_set *c, unsigned inode,
-				  uint64_t offset, int nr_sectors)
-{
-	struct bcache_device *d = c->devices[inode];
-	unsigned stripe_offset, stripe, sectors_dirty;
-
-	if (!d)
-		return;
-
-	stripe = offset_to_stripe(d, offset);
-	stripe_offset = offset & (d->stripe_size - 1);
-
-	while (nr_sectors) {
-		int s = min_t(unsigned, abs(nr_sectors),
-			      d->stripe_size - stripe_offset);
-
-		if (nr_sectors < 0)
-			s = -s;
-
-		if (stripe >= d->nr_stripes)
-			return;
-
-		sectors_dirty = atomic_add_return(s,
-					d->stripe_sectors_dirty + stripe);
-		if (sectors_dirty == d->stripe_size)
-			set_bit(stripe, d->full_dirty_stripes);
-		else
-			clear_bit(stripe, d->full_dirty_stripes);
-
-		nr_sectors -= s;
-		stripe_offset = 0;
-		stripe++;
-	}
-}
-
-static bool dirty_pred(struct keybuf *buf, struct bkey *k)
-{
-	struct cached_dev *dc = container_of(buf, struct cached_dev, writeback_keys);
-
-	BUG_ON(KEY_INODE(k) != dc->disk.id);
-
-	return KEY_DIRTY(k);
-}
-
-static void refill_full_stripes(struct cached_dev *dc)
-{
-	struct keybuf *buf = &dc->writeback_keys;
-	unsigned start_stripe, stripe, next_stripe;
-	bool wrapped = false;
-
-	stripe = offset_to_stripe(&dc->disk, KEY_OFFSET(&buf->last_scanned));
-
-	if (stripe >= dc->disk.nr_stripes)
-		stripe = 0;
-
-	start_stripe = stripe;
-
-	while (1) {
-		stripe = find_next_bit(dc->disk.full_dirty_stripes,
-				       dc->disk.nr_stripes, stripe);
-
-		if (stripe == dc->disk.nr_stripes)
-			goto next;
-
-		next_stripe = find_next_zero_bit(dc->disk.full_dirty_stripes,
-						 dc->disk.nr_stripes, stripe);
-
-		buf->last_scanned = KEY(dc->disk.id,
-					stripe * dc->disk.stripe_size, 0);
-
-		bch_refill_keybuf(dc->disk.c, buf,
-				  &KEY(dc->disk.id,
-				       next_stripe * dc->disk.stripe_size, 0),
-				  dirty_pred);
-
-		if (array_freelist_empty(&buf->freelist))
-			return;
-
-		stripe = next_stripe;
-next:
-		if (wrapped && stripe > start_stripe)
-			return;
-
-		if (stripe == dc->disk.nr_stripes) {
-			stripe = 0;
-			wrapped = true;
-		}
-	}
-}
-
-/*
- * Returns true if we scanned the entire disk
- */
-static bool refill_dirty(struct cached_dev *dc)
-{
-	struct keybuf *buf = &dc->writeback_keys;
-	struct bkey start = KEY(dc->disk.id, 0, 0);
-	struct bkey end = KEY(dc->disk.id, MAX_KEY_OFFSET, 0);
-	struct bkey start_pos;
-
-	/*
-	 * make sure keybuf pos is inside the range for this disk - at bringup
-	 * we might not be attached yet so this disk's inode nr isn't
-	 * initialized then
-	 */
-	if (bkey_cmp(&buf->last_scanned, &start) < 0 ||
-	    bkey_cmp(&buf->last_scanned, &end) > 0)
-		buf->last_scanned = start;
-
-	if (dc->partial_stripes_expensive) {
-		refill_full_stripes(dc);
-		if (array_freelist_empty(&buf->freelist))
-			return false;
-	}
-
-	start_pos = buf->last_scanned;
-	bch_refill_keybuf(dc->disk.c, buf, &end, dirty_pred);
-
-	if (bkey_cmp(&buf->last_scanned, &end) < 0)
-		return false;
-
-	/*
-	 * If we get to the end start scanning again from the beginning, and
-	 * only scan up to where we initially started scanning from:
-	 */
-	buf->last_scanned = start;
-	bch_refill_keybuf(dc->disk.c, buf, &start_pos, dirty_pred);
-
-	return bkey_cmp(&buf->last_scanned, &start_pos) >= 0;
-}
-
-static int bch_writeback_thread(void *arg)
-{
-	struct cached_dev *dc = arg;
-	bool searched_full_index;
-
-	while (!kthread_should_stop()) {
-		down_write(&dc->writeback_lock);
-		set_current_state(TASK_INTERRUPTIBLE);
-		/*
-		 * If the bache device is detaching, skip here and continue
-		 * to perform writeback. Otherwise, if no dirty data on cache,
-		 * or there is dirty data on cache but writeback is disabled,
-		 * the writeback thread should sleep here and wait for others
-		 * to wake up it.
-		 */
-		if (!test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) &&
-		    (!atomic_read(&dc->has_dirty) || !dc->writeback_running)) {
-			up_write(&dc->writeback_lock);
-
-			if (kthread_should_stop()) {
-				set_current_state(TASK_RUNNING);
-				return 0;
-			}
-
-			try_to_freeze();
-			schedule();
-			continue;
-		}
-		set_current_state(TASK_RUNNING);
-
-		searched_full_index = refill_dirty(dc);
-
-		if (searched_full_index &&
-		    RB_EMPTY_ROOT(&dc->writeback_keys.keys)) {
-			atomic_set(&dc->has_dirty, 0);
-			cached_dev_put(dc);
-			SET_BDEV_STATE(&dc->sb, BDEV_STATE_CLEAN);
-			bch_write_bdev_super(dc, NULL);
-			/*
-			 * If bcache device is detaching via sysfs interface,
-			 * writeback thread should stop after there is no dirty
-			 * data on cache. BCACHE_DEV_DETACHING flag is set in
-			 * bch_cached_dev_detach().
-			 */
-			if (test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags)) {
-				up_write(&dc->writeback_lock);
-				break;
-			}
-		}
-
-		up_write(&dc->writeback_lock);
-
-		bch_ratelimit_reset(&dc->writeback_rate);
-		read_dirty(dc);
-
-		if (searched_full_index) {
-			unsigned delay = dc->writeback_delay * HZ;
-
-			while (delay &&
-			       !kthread_should_stop() &&
-			       !test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags))
-				delay = schedule_timeout_interruptible(delay);
-		}
-	}
-
-	return 0;
-}
-
-/* Init */
-
-struct sectors_dirty_init {
-	struct btree_op	op;
-	unsigned	inode;
-};
-
-static int sectors_dirty_init_fn(struct btree_op *_op, struct btree *b,
-				 struct bkey *k)
-{
-	struct sectors_dirty_init *op = container_of(_op,
-						struct sectors_dirty_init, op);
-	if (KEY_INODE(k) > op->inode)
-		return MAP_DONE;
-
-	if (KEY_DIRTY(k))
-		bcache_dev_sectors_dirty_add(b->c, KEY_INODE(k),
-					     KEY_START(k), KEY_SIZE(k));
-
-	return MAP_CONTINUE;
-}
-
-void bch_sectors_dirty_init(struct bcache_device *d)
-{
-	struct sectors_dirty_init op;
-
-	bch_btree_op_init(&op.op, -1);
-	op.inode = d->id;
-
-	bch_btree_map_keys(&op.op, d->c, &KEY(op.inode, 0, 0),
-			   sectors_dirty_init_fn, 0);
-
-	d->sectors_dirty_last = bcache_dev_sectors_dirty(d);
-}
-
-void bch_cached_dev_writeback_init(struct cached_dev *dc)
-{
-	sema_init(&dc->in_flight, 64);
-	init_rwsem(&dc->writeback_lock);
-	bch_keybuf_init(&dc->writeback_keys);
-
-	dc->writeback_metadata		= true;
-	dc->writeback_running		= true;
-	dc->writeback_percent		= 10;
-	dc->writeback_delay		= 30;
-	dc->writeback_rate.rate		= 1024;
-
-	dc->writeback_rate_update_seconds = 5;
-	dc->writeback_rate_d_term	= 30;
-	dc->writeback_rate_p_term_inverse = 6000;
-
-	INIT_DELAYED_WORK(&dc->writeback_rate_update, update_writeback_rate);
-}
-
-int bch_cached_dev_writeback_start(struct cached_dev *dc)
-{
-	dc->writeback_write_wq = alloc_workqueue("bcache_writeback_wq",
-						WQ_MEM_RECLAIM, 0);
-	if (!dc->writeback_write_wq)
-		return -ENOMEM;
-
-	dc->writeback_thread = kthread_create(bch_writeback_thread, dc,
-					      "bcache_writeback");
-	if (IS_ERR(dc->writeback_thread))
-		return PTR_ERR(dc->writeback_thread);
-
-	schedule_delayed_work(&dc->writeback_rate_update,
-			      dc->writeback_rate_update_seconds * HZ);
-
-	bch_writeback_queue(dc);
-
-	return 0;
-}
+ine SMU_PM_STATUS_11__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_12__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_12__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_13__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_13__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_14__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_14__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_15__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_15__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_16__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_16__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_17__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_17__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_18__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_18__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_19__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_19__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_20__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_20__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_21__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_21__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_22__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_22__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_23__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_23__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_24__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_24__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_25__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_25__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_26__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_26__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_27__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_27__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_28__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_28__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_29__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_29__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_30__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_30__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_31__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_31__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_32__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_32__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_33__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_33__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_34__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_34__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_35__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_35__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_36__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_36__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_37__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_37__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_38__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_38__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_39__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_39__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_40__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_40__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_41__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_41__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_42__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_42__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_43__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_43__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_44__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_44__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_45__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_45__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_46__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_46__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_47__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_47__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_48__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_48__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_49__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_49__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_50__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_50__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_51__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_51__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_52__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_52__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_53__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_53__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_54__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_54__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_55__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_55__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_56__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_56__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_57__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_57__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_58__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_58__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_59__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_59__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_60__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_60__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_61__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_61__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_62__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_62__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_63__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_63__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_64__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_64__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_65__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_65__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_66__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_66__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_67__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_67__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_68__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_68__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_69__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_69__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_70__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_70__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_71__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_71__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_72__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_72__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_73__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_73__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_74__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_74__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_75__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_75__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_76__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_76__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_77__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_77__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_78__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_78__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_79__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_79__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_80__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_80__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_81__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_81__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_82__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_82__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_83__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_83__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_84__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_84__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_85__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_85__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_86__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_86__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_87__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_87__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_88__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_88__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_89__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_89__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_90__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_90__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_91__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_91__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_92__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_92__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_93__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_93__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_94__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_94__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_95__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_95__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_96__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_96__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_97__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_97__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_98__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_98__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_99__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_99__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_100__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_100__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_101__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_101__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_102__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_102__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_103__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_103__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_104__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_104__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_105__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_105__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_106__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_106__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_107__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_107__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_108__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_108__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_109__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_109__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_110__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_110__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_111__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_111__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_112__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_112__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_113__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_113__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_114__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_114__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_115__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_115__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_116__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_116__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_117__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_117__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_118__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_118__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_119__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_119__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_120__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_120__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_121__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_121__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_122__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_122__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_123__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_123__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_124__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_124__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_125__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_125__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_126__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_126__DATA__SHIFT 0x0
+#define SMU_PM_STATUS_127__DATA_MASK 0xffffffff
+#define SMU_PM_STATUS_127__DATA__SHIFT 0x0
+#define CG_THERMAL_INT_ENA__THERM_INTH_SET_MASK 0x1
+#define CG_THERMAL_INT_ENA__THERM_INTH_SET__SHIFT 0x0
+#define CG_THERMAL_INT_ENA__THERM_INTL_SET_MASK 0x2
+#define CG_THERMAL_INT_ENA__THERM_INTL_SET__SHIFT 0x1
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_SET_MASK 0x4
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_SET__SHIFT 0x2
+#define CG_THERMAL_INT_ENA__THERM_INTH_CLR_MASK 0x8
+#define CG_THERMAL_INT_ENA__THERM_INTH_CLR__SHIFT 0x3
+#define CG_THERMAL_INT_ENA__THERM_INTL_CLR_MASK 0x10
+#define CG_THERMAL_INT_ENA__THERM_INTL_CLR__SHIFT 0x4
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_CLR_MASK 0x20
+#define CG_THERMAL_INT_ENA__THERM_TRIGGER_CLR__SHIFT 0x5
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTH_MASK 0xff
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTH__SHIFT 0x0
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTL_MASK 0xff00
+#define CG_THERMAL_INT_CTRL__DIG_THERM_INTL__SHIFT 0x8
+#define CG_THERMAL_INT_CTRL__GNB_TEMP_THRESHOLD_MASK 0xff0000
+#define CG_THERMAL_INT_CTRL__GNB_TEMP_THRESHOLD__SHIFT 0x10
+#define CG_THERMAL_INT_CTRL__THERM_INTH_MASK_MASK 0x1000000
+#define CG_THERMAL_INT_CTRL__THERM_INTH_MASK__SHIFT 0x18
+#define CG_THERMAL_INT_CTRL__THERM_INTL_MASK_MASK 0x2000000
+#define CG_THERMAL_INT_CTRL__THERM_INTL_MASK__SHIFT 0x19
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_MASK_MASK 0x4000000
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_MASK__SHIFT 0x1a
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_CNB_MASK_MASK 0x8000000
+#define CG_THERMAL_INT_CTRL__THERM_TRIGGER_CNB_MASK__SHIFT 0x1b
+#define CG_THERMAL_INT_CTRL__THERM_GNB_HW_ENA_MASK 0x10000000
+#define CG_THERMAL_INT_CTRL__THERM_GNB_HW_ENA__SHIFT 0x1c
+#define CG_THERMAL_INT_STATUS__THERM_INTH_DETECT_MASK 0x1
+#define CG_THERMAL_INT_STATUS__THERM_INTH_DETECT__SHIFT 0x0
+#define CG_THERMAL_INT_STATUS__THERM_INTL_DETECT_MASK 0x2
+#define CG_THERMAL_INT_STATUS__THERM_INTL_DETECT__SHIFT 0x1
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_DETECT_MASK 0x4
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_DETECT__SHIFT 0x2
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_CNB_DETECT_MASK 0x8
+#define CG_THERMAL_INT_STATUS__THERM_TRIGGER_CNB_DETECT__SHIFT 0x3
+#define CG_THERMAL_CTRL__DPM_EVENT_SRC_MASK 0x7
+#define CG_THERMAL_CTRL__DPM_EVENT_SRC__SHIFT 0x0
+#define CG_THERMAL_CTRL__THERM_INC_CLK_MASK 0x8
+#define CG_THERMAL_CTRL__THERM_INC_CLK__SHIFT 0x3
+#define CG_THERMAL_CTRL__SPARE_MASK 0x3ff0
+#define CG_THERMAL_CTRL__SPARE__SHIFT 0x4
+#define CG_THERMAL_CTRL__DIG_THERM_DPM_MASK 0x3fc000
+#define CG_THERMAL_CTRL__DIG_THERM_DPM__SHIFT 0xe
+#define CG_THERMAL_CTRL__RESERVED_MASK 0x1c00000
+#define CG_THERMAL_CTRL__RESERVED__SHIFT 0x16
+#define CG_THERMAL_CTRL__CTF_PAD_POLARITY_MASK 0x2000000
+#define CG_THERMAL_CTRL__CTF_PAD_POLARITY__SHIFT 0x19
+#define CG_THERMAL_CTRL__CTF_PAD_EN_MASK 0x4000000
+#define CG_THERMAL_CTRL__CTF_PAD_EN__SHIFT 0x1a
+#define CG_THERMAL_STATUS__SPARE_MASK 0x1ff
+#define CG_THERMAL_STATUS__SPARE__SHIFT 0x0
+#define CG_THERMAL_STATUS__FDO_PWM_DUTY_MASK 0x1fe00
+#define CG_THERMAL_STATUS__FDO_PWM_DUTY__SHIFT 0x9
+#define CG_THERMAL_STATUS__THERM_ALERT_MASK 0x20000
+#define CG_THERMAL_STATUS__THERM_ALERT__SHIFT 0x11
+#define CG_THERMAL_STATUS__GEN_STATUS_MASK 0x3c0000
+#define CG_THERMAL_STATUS__GEN_STATUS__SHIFT 0x12
+#define CG_THERMAL_INT__DIG_THERM_CTF_MASK 0xff
+#define CG_THERMAL_INT__DIG_THERM_CTF__SHIF
